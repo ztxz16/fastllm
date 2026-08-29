@@ -1936,6 +1936,11 @@ namespace fastllm {
 
         Data routerLogits, sharedGateUp, sharedHidden, sharedOutput, sharedGate;
         Linear(flattened, this->weight[mlp + "gate.weight"], Data(), routerLogits);
+        // Expert selection is defined in float32 (and the generic
+        // SelectExpert contract requires it).  Keep only the narrow router
+        // tensor in float32 while the much larger residual/MLP activations
+        // remain in the configured activation dtype.
+        ToDataType(routerLogits, DataType::FLOAT32);
         Softmax(routerLogits, routerLogits, -1);
         Linear(flattened, this->weight[mlp + "shared_expert.gateup_proj.weight"],
                Data(), sharedGateUp);
