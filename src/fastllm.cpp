@@ -613,6 +613,107 @@ namespace fastllm {
         return data.cpuData + weightBytes;
     }
 
+    void PackCompactE4M3NVFP4Block16Rows(
+            int rows, int columns, const uint8_t *weights,
+            const uint8_t *scaleBytes,
+            const std::vector<float> &globalScales,
+            int blockK, int blockM, uint8_t *destination,
+            int destinationRowStart, int destinationRows,
+            bool crossSwiglu) {
+        AssertInFastLLM(
+            rows > 0 && columns > 0 && weights != nullptr &&
+            scaleBytes != nullptr && !globalScales.empty() &&
+            blockK > 0 && blockM == 16 && destination != nullptr &&
+            destinationRowStart >= 0 && destinationRows >= 0 &&
+            destinationRowStart + destinationRows <= rows &&
+            (!crossSwiglu || (rows & 1) == 0),
+            "Compact E4M3 NVFP4 block-16 packing received invalid metadata.\n");
+        const int packedBlocks = (columns - 1) / 16 + 1;
+        const int scaleRows = (rows - 1) / blockK + 1;
+        const int scaleColumns = (columns - 1) / blockM + 1;
+        const int globalCount = (int)globalScales.size();
+        const size_t rawBytesPerRow = GetNVFP4WeightBytes(1, columns);
+        const size_t packedBytesPerRow =
+            GetDataBytes(DataType::NVFP4_BLOCK_16, 1, columns);
+        static const FP8E4M3ToFP32Manager fp8ToFloat;
+
+        for (int localRow = 0; localRow < destinationRows; localRow++) {
+            const int destinationRow = destinationRowStart + localRow;
+            const int sourceRow = crossSwiglu
+                ? ((destinationRow & 1)
+                    ? rows / 2 + destinationRow / 2
+                    : destinationRow / 2)
+                : destinationRow;
+            const int scaleRow = sourceRow / blockK;
+            const int globalIndex = std::min(
+                globalCount - 1,
+                (int)((int64_t)scaleRow * globalCount / scaleRows));
+            const float globalScale = globalScales[globalIndex];
+            const uint8_t *source =
+                weights + (size_t)sourceRow * rawBytesPerRow;
+            uint8_t *rowDestination =
+                destination + (size_t)localRow * packedBytesPerRow;
+            for (int block = 0; block < packedBlocks; block++) {
+                const int blockStart = block * 16;
+                const int blockElements =
+                    std::min(16, columns - blockStart);
+                const int blockBytes = (blockElements + 1) / 2;
+                memset(rowDestination, 0, 8);
+                memcpy(rowDestination, source + blockStart / 2,
+                       blockBytes);
+                rowDestination += 8;
+
+                const size_t scaleIndex =
+                    (size_t)scaleRow * scaleColumns + block;
+                const float scale =
+                    fp8ToFloat.dict[scaleBytes[scaleIndex]] * globalScale;
+                memcpy(rowDestination, &scale, sizeof(scale));
+                rowDestination += sizeof(scale);
+            }
+        }
+    }
+
+    void ConvertCompactE4M3NVFP4ToBlock16(
+            Data &data, bool crossSwiglu) {
+        if (data.dataType != DataType::NVFP4_BLOCK_16_E4M3) {
+            return;
+        }
+        AssertInFastLLM(
+            data.dataDevice == DataDevice::CPU && data.cpuData != nullptr &&
+            data.dims.size() == 2 && !data.isFake &&
+            !data.multiDeviceData && data.numasData.empty() &&
+            !data.isDiskWeight,
+            "Compact E4M3 NVFP4 conversion requires a resident CPU matrix.\n");
+        const int rows = data.dims[0];
+        const int columns = data.dims[1];
+        const uint8_t *scaleBytes = GetNVFP4ScaleData(data);
+        const size_t packedBytes =
+            GetDataBytes(DataType::NVFP4_BLOCK_16, rows, columns);
+        std::vector<uint8_t> packed(packedBytes);
+        PackCompactE4M3NVFP4Block16Rows(
+            rows, columns, data.cpuData, scaleBytes, data.scales,
+            data.blockK, data.blockM, packed.data(), 0, rows,
+            crossSwiglu);
+
+        data.FreeSpace();
+        // FreeSpace deliberately does not delete an mmap-backed pointer.
+        // The converted allocation is owned storage, so detach the old map
+        // before allocating it or the new buffer would later be treated as a
+        // borrowed mapping and leaked.
+        data.mapFile.reset();
+        data.dataType = DataType::NVFP4_BLOCK_16;
+        data.blockK = 1;
+        data.blockM = 16;
+        data.IsRepacked = false;
+        data.cpuNVFP4Scales.clear();
+        data.UpdateUnitSize();
+        data.Allocate(false);
+        AssertInFastLLM(data.cpuData != nullptr &&
+                        data.GetBytes() == packedBytes,
+                        "Compact E4M3 NVFP4 conversion allocation failed.\n");
+        memcpy(data.cpuData, packed.data(), packedBytes);
+    }
+
     size_t GetDataBytes(DataType type, size_t rows, size_t columns) {
         if (rows == 0 || columns == 0) {
             return 0;

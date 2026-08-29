@@ -3435,6 +3435,32 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
 
 }  // namespace fastllm_marlin_moe
 
+bool FastllmCudaNVFP4E4M3GroupedMoeSupported(int device) {
+#ifdef CUDA_NO_TENSOR_CORE
+    (void)device;
+    return false;
+#else
+    static std::mutex cacheMutex;
+    static std::map<int, bool> cache;
+    std::lock_guard<std::mutex> lock(cacheMutex);
+    auto cached = cache.find(device);
+    if (cached != cache.end()) {
+        return cached->second;
+    }
+
+    int previousDevice = -1;
+    const bool havePrevious = cudaGetDevice(&previousDevice) == cudaSuccess;
+    bool supported = device >= 0 &&
+        cudaSetDevice(device) == cudaSuccess &&
+        fastllm_marlin_moe::PrepareNvfp4E4M3MarlinMoeKernels(device);
+    if (havePrevious && previousDevice != device) {
+        cudaSetDevice(previousDevice);
+    }
+    cache[device] = supported;
+    return supported;
+#endif
+}
+
 void FastllmCudaReleaseMergeMOEVllmMarlinCache(
         const fastllm::Data *layerKey) {
     fastllm_marlin_moe::ReleaseLayerCache(layerKey);

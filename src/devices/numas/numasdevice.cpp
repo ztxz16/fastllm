@@ -346,6 +346,7 @@ namespace fastllm {
                weight.dataType == DataType::NVFP4 ||
                weight.dataType == DataType::NVFP4_BLOCK_16 ||
                weight.dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+               weight.dataType == DataType::NVFP4_BLOCK_16_E4M3 ||
                weight.dataType == DataType::NVFP4_BLOCK_32_E8M0;
     }
 
@@ -1724,6 +1725,29 @@ namespace fastllm {
                         data->numasData[i] = (uint8_t*)allocFunc(kPerNuma * bytesPerRow, i);
                         memcpy(data->numasData[i], fp8Packed.data() + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
                     }
+                } else if (data->dataType ==
+                           DataType::NVFP4_BLOCK_16_E4M3) {
+                    uint8_t *scaleBytes = GetNVFP4ScaleData(*data);
+                    const int sourceBlockK = data->blockK;
+                    const int sourceBlockM = data->blockM;
+                    AssertInFastLLM(
+                        sourceBlockK > 0 && sourceBlockM == 16 &&
+                        scaleBytes != nullptr && !data->scales.empty(),
+                        "RegisterNumas received invalid compact E4M3 NVFP4 metadata.\n");
+                    data->dataType = DataType::NVFP4_BLOCK_16;
+                    const size_t packedBytesPerRow =
+                        GetDataBytes(data->dataType, 1, m);
+                    for (int i = 0; i < numaConfig->numaCnt; i++) {
+                        data->numasData[i] = (uint8_t*)allocFunc(
+                            kPerNuma * packedBytesPerRow, i);
+                        PackCompactE4M3NVFP4Block16Rows(
+                            k, m, data->cpuData, scaleBytes, data->scales,
+                            sourceBlockK, sourceBlockM,
+                            data->numasData[i], i * kPerNuma, kPerNuma,
+                            isCrossSwiglu);
+                    }
+                    data->blockK = 1;
+                    data->blockM = 16;
                 } else if (data->dataType == DataType::NVFP4) {
                     if (data->blockM < 16 || (data->blockM % 16 != 0 && data->blockM != m)) {
                         ErrorInFastLLM("RegisterNumas can't support nvfp4 with blockM = " + std::to_string(data->blockM));
@@ -2318,6 +2342,7 @@ namespace fastllm {
             (weight->dataType == DataType::NVFP4 ||
              weight->dataType == DataType::NVFP4_BLOCK_16 ||
              weight->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+             weight->dataType == DataType::NVFP4_BLOCK_16_E4M3 ||
              weight->dataType == DataType::NVFP4_BLOCK_32_E8M0)) {
             return DataType::BFLOAT16;
         }
@@ -2352,6 +2377,7 @@ namespace fastllm {
             case DataType::FP8_E4M3_PERCHANNEL:
             case DataType::NVFP4_BLOCK_16:
             case DataType::NVFP4_BLOCK_16_E8M0:
+            case DataType::NVFP4_BLOCK_16_E4M3:
             case DataType::NVFP4_BLOCK_32_E8M0:
             case DataType::INT8:
             case DataType::INT8_PERCHANNEL:
@@ -2973,6 +2999,9 @@ namespace fastllm {
                 return useBlock32 ?
                     DataType::NVFP4_BLOCK_32_E8M0 :
                     DataType::NVFP4_BLOCK_16_E8M0;
+            }
+            if (weight.dataType == DataType::NVFP4_BLOCK_16_E4M3) {
+                return DataType::NVFP4_BLOCK_16;
             }
             if (weight.dataType == DataType::INT8) {
                 return DataType::INT8_PERCHANNEL;

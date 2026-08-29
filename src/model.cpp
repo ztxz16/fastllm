@@ -63,6 +63,7 @@
 #endif
 
 #ifdef USE_CUDA
+#include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #endif
 
@@ -693,6 +694,35 @@ namespace fastllm {
         std::map <int, int> ratios;
         std::vector <int> deviceIds = ParseDeviceIds(selectedDevice,
             selectedMultiCuda ? "multicuda" : "cuda", ratios);
+        if (data.dataType == DataType::NVFP4_BLOCK_16_E4M3) {
+            std::vector<int> capabilityDeviceIds = deviceIds;
+            if (capabilityDeviceIds.empty()) {
+                if (selectedMultiCuda) {
+                    const int deviceCount = FastllmCudaGetDeviceCount();
+                    for (int deviceId = 0; deviceId < deviceCount;
+                         deviceId++) {
+                        capabilityDeviceIds.push_back(deviceId);
+                    }
+                } else {
+                    capabilityDeviceIds.push_back(FastllmCudaGetDevice());
+                }
+            }
+            bool groupedLayoutSupported = !capabilityDeviceIds.empty();
+            for (int deviceId : capabilityDeviceIds) {
+                groupedLayoutSupported = groupedLayoutSupported &&
+                    deviceId >= 0 &&
+                    FastllmCudaNVFP4E4M3GroupedMoeSupported(deviceId);
+            }
+            if (!groupedLayoutSupported) {
+                // The compact planar checkpoint layout is consumed directly
+                // only by grouped Marlin (SM80+ with sufficient dynamic
+                // shared memory).  Expand it losslessly to FastLLM's standard
+                // block-16 layout before moving the weight so every CUDA
+                // architecture supported by the build retains the ordinary
+                // NVFP4 linear/MoE fallbacks.
+                ConvertCompactE4M3NVFP4ToBlock16(data);
+            }
+        }
         if (SplitSpecialWeightToCudaTpDevices(this, weightName, data, deviceIds, ratios)) {
             return true;
         }

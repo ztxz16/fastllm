@@ -378,6 +378,15 @@ namespace fastllm {
     uint8_t *GetNVFP4ScaleData(Data &data);
     const uint8_t *GetNVFP4ScaleData(const Data &data);
     float NVFP4E8M0ScaleToFloat(uint8_t v);
+    void PackCompactE4M3NVFP4Block16Rows(
+        int rows, int columns, const uint8_t *weights,
+        const uint8_t *scaleBytes,
+        const std::vector<float> &globalScales,
+        int blockK, int blockM, uint8_t *destination,
+        int destinationRowStart, int destinationRows,
+        bool crossSwiglu = false);
+    void ConvertCompactE4M3NVFP4ToBlock16(
+        Data &data, bool crossSwiglu = false);
 
     enum DataDevice {
         CPU = 0, CUDA = 1

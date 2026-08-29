@@ -1419,6 +1419,7 @@ bool FastllmCudaMergeMOENVFP4E4M3MarlinIndexed(
         fastllm::Data **weights, int weightsBatch,
         const int32_t *indices, const float *scores,
         int batch, int topk);
+bool FastllmCudaNVFP4E4M3GroupedMoeSupported(int device);
 bool FastllmCudaHalfMatMulFloatInt4Group128(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaHalfMatMulFloatInt4NoZero(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaHalfMatMulFloatFP8E4M3(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
