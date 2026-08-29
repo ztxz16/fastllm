@@ -73,11 +73,22 @@ namespace fastllm {
                  const FloatDict &floatParams = FloatDict(),
                  const IntDict &intParams = IntDict(),
                  const std::vector<std::string> &outputs = std::vector<std::string>(),
-                 bool checkCanRun = true) {
+                 bool checkCanRun = true,
+                 bool preserveFakeOutputs = false) {
             FastllmCudaSetDevice(deviceId);
             for (auto &name : outputs) {
                 auto it = datas.find(name);
                 if (it != datas.end() && it->second != nullptr) {
+                    if (preserveFakeOutputs && it->second->isFake) {
+                        AssertInFastLLM(
+                            it->second->dataDevice == DataDevice::CUDA &&
+                            it->second->cudaData != nullptr &&
+                            (it->second->dataDeviceIds.empty() ||
+                             it->second->dataDeviceIds[0] == deviceId),
+                            "Qwen3 CUDA direct runner got an invalid "
+                            "borrowed output.\n");
+                        continue;
+                    }
                     Qwen3CudaPrepareLocalOutput(*it->second, deviceId);
                 }
             }
@@ -441,7 +452,9 @@ namespace fastllm {
         int inter = down.dims[1];
         int hidden = hiddenStates.dims.back();
         int n = input.Count(0) / input.dims.back();
-        int minBatch = Qwen3CudaEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 8);
+        int minBatch = std::max(
+            Qwen3CudaEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 8),
+            FastllmCudaGetLinearExactBatchThreshold());
         if (n < minBatch) {
             return false;
         }
@@ -1097,7 +1110,8 @@ namespace fastllm {
             bool inited,
             bool enableCudaGraph = false,
             int flashInferCudaGraph = -1,
-            int windowLeft = -1) {
+            int windowLeft = -1,
+            bool preserveFakeOutput = false) {
         runner.Run("AttentionPagedBatch",
                    DataDict{{"q", &q}, {"kCaches", &kCaches}, {"vCaches", &vCaches},
                             {"output", &output}, {"qSizes", &qSizes}, {"pageSizes", &pageSizes},
@@ -1107,7 +1121,7 @@ namespace fastllm {
                            {"sync", 0}, {"enableCudaGraph", (int)enableCudaGraph},
                            {"flashInferCudaGraph", flashInferCudaGraph},
                            {"windowLeft", windowLeft}},
-                   {"output"});
+                   {"output"}, true, preserveFakeOutput);
     }
 
     inline void Qwen3CudaQKVRMSNormRopeSplitAppendPagedCache(

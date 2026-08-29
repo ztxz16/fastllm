@@ -5612,6 +5612,208 @@ namespace fastllm {
             return true;
         }
 
+        struct Qwen35ExactDFlashPagedMeta {
+            Data storage;
+            Data insertIndexRows;
+            Data insertPositionRows;
+            Data qSizes;
+            Data pageIndexs;
+            Data batchQSizes;
+            Data batchPageSizes;
+            Data batchPageIndexs;
+            Data batchLastPageLens;
+            Data rowInsertIndex;
+            Data rowInsertPosition;
+            Data rowPageSizes;
+            Data rowLastPageLen;
+            std::vector<int> insertIndexHost;
+            std::vector<int> insertPositionHost;
+            std::vector<int> pageSizeRowsHost;
+            std::vector<int> pageIndexHost;
+            std::vector<int> lastPageLenHost;
+            std::vector<int> batchQSizesHost;
+            std::vector<int> batchPageSizesHost;
+            std::vector<int> batchPageIndexHost;
+            std::vector<int> singleHost{0};
+            std::vector<int> pairHost{0, 0};
+            size_t insertIndexOffset = 0;
+            size_t insertPositionOffset = 0;
+            size_t pageSizeRowsOffset = 0;
+            size_t lastPageLenOffset = 0;
+            int rows = 0;
+            int device = -1;
+
+            bool Prepare(Data &key, Data &value,
+                         int appendTokens, int targetDevice) {
+                if (appendTokens <= 0 ||
+                    key.pagedKVCacheData == nullptr ||
+                    value.pagedKVCacheData == nullptr ||
+                    key.pageLen <= 0 ||
+                    key.pageLen != value.pageLen ||
+                    key.pageIndex != value.pageIndex ||
+                    key.lastPageLen != value.lastPageLen) {
+                    return false;
+                }
+                const size_t originalPages = key.pageIndex.size();
+                const int originalLastPageLen = key.lastPageLen;
+                const int originalKeyTokens =
+                    key.dims.size() >= 2 ? key.dims[1] : -1;
+                const int originalValueTokens =
+                    value.dims.size() >= 2 ? value.dims[1] : -1;
+                int baseTokens = 0;
+                if (!Qwen35AdvanceMtpVerifyPagedCachePair(
+                        key, value, appendTokens, baseTokens)) {
+                    return false;
+                }
+                auto rollback = [&]() {
+                    while (value.pageIndex.size() > originalPages) {
+                        value.pagedKVCacheData->ReleasePageIndex(
+                            value.pageIndex.back());
+                        value.pageIndex.pop_back();
+                    }
+                    while (key.pageIndex.size() > originalPages) {
+                        key.pagedKVCacheData->ReleasePageIndex(
+                            key.pageIndex.back());
+                        key.pageIndex.pop_back();
+                    }
+                    key.lastPageLen = originalLastPageLen;
+                    value.lastPageLen = originalLastPageLen;
+                    if (originalKeyTokens >= 0) {
+                        key.dims[1] = originalKeyTokens;
+                    }
+                    if (originalValueTokens >= 0) {
+                        value.dims[1] = originalValueTokens;
+                    }
+                };
+
+                rows = appendTokens;
+                device = targetDevice;
+                insertIndexHost.resize(rows);
+                insertPositionHost.resize(rows);
+                pageSizeRowsHost.resize((size_t)rows * 2);
+                lastPageLenHost.resize(rows);
+                static const std::vector<int> qSizesHost{0, 1};
+                pageIndexHost = key.pageIndex;
+                batchQSizesHost.assign(rows + 1, 0);
+                batchPageSizesHost.assign(rows + 1, 0);
+                batchPageIndexHost.clear();
+                for (int row = 0; row < rows; ++row) {
+                    int logicalToken = baseTokens + row;
+                    int pageOrdinal = logicalToken / key.pageLen;
+                    int pageOffset = logicalToken % key.pageLen;
+                    if (pageOrdinal < 0 ||
+                        pageOrdinal >= (int)pageIndexHost.size()) {
+                        rollback();
+                        return false;
+                    }
+                    insertIndexHost[row] =
+                        pageIndexHost[pageOrdinal];
+                    insertPositionHost[row] = pageOffset;
+                    pageSizeRowsHost[(size_t)row * 2] = 0;
+                    pageSizeRowsHost[(size_t)row * 2 + 1] =
+                        pageOrdinal + 1;
+                    lastPageLenHost[row] = pageOffset + 1;
+                    batchQSizesHost[row + 1] = row + 1;
+                    batchPageSizesHost[row + 1] =
+                        batchPageSizesHost[row] + pageOrdinal + 1;
+                    batchPageIndexHost.insert(
+                        batchPageIndexHost.end(),
+                        pageIndexHost.begin(),
+                        pageIndexHost.begin() + pageOrdinal + 1);
+                }
+
+                std::vector<int> packedHost;
+                packedHost.reserve(
+                    insertIndexHost.size() +
+                    insertPositionHost.size() + qSizesHost.size() +
+                    pageSizeRowsHost.size() + pageIndexHost.size() +
+                    lastPageLenHost.size() + batchQSizesHost.size() +
+                    batchPageSizesHost.size() +
+                    batchPageIndexHost.size());
+                auto append = [&](const std::vector<int> &values,
+                                  size_t &offset) {
+                    offset = packedHost.size();
+                    packedHost.insert(packedHost.end(), values.begin(),
+                                      values.end());
+                };
+                size_t qSizesOffset = 0;
+                size_t pageIndexOffset = 0;
+                size_t batchQSizesOffset = 0;
+                size_t batchPageSizesOffset = 0;
+                size_t batchPageIndexOffset = 0;
+                append(insertIndexHost, insertIndexOffset);
+                append(insertPositionHost, insertPositionOffset);
+                append(qSizesHost, qSizesOffset);
+                append(pageSizeRowsHost, pageSizeRowsOffset);
+                append(pageIndexHost, pageIndexOffset);
+                append(lastPageLenHost, lastPageLenOffset);
+                append(batchQSizesHost, batchQSizesOffset);
+                append(batchPageSizesHost, batchPageSizesOffset);
+                append(batchPageIndexHost, batchPageIndexOffset);
+                if (!Qwen35PrepareMtpVerifyGraphPackedIntTensor(
+                        storage, device, packedHost,
+                        (int)packedHost.size(), true) ||
+                    !Qwen35BindMtpVerifyGraphIntView(
+                        insertIndexRows, storage, device,
+                        insertIndexOffset, insertIndexHost) ||
+                    !Qwen35BindMtpVerifyGraphIntView(
+                        insertPositionRows, storage, device,
+                        insertPositionOffset, insertPositionHost) ||
+                    !Qwen35BindMtpVerifyGraphIntView(
+                        qSizes, storage, device,
+                        qSizesOffset, qSizesHost) ||
+                    !Qwen35BindMtpVerifyGraphIntView(
+                        pageIndexs, storage, device,
+                        pageIndexOffset, pageIndexHost) ||
+                    !Qwen35BindMtpVerifyGraphIntView(
+                        batchQSizes, storage, device,
+                        batchQSizesOffset, batchQSizesHost) ||
+                    !Qwen35BindMtpVerifyGraphIntView(
+                        batchPageSizes, storage, device,
+                        batchPageSizesOffset, batchPageSizesHost) ||
+                    !Qwen35BindMtpVerifyGraphIntView(
+                        batchPageIndexs, storage, device,
+                        batchPageIndexOffset, batchPageIndexHost) ||
+                    !Qwen35BindMtpVerifyGraphIntView(
+                        batchLastPageLens, storage, device,
+                        lastPageLenOffset, lastPageLenHost)) {
+                    rollback();
+                    return false;
+                }
+                return true;
+            }
+
+            bool BindRow(int row) {
+                if (row < 0 || row >= rows) {
+                    return false;
+                }
+                singleHost[0] = insertIndexHost[row];
+                if (!Qwen35BindMtpVerifyGraphIntView(
+                        rowInsertIndex, storage, device,
+                        insertIndexOffset + row, singleHost)) {
+                    return false;
+                }
+                singleHost[0] = insertPositionHost[row];
+                if (!Qwen35BindMtpVerifyGraphIntView(
+                        rowInsertPosition, storage, device,
+                        insertPositionOffset + row, singleHost)) {
+                    return false;
+                }
+                pairHost[0] = 0;
+                pairHost[1] = pageSizeRowsHost[(size_t)row * 2 + 1];
+                if (!Qwen35BindMtpVerifyGraphIntView(
+                        rowPageSizes, storage, device,
+                        pageSizeRowsOffset + (size_t)row * 2,
+                        pairHost)) {
+                    return false;
+                }
+                singleHost[0] = lastPageLenHost[row];
+                return Qwen35BindMtpVerifyGraphIntView(
+                    rowLastPageLen, storage, device,
+                    lastPageLenOffset + row, singleHost);
+            }
+        };
+
         static bool Qwen35PrepareMtpVerifyGraphPagedMeta(
                 Qwen35MtpVerifyGraphDeviceState &deviceState,
                 int batch, int blockCnt, int maxPositions,
@@ -5922,7 +6124,9 @@ namespace fastllm {
                 int flashInferCudaGraph = -1,
                 bool externalPrefillMeta = false,
                 Data *externalAppendBaseTokenLens = nullptr,
-                Data *inputRmsWeight = nullptr) {
+                Data *inputRmsWeight = nullptr,
+                bool precomputedInputProjection = false,
+                bool repeatSinglePagedCache = false) {
             using namespace qwen3cuda;
             AssertInFastLLM(attenInput != nullptr && mergeQkvWeight != nullptr &&
                             mergeQkvBias != nullptr && qNormWeight != nullptr &&
@@ -5942,13 +6146,14 @@ namespace fastllm {
                             "Qwen3.5 gated paged attention block got invalid head metadata.\n");
 
             bool fusedInputProjection =
+                !precomputedInputProjection &&
                 inputRmsWeight != nullptr && hiddenStates != nullptr &&
                 Qwen3CudaEnvDefaultEnabled(
                     "FASTLLM_CUDA_CUTLASS_LINEAR_FP8_INPUT_RMSNORM_QUANT_TP") &&
                 Qwen3CudaTryRMSNormLinearFp8(
                     runner, *hiddenStates, *inputRmsWeight, rmsNormEps,
                     *mergeQkvWeight, *mergeQkvBias, *merged);
-            if (!fusedInputProjection) {
+            if (!precomputedInputProjection && !fusedInputProjection) {
                 if (inputRmsWeight != nullptr) {
                     AssertInFastLLM(hiddenStates != nullptr,
                                     "Qwen3.5 input RMSNorm requires hidden states.\n");
@@ -5968,9 +6173,26 @@ namespace fastllm {
             int group = numAttentionHeads / numKeyValueHeads;
             float ropeScale = (ropeType == RoPEType::LINEAR_SCALE) ? ropeFactor : 1.0f;
 
-            for (int b = 0; b < batch; b++) {
-                (*batchPastKeys)[b] = (*pastKeyValues)[b * blockCnt + layerIdx].first;
-                (*batchPastValues)[b] = (*pastKeyValues)[b * blockCnt + layerIdx].second;
+            if (repeatSinglePagedCache) {
+                AssertInFastLLM(
+                    pastKeyValues->size() > (size_t)layerIdx,
+                    "Qwen3.5 repeated paged attention is missing its "
+                    "source cache.\n");
+                batchPastKeys->resize(batch);
+                batchPastValues->resize(batch);
+                for (int b = 0; b < batch; ++b) {
+                    (*batchPastKeys)[b] =
+                        (*pastKeyValues)[layerIdx].first;
+                    (*batchPastValues)[b] =
+                        (*pastKeyValues)[layerIdx].second;
+                }
+            } else {
+                for (int b = 0; b < batch; b++) {
+                    (*batchPastKeys)[b] =
+                        (*pastKeyValues)[b * blockCnt + layerIdx].first;
+                    (*batchPastValues)[b] =
+                        (*pastKeyValues)[b * blockCnt + layerIdx].second;
+                }
             }
 
             auto makeCacheDesc = [](const Data &src, DataType targetType) {
@@ -6208,7 +6430,8 @@ namespace fastllm {
                                              1.0f / std::sqrt((float)headDim),
                                              1, layerIdx > 0,
                                              enableFlashInferCudaGraph,
-                                             flashInferCudaGraph);
+                                             flashInferCudaGraph, -1,
+                                             attenOutput->isFake);
                 if (bsz == 1 && seqlen == 1) {
                     attenOutput->Reshape({bsz, seqlen, -1});
                 } else {
@@ -10831,6 +11054,26 @@ namespace fastllm {
             hiddenStatesPtr = &embeddingOutput;
         }
         Data &hiddenStates = *hiddenStatesPtr;
+        const int previousLinearExactBatchThreshold =
+            FastllmCudaGetLinearExactBatchThreshold();
+        const bool exactSmallDFlashVerifier =
+            speculativeCollectAllLogits &&
+            speculativeCaptureDFlashHiddenStates &&
+            hiddenStates.dims.size() >= 2 &&
+            hiddenStates.dims[1] > 1 &&
+            hiddenStates.dims[1] <= QWEN35_MTP_FAST_SEQ_MAX;
+        if (exactSmallDFlashVerifier) {
+            FastllmCudaSetLinearExactBatchThreshold(
+                std::max(previousLinearExactBatchThreshold,
+                         QWEN35_MTP_FAST_SEQ_MAX + 1));
+        }
+        struct LinearExactBatchThresholdRestore {
+            int previous;
+            ~LinearExactBatchThresholdRestore() {
+                FastllmCudaSetLinearExactBatchThreshold(previous);
+            }
+        } linearExactBatchThresholdRestore{
+            previousLinearExactBatchThreshold};
         if (hiddenStates.dataType != computeType) {
             Qwen3CudaToDataType(cudaRunner, hiddenStates, computeType);
         }
@@ -10847,6 +11090,7 @@ namespace fastllm {
         Data gdnMerged, baMerged, qkvConvInput, qkvConvInputPermuted;
         Data z, b, a, g, conv, convOutput, convOutputPermuted;
         Data coreAttnOut, coreTemp, gatedCoreAttnOut;
+        Qwen35ExactDFlashPagedMeta exactDFlashPagedMeta;
         Data convInputWithCache;
         Data convToken0, convToken1, convOutput0, convOutput1;
         Data convRow0, convRow1, baRow0, baRow1;
@@ -10980,46 +11224,301 @@ namespace fastllm {
                     Data *activeLastPageLens = graphPagedLayer != nullptr ?
                         &graphPagedLayer->lastPageLens : &lastPageLens;
                     int localQHeads = localKVHeads * (num_attention_heads / num_key_value_heads);
-                    Qwen35CudaAttentionPagedBlock(
-                        cudaRunner,
-                        &attenInput,
-                        requireLocal(weight[mergeQkvWeightName], mergeQkvWeightName),
-                        requireLocal(GetThreadTensorParallelBias(mergeQkvBiasName), mergeQkvBiasName),
-                        requireLocal(weight[qNormName], qNormName),
-                        requireLocal(weight[kNormName], kNormName),
-                        requireLocal(weight[oWeightName], oWeightName),
-                        requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
-                        requireLocal((Data&)positionIds, "positionIds"),
-                        &pastKeyValues,
-                        &batchPastKeys, &batchPastValues,
-                        &merged, &qgate, &gate,
-                        &q, &k, &v,
-                        &attenOutput, &attenLastOutput,
-                        &qForAttentionHolder,
-                        &insertIndexs, &insertPositions,
-                        activeQSizes, activePageSizes,
-                        activePageIndexs, activeLastPageLens,
-                        &generatedAppendParams, &generatedDecodeParams,
-                        batch, block_cnt, i, seqLens,
-                        localQHeads, localKVHeads, head_dim,
-                        rotary_dim, mrope_sections,
-                        rms_norm_eps, rope_base, rope_factor,
-                        rope_type, isPrefill,
-                        &hiddenStates,
-                        pagedCacheLayerOffset,
-                        true, false,
-                        mtpVerifyGraphDeviceState != nullptr,
-                        mtpVerifyGraphDeviceState != nullptr ? 1 : -1,
-                        mtpVerifyGraphDeviceState != nullptr,
-                        graphPagedLayer != nullptr ?
-                            &graphPagedLayer->baseTokenLens : nullptr,
-                        &inputRmsWeight);
-                    Qwen3CudaLinearResidualReduce(
-                        cudaRunner, attenOutput,
-                        *requireLocal(weight[oWeightName], oWeightName),
-                        *requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
-                        attenLastOutput, hiddenStates,
-                        tensorParallel, firstTensorParallelRank, gpuId, true);
+                    const bool exactDFlashVerifierAttention =
+                        exactSmallDFlashVerifier &&
+                        mtpVerifyGraphDeviceState == nullptr &&
+                        batch == 1 && bsz == 1 && seqlen > 1 &&
+                        seqlen <= QWEN35_MTP_FAST_SEQ_MAX;
+                    if (exactDFlashVerifierAttention) {
+                        // Project all verifier rows together, but run the
+                        // cache append and attention core as chronological
+                        // q1 decodes.  The prefill attention reduction is
+                        // numerically shape-dependent and can flip close
+                        // greedy logits even though it is causally correct.
+                        Qwen3CudaRMSNorm(
+                            cudaRunner, hiddenStates, inputRmsWeight,
+                            rms_norm_eps, attenInput);
+                        Qwen3CudaLinear(
+                            cudaRunner, attenInput,
+                            *requireLocal(
+                                weight[mergeQkvWeightName],
+                                mergeQkvWeightName),
+                            *requireLocal(
+                                GetThreadTensorParallelBias(
+                                    mergeQkvBiasName),
+                                mergeQkvBiasName),
+                            merged);
+                        Data exactAttentionOutput;
+                        Data &localPositionIds = *requireLocal(
+                            (Data&)positionIds, "positionIds");
+                        auto makeContiguousSliceView = [](
+                                Data &source, int axis, int index,
+                                Data &view) {
+                            int dimsSize = (int)source.dims.size();
+                            AssertInFastLLM(
+                                dimsSize > 0 &&
+                                    source.strides.size() ==
+                                        source.dims.size(),
+                                "Qwen3.5 DFlash exact attention got an "
+                                "invalid slice source.\n");
+                            axis = (axis % dimsSize + dimsSize) % dimsSize;
+                            AssertInFastLLM(
+                                index >= 0 && index < source.dims[axis],
+                                "Qwen3.5 DFlash exact attention got an "
+                                "invalid slice index.\n");
+                            size_t elementOffset =
+                                (size_t)index * source.strides[axis];
+                            size_t byteNumerator =
+                                elementOffset * source.unitSize;
+                            AssertInFastLLM(
+                                byteNumerator % source.unitSizeDiv == 0,
+                                "Qwen3.5 DFlash exact attention got an "
+                                "unaligned slice offset.\n");
+                            view.FakeFrom(
+                                source,
+                                byteNumerator / source.unitSizeDiv);
+                            view.dataDeviceIds = source.dataDeviceIds;
+                            std::vector<int> viewDims = source.dims;
+                            viewDims[axis] = 1;
+                            view.Resize(viewDims);
+                        };
+
+                        Data rowHiddenStates, rowPositionIds, rowMerged;
+                        Data rowAttentionOutput;
+                        const std::vector<int> rowSeqLens{1};
+                        const bool packedExactPagedMeta =
+                            exactDFlashPagedMeta.Prepare(
+                                *pastKeyValues[i].first,
+                                *pastKeyValues[i].second,
+                                seqlen, gpuId);
+                        const bool batchedExactQ1Attention =
+                            packedExactPagedMeta &&
+                            localPositionIds.dims.size() == 2 &&
+                            localPositionIds.dims[0] == 1;
+                        Data *exactProjectionInput = &exactAttentionOutput;
+                        if (batchedExactQ1Attention) {
+                            // Treat each verifier row as an independent q1
+                            // request, while all rows share the same physical
+                            // cache.  Row-specific page tables expose only
+                            // the chronological prefix, preserving the q1
+                            // attention reduction without eight launches.
+                            std::vector<int> batchRowSeqLens(seqlen, 1);
+                            bool batchGeneratedAppendParams = false;
+                            bool batchGeneratedDecodeParams = false;
+                            Qwen35CudaAttentionPagedBlock(
+                                cudaRunner,
+                                &attenInput,
+                                requireLocal(
+                                    weight[mergeQkvWeightName],
+                                    mergeQkvWeightName),
+                                requireLocal(
+                                    GetThreadTensorParallelBias(
+                                        mergeQkvBiasName),
+                                    mergeQkvBiasName),
+                                requireLocal(weight[qNormName], qNormName),
+                                requireLocal(weight[kNormName], kNormName),
+                                requireLocal(weight[oWeightName], oWeightName),
+                                requireLocal(
+                                    GetThreadTensorParallelBias(oBiasName),
+                                    oBiasName),
+                                &localPositionIds,
+                                &pastKeyValues,
+                                &batchPastKeys, &batchPastValues,
+                                &merged, &qgate, &gate,
+                                &q, &k, &v,
+                                &attenOutput, &attenLastOutput,
+                                &qForAttentionHolder,
+                                &exactDFlashPagedMeta.insertIndexRows,
+                                &exactDFlashPagedMeta.insertPositionRows,
+                                &exactDFlashPagedMeta.batchQSizes,
+                                &exactDFlashPagedMeta.batchPageSizes,
+                                &exactDFlashPagedMeta.batchPageIndexs,
+                                &exactDFlashPagedMeta.batchLastPageLens,
+                                &batchGeneratedAppendParams,
+                                &batchGeneratedDecodeParams,
+                                seqlen, block_cnt, i,
+                                batchRowSeqLens,
+                                localQHeads, localKVHeads, head_dim,
+                                rotary_dim, mrope_sections,
+                                rms_norm_eps, rope_base, rope_factor,
+                                rope_type, false,
+                                &hiddenStates,
+                                pagedCacheLayerOffset,
+                                true, true,
+                                false, -1, false, nullptr,
+                                &inputRmsWeight, true, true);
+                            exactProjectionInput = &attenOutput;
+                        } else {
+                            for (int row = 0; row < seqlen; ++row) {
+                                makeContiguousSliceView(
+                                    hiddenStates, 1, row,
+                                    rowHiddenStates);
+                                // Text positions are [1, seq] and can be borrowed
+                                // directly.  MRoPE positions are [3, seq], where a
+                                // token slice is strided, so retain the packed
+                                // Split fallback for multimodal requests.
+                                if (localPositionIds.dims.size() == 2 &&
+                                    localPositionIds.dims[0] == 1) {
+                                    makeContiguousSliceView(
+                                        localPositionIds, -1, row,
+                                        rowPositionIds);
+                                } else {
+                                    Qwen3CudaSplit(
+                                        cudaRunner, localPositionIds, -1,
+                                        row, row + 1, rowPositionIds);
+                                }
+                                // The fused q/gate/KV decode kernel normalizes
+                                // and applies RoPE to qgatekv in place.  Keep a
+                                // private packed row so the batched projection is
+                                // not aliased by those writes.
+                                Qwen3CudaSplit(
+                                    cudaRunner, merged, 1,
+                                    row, row + 1, rowMerged);
+                                Data *activeAttentionOutput = &attenOutput;
+                                if (row > 0) {
+                                    makeContiguousSliceView(
+                                        exactAttentionOutput, 1, row,
+                                        rowAttentionOutput);
+                                    activeAttentionOutput =
+                                        &rowAttentionOutput;
+                                }
+                                bool rowGeneratedAppendParams = false;
+                                bool rowGeneratedDecodeParams = false;
+                                Data *rowInsertIndexs = &insertIndexs;
+                                Data *rowInsertPositions = &insertPositions;
+                                Data *rowQSizes = activeQSizes;
+                                Data *rowPageSizes = activePageSizes;
+                                Data *rowPageIndexs = activePageIndexs;
+                                Data *rowLastPageLens = activeLastPageLens;
+                                if (packedExactPagedMeta) {
+                                    AssertInFastLLM(
+                                        exactDFlashPagedMeta.BindRow(row),
+                                        "Qwen3.5 DFlash exact attention failed "
+                                        "to bind packed paged metadata.\n");
+                                    rowInsertIndexs =
+                                        &exactDFlashPagedMeta.rowInsertIndex;
+                                    rowInsertPositions =
+                                        &exactDFlashPagedMeta.rowInsertPosition;
+                                    rowQSizes =
+                                        &exactDFlashPagedMeta.qSizes;
+                                    rowPageSizes =
+                                        &exactDFlashPagedMeta.rowPageSizes;
+                                    rowPageIndexs =
+                                        &exactDFlashPagedMeta.pageIndexs;
+                                    rowLastPageLens =
+                                        &exactDFlashPagedMeta.rowLastPageLen;
+                                }
+                                Qwen35CudaAttentionPagedBlock(
+                                    cudaRunner,
+                                    &attenInput,
+                                    requireLocal(
+                                        weight[mergeQkvWeightName],
+                                        mergeQkvWeightName),
+                                    requireLocal(
+                                        GetThreadTensorParallelBias(
+                                            mergeQkvBiasName),
+                                        mergeQkvBiasName),
+                                    requireLocal(weight[qNormName], qNormName),
+                                    requireLocal(weight[kNormName], kNormName),
+                                    requireLocal(weight[oWeightName], oWeightName),
+                                    requireLocal(
+                                        GetThreadTensorParallelBias(oBiasName),
+                                        oBiasName),
+                                    &rowPositionIds,
+                                    &pastKeyValues,
+                                    &batchPastKeys, &batchPastValues,
+                                    &rowMerged, &qgate, &gate,
+                                    &q, &k, &v,
+                                    activeAttentionOutput, &attenLastOutput,
+                                    &qForAttentionHolder,
+                                    rowInsertIndexs, rowInsertPositions,
+                                    rowQSizes, rowPageSizes,
+                                    rowPageIndexs, rowLastPageLens,
+                                    &rowGeneratedAppendParams,
+                                    &rowGeneratedDecodeParams,
+                                    1, block_cnt, i, rowSeqLens,
+                                    localQHeads, localKVHeads, head_dim,
+                                    rotary_dim, mrope_sections,
+                                    rms_norm_eps, rope_base, rope_factor,
+                                    rope_type, false,
+                                    &rowHiddenStates,
+                                    pagedCacheLayerOffset,
+                                    true, packedExactPagedMeta,
+                                    false, -1, false, nullptr,
+                                    &inputRmsWeight, true);
+                                if (row == 0) {
+                                    Qwen3CudaPrepareLocalOutput(
+                                        exactAttentionOutput, gpuId);
+                                    exactAttentionOutput.dataType =
+                                        attenOutput.dataType;
+                                    exactAttentionOutput.UpdateUnitSize();
+                                    std::vector<int> outputDims =
+                                        attenOutput.dims;
+                                    outputDims[1] = seqlen;
+                                    exactAttentionOutput.Resize(outputDims);
+                                    exactAttentionOutput.Allocate(false);
+                                    const size_t rowBytes =
+                                        attenOutput.GetBytes();
+                                    AssertInFastLLM(
+                                        FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
+                                            exactAttentionOutput.cudaData,
+                                            attenOutput.cudaData, rowBytes),
+                                        "Qwen3.5 DFlash exact attention copy "
+                                        "failed.\n");
+                                }
+                            }
+                        }
+                        Qwen3CudaLinearResidualReduce(
+                            cudaRunner, *exactProjectionInput,
+                            *requireLocal(weight[oWeightName], oWeightName),
+                            *requireLocal(
+                                GetThreadTensorParallelBias(oBiasName),
+                                oBiasName),
+                            attenLastOutput, hiddenStates,
+                            tensorParallel, firstTensorParallelRank,
+                            gpuId, true);
+                    } else {
+                        Qwen35CudaAttentionPagedBlock(
+                            cudaRunner,
+                            &attenInput,
+                            requireLocal(weight[mergeQkvWeightName], mergeQkvWeightName),
+                            requireLocal(GetThreadTensorParallelBias(mergeQkvBiasName), mergeQkvBiasName),
+                            requireLocal(weight[qNormName], qNormName),
+                            requireLocal(weight[kNormName], kNormName),
+                            requireLocal(weight[oWeightName], oWeightName),
+                            requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
+                            requireLocal((Data&)positionIds, "positionIds"),
+                            &pastKeyValues,
+                            &batchPastKeys, &batchPastValues,
+                            &merged, &qgate, &gate,
+                            &q, &k, &v,
+                            &attenOutput, &attenLastOutput,
+                            &qForAttentionHolder,
+                            &insertIndexs, &insertPositions,
+                            activeQSizes, activePageSizes,
+                            activePageIndexs, activeLastPageLens,
+                            &generatedAppendParams, &generatedDecodeParams,
+                            batch, block_cnt, i, seqLens,
+                            localQHeads, localKVHeads, head_dim,
+                            rotary_dim, mrope_sections,
+                            rms_norm_eps, rope_base, rope_factor,
+                            rope_type, isPrefill,
+                            &hiddenStates,
+                            pagedCacheLayerOffset,
+                            true, false,
+                            mtpVerifyGraphDeviceState != nullptr,
+                            mtpVerifyGraphDeviceState != nullptr ? 1 : -1,
+                            mtpVerifyGraphDeviceState != nullptr,
+                            graphPagedLayer != nullptr ?
+                                &graphPagedLayer->baseTokenLens : nullptr,
+                            &inputRmsWeight);
+                        Qwen3CudaLinearResidualReduce(
+                            cudaRunner, attenOutput,
+                            *requireLocal(weight[oWeightName], oWeightName),
+                            *requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
+                            attenLastOutput, hiddenStates,
+                            tensorParallel, firstTensorParallelRank, gpuId, true);
+                    }
                 } else {
                     Qwen35ZeroCudaLike(attenLastOutput, hiddenStates, gpuId);
                     addPartialToResidualReduce(attenLastOutput);
@@ -13915,6 +14414,7 @@ namespace fastllm {
         bool mtpVerifyGraphEligible =
             Qwen35CudaGraphEnabled() &&
             Qwen35MtpVerifyCudaGraphEnabled() &&
+            !speculativeCaptureDFlashHiddenStates &&
             speculativeCollectAllLogits &&
             speculativeCaptureFirstTokenLinearState &&
             speculativeLinearStateCaptureSlots > 0 &&

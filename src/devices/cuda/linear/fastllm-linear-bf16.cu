@@ -373,7 +373,14 @@ __global__ void Bf16ToHalfTransposeKernel(const __nv_bfloat16 *src, half *dst, i
 }
 
 void LaunchFastllmGemmFp16Bf16(half *input, __nv_bfloat16 *weight, half *output, half *bias, int n, int m, int k) {
-    if (n == 1) {
+    if (n > 1 &&
+        n < fastllm::FastllmCudaGetLinearExactBatchThreshold()) {
+        for (int i = 0; i < n; ++i) {
+            FastllmGemvFp16Bf16Kernel2MultiRow<256, 1>
+                <<<k, 256>>>(input + (size_t)i * m, weight,
+                             output + (size_t)i * k, bias, m, k);
+        }
+    } else if (n == 1) {
         FastllmGemvFp16Bf16Kernel2MultiRow<256, 1> <<<k, 256>>>(input, weight, output, bias, m, k);
     } else if (n == 2) {
         FastllmGemvFp16Bf16Kernel2MultiRow<256, 2> <<<k, 256>>>(input, weight, output, bias, m, k);
@@ -395,7 +402,14 @@ void LaunchFastllmGemmFp16Bf16(half *input, __nv_bfloat16 *weight, half *output,
 }
 
 void LaunchFastllmGemmBf16Bf16(__nv_bfloat16 *input, __nv_bfloat16 *weight, __nv_bfloat16 *output, __nv_bfloat16 *bias, int n, int m, int k) {
-    if (n == 1) {
+    if (n > 1 &&
+        n < fastllm::FastllmCudaGetLinearExactBatchThreshold()) {
+        for (int i = 0; i < n; ++i) {
+            FastllmGemvBf16Bf16Kernel2MultiRow<256, 1>
+                <<<k, 256>>>(input + (size_t)i * m, weight,
+                             output + (size_t)i * k, bias, m, k);
+        }
+    } else if (n == 1) {
         FastllmGemvBf16Bf16Kernel2MultiRow<256, 1> <<<k, 256>>>(input, weight, output, bias, m, k);
     } else if (n == 2) {
         FastllmGemvBf16Bf16Kernel2MultiRow<256, 2> <<<k, 256>>>(input, weight, output, bias, m, k);
@@ -474,7 +488,9 @@ bool FastllmCudaHalfMatMulBFloat16(const fastllm::Data &input, fastllm::Data &we
     half *cudaBiasData = bias.dims.size() == 0 ? nullptr : (half *)weight.extraCudaHalfData[0];
     __nv_bfloat16 *weightPtr = (__nv_bfloat16 *)weight.cudaData;
 
-    if (n < 8) {
+    bool exactRows = n > 1 &&
+        n < fastllm::FastllmCudaGetLinearExactBatchThreshold();
+    if (n < 8 || exactRows) {
         LaunchFastllmGemmFp16Bf16(cudaInput, weightPtr, cudaOutput, cudaBiasData, n, m, k);
     } else if (false) {
         auto fastllmCublasHandle = getFastllmCublasHandle();
@@ -596,7 +612,9 @@ bool FastllmCudaBFloat16MatMulBFloat16(const fastllm::Data &input, fastllm::Data
     __nv_bfloat16 *cudaBiasData = bias.dims.size() == 0 ? nullptr : (__nv_bfloat16 *)weight.extraCudaData[1];
     __nv_bfloat16 *weightPtr = (__nv_bfloat16 *)weight.cudaData;
 
-    if (n < 8) {
+    bool exactRows = n > 1 &&
+        n < fastllm::FastllmCudaGetLinearExactBatchThreshold();
+    if (n < 8 || exactRows) {
         LaunchFastllmGemmBf16Bf16(cudaInput, weightPtr, cudaOutput, cudaBiasData, n, m, k);
     } else {
         auto fastllmCublasHandle = getFastllmCublasHandle();

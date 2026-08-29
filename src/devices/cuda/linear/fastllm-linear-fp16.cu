@@ -86,7 +86,8 @@ __global__ void FastllmGemvBf16Fp16Kernel2MultiRow(__nv_bfloat16 *A, half *B, __
     }
 }
 
-template <int THREAD_PER_BLOCK, int PART, bool WITH_SHARED_GATE>
+template <int THREAD_PER_BLOCK, int PART, bool WITH_SHARED_GATE,
+          bool INDEPENDENT_ROW_REDUCTION = false>
 __global__ void FastllmGemvFp16Fp16Kernel2MultiRow(
         half *A, half *B, half *C, half *bias, int m, int k, bool addTo,
         half *sharedGateB, half *sharedGateC, bool sigmoidSharedGate) {
@@ -141,18 +142,68 @@ __global__ void FastllmGemvFp16Fp16Kernel2MultiRow(
         }
     }
     __syncthreads();
-    float diff = 0.0f;
-    for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            #pragma unroll
+    float diff[INDEPENDENT_ROW_REDUCTION ? PART : 1];
+#pragma unroll
+    for (int x = 0; x < (INDEPENDENT_ROW_REDUCTION ? PART : 1); x++) {
+        diff[x] = 0.0f;
+    }
+    if constexpr (INDEPENDENT_ROW_REDUCTION) {
+        // Preserve the legacy 256-thread compensated tree through stride 32,
+        // then execute the identical final five stages with warp shuffles.
+        // This removes five CTA barriers from every exact verifier GEMV
+        // without changing the operation order of any output row.
+        for (unsigned int s = THREAD_PER_BLOCK / 2; s >= 32; s >>= 1) {
+            if (tid < s) {
+#pragma unroll
+                for (int x = 0; x < PART; x++) {
+                    float other = sdata[x][tid + s] - diff[x];
+                    float sumTmp = sdata[x][tid] + other;
+                    diff[x] = (sumTmp - sdata[x][tid]) - other;
+                    sdata[x][tid] = sumTmp;
+                }
+            }
+            __syncthreads();
+        }
+        if (tid < 32) {
+            float values[PART];
+#pragma unroll
             for (int x = 0; x < PART; x++) {
-                float other = sdata[x][tid + s] - diff;
-                float sumTmp = sdata[x][tid] + other;
-                diff = (sumTmp - sdata[x][tid]) - other;
-                sdata[x][tid] = sumTmp;
+                values[x] = sdata[x][tid];
+            }
+#pragma unroll
+            for (int s = 16; s > 0; s >>= 1) {
+#pragma unroll
+                for (int x = 0; x < PART; x++) {
+                    float rhs = __shfl_down_sync(
+                        0xffffffffu, values[x], s);
+                    if (tid < (unsigned int)s) {
+                        float other = rhs - diff[x];
+                        float sumTmp = values[x] + other;
+                        diff[x] = (sumTmp - values[x]) - other;
+                        values[x] = sumTmp;
+                    }
+                }
+            }
+            if (tid == 0) {
+#pragma unroll
+                for (int x = 0; x < PART; x++) {
+                    sdata[x][0] = values[x];
+                }
             }
         }
-        __syncthreads();
+    } else {
+        for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
+            if (tid < s) {
+#pragma unroll
+                for (int x = 0; x < PART; x++) {
+                    float other = sdata[x][tid + s] - diff[0];
+                    float sumTmp = sdata[x][tid] + other;
+                    diff[0] = (sumTmp - sdata[x][tid]) - other;
+                    sdata[x][tid] = sumTmp;
+                }
+            }
+            __syncthreads();
+        }
     }
 
     if (tid == 0) {
@@ -175,17 +226,21 @@ __global__ void FastllmGemvFp16Fp16Kernel2MultiRow(
 #pragma unroll
             for (int x = 0; x < PART; x++) {
                 float val = sdata[x][0] + (float)(__ldg(bias + p));
-                C[p + k * x] = addTo ? (half)(val + (float)C[p + k * x]) : (half)val;
+                C[p + k * x] = addTo ?
+                    (half)(val + (float)C[p + k * x]) : (half)val;
             }
         } else {
 #pragma unroll
             for (int x = 0; x < PART; x++) {
                 float val = sdata[x][0];
-                C[p + k * x] = addTo ? (half)(val + (float)C[p + k * x]) : (half)val;
+                C[p + k * x] = addTo ?
+                    (half)(val + (float)C[p + k * x]) : (half)val;
             }
         }
     }
-    __syncthreads();
+    if constexpr (!INDEPENDENT_ROW_REDUCTION) {
+        __syncthreads();
+    }
 }
 
 // Batch-1 projection specialization for the two input widths used by Qwen3.5
@@ -666,6 +721,28 @@ bool FastllmCudaMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight,
 void LaunchFastllmGemmFp16Fp16(half *input, half *weight, half *output, half *bias,
                                int n, int m, int k, bool addTo,
                                bool allowRouterSpecialization) {
+    // DFlash verification must retain the compensated reduction state of each
+    // q1 row independently.  A PART=n launch still lets those rows share each
+    // weight read without changing their per-row accumulation order.
+    const bool exactRows = n > 1 && n <= 8 &&
+        n < fastllm::FastllmCudaGetLinearExactBatchThreshold();
+#define FASTLLM_FP16_EXACT_LAUNCH(PARTVAL) \
+    FastllmGemvFp16Fp16Kernel2MultiRow<256, PARTVAL, false, true> \
+        <<<k, 256>>>(input, weight, output, bias, m, k, addTo, \
+                     nullptr, nullptr, false)
+    if (exactRows) {
+        switch (n) {
+            case 2: FASTLLM_FP16_EXACT_LAUNCH(2); return;
+            case 3: FASTLLM_FP16_EXACT_LAUNCH(3); return;
+            case 4: FASTLLM_FP16_EXACT_LAUNCH(4); return;
+            case 5: FASTLLM_FP16_EXACT_LAUNCH(5); return;
+            case 6: FASTLLM_FP16_EXACT_LAUNCH(6); return;
+            case 7: FASTLLM_FP16_EXACT_LAUNCH(7); return;
+            case 8: FASTLLM_FP16_EXACT_LAUNCH(8); return;
+            default: break;
+        }
+    }
+#undef FASTLLM_FP16_EXACT_LAUNCH
     if (allowRouterSpecialization && n == 1 && m == 2048 && k == 256 &&
         bias == nullptr && !addTo) {
         FastllmGemvFp16Fp16Router2048x256Kernel<false><<<k, 64>>>(
@@ -741,6 +818,10 @@ void LaunchFastllmGemmFp16Fp16AddToNoBias(half *input, half *weight, half *outpu
 
 FastllmCudaLinearFp16Path FastllmCudaResolveLinearFp16AutoPath(
         int n, int m, int k, bool addTo, bool hasBias) {
+    if (n >= 1 && n <= 8 &&
+        n < fastllm::FastllmCudaGetLinearExactBatchThreshold()) {
+        return FASTLLM_CUDA_LINEAR_FP16_PATH_NATIVE;
+    }
     if (n >= 1 && n < 8) {
         return FASTLLM_CUDA_LINEAR_FP16_PATH_NATIVE;
     }

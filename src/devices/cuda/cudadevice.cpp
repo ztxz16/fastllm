@@ -38,6 +38,15 @@
 namespace fastllm {
     // CUDA graph replay cannot reuse a MergeMOE path that picked experts on CPU.
     static thread_local bool cudaMergeMOEUsedGraphUnsafeFallback = false;
+    static thread_local int cudaLinearExactBatchThreshold = 0;
+
+    int FastllmCudaGetLinearExactBatchThreshold() {
+        return cudaLinearExactBatchThreshold;
+    }
+
+    void FastllmCudaSetLinearExactBatchThreshold(int threshold) {
+        cudaLinearExactBatchThreshold = std::max(0, threshold);
+    }
 
     void FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag() {
         cudaMergeMOEUsedGraphUnsafeFallback = false;
@@ -2127,7 +2136,9 @@ namespace fastllm {
             return false;
         }
 
-        int minBatch = CudaEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 8);
+        int minBatch = std::max(
+            CudaEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 8),
+            FastllmCudaGetLinearExactBatchThreshold());
         if (n < minBatch) {
             return false;
         }
@@ -2372,6 +2383,7 @@ namespace fastllm {
                 "FASTLLM_CUDA_CUTLASS_LINEAR_FP8", true) ||
             !CudaLinearFp8IsPerChannelWeight(weight, m, k) ||
             n <= 0 || (m % 16) != 0 || (k % 4) != 0 ||
+            n < FastllmCudaGetLinearExactBatchThreshold() ||
             input.dataDevice != DataDevice::CUDA ||
             input.cudaData == nullptr ||
             (input.dataType != DataType::FLOAT16 &&
@@ -2584,6 +2596,10 @@ namespace fastllm {
         Data &input, Data &weight, const Data &bias, Data &output, int n, int m, int k) {
         if (!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON") ||
             !CudaEnvFlagDefaultEnabled("FASTLLM_CUDA_TRITON_LINEAR_FP8", true)) {
+            return false;
+        }
+        int minBatchOverride = FastllmCudaGetLinearExactBatchThreshold();
+        if (n < minBatchOverride) {
             return false;
         }
 
@@ -5210,7 +5226,9 @@ namespace fastllm {
             return false;
         }
         int n = input.Count(0) / gateup;
-        int minBatch = CudaEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 8);
+        int minBatch = std::max(
+            CudaEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 8),
+            FastllmCudaGetLinearExactBatchThreshold());
         if (n < minBatch) {
             return false;
         }

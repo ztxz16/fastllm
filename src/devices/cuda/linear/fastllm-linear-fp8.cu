@@ -328,8 +328,15 @@ __global__ void FastllmGemvHalfFP8E4M3Kernel1MultiRow(half *A, uint8_t *B, half 
 // Pack 4 sequential FP8-E4M3 bytes into 2×half2 via high-byte layout + >>1
 // (same numeric mapping as the previous per-byte shift path).
 __device__ __forceinline__ void FastllmDequantFp8E4M3x4(uint32_t bb, half2 &h01, half2 &h23) {
-    uint32_t q01 = ((bb & 0x000000FFu) << 8) | ((bb & 0x0000FF00u) << 16);
-    uint32_t q23 = ((bb & 0x00FF0000u) >> 8) | (bb & 0xFF000000u);
+#if __CUDA_ARCH__ >= 1200
+    uint32_t q01 = __byte_perm(bb, 0u, 0x1404);
+    uint32_t q23 = __byte_perm(bb, 0u, 0x3424);
+#else
+    uint32_t q01 = ((bb & 0x000000FFu) << 8) |
+                   ((bb & 0x0000FF00u) << 16);
+    uint32_t q23 = ((bb & 0x00FF0000u) >> 8) |
+                   (bb & 0xFF000000u);
+#endif
     uint32_t o01 = (q01 & 0x80008000u) | ((q01 & 0x7F007F00u) >> 1);
     uint32_t o23 = (q23 & 0x80008000u) | ((q23 & 0x7F007F00u) >> 1);
     h01 = *reinterpret_cast<const half2 *>(&o01);
@@ -554,6 +561,16 @@ void LaunchFastllmGemmFp32FP8E4M3(float *input, uint8_t *weight, float *output, 
 void LaunchFastllmGemmFp16FP8E4M3(half *input, uint8_t *weight, half *output, half *bias, float *scales, int n, int m, int k, int blockM, int blockK) {
     // m 不是 16 的倍数时, 无法安全使用 uint4 向量化加载, 回退到旧 kernel。
     if ((m & 15) != 0) {
+        const bool exactRows = n > 1 &&
+            n < fastllm::FastllmCudaGetLinearExactBatchThreshold();
+        if (exactRows) {
+            for (int i = 0; i < n; ++i) {
+                FastllmGemvHalfFP8E4M3Kernel1MultiRow<64, 1>
+                    <<<k, 64>>>(input + i * m, weight, output + i * k,
+                                bias, scales, m, k, blockM, blockK);
+            }
+            return;
+        }
         int i = 0;
         for (; i + 15 < n; i += 16) {
             FastllmGemvHalfFP8E4M3Kernel1MultiRow<64, 16> <<< k, 64 >>>(input + i * m, weight, output + i * k, bias, scales, m, k, blockM, blockK);
@@ -575,6 +592,52 @@ void LaunchFastllmGemmFp16FP8E4M3(half *input, uint8_t *weight, half *output, ha
     constexpr int ROWS = 4;
     const int grid = (k + W * ROWS - 1) / (W * ROWS);
     const bool useBlock128 = (blockM == 128 && blockK == 128 && (m & 127) == 0);
+    const bool exactRows = n > 1 &&
+        n < fastllm::FastllmCudaGetLinearExactBatchThreshold();
+
+    // PART=8 with four output rows per warp needs 128 registers/thread on
+    // current nvcc. SM120 benefits from trading cache-resident activation
+    // reloads for occupancy, with the best tradeoff depending on the output
+    // width. Every layout below preserves each row's q1 accumulation order.
+    // Other architectures retain the established layout below.
+    if (exactRows && n == 8 && useBlock128) {
+        static thread_local const int exactArch = FastllmCudaRuntimeArch();
+        const bool tunedArch = exactArch == 120 || exactArch == 121;
+        if (tunedArch && k >= 12288) {
+            constexpr int EXACT_W = 4;
+            constexpr int EXACT_ROWS = 1;
+            const int exactGrid =
+                (k + EXACT_W * EXACT_ROWS - 1) /
+                (EXACT_W * EXACT_ROWS);
+            FastllmGemvHalfFP8E4M3KernelWarpMultiRowBlock128
+                <EXACT_W, 8, EXACT_ROWS>
+                <<<exactGrid, EXACT_W * 32>>>(
+                    input, weight, output, bias, scales, m, k);
+            return;
+        } else if (tunedArch && k < 6144) {
+            constexpr int EXACT_W = 2;
+            constexpr int EXACT_ROWS = 2;
+            const int exactGrid =
+                (k + EXACT_W * EXACT_ROWS - 1) /
+                (EXACT_W * EXACT_ROWS);
+            FastllmGemvHalfFP8E4M3KernelWarpMultiRowBlock128
+                <EXACT_W, 8, EXACT_ROWS>
+                <<<exactGrid, EXACT_W * 32>>>(
+                    input, weight, output, bias, scales, m, k);
+            return;
+        } else if (tunedArch) {
+            constexpr int EXACT_W = 2;
+            constexpr int EXACT_ROWS = 1;
+            const int exactGrid =
+                (k + EXACT_W * EXACT_ROWS - 1) /
+                (EXACT_W * EXACT_ROWS);
+            FastllmGemvHalfFP8E4M3KernelWarpMultiRowBlock128
+                <EXACT_W, 8, EXACT_ROWS>
+                <<<exactGrid, EXACT_W * 32>>>(
+                    input, weight, output, bias, scales, m, k);
+            return;
+        }
+    }
 
     // Six-token speculative verification is the dominant FP8 shape on the
     // target model.  Two output rows per warp expose twice as many blocks and
@@ -745,6 +808,12 @@ template <int WARPS_PER_BLOCK, int PART>
 __global__ void FastllmGemvHalfFP8E4M3Block128KernelWarpMultiRow(
         const half * __restrict__ A, const uint8_t * __restrict__ B, half * __restrict__ C,
         const half * __restrict__ bias, int m, int k, int perRow) {
+    // grid.y is normally one.  Exact speculative verification uses one
+    // independent PART=1 block row for every token so that it executes the
+    // same template instantiation (and therefore the same FP16 arithmetic)
+    // as ordinary single-token decode.
+    A += (size_t)blockIdx.y * m;
+    C += (size_t)blockIdx.y * k;
     const int warpId = threadIdx.x >> 5;
     const int laneId = threadIdx.x & 31;
     const int st = blockIdx.x * WARPS_PER_BLOCK + warpId;
@@ -813,12 +882,19 @@ __global__ void FastllmGemvHalfFP8E4M3Block128KernelWarpMultiRow(
     }
 }
 
-void LaunchFastllmGemmFp16FP8E4M3Block128(half *input, uint8_t *weight, half *output, half *bias, int n, int m, int k, int perRow) {
+void LaunchFastllmGemmFp16FP8E4M3Block128(half *input, uint8_t *weight, half *output, half *bias, int n, int m, int k, int perRow, bool exactRows) {
     constexpr int W = 8; // 每个 block 8 个 warp (256 线程)
     const int grid = (k + W - 1) / W;
 #define FASTLLM_FP8_B128_WARP_LAUNCH(PARTVAL, AOFF, COFF) \
     FastllmGemvHalfFP8E4M3Block128KernelWarpMultiRow<W, PARTVAL> <<< grid, W * 32 >>>( \
         input + (AOFF) * m, weight, output + (COFF) * k, bias, m, k, perRow)
+
+    if (exactRows && n > 1) {
+        FastllmGemvHalfFP8E4M3Block128KernelWarpMultiRow<W, 1>
+            <<<dim3(grid, n), W * 32>>>(
+                input, weight, output, bias, m, k, perRow);
+        return;
+    }
 
     switch (n) {
         case 1:  FASTLLM_FP8_B128_WARP_LAUNCH(1, 0, 0);  return;
@@ -1340,6 +1416,15 @@ __global__ void FastllmGemvBF16FP8E4M3Kernel1MultiRow(__nv_bfloat16 *A, uint8_t 
 }
 
 void LaunchFastllmGemmBF16FP8E4M3(__nv_bfloat16 *input, uint8_t *weight, __nv_bfloat16 *output, __nv_bfloat16 *bias, float *scales, int n, int m, int k, int blockM, int blockK) {
+    if (n > 1 &&
+        n < fastllm::FastllmCudaGetLinearExactBatchThreshold()) {
+        for (int i = 0; i < n; ++i) {
+            FastllmGemvBF16FP8E4M3Kernel1MultiRow<64, 1>
+                <<<k, 64>>>(input + i * m, weight, output + i * k,
+                            bias, scales, m, k, blockM, blockK);
+        }
+        return;
+    }
     if (n == 1) {
         FastllmGemvBF16FP8E4M3Kernel1MultiRow<64, 1> <<< k, 64 >>>(input, weight, output, bias, scales, m, k, blockM, blockK);
     } else if (n == 2) {
@@ -1533,7 +1618,11 @@ bool FastllmCudaHalfMatMulFloatFP8E4M3Block128(const fastllm::Data &input, fastl
 
         FastllmReleaseDequantScratch(cudaFp16Weight, ownScratch);
     } else {
-        LaunchFastllmGemmFp16FP8E4M3Block128(cudaInput, (uint8_t*)weight.cudaData, cudaOutput, cudaBiasData, n, m, k, perRow);
+        bool exactRows = n > 1 &&
+            n < fastllm::FastllmCudaGetLinearExactBatchThreshold();
+        LaunchFastllmGemmFp16FP8E4M3Block128(
+            cudaInput, (uint8_t*)weight.cudaData, cudaOutput, cudaBiasData,
+            n, m, k, perRow, exactRows);
     }
 
     FastllmCudaFinishInput(input, cudaInput);
@@ -1727,6 +1816,8 @@ template <int WARPS_PER_BLOCK, int PART, typename OutputType>
 __global__ void FastllmGemvBF16FP8E4M3Block128KernelWarpMultiRow(
         const __nv_bfloat16 * __restrict__ A, const uint8_t * __restrict__ B, OutputType * __restrict__ C,
         const __nv_bfloat16 * __restrict__ bias, int m, int k, int perRow) {
+    A += (size_t)blockIdx.y * m;
+    C += (size_t)blockIdx.y * k;
     const int warpId = threadIdx.x >> 5;
     const int laneId = threadIdx.x & 31;
     const int st = blockIdx.x * WARPS_PER_BLOCK + warpId;
@@ -1811,6 +1902,14 @@ void LaunchFastllmGemmBF16FP8E4M3Block128(
 #define FASTLLM_BF16_FP8_B128_WARP_LAUNCH(PARTVAL, AOFF, COFF) \
     FastllmGemvBF16FP8E4M3Block128KernelWarpMultiRow<W, PARTVAL> <<< grid, W * 32 >>>( \
         input + (AOFF) * m, weight, output + (COFF) * k, bias, m, k, perRow)
+
+    if (n > 1 &&
+        n < fastllm::FastllmCudaGetLinearExactBatchThreshold()) {
+        FastllmGemvBF16FP8E4M3Block128KernelWarpMultiRow<W, 1>
+            <<<dim3(grid, n), W * 32>>>(
+                input, weight, output, bias, m, k, perRow);
+        return;
+    }
 
     switch (n) {
         case 1:  FASTLLM_BF16_FP8_B128_WARP_LAUNCH(1, 0, 0);  return;

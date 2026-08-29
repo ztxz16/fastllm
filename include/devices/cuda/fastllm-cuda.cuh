@@ -886,6 +886,10 @@ extern "C" bool FastllmCudaDeepSeekV4WoADeepGemmSm120(
                               fastllm::Data &output);
 #endif
 namespace fastllm {
+// Verifier batches below this thread-local threshold must use a native linear
+// path whose arithmetic is equivalent to independent single-token decoding.
+int FastllmCudaGetLinearExactBatchThreshold();
+void FastllmCudaSetLinearExactBatchThreshold(int threshold);
 bool FastllmCudaTryTritonDeepSeekV4WoA(const Data &o, Data &woA,
                                        int groups, int oRank, Data &output);
 bool FastllmCudaTryCombinedBaSigmoidMambaSoftplus(

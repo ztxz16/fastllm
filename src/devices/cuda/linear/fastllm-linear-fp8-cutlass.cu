@@ -1263,8 +1263,10 @@ static bool FastllmCudaCutlassLinearFP8E4M3Block128FromGdnOutputGateImpl(
         return true;
     };
 
-    int minBatch = FastllmCutlassEnvInt(
-        "FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 8);
+    int minBatch = std::max(
+        FastllmCutlassEnvInt(
+            "FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 8),
+        fastllm::FastllmCudaGetLinearExactBatchThreshold());
     if (!FastllmCutlassUseWarpQuant() ||
         batch <= 0 || seqLen <= 0 || gateOffset < 0 ||
         gateHeads <= 0 || n < minBatch ||
@@ -1456,7 +1458,9 @@ static bool FastllmCudaCutlassLinearFP8E4M3Block128FromSwigluImpl(
     if (!FastllmCutlassUseFusedSwigluQuant() || !FastllmCutlassUseWarpQuant()) {
         return false;
     }
-    int minBatch = FastllmCutlassEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 8);
+    int minBatch = std::max(
+        FastllmCutlassEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 8),
+        fastllm::FastllmCudaGetLinearExactBatchThreshold());
     if (n < minBatch) {
         return false;
     }
