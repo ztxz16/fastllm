@@ -786,6 +786,13 @@ bool FastllmCudaDots3NotePackAttentionKey(
         const fastllm::Data &kv, const fastllm::Data &rope,
         int nopeDim, fastllm::Data &output);
 
+// Pack the main-attention value directly from the per-head value portion of
+// the combined KV projection. The logical output is [heads, tokens, valueDim];
+// physical output strides are preserved for pooled-cache capacity padding.
+bool FastllmCudaDots3NotePackAttentionValue(
+        const fastllm::Data &kv, int nopeDim, int valueDim,
+        fastllm::Data &output);
+
 bool FastllmCudaDots3NoteQuantizeIndexer(
         const fastllm::Data &qRope, const fastllm::Data &qNope,
         const fastllm::Data &k,

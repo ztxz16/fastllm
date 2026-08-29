@@ -180,6 +180,25 @@ __global__ void PackAttentionKeyKernel(
     }
 }
 
+__global__ void PackAttentionValueKernel(
+        const __nv_bfloat16 *kv, __nv_bfloat16 *output,
+        uint64_t elements, int tokens, int nopeDim, int valueDim,
+        uint64_t kvHeadStride, uint64_t kvTokenStride,
+        uint64_t outputHeadStride, uint64_t outputTokenStride) {
+    uint64_t index = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= elements) {
+        return;
+    }
+    int d = index % valueDim;
+    uint64_t row = index / valueDim;
+    int token = row % tokens;
+    int head = row / tokens;
+    output[(uint64_t)head * outputHeadStride +
+           (uint64_t)token * outputTokenStride + d] =
+        kv[(uint64_t)head * kvHeadStride +
+           (uint64_t)token * kvTokenStride + nopeDim + d];
+}
+
 __global__ void IndexerLogitsTiledKernel(
         const uint8_t *q, const uint8_t *k, const float *kScales,
         const float *weights, float *logits,
@@ -1343,6 +1362,38 @@ bool FastllmCudaDots3NotePackAttentionKey(
         (__nv_bfloat16 *)output.cudaData, elements, tokens,
         nopeDim, ropeDim,
         kv.strides[0], kv.strides[1], rope.strides[0],
+        output.strides[0], output.strides[1]);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool FastllmCudaDots3NotePackAttentionValue(
+        const fastllm::Data &kv, int nopeDim, int valueDim,
+        fastllm::Data &output) {
+    if (nopeDim <= 0 || valueDim <= 0 ||
+        kv.dataDevice != fastllm::DataDevice::CUDA ||
+        kv.dataType != fastllm::DataType::BFLOAT16 ||
+        kv.cudaData == nullptr || kv.dims.size() != 3 ||
+        kv.dims[0] <= 0 || kv.dims[1] <= 0 ||
+        kv.dims[2] < nopeDim + valueDim || kv.strides[2] != 1) {
+        return false;
+    }
+    int device = GetPointerDeviceId(kv.cudaData);
+    if (device < 0) {
+        return false;
+    }
+    FastllmCudaSetDevice(device);
+    int heads = kv.dims[0];
+    int tokens = kv.dims[1];
+    if (!PrepareOutput(output, fastllm::DataType::BFLOAT16,
+                       {heads, tokens, valueDim})) {
+        return false;
+    }
+    uint64_t elements = (uint64_t)heads * tokens * valueDim;
+    int blocks = (int)((elements + 255) / 256);
+    PackAttentionValueKernel<<<blocks, 256, 0, cudaStreamPerThread>>>(
+        (const __nv_bfloat16 *)kv.cudaData,
+        (__nv_bfloat16 *)output.cudaData, elements, tokens,
+        nopeDim, valueDim, kv.strides[0], kv.strides[1],
         output.strides[0], output.strides[1]);
     return cudaGetLastError() == cudaSuccess;
 }

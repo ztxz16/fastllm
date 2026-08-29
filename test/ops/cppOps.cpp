@@ -3393,6 +3393,66 @@ namespace {
             }
         }
 
+        void ValidateAttentionValuePacking() {
+            constexpr int heads = 2;
+            constexpr int tokens = 3;
+            constexpr int capacity = 5;
+            constexpr int nopeDim = 3;
+            constexpr int valueDim = 2;
+            constexpr int kvDim = nopeDim + valueDim;
+
+            fastllm::Data kv = MakeTensor(
+                {heads, tokens, kvDim}, 0.137f, 0.5f);
+            fastllm::ToDataType(kv, fastllm::DataType::BFLOAT16);
+            std::vector<float> kvValues =
+                ToFloatVector(ConvertToFloat32Data(kv));
+            kv.ToDevice(fastllm::DataDevice::CUDA);
+
+            fastllm::Data packed(fastllm::DataType::BFLOAT16);
+            packed.ToDevice(fastllm::DataDevice::CUDA, {0}, false);
+            packed.Expansion({heads, capacity, valueDim});
+            packed.Resize({heads, tokens, valueDim});
+            if (!FastllmCudaDots3NotePackAttentionValue(
+                    kv, nopeDim, valueDim, packed)) {
+                throw std::runtime_error(
+                    "Dots attention-value packing CUDA launch failed");
+            }
+            ForceDeviceSync();
+            if (packed.strides[0] <= tokens * valueDim) {
+                throw std::runtime_error(
+                    "Dots attention-value test did not create a padded head stride");
+            }
+            std::vector<uint8_t> packedBytes = ToBytes(packed);
+            for (int head = 0; head < heads; ++head) {
+                for (int token = 0; token < tokens; ++token) {
+                    for (int d = 0; d < valueDim; ++d) {
+                        size_t outputOffset =
+                            ((size_t)head * tokens + token) * valueDim + d;
+                        size_t physicalOffset =
+                            (size_t)head * packed.strides[0] +
+                            (size_t)token * packed.strides[1] + d;
+                        uint16_t actualBits;
+                        std::memcpy(&actualBits,
+                                    packedBytes.data() +
+                                        physicalOffset * sizeof(actualBits),
+                                    sizeof(actualBits));
+                        float actual =
+                            fastllm::BFloat16BitsToFloat32(actualBits);
+                        float expected = kvValues[
+                            ((size_t)head * tokens + token) * kvDim +
+                            nopeDim + d];
+                        if (actual != expected) {
+                            std::ostringstream os;
+                            os << "Dots attention-value packing mismatch at "
+                               << outputOffset << ": expected=" << expected
+                               << " actual=" << actual;
+                            throw std::runtime_error(os.str());
+                        }
+                    }
+                }
+            }
+        }
+
         void ValidateTopK() {
             const fastllm::FP8E4M3ToFP32Manager fp8;
             std::vector<uint8_t> qRaw = ToBytes(qFp8);
@@ -3980,6 +4040,7 @@ namespace {
         void Init(const OpTestParams &params) {
             FastllmCudaSetDevice(0);
             ValidateAttentionKeyPacking();
+            ValidateAttentionValuePacking();
             queryTokens = params.GetInt("queries");
             totalTokens = params.GetInt("keys");
             path = params.GetString("path");

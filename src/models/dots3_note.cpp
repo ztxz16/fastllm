@@ -1332,19 +1332,24 @@ namespace fastllm {
             PermuteSelf(kv, {0, 2, 1, 3});
             kv.Reshape({config.numHeads, seqlen,
                         config.qkNopeHeadDim + config.vHeadDim});
-            Data &currentValue = directFreshFullPrefill
-                                     ? pastValue : value;
             if (directFreshFullPrefill) {
                 int capacity = ((seqlen - 1) / 128 + 1) * 128;
                 prepareFreshPooledCache(
                     pastValue,
                     {config.numHeads, seqlen, config.vHeadDim},
                     {config.numHeads, capacity, config.vHeadDim});
+#ifdef USE_CUDA
+                AssertInFastLLM(
+                    FastllmCudaDots3NotePackAttentionValue(
+                        kv, config.qkNopeHeadDim, config.vHeadDim,
+                        pastValue),
+                    "FastLLM Dots3-Note failed to pack the attention V tensor.\n");
+#endif
             } else {
                 Split(kv, -1, 0, config.qkNopeHeadDim, kNope);
+                Split(kv, -1, config.qkNopeHeadDim,
+                      config.qkNopeHeadDim + config.vHeadDim, value);
             }
-            Split(kv, -1, config.qkNopeHeadDim,
-                  config.qkNopeHeadDim + config.vHeadDim, currentValue);
             if (!directFreshFullPrefill) {
                 kv.FreeSpace();
             }
