@@ -14,6 +14,10 @@
 #include "json11.hpp"
 #include "utils.h"
 
+#ifdef USE_CUDA
+#include "fastllm-cuda.cuh"
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -374,6 +378,13 @@ namespace fastllm {
         AssertInFastLLM(this->indexerKvHeads == 1 &&
                         this->indexerBudget % this->indexerCompressRatio == 0,
                         "Qwen4-Exp QSA requires one KV head and a divisible token budget.");
+
+        const float linearInvScale =
+            1.0f / std::sqrt((float)this->head_k_dim);
+        Data linearInvScaleData(
+            DataType::FLOAT32, {this->head_k_dim},
+            std::vector<float>(this->head_k_dim, linearInvScale));
+        this->linearInvScaleData.CopyFrom(linearInvScaleData);
 
         // Deterministic PLE hash metadata.  Rebuilding it avoids truncating the
         // checkpoint's uint64 multipliers through FastLLM's int32 parameter
@@ -1605,54 +1616,11 @@ namespace fastllm {
 
         const int keyDimension = this->num_k_heads * this->head_k_dim;
         const int valueDimension = this->num_v_heads * this->head_v_dim;
-        Data query, key, value;
-        Split(currentConvolved, -1, 0, keyDimension, query);
-        Split(currentConvolved, -1, keyDimension, 2 * keyDimension, key);
-        Split(currentConvolved, -1, 2 * keyDimension,
-              2 * keyDimension + valueDimension, value);
-        query.Reshape({batch, sequence, this->num_k_heads, this->head_k_dim});
-        key.Reshape({batch, sequence, this->num_k_heads, this->head_k_dim});
-        value.Reshape({batch, sequence, this->num_v_heads, this->head_v_dim});
-
-        const int repeat = this->num_v_heads / this->num_k_heads;
-        if (repeat > 1) {
-            Data expandedQuery, expandedKey;
-            query.Reshape({batch, sequence, this->num_k_heads, 1,
-                           this->head_k_dim});
-            key.Reshape({batch, sequence, this->num_k_heads, 1,
-                         this->head_k_dim});
-            Repeat(query, 3, repeat, expandedQuery);
-            Repeat(key, 3, repeat, expandedKey);
-            expandedQuery.Reshape({batch, sequence, this->num_v_heads,
-                                   this->head_k_dim});
-            expandedKey.Reshape({batch, sequence, this->num_v_heads,
-                                 this->head_k_dim});
-            query.CopyFrom(expandedQuery);
-            key.CopyFrom(expandedKey);
-        }
-
         const float inverseHead = 1.0f / std::sqrt((float)this->head_k_dim);
-        Data l2Weight(DataType::FLOAT32, {this->head_k_dim},
-                      std::vector<float>(this->head_k_dim, inverseHead));
-        RMSNorm(query, l2Weight, 1e-6f, query);
-        RMSNorm(key, l2Weight, 1e-6f, key);
         Sigmoid(beta, beta);
         Data decay;
         MambaSoftplus(alpha, this->weight[linear + "A_log"],
                       this->weight[linear + "dt_bias"], decay);
-        if (!mixedGdnPrefill) {
-            ToDataType(query, DataType::FLOAT32);
-            ToDataType(key, DataType::FLOAT32);
-            ToDataType(value, DataType::FLOAT32);
-            ToDataType(beta, DataType::FLOAT32);
-            ToDataType(decay, DataType::FLOAT32);
-        }
-
-        PermuteSelf(query, {0, 2, 1, 3});
-        PermuteSelf(key, {0, 2, 1, 3});
-        PermuteSelf(value, {0, 2, 1, 3});
-        PermuteSelf(beta, {0, 2, 1});
-        PermuteSelf(decay, {0, 2, 1});
 
         // Qwen3.5 and Qwen4 share this standard chunk-GDN operation.  CUDA
         // prefill keeps the projected activations in float16 and uses the
@@ -1661,35 +1629,112 @@ namespace fastllm {
         // types retain the float32 reference path.
         constexpr int chunkSize = 64;
         const int padding = (chunkSize - sequence % chunkSize) % chunkSize;
+        Data query, key, value;
+        Data normalizedQuery, normalizedKey;
         Data scaledQuery, paddedKey, paddedValue, paddedBeta, paddedDecay;
-        Data *chunkKey, *chunkValue, *chunkBeta, *chunkDecay;
-        if (padding > 0) {
-            Data paddedQuery;
-            Pad(query, 2, padding, paddedQuery);
-            Pad(key, 2, padding, paddedKey);
-            Pad(value, 2, padding, paddedValue);
-            Pad(beta, 2, padding, paddedBeta);
-            Pad(decay, 2, padding, paddedDecay);
-            Mul(paddedQuery, inverseHead, scaledQuery);
+        Data keyBeta, valueBeta;
+        Data *chunkKey = nullptr;
+        Data *chunkDecay = nullptr;
+        bool fusedPostConv = false;
+
+        if (this->linearInvScaleData.dataDevice !=
+                currentConvolved.dataDevice ||
+            this->linearInvScaleData.dataDeviceIds !=
+                currentConvolved.dataDeviceIds) {
+            this->linearInvScaleData.ToDevice(
+                currentConvolved.dataDevice,
+                currentConvolved.dataDeviceIds);
+        }
+#ifdef USE_CUDA
+        if (mixedGdnPrefill) {
+            fusedPostConv = FastllmCudaTryTritonChunkGdnPostConv(
+                currentConvolved, this->linearInvScaleData,
+                decay, beta,
+                batch, sequence, this->num_k_heads, this->num_v_heads,
+                this->head_k_dim, this->head_v_dim,
+                1e-6f, inverseHead,
+                normalizedQuery, normalizedKey,
+                scaledQuery, paddedKey, paddedValue,
+                paddedDecay, paddedBeta, keyBeta, valueBeta);
+        }
+#endif
+        if (fusedPostConv) {
             chunkKey = &paddedKey;
-            chunkValue = &paddedValue;
-            chunkBeta = &paddedBeta;
             chunkDecay = &paddedDecay;
         } else {
-            Mul(query, inverseHead, scaledQuery);
-            chunkKey = &key;
-            chunkValue = &value;
-            chunkBeta = &beta;
-            chunkDecay = &decay;
-        }
+            Split(currentConvolved, -1, 0, keyDimension, query);
+            Split(currentConvolved, -1, keyDimension, 2 * keyDimension, key);
+            Split(currentConvolved, -1, 2 * keyDimension,
+                  2 * keyDimension + valueDimension, value);
+            query.Reshape(
+                {batch, sequence, this->num_k_heads, this->head_k_dim});
+            key.Reshape(
+                {batch, sequence, this->num_k_heads, this->head_k_dim});
+            value.Reshape(
+                {batch, sequence, this->num_v_heads, this->head_v_dim});
 
-        chunkBeta->Resize({chunkBeta->dims[0], chunkBeta->dims[1],
-                           chunkBeta->dims[2], 1});
-        Data keyBeta, valueBeta;
-        Mul(*chunkKey, 1.0f, keyBeta);
-        Mul(*chunkValue, 1.0f, valueBeta);
-        MulTo(keyBeta, *chunkBeta);
-        MulTo(valueBeta, *chunkBeta);
+            const int repeat = this->num_v_heads / this->num_k_heads;
+            if (repeat > 1) {
+                Data expandedQuery, expandedKey;
+                query.Reshape({batch, sequence, this->num_k_heads, 1,
+                               this->head_k_dim});
+                key.Reshape({batch, sequence, this->num_k_heads, 1,
+                             this->head_k_dim});
+                Repeat(query, 3, repeat, expandedQuery);
+                Repeat(key, 3, repeat, expandedKey);
+                expandedQuery.Reshape(
+                    {batch, sequence, this->num_v_heads, this->head_k_dim});
+                expandedKey.Reshape(
+                    {batch, sequence, this->num_v_heads, this->head_k_dim});
+                query.CopyFrom(expandedQuery);
+                key.CopyFrom(expandedKey);
+            }
+
+            RMSNorm(query, this->linearInvScaleData, 1e-6f, query);
+            RMSNorm(key, this->linearInvScaleData, 1e-6f, key);
+            if (!mixedGdnPrefill) {
+                ToDataType(query, DataType::FLOAT32);
+                ToDataType(key, DataType::FLOAT32);
+                ToDataType(value, DataType::FLOAT32);
+                ToDataType(beta, DataType::FLOAT32);
+                ToDataType(decay, DataType::FLOAT32);
+            }
+
+            PermuteSelf(query, {0, 2, 1, 3});
+            PermuteSelf(key, {0, 2, 1, 3});
+            PermuteSelf(value, {0, 2, 1, 3});
+            PermuteSelf(beta, {0, 2, 1});
+            PermuteSelf(decay, {0, 2, 1});
+
+            Data *chunkBeta = nullptr;
+            Data *chunkValue = nullptr;
+            if (padding > 0) {
+                Data paddedQuery;
+                Pad(query, 2, padding, paddedQuery);
+                Pad(key, 2, padding, paddedKey);
+                Pad(value, 2, padding, paddedValue);
+                Pad(beta, 2, padding, paddedBeta);
+                Pad(decay, 2, padding, paddedDecay);
+                Mul(paddedQuery, inverseHead, scaledQuery);
+                chunkKey = &paddedKey;
+                chunkValue = &paddedValue;
+                chunkBeta = &paddedBeta;
+                chunkDecay = &paddedDecay;
+            } else {
+                Mul(query, inverseHead, scaledQuery);
+                chunkKey = &key;
+                chunkValue = &value;
+                chunkBeta = &beta;
+                chunkDecay = &decay;
+            }
+
+            chunkBeta->Resize({chunkBeta->dims[0], chunkBeta->dims[1],
+                               chunkBeta->dims[2], 1});
+            Mul(*chunkKey, 1.0f, keyBeta);
+            Mul(*chunkValue, 1.0f, valueBeta);
+            MulTo(keyBeta, *chunkBeta);
+            MulTo(valueBeta, *chunkBeta);
+        }
 
         scaledQuery.Reshape({scaledQuery.dims[0], scaledQuery.dims[1], -1,
                              chunkSize, scaledQuery.dims.back()});

@@ -133,6 +133,10 @@ namespace fastllm {
         std::vector<int64_t> pleHeadVocabSizes;
         std::vector<int64_t> pleHeadOffsets;
         std::vector<bool> linearLayers;
+        // Shared Q/K L2-normalization scale. Keep one persistent tensor so
+        // prefill does not rebuild and upload the same 128-float constant in
+        // every linear-attention layer.
+        Data linearInvScaleData;
         // QSA cache compression applies RoPE on the host while regular
         // attention applies it on its execution device. Keep an immutable
         // host view so cache updates never migrate the shared sinData/cosData
