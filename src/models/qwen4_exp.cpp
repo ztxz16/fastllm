@@ -1507,7 +1507,11 @@ namespace fastllm {
         Linear(typedInput, this->weight[linear + "in_proj_b.weight"], Data(), beta);
         Linear(typedInput, this->weight[linear + "in_proj_a.weight"], Data(), alpha);
         const bool fusedDecode = sequence == 1;
-        if (!fusedDecode) {
+        const bool mixedGdnPrefill =
+            !fusedDecode && GetFastllmEnv().cudaTriton &&
+            qkv.dataDevice == DataDevice::CUDA &&
+            qkv.dataType == DataType::FLOAT16;
+        if (!fusedDecode && !mixedGdnPrefill) {
             ToDataType(qkv, DataType::FLOAT32);
         }
 
@@ -1545,6 +1549,13 @@ namespace fastllm {
                 qkv, this->weight[linear + "conv1d.weight"],
                 pastConv, this->linearConvKernel, true, currentConvolved);
             pastConv.expansionDims = pastConv.dims;
+            if (mixedGdnPrefill) {
+                // The convolution accumulates into float32 alongside its
+                // float32 history.  Round only its token activations before
+                // the standard mixed GDN, matching Qwen3.5/vLLM-style
+                // activation precision without lowering cache precision.
+                ToDataType(currentConvolved, DataType::FLOAT16);
+            }
         }
 
         if (pastRecurrent.dims.empty()) {
@@ -1584,8 +1595,13 @@ namespace fastllm {
             return;
         }
 
-        ToDataType(beta, DataType::FLOAT32);
-        ToDataType(alpha, DataType::FLOAT32);
+        if (mixedGdnPrefill) {
+            ToDataType(beta, DataType::FLOAT16);
+            ToDataType(alpha, DataType::FLOAT16);
+        } else {
+            ToDataType(beta, DataType::FLOAT32);
+            ToDataType(alpha, DataType::FLOAT32);
+        }
 
         const int keyDimension = this->num_k_heads * this->head_k_dim;
         const int valueDimension = this->num_v_heads * this->head_v_dim;
@@ -1624,11 +1640,13 @@ namespace fastllm {
         Data decay;
         MambaSoftplus(alpha, this->weight[linear + "A_log"],
                       this->weight[linear + "dt_bias"], decay);
-        ToDataType(query, DataType::FLOAT32);
-        ToDataType(key, DataType::FLOAT32);
-        ToDataType(value, DataType::FLOAT32);
-        ToDataType(beta, DataType::FLOAT32);
-        ToDataType(decay, DataType::FLOAT32);
+        if (!mixedGdnPrefill) {
+            ToDataType(query, DataType::FLOAT32);
+            ToDataType(key, DataType::FLOAT32);
+            ToDataType(value, DataType::FLOAT32);
+            ToDataType(beta, DataType::FLOAT32);
+            ToDataType(decay, DataType::FLOAT32);
+        }
 
         PermuteSelf(query, {0, 2, 1, 3});
         PermuteSelf(key, {0, 2, 1, 3});
@@ -1636,9 +1654,11 @@ namespace fastllm {
         PermuteSelf(beta, {0, 2, 1});
         PermuteSelf(decay, {0, 2, 1});
 
-        // Use the same 64-token chunk GDN decomposition as Qwen3.5.  Besides
-        // matching the reference FLA algorithm, this removes the per-token
-        // Split/Recurrent/Cat launch chain and the quadratic Cat copies.
+        // Qwen3.5 and Qwen4 share this standard chunk-GDN operation.  CUDA
+        // prefill keeps the projected activations in float16 and uses the
+        // operation's layer-wide mixed path, while the checkpoint-required
+        // recurrent state remains float32.  CPU and unsupported activation
+        // types retain the float32 reference path.
         constexpr int chunkSize = 64;
         const int padding = (chunkSize - sequence % chunkSize) % chunkSize;
         Data scaledQuery, paddedKey, paddedValue, paddedBeta, paddedDecay;

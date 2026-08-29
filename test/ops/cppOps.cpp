@@ -4537,6 +4537,101 @@ namespace {
         };
     }
 
+    static OpCase MakeChunkGdnMixedStateCase() {
+        return {
+            "chunk_gdn_mixed_state",
+            "float16 chunk GDN activations with float32 recurrent state",
+            []() {
+                OpTestParams params;
+                params.Add("batch", "1", "batch size");
+                params.Add("heads", "3", "value/key heads");
+                params.Add("chunks", "2", "64-token chunks");
+                params.Add("chunk_size", "64", "tokens per chunk");
+                params.Add("key_dim", "128", "key/query head width");
+                params.Add("value_dim", "128", "value head width");
+                return params;
+            },
+            [](const OpTestParams&, const std::string &device) {
+                return device == "cpu" || device.rfind("cuda", 0) == 0;
+            },
+            [](const OpTestParams &params, const std::string &device) {
+                const int batch = params.GetInt("batch");
+                const int heads = params.GetInt("heads");
+                const int chunks = params.GetInt("chunks");
+                const int chunkSize = params.GetInt("chunk_size");
+                const int keyDim = params.GetInt("key_dim");
+                const int valueDim = params.GetInt("value_dim");
+                const std::vector<int> qShape = {
+                    batch, heads, chunks, chunkSize, keyDim};
+                const std::vector<int> vShape = {
+                    batch, heads, chunks, chunkSize, valueDim};
+                const std::vector<int> gShape = {
+                    batch, heads, chunks, chunkSize};
+                const std::vector<int> attnShape = {
+                    batch, heads, chunks, chunkSize, chunkSize};
+
+                fastllm::Data q = MakeTensor(qShape, 0.11f, 0.01f);
+                fastllm::Data k = MakeTensor(qShape, 0.29f, 0.01f);
+                fastllm::Data v = MakeTensor(vShape, 0.47f, 0.01f);
+                fastllm::Data g = MakeTensor(
+                    gShape, 0.65f, 0.002f, -0.01f);
+                fastllm::Data attn = MakeTensor(
+                    attnShape, 0.83f, 0.001f);
+                fastllm::Data kCum = MakeTensor(
+                    qShape, 1.01f, 0.001f);
+                fastllm::Data state = MakeTensor(
+                    {batch, heads, keyDim, valueDim},
+                    1.19f, 0.01f);
+                {
+                    ScopedFirstDevice inputGuard("cpu");
+                    fastllm::ToDataType(q, fastllm::DataType::FLOAT16);
+                    fastllm::ToDataType(k, fastllm::DataType::FLOAT16);
+                    fastllm::ToDataType(v, fastllm::DataType::FLOAT16);
+                    fastllm::ToDataType(g, fastllm::DataType::FLOAT16);
+                    fastllm::ToDataType(attn, fastllm::DataType::FLOAT16);
+                    fastllm::ToDataType(kCum, fastllm::DataType::FLOAT16);
+                }
+
+                fastllm::Data output;
+                ScopedFirstDevice guard(device);
+                fastllm::ChunkGatedDeltaRulePrefill(
+                    q, k, v, g, attn, kCum, state, output);
+                fastllm::Data outputFloat;
+                fastllm::ToDataType(
+                    output, outputFloat, fastllm::DataType::FLOAT32);
+                outputFloat.Reshape({(int)outputFloat.Count(0)});
+                state.Reshape({(int)state.Count(0)});
+                fastllm::Data combined;
+                fastllm::Cat(outputFloat, state, 0, combined);
+                combined.ToDevice(fastllm::DataDevice::CPU);
+                return combined;
+            },
+            [](const OpTestParams &params) {
+                const double batch = params.GetInt("batch");
+                const double heads = params.GetInt("heads");
+                const double chunks = params.GetInt("chunks");
+                const double chunk = params.GetInt("chunk_size");
+                const double key = params.GetInt("key_dim");
+                const double value = params.GetInt("value_dim");
+                return batch * heads *
+                    (chunks * chunk * (3.0 * key + 2.0 * value +
+                                       chunk + 1.0) * sizeof(uint16_t) +
+                     key * value * sizeof(float));
+            },
+            [](const OpTestParams &params) {
+                const double batch = params.GetInt("batch");
+                const double heads = params.GetInt("heads");
+                const double chunks = params.GetInt("chunks");
+                const double chunk = params.GetInt("chunk_size");
+                const double key = params.GetInt("key_dim");
+                const double value = params.GetInt("value_dim");
+                return batch * heads * chunks *
+                    (4.0 * chunk * key * value +
+                     2.0 * chunk * chunk * value);
+            }
+        };
+    }
+
     static OpCase MakeQwen4QSADenseMaskCase() {
         return {
             "qwen4_qsa_dense_mask",
@@ -4758,6 +4853,7 @@ namespace {
             MakeQwen4PLEGateCase(),
             MakeQwen4PLECausalConvCase(),
             MakeCausalDepthwiseConv1DPrefillCase(),
+            MakeChunkGdnMixedStateCase(),
             MakeQwen4QSADenseMaskCase(),
             MakeCausalDepthwiseConv1DPrefillReferenceCase(),
             MakeDots3NoteIndexerCase()

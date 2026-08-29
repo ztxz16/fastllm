@@ -213,6 +213,7 @@ namespace fastllm {
         int vDim = 128;
         int blockV = 32;
         int numStages = 3;
+        bool floatState = false;
     };
 
     struct CudaTritonChunkGdnVarlenPrefillMeta {
@@ -401,9 +402,14 @@ namespace fastllm {
 
     static std::string CudaTritonChunkGdnPrefillBaseName(
         int arch, int chunks, int chunkSize, int kDim, int vDim,
-        int blockV, int numWarps, int numStages) {
+        int blockV, int numWarps, int numStages, bool floatState) {
         std::ostringstream os;
-        os << "chunk_gdn_prefill_v6_fp16_sm" << arch
+        if (floatState) {
+            os << "chunk_gdn_prefill_v7_fp16_statefp32_sm";
+        } else {
+            os << "chunk_gdn_prefill_v6_fp16_sm";
+        }
+        os << arch
            << "_c" << chunks << "_t" << chunkSize
            << "_k" << kDim << "_v" << vDim
            << "_bv" << blockV
@@ -581,6 +587,14 @@ namespace fastllm {
             json["dtype"].string_value() != "fp16") {
             return false;
         }
+        std::string stateDtype = json["state_dtype"].string_value();
+        if (stateDtype.empty()) {
+            stateDtype = "fp16";
+        }
+        if (stateDtype != "fp16" && stateDtype != "fp32") {
+            return false;
+        }
+        meta.floatState = stateDtype == "fp32";
         meta.chunks = json["chunks"].int_value();
         meta.chunkSize = json["chunk_size"].int_value();
         meta.kDim = json["k_dim"].int_value();
@@ -1225,6 +1239,7 @@ namespace fastllm {
     static bool CudaTritonRequestChunkGdnPrefillKernel(
         const std::string &cacheDir, int arch, int chunks, int chunkSize,
         int kDim, int vDim, int blockV, int numWarps, int numStages,
+        bool floatState,
         CudaTritonChunkGdnPrefillMeta &meta) {
         if (!CudaTritonEnsureServer()) {
             return false;
@@ -1234,6 +1249,7 @@ namespace fastllm {
             {"cache_dir", cacheDir},
             {"arch", arch},
             {"dtype", "fp16"},
+            {"state_dtype", floatState ? "fp32" : "fp16"},
             {"chunks", chunks},
             {"chunk_size", chunkSize},
             {"k_dim", kDim},
@@ -1267,9 +1283,12 @@ namespace fastllm {
         meta.vDim = response["v_dim"].int_value();
         meta.blockV = response["block_v"].int_value();
         meta.numStages = response["num_stages"].int_value();
+        meta.floatState =
+            response["state_dtype"].string_value() == "fp32";
         if (meta.chunks != chunks || meta.chunkSize != chunkSize ||
             meta.kDim != kDim || meta.vDim != vDim ||
-            meta.blockV != blockV || meta.numStages != numStages) {
+            meta.blockV != blockV || meta.numStages != numStages ||
+            meta.floatState != floatState) {
             return false;
         }
         json11::Json kernels = response["kernels"];
@@ -1293,7 +1312,7 @@ namespace fastllm {
     static bool CudaTritonGetChunkGdnPrefillMeta(
         const std::string &cacheDir, const std::string &base,
         int arch, int chunks, int chunkSize, int kDim, int vDim,
-        int blockV, int numWarps, int numStages,
+        int blockV, int numWarps, int numStages, bool floatState,
         const CudaTritonChunkGdnPrefillMeta *&meta) {
         static std::mutex mutex;
         static std::map<std::string, CudaTritonChunkGdnPrefillMeta> cachedMeta;
@@ -1312,13 +1331,14 @@ namespace fastllm {
         if (!CudaTritonReadChunkGdnPrefillMeta(metaPath, loaded)) {
             if (!CudaTritonRequestChunkGdnPrefillKernel(
                     cacheDir, arch, chunks, chunkSize, kDim, vDim,
-                    blockV, numWarps, numStages, loaded)) {
+                    blockV, numWarps, numStages, floatState, loaded)) {
                 return false;
             }
         }
         if (loaded.chunks != chunks || loaded.chunkSize != chunkSize ||
             loaded.kDim != kDim || loaded.vDim != vDim ||
-            loaded.blockV != blockV || loaded.numStages != numStages) {
+            loaded.blockV != blockV || loaded.numStages != numStages ||
+            loaded.floatState != floatState) {
             return false;
         }
 
@@ -2755,11 +2775,17 @@ namespace fastllm {
                    data.dataType == DataType::FLOAT16 &&
                    data.cudaData != nullptr && isDense(data);
         };
+        const bool floatState =
+            lastRecurrentState.dataDevice == DataDevice::CUDA &&
+            lastRecurrentState.dataType == DataType::FLOAT32 &&
+            lastRecurrentState.cudaData != nullptr &&
+            isDense(lastRecurrentState);
+        const bool halfState = isCudaFp16(lastRecurrentState);
         if (!isCudaFp16(q) || !isCudaFp16(k) || !isCudaFp16(v) ||
             !isCudaFp16(g) || !isCudaFp16(attn) ||
             (fuseDecayMask &&
              (decayMask == nullptr || !isCudaFp16(*decayMask))) ||
-            !isCudaFp16(kCumdecay) || !isCudaFp16(lastRecurrentState) ||
+            !isCudaFp16(kCumdecay) || (!halfState && !floatState) ||
             q.dims.size() != 5 || k.dims != q.dims) {
             return false;
         }
@@ -2820,11 +2846,11 @@ namespace fastllm {
         std::string cacheDir = CudaTritonCacheDir();
         std::string base = CudaTritonChunkGdnPrefillBaseName(
             arch, chunks, chunkSize, kDim, vDim,
-            blockV, numWarps, hNumStages);
+            blockV, numWarps, hNumStages, floatState);
         const CudaTritonChunkGdnPrefillMeta *meta = nullptr;
         if (!CudaTritonGetChunkGdnPrefillMeta(
                 cacheDir, base, arch, chunks, chunkSize, kDim, vDim,
-                blockV, numWarps, hNumStages, meta) ||
+                blockV, numWarps, hNumStages, floatState, meta) ||
             meta == nullptr) {
             return false;
         }
@@ -2838,18 +2864,24 @@ namespace fastllm {
         if (oBlockV != blockV || oNumStages != hNumStages) {
             std::string oBase = CudaTritonChunkGdnPrefillBaseName(
                 arch, chunks, chunkSize, kDim, vDim,
-                oBlockV, numWarps, oNumStages);
+                oBlockV, numWarps, oNumStages, floatState);
             const CudaTritonChunkGdnPrefillMeta *candidate = nullptr;
             if (CudaTritonGetChunkGdnPrefillMeta(
                     cacheDir, oBase, arch, chunks, chunkSize, kDim, vDim,
-                    oBlockV, numWarps, oNumStages, candidate) &&
+                    oBlockV, numWarps, oNumStages, floatState,
+                    candidate) &&
                 candidate != nullptr) {
                 oMeta = candidate;
             }
         }
-        bool precomputeScale = CudaEnvFlagDefaultEnabled(
-            "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_PRECOMPUTE_SCALE",
-            true);
+        // Only the Qwen3.5 direct path passes decay_mask together with the
+        // one-layer scale handoff.  Public callers such as Qwen4 do not, so
+        // they must not accidentally consume a stale handoff with matching
+        // dimensions from an earlier request.
+        bool precomputeScale = decayMask != nullptr &&
+            CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_PRECOMPUTE_SCALE",
+                true);
         Data &decayMaskArg =
             decayMask == nullptr ? attn : *decayMask;
         return FastllmCudaTritonChunkGatedDeltaRulePrefill(

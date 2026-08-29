@@ -8868,13 +8868,23 @@ ops += (long long)lines * inputDim * interDim * 2;
         Data &state = *(datas.find("last_recurrent_state")->second);
         Data &coreAttnOut = *(datas.find("core_attn_out")->second);
 
+        const bool mixedFloatState =
+            q.dataType == DataType::FLOAT16 &&
+            k.dataType == DataType::FLOAT16 &&
+            v.dataType == DataType::FLOAT16 &&
+            g.dataType == DataType::FLOAT16 &&
+            attn.dataType == DataType::FLOAT16 &&
+            kCumDecay.dataType == DataType::FLOAT16 &&
+            state.dataType == DataType::FLOAT32;
         AssertInFastLLM(
             (q.dataType == DataType::FLOAT32 ||
              q.dataType == DataType::FLOAT16) &&
             k.dataType == q.dataType && v.dataType == q.dataType &&
             g.dataType == q.dataType && attn.dataType == q.dataType &&
-            kCumDecay.dataType == q.dataType && state.dataType == q.dataType,
-            "CPU chunk GDN prefill expects matching float32 or float16 inputs.\n");
+            kCumDecay.dataType == q.dataType &&
+            (state.dataType == q.dataType || mixedFloatState),
+            "CPU chunk GDN prefill expects matching float32 or float16 "
+            "activations and optionally a float32 state.\n");
         AssertInFastLLM(
             q.dims.size() == 5 && k.dims.size() == 5 &&
             v.dims.size() == 5 && g.dims.size() == 4 &&
@@ -8891,6 +8901,26 @@ ops += (long long)lines * inputDim * interDim * 2;
         AssertInFastLLM(
             state.dims == std::vector<int>({batch, heads, keyDim, valueDim}),
             "CPU chunk GDN prefill state shape mismatch.\n");
+
+        // Preserve the public mixed-dtype contract on CPU.  The reference
+        // implementation computes the recurrence in float32, then rounds only
+        // the activation output back to float16; the recurrent state remains
+        // float32 across calls.
+        if (mixedFloatState) {
+            Data qFloat, kFloat, vFloat, gFloat;
+            Data attnFloat, kCumFloat, outputFloat;
+            ToDataType(q, qFloat, DataType::FLOAT32);
+            ToDataType(k, kFloat, DataType::FLOAT32);
+            ToDataType(v, vFloat, DataType::FLOAT32);
+            ToDataType(g, gFloat, DataType::FLOAT32);
+            ToDataType(attn, attnFloat, DataType::FLOAT32);
+            ToDataType(kCumDecay, kCumFloat, DataType::FLOAT32);
+            ChunkGatedDeltaRulePrefill(
+                qFloat, kFloat, vFloat, gFloat, attnFloat, kCumFloat,
+                state, outputFloat);
+            ToDataType(outputFloat, coreAttnOut, DataType::FLOAT16);
+            return;
+        }
 
         // The chunk formula is composed from standard CPU matmul/elementwise
         // operators.  Reorder only private copies so the public operation does

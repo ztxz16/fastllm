@@ -2483,7 +2483,8 @@ extern "C" bool FastllmCudaTritonChunkGatedDeltaRulePrefill(
         attn.dataType != fastllm::DataType::FLOAT16 ||
         decayMask.dataType != fastllm::DataType::FLOAT16 ||
         kCumdecay.dataType != fastllm::DataType::FLOAT16 ||
-        lastRecurrentState.dataType != fastllm::DataType::FLOAT16 ||
+        (lastRecurrentState.dataType != fastllm::DataType::FLOAT16 &&
+         lastRecurrentState.dataType != fastllm::DataType::FLOAT32) ||
         q.cudaData == nullptr || k.cudaData == nullptr || v.cudaData == nullptr ||
         g.cudaData == nullptr || attn.cudaData == nullptr ||
         decayMask.cudaData == nullptr ||
@@ -2525,14 +2526,12 @@ extern "C" bool FastllmCudaTritonChunkGatedDeltaRulePrefill(
     int batchHeads = q.dims[0] * q.dims[1];
     TritonChunkGdnScaleScratch *scaleScratch =
         FindTritonChunkGdnScaleScratch();
-    if (precomputeScale &&
-        (scaleScratch == nullptr || !scaleScratch->valid ||
-         scaleScratch->batchHeads != batchHeads ||
-         scaleScratch->chunks != chunks ||
-         scaleScratch->chunkSize != chunkSize)) {
-        return false;
-    }
-    if (precomputeScale) {
+    bool usePrecomputedScale =
+        precomputeScale && scaleScratch != nullptr && scaleScratch->valid &&
+        scaleScratch->batchHeads == batchHeads &&
+        scaleScratch->chunks == chunks &&
+        scaleScratch->chunkSize == chunkSize;
+    if (usePrecomputedScale) {
         // Consume the handoff before any later allocation or launch can fail,
         // so a fallback cannot leave stale scales valid for the next layer.
         scaleScratch->valid = false;
@@ -2542,7 +2541,9 @@ extern "C" bool FastllmCudaTritonChunkGatedDeltaRulePrefill(
     size_t vNewBytes =
         (size_t)batchHeads * chunks * chunkSize * vDim * sizeof(half);
     size_t stateBytes =
-        (size_t)batchHeads * kDim * vDim * sizeof(half);
+        (size_t)batchHeads * kDim * vDim *
+        (lastRecurrentState.dataType == fastllm::DataType::FLOAT32
+             ? sizeof(float) : sizeof(half));
     TritonChunkGdnPrefillScratch *scratch = nullptr;
     if (!EnsureTritonChunkGdnPrefillScratch(
             hBytes, vNewBytes, stateBytes, scratch)) {
@@ -2594,9 +2595,9 @@ extern "C" bool FastllmCudaTritonChunkGatedDeltaRulePrefill(
     CUdeviceptr nextStatePtr = (CUdeviceptr)scratch->nextState;
     CUdeviceptr hPtr = (CUdeviceptr)scratch->h;
     CUdeviceptr vNewPtr = (CUdeviceptr)scratch->vNew;
-    CUdeviceptr rowScalePtr = precomputeScale
+    CUdeviceptr rowScalePtr = usePrecomputedScale
         ? (CUdeviceptr)scaleScratch->rowScale : 0;
-    CUdeviceptr stateScalePtr = precomputeScale
+    CUdeviceptr stateScalePtr = usePrecomputedScale
         ? (CUdeviceptr)scaleScratch->stateScale : 0;
     CUdeviceptr outputPtr = (CUdeviceptr)outputData;
     CUdeviceptr globalScratch = 0;
@@ -2617,11 +2618,11 @@ extern "C" bool FastllmCudaTritonChunkGatedDeltaRulePrefill(
     unsigned int oVBlocks =
         (unsigned int)((vDim + oBlockV - 1) / oBlockV);
     LoadedTritonKernel *selectedHKernel =
-        precomputeScale ? hPrecomputedScaleKernel : hKernel;
+        usePrecomputedScale ? hPrecomputedScaleKernel : hKernel;
     int selectedHNumWarps =
-        precomputeScale ? hPrecomputedScaleNumWarps : hNumWarps;
+        usePrecomputedScale ? hPrecomputedScaleNumWarps : hNumWarps;
     int selectedHShared =
-        precomputeScale ? hPrecomputedScaleShared : hShared;
+        usePrecomputedScale ? hPrecomputedScaleShared : hShared;
     LoadedTritonKernel *selectedOKernel =
         fuseDecayMask ? oFusedDecayKernel : oKernel;
     int selectedONumWarps =

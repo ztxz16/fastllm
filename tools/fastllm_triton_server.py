@@ -2384,6 +2384,11 @@ def chunk_gdn_prefill_cache_paths(payload):
     dtype = require_dtype(payload, "dtype")
     if dtype != "fp16":
         raise ValueError("chunk_gdn_prefill currently requires fp16")
+    state_dtype = str(payload.get("state_dtype") or dtype)
+    if state_dtype not in {"fp16", "fp32"}:
+        raise ValueError(
+            "chunk_gdn_prefill state_dtype must be fp16 or fp32"
+        )
     chunks = require_int(payload, "chunks")
     chunk_size = require_int(payload, "chunk_size", 64)
     k_dim = require_int(payload, "k_dim", 128)
@@ -2398,11 +2403,18 @@ def chunk_gdn_prefill_cache_paths(payload):
     if block_v not in {32, 64}:
         raise ValueError("chunk_gdn_prefill block_v must be 32 or 64")
     cache_dir = Path(payload.get("cache_dir") or default_cache_dir()).expanduser()
-    name = (
-        f"chunk_gdn_prefill_v6_{dtype}_sm{arch}"
-        f"_c{chunks}_t{chunk_size}_k{k_dim}_v{v_dim}_bv{block_v}"
-        f"_nw{num_warps}_ns{num_stages}"
-    )
+    if state_dtype == dtype:
+        name = (
+            f"chunk_gdn_prefill_v6_{dtype}_sm{arch}"
+            f"_c{chunks}_t{chunk_size}_k{k_dim}_v{v_dim}_bv{block_v}"
+            f"_nw{num_warps}_ns{num_stages}"
+        )
+    else:
+        name = (
+            f"chunk_gdn_prefill_v7_{dtype}_state{state_dtype}_sm{arch}"
+            f"_c{chunks}_t{chunk_size}_k{k_dim}_v{v_dim}_bv{block_v}"
+            f"_nw{num_warps}_ns{num_stages}"
+        )
     cubins = {
         key: cache_dir / f"{name}_{key}.cubin"
         for key in CHUNK_GDN_PREFILL_KERNEL_ORDER
@@ -2756,6 +2768,11 @@ def compile_chunk_gdn_prefill(payload):
     dtype = require_dtype(payload, "dtype")
     if dtype != "fp16":
         raise ValueError("chunk_gdn_prefill currently requires fp16")
+    state_dtype = str(payload.get("state_dtype") or dtype)
+    if state_dtype not in {"fp16", "fp32"}:
+        raise ValueError(
+            "chunk_gdn_prefill state_dtype must be fp16 or fp32"
+        )
     chunks = require_int(payload, "chunks")
     chunk_size = require_int(payload, "chunk_size", 64)
     k_dim = require_int(payload, "k_dim", 128)
@@ -2789,8 +2806,8 @@ def compile_chunk_gdn_prefill(payload):
         "v_ptr": f"*{dtype}",
         "g_ptr": f"*{dtype}",
         "k_cumdecay_ptr": f"*{dtype}",
-        "state_ptr": f"*{dtype}",
-        "next_state_ptr": f"*{dtype}",
+        "state_ptr": f"*{state_dtype}",
+        "next_state_ptr": f"*{state_dtype}",
         "h_ptr": f"*{dtype}",
         "v_new_ptr": f"*{dtype}",
         "row_scale_ptr": "*fp32",
@@ -2870,6 +2887,7 @@ def compile_chunk_gdn_prefill(payload):
         "kernels": kernels,
         "arch": arch,
         "dtype": dtype,
+        "state_dtype": state_dtype,
         "chunks": chunks,
         "chunk_size": chunk_size,
         "k_dim": k_dim,
