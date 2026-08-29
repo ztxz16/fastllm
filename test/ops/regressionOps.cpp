@@ -3214,6 +3214,126 @@ namespace {
         return values;
     }
 
+    void RunCudaKimiK3CausalConvDecodeRegression() {
+        FastllmCudaSetDevice(0);
+        constexpr int kernelSize = 4;
+        constexpr int history = kernelSize - 1;
+        constexpr int channels = 257;
+        constexpr int steps = 7;
+        uint64_t hash = 1469598103934665603ull;
+        auto mix = [&](const std::vector<float> &values) {
+            for (float value : values) {
+                uint32_t bits = 0;
+                std::memcpy(&bits, &value, sizeof(bits));
+                hash ^= bits;
+                hash *= 1099511628211ull;
+            }
+        };
+
+        for (int batch : {1, 2}) {
+            const std::vector<int> weightDims = {
+                channels, 1, kernelSize};
+            const std::vector<int> cacheDims = {
+                batch, history, channels};
+            const std::vector<float> weightValues = MakeRegressionValues(
+                channels * kernelSize, 0.37f + batch, 0.31f);
+            const std::vector<float> initialCacheValues = MakeRegressionValues(
+                batch * history * channels, 0.83f + batch, 0.43f);
+            fastllm::Data cpuWeight(
+                fastllm::DataType::FLOAT32, weightDims, weightValues);
+            fastllm::Data cudaWeight = MakeCudaTensor(
+                fastllm::DataType::FLOAT32, weightDims, weightValues);
+            fastllm::Data cpuCache(
+                fastllm::DataType::BFLOAT16, cacheDims, initialCacheValues);
+            fastllm::Data cudaCache = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16, cacheDims, initialCacheValues);
+
+            for (int step = 0; step < steps; step++) {
+                const std::vector<int> inputDims = {batch, 1, channels};
+                const std::vector<float> inputValues = MakeRegressionValues(
+                    batch * channels, 1.19f + batch * 0.17f + step * 0.29f,
+                    0.67f);
+                fastllm::Data cpuInput(
+                    fastllm::DataType::BFLOAT16, inputDims, inputValues);
+                fastllm::Data cudaInput = MakeCudaTensor(
+                    fastllm::DataType::BFLOAT16, inputDims, inputValues);
+                fastllm::Data cpuOutput;
+                fastllm::Data cudaOutput;
+                {
+                    ScopedFirstDevice device("cpu");
+                    fastllm::KimiK3CausalConv1D(
+                        cpuInput, cpuWeight, kernelSize, cpuCache, cpuOutput);
+                }
+                {
+                    ScopedFirstDevice device("cuda:0");
+                    fastllm::KimiK3CausalConv1D(
+                        cudaInput, cudaWeight, kernelSize,
+                        cudaCache, cudaOutput);
+                }
+                FastllmCudaSyncCurrentThreadStream();
+                const std::string suffix =
+                    " batch=" + std::to_string(batch) +
+                    " step=" + std::to_string(step);
+                const std::vector<float> cudaOutputValues =
+                    ToFloatVector(cudaOutput);
+                ExpectFloatNear(ToFloatVector(cpuOutput), cudaOutputValues,
+                                1.0f / 128.0f, 1.0e-4f,
+                                "CUDA Kimi-K3 causal conv output" + suffix);
+                ExpectFloatNear(ToFloatVector(cpuCache),
+                                ToFloatVector(cudaCache), 0.0f, 0.0f,
+                                "CUDA Kimi-K3 causal conv cache" + suffix);
+                mix(cudaOutputValues);
+            }
+            mix(ToFloatVector(cudaCache));
+        }
+        std::cout << "CUDA Kimi-K3 causal conv decode hash: "
+                  << std::hex << hash << std::dec << "\n";
+    }
+
+    void RunCudaKimiK3CausalConvDecodeBenchmark() {
+        FastllmCudaSetDevice(0);
+        constexpr int kernelSize = 4;
+        constexpr int channels = 8192;
+        constexpr int warmups = 1000;
+        constexpr int iterations = 20000;
+        const std::vector<float> inputValues = MakeRegressionValues(
+            channels, 0.71f, 0.67f);
+        const std::vector<float> weightValues = MakeRegressionValues(
+            channels * kernelSize, 1.13f, 0.31f);
+        const std::vector<float> cacheValues = MakeRegressionValues(
+            channels * (kernelSize - 1), 1.59f, 0.43f);
+        fastllm::Data input = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16, {1, 1, channels}, inputValues);
+        fastllm::Data weight = MakeCudaTensor(
+            fastllm::DataType::FLOAT32,
+            {channels, 1, kernelSize}, weightValues);
+        fastllm::Data cache = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16,
+            {1, kernelSize - 1, channels}, cacheValues);
+        fastllm::Data output = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16,
+            {1, 1, channels}, std::vector<float>(channels));
+        auto run = [&]() {
+            Expect(FastllmCudaKimiK3CausalConv1D(
+                       input, weight, &cache, output, kernelSize, false),
+                   "CUDA Kimi-K3 causal conv benchmark launch failed.");
+        };
+        for (int i = 0; i < warmups; i++) {
+            run();
+        }
+        FastllmCudaSyncCurrentThreadStream();
+        const auto begin = std::chrono::steady_clock::now();
+        for (int i = 0; i < iterations; i++) {
+            run();
+        }
+        FastllmCudaSyncCurrentThreadStream();
+        const double elapsedUs = std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - begin).count();
+        std::cout << "CUDA Kimi-K3 causal conv decode benchmark: iterations="
+                  << iterations << " us_per_call="
+                  << elapsedUs / iterations << "\n";
+    }
+
     void RunCudaKimiK3PackedConvCacheRegression() {
         FastllmCudaSetDevice(0);
         constexpr int sequence = 8;
@@ -12121,6 +12241,21 @@ int main(int argc, char **argv) {
             return 0;
         }
         if (argc == 2 &&
+            std::string(argv[1]) == "--bench-cuda-kimi-k3-conv-decode") {
+            Expect(FastllmCudaGetDeviceCount() > 0,
+                   "Kimi-K3 causal conv decode benchmark requires CUDA.");
+            RunCudaKimiK3CausalConvDecodeBenchmark();
+            return 0;
+        }
+        if (argc == 2 &&
+            std::string(argv[1]) == "--cuda-kimi-k3-conv-decode") {
+            Expect(FastllmCudaGetDeviceCount() > 0,
+                   "Kimi-K3 causal conv decode regression requires CUDA.");
+            RunCudaKimiK3CausalConvDecodeRegression();
+            std::cout << "CUDA Kimi-K3 causal conv decode regression: PASS\n";
+            return 0;
+        }
+        if (argc == 2 &&
             std::string(argv[1]) == "--cuda-paged-packed-append") {
             Expect(FastllmCudaGetDeviceCount() > 0,
                    "packed paged append regression requires CUDA.");
@@ -12350,6 +12485,7 @@ int main(int argc, char **argv) {
             RunCudaGraphMemoryPoolOwnershipRegression();
             RunCudaLinearDataTypeCapabilityRegression();
             RunCudaGgufMmvqBatch8Regression();
+            RunCudaKimiK3CausalConvDecodeRegression();
             RunCudaKimiK3PackedConvCacheRegression();
             RunCudaKimiK3RecurrentKdaRegression();
             RunCudaMergeMlaPagedChunkRegression();
