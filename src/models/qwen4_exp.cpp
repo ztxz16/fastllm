@@ -734,6 +734,85 @@ namespace fastllm {
         }
     }
 
+    struct Qwen4ExpModel::DecodeCudaGraphState {
+        struct Segment {
+            bool warmed = false;
+            bool captured = false;
+            bool disabled = false;
+            int captureFailures = 0;
+            void *graph = nullptr;
+            void *exec = nullptr;
+            std::vector<void*> reservedPointers;
+        };
+
+        std::mutex mutex;
+        int device = -1;
+        std::vector<void*> linearCachePointers;
+        Data hiddenStates[2];
+        Data attentionInput;
+        Data attentionInjection;
+        Data attentionOutput;
+        Data logits;
+        std::map<int, Segment> segments;
+
+        void DestroyGraphs() {
+#ifdef USE_CUDA
+            const int previousDevice = FastllmCudaGetDevice();
+            if (device >= 0) {
+                FastllmCudaSetDevice(device);
+            }
+            for (auto &item : segments) {
+                Segment &segment = item.second;
+                if (segment.exec != nullptr) {
+                    FastllmCudaGraphExecDestroy(segment.exec);
+                    segment.exec = nullptr;
+                }
+                if (segment.graph != nullptr) {
+                    FastllmCudaGraphDestroy(segment.graph);
+                    segment.graph = nullptr;
+                }
+                if (!segment.reservedPointers.empty()) {
+                    FastllmCudaGraphMemoryPoolRelease(
+                        segment.reservedPointers);
+                    segment.reservedPointers.clear();
+                }
+                segment.captured = false;
+            }
+            if (previousDevice >= 0) {
+                FastllmCudaSetDevice(previousDevice);
+            }
+#endif
+            segments.clear();
+        }
+
+        void Reset(int newDevice) {
+            DestroyGraphs();
+#ifdef USE_CUDA
+            const int previousDevice = FastllmCudaGetDevice();
+            if (device >= 0) {
+                FastllmCudaSetDevice(device);
+            }
+#endif
+            hiddenStates[0].FreeSpace();
+            hiddenStates[1].FreeSpace();
+            attentionInput.FreeSpace();
+            attentionInjection.FreeSpace();
+            attentionOutput.FreeSpace();
+            logits.FreeSpace();
+#ifdef USE_CUDA
+            if (previousDevice >= 0) {
+                FastllmCudaSetDevice(previousDevice);
+            }
+#endif
+            linearCachePointers.clear();
+            device = newDevice;
+        }
+
+        ~DecodeCudaGraphState() {
+            DestroyGraphs();
+        }
+    };
+
     Qwen4ExpModel::Qwen4ExpModel() : Qwen3NextModel() {
         this->canDoBatchForward = false;
         this->model_type = "qwen4_exp";
@@ -789,6 +868,7 @@ namespace fastllm {
         }
         {
             std::lock_guard<std::mutex> guard(this->stateMutex);
+            this->decodeCudaGraphStates.clear();
             this->requestStates.clear();
         }
     }
@@ -2828,6 +2908,405 @@ namespace fastllm {
         AddTo(output, sharedOutput);
     }
 
+    bool Qwen4ExpModel::TryRunDecodeCudaGraphBackbone(
+            int firstFullAttentionLayer,
+            const Data &hiddenStates,
+            const Data &attentionOutput,
+            const Data &attentionInjection,
+            const Data &attentionMask,
+            const Data &positionIds,
+            bool qsaDeviceCompatibleMask,
+            std::vector<std::pair<Data, Data>> &pastKeyValues,
+            RequestState &requestState,
+            Data &logits) {
+#ifndef USE_CUDA
+        return false;
+#else
+        if (!GetFastllmEnv().cudaGraph ||
+            hiddenStates.dims.size() != 3 || hiddenStates.dims[0] != 1 ||
+            hiddenStates.dims[1] != 1 ||
+            hiddenStates.dataDevice != DataDevice::CUDA ||
+            hiddenStates.cudaData == nullptr ||
+            attentionOutput.dataDevice != DataDevice::CUDA ||
+            attentionOutput.cudaData == nullptr ||
+            attentionInjection.dataDevice != DataDevice::CUDA ||
+            attentionInjection.cudaData == nullptr ||
+            GetKVCacheInCPU() || firstFullAttentionLayer != this->kvCacheId ||
+            this->pleLayer >= firstFullAttentionLayer ||
+            std::getenv("FASTLLM_QWEN4_DUMP_DIR") != nullptr ||
+            !Qwen4CudaOnlyDeviceMap(this->deviceMap) ||
+            !Qwen4CudaOnlyDeviceMap(this->moeDeviceMap) ||
+            !Qwen4CudaOnlyDeviceMap(this->layeredMoeDeviceMap)) {
+            return false;
+        }
+
+        int device = hiddenStates.dataDeviceIds.empty()
+            ? FastllmCudaGetDevice() : hiddenStates.dataDeviceIds[0];
+        if (device < 0 || (int)pastKeyValues.size() < this->block_cnt) {
+            return false;
+        }
+
+        std::vector<void*> linearCachePointers;
+        for (int layer = firstFullAttentionLayer + 1;
+             layer < this->block_cnt; layer++) {
+            if (!this->IsLinearAttentionLayer(layer)) {
+                continue;
+            }
+            Data &pastConv = pastKeyValues[layer].first;
+            Data &pastRecurrent = pastKeyValues[layer].second;
+            if (pastConv.dims.empty() || pastRecurrent.dims.empty() ||
+                pastConv.dataDevice != DataDevice::CUDA ||
+                pastRecurrent.dataDevice != DataDevice::CUDA ||
+                pastConv.cudaData == nullptr ||
+                pastRecurrent.cudaData == nullptr ||
+                (!pastConv.dataDeviceIds.empty() &&
+                 pastConv.dataDeviceIds[0] != device) ||
+                (!pastRecurrent.dataDeviceIds.empty() &&
+                 pastRecurrent.dataDeviceIds[0] != device)) {
+                return false;
+            }
+            linearCachePointers.push_back(pastConv.cudaData);
+            linearCachePointers.push_back(pastRecurrent.cudaData);
+        }
+
+        const Data *requestKey = &pastKeyValues[0].first;
+        DecodeCudaGraphState *graphState = nullptr;
+        {
+            std::lock_guard<std::mutex> guard(this->stateMutex);
+            std::unique_ptr<DecodeCudaGraphState> &entry =
+                this->decodeCudaGraphStates[requestKey];
+            if (entry == nullptr) {
+                entry.reset(new DecodeCudaGraphState());
+            }
+            graphState = entry.get();
+        }
+        std::lock_guard<std::mutex> graphGuard(graphState->mutex);
+
+        const bool workspaceShapeChanged =
+            graphState->hiddenStates[0].cudaData != nullptr &&
+            (graphState->hiddenStates[0].dataType != hiddenStates.dataType ||
+             graphState->hiddenStates[0].dims != hiddenStates.dims);
+        if (graphState->device != device || workspaceShapeChanged ||
+            (!graphState->linearCachePointers.empty() &&
+             graphState->linearCachePointers != linearCachePointers)) {
+            graphState->Reset(device);
+        }
+        graphState->device = device;
+        graphState->linearCachePointers = linearCachePointers;
+        if (!Qwen4PrepareDecodeGraphTensor(
+                graphState->hiddenStates[0], hiddenStates, device) ||
+            !Qwen4PrepareDecodeGraphTensor(
+                graphState->attentionOutput, attentionOutput, device) ||
+            !Qwen4PrepareDecodeGraphTensor(
+                graphState->attentionInjection,
+                attentionInjection, device)) {
+            return false;
+        }
+
+        auto destroySegment = [&](DecodeCudaGraphState::Segment &segment) {
+            FastllmCudaSetDevice(device);
+            if (segment.exec != nullptr) {
+                FastllmCudaGraphExecDestroy(segment.exec);
+                segment.exec = nullptr;
+            }
+            if (segment.graph != nullptr) {
+                FastllmCudaGraphDestroy(segment.graph);
+                segment.graph = nullptr;
+            }
+            if (!segment.reservedPointers.empty()) {
+                FastllmCudaGraphMemoryPoolRelease(
+                    segment.reservedPointers);
+                segment.reservedPointers.clear();
+            }
+            segment.captured = false;
+        };
+
+        auto runSegmentBody = [&](int startLayer, int nextFullLayer) {
+            Data carriedAttentionNorm;
+            for (int layer = startLayer; layer < nextFullLayer; layer++) {
+                ApplyDeviceMap(this->deviceMap, layer + 1,
+                               this->block_cnt);
+                const std::string layerPrefix = languagePrefix + "layers." +
+                                                std::to_string(layer) + ".";
+
+                Data linearAttentionInput;
+                Data linearAttentionInjection;
+                Data linearAttentionOutput;
+                const Data *currentAttentionOutput = nullptr;
+                const Data *currentAttentionInjection = nullptr;
+                if (layer == startLayer) {
+                    currentAttentionOutput = &graphState->attentionOutput;
+                    currentAttentionInjection =
+                        &graphState->attentionInjection;
+                } else {
+                    const std::string attentionHyperPrefix =
+                        layerPrefix + "attn_hyper_connection.";
+                    HyperMixNormalized(
+                        carriedAttentionNorm, attentionHyperPrefix,
+                        linearAttentionInput,
+                        &linearAttentionInjection);
+                    carriedAttentionNorm.FreeSpace();
+                    RunLinearAttention(
+                        layer, linearAttentionInput,
+                        pastKeyValues[layer].first,
+                        pastKeyValues[layer].second,
+                        linearAttentionOutput);
+                    currentAttentionOutput = &linearAttentionOutput;
+                    currentAttentionInjection =
+                        &linearAttentionInjection;
+                }
+
+                const std::string mlpHyperPrefix =
+                    layerPrefix + "mlp_hyper_connection.";
+                Data mlpNorm;
+                HyperCombineRMSNorm(
+                    graphState->hiddenStates[0],
+                    *currentAttentionOutput,
+                    *currentAttentionInjection,
+                    this->weight[mlpHyperPrefix + "hc_norm.weight"],
+                    graphState->hiddenStates[1], mlpNorm);
+
+                Data mlpInput, mlpInjection, mlpOutput;
+                HyperMixNormalized(mlpNorm, mlpHyperPrefix,
+                                   mlpInput, &mlpInjection);
+                mlpNorm.FreeSpace();
+                RunMoE(layer, mlpInput, mlpOutput);
+
+                if (layer + 1 == this->block_cnt) {
+                    const std::string finalHyperPrefix =
+                        languagePrefix + "hyper_connection_mixer.";
+                    Data finalHyperNorm;
+                    HyperCombineRMSNorm(
+                        graphState->hiddenStates[1], mlpOutput,
+                        mlpInjection,
+                        this->weight[finalHyperPrefix +
+                                     "hc_norm.weight"],
+                        graphState->hiddenStates[0], finalHyperNorm);
+                    Data finalHidden;
+                    HyperMixNormalized(finalHyperNorm,
+                                       finalHyperPrefix,
+                                       finalHidden, nullptr);
+                    finalHyperNorm.FreeSpace();
+                    Linear(finalHidden, this->weight["lm_head.weight"],
+                           Data(), graphState->logits);
+                    ToDataType(graphState->logits,
+                               DataType::FLOAT32);
+                } else {
+                    const std::string nextAttentionHyperPrefix =
+                        languagePrefix + "layers." +
+                        std::to_string(layer + 1) +
+                        ".attn_hyper_connection.";
+                    HyperCombineRMSNorm(
+                        graphState->hiddenStates[1], mlpOutput,
+                        mlpInjection,
+                        this->weight[nextAttentionHyperPrefix +
+                                     "hc_norm.weight"],
+                        graphState->hiddenStates[0],
+                        carriedAttentionNorm);
+                }
+            }
+
+            if (nextFullLayer < this->block_cnt) {
+                ApplyDeviceMap(this->deviceMap,
+                               nextFullLayer + 1,
+                               this->block_cnt);
+                const std::string attentionHyperPrefix =
+                    languagePrefix + "layers." +
+                    std::to_string(nextFullLayer) +
+                    ".attn_hyper_connection.";
+                HyperMixNormalized(
+                    carriedAttentionNorm, attentionHyperPrefix,
+                    graphState->attentionInput,
+                    &graphState->attentionInjection);
+                carriedAttentionNorm.FreeSpace();
+            }
+        };
+
+        bool captureAttempted = false;
+        auto runSegment = [&](int startLayer, int nextFullLayer) {
+            DecodeCudaGraphState::Segment &segment =
+                graphState->segments[startLayer];
+            FastllmCudaSetDevice(device);
+
+            if (segment.captured) {
+                if (FastllmCudaGraphLaunch(segment.exec)) {
+                    return;
+                }
+                std::fprintf(
+                    stderr,
+                    "[Fastllm] Qwen4 decode CUDA graph replay failed "
+                    "on GPU %d segment %d: %s; using eager fallback.\n",
+                    device, startLayer,
+                    FastllmCudaGraphLastError());
+                destroySegment(segment);
+                segment.disabled = true;
+                FastllmCudaClearThreadError();
+                FastllmCudaClearGraphError();
+                runSegmentBody(startLayer, nextFullLayer);
+                return;
+            }
+
+            FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag();
+            if (!segment.warmed || segment.disabled) {
+                runSegmentBody(startLayer, nextFullLayer);
+                segment.warmed = true;
+                if (FastllmCudaMergeMOEUsedGraphUnsafeFallback()) {
+                    segment.disabled = true;
+                }
+                return;
+            }
+            if (captureAttempted) {
+                runSegmentBody(startLayer, nextFullLayer);
+                return;
+            }
+            captureAttempted = true;
+
+            void *capturedGraph = nullptr;
+            void *capturedExec = nullptr;
+            bool poolActive = false;
+            bool captureActive = false;
+            bool captureOk = FastllmCudaGraphPrepareCaptureDevice();
+            if (captureOk) {
+                poolActive = FastllmCudaGraphMemoryPoolBegin();
+                captureOk = poolActive;
+            }
+            if (captureOk) {
+                FastllmCudaClearThreadError();
+                FastllmCudaClearGraphError();
+                captureActive = FastllmCudaGraphBeginCapture();
+                captureOk = captureActive;
+            }
+
+            bool bodyThrew = false;
+            if (captureOk) {
+                FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag();
+                try {
+                    runSegmentBody(startLayer, nextFullLayer);
+                } catch (...) {
+                    bodyThrew = true;
+                }
+                const bool unsafeMoe =
+                    FastllmCudaMergeMOEUsedGraphUnsafeFallback();
+                const bool bodyFailed = bodyThrew ||
+                    unsafeMoe || FastllmCudaGetThreadError() ||
+                    FastllmCudaGetGraphError() ||
+                    FastllmCudaGraphCaptureInvalidated();
+                bool endOk = FastllmCudaGraphEndCapture(
+                    &capturedGraph);
+                captureActive = false;
+                captureOk = !bodyFailed && endOk &&
+                            capturedGraph != nullptr;
+                if (unsafeMoe) {
+                    segment.disabled = true;
+                }
+            }
+            if (captureActive) {
+                void *discardedGraph = nullptr;
+                FastllmCudaGraphEndCapture(&discardedGraph);
+                if (discardedGraph != nullptr) {
+                    FastllmCudaGraphDestroy(discardedGraph);
+                }
+            }
+
+            if (captureOk) {
+                captureOk = FastllmCudaGraphMemoryPoolEnd(
+                    segment.reservedPointers);
+                poolActive = false;
+            }
+            if (poolActive) {
+                FastllmCudaGraphMemoryPoolAbort();
+            }
+            if (captureOk) {
+                captureOk = FastllmCudaGraphInstantiate(
+                    capturedGraph, &capturedExec) &&
+                    capturedExec != nullptr;
+            }
+
+            if (!captureOk) {
+                if (capturedExec != nullptr) {
+                    FastllmCudaGraphExecDestroy(capturedExec);
+                }
+                if (capturedGraph != nullptr) {
+                    FastllmCudaGraphDestroy(capturedGraph);
+                }
+                if (!segment.reservedPointers.empty()) {
+                    FastllmCudaGraphMemoryPoolRelease(
+                        segment.reservedPointers);
+                    segment.reservedPointers.clear();
+                }
+                segment.captureFailures++;
+                if (segment.captureFailures >= 3) {
+                    segment.disabled = true;
+                    std::fprintf(
+                        stderr,
+                        "[Fastllm] Qwen4 decode CUDA graph disabled "
+                        "on GPU %d segment %d after capture failure: %s\n",
+                        device, startLayer,
+                        FastllmCudaGraphLastError());
+                }
+                FastllmCudaClearThreadError();
+                FastllmCudaClearGraphError();
+                FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag();
+                runSegmentBody(startLayer, nextFullLayer);
+                if (FastllmCudaMergeMOEUsedGraphUnsafeFallback()) {
+                    segment.disabled = true;
+                }
+                return;
+            }
+
+            segment.graph = capturedGraph;
+            segment.exec = capturedExec;
+            segment.captured = true;
+            segment.captureFailures = 0;
+            if (!FastllmCudaGraphLaunch(segment.exec)) {
+                std::fprintf(
+                    stderr,
+                    "[Fastllm] Qwen4 decode CUDA graph first launch "
+                    "failed on GPU %d segment %d: %s; using eager fallback.\n",
+                    device, startLayer,
+                    FastllmCudaGraphLastError());
+                destroySegment(segment);
+                segment.disabled = true;
+                FastllmCudaClearThreadError();
+                FastllmCudaClearGraphError();
+                runSegmentBody(startLayer, nextFullLayer);
+                return;
+            }
+        };
+
+        int startLayer = firstFullAttentionLayer;
+        while (startLayer < this->block_cnt) {
+            int nextFullLayer = startLayer + 1;
+            while (nextFullLayer < this->block_cnt &&
+                   this->IsLinearAttentionLayer(nextFullLayer)) {
+                nextFullLayer++;
+            }
+            runSegment(startLayer, nextFullLayer);
+            if (nextFullLayer >= this->block_cnt) {
+                break;
+            }
+            ApplyDeviceMap(this->deviceMap,
+                           nextFullLayer + 1, this->block_cnt);
+            RunFullAttention(
+                nextFullLayer, graphState->attentionInput,
+                attentionMask, positionIds,
+                qsaDeviceCompatibleMask,
+                pastKeyValues[nextFullLayer].first,
+                pastKeyValues[nextFullLayer].second,
+                requestState, graphState->attentionOutput);
+            startLayer = nextFullLayer;
+        }
+
+        if (graphState->logits.dataDevice != DataDevice::CUDA ||
+            graphState->logits.cudaData == nullptr ||
+            graphState->logits.dims.empty()) {
+            return false;
+        }
+        Qwen4BorrowCudaStorage(logits, graphState->logits);
+        return true;
+#endif
+    }
+
     std::shared_ptr<Qwen4ExpModel::PrefixSnapshot>
     Qwen4ExpModel::FindPrefixSnapshotLocked(
             const std::vector<int> &tokens,
@@ -3588,6 +4067,8 @@ namespace fastllm {
         Data carriedAttentionNorm, finalHyperNorm;
         bool hasCarriedAttentionNorm = false;
         bool hasFinalHyperNorm = false;
+        bool usedDecodeCudaGraph = false;
+        Data logits;
         int qsaPreviousLength = 0;
         for (int layer = 0; layer < this->block_cnt; layer++) {
             if (!this->IsLinearAttentionLayer(layer)) {
@@ -3678,6 +4159,17 @@ namespace fastllm {
             }
             DumpTensorIfRequested("layer_" + std::to_string(layer) +
                                   "_attention", attentionOutput);
+            if (!this->IsLinearAttentionLayer(layer) &&
+                layer == this->kvCacheId &&
+                TryRunDecodeCudaGraphBackbone(
+                    layer, *hiddenStates, attentionOutput,
+                    attentionInjection, attentionMask,
+                    *layerPositionIds,
+                    qsaDeviceCompatibleMask,
+                    pastKeyValues, *requestState, logits)) {
+                usedDecodeCudaGraph = true;
+                break;
+            }
             const std::string mlpHyperPrefix =
                 layerPrefix + "mlp_hyper_connection.";
             Data mlpNorm;
@@ -3726,26 +4218,27 @@ namespace fastllm {
 
         MaybeRecordPrefixSnapshot(pastKeyValues, *requestState);
 
-        Data finalHidden;
-        AssertInFastLLM(hasFinalHyperNorm,
-                        "Qwen4-Exp final hyper norm was not produced.");
-        HyperMixNormalized(
-            finalHyperNorm, languagePrefix + "hyper_connection_mixer.",
-            finalHidden, nullptr);
-        finalHyperNorm.FreeSpace();
-        DumpTensorIfRequested("final_hidden", finalHidden);
-        Data lastHidden;
-        if (finalHidden.dims[1] > 1) {
-            Split(finalHidden, 1, finalHidden.dims[1] - 1,
-                  finalHidden.dims[1], lastHidden);
-        } else {
-            lastHidden.FakeFrom(finalHidden, 0);
-            lastHidden.Resize(finalHidden.dims);
-        }
+        if (!usedDecodeCudaGraph) {
+            Data finalHidden;
+            AssertInFastLLM(hasFinalHyperNorm,
+                            "Qwen4-Exp final hyper norm was not produced.");
+            HyperMixNormalized(
+                finalHyperNorm, languagePrefix + "hyper_connection_mixer.",
+                finalHidden, nullptr);
+            finalHyperNorm.FreeSpace();
+            DumpTensorIfRequested("final_hidden", finalHidden);
+            Data lastHidden;
+            if (finalHidden.dims[1] > 1) {
+                Split(finalHidden, 1, finalHidden.dims[1] - 1,
+                      finalHidden.dims[1], lastHidden);
+            } else {
+                lastHidden.FakeFrom(finalHidden, 0);
+                lastHidden.Resize(finalHidden.dims);
+            }
 
-        Data logits;
-        Linear(lastHidden, this->weight["lm_head.weight"], Data(), logits);
-        ToDataType(logits, DataType::FLOAT32);
+            Linear(lastHidden, this->weight["lm_head.weight"], Data(), logits);
+            ToDataType(logits, DataType::FLOAT32);
+        }
         ResetLogitsOfEOS(1, &logits, pastKeyValues, generationConfig);
         DumpTensorIfRequested("logits", logits);
 
@@ -3774,6 +4267,11 @@ namespace fastllm {
     void Qwen4ExpModel::OnResponseContextCreated(ResponseContext *context) {
         if (context == nullptr) {
             return;
+        }
+        if (!context->pastKeyValues.empty()) {
+            std::lock_guard<std::mutex> guard(this->stateMutex);
+            this->decodeCudaGraphStates.erase(
+                &context->pastKeyValues[0].first);
         }
         std::shared_ptr<PrefixSnapshot> snapshot;
         if (context->cacheLen > 0) {
@@ -3868,6 +4366,8 @@ namespace fastllm {
         }
         std::lock_guard<std::mutex> guard(this->stateMutex);
         if (!context->pastKeyValues.empty()) {
+            this->decodeCudaGraphStates.erase(
+                &context->pastKeyValues[0].first);
             this->requestStates.erase(&context->pastKeyValues[0].first);
         }
     }
@@ -3887,6 +4387,7 @@ namespace fastllm {
         {
             std::lock_guard<std::mutex> guard(this->stateMutex);
             if (!cache.empty()) {
+                this->decodeCudaGraphStates.erase(&cache[0].first);
                 this->requestStates.erase(&cache[0].first);
             }
         }

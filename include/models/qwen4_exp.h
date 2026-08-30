@@ -145,6 +145,8 @@ namespace fastllm {
         std::mutex prepareMutex;
         mutable std::mutex stateMutex;
         mutable std::map<const Data *, RequestState> requestStates;
+        mutable std::map<const Data *, std::unique_ptr<DecodeCudaGraphState>>
+            decodeCudaGraphStates;
         mutable std::mutex prefixCacheMutex;
         std::vector<std::shared_ptr<PrefixSnapshot>> prefixSnapshots;
         std::deque<PendingPrefixRestore> pendingPrefixRestores;
@@ -203,6 +205,18 @@ namespace fastllm {
                                 Data &pastConv, Data &pastRecurrent,
                                 Data &output);
         void RunMoE(int layer, const Data &input, Data &output);
+
+        bool TryRunDecodeCudaGraphBackbone(
+            int firstFullAttentionLayer,
+            const Data &hiddenStates,
+            const Data &attentionOutput,
+            const Data &attentionInjection,
+            const Data &attentionMask,
+            const Data &positionIds,
+            bool qsaDeviceCompatibleMask,
+            std::vector<std::pair<Data, Data>> &pastKeyValues,
+            RequestState &requestState,
+            Data &logits);
 
         std::shared_ptr<PrefixSnapshot> FindPrefixSnapshotLocked(
             const std::vector<int> &tokens, int maxCachedLen,
