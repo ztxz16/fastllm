@@ -9372,7 +9372,6 @@ namespace fastllm {
         clearIfOnOtherDevice(w2);
         clearIfOnOtherDevice(w3);
         clearIfOnOtherDevice(output);
-        output.Allocate();
 // ForceDeviceSync(); mergeMoeTimeCnt["allocate"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
         {
             int batch = input.dims[0];
@@ -9383,6 +9382,11 @@ namespace fastllm {
                     w1, w2, weights, weightsBatch, gateType)) {
                 return;
             }
+            // The NVFP4 grouped-Marlin implementation sizes and completely
+            // overwrites output itself. Delay the generic zero allocation
+            // until after that path so decode does not enqueue one redundant
+            // output memset per MoE layer.
+            output.Allocate();
             if (TryCudaMergeMOEInt4GroupMarlinIndexed(
                     input, output, index, score, batch, marlinTopk, w1, w2,
                     weights, weightsBatch, gateType)) {
