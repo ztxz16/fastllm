@@ -13961,29 +13961,32 @@ __global__ void FastllmDFlashDynamicConvBf16Kernel(
         const __nv_bfloat16 *__restrict__ dynamicProjection,
         const __nv_bfloat16 *__restrict__ baseKernel,
         __nv_bfloat16 *__restrict__ output,
-        int side, int blockSize, int hiddenSize,
+        int side, int tokenCount, int blockSize, int hiddenSize,
         int groupSize, int kernelSize) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = blockSize * hiddenSize;
+    int total = tokenCount * hiddenSize;
     if (index >= total) {
         return;
     }
 
-    int token = index / hiddenSize;
-    int channel = index - token * hiddenSize;
+    int flatToken = index / hiddenSize;
+    int token = flatToken % blockSize;
+    int channel = index - flatToken * hiddenSize;
     int group = channel / groupSize;
     int groups = hiddenSize / groupSize;
     __nv_bfloat16 accumulated = __float2bfloat16_rn(0.0f);
     for (int tap = 0; tap < kernelSize && tap <= token; tap++) {
         size_t dynamicIndex =
-            (((size_t)token * 2 + side) * kernelSize + tap) * groups + group;
+            (((size_t)flatToken * 2 + side) * kernelSize + tap) * groups +
+            group;
         size_t baseIndex =
             ((size_t)side * kernelSize + tap) * hiddenSize + channel;
         __nv_bfloat16 coefficient = __float2bfloat16_rn(
             __bfloat162float(dynamicProjection[dynamicIndex]) +
             __bfloat162float(baseKernel[baseIndex]));
         __nv_bfloat16 product = __float2bfloat16_rn(
-            __bfloat162float(source[(token - tap) * hiddenSize + channel]) *
+            __bfloat162float(source[
+                (flatToken - tap) * hiddenSize + channel]) *
             __bfloat162float(coefficient));
         if (tap == 0) {
             accumulated = product;
@@ -14009,13 +14012,14 @@ bool FastllmCudaDFlashDynamicConv(
         dynamicProjection.dataType != fastllm::DataType::BFLOAT16 ||
         baseKernel.dataType != fastllm::DataType::BFLOAT16 ||
         output.dataType != fastllm::DataType::BFLOAT16 ||
-        source.Count(0) != (uint64_t)blockSize * hiddenSize ||
+        source.Count(0) == 0 ||
+        source.Count(0) % ((uint64_t)blockSize * hiddenSize) != 0 ||
         dynamicProjection.Count(0) !=
-            (uint64_t)blockSize * 2 * kernelSize *
+            (source.Count(0) / hiddenSize) * 2 * kernelSize *
                 (hiddenSize / groupSize) ||
         baseKernel.Count(0) !=
             (uint64_t)2 * kernelSize * hiddenSize ||
-        output.Count(0) != (uint64_t)blockSize * hiddenSize ||
+        output.Count(0) != source.Count(0) ||
         !FastllmCudaDataHasDenseStrides(source) ||
         !FastllmCudaDataHasDenseStrides(dynamicProjection) ||
         !FastllmCudaDataHasDenseStrides(baseKernel) ||
@@ -14031,14 +14035,15 @@ bool FastllmCudaDFlashDynamicConv(
         return false;
     }
 
-    const int total = blockSize * hiddenSize;
+    const int tokenCount = source.Count(0) / hiddenSize;
+    const int total = tokenCount * hiddenSize;
     FastllmDFlashDynamicConvBf16Kernel<<<
         (total + 255) / 256, 256, 0, cudaStreamPerThread>>>(
             (const __nv_bfloat16 *)source.cudaData,
             (const __nv_bfloat16 *)dynamicProjection.cudaData,
             (const __nv_bfloat16 *)baseKernel.cudaData,
             (__nv_bfloat16 *)output.cudaData,
-            side, blockSize, hiddenSize, groupSize, kernelSize);
+            side, tokenCount, blockSize, hiddenSize, groupSize, kernelSize);
     cudaError_t state = cudaPeekAtLastError();
     if (state != cudaSuccess) {
         cudaGetLastError();

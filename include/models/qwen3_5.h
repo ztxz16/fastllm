@@ -412,6 +412,13 @@ namespace fastllm {
         bool RunDFlashTensorParallelMlp(int device, Data &input,
                                        Data &gateupWeight,
                                        Data &downWeight, Data &output);
+        void RunDFlashDynamicConvolutionFallback(
+                const Data &source, Data &dynamicProjection,
+                Data &baseKernel, int side, int blockSize, Data &output);
+        std::vector<int> SelectDFlashDraftTokens(
+                const float *candidateTopK, const float *selectorHidden,
+                int anchorToken, const GenerationConfig &generationConfig,
+                DFlashContext &context);
         void EnsureDFlashRotary(int positions, int device);
         void AppendDFlashTargetHidden(int device, int tokens,
                                       DFlashContext &context);
@@ -420,6 +427,11 @@ namespace fastllm {
                                        int anchorToken,
                                        const GenerationConfig &generationConfig,
                                        DFlashContext &context);
+        std::vector<std::vector<int> > RunDFlashDraftBatch(
+                int device, const std::vector<int> &devices,
+                const std::vector<int> &anchorTokens,
+                const std::vector<const GenerationConfig*> &generationConfigs,
+                const std::vector<DFlashContext*> &contexts);
         bool HasMtpMoeWeights() const;
         bool CanUseQwen35MTPBatchForward(int draftsPerStep) const;
         bool CanUseQwen35DFlashBatchForward(int draftsPerStep) const;

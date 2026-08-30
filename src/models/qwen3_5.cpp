@@ -136,6 +136,12 @@ namespace fastllm {
         return value != nullptr && Qwen35MoeIsTrueString(std::string(value));
     }
 
+    static bool Qwen35DFlashExactVerifyEnabled() {
+        static const bool enabled = Qwen35MoeIsTrueString(
+            std::getenv("FASTLLM_CUDA_DFLASH_EXACT_VERIFY"));
+        return enabled;
+    }
+
     static bool Qwen35DFlashBackboneTpForced() {
         // "force" keeps an explicit escape hatch for benchmarking other
         // GPU/interconnect topologies.
@@ -5643,83 +5649,138 @@ namespace fastllm {
             int rows = 0;
             int device = -1;
 
-            bool Prepare(Data &key, Data &value,
-                         int appendTokens, int targetDevice) {
-                if (appendTokens <= 0 ||
-                    key.pagedKVCacheData == nullptr ||
-                    value.pagedKVCacheData == nullptr ||
-                    key.pageLen <= 0 ||
-                    key.pageLen != value.pageLen ||
-                    key.pageIndex != value.pageIndex ||
-                    key.lastPageLen != value.lastPageLen) {
+            bool PrepareBatch(const std::vector<Data*> &keys,
+                              const std::vector<Data*> &values,
+                              const std::vector<int> &appendTokens,
+                              int targetDevice) {
+                const int requestCount = (int)keys.size();
+                if (requestCount <= 0 || values.size() != keys.size() ||
+                    appendTokens.size() != keys.size()) {
                     return false;
                 }
-                const size_t originalPages = key.pageIndex.size();
-                const int originalLastPageLen = key.lastPageLen;
-                const int originalKeyTokens =
-                    key.dims.size() >= 2 ? key.dims[1] : -1;
-                const int originalValueTokens =
-                    value.dims.size() >= 2 ? value.dims[1] : -1;
-                int baseTokens = 0;
-                if (!Qwen35AdvanceMtpVerifyPagedCachePair(
-                        key, value, appendTokens, baseTokens)) {
-                    return false;
+                PagedCacheManager *keyManager = nullptr;
+                PagedCacheManager *valueManager = nullptr;
+                for (int request = 0; request < requestCount; ++request) {
+                    Data *key = keys[request];
+                    Data *value = values[request];
+                    if (appendTokens[request] <= 0 || key == nullptr ||
+                        value == nullptr || key->pagedKVCacheData == nullptr ||
+                        value->pagedKVCacheData == nullptr || key->pageLen <= 0 ||
+                        key->pageLen != value->pageLen ||
+                        key->pageIndex != value->pageIndex ||
+                        key->lastPageLen != value->lastPageLen ||
+                        (keyManager != nullptr &&
+                         keyManager != key->pagedKVCacheData) ||
+                        (valueManager != nullptr &&
+                         valueManager != value->pagedKVCacheData)) {
+                        return false;
+                    }
+                    keyManager = key->pagedKVCacheData;
+                    valueManager = value->pagedKVCacheData;
                 }
+
+                struct CacheBackup {
+                    Data *key = nullptr;
+                    Data *value = nullptr;
+                    size_t keyPages = 0;
+                    size_t valuePages = 0;
+                    int keyLastPageLen = 0;
+                    int valueLastPageLen = 0;
+                    int keyTokens = -1;
+                    int valueTokens = -1;
+                    bool advanced = false;
+                };
+                std::vector<CacheBackup> backups(requestCount);
+                std::vector<int> baseTokens(requestCount, 0);
                 auto rollback = [&]() {
-                    while (value.pageIndex.size() > originalPages) {
-                        value.pagedKVCacheData->ReleasePageIndex(
-                            value.pageIndex.back());
-                        value.pageIndex.pop_back();
-                    }
-                    while (key.pageIndex.size() > originalPages) {
-                        key.pagedKVCacheData->ReleasePageIndex(
-                            key.pageIndex.back());
-                        key.pageIndex.pop_back();
-                    }
-                    key.lastPageLen = originalLastPageLen;
-                    value.lastPageLen = originalLastPageLen;
-                    if (originalKeyTokens >= 0) {
-                        key.dims[1] = originalKeyTokens;
-                    }
-                    if (originalValueTokens >= 0) {
-                        value.dims[1] = originalValueTokens;
+                    for (int request = requestCount - 1; request >= 0;
+                         --request) {
+                        CacheBackup &backup = backups[request];
+                        if (!backup.advanced) {
+                            continue;
+                        }
+                        while (backup.value->pageIndex.size() >
+                               backup.valuePages) {
+                            backup.value->pagedKVCacheData->ReleasePageIndex(
+                                backup.value->pageIndex.back());
+                            backup.value->pageIndex.pop_back();
+                        }
+                        while (backup.key->pageIndex.size() > backup.keyPages) {
+                            backup.key->pagedKVCacheData->ReleasePageIndex(
+                                backup.key->pageIndex.back());
+                            backup.key->pageIndex.pop_back();
+                        }
+                        backup.key->lastPageLen = backup.keyLastPageLen;
+                        backup.value->lastPageLen = backup.valueLastPageLen;
+                        if (backup.keyTokens >= 0) {
+                            backup.key->dims[1] = backup.keyTokens;
+                        }
+                        if (backup.valueTokens >= 0) {
+                            backup.value->dims[1] = backup.valueTokens;
+                        }
                     }
                 };
+                rows = 0;
+                for (int request = 0; request < requestCount; ++request) {
+                    CacheBackup &backup = backups[request];
+                    backup.key = keys[request];
+                    backup.value = values[request];
+                    backup.keyPages = backup.key->pageIndex.size();
+                    backup.valuePages = backup.value->pageIndex.size();
+                    backup.keyLastPageLen = backup.key->lastPageLen;
+                    backup.valueLastPageLen = backup.value->lastPageLen;
+                    backup.keyTokens = backup.key->dims.size() >= 2 ?
+                        backup.key->dims[1] : -1;
+                    backup.valueTokens = backup.value->dims.size() >= 2 ?
+                        backup.value->dims[1] : -1;
+                    if (!Qwen35AdvanceMtpVerifyPagedCachePair(
+                            *backup.key, *backup.value,
+                            appendTokens[request], baseTokens[request])) {
+                        rollback();
+                        return false;
+                    }
+                    backup.advanced = true;
+                    rows += appendTokens[request];
+                }
 
-                rows = appendTokens;
                 device = targetDevice;
                 insertIndexHost.resize(rows);
                 insertPositionHost.resize(rows);
                 pageSizeRowsHost.resize((size_t)rows * 2);
                 lastPageLenHost.resize(rows);
                 static const std::vector<int> qSizesHost{0, 1};
-                pageIndexHost = key.pageIndex;
+                pageIndexHost = keys[0]->pageIndex;
                 batchQSizesHost.assign(rows + 1, 0);
                 batchPageSizesHost.assign(rows + 1, 0);
                 batchPageIndexHost.clear();
-                for (int row = 0; row < rows; ++row) {
-                    int logicalToken = baseTokens + row;
-                    int pageOrdinal = logicalToken / key.pageLen;
-                    int pageOffset = logicalToken % key.pageLen;
-                    if (pageOrdinal < 0 ||
-                        pageOrdinal >= (int)pageIndexHost.size()) {
-                        rollback();
-                        return false;
+                int row = 0;
+                for (int request = 0; request < requestCount; ++request) {
+                    const Data &key = *keys[request];
+                    for (int localRow = 0;
+                         localRow < appendTokens[request];
+                         ++localRow, ++row) {
+                        int logicalToken = baseTokens[request] + localRow;
+                        int pageOrdinal = logicalToken / key.pageLen;
+                        int pageOffset = logicalToken % key.pageLen;
+                        if (pageOrdinal < 0 ||
+                            pageOrdinal >= (int)key.pageIndex.size()) {
+                            rollback();
+                            return false;
+                        }
+                        insertIndexHost[row] = key.pageIndex[pageOrdinal];
+                        insertPositionHost[row] = pageOffset;
+                        pageSizeRowsHost[(size_t)row * 2] = 0;
+                        pageSizeRowsHost[(size_t)row * 2 + 1] =
+                            pageOrdinal + 1;
+                        lastPageLenHost[row] = pageOffset + 1;
+                        batchQSizesHost[row + 1] = row + 1;
+                        batchPageSizesHost[row + 1] =
+                            batchPageSizesHost[row] + pageOrdinal + 1;
+                        batchPageIndexHost.insert(
+                            batchPageIndexHost.end(),
+                            key.pageIndex.begin(),
+                            key.pageIndex.begin() + pageOrdinal + 1);
                     }
-                    insertIndexHost[row] =
-                        pageIndexHost[pageOrdinal];
-                    insertPositionHost[row] = pageOffset;
-                    pageSizeRowsHost[(size_t)row * 2] = 0;
-                    pageSizeRowsHost[(size_t)row * 2 + 1] =
-                        pageOrdinal + 1;
-                    lastPageLenHost[row] = pageOffset + 1;
-                    batchQSizesHost[row + 1] = row + 1;
-                    batchPageSizesHost[row + 1] =
-                        batchPageSizesHost[row] + pageOrdinal + 1;
-                    batchPageIndexHost.insert(
-                        batchPageIndexHost.end(),
-                        pageIndexHost.begin(),
-                        pageIndexHost.begin() + pageOrdinal + 1);
                 }
 
                 std::vector<int> packedHost;
@@ -5781,6 +5842,12 @@ namespace fastllm {
                     return false;
                 }
                 return true;
+            }
+
+            bool Prepare(Data &key, Data &value,
+                         int appendTokens, int targetDevice) {
+                return PrepareBatch({&key}, {&value}, {appendTokens},
+                                    targetDevice);
             }
 
             bool BindRow(int row) {
@@ -11056,16 +11123,30 @@ namespace fastllm {
         Data &hiddenStates = *hiddenStatesPtr;
         const int previousLinearExactBatchThreshold =
             FastllmCudaGetLinearExactBatchThreshold();
-        const bool exactSmallDFlashVerifier =
-            speculativeCollectAllLogits &&
-            speculativeCaptureDFlashHiddenStates &&
-            hiddenStates.dims.size() >= 2 &&
-            hiddenStates.dims[1] > 1 &&
-            hiddenStates.dims[1] <= QWEN35_MTP_FAST_SEQ_MAX;
+        const bool exactSmallDFlashVerifier = [&]() {
+            if (!Qwen35DFlashExactVerifyEnabled() ||
+                !speculativeCollectAllLogits ||
+                !speculativeCaptureDFlashHiddenStates || batch <= 0 ||
+                hiddenStates.dims.size() < 2 ||
+                hiddenStates.dims[0] != 1 ||
+                (int)seqLens.size() < batch) {
+                return false;
+            }
+            int totalVerifierTokens = 0;
+            for (int b = 0; b < batch; ++b) {
+                if (seqLens[b] <= 0 ||
+                    seqLens[b] > QWEN35_MTP_FAST_SEQ_MAX) {
+                    return false;
+                }
+                totalVerifierTokens += seqLens[b];
+            }
+            return totalVerifierTokens > 1 &&
+                totalVerifierTokens == hiddenStates.dims[1];
+        }();
         if (exactSmallDFlashVerifier) {
             FastllmCudaSetLinearExactBatchThreshold(
                 std::max(previousLinearExactBatchThreshold,
-                         QWEN35_MTP_FAST_SEQ_MAX + 1));
+                         hiddenStates.dims[1] + 1));
         }
         struct LinearExactBatchThresholdRestore {
             int previous;
@@ -11099,6 +11180,12 @@ namespace fastllm {
         Data qRepeat, kRepeat, qq, qTemp, kkPad, vvPad, bbPad, ggPad, decayMask;
         Data kBeta, vBeta, attn, at, kCumdecay, gExp;
         std::vector<Data*> batchPastKeys(batch), batchPastValues(batch);
+        // The q1 attention helper expands its cache scratch to one entry per
+        // flattened verifier row. Keep request-level metadata in a separate
+        // fixed-size vector so later attention layers still see one cache per
+        // original request.
+        std::vector<Data*> exactRequestPastKeys(batch),
+                           exactRequestPastValues(batch);
         bool generatedAppendParams = false;
         bool generatedDecodeParams = false;
         bool freshBatchPrefill =
@@ -11227,8 +11314,7 @@ namespace fastllm {
                     const bool exactDFlashVerifierAttention =
                         exactSmallDFlashVerifier &&
                         mtpVerifyGraphDeviceState == nullptr &&
-                        batch == 1 && bsz == 1 && seqlen > 1 &&
-                        seqlen <= QWEN35_MTP_FAST_SEQ_MAX;
+                        bsz == 1 && seqlen > 1;
                     if (exactDFlashVerifierAttention) {
                         // Project all verifier rows together, but run the
                         // cache append and attention core as chronological
@@ -11286,15 +11372,39 @@ namespace fastllm {
                         Data rowHiddenStates, rowPositionIds, rowMerged;
                         Data rowAttentionOutput;
                         const std::vector<int> rowSeqLens{1};
-                        const bool packedExactPagedMeta =
+                        for (int b = 0; b < batch; ++b) {
+                            exactRequestPastKeys[b] =
+                                pastKeyValues[b * block_cnt + i].first;
+                            exactRequestPastValues[b] =
+                                pastKeyValues[b * block_cnt + i].second;
+                        }
+                        const bool flatTextPositions =
+                            localPositionIds.dims.size() == 2 &&
+                            localPositionIds.dims[0] == 1;
+                        if (batch > 1 && !flatTextPositions) {
+                            // Multimodal MRoPE rows are not contiguous per
+                            // request.  Let the scheduler use its established
+                            // serial fallback before advancing paged caches.
+                            throw Qwen35MtpBatchFastPathUnavailable(
+                                "batched DFlash exact position layout is "
+                                "unavailable");
+                        }
+                        const bool packedExactPagedMeta = batch == 1 ?
                             exactDFlashPagedMeta.Prepare(
                                 *pastKeyValues[i].first,
                                 *pastKeyValues[i].second,
-                                seqlen, gpuId);
+                                seqlen, gpuId) :
+                            exactDFlashPagedMeta.PrepareBatch(
+                                exactRequestPastKeys,
+                                exactRequestPastValues,
+                                seqLens, gpuId);
+                        if (!packedExactPagedMeta && batch > 1) {
+                            throw Qwen35MtpBatchFastPathUnavailable(
+                                "batched DFlash exact attention metadata "
+                                "is unavailable");
+                        }
                         const bool batchedExactQ1Attention =
-                            packedExactPagedMeta &&
-                            localPositionIds.dims.size() == 2 &&
-                            localPositionIds.dims[0] == 1;
+                            packedExactPagedMeta && flatTextPositions;
                         Data *exactProjectionInput = &exactAttentionOutput;
                         if (batchedExactQ1Attention) {
                             // Treat each verifier row as an independent q1
@@ -19386,35 +19496,60 @@ namespace fastllm {
                 targetRet[tokenOffset + matchedDrafts[b]]);
         };
         if (useDFlash) {
+            std::vector<int> lastTargetTokens(batch, 0);
+            std::vector<std::vector<int> > drafts(batch);
+            std::vector<int> activeIndices;
+            std::vector<int> activeAnchors;
+            std::vector<const GenerationConfig*> activeConfigs;
+            std::vector<DFlashContext*> activeContexts;
+            activeIndices.reserve(batch);
+            activeAnchors.reserve(batch);
+            activeConfigs.reserve(batch);
+            activeContexts.reserve(batch);
             for (int b = 0; b < batch; b++) {
                 const int commitLen = commitLens[b];
                 const int tokenOffset = tokenOffsets[b];
                 const int lastTargetToken =
                     targetRet[tokenOffset + commitLen - 1];
+                lastTargetTokens[b] = lastTargetToken;
                 commitAcceptedTokens(b);
                 speculativeDFlashHiddenStates =
                     std::move(committedDFlashHidden[b]);
                 AppendDFlashTargetHidden(
                     rootDevice, commitLen, *requestDFlashContexts[b]);
-                std::vector<int> drafts;
                 if (!Qwen35DFlashCommitEndsRequest(
                         *this, contexts[b], acceptedTokens[b]) &&
                     Qwen35DFlashDraftFitsContext(
                         max_positions, dflashCheckpointBlockSize,
                         requestDFlashContexts[b]->committedTokens)) {
-                    drafts = RunDFlashDraft(
-                        rootDevice, devices, lastTargetToken,
-                        generationConfigs[b],
-                        *requestDFlashContexts[b]);
-                    AssertInFastLLM(
-                        (int)drafts.size() == draftsPerStep,
-                        "Qwen3.5 batched DFlash draft returned invalid output.\n");
+                    activeIndices.push_back(b);
+                    activeAnchors.push_back(lastTargetToken);
+                    activeConfigs.push_back(&generationConfigs[b]);
+                    activeContexts.push_back(requestDFlashContexts[b]);
                 }
+            }
 
-                nextInputTokens[b].reserve(1 + drafts.size());
-                nextInputTokens[b].push_back(lastTargetToken);
+            if (!activeIndices.empty()) {
+                std::vector<std::vector<int> > activeDrafts =
+                    RunDFlashDraftBatch(
+                        rootDevice, devices, activeAnchors,
+                        activeConfigs, activeContexts);
+                AssertInFastLLM(
+                    activeDrafts.size() == activeIndices.size(),
+                    "Qwen3.5 batched DFlash draft returned invalid batch.\n");
+                for (int i = 0; i < (int)activeIndices.size(); ++i) {
+                    AssertInFastLLM(
+                        (int)activeDrafts[i].size() == draftsPerStep,
+                        "Qwen3.5 batched DFlash draft returned invalid output.\n");
+                    drafts[activeIndices[i]] = std::move(activeDrafts[i]);
+                }
+            }
+
+            for (int b = 0; b < batch; ++b) {
+                nextInputTokens[b].reserve(1 + drafts[b].size());
+                nextInputTokens[b].push_back(lastTargetTokens[b]);
                 nextInputTokens[b].insert(nextInputTokens[b].end(),
-                                          drafts.begin(), drafts.end());
+                                          drafts[b].begin(), drafts[b].end());
                 int proposalCount = seqLens[b] - 1;
                 for (int pos = 0;
                      pos < proposalCount && pos < QWEN35_MTP_MAX_DRAFTS;
@@ -19962,6 +20097,91 @@ namespace fastllm {
                 current = current >= INT_MAX - it.second ?
                     INT_MAX : current + it.second;
             }
+        };
+
+        auto collectPrefillPageNeeds = [&](ResponseContext *ctx,
+                                           int appendTokens) {
+            std::map<PagedCacheManager*, int> needs;
+            if (ctx == nullptr || appendTokens <= 0) {
+                return needs;
+            }
+            auto addManagerNeed = [&](PagedCacheManager *manager,
+                                      int currentTokens,
+                                      int currentPages) {
+                if (manager == nullptr || manager->pageLen <= 0 ||
+                    manager->type !=
+                        PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE) {
+                    return;
+                }
+                long long totalTokens =
+                    (long long)std::max(0, currentTokens) + appendTokens;
+                long long totalPages =
+                    (totalTokens + manager->pageLen - 1) /
+                    manager->pageLen;
+                if (totalPages > manager->maxPages) {
+                    needs[manager] = INT_MAX;
+                    return;
+                }
+                int newPages = (int)totalPages - std::max(0, currentPages);
+                if (newPages > 0) {
+                    int &managerNeed = needs[manager];
+                    managerNeed = managerNeed >= INT_MAX - newPages ?
+                        INT_MAX : managerNeed + newPages;
+                }
+            };
+            std::function<bool(Data&)> addExistingCache =
+                    [&](Data &cache) -> bool {
+                if (cache.multiDeviceData &&
+                    !cache.multiDeviceDatas.empty()) {
+                    bool foundPagedLocal = false;
+                    for (auto &it : cache.multiDeviceDatas) {
+                        if (it.second != nullptr) {
+                            foundPagedLocal =
+                                addExistingCache(*it.second) ||
+                                foundPagedLocal;
+                        }
+                    }
+                    if (foundPagedLocal) {
+                        return true;
+                    }
+                }
+                PagedCacheManager *manager = cache.pagedKVCacheData;
+                if (!cache.isPagedKVCache || manager == nullptr ||
+                    manager->type !=
+                        PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE) {
+                    return false;
+                }
+                int currentPages = (int)cache.pageIndex.size();
+                if (currentPages > 0 &&
+                    (cache.pageLen <= 0 || cache.lastPageLen <= 0 ||
+                     cache.lastPageLen > cache.pageLen)) {
+                    needs[manager] = INT_MAX;
+                    return true;
+                }
+                int currentTokens = currentPages > 0 ?
+                    (currentPages - 1) * cache.pageLen +
+                        cache.lastPageLen : 0;
+                addManagerNeed(manager, currentTokens, currentPages);
+                return true;
+            };
+            for (int layer = 0;
+                 layer < model->block_cnt &&
+                 layer < (int)ctx->pastKeyValues.size(); ++layer) {
+                for (int keyFlag = 0; keyFlag < 2; ++keyFlag) {
+                    Data &cache = keyFlag == 0 ?
+                        ctx->pastKeyValues[layer].first :
+                        ctx->pastKeyValues[layer].second;
+                    if (addExistingCache(cache)) {
+                        continue;
+                    }
+                    auto refs = model->GetPagedKVCacheManagers(
+                        layer, keyFlag == 0);
+                    for (auto &ref : refs) {
+                        addManagerNeed(ref.second, 0, 0);
+                    }
+                }
+            }
+            return needs;
         };
 
         auto tryRestorePrefixCache = [&](ResponseContext *ctx) -> int {
@@ -20518,6 +20738,7 @@ namespace fastllm {
             bool selectedNeedLastTokens = false;
             bool selectedIsPrompt = false;
             bool selectedMultimodal = false;
+            bool prefillPageCapacityBlocked = false;
             std::map<PagedCacheManager*, int> selectedDecodePageNeeds;
 
             attentionMasks.reserve(mtpSchedulerLanes);
@@ -20711,7 +20932,8 @@ namespace fastllm {
                 if (isPrompt == 1 && !canAddPrefill) {
                     continue;
                 }
-                if (isPrompt == 0 && hasPrefill && canAddPrefill) {
+                if (isPrompt == 0 && hasPrefill && canAddPrefill &&
+                    !prefillPageCapacityBlocked) {
                     continue;
                 }
 
@@ -20725,10 +20947,6 @@ namespace fastllm {
                     }
                     if (!isPrompt && ctx->preTokens == 0) {
                         continue;
-                    }
-                    if (isPrompt && ctx->cacheLen == 0 &&
-                        tryRestorePrefixCache(ctx) < 0) {
-                        releaseAndReinitRequest(ctx);
                     }
                     if (!isPrompt && !seqLens.empty() &&
                         scheduledDecodeTokens(ctx) != seqLens[0]) {
@@ -20758,6 +20976,39 @@ namespace fastllm {
                         ctx->isEnding = true;
                         ctx->error = ResponseContextErrorPromptTooLong;
                         continue;
+                    }
+
+                    if (isPrompt) {
+                        int cachedAndScheduled =
+                            ctx->cacheLen + scheduledTokens;
+                        int remainingCapacity =
+                            model->max_positions - cachedAndScheduled;
+                        if (maxTotalLens > 0) {
+                            remainingCapacity = std::min(
+                                remainingCapacity,
+                                maxTotalLens - cachedAndScheduled);
+                        }
+                        int reserveTokens = std::min(
+                            mtpBatchDecodeTokens,
+                            std::max(0, remainingCapacity));
+                        auto pageNeeds = collectPrefillPageNeeds(
+                            ctx, scheduledTokens + reserveTokens);
+                        if (!pageNeeds.empty() &&
+                            hasPagedManagerShortage(pageNeeds)) {
+                            // A decode request can temporarily leave too few
+                            // pages to rebuild an evicted long context. Keep
+                            // the prefill pending until that request releases
+                            // its cache; restoring a prefix here would consume
+                            // every free page and fail on the first append.
+                            prefillPageCapacityBlocked = true;
+                            continue;
+                        }
+                        if (ctx->cacheLen == 0 &&
+                            tryRestorePrefixCache(ctx) < 0) {
+                            releaseAndReinitRequest(ctx);
+                        }
+                        scheduledTokens =
+                            (int)ctx->currentTokens.size();
                     }
 
                     if (!isPrompt &&
@@ -24544,6 +24795,204 @@ namespace fastllm {
 #endif
     }
 
+    void Qwen3_5Model::RunDFlashDynamicConvolutionFallback(
+            const Data &source, Data &dynamicProjection,
+            Data &baseKernel, int side, int blockSize, Data &output) {
+        AssertInFastLLM(
+            blockSize > 0 && source.dims.size() == 3 &&
+                source.dims[0] == 1 && source.dims[1] > 0 &&
+                source.dims[1] % blockSize == 0 &&
+                source.dims[2] == embed_dim,
+            "DFlash dynamic convolution source shape is invalid.\n");
+        const int groups = embed_dim / dflashConvGroupSize;
+        const int batch = source.dims[1] / blockSize;
+        Data sideBase;
+        Split(baseKernel, 0, side, side + 1, sideBase);
+        sideBase.Reshape({dflashConvKernelSize, embed_dim});
+        Data joined;
+        for (int b = 0; b < batch; ++b) {
+            const int begin = b * blockSize;
+            Data sourcePart, dynamicPart;
+            Split(source, 1, begin, begin + blockSize, sourcePart);
+            Split(dynamicProjection, 1, begin, begin + blockSize,
+                  dynamicPart);
+            dynamicPart.Reshape(
+                {1, blockSize, 2, dflashConvKernelSize, groups});
+            Data sideDynamic;
+            Split(dynamicPart, 2, side, side + 1, sideDynamic);
+            sideDynamic.Reshape(
+                {1, blockSize, dflashConvKernelSize, groups});
+
+            Data requestOutput;
+            for (int tap = 0; tap < dflashConvKernelSize; ++tap) {
+                Data delta, expandedDelta, baseTap, repeatedBase;
+                Split(sideDynamic, 2, tap, tap + 1, delta);
+                delta.Reshape({1, blockSize, groups, 1});
+                Repeat(delta, 3, dflashConvGroupSize, expandedDelta);
+                expandedDelta.Reshape({1, blockSize, embed_dim});
+                Split(sideBase, 0, tap, tap + 1, baseTap);
+                baseTap.Reshape({1, 1, embed_dim});
+                Repeat(baseTap, 1, blockSize, repeatedBase);
+                AddTo(expandedDelta, repeatedBase);
+
+                Data values;
+                if (tap == 0) {
+                    Copy(sourcePart, values);
+                } else {
+                    Data zero, prefix;
+                    Split(sourcePart, 1, 0, 1, zero);
+                    Mul(zero, 0.0f, zero);
+                    Split(sourcePart, 1, 0, blockSize - tap, prefix);
+                    Cat(zero, prefix, 1, values);
+                }
+                MulTo(values, expandedDelta);
+                if (tap == 0) {
+                    Copy(values, requestOutput);
+                } else {
+                    AddTo(requestOutput, values);
+                }
+            }
+            if (b == 0) {
+                Copy(requestOutput, joined);
+            } else {
+                Data next;
+                Cat(joined, requestOutput, 1, next);
+                joined.CopyFrom(next);
+            }
+        }
+        output.CopyFrom(joined);
+    }
+
+    std::vector<int> Qwen3_5Model::SelectDFlashDraftTokens(
+            const float *candidateTopK, const float *selectorHidden,
+            int anchorToken, const GenerationConfig &generationConfig,
+            DFlashContext &context) {
+        AssertInFastLLM(candidateTopK != nullptr && selectorHidden != nullptr,
+                        "DFlash selector input is null.\n");
+        Data &predecessor =
+            weight["dflash.candidate_selector.predecessor_codebook"];
+        Data &successor =
+            weight["dflash.candidate_selector.successor_codebook"];
+        predecessor.ToDevice(DataDevice::CPU);
+        successor.ToDevice(DataDevice::CPU);
+        AssertInFastLLM(
+            predecessor.dims.size() == 2 && successor.dims.size() == 2 &&
+                predecessor.dims[1] == dflashSelectorRank &&
+                successor.dims[1] == dflashSelectorRank,
+            "DFlash selector codebook shape mismatch.\n");
+        auto codebookValue = [&](const Data &table, int token, int rank) {
+            const size_t index =
+                (size_t)token * dflashSelectorRank + rank;
+            if (table.dataType == DataType::BFLOAT16) {
+                return BFloat16BitsToFloat32(
+                    ((const uint16_t*)table.cpuData)[index]);
+            }
+            AssertInFastLLM(table.dataType == DataType::FLOAT32,
+                            "DFlash selector codebook dtype is unsupported.\n");
+            return ((const float*)table.cpuData)[index];
+        };
+
+        const int slots = dflashRuntimeBlockSize - 1;
+        std::vector<int> drafts;
+        drafts.reserve(slots);
+        context.proposalTokens.clear();
+        context.proposalCandidateIds.clear();
+        context.proposalCandidateProbs.clear();
+        context.proposalTokens.reserve(slots);
+        context.proposalCandidateIds.reserve(
+            (size_t)slots * dflashSelectorTopK);
+        context.proposalCandidateProbs.reserve(
+            (size_t)slots * dflashSelectorTopK);
+        const bool greedy = generationConfig.IsSimpleGreedy();
+        const float temperature = std::max(
+            generationConfig.temperature, 1.0e-5f);
+        static thread_local std::mt19937 selectorRng(
+            std::random_device{}());
+        static thread_local std::uniform_real_distribution<float>
+            selectorUniform(0.0f, 1.0f);
+        int previousToken = anchorToken;
+        for (int position = 0; position < slots; ++position) {
+            AssertInFastLLM(
+                previousToken >= 0 && previousToken < predecessor.dims[0],
+                "DFlash selector predecessor id is out of range.\n");
+            std::vector<float> scores(dflashSelectorTopK);
+            float bestScore = -std::numeric_limits<float>::infinity();
+            int bestCandidate = 0;
+            for (int candidate = 0; candidate < dflashSelectorTopK;
+                 ++candidate) {
+                const size_t topKOffset =
+                    ((size_t)position * dflashSelectorTopK + candidate) * 2;
+                const int candidateToken =
+                    (int)(candidateTopK[topKOffset] + 1.0e-3f);
+                AssertInFastLLM(
+                    candidateToken >= 0 && candidateToken < successor.dims[0],
+                    "DFlash selector candidate id is out of range.\n");
+                float score = candidateTopK[topKOffset + 1];
+                const float *positionHidden = selectorHidden +
+                    (size_t)position * dflashSelectorRank;
+                for (int rank = 0; rank < dflashSelectorRank; ++rank) {
+                    score += codebookValue(
+                                 predecessor, previousToken, rank) *
+                             positionHidden[rank] *
+                             codebookValue(
+                                 successor, candidateToken, rank);
+                }
+                scores[candidate] = score;
+                context.proposalCandidateIds.push_back(candidateToken);
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestCandidate = candidate;
+                }
+            }
+
+            std::vector<float> probabilities(dflashSelectorTopK, 0.0f);
+            int selectedCandidate = bestCandidate;
+            if (greedy) {
+                probabilities[bestCandidate] = 1.0f;
+            } else {
+                float maxScaled = -std::numeric_limits<float>::infinity();
+                for (float score : scores) {
+                    maxScaled = std::max(maxScaled, score / temperature);
+                }
+                float sum = 0.0f;
+                for (int candidate = 0; candidate < dflashSelectorTopK;
+                     ++candidate) {
+                    probabilities[candidate] = std::exp(
+                        scores[candidate] / temperature - maxScaled);
+                    sum += probabilities[candidate];
+                }
+                AssertInFastLLM(std::isfinite(sum) && sum > 0.0f,
+                                "DFlash selector probability is invalid.\n");
+                const float inverseSum = 1.0f / sum;
+                for (float &probability : probabilities) {
+                    probability *= inverseSum;
+                }
+                const float uniform = selectorUniform(selectorRng);
+                float cumulative = 0.0f;
+                selectedCandidate = dflashSelectorTopK - 1;
+                for (int candidate = 0; candidate < dflashSelectorTopK;
+                     ++candidate) {
+                    cumulative += probabilities[candidate];
+                    if (uniform < cumulative) {
+                        selectedCandidate = candidate;
+                        break;
+                    }
+                }
+            }
+            context.proposalCandidateProbs.insert(
+                context.proposalCandidateProbs.end(),
+                probabilities.begin(), probabilities.end());
+            const size_t selectedOffset =
+                (size_t)position * dflashSelectorTopK + selectedCandidate;
+            const int bestToken =
+                context.proposalCandidateIds[selectedOffset];
+            drafts.push_back(bestToken);
+            context.proposalTokens.push_back(bestToken);
+            previousToken = bestToken;
+        }
+        return drafts;
+    }
+
     std::vector<int> Qwen3_5Model::RunDFlashDraft(
             int device, const std::vector<int> &devices,
             int anchorToken, const GenerationConfig &generationConfig,
@@ -24679,7 +25128,6 @@ namespace fastllm {
                                    Data &baseKernel,
                                    int side,
                                    Data &output) {
-            const int groups = embed_dim / dflashConvGroupSize;
             if (::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled(
                     "FASTLLM_CUDA_DFLASH_FUSED_CONV") &&
                 source.dataDevice == DataDevice::CUDA &&
@@ -24699,44 +25147,9 @@ namespace fastllm {
                     return;
                 }
             }
-            dynamicProjection.Reshape(
-                {1, blockSize, 2, dflashConvKernelSize, groups});
-            Data sideDynamic;
-            Split(dynamicProjection, 2, side, side + 1, sideDynamic);
-            sideDynamic.Reshape(
-                {1, blockSize, dflashConvKernelSize, groups});
-            Data sideBase;
-            Split(baseKernel, 0, side, side + 1, sideBase);
-            sideBase.Reshape(
-                {dflashConvKernelSize, embed_dim});
-            for (int tap = 0; tap < dflashConvKernelSize; tap++) {
-                Data delta, expandedDelta, baseTap, repeatedBase;
-                Split(sideDynamic, 2, tap, tap + 1, delta);
-                delta.Reshape({1, blockSize, groups, 1});
-                Repeat(delta, 3, dflashConvGroupSize, expandedDelta);
-                expandedDelta.Reshape({1, blockSize, embed_dim});
-                Split(sideBase, 0, tap, tap + 1, baseTap);
-                baseTap.Reshape({1, 1, embed_dim});
-                Repeat(baseTap, 1, blockSize, repeatedBase);
-                AddTo(expandedDelta, repeatedBase);
-
-                Data values;
-                if (tap == 0) {
-                    Copy(source, values);
-                } else {
-                    Data zero, prefix;
-                    Split(source, 1, 0, 1, zero);
-                    Mul(zero, 0.0f, zero);
-                    Split(source, 1, 0, blockSize - tap, prefix);
-                    Cat(zero, prefix, 1, values);
-                }
-                MulTo(values, expandedDelta);
-                if (tap == 0) {
-                    Copy(values, output);
-                } else {
-                    AddTo(output, values);
-                }
-            }
+            RunDFlashDynamicConvolutionFallback(
+                source, dynamicProjection, baseKernel, side, blockSize,
+                output);
         };
 
         for (int layerIndex = 0; layerIndex < dflashLayers; layerIndex++) {
@@ -24908,7 +25321,8 @@ namespace fastllm {
                    *GetEmptyData(), mlpDynamic);
             dynamicConvolve(
                 normalized, mlpDynamic,
-                weight[prefix + "mlp_conv.base_kernel"], 0, mlpInput);
+                weight[prefix + "mlp_conv.base_kernel"], 0,
+                mlpInput);
             Data mlpOutput, convolvedMlp;
             auto gateupIt = weight.weight.find(
                 prefix + "mlp.gateup_proj.weight");
@@ -25290,126 +25704,699 @@ namespace fastllm {
                *GetEmptyData(), selectorHidden);
         ToDataType(selectorHidden, DataType::FLOAT32);
         selectorHidden.ToDevice(DataDevice::CPU);
-        Data &predecessor =
-            weight["dflash.candidate_selector.predecessor_codebook"];
-        Data &successor =
-            weight["dflash.candidate_selector.successor_codebook"];
-        predecessor.ToDevice(DataDevice::CPU);
-        successor.ToDevice(DataDevice::CPU);
         AssertInFastLLM(
             candidateTopK.Count(0) ==
                     (uint64_t)slots * dflashSelectorTopK * 2 &&
-                selectorHidden.Count(0) ==
-                    (uint64_t)slots * dflashSelectorRank &&
-                predecessor.dims.size() == 2 &&
-                successor.dims.size() == 2 &&
-                predecessor.dims[1] == dflashSelectorRank &&
-                successor.dims[1] == dflashSelectorRank,
+            selectorHidden.Count(0) ==
+                    (uint64_t)slots * dflashSelectorRank,
             "DFlash selector tensor shape mismatch.\n");
-        const float *topKData = (const float*)candidateTopK.cpuData;
-        const float *hiddenData = (const float*)selectorHidden.cpuData;
-        auto codebookValue = [&](const Data &table, int token, int rank) {
-            size_t index = (size_t)token * dflashSelectorRank + rank;
-            if (table.dataType == DataType::BFLOAT16) {
-                return BFloat16BitsToFloat32(
-                    ((const uint16_t*)table.cpuData)[index]);
+        return SelectDFlashDraftTokens(
+            (const float*)candidateTopK.cpuData,
+            (const float*)selectorHidden.cpuData,
+            anchorToken, generationConfig, context);
+#endif
+    }
+
+    std::vector<std::vector<int> > Qwen3_5Model::RunDFlashDraftBatch(
+            int device, const std::vector<int> &devices,
+            const std::vector<int> &anchorTokens,
+            const std::vector<const GenerationConfig*> &generationConfigs,
+            const std::vector<DFlashContext*> &contexts) {
+#ifndef USE_CUDA
+        (void)device;
+        (void)devices;
+        (void)anchorTokens;
+        (void)generationConfigs;
+        (void)contexts;
+        return {};
+#else
+        const int batch = (int)contexts.size();
+        AssertInFastLLM(
+            batch > 0 && (int)anchorTokens.size() == batch &&
+                (int)generationConfigs.size() == batch,
+            "DFlash batched draft input size mismatch.\n");
+        if (batch == 1) {
+            AssertInFastLLM(contexts[0] != nullptr &&
+                                generationConfigs[0] != nullptr,
+                            "DFlash single draft input is null.\n");
+            return {RunDFlashDraft(device, devices, anchorTokens[0],
+                                   *generationConfigs[0], *contexts[0])};
+        }
+
+        PrepareDFlashWeightsForDevice(device);
+        AssertInFastLLM(HasDFlashWeights(),
+                        "DFlash draft weights are incomplete.\n");
+        const int runtimeBlockSize = dflashRuntimeBlockSize;
+        const int blockSize = dflashCheckpointBlockSize;
+        const int slots = runtimeBlockSize - 1;
+        const int totalTokens = batch * blockSize;
+        const int cacheAllocationUnit = Qwen35DFlashCacheAllocationUnit(
+            dflashSlidingWindow, blockSize);
+        int maxRotaryPosition = 0;
+        std::vector<int> cachedTokens(batch), cacheStarts(batch);
+        for (int b = 0; b < batch; ++b) {
+            AssertInFastLLM(
+                contexts[b] != nullptr && generationConfigs[b] != nullptr &&
+                    (int)contexts[b]->draftKeyValues.size() == dflashLayers &&
+                    Qwen35DFlashDraftFitsContext(
+                        max_positions, dflashCheckpointBlockSize,
+                        contexts[b]->committedTokens),
+                "DFlash batched draft context is incomplete.\n");
+            cachedTokens[b] =
+                contexts[b]->draftKeyValues[0].first.dims.size() == 3 ?
+                    contexts[b]->draftKeyValues[0].first.dims[1] : 0;
+            cacheStarts[b] = contexts[b]->committedTokens - cachedTokens[b];
+            maxRotaryPosition = std::max(
+                maxRotaryPosition, contexts[b]->committedTokens + blockSize);
+        }
+
+        Qwen35ScopedGenericExecutor executor(
+            "cuda:" + std::to_string(device));
+        FastllmCudaSetDevice(device);
+        EnsureDFlashRotary(maxRotaryPosition, device);
+
+        std::vector<float> tokenValues(totalTokens,
+                                       (float)dflashMaskTokenId);
+        std::vector<float> positionValues(totalTokens);
+        for (int b = 0; b < batch; ++b) {
+            const int offset = b * blockSize;
+            tokenValues[offset] = (float)anchorTokens[b];
+            for (int token = 0; token < blockSize; ++token) {
+                positionValues[offset + token] =
+                    (float)(contexts[b]->committedTokens + token);
             }
-            AssertInFastLLM(table.dataType == DataType::FLOAT32,
-                            "DFlash selector codebook dtype is unsupported.\n");
-            return ((const float*)table.cpuData)[index];
-        };
-        std::vector<int> drafts;
-        drafts.reserve(slots);
-        context.proposalTokens.clear();
-        context.proposalCandidateIds.clear();
-        context.proposalCandidateProbs.clear();
-        context.proposalTokens.reserve(slots);
-        context.proposalCandidateIds.reserve(
-            (size_t)slots * dflashSelectorTopK);
-        context.proposalCandidateProbs.reserve(
-            (size_t)slots * dflashSelectorTopK);
-        const bool greedy = generationConfig.IsSimpleGreedy();
-        const float temperature = std::max(
-            generationConfig.temperature, 1.0e-5f);
-        static thread_local std::mt19937 selectorRng(
-            std::random_device{}());
-        static thread_local std::uniform_real_distribution<float>
-            selectorUniform(0.0f, 1.0f);
-        int previousToken = anchorToken;
-        for (int position = 0; position < slots; position++) {
-            AssertInFastLLM(previousToken >= 0 &&
-                                previousToken < predecessor.dims[0],
-                            "DFlash selector predecessor id is out of range.\n");
-            std::vector<float> scores(dflashSelectorTopK);
-            float bestScore = -std::numeric_limits<float>::infinity();
-            int bestCandidate = 0;
-            for (int candidate = 0;
-                 candidate < dflashSelectorTopK; candidate++) {
-                size_t topKOffset =
-                    ((size_t)position * dflashSelectorTopK + candidate) * 2;
-                int candidateToken =
-                    (int)(topKData[topKOffset] + 1.0e-3f);
-                AssertInFastLLM(candidateToken >= 0 &&
-                                    candidateToken < successor.dims[0],
-                                "DFlash selector candidate id is out of range.\n");
-                float score = topKData[topKOffset + 1];
-                const float *positionHidden = hiddenData +
-                    (size_t)position * dflashSelectorRank;
-                for (int rank = 0; rank < dflashSelectorRank; rank++) {
-                    score += codebookValue(predecessor, previousToken, rank) *
-                             positionHidden[rank] *
-                             codebookValue(successor, candidateToken, rank);
-                }
-                scores[candidate] = score;
-                context.proposalCandidateIds.push_back(candidateToken);
-                if (score > bestScore) {
-                    bestScore = score;
-                    bestCandidate = candidate;
-                }
+        }
+        Data inputIds(DataType::FLOAT32, {1, totalTokens}, tokenValues);
+        Data positions(DataType::FLOAT32, {1, totalTokens}, positionValues);
+        positions.ToDevice(DataDevice::CUDA, {device}, true);
+
+        Data hiddenStates;
+        Data &embedWeight = weight[language_prefix + "embed_tokens.weight"];
+        Data *draftEmbedWeight = &embedWeight;
+        if (embedWeight.multiDeviceData) {
+            auto embedIt = embedWeight.multiDeviceDatas.find(device);
+            if (embedIt != embedWeight.multiDeviceDatas.end() &&
+                embedIt->second != nullptr) {
+                draftEmbedWeight = embedIt->second;
             }
-            std::vector<float> probabilities(dflashSelectorTopK, 0.0f);
-            int selectedCandidate = bestCandidate;
-            if (greedy) {
-                probabilities[bestCandidate] = 1.0f;
-            } else {
-                float maxScaled = -std::numeric_limits<float>::infinity();
-                for (float score : scores) {
-                    maxScaled = std::max(maxScaled, score / temperature);
-                }
-                float sum = 0.0f;
-                for (int candidate = 0;
-                     candidate < dflashSelectorTopK; candidate++) {
-                    probabilities[candidate] = std::exp(
-                        scores[candidate] / temperature - maxScaled);
-                    sum += probabilities[candidate];
-                }
-                AssertInFastLLM(std::isfinite(sum) && sum > 0.0f,
-                                "DFlash selector probability is invalid.\n");
-                float inverseSum = 1.0f / sum;
-                for (float &probability : probabilities) {
-                    probability *= inverseSum;
-                }
-                float uniform = selectorUniform(selectorRng);
-                float cumulative = 0.0f;
-                selectedCandidate = dflashSelectorTopK - 1;
-                for (int candidate = 0;
-                     candidate < dflashSelectorTopK; candidate++) {
-                    cumulative += probabilities[candidate];
-                    if (uniform < cumulative) {
-                        selectedCandidate = candidate;
-                        break;
+        }
+        const bool useCudaEmbedding =
+            GetCudaEmbedding() && !GetLowMemMode() &&
+            draftEmbedWeight->dataDevice == DataDevice::CUDA &&
+            draftEmbedWeight->cudaData != nullptr &&
+            !draftEmbedWeight->dataDeviceIds.empty() &&
+            draftEmbedWeight->dataDeviceIds[0] == device;
+        if (useCudaEmbedding) {
+            inputIds.ToDevice(DataDevice::CUDA, {device}, true);
+            Embedding(inputIds, *draftEmbedWeight, hiddenStates);
+        } else {
+            DataType hostEmbeddingType = embedWeight.dataType;
+            if (hostEmbeddingType != DataType::FLOAT16 &&
+                hostEmbeddingType != DataType::BFLOAT16 &&
+                hostEmbeddingType != DataType::FLOAT32) {
+                hostEmbeddingType = DataType::BFLOAT16;
+            }
+            Qwen35CpuEmbeddingDirect(inputIds, embedWeight, hiddenStates,
+                                     hostEmbeddingType);
+            hiddenStates.ToDevice(DataDevice::CUDA, {device}, true);
+        }
+        if (hiddenStates.dataType != DataType::BFLOAT16) {
+            ToDataType(hiddenStates, DataType::BFLOAT16);
+        }
+
+        std::vector<std::optional<Data> > attentionMasks(batch);
+        auto ensureAttentionMask = [&](int b) -> Data& {
+            if (!attentionMasks[b].has_value()) {
+                const int totalKeys = cachedTokens[b] + blockSize;
+                std::vector<float> maskValues(
+                    (size_t)blockSize * totalKeys, 0.0f);
+                for (int query = 0; query < blockSize; ++query) {
+                    const int queryPosition =
+                        contexts[b]->committedTokens + query;
+                    for (int keyIndex = 0; keyIndex < totalKeys;
+                         ++keyIndex) {
+                        const int keyPosition = keyIndex < cachedTokens[b] ?
+                            cacheStarts[b] + keyIndex :
+                            contexts[b]->committedTokens +
+                                keyIndex - cachedTokens[b];
+                        const bool paddedDraftKey =
+                            keyIndex >= cachedTokens[b] + runtimeBlockSize;
+                        if (paddedDraftKey ||
+                            std::abs(queryPosition - keyPosition) >=
+                                dflashSlidingWindow) {
+                            maskValues[(size_t)query * totalKeys +
+                                       keyIndex] = 1.0f;
+                        }
                     }
                 }
+                attentionMasks[b].emplace(
+                    DataType::FLOAT32,
+                    std::vector<int>{1, blockSize, totalKeys}, maskValues);
+                ToDataType(*attentionMasks[b], DataType::FLOAT16);
+                attentionMasks[b]->ToDevice(
+                    DataDevice::CUDA, {device}, true);
             }
-            context.proposalCandidateProbs.insert(
-                context.proposalCandidateProbs.end(),
-                probabilities.begin(), probabilities.end());
-            size_t selectedOffset =
-                (size_t)position * dflashSelectorTopK + selectedCandidate;
-            int bestToken = context.proposalCandidateIds[selectedOffset];
-            drafts.push_back(bestToken);
-            context.proposalTokens.push_back(bestToken);
-            previousToken = bestToken;
+            return *attentionMasks[b];
+        };
+        const bool useImplicitAttention = Qwen35EnvDefaultEnabled(
+            "FASTLLM_CUDA_DFLASH_IMPLICIT_ATTENTION");
+
+        auto dynamicConvolve = [&](const Data &source,
+                                   Data &dynamicProjection,
+                                   Data &baseKernel,
+                                   int side,
+                                   Data &output) {
+            if (::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled(
+                    "FASTLLM_CUDA_DFLASH_FUSED_CONV") &&
+                source.dataDevice == DataDevice::CUDA &&
+                dynamicProjection.dataDevice == DataDevice::CUDA &&
+                baseKernel.dataDevice == DataDevice::CUDA &&
+                source.dataType == DataType::BFLOAT16 &&
+                dynamicProjection.dataType == DataType::BFLOAT16 &&
+                baseKernel.dataType == DataType::BFLOAT16) {
+                ::fastllm::Qwen3CudaPrepareLocalOutput(output, device);
+                output.dataType = source.dataType;
+                output.Resize(source.dims);
+                output.Allocate(false);
+                if (FastllmCudaDFlashDynamicConv(
+                        source, dynamicProjection, baseKernel, output,
+                        side, blockSize, embed_dim,
+                        dflashConvGroupSize, dflashConvKernelSize)) {
+                    return;
+                }
+            }
+            RunDFlashDynamicConvolutionFallback(
+                source, dynamicProjection, baseKernel, side, blockSize,
+                output);
+        };
+
+        for (int layerIndex = 0; layerIndex < dflashLayers;
+             ++layerIndex) {
+            const std::string prefix = "dflash.layers." +
+                std::to_string(layerIndex) + ".";
+            Data normalized, attentionDynamic, attentionInput;
+            RMSNorm(hiddenStates,
+                    weight[prefix + "input_layernorm.weight"],
+                    dflashRmsNormEps, normalized);
+            Linear(normalized,
+                   weight[prefix +
+                          "attention_conv.kernel_projection.weight"],
+                   *GetEmptyData(), attentionDynamic);
+            dynamicConvolve(
+                normalized, attentionDynamic,
+                weight[prefix + "attention_conv.base_kernel"], 0,
+                attentionInput);
+
+            Data query, key, value, mergedQkv;
+            bool fusedQkvPrepared = false;
+            auto mergedQkvIt = weight.weight.find(
+                prefix + "self_attn.mergeqkv.weight");
+            if (mergedQkvIt != weight.weight.end()) {
+                const int qChannels = dflashHeads * dflashHeadDim;
+                const int kvChannels = dflashKvHeads * dflashHeadDim;
+                Linear(attentionInput, mergedQkvIt->second,
+                       *GetEmptyData(), mergedQkv);
+                if (::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled(
+                        "FASTLLM_CUDA_DFLASH_FUSED_QKV_PREPARE")) {
+                    for (auto item : {
+                             std::make_pair(&query, dflashHeads),
+                             std::make_pair(&key, dflashKvHeads),
+                             std::make_pair(&value, dflashKvHeads)}) {
+                        ::fastllm::Qwen3CudaPrepareLocalOutput(
+                            *item.first, device);
+                        item.first->dataType = DataType::FLOAT16;
+                        item.first->UpdateUnitSize();
+                        item.first->Resize(
+                            {item.second, totalTokens, dflashHeadDim});
+                        item.first->Allocate(false);
+                    }
+                    fusedQkvPrepared = FastllmCudaDFlashPrepareQKV(
+                        mergedQkv,
+                        weight[prefix + "self_attn.q_norm.weight"],
+                        weight[prefix + "self_attn.k_norm.weight"],
+                        positions, dflashSinData, dflashCosData,
+                        query, key, value, totalTokens, dflashHeads,
+                        dflashKvHeads, dflashHeadDim, dflashRmsNormEps);
+                    if (!fusedQkvPrepared) {
+                        for (Data *output : {&query, &key, &value}) {
+                            output->FreeSpace();
+                            output->dims.clear();
+                            output->strides.clear();
+                            output->expansionDims.clear();
+                        }
+                    }
+                }
+                if (!fusedQkvPrepared) {
+                    Split(mergedQkv, -1, 0, qChannels, query);
+                    Split(mergedQkv, -1, qChannels,
+                          qChannels + kvChannels, key);
+                    Split(mergedQkv, -1, qChannels + kvChannels,
+                          qChannels + 2 * kvChannels, value);
+                }
+            } else {
+                Linear(attentionInput,
+                       weight[prefix + "self_attn.q_proj.weight"],
+                       *GetEmptyData(), query);
+                Linear(attentionInput,
+                       weight[prefix + "self_attn.k_proj.weight"],
+                       *GetEmptyData(), key);
+                Linear(attentionInput,
+                       weight[prefix + "self_attn.v_proj.weight"],
+                       *GetEmptyData(), value);
+            }
+            if (!fusedQkvPrepared) {
+                query.Reshape(
+                    {1, totalTokens, dflashHeads, dflashHeadDim});
+                key.Reshape(
+                    {1, totalTokens, dflashKvHeads, dflashHeadDim});
+                value.Reshape(
+                    {1, totalTokens, dflashKvHeads, dflashHeadDim});
+                RMSNorm(query,
+                        weight[prefix + "self_attn.q_norm.weight"],
+                        dflashRmsNormEps, query);
+                RMSNorm(key,
+                        weight[prefix + "self_attn.k_norm.weight"],
+                        dflashRmsNormEps, key);
+                LlamaRotatePosition2D(query, positions, dflashSinData,
+                                      dflashCosData, dflashHeadDim);
+                LlamaRotatePosition2D(key, positions, dflashSinData,
+                                      dflashCosData, dflashHeadDim);
+                PermuteSelf(query, {0, 2, 1, 3});
+                PermuteSelf(key, {0, 2, 1, 3});
+                PermuteSelf(value, {0, 2, 1, 3});
+                query.Reshape(
+                    {dflashHeads, totalTokens, dflashHeadDim});
+                key.Reshape(
+                    {dflashKvHeads, totalTokens, dflashHeadDim});
+                value.Reshape(
+                    {dflashKvHeads, totalTokens, dflashHeadDim});
+                ToDataType(query, DataType::FLOAT16);
+                ToDataType(key, DataType::FLOAT16);
+                ToDataType(value, DataType::FLOAT16);
+            }
+
+            Data attentionHeads(DataType::BFLOAT16);
+            ::fastllm::Qwen3CudaPrepareLocalOutput(attentionHeads, device);
+            attentionHeads.Resize(
+                {1, totalTokens, dflashHeads * dflashHeadDim});
+            attentionHeads.Allocate(false);
+            const size_t attentionRowBytes =
+                (size_t)dflashHeads * dflashHeadDim *
+                attentionHeads.unitSize / attentionHeads.unitSizeDiv;
+            std::vector<Data> requestQueries(batch), requestKeys(batch),
+                              requestValues(batch), requestAttentions(batch);
+            for (int b = 0; b < batch; ++b) {
+                const int begin = b * blockSize;
+                Split(query, 1, begin, begin + blockSize,
+                      requestQueries[b]);
+                Split(key, 1, begin, begin + blockSize,
+                      requestKeys[b]);
+                Split(value, 1, begin, begin + blockSize,
+                      requestValues[b]);
+                Data &keyCache =
+                    contexts[b]->draftKeyValues[layerIndex].first;
+                Data &valueCache =
+                    contexts[b]->draftKeyValues[layerIndex].second;
+                AssertInFastLLM(
+                    keyCache.dims.size() == 3 &&
+                        valueCache.dims.size() == 3 &&
+                        keyCache.dims[1] == cachedTokens[b] &&
+                        valueCache.dims[1] == cachedTokens[b],
+                    "DFlash batched draft KV cache is out of sync.\n");
+                const int oldKeyTokens = keyCache.dims[1];
+                const int oldValueTokens = valueCache.dims[1];
+                Qwen35AppendDraftSequenceCache(
+                    keyCache, requestKeys[b], cacheAllocationUnit);
+                Qwen35AppendDraftSequenceCache(
+                    valueCache, requestValues[b], cacheAllocationUnit);
+
+                ::fastllm::Qwen3CudaPrepareLocalOutput(
+                    requestAttentions[b], device);
+                requestAttentions[b].dataType = DataType::FLOAT16;
+                requestAttentions[b].UpdateUnitSize();
+                requestAttentions[b].Resize(
+                    {dflashHeads, blockSize, dflashHeadDim});
+                requestAttentions[b].Allocate(false);
+                bool implicitAttention =
+                    useImplicitAttention &&
+                    FastllmCudaDFlashAttention(
+                        requestQueries[b], keyCache, valueCache,
+                        requestAttentions[b],
+                        dflashHeads / dflashKvHeads,
+                        1.0f / std::sqrt((float)dflashHeadDim),
+                        runtimeBlockSize, dflashSlidingWindow);
+                if (!implicitAttention) {
+                    Attention(requestQueries[b], keyCache, valueCache,
+                              ensureAttentionMask(b),
+                              requestAttentions[b],
+                              dflashHeads / dflashKvHeads,
+                              1.0f / std::sqrt((float)dflashHeadDim), 2);
+                }
+                Qwen35ResizeDraftSequenceCache(
+                    keyCache, oldKeyTokens);
+                Qwen35ResizeDraftSequenceCache(
+                    valueCache, oldValueTokens);
+                PermuteSelf(requestAttentions[b], {1, 0, 2});
+                requestAttentions[b].Reshape(
+                    {1, blockSize,
+                     dflashHeads * dflashHeadDim});
+                ToDataType(requestAttentions[b], DataType::BFLOAT16);
+                FastllmCudaCopyFromDeviceToDevice(
+                    (uint8_t*)attentionHeads.cudaData +
+                        (size_t)begin * attentionRowBytes,
+                    requestAttentions[b].cudaData,
+                    (size_t)blockSize * attentionRowBytes);
+            }
+
+            Data attentionOutput, convolvedAttention;
+            Linear(attentionHeads,
+                   weight[prefix + "self_attn.o_proj.weight"],
+                   *GetEmptyData(), attentionOutput);
+            dynamicConvolve(
+                attentionOutput, attentionDynamic,
+                weight[prefix + "attention_conv.base_kernel"], 1,
+                convolvedAttention);
+            AddTo(hiddenStates, convolvedAttention);
+
+            RMSNorm(hiddenStates,
+                    weight[prefix + "post_attention_layernorm.weight"],
+                    dflashRmsNormEps, normalized);
+            Data mlpDynamic, mlpInput;
+            Linear(normalized,
+                   weight[prefix +
+                          "mlp_conv.kernel_projection.weight"],
+                   *GetEmptyData(), mlpDynamic);
+            dynamicConvolve(
+                normalized, mlpDynamic,
+                weight[prefix + "mlp_conv.base_kernel"], 0,
+                mlpInput);
+            Data mlpOutput, convolvedMlp;
+            auto gateupIt = weight.weight.find(
+                prefix + "mlp.gateup_proj.weight");
+            auto downIt = weight.weight.find(
+                prefix + "mlp.down_proj.weight");
+            const bool pairedTpMlp =
+                gateupIt != weight.weight.end() &&
+                downIt != weight.weight.end() &&
+                RunDFlashTensorParallelMlp(
+                    device, mlpInput, gateupIt->second,
+                    downIt->second, mlpOutput);
+            if (!pairedTpMlp) {
+                Data gate, up, gateup;
+                bool fusedGateupPrepared = false;
+                if (gateupIt != weight.weight.end()) {
+                    RunDFlashGateupLinear(
+                        device, mlpInput, gateupIt->second, gateup);
+                    if (::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled(
+                            "FASTLLM_CUDA_DFLASH_FUSED_GATEUP_PREPARE")) {
+                        ::fastllm::Qwen3CudaPrepareLocalOutput(gate, device);
+                        gate.dataType = DataType::BFLOAT16;
+                        gate.UpdateUnitSize();
+                        gate.Resize(
+                            {1, totalTokens, dflashIntermediateSize});
+                        gate.Allocate(false);
+                        fusedGateupPrepared =
+                            FastllmCudaDFlashPrepareGateup(
+                                gateup, gate, totalTokens,
+                                dflashIntermediateSize);
+                        if (!fusedGateupPrepared) {
+                            gate.FreeSpace();
+                            gate.dims.clear();
+                            gate.strides.clear();
+                            gate.expansionDims.clear();
+                        }
+                    }
+                    if (!fusedGateupPrepared) {
+                        Split(gateup, -1, 0,
+                              dflashIntermediateSize, gate);
+                        Split(gateup, -1, dflashIntermediateSize,
+                              2 * dflashIntermediateSize, up);
+                    }
+                } else {
+                    Linear(
+                        mlpInput,
+                        weight[prefix + "mlp.gate_proj.weight"],
+                        *GetEmptyData(), gate);
+                    Linear(
+                        mlpInput,
+                        weight[prefix + "mlp.up_proj.weight"],
+                        *GetEmptyData(), up);
+                }
+                if (!fusedGateupPrepared) {
+                    ToDataType(gate, DataType::FLOAT16);
+                    ToDataType(up, DataType::FLOAT16);
+                    Silu(gate, gate);
+                    MulTo(gate, up);
+                    ToDataType(gate, DataType::BFLOAT16);
+                }
+                Linear(gate,
+                       weight[prefix + "mlp.down_proj.weight"],
+                       *GetEmptyData(), mlpOutput);
+            }
+            dynamicConvolve(
+                mlpOutput, mlpDynamic,
+                weight[prefix + "mlp_conv.base_kernel"], 1,
+                convolvedMlp);
+            AddTo(hiddenStates, convolvedMlp);
+        }
+
+        RMSNorm(hiddenStates, weight["dflash.norm.weight"],
+                dflashRmsNormEps, hiddenStates);
+        Data slotHidden(hiddenStates.dataType);
+        ::fastllm::Qwen3CudaPrepareLocalOutput(slotHidden, device);
+        slotHidden.Resize({1, batch * slots, embed_dim});
+        slotHidden.Allocate(false);
+        const size_t hiddenRowBytes =
+            (size_t)embed_dim * slotHidden.unitSize / slotHidden.unitSizeDiv;
+        for (int b = 0; b < batch; ++b) {
+            FastllmCudaCopyFromDeviceToDevice(
+                (uint8_t*)slotHidden.cudaData +
+                    (size_t)b * slots * hiddenRowBytes,
+                (uint8_t*)hiddenStates.cudaData +
+                    (size_t)(b * blockSize + 1) * hiddenRowBytes,
+                (size_t)slots * hiddenRowBytes);
+        }
+
+        const int lmHeadRows = std::max(8, blockSize);
+        const int totalLmHeadRows = batch * lmHeadRows;
+        Data lmHeadHidden;
+        if (lmHeadRows == blockSize) {
+            Copy(hiddenStates, lmHeadHidden);
+        } else {
+            Data zeroRow, padding, packed;
+            Split(hiddenStates, 1, 0, 1, zeroRow);
+            Mul(zeroRow, 0.0f, zeroRow);
+            Repeat(zeroRow, 1, lmHeadRows - blockSize, padding);
+            for (int b = 0; b < batch; ++b) {
+                Data requestHidden, paddedRequest;
+                Split(hiddenStates, 1, b * blockSize,
+                      (b + 1) * blockSize, requestHidden);
+                Cat(requestHidden, padding, 1, paddedRequest);
+                if (b == 0) {
+                    Copy(paddedRequest, packed);
+                } else {
+                    Data next;
+                    Cat(packed, paddedRequest, 1, next);
+                    packed.CopyFrom(next);
+                }
+            }
+            lmHeadHidden.CopyFrom(packed);
+        }
+
+        auto packCandidateSlots = [&](Data &allRows, Data &packedSlots) {
+            Data packed;
+            for (int b = 0; b < batch; ++b) {
+                Data requestSlots;
+                Split(allRows, 0, b * lmHeadRows + 1,
+                      b * lmHeadRows + runtimeBlockSize,
+                      requestSlots);
+                if (b == 0) {
+                    Copy(requestSlots, packed);
+                } else {
+                    Data next;
+                    Cat(packed, requestSlots, 0, next);
+                    packed.CopyFrom(next);
+                }
+            }
+            packedSlots.CopyFrom(packed);
+        };
+
+        const std::vector<int> draftDevices =
+            devices.empty() ? std::vector<int>{device} : devices;
+        Data candidateTopK;
+        if (draftDevices.size() == 1) {
+            Data fullLogits, allTopK;
+            Linear(lmHeadHidden, weight["lm_head.weight"],
+                   *GetEmptyData(), fullLogits);
+            ToDataType(fullLogits, DataType::FLOAT32);
+            fullLogits.Reshape(
+                {totalLmHeadRows, fullLogits.dims.back()});
+            TopK(fullLogits, allTopK, dflashSelectorTopK);
+            packCandidateSlots(allTopK, candidateTopK);
+            candidateTopK.ToDevice(DataDevice::CPU);
+        } else {
+            AssertInFastLLM(
+                threadTpWeightsPrepared.load(std::memory_order_acquire) &&
+                    threadTpPreparedDevices == draftDevices &&
+                    weight["lm_head.weight"].multiDeviceData &&
+                    !threadTpLmHeadScheme.empty(),
+                "DFlash TP batched draft requires prepared lm_head shards.\n");
+            Data replicatedHidden;
+            replicatedHidden.CopyFrom(lmHeadHidden);
+            PrepareMultiCudaReplicatedData(
+                replicatedHidden, draftDevices, true);
+
+            Data &lmHead = weight["lm_head.weight"];
+            Data &lmHeadBias =
+                GetThreadTensorParallelBias("lm_head.weight.tp_bias");
+            const int tpSize = (int)draftDevices.size();
+            std::vector<Data> localPacked(tpSize), localScratch(tpSize);
+            std::vector<int> globalOffsets(tpSize, -1), ready(tpSize, 0);
+            for (int rank = 0; rank < tpSize; ++rank) {
+                auto schemeIt = threadTpLmHeadScheme.find(
+                    draftDevices[rank]);
+                auto weightIt = lmHead.multiDeviceDatas.find(
+                    draftDevices[rank]);
+                AssertInFastLLM(
+                    schemeIt != threadTpLmHeadScheme.end() &&
+                        schemeIt->second.size() == 1 &&
+                        weightIt != lmHead.multiDeviceDatas.end() &&
+                        weightIt->second != nullptr,
+                    "DFlash batched top-k has an invalid lm_head shard.\n");
+                globalOffsets[rank] = schemeIt->second[0].first;
+            }
+            std::vector<std::exception_ptr> errors(tpSize);
+            threadTpWorkerGroup.Run(draftDevices, [&](int rank) {
+                const int localDevice = draftDevices[rank];
+                auto hiddenIt =
+                    replicatedHidden.multiDeviceDatas.find(localDevice);
+                auto weightIt = lmHead.multiDeviceDatas.find(localDevice);
+                auto biasIt = lmHeadBias.multiDeviceDatas.find(localDevice);
+                AssertInFastLLM(
+                    hiddenIt !=
+                            replicatedHidden.multiDeviceDatas.end() &&
+                        hiddenIt->second != nullptr &&
+                        weightIt != lmHead.multiDeviceDatas.end() &&
+                        weightIt->second != nullptr &&
+                        biasIt != lmHeadBias.multiDeviceDatas.end() &&
+                        biasIt->second != nullptr,
+                    "DFlash batched top-k is missing local data.\n");
+                FastllmCudaSetDevice(localDevice);
+                Qwen3CudaDirectRunner runner(localDevice);
+                Data localLogits;
+                qwen3cuda::Qwen3CudaLinear(
+                    runner, *hiddenIt->second, *weightIt->second,
+                    *biasIt->second, localLogits);
+                qwen3cuda::Qwen3CudaToDataType(
+                    runner, localLogits, DataType::FLOAT32);
+
+                ::fastllm::Qwen3CudaPrepareLocalOutput(
+                    localPacked[rank], localDevice);
+                localPacked[rank].dataType = DataType::INT32;
+                localPacked[rank].UpdateUnitSize();
+                localPacked[rank].Resize(
+                    {2 * totalLmHeadRows * dflashSelectorTopK});
+                localPacked[rank].Allocate(false);
+                const size_t scratchBytes =
+                    FastllmCudaDFlashTopKScratchBytes(totalLmHeadRows);
+                ::fastllm::Qwen3CudaPrepareLocalOutput(
+                    localScratch[rank], localDevice);
+                localScratch[rank].dataType = DataType::INT8;
+                localScratch[rank].UpdateUnitSize();
+                localScratch[rank].Resize({(int)scratchBytes});
+                localScratch[rank].Allocate(false);
+                ready[rank] = FastllmCudaDFlashTopK(
+                    localLogits, localPacked[rank], localScratch[rank],
+                    dflashSelectorTopK, globalOffsets[rank]) ? 1 : 0;
+                FastllmCudaSyncCurrentThreadStream();
+            }, errors);
+            for (auto &error : errors) {
+                if (error) {
+                    std::rethrow_exception(error);
+                }
+            }
+            AssertInFastLLM(
+                std::all_of(ready.begin(), ready.end(),
+                            [](int value) { return value != 0; }),
+                "DFlash batched CUDA top-k failed.\n");
+
+            const size_t packedBytes =
+                (size_t)2 * totalLmHeadRows * dflashSelectorTopK *
+                sizeof(int);
+            FastllmCudaSetDevice(device);
+            Data gathered;
+            ::fastllm::Qwen3CudaPrepareLocalOutput(gathered, device);
+            gathered.dataType = DataType::INT32;
+            gathered.UpdateUnitSize();
+            gathered.Resize(
+                {tpSize, 2 * totalLmHeadRows * dflashSelectorTopK});
+            gathered.Allocate(false);
+            std::vector<int> copied(tpSize, 0);
+            for (int rank = 0; rank < tpSize; ++rank) {
+                copied[rank] = FastllmCudaMemcpyPeerAsyncCurrentThread(
+                    device,
+                    (uint8_t*)gathered.cudaData +
+                        (size_t)rank * packedBytes,
+                    draftDevices[rank], localPacked[rank].cudaData,
+                    packedBytes) ? 1 : 0;
+            }
+            if (std::any_of(copied.begin(), copied.end(),
+                            [](int value) { return value == 0; })) {
+                FastllmCudaSyncCurrentThreadStream();
+                for (int rank = 0; rank < tpSize; ++rank) {
+                    if (copied[rank] == 0) {
+                        FastllmCudaMemcpyBetweenDevices(
+                            device,
+                            (uint8_t*)gathered.cudaData +
+                                (size_t)rank * packedBytes,
+                            draftDevices[rank],
+                            localPacked[rank].cudaData, packedBytes);
+                    }
+                }
+                FastllmCudaSetDevice(device);
+            }
+
+            Data allTopK;
+            ::fastllm::Qwen3CudaPrepareLocalOutput(allTopK, device);
+            allTopK.dataType = DataType::FLOAT32;
+            allTopK.UpdateUnitSize();
+            allTopK.Resize(
+                {totalLmHeadRows, dflashSelectorTopK * 2});
+            allTopK.Allocate(false);
+            AssertInFastLLM(
+                FastllmCudaDFlashMergeTopK(
+                    gathered, allTopK, tpSize, totalLmHeadRows,
+                    0, totalLmHeadRows, dflashSelectorTopK),
+                "DFlash batched CUDA top-k merge failed.\n");
+            FastllmCudaSyncCurrentThreadStream();
+            packCandidateSlots(allTopK, candidateTopK);
+            candidateTopK.ToDevice(DataDevice::CPU);
+        }
+
+        Data selectorHidden;
+        Linear(slotHidden,
+               weight[
+                   "dflash.candidate_selector.hidden_projection.weight"],
+               *GetEmptyData(), selectorHidden);
+        ToDataType(selectorHidden, DataType::FLOAT32);
+        selectorHidden.ToDevice(DataDevice::CPU);
+        AssertInFastLLM(
+            candidateTopK.Count(0) ==
+                    (uint64_t)batch * slots * dflashSelectorTopK * 2 &&
+            selectorHidden.Count(0) ==
+                    (uint64_t)batch * slots * dflashSelectorRank,
+            "DFlash batched selector tensor shape mismatch.\n");
+        const float *topKData =
+            (const float*)candidateTopK.cpuData;
+        const float *hiddenData =
+            (const float*)selectorHidden.cpuData;
+        std::vector<std::vector<int> > drafts(batch);
+        for (int b = 0; b < batch; ++b) {
+            drafts[b] = SelectDFlashDraftTokens(
+                topKData +
+                    (size_t)b * slots * dflashSelectorTopK * 2,
+                hiddenData + (size_t)b * slots * dflashSelectorRank,
+                anchorTokens[b], *generationConfigs[b], *contexts[b]);
         }
         return drafts;
 #endif
