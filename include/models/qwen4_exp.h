@@ -12,6 +12,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -55,6 +56,8 @@ namespace fastllm {
 
     private:
         struct PrefixSnapshot;
+        struct DecodeCudaGraphState;
+        struct QsaHostMirrorTransfer;
 
         struct RequestState {
             int previousToken1 = -1;
@@ -62,11 +65,20 @@ namespace fastllm {
             std::vector<float> convHistory;
             std::map<int, std::vector<float>> indexerRawKeys;
             std::map<int, std::vector<float>> indexerPositions;
-            // Host compressed keys are the snapshot-safe source of truth.
-            // The tensor view is rebuilt lazily on the request's execution
-            // device and is deliberately excluded from prefix snapshots.
+            // CPU/non-contiguous-mask fallback cache. CUDA appends completed
+            // compression groups to a pinned host mirror and leaves fewer
+            // than indexerCompressRatio raw rows in the device tail. The
+            // vectors are materialized only at a fallback or snapshot boundary.
             std::map<int, std::vector<float>> indexerBlockKeys;
+            std::map<int, std::shared_ptr<QsaHostMirrorTransfer>>
+                indexerHostMirrorTransfers;
+            std::map<int, std::shared_ptr<Data>> indexerTailKeyTensors;
+            std::map<int, std::shared_ptr<Data>> indexerTailPositionTensors;
             std::map<int, std::shared_ptr<Data>> indexerBlockKeyTensors;
+            // Geometric cache growth is enabled per full-attention layer only
+            // after that request has completed its first single-token pass,
+            // so CUDA Graph capture retains the established allocation order.
+            std::set<int> geometricCacheGrowthReadyLayers;
             std::vector<int> processedTokens;
             int prefixRequestId = 0;
             int lastPrefixSnapshotLen = 0;
@@ -84,6 +96,10 @@ namespace fastllm {
             DataDevice secondDevice = DataDevice::CPU;
             std::vector<int> firstDeviceIds;
             std::vector<int> secondDeviceIds;
+            bool qsaDeviceCache = false;
+            Data qsaTailKeys;
+            Data qsaTailPositions;
+            Data qsaBlockKeys;
         };
 
         struct PrefixSnapshot {
@@ -172,11 +188,15 @@ namespace fastllm {
                     RequestState &state, Data &output);
         void BuildQSAMask(int layer, const Data &input,
                           const Data &baseMask, const Data &positionIds,
-                          int previousLength, RequestState &state,
+                          int previousLength, bool deviceCompatibleMask,
+                          RequestState &state,
                           Data &qsaMask, Data &qsaIndices);
+        void MaterializeQsaHostHistory(int layer, int length,
+                                       RequestState &state);
         void RunFullAttention(int layer, const Data &input,
                               const Data &attentionMask,
                               const Data &positionIds,
+                              bool qsaDeviceCompatibleMask,
                               Data &pastKey, Data &pastValue,
                               RequestState &state, Data &output);
         void RunLinearAttention(int layer, const Data &input,
