@@ -314,6 +314,48 @@ namespace {
             Qwen4CudaRound<T>(gate * 2.0f));
     }
 
+    template <typename T>
+    __device__ __forceinline__ T Qwen4HyperActivatedValue(
+            T input, int groups) {
+        const T scale = Qwen4CudaFromFloat<T>(1.0f / groups);
+        const float scaled = Qwen4CudaRound<T>(
+            Qwen4CudaToFloat(input) * Qwen4CudaToFloat(scale));
+        if constexpr (std::is_same_v<T, float>) {
+            return scaled / (1.0 + expf(-scaled));
+        } else {
+            return Qwen4CudaFromFloat<T>(
+                scaled / (1.0f + expf(-scaled)));
+        }
+    }
+
+    template <>
+    __device__ __forceinline__ half Qwen4HyperActivatedValue<half>(
+            half input, int groups) {
+#ifdef CUDA_NO_TENSOR_CORE
+        const half scale = __float2half_rn(1.0f / groups);
+        const half rounded = __float2half_rn(
+            __half2float(input) * __half2float(scale));
+        const float value = __half2float(rounded);
+        return __float2half_rn(value / (1.0 + expf(-value)));
+#else
+        const half scaled = __hmul(input, __float2half_rn(1.0f / groups));
+        return __hdiv(
+            scaled, __hadd(__float2half_rn(1.0f), hexp(-scaled)));
+#endif
+    }
+
+    template <typename T>
+    __global__ void Qwen4HyperPrepareKernel(
+            const T *input, T *activated,
+            uint64_t count, int groups) {
+        const uint64_t index = (uint64_t)blockIdx.x * blockDim.x +
+                               threadIdx.x;
+        if (index >= count) {
+            return;
+        }
+        activated[index] = Qwen4HyperActivatedValue(input[index], groups);
+    }
+
     template <typename T, int THREADS>
     __global__ void Qwen4PLEGateKernel(
             const T *key, const T *query, const T *value,
@@ -1509,6 +1551,44 @@ bool FastllmCudaQwen4HyperMix(
                 normalized.cudaData, mixLogits.cudaData, output.cudaData,
                 blocks, threads, count, groups, outputChannels);
         }
+    }
+    DeviceSync();
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool FastllmCudaQwen4HyperPrepare(
+        const fastllm::Data &input,
+        fastllm::Data &activated, int groups) {
+    if (input.dataDevice != fastllm::DataDevice::CUDA ||
+        activated.dataDevice != fastllm::DataDevice::CUDA ||
+        input.cudaData == nullptr || activated.cudaData == nullptr ||
+        input.dims.empty() || groups <= 0 ||
+        input.dataType != activated.dataType ||
+        !Qwen4CudaActivationType(input.dataType)) {
+        return false;
+    }
+    const uint64_t count = input.Count(0);
+    if (activated.Count(0) != count) {
+        return false;
+    }
+    constexpr int threads = 256;
+    const int blocks = (int)((count + threads - 1) / threads);
+    if (input.dataType == fastllm::DataType::FLOAT32) {
+        Qwen4HyperPrepareKernel<<<
+            blocks, threads, 0, cudaStreamPerThread>>>(
+            (const float*)input.cudaData, (float*)activated.cudaData,
+            count, groups);
+    } else if (input.dataType == fastllm::DataType::FLOAT16) {
+        Qwen4HyperPrepareKernel<<<
+            blocks, threads, 0, cudaStreamPerThread>>>(
+            (const half*)input.cudaData, (half*)activated.cudaData,
+            count, groups);
+    } else {
+        Qwen4HyperPrepareKernel<<<
+            blocks, threads, 0, cudaStreamPerThread>>>(
+            (const __nv_bfloat16*)input.cudaData,
+            (__nv_bfloat16*)activated.cudaData,
+            count, groups);
     }
     DeviceSync();
     return cudaGetLastError() == cudaSuccess;

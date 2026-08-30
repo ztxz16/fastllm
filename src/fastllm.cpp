@@ -4259,6 +4259,14 @@ namespace fastllm {
         }, {}, {{"groups", groups}});
     }
 
+    void Qwen4HyperPrepare(const Data &lowRankProjection, int groups,
+                           Data &activated) {
+        curExecutor->Run("Qwen4HyperPrepare", {
+                {"input", (Data*)&lowRankProjection},
+                {"output", &activated}
+        }, {}, {{"groups", groups}});
+    }
+
     void Qwen4HyperInject(const Data &logits, int groups, Data &output) {
         curExecutor->Run("Qwen4HyperInject", {
                 {"input", (Data*)&logits}, {"output", &output}

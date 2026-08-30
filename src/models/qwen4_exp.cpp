@@ -714,21 +714,23 @@ namespace fastllm {
         Linear(normalized,
                this->weight[prefix + "input_mix_weight_down.weight"],
                Data(), lowRank);
-        Mul(lowRank, 1.0f / (float)this->hcCount, lowRank);
-        Silu(lowRank, lowRank);
+        if (injectionWeights != nullptr) {
+            Linear(normalized,
+                   this->weight[prefix + "block_inject_weight.weight"],
+                   Data(), *injectionWeights);
+            fastllm::Qwen4HyperPrepare(
+                lowRank, this->hcCount, lowRank);
+            fastllm::Qwen4HyperInject(
+                *injectionWeights, this->hcCount, *injectionWeights);
+        } else {
+            Mul(lowRank, 1.0f / (float)this->hcCount, lowRank);
+            Silu(lowRank, lowRank);
+        }
         Linear(lowRank, this->weight[prefix + "input_mix_weight_up.weight"],
                Data(), inputMix);
         fastllm::Qwen4HyperMix(normalized, inputMix,
                               this->hcCount, mixedInput);
 
-        if (injectionWeights != nullptr) {
-            Linear(normalized,
-                   this->weight[prefix + "block_inject_weight.weight"],
-                   Data(), *injectionWeights);
-            fastllm::Qwen4HyperInject(*injectionWeights,
-                                     this->hcCount,
-                                     *injectionWeights);
-        }
     }
 
     void Qwen4ExpModel::HyperCombine(const Data &hyperInput,

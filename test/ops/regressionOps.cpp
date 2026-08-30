@@ -3162,6 +3162,73 @@ namespace {
         }
     }
 
+    void RunQwen4HyperPrepareRegressionCase(
+            fastllm::DataType type, int rows, int lowRank, int groups,
+            const std::string &deviceName) {
+        std::vector<float> lowRankValues((size_t)rows * lowRank);
+        for (size_t index = 0; index < lowRankValues.size(); index++) {
+            lowRankValues[index] =
+                (float)((int)((index * 37 + 11) % 127) - 63) / 19.0f;
+        }
+        fastllm::Data lowRankProjection(
+            type, {rows, lowRank}, lowRankValues);
+        if (deviceName != "cpu") {
+            lowRankProjection.ToDevice(
+                fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+        }
+
+        fastllm::Data expectedActivated, activated, inPlaceActivated;
+        {
+            ScopedFirstDevice device(deviceName);
+            fastllm::Copy(lowRankProjection, expectedActivated);
+            fastllm::Mul(
+                expectedActivated, 1.0f / groups, expectedActivated);
+            fastllm::Silu(expectedActivated, expectedActivated);
+            fastllm::Qwen4HyperPrepare(
+                lowRankProjection, groups, activated);
+            fastllm::Copy(lowRankProjection, inPlaceActivated);
+            fastllm::Qwen4HyperPrepare(
+                inPlaceActivated, groups, inPlaceActivated);
+        }
+#ifdef USE_CUDA
+        if (deviceName != "cpu") {
+            FastllmCudaSyncCurrentThreadStream();
+        }
+#endif
+        const std::string prefix = deviceName + " type=" +
+            std::to_string((int)type) + " rows=" + std::to_string(rows) +
+            " lowRank=" + std::to_string(lowRank) +
+            " groups=" + std::to_string(groups);
+        ExpectFloatNear(
+            ToFloatVector(expectedActivated), ToFloatVector(activated),
+            0.0f, 0.0f, prefix + " Qwen4HyperPrepare activation");
+        ExpectFloatNear(
+            ToFloatVector(expectedActivated), ToFloatVector(inPlaceActivated),
+            0.0f, 0.0f, prefix + " Qwen4HyperPrepare in-place activation");
+    }
+
+    void RunQwen4HyperPrepareRegression() {
+        for (fastllm::DataType type : {
+                 fastllm::DataType::FLOAT32,
+                 fastllm::DataType::FLOAT16,
+                 fastllm::DataType::BFLOAT16}) {
+            for (int rows : {1, 5}) {
+                for (int lowRank : {17, 320}) {
+                    for (int groups : {3, 4, 7}) {
+                        RunQwen4HyperPrepareRegressionCase(
+                            type, rows, lowRank, groups, "cpu");
+#ifdef USE_CUDA
+                        if (fastllm::HasDeviceType("cuda")) {
+                            RunQwen4HyperPrepareRegressionCase(
+                                type, rows, lowRank, groups, "cuda:0");
+                        }
+#endif
+                    }
+                }
+            }
+        }
+    }
+
     void RunCudaLocalExpertRangeMaskRegression() {
         const std::vector<int32_t> routeIndices = {
             -1, 0, 31, 32, 47, 63, 64, 255
@@ -12285,6 +12352,12 @@ int main(int argc, char **argv) {
             return 0;
         }
 #endif
+        if (argc == 2 &&
+            std::string(argv[1]) == "--qwen4-hyper-prepare") {
+            RunQwen4HyperPrepareRegression();
+            std::cout << "Qwen4 HyperPrepare CPU/CUDA regressions: PASS\n";
+            return 0;
+        }
         if (argc == 2 &&
             std::string(argv[1]) == "--cpu-dsv4-preprocess") {
             RunCpuDeepSeekV4PreprocessRegression();

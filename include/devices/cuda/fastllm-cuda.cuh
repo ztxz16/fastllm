@@ -559,6 +559,9 @@ bool FastllmCudaQwen4PLECausalConv(
 bool FastllmCudaQwen4HyperMix(const fastllm::Data &normalized,
                               const fastllm::Data &mixLogits,
                               fastllm::Data &output, int groups);
+bool FastllmCudaQwen4HyperPrepare(const fastllm::Data &lowRankProjection,
+                                  fastllm::Data &activated,
+                                  int groups);
 bool FastllmCudaQwen4HyperInject(const fastllm::Data &logits,
                                  fastllm::Data &output, int groups);
 bool FastllmCudaQwen4HyperCombine(const fastllm::Data &hyperInput,

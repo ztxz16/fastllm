@@ -4355,6 +4355,7 @@ namespace fastllm {
         this->ops["Qwen4PLEGate"] = (BaseOperator*)(new CudaQwen4PLEGateOp());
         this->ops["Qwen4PLECausalConv"] = (BaseOperator*)(new CudaQwen4PLECausalConvOp());
         this->ops["Qwen4HyperMix"] = (BaseOperator*)(new CudaQwen4HyperMixOp());
+        this->ops["Qwen4HyperPrepare"] = (BaseOperator*)(new CudaQwen4HyperPrepareOp());
         this->ops["Qwen4HyperInject"] = (BaseOperator*)(new CudaQwen4HyperInjectOp());
         this->ops["Qwen4HyperCombine"] = (BaseOperator*)(new CudaQwen4HyperCombineOp());
         this->ops["Qwen4HyperCombineRMSNorm"] = (BaseOperator*)(new CudaQwen4HyperCombineRMSNormOp());
@@ -4977,6 +4978,29 @@ namespace fastllm {
         if (!FastllmCudaQwen4HyperMix(input, mixLogits, output, groups)) {
             ErrorInFastLLM(
                 "Qwen4HyperMix CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaQwen4HyperPrepareOp::CanRun(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        const int groups = CudaQwen4Groups(intParams);
+        return !input.dims.empty() && groups > 0 &&
+               CudaQwen4ActivationType(input.dataType);
+    }
+
+    void CudaQwen4HyperPrepareOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &activated = *datas.find("output")->second;
+        const int groups = CudaQwen4Groups(intParams);
+        activated.Allocate(false);
+        if (!FastllmCudaQwen4HyperPrepare(
+                input, activated, groups)) {
+            ErrorInFastLLM(
+                "Qwen4HyperPrepare CUDA error: kernel rejected input.\n");
         }
     }
 

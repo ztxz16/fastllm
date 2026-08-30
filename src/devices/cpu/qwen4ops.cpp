@@ -394,6 +394,46 @@ namespace fastllm {
         });
     }
 
+    void CpuQwen4HyperPrepareOp::Reshape(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &activated = *datas.find("output")->second;
+        const int groups = Qwen4Groups(intParams);
+        AssertInFastLLM(!input.dims.empty() && groups > 0,
+                        "Qwen4HyperPrepare received an invalid shape.\n");
+        activated.dataType = input.dataType;
+        activated.Resize(input.dims);
+    }
+
+    void CpuQwen4HyperPrepareOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &activated = *datas.find("output")->second;
+        const int groups = Qwen4Groups(intParams);
+        Qwen4AssertCpuTensor(input, "Qwen4HyperPrepare input");
+        AssertInFastLLM(!input.dims.empty() && groups > 0,
+                        "Qwen4HyperPrepare received an invalid shape.\n");
+        activated.Allocate(false);
+
+        const DataType type = input.dataType;
+        const int count = (int)input.Count(0);
+        const float scale = 1.0f / groups;
+        Qwen4ParallelFor(count, [&](int start, int end) {
+            for (int index = start; index < end; index++) {
+                const float scaled = Qwen4RoundCpu(
+                    Qwen4LoadCpu(input.cpuData, type, index) * scale,
+                    type);
+                const float activatedValue = type == DataType::BFLOAT16
+                    ? scaled / (1.0f + std::exp(-scaled))
+                    : scaled / (1.0 + expf(-scaled));
+                Qwen4StoreCpu(
+                    activated.cpuData, type, index, activatedValue);
+            }
+        });
+    }
+
     void CpuQwen4HyperInjectOp::Run(
             const std::string &opType, const DataDict &datas,
             const FloatDict &floatParams, const IntDict &intParams) {

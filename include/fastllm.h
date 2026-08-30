@@ -1006,6 +1006,10 @@ namespace fastllm {
                             Data &newHistory);
     void Qwen4HyperMix(const Data &normalized, const Data &mixLogits,
                        int groups, Data &output);
+    // Fuse the low-rank scale and SiLU without changing either projection's
+    // GEMM geometry or the independent injection-gate dataflow.
+    void Qwen4HyperPrepare(const Data &lowRankProjection, int groups,
+                           Data &activated);
     void Qwen4HyperInject(const Data &logits, int groups, Data &output);
     void Qwen4HyperCombine(const Data &hyperInput, const Data &blockOutput,
                            const Data &injection, int groups, Data &output);
