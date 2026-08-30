@@ -180,6 +180,10 @@ extern "C" {
         fastllm::SetMoeDeviceLayers(layers);
     }
 
+    DLL_EXPORT void set_ngram_device(const char *device) {
+        fastllm::SetNgramDevice(device == nullptr ? "cpu" : device);
+    }
+
     DLL_EXPORT struct ModelManager {
         std::mutex locker;
         std::map <int, std::unique_ptr<fastllm::basellm> > models;

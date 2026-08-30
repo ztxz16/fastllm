@@ -501,6 +501,9 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--tp', type = str, default = "", help = '线程级张量并行设备；裸数字X表示使用前X张卡，0表示0号卡，也可写 0,1 或 auto')
     parser.add_argument('--moe_device', type = str, default = "", help = 'moe使用的设备')
     parser.add_argument('--moe_device_layers', type = int, default = -1, help = '后面多少层moe使用moe_device，-1表示全部moe层使用moe_device')
+    parser.add_argument('--ngram_device', '--ngram-device', dest = 'ngram_device',
+                        choices = ['cpu', 'disk'], default = 'cpu',
+                        help = 'ngram表存放位置；disk从checkpoint按行读取以显著降低内存占用')
     parser.add_argument('--moe_experts', type = int, default = -1, help = 'moe使用的专家数')
     parser.add_argument("--cache_history", type = str, default = "", help = "缓存历史对话")
     parser.add_argument("--cache_fast", type = str, default = "", help = "是否启用快速缓存（会消耗一定显存）")
@@ -1054,6 +1057,7 @@ def make_normal_llm_model(args, startup_progress = None):
     _configure_qwen35_auto_fast_paths(args, is_qwen35_model, mtp)
     from ftllm import llm
     llm.set_moe_device_layers(-1)
+    llm.set_ngram_device(args.ngram_device)
     if (args.device and args.device != ""):
         try:
             import ast

@@ -10,6 +10,7 @@
 
 #include <cstring>
 #include <cstdlib>
+#include <cctype>
 #include <cmath>
 #include <cfloat>
 #include <climits>
@@ -272,6 +273,7 @@ namespace fastllm {
 
     std::map <std::string, int> defaultDeviceMap, defaultMoeDeviceMap, defaultLayeredMoeDeviceMap;
     int defaultMoeDeviceLayers = -1;
+    std::string defaultNgramDevice = "cpu";
     Executor defaultExecutor;
     thread_local Executor *curExecutor = &defaultExecutor;
 
@@ -5586,6 +5588,19 @@ namespace fastllm {
 
     int GetMoeDeviceLayers() {
         return defaultMoeDeviceLayers;
+    }
+
+    void SetNgramDevice(const std::string &device) {
+        std::string normalized = device;
+        std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        AssertInFastLLM(normalized == "cpu" || normalized == "disk",
+                        "ngram device should be cpu or disk.\n");
+        defaultNgramDevice = normalized;
+    }
+
+    std::string GetNgramDevice() {
+        return defaultNgramDevice;
     }
 
     void PagedCacheManager::SetMaxPages(int maxPages) {

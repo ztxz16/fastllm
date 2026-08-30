@@ -212,6 +212,7 @@ namespace fastllm {
         this->moeDeviceMap = GetMoeDeviceMap();
         this->layeredMoeDeviceMap = GetLayeredMoeDeviceMap();
         this->moeDeviceLayers = GetMoeDeviceLayers();
+        this->ngramDevice = GetNgramDevice();
     }
 
     void basellm::AddSpecialWeight(const std::string &weightName, const std::string &weightType, int layerId) {
@@ -1842,6 +1843,10 @@ namespace fastllm {
                                             uint64_t sourceBytes) {
         if (model == nullptr) {
             return WeightType::NONE;
+        }
+        if (model->ngramDevice == "disk" &&
+            model->ngramWeights.find(weightName) != model->ngramWeights.end()) {
+            return WeightType::EMBEDDING;
         }
         if (IsDiskMoeWeight(model, weightName)) {
             return WeightType::LINEAR;

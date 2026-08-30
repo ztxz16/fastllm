@@ -13,14 +13,30 @@ checkpoint are deliberately not loaded by the text-generation model.
   convolution, recurrent state, L2-normalized Q/K, and sigmoid output gate;
 - partial RoPE GQA and the long-context QSA block indexer;
 - 512 routed FP8 experts plus the shared expert;
-- PLE hashed 2/3-gram lookup, raw E4M3 host-resident shards, the checkpoint's
-  common scalar, EOS-aware history, signed hash remainder, gated injection, and
-  dilated depthwise convolution;
+- PLE hashed 2/3-gram lookup, raw BF16/E4M3 host or disk-backed shards, the
+  checkpoint's common scalar, EOS-aware history, signed hash remainder, gated
+  injection, and dilated depthwise convolution;
 - per-request PLE, convolution, recurrent, KV, and QSA index-key state.
 
-The PLE embedding is intentionally gathered on the CPU.  Only the selected
+By default, the PLE embedding stays resident on the CPU.  Only the selected
 160-element rows are converted to float and scaled, so loading the model does
 not expand the very large table to float32.
+
+Set `--ngram_device disk` to keep the PLE table in its original safetensors
+files and read only the selected rows.  This is useful when host memory is
+limited; the Qwen3.8-Flash-Next checkpoint's 320,001,536-row table occupies
+95.37 GiB.  The default is `--ngram_device cpu`.
+
+```bash
+ftllm benchmark "$MODEL" \
+  --device cuda --moe_device cuda --ngram_device disk \
+  --max_batch 1 --input_tokens 4096 --output_tokens 16 \
+  --warmup 1 --temperature 0
+```
+
+Disk mode lowers process RSS by avoiding the resident table allocation.  The
+operating-system page cache may still use otherwise-free memory, and decode
+performs small random reads, so an SSD is recommended when this mode is used.
 
 ## Build and smoke tests
 

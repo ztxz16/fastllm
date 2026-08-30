@@ -26,6 +26,7 @@ namespace fastllm {
 
         std::map<std::string, std::vector<std::pair<std::string, DataType>>>
         GetTensorMap(const std::vector<std::string> &tensorNames) override;
+        void OnModelWeightsLoaded() override;
 
         int Forward(
                 const Data &inputIds,
@@ -161,6 +162,9 @@ namespace fastllm {
         // prefill does not rebuild and upload the same 128-float constant in
         // every linear-attention layer.
         Data linearInvScaleData;
+        // Logical concatenation of the lazy shard metadata used by the
+        // standard disk EmbeddingDirect operation.
+        Data pleNgramDiskWeight;
         // QSA cache compression applies RoPE on the host while regular
         // attention applies it on its execution device. Keep an immutable
         // host view so cache updates never migrate the shared sinData/cosData

@@ -516,6 +516,11 @@ namespace fastllm {
         std::map <std::string, int> specialWeightLayerIds;
         std::set <std::string> cantQuantLinears; // 不能量化的Linear层
         std::set <std::string> moeLinears;
+        // Model-declared ngram tables can follow an independent placement
+        // policy.  Today they support resident host memory (cpu) or lazy
+        // row-wise checkpoint reads (disk).
+        std::set <std::string> ngramWeights;
+        std::string ngramDevice = "cpu";
 
         std::vector<std::vector<float> > sin, cos;
 

@@ -11,6 +11,7 @@
 #include "qwen4_exp.h"
 
 #include "devices/cpu/alivethreadpool.h"
+#include "executor.h"
 #include "json11.hpp"
 #include "utils.h"
 
@@ -28,6 +29,7 @@
 #include <limits>
 #include <set>
 #include <sstream>
+#include <utility>
 
 namespace fastllm {
 #ifdef USE_CUDA
@@ -1099,6 +1101,7 @@ namespace fastllm {
                 result[name].push_back({
                     name,
                     scaledFp8Ple ? DataType::FP8_E4M3 : DataType::BFLOAT16});
+                this->ngramWeights.insert(name);
                 continue;
             }
             if (name.find("ple_embedding.ngram_embedding.weight_scale") != std::string::npos) {
@@ -1121,6 +1124,59 @@ namespace fastllm {
         }
         result.insert(mapped.begin(), mapped.end());
         return result;
+    }
+
+    void Qwen4ExpModel::OnModelWeightsLoaded() {
+        if (this->ngramDevice != "disk") {
+            return;
+        }
+
+        const std::string embeddingPrefix = languagePrefix + "layers." +
+            std::to_string(this->pleLayer) +
+            ".ple.ple_embedding.ngram_embedding.";
+        int64_t totalRows = 0;
+        DataType dataType = DataType::FLOAT32;
+        std::vector<DiskWeightPart> parts;
+        for (int shardIndex = 0; shardIndex < this->ngramShardCount;
+             shardIndex++) {
+            const std::string name = embeddingPrefix + "shard_" +
+                std::to_string(shardIndex) + ".weight";
+            auto it = this->weight.weight.find(name);
+            AssertInFastLLM(it != this->weight.weight.end(),
+                            "Qwen4-Exp disk PLE is missing shard metadata: " +
+                                name + "\n");
+            const Data &shard = it->second;
+            AssertInFastLLM(
+                shard.isDiskWeight && shard.cpuData == nullptr &&
+                    shard.dims.size() == 2 && shard.dims[0] > 0 &&
+                    shard.dims[1] == this->ngramHeadDim &&
+                    !shard.diskWeightParts.empty(),
+                "Qwen4-Exp disk PLE shard has invalid metadata: " + name +
+                    "\n");
+            if (shardIndex == 0) {
+                dataType = shard.dataType;
+            } else {
+                AssertInFastLLM(shard.dataType == dataType,
+                                "Qwen4-Exp disk PLE shards have mixed dtypes.\n");
+            }
+            totalRows += shard.dims[0];
+            parts.insert(parts.end(), shard.diskWeightParts.begin(),
+                         shard.diskWeightParts.end());
+        }
+        AssertInFastLLM(
+            totalRows > 0 && totalRows <= std::numeric_limits<int>::max(),
+            "Qwen4-Exp disk PLE table is too large for int32 row indices.\n");
+
+        this->pleNgramDiskWeight.dataType = dataType;
+        this->pleNgramDiskWeight.UpdateUnitSize();
+        this->pleNgramDiskWeight.Resize(
+            {(int)totalRows, this->ngramHeadDim});
+        this->pleNgramDiskWeight.name = embeddingPrefix + "weight";
+        this->pleNgramDiskWeight.isModelWeight = true;
+        this->pleNgramDiskWeight.weightType = WeightType::EMBEDDING;
+        this->pleNgramDiskWeight.dataDevice = DataDevice::CPU;
+        this->pleNgramDiskWeight.isDiskWeight = true;
+        this->pleNgramDiskWeight.diskWeightParts = std::move(parts);
     }
 
     bool Qwen4ExpModel::IsLinearAttentionLayer(int layer) const {
@@ -1274,10 +1330,18 @@ namespace fastllm {
         Data &firstShard = this->weight[embeddingPrefix + "shard_0.weight"];
         const bool fp8Embedding = firstShard.dataType == DataType::FP8_E4M3;
         const bool bf16Embedding = firstShard.dataType == DataType::BFLOAT16;
+        const bool diskEmbedding = firstShard.isDiskWeight;
         AssertInFastLLM((fp8Embedding || bf16Embedding) &&
                         firstShard.dims.size() == 2 &&
                         firstShard.dims[1] == this->ngramHeadDim,
                         "Qwen4-Exp PLE shard has an unexpected dtype or shape.");
+        AssertInFastLLM(
+            !diskEmbedding ||
+                (this->pleNgramDiskWeight.isDiskWeight &&
+                 this->pleNgramDiskWeight.dataType == firstShard.dataType &&
+                 this->pleNgramDiskWeight.dims.size() == 2 &&
+                 this->pleNgramDiskWeight.dims[1] == this->ngramHeadDim),
+            "Qwen4-Exp disk PLE table was not initialized.");
         const int64_t rowsPerShard = firstShard.dims[0];
 
         float embeddingScale = 1.0f;
@@ -1295,6 +1359,10 @@ namespace fastllm {
         static const FP8E4M3ToFP32Manager fp8Decoder;
 
         std::vector<float> embeddings((size_t)batch * sequence * this->pleEmbedDim);
+        std::vector<int32_t> diskRows;
+        if (diskEmbedding) {
+            diskRows.resize((size_t)batch * sequence * this->ngramHeads);
+        }
         int previous1 = state.previousToken1 < 0 ? this->eosToken : state.previousToken1;
         int previous2 = state.previousToken2 < 0 ? this->eosToken : state.previousToken2;
         for (int tokenIndex = 0; tokenIndex < sequence; tokenIndex++) {
@@ -1320,6 +1388,16 @@ namespace fastllm {
                     }
                     const int64_t globalRow =
                         this->pleHeadOffsets[head] + remainder;
+                    const size_t lookupIndex =
+                        (size_t)tokenIndex * this->ngramHeads + head;
+                    if (diskEmbedding) {
+                        AssertInFastLLM(
+                            globalRow >= 0 &&
+                                globalRow < this->pleNgramDiskWeight.dims[0],
+                            "Qwen4-Exp PLE hash selected an invalid disk row.");
+                        diskRows[lookupIndex] = (int32_t)globalRow;
+                        continue;
+                    }
                     const int shardIndex = (int)(globalRow / rowsPerShard);
                     const int64_t shardRow = globalRow % rowsPerShard;
                     AssertInFastLLM(shardIndex >= 0 &&
@@ -1330,8 +1408,7 @@ namespace fastllm {
                                                ".weight"];
                     shard.ToDevice(DataDevice::CPU);
                     float *destination = embeddings.data() +
-                        ((size_t)tokenIndex * this->ngramHeads + head) *
-                        this->ngramHeadDim;
+                        lookupIndex * this->ngramHeadDim;
                     if (fp8Embedding) {
                         const uint8_t *source = shard.cpuData +
                             (size_t)shardRow * this->ngramHeadDim;
@@ -1361,6 +1438,45 @@ namespace fastllm {
         }
         state.previousToken1 = previous1;
         state.previousToken2 = previous2;
+
+        if (diskEmbedding) {
+            Data lookupRows(DataType::INT32,
+                            {batch, sequence, this->ngramHeads});
+            lookupRows.Allocate(false);
+            std::memcpy(lookupRows.cpuData, diskRows.data(),
+                        diskRows.size() * sizeof(int32_t));
+            Data diskValues;
+            auto *executor = (Executor*)GetExecutor();
+            executor->RunOnDevice(
+                "disk", "EmbeddingDirect",
+                {{"input", &lookupRows},
+                 {"weight", &this->pleNgramDiskWeight},
+                 {"output", &diskValues}},
+                {}, {});
+            AssertInFastLLM(
+                diskValues.dataDevice == DataDevice::CPU &&
+                    diskValues.cpuData != nullptr &&
+                    diskValues.dataType == firstShard.dataType &&
+                    diskValues.Count(0) ==
+                        (uint64_t)diskRows.size() * this->ngramHeadDim,
+                "Qwen4-Exp disk PLE lookup returned an invalid tensor.");
+
+            const size_t valueCount =
+                diskRows.size() * (size_t)this->ngramHeadDim;
+            if (fp8Embedding) {
+                const uint8_t *source = diskValues.cpuData;
+                for (size_t i = 0; i < valueCount; i++) {
+                    embeddings[i] =
+                        fp8Decoder.dict[source[i]] * embeddingScale;
+                }
+            } else {
+                const uint16_t *source =
+                    reinterpret_cast<const uint16_t *>(diskValues.cpuData);
+                for (size_t i = 0; i < valueCount; i++) {
+                    embeddings[i] = BFloat16BitsToFloat32(source[i]);
+                }
+            }
+        }
 
         Data embeddingData(DataType::FLOAT32,
                            {batch, sequence, this->pleEmbedDim}, embeddings);

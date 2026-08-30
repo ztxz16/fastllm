@@ -629,6 +629,11 @@ namespace fastllm {
                type == DataType::BFLOAT16;
     }
 
+    static bool IsDiskEmbeddingStorageType(DataType type, bool direct) {
+        return IsDiskFloatStorageType(type) ||
+               (direct && type == DataType::FP8_E4M3);
+    }
+
     static bool CanConvertDiskStorageType(DataType dst, DataType src) {
         return dst == src || (IsDiskFloatStorageType(dst) && IsDiskFloatStorageType(src));
     }
@@ -1079,11 +1084,13 @@ namespace fastllm {
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
         Data &weight = *(datas.find("weight")->second);
-        AssertInFastLLM(weight.dims.size() == 2 && IsDiskFloatStorageType(weight.dataType),
+        AssertInFastLLM(weight.dims.size() == 2 &&
+                            IsDiskEmbeddingStorageType(weight.dataType, direct),
                         "Disk Embedding expects a 2D floating-point weight.\n");
         AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
-                        input.dataType == DataType::FLOAT16,
-                        "Disk Embedding input should be float32 or float16.\n");
+                        input.dataType == DataType::FLOAT16 ||
+                        input.dataType == DataType::INT32,
+                        "Disk Embedding input should be float32, float16 or int32.\n");
         std::vector<int> dims = input.dims;
         dims.push_back(weight.dims[1]);
         output.dataType = direct ? weight.dataType : input.dataType;
@@ -1099,7 +1106,7 @@ namespace fastllm {
         auto it = datas.find("weight");
         return it != datas.end() && it->second != nullptr &&
                it->second->isDiskWeight && !it->second->diskWeightParts.empty() &&
-               IsDiskFloatStorageType(it->second->dataType);
+               IsDiskEmbeddingStorageType(it->second->dataType, direct);
     }
 
     void DiskEmbeddingOp::Run(const std::string &opType, const DataDict &datas,
@@ -1118,11 +1125,17 @@ namespace fastllm {
         std::unordered_map<int, int> previousRows;
 
         for (int i = 0; i < inputLen; i++) {
-            float rawToken = input.dataType == DataType::FLOAT32 ?
-                ((float*)input.cpuData)[i] : half_to_float(((uint16_t*)input.cpuData)[i]);
-            AssertInFastLLM(std::isfinite(rawToken),
-                            "Disk Embedding token is not finite.\n");
-            int token = (int)(rawToken + 1e-9f);
+            int token;
+            if (input.dataType == DataType::INT32) {
+                token = ((int32_t*)input.cpuData)[i];
+            } else {
+                float rawToken = input.dataType == DataType::FLOAT32 ?
+                    ((float*)input.cpuData)[i] :
+                    half_to_float(((uint16_t*)input.cpuData)[i]);
+                AssertInFastLLM(std::isfinite(rawToken),
+                                "Disk Embedding token is not finite.\n");
+                token = (int)(rawToken + 1e-9f);
+            }
             AssertInFastLLM(token >= 0 && token < vocabSize,
                             "Disk Embedding token is out of range: " + std::to_string(token) + "\n");
             auto previous = previousRows.find(token);
