@@ -1306,6 +1306,43 @@ namespace fastllm {
             this->rms_norm_eps, this->hcCount, output, normalized);
     }
 
+    void Qwen4ExpModel::MaterializePLEHostHistory(
+            RequestState &state) {
+        const int channels = this->hcCount * this->embed_dim;
+        const int historyLength =
+            (this->pleConvKernel - 1) * this->ngramSize;
+        const size_t historyCount =
+            (size_t)historyLength * channels;
+        if (state.convHistory.size() != historyCount) {
+            state.convHistory.assign(historyCount, 0.0f);
+        }
+
+        AssertInFastLLM(
+            state.pleConvHistoryIndex == 0 ||
+                state.pleConvHistoryIndex == 1,
+            "Qwen4-Exp PLE device history has an invalid active index.");
+        const std::shared_ptr<Data> &deviceHistory =
+            state.pleConvHistoryTensors[state.pleConvHistoryIndex];
+        if (deviceHistory == nullptr) {
+            return;
+        }
+        AssertInFastLLM(
+            deviceHistory->dataType == DataType::FLOAT32 &&
+                deviceHistory->dims ==
+                    std::vector<int>({historyLength, channels}) &&
+                ((deviceHistory->dataDevice == DataDevice::CUDA &&
+                  deviceHistory->cudaData != nullptr) ||
+                 (deviceHistory->dataDevice == DataDevice::CPU &&
+                  deviceHistory->cpuData != nullptr)),
+            "Qwen4-Exp PLE device history is invalid.");
+
+        Data hostHistory;
+        hostHistory.CopyFrom(*deviceHistory);
+        hostHistory.ToDevice(DataDevice::CPU);
+        std::memcpy(state.convHistory.data(), hostHistory.cpuData,
+                    historyCount * sizeof(float));
+    }
+
     void Qwen4ExpModel::RunPLE(const Data &hyperInput,
                                const Data &inputIds,
                                RequestState &state,
@@ -1487,14 +1524,12 @@ namespace fastllm {
         GroupedRMSNorm(hyperInput, this->weight[ple + "norm_query.weight"],
                        queryNormed);
 
-        // The ngram lookup above intentionally remains on the host. For a
-        // multi-token CUDA prefill, keep the much larger projection tail on
-        // the device: the legacy path copied key/query/value/normalized to
-        // CPU and the final result back to CUDA (about 880 MiB at 4K).
-        // Single-token decode still uses the legacy implementation until its
-        // convolution history becomes a persistent device cache.
-        if (sequence > 1 &&
-            keyNormed.dataDevice == DataDevice::CUDA &&
+        // The ngram lookup above intentionally remains on the host.  Keep the
+        // projection tail and the dilated short-convolution state on the
+        // execution device for both prefill and decode.  This follows the
+        // accelerator-resident short-conv cache used by vLLM while retaining
+        // convHistory as a self-contained CPU snapshot/fallback image.
+        if (keyNormed.dataDevice == DataDevice::CUDA &&
             queryNormed.dataDevice == DataDevice::CUDA &&
             value.dataDevice == DataDevice::CUDA) {
             const int channels = this->hcCount * this->embed_dim;
@@ -1504,6 +1539,69 @@ namespace fastllm {
             if ((int)state.convHistory.size() != historyLength * channels) {
                 state.convHistory.assign(
                     (size_t)historyLength * channels, 0.0f);
+            }
+
+            AssertInFastLLM(
+                state.pleConvHistoryIndex == 0 ||
+                    state.pleConvHistoryIndex == 1,
+                "Qwen4-Exp PLE device history has an invalid active index.");
+            std::vector<int> targetDeviceIds =
+                keyNormed.dataDeviceIds;
+#ifdef USE_CUDA
+            // Data::ToDevice canonicalizes an empty CUDA device list to the
+            // current device. Canonicalize the producer metadata as well so
+            // an otherwise identical request does not look like a device-map
+            // migration on every token.
+            if (targetDeviceIds.empty()) {
+                targetDeviceIds = {FastllmCudaGetDevice()};
+            }
+#endif
+            auto sameHistoryDevice = [&](
+                    const std::shared_ptr<Data> &history) {
+                return history != nullptr &&
+                    history->dataDevice == DataDevice::CUDA &&
+                    history->dataDeviceIds == targetDeviceIds &&
+                    history->dataType == DataType::FLOAT32 &&
+                    history->dims ==
+                        std::vector<int>({historyLength, channels}) &&
+                    history->cudaData != nullptr;
+            };
+
+            const int currentIndex = state.pleConvHistoryIndex;
+            if (state.pleConvHistoryTensors[currentIndex] != nullptr &&
+                !sameHistoryDevice(
+                    state.pleConvHistoryTensors[currentIndex])) {
+                // A device-map change is a compatibility boundary.  Preserve
+                // the latest state once, then rebuild both buffers on the new
+                // execution device.
+                MaterializePLEHostHistory(state);
+                state.pleConvHistoryTensors[0].reset();
+                state.pleConvHistoryTensors[1].reset();
+                state.pleConvHistoryIndex = 0;
+            }
+
+            if (!sameHistoryDevice(
+                    state.pleConvHistoryTensors[
+                        state.pleConvHistoryIndex])) {
+                state.pleConvHistoryTensors[
+                    state.pleConvHistoryIndex] =
+                    std::make_shared<Data>(
+                        DataType::FLOAT32,
+                        std::vector<int>({historyLength, channels}),
+                        state.convHistory);
+                state.pleConvHistoryTensors[
+                    state.pleConvHistoryIndex]->ToDevice(
+                        DataDevice::CUDA, targetDeviceIds);
+            }
+            const int nextIndex = 1 - state.pleConvHistoryIndex;
+            if (!sameHistoryDevice(
+                    state.pleConvHistoryTensors[nextIndex])) {
+                state.pleConvHistoryTensors[nextIndex] =
+                    std::make_shared<Data>(
+                        DataType::FLOAT32,
+                        std::vector<int>({historyLength, channels}));
+                state.pleConvHistoryTensors[nextIndex]->ToDevice(
+                    DataDevice::CUDA, targetDeviceIds, false);
             }
 
             Data gatedData, normalized;
@@ -1526,21 +1624,25 @@ namespace fastllm {
                 convWeight.dims.back() == this->pleConvKernel,
                 "Qwen4-Exp PLE convolution weight has an invalid shape.");
 
-            Data historyData(
-                DataType::FLOAT32, {historyLength, channels},
-                state.convHistory);
-            historyData.ToDevice(normalized.dataDevice);
-            Data nextHistory;
             fastllm::Qwen4PLECausalConv(
-                normalized, gatedData, convWeight, historyData,
-                this->pleConvKernel, dilation, output, nextHistory);
-            nextHistory.ToDevice(DataDevice::CPU);
-            std::memcpy(state.convHistory.data(), nextHistory.cpuData,
-                        state.convHistory.size() * sizeof(float));
+                normalized, gatedData, convWeight,
+                *state.pleConvHistoryTensors[
+                    state.pleConvHistoryIndex],
+                this->pleConvKernel, dilation, output,
+                *state.pleConvHistoryTensors[nextIndex]);
+            state.pleConvHistoryIndex = nextIndex;
             ToDataType(output, hyperInput.dataType);
             output.ToDevice(hyperInput.dataDevice);
             return;
         }
+
+        // CPU and other generic device fallbacks consume the host image.
+        // Materialize only at this boundary; ordinary CUDA forwards never
+        // synchronize the persistent history back to the host.
+        MaterializePLEHostHistory(state);
+        state.pleConvHistoryTensors[0].reset();
+        state.pleConvHistoryTensors[1].reset();
+        state.pleConvHistoryIndex = 0;
 
         Data keyCpu, queryCpu, valueCpu;
         ToDataType(keyNormed, keyCpu, DataType::FLOAT32);
@@ -3488,8 +3590,10 @@ namespace fastllm {
         }
 
         // Snapshot state is copied by value. Complete the asynchronous groups
-        // and the small device tail once at this boundary so the snapshot has
-        // a self-sufficient generic fallback history.
+        // and materialize the device-resident PLE/QSA histories once at this
+        // boundary so the snapshot has a self-sufficient generic fallback
+        // representation.
+        MaterializePLEHostHistory(state);
         for (int layer = 0; layer < this->block_cnt; layer++) {
             if (!this->IsLinearAttentionLayer(layer)) {
                 MaterializeQsaHostHistory(layer, cachedLen, state);
@@ -3641,6 +3745,9 @@ namespace fastllm {
         snapshot->tokens = state.processedTokens;
         snapshot->state = state;
         snapshot->state.borrowedPrefixSnapshot.reset();
+        snapshot->state.pleConvHistoryTensors[0].reset();
+        snapshot->state.pleConvHistoryTensors[1].reset();
+        snapshot->state.pleConvHistoryIndex = 0;
         snapshot->state.indexerHostMirrorTransfers.clear();
         snapshot->state.indexerTailKeyTensors.clear();
         snapshot->state.indexerTailPositionTensors.clear();

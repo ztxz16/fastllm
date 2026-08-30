@@ -64,6 +64,14 @@ namespace fastllm {
             int previousToken1 = -1;
             int previousToken2 = -1;
             std::vector<float> convHistory;
+            // PLE's dilated short-convolution state stays on its execution
+            // device between forwards.  Two tensors are used as a ping-pong
+            // cache because the standard operation reads the old history and
+            // writes the next history separately.  convHistory remains the
+            // self-contained host representation used by CPU fallback and
+            // prefix snapshots.
+            std::shared_ptr<Data> pleConvHistoryTensors[2];
+            int pleConvHistoryIndex = 0;
             std::map<int, std::vector<float>> indexerRawKeys;
             std::map<int, std::vector<float>> indexerPositions;
             // CPU/non-contiguous-mask fallback cache. CUDA appends completed
@@ -192,6 +200,7 @@ namespace fastllm {
 
         void RunPLE(const Data &hyperInput, const Data &inputIds,
                     RequestState &state, Data &output);
+        void MaterializePLEHostHistory(RequestState &state);
         void BuildQSAMask(int layer, const Data &input,
                           const Data &baseMask, const Data &positionIds,
                           int previousLength, bool deviceCompatibleMask,
