@@ -220,7 +220,8 @@ namespace fastllm {
         void RunMoE(int layer, const Data &input, Data &output);
 
         bool TryRunDecodeCudaGraphBackbone(
-            int firstFullAttentionLayer,
+            int graphStartLayer,
+            bool startBeforeAttention,
             const Data &hiddenStates,
             const Data &attentionOutput,
             const Data &attentionInjection,

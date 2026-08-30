@@ -166,13 +166,15 @@ bool FastllmCudaGraphCaptureInvalidated();
 void FastllmCudaGraphPointerTablesBegin(const void *owner);
 void FastllmCudaGraphPointerTablesEnd();
 
-// Qwen3.5 MoE graph markers are emitted only while the per-thread stream is
-// being captured. After capture, the optimizer rewires the sequential region
-// into shared/routed expert branches and removes every marker node. CUDA does
-// not allow node removal from graphs containing allocation/free nodes; in that
+// MoE graph markers are emitted only while the per-thread stream is being
+// captured. After capture, the optimizer rewires the sequential region into
+// shared/routed expert branches and removes every marker node. CUDA does not
+// allow node removal from graphs containing allocation/free nodes; in that
 // case the optimizer leaves the graph untouched and asks the caller to capture
 // again with markers disabled.
 static constexpr int FASTLLM_CUDA_GRAPH_MOE_RECAPTURE_WITHOUT_MARKERS = -2;
+static constexpr int FASTLLM_CUDA_GRAPH_RECAPTURE_WITHOUT_PARALLEL_MARKERS =
+    FASTLLM_CUDA_GRAPH_MOE_RECAPTURE_WITHOUT_MARKERS;
 bool FastllmCudaGraphSetQwen35MoeMarkersEnabled(bool enabled);
 void FastllmCudaGraphMarkQwen35MoeFork(int layer);
 void FastllmCudaGraphMarkQwen35MoeSharedDone(int layer);
@@ -182,6 +184,31 @@ void FastllmCudaGraphMarkQwen35MoeJoin(int layer);
 // -1 on an invalid graph/runtime error.
 int FastllmCudaGraphOptimizeQwen35Moe(void *graph);
 bool FastllmCudaGraphQwen35MoeSelfTest();
+
+// Model-neutral aliases. The four markers describe two independent regions:
+// fork -> first -> firstDone -> secondBegin -> second -> join. The optimizer
+// removes the markers and makes both regions depend on the fork input, while
+// the join depends on both region tails. Region ids only need to be unique in
+// one captured graph. Keep the Qwen3.5 entry points for source/ABI
+// compatibility.
+inline bool FastllmCudaGraphSetParallelMarkersEnabled(bool enabled) {
+    return FastllmCudaGraphSetQwen35MoeMarkersEnabled(enabled);
+}
+inline void FastllmCudaGraphMarkParallelFork(int region) {
+    FastllmCudaGraphMarkQwen35MoeFork(region);
+}
+inline void FastllmCudaGraphMarkParallelFirstDone(int region) {
+    FastllmCudaGraphMarkQwen35MoeSharedDone(region);
+}
+inline void FastllmCudaGraphMarkParallelSecondBegin(int region) {
+    FastllmCudaGraphMarkQwen35MoeRoutedBegin(region);
+}
+inline void FastllmCudaGraphMarkParallelJoin(int region) {
+    FastllmCudaGraphMarkQwen35MoeJoin(region);
+}
+inline int FastllmCudaGraphOptimizeParallelRegions(void *graph) {
+    return FastllmCudaGraphOptimizeQwen35Moe(graph);
+}
 // CUDA graph 捕获期间，算子内部仍会从 FastLLM 内存池申请并归还临时块。
 // 捕获结束后 Graph 会长期保存这些地址，因此需要把已归还、但被 Graph 引用的
 // 内存池块保留到 Graph 销毁。Begin/End 之间允许正常复用，以保持逐层 workspace
@@ -581,6 +608,33 @@ bool FastllmCudaQwen4QSASelect(const fastllm::Data &query,
                                fastllm::Data &indices, int keyLength,
                                int heads, int headDim, int tokenBudget,
                                int compressRatio, int queryStart);
+// Fixed-capacity decode helpers used while replaying a CUDA graph.  The
+// logical cache length lives in decodeMeta[0], so every kernel launch keeps
+// the same pointer, grid, and output shape across decode tokens.
+bool FastllmCudaQwen4QSAAppendGraph(
+        const fastllm::Data &rawKey, const fastllm::Data &position,
+        const int32_t *decodeMeta, int compressRatio,
+        fastllm::Data &tailKeys, fastllm::Data &tailPositions);
+bool FastllmCudaQwen4QSACommitGraph(
+        const fastllm::Data &compressedKey, const int32_t *decodeMeta,
+        int compressRatio, fastllm::Data &compressedKeys);
+bool FastllmCudaQwen4QSASelectGraph(
+        const fastllm::Data &query, const fastllm::Data &compressedKeys,
+        const int32_t *decodeMeta, fastllm::Data &scores,
+        fastllm::Data &selectedBlocks, fastllm::Data &indices,
+        int heads, int headDim, int tokenBudget, int compressRatio);
+bool FastllmCudaQwen4KVAppend(
+        const fastllm::Data &key, const fastllm::Data &value,
+        int previousLength,
+        fastllm::Data &keyCache, fastllm::Data &valueCache);
+bool FastllmCudaQwen4KVAppendGraph(
+        const fastllm::Data &key, const fastllm::Data &value,
+        const int32_t *decodeMeta,
+        fastllm::Data &keyCache, fastllm::Data &valueCache);
+bool FastllmCudaQwen4GatherKVGraph(
+        const fastllm::Data &key, const fastllm::Data &value,
+        const fastllm::Data &indices, const int32_t *decodeMeta,
+        fastllm::Data &compactKey, fastllm::Data &compactValue);
 bool FastllmCudaQwen4QSABuildMask(const fastllm::Data &indices,
                                   const fastllm::Data &reference,
                                   fastllm::Data &mask, int keyLength);
