@@ -1188,11 +1188,13 @@ static bool FastllmPagedUseGqaDecodeFor(int group, int headDim, int H, int numKv
 
 // Qwen3.5 在 TP=2 时使用 group=6、headDim=256。原来的共享 GQA kernel 只覆盖
 // headDim<=128，因此会回退到 per-Q-head 路径，把同一个 KV head 从 HBM 重读 6 次。
-// 这条路径的 kernel 配置专门按 V100 的寄存器、共享内存和 SM 数量调优；严格限制为
-// SM70，避免改变其它架构已有的 FlashInfer/native 路径。设为 0 可随时回退做对照。
-static bool FastllmPagedUseSm70GqaD256DecodeFor(int group, int headDim, int H, int numKvHeads) {
+// Volta/Turing 都能承载该 kernel 的寄存器和约 15KB 共享内存配置；严格限制为
+// SM70-SM75，避免改变更新架构已有的 FlashInfer/native 路径。设为 0 可随时回退做对照。
+static bool FastllmPagedUseSm7xGqaD256DecodeFor(int group, int headDim, int H, int numKvHeads) {
     const char *env = std::getenv("FASTLLM_PAGED_SM70_GQA_D256_DECODE");
-    return FastllmCudaRuntimeArch() == 70 && (env == nullptr || env[0] != '0') &&
+    const int arch = FastllmCudaRuntimeArch();
+    return arch >= 70 && arch <= 75 &&
+           (env == nullptr || env[0] != '0') &&
            group == 6 && headDim == 256 && H == group * numKvHeads;
 }
 
@@ -2426,10 +2428,10 @@ static void FastllmCudaPagedAttentionSplitLaunch(
     QType *qd = (QType*)q.cudaData;
     QType *od = (QType*)output.cudaData;
     const bool useGqa = FastllmPagedUseGqaDecodeFor(group, headDim, H, numKvHeads);
-    const bool useSm70GqaD256 =
-        FastllmPagedUseSm70GqaD256DecodeFor(group, headDim, H, numKvHeads);
+    const bool useSm7xGqaD256 =
+        FastllmPagedUseSm7xGqaD256DecodeFor(group, headDim, H, numKvHeads);
 
-    if (useSm70GqaD256) {
+    if (useSm7xGqaD256) {
         if (pagedKVCacheK->dataType == fastllm::DataType::FP8_E4M3) {
             FastllmCudaPagedAttentionSplitLaunchSm70GqaD256<QType, __nv_fp8_e4m3>(
                 qd, (__nv_fp8_e4m3*)pagedKVCacheK->cudaData,
@@ -2484,7 +2486,7 @@ static void FastllmCudaPagedAttentionSplitLaunch(
     }
     dim3 grid2(batch_size, (unsigned int)H, 1);
     dim3 block2((unsigned int)headDim, 1, 1);
-    if (useSm70GqaD256) {
+    if (useSm7xGqaD256) {
         grid2.y = (unsigned int)numKvHeads;
         FastllmPagedAttentionCombineGQAKernel<QType, 6><<<grid2, block2>>>(
             scratch, od, qSizesData, H, group, headDim, S);
@@ -2555,12 +2557,12 @@ static bool FastllmCudaHalfPagedAttentionBatchCapturable(
         float *scratch = FastllmGetPagedSplitScratch(device, H, kMaxDecodeBatch, headDim,
                                                      capacitySlots, capturing);
         const bool useGqa = FastllmPagedUseGqaDecodeFor(group, headDim, H, numKvHeads);
-        const bool useSm70GqaD256 =
-            FastllmPagedUseSm70GqaD256DecodeFor(group, headDim, H, numKvHeads);
-        int sharedGqaHeads = useSm70GqaD256
+        const bool useSm7xGqaD256 =
+            FastllmPagedUseSm7xGqaD256DecodeFor(group, headDim, H, numKvHeads);
+        int sharedGqaHeads = useSm7xGqaD256
             ? numKvHeads * (group / FASTLLM_PAGED_SM70_GQA_D256_SUBGROUP)
             : numKvHeads;
-        int S = (useGqa || useSm70GqaD256)
+        int S = (useGqa || useSm7xGqaD256)
             ? FastllmChoosePagedSplits(batch_size, sharedGqaHeads, true)
             : FastllmChoosePagedSplits(batch_size, H, false);
         if (useGqa && S == 1) {
