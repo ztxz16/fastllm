@@ -95,6 +95,18 @@ constexpr uint32_t get_num_mma_q(const uint32_t cta_tile_q) {
   }
 }
 
+// VO-split was originally reserved for head dimensions above 256. D256 with
+// CTA16 also needs it on 64 KiB-smem GPUs: time-sharing the K/V tile is what
+// makes this short-query shape launchable on SM75.
+constexpr bool use_vo_split_shape(const uint32_t num_warps_kv,
+                                  const uint32_t cta_tile_q,
+                                  const uint32_t head_dim_vo) {
+  const uint32_t num_mma_d_vo = head_dim_vo / 16;
+  return (num_mma_d_vo > 16 ||
+          (num_mma_d_vo == 16 && cta_tile_q == 16)) &&
+         num_mma_d_vo % num_warps_kv == 0;
+}
+
 // NVFP4 KV-cache scale-factor staging (one UE4M3 byte per NVFP4_SF_VEC_SIZE elements), used only
 // when DTypeKV is FP4. Kept as an empty base for other dtypes so it adds 0 bytes via EBO instead
 // of a padded placeholder: at HEAD_DIM 256 the q/k/v union already fills the 64 KiB opt-in smem
@@ -127,8 +139,8 @@ struct KVRepackSmem<DTypeQ, DTypeKV, CTA_TILE_Q, CTA_TILE_KV, HEAD_DIM_QK, HEAD_
 // alignas(16) placeholders do not push HEAD_DIM 256 past the 64 KiB opt-in smem budget.
 template <uint32_t NUM_WARPS_KV, uint32_t CTA_TILE_Q, uint32_t CTA_TILE_KV, uint32_t HEAD_DIM_VO,
           typename DTypeQ, bool kEnableVOSplitOpt,
-          bool = kEnableVOSplitOpt && (HEAD_DIM_VO / 16 > 16) &&
-                 ((HEAD_DIM_VO / 16) % NUM_WARPS_KV == 0)>
+          bool = kEnableVOSplitOpt &&
+                 use_vo_split_shape(NUM_WARPS_KV, CTA_TILE_Q, HEAD_DIM_VO)>
 struct VOSplitSmem {};
 template <uint32_t NUM_WARPS_KV, uint32_t CTA_TILE_Q, uint32_t CTA_TILE_KV, uint32_t HEAD_DIM_VO,
           typename DTypeQ, bool kEnableVOSplitOpt>
@@ -146,10 +158,10 @@ struct SharedStorageQKVO
       KVRepackSmem<DTypeQ, DTypeKV, CTA_TILE_Q, CTA_TILE_KV, HEAD_DIM_QK, HEAD_DIM_VO>,
       VOSplitSmem<NUM_WARPS_KV, CTA_TILE_Q, CTA_TILE_KV, HEAD_DIM_VO, DTypeQ, kEnableVOSplitOpt> {
   static constexpr bool kKVShareShape =
-      (HEAD_DIM_VO / 16 > 16) && ((HEAD_DIM_VO / 16) % NUM_WARPS_KV == 0);
+      use_vo_split_shape(NUM_WARPS_KV, CTA_TILE_Q, HEAD_DIM_VO);
   static constexpr bool kVOSplit = kEnableVOSplitOpt && kKVShareShape;
-  // K/V time-sharing (V loaded into k_smem after Q.K^T) applies to ALL kernels
-  // at large head dims. Must match KernelTraits::USE_KV_SHARED_SMEM.
+  // K/V time-sharing (V loaded into k_smem after Q.K^T) applies to every
+  // VO-split shape. Must match KernelTraits::USE_KV_SHARED_SMEM.
   // Otherwise the single/ragged kernels cannot fit head_dim=512 K+V
   // tiles on SKUs with 99KB-smem (SM86/89/120/121).
   static constexpr bool kVShareActive = kKVShareShape && !is_fp4_type_v<DTypeKV> &&
@@ -256,7 +268,8 @@ struct KernelTraits {
   static_assert(NUM_MMA_D_VO % NUM_MMA_D_VO_TILE == 0,
                 "NUM_MMA_D_VO must be divisible by NUM_MMA_D_VO_TILE");
   static constexpr uint32_t HEAD_DIM_VO_TILE = NUM_MMA_D_VO_TILE * 16;
-  static constexpr bool USE_VO_SPLIT = (NUM_MMA_D_VO > 16) && (NUM_MMA_D_VO % NUM_WARPS_KV == 0);
+  static constexpr bool USE_VO_SPLIT =
+      use_vo_split_shape(NUM_WARPS_KV, CTA_TILE_Q_, HEAD_DIM_VO);
   static constexpr uint32_t NUM_MMA_D_VO_PER_WARP =
       USE_VO_SPLIT ? (NUM_MMA_D_VO / NUM_WARPS_KV) : NUM_MMA_D_VO;
   static constexpr bool USE_KV_SHARED_SMEM = USE_VO_SPLIT && !is_fp4_type_v<DTypeKV_> &&
@@ -2514,13 +2527,13 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
     // staging buffer still lives in SharedStorageQKVO, so it must be accounted.
     constexpr bool kUseRepack = (sizeof(DTypeKV) == 1) && !is_fp4_type_v<DTypeKV> &&
                                 (HEAD_DIM_VO != 64) && (HEAD_DIM_VO <= 256) && (CTA_TILE_Q > 16);
-    constexpr bool kKVShared = !is_fp4_type_v<DTypeKV> && (HEAD_DIM_VO / 16 > 16) &&
-                               ((HEAD_DIM_VO / 16) % NUM_WARPS_KV == 0) &&
+    constexpr bool kKVShared = !is_fp4_type_v<DTypeKV> &&
+                               use_vo_split_shape(NUM_WARPS_KV, CTA_TILE_Q, HEAD_DIM_VO) &&
                                (HEAD_DIM_QK == HEAD_DIM_VO) &&
                                (sizeof(DTypeKV) == 2 || CTA_TILE_Q > 16);
     constexpr bool kSinglePrefillVOSplitDispatch =
-        AttentionVariant::use_softmax && is_fp4_type_v<DTypeKV> && (HEAD_DIM_VO / 16 > 16) &&
-        ((HEAD_DIM_VO / 16) % NUM_WARPS_KV == 0);
+        AttentionVariant::use_softmax && is_fp4_type_v<DTypeKV> &&
+        use_vo_split_shape(NUM_WARPS_KV, CTA_TILE_Q, HEAD_DIM_VO);
     constexpr uint32_t kKVSmemPerMmaKV =
         (kKVShared ? (HEAD_DIM_QK * 16 * NUM_WARPS_KV * sizeof(DTypeKV))
                    : ((HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV))) +
@@ -4114,16 +4127,15 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
   // budget (otherwise the staging silently drops blocks/SM at large head dims).
   constexpr bool kUseRepack = (sizeof(DTypeKV) == 1) && !is_fp4_type_v<DTypeKV> &&
                               (HEAD_DIM_VO != 64) && (HEAD_DIM_VO <= 256) && (CTA_TILE_Q > 16);
-  // Matches KernelTraits::USE_KV_SHARED_SMEM: at large head dims K and V
-  // time-share one smem buffer, so the occupancy budget counts the K/V
-  // footprint once exactly when the kernel actually shares it.
-  constexpr bool kKVShared = !is_fp4_type_v<DTypeKV> && (HEAD_DIM_VO / 16 > 16) &&
-                             ((HEAD_DIM_VO / 16) % NUM_WARPS_KV == 0) &&
+  // Matches KernelTraits::USE_KV_SHARED_SMEM: VO-split shapes time-share one
+  // K/V smem buffer, so the occupancy budget counts that footprint once.
+  constexpr bool kKVShared = !is_fp4_type_v<DTypeKV> &&
+                             use_vo_split_shape(NUM_WARPS_KV, CTA_TILE_Q, HEAD_DIM_VO) &&
                              (HEAD_DIM_QK == HEAD_DIM_VO) &&
                              (sizeof(DTypeKV) == 2 || CTA_TILE_Q > 16);
   constexpr bool kVOSplitDispatch = ((sizeof(DTypeKV) == 2) || is_fp4_type_v<DTypeKV>) &&
-                                    AttentionVariant::use_softmax && (HEAD_DIM_VO / 16 > 16) &&
-                                    ((HEAD_DIM_VO / 16) % NUM_WARPS_KV == 0);
+                                    AttentionVariant::use_softmax &&
+                                    use_vo_split_shape(NUM_WARPS_KV, CTA_TILE_Q, HEAD_DIM_VO);
   constexpr uint32_t kKVSmemPerMmaKV =
       (kKVShared ? (HEAD_DIM_QK * 16 * NUM_WARPS_KV * sizeof(DTypeKV))
                  : ((HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV))) +
@@ -4317,12 +4329,12 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
   // Matches KernelTraits::USE_KV_SHARED_SMEM: K/V share one smem buffer for bf16/fp16 at every
   // tile and for FP8 only at CTA_TILE_Q=32 (not NVFP4), so the occupancy budget counts the K/V
   // footprint once exactly when the kernel actually shares it.
-  constexpr bool kKVShared = !is_fp4_type_v<DTypeKV> && (HEAD_DIM_VO / 16 > 16) &&
-                             ((HEAD_DIM_VO / 16) % NUM_WARPS_KV == 0) &&
+  constexpr bool kKVShared = !is_fp4_type_v<DTypeKV> &&
+                             use_vo_split_shape(NUM_WARPS_KV, CTA_TILE_Q, HEAD_DIM_VO) &&
                              (HEAD_DIM_QK == HEAD_DIM_VO) &&
                              (sizeof(DTypeKV) == 2 || CTA_TILE_Q > 16);
   constexpr bool kVOSplitDispatch =
-      (HEAD_DIM_VO / 16 > 16) && ((HEAD_DIM_VO / 16) % NUM_WARPS_KV == 0);
+      use_vo_split_shape(NUM_WARPS_KV, CTA_TILE_Q, HEAD_DIM_VO);
   constexpr uint32_t kKVSmemPerMmaKV =
       (kKVShared ? (HEAD_DIM_QK * 16 * NUM_WARPS_KV * sizeof(DTypeKV))
                  : ((HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV))) +

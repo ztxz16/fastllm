@@ -407,7 +407,13 @@ inline uint32_t FA2DetermineCtaTileQ(int64_t avg_packed_qo_len, uint32_t head_di
         return 16;
       }
     } else {
-      // NOTE(Zihao): not enough shared memory on Turing for 1x4 warp layout
+      // Turing normally needs CTA64 to fit the prefill layout.  The D256
+      // short-query specialization time-shares K/V shared memory, so CTA16
+      // is both launchable and substantially less wasteful for q1 decode.
+      if (compute_capacity.first == 7 && compute_capacity.second == 5 &&
+          head_dim == 256 && avg_packed_qo_len <= 16) {
+        return 16;
+      }
       return 64;
     }
   }
