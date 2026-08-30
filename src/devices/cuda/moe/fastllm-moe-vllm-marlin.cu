@@ -614,6 +614,104 @@ __global__ void ScatterAwqMoeRoutesKernel(
     sortedTokenIds[expertStarts[expert] + offset] = route;
 }
 
+// Qwen4 decode has one row, 512 experts and top-10 routing. Building and
+// sorting those ten routes in one thread is cheaper than clearing every
+// expert counter and launching count/prefix/scatter kernels. Other shapes
+// retain the established generic path below.
+__global__ void BuildQwen4DecodeAwqMoeRouteMetadataKernel(
+        const int32_t *__restrict__ indices,
+        int32_t *__restrict__ sortedTokenIds,
+        int32_t *__restrict__ gateExpertIds,
+        int32_t *__restrict__ downExpertIds,
+        int32_t *__restrict__ numTokensPadded,
+        int routes, int experts) {
+    constexpr int ROUTES = 10;
+    if (blockIdx.x != 0 || threadIdx.x != 0) {
+        return;
+    }
+
+    int routeIds[ROUTES];
+    int routeExperts[ROUTES];
+    int validRoutes = 0;
+    for (int route = 0; route < routes; ++route) {
+        int expert = indices[route];
+        if ((unsigned int)expert >= (unsigned int)experts) {
+            continue;
+        }
+        int position = validRoutes;
+        while (position > 0 &&
+               (routeExperts[position - 1] > expert ||
+                (routeExperts[position - 1] == expert &&
+                 routeIds[position - 1] > route))) {
+            routeExperts[position] = routeExperts[position - 1];
+            routeIds[position] = routeIds[position - 1];
+            --position;
+        }
+        routeExperts[position] = expert;
+        routeIds[position] = route;
+        ++validRoutes;
+    }
+
+    int outputPosition = 0;
+    int inputPosition = 0;
+    while (inputPosition < validRoutes) {
+        int expert = routeExperts[inputPosition];
+        int groupEnd = inputPosition + 1;
+        while (groupEnd < validRoutes && routeExperts[groupEnd] == expert) {
+            ++groupEnd;
+        }
+        int groupRoutes = groupEnd - inputPosition;
+        int paddedRoutes = (groupRoutes + 7) & ~7;
+        for (int offset = 0; offset < groupRoutes; ++offset) {
+            sortedTokenIds[outputPosition + offset] =
+                routeIds[inputPosition + offset];
+        }
+        for (int offset = groupRoutes; offset < paddedRoutes; ++offset) {
+            sortedTokenIds[outputPosition + offset] = routes;
+        }
+        for (int offset = 0; offset < paddedRoutes; offset += 8) {
+            int block = (outputPosition + offset) / 8;
+            gateExpertIds[block] = expert;
+            downExpertIds[block] = expert;
+        }
+        outputPosition += paddedRoutes;
+        inputPosition = groupEnd;
+    }
+    numTokensPadded[0] = outputPosition;
+}
+
+static void LaunchAwqMoeRouteMetadata(
+        const int32_t *indices, int32_t *expertCounts,
+        int32_t *expertStarts, int32_t *expertCursors,
+        int32_t *sortedTokenIds, int32_t *gateExpertIds,
+        int32_t *downExpertIds, int32_t *numTokensPadded,
+        int routes, int experts, int gateBlock, int downBlock,
+        cudaStream_t stream) {
+    constexpr int threads = 256;
+    if (routes == 10 && experts == 512 &&
+        gateBlock == 8 && downBlock == 8) {
+        BuildQwen4DecodeAwqMoeRouteMetadataKernel<<<1, 1, 0, stream>>>(
+            indices, sortedTokenIds,
+            gateExpertIds, downExpertIds,
+            numTokensPadded, routes, experts);
+        return;
+    }
+    InitAwqMoeRouteCountersKernel<<<
+        (experts + threads - 1) / threads, threads, 0, stream>>>(
+        expertCounts, expertCursors, experts);
+    CountAwqMoeRoutesKernel<<<
+        (routes + threads - 1) / threads, threads, 0, stream>>>(
+        indices, expertCounts, routes, experts);
+    BuildAwqMoeRouteOffsetsKernel<<<1, threads, 0, stream>>>(
+        expertCounts, expertStarts, sortedTokenIds, gateExpertIds,
+        downExpertIds, numTokensPadded, routes, experts,
+        gateBlock, downBlock);
+    ScatterAwqMoeRoutesKernel<<<
+        (routes + threads - 1) / threads, threads, 0, stream>>>(
+        indices, expertStarts, expertCursors, sortedTokenIds,
+        routes, experts);
+}
+
 template <typename T>
 __global__ void SwigluRowsKernel(const T *__restrict__ gateUp,
                                  T *__restrict__ output,
@@ -2492,21 +2590,12 @@ static bool RunAwqMarlinMoe(
 
     cudaStream_t stream = cudaStreamPerThread;
     constexpr int threads = 256;
-    InitAwqMoeRouteCountersKernel<<<
-        (cache->experts + threads - 1) / threads, threads, 0, stream>>>(
-        cache->expertCounts, cache->expertCursors, cache->experts);
-    CountAwqMoeRoutesKernel<<<
-        (routes + threads - 1) / threads, threads, 0, stream>>>(
-        indices, cache->expertCounts, routes, cache->experts);
-    BuildAwqMoeRouteOffsetsKernel<<<1, threads, 0, stream>>>(
-        cache->expertCounts, cache->expertStarts,
-        routeStorage->sortedTokenIds, routeStorage->gateExpertIds,
-        routeStorage->downExpertIds, routeStorage->numTokensPadded,
-        routes, cache->experts, gateBlock, downBlock);
-    ScatterAwqMoeRoutesKernel<<<
-        (routes + threads - 1) / threads, threads, 0, stream>>>(
-        indices, cache->expertStarts, cache->expertCursors,
-        routeStorage->sortedTokenIds, routes, cache->experts);
+    LaunchAwqMoeRouteMetadata(
+        indices, cache->expertCounts, cache->expertStarts,
+        cache->expertCursors, routeStorage->sortedTokenIds,
+        routeStorage->gateExpertIds, routeStorage->downExpertIds,
+        routeStorage->numTokensPadded, routes, cache->experts,
+        gateBlock, downBlock, stream);
     if (cudaPeekAtLastError() != cudaSuccess) {
         FailAwqMarlinAfterRepack("route-metadata launch", cache.get());
     }
@@ -3153,24 +3242,12 @@ static bool RunNvfp4E4M3MarlinMoe(
         }
         marlinInput = activation.cudaData;
     }
-    InitAwqMoeRouteCountersKernel<<<
-        (cache->experts + threads - 1) / threads,
-        threads, 0, stream>>>(
-        cache->expertCounts, cache->expertCursors, cache->experts);
-    CountAwqMoeRoutesKernel<<<
-        (routes + threads - 1) / threads,
-        threads, 0, stream>>>(
-        indices, cache->expertCounts, routes, cache->experts);
-    BuildAwqMoeRouteOffsetsKernel<<<1, threads, 0, stream>>>(
-        cache->expertCounts, cache->expertStarts,
-        routeStorage->sortedTokenIds, routeStorage->gateExpertIds,
-        routeStorage->downExpertIds, routeStorage->numTokensPadded,
-        routes, cache->experts, gateBlock, downBlock);
-    ScatterAwqMoeRoutesKernel<<<
-        (routes + threads - 1) / threads,
-        threads, 0, stream>>>(
-        indices, cache->expertStarts, cache->expertCursors,
-        routeStorage->sortedTokenIds, routes, cache->experts);
+    LaunchAwqMoeRouteMetadata(
+        indices, cache->expertCounts, cache->expertStarts,
+        cache->expertCursors, routeStorage->sortedTokenIds,
+        routeStorage->gateExpertIds, routeStorage->downExpertIds,
+        routeStorage->numTokensPadded, routes, cache->experts,
+        gateBlock, downBlock, stream);
     if (cudaPeekAtLastError() != cudaSuccess) {
         FailNvfp4E4M3MarlinAfterRepack(
             "route-metadata launch", cache.get());

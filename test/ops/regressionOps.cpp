@@ -9620,6 +9620,73 @@ namespace {
             "multi-token packed router graph scores");
         FastllmCudaGraphExecDestroy(graphExec);
         FastllmCudaGraphDestroy(graph);
+
+        // Qwen4's router probabilities are already FP32 when they reach the
+        // generic SelectExpert operation. Compare the 512x10 single-row warp
+        // path with an otherwise identical two-row invocation, which must use
+        // the established 64-thread merge kernel. Cover distinct keys, bias,
+        // and the exact-tie compatibility path.
+        constexpr int qwen4Experts = 512;
+        constexpr int qwen4Topk = 10;
+        auto checkQwen4SelectExpert = [&](bool withBias, bool tied) {
+            std::vector<float> values(qwen4Experts);
+            std::vector<float> qwen4BiasValues(qwen4Experts);
+            for (int expert = 0; expert < qwen4Experts; ++expert) {
+                values[expert] = tied
+                    ? 0.5f
+                    : 0.05f + (float)((expert * 73 + 19) % 521) /
+                                  1024.0f + expert * 1.0e-7f;
+                qwen4BiasValues[expert] =
+                    (float)(((expert * 29 + 7) % 31) - 15) * 1.0e-5f;
+            }
+            std::vector<float> twoRows(values);
+            twoRows.insert(twoRows.end(), values.begin(), values.end());
+            fastllm::Data single = MakeCudaTensor(
+                fastllm::DataType::FLOAT32, {1, qwen4Experts}, values);
+            fastllm::Data generic = MakeCudaTensor(
+                fastllm::DataType::FLOAT32, {2, qwen4Experts}, twoRows);
+            fastllm::Data qwen4Bias = MakeCudaTensor(
+                fastllm::DataType::FLOAT32, {qwen4Experts},
+                qwen4BiasValues);
+            fastllm::Data singleIndex = MakeIntTensor(
+                {1, qwen4Topk}, std::vector<int32_t>(qwen4Topk, -1));
+            singleIndex.ToDevice(fastllm::DataDevice::CUDA);
+            fastllm::Data genericIndex = MakeIntTensor(
+                {2, qwen4Topk},
+                std::vector<int32_t>(2 * qwen4Topk, -1));
+            genericIndex.ToDevice(fastllm::DataDevice::CUDA);
+            fastllm::Data singleScore = MakeCudaTensor(
+                fastllm::DataType::FLOAT32, {1, qwen4Topk},
+                std::vector<float>(qwen4Topk, 0.0f));
+            fastllm::Data genericScore = MakeCudaTensor(
+                fastllm::DataType::FLOAT32, {2, qwen4Topk},
+                std::vector<float>(2 * qwen4Topk, 0.0f));
+            fastllm::Data *biasPointer = withBias ? &qwen4Bias : nullptr;
+            Expect(FastllmCudaSelectExpert(
+                       single, biasPointer, singleIndex, singleScore,
+                       qwen4Topk, true, 1.375f),
+                   "Qwen4 single-row SelectExpert specialization failed");
+            Expect(FastllmCudaSelectExpert(
+                       generic, biasPointer, genericIndex, genericScore,
+                       qwen4Topk, true, 1.375f),
+                   "Qwen4 generic SelectExpert reference failed");
+            FastllmCudaSyncCurrentThreadStream();
+            std::vector<int32_t> expectedIndex = ToIntVector(genericIndex);
+            std::vector<float> expectedScore = ToFloatVector(genericScore);
+            expectedIndex.resize(qwen4Topk);
+            expectedScore.resize(qwen4Topk);
+            ExpectIntEqual(
+                expectedIndex, ToIntVector(singleIndex),
+                tied ? "Qwen4 SelectExpert tied indices"
+                     : "Qwen4 SelectExpert distinct indices");
+            ExpectFloatNear(
+                expectedScore, ToFloatVector(singleScore), 0.0f, 0.0f,
+                tied ? "Qwen4 SelectExpert tied scores"
+                     : "Qwen4 SelectExpert distinct scores");
+        };
+        checkQwen4SelectExpert(false, false);
+        checkQwen4SelectExpert(true, false);
+        checkQwen4SelectExpert(false, true);
     }
 
     void RunCudaQwen35RouterSharedGateFusionRegression() {
@@ -12342,6 +12409,14 @@ int main(int argc, char **argv) {
             Expect(FastllmCudaGetDeviceCount() > 0,
                    "DeepSeek-V4 WoA regression requires CUDA.");
             RunCudaDeepSeekV4TokenTiledWoARegression();
+            return 0;
+        }
+        if (argc == 2 &&
+            std::string(argv[1]) == "--cuda-router-selection") {
+            Expect(FastllmCudaGetDeviceCount() > 0,
+                   "router selection regression requires CUDA.");
+            RunCudaFusedRouterSelectionRegression();
+            std::cout << "CUDA router selection regressions: PASS\n";
             return 0;
         }
         if (argc == 2 &&
