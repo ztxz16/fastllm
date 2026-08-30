@@ -17288,7 +17288,7 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16(
         cache.cudaData == nullptr || newTokens.cudaData == nullptr || weight.cudaData == nullptr ||
         (bias.dims.size() > 0 && bias.cudaData == nullptr) ||
         numTokenCaches < 0 ||
-        numTokenCaches > FASTLLM_CUDA_MTP_FAST_SEQ_MAX ||
+        numTokenCaches > FASTLLM_CUDA_MTP_PREFIX_SNAPSHOT_MAX ||
         numTokenCaches > newTokens.dims[2] ||
         (numTokenCaches > 0 && tokenCaches == nullptr)) {
         return false;
@@ -17329,7 +17329,7 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16(
         return false;
     }
 
-    half *snaps[FASTLLM_CUDA_MTP_FAST_SEQ_MAX] = {};
+    half *snaps[FASTLLM_CUDA_MTP_PREFIX_SNAPSHOT_MAX] = {};
     for (int t = 0; t < numTokenCaches; t++) {
         fastllm::Data *snap = tokenCaches[t];
         if (snap == nullptr) {

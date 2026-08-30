@@ -7494,6 +7494,7 @@ namespace {
         const int batch = 2;
         const int channels = 5;
         const int rows = batch * channels;
+        constexpr int maxFastTokens = 8;
 
         std::vector<float> initialCacheValues = MakeRegressionValues(rows * 4, 0.2f, 0.35f);
         std::vector<float> weightValues = MakeRegressionValues(channels * 4, 0.7f, 0.25f);
@@ -7503,7 +7504,7 @@ namespace {
         fastllm::Data bias = MakeCudaTensor(fastllm::DataType::FLOAT32,
                                             {channels}, biasValues);
 
-        for (int tokenCount = 1; tokenCount <= 6; tokenCount++) {
+        for (int tokenCount = 1; tokenCount <= maxFastTokens; tokenCount++) {
             std::vector<float> tokenValues =
                 MakeRegressionValues(rows * tokenCount, 1.7f + tokenCount, 0.4f);
             fastllm::Data allTokens = MakeCudaTensor(fastllm::DataType::FLOAT16,
@@ -7531,15 +7532,16 @@ namespace {
                 expectedCaches[token] = ToFloatVector(sequentialCache);
             }
 
-            std::vector<fastllm::Data> snapshots(tokenCount);
-            std::vector<fastllm::Data*> snapshotPtrs(tokenCount);
-            for (int token = 0; token < tokenCount; token++) {
+            const int snapshotCount = std::min(tokenCount, maxFastTokens - 1);
+            std::vector<fastllm::Data> snapshots(snapshotCount);
+            std::vector<fastllm::Data*> snapshotPtrs(snapshotCount);
+            for (int token = 0; token < snapshotCount; token++) {
                 snapshotPtrs[token] = &snapshots[token];
             }
             fastllm::Data multiOutput;
             Expect(FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16(
                        multiCache, allTokens, weight, bias, multiOutput,
-                       snapshotPtrs.data(), tokenCount),
+                       snapshotPtrs.data(), snapshotCount),
                    "multi-token conv rejected N=" + std::to_string(tokenCount));
             ExpectCudaTensorMeta(multiOutput, fastllm::DataType::FLOAT16,
                                  {batch, channels, tokenCount},
@@ -7552,41 +7554,17 @@ namespace {
                 ExpectFloatNear(expectedOutputs[token],
                                 ExtractLastAxisToken(actualOutput, rows, tokenCount, token),
                                 1e-3f, 1e-3f, "multi-token conv output" + suffix);
-                ExpectFloatNear(expectedCaches[token], ToFloatVector(snapshots[token]),
-                                1e-3f, 1e-3f, "multi-token conv snapshot" + suffix);
-                ExpectCudaTensorMeta(snapshots[token], fastllm::DataType::FLOAT16,
-                                     {batch, channels, 4},
-                                     "multi-token conv snapshot metadata" + suffix);
+                if (token < snapshotCount) {
+                    ExpectFloatNear(expectedCaches[token], ToFloatVector(snapshots[token]),
+                                    1e-3f, 1e-3f, "multi-token conv snapshot" + suffix);
+                    ExpectCudaTensorMeta(snapshots[token], fastllm::DataType::FLOAT16,
+                                         {batch, channels, 4},
+                                         "multi-token conv snapshot metadata" + suffix);
+                }
             }
             ExpectFloatNear(ToFloatVector(sequentialCache), ToFloatVector(multiCache),
                             1e-3f, 1e-3f,
                             "multi-token conv final cache N=" + std::to_string(tokenCount));
-            if (tokenCount == 6) {
-                fastllm::Data partialCache = MakeCudaTensor(
-                    fastllm::DataType::FLOAT16, {batch, channels, 4}, initialCacheValues);
-                std::vector<fastllm::Data> partialSnapshots(5);
-                std::vector<fastllm::Data*> partialSnapshotPtrs(5);
-                for (int token = 0; token < 5; token++) {
-                    partialSnapshotPtrs[token] = &partialSnapshots[token];
-                }
-                fastllm::Data partialOutput;
-                Expect(FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16(
-                           partialCache, allTokens, weight, bias, partialOutput,
-                           partialSnapshotPtrs.data(), 5),
-                       "multi-token conv rejected N=6 with five prefix snapshots");
-                ExpectFloatNear(ToFloatVector(multiOutput), ToFloatVector(partialOutput),
-                                1e-3f, 1e-3f,
-                                "multi-token conv partial-snapshot output");
-                ExpectFloatNear(ToFloatVector(multiCache), ToFloatVector(partialCache),
-                                1e-3f, 1e-3f,
-                                "multi-token conv partial-snapshot final cache");
-                for (int token = 0; token < 5; token++) {
-                    ExpectFloatNear(expectedCaches[token], ToFloatVector(partialSnapshots[token]),
-                                    1e-3f, 1e-3f,
-                                    "multi-token conv partial snapshot token=" +
-                                    std::to_string(token));
-                }
-            }
         }
 
         const int tokenCount = 2;
@@ -7657,7 +7635,25 @@ namespace {
                        "multi-token conv accepted a snapshot count larger than N");
         }
         {
-            const int tooManyTokens = 7;
+            const int tokenCount = maxFastTokens;
+            fastllm::Data cache = MakeCudaTensor(fastllm::DataType::FLOAT16,
+                                                 {batch, channels, 4}, initialCacheValues);
+            fastllm::Data tokens = MakeCudaTensor(
+                fastllm::DataType::FLOAT16, {batch, channels, tokenCount},
+                MakeRegressionValues(rows * tokenCount, 6.3f, 0.4f));
+            fastllm::Data snapshots[maxFastTokens];
+            fastllm::Data *snapshotPtrs[maxFastTokens];
+            for (int token = 0; token < maxFastTokens; token++) {
+                snapshotPtrs[token] = &snapshots[token];
+            }
+            fastllm::Data output;
+            Expect(!FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16(
+                       cache, tokens, weight, bias, output,
+                       snapshotPtrs, maxFastTokens),
+                   "multi-token conv accepted more than seven prefix snapshots");
+        }
+        {
+            const int tooManyTokens = maxFastTokens + 1;
             fastllm::Data cache = MakeCudaTensor(fastllm::DataType::FLOAT16,
                                                  {batch, channels, 4}, initialCacheValues);
             fastllm::Data tokens = MakeCudaTensor(
@@ -7666,7 +7662,7 @@ namespace {
             fastllm::Data output;
             Expect(!FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16(
                        cache, tokens, weight, bias, output, nullptr, 0),
-                   "multi-token conv accepted N=7");
+                   "multi-token conv accepted more than eight tokens");
         }
     }
 
@@ -7974,6 +7970,8 @@ namespace {
         const int qkvDim = 2 * numKHeads * headKDim + numVHeads * headVDim;
         const float eps = 1e-6f;
         const float qScale = 1.0f / std::sqrt((float) headKDim);
+        constexpr int maxFastTokens = 8;
+        constexpr int maxPrefixSnapshots = maxFastTokens - 1;
 
         std::vector<float> normValues(headKDim);
         for (int i = 0; i < headKDim; i++) {
@@ -7988,7 +7986,7 @@ namespace {
         fastllm::Data dtBias = MakeCudaTensor(fastllm::DataType::FLOAT32,
                                               {numVHeads}, {0.15f, -0.08f});
 
-        for (int tokenCount = 2; tokenCount <= 6; tokenCount++) {
+        for (int tokenCount = 2; tokenCount <= maxFastTokens; tokenCount++) {
             std::vector<float> convValues =
                 MakeRegressionValues(tokenCount * qkvDim, 2.1f + tokenCount, 0.12f);
             std::vector<float> baValues(tokenCount * numVHeads * 2);
@@ -8040,7 +8038,7 @@ namespace {
                 expectedStates[token] = ToFloatVector(sequentialState);
             }
 
-            int snapshotCount = std::min(tokenCount, 5);
+            int snapshotCount = std::min(tokenCount, maxPrefixSnapshots);
             std::vector<fastllm::Data> snapshots(snapshotCount);
             std::vector<fastllm::Data*> snapshotPtrs(snapshotCount);
             for (int token = 0; token < snapshotCount; token++) {
@@ -8100,23 +8098,6 @@ namespace {
             ExpectFloatNear(ToFloatVector(sequentialState), ToFloatVector(sequenceState),
                             2e-3f, 2e-3f,
                             "recurrent final state N=" + std::to_string(tokenCount));
-            if (tokenCount == 6) {
-                fastllm::Data rejectedState = MakeCudaTensor(
-                    fastllm::DataType::FLOAT16,
-                    {1, numVHeads, headKDim, headVDim}, initialStateValues);
-                rejectedState.isLinearAttentionTransposed = true;
-                fastllm::Data rejectedSnapshots[6];
-                fastllm::Data *rejectedSnapshotPtrs[6];
-                for (int token = 0; token < 6; token++) {
-                    rejectedSnapshotPtrs[token] = &rejectedSnapshots[token];
-                }
-                fastllm::Data rejectedOutput;
-                Expect(!FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16Snapshots(
-                           convSequence, baSequence, normWeight, aLog, dtBias,
-                           rejectedState, rejectedOutput, rejectedSnapshotPtrs, 6,
-                           numKHeads, numVHeads, headKDim, headVDim, eps, qScale),
-                       "recurrent sequence accepted N=6 with six snapshots");
-            }
         }
 
         std::vector<float> oneConvValues = MakeRegressionValues(qkvDim, 5.2f, 0.12f);
@@ -8159,7 +8140,32 @@ namespace {
                        "recurrent snapshot sequence accepted nullptr tokenStates");
         }
         {
-            const int tooManyTokens = 7;
+            const int tokenCount = maxFastTokens;
+            fastllm::Data conv = MakeCudaTensor(
+                fastllm::DataType::FLOAT16, {1, tokenCount, qkvDim},
+                MakeRegressionValues(tokenCount * qkvDim, 6.2f, 0.12f));
+            fastllm::Data ba = MakeCudaTensor(
+                fastllm::DataType::FLOAT16,
+                {1, tokenCount, numVHeads * 2},
+                MakeRegressionValues(tokenCount * numVHeads * 2, 6.6f, 0.08f));
+            fastllm::Data state = MakeCudaTensor(
+                fastllm::DataType::FLOAT16,
+                {1, numVHeads, headKDim, headVDim}, initialStateValues);
+            state.isLinearAttentionTransposed = true;
+            fastllm::Data snapshots[maxFastTokens];
+            fastllm::Data *snapshotPtrs[maxFastTokens];
+            for (int token = 0; token < maxFastTokens; token++) {
+                snapshotPtrs[token] = &snapshots[token];
+            }
+            fastllm::Data output;
+            Expect(!FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16Snapshots(
+                       conv, ba, normWeight, aLog, dtBias, state, output,
+                       snapshotPtrs, maxFastTokens,
+                       numKHeads, numVHeads, headKDim, headVDim, eps, qScale),
+                   "recurrent sequence accepted more than seven prefix snapshots");
+        }
+        {
+            const int tooManyTokens = maxFastTokens + 1;
             fastllm::Data conv = MakeCudaTensor(
                 fastllm::DataType::FLOAT16, {1, tooManyTokens, qkvDim},
                 MakeRegressionValues(tooManyTokens * qkvDim, 6.4f, 0.12f));
@@ -8175,7 +8181,7 @@ namespace {
             Expect(!FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16(
                        conv, ba, normWeight, aLog, dtBias, state, output,
                        numKHeads, numVHeads, headKDim, headVDim, eps, qScale),
-                   "recurrent sequence accepted N=7");
+                   "recurrent sequence accepted more than eight tokens");
         }
     }
 #endif
