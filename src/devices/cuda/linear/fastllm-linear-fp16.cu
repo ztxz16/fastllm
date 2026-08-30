@@ -613,7 +613,17 @@ static void FastllmCudaFP16EnsureBiasHalfOnDevice(fastllm::Data &weight, const f
 
 void LaunchFastllmGemmFp32Fp16(float *input, half *weight, float *output, float *bias, int n, int m, int k) {
     if (n == 1) {
-        FastllmGemvFp32Fp16Kernel2MultiRow<256, 1> <<< k, 256 >>>(input, weight, output, bias, m, k);
+        // With four input elements per thread, m <= 512 needs at most 128
+        // active lanes. The old 256-thread launch reduced an all-zero upper
+        // half before doing exactly the same 128-lane reduction. Keeping the
+        // load mapping and reduction tree below 128 unchanged preserves the
+        // float accumulation order while doubling resident blocks for small
+        // decode GEMVs such as HyperConnection's 320 -> hidden projection.
+        if (m <= 512 && m % 4 == 0) {
+            FastllmGemvFp32Fp16Kernel2MultiRow<128, 1> <<< k, 128 >>>(input, weight, output, bias, m, k);
+        } else {
+            FastllmGemvFp32Fp16Kernel2MultiRow<256, 1> <<< k, 256 >>>(input, weight, output, bias, m, k);
+        }
     } else if (n == 2) {
         FastllmGemvFp32Fp16Kernel2MultiRow<256, 2> <<< k, 256 >>>(input, weight, output, bias, m, k);
     } else if (n == 3) {

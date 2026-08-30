@@ -287,11 +287,71 @@ namespace {
             Qwen4CudaRound<T>(sum / groups));
     }
 
+    __global__ void Qwen4HyperMixFourGroupFloatKernel(
+            const float *normalized, const float *mixLogits, float *output,
+            uint64_t count, int outputChannels) {
+        constexpr int groups = 4;
+        const int group = threadIdx.x & (groups - 1);
+        const int itemInBlock = threadIdx.x / groups;
+        const int itemsPerBlock = blockDim.x / groups;
+        const uint64_t outputIndex =
+            (uint64_t)blockIdx.x * itemsPerBlock + itemInBlock;
+        float inputValue = 0.0f;
+        float gate = 0.0f;
+        if (outputIndex < count) {
+            const uint64_t row = outputIndex / outputChannels;
+            const int channel = (int)(outputIndex % outputChannels);
+            const uint64_t inputIndex =
+                row * groups * outputChannels +
+                (uint64_t)group * outputChannels + channel;
+            inputValue = normalized[inputIndex];
+            gate = Qwen4CudaSigmoidRounded<float>(mixLogits[inputIndex]);
+        }
+
+        // Evaluate the expensive sigmoid for all four groups in parallel.
+        // The first lane performs the products and additions in the original
+        // expression order, allowing the compiler to retain the reference
+        // kernel's multiply-add contraction instead of introducing a new
+        // float rounding boundary before the shuffle.
+        const unsigned int mask = __activemask();
+        const float input0 = __shfl_sync(mask, inputValue, 0, groups);
+        const float input1 = __shfl_sync(mask, inputValue, 1, groups);
+        const float input2 = __shfl_sync(mask, inputValue, 2, groups);
+        const float input3 = __shfl_sync(mask, inputValue, 3, groups);
+        const float gate0 = __shfl_sync(mask, gate, 0, groups);
+        const float gate1 = __shfl_sync(mask, gate, 1, groups);
+        const float gate2 = __shfl_sync(mask, gate, 2, groups);
+        const float gate3 = __shfl_sync(mask, gate, 3, groups);
+        if (group == 0 && outputIndex < count) {
+            // The generic float kernel contracts groups 1..3 into the
+            // running sum. Spell that sequence explicitly so nvcc cannot
+            // swap which group's product receives the standalone round.
+            float sum = __fmul_rn(input0, gate0);
+            sum = __fmaf_rn(input1, gate1, sum);
+            sum = __fmaf_rn(input2, gate2, sum);
+            sum = __fmaf_rn(input3, gate3, sum);
+            output[outputIndex] = sum / groups;
+        }
+    }
+
     template <typename T, typename LogitT>
     void Qwen4LaunchHyperMix(const void *normalized, const void *mixLogits,
                              void *output, int blocks, int threads,
                              uint64_t count, int groups,
                              int outputChannels) {
+        if constexpr (std::is_same_v<T, float> &&
+                      std::is_same_v<LogitT, float>) {
+            if (groups == 4) {
+                const int itemsPerBlock = threads / groups;
+                const int fourGroupBlocks = (int)(
+                    (count + itemsPerBlock - 1) / itemsPerBlock);
+                Qwen4HyperMixFourGroupFloatKernel<<<
+                    fourGroupBlocks, threads, 0, cudaStreamPerThread>>>(
+                    (const float*)normalized, (const float*)mixLogits,
+                    (float*)output, count, outputChannels);
+                return;
+            }
+        }
         Qwen4HyperMixKernel<T, LogitT><<<
             blocks, threads, 0, cudaStreamPerThread>>>(
             (const T*)normalized, (const LogitT*)mixLogits, (T*)output,
