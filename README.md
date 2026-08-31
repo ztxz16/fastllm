@@ -1,481 +1,396 @@
-# fastllm
+# FastLLM
 
-| [快速开始](#快速开始) | [部署DeepSeek](docs/deepseek.md) | [部署Qwen3](docs/qwen3.md) | [版本日志](docs/version.md) | [English Document](README_EN.md)
+[English](README_EN.md) · [快速开始](#快速开始) · [模型部署指南](#模型部署指南) · [Benchmark](docs/benchmark.md) · [常用参数](#常用参数) · [版本日志](docs/version.md)
 
-# 引用说明
+FastLLM 是一个面向本地运行和服务部署的高性能大模型推理引擎。核心运行时使用 C++ 实现，不依赖 PyTorch，支持稠密模型与 MoE 模型，并提供 CUDA、ROCm、CPU、NUMA、磁盘混合推理以及多卡张量并行能力。
 
-本项目参考了许多开源项目的代码和相关文章，具体请参考 [参考代码和文章](#参考代码和文章)
+项目同时提供命令行对话、终端部署向导、WebUI、性能测试工具，以及兼容 OpenAI Chat Completions、OpenAI Responses 和 Anthropic Messages 的 API 服务。
 
-## 介绍
+## 核心能力
 
-fastllm是c++实现自有算子替代Pytorch的高性能全功能大模型推理库，可以推理Qwen, Llama, Phi等稠密模型，以及DeepSeek, Qwen-moe等moe模型
-- 具有优良的兼容性，支持M40, K80到5090全系列N卡，支持MI50，7900等A卡，支持天数，沐曦等国产卡，支持ThinkForce NPU推理
-- 支持任意显卡的FP8推理
-- 任意显卡只需要显存 > 10G就可以支持单卡推理满血DeepSeek R1 671B模型
-- 双路9004/9005服务器 + 单显卡部署DeepSeek R1 671B - FP8原版模型，单并发速度可达20左右，部署INT4模型单并发速度可达30左右，最高并发速度可达60+
+- **新模型快速适配**：当前主线覆盖 Qwen4-Exp / Qwen3.8-Flash-Next、Qwen3.5/3.6/3.8、DeepSeek-V4、Kimi-K3、GLM-5.3-Flash、Dots3-Note 等模型。
+- **大规模 MoE 混合部署**：可将普通层和专家层分别放在 CUDA、CPU、NUMA 或磁盘上，也可按比例组合多种设备，适合显存有限但主机内存或 SSD 容量充足的机器。
+- **多卡与高吞吐服务**：支持张量并行、奇数卡数量、动态批处理、流式输出、Paged KV Cache、前缀缓存、分块 Prefill 和 CUDA Graph。
+- **投机解码**：为匹配的模型提供 MTP、内置或外部 DSpark，以及 DFlash2 等投机解码路径。
+- **多种精度与格式**：支持 Hugging Face Safetensors、FastLLM 导出格式、AWQ 和部分 GGUF；可按模型与硬件使用 FP16、BF16、FP8、NVFP4、MXFP4、INT4、K-Quant 等路径。
+- **完整服务接口**：支持思考内容分离、工具调用、流式响应、缓存命中统计、服务端采样参数和启动进度事件。
+- **可扩展后端**：内置 CPU/CUDA/ROCm 算子，并提供 Triton 可选算子、自定义 Python 模型图和其他加速器后端的源码接入能力。
 
-部署交流QQ群：831641348
+> 不同模型、量化格式和硬件后端支持的算子并不完全相同。正式部署前请用目标模型和目标硬件验证精度、显存占用及吞吐。
 
-**微信**
+## 当前模型能力
 
-- **用户交流群**（使用、部署等问题）：![用户交流群二维码](docs/wechat_group0.jpg)
-- **社区开发群**（参与贡献与开发讨论）：![社区开发群二维码](docs/develop-group.png)
+下面列出当前开发主线重点，不再把早期模型作为首页介绍内容。
 
-## 新功能速览
+| 模型系列 | 当前重点能力 |
+| --- | --- |
+| Qwen | Qwen4-Exp / Qwen3.8-Flash-Next 文本解码，QSA、PLE n-gram、CPU/CUDA/NUMA 混合推理；Qwen3.5/3.6/3.8、MTP 和 DFlash2 |
+| DeepSeek | DeepSeek-V4 / V4-Flash、稀疏注意力、内置 DSpark、多卡 CUDA 与 CPU/NUMA 混合 MoE |
+| Kimi | Kimi-K3、KDA/MLA、外部 DSpark，以及 CUDA、NUMA、CPU/GPU 专家和磁盘专家 |
+| GLM | GLM-5 DSA、GLM-5.3-Flash KDA 与分页缓存、GLM-5.2 量化 KV-B CPU 推理 |
+| 其他 | Dots3-Note、Laguna、HY-V3、Step3.5/3.7、MiniMax-M2、Gemma4 等 |
 
-- Fastllm目前支持DeepSeek-V4模型了
-- Fastllm目前支持导出通用动态量化模型了！参考[动态量化说明](docs/dtype_config.md)
-- Fastllm目前可以支持部分GGUF模型的读取了！需要注意，目前需要使用`--ori`参数指定源模型配置文件夹，请阅读 [使用指南](#使用指南)
-
-## 亮点功能
-
-- 🚀 安装使用简单方便，一条命令就能成功安装，一条命令就能成功运行。
-- 🚀 支持CPU + GPU混合推理MOE大参数模型（单显卡即可推理DEEPSEEK 671B）。
-- 🚀 使用C++实现自有底层算子，不依赖PyTorch。
-- 🚀 兼容性好，PIP安装支持可以支持到P100、MI50等老卡，源码安装支持更多设备。
-- 🚀 支持多卡张量并行推理，支持3、5、7等奇数张卡。
-- 🚀 支持GPU + CPU混合张量并行推理
-- 🚀 支持CPU和显卡实现FP8运算，老设备也可以运行
-- 🚀 支持多CPU加速，且只占用1份内存
-- 🚀 支持ROCM，AMD GPU；支持天数，沐曦，燧原；支持华为昇腾。
-- 🚀 支持动态Batch，流式输出；前后端分离设计，可跨平台移植，可在安卓上直接编译。
-- 🚀 支持Python[自定义模型结构](docs/custom.md)
+Qwen4-Exp 当前加载的是文本生成模型，不加载复合 checkpoint 中的视觉和 MTP 权重。早期模型的兼容信息仍可在[支持模型列表](docs/models.md)中查询；最新适配和限制以[版本日志](docs/version.md)为准。
 
 ## 快速开始
 
 ### 安装
 
-- `pip`安装支持`Nvidia GPU`和`AMD GPU`，其余`GPU`请使用[源码安装](#源码安装)
-- `pip`安装速度慢时，可使用镜像加速
+建议在独立的 Python 虚拟环境中安装。预编译包适用于以下常见环境：
 
-```
-pip config set global.index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
-```
+| 环境 | 安装命令 | 说明 |
+| --- | --- | --- |
+| Linux + NVIDIA GPU | `python -m pip install -U ftllm` | 包含 Python 接口和常用 CUDA 运行时依赖；驱动需要与 CUDA 运行时兼容 |
+| Windows + NVIDIA GPU | `python -m pip install -U ftllm` | 如果首次安装提示缺少 DLL，请先安装下方的 Windows 依赖包 |
+| Linux + AMD GPU | `python -m pip install -U ftllm-rocm` | 需要先安装与显卡匹配的 ROCm 环境，参见 [ROCm 文档](docs/rocm.md) |
+| CPU-only、特殊架构或其他加速器 | [源码安装](#源码安装) | 可按实际平台选择 CMake 后端 |
 
-#### Linux系统 + Nvidia GPU:
+Windows 首次安装所需的依赖包：
 
-```
-pip install ftllm -U
-```
+~~~bash
+python -m pip install https://www.modelscope.cn/models/huangyuyang/fastllmdepend-windows/resolve/master/ftllmdepend-0.0.0.2-py3-none-win_amd64.whl
+python -m pip install -U ftllm
+~~~
 
-#### Linux系统 + AMD GPU:
+如果 Conda 环境出现动态库冲突，可尝试使用 `venv` 创建干净环境。安装或加载失败时先查看 [FAQ](docs/faq.md)。
 
-由于目前PyPI限制库大小，安装包中不含ROCM依赖，安装ftllm之前建议先手动安装ROCM 6.3.3 (若已安装ROCM可跳过)
-```
-wget wget https://repo.radeon.com/amdgpu-install/6.3.3/ubuntu/jammy/amdgpu-install_6.3.60303-1_all.deb
-apt install ./amdgpu-install_6.3.60303-1_all.deb -y
-amdgpu-install --usecase=hiplibsdk,rocm,dkms -y
-```
+### 验证安装
 
-然后用pip安装，命令如下：
+下面使用体积较小的 Qwen3-0.6B 做安装冒烟测试；它只是便于快速下载的测试模型，不代表当前模型主线。
 
-```
-pip install ftllm-rocm -U
-```
-
-#### Windows系统 （仅支持Nvidia GPU）:
-
-第一次安装前需要安装依赖库:
-
-```
-pip install https://www.modelscope.cn/models/huangyuyang/fastllmdepend-windows/resolve/master/ftllmdepend-0.0.0.2-py3-none-win_amd64.whl
-```
-
-然后用pip安装，命令如下：
-
-```
-pip install ftllm -U
-```
-
-- Hint
-
-Conda下安装有时候会出现环境错误，如果出现可以尝试在Conda外或使用venv等虚拟环境尝试
-
-（若使用时报错，可参考[ftllm报错](docs/faq.md#ftllm加载报错) )
-
-### 运行demo程序
-
-可以运行一个较小模型测试安装是否成功, 以Qwen/Qwen3-0.6B模型为例
-
-#### 命令行聊天：
-
-```
+~~~bash
 ftllm run Qwen/Qwen3-0.6B
-```
+~~~
 
-#### WebUI:
+最常用的部署入口是 API Server：
 
-```
-ftllm webui Qwen/Qwen3-0.6B
-```
-
-#### API Server (OpenAI 风格):
-
-```
+~~~bash
+# API Server，默认监听 0.0.0.0:8080
 ftllm server Qwen/Qwen3-0.6B
-```
 
-#### 终端部署向导:
+# 命令行对话
+ftllm run Qwen/Qwen3-0.6B
 
-```
+# WebUI，默认监听 1616 端口
+ftllm webui Qwen/Qwen3-0.6B
+
+# 终端部署向导；无参数时等价于 ftllm tui
 ftllm
 ftllm tui
-```
 
-`ftllm` 不带参数时会进入终端部署向导，等价于 `ftllm tui`。它会保存部署配置到本机用户配置目录，首页可通过键盘选择已保存命令进行新建、编辑、启动或删除。部署表单默认只显示基础配置，更多参数放在高级选项中；模型路径必须填写为已存在的本地目录，可按 Tab 补全目录；也可以从常用 ModelScope 模型列表中选择模型并下载到指定目录。
+# 性能测试
+ftllm bench Qwen/Qwen3-0.6B \
+  --device cuda --input_tokens 512 --output_tokens 128 --batch 4
+~~~
 
-## 使用指南
+`model` 位置参数既可以是 Hugging Face 仓库 ID，也可以是本地 Hugging Face 模型目录、FastLLM 模型文件或配置文件。例如：
 
-### 1. 如何启动模型
+~~~bash
+ftllm server /data/models/my-model --device cuda
+~~~
 
-基本的启动命令格式如下：
+### 调用 API
 
-```
-ftllm run Qwen/Qwen3-0.6B # 启动本地对话
-ftllm webui Qwen/Qwen3-0.6B # 启动WebUI
-ftllm server Qwen/Qwen3-0.6B # 启动API Server
-ftllm # 通过终端命令列表选择/编辑/启动部署配置，模型路径必须是已存在目录
-```
+启动一个带固定服务名的本地模型：
 
-根据你需要开启的服务，选择相应的命令。以 `server` 命令为例，格式如下：
+~~~bash
+ftllm server /data/models/my-model \
+  --model_name local-model \
+  --host 0.0.0.0 --port 8080 \
+  --api_key local-key
+~~~
 
-```
-ftllm server model
-```
+通过 OpenAI Chat Completions 接口调用：
 
-这里的`model`可以是:
+~~~bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer local-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "local-model",
+    "messages": [{"role": "user", "content": "你好，请介绍一下 FastLLM。"}],
+    "stream": false
+  }'
+~~~
 
-- Huggingface上的模型，例如 `Qwen/Qwen3-0.6B` 代表 [千问3-0.6B模型](https://hf-mirror.com/Qwen/Qwen3-0.6B)
-- 本地模型路径。例如`/mnt/Qwen3-0.6B`，高速下载模型可以参考 [模型下载](#模型下载)
+服务还提供 OpenAI Responses API 和 Anthropic Messages API。模型支持时，可使用思考内容分离、工具调用和图文输入等能力。
 
-无论是在线模型还是本地模型，目前支持以下几种格式 （均以在线模型举例，可以在Huggingface上搜到对应模型）:
+## 模型部署指南
 
-- `FP16`, `BF16`格式的原始模型，例如`Qwen/Qwen3-0.6B`
-- `FP8`格式的模型，例如`Qwen/Qwen3-0.6B-FP8`
-- `AWQ`格式的模型，例如`Qwen/Qwen3-14B-AWQ`
-- `Fastllm`格式的模型，例如`fastllm/DeepSeek-V3-0324-INT4`。也可以下载原始模型后通过 [模型导出](#模型导出) 中的命令导出
-- `GGUF` 格式的模型，需要用`--ori`参数指定原始模型路径，例如
+不同模型在注意力结构、MoE 布局、投机解码和量化格式上差异很大。选择目标模型后，请先阅读对应部署指南，再使用后面的通用配置作为补充。
 
-``` sh
-ftllm server DeepSeek-V3-0324-Q4_K_M-00001-of-00009.gguf --ori DeepSeek-V3
-```
+| 模型 | 部署指南 | 推荐配置入口 | Benchmark |
+| --- | --- | --- | --- |
+| Qwen4-Exp / Qwen3.8-Flash-Next | [Qwen4-Exp 指南](docs/qwen4.md) | PLE、QSA、CUDA/NUMA、`--ngram_device disk` | [Qwen4 Benchmark](docs/benchmarks/qwen4_exp.md) |
+| Qwen3.5 / Qwen3.6 / Qwen3.8 | [Qwen 当前模型指南](docs/qwen3.md) | 单卡、TP、混合 MoE、MTP、DFlash2 | [Qwen3 Benchmark](docs/benchmarks/qwen3.md) |
+| DeepSeek-V4 / V4-Flash | [DeepSeek-V4 指南](docs/deepseek.md) | CUDA + NUMA、磁盘专家、TP、内置 DSpark | [DeepSeek-V4 Benchmark](docs/benchmarks/deepseek_v4.md) |
+| Kimi-K3 | [Kimi-K3 指南](docs/kimi_k3.md) | KDA/MLA、混合专家、磁盘专家、外部 DSpark | [Kimi-K3 Benchmark](docs/benchmarks/kimi_k3.md) |
+| Dots3-Note | [Dots3-Note 指南](docs/dots3_note.md) | DSA、长上下文、CUDA + CPU/NUMA | [Dots3-Note Benchmark](docs/benchmarks/dots3_note.md) |
+| GLM-5 / GLM-5.3-Flash | [GLM-5 指南](docs/glm5.md) | DSA/KDA、分页缓存、NUMA、量化 KV-B CPU | [GLM-5 Benchmark](docs/benchmarks/glm5.md) |
+| Laguna | [Laguna 指南](docs/laguna.md) | 多卡 TP、混合 MoE、NVFP4、INT4_GROUP32 | [Laguna Benchmark](docs/benchmarks/laguna.md) |
 
-这里的`DeepSeek-V3`是原始模型文件夹，无需下载权重文件，可以参考如下命令下载：
+[Benchmark 索引](docs/benchmark.md) 按模型分别记录测试硬件、完整启动命令、TTFT、Prefill、Decode 和并发吞吐。没有仓库实测的数据会明确标为“待实测”，不会从其他设备或模型外推。
 
-``` sh
-ftllm download deepseek-ai/DeepSeek-V3 --exclude "*safetensors*"
-```
+## 典型部署配置
 
+### 多卡张量并行
 
-如果您是第一次使用ftllm，建议直接使用基本的启动命令启动，所有的参数都会自动设置。如果您希望继续调参，请参照下面的参数设置说明
+`--tp 0,1` 显式使用 0、1 号 GPU；`--tp 2` 表示使用前两张可见 GPU；`--tp auto` 自动使用检测到的 GPU。
 
-### 2. 如何设定推理精度
+~~~bash
+ftllm server /data/models/my-model \
+  --device cuda --tp 0,1 \
+  --max_batch 16 --gpu_mem_ratio 0.9
+~~~
 
-当启动的模型为浮点精度时（`BF16`, `FP16`, `FP8`）时，可以通过以下参数来设置模型的推理精度：
+### GPU + NUMA 混合 MoE
 
-- `--dtype`:
-  - **描述**: 指定模型的数据类型。
-  - **可选值**: `int4g` `int4` `int8` `fp8` `float16` 或其他支持的数据类型。
-  - **示例**: `--dtype int4`
+~~~bash
+ftllm server /data/models/my-moe-model \
+  --device cuda --moe_device numa \
+  --chunked_prefill_size 8192
+~~~
+
+内存不足时还可以把少量专家层放到磁盘，例如 `--moe_device "{'cuda':1,'numa':8,'disk':1}"`。磁盘路径依赖 SSD 随机读取性能，详细配置参见[混合推理指南](docs/mixforward.md)。
+
+### 长上下文与前缀缓存
+
+~~~bash
+ftllm server /data/models/my-model \
+  --max_context_length 131072 \
+  --max_batch 16 \
+  --gpu_mem_ratio 0.9 \
+  --chunked_prefill_size 8192 \
+  --prefix_cache true
+~~~
+
+实际可用上下文取模型原生上限、`--max_context_length` 和共享 KV Cache 容量的较小值；`/v1/models` 会返回最终生效值。
+
+### 投机解码
+
+以下功能只适用于结构和 checkpoint 匹配的模型：
+
+~~~bash
+# 以 Qwen3.5 为例使用内置 MTP，每轮最多配置 8 个 draft token
+ftllm server /data/models/qwen3.5 --mtp 4
+
+# DeepSeek-V4 内置 DSpark
+ftllm server /data/models/deepseek-v4 --dspark 7
+
+# Qwen3.8 + 独立 DFlash2 draft checkpoint
+ftllm server /data/models/qwen3.8 \
+  --tp 2 \
+  --speculative_algorithm dflash \
+  --speculative_draft_model_path /data/models/qwen3.8-dflash2 \
+  --speculative_num_draft_tokens 8
+~~~
+
+DFlash2 的完整配置和验证结果见 [Qwen3.8 DFlash2 文档](docs/dflash2_qwen38_27b_tp2_20260819.md)。
+
+### Qwen4 PLE 磁盘模式
+
+Qwen4-Exp / Qwen3.8-Flash-Next 的 PLE 表较大。主机内存不足时可按需从 checkpoint 读取：
+
+~~~bash
+ftllm server /data/models/qwen4-exp \
+  --device cuda --moe_device numa \
+  --ngram_device disk
+~~~
+
+磁盘模式会降低常驻内存，但增加随机 I/O，建议使用高速 SSD。更多限制见 [Qwen4-Exp 文档](docs/qwen4_exp.md)。
+
+## 常用参数
+
+CLI 会持续演进，`ftllm <command> --help` 是当前安装版本的最终依据。下面列出部署中最常用的参数。
+
+### 模型、设备与精度
+
+<a id="3-如何设定运行设备"></a>
+
+| 参数 | 说明 |
+| --- | --- |
+| `model` / `-p, --path` | Hugging Face 仓库 ID、本地 HF 目录、FastLLM 模型文件或配置文件 |
+| `--device` | 主计算设备，常用值为 `cpu`、`cuda`、`numa` |
+| `--tp` | CUDA 张量并行设备；支持 `0,1`、`2` 或 `auto` |
+| `--moe_device` | MoE 专家层设备，可使用 `cpu`、`cuda`、`numa`、`disk` 或按比例组合 |
+| `--moe_device_layers` | 仅让最后 N 个 MoE 层使用 `--moe_device`；`-1` 表示全部 |
+| `-t, --threads` | CPU/NUMA 线程数；`-1` 表示自动选择 |
+| `--dtype` | 加载 HF 权重时的权重类型；默认 `auto`，已量化模型通常不应覆盖 |
+| `--moe_dtype` | 单独设置 MoE 权重类型 |
+| `--atype` / `--moe_atype` | 设置普通层和 MoE 层的激活类型 |
+| `--kv_cache_dtype` | KV Cache 类型：`auto`、`float16`、`bfloat16` 或 `fp8_e4m3` |
+| `--dtype_config` | 动态量化配置文件，参见[动态量化说明](docs/dtype_config.md) |
+| `--triton` | 启用可用的 Triton CUDA 算子 |
+
+### 显存、上下文与调度
+
+| 参数 | 默认值 | 说明 |
+| --- | ---: | --- |
+| `--gpu_mem_ratio` | `0.9` | 可用于模型与缓存的 GPU 显存比例 |
+| `--kv_cache_limit` | `auto` | KV Cache 最大使用量 |
+| `--tokens` | 自动 | 用于计算 Paged KV Cache 容量的总 token 数 |
+| `--page_size` | 后端决定 | Paged KV Cache 每页 token 数；多卡默认通常为 16 |
+| `--max_batch` | 自动 | 每轮最多同时推理的请求数 |
+| `--max_context_length` | 自动 | Server 单会话输入与输出合计上限 |
+| `--chunked_prefill_size` | 关闭/模型决定 | 分块 Prefill 的切片大小，例如 `8192` |
+| `--prefix_cache` | 模型/环境决定 | 是否开启前缀缓存，使用 `true` 或 `false` |
+| `--cuda_slab` | `0` | CUDA 权重 slab 大小（MB）；`0` 为关闭 |
+| `--ngram_device` | `cpu` | Qwen4 PLE 表放在 `cpu` 或 `disk` |
+
+### 解码、模板与工具调用
+
+<a id="工具调用"></a>
+
+| 参数 | 说明 |
+| --- | --- |
+| `--enable_thinking` | 控制模型的思考模板开关，需要模型支持 |
+| `--mtp` | 支持 MTP 的模型每轮生成的 draft token 数，`0` 关闭，当前最大为 8 |
+| `--dspark` | 启用模型内置 DSpark，并设置每轮 draft token 数 |
+| `--speculative_algorithm` | 外部投机解码算法，当前支持 `dspark`、`dflash` |
+| `--speculative_draft_model_path` | 外部 DSpark/DFlash draft 模型目录 |
+| `--speculative_num_draft_tokens` | DFlash block token 数；默认读取 draft 配置 |
+| `--tool_call_parser` | 工具调用解析器；默认 `auto` |
+| `--chat_template` | 自定义 Jinja chat template 文件 |
+| `--cache_dir` | 在线模型的本地缓存目录 |
+| `--ori` | 读取部分 GGUF 时指定原模型配置和 tokenizer 目录 |
 
-- `--moe_dtype`:
-  - **描述**: 指定模型MOE层的数据类型。
-  - **可选值**: `int4g` `int4` `int8` `fp8` `float16` 或其他支持的数据类型。
-  - **示例**: `--moe_dtype int4`
-  - **说明**: 如果指定的模型不是`moe`结构的模型，这个参数不会生效
+### API Server
+
+| 参数 | 默认值 | 说明 |
+| --- | ---: | --- |
+| `--host` | `0.0.0.0` | 监听地址 |
+| `--port` | `8080` | Server 端口；WebUI 默认端口为 1616 |
+| `--model_name` | 自动 | API 中校验和返回的部署名称 |
+| `--api_key` | 空 | 非空时开启 Bearer API Key 校验 |
+| `--temperature` / `--top_p` / `--top_k` | 模型默认 | 覆盖服务端默认采样参数 |
+| `--repeat_penalty` | 模型默认 | 覆盖重复惩罚参数，也支持 `--repetition_penalty` |
+| `--hide_input` | 关闭 | 不在服务日志中显示请求内容 |
+| `--startup-progress` | `off` | 设置为 `ndjson` 时向 stderr 输出模型加载与就绪事件 |
+
+查看完整参数：
+
+~~~bash
+ftllm --help
+ftllm server --help
+ftllm bench --help
+ftllm download --help
+~~~
 
-命令示例：
+## 模型格式、下载与导出
 
-```
-ftllm server Qwen/Qwen3-0.6B --dtype int8 
-# 上面的命令会读取原始模型（这个模型是BF16精度），并在线量化为INT8精度推理
+### 支持的输入格式
 
-ftllm server deepseek-ai/DeepSeek-V3-0324 --dtype fp8 --moe_dtype int4
-# 上面的命令会读取原始模型（这个模型是FP8精度），并使用FP8 + INT4的混合精度推理
-```
+- Hugging Face 原始 Safetensors 权重，包括模型自带的 FP16、BF16 或 FP8 权重。
+- 已量化的 AWQ 模型。
+- FastLLM 导出的定精度或动态量化模型。
+- 部分 GGUF 格式；需要通过 `--ori` 指定原模型的配置和 tokenizer 目录。
 
-- `--dtype_config`:
-  - **描述**: 指定动态量化配置文件。
-  - **说明**: 参考[动态量化说明](docs/dtype_config.md)
+量化格式是否可用取决于模型结构、设备和对应 kernel。首次部署建议保留 `--dtype auto`；对于已经量化的 checkpoint，不要再次指定在线量化类型。
 
-若不设定这些参数，ftllm会使用模型中设定的精度来进行推理
+### 下载模型
 
-若使用的模型已经是量化好的模型（例如AWQ模型，Fastllm导出的量化模型等），建议不指定这些参数
+~~~bash
+ftllm download <repo-id> --local-dir /data/models/model-name
+~~~
 
-### 3. 如何设定运行设备
+只下载配置和 tokenizer 文件时可以排除权重：
 
-可以通过以下参数来设定执行推理的设备
+~~~bash
+ftllm download <repo-id> \
+  --exclude "*safetensors*" \
+  --local-dir /data/models/model-config
+~~~
 
-- `--device`:
-  - **描述**: 指定模型运行的计算设备。
-  - **示例**: `--device cpu`, `--device cuda`
-  - **常用值说明**: 
-    - `cpu` 使用`cpu`推理
-    - `cuda` 使用`gpu`推理 
-    - `numa` 使用多路`numa`节点加速推理，在多CPU的机器才会有提升。使用numa加速时，强烈建议关闭系统numa平衡。（ubuntu中可使用命令`sudo sysctl -w kernel.numa_balancing=0`)
-    - `multicuda` 使用多设备张量并行推理
-      - **使用多显卡**: `--device multicuda:0,1`
-      - **使用多显卡+CPU**: `--device multicuda:0,cpu`
-      - **按比例使用多显卡+CPU**: `--device multicuda:0:4,1:5,cpu:1` 
-      (`cuda:0`计算4/10, `cuda:1`计算5/10, `cpu`计算1/10)
-  - **串行计算**: 一些场景下可以指定不同的device串行执行。例如
-    - `--device "{'cuda:0':3,'cuda:1':2}"`: 这样`3/5`的层会运行在`cuda:0`上，`2/5`的层会运行在`cuda:1`上
-    - `--device "{'multicuda:0,1':3,'cuda:1':2}"`: 这样`3/5`的层会使用`cuda:0`,`cuda:1`张量并行，`2/5`的层仅仅运行在`cuda:1`上
-    - **简写**: `--device cudapp=N` 表示N卡均匀串行，例如 `--device cudapp=4` 等价于 `--device "{'cuda:0':1,'cuda:1':1,'cuda:2':1,'cuda:3':1}"`
-    - **简写**: `--device cudapp=1:2:3` 表示三卡按1:2:3比例串行，等价于 `--device "{'cuda:0':1,'cuda:1':2,'cuda:2':3}"`
+### 导出模型
 
-- `--moe_device`:
-  - **描述**: 指定 MOE（Mixture of Experts）层的计算设备。
-  - **示例**: `--moe_device cpu`, `--moe_device numa`
-  - **常用值说明**: 
-    - `cpu` 使用`cpu`推理
-    - `numa` 使用多路`numa`节点加速推理，在多CPU的机器才会有提升
-    - `cuda` 使用`gpu`推理 （MOE层需要大量显存，一般不建议指定为`cuda`）
-  - **说明**: 一般和device指定为不同的设备实现混合推理，例如
-  `--device cuda --moe_device cpu`来实现MOE模型的单卡+CPU混合推理。
-   `--device cuda --moe_device numa` 来实现MOE模型的单卡+多NUMA节点加速推理
-   如果指定的模型不是`moe`结构的模型，这个参数不会生效
-
-- `--moe_device_layers`:
-  - **描述**: 指定最后多少层 MOE 使用 `--moe_device`，前面的 MOE 层继续使用主设备或 `--tp` 指定的 CUDA 张量并行设备。
-  - **示例**: `--tp 0,1 --moe_device numa --moe_device_layers 8`
-  - **说明**: 默认 `-1` 表示所有 MOE 层都使用 `--moe_device`，设置为 `0` 表示不单独把后段 MOE 放到 `--moe_device`。
+在线量化会增加每次启动的加载时间。可以预先导出 FastLLM 格式：
 
-若不设定这些参数，会使用默认配置来推理，默认配置如下：
+~~~bash
+ftllm export /data/models/source-model \
+  -o /data/models/source-model-int4 \
+  --dtype int4 -t 16
+~~~
 
-| 模型类型 | device | moe_device |
-|-------:|--------|------------:|
-| 稠密模型 | cuda   |   不生效    |
-| MOE模型  | cuda   |   cpu    |
+MoE 模型可以分别设置普通层和专家层精度：
 
-如果只设置了device没设置moe_device，则moe_device会跟随device
+~~~bash
+ftllm export /data/models/source-moe \
+  -o /data/models/source-moe-mixed \
+  --dtype float16 --moe_dtype int4 -t 16
+~~~
 
-对于发烧友而言，如果想更进一步榨干硬件，可以参考 [混合推理指南](docs/mixforward.md)
+动态量化配置见[动态量化说明](docs/dtype_config.md)。
 
-multicuda专用worker线程的调优环境变量见 [混合推理指南：multicuda调优环境变量](docs/mixforward.md#multicuda调优环境变量)
+## 源码安装
 
-### 4. 如何设定运行参数
+源码构建需要 C++17 编译器、Make 和 CMake；建议 GCC/G++ 9.4+、CMake 3.23+。Linux NUMA 构建通常还需要 `libnuma-dev`。CUDA 构建请预先安装兼容的 CUDA Toolkit 和 NCCL。
 
-可以通过下列参数设置运行参数。
+~~~bash
+# Ubuntu/Debian 基础依赖
+sudo apt-get install -y build-essential cmake libnuma-dev
 
-需要注意的是，速度和参数设置并不一定正相关，如果对性能要求高，可以多方向尝试一下
+# NVIDIA CUDA
+bash install.sh -DUSE_CUDA=ON \
+  -DCMAKE_CUDA_COMPILER="$(command -v nvcc)"
 
-- `-t` 或 `--threads`:
-  - **描述**: 设置使用的CPU线程数。
-    - 当`device`为`cpu`时，这个参数决定了推理使用的线程数
-    - 当`device`为`numa`时，推理线程数主要由环境变量`FASTLLM_NUMA_THREADS`决定，`threads`参数请设得小一点（推荐设为1）
-  - **示例**: `-t 27`
+# 指定 CUDA 架构，例如 Ada 使用 89
+bash install.sh -DUSE_CUDA=ON -DCUDA_ARCH=89 \
+  -DCMAKE_CUDA_COMPILER="$(command -v nvcc)"
 
-例如我们在多CPU设备上用GPU + 多CPU混合部署一个`MOE`模型`fastllm/DeepSeek-V3-0324-INT4`，可以尝试这些命令：
+# AMD ROCm
+bash install.sh -DUSE_ROCM=ON
 
-``` bash
-export FASTLLM_NUMA_THREADS=27 && ftllm server fastllm/DeepSeek-V3-0324-INT4 --device cuda --moe_device numa -t 1 
-# 使用多numa推理，每个numa节点使用27个线程
+# CPU-only
+bash install.sh
+~~~
 
-export FASTLLM_NUMA_THREADS=16 && ftllm server fastllm/DeepSeek-V3-0324-INT4 --device cuda --moe_device numa -t 1 
-# 使用多numa推理，每个numa节点使用16个线程
+更多平台说明：
 
-numactl -C 0-31 -m 0 ftllm server fastllm/DeepSeek-V3-0324-INT4 --device cuda --moe_device cpu -t 27 
-# 绑定单numa节点，使用CPU推理，使用27线程
-```
+- [ROCm 编译](docs/rocm.md)
+- [TFACC 平台](docs/tfacc.md)
+- [示例程序、Android 和其他平台](example/README.md)
+- [编译与运行 FAQ](docs/faq.md)
 
-不同硬件上，不同参数发挥出的性能有很大不同。一般而言，CPU上使用的线程数不建议超过物理核数
+## 文档导航
 
+| 主题 | 文档 |
+| --- | --- |
+| 发布说明 | [稳定版日志](docs/version.md) · [Nightly 使用](docs/nightly.md) · [Nightly 日志](docs/nightly_changelog.md) |
+| 模型部署 | [Qwen4-Exp](docs/qwen4.md) · [Qwen3.5/3.6/3.8](docs/qwen3.md) · [DeepSeek-V4](docs/deepseek.md) · [Kimi-K3](docs/kimi_k3.md) · [Dots3-Note](docs/dots3_note.md) · [GLM-5](docs/glm5.md) · [Laguna](docs/laguna.md) |
+| 混合推理 | [GPU、NUMA 与磁盘混合部署](docs/mixforward.md) |
+| 性能与验证 | [按模型查看 Benchmark](docs/benchmark.md) |
+| 量化 | [动态量化配置](docs/dtype_config.md) |
+| 扩展开发 | [Python 自定义模型](docs/custom.md) · [自定义算子](docs/custom_op.md) |
+| 平台与排错 | [ROCm](docs/rocm.md) · [TFACC](docs/tfacc.md) · [FAQ](docs/faq.md) |
 
-### 5. 其它参数
+## 社区与贡献
 
-- `--moe_experts`:
-  - **描述**: 指定 MOE（Mixture of Experts）层使用的专家数。不设定则根据模型配置设定。减少专家数可以提高推理速度，但可能降低推理准确度
-  - **示例**: `--moe_experts 6`
+欢迎通过 [GitHub Issues](https://github.com/ztxz16/fastllm/issues) 报告问题，通过 [Pull Requests](https://github.com/ztxz16/fastllm/pulls) 参与开发。
 
-- `--cuda_se`:
-  - **描述**: 指定 MOE中的共享专家 是否在cuda上执行，默认为true
-  - **示例**: `--cuda_se false`
+部署交流 QQ 群：`831641348`
 
-- `--cuda_slab`:
-  - **描述**: 设置 CUDA 模型权重 slab 分配块大小，单位 MB。默认 `0` 表示关闭。将大量 MOE 专家权重放在 CUDA 上时，可用它减少小权重分别 `cudaMalloc` 带来的显存页对齐和碎片开销。
-  - **示例**: `--cuda_slab 1024`
+用户交流群（使用、部署）：
 
-- `--port`:
-  - **描述**: 指定服务运行的端口号。
-  - **示例**: `--port 8080`
+<img src="docs/wechat_group0.jpg" width="220" alt="FastLLM 用户交流群二维码">
 
-- `--help`:
-  - **描述**: 查看模块参数详细信息。
-  - **示例**: `ftllm server --help`
+社区开发群（贡献、开发讨论）：
 
-- `--version` 或 `-v`:
-  - **描述**: 查看ftllm版本号。
-  - **示例**: `ftllm -v`
+<img src="docs/develop-group.png" width="220" alt="FastLLM 社区开发群二维码">
 
-- `--hide_input`:
-  - **描述**: server模式隐藏日志中的请求信息。
-  - **示例**: `ftllm server --hide_input`
- 
-- `--api_key`:
-  - **描述**: server模式设定api_key。
-  - **示例**: `ftllm server --api_key xxxxxxxx` 
-
-- `--max_context_length`:
-  - **描述**: server模式限制单会话输入与输出合计的最大 token 数。默认取模型上下文上限与共享 KV Cache 总容量的较小值；`/v1/models` 会返回实际生效值。
-  - **示例**: `ftllm server Qwen/Qwen3.6-27B-FP8 --max_context_length 131072`
- 
-- `--max_token`:
-  - **描述**: webui模式指定最大输出。
-  - **示例**: `ftllm webui --max_token`
- 
-- `--think`:
-  - **描述**: 强制思考。
-  - **示例**: `ftllm webui --think`
-
-- `--cache_dir`:
-  - **描述**: 指定在线Huggingface模型的缓存目录
-  - **示例**: `ftllm --cache_dir /mnt`
-
-- `--chat_template`:
-  - **描述**: 指定chat_template文件
-  - **示例**: `ftllm --chat_template deepseekv31.jinja`
-
-## 工具调用
-
-目前以下模型支持工具调用：
-
-- GLM4.5, GLM4.5-AIR
-- Qwen3-Instruct系列
-- Qwen3-Coder系列
-- Kimi-K2
-- DeepSeekV3.1, 需要指定chat_template, 文件位于本项目`example/chat_template/deepseekv31.jinja`
-
-## 模型获取
-
-### 模型下载
-
-可以使用如下命令将模型下载到本地（使用高速镜像，无需科学上网）
-
-```
-ftllm download deepseek-ai/DeepSeek-R1
-```
-
-
-### 模型导出
-
-如果使用量化加载模型（如`--dtype int4`），那么每次读取模型时会在线量化，读取速度较慢。
-
-ftllm export 是一个用于导出和转换模型权重的工具。它支持将模型权重转换为不同的数据类型。以下是如何使用 ftllm export 的详细说明。
-
-#### 命令格式
-
-``` sh
-ftllm export <模型路径> -o <输出路径> --dtype <数据类型> -t <线程数>
-```
-
-#### 示例命令
-
-``` sh
-ftllm export /mnt/DeepSeek-V3 -o /mnt/DeepSeek-V3-INT4 --dtype int4 -t 16
-```
-
-#### 混合精度
-
-可以通过指定`--moe_dtype`来实现混合精度，例如
-
-``` sh
-ftllm export /mnt/DeepSeek-V3 -o /mnt/DeepSeek-V3-FP16INT4 --dtype float16 --moe_dtype int4 -t 16
-```
-
-#### 加载导出后的模型
-
-导出后的模型使用方法和原始模型类似，使用导出模型时`--dtype`参数将被忽略
-
-例如
-
-``` sh
-ftllm run /mnt/DeepSeek-V3-INT4/
-```
-
-### 支持的模型
-
-如果需要运行更多早期的模型，请参考[支持模型列表](docs/models.md)
-
-### 源码安装
-
-若pip安装失败或有其它特殊需求，可以用源码编译安装
-源码安装后如果需要卸载，方法和PIP安装一样
-```
-pip uninstall ftllm
-```
-
-建议使用cmake编译，需要提前安装gcc，g++ (建议9.4以上), make, cmake (建议3.23以上)
-
-需要安装numa库，在Ubuntu下的安装命令一般使用：
-
-```
-apt-get install libnuma-dev
-```
-
-如果编译出错，建议使用AI工具帮忙安装环境
-
-GPU编译需要提前安装好CUDA编译环境，建议使用尽可能新的CUDA版本，并安装NCCL包
-
-使用如下命令编译
-
-``` sh
-bash install.sh -DUSE_CUDA=ON -D CMAKE_CUDA_COMPILER=$(which nvcc) # 编译GPU版本
-# bash install.sh -DUSE_CUDA=ON -DCUDA_ARCH=89 -D CMAKE_CUDA_COMPILER=$(which nvcc) # 可以指定CUDA架构，如4090使用89架构
-# bash install.sh # 仅编译CPU版本
-```
-
-##### 其他平台编译
-
-其他不同平台的编译可参考文档
-
-[TFACC平台](docs/tfacc.md)  
-[ROCm平台](docs/rocm.md)
-
-编译中遇到问题可参考 [FAQ文档](docs/faq.md)
+项目采用 [Apache License 2.0](LICENSE)。
 
 ## 参考代码和文章
 
-### 大量NN底层算子的实现思路
+FastLLM 的实现参考或使用了以下开源项目与文章中的思路或代码：
 
-[pytorch](https://github.com/pytorch/pytorch)
+- [PyTorch](https://github.com/pytorch/pytorch)：底层算子实现思路。
+- [Transformers](https://github.com/huggingface/transformers)：模型结构与参考实现。
+- [llama.cpp](https://github.com/ggml-org/llama.cpp) 和 [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp)：GGUF 量化格式与 kernel。
+- [FlashInfer](https://github.com/flashinfer-ai/flashinfer)：Attention、MLA 等算子。
+- [TurboMind / LMDeploy](https://github.com/InternLM/lmdeploy/tree/main/src/turbomind) 和 [1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM/blob/main/csrc/quantization/awq/awq_sm70_gemm.cu)：SM70 AWQ W4A16 GEMM 路径。
+- [KTransformers](https://github.com/kvcache-ai/ktransformers/blob/main/csrc/ktransformers_ext/cpu_backend/backend.cpp)：MoE 动态线程调度；另见[思路介绍](https://zhuanlan.zhihu.com/p/1900318746402329329)。
+- [Lvllm](https://github.com/guqiong96/Lvllm/blob/main/csrc/lk/moe.cpp)：NUMA MoE 动态调度。
+- [vLLM](https://github.com/vllm-project/vllm/tree/main/vllm/entrypoints/openai/tool_parsers)：工具调用解析。
+- [json11](https://github.com/dropbox/json11)：JSON 构造与解析。
 
-### 大量LLM具体的模型实现
-
-[transfomers](https://github.com/huggingface/transformers)
-
-### GGML中的一些量化方法、以及计算Kernel
-
-[llama.cpp](https://github.com/ggml-org/llama.cpp)
-
-[ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp)
-
-### FlashInfer中的一些库，主要是Attention, MLA等部分
-
-[flashInfer](https://github.com/flashinfer-ai/flashinfer)
-
-### SM70 (V100) AWQ W4A16 GEMM 路径中使用的 TurboMind s884 内核子集
-
-[TurboMind / LMDeploy](https://github.com/InternLM/lmdeploy/tree/main/src/turbomind)
-
-[1Cat-vLLM 中的 awq_sm70_gemm 适配思路](https://github.com/1CatAI/1Cat-vLLM/blob/main/csrc/quantization/awq/awq_sm70_gemm.cu)
-
-### MOE算子线程不平衡时动态调度的思路
-
-[KTransformers 0.3 思路介绍](https://zhuanlan.zhihu.com/p/1900318746402329329)
-
-[KT中关于线程调度的相关代码](https://github.com/kvcache-ai/ktransformers/blob/main/csrc/ktransformers_ext/cpu_backend/backend.cpp)
-
-### 基于numa改进的MOE动态调度算子
-
-[lvllm中的实现](https://github.com/guqiong96/Lvllm/blob/main/csrc/lk/moe.cpp)
-
-### Function call解析相关的代码
-
-[vllm中的实现](https://github.com/vllm-project/vllm/tree/main/vllm/entrypoints/openai/tool_parsers)
-
-### json的构造和解析
-
-[json11](https://github.com/dropbox/json11)
-
-感谢大佬对开源社区的贡献！如发现未标明的引用代码可在issue中提出
+感谢所有开源贡献者。如发现遗漏的代码来源或引用，请通过 Issue 告知。
