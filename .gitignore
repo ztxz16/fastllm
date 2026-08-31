@@ -5,6 +5,7 @@ __pycache__/
 token
 /cmake-build-debug/
 /build*
+/portable-dist/
 /pyfastllm/build/
 /pyfastllm/dist/
 /.idea/

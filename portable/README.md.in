@@ -1,0 +1,41 @@
+# @PACKAGE_NAME@ @PACKAGE_VERSION@ 绿色包
+
+本目录已经包含 Python @PYTHON_VERSION@、ftllm、CUDA 12 runtime、cuBLAS、NCCL
+及 wheel 声明的全部 Python 依赖。不要把本目录中的 `runtime` 单独移动出去。
+
+## 直接使用
+
+```bash
+./ftllm-check --require-cuda
+./ftllm --version
+./ftllm --help
+./ftllm chat /path/to/model
+./ftllm serve /path/to/model --port 8080
+```
+
+需要用同一环境运行自己的脚本时：
+
+```bash
+./python your_script.py
+./pip list
+```
+
+需要让当前 Bash 会话中的 `python3`、`streamlit` 等命令都指向绿色包时：
+
+```bash
+source ./env.sh
+```
+
+## 宿主机要求
+
+- x86_64 Linux；面向 Ubuntu 22.04、24.04、26.04。
+- glibc 2.35 或更高。构建脚本会扫描包内每个 ELF，阻止高于该基线的产物。
+- NVIDIA GPU Compute Capability 6.0 或更高；当前 ftllm wheel 含
+  SM60、70、75、80、89、90、100、120 原生代码。未来高于 SM120 的新架构需重新构建 wheel。
+- CUDA 12 minor-version compatibility 的最低 Linux 驱动为
+  @MIN_NVIDIA_DRIVER@；推荐 @RECOMMENDED_NVIDIA_DRIVER@ 或更新版本。
+- 不需要安装 Python、pip、CUDA Toolkit、cuBLAS 或 NCCL。NVIDIA 内核/用户态驱动
+  (`libcuda.so.1`) 必须由宿主机安装，不能放进普通绿色包。
+
+模型权重不在本包中。完整依赖版本见 `requirements.lock.txt`，构建来源与校验值见
+`BUILD-INFO.json`，包内文件校验值见 `MANIFEST.sha256`。
