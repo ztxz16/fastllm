@@ -1,86 +1,128 @@
-## Qwen3模型介绍
+# Qwen3.5 / Qwen3.6 / Qwen3.8 部署指南
 
-Qwen3是阿里巴巴出品的系列模型
+[English](qwen3_en.md) · [返回 README](../README.md) · [Qwen4-Exp](qwen4.md) · [Benchmark](benchmarks/qwen3.md)
 
-### 安装Fastllm
+本文面向当前 Qwen3.5、Qwen3.6 和 Qwen3.8 文本模型。Qwen4-Exp / Qwen3.8-Flash-Next 使用独立架构，请阅读 [Qwen4-Exp 部署说明](qwen4.md)。
 
-- PIP安装
+不同 checkpoint 可能是稠密、MoE、FP8、NVFP4 或其他量化格式。首次启动建议保留 `--dtype auto`，再根据显存和实测结果调整。
 
-Linux系统可尝试直接pip安装，命令如下：
-```
-pip install ftllm -U
-```
-若安装失败则参考[源码安装](../README.md#安装)
+## API Server 快速启动
 
-### 运行示例
+~~~bash
+ftllm server /data/models/qwen \
+  --model_name qwen \
+  --host 0.0.0.0 --port 8080
+~~~
 
-#### 命令行聊天：
+FastLLM 会根据模型配置选择默认精度和设备。生产部署建议显式设置 `--model_name`、`--max_batch`、上下文上限和显存比例。
 
-```
-ftllm run fastllm/Qwen3-235B-A22B-INT4MIX
-ftllm run Qwen/Qwen3-30B-A3B
-```
+## 按设备选择启动命令
 
-#### webui:
+### 单张 NVIDIA GPU
 
-```
-ftllm webui fastllm/Qwen3-235B-A22B-INT4MIX
-ftllm webui Qwen/Qwen3-30B-A3B
-```
+适合能完整放入显存的稠密或量化 checkpoint：
 
-#### api server (openai风格):
+~~~bash
+ftllm server /data/models/qwen \
+  --device cuda \
+  --max_batch 8 \
+  --gpu_mem_ratio 0.9
+~~~
 
-```
-ftllm server fastllm/Qwen3-235B-A22B-INT4MIX
-ftllm server Qwen/Qwen3-30B-A3B
-```
+### 多张 NVIDIA GPU 张量并行
 
-#### 参数建议
+~~~bash
+ftllm server /data/models/qwen \
+  --device cuda --tp 0,1 \
+  --cuda_embedding \
+  --max_batch 16 \
+  --gpu_mem_ratio 0.9
+~~~
 
-如有需要，可以将以下参数可以加在运行命令中
+`--tp 0,1` 显式选择两张卡；也可以用 `--tp 2` 表示前两张可见 GPU。具体模型支持的并行路径和显存容量需要在目标机器上验证。
 
-- 硬思考模式: 千问3的独有模式，该模式默认打开，可以通过enable_thinking参数来关闭，关闭后模型将不生成思考。例如
+### GPU + NUMA 混合 MoE
 
-```bash
-ftllm server Qwen/Qwen3-30B-A3B --enable_thinking false
-```
+适合专家权重无法全部放入显存的 MoE checkpoint：
 
-- 推理设备: 非MOE模型默认使用显卡推理，若显存容量不足希望使用纯CPU推理，可以设置`--device cpu`, 或`--device numa`使用多路numa加速
-- 量化: Qwen3系列模型目前建议使用参数`--dtype int4g256`指定4bit量化，`--dtype int8`指定8bit量化
+~~~bash
+ftllm server /data/models/qwen-moe \
+  --device cuda --moe_device numa \
+  --chunked_prefill_size 8192 \
+  --gpu_mem_ratio 0.9
+~~~
 
+如果机器只有单路 CPU，可将 `--moe_device` 改为 `cpu`。NUMA 模式下线程数默认自动选择，也可以通过 `-t` 调整。
 
-- MOE模型（Qwen3-30B-A3B, Qwen3-235B-A22B）默认使用cpu+gpu混合推理，若希望使用cuda推理需要指定device参数，例如
-``` bash
-ftllm server Qwen/Qwen3-30B-A3B --device cuda --dtype int4g256
-ftllm server Qwen/Qwen3-30B-A3B --device cuda --dtype int8
-```
+### CPU / NUMA
 
-- 更多参数信息可参考 [常用参数](../README.md#常用参数)
+~~~bash
+# 单路 CPU
+ftllm server /data/models/qwen \
+  --device cpu -t 32
 
-#### NUMA加速
+# 多路 NUMA
+ftllm server /data/models/qwen \
+  --device numa -t 64
+~~~
 
-若想使用单NUMA节点，建议用numactl绑定numa节点
+线程数应结合物理核心数和内存带宽实测，不建议直接照搬示例值。
 
-可以设定环境变量来激活多NUMA节点加速（PIP版本可直接激活，源码安装时需要在编译时加入-DUSE_NUMAS=ON选项）
+## 长上下文与缓存
 
-```
-export FASTLLM_ACTIVATE_NUMA=ON
-# export FASTLLM_NUMA_THREADS=27 # 选用，这个变量用于设定每个numa节点开启的线程数
-```
+~~~bash
+ftllm server /data/models/qwen \
+  --max_context_length 131072 \
+  --chunked_prefill_size 8192 \
+  --prefix_cache true \
+  --gpu_mem_ratio 0.9
+~~~
 
-#### 本地模型
+`--max_context_length` 是输入与输出合计上限。实际值还受模型原生上下文和 KV Cache 容量限制，可从 `/v1/models` 查询。
 
-可以启动本地下载好的模型（支持原始模型，AWQ模型，FASTLLM模型，暂不支持GGUF模型），假设本地模型路径为 `/mnt/Qwen/Qwen3-30B-A3B`
-则可以用如下命令启动（webui, server类似）
+## MTP
 
-```
-ftllm run /mnt/Qwen/Qwen3-30B-A3B
-```
+对于包含兼容 MTP 权重的模型：
 
-### 模型下载
+~~~bash
+ftllm server /data/models/qwen-with-mtp \
+  --device cuda --mtp 4
+~~~
 
-可以使用如下命令将模型下载到本地
+`--mtp` 设置每轮 draft token 数，`0` 表示关闭，当前最大为 8。MTP 并不只属于某一个 Qwen 版本，是否可用取决于模型结构和 checkpoint。
 
-```
-ftllm download Qwen/Qwen3-30B-A3B
-```
+## Qwen3.8 DFlash2
+
+DFlash2 需要独立的 draft checkpoint：
+
+~~~bash
+ftllm server /data/models/qwen3.8-27b-fp8 \
+  --model_name qwen3.8 \
+  --tp 2 --cuda_embedding \
+  --max_batch 1 \
+  --speculative_algorithm dflash \
+  --speculative_draft_model_path /data/models/qwen3.8-27b-dflash2 \
+  --speculative_num_draft_tokens 8
+~~~
+
+当前推荐使用 draft checkpoint 的原生 block 大小。完整复现方式与实测速度见 [Qwen3.8 DFlash2 Benchmark](benchmarks/qwen38_27b_dflash2.md)。
+
+## 思考与工具调用
+
+~~~bash
+# 关闭模型的 thinking 模板
+ftllm server /data/models/qwen --enable_thinking false
+
+# 自动选择工具调用解析器
+ftllm server /data/models/qwen --tool_call_parser auto
+~~~
+
+API 请求也可以通过 `chat_template_kwargs.enable_thinking` 按请求控制思考模式。工具调用能力取决于具体 Instruct checkpoint 和 chat template。
+
+## Benchmark
+
+- [Qwen3.6-27B-FP8 双 RTX 5090 TP2](benchmarks/qwen36_27b_fp8.md)
+- [Qwen3.8-27B DFlash2 / MTP 双 RTX 5090](benchmarks/qwen38_27b_dflash2.md)
+- [通用 Benchmark 入口](benchmark.md)
+
+速度只对文档中记录的模型、精度、硬件、batch 和上下文口径有效。

@@ -1,5 +1,7 @@
 # Qwen4-Exp / Qwen3.8-Flash-Next FP8
 
+[中文部署指南](qwen4.md) · [Back to README](../README_EN.md) · [Benchmark](benchmarks/qwen4_exp_en.md)
+
 FastLLM supports the Qwen4-Exp text decoder stored by the released
 `Qwen4ExpForConditionalGeneration` checkpoint.  The implementation is isolated
 in `src/models/qwen4_exp.cpp`; vision and MTP tensors in the composite

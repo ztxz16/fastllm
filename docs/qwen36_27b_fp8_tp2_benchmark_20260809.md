@@ -1,5 +1,7 @@
 # Qwen3.6-27B-FP8 双卡 TP2 推理性能对比
 
+[Benchmark 摘要](benchmarks/qwen36_27b_fp8.md) · [部署指南](qwen3.md)
+
 - 测试日期：2026-08-09
 - 硬件：2 × NVIDIA GeForce RTX 5090（每卡 32607 MiB，PCIe PIX，无 NVLink）
 - 模型：`/root/hfmodels/Qwen3.6-27B-FP8`
