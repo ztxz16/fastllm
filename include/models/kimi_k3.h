@@ -212,6 +212,7 @@ namespace fastllm {
 
         bool dsparkEnabled = false;
         int dsparkBlockSize = 0;
+        int dsparkDraftTokens = 0;
         int dsparkLayers = 0;
         int dsparkHeads = 0;
         int dsparkKvHeads = 0;

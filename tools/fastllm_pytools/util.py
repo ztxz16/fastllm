@@ -525,15 +525,18 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help = "全局最多保留的前缀缓存快照数，对应 FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_RECORDS")
     parser.add_argument("--gpu_mem_ratio", type = float, default = 0.9, help = "GPU显存使用比例，如0.9表示使用90%%的显存")
     parser.add_argument("--cuda_slab", type = int, default = 0, help = "CUDA模型权重slab大小（MB），0表示关闭")
-    parser.add_argument("--mtp", type = int, default = 0, help = "Qwen3.5 MTP每步生成的draft token数，0表示关闭（默认），当前最大8")
+    parser.add_argument("--mtp", type = int, default = 0, help = "支持MTP的模型每步生成的draft token数，0表示关闭（默认），当前最大8")
     parser.add_argument("--dspark", type = int, default = 0,
                         help = "启用模型内置 DSpark，并指定每轮 draft token 数；例如 --dspark 7")
     parser.add_argument("--speculative_algorithm", "--speculative-algorithm",
                         dest = "speculative_algorithm", type = str, default = "",
                         help = "投机解码算法；当前支持 dspark、dflash")
-    parser.add_argument("--speculative_draft_model_path", "--speculative-draft-model-path", "--dspark_model",
+    parser.add_argument("--speculative_draft_model_path", "--speculative-draft-model-path",
+                        "--draft", "--draft_model_path", "--dspark_model",
                         dest = "speculative_draft_model_path", type = str, default = "",
                         help = "DSpark/DFlash draft model 的 Hugging Face 目录")
+    parser.add_argument("--draft_tokens", type = _positive_int, default = -1,
+                        help = "每轮最多使用的 draft token 数；未指定时读取 draft 配置")
     parser.add_argument("--speculative_num_draft_tokens", "--speculative-num-draft-tokens",
                         dest = "speculative_num_draft_tokens", type = int, default = -1,
                         help = "DFlash 每轮 block token 数（含 anchor），默认读取 draft config")
@@ -616,6 +619,7 @@ def make_normal_llm_model(args, startup_progress = None):
         getattr(args, "speculative_algorithm", "") or "").strip().lower()
     speculative_draft_path = str(
         getattr(args, "speculative_draft_model_path", "") or "").strip()
+    draft_tokens = int(getattr(args, "draft_tokens", -1))
     dspark_tokens = int(getattr(args, "dspark", 0) or 0)
     if dspark_tokens < 0:
         raise ValueError("--dspark must be >= 0")
@@ -638,6 +642,15 @@ def make_normal_llm_model(args, startup_progress = None):
             speculative_algorithm = (
                 "dflash" if "DFlash2DraftModel" in draft_architectures
                 else "dspark")
+    if draft_tokens > 0 and not speculative_algorithm and not speculative_draft_path:
+        speculative_algorithm = "dspark"
+    if (speculative_algorithm == "dspark" and not speculative_draft_path and
+            draft_tokens > 0):
+        if dspark_tokens > 0 and dspark_tokens != draft_tokens:
+            raise ValueError(
+                "--draft_tokens and --dspark specify different token counts")
+        dspark_tokens = draft_tokens
+        args.dspark = dspark_tokens
     if speculative_algorithm and speculative_algorithm not in ("dspark", "dflash"):
         raise ValueError(
             "--speculative_algorithm currently supports dspark or dflash")
@@ -662,8 +675,21 @@ def make_normal_llm_model(args, startup_progress = None):
         configured_block = int(dflash_config.get("block_size", 0))
         requested_block = int(
             getattr(args, "speculative_num_draft_tokens", -1))
+        if draft_tokens > 0:
+            draft_block = draft_tokens + 1
+            if requested_block > 0 and requested_block != draft_block:
+                raise ValueError(
+                    "--draft_tokens and --speculative_num_draft_tokens "
+                    "specify different DFlash block sizes")
+            requested_block = draft_block
         if requested_block <= 0:
             requested_block = configured_block
+        if (draft_tokens > 0 and
+                not 1 <= draft_tokens < configured_block):
+            raise ValueError(
+                "DFlash --draft_tokens must be in [1, checkpoint block_size - 1] "
+                "(requested=%d, checkpoint block_size=%d)" %
+                (draft_tokens, configured_block))
         if configured_block < 2 or not 2 <= requested_block <= configured_block:
             raise ValueError(
                 "DFlash block tokens must be in [2, checkpoint block_size] "
@@ -694,7 +720,15 @@ def make_normal_llm_model(args, startup_progress = None):
                 "FastLLM currently requires the DSpark runtime block size "
                 "to match the checkpoint (requested=%d, checkpoint=%d)" %
                 (requested_block, configured_block))
+        if (draft_tokens > 0 and
+                not 1 <= draft_tokens <= configured_block):
+            raise ValueError(
+                "DSpark --draft_tokens must be in [1, checkpoint block_size] "
+                "(requested=%d, checkpoint block_size=%d)" %
+                (draft_tokens, configured_block))
         os.environ["FASTLLM_DSPARK_MODEL_PATH"] = speculative_draft_path
+        if draft_tokens > 0:
+            os.environ["FASTLLM_DSPARK_TOKENS"] = str(draft_tokens)
         confidence_threshold = float(getattr(
             args, "speculative_dspark_confidence_threshold", 0.5))
         if not 0.0 <= confidence_threshold <= 1.0:
@@ -807,7 +841,7 @@ def make_normal_llm_model(args, startup_progress = None):
                         model_type == "deepseek_v4")
                     if not is_deepseek_v4:
                         raise ValueError(
-                            "--dspark N requires a DeepSeek-V4 checkpoint with "
+                            "Embedded DSpark requires a DeepSeek-V4 checkpoint with "
                             "embedded mtp.* DSpark weights, got architecture=%s "
                             "model_type=%s" % (architecture, model_type))
                     checkpoint_block = int(config.get(
@@ -822,7 +856,7 @@ def make_normal_llm_model(args, startup_progress = None):
                             "configuration")
                     if dspark_tokens < checkpoint_block:
                         raise ValueError(
-                            "--dspark must be at least the checkpoint training "
+                            "DSpark draft tokens must be at least the checkpoint training "
                             "block size (requested=%d, checkpoint=%d)" %
                             (dspark_tokens, checkpoint_block))
             elif speculative_algorithm == "dflash":

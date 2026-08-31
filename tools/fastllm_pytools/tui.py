@@ -311,7 +311,7 @@ FIELDS: Sequence[FormField] = (
         "分块 prefill 的切片大小；调小可以减少显存占用，auto 表示不指定。",
     ),
     FormField("kv_cache_dtype", "缓存类型", "choice", "KV Cache 类型，可使用 auto、float16、bfloat16 或 fp8。", KV_CACHE_DTYPE_CHOICES),
-    FormField("mtp", "MTP", "text", "Qwen3.5 MTP 每步生成的 draft token 数；0 表示关闭，1-8 开启，auto 表示不指定。"),
+    FormField("mtp", "MTP", "text", "支持 MTP 的模型每步生成的 draft token 数；0 表示关闭，1-8 开启，auto 表示不指定。"),
     FormField("max_batch", "最大Batch", "text", "每次最多同时推理的询问数量；auto 表示不指定。"),
     FormField(
         "max_context_length",

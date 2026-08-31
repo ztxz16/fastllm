@@ -393,6 +393,18 @@ namespace fastllm {
                        (float)atof(it->second.c_str());
             };
             dsparkBlockSize = dsparkRequiredInt("block_size");
+            dsparkDraftTokens = dsparkBlockSize;
+            const char *draftTokensEnv =
+                std::getenv("FASTLLM_DSPARK_TOKENS");
+            if (draftTokensEnv != nullptr && draftTokensEnv[0] != '\0') {
+                char *end = nullptr;
+                long parsed = std::strtol(draftTokensEnv, &end, 10);
+                AssertInFastLLM(
+                    end != draftTokensEnv && *end == '\0' && parsed >= 1 &&
+                        parsed <= dsparkBlockSize,
+                    "FASTLLM_DSPARK_TOKENS must be in [1, DSpark block_size].");
+                dsparkDraftTokens = (int)parsed;
+            }
             dsparkLayers = dsparkRequiredInt("num_hidden_layers");
             dsparkHeads = dsparkRequiredInt("num_attention_heads");
             dsparkKvHeads = dsparkRequiredInt("num_key_value_heads");
@@ -812,6 +824,7 @@ namespace fastllm {
             }
             std::cout << "[Kimi-K3] DSpark enabled: 5-layer BF16 draft, "
                       << "block=" << dsparkBlockSize
+                      << ", draft_tokens=" << dsparkDraftTokens
                       << ", target hidden layers=[7,23,51,67,83].\n";
             std::cout << "[Kimi-K3] Reusable history cache uses aligned "
                       << "target + DSpark prefill snapshots.\n";
@@ -1944,7 +1957,7 @@ namespace fastllm {
         auto &entry = dsparkContexts[key];
         if (entry == nullptr) {
             entry.reset(new DsparkContext());
-            entry->adaptiveDraftLimit = dsparkBlockSize;
+            entry->adaptiveDraftLimit = dsparkDraftTokens;
             entry->draftKeyValues.resize(dsparkLayers);
             entry->kdaSnapshots.resize(block_cnt);
             entry->replay.resize(block_cnt);
@@ -2237,7 +2250,7 @@ namespace fastllm {
         restored->initialized = true;
         restored->committedTokens = (int)memory.inputTokens.size();
         restored->adaptiveDraftLimit = std::max(
-            1, std::min(dsparkBlockSize, memory.adaptiveDraftLimit));
+            1, std::min(dsparkDraftTokens, memory.adaptiveDraftLimit));
         restored->draftKeyValues.resize(dsparkLayers);
         for (int index = 0; index < dsparkLayers; index++) {
             restored->draftKeyValues[index].first.CopyFrom(
@@ -2630,17 +2643,17 @@ namespace fastllm {
         // making the policy configurable, this gives correctness/performance
         // regressions a byte-for-byte equivalent of the original path.
         if (dsparkConfidenceThreshold <= 0.0f) {
-            return dsparkBlockSize;
+            return dsparkDraftTokens;
         }
 
         int confidenceLimit = 0;
-        while (confidenceLimit < dsparkBlockSize &&
+        while (confidenceLimit < dsparkDraftTokens &&
                proposal.confidence[confidenceLimit] >=
                    dsparkConfidenceThreshold) {
             confidenceLimit++;
         }
         const int rollingLimit = std::max(
-            1, std::min(dsparkBlockSize, context.adaptiveDraftLimit));
+            1, std::min(dsparkDraftTokens, context.adaptiveDraftLimit));
         return std::min(confidenceLimit, rollingLimit);
     }
 
@@ -2660,7 +2673,7 @@ namespace fastllm {
             context.adaptiveDraftLimit = std::max(1, acceptedDrafts + 1);
         } else if (verifyDrafts >= context.adaptiveDraftLimit) {
             context.adaptiveDraftLimit = std::min(
-                dsparkBlockSize, context.adaptiveDraftLimit + 1);
+                dsparkDraftTokens, context.adaptiveDraftLimit + 1);
         }
     }
 
