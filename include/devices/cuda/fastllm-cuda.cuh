@@ -1899,6 +1899,7 @@ int FastllmCudaGetDeviceCount();
 /* CUDA kernel declarations (shared by linear/ggml/attention .cu files) */
 extern __global__ void FastllmCudaFloat2HalfKernel(float* a, half *b, int len);
 extern __global__ void FastllmCudaHalf2FloatKernel(half* a, float *b, int len);
+extern __global__ void FastllmAddToKernel(half* a, half *b, half alpha, int len);
 extern __global__ void FastllmCudaBF162FloatKernel(uint16_t* a, float *b, int len);
 extern __global__ void FastllmCudaBiasKernel(float *a, float *bias, int k);
 extern __global__ void FastllmCudaBiasKernel(half *a, half *bias, int k);

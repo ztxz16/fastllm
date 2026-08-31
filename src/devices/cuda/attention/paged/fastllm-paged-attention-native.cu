@@ -2656,7 +2656,11 @@ bool FastllmCudaHalfPagedAttentionBatchFastllmFallback(
         return FastllmCudaHalfPagedAttentionBatchCapturable(
             q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens, output, group, scale);
     }
-    bool useChunkedCublasPrefill = !isDecode;
+    // The chunked cuBLAS path is tuned around the SM70+ FP16 execution model.
+    // Pascal (SM60) has no tensor cores and can fail inside the grouped/native
+    // prefill sequence before cuBLAS reports the originating kernel error, so
+    // retain the established gather + native-attention fallback there.
+    bool useChunkedCublasPrefill = !isDecode && FastllmCudaRuntimeArch() >= 70;
     if (useChunkedCublasPrefill) {
         static thread_local bool loggedChunkedCublasPrefill = false;
         if (!loggedChunkedCublasPrefill) {

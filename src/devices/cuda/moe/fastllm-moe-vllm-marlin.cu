@@ -816,14 +816,32 @@ __device__ __forceinline__ size_t AwqMarlinWeightTileBase(
 }
 
 __device__ __forceinline__ half2 AwqDecodeZeroHalf2(int zero) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+    return __floats2half2_rn((float)zero, (float)zero);
+#else
     const uint32_t scalar = (uint32_t)(0x6400 + zero);
     const uint32_t packed = scalar | (scalar << 16);
     return *reinterpret_cast<const half2 *>(&packed);
+#endif
 }
 
 __device__ __forceinline__ void AwqMarlinAccumulatePackedPair(
         uint32_t packed, half2 inputLow, half2 inputHigh,
         half2 zero0, half2 zero1, half2 &sum0, half2 &sum1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+    const half2 quant00 = __floats2half2_rn(
+        (float)((packed >> 0) & 15), (float)((packed >> 16) & 15));
+    const half2 quant01 = __floats2half2_rn(
+        (float)((packed >> 4) & 15), (float)((packed >> 20) & 15));
+    const half2 quant10 = __floats2half2_rn(
+        (float)((packed >> 8) & 15), (float)((packed >> 24) & 15));
+    const half2 quant11 = __floats2half2_rn(
+        (float)((packed >> 12) & 15), (float)((packed >> 28) & 15));
+    sum0 = __hfma2(inputLow, __hsub2(quant00, zero0), sum0);
+    sum0 = __hfma2(inputHigh, __hsub2(quant01, zero0), sum0);
+    sum1 = __hfma2(inputLow, __hsub2(quant10, zero1), sum1);
+    sum1 = __hfma2(inputHigh, __hsub2(quant11, zero1), sum1);
+#else
     half2 quant0[2];
     half2 quant1[2];
     marlin_kernel::dequant<
@@ -836,6 +854,7 @@ __device__ __forceinline__ void AwqMarlinAccumulatePackedPair(
     sum0 = __hfma2(inputHigh, __hsub2(quant0[1], zero0), sum0);
     sum1 = __hfma2(inputLow, __hsub2(quant1[0], zero1), sum1);
     sum1 = __hfma2(inputHigh, __hsub2(quant1[1], zero1), sum1);
+#endif
 }
 
 __device__ __forceinline__ float AwqHorizontalHalf2(half2 value) {

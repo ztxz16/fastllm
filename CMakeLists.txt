@@ -272,6 +272,22 @@ if (USE_CUDA)
     endif()
     message(STATUS "Effective CUDA architectures: ${FASTLLM_CUDA_ARCHITECTURES}")
     add_compile_definitions(USE_CUDA)
+    # FlashInfer requires sm_70+.  The CUDA host compilation pass does not set
+    # __CUDA_ARCH__, so a pure legacy build needs an explicit project-wide
+    # marker to keep FlashInfer headers out of that pass as well.
+    set(FASTLLM_CUDA_LEGACY_ONLY ON)
+    foreach(FASTLLM_CUDA_ARCH IN LISTS FASTLLM_CUDA_ARCHITECTURES)
+        string(REGEX MATCH "^[0-9]+" FASTLLM_CUDA_ARCH_NUMBER
+            "${FASTLLM_CUDA_ARCH}")
+        if (FASTLLM_CUDA_ARCH_NUMBER STREQUAL "" OR
+            FASTLLM_CUDA_ARCH_NUMBER GREATER_EQUAL 70)
+            set(FASTLLM_CUDA_LEGACY_ONLY OFF)
+        endif()
+    endforeach()
+    if (FASTLLM_CUDA_LEGACY_ONLY)
+        message(STATUS "FlashInfer kernels: OFF (all CUDA architectures are below sm_70)")
+        add_compile_definitions(FASTLLM_CUDA_LEGACY_ONLY)
+    endif()
     if (CUDA_NO_TENSOR_CORE)
         add_compile_definitions(CUDA_NO_TENSOR_CORE)
     endif()

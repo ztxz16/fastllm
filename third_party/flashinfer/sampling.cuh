@@ -37,8 +37,22 @@
 #include "utils.cuh"
 #include "vec_dtypes.cuh"
 
-using MaxReduceOp = cuda::maximum<>;
-using MinReduceOp = cuda::minimum<>;
+// cuda::maximum/minimum are absent from CCCL 2.7 (CUDA 12.8), while the old
+// cub::Max/Min aliases are absent from newer CCCL releases. Keep these tiny
+// operators local so the vendored sampling kernels build with both layouts.
+struct MaxReduceOp {
+  template <typename T>
+  __host__ __device__ constexpr T operator()(const T& lhs, const T& rhs) const {
+    return lhs < rhs ? rhs : lhs;
+  }
+};
+
+struct MinReduceOp {
+  template <typename T>
+  __host__ __device__ constexpr T operator()(const T& lhs, const T& rhs) const {
+    return rhs < lhs ? rhs : lhs;
+  }
+};
 
 namespace flashinfer {
 
