@@ -7,10 +7,10 @@ all_require = server_require + webui_require + download_require
 
 setup (
     name = "ftllm_rocm",
-    version = "0.1.7.1",
+    version = "0.1.8.0",
     author = "huangyuyang",
     author_email = "ztxz16@foxmail.com",
-    description = "Fastllm",
+    description = "High-performance C++ inference engine for dense and MoE language models",
     url = "https://github.com/ztxz16/fastllm",
     entry_points = {
         'console_scripts' : [

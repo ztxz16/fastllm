@@ -180,10 +180,11 @@ ftllm server /data/models/deepseek-v4 --dspark 7
 # Qwen3.8 with a separate DFlash2 draft checkpoint
 ftllm server /data/models/qwen3.8 \
   --tp 2 \
-  --speculative_algorithm dflash \
-  --speculative_draft_model_path /data/models/qwen3.8-dflash2 \
-  --speculative_num_draft_tokens 8
+  --draft /data/models/qwen3.8-dflash2 \
+  --draft_tokens 7
 ~~~
+
+`--draft` detects DFlash2 or DSpark from the draft checkpoint. If `--draft_tokens` is omitted, the checkpoint default is used. For DFlash2, `--draft_tokens` counts actual draft tokens and excludes the anchor token.
 
 See the [Qwen3.8 DFlash2 report](docs/dflash2_qwen38_27b_tp2_20260819.md) for the complete configuration and validation results.
 
@@ -242,9 +243,8 @@ The CLI evolves continuously, so `ftllm <command> --help` is authoritative for t
 | `--enable_thinking` | Control the model's thinking template when supported |
 | `--mtp` | Draft tokens per step for models with MTP support; `0` disables it and the current maximum is 8 |
 | `--dspark` | Enable embedded DSpark and set draft tokens per step |
-| `--speculative_algorithm` | External speculative algorithm; currently `dspark` or `dflash` |
-| `--speculative_draft_model_path` | External DSpark or DFlash draft-model directory |
-| `--speculative_num_draft_tokens` | DFlash block size; defaults to the draft configuration |
+| `--draft` / `--draft_model_path` | External DSpark or DFlash draft-model directory; the algorithm is detected from the checkpoint |
+| `--draft_tokens` | Maximum draft tokens per step; defaults to the draft configuration |
 | `--tool_call_parser` | Tool-call parser; defaults to `auto` |
 | `--chat_template` | Custom Jinja chat-template file |
 | `--cache_dir` | Local cache directory for online models |

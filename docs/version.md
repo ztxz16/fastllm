@@ -1,3 +1,53 @@
+# 版本日志
+
+[English](version_en.md)
+
+## V0.1.8.0
+
+### 新模型与推理能力
+
+- 支持 Qwen4-Exp / Qwen3.8-Flash-Next FP8 文本模型，覆盖四路超连接、Gated DeltaNet、QSA 稀疏注意力、PLE ngram 和 FP8 MoE；当前支持文本解码，不加载视觉和 MTP 权重
+- 完善 Qwen4 CPU、CUDA 和 NUMA 混合推理、长上下文与前缀缓存、预填充和解码融合算子及 CUDA Graph；新增 `--ngram_device disk`，可从磁盘按需读取超大 PLE 表以降低主机内存占用
+- 支持 Kimi-K3，覆盖 CUDA、NUMA、CPU/GPU 专家并行、磁盘专家、KDA/MLA 分块预填充、DSpark、XTML 服务协议及工具调用
+- 支持 Dots3-Note，加入 DSA 索引、稀疏注意力、长上下文缓存、分块预填充、思考模式及工具调用
+- 支持 GLM-5.3-Flash，加入 KDA、分页历史缓存、压缩分页注意力、NUMA 解码流水及思考和工具调用协议
+- 新增 GLM-5 DSA 模型支持，并支持 GLM-5.2 量化 KV-B 的纯 CPU 推理
+- 支持 Laguna 模型及长上下文缓存，完善 CUDA Graph、八卡张量并行、混合 MoE、NVFP4 和 INT4_GROUP32 推理
+- 新增 HY-V3 模型及工具调用解析，并支持 Poolside V1 工具调用协议
+- 为 Qwen3.8/Qwen3.5 架构接入 DFlash2 投机解码，支持独立 draft checkpoint、rejection sampling、批量解码、双卡张量并行、长上下文、前缀快照和紧凑 INT4 draft 权重；双卡等权 CUDA 部署会自动启用 DFlash2 backbone TP
+- 为 DeepSeek-V4 接入模型内置 DSpark，并为 Kimi-K3 支持外部 DSpark draft 模型；统一 DSpark/DFlash2 草稿参数，新增 `--dspark`、`--draft` / `--draft_model_path` 和 `--draft_tokens` 简写，同时保留 `--speculative_*` 完整参数
+- 继续优化 Qwen3.5 MTP，支持 MoE MTP，改善批量状态备份、八 token 验证快照、并发调度和长 KV 验证性能
+
+### 性能与后端
+
+- 系统优化 Qwen3.5 的路由、FP8 MoE、RMSNorm、GDN、预填充和解码融合；符合条件的 CUDA 张量并行部署会自动启用 CUDA Graph、GPU Token Handoff 和 CUDA Embedding 快速路径
+- 将 Qwen3.5 默认分块 Prefill 大小调整为 2048
+- 深化 DeepSeek-V4 CUDA、CPU 和 NUMA 推理，加入多卡完整图执行、SM120 稀疏 MLA、路由、MoE 与 WoA 加速，并优化压缩缓存和混合 NUMA MoE 流水
+- 优化 Dots3 稀疏预填充、FP8 索引器和长 KV 搬运，优化 Kimi-K3 KDA/MLA 缓存与分块预填充，以及 GLM-5.3-Flash NUMA 解码流水
+- 新增 CUDA Q2_K GGUF、AWQ MoE Marlin、NVFP4 Marlin 张量并行、SM75+ FP8 dense Marlin、SM89 FP8 CUTLASS 自动择优及紧凑 NVFP4 CUDA/NUMA 回退
+- 支持 compressed-tensors `pack-quantized` 非对称 INT4 checkpoint，统一转换为可移植的 `INT4_GROUP` 权重，覆盖 CPU、CUDA 与多卡 TP，并补齐 TFACC 元数据兼容
+- 优化 INT4_GROUP、FP8、NVFP4、MXFP4、Q8_0/Q8_K 等量化格式在 CUDA、CPU、NUMA 和多卡场景下的加载、计算及显存使用
+- 优化自定义 AllReduce 自动选择、多卡图内通信、无 P2P 跨卡回退、CUDA Graph 显存复用及分页缓存调度
+- 优化分页注意力预填充和 SM70/SM75 D256 GQA 解码，支持磁盘流式执行 Linear 和 Embedding，并将 FlashInfer 更新至 `v0.6.16.post1`
+
+### 服务与接口
+
+- 新增 `--max_context_length` / `--max-context-length`，限制单会话输入与输出总长度；`/v1/models` 同时返回模型上下文、实际上下文、KV Cache 容量和配置上限
+- 新增 `--startup-progress ndjson`，通过标准错误输出模型加载、权重读取、预热和服务就绪进度
+- OpenAI Chat Completions、Responses API 和 Anthropic API 使用运行时原生 token 统计，返回缓存命中、未命中输入 token 和实际输出 token
+- 为 Qwen3.5、Qwen4-Exp、Kimi-K3、Dots3 和 GLM-5.3-Flash 完善 reasoning effort，并正确拆分流式和非流式 `reasoning_content`
+- 新增或完善 GLM、HY-V3、Kimi-K3、Dots3、Qwen4-Exp 和 Poolside V1 工具调用解析，改进 `tool_choice=required`、参数约束和跨分片流式解析
+- 改进 Fastllm Studio 的模型部署、启动参数、运行状态、模型选择和本地聊天界面
+
+### 稳定性与兼容性
+
+- 修复流式请求句柄复用竞态、提前终止后的资源释放、停止词约束、最小输出长度和缓存用量统计问题
+- 修复前缀缓存恢复、低 KV 预算调度、CUDA Graph KV 定容、图捕获期间通信、显存池复用和多卡量化权重拆分问题
+- 修复 DeepSeek-V4 多卡缓存恢复、纯 CPU/非 CUDA 构建、NUMA 退出卡死和双卡串行解码，以及 Qwen3.5 GGUF 合并、多卡采样和服务预热显存估算问题
+- 完善 SM60/Pascal 的纯旧架构 CUDA 构建、原生分页注意力预填充和 AWQ Marlin 兼容回退，并适配不同 CCCL 版本的采样算子接口
+- 修复 AWQ、GGUF MoE、FP8 Marlin/CUTLASS、NUMA FP8 MoE、Q8_K 和 YaRN 等量化精度或跨平台兼容性问题
+- 补充新模型、量化算子、CUDA Graph、MoE、多卡、工具调用和 API 回归测试，以及 logits 对齐、NCCL、HLE 和性能分析工具
+
 ## V0.1.7.1
 
 - 完善Qwen3.5 MTP解码，支持多卡、批量和非贪婪采样，支持FP8草稿头
@@ -7,7 +57,6 @@
 - 优化Qwen3 FP8 MLP融合路径
 - 完善auto模式下的FP8权重识别、NVFP4权重加载及多卡切分，优化NVFP4单Token GEMV，修复FP8多卡缩放因子切分
 - 支持OpenAI Responses API
-- API server支持`--max_context_length`限制单会话上下文，并在`/v1/models`返回模型、KV Cache及实际上下文容量
 - 完善工具调用解析和流式、非流式校验，支持tool_choice、strict参数校验以及工具名和参数名生成约束
 - 修复多种工具流解析状态及聊天结束原因，补充DeepSeek V4等工具调用回归和手动测试
 - 修复think模式下KV Cache复用失败，以及CPU Qwen3数据类型、重复输出和乱码问题

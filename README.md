@@ -180,10 +180,11 @@ ftllm server /data/models/deepseek-v4 --dspark 7
 # Qwen3.8 + 独立 DFlash2 draft checkpoint
 ftllm server /data/models/qwen3.8 \
   --tp 2 \
-  --speculative_algorithm dflash \
-  --speculative_draft_model_path /data/models/qwen3.8-dflash2 \
-  --speculative_num_draft_tokens 8
+  --draft /data/models/qwen3.8-dflash2 \
+  --draft_tokens 7
 ~~~
+
+`--draft` 会根据 draft checkpoint 自动识别 DFlash2 或 DSpark；省略 `--draft_tokens` 时使用 checkpoint 默认值。DFlash2 的 `--draft_tokens` 表示实际 draft token 数，不包含 anchor token。
 
 DFlash2 的完整配置和验证结果见 [Qwen3.8 DFlash2 文档](docs/dflash2_qwen38_27b_tp2_20260819.md)。
 
@@ -246,9 +247,8 @@ CLI 会持续演进，`ftllm <command> --help` 是当前安装版本的最终依
 | `--enable_thinking` | 控制模型的思考模板开关，需要模型支持 |
 | `--mtp` | 支持 MTP 的模型每轮生成的 draft token 数，`0` 关闭，当前最大为 8 |
 | `--dspark` | 启用模型内置 DSpark，并设置每轮 draft token 数 |
-| `--speculative_algorithm` | 外部投机解码算法，当前支持 `dspark`、`dflash` |
-| `--speculative_draft_model_path` | 外部 DSpark/DFlash draft 模型目录 |
-| `--speculative_num_draft_tokens` | DFlash block token 数；默认读取 draft 配置 |
+| `--draft` / `--draft_model_path` | 外部 DSpark/DFlash draft 模型目录；根据 checkpoint 自动识别算法 |
+| `--draft_tokens` | 每轮最多使用的 draft token 数；未指定时读取 draft 配置 |
 | `--tool_call_parser` | 工具调用解析器；默认 `auto` |
 | `--chat_template` | 自定义 Jinja chat template 文件 |
 | `--cache_dir` | 在线模型的本地缓存目录 |
