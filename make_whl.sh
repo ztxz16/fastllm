@@ -45,7 +45,7 @@ echo "Using C++ compiler: ${CXX_COMPILER}"
 # cpu
 rm -rf CMakeCache.txt CMakeFiles
 cmake .. -DMAKE_WHL_X86=ON -DUSE_CUDA=OFF -DUSE_NUMAS=ON -DCMAKE_CXX_COMPILER="${CXX_COMPILER}"
-make fastllm_tools -j30
+make fastllm_tools -j20
 if [ $? != 0 ]; then
     exit -1
 fi
@@ -84,7 +84,7 @@ cmake .. \
     -DCMAKE_CUDA_HOST_COMPILER="${CXX_COMPILER}" \
     -DCMAKE_CUDA_COMPILER="${CUDA_COMPILER}" \
     -DCMAKE_CUDA_FLAGS="--split-compile=16"
-make fastllm_tools -j30
+make fastllm_tools -j20
 if [ $? != 0 ]; then
     exit -1
 fi
