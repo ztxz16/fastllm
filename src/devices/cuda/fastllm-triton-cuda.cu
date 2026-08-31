@@ -1157,11 +1157,25 @@ extern "C" int FastllmCudaRuntimeArch() {
     if (cudaGetDevice(&device) != cudaSuccess) {
         return 0;
     }
+    // Architecture probes sit on several hot-path feature gates.  In a
+    // multi-architecture wheel, unsupported backends still query the current
+    // device before falling back, so fetching cudaDeviceProp for every layer
+    // can serialize otherwise asynchronous decode work.  CUDA device
+    // capabilities are immutable for the lifetime of the process; cache them
+    // per host thread and per device while still allowing a failed query to be
+    // retried later.
+    static thread_local std::map<int, int> cachedArchByDevice;
+    auto cached = cachedArchByDevice.find(device);
+    if (cached != cachedArchByDevice.end()) {
+        return cached->second;
+    }
     cudaDeviceProp prop;
     if (cudaGetDeviceProperties(&prop, device) != cudaSuccess) {
         return 0;
     }
-    return prop.major * 10 + prop.minor;
+    int arch = prop.major * 10 + prop.minor;
+    cachedArchByDevice[device] = arch;
+    return arch;
 }
 
 extern "C" bool FastllmCudaTritonLinearFP8E4M3Block128(
