@@ -207,7 +207,7 @@ namespace fastllm {
         return arch > 0 && arch <= 75;
     }
 
-    static bool Qwen35DFlashTpValidatedTopology(
+    static bool Qwen35DFlashTpDefaultTopology(
             const std::vector<int> &devices,
             const std::map<int, int> &ratios) {
         if (devices.size() != 2) {
@@ -217,24 +217,7 @@ namespace fastllm {
             auto it = ratios.find(device);
             return it == ratios.end() ? 1 : std::max(1, it->second);
         };
-        if (ratioFor(devices[0]) != ratioFor(devices[1])) {
-            return false;
-        }
-
-        const int previousDevice = FastllmCudaGetDevice();
-        bool supported = true;
-        for (int device : devices) {
-            FastllmCudaSetDevice(device);
-            const int arch = FastllmCudaRuntimeArch();
-            if (arch <= 0 || arch > 75) {
-                supported = false;
-                break;
-            }
-        }
-        if (previousDevice >= 0) {
-            FastllmCudaSetDevice(previousDevice);
-        }
-        return supported;
+        return ratioFor(devices[0]) == ratioFor(devices[1]);
     }
 
     static bool Qwen35DFlashBackboneTpEnabledFor(
@@ -242,7 +225,7 @@ namespace fastllm {
             const std::map<int, int> &ratios) {
         return Qwen35DFlashBackboneTpRequested() && devices.size() > 1 &&
                (Qwen35DFlashBackboneTpForced() ||
-                Qwen35DFlashTpValidatedTopology(devices, ratios));
+                Qwen35DFlashTpDefaultTopology(devices, ratios));
     }
 #endif
 
@@ -357,6 +340,26 @@ namespace fastllm {
         }
         return *state.executor;
     }
+
+#ifdef USE_CUDA
+    class Qwen35ScopedMultiCudaAsyncDispatch {
+    public:
+        Qwen35ScopedMultiCudaAsyncDispatch()
+                : previous(MultiCudaSetPersistentAsyncDispatch(true)) {}
+
+        ~Qwen35ScopedMultiCudaAsyncDispatch() {
+            MultiCudaSetPersistentAsyncDispatch(previous);
+        }
+
+        Qwen35ScopedMultiCudaAsyncDispatch(
+                const Qwen35ScopedMultiCudaAsyncDispatch&) = delete;
+        Qwen35ScopedMultiCudaAsyncDispatch &operator=(
+                const Qwen35ScopedMultiCudaAsyncDispatch&) = delete;
+
+    private:
+        bool previous;
+    };
+#endif
 
     static bool Qwen35DFlashHasTpShards(
             const Data &data, const std::vector<int> &devices) {
@@ -24195,8 +24198,8 @@ namespace fastllm {
         dflashTpBackboneDecisionMade = true;
         if (!Qwen35DFlashBackboneTpEnabledFor(devices, ratios)) {
             std::printf(
-                "[Qwen3.5 DFlash2] backbone TP skipped: the safe "
-                "path is limited to two equal-ratio SM <= 75 GPUs; set "
+                "[Qwen3.5 DFlash2] backbone TP skipped: the default "
+                "path requires two equal-ratio GPUs; set "
                 "FASTLLM_CUDA_DFLASH_TP_BACKBONE=force before model load "
                 "to override.\n");
             std::fflush(stdout);
@@ -24405,6 +24408,10 @@ namespace fastllm {
         Executor &tpExecutor = Qwen35DFlashTpExecutor(
             dflashTpPreparedDevices, dflashTpPreparedRatios);
         Data swigluOutput, unusedScratch, gateupOutput;
+        // Ordered worker dispatch joins producer and completion streams with
+        // events. This avoids the generic per-MLP device synchronizations;
+        // the MultiCUDA MLP then defers replica reuse behind those waits.
+        Qwen35ScopedMultiCudaAsyncDispatch asyncDispatch;
         tpExecutor.Run(
             "MLP",
             {{"input", &input},
