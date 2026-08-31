@@ -177,9 +177,23 @@ namespace fastllm {
             buffer.WriteInt(data->group);
             buffer.WriteInt(data->groupCnt);
             int k = data->perChannelAxis == -1 ? 1 : data->dims[data->perChannelAxis];
-            for (int i = 0; i < k * data->group; i++) {
-                buffer.WriteFloat(data->perChannelsConfigs[i].min);
-                buffer.WriteFloat(data->perChannelsConfigs[i].scale);
+            const int configCount = k * data->group;
+            const bool hasConfigs =
+                data->perChannelsConfigs.size() == (size_t)configCount;
+            AssertInFastLLM(
+                hasConfigs ||
+                    (data->mins.size() == (size_t)configCount &&
+                     data->scales.size() == (size_t)configCount),
+                "RegisterFastllmData received incomplete INT4_GROUP metadata.");
+            for (int i = 0; i < configCount; i++) {
+                // Native/safetensors INT4_GROUP weights retain min and scale
+                // directly and deliberately need not materialize the legacy
+                // LowBitConfig mirror. Both representations describe the same
+                // affine dequantization consumed by TFACC.
+                buffer.WriteFloat(hasConfigs ?
+                    data->perChannelsConfigs[i].min : data->mins[i]);
+                buffer.WriteFloat(hasConfigs ?
+                    data->perChannelsConfigs[i].scale : data->scales[i]);
             }
             buffer.WriteBytes(data->cpuData, data->GetBytes());
         }

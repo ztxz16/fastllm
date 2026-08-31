@@ -849,6 +849,224 @@ namespace {
         }
     }
 
+    void WriteLagunaPackedAffineInt4Fixture(
+            const std::filesystem::path &path) {
+        const std::string config = R"JSON({
+            "model_type": "laguna",
+            "architectures": ["LagunaForCausalLM"],
+            "eos_token_id": 2,
+            "torch_dtype": "bfloat16",
+            "quantization_config": {
+                "format": "pack-quantized",
+                "quant_method": "compressed-tensors",
+                "config_groups": {
+                    "group_0": {
+                        "format": "pack-quantized",
+                        "weights": {
+                            "group_size": 32,
+                            "num_bits": 4,
+                            "strategy": "group",
+                            "symmetric": false,
+                            "type": "int",
+                            "zp_dtype": "torch.int8"
+                        }
+                    }
+                }
+            },
+            "num_hidden_layers": 1,
+            "hidden_size": 32,
+            "head_dim": 8,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 1,
+            "num_attention_heads_per_layer": [4],
+            "layer_types": ["full_attention"],
+            "intermediate_size": 32,
+            "moe_intermediate_size": 64,
+            "shared_expert_intermediate_size": 32,
+            "num_experts": 1,
+            "num_experts_per_tok": 1,
+            "max_position_embeddings": 32,
+            "sliding_window": 16
+        })JSON";
+        {
+            std::ofstream output(path / "config.json");
+            Expect(output.good(),
+                   "failed to create affine packed INT4 fixture config.");
+            output << config;
+        }
+
+        constexpr int rows = 32;
+        constexpr int columns = 64;
+        constexpr int groups = columns / 32;
+        constexpr int packedColumns = columns / 8;
+        constexpr int packedZeroRows = rows / 8;
+        const std::string prefix =
+            "model.layers.0.mlp.experts.0.down_proj";
+        const std::string packedName = prefix + ".weight_packed";
+        const std::string scaleName = prefix + ".weight_scale";
+        const std::string zeroName = prefix + ".weight_zero_point";
+        const std::string shapeName = prefix + ".weight_shape";
+        constexpr uint64_t lmHeadBytes =
+            2 * 32 * sizeof(uint16_t);
+        constexpr uint64_t packedBytes =
+            rows * packedColumns * sizeof(uint32_t);
+        constexpr uint64_t scaleBytes =
+            rows * groups * sizeof(uint16_t);
+        constexpr uint64_t zeroBytes =
+            packedZeroRows * groups * sizeof(uint32_t);
+        constexpr uint64_t shapeBytes = 2 * sizeof(int64_t);
+        const uint64_t packedBegin = lmHeadBytes;
+        const uint64_t scaleBegin = packedBegin + packedBytes;
+        const uint64_t zeroBegin = scaleBegin + scaleBytes;
+        const uint64_t shapeBegin = zeroBegin + zeroBytes;
+        std::string header =
+            "{\"lm_head.weight\":{\"dtype\":\"BF16\",\"shape\":[2,32],\"data_offsets\":[0," +
+            std::to_string(lmHeadBytes) + "]},\"" + packedName +
+            "\":{\"dtype\":\"I32\",\"shape\":[32,8],\"data_offsets\":[" +
+            std::to_string(packedBegin) + "," +
+            std::to_string(scaleBegin) + "]},\"" + scaleName +
+            "\":{\"dtype\":\"BF16\",\"shape\":[32,2],\"data_offsets\":[" +
+            std::to_string(scaleBegin) + "," +
+            std::to_string(zeroBegin) + "]},\"" + zeroName +
+            "\":{\"dtype\":\"I32\",\"shape\":[4,2],\"data_offsets\":[" +
+            std::to_string(zeroBegin) + "," +
+            std::to_string(shapeBegin) + "]},\"" + shapeName +
+            "\":{\"dtype\":\"I64\",\"shape\":[2],\"data_offsets\":[" +
+            std::to_string(shapeBegin) + "," +
+            std::to_string(shapeBegin + shapeBytes) + "]}}";
+        while (header.size() % 8 != 0) {
+            header.push_back(' ');
+        }
+
+        std::vector<uint16_t> lmHead(2 * 32, 0);
+        std::vector<uint32_t> packed(rows * packedColumns, 0);
+        for (int row = 0; row < rows; row++) {
+            for (int column = 0; column < columns; column++) {
+                const uint32_t storedValue =
+                    (uint32_t)((row * 3 + column * 5 + 1) & 15);
+                packed[row * packedColumns + column / 8] |=
+                    storedValue << ((column % 8) * 4);
+            }
+        }
+        std::vector<uint16_t> scales(rows * groups);
+        for (int row = 0; row < rows; row++) {
+            for (int group = 0; group < groups; group++) {
+                const float value =
+                    0.125f * (float)((row + group) % 7 + 1);
+                scales[row * groups + group] =
+                    fastllm::Float32ToBFloat16RNEBits(value);
+            }
+        }
+        std::vector<uint32_t> packedZeros(
+            packedZeroRows * groups, 0);
+        for (int row = 0; row < rows; row++) {
+            for (int group = 0; group < groups; group++) {
+                const uint32_t storedZero =
+                    (uint32_t)((row * 7 + group * 3 + 2) & 15);
+                packedZeros[(row / 8) * groups + group] |=
+                    storedZero << ((row % 8) * 4);
+            }
+        }
+        const int64_t originalShape[2] = {rows, columns};
+
+        std::ofstream output(
+            path / "model.safetensors", std::ios::binary);
+        Expect(output.good(),
+               "failed to create affine packed INT4 fixture weights.");
+        const uint64_t headerSize = header.size();
+        output.write(
+            reinterpret_cast<const char*>(&headerSize),
+            sizeof(headerSize));
+        output.write(header.data(), header.size());
+        output.write(
+            reinterpret_cast<const char*>(lmHead.data()),
+            lmHeadBytes);
+        output.write(
+            reinterpret_cast<const char*>(packed.data()),
+            packedBytes);
+        output.write(
+            reinterpret_cast<const char*>(scales.data()),
+            scaleBytes);
+        output.write(
+            reinterpret_cast<const char*>(packedZeros.data()),
+            zeroBytes);
+        output.write(
+            reinterpret_cast<const char*>(originalShape), shapeBytes);
+        Expect(output.good(),
+               "failed to write affine packed INT4 fixture weights.");
+    }
+
+    void RunLagunaPackedAffineInt4AutoDtypeRegression() {
+        ScopedTempDirectory temp(
+            "fastllm_laguna_packed_affine_int4_auto_");
+        WriteLagunaPackedAffineInt4Fixture(temp.Path());
+
+        auto model = fastllm::CreateLLMModelFromHF(
+            temp.Path().string(),
+            fastllm::DataType::DATA_AUTO_SOURCE, -1, true);
+        Expect(model != nullptr && model->model_type == "laguna",
+               "affine packed INT4 fixture did not create a Laguna model.");
+
+        const std::string weightName =
+            "model.layers.0.moe.experts.0.down_proj.weight";
+        auto packed = model->weight.weight.find(weightName);
+        Expect(packed != model->weight.weight.end(),
+               "affine packed INT4 expert weight was not loaded.");
+        const fastllm::Data &weight = packed->second;
+        Expect(weight.dataType == fastllm::DataType::INT4_GROUP,
+               "asymmetric compressed-tensors INT4 did not use the portable INT4_GROUP format.");
+        Expect(weight.dims == std::vector<int>({32, 64}) &&
+                   weight.groupCnt == 32 && weight.group == 2,
+               "affine packed INT4 logical shape or group metadata is incorrect.");
+        Expect(weight.cpuData != nullptr &&
+                   weight.GetBytes() == 32 * 64 / 2 &&
+                   weight.scales.size() == 32 * 2 &&
+                   weight.mins.size() == 32 * 2 &&
+                   weight.zeros.size() == 32 * 2,
+               "affine packed INT4 did not retain complete scale/zero metadata.");
+
+        for (int row = 0; row < 32; row++) {
+            for (int group = 0; group < 2; group++) {
+                const size_t meta = (size_t)row * 2 + group;
+                const int expectedZero =
+                    (row * 7 + group * 3 + 2) & 15;
+                const float expectedScale =
+                    0.125f * (float)((row + group) % 7 + 1);
+                Expect(weight.zeros[meta] == expectedZero,
+                       "affine packed INT4 zero point was unpacked from the wrong output row.");
+                Expect(std::fabs(weight.scales[meta] - expectedScale) <
+                           1e-6f &&
+                           std::fabs(weight.mins[meta] +
+                                     expectedScale * expectedZero) <
+                           1e-6f,
+                       "affine packed INT4 scale/min metadata is incorrect.");
+                for (int localColumn = 0;
+                     localColumn < 32; localColumn++) {
+                    const int column = group * 32 + localColumn;
+                    const uint8_t byte = weight.cpuData[
+                        ((size_t)row * 64 + column) / 2];
+                    const int actualValue = (column & 1) ?
+                        (byte & 15) : (byte >> 4);
+                    const int expectedValue =
+                        (row * 3 + column * 5 + 1) & 15;
+                    Expect(actualValue == expectedValue,
+                           "affine packed INT4 weight nibble order is incorrect.");
+                }
+            }
+        }
+
+        Expect(model->weight.weight.find(
+                   "model.layers.0.mlp.experts.0.down_proj.weight_scale") ==
+                   model->weight.weight.end() &&
+                   model->weight.weight.find(
+                   "model.layers.0.mlp.experts.0.down_proj.weight_zero_point") ==
+                   model->weight.weight.end() &&
+                   model->weight.weight.find(
+                   "model.layers.0.mlp.experts.0.down_proj.weight_shape") ==
+                   model->weight.weight.end(),
+               "compressed-tensors auxiliary tensors leaked into model weights.");
+    }
+
     void RunPerRequestMinOutputLengthRegression() {
         MoeAtypeConfigTestModel model;
         model.block_cnt = 3;
@@ -12409,6 +12627,30 @@ namespace {
 
 int main(int argc, char **argv) {
     try {
+        if (argc == 2 &&
+            std::string(argv[1]) ==
+                "--packed-affine-int4-loader") {
+            RunLagunaPackedAffineInt4AutoDtypeRegression();
+            std::cout << "asymmetric compressed-tensors INT4 loader regression: PASS\n";
+            return 0;
+        }
+        if (argc == 2 &&
+            std::string(argv[1]) ==
+                "--affine-int4-backends") {
+            RunCpuInt4GroupAwqLinearRegression();
+            std::cout << "CPU affine INT4_GROUP backend regression: PASS\n";
+#ifdef USE_CUDA
+            Expect(FastllmCudaGetDeviceCount() > 0,
+                   "affine INT4_GROUP CUDA regression requires CUDA.");
+            RunCudaInt4Group32AwqLinearRegression();
+            std::cout << "CUDA affine INT4_GROUP backend regression: PASS\n";
+            if (FastllmCudaGetDeviceCount() >= 2) {
+                RunMultiCudaInt4GroupColumnSplitRegression();
+                std::cout << "multi-CUDA affine INT4_GROUP TP regression: PASS\n";
+            }
+#endif
+            return 0;
+        }
 #ifdef USE_CUDA
         if (argc == 2 &&
             std::string(argv[1]) == "--cuda-kimi-kda") {
@@ -12574,6 +12816,9 @@ int main(int argc, char **argv) {
 
         RunLagunaPackedInt4AutoDtypeRegression();
         std::cout << "Laguna compressed-tensors INT4 auto dtype regression: PASS\n";
+
+        RunLagunaPackedAffineInt4AutoDtypeRegression();
+        std::cout << "Laguna asymmetric compressed-tensors INT4 auto dtype regression: PASS\n";
 
         RunPerRequestMinOutputLengthRegression();
         std::cout << "per-request minimum output length regression: PASS\n";

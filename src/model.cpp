@@ -1395,6 +1395,114 @@ namespace fastllm {
             fclose(file);
         }
 
+        void ReadRawData(void *output, size_t outputBytes) const {
+            AssertInFastLLM(
+                output != nullptr && outputBytes == this->bytes,
+                "SafeTensorItem.ReadRawData error: destination size does not match tensor " +
+                this->tensorName + ".");
+            FILE *file = fopen(this->fileName.c_str(), "rb");
+            AssertInFastLLM(
+                file != nullptr,
+                "SafeTensorItem.ReadRawData error: cannot open tensor file for " +
+                this->tensorName + ".");
+#if defined(_WIN32) || defined(_WIN64)
+            _fseeki64(file, this->data_offsets[0], 0);
+#else
+            fseek(file, this->data_offsets[0], 0);
+#endif
+            const size_t readBytes = fread(output, 1, outputBytes, file);
+            fclose(file);
+            AssertInFastLLM(
+                readBytes == outputBytes,
+                "SafeTensorItem.ReadRawData error: failed to read tensor " +
+                this->tensorName + ".");
+        }
+
+        // compressed-tensors' asymmetric pack-quantized layout keeps the
+        // weight and zero point in two differently packed I32 tensors:
+        //   weight_packed:     [out, ceil(in / 8)], packed along input
+        //   weight_zero_point: [ceil(out / 8), groups], packed along output
+        // Normalize it once while loading to FastLLM's portable INT4_GROUP
+        // layout. Device backends can then consume the affine metadata
+        // directly or repack it to an optimized device-specific form without
+        // making the checkpoint itself device-specific.
+        void CreateBufferWithPackedAffineInt4Group(
+                const SafeTensorItem &scale,
+                const SafeTensorItem &qzero,
+                const SafeTensorItem &weightShape,
+                int groupCnt) {
+            AssertInFastLLM(
+                this->dtype == "I32" && this->shape.size() == 2 &&
+                    scale.shape.size() == 2 && qzero.dtype == "I32" &&
+                    qzero.shape.size() == 2 && weightShape.dtype == "I64" &&
+                    weightShape.len == 2,
+                "CreateBufferWithPackedAffineInt4Group error: invalid tensor dtypes or ranks.");
+            AssertInFastLLM(
+                scale.buffer != nullptr &&
+                    (scale.dtype == "F32" || scale.dtype == "BF16"),
+                "CreateBufferWithPackedAffineInt4Group error: scale should be loaded as float32.");
+
+            const size_t rows = (size_t)this->shape[0];
+            const size_t packedColumns = (size_t)this->shape[1];
+            const size_t logicalColumns = packedColumns * 8;
+            const size_t groups = (size_t)scale.shape[1];
+            const size_t packedZeroRows = (rows + 7) / 8;
+            AssertInFastLLM(
+                rows > 0 && packedColumns > 0 && groups > 0 &&
+                    logicalColumns % groups == 0 &&
+                    logicalColumns / groups == (size_t)groupCnt &&
+                    scale.shape[0] == rows &&
+                    qzero.shape[0] == packedZeroRows &&
+                    qzero.shape[1] == groups,
+                "CreateBufferWithPackedAffineInt4Group error: tensor shapes do not match.");
+            AssertInFastLLM(
+                this->bytes == rows * packedColumns * sizeof(uint32_t) &&
+                    scale.len == rows * groups &&
+                    qzero.bytes == packedZeroRows * groups * sizeof(uint32_t) &&
+                    weightShape.bytes == 2 * sizeof(int64_t),
+                "CreateBufferWithPackedAffineInt4Group error: tensor byte sizes do not match.");
+
+            int64_t originalShape[2] = {0, 0};
+            weightShape.ReadRawData(
+                originalShape, sizeof(originalShape));
+            AssertInFastLLM(
+                originalShape[0] == (int64_t)rows &&
+                    originalShape[1] == (int64_t)logicalColumns,
+                "CreateBufferWithPackedAffineInt4Group error: weight_shape does not match packed weight. "
+                "Padded input dimensions are not supported.");
+
+            ClearBuffer();
+            buffer = new uint8_t[this->bytes];
+            ReadRawData(buffer, this->bytes);
+
+            // compressed-tensors places q0 in the low nibble; FastLLM's
+            // canonical INT4_GROUP layout places the even input in the high
+            // nibble.  On little-endian hosts a nibble swap converts all eight
+            // values in every source I32 without expanding the weights.
+            for (size_t i = 0; i < this->bytes; i++) {
+                const uint8_t value = buffer[i];
+                buffer[i] = (uint8_t)((value << 4) | (value >> 4));
+            }
+
+            std::vector<uint32_t> packedZeros(packedZeroRows * groups);
+            qzero.ReadRawData(packedZeros.data(), qzero.bytes);
+
+            scalesBuffer = new float[rows * groups];
+            minsBuffer = new float[rows * groups];
+            const float *sourceScales = (const float*)scale.buffer;
+            for (size_t row = 0; row < rows; row++) {
+                for (size_t group = 0; group < groups; group++) {
+                    const size_t index = row * groups + group;
+                    const uint32_t packed =
+                        packedZeros[(row / 8) * groups + group];
+                    const int zero = (int)((packed >> ((row % 8) * 4)) & 15);
+                    const float value = sourceScales[index];
+                    scalesBuffer[index] = value;
+                    minsBuffer[index] = -value * zero;
+                }
+            }
+        }
+
         void CreateBuffer(DataType dstType) {
             //printf("read %s from %s [%llu %llu] (%f M)\n", this->tensorName.c_str(), this->fileName.c_str(), this->data_offsets[0], this->data_offsets[0] + this->bytes, (float)this->bytes / 1e6);
             FILE *fi = fopen(this->fileName.c_str(), "rb");
@@ -1636,10 +1744,62 @@ namespace fastllm {
         return groupCnt > 0;
     }
 
-    static bool IsPackedInt4GroupTensor(const SafeTensors &safeTensors,
-                                        const std::string &name) {
-        int groupCnt = -1;
-        return TryGetPackedInt4GroupCnt(safeTensors, name, groupCnt);
+    static bool TryGetPackedAffineInt4GroupCnt(
+            const SafeTensors &safeTensors, const std::string &name,
+            int &groupCnt) {
+        auto weightIt = safeTensors.itmeDict.find(name);
+        if (weightIt == safeTensors.itmeDict.end() ||
+            weightIt->second.dtype != "I32" ||
+            !StringEndWith(name, ".weight_packed") ||
+            weightIt->second.shape.size() != 2) {
+            return false;
+        }
+
+        const std::string prefix =
+            name.substr(0, name.size() - strlen(".weight_packed"));
+        const std::string scaleName = prefix + ".weight_scale";
+        const std::string zeroName = prefix + ".weight_zero_point";
+        const std::string shapeName = prefix + ".weight_shape";
+        auto scaleIt = safeTensors.itmeDict.find(scaleName);
+        auto zeroIt = safeTensors.itmeDict.find(zeroName);
+        auto shapeIt = safeTensors.itmeDict.find(shapeName);
+        if (scaleIt == safeTensors.itmeDict.end() ||
+            zeroIt == safeTensors.itmeDict.end() ||
+            shapeIt == safeTensors.itmeDict.end() ||
+            safeTensors.itmeDict.find(prefix + ".weight_g_idx") !=
+                safeTensors.itmeDict.end()) {
+            return false;
+        }
+
+        const SafeTensorItem &weight = weightIt->second;
+        const SafeTensorItem &scale = scaleIt->second;
+        const SafeTensorItem &zero = zeroIt->second;
+        const SafeTensorItem &shape = shapeIt->second;
+        if ((scale.dtype != "F32" && scale.dtype != "BF16") ||
+            scale.shape.size() != 2 || zero.dtype != "I32" ||
+            zero.shape.size() != 2 ||
+            shape.dtype != "I64" ||
+            shape.shape.size() != 1 || shape.shape[0] != 2) {
+            return false;
+        }
+
+        const uint64_t rows = weight.shape[0];
+        const uint64_t packedColumns = weight.shape[1];
+        const uint64_t logicalColumns = packedColumns * 8;
+        const uint64_t groups = scale.shape[1];
+        if (rows == 0 || packedColumns == 0 || groups == 0 ||
+            scale.shape[0] != rows || logicalColumns % groups != 0 ||
+            logicalColumns / groups > INT_MAX ||
+            zero.shape[0] != (rows + 7) / 8 ||
+            zero.shape[1] != groups ||
+            weight.bytes != rows * packedColumns * sizeof(uint32_t) ||
+            scale.len != rows * groups ||
+            zero.bytes != ((rows + 7) / 8) * groups * sizeof(uint32_t) ||
+            shape.bytes != 2 * sizeof(int64_t)) {
+            return false;
+        }
+        groupCnt = (int)(logicalColumns / groups);
+        return groupCnt > 0;
     }
 
     static DataType GetPackedInt4GroupDataType(const SafeTensors &safeTensors,
@@ -1652,6 +1812,40 @@ namespace fastllm {
             return DataType::INT4_GROUP32;
         }
         return DataType::INT4_GROUP;
+    }
+
+    struct PackedInt4GroupInfo {
+        bool isAffine = false;
+        int groupCnt = -1;
+        DataType dataType = DataType::INT4_GROUP;
+        std::string scaleTensorName;
+        std::string zeroTensorName;
+        std::string shapeTensorName;
+    };
+
+    static bool TryGetPackedInt4GroupInfo(
+            const SafeTensors &safeTensors, const std::string &name,
+            PackedInt4GroupInfo &info) {
+        info = PackedInt4GroupInfo();
+        if (TryGetPackedAffineInt4GroupCnt(
+                safeTensors, name, info.groupCnt)) {
+            const std::string prefix =
+                name.substr(0, name.size() - strlen(".weight_packed"));
+            info.isAffine = true;
+            info.scaleTensorName = prefix + ".weight_scale";
+            info.zeroTensorName = prefix + ".weight_zero_point";
+            info.shapeTensorName = prefix + ".weight_shape";
+            return true;
+        }
+        if (!TryGetPackedInt4GroupCnt(
+                safeTensors, name, info.groupCnt)) {
+            return false;
+        }
+        info.dataType = GetPackedInt4GroupDataType(
+            safeTensors, name, info.groupCnt);
+        info.scaleTensorName =
+            FindSafeTensorScaleTensorName(safeTensors, name);
+        return true;
     }
 
     static void ResolvePackedFP4DataType(const SafeTensors &safeTensors, const std::string &name,
@@ -1683,13 +1877,15 @@ namespace fastllm {
         }
     }
 
-    static bool IsSafeTensorQuantScaleTensorName(const SafeTensors &safeTensors,
-                                                 const std::string &name) {
+    static bool IsSafeTensorQuantAuxTensorName(const SafeTensors &safeTensors,
+                                               const std::string &name) {
         auto isQuantTensor = [&](const std::string &candidate) {
             auto it = safeTensors.itmeDict.find(candidate);
+            PackedInt4GroupInfo packedInt4Info;
             return it != safeTensors.itmeDict.end() &&
                    (it->second.dtype == "F8_E4M3" || IsPackedFP4StorageDType(it->second.dtype) ||
-                    IsPackedInt4GroupTensor(safeTensors, candidate));
+                    TryGetPackedInt4GroupInfo(
+                        safeTensors, candidate, packedInt4Info));
         };
         if (StringEndWith(name, ".weight_scale")) {
             std::string prefix = name.substr(0, name.size() - strlen(".weight_scale"));
@@ -1706,6 +1902,23 @@ namespace fastllm {
         if (StringEndWith(name, ".input_global_scale")) {
             std::string prefix = name.substr(0, name.size() - strlen(".input_global_scale"));
             return isQuantTensor(prefix + ".weight_packed");
+        }
+        if (StringEndWith(name, ".weight_zero_point")) {
+            std::string prefix =
+                name.substr(0, name.size() - strlen(".weight_zero_point"));
+            PackedInt4GroupInfo packedInt4Info;
+            return TryGetPackedInt4GroupInfo(
+                       safeTensors, prefix + ".weight_packed",
+                       packedInt4Info) &&
+                   packedInt4Info.isAffine;
+        }
+        if (StringEndWith(name, ".weight_shape")) {
+            std::string prefix =
+                name.substr(0, name.size() - strlen(".weight_shape"));
+            PackedInt4GroupInfo packedInt4Info;
+            return TryGetPackedInt4GroupInfo(
+                safeTensors, prefix + ".weight_packed",
+                packedInt4Info);
         }
         if (StringEndWith(name, "_scale_inv")) {
             return isQuantTensor(name.substr(0, name.size() - strlen("_scale_inv")));
@@ -3666,7 +3879,7 @@ namespace fastllm {
         ReportModelLoadProgress("weights_prepare", 0, prepareTotal);
         for (auto &tensorName : tensors) {
             auto &tensor = safeTensors.itmeDict[tensorName];
-            if (IsSafeTensorQuantScaleTensorName(safeTensors, tensorName)) {
+            if (IsSafeTensorQuantAuxTensorName(safeTensors, tensorName)) {
                 int current = ++cur;
                 printf("Load %d \r", current * 100 / prepareTotal);
                 fflush(stdout);
@@ -3676,12 +3889,9 @@ namespace fastllm {
                 }
                 continue;
             }
-            int packedInt4GroupCnt = -1;
-            bool isPackedInt4Group = TryGetPackedInt4GroupCnt(
-                safeTensors, tensorName, packedInt4GroupCnt);
-            DataType packedInt4DataType = isPackedInt4Group ?
-                GetPackedInt4GroupDataType(safeTensors, tensorName, packedInt4GroupCnt) :
-                DataType::INT4_GROUP;
+            PackedInt4GroupInfo packedInt4Info;
+            bool isPackedInt4Group = TryGetPackedInt4GroupInfo(
+                safeTensors, tensorName, packedInt4Info);
             auto oriDataType = DataType::FLOAT32;
             for (auto &it : tensorMap[tensorName]) {
                 std::string weightName = it.first;
@@ -3699,7 +3909,7 @@ namespace fastllm {
                     }
                     ResolvePackedFP4DataType(safeTensors, tensorName, dataType);
                     if (isPackedInt4Group) {
-                        dataType = packedInt4DataType;
+                        dataType = packedInt4Info.dataType;
                     }
                 }
 
@@ -3721,12 +3931,12 @@ namespace fastllm {
                     }
                     ResolvePackedFP4DataType(safeTensors, tensorName, dataType);
                     if (isPackedInt4Group) {
-                        dataType = packedInt4DataType;
+                        dataType = packedInt4Info.dataType;
                     }
                 }
                 ResolvePackedFP4DataType(safeTensors, tensorName, dataType);
                 if (isPackedInt4Group) {
-                    dataType = packedInt4DataType;
+                    dataType = packedInt4Info.dataType;
                 }
                 if (tensor.dtype == "I64") {
                     dataType = DataType::INT32PARAM;
@@ -3870,13 +4080,18 @@ namespace fastllm {
                     for (int i = st; i < end; i++) {
                         auto &tensorName = (*activeTensors)[i];
                         auto &tensor = safeTensors.itmeDict[tensorName];
-                        if (IsSafeTensorQuantScaleTensorName(safeTensors, tensorName) ||
+                        if (IsSafeTensorQuantAuxTensorName(safeTensors, tensorName) ||
                             (isAwqModel && (StringEndWith(tensorName, ".scales") || StringEndWith(tensorName, ".qzeros")))) {
                             printLoadingProgress(tensor.bytes);
                             continue;
                         }
                         std::string scaleTensorName = "";
                         std::string qzeroTensorName = "";
+                        PackedInt4GroupInfo packedInt4Info;
+                        const bool isPackedInt4Group =
+                            TryGetPackedInt4GroupInfo(
+                                safeTensors, tensorName,
+                                packedInt4Info);
 
                         for (auto &it : tensorMap[tensorName]) {
                             auto oriDataType = DataType::FLOAT32;
@@ -3954,18 +4169,12 @@ namespace fastllm {
                                         ? dataType : packedFp4DataType;
                                 scaleTensorName = FindSafeTensorScaleTensorName(safeTensors, tensorName);
                             }
-                            int packedInt4GroupCnt = -1;
-                            bool isPackedInt4Group = TryGetPackedInt4GroupCnt(
-                                safeTensors, tensorName, packedInt4GroupCnt);
-                            DataType packedInt4DataType = isPackedInt4Group ?
-                                GetPackedInt4GroupDataType(safeTensors, tensorName,
-                                                          packedInt4GroupCnt) :
-                                DataType::INT4_GROUP;
                             if (isPackedInt4Group) {
-                                dataType = packedInt4DataType;
-                                oriDataType = packedInt4DataType;
-                                curGroupCnt = packedInt4GroupCnt;
-                                scaleTensorName = FindSafeTensorScaleTensorName(safeTensors, tensorName);
+                                dataType = packedInt4Info.dataType;
+                                oriDataType = packedInt4Info.dataType;
+                                curGroupCnt = packedInt4Info.groupCnt;
+                                scaleTensorName =
+                                    packedInt4Info.scaleTensorName;
                             }
 
                             if (tensor.dtype == "I32" && isAwqModel && StringEndWith(tensorName, "qweight")) {
@@ -3985,6 +4194,11 @@ namespace fastllm {
                                 model, weightName, tensor.bytes);
                             bool diskLazyWeight = diskLazyWeightType != WeightType::NONE;
                             if (diskLazyWeight) {
+                                if (packedInt4Info.isAffine) {
+                                    ErrorInFastLLM(
+                                        "Disk device does not support compressed-tensors asymmetric INT4 lazy weights yet: " +
+                                        weightName + "\n");
+                                }
                                 if (isAwqModel || loraDicts.find(weightName) != loraDicts.end()) {
                                     ErrorInFastLLM("Disk device does not support AWQ/lora lazy weight yet: " + weightName + "\n");
                                 }
@@ -4021,7 +4235,22 @@ namespace fastllm {
                                     }
                                 }
                             } else {
-                                if (scaleTensorName == "") {
+                                if (packedInt4Info.isAffine) {
+                                    auto &scaleTensor = safeTensors.itmeDict[
+                                        packedInt4Info.scaleTensorName];
+                                    auto &qzeroTensor = safeTensors.itmeDict[
+                                        packedInt4Info.zeroTensorName];
+                                    auto &weightShapeTensor =
+                                        safeTensors.itmeDict[
+                                            packedInt4Info.shapeTensorName];
+                                    scaleTensor.CreateBuffer(
+                                        DataType::FLOAT32);
+                                    tensor.CreateBufferWithPackedAffineInt4Group(
+                                        scaleTensor, qzeroTensor,
+                                        weightShapeTensor,
+                                        packedInt4Info.groupCnt);
+                                    scaleTensor.ClearBuffer();
+                                } else if (scaleTensorName == "") {
                                     tensor.CreateBuffer(oriDataType);
                                 } else if(!isAwqModel) {
                                     auto &scaleTensor = safeTensors.itmeDict[scaleTensorName];
@@ -4034,10 +4263,10 @@ namespace fastllm {
                                                            ((oriDataType == DataType::NVFP4_BLOCK_16 ||
                                                              oriDataType == DataType::NVFP4_BLOCK_16_E4M3) &&
                                                             scaleTensor.dtype == "F8_E4M3") ||
-                                                           packedInt4DataType == DataType::INT4_GROUP32;
+                                                           packedInt4Info.dataType == DataType::INT4_GROUP32;
                                     if (!keepScalePacked) {
                                         scaleTensor.CreateBuffer(DataType::FLOAT32);
-                                    } else if (packedInt4DataType == DataType::INT4_GROUP32) {
+                                    } else if (packedInt4Info.dataType == DataType::INT4_GROUP32) {
                                         scaleTensor.CreateBuffer(DataType::BFLOAT16);
                                     }
                                     SafeTensorItem *scale2Tensor = nullptr;
@@ -4048,8 +4277,8 @@ namespace fastllm {
                                     }
                                     if (isPackedInt4Group) {
                                         tensor.CreateBufferWithPackedInt4Group(scaleTensor,
-                                                                               packedInt4GroupCnt,
-                                                                               packedInt4DataType);
+                                                                               packedInt4Info.groupCnt,
+                                                                               packedInt4Info.dataType);
                                         scaleTensor.ClearBuffer();
                                     } else {
                                         tensor.CreateBufferWithScale(oriDataType, scaleTensor, scale2Tensor);
@@ -4557,20 +4786,17 @@ namespace fastllm {
             json11::Json::object config;
             for (auto it : items) {
                 auto &tensor = *it;
-                if (IsSafeTensorQuantScaleTensorName(safeTensors, tensor.tensorName)) {
+                if (IsSafeTensorQuantAuxTensorName(safeTensors, tensor.tensorName)) {
                     continue;
                 }
                 auto oriDataType = DataType::FLOAT32;
                 auto dataType = tensorMap[tensor.tensorName][0].second;
                 auto weightName = tensor.tensorName;
                 bool isPackedFp4 = IsPackedFP4Tensor(safeTensors, tensor.tensorName);
-                int packedInt4GroupCnt = -1;
-                bool isPackedInt4Group = TryGetPackedInt4GroupCnt(
-                    safeTensors, tensor.tensorName, packedInt4GroupCnt);
-                DataType packedInt4DataType = isPackedInt4Group ?
-                    GetPackedInt4GroupDataType(safeTensors, tensor.tensorName,
-                                               packedInt4GroupCnt) :
-                    DataType::INT4_GROUP;
+                PackedInt4GroupInfo packedInt4Info;
+                bool isPackedInt4Group = TryGetPackedInt4GroupInfo(
+                    safeTensors, tensor.tensorName,
+                    packedInt4Info);
                 int ggmlType = -1;
 
                 if ((dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) && dtypeRules.size() > 0) {
@@ -4579,7 +4805,7 @@ namespace fastllm {
                 }
                 ResolveExportDataTypeForTensor(tensor, isPackedFp4, linearDataType, oriDataType, dataType);
                 if (isPackedInt4Group) {
-                    dataType = packedInt4DataType;
+                    dataType = packedInt4Info.dataType;
                 }
                 if (tensor.dtype == "I64") {
                     dataType = DataType::INT32PARAM;
@@ -4620,7 +4846,7 @@ namespace fastllm {
                     new std::thread([&](int st, int end) {
                         for (int i = st; i < end; i++) {
                             auto &tensor = *items[i];
-                            if (IsSafeTensorQuantScaleTensorName(safeTensors, tensor.tensorName)) {
+                            if (IsSafeTensorQuantAuxTensorName(safeTensors, tensor.tensorName)) {
                                 continue;
                             }
                             std::string scaleTensorName = "";
@@ -4631,13 +4857,11 @@ namespace fastllm {
                             int ggmlType = -1;
                             int curGroupCnt = model->moeLinears.find(weightName) != model->moeLinears.end() ? moeGroupCnt : groupCnt;
                             bool isPackedFp4 = IsPackedFP4Tensor(safeTensors, tensor.tensorName);
-                            int packedInt4GroupCnt = -1;
-                            bool isPackedInt4Group = TryGetPackedInt4GroupCnt(
-                                safeTensors, tensor.tensorName, packedInt4GroupCnt);
-                            DataType packedInt4DataType = isPackedInt4Group ?
-                                GetPackedInt4GroupDataType(safeTensors, tensor.tensorName,
-                                                          packedInt4GroupCnt) :
-                                DataType::INT4_GROUP;
+                            PackedInt4GroupInfo packedInt4Info;
+                            bool isPackedInt4Group =
+                                TryGetPackedInt4GroupInfo(
+                                    safeTensors, tensor.tensorName,
+                                    packedInt4Info);
                             if ((dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) && dtypeRules.size() > 0) {
                                 ParseDataType(weightName, dtypeRules, dataType, curGroupCnt, ggmlType);
                                 if (dataType == DATA_GGUF_FORMAT) {
@@ -4653,11 +4877,11 @@ namespace fastllm {
 
                             ResolveExportDataTypeForTensor(tensor, isPackedFp4, linearDataType, oriDataType, dataType);
                             if (isPackedInt4Group) {
-                                dataType = packedInt4DataType;
-                                oriDataType = packedInt4DataType;
-                                curGroupCnt = packedInt4GroupCnt;
-                                scaleTensorName = FindSafeTensorScaleTensorName(
-                                    safeTensors, tensor.tensorName);
+                                dataType = packedInt4Info.dataType;
+                                oriDataType = packedInt4Info.dataType;
+                                curGroupCnt = packedInt4Info.groupCnt;
+                                scaleTensorName =
+                                    packedInt4Info.scaleTensorName;
                             }
                             if (tensor.dtype == "I64") {
                                 dataType = DataType::INT32PARAM;
@@ -4688,14 +4912,29 @@ namespace fastllm {
                                 scaleTensorName = FindSafeTensorScaleTensorName(safeTensors, tensor.tensorName);
                             }
 
-                            if (scaleTensorName == "") {
+                            if (packedInt4Info.isAffine) {
+                                auto &scaleTensor = safeTensors.itmeDict[
+                                    packedInt4Info.scaleTensorName];
+                                auto &qzeroTensor = safeTensors.itmeDict[
+                                    packedInt4Info.zeroTensorName];
+                                auto &weightShapeTensor =
+                                    safeTensors.itmeDict[
+                                        packedInt4Info.shapeTensorName];
+                                scaleTensor.CreateBuffer(
+                                    DataType::FLOAT32);
+                                tensor.CreateBufferWithPackedAffineInt4Group(
+                                    scaleTensor, qzeroTensor,
+                                    weightShapeTensor,
+                                    packedInt4Info.groupCnt);
+                                scaleTensor.ClearBuffer();
+                            } else if (scaleTensorName == "") {
                                 tensor.CreateBuffer(oriDataType);
                             } else {
                                 auto &scaleTensor = safeTensors.itmeDict[scaleTensorName];
                                 AssertInFastLLM(scaleTensor.dtype == "F32" || scaleTensor.dtype == "BF16" ||
                                                 scaleTensor.dtype == "F8_E8M0" || scaleTensor.dtype == "U8"
                                     , "Tensor scale error: scale's dtype should be F32, BF16, F8_E8M0 or U8.");
-                                if (packedInt4DataType == DataType::INT4_GROUP32) {
+                                if (packedInt4Info.dataType == DataType::INT4_GROUP32) {
                                     scaleTensor.CreateBuffer(DataType::BFLOAT16);
                                 } else if (!(oriDataType == DataType::NVFP4 &&
                                              (scaleTensor.dtype == "F8_E8M0" || scaleTensor.dtype == "U8"))) {
@@ -4703,8 +4942,8 @@ namespace fastllm {
                                 }
                                 if (isPackedInt4Group) {
                                     tensor.CreateBufferWithPackedInt4Group(scaleTensor,
-                                                                           packedInt4GroupCnt,
-                                                                           packedInt4DataType);
+                                                                           packedInt4Info.groupCnt,
+                                                                           packedInt4Info.dataType);
                                     scaleTensor.ClearBuffer();
                                 } else {
                                     tensor.CreateBufferWithScale(oriDataType, scaleTensor);
@@ -4789,7 +5028,7 @@ namespace fastllm {
             long long currentOffset = 0;
             for (auto it : items) {
                 std::string weightName = it->tensorName;
-                if (IsSafeTensorQuantScaleTensorName(safeTensors, weightName)) {
+                if (IsSafeTensorQuantAuxTensorName(safeTensors, weightName)) {
                     continue;
                 }
                 long long currentBytes = weights[weightName].GetFastllmFormateBytes();
@@ -4818,7 +5057,7 @@ namespace fastllm {
 
             for (auto it : items) {
                 std::string weightName = it->tensorName;
-                if (IsSafeTensorQuantScaleTensorName(safeTensors, weightName)) {
+                if (IsSafeTensorQuantAuxTensorName(safeTensors, weightName)) {
                     continue;
                 }
                 weights[weightName].ExportFastllmFormat(bytes.data() + offsets[weightName][0]);
@@ -4834,7 +5073,9 @@ namespace fastllm {
         if (hasSafeTensorIndex) {
             json11::Json::object exportedWeightMap;
             for (const auto &mapping : tensorMap) {
-                if (mapping.second.empty()) {
+                if (mapping.second.empty() ||
+                    IsSafeTensorQuantAuxTensorName(
+                        safeTensors, mapping.first)) {
                     continue;
                 }
                 auto tensor = safeTensors.itmeDict.find(mapping.first);
