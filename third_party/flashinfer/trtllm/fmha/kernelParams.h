@@ -26,9 +26,9 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
-#include <cuda/cmath>
 #include <cute/tensor.hpp>
 
+#include "../../fast_mod_div_compat.cuh"
 #include "../../utils.cuh"
 #include "../common.h"
 #include "fmhaRunnerParams.h"

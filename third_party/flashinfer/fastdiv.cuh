@@ -16,7 +16,8 @@
 #ifndef FLASHINFER_FASTDIV_CUH_
 #define FLASHINFER_FASTDIV_CUH_
 #include <cstdint>
-#include <cuda/cmath>
+
+#include "fast_mod_div_compat.cuh"
 
 namespace flashinfer {
 
