@@ -8079,6 +8079,7 @@ namespace fastllm {
         this->model_struct = "qwen3_5";
         this->model_type = "qwen3_5";
         this->use_new_engine = true;
+        this->defaultChunkedPrefillSize = 2048;
         this->num_experts = 0;
         this->num_experts_per_tok = 0;
         this->norm_topk_prob = true;
@@ -9432,9 +9433,8 @@ namespace fastllm {
                 this->maxBatch > 0 ? this->maxBatch : maxWarmupBatch;
             eagerWarmupBatch = std::max(1, eagerWarmupBatch);
             // The scheduler may aggregate unrelated prompts up to a larger
-            // token budget than the per-request chunk size. Qwen3.5 deliberately
-            // does this when linear-prefix snapshots clamp GetChunkedPrefillSize()
-            // (for example 2048) but serving still batches up to 8192 tokens.
+            // token budget than the per-request chunk size when an explicit
+            // prefix-snapshot interval clamps GetChunkedPrefillSize().
             int servingPrefillTokenLimit = std::max(
                 this->GetChunkedPrefillSize(),
                 this->GetBatchedPrefillTokenLimit());
