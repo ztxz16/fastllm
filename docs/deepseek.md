@@ -1,159 +1,117 @@
-## DeepSeek模型介绍
+# DeepSeek-V4 / DeepSeek-V4-Flash 部署指南
 
-DeepSeek是深度求索公司出品的模型，目前主要产品为DeepSeek-V3和DeepSeek-R1。
+[English](deepseek_en.md) · [返回 README](../README.md) · [混合推理](mixforward.md) · [Benchmark](benchmarks/deepseek_v4.md)
 
-### 安装Fastllm
+本文面向 DeepSeek-V4 与 DeepSeek-V4-Flash。早期 DeepSeek 模型仍可兼容运行，但不再作为本指南的主要示例。
 
-- PIP安装
+## API Server 快速启动
 
-Linux系统可尝试直接pip安装，命令如下：
-```
-pip install ftllm -U
-```
-若安装失败则参考[源码安装](../README.md#安装)
+~~~bash
+ftllm server fastllm/DeepSeek-V4-Flash \
+  --model_name DeepSeek-V4-Flash \
+  --host 0.0.0.0 --port 8080
+~~~
 
-### 运行示例
+对于大型 MoE checkpoint，FastLLM 默认会优先使用 CUDA 运行非专家部分，并根据构建能力将专家层放到 CPU 或 NUMA。正式部署时建议显式指定设备布局。
 
-#### 命令行聊天：
+## 按设备选择启动命令
 
-```
-ftllm run fastllm/DeepSeek-V3-0324-INT4
-```
+### 单 GPU + NUMA
 
-#### webui:
+~~~bash
+ftllm server fastllm/DeepSeek-V4-Flash \
+  --device cuda --moe_device numa \
+  --chunked_prefill_size 8192 \
+  --gpu_mem_ratio 0.9
+~~~
 
-```
-ftllm webui fastllm/DeepSeek-V3-0324-INT4
-```
+单路 CPU 机器可以使用 `--moe_device cpu`。
 
-#### api server (openai风格):
+### 多 GPU 张量并行
 
-```
-ftllm server fastllm/DeepSeek-V3-0324-INT4
-```
+当 GPU 总显存足以容纳目标 checkpoint 时：
 
-#### NUMA加速
+~~~bash
+ftllm server /data/models/deepseek-v4 \
+  --tp 0,1 \
+  --max_batch 8 \
+  --gpu_mem_ratio 0.9
+~~~
 
-若想使用单NUMA节点，建议用numactl绑定numa节点
+DeepSeek-V4 的 `--tp` 会选择 MultiCUDA 张量并行路径。更多 GPU 可以显式写成 `--tp 0,1,2,3` 或使用对应的裸数字数量。
 
-可以设定环境变量来激活多NUMA节点加速（PIP版本可直接激活，源码安装时需要在编译时加入-DUSE_NUMAS=ON选项）
+### GPU、NUMA 与磁盘混合专家
 
-```
-export FASTLLM_ACTIVATE_NUMA=ON
-# export FASTLLM_NUMA_THREADS=27 # 选用，这个变量用于设定每个numa节点开启的线程数
-```
+~~~bash
+ftllm server fastllm/DeepSeek-V4-Flash \
+  --device cuda \
+  --moe_device "{'cuda':1,'numa':8,'disk':1}" \
+  --chunked_prefill_size 8192
+~~~
 
-#### 本地模型
+比例表示 MoE 层在不同设备上的相对分配。磁盘只适合容量补充，并强依赖 SSD 随机读取性能。更多布局见[混合推理指南](mixforward.md)。
 
-可以启动本地下载好的模型（支持原始模型，AWQ模型，FASTLLM模型，暂不支持GGUF模型），假设本地模型路径为 `/mnt/DeepSeek-R1`
-则可以用如下命令启动（webui, server类似）
+### 多 GPU + NUMA 混合 MoE
 
-```
-ftllm run /mnt/DeepSeek-R1
-```
+~~~bash
+ftllm server fastllm/DeepSeek-V4-Flash \
+  --device cuda \
+  --moe_device "{'multicuda:0,1':15,'numa':85}"
+~~~
 
-#### 模糊启动
+该方式让部分专家层使用两卡张量并行，其余专家层运行在 NUMA 内存中。比例应根据显存、内存带宽和实际吞吐调整。
 
-如果记不住模型名，可以输入大概的模型名（不保证能匹配成功）
-例如：
-```
-ftllm run deepseek-v3-0324-int4 # 这条命令会直接运行deepseek-v3-0324版本的int4量化模型
-```
+## 内置 DSpark
 
-#### 设置缓存目录
+包含内置 DSpark 权重和配置的 DeepSeek-V4 checkpoint 可以使用：
 
-如果不想使用默认的缓存目录，可以通过环境变量 `FASTLLM_CACHEDIR` 来设置缓存目录，例如在Linux下:
+~~~bash
+ftllm server /data/models/deepseek-v4 \
+  --dspark 7
+~~~
 
-```
-export FASTLLM_CACHEDIR=/mnt/
-```
+`--dspark` 不能小于 checkpoint 训练时的 block 大小。服务启动时会校验模型架构和 DSpark 配置。
 
-#### 一些推荐模型
+## 长上下文
 
-目前推荐使用的一些模型：
+~~~bash
+ftllm server /data/models/deepseek-v4 \
+  --max_context_length 131072 \
+  --chunked_prefill_size 8192 \
+  --prefix_cache true \
+  --gpu_mem_ratio 0.9
+~~~
 
-- fastllm/DeepSeek-V3-0324-INT4
-- fastllm/DeepSeek-R1-INT4
-- deepseek-ai/DeepSeek-R1
-- deepseek-ai/DeepSeek-V3
-- deepseek-ai/DeepSeek-V3-0324
-- deepseek-ai/DeepSeek-V2.5-1210
+实际上下文上限取模型原生上限、命令行上限和 KV Cache 容量的较小值。
 
-#### 参数说明
+## SM120 TP8 稀疏注意力路径
 
-以下是运行 `ftllm` 模块时常用的参数说明：
+在支持的 SM120/SM121 CUDA 设备上，TP8 稀疏注意力测试使用：
 
-##### 通用参数
+~~~bash
+FASTLLM_CUDA_GRAPH=1 \
+FASTLLM_CUDA_CUSTOM_ALLREDUCE=1 \
+ftllm server /data/models/deepseek-v4 \
+  --tp 8 --triton \
+  --max_batch 1
+~~~
 
-- `-t` 或 `--threads`:
-  - **描述**: 设置使用的CPU线程数。
-  - **示例**: `-t 27`
+该命令是已记录 TP8 Benchmark 的推荐起点，不代表其他 GPU 架构也应使用相同设置。实测速度与限制见 [DeepSeek-V4 Benchmark](benchmarks/deepseek_v4.md) 和[稀疏注意力分析](deepseek_v4_sparse_attention.md)。
 
-- `--dtype`:
-  - **描述**: 指定模型的数据类型。
-  - **可选值**: `int4` 或其他支持的数据类型。
-  - **示例**: `--dtype int4`
-  
-- `--device`:
-  - **描述**: 指定模型运行的计算设备。
-  - **常用值**: `cpu` 或 `cuda`或`numa`
-  - **示例**: `--device cpu` 或 `--device cuda`
+## 思考与工具调用
 
-- `--moe_device`:
-  - **描述**: 指定 MOE（Mixture of Experts）层的计算设备。
-  - **常用值**: `cpu` 或 `cuda`或`numa`
-  - **示例**: `--moe_device cpu`
+~~~bash
+ftllm server /data/models/deepseek-v4 \
+  --enable_thinking true \
+  --tool_call_parser auto
+~~~
 
-- `--moe_experts`:
-  - **描述**: 指定 MOE（Mixture of Experts）层使用的专家数。不设定则根据模型配置设定。减少专家数可以提高推理速度，但可能降低推理准确度
-  - **示例**: `--moe_experts 6`
+DeepSeek-V4 使用模型对应的编码和工具协议。API 端建议保留模型原始模板与 parser 自动选择。
 
-- `--port`:
-  - **描述**: 指定服务运行的端口号。
-  - **示例**: `--port 8080`
+## Benchmark
 
-以上demo均可使用参数 --help 查看详细参数，详细参数说明可参考 [参数说明](docs/demo_arguments.md)
+- [DeepSeek-V4 TP8 SM120 性能摘要](benchmarks/deepseek_v4.md)
+- [DeepSeek-V4 稀疏注意力详细分析](deepseek_v4_sparse_attention.md)
+- [通用 Benchmark 入口](benchmark.md)
 
-### 模型下载
-
-可以使用如下命令将模型下载到本地
-
-```
-ftllm download deepseek-ai/DeepSeek-R1
-```
-
-### 模型导出
-
-如果使用量化加载模型（如`--dtype int4`），那么每次读取模型时会在线量化，读取速度较慢。
-
-ftllm export 是一个用于导出和转换模型权重的工具。它支持将模型权重转换为不同的数据类型。以下是如何使用 ftllm export 的详细说明。
-
-#### 命令格式
-
-``` sh
-ftllm export <模型路径> -o <输出路径> --dtype <数据类型> -t <线程数>
-```
-
-#### 示例命令
-
-``` sh
-ftllm export /mnt/DeepSeek-V3 -o /mnt/DeepSeek-V3-INT4 --dtype int4 -t 16
-```
-
-#### 混合精度
-
-可以通过指定moe_dtype来实现混合精度，例如
-
-``` sh
-ftllm export /mnt/DeepSeek-V3 -o /mnt/DeepSeek-V3-FP16INT4 --dtype float16 --moe_dtype int4 -t 16
-```
-
-#### 加载导出后的模型
-
-导出后的模型使用方法和原始模型类似，使用导出模型时`--dtype`参数将被忽略
-
-例如
-
-``` sh
-ftllm run /mnt/DeepSeek-V3-INT4/
-```
+尚未收录单 GPU + NUMA 和磁盘专家布局的正式吞吐；这些命令是部署起点，不能用 TP8 数据外推速度。

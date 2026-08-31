@@ -1,5 +1,7 @@
 # DeepSeek V4 Sparse Attention Decode
 
+[Benchmark 摘要](benchmarks/deepseek_v4.md) · [部署指南](deepseek.md)
+
 本文记录 DeepSeek V4 / DeepSeek V4 Flash 在 FastLLM 上的 sparse attention
 decode 实现、与 vLLM/FlashInfer SM120 实现的差异，以及 TP8 SM120 的优化结果。
 
