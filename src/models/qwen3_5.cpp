@@ -26155,6 +26155,42 @@ namespace fastllm {
         return drafts;
     }
 
+#ifdef USE_CUDA
+    static bool Qwen35TryCudaDFlashTopK(
+            const Data &logits, Data &output, int device,
+            int localRows, int firstRow, int outputRows, int topK) {
+        AssertInFastLLM(
+            localRows > 0 && firstRow >= 0 && outputRows > 0 &&
+                firstRow + outputRows <= localRows && topK > 0,
+            "DFlash CUDA top-k got an invalid row range.\n");
+
+        Data packedCandidates, scratch;
+        Qwen3CudaPrepareLocalOutput(packedCandidates, device);
+        packedCandidates.dataType = DataType::INT32;
+        packedCandidates.UpdateUnitSize();
+        packedCandidates.Resize({2 * localRows * topK});
+        packedCandidates.Allocate(false);
+
+        Qwen3CudaPrepareLocalOutput(scratch, device);
+        scratch.dataType = DataType::INT8;
+        scratch.UpdateUnitSize();
+        scratch.Resize({(int)FastllmCudaDFlashTopKScratchBytes(localRows)});
+        scratch.Allocate(false);
+
+        Qwen3CudaPrepareLocalOutput(output, device);
+        output.dataType = DataType::FLOAT32;
+        output.UpdateUnitSize();
+        output.Resize({outputRows, topK * 2});
+        output.Allocate(false);
+
+        return FastllmCudaDFlashTopK(
+                   logits, packedCandidates, scratch, topK, 0) &&
+               FastllmCudaDFlashMergeTopK(
+                   packedCandidates, output, 1, localRows,
+                   firstRow, outputRows, topK);
+    }
+#endif
+
     std::vector<int> Qwen3_5Model::RunDFlashDraft(
             int device, const std::vector<int> &devices,
             int anchorToken, const GenerationConfig &generationConfig,
@@ -26598,42 +26634,9 @@ namespace fastllm {
 
         Data candidateTopK;
         if (draftDevices.size() == 1) {
-            bool usedCudaFastTopK = false;
-            if (::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled(
-                    "FASTLLM_CUDA_DFLASH_FAST_TOPK")) {
-                Data packedCandidates, topKScratch;
-                ::fastllm::Qwen3CudaPrepareLocalOutput(
-                    packedCandidates, device);
-                packedCandidates.dataType = DataType::INT32;
-                packedCandidates.UpdateUnitSize();
-                packedCandidates.Resize(
-                    {2 * lmHeadRows * dflashSelectorTopK});
-                packedCandidates.Allocate(false);
-
-                const size_t scratchBytes =
-                    FastllmCudaDFlashTopKScratchBytes(lmHeadRows);
-                ::fastllm::Qwen3CudaPrepareLocalOutput(topKScratch, device);
-                topKScratch.dataType = DataType::INT8;
-                topKScratch.UpdateUnitSize();
-                topKScratch.Resize({(int)scratchBytes});
-                topKScratch.Allocate(false);
-
-                ::fastllm::Qwen3CudaPrepareLocalOutput(
-                    candidateTopK, device);
-                candidateTopK.dataType = DataType::FLOAT32;
-                candidateTopK.UpdateUnitSize();
-                candidateTopK.Resize(
-                    {slots, dflashSelectorTopK * 2});
-                candidateTopK.Allocate(false);
-                usedCudaFastTopK =
-                    FastllmCudaDFlashTopK(
-                        fullLogits, packedCandidates, topKScratch,
-                        dflashSelectorTopK, 0) &&
-                    FastllmCudaDFlashMergeTopK(
-                        packedCandidates, candidateTopK,
-                        1, lmHeadRows, 1, slots,
-                        dflashSelectorTopK);
-            }
+            bool usedCudaFastTopK = Qwen35TryCudaDFlashTopK(
+                fullLogits, candidateTopK, device, lmHeadRows,
+                1, slots, dflashSelectorTopK);
             if (!usedCudaFastTopK) {
                 Data allTopK;
                 TopK(fullLogits, allTopK, dflashSelectorTopK);
@@ -26650,10 +26653,6 @@ namespace fastllm {
             Data &lmHeadBias =
                 GetThreadTensorParallelBias("lm_head.weight.tp_bias");
             auto tryCudaFastTopK = [&]() -> bool {
-                if (!::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled(
-                        "FASTLLM_CUDA_DFLASH_FAST_TOPK")) {
-                    return false;
-                }
                 const int tpSize = (int)draftDevices.size();
                 std::vector<int> globalOffsets(tpSize, -1);
                 for (int rank = 0; rank < tpSize; rank++) {
@@ -27431,41 +27430,9 @@ namespace fastllm {
             ToDataType(fullLogits, DataType::FLOAT32);
             fullLogits.Reshape(
                 {totalLmHeadRows, fullLogits.dims.back()});
-            bool usedCudaFastTopK = false;
-            if (::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled(
-                    "FASTLLM_CUDA_DFLASH_FAST_TOPK")) {
-                Data packedCandidates, topKScratch;
-                ::fastllm::Qwen3CudaPrepareLocalOutput(
-                    packedCandidates, device);
-                packedCandidates.dataType = DataType::INT32;
-                packedCandidates.UpdateUnitSize();
-                packedCandidates.Resize(
-                    {2 * totalLmHeadRows * dflashSelectorTopK});
-                packedCandidates.Allocate(false);
-
-                const size_t scratchBytes =
-                    FastllmCudaDFlashTopKScratchBytes(totalLmHeadRows);
-                ::fastllm::Qwen3CudaPrepareLocalOutput(topKScratch, device);
-                topKScratch.dataType = DataType::INT8;
-                topKScratch.UpdateUnitSize();
-                topKScratch.Resize({(int)scratchBytes});
-                topKScratch.Allocate(false);
-
-                ::fastllm::Qwen3CudaPrepareLocalOutput(allTopK, device);
-                allTopK.dataType = DataType::FLOAT32;
-                allTopK.UpdateUnitSize();
-                allTopK.Resize(
-                    {totalLmHeadRows, dflashSelectorTopK * 2});
-                allTopK.Allocate(false);
-                usedCudaFastTopK =
-                    FastllmCudaDFlashTopK(
-                        fullLogits, packedCandidates, topKScratch,
-                        dflashSelectorTopK, 0) &&
-                    FastllmCudaDFlashMergeTopK(
-                        packedCandidates, allTopK,
-                        1, totalLmHeadRows, 0, totalLmHeadRows,
-                        dflashSelectorTopK);
-            }
+            bool usedCudaFastTopK = Qwen35TryCudaDFlashTopK(
+                fullLogits, allTopK, device, totalLmHeadRows,
+                0, totalLmHeadRows, dflashSelectorTopK);
             if (!usedCudaFastTopK) {
                 TopK(fullLogits, allTopK, dflashSelectorTopK);
             }
