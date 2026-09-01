@@ -87,6 +87,10 @@ extern "C" {
         fastllm::SetCudaEmbedding(cuda_embedding);
     }
 
+    DLL_EXPORT void set_cuda_graph(bool cuda_graph) {
+        fastllm::SetCudaGraph(cuda_graph);
+    }
+
     DLL_EXPORT void set_cuda_slab(int mb) {
         fastllm::SetCudaSlabMB(mb);
     }

@@ -52,6 +52,7 @@ namespace fastllm {
     };
 
     const FastllmEnv &GetFastllmEnv();
+    void SetCudaGraph(bool v);
 
     struct ModelLoadProgress {
         std::string stage;

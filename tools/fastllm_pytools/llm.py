@@ -317,6 +317,10 @@ fastllm_lib.has_device.restype = ctypes.c_bool
 
 fastllm_lib.disable_cuda_malloc.argtypes = []
 
+if hasattr(fastllm_lib, "set_cuda_graph"):
+    fastllm_lib.set_cuda_graph.argtypes = [ctypes.c_bool]
+    fastllm_lib.set_cuda_graph.restype = None
+
 fastllm_lib.export_llm_model_fromhf.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_bool, ctypes.c_int, ctypes.c_int, ctypes.c_char_p]
 
 fastllm_lib.create_llm_model.argtypes = [ctypes.c_char_p]
@@ -559,6 +563,13 @@ def get_cpu_historycache():
 
 def set_cuda_embedding(cuda_embedding):
     fastllm_lib.set_cuda_embedding(ctypes.c_bool(cuda_embedding));
+
+def set_cuda_graph(cuda_graph):
+    native_setter = getattr(fastllm_lib, "set_cuda_graph", None)
+    if native_setter is None:
+        return False
+    native_setter(ctypes.c_bool(cuda_graph))
+    return True
 
 def set_cuda_slab(mb: int):
     fastllm_lib.set_cuda_slab(ctypes.c_int(mb));

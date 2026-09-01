@@ -59,6 +59,16 @@ def _uses_thread_tp(tp) -> bool:
     spec = str(tp).strip().lower()
     return spec not in ["", "false", "off", "none", "disable"]
 
+def _uses_single_cuda_device(device) -> bool:
+    """Return whether the ordinary device map selects exactly one CUDA GPU."""
+    spec = str(device or "").strip().lower()
+    if spec == "cuda":
+        return True
+    if not spec.startswith("cuda:"):
+        return False
+    payload = spec.split(":", 1)[1].strip()
+    return payload != "" and "," not in payload
+
 def _arg_enabled(value) -> bool:
     if isinstance(value, bool):
         return value
@@ -344,35 +354,97 @@ def _fastllm_env_flag_enabled(name: str, fallback_name: str = "") -> bool:
         return False
     return str(value).strip().lower() in ["1", "true", "on", "yes"]
 
+def _single_cuda_total_memory_bytes(device) -> int:
+    """Best-effort VRAM query for an ordinary single CUDA device mapping."""
+    spec = str(device or "").strip().lower()
+    if spec == "cuda":
+        logical_device = 0
+    elif spec.startswith("cuda:"):
+        payload = spec.split(":", 1)[1].strip()
+        if not payload.isdigit():
+            return 0
+        logical_device = int(payload)
+    else:
+        return 0
+
+    identifier = str(logical_device)
+    visible = [item.strip() for item in
+               os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+               if item.strip()]
+    if visible:
+        if logical_device >= len(visible):
+            return 0
+        identifier = visible[logical_device]
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "-i", identifier, "--query-gpu=memory.total",
+             "--format=csv,noheader,nounits"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, timeout=8)
+        if result.returncode != 0:
+            return 0
+        first_line = result.stdout.splitlines()[0].strip()
+        return int(float(first_line)) * 1024 * 1024
+    except Exception:
+        return 0
+
+def _qwen35_gguf_needs_low_memory_fast_paths(args) -> bool:
+    """Detect GGUFs that cannot keep embedding/handoff state on the GPU."""
+    path = str(getattr(args, "path", "") or "")
+    if not path.lower().endswith(".gguf") or not os.path.isfile(path):
+        return False
+    total_memory = _single_cuda_total_memory_bytes(
+        getattr(args, "device", ""))
+    if total_memory <= 0:
+        return False
+    # CUDA context, cuBLAS, activations and one KV page still need headroom.
+    # Above 90%, keeping the large vocabulary output/embedding path on GPU is
+    # not viable on a 32 GiB card (for example Qwen3.5/Qwen3.8 Q8_K_XL).
+    return os.path.getsize(path) >= int(total_memory * 0.90)
+
 def _configure_qwen35_auto_fast_paths(args, is_qwen35_model: bool, mtp: int):
-    """Select the tested Qwen3.5 CUDA TP fast path without deployment env vars.
+    """Select tested Qwen3.5 CUDA fast paths without deployment env vars.
 
     Environment variables remain authoritative debugging overrides.  The
-    automatic path is deliberately limited to the configuration for which the
-    scheduler can safely fall back row-by-row: CUDA thread TP, no MTP or
-    external DFlash, and no low-memory mode. DFlash keeps the embedding table
-    on the host by default; its target and draft paths share one table dtype
-    and only transfer the selected hidden rows.
+    automatic path is limited to ordinary single-GPU CUDA or CUDA thread TP,
+    no MTP or external DFlash, and no low-memory mode. DFlash keeps the
+    embedding table on the host by default; its target and draft paths share
+    one table dtype and only transfer the selected hidden rows.
     """
     tp_arg = getattr(args, "tp", "")
     device = getattr(args, "device", "")
     speculative_algorithm = str(
         getattr(args, "speculative_algorithm", "") or "").strip().lower()
+    cuda_execution = (_uses_thread_tp(tp_arg) or
+                      _uses_single_cuda_device(device))
     eligible = (is_qwen35_model and mtp == 0 and
                 speculative_algorithm != "dflash" and
                 not bool(getattr(args, "low", False)) and
-                _uses_thread_tp(tp_arg) and _uses_cuda_device(device))
-
-    if eligible and "FASTLLM_CUDA_GRAPH" not in os.environ:
-        os.environ["FASTLLM_CUDA_GRAPH"] = "1"
+                cuda_execution and _uses_cuda_device(device))
 
     handoff_env = "FASTLLM_GPU_TOKEN_HANDOFF"
+    low_memory_gguf = eligible and _qwen35_gguf_needs_low_memory_fast_paths(
+        args)
+    if eligible and "FASTLLM_CUDA_GRAPH" not in os.environ:
+        # Decode graph capture itself is small enough for the large-GGUF
+        # configuration.  The material VRAM cost comes from implicitly moving
+        # the vocabulary embedding/output tensors to CUDA.
+        os.environ["FASTLLM_CUDA_GRAPH"] = "1"
     if eligible and handoff_env not in os.environ:
-        os.environ[handoff_env] = "1"
+        os.environ[handoff_env] = "0" if low_memory_gguf else "1"
+    if low_memory_gguf:
+        print(
+            "[Fastllm] Qwen3.5 large-GGUF memory guard: keeping CUDA "
+            "graph while disabling automatic GPU token handoff and CUDA "
+            "embedding; explicit command-line settings remain "
+            "authoritative.",
+            flush=True,
+        )
 
     graph_enabled = _fastllm_env_flag_enabled("FASTLLM_CUDA_GRAPH")
     handoff_enabled = _fastllm_env_flag_enabled(handoff_env)
-    if is_qwen35_model and (graph_enabled or handoff_enabled):
+    if is_qwen35_model and (
+            handoff_enabled or (graph_enabled and not low_memory_gguf)):
         # Qwen3.5 handoff keeps sampled tokens on device, and graph replay also
         # benefits from avoiding a host embedding round trip.
         args.cuda_embedding = True
@@ -1090,6 +1162,8 @@ def make_normal_llm_model(args, startup_progress = None):
         args.moe_device = expand_cudapp_device(args.moe_device)
     _configure_qwen35_auto_fast_paths(args, is_qwen35_model, mtp)
     from ftllm import llm
+    if hasattr(llm, "set_cuda_graph"):
+        llm.set_cuda_graph(_fastllm_env_flag_enabled("FASTLLM_CUDA_GRAPH"))
     llm.set_moe_device_layers(-1)
     llm.set_ngram_device(args.ngram_device)
     if (args.device and args.device != ""):

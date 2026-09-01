@@ -3028,6 +3028,32 @@ namespace fastllm {
             return ret;
         }
 
+        static DivisionScheme BuildQwen35GgufLinearOutProjScheme(
+                const DivisionScheme &keyHeadScheme,
+                int numKHeads, int valueHeadsPerKey,
+                int headVDim) {
+            DivisionScheme ret;
+            for (auto &it : keyHeadScheme) {
+                ret[it.first];
+                // GGUF columns are tiled by value-within-group first.  Emit
+                // the non-contiguous source ranges in that same order so the
+                // local shard matches the activation permutation performed
+                // immediately before the output projection.
+                for (int valueInGroup = 0;
+                     valueInGroup < valueHeadsPerKey; valueInGroup++) {
+                    for (auto &keyRange : it.second) {
+                        const int startHead =
+                            valueInGroup * numKHeads + keyRange.first;
+                        const int endHead =
+                            valueInGroup * numKHeads + keyRange.second;
+                        ret[it.first].push_back(
+                            {startHead * headVDim, endHead * headVDim});
+                    }
+                }
+            }
+            return ret;
+        }
+
         static int Qwen35RangeTotal(const DivisionScheme &scheme, int device) {
             int total = 0;
             auto it = scheme.find(device);
@@ -3212,7 +3238,8 @@ namespace fastllm {
             Data w1, w2, w3, tempInput, tempOutput, moeInputTemp, moeOutputTemp;
             Data moeFinal, sharedGate, sharedOutput;
             Data qSizes, pageSizes, pageIndexs, lastPageLens, insertIndexs, insertPositions;
-            Data gdnMerged, qkvConvInput, z, ba, b, a, g, convOutput, coreAttnOut;
+            Data gdnMerged, gdnQkvProjection, gdnZProjection;
+            Data qkvConvInput, z, ba, b, a, g, convOutput, coreAttnOut;
             Data linearQ, linearK, linearV;
             Data qRepeat, kRepeat, qq, kkPad, vvPad, bbPad, ggPad, decayMask;
             Data kBeta, vBeta, attn, at, kCumdecay, gExp, coreTemp;
@@ -3270,6 +3297,7 @@ namespace fastllm {
             visitor(buf.qSizes); visitor(buf.pageSizes); visitor(buf.pageIndexs);
             visitor(buf.lastPageLens); visitor(buf.insertIndexs);
             visitor(buf.insertPositions); visitor(buf.gdnMerged);
+            visitor(buf.gdnQkvProjection); visitor(buf.gdnZProjection);
             visitor(buf.qkvConvInput); visitor(buf.z); visitor(buf.ba);
             visitor(buf.b); visitor(buf.a); visitor(buf.g); visitor(buf.convOutput);
             visitor(buf.coreAttnOut); visitor(buf.linearQ); visitor(buf.linearK);
@@ -3313,6 +3341,11 @@ namespace fastllm {
             bool disabled = false;
             void *graph = nullptr;
             void *exec = nullptr;
+            // GGUF decode quantizes every activation row into temporary Q8_1
+            // storage.  Graph nodes retain those pool addresses after capture,
+            // so keep the corresponding pool blocks pinned for the lifetime of
+            // the executable graph.
+            std::vector<void*> reservedPointers;
             std::vector<int> logitsDims;
             std::vector<int> lastInsertIndexHost;
             std::vector<int> lastPageSizesHost;
@@ -3329,6 +3362,10 @@ namespace fastllm {
                 if (graph != nullptr) {
                     FastllmCudaGraphDestroy(graph);
                     graph = nullptr;
+                }
+                if (!reservedPointers.empty()) {
+                    FastllmCudaGraphMemoryPoolRelease(reservedPointers);
+                    reservedPointers.clear();
                 }
             }
         };
@@ -3496,6 +3533,10 @@ namespace fastllm {
             if (state.graph != nullptr) {
                 FastllmCudaGraphDestroy(state.graph);
                 state.graph = nullptr;
+            }
+            if (!state.reservedPointers.empty()) {
+                FastllmCudaGraphMemoryPoolRelease(state.reservedPointers);
+                state.reservedPointers.clear();
             }
             state.captured = false;
             state.warmed = false;
@@ -5003,6 +5044,78 @@ namespace fastllm {
                        FloatDict{{"alpha", alpha}}, IntDict());
         }
 
+        static bool Qwen35CudaTryGgufGateUpSiluMul(
+                Qwen3CudaDirectRunner &runner,
+                Data &input,
+                Data &gateWeight, const Data &gateBias,
+                Data &upWeight, const Data &upBias,
+                Data &output) {
+            if (input.dims.empty() || gateWeight.dims.size() != 2 ||
+                upWeight.dims.size() != 2 ||
+                !gateBias.dims.empty() || !upBias.dims.empty() ||
+                input.dataType != DataType::FLOAT16 ||
+                gateWeight.dataType != DataType::DATA_GGUF_FORMAT ||
+                upWeight.dataType != DataType::DATA_GGUF_FORMAT ||
+                input.cudaData == nullptr || gateWeight.cudaData == nullptr ||
+                upWeight.cudaData == nullptr ||
+                gateWeight.dims != upWeight.dims ||
+                input.dims.back() != gateWeight.dims[1]) {
+                return false;
+            }
+
+            const int m = input.dims.back();
+            const int n = input.Count(0) / m;
+            const int k = gateWeight.dims[0];
+            if (n <= 0 || n > 8 || k <= 0) {
+                return false;
+            }
+
+            FastllmCudaSetDevice(runner.DeviceId());
+            gateWeight.weightType = WeightType::LINEAR;
+            upWeight.weightType = WeightType::LINEAR;
+            output.dataType = input.dataType;
+            Qwen3CudaPrepareLocalOutput(output, runner.DeviceId());
+            std::vector<int> outputDims = input.dims;
+            outputDims.back() = k;
+            output.Resize(outputDims);
+            output.Allocate(false);
+            return FastllmCudaHalfGgufGateUpSiluMul(
+                input, gateWeight, upWeight, output, n, m, k);
+        }
+
+        static bool Qwen35CudaTryGgufMergedGateUpSiluMul(
+                Qwen3CudaDirectRunner &runner,
+                Data &input, Data &weight, const Data &bias,
+                Data &output) {
+            if (input.dims.empty() || weight.dims.size() != 2 ||
+                !bias.dims.empty() ||
+                input.dataType != DataType::FLOAT16 ||
+                weight.dataType != DataType::DATA_GGUF_FORMAT ||
+                input.cudaData == nullptr || weight.cudaData == nullptr ||
+                input.dims.back() != weight.dims[1] ||
+                weight.dims[0] <= 0 || (weight.dims[0] % 2) != 0) {
+                return false;
+            }
+
+            const int m = input.dims.back();
+            const int n = input.Count(0) / m;
+            const int k = weight.dims[0] / 2;
+            if (n != 1) {
+                return false;
+            }
+
+            FastllmCudaSetDevice(runner.DeviceId());
+            weight.weightType = WeightType::LINEAR;
+            output.dataType = input.dataType;
+            Qwen3CudaPrepareLocalOutput(output, runner.DeviceId());
+            std::vector<int> outputDims = input.dims;
+            outputDims.back() = k;
+            output.Resize(outputDims);
+            output.Allocate(false);
+            return FastllmCudaHalfGgufMergedGateUpSiluMul(
+                input, weight, output, n, m, k);
+        }
+
         static bool Qwen35CudaCanFuseRouterSharedGate(
                 const Data &input,
                 const Data &routerWeight,
@@ -6164,6 +6277,9 @@ namespace fastllm {
                 Qwen3CudaDirectRunner &runner,
                 Data *attenInput,
                 Data *mergeQkvWeight, Data *mergeQkvBias,
+                Data *qWeight, Data *qBias,
+                Data *kWeight, Data *kBias,
+                Data *vWeight, Data *vBias,
                 Data *qNormWeight, Data *kNormWeight,
                 Data *oWeight, Data *oBias,
                 Data *allPositionIds,
@@ -6198,8 +6314,18 @@ namespace fastllm {
                 bool precomputedInputProjection = false,
                 bool repeatSinglePagedCache = false) {
             using namespace qwen3cuda;
-            AssertInFastLLM(attenInput != nullptr && mergeQkvWeight != nullptr &&
-                            mergeQkvBias != nullptr && qNormWeight != nullptr &&
+            const bool hasMergedQkv =
+                mergeQkvWeight != nullptr && !mergeQkvWeight->dims.empty();
+            const bool hasSeparateQkv =
+                qWeight != nullptr && qBias != nullptr &&
+                kWeight != nullptr && kBias != nullptr &&
+                vWeight != nullptr && vBias != nullptr &&
+                !qWeight->dims.empty() && !kWeight->dims.empty() &&
+                !vWeight->dims.empty();
+            AssertInFastLLM(attenInput != nullptr &&
+                            (hasMergedQkv || hasSeparateQkv) &&
+                            (!hasMergedQkv || mergeQkvBias != nullptr) &&
+                            qNormWeight != nullptr &&
                             kNormWeight != nullptr && allPositionIds != nullptr &&
                             pastKeyValues != nullptr && batchPastKeys != nullptr &&
                             batchPastValues != nullptr && merged != nullptr &&
@@ -6216,7 +6342,7 @@ namespace fastllm {
                             "Qwen3.5 gated paged attention block got invalid head metadata.\n");
 
             bool fusedInputProjection =
-                !precomputedInputProjection &&
+                !precomputedInputProjection && hasMergedQkv &&
                 inputRmsWeight != nullptr && hiddenStates != nullptr &&
                 Qwen3CudaEnvDefaultEnabled(
                     "FASTLLM_CUDA_CUTLASS_LINEAR_FP8_INPUT_RMSNORM_QUANT_TP") &&
@@ -6231,9 +6357,24 @@ namespace fastllm {
                         runner, *hiddenStates, *inputRmsWeight,
                         rmsNormEps, *attenInput);
                 }
-                Qwen3CudaLinear(
-                    runner, *attenInput,
-                    *mergeQkvWeight, *mergeQkvBias, *merged);
+                if (hasMergedQkv) {
+                    Qwen3CudaLinear(
+                        runner, *attenInput,
+                        *mergeQkvWeight, *mergeQkvBias, *merged);
+                } else {
+                    // Preserve every UD quant type instead of expanding the
+                    // heterogeneous Q/K/V rows to FP16.  Reuse the persistent
+                    // attention buffers so CUDA graph capture does not retain
+                    // pointers owned by temporary Data objects.
+                    Qwen3CudaLinear(
+                        runner, *attenInput, *qWeight, *qBias, *qgate);
+                    Qwen3CudaLinear(
+                        runner, *attenInput, *kWeight, *kBias, *k);
+                    Qwen3CudaLinear(
+                        runner, *attenInput, *vWeight, *vBias, *v);
+                    Qwen3CudaCat(runner, *qgate, *k, -1, *gate);
+                    Qwen3CudaCat(runner, *gate, *v, -1, *merged);
+                }
             }
 
             Data *projectionInput =
@@ -7372,8 +7513,113 @@ namespace fastllm {
         }
     }
 
+    // llama.cpp's Qwen3.5 GGUF converter stores the value heads in tiled
+    // order: [value-within-group, key-head, head-dim].  FastLLM's GDN
+    // kernels use the Hugging Face grouped order instead:
+    // [key-head, value-within-group, head-dim].  Restore a row-oriented
+    // weight section without dequantizing it; GGUF rows are independently
+    // packed, so moving complete head blocks is lossless for quantized data.
+    static void Qwen35RestoreGgufTiledHeadRows(
+            Data &data, int rowOffset, int valueHeads, int rowsPerHead,
+            int keyHeads, const std::string &weightName) {
+        AssertInFastLLM(
+            data.dataDevice == DataDevice::CPU && data.cpuData != nullptr,
+            "Qwen3.5 GGUF GDN layout restore requires a resident CPU weight: " +
+                weightName + ".\n");
+        AssertInFastLLM(
+            !data.dims.empty() && data.dims[0] > 0 && keyHeads > 0 &&
+                valueHeads > 0 && valueHeads % keyHeads == 0 &&
+                rowsPerHead > 0 && rowOffset >= 0 &&
+                rowOffset + valueHeads * rowsPerHead <= data.dims[0],
+            "Qwen3.5 GGUF GDN weight has an invalid head layout: " +
+                weightName + ".\n");
+
+        const size_t totalBytes = data.GetBytes();
+        const size_t rows = (size_t)data.dims[0];
+        AssertInFastLLM(
+            totalBytes % rows == 0,
+            "Qwen3.5 GGUF GDN weight has non-row-aligned storage: " +
+                weightName + ".\n");
+        const size_t rowBytes = totalBytes / rows;
+        const size_t headBytes = rowBytes * (size_t)rowsPerHead;
+        std::vector<uint8_t> reordered((size_t)valueHeads * headBytes);
+        const int valuesPerKey = valueHeads / keyHeads;
+        const uint8_t *source = data.cpuData + (size_t)rowOffset * rowBytes;
+        for (int groupedHead = 0; groupedHead < valueHeads; groupedHead++) {
+            const int keyHead = groupedHead / valuesPerKey;
+            const int valueInGroup = groupedHead % valuesPerKey;
+            const int tiledHead = valueInGroup * keyHeads + keyHead;
+            memcpy(reordered.data() + (size_t)groupedHead * headBytes,
+                   source + (size_t)tiledHead * headBytes, headBytes);
+        }
+        memcpy(data.cpuData + (size_t)rowOffset * rowBytes,
+               reordered.data(), reordered.size());
+    }
+
+    static void Qwen35RestoreGgufSsmA(Data &data,
+                                      const std::string &weightName) {
+        AssertInFastLLM(
+            data.dataDevice == DataDevice::CPU && data.cpuData != nullptr &&
+                data.dataType == DataType::FLOAT32,
+            "Qwen3.5 GGUF ssm_a must be a resident FP32 tensor: " +
+                weightName + ".\n");
+        float *values = (float *)data.cpuData;
+        for (uint64_t i = 0; i < data.Count(0); i++) {
+            AssertInFastLLM(
+                std::isfinite(values[i]) && values[i] < 0.0f,
+                "Qwen3.5 GGUF ssm_a contains an invalid decay value: " +
+                    weightName + ".\n");
+            // GGUF stores the effective decay -exp(A_log), whereas FastLLM's
+            // recurrent kernels apply -exp() themselves.
+            values[i] = std::log(-values[i]);
+        }
+    }
+
+    static void Qwen35PermuteGroupedGdnOutputForGguf(
+            Data &input, const Data &outProjection,
+            int keyHeads, int valueHeads, int headDim) {
+        if (!outProjection.isGGUFData) {
+            return;
+        }
+        AssertInFastLLM(
+            !input.dims.empty() && keyHeads > 0 && valueHeads > 0 &&
+                valueHeads % keyHeads == 0 && headDim > 0 &&
+                input.dims.back() == valueHeads * headDim,
+            "Qwen3.5 GGUF GDN output has an invalid grouped layout.\n");
+        const std::vector<int> originalShape = input.dims;
+        const int tokens = (int)(input.Count(0) / input.dims.back());
+        input.Reshape({tokens, keyHeads, valueHeads / keyHeads, headDim});
+        PermuteSelf(input, {0, 2, 1, 3});
+        input.Reshape(originalShape);
+    }
+
+#ifdef USE_CUDA
+    static void Qwen35CudaPermuteGroupedGdnOutputForGguf(
+            Qwen3CudaDirectRunner &runner,
+            Data &input, const Data &outProjection,
+            int keyHeads, int valueHeads, int headDim) {
+        if (!outProjection.isGGUFData) {
+            return;
+        }
+        AssertInFastLLM(
+            !input.dims.empty() && keyHeads > 0 && valueHeads > 0 &&
+                valueHeads % keyHeads == 0 && headDim > 0 &&
+                input.dims.back() == valueHeads * headDim,
+            "Qwen3.5 GGUF GDN CUDA output has an invalid grouped layout.\n");
+        const std::vector<int> originalShape = input.dims;
+        const int tokens = (int)(input.Count(0) / input.dims.back());
+        input.Reshape({tokens, keyHeads, valueHeads / keyHeads, headDim});
+        qwen3cuda::Qwen3CudaPermuteSelf(runner, input, {0, 2, 1, 3});
+        input.Reshape(originalShape);
+    }
+#endif
+
     static void Add1(Data &input) {
-        if (input.dims.size() == 0) {
+        // Hugging Face stores Qwen3.5's main RMSNorm weights as an offset from
+        // one.  GGUF converters materialize the effective scale already, so
+        // applying the checkpoint offset again would shift every norm by a
+        // second +1 and corrupt the model from the first layer onward.
+        if (input.dims.size() == 0 || input.isGGUFData) {
             return;
         }
         float *v = (float*)input.cpuData;
@@ -10201,6 +10447,12 @@ namespace fastllm {
                 if (isAttentionLayer) {
                     std::string mergeQkvWeightName = prefix + "self_attn.mergeqkv.weight";
                     std::string mergeQkvBiasName = prefix + "self_attn.mergeqkv.bias";
+                    std::string qWeightName = prefix + "self_attn.q_proj.weight";
+                    std::string qBiasName = prefix + "self_attn.q_proj.bias";
+                    std::string kWeightName = prefix + "self_attn.k_proj.weight";
+                    std::string kBiasName = prefix + "self_attn.k_proj.bias";
+                    std::string vWeightName = prefix + "self_attn.v_proj.weight";
+                    std::string vBiasName = prefix + "self_attn.v_proj.bias";
                     std::string qNormName = prefix + "self_attn.q_norm.weight";
                     std::string kNormName = prefix + "self_attn.k_norm.weight";
                     std::string oWeightName = prefix + "self_attn.o_proj.weight";
@@ -10215,11 +10467,32 @@ namespace fastllm {
                     }
                     if (localKVHeads > 0) {
                         int localQHeads = localKVHeads * (num_attention_heads / num_key_value_heads);
+                        auto localWeightIfPresent = [&](const std::string &name) -> Data* {
+                            auto it = weight.weight.find(name);
+                            return it == weight.weight.end() ? nullptr :
+                                requireLocal(it->second, name);
+                        };
+                        Data *localMergedQkv =
+                            localWeightIfPresent(mergeQkvWeightName);
+                        Data *localMergedQkvBias = localMergedQkv == nullptr ? nullptr :
+                            requireLocal(GetThreadTensorParallelBias(mergeQkvBiasName),
+                                         mergeQkvBiasName);
+                        Data *localQWeight = localWeightIfPresent(qWeightName);
+                        Data *localKWeight = localWeightIfPresent(kWeightName);
+                        Data *localVWeight = localWeightIfPresent(vWeightName);
+                        Data *localQBias = localQWeight == nullptr ? nullptr :
+                            requireLocal(GetThreadTensorParallelBias(qBiasName), qBiasName);
+                        Data *localKBias = localKWeight == nullptr ? nullptr :
+                            requireLocal(GetThreadTensorParallelBias(kBiasName), kBiasName);
+                        Data *localVBias = localVWeight == nullptr ? nullptr :
+                            requireLocal(GetThreadTensorParallelBias(vBiasName), vBiasName);
                         Qwen35CudaAttentionPagedBlock(
                             cudaRunner,
                             &buf.attenInput,
-                            requireLocal(weight[mergeQkvWeightName], mergeQkvWeightName),
-                            requireLocal(GetThreadTensorParallelBias(mergeQkvBiasName), mergeQkvBiasName),
+                            localMergedQkv, localMergedQkvBias,
+                            localQWeight, localQBias,
+                            localKWeight, localKBias,
+                            localVWeight, localVBias,
                             requireLocal(weight[qNormName], qNormName),
                             requireLocal(weight[kNormName], kNormName),
                             requireLocal(weight[oWeightName], oWeightName),
@@ -10258,6 +10531,8 @@ namespace fastllm {
                     }
                 } else {
                     std::string qkvzWeightName = prefix + "linear_attn.in_proj_qkvz.weight";
+                    std::string qkvWeightName = prefix + "linear_attn.in_proj_qkv.weight";
+                    std::string zWeightName = prefix + "linear_attn.in_proj_z.weight";
                     std::string baWeightName = prefix + "linear_attn.in_proj_ba.weight";
                     std::string qkvzbaWeightName = prefix + "linear_attn.in_proj_qkvzba.weight";
                     std::string conv1dWeightName = prefix + "linear_attn.conv1d.weight";
@@ -10285,6 +10560,15 @@ namespace fastllm {
 
                     bool hasMergedGdnInLinear =
                         weight.weight.find(qkvzbaWeightName) != weight.weight.end();
+                    bool hasQkvzGdnInLinear =
+                        weight.weight.find(qkvzWeightName) != weight.weight.end();
+                    bool hasSeparateQkvZGdnInLinear =
+                        weight.weight.find(qkvWeightName) != weight.weight.end() &&
+                        weight.weight.find(zWeightName) != weight.weight.end();
+                    AssertInFastLLM(
+                        hasMergedGdnInLinear || hasQkvzGdnInLinear ||
+                            hasSeparateQkvZGdnInLinear,
+                        "Qwen3.5 CUDA graph requires qkvzba, qkvz, or separate qkv/z weights.\n");
                     bool fusedInputProjection =
                         hasMergedGdnInLinear &&
                         Qwen3CudaEnvDefaultEnabled(
@@ -10310,27 +10594,43 @@ namespace fastllm {
                             *requireLocal(GetThreadTensorParallelBias(qkvzbaWeightName + ".tp_bias"),
                                           qkvzbaWeightName + ".tp_bias"),
                             buf.gdnMerged);
-                    } else if (!fusedInputProjection) {
-                        AssertInFastLLM(weight.weight.find(qkvzWeightName) != weight.weight.end() &&
-                                        weight.weight.find(baWeightName) != weight.weight.end(),
-                                        "Qwen3.5 CUDA graph requires linear attention qkvz/ba weights.\n");
+                    } else if (!fusedInputProjection && hasQkvzGdnInLinear) {
                         Qwen3CudaLinear(cudaRunner, buf.attenInput,
                                         *requireLocal(weight[qkvzWeightName], qkvzWeightName),
                                         *requireLocal(GetThreadTensorParallelBias(qkvzWeightName + ".tp_bias"),
                                                       qkvzWeightName + ".tp_bias"),
                                         buf.gdnMerged);
+                    } else if (!fusedInputProjection) {
+                        Qwen3CudaLinear(
+                            cudaRunner, buf.attenInput,
+                            *requireLocal(weight[qkvWeightName], qkvWeightName),
+                            *requireLocal(GetThreadTensorParallelBias(
+                                              qkvWeightName + ".tp_bias"),
+                                          qkvWeightName + ".tp_bias"),
+                            buf.gdnQkvProjection);
+                        Qwen3CudaLinear(
+                            cudaRunner, buf.attenInput,
+                            *requireLocal(weight[zWeightName], zWeightName),
+                            *requireLocal(GetThreadTensorParallelBias(
+                                              zWeightName + ".tp_bias"),
+                                          zWeightName + ".tp_bias"),
+                            buf.gdnZProjection);
                     }
                     // Preserve the batch-1 zero-copy path without replacing the
                     // owning max-batch workspace tensors with borrowed views.
                     // The temporary view objects are non-owning; captured nodes
                     // retain only their stable offsets into gdnMerged.
                     bool useSingleRowGdnViews =
-                        batch == 1 && CanUseSingleRowLastDimView(buf.gdnMerged);
+                        !hasSeparateQkvZGdnInLinear && batch == 1 &&
+                        CanUseSingleRowLastDimView(buf.gdnMerged);
                     Data singleRowQkvConvInput, singleRowZ, singleRowBa;
                     Data *graphQkvConvInput = &buf.qkvConvInput;
                     Data *graphZ = &buf.z;
                     Data *graphBa = &buf.ba;
-                    if (useSingleRowGdnViews) {
+                    if (hasSeparateQkvZGdnInLinear) {
+                        graphQkvConvInput = &buf.gdnQkvProjection;
+                        graphZ = &buf.gdnZProjection;
+                    } else if (useSingleRowGdnViews) {
                         MakeSingleRowLastDimView(
                             buf.gdnMerged, 0, localQkvDim, singleRowQkvConvInput);
                         MakeSingleRowLastDimView(
@@ -10529,18 +10829,24 @@ namespace fastllm {
                         Qwen35CudaMulTo(cudaRunner, buf.coreAttnOut, activeZ);
                     }
                     buf.coreAttnOut.Reshape({zShape[0], zShape[1], localVd});
+                    Data &outProjWeight = *requireLocal(
+                        weight[outProjWeightName], outProjWeightName);
+                    Qwen35CudaPermuteGroupedGdnOutputForGguf(
+                        cudaRunner, buf.coreAttnOut, outProjWeight,
+                        localKeyHeads, localValueHeads, head_v_dim);
                     Qwen3CudaLinearResidualReduce(
                         cudaRunner, buf.coreAttnOut,
-                        *requireLocal(weight[outProjWeightName], outProjWeightName),
+                        outProjWeight,
                         *requireLocal(GetThreadTensorParallelBias(outProjWeightName + ".tp_bias"),
                                       outProjWeightName + ".tp_bias"),
                         buf.attenLastOutput, buf.hiddenStates,
                         tensorParallel, firstTensorParallelRank, gpuId, true);
                 }
 
-                bool hasDenseMlp = weight.weight.find(swigluWeightName) != weight.weight.end() &&
-                                   weight.weight.find(downWeightName) != weight.weight.end();
-                if (hasDenseMlp) {
+                bool hasMergedDenseMlp =
+                    weight.weight.find(swigluWeightName) != weight.weight.end() &&
+                    weight.weight.find(downWeightName) != weight.weight.end();
+                if (hasMergedDenseMlp) {
                     Data &gateUpWeight = *requireLocal(
                         weight[swigluWeightName], swigluWeightName);
                     Data &gateUpBias = *requireLocal(
@@ -10568,7 +10874,7 @@ namespace fastllm {
                 Qwen3CudaRMSNorm(cudaRunner, buf.hiddenStates,
                                  *requireLocal(weight[postRmsName], postRmsName),
                                  rms_norm_eps, buf.attenInput);
-                if (hasDenseMlp) {
+                if (hasMergedDenseMlp) {
                     Data &gateUpWeight = *requireLocal(weight[swigluWeightName], swigluWeightName);
                     Data &gateUpBias = *requireLocal(GetThreadTensorParallelBias(swigluWeightName + ".tp_bias"),
                                                      swigluWeightName + ".tp_bias");
@@ -10590,9 +10896,15 @@ namespace fastllm {
                             buf.gateupResult,
                             buf.swigluResult, buf.mlpPart,
                             buf.hiddenStates, tensorParallel)) {
-                        Qwen3CudaLinearSwiglu(cudaRunner, buf.attenInput,
-                                              gateUpWeight, gateUpBias,
-                                              buf.gateupResult, buf.swigluResult);
+                        if (!Qwen35CudaTryGgufMergedGateUpSiluMul(
+                                cudaRunner, buf.attenInput,
+                                gateUpWeight, gateUpBias,
+                                buf.swigluResult)) {
+                            Qwen3CudaLinearSwiglu(
+                                cudaRunner, buf.attenInput,
+                                gateUpWeight, gateUpBias,
+                                buf.gateupResult, buf.swigluResult);
+                        }
                         Qwen3CudaLinearResidualReduce(
                             cudaRunner, buf.swigluResult,
                             downWeight, downBias,
@@ -10600,6 +10912,55 @@ namespace fastllm {
                             tensorParallel, firstTensorParallelRank, gpuId,
                             true);
                     }
+                    continue;
+                }
+
+                std::string denseGateWeightName = prefix + "mlp.gate_proj.weight";
+                std::string denseUpWeightName = prefix + "mlp.up_proj.weight";
+                bool hasSeparateDenseMlp =
+                    weight.weight.find(denseGateWeightName) != weight.weight.end() &&
+                    weight.weight.find(denseUpWeightName) != weight.weight.end() &&
+                    weight.weight.find(downWeightName) != weight.weight.end();
+                if (hasSeparateDenseMlp) {
+                    Data &gateWeight = *requireLocal(
+                        weight[denseGateWeightName], denseGateWeightName);
+                    Data &gateBias = *requireLocal(
+                        GetThreadTensorParallelBias(
+                            denseGateWeightName + ".tp_bias"),
+                        denseGateWeightName + ".tp_bias");
+                    Data &upWeight = *requireLocal(
+                        weight[denseUpWeightName], denseUpWeightName);
+                    Data &upBias = *requireLocal(
+                        GetThreadTensorParallelBias(
+                            denseUpWeightName + ".tp_bias"),
+                        denseUpWeightName + ".tp_bias");
+                    if (!Qwen35CudaTryGgufGateUpSiluMul(
+                            cudaRunner, buf.attenInput,
+                            gateWeight, gateBias, upWeight, upBias,
+                            buf.gateupResult)) {
+                        Qwen3CudaLinear(
+                            cudaRunner, buf.attenInput,
+                            gateWeight, gateBias, buf.gateupResult);
+                        Qwen35CudaSilu(cudaRunner, buf.gateupResult,
+                                      buf.gateupResult);
+                        Qwen3CudaLinear(
+                            cudaRunner, buf.attenInput,
+                            upWeight, upBias, buf.swigluResult);
+                        if (buf.swigluResult.dataType !=
+                            buf.gateupResult.dataType) {
+                            Qwen3CudaToDataType(cudaRunner, buf.swigluResult,
+                                               buf.gateupResult.dataType);
+                        }
+                        Qwen35CudaMulTo(cudaRunner, buf.gateupResult,
+                                        buf.swigluResult);
+                    }
+                    Qwen3CudaLinearResidualReduce(
+                        cudaRunner, buf.gateupResult,
+                        *requireLocal(weight[downWeightName], downWeightName),
+                        *requireLocal(GetThreadTensorParallelBias(downBiasName),
+                                      downBiasName),
+                        buf.mlpPart, buf.hiddenStates,
+                        tensorParallel, firstTensorParallelRank, gpuId, true);
                     continue;
                 }
 
@@ -10863,7 +11224,8 @@ namespace fastllm {
             End
         };
         auto capturePreparedGraph = [&](bool enableMoeMarkers,
-                                        void *&capturedGraph) {
+                                        void *&capturedGraph,
+                                        std::vector<void*> &reservedPointers) {
             struct MoeMarkerScope {
                 bool previous;
                 explicit MoeMarkerScope(bool enabled) :
@@ -10874,19 +11236,27 @@ namespace fastllm {
             } markerScope(enableMoeMarkers);
 
             capturedGraph = nullptr;
+            reservedPointers.clear();
             FastllmCudaClearThreadError();
+            if (!FastllmCudaGraphPrepareCaptureDevice() ||
+                !FastllmCudaGraphMemoryPoolBegin()) {
+                return Qwen35GraphCaptureFailure::Begin;
+            }
             if (!FastllmCudaGraphBeginCapture()) {
+                FastllmCudaGraphMemoryPoolAbort();
                 return Qwen35GraphCaptureFailure::Begin;
             }
             FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag();
             runGraphBody();
             if (FastllmCudaMergeMOEUsedGraphUnsafeFallback()) {
                 Qwen35AbortCudaGraphCapture();
+                FastllmCudaGraphMemoryPoolAbort();
                 return Qwen35GraphCaptureFailure::UnsafeMoeFallback;
             }
             if (FastllmCudaGetThreadError() ||
                 FastllmCudaGraphCaptureInvalidated()) {
                 Qwen35AbortCudaGraphCapture();
+                FastllmCudaGraphMemoryPoolAbort();
                 return Qwen35GraphCaptureFailure::Body;
             }
             if (!FastllmCudaGraphEndCapture(&capturedGraph) ||
@@ -10895,6 +11265,12 @@ namespace fastllm {
                     FastllmCudaGraphDestroy(capturedGraph);
                     capturedGraph = nullptr;
                 }
+                FastllmCudaGraphMemoryPoolAbort();
+                return Qwen35GraphCaptureFailure::End;
+            }
+            if (!FastllmCudaGraphMemoryPoolEnd(reservedPointers)) {
+                FastllmCudaGraphDestroy(capturedGraph);
+                capturedGraph = nullptr;
                 return Qwen35GraphCaptureFailure::End;
             }
             return Qwen35GraphCaptureFailure::None;
@@ -10919,8 +11295,10 @@ namespace fastllm {
         };
 
         void *capturedGraph = nullptr;
+        std::vector<void*> capturedReservedPointers;
         Qwen35GraphCaptureFailure captureFailure =
-            capturePreparedGraph(true, capturedGraph);
+            capturePreparedGraph(
+                true, capturedGraph, capturedReservedPointers);
         if (captureFailure != Qwen35GraphCaptureFailure::None) {
             reportCaptureFailure(captureFailure, false);
             Qwen35DestroyCudaGraph(state);
@@ -10934,7 +11312,10 @@ namespace fastllm {
             FASTLLM_CUDA_GRAPH_MOE_RECAPTURE_WITHOUT_MARKERS) {
             FastllmCudaGraphDestroy(capturedGraph);
             capturedGraph = nullptr;
-            captureFailure = capturePreparedGraph(false, capturedGraph);
+            FastllmCudaGraphMemoryPoolRelease(capturedReservedPointers);
+            capturedReservedPointers.clear();
+            captureFailure = capturePreparedGraph(
+                false, capturedGraph, capturedReservedPointers);
             if (captureFailure != Qwen35GraphCaptureFailure::None) {
                 reportCaptureFailure(captureFailure, true);
                 Qwen35DestroyCudaGraph(state);
@@ -10949,6 +11330,7 @@ namespace fastllm {
                    gpuId, FastllmCudaGraphLastError());
             fflush(stdout);
             FastllmCudaGraphDestroy(capturedGraph);
+            FastllmCudaGraphMemoryPoolRelease(capturedReservedPointers);
             Qwen35DestroyCudaGraph(state);
             state.disabled = true;
             runWithoutGraph();
@@ -10960,6 +11342,7 @@ namespace fastllm {
             printf("Warning: Qwen3.5 CUDA graph instantiate failed on gpu %d: %s. Disable graph for this GPU.\n",
                    gpuId, FastllmCudaGraphLastError());
             FastllmCudaGraphDestroy(capturedGraph);
+            FastllmCudaGraphMemoryPoolRelease(capturedReservedPointers);
             Qwen35DestroyCudaGraph(state);
             state.disabled = true;
             runWithoutGraph();
@@ -10973,6 +11356,7 @@ namespace fastllm {
         } else if (workspace.capturedDataPointers != capturedDataPointers) {
             FastllmCudaGraphExecDestroy(capturedExec);
             FastllmCudaGraphDestroy(capturedGraph);
+            FastllmCudaGraphMemoryPoolRelease(capturedReservedPointers);
             throw std::runtime_error(
                 "Qwen3.5 CUDA graph shared workspace changed device addresses "
                 "after the max-batch capture.");
@@ -10980,6 +11364,7 @@ namespace fastllm {
 
         state.graph = capturedGraph;
         state.exec = capturedExec;
+        state.reservedPointers.swap(capturedReservedPointers);
         state.captured = true;
         printf("[Fastllm] Qwen3.5 CUDA graph captured GPU %d batch %d: "
                "shared Data %.2f MB, capacity batch %d, stable pointers %zu.\n",
@@ -11283,6 +11668,12 @@ namespace fastllm {
             if (isAttentionLayer) {
                 std::string mergeQkvWeightName = prefix + "self_attn.mergeqkv.weight";
                 std::string mergeQkvBiasName = prefix + "self_attn.mergeqkv.bias";
+                std::string qWeightName = prefix + "self_attn.q_proj.weight";
+                std::string qBiasName = prefix + "self_attn.q_proj.bias";
+                std::string kWeightName = prefix + "self_attn.k_proj.weight";
+                std::string kBiasName = prefix + "self_attn.k_proj.bias";
+                std::string vWeightName = prefix + "self_attn.v_proj.weight";
+                std::string vBiasName = prefix + "self_attn.v_proj.bias";
                 std::string qNormName = prefix + "self_attn.q_norm.weight";
                 std::string kNormName = prefix + "self_attn.k_norm.weight";
                 std::string oWeightName = prefix + "self_attn.o_proj.weight";
@@ -11296,6 +11687,30 @@ namespace fastllm {
                                                         num_key_value_heads);
                 }
                 if (localKVHeads > 0) {
+                    auto localWeightIfPresent = [&](const std::string &name) -> Data* {
+                        auto it = weight.weight.find(name);
+                        return it == weight.weight.end() ? nullptr :
+                            requireLocal(it->second, name);
+                    };
+                    Data *localMergedQkv =
+                        localWeightIfPresent(mergeQkvWeightName);
+                    Data *localMergedQkvBias = localMergedQkv == nullptr ? nullptr :
+                        requireLocal(GetThreadTensorParallelBias(mergeQkvBiasName),
+                                     mergeQkvBiasName);
+                    Data *localQWeight = localWeightIfPresent(qWeightName);
+                    Data *localKWeight = localWeightIfPresent(kWeightName);
+                    Data *localVWeight = localWeightIfPresent(vWeightName);
+                    Data *localQBias = localQWeight == nullptr ? nullptr :
+                        requireLocal(GetThreadTensorParallelBias(qBiasName), qBiasName);
+                    Data *localKBias = localKWeight == nullptr ? nullptr :
+                        requireLocal(GetThreadTensorParallelBias(kBiasName), kBiasName);
+                    Data *localVBias = localVWeight == nullptr ? nullptr :
+                        requireLocal(GetThreadTensorParallelBias(vBiasName), vBiasName);
+                    AssertInFastLLM(
+                        localMergedQkv != nullptr ||
+                            (localQWeight != nullptr && localKWeight != nullptr &&
+                             localVWeight != nullptr),
+                        "Qwen3.5 attention is missing merged and separate QKV weights.\n");
                     Qwen35MtpVerifyGraphPagedLayerState *graphPagedLayer =
                         mtpVerifyGraphDeviceState != nullptr &&
                                 i < (int)mtpVerifyGraphDeviceState->pagedLayers.size() ?
@@ -11327,16 +11742,21 @@ namespace fastllm {
                         Qwen3CudaRMSNorm(
                             cudaRunner, hiddenStates, inputRmsWeight,
                             rms_norm_eps, attenInput);
-                        Qwen3CudaLinear(
-                            cudaRunner, attenInput,
-                            *requireLocal(
-                                weight[mergeQkvWeightName],
-                                mergeQkvWeightName),
-                            *requireLocal(
-                                GetThreadTensorParallelBias(
-                                    mergeQkvBiasName),
-                                mergeQkvBiasName),
-                            merged);
+                        if (localMergedQkv != nullptr) {
+                            Qwen3CudaLinear(
+                                cudaRunner, attenInput,
+                                *localMergedQkv, *localMergedQkvBias,
+                                merged);
+                        } else {
+                            Qwen3CudaLinear(cudaRunner, attenInput,
+                                            *localQWeight, *localQBias, qgate);
+                            Qwen3CudaLinear(cudaRunner, attenInput,
+                                            *localKWeight, *localKBias, k);
+                            Qwen3CudaLinear(cudaRunner, attenInput,
+                                            *localVWeight, *localVBias, v);
+                            Qwen3CudaCat(cudaRunner, qgate, k, -1, gate);
+                            Qwen3CudaCat(cudaRunner, gate, v, -1, merged);
+                        }
                         Data exactAttentionOutput;
                         Data &localPositionIds = *requireLocal(
                             (Data&)positionIds, "positionIds");
@@ -11421,13 +11841,10 @@ namespace fastllm {
                             Qwen35CudaAttentionPagedBlock(
                                 cudaRunner,
                                 &attenInput,
-                                requireLocal(
-                                    weight[mergeQkvWeightName],
-                                    mergeQkvWeightName),
-                                requireLocal(
-                                    GetThreadTensorParallelBias(
-                                        mergeQkvBiasName),
-                                    mergeQkvBiasName),
+                                localMergedQkv, localMergedQkvBias,
+                                localQWeight, localQBias,
+                                localKWeight, localKBias,
+                                localVWeight, localVBias,
                                 requireLocal(weight[qNormName], qNormName),
                                 requireLocal(weight[kNormName], kNormName),
                                 requireLocal(weight[oWeightName], oWeightName),
@@ -11524,13 +11941,10 @@ namespace fastllm {
                                 Qwen35CudaAttentionPagedBlock(
                                     cudaRunner,
                                     &attenInput,
-                                    requireLocal(
-                                        weight[mergeQkvWeightName],
-                                        mergeQkvWeightName),
-                                    requireLocal(
-                                        GetThreadTensorParallelBias(
-                                            mergeQkvBiasName),
-                                        mergeQkvBiasName),
+                                    localMergedQkv, localMergedQkvBias,
+                                    localQWeight, localQBias,
+                                    localKWeight, localKBias,
+                                    localVWeight, localVBias,
                                     requireLocal(weight[qNormName], qNormName),
                                     requireLocal(weight[kNormName], kNormName),
                                     requireLocal(weight[oWeightName], oWeightName),
@@ -11594,8 +12008,10 @@ namespace fastllm {
                         Qwen35CudaAttentionPagedBlock(
                             cudaRunner,
                             &attenInput,
-                            requireLocal(weight[mergeQkvWeightName], mergeQkvWeightName),
-                            requireLocal(GetThreadTensorParallelBias(mergeQkvBiasName), mergeQkvBiasName),
+                            localMergedQkv, localMergedQkvBias,
+                            localQWeight, localQBias,
+                            localKWeight, localKBias,
+                            localVWeight, localVBias,
                             requireLocal(weight[qNormName], qNormName),
                             requireLocal(weight[kNormName], kNormName),
                             requireLocal(weight[oWeightName], oWeightName),
@@ -11638,6 +12054,8 @@ namespace fastllm {
                 }
             } else {
                 std::string qkvzWeightName = prefix + "linear_attn.in_proj_qkvz.weight";
+                std::string qkvWeightName = prefix + "linear_attn.in_proj_qkv.weight";
+                std::string zWeightName = prefix + "linear_attn.in_proj_z.weight";
                 std::string baWeightName = prefix + "linear_attn.in_proj_ba.weight";
                 std::string qkvzbaWeightName = prefix + "linear_attn.in_proj_qkvzba.weight";
                 std::string conv1dWeightName = prefix + "linear_attn.conv1d.weight";
@@ -11664,12 +12082,17 @@ namespace fastllm {
                 int localQkvDim = localKd * 2 + localVd;
                 bool hasMergedGdnInLinear =
                     weight.weight.find(qkvzbaWeightName) != weight.weight.end();
-                bool hasSeparateGdnInLinear =
+                bool hasQkvzGdnInLinear =
                     weight.weight.find(qkvzWeightName) != weight.weight.end() &&
                     weight.weight.find(baWeightName) != weight.weight.end();
+                bool hasSeparateQkvZGdnInLinear =
+                    weight.weight.find(qkvWeightName) != weight.weight.end() &&
+                    weight.weight.find(zWeightName) != weight.weight.end() &&
+                    weight.weight.find(baWeightName) != weight.weight.end();
                 AssertInFastLLM(
-                    hasMergedGdnInLinear || hasSeparateGdnInLinear,
-                    "Qwen3.5 ForwardSingleGPU requires linear attention qkvzba or qkvz/ba weights.\n");
+                    hasMergedGdnInLinear || hasQkvzGdnInLinear ||
+                        hasSeparateQkvZGdnInLinear,
+                    "Qwen3.5 ForwardSingleGPU requires qkvzba, qkvz/ba, or qkv/z/ba weights.\n");
                 bool fusedInputProjection =
                     hasMergedGdnInLinear &&
                     Qwen3CudaEnvDefaultEnabled(
@@ -11684,7 +12107,7 @@ namespace fastllm {
                             qkvzbaWeightName + ".tp_bias"),
                         gdnMerged);
                 if (!fusedInputProjection &&
-                    !hasMergedGdnInLinear &&
+                    !hasMergedGdnInLinear && hasQkvzGdnInLinear &&
                     Qwen3CudaEnvDefaultEnabled(
                         "FASTLLM_CUDA_CUTLASS_LINEAR_FP8_GDN_INPUT_RMSNORM_QUANT_TP")) {
                     fusedInputProjection =
@@ -11713,14 +12136,29 @@ namespace fastllm {
                         *requireLocal(GetThreadTensorParallelBias(qkvzbaWeightName + ".tp_bias"),
                                       qkvzbaWeightName + ".tp_bias"),
                         gdnMerged);
-                } else if (!fusedInputProjection) {
+                } else if (!fusedInputProjection && hasQkvzGdnInLinear) {
                     Qwen3CudaLinear(cudaRunner, attenInput,
                                     *requireLocal(weight[qkvzWeightName], qkvzWeightName),
                                     *requireLocal(GetThreadTensorParallelBias(qkvzWeightName + ".tp_bias"),
                                                   qkvzWeightName + ".tp_bias"),
                                     gdnMerged);
+                } else if (!fusedInputProjection) {
+                    Qwen3CudaLinear(
+                        cudaRunner, attenInput,
+                        *requireLocal(weight[qkvWeightName], qkvWeightName),
+                        *requireLocal(GetThreadTensorParallelBias(
+                                          qkvWeightName + ".tp_bias"),
+                                      qkvWeightName + ".tp_bias"),
+                        qkvConvInput);
+                    Qwen3CudaLinear(
+                        cudaRunner, attenInput,
+                        *requireLocal(weight[zWeightName], zWeightName),
+                        *requireLocal(GetThreadTensorParallelBias(
+                                          zWeightName + ".tp_bias"),
+                                      zWeightName + ".tp_bias"),
+                        z);
                 }
-                bool projectedQkvSplitReady = false;
+                bool projectedQkvSplitReady = hasSeparateQkvZGdnInLinear;
                 auto ensureProjectedQkvSplit = [&]() {
                     if (projectedQkvSplitReady) {
                         return;
@@ -11730,7 +12168,7 @@ namespace fastllm {
                         0, localQkvDim, qkvConvInput);
                     projectedQkvSplitReady = true;
                 };
-                bool projectedZSplitReady = false;
+                bool projectedZSplitReady = hasSeparateQkvZGdnInLinear;
                 auto ensureProjectedZSplit = [&]() {
                     if (projectedZSplitReady) {
                         return;
@@ -11952,13 +12390,16 @@ namespace fastllm {
                     tokenMajorBatchPrefill ||
                     tokenMajorBatchedSpeculativeConv;
                 bool combinedGdnConvCandidate =
-                    (uniformPrefill && tokenMajorBatchPrefill) ||
-                    tokenMajorBatchedSpeculativeConv;
+                    !hasSeparateQkvZGdnInLinear &&
+                    ((uniformPrefill && tokenMajorBatchPrefill) ||
+                     tokenMajorBatchedSpeculativeConv);
                 bool mtpCombinedGdnZCandidate =
+                    !hasSeparateQkvZGdnInLinear &&
                     tokenMajorBatchedSpeculativeConv &&
                     Qwen35MtpCombinedZGateEnabled();
                 bool combinedGdnZCandidate =
-                    uniformPrefill || mtpCombinedGdnZCandidate;
+                    (!hasSeparateQkvZGdnInLinear && uniformPrefill) ||
+                    mtpCombinedGdnZCandidate;
                 if (!combinedGdnConvCandidate) {
                     ensureProjectedQkvSplit();
                 }
@@ -13187,9 +13628,11 @@ namespace fastllm {
                 }
                 std::vector<int> zShape =
                     {bsz, seqlen, localValueHeads, head_v_dim};
+                Data &outProjWeight = *requireLocal(
+                    weight[outProjWeightName], outProjWeightName);
                 bool fusedGdnOutputProjection = false;
 #ifdef USE_CUDA
-                if (combinedGdnZCandidate &&
+                if (!outProjWeight.isGGUFData && combinedGdnZCandidate &&
                     deferredGdnOutputLayout) {
                     fusedGdnOutputProjection =
                         Qwen3CudaTryTpGdnOutputGateLinearResidualReduce(
@@ -13201,9 +13644,7 @@ namespace fastllm {
                             deferredGdnOutputSeqLen,
                             localQkvDim, localValueHeads,
                             rms_norm_eps,
-                            *requireLocal(
-                                weight[outProjWeightName],
-                                outProjWeightName),
+                            outProjWeight,
                             *requireLocal(
                                 GetThreadTensorParallelBias(
                                     outProjWeightName + ".tp_bias"),
@@ -13323,18 +13764,22 @@ namespace fastllm {
                     }
                     postLinearAttnOutput->Reshape(
                         {zShape[0], zShape[1], localVd});
+                    Qwen35CudaPermuteGroupedGdnOutputForGguf(
+                        cudaRunner, *postLinearAttnOutput, outProjWeight,
+                        localKeyHeads, localValueHeads, head_v_dim);
                     Qwen3CudaLinearResidualReduce(
                         cudaRunner, *postLinearAttnOutput,
-                        *requireLocal(weight[outProjWeightName], outProjWeightName),
+                        outProjWeight,
                         *requireLocal(GetThreadTensorParallelBias(outProjWeightName + ".tp_bias"),
                                       outProjWeightName + ".tp_bias"),
                         attenLastOutput, hiddenStates,
                         tensorParallel, firstTensorParallelRank, gpuId, true);
                 }
             }
-            bool hasDenseMlp = weight.weight.find(swigluWeightName) != weight.weight.end() &&
-                               weight.weight.find(downWeightName) != weight.weight.end();
-            if (hasDenseMlp) {
+            bool hasMergedDenseMlp =
+                weight.weight.find(swigluWeightName) != weight.weight.end() &&
+                weight.weight.find(downWeightName) != weight.weight.end();
+            if (hasMergedDenseMlp) {
                 Data &gateUpWeight = *requireLocal(
                     weight[swigluWeightName], swigluWeightName);
                 Data &gateUpBias = *requireLocal(
@@ -13363,7 +13808,7 @@ namespace fastllm {
             Qwen3CudaRMSNorm(cudaRunner, hiddenStates,
                              *requireLocal(weight[postRmsName], postRmsName),
                              rms_norm_eps, attenInput);
-            if (hasDenseMlp) {
+            if (hasMergedDenseMlp) {
                 Data &gateUpWeight = *requireLocal(weight[swigluWeightName], swigluWeightName);
                 Data &gateUpBias = *requireLocal(GetThreadTensorParallelBias(swigluWeightName + ".tp_bias"),
                                                  swigluWeightName + ".tp_bias");
@@ -13384,15 +13829,70 @@ namespace fastllm {
                         downWeight, downBias,
                         gateupResult, swigluResult, mlpPart,
                         hiddenStates, tensorParallel)) {
-                    Qwen3CudaLinearSwiglu(cudaRunner, attenInput,
-                                          gateUpWeight, gateUpBias,
-                                          gateupResult, swigluResult);
+                    if (!Qwen35CudaTryGgufMergedGateUpSiluMul(
+                            cudaRunner, attenInput,
+                            gateUpWeight, gateUpBias,
+                            swigluResult)) {
+                        Qwen3CudaLinearSwiglu(
+                            cudaRunner, attenInput,
+                            gateUpWeight, gateUpBias,
+                            gateupResult, swigluResult);
+                    }
                     Qwen3CudaLinearResidualReduce(
                         cudaRunner, swigluResult,
                         downWeight, downBias,
                         mlpPart, hiddenStates,
                         tensorParallel, firstTensorParallelRank, gpuId, true);
                 }
+                captureDFlashHidden(i);
+                continue;
+            }
+
+            std::string denseGateWeightName = prefix + "mlp.gate_proj.weight";
+            std::string denseUpWeightName = prefix + "mlp.up_proj.weight";
+            bool hasSeparateDenseMlp =
+                weight.weight.find(denseGateWeightName) != weight.weight.end() &&
+                weight.weight.find(denseUpWeightName) != weight.weight.end() &&
+                weight.weight.find(downWeightName) != weight.weight.end();
+            if (hasSeparateDenseMlp) {
+                Data &gateWeight = *requireLocal(
+                    weight[denseGateWeightName], denseGateWeightName);
+                Data &gateBias = *requireLocal(
+                    GetThreadTensorParallelBias(
+                        denseGateWeightName + ".tp_bias"),
+                    denseGateWeightName + ".tp_bias");
+                Data &upWeight = *requireLocal(
+                    weight[denseUpWeightName], denseUpWeightName);
+                Data &upBias = *requireLocal(
+                    GetThreadTensorParallelBias(
+                        denseUpWeightName + ".tp_bias"),
+                    denseUpWeightName + ".tp_bias");
+                if (!Qwen35CudaTryGgufGateUpSiluMul(
+                        cudaRunner, attenInput,
+                        gateWeight, gateBias, upWeight, upBias,
+                        gateupResult)) {
+                    Qwen3CudaLinear(
+                        cudaRunner, attenInput,
+                        gateWeight, gateBias, gateupResult);
+                    Qwen35CudaSilu(
+                        cudaRunner, gateupResult, gateupResult);
+                    Qwen3CudaLinear(
+                        cudaRunner, attenInput,
+                        upWeight, upBias, swigluResult);
+                    if (swigluResult.dataType != gateupResult.dataType) {
+                        Qwen3CudaToDataType(cudaRunner, swigluResult,
+                                           gateupResult.dataType);
+                    }
+                    Qwen35CudaMulTo(
+                        cudaRunner, gateupResult, swigluResult);
+                }
+                Qwen3CudaLinearResidualReduce(
+                    cudaRunner, gateupResult,
+                    *requireLocal(weight[downWeightName], downWeightName),
+                    *requireLocal(GetThreadTensorParallelBias(downBiasName),
+                                  downBiasName),
+                    mlpPart, hiddenStates,
+                    tensorParallel, firstTensorParallelRank, gpuId, true);
                 captureDFlashHidden(i);
                 continue;
             }
@@ -14184,7 +14684,14 @@ namespace fastllm {
                             AssertInFastLLM(SplitQwen35VectorWeight(weight[dtBiasName], devices, valueScheme),
                                             "Qwen3.5 ForwardGPU failed to split " + dtBiasName + ".\n");
 
-                            DivisionScheme outScheme = BuildQwen35LinearOutProjScheme(valueScheme, head_v_dim);
+                            DivisionScheme outScheme =
+                                weight[outProjWeightName].isGGUFData ?
+                                BuildQwen35GgufLinearOutProjScheme(
+                                    keyScheme, num_k_heads,
+                                    num_v_heads / num_k_heads,
+                                    head_v_dim) :
+                                BuildQwen35LinearOutProjScheme(
+                                    valueScheme, head_v_dim);
                             Data &outBias = GetThreadTensorParallelBias(outProjWeightName + ".tp_bias");
                             devCopy = devices;
                             AssertInFastLLM(SplitMultiCudaWeight(
@@ -14193,9 +14700,10 @@ namespace fastllm {
                                             "Qwen3.5 ForwardGPU failed to split " + outProjWeightName + ".\n");
                         }
 
-                        bool hasDenseMlp = weight.weight.find(swigluWeightName) != weight.weight.end() &&
-                                           weight.weight.find(downWeightName) != weight.weight.end();
-                        if (hasDenseMlp) {
+                        bool hasMergedDenseMlp =
+                            weight.weight.find(swigluWeightName) != weight.weight.end() &&
+                            weight.weight.find(downWeightName) != weight.weight.end();
+                        if (hasMergedDenseMlp) {
                             Data &gateup = weight[swigluWeightName];
                             Data &gateupBias = GetThreadTensorParallelBias(swigluWeightName + ".tp_bias");
                             gateup.tpLinearType = TP_LINEAR_ROW;
@@ -14214,6 +14722,50 @@ namespace fastllm {
                             AssertInFastLLM(SplitMultiCudaWeight(weight[downWeightName], downBias,
                                                                  devCopy, downScheme, 1, true),
                                             "Qwen3.5 ForwardGPU failed to split " + downWeightName + ".\n");
+                            continue;
+                        }
+
+                        std::string denseGateWeightName = prefix + "mlp.gate_proj.weight";
+                        std::string denseUpWeightName = prefix + "mlp.up_proj.weight";
+                        bool hasSeparateDenseMlp =
+                            weight.weight.find(denseGateWeightName) != weight.weight.end() &&
+                            weight.weight.find(denseUpWeightName) != weight.weight.end() &&
+                            weight.weight.find(downWeightName) != weight.weight.end();
+                        if (hasSeparateDenseMlp) {
+                            Data &gate = weight[denseGateWeightName];
+                            Data &gateBias = GetThreadTensorParallelBias(
+                                denseGateWeightName + ".tp_bias");
+                            gate.tpLinearType = TP_LINEAR_ROW;
+                            std::vector<int> devCopy = devices;
+                            DivisionScheme gateScheme =
+                                BuildMultiCudaRowSplitScheme(gate, devCopy, ratios);
+                            BalanceMultiCudaDivisionSchemeByLayer(
+                                denseGateWeightName, devices, gateScheme);
+                            AssertInFastLLM(
+                                SplitMultiCudaWeight(gate, gateBias, devCopy,
+                                                     gateScheme, 0, true),
+                                "Qwen3.5 ForwardGPU failed to split " +
+                                    denseGateWeightName + ".\n");
+
+                            Data &up = weight[denseUpWeightName];
+                            Data &upBias = GetThreadTensorParallelBias(
+                                denseUpWeightName + ".tp_bias");
+                            up.tpLinearType = TP_LINEAR_ROW;
+                            devCopy = devices;
+                            AssertInFastLLM(
+                                SplitMultiCudaWeight(up, upBias, devCopy,
+                                                     gateScheme, 0, true),
+                                "Qwen3.5 ForwardGPU failed to split " +
+                                    denseUpWeightName + ".\n");
+
+                            Data &downBias = GetThreadTensorParallelBias(downBiasName);
+                            weight[downWeightName].tpLinearType = TP_LINEAR_COLUMN;
+                            devCopy = devices;
+                            AssertInFastLLM(
+                                SplitMultiCudaWeight(weight[downWeightName], downBias,
+                                                     devCopy, gateScheme, 1, true),
+                                "Qwen3.5 ForwardGPU failed to split " +
+                                    downWeightName + ".\n");
                             continue;
                         }
 
@@ -23185,7 +23737,138 @@ namespace fastllm {
         consumedFusedMoeSourceWeights.clear();
     }
 
+    void Qwen3_5Model::RestoreGgufGdnWeights() {
+        if (ggufGdnLayoutRestored) {
+            return;
+        }
+        AssertInFastLLM(
+            num_k_heads > 0 && num_v_heads > 0 &&
+                num_v_heads % num_k_heads == 0 &&
+                head_k_dim > 0 && head_v_dim > 0,
+            "Qwen3.5 GGUF GDN metadata is incomplete.\n");
+
+        const int kd = num_k_heads * head_k_dim;
+        const int vd = num_v_heads * head_v_dim;
+        for (int layer = 0; layer < block_cnt; layer++) {
+            const std::string prefix = language_prefix + "layers." +
+                std::to_string(layer) + ".linear_attn.";
+            const std::string outName = prefix + "out_proj.weight";
+            auto outIt = this->weight.weight.find(outName);
+            if (outIt == this->weight.weight.end() ||
+                !outIt->second.isGGUFData) {
+                continue;
+            }
+
+            auto requireWeight = [&](const std::string &name) -> Data & {
+                auto it = this->weight.weight.find(name);
+                AssertInFastLLM(
+                    it != this->weight.weight.end(),
+                    "Qwen3.5 GGUF GDN is missing weight " + name + ".\n");
+                return it->second;
+            };
+            auto requireRows = [&](Data &data, int expectedRows,
+                                   const std::string &name) {
+                AssertInFastLLM(
+                    !data.dims.empty() && data.dims[0] == expectedRows,
+                    "Qwen3.5 GGUF GDN weight has an unexpected shape: " +
+                        name + ".\n");
+            };
+
+            const std::string qkvzbaName = prefix + "in_proj_qkvzba.weight";
+            const std::string qkvzName = prefix + "in_proj_qkvz.weight";
+            const std::string qkvName = prefix + "in_proj_qkv.weight";
+            const std::string zName = prefix + "in_proj_z.weight";
+            const std::string baName = prefix + "in_proj_ba.weight";
+            const std::string bName = prefix + "in_proj_b.weight";
+            const std::string aName = prefix + "in_proj_a.weight";
+
+            auto qkvzbaIt = this->weight.weight.find(qkvzbaName);
+            if (qkvzbaIt != this->weight.weight.end()) {
+                Data &qkvzba = qkvzbaIt->second;
+                requireRows(qkvzba, kd * 2 + vd * 2 + num_v_heads * 2,
+                            qkvzbaName);
+                Qwen35RestoreGgufTiledHeadRows(
+                    qkvzba, kd * 2, num_v_heads, head_v_dim,
+                    num_k_heads, qkvzbaName);
+                Qwen35RestoreGgufTiledHeadRows(
+                    qkvzba, kd * 2 + vd, num_v_heads, head_v_dim,
+                    num_k_heads, qkvzbaName);
+                Qwen35RestoreGgufTiledHeadRows(
+                    qkvzba, kd * 2 + vd * 2, num_v_heads, 1,
+                    num_k_heads, qkvzbaName);
+                Qwen35RestoreGgufTiledHeadRows(
+                    qkvzba, kd * 2 + vd * 2 + num_v_heads,
+                    num_v_heads, 1, num_k_heads, qkvzbaName);
+            } else {
+                auto qkvzIt = this->weight.weight.find(qkvzName);
+                if (qkvzIt != this->weight.weight.end()) {
+                    Data &qkvz = qkvzIt->second;
+                    requireRows(qkvz, kd * 2 + vd * 2, qkvzName);
+                    Qwen35RestoreGgufTiledHeadRows(
+                        qkvz, kd * 2, num_v_heads, head_v_dim,
+                        num_k_heads, qkvzName);
+                    Qwen35RestoreGgufTiledHeadRows(
+                        qkvz, kd * 2 + vd, num_v_heads, head_v_dim,
+                        num_k_heads, qkvzName);
+                } else {
+                    Data &qkv = requireWeight(qkvName);
+                    Data &z = requireWeight(zName);
+                    requireRows(qkv, kd * 2 + vd, qkvName);
+                    requireRows(z, vd, zName);
+                    Qwen35RestoreGgufTiledHeadRows(
+                        qkv, kd * 2, num_v_heads, head_v_dim,
+                        num_k_heads, qkvName);
+                    Qwen35RestoreGgufTiledHeadRows(
+                        z, 0, num_v_heads, head_v_dim,
+                        num_k_heads, zName);
+                }
+
+                auto baIt = this->weight.weight.find(baName);
+                if (baIt != this->weight.weight.end()) {
+                    Data &ba = baIt->second;
+                    requireRows(ba, num_v_heads * 2, baName);
+                    Qwen35RestoreGgufTiledHeadRows(
+                        ba, 0, num_v_heads, 1, num_k_heads, baName);
+                    Qwen35RestoreGgufTiledHeadRows(
+                        ba, num_v_heads, num_v_heads, 1,
+                        num_k_heads, baName);
+                } else {
+                    Data &b = requireWeight(bName);
+                    Data &a = requireWeight(aName);
+                    requireRows(b, num_v_heads, bName);
+                    requireRows(a, num_v_heads, aName);
+                    Qwen35RestoreGgufTiledHeadRows(
+                        b, 0, num_v_heads, 1, num_k_heads, bName);
+                    Qwen35RestoreGgufTiledHeadRows(
+                        a, 0, num_v_heads, 1, num_k_heads, aName);
+                }
+            }
+
+            const std::string convName = prefix + "conv1d.weight";
+            Data &conv = requireWeight(convName);
+            requireRows(conv, kd * 2 + vd, convName);
+            Qwen35RestoreGgufTiledHeadRows(
+                conv, kd * 2, num_v_heads, head_v_dim,
+                num_k_heads, convName);
+
+            const std::string aLogName = prefix + "A_log";
+            Data &aLog = requireWeight(aLogName);
+            requireRows(aLog, num_v_heads, aLogName);
+            Qwen35RestoreGgufTiledHeadRows(
+                aLog, 0, num_v_heads, 1, num_k_heads, aLogName);
+            Qwen35RestoreGgufSsmA(aLog, aLogName);
+
+            const std::string dtBiasName = prefix + "dt_bias";
+            Data &dtBias = requireWeight(dtBiasName);
+            requireRows(dtBias, num_v_heads, dtBiasName);
+            Qwen35RestoreGgufTiledHeadRows(
+                dtBias, 0, num_v_heads, 1, num_k_heads, dtBiasName);
+        }
+        ggufGdnLayoutRestored = true;
+    }
+
     void Qwen3_5Model::OnModelWeightsLoaded() {
+        RestoreGgufGdnWeights();
         if (!loadFusedMoePlanned || moeFusedWeightsPrepared) {
             return;
         }
@@ -23269,6 +23952,14 @@ namespace fastllm {
         }
 
         for (int i = 0; i < block_cnt; i++) {
+            std::string conv1dWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.conv1d.weight";
+            auto conv1dIt = this->weight.weight.find(conv1dWeightName);
+            if (conv1dIt != this->weight.weight.end() && conv1dIt->second.dims.size() == 2) {
+                // GGUF omits the singleton input-channel dimension used by
+                // Hugging Face Conv1d weights. The storage layout is identical.
+                conv1dIt->second.Reshape({conv1dIt->second.dims[0], 1, conv1dIt->second.dims[1]});
+            }
+
             std::string qkvzWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_qkvz.weight";
             std::string baWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_ba.weight";
             std::string mergedWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_qkvzba.weight";
@@ -25443,9 +26134,47 @@ namespace fastllm {
 
         Data candidateTopK;
         if (draftDevices.size() == 1) {
-            Data allTopK;
-            TopK(fullLogits, allTopK, dflashSelectorTopK);
-            Split(allTopK, 0, 1, runtimeBlockSize, candidateTopK);
+            bool usedCudaFastTopK = false;
+            if (::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled(
+                    "FASTLLM_CUDA_DFLASH_FAST_TOPK")) {
+                Data packedCandidates, topKScratch;
+                ::fastllm::Qwen3CudaPrepareLocalOutput(
+                    packedCandidates, device);
+                packedCandidates.dataType = DataType::INT32;
+                packedCandidates.UpdateUnitSize();
+                packedCandidates.Resize(
+                    {2 * lmHeadRows * dflashSelectorTopK});
+                packedCandidates.Allocate(false);
+
+                const size_t scratchBytes =
+                    FastllmCudaDFlashTopKScratchBytes(lmHeadRows);
+                ::fastllm::Qwen3CudaPrepareLocalOutput(topKScratch, device);
+                topKScratch.dataType = DataType::INT8;
+                topKScratch.UpdateUnitSize();
+                topKScratch.Resize({(int)scratchBytes});
+                topKScratch.Allocate(false);
+
+                ::fastllm::Qwen3CudaPrepareLocalOutput(
+                    candidateTopK, device);
+                candidateTopK.dataType = DataType::FLOAT32;
+                candidateTopK.UpdateUnitSize();
+                candidateTopK.Resize(
+                    {slots, dflashSelectorTopK * 2});
+                candidateTopK.Allocate(false);
+                usedCudaFastTopK =
+                    FastllmCudaDFlashTopK(
+                        fullLogits, packedCandidates, topKScratch,
+                        dflashSelectorTopK, 0) &&
+                    FastllmCudaDFlashMergeTopK(
+                        packedCandidates, candidateTopK,
+                        1, lmHeadRows, 1, slots,
+                        dflashSelectorTopK);
+            }
+            if (!usedCudaFastTopK) {
+                Data allTopK;
+                TopK(fullLogits, allTopK, dflashSelectorTopK);
+                Split(allTopK, 0, 1, runtimeBlockSize, candidateTopK);
+            }
             candidateTopK.ToDevice(DataDevice::CPU);
         } else {
             // DFlash only consumes the global top-k logits.  Selecting the
@@ -26238,7 +26967,44 @@ namespace fastllm {
             ToDataType(fullLogits, DataType::FLOAT32);
             fullLogits.Reshape(
                 {totalLmHeadRows, fullLogits.dims.back()});
-            TopK(fullLogits, allTopK, dflashSelectorTopK);
+            bool usedCudaFastTopK = false;
+            if (::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled(
+                    "FASTLLM_CUDA_DFLASH_FAST_TOPK")) {
+                Data packedCandidates, topKScratch;
+                ::fastllm::Qwen3CudaPrepareLocalOutput(
+                    packedCandidates, device);
+                packedCandidates.dataType = DataType::INT32;
+                packedCandidates.UpdateUnitSize();
+                packedCandidates.Resize(
+                    {2 * totalLmHeadRows * dflashSelectorTopK});
+                packedCandidates.Allocate(false);
+
+                const size_t scratchBytes =
+                    FastllmCudaDFlashTopKScratchBytes(totalLmHeadRows);
+                ::fastllm::Qwen3CudaPrepareLocalOutput(topKScratch, device);
+                topKScratch.dataType = DataType::INT8;
+                topKScratch.UpdateUnitSize();
+                topKScratch.Resize({(int)scratchBytes});
+                topKScratch.Allocate(false);
+
+                ::fastllm::Qwen3CudaPrepareLocalOutput(allTopK, device);
+                allTopK.dataType = DataType::FLOAT32;
+                allTopK.UpdateUnitSize();
+                allTopK.Resize(
+                    {totalLmHeadRows, dflashSelectorTopK * 2});
+                allTopK.Allocate(false);
+                usedCudaFastTopK =
+                    FastllmCudaDFlashTopK(
+                        fullLogits, packedCandidates, topKScratch,
+                        dflashSelectorTopK, 0) &&
+                    FastllmCudaDFlashMergeTopK(
+                        packedCandidates, allTopK,
+                        1, totalLmHeadRows, 0, totalLmHeadRows,
+                        dflashSelectorTopK);
+            }
+            if (!usedCudaFastTopK) {
+                TopK(fullLogits, allTopK, dflashSelectorTopK);
+            }
             packCandidateSlots(allTopK, candidateTopK);
             candidateTopK.ToDevice(DataDevice::CPU);
         } else {
@@ -27779,6 +28545,8 @@ namespace fastllm {
                 Linear(qkv, weight[oWeightName], oBias, attenInput);
             } else {
                 std::string qkvzWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_qkvz.weight";
+                std::string qkvWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_qkv.weight";
+                std::string zWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_z.weight";
                 std::string baWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_ba.weight";
                 std::string qkvzbaWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_qkvzba.weight";
                 std::string conv1dWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.conv1d.weight";
@@ -27790,7 +28558,21 @@ namespace fastllm {
                 Qwen35PrepareLinearAttentionCache(pastValue, linearCacheType);
 
                 int kd = num_k_heads * head_k_dim, vd = num_v_heads * head_v_dim;
-                int mixedQkvzDim = this->weight[qkvzWeightName].dims[0];
+                bool hasQkvzGdnInLinear =
+                    this->weight.weight.find(qkvzWeightName) !=
+                        this->weight.weight.end();
+                bool hasSeparateQkvZGdnInLinear =
+                    this->weight.weight.find(qkvWeightName) !=
+                        this->weight.weight.end() &&
+                    this->weight.weight.find(zWeightName) !=
+                        this->weight.weight.end();
+                AssertInFastLLM(
+                    hasQkvzGdnInLinear || hasSeparateQkvZGdnInLinear,
+                    "Qwen3.5 forward requires qkvz or separate qkv/z GDN weights.\n");
+                int mixedQkvzDim = hasQkvzGdnInLinear ?
+                    this->weight[qkvzWeightName].dims[0] :
+                    this->weight[qkvWeightName].dims[0] +
+                        this->weight[zWeightName].dims[0];
                 int baMergedDim = this->weight[baWeightName].dims[0];
                 bool hasMergedGdnInLinear = this->weight.weight.find(qkvzbaWeightName) != this->weight.weight.end();
                 if (hasMergedGdnInLinear && !isSingleTokenDecode &&
@@ -27805,6 +28587,7 @@ namespace fastllm {
                 bool useMergedGdnInLinear = (isSingleTokenDecode || isFusedBatchDecode) && hasMergedGdnInLinear;
 
                 Data gdn_in_merged, mixed_qkvz, ba_merged, qkvConvInput, z, b, a, g;
+                bool projectedQkvZSplitReady = false;
                 if (useMergedGdnInLinear) {
                     Linear(attenInput, weight[qkvzbaWeightName], Data(), gdn_in_merged);
                     if (CanUseSingleRowLastDimView(gdn_in_merged)) {
@@ -27814,18 +28597,25 @@ namespace fastllm {
                         Split(gdn_in_merged, -1, 0, mixedQkvzDim, mixed_qkvz);
                         Split(gdn_in_merged, -1, mixedQkvzDim, mixedQkvzDim + baMergedDim, ba_merged);
                     }
-                } else {
+                } else if (hasQkvzGdnInLinear) {
                     Linear(attenInput, weight[qkvzWeightName], Data(), mixed_qkvz);
                     Linear(attenInput, weight[baWeightName], Data(), ba_merged);
+                } else {
+                    Linear(attenInput, weight[qkvWeightName], Data(), qkvConvInput);
+                    Linear(attenInput, weight[zWeightName], Data(), z);
+                    Linear(attenInput, weight[baWeightName], Data(), ba_merged);
+                    projectedQkvZSplitReady = true;
                 }
 
                 int qkvzDim = kd * 2 + vd;
-                if (isSingleTokenDecode && CanUseSingleRowLastDimView(mixed_qkvz)) {
-                    MakeSingleRowLastDimView(mixed_qkvz, 0, qkvzDim, qkvConvInput);
-                    MakeSingleRowLastDimView(mixed_qkvz, qkvzDim, qkvzDim + vd, z);
-                } else {
-                    Split(mixed_qkvz, -1, 0, qkvzDim, qkvConvInput);
-                    Split(mixed_qkvz, -1, qkvzDim, qkvzDim + vd, z);
+                if (!projectedQkvZSplitReady) {
+                    if (isSingleTokenDecode && CanUseSingleRowLastDimView(mixed_qkvz)) {
+                        MakeSingleRowLastDimView(mixed_qkvz, 0, qkvzDim, qkvConvInput);
+                        MakeSingleRowLastDimView(mixed_qkvz, qkvzDim, qkvzDim + vd, z);
+                    } else {
+                        Split(mixed_qkvz, -1, 0, qkvzDim, qkvConvInput);
+                        Split(mixed_qkvz, -1, qkvzDim, qkvzDim + vd, z);
+                    }
                 }
 
                 if (isSingleTokenDecode && CanUseSingleRowLastDimView(ba_merged)) {
@@ -28235,6 +29025,13 @@ namespace fastllm {
                 }
 
                 core_attn_out.Reshape({zShape[0], zShape[1], -1});
+                const std::string outProjWeightName = language_prefix +
+                    "layers." + std::to_string(i) +
+                    ".linear_attn.out_proj.weight";
+                Data &outProjWeight = this->weight[outProjWeightName];
+                Qwen35PermuteGroupedGdnOutputForGguf(
+                    core_attn_out, outProjWeight,
+                    num_k_heads, num_v_heads, head_v_dim);
                 if (isSingleTokenDecode &&
                     core_attn_out.dataDevice == DataDevice::CUDA &&
                     core_attn_out.dataType == DataType::FLOAT16 &&
@@ -28246,19 +29043,17 @@ namespace fastllm {
                     #ifdef USE_CUDA
                     if (FastllmCudaHalfMatMulFloat16AddToNoBias(
                             core_attn_out,
-                            this->weight[language_prefix + "layers." + std::to_string(i) + ".linear_attn.out_proj.weight"],
+                            outProjWeight,
                             hiddenStates, n, m, kdim)) {
                         residualAddedInBranch = true;
                     } else
                     #endif
                     {
-                        Linear(core_attn_out,
-                               this->weight[language_prefix + "layers." + std::to_string(i) + ".linear_attn.out_proj.weight"],
+                        Linear(core_attn_out, outProjWeight,
                                Data(), attenInput);
                     }
                 } else {
-                    Linear(core_attn_out,
-                           this->weight[language_prefix + "layers." + std::to_string(i) + ".linear_attn.out_proj.weight"],
+                    Linear(core_attn_out, outProjWeight,
                            Data(), attenInput);
                 }
             }
@@ -28961,6 +29756,8 @@ namespace fastllm {
                 Qwen35PrepareLinearAttentionCache(pastKey, linearCacheType);
                 Qwen35PrepareLinearAttentionCache(pastValue, linearCacheType);
                 std::string qkvzWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_qkvz.weight";
+                std::string qkvWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_qkv.weight";
+                std::string zWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_z.weight";
                 std::string baWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_ba.weight";
                 std::string qkvzbaWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_qkvzba.weight";
                 std::string conv1dWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.conv1d.weight";
@@ -28969,7 +29766,21 @@ namespace fastllm {
                 std::string dtBiasName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.dt_bias";
 
                 int kd = num_k_heads * head_k_dim, vd = num_v_heads * head_v_dim;
-                int mixedQkvzDim = this->weight[qkvzWeightName].dims[0];
+                bool hasQkvzGdnInLinear =
+                    this->weight.weight.find(qkvzWeightName) !=
+                        this->weight.weight.end();
+                bool hasSeparateQkvZGdnInLinear =
+                    this->weight.weight.find(qkvWeightName) !=
+                        this->weight.weight.end() &&
+                    this->weight.weight.find(zWeightName) !=
+                        this->weight.weight.end();
+                AssertInFastLLM(
+                    hasQkvzGdnInLinear || hasSeparateQkvZGdnInLinear,
+                    "Qwen3.5 forward requires qkvz or separate qkv/z GDN weights.\n");
+                int mixedQkvzDim = hasQkvzGdnInLinear ?
+                    this->weight[qkvzWeightName].dims[0] :
+                    this->weight[qkvWeightName].dims[0] +
+                        this->weight[zWeightName].dims[0];
                 int baMergedDim = this->weight[baWeightName].dims[0];
                 bool hasMergedGdnInLinear = this->weight.weight.find(qkvzbaWeightName) != this->weight.weight.end();
                 if (hasMergedGdnInLinear && !isSingleTokenDecode &&
@@ -28984,6 +29795,7 @@ namespace fastllm {
                 bool useMergedGdnInLinear = (isSingleTokenDecode || isFusedBatchDecode) && hasMergedGdnInLinear;
 
                 Data gdn_in_merged, mixed_qkvz, ba_merged, qkvConvInput, z, b, a, g;
+                bool projectedQkvZSplitReady = false;
                 if (useMergedGdnInLinear) {
                     Linear(attenInput, weight[qkvzbaWeightName], Data(), gdn_in_merged);
                     if (CanUseSingleRowLastDimView(gdn_in_merged)) {
@@ -28993,19 +29805,26 @@ namespace fastllm {
                         Split(gdn_in_merged, -1, 0, mixedQkvzDim, mixed_qkvz);
                         Split(gdn_in_merged, -1, mixedQkvzDim, mixedQkvzDim + baMergedDim, ba_merged);
                     }
-                } else {
+                } else if (hasQkvzGdnInLinear) {
                     Linear(attenInput, weight[qkvzWeightName], Data(), mixed_qkvz);
                     Linear(attenInput, weight[baWeightName], Data(), ba_merged);
+                } else {
+                    Linear(attenInput, weight[qkvWeightName], Data(), qkvConvInput);
+                    Linear(attenInput, weight[zWeightName], Data(), z);
+                    Linear(attenInput, weight[baWeightName], Data(), ba_merged);
+                    projectedQkvZSplitReady = true;
                 }
 
                 // Split qkvz -> mixed_qkv + z
                 int qkvzDim = kd * 2 + vd;
-                if (isSingleTokenDecode && CanUseSingleRowLastDimView(mixed_qkvz)) {
-                    MakeSingleRowLastDimView(mixed_qkvz, 0, qkvzDim, qkvConvInput);
-                    MakeSingleRowLastDimView(mixed_qkvz, qkvzDim, qkvzDim + vd, z);
-                } else {
-                    Split(mixed_qkvz, -1, 0, qkvzDim, qkvConvInput);
-                    Split(mixed_qkvz, -1, qkvzDim, qkvzDim + vd, z);
+                if (!projectedQkvZSplitReady) {
+                    if (isSingleTokenDecode && CanUseSingleRowLastDimView(mixed_qkvz)) {
+                        MakeSingleRowLastDimView(mixed_qkvz, 0, qkvzDim, qkvConvInput);
+                        MakeSingleRowLastDimView(mixed_qkvz, qkvzDim, qkvzDim + vd, z);
+                    } else {
+                        Split(mixed_qkvz, -1, 0, qkvzDim, qkvConvInput);
+                        Split(mixed_qkvz, -1, qkvzDim, qkvzDim + vd, z);
+                    }
                 }
 
                 // Split ba -> b + a (note: b and a have dim num_v_heads, not vd).
@@ -29552,6 +30371,13 @@ namespace fastllm {
                     }
 
                     core_attn_out.Reshape({zShape[0], zShape[1], -1});
+                    const std::string outProjWeightName = language_prefix +
+                        "layers." + std::to_string(i) +
+                        ".linear_attn.out_proj.weight";
+                    Data &outProjWeight = this->weight[outProjWeightName];
+                    Qwen35PermuteGroupedGdnOutputForGguf(
+                        core_attn_out, outProjWeight,
+                        num_k_heads, num_v_heads, head_v_dim);
                     if (isSingleTokenDecode &&
                         core_attn_out.dataDevice == DataDevice::CUDA &&
                         core_attn_out.dataType == DataType::FLOAT16 &&
@@ -29563,20 +30389,18 @@ namespace fastllm {
 #ifdef USE_CUDA
                         if (FastllmCudaHalfMatMulFloat16AddToNoBias(
                                 core_attn_out,
-                                this->weight[language_prefix + "layers." + std::to_string(i) + ".linear_attn.out_proj.weight"],
+                                outProjWeight,
                                 hiddenStates, n, m, k)) {
                             residualAddedInBranch = true;
                         } else
 #endif
                         {
-                            Linear(core_attn_out,
-                                   this->weight[language_prefix + "layers." + std::to_string(i) + ".linear_attn.out_proj.weight"],
+                            Linear(core_attn_out, outProjWeight,
                                    Data(), attenInput);
                         }
                     } else {
-                        Linear(core_attn_out,
-                            this->weight[language_prefix + "layers." + std::to_string(i) + ".linear_attn.out_proj.weight"],
-                            Data(), attenInput);
+                        Linear(core_attn_out, outProjWeight,
+                               Data(), attenInput);
                     }
                 }
             }

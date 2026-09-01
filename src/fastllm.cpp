@@ -379,6 +379,10 @@ namespace fastllm {
         return fastllmEnv;
     }
 
+    void SetCudaGraph(bool v) {
+        fastllmEnv.cudaGraph = v;
+    }
+
     void PrintInstructionInfo() {
         std::string avx = "OFF", avx2 = "OFF", aarch64 = "OFF", neonFp16 = "OFF", neonDot = "OFF";
 #ifdef __AVX__

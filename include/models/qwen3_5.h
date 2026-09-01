@@ -291,6 +291,7 @@ namespace fastllm {
         std::unordered_map <int, std::vector <std::vector <Data*> > > singleGpuMoeBiass;
         bool moeWeightsPrepared = false;
         bool gdnMergedWeightsPrepared = false;
+        bool ggufGdnLayoutRestored = false;
         std::vector <int> mrope_sections = {11, 11, 10};
         bool visionPrepared = false;
         int vision_depth = 0;
@@ -377,6 +378,7 @@ namespace fastllm {
                                              std::map <int, int> ratios);
         void PrepareFusedMoeWeightsForDevices(const std::vector <int> &devices,
                                               std::map <int, int> ratios);
+        void RestoreGgufGdnWeights();
         void PrepareGdnWeights();
         void PrepareVision();
         Data BuildFlattenedPositionIds(const std::vector <Data*> &positionIds,

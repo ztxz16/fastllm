@@ -2929,6 +2929,7 @@ namespace fastllm {
         static std::map <std::string, std::string> ggufTypeToFastllmTypeDict = {
             {"qwen2", "qwen2"}, // llama
             {"qwen3moe", "qwen3_moe"}, {"qwen3_moe", "qwen3_moe"}, // qwen3_moe
+            {"qwen35", "qwen3_5"}, {"qwen3_5", "qwen3_5"}, // qwen3.5
             {"glm4_moe", "glm4_moe"}, // glm4_moe
             {"glm-dsa", "glm_moe_dsa"}, {"glm_moe_dsa", "glm_moe_dsa"}, // glm_moe_dsa
             {"minimax_m2", "minimax_m2"}, // minimax_m2
@@ -3000,6 +3001,8 @@ namespace fastllm {
     std::unique_ptr<basellm> CreateLLMModelFromGGUFFile(const std::string &fileName, const std::string &originalPath) {
         std::vector <ReadGGUFTask> readGGUFTasks;
         std::map <std::string, ReadGGUFTask*> readGGUFTaskDict;
+        std::unique_ptr<SafeTensors> dflashSafeTensors;
+        std::map<std::string, std::pair<SafeTensorItem*, DataType> > dflashReadTaskDict;
         std::vector <std::string> ggufFileNames = GenerateGGUFFileList(fileName);
         AssertInFastLLM(ggufFileNames.size() > 0, "0 gguf file found!");
 
@@ -3211,6 +3214,61 @@ namespace fastllm {
             // printf("config = %s\n", config.dump().c_str());
         }
 
+        std::string dflashPath;
+        const char *dflashPathEnv = std::getenv("FASTLLM_DFLASH_MODEL_PATH");
+        if (dflashPathEnv != nullptr && dflashPathEnv[0] != '\0') {
+            dflashPath = dflashPathEnv;
+            if (dflashPath.back() != '/' && dflashPath.back() != '\\') {
+                dflashPath += "/";
+            }
+        }
+        if (!dflashPath.empty()) {
+            AssertInFastLLM(
+                model->model_struct == "qwen3_5" ||
+                    ConvertGGUFTypeToFastllmType(arch) == "qwen3_5",
+                "The current DFlash integration requires a Qwen3.5 target model.");
+
+            std::string dflashConfigError;
+            auto dflashConfig = json11::Json::parse(
+                ReadAllFile(dflashPath + "config.json"), dflashConfigError);
+            AssertInFastLLM(dflashConfigError.empty(),
+                            "Failed to parse DFlash config.json.");
+            bool dflashArchitecture = false;
+            for (const auto &architecture :
+                 dflashConfig["architectures"].array_items()) {
+                dflashArchitecture |=
+                    architecture.string_value() == "DFlash2DraftModel";
+            }
+            AssertInFastLLM(dflashArchitecture,
+                            "The draft checkpoint is not DFlash2DraftModel.");
+            AddDictRecursion(model, "dflash.", dflashConfig);
+            model->weight.AddDict("dflash.model_path", dflashPath);
+
+            std::set<std::string> dflashFiles;
+            std::string dflashIndexFile =
+                dflashPath + "model.safetensors.index.json";
+            if (!FileExists(dflashIndexFile)) {
+                AssertInFastLLM(
+                    FileExists(dflashPath + "model.safetensors"),
+                    "DFlash checkpoint has no model.safetensors: " +
+                        dflashPath);
+                dflashFiles.insert(dflashPath + "model.safetensors");
+            } else {
+                std::string dflashIndexError;
+                auto dflashIndex = json11::Json::parse(
+                    ReadAllFile(dflashIndexFile),
+                    dflashIndexError)["weight_map"];
+                AssertInFastLLM(dflashIndexError.empty(),
+                                "Failed to parse DFlash safetensors index.");
+                for (const auto &item : dflashIndex.object_items()) {
+                    dflashFiles.insert(dflashPath + item.second.string_value());
+                }
+            }
+            dflashSafeTensors.reset(new SafeTensors(dflashFiles));
+            printf("[Fastllm] GGUF target: loading external DFlash2 from %s\n",
+                   dflashPath.c_str());
+        }
+
         arch = ConvertGGUFTypeToFastllmType(arch);
         int ggufMainLayerCount = GetGLMDSAGGUFMainLayerCount(params, arch, model);
 
@@ -3238,6 +3296,40 @@ namespace fastllm {
             readGGUFTasks[i].weight = &model->weight.weight[weightName];
             readGGUFTaskDict[readGGUFTasks[i].name] = &readGGUFTasks[i];
             totalLoadBytes += ggml_nbytes(&readGGUFTasks[i].tensor);
+        }
+        if (dflashSafeTensors != nullptr) {
+            auto dflashTensorNames = dflashSafeTensors->GetSortedItemNames();
+            auto dflashTensorMap = model->GetTensorMap(dflashTensorNames);
+            for (const auto &tensorName : dflashTensorNames) {
+                auto mapIt = dflashTensorMap.find(tensorName);
+                if (mapIt == dflashTensorMap.end() || mapIt->second.empty()) {
+                    continue;
+                }
+                auto tensorIt = dflashSafeTensors->itmeDict.find(tensorName);
+                AssertInFastLLM(tensorIt != dflashSafeTensors->itmeDict.end(),
+                                "DFlash tensor metadata is missing: " + tensorName);
+                for (const auto &mapped : mapIt->second) {
+                    const std::string &weightName = mapped.first;
+                    DataType dataType = mapped.second;
+                    AssertInFastLLM(
+                        dataType == DataType::FLOAT32 ||
+                            dataType == DataType::FLOAT16 ||
+                            dataType == DataType::BFLOAT16,
+                        "GGUF external DFlash only supports floating-point draft weights.");
+                    AssertInFastLLM(
+                        allWeightNames.find(weightName) == allWeightNames.end(),
+                        "Duplicate target/DFlash weight name: " + weightName);
+                    tensors.push_back(weightName);
+                    allWeightNames.insert(weightName);
+                    model->weight.AddEmptyWeight(
+                        weightName, tensorIt->second.intShape, dataType);
+                    dflashReadTaskDict[weightName] =
+                        std::make_pair(&tensorIt->second, dataType);
+                    totalLoadBytes += tensorIt->second.bytes;
+                }
+            }
+            AssertInFastLLM(!dflashReadTaskDict.empty(),
+                            "No DFlash tensors were mapped for the GGUF target.");
         }
         model->OnWeightsCreated(allWeightNames);
         ReportModelLoadProgress("weights_prepare", 1, 1);
@@ -3298,7 +3390,18 @@ namespace fastllm {
                                 WeightImportGGUFTensor(task->weight, &task->tensor, task->fileName,
                                                        task->offset, task->replaceType);
                             }
-                        } 
+                        } else if (dflashReadTaskDict.find(weightName) !=
+                                   dflashReadTaskDict.end()) {
+                            auto &task = dflashReadTaskDict[weightName];
+                            SafeTensorItem *tensor = task.first;
+                            DataType dataType = task.second;
+                            tensorBytes = tensor->bytes;
+                            tensor->CreateBuffer(dataType);
+                            model->weight[weightName].CreateFromOriData(
+                                WeightType::AUTO, dataType, tensor->buffer,
+                                nullptr, nullptr, -1, -1, -1);
+                            tensor->ClearBuffer();
+                        }
                         {
                             // try merge                                
                             locker.lock();
@@ -3375,6 +3478,11 @@ namespace fastllm {
                                         Data &mergeData = model->weight[mergeName];
                                         mergeData.name = mergeName;
                                         mergeData.isModelWeight = true;
+                                        for (const auto &input : it.inputs) {
+                                            mergeData.isGGUFData = mergeData.isGGUFData ||
+                                                model->weight[input].isGGUFData ||
+                                                model->weight[input].dataType == DATA_GGUF_FORMAT;
+                                        }
                                         if (AllInputsAreDiskWeights(model->weight.weight, it.inputs)) {
                                             MergeDiskWeightMeta(model->weight.weight, it.inputs, mergeData);
                                         } else {
@@ -3398,6 +3506,11 @@ namespace fastllm {
                                         Data &mergeData = model->weight[mergeName];
                                         mergeData.name = mergeName;
                                         mergeData.isModelWeight = true;
+                                        for (const auto &input : it.inputs) {
+                                            mergeData.isGGUFData = mergeData.isGGUFData ||
+                                                model->weight[input].isGGUFData ||
+                                                model->weight[input].dataType == DATA_GGUF_FORMAT;
+                                        }
                                         mergeData.perChannelAxis = model->weight[input0].perChannelAxis;
                                         mergeData.group = model->weight[input0].group;
                                         mergeData.groupCnt = model->weight[input0].groupCnt;

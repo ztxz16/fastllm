@@ -715,6 +715,11 @@ namespace fastllm {
 
     void WeightImportGGUFTensor(Data* weight, ggml_tensor *tensor, std::string &fileName, uint64_t offset, 
                                 GGUFWeightReplaceRule::GGUFWeightReplaceType replaceType) {
+        // Keep the source-format marker even when a GGUF tensor is imported as
+        // a plain floating-point Data object.  Some architectures need to
+        // distinguish GGUF's canonicalized parameters from their native
+        // checkpoint representation (for example Qwen3.5 RMSNorm offsets).
+        weight->isGGUFData = true;
         if (tensor->type == ggml_type::GGML_TYPE_F32) {
             weight->dataType = DataType::FLOAT32;    
         } else if (tensor->type == ggml_type::GGML_TYPE_F16) {
