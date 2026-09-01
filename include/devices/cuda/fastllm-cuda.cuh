@@ -1540,6 +1540,32 @@ bool FastllmCudaHalfMatMulFloatNVFP4(const fastllm::Data &input, fastllm::Data &
 bool FastllmCudaHalfMatMulFloatNVFP4Block16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaHalfMatMulFloatNVFP4Block16E8M0(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
+bool FastllmCudaHalfMatMulGGUFMMQ(const void *input, const void *weight,
+                                 void *output, int ggmlType,
+                                 int n, int m, int k, void *stream);
+bool FastllmCudaBFloat16MatMulGGUFMMQ(const void *input, const void *weight,
+                                     void *output, int ggmlType,
+                                     int n, int m, int k, void *stream);
+bool FastllmCudaHalfMatMulGGUFMMVQ(const void *input, const void *weight,
+                                  void *output, int ggmlType,
+                                  int n, int m, int k, void *stream);
+bool FastllmCudaBFloat16MatMulGGUFMMVQ(const void *input, const void *weight,
+                                      void *output, int ggmlType,
+                                      int n, int m, int k, void *stream);
+bool FastllmCudaFloatMatMulGGUFMMVQ(const void *input, const void *weight,
+                                   void *output, int ggmlType,
+                                   int n, int m, int k, void *stream);
+bool FastllmCudaHalfGgufGateUpSiluMulMMVQ(
+        const void *input, const void *gateWeight, const void *upWeight,
+        void *output, int ggmlType, int n, int m, int k, void *stream);
+bool FastllmCudaHalfGgufGateUpSiluMul(const fastllm::Data &input,
+                                     fastllm::Data &gateWeight,
+                                     fastllm::Data &upWeight,
+                                     fastllm::Data &output,
+                                     int n, int m, int k);
+bool FastllmCudaHalfGgufMergedGateUpSiluMul(
+        const fastllm::Data &input, fastllm::Data &weight,
+        fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaHalfMergeMOEGGUFBatch1(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &output,
                                        fastllm::Data **gateups, fastllm::Data **downs, const float *scores,
                                        bool scoresOnCuda, int topk, int hidden, int inter);
