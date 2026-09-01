@@ -641,6 +641,77 @@ namespace {
         };
     }
 
+    static fastllm::DataType ParseSigmoidMulToType(
+            const std::string &type) {
+        if (type == "fp32") {
+            return fastllm::DataType::FLOAT32;
+        }
+        if (type == "fp16") {
+            return fastllm::DataType::FLOAT16;
+        }
+        if (type == "bf16") {
+            return fastllm::DataType::BFLOAT16;
+        }
+        throw std::runtime_error(
+            "SigmoidMulTo type must be fp32, fp16 or bf16");
+    }
+
+    static OpCase MakeSigmoidMulToCase() {
+        return {
+            "sigmoid_multo",
+            "multiply by a broadcast sigmoid gate with independent dtypes",
+            []() {
+                OpTestParams params;
+                params.Add("input_dims", "2,3,4", "input tensor shape");
+                params.Add("gate_dims", "2,3,1", "broadcast gate shape");
+                params.Add("input_type", "fp32", "fp32, fp16 or bf16");
+                params.Add("gate_type", "fp32", "fp32, fp16 or bf16");
+                return params;
+            },
+            [](const OpTestParams &params, const std::string &device) {
+                fastllm::Data input =
+                    MakeTensor(params.GetInts("input_dims"), 0.37f);
+                fastllm::Data gate =
+                    MakeTensor(params.GetInts("gate_dims"), 0.83f);
+                fastllm::ToDataType(
+                    input, ParseSigmoidMulToType(
+                        params.GetString("input_type")));
+                fastllm::ToDataType(
+                    gate, ParseSigmoidMulToType(
+                        params.GetString("gate_type")));
+                return CanRunOnDevice(
+                    device, "SigmoidMulTo",
+                    {{"input", &input}, {"gate", &gate}}, {}, {});
+            },
+            [](const OpTestParams &params, const std::string &device) {
+                fastllm::Data input =
+                    MakeTensor(params.GetInts("input_dims"), 0.37f);
+                fastllm::Data gate =
+                    MakeTensor(params.GetInts("gate_dims"), 0.83f);
+                fastllm::ToDataType(
+                    input, ParseSigmoidMulToType(
+                        params.GetString("input_type")));
+                fastllm::ToDataType(
+                    gate, ParseSigmoidMulToType(
+                        params.GetString("gate_type")));
+                ScopedFirstDevice guard(device);
+                fastllm::SigmoidMulTo(input, gate);
+                fastllm::Data output;
+                fastllm::ToDataType(
+                    input, output, fastllm::DataType::FLOAT32);
+                output.ToDevice(fastllm::DataDevice::CPU);
+                return output;
+            },
+            [](const OpTestParams &params) {
+                return FloatBytes(params.GetInts("input_dims")) * 2.0 +
+                       FloatBytes(params.GetInts("gate_dims"));
+            },
+            [](const OpTestParams &params) {
+                return (double)CountElements(params.GetInts("input_dims"));
+            }
+        };
+    }
+
     static OpCase MakePermuteCase() {
         return {
             "permute",
@@ -3044,6 +3115,7 @@ namespace {
 #ifdef USE_CUDA
     struct FusedRouterTopKBenchState {
         int batch = 1;
+        int experts = 256;
         int topk = 8;
         bool withBias = true;
         bool needNorm = true;
@@ -3118,7 +3190,7 @@ namespace {
                 }
                 os << "] expected_prob=";
                 std::vector<float> referenceProbValues = ToFloatVector(referenceProb);
-                size_t probStart = (mismatch / topk) * 256;
+                size_t probStart = (mismatch / topk) * experts;
                 for (size_t i = tokenStart; i < tokenStart + topk; i++) {
                     os << (i == tokenStart ? "[" : ",")
                        << referenceProbValues[probStart + expectedIndex[i]];
@@ -3133,7 +3205,7 @@ namespace {
                 maxAbsDiff = std::max(maxAbsDiff, std::fabs(expectedScore[i] - actualScore[i]));
             }
             const bool selectedLogitFastPath =
-                !sigmoid && !withBias && needNorm;
+                experts == 256 && !sigmoid && !withBias && needNorm;
             const float scoreTolerance = sigmoid ? 1.0e-6f :
                 (selectedLogitFastPath ? 2.0e-6f : 0.0f);
             if (maxAbsDiff > scoreTolerance) {
@@ -3147,8 +3219,12 @@ namespace {
 #ifdef USE_CUDA
             FastllmCudaSetDevice(0);
             batch = params.GetInt("batch");
+            experts = params.GetInt("experts");
             sigmoid = params.GetString("activation") == "sigmoid";
-            topk = sigmoid ? 10 : 8;
+            topk = params.GetInt("topk");
+            if (topk <= 0) {
+                topk = sigmoid ? 10 : 8;
+            }
             withBias = params.GetInt("bias") != 0;
             needNorm = params.GetInt("norm") != 0;
             routeScale = params.GetFloat("route_scale");
@@ -3157,18 +3233,19 @@ namespace {
             std::string pattern = params.GetString("pattern");
             fastllm::Data fp32Logits;
             if (pattern == "unique") {
-                fastllm::Data generated = MakeTensor({batch, 256}, 0.731f, 1.7f);
+                fastllm::Data generated = MakeTensor(
+                    {batch, experts}, 0.731f, 1.7f);
                 fp32Logits.CopyFrom(generated);
             } else if (pattern == "tied") {
-                std::vector<float> values((size_t)batch * 256);
+                std::vector<float> values((size_t)batch * experts);
                 for (int token = 0; token < batch; token++) {
-                    for (int expert = 0; expert < 256; expert++) {
-                        values[(size_t)token * 256 + expert] =
+                    for (int expert = 0; expert < experts; expert++) {
+                        values[(size_t)token * experts + expert] =
                             (float)((expert * 17 + token * 13) & 7) * 0.25f;
                     }
                 }
                 fastllm::Data generated(fastllm::DataType::FLOAT32,
-                                        {batch, 256}, values);
+                                        {batch, experts}, values);
                 fp32Logits.CopyFrom(generated);
             } else {
                 throw std::runtime_error("pattern must be unique or tied");
@@ -3186,15 +3263,16 @@ namespace {
 
             fastllm::Data fp32Bias;
             if (pattern == "unique") {
-                fastllm::Data generated = MakeTensor({256}, 1.217f, 0.015f);
+                fastllm::Data generated = MakeTensor(
+                    {experts}, 1.217f, 0.015f);
                 fp32Bias.CopyFrom(generated);
             } else {
-                std::vector<float> values(256);
-                for (int expert = 0; expert < 256; expert++) {
+                std::vector<float> values(experts);
+                for (int expert = 0; expert < experts; expert++) {
                     values[expert] = (float)(expert & 3) * 0.001f;
                 }
                 fastllm::Data generated(fastllm::DataType::FLOAT32,
-                                        {256}, values);
+                                        {experts}, values);
                 fp32Bias.CopyFrom(generated);
             }
             bias.CopyFrom(fp32Bias);
@@ -3263,10 +3341,13 @@ namespace {
     static OpCase MakeFusedRouterTopKCase() {
         return {
             "fused_router_topk",
-            "benchmark and validate fused softmax/sigmoid + SelectExpert for 256 experts",
+            "benchmark and validate fused softmax/sigmoid + SelectExpert",
             []() {
                 OpTestParams params;
                 params.Add("batch", "1", "token batch size");
+                params.Add("experts", "256", "expert count");
+                params.Add("topk", "0",
+                           "selected experts (0 uses activation default)");
                 params.Add("input_type", "fp16", "fp16, bf16 or fp32");
                 params.Add("bias_type", "fp32", "fp16, bf16 or fp32");
                 params.Add("activation", "softmax", "softmax/top8 or sigmoid/top10");
@@ -5044,6 +5125,7 @@ namespace {
             MakeAddToCase(),
             MakeCatCase(),
             MakeMulCase(),
+            MakeSigmoidMulToCase(),
             MakePermuteCase(),
             MakeSplitCase(),
             MakeMatMulCase(),

@@ -4265,6 +4265,17 @@ namespace fastllm {
         }, {}, {{"groups", groups}});
     }
 
+    void Qwen4HyperProject(const Data &normalized, Data &downWeight,
+                           Data &injectionWeight, int groups,
+                           Data &activated, Data &injection) {
+        curExecutor->Run("Qwen4HyperProject", {
+                {"input", (Data*)&normalized},
+                {"downWeight", &downWeight},
+                {"injectionWeight", &injectionWeight},
+                {"output", &activated}, {"injection", &injection}
+        }, {}, {{"groups", groups}});
+    }
+
     void Qwen4HyperPrepare(const Data &lowRankProjection, int groups,
                            Data &activated) {
         curExecutor->Run("Qwen4HyperPrepare", {
@@ -4344,6 +4355,27 @@ namespace fastllm {
                 {"aLog", (Data*)&aLog}, {"dtBias", (Data*)&dtBias},
                 {"state", &state}, {"output", &output}
         }, {{"recurrentEps", recurrentEps}},
+        {{"keyHeads", keyHeads}, {"valueHeads", valueHeads},
+         {"keyDim", keyDim}, {"valueDim", valueDim}});
+    }
+
+    void GatedDeltaRuleSequence(
+            const Data &qkv, const Data &alpha, const Data &beta,
+            const Data &aLog, const Data &dtBias,
+            Data &state, int keyHeads, int valueHeads,
+            int keyDim, int valueDim, float recurrentEps, Data &output,
+            Data *stateOutput) {
+        DataDict datas = {
+                {"input", (Data*)&qkv},
+                {"alpha", (Data*)&alpha}, {"beta", (Data*)&beta},
+                {"aLog", (Data*)&aLog}, {"dtBias", (Data*)&dtBias},
+                {"state", &state}, {"output", &output}
+        };
+        if (stateOutput != nullptr) {
+            datas["stateOutput"] = stateOutput;
+        }
+        curExecutor->Run("GatedDeltaRuleSequence", datas,
+        {{"recurrentEps", recurrentEps}},
         {{"keyHeads", keyHeads}, {"valueHeads", valueHeads},
          {"keyDim", keyDim}, {"valueDim", valueDim}});
     }
@@ -4621,6 +4653,14 @@ namespace fastllm {
         }, {}, {{"axis", axis}, {"repeatTimes", repeatTimes}});
     }
 
+    void RepeatAddTo(Data &input0, const Data &input1, int axis,
+                     int repeatTimes, float alpha) {
+        curExecutor->Run("RepeatAddTo", {
+                {"input0", &input0}, {"input1", (Data*)&input1}
+        }, {{"alpha", alpha}},
+        {{"axis", axis}, {"repeatTimes", repeatTimes}});
+    }
+
     void Copy(const Data &input, Data &output) {
         curExecutor->Run("Copy", {
                 {"input", (Data*)&input}, {"output", &output}
@@ -4823,6 +4863,12 @@ namespace fastllm {
         }, {}, {});
     }
 
+    void SigmoidMulTo(Data &input, const Data &gate) {
+        curExecutor->Run("SigmoidMulTo", {
+                {"input", &input}, {"gate", (Data*)&gate}
+        }, {}, {});
+    }
+
     void Exp(const fastllm::Data &input, fastllm::Data &output) {
         curExecutor->Run("Exp", {
                 {"input", (Data*)&input}, {"output", &output}
@@ -4974,6 +5020,20 @@ namespace fastllm {
         curExecutor->Run("SelectExpert", datas, 
             {{"routeScale", routeScale}}, 
             {{"topk", topk}, {"needNorm", needNorm ? 1 : 0}});
+    };
+
+    void FusedSoftmaxSelectExpert(const Data &logits, Data &index, Data &score,
+                                  int topk, bool needNorm, float routeScale,
+                                  const Data *gateBias) {
+        DataDict datas = {{"logits", (Data*)&logits},
+                          {"index", &index}, {"score", &score}};
+        if (gateBias != nullptr) {
+            datas["gateBias"] = (Data*)gateBias;
+        }
+        curExecutor->Run("FusedSoftmaxSelectExpert", datas,
+                         {{"routeScale", routeScale}},
+                         {{"topk", topk},
+                          {"needNorm", needNorm ? 1 : 0}});
     };
 
     void RotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim) {

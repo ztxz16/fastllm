@@ -991,6 +991,16 @@ namespace fastllm {
             Data &state, int keyHeads, int valueHeads,
             int keyDim, int valueDim, float recurrentEps, Data &output);
 
+    // Small or general multi-token recurrence in token-major layout.  It
+    // advances the same float32 state in causal token order while allowing a
+    // backend to keep the whole sequence inside one operation.
+    void GatedDeltaRuleSequence(
+            const Data &qkv, const Data &alpha, const Data &beta,
+            const Data &aLog, const Data &dtBias,
+            Data &state, int keyHeads, int valueHeads,
+            int keyDim, int valueDim, float recurrentEps, Data &output,
+            Data *stateOutput = nullptr);
+
     // Qwen4-Exp hyper-connection primitives.  Keeping these behind the regular
     // executor lets CPU and CUDA share one model path while avoiding the many
     // Split/Cat/elementwise launches in the operator-composed reference.
@@ -1009,6 +1019,12 @@ namespace fastllm {
                             Data &newHistory);
     void Qwen4HyperMix(const Data &normalized, const Data &mixLogits,
                        int groups, Data &output);
+    // Compute the two bias-free hyper-connection projections and apply their
+    // prepare/injection activations.  Backends may fuse the independent
+    // projections, while the executor contract remains available on CPU.
+    void Qwen4HyperProject(const Data &normalized, Data &downWeight,
+                           Data &injectionWeight, int groups,
+                           Data &activated, Data &injection);
     // Fuse the low-rank scale and SiLU without changing either projection's
     // GEMM geometry or the independent injection-gate dataflow.
     void Qwen4HyperPrepare(const Data &lowRankProjection, int groups,
@@ -1162,6 +1178,11 @@ namespace fastllm {
 
     void Repeat(const Data &input, int axis, int repeatTimes, Data &output);
 
+    // input0 += Repeat(input1, axis, repeatTimes) * alpha without
+    // materializing the repeated tensor.
+    void RepeatAddTo(Data &input0, const Data &input1, int axis,
+                     int repeatTimes, float alpha = 1.0f);
+
     void Copy(const Data &input, Data &output);
 
     void DeepSeekV4HcPre(const Data &input, Data &hcFn, Data &hcScale, Data &hcBase,
@@ -1233,6 +1254,10 @@ namespace fastllm {
 
     void Sigmoid(const Data &input, Data &output);
 
+    // input *= cast_like(input, sigmoid(gate)). The gate may be a scalar,
+    // have the same shape as input, or broadcast over contiguous channels.
+    void SigmoidMulTo(Data &input, const Data &gate);
+
     void Normalize(const Data &input, Data &output, int axis);
 
     void Exp(const Data &input, Data &output);
@@ -1281,6 +1306,8 @@ namespace fastllm {
     void TopK(const Data &input, Data &output, int topK); // 求topk
 
     void SelectExpert(const Data &logits, Data &index, Data &score, int topk, bool needNorm = false, float routeScale = 1.0f, const Data *gateBias = nullptr); // MOE专家选择
+
+    void FusedSoftmaxSelectExpert(const Data &logits, Data &index, Data &score, int topk, bool needNorm = false, float routeScale = 1.0f, const Data *gateBias = nullptr); // Softmax与MOE专家选择融合
 
     void RotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim); // 2D position
 

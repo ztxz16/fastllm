@@ -394,6 +394,82 @@ namespace fastllm {
         });
     }
 
+    void CpuQwen4HyperProjectOp::Reshape(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &downWeight = *datas.find("downWeight")->second;
+        Data &injectionWeight = *datas.find("injectionWeight")->second;
+        Data &activated = *datas.find("output")->second;
+        Data &injection = *datas.find("injection")->second;
+        const int groups = Qwen4Groups(intParams);
+        AssertInFastLLM(
+            !input.dims.empty() && downWeight.dims.size() == 2 &&
+            injectionWeight.dims.size() == 2 && groups > 0 &&
+            input.dims.back() == downWeight.dims[1] &&
+            input.dims.back() == injectionWeight.dims[1] &&
+            injectionWeight.dims[0] == groups,
+            "Qwen4HyperProject received incompatible shapes.\n");
+
+        downWeight.weightType = WeightType::LINEAR;
+        injectionWeight.weightType = WeightType::LINEAR;
+        std::vector<int> activatedDims = input.dims;
+        activatedDims.back() = downWeight.dims[0];
+        std::vector<int> injectionDims = input.dims;
+        injectionDims.back() = injectionWeight.dims[0];
+        activated.dataType = input.dataType;
+        injection.dataType = input.dataType;
+        activated.Resize(activatedDims);
+        injection.Resize(injectionDims);
+    }
+
+    void CpuQwen4HyperProjectOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &downWeight = *datas.find("downWeight")->second;
+        Data &injectionWeight = *datas.find("injectionWeight")->second;
+        Data &activated = *datas.find("output")->second;
+        Data &injection = *datas.find("injection")->second;
+        const int groups = Qwen4Groups(intParams);
+        Qwen4AssertCpuTensor(input, "Qwen4HyperProject input");
+        Qwen4AssertCpuTensor(downWeight, "Qwen4HyperProject down weight");
+        Qwen4AssertCpuTensor(
+            injectionWeight, "Qwen4HyperProject injection weight");
+
+        Data emptyBias;
+        DoCpuLinear(input, downWeight, emptyBias, activated);
+        DoCpuLinear(input, injectionWeight, emptyBias, injection);
+
+        const DataType type = activated.dataType;
+        const int activatedCount = (int)activated.Count(0);
+        const float scale = 1.0f / groups;
+        Qwen4ParallelFor(activatedCount, [&](int start, int end) {
+            for (int index = start; index < end; index++) {
+                const float scaled = Qwen4RoundCpu(
+                    Qwen4LoadCpu(activated.cpuData, type, index) * scale,
+                    type);
+                const float value = type == DataType::BFLOAT16
+                    ? scaled / (1.0f + std::exp(-scaled))
+                    : scaled / (1.0 + expf(-scaled));
+                Qwen4StoreCpu(activated.cpuData, type, index, value);
+            }
+        });
+
+        const int injectionCount = (int)injection.Count(0);
+        Qwen4ParallelFor(injectionCount, [&](int start, int end) {
+            for (int index = start; index < end; index++) {
+                const float scaled = Qwen4RoundCpu(
+                    Qwen4LoadCpu(injection.cpuData, type, index) / groups,
+                    type);
+                const float gate = Qwen4RoundCpu(
+                    Qwen4SigmoidCpu(scaled), type);
+                Qwen4StoreCpu(injection.cpuData, type, index,
+                              Qwen4RoundCpu(gate * 2.0f, type));
+            }
+        });
+    }
+
     void CpuQwen4HyperPrepareOp::Reshape(
             const std::string &opType, const DataDict &datas,
             const FloatDict &floatParams, const IntDict &intParams) {
@@ -1155,14 +1231,22 @@ namespace fastllm {
             const std::string &opType, const DataDict &datas,
             const FloatDict &floatParams, const IntDict &intParams) {
         Data &qkv = *datas.find("input")->second;
+        Data &state = *datas.find("state")->second;
         Data &output = *datas.find("output")->second;
         const int valueHeads = intParams.find("valueHeads")->second;
         const int valueDim = intParams.find("valueDim")->second;
-        AssertInFastLLM(qkv.dims.size() == 3 && qkv.dims[1] == 1 &&
+        AssertInFastLLM(qkv.dims.size() == 3 && qkv.dims[1] > 0 &&
                         valueHeads > 0 && valueDim > 0,
-                        "Qwen4GatedDeltaRuleDecode expects one decode token.\n");
+                        "GatedDeltaRuleSequence expects a non-empty sequence.\n");
         output.dataType = DataType::FLOAT32;
-        output.Resize({qkv.dims[0], 1, valueHeads * valueDim});
+        output.Resize({qkv.dims[0], qkv.dims[1],
+                       valueHeads * valueDim});
+        auto stateOutputIt = datas.find("stateOutput");
+        if (stateOutputIt != datas.end() &&
+            stateOutputIt->second != nullptr) {
+            stateOutputIt->second->dataType = state.dataType;
+            stateOutputIt->second->Resize(state.dims);
+        }
     }
 
     void CpuQwen4GatedDeltaRuleDecodeOp::Run(
@@ -1175,6 +1259,9 @@ namespace fastllm {
         Data &dtBias = *datas.find("dtBias")->second;
         Data &state = *datas.find("state")->second;
         Data &output = *datas.find("output")->second;
+        auto stateOutputIt = datas.find("stateOutput");
+        Data *stateOutput = stateOutputIt == datas.end()
+            ? nullptr : stateOutputIt->second;
         const int keyHeads = intParams.find("keyHeads")->second;
         const int valueHeads = intParams.find("valueHeads")->second;
         const int keyDim = intParams.find("keyDim")->second;
@@ -1182,39 +1269,54 @@ namespace fastllm {
         const float recurrentEps =
             floatParams.find("recurrentEps")->second;
         const int batch = qkv.dims[0];
+        const int sequence = qkv.dims[1];
         const int qkvChannels = 2 * keyHeads * keyDim +
                                 valueHeads * valueDim;
 
-        Qwen4AssertCpuTensor(qkv, "Qwen4GatedDeltaRuleDecode qkv");
-        Qwen4AssertCpuTensor(alpha, "Qwen4GatedDeltaRuleDecode alpha");
-        Qwen4AssertCpuTensor(beta, "Qwen4GatedDeltaRuleDecode beta");
-        Qwen4AssertCpuTensor(aLog, "Qwen4GatedDeltaRuleDecode A_log");
-        Qwen4AssertCpuTensor(dtBias, "Qwen4GatedDeltaRuleDecode dt_bias");
-        Qwen4AssertCpuTensor(state, "Qwen4GatedDeltaRuleDecode state");
+        Qwen4AssertCpuTensor(qkv, "GatedDeltaRuleSequence qkv");
+        Qwen4AssertCpuTensor(alpha, "GatedDeltaRuleSequence alpha");
+        Qwen4AssertCpuTensor(beta, "GatedDeltaRuleSequence beta");
+        Qwen4AssertCpuTensor(aLog, "GatedDeltaRuleSequence A_log");
+        Qwen4AssertCpuTensor(dtBias, "GatedDeltaRuleSequence dt_bias");
+        Qwen4AssertCpuTensor(state, "GatedDeltaRuleSequence state");
         AssertInFastLLM(qkv.dataType == DataType::FLOAT32 &&
                         state.dataType == DataType::FLOAT32 &&
                         aLog.dataType == DataType::FLOAT32 &&
                         dtBias.dataType == DataType::FLOAT32 &&
                         output.dataType == DataType::FLOAT32,
-                        "Qwen4GatedDeltaRuleDecode keeps qkv, state and parameters in float32.\n");
+                        "GatedDeltaRuleSequence keeps qkv, state and parameters in float32.\n");
         AssertInFastLLM(keyHeads > 0 && valueHeads > 0 &&
                         valueHeads % keyHeads == 0 &&
                         keyDim > 0 && valueDim > 0 &&
-                        qkv.dims.size() == 3 && qkv.dims[1] == 1 &&
+                        qkv.dims.size() == 3 && sequence > 0 &&
                         qkv.dims[2] == qkvChannels &&
-                        alpha.Count(0) == (uint64_t)batch * valueHeads &&
-                        beta.Count(0) == (uint64_t)batch * valueHeads &&
+                        alpha.Count(0) ==
+                            (uint64_t)batch * sequence * valueHeads &&
+                        beta.Count(0) ==
+                            (uint64_t)batch * sequence * valueHeads &&
                         aLog.Count(0) == (uint64_t)valueHeads &&
                         dtBias.Count(0) == (uint64_t)valueHeads &&
                         state.dims == std::vector<int>({batch, valueHeads,
                                                        keyDim, valueDim}),
-                        "Qwen4GatedDeltaRuleDecode shape mismatch.\n");
+                        "GatedDeltaRuleSequence shape mismatch.\n");
+        AssertInFastLLM(
+                        stateOutput == nullptr ||
+                        (stateOutput->dataType == DataType::FLOAT32 &&
+                         stateOutput->dims == state.dims),
+                        "GatedDeltaRuleSequence state output shape mismatch.\n");
         output.Allocate(false);
+        if (stateOutput != nullptr) {
+            stateOutput->Allocate(false);
+            Qwen4AssertCpuTensor(
+                *stateOutput, "GatedDeltaRuleSequence state output");
+        }
 
         const float *qkvData = (const float*)qkv.cpuData;
         const float *aLogData = (const float*)aLog.cpuData;
         const float *dtBiasData = (const float*)dtBias.cpuData;
         float *stateData = (float*)state.cpuData;
+        float *nextStateData = stateOutput == nullptr
+            ? stateData : (float*)stateOutput->cpuData;
         float *outputData = (float*)output.cpuData;
         const int repeat = valueHeads / keyHeads;
         const float inverseHead = 1.0f / std::sqrt((float)keyDim);
@@ -1226,73 +1328,88 @@ namespace fastllm {
                 const int batchIndex = item / valueHeads;
                 const int valueHead = item % valueHeads;
                 const int keyHead = valueHead / repeat;
-                const uint64_t qkvBase =
-                    (uint64_t)batchIndex * qkvChannels;
-                const float *queryRaw = qkvData + qkvBase +
-                    (uint64_t)keyHead * keyDim;
-                const float *keyRaw = qkvData + qkvBase +
-                    (uint64_t)(keyHeads + keyHead) * keyDim;
-                const float *value = qkvData + qkvBase +
-                    (uint64_t)2 * keyHeads * keyDim +
-                    (uint64_t)valueHead * valueDim;
-
-                float querySquares = 0.0f;
-                float keySquares = 0.0f;
-                for (int channel = 0; channel < keyDim; channel++) {
-                    querySquares += queryRaw[channel] * queryRaw[channel];
-                    keySquares += keyRaw[channel] * keyRaw[channel];
-                }
-                const float queryScale = 1.0f / std::sqrt(
-                    querySquares / keyDim + recurrentEps);
-                const float keyScale = 1.0f / std::sqrt(
-                    keySquares / keyDim + recurrentEps);
-                for (int channel = 0; channel < keyDim; channel++) {
-                    query[channel] = queryRaw[channel] * queryScale *
-                                     inverseHead * inverseHead;
-                    key[channel] = keyRaw[channel] * keyScale * inverseHead;
-                }
-
-                const uint64_t gateIndex =
-                    (uint64_t)batchIndex * valueHeads + valueHead;
-                const float betaValue = Qwen4SigmoidCpu(Qwen4LoadCpu(
-                    beta.cpuData, beta.dataType, gateIndex));
-                const float alphaValue = Qwen4LoadCpu(
-                    alpha.cpuData, alpha.dataType, gateIndex);
-                const float biasedAlpha = alphaValue +
-                    dtBiasData[valueHead];
-                const float softplus = biasedAlpha > 20.0f
-                    ? biasedAlpha : std::log1p(std::exp(biasedAlpha));
-                const float logDecay =
-                    -std::exp(aLogData[valueHead]) * softplus;
-                const float decay = std::exp(logDecay);
                 float *headState = stateData +
                     (uint64_t)item * keyDim * valueDim;
+                float *headNextState = nextStateData +
+                    (uint64_t)item * keyDim * valueDim;
 
-                for (int valueChannel = 0;
-                     valueChannel < valueDim; valueChannel++) {
-                    float memory = 0.0f;
-                    for (int keyChannel = 0;
-                         keyChannel < keyDim; keyChannel++) {
-                        const uint64_t stateIndex =
-                            (uint64_t)keyChannel * valueDim + valueChannel;
-                        const float scaled = headState[stateIndex] * decay;
-                        headState[stateIndex] = scaled;
-                        memory += scaled * key[keyChannel];
+                for (int token = 0; token < sequence; token++) {
+                    const uint64_t row =
+                        (uint64_t)batchIndex * sequence + token;
+                    const uint64_t qkvBase = row * qkvChannels;
+                    const float *queryRaw = qkvData + qkvBase +
+                        (uint64_t)keyHead * keyDim;
+                    const float *keyRaw = qkvData + qkvBase +
+                        (uint64_t)(keyHeads + keyHead) * keyDim;
+                    const float *value = qkvData + qkvBase +
+                        (uint64_t)2 * keyHeads * keyDim +
+                        (uint64_t)valueHead * valueDim;
+
+                    float querySquares = 0.0f;
+                    float keySquares = 0.0f;
+                    for (int channel = 0; channel < keyDim; channel++) {
+                        querySquares +=
+                            queryRaw[channel] * queryRaw[channel];
+                        keySquares += keyRaw[channel] * keyRaw[channel];
                     }
-                    const float delta =
-                        (value[valueChannel] - memory) * betaValue;
-                    float core = 0.0f;
-                    for (int keyChannel = 0;
-                         keyChannel < keyDim; keyChannel++) {
-                        const uint64_t stateIndex =
-                            (uint64_t)keyChannel * valueDim + valueChannel;
-                        const float updated = headState[stateIndex] +
-                                              key[keyChannel] * delta;
-                        headState[stateIndex] = updated;
-                        core += updated * query[keyChannel];
+                    const float queryScale = 1.0f / std::sqrt(
+                        querySquares / keyDim + recurrentEps);
+                    const float keyScale = 1.0f / std::sqrt(
+                        keySquares / keyDim + recurrentEps);
+                    for (int channel = 0; channel < keyDim; channel++) {
+                        query[channel] = queryRaw[channel] * queryScale *
+                                         inverseHead * inverseHead;
+                        key[channel] =
+                            keyRaw[channel] * keyScale * inverseHead;
                     }
-                    outputData[(uint64_t)item * valueDim + valueChannel] =
-                        core;
+
+                    const uint64_t gateIndex =
+                        row * valueHeads + valueHead;
+                    const float betaValue = Qwen4SigmoidCpu(Qwen4LoadCpu(
+                        beta.cpuData, beta.dataType, gateIndex));
+                    const float alphaValue = Qwen4LoadCpu(
+                        alpha.cpuData, alpha.dataType, gateIndex);
+                    const float biasedAlpha =
+                        alphaValue + dtBiasData[valueHead];
+                    const float softplus = biasedAlpha > 20.0f
+                        ? biasedAlpha : std::log1p(std::exp(biasedAlpha));
+                    const float logDecay =
+                        -std::exp(aLogData[valueHead]) * softplus;
+                    const float decay = std::exp(logDecay);
+                    const float *headPreviousState =
+                        token == 0 ? headState : headNextState;
+
+                    for (int valueChannel = 0;
+                         valueChannel < valueDim; valueChannel++) {
+                        float memory = 0.0f;
+                        for (int keyChannel = 0;
+                             keyChannel < keyDim; keyChannel++) {
+                            const uint64_t stateIndex =
+                                (uint64_t)keyChannel * valueDim +
+                                valueChannel;
+                            const float previous =
+                                headPreviousState[stateIndex];
+                            const float scaled = previous * decay;
+                            headNextState[stateIndex] = scaled;
+                            memory += scaled * key[keyChannel];
+                        }
+                        const float delta =
+                            (value[valueChannel] - memory) * betaValue;
+                        float core = 0.0f;
+                        for (int keyChannel = 0;
+                             keyChannel < keyDim; keyChannel++) {
+                            const uint64_t stateIndex =
+                                (uint64_t)keyChannel * valueDim +
+                                valueChannel;
+                            const float updated = headNextState[stateIndex] +
+                                key[keyChannel] * delta;
+                            headNextState[stateIndex] = updated;
+                            core += updated * query[keyChannel];
+                        }
+                        outputData[
+                            (row * valueHeads + valueHead) * valueDim +
+                            valueChannel] = core;
+                    }
                 }
             }
         });

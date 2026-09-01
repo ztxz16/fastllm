@@ -348,6 +348,7 @@ namespace fastllm {
         this->ops["Qwen4PLEGate"] = (BaseOperator*)(new CpuQwen4PLEGateOp());
         this->ops["Qwen4PLECausalConv"] = (BaseOperator*)(new CpuQwen4PLECausalConvOp());
         this->ops["Qwen4HyperMix"] = (BaseOperator*)(new CpuQwen4HyperMixOp());
+        this->ops["Qwen4HyperProject"] = (BaseOperator*)(new CpuQwen4HyperProjectOp());
         this->ops["Qwen4HyperPrepare"] = (BaseOperator*)(new CpuQwen4HyperPrepareOp());
         this->ops["Qwen4HyperInject"] = (BaseOperator*)(new CpuQwen4HyperInjectOp());
         this->ops["Qwen4HyperCombine"] = (BaseOperator*)(new CpuQwen4HyperCombineOp());
@@ -358,6 +359,7 @@ namespace fastllm {
         this->ops["CausalDepthwiseConv1DDecode"] = (BaseOperator*)(new CpuCausalDepthwiseConv1DDecodeOp());
         this->ops["CausalDepthwiseConv1DPrefill"] = (BaseOperator*)(new CpuCausalDepthwiseConv1DPrefillOp());
         this->ops["GatedDeltaRuleDecode"] = (BaseOperator*)(new CpuQwen4GatedDeltaRuleDecodeOp());
+        this->ops["GatedDeltaRuleSequence"] = (BaseOperator*)(new CpuQwen4GatedDeltaRuleDecodeOp());
         this->ops["Qwen4GatedDeltaRuleDecode"] = (BaseOperator*)(new CpuQwen4GatedDeltaRuleDecodeOp());
         this->ops["KimiK3RMSNorm"] = (BaseOperator*)(new CpuKimiK3RMSNormOp());
         this->ops["KimiK3CausalConv1D"] = (BaseOperator*)(new CpuKimiK3CausalConv1DOp());
@@ -375,6 +377,7 @@ namespace fastllm {
         this->ops["Conv2D"] = (BaseOperator*)(new CpuConv2DOp());
         this->ops["Split"] = (BaseOperator*)(new CpuSplitOp());
         this->ops["Repeat"] = (BaseOperator*)(new CpuRepeatOp());
+        this->ops["RepeatAddTo"] = (BaseOperator*)(new CpuRepeatAddToOp());
         this->ops["Copy"] = (BaseOperator*)(new CpuCopyOp());
         this->ops["DeepSeekV4HcPre"] = (BaseOperator*)(new CpuDeepSeekV4HcPreOp());
         this->ops["DeepSeekV4HcPost"] = (BaseOperator*)(new CpuDeepSeekV4HcPostOp());
@@ -400,6 +403,7 @@ namespace fastllm {
         this->ops["Relu"] = (BaseOperator*)(new CpuReluOp());
         this->ops["Exp"] = (BaseOperator*)(new CpuExpOp());
         this->ops["Sigmoid"] = (BaseOperator*)(new CpuSigmoidOp());
+        this->ops["SigmoidMulTo"] = (BaseOperator*)(new CpuSigmoidMulToOp());
         this->ops["Gelu"] = (BaseOperator*)(new CpuGeluOp());
         this->ops["GeluNew"] = (BaseOperator*)(new CpuGeluNewOp());
         this->ops["Geglu"] = (BaseOperator*)(new CpuGegluOp());
@@ -6995,6 +6999,82 @@ ops += (long long)lines * inputDim * interDim * 2;
         }
     }
 
+    void CpuRepeatAddToOp::Run(
+            const std::string &opType, const fastllm::DataDict &datas,
+            const fastllm::FloatDict &floatParams,
+            const fastllm::IntDict &intParams) {
+        Data &input0 = *datas.find("input0")->second;
+        Data &input1 = *datas.find("input1")->second;
+        const float alpha = floatParams.find("alpha") != floatParams.end()
+            ? floatParams.find("alpha")->second : 1.0f;
+        int axis = intParams.find("axis") != intParams.end()
+            ? intParams.find("axis")->second : -1;
+        const int repeatTimes =
+            intParams.find("repeatTimes") != intParams.end()
+                ? intParams.find("repeatTimes")->second : 1;
+        AssertInFastLLM(
+            input0.dataType == input1.dataType &&
+            (input0.dataType == DataType::FLOAT32 ||
+             input0.dataType == DataType::FLOAT16 ||
+             input0.dataType == DataType::BFLOAT16),
+            "RepeatAddTo requires equal float32, float16 or bfloat16 types.\n");
+        AssertInFastLLM(
+            !input0.dims.empty() &&
+            input0.dims.size() == input1.dims.size() &&
+            repeatTimes > 0,
+            "RepeatAddTo received invalid shapes or repeat count.\n");
+        axis = (axis % (int)input0.dims.size() +
+                (int)input0.dims.size()) % (int)input0.dims.size();
+        for (int i = 0; i < (int)input0.dims.size(); i++) {
+            const int expected = i == axis
+                ? input1.dims[i] * repeatTimes : input1.dims[i];
+            AssertInFastLLM(
+                input0.dims[i] == expected,
+                "RepeatAddTo shape does not match Repeat(input1).\n");
+        }
+
+        const int outputStride = input0.Count(axis);
+        const int inputStride = input1.Count(axis);
+        const int outer = input0.Count(0) / outputStride;
+        if (input0.dataType == DataType::FLOAT32) {
+            float *output = reinterpret_cast<float *>(input0.cpuData);
+            const float *input =
+                reinterpret_cast<const float *>(input1.cpuData);
+            for (int o = 0; o < outer; o++) {
+                for (int i = 0; i < outputStride; i++) {
+                    output[o * outputStride + i] +=
+                        input[o * inputStride + i % inputStride] * alpha;
+                }
+            }
+        } else if (input0.dataType == DataType::FLOAT16) {
+            uint16_t *output = reinterpret_cast<uint16_t *>(input0.cpuData);
+            const uint16_t *input =
+                reinterpret_cast<const uint16_t *>(input1.cpuData);
+            for (int o = 0; o < outer; o++) {
+                for (int i = 0; i < outputStride; i++) {
+                    const int destination = o * outputStride + i;
+                    const int source = o * inputStride + i % inputStride;
+                    output[destination] = float_to_half(
+                        fp16tofp32.dict[output[destination]] +
+                        fp16tofp32.dict[input[source]] * alpha);
+                }
+            }
+        } else {
+            uint16_t *output = reinterpret_cast<uint16_t *>(input0.cpuData);
+            const uint16_t *input =
+                reinterpret_cast<const uint16_t *>(input1.cpuData);
+            for (int o = 0; o < outer; o++) {
+                for (int i = 0; i < outputStride; i++) {
+                    const int destination = o * outputStride + i;
+                    const int source = o * inputStride + i % inputStride;
+                    output[destination] = Float32ToBFloat16RNEBits(
+                        bf16tofp32.dict[output[destination]] +
+                        bf16tofp32.dict[input[source]] * alpha);
+                }
+            }
+        }
+    }
+
     struct CpuCopyRangeOp : MultiThreadBaseOp {
         uint8_t *output;
         uint8_t *input;
@@ -8065,6 +8145,83 @@ ops += (long long)lines * inputDim * interDim * 2;
             for (; i < len; i++) {
                 float x = inputData[i];
                 outputData[i] = 1.0 / (1.0 + exp(-x));
+            }
+        }
+    }
+
+    void CpuSigmoidMulToOp::Run(
+            const std::string &opType, const fastllm::DataDict &datas,
+            const fastllm::FloatDict &floatParams,
+            const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &gate = *(datas.find("gate")->second);
+        const int inputLen = input.Count(0);
+        const int gateLen = gate.Count(0);
+        auto supportedType = [](DataType type) {
+            return type == DataType::FLOAT32 ||
+                   type == DataType::FLOAT16 ||
+                   type == DataType::BFLOAT16;
+        };
+        AssertInFastLLM(
+            supportedType(input.dataType) && supportedType(gate.dataType),
+            "SigmoidMulTo error: input and gate should be float32, "
+            "float16 or bfloat16.\n");
+        AssertInFastLLM(
+            inputLen > 0 && gateLen > 0 &&
+            (input.dims == gate.dims || gateLen == 1 ||
+             inputLen % gateLen == 0),
+            "SigmoidMulTo error: gate shape cannot broadcast to input.\n");
+        const int channelLen = inputLen / gateLen;
+
+        auto gateIndex = [&](int index) {
+            if (gateLen == 1) {
+                return 0;
+            }
+            return input.dims == gate.dims ? index : index / channelLen;
+        };
+        auto roundedProbability = [&](int index) {
+            const int source = gateIndex(index);
+            if (gate.dataType == DataType::FLOAT16) {
+                const uint16_t bits =
+                    reinterpret_cast<const uint16_t *>(gate.cpuData)[source];
+                return fp16tofp32.dict[fp16SigmoidManager.dict[bits]];
+            }
+            if (gate.dataType == DataType::BFLOAT16) {
+                const uint16_t bits =
+                    reinterpret_cast<const uint16_t *>(gate.cpuData)[source];
+                const float value = BFloat16BitsToFloat32(bits);
+                const uint16_t probability = Float32ToBFloat16RNEBits(
+                    1.0f / (1.0f + std::exp(-value)));
+                return BFloat16BitsToFloat32(probability);
+            }
+            const float value =
+                reinterpret_cast<const float *>(gate.cpuData)[source];
+            // Match CpuSigmoidOp's float32 evaluation and rounding order.
+            return (float)(1.0 / (1.0 + exp(-value)));
+        };
+
+        if (input.dataType == DataType::FLOAT32) {
+            float *values = reinterpret_cast<float *>(input.cpuData);
+            for (int i = 0; i < inputLen; i++) {
+                values[i] *= roundedProbability(i);
+            }
+        } else if (input.dataType == DataType::FLOAT16) {
+            uint16_t *values = reinterpret_cast<uint16_t *>(input.cpuData);
+            for (int i = 0; i < inputLen; i++) {
+                const uint16_t probability =
+                    float_to_half(roundedProbability(i));
+                values[i] = float_to_half(
+                    fp16tofp32.dict[values[i]] *
+                    fp16tofp32.dict[probability]);
+            }
+        } else {
+            uint16_t *values = reinterpret_cast<uint16_t *>(input.cpuData);
+            for (int i = 0; i < inputLen; i++) {
+                const uint16_t probability = Float32ToBFloat16RNEBits(
+                    roundedProbability(i));
+                values[i] = Float32ToBFloat16RNEBits(
+                    BFloat16BitsToFloat32(values[i]) *
+                    BFloat16BitsToFloat32(probability));
             }
         }
     }

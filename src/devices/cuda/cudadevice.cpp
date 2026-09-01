@@ -4355,6 +4355,7 @@ namespace fastllm {
         this->ops["Qwen4PLEGate"] = (BaseOperator*)(new CudaQwen4PLEGateOp());
         this->ops["Qwen4PLECausalConv"] = (BaseOperator*)(new CudaQwen4PLECausalConvOp());
         this->ops["Qwen4HyperMix"] = (BaseOperator*)(new CudaQwen4HyperMixOp());
+        this->ops["Qwen4HyperProject"] = (BaseOperator*)(new CudaQwen4HyperProjectOp());
         this->ops["Qwen4HyperPrepare"] = (BaseOperator*)(new CudaQwen4HyperPrepareOp());
         this->ops["Qwen4HyperInject"] = (BaseOperator*)(new CudaQwen4HyperInjectOp());
         this->ops["Qwen4HyperCombine"] = (BaseOperator*)(new CudaQwen4HyperCombineOp());
@@ -4365,6 +4366,7 @@ namespace fastllm {
         this->ops["CausalDepthwiseConv1DDecode"] = (BaseOperator*)(new CudaCausalDepthwiseConv1DDecodeOp());
         this->ops["CausalDepthwiseConv1DPrefill"] = (BaseOperator*)(new CudaCausalDepthwiseConv1DPrefillOp());
         this->ops["GatedDeltaRuleDecode"] = (BaseOperator*)(new CudaQwen4GatedDeltaRuleDecodeOp());
+        this->ops["GatedDeltaRuleSequence"] = (BaseOperator*)(new CudaQwen4GatedDeltaRuleDecodeOp());
         this->ops["Qwen4GatedDeltaRuleDecode"] = (BaseOperator*)(new CudaQwen4GatedDeltaRuleDecodeOp());
         this->ops["KimiK3RMSNorm"] =
             (BaseOperator*)(new CudaKimiK3RMSNormOp());
@@ -4392,6 +4394,7 @@ namespace fastllm {
         this->ops["Conv2D"] = (BaseOperator*)(new CudaConv2DOp());
         this->ops["Split"] = (BaseOperator*)(new CudaSplitOp());
         this->ops["Repeat"] = (BaseOperator*)(new CudaRepeatOp());
+        this->ops["RepeatAddTo"] = (BaseOperator*)(new CudaRepeatAddToOp());
         this->ops["Copy"] = (BaseOperator*)(new CudaCopyOp());
         this->ops["DeepSeekV4HcPre"] = (BaseOperator*)(new CudaDeepSeekV4HcPreOp());
         this->ops["DeepSeekV4HcPost"] = (BaseOperator*)(new CudaDeepSeekV4HcPostOp());
@@ -4414,6 +4417,7 @@ namespace fastllm {
         this->ops["Geglu"] = (BaseOperator*)(new CudaGegluOp());
         this->ops["Silu"] = (BaseOperator*)(new CudaSiluOp());
         this->ops["Sigmoid"] = (BaseOperator*)(new CudaSigmoidOp());
+        this->ops["SigmoidMulTo"] = (BaseOperator*)(new CudaSigmoidMulToOp());
         this->ops["MambaSoftplus"] = (BaseOperator*)(new CudaMambaSoftplusOp());
         this->ops["SigmoidMambaSoftplus"] = (BaseOperator*)(new CudaSigmoidMambaSoftplusOp());
         this->ops["Swiglu"] = (BaseOperator*)(new CudaSwigluOp());
@@ -4981,6 +4985,42 @@ namespace fastllm {
         }
     }
 
+    bool CudaQwen4HyperProjectOp::CanRun(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &downWeight = *datas.find("downWeight")->second;
+        Data &injectionWeight = *datas.find("injectionWeight")->second;
+        const int groups = CudaQwen4Groups(intParams);
+        return input.dataType == DataType::FLOAT32 &&
+               downWeight.dataType == DataType::FLOAT16 &&
+               injectionWeight.dataType == DataType::FLOAT16 &&
+               !input.dims.empty() && downWeight.dims.size() == 2 &&
+               injectionWeight.dims.size() == 2 && groups > 0 &&
+               input.dims.back() == downWeight.dims[1] &&
+               input.dims.back() == injectionWeight.dims[1] &&
+               injectionWeight.dims[0] == groups;
+    }
+
+    void CudaQwen4HyperProjectOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &downWeight = *datas.find("downWeight")->second;
+        Data &injectionWeight = *datas.find("injectionWeight")->second;
+        Data &activated = *datas.find("output")->second;
+        Data &injection = *datas.find("injection")->second;
+        const int groups = CudaQwen4Groups(intParams);
+        activated.Allocate(false);
+        injection.Allocate(false);
+        if (!FastllmCudaQwen4HyperProject(
+                input, downWeight, injectionWeight,
+                activated, injection, groups)) {
+            ErrorInFastLLM(
+                "Qwen4HyperProject CUDA error: kernel rejected input.\n");
+        }
+    }
+
     bool CudaQwen4HyperPrepareOp::CanRun(
             const std::string &opType, const DataDict &datas,
             const FloatDict &floatParams, const IntDict &intParams) {
@@ -5390,6 +5430,7 @@ namespace fastllm {
         const int keyDim = intParams.find("keyDim")->second;
         const int valueDim = intParams.find("valueDim")->second;
         const int batch = qkv.dims.empty() ? 0 : qkv.dims[0];
+        const int sequence = qkv.dims.size() == 3 ? qkv.dims[1] : 0;
         const int qkvChannels = 2 * keyHeads * keyDim +
                                 valueHeads * valueDim;
         return qkv.dataType == DataType::FLOAT32 &&
@@ -5401,10 +5442,12 @@ namespace fastllm {
                keyHeads > 0 && valueHeads > 0 &&
                valueHeads % keyHeads == 0 &&
                keyDim == 128 && valueDim == 128 &&
-               qkv.dims.size() == 3 && qkv.dims[1] == 1 &&
+               qkv.dims.size() == 3 && sequence > 0 &&
                qkv.dims[2] == qkvChannels &&
-               alpha.Count(0) == (uint64_t)batch * valueHeads &&
-               beta.Count(0) == (uint64_t)batch * valueHeads &&
+               alpha.Count(0) ==
+                   (uint64_t)batch * sequence * valueHeads &&
+               beta.Count(0) ==
+                   (uint64_t)batch * sequence * valueHeads &&
                aLog.Count(0) == (uint64_t)valueHeads &&
                dtBias.Count(0) == (uint64_t)valueHeads &&
                state.dims == std::vector<int>({batch, valueHeads,
@@ -5421,6 +5464,9 @@ namespace fastllm {
         Data &dtBias = *datas.find("dtBias")->second;
         Data &state = *datas.find("state")->second;
         Data &output = *datas.find("output")->second;
+        auto stateOutputIt = datas.find("stateOutput");
+        Data *stateOutput = stateOutputIt == datas.end()
+            ? nullptr : stateOutputIt->second;
         const int keyHeads = intParams.find("keyHeads")->second;
         const int valueHeads = intParams.find("valueHeads")->second;
         const int keyDim = intParams.find("keyDim")->second;
@@ -5428,11 +5474,15 @@ namespace fastllm {
         const float recurrentEps =
             floatParams.find("recurrentEps")->second;
         output.Allocate(false);
+        if (stateOutput != nullptr) {
+            stateOutput->Allocate(false);
+        }
         if (!FastllmCudaQwen4GatedDeltaRuleDecode(
                 qkv, alpha, beta, aLog, dtBias, state, output,
-                keyHeads, valueHeads, keyDim, valueDim, recurrentEps)) {
+                keyHeads, valueHeads, keyDim, valueDim, recurrentEps,
+                stateOutput)) {
             ErrorInFastLLM(
-                "Qwen4GatedDeltaRuleDecode CUDA error: kernel rejected input.\n");
+                "GatedDeltaRuleSequence CUDA error: kernel rejected input.\n");
         }
     }
 
@@ -6370,6 +6420,49 @@ namespace fastllm {
         FastllmCudaRepeat(input.cudaData, output.cudaData, outer, repeatTimes, inputStride * unitSize, outputStride * unitSize, channels * inner * unitSize, channels * inner * unitSize);
     }
 
+    void CudaRepeatAddToOp::Run(
+            const std::string &opType, const fastllm::DataDict &datas,
+            const fastllm::FloatDict &floatParams,
+            const fastllm::IntDict &intParams) {
+        Data &input0 = *datas.find("input0")->second;
+        Data &input1 = *datas.find("input1")->second;
+        const float alpha = floatParams.find("alpha") != floatParams.end()
+            ? floatParams.find("alpha")->second : 1.0f;
+        int axis = intParams.find("axis") != intParams.end()
+            ? intParams.find("axis")->second : -1;
+        const int repeatTimes =
+            intParams.find("repeatTimes") != intParams.end()
+                ? intParams.find("repeatTimes")->second : 1;
+        AssertInFastLLM(
+            input0.dataType == input1.dataType &&
+            (input0.dataType == DataType::FLOAT32 ||
+             input0.dataType == DataType::FLOAT16 ||
+             input0.dataType == DataType::BFLOAT16),
+            "RepeatAddTo requires equal float32, float16 or bfloat16 types.\n");
+        AssertInFastLLM(
+            !input0.dims.empty() &&
+            input0.dims.size() == input1.dims.size() &&
+            repeatTimes > 0,
+            "RepeatAddTo received invalid shapes or repeat count.\n");
+        axis = (axis % (int)input0.dims.size() +
+                (int)input0.dims.size()) % (int)input0.dims.size();
+        for (int i = 0; i < (int)input0.dims.size(); i++) {
+            const int expected = i == axis
+                ? input1.dims[i] * repeatTimes : input1.dims[i];
+            AssertInFastLLM(
+                input0.dims[i] == expected,
+                "RepeatAddTo shape does not match Repeat(input1).\n");
+        }
+        const int outputStride = input0.Count(axis);
+        const int inputStride = input1.Count(axis);
+        const int outer = input0.Count(0) / outputStride;
+        AssertInFastLLM(
+            FastllmCudaRepeatAddTo(
+                input0, input1, outer, outputStride,
+                inputStride, alpha),
+            "RepeatAddTo CUDA kernel rejected its inputs.\n");
+    }
+
     void CudaCopyOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                          const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
@@ -7191,6 +7284,31 @@ namespace fastllm {
         FastllmCudaSigmoid(input, output);
     }
 
+    void CudaSigmoidMulToOp::Run(
+            const std::string &opType, const fastllm::DataDict &datas,
+            const fastllm::FloatDict &floatParams,
+            const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &gate = *(datas.find("gate")->second);
+        auto supportedType = [](DataType type) {
+            return type == DataType::FLOAT32 ||
+                   type == DataType::FLOAT16 ||
+                   type == DataType::BFLOAT16;
+        };
+        AssertInFastLLM(
+            supportedType(input.dataType) && supportedType(gate.dataType),
+            "CUDA SigmoidMulTo input and gate should be float32, "
+            "float16 or bfloat16.");
+        AssertInFastLLM(
+            input.Count(0) > 0 && gate.Count(0) > 0 &&
+            (input.dims == gate.dims || gate.Count(0) == 1 ||
+             input.Count(0) % gate.Count(0) == 0),
+            "CUDA SigmoidMulTo gate shape cannot broadcast to input.");
+        AssertInFastLLM(
+            FastllmCudaSigmoidMulTo(input, gate),
+            "CUDA SigmoidMulTo launch failed.");
+    }
+
     void CudaMambaSoftplusOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
@@ -7466,21 +7584,32 @@ namespace fastllm {
         const Data &logits = *logitsIt->second;
         int topk = intParams.find("topk") != intParams.end() ? intParams.find("topk")->second : 1;
         bool sigmoid = opType == "FusedSigmoidSelectExpert";
+        const bool validType =
+            logits.dataType == DataType::FLOAT16 ||
+            logits.dataType == DataType::BFLOAT16 ||
+            logits.dataType == DataType::FLOAT32;
+        const bool supported256 =
+            !logits.dims.empty() && logits.dims.back() == 256 &&
+            topk == (sigmoid ? 10 : 8) && validType;
+        const bool supportedQwen4 =
+            !sigmoid && !logits.dims.empty() &&
+            logits.dims.back() == 512 && topk == 10 &&
+            logits.dataType == DataType::FLOAT32;
         if ((!sigmoid && opType != "FusedSoftmaxSelectExpert") ||
-            topk != (sigmoid ? 10 : 8) ||
-            logits.dims.empty() || logits.dims.back() != 256 || logits.Count(0) == 0 ||
-            (logits.dataType != DataType::FLOAT16 &&
-             logits.dataType != DataType::BFLOAT16 &&
-             logits.dataType != DataType::FLOAT32)) {
+            logits.Count(0) == 0 ||
+            (!supported256 && !supportedQwen4)) {
             return false;
         }
         auto biasIt = datas.find("gateBias");
         if (biasIt != datas.end() && biasIt->second != nullptr && !biasIt->second->dims.empty()) {
             const Data &bias = *biasIt->second;
-            if ((bias.dataType != DataType::FLOAT32 &&
-                 bias.dataType != DataType::FLOAT16 &&
-                 bias.dataType != DataType::BFLOAT16) ||
-                bias.Count(0) != 256) {
+            const bool validBiasType = supportedQwen4
+                ? bias.dataType == DataType::FLOAT32
+                : (bias.dataType == DataType::FLOAT32 ||
+                   bias.dataType == DataType::FLOAT16 ||
+                   bias.dataType == DataType::BFLOAT16);
+            if (!validBiasType ||
+                bias.Count(0) != logits.dims.back()) {
                 return false;
             }
         }

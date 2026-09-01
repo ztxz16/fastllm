@@ -1677,32 +1677,121 @@ __global__ void FastllmSigmoidKernel(__nv_bfloat16* a,
     }
 }
 
-__global__ void FastllmSigmoidMulToKernel(float *input, const float *gate,
-                                          int len) {
-    int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (idx < len) {
-        input[idx] *= 1.0f / (1.0f + expf(-gate[idx]));
-    }
+template <typename T>
+__device__ __forceinline__ float FastllmSigmoidMulToFloat(T value);
+
+template <>
+__device__ __forceinline__ float FastllmSigmoidMulToFloat<float>(
+        float value) {
+    return value;
 }
 
-__global__ void FastllmSigmoidMulToKernel(half *input, const half *gate,
-                                          int len) {
-    int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (idx < len) {
-        float x = __half2float(gate[idx]);
-        float value = __half2float(input[idx]);
-        input[idx] = __float2half_rn(value / (1.0f + expf(-x)));
-    }
+template <>
+__device__ __forceinline__ float FastllmSigmoidMulToFloat<half>(
+        half value) {
+    return __half2float(value);
 }
 
-__global__ void FastllmSigmoidMulToKernel(__nv_bfloat16 *input,
-                                          const __nv_bfloat16 *gate,
-                                          int len) {
-    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+template <>
+__device__ __forceinline__ float FastllmSigmoidMulToFloat<__nv_bfloat16>(
+        __nv_bfloat16 value) {
+    return __bfloat162float(value);
+}
+
+template <typename T>
+__device__ __forceinline__ T FastllmSigmoidMulToFromFloat(float value);
+
+template <>
+__device__ __forceinline__ float FastllmSigmoidMulToFromFloat<float>(
+        float value) {
+    return value;
+}
+
+template <>
+__device__ __forceinline__ half FastllmSigmoidMulToFromFloat<half>(
+        float value) {
+    return __float2half_rn(value);
+}
+
+template <>
+__device__ __forceinline__ __nv_bfloat16
+FastllmSigmoidMulToFromFloat<__nv_bfloat16>(float value) {
+    return __float2bfloat16_rn(value);
+}
+
+template <typename T>
+__device__ __forceinline__ T FastllmSigmoidMulToProbability(T value);
+
+template <>
+__device__ __forceinline__ float FastllmSigmoidMulToProbability<float>(
+        float value) {
+    // Match FastllmSigmoidKernel(float), including its literal types.
+    return 1.0 / (1.0 + expf(-value));
+}
+
+template <>
+__device__ __forceinline__ half FastllmSigmoidMulToProbability<half>(
+        half value) {
+#ifdef CUDA_NO_TENSOR_CORE
+    const float x = __half2float(value);
+    return __float2half_rn(1.0 / (1.0 + expf(-x)));
+#else
+    return __hdiv(__float2half(1.0f),
+                  __hadd(__float2half(1.0f), hexp(-value)));
+#endif
+}
+
+template <>
+__device__ __forceinline__ __nv_bfloat16
+FastllmSigmoidMulToProbability<__nv_bfloat16>(__nv_bfloat16 value) {
+    const float x = __bfloat162float(value);
+    return __float2bfloat16_rn(1.0f / (1.0f + expf(-x)));
+}
+
+template <typename T>
+__device__ __forceinline__ T FastllmSigmoidMulToProduct(T value,
+                                                        T probability);
+
+template <>
+__device__ __forceinline__ float FastllmSigmoidMulToProduct<float>(
+        float value, float probability) {
+    return value * probability;
+}
+
+template <>
+__device__ __forceinline__ half FastllmSigmoidMulToProduct<half>(
+        half value, half probability) {
+#ifdef CUDA_NO_TENSOR_CORE
+    return __float2half_rn(
+        __half2float(value) * __half2float(probability));
+#else
+    return __hmul(value, probability);
+#endif
+}
+
+template <>
+__device__ __forceinline__ __nv_bfloat16
+FastllmSigmoidMulToProduct<__nv_bfloat16>(
+        __nv_bfloat16 value, __nv_bfloat16 probability) {
+    return __float2bfloat16_rn(
+        __bfloat162float(value) * __bfloat162float(probability));
+}
+
+template <typename InputT, typename GateT>
+__global__ void FastllmSigmoidMulToKernel(
+        InputT *input, const GateT *gate, int len, int gateLen,
+        int channelLen) {
+    const int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
-        float x = __bfloat162float(gate[idx]);
-        float value = __bfloat162float(input[idx]);
-        input[idx] = __float2bfloat16_rn(value / (1.0f + expf(-x)));
+        const int gateIndex = gateLen == 1 ? 0 :
+            (gateLen == len ? idx : idx / channelLen);
+        const GateT gateProbability =
+            FastllmSigmoidMulToProbability(gate[gateIndex]);
+        const InputT inputProbability =
+            FastllmSigmoidMulToFromFloat<InputT>(
+                FastllmSigmoidMulToFloat(gateProbability));
+        input[idx] = FastllmSigmoidMulToProduct(
+            input[idx], inputProbability);
     }
 }
 
@@ -2001,6 +2090,48 @@ __global__ void FastllmAddToKernel(__nv_bfloat16* a, __nv_bfloat16 *b, __nv_bflo
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
         a[idx] = __float2bfloat16_rn(__bfloat162float(a[idx]) + __bfloat162float(b[idx]) * __bfloat162float(alpha));
+    }
+}
+
+__global__ void FastllmRepeatAddToKernel(
+        float *output, const float *input, float alpha, int len,
+        int outputStride, int inputStride) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        const int source =
+            (idx / outputStride) * inputStride + idx % inputStride;
+        output[idx] += input[source] * alpha;
+    }
+}
+
+__global__ void FastllmRepeatAddToKernel(
+        half *output, const half *input, half alpha, int len,
+        int outputStride, int inputStride) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        const int source =
+            (idx / outputStride) * inputStride + idx % inputStride;
+#ifdef CUDA_NO_TENSOR_CORE
+        output[idx] = __float2half(
+            __half2float(output[idx]) +
+            __half2float(input[source]) * __half2float(alpha));
+#else
+        output[idx] = __hadd(output[idx], __hmul(input[source], alpha));
+#endif
+    }
+}
+
+__global__ void FastllmRepeatAddToKernel(
+        __nv_bfloat16 *output, const __nv_bfloat16 *input,
+        __nv_bfloat16 alpha, int len,
+        int outputStride, int inputStride) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        const int source =
+            (idx / outputStride) * inputStride + idx % inputStride;
+        output[idx] = __float2bfloat16_rn(
+            __bfloat162float(output[idx]) +
+            __bfloat162float(input[source]) * __bfloat162float(alpha));
     }
 }
 
@@ -5656,7 +5787,7 @@ bool FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
 
 namespace {
     constexpr int FASTLLM_CUDA_BATCH_COPY_MAX_SEGMENTS = 128;
-    constexpr int FASTLLM_CUDA_BATCH_COPY_BLOCKS_PER_SEGMENT = 4;
+    constexpr int FASTLLM_CUDA_BATCH_COPY_BLOCKS_PER_SEGMENT = 8;
 
     struct FastllmCudaBatchCopyParams {
         const uint8_t *srcs[FASTLLM_CUDA_BATCH_COPY_MAX_SEGMENTS];
@@ -5694,7 +5825,8 @@ namespace {
 }
 
 bool FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
-        void *const *dsts, const void *const *srcs, const size_t *sizes, int count) {
+        void *const *dsts, const void *const *srcs,
+        const size_t *sizes, int count) {
     if (count < 0 ||
         (count > 0 && (dsts == nullptr || srcs == nullptr || sizes == nullptr))) {
         return false;
@@ -5727,7 +5859,8 @@ bool FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
         }
 
         int blocks = params.count * FASTLLM_CUDA_BATCH_COPY_BLOCKS_PER_SEGMENT;
-        FastllmCudaBatchCopyKernel<<<blocks, 256, 0, cudaStreamPerThread>>>(params);
+        FastllmCudaBatchCopyKernel<<<
+            blocks, 256, 0, cudaStreamPerThread>>>(params);
         cudaError_t state = cudaGetLastError();
         checkCudaErrors("Error: CUDA error when launching batched device copy!", state);
         if (state != cudaSuccess) {
@@ -6190,35 +6323,56 @@ bool FastllmCudaSigmoid(const fastllm::Data &input, fastllm::Data &output) {
     return true;
 }
 
-bool FastllmCudaSigmoidMulTo(fastllm::Data &input,
-                             const fastllm::Data &gate) {
-    if (input.dataType != gate.dataType || input.dims != gate.dims ||
-        input.Count(0) <= 0) {
+template <typename InputT>
+static bool FastllmCudaLaunchSigmoidMulTo(
+        InputT *input, const void *gate, fastllm::DataType gateType,
+        int len, int gateLen, int channelLen, int blocks, int threads) {
+    if (gateType == fastllm::DataType::FLOAT32) {
+        FastllmSigmoidMulToKernel<<<blocks, threads>>>(
+            input, (const float*)gate, len, gateLen, channelLen);
+    } else if (gateType == fastllm::DataType::FLOAT16) {
+        FastllmSigmoidMulToKernel<<<blocks, threads>>>(
+            input, (const half*)gate, len, gateLen, channelLen);
+    } else if (gateType == fastllm::DataType::BFLOAT16) {
+        FastllmSigmoidMulToKernel<<<blocks, threads>>>(
+            input, (const __nv_bfloat16*)gate,
+            len, gateLen, channelLen);
+    } else {
         return false;
     }
-    int len = input.Count(0);
+    return true;
+}
+
+bool FastllmCudaSigmoidMulTo(fastllm::Data &input,
+                             const fastllm::Data &gate) {
+    const int len = input.Count(0);
+    const int gateLen = gate.Count(0);
+    if (len <= 0 || gateLen <= 0 ||
+        (input.dims != gate.dims && gateLen != 1 && len % gateLen != 0)) {
+        return false;
+    }
     void *inputData = FastllmCudaPrepareInput(input);
     void *gateData = FastllmCudaPrepareInput(gate);
-    int threads = std::min(256, len);
-    int blocks = (len + threads - 1) / threads;
+    const int threads = std::min(256, len);
+    const int blocks = (len + threads - 1) / threads;
+    const int channelLen = len / gateLen;
+    bool launched = false;
     if (input.dataType == fastllm::DataType::FLOAT32) {
-        FastllmSigmoidMulToKernel<<<blocks, threads>>>(
-            (float*)inputData, (const float*)gateData, len);
+        launched = FastllmCudaLaunchSigmoidMulTo(
+            (float*)inputData, gateData, gate.dataType,
+            len, gateLen, channelLen, blocks, threads);
     } else if (input.dataType == fastllm::DataType::FLOAT16) {
-        FastllmSigmoidMulToKernel<<<blocks, threads>>>(
-            (half*)inputData, (const half*)gateData, len);
+        launched = FastllmCudaLaunchSigmoidMulTo(
+            (half*)inputData, gateData, gate.dataType,
+            len, gateLen, channelLen, blocks, threads);
     } else if (input.dataType == fastllm::DataType::BFLOAT16) {
-        FastllmSigmoidMulToKernel<<<blocks, threads>>>(
-            (__nv_bfloat16*)inputData,
-            (const __nv_bfloat16*)gateData, len);
-    } else {
-        FastllmCudaFinishInput(gate, gateData);
-        FastllmCudaFinishOutput(input, inputData);
-        return false;
+        launched = FastllmCudaLaunchSigmoidMulTo(
+            (__nv_bfloat16*)inputData, gateData, gate.dataType,
+            len, gateLen, channelLen, blocks, threads);
     }
     FastllmCudaFinishInput(gate, gateData);
     FastllmCudaFinishOutput(input, inputData);
-    return true;
+    return launched;
 }
 
 bool FastllmCudaMambaSoftplus(const fastllm::Data &input, fastllm::Data &output, fastllm::Data &aLogData, fastllm::Data &dtBiasData, float outputScale) {
@@ -6455,6 +6609,40 @@ bool FastllmCudaAddTo(fastllm::Data &input0, const fastllm::Data &input1, float 
 
     FastllmCudaFinishInput(input1, input1Data);
     FastllmCudaFinishOutput(input0, cudaData);
+    return true;
+}
+
+bool FastllmCudaRepeatAddTo(
+        fastllm::Data &input0, const fastllm::Data &input1,
+        int outer, int outputStride, int inputStride, float alpha) {
+    if (outer <= 0 || outputStride <= 0 || inputStride <= 0 ||
+        outputStride % inputStride != 0) {
+        return false;
+    }
+    const int len = outer * outputStride;
+    float *output = (float *)FastllmCudaPrepareInput(input0);
+    float *input = (float *)FastllmCudaPrepareInput(input1);
+    const int threadPerBlock = std::min(1024, len);
+    const int blocks = (len - 1) / threadPerBlock + 1;
+    if (input0.dataType == fastllm::DataType::FLOAT32) {
+        FastllmRepeatAddToKernel<<<blocks, threadPerBlock>>>(
+            output, input, alpha, len, outputStride, inputStride);
+    } else if (input0.dataType == fastllm::DataType::FLOAT16) {
+        FastllmRepeatAddToKernel<<<blocks, threadPerBlock>>>(
+            (half *)output, (half *)input, __float2half_rn(alpha),
+            len, outputStride, inputStride);
+    } else if (input0.dataType == fastllm::DataType::BFLOAT16) {
+        FastllmRepeatAddToKernel<<<blocks, threadPerBlock>>>(
+            (__nv_bfloat16 *)output, (__nv_bfloat16 *)input,
+            __float2bfloat16_rn(alpha), len,
+            outputStride, inputStride);
+    } else {
+        FastllmCudaFinishInput(input1, input);
+        FastllmCudaFinishOutput(input0, output);
+        return false;
+    }
+    FastllmCudaFinishInput(input1, input);
+    FastllmCudaFinishOutput(input0, output);
     return true;
 }
 
@@ -10267,11 +10455,12 @@ __global__ void FastllmFusedSigmoidSelectExpert256Top10Kernel(
     }
 }
 
-// Qwen4 decode feeds already-normalized FP32 probabilities from 512 experts
-// into SelectExpert. One warp is enough for a single row and avoids the
-// generic kernel's block-wide TopK merge. Distinct keys use a deterministic
-// total order; exact ties rebuild the original 64-thread lists and merge tree
-// so this specialization remains compatible with the established path.
+// Qwen4 decode and speculative verification use a fixed 512-expert, top-10
+// router. APPLY_SOFTMAX joins the established 256-thread FP32 softmax with
+// selection while reproducing its max/sum/division order exactly. One warp
+// then performs TopK; exact ties rebuild the original 64-thread lists and
+// merge tree so both instantiations remain compatible with the legacy path.
+template <bool APPLY_SOFTMAX>
 __global__ void FastllmSelectExpert512Top10Kernel(
         const float *logits, const float *bias, int32_t *index, float *score,
         int hasBias, int needNorm, float routeScale) {
@@ -10286,15 +10475,75 @@ __global__ void FastllmSelectExpert512Top10Kernel(
     __shared__ float selectedProbabilities[TOPK];
     __shared__ float legacyKeys[LEGACY_THREADS][TOPK];
     __shared__ float legacyIds[LEGACY_THREADS][TOPK];
+    __shared__ float softmaxReduce[256];
+    __shared__ __align__(16) float softmaxProbabilities[512];
+    __shared__ float softmaxMaximum;
 
-    int lane = threadIdx.x;
+    int token = blockIdx.x;
+    const float *tokenLogits = logits + (size_t)token * 512;
+    index += (size_t)token * TOPK;
+    score += (size_t)token * TOPK;
+    int tid = threadIdx.x;
+    const float *probabilityLogits = tokenLogits;
+    if constexpr (APPLY_SOFTMAX) {
+        float maxValue = -1e100;
+        for (int expert = tid; expert < 512; expert += blockDim.x) {
+            maxValue = max(maxValue, tokenLogits[expert]);
+        }
+        softmaxReduce[tid] = maxValue;
+        __syncthreads();
+        for (unsigned int stride = blockDim.x / 2;
+             stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                softmaxReduce[tid] = max(
+                    softmaxReduce[tid],
+                    softmaxReduce[tid + stride]);
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            softmaxMaximum = softmaxReduce[0];
+        }
+        __syncthreads();
+
+        float sum = 0.0f;
+        for (int expert = tid; expert < 512; expert += blockDim.x) {
+            softmaxProbabilities[expert] =
+                exp(tokenLogits[expert] - softmaxMaximum);
+            sum += softmaxProbabilities[expert];
+        }
+        softmaxReduce[tid] = sum;
+        __syncthreads();
+        for (unsigned int stride = blockDim.x / 2;
+             stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                softmaxReduce[tid] += softmaxReduce[tid + stride];
+            }
+            __syncthreads();
+        }
+        if (tid == 0 && fabs(softmaxReduce[0]) < 1e-6) {
+            softmaxReduce[0] = 0.0001f;
+        }
+        __syncthreads();
+        for (int expert = tid; expert < 512; expert += blockDim.x) {
+            softmaxProbabilities[expert] /= softmaxReduce[0];
+        }
+        __syncthreads();
+        probabilityLogits = softmaxProbabilities;
+    }
+    if (tid >= 32) {
+        return;
+    }
+    int lane = tid;
     int firstExpert = lane * VALUES_PER_LANE;
     float probabilities[VALUES_PER_LANE];
     float choiceKeys[VALUES_PER_LANE];
     float firstProbabilities[8];
     float secondProbabilities[8];
-    FastllmRouterLoad8(logits + firstExpert, firstProbabilities);
-    FastllmRouterLoad8(logits + firstExpert + 8, secondProbabilities);
+    FastllmRouterLoad8(
+        probabilityLogits + firstExpert, firstProbabilities);
+    FastllmRouterLoad8(
+        probabilityLogits + firstExpert + 8, secondProbabilities);
 #pragma unroll
     for (int part = 0; part < VALUES_PER_LANE; ++part) {
         int expert = firstExpert + part;
@@ -10487,7 +10736,7 @@ __global__ void FastllmSelectExpert512Top10Kernel(
 #pragma unroll
             for (int rank = 0; rank < TOPK; ++rank) {
                 int expert = (int)legacyIds[0][rank];
-                float probability = logits[expert];
+                float probability = probabilityLogits[expert];
                 if (isfinite(probability)) {
                     selectedSum += probability;
                 }
@@ -10499,7 +10748,7 @@ __global__ void FastllmSelectExpert512Top10Kernel(
 #pragma unroll
         for (int rank = 0; rank < TOPK; ++rank) {
             int expert = (int)legacyIds[0][rank];
-            float probability = logits[expert];
+            float probability = probabilityLogits[expert];
             index[rank] = expert;
             score[rank] = (isfinite(probability) ? probability : 0.0f) /
                           selectedSum * routeScale;
@@ -11432,6 +11681,56 @@ bool FastllmCudaFusedSoftmaxSelectExpert(
         const fastllm::Data &logits, const fastllm::Data *gateBias,
         fastllm::Data &index, fastllm::Data &score,
         int topk, bool needNorm, float routeScale) {
+#ifndef USE_ROCM
+    const bool qwen4Shape =
+        topk == 10 && !logits.dims.empty() &&
+        logits.dims.back() == 512 && logits.Count(0) > 0 &&
+        logits.dataType == fastllm::DataType::FLOAT32;
+    if (qwen4Shape) {
+        const bool hasBias =
+            gateBias != nullptr && !gateBias->dims.empty();
+        if (hasBias &&
+            (gateBias->Count(0) != 512 ||
+             gateBias->dataType != fastllm::DataType::FLOAT32)) {
+            return false;
+        }
+        const float *cudaLogits = reinterpret_cast<const float *>(
+            FastllmCudaPrepareInput(logits));
+        const float *cudaBias = hasBias
+            ? reinterpret_cast<const float *>(
+                  FastllmCudaPrepareInput(*gateBias))
+            : nullptr;
+        int32_t *cudaIndex = reinterpret_cast<int32_t *>(
+            FastllmCudaPrepareOutput(index));
+        float *cudaScore = reinterpret_cast<float *>(
+            FastllmCudaPrepareOutput(score));
+        if (cudaLogits == nullptr || cudaIndex == nullptr ||
+            cudaScore == nullptr || (hasBias && cudaBias == nullptr)) {
+            FastllmCudaFinishInput(logits, (void *)cudaLogits);
+            if (hasBias) {
+                FastllmCudaFinishInput(*gateBias, (void *)cudaBias);
+            }
+            return false;
+        }
+        const int tokens = (int)(logits.Count(0) / 512);
+        FastllmSelectExpert512Top10Kernel<true><<<tokens, 256>>>(
+            cudaLogits, cudaBias, cudaIndex, cudaScore,
+            hasBias ? 1 : 0, needNorm ? 1 : 0, routeScale);
+        const cudaError_t state = cudaGetLastError();
+        if (state != cudaSuccess) {
+            checkCudaErrors(
+                "Error: fused Qwen4 SelectExpert launch failed!",
+                state);
+        }
+        FastllmCudaFinishInput(logits, (void *)cudaLogits);
+        if (hasBias) {
+            FastllmCudaFinishInput(*gateBias, (void *)cudaBias);
+        }
+        FastllmCudaFinishOutput(index, cudaIndex);
+        FastllmCudaFinishOutput(score, cudaScore);
+        return state == cudaSuccess;
+    }
+#endif
     if (topk != 8 || logits.dims.empty() || logits.dims.back() != 256 || logits.Count(0) == 0 ||
         (logits.dataType != fastllm::DataType::FLOAT16 &&
          logits.dataType != fastllm::DataType::BFLOAT16 &&
@@ -11622,8 +11921,8 @@ bool FastllmCudaSelectExpert(const fastllm::Data &logits, const fastllm::Data *g
         cudaLogits, cudaBias, cudaIndex, cudaScore, n, numExperts,
         topk, hasBias, needNorm, routeScale);
 #else
-    if (n == 1 && numExperts == 512 && topk == 10) {
-        FastllmSelectExpert512Top10Kernel<<<1, 32>>>(
+    if (n <= 9 && numExperts == 512 && topk == 10) {
+        FastllmSelectExpert512Top10Kernel<false><<<n, 32>>>(
             cudaLogits, cudaBias, cudaIndex, cudaScore,
             hasBias, needNorm, routeScale);
     } else {

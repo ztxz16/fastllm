@@ -3,11 +3,14 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cub/block/block_radix_sort.cuh>
 
 #include <algorithm>
 #include <cfloat>
 #include <cstdint>
 #include <cmath>
+#include <cstring>
+#include <limits>
 #include <type_traits>
 #include <vector>
 
@@ -844,8 +847,8 @@ namespace {
 
     template <typename T>
     __global__ void CausalDepthwiseConv1DPrefillStateKernel(
-            const T *input, float *state,
-            int total, int sequence, int channels, int kernel) {
+            const T *input, float *state, int total, int sequence,
+            int channels, int kernel) {
         const int item = blockIdx.x * blockDim.x + threadIdx.x;
         if (item >= total) {
             return;
@@ -872,28 +875,28 @@ namespace {
         }
     }
 
-    template <typename T>
+    template <typename T, bool OUT_OF_PLACE_STATE>
     __global__ __launch_bounds__(128) void Qwen4GatedDeltaRuleDecodeKernel(
             const float *qkv, const T *alpha, const T *beta,
             const float *aLog, const float *dtBias, float *state,
-            float *output, int keyHeads, int valueHeads,
-            float recurrentEps, float inverseHead) {
+            float *stateOutput, float *output,
+            int keyHeads, int valueHeads,
+            int sequence, float recurrentEps, float inverseHead) {
         constexpr int KEY_DIM = 128;
         constexpr int VALUE_DIM = 128;
         const int item = blockIdx.x;
-        const int batch = item / valueHeads;
-        const int valueHead = item - batch * valueHeads;
+        const int batchIndex = item / valueHeads;
+        const int valueHead = item - batchIndex * valueHeads;
         const int repeat = valueHeads / keyHeads;
         const int keyHead = valueHead / repeat;
         const int qkvChannels = (2 * keyHeads + valueHeads) * KEY_DIM;
-        const uint64_t qkvBase = (uint64_t)batch * qkvChannels;
-        const float *queryRaw = qkv + qkvBase + keyHead * KEY_DIM;
-        const float *keyRaw = qkv + qkvBase +
-                              (keyHeads + keyHead) * KEY_DIM;
-        const float *value = qkv + qkvBase +
-                             (2 * keyHeads + valueHead) * KEY_DIM;
         float *headState = state +
             (uint64_t)item * KEY_DIM * VALUE_DIM;
+        float *headNextState = headState;
+        if constexpr (OUT_OF_PLACE_STATE) {
+            headNextState = stateOutput +
+                (uint64_t)item * KEY_DIM * VALUE_DIM;
+        }
 
         __shared__ float queryNorm[KEY_DIM];
         __shared__ float keyNorm[KEY_DIM];
@@ -901,9 +904,175 @@ namespace {
         __shared__ float gateValues[2];
 
         const int tid = threadIdx.x;
-        if (tid < 32) {
-            const float4 queryValue = ((const float4*)queryRaw)[tid];
-            const float4 keyValue = ((const float4*)keyRaw)[tid];
+        for (int token = 0; token < sequence; token++) {
+            const uint64_t row =
+                (uint64_t)batchIndex * sequence + token;
+            const uint64_t qkvBase = row * qkvChannels;
+            const float *queryRaw =
+                qkv + qkvBase + keyHead * KEY_DIM;
+            const float *keyRaw = qkv + qkvBase +
+                (keyHeads + keyHead) * KEY_DIM;
+            const float *value = qkv + qkvBase +
+                (2 * keyHeads + valueHead) * KEY_DIM;
+
+            if (tid < 32) {
+                const float4 queryValue = ((const float4*)queryRaw)[tid];
+                const float4 keyValue = ((const float4*)keyRaw)[tid];
+                float querySquares = queryValue.x * queryValue.x +
+                                     queryValue.y * queryValue.y +
+                                     queryValue.z * queryValue.z +
+                                     queryValue.w * queryValue.w;
+                float keySquares = keyValue.x * keyValue.x +
+                                   keyValue.y * keyValue.y +
+                                   keyValue.z * keyValue.z +
+                                   keyValue.w * keyValue.w;
+#pragma unroll
+                for (int offset = 16; offset > 0; offset >>= 1) {
+                    querySquares += __shfl_down_sync(
+                        0xffffffffu, querySquares, offset);
+                    keySquares += __shfl_down_sync(
+                        0xffffffffu, keySquares, offset);
+                }
+                if (tid == 0) {
+                    normScales[0] = rsqrtf(
+                        querySquares / KEY_DIM + recurrentEps);
+                    normScales[1] = rsqrtf(
+                        keySquares / KEY_DIM + recurrentEps);
+                }
+            }
+            if (tid == 0) {
+                const uint64_t gateIndex = row * valueHeads + valueHead;
+                const float alphaValue =
+                    Qwen4CudaToFloat(alpha[gateIndex]);
+                const float biasedAlpha =
+                    alphaValue + dtBias[valueHead];
+                const float softplus = biasedAlpha > 20.0f
+                    ? biasedAlpha : log1p(expf(biasedAlpha));
+                const float betaValue =
+                    Qwen4CudaToFloat(beta[gateIndex]);
+                // Preserve the established single-token expressions exactly.
+                gateValues[0] = 1.0 / (1.0 + expf(-betaValue));
+                gateValues[1] = expf(
+                    -expf((double)aLog[valueHead]) * softplus);
+            }
+            __syncthreads();
+
+            // Preserve the float32 write/read boundary between normalization
+            // and the additional query scale used by the decode operation.
+            queryNorm[tid] =
+                queryRaw[tid] * normScales[0] * inverseHead;
+            keyNorm[tid] = keyRaw[tid] * normScales[1] * inverseHead;
+            __syncthreads();
+            queryNorm[tid] *= inverseHead;
+            __syncthreads();
+
+            float memory = 0.0f;
+            const float *headPreviousState = headState;
+            if constexpr (OUT_OF_PLACE_STATE) {
+                if (token > 0) {
+                    headPreviousState = headNextState;
+                }
+            }
+#pragma unroll
+            for (int keyChannel = 0; keyChannel < KEY_DIM; keyChannel++) {
+                const uint64_t stateIndex =
+                    (uint64_t)keyChannel * VALUE_DIM + tid;
+                const float previous = headPreviousState[stateIndex];
+                const float scaled = previous * gateValues[1];
+                memory += scaled * keyNorm[keyChannel];
+            }
+            const float delta =
+                (value[tid] - memory) * gateValues[0];
+            float core = 0.0f;
+#pragma unroll
+            for (int keyChannel = 0; keyChannel < KEY_DIM; keyChannel++) {
+                const uint64_t stateIndex =
+                    (uint64_t)keyChannel * VALUE_DIM + tid;
+                // Recompute the rounded float32 decay product instead of
+                // writing it to global memory in the first pass and loading
+                // it here.  Every thread owns one value column, so the state
+                // remains unchanged until this pass without introducing a
+                // dependency.  This preserves the established arithmetic
+                // while reducing recurrent-state traffic from four to three
+                // float words per element.
+                const float scaled =
+                    headPreviousState[stateIndex] * gateValues[1];
+                const float updated = scaled +
+                                      keyNorm[keyChannel] * delta;
+                headNextState[stateIndex] = updated;
+                core += updated * queryNorm[keyChannel];
+            }
+            output[(row * valueHeads + valueHead) * VALUE_DIM + tid] =
+                core;
+            __syncthreads();
+        }
+    }
+
+    // Exact SM120 short-sequence mapping.  A warp owns 32 adjacent value
+    // channels, so each lane retains the generic kernel's strictly increasing
+    // K reduction order.  Four independent blocks per value head expose the
+    // same 128 lanes to four times as many SMs while caching each state tile
+    // across all speculative tokens.
+    template <typename T, bool OUT_OF_PLACE_STATE>
+    __global__ __launch_bounds__(32)
+    void Qwen4GatedDeltaRuleSequenceValueTileSm120Kernel(
+            const float *qkv, const T *alpha, const T *beta,
+            const float *aLog, const float *dtBias, float *state,
+            float *stateOutput, float *output,
+            int keyHeads, int valueHeads,
+            int sequence, float recurrentEps, float inverseHead) {
+        constexpr int KEY_DIM = 128;
+        constexpr int VALUE_DIM = 128;
+        constexpr int VALUE_TILE = 32;
+        constexpr int TILES = VALUE_DIM / VALUE_TILE;
+
+        const int item = blockIdx.x / TILES;
+        const int tile = blockIdx.x - item * TILES;
+        const int batchIndex = item / valueHeads;
+        const int valueHead = item - batchIndex * valueHeads;
+        const int repeat = valueHeads / keyHeads;
+        const int keyHead = valueHead / repeat;
+        const int qkvChannels = (2 * keyHeads + valueHeads) * KEY_DIM;
+        const int lane = threadIdx.x;
+        const int valueChannel = tile * VALUE_TILE + lane;
+        float *headState = state +
+            (uint64_t)item * KEY_DIM * VALUE_DIM;
+        float *headNextState = headState;
+        if constexpr (OUT_OF_PLACE_STATE) {
+            headNextState = stateOutput +
+                (uint64_t)item * KEY_DIM * VALUE_DIM;
+        }
+
+        __shared__ float stateTile[KEY_DIM * VALUE_TILE];
+        __shared__ float queryNorm[KEY_DIM];
+        __shared__ float keyNorm[KEY_DIM];
+        __shared__ float normScales[2];
+        __shared__ float gateValues[2];
+
+#pragma unroll
+        for (int keyChannel = 0; keyChannel < KEY_DIM; keyChannel++) {
+            const uint64_t stateIndex =
+                (uint64_t)keyChannel * VALUE_DIM + valueChannel;
+            const float previous = headState[stateIndex];
+            stateTile[keyChannel * VALUE_TILE + lane] = previous;
+        }
+        __syncwarp();
+
+        for (int token = 0; token < sequence; token++) {
+            const uint64_t row =
+                (uint64_t)batchIndex * sequence + token;
+            const uint64_t qkvBase = row * qkvChannels;
+            const float *queryRaw =
+                qkv + qkvBase + keyHead * KEY_DIM;
+            const float *keyRaw = qkv + qkvBase +
+                (keyHeads + keyHead) * KEY_DIM;
+            const float *value = qkv + qkvBase +
+                (2 * keyHeads + valueHead) * KEY_DIM;
+
+            const float4 queryValue =
+                reinterpret_cast<const float4 *>(queryRaw)[lane];
+            const float4 keyValue =
+                reinterpret_cast<const float4 *>(keyRaw)[lane];
             float querySquares = queryValue.x * queryValue.x +
                                  queryValue.y * queryValue.y +
                                  queryValue.z * queryValue.z +
@@ -919,59 +1088,377 @@ namespace {
                 keySquares += __shfl_down_sync(
                     0xffffffffu, keySquares, offset);
             }
-            if (tid == 0) {
+            if (lane == 0) {
                 normScales[0] = rsqrtf(
                     querySquares / KEY_DIM + recurrentEps);
                 normScales[1] = rsqrtf(
                     keySquares / KEY_DIM + recurrentEps);
+                const uint64_t gateIndex = row * valueHeads + valueHead;
+                const float alphaValue =
+                    Qwen4CudaToFloat(alpha[gateIndex]);
+                const float biasedAlpha =
+                    alphaValue + dtBias[valueHead];
+                const float softplus = biasedAlpha > 20.0f
+                    ? biasedAlpha : log1p(expf(biasedAlpha));
+                const float betaValue =
+                    Qwen4CudaToFloat(beta[gateIndex]);
+                gateValues[0] = 1.0 / (1.0 + expf(-betaValue));
+                gateValues[1] = expf(
+                    -expf((double)aLog[valueHead]) * softplus);
+            }
+            __syncwarp();
+
+#pragma unroll
+            for (int part = 0; part < 4; part++) {
+                const int channel = lane + part * 32;
+                queryNorm[channel] =
+                    queryRaw[channel] * normScales[0] * inverseHead;
+                keyNorm[channel] =
+                    keyRaw[channel] * normScales[1] * inverseHead;
+            }
+            __syncwarp();
+#pragma unroll
+            for (int part = 0; part < 4; part++) {
+                const int channel = lane + part * 32;
+                queryNorm[channel] *= inverseHead;
+            }
+            __syncwarp();
+
+            float memory = 0.0f;
+#pragma unroll
+            for (int keyChannel = 0; keyChannel < KEY_DIM; keyChannel++) {
+                const float scaled =
+                    stateTile[keyChannel * VALUE_TILE + lane] *
+                    gateValues[1];
+                memory += scaled * keyNorm[keyChannel];
+            }
+            const float delta =
+                (value[valueChannel] - memory) * gateValues[0];
+            float core = 0.0f;
+#pragma unroll
+            for (int keyChannel = 0; keyChannel < KEY_DIM; keyChannel++) {
+                const int stateIndex =
+                    keyChannel * VALUE_TILE + lane;
+                const float scaled =
+                    stateTile[stateIndex] * gateValues[1];
+                const float updated = scaled +
+                    keyNorm[keyChannel] * delta;
+                stateTile[stateIndex] = updated;
+                core += updated * queryNorm[keyChannel];
+            }
+            output[(row * valueHeads + valueHead) * VALUE_DIM +
+                   valueChannel] = core;
+            __syncwarp();
+        }
+
+#pragma unroll
+        for (int keyChannel = 0; keyChannel < KEY_DIM; keyChannel++) {
+            headNextState[
+                (uint64_t)keyChannel * VALUE_DIM + valueChannel] =
+                stateTile[keyChannel * VALUE_TILE + lane];
+        }
+    }
+
+    // Reproduce the verifier's materialized operation chain exactly:
+    //   FP32 core -> FP16(rz) -> RMSNorm(FP16, 128) -> Sigmoid(FP16) -> Mul(FP16).
+    // One warp evaluates the same two legacy warp reductions independently
+    // and combines them in the same order as FastllmRMSNormHalf128ExactKernel.
+    __global__ __launch_bounds__(32) void Qwen4GdnOutputGateExactKernel(
+            const float *input, const float *weight, const half *gate,
+            half *output, float eps) {
+        constexpr int CHANNELS = 128;
+        const int row = blockIdx.x;
+        const int lane = threadIdx.x;
+        input += (uint64_t)row * CHANNELS;
+        gate += (uint64_t)row * CHANNELS;
+        output += (uint64_t)row * CHANNELS;
+
+        const float2 raw0 = *reinterpret_cast<const float2 *>(
+            input + lane * 2);
+        const float2 raw1 = *reinterpret_cast<const float2 *>(
+            input + (lane + 32) * 2);
+        const half2 rounded0 = __halves2half2(
+            __float2half_rz(raw0.x), __float2half_rz(raw0.y));
+        const half2 rounded1 = __halves2half2(
+            __float2half_rz(raw1.x), __float2half_rz(raw1.y));
+        const float2 value0 = __half22float2(rounded0);
+        const float2 value1 = __half22float2(rounded1);
+        float sum0 = value0.x * value0.x + value0.y * value0.y;
+        float sum1 = value1.x * value1.x + value1.y * value1.y;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum0 += __shfl_down_sync(0xffffffffu, sum0, offset);
+            sum1 += __shfl_down_sync(0xffffffffu, sum1, offset);
+        }
+        float scale = 0.0f;
+        if (lane == 0) {
+            scale = rsqrtf((sum0 + sum1) / CHANNELS + eps);
+        }
+        scale = __shfl_sync(0xffffffffu, scale, 0);
+
+        const half2 gate0 = reinterpret_cast<const half2 *>(gate)[lane];
+        const half2 gate1 =
+            reinterpret_cast<const half2 *>(gate)[lane + 32];
+        half2 *output2 = reinterpret_cast<half2 *>(output);
+        const float2 values[2] = {value0, value1};
+        const half2 gates[2] = {gate0, gate1};
+#pragma unroll
+        for (int part = 0; part < 2; part++) {
+            const int index = lane + part * 32;
+            const half rms0 = __float2half_rn(
+                values[part].x * scale * __ldg(weight + index * 2));
+            const half rms1 = __float2half_rn(
+                values[part].y * scale * __ldg(weight + index * 2 + 1));
+            const half gateInput0 = __low2half(gates[part]);
+            const half gateInput1 = __high2half(gates[part]);
+#ifdef CUDA_NO_TENSOR_CORE
+            const half sigmoid0 = __float2half_rn(
+                1.0f / (1.0f + expf(-__half2float(gateInput0))));
+            const half sigmoid1 = __float2half_rn(
+                1.0f / (1.0f + expf(-__half2float(gateInput1))));
+            const half result0 = __float2half_rn(
+                __half2float(sigmoid0) * __half2float(rms0));
+            const half result1 = __float2half_rn(
+                __half2float(sigmoid1) * __half2float(rms1));
+#else
+            const half one = __float2half_rn(1.0f);
+            const half sigmoid0 = __hdiv(
+                one, __hadd(one, hexp(-gateInput0)));
+            const half sigmoid1 = __hdiv(
+                one, __hadd(one, hexp(-gateInput1)));
+            const half result0 = __hmul(rms0, sigmoid0);
+            const half result1 = __hmul(rms1, sigmoid1);
+#endif
+            output2[index] = __halves2half2(result0, result1);
+        }
+    }
+
+    struct Qwen4LinearReplayPointers {
+        const void *convInput;
+        const float *convWeight;
+        const float *convCheckpoint;
+        float *convState;
+        float *convolved;
+        const void *alpha;
+        const void *beta;
+        const float *aLog;
+        const float *dtBias;
+        const float *recurrentCheckpoint;
+        float *recurrentState;
+        float *coreOutput;
+    };
+
+    static_assert(sizeof(Qwen4LinearReplayPointers) == 12 * sizeof(void*),
+                  "Qwen4 replay pointer table must not contain padding");
+
+    __global__ void Qwen4LinearReplayRestoreKernel(
+            const Qwen4LinearReplayPointers *layers,
+            uint64_t totalVectors, int vectorsPerLayer,
+            int convVectors) {
+        for (uint64_t item =
+                 (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+             item < totalVectors;
+             item += (uint64_t)blockDim.x * gridDim.x) {
+            const int layer = item / vectorsPerLayer;
+            const int local = item - (uint64_t)layer * vectorsPerLayer;
+            const Qwen4LinearReplayPointers &pointers = layers[layer];
+            if (local < convVectors) {
+                ((float4*)pointers.convState)[local] =
+                    ((const float4*)pointers.convCheckpoint)[local];
+            } else {
+                const int recurrentLocal = local - convVectors;
+                ((float4*)pointers.recurrentState)[recurrentLocal] =
+                    ((const float4*)pointers.recurrentCheckpoint)[
+                        recurrentLocal];
             }
         }
-        if (tid == 0) {
-            const float alphaValue = Qwen4CudaToFloat(alpha[item]);
-            const float biasedAlpha = alphaValue + dtBias[valueHead];
-            const float softplus = biasedAlpha > 20.0f
-                ? biasedAlpha : log1p(expf(biasedAlpha));
-            const float betaValue = Qwen4CudaToFloat(beta[item]);
-            // The reference path casts both projections to float32 before
-            // Sigmoid/MambaSoftplus.  Mirror its expressions exactly while
-            // consuming the original activation values in-place.
-            gateValues[0] = 1.0 / (1.0 + expf(-betaValue));
-            gateValues[1] = expf(
-                -expf((double)aLog[valueHead]) * softplus);
-        }
-        __syncthreads();
+    }
 
-        // The reference executes RMSNorm and the extra query scaling as two
-        // operations.  Preserve the intervening float32 write/read boundary;
-        // otherwise nvcc may reassociate four multiplies and shift the final
-        // fp16 core output by one ULP.
-        queryNorm[tid] = queryRaw[tid] * normScales[0] * inverseHead;
-        keyNorm[tid] = keyRaw[tid] * normScales[1] * inverseHead;
-        __syncthreads();
-        queryNorm[tid] *= inverseHead;
-        __syncthreads();
+    template <typename T>
+    __global__ void Qwen4LinearReplayConvOutputKernel(
+            const Qwen4LinearReplayPointers *layers,
+            uint64_t total, int sequence, int channels,
+            int kernel, bool silu) {
+        for (uint64_t item =
+                 (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+             item < total;
+             item += (uint64_t)blockDim.x * gridDim.x) {
+            const uint64_t layerStride =
+                (uint64_t)sequence * channels;
+            const int layer = item / layerStride;
+            const uint64_t local = item - (uint64_t)layer * layerStride;
+            const int token = local / channels;
+            const int channel = local - (uint64_t)token * channels;
+            const Qwen4LinearReplayPointers &pointers = layers[layer];
+            const T *input = (const T*)pointers.convInput;
+            const float *weightRow = pointers.convWeight +
+                (uint64_t)channel * kernel;
+            const float *stateRow = pointers.convState +
+                (uint64_t)channel * kernel;
+            float value = 0.0f;
+            for (int tap = 0; tap < kernel; tap++) {
+                const int sourceToken = token - kernel + 1 + tap;
+                const float sample = sourceToken >= 0
+                    ? Qwen4CudaToFloat(input[
+                          (uint64_t)sourceToken * channels + channel])
+                    : stateRow[kernel + sourceToken];
+                value += sample * weightRow[tap];
+            }
+            if (silu) {
+                value = value / (1.0 + expf(-value));
+            }
+            pointers.convolved[local] = value;
+        }
+    }
 
-        float memory = 0.0f;
-#pragma unroll
-        for (int keyChannel = 0; keyChannel < KEY_DIM; keyChannel++) {
-            const uint64_t stateIndex =
-                (uint64_t)keyChannel * VALUE_DIM + tid;
-            const float scaled = headState[stateIndex] * gateValues[1];
-            headState[stateIndex] = scaled;
-            memory += scaled * keyNorm[keyChannel];
+    template <typename T>
+    __global__ void Qwen4LinearReplayConvStateKernel(
+            const Qwen4LinearReplayPointers *layers,
+            int total, int sequence, int channels, int kernel) {
+        const int item = blockIdx.x * blockDim.x + threadIdx.x;
+        if (item >= total) {
+            return;
         }
-        const float delta = (value[tid] - memory) * gateValues[0];
-        float core = 0.0f;
-#pragma unroll
-        for (int keyChannel = 0; keyChannel < KEY_DIM; keyChannel++) {
-            const uint64_t stateIndex =
-                (uint64_t)keyChannel * VALUE_DIM + tid;
-            const float updated = headState[stateIndex] +
-                                  keyNorm[keyChannel] * delta;
-            headState[stateIndex] = updated;
-            core += updated * queryNorm[keyChannel];
+        const int layer = item / channels;
+        const int channel = item - layer * channels;
+        const Qwen4LinearReplayPointers &pointers = layers[layer];
+        const T *input = (const T*)pointers.convInput;
+        float *stateRow = pointers.convState +
+            (uint64_t)channel * kernel;
+        if (sequence >= kernel) {
+            for (int slot = 0; slot < kernel; slot++) {
+                stateRow[slot] = Qwen4CudaToFloat(input[
+                    ((uint64_t)sequence - kernel + slot) * channels +
+                        channel]);
+            }
+        } else {
+            for (int slot = 0; slot < kernel - sequence; slot++) {
+                stateRow[slot] = stateRow[slot + sequence];
+            }
+            for (int token = 0; token < sequence; token++) {
+                stateRow[kernel - sequence + token] =
+                    Qwen4CudaToFloat(input[
+                        (uint64_t)token * channels + channel]);
+            }
         }
-        output[(uint64_t)item * VALUE_DIM + tid] = core;
+    }
+
+    template <typename T>
+    __global__ __launch_bounds__(128)
+    void Qwen4LinearReplayGatedDeltaStateKernel(
+            const Qwen4LinearReplayPointers *layers,
+            int valueHeads, int keyHeads, int sequence,
+            float recurrentEps, float inverseHead) {
+        constexpr int KEY_DIM = 128;
+        constexpr int VALUE_DIM = 128;
+        const int item = blockIdx.x;
+        const int layer = item / valueHeads;
+        const int valueHead = item - layer * valueHeads;
+        const int repeat = valueHeads / keyHeads;
+        const int keyHead = valueHead / repeat;
+        const int qkvChannels =
+            (2 * keyHeads + valueHeads) * KEY_DIM;
+        const Qwen4LinearReplayPointers &pointers = layers[layer];
+        const float *qkv = pointers.convolved;
+        const T *alpha = (const T*)pointers.alpha;
+        const T *beta = (const T*)pointers.beta;
+        float *headState = pointers.recurrentState +
+            (uint64_t)valueHead * KEY_DIM * VALUE_DIM;
+        float *output = pointers.coreOutput;
+
+        __shared__ float queryNorm[KEY_DIM];
+        __shared__ float keyNorm[KEY_DIM];
+        __shared__ float normScales[2];
+        __shared__ float gateValues[2];
+        const int tid = threadIdx.x;
+
+        for (int token = 0; token < sequence; token++) {
+            const uint64_t qkvBase = (uint64_t)token * qkvChannels;
+            const float *queryRaw = qkv + qkvBase +
+                keyHead * KEY_DIM;
+            const float *keyRaw = qkv + qkvBase +
+                (keyHeads + keyHead) * KEY_DIM;
+            const float *value = qkv + qkvBase +
+                (2 * keyHeads + valueHead) * KEY_DIM;
+            if (tid < 32) {
+                const float4 queryValue = ((const float4*)queryRaw)[tid];
+                const float4 keyValue = ((const float4*)keyRaw)[tid];
+                float querySquares = queryValue.x * queryValue.x +
+                                     queryValue.y * queryValue.y +
+                                     queryValue.z * queryValue.z +
+                                     queryValue.w * queryValue.w;
+                float keySquares = keyValue.x * keyValue.x +
+                                   keyValue.y * keyValue.y +
+                                   keyValue.z * keyValue.z +
+                                   keyValue.w * keyValue.w;
+#pragma unroll
+                for (int offset = 16; offset > 0; offset >>= 1) {
+                    querySquares += __shfl_down_sync(
+                        0xffffffffu, querySquares, offset);
+                    keySquares += __shfl_down_sync(
+                        0xffffffffu, keySquares, offset);
+                }
+                if (tid == 0) {
+                    normScales[0] = rsqrtf(
+                        querySquares / KEY_DIM + recurrentEps);
+                    normScales[1] = rsqrtf(
+                        keySquares / KEY_DIM + recurrentEps);
+                }
+            }
+            if (tid == 0) {
+                const uint64_t gateIndex =
+                    (uint64_t)token * valueHeads + valueHead;
+                const float alphaValue =
+                    Qwen4CudaToFloat(alpha[gateIndex]);
+                const float biasedAlpha =
+                    alphaValue + pointers.dtBias[valueHead];
+                const float softplus = biasedAlpha > 20.0f
+                    ? biasedAlpha : log1p(expf(biasedAlpha));
+                const float betaValue =
+                    Qwen4CudaToFloat(beta[gateIndex]);
+                gateValues[0] = 1.0 / (1.0 + expf(-betaValue));
+                gateValues[1] = expf(
+                    -expf((double)pointers.aLog[valueHead]) * softplus);
+            }
+            __syncthreads();
+
+            queryNorm[tid] =
+                queryRaw[tid] * normScales[0] * inverseHead;
+            keyNorm[tid] =
+                keyRaw[tid] * normScales[1] * inverseHead;
+            __syncthreads();
+            queryNorm[tid] *= inverseHead;
+            __syncthreads();
+
+            float memory = 0.0f;
+#pragma unroll
+            for (int keyChannel = 0;
+                 keyChannel < KEY_DIM; keyChannel++) {
+                const uint64_t stateIndex =
+                    (uint64_t)keyChannel * VALUE_DIM + tid;
+                const float scaled =
+                    headState[stateIndex] * gateValues[1];
+                memory += scaled * keyNorm[keyChannel];
+            }
+            const float delta =
+                (value[tid] - memory) * gateValues[0];
+            float core = 0.0f;
+#pragma unroll
+            for (int keyChannel = 0;
+                 keyChannel < KEY_DIM; keyChannel++) {
+                const uint64_t stateIndex =
+                    (uint64_t)keyChannel * VALUE_DIM + tid;
+                const float scaled =
+                    headState[stateIndex] * gateValues[1];
+                const float updated = scaled +
+                    keyNorm[keyChannel] * delta;
+                headState[stateIndex] = updated;
+                core += updated * queryNorm[keyChannel];
+            }
+            output[((uint64_t)token * valueHeads + valueHead) *
+                       VALUE_DIM + tid] = core;
+            __syncthreads();
+        }
     }
 
     template <typename T>
@@ -1480,6 +1967,41 @@ namespace {
         return type == fastllm::DataType::FLOAT32 ||
                type == fastllm::DataType::FLOAT16 ||
                type == fastllm::DataType::BFLOAT16;
+    }
+
+    template <typename T, bool OUT_OF_PLACE_STATE>
+    void Qwen4LaunchGatedDeltaRule(
+            const fastllm::Data &qkv, const fastllm::Data &alpha,
+            const fastllm::Data &beta, const fastllm::Data &aLog,
+            const fastllm::Data &dtBias, fastllm::Data &state,
+            fastllm::Data *stateOutput, fastllm::Data &output,
+            int blocks, int keyHeads, int valueHeads, int sequence,
+            float recurrentEps, float inverseHead,
+            bool useValueTileSm120) {
+        float *nextState = OUT_OF_PLACE_STATE
+            ? (float*)stateOutput->cudaData : nullptr;
+        if (useValueTileSm120) {
+            Qwen4GatedDeltaRuleSequenceValueTileSm120Kernel<
+                T, OUT_OF_PLACE_STATE><<<
+                    blocks * 4, 32, 0, cudaStreamPerThread>>>(
+                (const float*)qkv.cudaData, (const T*)alpha.cudaData,
+                (const T*)beta.cudaData,
+                (const float*)aLog.cudaData,
+                (const float*)dtBias.cudaData,
+                (float*)state.cudaData, nextState,
+                (float*)output.cudaData, keyHeads, valueHeads,
+                sequence, recurrentEps, inverseHead);
+        } else {
+            Qwen4GatedDeltaRuleDecodeKernel<T, OUT_OF_PLACE_STATE><<<
+                blocks, 128, 0, cudaStreamPerThread>>>(
+                (const float*)qkv.cudaData, (const T*)alpha.cudaData,
+                (const T*)beta.cudaData,
+                (const float*)aLog.cudaData,
+                (const float*)dtBias.cudaData,
+                (float*)state.cudaData, nextState,
+                (float*)output.cudaData, keyHeads, valueHeads,
+                sequence, recurrentEps, inverseHead);
+        }
     }
 
 }
@@ -2685,8 +3207,9 @@ bool FastllmCudaQwen4GatedDeltaRuleDecode(
         const fastllm::Data &aLog, const fastllm::Data &dtBias,
         fastllm::Data &state, fastllm::Data &output,
         int keyHeads, int valueHeads, int keyDim, int valueDim,
-        float recurrentEps) {
+        float recurrentEps, fastllm::Data *stateOutput) {
     const int batch = qkv.dims.empty() ? 0 : qkv.dims[0];
+    const int sequence = qkv.dims.size() == 3 ? qkv.dims[1] : 0;
     const int qkvChannels = 2 * keyHeads * keyDim +
                             valueHeads * valueDim;
     if (qkv.dataDevice != fastllm::DataDevice::CUDA ||
@@ -2709,46 +3232,377 @@ bool FastllmCudaQwen4GatedDeltaRuleDecode(
         output.dataType != fastllm::DataType::FLOAT32 || keyHeads <= 0 ||
         valueHeads <= 0 || valueHeads % keyHeads != 0 ||
         keyDim != 128 || valueDim != 128 || qkv.dims.size() != 3 ||
-        qkv.dims[1] != 1 || qkv.dims[2] != qkvChannels ||
-        alpha.Count(0) != (uint64_t)batch * valueHeads ||
-        beta.Count(0) != (uint64_t)batch * valueHeads ||
+        sequence <= 0 || qkv.dims[2] != qkvChannels ||
+        alpha.Count(0) !=
+            (uint64_t)batch * sequence * valueHeads ||
+        beta.Count(0) !=
+            (uint64_t)batch * sequence * valueHeads ||
         aLog.Count(0) != (uint64_t)valueHeads ||
         dtBias.Count(0) != (uint64_t)valueHeads ||
-        state.dims != std::vector<int>({batch, valueHeads, keyDim, valueDim})) {
+        state.dims != std::vector<int>({batch, valueHeads, keyDim, valueDim}) ||
+        (stateOutput != nullptr &&
+         (stateOutput->dataDevice != fastllm::DataDevice::CUDA ||
+          stateOutput->cudaData == nullptr ||
+          stateOutput->dataType != fastllm::DataType::FLOAT32 ||
+          stateOutput->dims != state.dims))) {
         return false;
     }
-
     const int blocks = batch * valueHeads;
     // RunLinearAttention constructs this value on the host and then uses it
     // as both the RMSNorm weight and the subsequent query scale.  Passing the
     // same host result avoids the one-ULP difference of device rsqrtf().
     const float inverseHead = 1.0f / std::sqrt((float)keyDim);
+    int device = -1;
+    int major = 0;
+    int minor = 0;
+    const bool useValueTileSm120 = sequence > 1 && sequence <= 9 &&
+        cudaGetDevice(&device) == cudaSuccess &&
+        cudaDeviceGetAttribute(
+            &major, cudaDevAttrComputeCapabilityMajor, device) ==
+            cudaSuccess &&
+        cudaDeviceGetAttribute(
+            &minor, cudaDevAttrComputeCapabilityMinor, device) ==
+            cudaSuccess &&
+        major == 12 && minor == 0;
     if (alpha.dataType == fastllm::DataType::FLOAT32) {
-        Qwen4GatedDeltaRuleDecodeKernel<<<
-            blocks, 128, 0, cudaStreamPerThread>>>(
-            (const float*)qkv.cudaData, (const float*)alpha.cudaData,
-            (const float*)beta.cudaData,
-            (const float*)aLog.cudaData, (const float*)dtBias.cudaData,
-            (float*)state.cudaData, (float*)output.cudaData,
-            keyHeads, valueHeads, recurrentEps, inverseHead);
+        if (stateOutput == nullptr) {
+            Qwen4LaunchGatedDeltaRule<float, false>(
+                qkv, alpha, beta, aLog, dtBias, state, nullptr, output,
+                blocks, keyHeads, valueHeads, sequence, recurrentEps,
+                inverseHead, useValueTileSm120);
+        } else {
+            Qwen4LaunchGatedDeltaRule<float, true>(
+                qkv, alpha, beta, aLog, dtBias, state, stateOutput, output,
+                blocks, keyHeads, valueHeads, sequence, recurrentEps,
+                inverseHead, useValueTileSm120);
+        }
     } else if (alpha.dataType == fastllm::DataType::FLOAT16) {
-        Qwen4GatedDeltaRuleDecodeKernel<<<
-            blocks, 128, 0, cudaStreamPerThread>>>(
-            (const float*)qkv.cudaData, (const half*)alpha.cudaData,
-            (const half*)beta.cudaData,
-            (const float*)aLog.cudaData, (const float*)dtBias.cudaData,
-            (float*)state.cudaData, (float*)output.cudaData,
-            keyHeads, valueHeads, recurrentEps, inverseHead);
+        if (stateOutput == nullptr) {
+            Qwen4LaunchGatedDeltaRule<half, false>(
+                qkv, alpha, beta, aLog, dtBias, state, nullptr, output,
+                blocks, keyHeads, valueHeads, sequence, recurrentEps,
+                inverseHead, useValueTileSm120);
+        } else {
+            Qwen4LaunchGatedDeltaRule<half, true>(
+                qkv, alpha, beta, aLog, dtBias, state, stateOutput, output,
+                blocks, keyHeads, valueHeads, sequence, recurrentEps,
+                inverseHead, useValueTileSm120);
+        }
+    } else if (stateOutput == nullptr) {
+        Qwen4LaunchGatedDeltaRule<__nv_bfloat16, false>(
+            qkv, alpha, beta, aLog, dtBias, state, nullptr, output,
+            blocks, keyHeads, valueHeads, sequence, recurrentEps,
+            inverseHead, useValueTileSm120);
     } else {
-        Qwen4GatedDeltaRuleDecodeKernel<<<
-            blocks, 128, 0, cudaStreamPerThread>>>(
-            (const float*)qkv.cudaData,
-            (const __nv_bfloat16*)alpha.cudaData,
-            (const __nv_bfloat16*)beta.cudaData,
-            (const float*)aLog.cudaData, (const float*)dtBias.cudaData,
-            (float*)state.cudaData, (float*)output.cudaData,
-            keyHeads, valueHeads, recurrentEps, inverseHead);
+        Qwen4LaunchGatedDeltaRule<__nv_bfloat16, true>(
+            qkv, alpha, beta, aLog, dtBias, state, stateOutput, output,
+            blocks, keyHeads, valueHeads, sequence, recurrentEps,
+            inverseHead, useValueTileSm120);
     }
     DeviceSync();
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool FastllmCudaQwen4GdnOutputGateExact(
+        const fastllm::Data &input,
+        const fastllm::Data &normWeight,
+        const fastllm::Data &gate,
+        fastllm::Data &output, float eps) {
+    constexpr int CHANNELS = 128;
+    if (input.dataDevice != fastllm::DataDevice::CUDA ||
+        normWeight.dataDevice != fastllm::DataDevice::CUDA ||
+        gate.dataDevice != fastllm::DataDevice::CUDA ||
+        output.dataDevice != fastllm::DataDevice::CUDA ||
+        input.dataType != fastllm::DataType::FLOAT32 ||
+        normWeight.dataType != fastllm::DataType::FLOAT32 ||
+        gate.dataType != fastllm::DataType::FLOAT16 ||
+        output.dataType != fastllm::DataType::FLOAT16 ||
+        input.cudaData == nullptr || normWeight.cudaData == nullptr ||
+        gate.cudaData == nullptr || output.cudaData == nullptr ||
+        input.multiDeviceData || normWeight.multiDeviceData ||
+        gate.multiDeviceData || output.multiDeviceData ||
+        input.dims.empty() || input.dims.back() != CHANNELS ||
+        input.dims != gate.dims || input.dims != output.dims ||
+        normWeight.Count(0) != CHANNELS || !(eps > 0.0f)) {
+        return false;
+    }
+    const uint64_t count = input.Count(0);
+    if (count == 0 || count % CHANNELS != 0 ||
+        count / CHANNELS > (uint64_t)std::numeric_limits<int>::max()) {
+        return false;
+    }
+    const int device = input.dataDeviceIds.empty()
+        ? FastllmCudaGetDevice() : input.dataDeviceIds[0];
+    const auto onDevice = [&](const fastllm::Data &data) {
+        return data.dataDeviceIds.empty() ||
+               data.dataDeviceIds[0] == device;
+    };
+    if (!onDevice(normWeight) || !onDevice(gate) || !onDevice(output)) {
+        return false;
+    }
+
+    Qwen4GdnOutputGateExactKernel<<<
+        (int)(count / CHANNELS), 32, 0, cudaStreamPerThread>>>(
+        (const float*)input.cudaData,
+        (const float*)normWeight.cudaData,
+        (const half*)gate.cudaData,
+        (half*)output.cudaData, eps);
+    DeviceSync();
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool FastllmCudaQwen4ReplayLinearAttentionBatch(
+        const std::vector<FastllmCudaQwen4LinearReplayItem> &items,
+        fastllm::Data &pointerWorkspace,
+        std::vector<uint8_t> &pointerCache,
+        int sequence, int convKernel, bool silu,
+        int keyHeads, int valueHeads, int keyDim, int valueDim,
+        float recurrentEps) {
+    if (items.empty() || sequence <= 0 || convKernel <= 0 ||
+        keyHeads <= 0 || valueHeads <= 0 ||
+        valueHeads % keyHeads != 0 ||
+        keyDim != 128 || valueDim != 128) {
+        return false;
+    }
+    const int qkvChannels =
+        2 * keyHeads * keyDim + valueHeads * valueDim;
+    const fastllm::Data *firstInput = items.front().convInput;
+    if (firstInput == nullptr ||
+        firstInput->dataDevice != fastllm::DataDevice::CUDA ||
+        firstInput->cudaData == nullptr ||
+        !Qwen4CudaActivationType(firstInput->dataType)) {
+        return false;
+    }
+    const int device = firstInput->dataDeviceIds.empty()
+        ? FastllmCudaGetDevice() : firstInput->dataDeviceIds[0];
+    const fastllm::DataType inputType = firstInput->dataType;
+    fastllm::DataType gateType = fastllm::DataType::FLOAT32;
+    bool gateTypeReady = false;
+    auto onDevice = [&](const fastllm::Data *data) {
+        return data != nullptr &&
+            data->dataDevice == fastllm::DataDevice::CUDA &&
+            data->cudaData != nullptr &&
+            (data->dataDeviceIds.empty() ||
+             data->dataDeviceIds[0] == device);
+    };
+
+    const size_t pointerBytes =
+        items.size() * sizeof(Qwen4LinearReplayPointers);
+    bool pointerCacheMatches = pointerCache.size() == pointerBytes;
+    auto makeReplayPointers = [](
+            const FastllmCudaQwen4LinearReplayItem &item) {
+        return Qwen4LinearReplayPointers {
+            item.convInput->cudaData,
+            (const float*)item.convWeight->cudaData,
+            (const float*)item.convCheckpoint->cudaData,
+            (float*)item.convState->cudaData,
+            (float*)item.convolved->cudaData,
+            item.alpha->cudaData,
+            item.beta->cudaData,
+            (const float*)item.aLog->cudaData,
+            (const float*)item.dtBias->cudaData,
+            (const float*)item.recurrentCheckpoint->cudaData,
+            (float*)item.recurrentState->cudaData,
+            (float*)item.coreOutput->cudaData
+        };
+    };
+    auto hasExactDims3 = [](const fastllm::Data *data,
+                            int dim0, int dim1, int dim2) {
+        return data->dims.size() == 3 &&
+            data->dims[0] == dim0 && data->dims[1] == dim1 &&
+            data->dims[2] == dim2;
+    };
+    auto hasExactDims4 = [](const fastllm::Data *data,
+                            int dim0, int dim1, int dim2, int dim3) {
+        return data->dims.size() == 4 &&
+            data->dims[0] == dim0 && data->dims[1] == dim1 &&
+            data->dims[2] == dim2 && data->dims[3] == dim3;
+    };
+    size_t pointerOffset = 0;
+    for (const auto &item : items) {
+        if (!onDevice(item.convInput) || !onDevice(item.convWeight) ||
+            !onDevice(item.convCheckpoint) ||
+            !onDevice(item.convState) || !onDevice(item.convolved) ||
+            !onDevice(item.alpha) || !onDevice(item.beta) ||
+            !onDevice(item.aLog) || !onDevice(item.dtBias) ||
+            !onDevice(item.recurrentCheckpoint) ||
+            !onDevice(item.recurrentState) ||
+            !onDevice(item.coreOutput) ||
+            item.convInput->dataType != inputType ||
+            item.convInput->dims.size() != 3 ||
+            item.convInput->dims[0] != 1 ||
+            item.convInput->dims[1] < sequence ||
+            item.convInput->dims[2] != qkvChannels ||
+            item.convWeight->dataType != fastllm::DataType::FLOAT32 ||
+            item.convWeight->Count(0) !=
+                (uint64_t)qkvChannels * convKernel ||
+            item.convCheckpoint->dataType !=
+                fastllm::DataType::FLOAT32 ||
+            !hasExactDims3(
+                item.convCheckpoint, 1, qkvChannels, convKernel) ||
+            item.convState->dataType != fastllm::DataType::FLOAT32 ||
+            !hasExactDims3(
+                item.convState, 1, qkvChannels, convKernel) ||
+            item.convolved->dataType != fastllm::DataType::FLOAT32 ||
+            !hasExactDims3(
+                item.convolved, 1, sequence, qkvChannels) ||
+            !Qwen4CudaActivationType(item.alpha->dataType) ||
+            item.beta->dataType != item.alpha->dataType ||
+            item.alpha->Count(0) <
+                (uint64_t)sequence * valueHeads ||
+            item.beta->Count(0) <
+                (uint64_t)sequence * valueHeads ||
+            item.aLog->dataType != fastllm::DataType::FLOAT32 ||
+            item.dtBias->dataType != fastllm::DataType::FLOAT32 ||
+            item.aLog->Count(0) != (uint64_t)valueHeads ||
+            item.dtBias->Count(0) != (uint64_t)valueHeads ||
+            item.recurrentState->dataType !=
+                fastllm::DataType::FLOAT32 ||
+            item.recurrentCheckpoint->dataType !=
+                fastllm::DataType::FLOAT32 ||
+            !hasExactDims4(
+                item.recurrentCheckpoint, 1, valueHeads,
+                keyDim, valueDim) ||
+            !hasExactDims4(
+                item.recurrentState, 1, valueHeads,
+                keyDim, valueDim) ||
+            item.coreOutput->dataType !=
+                fastllm::DataType::FLOAT32 ||
+            !hasExactDims3(
+                item.coreOutput, 1, sequence,
+                valueHeads * valueDim)) {
+            return false;
+        }
+        if (!gateTypeReady) {
+            gateType = item.alpha->dataType;
+            gateTypeReady = true;
+        } else if (gateType != item.alpha->dataType) {
+            return false;
+        }
+        if (pointerCacheMatches) {
+            const Qwen4LinearReplayPointers current =
+                makeReplayPointers(item);
+            pointerCacheMatches = std::memcmp(
+                pointerCache.data() + pointerOffset, &current,
+                sizeof(current)) == 0;
+        }
+        pointerOffset += sizeof(Qwen4LinearReplayPointers);
+    }
+
+    FastllmCudaSetDevice(device);
+    const bool workspaceCompatible =
+        pointerWorkspace.dataType == fastllm::DataType::INT8 &&
+        pointerWorkspace.dataDevice == fastllm::DataDevice::CUDA &&
+        pointerWorkspace.cudaData != nullptr &&
+        pointerWorkspace.Count(0) == pointerBytes &&
+        !pointerWorkspace.dataDeviceIds.empty() &&
+        pointerWorkspace.dataDeviceIds[0] == device;
+    if (!workspaceCompatible) {
+        pointerWorkspace.dataType = fastllm::DataType::INT8;
+        pointerWorkspace.UpdateUnitSize();
+        pointerWorkspace.Resize({(int)pointerBytes});
+        pointerWorkspace.ToDevice(
+            fastllm::DataDevice::CUDA, std::vector<int>({device}));
+        pointerWorkspace.Allocate(false);
+    }
+    if (pointerWorkspace.cudaData == nullptr) {
+        return false;
+    }
+    const bool pointersChanged =
+        !workspaceCompatible || !pointerCacheMatches;
+    if (pointersChanged) {
+        pointerCache.resize(pointerBytes);
+        for (size_t i = 0; i < items.size(); i++) {
+            const Qwen4LinearReplayPointers current =
+                makeReplayPointers(items[i]);
+            std::memcpy(
+                pointerCache.data() +
+                    i * sizeof(Qwen4LinearReplayPointers),
+                &current, sizeof(current));
+        }
+        if (cudaMemcpy(
+                pointerWorkspace.cudaData, pointerCache.data(), pointerBytes,
+                cudaMemcpyHostToDevice) != cudaSuccess) {
+            pointerCache.clear();
+            return false;
+        }
+    }
+    const Qwen4LinearReplayPointers *devicePointers =
+        (const Qwen4LinearReplayPointers*)pointerWorkspace.cudaData;
+    constexpr int threads = 256;
+    const int convVectors = qkvChannels * convKernel / 4;
+    const int recurrentVectors = valueHeads * keyDim * valueDim / 4;
+    bool restoreRecurrent = false;
+    for (const auto &item : items) {
+        restoreRecurrent = restoreRecurrent ||
+            item.recurrentCheckpoint->cudaData !=
+                item.recurrentState->cudaData;
+    }
+    const int vectorsPerLayer = convVectors +
+        (restoreRecurrent ? recurrentVectors : 0);
+    const uint64_t restoreVectors =
+        (uint64_t)items.size() * vectorsPerLayer;
+    const int restoreBlocks = std::min<uint64_t>(
+        65535, (restoreVectors + threads - 1) / threads);
+    Qwen4LinearReplayRestoreKernel<<<
+        restoreBlocks, threads, 0, cudaStreamPerThread>>>(
+        devicePointers, restoreVectors, vectorsPerLayer, convVectors);
+    const uint64_t convCount =
+        (uint64_t)items.size() * sequence * qkvChannels;
+    const int convBlocks = std::min<uint64_t>(
+        65535, (convCount + threads - 1) / threads);
+    const int stateCount = (int)items.size() * qkvChannels;
+    const int stateBlocks = (stateCount + threads - 1) / threads;
+    if (inputType == fastllm::DataType::FLOAT32) {
+        Qwen4LinearReplayConvOutputKernel<float><<<
+            convBlocks, threads, 0, cudaStreamPerThread>>>(
+            devicePointers, convCount, sequence, qkvChannels,
+            convKernel, silu);
+        Qwen4LinearReplayConvStateKernel<float><<<
+            stateBlocks, threads, 0, cudaStreamPerThread>>>(
+            devicePointers, stateCount, sequence, qkvChannels,
+            convKernel);
+    } else if (inputType == fastllm::DataType::FLOAT16) {
+        Qwen4LinearReplayConvOutputKernel<half><<<
+            convBlocks, threads, 0, cudaStreamPerThread>>>(
+            devicePointers, convCount, sequence, qkvChannels,
+            convKernel, silu);
+        Qwen4LinearReplayConvStateKernel<half><<<
+            stateBlocks, threads, 0, cudaStreamPerThread>>>(
+            devicePointers, stateCount, sequence, qkvChannels,
+            convKernel);
+    } else {
+        Qwen4LinearReplayConvOutputKernel<__nv_bfloat16><<<
+            convBlocks, threads, 0, cudaStreamPerThread>>>(
+            devicePointers, convCount, sequence, qkvChannels,
+            convKernel, silu);
+        Qwen4LinearReplayConvStateKernel<__nv_bfloat16><<<
+            stateBlocks, threads, 0, cudaStreamPerThread>>>(
+            devicePointers, stateCount, sequence, qkvChannels,
+            convKernel);
+    }
+
+    const int recurrentBlocks = (int)items.size() * valueHeads;
+    const float inverseHead = 1.0f / std::sqrt((float)keyDim);
+    if (gateType == fastllm::DataType::FLOAT32) {
+        Qwen4LinearReplayGatedDeltaStateKernel<float><<<
+            recurrentBlocks, 128, 0, cudaStreamPerThread>>>(
+            devicePointers, valueHeads, keyHeads, sequence,
+            recurrentEps, inverseHead);
+    } else if (gateType == fastllm::DataType::FLOAT16) {
+        Qwen4LinearReplayGatedDeltaStateKernel<half><<<
+            recurrentBlocks, 128, 0, cudaStreamPerThread>>>(
+            devicePointers, valueHeads, keyHeads, sequence,
+            recurrentEps, inverseHead);
+    } else {
+        Qwen4LinearReplayGatedDeltaStateKernel<__nv_bfloat16><<<
+            recurrentBlocks, 128, 0, cudaStreamPerThread>>>(
+            devicePointers, valueHeads, keyHeads, sequence,
+            recurrentEps, inverseHead);
+    }
+    // The model executor may dispatch the following layer on another host
+    // thread (and therefore another per-thread CUDA stream).  Complete this
+    // rejected-prefix transition before publishing the restored caches.
+    ForceDeviceSync();
     return cudaGetLastError() == cudaSuccess;
 }

@@ -463,6 +463,10 @@ bool FastllmCudaAdd(const fastllm::Data &input, float v, fastllm::Data &output);
 bool FastllmCudaMul(const fastllm::Data &input, float v, fastllm::Data &output);
 bool FastllmCudaSoftmax(const fastllm::Data &input, fastllm::Data &output, int axis);
 bool FastllmCudaAddTo(fastllm::Data &input0, const fastllm::Data &input1, float alpha);
+bool FastllmCudaRepeatAddTo(fastllm::Data &input0,
+                            const fastllm::Data &input1,
+                            int outer, int outputStride,
+                            int inputStride, float alpha);
 bool FastllmCudaMulTo(fastllm::Data &input0, const fastllm::Data &input1, float alpha);
 bool FastllmCudaMulToCausalMask(fastllm::Data &input0,
                                 const fastllm::Data &input1,
@@ -586,6 +590,12 @@ bool FastllmCudaQwen4PLECausalConv(
 bool FastllmCudaQwen4HyperMix(const fastllm::Data &normalized,
                               const fastllm::Data &mixLogits,
                               fastllm::Data &output, int groups);
+bool FastllmCudaQwen4HyperProject(const fastllm::Data &normalized,
+                                  fastllm::Data &downWeight,
+                                  fastllm::Data &injectionWeight,
+                                  fastllm::Data &activated,
+                                  fastllm::Data &injection,
+                                  int groups);
 bool FastllmCudaQwen4HyperPrepare(const fastllm::Data &lowRankProjection,
                                   fastllm::Data &activated,
                                   int groups);
@@ -661,10 +671,44 @@ bool FastllmCudaCausalDepthwiseConv1DPrefill(
         fastllm::Data &state, fastllm::Data &output,
         int kernel, bool silu, bool initializeState);
 bool FastllmCudaQwen4GatedDeltaRuleDecode(
-        const fastllm::Data &qkv, const fastllm::Data &alpha,
-        const fastllm::Data &beta,
-        const fastllm::Data &aLog, const fastllm::Data &dtBias,
-        fastllm::Data &state, fastllm::Data &output,
+    const fastllm::Data &qkv, const fastllm::Data &alpha,
+    const fastllm::Data &beta,
+    const fastllm::Data &aLog, const fastllm::Data &dtBias,
+    fastllm::Data &state, fastllm::Data &output,
+    int keyHeads, int valueHeads, int keyDim, int valueDim,
+    float recurrentEps, fastllm::Data *stateOutput = nullptr);
+// Exact verifier tail for Qwen4 GDN: FP32->FP16 (round-to-zero), RMSNorm,
+// FP16 sigmoid and FP16 multiply retain the same boundaries as the four
+// standard operations while sharing one launch. Unsupported layouts return
+// false without modifying output.
+bool FastllmCudaQwen4GdnOutputGateExact(
+        const fastllm::Data &input, const fastllm::Data &normWeight,
+        const fastllm::Data &gate, fastllm::Data &output, float eps);
+
+struct FastllmCudaQwen4LinearReplayItem {
+    const fastllm::Data *convInput = nullptr;
+    const fastllm::Data *convWeight = nullptr;
+    const fastllm::Data *convCheckpoint = nullptr;
+    fastllm::Data *convState = nullptr;
+    fastllm::Data *convolved = nullptr;
+    const fastllm::Data *alpha = nullptr;
+    const fastllm::Data *beta = nullptr;
+    const fastllm::Data *aLog = nullptr;
+    const fastllm::Data *dtBias = nullptr;
+    const fastllm::Data *recurrentCheckpoint = nullptr;
+    fastllm::Data *recurrentState = nullptr;
+    fastllm::Data *coreOutput = nullptr;
+};
+
+// Replays independent linear-attention cache transitions after a rejected
+// speculative suffix.  Every item has the same Qwen GDN geometry, allowing
+// all layers to share three launches instead of replaying three operations per
+// layer.  Unsupported devices or shapes return false before launching.
+bool FastllmCudaQwen4ReplayLinearAttentionBatch(
+        const std::vector<FastllmCudaQwen4LinearReplayItem> &items,
+        fastllm::Data &pointerWorkspace,
+        std::vector<uint8_t> &pointerCache,
+        int sequence, int convKernel, bool silu,
         int keyHeads, int valueHeads, int keyDim, int valueDim,
         float recurrentEps);
 bool FastllmCudaDeepSeekV4ScaleQRotary(fastllm::Data &q, int ropeDim, float ropeBase, int startPos,
@@ -1417,6 +1461,12 @@ bool FastllmCudaDFlashAttention(
 bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &output, int group, float scale, bool inited = false);
 bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches, fastllm::Data &vCaches, fastllm::Data &qSizes, fastllm::Data &pageSizes, fastllm::Data &pageIndexs, fastllm::Data &lastPageLens, fastllm::Data &output, int group, float scale, int attentionType, bool inited = false, bool sync = true, bool enableCudaGraph = false, int flashInferCudaGraph = -1, int windowLeft = -1);
 bool FastllmCudaHalfMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k, bool addTo = false);
+// Runs up to four independent no-bias FP16 linears that share the same one-to-
+// eight-row input. Each output row keeps the native compensated reduction
+// order; only the CUDA launch is shared.
+bool FastllmCudaHalfMultiLinearExact(
+    const fastllm::Data &input, const fastllm::Data *const *weights,
+    fastllm::Data *const *outputs, int count);
 enum FastllmCudaLinearFp16Path {
     FASTLLM_CUDA_LINEAR_FP16_PATH_AUTO = 0,
     FASTLLM_CUDA_LINEAR_FP16_PATH_NATIVE = 1,
