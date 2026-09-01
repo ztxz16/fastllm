@@ -1471,6 +1471,9 @@ namespace {
         const int warpInBlock = threadIdx.x >> 5;
         const int warpsPerBlock = blockDim.x >> 5;
         const uint64_t total = (uint64_t)rows * blocks;
+        const int dynamicQueryStart =
+            queryStart == -2 && decodeMeta != nullptr
+                ? decodeMeta[0] : queryStart;
         const int actualBlocks = decodeMeta == nullptr
             ? blocks : (decodeMeta[0] + 1) / compressRatio;
         for (uint64_t item =
@@ -1479,8 +1482,9 @@ namespace {
              item += (uint64_t)warpsPerBlock * gridDim.x) {
             const int row = item / blocks;
             const int block = item - (uint64_t)row * blocks;
-            const int rowBlocks = queryStart >= 0
-                ? (queryStart + row + 1) / compressRatio : actualBlocks;
+            const int rowBlocks = dynamicQueryStart >= 0
+                ? (dynamicQueryStart + row + 1) / compressRatio
+                : actualBlocks;
             if (block >= rowBlocks) {
                 continue;
             }
@@ -1515,6 +1519,9 @@ namespace {
             float inverseSqrt, int queryStart, int compressRatio,
             const int32_t *decodeMeta) {
         const uint64_t total = (uint64_t)rows * blocks;
+        const int dynamicQueryStart =
+            queryStart == -2 && decodeMeta != nullptr
+                ? decodeMeta[0] : queryStart;
         const int actualBlocks = decodeMeta == nullptr
             ? blocks : (decodeMeta[0] + 1) / compressRatio;
         for (uint64_t item = (uint64_t)blockIdx.x * blockDim.x +
@@ -1522,8 +1529,9 @@ namespace {
              item < total; item += (uint64_t)blockDim.x * gridDim.x) {
             const int row = item / blocks;
             const int block = item - (uint64_t)row * blocks;
-            const int rowBlocks = queryStart >= 0
-                ? (queryStart + row + 1) / compressRatio : actualBlocks;
+            const int rowBlocks = dynamicQueryStart >= 0
+                ? (dynamicQueryStart + row + 1) / compressRatio
+                : actualBlocks;
             if (block >= rowBlocks) {
                 continue;
             }
@@ -1558,6 +1566,9 @@ namespace {
         const int itemInBlock = threadIdx.x / lanesPerItem;
         const int itemsPerBlock = blockDim.x / lanesPerItem;
         const uint64_t total = (uint64_t)rows * blocks;
+        const int dynamicQueryStart =
+            queryStart == -2 && decodeMeta != nullptr
+                ? decodeMeta[0] : queryStart;
         const int actualBlocks = decodeMeta == nullptr
             ? blocks : (decodeMeta[0] + 1) / compressRatio;
         for (uint64_t item =
@@ -1566,8 +1577,9 @@ namespace {
              item += (uint64_t)itemsPerBlock * gridDim.x) {
             const int row = item / blocks;
             const int block = item - (uint64_t)row * blocks;
-            const int rowBlocks = queryStart >= 0
-                ? (queryStart + row + 1) / compressRatio : actualBlocks;
+            const int rowBlocks = dynamicQueryStart >= 0
+                ? (dynamicQueryStart + row + 1) / compressRatio
+                : actualBlocks;
             if (block >= rowBlocks) {
                 continue;
             }
@@ -1577,9 +1589,17 @@ namespace {
             if (lane < heads) {
                 const T *headQuery = query +
                     ((uint64_t)row * heads + lane) * headDim;
-                for (int column = 0; column < headDim; column++) {
-                    dot += Qwen4CudaToFloat(headQuery[column]) *
-                           blockKey[column];
+                if (headDim == 128) {
+#pragma unroll
+                    for (int column = 0; column < 128; column++) {
+                        dot += Qwen4CudaToFloat(headQuery[column]) *
+                               blockKey[column];
+                    }
+                } else {
+                    for (int column = 0; column < headDim; column++) {
+                        dot += Qwen4CudaToFloat(headQuery[column]) *
+                               blockKey[column];
+                    }
                 }
             }
             float score = 0.0f;
@@ -1614,8 +1634,11 @@ namespace {
         const float *row = scores + (uint64_t)rowIndex * blocks;
         int32_t *output = selectedBlocks +
                           (uint64_t)rowIndex * selectedK;
-        const int rowBlocks = queryStart >= 0
-            ? (queryStart + rowIndex + 1) / compressRatio
+        const int dynamicQueryStart =
+            queryStart == -2 && decodeMeta != nullptr
+                ? decodeMeta[0] : queryStart;
+        const int rowBlocks = dynamicQueryStart >= 0
+            ? (dynamicQueryStart + rowIndex + 1) / compressRatio
             : (decodeMeta == nullptr
                 ? blocks : (decodeMeta[0] + 1) / compressRatio);
         if (rowBlocks <= selectedK) {
@@ -1626,6 +1649,11 @@ namespace {
             return;
         }
 
+        constexpr int sortItemsPerThread = 5;
+        constexpr int sortCapacity = 256 * sortItemsPerThread;
+        using BlockRadixSort = cub::BlockRadixSort<
+            uint32_t, 256, sortItemsPerThread>;
+        __shared__ typename BlockRadixSort::TempStorage sortStorage;
         __shared__ uint32_t histogram[256];
         __shared__ uint32_t prefix;
         __shared__ uint32_t remaining;
@@ -1633,44 +1661,59 @@ namespace {
         __shared__ uint32_t threadPivot[256];
         __shared__ uint32_t threadPivotChosen[256];
         __shared__ uint32_t threadOutputOffset[256];
-        if (threadIdx.x == 0) {
-            prefix = 0;
-            remaining = selectedK;
-        }
-        __syncthreads();
-        #pragma unroll
-        for (int round = 0; round < 4; round++) {
-            if (threadIdx.x < 256) {
-                histogram[threadIdx.x] = 0;
+        if (rowBlocks <= sortCapacity) {
+            uint32_t keys[sortItemsPerThread];
+#pragma unroll
+            for (int item = 0; item < sortItemsPerThread; item++) {
+                const int block = threadIdx.x * sortItemsPerThread + item;
+                keys[item] = block < rowBlocks
+                    ? Qwen4QSAOrderedFloatBits(row[block]) : 0u;
+            }
+            BlockRadixSort(sortStorage).SortDescending(keys);
+            const int pivotRank = selectedK - 1;
+            if (threadIdx.x == pivotRank / sortItemsPerThread) {
+                prefix = keys[pivotRank % sortItemsPerThread];
             }
             __syncthreads();
-            const int shift = 24 - round * 8;
-            const uint32_t mask = round == 0
-                ? 0u : (~0u << (32 - round * 8));
-            const uint32_t currentPrefix = prefix;
-            for (int block = threadIdx.x; block < rowBlocks;
-                 block += blockDim.x) {
-                const uint32_t ordered =
-                    Qwen4QSAOrderedFloatBits(row[block]);
-                if ((ordered & mask) == currentPrefix) {
-                    atomicAdd(&histogram[(ordered >> shift) & 0xffu], 1u);
-                }
-            }
-            __syncthreads();
+        } else {
             if (threadIdx.x == 0) {
-                uint32_t higher = 0;
-                for (int bucket = 255; bucket >= 0; bucket--) {
-                    const uint32_t count = histogram[bucket];
-                    if (higher + count >= remaining) {
-                        prefix = currentPrefix |
-                                 ((uint32_t)bucket << shift);
-                        remaining -= higher;
-                        break;
-                    }
-                    higher += count;
-                }
+                prefix = 0;
+                remaining = selectedK;
             }
             __syncthreads();
+#pragma unroll
+            for (int round = 0; round < 4; round++) {
+                histogram[threadIdx.x] = 0;
+                __syncthreads();
+                const int shift = 24 - round * 8;
+                const uint32_t mask = round == 0
+                    ? 0u : (~0u << (32 - round * 8));
+                const uint32_t currentPrefix = prefix;
+                for (int block = threadIdx.x; block < rowBlocks;
+                     block += blockDim.x) {
+                    const uint32_t ordered =
+                        Qwen4QSAOrderedFloatBits(row[block]);
+                    if ((ordered & mask) == currentPrefix) {
+                        atomicAdd(
+                            &histogram[(ordered >> shift) & 0xffu], 1u);
+                    }
+                }
+                __syncthreads();
+                if (threadIdx.x == 0) {
+                    uint32_t higher = 0;
+                    for (int bucket = 255; bucket >= 0; bucket--) {
+                        const uint32_t count = histogram[bucket];
+                        if (higher + count >= remaining) {
+                            prefix = currentPrefix |
+                                     ((uint32_t)bucket << shift);
+                            remaining -= higher;
+                            break;
+                        }
+                        higher += count;
+                    }
+                }
+                __syncthreads();
+            }
         }
         // Emit the chosen set in physical cache order without a single CUDA
         // thread rescanning the entire context. Give every thread a contiguous
@@ -1724,6 +1767,9 @@ namespace {
             int rows, int selectedK, int compressRatio,
             int completeBlocks, int keyLength, int outputWidth,
             int queryStart, const int32_t *decodeMeta) {
+        const int dynamicQueryStart =
+            queryStart == -2 && decodeMeta != nullptr
+                ? decodeMeta[0] : queryStart;
         if (decodeMeta != nullptr) {
             keyLength = decodeMeta[0] + 1;
             completeBlocks = keyLength / compressRatio;
@@ -1734,9 +1780,9 @@ namespace {
              item < total; item += (uint64_t)blockDim.x * gridDim.x) {
             const int row = item / outputWidth;
             const int column = item - (uint64_t)row * outputWidth;
-            const int visibleLength = queryStart >= 0
-                ? queryStart + row + 1 : keyLength;
-            const int rowBlocks = queryStart >= 0
+            const int visibleLength = dynamicQueryStart >= 0
+                ? dynamicQueryStart + row + 1 : keyLength;
+            const int rowBlocks = dynamicQueryStart >= 0
                 ? visibleLength / compressRatio : completeBlocks;
             const int selectedTokens = min(selectedK, rowBlocks) *
                                        compressRatio;
@@ -1815,8 +1861,9 @@ namespace {
     __global__ void Qwen4QSAAppendGraphKernel(
             const float *rawKey, const float *position,
             const int32_t *decodeMeta, float *tailKeys,
-            float *tailPositions, int headDim, int compressRatio) {
-        const int slot = decodeMeta[0] % compressRatio;
+            float *tailPositions, int headDim, int tokenOffset,
+            int compressRatio) {
+        const int slot = (decodeMeta[0] + tokenOffset) % compressRatio;
         for (int column = threadIdx.x; column < headDim;
              column += blockDim.x) {
             tailKeys[(uint64_t)slot * headDim + column] =
@@ -1830,8 +1877,8 @@ namespace {
     __global__ void Qwen4QSACommitGraphKernel(
             const float *compressedKey, const int32_t *decodeMeta,
             float *compressedKeys, int headDim, int compressRatio,
-            int compressedCapacity) {
-        const int keyLength = decodeMeta[0] + 1;
+            int tokenOffset, int compressedCapacity) {
+        const int keyLength = decodeMeta[0] + tokenOffset + 1;
         if (keyLength % compressRatio != 0) {
             return;
         }
@@ -1843,6 +1890,147 @@ namespace {
              column += blockDim.x) {
             compressedKeys[(uint64_t)block * headDim + column] =
                 compressedKey[column];
+        }
+    }
+
+    // Qwen3.8-Flash verifies four speculative rows at once.  The established
+    // path appends each row to a four-row tail, materializes five Split
+    // outputs, adds the tail rows in order, and then runs float32 RMSNorm and
+    // RoPE before conditionally committing the completed block.  Keep that
+    // exact arithmetic and reduction mapping in one graph-safe kernel.
+    __global__ __launch_bounds__(64)
+    void Qwen4QSAAppendCompress4ExactKernel(
+            const float *rawKeys, const float *positions,
+            const float *normWeight, const float *sin, const float *cos,
+            const int32_t *decodeMeta, float *tailKeys,
+            float *tailPositions, float *compressedKeys,
+            int compressedCapacity, int sinCosStride, float eps) {
+        constexpr int kSequence = 4;
+        constexpr int kHeadDim = 128;
+        constexpr int kRotaryPart = 64;
+        constexpr int kThreads = 64;
+        const int tid = threadIdx.x;
+        const int lane = tid & 31;
+        const int warp = tid >> 5;
+        const int baseLength = decodeMeta[0];
+        const int oldTail = baseLength & (kSequence - 1);
+        const int commitToken = kSequence - oldTail - 1;
+
+        __shared__ __align__(16) float averaged[kHeadDim];
+        __shared__ __align__(16) float normalized[kHeadDim];
+        __shared__ float warpSums[2];
+        __shared__ float scale;
+        __shared__ int ropeIndex;
+        __shared__ int commitBlock;
+
+        // Reconstruct the tail exactly as it appears immediately after the
+        // row that closes this compression group.  Slots before oldTail are
+        // the persistent old tail; the rest come from the new token rows.
+        for (int column = tid; column < kHeadDim;
+             column += kThreads) {
+            float pooled = oldTail > 0
+                ? tailKeys[column]
+                : rawKeys[column];
+#pragma unroll
+            for (int slot = 1; slot < kSequence; slot++) {
+                const float member = slot < oldTail
+                    ? tailKeys[(uint64_t)slot * kHeadDim + column]
+                    : rawKeys[(uint64_t)(slot - oldTail) * kHeadDim +
+                              column];
+                pooled += member * 1.0f;
+            }
+            averaged[column] = pooled * (1.0f / (float)kSequence);
+        }
+        if (tid == 0) {
+            const float firstPosition = oldTail > 0
+                ? tailPositions[0] : positions[0];
+            ropeIndex = (int)firstPosition;
+            commitBlock =
+                (baseLength + commitToken + 1) / kSequence - 1;
+        }
+        __syncthreads();
+
+        // Match FastllmRMSNormKernelInner1<64>(float, channels=128):
+        // lanes 0..31 each reduce one float4, the second warp contributes 0,
+        // and warp 0 performs the same two-warp final reduction.
+        float sum2 = 0.0f;
+        if (tid < kHeadDim / 4) {
+            const float4 value =
+                reinterpret_cast<const float4 *>(averaged)[tid];
+            sum2 += value.x * value.x + value.y * value.y +
+                    value.z * value.z + value.w * value.w;
+        }
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum2 += __shfl_down_sync(0xffffffffu, sum2, offset);
+        }
+        if (lane == 0) {
+            warpSums[warp] = sum2;
+        }
+        __syncthreads();
+        if (warp == 0) {
+            float value = lane < 2 ? warpSums[lane] : 0.0f;
+#pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                value += __shfl_down_sync(
+                    0xffffffffu, value, offset);
+            }
+            if (lane == 0) {
+                scale = rsqrtf(value / kHeadDim + eps);
+            }
+        }
+        __syncthreads();
+
+        if (tid < kHeadDim / 4) {
+            const float4 value =
+                reinterpret_cast<const float4 *>(averaged)[tid];
+            const float4 weight =
+                reinterpret_cast<const float4 *>(normWeight)[tid];
+            float4 output;
+            output.x = value.x * scale * weight.x;
+            output.y = value.y * scale * weight.y;
+            output.z = value.z * scale * weight.z;
+            output.w = value.w * scale * weight.w;
+            reinterpret_cast<float4 *>(normalized)[tid] = output;
+        }
+        __syncthreads();
+
+        const int block = commitBlock;
+        if (block >= 0 && block < compressedCapacity) {
+            if (tid < kRotaryPart / 2) {
+                const float currentSin =
+                    sin[(uint64_t)ropeIndex * sinCosStride + tid];
+                const float currentCos =
+                    cos[(uint64_t)ropeIndex * sinCosStride + tid];
+                const float low = normalized[tid];
+                const float high = normalized[
+                    tid + kRotaryPart / 2];
+                compressedKeys[(uint64_t)block * kHeadDim + tid] =
+                    low * currentCos - high * currentSin;
+                compressedKeys[(uint64_t)block * kHeadDim + tid +
+                               kRotaryPart / 2] =
+                    low * currentSin + high * currentCos;
+            }
+            compressedKeys[(uint64_t)block * kHeadDim +
+                           kRotaryPart + tid] =
+                normalized[kRotaryPart + tid];
+        }
+        __syncthreads();
+
+        // Four new rows overwrite every tail slot exactly once.  Delay this
+        // final state update until the completed block has consumed the old
+        // prefix slots above.
+        for (int item = tid; item < kSequence * kHeadDim;
+             item += kThreads) {
+            const int token = item / kHeadDim;
+            const int column = item - token * kHeadDim;
+            const int slot = (oldTail + token) & (kSequence - 1);
+            tailKeys[(uint64_t)slot * kHeadDim + column] =
+                rawKeys[(uint64_t)token * kHeadDim + column];
+        }
+        if (tid < kSequence) {
+            const int slot = (oldTail + tid) & (kSequence - 1);
+            tailPositions[slot] = positions[tid];
         }
     }
 
@@ -1898,10 +2086,14 @@ namespace {
     template <typename T>
     __global__ void Qwen4GatherSparseBatchKVKernel(
             const T *key, const T *value, const int32_t *indices,
-            T *compactKey, T *compactValue, int keyHeads,
+            T *compactKey, T *compactValue, T *paddingMask, int keyHeads,
             int keyLength, int keyHeadStride, int valueHeadStride,
             int headDim, int width,
-            int rowStart, int rows) {
+            int rowStart, int rows, const int32_t *decodeMeta,
+            int appendedSequence) {
+        if (decodeMeta != nullptr) {
+            keyLength = decodeMeta[0] + appendedSequence;
+        }
         const uint64_t total =
             (uint64_t)rows * keyHeads * width * headDim;
         for (uint64_t item = (uint64_t)blockIdx.x * blockDim.x +
@@ -1914,7 +2106,8 @@ namespace {
             const int row = vector / ((uint64_t)width * keyHeads);
             const int sourceToken = indices[
                 (uint64_t)(rowStart + row) * width + selected];
-            if (sourceToken >= 0 && sourceToken < keyLength) {
+            const bool valid = sourceToken >= 0 && sourceToken < keyLength;
+            if (valid) {
                 const uint64_t source =
                     (uint64_t)sourceToken * headDim + column;
                 compactKey[item] = key[
@@ -1925,22 +2118,55 @@ namespace {
                 compactKey[item] = Qwen4CudaFromFloat<T>(0.0f);
                 compactValue[item] = Qwen4CudaFromFloat<T>(0.0f);
             }
+            if (column == 0 && head == 0) {
+                paddingMask[(uint64_t)row * width + selected] =
+                    Qwen4CudaFromFloat<T>(valid ? 0.0f : 1.0f);
+            }
         }
     }
 
-    template <typename T>
-    __global__ void Qwen4SparsePaddingMaskKernel(
-            const int32_t *indices, T *mask, int keyLength,
-            int width, int rowStart, int rows) {
-        const int total = rows * width;
-        for (int item = blockIdx.x * blockDim.x + threadIdx.x;
-             item < total; item += blockDim.x * gridDim.x) {
-            const int row = item / width;
-            const int selected = item - row * width;
+    __global__ void Qwen4GatherSparseBatchKVHalf8Kernel(
+            const half *key, const half *value, const int32_t *indices,
+            half *compactKey, half *compactValue, half *paddingMask,
+            int keyHeads, int keyLength, int keyHeadStride,
+            int valueHeadStride, int headDim, int width,
+            int rowStart, int rows, const int32_t *decodeMeta,
+            int appendedSequence) {
+        if (decodeMeta != nullptr) {
+            keyLength = decodeMeta[0] + appendedSequence;
+        }
+        constexpr int valuesPerVector = sizeof(uint4) / sizeof(half);
+        const int vectorsPerToken = headDim / valuesPerVector;
+        const uint64_t total =
+            (uint64_t)rows * keyHeads * width * vectorsPerToken;
+        for (uint64_t item = (uint64_t)blockIdx.x * blockDim.x +
+                             threadIdx.x;
+             item < total; item += (uint64_t)blockDim.x * gridDim.x) {
+            const int vectorColumn = item % vectorsPerToken;
+            const uint64_t tokenVector = item / vectorsPerToken;
+            const int selected = tokenVector % width;
+            const int head = (tokenVector / width) % keyHeads;
+            const int row = tokenVector / ((uint64_t)width * keyHeads);
             const int sourceToken = indices[
                 (uint64_t)(rowStart + row) * width + selected];
-            mask[item] = Qwen4CudaFromFloat<T>(
-                sourceToken >= 0 && sourceToken < keyLength ? 0.0f : 1.0f);
+            const bool valid = sourceToken >= 0 && sourceToken < keyLength;
+            uint4 keyVector = make_uint4(0, 0, 0, 0);
+            uint4 valueVector = make_uint4(0, 0, 0, 0);
+            if (valid) {
+                const uint64_t source =
+                    (uint64_t)sourceToken * headDim +
+                    (uint64_t)vectorColumn * valuesPerVector;
+                keyVector = *reinterpret_cast<const uint4 *>(
+                    key + (uint64_t)head * keyHeadStride + source);
+                valueVector = *reinterpret_cast<const uint4 *>(
+                    value + (uint64_t)head * valueHeadStride + source);
+            }
+            reinterpret_cast<uint4 *>(compactKey)[item] = keyVector;
+            reinterpret_cast<uint4 *>(compactValue)[item] = valueVector;
+            if (vectorColumn == 0 && head == 0) {
+                paddingMask[(uint64_t)row * width + selected] =
+                    __float2half_rn(valid ? 0.0f : 1.0f);
+            }
         }
     }
 
@@ -2537,10 +2763,11 @@ bool FastllmCudaQwen4QSASelect(
     return success;
 }
 
-bool FastllmCudaQwen4QSAAppendGraph(
+bool FastllmCudaQwen4QSAAppendGraphOffset(
         const fastllm::Data &rawKey,
         const fastllm::Data &position,
-        const int32_t *decodeMeta, int compressRatio,
+        const int32_t *decodeMeta, int tokenOffset,
+        int compressRatio,
         fastllm::Data &tailKeys,
         fastllm::Data &tailPositions) {
     const int headDim = tailKeys.dims.size() == 2
@@ -2551,7 +2778,7 @@ bool FastllmCudaQwen4QSAAppendGraph(
     const int positionCapacity = tailPositions.expansionDims.size() == 1
         ? tailPositions.expansionDims[0]
         : (tailPositions.dims.size() == 1 ? tailPositions.dims[0] : 0);
-    if (decodeMeta == nullptr || compressRatio <= 0 ||
+    if (decodeMeta == nullptr || tokenOffset < 0 || compressRatio <= 0 ||
         rawKey.dataDevice != fastllm::DataDevice::CUDA ||
         position.dataDevice != fastllm::DataDevice::CUDA ||
         tailKeys.dataDevice != fastllm::DataDevice::CUDA ||
@@ -2574,14 +2801,28 @@ bool FastllmCudaQwen4QSAAppendGraph(
         (const float*)rawKey.cudaData,
         (const float*)position.cudaData, decodeMeta,
         (float*)tailKeys.cudaData,
-        (float*)tailPositions.cudaData, headDim, compressRatio);
+        (float*)tailPositions.cudaData, headDim, tokenOffset,
+        compressRatio);
     DeviceSync();
     return cudaGetLastError() == cudaSuccess;
 }
 
-bool FastllmCudaQwen4QSACommitGraph(
+bool FastllmCudaQwen4QSAAppendGraph(
+        const fastllm::Data &rawKey,
+        const fastllm::Data &position,
+        const int32_t *decodeMeta,
+        int compressRatio,
+        fastllm::Data &tailKeys,
+        fastllm::Data &tailPositions) {
+    return FastllmCudaQwen4QSAAppendGraphOffset(
+        rawKey, position, decodeMeta, 0, compressRatio,
+        tailKeys, tailPositions);
+}
+
+bool FastllmCudaQwen4QSACommitGraphOffset(
         const fastllm::Data &compressedKey,
-        const int32_t *decodeMeta, int compressRatio,
+        const int32_t *decodeMeta, int tokenOffset,
+        int compressRatio,
         fastllm::Data &compressedKeys) {
     const int headDim = compressedKeys.dims.size() == 2
         ? compressedKeys.dims[1] : 0;
@@ -2589,7 +2830,7 @@ bool FastllmCudaQwen4QSACommitGraph(
         ? compressedKeys.expansionDims[0]
         : (compressedKeys.dims.size() == 2
             ? compressedKeys.dims[0] : 0);
-    if (decodeMeta == nullptr || compressRatio <= 0 ||
+    if (decodeMeta == nullptr || tokenOffset < 0 || compressRatio <= 0 ||
         compressedKey.dataDevice != fastllm::DataDevice::CUDA ||
         compressedKeys.dataDevice != fastllm::DataDevice::CUDA ||
         compressedKey.cudaData == nullptr ||
@@ -2607,7 +2848,91 @@ bool FastllmCudaQwen4QSACommitGraph(
         1, threads, 0, cudaStreamPerThread>>>(
         (const float*)compressedKey.cudaData, decodeMeta,
         (float*)compressedKeys.cudaData, headDim,
-        compressRatio, capacity);
+        compressRatio, tokenOffset, capacity);
+    DeviceSync();
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool FastllmCudaQwen4QSACommitGraph(
+        const fastllm::Data &compressedKey,
+        const int32_t *decodeMeta,
+        int compressRatio,
+        fastllm::Data &compressedKeys) {
+    return FastllmCudaQwen4QSACommitGraphOffset(
+        compressedKey, decodeMeta, 0, compressRatio, compressedKeys);
+}
+
+bool FastllmCudaQwen4QSAAppendCompress4Graph(
+        const fastllm::Data &rawKeys,
+        const fastllm::Data &positions,
+        const fastllm::Data &normWeight,
+        const fastllm::Data &sinData,
+        const fastllm::Data &cosData,
+        const int32_t *decodeMeta,
+        fastllm::Data &tailKeys,
+        fastllm::Data &tailPositions,
+        fastllm::Data &compressedKeys,
+        float eps) {
+    constexpr int sequence = 4;
+    constexpr int headDim = 128;
+    const int tailCapacity = tailKeys.expansionDims.size() == 2
+        ? tailKeys.expansionDims[0]
+        : (tailKeys.dims.size() == 2 ? tailKeys.dims[0] : 0);
+    const int positionCapacity = tailPositions.expansionDims.size() == 1
+        ? tailPositions.expansionDims[0]
+        : (tailPositions.dims.size() == 1
+            ? tailPositions.dims[0] : 0);
+    const int compressedCapacity =
+        compressedKeys.expansionDims.size() == 2
+            ? compressedKeys.expansionDims[0]
+            : (compressedKeys.dims.size() == 2
+                ? compressedKeys.dims[0] : 0);
+    if (decodeMeta == nullptr ||
+        rawKeys.dataDevice != fastllm::DataDevice::CUDA ||
+        positions.dataDevice != fastllm::DataDevice::CUDA ||
+        normWeight.dataDevice != fastllm::DataDevice::CUDA ||
+        sinData.dataDevice != fastllm::DataDevice::CUDA ||
+        cosData.dataDevice != fastllm::DataDevice::CUDA ||
+        tailKeys.dataDevice != fastllm::DataDevice::CUDA ||
+        tailPositions.dataDevice != fastllm::DataDevice::CUDA ||
+        compressedKeys.dataDevice != fastllm::DataDevice::CUDA ||
+        rawKeys.cudaData == nullptr || positions.cudaData == nullptr ||
+        normWeight.cudaData == nullptr || sinData.cudaData == nullptr ||
+        cosData.cudaData == nullptr || tailKeys.cudaData == nullptr ||
+        tailPositions.cudaData == nullptr ||
+        compressedKeys.cudaData == nullptr ||
+        rawKeys.dataType != fastllm::DataType::FLOAT32 ||
+        positions.dataType != fastllm::DataType::FLOAT32 ||
+        normWeight.dataType != fastllm::DataType::FLOAT32 ||
+        sinData.dataType != fastllm::DataType::FLOAT32 ||
+        cosData.dataType != fastllm::DataType::FLOAT32 ||
+        tailKeys.dataType != fastllm::DataType::FLOAT32 ||
+        tailPositions.dataType != fastllm::DataType::FLOAT32 ||
+        compressedKeys.dataType != fastllm::DataType::FLOAT32 ||
+        rawKeys.dims != std::vector<int>({sequence, headDim}) ||
+        positions.Count(0) < sequence ||
+        normWeight.Count(0) != headDim ||
+        sinData.dims.size() != 2 || cosData.dims != sinData.dims ||
+        sinData.dims[1] < 32 || tailCapacity < sequence ||
+        positionCapacity < sequence || compressedCapacity <= 0 ||
+        tailKeys.strides.size() != 2 ||
+        tailKeys.strides[0] != headDim ||
+        compressedKeys.strides.size() != 2 ||
+        compressedKeys.strides[0] != headDim) {
+        return false;
+    }
+    Qwen4QSAAppendCompress4ExactKernel<<<
+        1, 64, 0, cudaStreamPerThread>>>(
+        (const float *)rawKeys.cudaData,
+        (const float *)positions.cudaData,
+        (const float *)normWeight.cudaData,
+        (const float *)sinData.cudaData,
+        (const float *)cosData.cudaData,
+        decodeMeta,
+        (float *)tailKeys.cudaData,
+        (float *)tailPositions.cudaData,
+        (float *)compressedKeys.cudaData,
+        compressedCapacity, sinData.dims[1], eps);
     DeviceSync();
     return cudaGetLastError() == cudaSuccess;
 }
@@ -2657,12 +2982,14 @@ bool FastllmCudaQwen4QSASelectGraph(
         return false;
     }
 
+    const int queryStart = rows > 1 ? -2 : -1;
     return FastllmCudaQwen4QSASelectLaunch(
         query, compressedKeys, decodeMeta,
         reinterpret_cast<float *>(scores.cudaData),
         reinterpret_cast<int32_t *>(selectedBlocks.cudaData), indices,
         rows, capacity, selectedK, outputWidth,
-        heads, headDim, compressRatio, -1, capacity * compressRatio);
+        heads, headDim, compressRatio, queryStart,
+        capacity * compressRatio);
 }
 
 static bool FastllmCudaQwen4KVAppendImpl(
@@ -2717,7 +3044,8 @@ static bool FastllmCudaQwen4KVAppendImpl(
         (decodeMeta == nullptr &&
          (previousLength < 0 || previousLength + sequence > keyCapacity ||
           previousLength + sequence > valueCapacity)) ||
-        (decodeMeta != nullptr && sequence != 1)) {
+        (decodeMeta != nullptr &&
+         (sequence > keyCapacity || sequence > valueCapacity))) {
         return false;
     }
     constexpr int threads = 256;
@@ -2928,17 +3256,24 @@ bool FastllmCudaQwen4GatherKV(
         key, value, indices, nullptr, compactKey, compactValue);
 }
 
-bool FastllmCudaQwen4PrepareSparseBatch(
+static bool FastllmCudaQwen4PrepareSparseBatchImpl(
         const fastllm::Data &query, const fastllm::Data &key,
         const fastllm::Data &value, const fastllm::Data &indices,
         fastllm::Data &packedQuery, fastllm::Data &compactKey,
         fastllm::Data &compactValue, fastllm::Data &paddingMask,
-        int rowStart, int rows) {
+        int rowStart, int rows, const int32_t *decodeMeta,
+        int appendedSequence) {
     const int queryHeads = query.dims.size() == 3 ? query.dims[0] : 0;
     const int sequence = query.dims.size() == 3 ? query.dims[1] : 0;
     const int headDim = query.dims.size() == 3 ? query.dims[2] : 0;
     const int keyHeads = key.dims.size() == 3 ? key.dims[0] : 0;
     const int keyLength = key.dims.size() == 3 ? key.dims[1] : 0;
+    const bool graphMode = decodeMeta != nullptr;
+    const int keyCapacity = graphMode && key.expansionDims.size() == 3
+        ? key.expansionDims[1] : keyLength;
+    const int valueCapacity = graphMode && value.expansionDims.size() == 3
+        ? value.expansionDims[1]
+        : (value.dims.size() == 3 ? value.dims[1] : 0);
     const int width = indices.dims.size() == 2 ? indices.dims[1] : 0;
     const std::vector<int> packedQueryDims = {
         rows * queryHeads, 1, headDim};
@@ -2967,9 +3302,13 @@ bool FastllmCudaQwen4PrepareSparseBatch(
         query.dims.size() != 3 || key.dims.size() != 3 ||
         value.dims != key.dims || indices.dims.size() != 2 ||
         indices.dims[0] != sequence || queryHeads <= 0 || keyHeads <= 0 ||
-        keyLength <= 0 || headDim <= 0 || key.dims[2] != headDim ||
+        keyLength <= 0 || keyCapacity <= 0 || headDim <= 0 ||
+        key.dims[2] != headDim ||
         width <= 0 || rowStart < 0 || rows <= 0 ||
         rowStart + rows > sequence ||
+        (graphMode &&
+         (appendedSequence <= 0 || appendedSequence != sequence ||
+          valueCapacity != keyCapacity)) ||
         packedQuery.dims != packedQueryDims ||
         compactKey.dims != compactDims || compactValue.dims != compactDims ||
         paddingMask.dims != maskDims ||
@@ -2984,13 +3323,10 @@ bool FastllmCudaQwen4PrepareSparseBatch(
         (uint64_t)rows * queryHeads * headDim;
     const uint64_t kvCount =
         (uint64_t)rows * keyHeads * width * headDim;
-    const int maskCount = rows * width;
     const int queryBlocks = std::min<uint64_t>(
         1024, (queryCount + threads - 1) / threads);
     const int kvBlocks = std::min<uint64_t>(
         1024, (kvCount + threads - 1) / threads);
-    const int maskBlocks = std::min(
-        1024, (maskCount + threads - 1) / threads);
     const int32_t *indexData = (const int32_t*)indices.cudaData;
     if (query.dataType == fastllm::DataType::FLOAT32) {
         Qwen4PackSparseQueryKernel<<<
@@ -3001,13 +3337,32 @@ bool FastllmCudaQwen4PrepareSparseBatch(
             kvBlocks, threads, 0, cudaStreamPerThread>>>(
             (const float*)key.cudaData, (const float*)value.cudaData,
             indexData, (float*)compactKey.cudaData,
-            (float*)compactValue.cudaData, keyHeads, keyLength,
+            (float*)compactValue.cudaData, (float*)paddingMask.cudaData,
+            keyHeads, keyCapacity,
             (int)key.strides[0], (int)value.strides[0], headDim,
-            width, rowStart, rows);
-        Qwen4SparsePaddingMaskKernel<<<
-            maskBlocks, threads, 0, cudaStreamPerThread>>>(
-            indexData, (float*)paddingMask.cudaData, keyLength,
-            width, rowStart, rows);
+            width, rowStart, rows, decodeMeta, appendedSequence);
+    } else if (query.dataType == fastllm::DataType::FLOAT16 &&
+               headDim % (int)(sizeof(uint4) / sizeof(half)) == 0 &&
+               ((uintptr_t)key.cudaData % alignof(uint4)) == 0 &&
+               ((uintptr_t)value.cudaData % alignof(uint4)) == 0 &&
+               ((uintptr_t)compactKey.cudaData % alignof(uint4)) == 0 &&
+               ((uintptr_t)compactValue.cudaData % alignof(uint4)) == 0) {
+        Qwen4PackSparseQueryKernel<<<
+            queryBlocks, threads, 0, cudaStreamPerThread>>>(
+            (const half*)query.cudaData, (half*)packedQuery.cudaData,
+            queryHeads, sequence, headDim, rowStart, rows);
+        constexpr int valuesPerVector = sizeof(uint4) / sizeof(half);
+        const uint64_t vectorCount = kvCount / valuesPerVector;
+        const int vectorBlocks = std::min<uint64_t>(
+            1024, (vectorCount + threads - 1) / threads);
+        Qwen4GatherSparseBatchKVHalf8Kernel<<<
+            vectorBlocks, threads, 0, cudaStreamPerThread>>>(
+            (const half*)key.cudaData, (const half*)value.cudaData,
+            indexData, (half*)compactKey.cudaData,
+            (half*)compactValue.cudaData, (half*)paddingMask.cudaData,
+            keyHeads, keyCapacity,
+            (int)key.strides[0], (int)value.strides[0], headDim,
+            width, rowStart, rows, decodeMeta, appendedSequence);
     } else if (query.dataType == fastllm::DataType::FLOAT16) {
         Qwen4PackSparseQueryKernel<<<
             queryBlocks, threads, 0, cudaStreamPerThread>>>(
@@ -3017,13 +3372,10 @@ bool FastllmCudaQwen4PrepareSparseBatch(
             kvBlocks, threads, 0, cudaStreamPerThread>>>(
             (const half*)key.cudaData, (const half*)value.cudaData,
             indexData, (half*)compactKey.cudaData,
-            (half*)compactValue.cudaData, keyHeads, keyLength,
+            (half*)compactValue.cudaData, (half*)paddingMask.cudaData,
+            keyHeads, keyCapacity,
             (int)key.strides[0], (int)value.strides[0], headDim,
-            width, rowStart, rows);
-        Qwen4SparsePaddingMaskKernel<<<
-            maskBlocks, threads, 0, cudaStreamPerThread>>>(
-            indexData, (half*)paddingMask.cudaData, keyLength,
-            width, rowStart, rows);
+            width, rowStart, rows, decodeMeta, appendedSequence);
     } else {
         Qwen4PackSparseQueryKernel<<<
             queryBlocks, threads, 0, cudaStreamPerThread>>>(
@@ -3036,16 +3388,40 @@ bool FastllmCudaQwen4PrepareSparseBatch(
             (const __nv_bfloat16*)value.cudaData, indexData,
             (__nv_bfloat16*)compactKey.cudaData,
             (__nv_bfloat16*)compactValue.cudaData,
-            keyHeads, keyLength,
+            (__nv_bfloat16*)paddingMask.cudaData,
+            keyHeads, keyCapacity,
             (int)key.strides[0], (int)value.strides[0], headDim,
-            width, rowStart, rows);
-        Qwen4SparsePaddingMaskKernel<<<
-            maskBlocks, threads, 0, cudaStreamPerThread>>>(
-            indexData, (__nv_bfloat16*)paddingMask.cudaData,
-            keyLength, width, rowStart, rows);
+            width, rowStart, rows, decodeMeta, appendedSequence);
     }
     DeviceSync();
     return cudaGetLastError() == cudaSuccess;
+}
+
+bool FastllmCudaQwen4PrepareSparseBatch(
+        const fastllm::Data &query, const fastllm::Data &key,
+        const fastllm::Data &value, const fastllm::Data &indices,
+        fastllm::Data &packedQuery, fastllm::Data &compactKey,
+        fastllm::Data &compactValue, fastllm::Data &paddingMask,
+        int rowStart, int rows) {
+    return FastllmCudaQwen4PrepareSparseBatchImpl(
+        query, key, value, indices, packedQuery, compactKey,
+        compactValue, paddingMask, rowStart, rows, nullptr, 0);
+}
+
+bool FastllmCudaQwen4PrepareSparseBatchGraph(
+        const fastllm::Data &query, const fastllm::Data &key,
+        const fastllm::Data &value, const fastllm::Data &indices,
+        const int32_t *decodeMeta, int appendedSequence,
+        fastllm::Data &packedQuery, fastllm::Data &compactKey,
+        fastllm::Data &compactValue, fastllm::Data &paddingMask,
+        int rowStart, int rows) {
+    if (decodeMeta == nullptr) {
+        return false;
+    }
+    return FastllmCudaQwen4PrepareSparseBatchImpl(
+        query, key, value, indices, packedQuery, compactKey,
+        compactValue, paddingMask, rowStart, rows,
+        decodeMeta, appendedSequence);
 }
 
 bool FastllmCudaQwen4UnpackSparseBatch(

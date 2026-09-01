@@ -621,13 +621,32 @@ bool FastllmCudaQwen4QSASelect(const fastllm::Data &query,
 // Fixed-capacity decode helpers used while replaying a CUDA graph.  The
 // logical cache length lives in decodeMeta[0], so every kernel launch keeps
 // the same pointer, grid, and output shape across decode tokens.
+bool FastllmCudaQwen4QSAAppendGraphOffset(
+        const fastllm::Data &rawKey, const fastllm::Data &position,
+        const int32_t *decodeMeta, int tokenOffset, int compressRatio,
+        fastllm::Data &tailKeys, fastllm::Data &tailPositions);
 bool FastllmCudaQwen4QSAAppendGraph(
         const fastllm::Data &rawKey, const fastllm::Data &position,
         const int32_t *decodeMeta, int compressRatio,
         fastllm::Data &tailKeys, fastllm::Data &tailPositions);
+bool FastllmCudaQwen4QSACommitGraphOffset(
+        const fastllm::Data &compressedKey, const int32_t *decodeMeta,
+        int tokenOffset, int compressRatio,
+        fastllm::Data &compressedKeys);
 bool FastllmCudaQwen4QSACommitGraph(
         const fastllm::Data &compressedKey, const int32_t *decodeMeta,
         int compressRatio, fastllm::Data &compressedKeys);
+bool FastllmCudaQwen4QSAAppendCompress4Graph(
+        const fastllm::Data &rawKeys,
+        const fastllm::Data &positions,
+        const fastllm::Data &normWeight,
+        const fastllm::Data &sinData,
+        const fastllm::Data &cosData,
+        const int32_t *decodeMeta,
+        fastllm::Data &tailKeys,
+        fastllm::Data &tailPositions,
+        fastllm::Data &compressedKeys,
+        float eps);
 bool FastllmCudaQwen4QSASelectGraph(
         const fastllm::Data &query, const fastllm::Data &compressedKeys,
         const int32_t *decodeMeta, fastllm::Data &scores,
@@ -656,6 +675,13 @@ bool FastllmCudaQwen4GatherKV(const fastllm::Data &key,
 bool FastllmCudaQwen4PrepareSparseBatch(
         const fastllm::Data &query, const fastllm::Data &key,
         const fastllm::Data &value, const fastllm::Data &indices,
+        fastllm::Data &packedQuery, fastllm::Data &compactKey,
+        fastllm::Data &compactValue, fastllm::Data &paddingMask,
+        int rowStart, int rows);
+bool FastllmCudaQwen4PrepareSparseBatchGraph(
+        const fastllm::Data &query, const fastllm::Data &key,
+        const fastllm::Data &value, const fastllm::Data &indices,
+        const int32_t *decodeMeta, int appendedSequence,
         fastllm::Data &packedQuery, fastllm::Data &compactKey,
         fastllm::Data &compactValue, fastllm::Data &paddingMask,
         int rowStart, int rows);
@@ -1181,6 +1207,8 @@ bool FastllmCudaMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight,
 bool FastllmCudaMatMulBFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaMatMulFloatFP8E4M3(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaQuantizeLinearWeightFP8E4M3Block128(
+    const fastllm::Data &input, fastllm::Data &output);
+bool FastllmCudaQuantizeLinearWeightNVFP4Block16(
     const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaFloatMergeMOEGGUFBatch1(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &output,
