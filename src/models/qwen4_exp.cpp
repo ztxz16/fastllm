@@ -3597,11 +3597,17 @@ namespace fastllm {
         const bool sequentialMtpDecode =
             sequence > 1 && sequence <= 9 &&
             qwen4MtpDecodeEquivalentTarget;
-        const bool mixedGdnPrefill =
+        constexpr int chunkSize = 64;
+        bool mixedGdnPrefill = false;
+#ifdef USE_CUDA
+        mixedGdnPrefill =
             !fusedDecode && !sequentialMtpDecode &&
-            GetFastllmEnv().cudaTriton &&
             qkv.dataDevice == DataDevice::CUDA &&
-            qkv.dataType == DataType::FLOAT16;
+            qkv.dataType == DataType::FLOAT16 &&
+            FastllmCudaCanUseTritonChunkGdnPrefill(
+                batch, (sequence + chunkSize - 1) / chunkSize,
+                chunkSize, this->head_k_dim, this->head_v_dim, true);
+#endif
         if (!fusedDecode && !mixedGdnPrefill) {
             ToDataType(qkv, DataType::FLOAT32);
         }
@@ -3748,7 +3754,6 @@ namespace fastllm {
         // operation's layer-wide mixed path, while the checkpoint-required
         // recurrent state remains float32.  CPU and unsupported activation
         // types retain the float32 reference path.
-        constexpr int chunkSize = 64;
         const int padding = (chunkSize - sequence % chunkSize) % chunkSize;
         Data query, key, value;
         Data normalizedQuery, normalizedKey;
