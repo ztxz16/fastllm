@@ -3481,7 +3481,7 @@ namespace fastllm {
             }
         };
 
-        struct Qwen35MtpVerifyGraphBarrier {
+        struct Qwen35CudaGraphBarrier {
             std::atomic<int> arrived{0};
             std::atomic<int> generation{0};
             int participants = 0;
@@ -3510,6 +3510,164 @@ namespace fastllm {
             }
         };
 
+        // A normal tensor-parallel decode owns one process-wide graph-memory
+        // transaction, even though every rank captures a different PTDS and
+        // produces a different cudaGraph_t.  The pool deliberately supports
+        // multiple capture ids in one transaction; letting every rank call
+        // MemoryPoolBegin/End independently races that single transaction and
+        // can leave one rank replaying a graph while another runs eagerly.
+        //
+        // Keep the coordination object on the ForwardGPU stack.  All worker
+        // calls finish before that stack frame returns, while graph/pool
+        // ownership itself is transferred to the existing per-GPU states.
+        struct Qwen35TpDecodeGraphContext {
+            int participants = 0;
+            std::vector<int> devices;
+            std::vector<int> values;
+            std::vector<void*> reservedPointers;
+            std::vector<int> reservedPointerRanks;
+            int leaderValue = 0;
+            Qwen35CudaGraphBarrier barrier;
+
+            void Reset(const std::vector<int> &captureDevices) {
+                devices = captureDevices;
+                participants = (int)devices.size();
+                values.assign(participants, 0);
+                reservedPointers.clear();
+                reservedPointerRanks.clear();
+                leaderValue = 0;
+                barrier.Reset(participants);
+            }
+
+            void Synchronize() {
+                barrier.Wait();
+            }
+
+            bool All(int rank, bool value) {
+                values[rank] = value ? 1 : 0;
+                barrier.Wait();
+                bool result = std::all_of(
+                    values.begin(), values.end(),
+                    [](int item) { return item != 0; });
+                // Do not let a fast rank overwrite its slot for the next
+                // reduction while another rank is still reading this one.
+                barrier.Wait();
+                return result;
+            }
+
+            bool AllEqual(int rank, int value) {
+                values[rank] = value;
+                barrier.Wait();
+                bool result = std::all_of(
+                    values.begin(), values.end(),
+                    [&](int item) { return item == values[0]; });
+                barrier.Wait();
+                return result;
+            }
+
+            int Max(int rank, int value) {
+                values[rank] = value;
+                barrier.Wait();
+                int result = *std::max_element(values.begin(), values.end());
+                barrier.Wait();
+                return result;
+            }
+
+            bool BeginMemoryPool(int rank) {
+                if (rank == 0) {
+                    reservedPointers.clear();
+                    reservedPointerRanks.clear();
+                    leaderValue = FastllmCudaGraphMemoryPoolBegin() ? 1 : 0;
+                }
+                barrier.Wait();
+                bool result = leaderValue != 0;
+                barrier.Wait();
+                return result;
+            }
+
+            void AbortMemoryPool(int rank) {
+                // Every participating stream must have left capture before
+                // the global allocation tracker is reset.
+                barrier.Wait();
+                if (rank == 0) {
+                    FastllmCudaGraphMemoryPoolAbort();
+                }
+                barrier.Wait();
+            }
+
+            bool EndMemoryPool(int rank) {
+                barrier.Wait();
+                if (rank == 0) {
+                    leaderValue = FastllmCudaGraphMemoryPoolEnd(
+                        reservedPointers) ? 1 : 0;
+                    if (leaderValue != 0) {
+                        reservedPointerRanks.reserve(reservedPointers.size());
+                        for (void *pointer : reservedPointers) {
+                            int pointerDevice = GetPointerDeviceId(pointer);
+                            auto it = std::find(devices.begin(), devices.end(),
+                                                pointerDevice);
+                            // CUDA pool blocks should always resolve to one of
+                            // the participating GPUs.  Rank 0 conservatively
+                            // owns an unclassified block so it is still
+                            // released exactly once.
+                            reservedPointerRanks.push_back(
+                                it == devices.end() ? 0 :
+                                (int)std::distance(devices.begin(), it));
+                        }
+                    }
+                }
+                barrier.Wait();
+                bool result = leaderValue != 0;
+                barrier.Wait();
+                return result;
+            }
+
+            void TakeReservedPointers(int rank,
+                                      std::vector<void*> &rankPointers) {
+                rankPointers.clear();
+                for (int i = 0; i < (int)reservedPointers.size(); ++i) {
+                    if (reservedPointerRanks[i] == rank) {
+                        rankPointers.push_back(reservedPointers[i]);
+                    }
+                }
+            }
+        };
+
+        static thread_local Qwen35TpDecodeGraphContext
+            *qwen35TpDecodeGraphContext = nullptr;
+        static thread_local int qwen35TpDecodeGraphRank = -1;
+
+        struct Qwen35ScopedTpDecodeGraphContext {
+            Qwen35TpDecodeGraphContext *oldContext = nullptr;
+            int oldRank = -1;
+            bool active = false;
+
+            Qwen35ScopedTpDecodeGraphContext(
+                    bool enabled, Qwen35TpDecodeGraphContext *context,
+                    int rank) : active(enabled) {
+                if (!active) {
+                    return;
+                }
+                oldContext = qwen35TpDecodeGraphContext;
+                oldRank = qwen35TpDecodeGraphRank;
+                qwen35TpDecodeGraphContext = context;
+                qwen35TpDecodeGraphRank = rank;
+            }
+
+            Qwen35ScopedTpDecodeGraphContext(
+                const Qwen35ScopedTpDecodeGraphContext&) = delete;
+            Qwen35ScopedTpDecodeGraphContext &operator=(
+                const Qwen35ScopedTpDecodeGraphContext&) = delete;
+
+            ~Qwen35ScopedTpDecodeGraphContext() {
+                if (!active) {
+                    return;
+                }
+                qwen35TpDecodeGraphContext = oldContext;
+                qwen35TpDecodeGraphRank = oldRank;
+            }
+        };
+
         struct Qwen35MtpVerifyGraphState {
             std::mutex mutex;
             std::string signature;
@@ -3525,7 +3683,7 @@ namespace fastllm {
             std::vector<std::unique_ptr<Qwen35MtpVerifyGraphDeviceState> >
                 deviceStates;
             std::vector<void*> reservedPointers;
-            Qwen35MtpVerifyGraphBarrier barrier;
+            Qwen35CudaGraphBarrier barrier;
 
             void DestroyCapturedGraph() {
                 for (auto &deviceState : deviceStates) {
@@ -9876,23 +10034,36 @@ namespace fastllm {
         return false;
 #else
         (void)ratios;
+        Qwen35TpDecodeGraphContext *tpGraphContext =
+            qwen35TpDecodeGraphContext;
+        const int tpGraphRank = qwen35TpDecodeGraphRank;
+        auto finishGraphEligibility = [&](bool localEligible) {
+            if (tpGraphContext == nullptr) {
+                return localEligible;
+            }
+            AssertInFastLLM(
+                tpGraphRank >= 0 &&
+                    tpGraphRank < tpGraphContext->participants,
+                "Qwen3.5 CUDA graph got an invalid TP rank.\n");
+            return tpGraphContext->All(tpGraphRank, localEligible);
+        };
         const int maxCudaGraphDecodeBatch = Qwen35MaxCudaGraphDecodeBatch(this);
         if (!Qwen35CudaGraphEnabled() || batch <= 0 || batch > maxCudaGraphDecodeBatch ||
             !all1 || isPrefill || (int)seqLens.size() < batch ||
             (int)pastKeyValues.size() < batch * block_cnt || seqLens[0] != 1 ||
             positionIds.Count(0) != (uint64_t)batch) {
-            return false;
+            return finishGraphEligibility(false);
         }
         for (int b = 0; b < batch; b++) {
             if (seqLens[b] != 1) {
-                return false;
+                return finishGraphEligibility(false);
             }
         }
         if (precomputedHiddenStates == nullptr && inputIds.Count(0) != (uint64_t)batch) {
-            return false;
+            return finishGraphEligibility(false);
         }
         if (num_experts > 0 && !Qwen35ModelMoeLayersAllowCudaOnly(this)) {
-            return false;
+            return finishGraphEligibility(false);
         }
 
         std::vector<int> attentionLayers;
@@ -9917,7 +10088,7 @@ namespace fastllm {
             }
         }
         if (attentionLayers.empty()) {
-            return false;
+            return finishGraphEligibility(false);
         }
 
         auto requireLocal = [&](Data &data, const std::string &name) -> Data* {
@@ -9945,11 +10116,11 @@ namespace fastllm {
         if (precomputedHiddenStates == nullptr) {
             localInputIds = requireLocal((Data&)inputIds, "inputIds");
             if (localInputIds->dims.size() != 2 || localInputIds->Count(0) != (uint64_t)batch) {
-                return false;
+                return finishGraphEligibility(false);
             }
         }
         if (localPositionIds->dims.empty() || localPositionIds->Count(0) != (uint64_t)batch) {
-            return false;
+            return finishGraphEligibility(false);
         }
 
         Data *localPrecomputedHiddenStates = nullptr;
@@ -9960,7 +10131,7 @@ namespace fastllm {
                 localPrecomputedHiddenStates->dims.size() != 3 ||
                 localPrecomputedHiddenStates->dims[0] != 1 ||
                 localPrecomputedHiddenStates->dims[1] != batch) {
-                return false;
+                return finishGraphEligibility(false);
             }
         }
 
@@ -9981,17 +10152,17 @@ namespace fastllm {
                     pastKey->pageLen <= 0 || pastKey->pageLen != pastValue->pageLen ||
                     pastKey->pageIndex.size() != pastValue->pageIndex.size() ||
                     pastKey->lastPageLen != pastValue->lastPageLen) {
-                    return false;
+                    return finishGraphEligibility(false);
                 }
                 int layerTokens = ((int)pastKey->pageIndex.size() - 1) * pastKey->pageLen + pastKey->lastPageLen;
                 currentTokens = std::max(currentTokens, layerTokens);
             }
         }
         if (rope_type == RoPEType::DYMAMIC_NTK && currentTokens + 1 >= max_positions) {
-            return false;
+            return finishGraphEligibility(false);
         }
         if (currentTokens < 8) {
-            return false;
+            return finishGraphEligibility(false);
         }
 
         std::vector<int> insertIndexHost(batch, -1);
@@ -10024,7 +10195,7 @@ namespace fastllm {
             graphMaxPagesPerRequest = graphPagedManager->dims[0];
         }
         if (graphMaxPagesPerRequest <= 0) {
-            return false;
+            return finishGraphEligibility(false);
         }
         int graphPlanPagesPerRequest = graphMaxPagesPerRequest;
         int graphPageLen =
@@ -10040,7 +10211,7 @@ namespace fastllm {
             int prospectivePages = (int)firstKey->pageIndex.size() +
                                    (needNewPageHost[b] ? 1 : 0);
             if (prospectivePages > graphPlanPagesPerRequest) {
-                return false;
+                return finishGraphEligibility(false);
             }
         }
         for (int b = 0; b < batch; b++) {
@@ -10058,9 +10229,13 @@ namespace fastllm {
                     convCache->dataDevice != DataDevice::CUDA ||
                     recurrentState->dataDevice != DataDevice::CUDA ||
                     convCache->cudaData == nullptr || recurrentState->cudaData == nullptr) {
-                    return false;
+                    return finishGraphEligibility(false);
                 }
             }
+        }
+
+        if (!finishGraphEligibility(true)) {
+            return false;
         }
 
         Qwen35CudaGraphDecodeState &state = GetQwen35CudaGraphDecodeState(this, gpuId, batch);
@@ -10072,6 +10247,18 @@ namespace fastllm {
         bool gpuTokenHandoffLaunch =
             qwen35GpuTokenHandoffControl != nullptr &&
             qwen35GpuTokenHandoffControl->launchActive;
+        if (tpGraphContext != nullptr) {
+            int localStatePhase = state.disabled ? -1 :
+                (state.captured ? 2 : (state.warmed ? 1 : 0));
+            if (!tpGraphContext->AllEqual(tpGraphRank, localStatePhase)) {
+                // A TP graph is one logical executable.  Never preserve a
+                // rank-local graph after another rank lost or invalidated its
+                // peer; doing so mixes graph replay with eager collectives.
+                Qwen35DestroyCudaGraph(state);
+                state.disabled = true;
+                return false;
+            }
+        }
         if (state.disabled) {
             return false;
         }
@@ -10093,6 +10280,7 @@ namespace fastllm {
         workspace.buffers.recurrentStates.resize(batch);
         std::vector<int> linearSlotIdsHost;
         int linearSlotCapacity = Qwen35LinearSlotCapacity(this, batch);
+        bool linearCacheReady = true;
         if (!Qwen35CollectExistingLinearSlotCaches(
                 gpuId, batch, block_cnt, linearLayers,
                 pastKeyValues, linearSlotIdsHost)) {
@@ -10100,15 +10288,26 @@ namespace fastllm {
                 for (int b = 0; b < batch; b++) {
                     if (!Qwen35EnsureCudaLinearAttnStateTransposed(
                             *pastKeyValues[b * block_cnt + layer].second)) {
-                        return false;
+                        linearCacheReady = false;
+                        break;
                     }
                 }
+                if (!linearCacheReady) {
+                    break;
+                }
             }
-            if (!Qwen35PrepareLinearSlotCaches(this, gpuId, batch, block_cnt,
-                                               linearLayers, pastKeyValues,
-                                               linearSlotIdsHost)) {
-                return false;
+            if (linearCacheReady) {
+                linearCacheReady = Qwen35PrepareLinearSlotCaches(
+                    this, gpuId, batch, block_cnt, linearLayers,
+                    pastKeyValues, linearSlotIdsHost);
             }
+        }
+        if (tpGraphContext != nullptr) {
+            linearCacheReady = tpGraphContext->All(
+                tpGraphRank, linearCacheReady);
+        }
+        if (!linearCacheReady) {
+            return false;
         }
 
         struct GraphPagedCacheMetaSnapshot {
@@ -10410,10 +10609,15 @@ namespace fastllm {
             state.lastPastKeyHosts = currentPastKeyHosts;
         } else {
             FastllmCudaSetDevice(gpuId);
-            if (!FastllmCudaAdvanceDecodeMeta(
-                    (int32_t*)workspace.buffers.insertPositions.cudaData,
-                    (int32_t*)workspace.buffers.lastPageLens.cudaData,
-                    batch)) {
+            bool metaAdvanceOk = FastllmCudaAdvanceDecodeMeta(
+                (int32_t*)workspace.buffers.insertPositions.cudaData,
+                (int32_t*)workspace.buffers.lastPageLens.cudaData,
+                batch);
+            if (tpGraphContext != nullptr) {
+                metaAdvanceOk = tpGraphContext->All(
+                    tpGraphRank, metaAdvanceOk);
+            }
+            if (!metaAdvanceOk) {
                 Qwen35DestroyCudaGraph(state);
                 state.disabled = true;
                 return false;
@@ -11215,8 +11419,21 @@ namespace fastllm {
         // metadata; the guard above only rolls it back on a false/exceptional
         // pre-execution exit so the outer eager fallback cannot append twice.
         graphPagedRollbackArmed = false;
+        if (tpGraphContext != nullptr) {
+            int localStatePhase = state.captured ? 2 :
+                (state.warmed ? 1 : 0);
+            if (!tpGraphContext->AllEqual(tpGraphRank, localStatePhase)) {
+                Qwen35DestroyCudaGraph(state);
+                state.disabled = true;
+                runWithoutGraph();
+                return true;
+            }
+        }
         if (state.captured) {
             bool replayOk = FastllmCudaGraphLaunch(state.exec);
+            if (tpGraphContext != nullptr) {
+                replayOk = tpGraphContext->All(tpGraphRank, replayOk);
+            }
             if (replayOk) {
                 if (qwen35GpuTokenHandoffControl != nullptr) {
                     qwen35GpuTokenHandoffControl->MarkGraphReplayUsed(gpuId);
@@ -11227,8 +11444,18 @@ namespace fastllm {
                 finishWithLogits();
                 return true;
             }
-            printf("Warning: Qwen3.5 CUDA graph replay failed on gpu %d: %s. Disable graph for this GPU.\n",
-                   gpuId, FastllmCudaGraphLastError());
+            if (tpGraphContext != nullptr) {
+                // A peer may already have queued its graph. Drain every local
+                // stream before any rank destroys executables and all ranks
+                // enter the eager fallback together.
+                FastllmCudaSetDevice(gpuId);
+                ForceDeviceSync();
+                tpGraphContext->Synchronize();
+            }
+            printf("Warning: Qwen3.5 CUDA graph replay failed on gpu %d: %s. Disable graph%s.\n",
+                   gpuId, FastllmCudaGraphLastError(),
+                   tpGraphContext == nullptr ? " for this GPU" :
+                                               " for all TP ranks");
             Qwen35DestroyCudaGraph(state);
             state.disabled = true;
             runWithoutGraph();
@@ -11243,7 +11470,13 @@ namespace fastllm {
         if (!state.warmed) {
             FastllmCudaClearThreadError();
             bool usedUnsafeMoeFallback = runWithoutGraph();
-            if (usedUnsafeMoeFallback) {
+            int warmupFailure = usedUnsafeMoeFallback ? 2 :
+                (FastllmCudaGetThreadError() ? 1 : 0);
+            if (tpGraphContext != nullptr) {
+                warmupFailure = tpGraphContext->Max(
+                    tpGraphRank, warmupFailure);
+            }
+            if (warmupFailure == 2) {
                 printf("Warning: Qwen3.5 CUDA graph disabled on gpu %d because MergeMOE used CPU expert routing fallback during warmup.\n",
                        gpuId);
                 fflush(stdout);
@@ -11251,7 +11484,7 @@ namespace fastllm {
                 state.disabled = true;
                 return true;
             }
-            if (FastllmCudaGetThreadError()) {
+            if (warmupFailure != 0) {
                 printf("Warning: Qwen3.5 CUDA graph disabled on gpu %d because CUDA errors occurred during warmup run.\n",
                        gpuId);
                 fflush(stdout);
@@ -11285,58 +11518,112 @@ namespace fastllm {
             capturedGraph = nullptr;
             reservedPointers.clear();
             FastllmCudaClearThreadError();
-            if (!FastllmCudaGraphPrepareCaptureDevice() ||
-                !FastllmCudaGraphMemoryPoolBegin()) {
+            FastllmCudaClearGraphError();
+            bool prepareOk = FastllmCudaGraphPrepareCaptureDevice();
+            if (tpGraphContext != nullptr) {
+                prepareOk = tpGraphContext->All(tpGraphRank, prepareOk);
+            }
+            if (!prepareOk) {
                 return Qwen35GraphCaptureFailure::Begin;
             }
-            if (!FastllmCudaGraphBeginCapture()) {
-                FastllmCudaGraphMemoryPoolAbort();
+            bool poolOk = tpGraphContext != nullptr ?
+                tpGraphContext->BeginMemoryPool(tpGraphRank) :
+                FastllmCudaGraphMemoryPoolBegin();
+            if (!poolOk) {
                 return Qwen35GraphCaptureFailure::Begin;
             }
+
+            bool beginOk = FastllmCudaGraphBeginCapture();
+            bool everyRankBegan = tpGraphContext != nullptr ?
+                tpGraphContext->All(tpGraphRank, beginOk) : beginOk;
+            if (!everyRankBegan) {
+                if (beginOk) {
+                    Qwen35AbortCudaGraphCapture();
+                }
+                if (tpGraphContext != nullptr) {
+                    tpGraphContext->AbortMemoryPool(tpGraphRank);
+                } else {
+                    FastllmCudaGraphMemoryPoolAbort();
+                }
+                return Qwen35GraphCaptureFailure::Begin;
+            }
+
             FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag();
             runGraphBody();
-            if (FastllmCudaMergeMOEUsedGraphUnsafeFallback()) {
-                Qwen35AbortCudaGraphCapture();
-                FastllmCudaGraphMemoryPoolAbort();
-                return Qwen35GraphCaptureFailure::UnsafeMoeFallback;
+            int bodyFailure =
+                FastllmCudaMergeMOEUsedGraphUnsafeFallback() ?
+                    (int)Qwen35GraphCaptureFailure::UnsafeMoeFallback :
+                (FastllmCudaGetThreadError() ||
+                 FastllmCudaGraphCaptureInvalidated()) ?
+                    (int)Qwen35GraphCaptureFailure::Body :
+                    (int)Qwen35GraphCaptureFailure::None;
+            if (tpGraphContext != nullptr) {
+                bodyFailure = tpGraphContext->Max(
+                    tpGraphRank, bodyFailure);
             }
-            if (FastllmCudaGetThreadError() ||
-                FastllmCudaGraphCaptureInvalidated()) {
+            if (bodyFailure != (int)Qwen35GraphCaptureFailure::None) {
                 Qwen35AbortCudaGraphCapture();
-                FastllmCudaGraphMemoryPoolAbort();
-                return Qwen35GraphCaptureFailure::Body;
+                if (tpGraphContext != nullptr) {
+                    tpGraphContext->AbortMemoryPool(tpGraphRank);
+                } else {
+                    FastllmCudaGraphMemoryPoolAbort();
+                }
+                return (Qwen35GraphCaptureFailure)bodyFailure;
             }
-            if (!FastllmCudaGraphEndCapture(&capturedGraph) ||
-                capturedGraph == nullptr) {
+
+            bool endOk = FastllmCudaGraphEndCapture(&capturedGraph) &&
+                         capturedGraph != nullptr;
+            bool everyRankEnded = tpGraphContext != nullptr ?
+                tpGraphContext->All(tpGraphRank, endOk) : endOk;
+            if (!everyRankEnded) {
                 if (capturedGraph != nullptr) {
                     FastllmCudaGraphDestroy(capturedGraph);
                     capturedGraph = nullptr;
                 }
-                FastllmCudaGraphMemoryPoolAbort();
+                if (tpGraphContext != nullptr) {
+                    tpGraphContext->AbortMemoryPool(tpGraphRank);
+                } else {
+                    FastllmCudaGraphMemoryPoolAbort();
+                }
                 return Qwen35GraphCaptureFailure::End;
             }
-            if (!FastllmCudaGraphMemoryPoolEnd(reservedPointers)) {
+
+            bool pinOk = tpGraphContext != nullptr ?
+                tpGraphContext->EndMemoryPool(tpGraphRank) :
+                FastllmCudaGraphMemoryPoolEnd(reservedPointers);
+            if (!pinOk) {
                 FastllmCudaGraphDestroy(capturedGraph);
                 capturedGraph = nullptr;
                 return Qwen35GraphCaptureFailure::End;
+            }
+            if (tpGraphContext != nullptr) {
+                tpGraphContext->TakeReservedPointers(
+                    tpGraphRank, reservedPointers);
             }
             return Qwen35GraphCaptureFailure::None;
         };
         auto reportCaptureFailure = [&](Qwen35GraphCaptureFailure failure,
                                         bool markerless) {
             const char *phase = markerless ? "markerless recapture" : "capture";
+            const char *scope = tpGraphContext == nullptr ?
+                "this GPU" : "all TP ranks";
+            const char *error = FastllmCudaGraphLastError();
+            if (error == nullptr || error[0] == '\0') {
+                error = tpGraphContext == nullptr ? "unknown CUDA error" :
+                    "a peer tensor-parallel rank failed";
+            }
             if (failure == Qwen35GraphCaptureFailure::Begin) {
-                printf("Warning: Qwen3.5 CUDA graph %s begin failed on gpu %d: %s. Disable graph for this GPU.\n",
-                       phase, gpuId, FastllmCudaGraphLastError());
+                printf("Warning: Qwen3.5 CUDA graph %s begin failed on gpu %d: %s. Disable graph for %s.\n",
+                       phase, gpuId, error, scope);
             } else if (failure == Qwen35GraphCaptureFailure::UnsafeMoeFallback) {
-                printf("Warning: Qwen3.5 CUDA graph disabled on gpu %d because MergeMOE used CPU expert routing fallback during %s.\n",
-                       gpuId, phase);
+                printf("Warning: Qwen3.5 CUDA graph disabled for %s on gpu %d because MergeMOE used CPU expert routing fallback during %s.\n",
+                       scope, gpuId, phase);
             } else if (failure == Qwen35GraphCaptureFailure::Body) {
-                printf("Warning: Qwen3.5 CUDA graph disabled on gpu %d because errors occurred inside %s body. Fallback to eager mode.\n",
-                       gpuId, phase);
+                printf("Warning: Qwen3.5 CUDA graph disabled for %s on gpu %d because errors occurred inside %s body. Fallback to eager mode.\n",
+                       scope, gpuId, phase);
             } else if (failure == Qwen35GraphCaptureFailure::End) {
-                printf("Warning: Qwen3.5 CUDA graph %s end failed on gpu %d: %s. Disable graph for this GPU.\n",
-                       phase, gpuId, FastllmCudaGraphLastError());
+                printf("Warning: Qwen3.5 CUDA graph %s end failed on gpu %d: %s. Disable graph for %s.\n",
+                       phase, gpuId, error, scope);
             }
             fflush(stdout);
         };
@@ -11355,8 +11642,14 @@ namespace fastllm {
         }
 
         int parallelMoeLayers = FastllmCudaGraphOptimizeQwen35Moe(capturedGraph);
-        if (parallelMoeLayers ==
-            FASTLLM_CUDA_GRAPH_MOE_RECAPTURE_WITHOUT_MARKERS) {
+        int optimizeDisposition = parallelMoeLayers < 0 ? 2 :
+            (parallelMoeLayers ==
+                 FASTLLM_CUDA_GRAPH_MOE_RECAPTURE_WITHOUT_MARKERS ? 1 : 0);
+        if (tpGraphContext != nullptr) {
+            optimizeDisposition = tpGraphContext->Max(
+                tpGraphRank, optimizeDisposition);
+        }
+        if (optimizeDisposition == 1) {
             FastllmCudaGraphDestroy(capturedGraph);
             capturedGraph = nullptr;
             FastllmCudaGraphMemoryPoolRelease(capturedReservedPointers);
@@ -11372,9 +11665,11 @@ namespace fastllm {
             }
             parallelMoeLayers = 0;
         }
-        if (parallelMoeLayers < 0) {
-            printf("Warning: Qwen3.5 CUDA graph MoE parallelization failed on gpu %d: %s. Disable graph for this GPU.\n",
-                   gpuId, FastllmCudaGraphLastError());
+        if (optimizeDisposition == 2) {
+            printf("Warning: Qwen3.5 CUDA graph MoE parallelization failed on gpu %d: %s. Disable graph%s.\n",
+                   gpuId, FastllmCudaGraphLastError(),
+                   tpGraphContext == nullptr ? " for this GPU" :
+                                               " for all TP ranks");
             fflush(stdout);
             FastllmCudaGraphDestroy(capturedGraph);
             FastllmCudaGraphMemoryPoolRelease(capturedReservedPointers);
@@ -11385,9 +11680,22 @@ namespace fastllm {
         }
 
         void *capturedExec = nullptr;
-        if (!FastllmCudaGraphInstantiate(capturedGraph, &capturedExec) || capturedExec == nullptr) {
-            printf("Warning: Qwen3.5 CUDA graph instantiate failed on gpu %d: %s. Disable graph for this GPU.\n",
-                   gpuId, FastllmCudaGraphLastError());
+        bool instantiateOk =
+            FastllmCudaGraphInstantiate(capturedGraph, &capturedExec) &&
+            capturedExec != nullptr;
+        if (tpGraphContext != nullptr) {
+            instantiateOk = tpGraphContext->All(
+                tpGraphRank, instantiateOk);
+        }
+        if (!instantiateOk) {
+            printf("Warning: Qwen3.5 CUDA graph instantiate failed on gpu %d: %s. Disable graph%s.\n",
+                   gpuId, FastllmCudaGraphLastError(),
+                   tpGraphContext == nullptr ? " for this GPU" :
+                                               " for all TP ranks");
+            if (capturedExec != nullptr) {
+                FastllmCudaGraphExecDestroy(capturedExec);
+                capturedExec = nullptr;
+            }
             FastllmCudaGraphDestroy(capturedGraph);
             FastllmCudaGraphMemoryPoolRelease(capturedReservedPointers);
             Qwen35DestroyCudaGraph(state);
@@ -11398,9 +11706,17 @@ namespace fastllm {
 
         std::set<void*> capturedDataPointers =
             Qwen35CudaGraphWorkspaceDataPointers(workspace);
+        bool workspacePointersStable = true;
         if (workspace.capturedDataPointers.empty()) {
             workspace.capturedDataPointers = capturedDataPointers;
         } else if (workspace.capturedDataPointers != capturedDataPointers) {
+            workspacePointersStable = false;
+        }
+        if (tpGraphContext != nullptr) {
+            workspacePointersStable = tpGraphContext->All(
+                tpGraphRank, workspacePointersStable);
+        }
+        if (!workspacePointersStable) {
             FastllmCudaGraphExecDestroy(capturedExec);
             FastllmCudaGraphDestroy(capturedGraph);
             FastllmCudaGraphMemoryPoolRelease(capturedReservedPointers);
@@ -11413,6 +11729,26 @@ namespace fastllm {
         state.exec = capturedExec;
         state.reservedPointers.swap(capturedReservedPointers);
         state.captured = true;
+        bool firstLaunchOk = FastllmCudaGraphLaunch(state.exec);
+        if (tpGraphContext != nullptr) {
+            firstLaunchOk = tpGraphContext->All(
+                tpGraphRank, firstLaunchOk);
+        }
+        if (!firstLaunchOk) {
+            if (tpGraphContext != nullptr) {
+                FastllmCudaSetDevice(gpuId);
+                ForceDeviceSync();
+                tpGraphContext->Synchronize();
+            }
+            printf("Warning: Qwen3.5 CUDA graph first launch failed on gpu %d: %s. Disable graph%s.\n",
+                   gpuId, FastllmCudaGraphLastError(),
+                   tpGraphContext == nullptr ? " for this GPU" :
+                                               " for all TP ranks");
+            Qwen35DestroyCudaGraph(state);
+            state.disabled = true;
+            runWithoutGraph();
+            return true;
+        }
         printf("[Fastllm] Qwen3.5 CUDA graph captured GPU %d batch %d: "
                "shared Data %.2f MB, capacity batch %d, stable pointers %zu.\n",
                gpuId, batch,
@@ -11420,15 +11756,6 @@ namespace fastllm {
                workspace.capacityBatch,
                workspace.capturedDataPointers.size());
         fflush(stdout);
-        bool firstLaunchOk = FastllmCudaGraphLaunch(state.exec);
-        if (!firstLaunchOk) {
-            printf("Warning: Qwen3.5 CUDA graph first launch failed on gpu %d: %s. Disable graph for this GPU.\n",
-                   gpuId, FastllmCudaGraphLastError());
-            Qwen35DestroyCudaGraph(state);
-            state.disabled = true;
-            runWithoutGraph();
-            return true;
-        }
         finishWithLogits();
         return true;
 #endif
@@ -15700,14 +16027,25 @@ namespace fastllm {
             // latency-sensitive and handing both ranks to condition-variable
             // workers adds a full wake-up/return round trip on every token.
             // Rank 1 still runs concurrently on its persistent worker.
+            bool coordinateNormalDecodeGraph =
+                Qwen35CudaGraphEnabled() && all1 && !isPrefill &&
+                !speculativeCollectAllLogits &&
+                !speculativeCaptureDFlashHiddenStates;
+            Qwen35TpDecodeGraphContext tpDecodeGraphContext;
+            if (coordinateNormalDecodeGraph) {
+                tpDecodeGraphContext.Reset(devices);
+            }
             threadTpWorkerGroup.RunWithCaller(devices, [&](int r) {
                 Qwen35ScopedGpuTokenHandoffControl handoffScope(
                     activeGpuTokenHandoff);
-                ForwardSingleGPU(devices[r], ratios, batch, gpuInputIds, allPositionIds,
-                                 seqLens, localPastKeyValues[r], all1, isPrefill,
-                                 tensorParallel, r == 0,
-                                 threadTpPagedCacheBase + r * block_cnt,
-                                 localLogits[r], precomputedHiddenStates);
+                Qwen35ScopedTpDecodeGraphContext graphContextScope(
+                    coordinateNormalDecodeGraph, &tpDecodeGraphContext, r);
+                ForwardSingleGPU(
+                    devices[r], ratios, batch, gpuInputIds,
+                    allPositionIds, seqLens, localPastKeyValues[r],
+                    all1, isPrefill, tensorParallel, r == 0,
+                    threadTpPagedCacheBase + r * block_cnt,
+                    localLogits[r], precomputedHiddenStates);
                 FastllmCudaSetDevice(devices[r]);
                 if (pipelineGpuTokenHandoff) {
                     activeGpuTokenHandoff->RecordForwardReady(r);
