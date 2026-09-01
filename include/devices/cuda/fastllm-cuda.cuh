@@ -1110,6 +1110,9 @@ bool FastllmCudaTryCombinedGdnOutputGate(
         int batch, int seqLen,
         int gateOffset, int gateHeads,
         Data &output, float eps);
+bool FastllmCudaCanUseTritonChunkGdnPrefill(
+        int batch, int chunks, int chunkSize,
+        int kDim, int vDim, bool floatState);
 bool FastllmCudaTryTritonChunkGdnPostConv(
         const Data &qkvInput, const Data &normWeight,
         const Data &gInput, const Data &betaInput,
