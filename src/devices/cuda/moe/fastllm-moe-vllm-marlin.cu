@@ -506,13 +506,42 @@ __global__ void BuildEpMetadataRowsKernel(
         const int32_t *__restrict__ globalIndices,
         int32_t *__restrict__ sortedTokenIds,
         int32_t *__restrict__ expertIds,
+        int32_t *__restrict__ secondaryExpertIds,
         int32_t *__restrict__ numTokensPadded,
         int rows, int topk, int ownerRank, int ownerCount,
         int localExperts) {
-    if (blockIdx.x != 0 || threadIdx.x != 0) {
+    if (blockIdx.x != 0) {
         return;
     }
     const int routes = rows * topk;
+
+    // The single-owner path receives valid TopK expert ids and needs no
+    // filtering or compaction.  Routes therefore map one-to-one to padded
+    // Marlin blocks and can be generated independently.  Writing the second
+    // expert-id array here also removes a tiny D2D copy from every MoE layer.
+    if (ownerRank == 0 && ownerCount == 1) {
+        for (int route = threadIdx.x; route < routes;
+             route += blockDim.x) {
+            const int expert = globalIndices[route];
+            const int base = route * 8;
+            reinterpret_cast<int4 *>(sortedTokenIds + base)[0] =
+                make_int4(route, routes, routes, routes);
+            reinterpret_cast<int4 *>(sortedTokenIds + base)[1] =
+                make_int4(routes, routes, routes, routes);
+            expertIds[route] = expert;
+            if (secondaryExpertIds != nullptr) {
+                secondaryExpertIds[route] = expert;
+            }
+        }
+        if (threadIdx.x == 0) {
+            numTokensPadded[0] = routes * 8;
+        }
+        return;
+    }
+
+    if (threadIdx.x != 0) {
+        return;
+    }
     int activeBlocks = 0;
     for (int route = 0; route < routes; ++route) {
         int expert = globalIndices[route];
@@ -530,18 +559,19 @@ __global__ void BuildEpMetadataRowsKernel(
             sortedTokenIds[position] = routes;
         }
         expertIds[activeBlocks] = localExpert;
+        if (secondaryExpertIds != nullptr) {
+            secondaryExpertIds[activeBlocks] = localExpert;
+        }
         ++activeBlocks;
     }
     numTokensPadded[0] = activeBlocks * 8;
 }
 
-__global__ void InitAwqMoeRouteCountersKernel(
-        int32_t *__restrict__ expertCounts,
-        int32_t *__restrict__ expertCursors, int experts) {
+__global__ void ClearAwqMoeRouteCountsKernel(
+        int32_t *__restrict__ expertCounts, int experts) {
     int expert = blockIdx.x * blockDim.x + threadIdx.x;
     if (expert < experts) {
         expertCounts[expert] = 0;
-        expertCursors[expert] = 0;
     }
 }
 
@@ -597,108 +627,69 @@ __global__ void BuildAwqMoeRouteOffsetsKernel(
     }
 }
 
-__global__ void ScatterAwqMoeRoutesKernel(
+// Preserve the flattened route order within every expert. The parallel
+// atomic-scatter implementation is fast, but its row assignment depends on
+// block scheduling. Different assignments are mathematically equivalent, yet
+// the tensor-core row layout can change low-order FP16 results enough to flip
+// a near-tied token. Assign one block to each expert and compact fixed route
+// tiles with warp ballots. This keeps the result deterministic while exposing
+// enough blocks to hide the scan latency and requires no extra workspace.
+__global__ void ScatterAwqMoeRoutesStableKernel(
         const int32_t *__restrict__ indices,
         const int32_t *__restrict__ expertStarts,
-        int32_t *__restrict__ expertCursors,
         int32_t *__restrict__ sortedTokenIds, int routes, int experts) {
-    int route = blockIdx.x * blockDim.x + threadIdx.x;
-    if (route >= routes) {
-        return;
-    }
-    int expert = indices[route];
-    if ((unsigned int)expert >= (unsigned int)experts) {
-        return;
-    }
-    int offset = atomicAdd(expertCursors + expert, 1);
-    sortedTokenIds[expertStarts[expert] + offset] = route;
-}
-
-// Qwen4 decode has one row, 512 experts and top-10 routing. Building and
-// sorting those ten routes in one thread is cheaper than clearing every
-// expert counter and launching count/prefix/scatter kernels. Other shapes
-// retain the established generic path below.
-__global__ void BuildQwen4DecodeAwqMoeRouteMetadataKernel(
-        const int32_t *__restrict__ indices,
-        int32_t *__restrict__ sortedTokenIds,
-        int32_t *__restrict__ gateExpertIds,
-        int32_t *__restrict__ downExpertIds,
-        int32_t *__restrict__ numTokensPadded,
-        int routes, int experts) {
-    constexpr int ROUTES = 10;
-    if (blockIdx.x != 0 || threadIdx.x != 0) {
+    int expert = blockIdx.x;
+    if (expert >= experts) {
         return;
     }
 
-    int routeIds[ROUTES];
-    int routeExperts[ROUTES];
-    int validRoutes = 0;
-    for (int route = 0; route < routes; ++route) {
-        int expert = indices[route];
-        if ((unsigned int)expert >= (unsigned int)experts) {
-            continue;
+    constexpr int WARPS = 8;
+    __shared__ int warpOffsets[WARPS];
+    __shared__ int tileCount;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    int outputOffset = expertStarts[expert];
+    for (int tile = 0; tile < routes; tile += blockDim.x) {
+        int route = tile + threadIdx.x;
+        bool selected = route < routes && indices[route] == expert;
+        unsigned int mask = __ballot_sync(0xffffffffu, selected);
+        if (lane == 0) {
+            warpOffsets[warp] = __popc(mask);
         }
-        int position = validRoutes;
-        while (position > 0 &&
-               (routeExperts[position - 1] > expert ||
-                (routeExperts[position - 1] == expert &&
-                 routeIds[position - 1] > route))) {
-            routeExperts[position] = routeExperts[position - 1];
-            routeIds[position] = routeIds[position - 1];
-            --position;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            int prefix = 0;
+#pragma unroll
+            for (int i = 0; i < WARPS; ++i) {
+                int count = warpOffsets[i];
+                warpOffsets[i] = prefix;
+                prefix += count;
+            }
+            tileCount = prefix;
         }
-        routeExperts[position] = expert;
-        routeIds[position] = route;
-        ++validRoutes;
+        __syncthreads();
+        if (selected) {
+            unsigned int lowerLanes = lane == 0
+                ? 0u : (0xffffffffu >> (32 - lane));
+            int rank = warpOffsets[warp] + __popc(mask & lowerLanes);
+            sortedTokenIds[outputOffset + rank] = route;
+        }
+        __syncthreads();
+        outputOffset += tileCount;
     }
-
-    int outputPosition = 0;
-    int inputPosition = 0;
-    while (inputPosition < validRoutes) {
-        int expert = routeExperts[inputPosition];
-        int groupEnd = inputPosition + 1;
-        while (groupEnd < validRoutes && routeExperts[groupEnd] == expert) {
-            ++groupEnd;
-        }
-        int groupRoutes = groupEnd - inputPosition;
-        int paddedRoutes = (groupRoutes + 7) & ~7;
-        for (int offset = 0; offset < groupRoutes; ++offset) {
-            sortedTokenIds[outputPosition + offset] =
-                routeIds[inputPosition + offset];
-        }
-        for (int offset = groupRoutes; offset < paddedRoutes; ++offset) {
-            sortedTokenIds[outputPosition + offset] = routes;
-        }
-        for (int offset = 0; offset < paddedRoutes; offset += 8) {
-            int block = (outputPosition + offset) / 8;
-            gateExpertIds[block] = expert;
-            downExpertIds[block] = expert;
-        }
-        outputPosition += paddedRoutes;
-        inputPosition = groupEnd;
-    }
-    numTokensPadded[0] = outputPosition;
 }
 
 static void LaunchAwqMoeRouteMetadata(
         const int32_t *indices, int32_t *expertCounts,
-        int32_t *expertStarts, int32_t *expertCursors,
+        int32_t *expertStarts,
         int32_t *sortedTokenIds, int32_t *gateExpertIds,
         int32_t *downExpertIds, int32_t *numTokensPadded,
         int routes, int experts, int gateBlock, int downBlock,
         cudaStream_t stream) {
     constexpr int threads = 256;
-    if (routes == 10 && experts == 512 &&
-        gateBlock == 8 && downBlock == 8) {
-        BuildQwen4DecodeAwqMoeRouteMetadataKernel<<<1, 1, 0, stream>>>(
-            indices, sortedTokenIds,
-            gateExpertIds, downExpertIds,
-            numTokensPadded, routes, experts);
-        return;
-    }
-    InitAwqMoeRouteCountersKernel<<<
+    ClearAwqMoeRouteCountsKernel<<<
         (experts + threads - 1) / threads, threads, 0, stream>>>(
-        expertCounts, expertCursors, experts);
+        expertCounts, experts);
     CountAwqMoeRoutesKernel<<<
         (routes + threads - 1) / threads, threads, 0, stream>>>(
         indices, expertCounts, routes, experts);
@@ -706,10 +697,8 @@ static void LaunchAwqMoeRouteMetadata(
         expertCounts, expertStarts, sortedTokenIds, gateExpertIds,
         downExpertIds, numTokensPadded, routes, experts,
         gateBlock, downBlock);
-    ScatterAwqMoeRoutesKernel<<<
-        (routes + threads - 1) / threads, threads, 0, stream>>>(
-        indices, expertStarts, expertCursors, sortedTokenIds,
-        routes, experts);
+    ScatterAwqMoeRoutesStableKernel<<<experts, threads, 0, stream>>>(
+        indices, expertStarts, sortedTokenIds, routes, experts);
 }
 
 template <typename T>
@@ -1895,7 +1884,6 @@ struct AwqMarlinLayerCache {
 
     int32_t *expertCounts = nullptr;
     int32_t *expertStarts = nullptr;
-    int32_t *expertCursors = nullptr;
     AwqMarlinRouteStorage smallRoutes;
     AwqMarlinRouteStorage largeRoutes;
 
@@ -1995,7 +1983,6 @@ static void ReleaseAwqCacheStorage(AwqMarlinLayerCache &cache) {
     ReleaseDirect(cache.downDecodeZero);
     ReleaseDirect(cache.expertCounts);
     ReleaseDirect(cache.expertStarts);
-    ReleaseDirect(cache.expertCursors);
     ReleaseAwqRouteStorage(cache.smallRoutes);
     ReleaseAwqRouteStorage(cache.largeRoutes);
     ReleaseDirect(cache.workspace);
@@ -2012,7 +1999,6 @@ static void ReleaseAwqCacheStorage(AwqMarlinLayerCache &cache) {
     cache.downDecodeZero = nullptr;
     cache.expertCounts = nullptr;
     cache.expertStarts = nullptr;
-    cache.expertCursors = nullptr;
     cache.workspace = nullptr;
     cache.temporaryOutput = nullptr;
     cache.ready = false;
@@ -2182,8 +2168,6 @@ static bool BuildAwqLayerCache(fastllm::Data **weights, int weightsBatch,
         (size_t)experts * sizeof(int32_t));
     cache.expertStarts = (int32_t *)AllocateDirect(
         (size_t)experts * sizeof(int32_t));
-    cache.expertCursors = (int32_t *)AllocateDirect(
-        (size_t)experts * sizeof(int32_t));
     cache.workspace = (int *)AllocateDirect(
         (size_t)sms * 4 * sizeof(int));
     cache.temporaryOutput = (float *)AllocateDirect(
@@ -2196,7 +2180,7 @@ static bool BuildAwqLayerCache(fastllm::Data **weights, int weightsBatch,
         cache.gateDecodeZero == nullptr ||
         cache.downDecodeZero == nullptr ||
         cache.expertCounts == nullptr || cache.expertStarts == nullptr ||
-        cache.expertCursors == nullptr || cache.workspace == nullptr ||
+        cache.workspace == nullptr ||
         cache.temporaryOutput == nullptr) {
         ReleaseAwqCacheStorage(cache);
         return false;
@@ -2611,7 +2595,7 @@ static bool RunAwqMarlinMoe(
     constexpr int threads = 256;
     LaunchAwqMoeRouteMetadata(
         indices, cache->expertCounts, cache->expertStarts,
-        cache->expertCursors, routeStorage->sortedTokenIds,
+        routeStorage->sortedTokenIds,
         routeStorage->gateExpertIds, routeStorage->downExpertIds,
         routeStorage->numTokensPadded, routes, cache->experts,
         gateBlock, downBlock, stream);
@@ -2680,7 +2664,6 @@ struct Nvfp4E4M3MarlinLayerCache {
 
     int32_t *expertCounts = nullptr;
     int32_t *expertStarts = nullptr;
-    int32_t *expertCursors = nullptr;
     AwqMarlinRouteStorage smallRoutes;
     AwqMarlinRouteStorage largeRoutes;
 
@@ -2766,7 +2749,6 @@ static void ReleaseNvfp4E4M3CacheStorage(
     ReleaseDirect(cache.downGlobalScale);
     ReleaseDirect(cache.expertCounts);
     ReleaseDirect(cache.expertStarts);
-    ReleaseDirect(cache.expertCursors);
     ReleaseAwqRouteStorage(cache.smallRoutes);
     ReleaseAwqRouteStorage(cache.largeRoutes);
     ReleaseDirect(cache.workspace);
@@ -2779,7 +2761,6 @@ static void ReleaseNvfp4E4M3CacheStorage(
     cache.downGlobalScale = nullptr;
     cache.expertCounts = nullptr;
     cache.expertStarts = nullptr;
-    cache.expertCursors = nullptr;
     cache.workspace = nullptr;
     cache.temporaryOutput = nullptr;
     cache.ready = false;
@@ -2920,8 +2901,6 @@ static bool BuildNvfp4E4M3LayerCache(
         (size_t)experts * sizeof(int32_t));
     cache.expertStarts = (int32_t *)AllocateDirect(
         (size_t)experts * sizeof(int32_t));
-    cache.expertCursors = (int32_t *)AllocateDirect(
-        (size_t)experts * sizeof(int32_t));
     cache.workspace = (int *)AllocateDirect(
         (size_t)sms * 4 * sizeof(int));
     cache.temporaryOutput = (float *)AllocateDirect(
@@ -2931,7 +2910,7 @@ static bool BuildNvfp4E4M3LayerCache(
         cache.gateGlobalScale == nullptr ||
         cache.downGlobalScale == nullptr ||
         cache.expertCounts == nullptr || cache.expertStarts == nullptr ||
-        cache.expertCursors == nullptr || cache.workspace == nullptr ||
+        cache.workspace == nullptr ||
         cache.temporaryOutput == nullptr) {
         ReleaseNvfp4E4M3CacheStorage(cache);
         return false;
@@ -3210,6 +3189,8 @@ static bool RunNvfp4E4M3MarlinMoe(
             "received an incompatible hidden size", cache.get());
     }
 
+    cudaStream_t stream = cudaStreamPerThread;
+
     const int routes = batch * topk;
     const bool smallBatch = routes <= cache->experts * 16;
     const int gateBlock = smallBatch ? 8 : 64;
@@ -3246,7 +3227,6 @@ static bool RunNvfp4E4M3MarlinMoe(
             "runtime buffer allocation", cache.get());
     }
 
-    cudaStream_t stream = cudaStreamPerThread;
     constexpr int threads = 256;
     const void *marlinInput = input.cudaData;
     if (input.dataType == fastllm::DataType::FLOAT32) {
@@ -3261,12 +3241,24 @@ static bool RunNvfp4E4M3MarlinMoe(
         }
         marlinInput = activation.cudaData;
     }
-    LaunchAwqMoeRouteMetadata(
-        indices, cache->expertCounts, cache->expertStarts,
-        cache->expertCursors, routeStorage->sortedTokenIds,
-        routeStorage->gateExpertIds, routeStorage->downExpertIds,
-        routeStorage->numTokensPadded, routes, cache->experts,
-        gateBlock, downBlock, stream);
+    if (smallBatch && batch <= 9) {
+        // Give each route a dedicated padded Marlin row. Besides matching
+        // the batch-1 reduction layout, this avoids the nondeterministic
+        // atomic scatter order when several top-k routes select one expert.
+        BuildEpMetadataRowsKernel<<<1, 64, 0, stream>>>(
+            indices, routeStorage->sortedTokenIds,
+            routeStorage->gateExpertIds,
+            routeStorage->downExpertIds,
+            routeStorage->numTokensPadded,
+            batch, topk, 0, 1, cache->experts);
+    } else {
+        LaunchAwqMoeRouteMetadata(
+            indices, cache->expertCounts, cache->expertStarts,
+            routeStorage->sortedTokenIds,
+            routeStorage->gateExpertIds, routeStorage->downExpertIds,
+            routeStorage->numTokensPadded, routes, cache->experts,
+            gateBlock, downBlock, stream);
+    }
     if (cudaPeekAtLastError() != cudaSuccess) {
         FailNvfp4E4M3MarlinAfterRepack(
             "route-metadata launch", cache.get());
@@ -3402,8 +3394,9 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
 
     if (groupedRows) {
         const int routes = rows * topk;
-        BuildEpMetadataRowsKernel<<<1, 1, 0, cudaStreamPerThread>>>(
+        BuildEpMetadataRowsKernel<<<1, 64, 0, cudaStreamPerThread>>>(
             globalIndices, cache->sortedTokenIds, cache->expertIds,
+            nullptr,
             cache->numTokensPadded, rows, topk, ownerRank, ownerCount,
             cache->experts);
         if (!checkStage("grouped EP metadata")) {
