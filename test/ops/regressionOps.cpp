@@ -70,6 +70,15 @@ namespace fastllm {
         int compressedBlocks, Data &allKV, Data &allScore,
         int &rawTokenBase);
 }
+
+using RegressionToFp32Cuda = void (*)(
+    const void *, float *, int64_t, int64_t, cudaStream_t);
+using RegressionTo16Cuda = void (*)(
+    const void *, uint16_t *, int64_t, int64_t, cudaStream_t);
+
+RegressionToFp32Cuda ggml_get_to_fp32_cuda(ggml_type type);
+RegressionTo16Cuda ggml_get_to_fp16_cuda(ggml_type type);
+RegressionTo16Cuda ggml_get_to_bf16_cuda(ggml_type type);
 #endif
 
 namespace {
@@ -9181,6 +9190,304 @@ namespace {
     }
 
 #ifdef USE_CUDA
+    void RunCudaGgufIq4DequantRegression() {
+        constexpr int rows = 3;
+        constexpr int columns = QK_K * 2;
+        constexpr int elements = rows * columns;
+
+        for (ggml_type type : {GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS}) {
+            std::vector<uint8_t> packed(
+                ggml_row_size(type, columns) * rows, 0);
+            if (type == GGML_TYPE_IQ4_NL) {
+                block_iq4_nl *blocks =
+                    reinterpret_cast<block_iq4_nl*>(packed.data());
+                const int blockCount = elements / QK4_NL;
+                for (int block = 0; block < blockCount; ++block) {
+                    blocks[block].d = fastllm::float_to_half(
+                        0.00075f * (1 + block % 13));
+                    for (int byte = 0; byte < QK4_NL / 2; ++byte) {
+                        const int low = (block * 7 + byte * 3 + 1) & 15;
+                        const int high = (block * 5 + byte * 11 + 9) & 15;
+                        blocks[block].qs[byte] =
+                            (uint8_t)(low | (high << 4));
+                    }
+                }
+            } else {
+                block_iq4_xs *blocks =
+                    reinterpret_cast<block_iq4_xs*>(packed.data());
+                const int blockCount = elements / QK_K;
+                for (int block = 0; block < blockCount; ++block) {
+                    blocks[block].d = fastllm::float_to_half(
+                        0.00025f * (1 + block % 7));
+                    for (int subblock = 0; subblock < QK_K / 32;
+                         ++subblock) {
+                        const int scale =
+                            1 + (block * 19 + subblock * 9) % 63;
+                        blocks[block].scales_l[subblock / 2] |=
+                            (uint8_t)((scale & 15) <<
+                                      (4 * (subblock % 2)));
+                        blocks[block].scales_h |=
+                            (uint16_t)(((scale >> 4) & 3) <<
+                                       (2 * subblock));
+                    }
+                    for (int byte = 0; byte < QK_K / 2; ++byte) {
+                        const int low = (block * 13 + byte * 5 + 2) & 15;
+                        const int high = (block * 3 + byte * 7 + 12) & 15;
+                        blocks[block].qs[byte] =
+                            (uint8_t)(low | (high << 4));
+                    }
+                }
+            }
+
+            std::vector<float> expected(elements);
+            if (type == GGML_TYPE_IQ4_NL) {
+                dequantize_row_iq4_nl(
+                    reinterpret_cast<const block_iq4_nl*>(packed.data()),
+                    expected.data(), elements);
+            } else {
+                dequantize_row_iq4_xs(
+                    reinterpret_cast<const block_iq4_xs*>(packed.data()),
+                    expected.data(), elements);
+            }
+
+            void *devicePacked = nullptr;
+            float *deviceFp32 = nullptr;
+            uint16_t *deviceFp16 = nullptr;
+            uint16_t *deviceBf16 = nullptr;
+            Expect(cudaMalloc(&devicePacked, packed.size()) == cudaSuccess,
+                   "CUDA IQ4 dequant source allocation failed.");
+            Expect(cudaMalloc((void**)&deviceFp32,
+                              elements * sizeof(float)) == cudaSuccess,
+                   "CUDA IQ4 FP32 dequant allocation failed.");
+            Expect(cudaMalloc((void**)&deviceFp16,
+                              elements * sizeof(uint16_t)) == cudaSuccess,
+                   "CUDA IQ4 FP16 dequant allocation failed.");
+            Expect(cudaMalloc((void**)&deviceBf16,
+                              elements * sizeof(uint16_t)) == cudaSuccess,
+                   "CUDA IQ4 BF16 dequant allocation failed.");
+            Expect(cudaMemcpy(devicePacked, packed.data(), packed.size(),
+                              cudaMemcpyHostToDevice) == cudaSuccess,
+                   "CUDA IQ4 dequant source upload failed.");
+
+            RegressionToFp32Cuda toFp32 = ggml_get_to_fp32_cuda(type);
+            RegressionTo16Cuda toFp16 = ggml_get_to_fp16_cuda(type);
+            RegressionTo16Cuda toBf16 = ggml_get_to_bf16_cuda(type);
+            Expect(toFp32 != nullptr && toFp16 != nullptr && toBf16 != nullptr,
+                   "CUDA IQ4 dequant dispatch is incomplete for " +
+                       std::string(ggml_type_name(type)) + ".");
+            toFp32(devicePacked, deviceFp32, rows, columns, 0);
+            toFp16(devicePacked, deviceFp16, rows, columns, 0);
+            toBf16(devicePacked, deviceBf16, rows, columns, 0);
+            Expect(cudaDeviceSynchronize() == cudaSuccess,
+                   "CUDA IQ4 dequant kernel failed for " +
+                       std::string(ggml_type_name(type)) + ".");
+
+            std::vector<float> actualFp32(elements);
+            std::vector<uint16_t> actualFp16(elements);
+            std::vector<uint16_t> actualBf16(elements);
+            Expect(cudaMemcpy(actualFp32.data(), deviceFp32,
+                              elements * sizeof(float),
+                              cudaMemcpyDeviceToHost) == cudaSuccess,
+                   "CUDA IQ4 FP32 dequant download failed.");
+            Expect(cudaMemcpy(actualFp16.data(), deviceFp16,
+                              elements * sizeof(uint16_t),
+                              cudaMemcpyDeviceToHost) == cudaSuccess,
+                   "CUDA IQ4 FP16 dequant download failed.");
+            Expect(cudaMemcpy(actualBf16.data(), deviceBf16,
+                              elements * sizeof(uint16_t),
+                              cudaMemcpyDeviceToHost) == cudaSuccess,
+                   "CUDA IQ4 BF16 dequant download failed.");
+
+            for (int index = 0; index < elements; ++index) {
+                Expect(std::abs(actualFp32[index] - expected[index]) <= 1e-6f,
+                       "CUDA IQ4 FP32 dequant mismatch for " +
+                           std::string(ggml_type_name(type)) +
+                           " at index " + std::to_string(index) + ".");
+                const float fp16Value =
+                    fastllm::half_to_float(actualFp16[index]);
+                const float fp16Tolerance = std::max(
+                    1e-6f, std::abs(expected[index]) * 1e-3f);
+                Expect(std::abs(fp16Value - expected[index]) <=
+                           fp16Tolerance,
+                       "CUDA IQ4 FP16 dequant mismatch for " +
+                           std::string(ggml_type_name(type)) +
+                           " at index " + std::to_string(index) + ".");
+                Expect(actualBf16[index] ==
+                           fastllm::Float32ToBFloat16RNEBits(expected[index]),
+                       "CUDA IQ4 BF16 dequant mismatch for " +
+                           std::string(ggml_type_name(type)) +
+                           " at index " + std::to_string(index) + ".");
+            }
+
+            cudaFree(deviceBf16);
+            cudaFree(deviceFp16);
+            cudaFree(deviceFp32);
+            cudaFree(devicePacked);
+        }
+    }
+
+    void RunCudaGgufQ3DequantRegression() {
+        constexpr int rows = 3;
+        constexpr int columns = QK_K * 2;
+        constexpr int elements = rows * columns;
+
+        for (ggml_type type : {
+                 GGML_TYPE_Q3_K, GGML_TYPE_IQ3_XXS,
+                 GGML_TYPE_IQ3_S}) {
+            std::vector<uint8_t> packed(
+                ggml_row_size(type, columns) * rows, 0);
+            const int blockCount = elements / QK_K;
+            if (type == GGML_TYPE_Q3_K) {
+                block_q3_K *blocks =
+                    reinterpret_cast<block_q3_K*>(packed.data());
+                for (int block = 0; block < blockCount; ++block) {
+                    blocks[block].d = fastllm::float_to_half(
+                        0.0005f * (1 + block % 11));
+                    for (int byte = 0; byte < (int)sizeof(blocks[block].hmask);
+                         ++byte) {
+                        blocks[block].hmask[byte] =
+                            (uint8_t)(block * 29 + byte * 17 + 3);
+                    }
+                    for (int byte = 0; byte < (int)sizeof(blocks[block].qs);
+                         ++byte) {
+                        blocks[block].qs[byte] =
+                            (uint8_t)(block * 11 + byte * 23 + 5);
+                    }
+                    for (int byte = 0; byte < (int)sizeof(blocks[block].scales);
+                         ++byte) {
+                        blocks[block].scales[byte] =
+                            (uint8_t)(block * 7 + byte * 13 + 9);
+                    }
+                }
+            } else if (type == GGML_TYPE_IQ3_XXS) {
+                block_iq3_xxs *blocks =
+                    reinterpret_cast<block_iq3_xxs*>(packed.data());
+                for (int block = 0; block < blockCount; ++block) {
+                    blocks[block].d = fastllm::float_to_half(
+                        0.00025f * (1 + block % 7));
+                    for (int byte = 0;
+                         byte < (int)sizeof(blocks[block].qs); ++byte) {
+                        blocks[block].qs[byte] =
+                            (uint8_t)(block * 19 + byte * 31 + 1);
+                    }
+                }
+            } else {
+                block_iq3_s *blocks =
+                    reinterpret_cast<block_iq3_s*>(packed.data());
+                for (int block = 0; block < blockCount; ++block) {
+                    blocks[block].d = fastllm::float_to_half(
+                        0.00025f * (1 + block % 7));
+                    for (int byte = 0; byte < (int)sizeof(blocks[block].qs);
+                         ++byte) {
+                        blocks[block].qs[byte] =
+                            (uint8_t)(block * 19 + byte * 31 + 1);
+                    }
+                    for (int byte = 0; byte < (int)sizeof(blocks[block].qh);
+                         ++byte) {
+                        blocks[block].qh[byte] =
+                            (uint8_t)(block * 5 + byte * 37 + 7);
+                    }
+                    for (int byte = 0; byte < (int)sizeof(blocks[block].signs);
+                         ++byte) {
+                        blocks[block].signs[byte] =
+                            (uint8_t)(block * 41 + byte * 3 + 11);
+                    }
+                    for (int byte = 0; byte < (int)sizeof(blocks[block].scales);
+                         ++byte) {
+                        blocks[block].scales[byte] =
+                            (uint8_t)(block * 17 + byte * 43 + 13);
+                    }
+                }
+            }
+
+            std::vector<float> expected(elements);
+            if (type == GGML_TYPE_Q3_K) {
+                dequantize_row_q3_K(
+                    reinterpret_cast<const block_q3_K*>(packed.data()),
+                    expected.data(), elements);
+            } else if (type == GGML_TYPE_IQ3_XXS) {
+                dequantize_row_iq3_xxs(
+                    reinterpret_cast<const block_iq3_xxs*>(packed.data()),
+                    expected.data(), elements);
+            } else {
+                dequantize_row_iq3_s(
+                    reinterpret_cast<const block_iq3_s*>(packed.data()),
+                    expected.data(), elements);
+            }
+
+            void *devicePacked = nullptr;
+            float *deviceFp32 = nullptr;
+            uint16_t *deviceFp16 = nullptr;
+            uint16_t *deviceBf16 = nullptr;
+            Expect(cudaMalloc(&devicePacked, packed.size()) == cudaSuccess,
+                   "CUDA Q3 dequant source allocation failed.");
+            Expect(cudaMalloc((void**)&deviceFp32,
+                              elements * sizeof(float)) == cudaSuccess,
+                   "CUDA Q3 FP32 dequant allocation failed.");
+            Expect(cudaMalloc((void**)&deviceFp16,
+                              elements * sizeof(uint16_t)) == cudaSuccess,
+                   "CUDA Q3 FP16 dequant allocation failed.");
+            Expect(cudaMalloc((void**)&deviceBf16,
+                              elements * sizeof(uint16_t)) == cudaSuccess,
+                   "CUDA Q3 BF16 dequant allocation failed.");
+            Expect(cudaMemcpy(devicePacked, packed.data(), packed.size(),
+                              cudaMemcpyHostToDevice) == cudaSuccess,
+                   "CUDA Q3 dequant source upload failed.");
+
+            RegressionToFp32Cuda toFp32 = ggml_get_to_fp32_cuda(type);
+            RegressionTo16Cuda toFp16 = ggml_get_to_fp16_cuda(type);
+            RegressionTo16Cuda toBf16 = ggml_get_to_bf16_cuda(type);
+            Expect(toFp32 != nullptr && toFp16 != nullptr && toBf16 != nullptr,
+                   "CUDA Q3 dequant dispatch is incomplete for " +
+                       std::string(ggml_type_name(type)) + ".");
+            toFp32(devicePacked, deviceFp32, rows, columns, 0);
+            toFp16(devicePacked, deviceFp16, rows, columns, 0);
+            toBf16(devicePacked, deviceBf16, rows, columns, 0);
+            Expect(cudaDeviceSynchronize() == cudaSuccess,
+                   "CUDA Q3 dequant kernel failed for " +
+                       std::string(ggml_type_name(type)) + ".");
+
+            std::vector<float> actualFp32(elements);
+            std::vector<uint16_t> actualFp16(elements);
+            std::vector<uint16_t> actualBf16(elements);
+            Expect(cudaMemcpy(actualFp32.data(), deviceFp32,
+                              elements * sizeof(float),
+                              cudaMemcpyDeviceToHost) == cudaSuccess,
+                   "CUDA Q3 FP32 dequant download failed.");
+            Expect(cudaMemcpy(actualFp16.data(), deviceFp16,
+                              elements * sizeof(uint16_t),
+                              cudaMemcpyDeviceToHost) == cudaSuccess,
+                   "CUDA Q3 FP16 dequant download failed.");
+            Expect(cudaMemcpy(actualBf16.data(), deviceBf16,
+                              elements * sizeof(uint16_t),
+                              cudaMemcpyDeviceToHost) == cudaSuccess,
+                   "CUDA Q3 BF16 dequant download failed.");
+
+            for (int index = 0; index < elements; ++index) {
+                const std::string where =
+                    std::string(ggml_type_name(type)) + " at index " +
+                    std::to_string(index) + ".";
+                Expect(std::abs(actualFp32[index] - expected[index]) <= 1e-6f,
+                       "CUDA Q3 FP32 dequant mismatch for " + where);
+                const float fp16Value =
+                    fastllm::half_to_float(actualFp16[index]);
+                const float fp16Tolerance = std::max(
+                    1e-6f, std::abs(expected[index]) * 1e-3f);
+                Expect(std::abs(fp16Value - expected[index]) <=
+                           fp16Tolerance,
+                       "CUDA Q3 FP16 dequant mismatch for " + where);
+                Expect(actualBf16[index] ==
+                           fastllm::Float32ToBFloat16RNEBits(expected[index]),
+                       "CUDA Q3 BF16 dequant mismatch for " + where);
+            }
+
+            cudaFree(deviceBf16);
+            cudaFree(deviceFp16);
+            cudaFree(deviceFp32);
+            cudaFree(devicePacked);
+        }
+    }
+
     void RunCudaGgufMmvqBatch8Regression() {
         constexpr int inputDim = QK_K;
         constexpr int outputDim = 64;
@@ -9204,7 +9511,8 @@ namespace {
             }
         }
 
-        for (ggml_type type : {GGML_TYPE_Q2_K, GGML_TYPE_Q4_K}) {
+        for (ggml_type type : {
+                 GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K}) {
             fastllm::Data weight(
                 fastllm::DataType::DATA_GGUF_FORMAT, (int)type,
                 {outputDim, inputDim});
@@ -9259,9 +9567,597 @@ namespace {
             std::vector<float> lastOutput = ToFloatVector(output1);
             expected.insert(expected.end(), lastOutput.begin(), lastOutput.end());
             ExpectFloatNear(
-                expected, ToFloatVector(output8), 0.0f, 0.0f,
-                "CUDA GGUF MMVQ batch 8 " +
+                expected, ToFloatVector(output8), 5e-2f, 5e-2f,
+                "CUDA GGUF batch 8 route consistency " +
                     std::string(ggml_type_name(type)));
+        }
+    }
+
+    void RunCudaGgufExtendedMmvqRegression() {
+        FastllmCudaSetDevice(0);
+
+        constexpr int inputDim = QK_K * 2;
+        constexpr int outputDim = 64;
+        for (ggml_type type : {
+                 GGML_TYPE_Q4_0, GGML_TYPE_Q4_1,
+                 GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS,
+                 GGML_TYPE_IQ2_S, GGML_TYPE_IQ1_S,
+                 GGML_TYPE_IQ1_M}) {
+            std::vector<uint8_t> packed(
+                ggml_row_size(type, inputDim) * outputDim, 0);
+            for (size_t byte = 0; byte < packed.size(); ++byte) {
+                packed[byte] = (uint8_t)(byte * 29 + byte / 7 * 11 + 3);
+            }
+            if (type == GGML_TYPE_Q4_0) {
+                auto *blocks = reinterpret_cast<block_q4_0*>(packed.data());
+                const int blockCount = outputDim * inputDim / QK4_0;
+                for (int block = 0; block < blockCount; ++block) {
+                    blocks[block].d = fastllm::float_to_half(
+                        0.002f * (1 + block % 5));
+                }
+            } else if (type == GGML_TYPE_Q4_1) {
+                auto *blocks = reinterpret_cast<block_q4_1*>(packed.data());
+                const int blockCount = outputDim * inputDim / QK4_1;
+                for (int block = 0; block < blockCount; ++block) {
+                    uint16_t *dm = reinterpret_cast<uint16_t*>(
+                        &blocks[block]);
+                    dm[0] = fastllm::float_to_half(
+                        0.002f * (1 + block % 5));
+                    dm[1] = fastllm::float_to_half(
+                        -0.01f * (block % 3));
+                }
+            } else {
+                // Every bit pattern used for indices/signs is valid for the
+                // importance quants. Fill them deterministically, then make
+                // each block scale a small finite FP16 value.
+                const int blockCount = outputDim * inputDim / QK_K;
+                if (type == GGML_TYPE_IQ2_XXS) {
+                    auto *blocks = reinterpret_cast<block_iq2_xxs*>(
+                        packed.data());
+                    for (int block = 0; block < blockCount; ++block) {
+                        blocks[block].d = fastllm::float_to_half(
+                            0.002f * (1 + block % 5));
+                    }
+                } else if (type == GGML_TYPE_IQ2_XS) {
+                    auto *blocks = reinterpret_cast<block_iq2_xs*>(
+                        packed.data());
+                    for (int block = 0; block < blockCount; ++block) {
+                        blocks[block].d = fastllm::float_to_half(
+                            0.002f * (1 + block % 5));
+                    }
+                } else if (type == GGML_TYPE_IQ2_S) {
+                    auto *blocks = reinterpret_cast<block_iq2_s*>(
+                        packed.data());
+                    for (int block = 0; block < blockCount; ++block) {
+                        blocks[block].d = fastllm::float_to_half(
+                            0.002f * (1 + block % 5));
+                    }
+                } else if (type == GGML_TYPE_IQ1_S) {
+                    auto *blocks = reinterpret_cast<block_iq1_s*>(
+                        packed.data());
+                    for (int block = 0; block < blockCount; ++block) {
+                        blocks[block].d = fastllm::float_to_half(
+                            0.002f * (1 + block % 5));
+                    }
+                } else {
+                    auto *blocks = reinterpret_cast<block_iq1_m*>(
+                        packed.data());
+                    for (int block = 0; block < blockCount; ++block) {
+                        const uint16_t base = fastllm::float_to_half(
+                            0.002f * (1 + block % 5));
+                        uint16_t *scales = reinterpret_cast<uint16_t*>(
+                            blocks[block].scales);
+                        for (int nibble = 0; nibble < 4; ++nibble) {
+                            scales[nibble] =
+                                (uint16_t)((scales[nibble] & 0x0fff) |
+                                    (((base >> (4 * nibble)) & 0x0f)
+                                     << 12));
+                        }
+                    }
+                }
+            }
+
+            std::vector<float> dequantized((size_t)outputDim * inputDim);
+            if (type == GGML_TYPE_Q4_0) {
+                dequantize_row_q4_0(
+                    reinterpret_cast<const block_q4_0*>(packed.data()),
+                    dequantized.data(), dequantized.size());
+            } else if (type == GGML_TYPE_Q4_1) {
+                dequantize_row_q4_1(
+                    reinterpret_cast<const block_q4_1*>(packed.data()),
+                    dequantized.data(), dequantized.size());
+            } else if (type == GGML_TYPE_IQ2_XXS) {
+                dequantize_row_iq2_xxs(
+                    reinterpret_cast<const block_iq2_xxs*>(packed.data()),
+                    dequantized.data(), dequantized.size());
+            } else if (type == GGML_TYPE_IQ2_XS) {
+                dequantize_row_iq2_xs(
+                    reinterpret_cast<const block_iq2_xs*>(packed.data()),
+                    dequantized.data(), dequantized.size());
+            } else if (type == GGML_TYPE_IQ2_S) {
+                dequantize_row_iq2_s(
+                    reinterpret_cast<const block_iq2_s*>(packed.data()),
+                    dequantized.data(), dequantized.size());
+            } else if (type == GGML_TYPE_IQ1_S) {
+                dequantize_row_iq1_s(
+                    reinterpret_cast<const block_iq1_s*>(packed.data()),
+                    dequantized.data(), dequantized.size());
+            } else {
+                dequantize_row_iq1_m(
+                    reinterpret_cast<const block_iq1_m*>(packed.data()),
+                    dequantized.data(), dequantized.size());
+            }
+
+            void *deviceWeight = nullptr;
+            Expect(cudaMalloc(&deviceWeight, packed.size()) == cudaSuccess,
+                   "CUDA extended GGUF weight allocation failed.");
+            Expect(cudaMemcpy(deviceWeight, packed.data(), packed.size(),
+                              cudaMemcpyHostToDevice) == cudaSuccess,
+                   "CUDA extended GGUF weight upload failed.");
+
+            const size_t dequantCount = dequantized.size();
+            float *deviceFp32 = nullptr;
+            uint16_t *deviceFp16 = nullptr;
+            uint16_t *deviceBf16 = nullptr;
+            Expect(cudaMalloc((void**)&deviceFp32,
+                              dequantCount * sizeof(float)) == cudaSuccess,
+                   "CUDA extended GGUF FP32 dequant allocation failed.");
+            Expect(cudaMalloc((void**)&deviceFp16,
+                              dequantCount * sizeof(uint16_t)) == cudaSuccess,
+                   "CUDA extended GGUF FP16 dequant allocation failed.");
+            Expect(cudaMalloc((void**)&deviceBf16,
+                              dequantCount * sizeof(uint16_t)) == cudaSuccess,
+                   "CUDA extended GGUF BF16 dequant allocation failed.");
+            RegressionToFp32Cuda toFp32 = ggml_get_to_fp32_cuda(type);
+            RegressionTo16Cuda toFp16 = ggml_get_to_fp16_cuda(type);
+            RegressionTo16Cuda toBf16 = ggml_get_to_bf16_cuda(type);
+            Expect(toFp32 != nullptr && toFp16 != nullptr && toBf16 != nullptr,
+                   "CUDA extended GGUF dequant dispatch is incomplete for " +
+                       std::string(ggml_type_name(type)) + ".");
+            toFp32(deviceWeight, deviceFp32, outputDim, inputDim, 0);
+            toFp16(deviceWeight, deviceFp16, outputDim, inputDim, 0);
+            toBf16(deviceWeight, deviceBf16, outputDim, inputDim, 0);
+            Expect(cudaDeviceSynchronize() == cudaSuccess,
+                   "CUDA extended GGUF dequant kernel failed for " +
+                       std::string(ggml_type_name(type)) + ".");
+
+            std::vector<float> actualFp32(dequantCount);
+            std::vector<uint16_t> actualFp16(dequantCount);
+            std::vector<uint16_t> actualBf16(dequantCount);
+            Expect(cudaMemcpy(actualFp32.data(), deviceFp32,
+                              dequantCount * sizeof(float),
+                              cudaMemcpyDeviceToHost) == cudaSuccess,
+                   "CUDA extended GGUF FP32 dequant download failed.");
+            Expect(cudaMemcpy(actualFp16.data(), deviceFp16,
+                              dequantCount * sizeof(uint16_t),
+                              cudaMemcpyDeviceToHost) == cudaSuccess,
+                   "CUDA extended GGUF FP16 dequant download failed.");
+            Expect(cudaMemcpy(actualBf16.data(), deviceBf16,
+                              dequantCount * sizeof(uint16_t),
+                              cudaMemcpyDeviceToHost) == cudaSuccess,
+                   "CUDA extended GGUF BF16 dequant download failed.");
+            for (size_t index = 0; index < dequantCount; ++index) {
+                const float expected = dequantized[index];
+                const float fp32Tolerance =
+                    std::max(1e-6f, std::abs(expected) * 2e-6f);
+                const std::string where =
+                    std::string(ggml_type_name(type)) + " at index " +
+                    std::to_string(index) + ".";
+                Expect(std::abs(actualFp32[index] - expected) <=
+                           fp32Tolerance,
+                       "CUDA extended GGUF FP32 dequant mismatch for " +
+                           where);
+                const float fp16Value =
+                    fastllm::half_to_float(actualFp16[index]);
+                const float fp16Tolerance =
+                    std::max(1e-6f, std::abs(expected) * 1e-3f);
+                Expect(std::abs(fp16Value - expected) <= fp16Tolerance,
+                       "CUDA extended GGUF FP16 dequant mismatch for " +
+                           where);
+                const float bf16Value = fastllm::BFloat16BitsToFloat32(
+                    actualBf16[index]);
+                const float bf16Tolerance =
+                    std::max(1e-5f, std::abs(expected) * 8e-3f);
+                Expect(std::abs(bf16Value - expected) <= bf16Tolerance,
+                       "CUDA extended GGUF BF16 dequant mismatch for " +
+                           where);
+            }
+            cudaFree(deviceBf16);
+            cudaFree(deviceFp16);
+            cudaFree(deviceFp32);
+
+            for (int batch : {1, 8}) {
+                std::vector<uint16_t> inputHalf((size_t)batch * inputDim);
+                std::vector<float> roundedInput(inputHalf.size());
+                for (int row = 0; row < batch; ++row) {
+                    for (int column = 0; column < inputDim; ++column) {
+                        const size_t index = (size_t)row * inputDim + column;
+                        const float value =
+                            std::cos((float)(row * 13 + column * 7 + 1) *
+                                     0.01953125f) *
+                            (0.35f +
+                             (float)((row * 3 + column) % 9) / 32.0f);
+                        inputHalf[index] = fastllm::float_to_half(value);
+                        roundedInput[index] =
+                            fastllm::half_to_float(inputHalf[index]);
+                    }
+                }
+
+                void *deviceInput = nullptr;
+                void *deviceOutput = nullptr;
+                const size_t outputCount = (size_t)batch * outputDim;
+                Expect(cudaMalloc(&deviceInput,
+                                  inputHalf.size() * sizeof(uint16_t)) ==
+                           cudaSuccess,
+                       "CUDA extended GGUF input allocation failed.");
+                Expect(cudaMalloc(&deviceOutput,
+                                  outputCount * sizeof(uint16_t)) ==
+                           cudaSuccess,
+                       "CUDA extended GGUF output allocation failed.");
+                Expect(cudaMemcpy(deviceInput, inputHalf.data(),
+                                  inputHalf.size() * sizeof(uint16_t),
+                                  cudaMemcpyHostToDevice) == cudaSuccess,
+                       "CUDA extended GGUF input upload failed.");
+
+                auto validate = [&](bool useMmq, const std::string &path) {
+                    const bool launched = useMmq ?
+                        FastllmCudaHalfMatMulGGUFMMQ(
+                            deviceInput, deviceWeight, deviceOutput,
+                            (int)type, batch, inputDim, outputDim, nullptr) :
+                        FastllmCudaHalfMatMulGGUFMMVQ(
+                            deviceInput, deviceWeight, deviceOutput,
+                            (int)type, batch, inputDim, outputDim, nullptr);
+                    Expect(launched,
+                           "CUDA extended GGUF rejected " + path + " for " +
+                               std::string(ggml_type_name(type)) +
+                               " batch " + std::to_string(batch) + ".");
+                    Expect(cudaDeviceSynchronize() == cudaSuccess,
+                           "CUDA extended GGUF kernel failed for " + path +
+                               " " + std::string(ggml_type_name(type)) +
+                               ".");
+
+                    std::vector<uint16_t> outputHalf(outputCount);
+                    Expect(cudaMemcpy(outputHalf.data(), deviceOutput,
+                                      outputHalf.size() * sizeof(uint16_t),
+                                      cudaMemcpyDeviceToHost) == cudaSuccess,
+                           "CUDA extended GGUF output download failed.");
+                    double squaredError = 0.0;
+                    double squaredReference = 0.0;
+                    for (int row = 0; row < batch; ++row) {
+                        for (int output = 0; output < outputDim; ++output) {
+                            float reference = 0.0f;
+                            for (int column = 0; column < inputDim; ++column) {
+                                reference += roundedInput[
+                                    (size_t)row * inputDim + column] *
+                                    dequantized[
+                                        (size_t)output * inputDim + column];
+                            }
+                            const float actual = fastllm::half_to_float(
+                                outputHalf[(size_t)row * outputDim + output]);
+                            Expect(std::isfinite(actual),
+                                   "CUDA extended GGUF produced a non-finite "
+                                   "value for " + path + ".");
+                            const double difference =
+                                (double)actual - (double)reference;
+                            squaredError += difference * difference;
+                            squaredReference +=
+                                (double)reference * (double)reference;
+                        }
+                    }
+                    const double relativeRmse =
+                        std::sqrt(squaredError / squaredReference);
+                    if (relativeRmse >= 0.04) {
+                        std::cerr << "extended GGUF debug "
+                                  << ggml_type_name(type) << " " << path
+                                  << " batch=" << batch
+                                  << " rmse=" << relativeRmse << " first=";
+                        for (int output = 0; output < 8; ++output) {
+                            float reference = 0.0f;
+                            for (int column = 0; column < inputDim; ++column) {
+                                reference += roundedInput[column] *
+                                    dequantized[
+                                        (size_t)output * inputDim + column];
+                            }
+                            std::cerr << " (" << reference << ","
+                                      << fastllm::half_to_float(
+                                             outputHalf[output]) << ")";
+                        }
+                        std::cerr << "\n";
+                    }
+                    Expect(relativeRmse < 0.04,
+                           "CUDA extended GGUF relative RMSE is too large "
+                           "for " + path + " " +
+                               std::string(ggml_type_name(type)) +
+                               " batch " + std::to_string(batch) + ": " +
+                               std::to_string(relativeRmse) + ".");
+                };
+
+                validate(false, "MMVQ");
+                if (batch == 8 && type != GGML_TYPE_IQ1_M) {
+                    validate(true, "MMQ");
+                }
+                cudaFree(deviceOutput);
+                cudaFree(deviceInput);
+            }
+            cudaFree(deviceWeight);
+        }
+    }
+
+    void RunCudaGgufMmqRegression() {
+        FastllmCudaSetDevice(0);
+        cudaDeviceProp properties{};
+        Expect(cudaGetDeviceProperties(&properties, 0) == cudaSuccess,
+               "CUDA GGUF MMQ failed to query device properties.");
+        if (properties.major * 100 + properties.minor * 10 < 750) {
+            std::cout << "CUDA GGUF MMQ regression: SKIP (INT8 MMA unavailable)\n";
+            return;
+        }
+
+        constexpr int inputDim = QK_K * 2;
+        constexpr int outputDim = 128;
+        std::vector<float> sourceWeight((size_t)outputDim * inputDim);
+        for (int row = 0; row < outputDim; ++row) {
+            for (int column = 0; column < inputDim; ++column) {
+                sourceWeight[(size_t)row * inputDim + column] =
+                    std::sin((float)(row * 17 + column * 5 + 3) *
+                             0.03125f) *
+                    (0.08f + (float)((row + column) % 11) / 128.0f);
+            }
+        }
+
+        for (ggml_type type : {
+                 GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
+                 GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_0}) {
+            std::vector<uint8_t> packed(
+                ggml_row_size(type, inputDim) * outputDim, 0);
+            if (type == GGML_TYPE_Q4_K) {
+                quantize_row_q4_K_ref(
+                    sourceWeight.data(),
+                    reinterpret_cast<block_q4_K*>(packed.data()),
+                    sourceWeight.size());
+            } else if (type == GGML_TYPE_Q5_K) {
+                quantize_row_q5_K_ref(
+                    sourceWeight.data(),
+                    reinterpret_cast<block_q5_K*>(packed.data()),
+                    sourceWeight.size());
+            } else if (type == GGML_TYPE_Q6_K) {
+                quantize_row_q6_K_ref(
+                    sourceWeight.data(),
+                    reinterpret_cast<block_q6_K*>(packed.data()),
+                    sourceWeight.size());
+            } else if (type == GGML_TYPE_Q8_0) {
+                quantize_row_q8_0_ref(
+                    sourceWeight.data(),
+                    reinterpret_cast<block_q8_0*>(packed.data()),
+                    sourceWeight.size());
+            } else {
+                block_iq4_xs *blocks =
+                    reinterpret_cast<block_iq4_xs*>(packed.data());
+                const int blockCount =
+                    (int)sourceWeight.size() / QK_K;
+                for (int block = 0; block < blockCount; ++block) {
+                    blocks[block].d = fastllm::float_to_half(
+                        0.00035f * (1 + block % 7));
+                    for (int subblock = 0; subblock < QK_K / 32;
+                         ++subblock) {
+                        const int scale =
+                            1 + (block * 19 + subblock * 9) % 63;
+                        blocks[block].scales_l[subblock / 2] |=
+                            (uint8_t)((scale & 15) <<
+                                      (4 * (subblock % 2)));
+                        blocks[block].scales_h |=
+                            (uint16_t)(((scale >> 4) & 3) <<
+                                       (2 * subblock));
+                    }
+                    for (int byte = 0; byte < QK_K / 2; ++byte) {
+                        blocks[block].qs[byte] =
+                            (uint8_t)(block * 13 + byte * 29 + 7);
+                    }
+                }
+            }
+
+            std::vector<float> dequantized(sourceWeight.size());
+            if (type == GGML_TYPE_Q4_K) {
+                dequantize_row_q4_K(
+                    reinterpret_cast<const block_q4_K*>(packed.data()),
+                    dequantized.data(), dequantized.size());
+            } else if (type == GGML_TYPE_Q5_K) {
+                dequantize_row_q5_K(
+                    reinterpret_cast<const block_q5_K*>(packed.data()),
+                    dequantized.data(), dequantized.size());
+            } else if (type == GGML_TYPE_Q6_K) {
+                dequantize_row_q6_K(
+                    reinterpret_cast<const block_q6_K*>(packed.data()),
+                    dequantized.data(), dequantized.size());
+            } else if (type == GGML_TYPE_Q8_0) {
+                dequantize_row_q8_0(
+                    reinterpret_cast<const block_q8_0*>(packed.data()),
+                    dequantized.data(), dequantized.size());
+            } else {
+                dequantize_row_iq4_xs(
+                    reinterpret_cast<const block_iq4_xs*>(packed.data()),
+                    dequantized.data(), dequantized.size());
+            }
+
+            void *deviceWeight = nullptr;
+            Expect(cudaMalloc(&deviceWeight, packed.size()) == cudaSuccess,
+                   "CUDA GGUF MMQ weight allocation failed.");
+            Expect(cudaMemcpy(deviceWeight, packed.data(), packed.size(),
+                              cudaMemcpyHostToDevice) == cudaSuccess,
+                   "CUDA GGUF MMQ weight upload failed.");
+
+            const std::vector<int> batches = properties.major >= 12 ?
+                std::vector<int>{8, 9, 129} : std::vector<int>{9, 129};
+            for (int batch : batches) {
+                std::vector<uint16_t> inputHalf(
+                    (size_t)batch * inputDim);
+                std::vector<float> roundedInput(inputHalf.size());
+                for (int row = 0; row < batch; ++row) {
+                    for (int column = 0; column < inputDim; ++column) {
+                        const size_t index =
+                            (size_t)row * inputDim + column;
+                        const float value =
+                            std::cos((float)(row * 13 + column * 7 + 1) *
+                                     0.01953125f) *
+                            (0.35f +
+                             (float)((row * 3 + column) % 9) / 32.0f);
+                        inputHalf[index] = fastllm::float_to_half(value);
+                        roundedInput[index] =
+                            fastllm::half_to_float(inputHalf[index]);
+                    }
+                }
+
+                void *deviceInput = nullptr;
+                void *deviceOutput = nullptr;
+                const size_t outputCount = (size_t)batch * outputDim;
+                Expect(cudaMalloc(&deviceInput,
+                                  inputHalf.size() * sizeof(uint16_t)) ==
+                           cudaSuccess,
+                       "CUDA GGUF MMQ input allocation failed.");
+                Expect(cudaMalloc(&deviceOutput,
+                                  outputCount * sizeof(uint16_t)) ==
+                           cudaSuccess,
+                       "CUDA GGUF MMQ output allocation failed.");
+                Expect(cudaMemcpy(deviceInput, inputHalf.data(),
+                                  inputHalf.size() * sizeof(uint16_t),
+                                  cudaMemcpyHostToDevice) == cudaSuccess,
+                       "CUDA GGUF MMQ input upload failed.");
+                Expect(FastllmCudaHalfMatMulGGUFMMQ(
+                           deviceInput, deviceWeight, deviceOutput, (int)type,
+                           batch, inputDim, outputDim, nullptr),
+                       "CUDA GGUF MMQ rejected " +
+                           std::string(ggml_type_name(type)) + " batch " +
+                           std::to_string(batch) + ".");
+                Expect(cudaDeviceSynchronize() == cudaSuccess,
+                       "CUDA GGUF MMQ kernel failed for " +
+                           std::string(ggml_type_name(type)) + " batch " +
+                           std::to_string(batch) + ".");
+
+                std::vector<uint16_t> outputHalf(outputCount);
+                Expect(cudaMemcpy(outputHalf.data(), deviceOutput,
+                                  outputHalf.size() * sizeof(uint16_t),
+                                  cudaMemcpyDeviceToHost) == cudaSuccess,
+                       "CUDA GGUF MMQ output download failed.");
+
+                double squaredError = 0.0;
+                double squaredReference = 0.0;
+                for (int row = 0; row < batch; ++row) {
+                    for (int output = 0; output < outputDim; ++output) {
+                        float reference = 0.0f;
+                        for (int column = 0; column < inputDim; ++column) {
+                            reference +=
+                                roundedInput[(size_t)row * inputDim + column] *
+                                dequantized[(size_t)output * inputDim + column];
+                        }
+                        const float actual = fastllm::half_to_float(
+                            outputHalf[(size_t)row * outputDim + output]);
+                        Expect(std::isfinite(actual),
+                               "CUDA GGUF MMQ produced a non-finite value.");
+                        const double difference =
+                            (double)actual - (double)reference;
+                        squaredError += difference * difference;
+                        squaredReference +=
+                            (double)reference * (double)reference;
+                    }
+                }
+                const double relativeRmse =
+                    std::sqrt(squaredError / squaredReference);
+                Expect(relativeRmse < 0.025,
+                       "CUDA GGUF MMQ relative RMSE is too large for " +
+                           std::string(ggml_type_name(type)) + " batch " +
+                           std::to_string(batch) + ": " +
+                           std::to_string(relativeRmse) + ".");
+
+                cudaFree(deviceOutput);
+                cudaFree(deviceInput);
+
+                if (type == GGML_TYPE_Q6_K && batch == 8) {
+                    std::vector<uint16_t> inputBfloat(
+                        (size_t)batch * inputDim);
+                    std::vector<float> roundedBfloat(inputBfloat.size());
+                    for (int row = 0; row < batch; ++row) {
+                        for (int column = 0; column < inputDim; ++column) {
+                            const size_t index =
+                                (size_t)row * inputDim + column;
+                            const float value =
+                                std::cos((float)(row * 13 + column * 7 + 1) *
+                                         0.01953125f) *
+                                (0.35f +
+                                 (float)((row * 3 + column) % 9) / 32.0f);
+                            inputBfloat[index] =
+                                fastllm::Float32ToBFloat16RNEBits(value);
+                            roundedBfloat[index] =
+                                fastllm::BFloat16BitsToFloat32(
+                                    inputBfloat[index]);
+                        }
+                    }
+
+                    void *deviceBfloatInput = nullptr;
+                    void *deviceBfloatOutput = nullptr;
+                    Expect(cudaMalloc(
+                               &deviceBfloatInput,
+                               inputBfloat.size() * sizeof(uint16_t)) ==
+                               cudaSuccess,
+                           "CUDA GGUF BF16 MMQ input allocation failed.");
+                    Expect(cudaMalloc(
+                               &deviceBfloatOutput,
+                               outputCount * sizeof(uint16_t)) == cudaSuccess,
+                           "CUDA GGUF BF16 MMQ output allocation failed.");
+                    Expect(cudaMemcpy(
+                               deviceBfloatInput, inputBfloat.data(),
+                               inputBfloat.size() * sizeof(uint16_t),
+                               cudaMemcpyHostToDevice) == cudaSuccess,
+                           "CUDA GGUF BF16 MMQ input upload failed.");
+                    Expect(FastllmCudaBFloat16MatMulGGUFMMQ(
+                               deviceBfloatInput, deviceWeight,
+                               deviceBfloatOutput, (int)type, batch,
+                               inputDim, outputDim, nullptr),
+                           "CUDA GGUF BF16 MMQ rejected Q6_K batch 8.");
+                    Expect(cudaDeviceSynchronize() == cudaSuccess,
+                           "CUDA GGUF BF16 MMQ kernel failed.");
+
+                    std::vector<uint16_t> outputBfloat(outputCount);
+                    Expect(cudaMemcpy(
+                               outputBfloat.data(), deviceBfloatOutput,
+                               outputBfloat.size() * sizeof(uint16_t),
+                               cudaMemcpyDeviceToHost) == cudaSuccess,
+                           "CUDA GGUF BF16 MMQ output download failed.");
+
+                    double bfSquaredError = 0.0;
+                    double bfSquaredReference = 0.0;
+                    for (int row = 0; row < batch; ++row) {
+                        for (int output = 0; output < outputDim; ++output) {
+                            float reference = 0.0f;
+                            for (int column = 0; column < inputDim; ++column) {
+                                reference += roundedBfloat[
+                                    (size_t)row * inputDim + column] *
+                                    dequantized[
+                                        (size_t)output * inputDim + column];
+                            }
+                            const float actual =
+                                fastllm::BFloat16BitsToFloat32(outputBfloat[
+                                    (size_t)row * outputDim + output]);
+                            Expect(std::isfinite(actual),
+                                   "CUDA GGUF BF16 MMQ produced a non-finite "
+                                   "value.");
+                            const double difference =
+                                (double)actual - (double)reference;
+                            bfSquaredError += difference * difference;
+                            bfSquaredReference +=
+                                (double)reference * (double)reference;
+                        }
+                    }
+                    const double bfRelativeRmse =
+                        std::sqrt(bfSquaredError / bfSquaredReference);
+                    Expect(bfRelativeRmse < 0.025,
+                           "CUDA GGUF BF16 MMQ relative RMSE is too large: " +
+                               std::to_string(bfRelativeRmse) + ".");
+
+                    cudaFree(deviceBfloatOutput);
+                    cudaFree(deviceBfloatInput);
+                }
+            }
+            cudaFree(deviceWeight);
         }
     }
 
@@ -12653,6 +13549,45 @@ int main(int argc, char **argv) {
         }
 #ifdef USE_CUDA
         if (argc == 2 &&
+            std::string(argv[1]) == "--cuda-gguf-q3-dequant") {
+            Expect(FastllmCudaGetDeviceCount() > 0,
+                   "GGUF Q3 dequant regression requires CUDA.");
+            RunCudaGgufQ3DequantRegression();
+            std::cout << "CUDA GGUF Q3 dequant regressions: PASS\n";
+            return 0;
+        }
+        if (argc == 2 &&
+            std::string(argv[1]) == "--cuda-gguf-iq4-dequant") {
+            Expect(FastllmCudaGetDeviceCount() > 0,
+                   "GGUF IQ4 dequant regression requires CUDA.");
+            RunCudaGgufIq4DequantRegression();
+            std::cout << "CUDA GGUF IQ4 dequant regressions: PASS\n";
+            return 0;
+        }
+        if (argc == 2 &&
+            std::string(argv[1]) == "--cuda-gguf-mmvq-batch8") {
+            Expect(FastllmCudaGetDeviceCount() > 0,
+                   "GGUF MMVQ batch-8 regression requires CUDA.");
+            RunCudaGgufMmvqBatch8Regression();
+            std::cout << "CUDA GGUF MMVQ batch-8 regressions: PASS\n";
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--cuda-gguf-mmq") {
+            Expect(FastllmCudaGetDeviceCount() > 0,
+                   "GGUF MMQ regression requires CUDA.");
+            RunCudaGgufMmqRegression();
+            std::cout << "CUDA GGUF MMQ regressions: PASS\n";
+            return 0;
+        }
+        if (argc == 2 &&
+            std::string(argv[1]) == "--cuda-gguf-extended-mmvq") {
+            Expect(FastllmCudaGetDeviceCount() > 0,
+                   "extended GGUF MMVQ regression requires CUDA.");
+            RunCudaGgufExtendedMmvqRegression();
+            std::cout << "CUDA extended GGUF MMVQ regressions: PASS\n";
+            return 0;
+        }
+        if (argc == 2 &&
             std::string(argv[1]) == "--cuda-kimi-kda") {
             Expect(FastllmCudaGetDeviceCount() > 0,
                    "Kimi/GLM recurrent KDA regression requires CUDA.");
@@ -12920,7 +13855,11 @@ int main(int argc, char **argv) {
             RunCudaDeepSeekV4FusedQKVRopeCacheRegression();
             RunCudaGraphMemoryPoolOwnershipRegression();
             RunCudaLinearDataTypeCapabilityRegression();
+            RunCudaGgufQ3DequantRegression();
+            RunCudaGgufIq4DequantRegression();
             RunCudaGgufMmvqBatch8Regression();
+            RunCudaGgufMmqRegression();
+            RunCudaGgufExtendedMmvqRegression();
             RunCudaKimiK3CausalConvDecodeRegression();
             RunCudaKimiK3PackedConvCacheRegression();
             RunCudaKimiK3RecurrentKdaRegression();
