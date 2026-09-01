@@ -2532,8 +2532,10 @@ namespace fastllm {
                         rawKeyCapture->CopyFrom(currentKeysFloat);
                         const int capacity = std::max(
                             sequence, Qwen4MtpDraftsPerStep() + 1);
-                        rawKeyCapture->Expansion(
-                            {capacity, this->indexerHeadDim});
+                        if (capacity > sequence) {
+                            rawKeyCapture->Expansion(
+                                {capacity, this->indexerHeadDim});
+                        }
                         rawKeyCapture->Resize(
                             {sequence, this->indexerHeadDim});
                     } else {
@@ -2707,6 +2709,122 @@ namespace fastllm {
                 }
             };
 
+#ifdef USE_CUDA
+            // The four-row verifier always completes exactly one QSA
+            // compression group. Reuse the graph-safe exact kernel on the
+            // eager path as well, avoiding the temporary concatenations,
+            // split reductions, normalization, RoPE and cache copies below.
+            if (sequence == 4 && ratio == 4 &&
+                this->indexerHeadDim == 128 &&
+                this->rotary_dim == 64) {
+                const int device = currentKeysFloat.dataDeviceIds.empty()
+                    ? FastllmCudaGetDevice()
+                    : currentKeysFloat.dataDeviceIds[0];
+                auto allocateCache = [&](std::shared_ptr<Data> &cache,
+                                         const std::vector<int> &capacity,
+                                         const std::vector<int> &logical) {
+                    cache = std::make_shared<Data>();
+                    cache->dataType = DataType::FLOAT32;
+                    cache->UpdateUnitSize();
+                    cache->dataDevice = DataDevice::CUDA;
+                    cache->dataDeviceIds = {device};
+                    cache->Expansion(capacity);
+                    cache->Resize(logical);
+                };
+                if (oldTailCount == 0 && tailKeys == nullptr) {
+                    allocateCache(
+                        tailKeys, {ratio, this->indexerHeadDim},
+                        {0, this->indexerHeadDim});
+                }
+                if (oldTailCount == 0 && tailPositions == nullptr) {
+                    allocateCache(tailPositions, {ratio}, {0});
+                }
+                if (cachedBlocks == 0 && blockCache == nullptr) {
+                    allocateCache(
+                        blockCache, {256, this->indexerHeadDim},
+                        {0, this->indexerHeadDim});
+                }
+
+                const int requiredBlocks = cachedBlocks + 1;
+                if (blockCache != nullptr && sameDevice(*blockCache) &&
+                    blockCache->dataType == DataType::FLOAT32 &&
+                    blockCache->dims.size() == 2 &&
+                    blockCache->dims[1] == this->indexerHeadDim &&
+                    Qwen4AxisCapacity(*blockCache, 0) < requiredBlocks) {
+                    const int capacity =
+                        ((requiredBlocks + 255) / 256) * 256;
+                    blockCache->Expansion(
+                        {capacity, this->indexerHeadDim});
+                }
+
+                Data &normWeight =
+                    this->weight[indexer + "k_layernorm.weight"];
+                const bool canFuse =
+                    tailKeys != nullptr && tailPositions != nullptr &&
+                    blockCache != nullptr && sameDevice(*tailKeys) &&
+                    sameDevice(*tailPositions) && sameDevice(*blockCache) &&
+                    sameDevice(normWeight) && sameDevice(this->sinData) &&
+                    sameDevice(this->cosData) &&
+                    tailKeys->dataType == DataType::FLOAT32 &&
+                    tailPositions->dataType == DataType::FLOAT32 &&
+                    blockCache->dataType == DataType::FLOAT32 &&
+                    normWeight.dataType == DataType::FLOAT32 &&
+                    this->sinData.dataType == DataType::FLOAT32 &&
+                    this->cosData.dataType == DataType::FLOAT32 &&
+                    Qwen4AxisCapacity(*tailKeys, 0) >= ratio &&
+                    Qwen4AxisCapacity(*tailPositions, 0) >= ratio &&
+                    Qwen4AxisCapacity(*blockCache, 0) >= requiredBlocks &&
+                    tailKeys->strides.size() == 2 &&
+                    tailKeys->strides[0] == this->indexerHeadDim &&
+                    blockCache->strides.size() == 2 &&
+                    blockCache->strides[0] == this->indexerHeadDim;
+                if (canFuse) {
+                    // Preserve the completed raw group in the pinned mirror
+                    // before the fused kernel rotates the four tail slots.
+                    int mirroredRows = previousLength - oldTailCount;
+                    if (oldTailCount > 0) {
+                        Data oldKeys, oldPositions;
+                        oldKeys.FakeFrom(*tailKeys, 0);
+                        oldKeys.Resize(
+                            {oldTailCount, this->indexerHeadDim});
+                        oldPositions.FakeFrom(*tailPositions, 0);
+                        oldPositions.Resize({oldTailCount});
+                        hostTransfer->Queue(
+                            oldKeys, oldPositions, mirroredRows,
+                            oldTailCount, this->indexerHeadDim);
+                        mirroredRows += oldTailCount;
+                    }
+                    const int newRows = ratio - oldTailCount;
+                    Data newKeys, newPositions;
+                    newKeys.FakeFrom(currentKeysFloat, 0);
+                    newKeys.Resize(
+                        {newRows, this->indexerHeadDim});
+                    newPositions.FakeFrom(currentPositionsFloat, 0);
+                    newPositions.Resize({newRows});
+                    hostTransfer->Queue(
+                        newKeys, newPositions, mirroredRows,
+                        newRows, this->indexerHeadDim);
+
+                    const bool fused =
+                        FastllmCudaQwen4QSAAppendCompress4(
+                            currentKeysFloat, currentPositionsFloat,
+                            normWeight, this->sinData, this->cosData,
+                            previousLength, *tailKeys, *tailPositions,
+                            *blockCache, this->rms_norm_eps);
+                    AssertInFastLLM(
+                        fused,
+                        "Qwen4-Exp exact QSA compression rejected a validated input.");
+                    tailKeys->Resize(
+                        {oldTailCount, this->indexerHeadDim});
+                    tailPositions->Resize({oldTailCount});
+                    blockCache->Resize(
+                        {requiredBlocks, this->indexerHeadDim});
+                    finishDeviceQsa();
+                    return;
+                }
+            }
+#endif
+
             // Most decode steps merely extend the incomplete group. Reuse
             // its small reserved buffer directly; constructing and then
             // splitting a temporary concatenation would add four D2D copies
@@ -2807,7 +2925,11 @@ namespace fastllm {
                          std::vector<int>({cachedBlocks,
                                            this->indexerHeadDim})),
                     "Qwen4-Exp QSA compressed cache append is inconsistent.");
-                if (blockCache == nullptr) {
+                if (blockCache == nullptr || blockCache->dims.empty() ||
+                    blockCache->dims[0] == 0) {
+                    AssertInFastLLM(
+                        cachedBlocks == 0,
+                        "Qwen4-Exp QSA lost a committed compressed block.");
                     blockCache = std::make_shared<Data>();
                     blockCache->CopyFrom(normalized);
                 } else {
@@ -3260,55 +3382,10 @@ namespace fastllm {
         Data typedInput;
         ToDataType(input, typedInput, this->dataType);
         Data qsaMask, qsaIndices;
-#ifdef USE_CUDA
-        const bool exactSparseMtpBatch =
-            qwen4MtpDecodeEquivalentTarget && sequence > 1 &&
-            previousLength + sequence > this->indexerBudget;
-        if (exactSparseMtpBatch) {
-            for (int token = 0; token < sequence; token++) {
-                Data tokenInput, tokenPosition, tokenMask, tokenIndices;
-                Split(typedInput, 1, token, token + 1, tokenInput);
-                Split(positionIds, 1, token, token + 1, tokenPosition);
-                BuildQSAMask(
-                    stateLayer, attention, tokenInput, Data(),
-                    tokenPosition, previousLength + token, true,
-                    state, tokenMask, tokenIndices,
-                    qsaRawKeyCapture, true);
-                AssertInFastLLM(
-                    !tokenIndices.dims.empty() &&
-                    tokenIndices.dims.size() == 2 &&
-                    tokenIndices.dims[0] == 1,
-                    "Qwen4-Exp MTP sparse QSA row capture failed.");
-                if (qsaIndices.dims.empty()) {
-                    qsaIndices.dataType = DataType::INT32;
-                    qsaIndices.UpdateUnitSize();
-                    qsaIndices.Resize(
-                        {sequence, tokenIndices.dims[1]});
-                    qsaIndices.ToDevice(
-                        DataDevice::CUDA,
-                        tokenIndices.dataDeviceIds, false);
-                    qsaIndices.Allocate(false);
-                }
-                AssertInFastLLM(
-                    qsaIndices.dims[1] == tokenIndices.dims[1] &&
-                    qsaIndices.cudaData != nullptr &&
-                    tokenIndices.cudaData != nullptr &&
-                    FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
-                        reinterpret_cast<uint8_t *>(qsaIndices.cudaData) +
-                            (size_t)token * tokenIndices.dims[1] *
-                                sizeof(int32_t),
-                        tokenIndices.cudaData,
-                        (size_t)tokenIndices.dims[1] * sizeof(int32_t)),
-                    "Qwen4-Exp MTP sparse QSA row copy failed.");
-            }
-        } else
-#endif
-        {
-            BuildQSAMask(stateLayer, attention, typedInput,
-                         attentionMask, positionIds,
-                         previousLength, qsaDeviceCompatibleMask,
-                         state, qsaMask, qsaIndices, qsaRawKeyCapture);
-        }
+        BuildQSAMask(stateLayer, attention, typedInput,
+                     attentionMask, positionIds,
+                     previousLength, qsaDeviceCompatibleMask,
+                     state, qsaMask, qsaIndices, qsaRawKeyCapture);
 
         Data qGate, query, key, value, gate;
         Data &qWeight = this->weight[attention + "q_proj.weight"];

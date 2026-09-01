@@ -1902,7 +1902,8 @@ namespace {
     void Qwen4QSAAppendCompress4ExactKernel(
             const float *rawKeys, const float *positions,
             const float *normWeight, const float *sin, const float *cos,
-            const int32_t *decodeMeta, float *tailKeys,
+            const int32_t *decodeMeta, int previousLength,
+            float *tailKeys,
             float *tailPositions, float *compressedKeys,
             int compressedCapacity, int sinCosStride, float eps) {
         constexpr int kSequence = 4;
@@ -1912,7 +1913,8 @@ namespace {
         const int tid = threadIdx.x;
         const int lane = tid & 31;
         const int warp = tid >> 5;
-        const int baseLength = decodeMeta[0];
+        const int baseLength = decodeMeta == nullptr
+            ? previousLength : decodeMeta[0];
         const int oldTail = baseLength & (kSequence - 1);
         const int commitToken = kSequence - oldTail - 1;
 
@@ -2841,13 +2843,13 @@ bool FastllmCudaQwen4QSACommitGraph(
     return cudaGetLastError() == cudaSuccess;
 }
 
-bool FastllmCudaQwen4QSAAppendCompress4Graph(
+static bool FastllmCudaQwen4QSAAppendCompress4Launch(
         const fastllm::Data &rawKeys,
         const fastllm::Data &positions,
         const fastllm::Data &normWeight,
         const fastllm::Data &sinData,
         const fastllm::Data &cosData,
-        const int32_t *decodeMeta,
+        const int32_t *decodeMeta, int previousLength,
         fastllm::Data &tailKeys,
         fastllm::Data &tailPositions,
         fastllm::Data &compressedKeys,
@@ -2866,7 +2868,7 @@ bool FastllmCudaQwen4QSAAppendCompress4Graph(
             ? compressedKeys.expansionDims[0]
             : (compressedKeys.dims.size() == 2
                 ? compressedKeys.dims[0] : 0);
-    if (decodeMeta == nullptr ||
+    if ((decodeMeta == nullptr && previousLength < 0) ||
         rawKeys.dataDevice != fastllm::DataDevice::CUDA ||
         positions.dataDevice != fastllm::DataDevice::CUDA ||
         normWeight.dataDevice != fastllm::DataDevice::CUDA ||
@@ -2894,6 +2896,8 @@ bool FastllmCudaQwen4QSAAppendCompress4Graph(
         sinData.dims.size() != 2 || cosData.dims != sinData.dims ||
         sinData.dims[1] < 32 || tailCapacity < sequence ||
         positionCapacity < sequence || compressedCapacity <= 0 ||
+        (decodeMeta == nullptr &&
+         previousLength / sequence + 1 > compressedCapacity) ||
         tailKeys.strides.size() != 2 ||
         tailKeys.strides[0] != headDim ||
         compressedKeys.strides.size() != 2 ||
@@ -2907,13 +2911,50 @@ bool FastllmCudaQwen4QSAAppendCompress4Graph(
         (const float *)normWeight.cudaData,
         (const float *)sinData.cudaData,
         (const float *)cosData.cudaData,
-        decodeMeta,
+        decodeMeta, previousLength,
         (float *)tailKeys.cudaData,
         (float *)tailPositions.cudaData,
         (float *)compressedKeys.cudaData,
         compressedCapacity, sinData.dims[1], eps);
     DeviceSync();
     return cudaGetLastError() == cudaSuccess;
+}
+
+bool FastllmCudaQwen4QSAAppendCompress4(
+        const fastllm::Data &rawKeys,
+        const fastllm::Data &positions,
+        const fastllm::Data &normWeight,
+        const fastllm::Data &sinData,
+        const fastllm::Data &cosData,
+        int previousLength,
+        fastllm::Data &tailKeys,
+        fastllm::Data &tailPositions,
+        fastllm::Data &compressedKeys,
+        float eps) {
+    return FastllmCudaQwen4QSAAppendCompress4Launch(
+        rawKeys, positions, normWeight, sinData, cosData,
+        nullptr, previousLength, tailKeys, tailPositions,
+        compressedKeys, eps);
+}
+
+bool FastllmCudaQwen4QSAAppendCompress4Graph(
+        const fastllm::Data &rawKeys,
+        const fastllm::Data &positions,
+        const fastllm::Data &normWeight,
+        const fastllm::Data &sinData,
+        const fastllm::Data &cosData,
+        const int32_t *decodeMeta,
+        fastllm::Data &tailKeys,
+        fastllm::Data &tailPositions,
+        fastllm::Data &compressedKeys,
+        float eps) {
+    if (decodeMeta == nullptr) {
+        return false;
+    }
+    return FastllmCudaQwen4QSAAppendCompress4Launch(
+        rawKeys, positions, normWeight, sinData, cosData,
+        decodeMeta, 0, tailKeys, tailPositions,
+        compressedKeys, eps);
 }
 
 bool FastllmCudaQwen4QSASelectGraph(
