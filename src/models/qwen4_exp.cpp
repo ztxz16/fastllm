@@ -664,6 +664,21 @@ namespace fastllm {
             return true;
         }
 
+        bool Qwen4CudaOrNumaOnlyDeviceMap(
+                const std::map<std::string, int> &deviceMap) {
+            for (const auto &item : deviceMap) {
+                const std::string &name = item.first;
+                const bool cuda = name == "cuda" ||
+                    (name.size() > 5 && name.compare(0, 5, "cuda:") == 0);
+                const bool numa = name == "numa" ||
+                    (name.size() > 5 && name.compare(0, 5, "numa:") == 0);
+                if (item.second > 0 && !cuda && !numa) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
         bool Qwen4EnvFlagEnabled(const char *name) {
             const char *value = std::getenv(name);
             return value != nullptr && value[0] != '\0' &&
@@ -3952,8 +3967,11 @@ namespace fastllm {
             !generationConfig.tool_call_parameter_name_constraint_enabled &&
             !generationConfig.tool_call_content_sampling_enabled &&
             Qwen4CudaOnlyDeviceMap(this->deviceMap) &&
-            Qwen4CudaOnlyDeviceMap(this->moeDeviceMap) &&
-            Qwen4CudaOnlyDeviceMap(this->layeredMoeDeviceMap);
+            // CUDA+NUMA MTP deliberately stays on the eager path. The draft
+            // and target CUDA Graph eligibility checks retain their stricter
+            // all-CUDA predicates because a graph cannot capture NUMA MoE.
+            Qwen4CudaOrNumaOnlyDeviceMap(this->moeDeviceMap) &&
+            Qwen4CudaOrNumaOnlyDeviceMap(this->layeredMoeDeviceMap);
     }
 
     namespace {
@@ -4039,11 +4057,11 @@ namespace fastllm {
         Qwen4CopyRuntimeTensor(
             state.pleConvHistoryTensors[1],
             checkpoint.pleConvHistoryTensors[1]);
-        // Speculative checkpoints are consumed only by the CUDA-only MTP
-        // path.  Its raw QSA prefix already lives in the persistent pinned
-        // mirror, so recording the logical length is sufficient.  Copying
-        // every 2-KiB-wide history to std::vector here synchronized all full
-        // attention layers and moved tens of MiB per verifier round.
+        // CUDA-backed speculative checkpoints normally keep the incomplete
+        // QSA group in the device tail and the completed prefix in the pinned
+        // mirror. Recording the logical length is therefore sufficient;
+        // copying every history to std::vector here would synchronize all
+        // full-attention layers and move tens of MiB per verifier round.
         checkpoint.indexerRawKeys.clear();
         checkpoint.indexerPositions.clear();
         checkpoint.indexerBlockKeys.clear();
@@ -4054,6 +4072,74 @@ namespace fastllm {
         Qwen4CopyRuntimeTensorMap(
             state.indexerTailPositionTensors,
             checkpoint.indexerTailPositionTensors);
+        // A short prompt can take the host QSA fallback before mixed MTP
+        // switches its verifier to CUDA. Preserve only that fallback's
+        // incomplete group (at most compression_ratio - 1 rows), so rollback
+        // remains exact without copying the completed history.
+        for (const auto &item : qsaLengths) {
+            const int layer = item.first;
+            const int length = item.second;
+            const int tail = length % this->indexerCompressRatio;
+            if (tail == 0) {
+                continue;
+            }
+            const auto tailKeys =
+                checkpoint.indexerTailKeyTensors.find(layer);
+            const auto tailPositions =
+                checkpoint.indexerTailPositionTensors.find(layer);
+            const bool deviceTailReady =
+                tailKeys != checkpoint.indexerTailKeyTensors.end() &&
+                tailKeys->second != nullptr &&
+                tailKeys->second->dims ==
+                    std::vector<int>({tail, this->indexerHeadDim}) &&
+                tailPositions !=
+                    checkpoint.indexerTailPositionTensors.end() &&
+                tailPositions->second != nullptr &&
+                tailPositions->second->dims ==
+                    std::vector<int>({tail});
+            if (deviceTailReady) {
+                continue;
+            }
+
+            auto rawKeys = state.indexerRawKeys.find(layer);
+            auto rawPositions = state.indexerPositions.find(layer);
+            const size_t requiredKeys =
+                (size_t)length * this->indexerHeadDim;
+            if (rawKeys == state.indexerRawKeys.end() ||
+                rawKeys->second.size() < requiredKeys ||
+                rawPositions == state.indexerPositions.end() ||
+                rawPositions->second.size() < (size_t)length) {
+                MaterializeQsaHostHistory(layer, length, state);
+                rawKeys = state.indexerRawKeys.find(layer);
+                rawPositions = state.indexerPositions.find(layer);
+            }
+            AssertInFastLLM(
+                rawKeys != state.indexerRawKeys.end() &&
+                rawKeys->second.size() >= requiredKeys &&
+                rawPositions != state.indexerPositions.end() &&
+                rawPositions->second.size() >= (size_t)length,
+                "Qwen4-Exp MTP cannot checkpoint its host QSA tail.");
+            const size_t keyBegin =
+                (size_t)(length - tail) * this->indexerHeadDim;
+            std::shared_ptr<Data> fallbackTailKeys =
+                std::make_shared<Data>(
+                    DataType::FLOAT32,
+                    std::vector<int>({tail, this->indexerHeadDim}),
+                    std::vector<float>(
+                        rawKeys->second.begin() + keyBegin,
+                        rawKeys->second.begin() + requiredKeys));
+            std::shared_ptr<Data> fallbackTailPositions =
+                std::make_shared<Data>(
+                    DataType::FLOAT32,
+                    std::vector<int>({tail}),
+                    std::vector<float>(
+                        rawPositions->second.begin() + length - tail,
+                        rawPositions->second.begin() + length));
+            checkpoint.indexerTailKeyTensors[layer] =
+                std::move(fallbackTailKeys);
+            checkpoint.indexerTailPositionTensors[layer] =
+                std::move(fallbackTailPositions);
+        }
         // Compressed QSA rows are append-only. Keep the storage identity and
         // restore its logical row count instead of copying every historical
         // block into the checkpoint. Newly appended rows never overwrite the
@@ -4615,10 +4701,18 @@ namespace fastllm {
                     baseKeyData = baseKeys->second.get();
                     basePositionData = basePositions->second.get();
                 } else {
-                    const std::vector<float> &hostKeys = checkpoint.request.
-                        indexerRawKeys.at(layer);
-                    const std::vector<float> &hostPositions = checkpoint.
-                        request.indexerPositions.at(layer);
+                    const auto hostKeysIt = checkpoint.request.
+                        indexerRawKeys.find(layer);
+                    const auto hostPositionsIt = checkpoint.request.
+                        indexerPositions.find(layer);
+                    AssertInFastLLM(
+                        hostKeysIt != checkpoint.request.indexerRawKeys.end() &&
+                        hostPositionsIt != checkpoint.request.
+                            indexerPositions.end(),
+                        "Qwen4-Exp MTP host QSA tail is unavailable.");
+                    const std::vector<float> &hostKeys = hostKeysIt->second;
+                    const std::vector<float> &hostPositions =
+                        hostPositionsIt->second;
                     const size_t keyOffset =
                         (size_t)(previousLength - oldTail) *
                             this->indexerHeadDim;
@@ -4658,6 +4752,29 @@ namespace fastllm {
                     basePositionData = &hostBasePositions;
                 }
             }
+#ifdef USE_CUDA
+            if (baseKeyData != nullptr &&
+                rawKeyPrefix.dataDevice == DataDevice::CUDA) {
+                const int currentDevice = FastllmCudaGetDevice();
+                const int targetDevice = rawKeyPrefix.dataDeviceIds.empty()
+                    ? currentDevice : rawKeyPrefix.dataDeviceIds[0];
+                const int baseDevice = baseKeyData->dataDeviceIds.empty()
+                    ? currentDevice : baseKeyData->dataDeviceIds[0];
+                if (baseKeyData->dataDevice != DataDevice::CUDA ||
+                    baseDevice != targetDevice) {
+                    hostBaseKeys.CopyFrom(*baseKeyData);
+                    hostBasePositions.CopyFrom(*basePositionData);
+                    hostBaseKeys.ToDevice(
+                        DataDevice::CUDA,
+                        rawKeyPrefix.dataDeviceIds);
+                    hostBasePositions.ToDevice(
+                        DataDevice::CUDA,
+                        rawKeyPrefix.dataDeviceIds);
+                    baseKeyData = &hostBaseKeys;
+                    basePositionData = &hostBasePositions;
+                }
+            }
+#endif
 
             std::shared_ptr<Data> &blockCache =
                 state.indexerBlockKeyTensors[layer];
@@ -7346,9 +7463,13 @@ namespace fastllm {
             Data &sampledTokenValues = mtp.sampledTokenValues;
             bool deviceChain = false;
 #ifdef USE_CUDA
+            Data &tokenEmbedding = this->weight[
+                languagePrefix + "embed_tokens.weight"];
             if (draftCount > 0 &&
                 targetHidden.dataDevice == DataDevice::CUDA &&
-                targetHidden.cudaData != nullptr) {
+                targetHidden.cudaData != nullptr &&
+                tokenEmbedding.dataDevice == DataDevice::CUDA &&
+                tokenEmbedding.cudaData != nullptr) {
                 const int device = targetHidden.dataDeviceIds.empty()
                     ? FastllmCudaGetDevice()
                     : targetHidden.dataDeviceIds[0];
@@ -7482,11 +7603,10 @@ namespace fastllm {
 
         if (mtp.proposals.empty()) {
             Data targetHidden;
-            std::vector<int> targetTokens;
             std::vector<int> result = ForwardTarget(
                 batch, inputIds, attentionMask, positionIds,
                 pastKeyValues, generationConfig, lastTokens, retLogits,
-                &targetHidden, &targetTokens, nullptr,
+                &targetHidden, nullptr, nullptr,
                 true, false, false);
 
             const std::vector<int> ids = dataToInts(inputIds);
@@ -7533,7 +7653,7 @@ namespace fastllm {
                     mtpTokens.push_back(
                         row + 1 < sequence
                             ? ids[row + 1]
-                            : targetTokens.back());
+                            : result.back());
                     mtpPositions.push_back(currentPositions[row]);
                 }
             }
