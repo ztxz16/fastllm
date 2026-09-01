@@ -2817,15 +2817,26 @@ namespace fastllm {
             root.pagedKVCacheData = firstLocal->pagedKVCacheData;
         }
 
-        static DivisionScheme ExtractQwen35FirstRangeScheme(const DivisionScheme &scheme) {
+        static DivisionScheme ExtractQwen35PackedRangeScheme(
+                const DivisionScheme &scheme, int rangeIndex, int base) {
+            AssertInFastLLM(rangeIndex >= 0,
+                            "Qwen3.5 TP packed range index should be non-negative.\n");
             DivisionScheme ret;
             for (auto &it : scheme) {
                 ret[it.first];
-                if (!it.second.empty()) {
-                    ret[it.first].push_back(it.second[0]);
+                if (rangeIndex >= (int)it.second.size()) {
+                    continue;
                 }
+                const auto &range = it.second[rangeIndex];
+                AssertInFastLLM(range.first >= base && range.second >= range.first,
+                                "Qwen3.5 TP packed range has an invalid base.\n");
+                ret[it.first].push_back({range.first - base, range.second - base});
             }
             return ret;
+        }
+
+        static DivisionScheme ExtractQwen35FirstRangeScheme(const DivisionScheme &scheme) {
+            return ExtractQwen35PackedRangeScheme(scheme, 0, 0);
         }
 
         static DivisionScheme BuildQwen35GatedAttentionQkvScheme(
@@ -2977,6 +2988,34 @@ namespace fastllm {
             return ret;
         }
 
+        static DivisionScheme BuildQwen35LinearQkvScheme(
+                const DivisionScheme &keyHeadScheme,
+                int numKHeads,
+                int numVHeads,
+                int headKDim,
+                int headVDim) {
+            DivisionScheme ret;
+            int valueHeadsPerKey = numVHeads / numKHeads;
+            int kd = numKHeads * headKDim;
+            int qBase = 0;
+            int kBase = kd;
+            int vBase = kd * 2;
+            for (auto &it : keyHeadScheme) {
+                ret[it.first];
+                for (auto &kr : it.second) {
+                    int vs = kr.first * valueHeadsPerKey;
+                    int ve = kr.second * valueHeadsPerKey;
+                    ret[it.first].push_back({qBase + kr.first * headKDim,
+                                             qBase + kr.second * headKDim});
+                    ret[it.first].push_back({kBase + kr.first * headKDim,
+                                             kBase + kr.second * headKDim});
+                    ret[it.first].push_back({vBase + vs * headVDim,
+                                             vBase + ve * headVDim});
+                }
+            }
+            return ret;
+        }
+
         static DivisionScheme BuildQwen35LinearBaScheme(
                 const DivisionScheme &valueHeadScheme,
                 int numVHeads) {
@@ -3015,17 +3054,25 @@ namespace fastllm {
             return ret;
         }
 
-        static DivisionScheme BuildQwen35LinearOutProjScheme(
-                const DivisionScheme &valueHeadScheme,
-                int headVDim) {
+        static DivisionScheme ScaleQwen35DivisionScheme(
+                const DivisionScheme &scheme, int scale) {
+            AssertInFastLLM(scale > 0,
+                            "Qwen3.5 TP division scheme scale should be positive.\n");
             DivisionScheme ret;
-            for (auto &it : valueHeadScheme) {
+            for (auto &it : scheme) {
                 ret[it.first];
                 for (auto &range : it.second) {
-                    ret[it.first].push_back({range.first * headVDim, range.second * headVDim});
+                    ret[it.first].push_back({range.first * scale,
+                                             range.second * scale});
                 }
             }
             return ret;
+        }
+
+        static DivisionScheme BuildQwen35LinearOutProjScheme(
+                const DivisionScheme &valueHeadScheme,
+                int headVDim) {
+            return ScaleQwen35DivisionScheme(valueHeadScheme, headVDim);
         }
 
         static DivisionScheme BuildQwen35GgufLinearOutProjScheme(
@@ -14588,25 +14635,70 @@ namespace fastllm {
                         if (isAttentionLayer) {
                             std::string mergeQkvWeightName = prefix + "self_attn.mergeqkv.weight";
                             std::string mergeQkvBiasName = prefix + "self_attn.mergeqkv.bias";
+                            std::string qWeightName = prefix + "self_attn.q_proj.weight";
+                            std::string qBiasName = prefix + "self_attn.q_proj.bias";
+                            std::string kWeightName = prefix + "self_attn.k_proj.weight";
+                            std::string kBiasName = prefix + "self_attn.k_proj.bias";
+                            std::string vWeightName = prefix + "self_attn.v_proj.weight";
+                            std::string vBiasName = prefix + "self_attn.v_proj.bias";
                             std::string qNormName = prefix + "self_attn.q_norm.weight";
                             std::string kNormName = prefix + "self_attn.k_norm.weight";
                             std::string oWeightName = prefix + "self_attn.o_proj.weight";
                             std::string oBiasName = prefix + "self_attn.o_proj.bias";
-                            AssertInFastLLM(weight.weight.find(mergeQkvWeightName) != weight.weight.end(),
-                                            "Qwen3.5 ForwardGPU requires merged qgate/k/v weight.\n");
+                            bool hasMergedQkv =
+                                weight.weight.find(mergeQkvWeightName) != weight.weight.end();
+                            bool hasSeparateQkv =
+                                weight.weight.find(qWeightName) != weight.weight.end() &&
+                                weight.weight.find(kWeightName) != weight.weight.end() &&
+                                weight.weight.find(vWeightName) != weight.weight.end();
+                            AssertInFastLLM(hasMergedQkv || hasSeparateQkv,
+                                            "Qwen3.5 ForwardGPU requires merged or separate qgate/k/v weights.\n");
                             prepareReplicated(qNormName);
                             prepareReplicated(kNormName);
 
-                            Data &mergeW = weight[mergeQkvWeightName];
-                            Data &mergeB = GetThreadTensorParallelBias(mergeQkvBiasName);
-                            mergeW.tpPackType = TP_PACK_NONE;
                             DivisionScheme qkvScheme = BuildQwen35GatedAttentionQkvScheme(
                                 devices, ratios, num_attention_heads, num_key_value_heads, head_dim);
                             std::vector<int> devCopy = devices;
-                            AssertInFastLLM(SplitMultiCudaWeight(
-                                                mergeW, mergeB, devCopy, qkvScheme, 0),
-                                            "Qwen3.5 ForwardGPU failed to split " + mergeQkvWeightName + ".\n");
                             int qGateWidth = num_attention_heads * head_dim * 2;
+                            int kvWidth = num_key_value_heads * head_dim;
+                            if (hasMergedQkv) {
+                                Data &mergeW = weight[mergeQkvWeightName];
+                                Data &mergeB = GetThreadTensorParallelBias(mergeQkvBiasName);
+                                mergeW.tpPackType = TP_PACK_NONE;
+                                AssertInFastLLM(SplitMultiCudaWeight(
+                                                    mergeW, mergeB, devCopy, qkvScheme, 0),
+                                                "Qwen3.5 ForwardGPU failed to split " + mergeQkvWeightName + ".\n");
+                            } else {
+                                // Keep one balanced head assignment for all three
+                                // heterogeneous GGUF projections. Each source keeps
+                                // its own packed type and is split independently.
+                                BalanceMultiCudaDivisionSchemeByLayer(
+                                    qWeightName, devices, qkvScheme);
+                                DivisionScheme qScheme = ExtractQwen35PackedRangeScheme(
+                                    qkvScheme, 0, 0);
+                                DivisionScheme kScheme = ExtractQwen35PackedRangeScheme(
+                                    qkvScheme, 1, qGateWidth);
+                                DivisionScheme vScheme = ExtractQwen35PackedRangeScheme(
+                                    qkvScheme, 2, qGateWidth + kvWidth);
+
+                                Data &qBias = GetThreadTensorParallelBias(qBiasName);
+                                AssertInFastLLM(SplitMultiCudaWeight(
+                                                    weight[qWeightName], qBias,
+                                                    devCopy, qScheme, 0, true),
+                                                "Qwen3.5 ForwardGPU failed to split " + qWeightName + ".\n");
+                                Data &kBias = GetThreadTensorParallelBias(kBiasName);
+                                devCopy = devices;
+                                AssertInFastLLM(SplitMultiCudaWeight(
+                                                    weight[kWeightName], kBias,
+                                                    devCopy, kScheme, 0, true),
+                                                "Qwen3.5 ForwardGPU failed to split " + kWeightName + ".\n");
+                                Data &vBias = GetThreadTensorParallelBias(vBiasName);
+                                devCopy = devices;
+                                AssertInFastLLM(SplitMultiCudaWeight(
+                                                    weight[vWeightName], vBias,
+                                                    devCopy, vScheme, 0, true),
+                                                "Qwen3.5 ForwardGPU failed to split " + vWeightName + ".\n");
+                            }
                             threadTpAttentionKVHeadSchemes[i] =
                                 ExtractQwen35AttentionKVHeadScheme(qkvScheme, qGateWidth, head_dim);
                             DivisionScheme oScheme = ExtractQwen35AttentionOutputScheme(qkvScheme);
@@ -14618,6 +14710,8 @@ namespace fastllm {
                                             "Qwen3.5 ForwardGPU failed to split " + oWeightName + ".\n");
                         } else {
                             std::string qkvzWeightName = prefix + "linear_attn.in_proj_qkvz.weight";
+                            std::string qkvWeightName = prefix + "linear_attn.in_proj_qkv.weight";
+                            std::string zWeightName = prefix + "linear_attn.in_proj_z.weight";
                             std::string baWeightName = prefix + "linear_attn.in_proj_ba.weight";
                             std::string qkvzbaWeightName = prefix + "linear_attn.in_proj_qkvzba.weight";
                             std::string conv1dWeightName = prefix + "linear_attn.conv1d.weight";
@@ -14628,16 +14722,25 @@ namespace fastllm {
                             std::string outProjWeightName = prefix + "linear_attn.out_proj.weight";
                             bool hasMergedGdnInLinear =
                                 weight.weight.find(qkvzbaWeightName) != weight.weight.end();
-                            AssertInFastLLM(hasMergedGdnInLinear ||
-                                            (weight.weight.find(qkvzWeightName) != weight.weight.end() &&
-                                             weight.weight.find(baWeightName) != weight.weight.end()),
-                                            "Qwen3.5 ForwardGPU requires linear attention qkvzba or qkvz/ba weights.\n");
+                            bool hasQkvzGdnInLinear =
+                                weight.weight.find(qkvzWeightName) != weight.weight.end();
+                            bool hasSeparateQkvZGdnInLinear =
+                                weight.weight.find(qkvWeightName) != weight.weight.end() &&
+                                weight.weight.find(zWeightName) != weight.weight.end();
+                            bool hasBaGdnInLinear =
+                                weight.weight.find(baWeightName) != weight.weight.end();
+                            AssertInFastLLM(
+                                hasMergedGdnInLinear ||
+                                    ((hasQkvzGdnInLinear || hasSeparateQkvZGdnInLinear) &&
+                                     hasBaGdnInLinear),
+                                "Qwen3.5 ForwardGPU requires qkvzba, qkvz/ba, or qkv/z/ba weights.\n");
                             prepareReplicated(outNormWeightName);
 
                             DivisionScheme keyScheme = BuildQwen35LinearKeyHeadScheme(
                                 devices, ratios, num_k_heads);
                             BalanceMultiCudaDivisionSchemeByLayer(
-                                hasMergedGdnInLinear ? qkvzbaWeightName : qkvzWeightName,
+                                hasMergedGdnInLinear ? qkvzbaWeightName :
+                                    (hasQkvzGdnInLinear ? qkvzWeightName : qkvWeightName),
                                 devices, keyScheme);
                             DivisionScheme valueScheme = BuildQwen35LinearValueHeadScheme(
                                 keyScheme, num_v_heads / num_k_heads);
@@ -14654,13 +14757,36 @@ namespace fastllm {
                                                     devCopy, qkvzbaScheme, 0, true),
                                                 "Qwen3.5 ForwardGPU failed to split " + qkvzbaWeightName + ".\n");
                             } else {
-                                DivisionScheme qkvzScheme = BuildQwen35LinearQkvzScheme(
-                                    keyScheme, num_k_heads, num_v_heads, head_k_dim, head_v_dim);
-                                Data &qkvzBias = GetThreadTensorParallelBias(qkvzWeightName + ".tp_bias");
-                                AssertInFastLLM(SplitMultiCudaWeight(
-                                                    weight[qkvzWeightName], qkvzBias,
-                                                    devCopy, qkvzScheme, 0, true),
-                                                "Qwen3.5 ForwardGPU failed to split " + qkvzWeightName + ".\n");
+                                if (hasQkvzGdnInLinear) {
+                                    DivisionScheme qkvzScheme = BuildQwen35LinearQkvzScheme(
+                                        keyScheme, num_k_heads, num_v_heads,
+                                        head_k_dim, head_v_dim);
+                                    Data &qkvzBias = GetThreadTensorParallelBias(
+                                        qkvzWeightName + ".tp_bias");
+                                    AssertInFastLLM(SplitMultiCudaWeight(
+                                                        weight[qkvzWeightName], qkvzBias,
+                                                        devCopy, qkvzScheme, 0, true),
+                                                    "Qwen3.5 ForwardGPU failed to split " + qkvzWeightName + ".\n");
+                                } else {
+                                    DivisionScheme qkvScheme = BuildQwen35LinearQkvScheme(
+                                        keyScheme, num_k_heads, num_v_heads,
+                                        head_k_dim, head_v_dim);
+                                    DivisionScheme zScheme = ScaleQwen35DivisionScheme(
+                                        valueScheme, head_v_dim);
+                                    Data &qkvBias = GetThreadTensorParallelBias(
+                                        qkvWeightName + ".tp_bias");
+                                    AssertInFastLLM(SplitMultiCudaWeight(
+                                                        weight[qkvWeightName], qkvBias,
+                                                        devCopy, qkvScheme, 0, true),
+                                                    "Qwen3.5 ForwardGPU failed to split " + qkvWeightName + ".\n");
+                                    Data &zBias = GetThreadTensorParallelBias(
+                                        zWeightName + ".tp_bias");
+                                    devCopy = devices;
+                                    AssertInFastLLM(SplitMultiCudaWeight(
+                                                        weight[zWeightName], zBias,
+                                                        devCopy, zScheme, 0, true),
+                                                    "Qwen3.5 ForwardGPU failed to split " + zWeightName + ".\n");
+                                }
                                 DivisionScheme baScheme = BuildQwen35LinearBaScheme(
                                     valueScheme, num_v_heads);
                                 Data &baBias = GetThreadTensorParallelBias(baWeightName + ".tp_bias");
