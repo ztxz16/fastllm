@@ -40,9 +40,7 @@ class Qwen3CoderToolParser(ToolParser):
         self.current_tool_string_id: Optional[str] = None
         self.current_function_name: Optional[str] = None
         self.current_param_name: Optional[str] = None
-        self.current_param_value: str = ""
         self.param_count: int = 0
-        self.in_param: bool = False
         self.in_function: bool = False
         self.accumulated_text: str = ""
         self.json_started: bool = False
@@ -91,9 +89,7 @@ class Qwen3CoderToolParser(ToolParser):
         self.current_tool_string_id = None
         self.current_function_name = None
         self.current_param_name = None
-        self.current_param_value = ""
         self.param_count = 0
-        self.in_param = False
         self.in_function = False
         self.accumulated_text = ""
         self.json_started = False
@@ -431,6 +427,7 @@ class Qwen3CoderToolParser(ToolParser):
                                      len(self.tool_call_end_token)]
 
         # Looking for function header
+        header_just_sent = False
         if not self.header_sent:
             if self.tool_call_prefix in tool_text:
                 func_start = (tool_text.find(self.tool_call_prefix) +
@@ -456,56 +453,80 @@ class Qwen3CoderToolParser(ToolParser):
                             "arguments":
                             "{}",  # Placeholder, will be updated later
                         })
-
-                    # Send header with function info
-                    return DeltaMessage(tool_calls=[
-                        DeltaToolCall(
-                            index=self.current_tool_index,
-                            id=self.current_tool_string_id,
-                            function=DeltaFunctionCall(
-                                name=self.current_function_name, arguments=""),
-                            type="function",
-                        )
-                    ])
-            return None
+                    header_just_sent = True
+            if not header_just_sent:
+                return None
 
         # We've sent header, now handle function body
         if self.in_function:
-            # Send opening brace if not sent yet
-            if (not self.json_started
-                    and self.parameter_prefix not in delta_text):
-                self.json_started = True
-                return DeltaMessage(tool_calls=[
-                    DeltaToolCall(
-                        index=self.current_tool_index,
-                        function=DeltaFunctionCall(arguments="{"),
-                    )
-                ])
-
-            # Make sure json_started is set if we're processing parameters
+            # A speculative decoder can publish several accepted tokens in a
+            # single streaming delta.  In particular, the final
+            # ``</parameter>`` and ``</function>`` often arrive together.
+            # Build every newly completed argument before closing the JSON;
+            # the old one-boundary-per-delta state machine closed the object
+            # first and silently dropped the last parameter.
+            arguments_delta = ""
             if not self.json_started:
                 self.json_started = True
+                arguments_delta = "{"
 
-            # Check for function end in accumulated text
+            # Look for parameters
+            complete_params = tool_text.count(self.parameter_end_token)
+            if self.param_count < complete_params:
+                param_starts: list[int] = []
+                idx = 0
+                while True:
+                    idx = tool_text.find(self.parameter_prefix, idx)
+                    if idx == -1:
+                        break
+                    param_starts.append(idx)
+                    idx += len(self.parameter_prefix)
+
+                while (self.param_count < complete_params and
+                       self.param_count < len(param_starts)):
+                    param_idx = param_starts[self.param_count]
+                    param_start = param_idx + len(self.parameter_prefix)
+                    remaining = tool_text[param_start:]
+                    if ">" not in remaining:
+                        break
+                    name_end = remaining.find(">")
+                    self.current_param_name = remaining[:name_end]
+                    value_start = param_start + name_end + 1
+                    value_text = tool_text[value_start:]
+                    if value_text.startswith("\n"):
+                        value_text = value_text[1:]
+                    param_end_idx = value_text.find(
+                        self.parameter_end_token)
+                    if param_end_idx == -1:
+                        break
+                    param_value = value_text[:param_end_idx]
+                    if param_value.endswith("\n"):
+                        param_value = param_value[:-1]
+
+                    if self.param_count > 0:
+                        arguments_delta += ", "
+                    arguments_delta += (
+                        '"' + self.current_param_name + '": "' +
+                        json.dumps(param_value)[1:-1] + '"')
+                    self.param_count += 1
+
+            # Close only after all complete parameters in this delta have been
+            # serialized.  This ordering is the key speculative-streaming
+            # invariant.
             if not self.json_closed and self.function_end_token in tool_text:
-                # Close JSON
+                arguments_delta += "}"
                 self.json_closed = True
 
-                # Extract the complete tool call to update prev_tool_call_arr
-                # with final arguments. Find the function content
                 func_start = (tool_text.find(self.tool_call_prefix) +
                               len(self.tool_call_prefix))
                 func_content_end = tool_text.find(self.function_end_token,
                                                   func_start)
                 if func_content_end != -1:
                     func_content = tool_text[func_start:func_content_end]
-                    # Parse to get the complete arguments
                     try:
                         parsed_tool = self._parse_xml_function_call(
                             func_content, request.tools if request else None)
                         if parsed_tool:
-                            # Update existing entry in prev_tool_call_arr with
-                            # complete arguments
                             for i, tool in enumerate(self.prev_tool_call_arr):
                                 if (tool.get("name") ==
                                         parsed_tool.function.name):
@@ -515,145 +536,18 @@ class Qwen3CoderToolParser(ToolParser):
                     except Exception:
                         pass  # Ignore parsing errors during streaming
 
-                result = DeltaMessage(tool_calls=[
-                    DeltaToolCall(
-                        index=self.current_tool_index,
-                        function=DeltaFunctionCall(arguments="}"),
-                    )
-                ])
-
-                # Reset state for next tool
                 self.in_function = False
-                self.json_closed = True
 
-                return result
-
-            # Look for parameters
-            # Count how many complete parameters we have processed
-            complete_params = tool_text.count(self.parameter_end_token)
-
-            # Check if we should start a new parameter
-            if not self.in_param and self.param_count < complete_params:
-                # Find the unprocessed parameter
-                # Count parameter starts
-                param_starts = []
-                idx = 0
-                while True:
-                    idx = tool_text.find(self.parameter_prefix, idx)
-                    if idx == -1:
-                        break
-                    param_starts.append(idx)
-                    idx += len(self.parameter_prefix)
-
-                if len(param_starts) > self.param_count:
-                    # Process the next parameter
-                    param_idx = param_starts[self.param_count]
-                    param_start = param_idx + len(self.parameter_prefix)
-                    remaining = tool_text[param_start:]
-
-                    if ">" in remaining:
-                        # We have the complete parameter name
-                        name_end = remaining.find(">")
-                        self.current_param_name = remaining[:name_end]
-
-                        # Find the parameter value
-                        value_start = param_start + name_end + 1
-                        value_text = tool_text[value_start:]
-                        if value_text.startswith("\n"):
-                            value_text = value_text[1:]
-
-                        # Find where this parameter ends
-                        param_end_idx = value_text.find(
-                            self.parameter_end_token)
-                        if param_end_idx != -1:
-                            # Complete parameter found
-                            param_value = value_text[:param_end_idx]
-                            if param_value.endswith("\n"):
-                                param_value = param_value[:-1]
-
-                            # Build complete JSON fragment for this parameter
-                            if self.param_count == 0:
-                                json_fragment = (
-                                    '"' + self.current_param_name + '": "' +
-                                    json.dumps(param_value)[1:-1] + '"')
-                            else:
-                                json_fragment = (
-                                    ', "' + self.current_param_name + '": "' +
-                                    json.dumps(param_value)[1:-1] + '"')
-
-                            self.param_count += 1
-
-                            return DeltaMessage(tool_calls=[
-                                DeltaToolCall(
-                                    index=self.current_tool_index,
-                                    function=DeltaFunctionCall(
-                                        arguments=json_fragment),
-                                )
-                            ])
-
-            # Continue parameter value
-            if self.in_param:
-                if self.parameter_end_token in delta_text:
-                    # End of parameter
-                    end_idx = delta_text.find(self.parameter_end_token)
-                    value_chunk = delta_text[:end_idx]
-
-                    # Skip past > if at start
-                    if not self.current_param_value and ">" in value_chunk:
-                        gt_idx = value_chunk.find(">")
-                        value_chunk = value_chunk[gt_idx + 1:]
-
-                    if (not self.current_param_value
-                            and value_chunk.startswith("\n")):
-                        value_chunk = value_chunk[1:]
-
-                    # Calculate incremental JSON
-                    full_value = self.current_param_value + value_chunk
-                    prev_escaped = (json.dumps(self.current_param_value)[1:-1]
-                                    if self.current_param_value else "")
-                    full_escaped = json.dumps(full_value)[1:-1]
-                    delta_escaped = full_escaped[len(prev_escaped):]
-
-                    self.in_param = False
-                    self.current_param_value = ""
-
-                    return DeltaMessage(tool_calls=[
-                        DeltaToolCall(
-                            index=self.current_tool_index,
-                            function=DeltaFunctionCall(
-                                arguments=delta_escaped + '"'),
-                        )
-                    ])
-                else:
-                    # Continue accumulating value
-                    value_chunk = delta_text
-
-                    # Handle first chunk after param name
-                    if not self.current_param_value and ">" in value_chunk:
-                        gt_idx = value_chunk.find(">")
-                        value_chunk = value_chunk[gt_idx + 1:]
-
-                    if (not self.current_param_value
-                            and value_chunk.startswith("\n")):
-                        value_chunk = value_chunk[1:]
-
-                    if value_chunk:
-                        # Stream the escaped delta
-                        prev_escaped = (json.dumps(
-                            self.current_param_value)[1:-1]
-                                        if self.current_param_value else "")
-                        self.current_param_value += value_chunk
-                        full_escaped = json.dumps(
-                            self.current_param_value)[1:-1]
-                        delta_escaped = full_escaped[len(prev_escaped):]
-
-                        if delta_escaped:
-                            return DeltaMessage(tool_calls=[
-                                DeltaToolCall(
-                                    index=self.current_tool_index,
-                                    function=DeltaFunctionCall(
-                                        arguments=delta_escaped),
-                                )
-                            ])
+            if arguments_delta or header_just_sent:
+                function_delta = DeltaFunctionCall(
+                    arguments=arguments_delta)
+                tool_delta = DeltaToolCall(
+                    index=self.current_tool_index,
+                    function=function_delta)
+                if header_just_sent:
+                    tool_delta.id = self.current_tool_string_id
+                    tool_delta.type = "function"
+                    function_delta.name = self.current_function_name
+                return DeltaMessage(tool_calls=[tool_delta])
 
         return None
