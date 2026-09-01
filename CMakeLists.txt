@@ -588,11 +588,17 @@ else()
 add_library(fastllm OBJECT
             ${FASTLLM_CXX_SOURCES}
             ${FASTLLM_CUDA_SOURCES}
-            ${FASTLLM_CUDA_SM120_OBJECTS}
             ${FASTLLM_TFACC_SOURCES}
             ${FASTLLM_TOPS_SOURCES}
             )
 target_link_libraries(fastllm PUBLIC ${FASTLLM_LINKED_LIBS})
+if (FASTLLM_CUDA_SM120_SOURCES)
+    # Nested object-library sources are not propagated when an executable
+    # links an OBJECT target.  Publish the SM120 objects explicitly so every
+    # fastllm consumer gets the implementations referenced by the core code.
+    target_link_libraries(
+        fastllm INTERFACE $<TARGET_OBJECTS:fastllm_cuda_sm120>)
+endif()
 
 add_executable(main main.cpp)
 target_link_libraries(main fastllm)
