@@ -2763,7 +2763,7 @@ bool FastllmCudaQwen4QSASelect(
     return success;
 }
 
-bool FastllmCudaQwen4QSAAppendGraphOffset(
+bool FastllmCudaQwen4QSAAppendGraph(
         const fastllm::Data &rawKey,
         const fastllm::Data &position,
         const int32_t *decodeMeta, int tokenOffset,
@@ -2807,19 +2807,7 @@ bool FastllmCudaQwen4QSAAppendGraphOffset(
     return cudaGetLastError() == cudaSuccess;
 }
 
-bool FastllmCudaQwen4QSAAppendGraph(
-        const fastllm::Data &rawKey,
-        const fastllm::Data &position,
-        const int32_t *decodeMeta,
-        int compressRatio,
-        fastllm::Data &tailKeys,
-        fastllm::Data &tailPositions) {
-    return FastllmCudaQwen4QSAAppendGraphOffset(
-        rawKey, position, decodeMeta, 0, compressRatio,
-        tailKeys, tailPositions);
-}
-
-bool FastllmCudaQwen4QSACommitGraphOffset(
+bool FastllmCudaQwen4QSACommitGraph(
         const fastllm::Data &compressedKey,
         const int32_t *decodeMeta, int tokenOffset,
         int compressRatio,
@@ -2851,15 +2839,6 @@ bool FastllmCudaQwen4QSACommitGraphOffset(
         compressRatio, tokenOffset, capacity);
     DeviceSync();
     return cudaGetLastError() == cudaSuccess;
-}
-
-bool FastllmCudaQwen4QSACommitGraph(
-        const fastllm::Data &compressedKey,
-        const int32_t *decodeMeta,
-        int compressRatio,
-        fastllm::Data &compressedKeys) {
-    return FastllmCudaQwen4QSACommitGraphOffset(
-        compressedKey, decodeMeta, 0, compressRatio, compressedKeys);
 }
 
 bool FastllmCudaQwen4QSAAppendCompress4Graph(

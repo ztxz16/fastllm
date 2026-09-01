@@ -1224,6 +1224,8 @@ def make_normal_llm_model(args, startup_progress = None):
     if (hasattr(args, 'cuda_slab') and hasattr(llm, 'set_cuda_slab')):
         llm.set_cuda_slab(args.cuda_slab)
     os.environ["FASTLLM_QWEN35_ENABLE_MTP"] = str(mtp)
+    os.environ["FASTLLM_QWEN4_ENABLE_MTP"] = str(
+        mtp if is_qwen38_flash_next_model else 0)
     graph = None
     if (args.custom != ""):
         import importlib.util

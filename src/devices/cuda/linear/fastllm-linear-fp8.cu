@@ -5,6 +5,8 @@
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
 
+#include <cmath>
+#include <cstring>
 #include <cstdlib>
 #include <cuda_fp8.h>
 
@@ -141,6 +143,240 @@ bool FastllmCudaQuantizeLinearWeightFP8E4M3Block128(
         output.FreeSpace();
         return false;
     }
+    return true;
+}
+
+__device__ __forceinline__ uint8_t FastllmQuantizeNVFP4E2M1(float value) {
+    const float absolute = fabsf(value);
+    uint8_t magnitude;
+    if (absolute < 0.25f) {
+        magnitude = 0;
+    } else if (absolute < 0.75f) {
+        magnitude = 1;
+    } else if (absolute < 1.25f) {
+        magnitude = 2;
+    } else if (absolute < 1.75f) {
+        magnitude = 3;
+    } else if (absolute < 2.5f) {
+        magnitude = 4;
+    } else if (absolute < 3.5f) {
+        magnitude = 5;
+    } else if (absolute < 5.0f) {
+        magnitude = 6;
+    } else {
+        magnitude = 7;
+    }
+    return magnitude == 0 || value >= 0.0f
+        ? magnitude : (uint8_t)(magnitude | 8);
+}
+
+__device__ __forceinline__ float FastllmQuantizedNVFP4E2M1Value(
+        uint8_t value) {
+    float magnitude;
+    switch (value & 7) {
+        case 0: magnitude = 0.0f; break;
+        case 1: magnitude = 0.5f; break;
+        case 2: magnitude = 1.0f; break;
+        case 3: magnitude = 1.5f; break;
+        case 4: magnitude = 2.0f; break;
+        case 5: magnitude = 3.0f; break;
+        case 6: magnitude = 4.0f; break;
+        default: magnitude = 6.0f; break;
+    }
+    return (value & 8) != 0 ? -magnitude : magnitude;
+}
+
+template <typename T>
+__global__ void FastllmQuantizeLinearWeightNVFP4Block16Kernel(
+        const T *input, uint8_t *output, unsigned int *maximumScaleBits,
+        int columns, int packedRowBytes, int blocksPerRow,
+        int totalBlocks) {
+    constexpr int warpsPerBlock = 8;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    int tile = blockIdx.x * warpsPerBlock + warp;
+    const int tileStride = gridDim.x * warpsPerBlock;
+
+    for (; tile < totalBlocks; tile += tileStride) {
+        const int row = tile / blocksPerRow;
+        const int columnBlock = tile - row * blocksPerRow;
+        const int column = columnBlock * 16 + lane;
+        float value = lane < 16
+            ? FastllmFp8QuantLoad(
+                  input, (size_t)row * columns + column)
+            : 0.0f;
+        float localMaximum = lane < 16 ? fabsf(value) : 0.0f;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            localMaximum = fmaxf(
+                localMaximum,
+                __shfl_down_sync(0xffffffff, localMaximum, offset));
+        }
+        const float maximum =
+            __shfl_sync(0xffffffff, localMaximum, 0);
+        float scale = maximum > 0.0f ? maximum / 6.0f : 1.0f;
+        float bestError = INFINITY;
+#pragma unroll
+        for (int candidate = 0; candidate < 5; candidate++) {
+            const float divisor = 4.0f + 0.5f * candidate;
+            const float candidateScale =
+                maximum > 0.0f ? maximum / divisor : 1.0f;
+            const uint8_t candidateValue = lane < 16
+                ? FastllmQuantizeNVFP4E2M1(value / candidateScale) : 0;
+            const float difference = lane < 16
+                ? value - FastllmQuantizedNVFP4E2M1Value(
+                              candidateValue) * candidateScale
+                : 0.0f;
+            float error = difference * difference;
+#pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                error += __shfl_down_sync(0xffffffff, error, offset);
+            }
+            if (lane == 0 && error < bestError) {
+                bestError = error;
+                scale = candidateScale;
+            }
+        }
+        scale = __shfl_sync(0xffffffff, scale, 0);
+
+        // One least-squares update minimizes the block error for the chosen
+        // E2M1 assignments.  Requantization below handles assignments that
+        // move across a midpoint after this small scale correction.
+        const uint8_t initialValue = lane < 16
+            ? FastllmQuantizeNVFP4E2M1(value / scale) : 0;
+        const float level = lane < 16
+            ? FastllmQuantizedNVFP4E2M1Value(initialValue) : 0.0f;
+        float numerator = value * level;
+        float denominator = level * level;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            numerator += __shfl_down_sync(
+                0xffffffff, numerator, offset);
+            denominator += __shfl_down_sync(
+                0xffffffff, denominator, offset);
+        }
+        if (lane == 0 && denominator > 0.0f) {
+            scale = numerator / denominator;
+        }
+        scale = __shfl_sync(0xffffffff, scale, 0);
+
+        uint8_t *packedBlock =
+            output + (size_t)row * packedRowBytes +
+            (size_t)columnBlock * (8 + sizeof(float));
+        if (lane == 0) {
+            *reinterpret_cast<float *>(packedBlock + 8) = scale;
+            atomicMax(maximumScaleBits, __float_as_uint(scale));
+        }
+        const uint8_t quantized = lane < 16
+            ? FastllmQuantizeNVFP4E2M1(value / scale) : 0;
+        const uint8_t low = (uint8_t)__shfl_sync(
+            0xffffffff, (int)quantized, (lane & 7) * 2);
+        const uint8_t high = (uint8_t)__shfl_sync(
+            0xffffffff, (int)quantized, (lane & 7) * 2 + 1);
+        if (lane < 8) {
+            packedBlock[lane] = low | (uint8_t)(high << 4);
+        }
+    }
+}
+
+bool FastllmCudaQuantizeLinearWeightNVFP4Block16(
+        const fastllm::Data &input, fastllm::Data &output) {
+    if (input.dataDevice != fastllm::DataDevice::CUDA ||
+        input.cudaData == nullptr || input.dims.size() != 2 ||
+        input.dims[0] <= 0 || input.dims[1] <= 0 ||
+        input.dims[1] % 16 != 0 ||
+        (input.dataType != fastllm::DataType::FLOAT16 &&
+         input.dataType != fastllm::DataType::BFLOAT16) ||
+        input.dataDeviceIds.empty()) {
+        return false;
+    }
+
+    const int device = input.dataDeviceIds[0];
+    if (cudaSetDevice(device) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    output.FreeSpace();
+    output.dataType = fastllm::DataType::NVFP4_BLOCK_16;
+    output.blockK = 1;
+    output.blockM = 16;
+    output.UpdateUnitSize();
+    output.dataDevice = fastllm::DataDevice::CUDA;
+    output.dataDeviceIds = {device};
+    output.Resize(input.dims);
+    output.Allocate(false);
+    if (output.cudaData == nullptr) {
+        return false;
+    }
+
+    unsigned int *deviceMaximumScaleBits = nullptr;
+    cudaError_t state = cudaMalloc(
+        reinterpret_cast<void **>(&deviceMaximumScaleBits),
+        sizeof(unsigned int));
+    if (state == cudaSuccess) {
+        state = cudaMemset(deviceMaximumScaleBits, 0,
+                           sizeof(unsigned int));
+    }
+    if (state != cudaSuccess) {
+        if (deviceMaximumScaleBits != nullptr) {
+            cudaFree(deviceMaximumScaleBits);
+        }
+        output.FreeSpace();
+        cudaGetLastError();
+        return false;
+    }
+
+    const int rows = input.dims[0];
+    const int columns = input.dims[1];
+    const int blocksPerRow = columns / 16;
+    const int packedRowBytes =
+        blocksPerRow * (8 + (int)sizeof(float));
+    const int totalBlocks = rows * blocksPerRow;
+    cudaDeviceProp properties;
+    state = cudaGetDeviceProperties(&properties, device);
+    if (state == cudaSuccess) {
+        const int grid = std::max(
+            1, std::min(totalBlocks,
+                        properties.multiProcessorCount * 8));
+        if (input.dataType == fastllm::DataType::FLOAT16) {
+            FastllmQuantizeLinearWeightNVFP4Block16Kernel<<<grid, 256>>>(
+                (const half *)input.cudaData,
+                (uint8_t *)output.cudaData, deviceMaximumScaleBits,
+                columns, packedRowBytes, blocksPerRow, totalBlocks);
+        } else {
+            FastllmQuantizeLinearWeightNVFP4Block16Kernel<<<grid, 256>>>(
+                (const __nv_bfloat16 *)input.cudaData,
+                (uint8_t *)output.cudaData, deviceMaximumScaleBits,
+                columns, packedRowBytes, blocksPerRow, totalBlocks);
+        }
+        state = cudaGetLastError();
+    }
+
+    unsigned int maximumScaleBits = 0;
+    if (state == cudaSuccess) {
+        state = cudaMemcpy(
+            &maximumScaleBits, deviceMaximumScaleBits,
+            sizeof(unsigned int), cudaMemcpyDeviceToHost);
+    }
+    cudaFree(deviceMaximumScaleBits);
+    if (state != cudaSuccess) {
+        printf("Error: NVFP4 block16 weight quantization failed on "
+               "cuda:%d (%s).\n", device, cudaGetErrorString(state));
+        output.FreeSpace();
+        return false;
+    }
+
+    float maximumScale = 0.0f;
+    std::memcpy(&maximumScale, &maximumScaleBits,
+                sizeof(maximumScale));
+    // Dense NVFP4 Marlin represents each effective block scale relative to
+    // one tensor scale.  Choosing max(blockScale) / 128 keeps every relative
+    // scale in its supported exponent range; native kernels continue to use
+    // the exact inline float scales above.
+    output.scales = {
+        maximumScale > 0.0f && std::isfinite(maximumScale)
+            ? maximumScale / 128.0f : 1.0f};
+    output.IsRepacked = false;
     return true;
 }
 

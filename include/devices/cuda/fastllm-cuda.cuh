@@ -621,21 +621,14 @@ bool FastllmCudaQwen4QSASelect(const fastllm::Data &query,
 // Fixed-capacity decode helpers used while replaying a CUDA graph.  The
 // logical cache length lives in decodeMeta[0], so every kernel launch keeps
 // the same pointer, grid, and output shape across decode tokens.
-bool FastllmCudaQwen4QSAAppendGraphOffset(
+bool FastllmCudaQwen4QSAAppendGraph(
         const fastllm::Data &rawKey, const fastllm::Data &position,
         const int32_t *decodeMeta, int tokenOffset, int compressRatio,
         fastllm::Data &tailKeys, fastllm::Data &tailPositions);
-bool FastllmCudaQwen4QSAAppendGraph(
-        const fastllm::Data &rawKey, const fastllm::Data &position,
-        const int32_t *decodeMeta, int compressRatio,
-        fastllm::Data &tailKeys, fastllm::Data &tailPositions);
-bool FastllmCudaQwen4QSACommitGraphOffset(
+bool FastllmCudaQwen4QSACommitGraph(
         const fastllm::Data &compressedKey, const int32_t *decodeMeta,
         int tokenOffset, int compressRatio,
         fastllm::Data &compressedKeys);
-bool FastllmCudaQwen4QSACommitGraph(
-        const fastllm::Data &compressedKey, const int32_t *decodeMeta,
-        int compressRatio, fastllm::Data &compressedKeys);
 bool FastllmCudaQwen4QSAAppendCompress4Graph(
         const fastllm::Data &rawKeys,
         const fastllm::Data &positions,

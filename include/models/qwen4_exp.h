@@ -58,7 +58,9 @@ namespace fastllm {
     private:
         struct PrefixSnapshot;
         struct DecodeCudaGraphState;
+        struct MtpDraftCudaGraphState;
         struct QsaHostMirrorTransfer;
+        struct MtpRuntimeState;
 
         struct RequestState {
             int previousToken1 = -1;
@@ -95,6 +97,72 @@ namespace fastllm {
             // tensors borrow it. The next Forward detaches mutable tensors
             // with a device-to-device copy and releases this reference.
             std::shared_ptr<PrefixSnapshot> borrowedPrefixSnapshot;
+            // The one-layer MTP cache is request-local and is intentionally
+            // not persisted in target prefix snapshots.
+            std::shared_ptr<MtpRuntimeState> mtpState;
+            bool mtpDisabled = false;
+        };
+
+        struct RequestRuntimeCheckpoint {
+            int previousToken1 = -1;
+            int previousToken2 = -1;
+            std::vector<float> convHistory;
+            std::shared_ptr<Data> pleConvHistoryTensors[2];
+            int pleConvHistoryIndex = 0;
+            std::map<int, std::vector<float>> indexerRawKeys;
+            std::map<int, std::vector<float>> indexerPositions;
+            std::map<int, std::vector<float>> indexerBlockKeys;
+            std::map<int, int> indexerLengths;
+            std::map<int, std::shared_ptr<Data>> indexerTailKeyTensors;
+            std::map<int, std::shared_ptr<Data>> indexerTailPositionTensors;
+            std::map<int, std::shared_ptr<Data>> indexerBlockKeyTensors;
+            std::set<int> geometricCacheGrowthReadyLayers;
+            std::vector<int> processedTokens;
+        };
+
+        struct TargetRuntimeCheckpoint {
+            std::vector<int> keyLengths;
+            std::vector<int> valueLengths;
+            std::vector<Data> linearFirst;
+            std::vector<Data> linearSecond;
+            RequestRuntimeCheckpoint request;
+        };
+
+        struct TargetVerificationCapture {
+            std::vector<Data> linearConvInputs;
+            std::vector<Data> linearAlphas;
+            std::vector<Data> linearBetas;
+            // Non-owning destination for verifier-time recurrent outputs.
+            // The live caches remain the replay baseline while the existing
+            // checkpoint buffers provide stable CUDA graph output pointers.
+            TargetRuntimeCheckpoint *runtimeCheckpoint = nullptr;
+            std::vector<Data> linearReplayOutputs;
+            std::vector<Data> linearReplayCoreOutputs;
+            Data linearReplayPointerWorkspace;
+            std::vector<uint8_t> linearReplayPointerCache;
+            std::map<int, Data> qsaRawKeys;
+            Data pleInput;
+            Data greedyTokenIds;
+            Data greedyTokenValues;
+        };
+
+        struct MtpRuntimeState {
+            Data key;
+            Data value;
+            RequestState attentionState;
+            // Keep sampling outputs resident on CUDA across verifier cycles;
+            // the host reads only the compact token-id prefix.
+            Data sampledTokenIds;
+            Data sampledTokenValues;
+            std::shared_ptr<MtpDraftCudaGraphState> draftGraphState;
+            std::vector<int> proposals;
+            std::deque<int> pendingOutputTokens;
+            Data deferredTargetHidden;
+            int deferredPosition = -1;
+            bool hasDeferredTargetHidden = false;
+            TargetRuntimeCheckpoint targetCheckpoint;
+            bool targetCheckpointPrepared = false;
+            TargetVerificationCapture targetCapture;
         };
 
         struct PrefixLayerSnapshot {
@@ -180,8 +248,18 @@ namespace fastllm {
         std::vector<float> qsaSinValues;
         std::vector<float> qsaCosValues;
         std::map<int, std::vector<float>> qsaKeyNormValues;
+        std::vector<Data *> mtpMoeWeights;
+        std::vector<Data *> mtpMoeBiass;
+        // MTP only needs an approximate proposal distribution: target
+        // verification still uses the original lm_head and therefore keeps
+        // the generated token stream exact.  A packed FP8 copy cuts the three
+        // bandwidth-bound draft head scans in half on supported CUDA models.
+        Data mtpDraftLmHeadWeight;
+        bool mtpDraftLmHeadReady = false;
+        bool mtpDraftLmHeadAttempted = false;
 
         void PrepareWeights();
+        void PrepareMtpDraftLmHeadWeight();
         bool IsLinearAttentionLayer(int layer) const;
 
         void GroupedRMSNorm(const Data &input, Data &normWeight, Data &output);
@@ -199,13 +277,17 @@ namespace fastllm {
                                  Data &normalized);
 
         void RunPLE(const Data &hyperInput, const Data &inputIds,
-                    RequestState &state, Data &output);
+                    RequestState &state, Data &output,
+                    const std::vector<int> *hostInputTokens = nullptr);
         void MaterializePLEHostHistory(RequestState &state);
-        void BuildQSAMask(int layer, const Data &input,
+        void BuildQSAMask(int layer, const std::string &attentionPrefix,
+                          const Data &input,
                           const Data &baseMask, const Data &positionIds,
                           int previousLength, bool deviceCompatibleMask,
                           RequestState &state,
-                          Data &qsaMask, Data &qsaIndices);
+                          Data &qsaMask, Data &qsaIndices,
+                          Data *rawKeyCapture = nullptr,
+                          bool fixedCausalWidth = false);
         void MaterializeQsaHostHistory(int layer, int length,
                                        RequestState &state);
         void RunFullAttention(int layer, const Data &input,
@@ -213,11 +295,88 @@ namespace fastllm {
                               const Data &positionIds,
                               bool qsaDeviceCompatibleMask,
                               Data &pastKey, Data &pastValue,
-                              RequestState &state, Data &output);
+                              RequestState &state, Data &output,
+                              Data *qsaRawKeyCapture = nullptr);
+        void RunFullAttentionWithPrefix(
+                              int stateLayer,
+                              const std::string &attentionPrefix,
+                              const Data &input,
+                              const Data &attentionMask,
+                              const Data &positionIds,
+                              bool qsaDeviceCompatibleMask,
+                              Data &pastKey, Data &pastValue,
+                              RequestState &state, Data &output,
+                              Data *qsaRawKeyCapture = nullptr);
         void RunLinearAttention(int layer, const Data &input,
                                 Data &pastConv, Data &pastRecurrent,
-                                Data &output);
+                                Data &output,
+                                Data *convInputCapture = nullptr,
+                                Data *alphaCapture = nullptr,
+                                Data *betaCapture = nullptr,
+                                Data *recurrentStateOutput = nullptr);
         void RunMoE(int layer, const Data &input, Data &output);
+        void RunMoEWithPrefix(int deviceLayer,
+                              const std::string &mlpPrefix,
+                              std::vector<Data *> &moeWeights,
+                              std::vector<Data *> &moeBiass,
+                              const Data &input, Data &output);
+
+        bool HasMtpWeights() const;
+        bool MtpSupportsGenerationConfig(
+            const GenerationConfig &generationConfig) const;
+        int RunMtpDraft(MtpRuntimeState &state,
+                        const Data &targetHiddenStates,
+                        const std::vector<int> &inputTokens,
+                        const std::vector<int> &positions,
+                        Data *nextMultiHidden,
+                        bool sampleToken,
+                        const Data *deviceTokenIds = nullptr,
+                        Data *sampledTokenIds = nullptr,
+                        Data *sampledTokenValues = nullptr,
+                        int sampledTokenOffset = 0);
+        void CaptureRequestRuntimeCheckpoint(
+            RequestState &state,
+            const std::map<int, int> &qsaLengths,
+            RequestRuntimeCheckpoint &checkpoint);
+        void RestoreRequestRuntimeCheckpoint(
+            RequestState &state,
+            const RequestRuntimeCheckpoint &checkpoint,
+            bool restoreQsa = true);
+        void CaptureTargetRuntimeCheckpoint(
+            std::vector<std::pair<Data, Data>> &pastKeyValues,
+            RequestState &state,
+            TargetRuntimeCheckpoint &checkpoint,
+            bool synchronize = true,
+            bool captureLinearRecurrent = true);
+        void CommitTargetRecurrentState(
+            std::vector<std::pair<Data, Data>> &pastKeyValues,
+            const TargetRuntimeCheckpoint &checkpoint);
+        void CommitTargetVerificationPrefix(
+            const Data &candidateIds,
+            const Data &candidatePositionIds,
+            const std::vector<int> &candidateTokens,
+            int committedInputs,
+            std::vector<std::pair<Data, Data>> &pastKeyValues,
+            RequestState &state,
+            const TargetRuntimeCheckpoint &checkpoint,
+            TargetVerificationCapture &capture);
+        std::vector<int> ForwardTarget(
+            int batch,
+            const Data &inputIds,
+            const Data &attentionMask,
+            const Data &positionIds,
+            std::vector<std::pair<Data, Data>> &pastKeyValues,
+            const GenerationConfig &generationConfig,
+            const LastTokensManager &lastTokens,
+            std::vector<std::vector<float> *> *logits,
+            Data *targetMultiHidden,
+            std::vector<int> *allGreedyTokens,
+            TargetVerificationCapture *verificationCapture,
+            bool recordPrefixSnapshot,
+            bool allowDecodeCudaGraph,
+            bool decodeEquivalentGdn,
+            const std::vector<int> *hostInputTokens = nullptr,
+            bool materializeCausalMaskOnGraphFallback = false);
 
         bool TryRunDecodeCudaGraphBackbone(
             int graphStartLayer,
@@ -230,7 +389,9 @@ namespace fastllm {
             bool qsaDeviceCompatibleMask,
             std::vector<std::pair<Data, Data>> &pastKeyValues,
             RequestState &requestState,
-            Data &logits);
+            Data &logits,
+            Data *targetMultiHidden,
+            TargetVerificationCapture *verificationCapture);
 
         std::shared_ptr<PrefixSnapshot> FindPrefixSnapshotLocked(
             const std::vector<int> &tokens, int maxCachedLen,
