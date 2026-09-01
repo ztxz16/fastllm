@@ -207,17 +207,6 @@ __device__ __forceinline__ __nv_bfloat16 CustomArDowncast<__nv_bfloat16>(float v
     return __float2bfloat16(v);
 }
 
-__device__ __forceinline__ void CustomArStoreVolatile(CustomArFlag *ptr,
-                                                       CustomArFlag value) {
-    asm volatile("st.volatile.global.u32 [%1], %0;" :: "r"(value), "l"(ptr));
-}
-
-__device__ __forceinline__ CustomArFlag CustomArLoadVolatile(CustomArFlag *ptr) {
-    CustomArFlag value;
-    asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(value) : "l"(ptr));
-    return value;
-}
-
 __device__ __forceinline__ void CustomArStoreRelease(CustomArFlag *ptr,
                                                       CustomArFlag value) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
@@ -233,7 +222,7 @@ __device__ __forceinline__ CustomArFlag CustomArLoadAcquire(CustomArFlag *ptr) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
     asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(value) : "l"(ptr));
 #else
-    asm volatile("ld.volatile.global.u32 %0, [%1]; membar.gl;" :
+    asm volatile("ld.volatile.global.u32 %0, [%1]; membar.sys;" :
                  "=r"(value) : "l"(ptr));
 #endif
     return value;
@@ -245,9 +234,14 @@ __device__ __forceinline__ void CustomArBarrierStart(
         int rank) {
     CustomArFlag next = self->flag[blockIdx.x] + 1;
     if (threadIdx.x < Ranks) {
-        CustomArStoreVolatile(
+        // Publishing the start flag also publishes every rank-local input
+        // write queued before this collective.  Plain volatile accesses only
+        // constrain the issuing GPU and are not a cross-device memory-order
+        // primitive, which allowed a skewed CUDA Graph replay to observe the
+        // flag before the peer input was globally visible.
+        CustomArStoreRelease(
             &allSignals.signals[threadIdx.x]->start[blockIdx.x][rank], next);
-        while (CustomArLoadVolatile(
+        while (CustomArLoadAcquire(
                    &self->start[blockIdx.x][threadIdx.x]) != next) {
         }
     }
@@ -257,9 +251,11 @@ __device__ __forceinline__ void CustomArBarrierStart(
     }
 }
 
-// The final barrier only prevents in-place overwrite while peers are still
-// reading. Keep this byte-for-byte equivalent to the original fast volatile
-// handshake used by decode-sized one-stage reductions.
+// The final barrier prevents in-place overwrite or allocator reuse while a
+// peer is still reading.  It therefore needs the same system-scope ordering as
+// the publish barrier: a peer's completion flag must become visible only after
+// all of its reads have completed, and observing that flag must precede the
+// local overwrite.
 template <int Ranks>
 __device__ __forceinline__ void CustomArBarrierFinal(
         const CustomArRankSignals &allSignals, CustomArSignal *self,
@@ -267,9 +263,9 @@ __device__ __forceinline__ void CustomArBarrierFinal(
     __syncthreads();
     CustomArFlag next = self->flag[blockIdx.x] + 1;
     if (threadIdx.x < Ranks) {
-        CustomArStoreVolatile(
+        CustomArStoreRelease(
             &allSignals.signals[threadIdx.x]->end[blockIdx.x][rank], next);
-        while (CustomArLoadVolatile(
+        while (CustomArLoadAcquire(
                    &self->end[blockIdx.x][threadIdx.x]) != next) {
         }
     }
