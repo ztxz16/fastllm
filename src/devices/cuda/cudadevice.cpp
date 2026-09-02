@@ -26,6 +26,7 @@
 
 #if !defined(_WIN32) && !defined(USE_ROCM)
 #include <arpa/inet.h>
+#include <dlfcn.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -1071,6 +1072,21 @@ namespace fastllm {
         if (script != nullptr && script[0] != '\0') {
             return CudaTritonExpandUser(script);
         }
+        static const int libraryAnchor = 0;
+        Dl_info libraryInfo = {};
+        if (dladdr(&libraryAnchor, &libraryInfo) != 0 &&
+            libraryInfo.dli_fname != nullptr) {
+            std::string libraryPath = libraryInfo.dli_fname;
+            size_t slash = libraryPath.find_last_of('/');
+            if (slash != std::string::npos) {
+                std::string installedScript = CudaTritonJoinPath(
+                    libraryPath.substr(0, slash),
+                    "fastllm_triton_server.py");
+                if (CudaTritonFileExists(installedScript)) {
+                    return installedScript;
+                }
+            }
+        }
         std::string sourceScript = CudaTritonJoinPath(FASTLLM_SOURCE_DIR, "tools/fastllm_triton_server.py");
         if (CudaTritonFileExists(sourceScript)) {
             return sourceScript;
@@ -1169,6 +1185,13 @@ namespace fastllm {
         static std::mutex mutex;
         static int state = -1;
         std::lock_guard<std::mutex> guard(mutex);
+        if (state == 0) {
+            if (CudaTritonServerHealthy()) {
+                state = 1;
+                return true;
+            }
+            return false;
+        }
         if (state == 1 && CudaTritonServerHealthy()) {
             return true;
         }
