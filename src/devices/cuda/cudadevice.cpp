@@ -5445,9 +5445,13 @@ namespace fastllm {
         Data &weight = *datas.find("weight")->second;
         Data &state = *datas.find("state")->second;
         const int kernel = intParams.find("kernel")->second;
+        auto outputTypeIt = intParams.find("outputType");
+        const DataType outputType = outputTypeIt == intParams.end()
+            ? DataType::FLOAT32 : (DataType)outputTypeIt->second;
         if (!CudaQwen4ActivationType(input.dataType) ||
             weight.dataType != DataType::FLOAT32 ||
             state.dataType != DataType::FLOAT32 || kernel <= 0 ||
+            !CudaQwen4ActivationType(outputType) ||
             input.dims.size() != 3 || input.dims[1] <= 0) {
             return false;
         }

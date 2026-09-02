@@ -4193,10 +4193,19 @@ namespace fastllm {
     void CausalDepthwiseConv1DPrefill(const Data &input, const Data &weight,
                                       Data &state, int kernel, bool silu,
                                       Data &output) {
+        CausalDepthwiseConv1DPrefill(
+            input, weight, state, kernel, silu,
+            output, DataType::FLOAT32);
+    }
+
+    void CausalDepthwiseConv1DPrefill(const Data &input, const Data &weight,
+                                      Data &state, int kernel, bool silu,
+                                      Data &output, DataType outputType) {
         curExecutor->Run("CausalDepthwiseConv1DPrefill", {
                 {"input", (Data*)&input}, {"weight", (Data*)&weight},
                 {"state", &state}, {"output", &output}
-        }, {}, {{"kernel", kernel}, {"silu", silu ? 1 : 0}});
+        }, {}, {{"kernel", kernel}, {"silu", silu ? 1 : 0},
+                {"outputType", (int)outputType}});
     }
 
     void Conv2D(const Data &input, Data &weight, Data &bias, int inputChannels, int outputChannels, int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, Data &output) {

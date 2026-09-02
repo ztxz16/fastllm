@@ -88,6 +88,22 @@ namespace fastllm {
             }
         }
 
+        uint16_t Qwen4FloatToHalfRz(float value) {
+            uint16_t result = float_to_half(value);
+            if (!std::isfinite(value)) {
+                return result;
+            }
+            const float rounded = half_to_float(result);
+            // float_to_half uses nearest rounding. Move one representable
+            // value toward zero only when it rounded away from the input.
+            // This matches FastllmCudaFloat2HalfKernel's __float2half_rz.
+            if (std::fabs(rounded) > std::fabs(value) &&
+                (result & 0x7fff) != 0) {
+                result--;
+            }
+            return result;
+        }
+
         float Qwen4RoundCpu(float value, DataType type) {
             if (type == DataType::FLOAT16) {
                 return half_to_float(float_to_half(value));
@@ -1082,7 +1098,13 @@ namespace fastllm {
                 state.dims == std::vector<int>({batch, channels, kernel}),
                 "CausalDepthwiseConv1DPrefill state shape mismatch.\n");
         }
-        output.dataType = DataType::FLOAT32;
+        auto outputTypeIt = intParams.find("outputType");
+        const DataType outputType = outputTypeIt == intParams.end()
+            ? DataType::FLOAT32 : (DataType)outputTypeIt->second;
+        AssertInFastLLM(Qwen4ActivationType(outputType),
+                        "CausalDepthwiseConv1DPrefill output type is invalid.\n");
+        output.dataType = outputType;
+        output.UpdateUnitSize();
         output.Resize(input.dims);
     }
 
@@ -1114,7 +1136,6 @@ namespace fastllm {
         const int sequence = input.dims[1];
         const int channels = input.dims[2];
         const float *weightData = (const float*)weight.cpuData;
-        float *outputData = (float*)output.cpuData;
         const int total = batch * sequence * channels;
         Qwen4ParallelFor(total, [&](int start, int end) {
             for (int item = start; item < end; item++) {
@@ -1143,7 +1164,13 @@ namespace fastllm {
                     // amplifies sub-ULP convolution differences.
                     value = value / (1.0 + expf(-value));
                 }
-                outputData[item] = value;
+                if (output.dataType == DataType::FLOAT16) {
+                    ((uint16_t*)output.cpuData)[item] =
+                        Qwen4FloatToHalfRz(value);
+                } else {
+                    Qwen4StoreCpu(output.cpuData, output.dataType,
+                                  (uint64_t)item, value);
+                }
             }
         });
 

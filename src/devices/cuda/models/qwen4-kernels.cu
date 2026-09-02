@@ -50,6 +50,42 @@ namespace {
         return __float2bfloat16_rn(value);
     }
 
+    // Match the public ToDataType conversion kernels. In particular,
+    // FastllmCudaFloat2HalfKernel uses round-toward-zero, which is observable
+    // when the converted activation feeds the recurrent GDN.
+    template <typename T>
+    __device__ __forceinline__ T Qwen4CudaCastFromFloat(float value);
+
+    template <>
+    __device__ __forceinline__ float Qwen4CudaCastFromFloat<float>(
+            float value) {
+        return value;
+    }
+
+    template <>
+    __device__ __forceinline__ half Qwen4CudaCastFromFloat<half>(float value) {
+        return __float2half_rz(value);
+    }
+
+    template <>
+    __device__ __forceinline__ __nv_bfloat16
+    Qwen4CudaCastFromFloat<__nv_bfloat16>(float value) {
+        return __float2bfloat16_rn(value);
+    }
+
+    __device__ __forceinline__ void Qwen4CudaStoreCast(
+            void *data, int type, uint64_t index, float value) {
+        if (type == (int)fastllm::DataType::FLOAT32) {
+            ((float*)data)[index] = value;
+        } else if (type == (int)fastllm::DataType::FLOAT16) {
+            ((half*)data)[index] =
+                Qwen4CudaCastFromFloat<half>(value);
+        } else {
+            ((__nv_bfloat16*)data)[index] =
+                Qwen4CudaCastFromFloat<__nv_bfloat16>(value);
+        }
+    }
+
     template <typename T>
     __device__ __forceinline__ float Qwen4CudaRound(float value) {
         return Qwen4CudaToFloat(Qwen4CudaFromFloat<T>(value));
@@ -812,10 +848,10 @@ namespace {
         output[item] = value;
     }
 
-    template <typename T>
+    template <typename T, typename OutputT>
     __global__ void CausalDepthwiseConv1DPrefillKernel(
             const T *input, const float *weight, const float *state,
-            float *output, uint64_t total, int sequence, int channels,
+            OutputT *output, uint64_t total, int sequence, int channels,
             int kernel, bool silu) {
         for (uint64_t item = (uint64_t)blockIdx.x * blockDim.x +
                              threadIdx.x;
@@ -841,7 +877,7 @@ namespace {
                 // Keep bitwise parity with FastllmSiluKernel(float).
                 value = value / (1.0 + expf(-value));
             }
-            output[item] = value;
+            output[item] = Qwen4CudaCastFromFloat<OutputT>(value);
         }
     }
 
@@ -872,6 +908,50 @@ namespace {
                         ((uint64_t)batch * sequence + token) * channels +
                             channel]);
             }
+        }
+    }
+
+    template <typename InputT, typename OutputT>
+    void Qwen4LaunchCausalDepthwiseConv1DPrefill(
+            const fastllm::Data &input, const fastllm::Data &weight,
+            fastllm::Data &state, fastllm::Data &output,
+            uint64_t outputCount, int outputBlocks,
+            int stateItems, int stateBlocks,
+            int sequence, int channels, int kernel, bool silu) {
+        constexpr int threads = 256;
+        CausalDepthwiseConv1DPrefillKernel<InputT, OutputT><<<
+            outputBlocks, threads, 0, cudaStreamPerThread>>>(
+                (const InputT*)input.cudaData,
+                (const float*)weight.cudaData,
+                (const float*)state.cudaData, (OutputT*)output.cudaData,
+                outputCount, sequence, channels, kernel, silu);
+        CausalDepthwiseConv1DPrefillStateKernel<<<
+            stateBlocks, threads, 0, cudaStreamPerThread>>>(
+                (const InputT*)input.cudaData, (float*)state.cudaData,
+                stateItems, sequence, channels, kernel);
+    }
+
+    template <typename InputT>
+    void Qwen4DispatchCausalDepthwiseConv1DPrefillOutput(
+            const fastllm::Data &input, const fastllm::Data &weight,
+            fastllm::Data &state, fastllm::Data &output,
+            uint64_t outputCount, int outputBlocks,
+            int stateItems, int stateBlocks,
+            int sequence, int channels, int kernel, bool silu) {
+        if (output.dataType == fastllm::DataType::FLOAT32) {
+            Qwen4LaunchCausalDepthwiseConv1DPrefill<InputT, float>(
+                input, weight, state, output, outputCount, outputBlocks,
+                stateItems, stateBlocks, sequence, channels, kernel, silu);
+        } else if (output.dataType == fastllm::DataType::FLOAT16) {
+            Qwen4LaunchCausalDepthwiseConv1DPrefill<InputT, half>(
+                input, weight, state, output, outputCount, outputBlocks,
+                stateItems, stateBlocks, sequence, channels, kernel, silu);
+        } else {
+            Qwen4LaunchCausalDepthwiseConv1DPrefill<
+                InputT, __nv_bfloat16>(
+                    input, weight, state, output, outputCount,
+                    outputBlocks, stateItems, stateBlocks,
+                    sequence, channels, kernel, silu);
         }
     }
 
@@ -3541,7 +3621,7 @@ bool FastllmCudaCausalDepthwiseConv1DPrefill(
         !Qwen4CudaActivationType(input.dataType) ||
         weight.dataType != fastllm::DataType::FLOAT32 ||
         state.dataType != fastllm::DataType::FLOAT32 ||
-        output.dataType != fastllm::DataType::FLOAT32 ||
+        !Qwen4CudaActivationType(output.dataType) ||
         batch <= 0 || sequence <= 0 || channels <= 0 || kernel <= 0 ||
         input.dims.size() != 3 ||
         weight.Count(0) != (uint64_t)channels * kernel ||
@@ -3559,39 +3639,17 @@ bool FastllmCudaCausalDepthwiseConv1DPrefill(
     const int stateItems = batch * channels;
     const int stateBlocks = (stateItems + threads - 1) / threads;
     if (input.dataType == fastllm::DataType::FLOAT32) {
-        CausalDepthwiseConv1DPrefillKernel<<<
-            outputBlocks, threads, 0, cudaStreamPerThread>>>(
-                (const float*)input.cudaData,
-                (const float*)weight.cudaData,
-                (const float*)state.cudaData, (float*)output.cudaData,
-                outputCount, sequence, channels, kernel, silu);
-        CausalDepthwiseConv1DPrefillStateKernel<<<
-            stateBlocks, threads, 0, cudaStreamPerThread>>>(
-                (const float*)input.cudaData, (float*)state.cudaData,
-                stateItems, sequence, channels, kernel);
+        Qwen4DispatchCausalDepthwiseConv1DPrefillOutput<float>(
+            input, weight, state, output, outputCount, outputBlocks,
+            stateItems, stateBlocks, sequence, channels, kernel, silu);
     } else if (input.dataType == fastllm::DataType::FLOAT16) {
-        CausalDepthwiseConv1DPrefillKernel<<<
-            outputBlocks, threads, 0, cudaStreamPerThread>>>(
-                (const half*)input.cudaData,
-                (const float*)weight.cudaData,
-                (const float*)state.cudaData, (float*)output.cudaData,
-                outputCount, sequence, channels, kernel, silu);
-        CausalDepthwiseConv1DPrefillStateKernel<<<
-            stateBlocks, threads, 0, cudaStreamPerThread>>>(
-                (const half*)input.cudaData, (float*)state.cudaData,
-                stateItems, sequence, channels, kernel);
+        Qwen4DispatchCausalDepthwiseConv1DPrefillOutput<half>(
+            input, weight, state, output, outputCount, outputBlocks,
+            stateItems, stateBlocks, sequence, channels, kernel, silu);
     } else {
-        CausalDepthwiseConv1DPrefillKernel<<<
-            outputBlocks, threads, 0, cudaStreamPerThread>>>(
-                (const __nv_bfloat16*)input.cudaData,
-                (const float*)weight.cudaData,
-                (const float*)state.cudaData, (float*)output.cudaData,
-                outputCount, sequence, channels, kernel, silu);
-        CausalDepthwiseConv1DPrefillStateKernel<<<
-            stateBlocks, threads, 0, cudaStreamPerThread>>>(
-                (const __nv_bfloat16*)input.cudaData,
-                (float*)state.cudaData,
-                stateItems, sequence, channels, kernel);
+        Qwen4DispatchCausalDepthwiseConv1DPrefillOutput<__nv_bfloat16>(
+            input, weight, state, output, outputCount, outputBlocks,
+            stateItems, stateBlocks, sequence, channels, kernel, silu);
     }
     DeviceSync();
     return cudaGetLastError() == cudaSuccess;

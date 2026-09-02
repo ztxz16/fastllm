@@ -4629,6 +4629,8 @@ namespace {
                 params.Add("kernel", "4", "convolution taps");
                 params.Add("with_history", "1", "seed a nonzero prior state");
                 params.Add("silu", "1", "apply SiLU to convolution output");
+                params.Add("output_half", "0",
+                           "store output directly as float16");
                 return params;
             },
             [](const OpTestParams &params, const std::string &device) {
@@ -4648,8 +4650,12 @@ namespace {
                     device, "CausalDepthwiseConv1DPrefill",
                     {{"input", &input}, {"weight", &weight},
                      {"state", &state}, {"output", &output}},
-                    {}, {{"kernel", kernel},
-                         {"silu", params.GetInt("silu")}});
+                    {},
+                    {{"kernel", kernel},
+                     {"silu", params.GetInt("silu")},
+                     {"outputType", params.GetInt("output_half")
+                          ? (int)fastllm::DataType::FLOAT16
+                          : (int)fastllm::DataType::FLOAT32}});
             },
             [](const OpTestParams &params, const std::string &device) {
                 const int batch = params.GetInt("batch");
@@ -4667,11 +4673,17 @@ namespace {
                 ScopedFirstDevice guard(device);
                 fastllm::CausalDepthwiseConv1DPrefill(
                     input, weight, state, kernel,
-                    params.GetInt("silu") != 0, output);
+                    params.GetInt("silu") != 0, output,
+                    params.GetInt("output_half")
+                        ? fastllm::DataType::FLOAT16
+                        : fastllm::DataType::FLOAT32);
                 output.Reshape({(int)output.Count(0)});
                 state.Reshape({(int)state.Count(0)});
+                fastllm::Data floatOutput;
+                fastllm::ToDataType(
+                    output, floatOutput, fastllm::DataType::FLOAT32);
                 fastllm::Data combined;
-                fastllm::Cat(output, state, 0, combined);
+                fastllm::Cat(floatOutput, state, 0, combined);
                 combined.ToDevice(fastllm::DataDevice::CPU);
                 return combined;
             },
@@ -4686,6 +4698,10 @@ namespace {
                 const int channels = params.GetInt("channels");
                 const int kernel = params.GetInt("kernel");
                 const bool silu = params.GetInt("silu") != 0;
+                const fastllm::DataType outputType =
+                    params.GetInt("output_half")
+                        ? fastllm::DataType::FLOAT16
+                        : fastllm::DataType::FLOAT32;
                 auto input = std::make_shared<fastllm::Data>(MakeTensor(
                     {batch, sequence, channels}, 0.23f, 0.2f));
                 auto weight = std::make_shared<fastllm::Data>(MakeTensor(
@@ -4693,7 +4709,7 @@ namespace {
                 auto state = std::make_shared<fastllm::Data>(MakeTensor(
                     {batch, channels, kernel}, 0.97f, 0.2f));
                 auto output = std::make_shared<fastllm::Data>(
-                    fastllm::DataType::FLOAT32,
+                    outputType,
                     std::vector<int>({batch, sequence, channels}));
                 input->ToDevice(fastllm::DataDevice::CUDA);
                 weight->ToDevice(fastllm::DataDevice::CUDA);
@@ -4719,8 +4735,11 @@ namespace {
                 const double sequence = params.GetInt("sequence");
                 const double channels = params.GetInt("channels");
                 const double kernel = params.GetInt("kernel");
+                const double outputBytes = params.GetInt("output_half")
+                    ? sizeof(uint16_t) : sizeof(float);
                 return batch * channels *
-                       (2.0 * sequence + 2.0 * kernel) * sizeof(float) +
+                       (sequence * (sizeof(float) + outputBytes) +
+                        2.0 * kernel * sizeof(float)) +
                        channels * kernel * sizeof(float);
             },
             [](const OpTestParams &params) {

@@ -3653,15 +3653,10 @@ namespace fastllm {
             // Split + SiLU chain and updates the four-value history in place.
             fastllm::CausalDepthwiseConv1DPrefill(
                 qkv, this->weight[linear + "conv1d.weight"],
-                pastConv, this->linearConvKernel, true, currentConvolved);
+                pastConv, this->linearConvKernel, true, currentConvolved,
+                mixedGdnPrefill
+                    ? DataType::FLOAT16 : DataType::FLOAT32);
             pastConv.expansionDims = pastConv.dims;
-            if (mixedGdnPrefill) {
-                // The convolution accumulates into float32 alongside its
-                // float32 history.  Round only its token activations before
-                // the standard mixed GDN, matching Qwen3.5/vLLM-style
-                // activation precision without lowering cache precision.
-                ToDataType(currentConvolved, DataType::FLOAT16);
-            }
         }
 
         if (pastRecurrent.dims.empty()) {
