@@ -7689,7 +7689,7 @@ namespace fastllm {
                 batch, inputIds, attentionMask, positionIds,
                 pastKeyValues, generationConfig, lastTokens, retLogits,
                 &targetHidden, nullptr, nullptr,
-                true, false, false);
+                false, false, false);
 
             const std::vector<int> ids = dataToInts(inputIds);
             const std::vector<int> currentPositions =
@@ -7750,6 +7750,11 @@ namespace fastllm {
                         mtp, pairedHidden, mtpTokens, mtpPositions,
                         nullptr, false);
                 }
+                // Prefix snapshot materialization can synchronize and
+                // rematerialize target recurrent state.  Keep it after the
+                // independent draft state has consumed this prompt chunk so
+                // snapshot bookkeeping cannot perturb prompt alignment.
+                MaybeRecordPrefixSnapshot(pastKeyValues, *requestState);
                 return result;
             }
 
@@ -7764,6 +7769,7 @@ namespace fastllm {
             // starts verification on a later host worker.
             ForceDeviceSync();
 #endif
+            MaybeRecordPrefixSnapshot(pastKeyValues, *requestState);
             return result;
         }
 
