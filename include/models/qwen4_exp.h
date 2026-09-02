@@ -97,8 +97,10 @@ namespace fastllm {
             // tensors borrow it. The next Forward detaches mutable tensors
             // with a device-to-device copy and releases this reference.
             std::shared_ptr<PrefixSnapshot> borrowedPrefixSnapshot;
-            // The one-layer MTP cache is request-local and is intentionally
-            // not persisted in target prefix snapshots.
+            // The one-layer MTP cache is request-local. Prefix snapshots keep
+            // a compact, independently owned copy only when it is aligned at
+            // the token boundary immediately preceding the deferred target
+            // hidden state.
             std::shared_ptr<MtpRuntimeState> mtpState;
             bool mtpDisabled = false;
         };
@@ -326,6 +328,8 @@ namespace fastllm {
         bool HasMtpWeights() const;
         bool MtpSupportsGenerationConfig(
             const GenerationConfig &generationConfig) const;
+        std::shared_ptr<MtpRuntimeState> CloneMtpPrefixState(
+            const MtpRuntimeState &source, int cachedLen) const;
         int RunMtpDraft(MtpRuntimeState &state,
                         const Data &targetHiddenStates,
                         const std::vector<int> &inputTokens,
@@ -399,6 +403,9 @@ namespace fastllm {
         std::shared_ptr<PrefixSnapshot> FindPrefixSnapshotLocked(
             const std::vector<int> &tokens, int maxCachedLen,
             int exactLen = -1) const;
+        bool ShouldRecordPrefixSnapshot(
+            const std::vector<std::pair<Data, Data>> &pastKeyValues,
+            const RequestState &state, int &cachedLen) const;
         void MaybeRecordPrefixSnapshot(
             const std::vector<std::pair<Data, Data>> &pastKeyValues,
             RequestState &state);

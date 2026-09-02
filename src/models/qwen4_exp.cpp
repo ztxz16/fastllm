@@ -4159,6 +4159,171 @@ namespace fastllm {
             }
         }
 
+        bool Qwen4CopyCompactCacheTensor(
+                const Data &source, Data &destination,
+                bool allowEmpty = false) {
+            if (source.dims.empty() || source.Count(0) == 0) {
+                destination = Data();
+                return allowEmpty;
+            }
+            if (source.multiDeviceData ||
+                (source.dataDevice == DataDevice::CUDA &&
+                 source.cudaData == nullptr) ||
+                (source.dataDevice == DataDevice::CPU &&
+                 source.cpuData == nullptr)) {
+                return false;
+            }
+#ifdef USE_CUDA
+            Qwen4CudaDeviceGuard deviceGuard(
+                source.dataDevice == DataDevice::CUDA
+                    ? source.dataDeviceIds : std::vector<int>());
+#endif
+            if (!source.isLinearAttention && source.dims.size() >= 2) {
+                // Growing K/V caches may retain spare token capacity. Copy
+                // only their logical rows into independently owned storage.
+                fastllm::Split(
+                    source, 1, 0, source.dims[1], destination);
+            } else {
+                destination.CopyFrom(source);
+            }
+            destination.dataDeviceIds = source.dataDeviceIds;
+            destination.isKVCache = true;
+            destination.isLinearAttention = source.isLinearAttention;
+            destination.isLinearAttentionTransposed =
+                source.isLinearAttentionTransposed;
+            destination.isPagedKVCache = false;
+            destination.pagedKVCacheData = nullptr;
+            destination.pageIndex.clear();
+            destination.lastPageLen = 0;
+            destination.multiDeviceData = false;
+            destination.multiDeviceDatas.clear();
+            destination.ClearTensorParallelLayout();
+            return (destination.dataDevice == DataDevice::CUDA &&
+                    destination.cudaData != nullptr) ||
+                   (destination.dataDevice == DataDevice::CPU &&
+                    destination.cpuData != nullptr);
+        }
+
+        bool Qwen4CopyCompactQsaTensor(
+                const Data &source, Data &destination) {
+            if (source.dims.empty() || source.dims[0] <= 0 ||
+                source.multiDeviceData ||
+                (source.dataDevice == DataDevice::CUDA &&
+                 source.cudaData == nullptr) ||
+                (source.dataDevice == DataDevice::CPU &&
+                 source.cpuData == nullptr)) {
+                return false;
+            }
+#ifdef USE_CUDA
+            Qwen4CudaDeviceGuard deviceGuard(
+                source.dataDevice == DataDevice::CUDA
+                    ? source.dataDeviceIds : std::vector<int>());
+#endif
+            fastllm::Split(source, 0, 0, source.dims[0], destination);
+            destination.dataDeviceIds = source.dataDeviceIds;
+            destination.isKVCache = false;
+            destination.isLinearAttention = false;
+            destination.multiDeviceData = false;
+            destination.multiDeviceDatas.clear();
+            destination.ClearTensorParallelLayout();
+            return (destination.dataDevice == DataDevice::CUDA &&
+                    destination.cudaData != nullptr) ||
+                   (destination.dataDevice == DataDevice::CPU &&
+                    destination.cpuData != nullptr);
+        }
+
+        bool Qwen4CopyCompactQsaTensorMap(
+                const std::map<int, std::shared_ptr<Data>> &source,
+                std::map<int, std::shared_ptr<Data>> &destination) {
+            destination.clear();
+            for (const auto &item : source) {
+                if (item.second == nullptr || item.second->dims.empty() ||
+                    item.second->Count(0) == 0) {
+                    continue;
+                }
+                std::shared_ptr<Data> copied = std::make_shared<Data>();
+                if (!Qwen4CopyCompactQsaTensor(
+                        *item.second, *copied)) {
+                    destination.clear();
+                    return false;
+                }
+                destination[item.first] = std::move(copied);
+            }
+            return true;
+        }
+
+        uint64_t Qwen4RuntimeTensorMapBytes(
+                const std::map<int, std::shared_ptr<Data>> &tensors) {
+            uint64_t bytes = 0;
+            for (const auto &item : tensors) {
+                if (item.second != nullptr) {
+                    bytes += item.second->GetBytes();
+                }
+            }
+            return bytes;
+        }
+
+        uint64_t Qwen4FloatVectorMapBytes(
+                const std::map<int, std::vector<float>> &values) {
+            uint64_t bytes = 0;
+            for (const auto &item : values) {
+                bytes += (uint64_t)item.second.size() * sizeof(float);
+            }
+            return bytes;
+        }
+
+    }
+
+    std::shared_ptr<Qwen4ExpModel::MtpRuntimeState>
+    Qwen4ExpModel::CloneMtpPrefixState(
+            const MtpRuntimeState &source, int cachedLen) const {
+        const int expectedMtpLength = std::max(0, cachedLen - 1);
+        const auto cacheLength = [](const Data &cache) {
+            return cache.dims.size() > 1 ? cache.dims[1] : 0;
+        };
+        if (cachedLen <= 0 || !source.hasDeferredTargetHidden ||
+            source.deferredPosition < 0 ||
+            source.deferredTargetHidden.dims !=
+                std::vector<int>({1, 1, this->hcCount * this->embed_dim}) ||
+            cacheLength(source.key) != expectedMtpLength ||
+            cacheLength(source.value) != expectedMtpLength ||
+            !source.proposals.empty() ||
+            !source.pendingOutputTokens.empty()) {
+            return nullptr;
+        }
+
+        std::shared_ptr<MtpRuntimeState> cloned =
+            std::make_shared<MtpRuntimeState>();
+        if (!Qwen4CopyCompactCacheTensor(
+                source.key, cloned->key, true) ||
+            !Qwen4CopyCompactCacheTensor(
+                source.value, cloned->value, true)) {
+            return nullptr;
+        }
+        cloned->deferredTargetHidden.CopyFrom(
+            source.deferredTargetHidden);
+        cloned->deferredPosition = source.deferredPosition;
+        cloned->hasDeferredTargetHidden = true;
+
+        const RequestState &sourceAttention = source.attentionState;
+        RequestState &clonedAttention = cloned->attentionState;
+        clonedAttention.indexerRawKeys = sourceAttention.indexerRawKeys;
+        clonedAttention.indexerPositions = sourceAttention.indexerPositions;
+        clonedAttention.indexerBlockKeys = sourceAttention.indexerBlockKeys;
+        clonedAttention.geometricCacheGrowthReadyLayers =
+            sourceAttention.geometricCacheGrowthReadyLayers;
+        if (!Qwen4CopyCompactQsaTensorMap(
+                sourceAttention.indexerTailKeyTensors,
+                clonedAttention.indexerTailKeyTensors) ||
+            !Qwen4CopyCompactQsaTensorMap(
+                sourceAttention.indexerTailPositionTensors,
+                clonedAttention.indexerTailPositionTensors) ||
+            !Qwen4CopyCompactQsaTensorMap(
+                sourceAttention.indexerBlockKeyTensors,
+                clonedAttention.indexerBlockKeyTensors)) {
+            return nullptr;
+        }
+        return cloned;
     }
 
     void Qwen4ExpModel::CaptureRequestRuntimeCheckpoint(
@@ -6834,15 +6999,15 @@ namespace fastllm {
         return best;
     }
 
-    void Qwen4ExpModel::MaybeRecordPrefixSnapshot(
+    bool Qwen4ExpModel::ShouldRecordPrefixSnapshot(
             const std::vector<std::pair<Data, Data>> &pastKeyValues,
-            RequestState &state) {
+            const RequestState &state, int &cachedLen) const {
         if (!Qwen4PrefixCacheEnabled() ||
             (int)pastKeyValues.size() < this->block_cnt) {
-            return;
+            return false;
         }
 
-        int cachedLen = 0;
+        cachedLen = 0;
         for (int layer = 0; layer < this->block_cnt; layer++) {
             if (this->IsLinearAttentionLayer(layer)) {
                 continue;
@@ -6852,20 +7017,24 @@ namespace fastllm {
             if (key.dims.size() < 2 || value.dims.size() < 2 ||
                 key.dims[1] <= 0 || key.dims[1] != value.dims[1] ||
                 (cachedLen > 0 && cachedLen != key.dims[1])) {
-                return;
+                return false;
             }
             cachedLen = key.dims[1];
         }
-        if (cachedLen <= 0 ||
-            cachedLen != (int)state.processedTokens.size()) {
-            return;
-        }
+        const int interval = std::max(1, fastllm::GetPageLen()) *
+            std::max(1, Qwen4EnvInt(
+                "FASTLLM_PREFIX_CACHE_SNAPSHOT_INTERVAL_PAGES", 16));
+        return cachedLen > 0 &&
+            cachedLen == (int)state.processedTokens.size() &&
+            cachedLen - state.lastPrefixSnapshotLen >= interval;
+    }
 
-        const int pageLen = std::max(1, fastllm::GetPageLen());
-        const int intervalPages = std::max(
-            1, Qwen4EnvInt("FASTLLM_PREFIX_CACHE_SNAPSHOT_INTERVAL_PAGES", 16));
-        const int interval = pageLen * intervalPages;
-        if (cachedLen - state.lastPrefixSnapshotLen < interval) {
+    void Qwen4ExpModel::MaybeRecordPrefixSnapshot(
+            const std::vector<std::pair<Data, Data>> &pastKeyValues,
+            RequestState &state) {
+        int cachedLen = 0;
+        if (!ShouldRecordPrefixSnapshot(
+                pastKeyValues, state, cachedLen)) {
             return;
         }
 
@@ -6980,6 +7149,42 @@ namespace fastllm {
         for (const auto &item : state.indexerBlockKeys) {
             stateBytes += (uint64_t)item.second.size() * sizeof(float);
         }
+        std::shared_ptr<MtpRuntimeState> mtpSnapshotState;
+        if (state.mtpState != nullptr) {
+            // Unlike the target request state, the MTP attention state is not
+            // visited by the target snapshot validation loop above.  Finish
+            // its asynchronous QSA host mirror before dropping the transfer
+            // object in CloneMtpPrefixState, so the restored request can seed
+            // a new mirror from a complete host history.
+            MaterializeQsaHostHistory(
+                this->block_cnt, std::max(0, cachedLen - 1),
+                state.mtpState->attentionState);
+            mtpSnapshotState = CloneMtpPrefixState(
+                *state.mtpState, cachedLen);
+            // A target-only snapshot would force every restored request to
+            // abandon MTP. Wait for an aligned boundary instead of recording
+            // a cache entry whose draft state cannot be continued correctly.
+            if (mtpSnapshotState == nullptr) {
+                return;
+            }
+            tensorBytes += mtpSnapshotState->key.GetBytes() +
+                mtpSnapshotState->value.GetBytes() +
+                mtpSnapshotState->deferredTargetHidden.GetBytes();
+            const RequestState &mtpAttention =
+                mtpSnapshotState->attentionState;
+            tensorBytes += Qwen4RuntimeTensorMapBytes(
+                mtpAttention.indexerTailKeyTensors);
+            tensorBytes += Qwen4RuntimeTensorMapBytes(
+                mtpAttention.indexerTailPositionTensors);
+            tensorBytes += Qwen4RuntimeTensorMapBytes(
+                mtpAttention.indexerBlockKeyTensors);
+            stateBytes += Qwen4FloatVectorMapBytes(
+                mtpAttention.indexerRawKeys);
+            stateBytes += Qwen4FloatVectorMapBytes(
+                mtpAttention.indexerPositions);
+            stateBytes += Qwen4FloatVectorMapBytes(
+                mtpAttention.indexerBlockKeys);
+        }
         const uint64_t snapshotBytes = tensorBytes + stateBytes;
         const uint64_t maxSnapshotBytes =
             (uint64_t)std::max(
@@ -7024,8 +7229,8 @@ namespace fastllm {
         snapshot->stateBytes = stateBytes;
         snapshot->tokens = state.processedTokens;
         snapshot->state = state;
-        snapshot->state.mtpState.reset();
-        snapshot->state.mtpDisabled = true;
+        snapshot->state.mtpState = mtpSnapshotState;
+        snapshot->state.mtpDisabled = mtpSnapshotState == nullptr;
         snapshot->state.borrowedPrefixSnapshot.reset();
         snapshot->state.pleConvHistoryTensors[0].reset();
         snapshot->state.pleConvHistoryTensors[1].reset();
@@ -7038,95 +7243,23 @@ namespace fastllm {
         snapshot->state.lastPrefixSnapshotLen = cachedLen;
         snapshot->layers.resize(this->block_cnt);
 
-        auto copyTensorToResident = [](const Data &source,
-                                       Data &destination,
-                                       DataDevice &sourceDevice,
-                                       std::vector<int> &sourceDeviceIds)
-                                       -> bool {
-            if (source.dims.empty() ||
-                (source.dataDevice == DataDevice::CUDA &&
-                 source.cudaData == nullptr) ||
-                (source.dataDevice == DataDevice::CPU &&
-                 source.cpuData == nullptr)) {
-                return false;
-            }
-            sourceDevice = source.dataDevice;
-            sourceDeviceIds = source.dataDeviceIds;
-#ifdef USE_CUDA
-            Qwen4CudaDeviceGuard deviceGuard(
-                source.dataDevice == DataDevice::CUDA
-                    ? source.dataDeviceIds : std::vector<int>());
-#endif
-            if (!source.isLinearAttention && source.dims.size() >= 2) {
-                // Growing K/V caches retain spare token-axis capacity.  A
-                // full-range Split copies only the logical tokens into tight
-                // snapshot storage instead of duplicating that unused space.
-                fastllm::Split(source, 1, 0, source.dims[1], destination);
-            } else {
-                destination.CopyFrom(source);
-            }
-            destination.dataDeviceIds = source.dataDeviceIds;
-            destination.isKVCache = true;
-            destination.isLinearAttention = source.isLinearAttention;
-            destination.isLinearAttentionTransposed =
-                source.isLinearAttentionTransposed;
-            destination.isPagedKVCache = false;
-            destination.pagedKVCacheData = nullptr;
-            destination.pageIndex.clear();
-            destination.lastPageLen = 0;
-            destination.multiDeviceData = false;
-            destination.multiDeviceDatas.clear();
-            destination.ClearTensorParallelLayout();
-            // Keep CUDA caches on their execution device. CopyFrom performs a
-            // D2D snapshot; CPU caches retain the established host fallback.
-            return (destination.dataDevice == DataDevice::CUDA &&
-                    destination.cudaData != nullptr) ||
-                   (destination.dataDevice == DataDevice::CPU &&
-                    destination.cpuData != nullptr);
-        };
-
-        auto copyQsaTensorToResident = [](const Data &source,
-                                          Data &destination) -> bool {
-            if (source.dims.empty() || source.dims[0] <= 0 ||
-                source.multiDeviceData ||
-                (source.dataDevice == DataDevice::CUDA &&
-                 source.cudaData == nullptr) ||
-                (source.dataDevice == DataDevice::CPU &&
-                 source.cpuData == nullptr)) {
-                return false;
-            }
-#ifdef USE_CUDA
-            Qwen4CudaDeviceGuard deviceGuard(
-                source.dataDevice == DataDevice::CUDA
-                    ? source.dataDeviceIds : std::vector<int>());
-#endif
-            fastllm::Split(source, 0, 0, source.dims[0],
-                           destination);
-            destination.dataDeviceIds = source.dataDeviceIds;
-            destination.isKVCache = false;
-            destination.isLinearAttention = false;
-            destination.multiDeviceData = false;
-            destination.multiDeviceDatas.clear();
-            destination.ClearTensorParallelLayout();
-            return (destination.dataDevice == DataDevice::CUDA &&
-                    destination.cudaData != nullptr) ||
-                   (destination.dataDevice == DataDevice::CPU &&
-                    destination.cpuData != nullptr);
-        };
-
         for (int layer = 0; layer < this->block_cnt; layer++) {
             PrefixLayerSnapshot &layerSnapshot = snapshot->layers[layer];
             layerSnapshot.linear = this->IsLinearAttentionLayer(layer);
-            if (!copyTensorToResident(
+            layerSnapshot.firstDevice =
+                pastKeyValues[layer].first.dataDevice;
+            layerSnapshot.firstDeviceIds =
+                pastKeyValues[layer].first.dataDeviceIds;
+            layerSnapshot.secondDevice =
+                pastKeyValues[layer].second.dataDevice;
+            layerSnapshot.secondDeviceIds =
+                pastKeyValues[layer].second.dataDeviceIds;
+            if (!Qwen4CopyCompactCacheTensor(
                     pastKeyValues[layer].first,
-                    layerSnapshot.first,
-                    layerSnapshot.firstDevice,
-                    layerSnapshot.firstDeviceIds) ||
-                !copyTensorToResident(
+                    layerSnapshot.first) ||
+                !Qwen4CopyCompactCacheTensor(
                     pastKeyValues[layer].second,
-                    layerSnapshot.second,
-                    layerSnapshot.secondDevice,
-                    layerSnapshot.secondDeviceIds)) {
+                    layerSnapshot.second)) {
                 return;
             }
             if (layerSnapshot.linear) {
@@ -7164,14 +7297,14 @@ namespace fastllm {
             }
             layerSnapshot.qsaDeviceCache = true;
             if ((tailCount > 0 &&
-                 (!copyQsaTensorToResident(
+                 (!Qwen4CopyCompactQsaTensor(
                       *tailKeys->second,
                       layerSnapshot.qsaTailKeys) ||
-                  !copyQsaTensorToResident(
+                  !Qwen4CopyCompactQsaTensor(
                       *tailPositions->second,
                       layerSnapshot.qsaTailPositions))) ||
                 (blockCount > 0 &&
-                 !copyQsaTensorToResident(
+                 !Qwen4CopyCompactQsaTensor(
                      *blockKeys->second,
                      layerSnapshot.qsaBlockKeys))) {
                 return;
@@ -7313,6 +7446,18 @@ namespace fastllm {
                 snapshot->cachedLen) {
             return false;
         }
+        if (snapshot->state.mtpState == nullptr &&
+            MtpSupportsGenerationConfig(context->generationConfig)) {
+            // A snapshot recorded while MTP was disabled cannot reconstruct
+            // the missing draft KV state. Retire it and recompute once; the
+            // current MTP request will then record an MTP-capable snapshot.
+            std::lock_guard<std::mutex> guard(this->prefixCacheMutex);
+            this->prefixSnapshots.erase(
+                std::remove(this->prefixSnapshots.begin(),
+                            this->prefixSnapshots.end(), snapshot),
+                this->prefixSnapshots.end());
+            return false;
+        }
         for (int layer = 0; layer < this->block_cnt; layer++) {
             const PrefixLayerSnapshot &layerSnapshot = snapshot->layers[layer];
             if (layerSnapshot.first.dims.empty() ||
@@ -7429,8 +7574,17 @@ namespace fastllm {
         }
 
         RequestState restored = snapshot->state;
-        restored.mtpState.reset();
-        restored.mtpDisabled = true;
+        if (snapshot->state.mtpState != nullptr) {
+            restored.mtpState = CloneMtpPrefixState(
+                *snapshot->state.mtpState, snapshot->cachedLen);
+            if (restored.mtpState == nullptr) {
+                return false;
+            }
+            restored.mtpDisabled = false;
+        } else {
+            restored.mtpState.reset();
+            restored.mtpDisabled = true;
+        }
         restored.borrowedPrefixSnapshot = snapshot;
         restored.geometricCacheGrowthReadyLayers.clear();
         restored.indexerHostMirrorTransfers.clear();
@@ -7519,10 +7673,6 @@ namespace fastllm {
             std::lock_guard<std::mutex> guard(this->stateMutex);
             requestState = &this->requestStates[&pastKeyValues[0].first];
         }
-        if (requestState->borrowedPrefixSnapshot != nullptr) {
-            requestState->mtpDisabled = true;
-        }
-
         // Target verification may have advanced several accepted inputs at
         // once. The ordinary scheduler still consumes one output per call;
         // drain those already-verified outputs without touching model state.
@@ -7573,6 +7723,18 @@ namespace fastllm {
             std::vector<int> dims = cache.dims;
             dims[1] = length;
             cache.Resize(dims);
+        };
+
+        auto prefixSnapshotDue = [&]() {
+            int cachedLen = 0;
+            if (!ShouldRecordPrefixSnapshot(
+                    pastKeyValues, *requestState, cachedLen)) {
+                return false;
+            }
+            std::lock_guard<std::mutex> guard(this->prefixCacheMutex);
+            return FindPrefixSnapshotLocked(
+                requestState->processedTokens,
+                cachedLen, cachedLen) == nullptr;
         };
 
         auto generateProposalChain = [&](const Data &targetHidden,
@@ -7801,15 +7963,50 @@ namespace fastllm {
             AssertInFastLLM(
                 hasPairedHidden && !mtpTokens.empty(),
                 "Qwen4-Exp MTP failed to align its prompt states.");
-            generateProposalChain(
-                pairedHidden, mtpTokens, mtpPositions);
+            if (prefixSnapshotDue()) {
+                const int pairedRows = (int)mtpTokens.size();
+                AssertInFastLLM(
+                    pairedRows > 0 &&
+                    pairedHidden.dims.size() == 3 &&
+                    pairedHidden.dims[1] == pairedRows,
+                    "Qwen4-Exp MTP prefix snapshot boundary is misaligned.");
+                if (pairedRows > 1) {
+                    Data prefixHidden;
+                    Split(pairedHidden, 1, 0, pairedRows - 1,
+                          prefixHidden);
+                    RunMtpDraft(
+                        mtp, prefixHidden,
+                        std::vector<int>(mtpTokens.begin(),
+                                         mtpTokens.end() - 1),
+                        std::vector<int>(mtpPositions.begin(),
+                                         mtpPositions.end() - 1),
+                        nullptr, false);
+                }
+                Data finalPairedHidden;
+                Split(pairedHidden, 1, pairedRows - 1, pairedRows,
+                      finalPairedHidden);
+                mtp.deferredTargetHidden.CopyFrom(finalPairedHidden);
+                mtp.deferredPosition = mtpPositions.back();
+                mtp.hasDeferredTargetHidden = true;
+                MaybeRecordPrefixSnapshot(pastKeyValues, *requestState);
+                mtp.hasDeferredTargetHidden = false;
+                mtp.deferredPosition = -1;
+                mtp.deferredTargetHidden = Data();
+                generateProposalChain(
+                    finalPairedHidden, {mtpTokens.back()},
+                    {mtpPositions.back()});
+            } else {
+                generateProposalChain(
+                    pairedHidden, mtpTokens, mtpPositions);
+                MaybeRecordPrefixSnapshot(
+                    pastKeyValues, *requestState);
+            }
 #ifdef USE_CUDA
             // Proposal state can be produced by executor workers with
             // different per-thread streams. Publish it before the scheduler
             // starts verification on a later host worker.
             ForceDeviceSync();
 #endif
-            MaybeRecordPrefixSnapshot(pastKeyValues, *requestState);
             return result;
         }
 
