@@ -2081,7 +2081,8 @@ namespace fastllm {
         return WeightType::NONE;
     }
 
-    static bool GetDiskSourceDataType(const std::string &dtype, DataType &dataType) {
+    static bool GetSafeTensorSourceDataType(const std::string &dtype,
+                                            DataType &dataType) {
         if (dtype == "F32") {
             dataType = DataType::FLOAT32;
             return true;
@@ -2174,7 +2175,8 @@ namespace fastllm {
         DataType sourceDataType;
         if (IsPackedFP4StorageDType(tensor.dtype) && targetDataType == DataType::NVFP4) {
             sourceDataType = DataType::NVFP4;
-        } else if (!GetDiskSourceDataType(tensor.dtype, sourceDataType)) {
+        } else if (!GetSafeTensorSourceDataType(
+                       tensor.dtype, sourceDataType)) {
             ErrorInFastLLM("Disk MoE only supports F32/F16/BF16/FP8/NVFP4 safetensors: " + weight.name + "\n");
         }
         if (!IsDiskTargetDataType(targetDataType)) {
@@ -3277,41 +3279,249 @@ namespace fastllm {
         return blockCount;
     }
 
-    static bool IsGGUFTaskBeyondMainLayers(const std::string &weightName, int mainLayerCount) {
+    static int ParseLayerIndex(const std::string &name,
+                               const std::string &prefix,
+                               size_t *separatorPos = nullptr) {
+        if (!StartWith(name, prefix)) {
+            return -1;
+        }
+        size_t pos = prefix.size();
+        int layerId = 0;
+        bool hasLayerId = false;
+        while (pos < name.size() && name[pos] >= '0' && name[pos] <= '9') {
+            hasLayerId = true;
+            const int digit = name[pos] - '0';
+            if (layerId > (INT_MAX - digit) / 10) {
+                return -1;
+            }
+            layerId = layerId * 10 + digit;
+            pos++;
+        }
+        if (!hasLayerId || pos >= name.size() || name[pos] != '.') {
+            return -1;
+        }
+        if (separatorPos != nullptr) {
+            *separatorPos = pos;
+        }
+        return layerId;
+    }
+
+    static bool IsGGUFTaskBeyondMainLayers(const std::string &weightName,
+                                           int mainLayerCount) {
         if (mainLayerCount < 0) {
             return false;
         }
         static const std::vector<std::string> prefixes = {
             "model.layers.", "model.language_model.layers."
         };
-        std::string prefix;
-        for (const auto &candidate : prefixes) {
-            if (StartWith(weightName, candidate)) {
-                prefix = candidate;
-                break;
+        for (const auto &prefix : prefixes) {
+            const int layerId = ParseLayerIndex(weightName, prefix);
+            if (layerId >= 0) {
+                return layerId >= mainLayerCount;
             }
         }
-        if (prefix.empty()) {
+        return false;
+    }
+
+    static bool RemapQwen35GGUFMtpTask(ReadGGUFTask &task,
+                                       int mainLayerCount,
+                                       int mtpLayerCount) {
+        if (mainLayerCount < 0 || mtpLayerCount <= 0) {
             return false;
         }
 
-        int pos = (int)prefix.size();
-        int layerId = 0;
-        bool hasLayerId = false;
-        while (pos < (int)weightName.size() && weightName[pos] >= '0' && weightName[pos] <= '9') {
-            hasLayerId = true;
-            layerId = layerId * 10 + weightName[pos] - '0';
-            pos++;
+        const std::string &sourceName = task.tensor.name;
+        static const std::string sourcePrefix = "blk.";
+        size_t separatorPos = 0;
+        const int sourceLayer = ParseLayerIndex(
+            sourceName, sourcePrefix, &separatorPos);
+        if (sourceLayer < mainLayerCount ||
+            sourceLayer >= mainLayerCount + mtpLayerCount) {
+            return false;
         }
-        return hasLayerId && pos < (int)weightName.size() && weightName[pos] == '.' &&
-               layerId >= mainLayerCount;
+
+        // The four NextN-only tensors are already mapped to their canonical
+        // mtp.* root names by the architecture rules above.  The rest of the
+        // optional block follows the normal decoder-layer naming convention;
+        // only its layer namespace has to become relative to the MTP stack.
+        if (sourceName.compare(
+                separatorPos + 1, strlen("nextn."), "nextn.") == 0) {
+            return StartWith(task.name, "mtp.");
+        }
+
+        const std::string targetPrefix = "model.language_model.layers." +
+            std::to_string(sourceLayer) + ".";
+        if (!StartWith(task.name, targetPrefix)) {
+            return false;
+        }
+        const int mtpLayer = sourceLayer - mainLayerCount;
+        task.name = "mtp.layers." + std::to_string(mtpLayer) + "." +
+            task.name.substr(targetPrefix.size());
+        return true;
     }
 
-    std::unique_ptr<basellm> CreateLLMModelFromGGUFFile(const std::string &fileName, const std::string &originalPath) {
+    struct ExternalMtpReadTask {
+        SafeTensorItem *tensor = nullptr;
+        SafeTensorItem *scale = nullptr;
+        DataType sourceDataType = DataType::FLOAT32;
+        DataType targetDataType = DataType::FLOAT32;
+        bool linear = false;
+    };
+
+    static std::string ParentDirectoryWithSlash(const std::string &path) {
+        size_t pos = path.find_last_of("/\\");
+        if (pos == std::string::npos) {
+            return "./";
+        }
+        return path.substr(0, pos + 1);
+    }
+
+    static std::set<std::string> FindExternalMtpSafeTensorFiles(
+            const std::string &externalMtpPath, std::string &configPath) {
+        std::set<std::string> files;
+        const bool exactSafeTensor = FileExists(externalMtpPath) &&
+            StringEndWith(externalMtpPath, ".safetensors");
+        std::string directory;
+        if (exactSafeTensor) {
+            files.insert(externalMtpPath);
+            directory = ParentDirectoryWithSlash(externalMtpPath);
+        } else {
+            directory = externalMtpPath;
+            if (!directory.empty() && directory.back() != '/' &&
+                directory.back() != '\\') {
+                directory += "/";
+            }
+            const std::string mtpFile = directory + "mtp.safetensors";
+            if (FileExists(mtpFile)) {
+                files.insert(mtpFile);
+            } else {
+                const std::string indexFile =
+                    directory + "model.safetensors.index.json";
+                AssertInFastLLM(FileExists(indexFile),
+                                "External MTP checkpoint has neither "
+                                "mtp.safetensors nor a safetensors index: " +
+                                externalMtpPath);
+                std::string error;
+                auto index = json11::Json::parse(
+                    ReadAllFile(indexFile), error)["weight_map"];
+                AssertInFastLLM(error.empty() && index.is_object(),
+                                "Failed to parse external MTP safetensors index.");
+                for (const auto &item : index.object_items()) {
+                    if (StartWith(item.first, "mtp.")) {
+                        files.insert(directory + item.second.string_value());
+                    }
+                }
+            }
+        }
+        configPath = directory + "config.json";
+        AssertInFastLLM(FileExists(configPath),
+                        "External MTP checkpoint has no adjacent config.json: " +
+                        externalMtpPath);
+        AssertInFastLLM(!files.empty(),
+                        "External MTP checkpoint contains no mtp.* tensors: " +
+                        externalMtpPath);
+        for (const auto &file : files) {
+            AssertInFastLLM(FileExists(file),
+                            "External MTP safetensors file is missing: " + file);
+        }
+        return files;
+    }
+
+    static json11::Json GetExternalMtpTextConfig(
+            const std::string &configPath) {
+        std::string error;
+        json11::Json config = json11::Json::parse(
+            ReadAllFile(configPath), error);
+        AssertInFastLLM(error.empty() && config.is_object(),
+                        "Failed to parse external MTP config.json.");
+        json11::Json textConfig = config["text_config"];
+        if (!textConfig.is_object()) {
+            textConfig = config;
+        }
+        const std::string modelType = textConfig["model_type"].string_value();
+        AssertInFastLLM(modelType == "qwen3_5" ||
+                            modelType == "qwen3_5_text",
+                        "External MTP checkpoint must use the Qwen3.5 architecture.");
+        return textConfig;
+    }
+
+    static void ValidateExternalMtpCheckpoint(
+            basellm *model, const json11::Json &textConfig,
+            const SafeTensors &safeTensors) {
+        auto requireConfigInt = [&](const std::string &key) {
+            int value = textConfig[key].int_value();
+            AssertInFastLLM(value > 0,
+                            "External MTP config is missing " + key + ".");
+            return value;
+        };
+        auto targetDictInt = [&](const std::string &key) {
+            auto it = model->weight.dicts.find(key);
+            return it == model->weight.dicts.end() ? 0 :
+                atoi(it->second.c_str());
+        };
+        auto requireMatchingConfigInt = [&](const std::string &key,
+                                            int targetValue) {
+            const int draftValue = requireConfigInt(key);
+            AssertInFastLLM(
+                draftValue == targetValue,
+                "External MTP config is incompatible with the GGUF target: " +
+                    key + " is " + std::to_string(draftValue) +
+                    ", expected " + std::to_string(targetValue) + ".");
+        };
+        requireMatchingConfigInt("hidden_size", model->embed_dim);
+        requireMatchingConfigInt("num_hidden_layers", model->block_cnt);
+        requireMatchingConfigInt("num_attention_heads",
+                                 model->num_attention_heads);
+        requireMatchingConfigInt("num_key_value_heads",
+                                 model->num_key_value_heads);
+        requireMatchingConfigInt("head_dim", model->head_dim);
+        requireMatchingConfigInt("vocab_size", targetDictInt("vocab_size"));
+        requireMatchingConfigInt("intermediate_size",
+                                 targetDictInt("intermediate_size"));
+
+        const int hidden = model->embed_dim;
+        const int heads = model->num_attention_heads;
+        const int kvHeads = model->num_key_value_heads;
+        const int headDim = model->head_dim;
+        const int intermediate = targetDictInt("intermediate_size");
+        auto requireShape = [&](const std::string &name,
+                                const std::vector<int> &shape) {
+            auto it = safeTensors.itmeDict.find(name);
+            AssertInFastLLM(it != safeTensors.itmeDict.end() &&
+                                it->second.intShape == shape,
+                            "External MTP weight is missing or has an "
+                            "incompatible shape: " + name);
+        };
+        requireShape("mtp.fc.weight", {hidden, hidden * 2});
+        requireShape("mtp.pre_fc_norm_embedding.weight", {hidden});
+        requireShape("mtp.pre_fc_norm_hidden.weight", {hidden});
+        requireShape("mtp.norm.weight", {hidden});
+        requireShape("mtp.layers.0.input_layernorm.weight", {hidden});
+        requireShape("mtp.layers.0.post_attention_layernorm.weight", {hidden});
+        requireShape("mtp.layers.0.self_attn.q_proj.weight",
+                     {heads * headDim * 2, hidden});
+        requireShape("mtp.layers.0.self_attn.k_proj.weight",
+                     {kvHeads * headDim, hidden});
+        requireShape("mtp.layers.0.self_attn.v_proj.weight",
+                     {kvHeads * headDim, hidden});
+        requireShape("mtp.layers.0.self_attn.o_proj.weight",
+                     {hidden, heads * headDim});
+        requireShape("mtp.layers.0.self_attn.q_norm.weight", {headDim});
+        requireShape("mtp.layers.0.self_attn.k_norm.weight", {headDim});
+        requireShape("mtp.layers.0.mlp.gate_proj.weight", {intermediate, hidden});
+        requireShape("mtp.layers.0.mlp.up_proj.weight", {intermediate, hidden});
+        requireShape("mtp.layers.0.mlp.down_proj.weight", {hidden, intermediate});
+    }
+
+    std::unique_ptr<basellm> CreateLLMModelFromGGUFFile(
+            const std::string &fileName, const std::string &originalPath,
+            const std::string &externalMtpPath) {
         std::vector <ReadGGUFTask> readGGUFTasks;
         std::map <std::string, ReadGGUFTask*> readGGUFTaskDict;
         std::unique_ptr<SafeTensors> dflashSafeTensors;
         std::map<std::string, std::pair<SafeTensorItem*, DataType> > dflashReadTaskDict;
+        std::unique_ptr<SafeTensors> externalMtpSafeTensors;
+        std::map<std::string, ExternalMtpReadTask> externalMtpReadTaskDict;
         std::vector <std::string> ggufFileNames = GenerateGGUFFileList(fileName);
         AssertInFastLLM(ggufFileNames.size() > 0, "0 gguf file found!");
 
@@ -3406,6 +3616,31 @@ namespace fastllm {
             printf("Load rms_norm_eps = %f\n", model->rms_norm_eps);
         }
 
+        json11::Json externalMtpTextConfig;
+        if (!externalMtpPath.empty()) {
+            AssertInFastLLM(
+                model->model_struct == "qwen3_5" ||
+                    ConvertGGUFTypeToFastllmType(arch) == "qwen3_5",
+                "External MTP currently requires a Qwen3.5 GGUF target model.");
+            std::string externalMtpConfigPath;
+            std::set<std::string> externalMtpFiles =
+                FindExternalMtpSafeTensorFiles(
+                    externalMtpPath, externalMtpConfigPath);
+            externalMtpTextConfig =
+                GetExternalMtpTextConfig(externalMtpConfigPath);
+            const int externalMtpLayers =
+                externalMtpTextConfig["mtp_num_hidden_layers"].int_value();
+            AssertInFastLLM(
+                externalMtpLayers == 1,
+                "FastLLM currently supports one external Qwen3.5 MTP layer.");
+            model->weight.AddDict("mtp_num_hidden_layers",
+                                  std::to_string(externalMtpLayers));
+            externalMtpSafeTensors.reset(
+                new SafeTensors(externalMtpFiles));
+            printf("[Fastllm] GGUF target: loading external MTP from %s\n",
+                   externalMtpPath.c_str());
+        }
+
         std::string dflashPath;
         const char *dflashPathEnv = std::getenv("FASTLLM_DFLASH_MODEL_PATH");
         if (dflashPathEnv != nullptr && dflashPathEnv[0] != '\0') {
@@ -3415,6 +3650,8 @@ namespace fastllm {
             }
         }
         if (!dflashPath.empty()) {
+            AssertInFastLLM(externalMtpSafeTensors == nullptr,
+                            "MTP and DFlash cannot be enabled together.");
             AssertInFastLLM(
                 model->model_struct == "qwen3_5" ||
                     ConvertGGUFTypeToFastllmType(arch) == "qwen3_5",
@@ -3463,9 +3700,15 @@ namespace fastllm {
 
         arch = ConvertGGUFTypeToFastllmType(arch);
         int ggufMainLayerCount = GetGGUFMainLayerCount(params, arch, model);
+        int ggufMtpLayerCount = GetGGUFArchParam(
+            params, arch, "nextn_predict_layers").int_value();
 
         // 3.0 更新模型信息
         model->InitParams();
+        if (externalMtpSafeTensors != nullptr) {
+            ValidateExternalMtpCheckpoint(
+                model, externalMtpTextConfig, *externalMtpSafeTensors);
+        }
 
         int cur = 0;
         long long totalBytes = 0;
@@ -3478,6 +3721,15 @@ namespace fastllm {
         }
         uint64_t totalLoadBytes = 0;
         for (int i = 0; i < readGGUFTasks.size(); i++) {
+            bool isEmbeddedMtpTask = false;
+            if (arch == "qwen3_5") {
+                isEmbeddedMtpTask = RemapQwen35GGUFMtpTask(
+                    readGGUFTasks[i], ggufMainLayerCount,
+                    ggufMtpLayerCount);
+            }
+            if (isEmbeddedMtpTask && externalMtpSafeTensors != nullptr) {
+                continue;
+            }
             std::string &weightName = readGGUFTasks[i].name;
             if (IsGGUFTaskBeyondMainLayers(weightName, ggufMainLayerCount)) {
                 continue;
@@ -3488,6 +3740,76 @@ namespace fastllm {
             readGGUFTasks[i].weight = &model->weight.weight[weightName];
             readGGUFTaskDict[readGGUFTasks[i].name] = &readGGUFTasks[i];
             totalLoadBytes += ggml_nbytes(&readGGUFTasks[i].tensor);
+        }
+        if (externalMtpSafeTensors != nullptr) {
+            auto externalMtpTensorNames =
+                externalMtpSafeTensors->GetSortedItemNames();
+            auto externalMtpTensorMap =
+                model->GetTensorMap(externalMtpTensorNames);
+            for (const auto &tensorName : externalMtpTensorNames) {
+                if (!StartWith(tensorName, "mtp.") ||
+                    IsSafeTensorQuantAuxTensorName(
+                        *externalMtpSafeTensors, tensorName)) {
+                    continue;
+                }
+                auto tensorIt =
+                    externalMtpSafeTensors->itmeDict.find(tensorName);
+                AssertInFastLLM(
+                    tensorIt != externalMtpSafeTensors->itmeDict.end(),
+                    "External MTP tensor metadata is missing: " + tensorName);
+                auto mapIt = externalMtpTensorMap.find(tensorName);
+                AssertInFastLLM(
+                    mapIt != externalMtpTensorMap.end() &&
+                        mapIt->second.size() == 1,
+                    "External MTP tensor has no unique FastLLM mapping: " +
+                    tensorName);
+                const std::string &weightName = mapIt->second[0].first;
+                AssertInFastLLM(
+                    allWeightNames.find(weightName) == allWeightNames.end(),
+                    "Duplicate target/MTP weight name: " + weightName);
+
+                SafeTensorItem &tensor = tensorIt->second;
+                ExternalMtpReadTask task;
+                task.tensor = &tensor;
+                task.linear = model->weight.GetWeightType(weightName) ==
+                    WeightType::LINEAR;
+                DataType sourceDataType;
+                AssertInFastLLM(
+                    GetSafeTensorSourceDataType(
+                        tensor.dtype, sourceDataType),
+                    "Unsupported external MTP safetensors dtype " +
+                        tensor.dtype + " for " + tensorName + ".");
+                if (sourceDataType == DataType::FP8_E4M3) {
+                    AssertInFastLLM(
+                        task.linear,
+                        "External MTP only supports FP8 for linear weights: " +
+                            tensorName);
+                    std::string scaleName = FindSafeTensorScaleTensorName(
+                        *externalMtpSafeTensors, tensorName);
+                    AssertInFastLLM(!scaleName.empty(),
+                                    "External FP8 MTP weight has no scale: " +
+                                    tensorName);
+                    task.scale = &externalMtpSafeTensors->itmeDict[scaleName];
+                    task.sourceDataType = DataType::FP8_E4M3;
+                    task.targetDataType = DataType::FP8_E4M3;
+                } else {
+                    // Match the native HF loader's default policy: keep
+                    // floating-point linears in FP16 and expand parameter
+                    // tensors such as norms to FP32.
+                    task.sourceDataType = task.linear ? sourceDataType :
+                                                        DataType::FLOAT32;
+                    task.targetDataType = task.linear ? DataType::FLOAT16 :
+                                                        DataType::FLOAT32;
+                }
+
+                tensors.push_back(weightName);
+                allWeightNames.insert(weightName);
+                model->weight.AddEmptyWeight(
+                    weightName, tensor.intShape, task.targetDataType);
+                externalMtpReadTaskDict[weightName] = task;
+                totalLoadBytes += tensor.bytes +
+                    (task.scale == nullptr ? 0 : task.scale->bytes);
+            }
         }
         if (dflashSafeTensors != nullptr) {
             auto dflashTensorNames = dflashSafeTensors->GetSortedItemNames();
@@ -3581,6 +3903,33 @@ namespace fastllm {
                             } else {
                                 WeightImportGGUFTensor(task->weight, &task->tensor, task->fileName,
                                                        task->offset, task->replaceType);
+                            }
+                        } else if (externalMtpReadTaskDict.find(weightName) !=
+                                   externalMtpReadTaskDict.end()) {
+                            auto &task = externalMtpReadTaskDict[weightName];
+                            SafeTensorItem *tensor = task.tensor;
+                            tensorBytes = tensor->bytes +
+                                (task.scale == nullptr ? 0 : task.scale->bytes);
+                            if (task.sourceDataType == DataType::FP8_E4M3) {
+                                AssertInFastLLM(task.scale != nullptr,
+                                                "External FP8 MTP task has no scale.");
+                                task.scale->CreateBuffer(DataType::FLOAT32);
+                                tensor->CreateBufferWithScale(
+                                    DataType::FP8_E4M3, *task.scale);
+                            } else {
+                                tensor->CreateBuffer(task.sourceDataType);
+                            }
+                            model->weight[weightName].CreateFromOriData(
+                                WeightType::AUTO, task.sourceDataType,
+                                tensor->buffer,
+                                tensor->minsBuffer, tensor->scalesBuffer,
+                                -1, tensor->blockK, tensor->blockM);
+                            if (task.linear) {
+                                model->weight[weightName].CalcWeightSum();
+                            }
+                            tensor->ClearBuffer();
+                            if (task.scale != nullptr) {
+                                task.scale->ClearBuffer();
                             }
                         } else if (dflashReadTaskDict.find(weightName) !=
                                    dflashReadTaskDict.end()) {

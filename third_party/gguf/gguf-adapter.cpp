@@ -197,9 +197,27 @@ namespace fastllm {
                         "model.language_model.layers.$1.linear_attn.out_proj.weight"
                     ),
 
-                    // The GGUF may carry an optional NextN block.  MTP loading
-                    // from GGUF is not wired up yet; ignore it for normal target
-                    // model inference instead of retaining unusable tensors.
+                    // Qwen3.5 GGUF stores the MTP input projection and norms
+                    // under the optional NextN block.  The surrounding
+                    // transformer weights use the ordinary blk.N names and are
+                    // remapped relative to the main-layer count by the GGUF
+                    // loader.
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.\d+\.nextn\.eh_proj\.weight$)"),
+                        "mtp.fc.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.\d+\.nextn\.enorm\.weight$)"),
+                        "mtp.pre_fc_norm_embedding.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.\d+\.nextn\.hnorm\.weight$)"),
+                        "mtp.pre_fc_norm_hidden.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(^blk\.\d+\.nextn\.shared_head_norm\.weight$)"),
+                        "mtp.norm.weight"
+                    ),
                     GGUFWeightReplaceRule (
                         std::regex(R"(^blk\.\d+\.nextn\..*$)"),
                         "ignore"

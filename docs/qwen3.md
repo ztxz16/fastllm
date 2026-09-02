@@ -91,6 +91,17 @@ ftllm server /data/models/qwen-with-mtp \
 
 `--mtp` 设置每轮 draft token 数，`0` 表示关闭，当前最大为 8。MTP 并不只属于某一个 Qwen 版本，是否可用取决于模型结构和 checkpoint。
 
+Qwen3.5 GGUF 会直接使用文件中内置的 NextN/MTP 层。如果 GGUF 不含该层，可以挂载同结构模型中抽出的独立 `mtp.safetensors`：
+
+~~~bash
+ftllm server /data/models/qwen3.5-target.gguf \
+  --device cuda --cuda_embedding \
+  --draft /data/models/qwen3.5-fp8/mtp.safetensors \
+  --draft_tokens 5
+~~~
+
+`mtp.safetensors` 的同目录必须有匹配的 `config.json`。也可以把 `--draft` 指向包含这两个文件的目录。加载时会校验 Qwen3.5 架构、层数、hidden size、head 数、词表和全部 MTP 张量形状；独立 MTP 当前只支持挂载到 GGUF target。MTP 会频繁访问词表投影，显存允许时应保留 `--cuda_embedding`，否则速度会明显下降。
+
 ## Qwen3.8 DFlash2
 
 DFlash2 需要独立的 draft checkpoint：

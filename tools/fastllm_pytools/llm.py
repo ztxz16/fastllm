@@ -340,6 +340,11 @@ fastllm_lib.create_llm_model_fromhf_with_config.restype = ctypes.c_int
 fastllm_lib.create_llm_model_from_gguf.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
 fastllm_lib.create_llm_model_from_gguf.restype = ctypes.c_int
 
+if hasattr(fastllm_lib, "create_llm_model_from_gguf_with_mtp"):
+    fastllm_lib.create_llm_model_from_gguf_with_mtp.argtypes = [
+        ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
+    fastllm_lib.create_llm_model_from_gguf_with_mtp.restype = ctypes.c_int
+
 fastllm_lib.create_llm_tokenizer_fromhf.argtypes = [ctypes.c_char_p]
 fastllm_lib.create_llm_tokenizer_fromhf.restype = ctypes.c_int
 
@@ -1115,7 +1120,8 @@ class model:
                   dtype_config: str = "",
                   ori_model_path: str = "", 
                   chat_template: str = "",
-                  tool_call_parser: str = "auto"):
+                  tool_call_parser: str = "auto",
+                  external_mtp_path: str = ""):
         if (graph != None):
             current_graph = graph()
             if (os.path.isdir(path) and os.path.isfile(os.path.join(path, "config.json"))):
@@ -1200,7 +1206,17 @@ class model:
                         self.hf_tokenizer = try_load_gguf_tokenizer(path)
                     finally:
                         report_model_load_progress("tokenizer", 1, 1)
-                self.model = fastllm_lib.create_llm_model_from_gguf(path.encode(), ori_model_path.encode())
+                if external_mtp_path:
+                    if not hasattr(fastllm_lib, "create_llm_model_from_gguf_with_mtp"):
+                        raise RuntimeError(
+                            "the loaded FastLLM library does not support "
+                            "external MTP for GGUF")
+                    self.model = fastllm_lib.create_llm_model_from_gguf_with_mtp(
+                        path.encode(), ori_model_path.encode(),
+                        external_mtp_path.encode())
+                else:
+                    self.model = fastllm_lib.create_llm_model_from_gguf(
+                        path.encode(), ori_model_path.encode())
                 # 配置目录：优先用 ori_model_path（若存在且为目录），否则用 GGUF 文件所在目录
                 if ori_model_path and os.path.isdir(ori_model_path):
                     config_base_path = ori_model_path

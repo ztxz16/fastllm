@@ -80,6 +80,17 @@ ftllm server /data/models/qwen-with-mtp \
 
 `--mtp` configures draft tokens per step; `0` disables it and the current maximum is 8. MTP is not exclusive to one Qwen version.
 
+Qwen3.5 GGUF files use an embedded NextN/MTP layer directly when present. A GGUF without that layer can attach a standalone `mtp.safetensors` extracted from a structurally matching model:
+
+~~~bash
+ftllm server /data/models/qwen3.5-target.gguf \
+  --device cuda --cuda_embedding \
+  --draft /data/models/qwen3.5-fp8/mtp.safetensors \
+  --draft_tokens 5
+~~~
+
+A matching `config.json` must be adjacent to `mtp.safetensors`; `--draft` may also point to the directory containing both files. Loading validates the Qwen3.5 architecture, layer and hidden dimensions, head counts, vocabulary, and every required MTP tensor shape. Standalone MTP currently attaches only to GGUF targets. MTP accesses the vocabulary projection frequently, so keep `--cuda_embedding` when memory permits or throughput drops substantially.
+
 ## Qwen3.8 DFlash2
 
 ~~~bash

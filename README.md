@@ -174,6 +174,12 @@ ftllm server /data/models/my-model \
 # 以 Qwen3.5 为例使用内置 MTP，每轮最多配置 8 个 draft token
 ftllm server /data/models/qwen3.5 --mtp 4
 
+# 给不含 MTP 权重的 Qwen3.5 GGUF 挂载独立 MTP 模块
+ftllm server /data/models/qwen3.5.gguf \
+  --device cuda --cuda_embedding \
+  --draft /data/models/qwen3.5-fp8/mtp.safetensors \
+  --draft_tokens 5
+
 # DeepSeek-V4 内置 DSpark
 ftllm server /data/models/deepseek-v4 --dspark 7
 
@@ -184,7 +190,7 @@ ftllm server /data/models/qwen3.8 \
   --draft_tokens 7
 ~~~
 
-`--draft` 会根据 draft checkpoint 自动识别 DFlash2 或 DSpark；省略 `--draft_tokens` 时使用 checkpoint 默认值。DFlash2 的 `--draft_tokens` 表示实际 draft token 数，不包含 anchor token。
+`--draft` 会根据 draft checkpoint 自动识别 MTP、DFlash2 或 DSpark。独立 MTP 当前用于 Qwen3.5 GGUF，路径可指向包含 `config.json` 和 `mtp.safetensors` 的目录，也可直接指向 `mtp.safetensors`；省略 `--draft_tokens` 时默认使用 5。DFlash2 的 `--draft_tokens` 表示实际 draft token 数，不包含 anchor token。
 
 DFlash2 的完整配置和验证结果见 [Qwen3.8 DFlash2 文档](docs/dflash2_qwen38_27b_tp2_20260819.md)。
 
@@ -247,7 +253,7 @@ CLI 会持续演进，`ftllm <command> --help` 是当前安装版本的最终依
 | `--enable_thinking` | 控制模型的思考模板开关，需要模型支持 |
 | `--mtp` | 支持 MTP 的模型每轮生成的 draft token 数，`0` 关闭，当前最大为 8 |
 | `--dspark` | 启用模型内置 DSpark，并设置每轮 draft token 数 |
-| `--draft` / `--draft_model_path` | 外部 DSpark/DFlash draft 模型目录；根据 checkpoint 自动识别算法 |
+| `--draft` / `--draft_model_path` | 外部 MTP/DSpark/DFlash draft checkpoint；根据配置自动识别算法，MTP 可直接指定 `mtp.safetensors` |
 | `--draft_tokens` | 每轮最多使用的 draft token 数；未指定时读取 draft 配置 |
 | `--tool_call_parser` | 工具调用解析器；默认 `auto` |
 | `--chat_template` | 自定义 Jinja chat template 文件 |

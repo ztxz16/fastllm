@@ -712,11 +712,11 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help = "启用模型内置 DSpark，并指定每轮 draft token 数；例如 --dspark 7")
     parser.add_argument("--speculative_algorithm", "--speculative-algorithm",
                         dest = "speculative_algorithm", type = str, default = "",
-                        help = "投机解码算法；当前支持 dspark、dflash")
+                        help = "投机解码算法；当前支持 mtp、dspark、dflash")
     parser.add_argument("--speculative_draft_model_path", "--speculative-draft-model-path",
                         "--draft", "--draft_model_path", "--dspark_model",
                         dest = "speculative_draft_model_path", type = str, default = "",
-                        help = "DSpark/DFlash draft model 的 Hugging Face 目录")
+                        help = "MTP/DSpark/DFlash draft 模型目录；MTP 也可直接指定 mtp.safetensors")
     parser.add_argument("--draft_tokens", type = _positive_int, default = -1,
                         help = "每轮最多使用的 draft token 数；未指定时读取 draft 配置")
     parser.add_argument("--speculative_num_draft_tokens", "--speculative-num-draft-tokens",
@@ -809,21 +809,52 @@ def make_normal_llm_model(args, startup_progress = None):
         speculative_algorithm = "dspark"
     draft_config = None
     draft_architectures = []
+    draft_text_config = {}
+    draft_has_mtp_weights = False
     if speculative_draft_path:
         speculative_draft_path = os.path.abspath(
             os.path.expanduser(speculative_draft_path))
-        draft_config_path = os.path.join(speculative_draft_path, "config.json")
+        draft_is_file = os.path.isfile(speculative_draft_path)
+        draft_config_dir = (os.path.dirname(speculative_draft_path)
+                            if draft_is_file else speculative_draft_path)
+        draft_config_path = os.path.join(draft_config_dir, "config.json")
         if not os.path.isfile(draft_config_path):
             raise ValueError(
-                "speculative draft directory has no config.json: %s" %
+                "speculative draft model has no adjacent config.json: %s" %
                 speculative_draft_path)
         with open(draft_config_path, "r", encoding = "utf-8") as file:
             draft_config = json.load(file)
         draft_architectures = draft_config.get("architectures", [])
+        draft_text_config = draft_config.get("text_config", draft_config)
+        if not isinstance(draft_text_config, dict):
+            draft_text_config = {}
+        draft_has_mtp_weights = (
+            (draft_is_file and
+             speculative_draft_path.lower().endswith(".safetensors")) or
+            os.path.isfile(os.path.join(draft_config_dir, "mtp.safetensors")))
+        if not draft_has_mtp_weights:
+            draft_index_path = os.path.join(
+                draft_config_dir, "model.safetensors.index.json")
+            if os.path.isfile(draft_index_path):
+                with open(draft_index_path, "r", encoding = "utf-8") as file:
+                    draft_index = json.load(file)
+                draft_weight_map = draft_index.get("weight_map", {})
+                draft_has_mtp_weights = isinstance(
+                    draft_weight_map, dict) and any(
+                        str(name).startswith("mtp.")
+                        for name in draft_weight_map)
         if not speculative_algorithm:
-            speculative_algorithm = (
-                "dflash" if "DFlash2DraftModel" in draft_architectures
-                else "dspark")
+            if "DFlash2DraftModel" in draft_architectures:
+                speculative_algorithm = "dflash"
+            elif "DSparkDraftModel" in draft_architectures:
+                speculative_algorithm = "dspark"
+            elif (draft_has_mtp_weights and
+                  int(draft_text_config.get("mtp_num_hidden_layers", 0) or 0) > 0):
+                speculative_algorithm = "mtp"
+            else:
+                raise ValueError(
+                    "cannot infer draft type from checkpoint: %s" %
+                    speculative_draft_path)
     if draft_tokens > 0 and not speculative_algorithm and not speculative_draft_path:
         speculative_algorithm = "dspark"
     if (speculative_algorithm == "dspark" and not speculative_draft_path and
@@ -833,18 +864,29 @@ def make_normal_llm_model(args, startup_progress = None):
                 "--draft_tokens and --dspark specify different token counts")
         dspark_tokens = draft_tokens
         args.dspark = dspark_tokens
-    if speculative_algorithm and speculative_algorithm not in ("dspark", "dflash"):
+    if speculative_algorithm and speculative_algorithm not in ("mtp", "dspark", "dflash"):
         raise ValueError(
-            "--speculative_algorithm currently supports dspark or dflash")
+            "--speculative_algorithm currently supports mtp, dspark or dflash")
     if (speculative_algorithm == "dspark" and not speculative_draft_path and
             dspark_tokens <= 0):
         raise ValueError(
             "DSpark requires either --dspark N for an embedded checkpoint or "
             "--speculative_draft_model_path")
+    for env_name in (
+            "FASTLLM_DSPARK_MODEL_PATH",
+            "FASTLLM_DSPARK_TOKENS",
+            "FASTLLM_DSPARK_CONFIDENCE_THRESHOLD",
+            "FASTLLM_DFLASH_MODEL_PATH",
+            "FASTLLM_DFLASH_BLOCK_SIZE"):
+        os.environ.pop(env_name, None)
     if speculative_algorithm == "dflash":
         if not speculative_draft_path:
             raise ValueError(
                 "DFlash requires --speculative_draft_model_path")
+        if not os.path.isdir(speculative_draft_path):
+            raise ValueError(
+                "DFlash draft checkpoint must be a directory: %s" %
+                speculative_draft_path)
         if mtp > 0:
             raise ValueError("DFlash and --mtp cannot be enabled together")
         if dspark_tokens > 0:
@@ -877,17 +919,41 @@ def make_normal_llm_model(args, startup_progress = None):
                 "DFlash block tokens must be in [2, checkpoint block_size] "
                 "(requested=%d, checkpoint=%d)" %
                 (requested_block, configured_block))
-        os.environ.pop("FASTLLM_DSPARK_MODEL_PATH", None)
-        os.environ.pop("FASTLLM_DSPARK_TOKENS", None)
-        os.environ.pop("FASTLLM_DSPARK_CONFIDENCE_THRESHOLD", None)
         os.environ["FASTLLM_DFLASH_MODEL_PATH"] = speculative_draft_path
         os.environ["FASTLLM_DFLASH_BLOCK_SIZE"] = str(requested_block)
         args.speculative_draft_model_path = speculative_draft_path
         args.speculative_algorithm = "dflash"
+    elif speculative_algorithm == "mtp":
+        if dspark_tokens > 0:
+            raise ValueError("MTP and --dspark cannot be enabled together")
+        if speculative_draft_path:
+            if not draft_has_mtp_weights:
+                raise ValueError(
+                    "MTP checkpoint contains no mtp.* safetensors: %s" %
+                    speculative_draft_path)
+            draft_model_type = str(
+                draft_text_config.get("model_type", "") or "")
+            if draft_model_type not in ("qwen3_5", "qwen3_5_text"):
+                raise ValueError(
+                    "external MTP checkpoint must be Qwen3.5, got model_type=%s" %
+                    draft_model_type)
+        if draft_tokens > 0:
+            if mtp > 0 and mtp != draft_tokens:
+                raise ValueError(
+                    "--mtp and --draft_tokens specify different MTP draft counts")
+            mtp = draft_tokens
+        elif mtp <= 0 and speculative_draft_path:
+            mtp = 5
+        if mtp <= 0:
+            raise ValueError("MTP requires --mtp N or an external --draft checkpoint")
+        args.mtp = mtp
+        args.speculative_draft_model_path = speculative_draft_path
+        args.speculative_algorithm = "mtp"
     elif speculative_draft_path:
-        os.environ.pop("FASTLLM_DSPARK_TOKENS", None)
-        os.environ.pop("FASTLLM_DFLASH_MODEL_PATH", None)
-        os.environ.pop("FASTLLM_DFLASH_BLOCK_SIZE", None)
+        if not os.path.isdir(speculative_draft_path):
+            raise ValueError(
+                "DSpark draft checkpoint must be a directory: %s" %
+                speculative_draft_path)
         if "DSparkDraftModel" not in draft_architectures:
             raise ValueError(
                 "draft checkpoint is not DSparkDraftModel: %s" %
@@ -921,7 +987,6 @@ def make_normal_llm_model(args, startup_progress = None):
         args.speculative_draft_model_path = speculative_draft_path
         args.speculative_algorithm = "dspark"
     else:
-        os.environ.pop("FASTLLM_DSPARK_MODEL_PATH", None)
         if dspark_tokens > 0:
             os.environ["FASTLLM_DSPARK_TOKENS"] = str(dspark_tokens)
             confidence_threshold = float(getattr(
@@ -932,11 +997,6 @@ def make_normal_llm_model(args, startup_progress = None):
             os.environ["FASTLLM_DSPARK_CONFIDENCE_THRESHOLD"] = str(
                 confidence_threshold)
             args.speculative_algorithm = "dspark"
-        else:
-            os.environ.pop("FASTLLM_DSPARK_TOKENS", None)
-            os.environ.pop("FASTLLM_DSPARK_CONFIDENCE_THRESHOLD", None)
-        os.environ.pop("FASTLLM_DFLASH_MODEL_PATH", None)
-        os.environ.pop("FASTLLM_DFLASH_BLOCK_SIZE", None)
 
     usenuma = False
     try:
@@ -1055,6 +1115,17 @@ def make_normal_llm_model(args, startup_progress = None):
                         "DFlash2 draft checkpoints currently require a Qwen3.5 "
                         "target, got architecture=%s model_type=%s" %
                         (architecture, model_type))
+            elif speculative_algorithm == "mtp":
+                if not is_qwen35_model:
+                    raise ValueError(
+                        "MTP currently requires a Qwen3.5 target, got "
+                        "architecture=%s model_type=%s" %
+                        (architecture, model_type))
+                if speculative_draft_path and not (
+                        os.path.isfile(args.path) and
+                        args.path.lower().endswith(".gguf")):
+                    raise ValueError(
+                        "external MTP attachment currently requires a GGUF target")
             is_moe_model = _is_moe_architecture(architecture, model_type, text_model_type)
 
             is_step3p5 = (architecture == 'Step3p5ForCausalLM' or
@@ -1366,7 +1437,11 @@ def make_normal_llm_model(args, startup_progress = None):
     try:
         model = llm.model(args.path, dtype = args.dtype, kv_cache_dtype = args.kv_cache_dtype,
                             moe_dtype = args.moe_dtype, graph = graph, tokenizer_type = "auto", lora = args.lora,
-                            dtype_config = args.dtype_config, ori_model_path = args.ori, chat_template = args.chat_template, tool_call_parser = args.tool_call_parser)
+                            dtype_config = args.dtype_config, ori_model_path = args.ori,
+                            chat_template = args.chat_template,
+                            tool_call_parser = args.tool_call_parser,
+                            external_mtp_path = (speculative_draft_path
+                                if speculative_algorithm == "mtp" else ""))
         llm.report_model_load_progress("weights_finalize", 0, 1)
         if (args.enable_thinking.lower() in ["", "false", "0", "off"]):
             model.enable_thinking = False

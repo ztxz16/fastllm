@@ -174,6 +174,12 @@ These features require a matching model architecture and checkpoint:
 # Example: embedded MTP on Qwen3.5, with up to 8 draft tokens per step
 ftllm server /data/models/qwen3.5 --mtp 4
 
+# Attach a standalone MTP module to a Qwen3.5 GGUF without MTP weights
+ftllm server /data/models/qwen3.5.gguf \
+  --device cuda --cuda_embedding \
+  --draft /data/models/qwen3.5-fp8/mtp.safetensors \
+  --draft_tokens 5
+
 # Embedded DeepSeek-V4 DSpark
 ftllm server /data/models/deepseek-v4 --dspark 7
 
@@ -184,7 +190,7 @@ ftllm server /data/models/qwen3.8 \
   --draft_tokens 7
 ~~~
 
-`--draft` detects DFlash2 or DSpark from the draft checkpoint. If `--draft_tokens` is omitted, the checkpoint default is used. For DFlash2, `--draft_tokens` counts actual draft tokens and excludes the anchor token.
+`--draft` detects MTP, DFlash2, or DSpark from the draft checkpoint. Standalone MTP currently targets Qwen3.5 GGUF and may be either a directory containing `config.json` plus `mtp.safetensors`, or the `mtp.safetensors` file itself; it defaults to five draft tokens. For DFlash2, `--draft_tokens` counts actual draft tokens and excludes the anchor token.
 
 See the [Qwen3.8 DFlash2 report](docs/dflash2_qwen38_27b_tp2_20260819.md) for the complete configuration and validation results.
 
@@ -243,7 +249,7 @@ The CLI evolves continuously, so `ftllm <command> --help` is authoritative for t
 | `--enable_thinking` | Control the model's thinking template when supported |
 | `--mtp` | Draft tokens per step for models with MTP support; `0` disables it and the current maximum is 8 |
 | `--dspark` | Enable embedded DSpark and set draft tokens per step |
-| `--draft` / `--draft_model_path` | External DSpark or DFlash draft-model directory; the algorithm is detected from the checkpoint |
+| `--draft` / `--draft_model_path` | External MTP, DSpark, or DFlash checkpoint; MTP may point directly to `mtp.safetensors` |
 | `--draft_tokens` | Maximum draft tokens per step; defaults to the draft configuration |
 | `--tool_call_parser` | Tool-call parser; defaults to `auto` |
 | `--chat_template` | Custom Jinja chat-template file |
