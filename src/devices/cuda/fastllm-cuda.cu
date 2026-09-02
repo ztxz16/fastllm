@@ -3419,12 +3419,34 @@ void FastllmQwen35GdnPostConvExactHalf128Kernel(
     int lane = threadIdx.x;
     int headGroup = valueHeads / keyHeads;
     if (token >= seqLen) {
-        if (lane == 0) {
-            for (int group = 0; group < headGroup; group++) {
-                int valueHead = head * headGroup + group;
-                size_t outputRow =
-                    ((size_t)batchIndex * valueHeads + valueHead) *
-                        paddedSeqLen + token;
+        half2 zero2 = __float2half2_rn(0.0f);
+        for (int group = 0; group < headGroup; group++) {
+            int valueHead = head * headGroup + group;
+            size_t outputRow =
+                ((size_t)batchIndex * valueHeads + valueHead) *
+                    paddedSeqLen + token;
+            size_t outputBase = outputRow * CHANNELS;
+            half2 *qOutput2 =
+                reinterpret_cast<half2 *>(qOutput + outputBase);
+            half2 *kOutput2 =
+                reinterpret_cast<half2 *>(kOutput + outputBase);
+            half2 *kBetaOutput2 =
+                reinterpret_cast<half2 *>(kBetaOutput + outputBase);
+            half2 *vBetaOutput2 =
+                reinterpret_cast<half2 *>(vBetaOutput + outputBase);
+            for (int channel2 = lane; channel2 < CHANNELS / 2;
+                 channel2 += blockDim.x) {
+                qOutput2[channel2] = zero2;
+                kOutput2[channel2] = zero2;
+                kBetaOutput2[channel2] = zero2;
+                vBetaOutput2[channel2] = zero2;
+                if constexpr (WRITE_DEAD_OUTPUTS) {
+                    half2 *vOutput2 =
+                        reinterpret_cast<half2 *>(vOutput + outputBase);
+                    vOutput2[channel2] = zero2;
+                }
+            }
+            if (lane == 0) {
                 gOutput[outputRow] = __float2half(0.0f);
                 if constexpr (WRITE_DEAD_OUTPUTS) {
                     betaOutput[outputRow] = __float2half(0.0f);
@@ -7832,7 +7854,7 @@ bool FastllmCudaQwen35GdnPostConvExactFloat16(
         }
         return true;
     };
-    if (batch <= 0 || seqLen <= 0 || seqLen % 64 != 0 ||
+    if (batch <= 0 || seqLen <= 0 ||
         keyHeads <= 0 || valueHeads < keyHeads ||
         valueHeads % keyHeads != 0 ||
         kDim != 128 || vDim != 128 ||
@@ -17716,16 +17738,14 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16BatchPointers(
     bool tokenMajorInput =
         tokenMajorInputOffset + channels <= newTokens.dims[2] &&
         newTokens.dims[1] > 1 &&
-        newTokens.dims[1] <= (numTokenCaches == 0 ?
-            FASTLLM_CUDA_BATCH_PREFILL_SEQ_MAX :
-            FASTLLM_CUDA_MTP_FAST_SEQ_MAX);
+        (numTokenCaches == 0 ||
+         newTokens.dims[1] <= FASTLLM_CUDA_MTP_FAST_SEQ_MAX);
     bool channelMajor =
         tokenMajorInputOffset == 0 &&
         newTokens.dims[1] == channels &&
         newTokens.dims[2] > 1 &&
-        newTokens.dims[2] <= (numTokenCaches == 0 ?
-            FASTLLM_CUDA_BATCH_PREFILL_SEQ_MAX :
-            FASTLLM_CUDA_MTP_FAST_SEQ_MAX);
+        (numTokenCaches == 0 ||
+         newTokens.dims[2] <= FASTLLM_CUDA_MTP_FAST_SEQ_MAX);
     if (!tokenMajorInput && !channelMajor) {
         return false;
     }

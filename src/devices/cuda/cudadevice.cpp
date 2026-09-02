@@ -3424,9 +3424,6 @@ namespace fastllm {
         int maxChunks = CudaEnvIntRange(
             "FASTLLM_CUDA_TRITON_CHUNK_GDN_POSTCONV_MAX_CHUNKS",
             64, 1, 256);
-        if (batch < minBatch || chunks > maxChunks) {
-            return false;
-        }
 
         if (CudaEnvFlagDefaultEnabled(
                 "FASTLLM_CUDA_QWEN35_GDN_FUSED_RMSNORM_POSTCONV",
@@ -3437,6 +3434,14 @@ namespace fastllm {
                 kDim, vDim, normEps, qScale,
                 q, k, v, g, beta, kBeta, vBeta)) {
             return true;
+        }
+
+        // The native exact path accepts runtime sequence lengths and is not
+        // specialized by chunk count. Keep the tuning limit on the Triton
+        // fallback only; otherwise a long single-request prefill needlessly
+        // falls back to split/repeat/transpose operators.
+        if (batch < minBatch || chunks > maxChunks) {
+            return false;
         }
 
         int arch = CudaTritonRuntimeArch();

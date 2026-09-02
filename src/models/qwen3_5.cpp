@@ -12624,8 +12624,7 @@ namespace fastllm {
                     !speculativeCollectAllLogits &&
                     computeType == DataType::FLOAT16 &&
                     (int)seqLens.size() == 1 && bsz == 1 &&
-                    seqLens[0] == seqlen && seqlen > 1 &&
-                    seqlen <= QWEN35_BATCH_PREFILL_SEQ_MAX;
+                    seqLens[0] == seqlen && seqlen > 1;
                 bool batchedUniformPrefill =
                     batch > 1 && !all1 && !speculativeCollectAllLogits &&
                     (int)seqLens.size() == batch && bsz == 1;
