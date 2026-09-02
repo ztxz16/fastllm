@@ -704,6 +704,9 @@ namespace fastllm {
                 8, Qwen4EnvInt("FASTLLM_QWEN4_ENABLE_MTP", 0)));
         }
 
+        constexpr float QWEN4_MTP_TYPICAL_POSTERIOR_THRESHOLD = 0.09f;
+        constexpr float QWEN4_MTP_TYPICAL_POSTERIOR_ALPHA = 0.3f;
+
         bool Qwen4MtpFp8DraftHeadEnabled() {
             const char *value = std::getenv("FASTLLM_MTP_FP8_DRAFT_HEAD");
             return value == nullptr || value[0] == '\0' ||
@@ -4068,9 +4071,19 @@ namespace fastllm {
 
     bool Qwen4ExpModel::MtpSupportsGenerationConfig(
             const GenerationConfig &generationConfig) const {
+        const bool samplingSupported =
+            !generationConfig.IsSimpleGreedy() &&
+            generationConfig.top_k > 1 &&
+            std::isfinite(generationConfig.temperature) &&
+            generationConfig.temperature > 0.0f &&
+            std::isfinite(generationConfig.top_p) &&
+            generationConfig.top_p > 0.0f &&
+            generationConfig.top_p <= 1.0f;
         return HasMtpWeights() &&
-            generationConfig.IsSimpleGreedy() &&
+            (generationConfig.IsSimpleGreedy() || samplingSupported) &&
             !generationConfig.output_logits &&
+            generationConfig.tool_call_allowed_token_ids.empty() &&
+            std::fabs(generationConfig.repeat_penalty - 1.0f) <= 1.0e-6f &&
             !generationConfig.tool_call_name_constraint_enabled &&
             !generationConfig.tool_call_parameter_name_constraint_enabled &&
             !generationConfig.tool_call_content_sampling_enabled &&
@@ -7530,7 +7543,8 @@ namespace fastllm {
             return ForwardTarget(
                 batch, inputIds, attentionMask, positionIds,
                 pastKeyValues, generationConfig, lastTokens, retLogits,
-                nullptr, nullptr, nullptr, true, true, false);
+                nullptr, nullptr, nullptr, nullptr,
+                true, true, false);
         }
 
         if (requestState->mtpState == nullptr) {
@@ -7714,7 +7728,7 @@ namespace fastllm {
             std::vector<int> result = ForwardTarget(
                 batch, inputIds, attentionMask, positionIds,
                 pastKeyValues, generationConfig, lastTokens, retLogits,
-                &targetHidden, nullptr, nullptr,
+                &targetHidden, nullptr, nullptr, nullptr,
                 false, false, false);
 
             const std::vector<int> ids = dataToInts(inputIds);
@@ -7807,7 +7821,8 @@ namespace fastllm {
             return ForwardTarget(
                 batch, inputIds, attentionMask, positionIds,
                 pastKeyValues, generationConfig, lastTokens, retLogits,
-                nullptr, nullptr, nullptr, true, true, false);
+                nullptr, nullptr, nullptr, nullptr,
+                true, true, false);
         }
 
         const int anchor = dataToInts(inputIds).front();
@@ -7845,17 +7860,30 @@ namespace fastllm {
         Data candidateMask;
         Data targetHidden;
         std::vector<int> targetTokens;
+        std::vector<unsigned char> verificationAccepted;
         mtp.targetCapture.runtimeCheckpoint = &mtp.targetCheckpoint;
         ForwardTarget(
             1, candidateIds, candidateMask, candidatePositionIds,
             pastKeyValues, generationConfig, lastTokens, nullptr,
-            &targetHidden, &targetTokens, &mtp.targetCapture,
+            &targetHidden, &targetTokens, &verificationAccepted,
+            &mtp.targetCapture,
             false, true, true, &candidateTokens, true);
 
         int acceptedDrafts = 0;
-        while (acceptedDrafts < (int)mtp.proposals.size() &&
-               targetTokens[acceptedDrafts] ==
-                   mtp.proposals[acceptedDrafts]) {
+        const bool sampledVerification =
+            !generationConfig.IsSimpleGreedy();
+        AssertInFastLLM(
+            !sampledVerification ||
+                verificationAccepted.size() == mtp.proposals.size(),
+            "Qwen4-Exp MTP rejection sampling returned an invalid shape.");
+        while (acceptedDrafts < (int)mtp.proposals.size()) {
+            const bool accepted = sampledVerification
+                ? verificationAccepted[acceptedDrafts] != 0
+                : targetTokens[acceptedDrafts] ==
+                    mtp.proposals[acceptedDrafts];
+            if (!accepted) {
+                break;
+            }
             acceptedDrafts++;
         }
         const int committedInputs = acceptedDrafts + 1;
@@ -7922,7 +7950,8 @@ namespace fastllm {
             const LastTokensManager &lastTokens,
             std::vector<std::vector<float> *> *retLogits,
             Data *targetMultiHidden,
-            std::vector<int> *allGreedyTokens,
+            std::vector<int> *allVerificationTokens,
+            std::vector<unsigned char> *verificationAccepted,
             TargetVerificationCapture *verificationCapture,
             bool recordPrefixSnapshot,
             bool allowDecodeCudaGraph,
@@ -8308,7 +8337,7 @@ namespace fastllm {
             finalHyperNorm.FreeSpace();
             DumpTensorIfRequested("final_hidden", finalHidden);
             Data lastHidden;
-            if (allGreedyTokens != nullptr) {
+            if (allVerificationTokens != nullptr) {
                 lastHidden.CopyFrom(finalHidden);
             } else if (finalHidden.dims[1] > 1) {
                 Split(finalHidden, 1, finalHidden.dims[1] - 1,
@@ -8321,7 +8350,44 @@ namespace fastllm {
             Linear(lastHidden, this->weight["lm_head.weight"], Data(), logits);
             ToDataType(logits, DataType::FLOAT32);
         }
-        ResetLogitsOfEOS(1, &logits, pastKeyValues, generationConfig);
+        if (allVerificationTokens != nullptr &&
+            generationConfig.output_token_least > 0) {
+#ifdef USE_CUDA
+            const int rows = inputIds.dims[1];
+            std::vector<int> resetLengths(rows, 0);
+            std::vector<int> eosIds = {this->eos_token_id};
+            eosIds.insert(eosIds.end(), this->eos_token_ids.begin(),
+                          this->eos_token_ids.end());
+            eosIds.insert(eosIds.end(),
+                          generationConfig.stop_token_ids.begin(),
+                          generationConfig.stop_token_ids.end());
+            std::vector<int> eosCounts(rows, (int)eosIds.size());
+            std::vector<int> flattenedEosIds;
+            flattenedEosIds.reserve((size_t)rows * eosIds.size());
+            bool needsReset = false;
+            for (int row = 0; row < rows; row++) {
+                const int rowCacheLength = qsaPreviousLength + row + 1;
+                resetLengths[row] =
+                    generationConfig.output_token_least - rowCacheLength +
+                    generationConfig.input_token_length;
+                needsReset |= resetLengths[row] > 0;
+                flattenedEosIds.insert(flattenedEosIds.end(),
+                                       eosIds.begin(), eosIds.end());
+            }
+            if (needsReset) {
+                ToDataType(logits, DataType::FLOAT32);
+                FastllmResetLogitsOfEOS(
+                    rows, &logits, resetLengths,
+                    eosCounts, flattenedEosIds);
+            }
+#else
+            ResetLogitsOfEOS(
+                1, &logits, pastKeyValues, generationConfig);
+#endif
+        } else {
+            ResetLogitsOfEOS(
+                1, &logits, pastKeyValues, generationConfig);
+        }
         DumpTensorIfRequested("logits", logits);
 
         if (generationConfig.output_logits && retLogits != nullptr &&
@@ -8333,55 +8399,117 @@ namespace fastllm {
         }
 
         int token;
-        if (allGreedyTokens != nullptr) {
-            AssertInFastLLM(
-                generationConfig.IsSimpleGreedy(),
-                "Qwen4-Exp MTP target verification requires greedy sampling.");
+        if (allVerificationTokens != nullptr) {
             const int rows = inputIds.dims[1];
-            bool sampledOnCuda = false;
+            AssertInFastLLM(
+                rows > 1 && hostInputTokens != nullptr &&
+                (int)hostInputTokens->size() == rows,
+                "Qwen4-Exp MTP target verification input is incomplete.");
+            if (!generationConfig.IsSimpleGreedy()) {
+                AssertInFastLLM(
+                    verificationAccepted != nullptr,
+                    "Qwen4-Exp MTP rejection sampling has no acceptance output.");
 #ifdef USE_CUDA
-            if (verificationCapture != nullptr && rows > 0 && rows <= 8 &&
-                logits.dataDevice == DataDevice::CUDA &&
-                logits.dataType == DataType::FLOAT32 &&
-                logits.cudaData != nullptr && !logits.multiDeviceData &&
-                !logits.dims.empty() &&
-                logits.Count(0) ==
-                    (uint64_t)rows * logits.dims.back()) {
+                AssertInFastLLM(
+                    logits.dataDevice == DataDevice::CUDA &&
+                    logits.dataType == DataType::FLOAT32 &&
+                    logits.cudaData != nullptr && !logits.multiDeviceData &&
+                    !logits.dims.empty() && logits.dims.back() > 0 &&
+                    logits.Count(0) ==
+                        (uint64_t)rows * logits.dims.back(),
+                    "Qwen4-Exp MTP rejection sampling requires full CUDA logits.");
                 const int device = logits.dataDeviceIds.empty()
                     ? FastllmCudaGetDevice() : logits.dataDeviceIds[0];
-                Data &tokenIds = verificationCapture->greedyTokenIds;
-                Data &tokenValues = verificationCapture->greedyTokenValues;
-                if (device >= 0 &&
-                    Qwen4PrepareDecodeGraphWorkspace(
-                        tokenIds, DataType::INT32, {rows}, device) &&
-                    Qwen4PrepareDecodeGraphWorkspace(
-                        tokenValues, DataType::FLOAT32, {rows}, device) &&
-                    FastllmCudaGreedySamplingWithFloatOutput(
+                AssertInFastLLM(
+                    device >= 0,
+                    "Qwen4-Exp MTP rejection sampling has no CUDA device.");
+                Qwen4CudaDeviceGuard samplingDeviceGuard({device});
+                std::vector<float> temperatures(
+                    rows, std::max(generationConfig.temperature, 1.0e-6f));
+                std::vector<int> topKs(
+                    rows, std::max(1, generationConfig.top_k));
+                std::vector<float> topPs(rows, generationConfig.top_p);
+                const int candidateCount = rows - 1;
+                std::vector<int> candidateIds(candidateCount);
+                std::vector<int> candidateRows(candidateCount);
+                for (int row = 0; row < candidateCount; row++) {
+                    candidateIds[row] = (*hostInputTokens)[row + 1];
+                    candidateRows[row] = row;
+                }
+                allVerificationTokens->assign(rows, -1);
+                verificationAccepted->assign(candidateCount, 0);
+                std::vector<int> recoveredIds(candidateCount, -1);
+                AssertInFastLLM(
+                    FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
                         reinterpret_cast<float *>(logits.cudaData),
-                        reinterpret_cast<int *>(tokenIds.cudaData),
-                        reinterpret_cast<float *>(tokenValues.cudaData),
-                        rows, logits.dims.back())) {
-                    allGreedyTokens->resize(rows);
-                    FastllmCudaCopyFromDeviceToHost(
-                        allGreedyTokens->data(), tokenIds.cudaData,
-                        (size_t)rows * sizeof(int));
-                    sampledOnCuda = true;
+                        temperatures.data(), topKs.data(), topPs.data(),
+                        allVerificationTokens->data(), rows,
+                        logits.dims.back(), candidateIds.data(),
+                        candidateRows.data(),
+                        verificationAccepted->data(), recoveredIds.data(),
+                        candidateCount,
+                        QWEN4_MTP_TYPICAL_POSTERIOR_THRESHOLD,
+                        QWEN4_MTP_TYPICAL_POSTERIOR_ALPHA),
+                    "Qwen4-Exp CUDA MTP rejection sampling failed.");
+                // Match Qwen3.5: accepted rows commit their draft token;
+                // the first rejected row recovers with the target argmax.
+                for (int row = 0; row < candidateCount; row++) {
+                    (*allVerificationTokens)[row] = recoveredIds[row];
                 }
-            }
+#else
+                AssertInFastLLM(
+                    false,
+                    "Qwen4-Exp MTP rejection sampling requires CUDA.");
 #endif
-            if (!sampledOnCuda) {
-                Data top;
-                TopK(logits, top, 1);
-                top.ToDevice(DataDevice::CPU);
-                const float *topValues =
-                    reinterpret_cast<const float *>(top.cpuData);
-                allGreedyTokens->resize(rows);
-                for (int row = 0; row < rows; row++) {
-                    (*allGreedyTokens)[row] =
-                        (int)(topValues[(size_t)row * 2] + 1e-3f);
+            } else {
+                if (verificationAccepted != nullptr) {
+                    verificationAccepted->clear();
+                }
+                bool sampledOnCuda = false;
+#ifdef USE_CUDA
+                if (verificationCapture != nullptr && rows <= 8 &&
+                    logits.dataDevice == DataDevice::CUDA &&
+                    logits.dataType == DataType::FLOAT32 &&
+                    logits.cudaData != nullptr && !logits.multiDeviceData &&
+                    !logits.dims.empty() &&
+                    logits.Count(0) ==
+                        (uint64_t)rows * logits.dims.back()) {
+                    const int device = logits.dataDeviceIds.empty()
+                        ? FastllmCudaGetDevice() : logits.dataDeviceIds[0];
+                    Data &tokenIds = verificationCapture->greedyTokenIds;
+                    Data &tokenValues = verificationCapture->greedyTokenValues;
+                    if (device >= 0 &&
+                        Qwen4PrepareDecodeGraphWorkspace(
+                            tokenIds, DataType::INT32, {rows}, device) &&
+                        Qwen4PrepareDecodeGraphWorkspace(
+                            tokenValues, DataType::FLOAT32, {rows}, device) &&
+                        FastllmCudaGreedySamplingWithFloatOutput(
+                            reinterpret_cast<float *>(logits.cudaData),
+                            reinterpret_cast<int *>(tokenIds.cudaData),
+                            reinterpret_cast<float *>(tokenValues.cudaData),
+                            rows, logits.dims.back())) {
+                        allVerificationTokens->resize(rows);
+                        FastllmCudaCopyFromDeviceToHost(
+                            allVerificationTokens->data(), tokenIds.cudaData,
+                            (size_t)rows * sizeof(int));
+                        sampledOnCuda = true;
+                    }
+                }
+#endif
+                if (!sampledOnCuda) {
+                    Data top;
+                    TopK(logits, top, 1);
+                    top.ToDevice(DataDevice::CPU);
+                    const float *topValues =
+                        reinterpret_cast<const float *>(top.cpuData);
+                    allVerificationTokens->resize(rows);
+                    for (int row = 0; row < rows; row++) {
+                        (*allVerificationTokens)[row] =
+                            (int)(topValues[(size_t)row * 2] + 1e-3f);
+                    }
                 }
             }
-            token = allGreedyTokens->back();
+            token = allVerificationTokens->back();
         } else if (generationConfig.IsSimpleGreedy()) {
             Data top;
             TopK(logits, top, 1);
