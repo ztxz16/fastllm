@@ -1023,12 +1023,24 @@ namespace fastllm {
                             Data &newHistory);
     void Qwen4HyperMix(const Data &normalized, const Data &mixLogits,
                        int groups, Data &output);
+    // Project low-rank logits and mix hyper-connection groups in one
+    // executor operation. Backends may keep the rounded projection in its
+    // native storage type instead of materializing a wider intermediate.
+    void Qwen4HyperMixProjected(const Data &normalized,
+                                const Data &lowRank, Data &upWeight,
+                                int groups, Data &output);
     // Compute the two bias-free hyper-connection projections and apply their
     // prepare/injection activations.  Backends may fuse the independent
     // projections, while the executor contract remains available on CPU.
+    // By default outputs retain the input type; outputType can request a
+    // wider storage type without changing the projection arithmetic.
     void Qwen4HyperProject(const Data &normalized, Data &downWeight,
                            Data &injectionWeight, int groups,
                            Data &activated, Data &injection);
+    void Qwen4HyperProject(const Data &normalized, Data &downWeight,
+                           Data &injectionWeight, int groups,
+                           Data &activated, Data &injection,
+                           DataType outputType);
     // Fuse the low-rank scale and SiLU without changing either projection's
     // GEMM geometry or the independent injection-gate dataflow.
     void Qwen4HyperPrepare(const Data &lowRankProjection, int groups,
@@ -1039,11 +1051,18 @@ namespace fastllm {
     // Hyper-connection residual update followed by grouped RMSNorm.  The
     // residual is rounded to hyperInput's dtype before normalization, exactly
     // matching Qwen4HyperCombine + Qwen4GroupedRMSNorm while avoiding the
-    // intermediate launch and reload.
+    // intermediate launch and reload. normalizedStorage optionally receives
+    // the same normalized values in a caller-selected activation type.
     void Qwen4HyperCombineRMSNorm(
         const Data &hyperInput, const Data &blockOutput,
         const Data &injection, const Data &normWeight,
         float eps, int groups, Data &residual, Data &normalized);
+    void Qwen4HyperCombineRMSNorm(
+        const Data &hyperInput, const Data &blockOutput,
+        const Data &injection, const Data &normWeight,
+        float eps, int groups, Data &residual, Data &normalized,
+        Data *normalizedStorage,
+        DataType normalizedStorageType = DataType::FLOAT16);
     // Qwen4 QSA primitives. QSASelect scores compressed block keys, selects
     // the highest-scoring blocks, and expands them to sorted token indices.
     // queryStart >= 0 enables row-wise causal selection for prefill: row r can

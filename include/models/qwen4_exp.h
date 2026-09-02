@@ -266,7 +266,8 @@ namespace fastllm {
         void HyperMixNormalized(Data &normalized,
                                 const std::string &prefix,
                                 Data &mixedInput,
-                                Data *injectionWeights);
+                                Data *injectionWeights,
+                                const Data *projectionStorage = nullptr);
         void HyperCombine(const Data &hyperInput, const Data &blockOutput,
                           const Data &injectionWeights, Data &output);
         void HyperCombineRMSNorm(const Data &hyperInput,
@@ -274,7 +275,8 @@ namespace fastllm {
                                  const Data &injectionWeights,
                                  Data &normWeight,
                                  Data &output,
-                                 Data &normalized);
+                                 Data &normalized,
+                                 Data *normalizedStorage = nullptr);
 
         void RunPLE(const Data &hyperInput, const Data &inputIds,
                     RequestState &state, Data &output,

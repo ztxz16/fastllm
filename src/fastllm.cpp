@@ -4274,15 +4274,38 @@ namespace fastllm {
         }, {}, {{"groups", groups}});
     }
 
+    void Qwen4HyperMixProjected(const Data &normalized,
+                                const Data &lowRank, Data &upWeight,
+                                int groups, Data &output) {
+        curExecutor->Run("Qwen4HyperMix", {
+                {"input", (Data*)&normalized},
+                {"mixLogits", (Data*)&lowRank},
+                {"weight", &upWeight}, {"output", &output}
+        }, {}, {{"groups", groups}});
+    }
+
     void Qwen4HyperProject(const Data &normalized, Data &downWeight,
                            Data &injectionWeight, int groups,
                            Data &activated, Data &injection) {
+        Qwen4HyperProject(
+            normalized, downWeight, injectionWeight, groups,
+            activated, injection, DataType::DATA_AUTO_NONE);
+    }
+
+    void Qwen4HyperProject(const Data &normalized, Data &downWeight,
+                           Data &injectionWeight, int groups,
+                           Data &activated, Data &injection,
+                           DataType outputType) {
+        IntDict intParams = {{"groups", groups}};
+        if (outputType != DataType::DATA_AUTO_NONE) {
+            intParams["outputType"] = (int)outputType;
+        }
         curExecutor->Run("Qwen4HyperProject", {
                 {"input", (Data*)&normalized},
                 {"downWeight", &downWeight},
                 {"injectionWeight", &injectionWeight},
                 {"output", &activated}, {"injection", &injection}
-        }, {}, {{"groups", groups}});
+        }, {}, intParams);
     }
 
     void Qwen4HyperPrepare(const Data &lowRankProjection, int groups,
@@ -4312,13 +4335,32 @@ namespace fastllm {
             const Data &hyperInput, const Data &blockOutput,
             const Data &injection, const Data &normWeight,
             float eps, int groups, Data &residual, Data &normalized) {
-        curExecutor->Run("Qwen4HyperCombineRMSNorm", {
+        Qwen4HyperCombineRMSNorm(
+            hyperInput, blockOutput, injection, normWeight,
+            eps, groups, residual, normalized, nullptr,
+            DataType::FLOAT16);
+    }
+
+    void Qwen4HyperCombineRMSNorm(
+            const Data &hyperInput, const Data &blockOutput,
+            const Data &injection, const Data &normWeight,
+            float eps, int groups, Data &residual, Data &normalized,
+            Data *normalizedStorage, DataType normalizedStorageType) {
+        DataDict datas = {
                 {"input", (Data*)&hyperInput},
                 {"blockOutput", (Data*)&blockOutput},
                 {"injection", (Data*)&injection},
                 {"weight", (Data*)&normWeight},
                 {"output", &residual}, {"normalized", &normalized}
-        }, {{"eps", eps}}, {{"groups", groups}});
+        };
+        IntDict intParams = {{"groups", groups}};
+        if (normalizedStorage != nullptr) {
+            datas["normalizedStorage"] = normalizedStorage;
+            intParams["normalizedStorageType"] =
+                (int)normalizedStorageType;
+        }
+        curExecutor->Run("Qwen4HyperCombineRMSNorm", datas,
+                         {{"eps", eps}}, intParams);
     }
 
     void Qwen4QSASelect(const Data &query, const Data &compressedKeys,

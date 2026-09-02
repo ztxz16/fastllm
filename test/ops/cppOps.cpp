@@ -4437,6 +4437,8 @@ namespace {
                            "float32, float16 or bfloat16 activation type");
                 params.Add("compare_unfused", "1",
                            "return fused-minus-unfused outputs when set");
+                params.Add("normalized_storage", "1",
+                           "also return a float16 normalized storage mirror");
                 return params;
             },
             [](const OpTestParams &params, const std::string &device) {
@@ -4466,13 +4468,21 @@ namespace {
                     fastllm::ToDataType(block, type);
                     fastllm::ToDataType(injection, type);
                 }
-                fastllm::Data output, normalized;
+                fastllm::Data output, normalized, normalizedStorage;
+                fastllm::DataDict datas = {
+                    {"input", &input}, {"blockOutput", &block},
+                    {"injection", &injection}, {"weight", &weight},
+                    {"output", &output}, {"normalized", &normalized}
+                };
+                fastllm::IntDict intParams = {{"groups", groups}};
+                if (params.GetInt("normalized_storage") != 0) {
+                    datas["normalizedStorage"] = &normalizedStorage;
+                    intParams["normalizedStorageType"] =
+                        (int)fastllm::DataType::FLOAT16;
+                }
                 return CanRunOnDevice(
                     device, "Qwen4HyperCombineRMSNorm",
-                    {{"input", &input}, {"blockOutput", &block},
-                     {"injection", &injection}, {"weight", &weight},
-                     {"output", &output}, {"normalized", &normalized}},
-                    {{"eps", 1e-6f}}, {{"groups", groups}});
+                    datas, {{"eps", 1e-6f}}, intParams);
             },
             [](const OpTestParams &params, const std::string &device) {
                 const int sequence = params.GetInt("sequence");
@@ -4498,11 +4508,46 @@ namespace {
                     fastllm::ToDataType(block, type);
                     fastllm::ToDataType(injection, type);
                 }
-                fastllm::Data output, normalized;
+                fastllm::Data output, normalized, normalizedStorage;
+                fastllm::Data *normalizedStoragePtr =
+                    params.GetInt("normalized_storage") != 0
+                        ? &normalizedStorage : nullptr;
                 ScopedFirstDevice guard(device);
                 fastllm::Qwen4HyperCombineRMSNorm(
                     input, block, injection, weight, 1e-6f, groups,
-                    output, normalized);
+                    output, normalized, normalizedStoragePtr,
+                    fastllm::DataType::FLOAT16);
+                fastllm::Data storageCheck(fastllm::DataType::FLOAT32);
+                if (normalizedStoragePtr != nullptr) {
+                    fastllm::Data normalizedHost, storageHost;
+                    normalizedHost.CopyFrom(normalized);
+                    fastllm::ToDataType(
+                        normalizedHost, fastllm::DataType::FLOAT32);
+                    normalizedHost.ToDevice(fastllm::DataDevice::CPU);
+                    storageHost.CopyFrom(normalizedStorage);
+                    storageHost.ToDevice(fastllm::DataDevice::CPU);
+                    const int count = normalized.Count(0);
+                    storageCheck.Resize({count});
+                    storageCheck.Allocate(false);
+                    float *mismatch = (float*)storageCheck.cpuData;
+                    const float *normalizedData =
+                        (const float*)normalizedHost.cpuData;
+                    const uint16_t *storageData =
+                        (const uint16_t*)storageHost.cpuData;
+                    for (int i = 0; i < count; i++) {
+                        const float value = normalizedData[i];
+                        uint16_t expected = fastllm::float_to_half(value);
+                        const float rounded =
+                            fastllm::half_to_float(expected);
+                        if (std::isfinite(value) &&
+                            std::fabs(rounded) > std::fabs(value) &&
+                            (expected & 0x7fff) != 0) {
+                            expected--;
+                        }
+                        mismatch[i] = storageData[i] == expected
+                            ? 0.0f : 1.0f;
+                    }
+                }
                 if (params.GetInt("compare_unfused") != 0) {
                     fastllm::Data referenceOutput, referenceNormalized;
                     fastllm::Qwen4HyperCombine(
@@ -4521,13 +4566,23 @@ namespace {
                 fastllm::ToDataType(
                     combined, fastllm::DataType::FLOAT32);
                 combined.ToDevice(fastllm::DataDevice::CPU);
+                if (normalizedStoragePtr != nullptr) {
+                    fastllm::Data withStorage;
+                    fastllm::Cat(
+                        combined, storageCheck, 0, withStorage);
+                    withStorage.ToDevice(fastllm::DataDevice::CPU);
+                    return withStorage;
+                }
                 return combined;
             },
             [](const OpTestParams &params) {
                 const double sequence = params.GetInt("sequence");
                 const double groups = params.GetInt("groups");
                 const double hidden = params.GetInt("hidden");
-                return sequence * groups * hidden * 5.0 * sizeof(float);
+                return sequence * groups * hidden *
+                       (5.0 * sizeof(float) +
+                        (params.GetInt("normalized_storage") != 0
+                             ? sizeof(uint16_t) : 0));
             },
             [](const OpTestParams &params) {
                 const double sequence = params.GetInt("sequence");

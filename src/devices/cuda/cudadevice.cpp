@@ -5028,6 +5028,28 @@ namespace fastllm {
         Data &input = *datas.find("input")->second;
         Data &mixLogits = *datas.find("mixLogits")->second;
         const int groups = CudaQwen4Groups(intParams);
+        auto weightIt = datas.find("weight");
+        if (weightIt != datas.end()) {
+#ifdef CUDA_NO_TENSOR_CORE
+            return false;
+#else
+            Data &weight = *weightIt->second;
+            const int rows = mixLogits.dims.empty() ||
+                mixLogits.dims.back() <= 0 ? 0 :
+                (int)(mixLogits.Count(0) / mixLogits.dims.back());
+            return input.dataType == DataType::FLOAT32 &&
+                   mixLogits.dataType == DataType::FLOAT32 &&
+                   weight.dataType == DataType::FLOAT16 &&
+                   !input.dims.empty() && !mixLogits.dims.empty() &&
+                   weight.dims.size() == 2 && groups > 0 &&
+                   input.dims.back() % groups == 0 &&
+                   rows >= 8 &&
+                   mixLogits.Count(0) / mixLogits.dims.back() ==
+                       input.Count(0) / input.dims.back() &&
+                   mixLogits.dims.back() == weight.dims[1] &&
+                   input.dims.back() == weight.dims[0];
+#endif
+        }
         return !input.dims.empty() && groups > 0 &&
                input.dims.back() % groups == 0 &&
                input.dims == mixLogits.dims &&
@@ -5042,8 +5064,17 @@ namespace fastllm {
         Data &mixLogits = *datas.find("mixLogits")->second;
         Data &output = *datas.find("output")->second;
         const int groups = CudaQwen4Groups(intParams);
-        output.Allocate(false);
-        if (!FastllmCudaQwen4HyperMix(input, mixLogits, output, groups)) {
+        auto weightIt = datas.find("weight");
+        bool ok;
+        if (weightIt == datas.end()) {
+            output.Allocate(false);
+            ok = FastllmCudaQwen4HyperMix(
+                input, mixLogits, output, groups);
+        } else {
+            ok = FastllmCudaQwen4HyperMixProjected(
+                input, mixLogits, *weightIt->second, output, groups);
+        }
+        if (!ok) {
             ErrorInFastLLM(
                 "Qwen4HyperMix CUDA error: kernel rejected input.\n");
         }
@@ -5056,14 +5087,22 @@ namespace fastllm {
         Data &downWeight = *datas.find("downWeight")->second;
         Data &injectionWeight = *datas.find("injectionWeight")->second;
         const int groups = CudaQwen4Groups(intParams);
-        return input.dataType == DataType::FLOAT32 &&
-               downWeight.dataType == DataType::FLOAT16 &&
-               injectionWeight.dataType == DataType::FLOAT16 &&
-               !input.dims.empty() && downWeight.dims.size() == 2 &&
-               injectionWeight.dims.size() == 2 && groups > 0 &&
-               input.dims.back() == downWeight.dims[1] &&
-               input.dims.back() == injectionWeight.dims[1] &&
-               injectionWeight.dims[0] == groups;
+        auto outputTypeIt = intParams.find("outputType");
+        const DataType outputType = outputTypeIt == intParams.end()
+            ? input.dataType : (DataType)outputTypeIt->second;
+        if (outputType != DataType::FLOAT32 ||
+            downWeight.dataType != DataType::FLOAT16 ||
+            injectionWeight.dataType != DataType::FLOAT16 ||
+            input.dims.empty() || downWeight.dims.size() != 2 ||
+            injectionWeight.dims.size() != 2 || groups <= 0 ||
+            input.dims.back() != downWeight.dims[1] ||
+            input.dims.back() != injectionWeight.dims[1] ||
+            injectionWeight.dims[0] != groups) {
+            return false;
+        }
+        const int rows = (int)(input.Count(0) / input.dims.back());
+        return input.dataType == DataType::FLOAT32 ||
+               (input.dataType == DataType::FLOAT16 && rows >= 8);
     }
 
     void CudaQwen4HyperProjectOp::Run(
@@ -5184,6 +5223,15 @@ namespace fastllm {
             weight.Count(0) != (uint64_t)input.dims.back()) {
             return false;
         }
+        auto storageIt = datas.find("normalizedStorage");
+        if (storageIt != datas.end()) {
+            auto storageTypeIt = intParams.find("normalizedStorageType");
+            const DataType storageType = storageTypeIt == intParams.end()
+                ? DataType::FLOAT16 : (DataType)storageTypeIt->second;
+            if (!CudaQwen4ActivationType(storageType)) {
+                return false;
+            }
+        }
         const int rows = (int)(input.Count(0) / input.dims.back());
         return blockOutput.Count(0) ==
                    (uint64_t)rows * input.dims.back() / groups &&
@@ -5199,14 +5247,21 @@ namespace fastllm {
         Data &weight = *datas.find("weight")->second;
         Data &output = *datas.find("output")->second;
         Data &normalized = *datas.find("normalized")->second;
+        auto storageIt = datas.find("normalizedStorage");
+        Data *normalizedStorage = storageIt == datas.end()
+            ? nullptr : storageIt->second;
         const int groups = CudaQwen4Groups(intParams);
         const float eps = floatParams.find("eps") == floatParams.end()
             ? 1e-6f : floatParams.find("eps")->second;
         output.Allocate(false);
         normalized.Allocate(false);
+        if (normalizedStorage != nullptr) {
+            normalizedStorage->Allocate(false);
+        }
         if (!FastllmCudaQwen4HyperCombineRMSNorm(
                 input, blockOutput, injection, weight,
-                output, normalized, eps, groups)) {
+                output, normalized, eps, groups,
+                normalizedStorage)) {
             ErrorInFastLLM(
                 "Qwen4HyperCombineRMSNorm CUDA error: kernel rejected input.\n");
         }

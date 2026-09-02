@@ -1752,19 +1752,30 @@ namespace fastllm {
 
     void Qwen4ExpModel::HyperMixNormalized(
             Data &normalized, const std::string &prefix,
-            Data &mixedInput, Data *injectionWeights) {
+            Data &mixedInput, Data *injectionWeights,
+            const Data *projectionStorage) {
         Data lowRank, inputMix;
         Data &downWeight =
             this->weight[prefix + "input_mix_weight_down.weight"];
         if (injectionWeights != nullptr) {
             Data &injectionWeight =
                 this->weight[prefix + "block_inject_weight.weight"];
-            if (normalized.dataType == DataType::FLOAT32 &&
+            const bool halfProjectionWeights =
                 downWeight.dataType == DataType::FLOAT16 &&
-                injectionWeight.dataType == DataType::FLOAT16) {
+                injectionWeight.dataType == DataType::FLOAT16;
+            const bool useProjectionStorage =
+                projectionStorage != nullptr &&
+                projectionStorage->dataType == DataType::FLOAT16 &&
+                halfProjectionWeights;
+            if (halfProjectionWeights &&
+                (normalized.dataType == DataType::FLOAT32 ||
+                 useProjectionStorage)) {
+                const Data &projectionSource = useProjectionStorage
+                    ? *projectionStorage : normalized;
                 fastllm::Qwen4HyperProject(
-                    normalized, downWeight, injectionWeight,
-                    this->hcCount, lowRank, *injectionWeights);
+                    projectionSource, downWeight, injectionWeight,
+                    this->hcCount, lowRank, *injectionWeights,
+                    DataType::FLOAT32);
             } else {
                 Linear(normalized, downWeight, Data(), lowRank);
                 Linear(normalized, injectionWeight,
@@ -1779,10 +1790,28 @@ namespace fastllm {
             Mul(lowRank, 1.0f / (float)this->hcCount, lowRank);
             Silu(lowRank, lowRank);
         }
-        Linear(lowRank, this->weight[prefix + "input_mix_weight_up.weight"],
-               Data(), inputMix);
-        fastllm::Qwen4HyperMix(normalized, inputMix,
-                              this->hcCount, mixedInput);
+        Data &upWeight =
+            this->weight[prefix + "input_mix_weight_up.weight"];
+        bool mixedProjected = false;
+#if defined(USE_CUDA) && !defined(CUDA_NO_TENSOR_CORE)
+        const int rows = normalized.dims.empty()
+            ? 0 : (int)(normalized.Count(0) / normalized.dims.back());
+        if (!qwen4MtpDecodeEquivalentTarget && rows >= 8 &&
+            normalized.dataDevice == DataDevice::CUDA &&
+            normalized.dataType == DataType::FLOAT32 &&
+            lowRank.dataType == DataType::FLOAT32 &&
+            upWeight.dataType == DataType::FLOAT16) {
+            fastllm::Qwen4HyperMixProjected(
+                normalized, lowRank, upWeight,
+                this->hcCount, mixedInput);
+            mixedProjected = true;
+        }
+#endif
+        if (!mixedProjected) {
+            Linear(lowRank, upWeight, Data(), inputMix);
+            fastllm::Qwen4HyperMix(normalized, inputMix,
+                                  this->hcCount, mixedInput);
+        }
 
     }
 
@@ -1801,10 +1830,12 @@ namespace fastllm {
     void Qwen4ExpModel::HyperCombineRMSNorm(
             const Data &hyperInput, const Data &blockOutput,
             const Data &injectionWeights, Data &normWeight,
-            Data &output, Data &normalized) {
+            Data &output, Data &normalized,
+            Data *normalizedStorage) {
         fastllm::Qwen4HyperCombineRMSNorm(
             hyperInput, blockOutput, injectionWeights, normWeight,
-            this->rms_norm_eps, this->hcCount, output, normalized);
+            this->rms_norm_eps, this->hcCount, output, normalized,
+            normalizedStorage, DataType::FLOAT16);
     }
 
     void Qwen4ExpModel::MaterializePLEHostHistory(
@@ -7997,10 +8028,30 @@ namespace fastllm {
                                this->hcCount * this->embed_dim});
         DumpTensorIfRequested("embedding", *hiddenStates);
 
-        Data carriedAttentionNorm, finalHyperNorm;
+        Data carriedAttentionNorm, carriedAttentionProjection;
+        Data finalHyperNorm;
         bool hasCarriedAttentionNorm = false;
+        bool hasCarriedAttentionProjection = false;
         bool hasFinalHyperNorm = false;
         bool usedDecodeCudaGraph = false;
+        auto prefillProjectionStorage = [&](
+                const Data &reference, const std::string &prefix,
+                Data &storage) -> Data* {
+#ifdef USE_CUDA
+            const Data &downWeight =
+                this->weight[prefix + "input_mix_weight_down.weight"];
+            const Data &injectionWeight =
+                this->weight[prefix + "block_inject_weight.weight"];
+            if (verificationCapture == nullptr && inputIds.dims[1] >= 8 &&
+                reference.dataDevice == DataDevice::CUDA &&
+                reference.dataType == DataType::FLOAT32 &&
+                downWeight.dataType == DataType::FLOAT16 &&
+                injectionWeight.dataType == DataType::FLOAT16) {
+                return &storage;
+            }
+#endif
+            return nullptr;
+        };
         Data logits;
         int qsaPreviousLength = 0;
         for (int layer = 0; layer < this->block_cnt; layer++) {
@@ -8069,7 +8120,9 @@ namespace fastllm {
                 DumpTensorIfRequested("layer_" + std::to_string(layer) +
                                       "_ple", *hiddenStates);
                 carriedAttentionNorm.FreeSpace();
+                carriedAttentionProjection.FreeSpace();
                 hasCarriedAttentionNorm = false;
+                hasCarriedAttentionProjection = false;
 
                 // PLE depends on layer-0's residual and its ngram lookup can
                 // remain on the host, so this is the earliest stable CUDA
@@ -8112,10 +8165,18 @@ namespace fastllm {
                     this->weight[attentionHyperPrefix + "hc_norm.weight"],
                     attentionNorm);
             }
+            Data *attentionProjection =
+                hasCarriedAttentionProjection
+                    ? &carriedAttentionProjection : nullptr;
             HyperMixNormalized(*normalizedAttention, attentionHyperPrefix,
-                               attentionInput, &attentionInjection);
+                               attentionInput, &attentionInjection,
+                               attentionProjection);
             normalizedAttention->FreeSpace();
+            if (attentionProjection != nullptr) {
+                carriedAttentionProjection.FreeSpace();
+            }
             hasCarriedAttentionNorm = false;
+            hasCarriedAttentionProjection = false;
             const Data *layerPositionIds = &positionIds;
             if (this->IsLinearAttentionLayer(layer)) {
                 RunLinearAttention(layer, attentionInput,
@@ -8173,17 +8234,22 @@ namespace fastllm {
             }
             const std::string mlpHyperPrefix =
                 layerPrefix + "mlp_hyper_connection.";
-            Data mlpNorm;
+            Data mlpNorm, mlpProjection;
+            Data *mlpProjectionStorage =
+                prefillProjectionStorage(
+                    *hiddenStates, mlpHyperPrefix, mlpProjection);
             HyperCombineRMSNorm(
                 *hiddenStates, attentionOutput, attentionInjection,
                 this->weight[mlpHyperPrefix + "hc_norm.weight"],
-                *nextHiddenStates, mlpNorm);
+                *nextHiddenStates, mlpNorm, mlpProjectionStorage);
             std::swap(hiddenStates, nextHiddenStates);
 
             Data mlpInput, mlpInjection, mlpOutput;
             HyperMixNormalized(mlpNorm, mlpHyperPrefix,
-                               mlpInput, &mlpInjection);
+                               mlpInput, &mlpInjection,
+                               mlpProjectionStorage);
             mlpNorm.FreeSpace();
+            mlpProjection.FreeSpace();
             RunMoE(layer, mlpInput, mlpOutput);
             if (layer + 1 == this->block_cnt) {
                 const std::string finalHyperPrefix =
@@ -8199,18 +8265,26 @@ namespace fastllm {
                     languagePrefix + "layers." +
                     std::to_string(layer + 1) +
                     ".attn_hyper_connection.";
+                Data *carriedProjectionStorage =
+                    prefillProjectionStorage(
+                        *hiddenStates, nextAttentionHyperPrefix,
+                        carriedAttentionProjection);
                 HyperCombineRMSNorm(
                     *hiddenStates, mlpOutput, mlpInjection,
                     this->weight[nextAttentionHyperPrefix +
                                  "hc_norm.weight"],
-                    *nextHiddenStates, carriedAttentionNorm);
+                    *nextHiddenStates, carriedAttentionNorm,
+                    carriedProjectionStorage);
                 hasCarriedAttentionNorm = true;
+                hasCarriedAttentionProjection =
+                    carriedProjectionStorage != nullptr;
             } else {
                 // PLE changes the residual before the next attention norm, so
                 // this single boundary cannot be normalized ahead of time.
                 HyperCombine(*hiddenStates, mlpOutput, mlpInjection,
                              *nextHiddenStates);
                 hasCarriedAttentionNorm = false;
+                hasCarriedAttentionProjection = false;
             }
             std::swap(hiddenStates, nextHiddenStates);
             DumpTensorIfRequested("layer_" + std::to_string(layer) +

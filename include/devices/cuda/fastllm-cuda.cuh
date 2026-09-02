@@ -590,6 +590,15 @@ bool FastllmCudaQwen4PLECausalConv(
 bool FastllmCudaQwen4HyperMix(const fastllm::Data &normalized,
                               const fastllm::Data &mixLogits,
                               fastllm::Data &output, int groups);
+bool FastllmCudaQwen4HyperMixPromotedFloatLogits(
+        const fastllm::Data &normalized,
+        const fastllm::Data &mixLogits,
+        fastllm::Data &output, int groups);
+bool FastllmCudaQwen4HyperMixProjected(
+        const fastllm::Data &normalized,
+        const fastllm::Data &lowRank,
+        fastllm::Data &upWeight,
+        fastllm::Data &output, int groups);
 bool FastllmCudaQwen4HyperProject(const fastllm::Data &normalized,
                                   fastllm::Data &downWeight,
                                   fastllm::Data &injectionWeight,
@@ -612,7 +621,8 @@ bool FastllmCudaQwen4HyperCombineRMSNorm(
     const fastllm::Data &normWeight,
     fastllm::Data &residual,
     fastllm::Data &normalized,
-    float eps, int groups);
+    float eps, int groups,
+    fastllm::Data *normalizedStorage = nullptr);
 bool FastllmCudaQwen4QSASelect(const fastllm::Data &query,
                                const fastllm::Data &compressedKeys,
                                fastllm::Data &indices, int keyLength,

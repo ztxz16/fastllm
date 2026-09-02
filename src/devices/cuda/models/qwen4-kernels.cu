@@ -373,6 +373,70 @@ namespace {
         }
     }
 
+    template <typename LogitT>
+    __global__ void Qwen4HyperMixPromotedFloatKernel(
+            const float *normalized, const LogitT *mixLogits, float *output,
+            uint64_t count, int groups, int outputChannels) {
+        const uint64_t outputIndex = (uint64_t)blockIdx.x * blockDim.x +
+                                     threadIdx.x;
+        if (outputIndex >= count) {
+            return;
+        }
+        const uint64_t row = outputIndex / outputChannels;
+        const int channel = (int)(outputIndex % outputChannels);
+        const uint64_t inputBase = row * groups * outputChannels;
+        float sum = 0.0f;
+        for (int group = 0; group < groups; group++) {
+            const uint64_t inputIndex = inputBase +
+                (uint64_t)group * outputChannels + channel;
+            const float gate = Qwen4CudaSigmoidRounded<float>(
+                Qwen4CudaToFloat(mixLogits[inputIndex]));
+            const float product = normalized[inputIndex] * gate;
+            sum = group == 0 ? product : sum + product;
+        }
+        output[outputIndex] = sum / groups;
+    }
+
+    template <typename LogitT>
+    __global__ void Qwen4HyperMixFourGroupPromotedFloatKernel(
+            const float *normalized, const LogitT *mixLogits, float *output,
+            uint64_t count, int outputChannels) {
+        constexpr int groups = 4;
+        const int group = threadIdx.x & (groups - 1);
+        const int itemInBlock = threadIdx.x / groups;
+        const int itemsPerBlock = blockDim.x / groups;
+        const uint64_t outputIndex =
+            (uint64_t)blockIdx.x * itemsPerBlock + itemInBlock;
+        float inputValue = 0.0f;
+        float gate = 0.0f;
+        if (outputIndex < count) {
+            const uint64_t row = outputIndex / outputChannels;
+            const int channel = (int)(outputIndex % outputChannels);
+            const uint64_t inputIndex =
+                row * groups * outputChannels +
+                (uint64_t)group * outputChannels + channel;
+            inputValue = normalized[inputIndex];
+            gate = Qwen4CudaSigmoidRounded<float>(
+                Qwen4CudaToFloat(mixLogits[inputIndex]));
+        }
+        const unsigned int mask = __activemask();
+        const float input0 = __shfl_sync(mask, inputValue, 0, groups);
+        const float input1 = __shfl_sync(mask, inputValue, 1, groups);
+        const float input2 = __shfl_sync(mask, inputValue, 2, groups);
+        const float input3 = __shfl_sync(mask, inputValue, 3, groups);
+        const float gate0 = __shfl_sync(mask, gate, 0, groups);
+        const float gate1 = __shfl_sync(mask, gate, 1, groups);
+        const float gate2 = __shfl_sync(mask, gate, 2, groups);
+        const float gate3 = __shfl_sync(mask, gate, 3, groups);
+        if (group == 0 && outputIndex < count) {
+            float sum = __fmul_rn(input0, gate0);
+            sum = __fmaf_rn(input1, gate1, sum);
+            sum = __fmaf_rn(input2, gate2, sum);
+            sum = __fmaf_rn(input3, gate3, sum);
+            output[outputIndex] = sum / groups;
+        }
+    }
+
     template <typename T, typename LogitT>
     void Qwen4LaunchHyperMix(const void *normalized, const void *mixLogits,
                              void *output, int blocks, int threads,
@@ -594,6 +658,7 @@ namespace {
             const T *hyperInput, const void *blockOutput, int blockType,
             const void *injection, int injectionType,
             const float *weight, T *residual, T *normalized,
+            void *normalizedStorage, int normalizedStorageType,
             int rows, int groups, int groupChannels, float eps) {
         const int item = blockIdx.x;
         if (item >= rows * groups) {
@@ -817,6 +882,17 @@ namespace {
                         __bfloat162float(groupResidual[channel]) *
                         normScale * groupWeight[channel]);
                 }
+            }
+        }
+
+        if (normalizedStorage != nullptr) {
+            __syncthreads();
+            for (int channel = threadIdx.x; channel < groupChannels;
+                 channel += THREADS) {
+                const uint64_t index = hyperBase + channel;
+                Qwen4CudaStoreCast(
+                    normalizedStorage, normalizedStorageType, index,
+                    Qwen4CudaToFloat(groupNormalized[channel]));
             }
         }
     }
@@ -2533,6 +2609,46 @@ bool FastllmCudaQwen4HyperMix(
     return cudaGetLastError() == cudaSuccess;
 }
 
+bool FastllmCudaQwen4HyperMixPromotedFloatLogits(
+        const fastllm::Data &normalized,
+        const fastllm::Data &mixLogits,
+        fastllm::Data &output, int groups) {
+    if (normalized.dataDevice != fastllm::DataDevice::CUDA ||
+        mixLogits.dataDevice != fastllm::DataDevice::CUDA ||
+        output.dataDevice != fastllm::DataDevice::CUDA ||
+        normalized.dataType != fastllm::DataType::FLOAT32 ||
+        mixLogits.dataType != fastllm::DataType::FLOAT16 ||
+        output.dataType != fastllm::DataType::FLOAT32 ||
+        normalized.cudaData == nullptr || mixLogits.cudaData == nullptr ||
+        output.cudaData == nullptr || normalized.dims.empty() || groups <= 0 ||
+        normalized.dims != mixLogits.dims ||
+        normalized.dims.back() % groups != 0) {
+        return false;
+    }
+    const int outputChannels = normalized.dims.back() / groups;
+    const uint64_t count = normalized.Count(0) / groups;
+    constexpr int threads = 256;
+    if (groups == 4) {
+        const int itemsPerBlock = threads / groups;
+        const int blocks = (int)((count + itemsPerBlock - 1) /
+                                 itemsPerBlock);
+        Qwen4HyperMixFourGroupPromotedFloatKernel<half><<<
+            blocks, threads, 0, cudaStreamPerThread>>>(
+            (const float*)normalized.cudaData,
+            (const half*)mixLogits.cudaData,
+            (float*)output.cudaData, count, outputChannels);
+    } else {
+        const int blocks = (int)((count + threads - 1) / threads);
+        Qwen4HyperMixPromotedFloatKernel<half><<<
+            blocks, threads, 0, cudaStreamPerThread>>>(
+            (const float*)normalized.cudaData,
+            (const half*)mixLogits.cudaData,
+            (float*)output.cudaData, count, groups, outputChannels);
+    }
+    DeviceSync();
+    return cudaGetLastError() == cudaSuccess;
+}
+
 bool FastllmCudaQwen4HyperPrepare(
         const fastllm::Data &input,
         fastllm::Data &activated, int groups) {
@@ -2660,7 +2776,8 @@ bool FastllmCudaQwen4HyperCombineRMSNorm(
         const fastllm::Data &normWeight,
         fastllm::Data &residual,
         fastllm::Data &normalized,
-        float eps, int groups) {
+        float eps, int groups,
+        fastllm::Data *normalizedStorage) {
     if (hyperInput.dataDevice != fastllm::DataDevice::CUDA ||
         blockOutput.dataDevice != fastllm::DataDevice::CUDA ||
         injection.dataDevice != fastllm::DataDevice::CUDA ||
@@ -2676,6 +2793,11 @@ bool FastllmCudaQwen4HyperCombineRMSNorm(
         hyperInput.dataType != normalized.dataType ||
         residual.dims != hyperInput.dims ||
         normalized.dims != hyperInput.dims ||
+        (normalizedStorage != nullptr &&
+         (normalizedStorage->dataDevice != fastllm::DataDevice::CUDA ||
+          normalizedStorage->cudaData == nullptr ||
+          normalizedStorage->dims != hyperInput.dims ||
+          !Qwen4CudaActivationType(normalizedStorage->dataType))) ||
         normWeight.dataType != fastllm::DataType::FLOAT32 ||
         !Qwen4CudaActivationType(hyperInput.dataType) ||
         !Qwen4CudaActivationType(blockOutput.dataType) ||
@@ -2692,6 +2814,11 @@ bool FastllmCudaQwen4HyperCombineRMSNorm(
 
     constexpr int threads = 512;
     const int blocks = rows * groups;
+    void *storageData = normalizedStorage == nullptr
+        ? nullptr : normalizedStorage->cudaData;
+    const int storageType = normalizedStorage == nullptr
+        ? (int)fastllm::DataType::FLOAT16
+        : (int)normalizedStorage->dataType;
     if (hyperInput.dataType == fastllm::DataType::FLOAT32) {
         Qwen4HyperCombineRMSNormKernel<float, threads><<<
             blocks, threads, 0, cudaStreamPerThread>>>(
@@ -2700,6 +2827,7 @@ bool FastllmCudaQwen4HyperCombineRMSNorm(
             injection.cudaData, (int)injection.dataType,
             (const float*)normWeight.cudaData,
             (float*)residual.cudaData, (float*)normalized.cudaData,
+            storageData, storageType,
             rows, groups, groupChannels, eps);
     } else if (hyperInput.dataType == fastllm::DataType::FLOAT16) {
         Qwen4HyperCombineRMSNormKernel<half, threads><<<
@@ -2709,6 +2837,7 @@ bool FastllmCudaQwen4HyperCombineRMSNorm(
             injection.cudaData, (int)injection.dataType,
             (const float*)normWeight.cudaData,
             (half*)residual.cudaData, (half*)normalized.cudaData,
+            storageData, storageType,
             rows, groups, groupChannels, eps);
     } else {
         Qwen4HyperCombineRMSNormKernel<__nv_bfloat16, threads><<<
@@ -2719,6 +2848,7 @@ bool FastllmCudaQwen4HyperCombineRMSNorm(
             (const float*)normWeight.cudaData,
             (__nv_bfloat16*)residual.cudaData,
             (__nv_bfloat16*)normalized.cudaData,
+            storageData, storageType,
             rows, groups, groupChannels, eps);
     }
     DeviceSync();

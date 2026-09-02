@@ -358,8 +358,24 @@ namespace fastllm {
         Data &mixLogits = *datas.find("mixLogits")->second;
         Data &output = *datas.find("output")->second;
         const int groups = Qwen4Groups(intParams);
-        AssertInFastLLM(!input.dims.empty() && input.dims == mixLogits.dims &&
-                        groups > 0 && input.dims.back() % groups == 0,
+        auto weightIt = datas.find("weight");
+        const bool projected = weightIt != datas.end();
+        bool compatible = !input.dims.empty() && groups > 0 &&
+                          input.dims.back() % groups == 0;
+        if (projected) {
+            Data &weight = *weightIt->second;
+            compatible = compatible && !mixLogits.dims.empty() &&
+                mixLogits.dims.back() > 0 &&
+                weight.dims.size() == 2 &&
+                mixLogits.Count(0) / mixLogits.dims.back() ==
+                    input.Count(0) / input.dims.back() &&
+                mixLogits.dims.back() == weight.dims[1] &&
+                input.dims.back() == weight.dims[0];
+            weight.weightType = WeightType::LINEAR;
+        } else {
+            compatible = compatible && input.dims == mixLogits.dims;
+        }
+        AssertInFastLLM(compatible,
                         "Qwen4HyperMix received incompatible shapes.\n");
         std::vector<int> dims = input.dims;
         dims.back() /= groups;
@@ -375,14 +391,26 @@ namespace fastllm {
         Data &output = *datas.find("output")->second;
         const int groups = Qwen4Groups(intParams);
         Qwen4AssertCpuTensor(normalized, "Qwen4HyperMix input");
-        Qwen4AssertCpuTensor(mixLogits, "Qwen4HyperMix logits");
+        Data projectedLogits;
+        Data *effectiveLogits = &mixLogits;
+        auto weightIt = datas.find("weight");
+        if (weightIt != datas.end()) {
+            Data &weight = *weightIt->second;
+            Qwen4AssertCpuTensor(mixLogits, "Qwen4HyperMix low rank");
+            Qwen4AssertCpuTensor(weight, "Qwen4HyperMix up weight");
+            DoCpuLinearReshape(mixLogits, weight, projectedLogits);
+            Data emptyBias;
+            DoCpuLinear(mixLogits, weight, emptyBias, projectedLogits);
+            effectiveLogits = &projectedLogits;
+        }
+        Qwen4AssertCpuTensor(*effectiveLogits, "Qwen4HyperMix logits");
         output.Allocate(false);
 
         const int channels = normalized.dims.back();
         const int outputChannels = channels / groups;
         const int rows = (int)(normalized.Count(0) / channels);
         const DataType type = normalized.dataType;
-        const DataType logitsType = mixLogits.dataType;
+        const DataType logitsType = effectiveLogits->dataType;
         Qwen4ParallelFor(rows, [&](int start, int end) {
             for (int row = start; row < end; row++) {
                 const uint64_t inputBase = (uint64_t)row * channels;
@@ -394,7 +422,8 @@ namespace fastllm {
                             (uint64_t)group * outputChannels + channel;
                         const float nativeGate = Qwen4RoundCpu(
                             Qwen4SigmoidCpu(Qwen4LoadCpu(
-                                mixLogits.cpuData, logitsType, index)),
+                                effectiveLogits->cpuData,
+                                logitsType, index)),
                             logitsType);
                         const float gate = Qwen4RoundCpu(nativeGate, type);
                         const float product = Qwen4RoundCpu(
@@ -433,8 +462,15 @@ namespace fastllm {
         activatedDims.back() = downWeight.dims[0];
         std::vector<int> injectionDims = input.dims;
         injectionDims.back() = injectionWeight.dims[0];
-        activated.dataType = input.dataType;
-        injection.dataType = input.dataType;
+        auto outputTypeIt = intParams.find("outputType");
+        const DataType outputType = outputTypeIt == intParams.end()
+            ? input.dataType : (DataType)outputTypeIt->second;
+        AssertInFastLLM(Qwen4ActivationType(outputType),
+                        "Qwen4HyperProject output type is invalid.\n");
+        activated.dataType = outputType;
+        injection.dataType = outputType;
+        activated.UpdateUnitSize();
+        injection.UpdateUnitSize();
         activated.Resize(activatedDims);
         injection.Resize(injectionDims);
     }
@@ -453,9 +489,41 @@ namespace fastllm {
         Qwen4AssertCpuTensor(
             injectionWeight, "Qwen4HyperProject injection weight");
 
+        Data temporaryActivated(input.dataType);
+        Data temporaryInjection(input.dataType);
+        Data *linearActivated = &activated;
+        Data *linearInjection = &injection;
+        if (input.dataType != activated.dataType) {
+            temporaryActivated.Resize(activated.dims);
+            temporaryInjection.Resize(injection.dims);
+            linearActivated = &temporaryActivated;
+            linearInjection = &temporaryInjection;
+        }
         Data emptyBias;
-        DoCpuLinear(input, downWeight, emptyBias, activated);
-        DoCpuLinear(input, injectionWeight, emptyBias, injection);
+        DoCpuLinear(input, downWeight, emptyBias, *linearActivated);
+        DoCpuLinear(input, injectionWeight, emptyBias, *linearInjection);
+        if (linearActivated != &activated) {
+            activated.Allocate(false);
+            injection.Allocate(false);
+            const int activatedCount = (int)activated.Count(0);
+            const int injectionCount = (int)injection.Count(0);
+            Qwen4ParallelFor(activatedCount, [&](int start, int end) {
+                for (int index = start; index < end; index++) {
+                    Qwen4StoreCpu(activated.cpuData, activated.dataType,
+                                  index, Qwen4LoadCpu(
+                                      linearActivated->cpuData,
+                                      linearActivated->dataType, index));
+                }
+            });
+            Qwen4ParallelFor(injectionCount, [&](int start, int end) {
+                for (int index = start; index < end; index++) {
+                    Qwen4StoreCpu(injection.cpuData, injection.dataType,
+                                  index, Qwen4LoadCpu(
+                                      linearInjection->cpuData,
+                                      linearInjection->dataType, index));
+                }
+            });
+        }
 
         const DataType type = activated.dataType;
         const int activatedCount = (int)activated.Count(0);
@@ -616,6 +684,19 @@ namespace fastllm {
         normalized.dataType = input.dataType;
         normalized.UpdateUnitSize();
         normalized.Resize(input.dims);
+        auto storageIt = datas.find("normalizedStorage");
+        if (storageIt != datas.end()) {
+            auto storageTypeIt = intParams.find("normalizedStorageType");
+            const DataType storageType = storageTypeIt == intParams.end()
+                ? DataType::FLOAT16 : (DataType)storageTypeIt->second;
+            AssertInFastLLM(
+                Qwen4ActivationType(storageType),
+                "Qwen4HyperCombineRMSNorm storage type is invalid.\n");
+            Data &storage = *storageIt->second;
+            storage.dataType = storageType;
+            storage.UpdateUnitSize();
+            storage.Resize(input.dims);
+        }
     }
 
     void CpuQwen4HyperCombineRMSNormOp::Run(
@@ -627,6 +708,9 @@ namespace fastllm {
         Data &weight = *datas.find("weight")->second;
         Data &output = *datas.find("output")->second;
         Data &normalized = *datas.find("normalized")->second;
+        auto storageIt = datas.find("normalizedStorage");
+        Data *normalizedStorage = storageIt == datas.end()
+            ? nullptr : storageIt->second;
         const int groups = Qwen4Groups(intParams);
         const float eps = floatParams.find("eps") == floatParams.end()
             ? 1e-6f : floatParams.find("eps")->second;
@@ -652,6 +736,9 @@ namespace fastllm {
             "Qwen4HyperCombineRMSNorm shape mismatch.\n");
         output.Allocate(false);
         normalized.Allocate(false);
+        if (normalizedStorage != nullptr) {
+            normalizedStorage->Allocate(false);
+        }
 
         const DataType type = hyperInput.dataType;
         const DataType blockType = blockOutput.dataType;
@@ -691,8 +778,23 @@ namespace fastllm {
                     const float normWeight = Qwen4LoadCpu(
                         weight.cpuData, weight.dataType,
                         (uint64_t)group * groupChannels + channel);
-                    Qwen4StoreCpu(normalized.cpuData, type, index,
-                                  value * normScale * normWeight);
+                    const float normalizedValue =
+                        value * normScale * normWeight;
+                    Qwen4StoreCpu(normalized.cpuData, type,
+                                  index, normalizedValue);
+                    if (normalizedStorage != nullptr) {
+                        const float rounded = Qwen4LoadCpu(
+                            normalized.cpuData, type, index);
+                        if (normalizedStorage->dataType ==
+                                DataType::FLOAT16) {
+                            ((uint16_t*)normalizedStorage->cpuData)[index] =
+                                Qwen4FloatToHalfRz(rounded);
+                        } else {
+                            Qwen4StoreCpu(normalizedStorage->cpuData,
+                                          normalizedStorage->dataType,
+                                          index, rounded);
+                        }
+                    }
                 }
             }
         });

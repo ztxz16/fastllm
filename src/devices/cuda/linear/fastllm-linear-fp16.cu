@@ -1381,6 +1381,178 @@ bool FastllmCudaMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight,
     return true;
 }
 
+// Run two FP16 projections of the same activation after materializing a shared
+// FP16 input when needed. This follows FastllmCudaMatMulFloat16's prefill
+// arithmetic exactly; only the duplicate input conversion is removed.
+static bool FastllmCudaMatMulFloat16PairSharedInput(
+        const fastllm::Data &input,
+        fastllm::Data &firstWeight, fastllm::Data &firstOutput,
+        fastllm::Data &secondWeight, fastllm::Data &secondOutput,
+        int n, int m, int firstK, int secondK) {
+    void *cudaInput = FastllmCudaPrepareInput(input);
+    float *cudaFirstOutput = (float*)FastllmCudaPrepareOutput(firstOutput);
+    float *cudaSecondOutput = (float*)FastllmCudaPrepareOutput(secondOutput);
+    if (cudaInput == nullptr || cudaFirstOutput == nullptr ||
+        cudaSecondOutput == nullptr) {
+        if (cudaInput != nullptr) {
+            FastllmCudaFinishInput(input, cudaInput);
+        }
+        if (cudaFirstOutput != nullptr) {
+            FastllmCudaFinishOutput(firstOutput, cudaFirstOutput);
+        }
+        if (cudaSecondOutput != nullptr) {
+            FastllmCudaFinishOutput(secondOutput, cudaSecondOutput);
+        }
+        return false;
+    }
+
+    const bool convertInput = input.dataType == fastllm::DataType::FLOAT32;
+    half *cudaFp16Input = convertInput
+        ? (half*)FastllmCudaMalloc((size_t)n * m * sizeof(half))
+        : (half*)cudaInput;
+    if (cudaFp16Input == nullptr) {
+        FastllmCudaFinishInput(input, cudaInput);
+        FastllmCudaFinishOutput(firstOutput, cudaFirstOutput);
+        FastllmCudaFinishOutput(secondOutput, cudaSecondOutput);
+        return false;
+    }
+    if (convertInput) {
+        const int inputLength = n * m;
+        const int threads = std::min(256, inputLength);
+        FastllmCudaFloat2HalfKernel<<<
+            (inputLength - 1) / threads + 1, threads>>>(
+            (float*)cudaInput, cudaFp16Input, inputLength);
+    }
+
+    auto handle = getFastllmCublasHandle();
+    auto project = [&](fastllm::Data &weight, float *output, int k) {
+#ifdef CUDA_NO_TENSOR_CORE
+        const float alpha = 1.0f, beta = 0.0f;
+        const cublasStatus_t status = cublasGemmEx(
+            handle, CUBLAS_OP_T, CUBLAS_OP_N, k, n, m,
+            &alpha, (half*)weight.cudaData, CUDA_R_16F, m,
+            cudaFp16Input, CUDA_R_16F, m, &beta,
+            output, CUDA_R_32F, k, CUDA_R_32F,
+            static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+        return status == CUBLAS_STATUS_SUCCESS;
+#else
+        half *cudaFp16Output =
+            (half*)FastllmCudaMalloc((size_t)n * k * sizeof(half));
+        if (cudaFp16Output == nullptr) {
+            return false;
+        }
+        const half alpha = __float2half_rn(1.0f);
+        const half beta = __float2half_rn(0.0f);
+        const cublasStatus_t status = cublasGemmEx(
+            handle, CUBLAS_OP_T, CUBLAS_OP_N, k, n, m,
+            &alpha, (half*)weight.cudaData, CUDA_R_16F, m,
+            cudaFp16Input, CUDA_R_16F, m, &beta,
+            cudaFp16Output, CUDA_R_16F, k, CUDA_R_16F,
+            static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+        if (status == CUBLAS_STATUS_SUCCESS) {
+            const int outputLength = n * k;
+            const int outputThreads = std::min(256, outputLength);
+            FastllmCudaHalf2FloatKernel<<<
+                (outputLength - 1) / outputThreads + 1, outputThreads>>>(
+                cudaFp16Output, output, outputLength);
+        }
+        FastllmCudaFree(cudaFp16Output);
+        return status == CUBLAS_STATUS_SUCCESS;
+#endif
+    };
+
+    const bool success =
+        project(firstWeight, cudaFirstOutput, firstK) &&
+        project(secondWeight, cudaSecondOutput, secondK);
+    if (convertInput) {
+        FastllmCudaFree(cudaFp16Input);
+    }
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(firstOutput, cudaFirstOutput);
+    FastllmCudaFinishOutput(secondOutput, cudaSecondOutput);
+    return success && cudaGetLastError() == cudaSuccess;
+}
+
+bool FastllmCudaQwen4HyperMixProjected(
+        const fastllm::Data &normalized,
+        const fastllm::Data &lowRank,
+        fastllm::Data &upWeight,
+        fastllm::Data &output, int groups) {
+#ifdef CUDA_NO_TENSOR_CORE
+    return false;
+#else
+    if (normalized.dataDevice != fastllm::DataDevice::CUDA ||
+        lowRank.dataDevice != fastllm::DataDevice::CUDA ||
+        upWeight.dataDevice != fastllm::DataDevice::CUDA ||
+        output.dataDevice != fastllm::DataDevice::CUDA ||
+        normalized.dataType != fastllm::DataType::FLOAT32 ||
+        lowRank.dataType != fastllm::DataType::FLOAT32 ||
+        upWeight.dataType != fastllm::DataType::FLOAT16 ||
+        normalized.dims.empty() || lowRank.dims.empty() ||
+        upWeight.dims.size() != 2 || groups <= 0 ||
+        normalized.dims.back() % groups != 0 ||
+        lowRank.dims.back() != upWeight.dims[1] ||
+        normalized.dims.back() != upWeight.dims[0]) {
+        return false;
+    }
+    const int m = lowRank.dims.back();
+    const int n = (int)(lowRank.Count(0) / m);
+    const int k = upWeight.dims[0];
+    if (n < 8 || normalized.Count(0) != (uint64_t)n * k) {
+        return false;
+    }
+
+    float *cudaInput = (float*)FastllmCudaPrepareInput(lowRank);
+    half *cudaFp16Input =
+        (half*)FastllmCudaMalloc((size_t)n * m * sizeof(half));
+    fastllm::Data projected(fastllm::DataType::FLOAT16);
+    projected.Resize(normalized.dims);
+    projected.ToDevice(fastllm::DataDevice::CUDA,
+                       normalized.dataDeviceIds);
+    projected.Allocate(false);
+    half *cudaProjected =
+        (half*)FastllmCudaPrepareOutput(projected);
+    if (cudaInput == nullptr || cudaProjected == nullptr ||
+        cudaFp16Input == nullptr) {
+        if (cudaInput != nullptr) {
+            FastllmCudaFinishInput(lowRank, cudaInput);
+        }
+        if (cudaProjected != nullptr) {
+            FastllmCudaFinishOutput(projected, cudaProjected);
+        }
+        if (cudaFp16Input != nullptr) {
+            FastllmCudaFree(cudaFp16Input);
+        }
+        return false;
+    }
+
+    const int inputLength = n * m;
+    const int threads = std::min(256, inputLength);
+    FastllmCudaFloat2HalfKernel<<<
+        (inputLength - 1) / threads + 1, threads>>>(
+        cudaInput, cudaFp16Input, inputLength);
+    const half alpha = __float2half_rn(1.0f);
+    const half beta = __float2half_rn(0.0f);
+    const cublasStatus_t status = cublasGemmEx(
+        getFastllmCublasHandle(), CUBLAS_OP_T, CUBLAS_OP_N,
+        k, n, m, &alpha,
+        (half*)upWeight.cudaData, CUDA_R_16F, m,
+        cudaFp16Input, CUDA_R_16F, m, &beta,
+        cudaProjected, CUDA_R_16F, k, CUDA_R_16F,
+        static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+    FastllmCudaFree(cudaFp16Input);
+    FastllmCudaFinishInput(lowRank, cudaInput);
+    FastllmCudaFinishOutput(projected, cudaProjected);
+    if (status != CUBLAS_STATUS_SUCCESS ||
+        cudaGetLastError() != cudaSuccess) {
+        return false;
+    }
+    output.Allocate(false);
+    return FastllmCudaQwen4HyperMixPromotedFloatLogits(
+        normalized, projected, output, groups);
+#endif
+}
+
 bool FastllmCudaQwen4HyperProject(
         const fastllm::Data &input, fastllm::Data &downWeight,
         fastllm::Data &injectionWeight, fastllm::Data &activated,
@@ -1390,7 +1562,8 @@ bool FastllmCudaQwen4HyperProject(
         injectionWeight.dataDevice != fastllm::DataDevice::CUDA ||
         activated.dataDevice != fastllm::DataDevice::CUDA ||
         injection.dataDevice != fastllm::DataDevice::CUDA ||
-        input.dataType != fastllm::DataType::FLOAT32 ||
+        (input.dataType != fastllm::DataType::FLOAT32 &&
+         input.dataType != fastllm::DataType::FLOAT16) ||
         downWeight.dataType != fastllm::DataType::FLOAT16 ||
         injectionWeight.dataType != fastllm::DataType::FLOAT16 ||
         activated.dataType != fastllm::DataType::FLOAT32 ||
@@ -1414,16 +1587,14 @@ bool FastllmCudaQwen4HyperProject(
         return false;
     }
 
-    // Prefill keeps the tuned GEMM implementations.  Small decode/verifier
-    // batches use the fused row grid, which exactly mirrors the native GEMV.
-    if (n <= 0 || n >= 8) {
-        fastllm::Data emptyBias;
-        if (!FastllmCudaMatMulFloat16(
-                input, downWeight, emptyBias,
-                activated, n, m, downRows) ||
-            !FastllmCudaMatMulFloat16(
-                input, injectionWeight, emptyBias,
-                injection, n, m, injectionRows) ||
+    // Prefill keeps the tuned GEMM implementations. Small float32
+    // decode/verifier batches use the fused row grid, which exactly mirrors
+    // the native GEMV; prepared float16 storage is a prefill-only input.
+    if (n >= 8) {
+        if (!FastllmCudaMatMulFloat16PairSharedInput(
+                input, downWeight, activated,
+                injectionWeight, injection,
+                n, m, downRows, injectionRows) ||
             !FastllmCudaQwen4HyperPrepare(
                 activated, activated, groups) ||
             !FastllmCudaQwen4HyperInject(
@@ -1431,6 +1602,9 @@ bool FastllmCudaQwen4HyperProject(
             return false;
         }
         return true;
+    }
+    if (n <= 0 || input.dataType != fastllm::DataType::FLOAT32) {
+        return false;
     }
 
     fastllm::Data emptyBias;
