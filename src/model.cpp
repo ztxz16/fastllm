@@ -2930,6 +2930,7 @@ namespace fastllm {
             {"qwen2", "qwen2"}, // llama
             {"qwen3moe", "qwen3_moe"}, {"qwen3_moe", "qwen3_moe"}, // qwen3_moe
             {"qwen35", "qwen3_5"}, {"qwen3_5", "qwen3_5"}, // qwen3.5
+            {"qwen35moe", "qwen3_5_moe"}, {"qwen3_5_moe", "qwen3_5_moe"},
             {"glm4_moe", "glm4_moe"}, // glm4_moe
             {"glm-dsa", "glm_moe_dsa"}, {"glm_moe_dsa", "glm_moe_dsa"}, // glm_moe_dsa
             {"minimax_m2", "minimax_m2"}, // minimax_m2
@@ -2943,35 +2944,334 @@ namespace fastllm {
         }
     }
 
-    static int GetGLMDSAGGUFMainLayerCount(const json11::Json &params,
-                                           const std::string &arch,
-                                           const basellm *model) {
-        if (model == nullptr || model->model_type != "glm_moe_dsa") {
-            return -1;
-        }
-
+    static json11::Json GetGGUFArchParam(const json11::Json &params,
+                                         const std::string &arch,
+                                         const std::string &suffix) {
         std::string ggufArch = params["general.architecture"].string_value();
         if (ggufArch.empty()) {
             ggufArch = arch;
         }
+        auto value = params[ggufArch + "." + suffix];
+        if (value.is_null() && ggufArch != arch) {
+            value = params[arch + "." + suffix];
+        }
+        return value;
+    }
 
-        int blockCount = model->block_cnt;
-        if (!params[ggufArch + ".block_count"].is_null()) {
-            blockCount = params[ggufArch + ".block_count"].int_value();
-        } else if (!params[arch + ".block_count"].is_null()) {
-            blockCount = params[arch + ".block_count"].int_value();
+    static std::string GGUFJsonToDictValue(const json11::Json &value) {
+        return value.is_string() ? value.string_value() : value.dump();
+    }
+
+    static void AddGGUFDictIfMissing(basellm *model, const std::string &key,
+                                     const std::string &value) {
+        if (model->weight.dicts.find(key) == model->weight.dicts.end()) {
+            model->weight.AddDict(key, value);
+        }
+    }
+
+    // Preserve architecture metadata under its standard suffix and translate
+    // common GGUF names to the configuration names consumed by FastLLM model
+    // classes. This keeps architecture-specific fields available without
+    // duplicating every metadata entry in the model dictionary.
+    static void LoadGGUFModelConfig(const json11::Json &params,
+                                    const std::string &arch,
+                                    basellm *model) {
+        const std::string prefix = arch + ".";
+        for (const auto &item : params.object_items()) {
+            if (item.first.rfind(prefix, 0) == 0) {
+                AddGGUFDictIfMissing(model, item.first.substr(prefix.size()),
+                                     GGUFJsonToDictValue(item.second));
+            }
+        }
+
+        AddGGUFDictIfMissing(model, "model_type",
+                             ConvertGGUFTypeToFastllmType(arch));
+
+        auto addAlias = [&](const std::string &dictKey,
+                            const std::string &ggufSuffix) {
+            auto value = GetGGUFArchParam(params, arch, ggufSuffix);
+            if (!value.is_null()) {
+                AddGGUFDictIfMissing(model, dictKey,
+                                     GGUFJsonToDictValue(value));
+            }
+        };
+        const std::vector<std::pair<std::string, std::string> > aliases = {
+            {"hidden_size", "embedding_length"},
+            {"intermediate_size", "feed_forward_length"},
+            {"max_position_embeddings", "context_length"},
+            {"num_attention_heads", "attention.head_count"},
+            {"num_key_value_heads", "attention.head_count_kv"},
+            {"head_dim", "attention.key_length"},
+            {"rms_norm_eps", "attention.layer_norm_rms_epsilon"},
+            {"layer_norm_eps", "attention.layer_norm_epsilon"},
+            {"rope_theta", "rope.freq_base"},
+            {"rope_parameters.rope_theta", "rope.freq_base"},
+            {"mtp_num_hidden_layers", "nextn_predict_layers"},
+            {"num_experts", "expert_count"},
+            {"n_routed_experts", "expert_count"},
+            {"num_experts_per_tok", "expert_used_count"},
+            {"moe_intermediate_size", "expert_feed_forward_length"},
+            {"n_shared_experts", "expert_shared_count"},
+            {"shared_expert_intermediate_size", "expert_shared_feed_forward_length"},
+            {"first_k_dense_replace", "leading_dense_block_count"},
+            {"routed_scaling_factor", "expert_weights_scale"},
+            {"norm_topk_prob", "expert_weights_norm"},
+            {"q_lora_rank", "attention.q_lora_rank"},
+            {"kv_lora_rank", "attention.kv_lora_rank"},
+            {"qk_rope_head_dim", "rope.dimension_count"},
+            {"v_head_dim", "attention.value_length_mla"},
+            {"linear_conv_kernel_dim", "ssm.conv_kernel"},
+            {"linear_num_key_heads", "ssm.group_count"},
+            {"linear_num_value_heads", "ssm.time_step_rank"},
+            {"linear_key_head_dim", "ssm.state_size"},
+        };
+        for (const auto &alias : aliases) {
+            addAlias(alias.first, alias.second);
+        }
+
+        int blockCount = GetGGUFArchParam(params, arch, "block_count").int_value();
+        int nextnLayers = GetGGUFArchParam(
+            params, arch, "nextn_predict_layers").int_value();
+        int mainLayerCount = blockCount;
+        if (nextnLayers > 0 && nextnLayers < mainLayerCount) {
+            mainLayerCount -= nextnLayers;
+        }
+        if (mainLayerCount > 0) {
+            AddGGUFDictIfMissing(model, "num_hidden_layers",
+                                 std::to_string(mainLayerCount));
+            model->block_cnt = mainLayerCount;
+        }
+
+        const auto &tokens = params["tokenizer.ggml.tokens"].array_items();
+        if (!tokens.empty()) {
+            AddGGUFDictIfMissing(model, "vocab_size",
+                                 std::to_string(tokens.size()));
+        } else {
+            addAlias("vocab_size", "vocab_size");
+        }
+
+        auto ropeSections = GetGGUFArchParam(
+            params, arch, "rope.dimension_sections").array_items();
+        while (ropeSections.size() > 1 && ropeSections.back().int_value() == 0) {
+            ropeSections.pop_back();
+        }
+        if (!ropeSections.empty()) {
+            const std::string sections = json11::Json(ropeSections).dump();
+            AddGGUFDictIfMissing(model, "mrope_section", sections);
+            AddGGUFDictIfMissing(model, "rope_parameters.mrope_section", sections);
+        }
+
+        int rotaryDim = GetGGUFArchParam(
+            params, arch, "rope.dimension_count").int_value();
+        int attentionKeyLength = GetGGUFArchParam(
+            params, arch, "attention.key_length").int_value();
+        if (rotaryDim > 0 && attentionKeyLength > 0) {
+            const std::string factor = std::to_string(
+                (double)rotaryDim / attentionKeyLength);
+            AddGGUFDictIfMissing(model, "partial_rotary_factor", factor);
+            AddGGUFDictIfMissing(model,
+                                 "rope_parameters.partial_rotary_factor",
+                                 factor);
+        }
+        AddGGUFDictIfMissing(model, "rope_parameters.rope_type", "default");
+
+        int ssmInnerSize = GetGGUFArchParam(
+            params, arch, "ssm.inner_size").int_value();
+        int ssmValueHeads = GetGGUFArchParam(
+            params, arch, "ssm.time_step_rank").int_value();
+        if (ssmInnerSize > 0 && ssmValueHeads > 0 &&
+            ssmInnerSize % ssmValueHeads == 0) {
+            AddGGUFDictIfMissing(model, "linear_value_head_dim",
+                                 std::to_string(ssmInnerSize / ssmValueHeads));
+        }
+
+        int qkMlaHeadDim = GetGGUFArchParam(
+            params, arch, "attention.key_length_mla").int_value();
+        if (qkMlaHeadDim > rotaryDim) {
+            AddGGUFDictIfMissing(model, "qk_nope_head_dim",
+                                 std::to_string(qkMlaHeadDim - rotaryDim));
+        }
+        auto gatingFunc = GetGGUFArchParam(
+            params, arch, "expert_gating_func");
+        if (!gatingFunc.is_null()) {
+            AddGGUFDictIfMissing(model, "scoring_func",
+                                 gatingFunc.int_value() == 2 ?
+                                     "sigmoid" : "softmax");
+        }
+    }
+
+    static void LoadGGUFTokenizer(const json11::Json &params,
+                                  basellm *model) {
+        const auto &tokenItems = params["tokenizer.ggml.tokens"].array_items();
+        AssertInFastLLM(!tokenItems.empty(),
+                        "GGUF has no tokenizer.ggml.tokens metadata.\n");
+        const auto &scoreItems = params["tokenizer.ggml.scores"].array_items();
+        const auto &typeItems = params["tokenizer.ggml.token_type"].array_items();
+        const auto &mergeItems = params["tokenizer.ggml.merges"].array_items();
+        const std::string tokenizerModel =
+            params["tokenizer.ggml.model"].string_value();
+
+        std::unordered_map<std::string, float> mergeScores;
+        if (tokenizerModel == "gpt2") {
+            model->weight.tokenizer.type = Tokenizer::TokenizerType::BPE;
+            mergeScores.reserve(mergeItems.size());
+            for (size_t i = 0; i < mergeItems.size(); i++) {
+                const std::string &pair = mergeItems[i].string_value();
+                const size_t separator = pair.find(' ', 1);
+                if (separator == std::string::npos) {
+                    continue;
+                }
+                mergeScores[pair.substr(0, separator) +
+                            pair.substr(separator + 1)] = -(float)i;
+            }
+            model->weight.tokenizer.byteAsChar = true;
+            model->weight.tokenizer.addDummyPrefix = false;
+            model->weight.tokenizer.removeExtraWhitespaces = false;
+            model->weight.AddDict("tokenizer_byte_as_char", "True");
+            model->weight.AddDict("tokenizer_add_dummy_prefix", "False");
+            model->weight.AddDict("tokenizer_remove_extra_whitespaces", "False");
+        } else if (tokenizerModel == "llama" || tokenizerModel == "t5") {
+            model->weight.tokenizer.type = Tokenizer::TokenizerType::UNIGRAM;
+            model->weight.tokenizer.byteAsChar = false;
+        } else if (tokenizerModel == "bert") {
+            model->weight.tokenizer.type = Tokenizer::TokenizerType::BERT;
+            model->weight.tokenizer.addDummyPrefix = false;
+            model->weight.tokenizer.removeExtraWhitespaces = false;
+        } else {
+            printf("Warning: tokenizer.ggml.model = %s is not explicitly "
+                   "supported; using the generic longest-match tokenizer.\n",
+                   tokenizerModel.c_str());
+            model->weight.tokenizer.type = Tokenizer::TokenizerType::NORMAL;
+        }
+
+        ReportModelLoadProgress("tokenizer", 0,
+                                std::max<size_t>(1, tokenItems.size()));
+        std::map<std::string, int> specialTokens;
+        for (size_t i = 0; i < tokenItems.size(); i++) {
+            const std::string &token = tokenItems[i].string_value();
+            float score = i < scoreItems.size() ?
+                (float)scoreItems[i].number_value() : 1.0f;
+            auto mergeScore = mergeScores.find(token);
+            if (mergeScore != mergeScores.end()) {
+                score = mergeScore->second;
+            }
+            model->weight.AddTokenizerWord(token, (int)i, score);
+            if (i < typeItems.size()) {
+                int tokenType = typeItems[i].int_value();
+                if (tokenType == 3 || tokenType == 4) {
+                    specialTokens[token] = (int)i;
+                }
+            }
+            if (i + 1 == tokenItems.size() ||
+                (i + 1) * 100 / tokenItems.size() !=
+                    i * 100 / tokenItems.size()) {
+                ReportModelLoadProgress("tokenizer", i + 1,
+                                        tokenItems.size());
+            }
+        }
+
+        auto addSpecialId = [&](const std::string &name,
+                                const std::string &dictName,
+                                bool isEndToken) {
+            auto value = params["tokenizer.ggml." + name + "_token_id"];
+            if (!value.is_number()) {
+                return;
+            }
+            int id = value.int_value();
+            if (id < 0 || id >= (int)tokenItems.size()) {
+                return;
+            }
+            specialTokens[tokenItems[id].string_value()] = id;
+            if (!dictName.empty()) {
+                model->weight.AddDict(dictName, std::to_string(id));
+            }
+            if (isEndToken) {
+                model->eos_token_ids.insert(id);
+            }
+        };
+        addSpecialId("bos", "bos_token_id", false);
+        addSpecialId("eos", "eos_token_id", true);
+        addSpecialId("eot", "", true);
+        addSpecialId("eom", "", true);
+        addSpecialId("unknown", "unk_token_id", false);
+        addSpecialId("padding", "pad_token_id", false);
+        addSpecialId("separator", "sep_token_id", false);
+        addSpecialId("mask", "mask_token_id", false);
+        addSpecialId("fim_pre", "", false);
+        addSpecialId("fim_suf", "", false);
+        addSpecialId("fim_mid", "", false);
+        addSpecialId("fim_pad", "", false);
+        if (!specialTokens.empty()) {
+            model->weight.tokenizer.SetSpecialTokens(specialTokens);
+            model->weight.AddDict("tokenizer_has_special_tokens", "1");
+        }
+
+        auto addSpacePrefix = params["tokenizer.ggml.add_space_prefix"];
+        if (addSpacePrefix.is_bool()) {
+            model->weight.tokenizer.addDummyPrefix =
+                addSpacePrefix.bool_value();
+            model->weight.AddDict("tokenizer_add_dummy_prefix",
+                                  addSpacePrefix.bool_value() ? "True" : "False");
+        }
+        auto removeExtra =
+            params["tokenizer.ggml.remove_extra_whitespaces"];
+        if (removeExtra.is_bool()) {
+            model->weight.tokenizer.removeExtraWhitespaces =
+                removeExtra.bool_value();
+            model->weight.AddDict("tokenizer_remove_extra_whitespaces",
+                                  removeExtra.bool_value() ? "True" : "False");
+        }
+        if (!params["tokenizer.chat_template"].is_null()) {
+            model->weight.tokenizer.chatTemplate =
+                params["tokenizer.chat_template"].string_value();
+            model->weight.AddDict("chat_template",
+                                  model->weight.tokenizer.chatTemplate);
+        }
+    }
+
+    static basellm *CreateLLMModelFromGGUFMetadata(
+        const json11::Json &params, const std::string &arch) {
+        basellm *model = CreateModelWithType(ConvertGGUFTypeToFastllmType(arch));
+        LoadGGUFModelConfig(params, arch, model);
+        LoadGGUFTokenizer(params, model);
+
+        auto setInt = [&](const std::string &key, int &target) {
+            auto it = model->weight.dicts.find(key);
+            if (it != model->weight.dicts.end()) {
+                target = std::atoi(it->second.c_str());
+            }
+        };
+        setInt("num_attention_heads", model->num_attention_heads);
+        model->num_key_value_heads = model->num_attention_heads;
+        setInt("num_key_value_heads", model->num_key_value_heads);
+        setInt("hidden_size", model->embed_dim);
+        setInt("max_position_embeddings", model->max_positions);
+        auto rmsNorm = model->weight.dicts.find("rms_norm_eps");
+        if (rmsNorm != model->weight.dicts.end()) {
+            model->rms_norm_eps = std::atof(rmsNorm->second.c_str());
+        }
+        return model;
+    }
+
+    static int GetGGUFMainLayerCount(const json11::Json &params,
+                                     const std::string &arch,
+                                     const basellm *model) {
+        if (model == nullptr) {
+            return -1;
+        }
+
+        int blockCount = GetGGUFArchParam(
+            params, arch, "block_count").int_value();
+        if (blockCount <= 0) {
+            blockCount = model->block_cnt;
         }
         if (blockCount <= 0) {
             return -1;
         }
 
-        int nextnPredictLayers = 0;
-        if (!params[ggufArch + ".nextn_predict_layers"].is_null()) {
-            nextnPredictLayers = params[ggufArch + ".nextn_predict_layers"].int_value();
-        } else if (!params[arch + ".nextn_predict_layers"].is_null()) {
-            nextnPredictLayers = params[arch + ".nextn_predict_layers"].int_value();
-        }
-        if (nextnPredictLayers > 0 && blockCount >= nextnPredictLayers) {
+        int nextnPredictLayers = GetGGUFArchParam(
+            params, arch, "nextn_predict_layers").int_value();
+        if (nextnPredictLayers > 0 && blockCount > nextnPredictLayers) {
             return blockCount - nextnPredictLayers;
         }
         return blockCount;
@@ -2981,8 +3281,17 @@ namespace fastllm {
         if (mainLayerCount < 0) {
             return false;
         }
-        const std::string prefix = "model.layers.";
-        if (!StartWith(weightName, prefix)) {
+        static const std::vector<std::string> prefixes = {
+            "model.layers.", "model.language_model.layers."
+        };
+        std::string prefix;
+        for (const auto &candidate : prefixes) {
+            if (StartWith(weightName, candidate)) {
+                prefix = candidate;
+                break;
+            }
+        }
+        if (prefix.empty()) {
             return false;
         }
 
@@ -3086,132 +3395,15 @@ namespace fastllm {
             // Load params from gguf
             printf("general.architecture = %s\n", arch.c_str());
             printf("general.name = %s\n", params["general.name"].string_value().c_str());
-
-            model = CreateModelWithType(ConvertGGUFTypeToFastllmType(arch));
-            if (!params[arch + ".block_count"].is_null()) {
-                model->block_cnt = params[arch + ".block_count"].int_value();
-                printf("Load block_cnt = %d\n", model->block_cnt);
-            }
-
-            if (arch == "glm-dsa" || arch == "glm_moe_dsa") {
-                int blockCount = model->block_cnt;
-                int nextnPredictLayers = params[arch + ".nextn_predict_layers"].is_null() ?
-                                         0 : params[arch + ".nextn_predict_layers"].int_value();
-                if (nextnPredictLayers > 0 && blockCount >= nextnPredictLayers) {
-                    blockCount -= nextnPredictLayers;
-                    model->block_cnt = blockCount;
-                    printf("Load GLM-DSA main block_cnt = %d\n", model->block_cnt);
-                }
-
-                auto addIntDict = [&](const std::string &dictKey, const std::string &ggufKey) {
-                    if (!params[arch + "." + ggufKey].is_null()) {
-                        model->weight.AddDict(dictKey, std::to_string(params[arch + "." + ggufKey].int_value()));
-                    }
-                };
-                auto addFloatDict = [&](const std::string &dictKey, const std::string &ggufKey) {
-                    if (!params[arch + "." + ggufKey].is_null()) {
-                        model->weight.AddDict(dictKey, std::to_string(params[arch + "." + ggufKey].number_value()));
-                    }
-                };
-
-                model->weight.AddDict("model_type", "glm_moe_dsa");
-                model->weight.AddDict("num_hidden_layers", std::to_string(model->block_cnt));
-                addIntDict("hidden_size", "embedding_length");
-                addIntDict("num_attention_heads", "attention.head_count");
-                addIntDict("num_key_value_heads", "attention.head_count_kv");
-                addIntDict("q_lora_rank", "attention.q_lora_rank");
-                addIntDict("kv_lora_rank", "attention.kv_lora_rank");
-                addIntDict("qk_rope_head_dim", "rope.dimension_count");
-                addIntDict("v_head_dim", "attention.value_length_mla");
-                addIntDict("n_routed_experts", "expert_count");
-                addIntDict("n_shared_experts", "expert_shared_count");
-                addIntDict("num_experts_per_tok", "expert_used_count");
-                addIntDict("first_k_dense_replace", "leading_dense_block_count");
-                addIntDict("intermediate_size", "feed_forward_length");
-                addIntDict("moe_intermediate_size", "expert_feed_forward_length");
-                addIntDict("max_position_embeddings", "context_length");
-                addFloatDict("rms_norm_eps", "attention.layer_norm_rms_epsilon");
-                addFloatDict("rope_parameters.rope_theta", "rope.freq_base");
-                addFloatDict("rope_theta", "rope.freq_base");
-                addFloatDict("routed_scaling_factor", "expert_weights_scale");
-                model->weight.AddDict("rope_parameters.rope_type", "default");
-
-                if (!params[arch + ".expert_weights_norm"].is_null()) {
-                    model->weight.AddDict("norm_topk_prob",
-                                          params[arch + ".expert_weights_norm"].bool_value() ? "true" : "false");
-                }
-                int gatingFunc = params[arch + ".expert_gating_func"].is_null() ?
-                                 2 : params[arch + ".expert_gating_func"].int_value();
-                model->weight.AddDict("scoring_func", gatingFunc == 2 ? "sigmoid" : "softmax");
-
-                int qkRopeHeadDim = params[arch + ".rope.dimension_count"].is_null() ?
-                                    0 : params[arch + ".rope.dimension_count"].int_value();
-                int qkMlaHeadDim = params[arch + ".attention.key_length_mla"].is_null() ?
-                                   0 : params[arch + ".attention.key_length_mla"].int_value();
-                if (qkMlaHeadDim > qkRopeHeadDim) {
-                    model->weight.AddDict("qk_nope_head_dim", std::to_string(qkMlaHeadDim - qkRopeHeadDim));
-                }
-            }
-
-            if (!params[arch + ".attention.head_count"].is_null()) {
-                model->num_attention_heads = params[arch + ".attention.head_count"].int_value();
-                printf("Load num_attention_heads = %d\n", model->num_attention_heads);
-            }
-
-            if (!params[arch + ".attention.head_count_kv"].is_null()) {
-                model->num_key_value_heads = params[arch + ".attention.head_count_kv"].int_value();
-                model->weight.dicts["num_key_value_heads"] = std::to_string(model->num_key_value_heads);
-                printf("Load num_key_value_heads = %d\n", model->num_key_value_heads);
-            }
-
-            if (!params[arch + ".embedding_length"].is_null()) {
-                model->embed_dim = params[arch + ".embedding_length"].int_value();
-                printf("Load embed_dim = %d\n", model->embed_dim);
-            }
-
-            if (!params[arch + ".context_length"].is_null()) {
-                model->max_positions = params[arch + ".context_length"].int_value();
-                printf("Load max_positions = %d\n", model->max_positions);
-            }
-
-            if (!params[arch + ".attention.layer_norm_rms_epsilon"].is_null()) {
-                model->rms_norm_eps = params[arch + ".attention.layer_norm_rms_epsilon"].number_value();
-                printf("Load rms_norm_eps = %f\n", model->rms_norm_eps);
-            }
-
-            if (!params["tokenizer.ggml.eos_token_id"].is_null()) {
-                model->eos_token_id = params["tokenizer.ggml.eos_token_id"].number_value();
-                printf("Load eos_token_id = %d\n", model->eos_token_id);
-            }
-
-            if (!params["tokenizer.chat_template"].is_null()) {
-                model->weight.tokenizer.chatTemplate = params["tokenizer.chat_template"].string_value();
-                printf("Load chatTemplate = %s\n", model->weight.tokenizer.chatTemplate.c_str());
-            }
-
-            const auto &tokenItems = params["tokenizer.ggml.tokens"].array_items();
-            int tokenTotal = (int)tokenItems.size();
-            ReportModelLoadProgress("tokenizer", 0, std::max(1, tokenTotal));
-            int idx = 0;
-            for (auto &it : tokenItems) {
-                if (idx < 10) {
-                    // printf("%s: %d\n", it.string_value().c_str(), idx);
-                }
-                model->weight.AddTokenizerWord(it.string_value(), idx, 1.0f);
-                idx++;
-                if (idx == tokenTotal ||
-                    idx * 100 / std::max(1, tokenTotal) != (idx - 1) * 100 / std::max(1, tokenTotal)) {
-                    ReportModelLoadProgress("tokenizer", idx, tokenTotal);
-                }
-            }
-            if (tokenTotal == 0) {
-                ReportModelLoadProgress("tokenizer", 1, 1);
-            }
-
-            model->weight.tokenizer.byteAsChar = true;
-            model->weight.AddDict("tokenizer_byte_as_char", "True");
-
-            // printf("config = %s\n", config.dump().c_str());
+            model = CreateLLMModelFromGGUFMetadata(params, arch);
+            printf("Load block_cnt = %d\n", model->block_cnt);
+            printf("Load num_attention_heads = %d\n",
+                   model->num_attention_heads);
+            printf("Load num_key_value_heads = %d\n",
+                   model->num_key_value_heads);
+            printf("Load embed_dim = %d\n", model->embed_dim);
+            printf("Load max_positions = %d\n", model->max_positions);
+            printf("Load rms_norm_eps = %f\n", model->rms_norm_eps);
         }
 
         std::string dflashPath;
@@ -3270,7 +3462,7 @@ namespace fastllm {
         }
 
         arch = ConvertGGUFTypeToFastllmType(arch);
-        int ggufMainLayerCount = GetGLMDSAGGUFMainLayerCount(params, arch, model);
+        int ggufMainLayerCount = GetGGUFMainLayerCount(params, arch, model);
 
         // 3.0 更新模型信息
         model->InitParams();

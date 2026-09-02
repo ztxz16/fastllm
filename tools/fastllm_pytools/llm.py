@@ -17,6 +17,11 @@ from collections import OrderedDict
 from typing import Optional, Tuple, Union, List, Callable, Dict, Any;
 
 try:
+    from .gguf_metadata import get_gguf_model_config, try_load_gguf_tokenizer
+except ImportError:
+    from gguf_metadata import get_gguf_model_config, try_load_gguf_tokenizer
+
+try:
     from .gemma4_multimodal import (
         build_gemma4_multimodal_payload,
         normalize_gemma4_conversation,
@@ -1159,6 +1164,7 @@ class model:
         
         self.hf_tokenizer = None
         self.enable_thinking = True
+        self._gguf_generation_config = {}
 
         self.tool_call_parser = tool_call_parser
         self.force_chat_template = False
@@ -1173,6 +1179,15 @@ class model:
         else:
             if len(path) > 5 and path[-5:].lower() == ".gguf":
                 # GGUF 文件
+                ori_config_path = os.path.join(ori_model_path, "config.json")
+                if ori_model_path and os.path.isfile(ori_config_path):
+                    with open(ori_config_path, "r", encoding="utf-8") as f:
+                        self.config = json.load(f)
+                else:
+                    gguf_config = get_gguf_model_config(path)
+                    self._gguf_generation_config = gguf_config.pop(
+                        "_fastllm_generation_config", {})
+                    self.config = gguf_config
                 if ori_model_path and os.path.isdir(ori_model_path):
                     report_model_load_progress("tokenizer", 0, 1)
                     try:
@@ -1180,7 +1195,11 @@ class model:
                     finally:
                         report_model_load_progress("tokenizer", 1, 1)
                 else:
-                    self.hf_tokenizer = try_load_hf_tokenizer(ori_model_path)
+                    report_model_load_progress("tokenizer", 0, 1)
+                    try:
+                        self.hf_tokenizer = try_load_gguf_tokenizer(path)
+                    finally:
+                        report_model_load_progress("tokenizer", 1, 1)
                 self.model = fastllm_lib.create_llm_model_from_gguf(path.encode(), ori_model_path.encode())
                 # 配置目录：优先用 ori_model_path（若存在且为目录），否则用 GGUF 文件所在目录
                 if ori_model_path and os.path.isdir(ori_model_path):
@@ -1277,6 +1296,14 @@ class model:
             'top_k': 1,
             'temperature': 1.0
         }
+
+        # Modern GGUF files can embed the recommended sampler settings.  Use
+        # them when there is no Hugging Face generation_config.json sidecar.
+        self.default_generation_config.update({
+            key: value
+            for key, value in self._gguf_generation_config.items()
+            if key in self.default_generation_config
+        })
 
         # 统一尝试加载 generation_config.json
         if config_base_path:
@@ -1392,6 +1419,32 @@ class model:
         except Exception:
             pass
         return ""
+
+    def _is_qwen35(self) -> bool:
+        if self._get_architecture() in {
+                "Qwen3_5ForConditionalGeneration",
+                "Qwen3_5MoeForConditionalGeneration"}:
+            return True
+        config = getattr(self, "config", {})
+        if not isinstance(config, dict):
+            return False
+        return str(config.get("model_type", "")).startswith("qwen3_5")
+
+    def _render_qwen35_text_prompt(
+            self, conversation, add_generation_prompt=True,
+            enable_thinking=None) -> str:
+        if enable_thinking is None:
+            enable_thinking = self.enable_thinking
+        return build_qwen35_prompt(
+            tokenizer=None,
+            conversation=copy.deepcopy(conversation),
+            image_grid_thw=None,
+            video_grid_thw=None,
+            video_timestamps=None,
+            merge_size=1,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=enable_thinking,
+        )
 
     def _is_deepseek_v4(self) -> bool:
         if self._get_architecture() == "DeepseekV4ForCausalLM":
@@ -1516,6 +1569,9 @@ class model:
             return apply_hf_chat_template(self.hf_tokenizer, messages, tokenize = False,
                                           enable_thinking = self.enable_thinking,
                                           add_generation_prompt = True)
+        elif self._is_qwen35():
+            return self._render_qwen35_text_prompt(
+                self._build_messages(query, history))
         else:
             if (self.system_prompt != ""):
                 messages += ["system", self.system_prompt]
@@ -1714,7 +1770,7 @@ class model:
                     enable_thinking = enable_thinking,
                 )
                 return len(native_inputs["input_ids"])
-            if architecture in ("Qwen3_5ForConditionalGeneration", "Qwen3_5MoeForConditionalGeneration"):
+            if self._is_qwen35():
                 qwen_conversation = normalize_qwen35_conversation(
                     copy.deepcopy(conversation),
                     len(multimodal_images),
@@ -1867,17 +1923,9 @@ class model:
                 from ftllm.encoding_dsv4 import encode_messages
                 thinking_mode = "thinking" if enable_thinking else "chat"
                 prompt = encode_messages(conversation, thinking_mode=thinking_mode)
-            elif architecture in ("Qwen3_5ForConditionalGeneration", "Qwen3_5MoeForConditionalGeneration"):
-                prompt = build_qwen35_prompt(
-                    tokenizer = None,
-                    conversation = copy.deepcopy(conversation),
-                    image_grid_thw = None,
-                    video_grid_thw = None,
-                    video_timestamps = None,
-                    merge_size = 1,
-                    add_generation_prompt = add_generation_prompt,
-                    enable_thinking = enable_thinking,
-                )
+            elif self._is_qwen35():
+                prompt = self._render_qwen35_text_prompt(
+                    conversation, add_generation_prompt, enable_thinking)
             elif architecture == "Step3p7ForConditionalGeneration":
                 prompt = build_step3p7_prompt(
                     conversation = copy.deepcopy(conversation),
@@ -2073,7 +2121,10 @@ class model:
         else:
             prompt = ""
             if (conversation != None and len(conversation) != 0):
-                if self._is_deepseek_v4() and not self.force_chat_template:
+                if self._is_qwen35():
+                    prompt = self._render_qwen35_text_prompt(
+                        conversation, add_generation_prompt)
+                elif self._is_deepseek_v4() and not self.force_chat_template:
                     from ftllm.encoding_dsv4 import encode_messages
                     thinking_mode = "thinking" if self.enable_thinking else "chat"
                     prompt = encode_messages(conversation, thinking_mode=thinking_mode)
@@ -2254,7 +2305,7 @@ class model:
                     False, stop_token_len, stop_token_list
                 )
                 return handle
-            elif architecture in ("Qwen3_5ForConditionalGeneration", "Qwen3_5MoeForConditionalGeneration"):
+            elif self._is_qwen35():
                 tokenizer = self.hf_tokenizer
                 qwen_conversation = None
                 if (conversation != None and len(conversation) != 0):
@@ -2424,23 +2475,10 @@ class model:
             return handle
         else:
             prompt = ""
-            architecture = ""
-            try:
-                architecture = self.config["architectures"][0]
-            except:
-                architecture = ""
             if (conversation != None and len(conversation) != 0):
-                if architecture in ("Qwen3_5ForConditionalGeneration", "Qwen3_5MoeForConditionalGeneration"):
-                    prompt = build_qwen35_prompt(
-                        tokenizer = None,
-                        conversation = copy.deepcopy(conversation),
-                        image_grid_thw = None,
-                        video_grid_thw = None,
-                        video_timestamps = None,
-                        merge_size = 1,
-                        add_generation_prompt = add_generation_prompt,
-                        enable_thinking = enable_thinking,
-                    )
+                if self._is_qwen35():
+                    prompt = self._render_qwen35_text_prompt(
+                        conversation, add_generation_prompt, enable_thinking)
                 elif self._is_deepseek_v4() and not self.force_chat_template:
                     from ftllm.encoding_dsv4 import encode_messages
                     thinking_mode = "thinking" if enable_thinking else "chat"

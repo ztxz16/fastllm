@@ -1,4 +1,5 @@
 #include <map>
+#include <limits>
 
 #include <assert.h>
 #include "gguf.h"
@@ -710,6 +711,7 @@ namespace fastllm {
     template int32_t GGUFBuffer::Read<int32_t>();
     template int64_t GGUFBuffer::Read<int64_t>();
     template float GGUFBuffer::Read<float>();
+    template double GGUFBuffer::Read<double>();
 
     extern void Float32ToFloat16(float *float32, uint16_t *float16, int len);
 
@@ -822,6 +824,97 @@ namespace fastllm {
         }
     }
 
+    static json11::Json ReadGGUFScalar(GGUFBuffer &buffer, int type) {
+        switch (type) {
+            case GGUF_TYPE_UINT8:
+                return (int)buffer.Read<uint8_t>();
+            case GGUF_TYPE_INT8:
+                return (int)buffer.Read<int8_t>();
+            case GGUF_TYPE_UINT16:
+                return (int)buffer.Read<uint16_t>();
+            case GGUF_TYPE_INT16:
+                return (int)buffer.Read<int16_t>();
+            case GGUF_TYPE_UINT32:
+                return (long long)buffer.Read<uint32_t>();
+            case GGUF_TYPE_INT32:
+                return (int)buffer.Read<int32_t>();
+            case GGUF_TYPE_FLOAT32:
+                return (double)buffer.Read<float>();
+            case GGUF_TYPE_BOOL:
+                return buffer.ReadBool();
+            case GGUF_TYPE_STRING:
+                return buffer.ReadString();
+            case GGUF_TYPE_UINT64: {
+                uint64_t value = buffer.Read<uint64_t>();
+                if (value <= (uint64_t)std::numeric_limits<long long>::max()) {
+                    return (long long)value;
+                }
+                // json11 has no unsigned 64-bit representation. A double is
+                // still preferable to rejecting otherwise valid metadata.
+                return (double)value;
+            }
+            case GGUF_TYPE_INT64:
+                return (long long)buffer.Read<int64_t>();
+            case GGUF_TYPE_FLOAT64:
+                return buffer.Read<double>();
+            default:
+                ErrorInFastLLM("Unsupported GGUF metadata scalar type " +
+                               std::to_string(type) + ".\n");
+                return json11::Json();
+        }
+    }
+
+    static json11::Json ReadGGUFValue(GGUFBuffer &buffer, int type) {
+        if (type != GGUF_TYPE_ARRAY) {
+            return ReadGGUFScalar(buffer, type);
+        }
+
+        int elementType = buffer.Read<int32_t>();
+        uint64_t count = buffer.Read<uint64_t>();
+        AssertInFastLLM(elementType != GGUF_TYPE_ARRAY,
+                        "Nested GGUF metadata arrays are not supported.\n");
+        json11::Json::array values;
+        values.reserve((size_t)count);
+        for (uint64_t i = 0; i < count; i++) {
+            values.emplace_back(ReadGGUFScalar(buffer, elementType));
+        }
+        return values;
+    }
+
+    static void SkipGGUFScalar(GGUFBuffer &buffer, int type) {
+        switch (type) {
+            case GGUF_TYPE_UINT8:   (void)buffer.Read<uint8_t>();  break;
+            case GGUF_TYPE_INT8:    (void)buffer.Read<int8_t>();   break;
+            case GGUF_TYPE_UINT16:  (void)buffer.Read<uint16_t>(); break;
+            case GGUF_TYPE_INT16:   (void)buffer.Read<int16_t>();  break;
+            case GGUF_TYPE_UINT32:  (void)buffer.Read<uint32_t>(); break;
+            case GGUF_TYPE_INT32:   (void)buffer.Read<int32_t>();  break;
+            case GGUF_TYPE_FLOAT32: (void)buffer.Read<float>();    break;
+            case GGUF_TYPE_BOOL:    (void)buffer.ReadBool();       break;
+            case GGUF_TYPE_STRING:  (void)buffer.ReadString();     break;
+            case GGUF_TYPE_UINT64:  (void)buffer.Read<uint64_t>(); break;
+            case GGUF_TYPE_INT64:   (void)buffer.Read<int64_t>();  break;
+            case GGUF_TYPE_FLOAT64: (void)buffer.Read<double>();   break;
+            default:
+                ErrorInFastLLM("Unsupported GGUF metadata scalar type " +
+                               std::to_string(type) + ".\n");
+        }
+    }
+
+    static void SkipGGUFValue(GGUFBuffer &buffer, int type) {
+        if (type != GGUF_TYPE_ARRAY) {
+            SkipGGUFScalar(buffer, type);
+            return;
+        }
+        int elementType = buffer.Read<int32_t>();
+        uint64_t count = buffer.Read<uint64_t>();
+        AssertInFastLLM(elementType != GGUF_TYPE_ARRAY,
+                        "Nested GGUF metadata arrays are not supported.\n");
+        for (uint64_t i = 0; i < count; i++) {
+            SkipGGUFScalar(buffer, elementType);
+        }
+    }
+
     void ReadGGUFMetaData(const std::string &fileName, json11::Json &config) {
         int ggufAlignment = GGUF_DEFAULT_ALIGNMENT;
         GGUFBuffer ggufBuffer = GGUFBuffer(fileName);
@@ -841,49 +934,8 @@ namespace fastllm {
         for (int i = 0; i < metaDataCount; i++) {
             std::string key = ggufBuffer.ReadString();
             // printf("key = %s\n", key.c_str());
-            int type = ggufBuffer.Read <int> ();            
-            if (type == GGUF_TYPE_STRING) {
-                std::string value = ggufBuffer.ReadString();
-                paramsConfig[key] = value;
-            } else if (type == GGUF_TYPE_UINT8) {
-                int8_t value = ggufBuffer.Read <int8_t> ();
-                paramsConfig[key] = value;
-            } else if (type == GGUF_TYPE_UINT16) {
-                uint16_t value = ggufBuffer.Read <uint16_t> ();
-                paramsConfig[key] = value;
-            } else if (type == GGUF_TYPE_UINT32) {
-                uint32_t value = ggufBuffer.Read <uint32_t> ();
-                paramsConfig[key] = (int)value;
-            } else if (type == GGUF_TYPE_FLOAT32) {
-                float value = ggufBuffer.Read <float> ();
-                paramsConfig[key] = value;
-            } else if (type == GGUF_TYPE_INT32) {
-                int value = ggufBuffer.Read <int> ();
-                paramsConfig[key] = value;
-            } else if (type == GGUF_TYPE_BOOL) {
-                bool value = ggufBuffer.ReadBool();
-                paramsConfig[key] = value;
-            } else if (type == GGUF_TYPE_ARRAY) {
-                int type = ggufBuffer.Read <int> ();
-                uint64_t n = ggufBuffer.Read <uint64_t> ();
-                if (type == GGUF_TYPE_STRING) {
-                    std::vector <std::string> value;
-                    for (int i = 0; i < n; i++) {
-                        value.push_back(ggufBuffer.ReadString());
-                    }
-                    paramsConfig[key] = value; // std::vector <std::string> ({value[0], value[1]});
-                } else if (type == GGUF_TYPE_INT32) {
-                    std::vector <int> value;
-                    for (int i = 0; i < n; i++) {
-                        value.push_back(ggufBuffer.Read <int> ());
-                    }
-                    paramsConfig[key] = value; // std::vector <int> ({value[0], value[1]});
-                } else {
-                    ErrorInFastLLM("Read GGUF_TYPE_ARRAY type " + std::to_string(type) + " error.\n");
-                }
-            } else {
-                ErrorInFastLLM("Read GGUF_TYPE type " + std::to_string(type) + " error.\n");
-            }
+            int type = ggufBuffer.Read<int32_t>();
+            paramsConfig[key] = ReadGGUFValue(ggufBuffer, type);
         }
 
         jsonConfig["params"] = paramsConfig;
@@ -900,35 +952,8 @@ namespace fastllm {
 
         for (int i = 0; i < metaDataCount; i++) {
             std::string key = ggufBuffer.ReadString();
-            int type = ggufBuffer.Read <int> ();            
-            if (type == GGUF_TYPE_STRING) {
-                std::string value = ggufBuffer.ReadString();
-            } else if (type == GGUF_TYPE_UINT8) {
-                int8_t value = ggufBuffer.Read <int8_t> ();
-            } else if (type == GGUF_TYPE_UINT16) {
-                uint16_t value = ggufBuffer.Read <uint16_t> ();
-            } else if (type == GGUF_TYPE_UINT32) {
-                uint32_t value = ggufBuffer.Read <uint32_t> ();
-            } else if (type == GGUF_TYPE_FLOAT32) {
-                float value = ggufBuffer.Read <float> ();
-            } else if (type == GGUF_TYPE_INT32) {
-                int value = ggufBuffer.Read <int> ();
-            } else if (type == GGUF_TYPE_BOOL) {
-                bool value = ggufBuffer.ReadBool();
-            } else if (type == GGUF_TYPE_ARRAY) {
-                int type = ggufBuffer.Read <int> ();
-                uint64_t n = ggufBuffer.Read <uint64_t> ();
-                for (int i = 0; i < n; i++) {
-                    if (type == GGUF_TYPE_STRING) {
-                        std::string value = ggufBuffer.ReadString();
-                    } else if (type == GGUF_TYPE_INT32) {
-                        int a = ggufBuffer.Read <int> ();
-                    }
-                }
-            } else {
-                printf("AppendGGUFTasks error, type = %d\n", type);
-                exit(0);
-            }
+            int type = ggufBuffer.Read<int32_t>();
+            SkipGGUFValue(ggufBuffer, type);
         }
 
         std::vector <std::pair <ggml_tensor, uint64_t> > tensors; // <tensors, offset>
@@ -1070,42 +1095,13 @@ namespace fastllm {
         for (int i = 0; i < metaDataCount; i++) {
             std::string key = ggufBuffer.ReadString();
             printf("key = %s\n", key.c_str());
-            int type = ggufBuffer.Read <int> ();            
-            if (type == GGUF_TYPE_STRING) {
-                std::string value = ggufBuffer.ReadString();
-                printf("value = %s\n", value.c_str());
-            } else if (type == GGUF_TYPE_UINT8) {
-                int8_t value = ggufBuffer.Read <int8_t> ();
-                printf("value = %d\n", value);
-            } else if (type == GGUF_TYPE_UINT16) {
-                uint16_t value = ggufBuffer.Read <uint16_t> ();
-                printf("value = %d\n", value);
-            } else if (type == GGUF_TYPE_UINT32) {
-                uint32_t value = ggufBuffer.Read <uint32_t> ();
-                printf("value = %u\n", value);
-            } else if (type == GGUF_TYPE_FLOAT32) {
-                float value = ggufBuffer.Read <float> ();
-                printf("value = %f\n", value);
-            } else if (type == GGUF_TYPE_INT32) {
-                int value = ggufBuffer.Read <int> ();
-                printf("value = %d\n", value);
-            } else if (type == GGUF_TYPE_BOOL) {
-                bool value = ggufBuffer.ReadBool();
-                printf("value = %d\n", value);
-            } else if (type == GGUF_TYPE_ARRAY) {
-                int type = ggufBuffer.Read <int> ();
-                uint64_t n = ggufBuffer.Read <uint64_t> ();
-                printf("type = %d\n", type);
-                for (int i = 0; i < n; i++) {
-                    if (type == GGUF_TYPE_STRING) {
-                        std::string value = ggufBuffer.ReadString();
-                    } else if (type == GGUF_TYPE_INT32) {
-                        int a = ggufBuffer.Read <int> ();
-                    }
-                }
+            int type = ggufBuffer.Read<int32_t>();
+            if (type == GGUF_TYPE_ARRAY) {
+                SkipGGUFValue(ggufBuffer, type);
+                printf("value = <array>\n");
             } else {
-                printf("type = %d\n", type);
-                exit(0);
+                printf("value = %s\n",
+                       ReadGGUFScalar(ggufBuffer, type).dump().c_str());
             }
         }
 

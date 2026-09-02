@@ -6,6 +6,11 @@ import subprocess
 import glob
 import math
 
+try:
+    from .gguf_metadata import get_gguf_model_config
+except ImportError:
+    from gguf_metadata import get_gguf_model_config
+
 def _positive_int(value: str) -> int:
     try:
         value = int(value)
@@ -968,6 +973,10 @@ def make_normal_llm_model(args, startup_progress = None):
     config_path = os.path.join(args.path, "config.json")
     if (not(os.path.exists(config_path)) and args.ori != "" and os.path.exists(os.path.join(args.ori, "config.json"))):
         config_path = os.path.join(args.ori, "config.json")
+    gguf_config = None
+    if (not os.path.exists(config_path) and os.path.isfile(args.path) and
+            args.path.lower().endswith(".gguf")):
+        gguf_config = get_gguf_model_config(args.path)
     is_moe_model = False
     is_thread_tp_moe_model = False
     is_multicuda_tp_model = False
@@ -976,11 +985,15 @@ def make_normal_llm_model(args, startup_progress = None):
     is_qwen35_model = False
     is_qwen38_flash_next_model = False
     is_dots3_note_model = False
-    if (os.path.exists(config_path)):
+    if (os.path.exists(config_path) or gguf_config is not None):
         try:
-            with open(config_path, "r", encoding="utf-8") as file:
-                config = json.load(file)
-            architecture = config["architectures"][0]
+            if gguf_config is None:
+                with open(config_path, "r", encoding="utf-8") as file:
+                    config = json.load(file)
+            else:
+                config = gguf_config
+            architectures = config.get("architectures", [])
+            architecture = architectures[0] if architectures else ""
             model_type = config.get("model_type", "")
             is_laguna_model = (architecture == 'LagunaForCausalLM' or
                                 model_type == 'laguna')
