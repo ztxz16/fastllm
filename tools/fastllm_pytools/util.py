@@ -26,6 +26,54 @@ def _has_cuda_device() -> bool:
     except Exception:
         return False
 
+def _uses_non_nvidia_cuda_compatible_build() -> bool:
+    """Recognize accelerator builds that intentionally expose CUDA devices."""
+    try:
+        info_path = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                                 "build_info.json")
+        with open(info_path, "r", encoding="utf-8") as info_file:
+            build_info = json.load(info_file)
+        return bool(build_info.get("USE_ROCM") or
+                    build_info.get("USE_IVCOREX"))
+    except Exception:
+        return False
+
+def _is_nvidia_cuda_platform() -> bool:
+    """Identify an NVIDIA-only accelerator host without using CUDA APIs."""
+    if _uses_non_nvidia_cuda_compatible_build():
+        return False
+    try:
+        accelerator_vendors = set()
+        has_nvidia_display_controller = False
+        for device_path in glob.glob("/sys/bus/pci/devices/*"):
+            vendor_path = os.path.join(device_path, "vendor")
+            class_path = os.path.join(device_path, "class")
+            try:
+                with open(vendor_path, "r", encoding="ascii") as vendor_file:
+                    vendor = vendor_file.read().strip().lower()
+                with open(class_path, "r", encoding="ascii") as class_file:
+                    device_class = class_file.read().strip().lower()
+            except Exception:
+                continue
+            if (device_class.startswith("0x03") or
+                    device_class.startswith("0x12")):
+                accelerator_vendors.add(vendor)
+            if device_class.startswith("0x03") and vendor == "0x10de":
+                has_nvidia_display_controller = True
+        if accelerator_vendors:
+            # Server boards commonly expose an ASPEED or Matrox BMC as a VGA
+            # controller alongside the compute GPUs.  They are display-only
+            # management devices and must not make an NVIDIA host look mixed.
+            bmc_display_vendors = {"0x1a03", "0x102b"}
+            compute_vendors = accelerator_vendors - bmc_display_vendors
+            return (has_nvidia_display_controller and
+                    compute_vendors == {"0x10de"})
+    except Exception:
+        pass
+    # Do not fall back to CUDA-compatible APIs or vendor utility shims.  If
+    # PCI identity is unavailable, the platform is not positively NVIDIA.
+    return False
+
 def _normalize_mtp_arg(value) -> int:
     try:
         value = int(value)
@@ -135,6 +183,44 @@ def _cuda_driver_device_info(device_ids):
     except Exception:
         return {}
 
+def _nvidia_cuda_compute_capabilities(device_ids):
+    """Query NVIDIA compute capabilities after vendor detection succeeds."""
+    try:
+        import ctypes
+        driver = ctypes.CDLL("libcuda.so.1")
+        driver.cuInit.argtypes = [ctypes.c_uint]
+        driver.cuInit.restype = ctypes.c_int
+        driver.cuDeviceGet.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+        driver.cuDeviceGet.restype = ctypes.c_int
+        driver.cuDeviceGetAttribute.argtypes = [ctypes.POINTER(ctypes.c_int),
+                                                 ctypes.c_int, ctypes.c_int]
+        driver.cuDeviceGetAttribute.restype = ctypes.c_int
+        if driver.cuInit(0) != 0:
+            return {}
+
+        # CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR/MINOR.
+        compute_capability_major = 75
+        compute_capability_minor = 76
+        result = {}
+        for ordinal in device_ids:
+            device = ctypes.c_int()
+            compute_major = ctypes.c_int()
+            compute_minor = ctypes.c_int()
+            if driver.cuDeviceGet(ctypes.byref(device), ordinal) != 0:
+                return {}
+            if driver.cuDeviceGetAttribute(ctypes.byref(compute_major),
+                                           compute_capability_major,
+                                           device.value) != 0:
+                return {}
+            if driver.cuDeviceGetAttribute(ctypes.byref(compute_minor),
+                                           compute_capability_minor,
+                                           device.value) != 0:
+                return {}
+            result[ordinal] = compute_major.value * 10 + compute_minor.value
+        return result
+    except Exception:
+        return {}
+
 def _auto_balanced_cuda_spec(device_ids) -> str:
     infos = _cuda_driver_device_info(device_ids)
     sm_counts = [infos.get(i, {}).get("sm_count", 0) for i in device_ids]
@@ -173,6 +259,17 @@ def _thread_tp_cuda_device_ids(tp):
         if device.isdigit():
             result.append(int(device))
     return result
+
+def _cuda_graph_auto_supported(cuda_spec) -> bool:
+    """Apply the SM75 cutoff only to positively identified NVIDIA systems."""
+    if not _is_nvidia_cuda_platform():
+        return True
+    device_ids = _thread_tp_cuda_device_ids(cuda_spec)
+    if not device_ids:
+        return False
+    capabilities = _nvidia_cuda_compute_capabilities(device_ids)
+    return all(capabilities.get(device_id, 0) > 75
+               for device_id in device_ids)
 
 def _configure_multicuda_worker_affinity(tp, threads):
     """Keep GPU launch workers off the NUMA MoE worker cores when possible."""
@@ -429,7 +526,15 @@ def _configure_qwen35_auto_fast_paths(args, is_qwen35_model: bool, mtp: int):
         # Decode graph capture itself is small enough for the large-GGUF
         # configuration.  The material VRAM cost comes from implicitly moving
         # the vocabulary embedding/output tensors to CUDA.
-        os.environ["FASTLLM_CUDA_GRAPH"] = "1"
+        cuda_spec = tp_arg if _uses_thread_tp(tp_arg) else device
+        if _cuda_graph_auto_supported(cuda_spec):
+            os.environ["FASTLLM_CUDA_GRAPH"] = "1"
+        else:
+            print(
+                "[Fastllm] Qwen3.5 auto CUDA graph disabled: every NVIDIA "
+                "CUDA device must have compute capability greater than 7.5.",
+                flush=True,
+            )
     if eligible and handoff_env not in os.environ:
         os.environ[handoff_env] = "0" if low_memory_gguf else "1"
     if low_memory_gguf:
