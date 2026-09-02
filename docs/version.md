@@ -2,6 +2,12 @@
 
 [English](version_en.md)
 
+## V0.1.8.1
+
+- 完善 Qwen3.8-Flash-Next，支持 MTP 推测解码和跨请求前缀缓存，优化 CUDA/NUMA 混合推理性能
+- 完善 Qwen3.5 GGUF、DFlash2 和双卡推理，修复 CUDA Graph 相关问题
+- 完善 CUDA 12.9、多架构 Wheel、Triton 服务脚本及 Linux 绿色包的构建与打包
+
 ## V0.1.8.0
 
 ### 新模型与推理能力

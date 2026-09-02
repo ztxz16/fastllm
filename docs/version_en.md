@@ -2,6 +2,12 @@
 
 [中文](version.md)
 
+## V0.1.8.1
+
+- Improved Qwen3.8-Flash-Next with MTP speculative decoding, cross-request prefix caching, and faster CUDA/NUMA hybrid inference.
+- Improved Qwen3.5 GGUF, DFlash2, and two-GPU inference, and fixed related CUDA Graph issues.
+- Improved build and packaging for CUDA 12.9, multi-architecture wheels, the Triton server script, and Linux portable packages.
+
 ## V0.1.8.0
 
 ### New models and inference capabilities

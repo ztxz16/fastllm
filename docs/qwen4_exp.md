@@ -2,10 +2,10 @@
 
 [中文部署指南](qwen4.md) · [Back to README](../README_EN.md) · [Benchmark](benchmarks/qwen4_exp_en.md)
 
-FastLLM supports the Qwen4-Exp text decoder stored by the released
-`Qwen4ExpForConditionalGeneration` checkpoint.  The implementation is isolated
-in `src/models/qwen4_exp.cpp`; vision and MTP tensors in the composite
-checkpoint are deliberately not loaded by the text-generation model.
+FastLLM supports the Qwen4-Exp / Qwen3.8-Flash-Next text decoder implemented
+in `src/models/qwen4_exp.cpp`. Vision tensors in composite checkpoints are not
+loaded. For `Qwen3_8FlashNextForConditionalGeneration` checkpoints, MTP
+tensors are loaded on demand only when `--mtp` is greater than zero.
 
 ## Implemented architecture
 
@@ -39,6 +39,24 @@ ftllm benchmark "$MODEL" \
 Disk mode lowers process RSS by avoiding the resident table allocation.  The
 operating-system page cache may still use otherwise-free memory, and decode
 performs small random reads, so an SSD is recommended when this mode is used.
+
+## MTP speculative decoding
+
+```bash
+ftllm server /data/models/qwen3.8-flash-next \
+  --device cuda --moe_device numa \
+  --mtp 4
+```
+
+`--mtp` sets the number of draft tokens per step, with a current maximum of
+eight. Qwen3.8-Flash-Next MTP currently requires simple greedy decoding, a CUDA
+target device map, and CUDA or NUMA MoE placement. Unsupported configurations
+automatically fall back to ordinary target decoding.
+
+For Qwen3.8-Flash-Next, MTP state is not persisted in cross-request prefix
+snapshots, so a request restored from such a snapshot falls back to ordinary
+target decoding. This limitation does not apply to Qwen3.8 checkpoints that
+use the Qwen3.5 architecture.
 
 ## Build and smoke tests
 

@@ -2,7 +2,7 @@
 
 [English architecture notes](qwen4_exp.md) · [返回 README](../README.md) · [Benchmark](benchmarks/qwen4_exp.md)
 
-FastLLM 当前加载 Qwen4-Exp / Qwen3.8-Flash-Next 的 FP8 文本生成模型，覆盖四路超连接、Gated DeltaNet、QSA 稀疏注意力、PLE n-gram 和 MoE。复合 checkpoint 中的视觉与 MTP 权重当前不会由文本模型加载。
+FastLLM 当前加载 Qwen4-Exp / Qwen3.8-Flash-Next 的 FP8 文本生成模型，覆盖四路超连接、Gated DeltaNet、QSA 稀疏注意力、PLE n-gram 和 MoE。复合 checkpoint 中的视觉权重不会由文本模型加载；Qwen3.8-Flash-Next 的 MTP 权重仅在 `--mtp` 大于 0 时按需加载。
 
 ## API Server 快速启动
 
@@ -68,6 +68,18 @@ ftllm server /data/models/qwen4-exp \
 ~~~
 
 `--triton` 只在当前 Python 环境能导入 Triton 时启用，否则自动回退到内置 CUDA。实际上下文仍受模型原生上限和 KV Cache 容量限制。
+
+## MTP 推测解码
+
+~~~bash
+ftllm server /data/models/qwen3.8-flash-next \
+  --device cuda --moe_device numa \
+  --mtp 4
+~~~
+
+`--mtp` 设置每轮 draft token 数，当前最大为 8。Qwen3.8-Flash-Next MTP 目前要求简单贪婪采样，目标网络运行在 CUDA，MoE 可放在 CUDA 或 NUMA；条件不满足时会自动回退普通解码。
+
+Qwen3.8-Flash-Next 复用跨请求前缀快照时，该请求会回退普通解码；采用 Qwen3.5 架构的 Qwen3.8 不受此限制。
 
 ## 思考与工具调用
 

@@ -24,13 +24,13 @@ FastLLM 是一个面向本地运行和服务部署的高性能大模型推理引
 
 | 模型系列 | 当前重点能力 |
 | --- | --- |
-| Qwen | Qwen4-Exp / Qwen3.8-Flash-Next 文本解码，QSA、PLE n-gram、CPU/CUDA/NUMA 混合推理；Qwen3.5/3.6/3.8、MTP 和 DFlash2 |
+| Qwen | Qwen4-Exp / Qwen3.8-Flash-Next 文本解码、QSA、PLE n-gram 和 CPU/CUDA/NUMA 混合推理；Qwen3.8-Flash-Next MTP；Qwen3.5/3.6/3.8 MTP 和 DFlash2 |
 | DeepSeek | DeepSeek-V4 / V4-Flash、稀疏注意力、内置 DSpark、多卡 CUDA 与 CPU/NUMA 混合 MoE |
 | Kimi | Kimi-K3、KDA/MLA、外部 DSpark，以及 CUDA、NUMA、CPU/GPU 专家和磁盘专家 |
 | GLM | GLM-5 DSA、GLM-5.3-Flash KDA 与分页缓存、GLM-5.2 量化 KV-B CPU 推理 |
 | 其他 | Dots3-Note、Laguna、HY-V3、Step3.5/3.7、MiniMax-M2、Gemma4 等 |
 
-Qwen4-Exp 当前加载的是文本生成模型，不加载复合 checkpoint 中的视觉和 MTP 权重。早期模型的兼容信息仍可在[支持模型列表](docs/models.md)中查询；最新适配和限制以[版本日志](docs/version.md)为准。
+Qwen4-Exp / Qwen3.8-Flash-Next 当前不加载视觉权重；Qwen3.8-Flash-Next 可通过 `--mtp` 按需加载 MTP 权重并启用推测解码。早期模型的兼容信息仍可在[支持模型列表](docs/models.md)中查询；最新适配和限制以[版本日志](docs/version.md)为准。
 
 ## 快速开始
 

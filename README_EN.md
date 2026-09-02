@@ -24,13 +24,13 @@ The table highlights the active development line instead of using legacy models 
 
 | Family | Current focus |
 | --- | --- |
-| Qwen | Qwen4-Exp / Qwen3.8-Flash-Next text decoding with QSA, PLE n-grams, and CPU/CUDA/NUMA hybrid execution; Qwen3.5/3.6/3.8, MTP, and DFlash2 |
+| Qwen | Qwen4-Exp / Qwen3.8-Flash-Next text decoding with QSA, PLE n-grams, and CPU/CUDA/NUMA hybrid execution; MTP for Qwen3.8-Flash-Next; MTP and DFlash2 for Qwen3.5/3.6/3.8 |
 | DeepSeek | DeepSeek-V4 / V4-Flash, sparse attention, embedded DSpark, multi-GPU CUDA, and CPU/NUMA hybrid MoE |
 | Kimi | Kimi-K3, KDA/MLA, external DSpark, CUDA and NUMA execution, CPU/GPU experts, and disk experts |
 | GLM | GLM-5 DSA, GLM-5.3-Flash KDA and paged caching, and quantized KV-B CPU inference for GLM-5.2 |
 | Others | Dots3-Note, Laguna, HY-V3, Step3.5/3.7, MiniMax-M2, Gemma4, and more |
 
-Qwen4-Exp currently loads the text-generation model only; vision and MTP tensors from the composite checkpoint are not loaded. See the [legacy model compatibility list](docs/models.md) for earlier architectures and the [changelog](docs/version_en.md) for the latest additions and limitations.
+Qwen4-Exp / Qwen3.8-Flash-Next currently does not load vision weights. Qwen3.8-Flash-Next can load MTP weights on demand and enable speculative decoding with `--mtp`. See the [legacy model compatibility list](docs/models.md) for earlier architectures and the [changelog](docs/version_en.md) for the latest additions and limitations.
 
 ## Quick start
 
