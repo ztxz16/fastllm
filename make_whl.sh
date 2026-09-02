@@ -83,8 +83,8 @@ cmake .. \
     -DCMAKE_CXX_COMPILER="${CXX_COMPILER}" \
     -DCMAKE_CUDA_HOST_COMPILER="${CXX_COMPILER}" \
     -DCMAKE_CUDA_COMPILER="${CUDA_COMPILER}" \
-    -DCMAKE_CUDA_FLAGS="--split-compile=16"
-make fastllm_tools -j20
+    -DCMAKE_CUDA_FLAGS="--split-compile=2"
+make fastllm_tools -j12
 if [ $? != 0 ]; then
     exit -1
 fi
