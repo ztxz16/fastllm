@@ -1439,7 +1439,8 @@ class model:
     def _is_qwen35(self) -> bool:
         if self._get_architecture() in {
                 "Qwen3_5ForConditionalGeneration",
-                "Qwen3_5MoeForConditionalGeneration"}:
+                "Qwen3_5MoeForConditionalGeneration",
+                "Qwen3_8FlashNextForConditionalGeneration"}:
             return True
         config = getattr(self, "config", {})
         if not isinstance(config, dict):

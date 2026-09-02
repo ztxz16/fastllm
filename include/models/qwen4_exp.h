@@ -47,6 +47,16 @@ namespace fastllm {
                 const LastTokensManager &lastTokens = LastTokensManager(),
                 std::vector<std::vector<float> *> *logits = nullptr) override;
 
+        std::vector<int> ForwardMultimodal(
+                const Data &inputIds,
+                const Data &attentionMask,
+                const Data &positionIds,
+                std::vector<std::pair<Data, Data>> &pastKeyValues,
+                const std::map<std::string, std::vector<Data *>> &multimodalInput,
+                const GenerationConfig &generationConfig = GenerationConfig(),
+                const LastTokensManager &lastTokens = LastTokensManager(),
+                std::vector<std::vector<float> *> *logits = nullptr) override;
+
         void WarmUp() override;
 
         bool TryRestoreHistoryCache(std::vector<int> &inputTokens,
@@ -199,6 +209,7 @@ namespace fastllm {
         };
 
         static const std::string languagePrefix;
+        static const std::string visualPrefix;
 
         int hcCount = 4;
         int hcLowRank = 320;
@@ -219,6 +230,27 @@ namespace fastllm {
         int indexerHeadDim = 128;
         int indexerBudget = 2048;
         int indexerCompressRatio = 4;
+        std::vector<int> mropeSections = {11, 11, 10};
+
+        bool visionPrepared = false;
+        int visionDepth = 0;
+        int visionHiddenSize = 0;
+        int visionNumHeads = 0;
+        int visionHeadDim = 0;
+        int visionIntermediateSize = 0;
+        int visionPatchSize = 16;
+        int visionTemporalPatchSize = 2;
+        int visionSpatialMergeSize = 2;
+        int visionOutHiddenSize = 0;
+        int visionNumPositionEmbeddings = 0;
+        int visionNumGridPerSide = 0;
+        int imageTokenId = -1;
+        int videoTokenId = -1;
+        std::vector<int> visionDeepstackIndexes;
+        std::vector<float> visionImageMean = {0.5f, 0.5f, 0.5f};
+        std::vector<float> visionImageStd = {0.5f, 0.5f, 0.5f};
+        Data visionSinData;
+        Data visionCosData;
 
         bool preparedWeights = false;
         std::mutex prepareMutex;
@@ -263,6 +295,32 @@ namespace fastllm {
         void PrepareWeights();
         void PrepareMtpDraftLmHeadWeight();
         bool IsLinearAttentionLayer(int layer) const;
+        void PrepareVision();
+        void ApplyVisionRotary(Data &input, const Data &posX,
+                               const Data &posY);
+        void ApplyTextRotary(Data &input, const Data &positionIds);
+        void EncodeVisualItems(
+            const std::vector<Data *> &rawInputs,
+            const Data *gridThwData,
+            bool isVideo,
+            Data &features,
+            std::vector<std::vector<int>> &gridThwList);
+        void BuildMultimodalPositionData(
+            const Data &inputIds,
+            const std::vector<std::vector<int>> &imageGridThwList,
+            const std::vector<std::vector<int>> &videoGridThwList,
+            Data &mmTokenTypeIds,
+            Data &mropePositionIds,
+            Data &mropePositionDelta);
+        void MergeMultimodalFeaturesIntoText(
+            const Data &mmTokenTypeIds,
+            const Data *imageEmbeds,
+            const Data *videoEmbeds,
+            Data &hiddenStates);
+        void AdjustPositionIdsWithDelta(
+            const Data &positionIds,
+            const Data &mropePositionDelta,
+            Data &adjustedPositionIds);
 
         void GroupedRMSNorm(const Data &input, Data &normWeight, Data &output);
         void HyperMixNormalized(Data &normalized,
@@ -383,7 +441,8 @@ namespace fastllm {
             bool allowDecodeCudaGraph,
             bool decodeEquivalentGdn,
             const std::vector<int> *hostInputTokens = nullptr,
-            bool materializeCausalMaskOnGraphFallback = false);
+            bool materializeCausalMaskOnGraphFallback = false,
+            const Data *precomputedEmbedding = nullptr);
 
         bool TryRunDecodeCudaGraphBackbone(
             int graphStartLayer,

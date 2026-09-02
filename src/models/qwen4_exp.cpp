@@ -39,6 +39,240 @@ namespace fastllm {
 #endif
 
     const std::string Qwen4ExpModel::languagePrefix = "model.language_model.";
+    const std::string Qwen4ExpModel::visualPrefix = "model.visual.";
+
+    static inline int Qwen4ClampInt(int value, int low, int high) {
+        return std::max(low, std::min(value, high));
+    }
+
+    static float Qwen4BicubicWeight(float x) {
+        const float a = -0.75f;
+        x = std::fabs(x);
+        if (x <= 1.0f) {
+            return ((a + 2.0f) * x - (a + 3.0f)) * x * x + 1.0f;
+        }
+        if (x < 2.0f) {
+            return ((a * x - 5.0f * a) * x + 8.0f * a) * x - 4.0f * a;
+        }
+        return 0.0f;
+    }
+
+    static void Qwen4ResizeRgbFrameBicubic(
+            const float *source, int sourceHeight, int sourceWidth,
+            int targetHeight, int targetWidth, std::vector<float> &target) {
+        target.resize((size_t)targetHeight * targetWidth * 3);
+        if (sourceHeight == targetHeight && sourceWidth == targetWidth) {
+            std::memcpy(target.data(), source,
+                        (size_t)sourceHeight * sourceWidth * 3 * sizeof(float));
+            return;
+        }
+        const float scaleY = (float)sourceHeight / targetHeight;
+        const float scaleX = (float)sourceWidth / targetWidth;
+        for (int y = 0; y < targetHeight; y++) {
+            const float sourceY = ((float)y + 0.5f) * scaleY - 0.5f;
+            const int baseY = (int)std::floor(sourceY);
+            float weightsY[4];
+            int indicesY[4];
+            for (int offset = 0; offset < 4; offset++) {
+                indicesY[offset] = Qwen4ClampInt(
+                    baseY + offset - 1, 0, sourceHeight - 1);
+                weightsY[offset] = Qwen4BicubicWeight(
+                    sourceY - (float)(baseY + offset - 1));
+            }
+            for (int x = 0; x < targetWidth; x++) {
+                const float sourceX = ((float)x + 0.5f) * scaleX - 0.5f;
+                const int baseX = (int)std::floor(sourceX);
+                float weightsX[4];
+                int indicesX[4];
+                for (int offset = 0; offset < 4; offset++) {
+                    indicesX[offset] = Qwen4ClampInt(
+                        baseX + offset - 1, 0, sourceWidth - 1);
+                    weightsX[offset] = Qwen4BicubicWeight(
+                        sourceX - (float)(baseX + offset - 1));
+                }
+                float pixel[3] = {0.0f, 0.0f, 0.0f};
+                for (int ky = 0; ky < 4; ky++) {
+                    for (int kx = 0; kx < 4; kx++) {
+                        const float weight = weightsY[ky] * weightsX[kx];
+                        const float *sourcePixel = source +
+                            ((size_t)indicesY[ky] * sourceWidth +
+                             indicesX[kx]) * 3;
+                        for (int channel = 0; channel < 3; channel++) {
+                            pixel[channel] += sourcePixel[channel] * weight;
+                        }
+                    }
+                }
+                float *targetPixel = target.data() +
+                    ((size_t)y * targetWidth + x) * 3;
+                for (int channel = 0; channel < 3; channel++) {
+                    targetPixel[channel] = std::max(
+                        0.0f, std::min(255.0f, pixel[channel]));
+                }
+            }
+        }
+    }
+
+    static void Qwen4BuildVisionPatches(
+            const float *rawData, int sourceFrames,
+            int sourceHeight, int sourceWidth,
+            int gridT, int gridH, int gridW,
+            int patchSize, int temporalPatchSize, int mergeSize,
+            const std::vector<float> &imageMean,
+            const std::vector<float> &imageStd,
+            std::vector<float> &patches,
+            std::vector<float> &positionH,
+            std::vector<float> &positionW) {
+        AssertInFastLLM(
+            sourceFrames > 0 && sourceHeight > 0 && sourceWidth > 0,
+            "Qwen4-Exp raw media shape is invalid.");
+        AssertInFastLLM(gridT > 0 && gridH > 0 && gridW > 0,
+                        "Qwen4-Exp grid_thw must be positive.");
+        AssertInFastLLM(
+            gridH % mergeSize == 0 && gridW % mergeSize == 0,
+            "Qwen4-Exp vision grid must be divisible by spatial_merge_size.");
+        AssertInFastLLM(
+            gridT == (sourceFrames + temporalPatchSize - 1) /
+                         temporalPatchSize,
+            "Qwen4-Exp grid_thw does not match the sampled frame count.");
+
+        const int targetHeight = gridH * patchSize;
+        const int targetWidth = gridW * patchSize;
+        std::vector<float> resizedFrames(
+            (size_t)sourceFrames * targetHeight * targetWidth * 3);
+        for (int frame = 0; frame < sourceFrames; frame++) {
+            std::vector<float> resized;
+            Qwen4ResizeRgbFrameBicubic(
+                rawData + (size_t)frame * sourceHeight * sourceWidth * 3,
+                sourceHeight, sourceWidth, targetHeight, targetWidth, resized);
+            std::memcpy(
+                resizedFrames.data() +
+                    (size_t)frame * targetHeight * targetWidth * 3,
+                resized.data(),
+                (size_t)targetHeight * targetWidth * 3 * sizeof(float));
+        }
+
+        const int patchDim =
+            3 * temporalPatchSize * patchSize * patchSize;
+        const int patchCount = gridT * gridH * gridW;
+        patches.clear();
+        positionH.clear();
+        positionW.clear();
+        patches.reserve((size_t)patchCount * patchDim);
+        positionH.reserve(patchCount);
+        positionW.reserve(patchCount);
+
+        const int blockHeight = gridH / mergeSize;
+        const int blockWidth = gridW / mergeSize;
+        for (int time = 0; time < gridT; time++) {
+            for (int blockH = 0; blockH < blockHeight; blockH++) {
+                for (int blockW = 0; blockW < blockWidth; blockW++) {
+                    for (int mergeH = 0; mergeH < mergeSize; mergeH++) {
+                        for (int mergeW = 0; mergeW < mergeSize; mergeW++) {
+                            const int patchH = blockH * mergeSize + mergeH;
+                            const int patchW = blockW * mergeSize + mergeW;
+                            positionH.push_back((float)patchH);
+                            positionW.push_back((float)patchW);
+                            for (int channel = 0; channel < 3; channel++) {
+                                for (int temporal = 0;
+                                     temporal < temporalPatchSize; temporal++) {
+                                    const int sourceFrame = std::min(
+                                        time * temporalPatchSize + temporal,
+                                        sourceFrames - 1);
+                                    const float *frame = resizedFrames.data() +
+                                        (size_t)sourceFrame * targetHeight *
+                                            targetWidth * 3;
+                                    for (int y = 0; y < patchSize; y++) {
+                                        for (int x = 0; x < patchSize; x++) {
+                                            const float pixel = frame[
+                                                ((size_t)(patchH * patchSize + y) *
+                                                     targetWidth +
+                                                 patchW * patchSize + x) * 3 +
+                                                channel];
+                                            patches.push_back(
+                                                (pixel / 255.0f -
+                                                 imageMean[channel]) /
+                                                imageStd[channel]);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    static void Qwen4BuildInterpolatedPositionEmbedding(
+            const float *embeddingWeight, int hiddenSize,
+            int gridPerSide, int gridT, int gridH, int gridW,
+            int mergeSize, std::vector<float> &output) {
+        AssertInFastLLM(
+            gridH % mergeSize == 0 && gridW % mergeSize == 0,
+            "Qwen4-Exp position interpolation needs merged grid alignment.");
+        std::vector<float> heightIndices(gridH);
+        std::vector<float> widthIndices(gridW);
+        for (int index = 0; index < gridH; index++) {
+            heightIndices[index] = gridH > 1
+                ? (float)index * (gridPerSide - 1) / (gridH - 1) : 0.0f;
+        }
+        for (int index = 0; index < gridW; index++) {
+            widthIndices[index] = gridW > 1
+                ? (float)index * (gridPerSide - 1) / (gridW - 1) : 0.0f;
+        }
+
+        std::vector<float> spatial(
+            (size_t)gridH * gridW * hiddenSize, 0.0f);
+        for (int height = 0; height < gridH; height++) {
+            const int lowH = (int)std::floor(heightIndices[height]);
+            const int highH = std::min(lowH + 1, gridPerSide - 1);
+            const float fractionH = heightIndices[height] - lowH;
+            for (int width = 0; width < gridW; width++) {
+                const int lowW = (int)std::floor(widthIndices[width]);
+                const int highW = std::min(lowW + 1, gridPerSide - 1);
+                const float fractionW = widthIndices[width] - lowW;
+                const float highHigh = fractionH * fractionW;
+                const float highLow = fractionH - highHigh;
+                const float lowHigh = fractionW - highHigh;
+                const float lowLow = 1.0f - fractionH - lowHigh;
+                const float *v00 = embeddingWeight +
+                    ((size_t)lowH * gridPerSide + lowW) * hiddenSize;
+                const float *v01 = embeddingWeight +
+                    ((size_t)lowH * gridPerSide + highW) * hiddenSize;
+                const float *v10 = embeddingWeight +
+                    ((size_t)highH * gridPerSide + lowW) * hiddenSize;
+                const float *v11 = embeddingWeight +
+                    ((size_t)highH * gridPerSide + highW) * hiddenSize;
+                float *destination = spatial.data() +
+                    ((size_t)height * gridW + width) * hiddenSize;
+                for (int column = 0; column < hiddenSize; column++) {
+                    destination[column] =
+                        v00[column] * lowLow + v01[column] * lowHigh +
+                        v10[column] * highLow + v11[column] * highHigh;
+                }
+            }
+        }
+
+        output.clear();
+        output.reserve((size_t)gridT * gridH * gridW * hiddenSize);
+        for (int time = 0; time < gridT; time++) {
+            (void)time;
+            for (int blockH = 0; blockH < gridH / mergeSize; blockH++) {
+                for (int blockW = 0; blockW < gridW / mergeSize; blockW++) {
+                    for (int mergeH = 0; mergeH < mergeSize; mergeH++) {
+                        for (int mergeW = 0; mergeW < mergeSize; mergeW++) {
+                            const int height = blockH * mergeSize + mergeH;
+                            const int width = blockW * mergeSize + mergeW;
+                            const float *source = spatial.data() +
+                                ((size_t)height * gridW + width) * hiddenSize;
+                            output.insert(output.end(), source,
+                                          source + hiddenSize);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     struct Qwen4ExpModel::QsaHostMirrorTransfer {
 #ifdef USE_CUDA
@@ -1219,8 +1453,67 @@ namespace fastllm {
         this->indexerBudget = Qwen4DictInt(weight.dicts, "indexer_budget", 2048);
         this->indexerCompressRatio = Qwen4DictInt(weight.dicts, "indexer_compress_ratio", 4);
 
+        auto parseIntegerArray = [&](const std::string &key,
+                                     std::vector<int> &values) {
+            auto iterator = this->weight.dicts.find(key);
+            if (iterator == this->weight.dicts.end() ||
+                iterator->second.empty() || iterator->second[0] != '[') {
+                return;
+            }
+            std::string error;
+            const json11::Json array =
+                json11::Json::parse(iterator->second, error);
+            if (!error.empty() || !array.is_array()) {
+                return;
+            }
+            std::vector<int> parsed;
+            for (const auto &item : array.array_items()) {
+                parsed.push_back(item.int_value());
+            }
+            values.swap(parsed);
+        };
+        parseIntegerArray("mrope_section", this->mropeSections);
+
+        this->visionDepth = Qwen4DictInt(
+            weight.dicts, "vision_config.depth", 0);
+        this->visionHiddenSize = Qwen4DictInt(
+            weight.dicts, "vision_config.hidden_size", 0);
+        this->visionNumHeads = Qwen4DictInt(
+            weight.dicts, "vision_config.num_heads", 0);
+        this->visionIntermediateSize = Qwen4DictInt(
+            weight.dicts, "vision_config.intermediate_size", 0);
+        this->visionPatchSize = Qwen4DictInt(
+            weight.dicts, "vision_config.patch_size", 16);
+        this->visionTemporalPatchSize = Qwen4DictInt(
+            weight.dicts, "vision_config.temporal_patch_size", 2);
+        this->visionSpatialMergeSize = Qwen4DictInt(
+            weight.dicts, "vision_config.spatial_merge_size", 2);
+        this->visionOutHiddenSize = Qwen4DictInt(
+            weight.dicts, "vision_config.out_hidden_size", this->embed_dim);
+        this->visionNumPositionEmbeddings = Qwen4DictInt(
+            weight.dicts, "vision_config.num_position_embeddings", 0);
+        this->visionNumGridPerSide = this->visionNumPositionEmbeddings > 0
+            ? (int)(std::sqrt((double)this->visionNumPositionEmbeddings) + 0.5)
+            : 0;
+        this->visionHeadDim = this->visionNumHeads > 0
+            ? this->visionHiddenSize / this->visionNumHeads : 0;
+        this->imageTokenId = Qwen4DictInt(
+            weight.dicts, "image_token_id", -1);
+        this->videoTokenId = Qwen4DictInt(
+            weight.dicts, "video_token_id", -1);
+        this->visionDeepstackIndexes.clear();
+        parseIntegerArray("vision_config.deepstack_visual_indexes",
+                          this->visionDeepstackIndexes);
+
         this->rotary_dim = (int)(this->head_dim *
             Qwen4DictFloat(weight.dicts, "partial_rotary_factor", 0.25f) + 1e-5f);
+        if (this->mropeSections.size() != 3 ||
+            this->mropeSections[0] + this->mropeSections[1] +
+                    this->mropeSections[2] != this->rotary_dim / 2) {
+            const int base = this->rotary_dim / 6;
+            this->mropeSections = {
+                base, base, this->rotary_dim / 2 - base * 2};
+        }
         this->rope_base = Qwen4DictFloat(weight.dicts, "rope_theta", 10000000.0f);
         auto rope = this->UpdateRotaryPosEmb(this->rope_base, 1.0f);
         this->qsaSinValues = rope.first;
@@ -1408,10 +1701,32 @@ namespace fastllm {
             const bool mtpWeight = Qwen4StartsWith(name, "mtp.");
             if (name != "lm_head.weight" &&
                 !Qwen4StartsWith(name, languagePrefix) &&
+                !Qwen4StartsWith(name, visualPrefix) &&
                 !(mtpWeight && Qwen4MtpDraftsPerStep() > 0)) {
-                // The model directory also contains vision and MTP tensors.
-                // Vision is never resident. MTP remains opt-in so the normal
-                // model keeps its established memory footprint.
+                // MTP remains opt-in so normal inference keeps its established
+                // memory footprint. Vision weights are loaded when present so
+                // the public conditional-generation checkpoint is complete.
+                continue;
+            }
+            if (Qwen4StartsWith(name, visualPrefix)) {
+                // ModelOpt explicitly excludes model.visual.* from NVFP4.
+                // Keep only matrix weights on FastLLM's standard FP16 Linear
+                // path; biases, norms and positional embeddings stay FP32,
+                // as required by the generic CUDA/CPU operation contracts.
+                const bool visualLinear =
+                    name == visualPrefix + "patch_embed.proj.weight" ||
+                    name.find(".attn.qkv.weight") != std::string::npos ||
+                    name.find(".attn.proj.weight") != std::string::npos ||
+                    name.find(".mlp.linear_fc1.weight") != std::string::npos ||
+                    name.find(".mlp.linear_fc2.weight") != std::string::npos ||
+                    name.find(".merger.linear_fc1.weight") != std::string::npos ||
+                    name.find(".merger.linear_fc2.weight") != std::string::npos ||
+                    (name.find(".deepstack_merger_list.") != std::string::npos &&
+                     (Qwen4EndsWith(name, ".linear_fc1.weight") ||
+                      Qwen4EndsWith(name, ".linear_fc2.weight")));
+                const DataType visualType = visualLinear
+                    ? DataType::FLOAT16 : DataType::DATA_AUTO_NONE;
+                result[name].push_back({name, visualType});
                 continue;
             }
             if (name.find("ple_embedding.layer_multipliers") != std::string::npos ||
@@ -2298,6 +2613,705 @@ namespace fastllm {
         output.ToDevice(hyperInput.dataDevice);
     }
 
+    void Qwen4ExpModel::PrepareVision() {
+        std::lock_guard<std::mutex> guard(this->prepareMutex);
+        if (this->visionPrepared) {
+            return;
+        }
+        AssertInFastLLM(
+            this->visionDepth > 0 && this->visionHiddenSize > 0 &&
+                this->visionNumHeads > 0 &&
+                this->visionIntermediateSize > 0 &&
+                this->visionOutHiddenSize > 0 &&
+                this->visionNumPositionEmbeddings > 0 &&
+                this->visionNumGridPerSide > 0,
+            "Qwen4-Exp vision_config is incomplete.");
+        AssertInFastLLM(
+            this->visionHiddenSize % this->visionNumHeads == 0 &&
+                this->visionHeadDim > 0 && this->visionHeadDim % 4 == 0,
+            "Qwen4-Exp vision hidden size must produce a head dim divisible by four.");
+        AssertInFastLLM(
+            this->visionNumGridPerSide * this->visionNumGridPerSide ==
+                this->visionNumPositionEmbeddings,
+            "Qwen4-Exp vision position embedding count must be a square.");
+        AssertInFastLLM(
+            this->visionImageMean.size() == 3 &&
+                this->visionImageStd.size() == 3 &&
+                std::all_of(this->visionImageStd.begin(),
+                            this->visionImageStd.end(),
+                            [](float value) { return value != 0.0f; }),
+            "Qwen4-Exp vision normalization requires three nonzero channel scales.");
+        AssertInFastLLM(
+            this->visionDeepstackIndexes.empty(),
+            "Qwen4-Exp deepstack vision is not supported yet.");
+        auto hasWeight = [&](const std::string &name) {
+            return this->weight.weight.find(name) != this->weight.weight.end();
+        };
+        AssertInFastLLM(
+            hasWeight(visualPrefix + "patch_embed.proj.weight") &&
+                hasWeight(visualPrefix + "patch_embed.proj.bias") &&
+                hasWeight(visualPrefix + "pos_embed.weight") &&
+                hasWeight(visualPrefix + "merger.norm.weight") &&
+                hasWeight(visualPrefix + "merger.norm.bias") &&
+                hasWeight(visualPrefix + "merger.linear_fc1.weight") &&
+                hasWeight(visualPrefix + "merger.linear_fc1.bias") &&
+                hasWeight(visualPrefix + "merger.linear_fc2.weight") &&
+                hasWeight(visualPrefix + "merger.linear_fc2.bias"),
+            "Qwen4-Exp multimodal inference needs model.visual.* weights.");
+
+        Data &patchWeight =
+            this->weight[visualPrefix + "patch_embed.proj.weight"];
+        const int patchDim = 3 * this->visionTemporalPatchSize *
+            this->visionPatchSize * this->visionPatchSize;
+        AssertInFastLLM(
+            patchWeight.Count(0) ==
+                (uint64_t)this->visionHiddenSize * patchDim,
+            "Qwen4-Exp vision patch embedding weight shape is invalid.");
+        if (patchWeight.dims !=
+                std::vector<int>({this->visionHiddenSize, patchDim})) {
+            patchWeight.Reshape({this->visionHiddenSize, patchDim});
+        }
+
+        const int maxVisionPosition = 8192;
+        const int rotaryQuarter = this->visionHeadDim / 4;
+        std::vector<float> inverseFrequencies;
+        inverseFrequencies.reserve(rotaryQuarter);
+        for (int index = 0; index < this->visionHeadDim / 2; index += 2) {
+            inverseFrequencies.push_back(
+                1.0f / std::pow(10000.0f,
+                                (float)index /
+                                    (this->visionHeadDim / 2)));
+        }
+        std::vector<float> sine;
+        std::vector<float> cosine;
+        sine.reserve((size_t)maxVisionPosition * rotaryQuarter);
+        cosine.reserve((size_t)maxVisionPosition * rotaryQuarter);
+        for (int position = 0; position < maxVisionPosition; position++) {
+            for (float inverseFrequency : inverseFrequencies) {
+                const float angle = position * inverseFrequency;
+                sine.push_back(std::sin(angle));
+                cosine.push_back(std::cos(angle));
+            }
+        }
+        this->visionSinData.CopyFrom(Data(
+            DataType::FLOAT32, {maxVisionPosition, rotaryQuarter}, sine));
+        this->visionCosData.CopyFrom(Data(
+            DataType::FLOAT32, {maxVisionPosition, rotaryQuarter}, cosine));
+        this->visionPrepared = true;
+    }
+
+    void Qwen4ExpModel::ApplyVisionRotary(
+            Data &input, const Data &positionH, const Data &positionW) {
+        AssertInFastLLM(
+            input.dims.size() == 4 && input.dims.back() % 4 == 0,
+            "Qwen4-Exp vision rotary expects [batch, seq, heads, dim].");
+        const int axis = (int)input.dims.size() - 1;
+        const int quarter = input.dims.back() / 4;
+        const int half = quarter * 2;
+        Data first, second, third, fourth, heightPair, widthPair;
+        Split(input, axis, 0, quarter, first);
+        Split(input, axis, quarter, half, second);
+        Split(input, axis, half, half + quarter, third);
+        Split(input, axis, half + quarter, input.dims.back(), fourth);
+        Cat(first, third, axis, heightPair);
+        Cat(second, fourth, axis, widthPair);
+        LlamaRotatePosition2DPart(
+            heightPair, positionH, this->visionSinData,
+            this->visionCosData, quarter, half);
+        LlamaRotatePosition2DPart(
+            widthPair, positionW, this->visionSinData,
+            this->visionCosData, quarter, half);
+
+        Data rotatedFirst, rotatedSecond, rotatedThird, rotatedFourth;
+        Data firstHalf, secondHalf, rotated;
+        Split(heightPair, axis, 0, quarter, rotatedFirst);
+        Split(heightPair, axis, quarter, half, rotatedThird);
+        Split(widthPair, axis, 0, quarter, rotatedSecond);
+        Split(widthPair, axis, quarter, half, rotatedFourth);
+        Cat(rotatedFirst, rotatedSecond, axis, firstHalf);
+        Cat(rotatedThird, rotatedFourth, axis, secondHalf);
+        Cat(firstHalf, secondHalf, axis, rotated);
+        input.CopyFrom(rotated);
+    }
+
+    void Qwen4ExpModel::ApplyTextRotary(
+            Data &input, const Data &positionIds) {
+        if (positionIds.dims.size() == 2 && positionIds.dims[0] == 3) {
+            fastllm::Qwen35InterleavedRope(
+                input, positionIds, this->rotary_dim,
+                this->mropeSections[0], this->mropeSections[1],
+                this->mropeSections[2], this->rope_base, 1.0f);
+        } else {
+            LlamaRotatePosition2DPart(
+                input, positionIds, this->sinData, this->cosData,
+                this->rotary_dim, this->rotary_dim);
+        }
+    }
+
+    void Qwen4ExpModel::EncodeVisualItems(
+            const std::vector<Data *> &rawInputs,
+            const Data *gridThwData, bool isVideo,
+            Data &features,
+            std::vector<std::vector<int>> &gridThwList) {
+        gridThwList.clear();
+        features = Data();
+        if (rawInputs.empty()) {
+            return;
+        }
+        PrepareVision();
+        AssertInFastLLM(
+            gridThwData != nullptr,
+            "Qwen4-Exp multimodal media needs grid_thw metadata.");
+
+        Data gridCpu(*gridThwData);
+        gridCpu.ToDevice(DataDevice::CPU);
+        AssertInFastLLM(
+            gridCpu.dims.size() == 2 &&
+                gridCpu.dims[0] == (int)rawInputs.size() &&
+                gridCpu.dims[1] == 3,
+            "Qwen4-Exp grid_thw should have shape [count, 3].");
+        AssertInFastLLM(
+            gridCpu.dataType == DataType::FLOAT32 ||
+                gridCpu.dataType == DataType::INT32 ||
+                gridCpu.dataType == DataType::INT32PARAM,
+            "Qwen4-Exp grid_thw should contain float32 or int32 values.");
+        auto gridValue = [&](int index) {
+            return gridCpu.dataType == DataType::FLOAT32
+                ? (int)reinterpret_cast<float *>(gridCpu.cpuData)[index]
+                : reinterpret_cast<int *>(gridCpu.cpuData)[index];
+        };
+
+        const std::string patchWeightName =
+            visualPrefix + "patch_embed.proj.weight";
+        const std::string patchBiasName =
+            visualPrefix + "patch_embed.proj.bias";
+        const float attentionScale =
+            std::pow((float)this->visionHeadDim, -0.5f);
+        const std::string visionDevice = SelectDeviceFromMap(
+            this->deviceMap, 1, std::max(1, this->block_cnt));
+        ApplyDeviceMap(this->deviceMap, 1, std::max(1, this->block_cnt));
+        std::vector<float> allFeatures;
+        int featureCount = 0;
+
+        for (int media = 0; media < (int)rawInputs.size(); media++) {
+            AssertInFastLLM(
+                rawInputs[media] != nullptr,
+                "Qwen4-Exp multimodal media contains a null tensor.");
+            const std::vector<int> grid = {
+                gridValue(media * 3), gridValue(media * 3 + 1),
+                gridValue(media * 3 + 2)};
+            gridThwList.push_back(grid);
+
+            Data rawCpu(*rawInputs[media]);
+            rawCpu.ToDevice(DataDevice::CPU);
+            if (rawCpu.dataType != DataType::FLOAT32) {
+                ToDataType(rawCpu, DataType::FLOAT32);
+                rawCpu.ToDevice(DataDevice::CPU);
+            }
+            int sourceFrames = 1;
+            int sourceHeight = 0;
+            int sourceWidth = 0;
+            if (isVideo) {
+                AssertInFastLLM(
+                    rawCpu.dims.size() == 4 && rawCpu.dims[3] == 3,
+                    "Qwen4-Exp video tensor should have shape [T, H, W, 3].");
+                sourceFrames = rawCpu.dims[0];
+                sourceHeight = rawCpu.dims[1];
+                sourceWidth = rawCpu.dims[2];
+            } else {
+                AssertInFastLLM(
+                    rawCpu.dims.size() == 3 && rawCpu.dims[2] == 3,
+                    "Qwen4-Exp image tensor should have shape [H, W, 3].");
+                sourceHeight = rawCpu.dims[0];
+                sourceWidth = rawCpu.dims[1];
+            }
+
+            std::vector<float> patches, positionsH, positionsW;
+            Qwen4BuildVisionPatches(
+                reinterpret_cast<float *>(rawCpu.cpuData),
+                sourceFrames, sourceHeight, sourceWidth,
+                grid[0], grid[1], grid[2], this->visionPatchSize,
+                this->visionTemporalPatchSize,
+                this->visionSpatialMergeSize,
+                this->visionImageMean, this->visionImageStd,
+                patches, positionsH, positionsW);
+
+            const int patchDim = 3 * this->visionTemporalPatchSize *
+                this->visionPatchSize * this->visionPatchSize;
+            const int patchCount = grid[0] * grid[1] * grid[2];
+            const int temporalChunks = grid[0];
+            const int spatialPatchCount = grid[1] * grid[2];
+            AssertInFastLLM(
+                patches.size() == (size_t)patchCount * patchDim &&
+                    positionsH.size() == (size_t)patchCount &&
+                    positionsW.size() == (size_t)patchCount,
+                "Qwen4-Exp vision patch packing size is invalid.");
+
+            Data pixelInput(
+                DataType::FLOAT32, {patchCount, patchDim}, patches);
+            Data pixelOnDevice(pixelInput);
+            Data &patchWeight = this->weight[patchWeightName];
+            if (patchWeight.dataType == DataType::FLOAT16 ||
+                patchWeight.dataType == DataType::BFLOAT16) {
+                // Match Conv3d.forward in Transformers, which casts pixels to
+                // the patch projection's checkpoint dtype before convolution.
+                ToDataType(pixelOnDevice, patchWeight.dataType);
+            }
+#ifdef USE_CUDA
+            if (visionDevice == "cuda" ||
+                Qwen4StartsWith(visionDevice, "cuda:")) {
+                int device = FastllmCudaGetDevice();
+                if (Qwen4StartsWith(visionDevice, "cuda:")) {
+                    try {
+                        device = std::stoi(visionDevice.substr(5));
+                    } catch (...) {
+                        AssertInFastLLM(
+                            false,
+                            "Qwen4-Exp vision received an invalid CUDA device name.");
+                    }
+                }
+                pixelOnDevice.ToDevice(
+                    DataDevice::CUDA, std::vector<int>({device}));
+            } else
+#endif
+            if (patchWeight.dataDevice != DataDevice::CPU) {
+                if (!patchWeight.dataDeviceIds.empty()) {
+                    pixelOnDevice.ToDevice(
+                        patchWeight.dataDevice, patchWeight.dataDeviceIds);
+                } else {
+                    pixelOnDevice.ToDevice(patchWeight.dataDevice);
+                }
+            }
+            Data hiddenStates;
+            Linear(pixelOnDevice, patchWeight,
+                   this->weight[patchBiasName], hiddenStates);
+            if (hiddenStates.dataType != this->dataType) {
+                ToDataType(hiddenStates, this->dataType);
+            }
+            hiddenStates.Reshape(
+                {1, patchCount, this->visionHiddenSize});
+
+            Data positionWeight(
+                this->weight[visualPrefix + "pos_embed.weight"]);
+            positionWeight.ToDevice(DataDevice::CPU);
+            if (positionWeight.dataType != DataType::FLOAT32) {
+                ToDataType(positionWeight, DataType::FLOAT32);
+                positionWeight.ToDevice(DataDevice::CPU);
+            }
+            AssertInFastLLM(
+                positionWeight.dims.size() == 2 &&
+                    positionWeight.dims[0] ==
+                        this->visionNumPositionEmbeddings &&
+                    positionWeight.dims[1] == this->visionHiddenSize,
+                "Qwen4-Exp vision position embedding shape is invalid.");
+            std::vector<float> interpolatedPosition;
+            Qwen4BuildInterpolatedPositionEmbedding(
+                reinterpret_cast<float *>(positionWeight.cpuData),
+                this->visionHiddenSize, this->visionNumGridPerSide,
+                grid[0], grid[1], grid[2],
+                this->visionSpatialMergeSize, interpolatedPosition);
+            Data positionEmbedding(
+                DataType::FLOAT32,
+                {1, patchCount, this->visionHiddenSize},
+                interpolatedPosition);
+            positionEmbedding.ToDevice(
+                hiddenStates.dataDevice, hiddenStates.dataDeviceIds);
+            if (positionEmbedding.dataType != hiddenStates.dataType) {
+                ToDataType(positionEmbedding, hiddenStates.dataType);
+            }
+            AddTo(hiddenStates, positionEmbedding);
+
+            Data positionH(
+                DataType::FLOAT32, {1, patchCount}, positionsH);
+            Data positionW(
+                DataType::FLOAT32, {1, patchCount}, positionsW);
+            for (int layer = 0; layer < this->visionDepth; layer++) {
+                Data blockInput, qkv, query, key, value;
+                Data attentionOutput, residual, mlpHidden, mlpOutput;
+                const std::string prefix = visualPrefix + "blocks." +
+                    std::to_string(layer);
+                Mul(hiddenStates, 1.0f, residual);
+                LayerNorm(
+                    hiddenStates, this->weight[prefix + ".norm1.weight"],
+                    this->weight[prefix + ".norm1.bias"], -1, blockInput);
+                Linear(
+                    blockInput, this->weight[prefix + ".attn.qkv.weight"],
+                    this->weight[prefix + ".attn.qkv.bias"], qkv);
+                Split(qkv, -1, 0, this->visionHiddenSize, query);
+                Split(qkv, -1, this->visionHiddenSize,
+                      this->visionHiddenSize * 2, key);
+                Split(qkv, -1, this->visionHiddenSize * 2,
+                      this->visionHiddenSize * 3, value);
+                query.Reshape({1, patchCount, this->visionNumHeads,
+                               this->visionHeadDim});
+                key.Reshape({1, patchCount, this->visionNumHeads,
+                             this->visionHeadDim});
+                value.Reshape({1, patchCount, this->visionNumHeads,
+                               this->visionHeadDim});
+                ApplyVisionRotary(query, positionH, positionW);
+                ApplyVisionRotary(key, positionH, positionW);
+                PermuteSelf(query, {0, 2, 1, 3});
+                PermuteSelf(key, {0, 2, 1, 3});
+                PermuteSelf(value, {0, 2, 1, 3});
+                query.Reshape({this->visionNumHeads * temporalChunks,
+                               spatialPatchCount, this->visionHeadDim});
+                key.Reshape({this->visionNumHeads * temporalChunks,
+                             spatialPatchCount, this->visionHeadDim});
+                value.Reshape({this->visionNumHeads * temporalChunks,
+                               spatialPatchCount, this->visionHeadDim});
+                Attention(query, key, value, *GetEmptyData(),
+                          attentionOutput, 1, attentionScale, 2);
+                attentionOutput.Reshape(
+                    {this->visionNumHeads, temporalChunks,
+                     spatialPatchCount, this->visionHeadDim});
+                PermuteSelf(attentionOutput, {1, 2, 0, 3});
+                attentionOutput.Reshape(
+                    {1, patchCount, this->visionHiddenSize});
+                Linear(
+                    attentionOutput,
+                    this->weight[prefix + ".attn.proj.weight"],
+                    this->weight[prefix + ".attn.proj.bias"],
+                    attentionOutput);
+                if (attentionOutput.dataType != residual.dataType) {
+                    ToDataType(attentionOutput, residual.dataType);
+                }
+                AddTo(residual, attentionOutput);
+                hiddenStates.CopyFrom(residual);
+
+                Mul(hiddenStates, 1.0f, residual);
+                LayerNorm(
+                    hiddenStates, this->weight[prefix + ".norm2.weight"],
+                    this->weight[prefix + ".norm2.bias"], -1, blockInput);
+                Linear(
+                    blockInput,
+                    this->weight[prefix + ".mlp.linear_fc1.weight"],
+                    this->weight[prefix + ".mlp.linear_fc1.bias"],
+                    mlpHidden);
+                if (mlpHidden.dataType != DataType::FLOAT32) {
+                    ToDataType(mlpHidden, DataType::FLOAT32);
+                }
+                GeluNew(mlpHidden, mlpHidden);
+                Linear(
+                    mlpHidden,
+                    this->weight[prefix + ".mlp.linear_fc2.weight"],
+                    this->weight[prefix + ".mlp.linear_fc2.bias"],
+                    mlpOutput);
+                if (mlpOutput.dataType != residual.dataType) {
+                    ToDataType(mlpOutput, residual.dataType);
+                }
+                AddTo(residual, mlpOutput);
+                hiddenStates.CopyFrom(residual);
+            }
+
+            Data mergerInput;
+            LayerNorm(
+                hiddenStates, this->weight[visualPrefix + "merger.norm.weight"],
+                this->weight[visualPrefix + "merger.norm.bias"],
+                -1, mergerInput);
+            const int mergeUnit = this->visionSpatialMergeSize *
+                this->visionSpatialMergeSize;
+            AssertInFastLLM(
+                patchCount % mergeUnit == 0,
+                "Qwen4-Exp vision merger received a partial merge unit.");
+            mergerInput.Reshape(
+                {patchCount / mergeUnit,
+                 this->visionHiddenSize * mergeUnit});
+            Data mergerHidden, mergerOutput;
+            Linear(
+                mergerInput,
+                this->weight[visualPrefix + "merger.linear_fc1.weight"],
+                this->weight[visualPrefix + "merger.linear_fc1.bias"],
+                mergerHidden);
+            if (mergerHidden.dataType != DataType::FLOAT32) {
+                ToDataType(mergerHidden, DataType::FLOAT32);
+            }
+            Gelu(mergerHidden, mergerHidden);
+            Linear(
+                mergerHidden,
+                this->weight[visualPrefix + "merger.linear_fc2.weight"],
+                this->weight[visualPrefix + "merger.linear_fc2.bias"],
+                mergerOutput);
+#ifdef USE_CUDA
+            if (mergerOutput.dataDevice == DataDevice::CUDA) {
+                FastllmCudaSyncCurrentThreadStream();
+            }
+#endif
+            mergerOutput.ToDevice(DataDevice::CPU);
+            if (mergerOutput.dataType != DataType::FLOAT32) {
+                ToDataType(mergerOutput, DataType::FLOAT32);
+                mergerOutput.ToDevice(DataDevice::CPU);
+            }
+            AssertInFastLLM(
+                mergerOutput.dims.size() == 2 &&
+                    mergerOutput.dims[1] == this->visionOutHiddenSize,
+                "Qwen4-Exp vision merger output shape is invalid.");
+            const float *values =
+                reinterpret_cast<float *>(mergerOutput.cpuData);
+            allFeatures.insert(
+                allFeatures.end(), values, values + mergerOutput.Count(0));
+            featureCount += mergerOutput.dims[0];
+        }
+
+        if (featureCount > 0) {
+            features.CopyFrom(Data(
+                DataType::FLOAT32,
+                {1, featureCount, this->visionOutHiddenSize},
+                allFeatures));
+        }
+    }
+
+    void Qwen4ExpModel::BuildMultimodalPositionData(
+            const Data &inputIds,
+            const std::vector<std::vector<int>> &imageGridThwList,
+            const std::vector<std::vector<int>> &videoGridThwList,
+            Data &mmTokenTypeIds, Data &mropePositionIds,
+            Data &mropePositionDelta) {
+        Data idsCpu(inputIds);
+        idsCpu.ToDevice(DataDevice::CPU);
+        if (idsCpu.dataType != DataType::FLOAT32) {
+            ToDataType(idsCpu, DataType::FLOAT32);
+            idsCpu.ToDevice(DataDevice::CPU);
+        }
+        AssertInFastLLM(
+            idsCpu.dims.size() == 2 && idsCpu.dims[0] == 1,
+            "Qwen4-Exp multimodal positions expect one text batch.");
+        const int sequence = idsCpu.dims[1];
+        const float *ids = reinterpret_cast<float *>(idsCpu.cpuData);
+        std::vector<int> tokenTypes(sequence, 0);
+        for (int index = 0; index < sequence; index++) {
+            const int token = (int)ids[index];
+            if (token == this->imageTokenId) {
+                tokenTypes[index] = 1;
+            } else if (token == this->videoTokenId) {
+                tokenTypes[index] = 2;
+            }
+        }
+
+        std::vector<std::vector<int>> repeatedVideoGrids;
+        for (const auto &grid : videoGridThwList) {
+            for (int time = 0; time < grid[0]; time++) {
+                repeatedVideoGrids.push_back({1, grid[1], grid[2]});
+            }
+        }
+
+        std::vector<float> typeValues(sequence, 0.0f);
+        std::vector<float> temporalPositions;
+        std::vector<float> heightPositions;
+        std::vector<float> widthPositions;
+        temporalPositions.reserve(sequence);
+        heightPositions.reserve(sequence);
+        widthPositions.reserve(sequence);
+        int currentPosition = 0;
+        int imageIndex = 0;
+        int videoIndex = 0;
+        for (int begin = 0; begin < sequence;) {
+            const int type = tokenTypes[begin];
+            int end = begin + 1;
+            while (end < sequence && tokenTypes[end] == type) {
+                end++;
+            }
+            const int length = end - begin;
+            std::fill(typeValues.begin() + begin,
+                      typeValues.begin() + end, (float)type);
+            if (type == 0) {
+                for (int offset = 0; offset < length; offset++) {
+                    const float position =
+                        (float)(currentPosition + offset);
+                    temporalPositions.push_back(position);
+                    heightPositions.push_back(position);
+                    widthPositions.push_back(position);
+                }
+                currentPosition += length;
+            } else {
+                const std::vector<int> *grid = nullptr;
+                if (type == 1) {
+                    AssertInFastLLM(
+                        imageIndex < (int)imageGridThwList.size(),
+                        "Qwen4-Exp image metadata does not match placeholders.");
+                    grid = &imageGridThwList[imageIndex++];
+                } else {
+                    AssertInFastLLM(
+                        videoIndex < (int)repeatedVideoGrids.size(),
+                        "Qwen4-Exp video metadata does not match placeholders.");
+                    grid = &repeatedVideoGrids[videoIndex++];
+                }
+                const int llmGridT = (*grid)[0];
+                const int llmGridH =
+                    (*grid)[1] / this->visionSpatialMergeSize;
+                const int llmGridW =
+                    (*grid)[2] / this->visionSpatialMergeSize;
+                AssertInFastLLM(
+                    llmGridT > 0 && llmGridH > 0 && llmGridW > 0 &&
+                        length == llmGridT * llmGridH * llmGridW,
+                    "Qwen4-Exp vision token count does not match grid_thw.");
+                for (int time = 0; time < llmGridT; time++) {
+                    for (int height = 0; height < llmGridH; height++) {
+                        for (int width = 0; width < llmGridW; width++) {
+                            temporalPositions.push_back(
+                                (float)(currentPosition + time));
+                            heightPositions.push_back(
+                                (float)(currentPosition + height));
+                            widthPositions.push_back(
+                                (float)(currentPosition + width));
+                        }
+                    }
+                }
+                currentPosition += std::max((*grid)[1], (*grid)[2]) /
+                    this->visionSpatialMergeSize;
+            }
+            begin = end;
+        }
+        AssertInFastLLM(
+            imageIndex == (int)imageGridThwList.size() &&
+                videoIndex == (int)repeatedVideoGrids.size(),
+            "Qwen4-Exp multimodal grid metadata was not fully consumed.");
+
+        mmTokenTypeIds.CopyFrom(Data(
+            DataType::FLOAT32, {1, sequence}, typeValues));
+        std::vector<float> positions;
+        positions.reserve((size_t)sequence * 3);
+        positions.insert(positions.end(), temporalPositions.begin(),
+                         temporalPositions.end());
+        positions.insert(positions.end(), heightPositions.begin(),
+                         heightPositions.end());
+        positions.insert(positions.end(), widthPositions.begin(),
+                         widthPositions.end());
+        mropePositionIds.CopyFrom(Data(
+            DataType::FLOAT32, {3, sequence}, positions));
+        float maximum = 0.0f;
+        if (!positions.empty()) {
+            maximum = *std::max_element(positions.begin(), positions.end());
+        }
+        mropePositionDelta.CopyFrom(Data(
+            DataType::FLOAT32, {1, 1},
+            {positions.empty() ? 0.0f : maximum + 1.0f - sequence}));
+    }
+
+    void Qwen4ExpModel::MergeMultimodalFeaturesIntoText(
+            const Data &mmTokenTypeIds, const Data *imageEmbeds,
+            const Data *videoEmbeds, Data &hiddenStates) {
+        Data types(mmTokenTypeIds);
+        types.ToDevice(DataDevice::CPU);
+        if (types.dataType != DataType::FLOAT32) {
+            ToDataType(types, DataType::FLOAT32);
+            types.ToDevice(DataDevice::CPU);
+        }
+        const DataType hiddenType = hiddenStates.dataType;
+        hiddenStates.ToDevice(DataDevice::CPU);
+        AssertInFastLLM(
+            (hiddenType == DataType::FLOAT32 ||
+             hiddenType == DataType::FLOAT16 ||
+             hiddenType == DataType::BFLOAT16) &&
+                hiddenStates.dims.size() == 3 &&
+                hiddenStates.dims[0] == 1,
+            "Qwen4-Exp multimodal hidden states have an invalid shape or type.");
+        AssertInFastLLM(
+            types.Count(0) == (uint64_t)hiddenStates.dims[1],
+            "Qwen4-Exp modality types must match the input sequence.");
+
+        const int hiddenSize = hiddenStates.dims[2];
+        const size_t rowBytes = (size_t)hiddenSize * hiddenStates.unitSize /
+            hiddenStates.unitSizeDiv;
+        Data imageCpu, videoCpu;
+        int imageCount = 0;
+        int videoCount = 0;
+        uint8_t *imageValues = nullptr;
+        uint8_t *videoValues = nullptr;
+        auto prepareFeatures = [&](const Data *source, Data &destination,
+                                   int &count, uint8_t *&values) {
+            if (source == nullptr || source->dims.empty()) {
+                return;
+            }
+            destination.CopyFrom(*source);
+            destination.ToDevice(DataDevice::CPU);
+            if (destination.dataType != hiddenType) {
+                ToDataType(destination, hiddenType);
+                destination.ToDevice(DataDevice::CPU);
+            }
+            if (destination.dims.size() == 3 &&
+                destination.dims[0] == 1) {
+                destination.Reshape(
+                    {destination.dims[1], destination.dims[2]});
+            }
+            AssertInFastLLM(
+                destination.dims.size() == 2 &&
+                    destination.dims[1] == hiddenSize,
+                "Qwen4-Exp visual feature shape does not match text hidden size.");
+            count = destination.dims[0];
+            values = reinterpret_cast<uint8_t *>(destination.cpuData);
+        };
+        prepareFeatures(imageEmbeds, imageCpu, imageCount, imageValues);
+        prepareFeatures(videoEmbeds, videoCpu, videoCount, videoValues);
+
+        uint8_t *hiddenValues =
+            reinterpret_cast<uint8_t *>(hiddenStates.cpuData);
+        const float *typeValues =
+            reinterpret_cast<float *>(types.cpuData);
+        int nextImage = 0;
+        int nextVideo = 0;
+        for (int token = 0; token < hiddenStates.dims[1]; token++) {
+            if ((int)typeValues[token] == 1) {
+                AssertInFastLLM(
+                    nextImage < imageCount,
+                    "Qwen4-Exp image features do not match placeholders.");
+                std::memcpy(hiddenValues + (size_t)token * rowBytes,
+                            imageValues + (size_t)nextImage++ * rowBytes,
+                            rowBytes);
+            } else if ((int)typeValues[token] == 2) {
+                AssertInFastLLM(
+                    nextVideo < videoCount,
+                    "Qwen4-Exp video features do not match placeholders.");
+                std::memcpy(hiddenValues + (size_t)token * rowBytes,
+                            videoValues + (size_t)nextVideo++ * rowBytes,
+                            rowBytes);
+            }
+        }
+        AssertInFastLLM(
+            nextImage == imageCount && nextVideo == videoCount,
+            "Qwen4-Exp visual features were not fully consumed.");
+    }
+
+    void Qwen4ExpModel::AdjustPositionIdsWithDelta(
+            const Data &positionIds, const Data &mropePositionDelta,
+            Data &adjustedPositionIds) {
+        adjustedPositionIds.CopyFrom(positionIds);
+        adjustedPositionIds.ToDevice(DataDevice::CPU);
+        if (adjustedPositionIds.dataType != DataType::FLOAT32) {
+            ToDataType(adjustedPositionIds, DataType::FLOAT32);
+            adjustedPositionIds.ToDevice(DataDevice::CPU);
+        }
+        Data deltaCpu(mropePositionDelta);
+        deltaCpu.ToDevice(DataDevice::CPU);
+        if (deltaCpu.dataType != DataType::FLOAT32) {
+            ToDataType(deltaCpu, DataType::FLOAT32);
+            deltaCpu.ToDevice(DataDevice::CPU);
+        }
+        const float delta =
+            reinterpret_cast<float *>(deltaCpu.cpuData)[0];
+        if (adjustedPositionIds.dims.size() == 2 &&
+            adjustedPositionIds.dims[0] == 3) {
+            float *values =
+                reinterpret_cast<float *>(adjustedPositionIds.cpuData);
+            for (uint64_t index = 0;
+                 index < adjustedPositionIds.Count(0); index++) {
+                values[index] += delta;
+            }
+            return;
+        }
+        const int sequence = adjustedPositionIds.Count(0);
+        const float *values =
+            reinterpret_cast<float *>(adjustedPositionIds.cpuData);
+        std::vector<float> expanded((size_t)sequence * 3);
+        for (int axis = 0; axis < 3; axis++) {
+            for (int token = 0; token < sequence; token++) {
+                expanded[(size_t)axis * sequence + token] =
+                    values[token] + delta;
+            }
+        }
+        adjustedPositionIds.CopyFrom(Data(
+            DataType::FLOAT32, {3, sequence}, expanded));
+    }
+
     void Qwen4ExpModel::MaterializeQsaHostHistory(
             int layer, int length, RequestState &state) {
         AssertInFastLLM(
@@ -2307,8 +3321,11 @@ namespace fastllm {
         std::vector<float> &positions = state.indexerPositions[layer];
         const size_t fullRawCount =
             (size_t)length * this->indexerHeadDim;
-        if (rawKeys.size() == fullRawCount &&
-            positions.size() == (size_t)length) {
+        const auto hasFullPositions = [&]() {
+            return positions.size() == (size_t)length ||
+                positions.size() == (size_t)length * 3;
+        };
+        if (rawKeys.size() == fullRawCount && hasFullPositions()) {
             return;
         }
 #ifdef USE_CUDA
@@ -2319,8 +3336,7 @@ namespace fastllm {
             transfer->second->Materialize(rawKeys, positions);
         }
 #endif
-        if (rawKeys.size() == fullRawCount &&
-            positions.size() == (size_t)length) {
+        if (rawKeys.size() == fullRawCount && hasFullPositions()) {
             return;
         }
 
@@ -2417,9 +3433,7 @@ namespace fastllm {
             {batch, sequence, this->indexerHeadDim});
         RMSNorm(query, this->weight[indexer + "q_layernorm.weight"],
                 this->rms_norm_eps, query);
-        LlamaRotatePosition2DPart(
-            query, positionIds, this->sinData, this->cosData,
-            this->rotary_dim, this->rotary_dim);
+        ApplyTextRotary(query, positionIds);
 
         qsaIndices = Data();
         const int keyLength = previousLength + sequence;
@@ -2452,10 +3466,13 @@ namespace fastllm {
         auto updateHostBlockCache = [&](int hostKeyLength) {
             const int hostCompleteKeyBlocks =
                 hostKeyLength / this->indexerCompressRatio;
+            const bool mropePositions =
+                positionCache.size() == (size_t)hostKeyLength * 3;
             AssertInFastLLM(
                 rawKeyCache.size() ==
                         (size_t)hostKeyLength * this->indexerHeadDim &&
-                    positionCache.size() == (size_t)hostKeyLength,
+                    (positionCache.size() == (size_t)hostKeyLength ||
+                     mropePositions),
                 "Qwen4-Exp QSA host mirror is inconsistent with the attention cache.");
             AssertInFastLLM(
                 blockKeys.size() % this->indexerHeadDim == 0,
@@ -2500,26 +3517,36 @@ namespace fastllm {
                             (float)this->indexerCompressRatio * inverseRms *
                             keyNorm[column];
                     }
-                    const int position =
-                        (int)(positionCache[groupStart] + 0.01f);
-                    AssertInFastLLM(
-                        position >= 0 && position < this->sinData.dims[0],
-                        "Qwen4-Exp QSA position exceeds its rotary table.");
-                    const float *sinRow = sinValues +
-                        (size_t)position * rotaryStride;
-                    const float *cosRow = cosValues +
-                        (size_t)position * rotaryStride;
                     float *destination = blockKeys.data() +
                         (size_t)block * this->indexerHeadDim;
                     std::copy(pooled.begin(), pooled.end(), destination);
                     for (int column = 0; column < rotaryHalf; column++) {
+                        int positionAxis = 0;
+                        if (mropePositions && column % 3 == 1 &&
+                            column < this->mropeSections[1] * 3) {
+                            positionAxis = 1;
+                        } else if (mropePositions && column % 3 == 2 &&
+                                   column < this->mropeSections[2] * 3) {
+                            positionAxis = 2;
+                        }
+                        const int position = (int)(
+                            positionCache[mropePositions
+                                ? (size_t)groupStart * 3 + positionAxis
+                                : (size_t)groupStart] + 0.01f);
+                        AssertInFastLLM(
+                            position >= 0 &&
+                                position < this->sinData.dims[0],
+                            "Qwen4-Exp QSA position exceeds its rotary table.");
+                        const float sine = sinValues[
+                            (size_t)position * rotaryStride + column];
+                        const float cosine = cosValues[
+                            (size_t)position * rotaryStride + column];
                         destination[column] =
-                            pooled[column] * cosRow[column] -
-                            pooled[column + rotaryHalf] * sinRow[column];
+                            pooled[column] * cosine -
+                            pooled[column + rotaryHalf] * sine;
                         destination[column + rotaryHalf] =
-                            pooled[column + rotaryHalf] *
-                                cosRow[column + rotaryHalf] +
-                            pooled[column] * sinRow[column + rotaryHalf];
+                            pooled[column + rotaryHalf] * cosine +
+                            pooled[column] * sine;
                     }
                 }
             });
@@ -2534,7 +3561,10 @@ namespace fastllm {
             deviceCompatibleMask &&
             query.dataDevice == DataDevice::CUDA &&
             currentRawKeys.dataDevice == DataDevice::CUDA &&
-            positionIds.dataDevice == DataDevice::CUDA;
+            positionIds.dataDevice == DataDevice::CUDA &&
+            !(previousLength > 0 &&
+              positionCache.size() == (size_t)previousLength * 3) &&
+            !(positionIds.dims.size() == 2 && positionIds.dims[0] == 3);
         if (useDeviceQsa) {
             const int ratio = this->indexerCompressRatio;
             AssertInFastLLM(ratio > 0,
@@ -3038,16 +4068,38 @@ namespace fastllm {
         const float *currentPositions =
             reinterpret_cast<const float *>(positionsCpu.cpuData);
 
-        AssertInFastLLM(rawKeyCache.size() % this->indexerHeadDim == 0 &&
-                        (int)(rawKeyCache.size() / this->indexerHeadDim) ==
-                            previousLength &&
-                        (int)positionCache.size() == previousLength,
-                        "Qwen4-Exp QSA cache is inconsistent with the attention cache.");
+        const bool cachedMrope = previousLength > 0 &&
+            positionCache.size() == (size_t)previousLength * 3;
+        const bool currentMrope = positionsCpu.dims.size() == 2 &&
+            positionsCpu.dims[0] == 3;
+        AssertInFastLLM(
+            rawKeyCache.size() % this->indexerHeadDim == 0 &&
+                (int)(rawKeyCache.size() / this->indexerHeadDim) ==
+                    previousLength &&
+                (positionCache.size() == (size_t)previousLength ||
+                 cachedMrope) &&
+                (!currentMrope || previousLength == 0 || cachedMrope),
+            "Qwen4-Exp QSA cache is inconsistent with the attention cache.");
         rawKeyCache.insert(rawKeyCache.end(), rawKeyValues,
                            rawKeyValues + (size_t)sequence *
                                               this->indexerHeadDim);
-        positionCache.insert(positionCache.end(), currentPositions,
-                             currentPositions + sequence);
+        if (currentMrope) {
+            for (int token = 0; token < sequence; token++) {
+                for (int axis = 0; axis < 3; axis++) {
+                    positionCache.push_back(
+                        currentPositions[(size_t)axis * sequence + token]);
+                }
+            }
+        } else if (cachedMrope) {
+            for (int token = 0; token < sequence; token++) {
+                for (int axis = 0; axis < 3; axis++) {
+                    positionCache.push_back(currentPositions[token]);
+                }
+            }
+        } else {
+            positionCache.insert(positionCache.end(), currentPositions,
+                                 currentPositions + sequence);
+        }
 
         // vLLM's QSA cache writes one compressed row only when a group is
         // completed. Keep the same invariant here: old rows are immutable and
@@ -3457,10 +4509,8 @@ namespace fastllm {
                 this->rms_norm_eps, query);
         RMSNorm(key, this->weight[attention + "k_norm.weight"],
                 this->rms_norm_eps, key);
-        LlamaRotatePosition2DPart(query, positionIds, this->sinData, this->cosData,
-                                  this->rotary_dim, this->rotary_dim);
-        LlamaRotatePosition2DPart(key, positionIds, this->sinData, this->cosData,
-                                  this->rotary_dim, this->rotary_dim);
+        ApplyTextRotary(query, positionIds);
+        ApplyTextRotary(key, positionIds);
 
         PermuteSelf(query, {0, 2, 1, 3});
         PermuteSelf(key, {0, 2, 1, 3});
@@ -7638,6 +8688,153 @@ namespace fastllm {
         }
         return true;
     }
+    std::vector<int> Qwen4ExpModel::ForwardMultimodal(
+            const Data &inputIds, const Data &attentionMask,
+            const Data &positionIds,
+            std::vector<std::pair<Data, Data>> &pastKeyValues,
+            const std::map<std::string, std::vector<Data *>> &multimodalInput,
+            const GenerationConfig &generationConfig,
+            const LastTokensManager &lastTokens,
+            std::vector<std::vector<float> *> *retLogits) {
+        AssertInFastLLM(
+            inputIds.dims.size() == 2 && inputIds.dims[0] == 1,
+            "Qwen4-Exp multimodal inference supports one request at a time.");
+        AssertInFastLLM(
+            (int)pastKeyValues.size() >= this->block_cnt,
+            "Qwen4-Exp multimodal inference received too few cache slots.");
+
+        // The payload remains attached to the response context during decode.
+        // Only the first call has an empty target cache and needs the visual
+        // encoder; later calls use the stored M-RoPE delta with normal text
+        // decode.
+        if (!pastKeyValues.empty() &&
+            !pastKeyValues[0].second.dims.empty()) {
+            Data adjustedPositionIds;
+            auto delta = multimodalInput.find("mrope_position_delta");
+            if (delta != multimodalInput.end() && !delta->second.empty() &&
+                delta->second[0] != nullptr) {
+                AdjustPositionIdsWithDelta(
+                    positionIds, *delta->second[0], adjustedPositionIds);
+            } else {
+                adjustedPositionIds.CopyFrom(positionIds);
+            }
+            std::vector<float> *logits = nullptr;
+            if (retLogits != nullptr && !retLogits->empty()) {
+                logits = (*retLogits)[0];
+            }
+            return {Forward(inputIds, attentionMask, adjustedPositionIds,
+                            pastKeyValues, generationConfig,
+                            lastTokens, logits)};
+        }
+
+        PrepareWeights();
+        RequestState *requestState;
+        {
+            std::lock_guard<std::mutex> guard(this->stateMutex);
+            requestState = &this->requestStates[&pastKeyValues[0].first];
+            // Draft state cannot be reconstructed from the visual encoder's
+            // replacement embeddings. Keep this request on exact target-model
+            // decoding; ordinary text requests retain MTP.
+            requestState->mtpDisabled = true;
+            requestState->mtpState.reset();
+        }
+
+        auto &mutableInputs = const_cast<
+            std::map<std::string, std::vector<Data *>> &>(multimodalInput);
+        auto imageFrames = multimodalInput.find("image_frames");
+        auto videoFrames = multimodalInput.find("video_frames");
+        auto imageGrid = multimodalInput.find("image_grid_thw");
+        auto videoGrid = multimodalInput.find("video_grid_thw");
+        const bool hasRawMedia =
+            (imageFrames != multimodalInput.end() &&
+             !imageFrames->second.empty()) ||
+            (videoFrames != multimodalInput.end() &&
+             !videoFrames->second.empty());
+
+        Data imageFeatures, videoFeatures;
+        const Data *imageEmbeds = nullptr;
+        const Data *videoEmbeds = nullptr;
+        auto modalityTypes = multimodalInput.find("mm_token_type_ids");
+        auto mropePositions = multimodalInput.find("mrope_position_ids");
+        if (hasRawMedia) {
+            std::vector<std::vector<int>> imageGrids, videoGrids;
+            EncodeVisualItems(
+                imageFrames == multimodalInput.end()
+                    ? std::vector<Data *>() : imageFrames->second,
+                imageGrid != multimodalInput.end() &&
+                        !imageGrid->second.empty()
+                    ? imageGrid->second[0] : nullptr,
+                false, imageFeatures, imageGrids);
+            EncodeVisualItems(
+                videoFrames == multimodalInput.end()
+                    ? std::vector<Data *>() : videoFrames->second,
+                videoGrid != multimodalInput.end() &&
+                        !videoGrid->second.empty()
+                    ? videoGrid->second[0] : nullptr,
+                true, videoFeatures, videoGrids);
+
+            Data computedTypes, computedPositions, computedDelta;
+            BuildMultimodalPositionData(
+                inputIds, imageGrids, videoGrids,
+                computedTypes, computedPositions, computedDelta);
+            mutableInputs["mm_token_type_ids"].clear();
+            mutableInputs["mrope_position_ids"].clear();
+            mutableInputs["mrope_position_delta"].clear();
+            mutableInputs["mm_token_type_ids"].push_back(
+                new Data(computedTypes));
+            mutableInputs["mrope_position_ids"].push_back(
+                new Data(computedPositions));
+            mutableInputs["mrope_position_delta"].push_back(
+                new Data(computedDelta));
+            modalityTypes = mutableInputs.find("mm_token_type_ids");
+            mropePositions = mutableInputs.find("mrope_position_ids");
+            imageEmbeds = imageFeatures.dims.empty()
+                ? nullptr : &imageFeatures;
+            videoEmbeds = videoFeatures.dims.empty()
+                ? nullptr : &videoFeatures;
+        } else {
+            auto images = multimodalInput.find("image_embeds");
+            if (images != multimodalInput.end() && !images->second.empty()) {
+                imageEmbeds = images->second[0];
+            }
+            auto videos = multimodalInput.find("video_embeds");
+            if (videos != multimodalInput.end() && !videos->second.empty()) {
+                videoEmbeds = videos->second[0];
+            }
+        }
+        AssertInFastLLM(
+            modalityTypes != mutableInputs.end() &&
+                !modalityTypes->second.empty() &&
+                mropePositions != mutableInputs.end() &&
+                !mropePositions->second.empty(),
+            "Qwen4-Exp multimodal inference needs modality and M-RoPE positions.");
+
+        Data embeddingResult, mergedEmbedding;
+        Data &embeddingWeight =
+            this->weight[languagePrefix + "embed_tokens.weight"];
+        Embedding(inputIds, embeddingWeight, embeddingResult);
+        mergedEmbedding.CopyFrom(embeddingResult);
+        MergeMultimodalFeaturesIntoText(
+            *modalityTypes->second[0], imageEmbeds, videoEmbeds,
+            mergedEmbedding);
+        if (embeddingWeight.dataDevice != DataDevice::CPU) {
+            mergedEmbedding.ToDevice(
+                embeddingWeight.dataDevice, embeddingWeight.dataDeviceIds);
+        }
+
+        Data mropePositionIds(*mropePositions->second[0]);
+        mropePositionIds.ToDevice(DataDevice::CPU);
+        if (mropePositionIds.dataType != DataType::FLOAT32) {
+            ToDataType(mropePositionIds, DataType::FLOAT32);
+            mropePositionIds.ToDevice(DataDevice::CPU);
+        }
+        return ForwardTarget(
+            1, inputIds, attentionMask, mropePositionIds,
+            pastKeyValues, generationConfig, lastTokens, retLogits,
+            nullptr, nullptr, nullptr, nullptr,
+            false, false, false, nullptr, false, &mergedEmbedding);
+    }
+
     int Qwen4ExpModel::Forward(
             const Data &inputIds,
             const Data &attentionMask,
@@ -8154,7 +9351,8 @@ namespace fastllm {
             bool allowDecodeCudaGraph,
             bool decodeEquivalentGdn,
             const std::vector<int> *hostInputTokens,
-            bool materializeCausalMaskOnGraphFallback) {
+            bool materializeCausalMaskOnGraphFallback,
+            const Data *precomputedEmbedding) {
         Qwen4MtpGdnModeGuard mtpGdnMode(decodeEquivalentGdn);
         AssertInFastLLM(batch == 1 && inputIds.dims.size() == 2 &&
                         inputIds.dims[0] == 1,
@@ -8246,8 +9444,19 @@ namespace fastllm {
         Data *nextHiddenStates = &hiddenBuffers[1];
         DumpTensorIfRequested("input_ids", inputIds);
         DumpTensorIfRequested("position_ids", positionIds);
-        Embedding(inputIds, this->weight[languagePrefix + "embed_tokens.weight"],
-                  embedding);
+        if (precomputedEmbedding != nullptr) {
+            AssertInFastLLM(
+                precomputedEmbedding->dims ==
+                    std::vector<int>({batch, inputIds.dims[1],
+                                      this->embed_dim}),
+                "Qwen4-Exp precomputed embedding shape is invalid.");
+            embedding.CopyFrom(*precomputedEmbedding);
+        } else {
+            Embedding(
+                inputIds,
+                this->weight[languagePrefix + "embed_tokens.weight"],
+                embedding);
+        }
         embedding.Reshape({batch, inputIds.dims[1], 1, this->embed_dim});
         Repeat(embedding, 2, this->hcCount, *hiddenStates);
         hiddenStates->Reshape({batch, inputIds.dims[1],
