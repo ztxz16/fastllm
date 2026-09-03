@@ -2001,9 +2001,25 @@ FastllmPagedAttentionSplitSm70GqaD256Kernel(
         acc[i] = 0.0f;
     }
 
-    for (int j = kvStart + warpId; j < kvEnd; j += kWarps) {
-        size_t base = FastllmPagedKvTokenBase(j, pageStart, pageLen, numPages, pageIndexs,
-                                              pageStride, tokenStride, kvHeadOffset);
+    // Walk each warp's strided token sequence with a page cursor.  Calling
+    // FastllmPagedKvTokenBase for every token repeats the j/pageLen mapping and
+    // page-table lookup even though the next token owned by a warp is known.
+    // Most iterations stay in the same 128-token page; only refresh the page
+    // mapping when the four-warp stride crosses a boundary.  This remains
+    // correct for fragmented/non-linear page lists as well as contiguous ones.
+    int j = kvStart + warpId;
+    int pageListIdx = 0;
+    int offsetInPage = 0;
+    size_t base = 0;
+    if (j < kvEnd) {
+        pageListIdx = j / pageLen;
+        offsetInPage = j - pageListIdx * pageLen;
+        int page = pageIndexs[pageStart + pageListIdx];
+        base = (size_t)page * pageStride +
+               (size_t)offsetInPage * tokenStride + kvHeadOffset;
+    }
+
+    for (; j < kvEnd; j += kWarps) {
         float kreg[kDimsPerLane], vreg[kDimsPerLane];
         FastllmKvLoad4Contig<KVType>(pagedK + base, d0, kHeadDim, kreg);
         FastllmKvLoad4Contig<KVType>(pagedK + base, d0 + 4, kHeadDim, kreg + 4);
@@ -2046,6 +2062,22 @@ FastllmPagedAttentionSplitSm70GqaD256Kernel(
                 acc[g * kDimsPerLane + i] += p * vreg[i];
             }
             l[g] += p;
+        }
+
+        int nextJ = j + kWarps;
+        if (nextJ < kvEnd) {
+            int nextOffset = offsetInPage + kWarps;
+            if (nextOffset < pageLen) {
+                offsetInPage = nextOffset;
+                base += (size_t)kWarps * tokenStride;
+            } else {
+                int pageAdvance = nextOffset / pageLen;
+                offsetInPage = nextOffset - pageAdvance * pageLen;
+                pageListIdx += pageAdvance;
+                int page = pageIndexs[pageStart + pageListIdx];
+                base = (size_t)page * pageStride +
+                       (size_t)offsetInPage * tokenStride + kvHeadOffset;
+            }
         }
     }
 
