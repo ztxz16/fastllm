@@ -1,6 +1,8 @@
+import io
 import os
 import sys
 import unittest
+from contextlib import redirect_stdout
 from unittest.mock import patch
 
 
@@ -46,6 +48,14 @@ class CliLaunchTest(unittest.TestCase):
         args = cli.args_parser().parse_args(["launch", "--no-browser"])
 
         self.assertTrue(args.no_browser)
+
+    def test_launcher_help_is_english(self):
+        output = io.StringIO()
+        with self.assertRaises(SystemExit), redirect_stdout(output):
+            cli.args_parser().parse_args(["launch", "--help"])
+
+        self.assertIn("Launcher listen address", output.getvalue())
+        self.assertNotRegex(output.getvalue(), r"[一-龥]")
 
 if __name__ == "__main__":
     unittest.main()

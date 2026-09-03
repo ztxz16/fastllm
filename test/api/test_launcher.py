@@ -10,7 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -28,10 +28,12 @@ from fastllm_pytools.launcher import (
     LauncherRuntime,
     _launcher_access_addresses,
     _parse_modelscope_download_progress,
+    browse_folders,
     create_launcher_app,
     fastllm_launcher,
+    recommend_launch_config,
 )
-from fastllm_pytools.tui import DeployConfig
+from fastllm_pytools.tui import DeployConfig, build_fastllm_argv, config_from_dict
 
 
 def unused_tcp_port():
@@ -67,6 +69,32 @@ class LauncherConfigTest(unittest.TestCase):
         }
         payload.update(changes)
         return payload
+
+    def hardware(self, gpu_memory_gib=(), memory_gib=128, numa_nodes=2):
+        gib = 1024 ** 3
+        return {
+            "cpu": {"logical": 64, "available": 32},
+            "memory": {"total": memory_gib * gib, "available": memory_gib * gib},
+            "gpus": [
+                {
+                    "index": index,
+                    "name": f"Test GPU {index}",
+                    "memoryTotalMiB": memory * 1024,
+                    "memoryFreeMiB": memory * 1024,
+                }
+                for index, memory in enumerate(gpu_memory_gib)
+            ],
+            "numa": [{} for _ in range(numa_nodes)],
+            "build": {"USE_CUDA": bool(gpu_memory_gib)},
+        }
+
+    def write_model(self, directory, config, weight_gib):
+        os.makedirs(directory)
+        with open(os.path.join(directory, "config.json"), "w", encoding="utf-8") as file:
+            json.dump(config, file)
+        weight_path = os.path.join(directory, "model.safetensors")
+        with open(weight_path, "wb") as file:
+            file.truncate(weight_gib * 1024 ** 3)
 
     def test_preview_reuses_tui_command_builder(self):
         preview = self.runtime.preview(self.config(
@@ -164,17 +192,17 @@ class LauncherConfigTest(unittest.TestCase):
             [
                 {
                     "scope": "local",
-                    "label": "本机地址",
+                    "label": "Local address",
                     "url": "http://127.0.0.1:8000",
                 },
                 {
                     "scope": "lan",
-                    "label": "局域网地址",
+                    "label": "LAN address",
                     "url": "http://10.20.30.40:8000",
                 },
                 {
                     "scope": "public",
-                    "label": "公网地址",
+                    "label": "Public address",
                     "url": "http://8.8.8.8:8000",
                 },
             ],
@@ -202,6 +230,102 @@ class LauncherConfigTest(unittest.TestCase):
 
         self.assertNotIn("--moe_device", preview["command"])
         self.assertEqual(preview["endpoint"], "http://127.0.0.1:18080")
+
+    def test_hybrid_device_map_and_ngram_storage_reach_ftllm(self):
+        config = config_from_dict(self.config(
+            enable_moe_hybrid=True,
+            moe_device="custom",
+            moe_device_custom="{'cuda':1,'numa':8,'disk':1}",
+            moe_device_layers="-1",
+            ngram_device="disk",
+        ))
+
+        argv = build_fastllm_argv(config)
+
+        self.assertEqual(
+            argv[argv.index("--moe_device") + 1],
+            "{'cuda':1,'numa':8,'disk':1}",
+        )
+        self.assertEqual(argv[argv.index("--moe_device_layers") + 1], "-1")
+        self.assertEqual(argv[argv.index("--ngram_device") + 1], "disk")
+
+    def test_auto_device_omits_explicit_device_argument(self):
+        config = config_from_dict(self.config(device="auto"))
+
+        self.assertNotIn("--device", build_fastllm_argv(config))
+
+    def test_invalid_custom_hybrid_device_map_is_rejected(self):
+        preview = self.runtime.preview(self.config(
+            enable_moe_hybrid=True,
+            moe_device="custom",
+            moe_device_custom="{'cuda': 0, 'numa': -1}",
+            moe_device_layers="-1",
+        ))
+
+        self.assertTrue(any("设备映射格式无效" in error for error in preview["errors"]))
+
+    def test_dense_model_recommendation_uses_available_gpus(self):
+        model = os.path.join(self.temp.name, "Qwen3-7B")
+        self.write_model(model, {
+            "architectures": ["Qwen3ForCausalLM"],
+            "model_type": "qwen3",
+        }, 14)
+
+        recommendation = recommend_launch_config(
+            model,
+            self.hardware(gpu_memory_gib=(24, 24)),
+        )
+
+        self.assertEqual(recommendation["strategy"], "tensor_parallel")
+        self.assertEqual(recommendation["config"]["device"], "tp")
+        self.assertEqual(recommendation["config"]["tp"], "0,1")
+        self.assertFalse(recommendation["config"]["enable_moe_hybrid"])
+        self.assertEqual(recommendation["config"]["speculative_algorithm"], "auto")
+        self.assertEqual(recommendation["config"]["mtp"], "auto")
+
+    def test_large_moe_recommendation_enables_numa_hybrid_inference(self):
+        model = os.path.join(self.temp.name, "DeepSeek-V3-100B")
+        self.write_model(model, {
+            "architectures": ["DeepseekV3ForCausalLM"],
+            "model_type": "deepseek_v3",
+            "n_routed_experts": 64,
+            "quantization_config": {"quant_method": "fp8", "fmt": "e4m3"},
+        }, 100)
+
+        recommendation = recommend_launch_config(
+            model,
+            self.hardware(gpu_memory_gib=(24,), memory_gib=180),
+        )
+
+        self.assertEqual(recommendation["strategy"], "hybrid_numa")
+        self.assertEqual(recommendation["config"]["device"], "cuda")
+        self.assertTrue(recommendation["config"]["enable_moe_hybrid"])
+        self.assertEqual(recommendation["config"]["moe_device"], "numa")
+        self.assertEqual(recommendation["config"]["moe_device_layers"], "-1")
+
+        low_memory = recommend_launch_config(
+            model,
+            self.hardware(gpu_memory_gib=(24,), memory_gib=64),
+        )
+        self.assertEqual(low_memory["strategy"], "hybrid_disk")
+        self.assertEqual(low_memory["config"]["moe_device"], "disk")
+
+    def test_qwen_ngram_table_moves_to_disk_under_memory_pressure(self):
+        model = os.path.join(self.temp.name, "Qwen4-Exp-30B")
+        self.write_model(model, {
+            "architectures": ["Qwen4ExpForConditionalGeneration"],
+            "model_type": "qwen4_exp",
+            "n_routed_experts": 64,
+        }, 30)
+
+        recommendation = recommend_launch_config(
+            model,
+            self.hardware(gpu_memory_gib=(24,), memory_gib=64),
+        )
+
+        self.assertTrue(recommendation["detected"]["usesNgram"])
+        self.assertEqual(recommendation["config"]["ngram_device"], "disk")
+        self.assertTrue(recommendation["adjustments"]["ngramOnDisk"])
 
     def test_webui_profile_builds_webui_command(self):
         preview = self.runtime.preview(self.config(
@@ -236,7 +360,7 @@ class LauncherConfigTest(unittest.TestCase):
         self.assertEqual(preview["errors"], [])
         self.assertIn("modelscope download", preview["command"])
         self.assertNotIn("private-modelscope-token", preview["command"])
-        self.assertIn("环境变量", preview["command"])
+        self.assertIn("Token injected through environment", preview["command"])
 
     def test_download_progress_parser_rejects_invalid_events(self):
         valid = MODELSCOPE_PROGRESS_PREFIX + json.dumps({
@@ -261,15 +385,50 @@ class LauncherConfigTest(unittest.TestCase):
             listener.bind(("127.0.0.1", 0))
             listener.listen(1)
             port = listener.getsockname()[1]
-            with self.assertRaisesRegex(LauncherError, "已被占用"):
+            with self.assertRaisesRegex(LauncherError, "already in use"):
                 self.runtime.start(self.config(port=str(port)))
 
     def test_launcher_assets_are_packaged_as_external_resources(self):
-        for filename in ("index.html", "styles.css", "app.js"):
+        for filename in ("index.html", "styles.css", "app.js", "launcher-icon.png"):
             self.assertTrue((ASSET_DIRECTORY / filename).is_file(), filename)
         html = (ASSET_DIRECTORY / "index.html").read_text(encoding="utf-8")
         javascript = (ASSET_DIRECTORY / "app.js").read_text(encoding="utf-8")
         self.assertIn('src="/assets/app.js"', html)
+        self.assertIn('rel="icon" type="image/png" href="/assets/launcher-icon.png"', html)
+        self.assertIn('class="brand-mark" src="/assets/launcher-icon.png"', html)
+        self.assertIn('id="profile-browser"', html)
+        self.assertIn('id="new-profile"', html)
+        self.assertIn('id="close-profile-editor"', html)
+        self.assertIn('id="auto-configure-profile"', html)
+        self.assertIn('id="clear-profile-config"', html)
+        self.assertIn('id="choose-model-folder"', html)
+        self.assertIn('id="folder-picker-modal"', html)
+        self.assertIn('id="folder-picker-list"', html)
+        self.assertIn('id="folder-picker-select"', html)
+        self.assertIn('id="confirmation-modal"', html)
+        self.assertIn('id="confirmation-cancel"', html)
+        self.assertIn('id="confirmation-confirm"', html)
+        self.assertLess(
+            html.index('data-field="model"'),
+            html.index('data-field="name"'),
+        )
+        self.assertIn('/api/folders?', javascript)
+        self.assertIn("function showConfirmation", javascript)
+        self.assertNotIn("window.confirm", javascript)
+        self.assertIn('data-field="enable_moe_hybrid"', html)
+        self.assertIn('data-field="ngram_device"', html)
+        self.assertIn('data-field="moe_device_custom"', html)
+        self.assertIn(
+            'id="profile-editor-modal" class="profile-editor-modal hidden" role="dialog"',
+            html,
+        )
+        self.assertIn(
+            'id="launch-form" class="configuration-card profile-editor"',
+            html,
+        )
+        self.assertNotIn('id="start-runtime-top"', html)
+        for action in ("start", "edit", "delete"):
+            self.assertIn(f'profileActionButton("{action}"', javascript)
         self.assertNotIn("<script>", html)
         self.assertRegex(
             html,
@@ -290,12 +449,99 @@ class LauncherConfigTest(unittest.TestCase):
             set(),
         )
 
+        locale_directory = ASSET_DIRECTORY / "locales"
+        resources = {}
+        for locale in ("zh-CN", "en-US"):
+            path = locale_directory / f"{locale}.json"
+            self.assertTrue(path.is_file(), locale)
+            resources[locale] = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(resources[locale]["locale"], locale)
+            for pattern in resources[locale]["patterns"]:
+                re.compile(pattern["source"])
+
+        self.assertIn('id="language-select"', html)
+        dynamic_messages = {
+            json.loads(match)
+            for match in re.findall(r'(?<![A-Za-z0-9_])t\(("(?:[^"\\]|\\.)*")', javascript)
+        }
+        self.assertEqual(
+            dynamic_messages - set(resources["zh-CN"]["messages"]),
+            set(),
+        )
+        static_chinese = {
+            value.strip()
+            for value in re.findall(r">([^<>]+)<", html)
+            if re.search(r"[一-龥]", value)
+        }
+        static_chinese.update(
+            re.findall(
+                r'(?:aria-label|placeholder|title)="([^\"]*[一-龥][^\"]*)"',
+                html,
+            )
+        )
+        self.assertEqual(
+            static_chinese - set(resources["zh-CN"]["static"]),
+            set(),
+        )
+        self.assertEqual(
+            static_chinese - set(resources["en-US"]["static"]),
+            set(),
+        )
+        english_values = [
+            value
+            for key, value in resources["en-US"]["static"].items()
+            if key != "简体中文"
+        ] + list(resources["en-US"]["messages"].values()) + [
+            pattern["target"] for pattern in resources["en-US"]["patterns"]
+        ]
+        self.assertNotRegex("\n".join(english_values), r"[一-龥]")
+
+    def test_folder_browser_lists_only_directories_and_resolves_file_path(self):
+        browser_root = os.path.join(self.temp.name, "browser")
+        os.makedirs(os.path.join(browser_root, "zeta"))
+        os.makedirs(os.path.join(browser_root, "Alpha"))
+        model_file = os.path.join(browser_root, "model.gguf")
+        with open(model_file, "wb") as file:
+            file.write(b"gguf")
+
+        listing = browse_folders(browser_root)
+        self.assertEqual(listing["path"], browser_root)
+        self.assertEqual(
+            [folder["name"] for folder in listing["folders"]],
+            ["Alpha", "zeta"],
+        )
+        self.assertFalse(listing["truncated"])
+        self.assertNotIn("model.gguf", [folder["name"] for folder in listing["folders"]])
+
+        file_listing = browse_folders(model_file)
+        self.assertEqual(file_listing["path"], browser_root)
+
+    def test_folder_browser_api_returns_server_directories(self):
+        from fastapi.testclient import TestClient
+
+        browser_root = os.path.join(self.temp.name, "browser-api")
+        child = os.path.join(browser_root, "model")
+        os.makedirs(child)
+        client = TestClient(create_launcher_app(self.runtime, "control-secret"))
+        response = client.get(
+            "/api/folders",
+            params={"path": browser_root},
+            headers={"X-FTLLM-Launcher-Token": "control-secret"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["path"], browser_root)
+        self.assertEqual(response.json()["folders"], [{
+            "name": "model",
+            "path": child,
+        }])
+
     def test_control_api_requires_launcher_token(self):
         from fastapi.testclient import TestClient
 
         addresses = [{
             "scope": "local",
-            "label": "本机地址",
+            "label": "Local address",
             "url": "http://127.0.0.1:8000",
         }]
         client = TestClient(create_launcher_app(
@@ -314,8 +560,33 @@ class LauncherConfigTest(unittest.TestCase):
         self.assertEqual(allowed.json()["launcherAddresses"], addresses)
         self.assertEqual(allowed.headers["cache-control"], "no-store")
 
+    def test_automatic_configuration_api_uses_model_and_hardware(self):
+        from fastapi.testclient import TestClient
+
+        with open(os.path.join(self.model_path, "config.json"), "w", encoding="utf-8") as file:
+            json.dump({
+                "architectures": ["Qwen3ForCausalLM"],
+                "model_type": "qwen3",
+            }, file)
+        client = TestClient(create_launcher_app(self.runtime, "control-secret"))
+        with patch(
+            "fastllm_pytools.launcher.detect_hardware",
+            return_value=self.hardware(gpu_memory_gib=(24,)),
+        ):
+            response = client.post(
+                "/api/recommend",
+                json={"model": self.model_path, "name": "Qwen3"},
+                headers={"X-FTLLM-Launcher-Token": "control-secret"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        recommendation = response.json()
+        self.assertEqual(recommendation["config"]["device"], "cuda")
+        self.assertEqual(recommendation["config"]["cuda_device_id"], "0")
+        self.assertEqual(recommendation["config"]["speculative_algorithm"], "auto")
+
     def test_control_api_rejects_an_empty_server_token(self):
-        with self.assertRaisesRegex(LauncherError, "令牌不能为空"):
+        with self.assertRaisesRegex(LauncherError, "token must not be empty"):
             create_launcher_app(self.runtime, "")
 
     def test_control_api_rejects_invalid_json(self):
@@ -357,6 +628,7 @@ class LauncherProcessTest(unittest.TestCase):
                 no_browser=False,
                 config=os.path.join(directory, "launcher.json"),
             )
+            terminal_output = io.StringIO()
             with (
                 patch.object(uvicorn.Server, "startup", fake_startup),
                 patch.object(uvicorn.Server, "run", fake_run),
@@ -368,7 +640,8 @@ class LauncherProcessTest(unittest.TestCase):
                     "fastllm_pytools.launcher.webbrowser.open",
                     return_value=True,
                 ) as browser_open,
-                redirect_stdout(io.StringIO()),
+                redirect_stdout(terminal_output),
+                redirect_stderr(terminal_output),
             ):
                 result = fastllm_launcher(args)
 
@@ -378,6 +651,8 @@ class LauncherProcessTest(unittest.TestCase):
             browser_open.call_args.args[0],
             r"^http://127\.0\.0\.1:8000/\?token=.+$",
         )
+        self.assertIn("Local address", terminal_output.getvalue())
+        self.assertNotRegex(terminal_output.getvalue(), r"[一-龥]")
 
     def test_concurrent_start_only_spawns_one_process(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -434,7 +709,7 @@ class LauncherProcessTest(unittest.TestCase):
 
                 self.assertEqual(spawn_count, 1)
                 self.assertEqual(len(outcomes), 2)
-                self.assertTrue(any("已有模型服务" in item for item in outcomes))
+                self.assertTrue(any("already running" in item for item in outcomes))
             finally:
                 release_popen.set()
                 runtime.close()

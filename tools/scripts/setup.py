@@ -64,7 +64,8 @@ setup (
     packages = ['ftllm', 'ftllm/openai_server', 'ftllm/openai_server/protocal', 'ftllm/openai_server/tool_parsers'],
     package_data = {
         '': ['*.dll', '*.so', '*.dylib', '*.so.*', 'build_info.json',
-             'fastllm_triton_server.py', 'launcher_assets/*']
+             'fastllm_triton_server.py', 'launcher_assets/*',
+             'launcher_assets/locales/*.json']
     },
     install_requires=[
         'pyreadline3',

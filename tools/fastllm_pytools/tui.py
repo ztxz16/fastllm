@@ -1,3 +1,4 @@
+import ast
 import json
 import os
 import shlex
@@ -105,6 +106,7 @@ class DeployConfig:
     moe_device: str = "numa"
     moe_device_layers: str = "10000"
     moe_device_custom: str = ""
+    ngram_device: str = "auto"
     dtype: str = "auto"
     dtype_custom: str = ""
     moe_dtype: str = "auto"
@@ -166,14 +168,26 @@ COMMAND_CHOICES: Sequence[Choice] = (
 )
 
 DEVICE_CHOICES: Sequence[Choice] = (
+    ("auto", "自动"),
     ("cuda", "CUDA 单卡"),
     ("tp", "多卡张量并行"),
     ("cudapp", "多卡串行"),
     ("cpu", "CPU"),
+    ("numa", "NUMA CPU"),
+    ("custom", "自定义"),
 )
 
 MOE_DEVICE_CHOICES: Sequence[Choice] = (
+    ("cpu", "CPU"),
+    ("cuda", "CUDA"),
     ("numa", "NUMA CPU"),
+    ("disk", "Disk"),
+    ("custom", "自定义设备映射"),
+)
+
+NGRAM_DEVICE_CHOICES: Sequence[Choice] = (
+    ("auto", "自动/不指定"),
+    ("cpu", "CPU"),
     ("disk", "Disk"),
 )
 
@@ -321,6 +335,20 @@ FIELDS: Sequence[FormField] = (
         visible=lambda c: c.enable_moe_hybrid,
     ),
     FormField(
+        "moe_device_custom",
+        "MOE自定义设备映射",
+        "text",
+        "例如 {'cuda':1,'numa':8,'disk':1}，表示按比例分配专家层。",
+        visible=lambda c: c.enable_moe_hybrid and c.moe_device == "custom",
+    ),
+    FormField(
+        "ngram_device",
+        "N-gram存储设备",
+        "choice",
+        "Qwen4 等模型的大型 PLE 表默认放在 CPU；内存不足时可选 Disk。",
+        NGRAM_DEVICE_CHOICES,
+    ),
+    FormField(
         "gpu_mem_ratio",
         "显存利用率",
         "text",
@@ -421,6 +449,8 @@ BASIC_FIELD_KEYS = {
     "enable_moe_hybrid",
     "moe_device",
     "moe_device_layers",
+    "moe_device_custom",
+    "ngram_device",
 }
 
 
@@ -487,6 +517,30 @@ def _resolve_custom(value: str, custom_value: str) -> str:
     if value == "auto":
         return ""
     return value.strip()
+
+
+def _is_valid_custom_device_map(value: str) -> bool:
+    value = str(value).strip()
+    if not value:
+        return False
+    try:
+        parsed = ast.literal_eval(value)
+    except (SyntaxError, ValueError):
+        return False
+    if isinstance(parsed, dict):
+        return bool(parsed) and all(
+            isinstance(device, str)
+            and bool(device.strip())
+            and isinstance(weight, (int, float))
+            and not isinstance(weight, bool)
+            and weight > 0
+            for device, weight in parsed.items()
+        )
+    if isinstance(parsed, list):
+        return bool(parsed) and all(
+            isinstance(device, str) and bool(device.strip()) for device in parsed
+        )
+    return False
 
 
 def is_gguf_model(model_path: str) -> bool:
@@ -857,7 +911,7 @@ def normalize_main_device_config(config: DeployConfig):
     device = str(config.device).strip()
     lower = device.lower()
     if lower in ("", "auto"):
-        config.device = "cuda"
+        config.device = "auto"
         config.cuda_device_id = config.cuda_device_id.strip() or "0"
     elif lower.startswith("cudapp="):
         spec = device.split("=", 1)[1].strip()
@@ -890,15 +944,21 @@ def normalize_main_device_config(config: DeployConfig):
         config.tp = config.tp.strip() or "2"
 
 
-def normalize_moe_hybrid_config(config: DeployConfig, has_enable_field: bool, has_layers_field: bool):
+def normalize_moe_hybrid_config(
+    config: DeployConfig,
+    has_enable_field: bool,
+    has_device_field: bool,
+    has_layers_field: bool,
+):
     moe_device = str(config.moe_device).strip().lower()
-    if not has_enable_field and moe_device in ("numa", "disk"):
+    supported_devices = ("cpu", "cuda", "numa", "disk", "custom")
+    if not has_enable_field and has_device_field and moe_device in supported_devices:
         config.enable_moe_hybrid = True
         if not has_layers_field:
             config.moe_device_layers = "-1"
 
     if config.enable_moe_hybrid:
-        if moe_device not in ("numa", "disk"):
+        if moe_device not in supported_devices:
             config.moe_device = "numa"
         else:
             config.moe_device = moe_device
@@ -910,6 +970,7 @@ def config_from_dict(data: dict) -> DeployConfig:
     config = DeployConfig()
     valid_keys = {field.name for field in fields(DeployConfig)}
     has_enable_moe_hybrid = "enable_moe_hybrid" in data
+    has_moe_device = "moe_device" in data
     has_moe_device_layers = "moe_device_layers" in data
     for key, value in data.items():
         if key not in valid_keys:
@@ -924,7 +985,12 @@ def config_from_dict(data: dict) -> DeployConfig:
             value = "" if value is None else str(value)
         setattr(config, key, value)
     normalize_main_device_config(config)
-    normalize_moe_hybrid_config(config, has_enable_moe_hybrid, has_moe_device_layers)
+    normalize_moe_hybrid_config(
+        config,
+        has_enable_moe_hybrid,
+        has_moe_device,
+        has_moe_device_layers,
+    )
     return config
 
 
@@ -987,7 +1053,7 @@ def apply_main_device_defaults(config: DeployConfig, old_device: str, new_device
 
 
 def apply_moe_hybrid_defaults(config: DeployConfig):
-    if config.moe_device not in ("numa", "disk"):
+    if config.moe_device not in ("cpu", "cuda", "numa", "disk", "custom"):
         config.moe_device = "numa"
     if not str(config.moe_device_layers).strip():
         config.moe_device_layers = "10000"
@@ -1072,8 +1138,17 @@ def build_fastllm_argv(config: DeployConfig) -> List[str]:
     _add_option(argv, "--device", device)
     _add_option(argv, "--tp", tp)
     if config.enable_moe_hybrid:
-        _add_option(argv, "--moe_device", config.moe_device.strip())
+        _add_option(
+            argv,
+            "--moe_device",
+            _resolve_custom(config.moe_device, config.moe_device_custom),
+        )
         _add_option(argv, "--moe_device_layers", config.moe_device_layers.strip())
+    _add_option(
+        argv,
+        "--ngram_device",
+        _optional_text(str(config.ngram_device).strip().lower()),
+    )
     _add_option(argv, "--gpu_mem_ratio", _optional_text(config.gpu_mem_ratio))
     _add_option(argv, "--chunked_prefill_size", _optional_text(config.chunked_prefill_size))
     _add_option(argv, "--kv_cache_dtype", _optional_text(config.kv_cache_dtype))
@@ -1236,10 +1311,17 @@ def validate_config(config: DeployConfig) -> List[str]:
     if config.device == "custom" and not config.device_custom.strip():
         errors.append("选择自定义主设备时必须填写自定义主设备。")
     if config.enable_moe_hybrid:
-        if config.moe_device not in ("numa", "disk"):
-            errors.append("MOE推理设备只能选择 NUMA CPU 或 Disk。")
+        if config.moe_device not in ("cpu", "cuda", "numa", "disk", "custom"):
+            errors.append("MOE推理设备配置无效。")
+        if (
+            config.moe_device == "custom"
+            and not _is_valid_custom_device_map(config.moe_device_custom)
+        ):
+            errors.append("自定义MOE设备映射格式无效，请填写设备列表或正权重映射。")
         if not _is_valid_moe_device_layers(config.moe_device_layers):
             errors.append("MOE设备层数格式不对。请输入正整数，例如 8；或输入 -1 表示全部 MOE 层。")
+    if str(config.ngram_device).strip().lower() not in ("", "auto", "cpu", "disk"):
+        errors.append("N-gram存储设备只能选择 CPU、Disk 或 auto。")
     if config.dtype == "custom" and not config.dtype_custom.strip():
         errors.append("选择自定义权重类型时必须填写自定义权重类型。")
     if config.moe_dtype == "custom" and not config.moe_dtype_custom.strip():

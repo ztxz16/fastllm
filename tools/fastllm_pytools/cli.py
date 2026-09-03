@@ -82,21 +82,21 @@ def args_parser():
     # 浏览器部署启动器。与 webui 一样启动本地网页，但不加载模型；
     # 模型服务由页面中的独立子进程托管。
     launch_parser_ = subparsers.add_parser(
-        'launch', help = '浏览器部署启动器'
+        'launch', help = 'Browser deployment launcher'
     )
     launch_parser_.add_argument(
         '--host', type = str, default = '127.0.0.1',
-        help = '启动器监听地址；需要从其他设备访问时可设为 0.0.0.0'
+        help = 'Launcher listen address; use 0.0.0.0 for access from other devices'
     )
     launch_parser_.add_argument(
         '--port', type = int, default = 8000,
-        help = '启动器端口号（默认 8000）'
+        help = 'Launcher port (default: 8000)'
     )
     launch_parser_.add_argument(
-        '--no-browser', action = 'store_true', help = '不自动打开浏览器'
+        '--no-browser', action = 'store_true', help = 'Do not open a browser automatically'
     )
     launch_parser_.add_argument(
-        '--config', type = str, default = '', help = '自定义启动配置文件路径'
+        '--config', type = str, default = '', help = 'Custom launch profile path'
     )
 
     from .util import add_server_args

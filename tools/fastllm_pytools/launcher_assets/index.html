@@ -5,6 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="color-scheme" content="light">
     <title>FastLLM Launcher</title>
+    <link rel="icon" type="image/png" href="/assets/launcher-icon.png">
+    <link rel="apple-touch-icon" href="/assets/launcher-icon.png">
     <link rel="stylesheet" href="/assets/styles.css">
     <script defer src="/assets/app.js"></script>
   </head>
@@ -12,9 +14,7 @@
     <div class="app-shell">
       <aside class="sidebar">
         <div class="brand">
-          <div class="brand-mark" aria-hidden="true">
-            <span></span><span></span><span></span>
-          </div>
+          <img class="brand-mark" src="/assets/launcher-icon.png" alt="" aria-hidden="true">
           <div>
             <strong>FastLLM</strong>
             <small>Launcher</small>
@@ -44,6 +44,13 @@
         </nav>
 
         <div class="sidebar-footer">
+          <label class="language-picker" for="language-select">
+            <span>界面语言</span>
+            <select id="language-select" aria-label="界面语言">
+              <option value="zh-CN">简体中文</option>
+              <option value="en-US">English</option>
+            </select>
+          </label>
           <div class="security-note"><span></span>网络控制 · 随机令牌保护</div>
           <div class="footer-row">
             <span id="app-version" class="version">ftllm</span>
@@ -58,104 +65,87 @@
             <span id="status-dot" class="status-dot stopped"></span>
             <div>
               <strong id="status-title">服务未启动</strong>
-              <small id="status-message">填写配置后即可启动本地 API</small>
+              <small id="status-message">选择启动项目后即可启动服务</small>
             </div>
           </div>
           <div class="topbar-actions">
             <button id="open-endpoint" class="secondary-button" type="button" disabled>打开服务</button>
             <button id="stop-runtime" class="secondary-button danger hidden" type="button">■ 停止</button>
-            <button id="start-runtime-top" class="primary-button" type="button"><span class="play-icon"></span>启动服务</button>
           </div>
         </header>
 
         <div class="page-scroll">
           <section id="view-launch" class="view active">
-            <section class="hero">
-              <div class="hero-copy">
-                <span id="launch-hero-eyebrow" class="eyebrow">LOCAL MODEL API</span>
-                <h1>让模型在本机跑起来</h1>
-                <p id="launch-hero-description">选择模型与设备，Launcher 会生成并托管 <code>ftllm server</code>，启动进度和日志都留在这个页面。</p>
-              </div>
-              <div class="hero-actions">
-                <button id="new-profile-hero" class="hero-secondary" type="button">新建配置</button>
-                <button id="start-runtime-hero" class="hero-primary" type="button">▷ 启动当前配置</button>
-              </div>
-            </section>
-
-            <section class="summary-grid" aria-label="运行概览">
-              <article>
-                <span class="summary-icon profiles">▦</span>
-                <div><small>已保存配置</small><strong id="profile-count">0</strong></div>
-              </article>
-              <article>
-                <span class="summary-icon runtime">▷</span>
-                <div><small>模型服务</small><strong id="runtime-summary">未启动</strong></div>
-              </article>
-              <article>
-                <span class="summary-icon endpoint">⌁</span>
-                <div><small id="endpoint-summary-label">服务地址</small><strong id="endpoint-summary">—</strong></div>
-              </article>
-            </section>
-
-            <section class="launcher-address-card" aria-label="Launcher 访问地址">
-              <div class="launcher-address-heading">
-                <span class="summary-icon network">◉</span>
-                <div><small>LAUNCHER ACCESS</small><strong>Launcher 访问地址</strong></div>
-              </div>
-              <div id="launcher-address-list" class="launcher-address-list">
-                <span class="launcher-address-empty">正在检测本机网络地址…</span>
-              </div>
-            </section>
-
-            <section id="runtime-progress-card" class="runtime-progress-card hidden" aria-live="polite">
-              <div class="runtime-progress-heading">
-                <span id="runtime-progress-icon" class="runtime-progress-icon">▷</span>
+            <div id="profile-browser" class="profile-browser">
+              <section class="projects-header">
                 <div>
-                  <strong id="runtime-progress-title">正在启动模型</strong>
-                  <small id="runtime-progress-label">正在初始化模型</small>
+                  <span class="eyebrow">LAUNCH PROFILES</span>
+                  <h1>启动项目</h1>
+                  <p>管理已保存的模型服务与聊天 WebUI。</p>
                 </div>
-                <span id="runtime-progress-value">0%</span>
-              </div>
-              <progress id="runtime-progress" class="progress-track" max="100" value="0"></progress>
-              <div class="runtime-meta">
-                <span>PID <strong id="runtime-pid">—</strong></span>
-                <span>模型 <strong id="runtime-model">—</strong></span>
-                <button id="copy-endpoint" class="inline-button" type="button">复制 API 地址</button>
-              </div>
-            </section>
+                <button id="new-profile" class="primary-button" type="button">＋ 增加启动项</button>
+              </section>
 
-            <div class="dashboard-grid">
-              <aside class="profiles-card">
-                <div class="card-heading compact">
-                  <div><span>CONFIGURATIONS</span><h2>启动配置</h2></div>
-                  <button id="new-profile" class="small-button" type="button">＋ 新建</button>
+              <section class="projects-card">
+                <div class="projects-card-heading">
+                  <div>
+                    <h2>已配置项目</h2>
+                    <p>每个项目可直接启动、编辑或删除。</p>
+                  </div>
+                  <span class="project-count"><strong id="profile-count">0</strong> 个项目</span>
                 </div>
                 <div id="profile-list" class="profile-list">
-                  <div class="empty-profile">还没有保存配置</div>
-                </div>
-                <div class="profile-actions">
-                  <button id="duplicate-profile" class="text-button" type="button">复制配置</button>
-                  <button id="delete-profile" class="text-button danger-text" type="button">删除</button>
+                  <div class="empty-profile">还没有启动项目</div>
                 </div>
                 <div class="config-location">
                   <span>配置保存在</span>
                   <code id="config-path">—</code>
                 </div>
-              </aside>
+              </section>
+            </div>
 
-              <form id="launch-form" class="configuration-card">
+            <div id="profile-editor-modal" class="profile-editor-modal hidden" role="dialog" aria-modal="true" aria-labelledby="profile-editor-title">
+              <form id="launch-form" class="configuration-card profile-editor">
                 <div class="card-heading">
                   <div>
                     <span id="launch-command-kicker">FTLLM SERVER</span>
-                    <h2>模型启动设置</h2>
+                    <h2 id="profile-editor-title" tabindex="-1">模型启动设置</h2>
                     <p>带 <b>*</b> 的字段为必填项，保存配置不会启动模型。</p>
                   </div>
-                  <span id="save-state" class="save-state">新配置</span>
+                  <div class="editor-heading-actions">
+                    <span id="save-state" class="save-state">新配置</span>
+                    <button id="close-profile-editor" class="small-button modal-close-button" type="button">
+                      <span aria-hidden="true">×</span><span>关闭窗口</span>
+                    </button>
+                  </div>
                 </div>
+
+                <section class="automatic-config-panel" aria-labelledby="automatic-config-title">
+                  <div class="automatic-config-heading">
+                    <span class="automatic-config-icon" aria-hidden="true">✦</span>
+                    <div>
+                      <strong id="automatic-config-title">智能推理配置</strong>
+                      <small>根据模型结构、权重规模和本机硬件推荐设备与混合推理参数。</small>
+                    </div>
+                  </div>
+                  <div class="automatic-config-actions">
+                    <button id="auto-configure-profile" class="secondary-button automatic-config-button" type="button">自动配置</button>
+                    <button id="clear-profile-config" class="quiet-config-button" type="button">清空配置</button>
+                  </div>
+                  <div id="automatic-config-status" class="automatic-config-status hidden" role="status" aria-live="polite"></div>
+                </section>
 
                 <section class="form-section">
                   <div class="section-title"><strong>基础配置</strong><small>模型、服务地址与运行设备</small></div>
                   <div class="form-grid two-columns">
+                    <div class="field span-2 model-path-field">
+                      <label for="model-path">模型路径 <b>*</b></label>
+                      <div class="path-input-with-button">
+                        <input id="model-path" data-field="model" data-path-input type="text" list="path-suggestions" placeholder="/path/to/model 或 /path/to/model.gguf" spellcheck="false">
+                        <button id="choose-model-folder" class="folder-picker-button" type="button"><span class="folder-button-icon" aria-hidden="true"></span>选择文件夹</button>
+                      </div>
+                      <small>支持 Hugging Face 模型目录、FastLLM 模型文件和 GGUF。</small>
+                    </div>
                     <label class="field">
                       <span>配置名称 <b>*</b></span>
                       <input data-field="name" type="text" placeholder="例如 Qwen3.5-27B">
@@ -170,11 +160,6 @@
                     <label id="server-model-name-field" class="field">
                       <span>API 模型名</span>
                       <input data-field="model_name" type="text" placeholder="留空时使用目录名">
-                    </label>
-                    <label class="field span-2">
-                      <span>模型路径 <b>*</b></span>
-                      <input data-field="model" data-path-input type="text" list="path-suggestions" placeholder="/path/to/model 或 /path/to/model.gguf" spellcheck="false">
-                      <small>支持 Hugging Face 模型目录、FastLLM 模型文件和 GGUF。</small>
                     </label>
                     <label id="server-host-field" class="field">
                       <span>监听地址 <b>*</b></span>
@@ -198,10 +183,12 @@
                     <label class="field">
                       <span>主设备</span>
                       <select data-field="device">
+                        <option value="auto">自动</option>
                         <option value="cuda">CUDA 单卡</option>
                         <option value="tp">多卡张量并行</option>
                         <option value="cudapp">多卡串行</option>
                         <option value="cpu">CPU</option>
+                        <option value="numa">NUMA CPU</option>
                       </select>
                     </label>
                     <label id="cuda-device-field" class="field device-field">
@@ -259,8 +246,68 @@
                   </div>
                 </section>
 
+                <section class="form-section hybrid-inference-section">
+                  <div class="section-title"><strong>混合推理配置</strong><small>为 MoE 专家层和大型 N-gram 表选择独立存储设备</small></div>
+                  <div class="form-grid three-columns">
+                    <label class="switch-field span-2">
+                      <input data-field="enable_moe_hybrid" type="checkbox">
+                      <span><strong>启用 MoE 混合推理</strong><small>将全部或尾部 MoE 专家层放到独立设备；关闭时由 FastLLM 跟随主设备。</small></span>
+                    </label>
+                    <label id="moe-device-field" class="field hidden">
+                      <span>MoE 设备</span>
+                      <select data-field="moe_device">
+                        <option value="cpu">CPU</option>
+                        <option value="cuda">CUDA</option>
+                        <option value="numa">NUMA CPU</option>
+                        <option value="disk">Disk</option>
+                        <option value="custom">自定义设备映射</option>
+                      </select>
+                    </label>
+                    <label id="moe-device-custom-field" class="field span-2 hidden">
+                      <span>自定义设备映射</span>
+                      <input data-field="moe_device_custom" type="text" placeholder="例如 {'cuda':1,'numa':8,'disk':1}" spellcheck="false">
+                      <small>按权重比例混合使用多个设备，适合显存、内存与 SSD 联合推理。</small>
+                    </label>
+                    <label id="moe-layers-field" class="field hidden">
+                      <span>MoE 设备层数</span>
+                      <input data-field="moe_device_layers" type="text" placeholder="-1">
+                      <small>-1 表示全部 MoE 层；正整数表示最后 N 层。</small>
+                    </label>
+                    <label class="field">
+                      <span>N-gram 存储设备</span>
+                      <select data-field="ngram_device">
+                        <option value="auto">自动 / CPU 默认</option>
+                        <option value="cpu">CPU</option>
+                        <option value="disk">Disk</option>
+                      </select>
+                      <small>大型 PLE 表可放到高速 SSD，以降低主机内存占用。</small>
+                    </label>
+                    <label class="field">
+                      <span>MoE 权重类型</span>
+                      <select data-field="moe_dtype">
+                        <option value="auto">自动 / 不指定</option>
+                        <option value="float16">float16</option>
+                        <option value="int8">int8</option>
+                        <option value="int4">int4</option>
+                        <option value="int4g128">int4g128</option>
+                        <option value="int4g256">int4g256</option>
+                        <option value="fp8_e4m3">fp8_e4m3</option>
+                      </select>
+                    </label>
+                    <label class="field">
+                      <span>MoE 激活类型</span>
+                      <select data-field="moe_atype">
+                        <option value="auto">自动 / 不指定</option>
+                        <option value="float32">float32</option>
+                        <option value="float16">float16</option>
+                        <option value="bfloat16">bfloat16</option>
+                      </select>
+                    </label>
+                  </div>
+                </section>
+
                 <details class="advanced-section">
-                  <summary><span><strong>高级设置</strong><small>缓存、采样、MoE 与额外参数</small></span><i></i></summary>
+                  <summary><span><strong>高级设置</strong><small>缓存、采样与额外参数</small></span><i></i></summary>
                   <div class="advanced-content">
                     <div class="form-grid three-columns">
                       <label class="field"><span>线程数</span><input data-field="threads" type="text" placeholder="auto"></label>
@@ -314,18 +361,6 @@
                       <label id="server-hide-input-field" class="switch-field">
                         <input data-field="hide_input" type="checkbox">
                         <span><strong>隐藏请求输入</strong><small>启动时添加 <code>--hide_input</code></small></span>
-                      </label>
-                      <label class="switch-field span-2">
-                        <input data-field="enable_moe_hybrid" type="checkbox">
-                        <span><strong>MoE 混合推理</strong><small>把指定数量的尾部 MoE 层放到 NUMA CPU 或磁盘。</small></span>
-                      </label>
-                      <label id="moe-device-field" class="field hidden">
-                        <span>MoE 设备</span>
-                        <select data-field="moe_device"><option value="numa">NUMA CPU</option><option value="disk">Disk</option></select>
-                      </label>
-                      <label id="moe-layers-field" class="field hidden">
-                        <span>MoE 设备层数</span>
-                        <input data-field="moe_device_layers" type="text" placeholder="10000">
                       </label>
                       <label class="field span-2">
                         <span>环境变量</span>
@@ -462,10 +497,62 @@
               <button id="refresh-hardware" class="primary-button" type="button">刷新检测</button>
             </div>
             <div id="hardware-status" class="hardware-status">切换到此页面后自动检测。</div>
+            <section class="launcher-address-card" aria-label="Launcher 访问地址">
+              <div class="launcher-address-heading">
+                <span class="summary-icon network">◉</span>
+                <div><small>LAUNCHER ACCESS</small><strong>Launcher 访问地址</strong></div>
+              </div>
+              <div id="launcher-address-list" class="launcher-address-list">
+                <span class="launcher-address-empty">正在检测本机网络地址…</span>
+              </div>
+            </section>
             <div id="hardware-grid" class="hardware-grid"></div>
           </section>
         </div>
       </main>
+    </div>
+
+    <div id="folder-picker-modal" class="folder-picker-modal hidden" role="dialog" aria-modal="true" aria-labelledby="folder-picker-title" aria-describedby="folder-picker-description">
+      <section class="folder-picker-window">
+        <header class="folder-picker-heading">
+          <div>
+            <span class="folder-picker-kicker">MODEL LOCATION</span>
+            <h2 id="folder-picker-title" tabindex="-1">选择模型文件夹</h2>
+            <p id="folder-picker-description">浏览当前机器上的文件夹，选中后会填入模型路径。</p>
+          </div>
+          <button id="folder-picker-close" class="folder-picker-close" type="button" aria-label="关闭文件夹选择器">×</button>
+        </header>
+        <div class="folder-picker-location">
+          <span>当前文件夹</span>
+          <code id="folder-picker-current">—</code>
+        </div>
+        <div class="folder-picker-toolbar">
+          <button id="folder-picker-up" class="folder-picker-up" type="button">↑ 上一级</button>
+        </div>
+        <div id="folder-picker-list" class="folder-picker-list" role="listbox" aria-label="文件夹列表"></div>
+        <div id="folder-picker-status" class="folder-picker-status" role="status" aria-live="polite"></div>
+        <footer class="folder-picker-actions">
+          <button id="folder-picker-cancel" class="secondary-button" type="button">取消</button>
+          <button id="folder-picker-select" class="primary-button" type="button">选择此文件夹</button>
+        </footer>
+      </section>
+    </div>
+
+    <div id="confirmation-modal" class="confirmation-modal hidden" role="alertdialog" aria-modal="true" aria-labelledby="confirmation-title" aria-describedby="confirmation-message">
+      <section class="confirmation-window">
+        <div class="confirmation-content">
+          <div id="confirmation-icon" class="confirmation-icon" aria-hidden="true">!</div>
+          <div class="confirmation-copy">
+            <span id="confirmation-kicker">CONFIRM ACTION</span>
+            <h2 id="confirmation-title" tabindex="-1">确认操作</h2>
+            <p id="confirmation-message">请确认是否继续。</p>
+          </div>
+        </div>
+        <footer class="confirmation-actions">
+          <button id="confirmation-cancel" class="secondary-button" type="button">取消</button>
+          <button id="confirmation-confirm" class="confirmation-confirm-button" type="button">确认</button>
+        </footer>
+      </section>
     </div>
 
     <datalist id="path-suggestions"></datalist>
