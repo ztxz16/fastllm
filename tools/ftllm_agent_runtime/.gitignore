@@ -1,0 +1,8 @@
+/build/
+/dist/
+/*.egg-info/
+/src/*.egg-info/
+/src/ftllm_agent_runtime/bin/*
+__pycache__/
+.pytest_cache/
+*.py[cod]
