@@ -13,8 +13,8 @@ import time
 import traceback
 import uuid
 from http import HTTPStatus
-from typing import (Any, AsyncGenerator, AsyncIterator, Awaitable, Dict, Iterable,
-                    List, Optional, Tuple, TypedDict, Union, final)
+from typing import (Any, AsyncGenerator, AsyncIterator, Dict, Iterable, List,
+                    Optional, Tuple, Union)
 from urllib.parse import unquote, urlparse
 from urllib.request import urlopen
 
@@ -3549,8 +3549,9 @@ class FastLLmCompletion:
         if (final_stream_error_data is None and request.tools
                 and tool_call_parser):
             flush_result = tool_call_parser.flush_stream_tool_calls()
-            if flush_result.valid_tool_calls:
+            if flush_result.content or flush_result.valid_tool_calls:
                 delta_message = DeltaMessage(
+                    content = flush_result.content,
                     tool_calls = flush_result.valid_tool_calls,
                 )
                 choice_data = ChatCompletionResponseStreamChoice(

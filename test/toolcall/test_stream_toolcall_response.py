@@ -176,6 +176,22 @@ class _DummyModel:
         return "deepseek_v4"
 
 
+class _QwenTokenizer:
+    chat_template = "<tool_call><function=<parameter="
+
+    def get_vocab(self):
+        return {"<tool_call>": 1, "</tool_call>": 2}
+
+
+class _QwenDummyModel:
+    force_chat_template = False
+    tool_call_parser = "qwen3_coder"
+    hf_tokenizer = _QwenTokenizer()
+
+    def get_type(self):
+        return "qwen3_5"
+
+
 def _completion():
     completion = FastLLmCompletion.__new__(FastLLmCompletion)
     completion.model_name = "dummy"
@@ -184,13 +200,31 @@ def _completion():
     return completion
 
 
+def _qwen_completion():
+    completion = _completion()
+    completion.model = _QwenDummyModel()
+    return completion
+
+
+def _qwen_call(name: str, arguments: Dict[str, str]) -> str:
+    parameters = "".join(
+        f"<parameter={key}>\n{value}\n</parameter>"
+        for key, value in arguments.items()
+    )
+    return (
+        f"<tool_call><function={name}>{parameters}"
+        "</function></tool_call>"
+    )
+
+
 class StreamToolCallResponseTest(unittest.IsolatedAsyncioTestCase):
     async def _collect_stream(
         self,
         text: str,
         request: ChatCompletionRequest,
+        completion=None,
     ) -> Tuple[List[Dict], bool]:
-        completion = _completion()
+        completion = completion or _completion()
         chunks: List[Dict] = []
         saw_done = False
         async for event in completion.chat_completion_stream_generator(
@@ -257,6 +291,42 @@ class StreamToolCallResponseTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tool_calls[0]["name"], "get_weather")
         self.assertEqual(json.loads(tool_calls[0]["arguments"]),
                          {"city": "北京"})
+
+    async def test_qwen_stream_preserves_two_calls_across_small_chunks(self):
+        raw_output = (
+            _qwen_call("get_weather", {"city": "北京"}) + "\n" +
+            _qwen_call("get_time", {"timezone": "Asia/Shanghai"})
+        )
+        chunks, saw_done = await self._collect_stream(
+            raw_output,
+            _request(tools=[_weather_tool(), _time_tool()]),
+            completion=_qwen_completion(),
+        )
+
+        tool_calls = self._reconstruct_tool_calls(chunks)
+        self.assertTrue(saw_done)
+        self.assertEqual(self._finish_reason(chunks), "tool_calls")
+        self.assertEqual(
+            [tool_calls[index]["name"] for index in sorted(tool_calls)],
+            ["get_weather", "get_time"],
+        )
+
+    async def test_qwen_stream_flushes_partial_marker_like_plain_text(self):
+        raw_output = "ordinary response ending in <tool"
+        chunks, saw_done = await self._collect_stream(
+            raw_output,
+            _request(tools=[_weather_tool()]),
+            completion=_qwen_completion(),
+        )
+
+        content = "".join(
+            choice.get("delta", {}).get("content") or ""
+            for chunk in chunks
+            for choice in chunk.get("choices", [])
+        )
+        self.assertTrue(saw_done)
+        self.assertEqual(content, raw_output)
+        self.assertEqual(self._finish_reason(chunks), "stop")
 
     async def test_unknown_tool_name_is_suppressed(self):
         with self.assertLogs(level="WARNING") as logs:

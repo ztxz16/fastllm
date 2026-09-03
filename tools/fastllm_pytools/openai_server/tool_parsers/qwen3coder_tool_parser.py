@@ -2,62 +2,72 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+import logging
 import uuid
 from collections.abc import Sequence
 from typing import Any, Optional, Union
 
-import regex as re
-from .abstract_tool_parser import (ToolParser, ToolParserManager, random_tool_call_id)
-from ..protocal.openai_protocol import *
+from .abstract_tool_parser import ToolParser, ToolParserManager
+from ..protocal.openai_protocol import (
+    ChatCompletionRequest,
+    ChatCompletionToolsParam,
+    DeltaFunctionCall,
+    DeltaMessage,
+    DeltaToolCall,
+    ExtractedToolCallInformation,
+    FunctionCall,
+    ToolCall,
+)
+from ..tool_schema import convert_text_value, get_value
 
-import logging
+
 logger = logging.getLogger(__name__)
+
+
+class _IncompleteToolCall(ValueError):
+    """Raised when a valid tool call may be completed by later text."""
+
+
+def _partial_tag_overlap(text: str, tag: str) -> int:
+    """Return the length of a tag prefix held at the end of ``text``."""
+    max_length = min(len(text), len(tag) - 1)
+    for length in range(max_length, 0, -1):
+        if text.endswith(tag[:length]):
+            return length
+    return 0
+
+
+def _skip_whitespace(text: str, cursor: int) -> int:
+    while cursor < len(text) and text[cursor].isspace():
+        cursor += 1
+    return cursor
+
+
+def _is_partial_token(text: str, cursor: int, token: str) -> bool:
+    remainder = text[cursor:]
+    return len(remainder) < len(token) and token.startswith(remainder)
 
 
 @ToolParserManager.register_module(["qwen3_coder"])
 class Qwen3CoderToolParser(ToolParser):
+    """Parser for Qwen's XML function-call wire format.
+
+    Streaming is deliberately block-buffered. A speculative decoder may put
+    any number of token boundaries into one delta, so parser correctness must
+    depend on the generated text rather than on how that text was chunked.
+    Complete blocks are drained in a loop and incomplete tails remain buffered
+    for the next delta.
+    """
+
+    tool_call_start_token = "<tool_call>"
+    tool_call_end_token = "</tool_call>"
+    tool_call_prefix = "<function="
+    function_end_token = "</function>"
+    parameter_prefix = "<parameter="
+    parameter_end_token = "</parameter>"
 
     def __init__(self, tokenizer):
         super().__init__(tokenizer)
-
-        self.current_tool_name_sent: bool = False
-        self.prev_tool_call_arr: list[dict] = []
-        self.streamed_args_for_tool: list[str] = []
-
-        # Sentinel tokens for streaming mode
-        self.tool_call_start_token: str = "<tool_call>"
-        self.tool_call_end_token: str = "</tool_call>"
-        self.tool_call_prefix: str = "<function="
-        self.function_end_token: str = "</function>"
-        self.parameter_prefix: str = "<parameter="
-        self.parameter_end_token: str = "</parameter>"
-        self.is_tool_call_started: bool = False
-        self.failed_count: int = 0
-
-        # Streaming state variables
-        self.current_tool_index: int = 0
-        self.header_sent: bool = False
-        self.current_tool_string_id: Optional[str] = None
-        self.current_function_name: Optional[str] = None
-        self.current_param_name: Optional[str] = None
-        self.param_count: int = 0
-        self.in_function: bool = False
-        self.accumulated_text: str = ""
-        self.json_started: bool = False
-        self.json_closed: bool = False
-
-        # Enhanced streaming state - reset for each new message
-        self._reset_streaming_state()
-
-        # Regex patterns
-        self.tool_call_complete_regex = re.compile(
-            r"<tool_call>(.*?)</tool_call>", re.DOTALL)
-        self.tool_call_regex = re.compile(
-            r"<tool_call>(.*?)</tool_call>|<tool_call>(.*?)$", re.DOTALL)
-        self.tool_call_function_regex = re.compile(
-            r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL)
-        self.tool_call_parameter_regex = re.compile(
-            r"<parameter=(.*?)</parameter>|<parameter=(.*?)$", re.DOTALL)
 
         if not self.model_tokenizer:
             raise ValueError(
@@ -67,243 +77,387 @@ class Qwen3CoderToolParser(ToolParser):
         self.tool_call_start_token_id = self.vocab.get(
             self.tool_call_start_token)
         self.tool_call_end_token_id = self.vocab.get(self.tool_call_end_token)
-
         if (self.tool_call_start_token_id is None
                 or self.tool_call_end_token_id is None):
             raise RuntimeError(
                 "Qwen3 XML Tool parser could not locate tool call start/end "
                 "tokens in the tokenizer!")
 
+        self._reset_streaming_state()
+
     def get_token_ids(self, text: str) -> list[int]:
         return [self.vocab.get(text)]
 
-    def _generate_tool_call_id(self) -> str:
-        """Generate a unique tool call ID."""
+    @staticmethod
+    def _generate_tool_call_id() -> str:
         return f"call_{uuid.uuid4().hex[:24]}"
 
-    def _reset_streaming_state(self):
-        """Reset all streaming state."""
-        self.current_tool_index = 0
-        self.is_tool_call_started = False
-        self.header_sent = False
-        self.current_tool_string_id = None
-        self.current_function_name = None
-        self.current_param_name = None
-        self.param_count = 0
-        self.in_function = False
-        self.accumulated_text = ""
-        self.json_started = False
-        self.json_closed = False
+    def _reset_streaming_state(self) -> None:
+        self.current_tool_id = -1
+        self.current_tool_name_sent = False
         self.prev_tool_call_arr.clear()
         self.streamed_args_for_tool.clear()
+        self._stream_buffer = ""
+        self._stream_error: Optional[str] = None
+        self._stream_has_content_since_tool = False
 
-    def _parse_xml_function_call(
-            self, function_call_str: str,
-            tools: Optional[list[ChatCompletionToolsParam]]
-    ) -> Optional[ToolCall]:
+    @staticmethod
+    def _tool_parameters(
+        function_name: str,
+        tools: Optional[list[ChatCompletionToolsParam]],
+    ) -> dict[str, Any]:
+        for tool in tools or []:
+            function = get_value(tool, "function")
+            if get_value(function, "name") != function_name:
+                continue
+            parameters = get_value(function, "parameters")
+            return parameters if isinstance(parameters, dict) else {}
+        return {}
 
-        def get_arguments_config(func_name: str) -> dict:
-            if tools is None:
-                return {}
-            for config in tools:
-                if not hasattr(config, "type") or not (
-                        hasattr(config, "function")
-                        and hasattr(config.function, "name")):
-                    continue
-                if (config.type == "function"
-                        and config.function.name == func_name):
-                    if not hasattr(config.function, "parameters"):
-                        return {}
-                    params = config.function.parameters
-                    if isinstance(params, dict) and "properties" in params:
-                        return params["properties"]
-                    elif isinstance(params, dict):
-                        return params
-                    else:
-                        return {}
-            logger.warning("Tool '%s' is not defined in the tools list.",
-                           func_name)
-            return {}
+    @staticmethod
+    def _parameter_schema(
+        parameter_name: str,
+        parameters: dict[str, Any],
+    ) -> Any:
+        properties = parameters.get("properties")
+        if isinstance(properties, dict) and parameter_name in properties:
+            return properties[parameter_name]
+        additional = parameters.get("additionalProperties")
+        if isinstance(additional, dict):
+            return additional
+        return None
 
-        def convert_param_value(param_value: str, param_name: str,
-                                param_config: dict, func_name: str) -> Any:
-            # Handle null value for any type
-            if param_value.lower() == "null":
-                return None
+    @staticmethod
+    def _strip_protocol_newlines(value: str) -> str:
+        if value.startswith("\n"):
+            value = value[1:]
+        if value.endswith("\n"):
+            value = value[:-1]
+        return value
 
-            converted_value: Any
+    @staticmethod
+    def _parse_named_opening(
+        text: str,
+        cursor: int,
+        prefix: str,
+        description: str,
+    ) -> tuple[str, int]:
+        if not text.startswith(prefix, cursor):
+            if _is_partial_token(text, cursor, prefix):
+                raise _IncompleteToolCall(
+                    f"Qwen output ended inside a {description} opening tag")
+            raise ValueError(f"Expected a Qwen {description} opening tag")
 
-            if param_name not in param_config:
-                if param_config != {}:
-                    logger.warning(
-                        "Parsed parameter '%s' is not defined in the tool "
-                        "parameters for tool '%s', directly returning the "
-                        "string value.", param_name, func_name)
-                return param_value
+        name_start = cursor + len(prefix)
+        name_end = text.find(">", name_start)
+        if name_end == -1:
+            raise _IncompleteToolCall(
+                f"Qwen output ended inside a {description} opening tag")
+        if "\n" in text[name_start:name_end] or "\r" in text[
+                name_start:name_end]:
+            raise ValueError(
+                f"Qwen {description} opening tag contains a newline")
 
-            if (isinstance(param_config[param_name], dict)
-                    and "type" in param_config[param_name]):
-                param_type = str(
-                    param_config[param_name]["type"]).strip().lower()
-            else:
-                param_type = "string"
-            if param_type in [
-                    "string", "str", "text", "varchar", "char", "enum"
-            ]:
-                return param_value
-            elif (param_type.startswith("int") or param_type.startswith("uint")
-                  or param_type.startswith("long")
-                  or param_type.startswith("short")
-                  or param_type.startswith("unsigned")):
-                try:
-                    converted_value = int(param_value)
-                    return converted_value
-                except ValueError:
-                    logger.warning(
-                        "Parsed value '%s' of parameter '%s' is not an "
-                        "integer in tool '%s', degenerating to string.",
-                        param_value, param_name, func_name)
-                return param_value
-            elif (param_type.startswith("num")
-                  or param_type.startswith("float")):
-                try:
-                    float_param_value = float(param_value)
-                    converted_value = (float_param_value if float_param_value -
-                                       int(float_param_value) != 0 else
-                                       int(float_param_value))
-                    return converted_value
-                except ValueError:
-                    logger.warning(
-                        "Parsed value '%s' of parameter '%s' is not a float "
-                        "in tool '%s', degenerating to string.", param_value,
-                        param_name, func_name)
-                return param_value
-            elif param_type in ["boolean", "bool", "binary"]:
-                param_value = param_value.lower()
-                if param_value not in ["true", "false"]:
-                    logger.warning(
-                        "Parsed value '%s' of parameter '%s' is not a "
-                        "boolean (`true` of `false`) in tool '%s', "
-                        "degenerating to false.", param_value, param_name,
-                        func_name)
-                return param_value == "true"
-            else:
-                if param_type == "object" or param_type.startswith("dict"):
-                    try:
-                        converted_value = json.loads(param_value)
-                        return converted_value
-                    except json.JSONDecodeError:
-                        logger.warning(
-                            "Parsed value '%s' of parameter '%s' is not a "
-                            "valid JSON object in tool '%s', will try other "
-                            "methods to parse it.", param_value, param_name,
-                            func_name)
-                logger.warning(
-                    "Parameter '%s' has unknown type '%s'. "
-                    "The value will be treated as a string.", param_name,
-                    param_type)
-                return param_value
+        name = text[name_start:name_end].strip()
+        if not name:
+            raise ValueError(f"Qwen {description} has an empty name")
+        return name, name_end + 1
 
-        # Extract function name
-        end_index = function_call_str.index(">")
-        function_name = function_call_str[:end_index]
-        param_config = get_arguments_config(function_name)
-        parameters = function_call_str[end_index + 1:]
-        param_dict = {}
-        for match in self.tool_call_parameter_regex.findall(parameters):
-            match_text = match[0] if match[0] else match[1]
-            idx = match_text.index(">")
-            param_name = match_text[:idx]
-            param_value = str(match_text[idx + 1:])
-            # Remove prefix and trailing \n
-            if param_value.startswith("\n"):
-                param_value = param_value[1:]
-            if param_value.endswith("\n"):
-                param_value = param_value[:-1]
+    def _find_parameter_end(self, text: str, value_start: int) -> int:
+        """Find a structural parameter terminator, ignoring tag-like data.
 
-            param_dict[param_name] = convert_param_value(
-                param_value, param_name, param_config, function_name)
-        return ToolCall(
-            type="function",
-            function=FunctionCall(name=function_name,
-                                  arguments=json.dumps(param_dict,
-                                                       ensure_ascii=False)),
+        Qwen does not escape XML-looking text inside parameter values. A
+        ``</parameter>`` is therefore structural only when the next
+        non-whitespace text can continue the wire grammar: another parameter
+        or the end of the function. This keeps ordinary code and documentation
+        that mention protocol tags intact. A value containing a complete,
+        structurally valid closing sequence remains inherently ambiguous in
+        the model's unescaped wire format.
+        """
+        search_from = value_start
+        continuations = (self.parameter_prefix, self.function_end_token)
+        while True:
+            end = text.find(self.parameter_end_token, search_from)
+            if end == -1:
+                raise _IncompleteToolCall(
+                    "Qwen output ended inside a parameter value")
+
+            continuation = _skip_whitespace(
+                text, end + len(self.parameter_end_token))
+            if any(text.startswith(token, continuation)
+                   for token in continuations):
+                return end
+            if any(_is_partial_token(text, continuation, token)
+                   for token in continuations):
+                raise _IncompleteToolCall(
+                    "Qwen output ended after a parameter closing tag")
+
+            # The delimiter is part of the argument text. Search for the next
+            # one instead of letting data alter the protocol nesting.
+            search_from = end + len(self.parameter_end_token)
+
+    def _parse_parameter_at(
+        self,
+        text: str,
+        cursor: int,
+    ) -> tuple[str, str, int]:
+        name, value_start = self._parse_named_opening(
+            text,
+            cursor,
+            self.parameter_prefix,
+            "parameter",
+        )
+        value_end = self._find_parameter_end(text, value_start)
+        raw_value = self._strip_protocol_newlines(
+            text[value_start:value_end])
+        return (
+            name,
+            raw_value,
+            value_end + len(self.parameter_end_token),
         )
 
-    def _get_function_calls(self, model_output: str) -> list[str]:
-        # Find all tool calls
-        matched_ranges = self.tool_call_regex.findall(model_output)
-        raw_tool_calls = [
-            match[0] if match[0] else match[1] for match in matched_ranges
-        ]
+    def _build_tool_call(
+        self,
+        function_name: str,
+        raw_arguments: list[tuple[str, str]],
+        tools: Optional[list[ChatCompletionToolsParam]],
+    ) -> ToolCall:
+        function_name = function_name.strip()
+        if not function_name:
+            raise ValueError("Qwen tool call has an empty function name")
 
-        # Back-off strategy if no tool_call tags found
-        if len(raw_tool_calls) == 0:
-            raw_tool_calls = [model_output]
+        parameters = self._tool_parameters(function_name, tools)
+        properties = parameters.get("properties")
+        arguments: dict[str, Any] = {}
+        for parameter_name, raw_value in raw_arguments:
+            if parameter_name in arguments:
+                raise ValueError(
+                    f"Tool {function_name!r} repeats parameter "
+                    f"{parameter_name!r}")
 
-        raw_function_calls = []
-        for tool_call in raw_tool_calls:
-            raw_function_calls.extend(
-                self.tool_call_function_regex.findall(tool_call))
+            parameter_schema = self._parameter_schema(parameter_name,
+                                                       parameters)
+            if parameter_schema is None:
+                if isinstance(properties, dict) and properties:
+                    logger.warning(
+                        "Parsed parameter '%s' is not defined for tool '%s'; "
+                        "preserving its string value.", parameter_name,
+                        function_name)
+                converted_value = raw_value
+            else:
+                converted_value = convert_text_value(
+                    raw_value,
+                    parameter_schema,
+                    parameters,
+                )
+            arguments[parameter_name] = converted_value
 
-        function_calls = [
-            match[0] if match[0] else match[1] for match in raw_function_calls
-        ]
-        return function_calls
+        serialized = json.dumps(
+            arguments,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        return ToolCall(
+            type="function",
+            function=FunctionCall(
+                name=function_name,
+                arguments=serialized,
+            ),
+        )
+
+    def _parse_function_at(
+        self,
+        text: str,
+        cursor: int,
+        tools: Optional[list[ChatCompletionToolsParam]],
+    ) -> tuple[ToolCall, int]:
+        function_name, cursor = self._parse_named_opening(
+            text,
+            cursor,
+            self.tool_call_prefix,
+            "function",
+        )
+        raw_arguments: list[tuple[str, str]] = []
+
+        while True:
+            cursor = _skip_whitespace(text, cursor)
+            if text.startswith(self.function_end_token, cursor):
+                cursor += len(self.function_end_token)
+                return self._build_tool_call(
+                    function_name,
+                    raw_arguments,
+                    tools,
+                ), cursor
+            if text.startswith(self.parameter_prefix, cursor):
+                name, raw_value, cursor = self._parse_parameter_at(
+                    text, cursor)
+                raw_arguments.append((name, raw_value))
+                continue
+            if (_is_partial_token(text, cursor, self.parameter_prefix)
+                    or _is_partial_token(text, cursor,
+                                         self.function_end_token)):
+                raise _IncompleteToolCall(
+                    f"Qwen output ended inside tool {function_name!r}")
+            raise ValueError(
+                f"Tool {function_name!r} contains malformed parameter markup")
+
+    def _parse_tool_block_prefix(
+        self,
+        text: str,
+        cursor: int,
+        tools: Optional[list[ChatCompletionToolsParam]],
+    ) -> tuple[list[ToolCall], int]:
+        if not text.startswith(self.tool_call_start_token, cursor):
+            if _is_partial_token(text, cursor, self.tool_call_start_token):
+                raise _IncompleteToolCall(
+                    "Qwen output ended inside a tool-call opening tag")
+            raise ValueError("Expected a Qwen tool-call opening tag")
+
+        cursor += len(self.tool_call_start_token)
+        tool_calls: list[ToolCall] = []
+        while True:
+            cursor = _skip_whitespace(text, cursor)
+            if text.startswith(self.tool_call_end_token, cursor):
+                if not tool_calls:
+                    raise ValueError(
+                        "Qwen tool-call block contains no complete function")
+                return tool_calls, cursor + len(self.tool_call_end_token)
+            if text.startswith(self.tool_call_prefix, cursor):
+                tool_call, cursor = self._parse_function_at(
+                    text, cursor, tools)
+                tool_calls.append(tool_call)
+                continue
+            if (_is_partial_token(text, cursor, self.tool_call_prefix)
+                    or _is_partial_token(text, cursor,
+                                         self.tool_call_end_token)):
+                raise _IncompleteToolCall(
+                    "Qwen output ended inside a tool-call block")
+            raise ValueError(
+                "Qwen tool-call block contains malformed function markup")
+
+    def _split_complete_blocks(
+        self,
+        text: str,
+        tools: Optional[list[ChatCompletionToolsParam]],
+    ) -> tuple[str, list[ToolCall]]:
+        normal_parts: list[str] = []
+        tool_calls: list[ToolCall] = []
+        cursor = 0
+
+        while True:
+            start = text.find(self.tool_call_start_token, cursor)
+            stray_end = text.find(self.tool_call_end_token, cursor)
+            if start == -1:
+                if stray_end != -1:
+                    raise ValueError("Qwen output has an unmatched tool-call end")
+                normal_segment = text[cursor:]
+                if normal_segment.strip():
+                    normal_parts.append(normal_segment)
+                break
+            if stray_end != -1 and stray_end < start:
+                raise ValueError("Qwen output has an unmatched tool-call end")
+
+            normal_segment = text[cursor:start]
+            if normal_segment.strip():
+                normal_parts.append(normal_segment)
+            parsed_calls, cursor = self._parse_tool_block_prefix(
+                text, start, tools)
+            tool_calls.extend(parsed_calls)
+
+        return "".join(normal_parts), tool_calls
 
     def extract_tool_calls(
         self,
         model_output: str,
         request: ChatCompletionRequest,
     ) -> ExtractedToolCallInformation:
-        # print("into extract_tool_calls")
-        # Quick check to avoid unnecessary processing
-        if self.tool_call_prefix not in model_output:
-            return ExtractedToolCallInformation(tools_called=False,
-                                                tool_calls=[],
-                                                content=model_output)
-
-        try:
-            function_calls = self._get_function_calls(model_output)
-            if len(function_calls) == 0:
-                return ExtractedToolCallInformation(tools_called=False,
-                                                    tool_calls=[],
-                                                    content=model_output)
-
-            tool_calls = [
-                self._parse_xml_function_call(function_call_str, request.tools)
-                for function_call_str in function_calls
-            ]
-
-            # Populate prev_tool_call_arr for serving layer to set
-            # finish_reason
-            self.prev_tool_call_arr.clear()  # Clear previous calls
-            for tool_call in tool_calls:
-                if tool_call:
-                    self.prev_tool_call_arr.append({
-                        "name":
-                        tool_call.function.name,
-                        "arguments":
-                        tool_call.function.arguments,
-                    })
-
-            # Extract content before tool calls
-            content_index = model_output.find(self.tool_call_start_token)
-            content_index = (content_index if content_index >= 0 else
-                             model_output.find(self.tool_call_prefix))
-            content = model_output[:content_index]  # .rstrip()
-
+        marker_index = model_output.find(self.tool_call_start_token)
+        if marker_index == -1:
             return ExtractedToolCallInformation(
-                tools_called=(len(tool_calls) > 0),
-                tool_calls=tool_calls,
-                content=content if content else None,
+                tools_called=False,
+                tool_calls=[],
+                content=model_output,
             )
 
-        except Exception:
-            logger.exception("Error in extracting tool call from response.")
-            return ExtractedToolCallInformation(tools_called=False,
-                                                tool_calls=[],
-                                                content=model_output)
+        try:
+            normal_text, tool_calls = self._split_complete_blocks(
+                model_output, request.tools)
+        except (TypeError, ValueError) as error:
+            logger.warning("Failed to parse Qwen tool call: %s", error)
+            prefix = model_output[:marker_index]
+            return ExtractedToolCallInformation(
+                tools_called=False,
+                tool_calls=[],
+                content=prefix or None,
+            )
+
+        self.prev_tool_call_arr = [{
+            "name": tool_call.function.name,
+            "arguments": tool_call.function.arguments,
+        } for tool_call in tool_calls]
+        return ExtractedToolCallInformation(
+            tools_called=bool(tool_calls),
+            tool_calls=tool_calls,
+            content=normal_text if normal_text.strip() else None,
+        )
+
+    def _append_stream_call(
+        self,
+        tool_call: ToolCall,
+        deltas: list[DeltaToolCall],
+    ) -> None:
+        self.current_tool_id += 1
+        call_id = self._generate_tool_call_id()
+        name = tool_call.function.name
+        arguments = tool_call.function.arguments
+
+        self.prev_tool_call_arr.append({
+            "name": name,
+            "arguments": arguments,
+        })
+        self.streamed_args_for_tool.append(arguments)
+        deltas.append(
+            DeltaToolCall(
+                index=self.current_tool_id,
+                id=call_id,
+                type="function",
+                function=DeltaFunctionCall(
+                    name=name,
+                    arguments=arguments,
+                ),
+            ))
+
+    def streaming_parse_error(self) -> Optional[str]:
+        if self._stream_error:
+            return self._stream_error
+        if self.tool_call_start_token in self._stream_buffer:
+            return "Qwen tool-call stream ended inside a tool-call block"
+        return None
+
+    def flush_streaming_content(self) -> Optional[str]:
+        """Return ordinary text held while disambiguating a partial marker."""
+        if (not self._stream_buffer or self._stream_error
+                or self.tool_call_start_token in self._stream_buffer):
+            return None
+        pending = self._stream_buffer
+        self._stream_buffer = ""
+        if (self.prev_tool_call_arr and not pending.strip()
+                and not self._stream_has_content_since_tool):
+            return None
+        return pending
+
+    def _append_normal_segment(
+        self,
+        segment: str,
+        normal_parts: list[str],
+    ) -> None:
+        if not segment:
+            return
+        if segment.strip():
+            self._stream_has_content_since_tool = True
+            normal_parts.append(segment)
+        elif self._stream_has_content_since_tool:
+            normal_parts.append(segment)
 
     def extract_tool_calls_streaming(
         self,
@@ -315,239 +469,66 @@ class Qwen3CoderToolParser(ToolParser):
         delta_token_ids: Sequence[int],
         request: ChatCompletionRequest,
     ) -> Union[DeltaMessage, None]:
-        # If no delta text, return None unless it's an EOS token after tool
-        # calls
-        if not delta_text:
-            # Check if this is an EOS token after all tool calls are complete
-            # We check for tool calls in the text even if is_tool_call_started
-            # is False because it might have been reset after processing all
-            # tools
-            if (delta_token_ids
-                    and self.tool_call_end_token_id not in delta_token_ids):
-                # Count complete tool calls
-                complete_calls = len(
-                    self.tool_call_complete_regex.findall(current_text))
-
-                # If we have completed tool calls and populated
-                # prev_tool_call_arr
-                if (complete_calls > 0 and len(self.prev_tool_call_arr) > 0):
-                    # Check if all tool calls are closed
-                    open_calls = (
-                        current_text.count(self.tool_call_start_token) -
-                        current_text.count(self.tool_call_end_token))
-                    if open_calls == 0:
-                        # Return empty delta message to allow finish_reason
-                        # processing
-                        return DeltaMessage(content="")
-                elif not self.is_tool_call_started and current_text:
-                    # This is a regular content response that's now complete
-                    return DeltaMessage(content="")
-            return None
-
-        # Check if this is the first call (reset state if needed)
+        del current_text, previous_token_ids, current_token_ids
         if not previous_text:
             self._reset_streaming_state()
 
-        # Update accumulated text
-        self.accumulated_text = current_text
-
-        # Check if we need to advance to next tool
-        if self.json_closed and not self.in_function:
-            # Check if this tool call has ended
-            tool_ends = current_text.count(self.tool_call_end_token)
-            if tool_ends > self.current_tool_index:
-                # This tool has ended, advance to next
-                self.current_tool_index += 1
-                self.header_sent = False
-                self.param_count = 0
-                self.json_started = False
-                self.json_closed = False
-
-                # Check if there are more tool calls
-                tool_starts_count = current_text.count(
-                    self.tool_call_start_token)
-                if self.current_tool_index >= tool_starts_count:
-                    # No more tool calls
-                    self.is_tool_call_started = False
-                # Continue processing next tool
-                return None
-
-        # Handle normal content before tool calls
-        if not self.is_tool_call_started:
-            # Check if tool call is starting
-            if (self.tool_call_start_token_id in delta_token_ids
-                    or self.tool_call_start_token in delta_text):
-                self.is_tool_call_started = True
-                # Return any content before the tool call
-                if self.tool_call_start_token in delta_text:
-                    content_before = delta_text[:delta_text.index(
-                        self.tool_call_start_token)]
-                    if content_before:
-                        return DeltaMessage(content=content_before)
-                return None
-            else:
-                # Check if we're between tool calls - skip whitespace
-                if (current_text.rstrip().endswith(self.tool_call_end_token)
-                        and delta_text.strip() == ""):
-                    # We just ended a tool call, skip whitespace
-                    return None
-                # Normal content, no tool call
-                return DeltaMessage(content=delta_text)
-
-        # Check if we're between tool calls (waiting for next one)
-        # Count tool calls we've seen vs processed
-        tool_starts_count = current_text.count(self.tool_call_start_token)
-        if self.current_tool_index >= tool_starts_count:
-            # We're past all tool calls, shouldn't be here
+        if self._stream_error:
             return None
 
-        # We're in a tool call, find the current tool call portion
-        # Need to find the correct tool call based on current_tool_index
-        tool_starts: list[int] = []
-        idx = 0
-        while True:
-            idx = current_text.find(self.tool_call_start_token, idx)
-            if idx == -1:
+        self._stream_buffer += delta_text
+        normal_parts: list[str] = []
+        tool_deltas: list[DeltaToolCall] = []
+        at_stream_end = bool(not delta_text and delta_token_ids)
+
+        while self._stream_buffer:
+            marker_index = self._stream_buffer.find(
+                self.tool_call_start_token)
+            if marker_index == -1:
+                overlap = (0 if at_stream_end else _partial_tag_overlap(
+                    self._stream_buffer, self.tool_call_start_token))
+                safe_end = len(self._stream_buffer) - overlap
+                safe_text = self._stream_buffer[:safe_end]
+                if safe_text.strip():
+                    content_end = len(safe_text.rstrip())
+                    self._append_normal_segment(
+                        safe_text[:content_end], normal_parts)
+                    self._stream_buffer = (
+                        safe_text[content_end:] +
+                        self._stream_buffer[safe_end:])
+                if at_stream_end:
+                    pending = self.flush_streaming_content()
+                    if pending:
+                        normal_parts.append(pending)
                 break
-            tool_starts.append(idx)
-            idx += len(self.tool_call_start_token)
 
-        if self.current_tool_index >= len(tool_starts):
-            # No more tool calls to process yet
+            if marker_index > 0:
+                prefix = self._stream_buffer[:marker_index]
+                self._append_normal_segment(prefix, normal_parts)
+                self._stream_buffer = self._stream_buffer[marker_index:]
+
+            try:
+                parsed_calls, consumed = self._parse_tool_block_prefix(
+                    self._stream_buffer,
+                    0,
+                    request.tools,
+                )
+            except _IncompleteToolCall:
+                break
+            except (TypeError, ValueError) as error:
+                logger.warning("Failed to parse streamed Qwen tool call: %s",
+                               error)
+                self._stream_error = str(error)
+                self._stream_buffer = ""
+                break
+            else:
+                self._stream_buffer = self._stream_buffer[consumed:]
+                for tool_call in parsed_calls:
+                    self._append_stream_call(tool_call, tool_deltas)
+                self._stream_has_content_since_tool = False
+
+        content_delta = "".join(normal_parts)
+        content = content_delta or None
+        if not content and not tool_deltas:
             return None
-
-        tool_start_idx = tool_starts[self.current_tool_index]
-        # Find where this tool call ends (or current position if not ended yet)
-        tool_end_idx = current_text.find(self.tool_call_end_token,
-                                         tool_start_idx)
-        if tool_end_idx == -1:
-            tool_text = current_text[tool_start_idx:]
-        else:
-            tool_text = current_text[tool_start_idx:tool_end_idx +
-                                     len(self.tool_call_end_token)]
-
-        # Looking for function header
-        header_just_sent = False
-        if not self.header_sent:
-            if self.tool_call_prefix in tool_text:
-                func_start = (tool_text.find(self.tool_call_prefix) +
-                              len(self.tool_call_prefix))
-                func_end = tool_text.find(">", func_start)
-
-                if func_end != -1:
-                    # Found complete function name
-                    self.current_function_name = tool_text[func_start:func_end]
-                    self.current_tool_string_id = self._generate_tool_call_id()
-                    self.header_sent = True
-                    self.in_function = True
-
-                    # IMPORTANT: Add to prev_tool_call_arr immediately when we
-                    # detect a tool call. This ensures
-                    # finish_reason="tool_calls" even if parsing isn't complete
-                    already_added = any(
-                        tool.get("name") == self.current_function_name
-                        for tool in self.prev_tool_call_arr)
-                    if not already_added:
-                        self.prev_tool_call_arr.append({
-                            "name": self.current_function_name,
-                            "arguments":
-                            "{}",  # Placeholder, will be updated later
-                        })
-                    header_just_sent = True
-            if not header_just_sent:
-                return None
-
-        # We've sent header, now handle function body
-        if self.in_function:
-            # A speculative decoder can publish several accepted tokens in a
-            # single streaming delta.  In particular, the final
-            # ``</parameter>`` and ``</function>`` often arrive together.
-            # Build every newly completed argument before closing the JSON;
-            # the old one-boundary-per-delta state machine closed the object
-            # first and silently dropped the last parameter.
-            arguments_delta = ""
-            if not self.json_started:
-                self.json_started = True
-                arguments_delta = "{"
-
-            # Look for parameters
-            complete_params = tool_text.count(self.parameter_end_token)
-            if self.param_count < complete_params:
-                param_starts: list[int] = []
-                idx = 0
-                while True:
-                    idx = tool_text.find(self.parameter_prefix, idx)
-                    if idx == -1:
-                        break
-                    param_starts.append(idx)
-                    idx += len(self.parameter_prefix)
-
-                while (self.param_count < complete_params and
-                       self.param_count < len(param_starts)):
-                    param_idx = param_starts[self.param_count]
-                    param_start = param_idx + len(self.parameter_prefix)
-                    remaining = tool_text[param_start:]
-                    if ">" not in remaining:
-                        break
-                    name_end = remaining.find(">")
-                    self.current_param_name = remaining[:name_end]
-                    value_start = param_start + name_end + 1
-                    value_text = tool_text[value_start:]
-                    if value_text.startswith("\n"):
-                        value_text = value_text[1:]
-                    param_end_idx = value_text.find(
-                        self.parameter_end_token)
-                    if param_end_idx == -1:
-                        break
-                    param_value = value_text[:param_end_idx]
-                    if param_value.endswith("\n"):
-                        param_value = param_value[:-1]
-
-                    if self.param_count > 0:
-                        arguments_delta += ", "
-                    arguments_delta += (
-                        '"' + self.current_param_name + '": "' +
-                        json.dumps(param_value)[1:-1] + '"')
-                    self.param_count += 1
-
-            # Close only after all complete parameters in this delta have been
-            # serialized.  This ordering is the key speculative-streaming
-            # invariant.
-            if not self.json_closed and self.function_end_token in tool_text:
-                arguments_delta += "}"
-                self.json_closed = True
-
-                func_start = (tool_text.find(self.tool_call_prefix) +
-                              len(self.tool_call_prefix))
-                func_content_end = tool_text.find(self.function_end_token,
-                                                  func_start)
-                if func_content_end != -1:
-                    func_content = tool_text[func_start:func_content_end]
-                    try:
-                        parsed_tool = self._parse_xml_function_call(
-                            func_content, request.tools if request else None)
-                        if parsed_tool:
-                            for i, tool in enumerate(self.prev_tool_call_arr):
-                                if (tool.get("name") ==
-                                        parsed_tool.function.name):
-                                    self.prev_tool_call_arr[i]["arguments"] = (
-                                        parsed_tool.function.arguments)
-                                    break
-                    except Exception:
-                        pass  # Ignore parsing errors during streaming
-
-                self.in_function = False
-
-            if arguments_delta or header_just_sent:
-                function_delta = DeltaFunctionCall(
-                    arguments=arguments_delta)
-                tool_delta = DeltaToolCall(
-                    index=self.current_tool_index,
-                    function=function_delta)
-                if header_just_sent:
-                    tool_delta.id = self.current_tool_string_id
-                    tool_delta.type = "function"
-                    function_delta.name = self.current_function_name
-                return DeltaMessage(tool_calls=[tool_delta])
-
-        return None
+        return DeltaMessage(content=content, tool_calls=tool_deltas)
