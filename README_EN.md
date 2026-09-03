@@ -71,8 +71,8 @@ ftllm server Qwen/Qwen3-0.6B
 # Command-line chat
 ftllm run Qwen/Qwen3-0.6B
 
-# WebUI, listening on port 1616 by default
-ftllm webui Qwen/Qwen3-0.6B
+# WebUI, connected to the API server above; listens on 127.0.0.1:1616 by default
+ftllm webui --api_base http://127.0.0.1:8080/v1
 
 # Browser deployment launcher; no arguments starts it and opens the local page
 ftllm
@@ -88,7 +88,9 @@ ftllm bench Qwen/Qwen3-0.6B \
 
 `ftllm` (or `ftllm launch`) listens only on `127.0.0.1:8000` by default and opens the browser after the service is ready; use `ftllm launch --no-browser` to disable automatic opening. The page can download models from ModelScope, save and preview launch profiles, and run either `ftllm server` or the chat-oriented `ftllm webui`. After a local model is selected for a new item, Launcher recommends TP, hybrid MoE inference, and N-gram storage settings from the model structure, weight size, GPUs, system memory, and NUMA topology; the optional inference settings can also be re-analyzed or cleared manually. Its interface supports Simplified Chinese and English, preferring the last selection and otherwise following the browser language; terminal output from `ftllm launch` always uses English. To access it from the LAN, run `ftllm launch --host 0.0.0.0`; the terminal and Launcher page then list loopback, LAN, and directly assigned public-interface addresses when available. Public access also requires the host firewall and cloud security group to allow the port, plus port forwarding when behind NAT; Launcher does not discover NAT public mappings. Non-loopback access uses unencrypted HTTP and should only be enabled on a trusted network. It shares profiles with the terminal wizard and stops its managed download and model processes when the launcher exits. Run `ftllm launch --help` for other options.
 
-The `model` positional argument can be a Hugging Face repository ID, a local Hugging Face model directory, an exported FastLLM model, or a configuration file:
+The WebUI does not load a model in its own process, so start an OpenAI-compatible API server first. Its optional `model` positional argument is only a model-name hint; when omitted, the WebUI discovers the model from `/v1/models`.
+
+For `run`, `server`, and `export`, the `model` positional argument can be a Hugging Face repository ID, a local Hugging Face model directory, an exported FastLLM model, or a configuration file:
 
 ~~~bash
 ftllm server /data/models/my-model --device cuda

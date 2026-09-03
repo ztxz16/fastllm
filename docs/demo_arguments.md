@@ -40,5 +40,28 @@
 
 
 ## Web UI 配置参数
-- **API服务器端口号 (`--port`)**: 设置WebUI的端口号
-- **页面标题 (`--title`)**: 设置WebUI的页面标题
+- **模型提示 (`model` / `-p, --path`)**: 可选；用于推导默认 API 模型名，省略时会从 `/v1/models` 自动发现
+- **监听地址 (`--host`)**: 设置 WebUI 监听地址，默认为 `127.0.0.1`
+- **页面端口 (`--port`)**: 设置 WebUI 监听端口，默认为 `1616`
+- **页面标题 (`--title`)**: 设置 WebUI 的页面标题
+- **模型 API (`--api_base`)**: 设置 OpenAI 兼容 API 的地址，默认为 `http://127.0.0.1:8080/v1`
+- **API 模型名 (`--api_model`)**: 设置 API 请求使用的模型名；默认使用模型目录名，也可从 `/v1/models` 自动发现
+- **API Key (`--api_key`)**: 设置 WebUI 后端访问模型 API 时使用的密钥；密钥不会下发到浏览器
+- **API 请求超时 (`--api_timeout`)**: 设置单次模型 API 请求的超时时间（秒）
+- **API 就绪超时 (`--api_ready_timeout`)**: 设置 WebUI 启动前等待模型 API 就绪的最长时间（秒）
+- **最大输出 (`--max_token`)**: 设置最大输出 token 数；默认不设人工上限，小于等于 `0` 也表示不限制
+- **会话目录 (`--history_dir`)**: 设置 SQLite 会话记录和上传附件的保存目录，默认为 `~/.fastllm/webui`
+- **上传上限 (`--max_upload_mb`)**: 设置单个文档、图片或视频的最大体积（MiB）
+- **数据行数上限 (`--data_max_rows`)**: 设置数据分析时每个数据表最多读取的行数，默认为 `200000`
+- **代码上下文上限 (`--code_max_context_chars`)**: 设置代码项目智能体单次注入模型的最大源码字符数，默认为 `60000`
+- **联网超时 (`--web_search_timeout`)**: 设置 Web Agent 单次搜索或网页读取的超时时间（秒）
+
+新版 WebUI 由 FastAPI 和原生前端提供，但不再在 WebUI 进程内加载模型。请先用 `ftllm server` 启动 OpenAI 兼容 API，再启动 WebUI：
+
+```bash
+ftllm server /path/to/model --host 127.0.0.1 --port 8080 --model_name my-model --device cuda
+ftllm webui /path/to/model --host 127.0.0.1 --port 1616 \
+    --api_base http://127.0.0.1:8080/v1 --api_model my-model
+```
+
+WebUI 启动前会等待 `/v1/models` 就绪，所有模型调用（普通对话、思考输出、图片和视频、数据分析、PPT 规划及代码审查）统一通过 `/v1/chat/completions` 完成。浏览器只访问 WebUI 后端，因此 API Key 不会暴露给页面；模型只由 API Server 加载一份。WebUI 支持多会话持久化、关闭/低/中/高思考档位、图片和视频上传，以及无需搜索服务 API Key 的快速搜索和深度浏览。文件知识库可读取 PDF、DOCX、XLSX、PPTX、CSV、Markdown、文本和常见代码文件，支持会话内跨请求检索、跨文件问答及原文位置引用；扫描版 PDF 暂不包含 OCR。数据分析智能体可读取 CSV、TSV、JSON、JSONL 和 XLSX，通过受限的分组汇总、趋势、相关性及排序操作生成结论、PNG 图表和可编辑的 Excel 报告，不执行模型生成的任意代码。代码项目智能体会读取会话内多个源码和项目配置文件，按行号进行跨文件审查和问题定位；用户要求修改时可生成经过路径校验、可下载的 unified diff，但服务器不会执行源码、应用补丁或运行模型生成的命令。“生成 PPT”可以从主题或会话文件直接生成 4–20 页、可继续编辑的 16:9 PPTX，并支持科技蓝、商务红、自然绿和高级黑金风格。文件和联网资料都会作为不可信上下文注入模型，并在回答下方保留来源。

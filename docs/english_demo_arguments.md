@@ -39,5 +39,28 @@ Configuration related to the model, OpenAI API Server, WebUI, and conversation d
 - **API Server Port Number (`--port`)**: Sets the port number of the API server.
 
 ## Web UI Configuration Parameters
-- **API Server Port Number (`--port`)**: Sets the port number for the WebUI.
-- **Page Title (`--title`)**: Sets the page title for the WebUI.
+- **Model hint (`model` / `-p, --path`)**: Optional; derives the default API model name. When omitted, the model is discovered from `/v1/models`.
+- **Listening address (`--host`)**: Sets the WebUI listening address; the default is `127.0.0.1`.
+- **Page port (`--port`)**: Sets the WebUI listening port; the default is `1616`.
+- **Page title (`--title`)**: Sets the WebUI page title.
+- **Model API (`--api_base`)**: Sets the OpenAI-compatible API URL; the default is `http://127.0.0.1:8080/v1`.
+- **API model (`--api_model`)**: Sets the model name used in API requests; it defaults to the model-directory name and can also be discovered from `/v1/models`.
+- **API key (`--api_key`)**: Sets the credential used by the WebUI backend; it is never sent to the browser.
+- **API request timeout (`--api_timeout`)**: Sets the timeout in seconds for one model API request.
+- **API readiness timeout (`--api_ready_timeout`)**: Sets how long the WebUI waits for the model API before it starts listening.
+- **Maximum output (`--max_token`)**: Sets the output-token limit. By default there is no artificial limit; values less than or equal to `0` also mean unlimited.
+- **History directory (`--history_dir`)**: Stores the SQLite conversation database and uploaded attachments; the default is `~/.fastllm/webui`.
+- **Upload limit (`--max_upload_mb`)**: Sets the maximum size of each document, image, or video in MiB.
+- **Data row limit (`--data_max_rows`)**: Sets the maximum number of rows read from each table during data analysis; the default is `200000`.
+- **Code context limit (`--code_max_context_chars`)**: Sets the maximum source characters injected into one code-agent model request; the default is `60000`.
+- **Web timeout (`--web_search_timeout`)**: Sets the timeout in seconds for each Web Agent search or page read.
+
+The WebUI uses FastAPI and a native frontend, but no longer loads the model in its own process. Start an OpenAI-compatible API with `ftllm server`, then point the WebUI at it:
+
+```bash
+ftllm server /path/to/model --host 127.0.0.1 --port 8080 --model_name my-model --device cuda
+ftllm webui /path/to/model --host 127.0.0.1 --port 1616 \
+    --api_base http://127.0.0.1:8080/v1 --api_model my-model
+```
+
+Before listening, the WebUI waits for `/v1/models`. Every model operation—normal chat, reasoning output, image and video input, data analysis, PPT planning, and code review—uses `/v1/chat/completions`. The browser talks only to the WebUI backend, so API credentials are not exposed and the model is loaded exactly once by the API Server. The WebUI supports persistent conversations, off/low/medium/high reasoning levels, image and video uploads, and quick search or deep browsing without a search-provider API key. Its file knowledge base reads PDF, DOCX, XLSX, PPTX, CSV, Markdown, text, and common source-code files, with cross-request retrieval, cross-file Q&A, and source locations inside each conversation; scanned PDFs do not yet include OCR. The data-analysis agent reads CSV, TSV, JSON, JSONL, and XLSX, executes only validated grouping, trend, correlation, and sorting operations, and produces findings, PNG charts, and editable Excel reports without running arbitrary model-generated code. The code-project agent reads multiple source and project-configuration files from the conversation for line-referenced cross-file review and issue localization. When changes are requested, it can produce a path-validated downloadable unified diff, but the server never executes source, applies patches, or runs model-generated commands. "Create PPT" generates an editable 4–20 slide, 16:9 PPTX from a topic or conversation files in tech, business, nature, or premium styling. File and web results are injected as untrusted context and retained as sources under the answer.

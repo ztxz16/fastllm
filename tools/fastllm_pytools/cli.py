@@ -1,7 +1,5 @@
 import argparse
 import os
-import shlex
-import subprocess
 import sys
 
 from .util import make_normal_parser
@@ -73,11 +71,10 @@ def args_parser():
 
     subparsers.add_parser('download', parents = [download_parser], help = '下载模型')
 
-    # 创建webui子命令（独立的解析器）
-    webui_parser_ = subparsers.add_parser('webui', parents = [shared_parser], help='Web UI')
-    webui_parser_.add_argument('--port', type = int, default = 1616, help = '端口号')
-    webui_parser_.add_argument("--max_token", type = int, default = 4096, help = "输出最大token数")
-    webui_parser_.add_argument("--think", type = str, default = "false", help = "if <think> lost")
+    # 创建webui子命令
+    from .webui_server import add_webui_args
+    webui_parser_ = subparsers.add_parser('webui', help='Web UI')
+    add_webui_args(webui_parser_)
 
     # 浏览器部署启动器。与 webui 一样启动本地网页，但不加载模型；
     # 模型服务由页面中的独立子进程托管。
@@ -115,28 +112,6 @@ def args_parser():
     return parser
 
 
-def _run_webui(args, forwarded_args):
-    current_path = os.path.dirname(os.path.abspath(__file__))
-    web_demo_path = os.path.join(current_path, 'web_demo.py')
-    cmd = [
-        "streamlit", "run",
-        "--server.port", str(args.port),
-        "--browser.gatherUsageStats", "false",
-        web_demo_path,
-        "--",
-        *forwarded_args,
-    ]
-    print(f"Running: {shlex.join(cmd)}")
-    try:
-        return subprocess.call(cmd)
-    except FileNotFoundError:
-        print(
-            "streamlit command not found; install ftllm[webui].",
-            file=sys.stderr,
-        )
-        return 1
-
-
 def main(argv=None):
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     if not raw_argv:
@@ -171,9 +146,8 @@ def main(argv=None):
         from .download import HFDDownloader
         HFDDownloader(args).run()
     elif args.command == 'webui':
-        # Pass only the options the caller supplied. Parser defaults such as
-        # -1 must not become explicit web_demo.py arguments.
-        return _run_webui(args, raw_argv[1:])
+        from .webui_server import serve_webui
+        return serve_webui(args)
     elif args.command == 'launch':
         from .launcher import fastllm_launcher
         return fastllm_launcher(args)

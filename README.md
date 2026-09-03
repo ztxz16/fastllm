@@ -71,8 +71,8 @@ ftllm server Qwen/Qwen3-0.6B
 # 命令行对话
 ftllm run Qwen/Qwen3-0.6B
 
-# WebUI，默认监听 1616 端口
-ftllm webui Qwen/Qwen3-0.6B
+# WebUI，连接上面的 API Server，默认监听 127.0.0.1:1616
+ftllm webui --api_base http://127.0.0.1:8080/v1
 
 # 浏览器部署启动器；无参数时启动并自动打开本地管理页面
 ftllm
@@ -88,7 +88,9 @@ ftllm bench Qwen/Qwen3-0.6B \
 
 `ftllm`（或 `ftllm launch`）默认仅监听 `127.0.0.1:8000`，并在服务就绪后自动打开浏览器；使用 `ftllm launch --no-browser` 可以关闭自动打开。页面可以从 ModelScope 下载模型、保存启动配置、预览命令，并选择托管 `ftllm server` 或聊天 `ftllm webui`。新增启动项选择本地模型后，会根据模型结构、权重规模以及本机 GPU、内存和 NUMA 拓扑自动推荐 TP、MoE 混合推理与 N-gram 存储参数，也可以手动重新分析或清空可选推理参数。界面支持简体中文和英文，会优先使用上次选择的语言，否则跟随浏览器语言；`ftllm launch` 的终端日志固定使用英文。需要从局域网访问时使用 `ftllm launch --host 0.0.0.0`；终端和 Launcher 页面随后会列出本机、局域网以及网卡上直接配置的公网访问地址（若有）。公网访问还需要放行主机防火墙及云安全组，经过 NAT 时还需配置端口映射；Launcher 不会自动探测 NAT 的公网地址。非本机监听使用未加密 HTTP，请仅在可信网络中使用。它与终端向导共用配置文件；关闭 Launcher 时，由它托管的下载和模型进程也会停止。使用 `ftllm launch --help` 查看其他选项。
 
-`model` 位置参数既可以是 Hugging Face 仓库 ID，也可以是本地 Hugging Face 模型目录、FastLLM 模型文件或配置文件。例如：
+WebUI 不会在自身进程内加载模型，请先启动 OpenAI 兼容 API Server。WebUI 的可选 `model` 位置参数只用于推导 API 模型名；省略时会从 `/v1/models` 自动发现。
+
+对于 `run`、`server` 和 `export`，`model` 位置参数既可以是 Hugging Face 仓库 ID，也可以是本地 Hugging Face 模型目录、FastLLM 模型文件或配置文件。例如：
 
 ~~~bash
 ftllm server /data/models/my-model --device cuda

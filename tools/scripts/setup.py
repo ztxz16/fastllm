@@ -3,11 +3,14 @@ import os
 from setuptools import setup
 
 server_require = ['fastapi', 'pydantic', 'openai', 'shortuuid', 'uvicorn']
-webui_require = ['streamlit-chat']
+pptx_require = ['python-pptx>=1.0.0']
+document_require = ['pypdf>=4.0.0']
+data_require = ['pandas>=2.0.0', 'openpyxl>=3.1.0', 'XlsxWriter>=3.1.0']
+webui_require = ['fastapi', 'uvicorn'] + pptx_require + document_require + data_require
 download_require = ['aria2', 'modelscope>=1.34.0,<2']
 tokenizer_require = ['tiktoken', 'blobfile', 'partial_json_parser']
 video_require = ['imageio', 'imageio-ffmpeg']
-all_require = server_require + webui_require + download_require + tokenizer_require + video_require
+all_require = server_require + download_require + tokenizer_require + video_require + pptx_require + document_require + data_require
 
 PACKAGE_INFO = {
     "release": {"name": "ftllm", "version": "0.1.8.1"},
@@ -63,7 +66,7 @@ setup (
     },
     packages = ['ftllm', 'ftllm/openai_server', 'ftllm/openai_server/protocal', 'ftllm/openai_server/tool_parsers'],
     package_data = {
-        '': ['*.dll', '*.so', '*.dylib', '*.so.*', 'build_info.json',
+        '': ['*.dll', '*.so', '*.dylib', '*.so.*', '*.html', '*.js', '*.svg', 'build_info.json',
              'fastllm_triton_server.py', 'launcher_assets/*',
              'launcher_assets/locales/*.json']
     },
@@ -79,6 +82,9 @@ setup (
         'all': all_require,
         'server': server_require,
         'webui': webui_require,
+        'pptx': pptx_require,
+        'document': document_require,
+        'data': data_require,
         'video': video_require,
     },
 )
