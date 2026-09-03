@@ -86,6 +86,40 @@ def _strict_todowrite_tool() -> Dict:
     }
 
 
+def _strict_composite_tool() -> Dict:
+    return {
+        "type": "function",
+        "function": {
+            "name": "composite",
+            "strict": True,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "anyOf": [
+                            {"type": "array", "items": {"type": "integer"}},
+                            {"type": "null"},
+                        ],
+                    },
+                    "payload": {"$ref": "#/$defs/payload"},
+                    "mode": {"enum": ["fast", "safe"]},
+                    "version": {"const": 1},
+                },
+                "required": ["items", "payload", "mode", "version"],
+                "additionalProperties": False,
+                "$defs": {
+                    "payload": {
+                        "type": "object",
+                        "properties": {"value": {"type": "integer"}},
+                        "required": ["value"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+        },
+    }
+
+
 def _time_tool() -> Dict:
     return {
         "type": "function",
@@ -487,6 +521,154 @@ class FunctionCallParserTest(unittest.TestCase):
         self.assertFalse(result.valid)
         self.assertEqual(result.valid_tool_calls, [])
         self.assertEqual(len(result.invalid_tool_calls), 1)
+        self.assertEqual(result.diagnostics[0].code,
+                         "malformed_arguments_json")
+
+    def test_strict_schema_combinators_and_reference_pass(self):
+        parser = FunctionCallParser.from_request(
+            _request(tools=[_strict_composite_tool()]))
+        arguments = {
+            "items": [1, 2],
+            "payload": {"value": 3},
+            "mode": "safe",
+            "version": 1,
+        }
+
+        result = parser.validate_tool_calls([
+            _tool_call_dict("composite", json.dumps(arguments))
+        ])
+
+        self.assertTrue(result.valid)
+        self.assertEqual(result.diagnostics, [])
+
+    def test_strict_schema_anyof_rejects_wrong_type(self):
+        parser = FunctionCallParser.from_request(
+            _request(tools=[_strict_composite_tool()]))
+        arguments = {
+            "items": "not-an-array",
+            "payload": {"value": 3},
+            "mode": "safe",
+            "version": 1,
+        }
+
+        result = parser.validate_tool_calls([
+            _tool_call_dict("composite", json.dumps(arguments))
+        ])
+
+        self.assertFalse(result.valid)
+        self.assertEqual(result.diagnostics[0].code, "invalid_argument_type")
+        self.assertEqual(result.diagnostics[0].argument_name, "items")
+
+    def test_strict_schema_reference_validates_nested_value(self):
+        parser = FunctionCallParser.from_request(
+            _request(tools=[_strict_composite_tool()]))
+        arguments = {
+            "items": None,
+            "payload": {"value": "three"},
+            "mode": "safe",
+            "version": 1,
+        }
+
+        result = parser.validate_tool_calls([
+            _tool_call_dict("composite", json.dumps(arguments))
+        ])
+
+        self.assertFalse(result.valid)
+        self.assertTrue(any(
+            diagnostic.code == "invalid_argument_type"
+            and diagnostic.argument_name == "payload.value"
+            for diagnostic in result.diagnostics
+        ))
+
+    def test_strict_schema_enum_const_and_extra_property_are_rejected(self):
+        parser = FunctionCallParser.from_request(
+            _request(tools=[_strict_composite_tool()]))
+        arguments = {
+            "items": [],
+            "payload": {"value": 3},
+            "mode": "turbo",
+            "version": True,
+            "extra": 1,
+        }
+
+        result = parser.validate_tool_calls([
+            _tool_call_dict("composite", json.dumps(arguments))
+        ])
+
+        self.assertFalse(result.valid)
+        diagnostic_pairs = {
+            (diagnostic.code, diagnostic.argument_name)
+            for diagnostic in result.diagnostics
+        }
+        self.assertIn(("invalid_argument_value", "mode"), diagnostic_pairs)
+        self.assertIn(("invalid_argument_value", "version"), diagnostic_pairs)
+        self.assertIn(("unexpected_argument", "extra"), diagnostic_pairs)
+
+    def test_strict_schema_oneof_requires_exactly_one_match(self):
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "ambiguous",
+                "strict": True,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "value": {
+                            "oneOf": [
+                                {"type": "number"},
+                                {"type": "integer"},
+                            ],
+                        },
+                    },
+                    "required": ["value"],
+                },
+            },
+        }
+        parser = FunctionCallParser.from_request(_request(tools=[tool]))
+
+        result = parser.validate_tool_calls([
+            _tool_call_dict("ambiguous", json.dumps({"value": 1}))
+        ])
+
+        self.assertFalse(result.valid)
+        self.assertEqual(result.diagnostics[0].code,
+                         "invalid_argument_value")
+        self.assertEqual(result.diagnostics[0].argument_name, "value")
+
+    def test_strict_integer_uses_json_schema_numeric_semantics(self):
+        parser = FunctionCallParser.from_request(
+            _request(tools=[_strict_weather_tool()]))
+
+        integral = parser.validate_tool_calls([
+            _tool_call_dict(
+                "get_weather",
+                '{"city":"北京","days":1.0}',
+            )
+        ])
+        fractional = parser.validate_tool_calls([
+            _tool_call_dict(
+                "get_weather",
+                '{"city":"北京","days":1.5}',
+            )
+        ])
+
+        self.assertTrue(integral.valid)
+        self.assertFalse(fractional.valid)
+        self.assertEqual(fractional.diagnostics[0].code,
+                         "invalid_argument_type")
+
+    def test_strict_schema_rejects_overflowing_json_number(self):
+        parser = FunctionCallParser.from_request(
+            _request(tools=[_strict_weather_tool()]))
+
+        result = parser.validate_tool_calls([
+            _tool_call_dict(
+                "get_weather",
+                '{"city":"北京","days":1e309}',
+            )
+        ])
+
+        self.assertFalse(result.valid)
         self.assertEqual(result.diagnostics[0].code,
                          "malformed_arguments_json")
 

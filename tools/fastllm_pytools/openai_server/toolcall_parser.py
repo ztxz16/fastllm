@@ -11,10 +11,13 @@ from .protocal.openai_protocol import (
     ExtractedToolCallInformation,
 )
 from .tool_parsers import ToolParserManager
-
-
-def _reject_non_finite_json_constant(value: str) -> None:
-    raise ValueError(f"non-finite JSON constant {value!r} is not allowed")
+from .tool_schema import (
+    dereference_schema,
+    get_value as _get_value,
+    json_type_name,
+    load_strict_json,
+    schema_types,
+)
 
 
 @dataclass(frozen=True)
@@ -124,7 +127,8 @@ class FunctionCallParser:
         self.stream_tool_call_fragments: Dict[int, Dict[str, str]] = {}
         self.buffered_stream_tool_calls: Dict[int, List[Any]] = {}
         self.stream_text = ""
-        self._stream_finalized = False
+        self._stream_final_diagnostics: Optional[
+            List[ToolCallDiagnostic]] = None
 
     @classmethod
     def from_request(
@@ -470,21 +474,35 @@ class FunctionCallParser:
                 diagnostics=diagnostics,
                 has_invalid_tool_block=True,
             )
+        content = None
+        content_flusher = getattr(self.parser, "flush_streaming_content", None)
+        if callable(content_flusher):
+            content = content_flusher()
         tool_calls: List[Any] = []
         for raw_index in sorted(self.buffered_stream_tool_calls):
             tool_calls.extend(self.buffered_stream_tool_calls[raw_index])
         self.buffered_stream_tool_calls.clear()
         return ToolCallParseResult(
+            content=content,
             tools_called=bool(tool_calls),
             valid_tool_calls=tool_calls,
         )
 
     def _finalize_stream_diagnostics(self) -> List[ToolCallDiagnostic]:
-        if self._stream_finalized:
-            return []
-        self._stream_finalized = True
+        if self._stream_final_diagnostics is not None:
+            return list(self._stream_final_diagnostics)
         diagnostics: List[ToolCallDiagnostic] = []
-        if (self.has_tool_call(self.stream_text)
+        parser_error = None
+        parser_error_fn = getattr(self.parser, "streaming_parse_error", None)
+        if callable(parser_error_fn):
+            parser_error = parser_error_fn()
+        if parser_error:
+            diagnostics.append(
+                ToolCallDiagnostic(
+                    code="malformed_tool_block",
+                    message=str(parser_error),
+                ))
+        elif (self.has_tool_call(self.stream_text)
                 and not self.valid_stream_tool_indices
                 and not self.invalid_stream_tool_indices):
             extracted = self.parser.extract_tool_calls(
@@ -528,6 +546,7 @@ class FunctionCallParser:
                     self.stream_index_map.get(raw_index, raw_index),
                 ))
         self.stream_diagnostics.extend(diagnostics)
+        self._stream_final_diagnostics = list(diagnostics)
         return diagnostics
 
     @staticmethod
@@ -656,10 +675,7 @@ class FunctionCallParser:
             ]
 
         try:
-            parsed_arguments = json.loads(
-                arguments,
-                parse_constant=_reject_non_finite_json_constant,
-            )
+            parsed_arguments = load_strict_json(arguments)
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
             return [
                 ToolCallDiagnostic(
@@ -681,31 +697,14 @@ class FunctionCallParser:
             ]
 
         parameters = _get_value(function, "parameters") or {}
-        diagnostics: List[ToolCallDiagnostic] = []
-        for argument_name in _required_arguments(parameters):
-            if argument_name not in parsed_arguments:
-                diagnostics.append(
-                    ToolCallDiagnostic(
-                        code="missing_required_argument",
-                        message=(
-                            f"required argument {argument_name!r} is missing"
-                        ),
-                        tool_name=name,
-                        index=index,
-                        argument_name=argument_name,
-                    ))
-
-        properties = _get_value(parameters, "properties") or {}
-        for argument_name, value in parsed_arguments.items():
-            property_schema = _get_value(properties, argument_name)
-            diagnostics.extend(_schema_value_diagnostics(
-                value,
-                property_schema,
-                argument_name,
-                name,
-                index,
-            ))
-        return diagnostics
+        return _schema_value_diagnostics(
+            parsed_arguments,
+            parameters,
+            "",
+            name,
+            index,
+            root_schema=parameters,
+        )
 
     def _tool_function(self, name: str) -> Any:
         position = self.tool_index.get(name)
@@ -776,14 +775,6 @@ def _env_enabled(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in {"1", "on", "true", "yes"}
 
 
-def _get_value(obj: Any, key: str) -> Any:
-    if obj is None:
-        return None
-    if isinstance(obj, dict):
-        return obj.get(key)
-    return getattr(obj, key, None)
-
-
 def _required_arguments(parameters: Any) -> List[str]:
     required = _get_value(parameters, "required") or []
     if not isinstance(required, list):
@@ -797,32 +788,134 @@ def _schema_value_diagnostics(
     path: str,
     tool_name: str,
     index: int,
+    *,
+    root_schema: Any = None,
+    depth: int = 0,
 ) -> List[ToolCallDiagnostic]:
+    if schema is True or schema is None:
+        return []
+    if schema is False:
+        return [_schema_value_diagnostic(
+            "invalid_argument_value",
+            f"argument {_display_schema_path(path)!r} is not allowed",
+            path,
+            tool_name,
+            index,
+        )]
+    if not isinstance(schema, dict):
+        return []
+    if root_schema is None:
+        root_schema = schema
+    if depth > 64:
+        return [_schema_value_diagnostic(
+            "invalid_argument_value",
+            f"argument {_display_schema_path(path)!r} exceeds schema nesting limit",
+            path,
+            tool_name,
+            index,
+        )]
+
+    schema = dereference_schema(schema, root_schema)
     if not isinstance(schema, dict):
         return []
 
-    expected_type = _get_value(schema, "type")
-    if expected_type is not None and not _matches_json_schema_type(
-            value, expected_type):
-        return [
-            ToolCallDiagnostic(
-                code="invalid_argument_type",
-                message=(
-                    f"argument {path!r} expected type "
-                    f"{expected_type!r} but got {_json_type_name(value)!r}"
-                ),
-                tool_name=tool_name,
-                index=index,
-                argument_name=path,
-            )
-        ]
-
+    child_kwargs = {
+        "root_schema": root_schema,
+        "depth": depth + 1,
+    }
     diagnostics: List[ToolCallDiagnostic] = []
-    if isinstance(value, dict) and _schema_allows_type(expected_type, "object"):
+
+    all_of = schema.get("allOf")
+    if isinstance(all_of, list):
+        for candidate in all_of:
+            diagnostics.extend(_schema_value_diagnostics(
+                value, candidate, path, tool_name, index, **child_kwargs))
+
+    any_of = schema.get("anyOf")
+    if isinstance(any_of, list) and not any(
+            not _schema_value_diagnostics(
+                value, candidate, path, tool_name, index, **child_kwargs)
+            for candidate in any_of):
+        diagnostics.append(_schema_combinator_diagnostic(
+            value, schema, "anyOf", path, tool_name, index, root_schema))
+
+    one_of = schema.get("oneOf")
+    if isinstance(one_of, list):
+        match_count = sum(
+            not _schema_value_diagnostics(
+                value, candidate, path, tool_name, index, **child_kwargs)
+            for candidate in one_of)
+        if match_count != 1:
+            diagnostics.append(_schema_value_diagnostic(
+                "invalid_argument_value",
+                f"argument {_display_schema_path(path)!r} must match exactly "
+                f"one oneOf schema; matched {match_count}",
+                path,
+                tool_name,
+                index,
+            ))
+
+    negated = schema.get("not")
+    if negated is not None and not _schema_value_diagnostics(
+            value, negated, path, tool_name, index, **child_kwargs):
+        diagnostics.append(_schema_value_diagnostic(
+            "invalid_argument_value",
+            f"argument {_display_schema_path(path)!r} matches a forbidden schema",
+            path,
+            tool_name,
+            index,
+        ))
+
+    conditional = schema.get("if")
+    if conditional is not None:
+        condition_matches = not _schema_value_diagnostics(
+            value, conditional, path, tool_name, index, **child_kwargs)
+        selected = schema.get("then" if condition_matches else "else")
+        if selected is not None:
+            diagnostics.extend(_schema_value_diagnostics(
+                value, selected, path, tool_name, index, **child_kwargs))
+
+    expected_type = _get_value(schema, "type")
+    if (value is None and schema.get("nullable") is True):
+        type_matches = True
+    else:
+        type_matches = (expected_type is None
+                        or _matches_json_schema_type(value, expected_type))
+    if not type_matches:
+        diagnostics.append(_schema_value_diagnostic(
+            "invalid_argument_type",
+            f"argument {_display_schema_path(path)!r} expected type "
+            f"{expected_type!r} but got {json_type_name(value)!r}",
+            path,
+            tool_name,
+            index,
+        ))
+        return diagnostics
+
+    if "const" in schema and not _json_values_equal(value, schema["const"]):
+        diagnostics.append(_schema_value_diagnostic(
+            "invalid_argument_value",
+            f"argument {_display_schema_path(path)!r} must equal {schema['const']!r}",
+            path,
+            tool_name,
+            index,
+        ))
+    enum = schema.get("enum")
+    if (isinstance(enum, list)
+            and not any(_json_values_equal(value, item) for item in enum)):
+        diagnostics.append(_schema_value_diagnostic(
+            "invalid_argument_value",
+            f"argument {_display_schema_path(path)!r} is not one of the allowed values",
+            path,
+            tool_name,
+            index,
+        ))
+
+    if isinstance(value, dict):
         for child_name in _required_arguments(schema):
             if child_name in value:
                 continue
-            child_path = f"{path}.{child_name}"
+            child_path = _join_schema_path(path, child_name)
             diagnostics.append(
                 ToolCallDiagnostic(
                     code="missing_required_argument",
@@ -833,18 +926,39 @@ def _schema_value_diagnostics(
                 ))
 
         properties = _get_value(schema, "properties") or {}
-        if isinstance(properties, dict):
-            for child_name, child_value in value.items():
-                child_schema = _get_value(properties, child_name)
+        if not isinstance(properties, dict):
+            properties = {}
+        additional = schema.get("additionalProperties", True)
+        for child_name, child_value in value.items():
+            child_path = _join_schema_path(path, child_name)
+            if child_name in properties:
                 diagnostics.extend(_schema_value_diagnostics(
                     child_value,
-                    child_schema,
-                    f"{path}.{child_name}",
+                    properties[child_name],
+                    child_path,
+                    tool_name,
+                    index,
+                    **child_kwargs,
+                ))
+            elif additional is False:
+                diagnostics.append(_schema_value_diagnostic(
+                    "unexpected_argument",
+                    f"argument {child_path!r} is not defined by the tool schema",
+                    child_path,
                     tool_name,
                     index,
                 ))
+            elif isinstance(additional, dict):
+                diagnostics.extend(_schema_value_diagnostics(
+                    child_value,
+                    additional,
+                    child_path,
+                    tool_name,
+                    index,
+                    **child_kwargs,
+                ))
 
-    if isinstance(value, list) and _schema_allows_type(expected_type, "array"):
+    if isinstance(value, list):
         item_schema = _get_value(schema, "items")
         for item_index, item_value in enumerate(value):
             diagnostics.extend(_schema_value_diagnostics(
@@ -853,17 +967,81 @@ def _schema_value_diagnostics(
                 f"{path}[{item_index}]",
                 tool_name,
                 index,
+                **child_kwargs,
             ))
 
     return diagnostics
 
 
-def _schema_allows_type(expected_type: Any, schema_type: str) -> bool:
-    if expected_type is None:
-        return True
-    if isinstance(expected_type, list):
-        return schema_type in expected_type
-    return expected_type == schema_type
+def _schema_value_diagnostic(
+    code: str,
+    message: str,
+    path: str,
+    tool_name: str,
+    index: int,
+) -> ToolCallDiagnostic:
+    return ToolCallDiagnostic(
+        code=code,
+        message=message,
+        tool_name=tool_name,
+        index=index,
+        argument_name=path or None,
+    )
+
+
+def _schema_combinator_diagnostic(
+    value: Any,
+    schema: Any,
+    keyword: str,
+    path: str,
+    tool_name: str,
+    index: int,
+    root_schema: Any,
+) -> ToolCallDiagnostic:
+    allowed_types = schema_types(schema, root_schema)
+    if (allowed_types
+            and not _matches_json_schema_type(value, list(allowed_types))):
+        return _schema_value_diagnostic(
+            "invalid_argument_type",
+            f"argument {_display_schema_path(path)!r} expected one of types "
+            f"{allowed_types!r} but got {json_type_name(value)!r}",
+            path,
+            tool_name,
+            index,
+        )
+    return _schema_value_diagnostic(
+        "invalid_argument_value",
+        f"argument {_display_schema_path(path)!r} does not match any {keyword} schema",
+        path,
+        tool_name,
+        index,
+    )
+
+
+def _join_schema_path(path: str, child_name: str) -> str:
+    return f"{path}.{child_name}" if path else child_name
+
+
+def _display_schema_path(path: str) -> str:
+    return path or "$"
+
+
+def _json_values_equal(left: Any, right: Any) -> bool:
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left == right
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return left == right
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, list):
+        return (len(left) == len(right)
+                and all(_json_values_equal(a, b)
+                        for a, b in zip(left, right)))
+    if isinstance(left, dict):
+        return (left.keys() == right.keys()
+                and all(_json_values_equal(left[key], right[key])
+                        for key in left))
+    return left == right
 
 
 def _schema_property_names(parameters: Any) -> List[str]:
@@ -882,7 +1060,12 @@ def _matches_json_schema_type(value: Any, expected_type: Any) -> bool:
     if expected_type == "string":
         return isinstance(value, str)
     if expected_type == "integer":
-        return isinstance(value, int) and not isinstance(value, bool)
+        if isinstance(value, bool):
+            return False
+        if isinstance(value, int):
+            return True
+        return (isinstance(value, float) and math.isfinite(value)
+                and value.is_integer())
     if expected_type == "number":
         if isinstance(value, bool):
             return False
@@ -898,24 +1081,6 @@ def _matches_json_schema_type(value: Any, expected_type: Any) -> bool:
     if expected_type == "null":
         return value is None
     return True
-
-
-def _json_type_name(value: Any) -> str:
-    if value is None:
-        return "null"
-    if isinstance(value, bool):
-        return "boolean"
-    if isinstance(value, str):
-        return "string"
-    if isinstance(value, int):
-        return "integer"
-    if isinstance(value, float):
-        return "number"
-    if isinstance(value, list):
-        return "array"
-    if isinstance(value, dict):
-        return "object"
-    return type(value).__name__
 
 
 def _normalize_tool_choice_for_descriptor(tool_choice: Any) -> Any:

@@ -24,26 +24,10 @@ from ..protocal.openai_protocol import (
     FunctionCall,
     ToolCall,
 )
+from ..tool_schema import get_value, load_strict_json
 
 
 logger = logging.getLogger(__name__)
-
-
-def _reject_non_finite_json_constant(value: str) -> None:
-    raise ValueError(f"non-finite JSON constant {value!r} is not allowed")
-
-
-def _load_strict_json(value: str) -> Any:
-    return json.loads(
-        value,
-        parse_constant=_reject_non_finite_json_constant,
-    )
-
-
-def _get_value(value: Any, key: str, default: Any = None) -> Any:
-    if isinstance(value, dict):
-        return value.get(key, default)
-    return getattr(value, key, default)
 
 
 def _partial_tag_overlap(text: str, tag: str) -> int:
@@ -136,7 +120,7 @@ class DotsToolParser(ToolParser):
                 return False
             return value
         try:
-            return _load_strict_json(value)
+            return load_strict_json(value)
         except (json.JSONDecodeError, TypeError, ValueError):
             return value
 
@@ -179,10 +163,10 @@ class DotsToolParser(ToolParser):
         tools: Optional[list[Any]],
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         for tool in tools or []:
-            function = _get_value(tool, "function")
-            if _get_value(function, "name") != name:
+            function = get_value(tool, "function")
+            if get_value(function, "name") != name:
                 continue
-            schema = _get_value(function, "parameters")
+            schema = get_value(function, "parameters")
             if not isinstance(schema, dict):
                 break
             properties = schema.get("properties", {})
@@ -230,7 +214,7 @@ class DotsToolParser(ToolParser):
                 raise ValueError("Dots tool-call block contains no invoke")
             return calls
 
-        parsed = _load_strict_json(content)
+        parsed = load_strict_json(content)
         if not isinstance(parsed, dict):
             raise TypeError("Dots JSON tool call must be an object")
         return [parsed]
