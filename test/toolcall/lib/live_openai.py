@@ -284,7 +284,9 @@ def validate_tool_calls(
     case_id = case["id"]
     expected = case.get("expected", {})
     allowed_names = expected.get("allowed_tool_names") or []
+    required_names = expected.get("required_tool_names") or []
     required_keys = expected.get("required_argument_keys") or []
+    expected_calls = expected.get("expected_tool_calls")
 
     if expected.get("must_call_tool") and not tool_calls:
         raise LiveOpenAIError("no_tool_call", f"{case_id}: no tool call returned")
@@ -293,6 +295,25 @@ def validate_tool_calls(
             "unexpected_tool_call",
             f"{case_id}: unexpected tool calls returned: "
             f"{[call.get('name') for call in tool_calls]}",
+        )
+
+    expected_count = expected.get("expected_tool_count")
+    if expected_count is not None and len(tool_calls) != expected_count:
+        raise LiveOpenAIError(
+            "unexpected_tool_call_count",
+            f"{case_id}: expected {expected_count} tool calls but got "
+            f"{len(tool_calls)}: "
+            f"{[call.get('name') for call in tool_calls]}",
+        )
+
+    returned_names = [call.get("name") for call in tool_calls]
+    missing_names = [name for name in required_names
+                     if name not in returned_names]
+    if missing_names:
+        raise LiveOpenAIError(
+            "missing_required_tool",
+            f"{case_id}: required tools were not called: {missing_names!r}; "
+            f"returned {returned_names!r}",
         )
 
     parsed_arguments = []
@@ -311,7 +332,7 @@ def validate_tool_calls(
                     "allowed_tool_names": allowed_names,
                 },
             )
-        if expected.get("arguments_must_be_json"):
+        if expected.get("arguments_must_be_json") or expected_calls is not None:
             arguments = _parse_arguments(tool_call.get("arguments") or "",
                                          case_id, index)
             parsed_arguments.append(arguments)
@@ -322,7 +343,47 @@ def validate_tool_calls(
                         f"{case_id}: tool_call {index} missing required "
                         f"argument {key!r}: {arguments!r}",
                     )
+
+    if expected_calls is not None:
+        if not isinstance(expected_calls, list):
+            raise LiveOpenAIError(
+                "invalid_test_expectation",
+                f"{case_id}: expected_tool_calls must be a list",
+            )
+        if len(expected_calls) != len(tool_calls):
+            raise LiveOpenAIError(
+                "unexpected_tool_call_count",
+                f"{case_id}: expected {len(expected_calls)} exact tool calls "
+                f"but got {len(tool_calls)}",
+            )
+        for index, (expected_call, actual_call, actual_arguments) in enumerate(
+                zip(expected_calls, tool_calls, parsed_arguments)):
+            expected_name = expected_call.get("name")
+            if (expected_name is not None
+                    and actual_call.get("name") != expected_name):
+                raise LiveOpenAIError(
+                    "unexpected_tool_call_sequence",
+                    f"{case_id}: tool_call {index} expected name "
+                    f"{expected_name!r} but got {actual_call.get('name')!r}",
+                )
+            if ("arguments" in expected_call
+                    and _canonical_json(actual_arguments)
+                    != _canonical_json(expected_call["arguments"])):
+                raise LiveOpenAIError(
+                    "unexpected_tool_arguments",
+                    f"{case_id}: tool_call {index} arguments "
+                    f"{actual_arguments!r} != {expected_call['arguments']!r}",
+                )
     return {"parsed_arguments": parsed_arguments}
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def validate_content(case: Dict[str, Any], content: Optional[str]):

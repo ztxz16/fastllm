@@ -105,6 +105,77 @@ class LiveOpenAIHelperTest(unittest.TestCase):
         self.assertEqual(ctx.exception.details["allowed_tool_names"],
                          ["get_weather"])
 
+    def test_parallel_expectation_requires_every_named_tool(self):
+        case = {
+            "id": "live_parallel_dummy",
+            "expected": {
+                "must_call_tool": True,
+                "allowed_tool_names": ["get_weather", "get_time"],
+                "required_tool_names": ["get_weather", "get_time"],
+                "expected_tool_count": 2,
+                "arguments_must_be_json": True,
+            },
+        }
+        with self.assertRaises(LiveOpenAIError) as ctx:
+            validate_tool_calls(case, [{
+                "index": 0,
+                "id": "call_1",
+                "type": "function",
+                "name": "get_weather",
+                "arguments": "{\"city\":\"北京\"}",
+            }])
+        self.assertEqual(ctx.exception.code, "unexpected_tool_call_count")
+
+    def test_parallel_expectation_rejects_wrong_two_call_subset(self):
+        case = {
+            "id": "live_parallel_dummy",
+            "expected": {
+                "must_call_tool": True,
+                "allowed_tool_names": ["get_weather", "get_time"],
+                "required_tool_names": ["get_weather", "get_time"],
+                "expected_tool_count": 2,
+                "arguments_must_be_json": True,
+            },
+        }
+        calls = [{
+            "index": index,
+            "id": f"call_{index}",
+            "type": "function",
+            "name": "get_weather",
+            "arguments": "{\"city\":\"北京\"}",
+        } for index in range(2)]
+
+        with self.assertRaises(LiveOpenAIError) as ctx:
+            validate_tool_calls(case, calls)
+
+        self.assertEqual(ctx.exception.code, "missing_required_tool")
+
+    def test_exact_tool_call_expectation_checks_json_types(self):
+        case = {
+            "id": "live_typed_dummy",
+            "expected": {
+                "must_call_tool": True,
+                "allowed_tool_names": ["configure"],
+                "arguments_must_be_json": True,
+                "expected_tool_calls": [{
+                    "name": "configure",
+                    "arguments": {"enabled": True, "items": [1, 2]},
+                }],
+            },
+        }
+        wrong_types = [{
+            "index": 0,
+            "id": "call_1",
+            "type": "function",
+            "name": "configure",
+            "arguments": '{"enabled":1,"items":"[1,2]"}',
+        }]
+
+        with self.assertRaises(LiveOpenAIError) as ctx:
+            validate_tool_calls(case, wrong_types)
+
+        self.assertEqual(ctx.exception.code, "unexpected_tool_arguments")
+
     def test_roundtrip_allows_first_tool_call_with_null_content(self):
         case = {
             "id": "live_roundtrip_dummy",
