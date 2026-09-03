@@ -44,7 +44,7 @@ hard-coded SHA-256 digests before copying anything into the package tree.
 
 ```bash
 python -m pip install \
-  dist/ftllm_agent_runtime-0.2.0-py3-none-linux_x86_64.whl
+  dist/ftllm_agent_runtime-0.2.1-py3-none-linux_x86_64.whl
 
 ftllm webui /path/to/model
 ```
@@ -52,6 +52,8 @@ ftllm webui /path/to/model
 Pi is the default agent runtime for code tasks and Web Agent searches. Use
 `--agent-runtime builtin` to force the original single-model-call paths, or
 `--agent-runtime auto` to prefer Pi while allowing a missing package fallback.
+Library callers can pass a `threading.Event` as `cancel_event` to
+`PiAgentRuntime.stream()`; setting it terminates the request-scoped Pi process.
 
 ## Smoke test
 

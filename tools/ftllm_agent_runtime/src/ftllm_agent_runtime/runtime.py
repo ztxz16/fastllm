@@ -21,7 +21,7 @@ from typing import Any, Dict, Iterable, Iterator, Mapping, Optional
 from urllib.parse import urlsplit
 
 
-BRIDGE_VERSION = "0.2.0"
+BRIDGE_VERSION = "0.2.1"
 PI_VERSION = "0.84.4"
 _RUNTIME_TOOLS = ("runtime_info",)
 _PROJECT_TOOLS = (
@@ -39,6 +39,10 @@ _THINKING_LEVELS = {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
 
 class PiAgentError(RuntimeError):
     """Raised when the packaged Pi process cannot complete an agent run."""
+
+
+class PiAgentCancelled(PiAgentError):
+    """Raised after a caller requests cancellation of an active Pi run."""
 
 
 def _resource_path(*parts: str) -> Path:
@@ -376,9 +380,12 @@ class PiAgentRuntime:
         system_prompt: str,
         thinking_level: str = "off",
         web_backend: Optional[Any] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Iterator[Dict[str, Any]]:
         """Yield normalized events from a complete Pi agent run."""
 
+        if cancel_event is not None and cancel_event.is_set():
+            raise PiAgentCancelled("Pi agent request was cancelled")
         level = str(thinking_level or "off").lower()
         if level not in _THINKING_LEVELS:
             raise ValueError(f"unsupported thinking level: {thinking_level}")
@@ -499,13 +506,17 @@ class PiAgentRuntime:
             turns = 0
             try:
                 while not saw_agent_end:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise PiAgentCancelled("Pi agent request was cancelled")
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise PiAgentError(
                             f"Pi agent exceeded the {self.timeout:g}s request timeout"
                         )
                     try:
-                        kind, line = records.get(timeout=min(1.0, remaining))
+                        poll_interval = 0.1 if cancel_event is not None else 1.0
+                        kind, line = records.get(
+                            timeout=min(poll_interval, remaining))
                     except queue.Empty:
                         if process.poll() is not None:
                             break

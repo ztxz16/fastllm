@@ -1,11 +1,14 @@
 import json
 from pathlib import Path
+import threading
+import time
 import urllib.error
 import urllib.request
 
 import pytest
 
 from ftllm_agent_runtime.runtime import (
+    PiAgentCancelled,
     PiAgentError,
     PiAgentRuntime,
     _WebToolBridge,
@@ -123,6 +126,38 @@ def test_runtime_rejects_an_empty_agent_response(tmp_path: Path):
             [{"name": "app.py", "text": "answer = 42\n"}],
             "Use the read-only project tools.",
         ))
+
+
+def test_runtime_cancellation_terminates_a_running_process(tmp_path: Path):
+    binary = tmp_path / "pi"
+    binary.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys, time\n"
+        "json.loads(sys.stdin.readline())\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    binary.chmod(0o755)
+    runtime = PiAgentRuntime(
+        api_base="http://localhost:8000/v1",
+        model="demo",
+        binary=str(binary),
+    )
+    cancelled = threading.Event()
+    timer = threading.Timer(0.15, cancelled.set)
+    started = time.monotonic()
+    timer.start()
+    try:
+        with pytest.raises(PiAgentCancelled, match="cancelled"):
+            list(runtime.stream(
+                "Inspect the project.",
+                [{"name": "app.py", "text": "answer = 42\n"}],
+                "Use the read-only project tools.",
+                cancel_event=cancelled,
+            ))
+    finally:
+        timer.cancel()
+    assert time.monotonic() - started < 3
 
 
 def test_web_tool_bridge_registers_sources_and_reads_by_index():
