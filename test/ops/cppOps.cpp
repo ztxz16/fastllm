@@ -1389,6 +1389,21 @@ namespace {
         };
     }
 
+    static void PrepareGeluNewInput(const OpTestParams &params,
+                                    const std::string &device,
+                                    fastllm::Data &input) {
+        const std::string inputType = params.GetString("input_type");
+        if (inputType != "fp32" && inputType != "fp16") {
+            throw std::runtime_error(
+                "gelunew input_type must be fp32 or fp16");
+        }
+        if (inputType == "fp16" &&
+            (device.rfind("cuda", 0) == 0 ||
+             device.rfind("multicuda", 0) == 0)) {
+            fastllm::ToDataType(input, fastllm::DataType::FLOAT16);
+        }
+    }
+
     static OpCase MakeGeluNewCase() {
         return {
             "gelunew",
@@ -1396,20 +1411,23 @@ namespace {
             []() {
                 OpTestParams params;
                 params.Add("dims", "4,8", "input tensor shape");
+                params.Add("input_type", "fp32",
+                           "fp32 or fp16 target input; CPU reference is fp32");
                 return params;
             },
             [](const OpTestParams &params, const std::string &device) {
                 fastllm::Data input = MakeTensor(params.GetInts("dims"), 0.5f);
+                PrepareGeluNewInput(params, device, input);
                 fastllm::Data output;
                 return CanRunOnDevice(device, "GeluNew", {{"input", &input}, {"output", &output}}, {}, {});
             },
             [](const OpTestParams &params, const std::string &device) {
                 fastllm::Data input = MakeTensor(params.GetInts("dims"), 0.5f);
+                PrepareGeluNewInput(params, device, input);
                 fastllm::Data output;
                 ScopedFirstDevice guard(device);
                 fastllm::GeluNew(input, output);
-                output.ToDevice(fastllm::DataDevice::CPU);
-                return output;
+                return ConvertToFloat32Data(output);
             },
             [](const OpTestParams &params) {
                 return FloatBytes(params.GetInts("dims")) * 2.0;
@@ -1455,6 +1473,23 @@ namespace {
         };
     }
 
+    static void PrepareAttentionInputs(const OpTestParams &params,
+                                       fastllm::Data &q,
+                                       fastllm::Data &k,
+                                       fastllm::Data &v) {
+        const std::string inputType = params.GetString("input_type");
+        if (inputType == "fp32") {
+            return;
+        }
+        if (inputType != "fp16") {
+            throw std::runtime_error(
+                "attention input_type must be fp32 or fp16");
+        }
+        fastllm::ToDataType(q, fastllm::DataType::FLOAT16);
+        fastllm::ToDataType(k, fastllm::DataType::FLOAT16);
+        fastllm::ToDataType(v, fastllm::DataType::FLOAT16);
+    }
+
     static OpCase MakeAttentionCase() {
         return {
             "attention",
@@ -1466,6 +1501,7 @@ namespace {
                 params.Add("dim", "8", "head dimension total");
                 params.Add("group", "1", "attention group");
                 params.Add("attention_type", "1", "1 normal, 2 no mask");
+                params.Add("input_type", "fp32", "fp32 or fp16");
                 return params;
             },
             [](const OpTestParams &params, const std::string &device) {
@@ -1473,6 +1509,7 @@ namespace {
                 fastllm::Data q = MakeTensor({batch, seq, dim}, 0.1f);
                 fastllm::Data k = MakeTensor({batch, seq, dim}, 0.5f);
                 fastllm::Data v = MakeTensor({batch, seq, dim}, 0.9f);
+                PrepareAttentionInputs(params, q, k, v);
                 fastllm::Data mask;
                 fastllm::Data output;
                 return CanRunOnDevice(device, "Attention", {{"q", &q}, {"k", &k}, {"v", &v}, {"mask", &mask}, {"output", &output}},
@@ -1484,17 +1521,19 @@ namespace {
                 fastllm::Data q = MakeTensor({batch, seq, dim}, 0.1f);
                 fastllm::Data k = MakeTensor({batch, seq, dim}, 0.5f);
                 fastllm::Data v = MakeTensor({batch, seq, dim}, 0.9f);
+                PrepareAttentionInputs(params, q, k, v);
                 fastllm::Data mask;
                 fastllm::Data output;
                 ScopedFirstDevice guard(device);
+                int maskType = params.GetInt("attention_type") == 2 ? 2 : 0;
                 fastllm::Attention(q, k, v, mask, output, params.GetInt("group"),
-                                   1.0f / std::sqrt((float) dim), params.GetInt("attention_type"));
-                output.ToDevice(fastllm::DataDevice::CPU);
-                return output;
+                                   1.0f / std::sqrt((float) dim), maskType);
+                return ConvertToFloat32Data(output);
             },
             [](const OpTestParams &params) {
                 int batch = params.GetInt("batch"), seq = params.GetInt("seq"), dim = params.GetInt("dim");
-                return FloatBytes({batch, seq, dim}) * 4.0;
+                double elementBytes = params.GetString("input_type") == "fp16" ? 2.0 : 4.0;
+                return (double) batch * seq * dim * elementBytes * 4.0;
             },
             [](const OpTestParams &params) {
                 int batch = params.GetInt("batch"), seq = params.GetInt("seq"), dim = params.GetInt("dim");
@@ -5346,6 +5385,7 @@ namespace {
         fastllm::Data baseline = opCase.run(params, "cpu");
         baseline.ToDevice(fastllm::DataDevice::CPU);
         bool ok = true;
+        bool ran = false;
 
         for (const auto &device : devices) {
             if (!DeviceSelected(config.deviceFilters, device)) {
@@ -5355,6 +5395,7 @@ namespace {
                 std::cout << "  [" << device << "] skipped: op not supported on this device\n";
                 continue;
             }
+            ran = true;
 
             fastllm::Data output = opCase.run(params, device);
             output.ToDevice(fastllm::DataDevice::CPU);
@@ -5387,7 +5428,7 @@ namespace {
                 ok = false;
             }
         }
-        return ok;
+        return ran && ok;
     }
 }
 

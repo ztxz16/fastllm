@@ -38,6 +38,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 
 template <int BN, int BM, int BK>
 __global__ void HalfFC(
@@ -1006,7 +1007,6 @@ bool FastllmCudaHalfAttention(const fastllm::Data &q, const fastllm::Data &k, co
     if (maskType == 0 && !use_custom_mask && batch == 1) {
         mask_mode = MaskMode::kCausal;
     }
-mask_mode = MaskMode::kCausal;
 #endif
     // FlashInfer's custom mask is bit-packed and is not compatible with
     // FastLLM's dense mask.  Keep use_custom_mask=true so the selection below
@@ -1083,7 +1083,11 @@ mask_mode = MaskMode::kCausal;
             // 分配临时缓冲区（如果需要 partition-kv）
             half *tmp = nullptr;
             cudaError_t status = cudaSuccess;
-            cudaStream_t stream = nullptr;
+            // Pad/Split, the FastLLM allocator, and the consumers below all
+            // use the per-thread default stream. Launch FlashInfer on that
+            // same stream so a completed host call also preserves producer /
+            // consumer ordering when the temporary head buffers are reused.
+            cudaStream_t stream = cudaStreamPerThread;
             
             {
                 // Prefill 阶段：q 的形状是 [num_qo_heads, qo_len, head_dim]
@@ -1140,6 +1144,104 @@ FastllmCudaPermute(*((fastllm::Data*)&output), {1, 0, 2});
     
     // Fallback 到原始实现
     half beta = __float2half_rn(0.0f), one = __float2half_rn(1.0f), hscale = __float2half_rn(scale);
+
+    // Vision self-attention is non-causal and can have tens of thousands of
+    // queries.  The legacy fallback below processes one head at a time, but it
+    // still materializes a full [q1, k1] score matrix (8 GiB at 65536 x 65536
+    // in FP16).  Split only the query rows instead: every row still sees the
+    // complete K/V sequence, so this is numerically the same softmax while the
+    // temporary allocation stays bounded.  This path uses only cuBLAS and
+    // ordinary CUDA kernels and therefore also works on SM70 where FlashInfer
+    // is unavailable.
+    if (!use_custom_mask && maskType == 2 && q1 >= 1024 && k1 >= 1024) {
+        constexpr size_t scratchLimit = 32ULL * 1024ULL * 1024ULL;
+        const size_t scoreRowBytes = (size_t)k1 * sizeof(half);
+        int queryChunk = (int)std::max<size_t>(
+            1, std::min<size_t>((size_t)q1, scratchLimit / scoreRowBytes));
+        size_t scoreBytes = 0;
+        half *qk = nullptr;
+        // On a crowded SM70 card even the default 32 MiB may be unavailable.
+        // Retry with progressively fewer query rows; one complete score row is
+        // the minimum required to preserve exact softmax over all keys.
+        while (queryChunk >= 1) {
+            scoreBytes = (size_t)queryChunk * scoreRowBytes;
+            void *scratch = nullptr;
+            FastllmCudaTryMallocResult allocResult =
+                FastllmCudaTryMalloc(&scratch, scoreBytes);
+            qk = (half *)scratch;
+            if (allocResult == FASTLLM_CUDA_TRY_MALLOC_SUCCESS &&
+                qk != nullptr) {
+                break;
+            }
+            if (qk != nullptr) {
+                FastllmCudaFree(qk);
+            }
+            qk = nullptr;
+            if (queryChunk == 1) {
+                break;
+            }
+            queryChunk = std::max(1, queryChunk / 2);
+        }
+        if (qk != nullptr) {
+            auto fastllmCublasHandle = getFastllmCublasHandle();
+            cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
+            for (int i = 0; i < q0; i++) {
+                const half *curK =
+                    kd + (size_t)(i / group) * k.Count(1);
+                const half *curV =
+                    vd + (size_t)(i / group) * v.Count(1);
+                for (int queryStart = 0; queryStart < q1;
+                     queryStart += queryChunk) {
+                    const int queryRows =
+                        std::min(queryChunk, q1 - queryStart);
+                    const half *curQ = qd + (size_t)i * q.Count(1) +
+                        (size_t)queryStart * q.strides[1];
+                    half *curOutput = od + (size_t)i * output.Count(1) +
+                        (size_t)queryStart * output.strides[1];
+
+                    status = cublasHgemm(
+                        fastllmCublasHandle,
+                        CUBLAS_OP_T, CUBLAS_OP_N,
+                        k1, queryRows, q2, &hscale,
+                        curK, k.strides[1],
+                        curQ, q.strides[1],
+                        &beta, qk, k1);
+                    if (status != CUBLAS_STATUS_SUCCESS) {
+                        FastllmCudaSyncCurrentThreadStream();
+                        FastllmCudaFree(qk);
+                        throw std::runtime_error(
+                            "cuBLAS failed during chunked non-causal QK");
+                    }
+
+                    FastllmSoftmaxKernelInner1<256>
+                        <<<queryRows, 256>>>(
+                            qk, qk, queryRows, k1);
+                    status = cublasHgemm(
+                        fastllmCublasHandle,
+                        CUBLAS_OP_N, CUBLAS_OP_N,
+                        v2, queryRows, k1, &one,
+                        curV, v.strides[1],
+                        qk, k1,
+                        &beta, curOutput, output.strides[1]);
+                    if (status != CUBLAS_STATUS_SUCCESS) {
+                        FastllmCudaSyncCurrentThreadStream();
+                        FastllmCudaFree(qk);
+                        throw std::runtime_error(
+                            "cuBLAS failed during chunked non-causal PV");
+                    }
+                }
+            }
+            // qk is pooled and may be reused by another request thread. Make
+            // the cuBLAS/kernels on this PTDS complete before returning it.
+            FastllmCudaSyncCurrentThreadStream();
+            FastllmCudaFree(qk);
+            return true;
+        }
+        throw std::runtime_error(
+            "CUDA non-causal attention could not allocate even one bounded "
+            "score row; refusing the quadratic-memory fallback");
+    }
+
     if (q1 >= 1024 || (q1 > 1 && q1 != k1 && k1 >= 1024)) {
         int alignQ1 = q1, alignK1 = k1;
         int part = alignK1;
@@ -1153,9 +1255,11 @@ FastllmCudaPermute(*((fastllm::Data*)&output), {1, 0, 2});
             alignK1 = ((k1 - 1) / 128 + 1) * 128;
             part = (alignK1 > 8192 ? 8192 : alignK1);
         }
-        half *qk = (half *) FastllmCudaMalloc(alignQ1 * part * sizeof(half));
+        const size_t qkBytes =
+            (size_t)alignQ1 * (size_t)part * sizeof(half);
+        half *qk = (half *)FastllmCudaMalloc(qkBytes);
 
-        cudaMemset(qk, 0, alignQ1 * part * sizeof(half));
+        cudaMemset(qk, 0, qkBytes);
         auto fastllmCublasHandle = getFastllmCublasHandle();
         cublasStatus_t status;
         for (int i = 0; i < q0; i++) {

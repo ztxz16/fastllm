@@ -300,6 +300,9 @@ static void FastllmCudaPrintMallocStack(size_t size, const char *file, int line,
 }
 
 cudaError_t FastllmCudaCheckedMalloc(void **ret, size_t size, const char *file, int line) {
+    if (ret != nullptr) {
+        *ret = nullptr;
+    }
     bool rejected = fastllmCudaMallocDisabled.load(std::memory_order_relaxed);
     int rejectLogIndex = rejected ?
         fastllmCudaMallocRejectLogCount.fetch_add(1, std::memory_order_relaxed) : -1;
@@ -321,7 +324,10 @@ cudaError_t FastllmCudaCheckedMalloc(void **ret, size_t size, const char *file, 
     }
     if (fastllmCudaNcclActive.load(std::memory_order_relaxed)) {
         // 真实 cudaMalloc 前排空在途 NCCL 集合通信，避免与 cudaMalloc 争用 CUDA 驱动锁导致跨 rank 死锁。
-        cudaDeviceSynchronize();
+        cudaError_t syncState = cudaDeviceSynchronize();
+        if (syncState != cudaSuccess) {
+            return syncState;
+        }
     }
     return cudaMalloc(ret, size);
 }
@@ -1614,6 +1620,15 @@ __global__ void FastllmGeluNewKernel(float* a, float *b, int len) {
     if (idx < len) {
         float x = a[idx];
         b[idx] = 0.5f * x * (1.0f + tanhf(0.7978845608028654f * x * (1.0f + 0.044715f * x * x)));
+    }
+}
+
+__global__ void FastllmGeluNewKernel(half* a, half *b, int len) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        float x = __half2float(a[idx]);
+        b[idx] = __float2half(0.5f * x * (1.0f + tanhf(0.7978845608028654f * x *
+                                                    (1.0f + 0.044715f * x * x))));
     }
 }
 
@@ -5684,7 +5699,7 @@ void FastllmCudaMallocBigBuffer(size_t size) {
     bigBuffers.push_back(CudaMemoryBuffer(ret, size, false));
 }
 
-void FastllmCudaClearBigBuffer() {
+static void FastllmCudaClearBigBufferWithRetain(size_t retainBytes) {
     if (fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
         return;
     }
@@ -5704,8 +5719,8 @@ void FastllmCudaClearBigBuffer() {
             state);
         auto &bigBuffers = *view.bigBuffers;
         std::vector <CudaMemoryBuffer> temp;
-        long long littleMemSum = 0;        
-        long long littleMemSumLimit = 300 * 1024 * 1024; // 留一小部分复用  
+        size_t littleMemSum = 0;
+        size_t littleMemSumLimit = retainBytes; // 留一小部分复用
         std::vector <std::pair <std::size_t, int > > v;
         for (int i = 0; i < bigBuffers.size(); i++) {
             if (!bigBuffers[i].busy && bigBuffers[i].graphPins == 0 &&
@@ -5742,6 +5757,14 @@ void FastllmCudaClearBigBuffer() {
         bigBuffers = temp;
     }
     cudaSetDevice(id);
+}
+
+void FastllmCudaClearBigBuffer() {
+    FastllmCudaClearBigBufferWithRetain(300ULL * 1024ULL * 1024ULL);
+}
+
+void FastllmCudaClearBigBufferAll() {
+    FastllmCudaClearBigBufferWithRetain(0);
 }
 
 void FastllmCudaCopyFromHostToDevice(void *dst, void *src, size_t size) {
@@ -5805,6 +5828,17 @@ bool FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
     }
     return cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToDevice,
                            cudaStreamPerThread) == cudaSuccess;
+}
+
+bool FastllmCudaMemcpy2DDeviceToDeviceAsyncCurrentThread(
+        void *dst, size_t dstPitch, const void *src, size_t srcPitch,
+        size_t widthBytes, size_t height) {
+    if (widthBytes == 0 || height == 0 || dst == src) {
+        return true;
+    }
+    return cudaMemcpy2DAsync(
+        dst, dstPitch, src, srcPitch, widthBytes, height,
+        cudaMemcpyDeviceToDevice, cudaStreamPerThread) == cudaSuccess;
 }
 
 namespace {
@@ -6284,7 +6318,13 @@ bool FastllmCudaGeluNew(const fastllm::Data &input, fastllm::Data &output) {
     float *cudaInput = (float *) FastllmCudaPrepareInput(input);
     float *cudaOutput = (float *) FastllmCudaPrepareOutput(output);
     int threadPerBlock = std::min(256, len);
-    FastllmGeluNewKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, len);
+    if (input.dataType == fastllm::DataType::FLOAT16) {
+        FastllmGeluNewKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(
+            (half*)cudaInput, (half*)cudaOutput, len);
+    } else if (input.dataType == fastllm::DataType::FLOAT32) {
+        FastllmGeluNewKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(
+            cudaInput, cudaOutput, len);
+    }
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
     return true;

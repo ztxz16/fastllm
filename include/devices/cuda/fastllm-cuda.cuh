@@ -237,6 +237,7 @@ bool FastllmCudaGetGraphError();
 int FastllmCudaTryMallocBigBuffers(size_t size, int count);
 void FastllmCudaMallocBigBuffer(size_t size);
 void FastllmCudaClearBigBuffer();
+void FastllmCudaClearBigBufferAll();
 #ifdef __CUDACC__
 cudaError_t FastllmCudaCheckedMalloc(void **ret, size_t size, const char *file, int line);
 #endif
@@ -361,6 +362,9 @@ bool FastllmCudaCopyFromPinnedHostToDeviceAsyncCurrentThread(
 void FastllmCudaCopyFromDeviceToDevice(void *dst, void *src, size_t size);
 bool FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
     void *dst, const void *src, size_t size);
+bool FastllmCudaMemcpy2DDeviceToDeviceAsyncCurrentThread(
+    void *dst, size_t dstPitch, const void *src, size_t srcPitch,
+    size_t widthBytes, size_t height);
 bool FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
     void *const *dsts, const void *const *srcs, const size_t *sizes, int count);
 

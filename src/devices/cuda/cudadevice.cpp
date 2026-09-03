@@ -7280,7 +7280,9 @@ namespace fastllm {
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
         output.Allocate();
-        AssertInFastLLM(input.dataType == DataType::FLOAT32, "GeluNew error: Data's type should be float32.\n");
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
+                        input.dataType == DataType::FLOAT16,
+                        "GeluNew error: Data's type should be float32 or float16.\n");
         FastllmCudaGeluNew(input, output);
     }
 

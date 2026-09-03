@@ -1145,12 +1145,14 @@ namespace fastllm {
     struct MultiThreadSingleAttentionOp : MultiThreadBaseOp {
         float *qd, *kd, *vd, *maskd, *od;
         float scale;
-        int q1, q2, k1, v2;
+        int q1, q2, k1, v2, maskType;
 
         MultiThreadSingleAttentionOp(float *qd, float *kd, float *vd, float *maskd, float *od,
-                         float scale, int q1, int q2, int k1, int v2) :
+                         float scale, int q1, int q2, int k1, int v2,
+                         int maskType) :
                          qd(qd), kd(kd), vd(vd), maskd(maskd), od(od), 
-                         scale(scale), q1(q1), q2(q2), k1(k1), v2(v2) {}
+                         scale(scale), q1(q1), q2(q2), k1(k1), v2(v2),
+                         maskType(maskType) {}
         
         void Run() {
             float *qk = new float[k1];
@@ -1163,7 +1165,7 @@ namespace fastllm {
                         qk[j] = -10000;
                         continue;
                     }
-                    if (!maskd && (base + i) < j) {
+                    if (!maskd && maskType == 0 && (base + i) < j) {
                         qk[j] = -10000;
                         continue;
                     }
@@ -1225,12 +1227,14 @@ namespace fastllm {
     struct MultiThreadSingleAttentionFloat16Op : MultiThreadBaseOp {
         uint16_t *qd, *kd, *vd, *maskd, *od;
         float scale;
-        int q1, q2, k1, v2;
+        int q1, q2, k1, v2, maskType;
 
         MultiThreadSingleAttentionFloat16Op(uint16_t *qd, uint16_t *kd, uint16_t *vd, uint16_t *maskd, uint16_t *od,
-                         float scale, int q1, int q2, int k1, int v2) :
+                         float scale, int q1, int q2, int k1, int v2,
+                         int maskType) :
                          qd(qd), kd(kd), vd(vd), maskd(maskd), od(od), 
-                         scale(scale), q1(q1), q2(q2), k1(k1), v2(v2) {}
+                         scale(scale), q1(q1), q2(q2), k1(k1), v2(v2),
+                         maskType(maskType) {}
         
         void Run() {
             std::vector <float> fqd, fkd, fvd, fmaskd, fod;
@@ -1249,7 +1253,7 @@ namespace fastllm {
             }
 
             MultiThreadSingleAttentionOp(fqd.data(), fkd.data(), fvd.data(), maskd ? fmaskd.data() : nullptr, fod.data(), 
-                            scale, q1, q2, k1, v2).Run();
+                            scale, q1, q2, k1, v2, maskType).Run();
 
             Float32ToFloat16(fod.data(), od, (int)fod.size());
         }
@@ -1264,6 +1268,8 @@ namespace fastllm {
         Data &output = *(datas.find("output")->second);
         int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : q.dims[0] / k.dims[0];
         float scale = floatParams.find("scale") != floatParams.end() ? floatParams.find("scale")->second : 1.0;
+        int maskType = intParams.find("maskType") != intParams.end() ?
+            intParams.find("maskType")->second : 0;
         output.Allocate(false);
         int q0 = q.dims[0], q1 = q.dims[1], q2 = q.dims[2], k0 = k.dims[0], k1 = k.dims[1], v2 = v.dims[2];
 
@@ -1283,8 +1289,9 @@ namespace fastllm {
             std::vector<fastllm::MultiThreadSingleAttentionOp*> ops;
             for (int o = 0; o < q0; o++) {
                 ops.push_back(new MultiThreadSingleAttentionOp(qd + o * q.strides[0], kd + (o / group) * k.strides[0], vd + (o / group) * v.strides[0],
-                                maskd + (o / (q0 / batch)) * maskStride, od + o * output.strides[0], scale,
-                                q1, q2, k1, v2));
+                                maskd != nullptr ? maskd + (o / (q0 / batch)) * maskStride : nullptr,
+                                od + o * output.strides[0], scale,
+                                q1, q2, k1, v2, maskType));
             }
             for (int st = 0; st < ops.size(); st += threads) {
                 for (int i = st; i < ops.size() && i < st + threads; i++) {
@@ -1310,8 +1317,9 @@ namespace fastllm {
             std::vector<fastllm::MultiThreadSingleAttentionFloat16Op*> ops;
             for (int o = 0; o < q0; o++) {
                 ops.push_back(new MultiThreadSingleAttentionFloat16Op(qd + o * q.strides[0], kd + (o / group) * k.strides[0], vd + (o / group) * v.strides[0],
-                                maskd + (o / (q0 / batch)) * maskStride, od + o * output.strides[0], scale,
-                                q1, q2, k1, v2));
+                                maskd != nullptr ? maskd + (o / (q0 / batch)) * maskStride : nullptr,
+                                od + o * output.strides[0], scale,
+                                q1, q2, k1, v2, maskType));
             }
             for (int st = 0; st < ops.size(); st += threads) {
                 for (int i = st; i < ops.size() && i < st + threads; i++) {
