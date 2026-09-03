@@ -25,6 +25,9 @@ class FastLLmModel:
         else:
             reasoning_efforts = []
             default_reasoning_effort = None
+        input_modalities = (
+            ["text", "image"]
+            if getattr(model, "mmproj_path", "") else ["text"])
 
         context_window_candidates = [
             value for value in (current_model_context_window, kv_cache_token_limit)
@@ -57,8 +60,8 @@ class FastLLmModel:
                 "supported_in_api": True,
                 "available_in_plans": [],
                 "priority": 0,
-                "input_modalities": ["text"],
-                "inputModalities": ["text"],
+                "input_modalities": input_modalities,
+                "inputModalities": input_modalities,
                 "supports_personality": False,
                 "supportsPersonality": False,
                 "additional_speed_tiers": [],

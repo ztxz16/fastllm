@@ -24377,6 +24377,44 @@ namespace fastllm {
             initialized_add1 = true;
         }
 
+        const std::string patchPart0 =
+            visual_prefix + "patch_embed.proj.weight.gguf_part0";
+        const std::string patchPart1 =
+            visual_prefix + "patch_embed.proj.weight.gguf_part1";
+        auto patch0It = this->weight.weight.find(patchPart0);
+        auto patch1It = this->weight.weight.find(patchPart1);
+        if (patch0It != this->weight.weight.end() ||
+            patch1It != this->weight.weight.end()) {
+            AssertInFastLLM(
+                patch0It != this->weight.weight.end() &&
+                    patch1It != this->weight.weight.end() &&
+                    patch0It->second.dataType == patch1It->second.dataType &&
+                    patch0It->second.dims == patch1It->second.dims &&
+                    patch0It->second.dims.size() == 4,
+                "Qwen3.5 mmproj patch embedding slices are incomplete or incompatible.");
+            const int outputChannels = patch0It->second.dims[0];
+            const int inputChannels = patch0It->second.dims[1];
+            const int patchHeight = patch0It->second.dims[2];
+            const int patchWidth = patch0It->second.dims[3];
+            patch0It->second.Reshape(
+                {outputChannels, inputChannels, 1, patchHeight, patchWidth});
+            patch1It->second.Reshape(
+                {outputChannels, inputChannels, 1, patchHeight, patchWidth});
+            const std::string patchWeightName =
+                visual_prefix + "patch_embed.proj.weight";
+            Data &patchWeight = this->weight.weight[patchWeightName];
+            // GGUF stores the two temporal Conv3D slices separately. Rebuild
+            // [out, channel, time, height, width], then flatten it in the same
+            // channel-major order used by BuildQwen35VisionPatches.
+            Cat(patch0It->second, patch1It->second, 2, patchWeight);
+            patchWeight.Reshape({outputChannels, -1});
+            patchWeight.name = patchWeightName;
+            patchWeight.isModelWeight = true;
+            this->weight.weight.erase(patchPart0);
+            this->weight.weight.erase(patchPart1);
+            this->MoveSpecialWeightToCudaIfNeeded(patchWeightName, patchWeight);
+        }
+
         if (!loadFusedMoePlanned || moeFusedWeightsPrepared) {
             return;
         }

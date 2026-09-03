@@ -345,6 +345,11 @@ if hasattr(fastllm_lib, "create_llm_model_from_gguf_with_mtp"):
         ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
     fastllm_lib.create_llm_model_from_gguf_with_mtp.restype = ctypes.c_int
 
+if hasattr(fastllm_lib, "create_llm_model_from_gguf_with_mmproj"):
+    fastllm_lib.create_llm_model_from_gguf_with_mmproj.argtypes = [
+        ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
+    fastllm_lib.create_llm_model_from_gguf_with_mmproj.restype = ctypes.c_int
+
 fastllm_lib.create_llm_tokenizer_fromhf.argtypes = [ctypes.c_char_p]
 fastllm_lib.create_llm_tokenizer_fromhf.restype = ctypes.c_int
 
@@ -1121,7 +1126,8 @@ class model:
                   ori_model_path: str = "", 
                   chat_template: str = "",
                   tool_call_parser: str = "auto",
-                  external_mtp_path: str = ""):
+                  external_mtp_path: str = "",
+                  mmproj_path: str = ""):
         if (graph != None):
             current_graph = graph()
             if (os.path.isdir(path) and os.path.isfile(os.path.join(path, "config.json"))):
@@ -1178,6 +1184,7 @@ class model:
         # 确定配置根目录（用于加载 generation_config.json）
         config_base_path = None
         self.model_path = path
+        self.mmproj_path = ""
 
         if id != -99999:
             # 使用已存在的 model id，无法自动关联配置文件，保持默认配置
@@ -1206,6 +1213,9 @@ class model:
                         self.hf_tokenizer = try_load_gguf_tokenizer(path)
                     finally:
                         report_model_load_progress("tokenizer", 1, 1)
+                if external_mtp_path and mmproj_path:
+                    raise ValueError(
+                        "external MTP and mmproj cannot be used together")
                 if external_mtp_path:
                     if not hasattr(fastllm_lib, "create_llm_model_from_gguf_with_mtp"):
                         raise RuntimeError(
@@ -1214,6 +1224,17 @@ class model:
                     self.model = fastllm_lib.create_llm_model_from_gguf_with_mtp(
                         path.encode(), ori_model_path.encode(),
                         external_mtp_path.encode())
+                elif mmproj_path:
+                    if not hasattr(
+                            fastllm_lib,
+                            "create_llm_model_from_gguf_with_mmproj"):
+                        raise RuntimeError(
+                            "the loaded FastLLM library does not support "
+                            "mmproj for GGUF")
+                    self.model = fastllm_lib.create_llm_model_from_gguf_with_mmproj(
+                        path.encode(), ori_model_path.encode(),
+                        mmproj_path.encode())
+                    self.mmproj_path = mmproj_path
                 else:
                     self.model = fastllm_lib.create_llm_model_from_gguf(
                         path.encode(), ori_model_path.encode())
@@ -1222,6 +1243,11 @@ class model:
                     config_base_path = ori_model_path
                 else:
                     config_base_path = os.path.dirname(path)
+                adjacent_config_path = os.path.join(
+                    config_base_path, "config.json")
+                if mmproj_path and os.path.isfile(adjacent_config_path):
+                    with open(adjacent_config_path, "r", encoding="utf-8") as f:
+                        self.config = json.load(f)
             elif os.path.isfile(path):
                 # 其他格式的单文件模型（如 safetensors）
                 self.model = fastllm_lib.create_llm_model(path.encode())

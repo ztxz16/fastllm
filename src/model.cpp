@@ -3515,7 +3515,8 @@ namespace fastllm {
 
     std::unique_ptr<basellm> CreateLLMModelFromGGUFFile(
             const std::string &fileName, const std::string &originalPath,
-            const std::string &externalMtpPath) {
+            const std::string &externalMtpPath,
+            const std::string &mmprojPath) {
         std::vector <ReadGGUFTask> readGGUFTasks;
         std::map <std::string, ReadGGUFTask*> readGGUFTaskDict;
         std::unique_ptr<SafeTensors> dflashSafeTensors;
@@ -3606,6 +3607,24 @@ namespace fastllm {
             printf("general.architecture = %s\n", arch.c_str());
             printf("general.name = %s\n", params["general.name"].string_value().c_str());
             model = CreateLLMModelFromGGUFMetadata(params, arch);
+            if (!mmprojPath.empty() && model->model_struct == "qwen3_5") {
+                const size_t slash = fileName.find_last_of("/\\");
+                const std::string ggufDir =
+                    slash == std::string::npos ? "." : fileName.substr(0, slash);
+                const std::string adjacentConfig = ggufDir + "/config.json";
+                if (FileExists(adjacentConfig)) {
+                    std::string adjacentConfigError;
+                    auto adjacentConfigJson = json11::Json::parse(
+                        ReadAllFile(adjacentConfig), adjacentConfigError);
+                    AssertInFastLLM(
+                        adjacentConfigError.empty(),
+                        "Failed to parse adjacent config " + adjacentConfig +
+                            ": " + adjacentConfigError);
+                    AddDictRecursion(model, "", adjacentConfigJson);
+                    printf("Use adjacent model config: %s\n",
+                           adjacentConfig.c_str());
+                }
+            }
             printf("Load block_cnt = %d\n", model->block_cnt);
             printf("Load num_attention_heads = %d\n",
                    model->num_attention_heads);
@@ -3734,6 +3753,21 @@ namespace fastllm {
         ReportModelLoadProgress("weights_prepare", 0, 1);
         for (auto &s : ggufFileNames) {
             AppendGGUFTasks(arch, s, readGGUFTasks);
+        }
+        if (!mmprojPath.empty()) {
+            AssertInFastLLM(
+                model->model_struct == "qwen3_5",
+                "--mmproj currently supports Qwen3.5-family GGUF models only.");
+            std::vector<std::string> mmprojFileNames =
+                GenerateGGUFFileList(mmprojPath);
+            AssertInFastLLM(
+                !mmprojFileNames.empty(),
+                "No mmproj GGUF file found: " + mmprojPath);
+            printf("Load multimodal projector from files:\n");
+            for (auto &s : mmprojFileNames) {
+                printf("%s\n", s.c_str());
+                AppendGGUFTasks("qwen3_5_mmproj", s, readGGUFTasks);
+            }
         }
         uint64_t totalLoadBytes = 0;
         for (int i = 0; i < readGGUFTasks.size(); i++) {

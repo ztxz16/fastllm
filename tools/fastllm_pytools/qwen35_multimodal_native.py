@@ -16,7 +16,10 @@ def get_qwen35_multimodal_config(
     model_dir: str,
     model_config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    image_processor_config = _load_json(os.path.join(model_dir, "preprocessor_config.json"))
+    image_processor_path = os.path.join(model_dir, "preprocessor_config.json")
+    image_processor_config = (
+        _load_json(image_processor_path)
+        if os.path.exists(image_processor_path) else {})
     video_processor_path = os.path.join(model_dir, "video_preprocessor_config.json")
     video_processor_config = _load_json(video_processor_path) if os.path.exists(video_processor_path) else {}
     vision_config = (model_config or {}).get("vision_config", {})

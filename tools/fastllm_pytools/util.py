@@ -735,6 +735,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--cache_dir', type = str, default = "", help = '指定缓存模型文件的路径')
     parser.add_argument('--dtype_config', type = str, default = "", help = '指定权重类型配置文件')
     parser.add_argument('--ori', type = str, default = "", help = '原始模型权重，读取GGUF文件时可以使用')
+    parser.add_argument('--mmproj', type = str, default = "", help = '多模态投影GGUF文件（仅在读取GGUF主模型时有效）')
 
     parser.add_argument('--tool_call_parser', type = str, default = "auto", help = '使用的tool_call_parser类型')
     parser.add_argument('--chat_template', type = str, default = "", help = '使用的chat_template文件')
@@ -1441,7 +1442,8 @@ def make_normal_llm_model(args, startup_progress = None):
                             chat_template = args.chat_template,
                             tool_call_parser = args.tool_call_parser,
                             external_mtp_path = (speculative_draft_path
-                                if speculative_algorithm == "mtp" else ""))
+                                if speculative_algorithm == "mtp" else ""),
+                            mmproj_path = args.mmproj)
         llm.report_model_load_progress("weights_finalize", 0, 1)
         if (args.enable_thinking.lower() in ["", "false", "0", "off"]):
             model.enable_thinking = False

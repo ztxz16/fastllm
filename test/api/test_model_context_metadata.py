@@ -12,7 +12,7 @@ if TOOLS_DIR not in sys.path:
 
 from fastllm_pytools.openai_server.fastllm_model import FastLLmModel
 from fastllm_pytools.tui import DeployConfig, build_fastllm_argv
-from fastllm_pytools.util import add_server_args
+from fastllm_pytools.util import add_server_args, make_normal_parser
 
 
 class _FakeModel:
@@ -138,8 +138,24 @@ class FastLLmModelContextMetadataTest(unittest.TestCase):
         self.assertEqual(model["default_reasoning_effort"], "xhigh")
         self.assertEqual(model["defaultReasoningEffort"], "xhigh")
 
+    def test_mmproj_model_advertises_image_input(self):
+        native_model = _FakeModel(262144, 262144, model_type = "qwen3_5")
+        native_model.mmproj_path = "/models/mmproj.gguf"
+
+        model = FastLLmModel("qwen3.5", native_model).response["data"][0]
+
+        self.assertEqual(model["input_modalities"], ["text", "image"])
+        self.assertEqual(model["inputModalities"], ["text", "image"])
+
 
 class ServerContextArgumentTest(unittest.TestCase):
+    def test_mmproj_argument_is_parsed(self):
+        args = make_normal_parser("test").parse_args([
+            "--mmproj", "/models/mmproj.gguf",
+        ])
+
+        self.assertEqual(args.mmproj, "/models/mmproj.gguf")
+
     def test_hyphenated_alias_is_parsed(self):
         parser = argparse.ArgumentParser()
         add_server_args(parser)
