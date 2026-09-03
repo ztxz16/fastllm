@@ -418,11 +418,14 @@ class OpenAIModelClientTests(unittest.TestCase):
             "--api-base", "http://127.0.0.1:8018/v1",
             "--code-max-context-chars", "32000",
             "--agent-runtime", "builtin",
+            "--agent-workspace-root", "/srv/projects",
         ])
         self.assertEqual(args.model, "/models/demo")
         self.assertEqual(args.api_base, "http://127.0.0.1:8018/v1")
         self.assertEqual(args.code_max_context_chars, 32000)
         self.assertEqual(args.agent_runtime, "builtin")
+        self.assertEqual(args.agent_workspace_root, "/srv/projects")
+        self.assertFalse(args.allow_remote_workspace_agent)
         self.assertEqual(
             parser.parse_args(["/models/demo"]).agent_runtime, "pi")
         self.assertEqual(parser.parse_args([
@@ -545,7 +548,21 @@ class WebUIServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('id="agentButton"', page.text)
             self.assertIn('id="webButton"', page.text)
             self.assertIn('id="stopButton"', page.text)
+            tool_right_start = page.text.index('<div class="tool-right">')
+            tool_right_end = page.text.index("</div>", tool_right_start)
+            action_positions = [
+                page.text.index(f'id="{button_id}"', tool_right_start)
+                for button_id in ("attachButton", "agentButton", "sendButton")
+            ]
+            self.assertEqual(action_positions, sorted(action_positions))
+            self.assertLess(action_positions[-1], tool_right_end)
             self.assertIn('id="newChat"', page.text)
+            self.assertIn('id="newAgent"', page.text)
+            self.assertIn('id="workspaceDialog"', page.text)
+            self.assertLess(
+                page.text.index('id="newChat"'),
+                page.text.index('id="newAgent"'),
+            )
             self.assertNotIn("state.generating", page.text)
             self.assertIn('id="languageButton"', page.text)
             self.assertIn('<span id="languageLabel">简体中文</span>', page.text)
@@ -554,6 +571,11 @@ class WebUIServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('id="deleteConversationAction"', page.text)
             self.assertIn('[hidden] { display: none !important; }', page.text)
             self.assertNotIn('.status-line::before', page.text)
+            self.assertIn('.tool-trace', page.text)
+            self.assertIn('function renderToolTrace(', page.text)
+            self.assertIn('["tool_start","tool_update","tool_end"]', page.text)
+            self.assertIn(
+                '$("#attachButton").disabled = running;', page.text)
             self.assertNotIn('id="dataButton"', page.text)
             self.assertNotIn('id="pptButton"', page.text)
             self.assertNotIn('id="openSettings"', page.text)
@@ -571,10 +593,18 @@ class WebUIServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('"zh-CN"', locales.text)
             self.assertIn('"en-US"', locales.text)
             self.assertIn('"locale.short": "简体中文"', locales.text)
+            self.assertIn('"nav.new_agent": "新建Agent"', locales.text)
+            self.assertIn('"tool.trace_done": "执行详情 · {count} 步"', locales.text)
+            self.assertIn(
+                '"status.prepare_workspace_files": "正在准备 {count} 个只读附件…"',
+                locales.text,
+            )
             self.assertEqual(
                 (await client.get("/health")).json(), {"status": "ok"})
             config = (await client.get("/api/config")).json()
             self.assertEqual(config["max_token"], -1)
+            self.assertTrue(config["agent_workspace_root"])
+            self.assertTrue(config["workspace_agent_enabled"])
             self.assertIn(".py", config["code_extensions"])
             self.assertIn("makefile", config["code_filenames"])
             self.assertEqual(
@@ -752,6 +782,227 @@ class WebUIServerTests(unittest.IsolatedAsyncioTestCase):
                 )
                 finished = (await client.get("/api/conversations")).json()
                 self.assertFalse(any(item["generating"] for item in finished))
+
+    async def test_workspace_agent_browses_scoped_directories_and_uses_pi(self):
+        import httpx
+
+        class FakeAPIClient:
+            model_name = "demo"
+            base_url = "http://test-api/v1"
+            api_key = ""
+
+            def complete(self, messages, **kwargs):
+                self.image_messages = messages
+                self.image_kwargs = kwargs
+                return "图片主色为红色。", ""
+
+        class FakePiAgent:
+            def info(self):
+                return {"available": True, "pi_version": "test"}
+
+            def stream(
+                self, prompt, files, system_prompt, thinking_level,
+                working_directory, cancel_event=None,
+            ):
+                self.prompt = prompt
+                self.files = files
+                self.system_prompt = system_prompt
+                self.thinking_level = thinking_level
+                self.working_directory = working_directory
+                self.cancel_event = cancel_event
+                if "触发失败" in prompt:
+                    yield {
+                        "type": "tool_start",
+                        "id": "call-before-error",
+                        "name": "read",
+                        "arguments": {"path": "missing.txt"},
+                    }
+                    raise RuntimeError("simulated Pi failure")
+                yield {
+                    "type": "tool_start",
+                    "id": "call-workspace-test",
+                    "name": "bash",
+                    "arguments": {"command": "python -m pytest"},
+                }
+                yield {
+                    "type": "tool_update",
+                    "id": "call-workspace-test",
+                    "name": "bash",
+                    "result": "tests running",
+                }
+                yield {
+                    "type": "tool_end",
+                    "id": "call-workspace-test",
+                    "name": "bash",
+                    "result": "37 passed",
+                    "is_error": False,
+                }
+                yield {"type": "text_delta", "text": "修改并验证完成。"}
+                yield {"type": "done", "turns": 2}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            container = Path(temp_dir)
+            workspace_root = container / "projects"
+            project = workspace_root / "demo"
+            nested = project / "src"
+            outside = container / "outside"
+            nested.mkdir(parents=True)
+            outside.mkdir()
+            try:
+                (workspace_root / "escape").symlink_to(outside, target_is_directory=True)
+            except OSError:
+                pass
+            args = SimpleNamespace(
+                model="/models/demo", path="", title="FastLLM Test",
+                history_dir=str(container / "history"), max_upload_mb=1,
+                agent_workspace_root=str(workspace_root),
+                agent_runtime="builtin", web_search_timeout=1.0,
+                max_token=-1,
+            )
+            app = create_app(args)
+            fake_pi = FakePiAgent()
+            fake_api = FakeAPIClient()
+            app.state.runtime.api_client = fake_api
+            app.state.runtime.agent_runtime = "pi"
+            app.state.runtime.pi_agent_class = FakePiAgent
+            app.state.runtime.pi_agent = fake_pi
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://testserver",
+            ) as client:
+                listing = (await client.get("/api/agent/directories")).json()
+                self.assertEqual(listing["path"], str(workspace_root))
+                self.assertEqual(
+                    [item["name"] for item in listing["directories"]],
+                    ["demo"],
+                )
+                child_listing = (await client.get(
+                    "/api/agent/directories", params={"path": str(project)},
+                )).json()
+                self.assertEqual(child_listing["parent"], str(workspace_root))
+                self.assertEqual(child_listing["directories"][0]["name"], "src")
+                escaped = await client.get(
+                    "/api/agent/directories", params={"path": str(outside)},
+                )
+                self.assertEqual(escaped.status_code, 400)
+
+                record = (await client.post(
+                    "/api/conversations",
+                    json={"settings": {
+                        "agent_mode": "workspace",
+                        "agent_workspace": str(project),
+                        "thinking_level": "关闭",
+                    }},
+                )).json()
+                self.assertEqual(record["title"], "Agent · demo")
+                self.assertEqual(
+                    record["settings"]["agent_workspace"], str(project))
+                rejected = await client.patch(
+                    f"/api/conversations/{record['id']}",
+                    json={"settings": {
+                        "agent_mode": "workspace",
+                        "agent_workspace": str(outside),
+                    }},
+                )
+                self.assertEqual(rejected.status_code, 400)
+
+                response = await client.post(
+                    f"/api/conversations/{record['id']}/chat",
+                    json={"prompt": "运行测试并修复失败项"},
+                )
+                events = [
+                    json.loads(line) for line in response.text.splitlines()]
+                tool_events = [event for event in events
+                               if event["type"].startswith("tool_")]
+                self.assertEqual(
+                    [event["type"] for event in tool_events],
+                    ["tool_start", "tool_update", "tool_end"],
+                )
+                self.assertEqual(
+                    tool_events[0]["tool_call"]["arguments"]["command"],
+                    "python -m pytest",
+                )
+                self.assertEqual(
+                    tool_events[-1]["tool_call"]["result"], "37 passed")
+                self.assertEqual(
+                    tool_events[-1]["tool_call"]["status"], "done")
+                self.assertEqual(events[-1]["message"]["content"], "修改并验证完成。")
+                self.assertEqual(events[-1]["message"]["agent_runtime"], "pi")
+                self.assertEqual(events[-1]["message"]["tool_calls"][0]["name"], "bash")
+                self.assertEqual(
+                    events[-1]["message"]["tool_calls"][0]["result"],
+                    "37 passed",
+                )
+                self.assertEqual(fake_pi.working_directory, str(project))
+                self.assertEqual(fake_pi.files, [])
+                self.assertIn("read、grep、find", fake_pi.system_prompt)
+
+                code_attachment = (await client.post(
+                    f"/api/conversations/{record['id']}/attachments",
+                    content=b"def attached_answer():\n    return 42\n",
+                    headers={
+                        "Content-Type": "text/x-python",
+                        "X-Filename": "attached.py",
+                    },
+                )).json()
+                brief_attachment = (await client.post(
+                    f"/api/conversations/{record['id']}/attachments",
+                    content="需求代号：晨星。必须保留兼容接口。".encode(),
+                    headers={
+                        "Content-Type": "text/markdown",
+                        "X-Filename": "brief.md",
+                    },
+                )).json()
+                image_attachment = (await client.post(
+                    f"/api/conversations/{record['id']}/attachments",
+                    content=b"small-image-fixture",
+                    headers={
+                        "Content-Type": "image/png",
+                        "X-Filename": "reference.png",
+                    },
+                )).json()
+                attached_response = await client.post(
+                    f"/api/conversations/{record['id']}/chat",
+                    json={
+                        "prompt": "按附件实现晨星需求",
+                        "attachments": [
+                            {"token": item["token"], "name": item["name"]}
+                            for item in (
+                                code_attachment,
+                                brief_attachment,
+                                image_attachment,
+                            )
+                        ],
+                    },
+                )
+                attached_events = [json.loads(line) for line
+                                   in attached_response.text.splitlines()]
+                attached_message = attached_events[-1]["message"]
+                self.assertEqual(fake_pi.files[0]["name"], "attached.py")
+                self.assertIn("return 42", fake_pi.files[0]["text"])
+                self.assertIn("晨星", fake_pi.system_prompt)
+                self.assertIn("只读源码附件", fake_pi.system_prompt)
+                self.assertIn("图片主色为红色", fake_pi.system_prompt)
+                image_part = fake_api.image_messages[-1]["content"][0]
+                self.assertTrue(
+                    image_part["image_url"]["url"].startswith(
+                        "data:image/png;base64,"))
+                self.assertEqual(
+                    {source["kind"] for source in attached_message["sources"]},
+                    {"code", "document"},
+                )
+
+                failed_response = await client.post(
+                    f"/api/conversations/{record['id']}/chat",
+                    json={"prompt": "触发失败", "attachments": []},
+                )
+                failed_events = [json.loads(line) for line
+                                 in failed_response.text.splitlines()]
+                failed_message = failed_events[-1]["message"]
+                self.assertTrue(failed_message["error"])
+                self.assertEqual(failed_message["agent_runtime"], "pi")
+                self.assertEqual(
+                    failed_message["tool_calls"][0]["status"], "error")
 
     async def test_code_agent_cross_file_stream_and_patch_download(self):
         import httpx
