@@ -1,7 +1,11 @@
 import argparse
-from .util import make_normal_parser
-import readline
 import os
+import shlex
+import subprocess
+import sys
+
+from .util import make_normal_parser
+
 
 def save_defaults_to_json(parser, filename):
     # 获取所有参数的默认值
@@ -17,7 +21,7 @@ def save_defaults_to_json(parser, filename):
         # 跳过位置参数（没有option_strings的）
         if not action.option_strings:
             continue
-            
+
         # 获取参数名（选择最长的选项名，去掉前面的--或-）
         name = max(action.option_strings, key=len).lstrip('-')
         if (name == 'low' or name == 'path'):
@@ -36,7 +40,7 @@ def save_defaults_to_json(parser, filename):
     import json
     with open(filename, 'w', encoding='utf-8') as f:
         json.dump(defaults, f, indent = 4, ensure_ascii = False)
-    
+
     print("Create config to -> \"" + filename + "\"")
 
 def args_parser():
@@ -47,7 +51,7 @@ def args_parser():
     shared_parser = make_normal_parser("fastllm", add_help = False)
 
     # 下载解析器
-    from ftllm.download import make_download_parser
+    from .download import make_download_parser
     download_parser = make_download_parser(add_help = False)
 
     # 打开终端部署向导
@@ -55,19 +59,19 @@ def args_parser():
     tui_parser_.add_argument('--plain', action = 'store_true', help = '使用普通问答模式，不启用curses界面')
 
     # 创建chat子命令（使用共享解析器）
-    chat_parser_ = subparsers.add_parser('chat', parents = [shared_parser], help = '聊天模式')
+    subparsers.add_parser('chat', parents = [shared_parser], help = '聊天模式')
 
     # 创建run子命令（使用相同的共享解析器）
-    run_parser_ = subparsers.add_parser('run', parents = [shared_parser], help = '运行模式')
+    subparsers.add_parser('run', parents = [shared_parser], help = '运行模式')
 
     # 创建benchmark子命令（使用相同的共享解析器）
-    from ftllm.benchmark import add_benchmark_args
+    from .benchmark import add_benchmark_args
     benchmark_parser_ = subparsers.add_parser('benchmark', aliases = ['bench'],
                                               parents = [shared_parser],
                                               help = '性能测试模式')
     add_benchmark_args(benchmark_parser_)
 
-    download_parser_ = subparsers.add_parser('download', parents = [download_parser], help = '下载模型')
+    subparsers.add_parser('download', parents = [download_parser], help = '下载模型')
 
     # 创建webui子命令（独立的解析器）
     webui_parser_ = subparsers.add_parser('webui', parents = [shared_parser], help='Web UI')
@@ -75,11 +79,10 @@ def args_parser():
     webui_parser_.add_argument("--max_token", type = int, default = 4096, help = "输出最大token数")
     webui_parser_.add_argument("--think", type = str, default = "false", help = "if <think> lost")
 
-    server_parser = shared_parser
-    from ftllm.util import add_server_args
-    add_server_args(server_parser)
-    server_parser_ = subparsers.add_parser('serve', parents = [server_parser], help = 'api模式')
-    serve_parser_ = subparsers.add_parser('server', parents = [server_parser], help = 'api模式')
+    from .util import add_server_args
+    add_server_args(shared_parser)
+    subparsers.add_parser('serve', parents = [shared_parser], help = 'api模式')
+    subparsers.add_parser('server', parents = [shared_parser], help = 'api模式')
 
     config_parser_ = subparsers.add_parser('config', help = '创建配置文件')
     config_parser_.add_argument('file', nargs='?', help = '配置文件的路径')
@@ -91,8 +94,32 @@ def args_parser():
 
     return parser
 
-def main():
-    args = args_parser().parse_args()
+
+def _run_webui(args, forwarded_args):
+    current_path = os.path.dirname(os.path.abspath(__file__))
+    web_demo_path = os.path.join(current_path, 'web_demo.py')
+    cmd = [
+        "streamlit", "run",
+        "--server.port", str(args.port),
+        "--browser.gatherUsageStats", "false",
+        web_demo_path,
+        "--",
+        *forwarded_args,
+    ]
+    print(f"Running: {shlex.join(cmd)}")
+    try:
+        return subprocess.call(cmd)
+    except FileNotFoundError:
+        print(
+            "streamlit command not found; install ftllm[webui].",
+            file=sys.stderr,
+        )
+        return 1
+
+
+def main(argv=None):
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = args_parser().parse_args(raw_argv)
     if (args.version):
         from . import __version__
         print("ftllm version: " + __version__)
@@ -116,46 +143,23 @@ def main():
                 return
         save_defaults_to_json(make_normal_parser("fastllm", add_help = False), file)
     elif args.command in ('chat', 'run'):
-        from ftllm.chat import fastllm_chat
+        from .chat import fastllm_chat
         fastllm_chat(args)
     elif args.command in ('benchmark', 'bench'):
-        from ftllm.benchmark import fastllm_benchmark
+        from .benchmark import fastllm_benchmark
         fastllm_benchmark(args)
     elif args.command == "download":
-        from ftllm.download import HFDDownloader
+        from .download import HFDDownloader
         HFDDownloader(args).run()
     elif args.command == 'webui':
-        current_path = os.path.dirname(os.path.abspath(__file__))
-        web_demo_path = os.path.join(current_path, 'web_demo.py')
-        
-        args_dict = vars(args)
-        args_dict.pop('command', None)
-        port = args_dict.pop('port', 1616)
-        model = args_dict.pop('model', '')
-        # Convert remaining arguments to command line format
-        args_list = []
-        if (model != ''):
-            args_list.append(model)
-        for key, value in args_dict.items():
-            if value is not None:
-                if isinstance(value, bool) and key not in ["think"]:
-                    if value:
-                        args_list.append(f"--{key}")
-                elif key in ["moe_device"] and value != '':
-                    args_list.append(f"--{key} \"{value}\"")
-                elif value != '':
-                    args_list.append(f"--{key} {value}")
-        
-        # Build the command
-        cmd = f"streamlit run --server.port {port} {web_demo_path} --browser.gatherUsageStats false -- {' '.join(args_list)}"
-        print(f"Running: {cmd}")
-        os.system(cmd)
-        return
+        # Pass only the options the caller supplied. Parser defaults such as
+        # -1 must not become explicit web_demo.py arguments.
+        return _run_webui(args, raw_argv[1:])
     elif args.command in ('server', 'serve'):
-        from ftllm.server import fastllm_server
+        from .server import fastllm_server
         fastllm_server(args)
     elif args.command == 'export':
-        from ftllm import llm
+        from . import llm
         if (args.path == '' or args.path is None):
             args.path = args.model
         llm.export_llm_model_fromhf(path = args.path, dtype = args.dtype, moe_dtype = args.moe_dtype, lora = args.lora, output = args.output, dtype_config = args.dtype_config)
