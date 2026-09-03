@@ -3699,6 +3699,22 @@ namespace fastllm {
         }
 
         arch = ConvertGGUFTypeToFastllmType(arch);
+        const int ggufFileType = params["general.file_type"].int_value();
+        // The new mixed-GGUF MMQ/MMVQ CUDA fast paths are not numerically
+        // correct yet for these primary quantization families. Mark this
+        // model's GGUF weights for the established dequant + cuBLAS path;
+        // higher-bit models stay on the low-memory fast path.
+        const bool forceSafeGgufDequant =
+            arch == "qwen3_5" &&
+            (ggufFileType == 10 || // Q2_K
+             (ggufFileType >= 11 && ggufFileType <= 13) || // Q3_K S/M/L
+             ggufFileType == 23 || // IQ3_XXS
+             ggufFileType == 26 || // IQ3_S
+             ggufFileType == 30);  // IQ4_XS
+        if (forceSafeGgufDequant) {
+            printf("[Fastllm] Qwen3.5 GGUF file type %d: use safe CUDA dequant path.\n",
+                   ggufFileType);
+        }
         int ggufMainLayerCount = GetGGUFMainLayerCount(params, arch, model);
         int ggufMtpLayerCount = GetGGUFArchParam(
             params, arch, "nextn_predict_layers").int_value();
@@ -4170,6 +4186,14 @@ namespace fastllm {
         for (int i = 0; i < threads.size(); i++) {
             threads[i]->join();
             delete threads[i];
+        }
+        if (forceSafeGgufDequant) {
+            for (auto &item : model->weight.weight) {
+                if (item.second.isGGUFData ||
+                    item.second.dataType == DataType::DATA_GGUF_FORMAT) {
+                    item.second.forceGGUFFp32Dequant = true;
+                }
+            }
         }
         model->OnModelWeightsLoaded();
 

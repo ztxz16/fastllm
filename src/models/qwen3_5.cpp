@@ -56,6 +56,29 @@ namespace fastllm {
                std::strcmp(env, "NO") != 0;
     }
 
+    static bool Qwen35TryRunSeparateDenseMlp(
+            WeightMap &weights, const std::string &prefix, Data &input,
+            Data &gateOutput, Data &upOutput, Data &hiddenStates) {
+        auto gate = weights.weight.find(prefix + "gate_proj.weight");
+        auto up = weights.weight.find(prefix + "up_proj.weight");
+        auto down = weights.weight.find(prefix + "down_proj.weight");
+        if (gate == weights.weight.end() || up == weights.weight.end() ||
+            down == weights.weight.end()) {
+            return false;
+        }
+
+        Linear(input, gate->second, Data(), gateOutput);
+        Linear(input, up->second, Data(), upOutput);
+        if (gateOutput.dataType != upOutput.dataType) {
+            ToDataType(upOutput, gateOutput.dataType);
+        }
+        Silu(gateOutput, gateOutput);
+        MulTo(gateOutput, upOutput);
+        Linear(gateOutput, down->second, Data(), input);
+        AddTo(hiddenStates, input);
+        return true;
+    }
+
     static std::string Qwen35MoeExpertPrefix(int layer, int expert) {
         return Qwen3_5Model::language_prefix + "layers." + std::to_string(layer) +
                ".mlp.experts." + std::to_string(expert) + ".";
@@ -24331,7 +24354,29 @@ namespace fastllm {
     }
 
     void Qwen3_5Model::OnModelWeightsLoaded() {
+        bool forceSafeGgufDequant = false;
+        for (const auto &item : this->weight.weight) {
+            forceSafeGgufDequant |= item.second.forceGGUFFp32Dequant;
+        }
         RestoreGgufGdnWeights();
+
+        if (forceSafeGgufDequant) {
+            for (auto &item : this->weight.weight) {
+                Data &loadedWeight = item.second;
+                if (loadedWeight.isGGUFData ||
+                    loadedWeight.dataType == DataType::DATA_GGUF_FORMAT) {
+                    loadedWeight.forceGGUFFp32Dequant = true;
+                }
+            }
+        }
+
+        auto finalNorm = this->weight.weight.find(
+            language_prefix + "norm.weight");
+        if (finalNorm != this->weight.weight.end() &&
+            finalNorm->second.isGGUFData) {
+            initialized_add1 = true;
+        }
+
         if (!loadFusedMoePlanned || moeFusedWeightsPrepared) {
             return;
         }
@@ -29498,6 +29543,14 @@ namespace fastllm {
                 continue;
             }
 
+            const std::string denseMlpPrefix = language_prefix + "layers." +
+                std::to_string(i) + ".mlp.";
+            if (Qwen35TryRunSeparateDenseMlp(
+                    weight, denseMlpPrefix, attenInput, q, v,
+                    hiddenStates)) {
+                continue;
+            }
+
             std::string gateWeightName = language_prefix + "layers." + std::to_string(i) + ".mlp.gate.weight";
             if (weight.weight.find(gateWeightName) == weight.weight.end()) {
                 ErrorInFastLLM("Qwen3.5 layer " + std::to_string(i) + " has neither dense MLP nor MoE weights.");
@@ -30842,6 +30895,14 @@ namespace fastllm {
             if (weight.weight.find(swigluWeightName) != weight.weight.end() &&
                 weight.weight.find(downWeightName) != weight.weight.end()) {
                 MLPBlock(&attenInput, &weight[swigluWeightName], &weight[downWeightName], &v, &q, &hiddenStates);
+                continue;
+            }
+
+            const std::string denseMlpPrefix = language_prefix + "layers." +
+                std::to_string(i) + ".mlp.";
+            if (Qwen35TryRunSeparateDenseMlp(
+                    weight, denseMlpPrefix, attenInput, q, v,
+                    hiddenStates)) {
                 continue;
             }
 

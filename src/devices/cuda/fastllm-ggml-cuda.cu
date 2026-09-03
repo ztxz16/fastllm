@@ -2887,7 +2887,8 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
     ggml_backend_cuda_context ctx;
 
     ggml_type ggufType = (ggml_type)weight.ggmlType;
-    auto dequantFp32 = FastllmGGUFUseFp32Dequant(weight, ggufType) ? ggml_get_to_fp32_cuda(ggufType) : nullptr;
+    const bool forceFp32Dequant = FastllmGGUFUseFp32Dequant(weight, ggufType);
+    auto dequantFp32 = forceFp32Dequant ? ggml_get_to_fp32_cuda(ggufType) : nullptr;
     bool pedanticSgemm = FastllmGGUFUsePedanticSgemm(weight, ggufType);
     auto dequantFp16 = ggml_get_to_fp16_cuda(ggufType);
     auto has_vec_dot = get_has_vec_dot_q_cuda((ggml_type)weight.ggmlType);
@@ -2897,13 +2898,15 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
         dequantFp16 = nullptr;
     }
     cudaStream_t stream = cudaStreamPerThread;
-    const bool usedExtendedMmvq = FastllmCudaFloatMatMulGGUFMMVQ(
-        cudaInput, weight.cudaData, cudaOutput, weight.ggmlType,
-        n, m, k, stream);
+    const bool usedExtendedMmvq = !forceFp32Dequant &&
+        FastllmCudaFloatMatMulGGUFMMVQ(
+            cudaInput, weight.cudaData, cudaOutput, weight.ggmlType,
+            n, m, k, stream);
     // dequant = nullptr; /// TODO: dequant目前似乎有bug，待查
 
     if (!usedExtendedMmvq &&
-        (n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) && dequantFp32 != nullptr) {
+        (forceFp32Dequant || n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) &&
+        dequantFp32 != nullptr) {
         auto fastllmCublasHandle = getFastllmCublasHandle();
 
         size_t wsBytes = 0;
@@ -3066,21 +3069,25 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
 
     ggml_backend_cuda_context ctx;
 
-    auto dequant = ggml_get_to_fp16_cuda((ggml_type)weight.ggmlType);
-    auto has_vec_dot = get_has_vec_dot_q_cuda((ggml_type)weight.ggmlType);
+    const ggml_type ggufType = (ggml_type)weight.ggmlType;
+    const bool forceDequant = FastllmGGUFUseFp32Dequant(weight, ggufType);
+    auto dequant = ggml_get_to_fp16_cuda(ggufType);
+    auto has_vec_dot = get_has_vec_dot_q_cuda(ggufType);
     cudaStream_t stream = cudaStreamPerThread;
     // dequant = nullptr; /// TODO: dequant目前似乎有bug，待查
 
-    const bool usedMmq = FastllmCudaHalfMatMulGGUFMMQ(
-        cudaInput, weight.cudaData, cudaOutput, weight.ggmlType,
-        n, m, k, stream);
-    const bool usedExtendedMmvq = !usedMmq &&
+    const bool usedMmq = !forceDequant &&
+        FastllmCudaHalfMatMulGGUFMMQ(
+            cudaInput, weight.cudaData, cudaOutput, weight.ggmlType,
+            n, m, k, stream);
+    const bool usedExtendedMmvq = !forceDequant && !usedMmq &&
         FastllmCudaHalfMatMulGGUFMMVQ(
             cudaInput, weight.cudaData, cudaOutput, weight.ggmlType,
             n, m, k, stream);
 
     if (!usedMmq && !usedExtendedMmvq &&
-        (n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) && dequant != nullptr) {
+        (forceDequant || n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) &&
+        dequant != nullptr) {
         auto fastllmCublasHandle = getFastllmCublasHandle();
 
         size_t needBytes = (size_t)k * m * sizeof(half);
@@ -3542,20 +3549,24 @@ bool FastllmCudaBFloat16MatMulGGUF(const fastllm::Data &input, fastllm::Data &we
 
     ggml_backend_cuda_context ctx;
 
-    auto dequant = ggml_get_to_bf16_cuda((ggml_type)weight.ggmlType);
-    auto has_vec_dot = get_has_vec_dot_q_cuda((ggml_type)weight.ggmlType);
+    const ggml_type ggufType = (ggml_type)weight.ggmlType;
+    const bool forceDequant = FastllmGGUFUseFp32Dequant(weight, ggufType);
+    auto dequant = ggml_get_to_bf16_cuda(ggufType);
+    auto has_vec_dot = get_has_vec_dot_q_cuda(ggufType);
     cudaStream_t stream = cudaStreamPerThread;
 
-    const bool usedMmq = FastllmCudaBFloat16MatMulGGUFMMQ(
+    const bool usedMmq = !forceDequant &&
+        FastllmCudaBFloat16MatMulGGUFMMQ(
             cudaInput, weight.cudaData, cudaOutput, weight.ggmlType,
             n, m, k, stream);
-    const bool usedExtendedMmvq = !usedMmq &&
+    const bool usedExtendedMmvq = !forceDequant && !usedMmq &&
         FastllmCudaBFloat16MatMulGGUFMMVQ(
             cudaInput, weight.cudaData, cudaOutput, weight.ggmlType,
             n, m, k, stream);
 
     if (!usedMmq && !usedExtendedMmvq &&
-        (n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) && dequant != nullptr) {
+        (forceDequant || n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) &&
+        dequant != nullptr) {
         auto fastllmCublasHandle = getFastllmCublasHandle();
 
         size_t needBytes = (size_t)k * m * sizeof(__nv_bfloat16);
