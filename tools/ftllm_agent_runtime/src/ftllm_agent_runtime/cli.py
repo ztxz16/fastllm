@@ -21,6 +21,10 @@ def build_parser() -> argparse.ArgumentParser:
     probe.add_argument("--model", required=True)
     probe.add_argument("--api-key", default="")
     probe.add_argument("--file", action="append", default=[])
+    probe.add_argument(
+        "--directory",
+        help="run with writable Pi coding tools from this working directory",
+    )
     probe.add_argument("--timeout", type=float, default=300)
     return parser
 
@@ -47,13 +51,22 @@ def main() -> int:
                 "size": path.stat().st_size,
             }
         )
-    if not files:
+    if not files and not args.directory:
         files = [{"name": "runtime.txt", "text": "FastLLM Pi bridge smoke test."}]
     system_prompt = (
+        "You are a coding agent. Inspect the selected working directory, complete "
+        "the requested task, and verify your work."
+        if args.directory else
         "You are a read-only project assistant. Always call runtime_info and "
         "read_project_file before answering. Never claim to execute project code."
     )
-    for event in runtime.stream(args.prompt, files, system_prompt, thinking_level="off"):
+    for event in runtime.stream(
+        args.prompt,
+        files,
+        system_prompt,
+        thinking_level="off",
+        working_directory=args.directory,
+    ):
         print(json.dumps(event, ensure_ascii=False), flush=True)
     return 0
 

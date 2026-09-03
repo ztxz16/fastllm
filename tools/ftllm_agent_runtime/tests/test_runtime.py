@@ -1,3 +1,4 @@
+import base64
 import json
 from pathlib import Path
 import threading
@@ -79,6 +80,31 @@ def test_runtime_keeps_api_key_out_of_process_arguments(tmp_path: Path):
     assert "top-secret" not in command
 
 
+def test_workspace_mode_enables_coding_tools_and_project_context(tmp_path: Path):
+    binary = _fake_pi_binary(tmp_path)
+    runtime = PiAgentRuntime(
+        api_base="http://localhost:8000/v1",
+        model="demo",
+        binary=str(binary),
+    )
+
+    command = runtime._command(
+        "system prompt",
+        "off",
+        ["read", "bash", "edit", "write", "grep", "find", "ls"],
+        workspace_mode=True,
+    )
+
+    assert "--no-builtin-tools" not in command
+    assert "--no-context-files" not in command
+    assert "--approve" in command
+    assert "--append-system-prompt" in command
+    assert "--system-prompt" not in command
+    assert command[command.index("--tools") + 1] == (
+        "read,bash,edit,write,grep,find,ls"
+    )
+
+
 def test_runtime_can_finish_on_the_configured_turn_limit(tmp_path: Path):
     binary = _fake_pi_binary(tmp_path, [
         {"type": "turn_start"},
@@ -106,6 +132,175 @@ def test_runtime_can_finish_on_the_configured_turn_limit(tmp_path: Path):
         {"type": "text_delta", "text": "Done"},
         {"type": "done", "turns": 1},
     ]
+
+
+def test_runtime_streams_tool_identity_arguments_updates_and_result(tmp_path: Path):
+    binary = _fake_pi_binary(tmp_path, [
+        {"type": "turn_start"},
+        {
+            "type": "tool_execution_start",
+            "toolCallId": "call-42",
+            "toolName": "bash",
+            "args": {"command": "printf tool-output-42"},
+        },
+        {
+            "type": "tool_execution_update",
+            "toolCallId": "call-42",
+            "toolName": "bash",
+            "partialResult": {
+                "content": [{"type": "text", "text": "tool-output"}],
+            },
+        },
+        {
+            "type": "tool_execution_end",
+            "toolCallId": "call-42",
+            "toolName": "bash",
+            "result": {
+                "content": [{"type": "text", "text": "tool-output-42"}],
+            },
+            "isError": False,
+        },
+        {
+            "type": "message_update",
+            "assistantMessageEvent": {"type": "text_delta", "delta": "Done"},
+        },
+        {"type": "turn_end"},
+        {"type": "agent_end"},
+    ])
+    runtime = PiAgentRuntime(
+        api_base="http://localhost:8000/v1",
+        model="demo",
+        binary=str(binary),
+    )
+
+    events = list(runtime.stream(
+        "Run the command.", [], "Use the coding tools.",
+        working_directory=str(tmp_path),
+    ))
+
+    assert [event for event in events if event["type"].startswith("tool_")] == [
+        {
+            "type": "tool_start",
+            "id": "call-42",
+            "name": "bash",
+            "arguments": {"command": "printf tool-output-42"},
+            "arguments_truncated": False,
+        },
+        {
+            "type": "tool_update",
+            "id": "call-42",
+            "name": "bash",
+            "result": "tool-output",
+            "result_truncated": False,
+        },
+        {
+            "type": "tool_end",
+            "id": "call-42",
+            "name": "bash",
+            "is_error": False,
+            "result": "tool-output-42",
+            "result_truncated": False,
+        },
+    ]
+
+
+def test_runtime_runs_workspace_agent_from_selected_directory(tmp_path: Path):
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    binary = tmp_path / "pi"
+    binary.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, pathlib, sys\n"
+        "json.loads(sys.stdin.readline())\n"
+        "pathlib.Path('agent-output.txt').write_text(os.getcwd())\n"
+        "events = [\n"
+        " {'type': 'turn_start'},\n"
+        " {'type': 'message_update', 'assistantMessageEvent': "
+        "{'type': 'text_delta', 'delta': 'Updated'}},\n"
+        " {'type': 'turn_end'},\n"
+        " {'type': 'agent_end'},\n"
+        "]\n"
+        "for event in events: print(json.dumps(event), flush=True)\n",
+        encoding="utf-8",
+    )
+    binary.chmod(0o755)
+    runtime = PiAgentRuntime(
+        api_base="http://localhost:8000/v1",
+        model="demo",
+        binary=str(binary),
+    )
+
+    events = list(runtime.stream(
+        "Update the project.",
+        [],
+        "Use the coding tools.",
+        working_directory=str(workspace),
+    ))
+
+    assert events[-1] == {"type": "done", "turns": 1}
+    assert (workspace / "agent-output.txt").read_text() == str(workspace)
+
+
+def test_runtime_sends_image_attachments_in_the_rpc_prompt(tmp_path: Path):
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    image = tmp_path / "sample.png"
+    image.write_bytes(b"small-png-fixture")
+    captured = tmp_path / "request.json"
+    binary = tmp_path / "pi"
+    binary.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, pathlib, sys\n"
+        f"pathlib.Path({str(captured)!r}).write_text(sys.stdin.readline())\n"
+        "events = [\n"
+        " {'type': 'turn_start'},\n"
+        " {'type': 'message_update', 'assistantMessageEvent': "
+        "{'type': 'text_delta', 'delta': 'Seen'}},\n"
+        " {'type': 'turn_end'},\n"
+        " {'type': 'agent_end'},\n"
+        "]\n"
+        "for event in events: print(json.dumps(event), flush=True)\n",
+        encoding="utf-8",
+    )
+    binary.chmod(0o755)
+    runtime = PiAgentRuntime(
+        api_base="http://localhost:8000/v1",
+        model="demo",
+        binary=str(binary),
+    )
+
+    events = list(runtime.stream(
+        "Inspect the image.",
+        [],
+        "Use the image.",
+        working_directory=str(workspace),
+        images=[{"path": str(image), "mime_type": "image/png"}],
+    ))
+
+    request = json.loads(captured.read_text(encoding="utf-8"))
+    assert request["images"] == [{
+        "type": "image",
+        "data": base64.b64encode(image.read_bytes()).decode("ascii"),
+        "mimeType": "image/png",
+    }]
+    assert events[-1] == {"type": "done", "turns": 1}
+
+
+def test_runtime_rejects_invalid_working_directory(tmp_path: Path):
+    binary = _fake_pi_binary(tmp_path)
+    runtime = PiAgentRuntime(
+        api_base="http://localhost:8000/v1",
+        model="demo",
+        binary=str(binary),
+    )
+
+    with pytest.raises(ValueError, match="working directory is unavailable"):
+        list(runtime.stream(
+            "Inspect it.",
+            [],
+            "Use the coding tools.",
+            working_directory=str(tmp_path / "missing"),
+        ))
 
 
 def test_runtime_rejects_an_empty_agent_response(tmp_path: Path):

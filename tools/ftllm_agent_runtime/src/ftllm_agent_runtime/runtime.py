@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import platform
@@ -21,8 +22,12 @@ from typing import Any, Dict, Iterable, Iterator, Mapping, Optional
 from urllib.parse import urlsplit
 
 
-BRIDGE_VERSION = "0.2.1"
+BRIDGE_VERSION = "0.3.2"
 PI_VERSION = "0.84.4"
+_MAX_TOOL_DETAIL_CHARS = 16 * 1024
+_MAX_IMAGES = 6
+_MAX_IMAGE_BYTES = 20 * 1024 * 1024
+_MAX_TOTAL_IMAGE_BYTES = 40 * 1024 * 1024
 _RUNTIME_TOOLS = ("runtime_info",)
 _PROJECT_TOOLS = (
     "list_project_files",
@@ -33,7 +38,16 @@ _WEB_TOOLS = (
     "web_search",
     "read_web_page",
 )
-_ALL_TOOLS = _RUNTIME_TOOLS + _PROJECT_TOOLS + _WEB_TOOLS
+_WORKSPACE_TOOLS = (
+    "read",
+    "bash",
+    "edit",
+    "write",
+    "grep",
+    "find",
+    "ls",
+)
+_ALL_TOOLS = _RUNTIME_TOOLS + _PROJECT_TOOLS + _WEB_TOOLS + _WORKSPACE_TOOLS
 _THINKING_LEVELS = {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
 
 
@@ -65,6 +79,43 @@ def _safe_name(value: str, fallback: str) -> str:
     name = Path(str(value or "")).name.strip() or fallback
     name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
     return name[:120] or fallback
+
+
+def _bounded_tool_arguments(value: Any) -> tuple[Any, bool]:
+    """Keep tool arguments useful without letting one call swamp chat history."""
+    try:
+        serialized = json.dumps(value, ensure_ascii=False)
+        normalized = json.loads(serialized)
+    except (TypeError, ValueError):
+        serialized = str(value)
+        normalized = serialized
+    if len(serialized) <= _MAX_TOOL_DETAIL_CHARS:
+        return normalized, False
+    return serialized[:_MAX_TOOL_DETAIL_CHARS] + "\n…", True
+
+
+def _tool_result_text(value: Any) -> tuple[str, bool]:
+    """Extract Pi's human-readable tool output and apply a storage bound."""
+    parts = []
+    content = value.get("content", []) if isinstance(value, Mapping) else value
+    if isinstance(content, (list, tuple)):
+        for item in content:
+            if isinstance(item, Mapping) and "text" in item:
+                parts.append(str(item.get("text", "")))
+            elif isinstance(item, str):
+                parts.append(item)
+    elif isinstance(content, str):
+        parts.append(content)
+    elif content not in (None, {}):
+        try:
+            parts.append(json.dumps(content, ensure_ascii=False, default=str))
+        except (TypeError, ValueError):
+            parts.append(str(content))
+    text = "\n".join(part for part in parts if part)
+    truncated = len(text) > _MAX_TOOL_DETAIL_CHARS
+    if truncated:
+        text = text[:_MAX_TOOL_DETAIL_CHARS] + "\n…"
+    return text, truncated
 
 
 class _WebToolBridge:
@@ -203,10 +254,9 @@ class _WebToolBridge:
 class PiAgentRuntime:
     """Launch one isolated Pi agent process per request.
 
-    This first Linux prototype deliberately disables every Pi built-in tool.
-    The bundled extension can inspect read-only source snapshots or call a
-    caller-supplied, SSRF-protected web backend through a temporary localhost
-    bridge.
+    Uploaded files stay in an isolated, read-only snapshot workflow. Callers
+    may alternatively opt into a real working directory, in which case Pi's
+    coding tools are enabled and the process runs from that directory.
     """
 
     def __init__(
@@ -299,7 +349,7 @@ class PiAgentRuntime:
                             "id": self.model,
                             "name": self.model,
                             "reasoning": reasoning,
-                            "input": ["text"],
+                            "input": ["text", "image"],
                             "contextWindow": self.context_window,
                             "maxTokens": self.max_tokens,
                             "cost": {
@@ -340,13 +390,56 @@ class PiAgentRuntime:
             raise ValueError("at least one project file is required")
         return manifest
 
+    @staticmethod
+    def _prepare_images(
+        images: Iterable[Mapping[str, Any]],
+    ) -> list[Dict[str, Any]]:
+        items = list(images)
+        if len(items) > _MAX_IMAGES:
+            raise ValueError(f"at most {_MAX_IMAGES} images can be attached")
+        prepared = []
+        total_bytes = 0
+        for item in items:
+            raw_path = str(item.get("path", "")).strip()
+            try:
+                path = Path(raw_path).expanduser().resolve(strict=True)
+            except (OSError, RuntimeError) as error:
+                raise ValueError(
+                    f"image attachment is unavailable: {raw_path}"
+                ) from error
+            if not path.is_file():
+                raise ValueError(f"image attachment is not a file: {path}")
+            mime_type = str(
+                item.get("mime_type", item.get("mimeType", ""))
+            ).strip().lower()
+            if not mime_type.startswith("image/"):
+                raise ValueError(
+                    f"unsupported image MIME type: {mime_type or 'unknown'}")
+            size = path.stat().st_size
+            if size > _MAX_IMAGE_BYTES:
+                raise ValueError(
+                    f"image attachment exceeds {_MAX_IMAGE_BYTES // 1024 // 1024} MiB: "
+                    f"{path.name}"
+                )
+            total_bytes += size
+            if total_bytes > _MAX_TOTAL_IMAGE_BYTES:
+                raise ValueError(
+                    "image attachments exceed the 40 MiB combined limit")
+            prepared.append({
+                "type": "image",
+                "data": base64.b64encode(path.read_bytes()).decode("ascii"),
+                "mimeType": mime_type,
+            })
+        return prepared
+
     def _command(
         self,
         system_prompt: str,
         thinking_level: str,
         active_tools: Iterable[str],
+        workspace_mode: bool = False,
     ) -> list[str]:
-        return [
+        command = [
             str(self.binary),
             "--mode",
             "rpc",
@@ -357,9 +450,8 @@ class PiAgentRuntime:
             self.model,
             "--thinking",
             thinking_level,
-            "--system-prompt",
+            "--append-system-prompt" if workspace_mode else "--system-prompt",
             system_prompt,
-            "--no-builtin-tools",
             "--tools",
             ",".join(active_tools),
             "--extension",
@@ -367,11 +459,28 @@ class PiAgentRuntime:
             "--no-extensions",
             "--no-skills",
             "--no-prompt-templates",
-            "--no-context-files",
             "--no-themes",
-            "--no-approve",
             "--offline",
         ]
+        if workspace_mode:
+            command.append("--approve")
+        else:
+            command.extend((
+                "--no-builtin-tools", "--no-context-files", "--no-approve",
+            ))
+        return command
+
+    @staticmethod
+    def _working_directory(value: Optional[str]) -> Optional[Path]:
+        if not str(value or "").strip():
+            return None
+        try:
+            path = Path(str(value)).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise ValueError(f"working directory is unavailable: {value}") from error
+        if not path.is_dir():
+            raise ValueError(f"working directory is not a directory: {path}")
+        return path
 
     def stream(
         self,
@@ -381,6 +490,8 @@ class PiAgentRuntime:
         thinking_level: str = "off",
         web_backend: Optional[Any] = None,
         cancel_event: Optional[threading.Event] = None,
+        working_directory: Optional[str] = None,
+        images: Iterable[Mapping[str, Any]] = (),
     ) -> Iterator[Dict[str, Any]]:
         """Yield normalized events from a complete Pi agent run."""
 
@@ -392,14 +503,19 @@ class PiAgentRuntime:
         prompt = str(prompt or "").strip()
         if not prompt:
             raise ValueError("prompt cannot be empty")
+        workspace = self._working_directory(working_directory)
 
         with tempfile.TemporaryDirectory(prefix="ftllm-pi-agent-") as temporary:
             root = Path(temporary)
             config_dir = root / "config"
             config_dir.mkdir(parents=True)
             file_items = list(files)
-            if not file_items and web_backend is None:
-                raise ValueError("at least one project file or web backend is required")
+            image_items = self._prepare_images(images)
+            if not file_items and web_backend is None and workspace is None:
+                raise ValueError(
+                    "at least one project file, web backend, or working directory "
+                    "is required"
+                )
             manifest = (
                 self._copy_project_files(root, file_items) if file_items else []
             )
@@ -414,6 +530,8 @@ class PiAgentRuntime:
                 active_tools.extend(_PROJECT_TOOLS)
             if web_bridge:
                 active_tools.extend(_WEB_TOOLS)
+            if workspace is not None:
+                active_tools.extend(_WORKSPACE_TOOLS)
             environment = os.environ.copy()
             environment.update(
                 {
@@ -441,8 +559,13 @@ class PiAgentRuntime:
 
             try:
                 process = subprocess.Popen(
-                    self._command(system_prompt, level, active_tools),
-                    cwd=root,
+                    self._command(
+                        system_prompt,
+                        level,
+                        active_tools,
+                        workspace_mode=workspace is not None,
+                    ),
+                    cwd=workspace or root,
                     env=environment,
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
@@ -485,10 +608,12 @@ class PiAgentRuntime:
             stdout_thread.start()
             stderr_thread.start()
 
-            command = json.dumps(
-                {"id": "ftllm-prompt", "type": "prompt", "message": prompt},
-                ensure_ascii=False,
-            )
+            request = {
+                "id": "ftllm-prompt", "type": "prompt", "message": prompt,
+            }
+            if image_items:
+                request["images"] = image_items
+            command = json.dumps(request, ensure_ascii=False)
             try:
                 process.stdin.write(command + "\n")
                 process.stdin.flush()
@@ -561,17 +686,38 @@ class PiAgentRuntime:
                                 "text": delta,
                             }
                     elif event_type == "tool_execution_start":
+                        arguments, arguments_truncated = (
+                            _bounded_tool_arguments(event.get("args", {}))
+                        )
                         yield {
                             "type": "tool_start",
+                            "id": str(event.get("toolCallId", "")),
                             "name": str(event.get("toolName", "")),
-                            "arguments": event.get("args", {}),
+                            "arguments": arguments,
+                            "arguments_truncated": arguments_truncated,
                         }
+                    elif event_type == "tool_execution_update":
+                        result, result_truncated = _tool_result_text(
+                            event.get("partialResult"))
+                        if result:
+                            yield {
+                                "type": "tool_update",
+                                "id": str(event.get("toolCallId", "")),
+                                "name": str(event.get("toolName", "")),
+                                "result": result,
+                                "result_truncated": result_truncated,
+                            }
                     elif event_type == "tool_execution_end":
                         tool_name = str(event.get("toolName", ""))
+                        result, result_truncated = _tool_result_text(
+                            event.get("result"))
                         yield {
                             "type": "tool_end",
+                            "id": str(event.get("toolCallId", "")),
                             "name": tool_name,
                             "is_error": bool(event.get("isError", False)),
+                            "result": result,
+                            "result_truncated": result_truncated,
                         }
                         if web_bridge and tool_name in {
                             "web_search", "read_web_page"
