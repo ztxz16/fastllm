@@ -1,0 +1,474 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="color-scheme" content="light">
+    <title>FastLLM Launcher</title>
+    <link rel="stylesheet" href="/assets/styles.css">
+    <script defer src="/assets/app.js"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">
+            <span></span><span></span><span></span>
+          </div>
+          <div>
+            <strong>FastLLM</strong>
+            <small>Launcher</small>
+          </div>
+        </div>
+
+        <nav class="navigation" aria-label="主导航">
+          <p class="sidebar-heading">本地部署</p>
+          <button class="nav-button active" type="button" data-view-button="launch">
+            <span class="nav-icon">▷</span>
+            <span><strong>启动服务</strong><small>API Server 或 WebUI</small></span>
+          </button>
+          <button class="nav-button" type="button" data-view-button="download">
+            <span class="nav-icon">↓</span>
+            <span><strong>下载模型</strong><small>从 ModelScope 获取</small></span>
+            <i id="download-activity" class="activity-dot"></i>
+          </button>
+          <button class="nav-button" type="button" data-view-button="logs">
+            <span class="nav-icon">›_</span>
+            <span><strong>运行日志</strong><small>查看模型实时输出</small></span>
+            <i id="log-activity" class="activity-dot"></i>
+          </button>
+          <button class="nav-button" type="button" data-view-button="hardware">
+            <span class="nav-icon">◇</span>
+            <span><strong>硬件信息</strong><small>查看当前运行环境</small></span>
+          </button>
+        </nav>
+
+        <div class="sidebar-footer">
+          <div class="security-note"><span></span>网络控制 · 随机令牌保护</div>
+          <div class="footer-row">
+            <span id="app-version" class="version">ftllm</span>
+            <button id="shutdown-launcher" class="quiet-button" type="button">退出</button>
+          </div>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <header class="topbar">
+          <div class="topbar-status">
+            <span id="status-dot" class="status-dot stopped"></span>
+            <div>
+              <strong id="status-title">服务未启动</strong>
+              <small id="status-message">填写配置后即可启动本地 API</small>
+            </div>
+          </div>
+          <div class="topbar-actions">
+            <button id="open-endpoint" class="secondary-button" type="button" disabled>打开服务</button>
+            <button id="stop-runtime" class="secondary-button danger hidden" type="button">■ 停止</button>
+            <button id="start-runtime-top" class="primary-button" type="button"><span class="play-icon"></span>启动服务</button>
+          </div>
+        </header>
+
+        <div class="page-scroll">
+          <section id="view-launch" class="view active">
+            <section class="hero">
+              <div class="hero-copy">
+                <span id="launch-hero-eyebrow" class="eyebrow">LOCAL MODEL API</span>
+                <h1>让模型在本机跑起来</h1>
+                <p id="launch-hero-description">选择模型与设备，Launcher 会生成并托管 <code>ftllm server</code>，启动进度和日志都留在这个页面。</p>
+              </div>
+              <div class="hero-actions">
+                <button id="new-profile-hero" class="hero-secondary" type="button">新建配置</button>
+                <button id="start-runtime-hero" class="hero-primary" type="button">▷ 启动当前配置</button>
+              </div>
+            </section>
+
+            <section class="summary-grid" aria-label="运行概览">
+              <article>
+                <span class="summary-icon profiles">▦</span>
+                <div><small>已保存配置</small><strong id="profile-count">0</strong></div>
+              </article>
+              <article>
+                <span class="summary-icon runtime">▷</span>
+                <div><small>模型服务</small><strong id="runtime-summary">未启动</strong></div>
+              </article>
+              <article>
+                <span class="summary-icon endpoint">⌁</span>
+                <div><small id="endpoint-summary-label">服务地址</small><strong id="endpoint-summary">—</strong></div>
+              </article>
+            </section>
+
+            <section class="launcher-address-card" aria-label="Launcher 访问地址">
+              <div class="launcher-address-heading">
+                <span class="summary-icon network">◉</span>
+                <div><small>LAUNCHER ACCESS</small><strong>Launcher 访问地址</strong></div>
+              </div>
+              <div id="launcher-address-list" class="launcher-address-list">
+                <span class="launcher-address-empty">正在检测本机网络地址…</span>
+              </div>
+            </section>
+
+            <section id="runtime-progress-card" class="runtime-progress-card hidden" aria-live="polite">
+              <div class="runtime-progress-heading">
+                <span id="runtime-progress-icon" class="runtime-progress-icon">▷</span>
+                <div>
+                  <strong id="runtime-progress-title">正在启动模型</strong>
+                  <small id="runtime-progress-label">正在初始化模型</small>
+                </div>
+                <span id="runtime-progress-value">0%</span>
+              </div>
+              <progress id="runtime-progress" class="progress-track" max="100" value="0"></progress>
+              <div class="runtime-meta">
+                <span>PID <strong id="runtime-pid">—</strong></span>
+                <span>模型 <strong id="runtime-model">—</strong></span>
+                <button id="copy-endpoint" class="inline-button" type="button">复制 API 地址</button>
+              </div>
+            </section>
+
+            <div class="dashboard-grid">
+              <aside class="profiles-card">
+                <div class="card-heading compact">
+                  <div><span>CONFIGURATIONS</span><h2>启动配置</h2></div>
+                  <button id="new-profile" class="small-button" type="button">＋ 新建</button>
+                </div>
+                <div id="profile-list" class="profile-list">
+                  <div class="empty-profile">还没有保存配置</div>
+                </div>
+                <div class="profile-actions">
+                  <button id="duplicate-profile" class="text-button" type="button">复制配置</button>
+                  <button id="delete-profile" class="text-button danger-text" type="button">删除</button>
+                </div>
+                <div class="config-location">
+                  <span>配置保存在</span>
+                  <code id="config-path">—</code>
+                </div>
+              </aside>
+
+              <form id="launch-form" class="configuration-card">
+                <div class="card-heading">
+                  <div>
+                    <span id="launch-command-kicker">FTLLM SERVER</span>
+                    <h2>模型启动设置</h2>
+                    <p>带 <b>*</b> 的字段为必填项，保存配置不会启动模型。</p>
+                  </div>
+                  <span id="save-state" class="save-state">新配置</span>
+                </div>
+
+                <section class="form-section">
+                  <div class="section-title"><strong>基础配置</strong><small>模型、服务地址与运行设备</small></div>
+                  <div class="form-grid two-columns">
+                    <label class="field">
+                      <span>配置名称 <b>*</b></span>
+                      <input data-field="name" type="text" placeholder="例如 Qwen3.5-27B">
+                    </label>
+                    <label class="field">
+                      <span>启动方式 <b>*</b></span>
+                      <select data-field="command">
+                        <option value="server">API Server</option>
+                        <option value="webui">聊天 WebUI</option>
+                      </select>
+                    </label>
+                    <label id="server-model-name-field" class="field">
+                      <span>API 模型名</span>
+                      <input data-field="model_name" type="text" placeholder="留空时使用目录名">
+                    </label>
+                    <label class="field span-2">
+                      <span>模型路径 <b>*</b></span>
+                      <input data-field="model" data-path-input type="text" list="path-suggestions" placeholder="/path/to/model 或 /path/to/model.gguf" spellcheck="false">
+                      <small>支持 Hugging Face 模型目录、FastLLM 模型文件和 GGUF。</small>
+                    </label>
+                    <label id="server-host-field" class="field">
+                      <span>监听地址 <b>*</b></span>
+                      <input data-field="host" type="text" placeholder="0.0.0.0" spellcheck="false">
+                    </label>
+                    <label class="field">
+                      <span>服务端口 <b>*</b></span>
+                      <input data-field="port" type="number" min="1" max="65535" inputmode="numeric">
+                    </label>
+                    <label id="webui-max-token-field" class="field hidden">
+                      <span>最大输出 Token</span>
+                      <input data-field="webui_max_token" type="number" min="1" inputmode="numeric" placeholder="4096">
+                    </label>
+                    <label id="webui-think-field" class="field hidden">
+                      <span>思考模式</span>
+                      <select data-field="webui_think">
+                        <option value="false">关闭</option>
+                        <option value="true">开启</option>
+                      </select>
+                    </label>
+                    <label class="field">
+                      <span>主设备</span>
+                      <select data-field="device">
+                        <option value="cuda">CUDA 单卡</option>
+                        <option value="tp">多卡张量并行</option>
+                        <option value="cudapp">多卡串行</option>
+                        <option value="cpu">CPU</option>
+                      </select>
+                    </label>
+                    <label id="cuda-device-field" class="field device-field">
+                      <span>CUDA 卡号</span>
+                      <input data-field="cuda_device_id" type="text" placeholder="0">
+                    </label>
+                    <label id="tp-device-field" class="field device-field hidden">
+                      <span>TP 卡数或卡号</span>
+                      <input data-field="tp" type="text" placeholder="2 或 0,1">
+                    </label>
+                    <label id="cudapp-device-field" class="field device-field hidden">
+                      <span>串行卡数或卡号</span>
+                      <input data-field="cudapp" type="text" placeholder="2 或 0,1">
+                    </label>
+                    <label class="field">
+                      <span>权重类型</span>
+                      <select data-field="dtype">
+                        <option value="auto">自动</option>
+                        <option value="float16">float16</option>
+                        <option value="float32">float32</option>
+                        <option value="int8">int8</option>
+                        <option value="int4">int4</option>
+                        <option value="int4g128">int4g128</option>
+                        <option value="int4g256">int4g256</option>
+                        <option value="fp8_e4m3">fp8_e4m3</option>
+                      </select>
+                    </label>
+                  </div>
+                </section>
+
+                <section class="form-section speculative-section">
+                  <div class="section-title"><strong>推测解码</strong><small>支持内置 MTP 以及外置 MTP、DFlash2、DSpark</small></div>
+                  <div class="form-grid four-columns">
+                    <label class="field">
+                      <span>算法</span>
+                      <select data-field="speculative_algorithm">
+                        <option value="auto">自动识别</option>
+                        <option value="mtp">MTP</option>
+                        <option value="dflash">DFlash2</option>
+                        <option value="dspark">DSpark</option>
+                      </select>
+                    </label>
+                    <label class="field">
+                      <span>MTP Token 数</span>
+                      <input data-field="mtp" type="text" placeholder="auto / 0-8">
+                    </label>
+                    <label class="field">
+                      <span>Draft Token 数</span>
+                      <input data-field="draft_tokens" type="text" placeholder="auto">
+                    </label>
+                    <label class="field span-2-wide">
+                      <span>Draft 模型路径</span>
+                      <input data-field="speculative_draft_model_path" data-path-input type="text" list="path-suggestions" placeholder="留空使用模型内置能力" spellcheck="false">
+                    </label>
+                  </div>
+                </section>
+
+                <details class="advanced-section">
+                  <summary><span><strong>高级设置</strong><small>缓存、采样、MoE 与额外参数</small></span><i></i></summary>
+                  <div class="advanced-content">
+                    <div class="form-grid three-columns">
+                      <label class="field"><span>线程数</span><input data-field="threads" type="text" placeholder="auto"></label>
+                      <label class="field"><span>最大 Batch</span><input data-field="max_batch" type="text" placeholder="auto"></label>
+                      <label class="field"><span>显存利用率</span><input data-field="gpu_mem_ratio" type="text" placeholder="0.9"></label>
+                      <label class="field"><span>总 Token 数</span><input data-field="tokens" type="text" placeholder="auto"></label>
+                      <label id="server-context-field" class="field"><span>单会话上下文</span><input data-field="max_context_length" type="text" placeholder="auto"></label>
+                      <label class="field"><span>分块 Prefill</span><input data-field="chunked_prefill_size" type="text" placeholder="auto"></label>
+                      <label class="field">
+                        <span>KV Cache 类型</span>
+                        <select data-field="kv_cache_dtype">
+                          <option value="auto">auto</option>
+                          <option value="float16">float16</option>
+                          <option value="bfloat16">bfloat16</option>
+                          <option value="fp8_e4m3">fp8</option>
+                        </select>
+                      </label>
+                      <label class="field">
+                        <span>思考开关</span>
+                        <select data-field="enable_thinking">
+                          <option value="auto">自动</option>
+                          <option value="true">开启</option>
+                          <option value="false">关闭</option>
+                        </select>
+                      </label>
+                      <label class="field"><span>KV Cache 上限</span><input data-field="kv_cache_limit" type="text" placeholder="auto"></label>
+                    </div>
+
+                    <div id="server-sampling-title" class="subsection-title">采样默认值</div>
+                    <div id="server-sampling-fields" class="form-grid four-columns equal">
+                      <label class="field"><span>temperature</span><input data-field="temperature" type="text" placeholder="模型默认"></label>
+                      <label class="field"><span>top_p</span><input data-field="top_p" type="text" placeholder="模型默认"></label>
+                      <label class="field"><span>top_k</span><input data-field="top_k" type="text" placeholder="模型默认"></label>
+                      <label class="field"><span>repeat_penalty</span><input data-field="repeat_penalty" type="text" placeholder="模型默认"></label>
+                    </div>
+
+                    <div class="form-grid two-columns advanced-paths">
+                      <label id="ori-field" class="field hidden">
+                        <span>GGUF 原始配置目录</span>
+                        <input data-field="ori" data-path-input data-directories-only type="text" list="path-suggestions" placeholder="包含 config.json 的目录">
+                      </label>
+                      <label class="field">
+                        <span>模型缓存目录</span>
+                        <input data-field="cache_dir" data-path-input data-directories-only type="text" list="path-suggestions" placeholder="留空使用默认缓存">
+                      </label>
+                      <label id="server-api-key-field" class="field">
+                        <span>API Key</span>
+                        <input data-field="api_key" type="password" autocomplete="off" placeholder="留空表示不校验">
+                        <small>保存在当前用户的本地配置文件中。</small>
+                      </label>
+                      <label id="server-hide-input-field" class="switch-field">
+                        <input data-field="hide_input" type="checkbox">
+                        <span><strong>隐藏请求输入</strong><small>启动时添加 <code>--hide_input</code></small></span>
+                      </label>
+                      <label class="switch-field span-2">
+                        <input data-field="enable_moe_hybrid" type="checkbox">
+                        <span><strong>MoE 混合推理</strong><small>把指定数量的尾部 MoE 层放到 NUMA CPU 或磁盘。</small></span>
+                      </label>
+                      <label id="moe-device-field" class="field hidden">
+                        <span>MoE 设备</span>
+                        <select data-field="moe_device"><option value="numa">NUMA CPU</option><option value="disk">Disk</option></select>
+                      </label>
+                      <label id="moe-layers-field" class="field hidden">
+                        <span>MoE 设备层数</span>
+                        <input data-field="moe_device_layers" type="text" placeholder="10000">
+                      </label>
+                      <label class="field span-2">
+                        <span>环境变量</span>
+                        <textarea data-field="env_vars" rows="2" placeholder="FASTLLM_ACTIVATE_NUMA=ON FASTLLM_NUMA_THREADS=27"></textarea>
+                      </label>
+                      <label class="field span-2">
+                        <span>其它参数</span>
+                        <textarea data-field="extra_args" rows="2" placeholder="例如 --cuda_slab 1024"></textarea>
+                      </label>
+                    </div>
+                  </div>
+                </details>
+
+                <section class="command-panel">
+                  <div><strong>实际启动命令</strong><small>敏感值会隐藏，参数不经过 Shell</small></div>
+                  <pre id="command-preview">正在生成命令…</pre>
+                  <div id="validation-messages" class="validation-messages"></div>
+                </section>
+
+                <div class="form-actions">
+                  <button id="save-profile" class="secondary-button" type="button">保存配置</button>
+                  <button id="start-runtime" class="primary-button" type="submit"><span class="play-icon"></span>启动服务</button>
+                </div>
+              </form>
+            </div>
+          </section>
+
+          <section id="view-download" class="view">
+            <div class="view-hero download-hero">
+              <div>
+                <span class="eyebrow">MODELSCOPE DOWNLOAD</span>
+                <h1>把模型下载到本机</h1>
+                <p>支持断点续传和并行下载。下载任务由独立进程托管，退出 Launcher 时会一并停止。</p>
+              </div>
+              <button id="download-use-last" class="hero-secondary hidden" type="button">用于启动配置</button>
+            </div>
+
+            <div class="download-layout">
+              <form id="download-form" class="download-card">
+                <div class="card-heading">
+                  <div>
+                    <span>MODEL DOWNLOAD</span>
+                    <h2>下载设置</h2>
+                    <p>从常用模型中选择，或直接填写任意 ModelScope 模型 ID。</p>
+                  </div>
+                  <span id="download-badge" class="save-state">未开始</span>
+                </div>
+
+                <section class="form-section">
+                  <div class="form-grid two-columns">
+                    <label class="field span-2">
+                      <span>常用模型</span>
+                      <select id="download-preset">
+                        <option value="custom">自定义模型 ID</option>
+                      </select>
+                    </label>
+                    <label class="field span-2">
+                      <span>ModelScope 模型 ID <b>*</b></span>
+                      <input data-download-field="modelId" type="text" placeholder="Qwen/Qwen3-0.6B" spellcheck="false">
+                    </label>
+                    <label class="field span-2">
+                      <span>保存目录 <b>*</b></span>
+                      <input data-download-field="targetDir" data-path-input data-directories-only type="text" list="path-suggestions" placeholder="~/.cache/fastllm/modelscope/model-name" spellcheck="false">
+                      <small>目录已存在时会校验缓存并继续未完成的下载。</small>
+                    </label>
+                    <label class="field">
+                      <span>Revision</span>
+                      <input data-download-field="revision" type="text" placeholder="master" spellcheck="false">
+                    </label>
+                    <label class="field">
+                      <span>并发下载数</span>
+                      <input data-download-field="maxWorkers" type="number" min="1" max="64" inputmode="numeric">
+                    </label>
+                    <label class="field span-2">
+                      <span>Access Token</span>
+                      <input data-download-field="token" type="password" autocomplete="off" placeholder="私有模型可选">
+                      <small>Token 只保存在当前页面内存中，通过环境变量传给下载进程，不写入命令或配置文件。</small>
+                    </label>
+                  </div>
+                </section>
+
+                <section class="command-panel">
+                  <div><strong>实际下载命令</strong><small>参数不经过 Shell，Token 不显示</small></div>
+                  <pre id="download-command">正在生成命令…</pre>
+                  <div id="download-validation" class="validation-messages"></div>
+                </section>
+
+                <div class="form-actions">
+                  <button id="download-cancel" class="secondary-button danger hidden" type="button">取消下载</button>
+                  <button id="download-start" class="primary-button" type="submit">↓ 开始下载</button>
+                </div>
+              </form>
+
+              <aside class="download-status-card" aria-live="polite">
+                <div class="download-status-icon" id="download-status-icon">↓</div>
+                <span>DOWNLOAD STATUS</span>
+                <h2 id="download-status-title">尚未开始下载</h2>
+                <p id="download-status-message">模型文件可能占用较多磁盘空间，请先确认保存位置。</p>
+                <div class="download-progress-heading">
+                  <span>模型总进度</span>
+                  <strong id="download-progress-value">0%</strong>
+                </div>
+                <progress id="download-progress" class="progress-track" max="100" value="0"></progress>
+                <div class="download-stat-list">
+                  <div><span>已下载</span><strong id="download-bytes">—</strong></div>
+                  <div><span>文件</span><strong id="download-files">—</strong></div>
+                  <div><span>保存位置</span><strong id="download-destination">—</strong></div>
+                </div>
+                <button id="download-use-model" class="secondary-button hidden" type="button">使用这个模型启动</button>
+              </aside>
+            </div>
+          </section>
+
+          <section id="view-logs" class="view">
+            <div class="view-hero compact-hero">
+              <div><span class="eyebrow">LIVE OUTPUT</span><h1>运行日志</h1><p>实时查看 Launcher 与模型服务输出，启动进度事件会自动整理为可读状态。</p></div>
+              <button id="clear-logs" class="secondary-button" type="button">清空日志</button>
+            </div>
+            <section class="terminal-card">
+              <div class="terminal-heading">
+                <div><span class="terminal-dot red"></span><span class="terminal-dot yellow"></span><span class="terminal-dot green"></span></div>
+                <strong>ftllm server</strong>
+                <span id="log-count">0 条</span>
+              </div>
+              <div id="log-output" class="log-output" aria-live="polite">
+                <div class="log-empty">启动模型后，日志会显示在这里。</div>
+              </div>
+            </section>
+          </section>
+
+          <section id="view-hardware" class="view">
+            <div class="view-hero hardware-hero">
+              <div><span class="eyebrow">RUNTIME ENVIRONMENT</span><h1>这台机器的 FastLLM 能力</h1><p>快速查看 CPU、内存、GPU、NUMA 和模型所在磁盘；数据直接来自当前机器。</p></div>
+              <button id="refresh-hardware" class="primary-button" type="button">刷新检测</button>
+            </div>
+            <div id="hardware-status" class="hardware-status">切换到此页面后自动检测。</div>
+            <div id="hardware-grid" class="hardware-grid"></div>
+          </section>
+        </div>
+      </main>
+    </div>
+
+    <datalist id="path-suggestions"></datalist>
+    <div id="toast-region" class="toast-region" aria-live="polite"></div>
+  </body>
+</html>

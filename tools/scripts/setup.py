@@ -1,10 +1,10 @@
 import email
 import os
-from setuptools import setup, find_packages
+from setuptools import setup
 
 server_require = ['fastapi', 'pydantic', 'openai', 'shortuuid', 'uvicorn']
 webui_require = ['streamlit-chat']
-download_require = ['aria2']
+download_require = ['aria2', 'modelscope>=1.34.0,<2']
 tokenizer_require = ['tiktoken', 'blobfile', 'partial_json_parser']
 video_require = ['imageio', 'imageio-ffmpeg']
 all_require = server_require + webui_require + download_require + tokenizer_require + video_require
@@ -64,7 +64,7 @@ setup (
     packages = ['ftllm', 'ftllm/openai_server', 'ftllm/openai_server/protocal', 'ftllm/openai_server/tool_parsers'],
     package_data = {
         '': ['*.dll', '*.so', '*.dylib', '*.so.*', 'build_info.json',
-             'fastllm_triton_server.py']
+             'fastllm_triton_server.py', 'launcher_assets/*']
     },
     install_requires=[
         'pyreadline3',

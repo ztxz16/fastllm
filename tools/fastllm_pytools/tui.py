@@ -15,16 +15,22 @@ except ImportError:
 
 Choice = Tuple[str, str]
 ModelGroup = Tuple[str, str, Sequence[Choice]]
-PATH_COMPLETION_FIELDS = {"model", "cache_dir", "ori"}
+PATH_COMPLETION_FIELDS = {
+    "model",
+    "cache_dir",
+    "ori",
+    "speculative_draft_model_path",
+}
 DIRECTORY_COMPLETION_FIELDS = {"cache_dir", "ori"}
 CONTENT_MAX_WIDTH = 96
 PANEL_MAX_HEIGHT = 28
 PANEL_PADDING_X = 2
 PANEL_PADDING_Y = 1
 DEFAULT_ESCDELAY_MS = 25
+DEFAULT_MODELSCOPE_MODEL_ID = "Qwen/Qwen3-0.6B"
 QWEN_MODELSCOPE_MODEL_CHOICES: Sequence[Choice] = (
     ("Qwen/Qwen3.6-27B-FP8", "Qwen3.6-27B-FP8"),
-    ("Qwen/Qwen3-0.6B", "Qwen3-0.6B"),
+    (DEFAULT_MODELSCOPE_MODEL_ID, "Qwen3-0.6B"),
     ("Qwen/Qwen3-1.7B", "Qwen3-1.7B"),
     ("Qwen/Qwen3-4B", "Qwen3-4B"),
     ("Qwen/Qwen3-8B", "Qwen3-8B"),
@@ -45,7 +51,7 @@ MINIMAX_MODELSCOPE_MODEL_CHOICES: Sequence[Choice] = (
 )
 HOT_MODELSCOPE_MODEL_CHOICES: Sequence[Choice] = (
     ("Qwen/Qwen3.6-27B-FP8", "Qwen3.6-27B-FP8"),
-    ("Qwen/Qwen3-0.6B", "Qwen3-0.6B"),
+    (DEFAULT_MODELSCOPE_MODEL_ID, "Qwen3-0.6B"),
     ("Qwen/Qwen3-8B", "Qwen3-8B"),
     ("Qwen/Qwen3-30B-A3B", "Qwen3-30B-A3B"),
     ("deepseek-ai/DeepSeek-R1-Distill-Qwen-7B", "DeepSeek-R1-Distill-Qwen-7B"),
@@ -112,6 +118,9 @@ class DeployConfig:
     threads: str = "auto"
     kv_cache_limit: str = "auto"
     mtp: str = "auto"
+    speculative_algorithm: str = "auto"
+    speculative_draft_model_path: str = ""
+    draft_tokens: str = "auto"
     max_batch: str = "auto"
     max_context_length: str = "auto"
     temperature: str = ""
@@ -120,6 +129,8 @@ class DeployConfig:
     repeat_penalty: str = ""
     api_key: str = ""
     hide_input: bool = False
+    webui_max_token: str = "4096"
+    webui_think: str = "false"
     cache_dir: str = ""
     ori: str = ""
     extra_args: str = ""
@@ -128,7 +139,7 @@ class DeployConfig:
 
 @dataclass
 class ModelScopeDownloadConfig:
-    model_id: str = "Qwen/Qwen3-0.6B"
+    model_id: str = DEFAULT_MODELSCOPE_MODEL_ID
     model_id_custom: str = ""
     target_dir: str = ""
     max_workers: str = "4"
@@ -207,6 +218,17 @@ ENABLE_THINKING_CHOICES: Sequence[Choice] = (
     ("auto", "自动"),
     ("true", "开启"),
     ("false", "关闭"),
+)
+
+SPECULATIVE_ALGORITHM_CHOICES: Sequence[Choice] = (
+    ("auto", "自动识别"),
+    ("mtp", "MTP"),
+    ("dflash", "DFlash2"),
+    ("dspark", "DSpark"),
+)
+
+SPECULATIVE_ALGORITHM_VALUES = frozenset(
+    value for value, _label in SPECULATIVE_ALGORITHM_CHOICES
 )
 
 
@@ -312,6 +334,25 @@ FIELDS: Sequence[FormField] = (
     ),
     FormField("kv_cache_dtype", "缓存类型", "choice", "KV Cache 类型，可使用 auto、float16、bfloat16 或 fp8。", KV_CACHE_DTYPE_CHOICES),
     FormField("mtp", "MTP", "text", "支持 MTP 的模型每步生成的 draft token 数；0 表示关闭，1-8 开启，auto 表示不指定。"),
+    FormField(
+        "speculative_algorithm",
+        "推测算法",
+        "choice",
+        "自动识别 draft checkpoint，或显式选择 MTP、DFlash2、DSpark。",
+        SPECULATIVE_ALGORITHM_CHOICES,
+    ),
+    FormField(
+        "speculative_draft_model_path",
+        "Draft模型路径",
+        "text",
+        "外置 MTP、DFlash2 或 DSpark checkpoint；留空使用模型内置能力。",
+    ),
+    FormField(
+        "draft_tokens",
+        "Draft Token数",
+        "text",
+        "每轮最多使用的 draft token 数；auto 表示读取 checkpoint 配置。",
+    ),
     FormField("max_batch", "最大Batch", "text", "每次最多同时推理的询问数量；auto 表示不指定。"),
     FormField(
         "max_context_length",
@@ -337,6 +378,21 @@ FIELDS: Sequence[FormField] = (
         "text",
         "设置后 server 会校验 Bearer token；留空表示不校验。",
         visible=lambda c: c.command == "server",
+    ),
+    FormField(
+        "webui_max_token",
+        "WebUI最大输出Token",
+        "text",
+        "网页聊天单次生成的最大 token 数。",
+        visible=lambda c: c.command == "webui",
+    ),
+    FormField(
+        "webui_think",
+        "WebUI思考模式",
+        "choice",
+        "开启后在缺少 <think> 起始标记时补齐该标记。",
+        ENABLE_THINKING_CHOICES[1:],
+        visible=lambda c: c.command == "webui",
     ),
     FormField("extra_args", "其它参数", "text", "直接追加到 ftllm 命令末尾，例如 --cuda_slab 1024。"),
     FormField("env_vars", "环境变量", "text", "启动前设置环境变量，格式 KEY=VALUE KEY2=VALUE2，例如 FASTLLM_ACTIVATE_NUMA=ON。"),
@@ -856,8 +912,17 @@ def config_from_dict(data: dict) -> DeployConfig:
     has_enable_moe_hybrid = "enable_moe_hybrid" in data
     has_moe_device_layers = "moe_device_layers" in data
     for key, value in data.items():
-        if key in valid_keys:
-            setattr(config, key, value)
+        if key not in valid_keys:
+            continue
+        default = getattr(config, key)
+        if isinstance(default, bool):
+            if isinstance(value, str):
+                value = value.strip().lower() in ("1", "true", "yes", "on")
+            else:
+                value = bool(value)
+        elif isinstance(default, str):
+            value = "" if value is None else str(value)
+        setattr(config, key, value)
     normalize_main_device_config(config)
     normalize_moe_hybrid_config(config, has_enable_moe_hybrid, has_moe_device_layers)
     return config
@@ -1020,6 +1085,17 @@ def build_fastllm_argv(config: DeployConfig) -> List[str]:
     _add_option(argv, "-t", _optional_text(config.threads))
     _add_option(argv, "--kv_cache_limit", _optional_text(config.kv_cache_limit))
     _add_option(argv, "--mtp", _optional_text(config.mtp))
+    _add_option(
+        argv,
+        "--speculative_algorithm",
+        _optional_text(config.speculative_algorithm),
+    )
+    _add_option(
+        argv,
+        "--speculative_draft_model_path",
+        _expand_user_path(config.speculative_draft_model_path.strip()),
+    )
+    _add_option(argv, "--draft_tokens", _optional_text(config.draft_tokens))
     _add_option(argv, "--max_batch", _optional_text(config.max_batch))
     _add_option(argv, "--cache_dir", _expand_user_path(config.cache_dir.strip()))
     if is_gguf_model(config.model):
@@ -1039,6 +1115,8 @@ def build_fastllm_argv(config: DeployConfig) -> List[str]:
             argv.append("--hide_input")
     elif config.command == "webui":
         _add_option(argv, "--port", config.port.strip())
+        _add_option(argv, "--max_token", config.webui_max_token.strip())
+        _add_option(argv, "--think", config.webui_think.strip())
 
     extra_args = config.extra_args.strip()
     if extra_args:
@@ -1077,18 +1155,72 @@ def validate_config(config: DeployConfig) -> List[str]:
         except ValueError:
             errors.append("端口必须是整数。")
 
+    if config.command == "webui":
+        if (
+            not _is_positive_int_or_auto(config.webui_max_token)
+            or _is_auto_or_empty(config.webui_max_token)
+        ):
+            errors.append("WebUI最大输出Token必须是正整数。")
+        if config.webui_think not in ("true", "false"):
+            errors.append("WebUI思考模式必须是 true 或 false。")
+
     for label, value in (
         ("预处理分片大小", config.chunked_prefill_size),
         ("最大Batch", config.max_batch),
         ("单会话上下文", config.max_context_length),
         ("tokens数量", config.tokens),
         ("线程数", config.threads),
+        ("Draft Token数", config.draft_tokens),
     ):
         if not _is_positive_int_or_auto(value):
             errors.append(f"{label}必须是正整数或 auto。")
 
     if not _is_mtp_value(config.mtp):
         errors.append("MTP 必须是 0-8 的整数或 auto。")
+
+    speculative_algorithm = str(config.speculative_algorithm).strip().lower()
+    if (
+        speculative_algorithm
+        and speculative_algorithm not in SPECULATIVE_ALGORITHM_VALUES
+    ):
+        errors.append("推测算法必须是 auto、mtp、dflash 或 dspark。")
+
+    draft_path = _expand_user_path(config.speculative_draft_model_path.strip())
+    draft_path_exists = bool(
+        draft_path
+        and (os.path.isdir(draft_path) or os.path.isfile(draft_path))
+    )
+    if draft_path and not draft_path_exists:
+        errors.append("Draft模型路径必须是已存在的本地目录或文件。")
+
+    try:
+        mtp_tokens = int(str(config.mtp).strip())
+    except ValueError:
+        mtp_tokens = 0
+    try:
+        draft_tokens = int(str(config.draft_tokens).strip())
+    except ValueError:
+        draft_tokens = 0
+
+    if speculative_algorithm == "dflash":
+        if not draft_path:
+            errors.append("DFlash2 必须指定 Draft模型路径。")
+        elif draft_path_exists and not os.path.isdir(draft_path):
+            errors.append("DFlash2 的 Draft模型路径必须是目录。")
+        if mtp_tokens > 0:
+            errors.append("DFlash2 和 MTP 不能同时启用。")
+    elif speculative_algorithm == "mtp":
+        if not draft_path and mtp_tokens <= 0:
+            errors.append("内置 MTP 必须指定 1-8 的 MTP token 数。")
+        if mtp_tokens > 0 and draft_tokens > 0 and mtp_tokens != draft_tokens:
+            errors.append("MTP Token 数和 Draft Token 数必须一致。")
+    elif speculative_algorithm == "dspark":
+        if draft_path_exists and not os.path.isdir(draft_path):
+            errors.append("DSpark 的 Draft模型路径必须是目录。")
+        if not draft_path and draft_tokens <= 0:
+            errors.append("内置 DSpark 必须指定 Draft Token 数。")
+        if mtp_tokens > 0:
+            errors.append("DSpark 和 MTP 不能同时启用。")
 
     if not _is_ratio(config.gpu_mem_ratio):
         errors.append("显存利用率必须是 0 到 1 之间的数字，例如 0.9。")

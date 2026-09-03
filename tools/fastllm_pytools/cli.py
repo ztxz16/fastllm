@@ -79,6 +79,26 @@ def args_parser():
     webui_parser_.add_argument("--max_token", type = int, default = 4096, help = "输出最大token数")
     webui_parser_.add_argument("--think", type = str, default = "false", help = "if <think> lost")
 
+    # 浏览器部署启动器。与 webui 一样启动本地网页，但不加载模型；
+    # 模型服务由页面中的独立子进程托管。
+    launch_parser_ = subparsers.add_parser(
+        'launch', help = '浏览器部署启动器'
+    )
+    launch_parser_.add_argument(
+        '--host', type = str, default = '127.0.0.1',
+        help = '启动器监听地址；需要从其他设备访问时可设为 0.0.0.0'
+    )
+    launch_parser_.add_argument(
+        '--port', type = int, default = 8000,
+        help = '启动器端口号（默认 8000）'
+    )
+    launch_parser_.add_argument(
+        '--no-browser', action = 'store_true', help = '不自动打开浏览器'
+    )
+    launch_parser_.add_argument(
+        '--config', type = str, default = '', help = '自定义启动配置文件路径'
+    )
+
     from .util import add_server_args
     add_server_args(shared_parser)
     subparsers.add_parser('serve', parents = [shared_parser], help = 'api模式')
@@ -119,16 +139,15 @@ def _run_webui(args, forwarded_args):
 
 def main(argv=None):
     raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if not raw_argv:
+        raw_argv = ["launch"]
     args = args_parser().parse_args(raw_argv)
     if (args.version):
         from . import __version__
         print("ftllm version: " + __version__)
         return
     # 根据不同的子命令执行不同的操作
-    if args.command is None:
-        from .tui import FastllmTUI
-        raise SystemExit(FastllmTUI())
-    elif args.command == 'tui':
+    if args.command == 'tui':
         from .tui import FastllmTUI
         raise SystemExit(FastllmTUI(plain = args.plain))
     elif args.command == 'config':
@@ -155,6 +174,9 @@ def main(argv=None):
         # Pass only the options the caller supplied. Parser defaults such as
         # -1 must not become explicit web_demo.py arguments.
         return _run_webui(args, raw_argv[1:])
+    elif args.command == 'launch':
+        from .launcher import fastllm_launcher
+        return fastllm_launcher(args)
     elif args.command in ('server', 'serve'):
         from .server import fastllm_server
         fastllm_server(args)

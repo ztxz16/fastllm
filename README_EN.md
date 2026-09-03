@@ -74,14 +74,19 @@ ftllm run Qwen/Qwen3-0.6B
 # WebUI, listening on port 1616 by default
 ftllm webui Qwen/Qwen3-0.6B
 
-# Terminal deployment wizard; no arguments is equivalent to ftllm tui
+# Browser deployment launcher; no arguments starts it and opens the local page
 ftllm
+ftllm launch  # Equivalent form
+
+# Terminal deployment wizard
 ftllm tui
 
 # Benchmark
 ftllm bench Qwen/Qwen3-0.6B \
   --device cuda --input_tokens 512 --output_tokens 128 --batch 4
 ~~~
+
+`ftllm` (or `ftllm launch`) listens only on `127.0.0.1:8000` by default and opens the browser after the service is ready; use `ftllm launch --no-browser` to disable automatic opening. The page can download models from ModelScope, save and preview launch profiles, and run either `ftllm server` or the chat-oriented `ftllm webui`. To access it from the LAN, run `ftllm launch --host 0.0.0.0`; the terminal and Launcher page then list loopback, LAN, and directly assigned public-interface addresses when available. Public access also requires the host firewall and cloud security group to allow the port, plus port forwarding when behind NAT; Launcher does not discover NAT public mappings. Non-loopback access uses unencrypted HTTP and should only be enabled on a trusted network. It shares profiles with the terminal wizard and stops its managed download and model processes when the launcher exits. Run `ftllm launch --help` for other options.
 
 The `model` positional argument can be a Hugging Face repository ID, a local Hugging Face model directory, an exported FastLLM model, or a configuration file:
 

@@ -1,8 +1,8 @@
-from setuptools import setup, find_packages
+from setuptools import setup
 
 server_require = ['fastapi', 'pydantic', 'openai', 'shortuuid', 'uvicorn']
 webui_require = ['streamlit-chat']
-download_require = ['aria2']
+download_require = ['aria2', 'modelscope>=1.34.0,<2']
 all_require = server_require + webui_require + download_require
 
 setup (
@@ -19,7 +19,8 @@ setup (
     },
     packages = ['ftllm', 'ftllm/openai_server', 'ftllm/openai_server/protocal'],
     package_data = {
-        '': ['*.dll', '*.so', '*.dylib', '*.so.*']
+        '': ['*.dll', '*.so', '*.dylib', '*.so.*',
+             'launcher_assets/*']
     },
     install_requires=[
         'pyreadline3',
