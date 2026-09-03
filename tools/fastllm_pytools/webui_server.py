@@ -3,6 +3,7 @@ import base64
 import json
 import mimetypes
 import os
+import socket
 import threading
 import time
 import urllib.error
@@ -60,6 +61,86 @@ except ImportError:
 
 WEB_MODES = {"关闭", "快速搜索", "深度浏览"}
 THINKING_LEVELS = {"关闭", "低", "中", "高"}
+
+
+class GenerationCancelled(RuntimeError):
+    """Carries the useful partial result when a conversation is stopped."""
+
+    def __init__(
+        self,
+        content: str = "",
+        reasoning: str = "",
+        tool_calls: Optional[List[Dict[str, Any]]] = None,
+        sources: Optional[List[Dict[str, Any]]] = None,
+        artifacts: Optional[List[Dict[str, Any]]] = None,
+    ):
+        super().__init__("生成已停止")
+        self.content = str(content or "")
+        self.reasoning = str(reasoning or "")
+        self.tool_calls = list(tool_calls or [])
+        self.sources = list(sources or [])
+        self.artifacts = list(artifacts or [])
+
+
+class GenerationControl:
+    """Thread-safe cancellation state for one conversation generation."""
+
+    def __init__(self):
+        self.event = threading.Event()
+        self._resource_lock = threading.Lock()
+        self._resource: Optional[Any] = None
+
+    @property
+    def cancelled(self) -> bool:
+        return self.event.is_set()
+
+    def check(self, **partial: Any) -> None:
+        if self.cancelled:
+            raise GenerationCancelled(**partial)
+
+    def bind_resource(self, resource: Any) -> None:
+        with self._resource_lock:
+            if self.cancelled:
+                try:
+                    resource.close()
+                except Exception:
+                    pass
+                raise GenerationCancelled()
+            self._resource = resource
+
+    def release_resource(self, resource: Any) -> None:
+        with self._resource_lock:
+            if self._resource is resource:
+                self._resource = None
+
+    def cancel(self) -> None:
+        self.event.set()
+        with self._resource_lock:
+            resource = self._resource
+            self._resource = None
+        if resource is not None:
+            try:
+                stream = getattr(getattr(resource, "fp", None), "raw", None)
+                connection = getattr(stream, "_sock", None)
+                if connection is not None:
+                    connection.shutdown(socket.SHUT_RDWR)
+            except (OSError, AttributeError):
+                pass
+
+            def close_resource() -> None:
+                try:
+                    resource.close()
+                except Exception:
+                    pass
+
+            try:
+                threading.Thread(
+                    target=close_resource,
+                    name="fastllm-generation-cancel",
+                    daemon=True,
+                ).start()
+            except RuntimeError:
+                close_resource()
 
 
 def add_webui_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -317,12 +398,28 @@ class OpenAIModelClient:
         top_p: float = 1.0,
         top_k: int = 1,
         repeat_penalty: float = 1.0,
+        control: Optional[GenerationControl] = None,
     ) -> Tuple[str, str]:
+        if control is not None:
+            control.check()
         payload = self._payload(
             messages, max_tokens, temperature, top_p, top_k,
             repeat_penalty, thinking_level, stream=False)
-        with self._open("/chat/completions", payload) as response:
-            result = json.loads(response.read().decode("utf-8"))
+        response = self._open("/chat/completions", payload)
+        if control is not None:
+            control.bind_resource(response)
+        try:
+            with response:
+                result = json.loads(response.read().decode("utf-8"))
+        except Exception as error:
+            if control is not None and control.cancelled:
+                raise GenerationCancelled() from error
+            raise
+        finally:
+            if control is not None:
+                control.release_resource(response)
+        if control is not None:
+            control.check()
         try:
             message = result["choices"][0]["message"]
         except (KeyError, IndexError, TypeError) as error:
@@ -341,35 +438,53 @@ class OpenAIModelClient:
         top_p: float,
         top_k: int,
         repeat_penalty: float,
+        control: Optional[GenerationControl] = None,
     ) -> Iterator[Tuple[str, str]]:
+        if control is not None:
+            control.check()
         payload = self._payload(
             messages, max_tokens, temperature, top_p, top_k,
             repeat_penalty, thinking_level, stream=True)
-        with self._open("/chat/completions", payload) as response:
-            for raw_line in response:
-                line = raw_line.decode("utf-8", errors="replace").strip()
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    event = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
-                if "error" in event:
-                    detail = event["error"]
-                    if isinstance(detail, dict):
-                        detail = detail.get("message", detail)
-                    raise RuntimeError(str(detail))
-                choices = event.get("choices", [])
-                if not choices:
-                    continue
-                delta = choices[0].get("delta", {}) or {}
-                content = str(delta.get("content") or "")
-                reasoning = str(delta.get("reasoning_content") or "")
-                if content or reasoning:
-                    yield content, reasoning
+        response = self._open("/chat/completions", payload)
+        if control is not None:
+            control.bind_resource(response)
+        try:
+            with response:
+                for raw_line in response:
+                    if control is not None:
+                        control.check()
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        event = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    if "error" in event:
+                        detail = event["error"]
+                        if isinstance(detail, dict):
+                            detail = detail.get("message", detail)
+                        raise RuntimeError(str(detail))
+                    choices = event.get("choices", [])
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta", {}) or {}
+                    content = str(delta.get("content") or "")
+                    reasoning = str(delta.get("reasoning_content") or "")
+                    if content or reasoning:
+                        yield content, reasoning
+        except Exception as error:
+            if control is not None and control.cancelled:
+                raise GenerationCancelled() from error
+            raise
+        finally:
+            if control is not None:
+                control.release_resource(response)
+        if control is not None:
+            control.check()
 
 
 class WebUIRuntime:
@@ -394,7 +509,9 @@ class WebUIRuntime:
             api_key=str(getattr(args, "api_key", "")),
             timeout=float(getattr(args, "api_timeout", 3600.0)),
         )
-        self.generation_lock = threading.Lock()
+        self._generation_controls: Dict[str, GenerationControl] = {}
+        self._generation_controls_lock = threading.Lock()
+        self._pi_agent_lock = threading.Lock()
         self.pi_agent = None
         self.pi_agent_class = None
         self.pi_agent_error = ""
@@ -426,22 +543,69 @@ class WebUIRuntime:
     def _get_pi_agent(self):
         if self.agent_runtime != "pi" or self.pi_agent_class is None:
             raise RuntimeError("Pi 代码智能体运行时不可用")
-        if self.pi_agent is None:
-            if not self.api_client.model_name:
-                self.api_client.wait_until_ready(min(
-                    self.api_client.timeout, 30.0))
-            maximum = int(getattr(self.args, "max_token", -1))
-            self.pi_agent = self.pi_agent_class(
-                api_base=self.api_client.base_url,
-                model=self.api_client.model_name,
-                api_key=str(getattr(self.api_client, "api_key", "")),
-                timeout=float(getattr(self.args, "pi_agent_timeout", 300.0)),
-                context_window=int(getattr(
-                    self.args, "pi_agent_context_window", 40000)),
-                max_tokens=maximum if maximum > 0 else 4096,
-                max_turns=int(getattr(self.args, "pi_agent_max_turns", 8)),
-            )
+        with self._pi_agent_lock:
+            if self.pi_agent is None:
+                if not self.api_client.model_name:
+                    self.api_client.wait_until_ready(min(
+                        self.api_client.timeout, 30.0))
+                maximum = int(getattr(self.args, "max_token", -1))
+                self.pi_agent = self.pi_agent_class(
+                    api_base=self.api_client.base_url,
+                    model=self.api_client.model_name,
+                    api_key=str(getattr(self.api_client, "api_key", "")),
+                    timeout=float(getattr(
+                        self.args, "pi_agent_timeout", 300.0)),
+                    context_window=int(getattr(
+                        self.args, "pi_agent_context_window", 40000)),
+                    max_tokens=maximum if maximum > 0 else 4096,
+                    max_turns=int(getattr(
+                        self.args, "pi_agent_max_turns", 8)),
+                )
         return self.pi_agent
+
+    def begin_generation(self, conversation_id: str) -> GenerationControl:
+        with self._generation_controls_lock:
+            if conversation_id in self._generation_controls:
+                raise RuntimeError("该会话已有任务正在运行")
+            control = GenerationControl()
+            self._generation_controls[conversation_id] = control
+            return control
+
+    def is_generating(self, conversation_id: str) -> bool:
+        with self._generation_controls_lock:
+            return conversation_id in self._generation_controls
+
+    def cancel_generation(self, conversation_id: str) -> bool:
+        with self._generation_controls_lock:
+            control = self._generation_controls.get(conversation_id)
+        if control is None:
+            return False
+        control.cancel()
+        return True
+
+    def _end_generation(
+        self, conversation_id: str, control: GenerationControl
+    ) -> None:
+        with self._generation_controls_lock:
+            if self._generation_controls.get(conversation_id) is control:
+                self._generation_controls.pop(conversation_id, None)
+
+    def managed_generation(
+        self,
+        conversation_id: str,
+        control: GenerationControl,
+        generator: Iterator[bytes],
+    ) -> Iterator[bytes]:
+        try:
+            yield from generator
+        finally:
+            control.cancel()
+            try:
+                close = getattr(generator, "close", None)
+                if callable(close):
+                    close()
+            finally:
+                self._end_generation(conversation_id, control)
 
     def pi_agent_info(self) -> Dict[str, Any]:
         if self.agent_runtime != "pi":
@@ -534,13 +698,18 @@ class WebUIRuntime:
         self,
         api_messages: List[Dict[str, Any]],
         settings: Dict[str, Any],
+        control: GenerationControl,
     ):
         raw_content = ""
         api_reasoning = ""
-        with self.generation_lock:
-            for content_delta, reasoning_delta in self.api_client.stream(
-                api_messages, **self._generation_args(settings)
-            ):
+        stream = self.api_client.stream(
+            api_messages, control=control, **self._generation_args(settings))
+        try:
+            for content_delta, reasoning_delta in stream:
+                control.check(
+                    content=raw_content,
+                    reasoning=(api_reasoning or split_reasoning(raw_content)[0]),
+                )
                 raw_content += content_delta
                 api_reasoning += reasoning_delta
                 if api_reasoning:
@@ -552,6 +721,35 @@ class WebUIRuntime:
                     "reasoning": reasoning,
                     "content": content,
                 })
+        except GenerationCancelled as error:
+            reasoning, content = (
+                (api_reasoning, raw_content) if api_reasoning
+                else split_reasoning(raw_content)
+            )
+            raise GenerationCancelled(
+                content=content,
+                reasoning=reasoning,
+                tool_calls=error.tool_calls,
+                sources=error.sources,
+                artifacts=error.artifacts,
+            ) from error
+        except Exception as error:
+            if control.cancelled:
+                reasoning, content = (
+                    (api_reasoning, raw_content) if api_reasoning
+                    else split_reasoning(raw_content)
+                )
+                raise GenerationCancelled(
+                    content=content, reasoning=reasoning) from error
+            raise
+        finally:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                close()
+        control.check(
+            content=raw_content,
+            reasoning=(api_reasoning or split_reasoning(raw_content)[0]),
+        )
         if api_reasoning:
             return api_reasoning.strip(), raw_content.strip()
         return split_reasoning(raw_content)
@@ -617,7 +815,9 @@ class WebUIRuntime:
         settings: Dict[str, Any],
         source_files: Iterable[Any] = (),
         web_backend: Optional[Any] = None,
+        control: Optional[GenerationControl] = None,
     ):
+        control = control or GenerationControl()
         content = ""
         reasoning = ""
         tool_calls = []
@@ -643,8 +843,17 @@ class WebUIRuntime:
         }
         if web_backend is not None:
             stream_args["web_backend"] = web_backend
-        with self.generation_lock:
-            for event in self._get_pi_agent().stream(**stream_args):
+        stream_args["cancel_event"] = control.event
+        control.check()
+        stream = self._get_pi_agent().stream(**stream_args)
+        try:
+            for event in stream:
+                control.check(
+                    content=content,
+                    reasoning=reasoning,
+                    tool_calls=tool_calls,
+                    sources=web_sources,
+                )
                 event_type = str(event.get("type", ""))
                 if event_type == "turn_start":
                     had_progress = bool(content or reasoning)
@@ -719,6 +928,32 @@ class WebUIRuntime:
                 elif event_type == "done" and event.get("web_sources"):
                     web_sources = _compact_sources(
                         event.get("web_sources", []))
+        except GenerationCancelled as error:
+            raise GenerationCancelled(
+                content=content or error.content,
+                reasoning=reasoning or error.reasoning,
+                tool_calls=tool_calls or error.tool_calls,
+                sources=web_sources or error.sources,
+            ) from error
+        except Exception as error:
+            if control.cancelled:
+                raise GenerationCancelled(
+                    content=content,
+                    reasoning=reasoning,
+                    tool_calls=tool_calls,
+                    sources=web_sources,
+                ) from error
+            raise
+        finally:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                close()
+        control.check(
+            content=content,
+            reasoning=reasoning,
+            tool_calls=tool_calls,
+            sources=web_sources,
+        )
         if (len(content) != last_content_length
                 or len(reasoning) != last_reasoning_length):
             yield _json_line({
@@ -727,6 +962,32 @@ class WebUIRuntime:
                 "content": content,
             })
         return reasoning.strip(), content.strip(), tool_calls, web_sources
+
+    @staticmethod
+    def _cancelled_message(
+        error: GenerationCancelled,
+        *,
+        sources: Optional[List[Dict[str, Any]]] = None,
+        artifacts: Optional[List[Dict[str, Any]]] = None,
+        tool_calls: Optional[List[Dict[str, Any]]] = None,
+        agent_runtime: str = "",
+    ) -> Dict[str, Any]:
+        message: Dict[str, Any] = {
+            "role": "assistant",
+            "content": error.content.strip() or "已停止生成。",
+            "reasoning": error.reasoning.strip(),
+            "sources": list(
+                sources if sources is not None else error.sources),
+            "artifacts": list(
+                artifacts if artifacts is not None else error.artifacts),
+            "cancelled": True,
+        }
+        effective_tool_calls = list(error.tool_calls or tool_calls or [])
+        if effective_tool_calls:
+            message["tool_calls"] = effective_tool_calls
+        if agent_runtime:
+            message["agent_runtime"] = agent_runtime
+        return message
 
     def _finish_generation(
         self,
@@ -815,6 +1076,7 @@ class WebUIRuntime:
 
     def public_record(self, record: Dict[str, Any]) -> Dict[str, Any]:
         result = dict(record)
+        result["generating"] = self.is_generating(str(record["id"]))
         result["messages"] = [
             self.public_message(record["id"], message)
             for message in record.get("messages", [])
@@ -858,10 +1120,12 @@ class WebUIRuntime:
         messages: List[Dict[str, Any]],
         settings: Dict[str, Any],
         title: str,
+        control: Optional[GenerationControl] = None,
     ):
+        control = control or GenerationControl()
         if str(settings.get("agent_mode", "chat")) == "code":
             yield from self.generate_code(
-                conversation_id, messages, settings, title)
+                conversation_id, messages, settings, title, control)
             return
 
         web_result = {"context": "", "sources": [], "warnings": []}
@@ -948,6 +1212,7 @@ class WebUIRuntime:
                         effective_system_prompt,
                         settings,
                         web_backend=self.web_agent,
+                        control=control,
                     )
                 )
                 web_result["sources"] = pi_sources
@@ -955,7 +1220,7 @@ class WebUIRuntime:
                 api_messages = self.build_api_messages(
                     messages, system_prompt=effective_system_prompt)
                 reasoning, content = yield from self._stream_model(
-                    api_messages, settings)
+                    api_messages, settings, control)
             if not content and reasoning:
                 content = "思考过程未完成（已达到输出长度上限）。"
             sources = (
@@ -976,6 +1241,26 @@ class WebUIRuntime:
                     "agent_runtime": "pi",
                     "tool_calls": tool_calls,
                 })
+        except GenerationCancelled as error:
+            if pi_web and error.sources:
+                web_result["sources"] = error.sources
+            sources = (
+                self._public_file_sources(
+                    conversation_id,
+                    knowledge_result.get("sources", []),
+                    kind="document",
+                )
+                + _compact_sources(web_result.get("sources", [])))
+            assistant_message = self._cancelled_message(
+                error,
+                sources=sources,
+                tool_calls=tool_calls,
+                agent_runtime="pi" if pi_web else "",
+            )
+            yield _json_line({
+                "type": "cancelled", "message": "已停止生成。",
+                "message_key": "status.generation_stopped",
+            })
         except Exception as error:
             assistant_message = {
                 "role": "assistant",
@@ -1033,9 +1318,14 @@ class WebUIRuntime:
         messages: List[Dict[str, Any]],
         settings: Dict[str, Any],
         title: str,
+        control: Optional[GenerationControl] = None,
     ):
+        control = control or GenerationControl()
         prompt = str(messages[-1].get("content", ""))
         attachments = _code_attachments(messages)
+        code_sources: List[Dict[str, Any]] = []
+        artifacts: List[Dict[str, Any]] = []
+        tool_calls: List[Dict[str, Any]] = []
         assistant_message: Dict[str, Any]
         yield _json_line({
             "type": "status",
@@ -1091,8 +1381,6 @@ class WebUIRuntime:
                 str(settings.get("system_prompt", "")).strip(),
                 self.code_agent.system_prompt(agent_context),
             ) if part)
-            artifacts: List[Dict[str, Any]] = []
-            tool_calls: List[Dict[str, Any]] = []
             if self.agent_runtime == "pi":
                 reasoning, content, tool_calls, _ = yield from (
                     self._stream_pi_agent(
@@ -1100,13 +1388,22 @@ class WebUIRuntime:
                         effective_system_prompt,
                         settings,
                         source_files=source_files,
+                        control=control,
                     )
                 )
             else:
                 api_messages = self.build_api_messages(
                     messages, system_prompt=effective_system_prompt)
                 reasoning, content = yield from self._stream_model(
-                    api_messages, settings)
+                    api_messages, settings, control)
+
+            control.check(
+                content=content,
+                reasoning=reasoning,
+                tool_calls=tool_calls,
+                sources=code_sources,
+                artifacts=artifacts,
+            )
 
             try:
                 patch = self.code_agent.extract_patch(content)
@@ -1147,6 +1444,18 @@ class WebUIRuntime:
                 "agent_runtime": self.agent_runtime,
                 "tool_calls": tool_calls,
             }
+        except GenerationCancelled as error:
+            assistant_message = self._cancelled_message(
+                error,
+                sources=code_sources,
+                artifacts=artifacts,
+                tool_calls=tool_calls,
+                agent_runtime=self.agent_runtime,
+            )
+            yield _json_line({
+                "type": "cancelled", "message": "已停止生成。",
+                "message_key": "status.generation_stopped",
+            })
         except Exception as error:
             assistant_message = {
                 "role": "assistant",
@@ -1165,9 +1474,14 @@ class WebUIRuntime:
         settings: Dict[str, Any],
         title: str,
         question: str,
+        control: Optional[GenerationControl] = None,
     ):
+        control = control or GenerationControl()
         attachments = _data_attachments(messages)
         artifacts: List[Dict[str, Any]] = []
+        sources: List[Dict[str, Any]] = []
+        reasoning = ""
+        content = ""
         assistant_message: Dict[str, Any]
         yield _json_line({
             "type": "status",
@@ -1198,18 +1512,20 @@ class WebUIRuntime:
             })
             raw_plan = ""
             try:
-                with self.generation_lock:
-                    planning_messages = self.data_agent.planning_messages(
-                        question, profiles)
-                    raw_plan, _ = self.api_client.complete(
-                        planning_messages,
-                        max_tokens=2048,
-                        thinking_level="关闭",
-                        top_p=1.0,
-                        top_k=1,
-                        temperature=1.0,
-                        repeat_penalty=1.0,
-                    )
+                planning_messages = self.data_agent.planning_messages(
+                    question, profiles)
+                raw_plan, _ = self.api_client.complete(
+                    planning_messages,
+                    max_tokens=2048,
+                    thinking_level="关闭",
+                    top_p=1.0,
+                    top_k=1,
+                    temperature=1.0,
+                    repeat_penalty=1.0,
+                    control=control,
+                )
+            except GenerationCancelled:
+                raise
             except Exception as error:
                 yield _json_line({
                     "type": "warning",
@@ -1233,6 +1549,7 @@ class WebUIRuntime:
                 plan, datasets, self.store.analysis_directory(conversation_id))
             artifacts = list(report["artifacts"])
             sources = self._public_data_sources(conversation_id, attachments)
+            control.check(sources=sources, artifacts=artifacts)
             legend = "\n".join(
                 f"[数据{source['index']}] {source['title']}"
                 for source in sources)
@@ -1243,8 +1560,6 @@ class WebUIRuntime:
                 "message": "正在解读分析结果…",
                 "message_key": "status.interpret_data",
             })
-            reasoning = ""
-            content = ""
             try:
                 system_prompt = "\n\n".join(part for part in (
                     str(settings.get("system_prompt", "")).strip(),
@@ -1261,7 +1576,9 @@ class WebUIRuntime:
                         f"已执行的分析结果：\n{analysis_context}"),
                 }]
                 reasoning, content = yield from self._stream_model(
-                    analysis_messages, settings)
+                    analysis_messages, settings, control)
+            except GenerationCancelled:
+                raise
             except Exception as error:
                 yield _json_line({
                     "type": "warning",
@@ -1280,6 +1597,13 @@ class WebUIRuntime:
                 "sources": sources,
                 "artifacts": artifacts,
             }
+        except GenerationCancelled as error:
+            assistant_message = self._cancelled_message(
+                error, sources=sources, artifacts=artifacts)
+            yield _json_line({
+                "type": "cancelled", "message": "已停止生成。",
+                "message_key": "status.generation_stopped",
+            })
         except Exception as error:
             assistant_message = {
                 "role": "assistant",
@@ -1302,9 +1626,12 @@ class WebUIRuntime:
         slide_count: int,
         style: str,
         web_mode: str,
+        control: Optional[GenerationControl] = None,
     ):
+        control = control or GenerationControl()
         web_result = {"context": "", "sources": [], "warnings": []}
         knowledge_result = {"context": "", "sources": [], "warnings": []}
+        sources: List[Dict[str, Any]] = []
         documents = _document_attachments(messages)
         if documents:
             yield _json_line({
@@ -1357,52 +1684,55 @@ class WebUIRuntime:
             "message_params": {"count": slide_count},
         })
         try:
-            with self.generation_lock:
-                style_name = THEMES.get(style, THEMES["tech"])["name"]
-                reference_context = "\n\n".join(
-                    part for part in (
-                        knowledge_result.get("context", ""),
-                        web_result.get("context", ""),
-                    ) if part)
-                prompt_messages = presentation_prompt(
-                    topic,
-                    audience,
-                    slide_count,
-                    style_name,
-                    reference_context,
+            control.check()
+            style_name = THEMES.get(style, THEMES["tech"])["name"]
+            reference_context = "\n\n".join(
+                part for part in (
+                    knowledge_result.get("context", ""),
+                    web_result.get("context", ""),
+                ) if part)
+            prompt_messages = presentation_prompt(
+                topic,
+                audience,
+                slide_count,
+                style_name,
+                reference_context,
+            )
+            raw_plan, _ = self.api_client.complete(
+                prompt_messages,
+                max_tokens=6144,
+                thinking_level="关闭",
+                top_p=1.0,
+                top_k=1,
+                temperature=1.0,
+                repeat_penalty=1.0,
+                control=control,
+            )
+            sources = (
+                self._public_file_sources(
+                    conversation_id,
+                    knowledge_result.get("sources", []),
+                    kind="document",
                 )
-                raw_plan, _ = self.api_client.complete(
-                    prompt_messages,
-                    max_tokens=6144,
-                    thinking_level="关闭",
-                    top_p=1.0,
-                    top_k=1,
-                    temperature=1.0,
-                    repeat_penalty=1.0,
-                )
-                sources = (
-                    self._public_file_sources(
-                        conversation_id,
-                        knowledge_result.get("sources", []),
-                        kind="document",
-                    )
-                    + _compact_sources(web_result.get("sources", [])))
-                plan = normalize_deck_plan(
-                    raw_plan, topic, audience, slide_count, sources=sources)
-                preview = plan_preview(plan)
-                yield _json_line({
-                    "type": "plan",
-                    "title": plan["title"],
-                    "slides": preview,
-                })
-                yield _json_line({
-                    "type": "status",
-                    "message": "大纲已完成，正在生成可编辑 PPTX…",
-                    "message_key": "status.render_ppt",
-                })
-                output_path = self.store.new_presentation_path(conversation_id)
-                report = render_presentation(
-                    plan, str(output_path), style=style, audience=audience)
+                + _compact_sources(web_result.get("sources", [])))
+            plan = normalize_deck_plan(
+                raw_plan, topic, audience, slide_count, sources=sources)
+            preview = plan_preview(plan)
+            yield _json_line({
+                "type": "plan",
+                "title": plan["title"],
+                "slides": preview,
+            })
+            yield _json_line({
+                "type": "status",
+                "message": "大纲已完成，正在生成可编辑 PPTX…",
+                "message_key": "status.render_ppt",
+            })
+            control.check(sources=sources)
+            output_path = self.store.new_presentation_path(conversation_id)
+            report = render_presentation(
+                plan, str(output_path), style=style, audience=audience)
+            control.check(sources=sources)
 
             display_name = "".join(
                 character if character not in '\\/:*?\"<>|' else "-"
@@ -1425,6 +1755,14 @@ class WebUIRuntime:
                 "sources": sources,
                 "artifacts": [artifact],
             }
+        except GenerationCancelled as error:
+            if output_path is not None and output_path.exists():
+                output_path.unlink()
+            assistant_message = self._cancelled_message(error, sources=sources)
+            yield _json_line({
+                "type": "cancelled", "message": "已停止生成。",
+                "message_key": "status.generation_stopped",
+            })
         except Exception as error:
             if output_path is not None and output_path.exists():
                 output_path.unlink()
@@ -1464,6 +1802,27 @@ def create_app(args: argparse.Namespace):
                 if os.path.basename(str(artifact.get("path", ""))) == path.name:
                     return str(artifact.get("name", path.name))
         return path.name
+
+    def begin_generation(conversation_id: str) -> GenerationControl:
+        try:
+            return runtime.begin_generation(conversation_id)
+        except RuntimeError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    def generation_response(
+        conversation_id: str,
+        control: GenerationControl,
+        generator: Iterator[bytes],
+    ) -> StreamingResponse:
+        return StreamingResponse(
+            runtime.managed_generation(conversation_id, control, generator),
+            media_type="application/x-ndjson",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    def require_idle(conversation_id: str) -> None:
+        if runtime.is_generating(conversation_id):
+            raise HTTPException(status_code=409, detail="请先停止该会话的当前任务")
 
     @app.get("/", response_class=HTMLResponse)
     def index():
@@ -1511,7 +1870,10 @@ def create_app(args: argparse.Namespace):
 
     @app.get("/api/conversations")
     def conversations():
-        return runtime.store.list_conversations()
+        return [
+            {**record, "generating": runtime.is_generating(record["id"])}
+            for record in runtime.store.list_conversations()
+        ]
 
     @app.post("/api/conversations")
     async def create_conversation(request: Request):
@@ -1533,6 +1895,7 @@ def create_app(args: argparse.Namespace):
     @app.patch("/api/conversations/{conversation_id}")
     async def update_conversation(conversation_id: str, request: Request):
         record = load(conversation_id)
+        require_idle(conversation_id)
         payload = await request.json()
         settings = dict(record["settings"])
         if isinstance(payload.get("settings"), dict):
@@ -1548,12 +1911,19 @@ def create_app(args: argparse.Namespace):
     @app.delete("/api/conversations/{conversation_id}")
     def delete_conversation(conversation_id: str):
         load(conversation_id)
+        require_idle(conversation_id)
         runtime.store.delete_conversation(conversation_id)
         return {"ok": True}
+
+    @app.post("/api/conversations/{conversation_id}/cancel")
+    def cancel_generation(conversation_id: str):
+        load(conversation_id)
+        return {"cancelled": runtime.cancel_generation(conversation_id)}
 
     @app.post("/api/conversations/{conversation_id}/attachments")
     async def upload_attachment(conversation_id: str, request: Request):
         load(conversation_id)
+        require_idle(conversation_id)
         content_length = request.headers.get("content-length")
         try:
             too_large = (
@@ -1645,6 +2015,7 @@ def create_app(args: argparse.Namespace):
             raise HTTPException(status_code=400, detail="消息不能为空")
         if not prompt:
             prompt = "请描述并分析这些附件。"
+        control = begin_generation(conversation_id)
         messages = list(record["messages"])
         messages.append({
             "role": "user", "content": prompt, "attachments": attachments,
@@ -1652,14 +2023,18 @@ def create_app(args: argparse.Namespace):
         title = record["title"]
         if len(messages) == 1 and title == "新对话":
             title = conversation_title(prompt)
-        runtime.store.save_conversation(
-            conversation_id, messages, settings=record["settings"], title=title)
-        return StreamingResponse(
-            runtime.generate(
-                conversation_id, messages, record["settings"], title),
-            media_type="application/x-ndjson",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
+        try:
+            runtime.store.save_conversation(
+                conversation_id, messages, settings=record["settings"], title=title)
+            return generation_response(
+                conversation_id,
+                control,
+                runtime.generate(
+                    conversation_id, messages, record["settings"], title, control),
+            )
+        except Exception:
+            runtime._end_generation(conversation_id, control)
+            raise
 
     @app.post("/api/conversations/{conversation_id}/presentations")
     async def create_presentation(conversation_id: str, request: Request):
@@ -1682,6 +2057,7 @@ def create_app(args: argparse.Namespace):
         web_mode = str(payload.get("web_mode", "关闭"))
         if web_mode not in WEB_MODES:
             web_mode = "关闭"
+        control = begin_generation(conversation_id)
         messages = list(record["messages"])
         user_message = {
             "role": "user",
@@ -1695,23 +2071,28 @@ def create_app(args: argparse.Namespace):
         title = record["title"]
         if len(messages) == 1 and title == "新对话":
             title = conversation_title(topic)
-        runtime.store.save_conversation(
-            conversation_id, messages, settings=record["settings"], title=title)
-        return StreamingResponse(
-            runtime.generate_presentation(
+        try:
+            runtime.store.save_conversation(
+                conversation_id, messages, settings=record["settings"], title=title)
+            return generation_response(
                 conversation_id,
-                messages,
-                record["settings"],
-                title,
-                topic,
-                audience,
-                slide_count,
-                style,
-                web_mode,
-            ),
-            media_type="application/x-ndjson",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
+                control,
+                runtime.generate_presentation(
+                    conversation_id,
+                    messages,
+                    record["settings"],
+                    title,
+                    topic,
+                    audience,
+                    slide_count,
+                    style,
+                    web_mode,
+                    control,
+                ),
+            )
+        except Exception:
+            runtime._end_generation(conversation_id, control)
+            raise
 
     @app.post("/api/conversations/{conversation_id}/analyses")
     async def create_analysis(conversation_id: str, request: Request):
@@ -1744,17 +2125,23 @@ def create_app(args: argparse.Namespace):
                 status_code=400,
                 detail="请先上传 CSV、TSV、JSON、JSONL 或 XLSX 数据文件",
             )
+        control = begin_generation(conversation_id)
         title = record["title"]
         if len(messages) == 1 and title == "新对话":
             title = conversation_title(question)
-        runtime.store.save_conversation(
-            conversation_id, messages, settings=record["settings"], title=title)
-        return StreamingResponse(
-            runtime.generate_analysis(
-                conversation_id, messages, record["settings"], title, question),
-            media_type="application/x-ndjson",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
+        try:
+            runtime.store.save_conversation(
+                conversation_id, messages, settings=record["settings"], title=title)
+            return generation_response(
+                conversation_id,
+                control,
+                runtime.generate_analysis(
+                    conversation_id, messages, record["settings"], title,
+                    question, control),
+            )
+        except Exception:
+            runtime._end_generation(conversation_id, control)
+            raise
 
     return app
 

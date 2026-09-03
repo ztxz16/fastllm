@@ -1,9 +1,12 @@
 from datetime import datetime
+import asyncio
 import io
 import json
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 import zipfile
@@ -33,7 +36,12 @@ from data_agent import DataAgent
 from knowledge_agent import KnowledgeAgent
 from webui_history import ChatStore, attachment_kind, conversation_title
 from webui_reasoning import split_reasoning
-from webui_server import OpenAIModelClient, add_webui_args, create_app
+from webui_server import (
+    GenerationControl,
+    OpenAIModelClient,
+    add_webui_args,
+    create_app,
+)
 from pptx_generator import generate_presentation, normalize_deck_plan
 
 
@@ -376,6 +384,31 @@ class WebUIReasoningTests(unittest.TestCase):
 
 
 class OpenAIModelClientTests(unittest.TestCase):
+    def test_cancel_does_not_wait_for_a_blocked_response_close(self):
+        class BlockingResource:
+            fp = None
+
+            def __init__(self):
+                self.close_started = threading.Event()
+                self.release = threading.Event()
+
+            def close(self):
+                self.close_started.set()
+                self.release.wait(2)
+
+        resource = BlockingResource()
+        control = GenerationControl()
+        control.bind_resource(resource)
+        started = time.monotonic()
+        control.cancel()
+        elapsed = time.monotonic() - started
+        try:
+            self.assertLess(elapsed, 0.5)
+            self.assertTrue(resource.close_started.wait(0.5))
+            self.assertTrue(control.cancelled)
+        finally:
+            resource.release.set()
+
     def test_webui_parser_contains_only_runtime_options(self):
         import argparse
 
@@ -511,6 +544,9 @@ class WebUIServerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn(f'data-agent="{agent}"', page.text)
             self.assertIn('id="agentButton"', page.text)
             self.assertIn('id="webButton"', page.text)
+            self.assertIn('id="stopButton"', page.text)
+            self.assertIn('id="newChat"', page.text)
+            self.assertNotIn("state.generating", page.text)
             self.assertIn('id="languageButton"', page.text)
             self.assertIn('<span id="languageLabel">简体中文</span>', page.text)
             self.assertIn('id="conversationActionMenu"', page.text)
@@ -612,6 +648,110 @@ class WebUIServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(ppt_file.status_code, 200)
             self.assertTrue(ppt_file.content.startswith(b"PK"))
             await client.aclose()
+
+    async def test_generations_are_per_conversation_and_can_be_cancelled(self):
+        import httpx
+
+        class ConcurrentAPIClient:
+            model_name = "demo"
+            base_url = "http://test-api/v1"
+
+            def __init__(self):
+                self.started = {
+                    "first": threading.Event(),
+                    "second": threading.Event(),
+                }
+                self.release = {
+                    "first": threading.Event(),
+                    "second": threading.Event(),
+                }
+                self.lock = threading.Lock()
+                self.active = 0
+                self.max_active = 0
+
+            def stream(self, messages, control=None, **_kwargs):
+                prompt = messages[-1]["content"]
+                with self.lock:
+                    self.active += 1
+                    self.max_active = max(self.max_active, self.active)
+                self.started[prompt].set()
+                try:
+                    yield (f"{prompt}-partial", "")
+                    while not self.release[prompt].wait(0.02):
+                        if control is not None:
+                            control.check()
+                    yield ("-done", "")
+                finally:
+                    with self.lock:
+                        self.active -= 1
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            args = SimpleNamespace(
+                model="/models/demo", path="", title="FastLLM Test",
+                history_dir=temp_dir, max_upload_mb=1,
+                agent_runtime="builtin", web_search_timeout=1.0,
+                max_token=-1,
+            )
+            app = create_app(args)
+            fake_api = ConcurrentAPIClient()
+            app.state.runtime.api_client = fake_api
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://testserver",
+            ) as client:
+                first_id = (await client.post(
+                    "/api/conversations", json={})).json()["id"]
+                second_id = (await client.post(
+                    "/api/conversations", json={})).json()["id"]
+
+                first_request = asyncio.create_task(client.post(
+                    f"/api/conversations/{first_id}/chat",
+                    json={"prompt": "first"},
+                ))
+                self.assertTrue(await asyncio.to_thread(
+                    fake_api.started["first"].wait, 2))
+                second_request = asyncio.create_task(client.post(
+                    f"/api/conversations/{second_id}/chat",
+                    json={"prompt": "second"},
+                ))
+                self.assertTrue(await asyncio.to_thread(
+                    fake_api.started["second"].wait, 2))
+
+                self.assertEqual(fake_api.max_active, 2)
+                running = (await client.get("/api/conversations")).json()
+                self.assertEqual(
+                    {item["id"] for item in running if item["generating"]},
+                    {first_id, second_id},
+                )
+                duplicate = await client.post(
+                    f"/api/conversations/{first_id}/chat",
+                    json={"prompt": "duplicate"},
+                )
+                self.assertEqual(duplicate.status_code, 409)
+
+                cancelled = await client.post(
+                    f"/api/conversations/{first_id}/cancel", json={})
+                self.assertEqual(cancelled.json(), {"cancelled": True})
+                first_response = await asyncio.wait_for(first_request, 3)
+                first_events = [
+                    json.loads(line) for line in first_response.text.splitlines()]
+                self.assertTrue(any(
+                    event["type"] == "cancelled" for event in first_events))
+                self.assertEqual(first_events[-1]["type"], "done")
+                self.assertTrue(first_events[-1]["message"]["cancelled"])
+                self.assertEqual(
+                    first_events[-1]["message"]["content"], "first-partial")
+
+                fake_api.release["second"].set()
+                second_response = await asyncio.wait_for(second_request, 3)
+                second_events = [
+                    json.loads(line) for line in second_response.text.splitlines()]
+                self.assertEqual(
+                    second_events[-1]["message"]["content"],
+                    "second-partial-done",
+                )
+                finished = (await client.get("/api/conversations")).json()
+                self.assertFalse(any(item["generating"] for item in finished))
 
     async def test_code_agent_cross_file_stream_and_patch_download(self):
         import httpx
@@ -721,11 +861,15 @@ class WebUIServerTests(unittest.IsolatedAsyncioTestCase):
             def info(self):
                 return {"available": True, "pi_version": "test"}
 
-            def stream(self, prompt, files, system_prompt, thinking_level):
+            def stream(
+                self, prompt, files, system_prompt, thinking_level,
+                cancel_event=None,
+            ):
                 self.prompt = prompt
                 self.files = files
                 self.system_prompt = system_prompt
                 self.thinking_level = thinking_level
+                self.cancel_event = cancel_event
                 yield {
                     "type": "tool_start",
                     "name": "read_project_file",
@@ -805,12 +949,14 @@ class WebUIServerTests(unittest.IsolatedAsyncioTestCase):
                 return {"available": True, "pi_version": "test"}
 
             def stream(
-                self, prompt, files, system_prompt, thinking_level, web_backend
+                self, prompt, files, system_prompt, thinking_level, web_backend,
+                cancel_event=None,
             ):
                 self.prompt = prompt
                 self.files = files
                 self.system_prompt = system_prompt
                 self.web_backend = web_backend
+                self.cancel_event = cancel_event
                 yield {
                     "type": "tool_start",
                     "name": "web_search",

@@ -151,6 +151,7 @@
       box-shadow: 0 0 0 4px rgba(79,103,233,.09);
     }
     .conversation-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .conversation-running { margin-left: 7px; padding: 2px 6px; flex: 0 0 auto; color: #5969c4; background: rgba(255,255,255,.72); border: 1px solid rgba(116,132,222,.2); border-radius: 999px; font-size: 8px; font-weight: 650; }
     .conversation-more {
       display: grid;
       place-items: center;
@@ -382,6 +383,8 @@
     .send-button { display: grid; place-items: center; width: 36px; height: 36px; padding: 0; color: #fff; background: linear-gradient(135deg,#6277f1,#5265e5); border: 0; border-radius: 12px; box-shadow: 0 7px 17px rgba(72,89,211,.24); cursor: pointer; transition: transform .16s ease,opacity .16s ease; }
     .send-button:hover { transform: translateY(-1px); }.send-button:disabled { opacity: .38; cursor: default; transform: none; }
     .send-button svg { width: 17px; }
+    .stop-button { background: linear-gradient(135deg,#e36d69,#cf5555); box-shadow: 0 7px 17px rgba(190,70,70,.22); }
+    .stop-button svg { width: 14px; }
     .composer-note { margin-top: 8px; color: #acb0ba; font-size: 9px; text-align: center; pointer-events: auto; }
     .toast-stack { position: fixed; z-index: 100; top: 18px; right: 18px; display: flex; flex-direction: column; gap: 8px; }
     .toast { max-width: 360px; padding: 11px 14px; color: #555b68; background: rgba(255,255,255,.96); border: 1px solid #e1e3e9; border-radius: 11px; box-shadow: 0 14px 35px rgba(29,33,52,.13); font-size: 11px; animation: rise .2s ease both; }
@@ -479,6 +482,7 @@
               <div class="mode-wrap"><button class="mode-button" id="thinkingButton"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M9 18h6M10 22h4M8.5 14.5A7 7 0 1 1 15.5 14.5C14.5 15.3 14 16 14 18h-4c0-2-.5-2.7-1.5-3.5Z"/></svg><span id="thinkingLabel">思考 · 中</span></button><div class="mode-menu" id="thinkingMenu"></div></div>
             </div>
             <button class="send-button" id="sendButton" aria-label="发送" data-i18n-aria="composer.send"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m5 12 14-7-4 14-3-6-7-1Z"/><path d="m12 13 7-8"/></svg></button>
+            <button class="send-button stop-button" id="stopButton" hidden aria-label="停止生成" title="停止生成" data-i18n-aria="composer.stop" data-i18n-title="composer.stop"><svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg></button>
           </div>
         </div>
         <div class="composer-note" data-i18n="composer.disclaimer">AI 生成内容可能不准确，请核验重要信息</div>
@@ -552,7 +556,7 @@
     const $ = (selector) => document.querySelector(selector);
     const localeResources = window.FASTLLM_LOCALES || {};
     const preferredLocale = (() => { try { const saved = localStorage.getItem("fastllm.locale"); if (localeResources[saved]) return saved; } catch (_) {} return "zh-CN"; })();
-    const state = { config: {}, conversations: [], activeId: null, record: null, pending: [], uploading: 0, generating: false, agent: "chat", locale: preferredLocale, menuConversationId: null, renameConversationId: null, deleteConversationId: null };
+    const state = { config: {}, conversations: [], activeId: null, record: null, pending: [], uploading: 0, tasks: new Map(), stopping: new Set(), loadSequence: 0, agent: "chat", locale: preferredLocale, menuConversationId: null, renameConversationId: null, deleteConversationId: null };
     const icon = `<img src="/assets/fastllm_icon.svg" alt="" draggable="false">`;
     const thinkingOptions = [["关闭","thinking.off"],["低","thinking.low"],["中","thinking.medium"],["高","thinking.high"]];
     const conversationOptions = [["关闭","mode.chat"],["快速搜索","mode.web_fast"],["深度浏览","mode.web_deep"]];
@@ -575,7 +579,7 @@
 
     function applyLocale() {
       document.documentElement.lang = state.locale; document.querySelectorAll("[data-i18n]").forEach(node => node.textContent = t(node.dataset.i18n)); document.querySelectorAll("[data-i18n-placeholder]").forEach(node => node.placeholder = t(node.dataset.i18nPlaceholder)); document.querySelectorAll("[data-i18n-title]").forEach(node => node.title = t(node.dataset.i18nTitle)); document.querySelectorAll("[data-i18n-aria]").forEach(node => node.setAttribute("aria-label",t(node.dataset.i18nAria)));
-      $("#languageLabel").textContent = t("locale.short"); renderLanguageMenu(); if (state.config.model) $("#modelName").textContent = state.config.model; renderSidebar(); renderPending(); if (state.record) { renderMessages(); renderModes(); }
+      $("#languageLabel").textContent = t("locale.short"); renderLanguageMenu(); if (state.config.model) $("#modelName").textContent = state.config.model; renderSidebar(); renderPending(); if (state.record) { renderMessages(); renderModes(); } syncGenerationUI();
     }
 
     function setLocale(locale) {
@@ -608,18 +612,24 @@
       state.menuConversationId = conversationId; trigger.classList.add("menu-open"); menu.classList.add("open"); const triggerRect = trigger.getBoundingClientRect(); const menuRect = menu.getBoundingClientRect(); const left = Math.min(innerWidth - menuRect.width - 8,Math.max(8,triggerRect.right - menuRect.width)); let top = triggerRect.bottom + 5; if (top + menuRect.height > innerHeight - 8) top = triggerRect.top - menuRect.height - 5; menu.style.left = `${left}px`; menu.style.top = `${Math.max(8,top)}px`;
     }
 
+    function isConversationGenerating(id = state.activeId) {
+      if (!id) return false;
+      if (state.tasks.has(id)) return true;
+      return Boolean(state.conversations.find(item => item.id === id)?.generating);
+    }
+
     function renderSidebar() {
       closeConversationMenu(); const list = $("#conversationList"); list.replaceChildren();
       for (const conversation of state.conversations) {
-        const row = document.createElement("div"); row.className = `conversation${conversation.id === state.activeId ? " active" : ""}`;
-        const button = document.createElement("button"); button.className = "conversation-main"; const label = document.createElement("span"); label.className = "conversation-title"; label.textContent = conversation.title; button.append(label); button.onclick = () => loadConversation(conversation.id);
+        const running = isConversationGenerating(conversation.id); const row = document.createElement("div"); row.className = `conversation${conversation.id === state.activeId ? " active" : ""}${running ? " running" : ""}`;
+        const button = document.createElement("button"); button.className = "conversation-main"; const label = document.createElement("span"); label.className = "conversation-title"; label.textContent = conversation.title; button.append(label); if (running) { const status = document.createElement("span"); status.className = "conversation-running"; status.textContent = t("nav.running"); button.append(status); } button.onclick = () => loadConversation(conversation.id);
         const more = document.createElement("button"); more.className = "conversation-more"; more.setAttribute("aria-label",t("nav.more")); more.innerHTML = `<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg>`; more.onclick = event => { event.stopPropagation(); openConversationMenu(conversation.id,more); };
         row.append(button,more); list.append(row);
       }
     }
 
     function openRenameDialog() {
-      const conversation = state.conversations.find(item => item.id === state.menuConversationId); if (!conversation || (state.generating && conversation.id === state.activeId)) return; state.renameConversationId = conversation.id; closeConversationMenu(); $("#renameTitle").value = conversation.title; $("#renameDialog").showModal(); $("#renameTitle").select();
+      const conversation = state.conversations.find(item => item.id === state.menuConversationId); if (!conversation || isConversationGenerating(conversation.id)) return; state.renameConversationId = conversation.id; closeConversationMenu(); $("#renameTitle").value = conversation.title; $("#renameDialog").showModal(); $("#renameTitle").select();
     }
 
     async function renameConversation() {
@@ -629,7 +639,7 @@
     }
 
     function openDeleteDialog() {
-      const conversation = state.conversations.find(item => item.id === state.menuConversationId); if (!conversation || (state.generating && conversation.id === state.activeId)) return; state.deleteConversationId = conversation.id; closeConversationMenu(); $("#deleteDialog").showModal();
+      const conversation = state.conversations.find(item => item.id === state.menuConversationId); if (!conversation || isConversationGenerating(conversation.id)) return; state.deleteConversationId = conversation.id; closeConversationMenu(); $("#deleteDialog").showModal();
     }
 
     async function deleteConversation() {
@@ -745,9 +755,49 @@
       const body = document.createElement("div"); body.className = "message-body"; renderAttachments(body,message.attachments);
       let reasoningDetails = null, reasoningContent = null;
       if (message.reasoning || live) { reasoningDetails = document.createElement("details"); reasoningDetails.className = "reasoning"; reasoningDetails.hidden = !message.reasoning; const summary = document.createElement("summary"); summary.textContent = t(live ? "chat.reasoning_live" : "chat.reasoning_done"); reasoningContent = document.createElement("div"); reasoningContent.className = "reasoning-content"; reasoningContent.textContent = message.reasoning || ""; reasoningDetails.append(summary,reasoningContent); body.append(reasoningDetails); }
-      const status = document.createElement("div"); status.className = "status-line"; status.hidden = true; body.append(status);
+      const status = document.createElement("div"); status.className = "status-line"; status.hidden = !message.cancelled; status.textContent = message.cancelled ? t("status.generation_stopped") : ""; body.append(status);
       const text = document.createElement("div"); text.className = "message-text"; renderMarkdown(text,message.content || ""); body.append(text); renderArtifacts(body,message.artifacts); renderSources(body,message.sources); wrapper.append(body);
       return { wrapper,body,text,status,reasoningDetails,reasoningContent };
+    }
+
+    function updateTaskView(task) {
+      const live = task.live; if (!live || state.activeId !== task.id || !live.wrapper.isConnected) return;
+      live.status.hidden = !task.showStatus; live.status.textContent = task.status || "";
+      live.text.replaceChildren(); if (task.content) renderMarkdown(live.text,task.content); else live.text.innerHTML = `<span class="typing"><i></i><i></i><i></i></span>`;
+      if (task.reasoning) { live.reasoningDetails.hidden = false; live.reasoningContent.textContent = task.reasoning; }
+      else live.reasoningDetails.hidden = true;
+      live.planHolder.replaceChildren();
+      if (task.plan?.type === "data") renderDataPlan(live.planHolder,task.plan.title,task.plan.analyses);
+      else if (task.plan?.type === "ppt") { renderMarkdown(live.text,t("ppt.outline_done",{title:task.plan.title})); live.planHolder.append(deckGrid(task.plan.slides)); }
+      $("#messages").scrollTop = $("#messages").scrollHeight;
+    }
+
+    function mountTask(task) {
+      const live = createMessage({role:"assistant",content:""},true); live.planHolder = document.createElement("div"); live.body.append(live.planHolder); task.live = live; $("#messages").append(live.wrapper); updateTaskView(task);
+    }
+
+    function beginTask(id,userMessage,kind) {
+      const task = { id, kind, userMessage, content:"", reasoning:"", status:"", showStatus:false, plan:null, stopping:false, completed:false, live:null };
+      state.tasks.set(id,task); if (state.activeId === id && state.record?.id === id) state.record.messages.push(userMessage); renderSidebar(); renderMessages(); syncGenerationUI(); return task;
+    }
+
+    function setTaskStatus(task,message) { task.status = message || ""; task.showStatus = true; updateTaskView(task); }
+    function setTaskProgress(task,event) { task.content = event.content || ""; task.reasoning = event.reasoning || ""; task.showStatus = false; updateTaskView(task); }
+
+    function completeTask(task,message) {
+      task.completed = true;
+      if (state.activeId !== task.id || !task.live?.wrapper.isConnected) return;
+      const final = createMessage(message); task.live.wrapper.replaceWith(final.wrapper); task.live = null; if (state.record?.id === task.id) state.record.messages.push(message);
+    }
+
+    async function settleTask(task) {
+      try { await refreshConversations(); } catch (error) { toast(error.message); }
+      state.tasks.delete(task.id); renderSidebar(); syncGenerationUI();
+      if (state.activeId === task.id) {
+        try { const record = await (await api(`/api/conversations/${task.id}`)).json(); if (state.activeId === task.id) { state.record = record; const savedAgent = record.settings.agent_mode; state.agent = agentLabelKeys[savedAgent] ? savedAgent : "chat"; renderMessages(); renderModes(); syncGenerationUI(); } }
+        catch (error) { toast(error.message); }
+      }
+      if (!isConversationGenerating() && state.activeId === task.id) $("#prompt").focus();
     }
 
     function renderHero() {
@@ -763,23 +813,24 @@
       const container = $("#messages"); container.replaceChildren();
       if (!state.record?.messages?.length) renderHero();
       else for (const message of state.record.messages) container.append(createMessage(message).wrapper);
+      const task = state.tasks.get(state.activeId); if (task && !task.completed) mountTask(task);
       requestAnimationFrame(() => { container.scrollTop = container.scrollHeight; });
     }
 
-    async function refreshConversations() { state.conversations = await (await api("/api/conversations")).json(); renderSidebar(); }
+    async function refreshConversations() { state.conversations = await (await api("/api/conversations")).json(); renderSidebar(); syncGenerationUI(); }
 
     async function loadConversation(id) {
-      if (state.generating || !id) return; state.activeId = id; state.record = await (await api(`/api/conversations/${id}`)).json();
+      if (!id) return; const sequence = ++state.loadSequence; const record = await (await api(`/api/conversations/${id}`)).json(); if (sequence !== state.loadSequence) return; state.activeId = id; state.record = record;
       const savedAgent = state.record.settings.agent_mode; state.agent = agentLabelKeys[savedAgent] ? savedAgent : "chat";
-      history.replaceState(null,"",`?chat=${encodeURIComponent(id)}`); state.pending = []; renderPending(); renderSidebar(); renderMessages(); renderModes(); setSidebar(false);
+      history.replaceState(null,"",`?chat=${encodeURIComponent(id)}`); state.pending = []; renderPending(); renderSidebar(); renderMessages(); renderModes(); syncGenerationUI(); setSidebar(false);
     }
 
     async function newConversation() {
-      if (state.generating) return; const record = await (await api("/api/conversations",{method:"POST",body:"{}"})).json(); await refreshConversations(); await loadConversation(record.id); $("#prompt").focus();
+      const record = await (await api("/api/conversations",{method:"POST",body:"{}"})).json(); await refreshConversations(); await loadConversation(record.id); $("#prompt").focus();
     }
 
     function renderMenu(menu, options, current, kind) {
-      menu.replaceChildren(); for (const [value,labelKey] of options) { const button = document.createElement("button"); button.className = `mode-option${value === current ? " selected" : ""}`; button.textContent = t(labelKey); button.onclick = async () => { state.record.settings[kind] = value; menu.classList.remove("open"); renderModes(); try { await saveRecordSettings(); } catch (error) { toast(error.message); } }; menu.append(button); }
+      menu.replaceChildren(); for (const [value,labelKey] of options) { const button = document.createElement("button"); button.className = `mode-option${value === current ? " selected" : ""}`; button.textContent = t(labelKey); button.onclick = async () => { if (isConversationGenerating()) return; state.record.settings[kind] = value; menu.classList.remove("open"); renderModes(); try { await saveRecordSettings(); } catch (error) { toast(error.message); } }; menu.append(button); }
     }
 
     function renderModes() {
@@ -798,7 +849,7 @@
     }
 
     async function chooseConversationMode(webMode) {
-      if (!Object.fromEntries(conversationOptions)[webMode] || !state.record || state.generating) return; state.agent = "chat"; state.record.settings.agent_mode = "chat"; state.record.settings.web_mode = webMode; $("#webMenu").classList.remove("open"); renderModes();
+      if (!Object.fromEntries(conversationOptions)[webMode] || !state.record || isConversationGenerating()) return; state.agent = "chat"; state.record.settings.agent_mode = "chat"; state.record.settings.web_mode = webMode; $("#webMenu").classList.remove("open"); renderModes();
       try { await saveRecordSettings(); } catch (error) { toast(error.message); }
       $("#prompt").focus();
     }
@@ -817,7 +868,7 @@
     function hasDataFiles() { return hasConfiguredFiles("data_extensions"); }
 
     async function chooseAgent(agent) {
-      if (!agentLabelKeys[agent] || !state.record || state.generating) return; state.agent = agent; state.record.settings.web_mode = "关闭"; state.record.settings.agent_mode = agent; renderModes(); $("#agentDialog").close();
+      if (!agentLabelKeys[agent] || !state.record || isConversationGenerating()) return; state.agent = agent; state.record.settings.web_mode = "关闭"; state.record.settings.agent_mode = agent; renderModes(); $("#agentDialog").close();
       try { await saveRecordSettings(); } catch (error) { toast(error.message); }
       if (agent === "knowledge" && !hasKnowledgeFiles()) { $("#prompt").value = $("#prompt").value.trim() || t("prompt.read_files"); resizePrompt(); $("#fileInput").click(); }
       else if (agent === "data") { if (hasDataFiles()) openDataDialog(); else { toast(t("data.file_choose")); $("#fileInput").click(); } }
@@ -826,7 +877,7 @@
       else $("#prompt").focus();
     }
 
-    async function saveRecordSettings(extra = {}) { if (!state.record) return; const payload = { title: extra.title ?? state.record.title, settings: { ...state.record.settings, ...(extra.settings || {}) } }; state.record = await (await api(`/api/conversations/${state.activeId}`,{method:"PATCH",body:JSON.stringify(payload)})).json(); await refreshConversations(); }
+    async function saveRecordSettings(extra = {}) { if (!state.record || isConversationGenerating()) return; const id = state.activeId; const payload = { title: extra.title ?? state.record.title, settings: { ...state.record.settings, ...(extra.settings || {}) } }; const record = await (await api(`/api/conversations/${id}`,{method:"PATCH",body:JSON.stringify(payload)})).json(); if (state.activeId === id) state.record = record; await refreshConversations(); }
 
     function renderPending() {
       const list = $("#pendingFiles"); list.replaceChildren(); list.classList.toggle("visible",state.pending.length > 0 || state.uploading > 0);
@@ -835,20 +886,36 @@
     }
 
     async function uploadFiles(files) {
+      if (!state.activeId || isConversationGenerating()) return;
+      const conversationId = state.activeId;
       state.uploading += files.length; renderPending();
       for (const file of files) {
         try {
           if (file.size > state.config.max_upload_mb * 1024 * 1024) throw new Error(t("upload.too_large",{name:file.name}));
-          const response = await fetch(`/api/conversations/${state.activeId}/attachments`,{method:"POST",headers:{"Content-Type":file.type || "application/octet-stream","X-Filename":encodeURIComponent(file.name)},body:file});
+          const response = await fetch(`/api/conversations/${conversationId}/attachments`,{method:"POST",headers:{"Content-Type":file.type || "application/octet-stream","X-Filename":encodeURIComponent(file.name)},body:file});
           if (!response.ok) { let detail = t("upload.failed"); try { detail = (await response.json()).detail || detail; } catch (_) {} throw new Error(detail); }
-          state.pending.push(await response.json());
+          const attachment = await response.json(); if (state.activeId === conversationId) state.pending.push(attachment);
         } catch (error) { toast(error.message); }
         finally { state.uploading -= 1; renderPending(); }
       }
       $("#fileInput").value = "";
     }
 
-    function setGenerating(value) { state.generating = value; $("#prompt").disabled = value; $("#sendButton").disabled = value; $("#agentButton").disabled = value; $("#webButton").disabled = value; $("#newChat").disabled = value; }
+    function syncGenerationUI() {
+      const running = isConversationGenerating(); const task = state.tasks.get(state.activeId); const stopping = Boolean(task?.stopping || state.stopping.has(state.activeId));
+      $("#prompt").disabled = running; $("#sendButton").hidden = running; $("#sendButton").disabled = running; $("#stopButton").hidden = !running; $("#stopButton").disabled = stopping; $("#stopButton").title = t(stopping ? "composer.stopping" : "composer.stop"); $("#stopButton").setAttribute("aria-label",t(stopping ? "composer.stopping" : "composer.stop"));
+      for (const selector of ["#attachButton","#agentButton","#webButton","#thinkingButton","#topSettings"]) $(selector).disabled = running;
+    }
+
+    async function stopActiveGeneration() {
+      const id = state.activeId; if (!id || !isConversationGenerating(id)) return; const task = state.tasks.get(id); if (task) task.stopping = true; else state.stopping.add(id); syncGenerationUI();
+      try {
+        const result = await (await api(`/api/conversations/${id}/cancel`,{method:"POST",body:"{}"})).json();
+        if (!task) { for (let attempt = 0; attempt < 80; attempt += 1) { await new Promise(resolve => setTimeout(resolve,250)); await refreshConversations(); if (!isConversationGenerating(id)) break; } if (state.activeId === id) await loadConversation(id); }
+        else if (!result.cancelled) { await refreshConversations(); if (state.activeId === id) await loadConversation(id); }
+      } catch (error) { if (task) task.stopping = false; toast(error.message); }
+      finally { state.stopping.delete(id); syncGenerationUI(); }
+    }
 
     async function readEventStream(response,onEvent) {
       const reader = response.body.getReader(), decoder = new TextDecoder(); let buffer = "";
@@ -860,36 +927,35 @@
     }
 
     async function sendMessage() {
-      if (state.generating || state.uploading) return; if (state.agent === "data") { openDataDialog(); return; } if (state.agent === "ppt") { openPptDialog(); return; } if (state.agent === "knowledge" && !hasKnowledgeFiles()) { toast(t("chat.knowledge_required")); $("#fileInput").click(); return; } if (state.agent === "code" && !hasCodeFiles()) { toast(t("chat.code_required")); $("#fileInput").click(); return; }
+      if (isConversationGenerating() || state.uploading || !state.record) return; if (state.agent === "data") { openDataDialog(); return; } if (state.agent === "ppt") { openPptDialog(); return; } if (state.agent === "knowledge" && !hasKnowledgeFiles()) { toast(t("chat.knowledge_required")); $("#fileInput").click(); return; } if (state.agent === "code" && !hasCodeFiles()) { toast(t("chat.code_required")); $("#fileInput").click(); return; }
       const prompt = $("#prompt").value.trim(); if (!prompt && !state.pending.length) return;
+      const conversationId = state.activeId;
       const publicAttachments = state.pending.map(item => ({...item})); const userMessage = {role:"user",content:prompt || t("prompt.attachments"),attachments:publicAttachments};
-      if (!state.record.messages.length) $("#messages").replaceChildren(); $("#messages").append(createMessage(userMessage).wrapper);
-      const live = createMessage({role:"assistant",content:""},true); live.text.innerHTML = `<span class="typing"><i></i><i></i><i></i></span>`; $("#messages").append(live.wrapper); $("#messages").scrollTop = $("#messages").scrollHeight;
-      const attachments = state.pending.map(({token,name}) => ({token,name})); state.pending = []; renderPending(); $("#prompt").value = ""; resizePrompt(); setGenerating(true);
-      let completed = false;
+      const attachments = state.pending.map(({token,name}) => ({token,name})); state.pending = []; renderPending(); $("#prompt").value = ""; resizePrompt(); const task = beginTask(conversationId,userMessage,"chat");
       try {
-        const response = await api(`/api/conversations/${state.activeId}/chat`,{method:"POST",body:JSON.stringify({prompt,attachments})});
+        const response = await api(`/api/conversations/${conversationId}/chat`,{method:"POST",body:JSON.stringify({prompt,attachments})});
         await readEventStream(response,event => {
-          if (event.type === "status") { live.status.hidden = false; live.status.textContent = eventMessage(event); }
-          else if (event.type === "progress") { live.status.hidden = true; live.text.replaceChildren(); renderMarkdown(live.text,event.content || ""); if (!event.content) live.text.innerHTML = `<span class="typing"><i></i><i></i><i></i></span>`; if (event.reasoning) { live.reasoningDetails.hidden = false; live.reasoningContent.textContent = event.reasoning; } $("#messages").scrollTop = $("#messages").scrollHeight; }
-          else if (event.type === "knowledge") { live.status.hidden = false; live.status.textContent = t("chat.knowledge_count",{count:event.sources.length}); for (const warning of event.warnings || []) toast(warning); }
-          else if (event.type === "code") { live.status.hidden = false; live.status.textContent = t("chat.code_count",{files:event.files || 0,count:event.sources.length}); for (const warning of event.warnings || []) toast(warning); }
-          else if (event.type === "web") { live.status.hidden = false; live.status.textContent = t("chat.web_count",{count:event.sources.length}); for (const warning of event.warnings || []) toast(warning); }
+          if (event.type === "status") setTaskStatus(task,eventMessage(event));
+          else if (event.type === "progress") setTaskProgress(task,event);
+          else if (event.type === "knowledge") { setTaskStatus(task,t("chat.knowledge_count",{count:event.sources.length})); for (const warning of event.warnings || []) toast(warning); }
+          else if (event.type === "code") { setTaskStatus(task,t("chat.code_count",{files:event.files || 0,count:event.sources.length})); for (const warning of event.warnings || []) toast(warning); }
+          else if (event.type === "web") { setTaskStatus(task,t("chat.web_count",{count:event.sources.length})); for (const warning of event.warnings || []) toast(warning); }
           else if (event.type === "warning") toast(eventMessage(event));
           else if (event.type === "error") toast(t("chat.failed",{message:event.message}));
-          else if (event.type === "done") { const final = createMessage(event.message); live.wrapper.replaceWith(final.wrapper); state.record.messages.push(userMessage,event.message); completed = true; }
+          else if (event.type === "cancelled") setTaskStatus(task,eventMessage(event));
+          else if (event.type === "done") completeTask(task,event.message);
         });
-      } catch (error) { toast(error.message); }
-      finally { setGenerating(false); await refreshConversations(); if (!completed) await loadConversation(state.activeId); $("#prompt").focus(); }
+      } catch (error) { if (!task.stopping) toast(error.message); }
+      finally { await settleTask(task); }
     }
 
     function openPptDialog() {
-      if (!state.record || state.generating) return;
+      if (!state.record || isConversationGenerating()) return;
       $("#pptTopic").value = $("#prompt").value.trim(); $("#pptAudience").value = ""; $("#pptSlides").value = 8; $("#pptStyle").value = "tech"; $("#pptWeb").checked = state.record.settings.web_mode !== "关闭"; $("#pptDialog").showModal(); $("#pptTopic").focus();
     }
 
     function openDataDialog() {
-      if (!state.record || state.generating) return;
+      if (!state.record || isConversationGenerating()) return;
       if (!hasDataFiles()) { toast(t("data.file_required")); $("#fileInput").click(); return; }
       $("#dataQuestion").value = $("#prompt").value.trim() || t("data.default_question"); $("#dataDialog").showModal(); $("#dataQuestion").focus();
     }
@@ -899,51 +965,53 @@
     }
 
     async function createDataAnalysis() {
+      if (!state.record || isConversationGenerating()) return; const conversationId = state.activeId;
       const question = $("#dataQuestion").value.trim() || t("data.default_question");
       const publicAttachments = state.pending.map(item => ({...item})); const userMessage = {role:"user",content:t("data.user_message",{question}),attachments:publicAttachments}; const attachments = state.pending.map(({token,name}) => ({token,name})); state.pending = []; renderPending(); $("#dataDialog").close(); $("#prompt").value = ""; resizePrompt();
-      if (!state.record.messages.length) $("#messages").replaceChildren(); $("#messages").append(createMessage(userMessage).wrapper); const live = createMessage({role:"assistant",content:""},true); live.text.innerHTML = `<span class="typing"><i></i><i></i><i></i></span>`; const planHolder = document.createElement("div"); live.body.append(planHolder); $("#messages").append(live.wrapper); $("#messages").scrollTop = $("#messages").scrollHeight; setGenerating(true); let completed = false;
+      const task = beginTask(conversationId,userMessage,"data");
       try {
-        const response = await api(`/api/conversations/${state.activeId}/analyses`,{method:"POST",body:JSON.stringify({question,attachments})});
+        const response = await api(`/api/conversations/${conversationId}/analyses`,{method:"POST",body:JSON.stringify({question,attachments})});
         await readEventStream(response,event => {
-          if (event.type === "status") { live.status.hidden = false; live.status.textContent = eventMessage(event); }
-          else if (event.type === "data") { live.status.hidden = false; live.status.textContent = t("status.data_loaded",{datasets:event.datasets.length,rows:event.datasets.reduce((sum,item) => sum + item.rows,0)}); }
-          else if (event.type === "data_plan") renderDataPlan(planHolder,event.title,event.analyses);
-          else if (event.type === "progress") { live.status.hidden = true; live.text.replaceChildren(); renderMarkdown(live.text,event.content || ""); if (!event.content) live.text.innerHTML = `<span class="typing"><i></i><i></i><i></i></span>`; if (event.reasoning) { live.reasoningDetails.hidden = false; live.reasoningContent.textContent = event.reasoning; } $("#messages").scrollTop = $("#messages").scrollHeight; }
+          if (event.type === "status") setTaskStatus(task,eventMessage(event));
+          else if (event.type === "data") setTaskStatus(task,t("status.data_loaded",{datasets:event.datasets.length,rows:event.datasets.reduce((sum,item) => sum + item.rows,0)}));
+          else if (event.type === "data_plan") { task.plan = {type:"data",title:event.title,analyses:event.analyses}; updateTaskView(task); }
+          else if (event.type === "progress") setTaskProgress(task,event);
           else if (event.type === "warning") toast(eventMessage(event));
           else if (event.type === "error") toast(t("data.failed",{message:event.message}));
-          else if (event.type === "done") { const final = createMessage(event.message); live.wrapper.replaceWith(final.wrapper); state.record.messages.push(userMessage,event.message); completed = true; }
+          else if (event.type === "cancelled") setTaskStatus(task,eventMessage(event));
+          else if (event.type === "done") completeTask(task,event.message);
         });
-      } catch (error) { toast(error.message); }
-      finally { setGenerating(false); await refreshConversations(); if (!completed) await loadConversation(state.activeId); $("#prompt").focus(); }
+      } catch (error) { if (!task.stopping) toast(error.message); }
+      finally { await settleTask(task); }
     }
 
     async function createPresentation() {
+      if (!state.record || isConversationGenerating()) return; const conversationId = state.activeId;
       const topic = $("#pptTopic").value.trim(); if (!topic) { toast(t("ppt.topic_required")); return; }
       const audience = $("#pptAudience").value.trim(); const slideCount = Math.min(20,Math.max(4,Number($("#pptSlides").value) || 8)); const style = $("#pptStyle").value;
       const styleNames = {tech:"ppt.style_tech",business:"ppt.style_business",nature:"ppt.style_nature",premium:"ppt.style_premium"}; const currentWeb = state.record.settings.web_mode || "关闭"; const webMode = $("#pptWeb").checked ? (currentWeb === "关闭" ? "深度浏览" : currentWeb) : "关闭";
       const userMessage = {role:"user",content:t("ppt.user_message",{topic,audience:audience || t("ppt.default_audience"),slides:slideCount,style:t(styleNames[style])})};
-      $("#pptDialog").close(); if (!state.record.messages.length) $("#messages").replaceChildren(); $("#messages").append(createMessage(userMessage).wrapper);
-      const live = createMessage({role:"assistant",content:""},true); live.text.innerHTML = `<span class="typing"><i></i><i></i><i></i></span>`; const planHolder = document.createElement("div"); live.body.append(planHolder); $("#messages").append(live.wrapper); $("#messages").scrollTop = $("#messages").scrollHeight; setGenerating(true);
-      let completed = false;
+      $("#pptDialog").close(); const task = beginTask(conversationId,userMessage,"ppt");
       try {
-        const response = await api(`/api/conversations/${state.activeId}/presentations`,{method:"POST",body:JSON.stringify({topic,audience,slide_count:slideCount,style,web_mode:webMode})});
+        const response = await api(`/api/conversations/${conversationId}/presentations`,{method:"POST",body:JSON.stringify({topic,audience,slide_count:slideCount,style,web_mode:webMode})});
         await readEventStream(response,event => {
-          if (event.type === "status") { live.status.hidden = false; live.status.textContent = eventMessage(event); }
-          else if (event.type === "knowledge") { live.status.hidden = false; live.status.textContent = t("status.knowledge",{count:event.sources.length}); for (const warning of event.warnings || []) toast(warning); }
-          else if (event.type === "web") { live.status.hidden = false; live.status.textContent = t("status.ppt_web",{count:event.sources.length}); for (const warning of event.warnings || []) toast(warning); }
+          if (event.type === "status") setTaskStatus(task,eventMessage(event));
+          else if (event.type === "knowledge") { setTaskStatus(task,t("status.knowledge",{count:event.sources.length})); for (const warning of event.warnings || []) toast(warning); }
+          else if (event.type === "web") { setTaskStatus(task,t("status.ppt_web",{count:event.sources.length})); for (const warning of event.warnings || []) toast(warning); }
           else if (event.type === "warning") toast(eventMessage(event));
-          else if (event.type === "plan") { live.text.replaceChildren(); renderMarkdown(live.text,t("ppt.outline_done",{title:event.title})); planHolder.replaceChildren(deckGrid(event.slides)); }
+          else if (event.type === "plan") { task.plan = {type:"ppt",title:event.title,slides:event.slides}; updateTaskView(task); }
           else if (event.type === "error") toast(t("ppt.failed",{message:event.message}));
-          else if (event.type === "done") { const final = createMessage(event.message); live.wrapper.replaceWith(final.wrapper); state.record.messages.push(userMessage,event.message); completed = true; }
+          else if (event.type === "cancelled") setTaskStatus(task,eventMessage(event));
+          else if (event.type === "done") completeTask(task,event.message);
         });
-      } catch (error) { toast(error.message); }
-      finally { setGenerating(false); await refreshConversations(); if (!completed) await loadConversation(state.activeId); $("#prompt").focus(); }
+      } catch (error) { if (!task.stopping) toast(error.message); }
+      finally { await settleTask(task); }
     }
 
     function resizePrompt() { const input = $("#prompt"); input.style.height = "auto"; input.style.height = `${Math.min(input.scrollHeight,180)}px`; }
 
     function openSettings() {
-      if (!state.record) return; const s = state.record.settings || {};
+      if (!state.record || isConversationGenerating()) return; const s = state.record.settings || {};
       const maximum = Number(s.max_new_tokens ?? state.config.max_token);
       $("#settingSystem").value = s.system_prompt || ""; $("#settingTokens").value = Number.isFinite(maximum) && maximum > 0 ? maximum : 0; $("#settingTemperature").value = s.temperature ?? 1; $("#settingTopP").value = s.top_p ?? .8; $("#settingTopK").value = s.top_k ?? 1; $("#settingPenalty").value = s.repeat_penalty ?? 1; $("#settingsDialog").showModal();
     }
@@ -964,7 +1032,7 @@
     }
 
     $("#newChat").onclick = newConversation; $("#attachButton").onclick = () => $("#fileInput").click(); $("#fileInput").onchange = event => uploadFiles([...event.target.files]); $("#agentButton").onclick = () => { renderAgentSelection(); $("#agentDialog").showModal(); };
-    $("#sendButton").onclick = sendMessage; $("#prompt").oninput = resizePrompt; $("#prompt").onkeydown = event => { if (event.key === "Enter" && !event.shiftKey && !event.isComposing) { event.preventDefault(); sendMessage(); } };
+    $("#sendButton").onclick = sendMessage; $("#stopButton").onclick = stopActiveGeneration; $("#prompt").oninput = resizePrompt; $("#prompt").onkeydown = event => { if (event.key === "Enter" && !event.shiftKey && !event.isComposing) { event.preventDefault(); sendMessage(); } };
     for (const [button,menu] of [["#webButton","#webMenu"],["#thinkingButton","#thinkingMenu"]]) $(button).onclick = event => { event.stopPropagation(); const target = $(menu); document.querySelectorAll(".mode-menu.open").forEach(item => item !== target && item.classList.remove("open")); target.classList.toggle("open"); };
     document.addEventListener("click",() => { document.querySelectorAll(".mode-menu.open").forEach(item => item.classList.remove("open")); $("#languageMenu").classList.remove("open"); closeConversationMenu(); });
     document.querySelectorAll(".agent-card").forEach(card => card.onclick = () => chooseAgent(card.dataset.agent)); $("#closeAgent").onclick = () => $("#agentDialog").close();
