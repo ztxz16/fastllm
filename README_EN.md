@@ -90,6 +90,12 @@ ftllm bench Qwen/Qwen3-0.6B \
 
 The WebUI does not load a model in its own process, so start an OpenAI-compatible API server first. Its optional `model` positional argument is only a model-name hint; when omitted, the WebUI discovers the model from `/v1/models`.
 
+Code analysis and web search use the Pi agent runtime by default. On Linux
+x86-64, build and install the companion wheel as described in
+[`tools/ftllm_agent_runtime/`](tools/ftllm_agent_runtime/). The wheel bundles
+Pi, so Node.js, npm, and Bun are not required. Use `--agent-runtime builtin`
+to select the original single-call paths when the companion wheel is absent.
+
 For `run`, `server`, and `export`, the `model` positional argument can be a Hugging Face repository ID, a local Hugging Face model directory, an exported FastLLM model, or a configuration file:
 
 ~~~bash

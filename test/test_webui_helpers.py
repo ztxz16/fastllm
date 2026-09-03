@@ -1,3 +1,4 @@
+from datetime import datetime
 import io
 import json
 import os
@@ -18,7 +19,15 @@ TOOLS_DIR = os.path.abspath(
 if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
 
-from web_agent import SearchResult, WebAgent, extract_page_text, parse_bing_rss, validate_public_url
+from web_agent import (
+    SearchResult,
+    WebAgent,
+    extract_page_text,
+    parse_bing_rss,
+    parse_sogou_html,
+    parse_so_html,
+    validate_public_url,
+)
 from code_agent import CodeAgent, is_code_file
 from data_agent import DataAgent
 from knowledge_agent import KnowledgeAgent
@@ -291,8 +300,11 @@ class WebAgentTests(unittest.TestCase):
         rss = b"""<?xml version="1.0"?><rss><channel>
         <item><title>First result</title><link>https://example.com/a</link>
         <description>Useful &amp; current</description></item>
+        <item><title>Unsafe result</title><link>javascript:alert(1)</link>
+        <description>Must not reach the UI</description></item>
         </channel></rss>"""
         results = parse_bing_rss(rss)
+        self.assertEqual(len(results), 1)
         self.assertEqual(results[0].title, "First result")
         self.assertEqual(results[0].snippet, "Useful & current")
         page = "<html><style>hidden</style><h1>Title</h1><script>bad()</script><p>Body text</p></html>"
@@ -301,6 +313,32 @@ class WebAgentTests(unittest.TestCase):
         self.assertIn("Body text", text)
         self.assertNotIn("hidden", text)
         self.assertNotIn("bad", text)
+
+        so_html = """
+        <ul><li class="res-list">
+          <h3 class="res-title"><a href="https://www.so.com/link"
+            data-mdurl="https://example.com/game">China <em>wins</em></a></h3>
+          <span class="res-list-summary">Final score <em>89-87</em></span>
+        </li></ul>
+        """
+        so_results = parse_so_html(so_html)
+        self.assertEqual(so_results, [SearchResult(
+            "China wins", "https://example.com/game", "Final score 89-87")])
+
+        sogou_html = """
+        <div class="vrResult"><h3 class="vr-tit"><a class="resultLink"
+          href="./tc?url=https%3A%2F%2Fexample.com%2Fofficial">
+          Official <em>result</em></a></h3>
+          <p>China won 89-87.</p></div>
+        <div class="vrResult"><h3 class="vr-tit"><a class="resultLink"
+          href="./tc?url=https%3A%2F%2Fexample.com%2Fsecond">
+          Second source</a></h3><p>Same score.</p></div>
+        """
+        sogou_results = parse_sogou_html(sogou_html)
+        self.assertEqual(sogou_results[0], SearchResult(
+            "Official result", "https://example.com/official",
+            "China won 89-87."))
+        self.assertEqual(len(sogou_results), 2)
 
     def test_private_urls_are_rejected(self):
         with self.assertRaises(ValueError):
@@ -346,10 +384,17 @@ class OpenAIModelClientTests(unittest.TestCase):
             "/models/demo",
             "--api-base", "http://127.0.0.1:8018/v1",
             "--code-max-context-chars", "32000",
+            "--agent-runtime", "builtin",
         ])
         self.assertEqual(args.model, "/models/demo")
         self.assertEqual(args.api_base, "http://127.0.0.1:8018/v1")
         self.assertEqual(args.code_max_context_chars, 32000)
+        self.assertEqual(args.agent_runtime, "builtin")
+        self.assertEqual(
+            parser.parse_args(["/models/demo"]).agent_runtime, "pi")
+        self.assertEqual(parser.parse_args([
+            "/models/demo", "--code-agent-runtime", "auto",
+        ]).agent_runtime, "auto")
         self.assertFalse(hasattr(args, "device"))
 
     def test_model_discovery_streaming_and_qwen_thinking_mapping(self):
@@ -594,6 +639,7 @@ class WebUIServerTests(unittest.IsolatedAsyncioTestCase):
                 model="/models/demo", path="", title="FastLLM Test",
                 history_dir=temp_dir, max_upload_mb=1,
                 code_max_context_chars=12000,
+                agent_runtime="builtin",
                 web_search_timeout=1.0, max_token=-1,
             )
             app = create_app(args)
@@ -658,6 +704,173 @@ class WebUIServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(patch_response.status_code, 200)
             self.assertIn("text/x-diff", patch_response.headers["content-type"])
             self.assertIn(b"if (divisor == 0)", patch_response.content)
+            await client.aclose()
+
+    async def test_code_agent_can_stream_through_pi_bridge(self):
+        import httpx
+
+        class FakeAPIClient:
+            model_name = "demo"
+            base_url = "http://test-api/v1"
+            api_key = ""
+
+            def stream(self, *_args, **_kwargs):
+                raise AssertionError("builtin model stream must not be used")
+
+        class FakePiAgent:
+            def info(self):
+                return {"available": True, "pi_version": "test"}
+
+            def stream(self, prompt, files, system_prompt, thinking_level):
+                self.prompt = prompt
+                self.files = files
+                self.system_prompt = system_prompt
+                self.thinking_level = thinking_level
+                yield {
+                    "type": "tool_start",
+                    "name": "read_project_file",
+                    "arguments": {"file": 1},
+                }
+                yield {"type": "tool_end", "name": "read_project_file"}
+                yield {
+                    "type": "text_delta",
+                    "text": "入口返回 42 [代码1:L1-L2]。",
+                }
+                yield {"type": "done", "turns": 2}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            args = SimpleNamespace(
+                model="/models/demo", path="", title="FastLLM Test",
+                history_dir=temp_dir, max_upload_mb=1,
+                code_max_context_chars=12000,
+                agent_runtime="builtin",
+                web_search_timeout=1.0, max_token=-1,
+            )
+            app = create_app(args)
+            fake_pi = FakePiAgent()
+            app.state.runtime.api_client = FakeAPIClient()
+            app.state.runtime.agent_runtime = "pi"
+            app.state.runtime.pi_agent_class = FakePiAgent
+            app.state.runtime.pi_agent = fake_pi
+            client = httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://testserver",
+            )
+            record = (await client.post("/api/conversations", json={})).json()
+            conversation_id = record["id"]
+            await client.patch(
+                f"/api/conversations/{conversation_id}",
+                json={"settings": {
+                    "agent_mode": "code", "thinking_level": "关闭",
+                }},
+            )
+            attachment = (await client.post(
+                f"/api/conversations/{conversation_id}/attachments",
+                content=b"def answer():\n    return 42\n",
+                headers={"Content-Type": "text/x-python", "X-Filename": "app.py"},
+            )).json()
+            response = await client.post(
+                f"/api/conversations/{conversation_id}/chat",
+                json={
+                    "prompt": "answer 返回什么？",
+                    "attachments": [{
+                        "token": attachment["token"],
+                        "name": attachment["name"],
+                    }],
+                },
+            )
+            events = [json.loads(line) for line in response.text.splitlines()]
+            message = events[-1]["message"]
+            self.assertEqual(message["agent_runtime"], "pi")
+            self.assertEqual(message["tool_calls"][0]["name"], "read_project_file")
+            self.assertEqual(message["content"], "入口返回 42 [代码1:L1-L2]。")
+            self.assertEqual(fake_pi.files[0]["name"], "app.py")
+            self.assertIn("return 42", fake_pi.files[0]["text"])
+            self.assertIn("list_project_files", fake_pi.system_prompt)
+            await client.aclose()
+
+    async def test_web_search_can_stream_through_pi_bridge(self):
+        import httpx
+
+        class FakeAPIClient:
+            model_name = "demo"
+            base_url = "http://test-api/v1"
+            api_key = ""
+
+            def stream(self, *_args, **_kwargs):
+                raise AssertionError("builtin model stream must not be used")
+
+        class FakePiAgent:
+            def info(self):
+                return {"available": True, "pi_version": "test"}
+
+            def stream(
+                self, prompt, files, system_prompt, thinking_level, web_backend
+            ):
+                self.prompt = prompt
+                self.files = files
+                self.system_prompt = system_prompt
+                self.web_backend = web_backend
+                yield {
+                    "type": "tool_start",
+                    "name": "web_search",
+                    "arguments": {"query": "China Lebanon basketball 2026"},
+                }
+                sources = [{
+                    "index": 1,
+                    "title": "Official result",
+                    "url": "https://example.com/game",
+                    "snippet": "China won 89-87",
+                }]
+                yield {"type": "web_sources", "sources": sources}
+                yield {
+                    "type": "text_delta",
+                    "text": "中国队以 89:87 获胜。[网页1]",
+                }
+                yield {"type": "done", "turns": 2, "web_sources": sources}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            args = SimpleNamespace(
+                model="/models/demo", path="", title="FastLLM Test",
+                history_dir=temp_dir, max_upload_mb=1,
+                agent_runtime="builtin",
+                web_search_timeout=1.0, max_token=-1,
+            )
+            app = create_app(args)
+            fake_pi = FakePiAgent()
+            app.state.runtime.api_client = FakeAPIClient()
+            app.state.runtime.agent_runtime = "pi"
+            app.state.runtime.pi_agent_class = FakePiAgent
+            app.state.runtime.pi_agent = fake_pi
+            client = httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://testserver",
+            )
+            record = (await client.post("/api/conversations", json={})).json()
+            conversation_id = record["id"]
+            await client.patch(
+                f"/api/conversations/{conversation_id}",
+                json={"settings": {
+                    "agent_mode": "chat",
+                    "web_mode": "快速搜索",
+                    "thinking_level": "关闭",
+                }},
+            )
+            response = await client.post(
+                f"/api/conversations/{conversation_id}/chat",
+                json={"prompt": "中国和黎巴嫩最新篮球比赛谁赢了？"},
+            )
+            events = [json.loads(line) for line in response.text.splitlines()]
+            message = events[-1]["message"]
+            self.assertEqual(message["agent_runtime"], "pi")
+            self.assertEqual(message["tool_calls"][0]["name"], "web_search")
+            self.assertEqual(message["content"], "中国队以 89:87 获胜。[网页1]")
+            self.assertEqual(message["sources"][0]["url"],
+                             "https://example.com/game")
+            self.assertIs(fake_pi.web_backend, app.state.runtime.web_agent)
+            self.assertEqual(fake_pi.files, [])
+            self.assertIn("web_search", fake_pi.system_prompt)
+            self.assertIn(str(datetime.now().year), fake_pi.system_prompt)
             await client.aclose()
 
     async def test_document_knowledge_persists_across_requests(self):

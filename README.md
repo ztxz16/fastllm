@@ -90,6 +90,11 @@ ftllm bench Qwen/Qwen3-0.6B \
 
 WebUI 不会在自身进程内加载模型，请先启动 OpenAI 兼容 API Server。WebUI 的可选 `model` 位置参数只用于推导 API 模型名；省略时会从 `/v1/models` 自动发现。
 
+代码分析和联网搜索默认使用 Pi 智能体运行时。Linux x86-64 用户可按
+[`tools/ftllm_agent_runtime/`](tools/ftllm_agent_runtime/) 中的说明构建并安装配套 wheel；
+该 wheel 已包含 Pi，不需要 Node.js、npm 或 Bun。尚未安装时可通过
+`--agent-runtime builtin` 使用原有单轮链路。
+
 对于 `run`、`server` 和 `export`，`model` 位置参数既可以是 Hugging Face 仓库 ID，也可以是本地 Hugging Face 模型目录、FastLLM 模型文件或配置文件。例如：
 
 ~~~bash
