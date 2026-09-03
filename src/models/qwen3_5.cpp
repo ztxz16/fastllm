@@ -22101,7 +22101,7 @@ namespace fastllm {
                         selectedPrefillTokens += scheduledTokens;
                     }
 
-                    if (!isPrompt && !selectedMultimodal && !ctx->currentTokens.empty()) {
+                    if (!isPrompt && !ctx->currentTokens.empty()) {
                         int seqLen = scheduledDecodeTokens(ctx);
                         if (seqLen == 1) {
                             if (!selectingGpuTokenHandoffPending) {
@@ -22229,6 +22229,26 @@ namespace fastllm {
                 forwardLocker.lock();
 
                 Data inputIds(DataType::FLOAT32, {1, (int)ids.size()}, ids);
+                Data multimodalAdjustedPositionIds;
+                std::vector<Data*> forwardPositionIds = positionIds;
+                if (selectedMultimodal && !selectedIsPrompt &&
+                    singleContext != nullptr && !positionIds.empty() &&
+                    positionIds[0] != nullptr) {
+                    auto deltaIt = singleContext->multimodalInput.find(
+                        "mrope_position_delta");
+                    if (deltaIt != singleContext->multimodalInput.end() &&
+                        !deltaIt->second.empty() &&
+                        deltaIt->second[0] != nullptr) {
+                        model->AdjustPositionIdsWithDelta(
+                            *positionIds[0], *deltaIt->second[0],
+                            multimodalAdjustedPositionIds);
+                    } else {
+                        multimodalAdjustedPositionIds.CopyFrom(
+                            *positionIds[0]);
+                    }
+                    forwardPositionIds[0] =
+                        &multimodalAdjustedPositionIds;
+                }
                 std::vector<int> ret;
                 std::vector<std::vector<int> > acceptedTokenLists;
                 std::vector<std::vector<int> > nextInputTokenLists;
@@ -22322,8 +22342,10 @@ namespace fastllm {
                                         "Qwen3.5 GPU token handoff lost a handle.\n");
                         ret.push_back(oldTokens[oldIt - oldHandles.begin()]);
                     }
-                } else if (selectedMultimodal && singleContext != nullptr) {
-                    ret = model->ForwardMultimodal(
+                } else if (selectedMultimodal && selectedIsPrompt &&
+                           singleContext != nullptr) {
+                    ret = model->Qwen35ForwardMultimodal(
+                        singleContext,
                         inputIds,
                         attentionMasks[0] == nullptr ? Data() : *attentionMasks[0],
                         positionIds[0] == nullptr ? Data() : *positionIds[0],
@@ -22331,7 +22353,11 @@ namespace fastllm {
                         singleContext->multimodalInput,
                         singleContext->generationConfig,
                         tokensManager,
-                        &logits);
+                        &logits,
+                        acceptedTokenLists,
+                        nextInputTokenLists,
+                        keptInputLens,
+                        usedMtpForward);
                 } else if (seqLens.size() == 1 && selectedIsPrompt &&
                            seqLens[0] > longPrefillChunkSize &&
                            singleContext != nullptr) {
@@ -22747,12 +22773,14 @@ namespace fastllm {
                     auto batchStartTime = std::chrono::system_clock::now();
                     if (seqLens.size() > 1) {
                         usedMtpForward = model->Qwen35MTPBatchForward(
-                            true, tokenContexts, inputIds, attentionMasks, positionIds,
+                            true, tokenContexts, inputIds, attentionMasks,
+                            forwardPositionIds,
                             seqLens, pastKeyValues, generationConfigs,
                             acceptedTokenLists, nextInputTokenLists, keptInputLens);
                     } else {
                         usedMtpForward = model->Qwen35MTPForward(
-                            true, singleContext, inputIds, attentionMasks, positionIds,
+                            true, singleContext, inputIds, attentionMasks,
+                            forwardPositionIds,
                             seqLens, pastKeyValues, generationConfigs,
                             acceptedTokenLists, nextInputTokenLists, keptInputLens);
                     }
@@ -22786,9 +22814,21 @@ namespace fastllm {
                                 0.0f : (float)((int)ctx->allTokens.size() - 1));
                         }
                         for (int b = 0; b < (int)tokenContexts.size(); b++) {
-                            fallbackPositionStorage.emplace_back(
-                                DataType::FLOAT32, decodeScalarDims,
-                                DataDevice::CPU, (void*)&fallbackPositions[b]);
+                            if (selectedMultimodal &&
+                                b < (int)forwardPositionIds.size() &&
+                                forwardPositionIds[b] != nullptr) {
+                                Data firstPosition =
+                                    model->BuildMtpPositionIdsSlice(
+                                        *forwardPositionIds[b], 0, 1, 0);
+                                fallbackPositionStorage.emplace_back();
+                                fallbackPositionStorage.back().CopyFrom(
+                                    firstPosition);
+                            } else {
+                                fallbackPositionStorage.emplace_back(
+                                    DataType::FLOAT32, decodeScalarDims,
+                                    DataDevice::CPU,
+                                    (void*)&fallbackPositions[b]);
+                            }
                             fallbackPositionIdVec.push_back(
                                 &fallbackPositionStorage.back());
                         }
@@ -22840,7 +22880,8 @@ namespace fastllm {
                                     &gpuTokenHandoff);
                                 ret = model->ForwardGPU(
                                     (int)seqLens.size(), inputIds,
-                                    attentionMasks, positionIds, seqLens,
+                                    attentionMasks, forwardPositionIds,
+                                    seqLens,
                                     pastKeyValues, generationConfigs,
                                     tokensManager, &logits);
                             }
@@ -22874,7 +22915,8 @@ namespace fastllm {
                         } else {
                             ret = model->ForwardGPU(
                                 (int)seqLens.size(), inputIds,
-                                attentionMasks, positionIds, seqLens,
+                                attentionMasks, forwardPositionIds,
+                                seqLens,
                                 pastKeyValues, generationConfigs,
                                 tokensManager, &logits);
                         }
@@ -30192,11 +30234,40 @@ namespace fastllm {
         return lastRet;
     }
 
-    std::vector <int> Qwen3_5Model::ForwardMultimodal(const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
-                                                      const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
-                                                      const std::map <std::string, std::vector <Data*> > &multimodalInput,
-                                                      const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
-                                                      std::vector <std::vector <float>*> *retLogits) {
+    std::vector <int> Qwen3_5Model::ForwardMultimodal(
+            const fastllm::Data &inputIds,
+            const fastllm::Data &attentionMask,
+            const fastllm::Data &positionIds,
+            std::vector<std::pair<Data, Data>> &pastKeyValues,
+            const std::map <std::string, std::vector <Data*> > &multimodalInput,
+            const GenerationConfig &generationConfig,
+            const LastTokensManager &lastTokens,
+            std::vector <std::vector <float>*> *retLogits) {
+        std::vector<std::vector<int> > acceptedTokens;
+        std::vector<std::vector<int> > nextInputTokens;
+        std::vector<int> keptInputLens;
+        bool usedMtpForward = false;
+        return Qwen35ForwardMultimodal(
+            nullptr, inputIds, attentionMask, positionIds, pastKeyValues,
+            multimodalInput, generationConfig, lastTokens, retLogits,
+            acceptedTokens, nextInputTokens, keptInputLens, usedMtpForward);
+    }
+
+    std::vector <int> Qwen3_5Model::Qwen35ForwardMultimodal(
+            ResponseContext *context,
+            const fastllm::Data &inputIds,
+            const fastllm::Data &attentionMask,
+            const fastllm::Data &positionIds,
+            std::vector<std::pair<Data, Data>> &pastKeyValues,
+            const std::map <std::string, std::vector <Data*> > &multimodalInput,
+            const GenerationConfig &generationConfig,
+            const LastTokensManager &lastTokens,
+            std::vector <std::vector <float>*> *retLogits,
+            std::vector<std::vector<int> > &acceptedTokens,
+            std::vector<std::vector<int> > &nextInputTokens,
+            std::vector<int> &keptInputLens,
+            bool &usedMtpForward) {
+        usedMtpForward = false;
         std::vector <int> ret;
         std::vector <float> *logits = nullptr;
         if (retLogits != nullptr && !retLogits->empty()) {
@@ -30211,6 +30282,32 @@ namespace fastllm {
             } else {
                 adjustedPositionIds.CopyFrom(positionIds);
             }
+#ifdef USE_CUDA
+            if (context != nullptr && CanUseGPUForward()) {
+                std::vector<Data*> attentionMasks = {
+                    attentionMask.dims.empty() ? nullptr :
+                                                const_cast<Data*>(&attentionMask)
+                };
+                std::vector<Data*> positionIdVec = {&adjustedPositionIds};
+                std::vector<int> seqLens = {(int)inputIds.Count(0)};
+                std::vector<std::pair<Data*, Data*> > pagedPastKeyValues;
+                pagedPastKeyValues.reserve(pastKeyValues.size());
+                for (auto &cache : pastKeyValues) {
+                    pagedPastKeyValues.push_back(
+                        std::make_pair(&cache.first, &cache.second));
+                }
+                std::vector<GenerationConfig> generationConfigs = {
+                    generationConfig
+                };
+                usedMtpForward = Qwen35MTPForward(
+                    true, context, inputIds, attentionMasks, positionIdVec,
+                    seqLens, pagedPastKeyValues, generationConfigs,
+                    acceptedTokens, nextInputTokens, keptInputLens);
+                if (usedMtpForward) {
+                    return {};
+                }
+            }
+#endif
             ret.push_back(Forward(inputIds, attentionMask, adjustedPositionIds, pastKeyValues, generationConfig, lastTokens, logits));
             return ret;
         }
@@ -30325,11 +30422,312 @@ namespace fastllm {
             pagedPastKeyValues.push_back(std::make_pair(&pastKeyValues[i].first, &pastKeyValues[i].second));
         }
 #ifdef USE_CUDA
+        const int totalLen = inputIds.dims[1];
+        std::vector<int> draftDevices;
+        std::map<int, int> draftRatios;
+        const bool canSeedDraftCache =
+            context != nullptr && context->cacheLen == 0 &&
+            context->preTokens == totalLen && totalLen > 0 &&
+            Qwen35MtpSupportsGenerationConfig(generationConfig) &&
+            CanUseGPUForward() &&
+            GetQwen35GPUForwardDevices(
+                deviceMap, draftDevices, draftRatios) &&
+            !draftDevices.empty();
+        bool seedDFlash = canSeedDraftCache && HasDFlashWeights() &&
+            DFlashDraftsPerStep() > 0;
+        bool seedMtp = canSeedDraftCache && !seedDFlash &&
+            !Qwen35MtpDisabledByEnv() && HasMtpWeights() &&
+            Qwen35MtpDraftsPerStep() > 0;
+
+        if (seedDFlash || seedMtp) {
+            hiddenStates.ToDevice(DataDevice::CPU);
+            FastllmCudaClearBigBuffer();
+
+            {
+                std::lock_guard<std::mutex> guard(mtpCacheMutex);
+                mtpCaches.erase(context);
+                dflashContexts.erase(context);
+            }
+
+            auto eraseDraftCache = [&]() {
+                std::lock_guard<std::mutex> guard(mtpCacheMutex);
+                mtpCaches.erase(context);
+                dflashContexts.erase(context);
+            };
+            auto releaseDFlashHidden = [&]() {
+                for (Data &captured : speculativeDFlashHiddenStates) {
+                    captured.FreeSpace();
+                    captured.dims.clear();
+                    captured.strides.clear();
+                    captured.expansionDims.clear();
+                }
+                speculativeDFlashHiddenStates.clear();
+            };
+            auto validDFlashCache = [&](const DFlashContext &cache,
+                                        int expectedTokens) {
+                if (cache.committedTokens != expectedTokens ||
+                    (int)cache.draftKeyValues.size() != dflashLayers) {
+                    return false;
+                }
+                for (const auto &layerCache : cache.draftKeyValues) {
+                    if (layerCache.first.dims.size() != 3 ||
+                        layerCache.second.dims.size() != 3 ||
+                        layerCache.first.dims[1] !=
+                            layerCache.second.dims[1] ||
+                        layerCache.first.dims[1] > expectedTokens) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            auto appendMtpChunk = [&](const Data &targetHiddenStates,
+                                      const std::vector<int> &mtpInputTokens,
+                                      const Data &mtpPositionIds,
+                                      int expectedTokens, bool cacheOnly,
+                                      int &draftToken) {
+                std::lock_guard<std::mutex> guard(mtpCacheMutex);
+                auto cacheIt = mtpCaches.find(context);
+                if (cacheIt == mtpCaches.end()) {
+                    if (expectedTokens != 0) {
+                        return false;
+                    }
+                    cacheIt = mtpCaches.emplace(
+                        context, MtpKvCache()).first;
+                }
+                MtpKvCache &cache = cacheIt->second;
+                if (cache.tokens != expectedTokens) {
+                    mtpCaches.erase(cacheIt);
+                    return false;
+                }
+                try {
+                    draftToken = RunMtpGreedyDraft(
+                        draftDevices[0], draftDevices, cache,
+                        targetHiddenStates, mtpInputTokens,
+                        mtpPositionIds,
+                        (int)mtpInputTokens.size() - 1,
+                        nullptr, cacheOnly);
+                } catch (...) {
+                    mtpCaches.erase(context);
+                    throw;
+                }
+                const int newTokens = expectedTokens +
+                    (int)mtpInputTokens.size();
+                const bool valid = cache.tokens == newTokens &&
+                    cache.key.dims.size() >= 2 &&
+                    cache.value.dims.size() >= 2 &&
+                    cache.key.dims[1] == newTokens &&
+                    cache.value.dims[1] == newTokens;
+                if (!valid) {
+                    mtpCaches.erase(context);
+                }
+                return valid;
+            };
+            auto appendDFlashChunk = [&](int expectedTokens,
+                                         int chunkTokens,
+                                         bool generateDrafts,
+                                         int anchorToken,
+                                         std::vector<int> &drafts) {
+                std::lock_guard<std::mutex> guard(mtpCacheMutex);
+                auto cacheIt = dflashContexts.find(context);
+                if (cacheIt == dflashContexts.end()) {
+                    if (expectedTokens != 0) {
+                        return false;
+                    }
+                    cacheIt = dflashContexts.emplace(
+                        context, DFlashContext()).first;
+                }
+                DFlashContext &cache = cacheIt->second;
+                if (cache.committedTokens != expectedTokens) {
+                    dflashContexts.erase(cacheIt);
+                    return false;
+                }
+                try {
+                    AppendDFlashTargetHidden(
+                        draftDevices[0], chunkTokens, cache);
+                    if (generateDrafts) {
+                        drafts = RunDFlashDraft(
+                            draftDevices[0], draftDevices, anchorToken,
+                            generationConfig, cache);
+                    }
+                } catch (...) {
+                    dflashContexts.erase(context);
+                    throw;
+                }
+                const int newTokens = expectedTokens + chunkTokens;
+                const bool valid = validDFlashCache(cache, newTokens) &&
+                    (!generateDrafts ||
+                     (int)drafts.size() == DFlashDraftsPerStep());
+                if (!valid) {
+                    dflashContexts.erase(context);
+                }
+                return valid;
+            };
+
+            Data inputCpu;
+            inputCpu.CopyFrom(inputIds);
+            inputCpu.ToDevice(DataDevice::CPU);
+            if (inputCpu.dataType != DataType::FLOAT32) {
+                ToDataType(inputCpu, DataType::FLOAT32);
+                inputCpu.ToDevice(DataDevice::CPU);
+            }
+            const float *inputPtr = (const float*)inputCpu.cpuData;
+            int chunkSize = GetChunkedPrefillSize();
+            if (chunkSize <= 0) {
+                chunkSize = totalLen;
+            }
+            if (seedDFlash) {
+                chunkSize = std::min(
+                    chunkSize, QWEN35_DFLASH_LONG_PREFILL_CHUNK_SIZE);
+            }
+            chunkSize = std::max(1, std::min(chunkSize, totalLen));
+
+            std::vector<int> chunkRet;
+            std::vector<int> dflashDrafts;
+            int firstMtpDraft = -1;
+            try {
+                for (int st = 0; st < totalLen; st += chunkSize) {
+                    const int curLen = std::min(chunkSize, totalLen - st);
+                    const bool isLastChunk = st + curLen == totalLen;
+                    Data curInputIds, curPositionIds, curHiddenStates;
+                    Split(inputIds, 1, st, st + curLen, curInputIds);
+                    Split(mropePositionIds, 1, st, st + curLen,
+                          curPositionIds);
+                    Split(hiddenStates, 1, st, st + curLen,
+                          curHiddenStates);
+                    std::vector<Data*> curAttentionMasks = {nullptr};
+                    std::vector<Data*> curPositionIdVec = {
+                        &curPositionIds
+                    };
+                    std::vector<int> curSeqLens = {curLen};
+
+                    const bool oldCaptureAllHiddenStates =
+                        speculativeCaptureAllHiddenStates;
+                    const bool oldCaptureDFlashHiddenStates =
+                        speculativeCaptureDFlashHiddenStates;
+                    const bool oldCacheOnlyForward =
+                        speculativeCacheOnlyForward;
+                    speculativeCaptureAllHiddenStates = seedMtp;
+                    speculativeCaptureDFlashHiddenStates = seedDFlash;
+                    // DFlash consumes intermediate-layer captures and can
+                    // skip the target head between chunks. Built-in MTP
+                    // consumes the normalized final hidden states, which are
+                    // only published when the target head path runs.
+                    speculativeCacheOnlyForward =
+                        oldCacheOnlyForward ||
+                        (seedDFlash && !isLastChunk);
+                    if (seedMtp) {
+                        speculativeHiddenStates.FreeSpace();
+                        speculativeHiddenStates.dims.clear();
+                        speculativeHiddenStates.strides.clear();
+                        speculativeHiddenStates.expansionDims.clear();
+                    }
+                    if (seedDFlash) {
+                        releaseDFlashHidden();
+                        speculativeDFlashHiddenStates.resize(
+                            dflashTargetLayerIds.size());
+                    }
+                    try {
+                        chunkRet = ForwardGPUWithHiddenStates(
+                            1, curInputIds, curAttentionMasks,
+                            curPositionIdVec, curSeqLens,
+                            pagedPastKeyValues, generationConfigs,
+                            lastTokens, retLogits, &curHiddenStates);
+                    } catch (...) {
+                        speculativeCaptureAllHiddenStates =
+                            oldCaptureAllHiddenStates;
+                        speculativeCaptureDFlashHiddenStates =
+                            oldCaptureDFlashHiddenStates;
+                        speculativeCacheOnlyForward =
+                            oldCacheOnlyForward;
+                        releaseDFlashHidden();
+                        throw;
+                    }
+                    speculativeCaptureAllHiddenStates =
+                        oldCaptureAllHiddenStates;
+                    speculativeCaptureDFlashHiddenStates =
+                        oldCaptureDFlashHiddenStates;
+                    speculativeCacheOnlyForward = oldCacheOnlyForward;
+
+                    if (isLastChunk) {
+                        AssertInFastLLM(
+                            !chunkRet.empty(),
+                            "Qwen3.5 multimodal prefill returned no token.\n");
+                    }
+
+                    if (seedMtp) {
+                        std::vector<int> mtpInputTokens(curLen);
+                        for (int token = 0; token < curLen; token++) {
+                            const int nextIndex = st + token + 1;
+                            mtpInputTokens[token] = nextIndex < totalLen ?
+                                (int)(inputPtr[nextIndex] + 1.0e-3f) :
+                                chunkRet.back();
+                        }
+                        const bool appended = appendMtpChunk(
+                            speculativeHiddenStates, mtpInputTokens,
+                            curPositionIds, st, !isLastChunk,
+                            firstMtpDraft);
+                        if (!appended) {
+                            seedMtp = false;
+                        }
+                    }
+                    if (seedDFlash) {
+                        const bool generateDrafts = isLastChunk &&
+                            !Qwen35DFlashCommitEndsRequest(
+                                *this, context,
+                                std::vector<int>{chunkRet.back()}) &&
+                            Qwen35DFlashDraftFitsContext(
+                                max_positions, dflashCheckpointBlockSize,
+                                st + curLen);
+                        const bool appended = appendDFlashChunk(
+                            st, curLen, generateDrafts,
+                            isLastChunk ? chunkRet.back() : -1,
+                            dflashDrafts);
+                        releaseDFlashHidden();
+                        if (!appended) {
+                            seedDFlash = false;
+                        }
+                    }
+                }
+            } catch (...) {
+                releaseDFlashHidden();
+                eraseDraftCache();
+                throw;
+            }
+
+            if (seedDFlash || (seedMtp && firstMtpDraft >= 0)) {
+                const int nextToken = chunkRet.back();
+                acceptedTokens = {{nextToken}};
+                nextInputTokens = {{nextToken}};
+                if (seedDFlash) {
+                    nextInputTokens[0].insert(
+                        nextInputTokens[0].end(),
+                        dflashDrafts.begin(), dflashDrafts.end());
+                } else {
+                    nextInputTokens[0].push_back(firstMtpDraft);
+                }
+                keptInputLens = {totalLen};
+                usedMtpForward = true;
+                if (!mtpLogPrinted.exchange(true)) {
+                    printf("[Qwen3.5 %s] enabled for multimodal: "
+                           "layers=%d, drafts_per_step=%d, "
+                           "root_device=cuda:%d, tp_devices=%zu.\n",
+                           seedDFlash ? "DFlash2" : "MTP",
+                           seedDFlash ? dflashLayers : mtp_num_hidden_layers,
+                           seedDFlash ? DFlashDraftsPerStep() :
+                                        Qwen35MtpDraftsPerStep(),
+                           draftDevices[0], draftDevices.size());
+                    fflush(stdout);
+                }
+                return chunkRet;
+            }
+            eraseDraftCache();
+            return chunkRet;
+        }
+
         if (IsThreadTensorParallelEnabled()) {
             hiddenStates.ToDevice(DataDevice::CPU);
             FastllmCudaClearBigBuffer();
 
-            const int totalLen = inputIds.dims[1];
             const int chunkSize = GetChunkedPrefillSize();
             if (chunkSize > 0 && totalLen > chunkSize) {
                 std::vector<int> chunkRet;
