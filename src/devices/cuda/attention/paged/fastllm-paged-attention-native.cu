@@ -1516,26 +1516,31 @@ static bool FastllmCudaPagedAttentionBatchKernelLaunch(
 // 部分结果写入进程级持久 scratch（首次在非捕获的 warmup 前向中分配，之后固定地址复用），
 // 因此整条路径对 CUDA graph 捕获 / 重放安全。
 
-static const int FASTLLM_PAGED_MAX_SPLITS = 128;
+// The SM7x FP8 D256 path can keep six CTAs resident per V100 SM. Allow enough
+// splits to expose that occupancy (2 local KV heads * 240 splits = 480 CTAs on
+// an 80-SM V100); other paths retain their established targets.
+static const int FASTLLM_PAGED_MAX_SPLITS = 256;
 static const int FASTLLM_PAGED_SPLIT_TARGET_BLOCKS = 1024;   // per-head split 期望并发 block 数
 static const int FASTLLM_PAGED_SPLIT_TARGET_BLOCKS_GQA = 384; // GQA：在 SM 占用与 combine 开销间折中（batch=1 时 S≈48）
+static const int FASTLLM_PAGED_SPLIT_TARGET_BLOCKS_SM7X_FP8_D256 = 480;
 
-static int FastllmPagedSplitTargetBlocks(bool gqa) {
+static int FastllmPagedSplitTargetBlocks(int defaultTarget) {
     const char *env = std::getenv("FASTLLM_PAGED_SPLIT_TARGET");
     if (env != nullptr && env[0] != '\0') {
         int t = atoi(env);
         return t < 32 ? 32 : (t > 4096 ? 4096 : t);
     }
-    return gqa ? FASTLLM_PAGED_SPLIT_TARGET_BLOCKS_GQA : FASTLLM_PAGED_SPLIT_TARGET_BLOCKS;
+    return defaultTarget;
 }
 
 // 根据 batch 与并行 head 数选择切分段数（host 端确定，CUDA graph 捕获与重放一致）。
-static int FastllmChoosePagedSplits(uint32_t batch_size, int parallelHeads, bool gqa) {
+static int FastllmChoosePagedSplits(
+    uint32_t batch_size, int parallelHeads, int defaultTarget) {
     int bh = (int)batch_size * parallelHeads;
     if (bh <= 0) {
         return 1;
     }
-    int target = FastllmPagedSplitTargetBlocks(gqa);
+    int target = FastllmPagedSplitTargetBlocks(defaultTarget);
     int s = (target + bh - 1) / bh;
     if (s < 1) {
         s = 1;
@@ -1549,14 +1554,16 @@ static int FastllmChoosePagedSplits(uint32_t batch_size, int parallelHeads, bool
 // 进程级持久 scratch（按 device + H 缓存）。容量按最坏情况一次性分配，绝不再 realloc，
 // 以免使已捕获的 graph 持有悬空指针。capturing 且尚未分配时返回 nullptr（调用方回退到非切分 kernel）。
 static float *FastllmGetPagedSplitScratch(int device, int H, int maxBatch, int headDim,
-                                          size_t &capacitySlots, bool capturing) {
+                                          bool needCombineStats,
+                                          size_t &capacitySlots, float *&combineStats,
+                                          bool capturing) {
     struct ScratchEntry {
         float *ptr = nullptr;
+        float *stats = nullptr;  // [maxBatch, H, 2] final exp2-domain M/L
         size_t slots = 0;   // 槽位数，每槽 (headDim+2) 个 float
-        int headDimPlus = 0;
     };
     static std::mutex mtx;
-    static std::map<int64_t, ScratchEntry> cache;   // key = ((device<<20)|H)<<8 | (headDim)
+    static std::map<int64_t, ScratchEntry> cache;   // key = ((device<<20)|H)<<9 | headDim
     std::lock_guard<std::mutex> guard(mtx);
     int64_t key = (((int64_t)device << 20) | (int64_t)H) << 9 | (int64_t)headDim;
     auto &entry = cache[key];
@@ -1567,23 +1574,33 @@ static float *FastllmGetPagedSplitScratch(int device, int H, int maxBatch, int h
     // 覆盖 GQA decode：S 可达 MAX_SPLITS，槽位按 batch*H*S 计。
     size_t worstSlots = (size_t)maxBatch * H * FASTLLM_PAGED_MAX_SPLITS;
     worstSlots = std::max(worstSlots, (size_t)2 * FASTLLM_PAGED_SPLIT_TARGET_BLOCKS);
-    if (entry.ptr != nullptr && entry.slots >= worstSlots) {
+    if (entry.ptr != nullptr && entry.slots >= worstSlots &&
+        (!needCombineStats || entry.stats != nullptr)) {
         capacitySlots = entry.slots;
+        combineStats = needCombineStats ? entry.stats : nullptr;
         return entry.ptr;
     }
     if (capturing) {
         // 捕获期间禁止分配；若已有（不足）缓冲则不可用，返回 nullptr 让调用方回退。
         capacitySlots = entry.ptr ? entry.slots : 0;
-        return entry.ptr != nullptr && entry.slots >= worstSlots ? entry.ptr : nullptr;
+        combineStats = needCombineStats ? entry.stats : nullptr;
+        return entry.ptr != nullptr && entry.slots >= worstSlots &&
+                       (!needCombineStats || entry.stats != nullptr)
+                   ? entry.ptr
+                   : nullptr;
     }
     // 非捕获：分配一次最坏容量。若之前分配过更小的（不应发生，因 worstSlots 固定），则保留旧的不动。
     if (entry.ptr == nullptr) {
         size_t bytes = worstSlots * (size_t)(headDim + 2) * sizeof(float);
         entry.ptr = (float*)FastllmCudaMalloc(bytes);
         entry.slots = worstSlots;
-        entry.headDimPlus = headDim + 2;
+    }
+    if (needCombineStats && entry.stats == nullptr) {
+        entry.stats = (float*)FastllmCudaMalloc(
+            (size_t)maxBatch * H * 2 * sizeof(float));
     }
     capacitySlots = entry.slots;
+    combineStats = needCombineStats ? entry.stats : nullptr;
     return entry.ptr;
 }
 
@@ -2515,6 +2532,136 @@ __global__ void FastllmPagedAttentionCombineKernel(
     }
 }
 
+// Parallel exp2-domain combine for the SM70 D256 kernels. Phase 1 stores its
+// online-softmax maxima in log2 space, so using exp2 here is required for an
+// exact merge. The first kernel reduces one (M,L) pair per head into a small
+// persistent stats buffer so every split's original maximum remains available
+// to the output reduction.
+__global__ void FastllmPagedAttentionCombineExp2StatsKernel(
+    const float *scratch, float *stats, int H, int headDim, int S) {
+    int b = blockIdx.x;
+    int h = blockIdx.y;
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warpId = tid >> 5;
+    constexpr int kWarps = 8;
+    int headDimPlus = headDim + 2;
+    const float *base = scratch +
+        ((size_t)(b * H + h) * S) * headDimPlus;
+
+    __shared__ float warpValues[kWarps];
+    __shared__ float finalM;
+
+    float localM = -1e30f;
+    for (int s = tid; s < S; s += blockDim.x) {
+        localM = fmaxf(localM,
+                       base[(size_t)s * headDimPlus + headDim]);
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        localM = fmaxf(localM,
+                       __shfl_down_sync(0xffffffffu, localM, offset));
+    }
+    if (lane == 0) {
+        warpValues[warpId] = localM;
+    }
+    __syncthreads();
+
+    if (warpId == 0) {
+        float value = (lane < kWarps) ? warpValues[lane] : -1e30f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            value = fmaxf(value,
+                          __shfl_down_sync(0xffffffffu, value, offset));
+        }
+        if (lane == 0) {
+            finalM = value;
+        }
+    }
+    __syncthreads();
+
+    float localL = 0.0f;
+    for (int s = tid; s < S; s += blockDim.x) {
+        float ms = base[(size_t)s * headDimPlus + headDim];
+        float ls = base[(size_t)s * headDimPlus + headDim + 1];
+        localL += ls * exp2f(ms - finalM);
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        localL += __shfl_down_sync(0xffffffffu, localL, offset);
+    }
+    if (lane == 0) {
+        warpValues[warpId] = localL;
+    }
+    __syncthreads();
+
+    if (warpId == 0) {
+        float value = (lane < kWarps) ? warpValues[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            value += __shfl_down_sync(0xffffffffu, value, offset);
+        }
+        if (lane == 0) {
+            size_t statsOffset = (size_t)(b * H + h) * 2;
+            stats[statsOffset] = finalM;
+            stats[statsOffset + 1] = value;
+        }
+    }
+}
+
+// Phase 2 assigns one output dimension to a warp and divides the split loop
+// over its 32 lanes. Eight dimensions per CTA gives 32 CTAs/head at D=256,
+// enough parallel work to fill V100 while each lane visits only ceil(S/32)
+// partials. Maxima are staged once per CTA and the exp2 factor is reused for
+// the numerator; the old kernel evaluated an additional exp per dimension for
+// its redundantly recomputed denominator.
+template <typename QType>
+__global__ void FastllmPagedAttentionCombineExp2OutputKernel(
+    const float *scratch,
+    const float *stats,
+    QType *od,
+    const int32_t *qSizes,
+    int H, int headDim, int S) {
+    int b = blockIdx.x;
+    int h = blockIdx.y;
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warpId = tid >> 5;
+    constexpr int kWarps = 8;
+    int d = blockIdx.z * kWarps + warpId;
+    int token = qSizes[b];
+    int headDimPlus = headDim + 2;
+    const float *base = scratch +
+        ((size_t)(b * H + h) * S) * headDimPlus;
+
+    __shared__ float sMs[FASTLLM_PAGED_MAX_SPLITS];
+    for (int s = tid; s < S; s += blockDim.x) {
+        sMs[s] = base[(size_t)s * headDimPlus + headDim];
+    }
+    __syncthreads();
+
+    if (d < headDim) {
+        size_t statsOffset = (size_t)(b * H + h) * 2;
+        float M = stats[statsOffset];
+        float L = stats[statsOffset + 1];
+        float localO = 0.0f;
+        for (int s = lane; s < S; s += 32) {
+            float factor = exp2f(sMs[s] - M);
+            localO += base[(size_t)s * headDimPlus + d] * factor;
+        }
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            localO += __shfl_down_sync(0xffffffffu, localO, offset);
+        }
+        if (lane == 0) {
+            float value = (L > 0.0f) ? (localO / L) : 0.0f;
+            od[(size_t)token * H * headDim +
+               (size_t)h * headDim + d] =
+                FastllmAttentionFloatToValue<QType>(value);
+        }
+    }
+}
+
 // phase2（GQA）：每个 block 合并一个 kv head 下 group 个 Q head 的 S 段，launch 数 H/group。
 template <typename QType, int GROUP_MAX>
 __global__ void FastllmPagedAttentionCombineGQAKernel(
@@ -2711,6 +2858,7 @@ static void FastllmPagedAttentionSplitKernelDispatchKV(
 template <typename QType>
 static void FastllmCudaPagedAttentionSplitLaunch(
     fastllm::Data &q, fastllm::Data &output, float *scratch,
+    float *combineStats,
     fastllm::Data *pagedKVCacheK, fastllm::Data *pagedKVCacheV,
     int32_t *qSizesData, int32_t *pageSizesData, int32_t *pageIndexsData, int32_t *lastPageLensData,
     uint32_t batch_size, int H, int group, int numKvHeads, int headDim, int pageLen,
@@ -2780,7 +2928,16 @@ static void FastllmCudaPagedAttentionSplitLaunch(
     }
     dim3 grid2(batch_size, (unsigned int)H, 1);
     dim3 block2((unsigned int)headDim, 1, 1);
-    if (useSm7xGqaD256) {
+    if (useSm7xGqaD256Fp8 && combineStats != nullptr) {
+        FastllmPagedAttentionCombineExp2StatsKernel<<<grid2, block2>>>(
+            scratch, combineStats, H, headDim, S);
+        constexpr int kCombineWarps = 8;
+        dim3 grid3(batch_size, (unsigned int)H,
+                   (unsigned int)((headDim + kCombineWarps - 1) /
+                                  kCombineWarps));
+        FastllmPagedAttentionCombineExp2OutputKernel<QType><<<grid3, block2>>>(
+            scratch, combineStats, od, qSizesData, H, headDim, S);
+    } else if (useSm7xGqaD256) {
         grid2.y = (unsigned int)numKvHeads;
         FastllmPagedAttentionCombineGQAKernel<QType, 6><<<grid2, block2>>>(
             scratch, od, qSizesData, H, group, headDim, S);
@@ -2847,18 +3004,35 @@ static bool FastllmCudaHalfPagedAttentionBatchCapturable(
         int device = -1;
         cudaGetDevice(&device);
         const int kMaxDecodeBatch = 32;   // 与 qwen3 的 maxCudaGraphDecodeBatch 一致
-        size_t capacitySlots = 0;
-        float *scratch = FastllmGetPagedSplitScratch(device, H, kMaxDecodeBatch, headDim,
-                                                     capacitySlots, capturing);
-        const bool useGqa = FastllmPagedUseGqaDecodeFor(group, headDim, H, numKvHeads);
+        const bool useGqa =
+            FastllmPagedUseGqaDecodeFor(group, headDim, H, numKvHeads);
         const bool useSm7xGqaD256 =
-            FastllmPagedUseSm7xGqaD256DecodeFor(group, headDim, H, numKvHeads);
-        int sharedGqaHeads = useSm7xGqaD256
-            ? numKvHeads * (group / FASTLLM_PAGED_SM70_GQA_D256_SUBGROUP)
-            : numKvHeads;
-        int S = (useGqa || useSm7xGqaD256)
-            ? FastllmChoosePagedSplits(batch_size, sharedGqaHeads, true)
-            : FastllmChoosePagedSplits(batch_size, H, false);
+            FastllmPagedUseSm7xGqaD256DecodeFor(
+                group, headDim, H, numKvHeads);
+        const bool useSm7xGqaD256Fp8 = useSm7xGqaD256 &&
+            pagedKVCacheK->dataType == fastllm::DataType::FP8_E4M3;
+
+        int parallelHeads = H;
+        int splitTarget = FASTLLM_PAGED_SPLIT_TARGET_BLOCKS;
+        if (useSm7xGqaD256Fp8) {
+            parallelHeads = numKvHeads;
+            splitTarget = FASTLLM_PAGED_SPLIT_TARGET_BLOCKS_SM7X_FP8_D256;
+        } else if (useSm7xGqaD256) {
+            parallelHeads = numKvHeads *
+                (group / FASTLLM_PAGED_SM70_GQA_D256_SUBGROUP);
+            splitTarget = FASTLLM_PAGED_SPLIT_TARGET_BLOCKS_GQA;
+        } else if (useGqa) {
+            parallelHeads = numKvHeads;
+            splitTarget = FASTLLM_PAGED_SPLIT_TARGET_BLOCKS_GQA;
+        }
+        int S = FastllmChoosePagedSplits(
+            batch_size, parallelHeads, splitTarget);
+
+        size_t capacitySlots = 0;
+        float *combineStats = nullptr;
+        float *scratch = FastllmGetPagedSplitScratch(
+            device, H, kMaxDecodeBatch, headDim, useSm7xGqaD256Fp8,
+            capacitySlots, combineStats, capturing);
         if (useGqa && S == 1) {
             if (q.dataType == fastllm::DataType::BFLOAT16) {
                 FastllmCudaPagedAttentionBatchGqaLaunch<__nv_bfloat16>(
@@ -2877,12 +3051,14 @@ static bool FastllmCudaHalfPagedAttentionBatchCapturable(
         if (scratch != nullptr && capacitySlots >= (size_t)batch_size * H * S && S > 1) {
             if (q.dataType == fastllm::DataType::BFLOAT16) {
                 FastllmCudaPagedAttentionSplitLaunch<__nv_bfloat16>(
-                    q, output, scratch, pagedKVCacheK, pagedKVCacheV,
+                    q, output, scratch, combineStats,
+                    pagedKVCacheK, pagedKVCacheV,
                     qSizesData, pageSizesData, pageIndexsData, lastPageLensData,
                     batch_size, H, group, numKvHeads, headDim, pageLen, q_stride_h, q_stride_n, scale, S);
             } else {
                 FastllmCudaPagedAttentionSplitLaunch<half>(
-                    q, output, scratch, pagedKVCacheK, pagedKVCacheV,
+                    q, output, scratch, combineStats,
+                    pagedKVCacheK, pagedKVCacheV,
                     qSizesData, pageSizesData, pageIndexsData, lastPageLensData,
                     batch_size, H, group, numKvHeads, headDim, pageLen, q_stride_h, q_stride_n, scale, S);
             }
