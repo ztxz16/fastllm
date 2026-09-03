@@ -42,6 +42,22 @@ namespace fastllm {
     extern void RegisterNumas(fastllm::Data *data, std::string weightType);
 #endif
 
+    static void Qwen35ToDeviceLike(Data &data, const Data &reference,
+                                   bool copyData = true) {
+#ifdef USE_CUDA
+        if (reference.dataDevice == DataDevice::CUDA &&
+            !reference.dataDeviceIds.empty()) {
+            FastllmCudaSetDevice(reference.dataDeviceIds.front());
+        }
+#endif
+        if (reference.dataDeviceIds.empty()) {
+            data.ToDevice(reference.dataDevice, copyData);
+        } else {
+            data.ToDevice(reference.dataDevice, reference.dataDeviceIds,
+                          copyData);
+        }
+    }
+
     static bool Qwen35EnvDefaultEnabled(const char *name) {
         const char *env = std::getenv(name);
         if (env == nullptr || env[0] == '\0') {
@@ -24607,18 +24623,30 @@ namespace fastllm {
         Split(input, axis, half, half + quarter, c);
         Split(input, axis, half + quarter, input.dims.back(), d);
         Cat(a, c, axis, rowPair);
+        a.FreeSpace();
+        c.FreeSpace();
         Cat(b, d, axis, colPair);
+        b.FreeSpace();
+        d.FreeSpace();
         LlamaRotatePosition2DPart(rowPair, posX, visionSinData, visionCosData, quarter, half);
         LlamaRotatePosition2DPart(colPair, posY, visionSinData, visionCosData, quarter, half);
 
         Data rotatedA, rotatedB, rotatedC, rotatedD, firstHalf, secondHalf, rotated;
         Split(rowPair, axis, 0, quarter, rotatedA);
         Split(rowPair, axis, quarter, half, rotatedC);
+        rowPair.FreeSpace();
         Split(colPair, axis, 0, quarter, rotatedB);
         Split(colPair, axis, quarter, half, rotatedD);
+        colPair.FreeSpace();
         Cat(rotatedA, rotatedB, axis, firstHalf);
+        rotatedA.FreeSpace();
+        rotatedB.FreeSpace();
         Cat(rotatedC, rotatedD, axis, secondHalf);
+        rotatedC.FreeSpace();
+        rotatedD.FreeSpace();
         Cat(firstHalf, secondHalf, axis, rotated);
+        firstHalf.FreeSpace();
+        secondHalf.FreeSpace();
         input.CopyFrom(rotated);
     }
 
@@ -24707,7 +24735,6 @@ namespace fastllm {
                 posH,
                 posW
             );
-
             const int patchDim = 3 * vision_temporal_patch_size * vision_patch_size * vision_patch_size;
             const int patchCount = grid[0] * grid[1] * grid[2];
             const int temporalChunks = grid[0];
@@ -24717,19 +24744,102 @@ namespace fastllm {
             AssertInFastLLM((int) patchTokens.size() == patchCount * patchDim,
                             "Qwen3.5 vision patch packing size mismatch.");
 
-            Data pixelInput(DataType::FLOAT32, {patchCount, patchDim}, patchTokens);
-            Data pixelOnDevice(pixelInput);
             Data &patchWeight = this->weight[patchWeightName];
-            if (patchWeight.dataDevice != DataDevice::CPU) {
-                if (!patchWeight.dataDeviceIds.empty()) {
-                    pixelOnDevice.ToDevice(patchWeight.dataDevice, patchWeight.dataDeviceIds);
-                } else {
-                    pixelOnDevice.ToDevice(patchWeight.dataDevice);
+#ifdef USE_CUDA
+            // Vision weights may still be lazy CPU tensors on the first
+            // multimodal request. Resolve the intended CUDA device before
+            // choosing the patch dtype/chunk path; checking dataDevice alone
+            // would optimize only the second request.
+            if (patchWeight.dataDevice == DataDevice::CPU) {
+                std::vector<int> visionDevices;
+                std::map<int, int> visionRatios;
+                if (GetQwen35GPUForwardDevices(
+                        this->deviceMap, visionDevices, visionRatios) &&
+                    !visionDevices.empty()) {
+                    std::vector<int> firstVisionDevice = {
+                        visionDevices.front()};
+                    patchWeight.ToDevice(
+                        DataDevice::CUDA, firstVisionDevice);
+                    this->weight[patchBiasName].ToDevice(
+                        DataDevice::CUDA, firstVisionDevice);
                 }
             }
+#endif
+            DataType pixelType = DataType::FLOAT32;
+#ifdef USE_CUDA
+            // CUDA vision blocks consume FP16 activations. Converting the
+            // packed patches on CPU before upload halves the 16 MP patch
+            // buffer from about 384 MiB to 192 MiB and avoids a second device
+            // conversion allocation.
+            if (patchWeight.dataDevice == DataDevice::CUDA &&
+                this->dataType == DataType::FLOAT16) {
+                pixelType = DataType::FLOAT16;
+            }
+#endif
+            Data pixelInput(pixelType, {patchCount, patchDim}, patchTokens);
+            std::vector<float>().swap(patchTokens);
 
+            constexpr int visionTokenChunkSize = 2048;
+            constexpr int visionMergerChunkSize = 512;
+            bool useCudaVisionChunks = false;
+#ifdef USE_CUDA
+            useCudaVisionChunks =
+                pixelType == DataType::FLOAT16 &&
+                patchWeight.dataDevice == DataDevice::CUDA;
+#endif
             Data hiddenStates;
-            Linear(pixelOnDevice, patchWeight, this->weight[patchBiasName], hiddenStates);
+            if (useCudaVisionChunks && patchCount > visionTokenChunkSize) {
+                hiddenStates.dataType = this->dataType;
+                hiddenStates.Resize({patchCount, vision_hidden_size});
+                Qwen35ToDeviceLike(hiddenStates, patchWeight, false);
+                hiddenStates.Allocate(false);
+                const size_t pixelRowBytes =
+                    (size_t)patchDim * pixelInput.unitSize /
+                    pixelInput.unitSizeDiv;
+                const size_t hiddenRowBytes =
+                    (size_t)vision_hidden_size * hiddenStates.unitSize /
+                    hiddenStates.unitSizeDiv;
+                for (int start = 0; start < patchCount;
+                     start += visionTokenChunkSize) {
+                    const int rows = std::min(
+                        visionTokenChunkSize, patchCount - start);
+                    Data pixelView, pixelOnDevice, chunkOutput;
+                    pixelView.FakeFrom(
+                        pixelInput, (size_t)start * pixelRowBytes);
+                    pixelView.Resize({rows, patchDim});
+                    pixelOnDevice.CopyFrom(pixelView);
+                    Qwen35ToDeviceLike(pixelOnDevice, patchWeight);
+                    Linear(pixelOnDevice, patchWeight,
+                           this->weight[patchBiasName], chunkOutput);
+                    pixelOnDevice.FreeSpace();
+                    if (chunkOutput.dataType != hiddenStates.dataType) {
+                        ToDataType(chunkOutput, hiddenStates.dataType);
+                    }
+#ifdef USE_CUDA
+                    // A Linear output view does not own expansion metadata;
+                    // some GEMM paths assume owned output storage. Keep the
+                    // chunk owned, then place it into the preallocated tensor.
+                    AssertInFastLLM(
+                        FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
+                            (uint8_t*)hiddenStates.cudaData +
+                                (size_t)start * hiddenRowBytes,
+                            chunkOutput.cudaData,
+                            (size_t)rows * hiddenRowBytes),
+                        "Qwen3.5 vision patch projection copy failed.");
+                    FastllmCudaSyncCurrentThreadStream();
+#endif
+                    chunkOutput.FreeSpace();
+                }
+            } else {
+                Data pixelOnDevice(pixelInput);
+                if (patchWeight.dataDevice != DataDevice::CPU) {
+                    Qwen35ToDeviceLike(pixelOnDevice, patchWeight);
+                }
+                Linear(pixelOnDevice, patchWeight,
+                       this->weight[patchBiasName], hiddenStates);
+                pixelOnDevice.FreeSpace();
+            }
+            pixelInput.FreeSpace();
             if (hiddenStates.dataType != this->dataType) {
                 ToDataType(hiddenStates, this->dataType);
             }
@@ -24756,18 +24866,83 @@ namespace fastllm {
                 vision_spatial_merge_size,
                 posEmbVec
             );
-            Data posEmb(DataType::FLOAT32, {1, patchCount, vision_hidden_size}, posEmbVec);
-            if (hiddenStates.dataDevice != DataDevice::CPU) {
-                if (!hiddenStates.dataDeviceIds.empty()) {
-                    posEmb.ToDevice(hiddenStates.dataDevice, hiddenStates.dataDeviceIds);
-                } else {
-                    posEmb.ToDevice(hiddenStates.dataDevice);
+            // Construct directly in the activation dtype on CPU. Uploading an
+            // FP32 position tensor and converting it on CUDA temporarily keeps
+            // both the 288 MiB FP32 and 144 MiB FP16 copies for a 16 MP image.
+            Data posEmbCpu(hiddenStates.dataType,
+                           {1, patchCount, vision_hidden_size}, posEmbVec);
+            std::vector<float>().swap(posEmbVec);
+            if (useCudaVisionChunks &&
+                patchCount > visionTokenChunkSize &&
+                hiddenStates.dataDevice == DataDevice::CUDA) {
+                const size_t posRowBytes =
+                    (size_t)vision_hidden_size * posEmbCpu.unitSize /
+                    posEmbCpu.unitSizeDiv;
+                const size_t hiddenRowBytes =
+                    (size_t)vision_hidden_size * hiddenStates.unitSize /
+                    hiddenStates.unitSizeDiv;
+                for (int start = 0; start < patchCount;
+                     start += visionTokenChunkSize) {
+                    const int rows = std::min(
+                        visionTokenChunkSize, patchCount - start);
+                    Data posCpuView, posChunk, hiddenChunk;
+                    posCpuView.FakeFrom(
+                        posEmbCpu, (size_t)start * posRowBytes);
+                    posCpuView.Resize({1, rows, vision_hidden_size});
+                    posChunk.CopyFrom(posCpuView);
+                    Qwen35ToDeviceLike(posChunk, hiddenStates);
+                    // Do not use a fake slice as AddTo's writable output.
+                    // Several CUDA operators assume that output allocation
+                    // metadata describes owned storage; at 65536 patches the
+                    // fake-view path could launch past the parent allocation.
+                    // Work on one owned chunk and copy it back instead.  The
+                    // extra live storage is bounded by the fixed chunk size
+                    // (4.5 MiB with FP16 and 2048 rows).
+                    hiddenChunk.dataType = hiddenStates.dataType;
+                    hiddenChunk.Resize({1, rows, vision_hidden_size});
+                    Qwen35ToDeviceLike(hiddenChunk, hiddenStates, false);
+                    hiddenChunk.Allocate(false);
+#ifdef USE_CUDA
+                    AssertInFastLLM(
+                        FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
+                            hiddenChunk.cudaData,
+                            (uint8_t*)hiddenStates.cudaData +
+                                (size_t)start * hiddenRowBytes,
+                            (size_t)rows * hiddenRowBytes),
+                        "Qwen3.5 vision position input copy failed.");
+#endif
+                    AddTo(hiddenChunk, posChunk);
+#ifdef USE_CUDA
+                    AssertInFastLLM(
+                        FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
+                            (uint8_t*)hiddenStates.cudaData +
+                                (size_t)start * hiddenRowBytes,
+                            hiddenChunk.cudaData,
+                            (size_t)rows * hiddenRowBytes),
+                        "Qwen3.5 vision position output copy failed.");
+                    FastllmCudaSyncCurrentThreadStream();
+#endif
+                    posChunk.FreeSpace();
+                    hiddenChunk.FreeSpace();
                 }
+            } else {
+                Data posEmb(posEmbCpu);
+                if (hiddenStates.dataDevice != DataDevice::CPU) {
+                    Qwen35ToDeviceLike(posEmb, hiddenStates);
+                }
+                AddTo(hiddenStates, posEmb);
+                posEmb.FreeSpace();
             }
-            if (posEmb.dataType != hiddenStates.dataType) {
-                ToDataType(posEmb, hiddenStates.dataType);
+            posEmbCpu.FreeSpace();
+
+#ifdef USE_CUDA
+            if (hiddenStates.dataDevice == DataDevice::CUDA) {
+                // In particular, return the one-shot packed-pixel allocation
+                // before the QKV/MLP high-water phase begins.
+                FastllmCudaSyncCurrentThreadStream();
+                FastllmCudaClearBigBufferAll();
             }
-            AddTo(hiddenStates, posEmb);
+#endif
 
             Data posHData(DataType::FLOAT32, {1, patchCount}, posH);
             Data posWData(DataType::FLOAT32, {1, patchCount}, posW);
@@ -24785,37 +24960,172 @@ namespace fastllm {
                           this->weight[pre + ".norm1.bias"],
                           -1,
                           blockInput);
+                hiddenStates.FreeSpace();
                 Linear(blockInput, this->weight[pre + ".attn.qkv.weight"], this->weight[pre + ".attn.qkv.bias"], qkv);
-                Split(qkv, -1, 0, vision_hidden_size, q);
-                Split(qkv, -1, vision_hidden_size, vision_hidden_size * 2, k);
-                Split(qkv, -1, vision_hidden_size * 2, vision_hidden_size * 3, v);
-                q.Reshape({1, patchCount, vision_num_heads, vision_head_dim});
-                k.Reshape({1, patchCount, vision_num_heads, vision_head_dim});
-                v.Reshape({1, patchCount, vision_num_heads, vision_head_dim});
-                ApplyVisionRotary(q, posHData, posWData);
-                ApplyVisionRotary(k, posHData, posWData);
-                PermuteSelf(q, {0, 2, 1, 3});
-                PermuteSelf(k, {0, 2, 1, 3});
-                PermuteSelf(v, {0, 2, 1, 3});
-                // Match Transformers' cu_seqlens behavior: every temporal
-                // patch is an independent spatial attention sequence.  The
-                // tensors are laid out as [head, time, spatial, dim], so fold
-                // head and time into Attention's batch dimension.
-                q.Reshape({vision_num_heads * temporalChunks, spatialPatchCount, vision_head_dim});
-                k.Reshape({vision_num_heads * temporalChunks, spatialPatchCount, vision_head_dim});
-                v.Reshape({vision_num_heads * temporalChunks, spatialPatchCount, vision_head_dim});
-                Attention(q, k, v, *GetEmptyData(), attnOutput, 1, attnScale, 2);
-                attnOutput.Reshape({vision_num_heads, temporalChunks, spatialPatchCount, vision_head_dim});
-                PermuteSelf(attnOutput, {1, 2, 0, 3});
-                attnOutput.Reshape({1, patchCount, vision_hidden_size});
-                Linear(attnOutput,
-                       this->weight[pre + ".attn.proj.weight"],
-                       this->weight[pre + ".attn.proj.bias"],
-                       attnOutput);
-                if (attnOutput.dataType != residual.dataType) {
-                    ToDataType(attnOutput, residual.dataType);
+                blockInput.FreeSpace();
+                // Qwen3.5 vision uses a 72-wide head. Process one vision head
+                // at a time so FlashInfer only needs one set of 128-wide padded
+                // Q/K/V buffers. Keeping all 16 padded heads alive costs about
+                // 768 MiB for a 16 MP image. On SM70 (or when FlashInfer is
+                // explicitly disabled), the unpadded head is handled by the
+                // bounded-query native CUDA attention path.
+                bool useCudaVisionFlashAttention = false;
+#ifdef USE_CUDA
+                useCudaVisionFlashAttention =
+                    qkv.dataDevice == DataDevice::CUDA &&
+                    qkv.dataType == DataType::FLOAT16 &&
+                    vision_head_dim == 72 &&
+                    FastllmCudaFlashInferSupported();
+#endif
+                bool scatterCudaVisionHeads = false;
+#ifdef USE_CUDA
+                scatterCudaVisionHeads =
+                    qkv.dataDevice == DataDevice::CUDA;
+#endif
+                attnOutput.dataType = qkv.dataType;
+                if (scatterCudaVisionHeads) {
+                    // Store heads directly in the final token-major layout.
+                    // This avoids a full 144 MiB Permute scratch tensor at
+                    // 65536 patches (especially important on SM70, which has
+                    // no FlashInfer workspace to lend as scratch storage).
+                    attnOutput.Resize(
+                        {1, patchCount, vision_hidden_size});
+                } else {
+                    attnOutput.Resize({vision_num_heads * temporalChunks,
+                                       spatialPatchCount, vision_head_dim});
                 }
-                AddTo(residual, attnOutput);
+                Qwen35ToDeviceLike(attnOutput, qkv, false);
+                attnOutput.Allocate(false);
+                const size_t headOutputBytes =
+                    (size_t)temporalChunks * spatialPatchCount *
+                    vision_head_dim * attnOutput.unitSize /
+                    attnOutput.unitSizeDiv;
+                for (int head = 0; head < vision_num_heads; head++) {
+                    const int qStart = head * vision_head_dim;
+                    const int kStart = vision_hidden_size + qStart;
+                    const int vStart = vision_hidden_size * 2 + qStart;
+                    Data headOutput;
+                    if (!scatterCudaVisionHeads) {
+                        headOutput.FakeFrom(
+                            attnOutput, (size_t)head * headOutputBytes);
+                        headOutput.Resize({temporalChunks, spatialPatchCount,
+                                           vision_head_dim});
+                        headOutput.dataDeviceIds = attnOutput.dataDeviceIds;
+                    }
+                    Split(qkv, -1, qStart, qStart + vision_head_dim, q);
+                    Split(qkv, -1, kStart, kStart + vision_head_dim, k);
+                    Split(qkv, -1, vStart, vStart + vision_head_dim, v);
+                    if (head + 1 == vision_num_heads) {
+                        // The final three copies have been queued on the same
+                        // CUDA stream, so the large fused QKV buffer can be
+                        // retired before rotary/attention allocations.
+                        qkv.FreeSpace();
+                    }
+
+                    q.Reshape({1, patchCount, 1, vision_head_dim});
+                    k.Reshape({1, patchCount, 1, vision_head_dim});
+                    ApplyVisionRotary(q, posHData, posWData);
+                    ApplyVisionRotary(k, posHData, posWData);
+                    // Tokens for one head are already contiguous in
+                    // [time, spatial, dim] order; no full-tensor Permute is
+                    // needed here.
+                    q.Reshape({temporalChunks, spatialPatchCount,
+                               vision_head_dim});
+                    k.Reshape({temporalChunks, spatialPatchCount,
+                               vision_head_dim});
+                    v.Reshape({temporalChunks, spatialPatchCount,
+                               vision_head_dim});
+
+                    if (useCudaVisionFlashAttention) {
+                        constexpr int flashHeadDim = 128;
+                        Data paddedQ, paddedK, paddedV, paddedOutput;
+                        Pad(q, -1, flashHeadDim - vision_head_dim, paddedQ);
+                        q.FreeSpace();
+                        Pad(k, -1, flashHeadDim - vision_head_dim, paddedK);
+                        k.FreeSpace();
+                        Pad(v, -1, flashHeadDim - vision_head_dim, paddedV);
+                        v.FreeSpace();
+                        Attention(paddedQ, paddedK, paddedV,
+                                  *GetEmptyData(), paddedOutput,
+                                  1, attnScale, 2);
+                        paddedQ.FreeSpace();
+                        paddedK.FreeSpace();
+                        paddedV.FreeSpace();
+                        Split(paddedOutput, -1, 0, vision_head_dim,
+                              headOutput);
+                        paddedOutput.FreeSpace();
+                    } else {
+                        Attention(q, k, v, *GetEmptyData(), headOutput,
+                                  1, attnScale, 2);
+                        q.FreeSpace();
+                        k.FreeSpace();
+                        v.FreeSpace();
+                    }
+
+#ifdef USE_CUDA
+                    if (scatterCudaVisionHeads) {
+                        const size_t elementBytes =
+                            attnOutput.unitSize / attnOutput.unitSizeDiv;
+                        const size_t headRowBytes =
+                            (size_t)vision_head_dim * elementBytes;
+                        const size_t outputRowBytes =
+                            (size_t)vision_hidden_size * elementBytes;
+                        AssertInFastLLM(
+                            FastllmCudaMemcpy2DDeviceToDeviceAsyncCurrentThread(
+                                (uint8_t*)attnOutput.cudaData +
+                                    (size_t)head * headRowBytes,
+                                outputRowBytes,
+                                headOutput.cudaData,
+                                headRowBytes,
+                                headRowBytes,
+                                patchCount),
+                            "Qwen3.5 vision attention head copy failed.");
+                        FastllmCudaSyncCurrentThreadStream();
+                        headOutput.FreeSpace();
+                    }
+#endif
+
+                }
+                if (!scatterCudaVisionHeads) {
+                    attnOutput.Reshape({vision_num_heads, temporalChunks,
+                                        spatialPatchCount, vision_head_dim});
+                    PermuteSelf(attnOutput, {1, 2, 0, 3});
+                    attnOutput.Reshape(
+                        {1, patchCount, vision_hidden_size});
+                }
+                Data projectedAttn;
+#ifdef USE_CUDA
+                if (attnOutput.dataDevice == DataDevice::CUDA &&
+                    CanRunLinearAdd(
+                        attnOutput,
+                        this->weight[pre + ".attn.proj.weight"],
+                        this->weight[pre + ".attn.proj.bias"],
+                        residual)) {
+                    // Accumulate the output projection straight into the
+                    // residual.  Besides avoiding another 144 MiB tensor at
+                    // 65536 patches, this avoids the old input/output-aliasing
+                    // GEMM (Linear(attnOutput, ..., attnOutput)).
+                    LinearAdd(
+                        attnOutput,
+                        this->weight[pre + ".attn.proj.weight"],
+                        this->weight[pre + ".attn.proj.bias"],
+                        projectedAttn, residual);
+                    attnOutput.FreeSpace();
+                    projectedAttn.FreeSpace();
+                } else
+#endif
+                {
+                    Linear(attnOutput,
+                           this->weight[pre + ".attn.proj.weight"],
+                           this->weight[pre + ".attn.proj.bias"],
+                           projectedAttn);
+                    attnOutput.FreeSpace();
+                    if (projectedAttn.dataType != residual.dataType) {
+                        ToDataType(projectedAttn, residual.dataType);
+                    }
+                    AddTo(residual, projectedAttn);
+                    projectedAttn.FreeSpace();
+                }
                 hiddenStates.CopyFrom(residual);
 
                 Mul(hiddenStates, 1.0f, residual);
@@ -24824,72 +25134,188 @@ namespace fastllm {
                           this->weight[pre + ".norm2.bias"],
                           -1,
                           blockInput);
-                Linear(blockInput,
-                       this->weight[pre + ".mlp.linear_fc1.weight"],
-                       this->weight[pre + ".mlp.linear_fc1.bias"],
-                       mlpHidden);
-                if (mlpHidden.dataType != DataType::FLOAT32) {
-                    ToDataType(mlpHidden, DataType::FLOAT32);
+                hiddenStates.FreeSpace();
+                auto runMlpChunk = [&](Data &input, Data &output) {
+                    Linear(input,
+                           this->weight[pre + ".mlp.linear_fc1.weight"],
+                           this->weight[pre + ".mlp.linear_fc1.bias"],
+                           mlpHidden);
+                    bool useHalfGeluNew = false;
+#ifdef USE_CUDA
+                    useHalfGeluNew =
+                        mlpHidden.dataDevice == DataDevice::CUDA &&
+                        mlpHidden.dataType == DataType::FLOAT16;
+#endif
+                    if (mlpHidden.dataType != DataType::FLOAT32 &&
+                        !useHalfGeluNew) {
+                        ToDataType(mlpHidden, DataType::FLOAT32);
+                    }
+                    GeluNew(mlpHidden, mlpHidden);
+                    Linear(mlpHidden,
+                           this->weight[pre + ".mlp.linear_fc2.weight"],
+                           this->weight[pre + ".mlp.linear_fc2.bias"],
+                           output);
+                    mlpHidden.FreeSpace();
+                    if (output.dataType != residual.dataType) {
+                        ToDataType(output, residual.dataType);
+                    }
+                };
+
+                if (useCudaVisionChunks &&
+                    patchCount > visionTokenChunkSize) {
+                    const size_t inputRowBytes =
+                        (size_t)vision_hidden_size * blockInput.unitSize /
+                        blockInput.unitSizeDiv;
+                    const size_t residualRowBytes =
+                        (size_t)vision_hidden_size * residual.unitSize /
+                        residual.unitSizeDiv;
+                    for (int start = 0; start < patchCount;
+                         start += visionTokenChunkSize) {
+                        const int rows = std::min(
+                            visionTokenChunkSize, patchCount - start);
+                        Data inputView, residualView;
+                        inputView.FakeFrom(
+                            blockInput, (size_t)start * inputRowBytes);
+                        inputView.Resize({1, rows, vision_hidden_size});
+                        inputView.dataDeviceIds = blockInput.dataDeviceIds;
+                        residualView.FakeFrom(
+                            residual, (size_t)start * residualRowBytes);
+                        residualView.Resize({1, rows, vision_hidden_size});
+                        residualView.dataDeviceIds = residual.dataDeviceIds;
+                        runMlpChunk(inputView, mlpOutput);
+                        AddTo(residualView, mlpOutput);
+                        mlpOutput.FreeSpace();
+                    }
+                    blockInput.FreeSpace();
+                } else {
+                    runMlpChunk(blockInput, mlpOutput);
+                    blockInput.FreeSpace();
+                    AddTo(residual, mlpOutput);
+                    mlpOutput.FreeSpace();
                 }
-                GeluNew(mlpHidden, mlpHidden);
-                Linear(mlpHidden,
-                       this->weight[pre + ".mlp.linear_fc2.weight"],
-                       this->weight[pre + ".mlp.linear_fc2.bias"],
-                       mlpOutput);
-                if (mlpOutput.dataType != residual.dataType) {
-                    ToDataType(mlpOutput, residual.dataType);
-                }
-                AddTo(residual, mlpOutput);
                 hiddenStates.CopyFrom(residual);
             }
 
-            Data mergerInput;
-            LayerNorm(hiddenStates,
-                      this->weight[visual_prefix + "merger.norm.weight"],
-                      this->weight[visual_prefix + "merger.norm.bias"],
-                      -1,
-                      mergerInput);
             const int mergeUnit = vision_spatial_merge_size * vision_spatial_merge_size;
             AssertInFastLLM(patchCount % mergeUnit == 0, "Qwen3.5 merger input length must be divisible by merge unit.");
-            mergerInput.Reshape({patchCount / mergeUnit, vision_hidden_size * mergeUnit});
-            Data mergerHidden, mergerOutput;
-            Linear(mergerInput,
-                   this->weight[visual_prefix + "merger.linear_fc1.weight"],
-                   this->weight[visual_prefix + "merger.linear_fc1.bias"],
-                   mergerHidden);
-            if (mergerHidden.dataType != DataType::FLOAT32) {
-                ToDataType(mergerHidden, DataType::FLOAT32);
-            }
-            // Vision blocks use gelu_pytorch_tanh, but the official patch
-            // merger uses torch.nn.GELU's exact formulation.
-            Gelu(mergerHidden, mergerHidden);
-            Linear(mergerHidden,
-                   this->weight[visual_prefix + "merger.linear_fc2.weight"],
-                   this->weight[visual_prefix + "merger.linear_fc2.bias"],
-                   mergerOutput);
+            const int mergedCount = patchCount / mergeUnit;
 #ifdef USE_CUDA
-            // CUDA kernels and cuBLAS run on cudaStreamPerThread, while the
-            // generic CUDA->CPU transfer below uses the legacy default stream.
-            // Make the visual merger result visible before reading it on CPU.
-            if (mergerOutput.dataDevice == DataDevice::CUDA) {
+            if (hiddenStates.dataDevice == DataDevice::CUDA) {
+                // QKV and block-MLP allocations are no longer useful to the
+                // merger. Do not retain the allocator's normal 300 MiB cache
+                // at this explicit phase boundary.
                 FastllmCudaSyncCurrentThreadStream();
+                FastllmCudaClearBigBufferAll();
             }
 #endif
-            mergerOutput.ToDevice(DataDevice::CPU);
-            if (mergerOutput.dataType != DataType::FLOAT32) {
-                // ToDataType 经 Executor 调度可能在 CUDA 上完成并释放 CPU 镜像,
-                // mergedFeatures 直接读取 cpuData, 必须再次 ToDevice(CPU).
-                ToDataType(mergerOutput, DataType::FLOAT32);
+            auto appendMergerOutput = [&](Data &mergerOutput) {
+#ifdef USE_CUDA
+                // CUDA kernels and cuBLAS run on cudaStreamPerThread, while
+                // the generic CUDA->CPU transfer uses the legacy default
+                // stream. Make this chunk visible before reading it on CPU.
+                if (mergerOutput.dataDevice == DataDevice::CUDA) {
+                    FastllmCudaSyncCurrentThreadStream();
+                }
+#endif
                 mergerOutput.ToDevice(DataDevice::CPU);
+                if (mergerOutput.dataType != DataType::FLOAT32) {
+                    // ToDataType 经 Executor 调度可能在 CUDA 上完成并释放 CPU 镜像,
+                    // mergedFeatures 直接读取 cpuData, 必须再次 ToDevice(CPU).
+                    ToDataType(mergerOutput, DataType::FLOAT32);
+                    mergerOutput.ToDevice(DataDevice::CPU);
+                }
+                AssertInFastLLM(
+                    mergerOutput.dims.size() == 2 &&
+                    mergerOutput.dims[1] == vision_out_hidden_size,
+                    "Qwen3.5 merger output shape is invalid.");
+                mergedFeatures.insert(
+                    mergedFeatures.end(),
+                    (float*)mergerOutput.cpuData,
+                    (float*)mergerOutput.cpuData + mergerOutput.Count(0));
+                totalFeatureCount += mergerOutput.dims[0];
+            };
+            auto runMerger = [&](Data &mergerInput, Data &mergerOutput) {
+                Data mergerHidden;
+                const int mergerRows = (int)(
+                    mergerInput.Count(0) /
+                    (uint64_t)(vision_hidden_size * mergeUnit));
+                mergerInput.Reshape(
+                    {mergerRows, vision_hidden_size * mergeUnit});
+                Linear(mergerInput,
+                       this->weight[
+                           visual_prefix + "merger.linear_fc1.weight"],
+                       this->weight[
+                           visual_prefix + "merger.linear_fc1.bias"],
+                       mergerHidden);
+                mergerInput.FreeSpace();
+                bool useHalfGelu = false;
+#ifdef USE_CUDA
+                useHalfGelu =
+                    mergerHidden.dataDevice == DataDevice::CUDA &&
+                    mergerHidden.dataType == DataType::FLOAT16;
+#endif
+                if (mergerHidden.dataType != DataType::FLOAT32 &&
+                    !useHalfGelu) {
+                    ToDataType(mergerHidden, DataType::FLOAT32);
+                }
+                // Vision blocks use gelu_pytorch_tanh, but the official patch
+                // merger uses torch.nn.GELU's exact formulation.
+                Gelu(mergerHidden, mergerHidden);
+                Linear(mergerHidden,
+                       this->weight[
+                           visual_prefix + "merger.linear_fc2.weight"],
+                       this->weight[
+                           visual_prefix + "merger.linear_fc2.bias"],
+                       mergerOutput);
+                mergerHidden.FreeSpace();
+            };
+
+            if (useCudaVisionChunks &&
+                mergedCount > visionMergerChunkSize) {
+                const size_t hiddenRowBytes =
+                    (size_t)vision_hidden_size * hiddenStates.unitSize /
+                    hiddenStates.unitSizeDiv;
+                for (int mergedStart = 0; mergedStart < mergedCount;
+                     mergedStart += visionMergerChunkSize) {
+                    const int rows = std::min(
+                        visionMergerChunkSize,
+                        mergedCount - mergedStart);
+                    const int tokenStart = mergedStart * mergeUnit;
+                    const int tokenRows = rows * mergeUnit;
+                    Data hiddenView, mergerInput, mergerOutput;
+                    hiddenView.FakeFrom(
+                        hiddenStates,
+                        (size_t)tokenStart * hiddenRowBytes);
+                    hiddenView.Resize(
+                        {1, tokenRows, vision_hidden_size});
+                    hiddenView.dataDeviceIds = hiddenStates.dataDeviceIds;
+                    LayerNorm(
+                        hiddenView,
+                        this->weight[
+                            visual_prefix + "merger.norm.weight"],
+                        this->weight[
+                            visual_prefix + "merger.norm.bias"],
+                        -1, mergerInput);
+                    runMerger(mergerInput, mergerOutput);
+                    appendMergerOutput(mergerOutput);
+                }
+                hiddenStates.FreeSpace();
+            } else {
+                Data mergerInput, mergerOutput;
+                LayerNorm(
+                    hiddenStates,
+                    this->weight[
+                        visual_prefix + "merger.norm.weight"],
+                    this->weight[
+                        visual_prefix + "merger.norm.bias"],
+                    -1, mergerInput);
+                hiddenStates.FreeSpace();
+                runMerger(mergerInput, mergerOutput);
+                appendMergerOutput(mergerOutput);
             }
-            AssertInFastLLM(mergerOutput.dims.size() == 2 && mergerOutput.dims[1] == vision_out_hidden_size,
-                            "Qwen3.5 merger output shape is invalid.");
-            mergedFeatures.insert(
-                mergedFeatures.end(),
-                (float*) mergerOutput.cpuData,
-                (float*) mergerOutput.cpuData + mergerOutput.Count(0)
-            );
-            totalFeatureCount += mergerOutput.dims[0];
+#ifdef USE_CUDA
+            FastllmCudaClearBigBufferAll();
+#endif
         }
 
         if (totalFeatureCount > 0) {
@@ -29876,6 +30302,9 @@ namespace fastllm {
         Embedding(inputIds, this->weight[language_prefix + "embed_tokens.weight"], embeddingResult);
         ToDataType(embeddingResult, hiddenStates, this->dataType);
         MergeMultimodalFeaturesIntoText(*mmTypeIt->second[0], imageEmbeds, videoEmbeds, hiddenStates);
+        embeddingResult.FreeSpace();
+        imageFeatures.FreeSpace();
+        videoFeatures.FreeSpace();
 
         Data mropePositionIds;
         mropePositionIds.CopyFrom(*mropeIt->second[0]);
@@ -29898,6 +30327,49 @@ namespace fastllm {
 #ifdef USE_CUDA
         if (IsThreadTensorParallelEnabled()) {
             hiddenStates.ToDevice(DataDevice::CPU);
+            FastllmCudaClearBigBuffer();
+
+            const int totalLen = inputIds.dims[1];
+            const int chunkSize = GetChunkedPrefillSize();
+            if (chunkSize > 0 && totalLen > chunkSize) {
+                std::vector<int> chunkRet;
+                for (int st = 0; st < totalLen; st += chunkSize) {
+                    const int curLen = std::min(chunkSize, totalLen - st);
+                    Data curInputIds, curPositionIds, curHiddenStates;
+                    Split(inputIds, 1, st, st + curLen, curInputIds);
+                    Split(mropePositionIds, 1, st, st + curLen,
+                          curPositionIds);
+                    Split(hiddenStates, 1, st, st + curLen,
+                          curHiddenStates);
+
+                    std::vector<Data*> curAttentionMasks = {nullptr};
+                    std::vector<Data*> curPositionIdsVec = {
+                        &curPositionIds
+                    };
+                    std::vector<int> curSeqLens = {curLen};
+
+                    bool oldIntermediateChunkedPrefill =
+                        isIntermediateChunkedPrefill;
+                    isIntermediateChunkedPrefill =
+                        st + curLen < totalLen &&
+                        generationConfig.IsSimpleGreedy();
+                    try {
+                        chunkRet = ForwardGPUWithHiddenStates(
+                            1, curInputIds, curAttentionMasks,
+                            curPositionIdsVec, curSeqLens,
+                            pagedPastKeyValues, generationConfigs,
+                            lastTokens, retLogits, &curHiddenStates);
+                    } catch (...) {
+                        isIntermediateChunkedPrefill =
+                            oldIntermediateChunkedPrefill;
+                        throw;
+                    }
+                    isIntermediateChunkedPrefill =
+                        oldIntermediateChunkedPrefill;
+                }
+                return chunkRet;
+            }
+
             std::vector <Data*> positionIds = {&mropePositionIds};
             return ForwardGPUWithHiddenStates(
                 1, inputIds, attentionMasks, positionIds, seqLens,
