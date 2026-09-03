@@ -8,6 +8,7 @@ fi
 
 export FTLLM_HOME="$FTLLM_BUNDLE_ROOT"
 export PATH="${FTLLM_BUNDLE_ROOT}/runtime/bin:${PATH:-/usr/bin:/bin}"
+export PYTHONDONTWRITEBYTECODE=1
 export PYTHONNOUSERSITE=1
 export PYTHONUTF8=1
 unset PYTHONHOME

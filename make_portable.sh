@@ -2,6 +2,9 @@
 
 set -Eeuo pipefail
 
+# Keep build paths out of bytecode and leave the relocatable runtime immutable.
+export PYTHONDONTWRITEBYTECODE=1
+
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PORTABLE_ASSETS_DIR="${ROOT_DIR}/portable"
 DEFAULT_DIST_DIR="${ROOT_DIR}/build-fastllm/tools/dist"
@@ -25,6 +28,7 @@ constraints_path="${PORTABLE_ASSETS_DIR}/constraints.txt"
 use_constraints=1
 archive_format="tar.gz"
 keep_dir=0
+directory_only=0
 force=0
 run_tests=1
 offline=0
@@ -46,6 +50,7 @@ usage() {
   --format tar.gz|tar.zst
                          压缩格式；默认 tar.gz（目标机无需安装 zstd）
   --keep-dir             除压缩包外，同时保留未压缩目录
+  --directory-only       只生成未压缩目录，便于被其他打包工具复用
   --skip-tests           跳过启动器、原生库和 CUDA 冒烟测试
   --offline              不访问软件源，仅使用已缓存的 wheelhouse
   --force                覆盖同名输出
@@ -356,6 +361,11 @@ while (($#)); do
             keep_dir=1
             shift
             ;;
+        --directory-only)
+            directory_only=1
+            keep_dir=1
+            shift
+            ;;
         --skip-tests)
             run_tests=0
             shift
@@ -404,10 +414,12 @@ require_command install
 require_command date
 require_command cut
 require_command du
-if [[ "$archive_format" == "tar.gz" ]]; then
-    require_command gzip
-else
-    require_command zstd
+if ((! directory_only)); then
+    if [[ "$archive_format" == "tar.gz" ]]; then
+        require_command gzip
+    else
+        require_command zstd
+    fi
 fi
 
 if [[ -z "$wheel_path" ]]; then
@@ -490,10 +502,12 @@ checksum_path="${archive_path}.sha256"
 final_dir="${output_dir}/${bundle_name}"
 
 if ((! force)); then
-    for existing_path in "$archive_path" "$checksum_path"; do
-        [[ ! -e "$existing_path" ]] \
-            || die "输出已存在：$existing_path（使用 --force 覆盖）"
-    done
+    if ((! directory_only)); then
+        for existing_path in "$archive_path" "$checksum_path"; do
+            [[ ! -e "$existing_path" ]] \
+                || die "输出已存在：$existing_path（使用 --force 覆盖）"
+        done
+    fi
     if ((keep_dir)) && [[ -e "$final_dir" ]]; then
         die "输出目录已存在：$final_dir（使用 --force 覆盖）"
     fi
@@ -577,11 +591,6 @@ sed -i \
 # or polyglot shell header. Point every one at its sibling bundled interpreter.
 patch_python_shebangs "$runtime_dir"
 
-# Avoid embedding the temporary build path in .pyc files. Python can create them
-# lazily after extraction, and also works when the bundle is read-only.
-find "$runtime_dir" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
-find "$runtime_dir" -depth -type d -name __pycache__ -empty -delete
-
 "$python_bin" -m pip --disable-pip-version-check list --format=freeze \
     | LC_ALL=C sort -f > "${bundle_dir}/requirements.lock.txt"
 if ((use_constraints)); then
@@ -607,6 +616,7 @@ relocation_parent="${build_root}/relocation test"
 mkdir -p "$relocation_parent"
 mv -- "$bundle_dir" "${relocation_parent}/${bundle_name}"
 bundle_dir="${relocation_parent}/${bundle_name}"
+runtime_dir="${bundle_dir}/runtime"
 
 if ((run_tests)); then
     log "运行可重定位启动器和原生库冒烟测试"
@@ -623,16 +633,23 @@ if ((run_tests)); then
     fi
 fi
 
+# Do this after all Python-based checks so no temporary build paths or redundant
+# bytecode files enter the portable package.
+find "$runtime_dir" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
+find "$runtime_dir" -depth -type d -name __pycache__ -empty -delete
+
 create_manifest "$bundle_dir"
 
-log "创建归档：$(basename -- "$archive_path")"
-archive_staging="${build_root}/${bundle_name}.${archive_suffix}.new"
-checksum_staging="${build_root}/${bundle_name}.${archive_suffix}.sha256.new"
-create_archive "$bundle_dir" "$archive_staging" "$build_epoch"
-archive_sha="$(sha256sum "$archive_staging" | cut -d' ' -f1)"
-printf '%s  %s\n' "$archive_sha" "$(basename -- "$archive_path")" > "$checksum_staging"
-mv -f -- "$archive_staging" "$archive_path"
-mv -f -- "$checksum_staging" "$checksum_path"
+if ((! directory_only)); then
+    log "创建归档：$(basename -- "$archive_path")"
+    archive_staging="${build_root}/${bundle_name}.${archive_suffix}.new"
+    checksum_staging="${build_root}/${bundle_name}.${archive_suffix}.sha256.new"
+    create_archive "$bundle_dir" "$archive_staging" "$build_epoch"
+    archive_sha="$(sha256sum "$archive_staging" | cut -d' ' -f1)"
+    printf '%s  %s\n' "$archive_sha" "$(basename -- "$archive_path")" > "$checksum_staging"
+    mv -f -- "$archive_staging" "$archive_path"
+    mv -f -- "$checksum_staging" "$checksum_path"
+fi
 
 if ((keep_dir)); then
     if [[ -e "$final_dir" ]]; then
@@ -644,9 +661,11 @@ if ((keep_dir)); then
     mv -- "$bundle_dir" "$final_dir"
 fi
 
-archive_size="$(du -h "$archive_path" | cut -f1)"
-log "完成：${archive_path}（${archive_size}）"
-log "校验：${checksum_path}"
+if ((! directory_only)); then
+    archive_size="$(du -h "$archive_path" | cut -f1)"
+    log "完成：${archive_path}（${archive_size}）"
+    log "校验：${checksum_path}"
+fi
 if ((keep_dir)); then
     log "目录：${final_dir}"
 fi
