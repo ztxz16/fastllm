@@ -1,0 +1,32 @@
+# FastLLM Launcher @FTLLM_VERSION@
+
+这是 Linux x86_64 绿色桌面包。解压后直接运行：
+
+```bash
+./FastLLM-Launcher
+```
+
+Electron 会在随机本机端口启动内置的 `ftllm launch --no-browser`，随后在桌面窗口中显示
+Launcher。配置、日志和默认模型缓存位于同目录的 `data/`，移动整个目录即可一并迁移。
+如包所在目录不可写，配置会自动回退到系统用户数据目录。
+
+命令行仍可从 `ftllm/` 子目录使用：
+
+```bash
+./ftllm/ftllm --version
+./ftllm/ftllm-check --require-cuda
+```
+
+## 运行环境
+
+- Linux x86_64，glibc 2.35 或更高（Ubuntu 22.04 基线）。
+- 可用的 X11 或 Wayland 桌面会话。
+- NVIDIA GPU 驱动 @MIN_NVIDIA_DRIVER@ 或更新版本；建议 @RECOMMENDED_NVIDIA_DRIVER@ 或更新版本。
+- 不需要另行安装 Electron、Node.js、Python、CUDA Toolkit、cuBLAS、NCCL 或 FastLLM 的 Python 依赖。
+
+NVIDIA 驱动的 `libcuda.so.1` 必须来自宿主机，包内不会复制驱动库。Linux 内核、glibc、
+图形会话等操作系统基础设施也不会随普通应用重打包。
+
+构建信息见 `DESKTOP-BUILD-INFO.json`，动态库清单见 `ELECTRON-LIBRARIES.json`，全部文件
+校验值见 `MANIFEST.sha256`。FastLLM 许可证位于 `licenses/FastLLM-LICENSE`；Electron
+和 Chromium 的许可说明保留在包根目录。运行日志默认写入 `data/logs/desktop.log`，控制令牌会被脱敏。

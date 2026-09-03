@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self'; style-src 'self'; script-src 'self'">
+    <title>FastLLM Launcher</title>
+    <link rel="stylesheet" href="loading.css">
+  </head>
+  <body>
+    <main class="shell">
+      <section class="card" aria-live="polite">
+        <div class="logo-wrap">
+          <img src="icon.png" alt="" class="logo">
+        </div>
+        <p class="eyebrow">FASTLLM</p>
+        <h1>FastLLM Launcher</h1>
+        <div id="spinner" class="spinner" aria-hidden="true"></div>
+        <p id="status" class="status">正在启动本地服务…</p>
+        <p id="detail" class="detail"></p>
+        <div id="actions" class="actions" hidden>
+          <a class="button primary" href="ftllm-action://restart" id="retry">重试</a>
+          <a class="button" href="ftllm-action://quit" id="quit">退出</a>
+        </div>
+      </section>
+      <p id="local-note" class="local-note">界面仅连接本机，模型与配置不会上传。</p>
+    </main>
+    <script src="loading.js"></script>
+  </body>
+</html>
