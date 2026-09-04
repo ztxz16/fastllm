@@ -17,6 +17,11 @@ struct LayoutConverter {
                         void*               D,
                         MatrixLayout&       Ddesc,
                         cudaStream_t        stream) const = 0;
+
+    // Leading dimension produced by Convert for this source descriptor.
+    // Exposing the deterministic layout metadata lets callers reconstruct a
+    // persistent packed tensor without keeping a side-table keyed by pointer.
+    virtual int GetConvertedLd(const MatrixLayout& Sdesc) const = 0;
 };
 
 // Pointers to singletons

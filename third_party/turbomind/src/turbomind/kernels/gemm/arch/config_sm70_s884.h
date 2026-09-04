@@ -139,6 +139,22 @@ using Config_MXF4 = Sm70_s884<Operand_A<half>,             // A
                               raster_order,
                               group_axis>;
 
+// NVIDIA NVFP4 stores an E2M1 value for every weight and a half-precision
+// effective scale for every group of sixteen weights.  Keep this separate
+// from MXFP4: MXFP4 uses an unsigned E8M0 byte scale, whereas NVFP4 needs the
+// uint16_t (FP16) scale operand consumed by the SM70 s884 mainloop.
+template<Order raster_order, int group_axis = -1>
+using Config_NVF4 = Sm70_s884<Operand_A<half>,             // A
+                              Transform_Default,           // transform A
+                              VoidOperand,                 // U
+                              Operand_B_Pack<fp4_e2m1_t>,  // B
+                              Transform_HMMA_SIMT_B,       // transform B
+                              Operand_V_Pack<uint16_t>,    // V
+                              kRowMajor,                   // order_C
+                              half,                        // Tc
+                              raster_order,
+                              group_axis>;
+
 template<Order raster_order, int group_axis = -1>
 using Config_E4M3 = Sm70_s884<Operand_A<half>,             // A
                               Transform_Default,           // tarnsform A

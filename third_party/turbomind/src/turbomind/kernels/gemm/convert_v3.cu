@@ -42,12 +42,21 @@ struct LayoutConverterImpl: public LayoutConverter {
 
         Convert_v2_Impl<Config<Operand, Dtype, pack_num>>(S, Sdesc, D, Ddesc, stream);
 
-        constexpr Pack pack = mma_tag | op_tag | pack_num;
-
         // Update leading dimension
-        Ddesc.ld = mk2cs<order_>(Packing_v2<pack, order_>::apply({Sdesc.rows, Sdesc.cols})).x;
+        Ddesc.ld = GetConvertedLd(Sdesc_);
 
         return 0;
+    }
+
+    int GetConvertedLd(const MatrixLayout& Sdesc_) const override
+    {
+        const bool trans = op_tag == OPERAND_B || op_tag == OPERAND_V;
+        const MatrixLayout Sdesc = trans ? transpose(Sdesc_) : Sdesc_;
+        constexpr Pack pack = mma_tag | op_tag | pack_num;
+        return mk2cs<order_>(
+                   Packing_v2<pack, order_>::apply(
+                       {Sdesc.rows, Sdesc.cols}))
+            .x;
     }
 };
 
