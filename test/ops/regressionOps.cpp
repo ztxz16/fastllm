@@ -11166,6 +11166,278 @@ namespace {
         }
     }
 
+    void RunCudaExactSmallBatchLinearRegression() {
+        FastllmCudaSetDevice(0);
+        fastllm::Data emptyBias;
+
+        auto makeValues = [](size_t count, uint32_t seed, float scale) {
+            std::vector<float> values(count);
+            uint32_t state = seed;
+            for (size_t index = 0; index < count; index++) {
+                state = state * 1664525u + 1013904223u;
+                values[index] =
+                    ((int32_t)(state >> 24) - 128) * scale;
+            }
+            return values;
+        };
+        auto copyBytes = [](fastllm::Data data) {
+            data.ToDevice(fastllm::DataDevice::CPU);
+            std::vector<uint8_t> bytes(data.GetBytes());
+            Expect(data.cpuData != nullptr,
+                   "exact small-batch output has no CPU buffer");
+            std::memcpy(bytes.data(), data.cpuData, bytes.size());
+            return bytes;
+        };
+        auto makeOutput = [](int rows, int columns) {
+            fastllm::Data output(
+                fastllm::DataType::BFLOAT16, {rows, columns});
+            output.ToDevice(
+                fastllm::DataDevice::CUDA,
+                std::vector<int>{0}, false);
+            output.Allocate(false);
+            return output;
+        };
+
+        auto verifyRows = [&](const std::string &name,
+                              const std::vector<float> &inputValues,
+                              fastllm::Data &weight,
+                              const fastllm::Data &bias,
+                              int rows, int inputDim, int outputDim,
+                              const std::function<bool(
+                                  const fastllm::Data &, fastllm::Data &,
+                                  const fastllm::Data &, fastllm::Data &,
+                                  int, int, int)> &launch) {
+            std::vector<uint8_t> reference(
+                (size_t)rows * outputDim * sizeof(uint16_t));
+            for (int row = 0; row < rows; row++) {
+                const auto begin = inputValues.begin() +
+                    (size_t)row * inputDim;
+                fastllm::Data rowInput = MakeCudaTensor(
+                    fastllm::DataType::BFLOAT16, {1, inputDim},
+                    std::vector<float>(begin, begin + inputDim));
+                fastllm::Data rowOutput = makeOutput(1, outputDim);
+                Expect(launch(rowInput, weight, bias, rowOutput,
+                              1, inputDim, outputDim),
+                       name + " one-row reference launch failed");
+                const std::vector<uint8_t> rowBytes = copyBytes(rowOutput);
+                std::memcpy(reference.data() +
+                                (size_t)row * outputDim * sizeof(uint16_t),
+                            rowBytes.data(), rowBytes.size());
+            }
+
+            fastllm::Data batchInput = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16, {rows, inputDim},
+                inputValues);
+            fastllm::Data batchOutput = makeOutput(rows, outputDim);
+            const int previousThreshold =
+                fastllm::FastllmCudaGetLinearExactBatchThreshold();
+            fastllm::FastllmCudaSetLinearExactBatchThreshold(rows + 1);
+            const bool launched = launch(
+                batchInput, weight, bias, batchOutput,
+                rows, inputDim, outputDim);
+            fastllm::FastllmCudaSetLinearExactBatchThreshold(
+                previousThreshold);
+            Expect(launched, name + " exact-batch launch failed");
+            FastllmCudaSyncCurrentThreadStream();
+            const std::vector<uint8_t> actual = copyBytes(batchOutput);
+            Expect(reference == actual,
+                   name + " changed BF16 output bits at rows=" +
+                       std::to_string(rows));
+        };
+
+        auto runBf16Case = [&](int inputDim, int outputDim,
+                               bool withBias) {
+            const std::vector<float> allInputs = makeValues(
+                (size_t)5 * inputDim,
+                0x51f2a9d3u + inputDim, 1.0f / 64.0f);
+            fastllm::Data weight = MakeCudaTensor(
+                fastllm::DataType::BFLOAT16,
+                {outputDim, inputDim},
+                makeValues((size_t)outputDim * inputDim,
+                           0xa73c19e5u + outputDim, 1.0f / 256.0f));
+            fastllm::Data bias = withBias ? MakeCudaTensor(
+                fastllm::DataType::FLOAT32, {outputDim},
+                makeValues(outputDim, 0x138bd24fu, 1.0f / 128.0f)) :
+                fastllm::Data();
+            auto launch = [](const fastllm::Data &input,
+                             fastllm::Data &caseWeight,
+                             const fastllm::Data &caseBias,
+                             fastllm::Data &output,
+                             int n, int m, int k) {
+                return FastllmCudaBFloat16MatMulBFloat16(
+                    input, caseWeight, caseBias, output, n, m, k);
+            };
+            for (int rows = 2; rows <= 5; rows++) {
+                verifyRows(
+                    "BF16xBF16 m=" + std::to_string(inputDim) +
+                        " k=" + std::to_string(outputDim) +
+                        (withBias ? " bias" : " no-bias"),
+                    std::vector<float>(
+                        allInputs.begin(),
+                        allInputs.begin() + (size_t)rows * inputDim),
+                    weight, withBias ? bias : emptyBias,
+                    rows, inputDim, outputDim, launch);
+            }
+        };
+
+        auto runFp32Case = [&](fastllm::DataType weightType,
+                               int inputDim, int outputDim,
+                               bool withBias) {
+            const int rows = 5;
+            const std::vector<float> inputValues = makeValues(
+                (size_t)rows * inputDim,
+                0x93e4b71du + inputDim, 1.0f / 64.0f);
+            fastllm::Data weight = MakeCudaTensor(
+                weightType,
+                {outputDim, inputDim},
+                makeValues((size_t)outputDim * inputDim,
+                           0x24d18a6bu + outputDim,
+                           1.0f / 256.0f));
+            fastllm::Data bias = withBias ? MakeCudaTensor(
+                fastllm::DataType::FLOAT32, {outputDim},
+                makeValues(outputDim, 0xbc7e315fu,
+                           1.0f / 128.0f)) : fastllm::Data();
+            const fastllm::Data &caseBias = withBias ? bias : emptyBias;
+
+            std::vector<uint8_t> reference(
+                (size_t)rows * outputDim * sizeof(float));
+            for (int row = 0; row < rows; row++) {
+                const auto begin = inputValues.begin() +
+                    (size_t)row * inputDim;
+                fastllm::Data rowInput = MakeCudaTensor(
+                    fastllm::DataType::FLOAT32, {1, inputDim},
+                    std::vector<float>(begin, begin + inputDim));
+                fastllm::Data rowOutput(
+                    fastllm::DataType::FLOAT32, {1, outputDim});
+                rowOutput.ToDevice(
+                    fastllm::DataDevice::CUDA,
+                    std::vector<int>{0}, false);
+                rowOutput.Allocate(false);
+                const bool launched =
+                    weightType == fastllm::DataType::BFLOAT16 ?
+                        FastllmCudaMatMulBFloat16(
+                            rowInput, weight, caseBias, rowOutput,
+                            1, inputDim, outputDim) :
+                        FastllmCudaMatMulFloat32(
+                            rowInput, weight, caseBias, rowOutput,
+                            1, inputDim, outputDim);
+                Expect(launched,
+                       "FP32 exact one-row reference launch failed");
+                const std::vector<uint8_t> rowBytes =
+                    copyBytes(rowOutput);
+                std::memcpy(
+                    reference.data() +
+                        (size_t)row * outputDim * sizeof(float),
+                    rowBytes.data(), rowBytes.size());
+            }
+
+            fastllm::Data batchInput = MakeCudaTensor(
+                fastllm::DataType::FLOAT32,
+                {rows, inputDim}, inputValues);
+            fastllm::Data batchOutput(
+                fastllm::DataType::FLOAT32, {rows, outputDim});
+            batchOutput.ToDevice(
+                fastllm::DataDevice::CUDA,
+                std::vector<int>{0}, false);
+            batchOutput.Allocate(false);
+            const int previousThreshold =
+                fastllm::FastllmCudaGetLinearExactBatchThreshold();
+            fastllm::FastllmCudaSetLinearExactBatchThreshold(rows + 1);
+            const bool launched =
+                weightType == fastllm::DataType::BFLOAT16 ?
+                    FastllmCudaMatMulBFloat16(
+                        batchInput, weight, caseBias, batchOutput,
+                        rows, inputDim, outputDim) :
+                    FastllmCudaMatMulFloat32(
+                        batchInput, weight, caseBias, batchOutput,
+                        rows, inputDim, outputDim);
+            fastllm::FastllmCudaSetLinearExactBatchThreshold(
+                previousThreshold);
+            Expect(launched,
+                   "FP32 exact-batch launch failed");
+            FastllmCudaSyncCurrentThreadStream();
+            Expect(reference == copyBytes(batchOutput),
+                   "FP32 input changed output bits at rows=5, m=" +
+                       std::to_string(inputDim) + ", k=" +
+                       std::to_string(outputDim));
+        };
+
+        auto runFp8Case = [&](int inputDim, int outputDim,
+                              bool withBias) {
+            constexpr int block = 128;
+            fastllm::Data weight(
+                fastllm::DataType::FP8_E4M3,
+                {outputDim, inputDim});
+            weight.weightType = fastllm::WeightType::LINEAR;
+            weight.blockK = block;
+            weight.blockM = block;
+            weight.scales.resize(
+                (size_t)((outputDim + block - 1) / block) *
+                ((inputDim + block - 1) / block));
+            for (size_t index = 0; index < weight.scales.size(); index++) {
+                weight.scales[index] =
+                    0.003125f * (float)(1 + index % 5);
+            }
+            weight.Allocate(false);
+            for (size_t index = 0;
+                 index < (size_t)outputDim * inputDim; index++) {
+                uint8_t value = (uint8_t)(
+                    0x18u + ((index * 13u + index / 17u) & 0x27u));
+                if ((index / 11u) & 1u) {
+                    value |= 0x80u;
+                }
+                weight.cpuData[index] = value;
+            }
+            weight.ToDevice(fastllm::DataDevice::CUDA);
+
+            const std::vector<float> allInputs = makeValues(
+                (size_t)5 * inputDim,
+                0x6c25e1b7u + inputDim, 1.0f / 128.0f);
+            fastllm::Data bias = withBias ? MakeCudaTensor(
+                fastllm::DataType::FLOAT32, {outputDim},
+                makeValues(outputDim, 0xd19a43efu, 1.0f / 64.0f)) :
+                fastllm::Data();
+            auto launch = [](const fastllm::Data &input,
+                             fastllm::Data &caseWeight,
+                             const fastllm::Data &caseBias,
+                             fastllm::Data &output,
+                             int n, int m, int k) {
+                return FastllmCudaBFloat16MatMulFP8E4M3(
+                    input, caseWeight, caseBias, output, n, m, k);
+            };
+            for (int rows = 2; rows <= 5; rows++) {
+                verifyRows(
+                    "BF16xFP8 m=" + std::to_string(inputDim) +
+                        " k=" + std::to_string(outputDim) +
+                        (withBias ? " bias" : " no-bias"),
+                    std::vector<float>(
+                        allInputs.begin(),
+                        allInputs.begin() + (size_t)rows * inputDim),
+                    weight, withBias ? bias : emptyBias,
+                    rows, inputDim, outputDim, launch);
+            }
+        };
+
+        for (bool withBias : {false, true}) {
+            runBf16Case(256, 257, withBias);
+            runBf16Case(259, 193, withBias);
+            runFp32Case(
+                fastllm::DataType::BFLOAT16,
+                256, 257, withBias);
+            runFp32Case(
+                fastllm::DataType::BFLOAT16,
+                259, 193, withBias);
+            runFp32Case(
+                fastllm::DataType::FLOAT32,
+                256, 257, withBias);
+            runFp32Case(
+                fastllm::DataType::FLOAT32,
+                259, 193, withBias);
+            runFp8Case(256, 257, withBias);
+            runFp8Case(260, 193, withBias);
+        }
+    }
+
     void RunCudaFp16WarpRowsGemvRegression() {
         FastllmCudaSetDevice(0);
         fastllm::Data emptyBias;
@@ -14369,6 +14641,14 @@ int main(int argc, char **argv) {
             return 0;
         }
         if (argc == 2 &&
+            std::string(argv[1]) == "--cuda-exact-small-batch-linear") {
+            Expect(FastllmCudaGetDeviceCount() > 0,
+                   "exact small-batch Linear regression requires CUDA.");
+            RunCudaExactSmallBatchLinearRegression();
+            std::cout << "CUDA exact small-batch Linear regressions: PASS\n";
+            return 0;
+        }
+        if (argc == 2 &&
             std::string(argv[1]) == "--cuda-gguf-q3-dequant") {
             Expect(FastllmCudaGetDeviceCount() > 0,
                    "GGUF Q3 dequant regression requires CUDA.");
@@ -14714,6 +14994,7 @@ int main(int argc, char **argv) {
             RunCudaCompactInt4Group32LinearRegression();
             RunCudaInt4GroupHalfWeightRoundingRegression();
             RunCudaFp8LinearAddRegression();
+            RunCudaExactSmallBatchLinearRegression();
             RunCudaFp16WarpRowsGemvRegression();
             RunCudaFusedRouterSelectionRegression();
             RunCudaQwen35RouterSharedGateFusionRegression();

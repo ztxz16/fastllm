@@ -11,6 +11,11 @@ template <int THREAD_PER_BLOCK, int PART>
 __global__ void FastllmGemvFp32Fp32Kernel2(float *A, float *B, float *C, float *bias, int m, int k) {
     __shared__ float sdata[THREAD_PER_BLOCK];
     unsigned int tid = threadIdx.x;
+    if constexpr (PART == 1) {
+        const size_t gridRow = (size_t)blockIdx.y;
+        A += gridRow * m;
+        C += gridRow * k;
+    }
 
     // 1. 计算
     int st = blockIdx.x * PART;
@@ -57,7 +62,23 @@ bool FastllmCudaMatMulFloat32(const fastllm::Data &input, fastllm::Data &weight,
     float *cudaInput = (float*)FastllmCudaPrepareInput(input);
     float *cudaOutput = (float*)FastllmCudaPrepareOutput(output);
 
-    if (n > 1) {
+    const bool exactRows = n > 1 &&
+        n < fastllm::FastllmCudaGetLinearExactBatchThreshold();
+    if (exactRows && n <= 65535) {
+        FastllmGemvFp32Fp32Kernel2<256, 1>
+            <<<dim3(k, n), 256>>>(
+                cudaInput, (float *)weight.cudaData, cudaOutput,
+                cudaBiasData, m, k);
+    } else if (exactRows) {
+        for (int row = 0; row < n; row++) {
+            FastllmGemvFp32Fp32Kernel2<256, 1>
+                <<<k, 256>>>(
+                    cudaInput + (size_t)row * m,
+                    (float *)weight.cudaData,
+                    cudaOutput + (size_t)row * k,
+                    cudaBiasData, m, k);
+        }
+    } else if (n > 1) {
         float h_alpha = 1.0, h_beta = 0.0;
         auto fastllmCublasHandle = getFastllmCublasHandle();
         //cudaDeviceSynchronize();

@@ -1714,6 +1714,14 @@ __global__ void FastllmGemvBF16FP8E4M3Kernel1MultiRow(__nv_bfloat16 *A, uint8_t 
                                                     int m, int k, int blockM, int blockK) {
     __shared__ float sdata[PART][THREAD_PER_BLOCK];
     unsigned int tid = threadIdx.x;
+    // Exact verification batches use PART=1 and grid.y for independent rows.
+    // This is the identical kernel used by single-token decode, preserving the
+    // per-row floating-point operation and reduction order across CUDA GPUs.
+    if constexpr (PART == 1) {
+        const size_t gridRow = (size_t)blockIdx.y;
+        A += gridRow * m;
+        C += gridRow * k;
+    }
 
     int st = blockIdx.x;
 #pragma unroll
@@ -1952,10 +1960,18 @@ static void LaunchFastllmGemmBF16FP8E4M3SmallBatch(
 void LaunchFastllmGemmBF16FP8E4M3(__nv_bfloat16 *input, uint8_t *weight, __nv_bfloat16 *output, __nv_bfloat16 *bias, float *scales, int n, int m, int k, int blockM, int blockK) {
     if (n > 1 &&
         n < fastllm::FastllmCudaGetLinearExactBatchThreshold()) {
-        for (int i = 0; i < n; ++i) {
-            LaunchFastllmGemmBF16FP8E4M3SmallBatch<1>(
-                input + i * m, weight, output + i * k, bias, scales,
-                m, k, blockM, blockK);
+        if (n <= 65535) {
+            FastllmGemvBF16FP8E4M3Kernel1MultiRow<64, 1, false>
+                <<<dim3(k, n), 64>>>(
+                    input, weight, output, bias, scales,
+                    m, k, blockM, blockK);
+        } else {
+            for (int i = 0; i < n; ++i) {
+                FastllmGemvBF16FP8E4M3Kernel1MultiRow<64, 1, false>
+                    <<<k, 64>>>(input + (size_t)i * m, weight,
+                                output + (size_t)i * k, bias, scales,
+                                m, k, blockM, blockK);
+            }
         }
         return;
     }

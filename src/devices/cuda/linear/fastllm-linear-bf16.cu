@@ -25,6 +25,15 @@ template <int THREAD_PER_BLOCK, int PART>
 __global__ void FastllmGemvBf16Bf16Kernel2MultiRow(__nv_bfloat16 *A, __nv_bfloat16 *B, __nv_bfloat16 *C, __nv_bfloat16 *bias, int m, int k) {
     __shared__ float sdata[PART][THREAD_PER_BLOCK];
     unsigned int tid = threadIdx.x;
+    // Keep exact small batches on the very same PART=1 kernel as ordinary
+    // decode.  blockIdx.y only selects an independent input/output row, so
+    // each row retains the same instructions and reduction order as a
+    // separate one-row launch on every CUDA architecture.
+    if constexpr (PART == 1) {
+        const size_t gridRow = (size_t)blockIdx.y;
+        A += gridRow * m;
+        C += gridRow * k;
+    }
     union_bf16_8 regA;
     union_bf16_8 regB;
 
@@ -177,6 +186,14 @@ template <int THREAD_PER_BLOCK, int PART>
 __global__ void FastllmGemvFp32Bf16Kernel2MultiRow(float *A, __nv_bfloat16 *B, float *C, float *bias, int m, int k) {
     __shared__ float sdata[PART][THREAD_PER_BLOCK];
     unsigned int tid = threadIdx.x;
+    // Exact speculative verification uses the ordinary one-row reduction
+    // tree for every candidate.  A grid-y row selector keeps those rows in a
+    // single launch without changing any arithmetic performed by PART=1.
+    if constexpr (PART == 1) {
+        const size_t gridRow = (size_t)blockIdx.y;
+        A += gridRow * m;
+        C += gridRow * k;
+    }
     float4 regA;
     union_bf16_4 regB;
 
@@ -328,7 +345,20 @@ static void FastllmCudaBF16EnsureBiasHalfOnDevice(fastllm::Data &weight, const f
 }
 
 void LaunchFastllmGemmFp32Bf16(float *input, __nv_bfloat16 *weight, float *output, float *bias, int n, int m, int k) {
-    if (n == 1) {
+    if (n > 1 &&
+        n < fastllm::FastllmCudaGetLinearExactBatchThreshold()) {
+        if (n <= 65535) {
+            FastllmGemvFp32Bf16Kernel2MultiRow<256, 1>
+                <<<dim3(k, n), 256>>>(
+                    input, weight, output, bias, m, k);
+        } else {
+            for (int i = 0; i < n; ++i) {
+                FastllmGemvFp32Bf16Kernel2MultiRow<256, 1>
+                    <<<k, 256>>>(input + (size_t)i * m, weight,
+                                 output + (size_t)i * k, bias, m, k);
+            }
+        }
+    } else if (n == 1) {
         FastllmGemvFp32Bf16Kernel2MultiRow<256, 1> <<<k, 256>>>(input, weight, output, bias, m, k);
     } else if (n == 2) {
         FastllmGemvFp32Bf16Kernel2MultiRow<256, 2> <<<k, 256>>>(input, weight, output, bias, m, k);
@@ -404,10 +434,19 @@ void LaunchFastllmGemmFp16Bf16(half *input, __nv_bfloat16 *weight, half *output,
 void LaunchFastllmGemmBf16Bf16(__nv_bfloat16 *input, __nv_bfloat16 *weight, __nv_bfloat16 *output, __nv_bfloat16 *bias, int n, int m, int k) {
     if (n > 1 &&
         n < fastllm::FastllmCudaGetLinearExactBatchThreshold()) {
-        for (int i = 0; i < n; ++i) {
+        // CUDA guarantees at least 65,535 blocks in grid.y. Preserve the
+        // previous launch-per-row fallback if an external caller requests a
+        // larger exact batch instead of relying on a device-specific limit.
+        if (n <= 65535) {
             FastllmGemvBf16Bf16Kernel2MultiRow<256, 1>
-                <<<k, 256>>>(input + (size_t)i * m, weight,
-                             output + (size_t)i * k, bias, m, k);
+                <<<dim3(k, n), 256>>>(
+                    input, weight, output, bias, m, k);
+        } else {
+            for (int i = 0; i < n; ++i) {
+                FastllmGemvBf16Bf16Kernel2MultiRow<256, 1>
+                    <<<k, 256>>>(input + (size_t)i * m, weight,
+                                 output + (size_t)i * k, bias, m, k);
+            }
         }
     } else if (n == 1) {
         FastllmGemvBf16Bf16Kernel2MultiRow<256, 1> <<<k, 256>>>(input, weight, output, bias, m, k);
