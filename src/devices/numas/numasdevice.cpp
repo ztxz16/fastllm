@@ -1340,6 +1340,17 @@ namespace fastllm {
             std::vector<int> expertOrder;
             std::vector<DeepSeekV4NumasGroupedGemmExpert>
                 groupedGemmExperts;
+            std::vector<std::vector<std::pair<int, float>>> expertTasks;
+            std::vector<int> expertTaskOffsets;
+            std::vector<MultiThreadMemcpyMultiLinesTask> memcpyTasks;
+            std::vector<int> reduceSampleExpertCounts;
+            std::vector<int> reducePositions;
+            std::vector<float> reduceTaskWeights;
+            std::vector<int> reduceSampleExpertIndices;
+            std::vector<int> reduceExpertOffsets;
+            std::vector<int> reduceExpertOrder;
+            std::vector<std::vector<MultiThreadGemmAndCrossSwigluOp>>
+                gateSwigluTaskStorage;
             std::vector<std::vector<MultiThreadGemmOp>> gemmTaskStorage;
             std::vector<std::vector<MultiThreadDeepSeekV4NumasDownPrepareOp>>
                 prepareTaskStorage;
@@ -1602,6 +1613,11 @@ namespace fastllm {
         GetNumasMoeRuntimeCache().clear();
     }
 
+    bool CanUseNumasMoeExactSmallBatch(int rows) {
+        return rows > 1 && rows <= kNumasMoePrefetchMaxRows &&
+            GetCPUInstructInfo()->hasAVX512BF16;
+    }
+
     bool PrefetchNumasMoeDecodeInput(
             const Data &input, const Data &index, const Data &score,
             int layer) {
@@ -1612,13 +1628,28 @@ namespace fastllm {
         (void)layer;
         return false;
 #else
+        auto isDenseMatrix = [](const Data &data) {
+            return data.dims.size() == 2 && data.dims[0] > 0 &&
+                data.dims[1] > 0 && data.strides.size() == 2 &&
+                data.strides[1] == 1 &&
+                data.strides[0] == (uint64_t)data.dims[1];
+        };
         if (input.dataDevice != DataDevice::CUDA ||
             index.dataDevice != DataDevice::CUDA ||
             score.dataDevice != DataDevice::CUDA ||
             input.cudaData == nullptr || index.cudaData == nullptr ||
             score.cudaData == nullptr || input.multiDeviceData ||
             index.multiDeviceData || score.multiDeviceData ||
-            input.dims.empty() || input.Count(0) != input.dims.back()) {
+            !isDenseMatrix(input) || !isDenseMatrix(index) ||
+            !isDenseMatrix(score) ||
+            input.dims[0] > kNumasMoePrefetchMaxRows ||
+            index.dims[0] != input.dims[0] ||
+            score.dims != index.dims ||
+            index.dataType != DataType::INT32 ||
+            score.dataType != DataType::FLOAT32 ||
+            (input.dataType != DataType::FLOAT32 &&
+             input.dataType != DataType::FLOAT16 &&
+             input.dataType != DataType::BFLOAT16)) {
             return false;
         }
         auto pointerDevice = [](const Data &data) {
@@ -2943,7 +2974,9 @@ namespace fastllm {
     };
     
     // 重构的动态任务调度函数，支持work-stealing
-    void DynamicScheduleTasks(std::vector<std::vector<MultiThreadBaseOp*>>& ops) {
+    void DynamicScheduleTasks(
+            std::vector<std::vector<MultiThreadBaseOp*>>& ops,
+            bool deleteTasks = true) {
         auto *pool = GetAlivePool();
         auto *numaConfig = GetNumaConfig();
         
@@ -3030,10 +3063,13 @@ namespace fastllm {
             }
         }
         
-        // 删除原始ops
-        for (int nid = 0; nid < numaConfig->numaCnt; nid++) {
-            for (auto* op : ops[nid]) {
-                delete op;
+        // Delete heap-backed tasks.  Small grouped decode can instead pass
+        // pointers into reusable contiguous storage.
+        if (deleteTasks) {
+            for (int nid = 0; nid < numaConfig->numaCnt; nid++) {
+                for (auto* op : ops[nid]) {
+                    delete op;
+                }
             }
         }
     }
@@ -5097,8 +5133,18 @@ namespace fastllm {
         int interDim = weights[2]->dims[0] / 2;
         int outputDim = output.dims[1];
 
-        std::vector <std::vector <std::pair <int, float> > > expertTasks; // expertTasks[i]代表专家i的task, expertTasks[i][j] = (第j个任务对应的行数， 权重)
+        // Verification repeatedly rebuilds the same-shaped routing scratch for
+        // every layer. Retain vector capacity for the grouped decode shapes;
+        // larger and non-DeepSeek batches keep their ordinary local lifetime.
+        const bool useGroupedScratch =
+            deepSeekV4Mode && bs > 1 && bs <= 8;
+        std::vector<std::vector<std::pair<int, float>>> localExpertTasks;
+        auto &expertTasks = useGroupedScratch ?
+            fastllmMoeDataManagerNumas.expertTasks : localExpertTasks;
         expertTasks.resize(m + 1);
+        for (auto &tasks : expertTasks) {
+            tasks.clear();
+        }
         for (int b = 0; b < bs; b++) {
             expertTasks[0].push_back(std::make_pair(b, sharedScale));
             for (int j = 0; j < topk; j++) {
@@ -5252,7 +5298,9 @@ namespace fastllm {
         }
 
         // 1. realInput -> expandInput
-        std::vector <MultiThreadMemcpyMultiLinesTask> memcpyTasks;
+        std::vector<MultiThreadMemcpyMultiLinesTask> localMemcpyTasks;
+        auto &memcpyTasks = useGroupedScratch ?
+            fastllmMoeDataManagerNumas.memcpyTasks : localMemcpyTasks;
         memcpyTasks.resize(totalLines);
         {
             uint8_t* realInputPtr = realInput.data();
@@ -5260,7 +5308,10 @@ namespace fastllm {
             int bytesPerLine = GetDataBytes(startDataType, 1, inputDim);
 
             // 预计算每个 expert 在 expandInput 中的起始偏移（跳过不在 cpuExperts 中的专家）
-            std::vector<int> curPos(expertTasks.size(), -1);
+            std::vector<int> localCurPos;
+            auto &curPos = useGroupedScratch ?
+                fastllmMoeDataManagerNumas.expertTaskOffsets : localCurPos;
+            curPos.assign(expertTasks.size(), -1);
             {
                 int base = 0;
                 for (int e = 0; e < (int)expertTasks.size(); e++) {
@@ -5327,9 +5378,12 @@ namespace fastllm {
             std::getenv(
                 "FASTLLM_DSV4_DISABLE_NUMAS_MOE_GROUPED_DECODE") ==
                 nullptr;
+        // A verifier layer can otherwise allocate and free hundreds of
+        // fine-grained GEMM task objects. Store those exact same tasks in
+        // contiguous vectors for every 2-8 row DeepSeek-V4 group.
         if (useDeepSeekV4GroupedDecodeFast) {
             // Match the tuned small-batch queue granularity.  The generic
-            // grouped path's 64-column chunks create thousands of heap-backed
+            // grouped path's 64-column chunks create thousands of fine-grained
             // tasks for an eight-row verifier layer and erase the cache reuse
             // gained by grouping repeated experts.
             stride = 208;
@@ -5347,6 +5401,22 @@ namespace fastllm {
             useParallelDeepSeekV4Prepare;
         const bool useDirectBFloat16Prepare =
             useParallelDeepSeekV4Prepare;
+
+        auto &gateTaskStorage =
+            fastllmMoeDataManagerNumas.gateSwigluTaskStorage;
+        auto &gateTasks = fastllmMoeDataManagerNumas.taskPointers;
+        if (useGroupedScratch && !useDeepSeekV4GroupedDecodeFast) {
+            gateTaskStorage.resize(numaConfig->numaCnt);
+            gateTasks.resize(numaConfig->numaCnt);
+            const size_t tasksPerNode =
+                (size_t)totalLines *
+                ((gateColsPerNuma + stride - 1) / stride);
+            for (int nid = 0; nid < numaConfig->numaCnt; nid++) {
+                gateTaskStorage[nid].clear();
+                gateTaskStorage[nid].reserve(tasksPerNode);
+                gateTasks[nid].clear();
+            }
+        }
 
         std::vector<std::vector <fastllm::MultiThreadBaseOp*> > ops;
         ops.resize(numaConfig->numaCnt);
@@ -5390,15 +5460,30 @@ namespace fastllm {
                     }
                     for (int st = 0; st < kPer; st += stride) {
                         int end = std::min(st + stride, kPer);
-                        ops[nid].push_back(new MultiThreadGemmAndCrossSwigluOp(
-                            (uint8_t*)expertInputPtr, startDataType,
-                            weights[e * 2]->numasData[nid], weights[e * 2]->GetDataType(),
-                            (uint8_t*)expertGateUpOutputPtr + outputOffset, DataType::FLOAT32,
-                            expertSwigluOutputPtr,
-                            lines, inputDim, k, st, end, base,
-                            expertDstOutputPtr, downInputDataType,
-                            skipRedundantCrossSwiglu
-                        ));
+                        if (useGroupedScratch) {
+                            gateTaskStorage[nid].emplace_back(
+                                (uint8_t*)expertInputPtr, startDataType,
+                                weights[e * 2]->numasData[nid],
+                                weights[e * 2]->GetDataType(),
+                                (uint8_t*)expertGateUpOutputPtr + outputOffset,
+                                DataType::FLOAT32, expertSwigluOutputPtr,
+                                lines, inputDim, k, st, end, base,
+                                expertDstOutputPtr, downInputDataType,
+                                skipRedundantCrossSwiglu);
+                        } else {
+                            ops[nid].push_back(
+                                new MultiThreadGemmAndCrossSwigluOp(
+                                    (uint8_t*)expertInputPtr, startDataType,
+                                    weights[e * 2]->numasData[nid],
+                                    weights[e * 2]->GetDataType(),
+                                    (uint8_t*)expertGateUpOutputPtr +
+                                        outputOffset,
+                                    DataType::FLOAT32,
+                                    expertSwigluOutputPtr,
+                                    lines, inputDim, k, st, end, base,
+                                    expertDstOutputPtr, downInputDataType,
+                                    skipRedundantCrossSwiglu));
+                        }
                     }
                 }
                 offset += lines;
@@ -5446,6 +5531,14 @@ namespace fastllm {
                     gateColsPerNuma, stride);
             }
             ScheduleDeepSeekV4NumasGemmQueue(contexts);
+        } else if (useGroupedScratch) {
+            for (int nid = 0; nid < numaConfig->numaCnt; nid++) {
+                gateTasks[nid].reserve(gateTaskStorage[nid].size());
+                for (auto &task : gateTaskStorage[nid]) {
+                    gateTasks[nid].push_back(&task);
+                }
+            }
+            DynamicScheduleTasks(gateTasks, false);
         } else {
             DynamicScheduleTasks(ops);
         }
@@ -5557,6 +5650,22 @@ namespace fastllm {
             // without flooding the shared queue.
             stride = std::max(64, std::min(512, balancedStride));
         }
+        auto &downTaskStorage =
+            fastllmMoeDataManagerNumas.gemmTaskStorage;
+        auto &downTasks = fastllmMoeDataManagerNumas.taskPointers;
+        if (useGroupedScratch && !useDeepSeekV4GroupedDecodeFast) {
+            downTaskStorage.resize(numaConfig->numaCnt);
+            downTasks.resize(numaConfig->numaCnt);
+            const int downColsPerNuma = outputDim / numaConfig->numaCnt;
+            const size_t tasksPerNode =
+                (size_t)totalLines *
+                ((downColsPerNuma + stride - 1) / stride);
+            for (int nid = 0; nid < numaConfig->numaCnt; nid++) {
+                downTaskStorage[nid].clear();
+                downTaskStorage[nid].reserve(tasksPerNode);
+                downTasks[nid].clear();
+            }
+        }
         ops.resize(numaConfig->numaCnt);
         for (int i = 0; i < (int)ops.size(); i++) {
             ops[i].clear();
@@ -5590,12 +5699,25 @@ namespace fastllm {
                     }
                     for (int st = 0; st < kPer; st += stride) {
                         int end = std::min(st + stride, kPer);
-                        ops[nid].push_back(new MultiThreadGemmOp(
-                            (uint8_t*)expertDownInputPtr, downInputDataType,
-                            weights[e * 2 + 1]->numasData[nid], weights[e * 2 + 1]->GetDataType(),
-                            (uint8_t*)expertDownOutputPtr + outputOffset, DataType::FLOAT32,
-                            lines, interDim, k, st, end
-                        ));
+                        if (useGroupedScratch) {
+                            downTaskStorage[nid].emplace_back(
+                                (uint8_t*)expertDownInputPtr,
+                                downInputDataType,
+                                weights[e * 2 + 1]->numasData[nid],
+                                weights[e * 2 + 1]->GetDataType(),
+                                (uint8_t*)expertDownOutputPtr + outputOffset,
+                                DataType::FLOAT32,
+                                lines, interDim, k, st, end);
+                        } else {
+                            ops[nid].push_back(new MultiThreadGemmOp(
+                                (uint8_t*)expertDownInputPtr,
+                                downInputDataType,
+                                weights[e * 2 + 1]->numasData[nid],
+                                weights[e * 2 + 1]->GetDataType(),
+                                (uint8_t*)expertDownOutputPtr + outputOffset,
+                                DataType::FLOAT32,
+                                lines, interDim, k, st, end));
+                        }
                     }
                 }
                 offset += lines;
@@ -5616,6 +5738,14 @@ namespace fastllm {
                     dim / numaConfig->numaCnt, stride);
             }
             ScheduleDeepSeekV4NumasGemmQueue(contexts);
+        } else if (useGroupedScratch) {
+            for (int nid = 0; nid < numaConfig->numaCnt; nid++) {
+                downTasks[nid].reserve(downTaskStorage[nid].size());
+                for (auto &task : downTaskStorage[nid]) {
+                    downTasks[nid].push_back(&task);
+                }
+            }
+            DynamicScheduleTasks(downTasks, false);
         } else {
             DynamicScheduleTasks(ops);
         }
@@ -5698,25 +5828,53 @@ namespace fastllm {
 
         // 6. reduce
         {
+            // Keep these small routing tables in the per-layer workspace too.
+            // Verification reaches this path thousands of times per request;
+            // retaining capacity avoids repeated allocator traffic without
+            // changing the expert or floating-point reduction order.
+            std::vector<int> localSampleExpertCounts;
+            std::vector<int> localPositions;
+            std::vector<float> localTaskWeights;
+            std::vector<int> localSampleExpertIndices;
+            std::vector<int> localExpertOffsets;
+            std::vector<int> localReduceExpertOrder;
+            auto &samplesExpertCount = useGroupedScratch ?
+                fastllmMoeDataManagerNumas.reduceSampleExpertCounts :
+                localSampleExpertCounts;
+            auto &pos = useGroupedScratch ?
+                fastllmMoeDataManagerNumas.reducePositions : localPositions;
+            auto &taskWeights = useGroupedScratch ?
+                fastllmMoeDataManagerNumas.reduceTaskWeights :
+                localTaskWeights;
+            auto &sampleExpertIdx = useGroupedScratch ?
+                fastllmMoeDataManagerNumas.reduceSampleExpertIndices :
+                localSampleExpertIndices;
+            auto &expertOffsets = useGroupedScratch ?
+                fastllmMoeDataManagerNumas.reduceExpertOffsets :
+                localExpertOffsets;
+            auto &reduceExpertOrder = useGroupedScratch ?
+                fastllmMoeDataManagerNumas.reduceExpertOrder :
+                localReduceExpertOrder;
+
             // 计算每个样本选择的专家数 k
             int k = 0;
-            std::vector<int> samples_expert_count(bs, 0);
+            samplesExpertCount.assign(bs, 0);
             for (int e = 0; e < (int)expertTasks.size(); e++) {
                 if (weights[e * 2] != nullptr && cpuExperts.count(e)) {
                     for (auto& task : expertTasks[e]) {
                         int rowIdx = task.first;
-                        samples_expert_count[rowIdx]++;
-                        k = std::max(k, samples_expert_count[rowIdx]);
+                        samplesExpertCount[rowIdx]++;
+                        k = std::max(k, samplesExpertCount[rowIdx]);
                     }
                 }
             }
 
             // 分配内存: task_weights 按 totalLines 大小，以 downOutput 行号索引
-            std::vector<int> pos(bs * k, -1);
-            std::vector<float> task_weights(totalLines, 0.0f);
-            std::vector<int> sample_expert_idx(bs, 0);
+            pos.assign((size_t)bs * k, -1);
+            taskWeights.assign(totalLines, 0.0f);
+            sampleExpertIdx.assign(bs, 0);
 
-            std::vector<int> expertOffsets(expertTasks.size(), -1);
+            expertOffsets.assign(expertTasks.size(), -1);
             int reduceOffset = 0;
             for (int e = 0; e < (int)expertTasks.size(); e++) {
                 if (weights[e * 2] != nullptr && cpuExperts.count(e)) {
@@ -5724,7 +5882,10 @@ namespace fastllm {
                     reduceOffset += expertTasks[e].size();
                 }
             }
-            std::vector<int> reduceExpertOrder;
+            reduceExpertOrder.clear();
+            if (useGroupedScratch) {
+                reduceExpertOrder.reserve(expertTasks.size());
+            }
             if (deepSeekV4Mode) {
                 for (int e = 1; e < (int)expertTasks.size(); e++) {
                     reduceExpertOrder.push_back(e);
@@ -5741,10 +5902,10 @@ namespace fastllm {
                     for (auto& task : expertTasks[e]) {
                         int rowIdx = task.first;
                         float weight = deepSeekV4Mode ? 1.0f : task.second;
-                        int idx = sample_expert_idx[rowIdx]++;
+                        int idx = sampleExpertIdx[rowIdx]++;
                         int outputRow = expertOffsets[e] + line++;
                         pos[rowIdx * k + idx] = outputRow;
-                        task_weights[outputRow] = weight;
+                        taskWeights[outputRow] = weight;
                     }
                 }
             }
@@ -5757,7 +5918,7 @@ namespace fastllm {
             MultiThreadReduceBatch(
                 (uint8_t*)downOutput.data(),  // downOutData
                 DataType::FLOAT32,             // downOutDataType
-                task_weights.data(),           // weights
+                taskWeights.data(),            // weights
                 lastOutput,                    // lastOutput
                 pos.data(),                    // pos
                 bs,                           // bsz

@@ -599,13 +599,85 @@ namespace fastllm {
         return false;
     }
 
+#ifdef __AVX512BF16__
+    static inline void
+    LinearBFloat16FP8E4M3Block128TwoRows_AVX512BF16(
+            const uint16_t *inputData, const uint8_t *weightData,
+            float *outputData, int m, int k, int st, int end,
+            size_t perRow, float magicScale) {
+        constexpr int blockM = 128;
+        const int numBlocks = (m + blockM - 1) / blockM;
+        const __m256i signMask = _mm256_set1_epi8((char)0x80);
+        const __m256i valueMask = _mm256_set1_epi8(0x7f);
+
+        for (int outputRow = st; outputRow < end; outputRow++) {
+            __m512 sum0 = _mm512_setzero_ps();
+            __m512 sum1 = _mm512_setzero_ps();
+
+            const uint8_t *rowData =
+                weightData + (size_t)outputRow * perRow;
+            for (int block = 0; block < numBlocks; block++) {
+                __m512 blockSum0 = _mm512_setzero_ps();
+                __m512 blockSum1 = _mm512_setzero_ps();
+
+                const uint8_t *fp8 =
+                    rowData + (size_t)block * (blockM + sizeof(float));
+                const int blockStart = block * blockM;
+                const int blockEnd = std::min(blockStart + blockM, m);
+                for (int column = blockStart; column + 31 < blockEnd;
+                     column += 32) {
+                    const __m256i bytes = _mm256_loadu_si256(
+                        (const __m256i*)(fp8 + column - blockStart));
+                    const __m512i signWords = _mm512_cvtepu8_epi16(
+                        _mm256_and_si256(bytes, signMask));
+                    const __m512i valueWords = _mm512_cvtepu8_epi16(
+                        _mm256_and_si256(bytes, valueMask));
+                    const __m512bh weights = (__m512bh)_mm512_or_si512(
+                        _mm512_slli_epi16(signWords, 8),
+                        _mm512_slli_epi16(valueWords, 4));
+                    const __m512bh input0 =
+                        (__m512bh)_mm512_loadu_si512(
+                            (const __m512i*)(inputData + column));
+                    const __m512bh input1 =
+                        (__m512bh)_mm512_loadu_si512(
+                            (const __m512i*)(inputData + m + column));
+                    blockSum0 = _mm512_dpbf16_ps(
+                        blockSum0, input0, weights);
+                    blockSum1 = _mm512_dpbf16_ps(
+                        blockSum1, input1, weights);
+                }
+
+                float scale;
+                std::memcpy(&scale, fp8 + blockM, sizeof(scale));
+                const __m512 scaleVector = _mm512_set1_ps(scale);
+                sum0 = _mm512_fmadd_ps(
+                    blockSum0, scaleVector, sum0);
+                sum1 = _mm512_fmadd_ps(
+                    blockSum1, scaleVector, sum1);
+            }
+
+            outputData[outputRow] =
+                _mm512_reduce_add_ps(sum0) * magicScale;
+            outputData[(size_t)k + outputRow] =
+                _mm512_reduce_add_ps(sum1) * magicScale;
+        }
+    }
+
+#endif
+
     bool LinearBFloat16_FP8E4M3BLOCK128_AVX512BF16_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
                         int n, int m, int k, int st, int end) {
 #ifdef __AVX512BF16__
         static int block_size = 128;
         size_t perRow = GetDataBytes(DataType::FP8_E4M3_BLOCK_128, 1, m);
         float magicScale = pow(2, 120);
-        
+
+        if (n == 2) {
+            LinearBFloat16FP8E4M3Block128TwoRows_AVX512BF16(
+                inputData, weightData, outputData,
+                m, k, st, end, perRow, magicScale);
+            return true;
+        }
         for (int i = 0; i < n; i++) {
             uint16_t *bf16A = inputData + i * m;
             float *floatC = outputData + i * k;

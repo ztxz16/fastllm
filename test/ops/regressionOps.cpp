@@ -201,6 +201,70 @@ namespace {
         }
     }
 #endif
+    void RunCpuFp8Block128SmallBatchRegression() {
+        constexpr int inputDim = 256;
+        constexpr int outputDim = 37;
+        constexpr int block = 128;
+        const size_t weightRowBytes = fastllm::GetDataBytes(
+            fastllm::DataType::FP8_E4M3_BLOCK_128, 1, inputDim);
+
+        std::vector<uint8_t> weights(
+            (size_t)outputDim * weightRowBytes);
+        for (int output = 0; output < outputDim; output++) {
+            uint8_t *row = weights.data() +
+                (size_t)output * weightRowBytes;
+            for (int group = 0; group < inputDim / block; group++) {
+                uint8_t *packed = row +
+                    (size_t)group * (block + sizeof(float));
+                for (int column = 0; column < block; column++) {
+                    uint8_t magnitude = (uint8_t)(
+                        (output * 37 + group * 23 + column * 11) % 0x78);
+                    packed[column] = magnitude |
+                        (((output + group + column) & 1) ? 0x80 : 0);
+                }
+                float scale =
+                    0.0078125f * (float)(1 + (output + group) % 7);
+                std::memcpy(packed + block, &scale, sizeof(scale));
+            }
+        }
+
+        constexpr int rows = 2;
+        std::vector<uint16_t> input((size_t)rows * inputDim);
+        for (size_t index = 0; index < input.size(); index++) {
+            float value = (float)((int)(index * 29 % 257) - 128) /
+                64.0f;
+            input[index] = fastllm::Float32ToBFloat16RNEBits(value);
+        }
+        std::vector<float> reference(
+            (size_t)rows * outputDim, -123.0f);
+        std::vector<float> optimized = reference;
+        for (int row = 0; row < rows; row++) {
+            fastllm::FastllmGemm(
+                1, inputDim, outputDim,
+                input.data() + (size_t)row * inputDim,
+                inputDim * (long)sizeof(uint16_t),
+                weights.data(), (long)weightRowBytes,
+                reference.data() + (size_t)row * outputDim,
+                outputDim * (long)sizeof(float),
+                1, outputDim - 1,
+                fastllm::DataType::BFLOAT16,
+                fastllm::DataType::FP8_E4M3_BLOCK_128,
+                fastllm::DataType::FLOAT32);
+        }
+        fastllm::FastllmGemm(
+            rows, inputDim, outputDim,
+            input.data(), inputDim * (long)sizeof(uint16_t),
+            weights.data(), (long)weightRowBytes,
+            optimized.data(), outputDim * (long)sizeof(float),
+            1, outputDim - 1,
+            fastllm::DataType::BFLOAT16,
+            fastllm::DataType::FP8_E4M3_BLOCK_128,
+            fastllm::DataType::FLOAT32);
+        Expect(std::memcmp(
+                   reference.data(), optimized.data(),
+                   reference.size() * sizeof(float)) == 0,
+               "CPU FP8 block-128 two-row kernel changed FP32 output bits.");
+    }
 
     void RunCpuDeepSeekV4Nvfp4Block32Benchmark() {
         constexpr int rows = 8;
@@ -13323,16 +13387,21 @@ namespace {
             fastllm::DataDevice *mergeOutputDevice = nullptr,
             bool keepCudaInputMirror = false,
             int cudaInputDevice = -1,
-            bool prefetchCudaDecode = false) {
+            bool prefetchCudaInput = false) {
         const int inputDim = weights.routedGate.dims[1];
         const int outputDim = weights.routedDown.dims[0];
         fastllm::Data input = MakeTensor(
             fastllm::DataType::BFLOAT16, {batch, inputDim}, 0.73f);
 #ifdef USE_CUDA
         if (cudaInputDevice >= 0) {
-            Expect(!keepCudaInputMirror && batch == 1,
-                   "NUMA MoE CUDA decode regression requires one input row "
-                   "without a CPU-primary mirror.");
+            Expect(!keepCudaInputMirror,
+                   "NUMA MoE CUDA input regression requires no CPU-primary "
+                   "mirror.");
+            Expect(!prefetchCudaInput ||
+                       (batch >= 1 &&
+                        batch <= fastllm::kNumasMoePrefetchMaxRows),
+                   "NUMA MoE CUDA prefetch regression batch is outside the "
+                   "supported small-batch range.");
             input.ToDevice(
                 fastllm::DataDevice::CUDA,
                 std::vector<int>{cudaInputDevice}, true);
@@ -13347,7 +13416,7 @@ namespace {
         }
 #else
         Expect(!keepCudaInputMirror && cudaInputDevice < 0 &&
-                   !prefetchCudaDecode,
+                   !prefetchCudaInput,
                "CUDA input mirror requested in a non-CUDA build.");
 #endif
         fastllm::Data index = MakeIntTensor(
@@ -13378,12 +13447,12 @@ namespace {
         {
             ScopedFirstDevice guard("numa");
 #if defined(USE_CUDA) && defined(USE_NUMAS)
-            if (prefetchCudaDecode) {
+            if (prefetchCudaInput) {
                 Expect(cudaInputDevice >= 0,
-                       "NUMA MoE decode prefetch requires CUDA inputs.");
+                       "NUMA MoE input prefetch requires CUDA inputs.");
                 Expect(fastllm::PrefetchNumasMoeDecodeInput(
                            input, index, score, 0),
-                       "NUMA MoE decode input prefetch was not accepted.");
+                       "NUMA MoE input prefetch was not accepted.");
             }
 #endif
             fastllm::MergeMOE(
@@ -13501,6 +13570,7 @@ namespace {
         constexpr int inputDim = 128;
         constexpr int interDim = 256;
         constexpr int outputDim = 128;
+        RunCpuFp8Block128SmallBatchRegression();
         auto makeWeights = []() {
             return MoeWeights {
                 MakeDeepSeekV4Fp8MoeWeight(
@@ -13586,13 +13656,28 @@ namespace {
         Expect(overflowScaleAuto == overflowScaleReference,
                "NVFP4 overflow-scale automatic fallback changed BF16 "
                "output bits.");
+        MoeWeights groupedFp8Weights = makeWeights();
+        for (int smallBatch = 2; smallBatch <= 8; smallBatch++) {
+            setenv(
+                "FASTLLM_DSV4_DISABLE_NUMAS_MOE_GROUPED_DECODE", "1", 1);
+            std::vector<uint16_t> rowMajor =
+                RunNumasDeepSeekV4LargeMoeCase(
+                    groupedFp8Weights, smallBatch);
+            unsetenv("FASTLLM_DSV4_DISABLE_NUMAS_MOE_GROUPED_DECODE");
+            std::vector<uint16_t> expertMajor =
+                RunNumasDeepSeekV4LargeMoeCase(
+                    groupedFp8Weights, smallBatch);
+            Expect(rowMajor == expertMajor,
+                   "DeepSeek-V4 NUMA FP8 grouped decode changed BF16 "
+                   "output bits at batch " +
+                       std::to_string(smallBatch) + ".");
+        }
         if (hadGroupedDecodeDisable) {
             setenv("FASTLLM_DSV4_DISABLE_NUMAS_MOE_GROUPED_DECODE",
                    savedGroupedDecodeDisableValue.c_str(), 1);
         } else {
             unsetenv("FASTLLM_DSV4_DISABLE_NUMAS_MOE_GROUPED_DECODE");
         }
-
         MoeWeights referenceWeights = makeWeights();
         setenv("FASTLLM_DSV4_DISABLE_NUMAS_MOE_LARGE_FAST", "1", 1);
         std::vector<uint16_t> expected =
@@ -13673,6 +13758,36 @@ namespace {
                    "prefetched NUMA MoE decode did not return CUDA output.");
             Expect(decodeReference == prefetchedDecode,
                    "prefetched NUMA MoE decode changed BF16 output bits.");
+
+            // Verification uses the same pinned staging path with 2-8 rows,
+            // but intentionally keeps the established grouped CPU MoE and
+            // CPU output path.  Compare the ordinary CUDA-input staging and
+            // early-prefetch variants bitwise at every supported row count.
+            MoeWeights verificationWeights = makeWeights();
+            for (int smallBatch = 2;
+                 smallBatch <= fastllm::kNumasMoePrefetchMaxRows;
+                 smallBatch++) {
+                fastllm::DataDevice ordinaryDevice =
+                    fastllm::DataDevice::CUDA;
+                std::vector<uint16_t> ordinary =
+                    RunNumasDeepSeekV4LargeMoeCase(
+                        verificationWeights, smallBatch, &ordinaryDevice,
+                        false, 0, false);
+                fastllm::DataDevice prefetchedDevice =
+                    fastllm::DataDevice::CUDA;
+                std::vector<uint16_t> prefetched =
+                    RunNumasDeepSeekV4LargeMoeCase(
+                        verificationWeights, smallBatch, &prefetchedDevice,
+                        false, 0, true);
+                Expect(ordinaryDevice == fastllm::DataDevice::CPU &&
+                           prefetchedDevice == fastllm::DataDevice::CPU,
+                       "NUMA MoE verification prefetch changed the grouped "
+                       "output device at batch " +
+                       std::to_string(smallBatch) + ".");
+                Expect(ordinary == prefetched,
+                       "NUMA MoE verification prefetch changed BF16 output "
+                       "bits at batch " + std::to_string(smallBatch) + ".");
+            }
 
             if (FastllmCudaGetDeviceCount() >= 2) {
                 fastllm::Data staleInput = MakeTensor(
