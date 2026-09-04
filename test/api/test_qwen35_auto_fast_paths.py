@@ -15,6 +15,7 @@ if TOOLS_DIR not in sys.path:
 
 from fastllm_pytools.util import (
     _configure_qwen35_auto_fast_paths,
+    _configure_sm89_fp8_linear_triton,
     _configure_triton_compiler_python,
     _find_triton_python,
     _is_nvidia_cuda_platform,
@@ -349,6 +350,64 @@ class TritonPythonAutoDetectionTest(unittest.TestCase):
             self.assertNotIn("FASTLLM_CUDA_TRITON_PYTHON", os.environ)
             self.assertIn("Triton is unavailable", output.getvalue())
             self.assertIn("--triton has been disabled", output.getvalue())
+
+
+class Sm89Fp8LinearTritonAutoConfigTest(unittest.TestCase):
+    def test_enables_only_fp8_linear_on_sm89(self):
+        current_python = "/opt/current-venv/bin/python"
+        output = io.StringIO()
+        with patch.dict(os.environ, {}, clear=True), patch(
+                "fastllm_pytools.util._nvidia_cuda_compute_capabilities",
+                return_value={0: 89, 1: 89}), patch(
+                "fastllm_pytools.util._find_triton_python",
+                return_value=current_python), redirect_stdout(output):
+            detected = _configure_sm89_fp8_linear_triton(_args())
+
+            self.assertEqual(detected, current_python)
+            self.assertEqual(
+                os.environ["FASTLLM_CUDA_TRITON_PYTHON"], current_python)
+            self.assertEqual(
+                os.environ["FASTLLM_CUDA_TRITON_LINEAR_FP8"], "1")
+            self.assertNotIn("FASTLLM_CUDA_TRITON", os.environ)
+            self.assertIn("enabled automatically", output.getvalue())
+
+    def test_keeps_builtin_cuda_when_triton_is_unavailable(self):
+        output = io.StringIO()
+        with patch.dict(os.environ, {}, clear=True), patch(
+                "fastllm_pytools.util._nvidia_cuda_compute_capabilities",
+                return_value={0: 89, 1: 89}), patch(
+                "fastllm_pytools.util._find_triton_python",
+                return_value=""), redirect_stdout(output):
+            detected = _configure_sm89_fp8_linear_triton(_args())
+
+            self.assertEqual(detected, "")
+            self.assertNotIn(
+                "FASTLLM_CUDA_TRITON_LINEAR_FP8", os.environ)
+            self.assertNotIn("FASTLLM_CUDA_TRITON_PYTHON", os.environ)
+            self.assertNotIn("FASTLLM_CUDA_TRITON", os.environ)
+            self.assertIn("built-in CUDA", output.getvalue())
+
+    def test_skips_other_architectures(self):
+        with patch.dict(os.environ, {}, clear=True), patch(
+                "fastllm_pytools.util._nvidia_cuda_compute_capabilities",
+                return_value={0: 86, 1: 90}), patch(
+                "fastllm_pytools.util._find_triton_python") as detector:
+            self.assertEqual(
+                _configure_sm89_fp8_linear_triton(_args()), "")
+
+            detector.assert_not_called()
+
+    def test_respects_explicit_disable(self):
+        for environment in (
+                {"FASTLLM_CUDA_TRITON": "0"},
+                {"FASTLLM_CUDA_TRITON_LINEAR_FP8": "0"}):
+            with self.subTest(environment=environment), patch.dict(
+                    os.environ, environment, clear=True), patch(
+                    "fastllm_pytools.util._find_triton_python") as detector:
+                self.assertEqual(
+                    _configure_sm89_fp8_linear_triton(_args()), "")
+
+                detector.assert_not_called()
 
 
 if __name__ == "__main__":

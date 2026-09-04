@@ -42,7 +42,7 @@ static bool Fp8MarlinEnvFlagDefaultEnabled(const char *name, bool defaultValue) 
 // (device stubs under __CUDA_ARCH__ < 750) and fall back to GEMV here. SM120
 // and SM121 use CUTLASS FP8 prefill kernels that require the original row-major
 // weights, so do not destructively repack them during warmup by default.
-static bool Fp8MarlinDeviceSupported() {
+static bool Fp8MarlinDeviceSupported(int &runtimeArch) {
 #ifdef CUDA_NO_TENSOR_CORE
     return false;
 #else
@@ -53,6 +53,7 @@ static bool Fp8MarlinDeviceSupported() {
         return false;
     }
     int arch = major * 10 + minor;
+    runtimeArch = arch;
     bool defaultEnabled = true;
 #if defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120)
     defaultEnabled = defaultEnabled && arch != 120;
@@ -62,6 +63,26 @@ static bool Fp8MarlinDeviceSupported() {
 #endif
     return arch >= 75 &&
            Fp8MarlinEnvFlagDefaultEnabled("FASTLLM_CUDA_FP8_MARLIN", defaultEnabled);
+#endif
+}
+
+static bool Fp8MarlinShouldPreserveRowMajorForTriton(int arch) {
+#if defined(_WIN32) || defined(USE_ROCM)
+    (void)arch;
+    return false;
+#else
+    if (arch != 89) {
+        return false;
+    }
+    const char *globalEnv = std::getenv("FASTLLM_CUDA_TRITON");
+    if (globalEnv != nullptr && globalEnv[0] != '\0') {
+        return Fp8MarlinEnvFlagDefaultEnabled(
+                   "FASTLLM_CUDA_TRITON", false) &&
+               Fp8MarlinEnvFlagDefaultEnabled(
+                   "FASTLLM_CUDA_TRITON_LINEAR_FP8", true);
+    }
+    return Fp8MarlinEnvFlagDefaultEnabled(
+        "FASTLLM_CUDA_TRITON_LINEAR_FP8", false);
 #endif
 }
 
@@ -300,10 +321,20 @@ extern "C" bool FastllmCudaHasFp8MarlinLayout(
 extern "C" bool FastllmCudaTryMarlinHalfMatMulFloatFP8E4M3(
         const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias,
         fastllm::Data &output, int n, int m, int k) {
-    if (!Fp8MarlinDeviceSupported() || n < 1 ||
+    int arch = 0;
+    if (!Fp8MarlinDeviceSupported(arch) || n < 1 ||
         weight.dataType != fastllm::DataType::FP8_E4M3 ||
         weight.blockM != FP8_GROUP_SIZE || weight.blockK != FP8_GROUP_SIZE ||
         m % 64 != 0 || k % 64 != 0 || m % FP8_GROUP_SIZE != 0) {
+        return false;
+    }
+
+    // Triton SM89 FP8 consumes row-major weights, while Marlin repacks cudaData
+    // in place during warmup. Preserve fresh eligible weights so Triton remains
+    // available; already packed weights continue using Marlin.
+    if (bias.dims.empty() && !weight.scales.empty() &&
+        !HasFp8MarlinOnDevice(weight) &&
+        Fp8MarlinShouldPreserveRowMajorForTriton(arch)) {
         return false;
     }
 

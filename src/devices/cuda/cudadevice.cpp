@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -2375,10 +2376,21 @@ namespace fastllm {
         return ok;
     }
 
+    static bool CudaTritonLinearFp8Enabled(int arch) {
+        const char *globalEnv = std::getenv("FASTLLM_CUDA_TRITON");
+        if (globalEnv != nullptr && globalEnv[0] != '\0') {
+            return CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON") &&
+                   CudaEnvFlagDefaultEnabled(
+                       "FASTLLM_CUDA_TRITON_LINEAR_FP8", true);
+        }
+        return arch == 89 &&
+               CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON_LINEAR_FP8");
+    }
+
     static bool RunCudaTritonLinearFp8Block128(
         Data &input, Data &weight, const Data &bias, Data &output, int n, int m, int k) {
-        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON") ||
-            !CudaEnvFlagDefaultEnabled("FASTLLM_CUDA_TRITON_LINEAR_FP8", true)) {
+        int arch = CudaTritonRuntimeArch();
+        if (arch < 89 || !CudaTritonLinearFp8Enabled(arch)) {
             return false;
         }
         if (n <= 0 || m <= 0 || k <= 0 || (m % 128) != 0 ||
@@ -2407,17 +2419,6 @@ namespace fastllm {
             return false;
         }
 
-        int arch = CudaTritonRuntimeArch();
-        if (arch <= 0 || arch < 89) {
-            return false;
-        }
-
-        int defaultMaxBatch = arch == 89 ? 256 : 64;
-        int maxBatch = CudaEnvInt("FASTLLM_CUDA_TRITON_LINEAR_FP8_MAX_BATCH", defaultMaxBatch);
-        if (maxBatch > 0 && n > maxBatch) {
-            return false;
-        }
-
         std::string inputDtype;
         if (!CudaTritonDataTypeName(input.dataType, inputDtype)) {
             return false;
@@ -2433,6 +2434,19 @@ namespace fastllm {
         }
         if (matmulVariant == "strided" && (packedWeight || hasBias)) {
             matmulVariant = "fastllm";
+        }
+
+        // The SM89 strided kernel accepts dynamic row counts, so do not impose
+        // a default prefill limit. Generic SM89 and other architectures retain
+        // their conservative limits; an explicit zero also means unlimited.
+        int defaultMaxBatch = arch == 89
+            ? (matmulVariant == "strided" ? 0 : 256)
+            : 64;
+        int maxBatch = CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_LINEAR_FP8_MAX_BATCH", defaultMaxBatch,
+            0, std::numeric_limits<int>::max());
+        if (maxBatch > 0 && n > maxBatch) {
+            return false;
         }
 
         int defaultBlockM = matmulVariant == "strided" ? 64 : (n <= 64 ? 16 : 64);
@@ -2816,8 +2830,8 @@ namespace fastllm {
 
     static bool TryCudaTritonLinearFp8Block128(
         Data &input, Data &weight, const Data &bias, Data &output, int n, int m, int k) {
-        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON") ||
-            !CudaEnvFlagDefaultEnabled("FASTLLM_CUDA_TRITON_LINEAR_FP8", true)) {
+        int arch = CudaTritonRuntimeArch();
+        if (arch < 89 || !CudaTritonLinearFp8Enabled(arch)) {
             return false;
         }
         int minBatchOverride = FastllmCudaGetLinearExactBatchThreshold();
@@ -2825,7 +2839,6 @@ namespace fastllm {
             return false;
         }
 
-        int arch = CudaTritonRuntimeArch();
         bool hasBias = bias.dims.size() > 0;
         bool separateScalesWeight = weight.dataType == DataType::FP8_E4M3 &&
                                     weight.blockK == 128 && weight.blockM == 128 &&

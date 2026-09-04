@@ -624,6 +624,39 @@ def _configure_triton_compiler_python() -> str:
         )
     return detected
 
+def _configure_sm89_fp8_linear_triton(args) -> str:
+    global_env_name = "FASTLLM_CUDA_TRITON"
+    op_env_name = "FASTLLM_CUDA_TRITON_LINEAR_FP8"
+    python_env_name = "FASTLLM_CUDA_TRITON_PYTHON"
+    if global_env_name in os.environ or op_env_name in os.environ:
+        return ""
+
+    device_ids = _thread_tp_cuda_device_ids(getattr(args, "tp", ""))
+    if not device_ids:
+        device_ids = _thread_tp_cuda_device_ids(
+            getattr(args, "device", ""))
+    capabilities = _nvidia_cuda_compute_capabilities(device_ids)
+    if not any(capability == 89 for capability in capabilities.values()):
+        return ""
+
+    detected = _find_triton_python()
+    if not detected:
+        print(
+            "[Fastllm] SM89 FP8 Linear Triton is unavailable in the "
+            "current Python environment; built-in CUDA will be used.",
+            flush=True,
+        )
+        return ""
+
+    os.environ[python_env_name] = detected
+    os.environ[op_env_name] = "1"
+    print(
+        "[Fastllm] SM89 FP8 Linear Triton enabled automatically with "
+        "the current Python environment: %s" % detected,
+        flush=True,
+    )
+    return detected
+
 def _is_moe_architecture(architecture: str, model_type: str = "", text_model_type: str = "") -> bool:
     return (architecture in [
         "DeepseekV3ForCausalLM",
@@ -1399,6 +1432,7 @@ def make_normal_llm_model(args, startup_progress = None):
             args.device = expanded
     if (args.moe_device and args.moe_device != ""):
         args.moe_device = expand_cudapp_device(args.moe_device)
+    _configure_sm89_fp8_linear_triton(args)
     _configure_qwen35_auto_fast_paths(args, is_qwen35_model, mtp)
     from ftllm import llm
     if hasattr(llm, "set_cuda_graph"):
