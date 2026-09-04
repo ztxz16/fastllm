@@ -17,6 +17,7 @@
 #ifdef USE_CUDA
 #include "devices/cpu/cpudevice.h"
 #include "devices/cuda/cudadevice.h"
+#include "devices/cuda/fastllm-awq-sm70.cuh"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #endif
@@ -3341,6 +3342,19 @@ namespace {
         bool hadValue = false;
     };
 
+    class ScopedNcclForceSyncRestore {
+    public:
+        ScopedNcclForceSyncRestore()
+            : previous(FastllmCudaGetNcclForceSync()) {}
+
+        ~ScopedNcclForceSyncRestore() {
+            FastllmCudaSetNcclForceSync(previous);
+        }
+
+    private:
+        bool previous;
+    };
+
     bool RunCudaVarlenChunkGdnSelected(
             fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,
             fastllm::Data &g, fastllm::Data &attn,
@@ -3541,6 +3555,189 @@ namespace {
         return weight;
     }
 
+    fastllm::Data MakeFp8Block128Weight(int outputDim, int inputDim) {
+        constexpr int block = 128;
+        Expect(outputDim % block == 0 && inputDim % block == 0,
+               "FP8 SM70 regression requires block-aligned weights");
+        fastllm::Data weight;
+        weight.dataType = fastllm::DataType::FP8_E4M3;
+        weight.UpdateUnitSize();
+        weight.Resize({outputDim, inputDim});
+        weight.weightType = fastllm::WeightType::LINEAR;
+        weight.blockK = block;
+        weight.blockM = block;
+        weight.Allocate(false);
+        auto *bytes = reinterpret_cast<uint8_t *>(weight.cpuData);
+        for (size_t i = 0; i < (size_t)outputDim * inputDim; i++) {
+            uint8_t value = static_cast<uint8_t>(
+                0x18 + ((i * 13 + i / 127) & 0x3f));
+            bytes[i] = static_cast<uint8_t>(value | (((i / 11) & 1) << 7));
+        }
+        weight.scales.resize(
+            (size_t)(outputDim / block) * (inputDim / block));
+        for (size_t i = 0; i < weight.scales.size(); i++) {
+            weight.scales[i] = 1.0f / (float)(32 << (i % 3));
+        }
+        weight.ToDevice(
+            fastllm::DataDevice::CUDA, std::vector<int>{0});
+        return weight;
+    }
+
+    void RunCudaFp8Sm70TurboMindRegression() {
+        FastllmCudaSetDevice(0);
+        if (!fastllm::awq_sm70::Fp8Supported()) {
+            std::cout << "CUDA FP8 SM70 TurboMind regression: SKIP\n";
+            return;
+        }
+
+        constexpr int inputDim = 256;
+        constexpr int outputDim = 256;
+        constexpr int nativeRows = 4;
+        constexpr int verifyRows = 5;
+        fastllm::Data referenceWeight = MakeFp8Block128Weight(
+            outputDim, inputDim);
+        fastllm::Data optimizedWeight = MakeFp8Block128Weight(
+            outputDim, inputDim);
+        fastllm::Data input = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {verifyRows, inputDim},
+            MakeRegressionValues(verifyRows * inputDim, 0.43f, 0.08f));
+        fastllm::Data emptyBias;
+        fastllm::Data nativeWeight = MakeFp8Block128Weight(
+            outputDim, inputDim);
+        fastllm::Data nativeInput = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {nativeRows, inputDim},
+            MakeRegressionValues(nativeRows * inputDim, 0.19f, 0.08f));
+        fastllm::Data nativeOutput = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {nativeRows, outputDim},
+            std::vector<float>((size_t)nativeRows * outputDim, 0.0f));
+        fastllm::Data reference = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {verifyRows, outputDim},
+            std::vector<float>((size_t)verifyRows * outputDim, 0.0f));
+        fastllm::Data actual = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {verifyRows, outputDim},
+            std::vector<float>((size_t)verifyRows * outputDim, 0.0f));
+
+        ScopedNcclForceSyncRestore restoreForceSync;
+
+        FastllmCudaSetNcclForceSync(false);
+        for (int i = 0; i < 2; i++) {
+            Expect(FastllmCudaHalfMatMulFloatFP8E4M3(
+                       nativeInput, nativeWeight, emptyBias, nativeOutput,
+                       nativeRows, inputDim, outputDim),
+                   "SM70 FP8 native-threshold execution failed");
+        }
+        FastllmCudaSyncCurrentThreadStream();
+        Expect(!nativeWeight.IsRepacked,
+               "SM70 FP8 repacked a weight at the native threshold");
+
+        FastllmCudaSetNcclForceSync(true);
+        Expect(FastllmCudaHalfMatMulFloatFP8E4M3(
+                   input, referenceWeight, emptyBias, reference,
+                   verifyRows, inputDim, outputDim),
+               "native SM70 FP8 reference failed");
+        Expect(FastllmCudaHalfMatMulFloatFP8E4M3(
+                   input, optimizedWeight, emptyBias, actual,
+                   verifyRows, inputDim, outputDim),
+               "SM70 FP8 startup path failed");
+        FastllmCudaSyncCurrentThreadStream();
+        Expect(!optimizedWeight.IsRepacked,
+               "SM70 FP8 startup path repacked the weight");
+        ExpectFloatNear(ToFloatVector(reference), ToFloatVector(actual),
+                        2.0e-2f, 2.0e-3f,
+                        "SM70 FP8 startup native output");
+
+        // The first eligible serving call only records demand. This avoids
+        // turning a one-off eight-row startup probe into a permanent M=1
+        // regression. The second call commits the in-place MMA conversion.
+        FastllmCudaSetNcclForceSync(false);
+        Expect(FastllmCudaHalfMatMulFloatFP8E4M3(
+                   input, optimizedWeight, emptyBias, actual,
+                   verifyRows, inputDim, outputDim),
+               "SM70 FP8 first serving probe failed");
+        FastllmCudaSyncCurrentThreadStream();
+        Expect(!optimizedWeight.IsRepacked,
+               "SM70 FP8 first serving probe repacked the weight");
+        Expect(FastllmCudaHalfMatMulFloatFP8E4M3(
+                   input, optimizedWeight, emptyBias, actual,
+                   verifyRows, inputDim, outputDim),
+               "SM70 FP8 TurboMind execution failed");
+        FastllmCudaSyncCurrentThreadStream();
+        Expect(optimizedWeight.IsRepacked,
+               "SM70 FP8 weight was not converted in place");
+        ExpectFloatNear(ToFloatVector(reference), ToFloatVector(actual),
+                        2.0e-2f, 2.0e-3f,
+                        "SM70 FP8 TurboMind output");
+        std::cout << "CUDA FP8 SM70 TurboMind regression: PASS\n";
+    }
+
+    void RunCudaNVFP4Sm70TurboMindRegression() {
+        FastllmCudaSetDevice(0);
+        if (!fastllm::awq_sm70::Nvfp4Supported()) {
+            std::cout << "CUDA NVFP4 SM70 TurboMind regression: SKIP\n";
+            return;
+        }
+
+        constexpr int inputDim = 128;
+        constexpr int outputDim = 256;
+        constexpr int batch = 7;
+        constexpr float globalScale = 1.0f / 256.0f;
+        fastllm::Data referenceWeight = MakeNvfp4Block16Weight(
+            outputDim, inputDim, globalScale);
+        fastllm::Data optimizedWeight = MakeNvfp4Block16Weight(
+            outputDim, inputDim, globalScale);
+        fastllm::Data input = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {batch, inputDim},
+            MakeRegressionValues(batch * inputDim, 0.43f, 0.08f));
+        fastllm::Data bias = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {outputDim},
+            MakeRegressionValues(outputDim, 0.79f, 0.015f));
+        fastllm::Data reference = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {batch, outputDim},
+            std::vector<float>((size_t)batch * outputDim, 0.0f));
+        fastllm::Data actual = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {batch, outputDim},
+            std::vector<float>((size_t)batch * outputDim, 0.0f));
+
+        ScopedNcclForceSyncRestore restoreForceSync;
+        FastllmCudaSetNcclForceSync(false);
+        Expect(FastllmCudaHalfMatMulFloatNVFP4Block16(
+                   input, referenceWeight, bias, reference,
+                   batch, inputDim, outputDim),
+               "native SM70 NVFP4 reference failed");
+        FastllmCudaSetNcclForceSync(true);
+        Expect(FastllmCudaHalfMatMulFloatNVFP4Block16(
+                   input, optimizedWeight, bias, actual,
+                   batch, inputDim, outputDim),
+               "SM70 NVFP4 TurboMind execution failed");
+        FastllmCudaSyncCurrentThreadStream();
+        Expect(optimizedWeight.IsRepacked,
+               "SM70 NVFP4 weight was not converted in place");
+        ExpectFloatNear(ToFloatVector(reference), ToFloatVector(actual),
+                        2.0e-2f, 2.0e-3f,
+                        "SM70 NVFP4 TurboMind output with bias");
+
+        // SM70's packed B operand groups output rows by 32. A partial group
+        // must stay in the original layout so the native fallback remains
+        // valid instead of being destructively repacked.
+        constexpr int fallbackOutputDim = 24;
+        fastllm::Data fallbackWeight = MakeNvfp4Block16Weight(
+            fallbackOutputDim, inputDim, globalScale);
+        fastllm::Data fallbackBias = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {fallbackOutputDim},
+            MakeRegressionValues(fallbackOutputDim, 0.29f, 0.015f));
+        fastllm::Data fallbackOutput = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {batch, fallbackOutputDim},
+            std::vector<float>((size_t)batch * fallbackOutputDim, 0.0f));
+        Expect(FastllmCudaHalfMatMulFloatNVFP4Block16(
+                   input, fallbackWeight, fallbackBias, fallbackOutput,
+                   batch, inputDim, fallbackOutputDim),
+               "unaligned SM70 NVFP4 native fallback failed");
+        FastllmCudaSyncCurrentThreadStream();
+        Expect(!fallbackWeight.IsRepacked,
+               "unaligned SM70 NVFP4 weight was destructively repacked");
+        std::cout << "CUDA NVFP4 SM70 TurboMind regression: PASS\n";
+    }
+
     void RunCudaNVFP4MarlinRegression() {
         FastllmCudaSetDevice(0);
         constexpr int inputDim = 128;
@@ -3552,12 +3749,7 @@ namespace {
         }
 
         ScopedEnvOverride forceMarlin("FASTLLM_CUDA_NVFP4_MARLIN", "1");
-        struct ScopedNcclForceSyncRestore {
-            bool previous = FastllmCudaGetNcclForceSync();
-            ~ScopedNcclForceSyncRestore() {
-                FastllmCudaSetNcclForceSync(previous);
-            }
-        } restoreForceSync;
+        ScopedNcclForceSyncRestore restoreForceSync;
 
         constexpr float globalScale = 1.0f / 256.0f;
         fastllm::Data referenceWeight = MakeNvfp4Block16Weight(
@@ -13947,6 +14139,20 @@ int main(int argc, char **argv) {
         }
 #ifdef USE_CUDA
         if (argc == 2 &&
+            std::string(argv[1]) == "--cuda-fp8-sm70-turbomind") {
+            Expect(FastllmCudaGetDeviceCount() > 0,
+                   "SM70 FP8 TurboMind regression requires CUDA.");
+            RunCudaFp8Sm70TurboMindRegression();
+            return 0;
+        }
+        if (argc == 2 &&
+            std::string(argv[1]) == "--cuda-nvfp4-sm70-turbomind") {
+            Expect(FastllmCudaGetDeviceCount() > 0,
+                   "SM70 NVFP4 TurboMind regression requires CUDA.");
+            RunCudaNVFP4Sm70TurboMindRegression();
+            return 0;
+        }
+        if (argc == 2 &&
             std::string(argv[1]) == "--cuda-gguf-q3-dequant") {
             Expect(FastllmCudaGetDeviceCount() > 0,
                    "GGUF Q3 dequant regression requires CUDA.");
@@ -14246,6 +14452,8 @@ int main(int argc, char **argv) {
         if (fastllm::HasDeviceType("cuda")) {
 #ifdef USE_CUDA
 #ifndef USE_ROCM
+            RunCudaFp8Sm70TurboMindRegression();
+            RunCudaNVFP4Sm70TurboMindRegression();
             RunCudaNVFP4MarlinRegression();
             RunCudaBFloat16Hidden3072RMSNormRegression();
             std::cout << "cuda BF16 hidden-3072 RMSNorm regression: PASS\n";
