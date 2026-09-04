@@ -3,9 +3,10 @@ import json
 import os
 import sys
 import tempfile
+import types
 import unittest
 from contextlib import redirect_stdout
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 TOOLS_DIR = os.path.abspath(
@@ -169,6 +170,58 @@ class SpeculativeDraftCliAliasesTest(unittest.TestCase):
             ])
             with self.assertRaisesRegex(ValueError,
                                         "must be Qwen3.5"):
+                make_normal_llm_model(args)
+
+    def test_deepseek_v4_mtp_uses_embedded_dspark(self):
+        with tempfile.TemporaryDirectory() as model_path:
+            self.write_draft_config(model_path, {
+                "architectures": ["DeepseekV4ForCausalLM"],
+                "model_type": "deepseek_v4",
+                "dspark_block_size": 5,
+                "dspark_target_layer_ids": [40, 41, 42],
+                "dspark_noise_token_id": 128799,
+            })
+            args = make_normal_parser("test").parse_args([
+                model_path,
+                "--device", "cuda",
+                "--moe_device", "numa",
+                "--mtp", "5",
+                "-t", "4",
+            ])
+            fake_model = MagicMock()
+            fake_model.get_max_input_len.return_value = 4096
+            fake_model.get_max_batch.return_value = 1
+            fake_llm = MagicMock()
+            fake_llm.model.return_value = fake_model
+            fake_ftllm = types.ModuleType("ftllm")
+            fake_ftllm.llm = fake_llm
+            with patch.dict(os.environ, {}, clear=True), \
+                    patch.dict(sys.modules, {"ftllm": fake_ftllm}):
+                with redirect_stdout(io.StringIO()) as output:
+                    result = make_normal_llm_model(args)
+                self.assertIs(result, fake_model)
+                self.assertEqual(args.speculative_algorithm, "dspark")
+                self.assertEqual(args.dspark, 5)
+                self.assertEqual(os.environ["FASTLLM_DSPARK_TOKENS"], "5")
+                self.assertIn("embedded DSpark draft weights",
+                              output.getvalue())
+                self.assertEqual(
+                    fake_llm.model.call_args.kwargs["external_mtp_path"], "")
+
+    def test_deepseek_v4_mtp_rejects_shorter_than_trained_block(self):
+        with tempfile.TemporaryDirectory() as model_path:
+            self.write_draft_config(model_path, {
+                "architectures": ["DeepseekV4ForCausalLM"],
+                "model_type": "deepseek_v4",
+                "dspark_block_size": 5,
+                "dspark_target_layer_ids": [40, 41, 42],
+                "dspark_noise_token_id": 128799,
+            })
+            args = make_normal_parser("test").parse_args([
+                model_path, "--mtp", "4",
+            ])
+            with self.assertRaisesRegex(ValueError,
+                                        "checkpoint training block size"):
                 make_normal_llm_model(args)
 
 

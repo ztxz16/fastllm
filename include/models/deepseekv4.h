@@ -141,6 +141,16 @@ namespace fastllm {
     };
 
     struct DeepSeekV4HistoryCacheMemory {
+        DeepSeekV4HistoryCacheMemory() = default;
+        DeepSeekV4HistoryCacheMemory(
+            const DeepSeekV4HistoryCacheMemory &other);
+        DeepSeekV4HistoryCacheMemory &operator=(
+            const DeepSeekV4HistoryCacheMemory &other);
+        DeepSeekV4HistoryCacheMemory(
+            DeepSeekV4HistoryCacheMemory &&other) noexcept = default;
+        DeepSeekV4HistoryCacheMemory &operator=(
+            DeepSeekV4HistoryCacheMemory &&other) noexcept = default;
+
         std::vector<int> inputToken;
         int tokens = 0;
         int blockCount = 0;
@@ -525,7 +535,13 @@ namespace fastllm {
 
         std::vector<int> SampleDsparkTargetRows(
                 Data &headInput,
+                const GenerationConfig &generationConfig,
+                const std::vector<int> &proposalTokens,
+                std::vector<unsigned char> &verificationAccepted,
                 DeepSeekV4DsparkContext *persistentContext = nullptr);
+
+        bool DsparkSupportsGenerationConfig(
+                const GenerationConfig &generationConfig) const;
 
         int ForwardDspark(
                 const Data &inputIds,

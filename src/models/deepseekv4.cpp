@@ -40,6 +40,7 @@
 #include <functional>
 #include <cstdio>
 #include <optional>
+#include <numeric>
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
@@ -61,6 +62,10 @@ namespace fastllm {
     namespace {
         static constexpr int DEEPSEEK_V4_DSPARK_LOG_INTERVAL = 64;
         static constexpr int DEEPSEEK_V4_DSPARK_CALIBRATION_ROUNDS = 7;
+        static constexpr float
+            DEEPSEEK_V4_MTP_TYPICAL_POSTERIOR_THRESHOLD = 0.09f;
+        static constexpr float
+            DEEPSEEK_V4_MTP_TYPICAL_POSTERIOR_ALPHA = 0.3f;
 
         // A DSpark target verification writes a speculative multi-token suffix
         // into the ordinary decode cache.  Keep the compressor raw rows alive
@@ -204,6 +209,21 @@ namespace fastllm {
 #else
             return false;
 #endif
+        }
+
+        static bool DeepSeekV4DeviceMapUsesOnlyNuma(
+                const std::map<std::string, int> &deviceMap) {
+            bool found = false;
+            for (const auto &item : deviceMap) {
+                if (item.second <= 0) {
+                    continue;
+                }
+                found = true;
+                if (!DeepSeekV4DeviceSpecUsesType(item.first, "numa")) {
+                    return false;
+                }
+            }
+            return found;
         }
 
         static bool DeepSeekV4PreferCuda() {
@@ -5743,6 +5763,41 @@ namespace fastllm {
         return *this;
     }
 
+    DeepSeekV4HistoryCacheMemory::DeepSeekV4HistoryCacheMemory(
+            const DeepSeekV4HistoryCacheMemory &other) {
+        *this = other;
+    }
+
+    DeepSeekV4HistoryCacheMemory &
+    DeepSeekV4HistoryCacheMemory::operator=(
+            const DeepSeekV4HistoryCacheMemory &other) {
+        if (this == &other) {
+            return *this;
+        }
+        inputToken = other.inputToken;
+        tokens = other.tokens;
+        blockCount = other.blockCount;
+        blockHash = other.blockHash;
+        recordTimes = other.recordTimes;
+        flushTime = other.flushTime;
+        layers = other.layers;
+        dsparkValid = other.dsparkValid;
+        dsparkCommittedTokens = other.dsparkCommittedTokens;
+        dsparkHistoryTokens = other.dsparkHistoryTokens;
+        dsparkMainWindowKV.resize(other.dsparkMainWindowKV.size());
+        for (size_t stage = 0;
+             stage < other.dsparkMainWindowKV.size(); ++stage) {
+            // Data has a deep-copy constructor but no deep-copy assignment.
+            // Prefix-cache replacement and lookup both use assignment, so an
+            // implicit vector<Data> assignment would alias cpuData and later
+            // double-free the DSpark snapshot.
+            CopyHistoryTensorData(
+                dsparkMainWindowKV[stage],
+                other.dsparkMainWindowKV[stage]);
+        }
+        return *this;
+    }
+
     void DeepSeekV4HistoryCacheManager::SetMaxRecordNum(int maxRecordNum) {
         std::lock_guard<std::mutex> guard(this->locker);
         this->maxRecordNum = std::max(1, maxRecordNum);
@@ -7706,14 +7761,59 @@ namespace fastllm {
         context.committedTokens += tokens;
     }
 
+    bool DeepSeekV4Model::DsparkSupportsGenerationConfig(
+            const GenerationConfig &generationConfig) const {
+        GenerationConfig effectiveConfig = generationConfig;
+        PrepareDeepSeekV4SamplingConfig(effectiveConfig);
+        const bool simpleGreedy = effectiveConfig.IsSimpleGreedy();
+        const bool mixedCudaNuma =
+            DeepSeekV4DeviceMapUsesSingleCuda(this->deviceMap) &&
+            DeepSeekV4DeviceMapUsesOnlyNuma(this->moeDeviceMap) &&
+            (this->layeredMoeDeviceMap.empty() ||
+             DeepSeekV4DeviceMapUsesOnlyNuma(
+                 this->layeredMoeDeviceMap));
+        const bool samplingSupported =
+            !simpleGreedy && mixedCudaNuma &&
+            effectiveConfig.top_k > 1 &&
+            std::isfinite(effectiveConfig.temperature) &&
+            effectiveConfig.temperature > 0.0f &&
+            std::isfinite(effectiveConfig.top_p) &&
+            effectiveConfig.top_p > 0.0f &&
+            effectiveConfig.top_p <= 1.0f;
+        return dsparkEnabled && (simpleGreedy || samplingSupported) &&
+            !effectiveConfig.output_logits &&
+            effectiveConfig.tool_call_allowed_token_ids.empty() &&
+            std::isfinite(effectiveConfig.repeat_penalty) &&
+            std::fabs(effectiveConfig.repeat_penalty - 1.0f) <= 1.0e-6f &&
+            !effectiveConfig.tool_call_name_constraint_enabled &&
+            !effectiveConfig.tool_call_parameter_name_constraint_enabled &&
+            !effectiveConfig.tool_call_content_sampling_enabled &&
+            // Per-row minimum-length EOS masking needs one full logits tensor;
+            // tensor-parallel verification keeps its logits sharded.
+            (effectiveConfig.output_token_least <= 0 ||
+             DeepSeekV4DeviceMapUsesSingleCuda(this->deviceMap));
+    }
+
     std::vector<int> DeepSeekV4Model::SampleDsparkTargetRows(
             Data &headInput,
+            const GenerationConfig &generationConfig,
+            const std::vector<int> &proposalTokens,
+            std::vector<unsigned char> &verificationAccepted,
             DeepSeekV4DsparkContext *persistentContext) {
         AssertInFastLLM(
             headInput.dims.size() == 3 && headInput.dims[0] == 1 &&
             headInput.dims[1] > 0 && headInput.dims[2] == embed_dim,
             "DSpark target head capture has an invalid shape.");
         const int rows = headInput.dims[1];
+        GenerationConfig effectiveConfig = generationConfig;
+        PrepareDeepSeekV4SamplingConfig(effectiveConfig);
+        const bool sampledVerification =
+            !effectiveConfig.IsSimpleGreedy();
+        AssertInFastLLM(
+            !sampledVerification ||
+                (int)proposalTokens.size() >= rows - 1,
+            "DeepSeek-V4 MTP rejection sampling input is incomplete.");
+        verificationAccepted.clear();
 #ifdef USE_CUDA
         struct ScopedDsparkSamplingAsync {
             bool active = false;
@@ -7736,6 +7836,8 @@ namespace fastllm {
             persistentContext == nullptr ? nullptr :
                 &persistentContext->targetCapture;
         const bool useGraphSampling =
+            !sampledVerification &&
+            effectiveConfig.output_token_least <= 0 &&
             graphCapture != nullptr && graphCapture->samplingReady &&
             graphCapture->samplingLogitsFloat != nullptr &&
             graphCapture->samplingGreedyIds != nullptr &&
@@ -7758,17 +7860,6 @@ namespace fastllm {
             samplingInput.Reshape({rows, 1, embed_dim});
             samplingInputPtr = &samplingInput;
         }
-        GenerationConfig greedy;
-        greedy.do_sample = false;
-        greedy.top_k = 1;
-        greedy.repeat_penalty = 1.0f;
-        greedy.output_token_least = 0;
-        greedy.output_logits = false;
-        std::vector<GenerationConfig> configs(rows, greedy);
-        std::vector<int> seqLens(rows, 1);
-        LastTokensManager emptyLastTokens(rows, greedy.last_n);
-        std::vector<std::pair<Data*, Data*> > emptyPast;
-        std::vector<int> sampled;
         Data *precomputedLogits = useGraphSampling ?
             graphCapture->samplingLogitsFloat : nullptr;
         Data *precomputedGreedyIds = useGraphSampling ?
@@ -7777,24 +7868,162 @@ namespace fastllm {
             graphCapture->samplingGreedyScores : nullptr;
         const std::map<int, void*> *precomputedReadyEvents =
             useGraphSampling ? &graphCapture->samplingReadyEvents : nullptr;
-        if (!useGraphSampling && persistentContext != nullptr) {
+        Data localSamplingLogits;
+        Data localSamplingLogitsFloat;
+        if (!useGraphSampling) {
             RMSNorm(samplingInput, weight["norm.weight"], rms_norm_eps,
                     samplingInput);
+            Data &samplingLogits = persistentContext == nullptr ?
+                localSamplingLogits :
+                persistentContext->targetSamplingLogits;
+            Data &samplingLogitsFloat = persistentContext == nullptr ?
+                localSamplingLogitsFloat :
+                persistentContext->targetSamplingLogitsFloat;
             Linear(samplingInput, weight["head.weight"], *GetEmptyData(),
-                   persistentContext->targetSamplingLogits);
-            ToDataType(persistentContext->targetSamplingLogits,
-                       persistentContext->targetSamplingLogitsFloat,
+                   samplingLogits);
+            ToDataType(samplingLogits, samplingLogitsFloat,
                        DataType::FLOAT32);
-            precomputedLogits =
-                &persistentContext->targetSamplingLogitsFloat;
+            precomputedLogits = &samplingLogitsFloat;
         }
-        LLMSamplingBlock(
-            this, samplingInputPtr, &weight["norm.weight"],
-            &weight["head.weight"], rms_norm_eps, rows, true,
-            seqLens, emptyPast, configs, emptyLastTokens,
-            nullptr, sampled, precomputedLogits,
-            precomputedGreedyIds, precomputedGreedyScores,
-            precomputedReadyEvents);
+
+        if (effectiveConfig.output_token_least > 0) {
+            AssertInFastLLM(
+                precomputedLogits != nullptr &&
+                !precomputedLogits->dims.empty() &&
+                !precomputedLogits->multiDeviceData &&
+                precomputedLogits->Count(0) ==
+                    (uint64_t)rows * precomputedLogits->dims.back(),
+                "DeepSeek-V4 MTP minimum-length masking requires full logits.");
+            std::vector<int> resetLengths(rows, 0);
+            std::vector<int> eosIds = {this->eos_token_id};
+            eosIds.insert(eosIds.end(), this->eos_token_ids.begin(),
+                          this->eos_token_ids.end());
+            eosIds.insert(eosIds.end(),
+                          effectiveConfig.stop_token_ids.begin(),
+                          effectiveConfig.stop_token_ids.end());
+            bool needsReset = false;
+            for (int row = 0; row < rows; ++row) {
+                const int cacheLength =
+                    (persistentContext == nullptr ? 0 :
+                     persistentContext->committedTokens) + row + 1;
+                resetLengths[row] =
+                    effectiveConfig.output_token_least - cacheLength +
+                    effectiveConfig.input_token_length;
+                needsReset |= resetLengths[row] > 0;
+            }
+            if (needsReset) {
+                if (precomputedLogits->dataDevice == DataDevice::CUDA) {
+#ifdef USE_CUDA
+                    std::vector<int> eosCounts(rows, (int)eosIds.size());
+                    std::vector<int> flattenedEosIds;
+                    flattenedEosIds.reserve((size_t)rows * eosIds.size());
+                    for (int row = 0; row < rows; ++row) {
+                        flattenedEosIds.insert(flattenedEosIds.end(),
+                                               eosIds.begin(), eosIds.end());
+                    }
+                    FastllmResetLogitsOfEOS(
+                        rows, precomputedLogits, resetLengths,
+                        eosCounts, flattenedEosIds);
+#endif
+                } else {
+                    precomputedLogits->ToDevice(DataDevice::CPU);
+                    const int vocab = precomputedLogits->dims.back();
+                    float *values = reinterpret_cast<float *>(
+                        precomputedLogits->cpuData);
+                    for (int row = 0; row < rows; ++row) {
+                        if (resetLengths[row] <= 0) {
+                            continue;
+                        }
+                        for (int token : eosIds) {
+                            if (token >= 0 && token < vocab) {
+                                values[(size_t)row * vocab + token] =
+                                    -1.0e30f;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        std::vector<int> sampled;
+        if (sampledVerification) {
+#ifdef USE_CUDA
+            AssertInFastLLM(
+                precomputedLogits != nullptr &&
+                precomputedLogits->dataDevice == DataDevice::CUDA &&
+                precomputedLogits->dataType == DataType::FLOAT32 &&
+                precomputedLogits->cudaData != nullptr &&
+                !precomputedLogits->multiDeviceData &&
+                !precomputedLogits->dims.empty() &&
+                precomputedLogits->Count(0) ==
+                    (uint64_t)rows * precomputedLogits->dims.back(),
+                "DeepSeek-V4 MTP rejection sampling requires full CUDA logits.");
+            const int device = GetPointerDeviceId(
+                precomputedLogits->cudaData);
+            AssertInFastLLM(
+                device >= 0,
+                "DeepSeek-V4 MTP rejection sampling has no CUDA device.");
+            const int previousDevice = FastllmCudaGetDevice();
+            struct ScopedSamplingDeviceRestore {
+                int previousDevice;
+                ~ScopedSamplingDeviceRestore() {
+                    FastllmCudaSetDevice(previousDevice);
+                }
+            } restoreSamplingDevice{previousDevice};
+            FastllmCudaSetDevice(device);
+            std::vector<float> temperatures(
+                rows, std::max(effectiveConfig.temperature, 1.0e-6f));
+            std::vector<int> topKs(
+                rows, std::max(1, effectiveConfig.top_k));
+            std::vector<float> topPs(rows, effectiveConfig.top_p);
+            const int candidateCount = rows - 1;
+            std::vector<int> candidateRows(candidateCount);
+            std::iota(candidateRows.begin(), candidateRows.end(), 0);
+            sampled.assign(rows, -1);
+            verificationAccepted.assign(candidateCount, 0);
+            std::vector<int> recoveredIds(candidateCount, -1);
+            AssertInFastLLM(
+                FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
+                    reinterpret_cast<float *>(
+                        precomputedLogits->cudaData),
+                    temperatures.data(), topKs.data(), topPs.data(),
+                    sampled.data(), rows, precomputedLogits->dims.back(),
+                    proposalTokens.data(), candidateRows.data(),
+                    verificationAccepted.data(), recoveredIds.data(),
+                    candidateCount,
+                    DEEPSEEK_V4_MTP_TYPICAL_POSTERIOR_THRESHOLD,
+                    DEEPSEEK_V4_MTP_TYPICAL_POSTERIOR_ALPHA),
+                "DeepSeek-V4 CUDA MTP rejection sampling failed.");
+            // Accepted rows commit their draft token.  On the first rejected
+            // row, recover with the verifier's target argmax; the final row is
+            // an independently sampled bonus token when every draft survives.
+            for (int row = 0; row < candidateCount; ++row) {
+                sampled[row] = recoveredIds[row];
+            }
+#else
+            AssertInFastLLM(
+                false,
+                "DeepSeek-V4 MTP rejection sampling requires CUDA.");
+#endif
+        } else {
+            GenerationConfig greedy = effectiveConfig;
+            greedy.do_sample = false;
+            greedy.top_k = 1;
+            greedy.repeat_penalty = 1.0f;
+            greedy.output_token_least = 0;
+            greedy.output_logits = false;
+            std::vector<GenerationConfig> configs(rows, greedy);
+            std::vector<int> seqLens(rows, 1);
+            LastTokensManager emptyLastTokens(rows, greedy.last_n);
+            std::vector<std::pair<Data*, Data*> > emptyPast;
+            LLMSamplingBlock(
+                this, samplingInputPtr, &weight["norm.weight"],
+                &weight["head.weight"], rms_norm_eps, rows, true,
+                seqLens, emptyPast, configs, emptyLastTokens,
+                nullptr, sampled, precomputedLogits,
+                precomputedGreedyIds, precomputedGreedyScores,
+                precomputedReadyEvents);
+        }
         if (useGraphSampling) {
             // The root gather waits every replay-done event and synchronizes
             // its stream before returning.  All verifier ranks are therefore
@@ -9827,6 +10056,10 @@ namespace fastllm {
 
         const int anchorToken = tokenIds[0];
         const int oldTokens = context.committedTokens;
+        GenerationConfig effectiveSamplingConfig = generationConfig;
+        PrepareDeepSeekV4SamplingConfig(effectiveSamplingConfig);
+        const bool sampledVerification =
+            !effectiveSamplingConfig.IsSimpleGreedy();
         using DsparkProfileClock = std::chrono::steady_clock;
         const int dsparkTargetOnlyCooldownRounds = std::max(
             0, std::min(
@@ -9845,7 +10078,8 @@ namespace fastllm {
         if (!dsparkLogPrinted.exchange(true)) {
             std::printf(
                 "[DeepSeek-V4 DSpark] enabled: layers=%d, "
-                "drafts_per_step=%d, acceptance=exact, "
+                "drafts_per_step=%d, "
+                "acceptance=exact(greedy)/typical(sampling), "
                 "log_interval=%d validations.\n",
                 dsparkLayers, dsparkTokens,
                 DEEPSEEK_V4_DSPARK_LOG_INTERVAL);
@@ -9986,6 +10220,7 @@ namespace fastllm {
             targetSubmitBegin, DsparkProfileClock::now());
         const auto targetFinishBegin = DsparkProfileClock::now();
         std::vector<int> targetRows;
+        std::vector<unsigned char> verificationAccepted;
         DeepSeekV4DsparkProposal pipelinedProposal;
         bool gpuPostprocess = false;
         int gpuAccepted = -1;
@@ -9994,6 +10229,7 @@ namespace fastllm {
 #ifdef USE_CUDA
         const int verifyRows = verifyTokens;
         bool gpuPostprocessEligible =
+            !sampledVerification &&
             verifyDrafts == dsparkTokens && proposal.gpuDeferred &&
             capture.samplingReady &&
             capture.contextReady && capture.contextRows == verifyRows &&
@@ -10248,7 +10484,7 @@ namespace fastllm {
                 proposal.gpuTokens = nullptr;
                 proposal.gpuReadySignal = nullptr;
                 proposal.gpuReadySeen = nullptr;
-                for (int token = 0; token < dsparkTokens; ++token) {
+                for (int token = 0; token < verifyDrafts; ++token) {
                     verifyIds[token + 1] = proposal.tokens[token];
                 }
                 capture.samplingDevicesDrained = true;
@@ -10261,9 +10497,6 @@ namespace fastllm {
             }
         }
 
-        if (!gpuPostprocess) {
-            targetRows = SampleDsparkTargetRows(capture.headInput, &context);
-        }
         if (!gpuPostprocess && proposal.gpuDeferred) {
             AssertInFastLLM(
                 proposal.gpuTokens != nullptr &&
@@ -10278,12 +10511,19 @@ namespace fastllm {
                 proposal.tokens.data(), proposal.gpuTokens->cudaData,
                 proposal.tokens.size() * sizeof(int));
             proposal.gpuDeferred = false;
-            for (int token = 0; token < dsparkTokens; ++token) {
+            for (int token = 0; token < verifyDrafts; ++token) {
                 verifyIds[token + 1] = proposal.tokens[token];
             }
         }
+        if (!gpuPostprocess) {
+            targetRows = SampleDsparkTargetRows(
+                capture.headInput, effectiveSamplingConfig,
+                proposal.tokens, verificationAccepted, &context);
+        }
 #else
-        targetRows = SampleDsparkTargetRows(capture.headInput, &context);
+        targetRows = SampleDsparkTargetRows(
+            capture.headInput, effectiveSamplingConfig,
+            proposal.tokens, verificationAccepted, &context);
 #endif
         dsparkTargetFinishMs = dsparkElapsedMs(
             targetFinishBegin, DsparkProfileClock::now());
@@ -10314,10 +10554,19 @@ namespace fastllm {
         AssertInFastLLM(
             (int)targetRows.size() == verifyTokens,
             "DSpark target verification returned an invalid row count.");
+        AssertInFastLLM(
+            !sampledVerification ||
+                (int)verificationAccepted.size() == verifyDrafts,
+            "DeepSeek-V4 MTP rejection sampling returned an invalid shape.");
 
         int accepted = 0;
-        while (accepted < verifyDrafts &&
-               proposal.tokens[accepted] == targetRows[accepted]) {
+        while (accepted < verifyDrafts) {
+            const bool acceptsCandidate = sampledVerification ?
+                verificationAccepted[accepted] != 0 :
+                proposal.tokens[accepted] == targetRows[accepted];
+            if (!acceptsCandidate) {
+                break;
+            }
             accepted++;
         }
         const int nextToken = targetRows[accepted];
@@ -10499,8 +10748,7 @@ namespace fastllm {
                                  const GenerationConfig &generationConfig,
                                  const LastTokensManager &lastTokens,
                                  std::vector <float> *retLogits) {
-        if (dsparkEnabled && generationConfig.IsSimpleGreedy() &&
-            !generationConfig.output_logits) {
+        if (DsparkSupportsGenerationConfig(generationConfig)) {
             return ForwardDspark(inputIds, pastKeyValues,
                                  generationConfig, lastTokens, retLogits);
         }

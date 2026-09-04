@@ -806,6 +806,10 @@ def make_normal_llm_model(args, startup_progress = None):
     dspark_tokens = int(getattr(args, "dspark", 0) or 0)
     if dspark_tokens < 0:
         raise ValueError("--dspark must be >= 0")
+    if mtp > 0 and dspark_tokens > 0:
+        raise ValueError("MTP and --dspark cannot be enabled together")
+    if mtp > 0 and not speculative_algorithm:
+        speculative_algorithm = "mtp"
     if dspark_tokens > 0 and not speculative_algorithm:
         speculative_algorithm = "dspark"
     draft_config = None
@@ -868,6 +872,8 @@ def make_normal_llm_model(args, startup_progress = None):
     if speculative_algorithm and speculative_algorithm not in ("mtp", "dspark", "dflash"):
         raise ValueError(
             "--speculative_algorithm currently supports mtp, dspark or dflash")
+    if speculative_algorithm == "dspark" and mtp > 0:
+        raise ValueError("MTP and DSpark cannot be enabled together")
     if (speculative_algorithm == "dspark" and not speculative_draft_path and
             dspark_tokens <= 0):
         raise ValueError(
@@ -1045,6 +1051,7 @@ def make_normal_llm_model(args, startup_progress = None):
     is_laguna_model = False
     is_qwen35_model = False
     is_qwen38_flash_next_model = False
+    is_deepseek_v4_model = False
     is_dots3_note_model = False
     if (os.path.exists(config_path) or gguf_config is not None):
         try:
@@ -1077,6 +1084,11 @@ def make_normal_llm_model(args, startup_progress = None):
                 model_type == "qwen3_8_flash_next" or
                 text_model_type == "qwen3_8_flash_next_text"
             )
+            is_deepseek_v4_model = (
+                architecture in ("DeepseekV4ForCausalLM",
+                                 "DeepSeekV4ForCausalLM") or
+                model_type == "deepseek_v4"
+            )
             if speculative_algorithm == "dspark":
                 if speculative_draft_path:
                     if (architecture != "KimiK3ForConditionalGeneration" and
@@ -1086,11 +1098,7 @@ def make_normal_llm_model(args, startup_progress = None):
                             "Kimi-K3, got architecture=%s model_type=%s" %
                             (architecture, model_type))
                 else:
-                    is_deepseek_v4 = (
-                        architecture in ("DeepseekV4ForCausalLM",
-                                         "DeepSeekV4ForCausalLM") or
-                        model_type == "deepseek_v4")
-                    if not is_deepseek_v4:
+                    if not is_deepseek_v4_model:
                         raise ValueError(
                             "Embedded DSpark requires a DeepSeek-V4 checkpoint with "
                             "embedded mtp.* DSpark weights, got architecture=%s "
@@ -1117,14 +1125,55 @@ def make_normal_llm_model(args, startup_progress = None):
                         "target, got architecture=%s model_type=%s" %
                         (architecture, model_type))
             elif speculative_algorithm == "mtp":
-                if not is_qwen35_model:
+                if is_deepseek_v4_model:
+                    if speculative_draft_path:
+                        raise ValueError(
+                            "DeepSeek-V4 MTP uses the checkpoint's embedded "
+                            "DSpark weights and does not accept an external draft")
+                    checkpoint_block = int(config.get(
+                        "dspark_block_size", 0) or 0)
+                    target_layers = config.get(
+                        "dspark_target_layer_ids", [])
+                    noise_token = int(config.get(
+                        "dspark_noise_token_id", -1) or -1)
+                    if (checkpoint_block <= 0 or not target_layers or
+                            noise_token < 0):
+                        raise ValueError(
+                            "DeepSeek-V4 checkpoint is missing embedded DSpark "
+                            "configuration")
+                    if mtp < checkpoint_block:
+                        raise ValueError(
+                            "DeepSeek-V4 MTP draft tokens must be at least the "
+                            "checkpoint training block size "
+                            "(requested=%d, checkpoint=%d)" %
+                            (mtp, checkpoint_block))
+                    confidence_threshold = float(getattr(
+                        args, "speculative_dspark_confidence_threshold", 0.5))
+                    if not 0.0 <= confidence_threshold <= 1.0:
+                        raise ValueError(
+                            "--speculative_dspark_confidence_threshold must be "
+                            "in [0, 1]")
+                    dspark_tokens = mtp
+                    args.dspark = mtp
+                    os.environ["FASTLLM_DSPARK_TOKENS"] = str(mtp)
+                    os.environ[
+                        "FASTLLM_DSPARK_CONFIDENCE_THRESHOLD"
+                    ] = str(confidence_threshold)
+                    args.speculative_algorithm = "dspark"
+                    speculative_algorithm = "dspark"
+                    print(
+                        "[Fastllm] DeepSeek-V4 --mtp uses the checkpoint's "
+                        "embedded DSpark draft weights.",
+                        flush=True,
+                    )
+                elif not is_qwen35_model:
                     raise ValueError(
                         "MTP currently requires a Qwen3.5 target, got "
                         "architecture=%s model_type=%s" %
                         (architecture, model_type))
-                if speculative_draft_path and not (
+                if (not is_deepseek_v4_model and speculative_draft_path and not (
                         os.path.isfile(args.path) and
-                        args.path.lower().endswith(".gguf")):
+                        args.path.lower().endswith(".gguf"))):
                     raise ValueError(
                         "external MTP attachment currently requires a GGUF target")
             is_moe_model = _is_moe_architecture(architecture, model_type, text_model_type)

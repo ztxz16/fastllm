@@ -1298,9 +1298,14 @@ namespace {
         struct TestDeepSeekV4Model : fastllm::DeepSeekV4Model {
             using fastllm::DeepSeekV4Model::dsparkConfidenceThreshold;
             using fastllm::DeepSeekV4Model::dsparkDraftBestUs;
+            using fastllm::DeepSeekV4Model::dsparkEnabled;
             using fastllm::DeepSeekV4Model::dsparkTokens;
             using fastllm::DeepSeekV4Model::dsparkValidationCount;
             using fastllm::DeepSeekV4Model::dsparkVerifyBestUs;
+            using fastllm::DeepSeekV4Model::deviceMap;
+            using fastllm::DeepSeekV4Model::DsparkSupportsGenerationConfig;
+            using fastllm::DeepSeekV4Model::layeredMoeDeviceMap;
+            using fastllm::DeepSeekV4Model::moeDeviceMap;
             using fastllm::DeepSeekV4Model::SelectDsparkVerifyDrafts;
         } model;
         model.dsparkTokens = 7;
@@ -1331,6 +1336,54 @@ namespace {
         model.dsparkConfidenceThreshold = 0.5f;
         Expect(model.SelectDsparkVerifyDrafts(proposal, context) == 7,
                "DeepSeek-V4 DSpark deferred GPU proposal lost fixed shape.");
+
+        model.dsparkEnabled = true;
+        model.deviceMap = {{"cuda", 1}};
+        model.moeDeviceMap = {{"numa", 1}};
+        model.layeredMoeDeviceMap.clear();
+        fastllm::GenerationConfig sampledConfig;
+        sampledConfig.do_sample = true;
+        sampledConfig.top_k = 1;
+        sampledConfig.top_p = 0.9f;
+        sampledConfig.temperature = 0.8f;
+#ifdef USE_CUDA
+        Expect(model.DsparkSupportsGenerationConfig(sampledConfig),
+               "DeepSeek-V4 mixed MTP did not recognize effective sampling.");
+#else
+        Expect(!model.DsparkSupportsGenerationConfig(sampledConfig),
+               "DeepSeek-V4 sampling MTP enabled without CUDA.");
+#endif
+        sampledConfig.repeat_penalty = 1.1f;
+        Expect(!model.DsparkSupportsGenerationConfig(sampledConfig),
+               "DeepSeek-V4 MTP accepted unsupported repeat penalty.");
+        sampledConfig.repeat_penalty = 1.0f;
+        model.moeDeviceMap = {{"cuda", 1}};
+        Expect(!model.DsparkSupportsGenerationConfig(sampledConfig),
+               "DeepSeek-V4 sampling MTP escaped mixed CUDA/NUMA gating.");
+        fastllm::GenerationConfig greedyConfig;
+        Expect(model.DsparkSupportsGenerationConfig(greedyConfig),
+               "DeepSeek-V4 greedy DSpark compatibility regressed.");
+
+        fastllm::DeepSeekV4HistoryCacheMemory firstSnapshot;
+        firstSnapshot.dsparkMainWindowKV.emplace_back(
+            fastllm::DataType::BFLOAT16, std::vector<int>{1, 2, 4});
+        firstSnapshot.dsparkMainWindowKV[0].Allocate(false);
+        std::memset(firstSnapshot.dsparkMainWindowKV[0].cpuData, 0x5a,
+                    firstSnapshot.dsparkMainWindowKV[0].GetBytes());
+        fastllm::DeepSeekV4HistoryCacheMemory assignedSnapshot;
+        assignedSnapshot = firstSnapshot;
+        Expect(assignedSnapshot.dsparkMainWindowKV.size() == 1 &&
+                   assignedSnapshot.dsparkMainWindowKV[0].cpuData != nullptr &&
+                   assignedSnapshot.dsparkMainWindowKV[0].cpuData !=
+                       firstSnapshot.dsparkMainWindowKV[0].cpuData,
+               "DeepSeek-V4 DSpark prefix snapshot assignment aliased storage.");
+        assignedSnapshot = firstSnapshot;
+        Expect(assignedSnapshot.dsparkMainWindowKV[0].cpuData !=
+                   firstSnapshot.dsparkMainWindowKV[0].cpuData &&
+                   std::memcmp(assignedSnapshot.dsparkMainWindowKV[0].cpuData,
+                               firstSnapshot.dsparkMainWindowKV[0].cpuData,
+                               firstSnapshot.dsparkMainWindowKV[0].GetBytes()) == 0,
+               "DeepSeek-V4 DSpark prefix snapshot replacement lost data.");
     }
 
 #ifdef USE_CUDA
@@ -13636,6 +13689,12 @@ namespace {
 
 int main(int argc, char **argv) {
     try {
+        if (argc == 2 &&
+            std::string(argv[1]) == "--dsv4-dspark-scheduler") {
+            RunDeepSeekV4DsparkPrefixSelectionRegression();
+            std::cout << "DeepSeek-V4 DSpark/MTP scheduler regression: PASS\n";
+            return 0;
+        }
         if (argc == 2 &&
             std::string(argv[1]) ==
                 "--packed-affine-int4-loader") {
