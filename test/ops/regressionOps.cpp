@@ -88,6 +88,119 @@ namespace {
                         const std::string &name);
     void RunCpuDeepSeekV4IndexerBenchmark(int sequence);
 
+#ifdef __aarch64__
+    void RunCpuAArch64Nvfp4Block16Regression() {
+        constexpr int rows = 2;
+        constexpr int inputDim = 33;
+        constexpr int columns = 5;
+        constexpr int blocks = (inputDim + 15) / 16;
+        static constexpr float e2m1[16] = {
+             0.0f,  0.5f,  1.0f,  1.5f,
+             2.0f,  3.0f,  4.0f,  6.0f,
+            -0.0f, -0.5f, -1.0f, -1.5f,
+            -2.0f, -3.0f, -4.0f, -6.0f
+        };
+        const fastllm::DataType inputTypes[] = {
+            fastllm::DataType::FLOAT32,
+            fastllm::DataType::BFLOAT16
+        };
+        const fastllm::DataType weightTypes[] = {
+            fastllm::DataType::NVFP4_BLOCK_16,
+            fastllm::DataType::NVFP4_BLOCK_16_E8M0
+        };
+
+        std::vector<float> floatInput((size_t)rows * inputDim);
+        std::vector<uint16_t> bfloatInput(floatInput.size());
+        for (size_t i = 0; i < floatInput.size(); i++) {
+            floatInput[i] = ((int)(i * 17 % 41) - 20) / 13.0f;
+            bfloatInput[i] =
+                fastllm::Float32ToBFloat16RNEBits(floatInput[i]);
+        }
+
+        for (fastllm::DataType inputType : inputTypes) {
+            const bool inputBfloat16 =
+                inputType == fastllm::DataType::BFLOAT16;
+            const void *input = inputBfloat16
+                ? (const void*)bfloatInput.data()
+                : (const void*)floatInput.data();
+            const long inputStride = inputDim *
+                (inputBfloat16 ? (long)sizeof(uint16_t)
+                              : (long)sizeof(float));
+
+            for (fastllm::DataType weightType : weightTypes) {
+                const bool scaleE8M0 = weightType ==
+                    fastllm::DataType::NVFP4_BLOCK_16_E8M0;
+                const int blockBytes = scaleE8M0 ? 9 : 12;
+                const long weightStride = (long)blocks * blockBytes;
+                std::vector<uint8_t> weight(
+                    (size_t)columns * weightStride);
+                for (size_t i = 0; i < weight.size(); i++) {
+                    weight[i] = (uint8_t)(i * 29 + 7);
+                }
+                for (int column = 0; column < columns; column++) {
+                    for (int block = 0; block < blocks; block++) {
+                        uint8_t *packed = weight.data() +
+                            (size_t)column * weightStride +
+                            block * blockBytes;
+                        if (scaleE8M0) {
+                            packed[8] = (uint8_t)(
+                                122 + (column + block) % 6);
+                        } else {
+                            const float scale =
+                                (1 + (column * 3 + block) % 7) / 32.0f;
+                            std::memcpy(
+                                packed + 8, &scale, sizeof(scale));
+                        }
+                    }
+                }
+
+                std::vector<float> actual(
+                    (size_t)rows * columns, 0.0f);
+                fastllm::FastllmGemm(
+                    rows, inputDim, columns, input, inputStride,
+                    weight.data(), weightStride, actual.data(),
+                    columns * (long)sizeof(float), 0, columns,
+                    inputType, weightType, fastllm::DataType::FLOAT32);
+
+                for (int row = 0; row < rows; row++) {
+                    for (int column = 0; column < columns; column++) {
+                        float expected = 0.0f;
+                        for (int index = 0; index < inputDim; index++) {
+                            const uint8_t *packed = weight.data() +
+                                (size_t)column * weightStride +
+                                (index / 16) * blockBytes;
+                            const uint8_t byte = packed[(index % 16) / 2];
+                            const uint8_t code = (index & 1)
+                                ? byte >> 4 : byte & 0x0f;
+                            float scale = scaleE8M0
+                                ? fastllm::NVFP4E8M0ScaleToFloat(packed[8])
+                                : 0.0f;
+                            if (!scaleE8M0) {
+                                std::memcpy(
+                                    &scale, packed + 8, sizeof(scale));
+                            }
+                            const size_t inputIndex =
+                                (size_t)row * inputDim + index;
+                            const float inputValue = inputBfloat16
+                                ? fastllm::BFloat16BitsToFloat32(
+                                      bfloatInput[inputIndex])
+                                : floatInput[inputIndex];
+                            expected += inputValue * e2m1[code] * scale;
+                        }
+                        const size_t outputIndex =
+                            (size_t)row * columns + column;
+                        const float limit =
+                            2.0e-5f * (1.0f + std::fabs(expected));
+                        Expect(std::fabs(actual[outputIndex] - expected) <= limit,
+                               "AArch64 NVFP4 block16 GEMM mismatch at output " +
+                                   std::to_string(outputIndex));
+                    }
+                }
+            }
+        }
+    }
+#endif
+
     void RunCpuDeepSeekV4Nvfp4Block32Benchmark() {
         constexpr int rows = 8;
         constexpr int inputDim = 4096;
@@ -13707,6 +13820,14 @@ int main(int argc, char **argv) {
             std::cout << "DeepSeek-V4 NUMA MoE bitwise regressions: PASS\n";
             return 0;
         }
+#ifdef __aarch64__
+        if (argc == 2 &&
+            std::string(argv[1]) == "--cpu-aarch64-nvfp4-block16") {
+            RunCpuAArch64Nvfp4Block16Regression();
+            std::cout << "AArch64 NVFP4 block16 GEMM regression: PASS\n";
+            return 0;
+        }
+#endif
 #ifdef USE_CUDA
         if (argc == 2 &&
             std::string(argv[1]) == "--numas-cuda-fp8-moe-hybrid") {

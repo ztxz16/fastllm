@@ -529,6 +529,13 @@ namespace fastllm {
         return table[v & 0xF];
     }
 
+#ifdef __aarch64__
+    alignas(16) static constexpr int8_t kNVFP4E2M1Twice[16] = {
+         0,  1,  2,  3,  4,  6,  8, 12,
+         0, -1, -2, -3, -4, -6, -8, -12
+    };
+#endif
+
     static inline uint16_t FloatToBFloat16Trunc(float v) {
         uint32_t bits;
         memcpy(&bits, &v, sizeof(bits));
@@ -670,6 +677,11 @@ namespace fastllm {
         const uint16_t *inputBF16 = reinterpret_cast<const uint16_t*>(inputBase);
         const int blocks = (m - 1) / 16 + 1;
         float now[COLS] = {};
+#ifdef __aarch64__
+        const uint8x16_t nvfp4Table = vreinterpretq_u8_s8(
+            vld1q_s8(kNVFP4E2M1Twice));
+        const uint8x8_t lowMask = vdup_n_u8(0x0f);
+#endif
 
         const int packedBlockBytes = 8 + (SCALE_E8M0 ? (int)sizeof(uint8_t) : (int)sizeof(float));
         for (int block = 0; block < blocks; block++) {
@@ -708,6 +720,54 @@ namespace fastllm {
             }
             for (int c = 0; c < COLS; c++) {
                 now[c] += Floatsum(vsum[c]) * scale[c];
+            }
+#elif defined(__aarch64__)
+            if (l + 15 < blockEnd) {
+                float32x4_t input[4];
+                if constexpr (INPUT_BF16) {
+                    const uint16x8_t input0 = vld1q_u16(inputBF16 + l);
+                    const uint16x8_t input1 = vld1q_u16(inputBF16 + l + 8);
+                    input[0] = vreinterpretq_f32_u32(
+                        vshll_n_u16(vget_low_u16(input0), 16));
+                    input[1] = vreinterpretq_f32_u32(
+                        vshll_n_u16(vget_high_u16(input0), 16));
+                    input[2] = vreinterpretq_f32_u32(
+                        vshll_n_u16(vget_low_u16(input1), 16));
+                    input[3] = vreinterpretq_f32_u32(
+                        vshll_n_u16(vget_high_u16(input1), 16));
+                } else {
+                    input[0] = vld1q_f32(inputF32 + l);
+                    input[1] = vld1q_f32(inputF32 + l + 4);
+                    input[2] = vld1q_f32(inputF32 + l + 8);
+                    input[3] = vld1q_f32(inputF32 + l + 12);
+                }
+                for (int c = 0; c < COLS; c++) {
+                    const uint8x8_t packed = vld1_u8(blockStart[c]);
+                    const uint8x8_t low = vand_u8(packed, lowMask);
+                    const uint8x8_t high = vshr_n_u8(packed, 4);
+                    const uint8x8x2_t codes = vzip_u8(low, high);
+                    const int16x8_t values0 = vmovl_s8(
+                        vreinterpret_s8_u8(
+                            vqtbl1_u8(nvfp4Table, codes.val[0])));
+                    const int16x8_t values1 = vmovl_s8(
+                        vreinterpret_s8_u8(
+                            vqtbl1_u8(nvfp4Table, codes.val[1])));
+
+                    float32x4_t sum = vmulq_f32(
+                        input[0], vcvtq_f32_s32(
+                            vmovl_s16(vget_low_s16(values0))));
+                    sum = vfmaq_f32(
+                        sum, input[1], vcvtq_f32_s32(
+                            vmovl_s16(vget_high_s16(values0))));
+                    sum = vfmaq_f32(
+                        sum, input[2], vcvtq_f32_s32(
+                            vmovl_s16(vget_low_s16(values1))));
+                    sum = vfmaq_f32(
+                        sum, input[3], vcvtq_f32_s32(
+                            vmovl_s16(vget_high_s16(values1))));
+                    now[c] += vaddvq_f32(sum) * (scale[c] * 0.5f);
+                }
+                l += 16;
             }
 #endif
             for (; l < blockEnd; l++) {
