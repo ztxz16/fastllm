@@ -4,10 +4,11 @@
 
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
+#include "devices/cuda/fastllm-awq-sm70.cuh"
 
 #include <cmath>
 #include <cstring>
-#include <cstdlib>
+#include <mutex>
 #include <cuda_fp8.h>
 
 #ifdef __CUDACC__
@@ -878,9 +879,7 @@ void LaunchFastllmGemmFp16FP8E4M3(half *input, uint8_t *weight, half *output, ha
     // Six-token speculative verification is the dominant FP8 shape on the
     // target model.  Two output rows per warp expose twice as many blocks and
     // hide weight-load latency better than the generic four-row launch.
-    const char *n6Rows2Env = std::getenv("FASTLLM_CUDA_FP8_N6_ROWS2");
-    const bool n6Rows2 = n6Rows2Env == nullptr || std::atoi(n6Rows2Env) != 0;
-    if (n == 6 && useBlock128 && n6Rows2) {
+    if (n == 6 && useBlock128) {
         constexpr int N6_W = 2;
         constexpr int N6_ROWS = 2;
         const int n6Grid =
@@ -1395,6 +1394,75 @@ static void FastllmCudaFP8E4M3EnsureHalfBiasOnDevice(fastllm::Data &weight, cons
     }
 }
 
+namespace {
+
+// Across representative SM70 projection shapes, the native SM70 GEMV wins for
+// one through four rows. TurboMind's MMA path wins every measured shape from
+// five rows onward. Repacking is therefore delayed until such a call occurs,
+// avoiding a second persistent weight copy while leaving batch-one-only
+// weights in the native layout.
+constexpr int kSm70Fp8NativeMaxRows = 4;
+constexpr int kSm70Fp8RepackMaxRows = 31;
+constexpr size_t kFp8StandardCudaDataCount = 2;
+
+bool FastllmCudaFp8E4M3HasSm70Layout(const fastllm::Data &weight) {
+    return weight.IsRepacked && !weight.extraCudaData.empty() &&
+           weight.extraCudaData[0] != nullptr &&
+           fastllm::awq_sm70::Fp8Supported();
+}
+
+bool FastllmCudaFp8E4M3PrepareSm70Layout(fastllm::Data &weight,
+                                         int rows, int inputDim,
+                                         int outputDim) {
+    if (FastllmCudaFp8E4M3HasSm70Layout(weight)) {
+        return true;
+    }
+    if (weight.IsRepacked || FastllmCudaGetNcclForceSync() ||
+        rows <= kSm70Fp8NativeMaxRows ||
+        rows > kSm70Fp8RepackMaxRows || weight.blockM != 128 ||
+        weight.blockK != 128 || inputDim % 128 != 0 ||
+        outputDim % 32 != 0 ||
+        weight.extraCudaData.size() < kFp8StandardCudaDataCount) {
+        return false;
+    }
+
+    // Startup probes include a single eight-row prefill call. Do not let that
+    // one-off shape irreversibly repack weights used later by batch-one decode.
+    // Repeated eligible calls are characteristic of batched/speculative
+    // serving and amortize the one-time conversion.
+    static std::mutex prepareMutex;
+    std::lock_guard<std::mutex> lock(prepareMutex);
+    if (FastllmCudaFp8E4M3HasSm70Layout(weight)) {
+        return true;
+    }
+    if (weight.IsRepacked) {
+        return false;
+    }
+    if (weight.extraCudaData.size() == kFp8StandardCudaDataCount) {
+        weight.extraCudaData.push_back(nullptr);
+        return false;
+    }
+    if (weight.extraCudaData.size() != kFp8StandardCudaDataCount + 1 ||
+        weight.extraCudaData.back() != nullptr) {
+        return false;
+    }
+
+    half *packedScales = nullptr;
+    if (!fastllm::awq_sm70::PrepareFp8InPlace(
+            static_cast<uint8_t *>(weight.cudaData),
+            static_cast<const float *>(weight.extraCudaData[0]),
+            &packedScales, inputDim, outputDim,
+            weight.blockM, weight.blockK, cudaStreamPerThread)) {
+        return false;
+    }
+    cudaFree(weight.extraCudaData[0]);
+    weight.extraCudaData[0] = packedScales;
+    weight.IsRepacked = true;
+    return true;
+}
+
+}  // namespace
+
 bool FastllmCudaMatMulFloatFP8E4M3(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
     FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(weight, bias, k);
 
@@ -1403,6 +1471,40 @@ bool FastllmCudaMatMulFloatFP8E4M3(const fastllm::Data &input, fastllm::Data &we
 
     float *cudaInput = (float*)FastllmCudaPrepareInput(input);
     float *cudaOutput = (float*)FastllmCudaPrepareOutput(output);
+
+    // A weight may have been repacked by an earlier FP16 call. Keep mixed
+    // activation-type reuse correct by adapting FP32 through the FP16 MMA path.
+    if (FastllmCudaFp8E4M3HasSm70Layout(weight)) {
+        const int inputLen = n * m;
+        const int outputLen = n * k;
+        half *cudaFp16Input = (half *)FastllmCudaMalloc(
+            (size_t)inputLen * sizeof(half));
+        half *cudaFp16Output = (half *)FastllmCudaMalloc(
+            (size_t)outputLen * sizeof(half));
+        FastllmCudaFloat2HalfKernel<<<(inputLen + 255) / 256, 256, 0,
+                                      cudaStreamPerThread>>>(
+            cudaInput, cudaFp16Input, inputLen);
+        const bool ok = fastllm::awq_sm70::GemmFp8(
+            static_cast<const uint8_t *>(weight.cudaData),
+            static_cast<const half *>(weight.extraCudaData[0]),
+            cudaFp16Input, cudaFp16Output, n, m, k, weight.blockM,
+            cudaStreamPerThread);
+        if (!ok) {
+            throw("fp8 sm70 fp32 adapter gemm error");
+        }
+        FastllmCudaHalf2FloatKernel<<<(outputLen + 255) / 256, 256, 0,
+                                      cudaStreamPerThread>>>(
+            cudaFp16Output, cudaOutput, outputLen);
+        if (bias.dims.size() > 0) {
+            FastllmCudaBiasKernel<<<n, 256, 0, cudaStreamPerThread>>>(
+                cudaOutput, cudaBiasData, k);
+        }
+        FastllmCudaFree(cudaFp16Input);
+        FastllmCudaFree(cudaFp16Output);
+        FastllmCudaFinishInput(input, cudaInput);
+        FastllmCudaFinishOutput(output, cudaOutput);
+        return true;
+    }
 
     if (n >= 16) {
         auto fastllmCublasHandle = getFastllmCublasHandle();
@@ -1495,11 +1597,31 @@ bool FastllmCudaHalfMatMulFloatFP8E4M3(const fastllm::Data &input, fastllm::Data
         return false;
     }
 
-    float *cudaScales = (float*)weight.extraCudaData[0];
     half *cudaBiasData = bias.dims.size() == 0 ? nullptr : (half *) weight.extraCudaHalfData[0];
     half *cudaInput = (half*)FastllmCudaPrepareInput(input);
     half *cudaOutput = (half*)FastllmCudaPrepareOutput(output);
 
+    if (FastllmCudaFp8E4M3PrepareSm70Layout(weight, n, m, k)) {
+        const bool ok = fastllm::awq_sm70::GemmFp8(
+            static_cast<const uint8_t *>(weight.cudaData),
+            static_cast<const half *>(weight.extraCudaData[0]),
+            cudaInput, cudaOutput, n, m, k, weight.blockM,
+            cudaStreamPerThread);
+        if (!ok) {
+            printf("Error: FP8 SM70 GEMM failed after the CUDA weight was "
+                   "repacked in place.\n");
+            throw("fp8 sm70 gemm error");
+        }
+        if (cudaBiasData != nullptr) {
+            FastllmCudaBiasKernel<<<n, 256, 0, cudaStreamPerThread>>>(
+                cudaOutput, cudaBiasData, k);
+        }
+        FastllmCudaFinishInput(input, cudaInput);
+        FastllmCudaFinishOutput(output, cudaOutput);
+        return true;
+    }
+
+    float *cudaScales = (float*)weight.extraCudaData[0];
     if (n >= 32) {
         auto fastllmCublasHandle = getFastllmCublasHandle();
 
@@ -1914,6 +2036,40 @@ bool FastllmCudaBFloat16MatMulFP8E4M3(const fastllm::Data &input, fastllm::Data 
     __nv_bfloat16 *cudaBF16Bias = bias.dims.size() == 0 ? nullptr : (__nv_bfloat16 *) weight.extraCudaHalfData[0];
     __nv_bfloat16 *cudaInput = (__nv_bfloat16*)FastllmCudaPrepareInput(input);
     __nv_bfloat16 *cudaOutput = (__nv_bfloat16*)FastllmCudaPrepareOutput(output);
+
+    // See the FP32 adapter above: this path is only needed if a caller reuses
+    // an FP16-repacked weight with BF16 activations later in its lifetime.
+    if (FastllmCudaFp8E4M3HasSm70Layout(weight)) {
+        const int inputLen = n * m;
+        const int outputLen = n * k;
+        half *cudaFp16Input = (half *)FastllmCudaMalloc(
+            (size_t)inputLen * sizeof(half));
+        half *cudaFp16Output = (half *)FastllmCudaMalloc(
+            (size_t)outputLen * sizeof(half));
+        FastllmCudaBF162HalfKernel<<<(inputLen + 255) / 256, 256, 0,
+                                     cudaStreamPerThread>>>(
+            reinterpret_cast<uint16_t *>(cudaInput), cudaFp16Input, inputLen);
+        const bool ok = fastllm::awq_sm70::GemmFp8(
+            static_cast<const uint8_t *>(weight.cudaData),
+            static_cast<const half *>(weight.extraCudaData[0]),
+            cudaFp16Input, cudaFp16Output, n, m, k, weight.blockM,
+            cudaStreamPerThread);
+        if (!ok) {
+            throw("fp8 sm70 bf16 adapter gemm error");
+        }
+        FastllmCudaHalf2BF16Kernel<<<(outputLen + 255) / 256, 256, 0,
+                                     cudaStreamPerThread>>>(
+            cudaFp16Output, cudaOutput, outputLen);
+        if (cudaBF16Bias != nullptr) {
+            FastllmCudaBiasKernel<<<n, 256, 0, cudaStreamPerThread>>>(
+                cudaOutput, cudaBF16Bias, k);
+        }
+        FastllmCudaFree(cudaFp16Input);
+        FastllmCudaFree(cudaFp16Output);
+        FastllmCudaFinishInput(input, cudaInput);
+        FastllmCudaFinishOutput(output, cudaOutput);
+        return true;
+    }
 
     if (n >= 32) {
         auto fastllmCublasHandle = getFastllmCublasHandle();
@@ -2849,21 +3005,7 @@ __global__ void FastllmGemvNVFP4Block16Kernel1Coalesced(
 }
 
 static inline int FastllmCudaNVFP4Block16ThreadsPerRow(int m) {
-    static const int overrideThreads = []() {
-        const char *env = std::getenv("FASTLLM_CUDA_NVFP4_BLOCK16_THREADS");
-        if (env == nullptr) return 0;
-        return std::atoi(env) >= 96 ? 128 : 64;
-    }();
-    if (overrideThreads != 0) return overrideThreads;
     return m >= 4096 ? 128 : 64;
-}
-
-static inline bool FastllmCudaNVFP4Block16CoalescedEnabled() {
-    static const bool enabled = []() {
-        const char *env = std::getenv("FASTLLM_CUDA_NVFP4_BLOCK16_COALESCED");
-        return env == nullptr || std::atoi(env) != 0;
-    }();
-    return enabled;
 }
 
 template <typename InputT, typename OutputT, typename BiasT>
@@ -2927,7 +3069,7 @@ static void LaunchFastllmGemmNVFP4Block16(InputT *input, uint8_t *weight, Output
                                           BiasT *bias, int n, int m, int k, int perRow) {
     if (n == 1) {
         const int threads = FastllmCudaNVFP4Block16ThreadsPerRow(m);
-        if (!SCALE_E8M0 && (m & 15) == 0 && FastllmCudaNVFP4Block16CoalescedEnabled()) {
+        if (!SCALE_E8M0 && (m & 15) == 0) {
             if (threads == 128) {
                 FastllmGemvNVFP4Block16Kernel1Coalesced<128> <<< k, 128 >>>(
                         input, weight, output, bias, m, k, perRow);
@@ -3330,6 +3472,69 @@ static inline size_t FastllmCudaNVFP4Block16BytesPerRow(int m) {
     return (size_t)((m - 1) / 16 + 1) * (8 + sizeof(float));
 }
 
+static bool FastllmCudaHasNVFP4Sm70TurboMindLayout(
+        const fastllm::Data &weight) {
+    return weight.cudaData != nullptr &&
+           weight.dataType == fastllm::DataType::NVFP4_BLOCK_16 &&
+           weight.blockM == 16 && weight.blockK == 1 &&
+           weight.IsRepacked && fastllm::awq_sm70::Nvfp4Supported();
+}
+
+static bool FastllmCudaEnsureNVFP4Sm70TurboMindLayout(
+        fastllm::Data &weight, int inputDim, int outputDim) {
+    if (FastllmCudaHasNVFP4Sm70TurboMindLayout(weight)) {
+        return true;
+    }
+    static std::mutex prepareMutex;
+    std::lock_guard<std::mutex> lock(prepareMutex);
+    if (FastllmCudaHasNVFP4Sm70TurboMindLayout(weight)) {
+        return true;
+    }
+    if (weight.cudaData == nullptr || weight.IsRepacked) {
+        return false;
+    }
+    if (!fastllm::awq_sm70::PrepareNvfp4InPlace(
+            static_cast<uint8_t *>(weight.cudaData), weight.GetBytes(),
+            inputDim, outputDim, cudaStreamPerThread)) {
+        return false;
+    }
+    weight.IsRepacked = true;
+    return true;
+}
+
+static bool FastllmCudaTryNVFP4Sm70TurboMind(
+        const fastllm::Data &input, fastllm::Data &weight,
+        const fastllm::Data &bias, fastllm::Data &output,
+        int n, int m, int k) {
+    if (!FastllmCudaHasNVFP4Sm70TurboMindLayout(weight)) {
+        if (n < 1 || n > 16 ||
+            weight.dataType != fastllm::DataType::NVFP4_BLOCK_16 ||
+            weight.blockM != 16 || weight.blockK != 1 ||
+            !FastllmCudaGetNcclForceSync() ||
+            !fastllm::awq_sm70::Nvfp4Supported() ||
+            !FastllmCudaEnsureNVFP4Sm70TurboMindLayout(weight, m, k)) {
+            return false;
+        }
+    }
+
+    half *cudaInput = static_cast<half *>(FastllmCudaPrepareInput(input));
+    half *cudaOutput = static_cast<half *>(FastllmCudaPrepareOutput(output));
+    if (!fastllm::awq_sm70::GemmNvfp4(
+            static_cast<const uint8_t *>(weight.cudaData), cudaInput,
+            cudaOutput, n, m, k, cudaStreamPerThread)) {
+        printf("Error: SM70 NVFP4 TurboMind GEMM failed after in-place repack.\n");
+        throw("nvfp4 sm70 turbomind gemm error");
+    }
+    if (bias.dims.size() > 0 && !weight.extraCudaHalfData.empty() &&
+        weight.extraCudaHalfData[0] != nullptr) {
+        FastllmCudaBiasKernel<<<n, 256, 0, cudaStreamPerThread>>>(
+            cudaOutput, static_cast<half *>(weight.extraCudaHalfData[0]), k);
+    }
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
+}
+
 static inline size_t FastllmCudaNVFP4Block16E8M0BytesPerRow(
         int m, bool block32 = false) {
     return block32 ?
@@ -3495,6 +3700,11 @@ bool FastllmCudaMatMulFloatNVFP4Block16E8M0(const fastllm::Data &input, fastllm:
 
 bool FastllmCudaHalfMatMulFloatNVFP4Block16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
     FastllmCudaFP8E4M3Block128EnsureHalfBiasOnDevice(weight, bias, k);
+
+    if (FastllmCudaTryNVFP4Sm70TurboMind(
+            input, weight, bias, output, n, m, k)) {
+        return true;
+    }
 
     if (FastllmCudaTryMarlinHalfMatMulFloatNVFP4Block16(
             input, weight, bias, output, n, m, k)) {

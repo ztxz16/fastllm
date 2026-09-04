@@ -67,6 +67,32 @@ static Nvfp4MarlinMode Nvfp4MarlinModeFromEnv() {
     return Nvfp4MarlinMode::AUTO;
 }
 
+static bool Nvfp4MarlinArchitectureSupported() {
+#ifdef CUDA_NO_TENSOR_CORE
+    return false;
+#else
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        return false;
+    }
+    static thread_local int cachedDevice = -1;
+    static thread_local bool cachedSupported = false;
+    if (cachedDevice == device) {
+        return cachedSupported;
+    }
+    int major = 0, minor = 0;
+    if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
+                               device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor,
+                               device) != cudaSuccess) {
+        return false;
+    }
+    cachedDevice = device;
+    cachedSupported = major * 10 + minor >= 75;
+    return cachedSupported;
+#endif
+}
+
 static const char *Nvfp4MarlinModeName(Nvfp4MarlinMode mode) {
     if (mode == Nvfp4MarlinMode::DISABLED) return "disabled";
     if (mode == Nvfp4MarlinMode::ENABLED) return "enabled";
@@ -77,27 +103,22 @@ static bool Nvfp4MarlinDeviceSupported() {
 #ifdef CUDA_NO_TENSOR_CORE
     return false;
 #else
-    int device = 0, major = 0, minor = 0;
-    if (cudaGetDevice(&device) != cudaSuccess ||
-        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
-                               device) != cudaSuccess ||
-        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor,
-                               device) != cudaSuccess) {
-        return false;
-    }
     Nvfp4MarlinMode mode = Nvfp4MarlinModeFromEnv();
     if (mode == Nvfp4MarlinMode::DISABLED) return false;
     // This is the same architecture gate used by vLLM's FP4 Marlin path.
     // SM75 uses Turing MMA with a two-stage pipeline; SM80+ uses four stages.
-    return major * 10 + minor >= 75;
+    return Nvfp4MarlinArchitectureSupported();
 #endif
 }
 
 static bool HasNvfp4MarlinOnDevice(const fastllm::Data &weight) {
+    // IsRepacked is shared with the SM70 TurboMind representation. Include
+    // the current architecture in the discriminator so the SM70 layout is
+    // not interpreted as Marlin (or vice versa) during generic dispatch.
     return weight.cudaData != nullptr &&
            weight.dataType == fastllm::DataType::NVFP4_BLOCK_16 &&
            weight.blockM == NVFP4_GROUP_SIZE && weight.blockK == 1 &&
-           weight.IsRepacked;
+           weight.IsRepacked && Nvfp4MarlinArchitectureSupported();
 }
 
 static bool Nvfp4MarlinShapeSupported(int sizeN, int sizeK) {
