@@ -743,6 +743,48 @@ static void ResetMultiDeviceData(fastllm::Data &data) {
     data.ClearTensorParallelLayout();
 }
 
+static void ReleaseMultiCudaSplitSource(fastllm::Data &weight) {
+    if (!weight.multiDeviceData) {
+        return;
+    }
+    // Preserve SplitMultiCudaWeight's previous behavior for temporary tensors
+    // as well as model weights, while also returning the vector capacity.
+    std::vector<int>().swap(weight.weightSum);
+    if (!weight.isModelWeight) {
+        return;
+    }
+
+    // SplitMultiCudaWeight gives every requested device an owned local tensor.
+    // Keeping the original host allocation after that point doubles the packed
+    // weight storage during tensor-parallel inference.  The parent Data remains
+    // as logical metadata and owns the local tensors, but no longer needs its
+    // source payload.
+    if (weight.cpuData != nullptr) {
+        if (!weight.isFake) {
+#ifdef USE_MMAP
+            if (weight.mapFile == nullptr) {
+                delete[] weight.cpuData;
+            }
+#else
+            delete[] weight.cpuData;
+#endif
+        }
+        weight.cpuData = nullptr;
+    }
+    weight.mapFile.reset();
+
+    // INT4_GROUP metadata is copied into the local shards below.  In
+    // particular, asymmetric group-32 checkpoints otherwise retain a full
+    // scales/mins/zeros triplet in the parent in addition to all shard-local
+    // copies.
+    if (weight.dataType == fastllm::DataType::INT4_GROUP) {
+        std::vector<float>().swap(weight.scales);
+        std::vector<float>().swap(weight.mins);
+        std::vector<int>().swap(weight.zeros);
+        std::vector<fastllm::LowBitConfig>().swap(weight.perChannelsConfigs);
+    }
+}
+
 void CopyToMultiDevices(fastllm::Data &data, std::vector <int> devices, bool copyData) {
     if (data.multiDeviceData) {
         return;
@@ -1825,7 +1867,7 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
     }
     ClearGGUFExtraCudaCaches(weight);
     weight.cudaData = nullptr;
-    weight.weightSum.clear();
+    ReleaseMultiCudaSplitSource(weight);
     return true;
 }
 

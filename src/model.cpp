@@ -71,6 +71,7 @@ namespace fastllm {
 #if defined(USE_NUMAS)
     void RegisterNumas(fastllm::Data *data, std::string weightType);
 #endif
+    extern BF16ToFP16Manager bf16tofp16;
 
     std::string ReadAllFile(const std::string &fileName) {
         std::ifstream t(fileName.c_str(), std::ios::in);
@@ -102,6 +103,12 @@ namespace fastllm {
             for (size_t i = 0; i < len; i++) {
                 u16dst[i * 2] = 0;
                 u16dst[i * 2 + 1] = u16src[i];
+            }
+        } else if (srcDtype == DataType::BFLOAT16 && dstDtype == DataType::FLOAT16) {
+            uint16_t *u16dst = (uint16_t*)dst;
+            uint16_t *u16src = (uint16_t*)src;
+            for (size_t i = 0; i < len; i++) {
+                u16dst[i] = bf16tofp16.dict[u16src[i]];
             }
         } else if (srcDtype == DataType::FLOAT16 && dstDtype == DataType::FLOAT32) {
             float *fdst = (float*)dst;
@@ -1983,6 +1990,25 @@ namespace fastllm {
                                                   DataType tensorDataType,
                                                   DataType linearDataType,
                                                   DataType originalDataType) {
+        if (tensorDataType == DataType::DATA_AUTO_EMBEDDING) {
+            // Embeddings are intentionally exempt from the requested linear
+            // quantization type. Resolve their native floating-point type from
+            // the safetensors header rather than the FLOAT32 scratch default;
+            // otherwise a BF16 vocabulary table is unnecessarily expanded to
+            // FP32 during load and remains twice as large for inference.
+            auto tensorIt = safeTensors.itmeDict.find(tensorName);
+            if (tensorIt != safeTensors.itmeDict.end()) {
+                if (tensorIt->second.dtype == "BF16") {
+                    return DataType::BFLOAT16;
+                }
+                if (tensorIt->second.dtype == "F16") {
+                    return DataType::FLOAT16;
+                }
+                if (tensorIt->second.dtype == "F32") {
+                    return DataType::FLOAT32;
+                }
+            }
+        }
         bool useLinearDataType = tensorDataType == DataType::DATA_AUTO_LINEAR ||
                                  tensorDataType == DataType::DATA_AUTO_CONV;
         DataType requestedDataType = useLinearDataType ? linearDataType : tensorDataType;
@@ -2001,6 +2027,45 @@ namespace fastllm {
             return originalDataType;
         }
         return tensorDataType;
+    }
+
+    static bool TryAdoptSafeTensorBuffer(Data &weight,
+                                         SafeTensorItem &tensor,
+                                         DataType sourceDataType,
+                                         bool hasUniqueMapping,
+                                         bool needsTranspose,
+                                         bool hasLora) {
+        const bool sameStorageType = weight.dataType == sourceDataType;
+        const bool convertBfloat16InPlace =
+            sourceDataType == DataType::BFLOAT16 &&
+            weight.dataType == DataType::FLOAT16;
+        const bool supportedStorageType =
+            sourceDataType == DataType::FLOAT32 ||
+            sourceDataType == DataType::FLOAT16 ||
+            sourceDataType == DataType::BFLOAT16;
+        if (!hasUniqueMapping || needsTranspose || hasLora ||
+            weight.dataDevice != DataDevice::CPU || weight.cpuData != nullptr ||
+            (!sameStorageType && !convertBfloat16InPlace) ||
+            !supportedStorageType || tensor.minsBuffer != nullptr ||
+            tensor.scalesBuffer != nullptr || tensor.buffer == nullptr ||
+            tensor.bytes != weight.GetBytes()) {
+            return false;
+        }
+
+        if (convertBfloat16InPlace) {
+            ConvertDataType(tensor.buffer, sourceDataType, tensor.buffer,
+                            weight.dataType, weight.Count(0));
+        }
+
+        // SafeTensorItem and CPU Data both own new[] storage. Transferring the
+        // buffer avoids a second full-size allocation for embeddings and other
+        // unmodified floating-point tensors.
+        weight.weightType = WeightType::AUTO;
+        weight.expansionSize = weight.Count(0);
+        weight.expansionBytes = weight.GetBytes();
+        weight.cpuData = tensor.buffer;
+        tensor.buffer = nullptr;
+        return true;
     }
 
     static bool ResolveAwqUnquantizedDataType(const std::string &sourceDataType,
@@ -5069,9 +5134,19 @@ namespace fastllm {
                                     if (it.second == DATA_AUTO_CONV) {
                                         tensor.Transpose(oriDataType);
                                     }
-                                    model->weight[weightName].CreateFromOriData(WeightType::AUTO, oriDataType, 
-                                            tensor.buffer, tensor.minsBuffer, tensor.scalesBuffer,
-                                            curGroupCnt, tensor.blockK, tensor.blockM);
+                                    Data &loadedWeight = model->weight[weightName];
+                                    if (!TryAdoptSafeTensorBuffer(
+                                            loadedWeight, tensor, oriDataType,
+                                            tensorMap[tensorName].size() == 1,
+                                            it.second == DATA_AUTO_CONV,
+                                            loraDicts.find(weightName) !=
+                                                loraDicts.end())) {
+                                        loadedWeight.CreateFromOriData(
+                                            WeightType::AUTO, oriDataType,
+                                            tensor.buffer, tensor.minsBuffer,
+                                            tensor.scalesBuffer, curGroupCnt,
+                                            tensor.blockK, tensor.blockM);
+                                    }
                                 }
                                 if (it.second == DATA_AUTO_LINEAR || it.second == DATA_AUTO_CONV)
                                     model->weight[weightName].CalcWeightSum();

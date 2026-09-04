@@ -27,6 +27,9 @@
 #include <cstring>
 #include <cstdlib>
 #include <cmath>
+#if defined(__linux__) && defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #include "json11.hpp"
 
 #ifdef USE_CUDA
@@ -107,6 +110,42 @@ namespace fastllm {
 
     static std::string Qwen35MoeExpertWeightName(int layer, int expert, const std::string &kind) {
         return Qwen35MoeExpertPrefix(layer, expert) + kind + "_proj.weight";
+    }
+
+    static int Qwen35MainLayerFromWeightName(const std::string &name) {
+        const std::string prefix = Qwen3_5Model::language_prefix + "layers.";
+        if (!StartWith(name, prefix)) {
+            return -1;
+        }
+        size_t pos = prefix.size();
+        if (pos >= name.size() || !std::isdigit((unsigned char)name[pos])) {
+            return -1;
+        }
+        int layer = 0;
+        while (pos < name.size() && std::isdigit((unsigned char)name[pos])) {
+            layer = layer * 10 + (name[pos] - '0');
+            pos++;
+        }
+        return pos < name.size() && name[pos] == '.' ? layer : -1;
+    }
+
+    static int Qwen35StreamingTpLoadGroup(
+            const std::string &tensorName,
+            const std::vector<std::pair<std::string, DataType>> &mappedWeights,
+            int blockCount) {
+        int layer = Qwen35MainLayerFromWeightName(tensorName);
+        if (layer >= 0 && layer < blockCount) {
+            return layer;
+        }
+        bool hasLmHead = tensorName == "lm_head.weight";
+        for (const auto &mapped : mappedWeights) {
+            layer = Qwen35MainLayerFromWeightName(mapped.first);
+            if (layer >= 0 && layer < blockCount) {
+                return layer;
+            }
+            hasLmHead = hasLmHead || mapped.first == "lm_head.weight";
+        }
+        return hasLmHead ? blockCount : -1;
     }
 
     static bool Qwen35MoeParseExpertWeightName(const std::string &name,
@@ -23975,13 +24014,252 @@ namespace fastllm {
         return moeFusedWeightsPrepared;
     }
 
+#ifdef USE_CUDA
+    static void Qwen35PrepareInt4TpShards(
+            Data &data, const std::vector<int> &devices) {
+        if (data.dataType != DataType::INT4_GROUP || !data.multiDeviceData) {
+            return;
+        }
+        for (int device : devices) {
+            auto it = data.multiDeviceDatas.find(device);
+            if (it == data.multiDeviceDatas.end() || it->second == nullptr) {
+                continue;
+            }
+            FastllmCudaPrepareInt4GroupWeight(*it->second);
+        }
+    }
+
+    void Qwen3_5Model::PrepareStreamingTpLayer(
+            int layer, const std::vector<int> &devices,
+            std::map<int, int> ratios) {
+        if (!streamingTpLoadEnabled || layer < 0 || layer >= block_cnt ||
+            devices.size() <= 1) {
+            return;
+        }
+
+        const std::string prefix = language_prefix + "layers." +
+                                   std::to_string(layer) + ".";
+        auto requireWeight = [&](const std::string &name) -> Data & {
+            auto it = this->weight.weight.find(name);
+            AssertInFastLLM(
+                it != this->weight.weight.end() &&
+                    (it->second.cpuData != nullptr || it->second.multiDeviceData),
+                "Qwen3.5 streaming TP load is missing weight " + name + ".\n");
+            return it->second;
+        };
+        auto splitLinear = [&](const std::string &name,
+                               const std::string &biasName,
+                               DivisionScheme &scheme, int axis,
+                               bool explicitRatios) {
+            // Non-explicit schemes may be rotated by layer in-place. Preserve
+            // that update for dependent layouts such as attention o_proj.
+            Data &data = requireWeight(name);
+            Data &bias = GetThreadTensorParallelBias(biasName);
+            std::vector<int> devCopy = devices;
+            const bool directInt4 = data.dataType == DataType::INT4_GROUP;
+            AssertInFastLLM(
+                SplitMultiCudaWeight(data, bias, devCopy, scheme, axis,
+                                     explicitRatios, directInt4),
+                "Qwen3.5 streaming TP load failed to split " + name + ".\n");
+            Qwen35PrepareInt4TpShards(data, devices);
+        };
+
+        const std::string oWeightName = prefix + "self_attn.o_proj.weight";
+        if (this->weight.weight.find(oWeightName) != this->weight.weight.end()) {
+            const std::string mergeQkvWeightName =
+                prefix + "self_attn.mergeqkv.weight";
+            const std::string mergeQkvBiasName =
+                prefix + "self_attn.mergeqkv.bias";
+            DivisionScheme qkvScheme = BuildQwen35GatedAttentionQkvScheme(
+                devices, ratios, num_attention_heads, num_key_value_heads,
+                head_dim);
+            splitLinear(mergeQkvWeightName, mergeQkvBiasName,
+                        qkvScheme, 0, false);
+
+            DivisionScheme oScheme =
+                ExtractQwen35AttentionOutputScheme(qkvScheme);
+            splitLinear(oWeightName, prefix + "self_attn.o_proj.bias",
+                        oScheme, 1, true);
+        } else {
+            const std::string qkvzWeightName =
+                prefix + "linear_attn.in_proj_qkvz.weight";
+            const std::string baWeightName =
+                prefix + "linear_attn.in_proj_ba.weight";
+            const std::string qkvzbaWeightName =
+                prefix + "linear_attn.in_proj_qkvzba.weight";
+            const std::string convWeightName =
+                prefix + "linear_attn.conv1d.weight";
+            const std::string convBiasName =
+                prefix + "linear_attn.conv1d.bias";
+            const std::string aLogName = prefix + "linear_attn.A_log";
+            const std::string dtBiasName = prefix + "linear_attn.dt_bias";
+            const std::string outWeightName =
+                prefix + "linear_attn.out_proj.weight";
+
+            Data &convWeight = requireWeight(convWeightName);
+            if (convWeight.dims.size() == 2) {
+                convWeight.Reshape(
+                    {convWeight.dims[0], 1, convWeight.dims[1]});
+            }
+
+            bool hasMergedGdnInLinear =
+                this->weight.weight.find(qkvzbaWeightName) !=
+                this->weight.weight.end();
+            const bool hasQkvzGdnInLinear =
+                this->weight.weight.find(qkvzWeightName) !=
+                this->weight.weight.end();
+            const bool hasBaGdnInLinear =
+                this->weight.weight.find(baWeightName) !=
+                this->weight.weight.end();
+            AssertInFastLLM(
+                hasMergedGdnInLinear ||
+                    (hasQkvzGdnInLinear && hasBaGdnInLinear),
+                "Qwen3.5 streaming TP load requires qkvzba or qkvz/ba "
+                "weights.\n");
+
+            // Some AWQ checkpoints quantize qkvz but leave ba in BF16. Those
+            // tensors cannot share a merged storage representation, so retain
+            // the separate TP layout already supported by ForwardGPU.
+            if (!hasMergedGdnInLinear) {
+                Data &qkvz = requireWeight(qkvzWeightName);
+                Data &ba = requireWeight(baWeightName);
+                Data &merged = this->weight.weight[qkvzbaWeightName];
+                hasMergedGdnInLinear = CreateMergedLinearWeight(
+                    qkvz, ba, qkvzbaWeightName, merged);
+                if (!hasMergedGdnInLinear) {
+                    this->weight.weight.erase(qkvzbaWeightName);
+                }
+            }
+
+            DivisionScheme keyScheme = BuildQwen35LinearKeyHeadScheme(
+                devices, ratios, num_k_heads);
+            BalanceMultiCudaDivisionSchemeByLayer(
+                hasMergedGdnInLinear ? qkvzbaWeightName : qkvzWeightName,
+                devices, keyScheme);
+            DivisionScheme valueScheme = BuildQwen35LinearValueHeadScheme(
+                keyScheme, num_v_heads / num_k_heads);
+            if (hasMergedGdnInLinear) {
+                DivisionScheme qkvzbaScheme = BuildQwen35LinearQkvzbaScheme(
+                    keyScheme, num_k_heads, num_v_heads, head_k_dim,
+                    head_v_dim);
+                splitLinear(qkvzbaWeightName,
+                            qkvzbaWeightName + ".tp_bias", qkvzbaScheme, 0,
+                            true);
+
+                // The merged tensor is the only form used by this TP layout.
+                this->weight.weight.erase(qkvzWeightName);
+                this->weight.weight.erase(baWeightName);
+            } else {
+                DivisionScheme qkvzScheme = BuildQwen35LinearQkvzScheme(
+                    keyScheme, num_k_heads, num_v_heads, head_k_dim,
+                    head_v_dim);
+                splitLinear(qkvzWeightName, qkvzWeightName + ".tp_bias",
+                            qkvzScheme, 0, true);
+
+                DivisionScheme baScheme = BuildQwen35LinearBaScheme(
+                    valueScheme, num_v_heads);
+                splitLinear(baWeightName, baWeightName + ".tp_bias",
+                            baScheme, 0, true);
+            }
+
+            DivisionScheme convScheme = BuildQwen35LinearConvScheme(
+                keyScheme, num_k_heads, num_v_heads, head_k_dim, head_v_dim);
+            AssertInFastLLM(
+                SplitQwen35Conv1DWeight(convWeight,
+                                       GetThreadTensorParallelBias(convBiasName),
+                                       devices, convScheme),
+                "Qwen3.5 streaming TP load failed to split " +
+                    convWeightName + ".\n");
+            AssertInFastLLM(
+                SplitQwen35VectorWeight(requireWeight(aLogName), devices,
+                                        valueScheme),
+                "Qwen3.5 streaming TP load failed to split " + aLogName +
+                    ".\n");
+            AssertInFastLLM(
+                SplitQwen35VectorWeight(requireWeight(dtBiasName), devices,
+                                        valueScheme),
+                "Qwen3.5 streaming TP load failed to split " + dtBiasName +
+                    ".\n");
+
+            DivisionScheme outScheme =
+                requireWeight(outWeightName).isGGUFData
+                    ? BuildQwen35GgufLinearOutProjScheme(
+                          keyScheme, num_k_heads,
+                          num_v_heads / num_k_heads, head_v_dim)
+                    : BuildQwen35LinearOutProjScheme(valueScheme, head_v_dim);
+            splitLinear(outWeightName, outWeightName + ".tp_bias",
+                        outScheme, 1, true);
+        }
+
+        const std::string gateupWeightName =
+            prefix + "mlp.gateup_proj.weight";
+        const std::string downWeightName = prefix + "mlp.down_proj.weight";
+        Data &gateup = requireWeight(gateupWeightName);
+        gateup.tpLinearType = TP_LINEAR_ROW;
+        gateup.tpPackType = TP_PACK_GATEUP;
+        std::vector<int> devCopy = devices;
+        DivisionScheme gateScheme =
+            BuildMultiCudaRowSplitScheme(gateup, devCopy, ratios);
+        BalanceMultiCudaPairedHalfDivisionSchemeSizesByLayer(
+            gateupWeightName, devices, gateScheme, gateup.dims[0] / 2);
+        splitLinear(gateupWeightName, gateupWeightName + ".tp_bias",
+                    gateScheme, 0, true);
+
+        Data &down = requireWeight(downWeightName);
+        down.tpLinearType = TP_LINEAR_COLUMN;
+        DivisionScheme downScheme = ExtractQwen35FirstRangeScheme(gateScheme);
+        splitLinear(downWeightName, prefix + "mlp.down_proj.bias",
+                    downScheme, 1, true);
+    }
+#endif
+
     void Qwen3_5Model::OnWeightsCreated(const std::set<std::string> &allWeightNames) {
         loadFusedMoePlanned = false;
         loadFusedMoeSourceWeights.clear();
         consumedFusedMoeSourceWeights.clear();
         moeFusedLayerPlanned.clear();
         moeFusedWeightsPrepared = false;
+        streamingTpLoadEnabled = false;
+        streamingTpCurrentLoadGroup = -1;
 #ifdef USE_CUDA
+        std::vector<int> streamingDevices;
+        std::map<int, int> streamingRatios;
+        if (num_experts <= 0 && block_cnt > 0 && !dflashEnabled &&
+            Qwen35DeviceMapAllCuda(this->deviceMap) &&
+            GetQwen35ThreadTpDevices(this->deviceMap, streamingDevices,
+                                     streamingRatios)) {
+            auto has = [&](const std::string &name) {
+                return allWeightNames.find(name) != allWeightNames.end();
+            };
+            bool complete = has("lm_head.weight");
+            for (int layer = 0; layer < block_cnt && complete; layer++) {
+                const std::string prefix = language_prefix + "layers." +
+                                           std::to_string(layer) + ".";
+                const bool hasDenseMlp =
+                    ((has(prefix + "mlp.gate_proj.weight") &&
+                      has(prefix + "mlp.up_proj.weight")) ||
+                     has(prefix + "mlp.gateup_proj.weight")) &&
+                    has(prefix + "mlp.down_proj.weight");
+                const bool hasFullAttention =
+                    has(prefix + "self_attn.q_proj.weight") &&
+                    has(prefix + "self_attn.k_proj.weight") &&
+                    has(prefix + "self_attn.v_proj.weight") &&
+                    has(prefix + "self_attn.o_proj.weight");
+                const bool hasLinearAttention =
+                    has(prefix + "linear_attn.in_proj_qkv.weight") &&
+                    has(prefix + "linear_attn.in_proj_z.weight") &&
+                    has(prefix + "linear_attn.in_proj_b.weight") &&
+                    has(prefix + "linear_attn.in_proj_a.weight") &&
+                    has(prefix + "linear_attn.conv1d.weight") &&
+                    has(prefix + "linear_attn.A_log") &&
+                    has(prefix + "linear_attn.dt_bias") &&
+                    has(prefix + "linear_attn.out_proj.weight");
+                complete = hasDenseMlp &&
+                           (hasFullAttention || hasLinearAttention);
+            }
+            streamingTpLoadEnabled = complete;
+        }
+
         if (Qwen35MoeDisableFusedMoe() ||
             !Qwen35CanPlanFusedMoe(this->deviceMap, this->moeDeviceMap) ||
             block_cnt <= 0 || this->num_experts <= 0) {
@@ -24134,6 +24412,13 @@ namespace fastllm {
     int Qwen3_5Model::GetWeightLoadPriority(
             const std::string &tensorName,
             const std::vector <std::pair <std::string, DataType> > &mappedWeights) const {
+        if (streamingTpLoadEnabled) {
+            const int group = Qwen35StreamingTpLoadGroup(
+                tensorName, mappedWeights, block_cnt);
+            if (group >= 0) {
+                return 100000 + group;
+            }
+        }
         if (!loadFusedMoePlanned) {
             return 0;
         }
@@ -24153,6 +24438,11 @@ namespace fastllm {
     bool Qwen3_5Model::ShouldLoadWeightSeriallyBeforeOthers(
             const std::string &tensorName,
             const std::vector <std::pair <std::string, DataType> > &mappedWeights) const {
+        if (streamingTpLoadEnabled &&
+            Qwen35StreamingTpLoadGroup(
+                tensorName, mappedWeights, block_cnt) >= 0) {
+            return true;
+        }
         if (!loadFusedMoePlanned) {
             return false;
         }
@@ -24168,6 +24458,22 @@ namespace fastllm {
     }
 
     void Qwen3_5Model::OnWeightLoadGroupStarted(const std::set<std::string> &weightNames) {
+        streamingTpCurrentLoadGroup = -1;
+        if (streamingTpLoadEnabled) {
+            for (const auto &weightName : weightNames) {
+                const int layer = Qwen35MainLayerFromWeightName(weightName);
+                const int group = layer >= 0 && layer < block_cnt
+                    ? layer
+                    : (weightName == "lm_head.weight" ? block_cnt : -1);
+                if (group >= 0) {
+                    AssertInFastLLM(
+                        streamingTpCurrentLoadGroup == -1 ||
+                            streamingTpCurrentLoadGroup == group,
+                        "Qwen3.5 streaming TP load group mixed multiple layers.\n");
+                    streamingTpCurrentLoadGroup = group;
+                }
+            }
+        }
         if (!loadFusedMoePlanned || moeFusedWeightsPrepared) {
             return;
         }
@@ -24272,13 +24578,52 @@ namespace fastllm {
     }
 
     void Qwen3_5Model::OnWeightLoadGroupFinished() {
-        if (consumedFusedMoeSourceWeights.empty()) {
-            return;
+        if (!consumedFusedMoeSourceWeights.empty()) {
+            for (auto &weightName : consumedFusedMoeSourceWeights) {
+                this->weight.weight.erase(weightName);
+            }
+            consumedFusedMoeSourceWeights.clear();
         }
-        for (auto &weightName : consumedFusedMoeSourceWeights) {
-            this->weight.weight.erase(weightName);
+
+        const int streamingGroup = streamingTpCurrentLoadGroup;
+        const bool finishedStreamingGroup =
+            streamingTpLoadEnabled && streamingGroup >= 0;
+#ifdef USE_CUDA
+        if (finishedStreamingGroup) {
+            std::vector<int> devices;
+            std::map<int, int> ratios;
+            AssertInFastLLM(
+                GetQwen35ThreadTpDevices(this->deviceMap, devices, ratios),
+                "Qwen3.5 streaming TP device configuration disappeared during load.\n");
+            if (streamingGroup < block_cnt) {
+                PrepareStreamingTpLayer(streamingGroup, devices, ratios);
+            } else if (streamingGroup == block_cnt) {
+                auto lmHeadIt = this->weight.weight.find("lm_head.weight");
+                AssertInFastLLM(lmHeadIt != this->weight.weight.end(),
+                                "Qwen3.5 streaming TP load is missing lm_head.weight.\n");
+                Data &lmHead = lmHeadIt->second;
+                std::vector<int> devCopy = devices;
+                DivisionScheme scheme =
+                    BuildMultiCudaRowSplitScheme(lmHead, devCopy, ratios);
+                Data &bias = GetThreadTensorParallelBias(
+                    "lm_head.weight.tp_bias");
+                AssertInFastLLM(
+                    SplitMultiCudaWeight(
+                        lmHead, bias, devCopy, scheme, 0, true,
+                        lmHead.dataType == DataType::INT4_GROUP),
+                    "Qwen3.5 streaming TP load failed to split lm_head.weight.\n");
+                Qwen35PrepareInt4TpShards(lmHead, devices);
+            }
         }
-        consumedFusedMoeSourceWeights.clear();
+#endif
+        streamingTpCurrentLoadGroup = -1;
+#if defined(__linux__) && defined(__GLIBC__)
+        if (finishedStreamingGroup) {
+            // Return this decoder/lm_head group's temporary loader allocations
+            // before reading the next group.
+            malloc_trim(0);
+        }
+#endif
     }
 
     void Qwen3_5Model::RestoreGgufGdnWeights() {
@@ -25939,9 +26284,9 @@ namespace fastllm {
                 FastllmCudaSetDevice(tpDevice);
                 ToDataType(*local, DataType::FLOAT16);
             }
-            // SplitMultiCudaWeight keeps the parent as logical metadata. Its
-            // CPU mapping may still contain BF16 bytes, but all runtime reads
-            // use the distributed local tensors after this point.
+            // SplitMultiCudaWeight keeps the parent as logical metadata and
+            // may release its source CPU storage. All runtime reads use the
+            // distributed local tensors after this point.
             linearWeight.dataType = DataType::FLOAT16;
             linearWeight.UpdateUnitSize();
             convertedTpWeights++;

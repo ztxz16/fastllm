@@ -1030,6 +1030,8 @@ namespace {
         const std::string shapeName = prefix + ".weight_shape";
         constexpr uint64_t lmHeadBytes =
             2 * 32 * sizeof(uint16_t);
+        constexpr uint64_t embeddingBytes =
+            2 * 32 * sizeof(uint16_t);
         constexpr uint64_t packedBytes =
             rows * packedColumns * sizeof(uint32_t);
         constexpr uint64_t scaleBytes =
@@ -1037,13 +1039,17 @@ namespace {
         constexpr uint64_t zeroBytes =
             packedZeroRows * groups * sizeof(uint32_t);
         constexpr uint64_t shapeBytes = 2 * sizeof(int64_t);
-        const uint64_t packedBegin = lmHeadBytes;
+        const uint64_t embeddingBegin = lmHeadBytes;
+        const uint64_t packedBegin = embeddingBegin + embeddingBytes;
         const uint64_t scaleBegin = packedBegin + packedBytes;
         const uint64_t zeroBegin = scaleBegin + scaleBytes;
         const uint64_t shapeBegin = zeroBegin + zeroBytes;
         std::string header =
             "{\"lm_head.weight\":{\"dtype\":\"BF16\",\"shape\":[2,32],\"data_offsets\":[0," +
-            std::to_string(lmHeadBytes) + "]},\"" + packedName +
+            std::to_string(lmHeadBytes) +
+            "]},\"model.embed_tokens.weight\":{\"dtype\":\"BF16\",\"shape\":[2,32],\"data_offsets\":[" +
+            std::to_string(embeddingBegin) + "," +
+            std::to_string(packedBegin) + "]},\"" + packedName +
             "\":{\"dtype\":\"I32\",\"shape\":[32,8],\"data_offsets\":[" +
             std::to_string(packedBegin) + "," +
             std::to_string(scaleBegin) + "]},\"" + scaleName +
@@ -1061,6 +1067,11 @@ namespace {
         }
 
         std::vector<uint16_t> lmHead(2 * 32, 0);
+        std::vector<uint16_t> embedding(2 * 32);
+        for (int i = 0; i < (int)embedding.size(); i++) {
+            embedding[i] = fastllm::Float32ToBFloat16RNEBits(
+                ((float)i - 16.0f) / 8.0f);
+        }
         std::vector<uint32_t> packed(rows * packedColumns, 0);
         for (int row = 0; row < rows; row++) {
             for (int column = 0; column < columns; column++) {
@@ -1104,6 +1115,9 @@ namespace {
             reinterpret_cast<const char*>(lmHead.data()),
             lmHeadBytes);
         output.write(
+            reinterpret_cast<const char*>(embedding.data()),
+            embeddingBytes);
+        output.write(
             reinterpret_cast<const char*>(packed.data()),
             packedBytes);
         output.write(
@@ -1128,6 +1142,23 @@ namespace {
             fastllm::DataType::DATA_AUTO_SOURCE, -1, true);
         Expect(model != nullptr && model->model_type == "laguna",
                "affine packed INT4 fixture did not create a Laguna model.");
+
+        auto embedding = model->weight.weight.find(
+            "model.embed_tokens.weight");
+        Expect(embedding != model->weight.weight.end() &&
+                   embedding->second.dataType ==
+                       fastllm::DataType::BFLOAT16 &&
+                   embedding->second.cpuData != nullptr &&
+                   embedding->second.GetBytes() == 2 * 32 * sizeof(uint16_t),
+               "auto safetensors embedding did not preserve its native BF16 storage.");
+        const uint16_t *embeddingData =
+            (const uint16_t*)embedding->second.cpuData;
+        for (int i = 0; i < 2 * 32; i++) {
+            const uint16_t expected = fastllm::Float32ToBFloat16RNEBits(
+                ((float)i - 16.0f) / 8.0f);
+            Expect(embeddingData[i] == expected,
+                   "auto BF16 embedding payload changed during load.");
+        }
 
         const std::string weightName =
             "model.layers.0.moe.experts.0.down_proj.weight";
@@ -8353,55 +8384,80 @@ namespace {
 
         const int originalDevice = FastllmCudaGetDevice();
         FastllmCudaSetDevice(0);
-        fastllm::Data weight(fastllm::DataType::INT4_GROUP, {rows, columns});
-        weight.name = "regression.int4_group_column_split.weight";
-        weight.group = globalGroup;
-        weight.groupCnt = groupCnt;
-        weight.perChannelAxis = 0;
-        weight.scales.resize(rows * globalGroup);
-        weight.mins.resize(rows * globalGroup);
-        weight.zeros.resize(rows * globalGroup);
-        weight.Allocate(true);
-        for (int row = 0; row < rows; row++) {
-            for (int group = 0; group < globalGroup; group++) {
-                size_t index = static_cast<size_t>(row) * globalGroup + group;
-                weight.scales[index] = 100.0f * row + group + 0.25f;
-                weight.mins[index] = -100.0f * row - group - 0.5f;
-                weight.zeros[index] = row * globalGroup + group + 1;
+        auto runSplit = [&](bool moveSourceToCuda) {
+            fastllm::Data weight(
+                fastllm::DataType::INT4_GROUP, {rows, columns});
+            weight.name = "regression.int4_group_column_split.weight";
+            weight.group = globalGroup;
+            weight.groupCnt = groupCnt;
+            weight.perChannelAxis = 0;
+            weight.isModelWeight = true;
+            weight.scales.resize(rows * globalGroup);
+            weight.mins.resize(rows * globalGroup);
+            weight.zeros.resize(rows * globalGroup);
+            weight.Allocate(true);
+            for (int row = 0; row < rows; row++) {
+                for (int group = 0; group < globalGroup; group++) {
+                    size_t index =
+                        static_cast<size_t>(row) * globalGroup + group;
+                    weight.scales[index] = 100.0f * row + group + 0.25f;
+                    weight.mins[index] = -100.0f * row - group - 0.5f;
+                    weight.zeros[index] = row * globalGroup + group + 1;
+                }
             }
-        }
-        weight.ToDevice(fastllm::DataDevice::CUDA, {0});
-
-        fastllm::Data bias;
-        std::vector<int> devices = {0};
-        DivisionScheme scheme;
-        scheme[0] = {{splitBegin, splitEnd}};
-        Expect(SplitMultiCudaWeight(weight, bias, devices, scheme, 1, true),
-               "failed to split INT4_GROUP weight by columns");
-
-        auto localIt = weight.multiDeviceDatas.find(0);
-        Expect(localIt != weight.multiDeviceDatas.end() && localIt->second != nullptr,
-               "INT4_GROUP column split did not create the local tensor");
-        fastllm::Data *local = localIt->second;
-        Expect(local->dims == std::vector<int>({rows, localColumns}),
-               "INT4_GROUP column split produced the wrong local shape");
-        Expect(local->group == localGroup && local->groupCnt == groupCnt,
-               "INT4_GROUP column split kept the global group count");
-        Expect(local->scales.size() == static_cast<size_t>(rows * localGroup) &&
-                   local->mins.size() == static_cast<size_t>(rows * localGroup) &&
-                   local->zeros.size() == static_cast<size_t>(rows * localGroup),
-               "INT4_GROUP column split produced the wrong quantization metadata shape");
-        for (int row = 0; row < rows; row++) {
-            for (int group = 0; group < localGroup; group++) {
-                size_t localIndex = static_cast<size_t>(row) * localGroup + group;
-                size_t sourceIndex = static_cast<size_t>(row) * globalGroup +
-                                     splitBegin / groupCnt + group;
-                Expect(local->scales[localIndex] == weight.scales[sourceIndex] &&
-                           local->mins[localIndex] == weight.mins[sourceIndex] &&
-                           local->zeros[localIndex] == weight.zeros[sourceIndex],
-                       "INT4_GROUP column split copied quantization metadata from the wrong row/group");
+            const std::vector<float> expectedScales = weight.scales;
+            const std::vector<float> expectedMins = weight.mins;
+            const std::vector<int> expectedZeros = weight.zeros;
+            if (moveSourceToCuda) {
+                weight.ToDevice(fastllm::DataDevice::CUDA, {0});
             }
-        }
+
+            fastllm::Data bias;
+            std::vector<int> devices = {0};
+            DivisionScheme scheme;
+            scheme[0] = {{splitBegin, splitEnd}};
+            Expect(SplitMultiCudaWeight(
+                       weight, bias, devices, scheme, 1, true),
+                   "failed to split INT4_GROUP weight by columns");
+            Expect(weight.cpuData == nullptr && weight.scales.empty() &&
+                       weight.mins.empty() && weight.zeros.empty(),
+                   "INT4_GROUP TP parent retained its source or quantization metadata");
+
+            auto localIt = weight.multiDeviceDatas.find(0);
+            Expect(localIt != weight.multiDeviceDatas.end() &&
+                       localIt->second != nullptr,
+                   "INT4_GROUP column split did not create the local tensor");
+            fastllm::Data *local = localIt->second;
+            Expect(local->dims == std::vector<int>({rows, localColumns}),
+                   "INT4_GROUP column split produced the wrong local shape");
+            Expect(local->group == localGroup && local->groupCnt == groupCnt,
+                   "INT4_GROUP column split kept the global group count");
+            Expect(local->scales.size() ==
+                           static_cast<size_t>(rows * localGroup) &&
+                       local->mins.size() ==
+                           static_cast<size_t>(rows * localGroup) &&
+                       local->zeros.size() ==
+                           static_cast<size_t>(rows * localGroup),
+                   "INT4_GROUP column split produced the wrong quantization metadata shape");
+            for (int row = 0; row < rows; row++) {
+                for (int group = 0; group < localGroup; group++) {
+                    size_t localIndex =
+                        static_cast<size_t>(row) * localGroup + group;
+                    size_t sourceIndex =
+                        static_cast<size_t>(row) * globalGroup +
+                        splitBegin / groupCnt + group;
+                    Expect(local->scales[localIndex] ==
+                                   expectedScales[sourceIndex] &&
+                               local->mins[localIndex] ==
+                                   expectedMins[sourceIndex] &&
+                               local->zeros[localIndex] ==
+                                   expectedZeros[sourceIndex],
+                           "INT4_GROUP column split copied quantization metadata from the wrong row/group");
+                }
+            }
+        };
+        runSplit(false);
+        runSplit(true);
 
         FastllmCudaSetDevice(originalDevice);
     }
@@ -10491,6 +10547,8 @@ namespace {
         fastllm::Data floatWeight(fastllm::DataType::FLOAT32,
                                   {outputDim, inputDim}, floatWeightValues);
         quantWeight.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{0}, true);
+        const bool eagerlyPrepared =
+            FastllmCudaPrepareInt4GroupWeight(quantWeight);
         fastllm::Data emptyBias;
 
         for (int batch : {1, 3, 33}) {
@@ -10524,8 +10582,13 @@ namespace {
                 cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, cudaDevice) == cudaSuccess &&
                 cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, cudaDevice) == cudaSuccess &&
                 major * 10 + minor >= 75) {
+                Expect(eagerlyPrepared,
+                       "CUDA INT4_GROUP(32) eager preparation failed on SM75+.");
                 Expect(quantWeight.cudaData == nullptr,
                        "CUDA INT4_GROUP(32) regression did not select Marlin on SM75+.");
+                Expect(quantWeight.scales.empty() && quantWeight.mins.empty() &&
+                           quantWeight.zeros.empty(),
+                       "CUDA INT4_GROUP(32) Marlin weight retained host quantization metadata.");
             }
 #endif
             ExpectFloatNear(ToFloatVector(expected), ToFloatVector(actual),

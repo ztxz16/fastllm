@@ -332,6 +332,8 @@ namespace fastllm {
         std::vector <std::map <int, std::vector <std::pair <int, int> > > > threadTpLinearConvSchemes;
         std::map <int, std::vector <std::pair <int, int> > > threadTpLmHeadScheme;
         std::vector <uint8_t> threadTpLinearAttentionLayers;
+        bool streamingTpLoadEnabled = false;
+        int streamingTpCurrentLoadGroup = -1;
         std::unordered_map <int, Data*> mtpDraftLmHeadWeights;
         PersistentWorkerGroup threadTpWorkerGroup;
 
@@ -380,6 +382,11 @@ namespace fastllm {
                                               std::map <int, int> ratios);
         void RestoreGgufGdnWeights();
         void PrepareGdnWeights();
+#ifdef USE_CUDA
+        void PrepareStreamingTpLayer(
+                int layer, const std::vector<int> &devices,
+                std::map<int, int> ratios);
+#endif
         void PrepareVision();
         Data BuildFlattenedPositionIds(const std::vector <Data*> &positionIds,
                                       const std::vector <int> &seqLens,

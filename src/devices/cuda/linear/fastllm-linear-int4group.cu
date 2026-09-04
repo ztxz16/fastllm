@@ -394,6 +394,19 @@ static std::unordered_map<const fastllm::Data*, void*> g_sm70AwqHandles;
 // 重排成功后释放原始 INT4_GROUP 权重，定义在后面，这里前置声明。
 static void FastllmCudaInt4GroupReleaseOriginalWeight(fastllm::Data &weight);
 
+static void FastllmCudaInt4GroupReleaseHostMetadata(fastllm::Data &weight) {
+    std::vector<float>().swap(weight.scales);
+    std::vector<float>().swap(weight.mins);
+    std::vector<int>().swap(weight.zeros);
+    std::vector<fastllm::LowBitConfig>().swap(weight.perChannelsConfigs);
+    std::vector<int>().swap(weight.weightSum);
+}
+
+static bool FastllmCudaInt4GroupHasSm70AwqOnDevice(const fastllm::Data &weight) {
+    auto it = g_sm70AwqHandles.find(&weight);
+    return it != g_sm70AwqHandles.end() && it->second != nullptr;
+}
+
 // weight: [k, m] 每字节两个 nibble（输出在外、输入在内），偶数输入在高位。
 // 输出 out: [K=m, N=k] 行主序，out[in * k + outIdx] = 该 (输入 in, 输出 outIdx) 的 4bit 值。
 __global__ void FastllmInt4GroupToAwqU16Kernel(const uint8_t *weight, uint16_t *out, int m, int k) {
@@ -1036,6 +1049,50 @@ static half *FastllmCudaInt4GroupEnsureHalfBiasDataOnDevice(fastllm::Data &weigh
         weight.extraCudaHalfData[INT4GROUP_HALF_BIAS_IDX] = (void*)cudaBiasData;
     }
     return (half*)weight.extraCudaHalfData[INT4GROUP_HALF_BIAS_IDX];
+}
+
+bool FastllmCudaPrepareInt4GroupWeight(fastllm::Data &weight) {
+    if (weight.dataType != fastllm::DataType::INT4_GROUP ||
+        weight.dims.size() != 2 || weight.dataDeviceIds.empty()) {
+        return false;
+    }
+
+    // Routed experts still need their source AWQ tensors for the fused decode
+    // pointer table, so they must not be eagerly converted to either backend.
+    const bool routedMoeWeight =
+        weight.name.find(".mlp.experts.") != std::string::npos ||
+        weight.name.find(".block_sparse_moe.experts.") != std::string::npos;
+    if (routedMoeWeight) {
+        return false;
+    }
+
+    const int previousDevice = FastllmCudaGetDevice();
+    const int device = weight.dataDeviceIds.front();
+    FastllmCudaSetDevice(device);
+    const int k = weight.dims[0];
+    const int m = weight.dims[1];
+    const int group = weight.group;
+    const bool hasZeroPoints =
+        group > 0 && weight.zeros.size() == (size_t)k * group;
+
+    bool prepared = FastllmCudaInt4GroupHasMarlinOnDevice(weight);
+    if (!prepared && weight.cudaData != nullptr && hasZeroPoints &&
+        FastllmCudaInt4GroupMarlinEnabled(1, m, k, weight.groupCnt)) {
+        prepared = FastllmCudaInt4GroupEnsureMarlinOnDevice(weight, m, k);
+    }
+    if (!prepared) {
+        prepared = FastllmCudaInt4GroupHasSm70AwqOnDevice(weight);
+    }
+    if (!prepared && weight.cudaData != nullptr && hasZeroPoints &&
+        FastllmCudaInt4GroupSm70AwqEnabled(1, m, k, weight.groupCnt)) {
+        prepared = FastllmCudaInt4GroupEnsureSm70AwqOnDevice(weight, m, k);
+    }
+    if (prepared) {
+        FastllmCudaInt4GroupReleaseHostMetadata(weight);
+    }
+
+    FastllmCudaSetDevice(previousDevice);
+    return prepared;
 }
 
 static void FastllmCudaInt4GroupEnsureHalfBiasOnDevice(fastllm::Data &weight, const fastllm::Data &bias, int k) {
@@ -1925,13 +1982,18 @@ bool FastllmCudaHalfMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Da
     // device-side expert pointer table needed by the fused path.
     bool routedMoeWeight = weight.name.find(".mlp.experts.") != std::string::npos ||
                            weight.name.find(".block_sparse_moe.experts.") != std::string::npos;
-    bool useMarlin = weight.zeros.size() == (size_t)k * group &&
-                     !routedMoeWeight &&
-                     FastllmCudaInt4GroupMarlinEnabled(n, m, k, groupCnt) &&
-                     FastllmCudaInt4GroupEnsureMarlinOnDevice(weight, m, k);
-    bool useSm70Awq = !useMarlin && weight.zeros.size() == (size_t)k * group &&
-                      FastllmCudaInt4GroupSm70AwqEnabled(n, m, k, groupCnt) &&
-                      FastllmCudaInt4GroupEnsureSm70AwqOnDevice(weight, m, k);
+    const bool hasMarlin = FastllmCudaInt4GroupHasMarlinOnDevice(weight);
+    bool useMarlin = !routedMoeWeight &&
+                     (hasMarlin ||
+                      (weight.zeros.size() == (size_t)k * group &&
+                       FastllmCudaInt4GroupMarlinEnabled(n, m, k, groupCnt) &&
+                       FastllmCudaInt4GroupEnsureMarlinOnDevice(weight, m, k)));
+    const bool hasSm70Awq = FastllmCudaInt4GroupHasSm70AwqOnDevice(weight);
+    bool useSm70Awq = !useMarlin &&
+                      (hasSm70Awq ||
+                       (weight.zeros.size() == (size_t)k * group &&
+                        FastllmCudaInt4GroupSm70AwqEnabled(n, m, k, groupCnt) &&
+                        FastllmCudaInt4GroupEnsureSm70AwqOnDevice(weight, m, k)));
     if (!useMarlin && !useSm70Awq) {
         if (weight.cudaData == nullptr) {
             FastllmCudaInt4GroupFallbackUnavailable();
