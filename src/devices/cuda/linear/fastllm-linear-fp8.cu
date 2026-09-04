@@ -1586,7 +1586,7 @@ __global__ void FastllmCudaFP8E4M32BF16Kernel(uint8_t* a, float *scales, __nv_bf
     }
 }
 
-template <int THREAD_PER_BLOCK, int PART>
+template <int THREAD_PER_BLOCK, int PART, bool USE_WARP_REDUCE = false>
 __global__ void FastllmGemvBF16FP8E4M3Kernel1MultiRow(__nv_bfloat16 *A, uint8_t *B, __nv_bfloat16 *C,
                                                     __nv_bfloat16 *bias, float *scales,
                                                     int m, int k, int blockM, int blockK) {
@@ -1625,58 +1625,234 @@ __global__ void FastllmGemvBF16FP8E4M3Kernel1MultiRow(__nv_bfloat16 *A, uint8_t 
     }
     __syncthreads();
 
-    float diff[PART];
+    if constexpr (USE_WARP_REDUCE && THREAD_PER_BLOCK == 64) {
+        float sums[PART];
+        float diff[PART];
 #pragma unroll
-    for (int x = 0; x < PART; x++) diff[x] = 0.0f;
-    for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            #pragma unroll
+        for (int x = 0; x < PART; x++) {
+            sums[x] = sdata[x][tid];
+            diff[x] = 0.0f;
+        }
+
+        // Keep the same binary reduction tree and compensation order as the
+        // shared-memory implementation.  Only the intra-warp communication is
+        // replaced with shuffles after the two warps have been combined.
+        if (tid < 32) {
+#pragma unroll
             for (int x = 0; x < PART; x++) {
-                float other = sdata[x][tid + s] - diff[x];
-                float sumTmp = sdata[x][tid] + other;
-                diff[x] = (sumTmp - sdata[x][tid]) - other;
-                sdata[x][tid] = sumTmp;
+                float other = sdata[x][tid + 32] - diff[x];
+                float sumTmp = sums[x] + other;
+                diff[x] = (sumTmp - sums[x]) - other;
+                sums[x] = sumTmp;
+            }
+            for (int offset = 16; offset > 0; offset >>= 1) {
+#pragma unroll
+                for (int x = 0; x < PART; x++) {
+                    float source = __shfl_down_sync(
+                        0xffffffffu, sums[x], offset);
+                    if (tid < (unsigned int)offset) {
+                        float other = source - diff[x];
+                        float sumTmp = sums[x] + other;
+                        diff[x] = (sumTmp - sums[x]) - other;
+                        sums[x] = sumTmp;
+                    }
+                }
             }
         }
-        __syncthreads();
-    }
 
-    if (tid == 0) {
-        if (bias == nullptr) {
-            for (int x = 0; x < PART; x++) C[st + k * x] = __float2bfloat16_rn(sdata[x][0] * magicScaleConstant);
-        } else {
+        if (tid == 0) {
+            if (bias == nullptr) {
 #pragma unroll
-            for (int x = 0; x < PART; x++) C[st + k * x] = __float2bfloat16_rn(sdata[x][0] * magicScaleConstant + __bfloat162float(bias[st]));
+                for (int x = 0; x < PART; x++) C[st + k * x] = __float2bfloat16_rn(sums[x] * magicScaleConstant);
+            } else {
+#pragma unroll
+                for (int x = 0; x < PART; x++) C[st + k * x] = __float2bfloat16_rn(sums[x] * magicScaleConstant + __bfloat162float(bias[st]));
+            }
+        }
+    } else {
+        float diff[PART];
+#pragma unroll
+        for (int x = 0; x < PART; x++) diff[x] = 0.0f;
+        for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
+            if (tid < s) {
+#pragma unroll
+                for (int x = 0; x < PART; x++) {
+                    float other = sdata[x][tid + s] - diff[x];
+                    float sumTmp = sdata[x][tid] + other;
+                    diff[x] = (sumTmp - sdata[x][tid]) - other;
+                    sdata[x][tid] = sumTmp;
+                }
+            }
+            __syncthreads();
+        }
+
+        if (tid == 0) {
+            if (bias == nullptr) {
+#pragma unroll
+                for (int x = 0; x < PART; x++) C[st + k * x] = __float2bfloat16_rn(sdata[x][0] * magicScaleConstant);
+            } else {
+#pragma unroll
+                for (int x = 0; x < PART; x++) C[st + k * x] = __float2bfloat16_rn(sdata[x][0] * magicScaleConstant + __bfloat162float(bias[st]));
+            }
         }
     }
+}
+
+// Each physical warp emulates both warps of the established 64-thread
+// kernel for one output channel.  Keeping two independent partial sums and
+// the same compensated reduction tree makes this path bitwise identical,
+// while grouping several output channels into one CUDA block removes half
+// of the resident warps and all shared-memory barriers.
+template <int WARPS_PER_BLOCK, int PART>
+__global__ void FastllmGemvBF16FP8E4M3KernelWarpRows(
+        const __nv_bfloat16 * __restrict__ A,
+        const uint8_t * __restrict__ B,
+        __nv_bfloat16 * __restrict__ C,
+        const __nv_bfloat16 * __restrict__ bias,
+        const float * __restrict__ scales,
+        int m, int k, int blockM, int blockK) {
+    const int warpId = threadIdx.x >> 5;
+    const int laneId = threadIdx.x & 31;
+    const int st = blockIdx.x * WARPS_PER_BLOCK + warpId;
+    if (st >= k) {
+        return;
+    }
+
+    const int ms = (m - 1) / blockM + 1;
+    const float *rowScales = scales + (st / blockK) * ms;
+    const uint8_t *baseB = B + (size_t)st * m;
+    float partial[2][PART];
+#pragma unroll
+    for (int virtualWarp = 0; virtualWarp < 2; virtualWarp++) {
+#pragma unroll
+        for (int x = 0; x < PART; x++) {
+            partial[virtualWarp][x] = 0.0f;
+        }
+        const int virtualTid = laneId + virtualWarp * 32;
+        union_bf16_4_fp8 regA;
+        for (int i = virtualTid * 4; i < m; i += 64 * 4) {
+            const float curScale = rowScales[i / blockM];
+            const uint32_t bb = *(const uint32_t*)(baseB + i);
+            const uint16_t b0Bits =
+                (((bb >> 0) & 0x80) << 8) | (((bb >> 0) & 0x7F) << 4);
+            const uint16_t b1Bits =
+                (((bb >> 8) & 0x80) << 8) | (((bb >> 8) & 0x7F) << 4);
+            const uint16_t b2Bits =
+                (((bb >> 16) & 0x80) << 8) | (((bb >> 16) & 0x7F) << 4);
+            const uint16_t b3Bits =
+                (((bb >> 24) & 0x80) << 8) | (((bb >> 24) & 0x7F) << 4);
+            const float bf0 = __bfloat162float(
+                *reinterpret_cast<const __nv_bfloat16*>(&b0Bits));
+            const float bf1 = __bfloat162float(
+                *reinterpret_cast<const __nv_bfloat16*>(&b1Bits));
+            const float bf2 = __bfloat162float(
+                *reinterpret_cast<const __nv_bfloat16*>(&b2Bits));
+            const float bf3 = __bfloat162float(
+                *reinterpret_cast<const __nv_bfloat16*>(&b3Bits));
+#pragma unroll
+            for (int x = 0; x < PART; x++) {
+                regA.in = *reinterpret_cast<const uint2*>(
+                    A + (size_t)x * m + i);
+                partial[virtualWarp][x] +=
+                    (__bfloat162float(regA.out[0]) * bf0 +
+                     __bfloat162float(regA.out[1]) * bf1 +
+                     __bfloat162float(regA.out[2]) * bf2 +
+                     __bfloat162float(regA.out[3]) * bf3) * curScale;
+            }
+        }
+    }
+
+    const float magicScaleConstant = exp2f(120.0f);
+#pragma unroll
+    for (int x = 0; x < PART; x++) {
+        float sum = partial[0][x];
+        float diff = 0.0f;
+        float other = partial[1][x] - diff;
+        float sumTmp = sum + other;
+        diff = (sumTmp - sum) - other;
+        sum = sumTmp;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            const float source = __shfl_down_sync(
+                0xffffffffu, sum, offset);
+            if (laneId < offset) {
+                other = source - diff;
+                sumTmp = sum + other;
+                diff = (sumTmp - sum) - other;
+                sum = sumTmp;
+            }
+        }
+        if (laneId == 0) {
+            float result = sum * magicScaleConstant;
+            if (bias != nullptr) {
+                result += __bfloat162float(bias[st]);
+            }
+            C[st + (size_t)k * x] = __float2bfloat16_rn(result);
+        }
+    }
+}
+
+template <int PART>
+static void LaunchFastllmGemmBF16FP8E4M3SmallBatch(
+        __nv_bfloat16 *input, uint8_t *weight, __nv_bfloat16 *output,
+        __nv_bfloat16 *bias, float *scales, int m, int k,
+        int blockM, int blockK) {
+    if constexpr (PART == 6) {
+        // Halving the resident warps wins when there is ample output-level
+        // parallelism and each warp's two virtual halves stay short.  Keep
+        // the 64-thread kernel for narrow or reduction-heavy projections.
+        if (k >= 2048 && m <= k / 2) {
+            constexpr int warpsPerBlock = 8;
+            const int grid =
+                (k + warpsPerBlock - 1) / warpsPerBlock;
+            FastllmGemvBF16FP8E4M3KernelWarpRows<warpsPerBlock, PART>
+                <<<grid, warpsPerBlock * 32>>>(
+                    input, weight, output, bias, scales,
+                    m, k, blockM, blockK);
+            return;
+        }
+    }
+    if constexpr (PART >= 3 && PART <= 6) {
+        // At six rows, narrow-output GEMVs are launch/memory dominated and
+        // the shuffle variant can regress on some GPUs.  Keep the established
+        // path below 2048 outputs; all smaller PART variants remain enabled.
+        if (PART < 6 || k >= 2048) {
+            FastllmGemvBF16FP8E4M3Kernel1MultiRow<64, PART, true>
+                <<<k, 64>>>(input, weight, output, bias, scales,
+                            m, k, blockM, blockK);
+            return;
+        }
+    }
+    FastllmGemvBF16FP8E4M3Kernel1MultiRow<64, PART, false>
+        <<<k, 64>>>(input, weight, output, bias, scales,
+                    m, k, blockM, blockK);
 }
 
 void LaunchFastllmGemmBF16FP8E4M3(__nv_bfloat16 *input, uint8_t *weight, __nv_bfloat16 *output, __nv_bfloat16 *bias, float *scales, int n, int m, int k, int blockM, int blockK) {
     if (n > 1 &&
         n < fastllm::FastllmCudaGetLinearExactBatchThreshold()) {
         for (int i = 0; i < n; ++i) {
-            FastllmGemvBF16FP8E4M3Kernel1MultiRow<64, 1>
-                <<<k, 64>>>(input + i * m, weight, output + i * k,
-                            bias, scales, m, k, blockM, blockK);
+            LaunchFastllmGemmBF16FP8E4M3SmallBatch<1>(
+                input + i * m, weight, output + i * k, bias, scales,
+                m, k, blockM, blockK);
         }
         return;
     }
     if (n == 1) {
-        FastllmGemvBF16FP8E4M3Kernel1MultiRow<64, 1> <<< k, 64 >>>(input, weight, output, bias, scales, m, k, blockM, blockK);
+        LaunchFastllmGemmBF16FP8E4M3SmallBatch<1>(input, weight, output, bias, scales, m, k, blockM, blockK);
     } else if (n == 2) {
-        FastllmGemvBF16FP8E4M3Kernel1MultiRow<64, 2> <<< k, 64 >>>(input, weight, output, bias, scales, m, k, blockM, blockK);
+        LaunchFastllmGemmBF16FP8E4M3SmallBatch<2>(input, weight, output, bias, scales, m, k, blockM, blockK);
     } else if (n == 3) {
-        FastllmGemvBF16FP8E4M3Kernel1MultiRow<64, 3> <<< k, 64 >>>(input, weight, output, bias, scales, m, k, blockM, blockK);
+        LaunchFastllmGemmBF16FP8E4M3SmallBatch<3>(input, weight, output, bias, scales, m, k, blockM, blockK);
     } else if (n == 4) {
-        FastllmGemvBF16FP8E4M3Kernel1MultiRow<64, 4> <<< k, 64 >>>(input, weight, output, bias, scales, m, k, blockM, blockK);
+        LaunchFastllmGemmBF16FP8E4M3SmallBatch<4>(input, weight, output, bias, scales, m, k, blockM, blockK);
     } else if (n == 5) {
-        FastllmGemvBF16FP8E4M3Kernel1MultiRow<64, 5> <<< k, 64 >>>(input, weight, output, bias, scales, m, k, blockM, blockK);
+        LaunchFastllmGemmBF16FP8E4M3SmallBatch<5>(input, weight, output, bias, scales, m, k, blockM, blockK);
     } else if (n == 6) {
-        FastllmGemvBF16FP8E4M3Kernel1MultiRow<64, 6> <<< k, 64 >>>(input, weight, output, bias, scales, m, k, blockM, blockK);
+        LaunchFastllmGemmBF16FP8E4M3SmallBatch<6>(input, weight, output, bias, scales, m, k, blockM, blockK);
     } else if (n == 7) {
-        FastllmGemvBF16FP8E4M3Kernel1MultiRow<64, 7> <<< k, 64 >>>(input, weight, output, bias, scales, m, k, blockM, blockK);
+        LaunchFastllmGemmBF16FP8E4M3SmallBatch<7>(input, weight, output, bias, scales, m, k, blockM, blockK);
     } else if (n == 8) {
-        FastllmGemvBF16FP8E4M3Kernel1MultiRow<64, 8> <<< k, 64 >>>(input, weight, output, bias, scales, m, k, blockM, blockK);
+        LaunchFastllmGemmBF16FP8E4M3SmallBatch<8>(input, weight, output, bias, scales, m, k, blockM, blockK);
     } else if (n == 9) {
         FastllmGemvBF16FP8E4M3Kernel1MultiRow<64, 9> <<< k, 64 >>>(input, weight, output, bias, scales, m, k, blockM, blockK);
     } else if (n == 10) {

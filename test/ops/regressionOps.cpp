@@ -3343,6 +3343,129 @@ namespace {
         return data;
     }
 
+#ifndef USE_ROCM
+    fastllm::Data MakeCudaFp8E4M3Weight(
+            int outputDim, int inputDim, int blockK, int blockM) {
+        fastllm::Data weight(
+            fastllm::DataType::FP8_E4M3, {outputDim, inputDim});
+        weight.weightType = fastllm::WeightType::LINEAR;
+        weight.blockK = blockK;
+        weight.blockM = blockM;
+        weight.scales.resize(
+            (size_t)((outputDim + blockK - 1) / blockK) *
+            ((inputDim + blockM - 1) / blockM));
+        for (size_t i = 0; i < weight.scales.size(); i++) {
+            weight.scales[i] =
+                0.001953125f * (float)(1 + (i * 7 + i / 3) % 5);
+        }
+        weight.Allocate(false);
+        for (size_t i = 0; i < (size_t)outputDim * inputDim; i++) {
+            int exponent = 3 + (int)((i * 5 + i / 97) % 6);
+            int mantissa = (int)((i * 11 + i / 29) & 7);
+            uint8_t value = (uint8_t)((exponent << 3) | mantissa);
+            if ((i * 13 + i / 17) & 1) {
+                value |= 0x80;
+            }
+            weight.cpuData[i] = value;
+        }
+        weight.ToDevice(fastllm::DataDevice::CUDA);
+        return weight;
+    }
+
+    std::vector<uint8_t> RunCudaBFloat16Fp8LinearPath(
+            fastllm::Data &input, fastllm::Data &weight,
+            const fastllm::Data &bias, int rows, int inputDim,
+            int outputDim) {
+        fastllm::Data output = MakeCudaTensor(
+            fastllm::DataType::BFLOAT16, {rows, outputDim},
+            std::vector<float>((size_t)rows * outputDim, 0.0f));
+        Expect(FastllmCudaBFloat16MatMulFP8E4M3(
+                   input, weight, bias, output,
+                   rows, inputDim, outputDim),
+               "CUDA BF16 x FP8 E4M3 linear rejected input");
+        FastllmCudaSyncCurrentThreadStream();
+        output.ToDevice(fastllm::DataDevice::CPU);
+        std::vector<uint8_t> bytes(output.GetBytes());
+        std::memcpy(bytes.data(), output.cpuData, bytes.size());
+        return bytes;
+    }
+
+    void RunCudaBFloat16Fp8WarpReduceRegression() {
+        FastllmCudaSetDevice(0);
+        const int savedExactBatchThreshold =
+            fastllm::FastllmCudaGetLinearExactBatchThreshold();
+        struct Shape {
+            int inputDim;
+            int outputDim;
+            int blockK;
+            int blockM;
+            bool hasBias;
+        };
+        const std::vector<Shape> shapes = {
+            {256, 65, 16, 64, false},
+            {516, 129, 128, 128, true},
+            {1024, 4096, 128, 128, false},
+            {7168, 1024, 128, 128, true},
+        };
+
+        for (const Shape &shape : shapes) {
+            fastllm::Data weight = MakeCudaFp8E4M3Weight(
+                shape.outputDim, shape.inputDim,
+                shape.blockK, shape.blockM);
+            fastllm::Data bias(fastllm::DataType::FLOAT32);
+            if (shape.hasBias) {
+                std::vector<float> biasValues(shape.outputDim);
+                for (int i = 0; i < shape.outputDim; i++) {
+                    biasValues[i] =
+                        (float)((i * 7 + i / 11) % 31 - 15) / 128.0f;
+                }
+                bias.Resize({shape.outputDim});
+                bias.Allocate(false);
+                std::memcpy(bias.cpuData, biasValues.data(),
+                            bias.GetBytes());
+                bias.ToDevice(fastllm::DataDevice::CUDA);
+            }
+            for (int rows = 1; rows <= 8; rows++) {
+                if (shape.inputDim > 1024 &&
+                    rows != 1 && rows != 3 && rows != 5 &&
+                    rows != 6 && rows != 8) {
+                    continue;
+                }
+                std::vector<float> inputValues(
+                    (size_t)rows * shape.inputDim);
+                for (size_t i = 0; i < inputValues.size(); i++) {
+                    inputValues[i] =
+                        (float)((int)((i * 17 + i / 23) % 257) - 128) /
+                        256.0f;
+                }
+                fastllm::Data input = MakeCudaTensor(
+                    fastllm::DataType::BFLOAT16,
+                    {rows, shape.inputDim}, inputValues);
+                fastllm::FastllmCudaSetLinearExactBatchThreshold(9);
+                const std::vector<uint8_t> reference =
+                    RunCudaBFloat16Fp8LinearPath(
+                        input, weight, bias, rows,
+                        shape.inputDim, shape.outputDim);
+                fastllm::FastllmCudaSetLinearExactBatchThreshold(0);
+                const std::vector<uint8_t> actual =
+                    RunCudaBFloat16Fp8LinearPath(
+                        input, weight, bias, rows,
+                        shape.inputDim, shape.outputDim);
+                Expect(reference == actual,
+                       "CUDA BF16 x FP8 small-batch kernel changed BF16 "
+                       "output bits at rows=" + std::to_string(rows) +
+                       ", m=" + std::to_string(shape.inputDim) +
+                       ", k=" + std::to_string(shape.outputDim));
+            }
+        }
+        fastllm::FastllmCudaSetLinearExactBatchThreshold(
+            savedExactBatchThreshold);
+        std::cout << "CUDA BF16 x FP8 small-batch regression: PASS "
+                  << "(BF16 bitwise, direct/split, bias/tails)\n";
+    }
+
+#endif
+
     std::vector<float> MakeRegressionValues(int count, float seed, float scale);
 
 #ifndef USE_ROCM
@@ -13060,13 +13183,53 @@ namespace {
                 RunNumasDeepSeekV4LargeMoeCase(
                     groupedDecodeWeights, smallBatch);
             unsetenv("FASTLLM_DSV4_DISABLE_NUMAS_MOE_GROUPED_DECODE");
-            std::vector<uint16_t> expertMajor =
+            std::vector<uint16_t> grouped =
                 RunNumasDeepSeekV4LargeMoeCase(
                     groupedDecodeWeights, smallBatch);
-            Expect(rowMajor == expertMajor,
+            if (groupedDecodeWeights.routedGate.dataType ==
+                fastllm::DataType::NVFP4_BLOCK_32_E8M0) {
+                Expect(
+                    groupedDecodeWeights.routedGate
+                            .numasNVFP4AllScalesFuseMagic &&
+                        groupedDecodeWeights.routedDown
+                            .numasNVFP4AllScalesFuseMagic,
+                    "eligible NVFP4 weights did not enable the NUMA fused "
+                    "scale fast path.");
+            }
+            Expect(rowMajor == grouped,
                    "DeepSeek-V4 NUMA grouped decode changed BF16 output "
                    "bits at batch " + std::to_string(smallBatch) + ".");
         }
+
+        // Values above 190 cannot absorb the kernel's internal 2^64
+        // compensation into one finite FP32 scale.  Registration must detect
+        // that data property and keep the branch-safe implementation.
+        MoeWeights overflowScaleWeights = makeNvfp4Weights();
+        uint8_t *overflowGateScales =
+            fastllm::GetNVFP4ScaleData(overflowScaleWeights.routedGate);
+        uint8_t *overflowDownScales =
+            fastllm::GetNVFP4ScaleData(overflowScaleWeights.routedDown);
+        Expect(overflowGateScales != nullptr &&
+                   overflowDownScales != nullptr,
+               "NVFP4 overflow-scale regression metadata is missing.");
+        overflowGateScales[0] = 191;
+        overflowDownScales[0] = 255;
+        setenv(
+            "FASTLLM_DSV4_DISABLE_NUMAS_MOE_GROUPED_DECODE", "1", 1);
+        std::vector<uint16_t> overflowScaleReference =
+            RunNumasDeepSeekV4LargeMoeCase(overflowScaleWeights, 5);
+        unsetenv("FASTLLM_DSV4_DISABLE_NUMAS_MOE_GROUPED_DECODE");
+        std::vector<uint16_t> overflowScaleAuto =
+            RunNumasDeepSeekV4LargeMoeCase(overflowScaleWeights, 5);
+        Expect(!overflowScaleWeights.routedGate
+                        .numasNVFP4AllScalesFuseMagic &&
+                   !overflowScaleWeights.routedDown
+                        .numasNVFP4AllScalesFuseMagic,
+               "overflowing NVFP4 scale incorrectly enabled the NUMA fused "
+               "scale fast path.");
+        Expect(overflowScaleAuto == overflowScaleReference,
+               "NVFP4 overflow-scale automatic fallback changed BF16 "
+               "output bits.");
         if (hadGroupedDecodeDisable) {
             setenv("FASTLLM_DSV4_DISABLE_NUMAS_MOE_GROUPED_DECODE",
                    savedGroupedDecodeDisableValue.c_str(), 1);
@@ -13789,6 +13952,15 @@ int main(int argc, char **argv) {
             std::cout << "CUDA packed paged-cache append regression: PASS\n";
             return 0;
         }
+#ifndef USE_ROCM
+        if (argc == 2 &&
+            std::string(argv[1]) == "--cuda-bf16-fp8-warp-reduce") {
+            Expect(FastllmCudaGetDeviceCount() > 0,
+                   "BF16 x FP8 warp-reduction regression requires CUDA.");
+            RunCudaBFloat16Fp8WarpReduceRegression();
+            return 0;
+        }
+#endif
         if (argc == 2 &&
             std::string(argv[1]) == "--cuda-dsv4-compressed-kv") {
             Expect(FastllmCudaGetDeviceCount() > 0,
@@ -13801,6 +13973,13 @@ int main(int argc, char **argv) {
             Expect(FastllmCudaGetDeviceCount() > 0,
                    "DeepSeek-V4 WoA regression requires CUDA.");
             RunCudaDeepSeekV4TokenTiledWoARegression();
+            return 0;
+        }
+        if (argc == 2 &&
+            std::string(argv[1]) == "--cuda-dsv4-fused-qkv") {
+            Expect(FastllmCudaGetDeviceCount() > 0,
+                   "DeepSeek-V4 fused QKV regression requires CUDA.");
+            RunCudaDeepSeekV4FusedQKVRopeCacheRegression();
             return 0;
         }
         if (argc == 2 &&

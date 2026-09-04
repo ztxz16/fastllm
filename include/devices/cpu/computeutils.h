@@ -21,7 +21,7 @@ namespace fastllm {
     bool FastllmGemmBFloat16NVFP4Block32E8M0FullBlocks_AVX512BF16(
         const void *A, long lda, const void *B, long ldb,
         void *C, long ldc, int n, int m, int k, int st, int end,
-        bool useScaleLookup);
+        bool useScaleLookup, bool allScalesFuseMagic);
     
     struct MultiThreadGemmOp : MultiThreadBaseOp {
         uint8_t *inputData;   // [n * m]

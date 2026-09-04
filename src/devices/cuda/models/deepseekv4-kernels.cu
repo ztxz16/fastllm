@@ -5064,6 +5064,43 @@ __global__ void DeepSeekV4SparseDecodeRotaryCastKernel(const float *input, __nv_
     dst[off + i + 1] = __float2bfloat16_rn(a * sn + b * c);
 }
 
+static void DeepSeekV4LaunchSparsePrefillRotaryCast(
+        const float *input, __nv_bfloat16 *output,
+        int rows, int rowOffset, int seqlen, int heads, int dim,
+        int ropeDim, float ropeBase, int startPos,
+        int originalSeqLen, float ropeFactor,
+        int betaFast, int betaSlow,
+        const int32_t *decodeMeta = nullptr) {
+    // DSpark verifies at most a handful of consecutive tokens.  Giving one
+    // CUDA thread a complete attention row leaves only a few blocks active
+    // and serializes every cast and RoPE pair inside that thread.  The decode
+    // kernel assigns one thread to each independent output item and evaluates
+    // the exact same expression, so reuse it for small static prefill shapes.
+    // Keep the established row kernel for larger prefills: this makes the
+    // optimization independent of GPU architecture without creating a very
+    // large grid for unrelated prompt processing.
+    constexpr int kParallelPrefillMaxTokens = 8;
+    const bool parallel = decodeMeta != nullptr ||
+        seqlen <= kParallelPrefillMaxTokens;
+    if (parallel) {
+        constexpr int threads = 256;
+        const int workPerRow = dim - ropeDim + (ropeDim >> 1);
+        const uint64_t work = (uint64_t)rows * workPerRow;
+        const int blocks = (int)((work + threads - 1) / threads);
+        DeepSeekV4SparseDecodeRotaryCastKernel<<<blocks, threads>>>(
+            input, output, rows, rowOffset, seqlen, heads, dim, ropeDim,
+            ropeBase, startPos, originalSeqLen, ropeFactor, betaFast,
+            betaSlow, decodeMeta);
+        return;
+    }
+
+    constexpr int threads = 128;
+    const int blocks = (rows + threads - 1) / threads;
+    DeepSeekV4SparsePrefillRotaryCastKernel<<<blocks, threads>>>(
+        input, output, rows, rowOffset, seqlen, heads, dim, ropeDim,
+        ropeBase, startPos, originalSeqLen, ropeFactor, betaFast, betaSlow);
+}
+
 __global__ void DeepSeekV4SparseDecodeRotaryCastBatchKernel(const float *input, __nv_bfloat16 *output,
                                                             const int *startPositions,
                                                             int rows, int heads, int dim, int ropeDim,
@@ -6469,9 +6506,7 @@ bool DeepSeekV4RunSparsePrefillCompressedCublas(
         if (!ok) {
             break;
         }
-        int threads = 128;
-        int blocks = (chunkRows + threads - 1) / threads;
-        DeepSeekV4SparsePrefillRotaryCastKernel<<<blocks, threads>>>(
+        DeepSeekV4LaunchSparsePrefillRotaryCast(
             cudaTemp, (__nv_bfloat16 *)output.cudaData, chunkRows, rowOffset, seqlen, heads, dim,
             ropeDim, ropeBase, startPos, originalSeqLen, ropeFactor, betaFast, betaSlow);
     }
@@ -6851,9 +6886,7 @@ bool DeepSeekV4RunSparsePrefillLocalCublas(
             if (!ok) {
                 break;
             }
-            int threads = 128;
-            int blocks = (rows + threads - 1) / threads;
-            DeepSeekV4SparsePrefillRotaryCastKernel<<<blocks, threads>>>(
+            DeepSeekV4LaunchSparsePrefillRotaryCast(
                 cudaTemp, (__nv_bfloat16 *)output.cudaData, rows, rowOffset, seqlen, heads, dim,
                 ropeDim, ropeBase, startPos, originalSeqLen, ropeFactor, betaFast, betaSlow);
         }
@@ -8633,23 +8666,10 @@ extern "C" bool FastllmCudaDeepSeekV4SparseAttentionPrefill(const fastllm::Data 
             ok = false;
             break;
         }
-        int threads = 128;
-        int blocks = (chunkRows + threads - 1) / threads;
-        if (decodeMeta != nullptr) {
-            int rotaryWorkPerRow = dim - ropeDim + (ropeDim >> 1);
-            int rotaryBlocks =
-                (chunkRows * rotaryWorkPerRow + threads - 1) / threads;
-            DeepSeekV4SparseDecodeRotaryCastKernel<<<rotaryBlocks, threads>>>(
-                cudaTemp, (__nv_bfloat16 *)output.cudaData,
-                chunkRows, rowOffset, seqlen, heads, dim, ropeDim, ropeBase,
-                startPos, originalSeqLen, ropeFactor, betaFast, betaSlow,
-                decodeMeta);
-        } else {
-            DeepSeekV4SparsePrefillRotaryCastKernel<<<blocks, threads>>>(
-                cudaTemp, (__nv_bfloat16 *)output.cudaData, chunkRows,
-                rowOffset, seqlen, heads, dim, ropeDim, ropeBase, startPos,
-                originalSeqLen, ropeFactor, betaFast, betaSlow);
-        }
+        DeepSeekV4LaunchSparsePrefillRotaryCast(
+            cudaTemp, (__nv_bfloat16 *)output.cudaData, chunkRows,
+            rowOffset, seqlen, heads, dim, ropeDim, ropeBase, startPos,
+            originalSeqLen, ropeFactor, betaFast, betaSlow, decodeMeta);
     }
     if (ok) {
         DeviceSync();

@@ -566,6 +566,11 @@ namespace fastllm {
         bool forceGGUFFp32Dequant = false;
 
         std::vector <uint8_t*> numasData; // numa数据
+        // True only when RegisterNumas has verified that every inline E8M0
+        // scale in an NVFP4 block32 shard can absorb the kernel's 2^64
+        // compensation without overflow.  Unknown and ineligible weights
+        // remain false and use the generic scale path.
+        bool numasNVFP4AllScalesFuseMagic = false;
         bool isPinned = false; // 是否使用pinned memory (page-locked)
 
         std::vector <int> cpuIntDatas; // 锁定在cpu上的int数据

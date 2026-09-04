@@ -699,9 +699,17 @@ namespace fastllm {
         }
     }
 
+    struct DeepSeekV4NumasGroupedGemmExpert {
+        int expert;
+        int rowOffset;
+        int rows;
+    };
+
     struct DeepSeekV4NumasGemmQueueContext {
         const std::vector<std::pair<int, float>> *experts;
         const std::vector<int> *expertOrder;
+        const std::vector<DeepSeekV4NumasGroupedGemmExpert>
+            *groupedExperts;
         Data **weights;
         uint8_t *inputData;
         size_t inputStrideBytes;
@@ -724,6 +732,7 @@ namespace fastllm {
             int weightOffset, int nid,
             int m, int k, int kPer, int rowsPerTask
         ) : experts(experts), expertOrder(expertOrder),
+            groupedExperts(nullptr),
             weights(weights), inputData(inputData),
             inputStrideBytes(inputStrideBytes),
             inputDataType(inputDataType), outputData(outputData),
@@ -731,7 +740,11 @@ namespace fastllm {
             m(m), k(k), kPer(kPer), rowsPerTask(rowsPerTask),
             chunksPerExpert(
                 (kPer + rowsPerTask - 1) / rowsPerTask),
+            // This removes bounds handling only when every activation block
+            // is complete.  Keep the generic GEMM fallback on CPUs without
+            // AVX512-BF16 and for every other dtype or shape.
             useNvfp4FullBlocks(
+                GetCPUInstructInfo()->hasAVX512BF16 &&
                 std::getenv(
                     "FASTLLM_DSV4_DISABLE_NUMAS_MOE_NVFP4_FULL_BLOCKS") ==
                 nullptr),
@@ -740,8 +753,25 @@ namespace fastllm {
                     "FASTLLM_DSV4_DISABLE_NUMAS_MOE_NVFP4_SCALE_LUT") ==
                 nullptr) {}
 
+        DeepSeekV4NumasGemmQueueContext(
+            const std::vector<DeepSeekV4NumasGroupedGemmExpert>
+                *groupedExperts,
+            Data **weights,
+            uint8_t *inputData, size_t inputStrideBytes,
+            DataType inputDataType, float *outputData,
+            int weightOffset, int nid,
+            int m, int k, int kPer, int rowsPerTask
+        ) : DeepSeekV4NumasGemmQueueContext(
+                nullptr, nullptr, weights,
+                inputData, inputStrideBytes, inputDataType, outputData,
+                weightOffset, nid, m, k, kPer, rowsPerTask) {
+            this->groupedExperts = groupedExperts;
+        }
+
         int TaskCount() const {
-            return (int)experts->size() * chunksPerExpert;
+            const int expertCount = groupedExperts == nullptr ?
+                (int)experts->size() : (int)groupedExperts->size();
+            return expertCount * chunksPerExpert;
         }
     };
 
@@ -760,9 +790,21 @@ namespace fastllm {
             int orderIndex = taskId / context->chunksPerExpert;
             int chunk = taskId -
                 orderIndex * context->chunksPerExpert;
-            int expertIdx =
-                (*context->expertOrder)[orderIndex];
-            int expert = (*context->experts)[expertIdx].first;
+            int expert = 0;
+            int rowOffset = 0;
+            int rows = 1;
+            if (context->groupedExperts == nullptr) {
+                int expertIdx =
+                    (*context->expertOrder)[orderIndex];
+                expert = (*context->experts)[expertIdx].first;
+                rowOffset = expertIdx;
+            } else {
+                const auto &group =
+                    (*context->groupedExperts)[orderIndex];
+                expert = group.expert;
+                rowOffset = group.rowOffset;
+                rows = group.rows;
+            }
             Data *weight =
                 context->weights[expert * 2 + context->weightOffset];
             int st = chunk * context->rowsPerTask;
@@ -770,10 +812,10 @@ namespace fastllm {
                 st + context->rowsPerTask, context->kPer);
             uint8_t *input =
                 context->inputData +
-                (size_t)expertIdx * context->inputStrideBytes;
+                (size_t)rowOffset * context->inputStrideBytes;
             uint8_t *output = (uint8_t*)(
                 context->outputData +
-                (size_t)expertIdx * context->k +
+                (size_t)rowOffset * context->k +
                 (size_t)context->nid * context->kPer);
             const long inputStride = GetDataBytes(
                 context->inputDataType, 1, context->m);
@@ -792,12 +834,13 @@ namespace fastllm {
                         input, inputStride,
                         weight->numasData[context->nid], weightStride,
                         output, outputStride,
-                        1, context->m, context->k, st, end,
-                        context->useNvfp4ScaleLookup);
+                        rows, context->m, context->k, st, end,
+                        context->useNvfp4ScaleLookup,
+                        weight->numasNVFP4AllScalesFuseMagic);
             }
             if (!fullBlocks) {
                 FastllmGemm(
-                    1, context->m, context->k,
+                    rows, context->m, context->k,
                     input, inputStride,
                     weight->numasData[context->nid], weightStride,
                     output, outputStride, st, end,
@@ -1020,7 +1063,8 @@ namespace fastllm {
     void Nvfp4ToFastllmNVFP4_BLOCK32_E8M0_Rows(
         int k, int m, uint8_t *nvfp4, uint8_t *scaleBytes,
         int blockK, int blockM, uint8_t *dst, int dstRowStart,
-        int dstRows, bool isCrossSwiglu
+        int dstRows, bool isCrossSwiglu,
+        bool *allScalesFuseMagic = nullptr
     ) {
         AssertInFastLLM(blockM == 32,
                         "NVFP4 block32 packing requires blockM = 32.\n");
@@ -1051,9 +1095,32 @@ namespace fastllm {
 
                 const size_t scaleIdx =
                     (size_t)(srcRow / blockK) * scaleMs + block;
-                *rowDst++ = scaleBytes[scaleIdx];
+                const uint8_t scaleByte = scaleBytes[scaleIdx];
+                *rowDst++ = scaleByte;
+                if (allScalesFuseMagic != nullptr && scaleByte > 190) {
+                    *allScalesFuseMagic = false;
+                }
             }
         }
+    }
+
+    static bool NumasNVFP4Block32AllScalesFuseMagic(
+            const uint8_t *data, int rows, int columns) {
+        if (data == nullptr || rows <= 0 || columns <= 0) {
+            return false;
+        }
+        const int blocks = (columns + 31) / 32;
+        const size_t rowBytes = GetDataBytes(
+            DataType::NVFP4_BLOCK_32_E8M0, 1, columns);
+        for (int row = 0; row < rows; row++) {
+            const uint8_t *rowData = data + (size_t)row * rowBytes;
+            for (int block = 0; block < blocks; block++) {
+                if (rowData[(size_t)block * 17 + 16] > 190) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     void Int4ToFastllmInt4PerchannelRow(uint8_t *newWeight, uint8_t *oldWeight, int m) {
@@ -1271,6 +1338,8 @@ namespace fastllm {
             std::vector<int> activeExperts;
             std::vector<std::pair<int, float>> selectedExperts;
             std::vector<int> expertOrder;
+            std::vector<DeepSeekV4NumasGroupedGemmExpert>
+                groupedGemmExperts;
             std::vector<std::vector<MultiThreadGemmOp>> gemmTaskStorage;
             std::vector<std::vector<MultiThreadDeepSeekV4NumasDownPrepareOp>>
                 prepareTaskStorage;
@@ -1640,6 +1709,7 @@ namespace fastllm {
             return;
         }
         if (data->numasData.size() == 0) {
+            data->numasNVFP4AllScalesFuseMagic = false;
             data->numasData.resize(numaConfig->numaCnt);
 
             int k = data->dims[0], m = data->dims[1];
@@ -1698,6 +1768,12 @@ namespace fastllm {
                     if (isCrossSwiglu) {
                         CrossSwigluReorder(data->cpuData, k, bytesPerRow, reordered);
                         srcData = reordered.data();
+                    }
+                    if (data->dataType ==
+                        DataType::NVFP4_BLOCK_32_E8M0) {
+                        data->numasNVFP4AllScalesFuseMagic =
+                            NumasNVFP4Block32AllScalesFuseMagic(
+                                srcData, k, m);
                     }
                     for (int i = 0; i < numaConfig->numaCnt; i++) {
                         data->numasData[i] = (uint8_t*)allocFunc(kPerNuma * bytesPerRow, i);
@@ -1762,6 +1838,7 @@ namespace fastllm {
                         data->dataType = useBlock32 ?
                             DataType::NVFP4_BLOCK_32_E8M0 :
                             DataType::NVFP4_BLOCK_16_E8M0;
+                        data->numasNVFP4AllScalesFuseMagic = useBlock32;
                         const size_t packedBytesPerRow =
                             GetDataBytes(data->dataType, 1, m);
                         for (int i = 0; i < numaConfig->numaCnt; i++) {
@@ -1772,7 +1849,8 @@ namespace fastllm {
                                     k, m, (uint8_t*)data->cpuData,
                                     scaleBytes, data->blockK, data->blockM,
                                     data->numasData[i], i * kPerNuma,
-                                    kPerNuma, isCrossSwiglu);
+                                    kPerNuma, isCrossSwiglu,
+                                    &data->numasNVFP4AllScalesFuseMagic);
                             } else {
                                 Nvfp4ToFastllmNVFP4_BLOCK16_E8M0_Rows(
                                     k, m, (uint8_t*)data->cpuData,
@@ -5272,12 +5350,21 @@ namespace fastllm {
 
         std::vector<std::vector <fastllm::MultiThreadBaseOp*> > ops;
         ops.resize(numaConfig->numaCnt);
+        auto &groupedGemmExperts =
+            fastllmMoeDataManagerNumas.groupedGemmExperts;
+        if (useDeepSeekV4GroupedDecodeFast) {
+            groupedGemmExperts.clear();
+            groupedGemmExperts.reserve(totalLines);
+        }
         for (int e = 0; e < (int)expertTasks.size(); e++) {
             if (weights[e * 2] != nullptr && expertTasks[e].size() > 0 && cpuExperts.count(e)) {
                 if (weights[e * 2]->numasData.empty() && weights[e * 2]->cpuData != nullptr) {
                     RegisterNumas(weights[e * 2], "linearSwiglu");
                 }
                 int lines = expertTasks[e].size();
+                if (useDeepSeekV4GroupedDecodeFast) {
+                    groupedGemmExperts.push_back({e, offset, lines});
+                }
                 // Prepare input pointer for this expert's batch
                 uint16_t* expertInputPtr = (uint16_t*)(expandInput.data() + offset * GetDataBytes(startDataType, 1, inputDim));
                     
@@ -5298,6 +5385,9 @@ namespace fastllm {
                     int base = kPer * nid;
                     size_t outputOffset = GetDataBytes(DataType::FLOAT32, 1, base);
 
+                    if (useDeepSeekV4GroupedDecodeFast) {
+                        continue;
+                    }
                     for (int st = 0; st < kPer; st += stride) {
                         int end = std::min(st + stride, kPer);
                         ops[nid].push_back(new MultiThreadGemmAndCrossSwigluOp(
@@ -5315,8 +5405,47 @@ namespace fastllm {
             }
         }
 
+        const int groupedThreadsPerNode = std::max(
+            1, numaConfig->threads / numaConfig->numaCnt);
+        // With many groups per worker, dynamic claiming already amortizes
+        // their different row counts and sorting only perturbs locality.
+        if (useDeepSeekV4GroupedDecodeFast &&
+            groupedGemmExperts.size() > 1 &&
+            groupedThreadsPerNode * 2 >=
+                (int)groupedGemmExperts.size()) {
+            const int firstRows = groupedGemmExperts.front().rows;
+            const bool unevenRows = std::any_of(
+                groupedGemmExperts.begin() + 1,
+                groupedGemmExperts.end(),
+                [firstRows](const auto &group) {
+                    return group.rows != firstRows;
+                });
+            if (unevenRows) {
+                // Dynamic claiming balances most of the queue.  Starting the
+                // larger row groups first also prevents an expensive group
+                // from becoming the final serial tail.
+                std::stable_sort(
+                    groupedGemmExperts.begin(), groupedGemmExperts.end(),
+                    [](const auto &left, const auto &right) {
+                        return left.rows > right.rows;
+                    });
+            }
+        }
+
         if (useDeepSeekV4GroupedDecodeFast) {
-            ScheduleDeepSeekV4NumasMoeTasks(ops);
+            std::vector<DeepSeekV4NumasGemmQueueContext> contexts;
+            contexts.reserve(numaConfig->numaCnt);
+            const size_t inputRowBytes =
+                GetDataBytes(startDataType, 1, inputDim);
+            for (int nid = 0; nid < numaConfig->numaCnt; nid++) {
+                contexts.emplace_back(
+                    &groupedGemmExperts, weights,
+                    expandInput.data(), inputRowBytes,
+                    startDataType, gateUpOutput.data(),
+                    0, nid, inputDim, gateCols,
+                    gateColsPerNuma, stride);
+            }
+            ScheduleDeepSeekV4NumasGemmQueue(contexts);
         } else {
             DynamicScheduleTasks(ops);
         }
@@ -5413,6 +5542,21 @@ namespace fastllm {
         // 5. down
         offset = 0;
         stride = useDeepSeekV4GroupedDecodeFast ? 128 : 64;
+        if (useDeepSeekV4GroupedDecodeFast) {
+            const int groups = std::max(
+                1, (int)groupedGemmExperts.size());
+            const int threadsPerNode = std::max(
+                1, numaConfig->threads / numaConfig->numaCnt);
+            const int targetTasks = threadsPerNode * 8;
+            const int chunksPerExpert = std::max(
+                1, (targetTasks + groups - 1) / groups);
+            const int kPerNode = dim / numaConfig->numaCnt;
+            const int balancedStride =
+                kPerNode / chunksPerExpert / 32 * 32;
+            // Keep enough independent chunks to absorb uneven expert work
+            // without flooding the shared queue.
+            stride = std::max(64, std::min(512, balancedStride));
+        }
         ops.resize(numaConfig->numaCnt);
         for (int i = 0; i < (int)ops.size(); i++) {
             ops[i].clear();
@@ -5441,6 +5585,9 @@ namespace fastllm {
                     int base = kPer * nid;
                     size_t outputOffset = GetDataBytes(DataType::FLOAT32, 1, base);
 
+                    if (useDeepSeekV4GroupedDecodeFast) {
+                        continue;
+                    }
                     for (int st = 0; st < kPer; st += stride) {
                         int end = std::min(st + stride, kPer);
                         ops[nid].push_back(new MultiThreadGemmOp(
@@ -5456,7 +5603,19 @@ namespace fastllm {
         }
 
         if (useDeepSeekV4GroupedDecodeFast) {
-            ScheduleDeepSeekV4NumasMoeTasks(ops);
+            std::vector<DeepSeekV4NumasGemmQueueContext> contexts;
+            contexts.reserve(numaConfig->numaCnt);
+            const size_t downRowBytes =
+                GetDataBytes(downInputDataType, 1, interDim);
+            for (int nid = 0; nid < numaConfig->numaCnt; nid++) {
+                contexts.emplace_back(
+                    &groupedGemmExperts, weights,
+                    downInput.data(), downRowBytes,
+                    downInputDataType, downOutput.data(),
+                    1, nid, interDim, dim,
+                    dim / numaConfig->numaCnt, stride);
+            }
+            ScheduleDeepSeekV4NumasGemmQueue(contexts);
         } else {
             DynamicScheduleTasks(ops);
         }

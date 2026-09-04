@@ -1352,7 +1352,8 @@ namespace fastllm {
     }
 
     template <int ROWS, bool useLookup, bool fullBlocks = false,
-              bool useScaleLookup = false>
+              bool useScaleLookup = false,
+              bool allScalesFuseMagic = false>
     static bool FastllmGemmBFloat16NVFP4Block32E8M0_AVX512BF16_Run(
         const void *A, long lda,
         const void *B, long ldb,
@@ -1378,7 +1379,8 @@ namespace fastllm {
             for (int block = 0; block < blocks; block++) {
                 const uint8_t *blockStart = rowStart + block * 17;
                 const uint8_t scaleByte = blockStart[16];
-                const bool fuseMagicScale = scaleByte <= 190;
+                const bool fuseMagicScale =
+                    allScalesFuseMagic || scaleByte <= 190;
                 __m512 scaleVec;
                 if constexpr (useScaleLookup) {
                     scaleVec = _mm512_set1_ps(
@@ -1422,8 +1424,13 @@ namespace fastllm {
                     }
                     const __m512 sum = _mm512_dpbf16_ps(
                         _mm512_setzero_ps(), vi, vw);
-                    const __m512 adjustedSum = fuseMagicScale ?
-                        sum : _mm512_mul_ps(sum, magicVec);
+                    __m512 adjustedSum;
+                    if constexpr (allScalesFuseMagic) {
+                        adjustedSum = sum;
+                    } else {
+                        adjustedSum = fuseMagicScale ?
+                            sum : _mm512_mul_ps(sum, magicVec);
+                    }
                     scaledSums[row] = _mm512_fmadd_ps(
                         adjustedSum, scaleVec, scaledSums[row]);
                 }
@@ -1445,10 +1452,18 @@ namespace fastllm {
         const void *B, long ldb,
         void *C, long ldc,
         int n, int m, int k, int st, int end,
-        bool useScaleLookup
+        bool useScaleLookup, bool allScalesFuseMagic
     ) {
         if ((m & 31) != 0) {
             return false;
+        }
+        // Removing the per-block overflow guard helps the memory-bound
+        // single-row GEMV.  Multi-row kernels reuse each decoded weight and
+        // did not benefit consistently, so keep their smaller generic body.
+        if (n == 1 && useScaleLookup && allScalesFuseMagic) {
+            return FastllmGemmBFloat16NVFP4Block32E8M0_AVX512BF16_Run<
+                1, true, true, true, true>(
+                A, lda, B, ldb, C, ldc, m, st, end);
         }
 #define FASTLLM_RUN_NVFP4_BLOCK32_FULL(ROWS) \
         if (useScaleLookup) { \
