@@ -4,6 +4,7 @@
 #include "basellm.h"
 
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -61,6 +62,38 @@ namespace fastllm {
                 const std::string &output) override;
 
     private:
+        struct KdaReplayCapture {
+            Data qProjected;
+            Data kProjected;
+            Data vProjected;
+            Data k;
+            Data v;
+            Data rawGate;
+            Data rawBeta;
+        };
+
+        struct TargetRuntimeCheckpoint {
+            std::vector<Data> kdaFirst;
+            std::vector<Data> kdaSecond;
+            std::vector<int> sparseLengths;
+            bool ready = false;
+        };
+
+        struct MtpRuntimeState {
+            std::vector<std::pair<Data, Data>> pastKeyValues;
+            std::vector<int> proposals;
+            std::deque<std::pair<int, int>> pendingOutputTokens;
+            Data deferredTargetHidden;
+            bool hasDeferredTargetHidden = false;
+            int deferredPosition = -1;
+            int targetTokensConsumed = 0;
+            int activeDraftLimit = 0;
+            int consecutiveFullAccepts = 0;
+            bool disabled = false;
+            TargetRuntimeCheckpoint targetCheckpoint;
+            std::vector<KdaReplayCapture> kdaReplay;
+        };
+
         struct HistoryCacheMemory {
             std::vector<int> tokens;
             std::vector<std::pair<Data, Data>> pastKeyValues;
@@ -78,7 +111,55 @@ namespace fastllm {
                 const GenerationConfig &generationConfig,
                 const LastTokensManager &lastTokens,
                 std::vector<float> *logits,
-                bool sampleOutput);
+                bool sampleOutput,
+                Data *targetHiddenStates = nullptr,
+                std::vector<KdaReplayCapture> *kdaReplay = nullptr);
+
+        int ForwardMtp(
+                const Data &inputIds,
+                const Data &attentionMask,
+                const Data &positionIds,
+                std::vector<std::pair<Data, Data>> &pastKeyValues,
+                const GenerationConfig &generationConfig,
+                const LastTokensManager &lastTokens,
+                std::vector<float> *logits,
+                MtpRuntimeState &state);
+
+        bool MtpSupportsGenerationConfig(
+                const GenerationConfig &generationConfig) const;
+
+        bool CanUseExactBatchedMtpVerification(int rows) const;
+
+        int RunMtpDraft(
+                MtpRuntimeState &state,
+                const Data &targetHiddenStates,
+                const std::vector<int> &inputTokens,
+                const std::vector<int> &positions,
+                Data *nextHiddenStates,
+                bool sampleToken);
+
+        void GenerateMtpProposalChain(
+                MtpRuntimeState &state,
+                const Data &targetHiddenStates,
+                const std::vector<int> &inputTokens,
+                const std::vector<int> &positions);
+
+        void CaptureTargetRuntimeCheckpoint(
+                const std::vector<std::pair<Data, Data>> &pastKeyValues,
+                TargetRuntimeCheckpoint &checkpoint);
+
+        void CommitTargetVerificationPrefix(
+                std::vector<std::pair<Data, Data>> &pastKeyValues,
+                const TargetRuntimeCheckpoint &checkpoint,
+                const std::vector<KdaReplayCapture> &kdaReplay,
+                int committedInputs,
+                int verificationInputs);
+
+        std::vector<int> SampleTargetRows(
+                Data &hiddenStates,
+                const GenerationConfig &generationConfig,
+                const LastTokensManager &lastTokens,
+                const std::vector<int> &proposals);
 
         int GetHistoryCacheSequenceLength(
                 const std::vector<std::pair<Data, Data>>
@@ -100,7 +181,8 @@ namespace fastllm {
         void RunKdaAttention(
                 int layerIndex, Data &input, int sequence,
                 std::vector<std::pair<Data, Data>> &pastKeyValues,
-                Data &output);
+                Data &output,
+                KdaReplayCapture *replayCapture = nullptr);
 
         void RunSparseAttention(
                 int layerIndex, Data &input, int sequence,
@@ -123,6 +205,12 @@ namespace fastllm {
 
         void RunMoe(
                 int layerIndex, Data &input, int sequence, Data &output);
+
+        void RunMoeWithPrefix(
+                int deviceLayer, const std::string &mlpPrefix,
+                std::vector<Data*> &weights,
+                std::vector<Data*> &biases,
+                Data &input, int sequence, Data &output);
 
         int Sample(
                 Data &hiddenStates,
@@ -172,6 +260,15 @@ namespace fastllm {
         std::vector<bool> denseMlpLayers;
         std::vector<std::vector<Data*>> expertWeights;
         std::vector<std::vector<Data*>> expertBiases;
+        std::vector<Data*> mtpExpertWeights;
+        std::vector<Data*> mtpExpertBiases;
+
+        bool mtpEnabled = false;
+        bool mtpWeightsReady = false;
+        int mtpDraftsPerStep = 0;
+        std::map<const std::vector<std::pair<Data, Data>> *,
+                 std::shared_ptr<MtpRuntimeState>> mtpStates;
+        std::mutex mtpStatesMutex;
 
         std::map<std::vector<int>, std::shared_ptr<HistoryCacheMemory>>
             historyCache;

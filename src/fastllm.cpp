@@ -4520,7 +4520,9 @@ namespace fastllm {
             const Data &k, const Data &v,
             const Data &rawGate, const Data &rawBeta,
             const Data &aLog, const Data &dtBias, float lowerBound,
-            int tokens, Data &state) {
+            int tokens, Data &state,
+            bool normalizeKInFp32,
+            bool roundBetaToBfloat16) {
         Data unusedOutput, unusedDecay, unusedBeta;
         curExecutor->Run("KimiK3RecurrentKDA", {
                 // Query contributes only to the emitted attention output; the
@@ -4533,7 +4535,9 @@ namespace fastllm {
                 {"state", &state}, {"output", &unusedOutput},
                 {"decay", &unusedDecay}, {"beta", &unusedBeta}
         }, {{"lowerBound", lowerBound}},
-        {{"tokenLimit", tokens}, {"stateOnly", 1}, {"outputAux", 0}});
+        {{"tokenLimit", tokens}, {"stateOnly", 1}, {"outputAux", 0},
+         {"normalizeQKInFp32", normalizeKInFp32 ? 1 : 0},
+         {"roundBetaToBfloat16", roundBetaToBfloat16 ? 1 : 0}});
     }
 
     void KimiK3RMSNormSigmoidGate(

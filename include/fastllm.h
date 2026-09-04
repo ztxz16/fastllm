@@ -1134,7 +1134,9 @@ namespace fastllm {
             const Data &k, const Data &v,
             const Data &rawGate, const Data &rawBeta,
             const Data &aLog, const Data &dtBias, float lowerBound,
-            int tokens, Data &state);
+            int tokens, Data &state,
+            bool normalizeKInFp32 = false,
+            bool roundBetaToBfloat16 = false);
 
     void KimiK3RMSNormSigmoidGate(
             const Data &input, const Data &gate, const Data &weight,
