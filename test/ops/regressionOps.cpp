@@ -13084,7 +13084,7 @@ namespace {
         std::vector<fastllm::Data*> biasPtrs(4, nullptr);
         {
             ScopedFirstDevice guard("numa");
-#ifdef USE_CUDA
+#if defined(USE_CUDA) && defined(USE_NUMAS)
             if (prefetchCudaDecode) {
                 Expect(cudaInputDevice >= 0,
                        "NUMA MoE decode prefetch requires CUDA inputs.");
@@ -13119,7 +13119,7 @@ namespace {
             data, data + (size_t)batch * outputDim);
     }
 
-#if defined(USE_CUDA) && !defined(USE_ROCM)
+#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
     void CUDART_CB DelayCudaStreamForNumasOutputReuseRegression(
             void *userData) {
         std::unique_ptr<int> delayMilliseconds(
@@ -13312,7 +13312,7 @@ namespace {
         Expect(expected == actual,
                "DeepSeek-V4 NUMA large-batch MergeMOE fast path changed BF16 output bits.");
 
-#ifdef USE_CUDA
+#if defined(USE_CUDA) && defined(USE_NUMAS)
         if (FastllmCudaGetDeviceCount() > 0) {
             std::vector<int> savedDevices;
             std::map<int, int> savedRatios;
