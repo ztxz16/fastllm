@@ -52,10 +52,11 @@ bool GemmFp8(const uint8_t *packedWeight, const half *packedScales,
 // NVFP4_BLOCK_16 bridge.  The source layout contains eight packed E2M1 bytes
 // followed by one float scale for each group of sixteen input channels.
 // PrepareNvfp4InPlace converts it to [TurboMind weight][TurboMind FP16 scales]
-// inside the same allocation; the converted representation is smaller than
-// the source representation.  K is the input dimension and N the output
-// dimension. K must be divisible by 16 and N by 32, matching the SM70 packed
-// operand layout.
+// inside the same allocation. K is the input dimension and N the logical output
+// dimension. K must be divisible by 16. When N is not divisible by 32, the
+// bridge pads the packed operand with zero columns if the original allocation
+// has enough room, then crops GEMM output back to N columns. Otherwise prepare
+// fails without modifying the source so the caller can use its native path.
 bool Nvfp4Supported();
 bool PrepareNvfp4InPlace(uint8_t *storage, size_t storageBytes,
                          int K, int N, cudaStream_t stream);

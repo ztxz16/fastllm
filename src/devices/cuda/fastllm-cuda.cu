@@ -5429,7 +5429,7 @@ void FastllmCudaForceFree(void *ret) {
     checkCudaErrors("CUDA error when force releasing uncached memory!", state);
 }
 
-bool FastllmCudaFreeAfterCurrentThreadStream(void *ret) {
+bool FastllmCudaFreeAfterStream(void *ret, cudaStream_t stream) {
     if (ret == nullptr) {
         return true;
     }
@@ -5458,7 +5458,7 @@ bool FastllmCudaFreeAfterCurrentThreadStream(void *ret) {
             }
         }
         cudaError_t recordState = cudaEventRecord(
-            buffer.reuseReadyEvent, cudaStreamPerThread);
+            buffer.reuseReadyEvent, stream);
         if (recordState != cudaSuccess) {
             checkCudaErrors(
                 "Error: CUDA error when recording deferred pool event!",
@@ -5489,6 +5489,10 @@ bool FastllmCudaFreeAfterCurrentThreadStream(void *ret) {
         }
     }
     return false;
+}
+
+bool FastllmCudaFreeAfterCurrentThreadStream(void *ret) {
+    return FastllmCudaFreeAfterStream(ret, cudaStreamPerThread);
 }
 
 void FastllmCudaFree(void *ret) {

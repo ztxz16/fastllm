@@ -3679,7 +3679,7 @@ namespace {
 
         constexpr int inputDim = 128;
         constexpr int outputDim = 256;
-        constexpr int batch = 7;
+        constexpr int batch = 8;
         constexpr float globalScale = 1.0f / 256.0f;
         fastllm::Data referenceWeight = MakeNvfp4Block16Weight(
             outputDim, inputDim, globalScale);
@@ -3716,25 +3716,126 @@ namespace {
                         2.0e-2f, 2.0e-3f,
                         "SM70 NVFP4 TurboMind output with bias");
 
+        // The production linear-attention projection has N % 32 == 16.
+        // Exercise that same residue at a compact shape whose source
+        // allocation can hold the zero-padded packed representation.
+        constexpr int paddedOutputDim = 144;
+        fastllm::Data paddedReferenceWeight = MakeNvfp4Block16Weight(
+            paddedOutputDim, inputDim, globalScale);
+        fastllm::Data paddedOptimizedWeight = MakeNvfp4Block16Weight(
+            paddedOutputDim, inputDim, globalScale);
+        fastllm::Data paddedBias = MakeCudaTensor(
+            fastllm::DataType::FLOAT32, {paddedOutputDim},
+            MakeRegressionValues(paddedOutputDim, 0.37f, 0.015f));
+        fastllm::Data paddedReference = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {batch, paddedOutputDim},
+            std::vector<float>((size_t)batch * paddedOutputDim, 0.0f));
+        fastllm::Data paddedActual = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {batch, paddedOutputDim},
+            std::vector<float>((size_t)batch * paddedOutputDim, 0.0f));
+        FastllmCudaSetNcclForceSync(false);
+        Expect(FastllmCudaHalfMatMulFloatNVFP4Block16(
+                   input, paddedReferenceWeight, paddedBias, paddedReference,
+                   batch, inputDim, paddedOutputDim),
+               "unaligned native SM70 NVFP4 reference failed");
+        FastllmCudaSetNcclForceSync(true);
+        Expect(FastllmCudaHalfMatMulFloatNVFP4Block16(
+                   input, paddedOptimizedWeight, paddedBias, paddedActual,
+                   batch, inputDim, paddedOutputDim),
+               "padded SM70 NVFP4 TurboMind execution failed");
+        FastllmCudaSyncCurrentThreadStream();
+        Expect(paddedOptimizedWeight.IsRepacked,
+               "padded SM70 NVFP4 weight was not converted in place");
+        ExpectFloatNear(ToFloatVector(paddedReference),
+                        ToFloatVector(paddedActual),
+                        2.0e-2f, 2.0e-3f,
+                        "padded SM70 NVFP4 TurboMind output with bias");
+
+        fastllm::Data noBias;
+        fastllm::Data paddedReferenceSingle = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {1, paddedOutputDim},
+            std::vector<float>(paddedOutputDim, 0.0f));
+        fastllm::Data paddedActualSingle = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {1, paddedOutputDim},
+            std::vector<float>(paddedOutputDim, 0.0f));
+        FastllmCudaSetNcclForceSync(false);
+        Expect(FastllmCudaHalfMatMulFloatNVFP4Block16(
+                   input, paddedReferenceWeight, noBias,
+                   paddedReferenceSingle, 1, inputDim, paddedOutputDim),
+               "unaligned native SM70 NVFP4 batch-one reference failed");
+        Expect(FastllmCudaHalfMatMulFloatNVFP4Block16(
+                   input, paddedOptimizedWeight, noBias,
+                   paddedActualSingle, 1, inputDim, paddedOutputDim),
+               "padded SM70 NVFP4 batch-one execution failed");
+        FastllmCudaSyncCurrentThreadStream();
+        ExpectFloatNear(ToFloatVector(paddedReferenceSingle),
+                        ToFloatVector(paddedActualSingle),
+                        2.0e-2f, 2.0e-3f,
+                        "padded SM70 NVFP4 batch-one output without bias");
+
+        // The bridge accepts an explicit stream. Verify both its padded output
+        // and the stream-ordered lifetime of its temporary GEMM buffer.
+        fastllm::Data paddedActualCustom = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {1, paddedOutputDim},
+            std::vector<float>(paddedOutputDim, 0.0f));
+        cudaStream_t customStream = nullptr;
+        Expect(cudaStreamCreateWithFlags(
+                   &customStream, cudaStreamNonBlocking) == cudaSuccess,
+               "failed to create NVFP4 regression stream");
+        const bool customStreamGemmOk = fastllm::awq_sm70::GemmNvfp4(
+            static_cast<const uint8_t *>(paddedOptimizedWeight.cudaData),
+            static_cast<const half *>(input.cudaData),
+            static_cast<half *>(paddedActualCustom.cudaData),
+            1, inputDim, paddedOutputDim, customStream);
+        const cudaError_t customStreamSyncState =
+            cudaStreamSynchronize(customStream);
+        const cudaError_t customStreamDestroyState =
+            cudaStreamDestroy(customStream);
+        Expect(customStreamGemmOk,
+               "padded SM70 NVFP4 custom-stream execution failed");
+        Expect(customStreamSyncState == cudaSuccess,
+               "padded SM70 NVFP4 custom-stream synchronization failed");
+        Expect(customStreamDestroyState == cudaSuccess,
+               "failed to destroy NVFP4 regression stream");
+        ExpectFloatNear(ToFloatVector(paddedReferenceSingle),
+                        ToFloatVector(paddedActualCustom),
+                        2.0e-2f, 2.0e-3f,
+                        "padded SM70 NVFP4 custom-stream output");
+
         // SM70's packed B operand groups output rows by 32. A partial group
-        // must stay in the original layout so the native fallback remains
-        // valid instead of being destructively repacked.
+        // whose packed representation would not fit the original allocation
+        // must stay native instead of being destructively repacked.
         constexpr int fallbackOutputDim = 24;
+        fastllm::Data fallbackReferenceWeight = MakeNvfp4Block16Weight(
+            fallbackOutputDim, inputDim, globalScale);
         fastllm::Data fallbackWeight = MakeNvfp4Block16Weight(
             fallbackOutputDim, inputDim, globalScale);
         fastllm::Data fallbackBias = MakeCudaTensor(
             fastllm::DataType::FLOAT32, {fallbackOutputDim},
             MakeRegressionValues(fallbackOutputDim, 0.29f, 0.015f));
-        fastllm::Data fallbackOutput = MakeCudaTensor(
+        fastllm::Data fallbackReference = MakeCudaTensor(
             fastllm::DataType::FLOAT16, {batch, fallbackOutputDim},
             std::vector<float>((size_t)batch * fallbackOutputDim, 0.0f));
+        fastllm::Data fallbackActual = MakeCudaTensor(
+            fastllm::DataType::FLOAT16, {batch, fallbackOutputDim},
+            std::vector<float>((size_t)batch * fallbackOutputDim, 0.0f));
+        FastllmCudaSetNcclForceSync(false);
         Expect(FastllmCudaHalfMatMulFloatNVFP4Block16(
-                   input, fallbackWeight, fallbackBias, fallbackOutput,
+                   input, fallbackReferenceWeight, fallbackBias,
+                   fallbackReference, batch, inputDim, fallbackOutputDim),
+               "unaligned native SM70 NVFP4 fallback reference failed");
+        FastllmCudaSetNcclForceSync(true);
+        Expect(FastllmCudaHalfMatMulFloatNVFP4Block16(
+                   input, fallbackWeight, fallbackBias, fallbackActual,
                    batch, inputDim, fallbackOutputDim),
                "unaligned SM70 NVFP4 native fallback failed");
         FastllmCudaSyncCurrentThreadStream();
         Expect(!fallbackWeight.IsRepacked,
                "unaligned SM70 NVFP4 weight was destructively repacked");
+        ExpectFloatNear(ToFloatVector(fallbackReference),
+                        ToFloatVector(fallbackActual),
+                        2.0e-2f, 2.0e-3f,
+                        "unaligned SM70 NVFP4 native fallback output");
         std::cout << "CUDA NVFP4 SM70 TurboMind regression: PASS\n";
     }
 

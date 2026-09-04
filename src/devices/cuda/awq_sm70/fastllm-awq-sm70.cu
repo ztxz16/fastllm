@@ -10,6 +10,7 @@
 #include "devices/cuda/fastllm-awq-sm70.cuh"
 
 #include <algorithm>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
@@ -155,13 +156,13 @@ __global__ void TransposeU16Kernel(uint16_t *dst, const uint16_t *src, int K, in
 // retaining the other branch keeps this bridge correct if converter policy
 // changes later.
 __global__ void UnpackNvfp4Block16Kernel(const uint8_t *source,
-                                         uint16_t *unpacked,
-                                         half *scales,
-                                         int K, int N,
-                                         int sourceRowBytes,
-                                         bool transposeWeight) {
+                                        uint16_t *unpacked,
+                                        half *scales,
+                                        int K, int logicalN, int packedN,
+                                        int sourceRowBytes,
+                                        bool transposeWeight) {
     size_t flat = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    const size_t total = (size_t)K * N;
+    const size_t total = (size_t)K * packedN;
     if (flat >= total) {
         return;
     }
@@ -169,14 +170,34 @@ __global__ void UnpackNvfp4Block16Kernel(const uint8_t *source,
     const int in = (int)(flat - (size_t)out * K);
     const int group = in >> 4;
     const int offset = in & 15;
-    const uint8_t *block = source + (size_t)out * sourceRowBytes +
-                           (size_t)group * 12;
-    const uint8_t packed = block[offset >> 1];
-    const uint16_t fp4 = (offset & 1) ? (packed >> 4) : (packed & 0xf);
-    unpacked[transposeWeight ? flat : (size_t)in * N + out] = fp4;
+    uint16_t fp4 = 0;
+    half scale = __float2half_rn(1.0f);
+    if (out < logicalN) {
+        const uint8_t *block = source + (size_t)out * sourceRowBytes +
+                               (size_t)group * 12;
+        const uint8_t packed = block[offset >> 1];
+        fp4 = (offset & 1) ? (packed >> 4) : (packed & 0xf);
+        if (offset == 0) {
+            scale = __float2half_rn(
+                *reinterpret_cast<const float *>(block + 8));
+        }
+    }
+    unpacked[transposeWeight ? flat : (size_t)in * packedN + out] = fp4;
     if (offset == 0) {
-        scales[(size_t)group * N + out] =
-            __float2half_rn(*reinterpret_cast<const float *>(block + 8));
+        scales[(size_t)group * packedN + out] = scale;
+    }
+}
+
+__global__ void CropNvfp4OutputKernel(const half *padded, half *logical,
+                                      int tokens, int logicalN, int packedN) {
+    const int col = (int)blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= logicalN) {
+        return;
+    }
+    for (int row = (int)blockIdx.y; row < tokens;
+         row += (int)gridDim.y) {
+        logical[(size_t)row * logicalN + col] =
+            padded[(size_t)row * packedN + col];
     }
 }
 
@@ -320,6 +341,16 @@ bool MakeNvfp4Layouts(int K, int N, PackedLayouts &layouts) {
 bool MakeFp8Layouts(int K, int N, PackedLayouts &layouts) {
     return MakePackedLayouts(K, N, kFp8GroupSize,
                              turbomind::kFloat8_e4m3, layouts);
+}
+
+bool GetNvfp4PackedOutputDim(int logicalN, int &packedN) {
+    if (logicalN <= 0 ||
+        logicalN > INT_MAX - (kPackedOutputAlignment - 1)) {
+        return false;
+    }
+    packedN = ((logicalN + kPackedOutputAlignment - 1) /
+               kPackedOutputAlignment) * kPackedOutputAlignment;
+    return true;
 }
 
 }  // namespace
@@ -814,27 +845,33 @@ bool PrepareNvfp4InPlace(uint8_t *storage, size_t storageBytes,
     if (storage == nullptr || !Nvfp4Supported()) {
         return false;
     }
+    int packedN = 0;
+    if (!GetNvfp4PackedOutputDim(N, packedN)) {
+        return false;
+    }
     PackedLayouts layouts;
-    if (!MakeNvfp4Layouts(K, N, layouts)) {
+    if (!MakeNvfp4Layouts(K, packedN, layouts)) {
         return false;
     }
 
-    const size_t elementCount = (size_t)K * N;
+    const size_t elementCount = (size_t)K * packedN;
     const size_t sourceRowBytes =
         (size_t)(K / kNvfp4GroupSize) * 12;
     const size_t sourceBytes = (size_t)N * sourceRowBytes;
     const size_t packedWeightBytes = elementCount / 2;
     const size_t scaleBytes =
-        (size_t)(K / kNvfp4GroupSize) * N * sizeof(half);
+        (size_t)(K / kNvfp4GroupSize) * packedN * sizeof(half);
     const size_t persistentBytes = packedWeightBytes + scaleBytes;
+    // This check happens before allocating scratch space or launching work, so
+    // failure leaves the native source representation completely untouched.
     if (storageBytes < sourceBytes || storageBytes < persistentBytes) {
         return false;
     }
 
     // The converter cannot safely write over the interleaved source layout.
     // Keep all temporary inputs and outputs in one allocation, then copy the
-    // smaller persistent representation back only after both conversions have
-    // been enqueued successfully.
+    // persistent representation back only after both conversions have been
+    // enqueued successfully.
     const size_t unpackedWeightBytes = elementCount * sizeof(uint16_t);
     const size_t scratchBytes = unpackedWeightBytes + scaleBytes +
                                 packedWeightBytes + scaleBytes;
@@ -860,7 +897,7 @@ bool PrepareNvfp4InPlace(uint8_t *storage, size_t storageBytes,
     const int blocks = static_cast<int>((elementCount + threads - 1) /
                                         threads);
     UnpackNvfp4Block16Kernel<<<blocks, threads, 0, stream>>>(
-        storage, unpackedWeight, unpackedScales, K, N,
+        storage, unpackedWeight, unpackedScales, K, N, packedN,
         static_cast<int>(sourceRowBytes),
         layouts.weightConverter->order == tm::kRowMajor);
 
@@ -926,10 +963,31 @@ bool GemmNvfp4(const uint8_t *storage, const half *in, half *out,
     if (storage == nullptr || in == nullptr || out == nullptr || tokens <= 0) {
         return false;
     }
-    PackedLayouts layouts;
-    if (!MakeNvfp4Layouts(K, N, layouts)) {
+    int packedN = 0;
+    if (!GetNvfp4PackedOutputDim(N, packedN)) {
         return false;
     }
+    PackedLayouts layouts;
+    if (!MakeNvfp4Layouts(K, packedN, layouts)) {
+        return false;
+    }
+
+    half *gemmOutput = out;
+    if (packedN != N) {
+        void *temporary = nullptr;
+        if (FastllmCudaTryMalloc(
+                &temporary, (size_t)tokens * packedN * sizeof(half)) !=
+            FASTLLM_CUDA_TRY_MALLOC_SUCCESS) {
+            return false;
+        }
+        gemmOutput = static_cast<half *>(temporary);
+    }
+    auto releaseTemporary = [&]() {
+        if (gemmOutput != out &&
+            !FastllmCudaFreeAfterStream(gemmOutput, stream)) {
+            FastllmCudaFree(gemmOutput);
+        }
+    };
 
     tm::MatrixLayout descA{
         turbomind::kHalf, tm::kRowMajor, tokens, K, K,
@@ -938,9 +996,9 @@ bool GemmNvfp4(const uint8_t *storage, const half *in, half *out,
     tm::MatrixLayout descB = layouts.packedWeight;
     tm::MatrixLayout descV = layouts.packedScale;
     tm::MatrixLayout descD{
-        turbomind::kHalf, tm::kRowMajor, tokens, N, N,
+        turbomind::kHalf, tm::kRowMajor, tokens, packedN, packedN,
     };
-    const size_t packedWeightBytes = (size_t)K * N / 2;
+    const size_t packedWeightBytes = (size_t)K * packedN / 2;
 
     tm::Operation op{};
     const int device = CurrentDevice();
@@ -952,17 +1010,33 @@ bool GemmNvfp4(const uint8_t *storage, const half *in, half *out,
     DeviceRuntime &runtime = GetRuntime(device);
     std::lock_guard<std::mutex> runLock(runtime.runMutex);
     op.dispatch = SelectDispatch(
-        runtime, DenseWeightKind::kNvfp4, tokens, N, K,
+        runtime, DenseWeightKind::kNvfp4, tokens, packedN, K,
         kNvfp4GroupSize);
     const int ec = runtime.gemm.Run(
         op, 1.f, in, descA, nullptr, descU, storage, descB,
-        storage + packedWeightBytes, descV, 0.f, out, descD, out, descD,
+        storage + packedWeightBytes, descV, 0.f,
+        gemmOutput, descD, gemmOutput, descD,
         runtime.workspace.workspace, stream);
     if (ec != 0) {
-        printf("Fastllm NVFP4 SM70 GEMM failed (ec=%d, M=%d, N=%d, K=%d).\n",
-               ec, tokens, N, K);
+        releaseTemporary();
+        printf("Fastllm NVFP4 SM70 GEMM failed "
+               "(ec=%d, M=%d, N=%d, packedN=%d, K=%d).\n",
+               ec, tokens, N, packedN, K);
         return false;
     }
+    if (gemmOutput != out) {
+        const int threads = 256;
+        const dim3 grid(
+            (N + threads - 1) / threads,
+            std::min(tokens, 65535));
+        CropNvfp4OutputKernel<<<grid, threads, 0, stream>>>(
+            gemmOutput, out, tokens, N, packedN);
+        if (cudaPeekAtLastError() != cudaSuccess) {
+            releaseTemporary();
+            return false;
+        }
+    }
+    releaseTemporary();
     return true;
 }
 

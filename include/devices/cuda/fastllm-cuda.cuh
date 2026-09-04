@@ -254,11 +254,15 @@ FastllmCudaTryMallocResult FastllmCudaTryMalloc(void **ret, size_t size);
 FastllmCudaTryMallocResult FastllmCudaTryDirectMalloc(void **ret, size_t size);
 void *FastllmCudaMalloc(size_t size);
 void FastllmCudaForceFree(void *ret);
-// Return a pooled allocation after all work already submitted to this host
-// thread's per-thread stream has completed. The allocation is detached from
-// its Data owner immediately but is not eligible for pool reuse until the
-// recorded stream event is ready. Returns false for non-pooled allocations or
-// while CUDA Graph capture owns the ordinary free path.
+// Return a pooled allocation after all work already submitted to stream has
+// completed. The allocation is detached from its Data owner immediately but is
+// not eligible for pool reuse until the recorded stream event is ready. Returns
+// false for non-pooled allocations or while CUDA Graph capture owns the
+// ordinary free path.
+#ifdef __CUDACC__
+bool FastllmCudaFreeAfterStream(void *ret, cudaStream_t stream);
+#endif
+// Convenience wrapper for cudaStreamPerThread.
 bool FastllmCudaFreeAfterCurrentThreadStream(void *ret);
 void FastllmCudaFree(void *ret);
 void DisableCudaMalloc();

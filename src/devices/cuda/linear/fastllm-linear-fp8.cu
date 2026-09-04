@@ -3490,7 +3490,9 @@ static bool FastllmCudaEnsureNVFP4Sm70TurboMindLayout(
     if (FastllmCudaHasNVFP4Sm70TurboMindLayout(weight)) {
         return true;
     }
-    if (weight.cudaData == nullptr || weight.IsRepacked) {
+    if (weight.cudaData == nullptr || weight.IsRepacked ||
+        weight.dataType != fastllm::DataType::NVFP4_BLOCK_16 ||
+        weight.blockM != 16 || weight.blockK != 1) {
         return false;
     }
     if (!fastllm::awq_sm70::PrepareNvfp4InPlace(
@@ -3508,10 +3510,7 @@ static bool FastllmCudaTryNVFP4Sm70TurboMind(
         int n, int m, int k) {
     if (!FastllmCudaHasNVFP4Sm70TurboMindLayout(weight)) {
         if (n < 1 || n > 16 ||
-            weight.dataType != fastllm::DataType::NVFP4_BLOCK_16 ||
-            weight.blockM != 16 || weight.blockK != 1 ||
             !FastllmCudaGetNcclForceSync() ||
-            !fastllm::awq_sm70::Nvfp4Supported() ||
             !FastllmCudaEnsureNVFP4Sm70TurboMindLayout(weight, m, k)) {
             return false;
         }
