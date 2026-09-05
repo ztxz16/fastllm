@@ -7,6 +7,9 @@
 
 #define FASTLLM_CUDA_NO_MALLOC_CHECK_MACRO
 #include "fastllm-cuda.cuh"
+#ifndef USE_ROCM
+#include "fastllm-cuda-ordered-reduce.cuh"
+#endif
 #include "fastllm.h"
 #include "utils/utils.h"
 
@@ -10530,8 +10533,8 @@ __global__ void FastllmFusedSigmoidSelectExpert256Top10Kernel(
     }
 }
 
-// Qwen4 decode and speculative verification use a fixed 512-expert, top-10
-// router. APPLY_SOFTMAX joins the established 256-thread FP32 softmax with
+// Shape specialization for 512 experts and top-10, independent of model name.
+// APPLY_SOFTMAX joins the established 256-thread FP32 softmax with
 // selection while reproducing its max/sum/division order exactly. One warp
 // then performs TopK; exact ties rebuild the original 64-thread lists and
 // merge tree so both instantiations remain compatible with the legacy path.
@@ -10550,9 +10553,8 @@ __global__ void FastllmSelectExpert512Top10Kernel(
     __shared__ float selectedProbabilities[TOPK];
     __shared__ float legacyKeys[LEGACY_THREADS][TOPK];
     __shared__ float legacyIds[LEGACY_THREADS][TOPK];
-    __shared__ float softmaxReduce[256];
+    __shared__ float softmaxReduce[257];
     __shared__ __align__(16) float softmaxProbabilities[512];
-    __shared__ float softmaxMaximum;
 
     int token = blockIdx.x;
     const float *tokenLogits = logits + (size_t)token * 512;
@@ -10565,21 +10567,8 @@ __global__ void FastllmSelectExpert512Top10Kernel(
         for (int expert = tid; expert < 512; expert += blockDim.x) {
             maxValue = max(maxValue, tokenLogits[expert]);
         }
-        softmaxReduce[tid] = maxValue;
-        __syncthreads();
-        for (unsigned int stride = blockDim.x / 2;
-             stride > 0; stride >>= 1) {
-            if (tid < stride) {
-                softmaxReduce[tid] = max(
-                    softmaxReduce[tid],
-                    softmaxReduce[tid + stride]);
-            }
-            __syncthreads();
-        }
-        if (tid == 0) {
-            softmaxMaximum = softmaxReduce[0];
-        }
-        __syncthreads();
+        float softmaxMaximum = fastllm::cuda::OrderedBlockReduce<256>(
+            maxValue, softmaxReduce, fastllm::cuda::OrderedMax{});
 
         float sum = 0.0f;
         for (int expert = tid; expert < 512; expert += blockDim.x) {
@@ -10587,21 +10576,11 @@ __global__ void FastllmSelectExpert512Top10Kernel(
                 exp(tokenLogits[expert] - softmaxMaximum);
             sum += softmaxProbabilities[expert];
         }
-        softmaxReduce[tid] = sum;
-        __syncthreads();
-        for (unsigned int stride = blockDim.x / 2;
-             stride > 0; stride >>= 1) {
-            if (tid < stride) {
-                softmaxReduce[tid] += softmaxReduce[tid + stride];
-            }
-            __syncthreads();
-        }
-        if (tid == 0 && fabs(softmaxReduce[0]) < 1e-6) {
-            softmaxReduce[0] = 0.0001f;
-        }
-        __syncthreads();
+        float denominator = fastllm::cuda::OrderedBlockReduce<256>(
+            sum, softmaxReduce, fastllm::cuda::OrderedSum{});
+        if (fabs(denominator) < 1e-6) denominator = 0.0001f;
         for (int expert = tid; expert < 512; expert += blockDim.x) {
-            softmaxProbabilities[expert] /= softmaxReduce[0];
+            softmaxProbabilities[expert] /= denominator;
         }
         __syncthreads();
         probabilityLogits = softmaxProbabilities;
@@ -10611,7 +10590,6 @@ __global__ void FastllmSelectExpert512Top10Kernel(
     }
     int lane = tid;
     int firstExpert = lane * VALUES_PER_LANE;
-    float probabilities[VALUES_PER_LANE];
     float choiceKeys[VALUES_PER_LANE];
     float firstProbabilities[8];
     float secondProbabilities[8];
@@ -10622,37 +10600,22 @@ __global__ void FastllmSelectExpert512Top10Kernel(
 #pragma unroll
     for (int part = 0; part < VALUES_PER_LANE; ++part) {
         int expert = firstExpert + part;
-        probabilities[part] = part < 8 ? firstProbabilities[part]
-                                       : secondProbabilities[part - 8];
-        float key = probabilities[part] + (hasBias ? bias[expert] : 0.0f);
+        float probability = part < 8 ? firstProbabilities[part]
+                                    : secondProbabilities[part - 8];
+        float key = probability + (hasBias ? bias[expert] : 0.0f);
         choiceKeys[part] = isfinite(key) ? key : NEG_INF;
     }
 
 #pragma unroll
     for (int rank = 0; rank < TOPK; ++rank) {
-        FastllmRouterCandidate best = {choiceKeys[0], firstExpert};
-#pragma unroll
-        for (int part = 1; part < VALUES_PER_LANE; ++part) {
-            FastllmRouterCandidate candidate = {
-                choiceKeys[part], firstExpert + part};
-            if (FastllmRouterCandidateBetter(candidate, best)) {
-                best = candidate;
-            }
-        }
-#pragma unroll
-        for (int mask = 16; mask > 0; mask >>= 1) {
-            FastllmRouterCandidate other;
-            other.key = __shfl_xor_sync(FULL_WARP_MASK, best.key, mask);
-            other.id = __shfl_xor_sync(FULL_WARP_MASK, best.id, mask);
-            if (FastllmRouterCandidateBetter(other, best)) {
-                best = other;
-            }
-        }
+        auto winner = fastllm::cuda::WarpArgMax(choiceKeys, firstExpert, 512);
+        FastllmRouterCandidate best{winner.value, winner.index};
 
         int owner = best.id / VALUES_PER_LANE;
         int ownerPart = best.id % VALUES_PER_LANE;
-        float probability = probabilities[ownerPart];
-        probability = __shfl_sync(FULL_WARP_MASK, probability, owner);
+        // The selected row is already available in shared/global storage.
+        // A dynamic index into a per-thread array forces a local-memory stack.
+        float probability = probabilityLogits[best.id];
         if (lane == 0) {
             selectedKeys[rank] = best.key;
             selectedIds[rank] = best.id;
@@ -11757,11 +11720,11 @@ bool FastllmCudaFusedSoftmaxSelectExpert(
         fastllm::Data &index, fastllm::Data &score,
         int topk, bool needNorm, float routeScale) {
 #ifndef USE_ROCM
-    const bool qwen4Shape =
+    const bool softmax512Top10Shape =
         topk == 10 && !logits.dims.empty() &&
         logits.dims.back() == 512 && logits.Count(0) > 0 &&
         logits.dataType == fastllm::DataType::FLOAT32;
-    if (qwen4Shape) {
+    if (softmax512Top10Shape) {
         const bool hasBias =
             gateBias != nullptr && !gateBias->dims.empty();
         if (hasBias &&
@@ -11794,7 +11757,7 @@ bool FastllmCudaFusedSoftmaxSelectExpert(
         const cudaError_t state = cudaGetLastError();
         if (state != cudaSuccess) {
             checkCudaErrors(
-                "Error: fused Qwen4 SelectExpert launch failed!",
+                "Error: fused softmax SelectExpert launch failed!",
                 state);
         }
         FastllmCudaFinishInput(logits, (void *)cudaLogits);
