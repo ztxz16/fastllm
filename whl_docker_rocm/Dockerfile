@@ -1,23 +1,13 @@
-# 使用 Ubuntu 22.04 作为基础镜像
-FROM ubuntu:22.04
+# Build context: whl_docker_rocm/ (no source tree or model files are copied).
+ARG UBUNTU_VERSION=22.04
+ARG BASE_IMAGE=ubuntu:${UBUNTU_VERSION}
+FROM ${BASE_IMAGE}
 
-# 设置非交互式安装环境
-ENV DEBIAN_FRONTEND=noninteractive
+ARG ROCM_VERSION=10.0.0
+COPY install-sdk.sh /tmp/install-sdk.sh
+RUN bash /tmp/install-sdk.sh "${ROCM_VERSION}" && rm /tmp/install-sdk.sh
 
-# 安装基础工具和GCC版本
-RUN apt-get update && apt-get install gcc g++ make -y
-# 验证安装
-RUN g++ --version
-
-RUN apt-get update
-RUN apt-get install cmake -y
-RUN apt-get install libnuma-dev -y
-RUN apt-get install python3-pip -y
-RUN apt-get install wget -y
-
-RUN wget https://repo.radeon.com/amdgpu-install/6.3.3/ubuntu/jammy/amdgpu-install_6.3.60303-1_all.deb
-RUN apt install ./amdgpu-install_6.3.60303-1_all.deb -y
-RUN amdgpu-install --usecase=hiplibsdk,rocm,dkms -y
-RUN apt-get install python-is-python3 -y
-RUN pip install setuptools wheel -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
-RUN apt install libstdc++-12-dev
+ENV PATH="/opt/rocm-venv/bin:${PATH}"
+WORKDIR /workspace/fastllm
+# Mount the source checkout here and pass the usual wheel-builder arguments.
+ENTRYPOINT ["bash", "/workspace/fastllm/make_whl_rocm.sh"]
