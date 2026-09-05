@@ -1,3 +1,5 @@
+import argparse
+import hashlib
 import hmac
 import importlib.util
 import ipaddress
@@ -362,6 +364,7 @@ def _empty_runtime_state() -> Dict[str, Any]:
         "progressIndeterminate": False,
         "message": "Choose a launch item to start a service",
         "startedAt": None,
+        "sessionId": "",
         "exitCode": None,
     }
 
@@ -392,7 +395,7 @@ class LauncherRuntime:
     cannot overwrite the state of a replacement process.
     """
 
-    def __init__(self, config_path: str = "", popen_factory=None):
+    def __init__(self, config_path: str = "", popen_factory=None, webui_history_dir: str = ""):
         self.config_path = os.path.abspath(os.path.expanduser(
             config_path or get_saved_commands_path()
         ))
@@ -402,6 +405,10 @@ class LauncherRuntime:
         self._generation = 0
         self._stopping_generation = -1
         self._state = _empty_runtime_state()
+        self._service_api_key = ""
+        self._webui_app = None
+        self._webui_session = ""
+        self._webui_history_dir = webui_history_dir
         self._download_process = None
         self._download_generation = 0
         self._download_stopping_generation = -1
@@ -422,6 +429,38 @@ class LauncherRuntime:
         config = new_deploy_config(configs)
         config.command = "server"
         return asdict(config)
+
+    def _close_webui_locked(self):
+        if self._webui_app is not None:
+            self._webui_app.state.runtime.close()
+        self._webui_app = None
+        self._webui_session = ""
+
+    def embedded_webui(self, session_id: str, launcher_host: str):
+        """Reuse the standalone WebUI with an immutable active-service client."""
+        with self._lock:
+            if (self._state["command"] != "server" or not self._state["ready"]
+                    or self._state["phase"] != "running" or self._process is None
+                    or self._process.poll() is not None):
+                raise LauncherError("Start an API Server before opening WebUI.")
+            if not session_id or session_id != self._state["sessionId"]:
+                raise LauncherError("The model service changed. Reopen WebUI.")
+            if self._webui_app is not None and self._webui_session == session_id:
+                return self._webui_app
+            self._close_webui_locked()
+            from .webui_server import add_webui_args, create_app
+            args = add_webui_args(argparse.ArgumentParser()).parse_args([])
+            args.host = launcher_host
+            args.api_base = self._state["endpoint"].rstrip("/") + "/v1"
+            args.api_model = self._state["modelName"]
+            args.api_key = self._service_api_key
+            args.agent_runtime = "auto"
+            args.embedded = True
+            if self._webui_history_dir:
+                args.history_dir = self._webui_history_dir
+            self._webui_app = create_app(args)
+            self._webui_session = session_id
+            return self._webui_app
 
     def download_defaults(self) -> Dict[str, Any]:
         model_id = DEFAULT_MODELSCOPE_MODEL_ID
@@ -757,6 +796,12 @@ class LauncherRuntime:
             "127.0.0.1" if config.command == "webui" else config.host.strip()
         )
         argv = build_fastllm_argv(config)
+        api_key = config.api_key.strip()
+        for index, value in enumerate(argv):
+            if value == "--api_key" and index + 1 < len(argv):
+                api_key = argv[index + 1]
+            elif value.startswith("--api_key="):
+                api_key = value.split("=", 1)[1]
         environment_overrides = build_fastllm_env(config)
         display_command = _redacted_command(argv, environment_overrides)
         endpoint = _display_endpoint(config)
@@ -782,7 +827,9 @@ class LauncherRuntime:
                 raise LauncherError(
                     f"Service port {port_host}:{config.port.strip()} is already in use."
                 )
+            self._close_webui_locked()
             self._generation += 1
+            self._service_api_key = api_key
             generation = self._generation
             self._stopping_generation = -1
             self._state.update({
@@ -804,6 +851,7 @@ class LauncherRuntime:
                 "progressIndeterminate": True,
                 "message": f"Starting ftllm {config.command}...",
                 "startedAt": time.time(),
+                "sessionId": secrets.token_hex(16),
                 "exitCode": None,
             })
             self._last_progress_stage = ""
@@ -845,7 +893,7 @@ class LauncherRuntime:
                 process,
                 generation,
                 endpoint,
-                config.api_key,
+                api_key,
                 config.command,
             ),
             name="ftllm-launcher-readiness",
@@ -975,6 +1023,7 @@ class LauncherRuntime:
         with self._lock:
             if generation != self._generation:
                 return
+            self._close_webui_locked()
             stopping = self._stopping_generation == generation
             command = self._state.get("command", "server")
             service_name = "WebUI" if command == "webui" else "Model service"
@@ -997,6 +1046,7 @@ class LauncherRuntime:
 
     def stop(self) -> Dict[str, Any]:
         with self._lock:
+            self._close_webui_locked()
             process = self._process
             generation = self._generation
             if process is None or process.poll() is not None:
@@ -1815,6 +1865,7 @@ def create_launcher_app(
     runtime: LauncherRuntime,
     control_token: str,
     launcher_addresses: Optional[List[Dict[str, str]]] = None,
+    launcher_host: str = "127.0.0.1",
 ):
     try:
         from fastapi import FastAPI, Request
@@ -1836,8 +1887,19 @@ def create_launcher_app(
     ]
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
+    webui_cookie = "ftllm-webui-" + hashlib.sha256(control_token.encode()).hexdigest()[:12]
+    webui_token = hmac.new(control_token.encode(), b"embedded-webui", hashlib.sha256).hexdigest()
+
     @app.middleware("http")
     async def protect_launcher(request: Request, call_next):
+        is_webui = request.url.path.startswith("/webui/")
+        if is_webui:
+            supplied = request.cookies.get(webui_cookie, "")
+            if not hmac.compare_digest(supplied, webui_token):
+                return JSONResponse({"detail": "Open WebUI from the Launcher."}, status_code=403)
+            origin = request.headers.get("origin")
+            if request.method not in ("GET", "HEAD", "OPTIONS") and origin and origin != str(request.base_url).rstrip("/"):
+                return JSONResponse({"detail": "Invalid request origin."}, status_code=403)
         if request.url.path.startswith("/api/"):
             content_length = request.headers.get("content-length", "0")
             try:
@@ -1854,15 +1916,26 @@ def create_launcher_app(
                     status_code=403,
                 )
         response = await call_next(request)
-        response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; script-src 'self'; style-src 'self'; "
-            "img-src 'self' data:; connect-src 'self'; object-src 'none'; "
-            "base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
-        )
+        if is_webui:
+            # The original WebUI page supplies nonces for its inline code.
+            # Other embedded resources must not become executable documents.
+            response.headers.setdefault("Content-Security-Policy", (
+                "default-src 'self'; script-src 'none'; style-src 'self'; "
+                "object-src 'none'; base-uri 'none'; frame-ancestors 'self'"
+            ))
+            if "/attachments/" in request.url.path:
+                response.headers["Content-Security-Policy"] += "; sandbox allow-downloads"
+            response.headers["X-Frame-Options"] = "SAMEORIGIN"
+        else:
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'self'; script-src 'self'; style-src 'self'; "
+                "img-src 'self' data:; connect-src 'self'; frame-src 'self'; object-src 'none'; "
+                "base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
+            )
+            response.headers["X-Frame-Options"] = "DENY"
         response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "no-referrer"
-        if request.url.path.startswith("/api/"):
+        if is_webui or request.url.path.startswith("/api/"):
             response.headers["Cache-Control"] = "no-store"
         return response
 
@@ -1939,6 +2012,29 @@ def create_launcher_app(
     @app.get("/api/runtime")
     async def runtime_state():
         return runtime.state()
+
+    @app.post("/api/webui/open")
+    async def open_webui(request: Request):
+        payload = await request.json()
+        session_id = payload.get("sessionId", "") if isinstance(payload, dict) else ""
+        await run_in_threadpool(runtime.embedded_webui, session_id, launcher_host)
+        response = JSONResponse({"url": f"/webui/{session_id}/"})
+        response.set_cookie(
+            webui_cookie, webui_token, path="/webui/", httponly=True,
+            samesite="strict", secure=request.url.scheme == "https",
+        )
+        return response
+
+    async def embedded_webui(scope, receive, send):
+        session_id = scope.get("path_params", {}).get("session_id", "")
+        try:
+            webui_app = await run_in_threadpool(runtime.embedded_webui, session_id, launcher_host)
+        except LauncherError as error:
+            await JSONResponse({"detail": str(error)}, status_code=409)(scope, receive, send)
+            return
+        await webui_app(scope, receive, send)
+
+    app.mount("/webui/{session_id}", embedded_webui, name="embedded-webui")
 
     @app.post("/api/download/preview")
     async def preview_download(request: Request):
@@ -2193,7 +2289,7 @@ def fastllm_launcher(args) -> int:
     runtime = LauncherRuntime(getattr(args, "config", ""))
     launcher_addresses = _launcher_access_addresses(host, port)
     try:
-        app = create_launcher_app(runtime, control_token, launcher_addresses)
+        app = create_launcher_app(runtime, control_token, launcher_addresses, launcher_host=host)
     except LauncherError as error:
         print(str(error), file=sys.stderr)
         return 1

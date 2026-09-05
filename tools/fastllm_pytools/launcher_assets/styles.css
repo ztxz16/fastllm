@@ -732,6 +732,19 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 .toast-region { z-index: 90; }
 
 
+/* The existing WebUI owns its full workspace, including its history sidebar. */
+.app-shell.webui-active { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); }
+.webui-active > .sidebar { display: none; }
+.webui-active .workspace-breadcrumb { display: flex; }
+.webui-active .workspace-breadcrumb > .management-label,
+.webui-active .workspace-breadcrumb > [aria-hidden] { display: none; }
+.webui-active .page-scroll { display: flex; overflow: hidden; padding: 0; scrollbar-gutter: auto; }
+#view-webui.active { display: flex; flex: 1; min-height: 0; width: 100%; max-width: none; animation: none; }
+.webui-frame { flex: 1; width: 100%; min-width: 0; height: 100%; border: 0; background: white; }
+.webui-placeholder { display: flex; flex: 1; align-items: center; justify-content: center; flex-direction: column; gap: 16px; padding: 24px; text-align: center; }
+.webui-placeholder > .icon { width: 30px; height: 30px; color: var(--primary); }
+.webui-placeholder h1 { font-size: 22px; font-weight: 600; }
+.webui-placeholder p { max-width: 560px; color: var(--muted); font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
 
 @media (max-width: 1100px) {
   .app-shell { grid-template-columns: 178px minmax(0, 1fr); }
@@ -750,6 +763,11 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 }
 @media (max-width: 900px) {
   .workspace-breadcrumb { display: none; }
+  .webui-active .workspace-breadcrumb { flex-shrink: 0; gap: 8px; }
+  .webui-active #current-view-title { display: none; }
+  .webui-active .topbar { gap: 12px; }
+  .webui-active .service-controls { width: auto; }
+  .webui-active .topbar-status { display: none; }
   .service-controls { width: 100%; justify-content: space-between; }
   .library-toolbar { align-items: stretch; flex-direction: column; gap: 12px; }
   .profile-filters { width: fit-content; }

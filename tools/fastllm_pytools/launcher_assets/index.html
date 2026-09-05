@@ -20,6 +20,7 @@
       <symbol id="icon-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></symbol>
       <symbol id="icon-arrow" viewBox="0 0 24 24"><path d="M4 12h16m-6-6 6 6-6 6"/></symbol>
       <symbol id="icon-spark" viewBox="0 0 24 24"><path d="m12 3 2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5L12 3Z"/></symbol>
+      <symbol id="icon-chat" viewBox="0 0 24 24"><path d="M21 11a8 8 0 0 1-8 8H6l-4 3V11a9 9 0 0 1 19 0Z"/><path d="M7 10h10M7 14h6"/></symbol>
     </svg>
     <div class="app-shell">
       <aside class="sidebar">
@@ -51,6 +52,10 @@
             <svg class="icon" aria-hidden="true"><use href="#icon-cpu"/></svg>
             <span><strong>硬件信息</strong></span>
           </button>
+          <button class="nav-button" type="button" data-view-button="webui">
+            <svg class="icon" aria-hidden="true"><use href="#icon-chat"/></svg>
+            <span><strong>WebUI</strong></span>
+          </button>
         </nav>
 
         <div class="sidebar-footer">
@@ -76,7 +81,7 @@
 
       <main class="workspace">
         <header class="topbar">
-          <div class="workspace-breadcrumb"><span>模型管理</span><span aria-hidden="true">/</span><strong id="current-view-title">启动服务</strong></div>
+          <div class="workspace-breadcrumb"><button id="back-to-management" class="secondary-button hidden" type="button" data-open-view="launch">返回模型管理</button><span class="management-label">模型管理</span><span aria-hidden="true">/</span><strong id="current-view-title">启动服务</strong></div>
           <div class="service-controls">
           <div class="topbar-status">
             <span id="status-dot" class="status-dot stopped"></span>
@@ -86,6 +91,7 @@
             </div>
           </div>
           <div class="topbar-actions">
+            <button id="open-webui" class="primary-button" type="button" data-open-view="webui" disabled>打开 WebUI</button>
             <button id="open-endpoint" class="secondary-button" type="button" disabled>打开服务</button>
             <button id="stop-runtime" class="secondary-button danger hidden" type="button">■ 停止</button>
           </div>
@@ -434,6 +440,17 @@
                 </div>
               </form>
             </div>
+          </section>
+
+          <section id="view-webui" class="view">
+            <div id="webui-placeholder" class="webui-placeholder">
+              <svg class="icon" aria-hidden="true"><use href="#icon-chat"/></svg>
+              <h1>WebUI</h1>
+              <p id="webui-status">启动 API Server 后即可使用 WebUI。</p>
+              <button id="webui-retry" class="secondary-button hidden" type="button">重新打开</button>
+              <button class="primary-button" type="button" data-open-view="launch">返回模型管理</button>
+            </div>
+            <iframe id="webui-frame" class="webui-frame hidden" title="FastLLM WebUI" allow="clipboard-write"></iframe>
           </section>
 
           <section id="view-download" class="view">

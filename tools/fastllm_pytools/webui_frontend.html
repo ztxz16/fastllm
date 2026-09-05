@@ -1,11 +1,11 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-base-path="__WEBUI_BASE_PATH__">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="color-scheme" content="light">
   <meta name="theme-color" content="#5268eb">
-  <link rel="icon" href="/assets/fastllm_icon.svg" type="image/svg+xml">
+  <link rel="icon" href="__WEBUI_BASE_PATH__/assets/fastllm_icon.svg" type="image/svg+xml">
   <title>FastLLM</title>
   <style>
     :root {
@@ -494,13 +494,15 @@
       .message.user .message-body { max-width: 88%; }.attachments { grid-template-columns: repeat(2,minmax(0,1fr)); }.deck-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
       .agent-grid { grid-template-columns: 1fr; padding: 0 14px 18px; }.agent-dialog-head { padding: 18px 16px 14px; }.agent-card { min-height: 88px; }
     }
+    html[data-embedded] .sidebar .brand { display: none; }
+    html[data-embedded] .private-badge { display: none; }
   </style>
 </head>
 <body>
   <div class="app">
     <aside class="sidebar" id="sidebar">
       <div class="brand">
-        <div class="brand-mark"><img src="/assets/fastllm_icon.svg" alt=""></div>
+        <div class="brand-mark"><img src="__WEBUI_BASE_PATH__/assets/fastllm_icon.svg" alt=""></div>
         <div class="brand-copy"><strong>FastLLM</strong><small>LOCAL AI WORKSPACE</small></div>
       </div>
       <button class="new-chat" id="newChat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg><span data-i18n="nav.new_chat">新建对话</span></button>
@@ -622,13 +624,13 @@
     <div class="dialog-foot"><button class="dialog-button" id="cancelData" data-i18n="common.cancel">取消</button><button class="dialog-button primary" id="createDataAnalysis" data-i18n="data.start">开始分析</button></div>
   </dialog>
 
-  <script src="/assets/webui_locales.js"></script>
+  <script src="__WEBUI_BASE_PATH__/assets/webui_locales.js"></script>
   <script>
     const $ = (selector) => document.querySelector(selector);
     const localeResources = window.FASTLLM_LOCALES || {};
     const preferredLocale = (() => { try { const saved = localStorage.getItem("fastllm.locale"); if (localeResources[saved]) return saved; } catch (_) {} return "zh-CN"; })();
     const state = { config: {}, conversations: [], activeId: null, record: null, pending: [], uploading: 0, tasks: new Map(), stopping: new Set(), loadSequence: 0, agent: "chat", locale: preferredLocale, menuConversationId: null, renameConversationId: null, deleteConversationId: null, workspaceDirectory: null, workspaceLoading: false };
-    const icon = `<img src="/assets/fastllm_icon.svg" alt="" draggable="false">`;
+    const icon = `<img src="__WEBUI_BASE_PATH__/assets/fastllm_icon.svg" alt="" draggable="false">`;
     const thinkingOptions = [["关闭","thinking.off"],["低","thinking.low"],["中","thinking.medium"],["高","thinking.high"]];
     const conversationOptions = [["关闭","mode.chat"],["快速搜索","mode.web_fast"],["深度浏览","mode.web_deep"]];
     const agentLabelKeys = {knowledge:"agent.knowledge",data:"agent.data",ppt:"agent.ppt",code:"agent.code",workspace:"agent.workspace"};
@@ -665,8 +667,14 @@
       if (!localeResources[locale]) return; state.locale = locale; try { localStorage.setItem("fastllm.locale",locale); } catch (_) {} $("#languageMenu").classList.remove("open"); applyLocale();
     }
 
+    const basePath = document.documentElement.dataset.basePath || "";
+    function localUrl(path) {
+      const value = String(path || "");
+      return value.startsWith("/") && !value.startsWith("//") ? basePath + value : value;
+    }
+
     async function api(path, options = {}) {
-      const response = await fetch(path, { ...options, headers: { "Content-Type": "application/json", ...(options.headers || {}) } });
+      const response = await fetch(localUrl(path), { ...options, headers: { "Content-Type": "application/json", ...(options.headers || {}) } });
       if (!response.ok) {
         let message = `${response.status} ${response.statusText}`;
         try { message = (await response.json()).detail || message; } catch (_) {}
@@ -768,12 +776,12 @@
       if (!attachments?.length) return; const grid = document.createElement("div"); grid.className = "attachments";
       for (const attachment of attachments) {
         if (attachment.kind === "document") {
-          let url; try { url = new URL(attachment.url,location.origin); if (url.origin !== location.origin || !url.pathname.startsWith("/api/conversations/")) continue; } catch (_) { continue; }
+          let url; try { url = new URL(localUrl(attachment.url),location.origin); if (url.origin !== location.origin || !url.pathname.startsWith(localUrl("/api/conversations/"))) continue; } catch (_) { continue; }
           const card = document.createElement("a"); card.className = "attachment-card document"; card.href = url.href; card.target = "_blank"; card.rel = "noopener noreferrer";
           const iconBox = document.createElement("span"); iconBox.className = "document-icon"; iconBox.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M5 3h10l4 4v14H5zM15 3v5h5M8 12h8M8 16h6"/></svg>`;
           const copy = document.createElement("span"); copy.className = "document-copy"; const name = document.createElement("span"); name.className = "attachment-name"; name.textContent = attachment.name || t("common.document"); const meta = document.createElement("small"); meta.textContent = `${(attachment.name?.split(".").pop() || "FILE").toUpperCase()} · ${attachment.size >= 1048576 ? `${(attachment.size/1048576).toFixed(1)} MB` : `${Math.max(1,Math.round((attachment.size || 0)/1024))} KB`}`; copy.append(name,meta); card.append(iconBox,copy); grid.append(card); continue;
         }
-        const card = document.createElement("div"); card.className = "attachment-card"; const media = document.createElement(attachment.kind === "video" ? "video" : "img"); media.src = attachment.url; media.alt = attachment.name || t("common.attachment"); if (attachment.kind === "video") media.controls = true; const name = document.createElement("div"); name.className = "attachment-name"; name.textContent = attachment.name || t("common.attachment"); card.append(media,name); grid.append(card);
+        const card = document.createElement("div"); card.className = "attachment-card"; const media = document.createElement(attachment.kind === "video" ? "video" : "img"); media.src = localUrl(attachment.url); media.alt = attachment.name || t("common.attachment"); if (attachment.kind === "video") media.controls = true; const name = document.createElement("div"); name.className = "attachment-name"; name.textContent = attachment.name || t("common.attachment"); card.append(media,name); grid.append(card);
       }
       parent.append(grid);
     }
@@ -792,19 +800,19 @@
     function renderArtifacts(parent, artifacts) {
       for (const artifact of artifacts || []) {
         if (artifact.kind === "chart") {
-          let url; try { url = new URL(artifact.url,location.origin); if (url.origin !== location.origin || !url.pathname.startsWith("/api/conversations/")) continue; } catch (_) { continue; }
+          let url; try { url = new URL(localUrl(artifact.url),location.origin); if (url.origin !== location.origin || !url.pathname.startsWith(localUrl("/api/conversations/"))) continue; } catch (_) { continue; }
           const chart = document.createElement("a"); chart.className = "analysis-chart"; chart.href = url.href; chart.target = "_blank"; chart.rel = "noopener noreferrer"; const image = document.createElement("img"); image.src = url.href; image.alt = artifact.title || artifact.name || t("artifact.chart"); image.loading = "lazy"; const label = document.createElement("span"); label.textContent = artifact.title || artifact.name || t("artifact.chart"); chart.append(image,label); parent.append(chart); continue;
         }
         if (artifact.kind === "analysis_report") {
-          let url; try { url = new URL(artifact.url,location.origin); if (url.origin !== location.origin || !url.pathname.startsWith("/api/conversations/")) continue; } catch (_) { continue; }
+          let url; try { url = new URL(localUrl(artifact.url),location.origin); if (url.origin !== location.origin || !url.pathname.startsWith(localUrl("/api/conversations/"))) continue; } catch (_) { continue; }
           const card = document.createElement("div"); card.className = "artifact-card"; const main = document.createElement("div"); main.className = "artifact-main"; const iconBox = document.createElement("div"); iconBox.className = "artifact-icon data"; iconBox.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M5 3h10l4 4v14H5zM15 3v5h5M8 12h8M8 16h8"/></svg>`; const copy = document.createElement("div"); copy.className = "artifact-copy"; const name = document.createElement("strong"); name.textContent = artifact.name || t("artifact.analysis_report"); const meta = document.createElement("small"); meta.textContent = t("artifact.analysis_meta",{datasets:artifact.datasets || 0,analyses:artifact.analyses || 0,size:Math.max(1,Math.round((artifact.size || 0)/1024))}); copy.append(name,meta); const download = document.createElement("a"); download.className = "artifact-download"; download.href = url.href; download.download = artifact.name || t("artifact.analysis_report"); download.textContent = t("artifact.download_excel"); main.append(iconBox,copy,download); card.append(main); parent.append(card); continue;
         }
         if (artifact.kind === "code_patch") {
-          let url; try { url = new URL(artifact.url,location.origin); if (url.origin !== location.origin || !url.pathname.startsWith("/api/conversations/")) continue; } catch (_) { continue; }
+          let url; try { url = new URL(localUrl(artifact.url),location.origin); if (url.origin !== location.origin || !url.pathname.startsWith(localUrl("/api/conversations/"))) continue; } catch (_) { continue; }
           const card = document.createElement("div"); card.className = "artifact-card"; const main = document.createElement("div"); main.className = "artifact-main"; const iconBox = document.createElement("div"); iconBox.className = "artifact-icon code"; iconBox.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="m8 9-4 3 4 3M16 9l4 3-4 3M14 5l-4 14"/></svg>`; const copy = document.createElement("div"); copy.className = "artifact-copy"; const name = document.createElement("strong"); name.textContent = artifact.name || t("artifact.code_patch"); const meta = document.createElement("small"); meta.textContent = t("artifact.code_meta",{files:artifact.files || 0,additions:artifact.additions || 0,deletions:artifact.deletions || 0,size:Math.max(1,Math.round((artifact.size || 0)/1024))}); copy.append(name,meta); const download = document.createElement("a"); download.className = "artifact-download"; download.href = url.href; download.download = artifact.name || t("artifact.code_patch"); download.textContent = t("artifact.download_patch"); main.append(iconBox,copy,download); card.append(main); parent.append(card); continue;
         }
         if (artifact.kind !== "presentation") continue;
-        let url; try { url = new URL(artifact.url,location.origin); if (url.origin !== location.origin || !url.pathname.startsWith("/api/conversations/")) continue; } catch (_) { continue; }
+        let url; try { url = new URL(localUrl(artifact.url),location.origin); if (url.origin !== location.origin || !url.pathname.startsWith(localUrl("/api/conversations/"))) continue; } catch (_) { continue; }
         const card = document.createElement("div"); card.className = "artifact-card";
         const main = document.createElement("div"); main.className = "artifact-main";
         const iconBox = document.createElement("div"); iconBox.className = "artifact-icon"; iconBox.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M5 3h10l4 4v14H5zM15 3v5h5M8 12h8M8 16h6"/></svg>`;
@@ -822,7 +830,7 @@
     function renderSources(parent, sources) {
       if (!sources?.length) return; const list = document.createElement("div"); list.className = "source-list";
       for (const source of sources) {
-        let url; try { url = new URL(source.url,location.origin); if (!/^https?:$/.test(url.protocol)) continue; if (url.origin === location.origin && !url.pathname.startsWith("/api/conversations/")) continue; } catch (_) { continue; }
+        let url; try { url = new URL(localUrl(source.url),location.origin); if (!/^https?:$/.test(url.protocol)) continue; if (url.origin === location.origin && !url.pathname.startsWith(localUrl("/api/conversations/"))) continue; } catch (_) { continue; }
         const localSource = ["document","data","code"].includes(source.kind); const prefix = t(source.kind === "data" ? "source.data" : source.kind === "code" ? "source.code" : "source.document"); const link = document.createElement("a"); link.className = `source${localSource ? " document" : ""}`; link.href = url.href; link.target = "_blank"; link.rel = "noopener noreferrer"; link.textContent = localSource ? `[${prefix}${source.index}] ${source.title}${source.location ? ` · ${source.location}` : ""}` : `[${source.index}] ${source.title || url.hostname}`; link.title = source.snippet || link.textContent; list.append(link);
       }
       parent.append(list);
@@ -1058,7 +1066,7 @@
           const workspaceVideo = file.type.startsWith("video/") || workspaceVideoExtensions.has(extension);
           if (state.agent === "workspace" && workspaceVideo) throw new Error(t("workspace.video_unsupported"));
           if (file.size > state.config.max_upload_mb * 1024 * 1024) throw new Error(t("upload.too_large",{name:file.name}));
-          const response = await fetch(`/api/conversations/${conversationId}/attachments`,{method:"POST",headers:{"Content-Type":file.type || "application/octet-stream","X-Filename":encodeURIComponent(file.name)},body:file});
+          const response = await fetch(localUrl(`/api/conversations/${conversationId}/attachments`),{method:"POST",headers:{"Content-Type":file.type || "application/octet-stream","X-Filename":encodeURIComponent(file.name)},body:file});
           if (!response.ok) { let detail = t("upload.failed"); try { detail = (await response.json()).detail || detail; } catch (_) {} throw new Error(detail); }
           const attachment = await response.json(); if (state.activeId === conversationId) state.pending.push(attachment);
         } catch (error) { toast(error.message); }

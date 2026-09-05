@@ -1,14 +1,17 @@
 import argparse
 import base64
+import html
 import json
 import mimetypes
 import os
+import secrets
 import socket
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -75,6 +78,10 @@ class _WorkspaceAttachmentBundle:
     total_count: int
     images_truncated: bool
     has_videos: bool
+
+
+class WebUIClosedError(RuntimeError):
+    """An old embedded session must no longer start tasks or write history."""
 
 
 class GenerationCancelled(RuntimeError):
@@ -557,6 +564,7 @@ class WebUIRuntime:
         )
         self._generation_controls: Dict[str, GenerationControl] = {}
         self._generation_controls_lock = threading.Lock()
+        self._closed = False
         self._pi_agent_lock = threading.Lock()
         self.pi_agent = None
         self.pi_agent_class = None
@@ -609,8 +617,16 @@ class WebUIRuntime:
                 )
         return self.pi_agent
 
-    def begin_generation(self, conversation_id: str) -> GenerationControl:
+    @contextmanager
+    def active_session(self):
+        """Serialize short history mutations with close; never hold across awaits."""
         with self._generation_controls_lock:
+            if self._closed:
+                raise WebUIClosedError("模型服务已停止或切换，请重新打开 WebUI。")
+            yield
+
+    def begin_generation(self, conversation_id: str) -> GenerationControl:
+        with self.active_session():
             if conversation_id in self._generation_controls:
                 raise RuntimeError("该会话已有任务正在运行")
             control = GenerationControl()
@@ -628,6 +644,17 @@ class WebUIRuntime:
             return False
         control.cancel()
         return True
+
+    def cancel_all_generations(self) -> None:
+        with self._generation_controls_lock:
+            controls = list(self._generation_controls.values())
+        for control in controls:
+            control.cancel()
+
+    def close(self) -> None:
+        with self._generation_controls_lock:
+            self._closed = True
+        self.cancel_all_generations()
 
     def _end_generation(
         self, conversation_id: str, control: GenerationControl
@@ -1320,9 +1347,18 @@ class WebUIRuntime:
         title: str,
         assistant_message: Dict[str, Any],
     ) -> bytes:
-        messages.append(assistant_message)
-        self.store.save_conversation(
-            conversation_id, messages, settings=settings, title=title)
+        try:
+            with self.active_session():
+                messages.append(assistant_message)
+                self.store.save_conversation(
+                    conversation_id, messages, settings=settings, title=title)
+        except WebUIClosedError:
+            # A replacement app may already have saved newer messages. Do not
+            # let a late completion (including cancellation) overwrite them.
+            return _json_line({
+                "type": "cancelled", "message": "已停止生成。",
+                "message_key": "status.generation_stopped",
+            })
         return _json_line({
             "type": "done",
             "message": self.public_message(conversation_id, assistant_message),
@@ -2247,12 +2283,17 @@ class WebUIRuntime:
 
 def create_app(args: argparse.Namespace):
     from fastapi import FastAPI, HTTPException, Request
-    from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 
     runtime = WebUIRuntime(args)
     app = FastAPI(title=getattr(args, "title", "FastLLM"), docs_url=None,
                   redoc_url=None)
     app.state.runtime = runtime
+
+    @app.exception_handler(WebUIClosedError)
+    async def closed_session(request: Request, error: WebUIClosedError):
+        return JSONResponse({"detail": str(error)}, status_code=409)
+
     frontend_html = Path(__file__).with_name(
         "webui_frontend.html").read_text(encoding="utf-8")
     locales_path = Path(__file__).with_name("webui_locales.js")
@@ -2293,8 +2334,21 @@ def create_app(args: argparse.Namespace):
             raise HTTPException(status_code=409, detail="请先停止该会话的当前任务")
 
     @app.get("/", response_class=HTMLResponse)
-    def index():
-        return HTMLResponse(frontend_html)
+    def index(request: Request):
+        base_path = str(request.scope.get("root_path", "")).rstrip("/")
+        page = frontend_html.replace("__WEBUI_BASE_PATH__", html.escape(base_path, quote=True))
+        headers = {}
+        if getattr(args, "embedded", False):
+            nonce = secrets.token_urlsafe(24)
+            page = page.replace('<html ', '<html data-embedded="true" ', 1)
+            page = page.replace("<script>", f'<script nonce="{nonce}">')
+            headers["Content-Security-Policy"] = (
+                f"default-src 'self'; script-src 'self' 'nonce-{nonce}'; "
+                "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
+                "media-src 'self' data: blob:; connect-src 'self'; object-src 'none'; "
+                "base-uri 'none'; frame-ancestors 'self'; form-action 'self'"
+            )
+        return HTMLResponse(page, headers=headers)
 
     @app.get("/assets/webui_locales.js", response_class=FileResponse)
     def webui_locales():
@@ -2378,10 +2432,11 @@ def create_app(args: argparse.Namespace):
         if not requested_title and settings.get("agent_mode") == "workspace":
             workspace = Path(str(settings["agent_workspace"]))
             requested_title = f"Agent · {workspace.name or workspace}"
-        conversation_id = runtime.store.create_conversation(
-            title=requested_title or "新对话",
-            settings=settings,
-        )
+        with runtime.active_session():
+            conversation_id = runtime.store.create_conversation(
+                title=requested_title or "新对话",
+                settings=settings,
+            )
         return load(conversation_id)
 
     @app.get("/api/conversations/{conversation_id}")
@@ -2402,19 +2457,21 @@ def create_app(args: argparse.Namespace):
             raise HTTPException(status_code=503, detail=str(error)) from error
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
-        runtime.store.save_conversation(
-            conversation_id,
-            record["messages"],
-            settings=settings,
-            title=str(payload.get("title", record["title"])),
-        )
+        with runtime.active_session():
+            runtime.store.save_conversation(
+                conversation_id,
+                record["messages"],
+                settings=settings,
+                title=str(payload.get("title", record["title"])),
+            )
         return runtime.public_record(load(conversation_id))
 
     @app.delete("/api/conversations/{conversation_id}")
     def delete_conversation(conversation_id: str):
         load(conversation_id)
         require_idle(conversation_id)
-        runtime.store.delete_conversation(conversation_id)
+        with runtime.active_session():
+            runtime.store.delete_conversation(conversation_id)
         return {"ok": True}
 
     @app.post("/api/conversations/{conversation_id}/cancel")
@@ -2440,8 +2497,9 @@ def create_app(args: argparse.Namespace):
         filename = urllib.parse.unquote(request.headers.get("x-filename", "upload"))
         mime_type = request.headers.get("content-type", "application/octet-stream")
         try:
-            attachment = runtime.store.save_upload(
-                conversation_id, _Upload(filename, mime_type, data))
+            with runtime.active_session():
+                attachment = runtime.store.save_upload(
+                    conversation_id, _Upload(filename, mime_type, data))
         except (KeyError, ValueError) as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
         return runtime.public_attachment(conversation_id, attachment)
@@ -2526,8 +2584,9 @@ def create_app(args: argparse.Namespace):
         if len(messages) == 1 and title == "新对话":
             title = conversation_title(prompt)
         try:
-            runtime.store.save_conversation(
-                conversation_id, messages, settings=record["settings"], title=title)
+            with runtime.active_session():
+                runtime.store.save_conversation(
+                    conversation_id, messages, settings=record["settings"], title=title)
             return generation_response(
                 conversation_id,
                 control,
@@ -2574,8 +2633,9 @@ def create_app(args: argparse.Namespace):
         if len(messages) == 1 and title == "新对话":
             title = conversation_title(topic)
         try:
-            runtime.store.save_conversation(
-                conversation_id, messages, settings=record["settings"], title=title)
+            with runtime.active_session():
+                runtime.store.save_conversation(
+                    conversation_id, messages, settings=record["settings"], title=title)
             return generation_response(
                 conversation_id,
                 control,
@@ -2632,8 +2692,9 @@ def create_app(args: argparse.Namespace):
         if len(messages) == 1 and title == "新对话":
             title = conversation_title(question)
         try:
-            runtime.store.save_conversation(
-                conversation_id, messages, settings=record["settings"], title=title)
+            with runtime.active_session():
+                runtime.store.save_conversation(
+                    conversation_id, messages, settings=record["settings"], title=title)
             return generation_response(
                 conversation_id,
                 control,

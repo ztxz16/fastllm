@@ -190,7 +190,11 @@
     "刷新检测": "刷新检测",
     "切换到此页面后自动检测。": "切换到此页面后自动检测。",
     "模型管理": "模型管理",
-    "管理本地模型、下载与运行环境。": "管理本地模型、下载与运行环境。"
+    "返回模型管理": "返回模型管理",
+    "管理本地模型、下载与运行环境。": "管理本地模型、下载与运行环境。",
+    "启动 API Server 后即可使用 WebUI。": "启动 API Server 后即可使用 WebUI。",
+    "重新打开": "重新打开",
+    "打开 WebUI": "打开 WebUI"
   },
   "messages": {
     "Launch service": "启动服务",
@@ -471,7 +475,12 @@
     "temperature 必须是大于等于 0 的数字，或留空使用模型默认值。": "temperature 必须是大于等于 0 的数字，或留空使用模型默认值。",
     "top_p 必须是 0 到 1 之间的数字，或留空使用模型默认值。": "top_p 必须是 0 到 1 之间的数字，或留空使用模型默认值。",
     "top_k 必须是正整数，或留空使用模型默认值。": "top_k 必须是正整数，或留空使用模型默认值。",
-    "repeat_penalty 必须是大于等于 0 的数字，或留空使用模型默认值。": "repeat_penalty 必须是大于等于 0 的数字，或留空使用模型默认值。"
+    "repeat_penalty 必须是大于等于 0 的数字，或留空使用模型默认值。": "repeat_penalty 必须是大于等于 0 的数字，或留空使用模型默认值。",
+    "Start an API Server before opening WebUI.": "请先启动 API Server，服务就绪后即可使用 WebUI。",
+    "The model service changed. Reopen WebUI.": "模型服务已切换，请重新打开 WebUI。",
+    "Opening WebUI…": "正在打开 WebUI…",
+    "Unable to load WebUI. Try reopening it.": "WebUI 加载失败，请重新打开。",
+    "WebUI loading timed out. Try reopening it.": "WebUI 加载超时，请重新打开。"
   },
   "patterns": [
     {"source": "^Unable to read folder: (.+)$", "target": "无法读取文件夹：$1"},
