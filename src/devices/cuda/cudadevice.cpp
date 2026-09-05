@@ -9191,6 +9191,27 @@ namespace fastllm {
         return success;
     }
 
+#ifndef USE_ROCM
+    static bool TryCudaMergeMOECacheBatch1(
+            const Data &input, Data &output, const Data &index,
+            const Data &score, Data &gateOutput,
+            Data **weights, int weightsBatch, MoeGateType gateType) {
+        if (!FastllmCudaCanRunMoeCacheBatch1(
+                input, index, score, weights, weightsBatch, gateType)) {
+            return false;
+        }
+        const bool success =
+            FastllmCudaMergeMOECacheBatch1(
+                input, gateOutput, output, weights, weightsBatch,
+                reinterpret_cast<const int32_t *>(index.cudaData),
+                reinterpret_cast<const float *>(score.cudaData), index.dims[1]);
+        AssertInFastLLM(
+            success,
+            "Prepared CUDA expert cache failed during decode.");
+        return true;
+    }
+#endif
+
     static bool TryCudaMergeMOEBatch1Fp8(
         Data &input, Data &output, int32_t *indexData, const float *scoreData, bool scoresOnCuda, int topk,
         Data &w1, Data **weights, float sharedScale, MoeGateType gateType) {
@@ -9649,6 +9670,13 @@ namespace fastllm {
             int batch = input.dims[0];
 
             int marlinTopk = index.dims.size() >= 2 ? index.dims[1] : 0;
+#ifndef USE_ROCM
+            if (TryCudaMergeMOECacheBatch1(
+                    input, output, index, score,
+                    w1, weights, weightsBatch, gateType)) {
+                return;
+            }
+#endif
             if (TryCudaMergeMOENVFP4E4M3MarlinIndexed(
                     input, output, index, score, batch, marlinTopk,
                     w1, w2, weights, weightsBatch, gateType)) {

@@ -277,6 +277,85 @@ namespace fastllm {
         ((Executor*)GetExecutor())->SetFirstDevice(selectedDevice);
     }
 
+    bool basellm::MoeCudaCacheRequested() const {
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        return FastllmCudaMoeCacheRequested();
+#else
+        return false;
+#endif
+    }
+
+    bool basellm::PrepareMoeCudaCache(
+            const std::vector<std::vector<Data *>> &layerWeights) const {
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        if (!FastllmCudaMoeCacheRequested() || layerWeights.empty()) {
+            return false;
+        }
+        std::vector<FastllmCudaMoeCacheLayer> layers;
+        layers.reserve(layerWeights.size());
+        for (const auto &weights : layerWeights) {
+            layers.push_back({
+                weights.data(),
+                static_cast<int>(weights.size())});
+        }
+        return FastllmCudaPrepareMoeCache(
+            layers.data(), static_cast<int>(layers.size()));
+#else
+        (void)layerWeights;
+        return false;
+#endif
+    }
+
+    bool basellm::TryApplyMoeCudaCache(
+            const Data &input, const Data &index, const Data &score,
+            std::vector<Data *> &weights,
+            const std::string &outputDevice, MoeGateType gateType) const {
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        const bool cudaOutput = outputDevice == "cuda" ||
+            outputDevice.compare(0, 5, "cuda:") == 0;
+        if (cudaOutput && FastllmCudaCanRunMoeCacheBatch1(
+                input, index, score, weights.data(),
+                static_cast<int>(weights.size()), gateType)) {
+            ((Executor*)GetExecutor())->SetFirstDevice(outputDevice);
+            return true;
+        }
+#else
+        (void)input;
+        (void)index;
+        (void)score;
+        (void)weights;
+        (void)outputDevice;
+        (void)gateType;
+#endif
+        return false;
+    }
+
+    bool basellm::MoeCudaCacheAvailable(
+            std::vector<Data *> &weights) const {
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        return FastllmCudaCanRunMoeCache(
+            weights.data(), static_cast<int>(weights.size()));
+#else
+        (void)weights;
+        return false;
+#endif
+    }
+
+    void basellm::ReleaseMoeCudaCache(
+            std::vector<std::vector<Data *>> &layerWeights) const {
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        for (auto &weights : layerWeights) {
+            if (!weights.empty()) {
+                FastllmCudaReleaseMoeCache(
+                    weights.data(), static_cast<int>(weights.size()));
+                return;
+            }
+        }
+#else
+        (void)layerWeights;
+#endif
+    }
+
     static bool DeviceNameMatchesType(const std::string &deviceName, const std::string &deviceType) {
         if (deviceName == deviceType) {
             return true;
@@ -672,6 +751,14 @@ namespace fastllm {
     bool basellm::ShouldRegisterSpecialWeightForDeviceTypes(const std::string &weightName, const std::vector<std::string> &deviceTypes) const {
         if (!GetFastllmEnv().activateNuma || this->specialWeights.find(weightName) == this->specialWeights.end()) {
             return false;
+        }
+        if (this->ShouldDelaySpecialWeightNumaRegistration(weightName)) {
+            for (const std::string &deviceType : deviceTypes) {
+                if (deviceType == "numa" ||
+                    deviceType.compare(0, 5, "numa:") == 0) {
+                    return false;
+                }
+            }
         }
         std::string selectedDevice = GetSpecialWeightSelectedDevice(this, weightName);
         if (selectedDevice.empty()) {

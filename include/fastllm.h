@@ -99,6 +99,8 @@ namespace fastllm {
     bool GetCudaEmbeddingRequested();
     void SetCudaSlabMB(int mb);
     int GetCudaSlabMB();
+    void SetMoeCudaCacheBytes(uint64_t bytes);
+    uint64_t GetMoeCudaCacheBytes();
     int GetThreads();
     bool GetKVCacheInCPU();
     bool GetHistoryCacheInCPU();

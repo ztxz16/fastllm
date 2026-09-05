@@ -1397,6 +1397,7 @@ namespace fastllm {
             this->decodeCudaGraphStates.clear();
             this->requestStates.clear();
         }
+        ReleaseMoeCudaCache(this->weights);
     }
 
     void Qwen4ExpModel::InitParams() {
@@ -1772,6 +1773,9 @@ namespace fastllm {
 
     void Qwen4ExpModel::OnModelWeightsLoaded() {
         if (this->ngramDevice != "disk") {
+            if (MoeCudaCacheRequested()) {
+                PrepareWeights();
+            }
             return;
         }
 
@@ -1821,6 +1825,21 @@ namespace fastllm {
         this->pleNgramDiskWeight.dataDevice = DataDevice::CPU;
         this->pleNgramDiskWeight.isDiskWeight = true;
         this->pleNgramDiskWeight.diskWeightParts = std::move(parts);
+        if (MoeCudaCacheRequested()) {
+            PrepareWeights();
+        }
+    }
+
+    bool Qwen4ExpModel::ShouldDelaySpecialWeightNumaRegistration(
+            const std::string &weightName) const {
+        if (!MoeCudaCacheRequested()) {
+            return false;
+        }
+        const std::string mainLayerPrefix = languagePrefix + "layers.";
+        return Qwen4StartsWith(weightName, mainLayerPrefix) &&
+               weightName.find(".mlp.experts.") != std::string::npos &&
+               (Qwen4EndsWith(weightName, ".gateup_proj.weight") ||
+                Qwen4EndsWith(weightName, ".down_proj.weight"));
     }
 
     bool Qwen4ExpModel::IsLinearAttentionLayer(int layer) const {
@@ -1939,6 +1958,15 @@ namespace fastllm {
                 Qwen4AddOne(this->weight[ple + "norm_key.weight"]);
                 Qwen4AddOne(this->weight[ple + "norm_query.weight"]);
                 Qwen4AddOne(this->weight[ple + "norm_conv.weight"]);
+            }
+        }
+        if (MoeCudaCacheRequested()) {
+            if (!PrepareMoeCudaCache(this->weights)) {
+                std::fprintf(
+                    stderr,
+                    "[Fastllm] Qwen4 CUDA expert cache was "
+                    "requested but could not be prepared; using the "
+                    "configured MoE device.\n");
             }
         }
         Qwen4AddOne(this->weight[languagePrefix +
@@ -5085,12 +5113,17 @@ namespace fastllm {
                          this->norm_topk_prob,
                          this->routed_scaling_factor, nullptr);
         }
-        const std::string routedDevice =
-            this->SelectMoeDeviceForLayer(deviceLayer);
         const std::string outputDevice = SelectDeviceFromMap(
             this->deviceMap, deviceLayer + 1, this->block_cnt);
+        const bool useMoeCudaCache = TryApplyMoeCudaCache(
+            flattened, expertIndex, expertScore, moeWeights,
+            outputDevice, MoeGateSwiglu);
+        const std::string routedDevice = useMoeCudaCache
+            ? outputDevice : this->SelectMoeDeviceForLayer(deviceLayer);
         const bool writeRoutedDirectly = routedDevice == outputDevice;
-        this->ApplyMoeDeviceMapForLayer(deviceLayer);
+        if (!useMoeCudaCache) {
+            this->ApplyMoeDeviceMapForLayer(deviceLayer);
+        }
 
         Data routed;
         Data &routedOutput = writeRoutedDirectly ? output : routed;
@@ -6733,6 +6766,15 @@ namespace fastllm {
             hiddenStates.dims.size() == 3 &&
             hiddenStates.dims[1] > 1 &&
             hiddenStates.dims[1] <= this->indexerCompressRatio;
+        const bool moeCudaCache =
+            !this->weights.empty() && !this->weights[0].empty() &&
+            MoeCudaCacheAvailable(this->weights[0]);
+        const bool moeDeviceMapGraphCompatible =
+            (Qwen4CudaOnlyDeviceMap(this->moeDeviceMap) &&
+             Qwen4CudaOnlyDeviceMap(this->layeredMoeDeviceMap)) ||
+            (moeCudaCache &&
+             Qwen4CudaOrNumaOnlyDeviceMap(this->moeDeviceMap) &&
+             Qwen4CudaOrNumaOnlyDeviceMap(this->layeredMoeDeviceMap));
         if (!GetFastllmEnv().cudaGraph ||
             !supportedStart ||
             hiddenStates.dims.size() != 3 || hiddenStates.dims[0] != 1 ||
@@ -6748,8 +6790,7 @@ namespace fastllm {
             this->pleLayer >= firstFullAttentionLayer ||
             std::getenv("FASTLLM_QWEN4_DUMP_DIR") != nullptr ||
             !Qwen4CudaOnlyDeviceMap(this->deviceMap) ||
-            !Qwen4CudaOnlyDeviceMap(this->moeDeviceMap) ||
-            !Qwen4CudaOnlyDeviceMap(this->layeredMoeDeviceMap)) {
+            !moeDeviceMapGraphCompatible) {
             return false;
         }
 

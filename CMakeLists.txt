@@ -366,6 +366,7 @@ if (USE_CUDA)
         src/devices/cuda/linear/fastllm-linear-fp8-cutlass.cu
         src/devices/cuda/linear/fastllm-linear-fp8-cutlass-sm89.cu
         src/devices/cuda/moe/fastllm-moe-fp8.cu
+        src/devices/cuda/moe/fastllm-moe-nvfp4-cache.cu
         src/devices/cuda/moe/fastllm-moe-vllm-marlin.cu
         src/devices/cuda/linear/fastllm-linear-int8.cu
         src/devices/cuda/linear/fastllm-linear-int4.cu

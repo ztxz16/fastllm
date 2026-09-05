@@ -27,6 +27,8 @@ namespace fastllm {
         std::map<std::string, std::vector<std::pair<std::string, DataType>>>
         GetTensorMap(const std::vector<std::string> &tensorNames) override;
         void OnModelWeightsLoaded() override;
+        bool ShouldDelaySpecialWeightNumaRegistration(
+                const std::string &weightName) const override;
 
         int Forward(
                 const Data &inputIds,

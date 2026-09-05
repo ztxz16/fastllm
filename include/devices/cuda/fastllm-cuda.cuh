@@ -1584,6 +1584,32 @@ bool FastllmCudaMergeMOENVFP4E4M3MarlinIndexed(
         fastllm::Data **weights, int weightsBatch,
         const int32_t *indices, const float *scores,
         int batch, int topk);
+#ifndef USE_ROCM
+// Model-facing interface for the opt-in GPU expert cache. Backends inspect
+// the actual weight format during preparation; the first implementation
+// supports compact E4M3 NVFP4 SwiGLU experts. Keeping format checks behind
+// this interface lets another MoE model reuse the cache without depending on
+// NVFP4-specific symbols.
+struct FastllmCudaMoeCacheLayer {
+    fastllm::Data *const *weights = nullptr;
+    int weightsBatch = 0;
+};
+bool FastllmCudaMoeCacheRequested();
+bool FastllmCudaPrepareMoeCache(
+        const FastllmCudaMoeCacheLayer *layers, int layerCount);
+bool FastllmCudaCanRunMoeCache(
+        fastllm::Data **weights, int weightsBatch);
+bool FastllmCudaCanRunMoeCacheBatch1(
+        const fastllm::Data &input, const fastllm::Data &index,
+        const fastllm::Data &score, fastllm::Data **weights,
+        int weightsBatch, fastllm::MoeGateType gateType);
+void FastllmCudaReleaseMoeCache(
+        fastllm::Data **weights, int weightsBatch);
+bool FastllmCudaMergeMOECacheBatch1(
+        const fastllm::Data &input, fastllm::Data &gateOutput,
+        fastllm::Data &output, fastllm::Data **weights, int weightsBatch,
+        const int32_t *indices, const float *scores, int topk);
+#endif
 bool FastllmCudaNVFP4E4M3GroupedMoeSupported(int device);
 bool FastllmCudaHalfMatMulFloatInt4Group128(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaHalfMatMulFloatInt4NoZero(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);

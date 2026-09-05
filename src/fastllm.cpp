@@ -288,6 +288,7 @@ namespace fastllm {
     static bool cudaEmbedding = false;
     static bool cudaSharedExpert = false;
     static int cudaSlabMB = 0;
+    static uint64_t moeCudaCacheBytes = 0;
     static bool enableAMX = false;
     static int maxTokens = -1;
     static int defaultPageLen = 128;
@@ -432,6 +433,14 @@ namespace fastllm {
 
     int GetCudaSlabMB() {
         return cudaSlabMB;
+    }
+
+    void SetMoeCudaCacheBytes(uint64_t bytes) {
+        moeCudaCacheBytes = bytes;
+    }
+
+    uint64_t GetMoeCudaCacheBytes() {
+        return moeCudaCacheBytes;
     }
 
     void SetCudaSharedExpert(bool v) {

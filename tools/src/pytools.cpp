@@ -95,6 +95,10 @@ extern "C" {
         fastllm::SetCudaSlabMB(mb);
     }
 
+    DLL_EXPORT void set_moe_cuda_cache(uint64_t bytes) {
+        fastllm::SetMoeCudaCacheBytes(bytes);
+    }
+
     DLL_EXPORT void disable_cuda_malloc() {
 #ifdef USE_CUDA
         DisableCudaMalloc();

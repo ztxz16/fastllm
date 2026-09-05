@@ -224,6 +224,15 @@ namespace fastllm {
         // 模型可延迟部分 special weight 的 CUDA 加载，例如先在 CPU 上合成 fused 权重。
         virtual bool ShouldDelaySpecialWeightCudaMove(const std::string &weightName) const { return false; }
 
+        // Models that need the original host representation for finalization
+        // may defer eager NUMA packing performed by the weight loader. The
+        // ordinary AutoWarmup/lazy NUMA paths remain available afterwards.
+        virtual bool ShouldDelaySpecialWeightNumaRegistration(
+                const std::string &weightName) const {
+            (void)weightName;
+            return false;
+        }
+
         // special weight 默认跟随 MoE 设备映射；同时包含非 MoE TP 权重的模型可覆盖此选择。
         virtual std::string SelectSpecialWeightDevice(const std::string &weightName,
                                                       int layerId) const;
@@ -546,6 +555,20 @@ namespace fastllm {
         bool UseLayeredMoeDevice(int layerId) const;
         std::string SelectMoeDeviceForLayer(int layerId) const;
         void ApplyMoeDeviceMapForLayer(int layerId) const;
+        // Common model integration for the optional CUDA expert cache. A
+        // model only supplies its standard MergeMOE tables and identifies
+        // which source weights must remain on the host until preparation.
+        bool MoeCudaCacheRequested() const;
+        bool PrepareMoeCudaCache(
+                const std::vector<std::vector<Data *>> &layerWeights) const;
+        bool TryApplyMoeCudaCache(
+                const Data &input, const Data &index, const Data &score,
+                std::vector<Data *> &weights,
+                const std::string &outputDevice,
+                MoeGateType gateType = MoeGateSwiglu) const;
+        bool MoeCudaCacheAvailable(std::vector<Data *> &weights) const;
+        void ReleaseMoeCudaCache(
+                std::vector<std::vector<Data *>> &layerWeights) const;
         bool ShouldRegisterSpecialWeightForDeviceType(const std::string &weightName, const std::string &deviceType) const;
         bool ShouldRegisterSpecialWeightForDeviceTypes(const std::string &weightName, const std::vector<std::string> &deviceTypes) const;
         bool MoveSpecialWeightToCudaIfNeeded(const std::string &weightName, Data &data) const;

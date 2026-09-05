@@ -5,6 +5,7 @@ import sys
 import subprocess
 import glob
 import math
+from decimal import Decimal, InvalidOperation, localcontext
 
 try:
     from .gguf_metadata import get_gguf_model_config
@@ -19,6 +20,48 @@ def _positive_int(value: str) -> int:
     if value <= 0:
         raise argparse.ArgumentTypeError("must be a positive integer")
     return value
+
+def _memory_size_bytes(value) -> int:
+    """Parse a non-negative binary memory size such as 3g or 512m."""
+    maximum = (1 << 64) - 1
+    if isinstance(value, int):
+        if value < 0:
+            raise argparse.ArgumentTypeError("must be a non-negative size")
+        if value > maximum:
+            raise argparse.ArgumentTypeError("size is too large")
+        return value
+    text = str(value).strip().lower()
+    suffixes = {
+        "kib": 1 << 10, "ki": 1 << 10, "kb": 1 << 10, "k": 1 << 10,
+        "mib": 1 << 20, "mi": 1 << 20, "mb": 1 << 20, "m": 1 << 20,
+        "gib": 1 << 30, "gi": 1 << 30, "gb": 1 << 30, "g": 1 << 30,
+    }
+    factor = 1
+    number = text
+    for suffix in sorted(suffixes, key=len, reverse=True):
+        if text.endswith(suffix):
+            factor = suffixes[suffix]
+            number = text[:-len(suffix)].strip()
+            break
+    try:
+        parsed = Decimal(number)
+    except InvalidOperation:
+        raise argparse.ArgumentTypeError(
+            "must be a size such as 3g, 512m, or 0")
+    if not parsed.is_finite() or parsed < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative size")
+    if parsed > maximum:
+        raise argparse.ArgumentTypeError("size is too large")
+    if 0 < parsed < Decimal(1) / factor:
+        raise argparse.ArgumentTypeError("size is too small")
+    # Preserve byte boundaries, including UINT64_MAX. Float parsing rounds
+    # large valid integers up to 2^64 and can silently accept overflow.
+    with localcontext() as context:
+        context.prec = max(28, len(parsed.as_tuple().digits) + 10)
+        bytes_ = parsed * factor
+    if bytes_ > maximum:
+        raise argparse.ArgumentTypeError("size is too large")
+    return int(bytes_)
 
 def _has_cuda_device() -> bool:
     if os.path.exists("/dev/nvidia0") or os.path.isdir("/proc/driver/nvidia/gpus"):
@@ -728,6 +771,10 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--tp', type = str, default = "", help = '线程级张量并行设备；裸数字X表示使用前X张卡，0表示0号卡，也可写 0,1 或 auto')
     parser.add_argument('--moe_device', type = str, default = "", help = 'moe使用的设备')
     parser.add_argument('--moe_device_layers', type = int, default = -1, help = '后面多少层moe使用moe_device，-1表示全部moe层使用moe_device')
+    parser.add_argument('--moe_cuda_cache', '--moe-cuda-cache',
+                        dest = 'moe_cuda_cache', type = _memory_size_bytes,
+                        default = 0,
+                        help = '混合推理时用于缓存MoE专家的CUDA显存，如3g；0表示关闭')
     parser.add_argument('--ngram_device', '--ngram-device', dest = 'ngram_device',
                         choices = ['cpu', 'disk'], default = 'cpu',
                         help = 'ngram表存放位置；disk从checkpoint按行读取以显著降低内存占用')
@@ -1450,6 +1497,8 @@ def make_normal_llm_model(args, startup_progress = None):
     if hasattr(llm, "set_cuda_graph"):
         llm.set_cuda_graph(_fastllm_env_flag_enabled("FASTLLM_CUDA_GRAPH"))
     llm.set_moe_device_layers(-1)
+    llm.set_moe_cuda_cache(
+        _memory_size_bytes(getattr(args, "moe_cuda_cache", 0)))
     llm.set_ngram_device(args.ngram_device)
     if (args.device and args.device != ""):
         try:

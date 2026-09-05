@@ -429,6 +429,7 @@ fastllm_lib.set_moe_device_map.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes
 fastllm_lib.set_layered_moe_device_map.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
 fastllm_lib.set_moe_device_layers.argtypes = [ctypes.c_int]
 fastllm_lib.set_ngram_device.argtypes = [ctypes.c_char_p]
+fastllm_lib.set_moe_cuda_cache.argtypes = [ctypes.c_uint64]
 
 fastllm_lib.apply_chat_template.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
 fastllm_lib.apply_chat_template.restype = ctypes.c_char_p
@@ -588,6 +589,12 @@ def set_cuda_graph(cuda_graph):
 
 def set_cuda_slab(mb: int):
     fastllm_lib.set_cuda_slab(ctypes.c_int(mb));
+
+def set_moe_cuda_cache(bytes_: int):
+    bytes_ = int(bytes_)
+    if bytes_ < 0 or bytes_ > (1 << 64) - 1:
+        raise ValueError("MoE CUDA cache size must fit in uint64")
+    fastllm_lib.set_moe_cuda_cache(ctypes.c_uint64(bytes_));
 
 def disable_cuda_malloc():
     fastllm_lib.disable_cuda_malloc();

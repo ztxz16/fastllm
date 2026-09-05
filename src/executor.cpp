@@ -67,6 +67,38 @@ namespace fastllm {
                name == "output";
     }
 
+#ifndef USE_ROCM
+    static bool KeepCudaMoeCacheWeightsOnHost(
+            const std::string &opType, const std::string &name,
+            BaseDevice *device, const DataDict &datas,
+            const IntDict &intParams) {
+        if (!FastllmCudaMoeCacheRequested() ||
+            opType != "MergeMOE" || name != "weights" ||
+            device == nullptr || device->deviceType != "cuda") {
+            return false;
+        }
+        auto weightsBatchIt = intParams.find("weights___batch");
+        auto inputIt = datas.find("input");
+        auto indexIt = datas.find("index");
+        auto scoreIt = datas.find("score");
+        auto weightsIt = datas.find("weights");
+        if (weightsBatchIt == intParams.end() ||
+            inputIt == datas.end() || inputIt->second == nullptr ||
+            indexIt == datas.end() || indexIt->second == nullptr ||
+            scoreIt == datas.end() || scoreIt->second == nullptr ||
+            weightsIt == datas.end() || weightsIt->second == nullptr) {
+            return false;
+        }
+        const auto gateTypeIt = intParams.find("gateType");
+        const MoeGateType gateType = gateTypeIt == intParams.end()
+            ? MoeGateSwiglu : static_cast<MoeGateType>(gateTypeIt->second);
+        return FastllmCudaCanRunMoeCacheBatch1(
+            *inputIt->second, *indexIt->second, *scoreIt->second,
+            reinterpret_cast<Data **>(weightsIt->second),
+            weightsBatchIt->second, gateType);
+    }
+#endif
+
     static bool KeepMultiCudaMergeMoeTensorOnSource(const std::string &opType,
                                                      const std::string &name,
                                                      BaseDevice *device,
@@ -270,6 +302,12 @@ namespace fastllm {
                 for (auto &it: datas) {
                     if (intParamsSize > 0 && intParams.find(it.first + "___batch") != intParams.end()) {
                         int batch = intParams.find(it.first + "___batch")->second;
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+                        if (KeepCudaMoeCacheWeightsOnHost(
+                                opType, it.first, device, datas, intParams)) {
+                            continue;
+                        }
+#endif
                         // The disk Kimi operator materializes only the routed
                         // experts selected by this invocation. Moving all 896
                         // lazy entries here would defeat that bounded loading
@@ -376,6 +414,12 @@ namespace fastllm {
             for (auto &it: datas) {
                 if (intParamsSize > 0 && intParams.find(it.first + "___batch") != intParams.end()) {
                     int batch = intParams.find(it.first + "___batch")->second;
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+                    if (KeepCudaMoeCacheWeightsOnHost(
+                            opType, it.first, device, datas, intParams)) {
+                        continue;
+                    }
+#endif
                     if ((it.first == "weights" || it.first == "biass") && ((Data**)it.second)[2]) {
                         if ((device->deviceType == "cpu" || device->deviceType == "numa" || device->deviceType == "tfacc" || device->deviceType == "disk") &&
                             ((Data**)it.second)[2]->dataDevice == DataDevice::CPU) {
