@@ -34,6 +34,7 @@
 
 #ifdef USE_CUDA
 #include "models/qwen3_cuda_common.h"
+#include "devices/cuda/fastllm-cuda-fp8.h"
 #endif
 
 #ifdef USE_TFACC
@@ -9162,6 +9163,51 @@ namespace fastllm {
     void Qwen3_5Model::OnAutoWarmupFinished() {
 #ifdef USE_CUDA
         PrepareMtpCudaServingWarmup();
+        std::vector<int> fp8Devices;
+        std::map<int, int> fp8Ratios;
+        if (HasDFlashWeights() && !GetFastllmEnv().cudaGraph &&
+            GetQwen35GPUForwardDevices(this->deviceMap, fp8Devices, fp8Ratios) &&
+            !fp8Devices.empty()) {
+            // DFlash repeatedly verifies multiple rows. Fix the eligible FP8
+            // weight layouts before any real prefill builds recurrent/KV state.
+            // Startup still uses synchronous NCCL and all TP workers are idle.
+            const int previousDevice = FastllmCudaGetDevice();
+            int prepared = 0;
+            auto prepare = [&](Data &local) {
+                if (local.dataType != DataType::FP8_E4M3 ||
+                    local.dataDevice != DataDevice::CUDA ||
+                    local.dataDeviceIds.empty() || local.IsRepacked) {
+                    return;
+                }
+                FastllmCudaSetDevice(local.dataDeviceIds.front());
+                if (FastllmCudaWarmupFp8E4M3Sm70(local, dflashRuntimeBlockSize)) {
+                    prepared++;
+                }
+            };
+            try {
+                for (auto &item : this->weight.weight) {
+                    Data &data = item.second;
+                    if (data.multiDeviceData) {
+                        for (auto &shard : data.multiDeviceDatas) {
+                            if (shard.second != nullptr) {
+                                prepare(*shard.second);
+                            }
+                        }
+                    } else {
+                        prepare(data);
+                    }
+                }
+            } catch (...) {
+                FastllmCudaSetDevice(previousDevice);
+                throw;
+            }
+            FastllmCudaSetDevice(previousDevice);
+            if (prepared > 0) {
+                printf("[Qwen3.5 DFlash2] warmup: prepared %d SM70 FP8 Linear weights.\n",
+                       prepared);
+                fflush(stdout);
+            }
+        }
         if (GetFastllmEnv().cudaGraph && !cudaServingPrepared) {
             if (threadTpWorkerGroup.HasWorkers()) {
                 threadTpWorkerGroup.Stop();
