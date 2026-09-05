@@ -4240,6 +4240,17 @@ namespace fastllm {
             batch, topk, hidden, inter, experts);
     }
 #else
+    // CUTLASS kernels are CUDA-only; retain the native FP8 fallback below.
+    static bool TryCudaCutlassLinearFp8PerChannel(
+        Data &, Data &, const Data &, Data &, int, int, int) {
+        return false;
+    }
+
+    static bool TryCudaCutlassLinearFp8Block128(
+        Data &, Data &, const Data &, Data &, int, int, int) {
+        return false;
+    }
+
     bool FastllmCudaTryTritonDeepSeekV4WoA(
         const Data &, Data &, int, int, Data &) {
         return false;

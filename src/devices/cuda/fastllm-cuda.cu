@@ -32,7 +32,9 @@
 #include <type_traits>
 #include <vector>
 #include <cuda_fp8.h>
+#ifndef USE_ROCM
 #include "sampling.cuh"
+#endif
 
 extern "C" bool FastllmNcclGraphPeerCopy(int dstDevice, void *dst,
                                           int srcDevice, const void *src,
@@ -6010,7 +6012,11 @@ bool FastllmCudaValidatePointerRange(const void *ptr, size_t bytes,
         cudaGetLastError();
         return false;
     }
+#ifdef USE_ROCM
+    size_t offset = (size_t)((uintptr_t)ptr - (uintptr_t)base);
+#else
     size_t offset = (size_t)((CUdeviceptr)ptr - base);
+#endif
     return offset <= allocation && bytes <= allocation - offset;
 }
 
@@ -14281,6 +14287,7 @@ bool FastllmCudaRepeatPenalty (fastllm::Data &input, fastllm::Data &penalty, fas
     return true;
 }
 
+#ifndef USE_ROCM
 template <int BLOCK_THREADS>
 __global__ void FastllmTemperatureSoftmaxKernel(float *logits, float *probs, float *temperatures, int vocabSize) {
     int bid = blockIdx.x;
@@ -14525,6 +14532,7 @@ bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
     FastllmReleaseDequantScratch(scratch, scratchOwn);
     return true;
 }
+#endif // Native sampling is provided by fastllm-rocm-sampling.hip.
 
 __global__ void FastllmDFlashScatterDraftProbsKernel(
         float *draftProbs, const int *candidateIds,
@@ -15288,6 +15296,7 @@ bool FastllmCudaDFlashCompactKVCache(
     return true;
 }
 
+#ifndef USE_ROCM
 size_t FastllmCudaDFlashTopKScratchBytes(int rows) {
     if (rows <= 0) {
         return 0;
@@ -15296,6 +15305,7 @@ size_t FastllmCudaDFlashTopKScratchBytes(int rows) {
         (sizeof(flashinfer::sampling::RadixRowState) +
          sizeof(flashinfer::sampling::RadixDeterministicCollectScratch));
 }
+#endif
 
 __global__ void FastllmDFlashOffsetTopKIdsKernel(
         int *ids, int count, int globalIdOffset) {
@@ -15305,6 +15315,7 @@ __global__ void FastllmDFlashOffsetTopKIdsKernel(
     }
 }
 
+#ifndef USE_ROCM
 bool FastllmCudaDFlashTopK(
         const fastllm::Data &logits,
         fastllm::Data &packedCandidates,
@@ -15364,6 +15375,7 @@ bool FastllmCudaDFlashTopK(
     }
     return true;
 }
+#endif
 
 __global__ void FastllmDFlashMergeTopKKernel(
         const int *packedCandidates, float *output,
@@ -15451,6 +15463,7 @@ bool FastllmCudaDFlashMergeTopK(
     return true;
 }
 
+#ifndef USE_ROCM
 bool FastllmCudaDFlashRejectionSampling(
                                   float *logits,
                                   const float *temperatures,
@@ -15647,7 +15660,9 @@ bool FastllmCudaDFlashRejectionSampling(
     FastllmReleaseDequantScratch(scratch, scratchOwn);
     return true;
 }
+#endif
 
+#ifndef USE_ROCM
 template <int BLOCK_THREADS>
 __global__ void FastllmRepeatPenaltyFactorsKernel(
         float *logits, const int *penaltyIds,
@@ -15732,6 +15747,7 @@ bool FastllmCudaTopKTopPSamplingToDevice(
     }
     return true;
 }
+#endif // Native sampling is provided by fastllm-rocm-sampling.hip.
 
 bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,
                                   int *topKArr, float *topPArr,

@@ -38,7 +38,9 @@ __device__ __forceinline__ bool DeepSeekV4DsparkGreedyIsBetter(
 
 __device__ __forceinline__ void DeepSeekV4DsparkStoreRelease(
         uint32_t *pointer, uint32_t value) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+#ifdef USE_ROCM
+    __hip_atomic_store(pointer, value, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
     asm volatile("st.release.sys.global.u32 [%1], %0;" ::
                  "r"(value), "l"(pointer));
 #else
@@ -50,7 +52,9 @@ __device__ __forceinline__ void DeepSeekV4DsparkStoreRelease(
 __device__ __forceinline__ uint32_t DeepSeekV4DsparkLoadAcquire(
         const uint32_t *pointer) {
     uint32_t value;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+#ifdef USE_ROCM
+    value = __hip_atomic_load(pointer, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
     asm volatile("ld.acquire.sys.global.u32 %0, [%1];" :
                  "=r"(value) : "l"(pointer));
 #else
@@ -8366,6 +8370,9 @@ extern "C" bool FastllmCudaDeepSeekV4SqrtSoftplusRouter(
         const fastllm::Data &logits, const fastllm::Data &gateBias,
         float routeScale, fastllm::Data &expertIndex,
         fastllm::Data &expertScore, bool allowTriton) {
+#ifdef USE_ROCM
+    using std::isfinite;
+#endif
     constexpr int experts = 256;
     constexpr int topk = 6;
     if (logits.dataDevice != fastllm::DataDevice::CUDA ||

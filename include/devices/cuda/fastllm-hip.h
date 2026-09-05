@@ -10,7 +10,6 @@
 #include <rocwmma/rocwmma.hpp>
 #endif
 
-#define __shfl_xor_sync(mask, var, laneMask, width) __shfl_xor(var, laneMask, width)
 
 typedef int8_t int8x4_t __attribute__((ext_vector_type(4)));
 typedef uint8_t uint8x4_t __attribute__((ext_vector_type(4)));
@@ -63,6 +62,69 @@ static __device__ __forceinline__ unsigned int __vcmpne4(unsigned int a, unsigne
 }
 
 namespace fastllm_hip {
+    // CUDA code uses 32-lane logical warps; HIP requires a 64-bit mask.
+    __device__ __forceinline__ unsigned long long WarpMask(unsigned int mask) {
+        const unsigned int lane = (threadIdx.x + blockDim.x *
+            (threadIdx.y + blockDim.y * threadIdx.z)) % warpSize;
+        return static_cast<unsigned long long>(mask) << (lane & ~31u);
+    }
+
+    __device__ __forceinline__ unsigned int BallotSync(unsigned int mask, int predicate) {
+        const unsigned int lane = (threadIdx.x + blockDim.x *
+            (threadIdx.y + blockDim.y * threadIdx.z)) % warpSize;
+        return static_cast<unsigned int>(__ballot_sync(WarpMask(mask), predicate) >> (lane & ~31u));
+    }
+
+    template <typename Kernel>
+    inline hipError_t FuncSetAttribute(Kernel kernel, hipFuncAttribute attr, int value) {
+        return ::hipFuncSetAttribute(reinterpret_cast<const void *>(kernel), attr, value);
+    }
+
+    template <typename T>
+    __device__ __forceinline__ T LoadReadOnly(const T *address) {
+        return *address;
+    }
+
+    __device__ __forceinline__ void SyncWarp(unsigned int mask = 0xffffffffu) {
+        __syncwarp(WarpMask(mask));
+    }
+
+    template <typename T>
+    __device__ __forceinline__ T ShflXorSync(unsigned int mask, T value,
+                                            int laneMask, int width = 32) {
+        return __shfl_xor_sync(WarpMask(mask), value, laneMask, width);
+    }
+
+    template <typename T>
+    __device__ __forceinline__ T ShflDownSync(unsigned int mask, T value,
+                                             unsigned int delta, int width = 32) {
+        return __shfl_down_sync(WarpMask(mask), value, delta, width);
+    }
+
+    template <typename T>
+    __device__ __forceinline__ T ShflSync(unsigned int mask, T value,
+                                         int lane, int width = 32) {
+        return __shfl_sync(WarpMask(mask), value, lane, width);
+    }
+
+    template <typename T>
+    __device__ __forceinline__ T ShflUpSync(unsigned int mask, T value,
+                                           unsigned int delta, int width = 32) {
+        return __shfl_up_sync(WarpMask(mask), value, delta, width);
+    }
+
+    inline hipblasStatus_t hipblasHgemmBatched(
+        hipblasHandle_t handle, hipblasOperation_t transA, hipblasOperation_t transB,
+        int m, int n, int k, const half *alpha, const half *const A[], int lda,
+        const half *const B[], int ldb, const half *beta, half *const C[], int ldc,
+        int batchCount) {
+        return ::hipblasHgemmBatched(handle, transA, transB, m, n, k,
+            reinterpret_cast<const hipblasHalf *>(alpha),
+            reinterpret_cast<const hipblasHalf *const *>(A), lda,
+            reinterpret_cast<const hipblasHalf *const *>(B), ldb,
+            reinterpret_cast<const hipblasHalf *>(beta),
+            reinterpret_cast<hipblasHalf *const *>(C), ldc, batchCount);
+    }
 
     inline const hipblasHalf* ToHipblasHalfConst(const half* x) {
         return reinterpret_cast<const hipblasHalf*>(x);
@@ -93,9 +155,25 @@ namespace fastllm_hip {
         hipblasGemmAlgo_t    algo) {
         hipblasComputeType_t computeType = HIPBLAS_COMPUTE_32F;
         switch (computeType_) {
-            case HIP_R_16F:
+            case HIP_R_16F: {
+                // HIP's explicit 16F compute mode accumulates in FP16 and
+                // loses accuracy for long dot products (e.g. INT4 dequant
+                // GEMM with K=4096). Preserve FP16 storage, use FP32 sums.
+                // CUDA callers use host alpha/beta; retain the original
+                // behavior for a handle explicitly using device scalars.
+                hipblasPointerMode_t pointerMode;
+                hipblasStatus_t status = ::hipblasGetPointerMode(handle, &pointerMode);
+                if (status != HIPBLAS_STATUS_SUCCESS) return status;
+                if (pointerMode == HIPBLAS_POINTER_MODE_HOST) {
+                    const float alpha32 = __half2float(*static_cast<const half*>(alpha));
+                    const float beta32 = __half2float(*static_cast<const half*>(beta));
+                    return ::hipblasGemmEx(handle, transA, transB, m, n, k,
+                        &alpha32, A, aType, lda, B, bType, ldb,
+                        &beta32, C, cType, ldc, HIPBLAS_COMPUTE_32F, algo);
+                }
                 computeType = HIPBLAS_COMPUTE_16F;
                 break;
+            }
             case HIP_R_32F:
                 computeType = HIPBLAS_COMPUTE_32F;
                 break;
@@ -147,6 +225,7 @@ namespace fastllm_hip {
         }
 } // namespace fastllm_hip
 
+using fastllm_hip::hipblasHgemmBatched;
 using fastllm_hip::hipblasGemmEx;
 using fastllm_hip::hipblasHgemmStridedBatched;
 using fastllm_hip::hipblasHgemm;

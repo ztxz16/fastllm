@@ -6,7 +6,7 @@
 // device 编译 pass（如 sm_60）中会直接 #error。为兼容多 CUDA_ARCH 一起编译，这里仅在
 // host pass 与 sm_70+ 的 device pass 中启用 FlashInfer；sm_70 以下的 device pass 完全
 // 排除 FlashInfer 代码，运行期由原生分页注意力兜底。
-#if !defined(FASTLLM_CUDA_LEGACY_ONLY) && \
+#if !defined(USE_ROCM) && !defined(FASTLLM_CUDA_LEGACY_ONLY) && \
     (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 700))
 #define FASTLLM_ENABLE_FLASHINFER
 #endif

@@ -467,56 +467,7 @@ if (USE_CUDA)
 endif()
 
 if(USE_ROCM)
-    list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/third_party/hipify_torch/cmake")
-    include(Hipify)
-    enable_language(HIP)
-
-    # remove target hip dirs first
-    EXECUTE_PROCESS(COMMAND rm -rf ${PROJECT_SOURCE_DIR}/src/devices/hip)
-    EXECUTE_PROCESS(COMMAND rm -rf ${PROJECT_SOURCE_DIR}/src/devices/multihip)
-    hipify(CUDA_SOURCE_DIR ${PROJECT_SOURCE_DIR}/src/devices/cuda HIP_SOURCE_DIR "${PROJECT_SOURCE_DIR}/src/devices/hip")
-    hipify(CUDA_SOURCE_DIR ${PROJECT_SOURCE_DIR}/src/devices/multicuda HIP_SOURCE_DIR "${PROJECT_SOURCE_DIR}/src/devices/multihip")
-    include_directories(include/devices/cuda)
-    include_directories(include/devices/multicuda)
-    set(FASTLLM_CUDA_SOURCES src/devices/cuda/cudadevice.cpp src/devices/cuda/cudadevicebatch.cpp 
-        src/devices/hip/fastllm-hip.hip src/devices/hip/fastllm-ggml-hip.hip 
-        src/devices/multicuda/multicudadevice.cpp src/devices/multihip/fastllm-multihip.hip)
-    add_compile_definitions(USE_ROCM)
-    add_compile_definitions(USE_CUDA)
-    if (DEFINED $ENV{ROCM_PATH})
-        set(ROCM_PATH $ENV{ROCM_PATH})
-    else()
-        set(ROCM_PATH /opt/rocm)
-    endif()
-    set(CMAKE_HIP_COMPILER_ROCM_ROOT ${ROCM_PATH})
-    set(CMAKE_CXX_COMPILER "${CMAKE_HIP_COMPILER_ROCM_ROOT}/bin/amdclang++")
-    message(STATUS "CMAKE_HIP_COMPILER_ROCM_ROOT: ${CMAKE_HIP_COMPILER_ROCM_ROOT}")
-    message(STATUS "CMAKE_HIP_COMPILER: ${CMAKE_HIP_COMPILER}")
-    message(STATUS "CMAKE_CXX_COMPILER: ${CMAKE_CXX_COMPILER}")
-    
-    set(CMAKE_PREFIX_PATH ${ROCM_PATH})
-    find_package(hip REQUIRED) 
-    find_package(hipblas REQUIRED)
-    find_package(rocprim REQUIRED)
-    list(APPEND FASTLLM_LINKED_LIBS hip::device roc::hipblas roc::rocprim)
-    set(CMAKE_HIP_ARCHITECTURES ${ROCM_ARCH})
-    add_compile_definitions(HIPBLAS_V2)
-
-    # Check if gfx906(MI50) is in the architecture list
-    set(HAS_MI50_IN_TARGETS FALSE)
-    foreach(ARCH IN LISTS CMAKE_HIP_ARCHITECTURES)
-        if(${ARCH} STREQUAL "gfx906")
-            set(HAS_MI50_IN_TARGETS TRUE)
-            break()
-        endif()
-    endforeach()
-    
-    # Enable MI50 workaround if MI50 is detected or in target architectures
-    if(ROCM_HAS_MI50 OR HAS_MI50_IN_TARGETS)
-        add_compile_definitions(USE_MI50_WORKAROUND)
-        add_compile_definitions(HIP_NO_TENSOR_CORE)
-        message(STATUS "MI50 support enabled (USE_MI50_WORKAROUND defined)")
-    endif()
+    include(cmake/ROCm.cmake)
 endif()
 
 if (USE_IVCOREX)
@@ -674,6 +625,10 @@ endif()
 
 add_library(fastllm_tools SHARED ${FASTLLM_CXX_SOURCES} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_CUDA_SM120_OBJECTS} ${FASTLLM_TFACC_SOURCES} ${FASTLLM_TOPS_SOURCES} tools/src/pytools.cpp)
 target_link_libraries(fastllm_tools PUBLIC ${FASTLLM_LINKED_LIBS})
+if(USE_ROCM)
+    # Fail the build if an optional CUDA entry point lacks a HIP fallback.
+    set_property(TARGET fastllm_tools APPEND_STRING PROPERTY LINK_FLAGS " -Wl,--no-undefined")
+endif()
 
 set(BUILD_INFO_USE_CUDA "false")
 set(BUILD_INFO_USE_ROCM "false")

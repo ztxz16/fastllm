@@ -1,6 +1,6 @@
 # cmake file to trigger hipify
 
-cmake_minimum_required(VERSION 3.0 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.5 FATAL_ERROR)
 
 set(HIPIFY_DICT_FILE ${CMAKE_BINARY_DIR}/hipify_output_dict_dump.txt)
 set(_temp_file_cuda_to_hip_list "cuda_to_hip_list")

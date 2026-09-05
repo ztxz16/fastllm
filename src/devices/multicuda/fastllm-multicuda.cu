@@ -2450,6 +2450,7 @@ static bool FastllmNcclPostSyncEnabled(cudaStream_t stream) {
     return true;
 }
 
+#ifndef USE_ROCM
 namespace {
 
 // Keep the direct-read path bounded to the same 8 MiB envelope used by
@@ -2983,6 +2984,17 @@ bool FastllmTryTP2P2PAllReduceAdd(void* data, void* dest, int count,
     }
     return true;
 }
+
+#else
+// The custom TP2 barrier uses NVIDIA PTX. Use the RCCL all-reduce path on HIP.
+bool FastllmCanUseTP2P2PAllReduceAdd(int, int, int) {
+    return false;
+}
+
+bool FastllmTryTP2P2PAllReduceAdd(void *, void *, int, int, int) {
+    return false;
+}
+#endif
 
 static int FastllmNcclRootRank(int root) {
     auto rootRankIt = g_ncclRanks.find(root);
