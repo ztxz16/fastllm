@@ -609,6 +609,7 @@ add_executable(quant tools/src/quant.cpp)
 target_link_libraries(quant fastllm)
 
 if (UNIT_TEST)
+    enable_testing()
     add_executable(optest test/ops/cppOps.cpp)
     target_link_libraries(optest fastllm)
     set_target_properties(optest PROPERTIES
@@ -625,6 +626,22 @@ if (UNIT_TEST)
     endif()
 
     if (USE_CUDA AND NOT USE_ROCM)
+        foreach(cache_test IN ITEMS expert_cache ordered_reduce record_copy)
+            add_executable(cuda_${cache_test}_test test/basic/test_cuda_${cache_test}.cu)
+            target_include_directories(cuda_${cache_test}_test PRIVATE include/devices/cuda)
+            set_target_properties(cuda_${cache_test}_test PROPERTIES
+                CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+            add_test(NAME cuda_${cache_test} COMMAND cuda_${cache_test}_test)
+            set_tests_properties(cuda_${cache_test} PROPERTIES LABELS cuda)
+        endforeach()
+
+        add_executable(cuda_moe_cache_test test/basic/test_cuda_moe_cache.cu)
+        target_link_libraries(cuda_moe_cache_test PRIVATE fastllm)
+        set_target_properties(cuda_moe_cache_test PROPERTIES
+            CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME cuda_moe_cache COMMAND cuda_moe_cache_test)
+        set_tests_properties(cuda_moe_cache PROPERTIES LABELS cuda)
+
         add_executable(cudaGraphPoolMissRegression test/ops/cudaGraphPoolMissRegression.cpp)
         target_link_libraries(cudaGraphPoolMissRegression fastllm)
         target_include_directories(cudaGraphPoolMissRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
