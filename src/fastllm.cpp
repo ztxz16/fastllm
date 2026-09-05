@@ -5434,9 +5434,8 @@ namespace fastllm {
             AssertInFastLLM(headDim == 128 || headDim == 256,
                             "FP4 KV cache requires head_dim 128 or 256.\n");
 #ifdef USE_CUDA
-            AssertInFastLLM(cacheData.dataDevice == DataDevice::CUDA &&
-                            FastllmCudaFlashInferDataTypeSupported(DataType::BFLOAT16),
-                            "FP4 KV cache requires SM80+ CUDA FlashInfer attention.\n");
+            AssertInFastLLM(cacheData.dataDevice == DataDevice::CUDA,
+                            "FP4 KV cache requires CUDA.\n");
 #else
             ErrorInFastLLM("FP4 KV cache requires CUDA.\n");
 #endif

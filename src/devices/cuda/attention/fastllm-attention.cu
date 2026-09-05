@@ -3204,11 +3204,26 @@ static cudaError_t FastllmDispatchPagedPrefillByHeadDim(uint32_t head_dim, long 
 }
 #endif
 
+#ifdef FASTLLM_ENABLE_FLASHINFER
+static bool FastllmCanUseFlashInferPagedKV(const fastllm::Data &cache) {
+    if (!FastllmCudaFlashInferSupported()) return false;
+    if (cache.pagedKVCacheData != nullptr &&
+        cache.pagedKVCacheData->dataType == fastllm::DataType::FP4_E2M1) {
+#if CUDA_VERSION >= 12080
+        return FastllmCudaRuntimeArch() >= 80;
+#else
+        return false;
+#endif
+    }
+    return true;
+}
+#endif
+
 bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &output, int group, float scale, bool inited) {
 #ifndef FASTLLM_ENABLE_FLASHINFER
     return FastllmCudaHalfPagedAttentionFastllmFallback(q, k, v, output, group, scale);
 #else
-    if (!FastllmCudaFlashInferSupported()) {
+    if (!FastllmCanUseFlashInferPagedKV(k)) {
         return FastllmCudaHalfPagedAttentionFastllmFallback(q, k, v, output, group, scale);
     }
     using namespace flashinfer;
@@ -3437,11 +3452,9 @@ bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::
     if (q.dataType == fastllm::DataType::BFLOAT16) {
         if (pagedKVCacheK->dataType == fastllm::DataType::FP8_E4M3) {
             runPrefill.template operator()<__nv_bfloat16, __nv_fp8_e4m3>();
-        } else if (pagedKVCacheK->dataType == fastllm::DataType::FP4_E2M1) {
 #if CUDA_VERSION >= 12080
+        } else if (pagedKVCacheK->dataType == fastllm::DataType::FP4_E2M1) {
             runPrefill.template operator()<__nv_bfloat16, __nv_fp4x2_e2m1>();
-#else
-            fastllm::ErrorInFastLLM("FP4 KV cache requires CUDA 12.8 or newer.\n");
 #endif
         } else {
             runPrefill.template operator()<__nv_bfloat16, __nv_bfloat16>();
@@ -3449,11 +3462,9 @@ bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::
     } else {
         if (pagedKVCacheK->dataType == fastllm::DataType::FP8_E4M3) {
             runPrefill.template operator()<half, __nv_fp8_e4m3>();
-        } else if (pagedKVCacheK->dataType == fastllm::DataType::FP4_E2M1) {
 #if CUDA_VERSION >= 12080
+        } else if (pagedKVCacheK->dataType == fastllm::DataType::FP4_E2M1) {
             runPrefill.template operator()<half, __nv_fp4x2_e2m1>();
-#else
-            fastllm::ErrorInFastLLM("FP4 KV cache requires CUDA 12.8 or newer.\n");
 #endif
         } else {
             runPrefill.template operator()<half, half>();
@@ -3717,7 +3728,7 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
     }
     return ok;
 #else
-    if (!FastllmCudaFlashInferSupported()) {
+    if (!FastllmCanUseFlashInferPagedKV(kCaches)) {
         fastllm::AssertInFastLLM(windowLeft < 0,
                                  "Sliding-window paged attention requires FlashInfer support on this GPU.\n");
         bool ok = FastllmCudaHalfPagedAttentionBatchFastllmFallback(
@@ -4269,11 +4280,9 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
     if (q.dataType == fastllm::DataType::BFLOAT16) {
         if (pagedKVCacheK->dataType == fastllm::DataType::FP8_E4M3) {
             runBatchPrefill.template operator()<__nv_bfloat16, __nv_fp8_e4m3>();
-        } else if (pagedKVCacheK->dataType == fastllm::DataType::FP4_E2M1) {
 #if CUDA_VERSION >= 12080
+        } else if (pagedKVCacheK->dataType == fastllm::DataType::FP4_E2M1) {
             runBatchPrefill.template operator()<__nv_bfloat16, __nv_fp4x2_e2m1>();
-#else
-            fastllm::ErrorInFastLLM("FP4 KV cache requires CUDA 12.8 or newer.\n");
 #endif
         } else {
             runBatchPrefill.template operator()<__nv_bfloat16, __nv_bfloat16>();
@@ -4281,11 +4290,9 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
     } else {
         if (pagedKVCacheK->dataType == fastllm::DataType::FP8_E4M3) {
             runBatchPrefill.template operator()<half, __nv_fp8_e4m3>();
-        } else if (pagedKVCacheK->dataType == fastllm::DataType::FP4_E2M1) {
 #if CUDA_VERSION >= 12080
+        } else if (pagedKVCacheK->dataType == fastllm::DataType::FP4_E2M1) {
             runBatchPrefill.template operator()<half, __nv_fp4x2_e2m1>();
-#else
-            fastllm::ErrorInFastLLM("FP4 KV cache requires CUDA 12.8 or newer.\n");
 #endif
         } else {
             runBatchPrefill.template operator()<half, half>();

@@ -655,6 +655,15 @@ if (UNIT_TEST)
             CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
         add_test(NAME cuda_fp4_kv COMMAND cuda_fp4_kv_test)
         set_tests_properties(cuda_fp4_kv PROPERTIES LABELS cuda SKIP_RETURN_CODE 77)
+        add_test(NAME cuda_fp4_kv_native COMMAND cuda_fp4_kv_test)
+        set_tests_properties(cuda_fp4_kv_native PROPERTIES LABELS cuda SKIP_RETURN_CODE 77
+            ENVIRONMENT "FASTLLM_FORCE_NATIVE_ATTN=1")
+        add_test(NAME cuda_fp4_kv_native_no_gqa COMMAND cuda_fp4_kv_test)
+        set_tests_properties(cuda_fp4_kv_native_no_gqa PROPERTIES LABELS cuda SKIP_RETURN_CODE 77
+            ENVIRONMENT "FASTLLM_FORCE_NATIVE_ATTN=1;FASTLLM_PAGED_GQA_DECODE=0")
+        add_test(NAME cuda_fp4_kv_native_no_split COMMAND cuda_fp4_kv_test)
+        set_tests_properties(cuda_fp4_kv_native_no_split PROPERTIES LABELS cuda SKIP_RETURN_CODE 77
+            ENVIRONMENT "FASTLLM_FORCE_NATIVE_ATTN=1;FASTLLM_PAGED_NO_SPLIT=1")
 
         add_executable(cudaGraphPoolMissRegression test/ops/cudaGraphPoolMissRegression.cpp)
         target_link_libraries(cudaGraphPoolMissRegression fastllm)

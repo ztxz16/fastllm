@@ -16,6 +16,31 @@ __device__ __forceinline__ uint8_t FastllmFP4KVEncode(float value) {
     return code | (signbit(value) ? 8 : 0);
 }
 
+// Software decode: no FP4 hardware instructions or CUDA 12.8 headers required.
+__device__ __forceinline__ float FastllmFP4KVDecode(uint8_t code) {
+    const int magnitude = code & 7;
+    // E2M1: 0, 0.5, 1, 1.5, 2, 3, 4, 6. Normal values map exactly to FP32 bits.
+    const float value = magnitude < 2 ? magnitude * 0.5f :
+        __int_as_float(((126 + (magnitude >> 1)) << 23) | ((magnitude & 1) << 22));
+    return code & 8 ? -value : value;
+}
+
+// One aligned load for 4/8 consecutive values, sharing their block16 scale.
+// The caller must keep the vector within one block; the LUT is optional on
+// older GPUs where software E4M3 conversion is more expensive than a lookup.
+template <int N>
+__device__ __forceinline__ void FastllmReadFP4KVVector(
+        const uint8_t *packed, const uint8_t *sf, float *out, const float *scaleLut = nullptr) {
+    static_assert(N == 4 || N == 8);
+    const uint32_t raw = N == 8 ? __ldg(reinterpret_cast<const uint32_t *>(packed)) :
+        __ldg(reinterpret_cast<const uint16_t *>(packed));
+    __nv_fp8_e4m3 scale;
+    scale.__x = __ldg(sf);
+    const float s = scaleLut == nullptr ? float(scale) : scaleLut[scale.__x];
+#pragma unroll
+    for (int i = 0; i < N; ++i) out[i] = FastllmFP4KVDecode(raw >> (i * 4)) * s;
+}
+
 template <typename T>
 __device__ __forceinline__ void FastllmWriteFP4KVBlock(
         uint8_t *cache, const T *input, size_t logicalOffset, size_t pageElements) {
