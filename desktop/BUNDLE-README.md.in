@@ -15,7 +15,13 @@ Launcher。配置、日志和默认模型缓存位于同目录的 `data/`，移�
 ```bash
 ./ftllm/ftllm --version
 ./ftllm/ftllm-check --require-cuda
+./ftllm/ftllm-agent-runtime info
 ```
+
+包内已包含 Pi Agent 及搜索工具 ripgrep、fd。启动模型后，在“工作室”中选择项目目录即可使用目录 Agent，
+无需另外安装 Pi、Node.js 或 npm。Agent 可在选定目录中执行命令和修改文件。
+命令行启动 Launcher 时可用 `--disable-workspace-agent` 关闭目录 Agent，或用
+`--agent-workspace-root /path/to/projects` 指定项目根目录。
 
 ## 运行环境
 

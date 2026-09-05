@@ -1,7 +1,9 @@
 # @PACKAGE_NAME@ @PACKAGE_VERSION@ 绿色包
 
 本目录已经包含 Python @PYTHON_VERSION@、ftllm、CUDA 12 runtime、cuBLAS、NCCL
-及 wheel 声明的全部 Python 依赖。不要把本目录中的 `runtime` 单独移动出去。
+及 wheel 声明的全部 Python 依赖，并内置 Pi Agent、FastLLM 桥接扩展及目录搜索所需的
+ripgrep 和 fd。
+不要把本目录中的 `runtime` 单独移动出去。
 
 ## 直接使用
 
@@ -9,9 +11,15 @@
 ./ftllm-check --require-cuda
 ./ftllm --version
 ./ftllm --help
+./ftllm launch
+./ftllm-agent-runtime info
 ./ftllm chat /path/to/model
 ./ftllm serve /path/to/model --port 8080
 ```
+
+启动模型后可在 Launcher 的“工作室”中使用目录 Agent，无需另外安装 Node.js、npm
+或 Pi。目录 Agent 默认启用，可通过 `./ftllm launch --disable-workspace-agent` 关闭；
+使用 `--agent-workspace-root /path/to/projects` 指定项目根目录。
 
 需要用同一环境运行自己的脚本时：
 

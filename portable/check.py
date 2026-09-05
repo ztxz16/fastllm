@@ -164,6 +164,7 @@ def main() -> int:
         "ftllm",
         "transformers",
         "fastapi",
+        "ftllm-agent-runtime",
         "nvidia-cuda-runtime-cu12",
         "nvidia-cublas-cu12",
         "nvidia-nccl-cu12",
@@ -174,6 +175,29 @@ def main() -> int:
             ok(f"Python 依赖：{distribution_name} {version}")
         except importlib.metadata.PackageNotFoundError:
             fail(f"缺少 Python 依赖：{distribution_name}")
+
+    try:
+        from ftllm_agent_runtime.runtime import PI_VERSION, PiAgentRuntime
+
+        agent = PiAgentRuntime(api_base="http://127.0.0.1:1/v1", model="portable-check")
+        info = agent.info()
+        if not agent.binary.is_relative_to(bundle_root / "runtime"):
+            fail("Pi Agent 没有使用包内运行时")
+        elif info["pi_version"] != PI_VERSION:
+            fail(f"Pi Agent 版本不匹配：{info['pi_version']}，预期 {PI_VERSION}")
+        else:
+            ok(f"Pi Agent：{info['pi_version']}（包内运行时）")
+    except Exception as error:
+        fail(f"Pi Agent 无法启动：{error}")
+
+    for tool in ("rg", "fd"):
+        try:
+            executable = bundle_root / "runtime/bin" / tool
+            result = subprocess.run([str(executable), "--version"], check=True,
+                                    capture_output=True, text=True, timeout=10)
+            ok(f"Agent 搜索工具：{result.stdout.splitlines()[0]}")
+        except (OSError, subprocess.SubprocessError, IndexError) as error:
+            fail(f"Agent 搜索工具 {tool} 不可用：{error}")
 
     driver_branch = query_nvidia_smi_driver()
     cuda_available = False
