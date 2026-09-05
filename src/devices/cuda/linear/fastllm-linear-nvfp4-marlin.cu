@@ -16,9 +16,7 @@
 #include <algorithm>
 #include <climits>
 #include <cmath>
-#include <cstdlib>
 #include <cstdint>
-#include <cstring>
 #include <mutex>
 
 namespace {
@@ -26,48 +24,6 @@ namespace {
 constexpr int NVFP4_GROUP_SIZE = 16;
 constexpr int NVFP4_MARLIN_CONVERT_MAX_M = 8;
 constexpr int NVFP4_MARLIN_OUTPUT_ALIGNMENT = 64;
-
-enum class Nvfp4MarlinMode {
-    AUTO,
-    DISABLED,
-    ENABLED,
-};
-
-static bool Nvfp4MarlinEnvFlag(const char *name, bool defaultValue) {
-    const char *value = std::getenv(name);
-    if (value == nullptr || value[0] == '\0') return defaultValue;
-    return std::strcmp(value, "0") != 0 &&
-           std::strcmp(value, "false") != 0 &&
-           std::strcmp(value, "FALSE") != 0 &&
-           std::strcmp(value, "off") != 0 &&
-           std::strcmp(value, "OFF") != 0;
-}
-
-static Nvfp4MarlinMode Nvfp4MarlinModeFromEnv() {
-    const char *value = std::getenv("FASTLLM_CUDA_NVFP4_MARLIN");
-    if (value == nullptr || value[0] == '\0' ||
-        std::strcmp(value, "auto") == 0 ||
-        std::strcmp(value, "AUTO") == 0) {
-        return Nvfp4MarlinMode::AUTO;
-    }
-    if (std::strcmp(value, "0") == 0 ||
-        std::strcmp(value, "false") == 0 ||
-        std::strcmp(value, "FALSE") == 0 ||
-        std::strcmp(value, "off") == 0 ||
-        std::strcmp(value, "OFF") == 0) {
-        return Nvfp4MarlinMode::DISABLED;
-    }
-    if (std::strcmp(value, "1") == 0 ||
-        std::strcmp(value, "true") == 0 ||
-        std::strcmp(value, "TRUE") == 0 ||
-        std::strcmp(value, "on") == 0 ||
-        std::strcmp(value, "ON") == 0) {
-        return Nvfp4MarlinMode::ENABLED;
-    }
-    // Unknown values are treated as auto instead of unexpectedly forcing a
-    // destructive in-place conversion.
-    return Nvfp4MarlinMode::AUTO;
-}
 
 static bool Nvfp4MarlinArchitectureSupported() {
 #ifdef CUDA_NO_TENSOR_CORE
@@ -95,24 +51,6 @@ static bool Nvfp4MarlinArchitectureSupported() {
 #endif
 }
 
-static const char *Nvfp4MarlinModeName(Nvfp4MarlinMode mode) {
-    if (mode == Nvfp4MarlinMode::DISABLED) return "disabled";
-    if (mode == Nvfp4MarlinMode::ENABLED) return "enabled";
-    return "auto";
-}
-
-static bool Nvfp4MarlinDeviceSupported() {
-#ifdef CUDA_NO_TENSOR_CORE
-    return false;
-#else
-    Nvfp4MarlinMode mode = Nvfp4MarlinModeFromEnv();
-    if (mode == Nvfp4MarlinMode::DISABLED) return false;
-    // This is the same architecture gate used by vLLM's FP4 Marlin path.
-    // SM75 uses Turing MMA with a two-stage pipeline; SM80+ uses four stages.
-    return Nvfp4MarlinArchitectureSupported();
-#endif
-}
-
 static bool HasNvfp4MarlinOnDevice(const fastllm::Data &weight) {
     // IsRepacked is shared with the SM70 TurboMind representation. Include
     // the current architecture in the discriminator so the SM70 layout is
@@ -121,16 +59,6 @@ static bool HasNvfp4MarlinOnDevice(const fastllm::Data &weight) {
            weight.dataType == fastllm::DataType::NVFP4_BLOCK_16 &&
            weight.blockM == NVFP4_GROUP_SIZE && weight.blockK == 1 &&
            weight.IsRepacked && Nvfp4MarlinArchitectureSupported();
-}
-
-static bool Nvfp4MarlinShapeSupported(int sizeN, int sizeK) {
-    if (sizeN <= 0 || sizeK <= 0 || sizeN % 64 != 0 || sizeK % 64 != 0) {
-        return false;
-    }
-    // Every Marlin thread-block shape is either K64xN128 or K128xN64
-    // (K128xN128 is covered by both conditions).
-    return (sizeK % 64 == 0 && sizeN % 128 == 0) ||
-           (sizeK % 128 == 0 && sizeN % 64 == 0);
 }
 
 static bool GetNvfp4MarlinPackedOutputDim(int logicalN, int &packedN) {
@@ -175,9 +103,8 @@ static bool GetNvfp4MarlinTailPointers(
         cTmpBytes = (size_t)sms * maxMBlock * 256 * sizeof(float);
     }
     const size_t requiredBytes = cTmpOffset + cTmpBytes;
-    if (metadataBytes > weight.GetBytes() || metadataOffset % alignof(int) != 0 ||
-        (metadataOffset + workspaceBytes) % alignof(float) != 0 ||
-        cTmpOffset % 16 != 0) {
+    // Supported K/N tiles already align weights, scales and workspace.
+    if (metadataBytes > weight.GetBytes()) {
         return false;
     }
 
@@ -277,15 +204,10 @@ __global__ void FastllmNvfp4MarlinCropOutputKernel(
 }
 
 static bool EnsureNvfp4MarlinOnDevice(fastllm::Data &weight,
-                                       int sizeK, int logicalN, int sizeN) {
+                                     int sizeK, int logicalN, int sizeN) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
     if (HasNvfp4MarlinOnDevice(weight)) return true;
-    if (weight.cudaData == nullptr || weight.blockM != NVFP4_GROUP_SIZE ||
-        weight.blockK != 1 || !Nvfp4MarlinShapeSupported(sizeN, sizeK) ||
-        weight.scales.empty()) {
-        return false;
-    }
 
     float commonGlobalScale = INFINITY;
     for (float scale : weight.scales) {
@@ -305,7 +227,6 @@ static bool EnsureNvfp4MarlinOnDevice(fastllm::Data &weight,
         return false;
     }
 
-    int workspaceInts = std::max(1, sms * 4);
     int *workspace = nullptr;
     float *globalScale = nullptr;
     float *cTmp = nullptr;
@@ -356,43 +277,27 @@ static bool EnsureNvfp4MarlinOnDevice(fastllm::Data &weight,
     // reusable CUDA pool after every model weight has been prepared.
     FastllmCudaForceFree(temporary);
 
-    if (!repacked || syncState != cudaSuccess) {
-        if (syncState != cudaSuccess) {
-            printf("Error: NVFP4 Marlin in-place repack failed: %s.\n",
-                   cudaGetErrorString(syncState));
-            throw("nvfp4 marlin repack error");
-        }
-        // A failed repack may already have overwritten the source allocation;
-        // do not silently execute the original-layout kernel in that case.
-        if (cudaPeekAtLastError() != cudaSuccess || !repacked) {
-            printf("Error: NVFP4 Marlin conversion failed after in-place repack began.\n");
-            throw("nvfp4 marlin conversion error");
-        }
-        return false;
+    if (syncState != cudaSuccess) {
+        printf("Error: NVFP4 Marlin in-place repack failed: %s.\n",
+               cudaGetErrorString(syncState));
+        throw("nvfp4 marlin repack error");
+    }
+    // A failed repack may already have overwritten the source allocation;
+    // never fall back to the original-layout kernel after conversion begins.
+    if (!repacked) {
+        printf("Error: NVFP4 Marlin conversion failed after in-place repack began.\n");
+        throw("nvfp4 marlin conversion error");
     }
 
     // The tail still contained unread source blocks until conversion was
     // complete, so initialise the in-place metadata only after the stream has
     // synchronized.  IsRepacked is the durable layout marker; CUDA copies of
     // this Data preserve both the marker and the tail bytes together.
-    FastllmCudaMemset0(workspace, (size_t)workspaceInts * sizeof(int));
+    FastllmCudaMemset0(workspace, (size_t)sms * 4 * sizeof(int));
     FastllmCudaCopyFromHostToDevice(globalScale, &processedGlobalScale,
                                     sizeof(float));
     weight.IsRepacked = true;
 
-    if (Nvfp4MarlinEnvFlag(
-            "FASTLLM_CUDA_NVFP4_MARLIN_TRACE", false)) {
-        int device = 0, major = 0, minor = 0;
-        cudaGetDevice(&device);
-        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
-                               device);
-        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor,
-                               device);
-        Nvfp4MarlinMode mode = Nvfp4MarlinModeFromEnv();
-        printf("FastLLM NVFP4 Marlin: repacked %s [N=%d, packedN=%d, K=%d] on SM%d "
-               "(mode=%s).\n", weight.name.c_str(), logicalN, sizeN, sizeK,
-               major * 10 + minor, Nvfp4MarlinModeName(mode));
-    }
     FastllmCudaClearThreadError();
     return true;
 }
@@ -410,25 +315,22 @@ extern "C" bool FastllmCudaTryMarlinHalfMatMulFloatNVFP4Block16(
         int n, int m, int k) {
     int packedN = 0;
     if (!GetNvfp4MarlinPackedOutputDim(k, packedN)) return false;
-    if (HasNvfp4MarlinOnDevice(weight)) {
-        // Once converted in place, the original-layout fallback is no longer
-        // valid, so always continue through Marlin even if an environment flag
-        // is changed later in the process.
-    } else {
-        if (!Nvfp4MarlinDeviceSupported() || n < 1 ||
-            weight.dataType != fastllm::DataType::NVFP4_BLOCK_16 ||
+    // Repacked weights must keep using Marlin, including larger prefills.
+    if (!HasNvfp4MarlinOnDevice(weight)) {
+        if (weight.dataType != fastllm::DataType::NVFP4_BLOCK_16 ||
             weight.blockM != NVFP4_GROUP_SIZE || weight.blockK != 1 ||
-            !Nvfp4MarlinShapeSupported(packedN, m) || weight.scales.empty()) {
+            weight.scales.empty()) {
             return false;
         }
-        // In auto mode this probes the actual compiled specialization and its
-        // dynamic shared-memory configuration before the source buffer is
-        // destructively repacked. Forced mode keeps the same safety check.
-        if (!FastllmCudaMarlinNVFP4Supported(packedN, m)) return false;
         // Destructive preparation is restricted to synchronized small-M
         // warmup, avoiding allocations or repacks during CUDA graph capture.
-        if (n > NVFP4_MARLIN_CONVERT_MAX_M ||
-            !FastllmCudaGetNcclForceSync() ||
+        if (n < 1 || n > NVFP4_MARLIN_CONVERT_MAX_M ||
+            !FastllmCudaGetNcclForceSync()) {
+            return false;
+        }
+        // Use the launcher's device, tile and compiled-kernel checks before
+        // changing the source layout.
+        if (!FastllmCudaMarlinNVFP4Supported(packedN, m) ||
             !EnsureNvfp4MarlinOnDevice(weight, m, k, packedN)) {
             return false;
         }
@@ -481,8 +383,8 @@ extern "C" bool FastllmCudaTryMarlinHalfMatMulFloatNVFP4Block16(
         throw("nvfp4 marlin gemm error");
     }
 
-    const half *cudaBias = bias.dims.size() > 0 && !weight.extraCudaHalfData.empty()
-        ? static_cast<const half *>(weight.extraCudaHalfData[0]) : nullptr;
+    half *cudaBias = bias.dims.size() > 0 && !weight.extraCudaHalfData.empty()
+        ? static_cast<half *>(weight.extraCudaHalfData[0]) : nullptr;
     if (packedN != k) {
         const int threads = 256;
         dim3 grid((k + threads - 1) / threads, std::min(n, 65535));
@@ -491,7 +393,7 @@ extern "C" bool FastllmCudaTryMarlinHalfMatMulFloatNVFP4Block16(
         releasePaddedOutput();
     } else if (cudaBias != nullptr) {
         FastllmCudaBiasKernel<<<n, 256, 0, cudaStreamPerThread>>>(
-            cudaOutput, static_cast<half *>(weight.extraCudaHalfData[0]), k);
+            cudaOutput, cudaBias, k);
     }
 
     FastllmCudaFinishInput(input, cudaInput);

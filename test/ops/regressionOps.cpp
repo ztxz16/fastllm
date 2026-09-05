@@ -3913,7 +3913,6 @@ namespace {
             return;
         }
 
-        ScopedEnvOverride forceMarlin("FASTLLM_CUDA_NVFP4_MARLIN", "1");
         ScopedNcclForceSyncRestore restoreForceSync;
 
         constexpr float globalScale = 1.0f / 256.0f;

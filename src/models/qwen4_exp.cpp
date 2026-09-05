@@ -2033,7 +2033,6 @@ namespace fastllm {
         // Delay quantization until now rather than inspecting the still-lazy
         // model weight during PrepareWeights().
         Data &lmHead = this->weight["lm_head.weight"];
-        bool useNvfp4 = false;
         if (lmHead.dataDevice != DataDevice::CUDA ||
             lmHead.cudaData == nullptr || lmHead.dims.size() != 2 ||
             (lmHead.dataType != DataType::FLOAT16 &&
@@ -2042,16 +2041,10 @@ namespace fastllm {
             this->mtpDraftLmHeadAttempted = true;
             return;
         }
-        const char *marlinSetting =
-            std::getenv("FASTLLM_CUDA_NVFP4_MARLIN");
-        const bool marlinEnabled =
-            marlinSetting == nullptr || marlinSetting[0] == '\0' ||
-            Qwen4EnvFlagEnabled("FASTLLM_CUDA_NVFP4_MARLIN");
         const int previousDevice = FastllmCudaGetDevice();
         FastllmCudaSetDevice(lmHead.dataDeviceIds[0]);
-        useNvfp4 = marlinEnabled &&
-            FastllmCudaMarlinNVFP4Supported(
-                lmHead.dims[0], lmHead.dims[1]);
+        const bool useNvfp4 = FastllmCudaMarlinNVFP4Supported(
+            lmHead.dims[0], lmHead.dims[1]);
         if (previousDevice >= 0 &&
             previousDevice != lmHead.dataDeviceIds[0]) {
             FastllmCudaSetDevice(previousDevice);
