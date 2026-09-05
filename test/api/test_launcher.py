@@ -338,10 +338,26 @@ class LauncherConfigTest(unittest.TestCase):
         self.assertEqual(preview["errors"], [])
         self.assertIn("ftllm webui", preview["command"])
         self.assertIn("--max_token 8192", preview["command"])
-        self.assertIn("--think true", preview["command"])
+        self.assertNotIn("--think", preview["command"])
+        self.assertNotIn("--device", preview["command"])
         self.assertNotIn("--model_name", preview["command"])
         self.assertNotIn("--host", preview["command"])
         self.assertEqual(preview["endpoint"], "http://127.0.0.1:1616")
+
+    def test_webui_saved_inference_options_produce_valid_api_client_args(self):
+        from fastllm_pytools.cli import args_parser
+
+        config = DeployConfig(**self.config(
+            command="webui", port="1616", device="cuda",
+            enable_moe_hybrid=True, moe_device="numa",
+            webui_think="true", api_key="test-api-key",
+            extra_args="--api_base http://127.0.0.1:8081/v1",
+        ))
+        args = args_parser().parse_args(build_fastllm_argv(config)[1:])
+        self.assertEqual(args.api_base, "http://127.0.0.1:8081/v1")
+        self.assertEqual(args.api_key, "test-api-key")
+        self.assertEqual(args.port, 1616)
+        self.assertFalse(hasattr(args, "moe_device"))
 
     def test_download_preview_hides_token(self):
         payload = {

@@ -1131,6 +1131,16 @@ def build_fastllm_argv(config: DeployConfig) -> List[str]:
     if model:
         argv.append(model)
 
+    if config.command == "webui":
+        # WebUI connects to an API server; inference options belong to the
+        # separately launched model service, including for saved profiles.
+        _add_option(argv, "--port", config.port.strip())
+        _add_option(argv, "--max_token", config.webui_max_token.strip())
+        _add_option(argv, "--api_key", config.api_key.strip())
+        if config.extra_args.strip():
+            argv.extend(shlex.split(config.extra_args.strip()))
+        return argv
+
     device, tp = _resolve_main_device_args(config)
     dtype = _resolve_custom(config.dtype, config.dtype_custom)
     moe_dtype = _resolve_custom(config.moe_dtype, config.moe_dtype_custom)
@@ -1188,11 +1198,6 @@ def build_fastllm_argv(config: DeployConfig) -> List[str]:
         _add_option(argv, "--repeat_penalty", config.repeat_penalty.strip())
         if config.hide_input:
             argv.append("--hide_input")
-    elif config.command == "webui":
-        _add_option(argv, "--port", config.port.strip())
-        _add_option(argv, "--max_token", config.webui_max_token.strip())
-        _add_option(argv, "--think", config.webui_think.strip())
-
     extra_args = config.extra_args.strip()
     if extra_args:
         argv.extend(shlex.split(extra_args))

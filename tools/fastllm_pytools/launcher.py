@@ -773,8 +773,6 @@ class LauncherRuntime:
         environment = os.environ.copy()
         environment.update(environment_overrides)
         environment["PYTHONUNBUFFERED"] = "1"
-        if config.command == "webui":
-            environment["STREAMLIT_SERVER_HEADLESS"] = "true"
         popen_options = _child_process_options(environment)
 
         with self._lock:

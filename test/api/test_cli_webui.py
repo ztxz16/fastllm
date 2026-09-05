@@ -17,7 +17,7 @@ from fastllm_pytools import cli
 
 
 class CliWebuiTest(unittest.TestCase):
-    def test_webui_uses_argument_array_for_model_path(self):
+    def test_webui_preserves_model_path_and_api_arguments(self):
         with tempfile.TemporaryDirectory(prefix="model path ") as model_path:
             argv = [
                 "ftllm",
@@ -25,30 +25,27 @@ class CliWebuiTest(unittest.TestCase):
                 model_path,
                 "--port",
                 "17777",
-                "--device",
-                "cpu",
+                "--api_base",
+                "http://127.0.0.1:8081/v1",
                 "--max_token",
                 "2048",
-                "--think",
-                "true",
             ]
             with (
                 patch(
-                    "fastllm_pytools.cli.subprocess.call",
+                    "fastllm_pytools.webui_server.serve_webui",
                     return_value=0,
                 ) as call,
                 redirect_stdout(io.StringIO()),
             ):
                 result = cli.main(argv[1:])
 
-        command = call.call_args.args[0]
+        args = call.call_args.args[0]
         self.assertEqual(result, 0)
-        self.assertEqual(command[:2], ["streamlit", "run"])
-        self.assertIn("--server.port", command)
-        self.assertIn("--browser.gatherUsageStats", command)
-        self.assertIn("--", command)
-        self.assertIn(model_path, command)
-        self.assertNotIn("--draft_tokens", command)
+        self.assertEqual(args.model, model_path)
+        self.assertEqual(args.api_base, "http://127.0.0.1:8081/v1")
+        self.assertEqual(args.port, 17777)
+        self.assertEqual(args.max_token, 2048)
+        self.assertFalse(hasattr(args, "draft_tokens"))
 
 
 if __name__ == "__main__":
