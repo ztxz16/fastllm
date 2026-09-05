@@ -409,6 +409,7 @@ FastLLM 的实现参考或使用了以下开源项目与文章中的思路或代
 - [1Cat-vLLM 的 SM70 TurboMind 适配](https://github.com/1CatAI/1Cat-vLLM/tree/main/csrc/sm70_turbomind)：AWQ 接入及 FP8/NVFP4 类型、布局和小批量 tactic 的参考来源；FastLLM 侧另行实现了无 Torch 的原始指针桥接、模型权重格式转换、非对齐 padding、回退和调度。
 - [KTransformers](https://github.com/kvcache-ai/ktransformers/blob/main/csrc/ktransformers_ext/cpu_backend/backend.cpp)：MoE 动态线程调度；另见[思路介绍](https://zhuanlan.zhihu.com/p/1900318746402329329)。
 - [Lvllm](https://github.com/guqiong96/Lvllm/blob/main/csrc/lk/moe.cpp)：NUMA MoE 动态调度。
+- [FreeToken](https://github.com/FlashML-org/FreeToken)：CUDA 专家缓存及相关混合推理优化的设计参考，包括 GPU 端路由与 LRU 缓存管理、主机专家权重按需回填，以及 CUDA Graph 兼容的执行流程。具体实现与扩展方式见 [CUDA 专家缓存说明](docs/cuda-expert-cache.md)。
 - [vLLM](https://github.com/vllm-project/vllm/tree/main/vllm/entrypoints/openai/tool_parsers)：工具调用解析。
 - [json11](https://github.com/dropbox/json11)：JSON 构造与解析。
 

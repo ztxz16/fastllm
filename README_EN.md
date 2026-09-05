@@ -408,6 +408,7 @@ FastLLM uses or draws implementation ideas from the following projects and artic
 - [1Cat-vLLM's SM70 TurboMind integration](https://github.com/1CatAI/1Cat-vLLM/tree/main/csrc/sm70_turbomind) for the AWQ integration and the FP8/NVFP4 type, layout, and small-batch tactic references. FastLLM separately implements its Torch-free raw-pointer bridge, model-weight format conversion, unaligned padding, fallbacks, and dispatch.
 - [KTransformers](https://github.com/kvcache-ai/ktransformers/blob/main/csrc/ktransformers_ext/cpu_backend/backend.cpp) for dynamic MoE thread scheduling; see also the [design article](https://zhuanlan.zhihu.com/p/1900318746402329329).
 - [Lvllm](https://github.com/guqiong96/Lvllm/blob/main/csrc/lk/moe.cpp) for NUMA-aware MoE scheduling.
+- [FreeToken](https://github.com/FlashML-org/FreeToken) for design ideas behind CUDA expert caching and related hybrid inference optimizations, including GPU-side routing and LRU cache management, on-demand refills of expert weights from host memory, and CUDA Graph-compatible execution. See the [CUDA expert cache documentation](docs/cuda-expert-cache.md) for implementation and extension details.
 - [vLLM](https://github.com/vllm-project/vllm/tree/main/vllm/entrypoints/openai/tool_parsers) for tool-call parsing.
 - [json11](https://github.com/dropbox/json11) for JSON construction and parsing.
 
