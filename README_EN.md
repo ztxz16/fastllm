@@ -404,7 +404,8 @@ FastLLM uses or draws implementation ideas from the following projects and artic
 - [Transformers](https://github.com/huggingface/transformers) for model architectures and reference implementations.
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) and [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) for GGUF quantization formats and kernels.
 - [FlashInfer](https://github.com/flashinfer-ai/flashinfer) for attention, MLA, and related operators.
-- [TurboMind / LMDeploy](https://github.com/InternLM/lmdeploy/tree/main/src/turbomind) and [1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM/blob/main/csrc/quantization/awq/awq_sm70_gemm.cu) for the SM70 AWQ W4A16 GEMM path.
+- [TurboMind / LMDeploy GEMM kernels](https://github.com/InternLM/lmdeploy/tree/main/src/turbomind/kernels/gemm): the SM70 s884 (`SM70_MMA_884` / HMMA 8x8x4) core bundled under `third_party/turbomind` is ported from this source and is used for AWQ INT4, block-scaled FP8, and NVFP4 Linear paths.
+- [1Cat-vLLM's SM70 TurboMind integration](https://github.com/1CatAI/1Cat-vLLM/tree/main/csrc/sm70_turbomind) for the AWQ integration and the FP8/NVFP4 type, layout, and small-batch tactic references. FastLLM separately implements its Torch-free raw-pointer bridge, model-weight format conversion, unaligned padding, fallbacks, and dispatch.
 - [KTransformers](https://github.com/kvcache-ai/ktransformers/blob/main/csrc/ktransformers_ext/cpu_backend/backend.cpp) for dynamic MoE thread scheduling; see also the [design article](https://zhuanlan.zhihu.com/p/1900318746402329329).
 - [Lvllm](https://github.com/guqiong96/Lvllm/blob/main/csrc/lk/moe.cpp) for NUMA-aware MoE scheduling.
 - [vLLM](https://github.com/vllm-project/vllm/tree/main/vllm/entrypoints/openai/tool_parsers) for tool-call parsing.

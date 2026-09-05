@@ -409,7 +409,7 @@ if (USE_CUDA)
     # Marlin 内核需要 sm_75+，但通过 __CUDA_ARCH__ 宏保护可在低算力（如 sm_70）下编译为占位实现，
     # 运行期再根据设备算力回退到朴素 int4 linear，因此这里始终编译 marlin.cu 以兼容多 CUDA_ARCH 打包。
 
-    # SM70 (V100) AWQ W4A16: 移植的 TurboMind s884 内核子集 + fastllm 对接层。
+    # SM70 (V100) AWQ/FP8/NVFP4 A16: 移植的 TurboMind s884 内核子集 + fastllm 对接层。
     # 仅在编译目标包含 sm_70 时编译；其它算力下这些 .cu 编译为占位实现（运行期不调度）。
     include_directories(${CMAKE_CURRENT_SOURCE_DIR}/third_party/turbomind)
     set(TURBOMIND_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/third_party/turbomind/src/turbomind)

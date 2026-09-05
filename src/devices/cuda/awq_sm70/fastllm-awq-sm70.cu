@@ -1,10 +1,10 @@
 //
 // SM70 (V100) quantized A16 GEMM bridge over ported TurboMind s884 kernels.
 //
-// The logic mirrors 1Cat-vLLM's csrc/quantization/awq/awq_sm70_gemm.cu, but is
+// The integration follows 1Cat-vLLM's csrc/sm70_turbomind adapter, but is
 // rewritten to use raw CUDA pointers instead of torch::Tensor so it can be
 // driven directly from FastLLM's INT4_GROUP, FP8_E4M3, and NVFP4_BLOCK_16
-// weights.
+// weights. See the provenance links in the top-level README files.
 //
 
 #include "devices/cuda/fastllm-awq-sm70.cuh"

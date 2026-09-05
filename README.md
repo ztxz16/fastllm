@@ -405,7 +405,8 @@ FastLLM 的实现参考或使用了以下开源项目与文章中的思路或代
 - [Transformers](https://github.com/huggingface/transformers)：模型结构与参考实现。
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) 和 [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp)：GGUF 量化格式与 kernel。
 - [FlashInfer](https://github.com/flashinfer-ai/flashinfer)：Attention、MLA 等算子。
-- [TurboMind / LMDeploy](https://github.com/InternLM/lmdeploy/tree/main/src/turbomind) 和 [1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM/blob/main/csrc/quantization/awq/awq_sm70_gemm.cu)：SM70 AWQ W4A16 GEMM 路径。
+- [TurboMind / LMDeploy 的 GEMM 内核](https://github.com/InternLM/lmdeploy/tree/main/src/turbomind/kernels/gemm)：仓内 `third_party/turbomind` 的 SM70 s884（`SM70_MMA_884` / HMMA 8x8x4）核心由其源码移植，并在其上接入 AWQ INT4、块缩放 FP8 与 NVFP4 Linear。
+- [1Cat-vLLM 的 SM70 TurboMind 适配](https://github.com/1CatAI/1Cat-vLLM/tree/main/csrc/sm70_turbomind)：AWQ 接入及 FP8/NVFP4 类型、布局和小批量 tactic 的参考来源；FastLLM 侧另行实现了无 Torch 的原始指针桥接、模型权重格式转换、非对齐 padding、回退和调度。
 - [KTransformers](https://github.com/kvcache-ai/ktransformers/blob/main/csrc/ktransformers_ext/cpu_backend/backend.cpp)：MoE 动态线程调度；另见[思路介绍](https://zhuanlan.zhihu.com/p/1900318746402329329)。
 - [Lvllm](https://github.com/guqiong96/Lvllm/blob/main/csrc/lk/moe.cpp)：NUMA MoE 动态调度。
 - [vLLM](https://github.com/vllm-project/vllm/tree/main/vllm/entrypoints/openai/tool_parsers)：工具调用解析。
