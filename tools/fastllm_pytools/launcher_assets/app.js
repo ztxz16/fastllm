@@ -60,6 +60,8 @@ const state = {
   logs: [],
   lastLogId: 0,
   currentView: "launch",
+  profileQuery: "",
+  profileFilter: "all",
   locale: DEFAULT_LOCALE,
   staticMessages: {},
   messages: {},
@@ -120,6 +122,7 @@ function cacheElements() {
   const ids = [
     "app-version", "shutdown-launcher", "status-dot", "status-title", "status-message",
     "open-endpoint", "stop-runtime", "profile-count", "profile-list", "new-profile",
+    "current-view-title", "profile-search", "profile-results",
     "config-path", "profile-editor-modal", "profile-editor-title", "launch-form",
     "close-profile-editor", "save-state", "ori-field", "auto-configure-profile",
     "clear-profile-config", "automatic-config-status",
@@ -349,6 +352,7 @@ async function changeLocale(locale) {
 }
 
 function renderLocalizedContent() {
+  renderViewTitle();
   updateConditionalFields();
   renderAutomaticConfigurationStatus();
   renderProfileEditorTitle();
@@ -407,6 +411,10 @@ function renderLauncherAddresses() {
 
 function bindEvents() {
   document.addEventListener("click", handleDelegatedClick);
+  elements.profileSearch.addEventListener("input", (event) => {
+    state.profileQuery = event.target.value;
+    renderProfiles();
+  });
   elements.launchForm.addEventListener("input", handleFormChange);
   elements.launchForm.addEventListener("change", handleFormChange);
   elements.downloadForm.addEventListener("input", handleDownloadChange);
@@ -452,6 +460,13 @@ function bindEvents() {
       }
       return;
     }
+    if (event.key === "Tab") {
+      const dialog = !elements.folderPickerModal.classList.contains("hidden")
+        ? elements.folderPickerModal
+        : !elements.profileEditorModal.classList.contains("hidden") ? elements.profileEditorModal : null;
+      if (dialog) trapDialogFocus(event, dialog);
+      return;
+    }
     if (event.key !== "Escape") return;
     if (!elements.folderPickerModal.classList.contains("hidden")) {
       event.preventDefault();
@@ -475,6 +490,36 @@ function bindEvents() {
 }
 
 function handleDelegatedClick(event) {
+  if (event.target.closest("[data-new-profile]")) {
+    newProfile();
+    return;
+  }
+  if (event.target.closest("[data-clear-profile-filters]")) {
+    resetProfileFilters();
+    renderProfiles();
+    elements.profileSearch.focus();
+    return;
+  }
+  const filter = event.target.closest("[data-profile-filter]");
+  if (filter) {
+    state.profileFilter = filter.dataset.profileFilter;
+    renderProfileFilters();
+    renderProfiles();
+    return;
+  }
+  const sectionButton = event.target.closest("[data-editor-section]");
+  if (sectionButton) {
+    const section = document.getElementById(`editor-${sectionButton.dataset.editorSection}`);
+    if (section instanceof HTMLDetailsElement) section.open = true;
+    section?.scrollIntoView({ block: "start" });
+    // Keep the jump links available while making the section keyboard-accessible.
+    const heading = section?.querySelector(".section-title, summary");
+    if (heading) {
+      heading.setAttribute("tabindex", "-1");
+      heading.focus({ preventScroll: true });
+    }
+    return;
+  }
   const profileAction = event.target.closest("[data-profile-action]");
   if (profileAction) {
     const index = Number(profileAction.dataset.profileIndex);
@@ -484,9 +529,9 @@ function handleDelegatedClick(event) {
     if (action === "delete") deleteProfile(index);
     return;
   }
-  const nav = event.target.closest("[data-view-button]");
+  const nav = event.target.closest("[data-view-button], [data-open-view]");
   if (nav) {
-    switchView(nav.dataset.viewButton);
+    switchView(nav.dataset.viewButton || nav.dataset.openView);
     return;
   }
 }
@@ -494,7 +539,10 @@ function handleDelegatedClick(event) {
 function switchView(view) {
   state.currentView = view;
   for (const button of document.querySelectorAll("[data-view-button]")) {
-    button.classList.toggle("active", button.dataset.viewButton === view);
+    const selected = button.dataset.viewButton === view;
+    button.classList.toggle("active", selected);
+    if (selected) button.setAttribute("aria-current", "page");
+    else button.removeAttribute("aria-current");
   }
   for (const panel of document.querySelectorAll(".view")) {
     panel.classList.toggle("active", panel.id === `view-${view}`);
@@ -507,6 +555,42 @@ function switchView(view) {
     document.querySelector('[data-view-button="download"]').classList.remove("has-activity");
   }
   if (view === "hardware" && !state.hardwareLoaded) loadHardware();
+  renderViewTitle();
+}
+
+function renderViewTitle() {
+  const titles = {
+    launch: t("Launch service"),
+    download: t("Download model"),
+    logs: t("Runtime logs"),
+    hardware: t("Hardware")
+  };
+  elements.currentViewTitle.textContent = titles[state.currentView] || titles.launch;
+}
+
+function renderProfileFilters() {
+  for (const button of document.querySelectorAll("[data-profile-filter]")) {
+    const selected = button.dataset.profileFilter === state.profileFilter;
+    button.classList.toggle("active", selected);
+    button.setAttribute("aria-pressed", String(selected));
+  }
+}
+
+function resetProfileFilters() {
+  state.profileQuery = "";
+  state.profileFilter = "all";
+  elements.profileSearch.value = "";
+  renderProfileFilters();
+}
+
+function createIcon(name) {
+  const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  icon.classList.add("icon");
+  icon.setAttribute("aria-hidden", "true");
+  const use = document.createElementNS("http://www.w3.org/2000/svg", "use");
+  use.setAttribute("href", `#icon-${name}`);
+  icon.append(use);
+  return icon;
 }
 
 function cloneConfig(config) {
@@ -884,12 +968,18 @@ function renderProfiles() {
   const runningIndex = findRunningProfileIndex();
   const signature = JSON.stringify([
     state.locale,
+    state.profileQuery,
+    state.profileFilter,
     state.profiles.map((profile) => [
       profile.name,
       profile.model_name,
       profile.command,
       profile.model,
       profile.device,
+      profile.cuda_device_id,
+      profile.tp,
+      profile.cudapp,
+      profile.dtype,
       profile.port
     ]),
     active,
@@ -903,21 +993,39 @@ function renderProfiles() {
   profileRenderSignature = signature;
   elements.profileList.replaceChildren();
   elements.profileCount.textContent = String(state.profiles.length);
-  if (!state.profiles.length) {
+  const query = state.profileQuery.trim().toLocaleLowerCase();
+  const profiles = state.profiles.map((profile, index) => ({ profile, index })).filter(({ profile }) => {
+    const mode = profile.command === "webui" ? "webui" : "server";
+    return (state.profileFilter === "all" || mode === state.profileFilter)
+      && [profile.name, profile.model_name, profile.model].some(
+        (value) => String(value || "").toLocaleLowerCase().includes(query)
+      );
+  });
+  elements.profileResults.textContent = t("{count} launch items shown", { count: profiles.length });
+  if (!profiles.length) {
+    const filtered = state.profiles.length > 0;
     const empty = document.createElement("div");
     empty.className = "empty-profile";
     const icon = document.createElement("span");
     icon.className = "empty-profile-icon";
-    icon.textContent = "+";
+    icon.append(createIcon(filtered ? "search" : "grid"));
     const title = document.createElement("strong");
-    title.textContent = t("No launch items yet");
+    title.textContent = filtered ? t("No matching launch items") : t("Your first model starts here");
     const detail = document.createElement("small");
-    detail.textContent = t("Add a launch item to configure your first local model service.");
-    empty.append(icon, title, detail);
+    detail.textContent = filtered
+      ? t("Try another name or model path, or clear the filters.")
+      : t("Choose a local model and save a profile to launch an API or chat service.");
+    const action = document.createElement("button");
+    action.type = "button";
+    action.className = "primary-button";
+    if (filtered) action.dataset.clearProfileFilters = "";
+    else action.dataset.newProfile = "";
+    action.textContent = filtered ? t("Clear filters") : t("Add launch item");
+    empty.append(icon, title, detail, action);
     elements.profileList.append(empty);
     return;
   }
-  state.profiles.forEach((profile, index) => {
+  profiles.forEach(({ profile, index }) => {
     const item = document.createElement("article");
     item.className = "profile-item";
     const running = index === runningIndex;
@@ -925,6 +1033,7 @@ function renderProfiles() {
 
     const avatar = document.createElement("span");
     avatar.className = "profile-avatar";
+    if (profile.command === "webui") avatar.classList.add("webui");
     avatar.textContent = firstVisibleCharacter(profile.name || profile.model_name || "F");
     const copy = document.createElement("div");
     copy.className = "profile-copy";
@@ -935,10 +1044,10 @@ function renderProfiles() {
     const mode = document.createElement("span");
     mode.className = "profile-mode";
     mode.textContent = profile.command === "webui" ? t("Chat WebUI") : t("API Server");
-    titleRow.append(title, mode);
+    titleRow.append(title);
     const metadata = document.createElement("div");
     metadata.className = "profile-metadata";
-    for (const value of [profileDeviceLabel(profile), t("Port {port}", { port: profile.port || "—" })]) {
+    for (const value of [profileDeviceLabel(profile), profile.dtype || "auto", t("Port {port}", { port: profile.port || "—" })]) {
       const detail = document.createElement("span");
       detail.textContent = value;
       metadata.append(detail);
@@ -947,7 +1056,7 @@ function renderProfiles() {
     path.className = "profile-path";
     path.textContent = profile.model || t("Model not set");
     path.title = profile.model || "";
-    copy.append(titleRow, metadata, path);
+    copy.append(mode, titleRow, path, metadata);
 
     const actions = document.createElement("div");
     actions.className = "project-actions";
@@ -997,7 +1106,9 @@ function profileDeviceLabel(profile) {
     cpu: "CPU",
     numa: "NUMA"
   };
-  return devices[profile.device] || String(profile.device || t("Auto device"));
+  const device = devices[profile.device] || String(profile.device || t("Auto device"));
+  const ids = { cuda: profile.cuda_device_id || "0", tp: profile.tp, cudapp: profile.cudapp };
+  return ids[profile.device] ? `${device} · ${ids[profile.device]}` : device;
 }
 
 function renderProfileRuntime() {
@@ -1184,6 +1295,7 @@ async function saveCurrentProfile(showSuccess = false) {
   state.currentIndex = result.index;
   state.editingConfig = cloneConfig(result.profile);
   state.dirty = false;
+  resetProfileFilters();
   renderSaveState();
   if (showSuccess) showToast(t("Launch profile saved."), "success");
   return result.profile;
@@ -2088,6 +2200,22 @@ function trapConfirmationFocus(event) {
     event.preventDefault();
     last.focus();
   } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
+function trapDialogFocus(event, dialog) {
+  const controls = [...dialog.querySelectorAll(
+    'button, input, select, textarea, summary, a[href], [tabindex="0"]'
+  )].filter((element) => !element.disabled && element.getClientRects().length > 0);
+  if (!controls.length) return;
+  const first = controls[0];
+  const last = controls[controls.length - 1];
+  if (event.shiftKey && (document.activeElement === first || !controls.includes(document.activeElement))) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && (document.activeElement === last || !dialog.contains(document.activeElement))) {
     event.preventDefault();
     first.focus();
   }
