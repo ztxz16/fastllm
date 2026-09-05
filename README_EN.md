@@ -42,7 +42,7 @@ A dedicated Python virtual environment is recommended. Prebuilt packages cover t
 | --- | --- | --- |
 | Linux + NVIDIA GPU | `python -m pip install -U ftllm` | Includes the Python interface and common CUDA runtime dependencies; the installed driver must be compatible |
 | Windows + NVIDIA GPU | `python -m pip install -U ftllm` | Install the Windows dependency wheel below first if required DLLs are missing |
-| Linux + AMD GPU | `python -m pip install -U ftllm-rocm` | Install a compatible ROCm environment first; see the [ROCm guide](docs/rocm.md) |
+| Linux + AMD GPU | [ROCm installation and build](docs/rocm.md) | Choose the build and installation options for your GPU architecture |
 | CPU-only, special architectures, or other accelerators | [Build from source](#build-from-source) | Select the appropriate CMake backend |
 
 Windows dependency package for first-time installations:
@@ -352,16 +352,13 @@ bash install.sh -DUSE_CUDA=ON \
 bash install.sh -DUSE_CUDA=ON -DCUDA_ARCH=89 \
   -DCMAKE_CUDA_COMPILER="$(command -v nvcc)"
 
-# AMD ROCm
-bash install.sh -DUSE_ROCM=ON
-
 # CPU-only
 bash install.sh
 ~~~
 
 Additional platform documentation:
 
-- [ROCm build guide](docs/rocm.md)
+- [ROCm build and wheel packaging](docs/rocm.md)
 - [TFACC platform](docs/tfacc.md)
 - [Examples, Android, and other platforms](example/README.md)
 - [Build and runtime FAQ](docs/faq.md)

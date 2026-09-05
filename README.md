@@ -42,7 +42,7 @@ Qwen4-Exp / Qwen3.8-Flash-Next 当前不加载视觉权重；Qwen3.8-Flash-Next 
 | --- | --- | --- |
 | Linux + NVIDIA GPU | `python -m pip install -U ftllm` | 包含 Python 接口和常用 CUDA 运行时依赖；驱动需要与 CUDA 运行时兼容 |
 | Windows + NVIDIA GPU | `python -m pip install -U ftllm` | 如果首次安装提示缺少 DLL，请先安装下方的 Windows 依赖包 |
-| Linux + AMD GPU | `python -m pip install -U ftllm-rocm` | 需要先安装与显卡匹配的 ROCm 环境，参见 [ROCm 文档](docs/rocm.md) |
+| Linux + AMD GPU | [ROCm 安装与编译](docs/rocm.md) | 按显卡架构选择构建与安装方式 |
 | CPU-only、特殊架构或其他加速器 | [源码安装](#源码安装) | 可按实际平台选择 CMake 后端 |
 
 Windows 首次安装所需的依赖包：
@@ -355,16 +355,13 @@ bash install.sh -DUSE_CUDA=ON \
 bash install.sh -DUSE_CUDA=ON -DCUDA_ARCH=89 \
   -DCMAKE_CUDA_COMPILER="$(command -v nvcc)"
 
-# AMD ROCm
-bash install.sh -DUSE_ROCM=ON
-
 # CPU-only
 bash install.sh
 ~~~
 
 更多平台说明：
 
-- [ROCm 编译](docs/rocm.md)
+- [ROCm 编译与 wheel 打包](docs/rocm.md)
 - [TFACC 平台](docs/tfacc.md)
 - [示例程序、Android 和其他平台](example/README.md)
 - [编译与运行 FAQ](docs/faq.md)
