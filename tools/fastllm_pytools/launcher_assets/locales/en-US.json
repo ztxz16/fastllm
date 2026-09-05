@@ -2,6 +2,7 @@
   "locale": "en-US",
   "name": "English",
   "static": {
+    "工作室": "Studio",
     "工作空间": "Workspace",
     "从一个模型开始": "Start with a model",
     "下载模型，选择配置，让本地算力开始工作。": "Download a model, choose a profile, and put your hardware to work.",
@@ -63,7 +64,7 @@
     "配置名称": "Profile name",
     "例如 Qwen3.5-27B": "For example, Qwen3.5-27B",
     "启动方式": "Launch mode",
-    "聊天 WebUI": "Chat WebUI",
+    "独立工作室": "Standalone Studio",
     "API 模型名": "API model name",
     "留空时使用目录名": "Uses the directory name when empty",
     "模型路径": "Model path",
@@ -192,11 +193,19 @@
     "模型管理": "Model management",
     "返回模型管理": "Model management",
     "管理本地模型、下载与运行环境。": "Manage local models, downloads, and hardware.",
-    "启动 API Server 后即可使用 WebUI。": "Start an API Server to use WebUI.",
+    "启动 API Server 后即可使用工作室。": "Start an API Server to use Studio.",
     "重新打开": "Reopen",
-    "打开 WebUI": "Open WebUI"
+    "打开工作室": "Open Studio"
   },
   "messages": {
+    "Studio": "Studio",
+    "Chat WebUI": "Standalone Studio",
+    "Starting chat WebUI": "Starting Studio",
+    "Chat WebUI is running": "Studio is running",
+    "Chat WebUI is ready": "Studio is ready",
+    "WebUI startup failed": "Studio startup failed",
+    "WebUI stopped": "Studio stopped",
+    "Open WebUI": "Open Studio",
     "Launch service": "Launch service",
     "Download model": "Download model",
     "Runtime logs": "Runtime logs",
@@ -280,11 +289,11 @@
     "top_p 必须是 0 到 1 之间的数字，或留空使用模型默认值。": "top_p must be a number from 0 to 1, or empty for the model default.",
     "top_k 必须是正整数，或留空使用模型默认值。": "top_k must be a positive integer, or empty for the model default.",
     "repeat_penalty 必须是大于等于 0 的数字，或留空使用模型默认值。": "repeat_penalty must be a number greater than or equal to 0, or empty for the model default.",
-    "Start an API Server before opening WebUI.": "Start an API Server before opening WebUI.",
-    "The model service changed. Reopen WebUI.": "The model service changed. Reopen WebUI.",
-    "Opening WebUI…": "Opening WebUI…",
-    "Unable to load WebUI. Try reopening it.": "Unable to load WebUI. Try reopening it.",
-    "WebUI loading timed out. Try reopening it.": "WebUI loading timed out. Try reopening it."
+    "Start an API Server before opening WebUI.": "Start an API Server before opening Studio.",
+    "The model service changed. Reopen WebUI.": "The model service changed. Reopen Studio.",
+    "Opening WebUI…": "Opening Studio…",
+    "Unable to load WebUI. Try reopening it.": "Unable to load Studio. Try reopening it.",
+    "WebUI loading timed out. Try reopening it.": "Studio loading timed out. Try reopening it."
   },
   "patterns": [
     {"source": "^额外参数无法解析: (.+)$", "target": "Unable to parse extra arguments: $1"},

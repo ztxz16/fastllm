@@ -4,7 +4,6 @@ import html
 import json
 import mimetypes
 import os
-import secrets
 import socket
 import threading
 import time
@@ -2284,6 +2283,7 @@ class WebUIRuntime:
 def create_app(args: argparse.Namespace):
     from fastapi import FastAPI, HTTPException, Request
     from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+    from fastapi.staticfiles import StaticFiles
 
     runtime = WebUIRuntime(args)
     app = FastAPI(title=getattr(args, "title", "FastLLM"), docs_url=None,
@@ -2339,16 +2339,16 @@ def create_app(args: argparse.Namespace):
         page = frontend_html.replace("__WEBUI_BASE_PATH__", html.escape(base_path, quote=True))
         headers = {}
         if getattr(args, "embedded", False):
-            nonce = secrets.token_urlsafe(24)
-            page = page.replace('<html ', '<html data-embedded="true" ', 1)
-            page = page.replace("<script>", f'<script nonce="{nonce}">')
             headers["Content-Security-Policy"] = (
-                f"default-src 'self'; script-src 'self' 'nonce-{nonce}'; "
-                "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
+                "default-src 'self'; script-src 'self'; "
+                "style-src 'self'; img-src 'self' data: blob:; "
                 "media-src 'self' data: blob:; connect-src 'self'; object-src 'none'; "
                 "base-uri 'none'; frame-ancestors 'self'; form-action 'self'"
             )
         return HTMLResponse(page, headers=headers)
+
+    app.mount("/assets/webui", StaticFiles(directory=str(
+        Path(__file__).with_name("webui_assets"))), name="webui-assets")
 
     @app.get("/assets/webui_locales.js", response_class=FileResponse)
     def webui_locales():

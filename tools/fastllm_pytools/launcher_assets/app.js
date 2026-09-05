@@ -43,6 +43,9 @@ const localeCache = new Map();
 const capturedStaticText = [];
 const capturedStaticAttributes = [];
 let profileRenderSignature = "";
+let webuiModulePromise;
+let webuiModuleRetries = 0;
+let webuiModuleLoaded = false;
 
 const state = {
   profiles: [],
@@ -69,6 +72,7 @@ const state = {
   webuiRequestId: 0,
   webuiLoadTimer: null,
   webuiAbortController: null,
+  webuiComponent: null,
   locale: DEFAULT_LOCALE,
   staticMessages: {},
   messages: {},
@@ -130,8 +134,8 @@ function cacheElements() {
     "app-version", "shutdown-launcher", "status-dot", "status-title", "status-message",
     "open-endpoint", "stop-runtime", "profile-count", "profile-list", "new-profile",
     "current-view-title", "profile-search", "profile-results",
-    "open-webui", "back-to-management", "webui-placeholder", "webui-status",
-    "webui-frame", "webui-retry",
+    "open-webui", "webui-placeholder", "webui-status",
+    "webui-content", "webui-retry",
     "config-path", "profile-editor-modal", "profile-editor-title", "launch-form",
     "close-profile-editor", "save-state", "ori-field", "auto-configure-profile",
     "clear-profile-config", "automatic-config-status",
@@ -361,6 +365,7 @@ async function changeLocale(locale) {
 }
 
 function renderLocalizedContent() {
+  state.webuiComponent?.setLocale(state.locale);
   renderViewTitle();
   updateConditionalFields();
   renderAutomaticConfigurationStatus();
@@ -423,23 +428,6 @@ function bindEvents() {
   elements.webuiRetry.addEventListener("click", () => {
     state.webuiError = "";
     openEmbeddedWebUI();
-  });
-  elements.webuiFrame.addEventListener("load", () => {
-    if (!state.webuiLoading || !state.webuiSessionId || !elements.webuiFrame.getAttribute("src")) return;
-    try {
-      // Ignore the about:blank load caused by clearing a previous attempt.
-      if (elements.webuiFrame.contentWindow.location.pathname !== new URL(elements.webuiFrame.src).pathname) return;
-      if (!elements.webuiFrame.contentDocument?.querySelector("#prompt")) {
-        failWebUILoad(state.webuiRequestId);
-        return;
-      }
-      clearWebUILoad();
-      state.webuiLoading = false;
-      renderWebUIAvailability();
-    } catch (_) {
-      // Browser network-error documents can have an inaccessible origin.
-      failWebUILoad(state.webuiRequestId);
-    }
   });
   elements.profileSearch.addEventListener("input", (event) => {
     state.profileQuery = event.target.value;
@@ -578,7 +566,6 @@ function switchView(view) {
     panel.classList.toggle("active", panel.id === `view-${view}`);
   }
   document.querySelector(".app-shell").classList.toggle("webui-active", view === "webui");
-  elements.backToManagement.classList.toggle("hidden", view !== "webui");
   elements.openWebui.classList.toggle("hidden", view === "webui");
   if (view === "webui") renderWebUIAvailability();
   if (view === "logs") {
@@ -595,7 +582,7 @@ function switchView(view) {
 function renderViewTitle() {
   const titles = {
     launch: t("Launch service"),
-    webui: "WebUI",
+    webui: t("Studio"),
     download: t("Download model"),
     logs: t("Runtime logs"),
     hardware: t("Hardware")
@@ -2284,11 +2271,11 @@ function renderWebUIAvailability() {
     state.webuiSessionId = "";
     state.webuiLoading = false;
     state.webuiError = "";
-    elements.webuiFrame.removeAttribute("src");
+    destroyWebUI();
   }
   const loaded = ready && state.webuiSessionId === state.runtime.sessionId
     && !state.webuiLoading && !state.webuiError;
-  elements.webuiFrame.classList.toggle("hidden", !loaded);
+  elements.webuiContent.classList.toggle("hidden", !loaded);
   elements.webuiPlaceholder.classList.toggle("hidden", loaded);
   elements.webuiRetry.classList.toggle("hidden", !ready || !state.webuiError);
   elements.webuiStatus.textContent = state.webuiError ? localizeServerText(state.webuiError)
@@ -2298,11 +2285,23 @@ function renderWebUIAvailability() {
   }
 }
 
+function destroyWebUI() {
+  state.webuiComponent?.destroy();
+  state.webuiComponent = null;
+  elements.webuiContent.replaceChildren();
+}
+
 function clearWebUILoad() {
   clearTimeout(state.webuiLoadTimer);
   state.webuiLoadTimer = null;
   state.webuiAbortController?.abort();
   state.webuiAbortController = null;
+  // Imports cannot be aborted. Retry a stalled import with a fresh URL while
+  // keeping the successfully loaded module shared across model sessions.
+  if (webuiModulePromise && !webuiModuleLoaded) {
+    webuiModulePromise = null;
+    webuiModuleRetries += 1;
+  }
 }
 
 function failWebUILoad(requestId, message = "Unable to load WebUI. Try reopening it.") {
@@ -2311,7 +2310,7 @@ function failWebUILoad(requestId, message = "Unable to load WebUI. Try reopening
   clearWebUILoad();
   state.webuiLoading = false;
   state.webuiError = message;
-  elements.webuiFrame.removeAttribute("src");
+  destroyWebUI();
   renderWebUIAvailability();
 }
 
@@ -2334,8 +2333,39 @@ async function openEmbeddedWebUI() {
       method: "POST", body: JSON.stringify({ sessionId }), signal: controller.signal
     });
     if (requestId !== state.webuiRequestId || sessionId !== state.runtime?.sessionId) return;
-    elements.webuiFrame.src = result.url;
+    if (!webuiModulePromise) {
+      const suffix = webuiModuleRetries ? `?retry=${webuiModuleRetries}` : "";
+      const pending = import(`/assets/webui/app.js${suffix}`).then(module => {
+        if (webuiModulePromise === pending) webuiModuleLoaded = true;
+        return module;
+      }, error => {
+        if (webuiModulePromise === pending) {
+          webuiModulePromise = null;
+          webuiModuleRetries += 1;
+        }
+        throw error;
+      });
+      webuiModulePromise = pending;
+    }
+    const {mountWebUI} = await webuiModulePromise;
+    if (requestId !== state.webuiRequestId) return;
+    const host = document.createElement("div");
+    elements.webuiContent.replaceChildren(host);
+    const component = await mountWebUI(host, {
+      basePath: result.url, embedded: true, locale: state.locale,
+      iconUrl: "/assets/launcher-icon.png", signal: controller.signal
+    });
+    if (requestId !== state.webuiRequestId || sessionId !== state.runtime?.sessionId) {
+      component.destroy();
+      return;
+    }
+    state.webuiComponent = component;
+    clearWebUILoad();
+    state.webuiLoading = false;
+    component.setLocale(state.locale);
+    renderWebUIAvailability();
   } catch (error) {
-    failWebUILoad(requestId, error?.message || "Unable to load WebUI. Try reopening it.");
+    failWebUILoad(requestId, error instanceof TypeError ? "Unable to load WebUI. Try reopening it."
+      : error?.message || "Unable to load WebUI. Try reopening it.");
   }
 }

@@ -54,7 +54,7 @@
           </button>
           <button class="nav-button" type="button" data-view-button="webui">
             <svg class="icon" aria-hidden="true"><use href="#icon-chat"/></svg>
-            <span><strong>WebUI</strong></span>
+            <span><strong>工作室</strong></span>
           </button>
         </nav>
 
@@ -81,7 +81,7 @@
 
       <main class="workspace">
         <header class="topbar">
-          <div class="workspace-breadcrumb"><button id="back-to-management" class="secondary-button hidden" type="button" data-open-view="launch">返回模型管理</button><span class="management-label">模型管理</span><span aria-hidden="true">/</span><strong id="current-view-title">启动服务</strong></div>
+          <div class="workspace-breadcrumb"><span class="management-label">模型管理</span><span aria-hidden="true">/</span><strong id="current-view-title">启动服务</strong></div>
           <div class="service-controls">
           <div class="topbar-status">
             <span id="status-dot" class="status-dot stopped"></span>
@@ -91,7 +91,7 @@
             </div>
           </div>
           <div class="topbar-actions">
-            <button id="open-webui" class="primary-button" type="button" data-open-view="webui" disabled>打开 WebUI</button>
+            <button id="open-webui" class="primary-button" type="button" data-open-view="webui" disabled>打开工作室</button>
             <button id="open-endpoint" class="secondary-button" type="button" disabled>打开服务</button>
             <button id="stop-runtime" class="secondary-button danger hidden" type="button">■ 停止</button>
           </div>
@@ -134,7 +134,7 @@
                   <div class="profile-filters" role="group" aria-label="筛选启动项目">
                     <button type="button" class="filter-button active" data-profile-filter="all" aria-pressed="true">全部项目</button>
                     <button type="button" class="filter-button" data-profile-filter="server" aria-pressed="false">API Server</button>
-                    <button type="button" class="filter-button" data-profile-filter="webui" aria-pressed="false">聊天 WebUI</button>
+                    <button type="button" class="filter-button" data-profile-filter="webui" aria-pressed="false">独立工作室</button>
                   </div>
                   <label class="profile-search">
                     <svg class="icon" aria-hidden="true"><use href="#icon-search"/></svg>
@@ -208,7 +208,7 @@
                       <span>启动方式 <b>*</b></span>
                       <select data-field="command">
                         <option value="server">API Server</option>
-                        <option value="webui">聊天 WebUI</option>
+                        <option value="webui">独立工作室</option>
                       </select>
                     </label>
                     <label id="server-model-name-field" class="field">
@@ -445,12 +445,12 @@
           <section id="view-webui" class="view">
             <div id="webui-placeholder" class="webui-placeholder">
               <svg class="icon" aria-hidden="true"><use href="#icon-chat"/></svg>
-              <h1>WebUI</h1>
-              <p id="webui-status">启动 API Server 后即可使用 WebUI。</p>
+              <h1>工作室</h1>
+              <p id="webui-status">启动 API Server 后即可使用工作室。</p>
               <button id="webui-retry" class="secondary-button hidden" type="button">重新打开</button>
               <button class="primary-button" type="button" data-open-view="launch">返回模型管理</button>
             </div>
-            <iframe id="webui-frame" class="webui-frame hidden" title="FastLLM WebUI" allow="clipboard-write"></iframe>
+            <div id="webui-content" class="webui-content hidden"></div>
           </section>
 
           <section id="view-download" class="view">

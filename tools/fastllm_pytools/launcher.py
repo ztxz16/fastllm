@@ -1917,8 +1917,7 @@ def create_launcher_app(
                 )
         response = await call_next(request)
         if is_webui:
-            # The original WebUI page supplies nonces for its inline code.
-            # Other embedded resources must not become executable documents.
+            # Downloaded resources must not become executable documents.
             response.headers.setdefault("Content-Security-Policy", (
                 "default-src 'self'; script-src 'none'; style-src 'self'; "
                 "object-src 'none'; base-uri 'none'; frame-ancestors 'self'"
@@ -1929,7 +1928,8 @@ def create_launcher_app(
         else:
             response.headers["Content-Security-Policy"] = (
                 "default-src 'self'; script-src 'self'; style-src 'self'; "
-                "img-src 'self' data:; connect-src 'self'; frame-src 'self'; object-src 'none'; "
+                "img-src 'self' data: blob:; media-src 'self' data: blob:; "
+                "connect-src 'self'; object-src 'none'; "
                 "base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
             )
             response.headers["X-Frame-Options"] = "DENY"
@@ -2088,6 +2088,15 @@ def create_launcher_app(
     async def shutdown():
         runtime.request_shutdown()
         return {"ok": True}
+
+    # Both entry points serve exactly the same component resources.
+    app.mount("/assets/webui", StaticFiles(directory=str(
+        Path(__file__).with_name("webui_assets"))), name="webui-assets")
+
+    @app.get("/assets/webui_locales.js")
+    async def webui_locales():
+        return FileResponse(Path(__file__).with_name("webui_locales.js"),
+                            media_type="application/javascript; charset=utf-8")
 
     app.mount(
         "/assets",

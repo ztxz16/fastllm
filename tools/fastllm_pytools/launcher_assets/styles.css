@@ -732,15 +732,11 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 .toast-region { z-index: 90; }
 
 
-/* The existing WebUI owns its full workspace, including its history sidebar. */
-.app-shell.webui-active { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); }
-.webui-active > .sidebar { display: none; }
-.webui-active .workspace-breadcrumb { display: flex; }
-.webui-active .workspace-breadcrumb > .management-label,
-.webui-active .workspace-breadcrumb > [aria-hidden] { display: none; }
+/* Chat shares Launcher's navigation and occupies the current content pane. */
 .webui-active .page-scroll { display: flex; overflow: hidden; padding: 0; scrollbar-gutter: auto; }
 #view-webui.active { display: flex; flex: 1; min-height: 0; width: 100%; max-width: none; animation: none; }
-.webui-frame { flex: 1; width: 100%; min-width: 0; height: 100%; border: 0; background: white; }
+.webui-content { flex: 1; min-width: 0; min-height: 0; background: white; }
+.webui-content > div { height: 100%; }
 .webui-placeholder { display: flex; flex: 1; align-items: center; justify-content: center; flex-direction: column; gap: 16px; padding: 24px; text-align: center; }
 .webui-placeholder > .icon { width: 30px; height: 30px; color: var(--primary); }
 .webui-placeholder h1 { font-size: 22px; font-weight: 600; }
@@ -763,11 +759,6 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 }
 @media (max-width: 900px) {
   .workspace-breadcrumb { display: none; }
-  .webui-active .workspace-breadcrumb { flex-shrink: 0; gap: 8px; }
-  .webui-active #current-view-title { display: none; }
-  .webui-active .topbar { gap: 12px; }
-  .webui-active .service-controls { width: auto; }
-  .webui-active .topbar-status { display: none; }
   .service-controls { width: 100%; justify-content: space-between; }
   .library-toolbar { align-items: stretch; flex-direction: column; gap: 12px; }
   .profile-filters { width: fit-content; }
@@ -796,7 +787,8 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
   .language-picker select { padding: 6px 7px; }
   .navigation { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 3px; margin-top: 10px; }
   .nav-button { display: flex; flex-direction: column; justify-content: center; gap: 5px; min-height: 48px; padding: 6px 2px; }
-  .nav-button strong { font-size: 10px; white-space: nowrap; }
+  .nav-button > span { width: 100%; min-width: 0; }
+  .nav-button strong { display: flex; align-items: center; justify-content: center; min-height: 22px; font-size: 9px; line-height: 11px; white-space: normal; overflow-wrap: anywhere; }
   .nav-button .icon { width: 16px; height: 16px; }
   .activity-dot { position: absolute; top: 5px; right: 5px; width: 4px; height: 4px; }
   .topbar { flex-basis: 50px; padding: 0 16px; }

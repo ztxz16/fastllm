@@ -2,7 +2,6 @@
 import asyncio
 import json
 import os
-import re
 import sys
 import tempfile
 import threading
@@ -59,28 +58,33 @@ class LauncherWebUITest(unittest.TestCase):
         self.assertEqual(self.client.post(self.base + '/api/conversations', json={},
                                          headers={'Origin': 'http://testserver'}).status_code, 200)
 
-    def test_embedded_page_uses_existing_ui_with_scoped_assets_and_nonce(self):
+    def test_both_entry_points_use_shared_component_assets(self):
         self.open()
         page = self.client.get(self.base + '/')
         self.assertEqual(page.status_code, 200)
-        self.assertIn('id="conversationList"', page.text)
-        self.assertIn('id="agentButton"', page.text)
-        self.assertIn('id="attachButton"', page.text)
-        self.assertIn('data-embedded="true"', page.text)
+        self.assertIn('id="webui-root"', page.text)
         self.assertIn(f'data-base-path="{self.base}"', page.text)
-        self.assertIn(f'src="{self.base}/assets/webui_locales.js"', page.text)
+        self.assertIn(f'src="{self.base}/assets/webui/standalone.js"', page.text)
         self.assertNotIn('__WEBUI_BASE_PATH__', page.text)
-        nonce = re.search(r'<script nonce="([^"]+)"', page.text).group(1)
-        self.assertIn(f"'nonce-{nonce}'", page.headers['content-security-policy'])
+        self.assertNotIn("'unsafe-inline'", page.headers['content-security-policy'])
         self.assertIn("frame-ancestors 'self'", page.headers['content-security-policy'])
-        self.assertEqual(page.headers['x-frame-options'], 'SAMEORIGIN')
         self.assertEqual(page.headers['cache-control'], 'no-store')
+        for asset in ('app.js', 'styles.css', 'template.html', 'standalone.js'):
+            child = self.client.get(self.base + '/assets/webui/' + asset)
+            parent = self.client.get('/assets/webui/' + asset)
+            self.assertEqual(child.status_code, 200)
+            self.assertEqual(parent.status_code, 200)
+            self.assertEqual(child.content, parent.content)
+        template = self.client.get('/assets/webui/template.html').text
+        for control in ('conversationList', 'agentButton', 'attachButton'):
+            self.assertIn(f'id="{control}"', template)
         for asset in ('webui_locales.js', 'fastllm_icon.svg'):
             self.assertEqual(self.client.get(self.base + '/assets/' + asset).status_code, 200)
         parent = self.client.get('/')
         self.assertEqual(parent.headers['x-frame-options'], 'DENY')
         self.assertNotIn("'unsafe-inline'", parent.headers['content-security-policy'])
-        self.assertNotIn('chat-form', parent.text)
+        self.assertNotIn('<iframe', parent.text)
+        self.assertIn('id="webui-content"', parent.text)
         self.assertIn('<h1>模型管理</h1>', parent.text)
 
     def test_active_model_and_credentials_are_snapshotted_on_server_side(self):

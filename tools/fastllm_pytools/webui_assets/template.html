@@ -1,0 +1,124 @@
+<div class="app">
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <div class="brand-mark"><img src="__WEBUI_BASE_PATH__/assets/fastllm_icon.svg" alt=""></div>
+      <div class="brand-copy"><strong>FastLLM</strong><small>LOCAL AI WORKSPACE</small></div>
+    </div>
+    <button class="new-chat" id="newChat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg><span data-i18n="nav.new_chat">新建对话</span></button>
+    <button class="new-agent" id="newAgent"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3c.5 4.8 3.2 7.5 8 8-4.8.5-7.5 3.2-8 8-.5-4.8-3.2-7.5-8-8 4.8-.5 7.5-3.2 8-8Z"/><path d="M19 3v4M17 5h4"/></svg><span data-i18n="nav.new_agent">新建Agent</span></button>
+    <div class="section-label" data-i18n="nav.recent_chats">最近对话</div>
+    <nav class="conversation-list" id="conversationList"></nav>
+    <div class="local-note"><span class="online-dot"></span><span data-i18n="nav.local_note">模型本机运行 · 会话本地保存</span></div>
+  </aside>
+  <div class="sidebar-backdrop" id="sidebarBackdrop"></div>
+
+  <main class="main">
+    <header class="topbar">
+      <div class="model-badge">
+        <button class="icon-button mobile-menu" id="mobileMenu" aria-label="打开菜单" data-i18n-aria="top.open_menu"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+        <span class="model-dot"></span>
+        <div class="model-copy"><small data-i18n="top.current_model">当前模型</small><strong id="modelName" data-i18n="top.connecting">正在连接…</strong></div>
+      </div>
+      <div class="top-actions">
+        <span class="private-badge" data-i18n="top.private">⌁&nbsp; 本地安全会话</span>
+        <div class="language-wrap"><button class="icon-button language-button" id="languageButton" aria-label="切换语言" data-i18n-aria="top.language"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3.5 3 14 0 18"/></svg><span id="languageLabel">简体中文</span></button><div class="language-menu" id="languageMenu"></div></div>
+        <button class="icon-button" id="topSettings" aria-label="模型设置" data-i18n-aria="top.settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.5-2-3.5-2.4 1A8 8 0 0 0 15 6l-.3-2.6h-4L10.4 6A8 8 0 0 0 8 7L5.6 6 3.6 9.5l2 1.5a7 7 0 0 0 0 2l-2 1.5 2 3.5L8 17a8 8 0 0 0 2.4 1l.3 2.6h4L15 18a8 8 0 0 0 1.5-1l2.4 1 2-3.5-2-1.5a7 7 0 0 0 .1-1Z"/></svg></button>
+      </div>
+    </header>
+
+    <section class="messages" id="messages"></section>
+
+    <section class="composer-area">
+      <div class="workspace-context" id="workspaceContext" hidden><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 6h7l2 2h9v11H3z"/></svg><span data-i18n="workspace.bound">Pi Agent 工作目录</span><strong id="workspaceContextPath"></strong></div>
+      <div class="pending-files" id="pendingFiles"></div>
+      <div class="composer">
+        <textarea id="prompt" rows="1" placeholder="输入消息，或拖入文档、图片和视频…" data-i18n-placeholder="composer.placeholder"></textarea>
+        <div class="composer-tools">
+          <div class="tool-left">
+            <div class="mode-wrap"><button class="mode-button" id="webButton"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3.5 3 14 0 18"/></svg><span id="webLabel">通用对话</span></button><div class="mode-menu" id="webMenu"></div></div>
+            <div class="mode-wrap"><button class="mode-button" id="thinkingButton"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M9 18h6M10 22h4M8.5 14.5A7 7 0 1 1 15.5 14.5C14.5 15.3 14 16 14 18h-4c0-2-.5-2.7-1.5-3.5Z"/></svg><span id="thinkingLabel">思考 · 中</span></button><div class="mode-menu" id="thinkingMenu"></div></div>
+          </div>
+          <div class="tool-right">
+            <input type="file" id="fileInput" hidden multiple>
+            <button class="tool-button" id="attachButton" title="上传文档、代码、图片或视频" data-i18n-title="composer.upload_title"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="m20.5 11.5-8.8 8.8a6 6 0 0 1-8.5-8.5l9.2-9.2a4 4 0 0 1 5.7 5.7l-9.2 9.2a2 2 0 0 1-2.8-2.8l8.5-8.5"/></svg><span data-i18n="composer.file">文件</span></button>
+            <button class="mode-button" id="agentButton" title="选择智能体" data-i18n-title="composer.agent_select"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3c.5 4.8 3.2 7.5 8 8-4.8.5-7.5 3.2-8 8-.5-4.8-3.2-7.5-8-8 4.8-.5 7.5-3.2 8-8Z"/><path d="M19 3v4M17 5h4"/></svg><span data-i18n="composer.agent">智能体</span></button>
+            <button class="send-button" id="sendButton" aria-label="发送" data-i18n-aria="composer.send"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m5 12 14-7-4 14-3-6-7-1Z"/><path d="m12 13 7-8"/></svg></button>
+            <button class="send-button stop-button" id="stopButton" hidden aria-label="停止生成" title="停止生成" data-i18n-aria="composer.stop" data-i18n-title="composer.stop"><svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg></button>
+          </div>
+        </div>
+      </div>
+      <div class="composer-note" data-i18n="composer.disclaimer">AI 生成内容可能不准确，请核验重要信息</div>
+    </section>
+  </main>
+</div>
+
+<div class="toast-stack" id="toasts"></div>
+<div class="conversation-action-menu" id="conversationActionMenu">
+  <button class="conversation-action" id="renameConversationAction"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="m4 20 4.3-1 10.9-10.9a2 2 0 0 0-2.8-2.8L5.5 16.2 4 20Z"/><path d="m14.8 6.9 2.8 2.8"/></svg><span data-i18n="nav.rename">重命名</span></button>
+  <button class="conversation-action danger" id="deleteConversationAction"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 7h16M9 7V4h6v3m3 0-1 14H7L6 7m4 4v6m4-6v6"/></svg><span data-i18n="nav.delete">删除</span></button>
+</div>
+<dialog id="workspaceDialog">
+  <div class="dialog-head"><h2 data-i18n="workspace.title">新建Agent</h2><button class="dialog-close" id="closeWorkspace" aria-label="关闭" data-i18n-aria="common.close">×</button></div>
+  <div class="dialog-body">
+    <p class="workspace-intro" data-i18n="workspace.subtitle">选择这台机器上的项目目录，Agent 会在后续对话中持续使用它。</p>
+    <div class="workspace-path-row"><button class="workspace-up" id="workspaceUp" aria-label="上一级" title="上一级" data-i18n-aria="workspace.up" data-i18n-title="workspace.up"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="m5 15 7-7 7 7"/></svg></button><input class="workspace-path" id="workspacePath" aria-label="目录路径" data-i18n-aria="workspace.path"></div>
+    <div class="workspace-list" id="workspaceList"></div>
+    <p class="workspace-warning" data-i18n="workspace.warning">Pi Agent 可以读取和修改所选目录中的文件，也可以执行命令。请只选择你信任的项目。</p>
+  </div>
+  <div class="dialog-foot"><button class="dialog-button" id="cancelWorkspace" data-i18n="common.cancel">取消</button><button class="dialog-button primary" id="createWorkspace" data-i18n="workspace.create">使用此目录</button></div>
+</dialog>
+<dialog id="agentDialog">
+  <div class="dialog-head agent-dialog-head"><div class="agent-dialog-copy"><h2 data-i18n="agent.title">选择智能体</h2><p data-i18n="agent.subtitle">按任务选择工作方式，随时可以切换</p></div><button class="dialog-close" id="closeAgent" aria-label="关闭" data-i18n-aria="common.close">×</button></div>
+  <div class="agent-grid">
+    <button class="agent-card" data-agent="knowledge"><span class="agent-state" data-i18n="common.current">当前</span><span class="agent-card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M5 3h10l4 4v14H5zM15 3v5h5M8 12h8M8 16h6"/></svg></span><span class="agent-card-copy"><strong data-i18n="agent.knowledge">文件知识库</strong><p data-i18n="agent.knowledge_desc">阅读 PDF、Word、Excel 与代码，跨文件问答并定位出处。</p><small>DOCUMENTS · RAG</small></span></button>
+    <button class="agent-card" data-agent="data"><span class="agent-state" data-i18n="common.current">当前</span><span class="agent-card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 19V9M10 19V5M16 19v-7M22 19V2M2 19h21"/></svg></span><span class="agent-card-copy"><strong data-i18n="agent.data">数据分析</strong><p data-i18n="agent.data_desc">分析 CSV、Excel 与 JSON，生成统计结论、图表和报告。</p><small>DATA · CHARTS · XLSX</small></span></button>
+    <button class="agent-card" data-agent="ppt"><span class="agent-state" data-i18n="common.current">当前</span><span class="agent-card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M5 3h10l4 4v14H5zM15 3v5h5M8 12h8M8 16h6"/></svg></span><span class="agent-card-copy"><strong data-i18n="agent.ppt">PPT 创作</strong><p data-i18n="agent.ppt_desc">规划内容和版式，生成可继续编辑的 PowerPoint 文件。</p><small>PRESENTATION</small></span></button>
+    <button class="agent-card" data-agent="code"><span class="agent-state" data-i18n="common.current">当前</span><span class="agent-card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="m8 9-4 3 4 3M16 9l4 3-4 3M14 5l-4 14"/></svg></span><span class="agent-card-copy"><strong data-i18n="agent.code">代码项目</strong><p data-i18n="agent.code_desc">跨文件审查、定位问题，并生成可下载但不会自动执行的补丁。</p><small>REVIEW · UNIFIED DIFF</small></span></button>
+  </div>
+</dialog>
+<dialog id="settingsDialog">
+  <div class="dialog-head"><h2 data-i18n="settings.title">模型参数</h2><button class="dialog-close" id="closeSettings" aria-label="关闭" data-i18n-aria="common.close">×</button></div>
+  <div class="dialog-body">
+    <div class="field"><label for="settingSystem" data-i18n="settings.system_prompt">系统提示词</label><textarea id="settingSystem" placeholder="可选：定义助手的角色与回答方式" data-i18n-placeholder="settings.system_placeholder"></textarea></div>
+    <div class="field-grid">
+      <div class="field"><label for="settingTokens" data-i18n="settings.max_tokens">最大输出 Tokens（0 为不限制）</label><input id="settingTokens" type="number" min="0" step="1"></div>
+      <div class="field"><label for="settingTemperature" data-i18n="settings.temperature">Temperature</label><input id="settingTemperature" type="number" min="0" max="2" step="0.05"></div>
+      <div class="field"><label for="settingTopP" data-i18n="settings.top_p">Top P</label><input id="settingTopP" type="number" min="0" max="1" step="0.01"></div>
+      <div class="field"><label for="settingTopK" data-i18n="settings.top_k">Top K</label><input id="settingTopK" type="number" min="1" max="100" step="1"></div>
+      <div class="field"><label for="settingPenalty" data-i18n="settings.repeat_penalty">重复惩罚</label><input id="settingPenalty" type="number" min="1" max="2" step="0.01"></div>
+    </div>
+  </div>
+  <div class="dialog-foot"><button class="dialog-button" id="cancelSettings" data-i18n="common.cancel">取消</button><button class="dialog-button primary" id="saveSettings" data-i18n="common.save">保存</button></div>
+</dialog>
+<dialog id="renameDialog">
+  <div class="dialog-head"><h2 data-i18n="rename.title">重命名对话</h2><button class="dialog-close" id="closeRename" aria-label="关闭" data-i18n-aria="common.close">×</button></div>
+  <div class="dialog-body"><div class="field"><label for="renameTitle" data-i18n="rename.label">对话名称</label><input id="renameTitle" maxlength="80" placeholder="输入新的会话名称" data-i18n-placeholder="rename.placeholder"></div></div>
+  <div class="dialog-foot"><button class="dialog-button" id="cancelRename" data-i18n="common.cancel">取消</button><button class="dialog-button primary" id="saveRename" data-i18n="rename.confirm">保存名称</button></div>
+</dialog>
+<dialog id="deleteDialog">
+  <div class="dialog-head"><h2 data-i18n="delete.title">删除对话？</h2><button class="dialog-close" id="closeDelete" aria-label="关闭" data-i18n-aria="common.close">×</button></div>
+  <div class="dialog-body"><p class="delete-copy" data-i18n="delete.message">删除后，对话记录及其附件将无法恢复。</p></div>
+  <div class="dialog-foot"><button class="dialog-button" id="cancelDelete" data-i18n="common.cancel">取消</button><button class="dialog-button danger" id="confirmDelete" data-i18n="delete.confirm">删除</button></div>
+</dialog>
+<dialog id="pptDialog">
+  <div class="dialog-head"><h2 data-i18n="ppt.title">创建可编辑的 PPTX</h2><button class="dialog-close" id="closePpt" aria-label="关闭" data-i18n-aria="common.close">×</button></div>
+  <div class="dialog-body">
+    <div class="field"><label for="pptTopic" data-i18n="ppt.topic">主题与核心要求</label><textarea id="pptTopic" placeholder="例如：为技术团队制作一份 FastLLM 性能优化复盘" data-i18n-placeholder="ppt.topic_placeholder"></textarea></div>
+    <div class="field"><label for="pptAudience" data-i18n="ppt.audience">目标受众</label><input id="pptAudience" placeholder="例如：GPU 推理工程师" data-i18n-placeholder="ppt.audience_placeholder"></div>
+    <div class="field-grid">
+      <div class="field"><label for="pptSlides" data-i18n="ppt.slides">页数（4–20）</label><input id="pptSlides" type="number" min="4" max="20" step="1" value="8"></div>
+      <div class="field"><label for="pptStyle" data-i18n="ppt.style">视觉风格</label><select id="pptStyle"><option value="tech" data-i18n="ppt.style_tech">科技蓝</option><option value="business" data-i18n="ppt.style_business">商务红</option><option value="nature" data-i18n="ppt.style_nature">自然绿</option><option value="premium" data-i18n="ppt.style_premium">高级黑金</option></select></div>
+    </div>
+    <label class="check-row"><input id="pptWeb" type="checkbox"><span data-i18n="ppt.use_web">使用 Web Agent 检索资料并生成来源页</span></label>
+    <p class="dialog-hint" data-i18n="ppt.hint">生成的文字、形状和版式都可以在 PowerPoint 中继续编辑。</p>
+  </div>
+  <div class="dialog-foot"><button class="dialog-button" id="cancelPpt" data-i18n="common.cancel">取消</button><button class="dialog-button primary" id="createPpt" data-i18n="ppt.create">生成 PPTX</button></div>
+</dialog>
+<dialog id="dataDialog">
+  <div class="dialog-head"><h2 data-i18n="data.title">数据分析智能体</h2><button class="dialog-close" id="closeData" aria-label="关闭" data-i18n-aria="common.close">×</button></div>
+  <div class="dialog-body">
+    <div class="field"><label for="dataQuestion" data-i18n="data.question">你希望分析什么？</label><textarea id="dataQuestion" placeholder="例如：按地区汇总销售额，分析月度趋势，并找出表现异常的项目" data-i18n-placeholder="data.question_placeholder"></textarea></div>
+    <p class="dialog-hint" data-i18n="data.hint">支持 CSV、TSV、JSON、JSONL 和 XLSX。智能体只会执行经过校验的统计操作，不运行模型生成的任意代码；结果将导出为 Excel 和 PNG 图表。</p>
+  </div>
+  <div class="dialog-foot"><button class="dialog-button" id="cancelData" data-i18n="common.cancel">取消</button><button class="dialog-button primary" id="createDataAnalysis" data-i18n="data.start">开始分析</button></div>
+</dialog>
