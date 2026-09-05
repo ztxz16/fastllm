@@ -5,11 +5,9 @@
 
 #include <hipblas/hipblas.h>
 #include <hip/hip_fp16.h>
-
-#if defined(USE_ROCM) && !defined(HIP_NO_TENSOR_CORE) // support tensor core
-#include <rocwmma/rocwmma.hpp>
-#endif
-
+#include <hip/hip_bf16.h>
+#include <hip/hip_fp8.h>
+#include <limits>
 
 typedef int8_t int8x4_t __attribute__((ext_vector_type(4)));
 typedef uint8_t uint8x4_t __attribute__((ext_vector_type(4)));
@@ -62,6 +60,61 @@ static __device__ __forceinline__ unsigned int __vcmpne4(unsigned int a, unsigne
 }
 
 namespace fastllm_hip {
+    // gfx942 provides FNUZ hardware conversions, while CUDA model weights
+    // use OCP E4M3. Use HIP's software conversion there, preserving the OCP
+    // exponent bias, signed zero and NaN encoding. Keep the wrapper types
+    // identical in host/device passes so template kernel names still match.
+    __host__ __device__ inline __hip_fp8_storage_t FloatToFp8(
+            float value, __hip_saturation_t saturation, __hip_fp8_interpretation_t interpretation) {
+        // HIP's software converter maps infinity to NaN even with SATFINITE.
+        // CUDA's E4M3 contract saturates it; comparisons preserve input NaNs.
+        if (saturation == __HIP_SATFINITE && interpretation == __HIP_E4M3) {
+            if (value > 448.0f) value = 448.0f;
+            if (value < -448.0f) value = -448.0f;
+        }
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx942__)
+        if (interpretation == __HIP_E4M3 || interpretation == __HIP_E5M2) {
+            return ::internal::cast_to_f8<float, false>(value,
+                interpretation == __HIP_E4M3 ? 3 : 2,
+                interpretation == __HIP_E4M3 ? 4 : 5, saturation == __HIP_SATFINITE);
+        }
+#endif
+        return __hip_cvt_float_to_fp8(value, saturation, interpretation);
+    }
+
+    struct Fp8E4M3 {
+        __hip_fp8_storage_t __x;
+        __host__ __device__ Fp8E4M3() = default;
+        __host__ __device__ explicit Fp8E4M3(float value)
+            : __x(FloatToFp8(value, __HIP_SATFINITE, __HIP_E4M3)) {}
+        __host__ __device__ operator float() const {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx942__)
+            return ::internal::cast_from_f8<float, false>(__x, 3, 4);
+#else
+            __hip_fp8_e4m3 value;
+            value.__x = __x;
+            return static_cast<float>(value);
+#endif
+        }
+        __host__ __device__ operator __half() const { return __float2half(static_cast<float>(*this)); }
+        __host__ __device__ operator __hip_bfloat16() const { return __float2bfloat16(static_cast<float>(*this)); }
+    };
+
+    struct Fp8x2E4M3 {
+        __hip_fp8x2_storage_t __x;
+        __host__ __device__ Fp8x2E4M3() = default;
+        __host__ __device__ explicit Fp8x2E4M3(float2 value)
+            : __x(static_cast<unsigned short>(FloatToFp8(value.x, __HIP_SATFINITE, __HIP_E4M3)) |
+                  (static_cast<unsigned short>(FloatToFp8(value.y, __HIP_SATFINITE, __HIP_E4M3)) << 8)) {}
+        __host__ __device__ operator float2() const {
+            Fp8E4M3 lo, hi;
+            lo.__x = __x & 0xff;
+            hi.__x = __x >> 8;
+            return make_float2(static_cast<float>(lo), static_cast<float>(hi));
+        }
+    };
+    static_assert(sizeof(Fp8E4M3) == 1 && sizeof(Fp8x2E4M3) == 2, "FP8 storage ABI");
+
     // CUDA code uses 32-lane logical warps; HIP requires a 64-bit mask.
     __device__ __forceinline__ unsigned long long WarpMask(unsigned int mask) {
         const unsigned int lane = (threadIdx.x + blockDim.x *
