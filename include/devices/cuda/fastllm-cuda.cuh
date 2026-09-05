@@ -237,6 +237,7 @@ bool FastllmCudaGetGraphError();
 int FastllmCudaTryMallocBigBuffers(size_t size, int count);
 void FastllmCudaMallocBigBuffer(size_t size);
 void FastllmCudaClearBigBuffer();
+void FastllmCudaClearBigBufferCurrentDevice();
 void FastllmCudaClearBigBufferAll();
 #ifdef __CUDACC__
 cudaError_t FastllmCudaCheckedMalloc(void **ret, size_t size, const char *file, int line);

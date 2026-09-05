@@ -5703,13 +5703,18 @@ void FastllmCudaMallocBigBuffer(size_t size) {
     bigBuffers.push_back(CudaMemoryBuffer(ret, size, false));
 }
 
-static void FastllmCudaClearBigBufferWithRetain(size_t retainBytes) {
+static void FastllmCudaClearBigBufferWithRetain(size_t retainBytes, bool currentDeviceOnly) {
     if (fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
         return;
     }
     int id = -1;
     cudaGetDevice(&id);
-    std::vector<FastllmCudaMemPoolView> views = FastllmSnapshotCudaMemPoolViews();
+    std::vector<FastllmCudaMemPoolView> views;
+    if (currentDeviceOnly) {
+        views.push_back(FastllmGetCudaMemPoolView(id));
+    } else {
+        views = FastllmSnapshotCudaMemPoolViews();
+    }
     if (views.empty())
         return;
     cudaError_t state = cudaSuccess;
@@ -5764,11 +5769,15 @@ static void FastllmCudaClearBigBufferWithRetain(size_t retainBytes) {
 }
 
 void FastllmCudaClearBigBuffer() {
-    FastllmCudaClearBigBufferWithRetain(300ULL * 1024ULL * 1024ULL);
+    FastllmCudaClearBigBufferWithRetain(300ULL * 1024ULL * 1024ULL, false);
+}
+
+void FastllmCudaClearBigBufferCurrentDevice() {
+    FastllmCudaClearBigBufferWithRetain(300ULL * 1024ULL * 1024ULL, true);
 }
 
 void FastllmCudaClearBigBufferAll() {
-    FastllmCudaClearBigBufferWithRetain(0);
+    FastllmCudaClearBigBufferWithRetain(0, false);
 }
 
 void FastllmCudaCopyFromHostToDevice(void *dst, void *src, size_t size) {

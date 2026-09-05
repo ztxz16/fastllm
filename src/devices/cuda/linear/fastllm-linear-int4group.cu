@@ -497,11 +497,12 @@ static bool FastllmCudaInt4GroupEnsureSm70AwqOnDevice(fastllm::Data &weight, int
 
     // dU16 已经从原始权重重排出量化值，scale/zero 也已拷到 device，原始 INT4_GROUP
     // 权重（weight.cudaData）此后不再需要：GEMM 走 handle->tmWeight/tmScales。
-    // 这里在 Prepare 之前就释放，并用 FastllmCudaClearBigBuffer 把池中空闲显存真正
-    // 归还给 OS——Prepare 内部用的是原生 cudaMalloc，只能向 OS 申请显存。否则
-    // 原始权重虽被标记空闲仍滞留在 fastllm 显存池里，Prepare 仍会 OOM。
+    // 这里在 Prepare 之前就释放，并把当前设备池中的空闲显存真正归还给 OS；Prepare
+    // 内部用的是原生 cudaMalloc，否则原始权重虽已空闲仍会滞留在 fastllm 显存池中。
+    // 不能从 TP worker 清理其它设备：其它 rank 可能已经进入 NCCL，跨设备 cudaFree
+    // 会等待那个 rank，而它同时在等待本 rank 提交同一个 collective，形成死锁。
     FastllmCudaInt4GroupReleaseOriginalWeight(weight);
-    FastllmCudaClearBigBuffer();
+    FastllmCudaClearBigBufferCurrentDevice();
 
     void *handle = fastllm::awq_sm70::Prepare(dU16, dScales, dZeros, K, N, numGroups, groupCnt, 0);
 
@@ -998,7 +999,7 @@ static bool FastllmCudaInt4GroupEnsureMarlinOnDevice(fastllm::Data &weight, int 
     // experts are prepared lazily that pool can retain several GB and starve
     // KV/prefill allocations. The final Marlin buffer is still marked busy, so
     // clearing idle pool entries here only releases the two obsolete buffers.
-    FastllmCudaClearBigBuffer();
+    FastllmCudaClearBigBufferCurrentDevice();
 
     std::vector<half> hostScales;
     std::vector<uint32_t> hostZeros;
