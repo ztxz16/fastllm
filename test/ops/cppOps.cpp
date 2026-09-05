@@ -312,6 +312,11 @@ namespace {
 
         ComparisonStats stats;
         for (size_t i = 0; i < expectedVec.size(); i++) {
+            // NaN comparisons are false, so a max-difference check alone can
+            // incorrectly report PASS for a broken GPU kernel.
+            if (!std::isfinite(expectedVec[i]) || !std::isfinite(actualVec[i])) {
+                throw std::runtime_error("non-finite output at index " + std::to_string(i));
+            }
             float absDiff = std::fabs(expectedVec[i] - actualVec[i]);
             float relDiff = absDiff / std::max(std::fabs(expectedVec[i]), 1e-6f);
             if (absDiff > stats.maxAbsDiff) {
