@@ -7,6 +7,7 @@
 #include "basellm.h"
 #include "cmath"
 #include "utils/persistent_worker_group.h"
+#include "utils/image_embedding_cache.h"
 
 #include <array>
 #include <atomic>
@@ -400,7 +401,11 @@ namespace fastllm {
                                const Data *gridThwData,
                                bool isVideo,
                                Data &features,
-                               std::vector<std::vector<int>> &gridThwList);
+                               std::vector<std::vector<int>> &gridThwList,
+                               const Data *imageCacheKeys = nullptr);
+        // Created only when an image request supplies cache keys and caching
+        // is enabled. Text-only models never construct a cache pool.
+        std::unique_ptr<ImageEmbeddingCache> imageEmbeddingCache;
         void BuildMultimodalPositionData(const Data &inputIds,
                                          const std::vector<std::vector<int>> &imageGridThwList,
                                          const std::vector<std::vector<int>> &videoGridThwList,

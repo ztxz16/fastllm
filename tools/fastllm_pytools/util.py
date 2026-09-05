@@ -471,6 +471,12 @@ def apply_page_size_default(args):
             args.page_size = 16
     return args
 
+def apply_image_embedding_cache_env(args):
+    capacity = getattr(args, "image_embedding_cache", None)
+    if capacity is not None:
+        os.environ["FASTLLM_IMAGE_EMBEDDING_CACHE_BYTES"] = str(_memory_size_bytes(capacity))
+
+
 def apply_prefix_cache_env(args):
     prefix_cache = getattr(args, "prefix_cache", "")
     if (prefix_cache != ""):
@@ -775,6 +781,9 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         dest = 'moe_cuda_cache', type = _memory_size_bytes,
                         default = 0,
                         help = '混合推理时用于缓存MoE专家的CUDA显存，如3g；0表示关闭')
+    parser.add_argument('--image-embedding-cache', '--image_embedding_cache',
+                        dest = 'image_embedding_cache', type = _memory_size_bytes, default = None,
+                        help = 'Qwen3.5图片embedding的CPU缓存上限，如512m或1g；默认512m，0关闭')
     parser.add_argument('--ngram_device', '--ngram-device', dest = 'ngram_device',
                         choices = ['cpu', 'disk'], default = 'cpu',
                         help = 'ngram表存放位置；disk从checkpoint按行读取以显著降低内存占用')
@@ -1553,6 +1562,7 @@ def make_normal_llm_model(args, startup_progress = None):
     if (args.page_size > 0):
         llm.set_page_size(args.page_size)
     apply_prefix_cache_env(args)
+    apply_image_embedding_cache_env(args)
     if (hasattr(args, 'gpu_mem_ratio')):
         llm.set_gpu_mem_ratio(args.gpu_mem_ratio)
     if (hasattr(args, 'cuda_slab') and hasattr(llm, 'set_cuda_slab')):

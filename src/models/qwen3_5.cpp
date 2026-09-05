@@ -23203,6 +23203,7 @@ namespace fastllm {
     }
 
     void Qwen3_5Model::InitParams() {
+        imageEmbeddingCache.reset();
         auto getDictValue = [&](const std::string &key, const std::string &defaultValue) {
             auto it = this->weight.dicts.find(key);
             if (it != this->weight.dicts.end()) {
@@ -24808,6 +24809,7 @@ namespace fastllm {
     }
 
     void Qwen3_5Model::OnModelWeightsLoaded() {
+        imageEmbeddingCache.reset();
         bool forceSafeGgufDequant = false;
         for (const auto &item : this->weight.weight) {
             forceSafeGgufDequant |= item.second.forceGGUFFp32Dequant;
@@ -25092,7 +25094,8 @@ namespace fastllm {
                                          const Data *gridThwData,
                                          bool isVideo,
                                          Data &features,
-                                         std::vector<std::vector<int>> &gridThwList) {
+                                         std::vector<std::vector<int>> &gridThwList,
+                                         const Data *imageCacheKeys) {
         gridThwList.clear();
         features = Data();
         if (rawInputs.empty()) {
@@ -25123,6 +25126,21 @@ namespace fastllm {
         std::vector<float> mergedFeatures;
         int totalFeatureCount = 0;
 
+        ImageEmbeddingCache *imageCache = nullptr;
+        if (!isVideo && imageCacheKeys != nullptr && imageCacheKeys->cpuData != nullptr &&
+            imageCacheKeys->dataType == DataType::INT32 &&
+            imageCacheKeys->dims == std::vector<int>({(int)rawInputs.size(), 8})) {
+            // The scheduler serializes model forwards. Delay both configuration
+            // lookup and pool construction until the first eligible image request.
+            if (!imageEmbeddingCache) {
+                size_t capacity = ImageEmbeddingCache::CapacityFromEnv();
+                if (capacity > 0) {
+                    imageEmbeddingCache = std::make_unique<ImageEmbeddingCache>(capacity);
+                }
+            }
+            imageCache = imageEmbeddingCache.get();
+        }
+
         for (int mediaIndex = 0; mediaIndex < (int) rawInputs.size(); mediaIndex++) {
             std::vector<int> grid = {
                 readGridValue(mediaIndex * 3 + 0),
@@ -25130,6 +25148,23 @@ namespace fastllm {
                 readGridValue(mediaIndex * 3 + 2),
             };
             gridThwList.push_back(grid);
+
+            std::string imageCacheKey;
+            if (imageCache != nullptr) {
+                // The Python payload hashes the actual FP32 image, shape, grid
+                // and processor settings. Keep all 256 bits, outside token IDs.
+                imageCacheKey.assign((const char*)imageCacheKeys->cpuData + mediaIndex * 32, 32);
+                imageCacheKey += std::to_string((int)this->dataType);
+                size_t cached = imageCache->Append(imageCacheKey, mergedFeatures);
+                if (cached > 0) {
+                    totalFeatureCount += (int)(cached / vision_out_hidden_size);
+                    if (this->verbose) {
+                        printf("[Vision] Image embedding cache hit (%zu bytes).\n", cached * sizeof(float));
+                    }
+                    continue;
+                }
+            }
+            size_t featureStart = mergedFeatures.size();
 
             Data rawCpu(*rawInputs[mediaIndex]);
             rawCpu.ToDevice(DataDevice::CPU);
@@ -25750,6 +25785,16 @@ namespace fastllm {
                 hiddenStates.FreeSpace();
                 runMerger(mergerInput, mergerOutput);
                 appendMergerOutput(mergerOutput);
+            }
+            if (!imageCacheKey.empty()) {
+                size_t count = mergedFeatures.size() - featureStart;
+                bool stored = imageCache->Put(
+                    imageCacheKey, mergedFeatures.data() + featureStart, count);
+                if (this->verbose) {
+                    printf("[Vision] Image embedding cache miss (%s; %zu/%zu bytes).\n",
+                           stored ? "stored" : "uncached",
+                           imageCache->SizeBytes(), imageCache->Capacity());
+                }
             }
 #ifdef USE_CUDA
             FastllmCudaClearBigBufferAll();
@@ -30729,12 +30774,15 @@ namespace fastllm {
         Data imageFeatures, videoFeatures;
         std::vector<std::vector<int>> imageGridThwList, videoGridThwList;
         if (hasRawMedia) {
+            auto imageCacheIt = multimodalInput.find("image_cache_keys");
             EncodeVisualItems(
                 rawImageIt != multimodalInput.end() ? rawImageIt->second : std::vector<Data*>(),
                 (imageGridIt != multimodalInput.end() && !imageGridIt->second.empty()) ? imageGridIt->second[0] : nullptr,
                 false,
                 imageFeatures,
-                imageGridThwList
+                imageGridThwList,
+                (imageCacheIt != multimodalInput.end() && !imageCacheIt->second.empty()) ?
+                    imageCacheIt->second[0] : nullptr
             );
             EncodeVisualItems(
                 rawVideoIt != multimodalInput.end() ? rawVideoIt->second : std::vector<Data*>(),

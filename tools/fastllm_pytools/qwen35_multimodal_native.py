@@ -1,3 +1,4 @@
+import hashlib
 import json
 import math
 import os
@@ -759,8 +760,26 @@ def build_qwen35_multimodal_payload(
     offset = _append_payload_tensor(arrays, descriptors, "image_grid_thw", native_inputs.get("image_grid_thw"), np.int32, offset)
     offset = _append_payload_tensor(arrays, descriptors, "video_grid_thw", native_inputs.get("video_grid_thw"), np.int32, offset)
 
-    for image_array in native_inputs.get("image_arrays", []):
+    image_cache_keys = []
+    cache_enabled = os.environ.get("FASTLLM_IMAGE_EMBEDDING_CACHE_BYTES", "").strip() != "0"
+    for image_index, image_array in enumerate(native_inputs.get("image_arrays", [])):
+        image_array = np.ascontiguousarray(image_array, dtype=np.float32)
+        if cache_enabled:
+            metadata = {
+                "version": 1,
+                "shape": list(image_array.shape),
+                "grid": native_inputs["image_grid_thw"][image_index].tolist(),
+                "processor": native_inputs.get("multimodal_config", {}),
+            }
+            digest = hashlib.sha256(json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode())
+            digest.update(memoryview(image_array).cast("B"))
+            image_cache_keys.append(np.frombuffer(digest.digest(), dtype=np.int32))
         offset = _append_payload_tensor(arrays, descriptors, "image_frames", image_array, np.float32, offset)
+
+    if image_cache_keys:
+        offset = _append_payload_tensor(
+            arrays, descriptors, "image_cache_keys", np.stack(image_cache_keys), np.int32, offset
+        )
 
     for video_array in native_inputs.get("video_arrays", []):
         offset = _append_payload_tensor(arrays, descriptors, "video_frames", video_array, np.float32, offset)

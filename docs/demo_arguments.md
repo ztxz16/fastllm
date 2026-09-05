@@ -10,6 +10,7 @@
 --path ~/model.flm # 从~/model.flm中读取模型，这里的模型是Fastllm格式的模型文件
 ```
 - **推理类型 (`--atype`)**: 设置中间计算类型，可以指定为`float16`或`float32`
+- **图片 embedding 缓存 (`--image-embedding-cache`)**: Qwen3.5 native 图片路径的 CPU 缓存上限，默认 `512m`，例如 `--image-embedding-cache 1g`；设为 `0` 关闭。首次处理图片请求时才创建，按实际内容分配内存，不额外常驻 GPU 显存。命中后跳过 native 图片预处理和视觉编码；图片解码、传输及语言模型预填充仍可能执行。配置、作用范围与验证方式见[多模态缓存](multimodal-cache.md)。
 - **权重类型 (`--dtype`)**: 指定模型的权重类型，适用于读取Hugging Face模型时。可以指定为`float16`, `int8`, `int4`, `int4g`(int4分组量化)，例如：
 ```bash
 --dtype float16  # 使用float16权重（不量化）
