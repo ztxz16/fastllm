@@ -610,6 +610,13 @@ target_link_libraries(quant fastllm)
 
 if (UNIT_TEST)
     enable_testing()
+    find_package(Threads REQUIRED)
+    add_executable(ncclSubmitRendezvousRegression test/ops/ncclSubmitRendezvousRegression.cpp)
+    target_include_directories(ncclSubmitRendezvousRegression PRIVATE include)
+    target_link_libraries(ncclSubmitRendezvousRegression PRIVATE Threads::Threads)
+    add_test(NAME ncclSubmitRendezvous COMMAND ncclSubmitRendezvousRegression)
+    set_tests_properties(ncclSubmitRendezvous PROPERTIES TIMEOUT 30)
+
     add_executable(optest test/ops/cppOps.cpp)
     target_link_libraries(optest fastllm)
     set_target_properties(optest PROPERTIES
@@ -653,6 +660,12 @@ if (UNIT_TEST)
         add_executable(fp8TpRepackDeadlockRegression test/ops/fp8TpRepackDeadlockRegression.cpp)
         target_link_libraries(fp8TpRepackDeadlockRegression fastllm)
         target_include_directories(fp8TpRepackDeadlockRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+
+        add_executable(ncclOddTpRegression test/ops/ncclOddTpRegression.cu)
+        target_link_libraries(ncclOddTpRegression fastllm)
+        target_include_directories(ncclOddTpRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME ncclOddTp COMMAND ncclOddTpRegression)
+        set_tests_properties(ncclOddTp PROPERTIES LABELS cuda TIMEOUT 180 SKIP_RETURN_CODE 77)
     endif()
 endif()
 

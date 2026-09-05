@@ -17,12 +17,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <thread>
 
 #include "fastllm-cuda.cuh"
 #include "fastllm-multicuda.cuh"
+#include "devices/multicuda/ncclsubmitrendezvous.h"
 #include "fastllm.h"
 #include "utils.h"
 #include "gguf.h"
@@ -2080,6 +2082,9 @@ static bool g_ncclInitialized = false;
 static int g_ncclWorldSize = 0;
 static std::atomic<uint64_t> g_ncclGeneration{0};
 static std::mutex g_ncclInitMutex;
+// Follows the main communicator group's lifetime. As with g_ncclComms,
+// initialization/replacement must not overlap active collectives.
+static std::unique_ptr<fastllm::NcclSubmitRendezvous> g_ncclSubmitRendezvous;
 
 struct FastllmNcclGraphPeerComms {
     int devices[2] = {-1, -1};
@@ -2218,6 +2223,7 @@ bool FastllmInitNccl(const std::vector<int>& devices) {
     // every rank will consistently reject the stale state and use NCCL.
     g_ncclGeneration.fetch_add(1, std::memory_order_acq_rel);
     FastllmCudaCustomAllReduceReset();
+    g_ncclSubmitRendezvous.reset();
 
     for (auto &it : g_ncclComms) {
         if (it.second != nullptr) {
@@ -2252,6 +2258,11 @@ bool FastllmInitNccl(const std::vector<int>& devices) {
         
     g_ncclInitialized = true;
     g_ncclWorldSize = numGPUs;
+    // Odd TP sizes cannot use the custom all-reduce. Keep the established
+    // even-rank path unchanged, including its NCCL fallback.
+    if (numGPUs % 2 != 0) {
+        g_ncclSubmitRendezvous.reset(new fastllm::NcclSubmitRendezvous(numGPUs));
+    }
     // Initialize the optional graph-safe small all-reduce before any captured
     // collective.  Failure is non-fatal: FastllmNcclAllReduce keeps NCCL as
     // the established fallback.
@@ -3128,6 +3139,9 @@ static void FastllmNcclAllReduceImpl(void* data, void* dest, int count,
     } else {
         // 如果有其他类型，需在此补充
         printf("Error: Unknown dataType %d for NCCL\n", dataType);
+        if (g_ncclSubmitRendezvous) {
+            g_ncclSubmitRendezvous->Abort("unsupported AllReduce data type");
+        }
         FastllmCudaSetThreadError();
         return;
     }
@@ -3135,13 +3149,56 @@ static void FastllmNcclAllReduceImpl(void* data, void* dest, int count,
     // 3. 执行 AllReduce
     // op: ncclSum (求和)
     cudaStream_t stream = cudaStreamPerThread;
-    
+    auto *rendezvous = g_ncclSubmitRendezvous.get();
+    int rank = -1;
+    if (rendezvous != nullptr) {
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        cudaError_t state = cudaStreamIsCapturing(stream, &capture);
+        if (state != cudaSuccess) {
+            rendezvous->Abort("AllReduce stream capture query failed");
+            printf("Error: AllReduce capture query on device %d: %s\n",
+                   deviceId, cudaGetErrorString(state));
+            cudaGetLastError();
+            FastllmCudaSetThreadError();
+            return;
+        }
+        if (capture != cudaStreamCaptureStatusNone) {
+            rendezvous = nullptr;
+        } else {
+            auto it = g_ncclRanks.find(deviceId);
+            if (it != g_ncclRanks.end()) {
+                rank = it->second;
+            }
+        }
+    }
+    auto waitForRanks = [&](fastllm::NcclSubmitRendezvous::Phase phase) {
+        if (rendezvous == nullptr || rendezvous->Wait(rank, phase, count, dataType)) {
+            return true;
+        }
+        printf("Error: AllReduce submission on device %d: %s\n",
+               deviceId, rendezvous->Error().c_str());
+        FastllmCudaSetThreadError();
+        return false;
+    };
+    // A rank entering the next GEMM while peers are still in NCCL submission
+    // can deadlock on CUDA driver locks (observed with odd TP on RTX 5090).
+    // Meet before submission AND after every rank's ncclAllReduce returns.
+    // Do not wait for GPU completion or add host barriers to CUDA Graphs.
+    if (!waitForRanks(fastllm::NcclSubmitRendezvous::Before)) {
+        return;
+    }
     // 注意：ncclAllReduce 发射是异步的
     ncclResult_t res = ncclAllReduce(data, dest, count, ncclType, ncclSum, comm, stream);
     
     if (res != ncclSuccess) {
+        if (rendezvous != nullptr) {
+            rendezvous->Abort("ncclAllReduce submission failed");
+        }
         printf("Error: ncclAllReduce failed on device %d: %s\n", deviceId, ncclGetErrorString(res));
         FastllmCudaSetThreadError();
+        return;
+    }
+    if (!waitForRanks(fastllm::NcclSubmitRendezvous::After)) {
         return;
     }
     // 发射后立即同步：保证返回时集合通信已完成，不残留在途通信。无 P2P 的多卡(经 PCIe/SHM)下，
