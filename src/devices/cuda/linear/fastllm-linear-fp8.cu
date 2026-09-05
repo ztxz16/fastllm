@@ -4,10 +4,12 @@
 
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
+#include "devices/cuda/fastllm-cuda-fp8.h"
 #include "devices/cuda/fastllm-awq-sm70.cuh"
 
 #include <cmath>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <cuda_fp8.h>
 
@@ -1411,13 +1413,23 @@ bool FastllmCudaFp8E4M3HasSm70Layout(const fastllm::Data &weight) {
            fastllm::awq_sm70::Fp8Supported();
 }
 
+std::mutex &FastllmCudaFp8Sm70PrepareMutex() {
+    const int device = FastllmCudaGetDevice();
+    static std::mutex registryMutex;
+    static std::map<int, std::mutex> deviceMutexes;
+    // Only host bookkeeping is protected across devices. Repacking may wait
+    // for NCCL, so it must let the other TP ranks keep submitting their work.
+    std::lock_guard<std::mutex> lock(registryMutex);
+    return deviceMutexes[device];
+}
+
 bool FastllmCudaFp8E4M3PrepareSm70Layout(fastllm::Data &weight,
                                          int rows, int inputDim,
-                                         int outputDim) {
+                                         int outputDim, bool warmup = false) {
     if (FastllmCudaFp8E4M3HasSm70Layout(weight)) {
         return true;
     }
-    if (weight.IsRepacked || FastllmCudaGetNcclForceSync() ||
+    if (weight.IsRepacked || (!warmup && FastllmCudaGetNcclForceSync()) ||
         rows <= kSm70Fp8NativeMaxRows ||
         rows > kSm70Fp8RepackMaxRows || weight.blockM != 128 ||
         weight.blockK != 128 || inputDim % 128 != 0 ||
@@ -1426,12 +1438,10 @@ bool FastllmCudaFp8E4M3PrepareSm70Layout(fastllm::Data &weight,
         return false;
     }
 
-    // Startup probes include a single eight-row prefill call. Do not let that
-    // one-off shape irreversibly repack weights used later by batch-one decode.
-    // Repeated eligible calls are characteristic of batched/speculative
-    // serving and amortize the one-time conversion.
-    static std::mutex prepareMutex;
-    std::lock_guard<std::mutex> lock(prepareMutex);
+    // Generic startup probes include small-row prefills and do not establish
+    // a serving pattern. Outside explicit speculative warmup, require repeated
+    // eligible serving calls before irreversibly selecting the MMA layout.
+    std::lock_guard<std::mutex> lock(FastllmCudaFp8Sm70PrepareMutex());
     if (FastllmCudaFp8E4M3HasSm70Layout(weight)) {
         return true;
     }
@@ -1440,7 +1450,9 @@ bool FastllmCudaFp8E4M3PrepareSm70Layout(fastllm::Data &weight,
     }
     if (weight.extraCudaData.size() == kFp8StandardCudaDataCount) {
         weight.extraCudaData.push_back(nullptr);
-        return false;
+        if (!warmup) {
+            return false;
+        }
     }
     if (weight.extraCudaData.size() != kFp8StandardCudaDataCount + 1 ||
         weight.extraCudaData.back() != nullptr) {
@@ -1462,6 +1474,17 @@ bool FastllmCudaFp8E4M3PrepareSm70Layout(fastllm::Data &weight,
 }
 
 }  // namespace
+
+bool FastllmCudaWarmupFp8E4M3Sm70(fastllm::Data &weight, int rows) {
+    if (weight.dataType != fastllm::DataType::FP8_E4M3 ||
+        weight.dims.size() != 2 || weight.cudaData == nullptr ||
+        rows <= kSm70Fp8NativeMaxRows || rows > kSm70Fp8RepackMaxRows ||
+        !fastllm::awq_sm70::Fp8Supported()) {
+        return false;
+    }
+    return FastllmCudaFp8E4M3PrepareSm70Layout(
+        weight, rows, weight.dims[1], weight.dims[0], true);
+}
 
 bool FastllmCudaMatMulFloatFP8E4M3(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
     FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(weight, bias, k);

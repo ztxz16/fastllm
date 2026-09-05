@@ -65,7 +65,8 @@ enum class DenseWeightKind : int {
 using DenseTuneKey = std::tuple<int, int, int, int, int>;
 
 struct DeviceRuntime {
-    tm::Gemm gemm;
+    std::unique_ptr<tm::Gemm> gemm;
+    std::once_flag initFlag;
     WorkspaceHolder workspace;
     std::mutex runMutex;
     std::set<DenseTuneKey> tunedShapes;
@@ -110,10 +111,19 @@ DeviceRuntime &GetRuntime(int device) {
     if (cachedDevice == device) {
         return *cachedRuntime;
     }
-    std::lock_guard<std::mutex> lock(g_runtimeMutex);
-    auto it = g_runtimes.find(device);
-    if (it == g_runtimes.end()) {
-        auto runtime = std::make_unique<DeviceRuntime>();
+    DeviceRuntime *runtime;
+    {
+        // Do not construct GEMM or allocate CUDA workspace under a lock shared
+        // by TP ranks: the allocation can wait for a peer's pending collective.
+        std::lock_guard<std::mutex> lock(g_runtimeMutex);
+        auto &entry = g_runtimes[device];
+        if (!entry) {
+            entry = std::make_unique<DeviceRuntime>();
+        }
+        runtime = entry.get();
+    }
+    std::call_once(runtime->initFlag, [runtime]() {
+        runtime->gemm = std::make_unique<tm::Gemm>();
         auto &holder = runtime->workspace;
         cudaMalloc(&holder.barriers, tm::Gemm::kBarriersSize);
         cudaMalloc(&holder.partials, tm::Gemm::kPartialsSize);
@@ -129,11 +139,8 @@ DeviceRuntime &GetRuntime(int device) {
         holder.workspace.tensormaps = holder.tensormaps;
         holder.workspace.tensormaps_size = (size_t)8192 * 128;
         holder.workspace.flags = holder.flags;
-        cachedRuntime = runtime.get();
-        g_runtimes.emplace(device, std::move(runtime));
-    } else {
-        cachedRuntime = it->second.get();
-    }
+    });
+    cachedRuntime = runtime;
     cachedDevice = device;
     return *cachedRuntime;
 }
@@ -662,7 +669,7 @@ bool Gemm(void *handlePtr, const half *in, half *out, int tokens, cudaStream_t s
     std::lock_guard<std::mutex> runLock(runtime.runMutex);
     op.dispatch = SelectDispatch(
         runtime, DenseWeightKind::kAwq, m, n, k, group_size);
-    const int ec = runtime.gemm.Run(
+    const int ec = runtime.gemm->Run(
         op, 1.f, in, desc_A, nullptr, desc_U, handle->tmWeight, desc_B,
         handle->tmScales, desc_V, 0.f, out, desc_D, out, desc_D,
         runtime.workspace.workspace, stream);
@@ -701,7 +708,13 @@ bool PrepareFp8InPlace(uint8_t *weight, const float *blockScales,
     if (!MakeFp8Layouts(K, N, layouts)) {
         return false;
     }
-    std::lock_guard<std::mutex> lock(g_prepareMutex);
+    // Keep conversions serialized, but never block a peer needed by an
+    // in-flight collective. The caller retains the native weight layout and
+    // retries on a later Linear when another device is already preparing.
+    std::unique_lock<std::mutex> lock(g_prepareMutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        return false;
+    }
 
     const size_t elementCount = (size_t)K * N;
     const size_t unpackedWeightBytes = elementCount * sizeof(uint16_t);
@@ -826,7 +839,7 @@ bool GemmFp8(const uint8_t *packedWeight, const half *packedScales,
     std::lock_guard<std::mutex> runLock(runtime.runMutex);
     op.dispatch = SelectDispatch(
         runtime, DenseWeightKind::kFp8, tokens, N, K, groupSize);
-    const int ec = runtime.gemm.Run(
+    const int ec = runtime.gemm->Run(
         op, 1.f, in, descA, nullptr, descU,
         packedWeight, layouts.packedWeight,
         packedScales, layouts.packedScale,
@@ -1012,7 +1025,7 @@ bool GemmNvfp4(const uint8_t *storage, const half *in, half *out,
     op.dispatch = SelectDispatch(
         runtime, DenseWeightKind::kNvfp4, tokens, packedN, K,
         kNvfp4GroupSize);
-    const int ec = runtime.gemm.Run(
+    const int ec = runtime.gemm->Run(
         op, 1.f, in, descA, nullptr, descU, storage, descB,
         storage + packedWeightBytes, descV, 0.f,
         gemmOutput, descD, gemmOutput, descD,
