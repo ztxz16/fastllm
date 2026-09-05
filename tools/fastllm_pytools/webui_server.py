@@ -1570,7 +1570,7 @@ class WebUIRuntime:
         yield _json_line({
             "type": "status",
             "message": (
-                "正在启动 Pi 联网智能体…" if pi_web else "正在准备模型…"),
+                "正在启动 Pi 联网智能体…" if pi_web else "正在处理请求…"),
             **({} if pi_web else {"message_key": "status.prepare_model"}),
         })
         try:
