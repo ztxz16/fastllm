@@ -15773,9 +15773,14 @@ namespace fastllm {
                     }
                     Qwen35MtpVerifyGraphDeviceState &rootGraphDevice =
                         *graphState.deviceStates[0];
+                    speculativeHiddenStates.FreeSpace();
                     Qwen35BorrowCudaTensor(
                         speculativeHiddenStates,
                         rootGraphDevice.hiddenStates);
+                    // This persistent output must detach on the next prefill.
+                    // cudaDataBorrowed protects the graph allocation; isFake
+                    // would also suppress freeing subsequent owning copies.
+                    speculativeHiddenStates.isFake = false;
                     if (speculativeCaptureDFlashHiddenStates) {
                         speculativeDFlashHiddenStates.resize(
                             rootGraphDevice.dflashHiddenStates.size());
