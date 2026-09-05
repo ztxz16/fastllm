@@ -30840,7 +30840,33 @@ namespace fastllm {
 
         Data hiddenStates;
         Data embeddingResult;
-        Embedding(inputIds, this->weight[language_prefix + "embed_tokens.weight"], embeddingResult);
+        Data &multimodalEmbedWeight = this->weight[language_prefix + "embed_tokens.weight"];
+#ifdef USE_CUDA
+        if (GetCudaEmbedding() && !GetLowMemMode() &&
+            multimodalEmbedWeight.IsTensorParallelReplicated() &&
+            multimodalEmbedWeight.multiDeviceData) {
+            // TP owns one full embedding table per GPU. The parent tensor is
+            // metadata; generic Embedding must use an actual local replica.
+            Data *localEmbed = nullptr;
+            int embedDevice = -1;
+            for (const auto &entry : multimodalEmbedWeight.multiDeviceDatas) {
+                if (entry.second != nullptr &&
+                    entry.second->dataDevice == DataDevice::CUDA &&
+                    entry.second->cudaData != nullptr) {
+                    embedDevice = entry.first;
+                    localEmbed = entry.second;
+                    break;
+                }
+            }
+            AssertInFastLLM(localEmbed != nullptr,
+                            "Qwen3.5 multimodal is missing a CUDA embedding replica.\n");
+            Qwen35ScopedGenericExecutor executor("cuda:" + std::to_string(embedDevice));
+            Embedding(inputIds, *localEmbed, embeddingResult);
+        } else
+#endif
+        {
+            Embedding(inputIds, multimodalEmbedWeight, embeddingResult);
+        }
         ToDataType(embeddingResult, hiddenStates, this->dataType);
         MergeMultimodalFeaturesIntoText(*mmTypeIt->second[0], imageEmbeds, videoEmbeds, hiddenStates);
         embeddingResult.FreeSpace();
