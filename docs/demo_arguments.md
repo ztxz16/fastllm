@@ -24,6 +24,7 @@
 
 - **低显存模式 (`--low_gpu_mem`)**: 关闭 CUDA embedding 配置和 GPU token handoff；此开关优先于 `--cuda_embedding` 和 `FASTLLM_GPU_TOKEN_HANDOFF` 环境变量。CUDA Graph 仍按原有自动策略或 `FASTLLM_CUDA_GRAPH` 设置运行，Qwen3.5/3.6 普通 CUDA 推理会将 embedding 保留在 CPU，并可继续使用 CUDA Graph；其他模型的后端可能仍要求在 Graph 模式下使用 GPU embedding。该开关可与双卡 TP、MTP 或 DFlash2 配合使用（MTP 与 DFlash2 二选一）；当前 Qwen3.5 系列的 MTP 校验 Graph 不支持 CPU embedding，因此该校验阶段会回退到普通执行。该开关默认关闭，与 `--low` 低内存模式独立，不改变 KV 类型或上下文配额，也不保证避免 OOM。例如：`ftllm server /path/to/model --device cuda --low_gpu_mem`。
 - **CUDA权重slab (`--cuda_slab`)**: 设置 CUDA 模型权重 slab 分配块大小，单位 MB，默认 `0` 表示关闭。对于将大量 MOE 专家权重放在 CUDA 上的场景，可以使用如 `--cuda_slab 1024` 减少小权重分别分配造成的显存碎片和页对齐开销
+- **KV缓存类型 (`--kv_cache_dtype`)**: 默认 `auto`，可使用 `float16`、`bfloat16`、`fp8_e4m3`；Qwen3.5 架构的 CUDA 分页注意力还支持 `fp4`（别名 `nvfp4`、`fp4_e2m1`）。仅量化普通注意力 KV，不改变模型权重或线性注意力状态精度。硬件要求、内存格式与示例见[FP4 KV cache](fp4-kv-cache.md)。
 - **KV缓存最大使用量 (`--kv_cache_limit`)**: 设置KV缓存的最大使用量。若不使用此参数或设置为`auto`，框架会自动处理。手动设定示例如下：
 ```bash
 --kv_cache_limit 5G   # 设置为5G

@@ -649,6 +649,13 @@ if (UNIT_TEST)
         add_test(NAME cuda_moe_cache COMMAND cuda_moe_cache_test)
         set_tests_properties(cuda_moe_cache PROPERTIES LABELS cuda)
 
+        add_executable(cuda_fp4_kv_test test/basic/test_cuda_fp4_kv.cu)
+        target_link_libraries(cuda_fp4_kv_test PRIVATE fastllm)
+        set_target_properties(cuda_fp4_kv_test PROPERTIES
+            CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME cuda_fp4_kv COMMAND cuda_fp4_kv_test)
+        set_tests_properties(cuda_fp4_kv PROPERTIES LABELS cuda SKIP_RETURN_CODE 77)
+
         add_executable(cudaGraphPoolMissRegression test/ops/cudaGraphPoolMissRegression.cpp)
         target_link_libraries(cudaGraphPoolMissRegression fastllm)
         target_include_directories(cudaGraphPoolMissRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

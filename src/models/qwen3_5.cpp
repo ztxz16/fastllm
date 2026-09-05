@@ -2279,7 +2279,7 @@ namespace fastllm {
         static DataType ResolveQwen35ThreadTpCacheType(DataType cacheType, DataType computeType) {
             if (cacheType == DataType::FLOAT16 ||
                 cacheType == DataType::BFLOAT16 ||
-                cacheType == DataType::FP8_E4M3) {
+                cacheType == DataType::FP8_E4M3 || cacheType == DataType::FP4_E2M1) {
                 return cacheType;
             }
             return computeType;

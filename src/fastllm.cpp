@@ -549,6 +549,7 @@ namespace fastllm {
         {DataType::FLOAT16, {"float16", "fp16", "half"}}, {DataType::INT4_NOZERO, {"int4"}}, {DataType::INT4_GROUP, {"int4g"}},
         {DataType::FP8_E4M3, {"float8", "fp8", "fp8_e4m3"}}, {DataType::INT2_GROUP, {"int2g"}}, {DataType::BASE3_GROUP, {"base3g"}},
         {DataType::INT32, {"int32"}}, {DataType::NVFP4, {"nvfp4", "fp4_e2m1"}}, {DataType::INT32PARAM, {"int32param"}},
+        {DataType::FP4_E2M1, {"fp4_kv"}},
         {DataType::FP8_E4M3_BLOCK_128, {"fp8_e4m3_block_128"}}, {DataType::AWQ_4BIT_128, {"awq_4bit_128"}},
         {DataType::INT4_PERCHANNEL, {"int4_perchannel"}}, {DataType::FP8_E4M3_PERCHANNEL, {"fp8_e4m3_perchannel"}},
         {DataType::INT4_GROUP128, {"int4_group128"}}, {DataType::INT8_PERCHANNEL, {"int8_perchannel"}},
@@ -735,6 +736,9 @@ namespace fastllm {
         }
         if (type == DataType::FLOAT32) {
             return rows * columns * sizeof(float);
+        } else if (type == DataType::FP4_E2M1) {
+            AssertInFastLLM(columns % 16 == 0, "FP4 KV cache requires columns divisible by 16.\n");
+            return rows * (columns / 16) * 9;
         } else if (type == DataType::BFLOAT16 || type == DataType::FLOAT16) {
             return rows * columns * sizeof(uint16_t);
         } else if (type == DataType::INT4_NOZERO || type == DataType::INT4 || type == DataType::INT4_GROUP ||
@@ -1818,6 +1822,9 @@ namespace fastllm {
         } else if (this->dataType == DataType::NVFP4) {
             this->unitSize = 1;
             this->unitSizeDiv = 2;
+        } else if (this->dataType == DataType::FP4_E2M1) {
+            this->unitSize = 9;
+            this->unitSizeDiv = 16;
         } else if (this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
                    this->dataType == DataType::NVFP4_BLOCK_16 ||
                    this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
@@ -1861,7 +1868,8 @@ namespace fastllm {
             this->blockK > 0 && this->blockM > 0 && this->scales.empty()) {
             this->expansionBytes = GetNVFP4StorageBytes(this->dims[0], this->dims[1], this->blockK, this->blockM);
         } else {
-            this->expansionBytes = (this->expansionSize * this->unitSize - 1) / this->unitSizeDiv + 1;
+            this->expansionBytes = this->expansionSize == 0 ? 0 :
+                (this->expansionSize * this->unitSize - 1) / this->unitSizeDiv + 1;
         }
     }
 
@@ -2066,6 +2074,9 @@ namespace fastllm {
     }
 
     uint64_t Data::GetBytes() const {
+        if (this->dims.empty() || this->strides.empty() || this->Count(0) == 0) {
+            return 0;
+        }
         if (this->dataType == DataType::DATA_GGUF_FORMAT) {
             return ggml_nbytes((ggml_tensor*)this->ggmlTensor);
         }
@@ -2108,7 +2119,8 @@ namespace fastllm {
             size == this->Count(0)) {
             this->expansionBytes = GetNVFP4StorageBytes(this->dims[0], this->dims[1], this->blockK, this->blockM);
         } else {
-            this->expansionBytes = (size * this->unitSize - 1) / this->unitSizeDiv + 1;
+            this->expansionBytes = size == 0 ? 0 :
+                (size * this->unitSize - 1) / this->unitSizeDiv + 1;
         }
         if (this->dataDevice == DataDevice::CPU) {
             this->cpuData = new uint8_t[this->expansionBytes];
@@ -5418,6 +5430,17 @@ namespace fastllm {
         int numHeads = cacheData.dims[0];
         int headDim = cacheData.dims.back();
         DataType dataType = cacheData.dataType;
+        if (dataType == DataType::FP4_E2M1) {
+            AssertInFastLLM(headDim == 128 || headDim == 256,
+                            "FP4 KV cache requires head_dim 128 or 256.\n");
+#ifdef USE_CUDA
+            AssertInFastLLM(cacheData.dataDevice == DataDevice::CUDA &&
+                            FastllmCudaFlashInferDataTypeSupported(DataType::BFLOAT16),
+                            "FP4 KV cache requires SM80+ CUDA FlashInfer attention.\n");
+#else
+            ErrorInFastLLM("FP4 KV cache requires CUDA.\n");
+#endif
+        }
 
         // 设置 Data 的基本属性（PagedCacheManager 继承自 Data）
         ((Data*)manager)->dataType = dataType;

@@ -219,6 +219,7 @@ KV_CACHE_DTYPE_CHOICES: Sequence[Choice] = (
     ("float16", "float16"),
     ("bfloat16", "bfloat16"),
     ("fp8_e4m3", "fp8"),
+    ("fp4", "fp4（Qwen3.5 CUDA）"),
 )
 
 MOE_ATYPE_CHOICES: Sequence[Choice] = (
@@ -360,7 +361,7 @@ FIELDS: Sequence[FormField] = (
         "text",
         "分块 prefill 的切片大小；调小可以减少显存占用，auto 表示不指定。",
     ),
-    FormField("kv_cache_dtype", "缓存类型", "choice", "KV Cache 类型，可使用 auto、float16、bfloat16 或 fp8。", KV_CACHE_DTYPE_CHOICES),
+    FormField("kv_cache_dtype", "缓存类型", "choice", "KV Cache 类型，可使用 auto、float16、bfloat16、fp8 或 fp4（Qwen3.5 CUDA）。", KV_CACHE_DTYPE_CHOICES),
     FormField("mtp", "MTP", "text", "支持 MTP 的模型每步生成的 draft token 数；0 表示关闭，1-8 开启，auto 表示不指定。"),
     FormField(
         "speculative_algorithm",

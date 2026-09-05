@@ -664,8 +664,10 @@ extern "C" {
             model->SetKVCacheDataType(fastllm::DataType::FLOAT32);
         } else if (dtypeStr == "fp8" || dtypeStr == "float8" || dtypeStr == "fp8_e4m3") {
             model->SetKVCacheDataType(fastllm::DataType::FP8_E4M3);
+        } else if (dtypeStr == "fp4" || dtypeStr == "nvfp4" || dtypeStr == "fp4_e2m1") {
+            model->SetKVCacheDataType(fastllm::DataType::FP4_E2M1);
         } else {
-            fastllm::ErrorInFastLLM("set_model_kv_cache_dtype error: kv_cache_dtype should be auto, float32, float16, bfloat16 or fp8_e4m3.");
+            fastllm::ErrorInFastLLM("set_model_kv_cache_dtype error: kv_cache_dtype should be auto, float32, float16, bfloat16, fp8_e4m3 or fp4_e2m1.");
         }
         return;
     }

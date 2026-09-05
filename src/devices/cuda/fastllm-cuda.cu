@@ -32,6 +32,7 @@
 #include <type_traits>
 #include <vector>
 #include <cuda_fp8.h>
+#include "attention/fastllm-fp4-kv.cuh"
 #include "sampling.cuh"
 
 extern "C" bool FastllmNcclGraphPeerCopy(int dstDevice, void *dst,
@@ -13941,10 +13942,10 @@ __global__ void FastllmQwen35QGateKVRMSNormRopeSplitAppendPagedCacheKernel(
             int pageOffset = insertPositions[batchIdx];
             int pageStride = pageLen * kHeads * headDim;
             int tokenStride = kHeads * headDim;
-            TKV *kDst = pagedKData + (size_t)pageIdx * pageStride +
-                pageOffset * tokenStride + kh * headDim;
             for (int i = tid; i < headDim; i += THREAD_PER_BLOCK) {
-                kDst[i] = FastllmCudaFloatToValue<TKV>(FastllmCudaValueToFloat(base[i]));
+                FastllmWritePagedKV(pagedKData, base + i,
+                    (size_t)pageIdx * pageStride + pageOffset * tokenStride + kh * headDim + i,
+                    pageStride);
             }
         }
     } else {
@@ -13954,10 +13955,10 @@ __global__ void FastllmQwen35QGateKVRMSNormRopeSplitAppendPagedCacheKernel(
         int pageOffset = insertPositions[batchIdx];
         int pageStride = pageLen * kHeads * headDim;
         int tokenStride = kHeads * headDim;
-        TKV *vDst = pagedVData + (size_t)pageIdx * pageStride +
-            pageOffset * tokenStride + vh * headDim;
         for (int i = tid; i < headDim; i += THREAD_PER_BLOCK) {
-            vDst[i] = FastllmCudaFloatToValue<TKV>(FastllmCudaValueToFloat(vBase[i]));
+            FastllmWritePagedKV(pagedVData, vBase + i,
+                (size_t)pageIdx * pageStride + pageOffset * tokenStride + vh * headDim + i,
+                pageStride);
         }
     }
 }
@@ -14029,6 +14030,8 @@ bool FastllmCudaQwen35QGateKVRMSNormRopeSplitAppendPagedCache(
             launch(TPB, qgatekvPtr, qOutputPtr, gateOutputPtr, (__nv_bfloat16*)nullptr);
         } else if (pagedDataType == fastllm::DataType::FP8_E4M3) {
             launch(TPB, qgatekvPtr, qOutputPtr, gateOutputPtr, (__nv_fp8_e4m3*)nullptr);
+        } else if (pagedDataType == fastllm::DataType::FP4_E2M1) {
+            launch(TPB, qgatekvPtr, qOutputPtr, gateOutputPtr, (uint8_t*)nullptr);
         } else {
             fastllm::ErrorInFastLLM("FastllmCudaQwen35QGateKVRMSNormRopeSplitAppendPagedCache: unsupported pagedDataType.\n");
         }
