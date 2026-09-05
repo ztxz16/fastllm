@@ -3913,7 +3913,6 @@ namespace {
             return;
         }
 
-        ScopedEnvOverride forceMarlin("FASTLLM_CUDA_NVFP4_MARLIN", "1");
         ScopedNcclForceSyncRestore restoreForceSync;
 
         constexpr float globalScale = 1.0f / 256.0f;
@@ -3990,6 +3989,110 @@ namespace {
                         ToFloatVector(actualSingle),
                         2.0e-2f, 2.0e-3f,
                         "NVFP4 Marlin batch-one output without bias");
+
+        // Unaligned TP projections retain their logical shape while Marlin
+        // pads only the packed output channels. Include odd row strides,
+        // the K64/N128 tile, small scratch fallback, and the production shape.
+        for (const auto &shape : std::vector<std::pair<int, int>>{
+                 {208, 256}, {255, 128}, {257, 128},
+                 {208, 192}, {8240, 5120}}) {
+            const int logicalN = shape.first;
+            const int sizeK = shape.second;
+            fastllm::Data nativeWeight = MakeNvfp4Block16Weight(
+                logicalN, sizeK, globalScale);
+            fastllm::Data paddedWeight = MakeNvfp4Block16Weight(
+                logicalN, sizeK, globalScale);
+            void *originalStorage = paddedWeight.cudaData;
+            const uint64_t originalBytes = paddedWeight.GetBytes();
+            fastllm::Data paddedBias = MakeCudaTensor(
+                fastllm::DataType::FLOAT32, {logicalN},
+                MakeRegressionValues(logicalN, 0.31f, 0.015f));
+
+            for (int rows : {1, 8, 31, 65}) {
+                const std::string label = "NVFP4 Marlin padded N=" +
+                    std::to_string(logicalN) + " K=" + std::to_string(sizeK) +
+                    " M=" + std::to_string(rows);
+                fastllm::Data x = MakeCudaTensor(
+                    fastllm::DataType::FLOAT16, {rows, sizeK},
+                    MakeRegressionValues(rows * sizeK, 0.53f, 0.08f));
+                fastllm::Data expected = MakeCudaTensor(
+                    fastllm::DataType::FLOAT16, {rows, logicalN},
+                    std::vector<float>((size_t)rows * logicalN, 0.0f));
+                fastllm::Data observed = MakeCudaTensor(
+                    fastllm::DataType::FLOAT16, {rows, logicalN},
+                    std::vector<float>((size_t)rows * logicalN, 0.0f));
+                const fastllm::Data &selectedBias = rows == 1 || rows == 31
+                    ? noBias : paddedBias;
+                FastllmCudaSetNcclForceSync(false);
+                Expect(FastllmCudaHalfMatMulFloatNVFP4Block16(
+                           x, nativeWeight, selectedBias, expected,
+                           rows, sizeK, logicalN), label + " native reference failed");
+                // Only the first small-M warmup may change the weight layout.
+                FastllmCudaSetNcclForceSync(rows == 1);
+                Expect(FastllmCudaHalfMatMulFloatNVFP4Block16(
+                           x, paddedWeight, selectedBias, observed,
+                           rows, sizeK, logicalN), label + " execution failed");
+                FastllmCudaSyncCurrentThreadStream();
+                Expect(FastllmCudaHasNVFP4MarlinLayout(paddedWeight),
+                       label + " did not use Marlin");
+                Expect(!nativeWeight.IsRepacked, label + " reference was repacked");
+                Expect(paddedWeight.dims == nativeWeight.dims &&
+                           paddedWeight.cudaData == originalStorage &&
+                           paddedWeight.GetBytes() == originalBytes,
+                       label + " changed the logical shape or weight allocation");
+                const std::vector<float> expectedValues = ToFloatVector(expected);
+                ExpectFloatNear(expectedValues, ToFloatVector(observed),
+                                2.0e-2f, 2.0e-3f, label);
+
+                if (rows == 8) {
+                    // Exercise both tail-resident and pooled padded outputs
+                    // under graph capture, repeated replay, and pool reuse.
+                    FastllmCudaSetNcclForceSync(false);
+                    void *graph = nullptr;
+                    void *graphExec = nullptr;
+                    Expect(FastllmCudaGraphBeginCapture(), label + " graph begin failed");
+                    Expect(FastllmCudaHalfMatMulFloatNVFP4Block16(
+                               x, paddedWeight, selectedBias, observed,
+                               rows, sizeK, logicalN), label + " graph execution failed");
+                    Expect(FastllmCudaGraphEndCapture(&graph) && graph != nullptr,
+                           label + " graph capture failed");
+                    Expect(FastllmCudaGraphInstantiate(graph, &graphExec) && graphExec,
+                           label + " graph instantiation failed");
+                    for (int replay = 0; replay < 2; replay++) {
+                        FastllmCudaMemset0(observed.cudaData, observed.GetBytes());
+                        Expect(FastllmCudaGraphLaunch(graphExec), label + " graph replay failed");
+                        FastllmCudaSyncCurrentThreadStream();
+                        ExpectFloatNear(expectedValues, ToFloatVector(observed),
+                                        2.0e-2f, 2.0e-3f, label + " graph output");
+                    }
+                    FastllmCudaGraphExecDestroy(graphExec);
+                    FastllmCudaGraphDestroy(graph);
+                }
+            }
+        }
+
+        // In-place padding must decline before touching the source when its
+        // allocation is too small, or the input channels still cannot tile.
+        for (const auto &shape : std::vector<std::pair<int, int>>{
+                 {24, 128}, {257, 144}}) {
+            const int logicalN = shape.first, sizeK = shape.second;
+            fastllm::Data weight = MakeNvfp4Block16Weight(logicalN, sizeK, globalScale);
+            std::vector<uint8_t> before(weight.GetBytes()), after(weight.GetBytes());
+            FastllmCudaCopyFromDeviceToHost(before.data(), weight.cudaData, before.size());
+            fastllm::Data x = MakeCudaTensor(
+                fastllm::DataType::FLOAT16, {1, sizeK},
+                MakeRegressionValues(sizeK, 0.23f, 0.08f));
+            fastllm::Data y = MakeCudaTensor(
+                fastllm::DataType::FLOAT16, {1, logicalN},
+                std::vector<float>(logicalN, 0.0f));
+            FastllmCudaSetNcclForceSync(true);
+            Expect(!FastllmCudaTryMarlinHalfMatMulFloatNVFP4Block16(
+                       x, weight, noBias, y, 1, sizeK, logicalN),
+                   "NVFP4 Marlin unsafe padded shape was accepted");
+            FastllmCudaCopyFromDeviceToHost(after.data(), weight.cudaData, after.size());
+            Expect(!weight.IsRepacked && before == after,
+                   "NVFP4 Marlin padding fallback changed the source layout");
+        }
         std::cout << "CUDA NVFP4 Marlin regression: PASS\n";
     }
 
@@ -14626,6 +14729,14 @@ int main(int argc, char **argv) {
             return 0;
         }
 #ifdef USE_CUDA
+#ifndef USE_ROCM
+        if (argc == 2 && std::string(argv[1]) == "--cuda-nvfp4-marlin") {
+            Expect(FastllmCudaGetDeviceCount() > 0,
+                   "NVFP4 Marlin regression requires CUDA.");
+            RunCudaNVFP4MarlinRegression();
+            return 0;
+        }
+#endif
         if (argc == 2 &&
             std::string(argv[1]) == "--cuda-fp8-sm70-turbomind") {
             Expect(FastllmCudaGetDeviceCount() > 0,
