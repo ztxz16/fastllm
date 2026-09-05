@@ -451,13 +451,16 @@ if ((run_tests)); then
     "${bundle_dir}/ftllm/python" "${ROOT_DIR}/portable/smoke_agent.py" --check-studio
     if command -v xvfb-run >/dev/null 2>&1; then
         smoke_data="${build_root}/electron-smoke-data"
+        smoke_log="${build_root}/electron-smoke.log"
         set +e
         FTLLM_LAUNCHER_DATA_DIR="$smoke_data" timeout --signal=TERM 15s \
-            xvfb-run -a "${bundle_dir}/FastLLM-Launcher" --disable-gpu >/dev/null 2>&1
+            xvfb-run -a "${bundle_dir}/FastLLM-Launcher" --disable-gpu >"$smoke_log" 2>&1
         smoke_status=$?
         set -e
-        [[ "$smoke_status" == 0 || "$smoke_status" == 124 ]] \
-            || die "Electron Launcher 冒烟测试失败，退出码 ${smoke_status}"
+        if [[ "$smoke_status" != 0 && "$smoke_status" != 124 ]]; then
+            tail -n 40 "$smoke_log" >&2
+            die "Electron Launcher 冒烟测试失败，退出码 ${smoke_status}"
+        fi
         grep -F "Starting bundled ftllm launch" "${smoke_data}/logs/desktop.log" >/dev/null \
             || die "Electron Launcher 未启动 ftllm launch"
     else

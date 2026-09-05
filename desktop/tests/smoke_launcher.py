@@ -11,6 +11,7 @@ import re
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -118,6 +119,12 @@ def main() -> int:
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=10) as response:
                 if b"FastLLM" not in response.read(65536):
                     raise RuntimeError("launcher root did not return the FastLLM UI")
+            for asset in ("app.js", "styles.css", "template.html", "standalone.js"):
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/assets/webui/{asset}", timeout=10
+                ) as response:
+                    if response.status != 200 or not response.read():
+                        raise RuntimeError(f"missing shared Studio asset: {asset}")
         finally:
             stop_process_group(process)
 

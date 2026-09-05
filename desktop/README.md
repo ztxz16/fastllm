@@ -40,6 +40,7 @@ Pi 使用 `tools/ftllm_agent_runtime/scripts/fetch_pi.py` 固定并校验的版�
 打包时从当前仓库构建 Agent wheel，构建工具在临时环境中安装；下载缓存位于
 `build-portable-cache/`。完整在线构建一次后可使用 `--offline` 复用缓存。
 默认测试包括包内 Pi 的实际启动、临时项目文件读取及本地模拟模型的工具调用往返。
+动态库收集同时包含 NSS 运行时加载的模块，以保证 Electron 能初始化证书和网络功能。
 
 ## 设计边界
 
