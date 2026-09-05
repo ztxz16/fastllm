@@ -507,9 +507,10 @@ def _qwen35_gguf_needs_low_memory_fast_paths(args) -> bool:
 def _configure_qwen35_auto_fast_paths(args, is_qwen35_model: bool, mtp: int):
     """Select tested Qwen3.5 CUDA fast paths without deployment env vars.
 
-    Environment variables remain authoritative debugging overrides.  The
+    Environment variables remain authoritative debugging overrides, except
+    --low_gpu_mem always disables CUDA embedding and GPU token handoff. The
     automatic path is limited to ordinary single-GPU CUDA or CUDA thread TP,
-    no MTP or external DFlash, and no low-memory mode. DFlash keeps the
+    no MTP or external DFlash, and no --low mode. DFlash keeps the
     embedding table on the host by default; its target and draft paths share
     one table dtype and only transfer the selected hidden rows.
     """
@@ -525,6 +526,15 @@ def _configure_qwen35_auto_fast_paths(args, is_qwen35_model: bool, mtp: int):
                 cuda_execution and _uses_cuda_device(device))
 
     handoff_env = "FASTLLM_GPU_TOKEN_HANDOFF"
+    low_gpu_mem = bool(getattr(args, "low_gpu_mem", False))
+    if low_gpu_mem:
+        args.cuda_embedding = False
+        os.environ[handoff_env] = "0"
+        print(
+            "[Fastllm] --low_gpu_mem: CUDA embedding and GPU token handoff "
+            "disabled; CUDA graph selection is unchanged.",
+            flush=True,
+        )
     low_memory_gguf = eligible and _qwen35_gguf_needs_low_memory_fast_paths(
         args)
     if eligible and "FASTLLM_CUDA_GRAPH" not in os.environ:
@@ -553,7 +563,7 @@ def _configure_qwen35_auto_fast_paths(args, is_qwen35_model: bool, mtp: int):
 
     graph_enabled = _fastllm_env_flag_enabled("FASTLLM_CUDA_GRAPH")
     handoff_enabled = _fastllm_env_flag_enabled(handoff_env)
-    if is_qwen35_model and (
+    if is_qwen35_model and not low_gpu_mem and (
             handoff_enabled or (graph_enabled and not low_memory_gguf)):
         # Qwen3.5 handoff keeps sampled tokens on device, and graph replay also
         # benefits from avoiding a host embedding round trip.
@@ -703,6 +713,8 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('-p', '--path', type = str, required = False, default = '', help = '模型路径，fastllm模型文件或HF模型文件夹')
     parser.add_argument('-t', '--threads', type = int, default = -1,  help = '线程数量')
     parser.add_argument('-l', '--low', action = 'store_true', help = '是否使用低内存模式')
+    parser.add_argument('--low_gpu_mem', action = 'store_true',
+                        help = '降低显存占用：强制关闭CUDA embedding和GPU token handoff，保留原有CUDA Graph策略；优先于--cuda_embedding及handoff环境变量')
     parser.add_argument('--dtype', type = str, default = "auto", help = '权重类型（读取HF模型时有效；auto默认使用float16，带缩放因子的FP8源权重保持FP8）')
     parser.add_argument('--moe_dtype', type = str, default = "", help = 'MOE层使用的权重类型（读取HF模型时有效）')
     parser.add_argument('--moe_atype', type = str, default = "", help = 'MOE层激活类型，可使用auto、float32、float16或bfloat16')
@@ -1479,8 +1491,8 @@ def make_normal_llm_model(args, startup_progress = None):
                 llm.set_device_map(args.moe_device, True)
     llm.set_cpu_threads(args.threads)
     llm.set_cpu_low_mem(args.low)
-    if (args.cuda_embedding):
-        llm.set_cuda_embedding(True)
+    if (args.cuda_embedding or getattr(args, "low_gpu_mem", False)):
+        llm.set_cuda_embedding(bool(args.cuda_embedding))
     llm.set_cuda_shared_expert(
         args.cuda_shared_expert.lower() not in ["", "false", "0", "off"]
     )
