@@ -110,14 +110,18 @@ class LauncherWebUITest(unittest.TestCase):
         self.runtime._process = None
         self.assertEqual(self.client.get(self.base + '/').status_code, 409)
 
-    def test_remote_launcher_preserves_webui_workspace_policy(self):
+    def test_remote_launcher_enables_workspace_agent_by_default(self):
+        self.runtime._agent_workspace_root = self.temp.name
         remote = TestClient(create_launcher_app(self.runtime, 'launcher-key', launcher_host='0.0.0.0'))
         try:
-            response = remote.post('/api/webui/open', headers=self.headers, json={'sessionId': 'model-a'})
+            fake_pi = lambda **kwargs: SimpleNamespace(info=lambda: {'available': True})
+            with patch.dict(sys.modules, {'ftllm_agent_runtime': SimpleNamespace(PiAgentRuntime=fake_pi)}):
+                response = remote.post('/api/webui/open', headers=self.headers, json={'sessionId': 'model-a'})
             self.assertEqual(response.status_code, 200)
             config = remote.get(self.base + '/api/config').json()
-            self.assertFalse(config['workspace_agent_enabled'])
-            self.assertEqual(remote.get(self.base + '/api/agent/directories').status_code, 403)
+            self.assertTrue(config['workspace_agent_enabled'])
+            self.assertFalse(config['workspace_agent_disabled'])
+            self.assertEqual(remote.get(self.base + '/api/agent/directories').status_code, 200)
         finally:
             remote.close()
 
@@ -137,6 +141,76 @@ class LauncherWebUITest(unittest.TestCase):
         self.runtime._process = None
         self.runtime.stop()
         self.assertIsNone(self.runtime._webui_app)
+
+    def test_remote_workspace_preserves_selected_root_and_authentication(self):
+        root = os.path.join(self.temp.name, 'projects')
+        os.mkdir(root)
+        os.mkdir(os.path.join(root, 'demo'))
+        runtime = LauncherRuntime(
+            os.path.join(self.temp.name, 'remote-profiles.json'),
+            webui_history_dir=os.path.join(self.temp.name, 'remote-history'),
+            agent_workspace_root=root)
+        runtime._process = SimpleNamespace(poll=lambda: None)
+        runtime._state.update(self.runtime._state)
+        client = TestClient(create_launcher_app(runtime, 'launcher-key', launcher_host='0.0.0.0'))
+        fake_pi = lambda **kwargs: SimpleNamespace(info=lambda: {'available': True})
+        try:
+            with patch.dict(sys.modules, {'ftllm_agent_runtime': SimpleNamespace(PiAgentRuntime=fake_pi)}):
+                self.assertEqual(client.get(self.base + '/api/agent/directories').status_code, 403)
+                opened = client.post('/api/webui/open', headers=self.headers, json={'sessionId': 'model-a'})
+                self.assertEqual(opened.status_code, 200, opened.text)
+                config = client.get(self.base + '/api/config').json()
+                self.assertTrue(config['workspace_agent_enabled'])
+                self.assertTrue(config['pi_agent']['available'])
+                self.assertEqual(config['agent_workspace_root'], root)
+                listing = client.get(self.base + '/api/agent/directories').json()
+                self.assertEqual(listing['path'], root)
+                self.assertEqual(client.get(self.base + '/api/agent/directories',
+                                           params={'path': self.temp.name}).status_code, 400)
+                record = client.post(self.base + '/api/conversations', json={'settings': {
+                    'agent_mode': 'workspace', 'agent_workspace': os.path.join(root, 'demo')}})
+                self.assertEqual(record.status_code, 200, record.text)
+                self.assertEqual(record.json()['settings']['agent_mode'], 'workspace')
+        finally:
+            client.close()
+            runtime._process = None
+            runtime.close()
+
+    def test_disabled_workspace_agent_blocks_directories_creation_and_saved_tasks(self):
+        for host in ('127.0.0.1', '0.0.0.0', '::'):
+            with self.subTest(host=host):
+                runtime = LauncherRuntime(
+                    os.path.join(self.temp.name, 'disabled-profiles.json'),
+                    webui_history_dir=os.path.join(self.temp.name, 'disabled-history'),
+                    agent_workspace_root=self.temp.name,
+                    allow_remote_workspace_agent=True, disable_workspace_agent=True)
+                runtime._process = SimpleNamespace(poll=lambda: None)
+                runtime._state.update(self.runtime._state)
+                client = TestClient(create_launcher_app(runtime, 'launcher-key', launcher_host=host))
+                try:
+                    response = client.post('/api/webui/open', headers=self.headers, json={'sessionId': 'model-a'})
+                    self.assertEqual(response.status_code, 200, response.text)
+                    config = client.get(self.base + '/api/config').json()
+                    self.assertFalse(config['workspace_agent_enabled'])
+                    self.assertTrue(config['workspace_agent_disabled'])
+                    self.assertEqual(client.get(self.base + '/api/agent/directories').status_code, 403)
+                    settings = {'agent_mode': 'workspace', 'agent_workspace': self.temp.name}
+                    response = client.post(self.base + '/api/conversations', json={'settings': settings})
+                    self.assertEqual(response.status_code, 503, response.text)
+                    self.assertIn('--disable-workspace-agent', response.text)
+                    # A previously saved Agent must not bypass the startup switch.
+                    webui = runtime._webui_app.state.runtime
+                    saved = webui.store.create_conversation(settings=settings)
+                    with patch.object(webui, '_get_pi_agent') as pi:
+                        response = client.post(self.base + '/api/conversations/' + saved + '/chat',
+                                               json={'prompt': 'Do not run this task'})
+                        self.assertIn('--disable-workspace-agent', response.text)
+                        pi.assert_not_called()
+                    self.assertEqual(client.post(self.base + '/api/conversations', json={}).status_code, 200)
+                finally:
+                    client.close()
+                    runtime._process = None
+                    runtime.close()
 
     def test_stop_cancels_every_active_webui_generation(self):
         self.open()

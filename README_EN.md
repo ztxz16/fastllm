@@ -98,6 +98,8 @@ x86-64, build and install the companion wheel as described in
 Pi, so Node.js, npm, and Bun are not required. Use `--agent-runtime builtin`
 to select the original single-call paths when the companion wheel is absent.
 
+Launcher automatically uses an installed Pi runtime. **New Agent** lets you select a project directory; use `ftllm launch --agent-workspace-root /path/to/projects` to set the selectable root (your home directory by default). Directory agents are enabled by default on both local and remote Launcher listeners, for example `ftllm launch --host 0.0.0.0 --agent-workspace-root /path/to/projects`. Use `--disable-workspace-agent` to disable directory browsing, creating directory agents, and executing saved directory-agent tasks; ordinary chat remains available. Directory agents can modify files and execute commands, so restrict access to trusted users. The interface explains when the runtime is unavailable or directory agents have been disabled.
+
 For `run`, `server`, and `export`, the `model` positional argument can be a Hugging Face repository ID, a local Hugging Face model directory, an exported FastLLM model, or a configuration file:
 
 ~~~bash

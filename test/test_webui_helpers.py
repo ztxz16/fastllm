@@ -426,6 +426,8 @@ class OpenAIModelClientTests(unittest.TestCase):
         self.assertEqual(args.agent_runtime, "builtin")
         self.assertEqual(args.agent_workspace_root, "/srv/projects")
         self.assertFalse(args.allow_remote_workspace_agent)
+        self.assertFalse(args.disable_workspace_agent)
+        self.assertTrue(parser.parse_args(['--disable-workspace-agent']).disable_workspace_agent)
         self.assertEqual(
             parser.parse_args(["/models/demo"]).agent_runtime, "pi")
         self.assertEqual(parser.parse_args([

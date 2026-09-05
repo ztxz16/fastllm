@@ -103,7 +103,7 @@ export async function mountWebUI(host, {basePath = "", embedded = false, locale 
 
     function applyLocale() {
       host.lang = state.locale; if (!embedded) document.documentElement.lang = state.locale; root.querySelectorAll("[data-i18n]").forEach(node => node.textContent = t(node.dataset.i18n)); root.querySelectorAll("[data-i18n-placeholder]").forEach(node => node.placeholder = t(node.dataset.i18nPlaceholder)); root.querySelectorAll("[data-i18n-title]").forEach(node => node.title = t(node.dataset.i18nTitle)); root.querySelectorAll("[data-i18n-aria]").forEach(node => node.setAttribute("aria-label",t(node.dataset.i18nAria)));
-      $("#languageLabel").textContent = t("locale.short"); renderLanguageMenu(); if (state.config.model) $("#modelName").textContent = state.config.model; renderSidebar(); renderPending(); if (state.record) { renderMessages(); renderModes(); } if ($("#workspaceDialog").open) renderWorkspaceDirectory(); syncGenerationUI();
+      $("#languageLabel").textContent = t("locale.short"); renderLanguageMenu(); if (state.config.model) $("#modelName").textContent = state.config.model; renderSidebar(); renderPending(); if (state.record) { renderMessages(); renderModes(); } if ($("#workspaceDialog").open) renderWorkspaceDirectory(); renderWorkspaceAvailability(); syncGenerationUI();
     }
 
     function setLocale(locale) {
@@ -427,8 +427,27 @@ export async function mountWebUI(host, {basePath = "", embedded = false, locale 
       finally { state.workspaceLoading = false; renderWorkspaceDirectory(); }
     }
 
+    function workspaceUnavailableReason() {
+      const reasons = [];
+      if (!state.config.pi_agent?.available) reasons.push(t("workspace.runtime_required"));
+      if (!state.config.workspace_agent_enabled) reasons.push(t(
+        state.config.workspace_agent_disabled ? "workspace.disabled" : "workspace.remote_disabled"));
+      return reasons.join("\n");
+    }
+
+    function renderWorkspaceAvailability() {
+      if (!("workspace_agent_enabled" in state.config)) return;
+      const reason = workspaceUnavailableReason();
+      $("#newAgent").disabled = Boolean(reason);
+      $("#newAgent").title = reason;
+      $("#agentUnavailable").hidden = !reason;
+      $("#agentUnavailable").textContent = reason;
+      $("#agentUnavailable").title = state.config.pi_agent?.error || "";
+    }
+
     async function openWorkspaceDialog() {
-      if (!state.config.workspace_agent_enabled || !state.config.pi_agent?.available) { toast(t("workspace.unavailable")); return; }
+      const reason = workspaceUnavailableReason();
+      if (reason) { toast(reason); return; }
       state.workspaceDirectory = null; $("#workspaceDialog").showModal(); await loadWorkspaceDirectory(state.config.agent_workspace_root || ""); $("#workspacePath").focus();
     }
 
@@ -643,9 +662,7 @@ export async function mountWebUI(host, {basePath = "", embedded = false, locale 
       state.config = await (await api("/api/config")).json();
       if (!embedded) document.title = state.config.title || "FastLLM";
       $("#modelName").textContent = state.config.model;
-      const workspaceAvailable = state.config.workspace_agent_enabled && state.config.pi_agent?.available;
-      $("#newAgent").disabled = !workspaceAvailable;
-      $("#newAgent").title = workspaceAvailable ? "" : t("workspace.unavailable");
+      renderWorkspaceAvailability();
       $("#fileInput").accept = ["image/*","video/*","text/*",...(state.config.upload_extensions || [])].join(",");
       await refreshConversations();
       if (!state.conversations.length) await newConversation();

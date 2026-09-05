@@ -22,6 +22,17 @@ class CliLaunchTest(unittest.TestCase):
         self.assertEqual(args.host, "127.0.0.1")
         self.assertEqual(args.port, 8000)
         self.assertFalse(args.no_browser)
+        self.assertTrue(args.allow_remote_workspace_agent)
+        self.assertFalse(args.disable_workspace_agent)
+        self.assertEqual(args.agent_workspace_root, "")
+
+    def test_launcher_accepts_explicit_workspace_agent_options(self):
+        args = cli.args_parser().parse_args([
+            "launch", "--host", "0.0.0.0", "--allow-remote-workspace-agent",
+            "--agent-workspace-root", "/srv/projects",
+        ])
+        self.assertTrue(args.allow_remote_workspace_agent)
+        self.assertEqual(args.agent_workspace_root, "/srv/projects")
 
     def test_no_arguments_start_launcher_and_open_browser_by_default(self):
         with patch(
@@ -36,6 +47,14 @@ class CliLaunchTest(unittest.TestCase):
         self.assertEqual(args.host, "127.0.0.1")
         self.assertEqual(args.port, 8000)
         self.assertFalse(args.no_browser)
+        self.assertFalse(args.disable_workspace_agent)
+        self.assertTrue(args.allow_remote_workspace_agent)
+
+    def test_workspace_agent_can_be_disabled_even_with_legacy_allow_flag(self):
+        for options in [[], ['--host', '0.0.0.0'], ['--allow-remote-workspace-agent']]:
+            with self.subTest(options=options):
+                args = cli.args_parser().parse_args(['launch', '--disable-workspace-agent', *options])
+                self.assertTrue(args.disable_workspace_agent)
 
     def test_launcher_can_listen_on_all_interfaces(self):
         args = cli.args_parser().parse_args(

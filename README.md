@@ -97,6 +97,8 @@ WebUI 不会在自身进程内加载模型，请先启动 OpenAI 兼容 API Serv
 该 wheel 已包含 Pi，不需要 Node.js、npm 或 Bun。尚未安装时可通过
 `--agent-runtime builtin` 使用原有单轮链路。
 
+Launcher 会自动使用已安装的 Pi 运行时；「新建 Agent」可选择工作目录。通过 `ftllm launch --agent-workspace-root /path/to/projects` 指定可选目录的根路径，默认为用户主目录。Launcher 的目录 Agent 默认启用，本机和远程监听均可使用，例如 `ftllm launch --host 0.0.0.0 --agent-workspace-root /path/to/projects`。使用 `--disable-workspace-agent` 可关闭目录 Agent，同时禁止目录浏览、新建目录 Agent 及继续执行已保存的目录 Agent 任务；普通对话仍可使用。目录 Agent 可修改文件和执行命令，请仅对可信用户开放。运行时缺失或目录 Agent 被关闭时，界面会显示原因。
+
 对于 `run`、`server` 和 `export`，`model` 位置参数既可以是 Hugging Face 仓库 ID，也可以是本地 Hugging Face 模型目录、FastLLM 模型文件或配置文件。例如：
 
 ~~~bash

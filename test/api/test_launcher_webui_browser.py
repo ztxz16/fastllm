@@ -314,6 +314,73 @@ class LauncherWebUIBrowserTest(unittest.TestCase):
             expect(pane.locator('#stopButton')).to_be_hidden()
             self.assertTrue(all(control.cancelled for control in controls))
 
+    def test_workspace_agent_can_select_a_project_and_chat(self):
+        workspace = os.path.join(self.temp.name, 'projects')
+        project = os.path.join(workspace, 'demo')
+        os.makedirs(project)
+        self.runtime._agent_workspace_root = workspace
+        calls = []
+
+        def stream(**kwargs):
+            calls.append(kwargs)
+            yield {'type': 'tool_start', 'id': 'read-project', 'name': 'read',
+                   'arguments': {'path': 'README.md'}}
+            yield {'type': 'tool_end', 'id': 'read-project', 'name': 'read',
+                   'result': 'Demo project', 'is_error': False}
+            yield {'type': 'text_delta', 'text': 'Project inspected.'}
+            yield {'type': 'done', 'turns': 1}
+
+        fake_pi = lambda **kwargs: SimpleNamespace(
+            info=lambda: {'available': True}, stream=stream)
+        with patch.dict(sys.modules, {'ftllm_agent_runtime': SimpleNamespace(PiAgentRuntime=fake_pi)}):
+            self.page.locator('#open-webui').click()
+            self.assert_loaded()
+            pane = self.page.locator('#webui-content')
+            expect(pane.locator('#newAgent')).to_be_enabled()
+            expect(pane.locator('#agentUnavailable')).to_be_hidden()
+            pane.locator('#newAgent').click()
+            expect(pane.locator('#workspaceDialog')).to_be_visible()
+            pane.locator('.workspace-directory').filter(has_text='demo').click()
+            expect(pane.locator('#workspacePath')).to_have_value(project)
+            pane.locator('#createWorkspace').click()
+            expect(pane.locator('#workspaceContextPath')).to_have_text(project)
+            pane.locator('#prompt').fill('Inspect this project')
+            pane.locator('#sendButton').click()
+            expect(pane.locator('.message.assistant')).to_contain_text('Project inspected.')
+            expect(pane.locator('#stopButton')).to_be_hidden()
+            self.assertEqual(str(calls[0]['working_directory']), project)
+            self.screenshot('launcher-pi-agent')
+
+    def test_workspace_unavailable_reason_explains_runtime_and_remote_policy(self):
+        def config(route):
+            response = route.fetch()
+            data = response.json()
+            data.update(workspace_agent_enabled=False, pi_agent={'available': False, 'error': 'Missing runtime'})
+            route.fulfill(response=response, json=data)
+
+        self.page.route('**/webui/*/api/config', config)
+        self.page.locator('#open-webui').click()
+        self.assert_loaded()
+        pane = self.page.locator('#webui-content')
+        expect(pane.locator('#newAgent')).to_be_disabled()
+        expect(pane.locator('#agentUnavailable')).to_contain_text('Install ftllm-agent-runtime')
+        expect(pane.locator('#agentUnavailable')).to_contain_text('--allow-remote-workspace-agent')
+        self.page.locator('#language-select').select_option('zh-CN')
+        expect(pane.locator('#agentUnavailable')).to_contain_text('目录 Agent 未对远程访问开放')
+        expect(self.page.locator('[data-view-button="webui"]')).to_have_text('工作室')
+        expect(self.page.locator('#current-view-title')).to_have_text('工作室')
+
+    def test_workspace_disabled_option_has_its_own_explanation(self):
+        self.runtime._disable_workspace_agent = True
+        self.page.locator('#open-webui').click()
+        self.assert_loaded()
+        pane = self.page.locator('#webui-content')
+        expect(pane.locator('#newAgent')).to_be_disabled()
+        expect(pane.locator('#agentUnavailable')).to_contain_text('Remove --disable-workspace-agent')
+        expect(pane.locator('#newChat')).to_be_enabled()
+        self.page.locator('#language-select').select_option('zh-CN')
+        expect(pane.locator('#agentUnavailable')).to_contain_text('目录 Agent 已关闭')
+
     def test_standalone_webui_uses_the_same_component(self):
         self.page.goto(self.url + '/standalone/')
         pane = self.page.locator('#webui-root')

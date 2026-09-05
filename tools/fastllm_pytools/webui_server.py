@@ -220,6 +220,10 @@ def add_webui_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         dest="allow_remote_workspace_agent", action="store_true",
         help="允许非本机监听地址启用可执行命令的目录 Agent（有安全风险）")
     parser.add_argument(
+        "--disable_workspace_agent", "--disable-workspace-agent",
+        dest="disable_workspace_agent", action="store_true",
+        help="关闭目录 Agent，本机和远程访问均生效")
+    parser.add_argument(
         "--api_base", "--api-base", dest="api_base", type=str,
         default="http://127.0.0.1:8080/v1",
         help="OpenAI 兼容 API 地址；WebUI 不再在进程内加载模型")
@@ -538,7 +542,8 @@ class WebUIRuntime:
             raise ValueError(
                 f"Agent 工作目录根路径不是目录：{self.agent_workspace_root}")
         host = str(getattr(args, "host", "127.0.0.1")).strip().lower()
-        self.workspace_agent_enabled = (
+        self.workspace_agent_disabled = bool(getattr(args, "disable_workspace_agent", False))
+        self.workspace_agent_enabled = not self.workspace_agent_disabled and (
             host in {"127.0.0.1", "localhost", "::1"}
             or bool(getattr(args, "allow_remote_workspace_agent", False))
         )
@@ -728,6 +733,8 @@ class WebUIRuntime:
         if str(normalized.get("agent_mode", "chat")) != "workspace":
             return normalized
         if not self.workspace_agent_enabled:
+            if self.workspace_agent_disabled:
+                raise RuntimeError("目录 Agent 已通过 --disable-workspace-agent 关闭")
             raise RuntimeError(
                 "目录 Agent 默认只允许本机监听；如需远程开放，请显式传入 "
                 "--allow-remote-workspace-agent")
@@ -2381,6 +2388,7 @@ def create_app(args: argparse.Namespace):
             "pi_agent": runtime.pi_agent_info(),
             "agent_workspace_root": str(runtime.agent_workspace_root),
             "workspace_agent_enabled": runtime.workspace_agent_enabled,
+            "workspace_agent_disabled": runtime.workspace_agent_disabled,
             "upload_extensions": sorted(
                 DOCUMENT_EXTENSIONS
                 | CODE_EXTENSIONS
@@ -2396,7 +2404,9 @@ def create_app(args: argparse.Namespace):
     def agent_directories(path: str = ""):
         if not runtime.workspace_agent_enabled:
             raise HTTPException(
-                status_code=403, detail="目录 Agent 未对远程监听地址开放")
+                status_code=403, detail=(
+                    "目录 Agent 已通过 --disable-workspace-agent 关闭"
+                    if runtime.workspace_agent_disabled else "目录 Agent 未对远程监听地址开放"))
         if runtime.agent_runtime != "pi":
             raise HTTPException(
                 status_code=503, detail="新建 Agent 需要可用的 Pi 智能体运行时")

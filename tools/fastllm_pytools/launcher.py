@@ -395,7 +395,9 @@ class LauncherRuntime:
     cannot overwrite the state of a replacement process.
     """
 
-    def __init__(self, config_path: str = "", popen_factory=None, webui_history_dir: str = ""):
+    def __init__(self, config_path: str = "", popen_factory=None, webui_history_dir: str = "",
+                 agent_workspace_root: str = "", allow_remote_workspace_agent: bool = True,
+                 disable_workspace_agent: bool = False):
         self.config_path = os.path.abspath(os.path.expanduser(
             config_path or get_saved_commands_path()
         ))
@@ -409,6 +411,9 @@ class LauncherRuntime:
         self._webui_app = None
         self._webui_session = ""
         self._webui_history_dir = webui_history_dir
+        self._agent_workspace_root = agent_workspace_root
+        self._allow_remote_workspace_agent = allow_remote_workspace_agent
+        self._disable_workspace_agent = disable_workspace_agent
         self._download_process = None
         self._download_generation = 0
         self._download_stopping_generation = -1
@@ -456,6 +461,10 @@ class LauncherRuntime:
             args.api_key = self._service_api_key
             args.agent_runtime = "auto"
             args.embedded = True
+            args.allow_remote_workspace_agent = self._allow_remote_workspace_agent
+            args.disable_workspace_agent = self._disable_workspace_agent
+            if self._agent_workspace_root:
+                args.agent_workspace_root = self._agent_workspace_root
             if self._webui_history_dir:
                 args.history_dir = self._webui_history_dir
             self._webui_app = create_app(args)
@@ -2295,7 +2304,12 @@ def fastllm_launcher(args) -> int:
         return 1
 
     control_token = secrets.token_urlsafe(32)
-    runtime = LauncherRuntime(getattr(args, "config", ""))
+    runtime = LauncherRuntime(
+        getattr(args, "config", ""),
+        agent_workspace_root=getattr(args, "agent_workspace_root", ""),
+        allow_remote_workspace_agent=bool(getattr(args, "allow_remote_workspace_agent", True)),
+        disable_workspace_agent=bool(getattr(args, "disable_workspace_agent", False)),
+    )
     launcher_addresses = _launcher_access_addresses(host, port)
     try:
         app = create_launcher_app(runtime, control_token, launcher_addresses, launcher_host=host)

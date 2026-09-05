@@ -463,6 +463,7 @@ dialog::backdrop { background: rgba(29,33,49,.3); backdrop-filter: blur(4px); }
 .agent-card[data-agent="knowledge"] .agent-card-icon { background: linear-gradient(145deg,#55af8c,#2b8061); }.agent-card[data-agent="data"] .agent-card-icon { background: linear-gradient(145deg,#43a7b7,#277584); }.agent-card[data-agent="ppt"] .agent-card-icon { background: linear-gradient(145deg,#ef746b,#ca3f3b); }.agent-card[data-agent="code"] .agent-card-icon { background: linear-gradient(145deg,#64748b,#334155); }.agent-card[data-agent^="web"] .agent-card-icon { background: linear-gradient(145deg,#8c70e7,#6049c2); }
 .agent-card-copy { min-width: 0; flex: 1; }.agent-card-copy strong { display: block; color: #343946; font-size: 12px; }.agent-card-copy p { margin: 6px 0 0; color: #8a909d; font-size: 10px; line-height: 1.55; }.agent-card-copy small { display: inline-block; margin-top: 8px; color: #6673c8; font-size: 8px; font-weight: 700; letter-spacing: .04em; }
 .agent-state { display: none; position: absolute; top: 11px; right: 11px; padding: 3px 7px; color: #5366cf; background: #e9edff; border-radius: 999px; font-size: 8px; font-weight: 700; }.agent-card.selected .agent-state { display: block; }
+.agent-unavailable { margin: 7px 4px 0; color: var(--muted); font-size: 10px; line-height: 1.6; white-space: pre-line; overflow-wrap: anywhere; }
 .sidebar-backdrop { display: none; }
 .empty-error { margin: 80px auto; color: #8b909b; text-align: center; }
 @container (max-width: 760px) {
