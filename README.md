@@ -392,7 +392,7 @@ bash install.sh
 | 发布说明 | [稳定版日志](docs/version.md) · [Nightly 使用](docs/nightly.md) · [Nightly 日志](docs/nightly_changelog.md) |
 | 模型部署 | [Qwen4-Exp](docs/qwen4.md) · [Qwen3.5/3.6/3.8](docs/qwen3.md) · [DeepSeek-V4](docs/deepseek.md) · [Kimi-K3](docs/kimi_k3.md) · [Dots3-Note](docs/dots3_note.md) · [GLM-5](docs/glm5.md) · [Laguna](docs/laguna.md) |
 | 混合推理 | [GPU、NUMA 与磁盘混合部署](docs/mixforward.md) |
-| 性能与验证 | [按模型查看 Benchmark](docs/benchmark.md) |
+| 性能与验证 | [按模型查看 Benchmark](docs/benchmark.md) · [H 系列显卡调优（SM90）](docs/hopper-tuning.md) |
 | 量化 | [动态量化配置](docs/dtype_config.md) |
 | 扩展开发 | [Python 自定义模型](docs/custom.md) · [自定义算子](docs/custom_op.md) |
 | 平台与排错 | [ROCm](docs/rocm.md) · [TFACC](docs/tfacc.md) · [FAQ](docs/faq.md) |

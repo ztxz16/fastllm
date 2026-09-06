@@ -1,5 +1,7 @@
 # 可选的 SM90 FlashInfer GDN prefill
 
+H800 的推荐命令、参数取舍和实测速度，见 [H 系列显卡调优指南](hopper-tuning.md)。
+
 此实验路径复用 FlashInfer 的四个 SM90 CuTe CP kernel，通过现有 Python 编译服务
 导出包含 cubin 和 TMA 描述符构造代码的共享库，由 C++ 调用。GDN kernel 启动不经过 Python。
 
@@ -19,7 +21,8 @@ CUDA Graph capture、其他架构、数据类型和不兼容布局均回退到�
 
 首次编译需要可用的 FlashInfer、CuTe DSL、CUDA Python bindings、CUDA toolkit 和 g++。
 没有增加 fastllm 的默认安装依赖。编译解释器可通过已有的
-`FASTLLM_CUDA_TRITON_PYTHON=/path/to/python` 指定。
+`FASTLLM_CUDA_TRITON_PYTHON=/path/to/python` 指定；但 CLI 的 `--triton` 会用当前
+ftllm 解释器覆盖该值，因此通过 CLI 启动时应直接使用具备可选依赖的 Python 环境。
 共享库仍依赖编译环境的 CUDA/CuTe 运行时动态库；不能将 cubin 单独复制后直接运行。
 已验证环境为 FlashInfer 0.6.16.post3、nvidia-cutlass-dsl 4.6.2、CUDA toolkit 12.8、
 CUDA 13 系列 CuTe 运行时和 H800。其他依赖版本尚未验证。

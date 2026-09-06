@@ -4,6 +4,8 @@
 
 Benchmark 按模型分别整理。测试硬件、推荐启动命令、实测速度和数据限制均放在对应模型页面中。
 
+H800 的 Triton GDN、prefill 分块及可选 FlashInfer 参数，见 [H 系列显卡调优指南（SM90）](hopper-tuning.md)。
+
 ## 模型
 
 - [Qwen4-Exp / Qwen3.8-Flash-Next](benchmarks/qwen4_exp.md)
