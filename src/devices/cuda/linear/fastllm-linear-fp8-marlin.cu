@@ -329,6 +329,16 @@ extern "C" bool FastllmCudaTryMarlinHalfMatMulFloatFP8E4M3(
         return false;
     }
 
+#if defined(FASTLLM_ENABLE_DEEPGEMM_FP8_SM90)
+    // DeepGEMM prefill and native GEMV share row-major weights on SM90.
+    // Preserve fresh eligible weights; already packed weights still use Marlin.
+    if (arch == 90 && k % 128 == 0 &&
+        weight.scales.size() == (size_t)(m / 128) * (k / 128) &&
+        !HasFp8MarlinOnDevice(weight)) {
+        return false;
+    }
+#endif
+
     // Triton SM89 FP8 consumes row-major weights, while Marlin repacks cudaData
     // in place during warmup. Preserve fresh eligible weights so Triton remains
     // available; already packed weights continue using Marlin.

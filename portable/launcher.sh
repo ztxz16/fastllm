@@ -10,6 +10,9 @@ case "$(basename -- "$0")" in
     ftllm)
         exec "${FTLLM_BUNDLE_ROOT}/runtime/bin/python3" -m ftllm.cli "$@"
         ;;
+    ftllm-agent-runtime)
+        exec "${FTLLM_BUNDLE_ROOT}/runtime/bin/python3" -m ftllm_agent_runtime.cli "$@"
+        ;;
     python)
         exec "${FTLLM_BUNDLE_ROOT}/runtime/bin/python3" "$@"
         ;;

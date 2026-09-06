@@ -88,6 +88,28 @@ def atomic_write(path: Path, data: bytes, mode: int) -> None:
         raise
 
 
+def cached_archive(url: str, digest: str, cached: Path | None, offline: bool) -> bytes:
+    if cached is not None and cached.is_file():
+        data = cached.read_bytes()
+        if sha256(data) == digest:
+            print(f"Using verified archive cache: {cached}", flush=True)
+            return data
+    if offline:
+        raise RuntimeError(f"Offline build requires a valid cached archive: {cached or url}")
+    print(f"Downloading {url}", flush=True)
+    data = verified(fetch(url), digest, url.rsplit("/", 1)[-1])
+    if cached is not None:
+        atomic_write(cached, data, 0o644)
+    return data
+
+
+def load_archive(archive_path: Path | None, cache_dir: Path | None, offline: bool) -> bytes:
+    if archive_path is not None:
+        return verified(archive_path.expanduser().read_bytes(), ARCHIVE_SHA256, ARCHIVE_NAME)
+    cached = cache_dir / f"pi-{PI_VERSION}-linux-x64.tar.gz" if cache_dir else None
+    return cached_archive(ARCHIVE_URL, ARCHIVE_SHA256, cached, offline)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -95,18 +117,15 @@ def main() -> int:
         type=Path,
         help="Use an already-downloaded pi-linux-x64.tar.gz archive",
     )
+    parser.add_argument("--cache-dir", type=Path, help="Cache the verified pinned Pi archive")
+    parser.add_argument("--offline", action="store_true", help="Use local files only")
     args = parser.parse_args()
 
     machine = platform.machine().lower()
     if not sys.platform.startswith("linux") or machine not in {"x86_64", "amd64"}:
         parser.error("this prototype supports only Linux x86-64")
 
-    if args.archive:
-        archive = args.archive.expanduser().resolve().read_bytes()
-    else:
-        print(f"Downloading {ARCHIVE_URL}", flush=True)
-        archive = fetch(ARCHIVE_URL)
-    verified(archive, ARCHIVE_SHA256, ARCHIVE_NAME)
+    archive = load_archive(args.archive, args.cache_dir, args.offline)
 
     binary = extract_member(archive, "pi/pi")
     package_json = extract_member(archive, "pi/package.json")
@@ -128,6 +147,8 @@ def main() -> int:
             license_text = cached_license
             print(f"Using verified cached Pi license: {LICENSE_PATH}", flush=True)
     if not license_text:
+        if args.offline:
+            raise RuntimeError("Offline build requires the verified cached Pi license")
         print(f"Downloading {LICENSE_URL}", flush=True)
         license_text = verified(fetch(LICENSE_URL), LICENSE_SHA256, "Pi LICENSE")
     atomic_write(LICENSE_PATH, license_text, 0o644)

@@ -791,15 +791,6 @@ namespace fastllm {
                        FloatDict(), IntDict());
         }
 
-        static void Qwen3CudaRopeEncoding(Qwen3CudaDirectRunner &runner,
-                                          Data &input, const Data &positionIds,
-                                          int rotaryDim, float ropeTheta, float ropeScale) {
-            runner.Run("RopeEncoding",
-                       DataDict{{"input", &input}, {"positionIds", (Data*)&positionIds}},
-                       FloatDict{{"ropeTheta", ropeTheta}, {"ropeScale", ropeScale}},
-                       IntDict{{"rotaryDim", rotaryDim}});
-        }
-
         static void Qwen3CudaAddTo(Qwen3CudaDirectRunner &runner,
                                    Data &input0, const Data &input1, float alpha = 1.0f) {
             runner.Run("AddTo",
@@ -982,7 +973,7 @@ namespace fastllm {
                 int pageLen,
                 int batch,
                 bool doQKNorm,
-                Data *lastPageLens) {
+                Data *lastPageLens, const RopeConfig *ropeConfig) {
             DataDict datas = {
                     {"qkv", &qkv},
                     {"qNormWeight", &qNormWeight},
@@ -999,12 +990,15 @@ namespace fastllm {
                 datas["lastPageLens"] = lastPageLens;
                 outputs.push_back("lastPageLens");
             }
+            FloatDict floats = {{"eps", eps}, {"ropeTheta", ropeTheta}, {"ropeScale", ropeScale}};
+            IntDict ints = {{"q_heads", qHeads}, {"k_heads", kHeads}, {"head_dim", headDim},
+                               {"rotaryDim", rotaryDim}, {"pageLen", pageLen}, {"batch", batch},
+                               {"doQKNorm", (int)doQKNorm}};
+            if (ropeConfig) ropeConfig->AddFusedParams(floats, ints);
             runner.Run("QKVRMSNormRopeSplitAppendPagedCache",
                        datas,
-                       FloatDict{{"eps", eps}, {"ropeTheta", ropeTheta}, {"ropeScale", ropeScale}},
-                       IntDict{{"q_heads", qHeads}, {"k_heads", kHeads}, {"head_dim", headDim},
-                               {"rotaryDim", rotaryDim}, {"pageLen", pageLen}, {"batch", batch},
-                               {"doQKNorm", (int)doQKNorm}},
+                       floats,
+                       ints,
                        outputs);
         }
 
@@ -1032,7 +1026,7 @@ namespace fastllm {
                 int numAttentionHeads, int numKeyValueHeads, int headDim,
                 int rotaryDim, float rmsNormEps,
                 float ropeBase, float ropeFactor, int maxPositions,
-                int ropeType,
+                int ropeType, const RopeConfig *ropeConfig,
                 bool kvCacheInCPU,
                 bool isPrefill,
                 Data *hiddenStates,
@@ -1156,8 +1150,8 @@ namespace fastllm {
                     Qwen3CudaRMSNorm(runner, *q, *qNormWeight, rmsNormEps, *q);
                     Qwen3CudaRMSNorm(runner, k, *kNormWeight, rmsNormEps, k);
                 }
-                Qwen3CudaRopeEncoding(runner, *q, *allPositionIds, rotaryDim, curRopeTheta, ropeScale);
-                Qwen3CudaRopeEncoding(runner, k, *allPositionIds, rotaryDim, curRopeTheta, ropeScale);
+                qwen3cuda::Qwen3CudaRopeEncoding(runner, *q, *allPositionIds, rotaryDim, curRopeTheta, ropeScale, ropeConfig);
+                qwen3cuda::Qwen3CudaRopeEncoding(runner, k, *allPositionIds, rotaryDim, curRopeTheta, ropeScale, ropeConfig);
 
                 Qwen3CudaPermuteSelf(runner, *q, {0, 2, 1, 3});
                 Qwen3CudaPermuteSelf(runner, k, {0, 2, 1, 3});
@@ -1265,7 +1259,7 @@ namespace fastllm {
                     numAttentionHeads, numKeyValueHeads, headDim,
                     rotaryDim, rmsNormEps, curRopeTheta, ropeScale,
                     curPageLen, batch, doQKNorm,
-                    fillLastPageLensOnDevice ? lastPageLens : nullptr);
+                    fillLastPageLensOnDevice ? lastPageLens : nullptr, ropeConfig);
 
                 if (!externalDecodeMeta) {
                     for (int b = 0; b < batch; b++) {
@@ -2068,8 +2062,8 @@ namespace fastllm {
                     seqLens,
                     localQHeads, localKVHeads, head_dim,
                     rotary_dim, rms_norm_eps,
-                    rope_base, rope_factor, max_positions,
-                    rope_type,
+                    rope_base, rope_factor, RopeReferenceLength(),
+                    rope_type, YarnConfig(),
                     GetKVCacheInCPU(),
                     false,
                     &buf.hiddenStates,
@@ -2326,8 +2320,8 @@ namespace fastllm {
                 seqLens,
                 localQHeads, localKVHeads, head_dim,
                 rotary_dim, rms_norm_eps,
-                rope_base, rope_factor, max_positions,
-                rope_type,
+                rope_base, rope_factor, RopeReferenceLength(),
+                rope_type, YarnConfig(),
                 GetKVCacheInCPU(),
                 isPrefill,
                 &hiddenStates,
@@ -2435,11 +2429,14 @@ namespace fastllm {
         if (this->weight.dicts.find("rope_scaling.factor") != this->weight.dicts.end()) {
             rope_factor = atof(this->weight.dicts["rope_scaling.factor"].c_str());
         }
-        std::pair<std::vector<float>, std::vector<float>> &&pair = this->UpdateRotaryPosEmb(rope_base, rope_factor, std::max(max_positions, 16384));
-        sinData.ToDevice(DataDevice::CPU);
-        cosData.ToDevice(DataDevice::CPU);
-        sinData.CopyFrom(Data(DataType::FLOAT32, { (int)this->sin.size(), (int)this->sin[0].size() }, pair.first));
-        cosData.CopyFrom(Data(DataType::FLOAT32, { (int)this->cos.size(), (int)this->cos[0].size() }, pair.second));
+        InitContextParams(rope_type, rope_base, rope_factor, rotary_dim);
+        if (!YarnConfig()) {
+            std::pair<std::vector<float>, std::vector<float>> &&pair = this->UpdateRotaryPosEmb(rope_base, rope_factor, std::max(max_positions, 16384));
+            sinData.ToDevice(DataDevice::CPU);
+            cosData.ToDevice(DataDevice::CPU);
+            sinData.CopyFrom(Data(DataType::FLOAT32, { (int)this->sin.size(), (int)this->sin[0].size() }, pair.first));
+            cosData.CopyFrom(Data(DataType::FLOAT32, { (int)this->cos.size(), (int)this->cos[0].size() }, pair.second));
+        }
         for (int i = 0; i < block_cnt; i++) {
             std::string w1WeightName = "model.layers." + std::to_string(i) + ".mlp.gate_proj.weight";
             std::string w3WeightName = "model.layers." + std::to_string(i) + ".mlp.up_proj.weight";
@@ -2577,16 +2574,18 @@ namespace fastllm {
                 }
                 int targetSeqLength = (pastKey.dims.size() > 2) ? pastKey.dims[1] + seqlen : seqlen;
                 float curRopeTheta = rope_base;
-                if (i == 0 && targetSeqLength >= max_positions && RoPEType::DYMAMIC_NTK == rope_type) {
-                    float scale = pow((rope_factor * targetSeqLength / max_positions) - (rope_factor - 1), rotary_dim / (rotary_dim - 2));
+                if (i == 0 && targetSeqLength >= RopeReferenceLength() && RoPEType::DYMAMIC_NTK == rope_type) {
+                    float scale = pow((rope_factor * targetSeqLength / RopeReferenceLength()) - (rope_factor - 1), rotary_dim / (rotary_dim - 2));
                     curRopeTheta = rope_base * scale;
                 }
                 float ropeScale = (rope_type == RoPEType::LINEAR_SCALE) ? rope_factor : 1.0f;
                 RMSNorm(q, this->weight["model.layers." + std::to_string(i) + ".self_attn.q_norm.weight"], rms_norm_eps, q);
-                fastllm::RopeEncoding(q, positionIds, rotary_dim, curRopeTheta, ropeScale);
+                if (YarnConfig()) ApplyYarnRope(q, positionIds, *YarnConfig());
+                else fastllm::RopeEncoding(q, positionIds, rotary_dim, curRopeTheta, ropeScale);
 
                 RMSNorm(k, this->weight["model.layers." + std::to_string(i) + ".self_attn.k_norm.weight"], rms_norm_eps, k);
-                fastllm::RopeEncoding(k, positionIds, rotary_dim, curRopeTheta, ropeScale);
+                if (YarnConfig()) ApplyYarnRope(k, positionIds, *YarnConfig());
+                else fastllm::RopeEncoding(k, positionIds, rotary_dim, curRopeTheta, ropeScale);
 
                 PermuteSelf(q, {0, 2, 1, 3});
                 PermuteSelf(k, {0, 2, 1, 3});
@@ -3185,8 +3184,8 @@ namespace fastllm {
                 seqLens,
                 num_attention_heads, num_key_value_heads, head_dim,
                 rotary_dim, rms_norm_eps,
-                rope_base, rope_factor, max_positions,
-                rope_type,
+                rope_base, rope_factor, RopeReferenceLength(),
+                rope_type, YarnConfig(),
                 GetKVCacheInCPU(),
                 isPrefill,
                 &hiddenStates,
@@ -3247,7 +3246,7 @@ namespace fastllm {
             int bsz = attenInput.dims[0], seqlen = attenInput.dims[1];
 
             if (weight.weight.find(mergeQkvWeightName) != weight.weight.end()
-                && CanRunMergeAttention()
+                && !YarnConfig() && CanRunMergeAttention()
                 && true) {
                 std::vector <Data*> keys, values, masks;
                 keys.push_back(&pastKeyValues[i].first);
@@ -3308,16 +3307,18 @@ namespace fastllm {
                     pastValue.ToDevice(k.dataDevice);
                 }
                 int targetSeqLength = (pastKey.dims.size() > 2) ? pastKey.dims[1] + seqlen : seqlen;
-                if (i == 0 && targetSeqLength >= max_positions && RoPEType::DYMAMIC_NTK == rope_type) {
-                    float scale = pow((rope_factor * targetSeqLength / max_positions) - (rope_factor - 1), rotary_dim / (rotary_dim - 2));
+                if (i == 0 && targetSeqLength >= RopeReferenceLength() && RoPEType::DYMAMIC_NTK == rope_type) {
+                    float scale = pow((rope_factor * targetSeqLength / RopeReferenceLength()) - (rope_factor - 1), rotary_dim / (rotary_dim - 2));
                     float newbase = rope_base * scale;
                     std::pair<std::vector<float>, std::vector<float>> &&pair = this->UpdateRotaryPosEmb(newbase, rope_factor, targetSeqLength);
                     sinDataPtr = new Data(DataType::FLOAT32, {(int)this->sin.size(), (int)this->sin[0].size()}, pair.first);
                     cosDataPtr = new Data(DataType::FLOAT32, {(int)this->cos.size(), (int)this->cos[0].size()}, pair.second);
                 }
 
-                fastllm::LlamaRotatePosition2D(q, positionIds, *sinDataPtr, *cosDataPtr, rotary_dim);
-                fastllm::LlamaRotatePosition2D(k, positionIds, *sinDataPtr, *cosDataPtr, rotary_dim);
+                if (YarnConfig()) ApplyYarnRope(q, positionIds, *YarnConfig());
+                else fastllm::LlamaRotatePosition2D(q, positionIds, *sinDataPtr, *cosDataPtr, rotary_dim);
+                if (YarnConfig()) ApplyYarnRope(k, positionIds, *YarnConfig());
+                else fastllm::LlamaRotatePosition2D(k, positionIds, *sinDataPtr, *cosDataPtr, rotary_dim);
 
                 PermuteSelf(q, {0, 2, 1, 3});
                 PermuteSelf(k, {0, 2, 1, 3});
@@ -3566,7 +3567,7 @@ namespace fastllm {
             // 1.1 Get q, k, v
             int bsz = attenInput.dims[0], seqlen = attenInput.dims[1];
             if (weight.weight.find(mergeQkvWeightName) != weight.weight.end()
-                && CanRunMergeAttention()
+                && !YarnConfig() && CanRunMergeAttention()
                 && true) {
                 std::vector <Data*> keys, values, masks;
                 for (int b = 0; b < batch; b++) {
@@ -3633,8 +3634,8 @@ namespace fastllm {
                         targetSeqLength = std::max(targetSeqLength, (pastKey.dims.size() > 2) ? pastKey.dims[1] + seqLens[b] : seqLens[b]);
                 }
 
-                if (targetSeqLength >= max_positions && RoPEType::DYMAMIC_NTK == rope_type) {
-                        float scale = pow((rope_factor * targetSeqLength / max_positions) - (rope_factor - 1), rotary_dim / (rotary_dim - 2));
+                if (targetSeqLength >= RopeReferenceLength() && RoPEType::DYMAMIC_NTK == rope_type) {
+                        float scale = pow((rope_factor * targetSeqLength / RopeReferenceLength()) - (rope_factor - 1), rotary_dim / (rotary_dim - 2));
                         float newbase = rope_base * scale;
                         std::pair<std::vector<float>, std::vector<float>> &&pair = this->UpdateRotaryPosEmb(newbase, rope_factor, targetSeqLength);
                         sinDataPtr = new Data(DataType::FLOAT32, {(int)this->sin.size(), (int)this->sin[0].size()}, pair.first);
@@ -3675,8 +3676,10 @@ namespace fastllm {
                     }
                 }
 
-                fastllm::LlamaRotatePosition2D(q, allPositionIds, *sinDataPtr, *cosDataPtr, rotary_dim);
-                fastllm::LlamaRotatePosition2D(k, allPositionIds, *sinDataPtr, *cosDataPtr, rotary_dim);
+                if (YarnConfig()) ApplyYarnRope(q, allPositionIds, *YarnConfig());
+                else fastllm::LlamaRotatePosition2D(q, allPositionIds, *sinDataPtr, *cosDataPtr, rotary_dim);
+                if (YarnConfig()) ApplyYarnRope(k, allPositionIds, *YarnConfig());
+                else fastllm::LlamaRotatePosition2D(k, allPositionIds, *sinDataPtr, *cosDataPtr, rotary_dim);
 
                 Data attenOutput = Data(this->dataType);
                 int total = 0;

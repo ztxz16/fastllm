@@ -334,6 +334,15 @@ fastllm_lib.create_llm_model.restype = ctypes.c_int
 fastllm_lib.create_llm_model_fromhf.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_bool, ctypes.c_char_p, ctypes.c_bool, ctypes.c_int, ctypes.c_int, ctypes.c_char_p]
 fastllm_lib.create_llm_model_fromhf.restype = ctypes.c_int
 
+if hasattr(fastllm_lib, "create_llm_model_fromhf_with_context"):
+    fastllm_lib.create_llm_model_fromhf_with_context.argtypes = (
+        fastllm_lib.create_llm_model_fromhf.argtypes + [ctypes.c_int, ctypes.c_char_p])
+    fastllm_lib.create_llm_model_fromhf_with_context.restype = ctypes.c_int
+    fastllm_lib.get_llm_context_result.argtypes = []
+    fastllm_lib.get_llm_context_result.restype = ctypes.c_char_p
+    fastllm_lib.get_llm_context_config.argtypes = [ctypes.c_int]
+    fastllm_lib.get_llm_context_config.restype = ctypes.c_char_p
+
 fastllm_lib.create_llm_model_fromhf_with_config.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_bool, ctypes.c_char_p]
 fastllm_lib.create_llm_model_fromhf_with_config.restype = ctypes.c_int
 
@@ -1134,7 +1143,24 @@ class model:
                   chat_template: str = "",
                   tool_call_parser: str = "auto",
                   external_mtp_path: str = "",
-                  mmproj_path: str = ""):
+                  mmproj_path: str = "",
+                  max_context_length: int = -1,
+                  rope_scaling = None):
+        if (isinstance(max_context_length, bool) or not isinstance(max_context_length, int) or
+                max_context_length != -1 and not 0 < max_context_length <= 2147483647):
+            raise ValueError("max_context_length must be a positive 32-bit integer")
+        if isinstance(rope_scaling, dict):
+            rope_scaling = json.dumps(rope_scaling, allow_nan=False)
+        elif rope_scaling is None:
+            rope_scaling = ""
+        if not isinstance(rope_scaling, str):
+            raise ValueError("rope_scaling must be yarn or a JSON object")
+        context_requested = max_context_length > 0 or bool(rope_scaling)
+        if context_requested and (id != -99999 or graph is not None or model_json or not os.path.isdir(path)):
+            raise ValueError("Context options currently require a Hugging Face model directory")
+        if context_requested and not hasattr(fastllm_lib, "create_llm_model_fromhf_with_context"):
+            raise RuntimeError("The native FastLLM library must be rebuilt to support context options")
+        self.context_config = None
         if (graph != None):
             current_graph = graph()
             if (os.path.isdir(path) and os.path.isfile(os.path.join(path, "config.json"))):
@@ -1275,6 +1301,14 @@ class model:
                     self.model = fastllm_lib.create_llm_model_fromhf_with_config(
                         path.encode(), fastllm_data_type_dict[dtype], int4g_groupcnt,
                         ctypes.c_bool(skip_tokenizer), model_json.encode())
+                elif hasattr(fastllm_lib, "create_llm_model_fromhf_with_context"):
+                    self.model = fastllm_lib.create_llm_model_fromhf_with_context(
+                        path.encode(), fastllm_data_type_dict[dtype], int4g_groupcnt,
+                        ctypes.c_bool(skip_tokenizer), lora.encode(),
+                        use_moe_dtype, fastllm_data_type_dict[moe_dtype], moe_int4g_groupcnt,
+                        dtype_config.encode(), max_context_length, rope_scaling.encode())
+                    if self.model < 0:
+                        raise ValueError(fastllm_lib.get_llm_context_result().decode("utf-8", errors="replace"))
                 else:
                     self.model = fastllm_lib.create_llm_model_fromhf(
                         path.encode(), fastllm_data_type_dict[dtype], int4g_groupcnt,
@@ -1367,6 +1401,28 @@ class model:
         print(f"[Fastllm] default generation config: {self.default_generation_config}")
         if (kv_cache_dtype != "" and kv_cache_dtype != "auto"):
             self.set_kv_cache_dtype(kv_cache_dtype)
+        self._refresh_context_config()
+
+    def _refresh_context_config(self):
+        getter = getattr(fastllm_lib, "get_llm_context_config", None)
+        if getter is None:
+            return
+        self.context_config = json.loads(getter(self.model).decode("utf-8"))
+        self.native_context_window = (self.context_config.get("model_context_window") or
+                                      getattr(self, "native_context_window", None) or self.get_max_input_len())
+        requested = self.context_config.get("configured_context_window_limit", -1)
+        if self.context_config.get("configured"):
+            self.configured_context_window_limit = requested if requested > 0 else None
+        elif not hasattr(self, "configured_context_window_limit"):
+            self.configured_context_window_limit = None
+        if self.context_config.get("configured") and self.context_config["rope_parameters"]["rope_type"] == "yarn":
+            config = getattr(self, "config", {})
+            text_config = config.get("text_config", config)
+            rope = dict(text_config.get("rope_parameters") or text_config.get("rope_scaling") or {})
+            resolved = self.context_config["rope_parameters"]
+            rope.update({k: v for k, v in resolved.items() if k != "rotary_dim"})
+            rope.pop("type", None)
+            text_config["rope_parameters"] = rope
 
     def encode(self, text: str, **kwargs) -> List[int]:
         output_buffer_init_len = 1024
@@ -2886,6 +2942,7 @@ class model:
         error = fastllm_lib.warmup_llm_model(self.model)
         if error:
             raise RuntimeError(error.decode("utf-8", errors="replace"))
+        self._refresh_context_config()
 
     def set_moe_experts(self, experts: int):
         fastllm_lib.set_moe_experts(self.model, experts)
@@ -2919,7 +2976,9 @@ class model:
 
     def set_max_context_length(self, length: int):
         """限制单会话输入与输出合计的最大 token 数。"""
-        return fastllm_lib.set_max_context_length_llm_model(self.model, length)
+        effective = fastllm_lib.set_max_context_length_llm_model(self.model, length)
+        self._refresh_context_config()
+        return effective
 
     def get_kv_cache_token_limit(self):
         """返回所有并发会话共享的 KV Cache token 总容量。"""

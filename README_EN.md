@@ -42,7 +42,7 @@ A dedicated Python virtual environment is recommended. Prebuilt packages cover t
 | --- | --- | --- |
 | Linux + NVIDIA GPU | `python -m pip install -U ftllm` | Includes the Python interface and common CUDA runtime dependencies; the installed driver must be compatible |
 | Windows + NVIDIA GPU | `python -m pip install -U ftllm` | Install the Windows dependency wheel below first if required DLLs are missing |
-| Linux + AMD GPU | `python -m pip install -U ftllm-rocm` | Install a compatible ROCm environment first; see the [ROCm guide](docs/rocm.md) |
+| Linux + AMD GPU | [ROCm installation and build](docs/rocm.md) | Choose the build and installation options for your GPU architecture |
 | CPU-only, special architectures, or other accelerators | [Build from source](#build-from-source) | Select the appropriate CMake backend |
 
 Windows dependency package for first-time installations:
@@ -88,6 +88,8 @@ ftllm bench Qwen/Qwen3-0.6B \
 
 `ftllm` (or `ftllm launch`) listens only on `127.0.0.1:8000` by default and opens the browser after the service is ready; use `ftllm launch --no-browser` to disable automatic opening. The page can download models from ModelScope, save and preview launch profiles, and run either `ftllm server` or the chat-oriented `ftllm webui`. After a local model is selected for a new item, Launcher recommends TP, hybrid MoE inference, and N-gram storage settings from the model structure, weight size, GPUs, system memory, and NUMA topology; the optional inference settings can also be re-analyzed or cleared manually. Its interface supports Simplified Chinese and English, preferring the last selection and otherwise following the browser language; terminal output from `ftllm launch` always uses English. To access it from the LAN, run `ftllm launch --host 0.0.0.0`; the terminal and Launcher page then list loopback, LAN, and directly assigned public-interface addresses when available. Public access also requires the host firewall and cloud security group to allow the port, plus port forwarding when behind NAT; Launcher does not discover NAT public mappings. Non-loopback access uses unencrypted HTTP and should only be enabled on a trusted network. It shares profiles with the terminal wizard and stops its managed download and model processes when the launcher exits. Run `ftllm launch --help` for other options.
 
+Once the API Server is ready, click **Open Studio** to use chat, saved conversations, Markdown, attachments, reasoning, and agents directly in Launcher's content area. Model management navigation stays visible, so you can visit launch profiles, downloads, logs, and hardware, then return to the same conversation. Launcher and standalone `ftllm webui` share the chat component and backend; the component adapts its colors, sizing, and language to Launcher. It connects to the active model with the configured API key, without another WebUI process or port. Conversations use WebUI’s existing local storage and survive page refreshes. Stopping or switching models cancels active WebUI tasks and disposes of the old component.
+
 The WebUI does not load a model in its own process, so start an OpenAI-compatible API server first. Its optional `model` positional argument is only a model-name hint; when omitted, the WebUI discovers the model from `/v1/models`.
 
 Code analysis and web search use the Pi agent runtime by default. On Linux
@@ -95,6 +97,8 @@ x86-64, build and install the companion wheel as described in
 [`tools/ftllm_agent_runtime/`](tools/ftllm_agent_runtime/). The wheel bundles
 Pi, so Node.js, npm, and Bun are not required. Use `--agent-runtime builtin`
 to select the original single-call paths when the companion wheel is absent.
+
+Launcher automatically uses an installed Pi runtime. **New Agent** lets you select a project directory; use `ftllm launch --agent-workspace-root /path/to/projects` to set the selectable root (your home directory by default). Directory agents are enabled by default on both local and remote Launcher listeners, for example `ftllm launch --host 0.0.0.0 --agent-workspace-root /path/to/projects`. Use `--disable-workspace-agent` to disable directory browsing, creating directory agents, and executing saved directory-agent tasks; ordinary chat remains available. Directory agents can modify files and execute commands, so restrict access to trusted users. The interface explains when the runtime is unavailable or directory agents have been disabled.
 
 For `run`, `server`, and `export`, the `model` positional argument can be a Hugging Face repository ID, a local Hugging Face model directory, an exported FastLLM model, or a configuration file:
 
@@ -168,16 +172,30 @@ When host memory is limited, a small fraction of expert layers can be placed on 
 
 ### Long context and prefix caching
 
+`--max_context_length` (alias `--max-context-length`) sets the combined input and output limit per session. Extending the model-declared window also requires a valid `--rope_scaling` (alias `--rope-scaling`), which accepts `yarn` or JSON. You can omit the RoPE option when reducing the window. These options take effect at model loading without editing the checkpoint's `config.json`.
+
+For example, extend Qwen3-0.6B to 65536 tokens and enable prefix caching. Its original YaRN length is 32768 and must be specified explicitly; the declared 40960 is a different value:
+
 ~~~bash
-ftllm server /data/models/my-model \
-  --max_context_length 131072 \
-  --max_batch 16 \
-  --gpu_mem_ratio 0.9 \
+ftllm server /data/models/Qwen3-0.6B \
+  --device cuda --max_batch 1 --tokens 65536 \
+  --max_context_length 65536 \
+  --rope_scaling '{"rope_type":"yarn","factor":2,"original_max_position_embeddings":32768}' \
   --chunked_prefill_size 8192 \
   --prefix_cache true
 ~~~
 
-The effective context limit is the minimum of the model's native limit, `--max_context_length`, and shared KV-cache capacity. The `/v1/models` endpoint reports the effective value.
+Qwen3.8-27B-FP8 supports the `yarn` shorthand because its original RoPE length is known. This example requests a 1,000,000-token window with two GPUs and FP4 KV cache, resolving to original=262144 and factor=4:
+
+~~~bash
+ftllm server /data/models/Qwen3.8-27B-FP8 \
+  --tp 2 --kv_cache_dtype fp4 \
+  --max_context_length 1000000 --rope_scaling yarn
+~~~
+
+`--tokens` sets the KV pool capacity shared by all sessions; omitting it enables automatic budgeting. Startup fails if an explicit target exceeds the configured RoPE range or the KV capacity calibrated during warmup. `/v1/models` reports the effective window, original model limit, and requested target. The 1M example requires sufficient GPU memory: the tested configuration with two 24GB GPUs cannot fit it, and a full 1M input has not been validated.
+
+Extension currently supports HF Qwen2, Qwen3, and Qwen3.5 layouts, including Qwen3.8 checkpoints based on Qwen3.5. Launcher's advanced "RoPE extension" field accepts the same configuration. GGUF, FLM, and custom GraphLLM loaders retain their existing shrink-only length behavior and do not support the new RoPE extension options. See the [context extension guide](docs/context-length-extension-design.md) for parameters, supported layouts, and validation results.
 
 ### Speculative decoding
 
@@ -236,7 +254,7 @@ The CLI evolves continuously, so `ftllm <command> --help` is authoritative for t
 | `--dtype` | Weight type when loading HF weights; defaults to `auto` and should normally not override an already quantized checkpoint |
 | `--moe_dtype` | Set the MoE weight type separately |
 | `--atype` / `--moe_atype` | Activation types for regular and MoE layers |
-| `--kv_cache_dtype` | KV-cache type: `auto`, `float16`, `bfloat16`, or `fp8_e4m3` |
+| `--kv_cache_dtype` | KV-cache type: `auto`, `float16`, `bfloat16`, `fp8_e4m3`, or `fp4`; requires model and backend support |
 | `--dtype_config` | Dynamic quantization configuration; see the [quantization guide](docs/dtype_config.md) |
 | `--triton` | Enable available Triton CUDA operators |
 
@@ -249,7 +267,8 @@ The CLI evolves continuously, so `ftllm <command> --help` is authoritative for t
 | `--tokens` | Automatic | Total token capacity used to size paged KV cache |
 | `--page_size` | Backend-defined | Tokens per KV-cache page; the multi-GPU default is normally 16 |
 | `--max_batch` | Automatic | Maximum number of requests processed together |
-| `--max_context_length` | Automatic | Combined input and output limit per server request |
+| `--max_context_length` / `--max-context-length` | Automatic | Combined input and output limit per session; explicit HF targets must pass RoPE and KV capacity checks |
+| `--rope_scaling` / `--rope-scaling` | Model config | RoPE extension as `yarn` or JSON; available for adapted HF model layouts |
 | `--chunked_prefill_size` | Disabled/model-defined | Prefill chunk size, for example `8192` |
 | `--prefix_cache` | Model/environment-defined | Enable or disable prefix caching with `true` or `false` |
 | `--cuda_slab` | `0` | CUDA weight-slab size in MB; `0` disables it |
@@ -352,16 +371,13 @@ bash install.sh -DUSE_CUDA=ON \
 bash install.sh -DUSE_CUDA=ON -DCUDA_ARCH=89 \
   -DCMAKE_CUDA_COMPILER="$(command -v nvcc)"
 
-# AMD ROCm
-bash install.sh -DUSE_ROCM=ON
-
 # CPU-only
 bash install.sh
 ~~~
 
 Additional platform documentation:
 
-- [ROCm build guide](docs/rocm.md)
+- [ROCm build and wheel packaging](docs/rocm.md)
 - [TFACC platform](docs/tfacc.md)
 - [Examples, Android, and other platforms](example/README.md)
 - [Build and runtime FAQ](docs/faq.md)

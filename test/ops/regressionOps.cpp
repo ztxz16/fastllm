@@ -8993,12 +8993,10 @@ namespace {
     }
 #endif
 
-    void RunCudaRecurrentSnapshotsRegression() {
+    void RunCudaRecurrentSnapshotsShapeRegression(
+            int numKHeads, int numVHeads, int headVDim) {
         FastllmCudaSetDevice(0);
-        const int numKHeads = 1;
-        const int numVHeads = 2;
         const int headKDim = 128;
-        const int headVDim = 9;
         const int qkvDim = 2 * numKHeads * headKDim + numVHeads * headVDim;
         const float eps = 1e-6f;
         const float qScale = 1.0f / std::sqrt((float) headKDim);
@@ -9013,10 +9011,15 @@ namespace {
             MakeRegressionValues(numVHeads * headVDim * headKDim, 0.9f, 0.025f);
         fastllm::Data normWeight = MakeCudaTensor(fastllm::DataType::FLOAT32,
                                                   {headKDim}, normValues);
+        std::vector<float> aLogValues(numVHeads), dtBiasValues(numVHeads);
+        for (int head = 0; head < numVHeads; head++) {
+            aLogValues[head] = head % 2 == 0 ? -0.7f : -0.55f;
+            dtBiasValues[head] = head % 2 == 0 ? 0.15f : -0.08f;
+        }
         fastllm::Data aLog = MakeCudaTensor(fastllm::DataType::FLOAT32,
-                                            {numVHeads}, {-0.7f, -0.55f});
+                                            {numVHeads}, aLogValues);
         fastllm::Data dtBias = MakeCudaTensor(fastllm::DataType::FLOAT32,
-                                              {numVHeads}, {0.15f, -0.08f});
+                                              {numVHeads}, dtBiasValues);
 
         for (int tokenCount = 2; tokenCount <= maxFastTokens; tokenCount++) {
             std::vector<float> convValues =
@@ -9133,7 +9136,7 @@ namespace {
         }
 
         std::vector<float> oneConvValues = MakeRegressionValues(qkvDim, 5.2f, 0.12f);
-        std::vector<float> oneBaValues = {-4.5f, -4.53f, -0.35f, -0.33f};
+        std::vector<float> oneBaValues = MakeRegressionValues(numVHeads * 2, 5.4f, 0.08f);
         {
             fastllm::Data conv = MakeCudaTensor(fastllm::DataType::FLOAT16,
                                                 {1, 1, qkvDim}, oneConvValues);
@@ -9153,10 +9156,7 @@ namespace {
         }
         {
             std::vector<float> twoConvValues = MakeRegressionValues(2 * qkvDim, 5.8f, 0.12f);
-            std::vector<float> twoBaValues = {
-                -4.5f, -4.53f, -0.35f, -0.33f,
-                -4.46f, -4.49f, -0.32f, -0.30f
-            };
+            std::vector<float> twoBaValues = MakeRegressionValues(2 * numVHeads * 2, 6.0f, 0.08f);
             fastllm::Data conv = MakeCudaTensor(fastllm::DataType::FLOAT16,
                                                 {1, 2, qkvDim}, twoConvValues);
             fastllm::Data ba = MakeCudaTensor(fastllm::DataType::FLOAT16,
@@ -9215,6 +9215,12 @@ namespace {
                        numKHeads, numVHeads, headKDim, headVDim, eps, qScale),
                    "recurrent sequence accepted more than eight tokens");
         }
+    }
+
+    void RunCudaRecurrentSnapshotsRegression() {
+        RunCudaRecurrentSnapshotsShapeRegression(1, 2, 9);
+        RunCudaRecurrentSnapshotsShapeRegression(8, 24, 128);
+        RunCudaRecurrentSnapshotsShapeRegression(16, 48, 128);
     }
 #endif
 
@@ -14730,6 +14736,13 @@ int main(int argc, char **argv) {
         }
 #ifdef USE_CUDA
 #ifndef USE_ROCM
+        if (argc == 2 && std::string(argv[1]) == "--cuda-recurrent-snapshots") {
+            Expect(FastllmCudaGetDeviceCount() > 0,
+                   "CUDA recurrent snapshots regression requires CUDA.");
+            RunCudaRecurrentSnapshotsRegression();
+            std::cout << "CUDA recurrent snapshots regression: PASS\n";
+            return 0;
+        }
         if (argc == 2 && std::string(argv[1]) == "--cuda-nvfp4-marlin") {
             Expect(FastllmCudaGetDeviceCount() > 0,
                    "NVFP4 Marlin regression requires CUDA.");

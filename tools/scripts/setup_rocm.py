@@ -78,7 +78,7 @@ setup(
     entry_points={'console_scripts': ['ftllm=ftllm.cli:main']},
     packages=find_namespace_packages(include=['ftllm', 'ftllm.openai_server', 'ftllm.openai_server.*']),
     package_data={'ftllm': ['*.so', '*.so.*', '*.json', '*.html', '*.js', '*.svg',
-                            'licenses/*', 'launcher_assets/*', 'launcher_assets/locales/*.json']},
+                            'licenses/*', 'launcher_assets/*', 'launcher_assets/locales/*.json', 'webui_assets/*']},
     install_requires=['numpy', 'pillow', 'requests', 'transformers', 'jinja2>=3.1.0',
                       f'rocm[libraries]=={sdk_version}'] + all_require,
     extras_require=extras,

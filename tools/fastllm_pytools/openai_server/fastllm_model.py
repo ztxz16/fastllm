@@ -34,6 +34,9 @@ class FastLLmModel:
             if value is not None
         ]
         context_window = min(context_window_candidates) if context_window_candidates else 32768
+        resolved_context = getattr(model, "context_config", None)
+        if isinstance(resolved_context, dict) and resolved_context.get("configured"):
+            context_window = self._positive_int(resolved_context.get("context_window")) or context_window
         auto_compact_token_limit = max(1, context_window * 9 // 10)
 
         self.context_window = context_window

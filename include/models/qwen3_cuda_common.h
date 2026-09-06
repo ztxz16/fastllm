@@ -1,6 +1,6 @@
 #pragma once
 
-#include "fastllm.h"
+#include "contextconfig.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -753,7 +753,15 @@ namespace fastllm {
 
     inline void Qwen3CudaRopeEncoding(Qwen3CudaDirectRunner &runner,
                                       Data &input, const Data &positionIds,
-                                      int rotaryDim, float ropeTheta, float ropeScale) {
+                                      int rotaryDim, float ropeTheta, float ropeScale,
+                                      const RopeConfig *ropeConfig = nullptr) {
+        if (ropeConfig) {
+            runner.Run("YarnRopeEncoding",
+                       DataDict{{"input", &input}, {"positionIds", (Data*)&positionIds}},
+                       ropeConfig->Params(),
+                       ropeConfig->PositionParams(positionIds.dims.size() == 2 && positionIds.dims[0] == 3));
+            return;
+        }
         runner.Run("RopeEncoding",
                    DataDict{{"input", &input}, {"positionIds", (Data*)&positionIds}},
                    FloatDict{{"ropeTheta", ropeTheta}, {"ropeScale", ropeScale}},
@@ -1145,7 +1153,7 @@ namespace fastllm {
             int pageLen,
             int batch,
             bool doQKNorm,
-            Data *lastPageLens) {
+            Data *lastPageLens, const RopeConfig *ropeConfig) {
         DataDict datas = {
                 {"qkv", &qkv},
                 {"qNormWeight", &qNormWeight},
@@ -1162,12 +1170,15 @@ namespace fastllm {
             datas["lastPageLens"] = lastPageLens;
             outputs.push_back("lastPageLens");
         }
+        FloatDict floats = {{"eps", eps}, {"ropeTheta", ropeTheta}, {"ropeScale", ropeScale}};
+        IntDict ints = {{"q_heads", qHeads}, {"k_heads", kHeads}, {"head_dim", headDim},
+                           {"rotaryDim", rotaryDim}, {"pageLen", pageLen}, {"batch", batch},
+                           {"doQKNorm", (int)doQKNorm}};
+        if (ropeConfig) ropeConfig->AddFusedParams(floats, ints);
         runner.Run("QKVRMSNormRopeSplitAppendPagedCache",
                    datas,
-                   FloatDict{{"eps", eps}, {"ropeTheta", ropeTheta}, {"ropeScale", ropeScale}},
-                   IntDict{{"q_heads", qHeads}, {"k_heads", kHeads}, {"head_dim", headDim},
-                           {"rotaryDim", rotaryDim}, {"pageLen", pageLen}, {"batch", batch},
-                           {"doQKNorm", (int)doQKNorm}},
+                   floats,
+                   ints,
                    outputs);
     }
 
@@ -1195,7 +1206,7 @@ namespace fastllm {
             int numAttentionHeads, int numKeyValueHeads, int headDim,
             int rotaryDim, float rmsNormEps,
             float ropeBase, float ropeFactor, int maxPositions,
-            int ropeType,
+            int ropeType, const RopeConfig *ropeConfig,
             bool kvCacheInCPU,
             bool isPrefill,
             Data *hiddenStates,
@@ -1327,8 +1338,8 @@ namespace fastllm {
                 Qwen3CudaRMSNorm(runner, *q, *qNormWeight, rmsNormEps, *q);
                 Qwen3CudaRMSNorm(runner, k, *kNormWeight, rmsNormEps, k);
             }
-            Qwen3CudaRopeEncoding(runner, *q, *allPositionIds, rotaryDim, curRopeTheta, ropeScale);
-            Qwen3CudaRopeEncoding(runner, k, *allPositionIds, rotaryDim, curRopeTheta, ropeScale);
+            Qwen3CudaRopeEncoding(runner, *q, *allPositionIds, rotaryDim, curRopeTheta, ropeScale, ropeConfig);
+            Qwen3CudaRopeEncoding(runner, k, *allPositionIds, rotaryDim, curRopeTheta, ropeScale, ropeConfig);
 
             Qwen3CudaPermuteSelf(runner, *q, {0, 2, 1, 3});
             Qwen3CudaPermuteSelf(runner, k, {0, 2, 1, 3});
@@ -1435,7 +1446,7 @@ namespace fastllm {
                 numAttentionHeads, numKeyValueHeads, headDim,
                 rotaryDim, rmsNormEps, curRopeTheta, ropeScale,
                 curPageLen, batch, doQKNorm,
-                fillLastPageLensOnDevice ? lastPageLens : nullptr);
+                fillLastPageLensOnDevice ? lastPageLens : nullptr, ropeConfig);
 
             if (!externalDecodeMeta) {
                 for (int b = 0; b < batch; b++) {

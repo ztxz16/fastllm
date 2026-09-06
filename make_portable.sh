@@ -40,7 +40,7 @@ usage() {
   ./make_portable.sh --wheel PATH [选项]
 
 把 ftllm wheel、Python 3.11、CUDA 12 runtime、cuBLAS、NCCL 和全部 Python
-依赖打成解压即用的 x86_64 Linux 绿色包。
+依赖以及 Pi Agent、ripgrep、fd 打成解压即用的 x86_64 Linux 绿色包。
 
 选项：
   --wheel PATH           输入 wheel；默认选择 build-fastllm/tools/dist 中最新的 ftllm wheel
@@ -51,8 +51,8 @@ usage() {
                          压缩格式；默认 tar.gz（目标机无需安装 zstd）
   --keep-dir             除压缩包外，同时保留未压缩目录
   --directory-only       只生成未压缩目录，便于被其他打包工具复用
-  --skip-tests           跳过启动器、原生库和 CUDA 冒烟测试
-  --offline              不访问软件源，仅使用已缓存的 wheelhouse
+  --skip-tests           跳过启动器、Pi Agent、原生库和 CUDA 冒烟测试
+  --offline              不访问网络，仅使用已缓存的 Python、wheelhouse、Pi 和搜索工具
   --force                覆盖同名输出
   -h, --help             显示帮助
 
@@ -231,10 +231,14 @@ write_build_info() {
     "$python_bin" - "$destination" "$package_name" "$package_version" \
         "$wheel_name" "$wheel_sha" "$constraints_sha" "$build_time" \
         "$PYTHON_VERSION" "$PYTHON_BUILD" "$PYTHON_SHA256" "$TARGET_GLIBC" \
-        "$MIN_NVIDIA_DRIVER" "$RECOMMENDED_NVIDIA_DRIVER" <<'PY'
+        "$MIN_NVIDIA_DRIVER" "$RECOMMENDED_NVIDIA_DRIVER" "$agent_wheel_path" <<'PY'
 import json
+import importlib.metadata
 import platform
 import sys
+from pathlib import Path
+import hashlib
+from ftllm_agent_runtime.runtime import PI_VERSION
 
 (
     destination,
@@ -250,12 +254,22 @@ import sys
     target_glibc,
     min_driver,
     recommended_driver,
+    agent_wheel,
 ) = sys.argv[1:]
 
 data = {
     "format_version": 1,
     "package": {"name": package_name, "version": package_version},
     "wheel": {"filename": wheel_name, "sha256": wheel_sha256},
+    "agent_runtime": {
+        "name": "ftllm-agent-runtime",
+        "version": importlib.metadata.version("ftllm-agent-runtime"),
+        "pi_version": PI_VERSION,
+        "wheel": {
+            "filename": Path(agent_wheel).name,
+            "sha256": hashlib.sha256(Path(agent_wheel).read_bytes()).hexdigest(),
+        },
+    },
     "python": {
         "version": python_version,
         "standalone_build": python_build,
@@ -568,8 +582,47 @@ pip_install_args=(
 pip_install_args+=("${pip_constraint_args[@]}")
 "$python_bin" -m pip "${pip_install_args[@]}" "$wheel_path"
 
+# Build the companion wheel from this checkout, in a disposable environment.
+# Do not reuse a version-only wheel cache: bridge/extension code may have changed.
+log "构建内置 Pi Agent 运行时"
+agent_source="${build_root}/agent-source"
+"$python_bin" - "${ROOT_DIR}/tools/ftllm_agent_runtime" "$agent_source" <<'PY'
+import shutil
+import sys
+
+shutil.copytree(sys.argv[1], sys.argv[2], ignore=shutil.ignore_patterns(
+    "build", "dist", "*.egg-info", "__pycache__", "*.pyc", "bin",
+))
+PY
+agent_fetch_args=(--cache-dir "${cache_dir}/pi")
+((offline == 0)) || agent_fetch_args+=(--offline)
+"$python_bin" "${agent_source}/scripts/fetch_pi.py" "${agent_fetch_args[@]}"
+agent_build_requirements=(setuptools==80.9.0 wheel==0.45.1)
+if ((! offline)); then
+    "$python_bin" -m pip download --disable-pip-version-check --no-input \
+        --only-binary=:all: --dest "$wheelhouse_dir" "${agent_build_requirements[@]}"
+fi
+agent_build_env="${build_root}/agent-build-env"
+"$python_bin" -m venv --without-pip "$agent_build_env"
+"$python_bin" -m pip --python "$agent_build_env" install \
+    --disable-pip-version-check --no-input --no-index --find-links "$wheelhouse_dir" \
+    "${agent_build_requirements[@]}"
+"$python_bin" -m pip --python "$agent_build_env" wheel \
+    --disable-pip-version-check --no-input --no-index --no-deps --no-build-isolation \
+    --wheel-dir "${build_root}/agent-wheel" "$agent_source"
+agent_wheels=("${build_root}"/agent-wheel/ftllm_agent_runtime-*.whl)
+[[ ${#agent_wheels[@]} == 1 && -f "${agent_wheels[0]}" ]] \
+    || die "没有生成唯一的 ftllm-agent-runtime wheel"
+agent_wheel_path="${agent_wheels[0]}"
+"$python_bin" -m pip install --disable-pip-version-check --no-input \
+    --no-index --no-deps --no-compile "$agent_wheel_path"
+agent_tools_args=(--runtime-dir "$runtime_dir" --cache-dir "${cache_dir}/agent-tools")
+((offline == 0)) || agent_tools_args+=(--offline)
+"$python_bin" "${PORTABLE_ASSETS_DIR}/fetch_agent_tools.py" "${agent_tools_args[@]}"
+
 mkdir -p "${bundle_dir}/libexec"
 install -m 0755 "${PORTABLE_ASSETS_DIR}/launcher.sh" "${bundle_dir}/ftllm"
+install -m 0755 "${PORTABLE_ASSETS_DIR}/launcher.sh" "${bundle_dir}/ftllm-agent-runtime"
 install -m 0755 "${PORTABLE_ASSETS_DIR}/launcher.sh" "${bundle_dir}/python"
 install -m 0755 "${PORTABLE_ASSETS_DIR}/launcher.sh" "${bundle_dir}/pip"
 install -m 0755 "${PORTABLE_ASSETS_DIR}/launcher.sh" "${bundle_dir}/ftllm-check"
@@ -622,7 +675,8 @@ if ((run_tests)); then
     log "运行可重定位启动器和原生库冒烟测试"
     "${bundle_dir}/ftllm" --version
     "${bundle_dir}/ftllm" --help >/dev/null
-    "${bundle_dir}/runtime/bin/streamlit" --version >/dev/null
+    "${bundle_dir}/ftllm-agent-runtime" info
+    "${bundle_dir}/python" "${PORTABLE_ASSETS_DIR}/smoke_agent.py"
     embedded_build_paths="$(grep -RIlF "$build_root" "${bundle_dir}/runtime/bin" || true)"
     [[ -z "$embedded_build_paths" ]] \
         || die "console script 仍包含临时构建路径：${embedded_build_paths}"

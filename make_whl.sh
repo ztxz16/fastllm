@@ -63,15 +63,20 @@ cp tools/ftllm/libfastllm_tools.so tools/ftllm/libfastllm_tools-cpu.so
 # cuda-12
 rm -rf CMakeCache.txt CMakeFiles
 CUDA_ARCH_LIST="60-real;70-real;75-real;80-real;89-real;90-real;100-real;120"
-if [ -x /usr/local/cuda/bin/nvcc ]; then
-    CUDA_COMPILER=/usr/local/cuda/bin/nvcc
-elif [ -x /usr/local/cuda-12.9/bin/nvcc ]; then
+if [ -x /usr/local/cuda-12.9/bin/nvcc ]; then
     CUDA_COMPILER=/usr/local/cuda-12.9/bin/nvcc
+elif [ -x /usr/local/cuda/bin/nvcc ]; then
+    CUDA_COMPILER=/usr/local/cuda/bin/nvcc
 elif [ -x /usr/local/cuda-12.1/bin/nvcc ]; then
     CUDA_COMPILER=/usr/local/cuda-12.1/bin/nvcc
 else
     echo "nvcc not found in /usr/local/cuda*/bin"
     exit -1
+fi
+
+if ! "$CUDA_COMPILER" --version | grep -q 'release 12\.'; then
+    echo "CUDA 12 is required for this wheel. Please install CUDA 12.9."
+    exit 1
 fi
 
 cmake .. \

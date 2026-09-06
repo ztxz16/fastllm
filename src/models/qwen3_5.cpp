@@ -2279,7 +2279,7 @@ namespace fastllm {
         static DataType ResolveQwen35ThreadTpCacheType(DataType cacheType, DataType computeType) {
             if (cacheType == DataType::FLOAT16 ||
                 cacheType == DataType::BFLOAT16 ||
-                cacheType == DataType::FP8_E4M3) {
+                cacheType == DataType::FP8_E4M3 || cacheType == DataType::FP4_E2M1) {
                 return cacheType;
             }
             return computeType;
@@ -5785,13 +5785,13 @@ namespace fastllm {
                 int rotaryDim,
                 const std::vector<int> &sections,
                 float ropeTheta,
-                float ropeScale) {
-            if (positionIds.dims.size() == 2 && positionIds.dims[0] == 3) {
+                float ropeScale, const RopeConfig *ropeConfig) {
+            if (!ropeConfig && positionIds.dims.size() == 2 && positionIds.dims[0] == 3) {
                 Qwen35CudaInterleavedRope(runner, input, positionIds, rotaryDim,
                                           sections, ropeTheta, ropeScale);
             } else {
                 qwen3cuda::Qwen3CudaRopeEncoding(runner, input, positionIds,
-                                                 rotaryDim, ropeTheta, ropeScale);
+                                                 rotaryDim, ropeTheta, ropeScale, ropeConfig);
             }
         }
 
@@ -5818,7 +5818,7 @@ namespace fastllm {
                 int pageLen,
                 int batch,
                 bool doQKNorm,
-                Data *lastPageLens) {
+                Data *lastPageLens, const RopeConfig *ropeConfig) {
             AssertInFastLLM(qgatekv.dims.size() == 3,
                             "Qwen3.5 fused gated attention decode expects [bs, seq, dim].\n");
             int bsz = qgatekv.dims[0];
@@ -5847,16 +5847,19 @@ namespace fastllm {
                 datas["lastPageLens"] = lastPageLens;
                 outputs.push_back("lastPageLens");
             }
-            runner.Run("Qwen35QGateKVRMSNormRopeSplitAppendPagedCache",
-                       datas,
-                       FloatDict{{"eps", eps}, {"ropeTheta", ropeTheta}, {"ropeScale", ropeScale}},
-                       IntDict{{"q_heads", qHeads}, {"k_heads", kHeads}, {"head_dim", headDim},
+            FloatDict floats = {{"eps", eps}, {"ropeTheta", ropeTheta}, {"ropeScale", ropeScale}};
+            IntDict ints = {{"q_heads", qHeads}, {"k_heads", kHeads}, {"head_dim", headDim},
                                {"rotaryDim", rotaryDim},
                                {"sectionT", sections.size() > 0 ? sections[0] : 0},
                                {"sectionH", sections.size() > 1 ? sections[1] : 0},
                                {"sectionW", sections.size() > 2 ? sections[2] : 0},
                                {"pageLen", pageLen}, {"batch", batch},
-                               {"doQKNorm", (int)doQKNorm}},
+                               {"doQKNorm", (int)doQKNorm}};
+            if (ropeConfig) ropeConfig->AddFusedParams(floats, ints);
+            runner.Run("Qwen35QGateKVRMSNormRopeSplitAppendPagedCache",
+                       datas,
+                       floats,
+                       ints,
                        outputs);
         }
 
@@ -6584,7 +6587,7 @@ namespace fastllm {
                 int numAttentionHeads, int numKeyValueHeads, int headDim,
                 int rotaryDim, const std::vector<int> &mropeSections,
                 float rmsNormEps, float ropeBase, float ropeFactor,
-                int ropeType,
+                int ropeType, const RopeConfig *ropeConfig,
                 bool isPrefill,
                 Data *hiddenStates,
                 int pagedCacheLayerOffset,
@@ -6726,7 +6729,7 @@ namespace fastllm {
             }
 
             if (isPrefill) {
-                bool fusedPrefill = Qwen35CudaTryQGateKVPrefill(
+                bool fusedPrefill = !ropeConfig && Qwen35CudaTryQGateKVPrefill(
                     runner, *merged, *qNormWeight, *kNormWeight,
                     *allPositionIds, *q, *gate, *k, *v,
                     numAttentionHeads, numKeyValueHeads, headDim,
@@ -6749,9 +6752,9 @@ namespace fastllm {
                     Qwen3CudaRMSNorm(runner, *q, *qNormWeight, rmsNormEps, *q);
                     Qwen3CudaRMSNorm(runner, *k, *kNormWeight, rmsNormEps, *k);
                     Qwen35CudaApplyRotary(runner, *q, *allPositionIds,
-                                          rotaryDim, mropeSections, ropeBase, ropeScale);
+                                          rotaryDim, mropeSections, ropeBase, ropeScale, ropeConfig);
                     Qwen35CudaApplyRotary(runner, *k, *allPositionIds,
-                                          rotaryDim, mropeSections, ropeBase, ropeScale);
+                                          rotaryDim, mropeSections, ropeBase, ropeScale, ropeConfig);
 
                     Qwen3CudaPermuteSelf(runner, *q, {0, 2, 1, 3});
                     Qwen3CudaPermuteSelf(runner, *k, {0, 2, 1, 3});
@@ -6892,7 +6895,7 @@ namespace fastllm {
                     numAttentionHeads, numKeyValueHeads, headDim,
                     rotaryDim, mropeSections, rmsNormEps, ropeBase, ropeScale,
                     kCaches.pageLen, batch, true,
-                    fillLastPageLensOnDevice ? lastPageLens : nullptr);
+                    fillLastPageLensOnDevice ? lastPageLens : nullptr, ropeConfig);
 
                 if (!externalDecodeMeta) {
                     for (int b = 0; b < batch; b++) {
@@ -10887,7 +10890,7 @@ namespace fastllm {
                             localQHeads, localKVHeads, head_dim,
                             rotary_dim, mrope_sections,
                             rms_norm_eps, rope_base, rope_factor,
-                            rope_type, isPrefill,
+                            rope_type, YarnConfig(), isPrefill,
                             &buf.hiddenStates,
                         pagedCacheLayerOffset,
                         true, true, true, 1,
@@ -12369,7 +12372,7 @@ namespace fastllm {
                                 localQHeads, localKVHeads, head_dim,
                                 rotary_dim, mrope_sections,
                                 rms_norm_eps, rope_base, rope_factor,
-                                rope_type, false,
+                                rope_type, YarnConfig(), false,
                                 &hiddenStates,
                                 pagedCacheLayerOffset,
                                 true, true,
@@ -12465,7 +12468,7 @@ namespace fastllm {
                                     localQHeads, localKVHeads, head_dim,
                                     rotary_dim, mrope_sections,
                                     rms_norm_eps, rope_base, rope_factor,
-                                    rope_type, false,
+                                    rope_type, YarnConfig(), false,
                                     &rowHiddenStates,
                                     pagedCacheLayerOffset,
                                     true, packedExactPagedMeta,
@@ -12529,7 +12532,7 @@ namespace fastllm {
                             localQHeads, localKVHeads, head_dim,
                             rotary_dim, mrope_sections,
                             rms_norm_eps, rope_base, rope_factor,
-                            rope_type, isPrefill,
+                            rope_type, YarnConfig(), isPrefill,
                             &hiddenStates,
                             pagedCacheLayerOffset,
                             true, false,
@@ -15773,9 +15776,14 @@ namespace fastllm {
                     }
                     Qwen35MtpVerifyGraphDeviceState &rootGraphDevice =
                         *graphState.deviceStates[0];
+                    speculativeHiddenStates.FreeSpace();
                     Qwen35BorrowCudaTensor(
                         speculativeHiddenStates,
                         rootGraphDevice.hiddenStates);
+                    // This persistent output must detach on the next prefill.
+                    // cudaDataBorrowed protects the graph allocation; isFake
+                    // would also suppress freeing subsequent owning copies.
+                    speculativeHiddenStates.isFake = false;
                     if (speculativeCaptureDFlashHiddenStates) {
                         speculativeDFlashHiddenStates.resize(
                             rootGraphDevice.dflashHiddenStates.size());
@@ -23198,6 +23206,7 @@ namespace fastllm {
     }
 
     void Qwen3_5Model::InitParams() {
+        imageEmbeddingCache.reset();
         auto getDictValue = [&](const std::string &key, const std::string &defaultValue) {
             auto it = this->weight.dicts.find(key);
             if (it != this->weight.dicts.end()) {
@@ -23279,6 +23288,7 @@ namespace fastllm {
             rope_factor = atof(this->weight.dicts["rope_scaling.factor"].c_str());
         }
         mrope_sections = {11, 11, 10};
+        InitContextParams(rope_type, rope_base, rope_factor, rotary_dim);
         std::string mropeSection = getDictValue(
             "mrope_section",
             getDictValue("rope_parameters.mrope_section", "")
@@ -23305,6 +23315,7 @@ namespace fastllm {
                 mrope_sections = {base, base, half - base * 2};
             }
         }
+        if (YarnConfig()) mrope_sections = YarnConfig()->mropeSections;
         vision_depth = atoi(getDictValue("vision_config.depth", "0").c_str());
         vision_hidden_size = atoi(getDictValue("vision_config.hidden_size", "0").c_str());
         vision_num_heads = atoi(getDictValue("vision_config.num_heads", "0").c_str());
@@ -24803,6 +24814,7 @@ namespace fastllm {
     }
 
     void Qwen3_5Model::OnModelWeightsLoaded() {
+        imageEmbeddingCache.reset();
         bool forceSafeGgufDequant = false;
         for (const auto &item : this->weight.weight) {
             forceSafeGgufDequant |= item.second.forceGGUFFp32Dequant;
@@ -25087,7 +25099,8 @@ namespace fastllm {
                                          const Data *gridThwData,
                                          bool isVideo,
                                          Data &features,
-                                         std::vector<std::vector<int>> &gridThwList) {
+                                         std::vector<std::vector<int>> &gridThwList,
+                                         const Data *imageCacheKeys) {
         gridThwList.clear();
         features = Data();
         if (rawInputs.empty()) {
@@ -25118,6 +25131,21 @@ namespace fastllm {
         std::vector<float> mergedFeatures;
         int totalFeatureCount = 0;
 
+        ImageEmbeddingCache *imageCache = nullptr;
+        if (!isVideo && imageCacheKeys != nullptr && imageCacheKeys->cpuData != nullptr &&
+            imageCacheKeys->dataType == DataType::INT32 &&
+            imageCacheKeys->dims == std::vector<int>({(int)rawInputs.size(), 8})) {
+            // The scheduler serializes model forwards. Delay both configuration
+            // lookup and pool construction until the first eligible image request.
+            if (!imageEmbeddingCache) {
+                size_t capacity = ImageEmbeddingCache::CapacityFromEnv();
+                if (capacity > 0) {
+                    imageEmbeddingCache = std::make_unique<ImageEmbeddingCache>(capacity);
+                }
+            }
+            imageCache = imageEmbeddingCache.get();
+        }
+
         for (int mediaIndex = 0; mediaIndex < (int) rawInputs.size(); mediaIndex++) {
             std::vector<int> grid = {
                 readGridValue(mediaIndex * 3 + 0),
@@ -25125,6 +25153,23 @@ namespace fastllm {
                 readGridValue(mediaIndex * 3 + 2),
             };
             gridThwList.push_back(grid);
+
+            std::string imageCacheKey;
+            if (imageCache != nullptr) {
+                // The Python payload hashes the actual FP32 image, shape, grid
+                // and processor settings. Keep all 256 bits, outside token IDs.
+                imageCacheKey.assign((const char*)imageCacheKeys->cpuData + mediaIndex * 32, 32);
+                imageCacheKey += std::to_string((int)this->dataType);
+                size_t cached = imageCache->Append(imageCacheKey, mergedFeatures);
+                if (cached > 0) {
+                    totalFeatureCount += (int)(cached / vision_out_hidden_size);
+                    if (this->verbose) {
+                        printf("[Vision] Image embedding cache hit (%zu bytes).\n", cached * sizeof(float));
+                    }
+                    continue;
+                }
+            }
+            size_t featureStart = mergedFeatures.size();
 
             Data rawCpu(*rawInputs[mediaIndex]);
             rawCpu.ToDevice(DataDevice::CPU);
@@ -25746,6 +25791,16 @@ namespace fastllm {
                 runMerger(mergerInput, mergerOutput);
                 appendMergerOutput(mergerOutput);
             }
+            if (!imageCacheKey.empty()) {
+                size_t count = mergedFeatures.size() - featureStart;
+                bool stored = imageCache->Put(
+                    imageCacheKey, mergedFeatures.data() + featureStart, count);
+                if (this->verbose) {
+                    printf("[Vision] Image embedding cache miss (%s; %zu/%zu bytes).\n",
+                           stored ? "stored" : "uncached",
+                           imageCache->SizeBytes(), imageCache->Capacity());
+                }
+            }
 #ifdef USE_CUDA
             FastllmCudaClearBigBufferAll();
 #endif
@@ -26009,6 +26064,10 @@ namespace fastllm {
     }
 
     void Qwen3_5Model::ApplyMultimodalRotary(Data &input, const Data &positionIds, float ropeScale) {
+        if (YarnConfig()) {
+            ApplyYarnRope(input, positionIds, *YarnConfig());
+            return;
+        }
         if (positionIds.dims.size() == 2 && positionIds.dims[0] == 3) {
             fastllm::Qwen35InterleavedRope(
                 input, positionIds, rotary_dim,
@@ -30724,12 +30783,15 @@ namespace fastllm {
         Data imageFeatures, videoFeatures;
         std::vector<std::vector<int>> imageGridThwList, videoGridThwList;
         if (hasRawMedia) {
+            auto imageCacheIt = multimodalInput.find("image_cache_keys");
             EncodeVisualItems(
                 rawImageIt != multimodalInput.end() ? rawImageIt->second : std::vector<Data*>(),
                 (imageGridIt != multimodalInput.end() && !imageGridIt->second.empty()) ? imageGridIt->second[0] : nullptr,
                 false,
                 imageFeatures,
-                imageGridThwList
+                imageGridThwList,
+                (imageCacheIt != multimodalInput.end() && !imageCacheIt->second.empty()) ?
+                    imageCacheIt->second[0] : nullptr
             );
             EncodeVisualItems(
                 rawVideoIt != multimodalInput.end() ? rawVideoIt->second : std::vector<Data*>(),
@@ -30787,7 +30849,33 @@ namespace fastllm {
 
         Data hiddenStates;
         Data embeddingResult;
-        Embedding(inputIds, this->weight[language_prefix + "embed_tokens.weight"], embeddingResult);
+        Data &multimodalEmbedWeight = this->weight[language_prefix + "embed_tokens.weight"];
+#ifdef USE_CUDA
+        if (GetCudaEmbedding() && !GetLowMemMode() &&
+            multimodalEmbedWeight.IsTensorParallelReplicated() &&
+            multimodalEmbedWeight.multiDeviceData) {
+            // TP owns one full embedding table per GPU. The parent tensor is
+            // metadata; generic Embedding must use an actual local replica.
+            Data *localEmbed = nullptr;
+            int embedDevice = -1;
+            for (const auto &entry : multimodalEmbedWeight.multiDeviceDatas) {
+                if (entry.second != nullptr &&
+                    entry.second->dataDevice == DataDevice::CUDA &&
+                    entry.second->cudaData != nullptr) {
+                    embedDevice = entry.first;
+                    localEmbed = entry.second;
+                    break;
+                }
+            }
+            AssertInFastLLM(localEmbed != nullptr,
+                            "Qwen3.5 multimodal is missing a CUDA embedding replica.\n");
+            Qwen35ScopedGenericExecutor executor("cuda:" + std::to_string(embedDevice));
+            Embedding(inputIds, *localEmbed, embeddingResult);
+        } else
+#endif
+        {
+            Embedding(inputIds, multimodalEmbedWeight, embeddingResult);
+        }
         ToDataType(embeddingResult, hiddenStates, this->dataType);
         MergeMultimodalFeaturesIntoText(*mmTypeIt->second[0], imageEmbeds, videoEmbeds, hiddenStates);
         embeddingResult.FreeSpace();

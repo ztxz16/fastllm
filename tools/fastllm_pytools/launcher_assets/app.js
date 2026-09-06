@@ -10,6 +10,7 @@ const ACTIVE_DOWNLOAD_PHASES = new Set(["starting", "downloading", "cancelling"]
 const DEFAULT_LOCALE = "zh-CN";
 const SUPPORTED_LOCALES = new Set(["zh-CN", "en-US"]);
 const LOCALE_STORAGE_KEY = "ftllm-launcher-locale";
+const WEBUI_LOAD_TIMEOUT_MS = 30000;
 const AUTOMATIC_CONFIGURATION_DEFAULTS = Object.freeze({
   device: "auto",
   cuda_device_id: "0",
@@ -42,6 +43,9 @@ const localeCache = new Map();
 const capturedStaticText = [];
 const capturedStaticAttributes = [];
 let profileRenderSignature = "";
+let webuiModulePromise;
+let webuiModuleRetries = 0;
+let webuiModuleLoaded = false;
 
 const state = {
   profiles: [],
@@ -60,6 +64,15 @@ const state = {
   logs: [],
   lastLogId: 0,
   currentView: "launch",
+  profileQuery: "",
+  profileFilter: "all",
+  webuiSessionId: "",
+  webuiLoading: false,
+  webuiError: "",
+  webuiRequestId: 0,
+  webuiLoadTimer: null,
+  webuiAbortController: null,
+  webuiComponent: null,
   locale: DEFAULT_LOCALE,
   staticMessages: {},
   messages: {},
@@ -120,12 +133,15 @@ function cacheElements() {
   const ids = [
     "app-version", "shutdown-launcher", "status-dot", "status-title", "status-message",
     "open-endpoint", "stop-runtime", "profile-count", "profile-list", "new-profile",
+    "current-view-title", "profile-search", "profile-results",
+    "open-webui", "webui-placeholder", "webui-status",
+    "webui-content", "webui-retry",
     "config-path", "profile-editor-modal", "profile-editor-title", "launch-form",
     "close-profile-editor", "save-state", "ori-field", "auto-configure-profile",
     "clear-profile-config", "automatic-config-status",
     "cuda-device-field", "tp-device-field", "cudapp-device-field", "moe-device-field",
     "moe-device-custom-field", "moe-layers-field", "server-model-name-field", "server-host-field",
-    "webui-max-token-field", "webui-think-field", "server-context-field",
+    "webui-max-token-field", "webui-think-field",
     "server-sampling-title", "server-sampling-fields", "server-api-key-field",
     "server-hide-input-field", "launch-command-kicker", "command-preview",
     "validation-messages", "save-profile",
@@ -349,6 +365,8 @@ async function changeLocale(locale) {
 }
 
 function renderLocalizedContent() {
+  state.webuiComponent?.setLocale(state.locale);
+  renderViewTitle();
   updateConditionalFields();
   renderAutomaticConfigurationStatus();
   renderProfileEditorTitle();
@@ -407,6 +425,14 @@ function renderLauncherAddresses() {
 
 function bindEvents() {
   document.addEventListener("click", handleDelegatedClick);
+  elements.webuiRetry.addEventListener("click", () => {
+    state.webuiError = "";
+    openEmbeddedWebUI();
+  });
+  elements.profileSearch.addEventListener("input", (event) => {
+    state.profileQuery = event.target.value;
+    renderProfiles();
+  });
   elements.launchForm.addEventListener("input", handleFormChange);
   elements.launchForm.addEventListener("change", handleFormChange);
   elements.downloadForm.addEventListener("input", handleDownloadChange);
@@ -452,6 +478,13 @@ function bindEvents() {
       }
       return;
     }
+    if (event.key === "Tab") {
+      const dialog = !elements.folderPickerModal.classList.contains("hidden")
+        ? elements.folderPickerModal
+        : !elements.profileEditorModal.classList.contains("hidden") ? elements.profileEditorModal : null;
+      if (dialog) trapDialogFocus(event, dialog);
+      return;
+    }
     if (event.key !== "Escape") return;
     if (!elements.folderPickerModal.classList.contains("hidden")) {
       event.preventDefault();
@@ -475,6 +508,36 @@ function bindEvents() {
 }
 
 function handleDelegatedClick(event) {
+  if (event.target.closest("[data-new-profile]")) {
+    newProfile();
+    return;
+  }
+  if (event.target.closest("[data-clear-profile-filters]")) {
+    resetProfileFilters();
+    renderProfiles();
+    elements.profileSearch.focus();
+    return;
+  }
+  const filter = event.target.closest("[data-profile-filter]");
+  if (filter) {
+    state.profileFilter = filter.dataset.profileFilter;
+    renderProfileFilters();
+    renderProfiles();
+    return;
+  }
+  const sectionButton = event.target.closest("[data-editor-section]");
+  if (sectionButton) {
+    const section = document.getElementById(`editor-${sectionButton.dataset.editorSection}`);
+    if (section instanceof HTMLDetailsElement) section.open = true;
+    section?.scrollIntoView({ block: "start" });
+    // Keep the jump links available while making the section keyboard-accessible.
+    const heading = section?.querySelector(".section-title, summary");
+    if (heading) {
+      heading.setAttribute("tabindex", "-1");
+      heading.focus({ preventScroll: true });
+    }
+    return;
+  }
   const profileAction = event.target.closest("[data-profile-action]");
   if (profileAction) {
     const index = Number(profileAction.dataset.profileIndex);
@@ -484,9 +547,9 @@ function handleDelegatedClick(event) {
     if (action === "delete") deleteProfile(index);
     return;
   }
-  const nav = event.target.closest("[data-view-button]");
+  const nav = event.target.closest("[data-view-button], [data-open-view]");
   if (nav) {
-    switchView(nav.dataset.viewButton);
+    switchView(nav.dataset.viewButton || nav.dataset.openView);
     return;
   }
 }
@@ -494,11 +557,17 @@ function handleDelegatedClick(event) {
 function switchView(view) {
   state.currentView = view;
   for (const button of document.querySelectorAll("[data-view-button]")) {
-    button.classList.toggle("active", button.dataset.viewButton === view);
+    const selected = button.dataset.viewButton === view;
+    button.classList.toggle("active", selected);
+    if (selected) button.setAttribute("aria-current", "page");
+    else button.removeAttribute("aria-current");
   }
   for (const panel of document.querySelectorAll(".view")) {
     panel.classList.toggle("active", panel.id === `view-${view}`);
   }
+  document.querySelector(".app-shell").classList.toggle("webui-active", view === "webui");
+  elements.openWebui.classList.toggle("hidden", view === "webui");
+  if (view === "webui") renderWebUIAvailability();
   if (view === "logs") {
     document.querySelector('[data-view-button="logs"]').classList.remove("has-activity");
     scrollLogsToBottom();
@@ -507,6 +576,43 @@ function switchView(view) {
     document.querySelector('[data-view-button="download"]').classList.remove("has-activity");
   }
   if (view === "hardware" && !state.hardwareLoaded) loadHardware();
+  renderViewTitle();
+}
+
+function renderViewTitle() {
+  const titles = {
+    launch: t("Launch service"),
+    webui: t("Studio"),
+    download: t("Download model"),
+    logs: t("Runtime logs"),
+    hardware: t("Hardware")
+  };
+  elements.currentViewTitle.textContent = titles[state.currentView] || titles.launch;
+}
+
+function renderProfileFilters() {
+  for (const button of document.querySelectorAll("[data-profile-filter]")) {
+    const selected = button.dataset.profileFilter === state.profileFilter;
+    button.classList.toggle("active", selected);
+    button.setAttribute("aria-pressed", String(selected));
+  }
+}
+
+function resetProfileFilters() {
+  state.profileQuery = "";
+  state.profileFilter = "all";
+  elements.profileSearch.value = "";
+  renderProfileFilters();
+}
+
+function createIcon(name) {
+  const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  icon.classList.add("icon");
+  icon.setAttribute("aria-hidden", "true");
+  const use = document.createElementNS("http://www.w3.org/2000/svg", "use");
+  use.setAttribute("href", `#icon-${name}`);
+  icon.append(use);
+  return icon;
 }
 
 function cloneConfig(config) {
@@ -884,12 +990,18 @@ function renderProfiles() {
   const runningIndex = findRunningProfileIndex();
   const signature = JSON.stringify([
     state.locale,
+    state.profileQuery,
+    state.profileFilter,
     state.profiles.map((profile) => [
       profile.name,
       profile.model_name,
       profile.command,
       profile.model,
       profile.device,
+      profile.cuda_device_id,
+      profile.tp,
+      profile.cudapp,
+      profile.dtype,
       profile.port
     ]),
     active,
@@ -903,21 +1015,39 @@ function renderProfiles() {
   profileRenderSignature = signature;
   elements.profileList.replaceChildren();
   elements.profileCount.textContent = String(state.profiles.length);
-  if (!state.profiles.length) {
+  const query = state.profileQuery.trim().toLocaleLowerCase();
+  const profiles = state.profiles.map((profile, index) => ({ profile, index })).filter(({ profile }) => {
+    const mode = profile.command === "webui" ? "webui" : "server";
+    return (state.profileFilter === "all" || mode === state.profileFilter)
+      && [profile.name, profile.model_name, profile.model].some(
+        (value) => String(value || "").toLocaleLowerCase().includes(query)
+      );
+  });
+  elements.profileResults.textContent = t("{count} launch items shown", { count: profiles.length });
+  if (!profiles.length) {
+    const filtered = state.profiles.length > 0;
     const empty = document.createElement("div");
     empty.className = "empty-profile";
     const icon = document.createElement("span");
     icon.className = "empty-profile-icon";
-    icon.textContent = "+";
+    icon.append(createIcon(filtered ? "search" : "grid"));
     const title = document.createElement("strong");
-    title.textContent = t("No launch items yet");
+    title.textContent = filtered ? t("No matching launch items") : t("Your first model starts here");
     const detail = document.createElement("small");
-    detail.textContent = t("Add a launch item to configure your first local model service.");
-    empty.append(icon, title, detail);
+    detail.textContent = filtered
+      ? t("Try another name or model path, or clear the filters.")
+      : t("Choose a local model and save a profile to launch an API or chat service.");
+    const action = document.createElement("button");
+    action.type = "button";
+    action.className = "primary-button";
+    if (filtered) action.dataset.clearProfileFilters = "";
+    else action.dataset.newProfile = "";
+    action.textContent = filtered ? t("Clear filters") : t("Add launch item");
+    empty.append(icon, title, detail, action);
     elements.profileList.append(empty);
     return;
   }
-  state.profiles.forEach((profile, index) => {
+  profiles.forEach(({ profile, index }) => {
     const item = document.createElement("article");
     item.className = "profile-item";
     const running = index === runningIndex;
@@ -925,6 +1055,7 @@ function renderProfiles() {
 
     const avatar = document.createElement("span");
     avatar.className = "profile-avatar";
+    if (profile.command === "webui") avatar.classList.add("webui");
     avatar.textContent = firstVisibleCharacter(profile.name || profile.model_name || "F");
     const copy = document.createElement("div");
     copy.className = "profile-copy";
@@ -935,10 +1066,10 @@ function renderProfiles() {
     const mode = document.createElement("span");
     mode.className = "profile-mode";
     mode.textContent = profile.command === "webui" ? t("Chat WebUI") : t("API Server");
-    titleRow.append(title, mode);
+    titleRow.append(title);
     const metadata = document.createElement("div");
     metadata.className = "profile-metadata";
-    for (const value of [profileDeviceLabel(profile), t("Port {port}", { port: profile.port || "—" })]) {
+    for (const value of [profileDeviceLabel(profile), profile.dtype || "auto", t("Port {port}", { port: profile.port || "—" })]) {
       const detail = document.createElement("span");
       detail.textContent = value;
       metadata.append(detail);
@@ -947,7 +1078,7 @@ function renderProfiles() {
     path.className = "profile-path";
     path.textContent = profile.model || t("Model not set");
     path.title = profile.model || "";
-    copy.append(titleRow, metadata, path);
+    copy.append(mode, titleRow, path, metadata);
 
     const actions = document.createElement("div");
     actions.className = "project-actions";
@@ -997,7 +1128,9 @@ function profileDeviceLabel(profile) {
     cpu: "CPU",
     numa: "NUMA"
   };
-  return devices[profile.device] || String(profile.device || t("Auto device"));
+  const device = devices[profile.device] || String(profile.device || t("Auto device"));
+  const ids = { cuda: profile.cuda_device_id || "0", tp: profile.tp, cudapp: profile.cudapp };
+  return ids[profile.device] ? `${device} · ${ids[profile.device]}` : device;
 }
 
 function renderProfileRuntime() {
@@ -1184,6 +1317,7 @@ async function saveCurrentProfile(showSuccess = false) {
   state.currentIndex = result.index;
   state.editingConfig = cloneConfig(result.profile);
   state.dirty = false;
+  resetProfileFilters();
   renderSaveState();
   if (showSuccess) showToast(t("Launch profile saved."), "success");
   return result.profile;
@@ -1344,6 +1478,7 @@ function renderRuntime() {
   elements.stopRuntime.disabled = phase === "stopping";
   elements.openEndpoint.disabled = !runtime.ready;
   elements.openEndpoint.textContent = isWebui ? t("Open WebUI") : t("Open API documentation");
+  renderWebUIAvailability();
   renderProfiles();
   updateActionAvailability();
 }
@@ -2093,6 +2228,22 @@ function trapConfirmationFocus(event) {
   }
 }
 
+function trapDialogFocus(event, dialog) {
+  const controls = [...dialog.querySelectorAll(
+    'button, input, select, textarea, summary, a[href], [tabindex="0"]'
+  )].filter((element) => !element.disabled && element.getClientRects().length > 0);
+  if (!controls.length) return;
+  const first = controls[0];
+  const last = controls[controls.length - 1];
+  if (event.shiftKey && (document.activeElement === first || !controls.includes(document.activeElement))) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && (document.activeElement === last || !dialog.contains(document.activeElement))) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
 function showToast(message, tone = "", duration = 3500) {
   const toast = document.createElement("div");
   toast.className = `toast ${tone}`.trim();
@@ -2103,4 +2254,118 @@ function showToast(message, tone = "", duration = 3500) {
 
 function friendlyError(error) {
   return localizeServerText(error?.message || error || t("Unknown error"));
+}
+
+function webuiIsReady() {
+  return state.runtime?.command === "server" && state.runtime?.phase === "running"
+    && state.runtime?.ready && Boolean(state.runtime?.sessionId);
+}
+
+function renderWebUIAvailability() {
+  const ready = webuiIsReady();
+  elements.openWebui.disabled = !ready;
+  if ((!ready || state.webuiSessionId !== state.runtime?.sessionId)
+      && (state.webuiSessionId || state.webuiLoading)) {
+    state.webuiRequestId += 1;
+    clearWebUILoad();
+    state.webuiSessionId = "";
+    state.webuiLoading = false;
+    state.webuiError = "";
+    destroyWebUI();
+  }
+  const loaded = ready && state.webuiSessionId === state.runtime.sessionId
+    && !state.webuiLoading && !state.webuiError;
+  elements.webuiContent.classList.toggle("hidden", !loaded);
+  elements.webuiPlaceholder.classList.toggle("hidden", loaded);
+  elements.webuiRetry.classList.toggle("hidden", !ready || !state.webuiError);
+  elements.webuiStatus.textContent = state.webuiError ? localizeServerText(state.webuiError)
+    : ready ? t("Opening WebUI…") : t("Start an API Server before opening WebUI.");
+  if (state.currentView === "webui" && ready && !state.webuiLoading && !state.webuiSessionId && !state.webuiError) {
+    openEmbeddedWebUI();
+  }
+}
+
+function destroyWebUI() {
+  state.webuiComponent?.destroy();
+  state.webuiComponent = null;
+  elements.webuiContent.replaceChildren();
+}
+
+function clearWebUILoad() {
+  clearTimeout(state.webuiLoadTimer);
+  state.webuiLoadTimer = null;
+  state.webuiAbortController?.abort();
+  state.webuiAbortController = null;
+  // Imports cannot be aborted. Retry a stalled import with a fresh URL while
+  // keeping the successfully loaded module shared across model sessions.
+  if (webuiModulePromise && !webuiModuleLoaded) {
+    webuiModulePromise = null;
+    webuiModuleRetries += 1;
+  }
+}
+
+function failWebUILoad(requestId, message = "Unable to load WebUI. Try reopening it.") {
+  if (requestId !== state.webuiRequestId || !state.webuiLoading) return;
+  state.webuiRequestId += 1;
+  clearWebUILoad();
+  state.webuiLoading = false;
+  state.webuiError = message;
+  destroyWebUI();
+  renderWebUIAvailability();
+}
+
+async function openEmbeddedWebUI() {
+  if (!webuiIsReady() || state.webuiLoading) return;
+  const sessionId = state.runtime.sessionId;
+  const requestId = ++state.webuiRequestId;
+  state.webuiSessionId = sessionId;
+  state.webuiLoading = true;
+  state.webuiError = "";
+  clearWebUILoad();
+  const controller = new AbortController();
+  state.webuiAbortController = controller;
+  state.webuiLoadTimer = setTimeout(() => {
+    failWebUILoad(requestId, "WebUI loading timed out. Try reopening it.");
+  }, WEBUI_LOAD_TIMEOUT_MS);
+  renderWebUIAvailability();
+  try {
+    const result = await request("/api/webui/open", {
+      method: "POST", body: JSON.stringify({ sessionId }), signal: controller.signal
+    });
+    if (requestId !== state.webuiRequestId || sessionId !== state.runtime?.sessionId) return;
+    if (!webuiModulePromise) {
+      const suffix = webuiModuleRetries ? `?retry=${webuiModuleRetries}` : "";
+      const pending = import(`/assets/webui/app.js${suffix}`).then(module => {
+        if (webuiModulePromise === pending) webuiModuleLoaded = true;
+        return module;
+      }, error => {
+        if (webuiModulePromise === pending) {
+          webuiModulePromise = null;
+          webuiModuleRetries += 1;
+        }
+        throw error;
+      });
+      webuiModulePromise = pending;
+    }
+    const {mountWebUI} = await webuiModulePromise;
+    if (requestId !== state.webuiRequestId) return;
+    const host = document.createElement("div");
+    elements.webuiContent.replaceChildren(host);
+    const component = await mountWebUI(host, {
+      basePath: result.url, embedded: true, locale: state.locale,
+      iconUrl: "/assets/launcher-icon.png", signal: controller.signal
+    });
+    if (requestId !== state.webuiRequestId || sessionId !== state.runtime?.sessionId) {
+      component.destroy();
+      return;
+    }
+    state.webuiComponent = component;
+    clearWebUILoad();
+    state.webuiLoading = false;
+    component.setLocale(state.locale);
+    renderWebUIAvailability();
+  } catch (error) {
+    failWebUILoad(requestId, error instanceof TypeError ? "Unable to load WebUI. Try reopening it."
+      : error?.message || "Unable to load WebUI. Try reopening it.");
+  }
 }

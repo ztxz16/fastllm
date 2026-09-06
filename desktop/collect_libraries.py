@@ -201,6 +201,11 @@ def collect(args: argparse.Namespace) -> Dict[str, object]:
 
     for soname, optional_path in find_optional_libraries(args.optional).items():
         bundle_library(soname, optional_path)
+    for soname, source in find_nss_libraries().items():
+        bundle_library(soname, source)
+        checksum = source.with_suffix(".chk")
+        if checksum.is_file():
+            shutil.copy2(checksum, (output / soname).with_suffix(".chk"))
 
     while queue:
         binary = queue.popleft().resolve()
@@ -248,6 +253,22 @@ def collect(args: argparse.Namespace) -> Dict[str, object]:
         "host": dict(sorted(host.items())),
         "scanned_elf_files": len(scanned),
     }
+
+
+def find_nss_libraries() -> Dict[str, Path]:
+    """NSS loads these modules at runtime, so ldd does not report them."""
+    core = find_optional_libraries(["libnss3.so"]).get("libnss3.so")
+    if core is None:
+        raise RuntimeError("Cannot locate the host NSS library (libnss3.so)")
+    directories = [core.parent, core.parent / "nss", core.resolve().parent,
+                   core.resolve().parent / "nss"]
+    found = {}
+    for name in ("libsoftokn3.so", "libfreebl3.so", "libfreeblpriv3.so", "libnssckbi.so"):
+        source = next((directory / name for directory in directories if (directory / name).is_file()), None)
+        if source is None:
+            raise RuntimeError(f"Missing runtime-loaded NSS module: {name}")
+        found[name] = source
+    return found
 
 
 def main() -> int:

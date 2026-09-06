@@ -3602,19 +3602,22 @@ namespace fastllm {
     }
 
     void basellm::SetKVCacheDataType(DataType dataType) {
+        if (dataType == DataType::FP4_E2M1 && this->model_type != "qwen3_5") {
+            ErrorInFastLLM("FP4 KV cache currently supports the Qwen3.5 CUDA paged attention path only.");
+        }
 #ifndef USE_CUDA
-        if (dataType == DataType::FP8_E4M3) {
-            ErrorInFastLLM("SetKVCacheDataType Error: fp8_e4m3 kv cache requires CUDA support.");
+        if (dataType == DataType::FP8_E4M3 || dataType == DataType::FP4_E2M1) {
+            ErrorInFastLLM("SetKVCacheDataType Error: FP8/FP4 kv cache requires CUDA support.");
         }
 #endif
         if (dataType == DataType::FLOAT32 ||
             dataType == DataType::FLOAT16 ||
             dataType == DataType::BFLOAT16 ||
-            dataType == DataType::FP8_E4M3) {
+            dataType == DataType::FP8_E4M3 || dataType == DataType::FP4_E2M1) {
             this->kvCacheDataType = dataType;
             this->useCustomKVCacheDataType = true;
         } else {
-            ErrorInFastLLM("SetKVCacheDataType Error: datatype should be float32, float16, bfloat16 or fp8_e4m3");
+            ErrorInFastLLM("SetKVCacheDataType Error: datatype should be float32, float16, bfloat16, fp8_e4m3 or fp4_e2m1");
         }
     }
 
@@ -3942,6 +3945,9 @@ namespace fastllm {
     void basellm::AutoWarmup() {
         ReportModelLoadProgress("warmup", 0, 1);
         if (GetFastllmEnv().skipWarmup) {
+            if (contextPlan.requestedLength > 0) {
+                throw std::runtime_error("Explicit context length requires warmup to validate KV capacity.");
+            }
             ReportModelLoadProgress("warmup", 1, 1);
             return;
         }
@@ -3986,6 +3992,7 @@ namespace fastllm {
                 }
                 finishCudaWarmup();
                 if (!unwinding) {
+                    model->ValidateContextCapacity();
                     ReportModelLoadProgress("warmup", 1, 1);
                 }
             }

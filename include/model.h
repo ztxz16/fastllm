@@ -32,7 +32,8 @@ namespace fastllm {
                                                     bool weightOnly = false, 
                                                     bool useMoeDataType = false, 
                                                     DataType moeDataType = DataType::FLOAT32, 
-                                                    int moeGroupCnt = -1, const std::string &dtypeConfigString = "");
+                                                    int moeGroupCnt = -1, const std::string &dtypeConfigString = "",
+                                                    const ContextOptions &contextOptions = {});
     
     void ExportLLMModelFromHF(const std::string &modelPath, 
                             DataType linearDataType, 

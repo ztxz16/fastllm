@@ -4406,19 +4406,19 @@ namespace fastllm {
     std::unique_ptr <basellm> CreateLLMModelFromHF(const std::string &modelPath, 
                                                     DataType linearDataType, int groupCnt, bool skipTokenizer, const std::string &modelConfig,
                                                     const std::string &loraPath, bool weightOnly, bool useMoeDataType, DataType moeDataType, int moeGroupCnt,
-                                                    const std::string &dtypeConfigString) {
+                                                    const std::string &dtypeConfigString, const ContextOptions &contextOptions) {
         if (moeGroupCnt == -1) {
             moeGroupCnt = groupCnt;
         }
         std::map <std::string, std::pair <std::string, std::string> > loraDicts;
-        SafeTensors *loraTensors = nullptr;
+        std::unique_ptr<SafeTensors> loraTensors;
         float loraScaling;
         if (loraPath != "") {
             std::string path = loraPath;
             if (path.back() != '/' || path.back() != '\\') {
                 path += "/";
             }
-            loraTensors = new SafeTensors({path + "adapter_model.safetensors"});
+            loraTensors.reset(new SafeTensors({path + "adapter_model.safetensors"}));
             for (auto &it : loraTensors->GetSortedItemNames()) {
                 if (it.size() >= 31 &&
                     it.substr(0, 17) == "base_model.model." &&
@@ -4557,7 +4557,8 @@ namespace fastllm {
             }
 
         }
-        basellm *model = CreateModelWithType(modelType);
+        std::unique_ptr<basellm> modelOwner(CreateModelWithType(modelType));
+        basellm *model = modelOwner.get();
         if (isJsonModel) {
             ((GraphLLMModel*)model)->graphLLMModelConfig->Init(modelConfig);
         }
@@ -4651,7 +4652,12 @@ namespace fastllm {
         }
 
         // 4.0 更新模型信息
+        model->ConfigureContext(contextOptions);
+        if (model->YarnConfig() && (!dsparkPath.empty() || !dflashPath.empty())) {
+            throw std::invalid_argument("Context extension with an external DSpark/DFlash draft is not implemented; disable the external draft.");
+        }
         model->InitParams();
+        if (model->contextPlan.configured) model->max_positions = model->contextPlan.effectiveLength;
 
         // 4.1 读取权重
         auto tensors = safeTensors.GetSortedItemNames();
@@ -5489,9 +5495,7 @@ namespace fastllm {
         printf("\n");
         fflush(stdout);
 
-        delete loraTensors;
-
-        return std::unique_ptr<fastllm::basellm> (model);
+        return modelOwner;
     }
 
     // 从hf文件夹读取，仅支持safetensor格式的模型，然后导出成safetensor格式

@@ -77,6 +77,7 @@ namespace fastllm {
         if (this->weight.dicts.find("rope_scaling.factor") != this->weight.dicts.end()) {
             rope_factor = atof(this->weight.dicts["rope_scaling.factor"].c_str());
         }
+        InitContextParams(rope_type, rope_base, rope_factor, rotary_dim);
         for (int i = 0; i < block_cnt; i++) {
             std::string w1WeightName = "model.layers." + std::to_string(i) + ".mlp.gate_proj.weight";
             std::string w3WeightName = "model.layers." + std::to_string(i) + ".mlp.up_proj.weight";
@@ -227,8 +228,8 @@ namespace fastllm {
                 seqLens,
                 num_attention_heads, num_key_value_heads, head_dim,
                 rotary_dim, rms_norm_eps,
-                rope_base, rope_factor, max_positions,
-                rope_type,
+                rope_base, rope_factor, RopeReferenceLength(),
+                rope_type, YarnConfig(),
                 GetKVCacheInCPU(),
                 isPrefill,
                 &hiddenStates,

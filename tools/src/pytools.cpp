@@ -40,6 +40,7 @@ struct FASTLLM_PYTOOLS_INIT {
 } fastllm_pytools_init;
 
 static thread_local std::string fastllmPytoolsWarmupError;
+static thread_local std::string fastllmPytoolsContextResult;
 
 extern "C" {
     typedef void (*FastllmModelLoadProgressCallback)(const char *stage,
@@ -437,6 +438,38 @@ extern "C" {
         return id;
     }
 
+    DLL_EXPORT const char *get_llm_context_result() {
+        return fastllmPytoolsContextResult.c_str();
+    }
+
+    DLL_EXPORT const char *get_llm_context_config(int modelId) {
+        auto model = models.GetModel(modelId);
+        fastllmPytoolsContextResult = model->contextPlan.ToJson();
+        return fastllmPytoolsContextResult.c_str();
+    }
+
+    DLL_EXPORT int create_llm_model_fromhf_with_context(char *path, int dataType, int groupCnt,
+            bool skipTokenizer, char *lora, bool useMoe, int moeDataType, int moeGroupCnt,
+            char *dtypeConfigString, int maxLength, char *ropeScaling) {
+        fastllmPytoolsContextResult.clear();
+        try {
+            std::lock_guard<std::mutex> guard(models.locker);
+            auto model = fastllm::CreateLLMModelFromHF(path, (fastllm::DataType)dataType,
+                groupCnt, skipTokenizer, "", lora, false, useMoe, (fastllm::DataType)moeDataType,
+                moeGroupCnt, dtypeConfigString, {maxLength, ropeScaling == nullptr ? "" : ropeScaling});
+            int id = models.models.size();
+            models.models[id] = std::move(model);
+            return id;
+        } catch (const std::exception &error) {
+            fastllmPytoolsContextResult = error.what();
+        } catch (const char *error) {
+            fastllmPytoolsContextResult = error == nullptr ? "unknown model initialization error" : error;
+        } catch (...) {
+            fastllmPytoolsContextResult = "unknown model initialization error";
+        }
+        return -1;
+    }
+
     DLL_EXPORT int create_llm_model_from_gguf(char *path, char *oriPath) {
         models.locker.lock();
         int id = models.models.size();
@@ -664,8 +697,10 @@ extern "C" {
             model->SetKVCacheDataType(fastllm::DataType::FLOAT32);
         } else if (dtypeStr == "fp8" || dtypeStr == "float8" || dtypeStr == "fp8_e4m3") {
             model->SetKVCacheDataType(fastllm::DataType::FP8_E4M3);
+        } else if (dtypeStr == "fp4" || dtypeStr == "nvfp4" || dtypeStr == "fp4_e2m1") {
+            model->SetKVCacheDataType(fastllm::DataType::FP4_E2M1);
         } else {
-            fastllm::ErrorInFastLLM("set_model_kv_cache_dtype error: kv_cache_dtype should be auto, float32, float16, bfloat16 or fp8_e4m3.");
+            fastllm::ErrorInFastLLM("set_model_kv_cache_dtype error: kv_cache_dtype should be auto, float32, float16, bfloat16, fp8_e4m3 or fp4_e2m1.");
         }
         return;
     }
@@ -1091,6 +1126,10 @@ extern "C" {
         auto model = models.GetModel(modelId);
         if (length > 0 && length < model->max_positions) {
             model->max_positions = length;
+            if (model->contextPlan.configured) {
+                model->contextPlan.requestedLength = length;
+                model->contextPlan.effectiveLength = std::min(model->contextPlan.effectiveLength, length);
+            }
         }
         return model->max_positions;
     }

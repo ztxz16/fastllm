@@ -4,6 +4,7 @@
 
 #define _USE_MATH_DEFINES
 #include "devices/cpu/cpudevice.h"
+#include "executor.h"
 #include "devices/cpu/computeutils.h"
 #include "devices/cpu/kimi_k3_ops.h"
 
@@ -10411,13 +10412,21 @@ ops += (long long)lines * inputDim * interDim * 2;
         AssertInFastLLM(rotaryDim <= data.dims[3],
                         "YaRN rotary_dim exceeds the input head dimension.");
 
+        const bool mrope = intParams.count("mrope") && intParams.at("mrope");
+        const int sectionH = mrope ? intParams.at("sectionH") : 0;
+        const int sectionW = mrope ? intParams.at("sectionW") : 0;
+        AssertInFastLLM(positionIds.dims.size() == 2 && positionIds.dims.back() >= data.dims[1] &&
+                        (mrope ? (data.dims[0] == 1 && positionIds.dims[0] == 3) : positionIds.dims[0] >= data.dims[0]),
+                        "YaRN position shape does not match input/layout.");
         int bs = data.dims[0], len = data.dims[1], n = data.dims[2], m = data.dims[3];
         int spatial = data.Count(2), half = rotaryDim / 2, posStride = positionIds.dims.back();
         for (int batch = 0; batch < bs; batch++) {
             for (int token = 0; token < len; token++) {
-                float position = (float)(int)((float*)positionIds.cpuData)[batch * posStride + token];
                 int tokenOffset = (batch * len + token) * spatial;
                 for (int j = 0; j < half; j++) {
+                    int row = mrope ? ((j % 3 == 1 && j < sectionH * 3) ? 1 :
+                              (j % 3 == 2 && j < sectionW * 3) ? 2 : 0) : batch;
+                    float position = (float)(int)((float*)positionIds.cpuData)[row * posStride + token];
                     float posFreq = powf(ropeTheta, (float)(2 * j) / rotaryDim);
                     float extrapolation = 1.0f / posFreq;
                     float interpolation = 1.0f / (factor * posFreq);
@@ -10697,8 +10706,17 @@ ops += (long long)lines * inputDim * interDim * 2;
             RMSNorm(k, kNormWeight, eps, k);
         }
 
-        RopeEncoding(q, positionIds, rotateDim, ropeTheta, ropeScale);
-        RopeEncoding(k, positionIds, rotateDim, ropeTheta, ropeScale);
+        if (intParams.count("useYarn") && intParams.at("useYarn")) {
+            FloatDict params = {{"ropeTheta",ropeTheta},{"factor",floatParams.at("yarnFactor")},
+                {"attentionFactor",floatParams.at("yarnAttentionFactor")},
+                {"correctionLow",floatParams.at("yarnCorrectionLow")},
+                {"correctionHigh",floatParams.at("yarnCorrectionHigh")}};
+            for (Data *tensor : {&q, &k}) static_cast<Executor*>(GetExecutor())->RunOnDevice("cpu", "YarnRopeEncoding",
+                {{"input",tensor},{"positionIds",&positionIds}},params,{{"rotaryDim",rotateDim}});
+        } else {
+            RopeEncoding(q, positionIds, rotateDim, ropeTheta, ropeScale);
+            RopeEncoding(k, positionIds, rotateDim, ropeTheta, ropeScale);
+        }
 
         int bs = qkv.dims[0];
         int seqlen = qkv.dims[1];

@@ -30,6 +30,7 @@
 #endif
 
 namespace fastllm {
+    struct RopeConfig;
     class Data;
 
     class FastllmEnv {
@@ -319,6 +320,7 @@ namespace fastllm {
         BASE3_GROUP = 12, // 三元量化，-1 0 1
         INT32 = 13, // int32
         NVFP4 = 14, // packed fp4 e2m1 + compact e8m0 block scales
+        FP4_E2M1 = 15, // KV-only: each page has packed E2M1 then E4M3 block-16 scales
         INT32PARAM = 100, // int32的参数，这种类型的数据永远存在CPU上
         FP8_E4M3_BLOCK_128 = 1000, // fp8e4m3, block = 128
         AWQ_4BIT_128 = 1001, // awq, bits = 4, group = 128
@@ -1383,7 +1385,7 @@ namespace fastllm {
         Data &insertIndexs, Data &insertPositions,
         int q_heads, int k_heads, int head_dim,
         int rotaryDim, float eps, float ropeTheta, float ropeScale,
-        int pageLen, int batch, bool doQKNorm = true, Data *lastPageLens = nullptr);
+        int pageLen, int batch, bool doQKNorm = true, Data *lastPageLens = nullptr, const RopeConfig *ropeConfig = nullptr);
 
     void Step3p5QKVRMSNormRopeSplitAppendPagedCache(
         Data &qkv, Data &qNormWeight, Data &kNormWeight,

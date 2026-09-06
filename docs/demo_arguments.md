@@ -10,6 +10,7 @@
 --path ~/model.flm # 从~/model.flm中读取模型，这里的模型是Fastllm格式的模型文件
 ```
 - **推理类型 (`--atype`)**: 设置中间计算类型，可以指定为`float16`或`float32`
+- **图片 embedding 缓存 (`--image-embedding-cache`)**: Qwen3.5 native 图片路径的 CPU 缓存上限，默认 `512m`，例如 `--image-embedding-cache 1g`；设为 `0` 关闭。首次处理图片请求时才创建，按实际内容分配内存，不额外常驻 GPU 显存。命中后跳过 native 图片预处理和视觉编码；图片解码、传输及语言模型预填充仍可能执行。配置、作用范围与验证方式见[多模态缓存](multimodal-cache.md)。
 - **权重类型 (`--dtype`)**: 指定模型的权重类型，适用于读取Hugging Face模型时。可以指定为`float16`, `int8`, `int4`, `int4g`(int4分组量化)，例如：
 ```bash
 --dtype float16  # 使用float16权重（不量化）
@@ -23,12 +24,15 @@
 
 - **低显存模式 (`--low_gpu_mem`)**: 关闭 CUDA embedding 配置和 GPU token handoff；此开关优先于 `--cuda_embedding` 和 `FASTLLM_GPU_TOKEN_HANDOFF` 环境变量。CUDA Graph 仍按原有自动策略或 `FASTLLM_CUDA_GRAPH` 设置运行，Qwen3.5/3.6 普通 CUDA 推理会将 embedding 保留在 CPU，并可继续使用 CUDA Graph；其他模型的后端可能仍要求在 Graph 模式下使用 GPU embedding。该开关可与双卡 TP、MTP 或 DFlash2 配合使用（MTP 与 DFlash2 二选一）；当前 Qwen3.5 系列的 MTP 校验 Graph 不支持 CPU embedding，因此该校验阶段会回退到普通执行。该开关默认关闭，与 `--low` 低内存模式独立，不改变 KV 类型或上下文配额，也不保证避免 OOM。例如：`ftllm server /path/to/model --device cuda --low_gpu_mem`。
 - **CUDA权重slab (`--cuda_slab`)**: 设置 CUDA 模型权重 slab 分配块大小，单位 MB，默认 `0` 表示关闭。对于将大量 MOE 专家权重放在 CUDA 上的场景，可以使用如 `--cuda_slab 1024` 减少小权重分别分配造成的显存碎片和页对齐开销
+- **KV缓存类型 (`--kv_cache_dtype`)**: 默认 `auto`，可使用 `float16`、`bfloat16`、`fp8_e4m3`；Qwen3.5 架构的 CUDA 分页注意力还支持 `fp4`（别名 `nvfp4`、`fp4_e2m1`）。仅量化普通注意力 KV，不改变模型权重或线性注意力状态精度。硬件要求、内存格式与示例见[FP4 KV cache](fp4-kv-cache.md)。
 - **KV缓存最大使用量 (`--kv_cache_limit`)**: 设置KV缓存的最大使用量。若不使用此参数或设置为`auto`，框架会自动处理。手动设定示例如下：
 ```bash
 --kv_cache_limit 5G   # 设置为5G
 --kv_cache_limit 100M # 设置为100M
 --kv_cache_limit 168K # 设置为168K
 ```
+- **单会话上下文 (`--max_context_length`, `--max-context-length`)**: 输入与输出合计上限；扩大模型声明窗口需要有效的 RoPE 配置，warmup 后容量不足会启动失败。
+- **RoPE 扩展 (`--rope_scaling`, `--rope-scaling`)**: HF Qwen2/3/3.5 布局支持静态 YaRN；填 `yarn` 或 JSON。Qwen3 等模型须明确 `original_max_position_embeddings`。用法、支持范围和验证记录见[上下文扩展](context-length-extension-design.md)。
 - **最大Batch数量 (`--max_batch`)**: 设置每次同时处理的请求数量。若不使用此参数，框架会自动处理
 - **线程数量 (`-t, --threads`)**: 设置CPU线程数量，device设置为`cpu`时对速度有较大影响，设置为`cuda`时影响较小，主要影响读取模型的速度
 - **自定义模型描述文件 (`--custom`)**: 指定描述自定义模型的Python文件。具体见 [自定义模型](custom.md)

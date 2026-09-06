@@ -23,6 +23,7 @@ namespace fastllm {
         virtual ~Qwen3Model() override;
 
         virtual void InitParams(); // 初始化参数信息
+        ModelContextSpec GetContextSpec() const override { return {true, false, ""}; }
 
         // 推理
         virtual int Forward(

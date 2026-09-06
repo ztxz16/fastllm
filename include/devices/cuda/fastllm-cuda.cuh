@@ -1323,7 +1323,7 @@ bool FastllmCudaLlama3RopeEncoding(fastllm::Data &data, const fastllm::Data &pos
                                    float lowFreqFactor, float highFreqFactor);
 bool FastllmCudaYarnRopeEncoding(fastllm::Data &data, const fastllm::Data &positionIds, int rotaryDim,
                                  float ropeTheta, float factor, float attentionFactor,
-                                 float correctionLow, float correctionHigh);
+                                 float correctionLow, float correctionHigh, int mrope = 0, int sectionH = 0, int sectionW = 0);
 bool FastllmCudaQwen35InterleavedRope(fastllm::Data &data, const fastllm::Data &positionIds, int rotaryDim,
                                       int sectionT, int sectionH, int sectionW,
                                       float ropeTheta, float ropeScale);
@@ -1364,7 +1364,8 @@ bool FastllmCudaQwen35QGateKVRMSNormRopeSplitAppendPagedCache(
     int rotaryDim, int sectionT, int sectionH, int sectionW,
     float eps, float ropeTheta, float ropeScale,
     int pageLen, fastllm::DataType pagedDataType, int batch,
-    int doQKNorm);
+    int doQKNorm, int useYarn = 0, float yarnFactor = 1, float yarnAttentionFactor = 1,
+    float yarnCorrectionLow = 0, float yarnCorrectionHigh = 1);
 bool FastllmCudaQwen35QGateKVPrefill(
     const fastllm::Data &qgatekv,
     const fastllm::Data &qNormWeight,

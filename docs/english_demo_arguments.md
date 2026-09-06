@@ -29,6 +29,8 @@ Configuration related to the model, OpenAI API Server, WebUI, and conversation d
   --kv_cache_limit 100M # Sets to 100M
   --kv_cache_limit 168K # Sets to 168K
   ```
+- **Context window (`--max_context_length`, `--max-context-length`)**: Limits combined input and output tokens. Extending the declared window requires a supported RoPE configuration; insufficient calibrated KV capacity fails startup.
+- **RoPE extension (`--rope_scaling`, `--rope-scaling`)**: Accepts `yarn` or JSON for supported HF Qwen2/3/3.5 layouts. Supply the original RoPE length explicitly when it is not known. See [context extension](context-length-extension-design.md) for configuration and validation limits.
 - **Maximum Batch Size (`--max_batch`)**: Sets the number of requests processed simultaneously each time. If this parameter is not used, the framework will handle it automatically.
 - **Number of Threads (`-t, --threads`)**: Sets the number of CPU threads, which significantly affects speed when the device is set to `cpu`, and has a smaller impact when set to `cuda`, mainly affecting the speed of model loading.
 - **Custom Model Description File (`--custom`)**: Specifies the Python file describing the custom model. See [Custom Model](custom.md) for details.

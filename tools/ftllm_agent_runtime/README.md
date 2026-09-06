@@ -49,6 +49,9 @@ python -m build --wheel --no-isolation
 
 The fetch script verifies the upstream release archive and license using
 hard-coded SHA-256 digests before copying anything into the package tree.
+Use `--cache-dir /path/to/cache` to retain the verified archive, and add
+`--offline` to require local files only. The repository's `make_portable.sh`
+and `desktop/package.sh` build and include this runtime automatically.
 
 ## Install and enable in WebUI
 

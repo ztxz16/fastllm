@@ -37,6 +37,11 @@
 #define FASTLLM_SOURCE_DIR "."
 #endif
 
+#ifdef FASTLLM_ENABLE_DEEPGEMM_FP8_SM90
+bool FastllmCudaDeepGemmLinearFp8Sm90(const fastllm::Data &input, fastllm::Data &weight,
+    const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
+#endif
+
 namespace fastllm {
     // CUDA graph replay cannot reuse a MergeMOE path that picked experts on CPU.
     static thread_local bool cudaMergeMOEUsedGraphUnsafeFallback = false;
@@ -2338,6 +2343,17 @@ namespace fastllm {
         meta = &it->second;
         return true;
     }
+
+#ifdef FASTLLM_ENABLE_DEEPGEMM_FP8_SM90
+    static bool TryCudaDeepGemmLinearFp8Sm90(
+        Data &input, Data &weight, const Data &bias, Data &output, int n, int m, int k) {
+        if (FastllmCudaDeepGemmLinearFp8Sm90(input, weight, bias, output, n, m, k)) {
+            TraceCudaLinearFp8Path("deepgemm-sm90-fp8-block128", n, m, k);
+            return true;
+        }
+        return false;
+    }
+#endif
 
     static bool TryCudaCutlassLinearFp8Block128(
         Data &input, Data &weight, const Data &bias, Data &output, int n, int m, int k) {
@@ -6152,7 +6168,11 @@ namespace fastllm {
             } else if (weight.dataType == DataType::INT4_NOZERO) {
                 FastllmCudaHalfMatMulFloatInt4NoZero(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::FP8_E4M3) {
-                if (!TryCudaCutlassLinearFp8PerChannel(input, weight, bias, output, n, m, k) &&
+                if (
+#ifdef FASTLLM_ENABLE_DEEPGEMM_FP8_SM90
+                    !TryCudaDeepGemmLinearFp8Sm90(input, weight, bias, output, n, m, k) &&
+#endif
+                    !TryCudaCutlassLinearFp8PerChannel(input, weight, bias, output, n, m, k) &&
                     !TryCudaCutlassLinearFp8Block128(input, weight, bias, output, n, m, k) &&
                     !TryCudaTritonLinearFp8Block128(input, weight, bias, output, n, m, k)) {
                     TraceCudaLinearFp8Path("native-fp8-e4m3", n, m, k);
@@ -6223,7 +6243,11 @@ namespace fastllm {
             } else if (weight.dataType == DataType::INT4_GROUP32) {
                 FastllmCudaBFloat16MatMulInt4Group32(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::FP8_E4M3) {
-                if (!TryCudaCutlassLinearFp8PerChannel(input, weight, bias, output, n, m, k) &&
+                if (
+#ifdef FASTLLM_ENABLE_DEEPGEMM_FP8_SM90
+                    !TryCudaDeepGemmLinearFp8Sm90(input, weight, bias, output, n, m, k) &&
+#endif
+                    !TryCudaCutlassLinearFp8PerChannel(input, weight, bias, output, n, m, k) &&
                     !TryCudaCutlassLinearFp8Block128(input, weight, bias, output, n, m, k) &&
                     !TryCudaTritonLinearFp8Block128(input, weight, bias, output, n, m, k)) {
                     TraceCudaLinearFp8Path("native-fp8-e4m3", n, m, k);
@@ -7914,7 +7938,10 @@ namespace fastllm {
         float correctionHigh = floatParams.find("correctionHigh") != floatParams.end() ? floatParams.find("correctionHigh")->second : 1.0f;
 
         FastllmCudaYarnRopeEncoding(data, positionIds, rotaryDim, ropeTheta, factor,
-                                    attentionFactor, correctionLow, correctionHigh);
+                                    attentionFactor, correctionLow, correctionHigh,
+                                    intParams.count("mrope") ? intParams.at("mrope") : 0,
+                                    intParams.count("sectionH") ? intParams.at("sectionH") : 0,
+                                    intParams.count("sectionW") ? intParams.at("sectionW") : 0);
     }
 
     void CudaQwen35InterleavedRopeOp::Run(const std::string &opType, const fastllm::DataDict &datas,
@@ -8124,7 +8151,12 @@ namespace fastllm {
             qHeads, kHeads, headDim, rotaryDim,
             sectionT, sectionH, sectionW,
             eps, ropeTheta, ropeScale, pageLen,
-            pagedKCacheData.dataType, batch, doQKNorm);
+            pagedKCacheData.dataType, batch, doQKNorm,
+            intParams.count("useYarn") ? intParams.at("useYarn") : 0,
+            floatParams.count("yarnFactor") ? floatParams.at("yarnFactor") : 1,
+            floatParams.count("yarnAttentionFactor") ? floatParams.at("yarnAttentionFactor") : 1,
+            floatParams.count("yarnCorrectionLow") ? floatParams.at("yarnCorrectionLow") : 0,
+            floatParams.count("yarnCorrectionHigh") ? floatParams.at("yarnCorrectionHigh") : 1);
     }
 
     void CudaRepeatPenaltyOp::Run(const std::string &opType, const fastllm::DataDict &datas,
@@ -10217,8 +10249,8 @@ namespace fastllm {
         AssertInFastLLM(cache.dataType == DataType::FLOAT32 ||
                         cache.dataType == DataType::FLOAT16 ||
                         cache.dataType == DataType::BFLOAT16 ||
-                        cache.dataType == DataType::FP8_E4M3,
-                        "CudaAppendPagedCacheOp's cache's type should be float32, float16, bfloat16 or fp8_e4m3.\n");
+                        cache.dataType == DataType::FP8_E4M3 || cache.dataType == DataType::FP4_E2M1,
+                        "CudaAppendPagedCacheOp's cache's type should be float32, float16, bfloat16, fp8_e4m3 or fp4_e2m1.\n");
         AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
                         input.dataType == DataType::FLOAT16 ||
                         input.dataType == DataType::BFLOAT16,
@@ -10428,8 +10460,9 @@ namespace fastllm {
         AssertInFastLLM(((Data*)&manager)->dataType == DataType::FLOAT32 ||
                         ((Data*)&manager)->dataType == DataType::FLOAT16 ||
                         ((Data*)&manager)->dataType == DataType::BFLOAT16 ||
-                        ((Data*)&manager)->dataType == DataType::FP8_E4M3,
-                        "CudaAppendPagedCacheBatchOp's cache type should be float32, float16, bfloat16 or fp8_e4m3.\n");
+                        ((Data*)&manager)->dataType == DataType::FP8_E4M3 ||
+                        ((Data*)&manager)->dataType == DataType::FP4_E2M1,
+                        "CudaAppendPagedCacheBatchOp's cache type should be float32, float16, bfloat16, fp8_e4m3 or fp4_e2m1.\n");
         AssertInFastLLM(input.dims.size() == 3,
                         "CudaAppendPagedCacheBatchOp's input should have 3 dimensions [batch, numHeads, headDim].\n");
         AssertInFastLLM(insertIndexs.dims.size() == 1 && insertIndexs.dims[0] == input.dims[0],

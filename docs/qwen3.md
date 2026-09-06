@@ -78,7 +78,7 @@ ftllm server /data/models/qwen \
   --gpu_mem_ratio 0.9
 ~~~
 
-`--max_context_length` 是输入与输出合计上限。实际值还受模型原生上下文和 KV Cache 容量限制，可从 `/v1/models` 查询。
+`--max_context_length` 是输入与输出合计上限。超出模型声明值时须指定有效的 `--rope_scaling`，容量不足会在启动时失败。Qwen3 的 YaRN 需要明确原始长度（常见为 32768）；具体配置和验证范围见[上下文扩展](context-length-extension-design.md)。实际窗口可从 `/v1/models` 查询。
 
 ## MTP
 

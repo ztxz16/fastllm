@@ -42,7 +42,7 @@ Qwen4-Exp / Qwen3.8-Flash-Next 当前不加载视觉权重；Qwen3.8-Flash-Next 
 | --- | --- | --- |
 | Linux + NVIDIA GPU | `python -m pip install -U ftllm` | 包含 Python 接口和常用 CUDA 运行时依赖；驱动需要与 CUDA 运行时兼容 |
 | Windows + NVIDIA GPU | `python -m pip install -U ftllm` | 如果首次安装提示缺少 DLL，请先安装下方的 Windows 依赖包 |
-| Linux + AMD GPU | `python -m pip install -U ftllm-rocm` | 需要先安装与显卡匹配的 ROCm 环境，参见 [ROCm 文档](docs/rocm.md) |
+| Linux + AMD GPU | [ROCm 安装与编译](docs/rocm.md) | 按显卡架构选择构建与安装方式 |
 | CPU-only、特殊架构或其他加速器 | [源码安装](#源码安装) | 可按实际平台选择 CMake 后端 |
 
 Windows 首次安装所需的依赖包：
@@ -88,12 +88,16 @@ ftllm bench Qwen/Qwen3-0.6B \
 
 `ftllm`（或 `ftllm launch`）默认仅监听 `127.0.0.1:8000`，并在服务就绪后自动打开浏览器；使用 `ftllm launch --no-browser` 可以关闭自动打开。页面可以从 ModelScope 下载模型、保存启动配置、预览命令，并选择托管 `ftllm server` 或聊天 `ftllm webui`。新增启动项选择本地模型后，会根据模型结构、权重规模以及本机 GPU、内存和 NUMA 拓扑自动推荐 TP、MoE 混合推理与 N-gram 存储参数，也可以手动重新分析或清空可选推理参数。界面支持简体中文和英文，会优先使用上次选择的语言，否则跟随浏览器语言；`ftllm launch` 的终端日志固定使用英文。需要从局域网访问时使用 `ftllm launch --host 0.0.0.0`；终端和 Launcher 页面随后会列出本机、局域网以及网卡上直接配置的公网访问地址（若有）。公网访问还需要放行主机防火墙及云安全组，经过 NAT 时还需配置端口映射；Launcher 不会自动探测 NAT 的公网地址。非本机监听使用未加密 HTTP，请仅在可信网络中使用。它与终端向导共用配置文件；关闭 Launcher 时，由它托管的下载和模型进程也会停止。使用 `ftllm launch --help` 查看其他选项。
 
+API Server 就绪后，点击「打开工作室」即可在 Launcher 内容区直接使用聊天、历史会话、Markdown、附件、思考过程和智能体功能。模型管理导航始终保留，可随时切换到启动、下载、日志和硬件页面，返回「工作室」后继续当前会话。Launcher 与独立的 `ftllm webui` 共用聊天组件和后端，界面配色、尺寸及语言会适配 Launcher。组件自动连接当前模型并使用启动配置中的 API Key，无需另开 WebUI 服务或端口。会话沿用 WebUI 的本地存储，刷新页面后仍然保留；停止或切换模型时会取消正在运行的 WebUI 任务并清理旧组件。
+
 WebUI 不会在自身进程内加载模型，请先启动 OpenAI 兼容 API Server。WebUI 的可选 `model` 位置参数只用于推导 API 模型名；省略时会从 `/v1/models` 自动发现。
 
 代码分析和联网搜索默认使用 Pi 智能体运行时。Linux x86-64 用户可按
 [`tools/ftllm_agent_runtime/`](tools/ftllm_agent_runtime/) 中的说明构建并安装配套 wheel；
 该 wheel 已包含 Pi，不需要 Node.js、npm 或 Bun。尚未安装时可通过
 `--agent-runtime builtin` 使用原有单轮链路。
+
+Launcher 会自动使用已安装的 Pi 运行时；「新建 Agent」可选择工作目录。通过 `ftllm launch --agent-workspace-root /path/to/projects` 指定可选目录的根路径，默认为用户主目录。Launcher 的目录 Agent 默认启用，本机和远程监听均可使用，例如 `ftllm launch --host 0.0.0.0 --agent-workspace-root /path/to/projects`。使用 `--disable-workspace-agent` 可关闭目录 Agent，同时禁止目录浏览、新建目录 Agent 及继续执行已保存的目录 Agent 任务；普通对话仍可使用。目录 Agent 可修改文件和执行命令，请仅对可信用户开放。运行时缺失或目录 Agent 被关闭时，界面会显示原因。
 
 对于 `run`、`server` 和 `export`，`model` 位置参数既可以是 Hugging Face 仓库 ID，也可以是本地 Hugging Face 模型目录、FastLLM 模型文件或配置文件。例如：
 
@@ -167,16 +171,30 @@ ftllm server /data/models/my-moe-model \
 
 ### 长上下文与前缀缓存
 
+`--max_context_length`（别名 `--max-context-length`）设置单会话输入与输出合计上限。扩大模型声明窗口时，还需要有效的 `--rope_scaling`（别名 `--rope-scaling`），接受 `yarn` 或 JSON；只缩小窗口时可省略 RoPE 参数。配置在加载时生效，不修改模型的 `config.json`。
+
+例如，将 Qwen3-0.6B 扩展到 65536 token，并开启前缀缓存。其 YaRN 原始长度为 32768，应显式指定，不能用配置声明的 40960 代替：
+
 ~~~bash
-ftllm server /data/models/my-model \
-  --max_context_length 131072 \
-  --max_batch 16 \
-  --gpu_mem_ratio 0.9 \
+ftllm server /data/models/Qwen3-0.6B \
+  --device cuda --max_batch 1 --tokens 65536 \
+  --max_context_length 65536 \
+  --rope_scaling '{"rope_type":"yarn","factor":2,"original_max_position_embeddings":32768}' \
   --chunked_prefill_size 8192 \
   --prefix_cache true
 ~~~
 
-实际可用上下文取模型原生上限、`--max_context_length` 和共享 KV Cache 容量的较小值；`/v1/models` 会返回最终生效值。
+Qwen3.8-27B-FP8 可以使用已知原始长度的 `yarn` 简写。下面配置双卡、FP4 KV 和 1,000,000 token 的目标窗口，解析得到 original=262144、factor=4：
+
+~~~bash
+ftllm server /data/models/Qwen3.8-27B-FP8 \
+  --tp 2 --kv_cache_dtype fp4 \
+  --max_context_length 1000000 --rope_scaling yarn
+~~~
+
+`--tokens` 是所有会话共享的 KV 池容量，未设置时自动预算。显式目标超过 RoPE 覆盖范围或 warmup 校准容量会启动失败；`/v1/models` 返回实际窗口、模型原声明和用户目标。上述 1M 命令需要足够显存，本机双 24GB 的测试配置无法容纳，完整 1M 输入尚未实测。
+
+当前扩展接入 HF Qwen2、Qwen3、Qwen3.5 布局，以及基于 Qwen3.5 架构的 Qwen3.8；Launcher 高级参数中的「RoPE 扩展」使用相同配置。GGUF、FLM 和自定义 GraphLLM 仅设置长度时保留旧的只缩小行为，暂不支持新的 RoPE 扩展。更多参数、适配范围和验证结果见[上下文扩展说明](docs/context-length-extension-design.md)。
 
 ### 投机解码
 
@@ -237,7 +255,7 @@ CLI 会持续演进，`ftllm <command> --help` 是当前安装版本的最终依
 | `--dtype` | 加载 HF 权重时的权重类型；默认 `auto`，已量化模型通常不应覆盖 |
 | `--moe_dtype` | 单独设置 MoE 权重类型 |
 | `--atype` / `--moe_atype` | 设置普通层和 MoE 层的激活类型 |
-| `--kv_cache_dtype` | KV Cache 类型：`auto`、`float16`、`bfloat16` 或 `fp8_e4m3` |
+| `--kv_cache_dtype` | KV Cache 类型：`auto`、`float16`、`bfloat16`、`fp8_e4m3` 或 `fp4`，需模型与后端支持 |
 | `--dtype_config` | 动态量化配置文件，参见[动态量化说明](docs/dtype_config.md) |
 | `--triton` | 启用可用的 Triton CUDA 算子 |
 
@@ -250,7 +268,8 @@ CLI 会持续演进，`ftllm <command> --help` 是当前安装版本的最终依
 | `--tokens` | 自动 | 用于计算 Paged KV Cache 容量的总 token 数 |
 | `--page_size` | 后端决定 | Paged KV Cache 每页 token 数；多卡默认通常为 16 |
 | `--max_batch` | 自动 | 每轮最多同时推理的请求数 |
-| `--max_context_length` | 自动 | Server 单会话输入与输出合计上限 |
+| `--max_context_length` / `--max-context-length` | 自动 | 单会话输入与输出合计上限；HF 显式目标需通过 RoPE 与 KV 容量检查 |
+| `--rope_scaling` / `--rope-scaling` | 沿用模型配置 | RoPE 扩展，接受 `yarn` 或 JSON；仅对已适配的 HF 模型布局生效 |
 | `--chunked_prefill_size` | 关闭/模型决定 | 分块 Prefill 的切片大小，例如 `8192` |
 | `--prefix_cache` | 模型/环境决定 | 是否开启前缀缓存，使用 `true` 或 `false` |
 | `--cuda_slab` | `0` | CUDA 权重 slab 大小（MB）；`0` 为关闭 |
@@ -355,16 +374,13 @@ bash install.sh -DUSE_CUDA=ON \
 bash install.sh -DUSE_CUDA=ON -DCUDA_ARCH=89 \
   -DCMAKE_CUDA_COMPILER="$(command -v nvcc)"
 
-# AMD ROCm
-bash install.sh -DUSE_ROCM=ON
-
 # CPU-only
 bash install.sh
 ~~~
 
 更多平台说明：
 
-- [ROCm 编译](docs/rocm.md)
+- [ROCm 编译与 wheel 打包](docs/rocm.md)
 - [TFACC 平台](docs/tfacc.md)
 - [示例程序、Android 和其他平台](example/README.md)
 - [编译与运行 FAQ](docs/faq.md)

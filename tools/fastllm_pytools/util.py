@@ -471,6 +471,12 @@ def apply_page_size_default(args):
             args.page_size = 16
     return args
 
+def apply_image_embedding_cache_env(args):
+    capacity = getattr(args, "image_embedding_cache", None)
+    if capacity is not None:
+        os.environ["FASTLLM_IMAGE_EMBEDDING_CACHE_BYTES"] = str(_memory_size_bytes(capacity))
+
+
 def apply_prefix_cache_env(args):
     prefix_cache = getattr(args, "prefix_cache", "")
     if (prefix_cache != ""):
@@ -762,7 +768,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--moe_dtype', type = str, default = "", help = 'MOE层使用的权重类型（读取HF模型时有效）')
     parser.add_argument('--moe_atype', type = str, default = "", help = 'MOE层激活类型，可使用auto、float32、float16或bfloat16')
     parser.add_argument('--atype', type = str, default = "auto", help = '推理类型，可使用float32或float16')
-    parser.add_argument('--kv_cache_dtype', type = str, default = "auto", help = 'KV Cache类型，可使用auto、float16、bfloat16或fp8_e4m3')
+    parser.add_argument('--kv_cache_dtype', type = str, default = "auto", help = 'KV Cache类型，可使用auto、float16、bfloat16、fp8_e4m3或fp4（Qwen3.5 CUDA）')
     parser.add_argument('--cuda_embedding', action = 'store_true', help = '在cuda上进行embedding')
     parser.add_argument('--kv_cache_limit', type = str, default = "auto",  help = 'kv缓存最大使用量')
     parser.add_argument('--max_batch', type = int, default = -1,  help = '每次最多同时推理的询问数量')
@@ -775,6 +781,9 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         dest = 'moe_cuda_cache', type = _memory_size_bytes,
                         default = 0,
                         help = '混合推理时用于缓存MoE专家的CUDA显存，如3g；0表示关闭')
+    parser.add_argument('--image-embedding-cache', '--image_embedding_cache',
+                        dest = 'image_embedding_cache', type = _memory_size_bytes, default = None,
+                        help = 'Qwen3.5图片embedding的CPU缓存上限，如512m或1g；默认512m，0关闭')
     parser.add_argument('--ngram_device', '--ngram-device', dest = 'ngram_device',
                         choices = ['cpu', 'disk'], default = 'cpu',
                         help = 'ngram表存放位置；disk从checkpoint按行读取以显著降低内存占用')
@@ -784,6 +793,11 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument("--enable_thinking", type = str, default = "", help = "是否开启硬思考开关（需要模型支持）")
     parser.add_argument("--cuda_shared_expert", "--cuda_se", type = str, default = "true", help = "是否使用cuda来执行共享专家")
     parser.add_argument("--enable_amx", "--amx", type = str, default = "false", help = "是否开启amx加速")
+    parser.add_argument("--max_context_length", "--max-context-length", dest = "max_context_length",
+                        type = _positive_int, default = -1,
+                        help = "单会话输入和输出合计的最大token数；超出模型配置时需要有效的RoPE扩展，容量不足则启动失败")
+    parser.add_argument("--rope_scaling", "--rope-scaling", default = "",
+                        help = "RoPE扩展配置：yarn或JSON；仅对已支持的模型布局生效")
     parser.add_argument("--tokens", type = int, default = -1, help = "设置总的token数量（用于计算paged cache的最大页数）")
     parser.add_argument("--page_size", type = int, default = -1, help = "设置paged cache每页的大小（token数），默认multicuda为16，其它设备使用后端默认值")
     parser.add_argument("--prefix_cache", "--prefix-cache", dest = "prefix_cache", type = str, default = "",
@@ -839,9 +853,6 @@ def add_server_args(parser):
     parser.add_argument("--host", type = str, default="0.0.0.0", help = "API server host")
     parser.add_argument("--port", type = int, default = 8080, help = "API server port")
     parser.add_argument("--api_key", type = str, default = "", help = "API Key")
-    parser.add_argument("--max_context_length", "--max-context-length", dest = "max_context_length",
-                        type = _positive_int, default = -1,
-                        help = "限制单会话输入和输出合计的最大token数；默认取模型上限和KV Cache总容量的较小值")
     parser.add_argument("--temperature", type = float, default = None, help = "覆盖服务端默认 temperature，未指定则使用模型默认值")
     parser.add_argument("--top_p", type = float, default = None, help = "覆盖服务端默认 top_p，未指定则使用模型默认值")
     parser.add_argument("--top_k", type = int, default = None, help = "覆盖服务端默认 top_k，未指定则使用模型默认值")
@@ -1553,6 +1564,7 @@ def make_normal_llm_model(args, startup_progress = None):
     if (args.page_size > 0):
         llm.set_page_size(args.page_size)
     apply_prefix_cache_env(args)
+    apply_image_embedding_cache_env(args)
     if (hasattr(args, 'gpu_mem_ratio')):
         llm.set_gpu_mem_ratio(args.gpu_mem_ratio)
     if (hasattr(args, 'cuda_slab') and hasattr(llm, 'set_cuda_slab')):
@@ -1580,6 +1592,13 @@ def make_normal_llm_model(args, startup_progress = None):
     if startup_progress is not None:
         startup_progress.progress("initializing", 1, 1)
         llm.set_model_load_progress_callback(startup_progress.model_load_progress)
+    max_context_length = getattr(args, "max_context_length", -1)
+    rope_scaling = getattr(args, "rope_scaling", "")
+    # Non-HF loaders still support the original, shrink-only context limit.
+    # Explicit RoPE options must reach the constructor's capability check.
+    legacy_context_limit = (max_context_length > 0 and not rope_scaling and
+                            (graph is not None or not os.path.isdir(args.path)))
+    model = None
     try:
         model = llm.model(args.path, dtype = args.dtype, kv_cache_dtype = args.kv_cache_dtype,
                             moe_dtype = args.moe_dtype, graph = graph, tokenizer_type = "auto", lora = args.lora,
@@ -1588,7 +1607,9 @@ def make_normal_llm_model(args, startup_progress = None):
                             tool_call_parser = args.tool_call_parser,
                             external_mtp_path = (speculative_draft_path
                                 if speculative_algorithm == "mtp" else ""),
-                            mmproj_path = args.mmproj)
+                            mmproj_path = args.mmproj,
+                            max_context_length = -1 if legacy_context_limit else max_context_length,
+                            rope_scaling = rope_scaling)
         llm.report_model_load_progress("weights_finalize", 0, 1)
         if (args.enable_thinking.lower() in ["", "false", "0", "off"]):
             model.enable_thinking = False
@@ -1603,14 +1624,13 @@ def make_normal_llm_model(args, startup_progress = None):
             model.set_moe_experts(args.moe_experts)
         if (args.max_batch > 0):
             model.set_max_batch(args.max_batch)
-        model.native_context_window = model.get_max_input_len()
-        model.configured_context_window_limit = None
-        max_context_length = getattr(args, "max_context_length", -1)
-        if (max_context_length == 0 or max_context_length < -1):
-            raise ValueError("--max_context_length must be a positive integer")
+        if not getattr(model, "native_context_window", None):
+            model.native_context_window = model.get_max_input_len()
         if (max_context_length > 0):
+            if legacy_context_limit:
+                model.set_max_context_length(max_context_length)
             model.configured_context_window_limit = max_context_length
-            effective_context_length = model.set_max_context_length(max_context_length)
+            effective_context_length = model.get_max_input_len()
             print("[Fastllm] Per-session context window limit: %d tokens "
                   "(requested=%d, model max=%d)." %
                   (effective_context_length, max_context_length, model.native_context_window))
@@ -1633,6 +1653,10 @@ def make_normal_llm_model(args, startup_progress = None):
                 % (args.max_batch, effective_max_batch, effective_max_batch)
             )
         return model
+    except Exception:
+        if model is not None:
+            model.release_memory()
+        raise
     finally:
         if startup_progress is not None:
             llm.set_model_load_progress_callback(None)

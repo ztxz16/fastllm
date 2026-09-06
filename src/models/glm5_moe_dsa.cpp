@@ -74,7 +74,7 @@ namespace fastllm {
     }
 
     static void Glm5MoeDsaMaybeMarkGlmDenseFp32Dequant(WeightMap &weight, bool isGlmMoeDsa) {
-        if (!isGlmMoeDsa || std::getenv("FASTLLM_GGUF_FP32_DEQUANT") != nullptr) {
+        if (!isGlmMoeDsa) {
             return;
         }
         const char *disable = std::getenv("FASTLLM_GLM_MOE_DSA_DISABLE_FP32_DENSE_DEQUANT");

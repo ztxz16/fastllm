@@ -3,6 +3,7 @@
 #define FASTLLM_BASELLM_H
 
 #include "fastllm.h"
+#include "contextconfig.h"
 #include "baseblock.h"
 #include "template.h"
 
@@ -184,7 +185,18 @@ namespace fastllm {
 
         virtual void LoadFromFile(const std::string &fileName); // 从文件读取 
 
-        virtual void InitParams(); // 初始化参数信息 
+        virtual void InitParams(); // 初始化参数信息
+        virtual ModelContextSpec GetContextSpec() const { return {}; }
+        void ConfigureContext(const ContextOptions &options);
+        void InitContextParams(RoPEType &type, float &theta, float &factor, int &rotaryDim);
+        void ValidateContextCapacity();
+        const RopeConfig *YarnConfig() const {
+            return contextPlan.configured && contextPlan.rope.IsYarn() ? &contextPlan.rope : nullptr;
+        }
+        int RopeReferenceLength() const {
+            return contextPlan.configured && contextPlan.declaredLength > 0 ? contextPlan.declaredLength : max_positions;
+        }
+        ContextPlan contextPlan;
 
         // 根据原始的tensorNames获得映射表
         virtual std::map <std::string, std::vector <std::pair <std::string, DataType> > >

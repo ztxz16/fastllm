@@ -45,7 +45,7 @@ namespace fastllm {
         int num_attention_heads, int num_key_value_heads, int head_dim,
         int rotary_dim, float rms_norm_eps,
         float rope_base, float rope_factor, int max_positions,
-        int rope_type,
+        int rope_type, const RopeConfig *ropeConfig,
         bool kvCacheInCPU,
         bool isPrefill,
         Data *hiddenStates,
@@ -167,8 +167,10 @@ namespace fastllm {
                 RMSNorm(*q, *qNormWeight, rms_norm_eps, *q);
                 RMSNorm(k, *kNormWeight, rms_norm_eps, k);
             }
-            RopeEncoding(*q, *allPositionIds, rotary_dim, curRopeTheta, ropeScale);
-            RopeEncoding(k, *allPositionIds, rotary_dim, curRopeTheta, ropeScale);
+            if (ropeConfig) ApplyYarnRope(*q, *allPositionIds, *ropeConfig);
+            else RopeEncoding(*q, *allPositionIds, rotary_dim, curRopeTheta, ropeScale);
+            if (ropeConfig) ApplyYarnRope(k, *allPositionIds, *ropeConfig);
+            else RopeEncoding(k, *allPositionIds, rotary_dim, curRopeTheta, ropeScale);
 
             // 2.4 Permute [bsz, seqlen, num_heads, head_dim] -> [bsz, num_heads, seqlen, head_dim]
             PermuteSelf(*q, {0, 2, 1, 3});
@@ -291,7 +293,7 @@ namespace fastllm {
                 num_attention_heads, num_key_value_heads, head_dim,
                 rotary_dim, rms_norm_eps, curRopeTheta, ropeScale,
                 curPageLen, batch, doQKNorm,
-                fillLastPageLensOnDevice ? lastPageLens : nullptr);
+                fillLastPageLensOnDevice ? lastPageLens : nullptr, ropeConfig);
 
             // 7. 更新 pastKey/pastValue 的 pageIndex 和 lastPageLen
             if (!externalDecodeMeta) {

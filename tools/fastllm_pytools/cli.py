@@ -95,6 +95,20 @@ def args_parser():
     launch_parser_.add_argument(
         '--config', type = str, default = '', help = 'Custom launch profile path'
     )
+    launch_parser_.add_argument(
+        '--agent-workspace-root', '--agent_workspace_root', default = '',
+        help = 'Root directory for Pi Agent projects (default: current user home)'
+    )
+    launch_parser_.add_argument(
+        '--allow-remote-workspace-agent', '--allow_remote_workspace_agent',
+        action = 'store_true', default = True,
+        help = 'Allow directory agents on remote listeners (enabled by default)'
+    )
+    launch_parser_.add_argument(
+        '--disable-workspace-agent', '--disable_workspace_agent',
+        action = 'store_true',
+        help = 'Disable directory agents on both local and remote listeners'
+    )
 
     from .util import add_server_args
     add_server_args(shared_parser)

@@ -32,6 +32,7 @@
 #include <type_traits>
 #include <vector>
 #include <cuda_fp8.h>
+#include "attention/fastllm-fp4-kv.cuh"
 #ifndef USE_ROCM
 #include "sampling.cuh"
 #endif
@@ -2664,13 +2665,15 @@ __global__ void FastllmYarnRopeEncodingKernel(float *data, float *positionIds,
                                                int len, int spatial, int n, int m,
                                                int positionStride, int rotateDim,
                                                float ropeTheta, float factor, float attentionFactor,
-                                               float correctionLow, float correctionHigh) {
+                                               float correctionLow, float correctionHigh, int mrope, int sectionH, int sectionW) {
     int token = blockIdx.x;
     int batch = token / len;
     int localToken = token % len;
     int dim = threadIdx.x;
     int halfDim = rotateDim / 2;
-    float position = (float)(int)positionIds[batch * positionStride + localToken];
+    int row = mrope ? ((dim % 3 == 1 && dim < sectionH * 3) ? 1 :
+              (dim % 3 == 2 && dim < sectionW * 3) ? 2 : 0) : batch;
+    float position = (float)(int)positionIds[row * positionStride + localToken];
     float angle = position * FastllmYarnInvFreq(
         dim, rotateDim, ropeTheta, factor, correctionLow, correctionHigh);
     float curSin, curCos;
@@ -2690,13 +2693,15 @@ __global__ void FastllmYarnRopeEncodingKernel(half *data, float *positionIds,
                                                int len, int spatial, int n, int m,
                                                int positionStride, int rotateDim,
                                                float ropeTheta, float factor, float attentionFactor,
-                                               float correctionLow, float correctionHigh) {
+                                               float correctionLow, float correctionHigh, int mrope, int sectionH, int sectionW) {
     int token = blockIdx.x;
     int batch = token / len;
     int localToken = token % len;
     int dim = threadIdx.x;
     int halfDim = rotateDim / 2;
-    float position = (float)(int)positionIds[batch * positionStride + localToken];
+    int row = mrope ? ((dim % 3 == 1 && dim < sectionH * 3) ? 1 :
+              (dim % 3 == 2 && dim < sectionW * 3) ? 2 : 0) : batch;
+    float position = (float)(int)positionIds[row * positionStride + localToken];
     float angle = position * FastllmYarnInvFreq(
         dim, rotateDim, ropeTheta, factor, correctionLow, correctionHigh);
     float curSin, curCos;
@@ -2717,13 +2722,15 @@ __global__ void FastllmYarnRopeEncodingKernel(__nv_bfloat16 *data, float *positi
                                                int len, int spatial, int n, int m,
                                                int positionStride, int rotateDim,
                                                float ropeTheta, float factor, float attentionFactor,
-                                               float correctionLow, float correctionHigh) {
+                                               float correctionLow, float correctionHigh, int mrope, int sectionH, int sectionW) {
     int token = blockIdx.x;
     int batch = token / len;
     int localToken = token % len;
     int dim = threadIdx.x;
     int halfDim = rotateDim / 2;
-    float position = (float)(int)positionIds[batch * positionStride + localToken];
+    int row = mrope ? ((dim % 3 == 1 && dim < sectionH * 3) ? 1 :
+              (dim % 3 == 2 && dim < sectionW * 3) ? 2 : 0) : batch;
+    float position = (float)(int)positionIds[row * positionStride + localToken];
     float angle = position * FastllmYarnInvFreq(
         dim, rotateDim, ropeTheta, factor, correctionLow, correctionHigh);
     float curSin, curCos;
@@ -13832,7 +13839,8 @@ __global__ void FastllmQwen35QGateKVRMSNormRopeSplitAppendPagedCacheKernel(
     float ropeScale,
     int pageLen,
     int batch,
-    int doQKNorm) {
+    int doQKNorm, int useYarn, float yarnFactor, float yarnAttentionFactor,
+    float yarnCorrectionLow, float yarnCorrectionHigh) {
     int totalHeads = qHeads + kHeads + kHeads;
     int blockId = blockIdx.x;
     int tokenId = blockId / totalHeads;
@@ -13923,9 +13931,12 @@ __global__ void FastllmQwen35QGateKVRMSNormRopeSplitAppendPagedCacheKernel(
                 rawPosition = positionIds[positionOffset];
             }
             float position = rawPosition / ropeScale;
-            float freq = position / powf(ropeTheta, (float)(2 * j) / rotaryDim);
+            float freq = useYarn ? rawPosition * FastllmYarnInvFreq(j, rotaryDim, ropeTheta,
+                yarnFactor, yarnCorrectionLow, yarnCorrectionHigh) :
+                position / powf(ropeTheta, (float)(2 * j) / rotaryDim);
             float curSin = sinf(freq);
             float curCos = cosf(freq);
+            if (useYarn) { curSin *= yarnAttentionFactor; curCos *= yarnAttentionFactor; }
             float va = FastllmCudaValueToFloat(base[j]);
             float vb = FastllmCudaValueToFloat(base[j + halfRotate]);
             base[j] = FastllmCudaFloatToValue<T>(va * curCos - vb * curSin);
@@ -13947,10 +13958,10 @@ __global__ void FastllmQwen35QGateKVRMSNormRopeSplitAppendPagedCacheKernel(
             int pageOffset = insertPositions[batchIdx];
             int pageStride = pageLen * kHeads * headDim;
             int tokenStride = kHeads * headDim;
-            TKV *kDst = pagedKData + (size_t)pageIdx * pageStride +
-                pageOffset * tokenStride + kh * headDim;
             for (int i = tid; i < headDim; i += THREAD_PER_BLOCK) {
-                kDst[i] = FastllmCudaFloatToValue<TKV>(FastllmCudaValueToFloat(base[i]));
+                FastllmWritePagedKV(pagedKData, base + i,
+                    (size_t)pageIdx * pageStride + pageOffset * tokenStride + kh * headDim + i,
+                    pageStride);
             }
         }
     } else {
@@ -13960,10 +13971,10 @@ __global__ void FastllmQwen35QGateKVRMSNormRopeSplitAppendPagedCacheKernel(
         int pageOffset = insertPositions[batchIdx];
         int pageStride = pageLen * kHeads * headDim;
         int tokenStride = kHeads * headDim;
-        TKV *vDst = pagedVData + (size_t)pageIdx * pageStride +
-            pageOffset * tokenStride + vh * headDim;
         for (int i = tid; i < headDim; i += THREAD_PER_BLOCK) {
-            vDst[i] = FastllmCudaFloatToValue<TKV>(FastllmCudaValueToFloat(vBase[i]));
+            FastllmWritePagedKV(pagedVData, vBase + i,
+                (size_t)pageIdx * pageStride + pageOffset * tokenStride + vh * headDim + i,
+                pageStride);
         }
     }
 }
@@ -13984,7 +13995,8 @@ bool FastllmCudaQwen35QGateKVRMSNormRopeSplitAppendPagedCache(
     int rotaryDim, int sectionT, int sectionH, int sectionW,
     float eps, float ropeTheta, float ropeScale,
     int pageLen, fastllm::DataType pagedDataType, int batch,
-    int doQKNorm) {
+    int doQKNorm, int useYarn, float yarnFactor, float yarnAttentionFactor,
+    float yarnCorrectionLow, float yarnCorrectionHigh) {
     fastllm::AssertInFastLLM(qgatekv.dims.size() == 3,
                              "FastllmCudaQwen35QGateKVRMSNormRopeSplitAppendPagedCache expects [bs, seq, dim].\n");
     int bs = qgatekv.dims[0];
@@ -14023,7 +14035,8 @@ bool FastllmCudaQwen35QGateKVRMSNormRopeSplitAppendPagedCache(
                 outer, totalDim, qHeads, kHeads, headDim,
                 bs, seqlen, positionStride, rotaryDim,
                 sectionH, sectionW, useInterleavedRope,
-                eps, ropeTheta, ropeScale, pageLen, batch, doQKNorm);
+                eps, ropeTheta, ropeScale, pageLen, batch, doQKNorm,
+                useYarn, yarnFactor, yarnAttentionFactor, yarnCorrectionLow, yarnCorrectionHigh);
     };
 
     auto launchByPagedType = [&](auto TPB, auto *qgatekvPtr, auto *qOutputPtr, auto *gateOutputPtr) {
@@ -14035,6 +14048,8 @@ bool FastllmCudaQwen35QGateKVRMSNormRopeSplitAppendPagedCache(
             launch(TPB, qgatekvPtr, qOutputPtr, gateOutputPtr, (__nv_bfloat16*)nullptr);
         } else if (pagedDataType == fastllm::DataType::FP8_E4M3) {
             launch(TPB, qgatekvPtr, qOutputPtr, gateOutputPtr, (__nv_fp8_e4m3*)nullptr);
+        } else if (pagedDataType == fastllm::DataType::FP4_E2M1) {
+            launch(TPB, qgatekvPtr, qOutputPtr, gateOutputPtr, (uint8_t*)nullptr);
         } else {
             fastllm::ErrorInFastLLM("FastllmCudaQwen35QGateKVRMSNormRopeSplitAppendPagedCache: unsupported pagedDataType.\n");
         }
@@ -14154,7 +14169,7 @@ bool FastllmCudaRopeEncoding(fastllm::Data &data, const fastllm::Data &positionI
 
 bool FastllmCudaYarnRopeEncoding(fastllm::Data &data, const fastllm::Data &positionIds, int rotaryDim,
                                  float ropeTheta, float factor, float attentionFactor,
-                                 float correctionLow, float correctionHigh) {
+                                 float correctionLow, float correctionHigh, int mrope, int sectionH, int sectionW) {
     fastllm::AssertInFastLLM(data.dims.size() == 4,
                              "YaRN RoPE expects [batch, seq, heads, dim] input.");
     fastllm::AssertInFastLLM(positionIds.dataType == fastllm::DataType::FLOAT32,
@@ -14167,6 +14182,9 @@ bool FastllmCudaYarnRopeEncoding(fastllm::Data &data, const fastllm::Data &posit
                              data.dataType == fastllm::DataType::BFLOAT16,
                              "CUDA YaRN RoPE supports FLOAT32, FLOAT16 and BFLOAT16 input.");
 
+    fastllm::AssertInFastLLM(positionIds.dims.size() == 2 && positionIds.dims.back() >= data.dims[1] &&
+        (mrope ? (data.dims[0] == 1 && positionIds.dims[0] == 3) : positionIds.dims[0] >= data.dims[0]),
+        "YaRN position shape does not match input/layout.");
     float *cudaData = (float *)FastllmCudaPrepareInput(data);
     float *cudaPositionIds = (float *)FastllmCudaPrepareInput(positionIds);
     int outer = data.dims[0] * data.dims[1];
@@ -14178,15 +14196,15 @@ bool FastllmCudaYarnRopeEncoding(fastllm::Data &data, const fastllm::Data &posit
     if (data.dataType == fastllm::DataType::FLOAT32) {
         FastllmYarnRopeEncodingKernel <<< outer, halfDim >>> (
             cudaData, cudaPositionIds, len, spatial, n, m, positionStride, rotaryDim,
-            ropeTheta, factor, attentionFactor, correctionLow, correctionHigh);
+            ropeTheta, factor, attentionFactor, correctionLow, correctionHigh, mrope, sectionH, sectionW);
     } else if (data.dataType == fastllm::DataType::FLOAT16) {
         FastllmYarnRopeEncodingKernel <<< outer, halfDim >>> (
             (half*)cudaData, cudaPositionIds, len, spatial, n, m, positionStride, rotaryDim,
-            ropeTheta, factor, attentionFactor, correctionLow, correctionHigh);
+            ropeTheta, factor, attentionFactor, correctionLow, correctionHigh, mrope, sectionH, sectionW);
     } else {
         FastllmYarnRopeEncodingKernel <<< outer, halfDim >>> (
             (__nv_bfloat16*)cudaData, cudaPositionIds, len, spatial, n, m, positionStride, rotaryDim,
-            ropeTheta, factor, attentionFactor, correctionLow, correctionHigh);
+            ropeTheta, factor, attentionFactor, correctionLow, correctionHigh, mrope, sectionH, sectionW);
     }
     FastllmCudaFinishInput(positionIds, cudaPositionIds);
     FastllmCudaFinishOutput(data, cudaData);
@@ -20283,11 +20301,11 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
 
     extern __shared__ char shared_buf[];
     float *q_norm = reinterpret_cast<float*>(shared_buf);
-    float *k_norm = q_norm + headKDim;
-    float *warp_q = k_norm + headKDim;
-    float *warp_k = warp_q + 2;
-    float *scales = warp_k + 2;
-    float *ba_values = scales + 2;
+    float *k_norm = q_norm + seqLen * headKDim;
+    float *warp_q = k_norm + seqLen * headKDim;
+    float *warp_k = warp_q + seqLen * 2;
+    float *scales = warp_k + seqLen * 2;
+    float *ba_values = scales + seqLen * 2;
 
     int batchIndex = blockIdx.z;
     if (statePointers != nullptr) {
@@ -20298,86 +20316,102 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
         last_recurrent_state + stateHeadBase + (size_t)v_col * headKDim :
         last_recurrent_state;
 
-    for (int token = 0; token < seqLen; token++) {
+    // Normalize the short sequence together. Once these shared values are
+    // ready, each warp owns its state row and needs no block-wide barriers
+    // between recurrent steps.
+    for (int token = tid / 64; token < seqLen; token += blockDim.x / 64) {
         int convBase = (batchIndex * seqLen + token) * qkvDim;
         int qOffset = convBase + qHead * headKDim;
         int kOffset = convBase + numKHeads * headKDim + qHead * headKDim;
-        int vOffset = convBase + 2 * numKHeads * headKDim + head_idx * headVDim;
-        int outBase = ((batchIndex * seqLen + token) * numVHeads + head_idx) *
-                      headVDim;
-
-        if (tid < 64) {
-            const half2 *q_h2 = reinterpret_cast<const half2*>(convOutput + qOffset);
-            const half2 *k_h2 = reinterpret_cast<const half2*>(convOutput + kOffset);
-            half2 qh = q_h2[tid];
-            half2 kh = k_h2[tid];
-            float2 qf = __half22float2(qh);
-            float2 kf = __half22float2(kh);
-            float q_sum2 = qf.x * qf.x + qf.y * qf.y;
-            float k_sum2 = kf.x * kf.x + kf.y * kf.y;
-            for (int offset = 16; offset > 0; offset >>= 1) {
-                q_sum2 += __shfl_down_sync(0xffffffff, q_sum2, offset);
-                k_sum2 += __shfl_down_sync(0xffffffff, k_sum2, offset);
-            }
-            if (lane_id == 0) {
-                int norm_warp = tid >> 5;
-                warp_q[norm_warp] = q_sum2;
-                warp_k[norm_warp] = k_sum2;
-            }
+        int normTid = tid % 64;
+        const half2 *q_h2 = reinterpret_cast<const half2*>(convOutput + qOffset);
+        const half2 *k_h2 = reinterpret_cast<const half2*>(convOutput + kOffset);
+        half2 qh = q_h2[normTid];
+        half2 kh = k_h2[normTid];
+        float2 qf = __half22float2(qh);
+        float2 kf = __half22float2(kh);
+        float q_sum2 = qf.x * qf.x + qf.y * qf.y;
+        float k_sum2 = kf.x * kf.x + kf.y * kf.y;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            q_sum2 += __shfl_down_sync(0xffffffff, q_sum2, offset);
+            k_sum2 += __shfl_down_sync(0xffffffff, k_sum2, offset);
         }
-        __syncthreads();
-
-        if (tid < 32) {
-            float q_val = tid < 2 ? warp_q[tid] : 0.0f;
-            float k_val = tid < 2 ? warp_k[tid] : 0.0f;
-            for (int offset = 16; offset > 0; offset >>= 1) {
-                q_val += __shfl_down_sync(0xffffffff, q_val, offset);
-                k_val += __shfl_down_sync(0xffffffff, k_val, offset);
-            }
-            if (tid == 0) {
-                scales[0] = rsqrtf(q_val / headKDim + eps);
-                scales[1] = rsqrtf(k_val / headKDim + eps);
-            }
+        if (lane_id == 0) {
+            int norm_warp = normTid >> 5;
+            warp_q[token * 2 + norm_warp] = q_sum2;
+            warp_k[token * 2 + norm_warp] = k_sum2;
         }
-        __syncthreads();
+    }
+    __syncthreads();
 
-        if (tid < 64) {
-            const half2 *q_h2 = reinterpret_cast<const half2*>(convOutput + qOffset);
-            const half2 *k_h2 = reinterpret_cast<const half2*>(convOutput + kOffset);
-            half2 qh = q_h2[tid];
-            half2 kh = k_h2[tid];
-            float2 qf = __half22float2(qh);
-            float2 kf = __half22float2(kh);
-            float w0 = __ldg(&normWeight[tid * 2]);
-            float w1 = __ldg(&normWeight[tid * 2 + 1]);
-            q_norm[tid * 2] = qf.x * scales[0] * w0;
-            q_norm[tid * 2 + 1] = qf.y * scales[0] * w1;
-            k_norm[tid * 2] = kf.x * scales[1] * w0;
-            k_norm[tid * 2 + 1] = kf.y * scales[1] * w1;
+    for (int token = warp_id; token < seqLen; token += TILE_V) {
+        float q_val = lane_id < 2 ? warp_q[token * 2 + lane_id] : 0.0f;
+        float k_val = lane_id < 2 ? warp_k[token * 2 + lane_id] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            q_val += __shfl_down_sync(0xffffffff, q_val, offset);
+            k_val += __shfl_down_sync(0xffffffff, k_val, offset);
         }
-
-        if (tid == 0) {
+        if (lane_id == 0) {
+            scales[token * 2] = rsqrtf(q_val / headKDim + eps);
+            scales[token * 2 + 1] = rsqrtf(k_val / headKDim + eps);
             const half *baRow = ba +
                 (size_t)(batchIndex * seqLen + token) * (numVHeads * 2);
             float bRaw = __half2float(baRow[head_idx]);
             float aRaw = __half2float(baRow[numVHeads + head_idx]);
             float gRaw = -__expf(aLog[head_idx]) * softplus_fast(aRaw + dtBias[head_idx]);
-            ba_values[0] = 1.0f / (1.0f + __expf(-bRaw));
-            ba_values[1] = __expf(gRaw);
+            ba_values[token * 2] = 1.0f / (1.0f + __expf(-bRaw));
+            ba_values[token * 2 + 1] = __expf(gRaw);
         }
-        __syncthreads();
+    }
+    __syncthreads();
 
-        if (activeV) {
-            float gVal = ba_values[1];
+    for (int index = tid; index < seqLen * 64; index += blockDim.x) {
+        int token = index / 64;
+        int normTid = index % 64;
+        int convBase = (batchIndex * seqLen + token) * qkvDim;
+        int qOffset = convBase + qHead * headKDim;
+        int kOffset = convBase + numKHeads * headKDim + qHead * headKDim;
+        const half2 *q_h2 = reinterpret_cast<const half2*>(convOutput + qOffset);
+        const half2 *k_h2 = reinterpret_cast<const half2*>(convOutput + kOffset);
+        half2 qh = q_h2[normTid];
+        half2 kh = k_h2[normTid];
+        float2 qf = __half22float2(qh);
+        float2 kf = __half22float2(kh);
+        float w0 = __ldg(&normWeight[normTid * 2]);
+        float w1 = __ldg(&normWeight[normTid * 2 + 1]);
+        int normIndex = token * headKDim + normTid * 2;
+        q_norm[normIndex] = qf.x * scales[token * 2] * w0;
+        q_norm[normIndex + 1] = qf.y * scales[token * 2] * w1;
+        k_norm[normIndex] = kf.x * scales[token * 2 + 1] * w0;
+        k_norm[normIndex + 1] = kf.y * scales[token * 2 + 1] * w1;
+    }
+    __syncthreads();
+
+    if (activeV) {
+        // The entry points require headKDim == 128. Preserve the reference
+        // half rounding after every token, including when no snapshot is kept.
+        half stateValues[4];
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            stateValues[j] = state_row[lane_id + j * 32];
+        }
+        for (int token = 0; token < seqLen; token++) {
+            int convBase = (batchIndex * seqLen + token) * qkvDim;
+            int vOffset = convBase + 2 * numKHeads * headKDim + head_idx * headVDim;
+            int outBase = ((batchIndex * seqLen + token) * numVHeads + head_idx) * headVDim;
+            const float *qToken = q_norm + token * headKDim;
+            const float *kToken = k_norm + token * headKDim;
+            float gVal = ba_values[token * 2 + 1];
             float sumK = 0.0f;
-            for (int j = lane_id; j < headKDim; j += 32) {
-                sumK += (__half2float(state_row[j]) * gVal) * k_norm[j];
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                sumK += (__half2float(stateValues[j]) * gVal) * kToken[lane_id + j * 32];
             }
             for (int offset = 16; offset > 0; offset >>= 1) {
                 sumK += __shfl_down_sync(0xffffffff, sumK, offset);
             }
             float delta = (__half2float(convOutput[vOffset + v_col]) -
-                           __shfl_sync(0xffffffff, sumK, 0)) * ba_values[0];
+                           __shfl_sync(0xffffffff, sumK, 0)) * ba_values[token * 2];
 
             float sumQ = 0.0f;
             half *snapBase = nullptr;
@@ -20397,14 +20431,16 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
             }
             half *snap_row = snapBase != nullptr ?
                 snapBase + stateHeadBase + (size_t)v_col * headKDim : nullptr;
-            for (int j = lane_id; j < headKDim; j += 32) {
-                float updated = __half2float(state_row[j]) * gVal + k_norm[j] * delta;
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                int channel = lane_id + j * 32;
+                float updated = __half2float(stateValues[j]) * gVal + kToken[channel] * delta;
                 half updatedHalf = __float2half_rn(updated);
-                state_row[j] = updatedHalf;
+                stateValues[j] = updatedHalf;
                 if (snap_row != nullptr) {
-                    snap_row[j] = updatedHalf;
+                    snap_row[channel] = updatedHalf;
                 }
-                sumQ += updated * (q_norm[j] * qScale);
+                sumQ += updated * (qToken[channel] * qScale);
             }
             for (int offset = 16; offset > 0; offset >>= 1) {
                 sumQ += __shfl_down_sync(0xffffffff, sumQ, offset);
@@ -20413,7 +20449,10 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
                 core_attn_out[outBase + v_col] = __float2half_rn(sumQ);
             }
         }
-        __syncthreads();
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            state_row[lane_id + j * 32] = stateValues[j];
+        }
     }
 }
 
@@ -20793,9 +20832,9 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16Snapshots(
         snaps[t] = (half*)snap->cudaData;
     }
 
-    constexpr int tileV = 8;
+    constexpr int tileV = 16;
     int threadsPerBlock = tileV * 32;
-    size_t sharedMemSize = (2 * (size_t)headKDim + 8) * sizeof(float);
+    size_t sharedMemSize = seqLen * (2 * (size_t)headKDim + 8) * sizeof(float);
     dim3 gridDim(numVHeads, (headVDim + tileV - 1) / tileV);
 
     cudaError_t pendingState = cudaGetLastError();
@@ -20939,9 +20978,9 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnaps
         !FastllmCudaDataCanShareDevice(first, coreAttnOut)) {
         return false;
     }
-    constexpr int tileV = 8;
+    constexpr int tileV = 16;
     int threads = tileV * 32;
-    size_t sharedBytes = (2 * (size_t)headKDim + 8) * sizeof(float);
+    size_t sharedBytes = seqLen * (2 * (size_t)headKDim + 8) * sizeof(float);
     dim3 grid(numVHeads, (headVDim + tileV - 1) / tileV, batch);
     FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWarpKernel<tileV>
         <<<grid, threads, sharedBytes>>>(

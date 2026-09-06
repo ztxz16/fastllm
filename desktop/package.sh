@@ -29,7 +29,7 @@ usage() {
 用法：
   ./desktop/package.sh [选项]
 
-把 Electron、ftllm 绿色运行时和桌面所需动态库组装为 Linux x86_64 绿色包。
+把 Electron、ftllm/Pi Agent 绿色运行时和桌面所需动态库组装为 Linux x86_64 绿色包。
 
 选项：
   --wheel PATH       使用指定的 ftllm wheel；默认选择 build-fastllm/tools/dist 中最新文件
@@ -37,7 +37,7 @@ usage() {
   --output-dir DIR   输出目录；默认 portable-dist
   --format FORMAT    tar.gz 或 tar.zst；默认 tar.gz
   --keep-dir         同时保留未压缩目录
-  --offline          不访问网络，只使用已有缓存
+  --offline          不访问网络，只使用已有 Python/Electron/Pi 缓存及 wheelhouse
   --skip-tests       跳过运行时冒烟测试
   --force            覆盖同名产物
   -h, --help         显示帮助
@@ -448,15 +448,19 @@ if ((run_tests)); then
     "${bundle_dir}/ftllm/ftllm" --version
     "${bundle_dir}/ftllm/ftllm-check"
     python3 "${SCRIPT_DIR}/tests/smoke_launcher.py" "$bundle_dir"
+    "${bundle_dir}/ftllm/python" "${ROOT_DIR}/portable/smoke_agent.py" --check-studio
     if command -v xvfb-run >/dev/null 2>&1; then
         smoke_data="${build_root}/electron-smoke-data"
+        smoke_log="${build_root}/electron-smoke.log"
         set +e
         FTLLM_LAUNCHER_DATA_DIR="$smoke_data" timeout --signal=TERM 15s \
-            xvfb-run -a "${bundle_dir}/FastLLM-Launcher" --disable-gpu >/dev/null 2>&1
+            xvfb-run -a "${bundle_dir}/FastLLM-Launcher" --disable-gpu >"$smoke_log" 2>&1
         smoke_status=$?
         set -e
-        [[ "$smoke_status" == 0 || "$smoke_status" == 124 ]] \
-            || die "Electron Launcher 冒烟测试失败，退出码 ${smoke_status}"
+        if [[ "$smoke_status" != 0 && "$smoke_status" != 124 ]]; then
+            tail -n 40 "$smoke_log" >&2
+            die "Electron Launcher 冒烟测试失败，退出码 ${smoke_status}"
+        fi
         grep -F "Starting bundled ftllm launch" "${smoke_data}/logs/desktop.log" >/dev/null \
             || die "Electron Launcher 未启动 ftllm launch"
     else
