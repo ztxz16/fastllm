@@ -7,6 +7,9 @@
 
 #define FASTLLM_CUDA_NO_MALLOC_CHECK_MACRO
 #include "fastllm-cuda.cuh"
+#ifdef USE_ROCM
+#include "devices/rocm/fastllm-rocm-router.h"
+#endif
 #ifndef USE_ROCM
 #include "fastllm-cuda-ordered-reduce.cuh"
 #endif
@@ -11648,7 +11651,11 @@ static bool FastllmCudaFusedSelectExpert256(
     int tokens = logits.Count(0) / 256;
     int biasType = !hasBias || gateBias->dataType == fastllm::DataType::FLOAT32 ? 0 :
                    (gateBias->dataType == fastllm::DataType::FLOAT16 ? 1 : 2);
-#ifndef USE_ROCM
+#ifdef USE_ROCM
+    FastllmRocmFusedSelectExpert256(
+        cudaLogits, logits.dataType, cudaBias, biasType, cudaIndex, cudaScore,
+        tokens, ROUTER_TOPK, ROUTER_SIGMOID, needNorm, routeScale);
+#else
     if constexpr (ROUTER_SIGMOID) {
         if (logits.dataType == fastllm::DataType::FLOAT16) {
             FastllmFusedSigmoidSelectExpert256Top10Kernel<half><<<tokens, 32>>>(
@@ -11668,7 +11675,6 @@ static bool FastllmCudaFusedSelectExpert256(
                 needNorm ? 1 : 0, routeScale);
         }
     } else
-#endif
     {
     bool useSelectedLogitFastPath =
         !ROUTER_SIGMOID && ROUTER_TOPK == 8 && !hasBias && needNorm;
@@ -11713,6 +11719,8 @@ static bool FastllmCudaFusedSelectExpert256(
         }
     }
     }
+
+#endif
 
     cudaError_t state = cudaGetLastError();
     bool success = state == cudaSuccess;

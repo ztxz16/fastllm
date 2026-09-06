@@ -73,7 +73,8 @@ set(FASTLLM_CUDA_SOURCES src/devices/cuda/cudadevice.cpp src/devices/cuda/cudade
     ${FASTLLM_HIP_GENERATED_DIR}/hip/models/deepseekv4-kernels.hip
     ${FASTLLM_HIP_GENERATED_DIR}/hip/models/qwen4-kernels.hip
     src/devices/rocm/fastllm-rocm-fallbacks.hip
-    src/devices/rocm/fastllm-rocm-sampling.hip)
+    src/devices/rocm/fastllm-rocm-sampling.hip
+    src/devices/rocm/fastllm-rocm-router.hip)
 add_compile_definitions(USE_ROCM)
 add_compile_definitions(USE_CUDA)
 find_package(hip REQUIRED)
