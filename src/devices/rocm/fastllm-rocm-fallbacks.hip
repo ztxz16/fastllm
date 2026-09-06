@@ -7,12 +7,6 @@
 #error "This file is only part of the ROCm backend"
 #endif
 
-bool FastllmCudaBFloat16MatMulGGUFMMQ(const void *input, const void *weight,
-                                     void *output, int ggmlType,
-                                     int n, int m, int k, void *stream) {
-    return false;
-}
-
 bool FastllmCudaBFloat16MatMulGGUFMMVQ(const void *input, const void *weight,
                                       void *output, int ggmlType,
                                       int n, int m, int k, void *stream) {
@@ -117,12 +111,6 @@ bool FastllmCudaGptqMarlinRepack(const uint32_t *b_q_weight, uint32_t *out,
 bool FastllmCudaHalfGgufGateUpSiluMulMMVQ(
         const void *input, const void *gateWeight, const void *upWeight,
         void *output, int ggmlType, int n, int m, int k, void *stream) {
-    return false;
-}
-
-bool FastllmCudaHalfMatMulGGUFMMQ(const void *input, const void *weight,
-                                 void *output, int ggmlType,
-                                 int n, int m, int k, void *stream) {
     return false;
 }
 
