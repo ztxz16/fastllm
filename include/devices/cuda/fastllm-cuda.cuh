@@ -1103,6 +1103,20 @@ extern "C" bool FastllmCudaDeepSeekV4WoADeepGemmSm120(
                               fastllm::Data &output);
 #endif
 namespace fastllm {
+// Optional CuTe C export. The launch function owns no Python state.
+using FlashInferGdnLaunch = int (*)(void **, int, int, int, void *);
+// Internal adapter: call through TryFlashInferGdnPrefill for eligibility checks.
+bool FastllmCudaFlashInferGdnPrefill(
+        FlashInferGdnLaunch launch,
+        const Data &qkv, const Data &normWeight,
+        const Data &g, const Data &beta,
+        int tokens, int keyHeads, int valueHeads, float eps,
+        Data &state, Data &output);
+bool FastllmCudaTryFlashInferGdnPrefill(
+        const Data &qkv, const Data &normWeight,
+        const Data &g, const Data &beta,
+        int tokens, int keyHeads, int valueHeads, float eps,
+        Data &state, Data &output);
 // Verifier batches below this thread-local threshold must use a native linear
 // path whose arithmetic is equivalent to independent single-token decoding.
 int FastllmCudaGetLinearExactBatchThreshold();

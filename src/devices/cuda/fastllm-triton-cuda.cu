@@ -20,6 +20,173 @@
 #include <vector>
 
 namespace {
+__global__ void FlashInferGdnGatesKernel(
+        const half *g, const half *beta, float *alpha, float *betaFloat,
+        int64_t *seq, int count, int tokens) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) {
+        alpha[i] = expf(__half2float(g[i]));
+        betaFloat[i] = __half2float(beta[i]);
+    }
+    if (i == 0) {
+        seq[0] = 0;
+        seq[1] = tokens;
+    }
+}
+
+// fastllm's cache is FP16 [K,V]; FlashInfer carries FP32 [V,K].
+template <bool TO_FLOAT>
+__global__ void FlashInferGdnStateKernel(const void *input, void *output) {
+    __shared__ float tile[32][33];
+    int x = blockIdx.x * 32 + threadIdx.x;
+    int y = blockIdx.y * 32 + threadIdx.y;
+    int base = blockIdx.z * 16384;
+    for (int j = 0; j < 32; j += 8) {
+        int index = base + (y + j) * 128 + x;
+        if constexpr (TO_FLOAT) {
+            tile[threadIdx.y + j][threadIdx.x] = input
+                ? __half2float(((const half *)input)[index]) : 0.0f;
+        } else {
+            tile[threadIdx.y + j][threadIdx.x] = ((const float *)input)[index];
+        }
+    }
+    __syncthreads();
+    x = blockIdx.y * 32 + threadIdx.x;
+    y = blockIdx.x * 32 + threadIdx.y;
+    for (int j = 0; j < 32; j += 8) {
+        int index = base + (y + j) * 128 + x;
+        float value = tile[threadIdx.x][threadIdx.y + j];
+        if constexpr (TO_FLOAT) ((float *)output)[index] = value;
+        else ((half *)output)[index] = __float2half_rn(value);
+    }
+}
+}
+
+bool fastllm::FastllmCudaFlashInferGdnPrefill(
+        FlashInferGdnLaunch launch,
+        const Data &qkv, const Data &normWeight,
+        const Data &g, const Data &beta,
+        int tokens, int keyHeads, int valueHeads, float eps,
+        Data &state, Data &output) {
+    // The Try entry point validates architecture, capture and tensor layout.
+    if (!launch) return false;
+    int device = FastllmCudaGetDevice();
+    struct Scratch {
+        void *data = nullptr;
+        size_t bytes = 0;
+        int sms = 0;
+        int device = 0;
+        ~Scratch() {
+            if (!data) return;
+            int previous = 0;
+            if (cudaGetDevice(&previous) != cudaSuccess) return;
+            if (cudaSetDevice(device) != cudaSuccess) return;
+            cudaFree(data);
+            cudaSetDevice(previous);
+        }
+    };
+    static thread_local std::map<int, Scratch> scratches;
+    Scratch &scratch = scratches[device];
+    scratch.device = device;
+    if (!scratch.sms && cudaDeviceGetAttribute(
+            &scratch.sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) {
+        return false;
+    }
+    // FlashInfer's HBM heuristic for long, single-sequence SM90 prefills:
+    // one wave of CP chunks, rounded up to the 512-token granularity.
+    int targetChunks = std::max(1, scratch.sms / valueHeads);
+    int cpLen = ((tokens + targetChunks - 1) / targetChunks + 511) / 512 * 512;
+    int nt = (tokens + 63) / 64;
+    int nc = (tokens + cpLen - 1) / cpLen;
+    size_t qBytes = (size_t)tokens * keyHeads * 128 * sizeof(half);
+    size_t gateBytes = (size_t)tokens * valueHeads * sizeof(float);
+    size_t stateBytes = (size_t)valueHeads * 16384 * sizeof(float);
+    size_t tBytes = (size_t)nt * valueHeads * 4096 * sizeof(half);
+    size_t chunkBytes = (size_t)nc * stateBytes;
+    enum Buffer { Q, K, Alpha, Beta, Initial, NextState, T, Transfer,
+                  Local, Fixed, Maps, Seq, BufferCount };
+    size_t sizes[BufferCount] = {qBytes, qBytes, gateBytes, gateBytes, stateBytes,
+                      stateBytes, tBytes, chunkBytes, chunkBytes, chunkBytes,
+                      (size_t)scratch.sms * 128, 2 * sizeof(int64_t)};
+    size_t bytes = 0;
+    for (size_t size : sizes) bytes += (size + 127) / 128 * 128;
+    if (bytes > scratch.bytes) {
+        // Growth is outside capture; preserve the previous cache on OOM.
+        void *data = nullptr;
+        if (cudaMalloc(&data, bytes) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        if (scratch.data) cudaFree(scratch.data);
+        scratch.data = data;
+        scratch.bytes = bytes;
+    }
+    void *buffers[BufferCount];
+    size_t offset = 0;
+    for (int i = 0; i < BufferCount; ++i) {
+        buffers[i] = (char *)scratch.data + offset;
+        offset += (sizes[i] + 127) / 128 * 128;
+    }
+    Data q(DataType::FLOAT16, {1, tokens, keyHeads, 128});
+    Data k(DataType::FLOAT16, {1, tokens, keyHeads, 128});
+    for (Data *data : {&q, &k}) {
+        data->isFake = true;
+        data->dataDevice = DataDevice::CUDA;
+        data->dataDeviceIds = qkv.dataDeviceIds;
+    }
+    q.cudaData = buffers[Q];
+    k.cudaData = buffers[K];
+    if (!FastllmCudaRMSNormCombinedQKFloat16(
+            qkv, normWeight, 1, tokens, keyHeads, valueHeads,
+            128, 128, eps, q, k)) return false;
+    output.dataType = DataType::FLOAT16;
+    output.dataDevice = DataDevice::CUDA;
+    output.dataDeviceIds = qkv.dataDeviceIds;
+    output.Resize({1, tokens, valueHeads, 128});
+    output.Allocate(false);
+    if (!output.cudaData) return false;
+    FlashInferGdnGatesKernel<<<(tokens * valueHeads + 255) / 256, 256>>>(
+        (const half *)g.cudaData, (const half *)beta.cudaData,
+        (float *)buffers[Alpha], (float *)buffers[Beta], (int64_t *)buffers[Seq],
+        tokens * valueHeads, tokens);
+    FlashInferGdnStateKernel<true><<<dim3(4, 4, valueHeads), dim3(32, 8)>>>(
+        state.dims.empty() ? nullptr : state.cudaData, buffers[Initial]);
+    if (cudaGetLastError() != cudaSuccess) return false;
+    void *args[] = {
+        q.cudaData, k.cudaData, (half *)qkv.cudaData + 2 * keyHeads * 128,
+        buffers[Alpha], buffers[Beta], buffers[Initial], buffers[NextState], output.cudaData,
+        buffers[T], buffers[Transfer], buffers[Local], buffers[Fixed], buffers[Maps], buffers[Seq]};
+    int result = launch(args, tokens, cpLen, scratch.sms, cudaStreamPerThread);
+    if (result != 0) {
+        printf("Fastllm FlashInfer GDN: launch failed (%d), using CUDA/Triton.\n", result);
+        return false;
+    }
+    // Commit only after all four kernels launch successfully. A failed trial
+    // must not advance the input recurrent state before the fallback runs.
+    bool newState = state.dims.empty();
+    if (newState) {
+        state.dataType = DataType::FLOAT16;
+        state.dataDevice = DataDevice::CUDA;
+        state.dataDeviceIds = qkv.dataDeviceIds;
+        state.Resize({1, valueHeads, 128, 128});
+        state.Allocate(false);
+    }
+    bool committed = false;
+    if (state.cudaData) {
+        FlashInferGdnStateKernel<false><<<dim3(4, 4, valueHeads), dim3(32, 8)>>>(
+            buffers[NextState], state.cudaData);
+        committed = cudaGetLastError() == cudaSuccess;
+    }
+    if (!committed && newState) {
+        // Let the fallback initialize a zero state after a failed commit.
+        state.dims.clear();
+        state.strides.clear();
+    }
+    state.isLinearAttentionTransposed = false;
+    return committed;
+}
+
+namespace {
 struct LoadedTritonKernel {
     CUmodule module = nullptr;
     CUfunction function = nullptr;

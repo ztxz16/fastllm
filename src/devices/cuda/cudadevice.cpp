@@ -3324,6 +3324,113 @@ namespace fastllm {
             lastRecurrentState, coreAttnOut);
     }
 
+    bool FastllmCudaTryFlashInferGdnPrefill(
+        const Data &qkv, const Data &normWeight,
+        const Data &g, const Data &beta,
+        int tokens, int keyHeads, int valueHeads, float eps,
+        Data &state, Data &output) {
+        // Experimental opt-in, independent of the existing Triton H/O path.
+        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON") ||
+            !CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON_FLASHINFER_GDN") ||
+            tokens < 1024 || tokens > 131072 || keyHeads <= 0 ||
+            valueHeads < 32 || valueHeads > 128 || valueHeads % keyHeads ||
+            CudaTritonRuntimeArch() != 90 || FastllmCudaGraphIsCapturing() ||
+            !std::isfinite(eps) || eps < 0.0f) {
+            return false;
+        }
+        auto dense = [](const Data &data, DataType dtype, uint64_t count) {
+            if (data.dataDevice != DataDevice::CUDA || data.dataType != dtype ||
+                !data.cudaData || ((uintptr_t)data.cudaData % 128) || data.dims.empty() ||
+                data.strides.size() != data.dims.size() || data.Count(0) != count) {
+                return false;
+            }
+            uint64_t stride = 1;
+            for (int i = (int)data.dims.size() - 1; i >= 0; --i) {
+                if (data.strides[i] != stride) return false;
+                stride *= data.dims[i];
+            }
+            return true;
+        };
+        if (!dense(qkv, DataType::FLOAT16,
+                   (uint64_t)tokens * (2 * keyHeads + valueHeads) * 128) ||
+            !dense(normWeight, DataType::FLOAT32, 128) ||
+            !dense(g, DataType::FLOAT16, (uint64_t)tokens * valueHeads) ||
+            !dense(beta, DataType::FLOAT16, (uint64_t)tokens * valueHeads) ||
+            (!state.dims.empty() &&
+             (state.isLinearAttentionTransposed ||
+              state.dims != std::vector<int>({1, valueHeads, 128, 128}) ||
+              !dense(state, DataType::FLOAT16, (uint64_t)valueHeads * 16384)))) {
+            return false;
+        }
+        std::string base = "flashinfer_gdn_v1_fp16_sm90_k" +
+            std::to_string(keyHeads) + "_v" + std::to_string(valueHeads);
+        std::string cache = CudaTritonCacheDir();
+        std::string path = CudaTritonJoinPath(cache, base + ".json");
+        using Init = int (*)(int);
+        static std::mutex mutex;
+        static std::map<std::pair<std::string, int>, FlashInferGdnLaunch> launches;
+        FlashInferGdnLaunch launch = nullptr;
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            auto key = std::make_pair(path, FastllmCudaGetDevice());
+            auto it = launches.find(key);
+            if (it != launches.end()) {
+                launch = it->second;
+            } else {
+                // Cache failures as well, avoiding a compile attempt per layer.
+                launches[key] = nullptr;
+                json11::Json meta;
+                std::string error, body;
+                std::ifstream file(path);
+                if (file.good()) {
+                    body.assign(std::istreambuf_iterator<char>(file), {});
+                    meta = json11::Json::parse(body, error);
+                }
+                if (!meta["ok"].bool_value()) {
+                    int status = 0;
+                    json11::Json request = json11::Json::object {
+                        {"op", "flashinfer_gdn"}, {"cache_dir", cache},
+                        {"arch", 90}, {"dtype", "fp16"},
+                        {"key_heads", keyHeads}, {"value_heads", valueHeads}};
+                    if (!CudaTritonEnsureServer() ||
+                        !CudaTritonHttpRequest("POST", "/compile", request.dump(),
+                                              &status, body)) return false;
+                    error.clear();
+                    meta = json11::Json::parse(body, error);
+                    if (status != 200 || !error.empty() || !meta["ok"].bool_value()) {
+                        printf("Fastllm FlashInfer GDN: compile failed, using CUDA/Triton. %s\n",
+                               meta["error"].string_value().c_str());
+                        return false;
+                    }
+                }
+                std::string library = meta["library"].string_value();
+                if (!error.empty() || meta["op"].string_value() != "flashinfer_gdn" ||
+                    meta["abi"].int_value() != 1 || meta["arch"].int_value() != 90 ||
+                    meta["dtype"].string_value() != "fp16" ||
+                    meta["key_heads"].int_value() != keyHeads ||
+                    meta["value_heads"].int_value() != valueHeads ||
+                    library.empty() || !CudaTritonFileExists(library)) return false;
+                // CuTe's exported host code builds TMA descriptors and loads
+                // its embedded cubin through the CUDA library API.
+                void *handle = dlopen(library.c_str(), RTLD_NOW | RTLD_LOCAL);
+                auto init = handle ? (Init)dlsym(handle, "fastllm_flashinfer_gdn_init") : nullptr;
+                launch = handle ? (FlashInferGdnLaunch)dlsym(
+                    handle, "fastllm_flashinfer_gdn_launch") : nullptr;
+                if (!init || !launch || init(key.second) != 0) {
+                    printf("Fastllm FlashInfer GDN: cannot load C export, using CUDA/Triton.\n");
+                    if (handle) dlclose(handle);
+                    return false;
+                }
+                // Keep the export/runtime loaded for the lifetime of queued work.
+                launches[key] = launch;
+                printf("Fastllm FlashInfer GDN: SM90 CuTe CP prefill enabled.\n");
+            }
+        }
+        return launch && FastllmCudaFlashInferGdnPrefill(
+            launch, qkv, normWeight, g, beta, tokens,
+            keyHeads, valueHeads, eps, state, output);
+    }
+
     bool FastllmCudaTryCombinedBaSigmoidMambaSoftplus(
         const Data &input, const Data &aLog, const Data &dtBias,
         int batch, int seqLen, int inputChannels,
@@ -4256,6 +4363,12 @@ namespace fastllm {
             batch, topk, hidden, inter, experts);
     }
 #else
+    bool FastllmCudaTryFlashInferGdnPrefill(
+        const Data &, const Data &, const Data &, const Data &,
+        int, int, int, float, Data &, Data &) {
+        return false;
+    }
+
     bool FastllmCudaTryTritonDeepSeekV4WoA(
         const Data &, Data &, int, int, Data &) {
         return false;

@@ -4522,6 +4522,9 @@ def compile_merge_moe_fp8(payload):
 def handle_compile(payload):
     op = payload.get("op")
     with _compile_lock:
+        if op == "flashinfer_gdn":
+            from fastllm_flashinfer_gdn import compile_gdn
+            return compile_gdn(payload)
         if op == "linear":
             return compile_linear(payload)
         if op == "chunk_gdn_prefill":

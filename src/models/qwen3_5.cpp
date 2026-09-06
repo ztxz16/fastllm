@@ -13486,6 +13486,20 @@ namespace fastllm {
                     if (batch == 1 && chunkPastValue->dims.size() > 0) {
                         Qwen35EnsureCudaLinearAttnStateKVLayout(*chunkPastValue);
                     }
+#ifdef USE_CUDA
+                    if (uniformPrefill && batch == 1 &&
+                        head_k_dim == 128 && head_v_dim == 128 &&
+                        FastllmCudaTryFlashInferGdnPrefill(
+                            *convOutputForRecurrent,
+                            *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
+                            g, b, uniformPrefillSeqLen,
+                            localKeyHeads, localValueHeads, rms_norm_eps,
+                            *chunkPastValue, coreAttnOut)) {
+                        // FlashInfer writes token-major output and preserves
+                        // the existing FP16 [K,V] recurrent-cache contract.
+                        return;
+                    }
+#endif
                     int keyBatchSize = 0;
                     int keySequenceLength = 0;
                     int keyKHeadDim = 0;
