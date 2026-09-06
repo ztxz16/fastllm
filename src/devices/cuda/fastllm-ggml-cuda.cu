@@ -94,7 +94,11 @@ void quantize_row_q8_1_cuda(
 }
 
 static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, int c) {
-#if defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)
+#if defined(USE_ROCM) && defined(__HIP_DEVICE_COMPILE__) && (defined(__GFX11__) || defined(__GFX12__))
+    return __builtin_amdgcn_sudot4(true, a, true, b, c, false);
+#elif defined(USE_ROCM) && defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || defined(__gfx1033__) || defined(__gfx1034__) || defined(__gfx1035__) || defined(__gfx1036__))
+    return __builtin_amdgcn_sdot4(a, b, c, false);
+#elif defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)
 #if defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || defined(RDNA2)
     c = __builtin_amdgcn_sdot4(a, b, c, false);
 #elif defined(RDNA3)
@@ -336,7 +340,30 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
 #define VDR_IQ4_NL_Q8_1_MMQ  4
 
 static __device__ __forceinline__ int2 get_int_from_table_16(const int & q4, const int8_t * values) {
-#if defined(__CUDA_ARCH__)
+#if defined(USE_ROCM) && defined(__HIP_DEVICE_COMPILE__)
+    // HIP lookup from llama.cpp; see fastllm-rocm-gguf.cuh for attribution.
+    // Load the 16-byte table into four 32-bit unsigned integers.
+    const uint32_t *table32 = (const uint32_t *)values;
+
+    const uint32_t q_even = q4;
+    const uint32_t q_odd  = (q4 >> 4);
+
+    // Perform lookups in the lower half of the table (indices 0-7).
+    uint32_t v_even_low = __builtin_amdgcn_perm(table32[1], table32[0], q_even & 0x07070707);
+    uint32_t v_odd_low = __builtin_amdgcn_perm(table32[1], table32[0], q_odd & 0x07070707);
+
+    // Perform lookups in the upper half of the table (indices 8-15).
+    uint32_t v_even_high = __builtin_amdgcn_perm(table32[3], table32[2], q_even & 0x07070707);
+    uint32_t v_odd_high = __builtin_amdgcn_perm(table32[3], table32[2], q_odd & 0x07070707);
+
+    // Select between the low and high results based on the MSB of each index nibble.
+    uint32_t mask_even = 0x03020100 | ((q_even & 0x08080808) >> 1);
+    uint32_t res_x = __builtin_amdgcn_perm(v_even_high, v_even_low, mask_even);
+    uint32_t mask_odd = 0x03020100 | ((q_odd & 0x08080808) >> 1);
+    uint32_t res_y = __builtin_amdgcn_perm(v_odd_high, v_odd_low, mask_odd);
+
+    return make_int2(res_x, res_y);
+#elif defined(__CUDA_ARCH__)
     uint32_t v1, v2, v3, v4, mask;
     const uint32_t * values32 = (const uint32_t *)values;
 
@@ -786,8 +813,16 @@ static __device__ __forceinline__ float vec_dot_q8_0_q8_1(
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
+#ifdef USE_ROCM
+#include "devices/rocm/fastllm-rocm-gguf.cuh"
+#endif
+
 bool get_has_vec_dot_q_cuda(ggml_type type) {
-    switch (type) {        
+    switch (type) {
+#ifdef USE_ROCM
+        case GGML_TYPE_IQ2_XS: return true;
+        case GGML_TYPE_IQ2_S: return true;
+#endif
         case GGML_TYPE_Q2_K   : return true;
         case GGML_TYPE_Q3_K   : return true;
         case GGML_TYPE_IQ3_XXS: return true;
@@ -805,7 +840,11 @@ bool get_has_vec_dot_q_cuda(ggml_type type) {
 }
 
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
-    switch (type) {        
+    switch (type) {
+#ifdef USE_ROCM
+        case GGML_TYPE_IQ2_XS: return vec_dot_iq2_xs_q8_1;
+        case GGML_TYPE_IQ2_S: return vec_dot_iq2_s_q8_1;
+#endif
         case GGML_TYPE_Q2_K   : return vec_dot_q2_K_q8_1;
         case GGML_TYPE_Q3_K   : return vec_dot_q3_K_q8_1;
         case GGML_TYPE_IQ3_XXS: return vec_dot_iq3_xxs_q8_1;
@@ -827,6 +866,10 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
 
 static constexpr __device__ int get_vdr_mmvq(ggml_type type) {
     switch (type) {
+#ifdef USE_ROCM
+        case GGML_TYPE_IQ2_XS: return VDR_IQ2_XS_Q8_1_MMVQ;
+        case GGML_TYPE_IQ2_S: return VDR_IQ2_S_Q8_1_MMVQ;
+#endif
         case GGML_TYPE_Q2_K    : return VDR_Q2_K_Q8_1_MMVQ;
         case GGML_TYPE_Q3_K    : return VDR_Q3_K_Q8_1_MMVQ;
         case GGML_TYPE_IQ3_XXS : return VDR_IQ3_XXS_Q8_1_MMVQ;
@@ -930,6 +973,23 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q8_0> {
     static constexpr int qi = QI8_0;
 };
 
+#ifdef USE_ROCM
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_IQ2_XS> {
+    static constexpr int qk = QK_K;
+    static constexpr int qr = QR2_XS;
+    static constexpr int qi = QI2_XS;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_IQ2_S> {
+    static constexpr int qk = QK_K;
+    static constexpr int qr = QR2_S;
+    static constexpr int qi = QI2_S;
+};
+
+#endif
+
 template <ggml_type type, int ncols_y, int nwarps, typename OType>
 static __device__ void mul_mat_vec_q(
     const void * __restrict__ vx, const void * __restrict__ vy, OType * __restrict__ dst,
@@ -943,7 +1003,7 @@ static __device__ void mul_mat_vec_q(
     //int64_t rows_per_cuda_block = ggml_cuda_info().devices[id].cc < CC_RDNA2 ?
     //    ncols_y < 4 ? 1 : 2 : 1;
 
-#if defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__) && (defined(RDNA2) || defined(RDNA3))
+#if defined(USE_ROCM) || defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__) && (defined(RDNA2) || defined(RDNA3))
     constexpr int rows_per_cuda_block = 1;
 #else
     // Match ggml's NVIDIA MMVQ packing: multi-row inputs have enough reuse to
@@ -1054,7 +1114,11 @@ static void mul_mat_vec_q_cuda_T(
     assert(ncols_x % ggml_blck_size(type) == 0);
     assert(ncols_y <= MMVQ_MAX_BATCH_SIZE);    
 
+#ifdef USE_ROCM
+    const int64_t rows_per_cuda_block = 1;
+#else
     const int64_t rows_per_cuda_block = ncols_y < 4 ? 1 : 2;
+#endif
     const int64_t nblocks = (nrows_x + rows_per_cuda_block - 1) / rows_per_cuda_block;
     const dim3 block_nums(nblocks, ne2, 1);
     const dim3 block_dims(WARP_SIZE, nwarps, 1);
@@ -1097,6 +1161,12 @@ static void mul_mat_vec_q_cuda(
     const int ncols_x, const int nrows_x, const int nrows_y, const int ncols_y, const int nrows_dst,
     const int ne2, const uint64_t nb02, const uint64_t nb12, const uint64_t nb2, const int64_t ids_nb0,
     cudaStream_t stream) {
+#ifdef USE_ROCM
+    // Match llama.cpp's RDNA MMVQ: one logical warp per output row.
+    mul_mat_vec_q_cuda_T<type, 1, OType>(
+        vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, ncols_y,
+        nrows_dst, ne2, nb02, nb12, nb2, ids_nb0, stream);
+#else
     // Up to four input rows benefit from four-way K reduction. B5-B8 has
     // twice the live accumulator state after packing two output rows per
     // block, so a single warp preserves occupancy. Batched expert slices
@@ -1110,6 +1180,7 @@ static void mul_mat_vec_q_cuda(
             vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, ncols_y,
             nrows_dst, ne2, nb02, nb12, nb2, ids_nb0, stream);
     }
+#endif
 }
 
 struct ggml_backend_cuda_context {
@@ -1133,6 +1204,14 @@ static void ggml_cuda_op_mul_mat_vec_q_impl(ggml_backend_cuda_context & ctx, ggm
     const int64_t nrows_dst = true ? ne0 : row_diff;
 
     switch (type) {
+#ifdef USE_ROCM
+        case GGML_TYPE_IQ2_XS:
+            mul_mat_vec_q_cuda<GGML_TYPE_IQ2_XS, OType>(src0_dd_i, src1_ddq_i, dst_dd_i, ids_data, ne00, row_diff, src1_padded_row_size, src1_ncols, nrows_dst, ne2, nb02, nb12, nb2, ids_nb0, stream);
+            break;
+        case GGML_TYPE_IQ2_S:
+            mul_mat_vec_q_cuda<GGML_TYPE_IQ2_S, OType>(src0_dd_i, src1_ddq_i, dst_dd_i, ids_data, ne00, row_diff, src1_padded_row_size, src1_ncols, nrows_dst, ne2, nb02, nb12, nb2, ids_nb0, stream);
+            break;
+#endif
         case GGML_TYPE_Q2_K:
             mul_mat_vec_q_cuda<GGML_TYPE_Q2_K, OType>(src0_dd_i, src1_ddq_i, dst_dd_i, ids_data, ne00, row_diff, src1_padded_row_size, src1_ncols, nrows_dst, ne2, nb02, nb12, nb2, ids_nb0, stream);
             break;

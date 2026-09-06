@@ -3880,8 +3880,13 @@ namespace fastllm {
             (ggufFileType == 10 || // Q2_K
              (ggufFileType >= 11 && ggufFileType <= 13) || // Q3_K S/M/L
              ggufFileType == 23 || // IQ3_XXS
-             ggufFileType == 26 || // IQ3_S
-             ggufFileType == 30);  // IQ4_XS
+             ggufFileType == 26 // IQ3_S
+#ifndef USE_ROCM
+             || ggufFileType == 30 // IQ4_XS
+#endif
+             );
+        // ROCm uses validated generic MMVQ for mixed IQ4_XS decode and MMQ
+        // for supported prefill shapes, with the shared dequant GEMM fallback.
         if (forceSafeGgufDequant) {
             printf("[Fastllm] Qwen3.5 GGUF file type %d: use safe CUDA dequant path.\n",
                    ggufFileType);
