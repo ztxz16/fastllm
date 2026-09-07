@@ -1529,11 +1529,32 @@ class FastLLmCompletion:
               "Tool calling requires a Hugging Face tokenizer with chat_template. "
               "Please use an HF model directory or provide the original tokenizer files."
           )
+      return self._resolve_tool_parser_class()(tokenizer)
+
+  def _resolve_tool_parser_class(self):
+      tokenizer = getattr(self.model, "hf_tokenizer", None)
       from .tool_parsers import ToolParserManager
       return ToolParserManager.get_tool_parser_auto(
-          model_type, chat_template,
+          self.model.get_type(), getattr(tokenizer, "chat_template", None),
           force_chat_template = self.model.force_chat_template,
-          force_type = force_type)(tokenizer)
+          force_type = getattr(self.model, "tool_call_parser", "auto"))
+
+  def _apply_qwen4_tool_choice(
+      self, messages, tools, tool_choice, parallel_tool_calls=None,
+  ):
+      if self.model.get_type() != "qwen4_exp" or not tools:
+          return messages, tools
+      if tool_choice != "required" and not isinstance(tool_choice, dict):
+          return messages, tools
+
+      from .tool_parsers.qwen3coder_tool_parser import Qwen3CoderToolParser
+      if not issubclass(
+              self._resolve_tool_parser_class(), Qwen3CoderToolParser):
+          return messages, tools
+
+      from .qwen_tool_guidance import apply_qwen_tool_choice_guidance
+      return apply_qwen_tool_choice_guidance(
+          messages, tools, tool_choice, parallel_tool_calls)
 
   def _create_function_call_parser(self, request: ChatCompletionRequest):
       from .toolcall_parser import FunctionCallParser
@@ -3010,6 +3031,8 @@ class FastLLmCompletion:
       try:
           messages, tools = self._apply_dots_tool_choice(
               messages, tools, tool_choice)
+          messages, tools = self._apply_qwen4_tool_choice(
+              messages, tools, tool_choice, request.parallel_tool_calls)
       except ValueError as error:
           self._cleanup_temp_paths(media.temp_paths)
           return self.create_error_response(str(error))
