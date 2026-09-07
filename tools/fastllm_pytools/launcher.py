@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .modelscope_download import PROGRESS_PREFIX as MODELSCOPE_PROGRESS_PREFIX
+from .agent_runtime_install import AgentRuntimeInstaller
 from .launcher_mtp import detect_mtp_support
 from .startup_progress import PROGRESS_PREFIX
 from .tui import (
@@ -443,6 +444,16 @@ class LauncherRuntime:
         self._next_log_id = 1
         self._last_progress_stage = ""
         self._shutdown_callback = None
+        self._agent_installer = AgentRuntimeInstaller(self._enable_installed_agent)
+
+    def _enable_installed_agent(self):
+        with self._lock:
+            if self._webui_app is not None:
+                webui = self._webui_app.state.runtime
+                with webui._pi_agent_lock:
+                    webui.pi_agent = None
+                    webui.pi_agent_error = ""
+                    webui._configure_pi_agent()
 
     def set_shutdown_callback(self, callback):
         self._shutdown_callback = callback
@@ -1179,6 +1190,7 @@ class LauncherRuntime:
             timer.start()
 
     def close(self):
+        self._agent_installer.close()
         self.stop_download()
         self.stop()
 
@@ -2014,6 +2026,17 @@ def create_launcher_app(
             "configPath": runtime.config_path,
             "launcherAddresses": advertised_addresses,
         }
+
+    @app.get("/api/agent-runtime")
+    async def agent_runtime_state():
+        return runtime._agent_installer.state()
+
+    @app.post("/api/agent-runtime/install")
+    async def install_agent_runtime():
+        try:
+            return runtime._agent_installer.start()
+        except RuntimeError as error:
+            raise LauncherError(str(error)) from error
 
     @app.post("/api/preview")
     async def preview(request: Request):

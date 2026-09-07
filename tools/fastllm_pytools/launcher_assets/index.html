@@ -466,6 +466,16 @@
           </section>
 
           <section id="view-webui" class="view">
+            <section id="agent-runtime-card" class="agent-runtime-card hidden" aria-label="Pi 智能体运行时">
+              <svg class="icon" aria-hidden="true"><use href="#icon-spark"/></svg>
+              <div class="agent-runtime-copy">
+                <strong id="agent-runtime-title">Pi 智能体</strong>
+                <p id="agent-runtime-message" role="status" aria-live="polite"></p>
+                <progress id="agent-runtime-progress" class="hidden" max="100" aria-label="运行时安装进度"></progress>
+                <p id="agent-runtime-error" class="agent-runtime-error hidden"></p>
+              </div>
+              <button id="install-agent-runtime" class="primary-button" type="button">安装 Agent 依赖</button>
+            </section>
             <div id="webui-placeholder" class="webui-placeholder">
               <svg class="icon" aria-hidden="true"><use href="#icon-chat"/></svg>
               <h1>工作室</h1>

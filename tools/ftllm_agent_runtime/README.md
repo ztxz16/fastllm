@@ -94,6 +94,14 @@ ftllm webui /path/to/model
 For a local build, pass the audited wheel's path to `pip install` instead.
 Restart an already-running FastLLM process after installing the package.
 
+FastLLM builds that include **Launcher → Studio → Install Agent dependencies**
+install this wheel with the Launcher's Python and pip. The installer uses pip's
+configured index/mirror and cache, and installs into the current user's
+`${XDG_DATA_HOME:-~/.local/share}/ftllm/agent-runtime/` directory with `--target`.
+It verifies Pi and both search tools before activating the installation, then
+enables the current Studio without restarting the model. Failed installations
+leave any previous managed runtime intact and can be retried from the UI.
+
 The companion wheel includes `rg` and `fd` beside Pi. The bridge prepends this
 directory to the child process's `PATH`, so directory searches work even when
 neither command is installed system-wide. Pi runs in offline mode and does not

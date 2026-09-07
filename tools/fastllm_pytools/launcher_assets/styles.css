@@ -759,7 +759,14 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 
 /* Chat shares Launcher's navigation and occupies the current content pane. */
 .webui-active .page-scroll { display: flex; overflow: hidden; padding: 0; scrollbar-gutter: auto; }
-#view-webui.active { display: flex; flex: 1; min-height: 0; width: 100%; max-width: none; animation: none; }
+#view-webui.active { display: flex; flex-direction: column; flex: 1; min-height: 0; width: 100%; max-width: none; animation: none; }
+.agent-runtime-card { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; padding: 16px 22px; border-bottom: 1px solid var(--line); background: white; }
+.agent-runtime-card > .icon { flex: none; width: 24px; height: 24px; color: var(--primary); }
+.agent-runtime-copy { flex: 1; min-width: 180px; }
+.agent-runtime-copy strong { font-size: 14px; }
+.agent-runtime-copy p { margin: 5px 0 0; color: var(--muted); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.agent-runtime-copy progress { width: 100%; max-width: 420px; height: 6px; margin-top: 8px; accent-color: var(--primary); }
+.agent-runtime-copy .agent-runtime-error { color: #b42318; }
 .webui-content { flex: 1; min-width: 0; min-height: 0; background: white; }
 .webui-content > div { height: 100%; }
 .webui-placeholder { display: flex; flex: 1; align-items: center; justify-content: center; flex-direction: column; gap: 16px; padding: 24px; text-align: center; }

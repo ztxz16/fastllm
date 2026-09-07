@@ -93,9 +93,18 @@ Once the API Server is ready, click **Open Studio** to use chat, saved conversat
 The WebUI does not load a model in its own process, so start an OpenAI-compatible API server first. Its optional `model` positional argument is only a model-name hint; when omitted, the WebUI discovers the model from `/v1/models`.
 
 Code analysis and web search use the Pi agent runtime by default. On Linux
-x86-64, build and install the companion wheel as described in
-[`tools/ftllm_agent_runtime/`](tools/ftllm_agent_runtime/). The wheel bundles
-Pi, so Node.js, npm, and Bun are not required. Use `--agent-runtime builtin`
+x86-64, open `ftllm launch` → **Studio** → **Install Agent dependencies** to install
+`ftllm-agent-runtime==0.3.3` with pip. The wheel includes Pi and the `rg`/`fd`
+search tools and downloads about 43 MB, using pip's configured mirror, proxy, and cache.
+Installation needs no administrator privileges, Node.js, npm, or Bun.
+Packages are stored in `${XDG_DATA_HOME:-~/.local/share}/ftllm/agent-runtime/`
+without modifying system Python packages. The UI shows installation status and errors with a retry button.
+The current Studio enables Pi when installation completes; later launches discover it automatically.
+Portable bundles with a complete runtime need no additional installation. You can also run
+`python -m pip install ftllm-agent-runtime==0.3.3` in FastLLM's Python environment
+and restart FastLLM, or build
+the companion wheel as described in [`tools/ftllm_agent_runtime/`](tools/ftllm_agent_runtime/).
+Use `--agent-runtime builtin`
 to select the original single-call paths when the companion wheel is absent.
 
 Launcher automatically uses an installed Pi runtime. **New Agent** lets you select a project directory; use `ftllm launch --agent-workspace-root /path/to/projects` to set the selectable root (your home directory by default). Directory agents are enabled by default on both local and remote Launcher listeners, for example `ftllm launch --host 0.0.0.0 --agent-workspace-root /path/to/projects`. Use `--disable-workspace-agent` to disable directory browsing, creating directory agents, and executing saved directory-agent tasks; ordinary chat remains available. Directory agents can modify files and execute commands, so restrict access to trusted users. The interface explains when the runtime is unavailable or directory agents have been disabled.

@@ -92,9 +92,15 @@ API Server 就绪后，点击「打开工作室」即可在 Launcher 内容区�
 
 WebUI 不会在自身进程内加载模型，请先启动 OpenAI 兼容 API Server。WebUI 的可选 `model` 位置参数只用于推导 API 模型名；省略时会从 `/v1/models` 自动发现。
 
-代码分析和联网搜索默认使用 Pi 智能体运行时。Linux x86-64 用户可按
-[`tools/ftllm_agent_runtime/`](tools/ftllm_agent_runtime/) 中的说明构建并安装配套 wheel；
-该 wheel 已包含 Pi，不需要 Node.js、npm 或 Bun。尚未安装时可通过
+代码分析和联网搜索默认使用 Pi 智能体运行时。Linux x86-64 用户可打开
+`ftllm launch` →「工作室」→「安装 Agent 依赖」，通过 pip 安装
+`ftllm-agent-runtime==0.3.3`，其中已包含 Pi 及 `rg`、`fd` 搜索工具。
+安装需要联网下载约 43 MB，沿用当前 pip 的镜像、代理和缓存配置；不需要管理员权限、Node.js、npm 或 Bun。
+安装包保存在 `${XDG_DATA_HOME:-~/.local/share}/ftllm/agent-runtime/`，不修改系统 Python 包。
+安装期间显示状态，失败后可查看错误并重试；完成后当前工作室即可使用，后续启动也会自动识别。
+已有完整运行时的绿色包无需重复安装。也可在 ftllm 所在的 Python 环境中执行
+`python -m pip install ftllm-agent-runtime==0.3.3` 后重启 ftllm，或按
+[`tools/ftllm_agent_runtime/`](tools/ftllm_agent_runtime/) 中的说明构建配套 wheel。尚未安装时可通过
 `--agent-runtime builtin` 使用原有单轮链路。
 
 Launcher 会自动使用已安装的 Pi 运行时；「新建 Agent」可选择工作目录。通过 `ftllm launch --agent-workspace-root /path/to/projects` 指定可选目录的根路径，默认为用户主目录。Launcher 的目录 Agent 默认启用，本机和远程监听均可使用，例如 `ftllm launch --host 0.0.0.0 --agent-workspace-root /path/to/projects`。使用 `--disable-workspace-agent` 可关闭目录 Agent，同时禁止目录浏览、新建目录 Agent 及继续执行已保存的目录 Agent 任务；普通对话仍可使用。目录 Agent 可修改文件和执行命令，请仅对可信用户开放。运行时缺失或目录 Agent 被关闭时，界面会显示原因。

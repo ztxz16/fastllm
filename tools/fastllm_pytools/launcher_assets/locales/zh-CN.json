@@ -2,6 +2,10 @@
   "locale": "zh-CN",
   "name": "简体中文",
   "static": {
+    "Pi 智能体运行时": "Pi 智能体运行时",
+    "Pi 智能体": "Pi 智能体",
+    "运行时安装进度": "运行时安装进度",
+    "安装 Agent 依赖": "安装 Agent 依赖",
     "文件夹路径": "文件夹路径",
     "输入文件夹或文件路径": "输入文件夹或文件路径",
     "前往": "前往",
@@ -225,6 +229,17 @@
     "打开工作室": "打开工作室"
   },
   "messages": {
+    "Pi Agent": "Pi 智能体",
+    "Install Agent dependencies": "安装 Agent 依赖",
+    "Installing…": "正在安装…",
+    "Retry installation": "重新安装",
+    "Install Agent dependencies with pip (about 43 MB). Uses your configured package mirror.": "使用 pip 安装 Agent 依赖，约 43 MB，沿用已配置的 pip 镜像。",
+    "Checking Pi runtime…": "正在检查 Pi 运行时…",
+    "Pi installation requires Linux x86-64, Python 3.9+ and glibc 2.17+.": "Pi 安装需要 Linux x86-64、Python 3.9 及以上、glibc 2.17 及以上。",
+    "Installation failed. See the error below and retry.": "安装失败，请查看以下错误后重试。",
+    "Verifying Pi runtime…": "正在验证 Pi 运行时…",
+    "Installing Agent dependencies with pip…": "正在通过 pip 安装 Agent 依赖…",
+    "Pi runtime is ready. You can create an Agent now.": "Pi 运行时已就绪，可以新建 Agent 了。",
     "Select a drive": "选择磁盘",
     "Folder root is unavailable.": "无法访问此路径的根目录，请确认磁盘或网络共享可用。",
     "Available context per session (input + output): {tokens} tokens. 1K = 1024 tokens.": "单会话可用上下文上限（输入与输出合计）：{tokens} tokens。1K = 1024 tokens。",

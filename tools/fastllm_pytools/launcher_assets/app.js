@@ -54,6 +54,10 @@ const state = {
   editingConfig: null,
   automaticConfigDialogPreviousStatus: null,
   runtime: null,
+  agentRuntime: null,
+  agentRuntimePolling: false,
+  agentRuntimeRequest: false,
+  agentConfigRefreshNeeded: false,
   inferenceSpeedSession: null,
   inferenceSpeedSamples: {},
   download: null,
@@ -140,7 +144,8 @@ function cacheElements() {
     "open-endpoint", "stop-runtime", "profile-count", "profile-list", "new-profile",
     "current-view-title", "profile-search", "profile-results",
     "open-webui", "webui-placeholder", "webui-status",
-    "webui-content", "webui-retry",
+    "webui-content", "webui-retry", "agent-runtime-card", "agent-runtime-title",
+    "agent-runtime-message", "agent-runtime-progress", "agent-runtime-error", "install-agent-runtime",
     "config-path", "profile-editor-modal", "profile-editor-title", "launch-form",
     "close-profile-editor", "save-state", "ori-field", "auto-configure-profile",
     "clear-profile-config", "automatic-config-status",
@@ -223,6 +228,8 @@ async function initialize() {
     window.setInterval(renderInferenceSpeed, 250);
     window.setInterval(refreshDownload, 700);
     window.setInterval(refreshLogs, 700);
+    refreshAgentRuntime();
+    window.setInterval(refreshAgentRuntime, 1000);
   } catch (error) {
     showToast(t("Launcher initialization failed: {error}", { error: friendlyError(error) }), "error", 10000);
     elements.statusTitle.textContent = t("Launcher connection failed");
@@ -386,6 +393,7 @@ function renderLocalizedContent() {
   renderProfileEditorTitle();
   renderSaveState();
   renderRuntime();
+  renderAgentRuntime();
   renderLauncherAddresses();
   renderDownloadCatalog();
   renderDownload();
@@ -438,6 +446,7 @@ function renderLauncherAddresses() {
 }
 
 function bindEvents() {
+  elements.installAgentRuntime.addEventListener("click", installAgentRuntime);
   document.addEventListener("click", handleDelegatedClick);
   elements.webuiRetry.addEventListener("click", () => {
     state.webuiError = "";
@@ -2502,6 +2511,65 @@ function webuiIsReady() {
     && state.runtime?.ready && Boolean(state.runtime?.sessionId);
 }
 
+function renderAgentRuntime() {
+  const runtime = state.agentRuntime || {phase: "checking"};
+  const phase = runtime.phase;
+  const busy = state.agentRuntimeRequest || ["checking", "unchecked", "installing"].includes(phase);
+  elements.agentRuntimeCard.classList.toggle("hidden", phase === "ready");
+  elements.installAgentRuntime.disabled = busy || runtime.supported === false;
+  elements.installAgentRuntime.textContent = t(phase === "installing" ? "Installing…"
+    : phase === "failed" ? "Retry installation" : "Install Agent dependencies");
+  elements.agentRuntimeTitle.textContent = t("Pi Agent");
+  let message = "Install Agent dependencies with pip (about 43 MB). Uses your configured package mirror.";
+  if (phase === "checking" || phase === "unchecked") message = "Checking Pi runtime…";
+  if (phase === "unsupported") message = "Pi installation requires Linux x86-64, Python 3.9+ and glibc 2.17+.";
+  if (phase === "failed") message = "Installation failed. See the error below and retry.";
+  if (phase === "installing") message = runtime.component === "verify"
+    ? "Verifying Pi runtime…" : "Installing Agent dependencies with pip…";
+  elements.agentRuntimeMessage.textContent = t(message);
+  elements.agentRuntimeProgress.classList.toggle("hidden", phase !== "installing");
+  elements.agentRuntimeProgress.removeAttribute("value");
+  elements.agentRuntimeError.classList.toggle("hidden", phase !== "failed");
+  elements.agentRuntimeError.textContent = phase === "failed" ? runtime.error || "" : "";
+  state.webuiComponent?.setRuntimeInstallState(runtime);
+}
+
+async function refreshAgentRuntime() {
+  if (state.agentRuntimePolling || state.agentRuntimeRequest) return;
+  state.agentRuntimePolling = true;
+  try {
+    const previous = state.agentRuntime?.phase;
+    const result = await request("/api/agent-runtime");
+    if (state.agentRuntimeRequest) return;
+    state.agentRuntime = result;
+    renderAgentRuntime();
+    if (previous && previous !== "ready" && state.agentRuntime.phase === "ready") {
+      state.agentConfigRefreshNeeded = true;
+      if (previous === "installing") showToast(t("Pi runtime is ready. You can create an Agent now."));
+    }
+    if (state.agentConfigRefreshNeeded) {
+      await state.webuiComponent?.refreshConfig();
+      state.agentConfigRefreshNeeded = false;
+    }
+  } catch (_error) {
+    // A temporary disconnect must not start another installation or erase progress.
+  } finally { state.agentRuntimePolling = false; }
+}
+
+async function installAgentRuntime() {
+  if (state.agentRuntimeRequest || state.agentRuntime?.phase === "installing" || state.agentRuntime?.supported === false) return;
+  state.agentRuntimeRequest = true;
+  state.agentRuntime = {...state.agentRuntime, phase: "installing", error: ""};
+  renderAgentRuntime();
+  try {
+    state.agentRuntime = await request("/api/agent-runtime/install", {method: "POST"});
+    if (state.agentRuntime.phase === "ready") state.agentConfigRefreshNeeded = true;
+  } catch (error) {
+    state.agentRuntime = {...state.agentRuntime, phase: "failed", error: friendlyError(error)};
+  } finally { state.agentRuntimeRequest = false; }
+  renderAgentRuntime();
+}
+
 function renderWebUIAvailability() {
   const ready = webuiIsReady();
   elements.openWebui.disabled = !ready;
@@ -2594,7 +2662,8 @@ async function openEmbeddedWebUI() {
     elements.webuiContent.replaceChildren(host);
     const component = await mountWebUI(host, {
       basePath: result.url, embedded: true, locale: state.locale,
-      iconUrl: "/assets/launcher-icon.png", signal: controller.signal
+      iconUrl: "/assets/launcher-icon.png", signal: controller.signal,
+      onInstallRuntime: installAgentRuntime
     });
     if (requestId !== state.webuiRequestId || sessionId !== state.runtime?.sessionId) {
       component.destroy();
@@ -2604,6 +2673,7 @@ async function openEmbeddedWebUI() {
     clearWebUILoad();
     state.webuiLoading = false;
     component.setLocale(state.locale);
+    renderAgentRuntime();
     renderWebUIAvailability();
   } catch (error) {
     failWebUILoad(requestId, error instanceof TypeError ? "Unable to load WebUI. Try reopening it."

@@ -2,6 +2,10 @@
   "locale": "en-US",
   "name": "English",
   "static": {
+    "Pi 智能体运行时": "Pi agent runtime",
+    "Pi 智能体": "Pi Agent",
+    "运行时安装进度": "Runtime installation progress",
+    "安装 Agent 依赖": "Install Agent dependencies",
     "文件夹路径": "Folder path",
     "输入文件夹或文件路径": "Enter a folder or file path",
     "前往": "Go",
@@ -225,6 +229,17 @@
     "打开工作室": "Open Studio"
   },
   "messages": {
+    "Pi Agent": "Pi Agent",
+    "Install Agent dependencies": "Install Agent dependencies",
+    "Installing…": "Installing…",
+    "Retry installation": "Retry installation",
+    "Install Agent dependencies with pip (about 43 MB). Uses your configured package mirror.": "Install Agent dependencies with pip (about 43 MB). Uses your configured package mirror.",
+    "Checking Pi runtime…": "Checking Pi runtime…",
+    "Pi installation requires Linux x86-64, Python 3.9+ and glibc 2.17+.": "Pi installation requires Linux x86-64, Python 3.9+ and glibc 2.17+.",
+    "Installation failed. See the error below and retry.": "Installation failed. See the error below and retry.",
+    "Verifying Pi runtime…": "Verifying Pi runtime…",
+    "Installing Agent dependencies with pip…": "Installing Agent dependencies with pip…",
+    "Pi runtime is ready. You can create an Agent now.": "Pi runtime is ready. You can create an Agent now.",
     "Select a drive": "Select a drive",
     "Folder root is unavailable.": "Folder root is unavailable.",
     "Available context per session (input + output): {tokens} tokens. 1K = 1024 tokens.": "Available context per session (input + output): {tokens} tokens. 1K = 1024 tokens.",

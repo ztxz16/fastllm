@@ -97,6 +97,67 @@ class LauncherWebUIBrowserTest(unittest.TestCase):
         expect(self.page.locator('#webui-content')).to_be_visible()
         expect(self.page.locator('#webui-retry')).to_be_hidden()
 
+    def test_pi_install_retry_enables_agent_and_preserves_draft(self):
+        job = {'phase': 'missing', 'supported': True, 'available': False, 'error': ''}
+        installed = False
+
+        def load_runtime():
+            if not installed:
+                raise ImportError('Pi runtime missing')
+            return lambda **kwargs: SimpleNamespace(info=lambda: {
+                'available': True, 'pi_version': '0.84.4', 'tools': ['read', 'find', 'grep']})
+
+        def start():
+            job.update(phase='installing', component='pip')
+            return dict(job)
+
+        with patch.object(self.runtime._agent_installer, 'state', side_effect=lambda: dict(job)), \
+                patch.object(self.runtime._agent_installer, 'start', side_effect=start) as install, \
+                patch('fastllm_pytools.agent_runtime_install.load_pi_agent_runtime', side_effect=load_runtime):
+            self.page.reload()
+            self.page.locator('[data-view-button="webui"]').click()
+            expect(self.page.locator('#webui-content #prompt')).to_be_visible()
+            expect(self.page.locator('#install-agent-runtime')).to_be_enabled()
+            expect(self.page.locator('#install-agent-runtime')).to_have_text('Install Agent dependencies')
+            expect(self.page.locator('#agent-runtime-message')).to_contain_text('pip')
+            expect(self.page.locator('#newAgent')).to_be_disabled()
+            expect(self.page.locator('#installRuntime')).to_be_visible()
+            self.screenshot('launcher-pi-install-en')
+            self.page.locator('#language-select').select_option('zh-CN')
+            expect(self.page.locator('#install-agent-runtime')).to_have_text('安装 Agent 依赖')
+            self.page.set_viewport_size({'width': 390, 'height': 844})
+            self.assertTrue(self.page.evaluate('document.documentElement.scrollWidth <= innerWidth'))
+            self.screenshot('launcher-pi-install-zh-mobile')
+            self.page.set_viewport_size({'width': 1280, 'height': 720})
+            self.page.locator('#language-select').select_option('en-US')
+            self.page.locator('#prompt').fill('Keep this draft while installing Pi')
+            self.page.locator('#installRuntime').click()
+            expect(self.page.locator('#install-agent-runtime')).to_be_disabled()
+            expect(self.page.locator('#agent-runtime-progress')).to_be_visible()
+            expect(self.page.locator('#agent-runtime-message')).to_have_text('Installing Agent dependencies with pip…')
+            self.assertIsNone(self.page.locator('#agent-runtime-progress').get_attribute('value'))
+            install.assert_called_once_with()
+
+            job.update(phase='failed', error='Temporary download failure')
+            self.page.clock.run_for(1100)
+            expect(self.page.locator('#agent-runtime-error')).to_have_text('Temporary download failure')
+            expect(self.page.locator('#install-agent-runtime')).to_have_text('Retry installation')
+            self.page.locator('#install-agent-runtime').click()
+            self.assertEqual(install.call_count, 2)
+
+            installed = True
+            self.runtime._enable_installed_agent()
+            job.update(phase='ready', available=True, error='')
+            self.page.route('**/webui/**/api/config', lambda route: route.abort())
+            self.page.clock.run_for(1100)
+            expect(self.page.locator('#newAgent')).to_be_disabled()
+            self.page.unroute('**/webui/**/api/config')
+            self.page.clock.run_for(1100)
+            expect(self.page.locator('#agent-runtime-card')).to_be_hidden()
+            expect(self.page.locator('#newAgent')).to_be_enabled()
+            expect(self.page.locator('#installRuntime')).to_be_hidden()
+            expect(self.page.locator('#prompt')).to_have_value('Keep this draft while installing Pi')
+
     def test_launch_item_can_be_added_saved_and_edited(self):
         editor = self.page.locator('#profile-editor-modal')
         for selector in ('#new-profile', '[data-new-profile]'):
@@ -832,7 +893,8 @@ class LauncherWebUIBrowserTest(unittest.TestCase):
         self.assert_loaded()
         pane = self.page.locator('#webui-content')
         expect(pane.locator('#newAgent')).to_be_disabled()
-        expect(pane.locator('#agentUnavailable')).to_contain_text('Install ftllm-agent-runtime')
+        expect(pane.locator('#agentUnavailable')).to_contain_text('Install it from Launcher Studio')
+        expect(pane.locator('#installRuntime')).to_have_text('Install Agent dependencies')
         expect(pane.locator('#agentUnavailable')).to_contain_text('--allow-remote-workspace-agent')
         self.page.locator('#language-select').select_option('zh-CN')
         expect(pane.locator('#agentUnavailable')).to_contain_text('目录 Agent 未对远程访问开放')

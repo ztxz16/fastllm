@@ -27,7 +27,7 @@ function abortable(promise, signal) {
   });
 }
 
-export async function mountWebUI(host, {basePath = "", embedded = false, locale = "", iconUrl = "", signal} = {}) {
+export async function mountWebUI(host, {basePath = "", embedded = false, locale = "", iconUrl = "", signal, onInstallRuntime} = {}) {
   const base = new URL(basePath || "/", location.origin);
   if (base.origin !== location.origin) throw new Error("WebUI must use the current origin.");
   basePath = base.pathname.replace(/\/$/, "");
@@ -38,6 +38,7 @@ export async function mountWebUI(host, {basePath = "", embedded = false, locale 
   const root = host.attachShadow({mode:"open"});
   host.toggleAttribute("data-embedded", embedded);
   let observer;
+  let runtimeInstallState = {};
   function destroy() {
     lifecycle.abort();
     signal?.removeEventListener("abort", abort);
@@ -443,6 +444,12 @@ export async function mountWebUI(host, {basePath = "", embedded = false, locale 
       $("#agentUnavailable").hidden = !reason;
       $("#agentUnavailable").textContent = reason;
       $("#agentUnavailable").title = state.config.pi_agent?.error || "";
+      $("#installRuntime").hidden = !onInstallRuntime || state.config.pi_agent?.available
+        || state.config.workspace_agent_disabled;
+      $("#installRuntime").disabled = runtimeInstallState.supported === false
+        || ["checking", "unchecked", "installing"].includes(runtimeInstallState.phase);
+      $("#installRuntime").textContent = t(runtimeInstallState.phase === "installing"
+        ? "workspace.installing_runtime" : "workspace.install_runtime");
     }
 
     async function openWorkspaceDialog() {
@@ -672,6 +679,13 @@ export async function mountWebUI(host, {basePath = "", embedded = false, locale 
       await loadConversation(target);
     }
 
+    async function refreshConfig() {
+      state.config = await (await api("/api/config")).json();
+      renderWorkspaceAvailability();
+    }
+
+    $("#installRuntime").onclick = guard(() => onInstallRuntime?.());
+
     $("#newChat").onclick = guard(newConversation); $("#newAgent").onclick = guard(openWorkspaceDialog); $("#attachButton").onclick = guard(() => $("#fileInput").click()); $("#fileInput").onchange = guard(event => uploadFiles([...event.target.files])); $("#agentButton").onclick = guard(() => { renderAgentSelection(); $("#agentDialog").showModal(); });
     $("#sendButton").onclick = guard(sendMessage); $("#stopButton").onclick = guard(stopActiveGeneration); $("#prompt").oninput = guard(resizePrompt); $("#prompt").onkeydown = guard(event => { if (event.key === "Enter" && !event.shiftKey && !event.isComposing) { event.preventDefault(); sendMessage(); } });
     for (const [button,menu] of [["#webButton","#webMenu"],["#thinkingButton","#thinkingMenu"]]) $(button).onclick = guard(event => { event.stopPropagation(); const target = $(menu); root.querySelectorAll(".mode-menu.open").forEach(item => item !== target && item.classList.remove("open")); target.classList.toggle("open"); });
@@ -693,7 +707,8 @@ export async function mountWebUI(host, {basePath = "", embedded = false, locale 
     observer = new ResizeObserver(() => { closeConversationMenu(); resizePrompt(); });
     observer.observe(host);
     signal?.removeEventListener("abort", abort);
-    return {destroy, setLocale: guard(setLocale)};
+    return {destroy, setLocale: guard(setLocale), refreshConfig: guard(refreshConfig),
+      setRuntimeInstallState: guard(value => { runtimeInstallState = value; renderWorkspaceAvailability(); })};
   } catch (error) {
     destroy();
     throw error;

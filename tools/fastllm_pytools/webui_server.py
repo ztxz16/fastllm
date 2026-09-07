@@ -587,13 +587,15 @@ class WebUIRuntime:
         if preference == "builtin":
             return
         try:
-            from ftllm_agent_runtime import PiAgentRuntime
+            from .agent_runtime_install import load_pi_agent_runtime
+            PiAgentRuntime = load_pi_agent_runtime()
         except (ImportError, OSError) as error:
             self.pi_agent_error = str(error)
             if preference == "pi":
                 raise RuntimeError(
-                    "已请求 Pi 代码智能体，但未安装可用的 "
-                    "ftllm-agent-runtime wheel") from error
+                    "已请求 Pi 代码智能体，但运行时尚不可用。请打开 "
+                    "ftllm launch → 工作室 → 安装 Agent 依赖，或安装配套 "
+                    "ftllm-agent-runtime wheel。") from error
             return
         self.pi_agent_class = PiAgentRuntime
         self.agent_runtime = "pi"
