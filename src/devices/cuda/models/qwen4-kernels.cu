@@ -1769,6 +1769,62 @@ namespace {
         }
     }
 
+    // Reuse each compressed key across four prefill queries. Transposed,
+    // padded shared tiles make global loads contiguous without changing the
+    // serial FP32 accumulation order within any head (including Top-K ties).
+    template <typename T>
+    __global__ void Qwen4QSAScorePrefillKernel(
+            const T *query, const float *compressedKeys, float *scores,
+            int rows, int blocks, int queryStart, int compressRatio) {
+        constexpr int tileRows = 4, tileKeys = 64, heads = 4, dim = 128;
+        __shared__ float keys[dim][tileKeys + 1];
+        __shared__ float queries[dim][tileRows * heads + 1];
+        const int firstRow = blockIdx.y * tileRows;
+        const int firstKey = blockIdx.x * tileKeys;
+        if (queryStart >= 0 && firstKey >=
+            (queryStart + min(rows, firstRow + tileRows)) / compressRatio) {
+            return;
+        }
+        for (int i = threadIdx.x; i < tileKeys * dim; i += blockDim.x) {
+            const int key = i / dim, column = i % dim;
+            keys[column][key] = firstKey + key < blocks
+                ? compressedKeys[(uint64_t)(firstKey + key) * dim + column] : 0.0f;
+        }
+        for (int i = threadIdx.x; i < tileRows * heads * dim; i += blockDim.x) {
+            const int head = i / dim, column = i % dim;
+            queries[column][head] = firstRow + head / heads < rows
+                ? Qwen4CudaToFloat(query[((uint64_t)firstRow * heads + head) * dim + column])
+                : 0.0f;
+        }
+        __syncthreads();
+        const int head = threadIdx.x % heads;
+        const int key = threadIdx.x / heads;
+        float dot[tileRows] = {};
+#pragma unroll
+        for (int column = 0; column < dim; ++column) {
+            const float k = keys[column][key];
+#pragma unroll
+            for (int row = 0; row < tileRows; ++row) {
+                dot[row] += queries[column][row * heads + head] * k;
+            }
+        }
+#pragma unroll
+        for (int row = 0; row < tileRows; ++row) {
+            float score = 0.0f;
+#pragma unroll
+            for (int h = 0; h < heads; ++h) {
+                score += fmaxf(__shfl_sync(0xffffffffu, dot[row], h, heads), 0.0f);
+            }
+            const int rowBlocks = queryStart < 0 ? blocks
+                : (queryStart + firstRow + row + 1) / compressRatio;
+            if (head == 0 && firstRow + row < rows &&
+                firstKey + key < blocks && firstKey + key < rowBlocks) {
+                scores[(uint64_t)(firstRow + row) * blocks + firstKey + key] =
+                    score * (1.0f / sqrtf((float)dim));
+            }
+        }
+    }
+
     __device__ __forceinline__ uint32_t Qwen4QSAOrderedFloatBits(
             float value) {
         uint32_t bits = __float_as_uint(value);
@@ -2897,38 +2953,60 @@ static bool FastllmCudaQwen4QSASelectLaunch(
         ((uint64_t)rows * scoreCapacity + scoreItemsPerBlock - 1) /
             scoreItemsPerBlock);
     const float inverseSqrt = 1.0f / std::sqrt((float)headDim);
-    if (query.dataType == fastllm::DataType::FLOAT32) {
-        auto kernel = heads == 4
-            ? Qwen4QSAScoreFourHeadKernel<float>
-            : (heads < 4 ? Qwen4QSAScoreSerialKernel<float>
-                         : Qwen4QSAScoreKernel<float>);
-        kernel<<<scoreBlocks, threads, 0, cudaStreamPerThread>>>(
-            (const float*)query.cudaData,
-            (const float*)compressedKeys.cudaData, scores,
-            rows, scoreCapacity, heads, headDim, inverseSqrt,
-            queryStart, compressRatio, decodeMeta);
-    } else if (query.dataType == fastllm::DataType::FLOAT16) {
-        auto kernel = heads == 4
-            ? Qwen4QSAScoreFourHeadKernel<half>
-            : (heads < 4 ? Qwen4QSAScoreSerialKernel<half>
-                         : Qwen4QSAScoreKernel<half>);
-        kernel<<<scoreBlocks, threads, 0, cudaStreamPerThread>>>(
-            (const half*)query.cudaData,
-            (const float*)compressedKeys.cudaData, scores,
-            rows, scoreCapacity, heads, headDim, inverseSqrt,
-            queryStart, compressRatio, decodeMeta);
-    } else {
-        auto kernel = heads == 4
-            ? Qwen4QSAScoreFourHeadKernel<__nv_bfloat16>
-            : (heads < 4
-                   ? Qwen4QSAScoreSerialKernel<__nv_bfloat16>
-                   : Qwen4QSAScoreKernel<__nv_bfloat16>);
-        kernel<<<scoreBlocks, threads, 0, cudaStreamPerThread>>>(
-            (const __nv_bfloat16*)query.cudaData,
-            (const float*)compressedKeys.cudaData, scores,
-            rows, scoreCapacity, heads, headDim, inverseSqrt,
-            queryStart, compressRatio, decodeMeta);
+    const int activeBlocks = queryStart < 0 ? scoreCapacity
+        : std::min(scoreCapacity, (queryStart + rows) / compressRatio);
+    bool tiledPrefill = decodeMeta == nullptr && rows >= 16 &&
+        rows <= 4 * 65535 && activeBlocks >= 64 && heads == 4 && headDim == 128;
+    if (tiledPrefill) {
+        // No SM-specific instructions or reduced-precision math are required.
+        // Retain the established kernel on devices that cannot fit the tile.
+        static thread_local int checkedDevice = -1;
+        static thread_local bool supported = false;
+        int device = -1;
+        if (cudaGetDevice(&device) != cudaSuccess) {
+            tiledPrefill = false;
+        } else {
+            if (checkedDevice != device) {
+                cudaDeviceProp properties{};
+                supported = cudaGetDeviceProperties(&properties, device) == cudaSuccess &&
+                    properties.warpSize == 32 && properties.maxThreadsPerBlock >= threads &&
+                    properties.sharedMemPerBlock >= 128 * (65 + 17) * sizeof(float);
+                checkedDevice = device;
+            }
+            tiledPrefill = supported;
+        }
     }
+    auto launchScore = [&](const auto *typedQuery) {
+        using T = std::remove_cv_t<std::remove_pointer_t<decltype(typedQuery)>>;
+        if (tiledPrefill) {
+            const dim3 grid((activeBlocks + 63) / 64, (rows + 3) / 4);
+            Qwen4QSAScorePrefillKernel<<<grid, threads, 0, cudaStreamPerThread>>>(
+                typedQuery, (const float*)compressedKeys.cudaData, scores,
+                rows, scoreCapacity, queryStart, compressRatio);
+            const cudaError_t error = cudaGetLastError();
+            if (error == cudaSuccess) return true;
+            // These launch failures enqueue no work; retry the generic score
+            // kernel. Execution faults must propagate, not be hidden by retry.
+            if (error != cudaErrorInvalidConfiguration && error != cudaErrorLaunchOutOfResources &&
+                error != cudaErrorNoKernelImageForDevice && error != cudaErrorInvalidDeviceFunction) {
+                return false;
+            }
+        }
+        auto kernel = heads == 4
+            ? Qwen4QSAScoreFourHeadKernel<T>
+            : (heads < 4 ? Qwen4QSAScoreSerialKernel<T> : Qwen4QSAScoreKernel<T>);
+        kernel<<<scoreBlocks, threads, 0, cudaStreamPerThread>>>(
+            typedQuery, (const float*)compressedKeys.cudaData, scores,
+            rows, scoreCapacity, heads, headDim, inverseSqrt,
+            queryStart, compressRatio, decodeMeta);
+        return true;
+    };
+    const bool scored = query.dataType == fastllm::DataType::FLOAT32
+        ? launchScore((const float*)query.cudaData)
+        : query.dataType == fastllm::DataType::FLOAT16
+            ? launchScore((const half*)query.cudaData)
+            : launchScore((const __nv_bfloat16*)query.cudaData);
+    if (!scored) return false;
     // Select the register footprint from the captured capacity, so replay
     // remains valid as decodeMeta advances without changing the graph.
     auto selectKernel = Qwen4QSARadixSelectKernel<0>;

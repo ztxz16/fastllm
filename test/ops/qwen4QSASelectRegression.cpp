@@ -28,6 +28,65 @@ static uint32_t Ordered(float value) {
     return bits & 0x80000000u ? ~bits : bits | 0x80000000u;
 }
 
+static int CheckPrefill() {
+    // The metadata-driven path deliberately retains the generic scoring
+    // kernel. Compare full indices with it, including ties, causal tails,
+    // partial tiles, all activation types and unsupported tile shapes.
+    struct Shape { int rows, blocks, heads, dim; };
+    const Shape shapes[] = {{15, 513, 4, 128}, {16, 513, 4, 128},
+        {19, 2049, 4, 128}, {128, 12801, 4, 128}, {1024, 32768, 4, 128},
+        {19, 2049, 3, 128}, {19, 2049, 8, 64}};
+    constexpr int budget = 2048, ratio = 4, width = budget + ratio - 1;
+    std::mt19937 generator(73);
+    std::uniform_real_distribution<float> random(-1, 1);
+    int checks = 0;
+    for (DataType type : {FLOAT32, FLOAT16, BFLOAT16}) {
+        for (const Shape &shape : shapes) {
+            for (int pattern = 0; pattern < 3; ++pattern) {
+                std::vector<float> queries(shape.rows * shape.heads * shape.dim);
+                std::vector<float> keys(shape.blocks * shape.dim);
+                for (float &v : queries) v = random(generator);
+                for (size_t i = 0; i < keys.size(); ++i) {
+                    keys[i] = pattern == 0 ? random(generator) : pattern == 1 ? 0.0f
+                        : i < (size_t)17 * shape.dim ? random(generator)
+                        : keys[i % (17 * shape.dim)];
+                }
+                Data query(type, {shape.rows, 1, shape.heads, shape.dim}, queries);
+                Data compressed(FLOAT32, {shape.blocks, shape.dim}, keys);
+                Data scores(FLOAT32, {shape.rows, shape.blocks});
+                Data selected(INT32, {shape.rows, budget / ratio});
+                Data reference(INT32, {shape.rows, width});
+                Data output(INT32, {shape.rows, width});
+                Data meta(INT32, {1});
+                for (Data *d : {&query, &compressed, &scores, &selected,
+                                &reference, &output, &meta}) ToGpu(*d);
+                for (int start : {0, shape.blocks * ratio - shape.rows}) {
+                    CheckCuda(cudaMemcpy(meta.cudaData, &start, sizeof(start), cudaMemcpyHostToDevice));
+                    if (!FastllmCudaQwen4QSASelectGraph(query, compressed,
+                            (const int32_t*)meta.cudaData, scores, selected, reference,
+                            shape.heads, shape.dim, budget, ratio) ||
+                        !FastllmCudaQwen4QSASelect(query, compressed, output,
+                            shape.blocks * ratio, shape.heads, shape.dim,
+                            budget, ratio, start)) {
+                        throw std::runtime_error("prefill QSA launch rejected");
+                    }
+                    CheckCuda(cudaStreamSynchronize(cudaStreamPerThread));
+                    std::vector<int32_t> expected(shape.rows * width), actual(expected.size());
+                    CheckCuda(cudaMemcpy(expected.data(), reference.cudaData,
+                        expected.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
+                    CheckCuda(cudaMemcpy(actual.data(), output.cudaData,
+                        actual.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
+                    if (actual != expected) {
+                        throw std::runtime_error("prefill QSA indices differ from generic scoring");
+                    }
+                    checks += shape.rows;
+                }
+            }
+        }
+    }
+    return checks;
+}
+
 // Use the GPU's scores as the reference input, so CPU/GPU dot-product
 // rounding cannot obscure a selection or tie-breaking error. Reuse each
 // captured graph while advancing and shrinking its visible context.
@@ -143,6 +202,9 @@ int main() {
                 }
             }
         }
+        const int prefillChecks = CheckPrefill();
+        std::cout << "PASS: " << prefillChecks
+                  << " prefill QSA rows match the generic scoring path\n";
         std::cout << "PASS: " << checks
                   << " QSA rows match stable Top-K and tail indices across graph replays\n";
     } catch (const std::exception &error) {
