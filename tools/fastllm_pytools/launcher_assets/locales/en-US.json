@@ -2,6 +2,9 @@
   "locale": "en-US",
   "name": "English",
   "static": {
+    "界面主题": "Appearance",
+    "浅色模式": "Light",
+    "黑夜模式": "Dark",
     "Pi 智能体运行时": "Pi agent runtime",
     "Pi 智能体": "Pi Agent",
     "运行时安装进度": "Runtime installation progress",

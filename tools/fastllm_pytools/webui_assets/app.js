@@ -27,7 +27,7 @@ function abortable(promise, signal) {
   });
 }
 
-export async function mountWebUI(host, {basePath = "", embedded = false, locale = "", iconUrl = "", signal, onInstallRuntime} = {}) {
+export async function mountWebUI(host, {basePath = "", embedded = false, locale = "", theme = "light", iconUrl = "", signal, onInstallRuntime} = {}) {
   const base = new URL(basePath || "/", location.origin);
   if (base.origin !== location.origin) throw new Error("WebUI must use the current origin.");
   basePath = base.pathname.replace(/\/$/, "");
@@ -37,6 +37,8 @@ export async function mountWebUI(host, {basePath = "", embedded = false, locale 
   signal?.addEventListener("abort", abort, {once:true});
   const root = host.attachShadow({mode:"open"});
   host.toggleAttribute("data-embedded", embedded);
+  function setTheme(value) { host.dataset.theme = value === "dark" ? "dark" : "light"; }
+  setTheme(theme);
   let observer;
   let runtimeInstallState = {};
   function destroy() {
@@ -707,7 +709,7 @@ export async function mountWebUI(host, {basePath = "", embedded = false, locale 
     observer = new ResizeObserver(() => { closeConversationMenu(); resizePrompt(); });
     observer.observe(host);
     signal?.removeEventListener("abort", abort);
-    return {destroy, setLocale: guard(setLocale), refreshConfig: guard(refreshConfig),
+    return {destroy, setLocale: guard(setLocale), setTheme: guard(setTheme), refreshConfig: guard(refreshConfig),
       setRuntimeInstallState: guard(value => { runtimeInstallState = value; renderWorkspaceAvailability(); })};
   } catch (error) {
     destroy();

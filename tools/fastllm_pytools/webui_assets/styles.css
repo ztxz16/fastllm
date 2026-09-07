@@ -534,3 +534,103 @@ dialog::backdrop { background: rgba(29,33,49,.3); backdrop-filter: blur(4px); }
   :host([data-embedded]) .composer-tools { flex-wrap: wrap; gap: 4px; }
   :host([data-embedded]) .tool-right { margin-left: auto; }
 }
+
+/* The hosting Launcher supplies the resolved theme without remounting chat. */
+:host([data-theme="dark"]) {
+  color-scheme: dark;
+  --brand: #75beff;
+  --brand-strong: #9cdcfe;
+  --brand-soft: #263b50;
+  --violet: #c586c0;
+  --ink: #d4d4d4;
+  --text: #cccccc;
+  --muted: #b0b0b0;
+  --faint: #969696;
+  --line: #3f3f46;
+  --canvas: #1e1e1e;
+  --sidebar: #252526;
+  --surface: #252526;
+  --soft: #2d2d30;
+  --danger: #f48771;
+  --danger-soft: #442d2d;
+  --warning: #cca700;
+  --warning-soft: #3c3629;
+  --action: #0e639c;
+  --focus: #007fd4;
+  --shadow: 0 10px 32px #00000030;
+}
+:host([data-theme="dark"]) .main { background: var(--canvas); }
+:host([data-theme="dark"]) .sidebar { background: var(--sidebar); border-color: var(--line); }
+:host([data-theme="dark"]) :is(.new-agent, .conversation-running, .conversation-more:hover,
+  .conversation-more.menu-open, .conversation-action-menu, .private-badge, .icon-button,
+  .icon-button:hover, .language-menu, .feature-row span, .suggestion, .suggestion:hover,
+  .tool-step, .pending-file, .mode-menu, .toast, dialog, .deck-slide, .analysis-chart,
+  .artifact-card, .agent-card, .attachment-card.document) { background: var(--surface); border-color: var(--line); }
+:host([data-theme="dark"]) :is(.reasoning, .tool-trace, .tool-detail pre, .attachment-card,
+  .field input, .field textarea, .field select, .dialog-button, .workspace-up,
+  .workspace-path, .workspace-list) { background: var(--soft); border-color: var(--line); }
+:host([data-theme="dark"]) :is(.conversation.active, .conversation:hover,
+  .message.user .message-body, .language-option:hover, .language-option.selected,
+  .conversation-action:hover, .new-agent:hover, .suggestion-icon,
+  .message-text code:not(pre code), .source, .source.document, .artifact-download,
+  .artifact-download:hover, .data-plan, .deck-slide::after, .workspace-context,
+  .tool-button:hover, .mode-button:hover, .mode-button.active, .mode-option:hover,
+  .mode-option.selected, .workspace-directory:hover, .workspace-hero-path,
+  .agent-card.selected, .agent-state) { background: var(--brand-soft); border-color: var(--line); }
+:host([data-theme="dark"]) :is(.topbar, .local-note, .hero-mark::after,
+  .dialog-head, .dialog-foot, .deck-outline, .composer) { border-color: var(--line); }
+:host([data-theme="dark"]) :is(.brand-copy strong, .model-copy strong,
+  .message-text h1, .message-text h2, .message-text h3, .artifact-copy strong,
+  .workspace-context strong, .composer textarea, .dialog-head h2, .workspace-path,
+  .agent-dialog-copy h2, .agent-card-copy strong) { color: var(--ink); }
+:host([data-theme="dark"]) :is(.new-agent, .conversation.active, .conversation:hover,
+  .conversation-running, .conversation-more:hover, .conversation-action:hover,
+  .language-option:hover, .language-option.selected, .suggestion-icon, .hero-kicker,
+  .message-text code:not(pre code), .reasoning summary::before, .tool-trace > summary::before,
+  .tool-step.running .tool-status, .source, .source.document, .artifact-download,
+  .data-plan strong, .deck-slide span, .workspace-context, .workspace-up,
+  .tool-button:hover, .mode-button:hover, .mode-button.active, .mode-option:hover,
+  .mode-option.selected, .workspace-directory:hover, .workspace-directory svg,
+  .workspace-hero-path, .agent-card-copy small, .agent-state) { color: var(--brand); }
+:host([data-theme="dark"]) :is(.conversation, .conversation-action, .language-option,
+  .suggestion, .message-text, .tool-step > summary, .tool-detail pre,
+  .document-copy .attachment-name, .deck-slide, .pending-file, .mode-option,
+  .field input, .field textarea, .field select, .check-row, .dialog-button,
+  .workspace-directory, .agent-card, .toast) { color: var(--text); }
+:host([data-theme="dark"]) :is(.brand-copy small, .section-label, .conversation-more,
+  .local-note, .model-copy small, .private-badge, .icon-button, .feature-row span,
+  .suggestion small, .reasoning summary, .reasoning-content, .tool-trace > summary,
+  .tool-trace > summary::after, .tool-preview, .tool-status, .tool-detail-label,
+  .tool-detail-note, .attachment-name, .document-copy small, .artifact-copy small,
+  .analysis-chart span, .data-plan, .deck-outline summary, .typing, .status-line,
+  .pending-file button, .tool-button, .mode-button, .composer-note, .dialog-close,
+  .field label, .dialog-hint, .workspace-intro, .workspace-directory small,
+  .workspace-empty, .delete-copy, .agent-dialog-copy p, .agent-card-copy p,
+  .empty-error) { color: var(--muted); }
+:host([data-theme="dark"]) .composer textarea::placeholder { color: var(--faint); }
+:host([data-theme="dark"]) :is(.conversation-action.danger, .tool-step.error .tool-status) { color: var(--danger); }
+:host([data-theme="dark"]) .conversation-action.danger:hover { background: var(--danger-soft); }
+:host([data-theme="dark"]) .workspace-warning { background: var(--warning-soft); color: var(--warning); border-color: #705736; }
+:host([data-theme="dark"]) :is(.new-chat, .send-button, .dialog-button.primary) {
+  background: var(--action); border-color: var(--action); color: #fff;
+}
+:host([data-theme="dark"]) .dialog-button.danger { background: #ab3e4f; border-color: #ab3e4f; color: #fff; }
+:host([data-theme="dark"]) .composer-area { background: linear-gradient(180deg, transparent, var(--canvas) 30%); }
+:host([data-theme="dark"]) .composer { box-shadow: var(--shadow); }
+:host([data-theme="dark"]) :is(.composer:focus-within, .field input:focus,
+  .field textarea:focus, .field select:focus, .workspace-path:focus, .agent-card:hover) {
+  border-color: var(--focus); box-shadow: 0 0 0 1px var(--brand-soft);
+}
+:host([data-theme="dark"]) .tool-step.running .tool-state-dot { background: var(--brand); box-shadow: 0 0 0 3px var(--brand-soft); }
+:host([data-theme="dark"]) .sidebar-backdrop,
+:host([data-theme="dark"]) dialog::backdrop { background: #00000099; }
+:host([data-theme="dark"]) ::-webkit-scrollbar-thumb { background-color: var(--line); }
+:host([data-theme="dark"]) .conversation.active { background: #37373d; box-shadow: inset 2px 0 var(--focus); }
+:host([data-theme="dark"]) .code-block { background: var(--canvas); border-color: var(--line); }
+:host([data-theme="dark"]) .code-head { background: var(--soft); }
+:host([data-theme="dark"]) .deck-slide::after { background: var(--brand-soft); }
+:host([data-theme="dark"]) :is(.new-chat, .send-button, .dialog-button.primary):hover { background: #1177bb; }
+:host([data-theme="dark"]) :is(.new-chat, .new-agent, .conversation, .suggestion,
+  .agent-card, .mode-button, .dialog-button, .field input, .field select,
+  .field textarea, .mode-menu, .conversation-action-menu) { border-radius: 4px; }
+:host([data-theme="dark"]) :is(.composer, dialog, .message.user .message-body, .code-block) { border-radius: 6px; }

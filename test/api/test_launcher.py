@@ -449,7 +449,7 @@ class LauncherConfigTest(unittest.TestCase):
                 self.runtime.start(self.config(port=str(port)))
 
     def test_launcher_assets_are_packaged_as_external_resources(self):
-        for filename in ("index.html", "styles.css", "app.js", "launcher-icon.png"):
+        for filename in ("index.html", "styles.css", "app.js", "theme.js", "launcher-icon.png"):
             self.assertTrue((ASSET_DIRECTORY / filename).is_file(), filename)
         html = (ASSET_DIRECTORY / "index.html").read_text(encoding="utf-8")
         javascript = (ASSET_DIRECTORY / "app.js").read_text(encoding="utf-8")

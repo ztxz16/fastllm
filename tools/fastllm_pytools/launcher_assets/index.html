@@ -3,10 +3,11 @@
   <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="color-scheme" content="light">
+    <meta name="color-scheme" content="light dark">
     <title>FastLLM Launcher</title>
     <link rel="icon" type="image/png" href="/assets/launcher-icon.png">
     <link rel="apple-touch-icon" href="/assets/launcher-icon.png">
+    <script src="/assets/theme.js"></script>
     <link rel="stylesheet" href="/assets/styles.css">
     <script defer src="/assets/app.js"></script>
   </head>
@@ -64,6 +65,13 @@
             <p>下载模型，选择配置，让本地算力开始工作。</p>
             <button type="button" data-open-view="download">浏览模型<svg class="icon" aria-hidden="true"><use href="#icon-arrow"/></svg></button>
           </div>
+          <label class="language-picker theme-picker" for="theme-select">
+            <span>界面主题</span>
+            <select id="theme-select" aria-label="界面主题">
+              <option value="light">浅色模式</option>
+              <option value="dark">黑夜模式</option>
+            </select>
+          </label>
           <label class="language-picker" for="language-select">
             <span>界面语言</span>
             <select id="language-select" aria-label="界面语言">

@@ -176,7 +176,7 @@ function cacheElements() {
     "download-cancel", "download-use-model", "download-use-last", "download-status-icon",
     "download-status-title", "download-status-message", "download-progress-value",
     "download-progress", "download-bytes", "download-files", "download-destination",
-    "launcher-address-list", "language-select"
+    "launcher-address-list", "language-select", "theme-select"
   ];
   for (const id of ids) {
     elements[toCamelCase(id)] = document.getElementById(id);
@@ -189,6 +189,7 @@ function toCamelCase(value) {
 
 async function initialize() {
   cacheElements();
+  initializeTheme();
   captureStaticMessages();
   await initializeLocale();
   bindEvents();
@@ -236,6 +237,16 @@ async function initialize() {
     elements.statusMessage.textContent = friendlyError(error);
     elements.statusDot.className = "status-dot failed";
   }
+}
+
+function initializeTheme() {
+  const theme = window.ftllmLauncherTheme;
+  elements.themeSelect.value = theme.getPreference();
+  elements.themeSelect.addEventListener("change", () => theme.setPreference(elements.themeSelect.value));
+  window.addEventListener("ftllm-theme-change", event => {
+    elements.themeSelect.value = event.detail.preference;
+    state.webuiComponent?.setTheme(event.detail.theme);
+  });
 }
 
 function normalizeLocale(locale) {
@@ -2662,6 +2673,7 @@ async function openEmbeddedWebUI() {
     elements.webuiContent.replaceChildren(host);
     const component = await mountWebUI(host, {
       basePath: result.url, embedded: true, locale: state.locale,
+      theme: window.ftllmLauncherTheme.getResolved(),
       iconUrl: "/assets/launcher-icon.png", signal: controller.signal,
       onInstallRuntime: installAgentRuntime
     });
@@ -2673,6 +2685,7 @@ async function openEmbeddedWebUI() {
     clearWebUILoad();
     state.webuiLoading = false;
     component.setLocale(state.locale);
+    component.setTheme(window.ftllmLauncherTheme.getResolved());
     renderAgentRuntime();
     renderWebUIAvailability();
   } catch (error) {

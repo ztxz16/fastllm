@@ -3,6 +3,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import socket
 import sys
 import tempfile
@@ -96,6 +97,89 @@ class LauncherWebUIBrowserTest(unittest.TestCase):
         self.page.clock.fast_forward(35000)
         expect(self.page.locator('#webui-content')).to_be_visible()
         expect(self.page.locator('#webui-retry')).to_be_hidden()
+
+    def test_theme_defaults_to_light_and_remembers_choice(self):
+        picker = self.page.locator('#theme-select')
+        root = self.page.locator('html')
+        self.page.emulate_media(color_scheme='dark')
+        self.page.reload()
+        expect(picker.locator('option')).to_have_count(2)
+        expect(picker).to_have_value('light')
+        expect(root).to_have_attribute('data-theme', 'light')
+        self.page.emulate_media(color_scheme='light')
+        self.page.emulate_media(color_scheme='dark')
+        expect(root).to_have_attribute('data-theme', 'light')
+        picker.select_option('dark')
+        self.page.emulate_media(color_scheme='light')
+        self.page.reload()
+        expect(picker).to_have_value('dark')
+        expect(root).to_have_attribute('data-theme', 'dark')
+        self.page.locator('#language-select').select_option('zh-CN')
+        expect(picker).to_have_value('dark')
+        expect(picker.locator('option:checked')).to_have_text('黑夜模式')
+        picker.select_option('light')
+        self.page.reload()
+        expect(picker).to_have_value('light')
+        expect(root).to_have_attribute('data-theme', 'light')
+        # Older saved system preferences fall back to the new light default.
+        self.page.evaluate("localStorage.setItem('ftllm-launcher-theme', 'system')")
+        self.page.emulate_media(color_scheme='dark')
+        self.page.reload()
+        expect(picker).to_have_value('light')
+        expect(root).to_have_attribute('data-theme', 'light')
+
+    def test_saved_theme_is_applied_before_main_script_runs(self):
+        self.page.evaluate("localStorage.setItem('ftllm-launcher-theme', 'dark')")
+        self.page.emulate_media(color_scheme='light')
+        self.page.route('**/assets/app.js', lambda route: route.abort())
+        self.page.reload()
+        expect(self.page.locator('html')).to_have_attribute('data-theme', 'dark')
+        self.assertEqual(self.page.locator('body').evaluate('node => getComputedStyle(node).colorScheme'), 'dark')
+        self.assert_dark_surface(self.page.locator('body'))
+
+    def assert_dark_surface(self, locator):
+        # Wait for existing hover/color transitions to finish after a theme change.
+        expect(locator).to_have_css('background-color', re.compile(r'rgb\([0-8]?\d, [0-8]?\d, [0-8]?\d\)'))
+
+    def test_dark_theme_updates_studio_dialogs_and_mobile_without_losing_draft(self):
+        self.page.locator('#open-webui').click()
+        self.assert_loaded()
+        pane = self.page.locator('#webui-content')
+        pane.locator('#prompt').fill('Keep this draft across theme changes')
+        self.page.evaluate("window.themeTestHost = document.querySelector('#webui-content > div')")
+        self.page.locator('#theme-select').select_option('dark')
+        expect(pane.locator(':scope > div')).to_have_attribute('data-theme', 'dark')
+        self.assert_dark_surface(pane.locator('.main'))
+        self.assert_dark_surface(pane.locator('.composer'))
+        self.assert_dark_surface(pane.locator('.suggestion').first)
+        self.screenshot('launcher-dark-studio')
+        pane.locator('#agentButton').click()
+        expect(pane.locator('#agentDialog')).to_be_visible()
+        self.assert_dark_surface(pane.locator('#agentDialog'))
+        self.screenshot('launcher-dark-agent-dialog')
+        pane.locator('#agentDialog').evaluate('node => node.close()')
+        self.page.locator('#theme-select').select_option('light')
+        expect(pane.locator(':scope > div')).to_have_attribute('data-theme', 'light')
+        expect(pane.locator('#prompt')).to_have_value('Keep this draft across theme changes')
+        self.assertTrue(self.page.evaluate("window.themeTestHost === document.querySelector('#webui-content > div')"))
+        self.page.locator('#theme-select').select_option('dark')
+        self.page.locator('[data-view-button="launch"]').click()
+        self.page.locator('#new-profile').click()
+        self.assert_dark_surface(self.page.locator('#launch-form'))
+        self.assert_dark_surface(self.page.locator('#model-path'))
+        self.screenshot('launcher-dark-profile-dialog')
+        self.page.locator('#close-profile-editor').click()
+        self.assert_dark_surface(self.page.locator('.confirmation-window'))
+        self.page.locator('#confirmation-confirm').click()
+        self.screenshot('launcher-dark-models')
+        self.page.locator('#language-select').select_option('zh-CN')
+        for width in (390, 320):
+            self.page.set_viewport_size({'width': width, 'height': 844})
+            self.assertTrue(self.page.evaluate('document.documentElement.scrollWidth <= innerWidth'))
+            expect(self.page.locator('#theme-select')).to_be_visible()
+            expect(self.page.locator('#language-select')).to_be_visible()
+            expect(self.page.locator('#shutdown-launcher')).to_be_visible()
+        self.screenshot('launcher-dark-mobile')
 
     def test_pi_install_retry_enables_agent_and_preserves_draft(self):
         job = {'phase': 'missing', 'supported': True, 'available': False, 'error': ''}
