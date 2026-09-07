@@ -3638,8 +3638,13 @@ namespace fastllm {
         requireMatchingConfigInt("num_hidden_layers", model->block_cnt);
         requireMatchingConfigInt("num_attention_heads",
                                  model->num_attention_heads);
+        // Qwen3_5Model keeps its own KV-head member. With --ori, the base
+        // class member can still have its default value after InitParams().
+        const int configuredKvHeads = targetDictInt("num_key_value_heads");
+        const int kvHeads = configuredKvHeads > 0 ? configuredKvHeads :
+            model->num_attention_heads;
         requireMatchingConfigInt("num_key_value_heads",
-                                 model->num_key_value_heads);
+                                 kvHeads);
         requireMatchingConfigInt("head_dim", model->head_dim);
         requireMatchingConfigInt("vocab_size", targetDictInt("vocab_size"));
         requireMatchingConfigInt("intermediate_size",
@@ -3647,7 +3652,6 @@ namespace fastllm {
 
         const int hidden = model->embed_dim;
         const int heads = model->num_attention_heads;
-        const int kvHeads = model->num_key_value_heads;
         const int headDim = model->head_dim;
         const int intermediate = targetDictInt("intermediate_size");
         auto requireShape = [&](const std::string &name,
