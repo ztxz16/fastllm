@@ -1342,13 +1342,39 @@ namespace fastllm {
         std::vector<int> votes;
         std::vector<std::unique_ptr<Qwen4ExpModel>> ranks;
         using Cache = std::vector<std::pair<Data, Data>>;
-        std::map<const Data *, std::vector<Cache>> caches;
+        struct RequestCache {
+            std::vector<Cache> ranks;
+            bool ownsRankZero = false;
+            bool failed = false;
+        };
+        std::map<const Data *, std::unique_ptr<RequestCache>> caches;
+        // Keep at most one completed sparse request. Graphs and all buffers
+        // whose addresses they capture share the same lifetime. Active
+        // requests never share mutable storage with this idle slot.
+        std::unique_ptr<RequestCache> idleCache;
         std::mutex forwardMutex, barrierMutex;
         std::condition_variable barrierCv;
         unsigned generation = 0;
         int arrived = 0;
         // Destroy workers before the rank models and synchronization state.
         PersistentWorkerGroup workers;
+
+        void ReleaseCache(const Data *key, std::unique_ptr<RequestCache> &cache) {
+            if (!cache) return;
+            for (size_t r = 0; r < ranks.size(); ++r) {
+                const Data *localKey = r == 0 && !cache->ownsRankZero
+                    ? key : &cache->ranks[r].front().first;
+                ranks[r]->decodeCudaGraphStates.erase(localKey);
+                ranks[r]->requestStates.erase(localKey);
+            }
+            cache.reset();
+        }
+
+        ~ThreadTpState() {
+            workers.Stop();
+            for (auto &item : caches) ReleaseCache(item.first, item.second);
+            ReleaseCache(nullptr, idleCache);
+        }
 
         void Barrier() {
             std::unique_lock<std::mutex> lock(barrierMutex);
@@ -1685,13 +1711,47 @@ namespace fastllm {
         ThreadTpState &tp = *threadTpState;
         std::lock_guard<std::mutex> guard(tp.forwardMutex);
         const Data *key = &pastKeyValues[0].first;
-        auto &caches = tp.caches[key];
-        if (caches.empty()) {
-            caches.resize(tp.devices.size());
-            for (size_t r = 1; r < caches.size(); ++r) {
-                caches[r].resize(block_cnt);
+        auto &entry = tp.caches[key];
+        bool resetRequest = false;
+        if (!entry) {
+            // Dense graph width depends on cache capacity. Retain the legacy
+            // allocation schedule for short prompts and externally supplied
+            // caches, including graph-disabled execution.
+            const bool reusable = batch == 1 && GetFastllmEnv().cudaGraph &&
+                indexerBudget > 0 &&
+                generationConfig.input_token_length >= indexerBudget &&
+                std::all_of(pastKeyValues.begin(), pastKeyValues.end(),
+                    [](const std::pair<Data, Data> &kv) {
+                        return kv.first.dims.empty() && kv.second.dims.empty();
+                    });
+            if (!reusable || tp.caches.size() > 1) {
+                tp.ReleaseCache(nullptr, tp.idleCache);
+            } else if (tp.idleCache) {
+                // Keep reuse within a capacity class. A much shorter request
+                // must not pin a long-context KV allocation through its own
+                // prefill, cancellation or admission of a concurrent request.
+                for (int layer = 0; layer < block_cnt; ++layer) {
+                    if (!IsLinearAttentionLayer(layer) &&
+                        Qwen4AxisCapacity(tp.idleCache->ranks[0][layer].first, 1) >
+                            2LL * generationConfig.input_token_length) {
+                        tp.ReleaseCache(nullptr, tp.idleCache);
+                        break;
+                    }
+                }
+            }
+            if (tp.idleCache) {
+                entry = std::move(tp.idleCache);
+                resetRequest = true;
+            } else {
+                entry = std::make_unique<ThreadTpState::RequestCache>();
+                entry->ownsRankZero = reusable;
+                entry->ranks.resize(tp.devices.size());
+                for (size_t r = reusable ? 0 : 1; r < tp.devices.size(); ++r) {
+                    entry->ranks[r].resize(block_cnt);
+                }
             }
         }
+        auto &caches = entry->ranks;
         // Each worker owns an executor, input tensors and a stable per-thread CUDA
         // stream. Operator dispatch must never mutate the shared global executor.
         std::vector<std::exception_ptr> errors(tp.devices.size());
@@ -1713,15 +1773,71 @@ namespace fastllm {
                 embedding.ToDevice(DataDevice::CUDA, std::vector<int>{tp.devices[r]});
             }
             Qwen4ExpModel &model = *tp.ranks[r];
+            auto &cache = r == 0 && !entry->ownsRankZero
+                ? pastKeyValues : caches[r];
+            if (resetRequest) {
+                // No prefix or recurrent contents survive a request boundary.
+                // Preserve only reusable storage, after the previous worker's
+                // stream has completed, so captured addresses stay valid.
+                auto &state = model.requestStates[&cache.front().first];
+                RequestState fresh;
+                fresh.indexerTailKeyTensors.swap(state.indexerTailKeyTensors);
+                fresh.indexerTailPositionTensors.swap(state.indexerTailPositionTensors);
+                fresh.indexerBlockKeyTensors.swap(state.indexerBlockKeyTensors);
+                fresh.indexerHostMirrorTransfers.swap(state.indexerHostMirrorTransfers);
+                for (auto *tensors : {&fresh.indexerTailKeyTensors,
+                                      &fresh.indexerTailPositionTensors,
+                                      &fresh.indexerBlockKeyTensors}) {
+                    for (auto &item : *tensors) {
+                        if (item.second && !item.second->dims.empty()) {
+                            auto dims = item.second->dims;
+                            dims[0] = 0;
+                            item.second->Resize(dims);
+                        }
+                    }
+                }
+                for (auto &item : fresh.indexerHostMirrorTransfers) {
+                    if (item.second) {
+                        item.second->MarkDeviceSynchronized();
+                        item.second->Rollback(0);
+                    }
+                }
+                state = std::move(fresh);
+                for (int layer = 0; layer < block_cnt; ++layer) {
+                    for (Data *tensor : {&cache[layer].first, &cache[layer].second}) {
+                        if (model.IsLinearAttentionLayer(layer)) {
+                            tensor->Allocate(0.0f);
+                        } else if (!tensor->dims.empty()) {
+                            auto dims = tensor->dims;
+                            dims[1] = 0;
+                            tensor->Resize(dims);
+                        }
+                    }
+                }
+            }
             auto tokens = model.ForwardTarget(batch, ids, mask, positions,
-                r == 0 ? pastKeyValues : caches[r], generationConfig, lastTokens,
+                cache, generationConfig, lastTokens,
                 r == 0 ? logits : nullptr, nullptr, nullptr, nullptr, nullptr,
                 false, true, false, nullptr, false,
                 precomputedEmbedding ? &embedding : nullptr);
             if (r == 0) result = std::move(tokens);
             FastllmCudaSyncCurrentThreadStream();
         }, errors);
-        for (auto &error : errors) if (error) std::rethrow_exception(error);
+        for (auto &error : errors) if (error) {
+            entry->failed = true;
+            std::rethrow_exception(error);
+        }
+        if (entry->ownsRankZero) {
+            // The scheduler observes rank-0 cache metadata. Ownership remains
+            // in the TP slot until graphs are destroyed or the slot is reused.
+            for (int layer = 0; layer < block_cnt; ++layer) {
+                const bool linear = IsLinearAttentionLayer(layer);
+                Qwen4BorrowCudaTensor(caches[0][layer].first,
+                                     pastKeyValues[layer].first, linear);
+                Qwen4BorrowCudaTensor(caches[0][layer].second,
+                                     pastKeyValues[layer].second, linear);
+            }
+        }
         return result;
 #else
         return {};
@@ -1734,10 +1850,25 @@ namespace fastllm {
         std::lock_guard<std::mutex> guard(tp.forwardMutex);
         auto found = tp.caches.find(key);
         if (found == tp.caches.end()) return;
-        for (size_t r = 0; r < tp.ranks.size(); ++r) {
-            const Data *localKey = r == 0 ? key : &found->second[r].front().first;
-            tp.ranks[r]->decodeCudaGraphStates.erase(localKey);
-            tp.ranks[r]->requestStates.erase(localKey);
+        auto &cache = found->second;
+        // Admission of another request takes priority over an idle graph.
+        // Retaining a completed long-context slot during a peer's prefill
+        // would otherwise pin its large KV and graph allocations unnecessarily.
+        bool reusable = tp.caches.size() == 1 &&
+            cache->ownsRankZero && !cache->failed;
+        for (size_t r = 0; reusable && r < tp.ranks.size(); ++r) {
+            const auto &graphs = tp.ranks[r]->decodeCudaGraphStates;
+            auto graph = graphs.find(&cache->ranks[r].front().first);
+            reusable = graph != graphs.end() && graph->second &&
+                graph->second->wholeGraphMode &&
+                std::any_of(graph->second->segments.begin(), graph->second->segments.end(),
+                    [](const auto &segment) { return segment.second.captured; });
+        }
+        if (reusable) {
+            tp.ReleaseCache(nullptr, tp.idleCache);
+            tp.idleCache = std::move(cache);
+        } else {
+            tp.ReleaseCache(key, cache);
         }
         tp.caches.erase(found);
     }
@@ -4534,8 +4665,15 @@ namespace fastllm {
                          std::vector<int>({cachedBlocks,
                                            this->indexerHeadDim})),
                     "Qwen4-Exp QSA compressed cache append is inconsistent.");
-                if (blockCache == nullptr || blockCache->dims.empty() ||
-                    blockCache->dims[0] == 0) {
+                const bool reusableEmptyBlocks = threadTpRank >= 0 &&
+                    blockCache != nullptr && sameDevice(*blockCache) &&
+                    blockCache->dataType == DataType::FLOAT32 &&
+                    blockCache->dims == std::vector<int>({0, this->indexerHeadDim}) &&
+                    Qwen4AxisCapacity(*blockCache, 0) >= newBlockCount;
+                if (reusableEmptyBlocks) {
+                    CatDirect(*blockCache, normalized, 0);
+                } else if (blockCache == nullptr || blockCache->dims.empty() ||
+                           blockCache->dims[0] == 0) {
                     AssertInFastLLM(
                         cachedBlocks == 0,
                         "Qwen4-Exp QSA lost a committed compressed block.");
@@ -7630,7 +7768,7 @@ namespace fastllm {
             graphState->hiddenStates[0].cudaData != nullptr &&
             (graphState->hiddenStates[0].dataType != hiddenStates.dataType ||
              graphState->hiddenStates[0].dims != hiddenStates.dims);
-        if (graphState->device != device || workspaceShapeChanged ||
+        const bool resetGraph = graphState->device != device || workspaceShapeChanged ||
             graphState->graphStartLayer != graphStartLayer ||
             graphState->startBeforeAttention != startBeforeAttention ||
             (!graphState->linearCachePointers.empty() &&
@@ -7639,7 +7777,10 @@ namespace fastllm {
              graphState->wholeGraphMode != wholeGraphReady) ||
             (wholeGraphReady &&
              !graphState->fullCacheSignature.empty() &&
-             graphState->fullCacheSignature != fullCacheSignature)) {
+             graphState->fullCacheSignature != fullCacheSignature);
+        // A reused collective graph must be invalidated on all ranks together,
+        // even if only one rank's allocator changed an address or capacity.
+        if (!ThreadTpAllTrue(!resetGraph)) {
             graphState->Reset(device);
         }
         graphState->device = device;
@@ -10193,6 +10334,18 @@ namespace fastllm {
             ((threadTpRank >= 0 || restoredPrefixSnapshot || verificationCapture != nullptr) &&
              Qwen4IsContiguousCausalMask(
                  attentionMask, qsaPreviousLength, inputIds.dims[1]));
+        if (threadTpRank >= 0 && inputIds.dims[1] > 1 &&
+            indexerBudget > 0 &&
+            generationConfig.input_token_length >= indexerBudget &&
+            qsaDeviceCompatibleMask) {
+            // Sparse decode has a fixed selection width. Grow its prefill KV
+            // geometrically as well; dense and hybrid allocation stay intact.
+            for (int layer = 0; layer < block_cnt; ++layer) {
+                if (!IsLinearAttentionLayer(layer)) {
+                    requestState->geometricCacheGrowthReadyLayers.insert(layer);
+                }
+            }
+        }
         int decodeReserveTokens = 0;
         // Dense decode graph width depends on KV capacity. Keep its original
         // allocation schedule and reserve only for fixed-budget sparse QSA.

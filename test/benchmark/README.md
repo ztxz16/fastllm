@@ -5,6 +5,7 @@
 - `prefill.py`：测长上下文 prefill 性能。
 - `decode.py`：测多 batch 并发请求下的 decode 性能。
 - `qwen4_prefix_cache.py`：用真实 Qwen4 checkpoint 验证普通解码和 MTP 的前缀快照。
+- `qwen4_tp_reuse.py`：连接已启用 CUDA Graph 的 Qwen4 TP 服务，验证不同内容/长度、取消请求及并发时的缓存隔离：`python3 test/benchmark/qwen4_tp_reuse.py --url http://127.0.0.1:18080 --output reuse.json`。
 
 本文主要说明 `decode.py` 和 `decode_config.example.json` 的用法。
 
