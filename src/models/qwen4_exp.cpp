@@ -6866,12 +6866,16 @@ namespace fastllm {
         // Check the supported cache shape before querying availability,
         // which lazily allocates the device cache. Cached verifier rows run
         // entirely on CUDA, so their configured NUMA fallback is graph-safe.
+#ifndef USE_ROCM
         const bool moeCudaCache =
             hiddenStates.dims.size() == 3 && hiddenStates.dims[1] > 0 &&
             hiddenStates.dims[1] <= FASTLLM_CUDA_MOE_CACHE_MAX_BATCH &&
             (hiddenStates.dims[1] == 1 || mtpTargetGraph) &&
             !this->weights.empty() && !this->weights[0].empty() &&
             MoeCudaCacheAvailable(this->weights[0]);
+#else
+        const bool moeCudaCache = false;
+#endif
         const bool moeDeviceMapGraphCompatible =
             (Qwen4CudaOnlyDeviceMap(this->moeDeviceMap) &&
              Qwen4CudaOnlyDeviceMap(this->layeredMoeDeviceMap)) ||
@@ -6880,9 +6884,13 @@ namespace fastllm {
              Qwen4CudaOrNumaOnlyDeviceMap(this->layeredMoeDeviceMap));
         // Host decisions and NUMA execution cannot be captured in the full
         // backbone graph. MTP and prefill retain their existing paths.
+#ifndef USE_ROCM
         const bool hybridMoe = Qwen4MtpDraftsPerStep() == 0 &&
             !this->weights.empty() && !this->weights[0].empty() &&
             FastllmCudaUseMoeHybrid(this->weights[0].data(), this->weights[0].size());
+#else
+        const bool hybridMoe = false;
+#endif
         if (!GetFastllmEnv().cudaGraph ||
             hybridMoe ||
             !supportedStart ||

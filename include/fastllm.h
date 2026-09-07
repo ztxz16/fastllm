@@ -389,14 +389,14 @@ namespace fastllm {
     const uint8_t *GetNVFP4ScaleData(const Data &data);
     float NVFP4E8M0ScaleToFloat(uint8_t v);
     constexpr int NVFP4_PLANAR_TILE_ROWS = 32;
-    #ifdef __CUDACC__
+    #if defined(__CUDACC__) || defined(__HIPCC__)
     __host__ __device__
     #endif
     inline size_t NVFP4PlanarWeightOffset(int row, int blocks, int block = 0) {
         return size_t(row / NVFP4_PLANAR_TILE_ROWS) * NVFP4_PLANAR_TILE_ROWS * blocks * 12 +
             (size_t(row % NVFP4_PLANAR_TILE_ROWS) * blocks + block) * 8;
     }
-    #ifdef __CUDACC__
+    #if defined(__CUDACC__) || defined(__HIPCC__)
     __host__ __device__
     #endif
     inline size_t NVFP4PlanarScaleOffset(int row, int blocks, int block = 0) {
