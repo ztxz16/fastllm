@@ -327,10 +327,13 @@
                       <span>Draft Token 数</span>
                       <input data-field="draft_tokens" type="text" placeholder="auto">
                     </label>
-                    <label class="field span-2-wide">
-                      <span>Draft 模型路径</span>
-                      <input data-field="speculative_draft_model_path" data-path-input type="text" list="path-suggestions" placeholder="留空使用模型内置能力" spellcheck="false">
-                    </label>
+                    <div class="field span-2">
+                      <label for="draft-model-path">Draft 模型路径</label>
+                      <div class="path-input-with-button">
+                        <input id="draft-model-path" data-field="speculative_draft_model_path" data-path-input type="text" list="path-suggestions" placeholder="留空使用模型内置能力" spellcheck="false">
+                        <button id="choose-draft-model-folder" class="folder-picker-button" type="button"><span class="folder-button-icon" aria-hidden="true"></span>浏览文件或文件夹</button>
+                      </div>
+                    </div>
                   </div>
                 </section>
 

@@ -263,6 +263,8 @@
     "Your model is configured for the selected mode. Save it or start the service.": "Your model is configured for the selected mode. Save it or start the service.",
     "Automatic configuration must finish before saving. Retry or choose custom configuration.": "Automatic configuration must finish before saving. Retry or choose custom configuration.",
     "Select this file": "Select this file",
+    "Choose a model file or folder": "Choose a model file or folder",
+    "Choose a draft model file or folder": "Choose a draft model file or folder",
     "Select this folder": "Select this folder",
     "This folder is empty.": "This folder is empty.",
     "Only the first {count} entries are shown.": "Only the first {count} entries are shown.",

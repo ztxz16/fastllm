@@ -263,6 +263,8 @@
     "Your model is configured for the selected mode. Save it or start the service.": "已按所选模式完成配置，可保存或启动服务。",
     "Automatic configuration must finish before saving. Retry or choose custom configuration.": "请先完成自动配置再保存，可重试或选择自定义配置。",
     "Select this file": "选择此文件",
+    "Choose a model file or folder": "选择模型文件或文件夹",
+    "Choose a draft model file or folder": "选择 Draft 模型文件或文件夹",
     "Select this folder": "选择此文件夹",
     "This folder is empty.": "此文件夹为空。",
     "Only the first {count} entries are shown.": "仅显示前 {count} 个文件和文件夹。",

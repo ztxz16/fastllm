@@ -106,6 +106,8 @@ const state = {
   folderPickerResult: null,
   folderPickerSelectedFile: "",
   folderPickerError: "",
+  folderPickerField: "model",
+  folderPickerTrigger: null,
   confirmationResolve: null,
   confirmationRestoreFocus: null
 };
@@ -163,7 +165,7 @@ function cacheElements() {
     "validation-messages", "save-profile",
     "start-runtime", "clear-logs", "log-count", "log-output",
     "refresh-hardware", "hardware-status", "hardware-grid", "path-suggestions",
-    "choose-model-folder", "folder-picker-modal", "folder-picker-title",
+    "choose-model-folder", "choose-draft-model-folder", "folder-picker-modal", "folder-picker-title",
     "folder-picker-close", "folder-picker-current", "folder-picker-up",
     "folder-picker-location", "folder-picker-drive-field", "folder-picker-drive",
     "folder-picker-list", "folder-picker-status", "folder-picker-cancel",
@@ -508,7 +510,8 @@ function bindEvents() {
   elements.profileEditorModal.addEventListener("click", (event) => {
     if (event.target === elements.profileEditorModal) closeProfileEditor();
   });
-  elements.chooseModelFolder.addEventListener("click", openFolderPicker);
+  elements.chooseModelFolder.addEventListener("click", () => openFolderPicker("model", elements.chooseModelFolder));
+  elements.chooseDraftModelFolder.addEventListener("click", () => openFolderPicker("speculative_draft_model_path", elements.chooseDraftModelFolder));
   elements.folderPickerClose.addEventListener("click", () => closeFolderPicker());
   elements.folderPickerCancel.addEventListener("click", () => closeFolderPicker());
   elements.folderPickerSelect.addEventListener("click", selectCurrentFolder);
@@ -2094,12 +2097,14 @@ function schedulePathSuggestions(input) {
   }, 180);
 }
 
-function openFolderPicker() {
-  const modelInput = elements.launchForm.querySelector('[data-field="model"]');
+function openFolderPicker(field, trigger) {
+  state.folderPickerField = field;
+  state.folderPickerTrigger = trigger;
+  const input = elements.launchForm.querySelector(`[data-field="${field}"]`);
   elements.folderPickerModal.classList.remove("hidden");
   document.body.classList.add("modal-open");
   elements.folderPickerTitle.focus({ preventScroll: true });
-  loadFolderPicker(modelInput.value || "");
+  loadFolderPicker(input.value || collectForm().model || "");
 }
 
 function closeFolderPicker(restoreFocus = true) {
@@ -2110,7 +2115,7 @@ function closeFolderPicker(restoreFocus = true) {
     document.body.classList.remove("modal-open");
   }
   if (restoreFocus && !elements.profileEditorModal.classList.contains("hidden")) {
-    elements.chooseModelFolder.focus({ preventScroll: true });
+    state.folderPickerTrigger?.focus({ preventScroll: true });
   }
 }
 
@@ -2145,6 +2150,8 @@ async function loadFolderPicker(path) {
 }
 
 function renderFolderPicker() {
+  elements.folderPickerTitle.textContent = state.folderPickerField === "speculative_draft_model_path"
+    ? t("Choose a draft model file or folder") : t("Choose a model file or folder");
   const drives = state.folderPickerResult?.drives || [];
   elements.folderPickerDriveField.classList.toggle("hidden", !drives.length);
   elements.folderPickerDrive.replaceChildren();
@@ -2252,11 +2259,11 @@ function renderFolderPicker() {
 function selectCurrentFolder() {
   const path = state.folderPickerSelectedFile || state.folderPickerResult?.path;
   if (!path) return;
-  const modelInput = elements.launchForm.querySelector('[data-field="model"]');
-  modelInput.value = path;
-  modelInput.dispatchEvent(new Event("input", { bubbles: true }));
+  const input = elements.launchForm.querySelector(`[data-field="${state.folderPickerField}"]`);
+  input.value = path;
+  input.dispatchEvent(new Event("input", { bubbles: true }));
   closeFolderPicker(false);
-  modelInput.focus({ preventScroll: true });
+  input.focus({ preventScroll: true });
 }
 
 async function loadHardware() {
