@@ -667,6 +667,13 @@ if (UNIT_TEST)
     target_link_libraries(contextExtensionRegression fastllm)
     add_test(NAME context_extension_cpu COMMAND contextExtensionRegression)
     if (USE_CUDA AND NOT USE_ROCM)
+        add_executable(qwen35_streaming_weights_test test/basic/test_qwen35_streaming_weights.cpp)
+        target_link_libraries(qwen35_streaming_weights_test PRIVATE fastllm)
+        add_test(NAME qwen35_streaming_tp_weights COMMAND qwen35_streaming_weights_test)
+        add_test(NAME qwen35_streaming_single_gpu_weights COMMAND qwen35_streaming_weights_test --single)
+        set_tests_properties(qwen35_streaming_tp_weights qwen35_streaming_single_gpu_weights
+                             PROPERTIES LABELS cuda SKIP_RETURN_CODE 77)
+
         target_include_directories(regressionOps PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         target_include_directories(contextExtensionRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         add_test(NAME context_extension_cuda COMMAND contextExtensionRegression --cuda)

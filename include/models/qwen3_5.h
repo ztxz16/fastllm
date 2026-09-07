@@ -293,7 +293,7 @@ namespace fastllm {
         std::unordered_map <int, std::vector <std::vector <Data*> > > singleGpuMoeBiass;
         bool moeWeightsPrepared = false;
         bool gdnMergedWeightsPrepared = false;
-        bool ggufGdnLayoutRestored = false;
+        std::set<int> ggufGdnRestoredLayers;
         std::vector <int> mrope_sections = {11, 11, 10};
         bool visionPrepared = false;
         int vision_depth = 0;
@@ -334,8 +334,8 @@ namespace fastllm {
         std::vector <std::map <int, std::vector <std::pair <int, int> > > > threadTpLinearConvSchemes;
         std::map <int, std::vector <std::pair <int, int> > > threadTpLmHeadScheme;
         std::vector <uint8_t> threadTpLinearAttentionLayers;
-        bool streamingTpLoadEnabled = false;
-        int streamingTpCurrentLoadGroup = -1;
+        bool streamingCudaLoadEnabled = false;
+        int streamingCudaCurrentLoadGroup = -1;
         std::unordered_map <int, Data*> mtpDraftLmHeadWeights;
         PersistentWorkerGroup threadTpWorkerGroup;
 
@@ -382,9 +382,11 @@ namespace fastllm {
                                              std::map <int, int> ratios);
         void PrepareFusedMoeWeightsForDevices(const std::vector <int> &devices,
                                               std::map <int, int> ratios);
-        void RestoreGgufGdnWeights();
+        void RestoreGgufGdnWeights(int firstLayer, int lastLayer);
         void PrepareGdnWeights();
+        void PrepareGdnWeights(int firstLayer, int lastLayer);
 #ifdef USE_CUDA
+        void PrepareStreamingSingleCudaLayer(int layer, int device);
         void PrepareStreamingTpLayer(
                 int layer, const std::vector<int> &devices,
                 std::map<int, int> ratios);

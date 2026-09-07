@@ -130,7 +130,7 @@ namespace fastllm {
         return pos < name.size() && name[pos] == '.' ? layer : -1;
     }
 
-    static int Qwen35StreamingTpLoadGroup(
+    static int Qwen35StreamingCudaLoadGroup(
             const std::string &tensorName,
             const std::vector<std::pair<std::string, DataType>> &mappedWeights,
             int blockCount) {
@@ -24097,6 +24097,32 @@ namespace fastllm {
     }
 
 #ifdef USE_CUDA
+    void Qwen3_5Model::PrepareStreamingSingleCudaLayer(int layer, int device) {
+        const std::string prefix = language_prefix + "layers." +
+                                   std::to_string(layer) + ".";
+        // Match the projection layout used by the existing single-GPU
+        // forward before releasing any CPU source required for merging.
+        PrepareGdnWeights(layer, layer + 1);
+        if (this->weight.weight.count(prefix + "linear_attn.in_proj_qkvzba.weight") != 0) {
+            this->weight.weight.erase(prefix + "linear_attn.in_proj_qkvz.weight");
+            this->weight.weight.erase(prefix + "linear_attn.in_proj_ba.weight");
+        }
+        auto gateup = this->weight.weight.find(prefix + "mlp.gateup_proj.weight");
+        if (gateup != this->weight.weight.end()) {
+            gateup->second.tpPackType = TP_PACK_GATEUP;
+        }
+        for (auto &item : this->weight.weight) {
+            Data &data = item.second;
+            if (!StartWith(item.first, prefix) || data.dims.size() < 2) {
+                continue;
+            }
+            // Small vectors, including RMSNorm offsets that Add1 still
+            // processes on the CPU, retain their normal preparation path.
+            // Matrices and Conv1d weights account for the layer's large buffers.
+            data.ToDevice(DataDevice::CUDA, {device}, true);
+        }
+    }
+
     static void Qwen35PrepareInt4TpShards(
             Data &data, const std::vector<int> &devices) {
         if (data.dataType != DataType::INT4_GROUP || !data.multiDeviceData) {
@@ -24114,7 +24140,7 @@ namespace fastllm {
     void Qwen3_5Model::PrepareStreamingTpLayer(
             int layer, const std::vector<int> &devices,
             std::map<int, int> ratios) {
-        if (!streamingTpLoadEnabled || layer < 0 || layer >= block_cnt ||
+        if (!streamingCudaLoadEnabled || layer < 0 || layer >= block_cnt ||
             devices.size() <= 1) {
             return;
         }
@@ -24155,8 +24181,25 @@ namespace fastllm {
             DivisionScheme qkvScheme = BuildQwen35GatedAttentionQkvScheme(
                 devices, ratios, num_attention_heads, num_key_value_heads,
                 head_dim);
-            splitLinear(mergeQkvWeightName, mergeQkvBiasName,
-                        qkvScheme, 0, false);
+            if (this->weight.weight.count(mergeQkvWeightName) != 0) {
+                splitLinear(mergeQkvWeightName, mergeQkvBiasName,
+                            qkvScheme, 0, false);
+            } else {
+                // Mixed GGUF quantization types cannot share merged storage.
+                // Match ForwardGPU's common head assignment for q/k/v.
+                const std::string qName = prefix + "self_attn.q_proj.weight";
+                BalanceMultiCudaDivisionSchemeByLayer(qName, devices, qkvScheme);
+                const int qGateWidth = num_attention_heads * head_dim * 2;
+                const int kvWidth = num_key_value_heads * head_dim;
+                DivisionScheme qScheme = ExtractQwen35PackedRangeScheme(qkvScheme, 0, 0);
+                DivisionScheme kScheme = ExtractQwen35PackedRangeScheme(qkvScheme, 1, qGateWidth);
+                DivisionScheme vScheme = ExtractQwen35PackedRangeScheme(qkvScheme, 2, qGateWidth + kvWidth);
+                splitLinear(qName, prefix + "self_attn.q_proj.bias", qScheme, 0, true);
+                splitLinear(prefix + "self_attn.k_proj.weight",
+                            prefix + "self_attn.k_proj.bias", kScheme, 0, true);
+                splitLinear(prefix + "self_attn.v_proj.weight",
+                            prefix + "self_attn.v_proj.bias", vScheme, 0, true);
+            }
 
             DivisionScheme oScheme =
                 ExtractQwen35AttentionOutputScheme(qkvScheme);
@@ -24165,6 +24208,10 @@ namespace fastllm {
         } else {
             const std::string qkvzWeightName =
                 prefix + "linear_attn.in_proj_qkvz.weight";
+            const std::string qkvWeightName =
+                prefix + "linear_attn.in_proj_qkv.weight";
+            const std::string zWeightName =
+                prefix + "linear_attn.in_proj_z.weight";
             const std::string baWeightName =
                 prefix + "linear_attn.in_proj_ba.weight";
             const std::string qkvzbaWeightName =
@@ -24178,13 +24225,10 @@ namespace fastllm {
             const std::string outWeightName =
                 prefix + "linear_attn.out_proj.weight";
 
+            PrepareGdnWeights(layer, layer + 1);
             Data &convWeight = requireWeight(convWeightName);
-            if (convWeight.dims.size() == 2) {
-                convWeight.Reshape(
-                    {convWeight.dims[0], 1, convWeight.dims[1]});
-            }
 
-            bool hasMergedGdnInLinear =
+            const bool hasMergedGdnInLinear =
                 this->weight.weight.find(qkvzbaWeightName) !=
                 this->weight.weight.end();
             const bool hasQkvzGdnInLinear =
@@ -24193,30 +24237,20 @@ namespace fastllm {
             const bool hasBaGdnInLinear =
                 this->weight.weight.find(baWeightName) !=
                 this->weight.weight.end();
+            const bool hasSeparateQkvZ =
+                this->weight.weight.count(qkvWeightName) != 0 &&
+                this->weight.weight.count(zWeightName) != 0;
             AssertInFastLLM(
                 hasMergedGdnInLinear ||
-                    (hasQkvzGdnInLinear && hasBaGdnInLinear),
-                "Qwen3.5 streaming TP load requires qkvzba or qkvz/ba "
-                "weights.\n");
-
-            // Some AWQ checkpoints quantize qkvz but leave ba in BF16. Those
-            // tensors cannot share a merged storage representation, so retain
-            // the separate TP layout already supported by ForwardGPU.
-            if (!hasMergedGdnInLinear) {
-                Data &qkvz = requireWeight(qkvzWeightName);
-                Data &ba = requireWeight(baWeightName);
-                Data &merged = this->weight.weight[qkvzbaWeightName];
-                hasMergedGdnInLinear = CreateMergedLinearWeight(
-                    qkvz, ba, qkvzbaWeightName, merged);
-                if (!hasMergedGdnInLinear) {
-                    this->weight.weight.erase(qkvzbaWeightName);
-                }
-            }
+                    ((hasQkvzGdnInLinear || hasSeparateQkvZ) && hasBaGdnInLinear),
+                "Qwen3.5 streaming TP load requires qkvzba, qkvz/ba, or "
+                "qkv/z/ba weights.\n");
 
             DivisionScheme keyScheme = BuildQwen35LinearKeyHeadScheme(
                 devices, ratios, num_k_heads);
             BalanceMultiCudaDivisionSchemeByLayer(
-                hasMergedGdnInLinear ? qkvzbaWeightName : qkvzWeightName,
+                hasMergedGdnInLinear ? qkvzbaWeightName :
+                    (hasQkvzGdnInLinear ? qkvzWeightName : qkvWeightName),
                 devices, keyScheme);
             DivisionScheme valueScheme = BuildQwen35LinearValueHeadScheme(
                 keyScheme, num_v_heads / num_k_heads);
@@ -24232,11 +24266,19 @@ namespace fastllm {
                 this->weight.weight.erase(qkvzWeightName);
                 this->weight.weight.erase(baWeightName);
             } else {
-                DivisionScheme qkvzScheme = BuildQwen35LinearQkvzScheme(
-                    keyScheme, num_k_heads, num_v_heads, head_k_dim,
-                    head_v_dim);
-                splitLinear(qkvzWeightName, qkvzWeightName + ".tp_bias",
-                            qkvzScheme, 0, true);
+                if (hasQkvzGdnInLinear) {
+                    DivisionScheme qkvzScheme = BuildQwen35LinearQkvzScheme(
+                        keyScheme, num_k_heads, num_v_heads, head_k_dim,
+                        head_v_dim);
+                    splitLinear(qkvzWeightName, qkvzWeightName + ".tp_bias",
+                                qkvzScheme, 0, true);
+                } else {
+                    DivisionScheme qkvScheme = BuildQwen35LinearQkvScheme(
+                        keyScheme, num_k_heads, num_v_heads, head_k_dim, head_v_dim);
+                    DivisionScheme zScheme = ScaleQwen35DivisionScheme(valueScheme, head_v_dim);
+                    splitLinear(qkvWeightName, qkvWeightName + ".tp_bias", qkvScheme, 0, true);
+                    splitLinear(zWeightName, zWeightName + ".tp_bias", zScheme, 0, true);
+                }
 
                 DivisionScheme baScheme = BuildQwen35LinearBaScheme(
                     valueScheme, num_v_heads);
@@ -24276,20 +24318,34 @@ namespace fastllm {
         const std::string gateupWeightName =
             prefix + "mlp.gateup_proj.weight";
         const std::string downWeightName = prefix + "mlp.down_proj.weight";
-        Data &gateup = requireWeight(gateupWeightName);
-        gateup.tpLinearType = TP_LINEAR_ROW;
-        gateup.tpPackType = TP_PACK_GATEUP;
-        std::vector<int> devCopy = devices;
-        DivisionScheme gateScheme =
-            BuildMultiCudaRowSplitScheme(gateup, devCopy, ratios);
-        BalanceMultiCudaPairedHalfDivisionSchemeSizesByLayer(
-            gateupWeightName, devices, gateScheme, gateup.dims[0] / 2);
-        splitLinear(gateupWeightName, gateupWeightName + ".tp_bias",
-                    gateScheme, 0, true);
+        DivisionScheme downScheme;
+        if (this->weight.weight.count(gateupWeightName) != 0) {
+            Data &gateup = requireWeight(gateupWeightName);
+            gateup.tpLinearType = TP_LINEAR_ROW;
+            gateup.tpPackType = TP_PACK_GATEUP;
+            std::vector<int> devCopy = devices;
+            DivisionScheme gateScheme =
+                BuildMultiCudaRowSplitScheme(gateup, devCopy, ratios);
+            BalanceMultiCudaPairedHalfDivisionSchemeSizesByLayer(
+                gateupWeightName, devices, gateScheme, gateup.dims[0] / 2);
+            splitLinear(gateupWeightName, gateupWeightName + ".tp_bias",
+                        gateScheme, 0, true);
+            downScheme = ExtractQwen35FirstRangeScheme(gateScheme);
+        } else {
+            const std::string gateName = prefix + "mlp.gate_proj.weight";
+            const std::string upName = prefix + "mlp.up_proj.weight";
+            Data &gate = requireWeight(gateName);
+            gate.tpLinearType = TP_LINEAR_ROW;
+            requireWeight(upName).tpLinearType = TP_LINEAR_ROW;
+            std::vector<int> devCopy = devices;
+            downScheme = BuildMultiCudaRowSplitScheme(gate, devCopy, ratios);
+            BalanceMultiCudaDivisionSchemeByLayer(gateName, devices, downScheme);
+            splitLinear(gateName, gateName + ".tp_bias", downScheme, 0, true);
+            splitLinear(upName, upName + ".tp_bias", downScheme, 0, true);
+        }
 
         Data &down = requireWeight(downWeightName);
         down.tpLinearType = TP_LINEAR_COLUMN;
-        DivisionScheme downScheme = ExtractQwen35FirstRangeScheme(gateScheme);
         splitLinear(downWeightName, prefix + "mlp.down_proj.bias",
                     downScheme, 1, true);
     }
@@ -24301,19 +24357,28 @@ namespace fastllm {
         consumedFusedMoeSourceWeights.clear();
         moeFusedLayerPlanned.clear();
         moeFusedWeightsPrepared = false;
-        streamingTpLoadEnabled = false;
-        streamingTpCurrentLoadGroup = -1;
+        streamingCudaLoadEnabled = false;
+        streamingCudaCurrentLoadGroup = -1;
 #ifdef USE_CUDA
         std::vector<int> streamingDevices;
         std::map<int, int> streamingRatios;
-        if (num_experts <= 0 && block_cnt > 0 && !dflashEnabled &&
+        // Only target decoder layers and lm_head belong to streaming groups.
+        // DFlash's separate draft weights can keep their existing load/prepare
+        // path without retaining the entire target model on the host.
+        if (num_experts <= 0 && block_cnt > 0 &&
             Qwen35DeviceMapAllCuda(this->deviceMap) &&
-            GetQwen35ThreadTpDevices(this->deviceMap, streamingDevices,
-                                     streamingRatios)) {
+            GetQwen35GPUForwardDevices(this->deviceMap, streamingDevices,
+                                      streamingRatios) &&
+            (streamingDevices.size() > 1 ||
+             (!GetLowMemMode() && !GetKVCacheInCPU()))) {
             auto has = [&](const std::string &name) {
                 return allWeightNames.find(name) != allWeightNames.end();
             };
-            bool complete = has("lm_head.weight");
+            // Single-GPU tied-embedding models create lm_head at warmup.
+            // Their decoder layers can already stream independently.
+            bool complete = has("lm_head.weight") ||
+                (streamingDevices.size() == 1 &&
+                 has(language_prefix + "embed_tokens.weight"));
             for (int layer = 0; layer < block_cnt && complete; layer++) {
                 const std::string prefix = language_prefix + "layers." +
                                            std::to_string(layer) + ".";
@@ -24339,7 +24404,7 @@ namespace fastllm {
                 complete = hasDenseMlp &&
                            (hasFullAttention || hasLinearAttention);
             }
-            streamingTpLoadEnabled = complete;
+            streamingCudaLoadEnabled = complete;
         }
 
         if (Qwen35MoeDisableFusedMoe() ||
@@ -24494,8 +24559,8 @@ namespace fastllm {
     int Qwen3_5Model::GetWeightLoadPriority(
             const std::string &tensorName,
             const std::vector <std::pair <std::string, DataType> > &mappedWeights) const {
-        if (streamingTpLoadEnabled) {
-            const int group = Qwen35StreamingTpLoadGroup(
+        if (streamingCudaLoadEnabled) {
+            const int group = Qwen35StreamingCudaLoadGroup(
                 tensorName, mappedWeights, block_cnt);
             if (group >= 0) {
                 return 100000 + group;
@@ -24520,8 +24585,8 @@ namespace fastllm {
     bool Qwen3_5Model::ShouldLoadWeightSeriallyBeforeOthers(
             const std::string &tensorName,
             const std::vector <std::pair <std::string, DataType> > &mappedWeights) const {
-        if (streamingTpLoadEnabled &&
-            Qwen35StreamingTpLoadGroup(
+        if (streamingCudaLoadEnabled &&
+            Qwen35StreamingCudaLoadGroup(
                 tensorName, mappedWeights, block_cnt) >= 0) {
             return true;
         }
@@ -24540,8 +24605,8 @@ namespace fastllm {
     }
 
     void Qwen3_5Model::OnWeightLoadGroupStarted(const std::set<std::string> &weightNames) {
-        streamingTpCurrentLoadGroup = -1;
-        if (streamingTpLoadEnabled) {
+        streamingCudaCurrentLoadGroup = -1;
+        if (streamingCudaLoadEnabled) {
             for (const auto &weightName : weightNames) {
                 const int layer = Qwen35MainLayerFromWeightName(weightName);
                 const int group = layer >= 0 && layer < block_cnt
@@ -24549,10 +24614,10 @@ namespace fastllm {
                     : (weightName == "lm_head.weight" ? block_cnt : -1);
                 if (group >= 0) {
                     AssertInFastLLM(
-                        streamingTpCurrentLoadGroup == -1 ||
-                            streamingTpCurrentLoadGroup == group,
-                        "Qwen3.5 streaming TP load group mixed multiple layers.\n");
-                    streamingTpCurrentLoadGroup = group;
+                        streamingCudaCurrentLoadGroup == -1 ||
+                            streamingCudaCurrentLoadGroup == group,
+                        "Qwen3.5 streaming CUDA load group mixed multiple layers.\n");
+                    streamingCudaCurrentLoadGroup = group;
                 }
             }
         }
@@ -24667,38 +24732,49 @@ namespace fastllm {
             consumedFusedMoeSourceWeights.clear();
         }
 
-        const int streamingGroup = streamingTpCurrentLoadGroup;
+        const int streamingGroup = streamingCudaCurrentLoadGroup;
         const bool finishedStreamingGroup =
-            streamingTpLoadEnabled && streamingGroup >= 0;
+            streamingCudaLoadEnabled && streamingGroup >= 0;
 #ifdef USE_CUDA
         if (finishedStreamingGroup) {
             std::vector<int> devices;
             std::map<int, int> ratios;
             AssertInFastLLM(
-                GetQwen35ThreadTpDevices(this->deviceMap, devices, ratios),
-                "Qwen3.5 streaming TP device configuration disappeared during load.\n");
+                GetQwen35GPUForwardDevices(this->deviceMap, devices, ratios),
+                "Qwen3.5 streaming CUDA device configuration disappeared during load.\n");
             if (streamingGroup < block_cnt) {
-                PrepareStreamingTpLayer(streamingGroup, devices, ratios);
+                // GGUF stores GDN value heads in tiled order. Restore this
+                // layer while its CPU weights still exist, exactly once.
+                RestoreGgufGdnWeights(streamingGroup, streamingGroup + 1);
+                if (devices.size() == 1) {
+                    PrepareStreamingSingleCudaLayer(streamingGroup, devices[0]);
+                } else {
+                    PrepareStreamingTpLayer(streamingGroup, devices, ratios);
+                }
             } else if (streamingGroup == block_cnt) {
                 auto lmHeadIt = this->weight.weight.find("lm_head.weight");
                 AssertInFastLLM(lmHeadIt != this->weight.weight.end(),
-                                "Qwen3.5 streaming TP load is missing lm_head.weight.\n");
+                                "Qwen3.5 streaming CUDA load is missing lm_head.weight.\n");
                 Data &lmHead = lmHeadIt->second;
-                std::vector<int> devCopy = devices;
-                DivisionScheme scheme =
-                    BuildMultiCudaRowSplitScheme(lmHead, devCopy, ratios);
-                Data &bias = GetThreadTensorParallelBias(
-                    "lm_head.weight.tp_bias");
-                AssertInFastLLM(
-                    SplitMultiCudaWeight(
-                        lmHead, bias, devCopy, scheme, 0, true,
-                        lmHead.dataType == DataType::INT4_GROUP),
-                    "Qwen3.5 streaming TP load failed to split lm_head.weight.\n");
-                Qwen35PrepareInt4TpShards(lmHead, devices);
+                if (devices.size() == 1) {
+                    lmHead.ToDevice(DataDevice::CUDA, devices, true);
+                } else {
+                    std::vector<int> devCopy = devices;
+                    DivisionScheme scheme =
+                        BuildMultiCudaRowSplitScheme(lmHead, devCopy, ratios);
+                    Data &bias = GetThreadTensorParallelBias(
+                        "lm_head.weight.tp_bias");
+                    AssertInFastLLM(
+                        SplitMultiCudaWeight(
+                            lmHead, bias, devCopy, scheme, 0, true,
+                            lmHead.dataType == DataType::INT4_GROUP),
+                        "Qwen3.5 streaming TP load failed to split lm_head.weight.\n");
+                    Qwen35PrepareInt4TpShards(lmHead, devices);
+                }
             }
         }
 #endif
-        streamingTpCurrentLoadGroup = -1;
+        streamingCudaCurrentLoadGroup = -1;
 #if defined(__linux__) && defined(__GLIBC__)
         if (finishedStreamingGroup) {
             // Return this decoder/lm_head group's temporary loader allocations
@@ -24708,19 +24784,11 @@ namespace fastllm {
 #endif
     }
 
-    void Qwen3_5Model::RestoreGgufGdnWeights() {
-        if (ggufGdnLayoutRestored) {
-            return;
-        }
-        AssertInFastLLM(
-            num_k_heads > 0 && num_v_heads > 0 &&
-                num_v_heads % num_k_heads == 0 &&
-                head_k_dim > 0 && head_v_dim > 0,
-            "Qwen3.5 GGUF GDN metadata is incomplete.\n");
-
-        const int kd = num_k_heads * head_k_dim;
-        const int vd = num_v_heads * head_v_dim;
-        for (int layer = 0; layer < block_cnt; layer++) {
+    void Qwen3_5Model::RestoreGgufGdnWeights(int firstLayer, int lastLayer) {
+        for (int layer = firstLayer; layer < lastLayer; layer++) {
+            if (ggufGdnRestoredLayers.count(layer) != 0) {
+                continue;
+            }
             const std::string prefix = language_prefix + "layers." +
                 std::to_string(layer) + ".linear_attn.";
             const std::string outName = prefix + "out_proj.weight";
@@ -24730,6 +24798,14 @@ namespace fastllm {
                 continue;
             }
 
+            AssertInFastLLM(
+                num_k_heads > 0 && num_v_heads > 0 &&
+                    num_v_heads % num_k_heads == 0 &&
+                    head_k_dim > 0 && head_v_dim > 0,
+                "Qwen3.5 GGUF GDN metadata is incomplete.\n");
+
+            const int kd = num_k_heads * head_k_dim;
+            const int vd = num_v_heads * head_v_dim;
             auto requireWeight = [&](const std::string &name) -> Data & {
                 auto it = this->weight.weight.find(name);
                 AssertInFastLLM(
@@ -24834,8 +24910,8 @@ namespace fastllm {
             requireRows(dtBias, num_v_heads, dtBiasName);
             Qwen35RestoreGgufTiledHeadRows(
                 dtBias, 0, num_v_heads, 1, num_k_heads, dtBiasName);
+            ggufGdnRestoredLayers.insert(layer);
         }
-        ggufGdnLayoutRestored = true;
     }
 
     void Qwen3_5Model::OnModelWeightsLoaded() {
@@ -24844,7 +24920,7 @@ namespace fastllm {
         for (const auto &item : this->weight.weight) {
             forceSafeGgufDequant |= item.second.forceGGUFFp32Dequant;
         }
-        RestoreGgufGdnWeights();
+        RestoreGgufGdnWeights(0, block_cnt);
 
         if (forceSafeGgufDequant) {
             for (auto &item : this->weight.weight) {
@@ -24983,7 +25059,12 @@ namespace fastllm {
             return;
         }
 
-        for (int i = 0; i < block_cnt; i++) {
+        PrepareGdnWeights(0, block_cnt);
+        gdnMergedWeightsPrepared = true;
+    }
+
+    void Qwen3_5Model::PrepareGdnWeights(int firstLayer, int lastLayer) {
+        for (int i = firstLayer; i < lastLayer; i++) {
             std::string conv1dWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.conv1d.weight";
             auto conv1dIt = this->weight.weight.find(conv1dWeightName);
             if (conv1dIt != this->weight.weight.end() && conv1dIt->second.dims.size() == 2) {
@@ -25017,8 +25098,6 @@ namespace fastllm {
                 this->weight.weight.erase(mergedWeightName);
             }
         }
-
-        gdnMergedWeightsPrepared = true;
     }
 
     void Qwen3_5Model::PrepareVision() {
@@ -30022,15 +30101,12 @@ namespace fastllm {
                         this->weight.weight.end() &&
                     this->weight.weight.find(zWeightName) !=
                         this->weight.weight.end();
-                AssertInFastLLM(
-                    hasQkvzGdnInLinear || hasSeparateQkvZGdnInLinear,
-                    "Qwen3.5 forward requires qkvz or separate qkv/z GDN weights.\n");
-                int mixedQkvzDim = hasQkvzGdnInLinear ?
-                    this->weight[qkvzWeightName].dims[0] :
-                    this->weight[qkvWeightName].dims[0] +
-                        this->weight[zWeightName].dims[0];
-                int baMergedDim = this->weight[baWeightName].dims[0];
                 bool hasMergedGdnInLinear = this->weight.weight.find(qkvzbaWeightName) != this->weight.weight.end();
+                AssertInFastLLM(
+                    hasMergedGdnInLinear || hasQkvzGdnInLinear || hasSeparateQkvZGdnInLinear,
+                    "Qwen3.5 forward requires qkvzba, qkvz, or separate qkv/z GDN weights.\n");
+                int mixedQkvzDim = kd * 2 + vd * 2;
+                int baMergedDim = num_v_heads * 2;
                 if (hasMergedGdnInLinear && !isSingleTokenDecode &&
                     attenInput.dataDevice == DataDevice::CUDA &&
                     this->weight[qkvzbaWeightName].dataDevice != DataDevice::CUDA) {
@@ -30040,7 +30116,11 @@ namespace fastllm {
                         this->weight[qkvzbaWeightName].ToDevice(DataDevice::CUDA);
                     }
                 }
-                bool useMergedGdnInLinear = (isSingleTokenDecode || isFusedBatchDecode) && hasMergedGdnInLinear;
+                // Streaming may retain only the merged projection. It also
+                // serves prefill and multimodal hidden-state forwarding.
+                bool useMergedGdnInLinear = hasMergedGdnInLinear &&
+                    (isSingleTokenDecode || isFusedBatchDecode ||
+                     (!hasQkvzGdnInLinear && !hasSeparateQkvZGdnInLinear));
 
                 Data gdn_in_merged, mixed_qkvz, ba_merged, qkvConvInput, z, b, a, g;
                 bool projectedQkvZSplitReady = false;
@@ -31669,15 +31749,12 @@ namespace fastllm {
                         this->weight.weight.end() &&
                     this->weight.weight.find(zWeightName) !=
                         this->weight.weight.end();
-                AssertInFastLLM(
-                    hasQkvzGdnInLinear || hasSeparateQkvZGdnInLinear,
-                    "Qwen3.5 forward requires qkvz or separate qkv/z GDN weights.\n");
-                int mixedQkvzDim = hasQkvzGdnInLinear ?
-                    this->weight[qkvzWeightName].dims[0] :
-                    this->weight[qkvWeightName].dims[0] +
-                        this->weight[zWeightName].dims[0];
-                int baMergedDim = this->weight[baWeightName].dims[0];
                 bool hasMergedGdnInLinear = this->weight.weight.find(qkvzbaWeightName) != this->weight.weight.end();
+                AssertInFastLLM(
+                    hasMergedGdnInLinear || hasQkvzGdnInLinear || hasSeparateQkvZGdnInLinear,
+                    "Qwen3.5 forward requires qkvzba, qkvz, or separate qkv/z GDN weights.\n");
+                int mixedQkvzDim = kd * 2 + vd * 2;
+                int baMergedDim = num_v_heads * 2;
                 if (hasMergedGdnInLinear && !isSingleTokenDecode &&
                     attenInput.dataDevice == DataDevice::CUDA &&
                     this->weight[qkvzbaWeightName].dataDevice != DataDevice::CUDA) {
@@ -31687,7 +31764,11 @@ namespace fastllm {
                         this->weight[qkvzbaWeightName].ToDevice(DataDevice::CUDA);
                     }
                 }
-                bool useMergedGdnInLinear = (isSingleTokenDecode || isFusedBatchDecode) && hasMergedGdnInLinear;
+                // Streaming may retain only the merged projection. It also
+                // serves prefill and multimodal hidden-state forwarding.
+                bool useMergedGdnInLinear = hasMergedGdnInLinear &&
+                    (isSingleTokenDecode || isFusedBatchDecode ||
+                     (!hasQkvzGdnInLinear && !hasSeparateQkvZGdnInLinear));
 
                 Data gdn_in_merged, mixed_qkvz, ba_merged, qkvConvInput, z, b, a, g;
                 bool projectedQkvZSplitReady = false;
