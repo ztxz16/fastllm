@@ -104,7 +104,7 @@ function buildFtllmEnvironment(runtimeRoot, dataRoot, baseEnvironment = process.
   }
 
   environment.FTLLM_HOME = runtimeRoot;
-  environment.PATH = `${pythonBin}:${environment.PATH || "/usr/bin:/bin"}`;
+  environment.PATH = `${runtimeRoot}:${pythonBin}:${environment.PATH || "/usr/bin:/bin"}`;
   environment.PYTHONDONTWRITEBYTECODE = "1";
   environment.PYTHONNOUSERSITE = "1";
   environment.PYTHONUNBUFFERED = "1";

@@ -5,41 +5,71 @@
 ripgrep 和 fd。
 不要把本目录中的 `runtime` 单独移动出去。
 
-## 直接使用
+## 命令行使用（不需要桌面）
+
+在解压目录打开终端，把下面的模型路径替换为本机模型目录或 GGUF 文件：
 
 ```bash
 ./ftllm-check --require-cuda
 ./ftllm --version
 ./ftllm --help
-./ftllm launch
-./ftllm-agent-runtime info
-./ftllm chat /path/to/model
-./ftllm serve /path/to/model --port 8080
+./ftllm server /path/to/model --device cuda:0 --host 127.0.0.1 --port 8080
+./ftllm chat /path/to/model --device cuda:0
+./ftllm tui --plain
 ```
+
+`server` 提供 OpenAI 兼容 API，地址为 `http://127.0.0.1:8080/v1`；`serve` 是它的别名。
+使用 `./ftllm server --help` 查看参数，在前台运行时按 `Ctrl+C` 停止服务。
+
+在当前 Bash 会话中启用不带 `./` 的命令：
+
+```bash
+source ./env.sh
+ftllm server /path/to/model --device cuda:0 --port 8080
+ftllm launch --no-browser
+```
+
+## 网页 Launcher
+
+独立启动脚本与命令行子命令等价，均不依赖 Electron 或图形桌面：
+
+```bash
+./launch.sh
+# 等价于 ./ftllm launch；默认打开本机浏览器
+```
+
+没有桌面的服务器上，可禁止自动打开浏览器，并从其他电脑访问：
+
+```bash
+./launch.sh --no-browser --host 0.0.0.0 --port 8000
+# 等价于 ./ftllm launch --no-browser --host 0.0.0.0 --port 8000
+```
+
+在另一台电脑的浏览器中打开终端打印的服务器地址，保留 URL 中的 `token` 参数。
+远程访问需要网络和防火墙允许该端口；Launcher 可启动进程和执行 Agent 任务，仅向可信用户开放。
 
 启动模型后可在 Launcher 的“工作室”中使用目录 Agent，无需另外安装 Node.js、npm
 或 Pi。目录 Agent 默认启用，可通过 `./ftllm launch --disable-workspace-agent` 关闭；
 使用 `--agent-workspace-root /path/to/projects` 指定项目根目录。
 
-需要用同一环境运行自己的脚本时：
+## 内置运行时
+
+需要用同一环境运行自己的脚本或检查 Agent 时：
 
 ```bash
 ./python your_script.py
 ./pip list
+./ftllm-agent-runtime info
 ```
 
-需要让当前 Bash 会话中的 `python3`、`streamlit` 等命令都指向绿色包时：
-
-```bash
-source ./env.sh
-```
+`source ./env.sh` 也会让当前 Bash 会话中的 `python3` 等命令指向绿色包。
 
 ## 宿主机要求
 
 - x86_64 Linux；面向 Ubuntu 22.04、24.04、26.04。
 - glibc 2.35 或更高。构建脚本会扫描包内每个 ELF，阻止高于该基线的产物。
 - NVIDIA GPU Compute Capability 6.0 或更高；当前 ftllm wheel 含
-  SM60、70、75、80、89、90、100、120 原生代码。未来高于 SM120 的新架构需重新构建 wheel。
+  SM60、70、75、80、86、89、90、100、120 原生代码。未来高于 SM120 的新架构需重新构建 wheel。
 - CUDA 12 minor-version compatibility 的最低 Linux 驱动为
   @MIN_NVIDIA_DRIVER@；推荐 @RECOMMENDED_NVIDIA_DRIVER@ 或更新版本。
 - 不需要安装 Python、pip、CUDA Toolkit、cuBLAS 或 NCCL。NVIDIA 内核/用户态驱动

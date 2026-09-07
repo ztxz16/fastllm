@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Start the bundled browser launcher and verify its authenticated API."""
+"""Start a portable Launcher without a desktop and verify its authenticated API."""
 
 from __future__ import annotations
 
@@ -45,22 +45,39 @@ def stop_process_group(process: subprocess.Popen[str]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("bundle", type=Path, help="Desktop bundle root")
+    parser.add_argument("bundle", type=Path, help="Portable bundle root")
+    parser.add_argument("--entrypoint", choices=("ftllm", "launch.sh"), default="ftllm")
     args = parser.parse_args()
-    executable = args.bundle.resolve() / "ftllm" / "ftllm"
+    bundle = args.bundle.resolve()
+    executable = bundle / args.entrypoint
     if not executable.is_file():
         parser.error(f"missing bundled ftllm executable: {executable}")
 
     port = available_port()
-    with tempfile.TemporaryDirectory(prefix="ftllm-desktop-smoke-") as temporary:
-        config = Path(temporary) / "config.json"
+    with tempfile.TemporaryDirectory(prefix="ftllm-portable-smoke-") as temporary:
+        config = Path(temporary) / "config with spaces.json"
         environment = os.environ.copy()
+        environment.pop("DISPLAY", None)
+        environment.pop("WAYLAND_DISPLAY", None)
         environment["XDG_CONFIG_HOME"] = str(Path(temporary) / "xdg-config")
         environment["XDG_CACHE_HOME"] = str(Path(temporary) / "xdg-cache")
+        if args.entrypoint == "ftllm":
+            subprocess.run(
+                [
+                    "bash", "--noprofile", "--norc", "-e", "-c",
+                    'source "$1/env.sh"\n'
+                    '[[ "$(command -v ftllm)" == "$1/ftllm" ]]\n'
+                    'ftllm server --help',
+                    "portable-cli-smoke", str(bundle),
+                ],
+                check=True, timeout=30, cwd=temporary, env=environment,
+                stdout=subprocess.DEVNULL,
+            )
+        command = [str(executable)]
+        if args.entrypoint == "ftllm":
+            command.append("launch")
         process = subprocess.Popen(
-            [
-                str(executable),
-                "launch",
+            command + [
                 "--host",
                 "127.0.0.1",
                 "--port",
@@ -74,6 +91,7 @@ def main() -> int:
             text=True,
             bufsize=1,
             env=environment,
+            cwd=temporary,
             start_new_session=True,
         )
         lines: "queue.Queue[str]" = queue.Queue()
@@ -128,7 +146,7 @@ def main() -> int:
         finally:
             stop_process_group(process)
 
-    print("Launcher backend smoke test passed.")
+    print(f"Headless Launcher smoke test passed: {args.entrypoint}.")
     return 0
 
 

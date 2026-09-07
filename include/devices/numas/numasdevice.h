@@ -54,6 +54,14 @@ namespace fastllm {
     bool IsNumasLinearWeightSupported(const Data *weight);
     bool IsNumasLinearWeightRegistered(const Data *weight);
 
+    // Single-token SwiGLU subsets using already registered NUMA shards. Each
+    // selected route writes its unweighted FP32 result at route * hidden.
+    // The caller owns host input/output and serializes the layer workspace.
+    bool CanRunNumasMoeDecodeExperts(Data *const *weights, int weightsBatch);
+    void NumasMoeDecodeExperts(const float *input, float *output,
+        Data **weights, const int32_t *indices, const int32_t *gpuIndices,
+        int topk, int layer);
+
     // NUMA MoE keeps reusable host/CUDA staging buffers outside the model.
     // Release them explicitly while the CUDA allocator is still alive.
     void ClearNumasMoeRuntimeCache();

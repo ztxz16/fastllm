@@ -6,6 +6,15 @@ Python、CUDA Toolkit、cuBLAS、NCCL 或 Python 包。
 包内同时包含 Pi Agent 和 FastLLM 桥接扩展，启动模型后可直接使用“工作室”中的目录 Agent。
 目录搜索所需的 ripgrep、fd 也会随包提供，不依赖目标机器预先安装这些工具。
 
+## 使用入口
+
+解压目录直接提供 `./ftllm server ...`、`./ftllm launch ...` 等命令，以及独立的
+`./launch.sh` 网页启动脚本。无桌面服务器使用 `./launch.sh --no-browser`；有桌面时
+也可以运行 `./FastLLM-Launcher` 打开 Electron 窗口。`source ./env.sh` 后可直接输入
+`ftllm` 命令。成品根目录的 `README.md` 包含模型服务、远程网页访问和环境检查示例。
+
+桌面资源与命令行运行时共用包根目录，Python 位于 `runtime/`，不再嵌套 `ftllm/` 子目录。
+
 ## 构建
 
 先生成当前源码对应的 wheel，再打桌面包：
@@ -48,5 +57,5 @@ Pi 使用 `tools/ftllm_agent_runtime/scripts/fetch_pi.py` 固定并校验的版�
 - Launcher 只监听 `127.0.0.1`，Electron 自动附加控制令牌并阻止主窗口跳转到外部页面。
 - NVIDIA 驱动库和 glibc 不会打包。驱动必须与内核匹配，而 glibc 必须与宿主系统动态
   加载器保持一致；构建时会扫描整个成品并拒绝混入 `libcuda.so` 或其他 NVIDIA 驱动库。
-- 最终用户仍需要 Linux 图形桌面（X11/Wayland）和满足基线的 glibc。这些是操作系统
-  能力，不是需要额外安装的 FastLLM 依赖。
+- 最终用户需要满足基线的 Linux/glibc；仅 Electron 桌面窗口需要 X11/Wayland。
+  `ftllm server`、`ftllm launch --no-browser` 和终端向导均可在无桌面的机器上使用。

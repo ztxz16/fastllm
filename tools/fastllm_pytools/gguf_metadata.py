@@ -118,6 +118,29 @@ def read_gguf_metadata(path, keys):
     return result
 
 
+def read_gguf_tensor_names(path):
+    """Read the tensor directory, skipping metadata values and tensor data."""
+    names = set()
+    with open(path, "rb") as stream:
+        if _read_exact(stream, 4) != b"GGUF":
+            raise ValueError("not a GGUF file: %s" % path)
+        version = _read_number(stream, "I")
+        if version not in (2, 3):
+            raise ValueError("unsupported GGUF version %d" % version)
+        tensor_count = _read_number(stream, "Q")
+        metadata_count = _read_number(stream, "Q")
+        for _ in range(metadata_count):
+            _read_string(stream, materialize=False)
+            _read_value(stream, _read_number(stream, "I"), materialize=False)
+        for _ in range(tensor_count):
+            names.add(_read_string(stream))
+            dimensions = _read_number(stream, "I")
+            if not 1 <= dimensions <= 4:
+                raise ValueError("invalid GGUF tensor dimensions")
+            _read_exact(stream, dimensions * 8 + 4 + 8)  # shape, type, offset
+    return names
+
+
 _ARCHITECTURE_CONFIGS = {
     "llama": ("llama", "LlamaForCausalLM"),
     "qwen2": ("qwen2", "Qwen2ForCausalLM"),

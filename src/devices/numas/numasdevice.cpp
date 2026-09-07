@@ -345,6 +345,7 @@ namespace fastllm {
                weight.dataType == DataType::FP8_E4M3_PERCHANNEL ||
                weight.dataType == DataType::NVFP4 ||
                weight.dataType == DataType::NVFP4_BLOCK_16 ||
+               weight.dataType == DataType::NVFP4_BLOCK_16_PLANAR ||
                weight.dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
                weight.dataType == DataType::NVFP4_BLOCK_16_E4M3 ||
                weight.dataType == DataType::NVFP4_BLOCK_32_E8M0;
@@ -1331,7 +1332,15 @@ namespace fastllm {
     };
     #endif
 
+    struct NumasMoeTaskList : MultiThreadBaseOp {
+        std::vector<MultiThreadBaseOp *> tasks;
+        void Run() override {
+            for (auto *task : tasks) task->Run();
+        }
+    };
+
     struct FastllmMoeDataManagerNumas {
+            std::vector<NumasMoeTaskList> decodeWorkers;
             std::vector <float, alignedAllocator<float, 64> > gateUpOutput, swigluOutput, downOutput, reduceOutput;
             std::vector <float, alignedAllocator<float, 64> > inputFloat32;  // 当 input 非 FLOAT32 时暂存转成 float32 的数据
             std::vector <uint8_t, alignedAllocator<uint8_t, 64> > realInput, expandInput, downInput;
@@ -1841,7 +1850,9 @@ namespace fastllm {
                         sourceBlockK > 0 && sourceBlockM == 16 &&
                         scaleBytes != nullptr && !data->scales.empty(),
                         "RegisterNumas received invalid compact E4M3 NVFP4 metadata.\n");
-                    data->dataType = DataType::NVFP4_BLOCK_16;
+                    data->dataType = GetMoeCudaCacheBytes() > 0 &&
+                        kPerNuma % NVFP4_PLANAR_TILE_ROWS == 0
+                        ? DataType::NVFP4_BLOCK_16_PLANAR : DataType::NVFP4_BLOCK_16;
                     const size_t packedBytesPerRow =
                         GetDataBytes(data->dataType, 1, m);
                     for (int i = 0; i < numaConfig->numaCnt; i++) {
@@ -1851,7 +1862,7 @@ namespace fastllm {
                             k, m, data->cpuData, scaleBytes, data->scales,
                             sourceBlockK, sourceBlockM,
                             data->numasData[i], i * kPerNuma, kPerNuma,
-                            isCrossSwiglu);
+                            isCrossSwiglu, data->dataType == DataType::NVFP4_BLOCK_16_PLANAR);
                     }
                     data->blockK = 1;
                     data->blockM = 16;
@@ -2450,12 +2461,111 @@ namespace fastllm {
         if (weight != nullptr &&
             (weight->dataType == DataType::NVFP4 ||
              weight->dataType == DataType::NVFP4_BLOCK_16 ||
+             weight->dataType == DataType::NVFP4_BLOCK_16_PLANAR ||
              weight->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
              weight->dataType == DataType::NVFP4_BLOCK_16_E4M3 ||
              weight->dataType == DataType::NVFP4_BLOCK_32_E8M0)) {
             return DataType::BFLOAT16;
         }
         return weight->GetLinearActDataType(batchSize);
+    }
+
+    bool CanRunNumasMoeDecodeExperts(Data *const *weights, int weightsBatch) {
+        if (!weights || weightsBatch < 4 || weightsBatch % 2 || weights[0] || weights[1]) return false;
+        auto *config = GetNumaConfig();
+        for (int i = 2; i < weightsBatch; ++i) {
+            const auto *w = weights[i];
+            if (!IsNumasLinearWeightRegistered(w) ||
+                w->dims[0] % (config->numaCnt * 4) != 0) return false;
+            const auto act = GetNumasLinearActDataType(weights[i], 1);
+            // Other activation encodings need their quantization-group row
+            // alignment/conversion adapter before entering the fused tasks.
+            if (act != DataType::FLOAT32 && act != DataType::FLOAT16 && act != DataType::BFLOAT16)
+                return false;
+            if (i > 3 && (w->dataType != weights[2 + i % 2]->dataType ||
+                          w->dims != weights[2 + i % 2]->dims)) return false;
+        }
+        return weights[2]->dims[0] == weights[3]->dims[1] * 2 &&
+               weights[2]->dims[1] == weights[3]->dims[0];
+    }
+
+    void NumasMoeDecodeExperts(const float *input, float *output,
+            Data **weights, const int32_t *indices, const int32_t *gpuIndices,
+            int topk, int layer) {
+        auto &work = GetNumasMoeRuntimeCache()[layer % 2];
+        auto *config = GetNumaConfig();
+        auto *pool = GetAlivePool();
+        auto &routes = work.activeExperts;
+        routes.clear();
+        for (int r = 0; r < topk; ++r)
+            if (gpuIndices[r] < 0) routes.push_back(r);
+        if (routes.empty()) return;
+        const int hidden = weights[2]->dims[1];
+        const int inter = weights[2]->dims[0] / 2;
+        const int count = routes.size();
+        const DataType gateAct = GetNumasLinearActDataType(weights[2], 1);
+        const DataType downAct = GetNumasLinearActDataType(weights[3], 1);
+        const size_t downBytes = GetDataBytes(downAct, 1, inter);
+        work.realInput.resize(GetDataBytes(gateAct, 1, hidden));
+        work.gateUpOutput.resize(count * inter * 2);
+        work.swigluOutput.resize(count * inter);
+        work.downInput.resize(count * downBytes);
+        RunMultiThreadConvertFromFloat32(work.realInput.data(), gateAct,
+                                        input, 1, hidden, pool);
+        work.decodeWorkers.resize(config->threads);
+        work.gateSwigluTaskStorage.resize(config->threads);
+        work.gemmTaskStorage.resize(config->threads);
+        for (int phase = 0; phase < 2; ++phase) {
+            const int columns = phase == 0 ? inter * 2 : hidden;
+            const int perNode = columns / config->numaCnt;
+            for (auto &worker : work.decodeWorkers) worker.tasks.clear();
+            for (int node = 0; node < config->numaCnt; ++node) {
+                const int threads = config->numaToCpuDict[node].size();
+                const int units = count * perNode / 4;
+                int start = 0;
+                for (int t = 0; t < threads; ++t) {
+                    const int worker = config->numaToCpuDict[node][t].first;
+                    auto &gateTasks = work.gateSwigluTaskStorage[worker];
+                    auto &downTasks = work.gemmTaskStorage[worker];
+                    auto &tasks = work.decodeWorkers[worker].tasks;
+                    gateTasks.clear();
+                    downTasks.clear();
+                    gateTasks.reserve(count);
+                    downTasks.reserve(count);
+                    const int end = start + (units / threads + (t < units % threads)) * 4;
+                    while (start < end) {
+                        const int item = start / perNode;
+                        const int row = start % perNode;
+                        const int rows = std::min(perNode - row, end - start);
+                        const int route = routes[item];
+                        const int expert = indices[route] + 1;
+                        Data &weight = *weights[expert * 2 + phase];
+                        if (phase == 0) {
+                            gateTasks.emplace_back(work.realInput.data(), gateAct,
+                                weight.numasData[node], weight.dataType,
+                                reinterpret_cast<uint8_t *>(work.gateUpOutput.data() +
+                                    item * columns + node * perNode), DataType::FLOAT32,
+                                work.swigluOutput.data() + item * inter,
+                                1, hidden, columns, row, row + rows, node * perNode,
+                                work.downInput.data() + item * downBytes, downAct);
+                        } else {
+                            downTasks.emplace_back(work.downInput.data() + item * downBytes, downAct,
+                                weight.numasData[node], weight.dataType,
+                                reinterpret_cast<uint8_t *>(output + route * hidden + node * perNode),
+                                DataType::FLOAT32, 1, inter, columns, row, row + rows);
+                        }
+                        start += rows;
+                    }
+                    if (phase == 0) {
+                        for (auto &task : gateTasks) tasks.push_back(&task);
+                    } else {
+                        for (auto &task : downTasks) tasks.push_back(&task);
+                    }
+                }
+            }
+            for (int t = 0; t < config->threads; ++t) pool->PushOp(t, &work.decodeWorkers[t]);
+            for (int t = 0; t < config->threads; ++t) pool->Wait(t);
+        }
     }
 
     bool IsNumasLinearWeightSupported(const Data *weight) {
@@ -2485,6 +2595,7 @@ namespace fastllm {
             case DataType::FP8_E4M3_BLOCK_128:
             case DataType::FP8_E4M3_PERCHANNEL:
             case DataType::NVFP4_BLOCK_16:
+            case DataType::NVFP4_BLOCK_16_PLANAR:
             case DataType::NVFP4_BLOCK_16_E8M0:
             case DataType::NVFP4_BLOCK_16_E4M3:
             case DataType::NVFP4_BLOCK_32_E8M0:
@@ -3115,6 +3226,7 @@ namespace fastllm {
                     DataType::NVFP4_BLOCK_16_E8M0;
             }
             if (weight.dataType == DataType::NVFP4_BLOCK_16_E4M3) {
+                // Only the allocation size is needed; planar tiles use the same bytes.
                 return DataType::NVFP4_BLOCK_16;
             }
             if (weight.dataType == DataType::INT8) {

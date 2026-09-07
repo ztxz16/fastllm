@@ -341,6 +341,9 @@ namespace fastllm {
         // followed by planar raw E4M3 block-16 scales. Tensor-level dequant
         // multipliers are retained in Data::scales.
         NVFP4_BLOCK_16_E4M3 = 1010,
+        // Internal NUMA layout: each 32-row tile stores packed block-16
+        // weights, then FP32 scales, retaining gate/up row interleaving.
+        NVFP4_BLOCK_16_PLANAR = 1011,
         INF_INT8_PERCHANNEL = 2000, // 推理用的int8, per channel量化
         INF_INT8_GROUP128 = 2001, // 推理用的int8, per group量化，group = 128
         INF_INT8_GROUP32 = 2002, // 推理用的int8, per group量化，group = 32
@@ -385,13 +388,29 @@ namespace fastllm {
     uint8_t *GetNVFP4ScaleData(Data &data);
     const uint8_t *GetNVFP4ScaleData(const Data &data);
     float NVFP4E8M0ScaleToFloat(uint8_t v);
+    constexpr int NVFP4_PLANAR_TILE_ROWS = 32;
+    #ifdef __CUDACC__
+    __host__ __device__
+    #endif
+    inline size_t NVFP4PlanarWeightOffset(int row, int blocks, int block = 0) {
+        return size_t(row / NVFP4_PLANAR_TILE_ROWS) * NVFP4_PLANAR_TILE_ROWS * blocks * 12 +
+            (size_t(row % NVFP4_PLANAR_TILE_ROWS) * blocks + block) * 8;
+    }
+    #ifdef __CUDACC__
+    __host__ __device__
+    #endif
+    inline size_t NVFP4PlanarScaleOffset(int row, int blocks, int block = 0) {
+        return size_t(row / NVFP4_PLANAR_TILE_ROWS) * NVFP4_PLANAR_TILE_ROWS * blocks * 12 +
+            size_t(NVFP4_PLANAR_TILE_ROWS) * blocks * 8 +
+            (size_t(row % NVFP4_PLANAR_TILE_ROWS) * blocks + block) * sizeof(float);
+    }
     void PackCompactE4M3NVFP4Block16Rows(
         int rows, int columns, const uint8_t *weights,
         const uint8_t *scaleBytes,
         const std::vector<float> &globalScales,
         int blockK, int blockM, uint8_t *destination,
         int destinationRowStart, int destinationRows,
-        bool crossSwiglu = false);
+        bool crossSwiglu = false, bool planar = false);
     void ConvertCompactE4M3NVFP4ToBlock16(
         Data &data, bool crossSwiglu = false);
 

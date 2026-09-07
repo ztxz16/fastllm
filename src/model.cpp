@@ -286,7 +286,7 @@ namespace fastllm {
     }
 
     bool basellm::PrepareMoeCudaCache(
-            const std::vector<std::vector<Data *>> &layerWeights) const {
+            const std::vector<std::vector<Data *>> &layerWeights) {
 #if defined(USE_CUDA) && !defined(USE_ROCM)
         if (!FastllmCudaMoeCacheRequested() || layerWeights.empty()) {
             return false;
@@ -298,8 +298,19 @@ namespace fastllm {
                 weights.data(),
                 static_cast<int>(weights.size())});
         }
+        std::function<void()> registerNumaWeights;
+#ifdef USE_NUMAS
+        bool allNuma = true;
+        for (int layer = 0; layer < static_cast<int>(layers.size()); ++layer) {
+            const std::string device = SelectMoeDeviceForLayer(layer);
+            allNuma = allNuma && (device == "numa" || device.compare(0, 5, "numa:") == 0);
+        }
+        if (allNuma) {
+            registerNumaWeights = [this] { WarmupNumaMoeWeights(); };
+        }
+#endif
         return FastllmCudaPrepareMoeCache(
-            layers.data(), static_cast<int>(layers.size()));
+            layers.data(), static_cast<int>(layers.size()), registerNumaWeights);
 #else
         (void)layerWeights;
         return false;
@@ -313,7 +324,7 @@ namespace fastllm {
 #if defined(USE_CUDA) && !defined(USE_ROCM)
         const bool cudaOutput = outputDevice == "cuda" ||
             outputDevice.compare(0, 5, "cuda:") == 0;
-        if (cudaOutput && FastllmCudaCanRunMoeCacheBatch1(
+        if (cudaOutput && FastllmCudaCanRunMoeCacheSmallBatch(
                 input, index, score, weights.data(),
                 static_cast<int>(weights.size()), gateType)) {
             ((Executor*)GetExecutor())->SetFirstDevice(outputDevice);
@@ -708,6 +719,15 @@ namespace fastllm {
             fflush(stdout);
         }
 
+#if defined(__linux__) && defined(__GLIBC__)
+        // Return freed source-weight pages even on the post-forward warmup
+        // pass, when every NUMA weight is already registered. This keeps
+        // allocator-retained pages out of steady-state RSS without trimming
+        // during inference.
+        if (!pending.empty() || alreadyRegisteredCount > 0) {
+            malloc_trim(0);
+        }
+#endif
         if (pending.empty()) {
             return;
         }
@@ -715,12 +735,6 @@ namespace fastllm {
         printf("[Fastllm] AutoWarmup NUMA MoE: registering %zu expert weights (%.2f GiB).\n",
                pending.size(), totalBytes / 1024.0 / 1024.0 / 1024.0);
         fflush(stdout);
-#if defined(__linux__) && defined(__GLIBC__)
-        // PrepareMoeWeights may just have released thousands of source gate/up
-        // buffers. Return those pages before allocating the NUMA copies, then
-        // trim periodically so the allocator cache does not inflate warmup RSS.
-        malloc_trim(0);
-#endif
         int lastProgress = -1;
         for (int i = 0; i < (int)pending.size(); i++) {
             RegisterNumas(pending[i].data, pending[i].weightType);

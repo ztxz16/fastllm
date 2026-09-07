@@ -17,6 +17,12 @@
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
+#ifndef USE_ROCM
+#include "devices/cuda/fastllm-cuda-moe-policy.h"
+#endif
+#endif
+#ifdef USE_TFACC
+#include "fastllm-tfacc.h"
 #endif
 
 #include <algorithm>
@@ -33,6 +39,9 @@
 #include <utility>
 
 namespace fastllm {
+#ifdef USE_NUMAS
+    void RegisterNumas(fastllm::Data *data, std::string weightType);
+#endif
 #ifdef USE_CUDA
     void FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag();
     bool FastllmCudaMergeMOEUsedGraphUnsafeFallback();
@@ -913,10 +922,12 @@ namespace fastllm {
             return true;
         }
 
-        bool Qwen4EnvFlagEnabled(const char *name) {
+        bool Qwen4EnvFlagEnabled(const char *name, bool fallback = false) {
             const char *value = std::getenv(name);
-            return value != nullptr && value[0] != '\0' &&
-                   std::strcmp(value, "0") != 0 &&
+            if (value == nullptr || value[0] == '\0') {
+                return fallback;
+            }
+            return std::strcmp(value, "0") != 0 &&
                    std::strcmp(value, "false") != 0 &&
                    std::strcmp(value, "FALSE") != 0 &&
                    std::strcmp(value, "off") != 0 &&
@@ -941,11 +952,9 @@ namespace fastllm {
         constexpr float QWEN4_MTP_TYPICAL_POSTERIOR_THRESHOLD = 0.09f;
         constexpr float QWEN4_MTP_TYPICAL_POSTERIOR_ALPHA = 0.3f;
 
-        bool Qwen4MtpFp8DraftHeadEnabled() {
-            const char *value = std::getenv("FASTLLM_MTP_FP8_DRAFT_HEAD");
-            return value == nullptr || value[0] == '\0' ||
-                   Qwen4EnvFlagEnabled("FASTLLM_MTP_FP8_DRAFT_HEAD");
-        }
+        const std::string kMtpExpertPrefix = "mtp.layers.0.mlp.experts.";
+        const std::string kMtpPackedGateName = kMtpExpertPrefix + "gate_up_proj";
+        const std::string kMtpPackedDownName = kMtpExpertPrefix + "down_proj";
 
         thread_local bool qwen4MtpDecodeEquivalentTarget = false;
 
@@ -961,9 +970,7 @@ namespace fastllm {
         };
 
         bool Qwen4PrefixCacheEnabled() {
-            const char *value = std::getenv("FASTLLM_PREFIX_CACHE");
-            return value == nullptr || value[0] == '\0' ||
-                   Qwen4EnvFlagEnabled("FASTLLM_PREFIX_CACHE");
+            return Qwen4EnvFlagEnabled("FASTLLM_PREFIX_CACHE", true);
         }
 
         bool Qwen4PrefixCacheDebugEnabled() {
@@ -1612,6 +1619,7 @@ namespace fastllm {
         this->weights.clear();
         this->biass.clear();
         this->preparedWeights = false;
+        this->mtpWeightsStatus.store(-1, std::memory_order_release);
 
         for (int layer = 0; layer < this->block_cnt; layer++) {
             const std::string mlp = languagePrefix + "layers." +
@@ -1698,12 +1706,13 @@ namespace fastllm {
                     "ple_embedding.ngram_embedding.weight_scale") !=
                     std::string::npos;
             });
+        const bool loadMtp = Qwen4MtpDraftsPerStep() > 0;
         for (const std::string &name : tensorNames) {
             const bool mtpWeight = Qwen4StartsWith(name, "mtp.");
             if (name != "lm_head.weight" &&
                 !Qwen4StartsWith(name, languagePrefix) &&
                 !Qwen4StartsWith(name, visualPrefix) &&
-                !(mtpWeight && Qwen4MtpDraftsPerStep() > 0)) {
+                !(mtpWeight && loadMtp)) {
                 // MTP remains opt-in so normal inference keeps its established
                 // memory footprint. Vision weights are loaded when present so
                 // the public conditional-generation checkpoint is complete.
@@ -1728,6 +1737,13 @@ namespace fastllm {
                 const DataType visualType = visualLinear
                     ? DataType::FLOAT16 : DataType::DATA_AUTO_NONE;
                 result[name].push_back({name, visualType});
+                continue;
+            }
+            if (name == kMtpPackedGateName || name == kMtpPackedDownName) {
+                // ModelOpt leaves the packed MTP experts in BF16. Keep the
+                // source precision and split the expert axis after loading;
+                // these tensors must not inherit the target's NVFP4 layout.
+                result[name].push_back({name, DataType::BFLOAT16});
                 continue;
             }
             if (name.find("ple_embedding.layer_multipliers") != std::string::npos ||
@@ -1769,6 +1785,77 @@ namespace fastllm {
         }
         result.insert(mapped.begin(), mapped.end());
         return result;
+    }
+
+    void Qwen4ExpModel::OnWeightLoaded(
+            const std::string &weightName,
+            const std::set<std::string> &finishedWeightNames) {
+        if ((weightName != kMtpPackedGateName && weightName != kMtpPackedDownName) ||
+            finishedWeightNames.count(kMtpPackedGateName) == 0 ||
+            finishedWeightNames.count(kMtpPackedDownName) == 0) {
+            return;
+        }
+        auto gate = this->weight.weight.find(kMtpPackedGateName);
+        auto down = this->weight.weight.find(kMtpPackedDownName);
+        if (gate == this->weight.weight.end() ||
+            down == this->weight.weight.end()) {
+            return;
+        }
+        const Data &gateUp = gate->second;
+        const Data &downProj = down->second;
+        AssertInFastLLM(
+            gateUp.dims.size() == 3 && downProj.dims.size() == 3 &&
+            this->num_experts > 0 &&
+            gateUp.dims[0] == this->num_experts &&
+            downProj.dims[0] == this->num_experts &&
+            downProj.dims[1] > 0 && downProj.dims[2] > 0 &&
+            gateUp.dims[1] == 2 * downProj.dims[2] &&
+            gateUp.dims[2] == downProj.dims[1],
+            "Qwen4-Exp packed MTP expert shapes are inconsistent.\n");
+        for (const Data *source : {&gateUp, &downProj}) {
+            AssertInFastLLM(
+                source->dataDevice == DataDevice::CPU &&
+                source->cpuData != nullptr &&
+                (source->dataType == DataType::FLOAT16 ||
+                 source->dataType == DataType::BFLOAT16 ||
+                 source->dataType == DataType::FLOAT32),
+                "Qwen4-Exp packed MTP experts require CPU floating-point weights.\n");
+        }
+        for (int expert = 0; expert < this->num_experts; expert++) {
+            for (const Data *source : {&gateUp, &downProj}) {
+                const bool isGate = source == &gateUp;
+                const std::string name = kMtpExpertPrefix + std::to_string(expert) +
+                    (isGate ? ".gateup_proj.weight" : ".down_proj.weight");
+                AssertInFastLLM(this->weight.weight.count(name) == 0,
+                    "Qwen4-Exp checkpoint mixes packed and separate MTP experts.\n");
+                Data &target = this->weight.weight[name];
+                target = Data(source->dataType,
+                              {source->dims[1], source->dims[2]});
+                target.Allocate();
+                std::memcpy(target.cpuData,
+                            source->cpuData + target.GetBytes() * expert,
+                            target.GetBytes());
+                target.name = name;
+                target.weightType = WeightType::LINEAR;
+                target.isModelWeight = true;
+                target.CalcWeightSum();
+                const std::string kind = isGate ? "linearSwiglu" : "linearColumn";
+#ifdef USE_TFACC
+                if (ShouldRegisterSpecialWeightForDeviceType(name, "tfacc")) {
+                    target.weightSum.resize(1);
+                    RegisterFastllmData(&target, kind);
+                }
+#endif
+#ifdef USE_NUMAS
+                if (ShouldRegisterSpecialWeightForDeviceType(name, "numa")) {
+                    RegisterNumas(&target, kind);
+                }
+#endif
+                MoveSpecialWeightToCudaIfNeeded(name, target);
+            }
+        }
+        this->weight.weight.erase(kMtpPackedGateName);
+        this->weight.weight.erase(kMtpPackedDownName);
     }
 
     void Qwen4ExpModel::OnModelWeightsLoaded() {
@@ -1850,6 +1937,10 @@ namespace fastllm {
     bool Qwen4ExpModel::HasMtpWeights() const {
         if (Qwen4MtpDraftsPerStep() <= 0) {
             return false;
+        }
+        const int status = this->mtpWeightsStatus.load(std::memory_order_acquire);
+        if (status >= 0) {
+            return status != 0;
         }
         const std::vector<std::string> required = {
             "mtp.fc_embedding.weight",
@@ -2014,8 +2105,8 @@ namespace fastllm {
                 this->mtpMoeBiass.push_back(nullptr);
                 this->mtpMoeBiass.push_back(nullptr);
             }
-
         }
+        this->mtpWeightsStatus.store(hasMtpWeights ? 1 : 0, std::memory_order_release);
         this->preparedWeights = true;
     }
 
@@ -2049,7 +2140,7 @@ namespace fastllm {
             previousDevice != lmHead.dataDeviceIds[0]) {
             FastllmCudaSetDevice(previousDevice);
         }
-        if ((!useNvfp4 && !Qwen4MtpFp8DraftHeadEnabled()) ||
+        if ((!useNvfp4 && !Qwen4EnvFlagEnabled("FASTLLM_MTP_FP8_DRAFT_HEAD", true)) ||
             lmHead.dims[1] % (useNvfp4 ? 16 : 128) != 0) {
             this->mtpDraftLmHeadAttempted = true;
             return;
@@ -5108,7 +5199,15 @@ namespace fastllm {
         }
         const std::string outputDevice = SelectDeviceFromMap(
             this->deviceMap, deviceLayer + 1, this->block_cnt);
-        const bool useMoeCudaCache = TryApplyMoeCudaCache(
+        bool hybridMoe = false;
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        if (Qwen4MtpDraftsPerStep() == 0 &&
+            outputDevice.find("cuda") == 0) {
+            hybridMoe = FastllmCudaMergeMOEHybrid(flattened, expertIndex, expertScore,
+                output, moeWeights.data(), moeWeights.size(), deviceLayer);
+        }
+#endif
+        const bool useMoeCudaCache = hybridMoe || TryApplyMoeCudaCache(
             flattened, expertIndex, expertScore, moeWeights,
             outputDevice, MoeGateSwiglu);
         const std::string routedDevice = useMoeCudaCache
@@ -5121,10 +5220,12 @@ namespace fastllm {
         Data routed;
         Data &routedOutput = writeRoutedDirectly ? output : routed;
         Data w1, w2, w3, temporaryInput, temporaryOutput;
-        MergeMOE(flattened, expertIndex, expertScore,
-                 moeWeights, moeBiass,
-                 w1, w2, w3, temporaryInput, temporaryOutput,
-                 1.0f, routedOutput, deviceLayer);
+        if (!hybridMoe) {
+            MergeMOE(flattened, expertIndex, expertScore,
+                     moeWeights, moeBiass,
+                     w1, w2, w3, temporaryInput, temporaryOutput,
+                     1.0f, routedOutput, deviceLayer);
+        }
 #ifdef USE_CUDA
         FastllmCudaGraphMarkParallelJoin(deviceLayer);
 #endif
@@ -5164,9 +5265,8 @@ namespace fastllm {
             !generationConfig.tool_call_parameter_name_constraint_enabled &&
             !generationConfig.tool_call_content_sampling_enabled &&
             Qwen4CudaOnlyDeviceMap(this->deviceMap) &&
-            // CUDA+NUMA MTP deliberately stays on the eager path. The draft
-            // and target CUDA Graph eligibility checks retain their stricter
-            // all-CUDA predicates because a graph cannot capture NUMA MoE.
+            // Mixed placement is supported. Each graph entry independently
+            // requires CUDA-resident experts or a usable GPU expert cache.
             Qwen4CudaOrNumaOnlyDeviceMap(this->moeDeviceMap) &&
             Qwen4CudaOrNumaOnlyDeviceMap(this->layeredMoeDeviceMap);
     }
@@ -5350,21 +5450,25 @@ namespace fastllm {
 
     }
 
-    std::shared_ptr<Qwen4ExpModel::MtpRuntimeState>
-    Qwen4ExpModel::CloneMtpPrefixState(
+    bool Qwen4ExpModel::CanCloneMtpPrefixState(
             const MtpRuntimeState &source, int cachedLen) const {
         const int expectedMtpLength = std::max(0, cachedLen - 1);
         const auto cacheLength = [](const Data &cache) {
             return cache.dims.size() > 1 ? cache.dims[1] : 0;
         };
-        if (cachedLen <= 0 || !source.hasDeferredTargetHidden ||
-            source.deferredPosition < 0 ||
-            source.deferredTargetHidden.dims !=
-                std::vector<int>({1, 1, this->hcCount * this->embed_dim}) ||
-            cacheLength(source.key) != expectedMtpLength ||
-            cacheLength(source.value) != expectedMtpLength ||
-            !source.proposals.empty() ||
-            !source.pendingOutputTokens.empty()) {
+        return cachedLen > 0 && source.hasDeferredTargetHidden &&
+            source.deferredPosition >= 0 &&
+            source.deferredTargetHidden.dims ==
+                std::vector<int>({1, 1, this->hcCount * this->embed_dim}) &&
+            cacheLength(source.key) == expectedMtpLength &&
+            cacheLength(source.value) == expectedMtpLength &&
+            source.proposals.empty() && source.pendingOutputTokens.empty();
+    }
+
+    std::shared_ptr<Qwen4ExpModel::MtpRuntimeState>
+    Qwen4ExpModel::CloneMtpPrefixState(
+            const MtpRuntimeState &source, int cachedLen) const {
+        if (!CanCloneMtpPrefixState(source, cachedLen)) {
             return nullptr;
         }
 
@@ -6759,7 +6863,13 @@ namespace fastllm {
             hiddenStates.dims.size() == 3 &&
             hiddenStates.dims[1] > 1 &&
             hiddenStates.dims[1] <= this->indexerCompressRatio;
+        // Check the supported cache shape before querying availability,
+        // which lazily allocates the device cache. Cached verifier rows run
+        // entirely on CUDA, so their configured NUMA fallback is graph-safe.
         const bool moeCudaCache =
+            hiddenStates.dims.size() == 3 && hiddenStates.dims[1] > 0 &&
+            hiddenStates.dims[1] <= FASTLLM_CUDA_MOE_CACHE_MAX_BATCH &&
+            (hiddenStates.dims[1] == 1 || mtpTargetGraph) &&
             !this->weights.empty() && !this->weights[0].empty() &&
             MoeCudaCacheAvailable(this->weights[0]);
         const bool moeDeviceMapGraphCompatible =
@@ -6768,7 +6878,13 @@ namespace fastllm {
             (moeCudaCache &&
              Qwen4CudaOrNumaOnlyDeviceMap(this->moeDeviceMap) &&
              Qwen4CudaOrNumaOnlyDeviceMap(this->layeredMoeDeviceMap));
+        // Host decisions and NUMA execution cannot be captured in the full
+        // backbone graph. MTP and prefill retain their existing paths.
+        const bool hybridMoe = Qwen4MtpDraftsPerStep() == 0 &&
+            !this->weights.empty() && !this->weights[0].empty() &&
+            FastllmCudaUseMoeHybrid(this->weights[0].data(), this->weights[0].size());
         if (!GetFastllmEnv().cudaGraph ||
+            hybridMoe ||
             !supportedStart ||
             hiddenStates.dims.size() != 3 || hiddenStates.dims[0] != 1 ||
             (hiddenStates.dims[1] != 1 && !mtpTargetGraph) ||
@@ -6895,6 +7011,12 @@ namespace fastllm {
                 }
             }
             if (needsGrowth) {
+                if (logicalDims[0] == 0) {
+                    // A restored empty tail may own compact storage. There
+                    // are no rows to preserve; avoid the strided copy used
+                    // when growing a nonempty cache.
+                    cache->FreeSpace();
+                }
                 cache->Expansion(capacityDims);
             }
             return sameCudaDevice(*cache);
@@ -7009,6 +7131,10 @@ namespace fastllm {
                         wholeGraphReady = false;
                         break;
                     }
+                    // Reservation is not a captured QSA append. Keep the
+                    // logical history empty until the whole graph is chosen;
+                    // segmented/eager attention appends its own rows.
+                    rawKeyCapture.Resize({0, this->indexerHeadDim});
                     appendSignature(
                         rawKeyCapture.cudaData, graphSequence,
                         rawKeyCapture.strides[0]);
@@ -7923,6 +8049,15 @@ namespace fastllm {
         };
 
         if (wholeGraphReady) {
+            if (mtpTargetGraph) {
+                for (int layer = fullAttentionCacheStartLayer;
+                     layer < this->block_cnt; layer++) {
+                    if (!this->IsLinearAttentionLayer(layer)) {
+                        verificationCapture->qsaRawKeys[layer].Resize(
+                            {graphSequence, this->indexerHeadDim});
+                    }
+                }
+            }
             runSegment(
                 graphStartLayer, this->block_cnt, true,
                 mtpTargetGraph ? this->indexerCompressRatio
@@ -8122,6 +8257,23 @@ namespace fastllm {
             return;
         }
 
+        {
+            std::lock_guard<std::mutex> guard(this->prefixCacheMutex);
+            auto existing = FindPrefixSnapshotLocked(
+                state.processedTokens, cachedLen, cachedLen);
+            if (existing != nullptr) {
+                existing->timestamp = ++this->prefixSnapshotTimestamp;
+                state.lastPrefixSnapshotLen = cachedLen;
+                return;
+            }
+        }
+        // Snapshot materialization requires the deferred MTP boundary;
+        // proposal generation may already have advanced its QSA history.
+        if (state.mtpState != nullptr &&
+            !CanCloneMtpPrefixState(*state.mtpState, cachedLen)) {
+            return;
+        }
+
         // Snapshot state is copied by value. Complete the asynchronous groups
         // and materialize the device-resident PLE/QSA histories once at this
         // boundary so the snapshot has a self-sufficient generic fallback
@@ -8245,9 +8397,6 @@ namespace fastllm {
                 state.mtpState->attentionState);
             mtpSnapshotState = CloneMtpPrefixState(
                 *state.mtpState, cachedLen);
-            // A target-only snapshot would force every restored request to
-            // abandon MTP. Wait for an aligned boundary instead of recording
-            // a cache entry whose draft state cannot be continued correctly.
             if (mtpSnapshotState == nullptr) {
                 return;
             }
@@ -8296,13 +8445,6 @@ namespace fastllm {
                     state.prefixRequestId = 1;
                     this->prefixRequestCounter = 1;
                 }
-            }
-            auto existing = FindPrefixSnapshotLocked(
-                state.processedTokens, cachedLen, cachedLen);
-            if (existing != nullptr) {
-                existing->timestamp = ++this->prefixSnapshotTimestamp;
-                state.lastPrefixSnapshotLen = cachedLen;
-                return;
             }
         }
 
@@ -8921,11 +9063,24 @@ namespace fastllm {
                 requestState->mtpState->proposals.clear();
                 requestState->mtpState->targetCheckpointPrepared = false;
             }
-            return ForwardTarget(
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+            void *decodePolicy = nullptr;
+            if (Qwen4MtpDraftsPerStep() == 0 && inputIds.dims[1] == 1 &&
+                Qwen4CudaOnlyDeviceMap(this->deviceMap) &&
+                !this->weights.empty() && !this->weights[0].empty()) {
+                decodePolicy = FastllmCudaBeginMoeDecode(
+                    this->weights[0].data(), this->weights[0].size(), this->num_experts_per_tok);
+            }
+#endif
+            auto result = ForwardTarget(
                 batch, inputIds, attentionMask, positionIds,
                 pastKeyValues, generationConfig, lastTokens, retLogits,
                 nullptr, nullptr, nullptr, nullptr,
                 true, true, false);
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+            FastllmCudaEndMoeDecode(decodePolicy);
+#endif
+            return result;
         }
 
         if (requestState->mtpState == nullptr) {

@@ -2,6 +2,19 @@
 
 [中文](version.md)
 
+## V0.1.8.2
+
+- Added a web deployment launcher and an Electron desktop launcher with model downloads, launch profile management, automatic configuration for long contexts and high concurrency, and inference speed and available context displays.
+- Reworked Studio with concurrent chat sessions, generation cancellation, attachments, and history. Integrated the Pi directory agent with web search, document Q&A, data analysis, code processing, and PowerPoint generation.
+- Improved Qwen3.8-Flash-Next multimodal inference, MTP, and prefix caching. Added FP8/NVFP4 CUDA expert caching, dynamic hybrid scheduling, and NUMA weight sharing to improve hybrid inference speed and memory usage.
+- Added GLM-5.3 MTP speculative decoding and MTP support for DeepSeek-V4 hybrid inference.
+- Improved self-describing GGUF loading, with embedded and external MTP weights and multimodal projectors for Qwen3.5-architecture GGUF models. Fixed low-bit quantization compatibility issues and reduced temporary GPU memory usage through chunked dequantization.
+- Added the `--low_gpu_mem` mode and FP4 KV Cache for the Qwen3.5 architecture. Reduced memory usage during tensor-parallel weight loading, optimized high-resolution vision inference, and added image feature caching.
+- Added `--rope_scaling` with static YaRN context extension for HF Qwen2, Qwen3, and Qwen3.5 families, along with context capacity checks at startup.
+- Optimized FP8 Linear, NVFP4, GDN, and paged attention across GPU architectures to improve prefill, decode, and small-batch inference performance.
+- Fixed hangs with odd GPU counts in tensor parallelism, deadlocks during multi-GPU quantized-weight repacking, GPU memory leaks in MTP verification graphs, and out-of-bounds accesses in two-GPU multimodal inference. Improved streaming tool-call parsing and argument validation.
+- Added native SM86 code to wheels and Triton as a default Linux dependency. Improved portable package dependencies, command-line entry points, and usage instructions for deployment without a desktop environment.
+
 ## V0.1.8.1
 
 - Improved Qwen3.8-Flash-Next with MTP speculative decoding, cross-request prefix caching, and faster CUDA/NUMA hybrid inference.

@@ -264,6 +264,7 @@ CLI 会持续演进，`ftllm <command> --help` 是当前安装版本的最终依
 | 参数 | 默认值 | 说明 |
 | --- | ---: | --- |
 | `--gpu_mem_ratio` | `0.9` | 可用于模型与缓存的 GPU 显存比例 |
+| `--moe_cuda_cache` / `--moe-cuda-cache` | `0` | GPU 专家权重缓存预算，例如 `3g`（3 GiB）；`0` 关闭。配合 CUDA 主计算与 CPU/NUMA 专家使用，KV Cache、普通权重及工作区另算；见[专家缓存说明](docs/cuda-expert-cache.md) |
 | `--kv_cache_limit` | `auto` | KV Cache 最大使用量 |
 | `--tokens` | 自动 | 用于计算 Paged KV Cache 容量的总 token 数 |
 | `--page_size` | 后端决定 | Paged KV Cache 每页 token 数；多卡默认通常为 16 |

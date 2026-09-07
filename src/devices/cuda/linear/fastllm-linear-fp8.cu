@@ -2901,7 +2901,7 @@ __global__ void FastllmGemvNVFP4Kernel1MultiRow(InputT *A, uint8_t *packedWeight
 }
 
 template <int THREAD_PER_BLOCK, int PART, bool SCALE_E8M0,
-          bool BLOCK32, typename InputT, typename OutputT, typename BiasT>
+          bool BLOCK32, bool PLANAR, typename InputT, typename OutputT, typename BiasT>
 __global__ void FastllmGemvNVFP4Block16Kernel1MultiRow(InputT *A, uint8_t *B, OutputT *C,
                                                        BiasT *bias, int m, int k, int perRow) {
     __shared__ float sdata[PART][THREAD_PER_BLOCK];
@@ -2911,7 +2911,9 @@ __global__ void FastllmGemvNVFP4Block16Kernel1MultiRow(InputT *A, uint8_t *B, Ou
 #pragma unroll
     for (int x = 0; x < PART; x++) sdata[x][tid] = 0.0f;
 
-    const uint8_t *rowData = B + (size_t)row * perRow;
+    const int blocks = (m + 15) / 16;
+    const uint8_t *rowData = B + (PLANAR ? fastllm::NVFP4PlanarWeightOffset(row, blocks) : (size_t)row * perRow);
+    const float *rowScales = PLANAR ? (const float *)(B + fastllm::NVFP4PlanarScaleOffset(row, blocks)) : nullptr;
     const int blockSize = BLOCK32 ? 32 : 16;
     const int blockShift = BLOCK32 ? 5 : 4;
     const int scaleOffset = BLOCK32 ? 16 : 8;
@@ -2921,9 +2923,9 @@ __global__ void FastllmGemvNVFP4Block16Kernel1MultiRow(InputT *A, uint8_t *B, Ou
         int block = i >> blockShift;
         int blockStart = block * blockSize;
         int blockEnd = min(blockStart + blockSize, m);
-        const uint8_t *blockData = rowData + block * blockBytes;
+        const uint8_t *blockData = rowData + block * (PLANAR ? 8 : blockBytes);
         float scaleMagic = SCALE_E8M0 ? FastllmCudaNVFP4E8M0ToMagicScale(blockData[scaleOffset])
-                                      : (*(float*)(blockData + 8)) * FastllmCudaNVFP4MagicScale();
+                                      : (PLANAR ? rowScales[block] : *(float*)(blockData + 8)) * FastllmCudaNVFP4MagicScale();
         int local = i - blockStart;
         int remaining = min(4, blockEnd - i);
         if (remaining == 4) {
@@ -2982,7 +2984,7 @@ __global__ void FastllmGemvNVFP4Block16Kernel1MultiRow(InputT *A, uint8_t *B, Ou
 // them load one consecutive uint32 each and exchange the words within the 4-lane
 // group. This turns three strided warp loads into one fully coalesced 12-byte/block
 // load and keeps the dot accumulator in a register until reduction.
-template <int THREAD_PER_BLOCK, typename InputT, typename OutputT, typename BiasT>
+template <int THREAD_PER_BLOCK, bool PLANAR, typename InputT, typename OutputT, typename BiasT>
 __global__ void FastllmGemvNVFP4Block16Kernel1Coalesced(
         const InputT * __restrict__ A, const uint8_t * __restrict__ B,
         OutputT * __restrict__ C, const BiasT * __restrict__ bias,
@@ -2997,14 +2999,17 @@ __global__ void FastllmGemvNVFP4Block16Kernel1Coalesced(
     const int laneInGroup = laneId & 3;
     const int groupBaseLane = laneId & ~3;
     const int row = blockIdx.x;
-    const uint8_t *rowData = B + (size_t)row * perRow;
+    const int blocks = (m + 15) / 16;
+    const uint8_t *rowData = B + (PLANAR ? fastllm::NVFP4PlanarWeightOffset(row, blocks) : (size_t)row * perRow);
+    const float *rowScales = PLANAR ? (const float *)(B + fastllm::NVFP4PlanarScaleOffset(row, blocks)) : nullptr;
     float acc = 0.0f;
 
     for (int i = tid * 4; i < m; i += THREAD_PER_BLOCK * 4) {
-        const uint8_t *blockData = rowData + (size_t)(i >> 4) * 12;
-        const uint32_t loaded = laneInGroup < 3
-                ? *(const uint32_t *)(blockData + laneInGroup * 4)
-                : 0u;
+        const uint8_t *blockData = rowData + (size_t)(i >> 4) * (PLANAR ? 8 : 12);
+        const uint32_t loaded = PLANAR && laneInGroup == 2
+                ? __float_as_uint(rowScales[i >> 4])
+                : (laneInGroup < (PLANAR ? 2 : 3)
+                    ? *(const uint32_t *)(blockData + laneInGroup * 4) : 0u);
         const unsigned int mask = __activemask();
         const uint32_t weightWord0 = __shfl_sync(mask, loaded, groupBaseLane);
         const uint32_t weightWord1 = __shfl_sync(mask, loaded, groupBaseLane + 1);
@@ -3102,7 +3107,7 @@ static void LaunchFastllmGemmNVFP4(InputT *input, uint8_t *packedWeight, uint8_t
 #undef FASTLLM_LAUNCH_NVFP4_GEMV
 }
 
-template <bool SCALE_E8M0, bool BLOCK32 = false,
+template <bool SCALE_E8M0, bool BLOCK32 = false, bool PLANAR = false,
           typename InputT, typename OutputT, typename BiasT>
 static void LaunchFastllmGemmNVFP4Block16(InputT *input, uint8_t *weight, OutputT *output,
                                           BiasT *bias, int n, int m, int k, int perRow) {
@@ -3110,20 +3115,20 @@ static void LaunchFastllmGemmNVFP4Block16(InputT *input, uint8_t *weight, Output
         const int threads = FastllmCudaNVFP4Block16ThreadsPerRow(m);
         if (!SCALE_E8M0 && (m & 15) == 0) {
             if (threads == 128) {
-                FastllmGemvNVFP4Block16Kernel1Coalesced<128> <<< k, 128 >>>(
+                FastllmGemvNVFP4Block16Kernel1Coalesced<128, PLANAR> <<< k, 128 >>>(
                         input, weight, output, bias, m, k, perRow);
             } else {
-                FastllmGemvNVFP4Block16Kernel1Coalesced<64> <<< k, 64 >>>(
+                FastllmGemvNVFP4Block16Kernel1Coalesced<64, PLANAR> <<< k, 64 >>>(
                         input, weight, output, bias, m, k, perRow);
             }
             return;
         }
-        FastllmGemvNVFP4Block16Kernel1MultiRow<64, 1, SCALE_E8M0, BLOCK32> <<< k, 64 >>>(
+        FastllmGemvNVFP4Block16Kernel1MultiRow<64, 1, SCALE_E8M0, BLOCK32, PLANAR> <<< k, 64 >>>(
                 input, weight, output, bias, m, k, perRow);
         return;
     }
 #define FASTLLM_LAUNCH_NVFP4_BLOCK16_GEMV(PART, IN, OUT) \
-    FastllmGemvNVFP4Block16Kernel1MultiRow<64, PART, SCALE_E8M0, BLOCK32> <<< k, 64 >>>(IN, weight, OUT, bias, m, k, perRow)
+    FastllmGemvNVFP4Block16Kernel1MultiRow<64, PART, SCALE_E8M0, BLOCK32, PLANAR> <<< k, 64 >>>(IN, weight, OUT, bias, m, k, perRow)
     if (n == 2) {
         FASTLLM_LAUNCH_NVFP4_BLOCK16_GEMV(2, input, output);
     } else if (n == 3) {
@@ -3168,6 +3173,16 @@ static void LaunchFastllmGemmNVFP4Block16(InputT *input, uint8_t *weight, Output
         }
     }
 #undef FASTLLM_LAUNCH_NVFP4_BLOCK16_GEMV
+}
+
+template <typename InputT, typename OutputT, typename BiasT>
+static void LaunchFastllmGemmNVFP4Block16Layout(InputT *input, uint8_t *weight, OutputT *output,
+        BiasT *bias, int n, int m, int k, int perRow, bool planar) {
+    if (planar) {
+        LaunchFastllmGemmNVFP4Block16<false, false, true>(input, weight, output, bias, n, m, k, perRow);
+    } else {
+        LaunchFastllmGemmNVFP4Block16<false>(input, weight, output, bias, n, m, k, perRow);
+    }
 }
 
 __global__ void FastllmCudaNVFP42HalfKernel(uint8_t *packedWeight, uint8_t *scaleBytes,
@@ -3430,34 +3445,40 @@ bool FastllmCudaBFloat16MatMulNVFP4(const fastllm::Data &input, fastllm::Data &w
     return true;
 }
 
-__global__ void FastllmCudaNVFP4Block162HalfKernel(uint8_t *a, half *b, int m, int perRow) {
+__global__ void FastllmCudaNVFP4Block162HalfKernel(uint8_t *a, half *b, int m, int perRow, int rowStart, bool planar) {
     int row = blockIdx.x;
     int tid = threadIdx.x;
 
-    uint8_t *rowData = a + (size_t)row * perRow;
+    const int blocks = (m + 15) / 16;
+    const int sourceRow = rowStart + row;
+    uint8_t *rowData = a + (planar ? fastllm::NVFP4PlanarWeightOffset(sourceRow, blocks) : (size_t)sourceRow * perRow);
+    const float *rowScales = planar ? (const float *)(a + fastllm::NVFP4PlanarScaleOffset(sourceRow, blocks)) : nullptr;
     half *rowOut = b + (size_t)row * m;
     for (int i = tid; i < m; i += blockDim.x) {
         int block = i >> 4;
         int offset = i & 15;
-        uint8_t *blockData = rowData + block * (8 + sizeof(float));
-        float scale = *(float*)(blockData + 8);
+        uint8_t *blockData = rowData + block * (planar ? 8 : (8 + sizeof(float)));
+        float scale = planar ? rowScales[block] : *(float*)(blockData + 8);
         uint8_t packed = blockData[offset >> 1];
         uint8_t fp4 = (offset & 1) ? (packed >> 4) : (packed & 0xF);
         rowOut[i] = __float2half_rn(FastllmCudaNVFP4E2M1ToFloat(fp4) * scale);
     }
 }
 
-__global__ void FastllmCudaNVFP4Block162BFloat16Kernel(uint8_t *a, __nv_bfloat16 *b, int m, int perRow) {
+__global__ void FastllmCudaNVFP4Block162BFloat16Kernel(uint8_t *a, __nv_bfloat16 *b, int m, int perRow, int rowStart, bool planar) {
     int row = blockIdx.x;
     int tid = threadIdx.x;
 
-    uint8_t *rowData = a + (size_t)row * perRow;
+    const int blocks = (m + 15) / 16;
+    const int sourceRow = rowStart + row;
+    uint8_t *rowData = a + (planar ? fastllm::NVFP4PlanarWeightOffset(sourceRow, blocks) : (size_t)sourceRow * perRow);
+    const float *rowScales = planar ? (const float *)(a + fastllm::NVFP4PlanarScaleOffset(sourceRow, blocks)) : nullptr;
     __nv_bfloat16 *rowOut = b + (size_t)row * m;
     for (int i = tid; i < m; i += blockDim.x) {
         int block = i >> 4;
         int offset = i & 15;
-        uint8_t *blockData = rowData + block * (8 + sizeof(float));
-        float scale = *(float*)(blockData + 8);
+        uint8_t *blockData = rowData + block * (planar ? 8 : (8 + sizeof(float)));
+        float scale = planar ? rowScales[block] : *(float*)(blockData + 8);
         uint8_t packed = blockData[offset >> 1];
         uint8_t fp4 = (offset & 1) ? (packed >> 4) : (packed & 0xF);
         rowOut[i] = __float2bfloat16_rn(FastllmCudaNVFP4E2M1ToFloat(fp4) * scale);
@@ -3587,11 +3608,12 @@ bool FastllmCudaMatMulFloatNVFP4Block16(const fastllm::Data &input, fastllm::Dat
     float *cudaInput = (float*)FastllmCudaPrepareInput(input);
     float *cudaOutput = (float*)FastllmCudaPrepareOutput(output);
 
+    const bool planar = weight.dataType == fastllm::DataType::NVFP4_BLOCK_16_PLANAR;
     const size_t packedBytesPerRow = FastllmCudaNVFP4Block16BytesPerRow(m);
     if (FastllmCudaNVFP4UseGemv(n)) {
         float *cudaBias = bias.dims.size() == 0 ? nullptr : cudaBiasData;
-        LaunchFastllmGemmNVFP4Block16<false>(cudaInput, (uint8_t*)weight.cudaData, cudaOutput,
-                                             cudaBias, n, m, k, (int)packedBytesPerRow);
+        LaunchFastllmGemmNVFP4Block16Layout(cudaInput, (uint8_t*)weight.cudaData, cudaOutput,
+            cudaBias, n, m, k, (int)packedBytesPerRow, planar);
         FastllmCudaFinishInput(input, cudaInput);
         FastllmCudaFinishOutput(output, cudaOutput);
         return true;
@@ -3620,8 +3642,8 @@ bool FastllmCudaMatMulFloatNVFP4Block16(const fastllm::Data &input, fastllm::Dat
     for (int kOff = 0; kOff < k; kOff += maxRowsPerChunk) {
         int kc = std::min(maxRowsPerChunk, k - kOff);
         FastllmCudaNVFP4Block162HalfKernel <<< kc, dequantThreads >>>(
-            (uint8_t*)weight.cudaData + (size_t)kOff * packedBytesPerRow,
-            cudaFp16Weight, m, packedBytesPerRow);
+            (uint8_t*)weight.cudaData,
+            cudaFp16Weight, m, packedBytesPerRow, kOff, planar);
 
         status = cublasGemmEx(fastllmCublasHandle,
                               CUBLAS_OP_T, CUBLAS_OP_N,
@@ -3753,10 +3775,11 @@ bool FastllmCudaHalfMatMulFloatNVFP4Block16(const fastllm::Data &input, fastllm:
     half *cudaInput = (half*)FastllmCudaPrepareInput(input);
     half *cudaOutput = (half*)FastllmCudaPrepareOutput(output);
 
+    const bool planar = weight.dataType == fastllm::DataType::NVFP4_BLOCK_16_PLANAR;
     const size_t packedBytesPerRow = FastllmCudaNVFP4Block16BytesPerRow(m);
     if (FastllmCudaNVFP4UseGemv(n)) {
-        LaunchFastllmGemmNVFP4Block16<false>(cudaInput, (uint8_t*)weight.cudaData, cudaOutput,
-                                             cudaBiasData, n, m, k, (int)packedBytesPerRow);
+        LaunchFastllmGemmNVFP4Block16Layout(cudaInput, (uint8_t*)weight.cudaData, cudaOutput,
+            cudaBiasData, n, m, k, (int)packedBytesPerRow, planar);
         FastllmCudaFinishInput(input, cudaInput);
         FastllmCudaFinishOutput(output, cudaOutput);
         return true;
@@ -3778,8 +3801,8 @@ bool FastllmCudaHalfMatMulFloatNVFP4Block16(const fastllm::Data &input, fastllm:
     for (int kOff = 0; kOff < k; kOff += maxRowsPerChunk) {
         int kc = std::min(maxRowsPerChunk, k - kOff);
         FastllmCudaNVFP4Block162HalfKernel <<< kc, dequantThreads >>>(
-            (uint8_t*)weight.cudaData + (size_t)kOff * packedBytesPerRow,
-            cudaFp16Weight, m, packedBytesPerRow);
+            (uint8_t*)weight.cudaData,
+            cudaFp16Weight, m, packedBytesPerRow, kOff, planar);
 
         status = cublasGemmEx(fastllmCublasHandle,
                               CUBLAS_OP_T, CUBLAS_OP_N,
@@ -3883,10 +3906,11 @@ bool FastllmCudaBFloat16MatMulNVFP4Block16(const fastllm::Data &input, fastllm::
     __nv_bfloat16 *cudaInput = (__nv_bfloat16*)FastllmCudaPrepareInput(input);
     __nv_bfloat16 *cudaOutput = (__nv_bfloat16*)FastllmCudaPrepareOutput(output);
 
+    const bool planar = weight.dataType == fastllm::DataType::NVFP4_BLOCK_16_PLANAR;
     const size_t packedBytesPerRow = FastllmCudaNVFP4Block16BytesPerRow(m);
     if (FastllmCudaNVFP4UseGemv(n)) {
-        LaunchFastllmGemmNVFP4Block16<false>(cudaInput, (uint8_t*)weight.cudaData, cudaOutput,
-                                             cudaBiasData, n, m, k, (int)packedBytesPerRow);
+        LaunchFastllmGemmNVFP4Block16Layout(cudaInput, (uint8_t*)weight.cudaData, cudaOutput,
+            cudaBiasData, n, m, k, (int)packedBytesPerRow, planar);
         FastllmCudaFinishInput(input, cudaInput);
         FastllmCudaFinishOutput(output, cudaOutput);
         return true;
@@ -3907,8 +3931,8 @@ bool FastllmCudaBFloat16MatMulNVFP4Block16(const fastllm::Data &input, fastllm::
     for (int kOff = 0; kOff < k; kOff += maxRowsPerChunk) {
         int kc = std::min(maxRowsPerChunk, k - kOff);
         FastllmCudaNVFP4Block162BFloat16Kernel <<< kc, dequantThreads >>>(
-            (uint8_t*)weight.cudaData + (size_t)kOff * packedBytesPerRow,
-            cudaBF16Weight, m, packedBytesPerRow);
+            (uint8_t*)weight.cudaData,
+            cudaBF16Weight, m, packedBytesPerRow, kOff, planar);
 
         status = cublasGemmEx(fastllmCublasHandle,
                               CUBLAS_OP_T, CUBLAS_OP_N,

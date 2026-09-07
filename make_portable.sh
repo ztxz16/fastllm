@@ -283,7 +283,7 @@ data = {
     "cuda": {
         "major": 12,
         "minimum_compute_capability": "6.0",
-        "embedded_native_targets": ["60", "70", "75", "80", "89", "90", "100", "120"],
+        "embedded_native_targets": ["60", "70", "75", "80", "86", "89", "90", "100", "120"],
         "minimum_linux_driver": min_driver,
         "recommended_linux_driver": recommended_driver,
     },
@@ -622,6 +622,7 @@ agent_tools_args=(--runtime-dir "$runtime_dir" --cache-dir "${cache_dir}/agent-t
 
 mkdir -p "${bundle_dir}/libexec"
 install -m 0755 "${PORTABLE_ASSETS_DIR}/launcher.sh" "${bundle_dir}/ftllm"
+install -m 0755 "${PORTABLE_ASSETS_DIR}/launch.sh" "${bundle_dir}/launch.sh"
 install -m 0755 "${PORTABLE_ASSETS_DIR}/launcher.sh" "${bundle_dir}/ftllm-agent-runtime"
 install -m 0755 "${PORTABLE_ASSETS_DIR}/launcher.sh" "${bundle_dir}/python"
 install -m 0755 "${PORTABLE_ASSETS_DIR}/launcher.sh" "${bundle_dir}/pip"
@@ -675,6 +676,11 @@ if ((run_tests)); then
     log "运行可重定位启动器和原生库冒烟测试"
     "${bundle_dir}/ftllm" --version
     "${bundle_dir}/ftllm" --help >/dev/null
+    "${bundle_dir}/ftllm" server --help >/dev/null
+    "${bundle_dir}/ftllm" tui --help >/dev/null
+    "${bundle_dir}/launch.sh" --help >/dev/null
+    "${bundle_dir}/python" "${PORTABLE_ASSETS_DIR}/smoke_launcher.py" "$bundle_dir"
+    "${bundle_dir}/python" "${PORTABLE_ASSETS_DIR}/smoke_launcher.py" "$bundle_dir" --entrypoint launch.sh
     "${bundle_dir}/ftllm-agent-runtime" info
     "${bundle_dir}/python" "${PORTABLE_ASSETS_DIR}/smoke_agent.py"
     embedded_build_paths="$(grep -RIlF "$build_root" "${bundle_dir}/runtime/bin" || true)"

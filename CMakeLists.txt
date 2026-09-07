@@ -370,7 +370,7 @@ if (USE_CUDA)
         src/devices/cuda/linear/fastllm-linear-fp8-cutlass.cu
         src/devices/cuda/linear/fastllm-linear-fp8-cutlass-sm89.cu
         src/devices/cuda/moe/fastllm-moe-fp8.cu
-        src/devices/cuda/moe/fastllm-moe-nvfp4-cache.cu
+        src/devices/cuda/moe/fastllm-moe-cache.cu
         src/devices/cuda/moe/fastllm-moe-vllm-marlin.cu
         src/devices/cuda/linear/fastllm-linear-int8.cu
         src/devices/cuda/linear/fastllm-linear-int4.cu
@@ -603,6 +603,14 @@ if (UNIT_TEST)
 
     add_executable(testTokenizer test/ops/tokenizerTest.cpp)
     target_link_libraries(testTokenizer fastllm)
+
+    add_executable(qwen4_mtp_weights_test test/basic/test_qwen4_mtp_weights.cpp)
+    target_link_libraries(qwen4_mtp_weights_test PRIVATE fastllm)
+    add_test(NAME qwen4_mtp_weights COMMAND qwen4_mtp_weights_test)
+
+    add_executable(nvfp4_planar_test test/basic/test_nvfp4_planar.cpp)
+    target_link_libraries(nvfp4_planar_test PRIVATE fastllm)
+    add_test(NAME nvfp4_planar COMMAND nvfp4_planar_test)
 
     add_executable(regressionOps test/ops/regressionOps.cpp)
     target_link_libraries(regressionOps fastllm)

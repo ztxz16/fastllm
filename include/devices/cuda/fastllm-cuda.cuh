@@ -1586,30 +1586,60 @@ bool FastllmCudaMergeMOENVFP4E4M3MarlinIndexed(
         const int32_t *indices, const float *scores,
         int batch, int topk);
 #ifndef USE_ROCM
-// Model-facing interface for the opt-in GPU expert cache. Backends inspect
-// the actual weight format during preparation; the first implementation
-// supports compact E4M3 NVFP4 SwiGLU experts. Keeping format checks behind
-// this interface lets another MoE model reuse the cache without depending on
-// NVFP4-specific symbols.
+// Model-facing interface for the opt-in GPU expert cache. Preparation validates
+// compact NVFP4 or FP8 SwiGLU weights behind this format-independent interface.
 struct FastllmCudaMoeCacheLayer {
     fastllm::Data *const *weights = nullptr;
     int weightsBatch = 0;
 };
+// One anchor plus up to eight speculative tokens. Larger prefill batches
+// keep using the configured MoE backend.
+constexpr int FASTLLM_CUDA_MOE_CACHE_MAX_BATCH = 9;
 bool FastllmCudaMoeCacheRequested();
+// With a registration callback, retain only original metadata and borrow the
+// registered pinned NUMA weights through byte-layout views. No duplicate
+// host weight snapshot is made, including during preparation. The callback
+// must not reenter cache APIs. Unsupported layouts or failed registration
+// leave no published cache; the configured MoE backend remains usable.
+// Borrowed shards must remain alive and unchanged until cache release.
+// Without a callback, snapshot the host weights for the ordinary CUDA cache.
 bool FastllmCudaPrepareMoeCache(
-        const FastllmCudaMoeCacheLayer *layers, int layerCount);
+        const FastllmCudaMoeCacheLayer *layers, int layerCount,
+        const std::function<void()> &registerNumaWeights = {});
 bool FastllmCudaCanRunMoeCache(
         fastllm::Data **weights, int weightsBatch);
-bool FastllmCudaCanRunMoeCacheBatch1(
+// Eager single-token FP32 activation decode. Weight-format adapters execute
+// disjoint CPU/CUDA subsets; scheduling and top-k reduction are shared.
+bool FastllmCudaCanRunMoeHybrid(fastllm::Data **weights, int weightsBatch);
+bool FastllmCudaMergeMOEHybrid(const fastllm::Data &input,
+        const fastllm::Data &index, const fastllm::Data &score,
+        fastllm::Data &output, fastllm::Data **weights, int weightsBatch, int layer);
+bool FastllmCudaCanRunMoeCacheSmallBatch(
         const fastllm::Data &input, const fastllm::Data &index,
         const fastllm::Data &score, fastllm::Data **weights,
         int weightsBatch, fastllm::MoeGateType gateType);
 void FastllmCudaReleaseMoeCache(
         fastllm::Data **weights, int weightsBatch);
-bool FastllmCudaMergeMOECacheBatch1(
+bool FastllmCudaMergeMOECache(
         const fastllm::Data &input, fastllm::Data &gateOutput,
         fastllm::Data &output, fastllm::Data **weights, int weightsBatch,
         const int32_t *indices, const float *scores, int topk);
+// Slot pointer tables are device-resident and stable for the lifetime of a
+// cache. Inputs/outputs are already allocated; this adapter only launches
+// the existing indexed FP8 compute kernels on cudaStreamPerThread.
+struct FastllmCudaMoeFP8CacheView {
+    fastllm::DataType weightType;
+    uint8_t **gateWeights;
+    uint8_t **downWeights;
+    float **gateScales;
+    float **downScales;
+    int gateBlockM, gateBlockK, downBlockM, downBlockK;
+};
+bool FastllmCudaMoeFP8CacheCompute(
+        const fastllm::Data &input, fastllm::Data &gateOutput,
+        fastllm::Data &output, const FastllmCudaMoeFP8CacheView &view,
+        const int32_t *slots, const float *scores, int topk,
+        float *perExpert = nullptr);
 #endif
 bool FastllmCudaNVFP4E4M3GroupedMoeSupported(int device);
 bool FastllmCudaHalfMatMulFloatInt4Group128(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);

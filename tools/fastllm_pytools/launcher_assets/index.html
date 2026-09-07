@@ -46,7 +46,6 @@
           <button class="nav-button" type="button" data-view-button="logs">
             <svg class="icon" aria-hidden="true"><use href="#icon-terminal"/></svg>
             <span><strong>运行日志</strong></span>
-            <i id="log-activity" class="activity-dot"></i>
           </button>
           <button class="nav-button" type="button" data-view-button="hardware">
             <svg class="icon" aria-hidden="true"><use href="#icon-cpu"/></svg>
@@ -83,12 +82,28 @@
         <header class="topbar">
           <div class="workspace-breadcrumb"><span class="management-label">模型管理</span><span aria-hidden="true">/</span><strong id="current-view-title">启动服务</strong></div>
           <div class="service-controls">
+          <div class="service-status">
           <div class="topbar-status">
             <span id="status-dot" class="status-dot stopped"></span>
             <div>
               <strong id="status-title">服务未启动</strong>
               <small id="status-message">选择启动项目后即可启动服务</small>
             </div>
+          </div>
+          <dl id="inference-status-bar" class="inference-status-bar hidden" aria-label="推理状态">
+            <div class="inference-metric" title="并发时显示总速度，3 秒无新采样时归零。">
+              <dt>Prefill</dt>
+              <dd><strong id="prefill-speed">0</strong><span>tps</span></dd>
+            </div>
+            <div class="inference-metric" title="并发时显示总速度，3 秒无新采样时归零。">
+              <dt>Decode</dt>
+              <dd><strong id="decode-speed">0</strong><span>tps</span></dd>
+            </div>
+            <div id="context-window-metric" class="inference-metric">
+              <dt>上下文</dt>
+              <dd><strong id="context-window">—</strong></dd>
+            </div>
+          </dl>
           </div>
           <div class="topbar-actions">
             <button id="open-webui" class="primary-button" type="button" data-open-view="webui" disabled>打开工作室</button>
@@ -130,17 +145,10 @@
                   </div>
                   <span class="library-caption">配置一次，随时启动</span>
                 </div>
-                <div class="library-toolbar">
-                  <div class="profile-filters" role="group" aria-label="筛选启动项目">
-                    <button type="button" class="filter-button active" data-profile-filter="all" aria-pressed="true">全部项目</button>
-                    <button type="button" class="filter-button" data-profile-filter="server" aria-pressed="false">API Server</button>
-                    <button type="button" class="filter-button" data-profile-filter="webui" aria-pressed="false">独立工作室</button>
-                  </div>
-                  <label class="profile-search">
-                    <svg class="icon" aria-hidden="true"><use href="#icon-search"/></svg>
-                    <input id="profile-search" type="search" placeholder="搜索名称、模型路径…" aria-label="搜索启动项目" autocomplete="off">
-                  </label>
-                </div>
+                <label class="profile-search">
+                  <svg class="icon" aria-hidden="true"><use href="#icon-search"/></svg>
+                  <input id="profile-search" type="search" placeholder="搜索名称、模型路径…" aria-label="搜索启动项目" autocomplete="off">
+                </label>
                 <p id="profile-results" class="visually-hidden" role="status" aria-live="polite"></p>
                 <div id="profile-list" class="profile-list">
                   <div class="empty-profile">还没有启动项目</div>
@@ -158,7 +166,7 @@
                   <div>
                     <span id="launch-command-kicker">FTLLM SERVER</span>
                     <h2 id="profile-editor-title" tabindex="-1">模型启动设置</h2>
-                    <p>带 <b>*</b> 的字段为必填项，保存配置不会启动模型。</p>
+                    <p id="profile-editor-description">选择模型和配置模式，保存后即可启动。</p>
                   </div>
                   <div class="editor-heading-actions">
                     <span id="save-state" class="save-state">新配置</span>
@@ -167,39 +175,58 @@
                     </button>
                   </div>
                 </div>
+                <section class="model-selection-section" aria-labelledby="model-selection-title">
+                  <div class="setup-section-heading"><span aria-hidden="true">01</span><h3 id="model-selection-title">文件选择</h3></div>
+                  <div class="field model-path-field">
+                    <label class="visually-hidden" for="model-path">模型路径</label>
+                    <div class="path-input-with-button">
+                      <input id="model-path" data-field="model" data-path-input type="text" list="path-suggestions" placeholder="/path/to/model 或 /path/to/model.gguf" spellcheck="false">
+                      <button id="choose-model-folder" class="folder-picker-button" type="button"><span class="folder-button-icon" aria-hidden="true"></span>浏览文件或文件夹</button>
+                    </div>
+                    <small>选择运行 Launcher 的机器上的模型文件夹、GGUF 或 FastLLM 模型文件。</small>
+                  </div>
+                </section>
+
+                <section class="configuration-mode-section" aria-labelledby="configuration-mode-title">
+                  <div id="configuration-mode-settings">
+                  <div class="setup-section-heading"><span aria-hidden="true">02</span><h3 id="configuration-mode-title">配置模式</h3></div>
+                  <div id="configuration-mode-options" class="configuration-mode-options" role="radiogroup" aria-labelledby="configuration-mode-title">
+                    <label class="configuration-mode-card">
+                      <input type="radio" name="configuration-mode" data-config-mode value="long_context" checked>
+                      <span><strong>长上下文模式</strong><small>优先单会话容量，适合长文档与多轮对话。</small></span>
+                    </label>
+                    <label class="configuration-mode-card">
+                      <input type="radio" name="configuration-mode" data-config-mode value="high_concurrency">
+                      <span><strong>高并发模式</strong><small>优先同时处理多个请求，适合共享 API 服务。</small></span>
+                    </label>
+                    <label class="configuration-mode-card">
+                      <input type="radio" name="configuration-mode" data-config-mode value="custom">
+                      <span><strong>自定义配置</strong><small>展开全部参数，自行设置设备、缓存与推理选项。</small></span>
+                    </label>
+                  </div>
+                  <p id="configuration-mode-description" class="configuration-mode-description"></p>
+                  <label class="speculative-auto-option">
+                    <input type="checkbox" data-field="enable_speculative_decoding" id="enable-speculative-decoding" aria-describedby="speculative-auto-description">
+                    <span><strong>打开推测解码</strong><small id="speculative-auto-description">自动配置时检查模型，仅在模型自带 MTP 且支持当前设备时开启。</small></span>
+                  </label>
+                  </div>
+                  <div id="automatic-config-actions" class="automatic-config-actions">
+                    <button id="auto-configure-profile" class="primary-button" type="button">自动配置</button>
+                    <button id="clear-profile-config" class="secondary-button clear-config-button" type="button">清空配置</button>
+                  </div>
+                  <div id="automatic-config-status" class="automatic-config-status hidden" role="status" aria-live="polite"></div>
+                </section>
+
+                <div id="profile-parameters">
                 <nav class="editor-navigation" aria-label="配置分区">
                   <button type="button" data-editor-section="basic">基础配置</button>
                   <button type="button" data-editor-section="speculative">推测解码</button>
                   <button type="button" data-editor-section="hybrid">混合推理</button>
                   <button type="button" data-editor-section="advanced">高级设置</button>
                 </nav>
-
-                <section class="automatic-config-panel" aria-labelledby="automatic-config-title">
-                  <div class="automatic-config-heading">
-                    <span class="automatic-config-icon" aria-hidden="true">✦</span>
-                    <div>
-                      <strong id="automatic-config-title">智能推理配置</strong>
-                      <small>根据模型结构、权重规模和本机硬件推荐设备与混合推理参数。</small>
-                    </div>
-                  </div>
-                  <div class="automatic-config-actions">
-                    <button id="auto-configure-profile" class="secondary-button automatic-config-button" type="button">自动配置</button>
-                    <button id="clear-profile-config" class="quiet-config-button" type="button">清空配置</button>
-                  </div>
-                  <div id="automatic-config-status" class="automatic-config-status hidden" role="status" aria-live="polite"></div>
-                </section>
-
                 <section id="editor-basic" class="form-section">
                   <div class="section-title"><strong>基础配置</strong><small>模型、服务地址与运行设备</small></div>
                   <div class="form-grid two-columns">
-                    <div class="field span-2 model-path-field">
-                      <label for="model-path">模型路径 <b>*</b></label>
-                      <div class="path-input-with-button">
-                        <input id="model-path" data-field="model" data-path-input type="text" list="path-suggestions" placeholder="/path/to/model 或 /path/to/model.gguf" spellcheck="false">
-                        <button id="choose-model-folder" class="folder-picker-button" type="button"><span class="folder-button-icon" aria-hidden="true"></span>选择文件夹</button>
-                      </div>
-                      <small>支持 Hugging Face 模型目录、FastLLM 模型文件和 GGUF。</small>
-                    </div>
                     <label class="field">
                       <span>配置名称 <b>*</b></span>
                       <input data-field="name" type="text" placeholder="例如 Qwen3.5-27B">
@@ -223,6 +250,16 @@
                       <span>服务端口 <b>*</b></span>
                       <input data-field="port" type="number" min="1" max="65535" inputmode="numeric">
                     </label>
+                    <label class="field">
+                      <span>KV Cache 类型</span>
+                      <select data-field="kv_cache_dtype">
+                        <option value="auto">auto</option>
+                        <option value="float16">float16</option>
+                        <option value="bfloat16">bfloat16</option>
+                        <option value="fp8_e4m3">fp8</option>
+                        <option value="fp4">fp4 (Qwen3.5 CUDA)</option>
+                      </select>
+                    </label>
                     <label id="webui-max-token-field" class="field hidden">
                       <span>最大输出 Token</span>
                       <input data-field="webui_max_token" type="number" min="1" inputmode="numeric" placeholder="4096">
@@ -234,42 +271,31 @@
                         <option value="true">开启</option>
                       </select>
                     </label>
-                    <label class="field">
-                      <span>主设备</span>
-                      <select data-field="device">
-                        <option value="auto">自动</option>
-                        <option value="cuda">CUDA 单卡</option>
-                        <option value="tp">多卡张量并行</option>
-                        <option value="cudapp">多卡串行</option>
-                        <option value="cpu">CPU</option>
-                        <option value="numa">NUMA CPU</option>
-                      </select>
-                    </label>
-                    <label id="cuda-device-field" class="field device-field">
-                      <span>CUDA 卡号</span>
-                      <input data-field="cuda_device_id" type="text" placeholder="0">
-                    </label>
-                    <label id="tp-device-field" class="field device-field hidden">
-                      <span>TP 卡数或卡号</span>
-                      <input data-field="tp" type="text" placeholder="2 或 0,1">
-                    </label>
-                    <label id="cudapp-device-field" class="field device-field hidden">
-                      <span>串行卡数或卡号</span>
-                      <input data-field="cudapp" type="text" placeholder="2 或 0,1">
-                    </label>
-                    <label class="field">
-                      <span>权重类型</span>
-                      <select data-field="dtype">
-                        <option value="auto">自动</option>
-                        <option value="float16">float16</option>
-                        <option value="float32">float32</option>
-                        <option value="int8">int8</option>
-                        <option value="int4">int4</option>
-                        <option value="int4g128">int4g128</option>
-                        <option value="int4g256">int4g256</option>
-                        <option value="fp8_e4m3">fp8_e4m3</option>
-                      </select>
-                    </label>
+                    <div class="device-config-row span-2">
+                      <label class="field">
+                        <span>主设备</span>
+                        <select data-field="device">
+                          <option value="auto">自动</option>
+                          <option value="cuda">CUDA 单卡</option>
+                          <option value="tp">多卡张量并行</option>
+                          <option value="cudapp">多卡串行</option>
+                          <option value="cpu">CPU</option>
+                          <option value="numa">NUMA CPU</option>
+                        </select>
+                      </label>
+                      <label id="cuda-device-field" class="field device-field">
+                        <span>CUDA 卡号</span>
+                        <input data-field="cuda_device_id" type="text" placeholder="0">
+                      </label>
+                      <label id="tp-device-field" class="field device-field hidden">
+                        <span>TP 卡数或卡号</span>
+                        <input data-field="tp" type="text" placeholder="2 或 0,1">
+                      </label>
+                      <label id="cudapp-device-field" class="field device-field hidden">
+                        <span>串行卡数或卡号</span>
+                        <input data-field="cudapp" type="text" placeholder="2 或 0,1">
+                      </label>
+                    </div>
                   </div>
                 </section>
 
@@ -363,6 +389,10 @@
                 <details id="editor-advanced" class="advanced-section">
                   <summary><span><strong>高级设置</strong><small>缓存、采样与额外参数</small></span><i></i></summary>
                   <div class="advanced-content">
+                    <label class="switch-field">
+                      <input data-field="low_gpu_mem" type="checkbox">
+                      <span><strong>低显存模式</strong><small>减少运行时显存占用，为上下文缓存留出更多空间。</small></span>
+                    </label>
                     <div class="form-grid three-columns">
                       <label class="field"><span>线程数</span><input data-field="threads" type="text" placeholder="auto"></label>
                       <label class="field"><span>最大 Batch</span><input data-field="max_batch" type="text" placeholder="auto"></label>
@@ -371,16 +401,6 @@
                       <label id="server-context-field" class="field"><span>单会话上下文</span><input data-field="max_context_length" type="text" placeholder="auto"></label>
                       <label class="field"><span>RoPE 扩展</span><input data-field="rope_scaling" type="text" placeholder="沿用配置；可填 yarn 或 JSON"></label>
                       <label class="field"><span>分块 Prefill</span><input data-field="chunked_prefill_size" type="text" placeholder="auto"></label>
-                      <label class="field">
-                        <span>KV Cache 类型</span>
-                        <select data-field="kv_cache_dtype">
-                          <option value="auto">auto</option>
-                          <option value="float16">float16</option>
-                          <option value="bfloat16">bfloat16</option>
-                          <option value="fp8_e4m3">fp8</option>
-                          <option value="fp4">fp4 (Qwen3.5 CUDA)</option>
-                        </select>
-                      </label>
                       <label class="field">
                         <span>思考开关</span>
                         <select data-field="enable_thinking">
@@ -433,8 +453,9 @@
                 <section class="command-panel">
                   <div><strong>实际启动命令</strong><small>敏感值会隐藏，参数不经过 Shell</small></div>
                   <pre id="command-preview">正在生成命令…</pre>
-                  <div id="validation-messages" class="validation-messages"></div>
                 </section>
+                </div>
+                <div id="validation-messages" class="validation-messages profile-validation"></div>
 
                 <div class="form-actions">
                   <button id="save-profile" class="secondary-button" type="button">保存配置</button>
@@ -579,24 +600,49 @@
       </main>
     </div>
 
+    <dialog id="automatic-config-dialog" class="automatic-config-dialog" aria-labelledby="automatic-config-dialog-title" aria-describedby="automatic-config-dialog-description">
+      <div class="automatic-config-dialog-heading">
+        <div><h2 id="automatic-config-dialog-title">自动配置</h2><p id="automatic-config-dialog-description">选择配置模式，确认后应用到当前启动项。</p></div>
+        <button id="automatic-config-dialog-close" class="small-button" type="button" aria-label="关闭窗口">×</button>
+      </div>
+      <div id="automatic-mode-options" class="configuration-mode-options automatic-mode-options" role="radiogroup" aria-label="配置模式"></div>
+      <p id="automatic-mode-description" class="configuration-mode-description"></p>
+      <label class="speculative-auto-option">
+        <input type="checkbox" id="automatic-enable-speculative-decoding" aria-describedby="automatic-speculative-description">
+        <span><strong>打开推测解码</strong><small id="automatic-speculative-description">自动配置时检查模型，仅在模型自带 MTP 且支持当前设备时开启。</small></span>
+      </label>
+      <p id="automatic-config-dialog-error" class="automatic-config-dialog-error hidden" role="alert"></p>
+      <div class="automatic-config-dialog-actions">
+        <button id="automatic-config-dialog-cancel" class="secondary-button" type="button">取消</button>
+        <button id="automatic-config-dialog-apply" class="primary-button" type="button">应用配置</button>
+      </div>
+    </dialog>
+
     <div id="folder-picker-modal" class="folder-picker-modal hidden" role="dialog" aria-modal="true" aria-labelledby="folder-picker-title" aria-describedby="folder-picker-description">
       <section class="folder-picker-window">
         <header class="folder-picker-heading">
           <div>
             <span class="folder-picker-kicker">MODEL LOCATION</span>
-            <h2 id="folder-picker-title" tabindex="-1">选择模型文件夹</h2>
-            <p id="folder-picker-description">浏览当前机器上的文件夹，选中后会填入模型路径。</p>
+            <h2 id="folder-picker-title" tabindex="-1">选择模型文件或文件夹</h2>
+            <p id="folder-picker-description">浏览运行 Launcher 的机器。点击文件夹进入，选择文件或当前文件夹后确认。</p>
           </div>
-          <button id="folder-picker-close" class="folder-picker-close" type="button" aria-label="关闭文件夹选择器">×</button>
+          <button id="folder-picker-close" class="folder-picker-close" type="button" aria-label="关闭文件选择器">×</button>
         </header>
-        <div class="folder-picker-location">
-          <span>当前文件夹</span>
-          <code id="folder-picker-current">—</code>
-        </div>
+        <form id="folder-picker-location" class="folder-picker-location">
+          <label for="folder-picker-current">文件夹路径</label>
+          <div class="folder-picker-path">
+            <input id="folder-picker-current" type="text" placeholder="输入文件夹或文件路径" spellcheck="false" autocomplete="off">
+            <button class="folder-picker-up" type="submit">前往</button>
+          </div>
+        </form>
         <div class="folder-picker-toolbar">
           <button id="folder-picker-up" class="folder-picker-up" type="button">↑ 上一级</button>
+          <label id="folder-picker-drive-field" class="folder-picker-drive-field hidden" for="folder-picker-drive">
+            <span>磁盘</span>
+            <select id="folder-picker-drive"></select>
+          </label>
         </div>
-        <div id="folder-picker-list" class="folder-picker-list" role="listbox" aria-label="文件夹列表"></div>
+        <div id="folder-picker-list" class="folder-picker-list" role="group" aria-label="文件和文件夹"></div>
         <div id="folder-picker-status" class="folder-picker-status" role="status" aria-live="polite"></div>
         <footer class="folder-picker-actions">
           <button id="folder-picker-cancel" class="secondary-button" type="button">取消</button>

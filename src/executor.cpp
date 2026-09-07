@@ -92,7 +92,7 @@ namespace fastllm {
         const auto gateTypeIt = intParams.find("gateType");
         const MoeGateType gateType = gateTypeIt == intParams.end()
             ? MoeGateSwiglu : static_cast<MoeGateType>(gateTypeIt->second);
-        return FastllmCudaCanRunMoeCacheBatch1(
+        return FastllmCudaCanRunMoeCacheSmallBatch(
             *inputIt->second, *indexIt->second, *scoreIt->second,
             reinterpret_cast<Data **>(weightsIt->second),
             weightsBatchIt->second, gateType);

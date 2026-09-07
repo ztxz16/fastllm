@@ -7,6 +7,7 @@
 
 #include "qwen3_next.h"
 
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <map>
@@ -26,6 +27,8 @@ namespace fastllm {
 
         std::map<std::string, std::vector<std::pair<std::string, DataType>>>
         GetTensorMap(const std::vector<std::string> &tensorNames) override;
+        void OnWeightLoaded(const std::string &weightName,
+                            const std::set<std::string> &finishedWeightNames) override;
         void OnModelWeightsLoaded() override;
         bool ShouldDelaySpecialWeightNumaRegistration(
                 const std::string &weightName) const override;
@@ -255,6 +258,7 @@ namespace fastllm {
         Data visionCosData;
 
         bool preparedWeights = false;
+        std::atomic<int> mtpWeightsStatus{-1};
         std::mutex prepareMutex;
         mutable std::mutex stateMutex;
         mutable std::map<const Data *, RequestState> requestStates;
@@ -388,6 +392,8 @@ namespace fastllm {
         bool HasMtpWeights() const;
         bool MtpSupportsGenerationConfig(
             const GenerationConfig &generationConfig) const;
+        bool CanCloneMtpPrefixState(
+            const MtpRuntimeState &source, int cachedLen) const;
         std::shared_ptr<MtpRuntimeState> CloneMtpPrefixState(
             const MtpRuntimeState &source, int cachedLen) const;
         int RunMtpDraft(MtpRuntimeState &state,

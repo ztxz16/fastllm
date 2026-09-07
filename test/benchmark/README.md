@@ -1,9 +1,10 @@
 # Benchmark Scripts
 
-这个目录目前有两类 benchmark：
+这个目录包含以下测试：
 
 - `prefill.py`：测长上下文 prefill 性能。
 - `decode.py`：测多 batch 并发请求下的 decode 性能。
+- `qwen4_prefix_cache.py`：用真实 Qwen4 checkpoint 验证普通解码和 MTP 的前缀快照。
 
 本文主要说明 `decode.py` 和 `decode_config.example.json` 的用法。
 
@@ -169,3 +170,17 @@ python test/benchmark/decode.py --config test/benchmark/decode_config.example.js
 
 - 用 `prefill.py` 看长上下文是否慢；
 - 用 `decode.py` 看多 batch 下吞吐能到多少。
+
+## Qwen4 前缀缓存回归
+
+使用已构建的 `ftllm` Python 包和支持 MTP 的 Qwen4 checkpoint，在空闲 GPU 上运行：
+
+```bash
+PYTHONPATH=build-proto/tools python test/benchmark/qwen4_prefix_cache.py \
+  ~/Qwen3.8-Flash-Next-FP8 --output-dir /tmp/qwen4-prefix-check \
+  --mtp 3,0 --cache-gib 50
+```
+
+默认使用 CUDA 计算、NUMA 专家、FP16 激活和 CUDA Graph；模型及专家主机快照需要足够的系统内存。可通过 `--cache-gib`、`--moe-device`、`--threads`、`--graph` 调整运行配置。输出目录须没有同模式的既有结果。
+
+测试先关闭前缀缓存生成参考，再开启缓存，检查重复请求、真实前缀恢复、不同续写及共享快照复用；覆盖 4095/4096/4097 token 和 8193 token 的分块 prefill。它比较完整生成 token，并要求日志中出现预期长度的 `restore`，防止把未崩溃或仅查找到缓存误判为恢复成功。`mtp*.log` 保留原始日志，`mtp*.json` 保存各请求输出与首 token 耗时，`summary.json` 仅在所有检查通过后生成。

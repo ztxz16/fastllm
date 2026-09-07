@@ -69,7 +69,7 @@ extras['all-gpus'] = [f'rocm-sdk-device-{arch}=={sdk_version}'
 
 setup(
     name="ftllm-rocm",
-    version="0.1.8.1.post1",
+    version="0.1.8.2",
     python_requires=">=3.10",
     author="huangyuyang",
     author_email="ztxz16@foxmail.com",

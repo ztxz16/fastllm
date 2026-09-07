@@ -6101,6 +6101,7 @@ namespace fastllm {
                    weightType == DataType::FP8_E4M3_PERCHANNEL ||
                    weightType == DataType::NVFP4 ||
                    weightType == DataType::NVFP4_BLOCK_16 ||
+                   weightType == DataType::NVFP4_BLOCK_16_PLANAR ||
                    weightType == DataType::NVFP4_BLOCK_16_E8M0 ||
                    weightType == DataType::NVFP4_BLOCK_32_E8M0 ||
                    weightType == DataType::DATA_GGUF_FORMAT;
@@ -6119,6 +6120,7 @@ namespace fastllm {
                    weightType == DataType::FP8_E4M3_PERCHANNEL ||
                    weightType == DataType::NVFP4 ||
                    weightType == DataType::NVFP4_BLOCK_16 ||
+                   weightType == DataType::NVFP4_BLOCK_16_PLANAR ||
                    weightType == DataType::NVFP4_BLOCK_16_E8M0 ||
                    weightType == DataType::NVFP4_BLOCK_32_E8M0 ||
                    weightType == DataType::DATA_GGUF_FORMAT;
@@ -6133,6 +6135,7 @@ namespace fastllm {
                    weightType == DataType::FP8_E4M3_PERCHANNEL ||
                    weightType == DataType::NVFP4 ||
                    weightType == DataType::NVFP4_BLOCK_16 ||
+                   weightType == DataType::NVFP4_BLOCK_16_PLANAR ||
                    weightType == DataType::NVFP4_BLOCK_16_E8M0 ||
                    weightType == DataType::NVFP4_BLOCK_32_E8M0 ||
                    weightType == DataType::DATA_GGUF_FORMAT;
@@ -6188,7 +6191,8 @@ namespace fastllm {
                 FastllmCudaHalfMatMulFloatFP8E4M3PerChannel(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::NVFP4) {
                 FastllmCudaHalfMatMulFloatNVFP4(input, weight, bias, output, n, m, k);
-            } else if (weight.dataType == DataType::NVFP4_BLOCK_16) {
+            } else if (weight.dataType == DataType::NVFP4_BLOCK_16 ||
+                       weight.dataType == DataType::NVFP4_BLOCK_16_PLANAR) {
                 FastllmCudaHalfMatMulFloatNVFP4Block16(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
                        weight.dataType == DataType::NVFP4_BLOCK_32_E8M0) {
@@ -6225,7 +6229,8 @@ namespace fastllm {
                 FastllmCudaMatMulFloatFP8E4M3PerChannel(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::NVFP4) {
                 FastllmCudaMatMulFloatNVFP4(input, weight, bias, output, n, m, k);
-            } else if (weight.dataType == DataType::NVFP4_BLOCK_16) {
+            } else if (weight.dataType == DataType::NVFP4_BLOCK_16 ||
+                       weight.dataType == DataType::NVFP4_BLOCK_16_PLANAR) {
                 FastllmCudaMatMulFloatNVFP4Block16(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
                        weight.dataType == DataType::NVFP4_BLOCK_32_E8M0) {
@@ -6263,7 +6268,8 @@ namespace fastllm {
                 FastllmCudaBFloat16MatMulFP8E4M3PerChannel(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::NVFP4) {
                 FastllmCudaBFloat16MatMulNVFP4(input, weight, bias, output, n, m, k);
-            } else if (weight.dataType == DataType::NVFP4_BLOCK_16) {
+            } else if (weight.dataType == DataType::NVFP4_BLOCK_16 ||
+                       weight.dataType == DataType::NVFP4_BLOCK_16_PLANAR) {
                 FastllmCudaBFloat16MatMulNVFP4Block16(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
                        weight.dataType == DataType::NVFP4_BLOCK_32_E8M0) {
@@ -8417,6 +8423,7 @@ namespace fastllm {
                weight.dataType == DataType::FP8_E4M3_PERCHANNEL ||
                weight.dataType == DataType::NVFP4 ||
                weight.dataType == DataType::NVFP4_BLOCK_16 ||
+               weight.dataType == DataType::NVFP4_BLOCK_16_PLANAR ||
                weight.dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
                weight.dataType == DataType::NVFP4_BLOCK_32_E8M0;
     }
@@ -9235,16 +9242,16 @@ namespace fastllm {
     }
 
 #ifndef USE_ROCM
-    static bool TryCudaMergeMOECacheBatch1(
+    static bool TryCudaMergeMOECache(
             const Data &input, Data &output, const Data &index,
             const Data &score, Data &gateOutput,
             Data **weights, int weightsBatch, MoeGateType gateType) {
-        if (!FastllmCudaCanRunMoeCacheBatch1(
+        if (!FastllmCudaCanRunMoeCacheSmallBatch(
                 input, index, score, weights, weightsBatch, gateType)) {
             return false;
         }
         const bool success =
-            FastllmCudaMergeMOECacheBatch1(
+            FastllmCudaMergeMOECache(
                 input, gateOutput, output, weights, weightsBatch,
                 reinterpret_cast<const int32_t *>(index.cudaData),
                 reinterpret_cast<const float *>(score.cudaData), index.dims[1]);
@@ -9714,7 +9721,7 @@ namespace fastllm {
 
             int marlinTopk = index.dims.size() >= 2 ? index.dims[1] : 0;
 #ifndef USE_ROCM
-            if (TryCudaMergeMOECacheBatch1(
+            if (TryCudaMergeMOECache(
                     input, output, index, score,
                     w1, weights, weightsBatch, gateType)) {
                 return;

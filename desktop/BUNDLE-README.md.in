@@ -1,6 +1,52 @@
 # FastLLM Launcher @FTLLM_VERSION@
 
-这是 Linux x86_64 绿色桌面包。解压后直接运行：
+这是 Linux x86_64 绿色包，同时提供命令行、网页 Launcher 和桌面窗口。
+不需要另行安装 Python 或 CUDA Toolkit；`runtime/` 必须与启动脚本一起保留。
+
+## 命令行（不需要桌面）
+
+在解压目录打开终端，把模型路径替换为本机模型目录或 GGUF 文件：
+
+```bash
+./ftllm --help
+./ftllm server /path/to/model --device cuda:0 --host 127.0.0.1 --port 8080
+./ftllm chat /path/to/model --device cuda:0
+./ftllm tui --plain
+```
+
+`server` 提供 OpenAI 兼容 API，地址为 `http://127.0.0.1:8080/v1`；`serve` 是它的别名。
+使用 `./ftllm server --help` 查看参数，前台服务按 `Ctrl+C` 停止。
+
+如需直接使用 `ftllm` 命令，在当前 Bash 会话中执行：
+
+```bash
+source ./env.sh
+ftllm launch --no-browser
+ftllm server /path/to/model --device cuda:0 --port 8080
+```
+
+## 网页 Launcher（不需要桌面）
+
+`launch.sh` 是独立的网页启动脚本，参数与 `ftllm launch` 相同：
+
+```bash
+./launch.sh
+# 等价于 ./ftllm launch；默认打开本机浏览器
+```
+
+没有桌面的服务器上，使用另一台电脑的浏览器访问：
+
+```bash
+./launch.sh --no-browser --host 0.0.0.0 --port 8000
+# 也可以用 ./ftllm launch --no-browser --host 0.0.0.0 --port 8000
+```
+
+打开终端打印的服务器地址，保留 URL 中的 `token` 参数，并确保网络和防火墙允许该端口。
+Launcher 可启动进程和执行 Agent 任务，仅向可信用户开放。
+
+## 桌面窗口
+
+有 X11 或 Wayland 桌面时运行：
 
 ```bash
 ./FastLLM-Launcher
@@ -10,12 +56,14 @@ Electron 会在随机本机端口启动内置的 `ftllm launch --no-browser`，�
 Launcher。配置、日志和默认模型缓存位于同目录的 `data/`，移动整个目录即可一并迁移。
 如包所在目录不可写，配置会自动回退到系统用户数据目录。
 
-命令行仍可从 `ftllm/` 子目录使用：
+命令行 Launcher 默认使用当前用户的配置目录；可用 `--config /path/to/config.json` 指定配置文件。
+
+## 检查环境
 
 ```bash
-./ftllm/ftllm --version
-./ftllm/ftllm-check --require-cuda
-./ftllm/ftllm-agent-runtime info
+./ftllm --version
+./ftllm-check --require-cuda
+./ftllm-agent-runtime info
 ```
 
 包内已包含 Pi Agent 及搜索工具 ripgrep、fd。启动模型后，在“工作室”中选择项目目录即可使用目录 Agent，
@@ -26,7 +74,7 @@ Launcher。配置、日志和默认模型缓存位于同目录的 `data/`，移�
 ## 运行环境
 
 - Linux x86_64，glibc 2.35 或更高（Ubuntu 22.04 基线）。
-- 可用的 X11 或 Wayland 桌面会话。
+- 仅 `FastLLM-Launcher` 桌面窗口需要 X11 或 Wayland；命令行和网页 Launcher 无此要求。
 - NVIDIA GPU 驱动 @MIN_NVIDIA_DRIVER@ 或更新版本；建议 @RECOMMENDED_NVIDIA_DRIVER@ 或更新版本。
 - 不需要另行安装 Electron、Node.js、Python、CUDA Toolkit、cuBLAS、NCCL 或 FastLLM 的 Python 依赖。
 

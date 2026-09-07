@@ -263,6 +263,7 @@ The CLI evolves continuously, so `ftllm <command> --help` is authoritative for t
 | Option | Default | Description |
 | --- | ---: | --- |
 | `--gpu_mem_ratio` | `0.9` | Fraction of GPU memory available to weights and caches |
+| `--moe_cuda_cache` / `--moe-cuda-cache` | `0` | GPU expert-weight cache budget, e.g. `3g` (3 GiB); `0` disables it. Use with CUDA compute and CPU/NUMA experts. KV cache, common weights, and workspaces are separate; see the [expert-cache guide](docs/cuda-expert-cache.md) |
 | `--kv_cache_limit` | `auto` | Maximum KV-cache memory |
 | `--tokens` | Automatic | Total token capacity used to size paged KV cache |
 | `--page_size` | Backend-defined | Tokens per KV-cache page; the multi-GPU default is normally 16 |

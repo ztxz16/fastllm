@@ -572,7 +572,7 @@ namespace fastllm {
         // which source weights must remain on the host until preparation.
         bool MoeCudaCacheRequested() const;
         bool PrepareMoeCudaCache(
-                const std::vector<std::vector<Data *>> &layerWeights) const;
+                const std::vector<std::vector<Data *>> &layerWeights);
         bool TryApplyMoeCudaCache(
                 const Data &input, const Data &index, const Data &score,
                 std::vector<Data *> &weights,

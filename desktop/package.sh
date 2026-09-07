@@ -343,8 +343,7 @@ runtime_source="$(
 [[ -n "$runtime_source" ]] || die "make_portable.sh 未生成运行时目录"
 
 bundle_dir="${build_root}/${bundle_name}"
-mkdir -p "$bundle_dir"
-mv -- "$runtime_source" "${bundle_dir}/ftllm"
+mv -- "$runtime_source" "$bundle_dir"
 unzip -q "$electron_archive_path" -d "$bundle_dir"
 [[ -x "${bundle_dir}/electron" ]] || die "Electron 归档结构异常"
 mv -- "${bundle_dir}/electron" "${bundle_dir}/FastLLM-Launcher.bin"
@@ -361,7 +360,7 @@ mkdir -p "${bundle_dir}/licenses"
 install -m 0644 "${ROOT_DIR}/LICENSE" "${bundle_dir}/licenses/FastLLM-LICENSE"
 
 IFS=$'\t' read -r minimum_driver recommended_driver < <(
-    python3 - "${bundle_dir}/ftllm/BUILD-INFO.json" <<'PY'
+    python3 - "${bundle_dir}/BUILD-INFO.json" <<'PY'
 import json
 import sys
 
@@ -383,7 +382,7 @@ python3 "${SCRIPT_DIR}/collect_libraries.py" \
     --output "${bundle_dir}/lib" \
     --report "${bundle_dir}/ELECTRON-LIBRARIES.json" \
     --copyrights "${bundle_dir}/third-party/system" \
-    --exclude "${bundle_dir}/ftllm" \
+    --exclude "${bundle_dir}/runtime" \
     --optional libgtk-3.so.0 \
     --optional libgdk-3.so.0 \
     --optional libXss.so.1
@@ -445,10 +444,12 @@ if ((run_tests)); then
         --test "${SCRIPT_DIR}/tests/runtime.test.js"
     ELECTRON_RUN_AS_NODE=1 "${bundle_dir}/FastLLM-Launcher" \
         -p 'process.versions.electron' | grep -Fx "$ELECTRON_VERSION" >/dev/null
-    "${bundle_dir}/ftllm/ftllm" --version
-    "${bundle_dir}/ftllm/ftllm-check"
-    python3 "${SCRIPT_DIR}/tests/smoke_launcher.py" "$bundle_dir"
-    "${bundle_dir}/ftllm/python" "${ROOT_DIR}/portable/smoke_agent.py" --check-studio
+    "${bundle_dir}/ftllm" --version
+    "${bundle_dir}/ftllm" server --help >/dev/null
+    "${bundle_dir}/ftllm-check"
+    "${bundle_dir}/python" "${ROOT_DIR}/portable/smoke_launcher.py" "$bundle_dir"
+    "${bundle_dir}/python" "${ROOT_DIR}/portable/smoke_launcher.py" "$bundle_dir" --entrypoint launch.sh
+    "${bundle_dir}/python" "${ROOT_DIR}/portable/smoke_agent.py" --check-studio
     if command -v xvfb-run >/dev/null 2>&1; then
         smoke_data="${build_root}/electron-smoke-data"
         smoke_log="${build_root}/electron-smoke.log"
@@ -468,7 +469,7 @@ if ((run_tests)); then
     fi
 fi
 
-if find "${bundle_dir}/ftllm/runtime" -type f \
+if find "${bundle_dir}/runtime" -type f \
     \( -name '*.pyc' -o -name '*.pyo' \) -print -quit | grep -q .; then
     die "内置 Python 运行时包含冗余字节码文件"
 fi

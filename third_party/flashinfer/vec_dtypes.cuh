@@ -415,6 +415,15 @@ struct vec_cast<half, __nv_fp8_e5m2> {
 };
 
 #if defined(FLASHINFER_ENABLE_FP4_E2M1) && CUDA_VERSION >= 12080
+// FP4 cvt requires an architecture-specific (a) or family-specific (f) target.
+// __CUDA_ARCH__ alone also matches generic sm_100/sm_120, which reject this PTX.
+// The SM*_ALL macros cover CUDA 12.8, before family-specific targets were added.
+#if defined(__CUDA_ARCH_FEAT_SM100_ALL) || defined(__CUDA_ARCH_FEAT_SM101_ALL) || \
+    defined(__CUDA_ARCH_FEAT_SM120_ALL) || \
+    (defined(__CUDA_ARCH_FAMILY_SPECIFIC__) && (__CUDA_ARCH_FAMILY_SPECIFIC__ >= 1000))
+#define FLASHINFER_HARDWARE_FP4_CONVERSION_ENABLED
+#endif
+
 // Convert __nv_fp4x2_e2m1 (2 fp4 values per byte) to fp16.
 // vec_size counts fp16 output elements; src has stride-2 layout:
 //   src[0] holds x0,x1  src[1] is padding
@@ -425,7 +434,7 @@ struct vec_cast<half, __nv_fp4x2_e2m1> {
   template <size_t vec_size>
   FLASHINFER_INLINE static void cast(half* dst, const __nv_fp4x2_e2m1* src) {
     static_assert(vec_size % 2 == 0, "vec_size must be even for fp4x2 dequantization");
-#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+#if defined(FLASHINFER_HARDWARE_FP4_CONVERSION_ENABLED)
 #pragma unroll
     for (size_t i = 0; i < vec_size / 2; ++i) {
       uint32_t y;
@@ -442,7 +451,7 @@ struct vec_cast<half, __nv_fp4x2_e2m1> {
       reinterpret_cast<uint32_t*>(dst)[i] = y;
     }
 #else
-    // Software LUT fallback for arch < SM100.
+    // Software LUT fallback for targets without FP4 conversion instructions.
     // e2m1 encoding: bit[3]=sign, bit[2:0]=magnitude index in {0,0.5,1,1.5,2,3,4,6}.
     // Each packed byte holds two fp4 values: bits[3:0]=first, bits[7:4]=second.
     constexpr uint16_t lut[16] = {
@@ -477,7 +486,7 @@ struct vec_cast<nv_bfloat16, __nv_fp4x2_e2m1> {
   template <size_t vec_size>
   FLASHINFER_INLINE static void cast(nv_bfloat16* dst, const __nv_fp4x2_e2m1* src) {
     static_assert(vec_size % 2 == 0, "vec_size must be even for fp4x2 dequantization");
-#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+#if defined(FLASHINFER_HARDWARE_FP4_CONVERSION_ENABLED)
 #pragma unroll
     for (size_t i = 0; i < vec_size / 2; ++i) {
       uint32_t y;
@@ -512,7 +521,7 @@ struct vec_cast<nv_bfloat16, __nv_fp4x2_e2m1> {
       reinterpret_cast<uint32_t*>(dst)[i] = y;
     }
 #else
-    // Software LUT fallback for arch < SM100.
+    // Software LUT fallback for targets without FP4 conversion instructions.
     // e2m1 encoding: bit[3]=sign, bit[2:0]=magnitude index in {0,0.5,1,1.5,2,3,4,6}.
     // Each packed byte holds two fp4 values: bits[3:0]=first, bits[7:4]=second.
     constexpr uint16_t lut[16] = {
@@ -543,6 +552,7 @@ struct vec_cast<nv_bfloat16, __nv_fp4x2_e2m1> {
   }
 };
 
+#undef FLASHINFER_HARDWARE_FP4_CONVERSION_ENABLED
 #endif  // FLASHINFER_ENABLE_FP4_E2M1 && CUDA_VERSION >= 12080
 
 template <>

@@ -10,7 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -121,6 +121,50 @@ class LauncherConfigTest(unittest.TestCase):
 
         result = self.runtime.delete_profile(0)
         self.assertEqual(result["profiles"], [])
+
+    def test_configuration_mode_is_saved_without_changing_legacy_profiles(self):
+        self.assertEqual(self.runtime.default_profile()["config_mode"], "long_context")
+        self.assertTrue(self.runtime.default_profile()["low_gpu_mem"])
+        for mode in ("long_context", "high_concurrency", "custom"):
+            saved = self.runtime.save_profile(None, self.config(config_mode=mode))
+            self.assertEqual(self.runtime.profiles()[saved["index"]]["config_mode"], mode)
+            self.assertNotIn("--config_mode", self.runtime.preview(saved["profile"])["command"])
+        legacy = config_from_dict({"max_batch": "3", "max_context_length": "12345"})
+        self.assertEqual(legacy.config_mode, "custom")
+        self.assertFalse(legacy.low_gpu_mem)
+        self.assertEqual(legacy.max_batch, "3")
+        self.assertEqual(legacy.max_context_length, "12345")
+
+    def test_configuration_modes_preserve_model_weight_context_and_chunk_defaults(self):
+        model_path = os.path.join(self.temp.name, "mode-test")
+        self.write_model(model_path, {
+            "architectures": ["Qwen3ForCausalLM"], "max_position_embeddings": 32768,
+        }, 4)
+        for mode, batch in (("long_context", "1"), ("high_concurrency", "auto"), ("custom", "4")):
+            recommendation = recommend_launch_config(model_path, self.hardware((24,)), config_mode=mode)
+            config = recommendation["config"]
+            self.assertEqual(config["config_mode"], mode)
+            self.assertEqual(config["max_batch"], batch)
+            self.assertEqual(config["max_context_length"], "auto")
+            self.assertEqual(config["low_gpu_mem"], mode == "long_context")
+            for field in ("dtype", "moe_dtype", "chunked_prefill_size"):
+                self.assertNotIn(field, config)
+            argv = build_fastllm_argv(config_from_dict({"model": model_path, **config}))
+            self.assertEqual("--low_gpu_mem" in argv, mode == "long_context")
+            for option in ("--dtype", "--moe_dtype", "--chunked_prefill_size", "--max_context_length"):
+                self.assertNotIn(option, argv)
+        with self.assertRaisesRegex(LauncherError, "Unknown configuration mode"):
+            recommend_launch_config(model_path, config_mode="invalid")
+
+    def test_insufficient_gpu_memory_does_not_trigger_weight_conversion(self):
+        model_path = os.path.join(self.temp.name, "Dense-20B")
+        self.write_model(model_path, {
+            "architectures": ["Qwen3ForCausalLM"], "torch_dtype": "float16",
+        }, 40)
+        for mode in ("long_context", "high_concurrency", "custom"):
+            recommendation = recommend_launch_config(model_path, self.hardware((24,)), config_mode=mode)
+            self.assertEqual(recommendation["strategy"], "numa")
+            self.assertNotIn("dtype", recommendation["config"])
 
     def test_invalid_dflash_configuration_is_reported(self):
         preview = self.runtime.preview(self.config(
@@ -512,7 +556,7 @@ class LauncherConfigTest(unittest.TestCase):
         ]
         self.assertNotRegex("\n".join(english_values), r"[一-龥]")
 
-    def test_folder_browser_lists_only_directories_and_resolves_file_path(self):
+    def test_folder_browser_lists_folders_and_files_and_resolves_file_path(self):
         browser_root = os.path.join(self.temp.name, "browser")
         os.makedirs(os.path.join(browser_root, "zeta"))
         os.makedirs(os.path.join(browser_root, "Alpha"))
@@ -528,9 +572,21 @@ class LauncherConfigTest(unittest.TestCase):
         )
         self.assertFalse(listing["truncated"])
         self.assertNotIn("model.gguf", [folder["name"] for folder in listing["folders"]])
+        self.assertEqual(listing["files"], [{"name": "model.gguf", "path": model_file}])
 
         file_listing = browse_folders(model_file)
         self.assertEqual(file_listing["path"], browser_root)
+        self.assertEqual(file_listing["selectedFile"], model_file)
+
+    def test_file_browser_bounds_combined_directory_and_file_entries(self):
+        for name in ("a.gguf", "b.flm", "c.bin"):
+            with open(os.path.join(self.model_path, name), "w"):
+                pass
+        os.mkdir(os.path.join(self.model_path, "folder"))
+        with patch("fastllm_pytools.launcher.FOLDER_BROWSER_ENTRY_LIMIT", 2):
+            listing = browse_folders(self.model_path)
+        self.assertEqual(len(listing["folders"]) + len(listing["files"]), 2)
+        self.assertTrue(listing["truncated"])
 
     def test_folder_browser_api_returns_server_directories(self):
         from fastapi.testclient import TestClient
@@ -539,18 +595,50 @@ class LauncherConfigTest(unittest.TestCase):
         child = os.path.join(browser_root, "model")
         os.makedirs(child)
         client = TestClient(create_launcher_app(self.runtime, "control-secret"))
-        response = client.get(
-            "/api/folders",
-            params={"path": browser_root},
-            headers={"X-FTLLM-Launcher-Token": "control-secret"},
-        )
+        drives = [{"name": "D:", "path": "D:\\"}]
+        with patch("fastllm_pytools.launcher._folder_browser_drives", return_value=drives):
+            response = client.get(
+                "/api/folders",
+                params={"path": browser_root},
+                headers={"X-FTLLM-Launcher-Token": "control-secret"},
+            )
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["path"], browser_root)
+        self.assertEqual(response.json()["drives"], drives)
         self.assertEqual(response.json()["folders"], [{
             "name": "model",
             "path": child,
         }])
+
+    def test_windows_folder_browser_lists_drives_and_selects_files_on_another_volume(self):
+        import ctypes
+        import ntpath
+
+        folder = "D:\\模型 目录"
+        model_file = folder + "\\model.gguf"
+        entry = SimpleNamespace(name="model.gguf", path=model_file,
+                                is_dir=lambda **kwargs: False, is_file=lambda **kwargs: True)
+        windows_os = SimpleNamespace(name="nt", path=ntpath,
+                                     scandir=lambda path: nullcontext(iter([entry] if path == folder else [])))
+        kernel32 = SimpleNamespace(GetLogicalDrives=lambda: (1 << 2) | (1 << 3) | (1 << 25))
+        with patch("fastllm_pytools.launcher.os", windows_os), \
+                patch("ctypes.windll", SimpleNamespace(kernel32=kernel32), create=True), \
+                patch("ntpath.isdir", side_effect=lambda path: path in ("C:\\", "D:\\", folder)), \
+                patch("ntpath.isfile", side_effect=lambda path: path == model_file):
+            listing = browse_folders(model_file)
+            self.assertEqual(listing["path"], folder)
+            self.assertEqual(listing["parent"], "D:\\")
+            self.assertEqual(listing["selectedFile"], model_file)
+            self.assertEqual(listing["files"], [{"name": "model.gguf", "path": model_file}])
+            self.assertEqual(listing["drives"], [
+                {"name": "C:", "path": "C:\\"},
+                {"name": "D:", "path": "D:\\"},
+                {"name": "Z:", "path": "Z:\\"},
+            ])
+            self.assertEqual(browse_folders("D:\\")["parent"], "")
+            with self.assertRaisesRegex(LauncherError, "Folder root is unavailable"):
+                browse_folders("Z:\\")
 
     def test_control_api_requires_launcher_token(self):
         from fastapi.testclient import TestClient
@@ -620,6 +708,108 @@ class LauncherConfigTest(unittest.TestCase):
 
 
 class LauncherProcessTest(unittest.TestCase):
+    def test_context_window_uses_reported_session_limit_and_ignores_stale_logs(self):
+        from fastapi.testclient import TestClient
+
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = LauncherRuntime(os.path.join(directory, "config.json"))
+            self.addCleanup(runtime.close)
+            self.assertIsNone(runtime.state()["contextWindowTokens"])
+            runtime._state.update(phase="starting")
+            for limit, capacity, configured in ((262144, 335360, "None"),
+                                                (167168, 167168, "None"),
+                                                (8192, 335360, "8192")):
+                line = (f"Model context window: {limit} tokens per session "
+                        f"(model=262144, shared KV cache={capacity}, configured limit={configured})")
+                runtime._consume_stream(io.StringIO(
+                    "\x1b[32m2026-09-06 16:14:10,407 447441 server.py[line:326] INFO: "
+                    + line + "\x1b[0m\n"), "stderr", runtime._generation)
+                self.assertEqual(runtime.state()["contextWindowTokens"], limit)
+            runtime.clear_logs()
+            client = TestClient(create_launcher_app(runtime, "test-key"))
+            response = client.get("/api/runtime", headers={"X-FTLLM-Launcher-Token": "test-key"})
+            self.assertEqual(response.json()["contextWindowTokens"], 8192)
+            for invalid in ("[Fastllm] KV Cache Token limit: 335360 tokens.",
+                            line.replace("8192 tokens", "0 tokens"),
+                            line.replace("8192 tokens", "-1 tokens"),
+                            line.replace("8192 tokens", "NaN tokens")):
+                runtime._handle_context_window(invalid, runtime._generation)
+                self.assertEqual(runtime.state()["contextWindowTokens"], 8192)
+            runtime._state["contextWindowTokens"] = None
+            runtime._handle_context_window(line, runtime._generation - 1)
+            self.assertIsNone(runtime.state()["contextWindowTokens"])
+            for phase in ("stopped", "stopping", "failed"):
+                runtime._state.update(phase=phase)
+                runtime._handle_context_window(line, runtime._generation)
+                self.assertIsNone(runtime.state()["contextWindowTokens"])
+            runtime._state.update(phase="running", command="webui")
+            runtime._handle_context_window(line, runtime._generation)
+            self.assertIsNone(runtime.state()["contextWindowTokens"])
+            runtime._state.update(command="server")
+            runtime._handle_context_window(line, runtime._generation)
+            self.assertEqual(runtime.state()["contextWindowTokens"], 8192)
+            runtime.stop()
+            self.assertIsNone(runtime.state()["contextWindowTokens"])
+
+    def test_speed_samples_are_read_from_engine_logs_and_exposed_by_api(self):
+        from fastapi.testclient import TestClient
+
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = LauncherRuntime(os.path.join(directory, "config.json"))
+            self.addCleanup(runtime.close)
+            runtime._state.update(phase="running", ready=True)
+            prompt = "[Prompt] 1024 Tokens. Speed: 2345.678900 tokens / s."
+            decode = "[Decode] alive = 2, pending = 1, context usages: 12.5%, Speed: 98.765432 tokens / s."
+            with patch("fastllm_pytools.launcher.time.time", return_value=1000.0):
+                runtime._consume_stream(io.StringIO("\x1b[32m" + prompt + "\x1b[0m\n" + decode + "\n"),
+                                        "stdout", runtime._generation)
+            speed = runtime.state()["speed"]
+            self.assertEqual(speed, {"prefillTokensPerSecond": 2345.6789, "decodeTokensPerSecond": 98.765432,
+                                     "prefillUpdatedAt": 1000.0, "decodeUpdatedAt": 1000.0})
+            runtime.clear_logs()
+            self.assertEqual(runtime.state()["speed"], speed)
+            client = TestClient(create_launcher_app(runtime, "test-key"))
+            response = client.get("/api/runtime", headers={"X-FTLLM-Launcher-Token": "test-key"})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["speed"], speed)
+            speed["decodeTokensPerSecond"] = 0
+            self.assertEqual(runtime.state()["speed"]["decodeTokensPerSecond"], 98.765432)
+            with patch("fastllm_pytools.launcher.time.time", return_value=1002.0):
+                runtime._handle_inference_speed(
+                    "[Prompt] Long Prefill ... (2048/8192, 25%). Speed: 4.5e3 tokens / s.", runtime._generation)
+                runtime._handle_inference_speed(
+                    "[Decode] alive = 1, pending = 0, contextLen = 8192, Speed: 123.0 tokens / s.", runtime._generation)
+            self.assertEqual(runtime.state()["speed"]["prefillTokensPerSecond"], 4500.0)
+            self.assertEqual(runtime.state()["speed"]["decodeTokensPerSecond"], 123.0)
+            self.assertEqual(runtime.state()["speed"]["decodeUpdatedAt"], 1002.0)
+
+    def test_speed_ignores_invalid_and_previous_service_samples(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = LauncherRuntime(os.path.join(directory, "config.json"))
+            self.addCleanup(runtime.close)
+            empty = runtime.state()["speed"]
+            runtime._state.update(phase="running")
+            for line in ("user output Speed: 42 tokens / s.", "[Prompt] Long Prefill ... (10%)",
+                         *[f"[Decode] alive = 1, Speed: {value} tokens / s."
+                           for value in ("nan", "inf", "-1", "1e9999")]):
+                runtime._handle_inference_speed(line, runtime._generation)
+            self.assertEqual(runtime.state()["speed"], empty)
+            valid = "[Decode] alive = 1, pending = 0, contextLen = 128, Speed: 42 tokens / s."
+            runtime._handle_inference_speed(valid, runtime._generation - 1)
+            self.assertEqual(runtime.state()["speed"], empty)
+            for phase in ("stopped", "failed", "stopping"):
+                runtime._state.update(phase=phase)
+                runtime._handle_inference_speed(valid, runtime._generation)
+                self.assertEqual(runtime.state()["speed"], empty)
+            runtime._state.update(phase="running", command="webui")
+            runtime._handle_inference_speed(valid, runtime._generation)
+            self.assertEqual(runtime.state()["speed"], empty)
+            runtime._state.update(command="server")
+            runtime._handle_inference_speed(valid, runtime._generation)
+            self.assertEqual(runtime.state()["speed"]["decodeTokensPerSecond"], 42)
+            runtime.stop()
+            self.assertEqual(runtime.state()["speed"], empty)
+
     def test_launcher_opens_browser_after_startup_by_default(self):
         import uvicorn
 
@@ -741,9 +931,17 @@ class LauncherProcessTest(unittest.TestCase):
                 "percent": 100,
                 "message": "API server is ready",
             }
+            runtime._state["speed"]["decodeTokensPerSecond"] = 99
+            runtime._state["contextWindowTokens"] = 262144
+            def checked_popen(*args, **kwargs):
+                self.assertTrue(all(value is None for value in runtime.state()["speed"].values()))
+                self.assertIsNone(runtime.state()["contextWindowTokens"])
+                return subprocess.Popen(*args, **kwargs)
+            runtime._popen = checked_popen
             script = (
                 "import json,sys,time;"
                 f"print('FTLLM_PROGRESS '+json.dumps({event!r}),file=sys.stderr,flush=True);"
+                "print('[Decode] alive = 1, pending = 0, contextLen = 128, Speed: 42.0 tokens / s.',flush=True);"
                 "time.sleep(30)"
             )
             fake_argv = [sys.executable, "-u", "-c", script]
@@ -765,11 +963,12 @@ class LauncherProcessTest(unittest.TestCase):
                 self.assertEqual(started["phase"], "starting")
                 deadline = time.monotonic() + 3
                 while time.monotonic() < deadline:
-                    if runtime.state()["phase"] == "running":
+                    if runtime.state()["phase"] == "running" and runtime.state()["speed"]["decodeTokensPerSecond"] == 42:
                         break
                     time.sleep(0.02)
                 self.assertEqual(runtime.state()["phase"], "running")
                 self.assertTrue(runtime.state()["ready"])
+                self.assertEqual(runtime.state()["speed"]["decodeTokensPerSecond"], 42)
 
                 runtime.stop()
                 deadline = time.monotonic() + 3

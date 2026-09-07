@@ -4,6 +4,7 @@ import hmac
 import importlib.util
 import ipaddress
 import json
+import math
 import os
 import platform
 import re
@@ -25,6 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .modelscope_download import PROGRESS_PREFIX as MODELSCOPE_PROGRESS_PREFIX
+from .launcher_mtp import detect_mtp_support
 from .startup_progress import PROGRESS_PREFIX
 from .tui import (
     DEFAULT_MODELSCOPE_MODEL_ID,
@@ -68,6 +70,14 @@ MODELSCOPE_INSTALL_ERROR = (
 )
 ANSI_ESCAPE_PATTERN = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 CONTROL_CHARACTER_PATTERN = re.compile(r"[\x00-\x1f\x7f]")
+INFERENCE_SPEED_PATTERN = re.compile(
+    r"^\[(Prompt|Decode)\]\s+.+?\bSpeed:\s*"
+    r"((?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s+tokens\s*/\s*s\.?\s*$"
+)
+CONTEXT_WINDOW_PATTERN = re.compile(
+    r"\bModel context window:\s*(\d{1,10})\s+tokens per session "
+    r"\(model=(?:\d+|None), shared KV cache=(?:\d+|None), configured limit=(?:\d+|None)\)\s*$"
+)
 GIB = 1024 ** 3
 MODEL_CONFIG_SIZE_LIMIT = 8 * 1024 * 1024
 MODEL_WEIGHT_ENTRY_LIMIT = 4096
@@ -348,6 +358,15 @@ def _log_level(line: str) -> str:
     return "info"
 
 
+def _empty_runtime_speed() -> Dict[str, Any]:
+    return {
+        "prefillTokensPerSecond": None,
+        "decodeTokensPerSecond": None,
+        "prefillUpdatedAt": None,
+        "decodeUpdatedAt": None,
+    }
+
+
 def _empty_runtime_state() -> Dict[str, Any]:
     return {
         "phase": "stopped",
@@ -366,6 +385,8 @@ def _empty_runtime_state() -> Dict[str, Any]:
         "startedAt": None,
         "sessionId": "",
         "exitCode": None,
+        "speed": _empty_runtime_speed(),
+        "contextWindowTokens": None,
     }
 
 
@@ -433,6 +454,8 @@ class LauncherRuntime:
         configs = load_saved_configs(self.config_path)
         config = new_deploy_config(configs)
         config.command = "server"
+        config.config_mode = "long_context"
+        config.low_gpu_mem = True
         return asdict(config)
 
     def _close_webui_locked(self):
@@ -553,7 +576,7 @@ class LauncherRuntime:
 
     def state(self) -> Dict[str, Any]:
         with self._lock:
-            return dict(self._state)
+            return {**self._state, "reportedAt": time.time(), "speed": dict(self._state["speed"])}
 
     def download_state(self) -> Dict[str, Any]:
         with self._lock:
@@ -862,6 +885,8 @@ class LauncherRuntime:
                 "startedAt": time.time(),
                 "sessionId": secrets.token_hex(16),
                 "exitCode": None,
+                "speed": _empty_runtime_speed(),
+                "contextWindowTokens": None,
             })
             self._last_progress_stage = ""
             self._append_log(
@@ -919,6 +944,8 @@ class LauncherRuntime:
                 if source == "stderr" and line.startswith(PROGRESS_PREFIX):
                     self._handle_progress(line[len(PROGRESS_PREFIX):], generation)
                     continue
+                self._handle_inference_speed(line, generation)
+                self._handle_context_window(line, generation)
                 self._append_log("ftllm", _log_level(line), line)
         except Exception as error:
             self._append_log("launcher", "warning", f"Failed to read {source}: {error}")
@@ -927,6 +954,37 @@ class LauncherRuntime:
                 stream.close()
             except Exception:
                 pass
+
+    def _handle_inference_speed(self, line: str, generation: int):
+        """Capture the engine's latest throughput samples without estimating tokens."""
+        match = INFERENCE_SPEED_PATTERN.fullmatch(line)
+        if not match:
+            return
+        value = float(match[2])
+        if not math.isfinite(value):
+            return
+        kind = "prefill" if match[1] == "Prompt" else "decode"
+        with self._lock:
+            if (generation != self._generation or self._state["command"] != "server"
+                    or self._state["phase"] not in ("starting", "running")):
+                return
+            self._state["speed"] = {
+                **self._state["speed"],
+                kind + "TokensPerSecond": value,
+                kind + "UpdatedAt": time.time(),
+            }
+
+    def _handle_context_window(self, line: str, generation: int):
+        # server.py reports the effective per-session limit after warmup,
+        # accounting for model, shared KV capacity, and explicit context settings.
+        match = CONTEXT_WINDOW_PATTERN.search(line)
+        if not match or int(match[1]) <= 0:
+            return
+        with self._lock:
+            if (generation != self._generation or self._state["command"] != "server"
+                    or self._state["phase"] not in ("starting", "running")):
+                return
+            self._state["contextWindowTokens"] = int(match[1])
 
     def _handle_progress(self, raw_event: str, generation: int):
         try:
@@ -1286,8 +1344,23 @@ def detect_hardware(model_path: str = "") -> Dict[str, Any]:
     }
 
 
+def _folder_browser_drives() -> List[Dict[str, str]]:
+    if os.name != "nt":
+        return []
+    try:
+        import ctypes
+        # Enumerate drive letters without probing removable or network volumes.
+        mask = ctypes.windll.kernel32.GetLogicalDrives()
+    except (AttributeError, OSError):
+        return []
+    return [
+        {"name": f"{chr(65 + index)}:", "path": f"{chr(65 + index)}:\\"}
+        for index in range(26) if mask & (1 << index)
+    ]
+
+
 def browse_folders(path: str = "") -> Dict[str, Any]:
-    """Return a bounded directory listing for the launcher's folder picker."""
+    """Return bounded folders and files from the machine running Launcher."""
     raw_path = str(path or "").strip()
     try:
         current = os.path.abspath(
@@ -1296,7 +1369,8 @@ def browse_folders(path: str = "") -> Dict[str, Any]:
     except (OSError, ValueError) as error:
         raise LauncherError("Invalid folder path.") from error
 
-    if os.path.isfile(current):
+    selected_file = current if os.path.isfile(current) else ""
+    if selected_file:
         current = os.path.dirname(current)
     else:
         # A partially typed model path is useful as a starting point. Walk up
@@ -1304,6 +1378,8 @@ def browse_folders(path: str = "") -> Dict[str, Any]:
         while not os.path.isdir(current):
             parent = os.path.dirname(current)
             if parent == current:
+                if raw_path:
+                    raise LauncherError("Folder root is unavailable.")
                 current = ""
                 break
             current = parent
@@ -1313,20 +1389,22 @@ def browse_folders(path: str = "") -> Dict[str, Any]:
         current = home if os.path.isdir(home) else os.getcwd()
 
     folders = []
+    files = []
     truncated = False
     try:
         with os.scandir(current) as entries:
             for entry in entries:
                 try:
                     is_directory = entry.is_dir(follow_symlinks=True)
+                    is_file = not is_directory and entry.is_file(follow_symlinks=True)
                 except OSError:
                     continue
-                if not is_directory:
+                if not is_directory and not is_file:
                     continue
-                if len(folders) >= FOLDER_BROWSER_ENTRY_LIMIT:
+                if len(folders) + len(files) >= FOLDER_BROWSER_ENTRY_LIMIT:
                     truncated = True
                     break
-                folders.append({
+                (folders if is_directory else files).append({
                     "name": entry.name,
                     "path": os.path.abspath(entry.path),
                 })
@@ -1334,11 +1412,15 @@ def browse_folders(path: str = "") -> Dict[str, Any]:
         raise LauncherError(f"Unable to read folder: {error}") from error
 
     folders.sort(key=lambda item: (item["name"].casefold(), item["name"]))
+    files.sort(key=lambda item: (item["name"].casefold(), item["name"]))
     parent = os.path.dirname(current)
     return {
         "path": current,
         "parent": "" if parent == current else parent,
+        "drives": _folder_browser_drives(),
         "folders": folders,
+        "files": files,
+        "selectedFile": selected_file,
         "truncated": truncated,
     }
 
@@ -1551,33 +1633,12 @@ def inspect_launch_model(model_path: str, name: str = "") -> Dict[str, Any]:
     }
 
 
-def _dtype_bytes_per_parameter(metadata: Dict[str, Any], dtype: str) -> float:
-    if dtype in ("int4", "int4g128", "int4g256"):
-        return 0.62
-    if dtype in ("int8", "fp8_e4m3"):
-        return 1.05
-    if dtype == "float32":
-        return 4.0
-    if dtype in ("float16", "bfloat16"):
-        return 2.0
-    return max(0.25, _positive_number(metadata.get("sourceBytesPerParameter")) or 2.0)
-
-
-def _estimate_launch_model_bytes(metadata: Dict[str, Any], dtype: str) -> int:
+def _estimate_launch_model_bytes(metadata: Dict[str, Any]) -> int:
     weight_bytes = int(_positive_number(metadata.get("weightBytes")))
-    source_dtype = str(metadata.get("recommendedDtype") or "auto")
-    if weight_bytes:
-        if dtype != source_dtype and dtype != "auto":
-            source_bytes = max(
-                0.25,
-                _positive_number(metadata.get("sourceBytesPerParameter")) or 2.0,
-            )
-            weight_bytes = int(
-                weight_bytes * _dtype_bytes_per_parameter(metadata, dtype) / source_bytes
-            )
-    else:
+    if not weight_bytes:
         parameters = _positive_number(metadata.get("parameterBillions")) * 1e9
-        weight_bytes = int(parameters * _dtype_bytes_per_parameter(metadata, dtype))
+        source_bytes = _positive_number(metadata.get("sourceBytesPerParameter")) or 2.0
+        weight_bytes = int(parameters * source_bytes)
     if weight_bytes <= 0:
         return 0
     return int(weight_bytes * 1.1 + 1.25 * GIB)
@@ -1647,53 +1708,26 @@ def _choose_gpu_launch_plan(
     gpus = hardware["gpus"]
     if not gpus:
         return None
-    recommended_dtype = str(metadata.get("recommendedDtype") or "auto")
-    candidates = [recommended_dtype]
-    if (
-        metadata.get("convertible")
-        and _dtype_bytes_per_parameter(metadata, recommended_dtype) > 0.7
-    ):
-        candidates.append("int4g128")
+    required_bytes = _estimate_launch_model_bytes(metadata)
+    if required_bytes <= 0:
+        return {"gpus": gpus[:1]}
     maximum = len(gpus) if _model_supports_tensor_parallel(metadata) else 1
-    for dtype in candidates:
-        required_bytes = _estimate_launch_model_bytes(metadata, dtype)
-        if required_bytes <= 0:
-            selected = gpus[:1]
-            return {
-                "dtype": dtype,
-                "requiredBytes": 0,
-                "gpus": selected,
-                "precisionAdjusted": dtype != recommended_dtype,
-            }
-        for count in range(maximum, 0, -1):
-            selected = gpus[:count]
-            if all(gpu["usableBytes"] >= required_bytes / count for gpu in selected):
-                return {
-                    "dtype": dtype,
-                    "requiredBytes": required_bytes,
-                    "gpus": selected,
-                    "precisionAdjusted": dtype != recommended_dtype,
-                }
+    for count in range(maximum, 0, -1):
+        selected = gpus[:count]
+        if all(gpu["usableBytes"] >= required_bytes / count for gpu in selected):
+            return {"gpus": selected}
     return None
-
-
-def _recommended_chunked_prefill(metadata: Dict[str, Any]) -> str:
-    parameters = _positive_number(metadata.get("parameterBillions"))
-    weight_bytes = _positive_number(metadata.get("weightBytes"))
-    if parameters >= 70 or weight_bytes >= 80 * GIB:
-        return "2048"
-    if parameters >= 30 or weight_bytes >= 40 * GIB:
-        return "4096"
-    if parameters >= 9 or weight_bytes >= 16 * GIB:
-        return "8192"
-    return "auto"
 
 
 def recommend_launch_config(
     model_path: str,
     hardware: Optional[Dict[str, Any]] = None,
     name: str = "",
+    config_mode: str = "custom",
+    enable_speculative_decoding: bool = False,
 ) -> Dict[str, Any]:
+    if config_mode not in ("long_context", "high_concurrency", "custom"):
+        raise LauncherError("Unknown configuration mode.")
     model_path = str(model_path or "").strip()[:4096]
     if not model_path:
         raise LauncherError("Model path is required for automatic configuration.")
@@ -1713,14 +1747,15 @@ def recommend_launch_config(
     else:
         maximum_batch = "4"
     config = {
+        "config_mode": config_mode,
         "device": "auto",
         "cuda_device_id": "0",
         "tp": "2",
-        "dtype": str(metadata.get("recommendedDtype") or "auto"),
         "threads": "auto",
         "gpu_mem_ratio": "0.9",
+        "low_gpu_mem": config_mode == "long_context",
         "max_batch": maximum_batch,
-        "chunked_prefill_size": _recommended_chunked_prefill(metadata),
+        "max_context_length": "auto",
         "kv_cache_dtype": "auto",
         "kv_cache_limit": "auto",
         "tokens": "auto",
@@ -1728,7 +1763,6 @@ def recommend_launch_config(
         "moe_device": "numa",
         "moe_device_layers": "-1",
         "moe_device_custom": "",
-        "moe_dtype": "auto",
         "moe_atype": "auto",
         "ngram_device": "auto",
         # Draft compatibility is model-specific. Keep speculative decoding
@@ -1739,12 +1773,9 @@ def recommend_launch_config(
         "draft_tokens": "auto",
     }
     strategy = "automatic"
-    precision_adjusted = False
     gpu_plan = _choose_gpu_launch_plan(metadata, normalized_hardware)
     if gpu_plan:
         selected = sorted(gpu_plan["gpus"], key=lambda gpu: gpu["index"])
-        config["dtype"] = gpu_plan["dtype"]
-        precision_adjusted = bool(gpu_plan["precisionAdjusted"])
         if len(selected) == 1:
             strategy = "cuda"
             config["device"] = "cuda"
@@ -1755,18 +1786,8 @@ def recommend_launch_config(
             config["tp"] = ",".join(str(gpu["index"]) for gpu in selected)
     elif metadata.get("isMoe") and normalized_hardware["gpus"]:
         best_gpu = normalized_hardware["gpus"][0]
-        runtime_bytes = _estimate_launch_model_bytes(metadata, config["dtype"])
+        runtime_bytes = _estimate_launch_model_bytes(metadata)
         available_memory = normalized_hardware["availableMemoryBytes"]
-        if (
-            metadata.get("convertible")
-            and available_memory > 0
-            and runtime_bytes > available_memory * HOST_MEMORY_USABLE_RATIO
-        ):
-            converted_bytes = _estimate_launch_model_bytes(metadata, "int4g128")
-            if converted_bytes <= available_memory * HOST_MEMORY_USABLE_RATIO:
-                config["dtype"] = "int4g128"
-                runtime_bytes = converted_bytes
-                precision_adjusted = True
         memory_fits = (
             runtime_bytes <= 0
             or available_memory <= 0
@@ -1796,19 +1817,8 @@ def recommend_launch_config(
             "numa" if normalized_hardware["numaNodes"] > 1 else "cpu"
         )
         strategy = "numa" if config["device"] == "numa" else "cpu"
-        runtime_bytes = _estimate_launch_model_bytes(metadata, config["dtype"])
+        runtime_bytes = _estimate_launch_model_bytes(metadata)
         available_memory = normalized_hardware["availableMemoryBytes"]
-        if (
-            metadata.get("convertible")
-            and parameter_billions >= 3
-            and available_memory > 0
-            and runtime_bytes > available_memory * HOST_MEMORY_USABLE_RATIO
-        ):
-            converted_bytes = _estimate_launch_model_bytes(metadata, "int4g128")
-            if converted_bytes <= available_memory * HOST_MEMORY_USABLE_RATIO:
-                config["dtype"] = "int4g128"
-                runtime_bytes = converted_bytes
-                precision_adjusted = True
         if (
             metadata.get("isMoe")
             and available_memory > 0
@@ -1820,11 +1830,33 @@ def recommend_launch_config(
 
     ngram_disk = False
     if metadata.get("usesNgram"):
-        runtime_bytes = _estimate_launch_model_bytes(metadata, config["dtype"])
+        runtime_bytes = _estimate_launch_model_bytes(metadata)
         memory_headroom = normalized_hardware["availableMemoryBytes"] - runtime_bytes
         if config["moe_device"] == "disk" or memory_headroom < NGRAM_MEMORY_RESERVE:
             config["ngram_device"] = "disk"
             ngram_disk = True
+
+    if config_mode == "long_context":
+        # Reserve the cache for a single long conversation. Context capacity
+        # still follows the model and the runtime's available-memory limit.
+        config["max_batch"] = "1"
+    elif config_mode == "high_concurrency":
+        # Let the engine size batching from its actual cache budget and model capabilities.
+        config["max_batch"] = "auto"
+
+    speculative_reason = "not_requested"
+    if enable_speculative_decoding:
+        speculative_reason = detect_mtp_support(
+            expanded_path, _read_model_config_for_recommendation(expanded_path)
+        )
+        if speculative_reason == "enabled":
+            build = normalized_hardware["build"]
+            if (config["device"] in ("cuda", "tp")
+                    and build.get("USE_CUDA") is not False and not build.get("USE_ROCM")):
+                config["mtp"] = "3"
+                config["speculative_algorithm"] = "mtp"
+            else:
+                speculative_reason = "cuda_required"
 
     selected_gpu_ids = []
     if config["device"] == "cuda":
@@ -1835,6 +1867,11 @@ def recommend_launch_config(
         "version": 1,
         "strategy": strategy,
         "config": config,
+        "speculative": {
+            "requested": bool(enable_speculative_decoding),
+            "enabled": speculative_reason == "enabled",
+            "reason": speculative_reason,
+        },
         "detected": {
             "architecture": metadata["architecture"],
             "modelType": metadata["modelType"],
@@ -1863,7 +1900,6 @@ def recommend_launch_config(
             "selectedGpuIds": selected_gpu_ids,
         },
         "adjustments": {
-            "precisionAdjusted": precision_adjusted,
             "ngramOnDisk": ngram_disk,
             "metadataLimited": not metadata["configFound"] or weight_bytes <= 0,
         },
@@ -1991,11 +2027,14 @@ def create_launcher_app(
             raise LauncherError("Invalid automatic configuration request.")
         model_path = str(payload.get("model") or "")[:4096]
         name = str(payload.get("name") or "")[:512]
+        config_mode = str(payload.get("config_mode") or "custom")
         return await run_in_threadpool(
             recommend_launch_config,
             model_path,
             None,
             name,
+            config_mode,
+            payload.get("enable_speculative_decoding") is True,
         )
 
     @app.post("/api/profiles")

@@ -21,7 +21,7 @@ const loadingPagePath = path.join(__dirname, "loading.html");
 const loadingPageUrl = pathToFileURL(loadingPagePath);
 const packagedRoot = path.dirname(process.execPath);
 const runtimeRoot = path.resolve(
-  process.env.FTLLM_RUNTIME_DIR || path.join(packagedRoot, "ftllm"),
+  process.env.FTLLM_RUNTIME_DIR || packagedRoot,
 );
 
 function makeWritableDataRoot(preferredRoot) {

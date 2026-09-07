@@ -1071,7 +1071,7 @@ namespace fastllm {
     }
 #endif
 
-    template <bool useLookup>
+    template <bool useLookup, bool PLANAR = false>
     static bool FastllmGemmBFloat16NVFP4Block16_AVX512BF16_Run(
         const void *A, long lda,
         const void *B, long ldb,
@@ -1086,20 +1086,26 @@ namespace fastllm {
             const uint16_t *input = (const uint16_t*)((const uint8_t*)A + (size_t)i * lda);
             float *output = (float*)((uint8_t*)C + (size_t)i * ldc);
             for (int j = st; j < end; j++) {
-                const uint8_t *rowStart = (const uint8_t*)B + (size_t)j * ldb;
+                const int blocks = (m - 1) / 16 + 1;
+                constexpr int weightStride = PLANAR ? 8 : 12;
+                constexpr int scaleStride = PLANAR ? sizeof(float) : 12;
+                const uint8_t *rowStart = (const uint8_t*)B +
+                    (PLANAR ? NVFP4PlanarWeightOffset(j, blocks) : (size_t)j * ldb);
+                const uint8_t *rowScales = PLANAR
+                    ? (const uint8_t*)B + NVFP4PlanarScaleOffset(j, blocks) : rowStart + 8;
                 int block = 0;
-                int blocks = (m - 1) / 16 + 1;
                 __m512 scaledSum = _mm512_setzero_ps();
                 while (block < blocks) {
-                    const uint8_t *blockStart = rowStart + block * (8 + sizeof(float));
+                    const uint8_t *blockStart = rowStart + block * weightStride;
+                    const uint8_t *scaleStart = rowScales + block * scaleStride;
                     float scale;
-                    memcpy(&scale, blockStart + 8, sizeof(float));
+                    memcpy(&scale, scaleStart, sizeof(float));
                     int l = block * 16;
 
                     if (block + 1 < blocks && l + 31 < m) {
-                        const uint8_t *nextBlockStart = rowStart + (block + 1) * (8 + sizeof(float));
+                        const uint8_t *nextBlockStart = blockStart + weightStride;
                         float nextScale;
-                        memcpy(&nextScale, nextBlockStart + 8, sizeof(float));
+                        memcpy(&nextScale, scaleStart + scaleStride, sizeof(float));
                         if (scale == nextScale) {
                             __m512bh vi = (__m512bh)_mm512_loadu_si512((const __m512i*)(input + l));
                             __m512bh vw =
@@ -1137,11 +1143,17 @@ namespace fastllm {
         const void *A, long lda,
         const void *B, long ldb,
         void *C, long ldc,
-        int n, int m, int k, int st, int end
+        int n, int m, int k, int st, int end, bool planar
     ) {
         static const bool useLookup =
             std::getenv(
                 "FASTLLM_DSV4_DISABLE_CPU_NVFP4_LUT") == nullptr;
+        if (planar) {
+            return useLookup ? FastllmGemmBFloat16NVFP4Block16_AVX512BF16_Run<true, true>(
+                A, lda, B, ldb, C, ldc, n, m, k, st, end) :
+                FastllmGemmBFloat16NVFP4Block16_AVX512BF16_Run<false, true>(
+                A, lda, B, ldb, C, ldc, n, m, k, st, end);
+        }
         return useLookup ?
             FastllmGemmBFloat16NVFP4Block16_AVX512BF16_Run<true>(
                 A, lda, B, ldb, C, ldc, n, m, k, st, end) :
@@ -1149,7 +1161,7 @@ namespace fastllm {
                 A, lda, B, ldb, C, ldc, n, m, k, st, end);
     }
 
-    template <bool useLookup>
+    template <bool useLookup, bool PLANAR = false>
     static bool FastllmGemmFloat32NVFP4Block16_AVX512BF16_Run(
         const void *A, long lda,
         const void *B, long ldb,
@@ -1164,20 +1176,26 @@ namespace fastllm {
             const float *input = (const float*)((const uint8_t*)A + (size_t)i * lda);
             float *output = (float*)((uint8_t*)C + (size_t)i * ldc);
             for (int j = st; j < end; j++) {
-                const uint8_t *rowStart = (const uint8_t*)B + (size_t)j * ldb;
+                const int blocks = (m - 1) / 16 + 1;
+                constexpr int weightStride = PLANAR ? 8 : 12;
+                constexpr int scaleStride = PLANAR ? sizeof(float) : 12;
+                const uint8_t *rowStart = (const uint8_t*)B +
+                    (PLANAR ? NVFP4PlanarWeightOffset(j, blocks) : (size_t)j * ldb);
+                const uint8_t *rowScales = PLANAR
+                    ? (const uint8_t*)B + NVFP4PlanarScaleOffset(j, blocks) : rowStart + 8;
                 int block = 0;
-                int blocks = (m - 1) / 16 + 1;
                 __m512 scaledSum = _mm512_setzero_ps();
                 while (block < blocks) {
-                    const uint8_t *blockStart = rowStart + block * (8 + sizeof(float));
+                    const uint8_t *blockStart = rowStart + block * weightStride;
+                    const uint8_t *scaleStart = rowScales + block * scaleStride;
                     float scale;
-                    memcpy(&scale, blockStart + 8, sizeof(float));
+                    memcpy(&scale, scaleStart, sizeof(float));
                     int l = block * 16;
 
                     if (block + 1 < blocks && l + 31 < m) {
-                        const uint8_t *nextBlockStart = rowStart + (block + 1) * (8 + sizeof(float));
+                        const uint8_t *nextBlockStart = blockStart + weightStride;
                         float nextScale;
-                        memcpy(&nextScale, nextBlockStart + 8, sizeof(float));
+                        memcpy(&nextScale, scaleStart + scaleStride, sizeof(float));
                         if (scale == nextScale) {
                             __m512 in0 = _mm512_loadu_ps(input + l);
                             __m512 in1 = _mm512_loadu_ps(input + l + 16);
@@ -1219,11 +1237,17 @@ namespace fastllm {
         const void *A, long lda,
         const void *B, long ldb,
         void *C, long ldc,
-        int n, int m, int k, int st, int end
+        int n, int m, int k, int st, int end, bool planar
     ) {
         static const bool useLookup =
             std::getenv(
                 "FASTLLM_DSV4_DISABLE_CPU_NVFP4_LUT") == nullptr;
+        if (planar) {
+            return useLookup ? FastllmGemmFloat32NVFP4Block16_AVX512BF16_Run<true, true>(
+                A, lda, B, ldb, C, ldc, n, m, k, st, end) :
+                FastllmGemmFloat32NVFP4Block16_AVX512BF16_Run<false, true>(
+                A, lda, B, ldb, C, ldc, n, m, k, st, end);
+        }
         return useLookup ?
             FastllmGemmFloat32NVFP4Block16_AVX512BF16_Run<true>(
                 A, lda, B, ldb, C, ldc, n, m, k, st, end) :
