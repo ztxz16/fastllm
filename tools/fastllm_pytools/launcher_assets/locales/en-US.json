@@ -230,7 +230,10 @@
     "管理本地模型、下载与运行环境。": "Manage local models, downloads, and hardware.",
     "启动 API Server 后即可使用工作室。": "Start an API Server to use Studio.",
     "重新打开": "Reopen",
-    "打开工作室": "Open Studio"
+    "打开工作室": "Open Studio",
+    "自动配置时尝试启用内置 MTP": "Try built-in MTP during automatic configuration",
+    "这是自动配置偏好；是否实际开启，以生成的推测解码参数为准。": "This is an automatic configuration preference. The generated speculative settings determine whether it is enabled.",
+    "每轮 Draft Token 数": "Draft tokens per step"
   },
   "messages": {
     "Pi Agent": "Pi Agent",
@@ -365,7 +368,19 @@
     "The model service changed. Reopen WebUI.": "The model service changed. Reopen Studio.",
     "Opening WebUI…": "Opening Studio…",
     "Unable to load WebUI. Try reopening it.": "Unable to load Studio. Try reopening it.",
-    "WebUI loading timed out. Try reopening it.": "Studio loading timed out. Try reopening it."
+    "WebUI loading timed out. Try reopening it.": "Studio loading timed out. Try reopening it.",
+    "Speculative decoding is off. No draft model will be loaded.": "Speculative decoding is off. No draft model will be loaded.",
+    "Built-in MTP needs 1–8 draft tokens. For external MTP, choose a checkpoint file or folder; auto uses its default.": "Built-in MTP needs 1–8 draft tokens. For external MTP, choose a checkpoint file or folder; auto uses its default.",
+    "Choose a DFlash2 model folder. Auto uses the checkpoint's draft token count; MTP is disabled.": "Choose a DFlash2 model folder. Auto uses the checkpoint's draft token count; MTP is disabled.",
+    "Choose a DSpark model folder, or set the token count for built-in DSpark. MTP is disabled.": "Choose a DSpark model folder, or set the token count for built-in DSpark. MTP is disabled.",
+    "Detect the algorithm from the draft model or existing MTP settings. Without either, speculative decoding stays off.": "Detect the algorithm from the draft model or existing MTP settings. Without either, speculative decoding stays off.",
+    "Saved · restart required": "Saved · restart required",
+    "Profile saved. The running service is unchanged; new settings apply on the next model start.": "Profile saved. The running service is unchanged; new settings apply on the next model start.",
+    "Errors: {count} · locate": "Errors: {count} · locate",
+    "A service is running. Saved changes apply on the next model start.": "A service is running. Saved changes apply on the next model start.",
+    "Fix the highlighted fields before starting. You can still save an unfinished profile.": "Fix the highlighted fields before starting. You can still save an unfinished profile.",
+    "Wait for automatic configuration to finish.": "Wait for automatic configuration to finish.",
+    "Choose a model before saving or starting.": "Choose a model before saving or starting."
   },
   "patterns": [
     {"source": "^额外参数无法解析: (.+)$", "target": "Unable to parse extra arguments: $1"},

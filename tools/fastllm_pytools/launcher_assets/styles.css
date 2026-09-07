@@ -460,6 +460,7 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 .save-state { flex: 0 0 auto; padding: 5px 9px; border-radius: 999px; background: var(--surface-soft); color: var(--muted); font-size: 11px; }
 .save-state.dirty { background: var(--warning-soft); color: var(--warning); }
 .save-state.saved { background: var(--success-soft); color: var(--success); }
+.save-state.pending { background: var(--warning-soft); color: var(--warning); }
 .save-state.downloading { background: var(--primary-soft); color: var(--primary); }
 .save-state.failed { background: var(--danger-soft); color: var(--danger); }
 
@@ -751,6 +752,20 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 .editor-navigation button:hover, .editor-navigation button:focus-visible { background: var(--primary-soft); color: var(--primary); }
 #profile-parameters > .form-section, #profile-parameters > .advanced-section { scroll-margin-top: 68px; }
 .profile-editor > .form-actions { position: sticky; bottom: 0; z-index: 3; padding: 16px 0; border-top: 1px solid var(--line); background: var(--surface); }
+.editor-action-status { flex: 1; min-width: 0; }
+.editor-action-status p { margin: 4px 0 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.editor-action-status p:empty { display: none; }
+.validation-summary { padding: 0; background: transparent; color: var(--danger); font-size: 12px; font-weight: 650; cursor: pointer; text-align: left; }
+.validation-summary:hover { text-decoration: underline; }
+.profile-validation button.validation-message { width: 100%; text-align: left; cursor: pointer; }
+.profile-validation button.validation-message:hover { text-decoration: underline; }
+.field .field-error { color: var(--danger); line-height: 1.5; font-weight: 400; }
+.field [aria-invalid="true"] { border-color: var(--danger); }
+.field [aria-invalid="true"]:focus { border-color: var(--danger); box-shadow: 0 0 0 3px var(--danger-soft); }
+@media (max-width: 680px) {
+  .profile-editor > .form-actions { flex-wrap: wrap; }
+  .editor-action-status { flex-basis: 100%; }
+}
 .profile-editor .section-title { flex-wrap: wrap; }
 .section-title:focus { outline: none; }
 .command-panel { background: #202e28; }
@@ -1000,6 +1015,9 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 :root[data-theme="dark"] .command-panel pre { color: var(--ink); }
 :root[data-theme="dark"] .terminal-heading { background: var(--surface); border-color: var(--line); }
 :root[data-theme="dark"] :is(.field input, .field select, .field textarea):focus { box-shadow: 0 0 0 1px var(--focus); }
+:root[data-theme="dark"] .field [aria-invalid="true"],
+:root[data-theme="dark"] .field [aria-invalid="true"]:hover { border-color: var(--danger); }
+:root[data-theme="dark"] .field [aria-invalid="true"]:focus { border-color: var(--danger); box-shadow: 0 0 0 1px var(--danger); }
 :root[data-theme="dark"] :is(.primary-button, .secondary-button, .small-button,
   .hero-secondary, .project-action, .nav-button, .field input, .field select,
   .field textarea, .language-picker select) { border-radius: 4px; }

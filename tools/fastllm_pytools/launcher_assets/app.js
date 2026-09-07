@@ -52,6 +52,7 @@ const state = {
   defaultProfile: null,
   currentIndex: null,
   editingConfig: null,
+  speculativeCountField: "draft_tokens",
   automaticConfigDialogPreviousStatus: null,
   runtime: null,
   agentRuntime: null,
@@ -162,7 +163,8 @@ function cacheElements() {
     "webui-max-token-field", "webui-think-field",
     "server-context-field", "server-sampling-title", "server-sampling-fields", "server-api-key-field",
     "server-hide-input-field", "launch-command-kicker", "command-preview",
-    "validation-messages", "save-profile",
+    "validation-messages", "validation-summary", "launch-action-hint", "save-profile",
+    "speculative-mtp-field", "speculative-draft-tokens-field", "speculative-path-field", "speculative-mode-hint",
     "start-runtime", "clear-logs", "log-count", "log-output",
     "refresh-hardware", "hardware-status", "hardware-grid", "path-suggestions",
     "choose-model-folder", "choose-draft-model-folder", "folder-picker-modal", "folder-picker-title",
@@ -512,6 +514,7 @@ function bindEvents() {
   });
   elements.chooseModelFolder.addEventListener("click", () => openFolderPicker("model", elements.chooseModelFolder));
   elements.chooseDraftModelFolder.addEventListener("click", () => openFolderPicker("speculative_draft_model_path", elements.chooseDraftModelFolder));
+  elements.validationSummary.addEventListener("click", () => focusValidationError());
   elements.folderPickerClose.addEventListener("click", () => closeFolderPicker());
   elements.folderPickerCancel.addEventListener("click", () => closeFolderPicker());
   elements.folderPickerSelect.addEventListener("click", selectCurrentFolder);
@@ -667,6 +670,7 @@ function cloneConfig(config) {
 }
 
 function fillForm(config) {
+  state.speculativeCountField = initialSpeculativeTokenField(config || {});
   for (const input of elements.launchForm.querySelectorAll("[data-field]")) {
     const value = config?.[input.dataset.field];
     if (input.type === "checkbox") {
@@ -781,6 +785,31 @@ function handleFormChange(event) {
       elements.launchForm.querySelector(`[data-field="${field}"]`).value = value;
     }
     elements.launchForm.querySelector('[data-field="enable_speculative_decoding"]').checked = false;
+  } else if (changedField === "speculative_algorithm" && event.target.value !== state.editingConfig?.speculative_algorithm) {
+    const mtp = elements.launchForm.querySelector('[data-field="mtp"]');
+    const draft = elements.launchForm.querySelector('[data-field="draft_tokens"]');
+    if (event.target.value === "mtp") {
+      const count = Number(draft.value) > 0 ? draft.value : mtp.value;
+      mtp.value = Number(count) >= 1 && Number(count) <= 8 ? count
+        : collectForm().speculative_draft_model_path ? "auto" : "3";
+      draft.value = "auto";
+    } else if (["dflash", "dspark"].includes(event.target.value)) {
+      if (Number(mtp.value) > 0) draft.value = mtp.value;
+      mtp.value = "auto";
+    }
+  } else if (changedField === "mtp") {
+    elements.launchForm.querySelector('[data-field="draft_tokens"]').value = "auto";
+  } else if (changedField === "draft_tokens") {
+    elements.launchForm.querySelector('[data-field="mtp"]').value = "auto";
+  }
+  if (changedField === "speculative_algorithm") {
+    state.speculativeCountField = initialSpeculativeTokenField(collectForm());
+  }
+  if (changedField === "speculative_draft_model_path" && !event.target.value.trim()
+      && collectForm().speculative_algorithm === "mtp" && state.speculativeCountField === "draft_tokens") {
+    elements.launchForm.querySelector('[data-field="mtp"]').value = collectForm().draft_tokens;
+    elements.launchForm.querySelector('[data-field="draft_tokens"]').value = "auto";
+    state.speculativeCountField = "mtp";
   }
   if (event.target.dataset.field === "command") {
     const oldCommand = state.editingConfig?.command || "server";
@@ -823,10 +852,23 @@ function updateConditionalFields() {
   const config = collectForm();
   const isWebui = config.command === "webui";
   const speculativeOff = config.speculative_algorithm === "off";
+  const mtpCount = speculativeTokenField() === "mtp";
+  elements.speculativeMtpField.classList.toggle("hidden", speculativeOff || !mtpCount);
+  elements.speculativeDraftTokensField.classList.toggle("hidden", speculativeOff || mtpCount);
+  elements.speculativePathField.classList.toggle("hidden", speculativeOff);
   for (const field of ["mtp", "draft_tokens", "speculative_draft_model_path"]) {
-    elements.launchForm.querySelector(`[data-field="${field}"]`).disabled = speculativeOff;
+    elements.launchForm.querySelector(`[data-field="${field}"]`).disabled = speculativeOff
+      || (field === "mtp" && !mtpCount) || (field === "draft_tokens" && mtpCount);
   }
   elements.chooseDraftModelFolder.disabled = speculativeOff;
+  const speculativeHints = {
+    off: t("Speculative decoding is off. No draft model will be loaded."),
+    mtp: t("Built-in MTP needs 1–8 draft tokens. For external MTP, choose a checkpoint file or folder; auto uses its default."),
+    dflash: t("Choose a DFlash2 model folder. Auto uses the checkpoint's draft token count; MTP is disabled."),
+    dspark: t("Choose a DSpark model folder, or set the token count for built-in DSpark. MTP is disabled."),
+    auto: t("Detect the algorithm from the draft model or existing MTP settings. Without either, speculative decoding stays off.")
+  };
+  elements.speculativeModeHint.textContent = speculativeHints[config.speculative_algorithm] || speculativeHints.auto;
   elements.cudaDeviceField.classList.toggle("hidden", config.device !== "cuda");
   elements.tpDeviceField.classList.toggle("hidden", config.device !== "tp");
   elements.cudappDeviceField.classList.toggle("hidden", config.device !== "cudapp");
@@ -847,6 +889,19 @@ function updateConditionalFields() {
   elements.serverApiKeyField.classList.toggle("hidden", isWebui);
   elements.serverHideInputField.classList.toggle("hidden", isWebui);
   elements.launchCommandKicker.textContent = isWebui ? "FTLLM WEBUI" : "FTLLM SERVER";
+}
+
+function initialSpeculativeTokenField(config) {
+  if (config.speculative_algorithm === "mtp") {
+    const externalCount = config.speculative_draft_model_path && !(Number(config.mtp) > 0) && Number(config.draft_tokens) > 0;
+    return externalCount ? "draft_tokens" : "mtp";
+  }
+  return (!config.speculative_algorithm || config.speculative_algorithm === "auto") && Number(config.mtp) > 0
+    ? "mtp" : "draft_tokens";
+}
+
+function speculativeTokenField() {
+  return state.speculativeCountField;
 }
 
 function automaticConfigurationFingerprint(config = collectForm()) {
@@ -1161,9 +1216,16 @@ function renderSaveState() {
   } else if (state.currentIndex === null) {
     elements.saveState.textContent = t("New profile");
   } else {
-    elements.saveState.classList.add("saved");
-    elements.saveState.textContent = t("Saved");
+    const pending = configurationNeedsRestart();
+    elements.saveState.classList.add(pending ? "pending" : "saved");
+    elements.saveState.textContent = pending ? t("Saved · restart required") : t("Saved");
   }
+}
+
+function configurationNeedsRestart() {
+  return state.currentIndex !== null && state.currentIndex === findRunningProfileIndex()
+    && state.preview?.runtimeSessionId === state.runtime?.sessionId
+    && state.preview?.matchesRunningConfig === false;
 }
 
 function renderProfiles() {
@@ -1502,7 +1564,9 @@ async function saveCurrentProfile(showSuccess = false) {
   state.dirty = false;
   resetProfileSearch();
   renderSaveState();
-  if (showSuccess) showToast(t("Launch profile saved."), "success");
+  if (showSuccess) showToast(runtimeIsActive(state.runtime)
+    ? t("Profile saved. The running service is unchanged; new settings apply on the next model start.")
+    : t("Launch profile saved."), "success");
   return result.profile;
 }
 
@@ -1540,6 +1604,7 @@ async function updatePreview(requestId) {
     state.preview = preview;
     elements.commandPreview.textContent = preview.command || t("Complete a valid configuration first.");
     renderLaunchValidation(preview.errors || []);
+    renderSaveState();
     updateActionAvailability();
   } catch (error) {
     if (requestId !== state.previewRequestId) return;
@@ -1563,8 +1628,66 @@ function renderValidation(container, errors, successMessage) {
 
 function renderLaunchValidation(errors) {
   const showErrors = errors.length && (!isSimpleNewProfile() || Boolean(collectForm().model.trim()));
+  for (const input of elements.launchForm.querySelectorAll('[aria-invalid="true"]')) {
+    input.removeAttribute("aria-invalid");
+    const descriptions = (input.getAttribute("aria-describedby") || "").split(/\s+/).filter(id => id && !id.startsWith("launch-error-"));
+    if (descriptions.length) input.setAttribute("aria-describedby", descriptions.join(" "));
+    else input.removeAttribute("aria-describedby");
+  }
+  elements.launchForm.querySelectorAll("[data-field-error]").forEach(node => node.remove());
   elements.validationMessages.classList.toggle("hidden", !showErrors);
-  renderValidation(elements.validationMessages, errors, t("Configuration is valid and ready to launch."));
+  elements.validationMessages.replaceChildren();
+  elements.validationSummary.classList.toggle("hidden", !showErrors);
+  elements.validationSummary.textContent = showErrors ? t("Errors: {count} · locate", { count: errors.length }) : "";
+  if (!showErrors) return;
+  const details = state.preview?.fieldErrors || [];
+  const byInput = new Map();
+  for (const message of errors) {
+    const detail = details.find(item => item.message === message);
+    const inputs = [...new Set((detail?.fields || []).map(validationInput).filter(Boolean))];
+    for (const input of inputs) {
+      if (!byInput.has(input)) byInput.set(input, []);
+      if (!byInput.get(input).includes(message)) byInput.get(input).push(message);
+    }
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "validation-message";
+    item.textContent = localizeServerText(message);
+    item.addEventListener("click", () => focusValidationError(inputs[0]));
+    elements.validationMessages.append(item);
+  }
+  for (const [input, messages] of byInput) {
+    const id = `launch-error-${input.dataset.field}`;
+    const note = document.createElement("small");
+    note.id = id;
+    note.dataset.fieldError = input.dataset.field;
+    note.className = "field-error";
+    note.textContent = messages.map(localizeServerText).join(" ");
+    (input.closest(".field, .switch-field") || input.parentElement).append(note);
+    input.setAttribute("aria-invalid", "true");
+    input.setAttribute("aria-describedby", [input.getAttribute("aria-describedby"), id].filter(Boolean).join(" "));
+  }
+}
+
+function validationInput(field) {
+  if (["mtp", "draft_tokens"].includes(field)) field = speculativeTokenField();
+  const fallback = { device_custom: "device", moe_dtype_custom: "moe_dtype" };
+  const inputs = [...elements.launchForm.querySelectorAll("[data-field]")];
+  return inputs.find(input => input.dataset.field === field)
+    || inputs.find(input => input.dataset.field === fallback[field]);
+}
+
+function focusValidationError(input) {
+  input ||= [...elements.launchForm.querySelectorAll('[aria-invalid="true"]')].find(node => !node.disabled);
+  if (!input) {
+    elements.validationMessages.scrollIntoView({ block: "center" });
+    elements.validationMessages.querySelector("button")?.focus({ preventScroll: true });
+    return;
+  }
+  const advanced = input.closest("details");
+  if (advanced) advanced.open = true;
+  input.scrollIntoView({ block: "center" });
+  input.focus({ preventScroll: true });
 }
 
 function renderDownloadValidation(errors) {
@@ -1739,6 +1862,15 @@ function updateActionAvailability() {
   const missingModel = isSimpleNewProfile() && !String(collectForm().model || "").trim();
   elements.startRuntime.disabled = active || invalid || automaticBusy || missingModel;
   elements.saveProfile.disabled = automaticBusy || missingModel;
+  const hint = active
+    ? t("A service is running. Saved changes apply on the next model start.")
+    : invalid ? t("Fix the highlighted fields before starting. You can still save an unfinished profile.")
+    : automaticBusy ? t("Wait for automatic configuration to finish.")
+    : missingModel ? t("Choose a model before saving or starting.") : "";
+  elements.launchActionHint.textContent = hint;
+  elements.startRuntime.title = hint;
+  elements.startRuntime.setAttribute("aria-describedby", "launch-action-hint");
+  renderSaveState();
 }
 
 function runtimeIsActive(runtime) {

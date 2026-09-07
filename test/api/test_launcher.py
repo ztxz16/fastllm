@@ -195,6 +195,44 @@ class LauncherConfigTest(unittest.TestCase):
 
         self.assertTrue(any("内置 MTP" in error for error in preview["errors"]))
 
+    def test_preview_attaches_errors_to_their_fields(self):
+        preview = self.runtime.preview(self.config(
+            port="0", max_batch="0", speculative_algorithm="dflash"))
+        issues = preview["fieldErrors"]
+        self.assertEqual([item["message"] for item in issues], preview["errors"])
+        self.assertEqual({field for item in issues for field in item["fields"]},
+                         {"port", "max_batch", "speculative_draft_model_path"})
+        repaired = self.runtime.preview(self.config())
+        self.assertEqual(repaired["fieldErrors"], [])
+
+    def test_preview_compares_with_started_configuration_without_exposing_secrets(self):
+        config = self.config(port=str(unused_tcp_port()), api_key="private-start-key",
+                             env_vars="AUTH_TOKEN=private-env-token")
+        process = SimpleNamespace(pid=12345, poll=lambda: None)
+        try:
+            with patch.object(self.runtime, "_popen", return_value=process), \
+                    patch.object(self.runtime, "_start_stream_readers"), \
+                    patch.object(self.runtime, "_watch_process"), \
+                    patch.object(self.runtime, "_probe_readiness"):
+                self.runtime.start(config)
+            unchanged = self.runtime.preview(config)
+            self.assertTrue(unchanged["matchesRunningConfig"])
+            self.assertEqual(unchanged["runtimeSessionId"], self.runtime.state()["sessionId"])
+            changed = {**config, "gpu_mem_ratio": "0.8"}
+            saved = self.runtime.save_profile(None, changed)
+            self.assertFalse(self.runtime.preview(self.runtime.profiles()[saved["index"]])["matchesRunningConfig"])
+            self.assertTrue(self.runtime.preview(config)["matchesRunningConfig"])
+            # Naming or automatic-configuration preferences do not change the launch command.
+            self.assertTrue(self.runtime.preview({**config, "name": "Renamed", "enable_speculative_decoding": True})["matchesRunningConfig"])
+            serialized = json.dumps(unchanged) + json.dumps(self.runtime.state())
+            self.assertNotIn("private-start-key", serialized)
+            self.assertNotIn("private-env-token", serialized)
+            self.runtime._state["phase"] = "stopped"
+            self.assertIsNone(self.runtime.preview(changed)["matchesRunningConfig"])
+        finally:
+            # The fake process must never reach the real process termination path.
+            self.runtime._process = None
+
     def test_disabling_speculative_decoding_clears_and_persists_old_settings(self):
         saved = self.runtime.save_profile(None, self.config(
             speculative_algorithm="mtp", mtp="3", draft_tokens="3",

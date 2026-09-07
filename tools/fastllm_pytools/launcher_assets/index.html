@@ -215,7 +215,7 @@
                   <p id="configuration-mode-description" class="configuration-mode-description"></p>
                   <label class="speculative-auto-option">
                     <input type="checkbox" data-field="enable_speculative_decoding" id="enable-speculative-decoding" aria-describedby="speculative-auto-description">
-                    <span><strong>打开推测解码</strong><small id="speculative-auto-description">自动配置时检查模型，仅在模型自带 MTP 且支持当前设备时开启。</small></span>
+                    <span><strong>自动配置时尝试启用内置 MTP</strong><small id="speculative-auto-description">这是自动配置偏好；是否实际开启，以生成的推测解码参数为准。</small></span>
                   </label>
                   </div>
                   <div id="automatic-config-actions" class="automatic-config-actions">
@@ -320,15 +320,15 @@
                         <option value="dspark">DSpark</option>
                       </select>
                     </label>
-                    <label class="field">
-                      <span>MTP Token 数</span>
+                    <label id="speculative-mtp-field" class="field">
+                      <span>每轮 Draft Token 数</span>
                       <input data-field="mtp" type="text" placeholder="auto / 0-8">
                     </label>
-                    <label class="field">
-                      <span>Draft Token 数</span>
+                    <label id="speculative-draft-tokens-field" class="field">
+                      <span>每轮 Draft Token 数</span>
                       <input data-field="draft_tokens" type="text" placeholder="auto">
                     </label>
-                    <div class="field span-2">
+                    <div id="speculative-path-field" class="field span-2">
                       <label for="draft-model-path">Draft 模型路径</label>
                       <div class="path-input-with-button">
                         <input id="draft-model-path" data-field="speculative_draft_model_path" data-path-input type="text" list="path-suggestions" placeholder="留空使用模型内置能力" spellcheck="false">
@@ -336,6 +336,7 @@
                       </div>
                     </div>
                   </div>
+                  <p id="speculative-mode-hint" class="configuration-mode-description"></p>
                 </section>
 
                 <section id="editor-hybrid" class="form-section hybrid-inference-section">
@@ -470,6 +471,10 @@
                 <div id="validation-messages" class="validation-messages profile-validation"></div>
 
                 <div class="form-actions">
+                  <div class="editor-action-status">
+                    <button id="validation-summary" class="validation-summary hidden" type="button"></button>
+                    <p id="launch-action-hint" role="status" aria-live="polite"></p>
+                  </div>
                   <button id="save-profile" class="secondary-button" type="button">保存配置</button>
                   <button id="start-runtime" class="primary-button" type="submit"><span class="play-icon"></span>启动服务</button>
                 </div>
@@ -631,7 +636,7 @@
       <p id="automatic-mode-description" class="configuration-mode-description"></p>
       <label class="speculative-auto-option">
         <input type="checkbox" id="automatic-enable-speculative-decoding" aria-describedby="automatic-speculative-description">
-        <span><strong>打开推测解码</strong><small id="automatic-speculative-description">自动配置时检查模型，仅在模型自带 MTP 且支持当前设备时开启。</small></span>
+        <span><strong>自动配置时尝试启用内置 MTP</strong><small id="automatic-speculative-description">这是自动配置偏好；是否实际开启，以生成的推测解码参数为准。</small></span>
       </label>
       <p id="automatic-config-dialog-error" class="automatic-config-dialog-error hidden" role="alert"></p>
       <div class="automatic-config-dialog-actions">

@@ -430,6 +430,7 @@ class LauncherRuntime:
         self._stopping_generation = -1
         self._state = _empty_runtime_state()
         self._service_api_key = ""
+        self._launch_signature = None
         self._webui_app = None
         self._webui_session = ""
         self._webui_history_dir = webui_history_dir
@@ -560,18 +561,30 @@ class LauncherRuntime:
 
     def preview(self, payload: Any) -> Dict[str, Any]:
         config = _coerce_config(payload)
-        errors = validate_config(config)
+        field_errors = []
+        errors = validate_config(config, field_errors)
+        signature = None
         try:
-            command = _redacted_command(
-                build_fastllm_argv(config), build_fastllm_env(config)
-            )
+            argv, environment = build_fastllm_argv(config), build_fastllm_env(config)
+            command = _redacted_command(argv, environment)
+            signature = (tuple(argv), tuple(sorted(environment.items())))
         except ValueError as error:
             command = ""
-            errors.append(str(error))
+            if str(error) not in errors:
+                errors.append(str(error))
+                field_errors.append({"message": str(error), "fields": []})
+        with self._lock:
+            session = self._state["sessionId"]
+            active = self._state["phase"] in ("starting", "running", "stopping")
+            matches = (signature == self._launch_signature
+                       if active and signature is not None and self._launch_signature is not None else None)
         return {
             "command": command,
             "endpoint": _display_endpoint(config),
             "errors": errors,
+            "fieldErrors": field_errors,
+            "runtimeSessionId": session,
+            "matchesRunningConfig": matches,
         }
 
     def preview_download(self, payload: Any) -> Dict[str, Any]:
@@ -846,6 +859,7 @@ class LauncherRuntime:
             elif value.startswith("--api_key="):
                 api_key = value.split("=", 1)[1]
         environment_overrides = build_fastllm_env(config)
+        launch_signature = (tuple(argv), tuple(sorted(environment_overrides.items())))
         display_command = _redacted_command(argv, environment_overrides)
         endpoint = _display_endpoint(config)
         argv = list(argv)
@@ -918,6 +932,7 @@ class LauncherRuntime:
                     f"Unable to start ftllm {config.command}: {error}"
                 ) from error
             self._process = process
+            self._launch_signature = launch_signature
             self._state["pid"] = process.pid
 
         self._start_stream_readers(

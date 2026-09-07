@@ -230,7 +230,10 @@
     "管理本地模型、下载与运行环境。": "管理本地模型、下载与运行环境。",
     "启动 API Server 后即可使用工作室。": "启动 API Server 后即可使用工作室。",
     "重新打开": "重新打开",
-    "打开工作室": "打开工作室"
+    "打开工作室": "打开工作室",
+    "自动配置时尝试启用内置 MTP": "自动配置时尝试启用内置 MTP",
+    "这是自动配置偏好；是否实际开启，以生成的推测解码参数为准。": "这是自动配置偏好；是否实际开启，以生成的推测解码参数为准。",
+    "每轮 Draft Token 数": "每轮 Draft Token 数"
   },
   "messages": {
     "Pi Agent": "Pi 智能体",
@@ -553,7 +556,19 @@
     "The model service changed. Reopen WebUI.": "模型服务已切换，请重新打开工作室。",
     "Opening WebUI…": "正在打开工作室…",
     "Unable to load WebUI. Try reopening it.": "工作室加载失败，请重新打开。",
-    "WebUI loading timed out. Try reopening it.": "工作室加载超时，请重新打开。"
+    "WebUI loading timed out. Try reopening it.": "工作室加载超时，请重新打开。",
+    "Speculative decoding is off. No draft model will be loaded.": "推测解码已关闭，本次启动不加载 Draft 模型。",
+    "Built-in MTP needs 1–8 draft tokens. For external MTP, choose a checkpoint file or folder; auto uses its default.": "内置 MTP 需填写 1–8 个 Token；外置 MTP 可选择模型文件或目录，auto 使用默认值。",
+    "Choose a DFlash2 model folder. Auto uses the checkpoint's draft token count; MTP is disabled.": "请选择 DFlash2 模型目录；auto 使用模型默认的 Draft Token 数，MTP 已停用。",
+    "Choose a DSpark model folder, or set the token count for built-in DSpark. MTP is disabled.": "请选择 DSpark 模型目录，或填写内置 DSpark 的 Token 数；MTP 已停用。",
+    "Detect the algorithm from the draft model or existing MTP settings. Without either, speculative decoding stays off.": "根据 Draft 模型或已有 MTP 参数识别算法；两者都未配置时保持关闭。",
+    "Saved · restart required": "已保存 · 待重启模型",
+    "Profile saved. The running service is unchanged; new settings apply on the next model start.": "配置已保存。当前服务继续运行，新参数在下次启动模型时生效。",
+    "Errors: {count} · locate": "{count} 项错误 · 点击定位",
+    "A service is running. Saved changes apply on the next model start.": "服务正在运行。保存的修改将在下次启动模型时生效。",
+    "Fix the highlighted fields before starting. You can still save an unfinished profile.": "请修正标红参数后再启动；未完成的配置仍可保存。",
+    "Wait for automatic configuration to finish.": "请等待自动配置完成。",
+    "Choose a model before saving or starting.": "请选择模型后再保存或启动。"
   },
   "patterns": [
     {"source": "^Unable to read folder: (.+)$", "target": "无法读取文件夹：$1"},
