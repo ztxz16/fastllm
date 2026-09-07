@@ -638,6 +638,7 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
   transition: border-color 0.14s ease, background 0.14s ease;
 }
 .folder-picker-button:hover { border-color: #a5cbb7; background: #eaf6ef; }
+.speculative-section input:disabled, .speculative-section .folder-picker-button:disabled { opacity: .5; cursor: not-allowed; }
 .folder-picker-button .folder-button-icon { width: 15px; height: 11px; color: currentColor; }
 
 .advanced-section { margin-top: 15px; overflow: hidden; border: 1px solid var(--line); border-radius: 13px; background: var(--surface-soft); }

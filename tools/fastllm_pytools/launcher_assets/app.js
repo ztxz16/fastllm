@@ -776,6 +776,12 @@ function handleConfigurationModeChange() {
 function handleFormChange(event) {
   if (!event.target.matches("[data-field]")) return;
   const changedField = event.target.dataset.field;
+  if (changedField === "speculative_algorithm" && event.target.value === "off") {
+    for (const [field, value] of Object.entries({ mtp: "0", draft_tokens: "auto", speculative_draft_model_path: "" })) {
+      elements.launchForm.querySelector(`[data-field="${field}"]`).value = value;
+    }
+    elements.launchForm.querySelector('[data-field="enable_speculative_decoding"]').checked = false;
+  }
   if (event.target.dataset.field === "command") {
     const oldCommand = state.editingConfig?.command || "server";
     const portInput = elements.launchForm.querySelector('[data-field="port"]');
@@ -816,6 +822,11 @@ function defaultServicePort(command) {
 function updateConditionalFields() {
   const config = collectForm();
   const isWebui = config.command === "webui";
+  const speculativeOff = config.speculative_algorithm === "off";
+  for (const field of ["mtp", "draft_tokens", "speculative_draft_model_path"]) {
+    elements.launchForm.querySelector(`[data-field="${field}"]`).disabled = speculativeOff;
+  }
+  elements.chooseDraftModelFolder.disabled = speculativeOff;
   elements.cudaDeviceField.classList.toggle("hidden", config.device !== "cuda");
   elements.tpDeviceField.classList.toggle("hidden", config.device !== "tp");
   elements.cudappDeviceField.classList.toggle("hidden", config.device !== "cudapp");

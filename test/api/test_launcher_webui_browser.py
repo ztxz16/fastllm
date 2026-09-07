@@ -701,6 +701,49 @@ document.querySelector('#counter').onclick = event => {
         draft.scroll_into_view_if_needed()
         self.assertTrue(self.page.evaluate('document.documentElement.scrollWidth <= innerWidth'))
 
+    def test_explicit_speculative_off_clears_saved_mtp_and_survives_reopening(self):
+        for legacy_algorithm in ('auto', 'mtp'):
+            with self.subTest(legacy_algorithm=legacy_algorithm):
+                saved = self.runtime.save_profile(None, {
+                    'name': 'MTP profile', 'model': self.temp.name, 'device': 'cpu',
+                    'mtp': '3', 'draft_tokens': '3', 'speculative_algorithm': legacy_algorithm,
+                    'speculative_draft_model_path': self.temp.name, 'enable_speculative_decoding': True})
+                index = saved['index']
+                self.page.reload()
+                self.page.locator(f'[data-profile-action="edit"][data-profile-index="{index}"]').click()
+                self.page.locator('[data-editor-section="speculative"]').click()
+                algorithm = self.page.locator('[data-field="speculative_algorithm"]')
+                expect(algorithm).to_have_value(legacy_algorithm)
+                algorithm.select_option('off')
+                expect(self.page.locator('[data-field="mtp"]')).to_have_value('0')
+                expect(self.page.locator('[data-field="mtp"]')).to_be_disabled()
+                expect(self.page.locator('#draft-model-path')).to_have_value('')
+                expect(self.page.locator('#choose-draft-model-folder')).to_be_disabled()
+                expect(self.page.locator('#enable-speculative-decoding')).not_to_be_checked()
+                self.page.clock.fast_forward(700)
+                expect(self.page.locator('#command-preview')).to_contain_text('--speculative_algorithm off')
+                expect(self.page.locator('#command-preview')).not_to_contain_text('--mtp')
+                expect(self.page.locator('#command-preview')).not_to_contain_text('--draft_tokens')
+                self.screenshot('launcher-speculative-off')
+                self.page.locator('#save-profile').click()
+                expect(self.page.locator('#profile-editor-modal')).to_be_hidden()
+                profile = self.runtime.profiles()[index]
+                self.assertEqual(profile['speculative_algorithm'], 'off')
+                self.assertEqual(profile['mtp'], '0')
+                self.assertEqual(profile['speculative_draft_model_path'], '')
+                self.assertFalse(profile['enable_speculative_decoding'])
+                self.page.reload()
+                self.page.locator(f'[data-profile-action="edit"][data-profile-index="{index}"]').click()
+                expect(algorithm).to_have_value('off')
+                self.page.locator('[data-editor-section="speculative"]').click()
+                algorithm.select_option('mtp')
+                expect(self.page.locator('[data-field="mtp"]')).to_be_enabled()
+                expect(self.page.locator('#choose-draft-model-folder')).to_be_enabled()
+                self.page.locator('[data-field="mtp"]').fill('3')
+                self.page.clock.fast_forward(700)
+                expect(self.page.locator('#command-preview')).to_contain_text('--speculative_algorithm mtp')
+                expect(self.page.locator('#command-preview')).to_contain_text('--mtp 3')
+
     def test_speculative_switch_detects_mtp_and_restores_the_saved_preference(self):
         from test_launcher_mtp import cuda_hardware, write_mtp_checkpoint, write_safetensors
         from pathlib import Path

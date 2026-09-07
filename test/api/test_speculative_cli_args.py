@@ -60,6 +60,28 @@ class SpeculativeDraftCliAliasesTest(unittest.TestCase):
         )
         self.assertEqual(args.draft_tokens, 5)
 
+    def test_explicit_off_overrides_stale_draft_options_and_environment(self):
+        stale_env = {
+            "FASTLLM_DSPARK_MODEL_PATH": "/stale/dspark",
+            "FASTLLM_DSPARK_TOKENS": "4",
+            "FASTLLM_DSPARK_CONFIDENCE_THRESHOLD": "0.5",
+            "FASTLLM_DFLASH_MODEL_PATH": "/stale/dflash",
+            "FASTLLM_DFLASH_BLOCK_SIZE": "8",
+        }
+        for flag in ("--speculative_algorithm", "--speculative-algorithm"):
+            with self.subTest(flag=flag), patch.dict(os.environ, stale_env, clear=True):
+                args = self.configure_without_target([
+                    flag, "off", "--mtp", "3", "--dspark", "5",
+                    "--draft", "/missing/draft", "--draft_tokens", "7",
+                ])
+                self.assertEqual(args.mtp, 0)
+                self.assertEqual(args.dspark, 0)
+                self.assertEqual(args.draft_tokens, -1)
+                self.assertEqual(args.speculative_algorithm, "")
+                self.assertEqual(args.speculative_draft_model_path, "")
+                for name in stale_env:
+                    self.assertNotIn(name, os.environ)
+
     def test_dflash_uses_checkpoint_default_when_unspecified(self):
         with tempfile.TemporaryDirectory() as draft_path:
             self.write_draft_config(draft_path, {

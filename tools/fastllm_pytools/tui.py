@@ -5,7 +5,7 @@ import shlex
 import subprocess
 import sys
 import unicodedata
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from typing import Callable, List, Optional, Sequence, Tuple, Union
 
 try:
@@ -212,6 +212,7 @@ ENABLE_THINKING_CHOICES: Sequence[Choice] = (
 )
 
 SPECULATIVE_ALGORITHM_CHOICES: Sequence[Choice] = (
+    ("off", "关闭推测解码"),
     ("auto", "自动识别"),
     ("mtp", "MTP"),
     ("dflash", "DFlash2"),
@@ -349,7 +350,7 @@ FIELDS: Sequence[FormField] = (
         "speculative_algorithm",
         "推测算法",
         "choice",
-        "自动识别 draft checkpoint，或显式选择 MTP、DFlash2、DSpark。",
+        "关闭推测解码、自动识别 draft checkpoint，或显式选择 MTP、DFlash2、DSpark。",
         SPECULATIVE_ALGORITHM_CHOICES,
     ),
     FormField(
@@ -949,6 +950,13 @@ def normalize_moe_hybrid_config(
             config.moe_device_layers = "10000"
 
 
+def _normalize_speculative_config(config: DeployConfig) -> DeployConfig:
+    if str(config.speculative_algorithm).strip().lower() == "off":
+        return replace(config, speculative_algorithm="off", mtp="0", draft_tokens="auto",
+                       speculative_draft_model_path="", enable_speculative_decoding=False)
+    return config
+
+
 def config_from_dict(data: dict) -> DeployConfig:
     config = DeployConfig()
     valid_keys = {field.name for field in fields(DeployConfig)}
@@ -976,7 +984,7 @@ def config_from_dict(data: dict) -> DeployConfig:
         has_moe_device,
         has_moe_device_layers,
     )
-    return config
+    return _normalize_speculative_config(config)
 
 
 def config_title(config: DeployConfig) -> str:
@@ -1111,6 +1119,7 @@ def complete_path_prefix(raw_prefix: str, directories_only: bool = False) -> Lis
 
 
 def build_fastllm_argv(config: DeployConfig) -> List[str]:
+    config = _normalize_speculative_config(config)
     argv = ["ftllm", config.command]
     model = _expand_user_path(config.model.strip())
     if model:
@@ -1156,12 +1165,9 @@ def build_fastllm_argv(config: DeployConfig) -> List[str]:
     _add_option(argv, "--moe_dtype", moe_dtype)
     _add_option(argv, "-t", _optional_text(config.threads))
     _add_option(argv, "--kv_cache_limit", _optional_text(config.kv_cache_limit))
-    _add_option(argv, "--mtp", _optional_text(config.mtp))
-    _add_option(
-        argv,
-        "--speculative_algorithm",
-        _optional_text(config.speculative_algorithm),
-    )
+    if config.speculative_algorithm != "off":
+        _add_option(argv, "--mtp", _optional_text(config.mtp))
+        _add_option(argv, "--speculative_algorithm", _optional_text(config.speculative_algorithm))
     _add_option(
         argv,
         "--speculative_draft_model_path",
@@ -1189,6 +1195,9 @@ def build_fastllm_argv(config: DeployConfig) -> List[str]:
     extra_args = config.extra_args.strip()
     if extra_args:
         argv.extend(shlex.split(extra_args))
+    # An explicit Off selection also overrides old speculative flags in extra_args.
+    if config.speculative_algorithm == "off":
+        argv.extend(["--speculative_algorithm", "off"])
     return argv
 
 
@@ -1201,6 +1210,7 @@ def build_fastllm_command(config: DeployConfig) -> str:
 
 
 def validate_config(config: DeployConfig) -> List[str]:
+    config = _normalize_speculative_config(config)
     errors = []
     model_path = _expand_user_path(config.model.strip())
     if not model_path:
@@ -1251,7 +1261,7 @@ def validate_config(config: DeployConfig) -> List[str]:
         speculative_algorithm
         and speculative_algorithm not in SPECULATIVE_ALGORITHM_VALUES
     ):
-        errors.append("推测算法必须是 auto、mtp、dflash 或 dspark。")
+        errors.append("推测算法必须是 off、auto、mtp、dflash 或 dspark。")
 
     draft_path = _expand_user_path(config.speculative_draft_model_path.strip())
     draft_path_exists = bool(
