@@ -14,18 +14,21 @@
 #include "executor.h"
 #include "json11.hpp"
 #include "utils.h"
+#include "utils/persistent_worker_group.h"
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
 #ifndef USE_ROCM
 #include "devices/cuda/fastllm-cuda-moe-policy.h"
 #endif
+#include "fastllm-multicuda.cuh"
 #endif
 #ifdef USE_TFACC
 #include "fastllm-tfacc.h"
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
@@ -49,6 +52,7 @@ namespace fastllm {
 
     const std::string Qwen4ExpModel::languagePrefix = "model.language_model.";
     const std::string Qwen4ExpModel::visualPrefix = "model.visual.";
+    static thread_local bool qwen4ThreadTpExecution = false;
 
     static inline int Qwen4ClampInt(int value, int low, int high) {
         return std::max(low, std::min(value, high));
@@ -500,6 +504,12 @@ namespace fastllm {
         void Qwen4ParallelFor(int count,
                               const std::function<void(int, int)> &function) {
             if (count <= 0) {
+                return;
+            }
+            // The process-wide CPU pool has one producer. Independent TP
+            // workers must not overwrite one another's fallback tasks.
+            if (qwen4ThreadTpExecution) {
+                function(0, count);
                 return;
             }
             AliveThreadPool *pool = GetAlivePool();
@@ -1159,6 +1169,7 @@ namespace fastllm {
         Data attentionOutput;
         Data positionIds;
         Data decodeMeta;
+        Data denseIndices;
         Data logits;
         std::map<int, Data> qsaScoreWorkspaces;
         std::map<int, Data> qsaSelectedWorkspaces;
@@ -1212,6 +1223,7 @@ namespace fastllm {
             attentionOutput.FreeSpace();
             positionIds.FreeSpace();
             decodeMeta.FreeSpace();
+            denseIndices.FreeSpace();
             logits.FreeSpace();
             for (auto &item : qsaScoreWorkspaces) {
                 item.second.FreeSpace();
@@ -1321,6 +1333,414 @@ namespace fastllm {
         }
     };
 
+    // Thread-level tensor parallelism shares the Qwen4 forward and graph bodies.
+    // Rank models own local weights and request state; the parent owns the scheduler
+    // and the immutable host PLE table. No rank starts a second scheduler.
+    struct Qwen4ExpModel::ThreadTpState {
+        std::vector<int> devices;
+        std::vector<int> votes;
+        std::vector<std::unique_ptr<Qwen4ExpModel>> ranks;
+        using Cache = std::vector<std::pair<Data, Data>>;
+        std::map<const Data *, std::vector<Cache>> caches;
+        std::mutex forwardMutex, barrierMutex;
+        std::condition_variable barrierCv;
+        unsigned generation = 0;
+        int arrived = 0;
+        // Destroy workers before the rank models and synchronization state.
+        PersistentWorkerGroup workers;
+
+        void Barrier() {
+            std::unique_lock<std::mutex> lock(barrierMutex);
+            unsigned previous = generation;
+            if (++arrived == (int)devices.size()) {
+                arrived = 0;
+                generation++;
+                barrierCv.notify_all();
+            } else if (!barrierCv.wait_for(lock, std::chrono::seconds(60), [&] {
+                           return generation != previous;
+                       })) {
+                std::fprintf(stderr, "Qwen4 TP rank rendezvous timed out.\n");
+                std::abort();
+            }
+        }
+    };
+
+    void Qwen4ExpModel::InitThreadTp() {
+#ifdef USE_CUDA
+        if (threadTpRank >= 0 || threadTpState) return;
+        const char *env = std::getenv("FASTLLM_TP");
+        if (env == nullptr || *env == 0) return;
+        std::string spec(env);
+        std::vector<int> devices;
+        std::map<int, int> ratios;
+        const int deviceCount = FastllmCudaGetDeviceCount();
+        if (spec == "auto" || spec == "true" || spec == "on" || spec == "1") {
+            for (int d = 0; d < deviceCount; ++d) devices.push_back(d);
+        } else {
+            const std::string type = spec.find("multicuda") == 0 ? "multicuda" : "cuda";
+            if (spec.find(type) != 0) spec = type + ":" + spec;
+            devices = ParseDeviceIds(spec, type, ratios);
+        }
+        for (int d : devices) {
+            AssertInFastLLM(d >= 0 && d < deviceCount,
+                            "Qwen4 TP has an invalid CUDA device.");
+            AssertInFastLLM(!ratios.count(d) || ratios[d] == 1,
+                            "Qwen4 TP currently requires equal device ratios.");
+        }
+        AssertInFastLLM(std::set<int>(devices.begin(), devices.end()).size() == devices.size(),
+                        "Qwen4 TP device IDs must be unique.");
+        if (devices.size() <= 1) return;
+        // Validate before loading weights; rank-local placement cannot honor
+        // CPU/NUMA offload, layered placement or a shared expert cache.
+        AssertInFastLLM(Qwen4CudaOnlyDeviceMap(deviceMap) &&
+                        Qwen4CudaOnlyDeviceMap(moeDeviceMap) &&
+                        moeDeviceLayers < 0 && layeredMoeDeviceMap.empty() &&
+                        GetMoeCudaCacheBytes() == 0,
+                        "Qwen4 TP requires CUDA-only weights without layered MoE placement or --moe_cuda_cache. "
+                        "Remove --tp for CPU/NUMA hybrid inference.");
+        const int count = devices.size();
+        AssertInFastLLM(num_k_heads % count == 0 && num_v_heads % count == 0 &&
+                        num_attention_heads % count == 0 &&
+                        (num_key_value_heads % count == 0 || count % num_key_value_heads == 0),
+                        "Qwen4 TP degree must divide query and linear attention heads.");
+        AssertInFastLLM(!GetKVCacheInCPU(), "Qwen4 TP requires CUDA KV caches.");
+        AssertInFastLLM(Qwen4MtpDraftsPerStep() == 0,
+                        "Qwen4 TP does not support MTP drafting.");
+        threadTpState.reset(new ThreadTpState());
+        threadTpState->devices = std::move(devices);
+#endif
+    }
+
+    bool Qwen4ExpModel::ShouldDelaySpecialWeightCudaMove(const std::string &) const {
+        // Splitting directly from host storage avoids loading all experts on rank 0.
+        return threadTpState != nullptr;
+    }
+
+    void Qwen4ExpModel::PrepareThreadTp() {
+#ifdef USE_CUDA
+        ThreadTpState &tp = *threadTpState;
+        if (!tp.ranks.empty()) return;
+        auto &devices = tp.devices;
+        const int count = devices.size();
+        PrepareWeights();
+        tp.votes.resize(count);
+        AssertInFastLLM(FastllmInitNccl(devices), "Qwen4 TP NCCL initialization failed.");
+        for (int device : devices) {
+            FastllmCudaSetDevice(device);
+            AssertInFastLLM(FastllmCudaGraphPrepareCaptureDevice(),
+                            "Qwen4 TP could not prepare CUDA graph device storage.");
+        }
+        for (int rank = 0; rank < count; ++rank) {
+            auto model = std::unique_ptr<Qwen4ExpModel>(new Qwen4ExpModel());
+            model->threadTpRank = rank;
+            model->threadTpOwner = &tp;
+            model->weight.dicts = weight.dicts;
+            model->InitParams();
+            model->dataType = dataType;
+            model->kvCacheDataType = kvCacheDataType;
+            model->num_k_heads = num_k_heads / count;
+            model->num_v_heads = num_v_heads / count;
+            model->num_attention_heads = num_attention_heads / count;
+            model->num_key_value_heads = std::max(1, num_key_value_heads / count);
+            model->deviceMap = {{"cuda:" + std::to_string(devices[rank]), 1}};
+            model->moeDeviceMap = model->deviceMap;
+            model->ngramDevice = ngramDevice;
+            model->pleNgramDiskWeight = pleNgramDiskWeight;
+            model->pleNgramDiskWeight.isFake = true;
+            model->qsaKeyNormValues = qsaKeyNormValues;
+            model->preparedWeights = true; // Parent already applied norm offsets.
+            model->weights.assign(block_cnt, std::vector<Data *>(2 + 2 * num_experts, nullptr));
+            model->biass = model->weights;
+            for (int layer = 0; layer < block_cnt; ++layer) {
+                for (int expert = 0; expert < num_experts; ++expert) {
+                    const std::string prefix = languagePrefix + "layers." + std::to_string(layer) +
+                        ".mlp.experts." + std::to_string(expert) + ".";
+                    model->weights[layer][2 + 2 * expert] = &model->weight[prefix + "gateup_proj.weight"];
+                    model->weights[layer][3 + 2 * expert] = &model->weight[prefix + "down_proj.weight"];
+                }
+            }
+            tp.ranks.push_back(std::move(model));
+        }
+        auto equalScheme = [&](int width, int parts = 1) {
+            AssertInFastLLM(width % count == 0, "Qwen4 TP weight dimension is not divisible.");
+            DivisionScheme result;
+            for (int r = 0; r < count; ++r) {
+                for (int part = 0; part < parts; ++part)
+                    result[devices[r]].push_back({part * width + width * r / count,
+                                                 part * width + width * (r + 1) / count});
+            }
+            return result;
+        };
+        const int kd = num_k_heads * head_k_dim, vd = num_v_heads * head_v_dim;
+        DivisionScheme qkvScheme;
+        for (int r = 0; r < count; ++r) {
+            qkvScheme[devices[r]] = {{kd * r / count, kd * (r + 1) / count},
+                {kd + kd * r / count, kd + kd * (r + 1) / count},
+                {2 * kd + vd * r / count, 2 * kd + vd * (r + 1) / count}};
+        }
+        std::map<int, int> compactLayerCounts;
+        // WeightMap uses an unordered_map. Sorting is essential for the per-layer
+        // consolidation below to bound the number of live source allocations.
+        std::vector<std::string> names;
+        for (const auto &item : weight.weight) names.push_back(item.first);
+        std::sort(names.begin(), names.end());
+        for (const std::string &name : names) {
+            Data &source = weight.weight.at(name);
+            if (name.find(languagePrefix) != 0 && name != "lm_head.weight") continue;
+            if (source.dims.empty()) continue;
+            // The PLE lookup table remains shared and read-only on the host.
+            if (name.find(".ple.ple_embedding.ngram_embedding.") != std::string::npos) {
+                for (auto &model : tp.ranks) {
+                    Data &local = model->weight[name];
+                    local = source;
+                    local.isFake = true;
+                    local.lockInCPU = true;
+                }
+                continue;
+            }
+            DivisionScheme scheme;
+            int axis = -1;
+            const bool linear = name.find(".linear_attn.") != std::string::npos;
+            const bool full = name.find(".self_attn.") != std::string::npos &&
+                              name.find(".indexer.") == std::string::npos;
+            if (linear) {
+                if (name.find("in_proj_qkv.weight") != std::string::npos ||
+                    name.find("conv1d.weight") != std::string::npos) {
+                    scheme = qkvScheme; axis = 0;
+                } else if (name.find("out_proj.weight") != std::string::npos) {
+                    scheme = equalScheme(vd); axis = 1;
+                } else if (name.find("in_proj_z.weight") != std::string::npos) {
+                    scheme = equalScheme(vd); axis = 0;
+                } else if (name.find("in_proj_a.weight") != std::string::npos ||
+                           name.find("in_proj_b.weight") != std::string::npos ||
+                           name.find("A_log") != std::string::npos ||
+                           name.find("dt_bias") != std::string::npos) {
+                    scheme = equalScheme(num_v_heads); axis = 0;
+                }
+            } else if (full) {
+                if (name.find("q_proj.weight") != std::string::npos) {
+                    scheme = equalScheme(num_attention_heads * head_dim * 2); axis = 0;
+                } else if (name.find("o_proj.weight") != std::string::npos) {
+                    scheme = equalScheme(num_attention_heads * head_dim); axis = 1;
+                } else if (name.find("k_proj.weight") != std::string::npos ||
+                           name.find("v_proj.weight") != std::string::npos) {
+                    for (int r = 0; r < count; ++r) {
+                        int first = r * num_attention_heads / count /
+                                    (num_attention_heads / num_key_value_heads);
+                        int heads = std::max(1, num_key_value_heads / count);
+                        scheme[devices[r]] = {{first * head_dim, (first + heads) * head_dim}};
+                    }
+                    axis = 0;
+                }
+            } else if (name.find(".mlp.") != std::string::npos) {
+                if (name.find("gateup_proj.weight") != std::string::npos) {
+                    axis = 0;
+                } else if (name.find("down_proj.weight") != std::string::npos) {
+                    axis = 1;
+                }
+                if (axis >= 0 && name.find(".experts.") != std::string::npos) {
+                    // Grouped NVFP4 Marlin needs 128 intermediate columns. A 640
+                    // wide expert on four GPUs is 256/128/128/128, rotated per
+                    // layer to balance memory while keeping each gate/down pair
+                    // on precisely the same intermediate slice.
+                    const int width = axis == 0 ? source.dims[0] / 2 : source.dims[1];
+                    AssertInFastLLM(width % 128 == 0 && width / 128 >= count,
+                                    "Qwen4 TP expert width cannot satisfy 128-column alignment.");
+                    const size_t layerStart = name.find("layers.") + 7;
+                    const int layer = std::atoi(name.c_str() + layerStart);
+                    int offset = 0;
+                    for (int r = 0; r < count; ++r) {
+                        const int blocks = width / 128 / count +
+                            ((r + layer) % count < (width / 128) % count ? 1 : 0);
+                        const int end = offset + blocks * 128;
+                        scheme[devices[r]] = {{offset, end}};
+                        if (axis == 0) scheme[devices[r]].push_back({width + offset, width + end});
+                        offset = end;
+                    }
+                } else if (axis >= 0) {
+                    scheme = axis == 0 ? equalScheme(source.dims[0] / 2, 2)
+                                       : equalScheme(source.dims[1]);
+                }
+            }
+            if (axis >= 0) {
+                const std::vector<int> originalDims = source.dims;
+                if (source.dims.size() != 2) source.Reshape({source.dims[0], (int)source.Count(1)});
+                Data bias;
+                // Explicit head ranges must not be rotated by layer balancing.
+                bool compact = source.dataType == DataType::NVFP4_BLOCK_16_E4M3;
+                AssertInFastLLM(SplitMultiCudaWeight(source, bias, devices, scheme, axis, true, compact),
+                                "Qwen4 TP failed to split " + name);
+                for (int r = 0; r < count; ++r) {
+                    Data *shard = source.multiDeviceDatas.at(devices[r]);
+                    Data &local = tp.ranks[r]->weight[name];
+                    local = *shard; // Transfer allocation ownership to the rank.
+                    shard->isFake = true;
+                    local.ClearTensorParallelLayout();
+                    if (originalDims.size() != 2) {
+                        std::vector<int> dims = originalDims;
+                        dims[0] = local.dims[0];
+                        local.Reshape(dims);
+                    }
+                }
+            } else {
+                source.ToDevice(DataDevice::CPU);
+                for (int r = 0; r < count; ++r) {
+                    FastllmCudaSetDevice(devices[r]);
+                    Data &local = tp.ranks[r]->weight[name];
+                    local.CopyFrom(source);
+                    local.isModelWeight = true;
+                    local.weightType = source.weightType;
+                    local.scales = source.scales;
+                    local.blockK = source.blockK;
+                    local.blockM = source.blockM;
+                    local.ToDevice(DataDevice::CUDA, std::vector<int>{devices[r]});
+                }
+            }
+            if (source.dataType == DataType::NVFP4_BLOCK_16_E4M3 &&
+                name.find(".experts.") != std::string::npos) {
+                const int layer = std::atoi(name.c_str() + name.find("layers.") + 7);
+                if (++compactLayerCounts[layer] == num_experts * 2) {
+                    // Repack each layer immediately to release small source
+                    // allocations before their CUDA page overhead exhausts memory.
+                    for (int r = 0; r < count; ++r) {
+                        FastllmCudaSetDevice(devices[r]);
+                        auto &experts = tp.ranks[r]->weights[layer];
+                        AssertInFastLLM(FastllmCudaPrepareNVFP4E4M3Moe(experts.data(), experts.size()),
+                                        "Qwen4 TP could not prepare compact NVFP4 layer " + std::to_string(layer));
+                    }
+                }
+            }
+        }
+        FastllmCudaSetDevice(devices.front());
+        std::printf("[Qwen4 TP] %d ranks ready (linear heads %d/%d, Q/KV heads %d/%d per rank).\n",
+                    count, num_k_heads / count, num_v_heads / count,
+                    num_attention_heads / count, std::max(1, num_key_value_heads / count));
+        std::fflush(stdout);
+#endif
+    }
+
+    void Qwen4ExpModel::ThreadTpAllReduce(Data &data) {
+#ifdef USE_CUDA
+        if (threadTpRank < 0) return;
+        AssertInFastLLM(data.dataDevice == DataDevice::CUDA && data.cudaData != nullptr &&
+                        data.Count(0) <= std::numeric_limits<int>::max(),
+                        "Qwen4 TP reduction has invalid storage.");
+        const int device = threadTpOwner->devices[threadTpRank];
+        // Eager NCCL submissions from several CPU threads need the same issue
+        // order. Capture records GPU collectives and must not synchronize streams.
+        const bool capture = FastllmCudaGraphIsCapturingFast();
+        if (!capture) threadTpOwner->Barrier();
+        // Use the same reduction tree for eager and captured execution; custom
+        // all-reduce registration depends on temporary-pointer reuse across requests.
+        FastllmNcclAllReduceNoCustom(data.cudaData, data.cudaData,
+                                   data.Count(0), data.dataType, device);
+        if (!capture) threadTpOwner->Barrier();
+#endif
+    }
+
+    bool Qwen4ExpModel::ThreadTpAllTrue(bool value) {
+        if (threadTpRank < 0) return value;
+        auto &tp = *threadTpOwner;
+        tp.votes[threadTpRank] = value;
+        tp.Barrier();
+        const bool result = std::all_of(tp.votes.begin(), tp.votes.end(),
+                                        [](int vote) { return vote != 0; });
+        tp.Barrier();
+        return result;
+    }
+
+    void Qwen4ExpModel::RunThreadTpPLE(const Data &hyperInput, const Data &inputIds,
+            RequestState &state, Data &output, const std::vector<int> *hostInputTokens) {
+#ifdef USE_CUDA
+        // PLE consumes replicated residuals. One lookup/projection/convolution
+        // followed by a broadcast avoids four identical host reads and pool use.
+        if (threadTpRank == 0) {
+            RunPLE(hyperInput, inputIds, state, output, hostInputTokens);
+        } else {
+            output.dataType = hyperInput.dataType;
+            output.UpdateUnitSize();
+            output.Resize(hyperInput.dims);
+            output.ToDevice(DataDevice::CUDA,
+                            std::vector<int>{threadTpOwner->devices[threadTpRank]}, false);
+            output.Allocate(false);
+        }
+        AssertInFastLLM(output.Count(0) <= std::numeric_limits<int>::max(),
+                        "Qwen4 TP PLE broadcast is too large.");
+        threadTpOwner->Barrier();
+        FastllmNcclBroadcast(output.cudaData, output.Count(0), output.dataType,
+                             threadTpOwner->devices.front(),
+                             threadTpOwner->devices[threadTpRank]);
+        threadTpOwner->Barrier();
+#endif
+    }
+
+    std::vector<int> Qwen4ExpModel::ForwardThreadTp(
+            int batch, const Data &inputIds, const Data &attentionMask,
+            const Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
+            const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
+            std::vector<std::vector<float> *> *logits, const Data *precomputedEmbedding) {
+#ifdef USE_CUDA
+        PrepareThreadTp();
+        ThreadTpState &tp = *threadTpState;
+        std::lock_guard<std::mutex> guard(tp.forwardMutex);
+        const Data *key = &pastKeyValues[0].first;
+        auto &caches = tp.caches[key];
+        if (caches.empty()) {
+            caches.resize(tp.devices.size());
+            for (size_t r = 1; r < caches.size(); ++r) {
+                caches[r].resize(block_cnt);
+            }
+        }
+        // Each worker owns an executor, input tensors and a stable per-thread CUDA
+        // stream. Operator dispatch must never mutate the shared global executor.
+        std::vector<std::exception_ptr> errors(tp.devices.size());
+        std::vector<int> result;
+        tp.workers.Run(tp.devices, [&](int r) {
+            FastllmCudaSetDevice(tp.devices[r]);
+            static thread_local Executor executor;
+            struct Restore {
+                void *old; bool oldTp;
+                ~Restore() { SetCurrentThreadExecutor(old); qwen4ThreadTpExecution = oldTp; }
+            } restore{GetExecutor(), qwen4ThreadTpExecution};
+            qwen4ThreadTpExecution = true;
+            SetCurrentThreadExecutor(&executor);
+            executor.SetFirstDevice("cuda:" + std::to_string(tp.devices[r]));
+            Data ids(inputIds), mask(attentionMask), positions(positionIds);
+            Data embedding;
+            if (precomputedEmbedding) {
+                embedding.CopyFrom(*precomputedEmbedding);
+                embedding.ToDevice(DataDevice::CUDA, std::vector<int>{tp.devices[r]});
+            }
+            Qwen4ExpModel &model = *tp.ranks[r];
+            auto tokens = model.ForwardTarget(batch, ids, mask, positions,
+                r == 0 ? pastKeyValues : caches[r], generationConfig, lastTokens,
+                r == 0 ? logits : nullptr, nullptr, nullptr, nullptr, nullptr,
+                false, true, false, nullptr, false,
+                precomputedEmbedding ? &embedding : nullptr);
+            if (r == 0) result = std::move(tokens);
+            FastllmCudaSyncCurrentThreadStream();
+        }, errors);
+        for (auto &error : errors) if (error) std::rethrow_exception(error);
+        return result;
+#else
+        return {};
+#endif
+    }
+
+    void Qwen4ExpModel::RemoveThreadTpRequest(const Data *key) {
+        if (!threadTpState) return;
+        ThreadTpState &tp = *threadTpState;
+        std::lock_guard<std::mutex> guard(tp.forwardMutex);
+        auto found = tp.caches.find(key);
+        if (found == tp.caches.end()) return;
+        for (size_t r = 0; r < tp.ranks.size(); ++r) {
+            const Data *localKey = r == 0 ? key : &found->second[r].front().first;
+            tp.ranks[r]->decodeCudaGraphStates.erase(localKey);
+            tp.ranks[r]->requestStates.erase(localKey);
+        }
+        tp.caches.erase(found);
+    }
+
     Qwen4ExpModel::Qwen4ExpModel() : Qwen3NextModel() {
         this->canDoBatchForward = false;
         this->model_type = "qwen4_exp";
@@ -1394,6 +1814,7 @@ namespace fastllm {
 
     Qwen4ExpModel::~Qwen4ExpModel() {
         ShutdownRuntime();
+        threadTpState.reset();
         {
             std::lock_guard<std::mutex> guard(this->prefixCacheMutex);
             this->pendingPrefixRestores.clear();
@@ -1405,6 +1826,15 @@ namespace fastllm {
             this->requestStates.clear();
         }
         ReleaseMoeCudaCache(this->weights);
+#ifdef USE_CUDA
+        if (threadTpRank >= 0) {
+            FastllmCudaSetDevice(threadTpOwner->devices[threadTpRank]);
+            for (auto &layer : this->weights) {
+                if (layer.size() > 2 && layer[2] != nullptr)
+                    FastllmCudaReleaseMergeMOEVllmMarlinCache(layer[2]);
+            }
+        }
+#endif
     }
 
     void Qwen4ExpModel::InitParams() {
@@ -1460,6 +1890,8 @@ namespace fastllm {
         this->indexerHeadDim = Qwen4DictInt(weight.dicts, "indexer_head_dim", 128);
         this->indexerBudget = Qwen4DictInt(weight.dicts, "indexer_budget", 2048);
         this->indexerCompressRatio = Qwen4DictInt(weight.dicts, "indexer_compress_ratio", 4);
+
+        InitThreadTp();
 
         auto parseIntegerArray = [&](const std::string &key,
                                      std::vector<int> &values) {
@@ -4707,6 +5139,7 @@ namespace fastllm {
 
         SigmoidMulTo(context, gate);
         Linear(context, this->weight[attention + "o_proj.weight"], Data(), output);
+        ThreadTpAllReduce(output);
     }
 
     void Qwen4ExpModel::RunLinearAttention(int layer,
@@ -4921,6 +5354,7 @@ namespace fastllm {
             Linear(*outputCore,
                    this->weight[linear + "out_proj.weight"],
                    Data(), output);
+            ThreadTpAllReduce(output);
             return;
         }
 
@@ -5112,6 +5546,7 @@ namespace fastllm {
         SigmoidMulTo(allCore, z);
         allCore.Reshape({batch, sequence, valueDimension});
         Linear(allCore, this->weight[linear + "out_proj.weight"], Data(), output);
+        ThreadTpAllReduce(output);
     }
 
     void Qwen4ExpModel::RunMoE(int layer, const Data &input, Data &output) {
@@ -5244,6 +5679,7 @@ namespace fastllm {
         }
         Qwen4CastLike(sharedOutput, output);
         AddTo(output, sharedOutput);
+        ThreadTpAllReduce(output);
     }
 
     bool Qwen4ExpModel::MtpSupportsGenerationConfig(
@@ -7160,8 +7596,10 @@ namespace fastllm {
                     blockCache->strides[0]);
             }
         }
+        const bool wholeDenseGraph = threadTpRank >= 0 && graphSequence == 1 &&
+            decodePreviousLength < this->indexerBudget;
         wholeGraphReady = wholeGraphReady && graphFullLayerCount > 0 &&
-            decodePreviousLength >= this->indexerBudget;
+            (decodePreviousLength >= this->indexerBudget || wholeDenseGraph);
         if (mtpTargetGraph && attentionMask.dims.empty() &&
             !wholeGraphReady) {
             // A verifier may defer construction of its dense causal mask
@@ -7178,7 +7616,7 @@ namespace fastllm {
         // threshold during generation therefore retain the established
         // segmented path; requests that start at or above it use the whole
         // graph from their first decode token.
-        if (wholeGraphReady && !graphState->segments.empty() &&
+        if (threadTpRank < 0 && wholeGraphReady && !graphState->segments.empty() &&
             !graphState->wholeGraphMode) {
             wholeGraphReady = false;
         }
@@ -7254,8 +7692,21 @@ namespace fastllm {
                 return false;
             }
 
-            const int selectedBlocks =
+            const int selectedBlocks = wholeDenseGraph ? 1 :
                 this->indexerBudget / this->indexerCompressRatio;
+            if (wholeDenseGraph) {
+                const int width = Qwen4AxisCapacity(
+                    pastKeyValues[fullAttentionCacheStartLayer].first, 1);
+                if (graphState->denseIndices.cudaData == nullptr ||
+                    graphState->denseIndices.dims != std::vector<int>({1, width})) {
+                    if (!Qwen4PrepareDecodeGraphWorkspace(graphState->denseIndices,
+                            DataType::INT32, {1, width}, device)) return false;
+                    std::vector<int32_t> indices(width);
+                    for (int i = 0; i < width; ++i) indices[i] = i;
+                    FastllmCudaCopyFromHostToDevice(graphState->denseIndices.cudaData,
+                        indices.data(), indices.size() * sizeof(int32_t));
+                }
+            }
             for (int layer = fullAttentionCacheStartLayer;
                  layer < this->block_cnt; layer++) {
                 if (this->IsLinearAttentionLayer(layer)) {
@@ -7475,8 +7926,9 @@ namespace fastllm {
             ? (decodePreviousLength + graphSequence) %
                 this->indexerCompressRatio
             : 0;
-        const int wholeGraphSparseWidth =
-            this->indexerBudget +
+        const int wholeGraphSparseWidth = wholeDenseGraph && wholeGraphReady
+            ? graphState->denseIndices.dims.back()
+            : this->indexerBudget +
             (mtpTargetGraph ? this->indexerCompressRatio - 1
                             : wholeGraphRemainder);
 
@@ -7674,10 +8126,17 @@ namespace fastllm {
             Data qsaIndices(
                 DataType::INT32,
                 {sequence, wholeGraphSparseWidth});
-            qsaIndices.ToDevice(
-                DataDevice::CUDA, std::vector<int>({device}));
-            qsaIndices.Allocate(false);
-            if (!FastllmCudaQwen4QSASelectGraph(
+            if (wholeDenseGraph) {
+                // The graph uses fixed-capacity storage and masks positions
+                // beyond the device-side logical length. Preserve dense key
+                // order; padding must never become a visible zero key.
+                Qwen4BorrowCudaStorage(qsaIndices, graphState->denseIndices);
+            } else {
+                qsaIndices.ToDevice(
+                    DataDevice::CUDA, std::vector<int>({device}));
+                qsaIndices.Allocate(false);
+            }
+            if (!wholeDenseGraph && !FastllmCudaQwen4QSASelectGraph(
                     indexQuery, blockCache, decodeMeta,
                     scoreWorkspace, selectedWorkspace, qsaIndices,
                     this->indexerHeads,
@@ -7744,7 +8203,7 @@ namespace fastllm {
                 query.dims[0] / pastKey.dims[0];
             const float attentionScale =
                 1.0f / std::sqrt((float)this->head_dim);
-            if (sequence == 1) {
+            if (sequence == 1 && !wholeDenseGraph) {
                 Data compactKey(
                     key.dataType,
                     {pastKey.dims[0], wholeGraphSparseWidth,
@@ -7823,6 +8282,7 @@ namespace fastllm {
             Linear(
                 context, this->weight[attention + "o_proj.weight"],
                 Data(), output);
+            ThreadTpAllReduce(output);
             return true;
         };
 
@@ -7914,11 +8374,15 @@ namespace fastllm {
             bool captureActive = false;
             bool recaptureWithoutParallelMarkers = false;
             const bool enableParallelRegions =
-                !segment.parallelRegionsUnavailable;
+                threadTpRank < 0 && !segment.parallelRegionsUnavailable;
             bool captureOk = FastllmCudaGraphPrepareCaptureDevice();
+            captureOk = ThreadTpAllTrue(captureOk);
             if (captureOk) {
-                poolActive = FastllmCudaGraphMemoryPoolBegin();
-                captureOk = poolActive;
+                if (threadTpRank <= 0) {
+                    poolActive = FastllmCudaGraphMemoryPoolBegin();
+                    captureOk = poolActive;
+                }
+                captureOk = ThreadTpAllTrue(captureOk);
             }
             if (captureOk) {
                 FastllmCudaClearThreadError();
@@ -7926,6 +8390,7 @@ namespace fastllm {
                 captureActive = FastllmCudaGraphBeginCapture();
                 captureOk = captureActive;
             }
+            captureOk = ThreadTpAllTrue(captureOk);
 
             bool bodyThrew = false;
             if (captureOk) {
@@ -7963,14 +8428,19 @@ namespace fastllm {
                 }
             }
 
-            if (captureOk) {
+            // The allocator capture pool is process-wide. Rank 0 owns one
+            // transaction containing all device captures and their pointers.
+            captureOk = ThreadTpAllTrue(captureOk);
+            if (captureOk && threadTpRank <= 0) {
                 captureOk = FastllmCudaGraphMemoryPoolEnd(
                     segment.reservedPointers);
                 poolActive = false;
             }
+            captureOk = ThreadTpAllTrue(captureOk);
             if (poolActive) {
                 FastllmCudaGraphMemoryPoolAbort();
             }
+            ThreadTpAllTrue(true);
             if (captureOk && enableParallelRegions) {
                 const int parallelRegions =
                     FastllmCudaGraphOptimizeParallelRegions(
@@ -7993,6 +8463,10 @@ namespace fastllm {
                     capturedExec != nullptr;
             }
 
+            // A collective graph is committed by every rank together. One
+            // failed capture must not leave peers replaying while it falls
+            // back to the eager host submission rendezvous.
+            captureOk = ThreadTpAllTrue(captureOk);
             if (!captureOk) {
                 if (capturedExec != nullptr) {
                     FastllmCudaGraphExecDestroy(capturedExec);
@@ -8060,6 +8534,7 @@ namespace fastllm {
             }
             runSegment(
                 graphStartLayer, this->block_cnt, true,
+                wholeDenseGraph ? this->indexerCompressRatio + 1 :
                 mtpTargetGraph ? this->indexerCompressRatio
                                : wholeGraphRemainder);
 
@@ -8626,6 +9101,7 @@ namespace fastllm {
     bool Qwen4ExpModel::TryRestoreHistoryCache(
             std::vector<int> &inputTokens, int &cacheLen) {
         cacheLen = 0;
+        if (threadTpState) return false;
         if (!Qwen4PrefixCacheEnabled() || inputTokens.size() <= 1) {
             return false;
         }
@@ -9004,6 +9480,10 @@ namespace fastllm {
             ToDataType(mropePositionIds, DataType::FLOAT32);
             mropePositionIds.ToDevice(DataDevice::CPU);
         }
+        if (threadTpState) {
+            return ForwardThreadTp(1, inputIds, attentionMask, mropePositionIds,
+                pastKeyValues, generationConfig, lastTokens, retLogits, &mergedEmbedding);
+        }
         return ForwardTarget(
             1, inputIds, attentionMask, mropePositionIds,
             pastKeyValues, generationConfig, lastTokens, retLogits,
@@ -9039,6 +9519,10 @@ namespace fastllm {
                         "Qwen4-Exp currently runs one request per Forward call.");
         AssertInFastLLM((int)pastKeyValues.size() >= this->block_cnt,
                         "Qwen4-Exp received too few cache slots.");
+        if (threadTpState) {
+            return ForwardThreadTp(batch, inputIds, attentionMask, positionIds,
+                pastKeyValues, generationConfig, lastTokens, retLogits);
+        }
         PrepareWeights();
 
         RequestState *requestState;
@@ -9701,7 +10185,7 @@ namespace fastllm {
         const bool qsaDeviceCompatibleMask =
             materializeCausalMaskOnGraphFallback ||
             attentionMask.dims.empty() ||
-            ((restoredPrefixSnapshot || verificationCapture != nullptr) &&
+            ((threadTpRank >= 0 || restoredPrefixSnapshot || verificationCapture != nullptr) &&
              Qwen4IsContiguousCausalMask(
                  attentionMask, qsaPreviousLength, inputIds.dims[1]));
         std::map<int, Data> cudaPositionIds;
@@ -9738,8 +10222,13 @@ namespace fastllm {
                 if (verificationCapture != nullptr) {
                     verificationCapture->pleInput.CopyFrom(*hiddenStates);
                 }
-                RunPLE(*hiddenStates, inputIds, *requestState, pleOutput,
-                       hostInputTokens);
+                if (threadTpRank >= 0) {
+                    RunThreadTpPLE(*hiddenStates, inputIds, *requestState, pleOutput,
+                                   hostInputTokens);
+                } else {
+                    RunPLE(*hiddenStates, inputIds, *requestState, pleOutput,
+                           hostInputTokens);
+                }
                 AddTo(*hiddenStates, pleOutput);
                 DumpTensorIfRequested("layer_" + std::to_string(layer) +
                                       "_ple", *hiddenStates);
@@ -10220,6 +10709,7 @@ namespace fastllm {
         }
         std::lock_guard<std::mutex> guard(this->stateMutex);
         if (!context->pastKeyValues.empty()) {
+            RemoveThreadTpRequest(&context->pastKeyValues[0].first);
             this->decodeCudaGraphStates.erase(
                 &context->pastKeyValues[0].first);
             this->requestStates.erase(&context->pastKeyValues[0].first);
@@ -10238,6 +10728,7 @@ namespace fastllm {
             cache.push_back({Data(cacheType), Data(cacheType)});
         }
         Forward(inputIds, attentionMask, positionIds, cache);
+        RemoveThreadTpRequest(&cache[0].first);
         {
             std::lock_guard<std::mutex> guard(this->stateMutex);
             if (!cache.empty()) {

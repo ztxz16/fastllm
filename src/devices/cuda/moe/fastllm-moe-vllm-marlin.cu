@@ -3550,6 +3550,11 @@ bool FastllmCudaNVFP4E4M3GroupedMoeSupported(int device) {
 #endif
 }
 
+bool FastllmCudaPrepareNVFP4E4M3Moe(fastllm::Data **weights, int weightsBatch) {
+    return fastllm_marlin_moe::GetOrBuildNvfp4E4M3LayerCache(
+        weights, weightsBatch) != nullptr;
+}
+
 void FastllmCudaReleaseMergeMOEVllmMarlinCache(
         const fastllm::Data *layerKey) {
     fastllm_marlin_moe::ReleaseLayerCache(layerKey);

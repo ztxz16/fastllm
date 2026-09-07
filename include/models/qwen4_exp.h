@@ -32,6 +32,8 @@ namespace fastllm {
         void OnModelWeightsLoaded() override;
         bool ShouldDelaySpecialWeightNumaRegistration(
                 const std::string &weightName) const override;
+        bool ShouldDelaySpecialWeightCudaMove(
+                const std::string &weightName) const override;
 
         int Forward(
                 const Data &inputIds,
@@ -76,6 +78,23 @@ namespace fastllm {
         struct MtpDraftCudaGraphState;
         struct QsaHostMirrorTransfer;
         struct MtpRuntimeState;
+        struct ThreadTpState;
+        std::unique_ptr<ThreadTpState> threadTpState;
+        ThreadTpState *threadTpOwner = nullptr;
+        int threadTpRank = -1;
+        void InitThreadTp();
+        void PrepareThreadTp();
+        void ThreadTpAllReduce(Data &data);
+        bool ThreadTpAllTrue(bool value);
+        void RemoveThreadTpRequest(const Data *key);
+        std::vector<int> ForwardThreadTp(
+                int batch, const Data &inputIds, const Data &attentionMask,
+                const Data &positionIds,
+                std::vector<std::pair<Data, Data>> &pastKeyValues,
+                const GenerationConfig &generationConfig,
+                const LastTokensManager &lastTokens,
+                std::vector<std::vector<float> *> *logits,
+                const Data *precomputedEmbedding = nullptr);
 
         struct RequestState {
             int previousToken1 = -1;
@@ -347,6 +366,9 @@ namespace fastllm {
         void RunPLE(const Data &hyperInput, const Data &inputIds,
                     RequestState &state, Data &output,
                     const std::vector<int> *hostInputTokens = nullptr);
+        void RunThreadTpPLE(const Data &hyperInput, const Data &inputIds,
+                    RequestState &state, Data &output,
+                    const std::vector<int> *hostInputTokens);
         void MaterializePLEHostHistory(RequestState &state);
         void BuildQSAMask(int layer, const std::string &attentionPrefix,
                           const Data &input,
