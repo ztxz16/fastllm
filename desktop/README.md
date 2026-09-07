@@ -42,6 +42,10 @@ support/            运行时、依赖、图标和辅助工具
 `ftllm` 保留系统默认图标；初始化时会清除旧版为它设置的自定义图标。
 HTML 文档的样式和插图全部随包提供，断网也能正常阅读。
 两枚图标沿用 `tools/fastllm_pytools/fastllm_icon.svg` 的 F 和速度线，强调 FastLLM 的快速推理特点。
+文档中的“详细参数手册”链接到包内 `support/docs/parameters.html`，完全离线可读。
+`build_parameter_docs.py` 使用包内 Python 和已安装的 CLI 解析器生成参数名、别名、默认值与取值类型，
+再结合中文说明、逐项写法与完整启动示例，覆盖模型、设备、量化、缓存、MoE、投机解码、服务和工具参数。
+页面模板为 `BUNDLE-PARAMETERS.html.in`；新增 CLI 选项也会出现在手册中。
 
 无桌面服务器可直接使用 `./ftllm server ...`、`./launch.sh --no-browser`。
 `source ./support/env.sh` 后可直接输入 `ftllm`、`ftllm-check` 等命令；

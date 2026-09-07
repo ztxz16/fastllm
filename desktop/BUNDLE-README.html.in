@@ -145,6 +145,7 @@
           <li><strong>打开 Launcher</strong>双击桌面应用或网页服务入口，在界面中选择模型目录或 GGUF 文件，并配置运行参数。</li>
           <li><strong>启动并使用</strong>启动模型后即可使用对应服务。进入“工作室”，选择项目目录可使用目录 Agent。</li>
         </ol>
+        <p class="subtle" style="margin-top: 18px">设备选择、量化类型、缓存和模型服务配置，参见包内的 <a href="support/docs/parameters.html">详细参数手册 →</a>，含默认值、作用与完整命令示例，断网也可阅读。</p>
       </div>
     </section>
     <section id="files">
@@ -164,7 +165,7 @@
       </div>
     </section>
     <section id="commands">
-      <h2>命令行与远程访问</h2>
+      <div class="section-title"><h2>命令行与远程访问</h2><a href="support/docs/parameters.html">查看详细参数手册 →</a></div>
       <div class="panel">
         <h3>在终端使用 ftllm</h3>
         <p class="subtle">在解压目录打开终端。把 <code>/path/to/model</code> 替换为本机模型目录或 GGUF 文件。</p>
@@ -176,7 +177,7 @@
         <h3>启动网页服务</h3>
         <pre><code>./ftllm-launch-webui
 <span class="comment"># 与 ./ftllm launch、./launch.sh 等价；默认打开本机浏览器</span></code></pre>
-        <p class="subtle">使用 <code>./ftllm-launch-webui --help</code> 查看本包网页启动器支持的参数；使用 <code>./ftllm server --help</code> 查看模型服务参数。</p>
+        <p class="subtle">网页启动器的选项见 <a href="support/docs/parameters.html#launch">启动器参数</a>；设备、量化等设置见 <a href="support/docs/parameters.html#devices">模型参数</a>。这些文档都在包内，也可使用 <code>./ftllm-launch-webui --help</code> 查看原始命令行帮助。</p>
         <p class="subtle">没有桌面的服务器上，可以让服务监听网络地址，再用另一台电脑的浏览器访问：</p>
         <pre><code>./ftllm-launch-webui --no-browser --host 0.0.0.0 --port 8000</code></pre>
         <p class="subtle">打开终端打印的访问地址，将主机地址换为服务器 IP，并保留 URL 中的 <code>token</code> 参数。确保网络和防火墙允许该端口。Launcher 可以启动进程和执行 Agent 任务，请仅向可信用户开放。</p>

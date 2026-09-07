@@ -374,6 +374,10 @@ for entrypoint in 'Fastllm-Launcher.desktop' 'ftllm-launch-webui.desktop'; do
     install -m 0755 "${SCRIPT_DIR}/${entrypoint}" "${payload_dir}/desktop/${entrypoint}"
 done
 install -m 0644 "${SCRIPT_DIR}/BUNDLE-README.html.in" "${bundle_dir}/README.html"
+log "生成包内离线参数手册"
+"${payload_dir}/python" "${SCRIPT_DIR}/build_parameter_docs.py" \
+    --template "${SCRIPT_DIR}/BUNDLE-PARAMETERS.html.in" \
+    --output "${payload_dir}/docs/parameters.html"
 mkdir -p "${payload_dir}/licenses"
 install -m 0644 "${ROOT_DIR}/LICENSE" "${payload_dir}/licenses/FastLLM-LICENSE"
 

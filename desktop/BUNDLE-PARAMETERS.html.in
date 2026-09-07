@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>FastLLM @FTLLM_VERSION@ · 启动与模型参数手册</title>
+  <style>
+    :root { --ink: #202a3c; --muted: #596477; --line: #e0e4eb; --purple: #5a46d6; }
+    * { box-sizing: border-box; }
+    html { scroll-padding-top: 24px; }
+    body { margin: 0; color: var(--ink); background: #f6f7fa; font: 15px/1.85 system-ui, -apple-system, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; }
+    a { color: var(--purple); text-underline-offset: 4px; }
+    a:focus-visible, summary:focus-visible { outline: 3px solid var(--purple); outline-offset: 4px; }
+    .page { max-width: 1440px; padding: 32px 36px 45px; margin: auto; }
+    .topline { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; padding-bottom: 22px; border-bottom: 1px solid var(--line); }
+    .brand { font-size: 22px; font-weight: 800; letter-spacing: -.7px; }
+    .brand span { color: var(--purple); }
+    .version { color: var(--muted); font-size: 13px; }
+    .layout { display: grid; grid-template-columns: 180px minmax(0, 1fr); gap: 32px; padding-top: 26px; }
+    nav { position: sticky; top: 20px; align-self: start; max-height: calc(100vh - 40px); overflow-y: auto; padding: 0 10px 12px 0; font-size: 13px; }
+    nav strong { display: block; margin: 20px 0 7px; color: var(--muted); font-size: 11px; letter-spacing: 1px; }
+    nav a { display: block; padding: 5px 0; text-decoration: none; color: var(--muted); }
+    nav a:hover { color: var(--purple); text-decoration: underline; }
+    nav .back { color: var(--purple); font-weight: 650; }
+    main { min-width: 0; }
+    header { padding: 5px 0 24px; }
+    .eyebrow { color: var(--purple); font-size: 12px; font-weight: 750; letter-spacing: 1.5px; margin: 0 0 9px; }
+    h1 { font-size: clamp(29px, 4vw, 40px); line-height: 1.35; letter-spacing: -.8px; margin: 0 0 14px; }
+    h2 { font-size: 23px; margin: 0 0 14px; letter-spacing: -.4px; }
+    h3 { font-size: 17px; margin: 20px 0 9px; }
+    p { margin: 0 0 12px; }
+    p:last-child { margin-bottom: 0; }
+    section { margin-bottom: 34px; }
+    .intro, .subtle { color: var(--muted); }
+    .scope { color: var(--purple); font-size: 13px; font-weight: 650; margin: 0 0 10px; }
+    .panel { background: #fff; padding: 22px; border: 1px solid var(--line); border-radius: 13px; margin: 16px 0; }
+    .note { border-left: 4px solid #7969dc; background: #eeebfc; padding: 13px 17px; color: #493f78; border-radius: 4px 9px 9px 4px; margin: 15px 0; font-size: 14px; }
+    .table-wrap { border: 1px solid var(--line); border-radius: 12px; overflow-x: auto; background: #fff; margin: 16px 0; }
+    table { width: 100%; border-collapse: collapse; text-align: left; font-size: 13px; table-layout: fixed; }
+    th, td { padding: 15px; border-bottom: 1px solid var(--line); vertical-align: top; overflow-wrap: anywhere; }
+    thead th { background: #edf0f6; color: var(--muted); font-size: 12px; }
+    tbody th { font-weight: 600; }
+    tr:last-child td, tr:last-child th { border-bottom: 0; }
+    .parameters th:first-child { width: 27%; }
+    .parameters th:nth-child(2) { width: 21%; }
+    .parameters th:nth-child(3) { width: 52%; }
+    tbody tr:target { background: #f0ecff; }
+    td p { margin: 0 0 8px; }
+    .meaning { font-weight: 650; }
+    .value-type { display: block; color: var(--muted); margin-top: 7px; font-size: 12px; }
+    code, pre, kbd { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
+    code { font-size: .93em; overflow-wrap: anywhere; }
+    p code, li code, td > code { background: #edf0f5; border-radius: 4px; padding: 2px 4px; }
+    .example { padding-top: 8px; color: #087780; font-size: 12px; }
+    pre { padding: 17px 20px; background: #202a3c; color: #f3f6fc; font-size: 13px; line-height: 1.9; overflow: auto; border-radius: 10px; margin: 12px 0 18px; }
+    pre code { font-size: inherit; overflow-wrap: normal; }
+    .comment { color: #b7c4d9; }
+    ul, ol { padding-left: 22px; margin: 9px 0; }
+    li { margin-bottom: 7px; }
+    .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .cards .panel { margin: 0; }
+    .cards h3 { margin-top: 0; }
+    .shortcut { font-size: 12px; color: var(--muted); }
+    kbd { padding: 1px 5px; border: 1px solid #cbd2de; border-radius: 4px; background: #fff; }
+    details { margin: 18px 0; }
+    summary { cursor: pointer; font-weight: 650; }
+    footer { border-top: 1px solid var(--line); padding-top: 20px; font-size: 13px; color: var(--muted); }
+    @media (max-width: 1000px) { .page { padding: 24px; } .layout { grid-template-columns: 155px minmax(0, 1fr); gap: 20px; } th, td { padding: 12px; } }
+    @media (max-width: 760px) {
+      .page { padding: 20px 16px; }
+      .layout { grid-template-columns: 1fr; padding-top: 16px; }
+      nav { position: static; max-height: none; display: flex; gap: 5px 16px; flex-wrap: wrap; padding-bottom: 15px; border-bottom: 1px solid var(--line); }
+      nav strong { display: none; }
+      .cards { grid-template-columns: 1fr; }
+      .panel { padding: 17px; }
+      .parameters thead { display: none; }
+      .parameters, .parameters tbody, .parameters tr, .parameters th, .parameters td { display: block; width: 100% !important; }
+      .parameters tr { border-bottom: 1px solid var(--line); padding: 6px 0; }
+      .parameters tr:last-child { border-bottom: 0; }
+      .parameters th, .parameters td { border-bottom: 0; padding: 7px 15px; }
+      .parameters td:nth-child(2)::before { content: "默认值："; color: var(--muted); }
+      .parameters .value-type { display: inline; margin-left: 10px; }
+    }
+    @media print {
+      body { background: #fff; font-size: 11pt; }
+      .page { padding: 0; }
+      nav, .shortcut { display: none; }
+      .layout { display: block; }
+      pre { white-space: pre-wrap; overflow-wrap: anywhere; color: #202a3c; background: #f0f1f4; }
+      tr { break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+<div class="page" id="top">
+  <div class="topline"><div class="brand">Fast<span>LLM</span></div><div class="version">v@FTLLM_VERSION@ · 包内参数手册 · 离线可读</div></div>
+  <div class="layout">
+    <nav aria-label="参数手册目录">
+      <a class="back" href="../../README.html">← 返回使用指南</a>
+      <strong>开始使用</strong>
+      <a href="#usage">参数应该填在哪里</a><a href="#examples">完整启动示例</a>
+      <strong>模型推理参数</strong>
+      <a href="#model">模型文件与模板</a><a href="#devices">设备与多卡</a><a href="#precision">量化与计算精度</a><a href="#memory">显存、上下文与并发</a><a href="#moe">MoE 混合推理</a><a href="#cache">历史与前缀缓存</a><a href="#speculative">MTP / DSpark / DFlash</a>
+      <strong>服务与工具参数</strong>
+      <a href="#server">模型 API 服务</a><a href="#launch">网页启动器</a><a href="#webui">独立聊天 WebUI</a><a href="#benchmark">性能测试</a><a href="#download">模型下载</a><a href="#tools">终端、配置与导出</a><a href="#desktop">桌面数据目录</a><a href="#troubleshooting">常见参数问题</a>
+    </nav>
+    <main>
+      <header>
+        <p class="eyebrow">PARAMETER REFERENCE / 参数详解</p>
+        <h1>启动与模型参数手册</h1>
+        <p class="intro">从选择设备到配置网页服务，逐项说明参数的作用、默认值和写法。本页随 FastLLM @FTLLM_VERSION@ 绿色包提供，包含 @PARAMETER_COUNT@ 项分组参数说明；无需联网。</p>
+        <p class="shortcut">按 <kbd>Ctrl</kbd> + <kbd>F</kbd> 可搜索参数名，例如 <code>--tp</code>、<code>--dtype</code> 或 <code>--port</code>。</p>
+      </header>
+      <section id="usage">
+        <h2>参数应该填在哪里</h2>
+        <div class="panel">
+          <p><strong>桌面应用和网页 Launcher：</strong>在“启动项”的模型配置中填写设备、量化、缓存等参数；保存前可预览最终启动命令。本页的<a href="#model">模型参数</a>与<a href="#server">API 参数</a>用于这些模型启动项。</p>
+          <p><strong>命令行：</strong>在解压根目录打开终端，基本格式是 <code>./ftllm 子命令 模型路径 --参数 值</code>。本文示例中的模型与项目路径需要替换为你的实际路径。</p>
+          <p><strong>网页启动器自身：</strong><code>./ftllm-launch-webui</code> 等价于 <code>./ftllm launch</code>，只接受<a href="#launch">启动器参数</a>。例如它的 <code>--port 8000</code> 设置管理页面端口；模型 API 的 <code>--port 8080</code> 应配置在模型启动项或 <code>ftllm server</code> 命令中。</p>
+        </div>
+        <div class="cards">
+          <div class="panel"><h3>不带值的开关</h3><p><code>--no-browser</code>、<code>--low_gpu_mem</code> 等直接添加即可。要关闭则省略该选项，不能写成 <code>--no-browser false</code>。</p></div>
+          <div class="panel"><h3>需要值的选项</h3><p><code>--device cuda:0</code>、<code>--dtype int4g128</code> 必须给值。部分开关也是带值形式，例如 <code>--enable_thinking false</code>。</p></div>
+        </div>
+        <div class="note">表中默认值来自本包 CLI 的初始参数。<code>auto</code>、<code>-1</code> 和“未指定”通常表示交给模型配置或运行时决定，实际行为见各项说明；不是所有参数中的 <code>0</code> 都表示关闭。</div>
+      </section>
+      <section id="examples">
+        <h2>完整启动示例</h2>
+        <h3>本机单卡模型 API</h3>
+        <pre><code>./ftllm server "/path/to/model" \
+  --device cuda:0 --dtype auto \
+  --host 127.0.0.1 --port 8080 --model_name my-model</code></pre>
+        <p class="subtle">模型服务地址为 <code>http://127.0.0.1:8080/v1</code>。如需访问密钥，增加 <code>--api_key your-api-key</code>，客户端使用相同的密钥。</p>
+        <h3>HF 模型使用 INT4 分组量化</h3>
+        <pre><code>./ftllm server "/path/to/hf-model" \
+  --device cuda:0 --dtype int4g128 --kv_cache_limit 5G \
+  --host 127.0.0.1 --port 8080</code></pre>
+        <p class="subtle">此处 <code>5G</code> 是 KV 缓存预算示例。还需要为模型权重和工作内存留出显存，具体值应结合模型与显卡调整。</p>
+        <h3>两张卡并行；或 GPU + CPU 混合运行 MoE</h3>
+        <pre><code><span class="comment"># 支持张量并行的模型：使用 0、1 号 GPU</span>
+./ftllm server "/path/to/model" --tp 2 --host 127.0.0.1 --port 8080
+
+<span class="comment"># 支持混合推理的 MoE 模型：主干在 GPU，专家在 CPU</span>
+./ftllm server "/path/to/moe-model" \
+  --device cuda:0 --moe_device cpu -t 16 \
+  --host 127.0.0.1 --port 8080</code></pre>
+        <h3>在另一台电脑上打开 Launcher</h3>
+        <pre><code>./ftllm-launch-webui --no-browser --host 0.0.0.0 --port 8000 \
+  --agent-workspace-root "/path/to/projects"</code></pre>
+        <p class="subtle">在浏览器中打开终端打印的地址，使用服务器 IP 并保留 URL 中的控制 token。网络和防火墙需要放行该端口；Launcher 能启动进程和执行目录 Agent 任务，仅向可信用户开放。</p>
+      </section>
+      <section id="model">
+        <p class="scope">适用：server / serve、chat / run、benchmark / bench 的模型加载</p>
+        <h2>模型文件与模板</h2>
+        <p>模型路径、权重来源与消息模板决定加载什么模型，以及如何把消息转换为模型输入。<code>--path</code>、<code>--ori</code>、<code>--mmproj</code> 的用途不同。</p>
+        @MODEL_TABLE@
+      </section>
+      <section id="devices">
+        <p class="scope">适用：模型推理</p><h2>设备与多卡</h2>
+        <div class="note"><code>--device cuda:2</code> 表示第 3 张 GPU；<code>--tp 2</code> 表示前两张 GPU（0、1）。要明确选择不连续的两张卡，可使用 <code>--tp 0,2</code>。</div>
+        @DEVICES_TABLE@
+      </section>
+      <section id="precision">
+        <p class="scope">适用：模型推理</p><h2>量化与计算精度</h2>
+        <p><code>--dtype</code> 控制权重，<code>--atype</code> 控制中间计算，<code>--kv_cache_dtype</code> 控制注意力缓存。它们是独立设置；降低权重精度不等于同时降低 KV 缓存精度。</p>
+        @PRECISION_TABLE@
+      </section>
+      <section id="memory">
+        <p class="scope">适用：模型推理；并发主要用于 API 服务</p><h2>显存、上下文与并发</h2>
+        <ul>
+          <li><strong>一个会话能有多长：</strong><code>--max_context_length</code>，输入与输出合计。</li>
+          <li><strong>缓存总共分配多少：</strong><code>--kv_cache_limit</code>、<code>--tokens</code> 等；多个并发请求共同消耗缓存。</li>
+          <li><strong>一次最多输出多少：</strong>API 请求中的 <code>max_tokens</code>，或独立 WebUI 的 <code>--max_token</code>；不要与上下文总长度混用。</li>
+        </ul>
+        @MEMORY_TABLE@
+        <h3>RoPE 扩展写法</h3>
+        <pre><code>./ftllm server "/path/to/supported-qwen-model" --device cuda:0 \
+  --max_context_length 65536 \
+  --rope_scaling '{"rope_type":"yarn","factor":2,"original_max_position_embeddings":32768}' \
+  --host 127.0.0.1 --port 8080</code></pre>
+        <p class="subtle">以上仅演示 JSON 的引号和字段写法。原始窗口值、扩展倍率和目标长度需要与实际模型匹配；GGUF、FLM 以及尚未支持扩展的布局不能直接套用。</p>
+      </section>
+      <section id="moe">
+        <p class="scope">适用：支持这些放置策略的 MoE / N-gram 模型</p><h2>MoE 混合推理</h2>
+        <p>主干和专家可以采用不同设备与权重精度。混合推理需要同时考虑 GPU 显存、主机内存及 CPU 线程；表中的磁盘与 NUMA 选项仅对已接入的模型路径有效。</p>
+        @MOE_TABLE@
+      </section>
+      <section id="cache">
+        <p class="scope">适用：支持缓存功能的模型推理后端</p><h2>历史与前缀缓存</h2>
+        <p>这些选项控制推理缓存。浏览器的聊天记录保存位置由独立 WebUI 的 <code>--history_dir</code> 决定，二者相互独立。</p>
+        @CACHE_TABLE@
+      </section>
+      <section id="speculative">
+        <p class="scope">适用：匹配的目标模型与 draft 模型</p><h2>MTP / DSpark / DFlash 投机解码</h2>
+        <p>使用 draft 先提出候选 token，再由目标模型验证。可用算法取决于模型架构和 checkpoint，不能把 MTP、DSpark 与 DFlash 混合启用。</p>
+        @SPECULATIVE_TABLE@
+        <pre><code><span class="comment"># 具备 MTP 支持和权重的模型</span>
+./ftllm server "/path/to/mtp-model" --device cuda:0 --mtp 3 --host 127.0.0.1
+
+<span class="comment"># 支持 DFlash 且已准备好匹配 draft 模型</span>
+./ftllm server "/path/to/target-model" --device cuda:0 \
+  --speculative_algorithm dflash --draft "/path/to/dflash-draft" \
+  --host 127.0.0.1</code></pre>
+      </section>
+      <section id="server">
+        <p class="scope">适用：./ftllm server / ./ftllm serve，以及 Launcher 中的 API 启动项</p><h2>模型 API 服务</h2>
+        <p>这些是 <code>server</code> 的专用选项，可以与前面的模型参数组合。采样项设置服务端默认值，单次 API 请求可以提供自己的采样值；<code>chat</code> 命令不接受这里的服务端采样选项。</p>
+        @SERVER_TABLE@
+      </section>
+      <section id="launch">
+        <p class="scope">适用：./ftllm-launch-webui、./launch.sh、./ftllm launch</p><h2>网页启动器 Launcher</h2>
+        <p>Launcher 管理模型启动项、下载和工作室，自身不直接加载模型。设备与量化参数应填写在它管理的模型启动项中。</p>
+        @LAUNCH_TABLE@
+        <pre><code>./ftllm-launch-webui --no-browser --port 8000 \
+  --config "/path/to/profiles.json" --disable-workspace-agent</code></pre>
+      </section>
+      <section id="webui">
+        <p class="scope">适用：./ftllm webui；与 ftllm-launch-webui 启动器入口区分</p><h2>独立聊天 WebUI</h2>
+        <p>此命令连接一个已经启动的模型 API，提供独立聊天页面。已有 Launcher 时通常直接使用“工作室”即可，无需再起一个独立 WebUI 进程。</p>
+        <pre><code><span class="comment"># 先在一个终端启动模型 API</span>
+./ftllm server "/path/to/model" --device cuda:0 \
+  --host 127.0.0.1 --port 8080 --model_name my-model
+
+<span class="comment"># 再在另一个终端启动独立聊天页面</span>
+./ftllm webui --host 127.0.0.1 --port 1616 \
+  --api_base http://127.0.0.1:8080/v1 --api_model my-model</code></pre>
+        @WEBUI_TABLE@
+      </section>
+      <section id="benchmark">
+        <p class="scope">适用：./ftllm benchmark / ./ftllm bench，另可组合模型参数</p><h2>性能测试</h2>
+        <p>用于比较同一模型、输入输出长度和并发条件下的速度。<code>--batch</code> 是基准请求数，<code>--max_batch</code> 是模型并发容量设置。</p>
+        @BENCHMARK_TABLE@
+        <pre><code>./ftllm benchmark "/path/to/model" --device cuda:0 \
+  --input_tokens 1024 --output_tokens 256 --batch 1 --warmup 1</code></pre>
+      </section>
+      <section id="download">
+        <p class="scope">适用：./ftllm download，需要联网与相应下载程序</p><h2>模型下载</h2>
+        <p>这是命令行仓库下载工具。无需手写命令时，也可以使用 Launcher 的模型下载页面。</p>
+        @DOWNLOAD_TABLE@
+        <pre><code>./ftllm download Qwen/Qwen3-0.6B --tool wget \
+  --local-dir "/path/to/models/Qwen3-0.6B"</code></pre>
+      </section>
+      <section id="tools">
+        <h2>终端、配置与导出</h2>
+        <div class="panel">
+          <h3>基础帮助与版本</h3>
+          <p><code>./ftllm --help</code> 显示子命令列表；<code>-h</code> 等价于 <code>--help</code>。<code>./ftllm --version</code>（或 <code>-v</code>）显示版本。无参数在终端运行 <code>./ftllm</code> 会启动 Launcher；文件管理器双击 <code>ftllm</code> 则先打开包内环境终端。</p>
+          <h3>命令行聊天与终端向导</h3>
+          <p><code>./ftllm chat "/path/to/model" --device cuda:0</code> 使用前面的通用模型参数；<code>run</code> 是等价命令。对话中输入 <code>clear</code> 清空记录，<code>stop</code> 结束。聊天采样配置由模型的配置文件等决定。</p>
+          <p><code>./ftllm tui</code> 打开终端部署向导；增加无值开关 <code>--plain</code> 改为普通问答模式。</p>
+          <h3>生成模型配置模板</h3>
+          <p><code>./ftllm config "/path/to/config.json"</code> 生成通用模型参数的 JSON 模板，省略文件路径时写入当前目录的 <code>config.json</code>。它与 Launcher 的 <code>--config</code> 启动项文件不是同一种配置。</p>
+          <h3>导出模型</h3>
+          <p><code>./ftllm export "/path/to/hf-model" --dtype int4g128 -o "/path/to/model.flm"</code> 指定导出目标；<code>-o</code> 与 <code>--output</code> 等价且必填。可用 <code>--moe_dtype</code>、<code>--dtype_config</code> 和 <code>--lora</code> 配置支持的导出路径。</p>
+          <h3>修复入口图标</h3>
+          <p><code>./ftllm --setup-desktop</code> 是绿色包入口提供的图标修复命令，在本机桌面终端执行；不会加载模型。正常首次启动会自动配置图标。</p>
+        </div>
+        <details><summary>本版本新增的其他通用参数</summary>@EXTRA_TABLE@</details>
+      </section>
+      <section id="desktop">
+        <h2>桌面应用的数据目录</h2>
+        <p><code>Fastllm-Launcher</code> 会自动安排本机后台端口并传入自己的配置文件。模型推理设置应在窗口中的启动项内填写。</p>
+        <p>默认数据位于 <code>support/data/</code>。若希望把桌面配置、日志与默认模型缓存放到另一个位置，可以在启动前设置环境变量：</p>
+        <pre><code>FTLLM_LAUNCHER_DATA_DIR="/path/to/launcher-data" ./Fastllm-Launcher</code></pre>
+        <p class="subtle">这是环境变量的写法，不是 <code>--</code> 参数。包目录不可写时，桌面应用会自动回退到当前用户的数据目录。</p>
+      </section>
+      <section id="troubleshooting">
+        <h2>常见参数问题</h2>
+        <div class="panel">
+          <h3>提示 unrecognized arguments</h3>
+          <p>先检查子命令和连字符：<code>ftllm launch</code> 不接受模型的 <code>--dtype</code>；<code>--no-browser</code> 不带 <code>true/false</code>。下划线与短横线只有在表中列出别名时才可互换。</p>
+          <h3>提示端口已占用</h3>
+          <p>修改对应服务的 <code>--port</code>。Launcher 默认 8000、模型 API 默认 8080、独立 WebUI 默认 1616；给 WebUI 改 API 服务端口时，也要同步修改 <code>--api_base</code>。</p>
+          <h3>显存不足或长上下文启动失败</h3>
+          <p>先检查模型权重、KV 缓存与工作内存总量。可以结合模型支持情况，减小上下文/并发、调整缓存预算、降低权重精度，或使用多卡和 MoE 混合推理。提高 <code>--max_context_length</code> 不会自动增加可用显存。</p>
+          <h3>数值与模型不匹配</h3>
+          <p>默认值表示不传该参数时的初始设置；模型配置、硬件能力和后端还会决定有效取值。MTP、FP4 KV、RoPE 扩展等功能只对支持的模型和路径生效，不能仅靠添加参数启用任意组合。</p>
+          <h3>查看本包的原始命令行帮助</h3>
+          <pre><code>./ftllm server --help
+./ftllm-launch-webui --help
+./ftllm webui --help
+./ftllm benchmark --help</code></pre>
+        </div>
+      </section>
+      <footer>FastLLM @FTLLM_VERSION@ · 参数名、别名、初始默认值与取值类型随本包生成。<br><a href="../../README.html">返回使用指南</a> · <a href="#top">回到顶部</a></footer>
+    </main>
+  </div>
+</div>
+</body>
+</html>
