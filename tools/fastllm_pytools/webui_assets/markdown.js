@@ -3,8 +3,8 @@ parserURL.search = new URL(import.meta.url).search;
 const {marked} = await import(parserURL.href);
 
 // Parse GFM with Marked, but build DOM nodes ourselves: message HTML is never
-// inserted into the application as markup.
-export function renderMarkdown(node, source, {t, onCopy} = {}) {
+// inserted into the application as markup. HTML code runs only in the preview.
+export function renderMarkdown(node, source, {t, onCopy, onPreview} = {}) {
   const doc = node.ownerDocument;
   const element = (tag, className) => {
     const result = doc.createElement(tag);
@@ -32,6 +32,13 @@ export function renderMarkdown(node, source, {t, onCopy} = {}) {
     const language = (token.lang || "").trim().split(/\s+/)[0];
     label.textContent = language || "code";
     const actions = element("div", "code-actions");
+    if (["html", "htm", "text/html"].includes(language.toLowerCase()) && onPreview) {
+      const preview = element("button", "preview-code");
+      preview.type = "button";
+      preview.textContent = t("html.preview");
+      preview.onclick = () => onPreview(token.text);
+      actions.append(preview);
+    }
     if (onCopy) {
       const copy = element("button", "copy-code");
       copy.type = "button";

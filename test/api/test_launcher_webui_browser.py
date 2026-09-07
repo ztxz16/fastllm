@@ -34,6 +34,7 @@ class LauncherWebUIBrowserTest(unittest.TestCase):
 
     def setUp(self):
         import uvicorn
+        from fastapi import FastAPI
 
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -44,7 +45,7 @@ class LauncherWebUIBrowserTest(unittest.TestCase):
         self.runtime._state.update(command='server', phase='running', ready=True,
                                    sessionId='model-a', modelName='browser-model',
                                    endpoint='http://127.0.0.1:19001')
-        app = create_launcher_app(self.runtime, 'browser-key')
+        launcher = create_launcher_app(self.runtime, 'browser-key')
         args = add_webui_args(argparse.ArgumentParser()).parse_args([])
         args.api_model = 'standalone-model'
         args.agent_runtime = 'builtin'
@@ -52,7 +53,10 @@ class LauncherWebUIBrowserTest(unittest.TestCase):
         standalone = create_app(args)
         self.standalone = standalone.state.runtime
         self.addCleanup(self.standalone.close)
+        # Exercise standalone WebUI without Launcher's unrelated middleware.
+        app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
         app.mount('/standalone', standalone)
+        app.mount('/', launcher)
         listener = socket.socket()
         self.addCleanup(listener.close)
         listener.bind(('127.0.0.1', 0))
@@ -226,6 +230,7 @@ class LauncherWebUIBrowserTest(unittest.TestCase):
                 expect(message.locator('a')).to_have_attribute('rel', 'noopener noreferrer')
                 expect(message.locator('img,script')).to_have_count(0)
                 expect(message.locator('.code-block code')).to_have_text('<h1>Still streaming</h1>')
+                expect(message.locator('.preview-code')).to_be_visible()
                 pane.locator('.reasoning summary').click()
                 expect(pane.locator('.reasoning-content table')).to_be_visible()
             finally:
@@ -239,6 +244,60 @@ class LauncherWebUIBrowserTest(unittest.TestCase):
         self.page.set_viewport_size({'width': 390, 'height': 844})
         self.assertTrue(self.page.evaluate('document.documentElement.scrollWidth <= innerWidth'))
         self.screenshot('markdown-mobile')
+
+    def test_html_preview_runs_scripts_with_isolated_storage_and_closes_cleanly(self):
+        self.page.locator('#open-webui').click()
+        self.assert_loaded()
+        pane = self.page.locator('#webui-content')
+        source = '''<!doctype html><html><head><style>
+body { background: rgb(12, 24, 36); color: white; font: 24px sans-serif; }
+</style></head><body><h1>HTML demo</h1><button id="counter">0</button>
+<p id="isolation"></p><script>
+localStorage.setItem('preview-test', 'inside');
+let isolated = false;
+try { parent.document.body.dataset.previewEscaped = 'yes'; } catch (_) { isolated = true; }
+document.querySelector('#isolation').textContent = isolated ? 'Isolated' : 'Unsafe';
+document.querySelector('#counter').onclick = event => {
+  event.target.textContent = Number(event.target.textContent) + 1;
+};
+</script></body></html>'''
+        with patch.object(self.runtime._webui_app.state.runtime.api_client, 'stream',
+                          side_effect=lambda *a, **k: iter([('```HTML\n' + source + '\n```', '')])):
+            pane.locator('#prompt').fill('Build a page')
+            pane.locator('#sendButton').click()
+            expect(pane.locator('#stopButton')).to_be_hidden()
+            expect(pane.locator('.preview-code')).to_be_visible()
+        self.page.evaluate("localStorage.setItem('preview-test', 'outside')")
+        pane.locator('#prompt').fill('Preserve this draft')
+        pane.locator('.preview-code').click()
+        dialog = pane.locator('#htmlPreviewDialog')
+        expect(dialog).to_be_visible()
+        frame = pane.frame_locator('#htmlPreviewBody iframe')
+        expect(frame.locator('h1')).to_have_text('HTML demo')
+        expect(frame.locator('body')).to_have_css('background-color', 'rgb(12, 24, 36)')
+        expect(frame.locator('#isolation')).to_have_text('Isolated')
+        frame.locator('#counter').click()
+        expect(frame.locator('#counter')).to_have_text('1')
+        self.assertEqual(self.page.evaluate("localStorage.getItem('preview-test')"), 'outside')
+        self.assertIsNone(self.page.locator('body').get_attribute('data-preview-escaped'))
+        self.screenshot('html-preview')
+        pane.locator('#closeHTMLPreview').click()
+        expect(dialog).to_be_hidden()
+        expect(pane.locator('iframe')).to_have_count(0)
+        expect(pane.locator('#prompt')).to_have_value('Preserve this draft')
+        self.page.locator('#language-select').select_option('zh-CN')
+        self.page.locator('#theme-select').select_option('dark')
+        expect(pane.locator('.preview-code')).to_have_text('预览')
+        pane.locator('.preview-code').click()
+        expect(frame.locator('#counter')).to_have_text('0')
+        self.page.set_viewport_size({'width': 390, 'height': 844})
+        self.assertLessEqual(dialog.bounding_box()['width'], 390)
+        self.screenshot('html-preview-mobile')
+        pane.locator('#closeHTMLPreview').click()
+        pane.locator('.preview-code').click()
+        self.page.keyboard.press('Escape')
+        expect(dialog).to_be_hidden()
+        expect(pane.locator('iframe')).to_have_count(0)
 
     def test_pi_install_retry_enables_agent_and_preserves_draft(self):
         job = {'phase': 'missing', 'supported': True, 'available': False, 'error': ''}
@@ -1006,7 +1065,7 @@ class LauncherWebUIBrowserTest(unittest.TestCase):
                    'arguments': {'path': 'README.md'}}
             yield {'type': 'tool_end', 'id': 'read-project', 'name': 'read',
                    'result': 'Demo project', 'is_error': False}
-            yield {'type': 'text_delta', 'text': 'Project inspected.\n\n| File | State |\n| --- | --- |\n| README.md | **Read** |'}
+            yield {'type': 'text_delta', 'text': 'Project inspected.\n\n| File | State |\n| --- | --- |\n| README.md | **Read** |\n\n```html\n<h1>Agent preview</h1>\n```'}
             yield {'type': 'done', 'turns': 1}
 
         fake_pi = lambda **kwargs: SimpleNamespace(
@@ -1029,6 +1088,9 @@ class LauncherWebUIBrowserTest(unittest.TestCase):
             expect(pane.locator('#stopButton')).to_be_hidden()
             self.assertEqual(str(calls[0]['working_directory']), project)
             expect(pane.locator('.message.assistant table td strong')).to_have_text('Read')
+            pane.locator('.preview-code').click()
+            expect(pane.frame_locator('#htmlPreviewBody iframe').locator('h1')).to_have_text('Agent preview')
+            pane.locator('#closeHTMLPreview').click()
             self.screenshot('launcher-pi-agent')
 
     def test_workspace_unavailable_reason_explains_runtime_and_remote_policy(self):
@@ -1069,12 +1131,15 @@ class LauncherWebUIBrowserTest(unittest.TestCase):
         expect(pane.locator('.brand')).to_be_visible()
         expect(pane.locator('#languageButton')).to_be_visible()
         with patch.object(self.standalone.api_client, 'stream',
-                          side_effect=lambda *a, **k: iter([('Shared standalone reply\n\n| A | B |\n| --- | --- |\n| 1 | 2 |', '')])):
+                          side_effect=lambda *a, **k: iter([('Shared standalone reply\n\n| A | B |\n| --- | --- |\n| 1 | 2 |\n\n```html\n<h1>Standalone preview</h1>\n```', '')])):
             pane.locator('#prompt').fill('Hello standalone')
             pane.locator('#sendButton').click()
             expect(pane.locator('.message.assistant')).to_have_count(1)
             expect(pane.locator('#stopButton')).to_be_hidden()
         expect(pane.locator('.message.assistant table')).to_be_visible()
+        pane.locator('.preview-code').click()
+        expect(pane.frame_locator('#htmlPreviewBody iframe').locator('h1')).to_have_text('Standalone preview')
+        pane.locator('#closeHTMLPreview').click()
         self.assertIn('/standalone/?chat=', self.page.url)
         self.screenshot('standalone-webui')
         self.page.reload()

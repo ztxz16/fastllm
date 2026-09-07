@@ -43,7 +43,7 @@ class LauncherWebUITest(unittest.TestCase):
         return response
 
     def test_authentication_covers_page_assets_api_and_downloads(self):
-        for path in ('/', '/assets/webui_locales.js', '/api/config', '/api/conversations/x/attachments/y'):
+        for path in ('/', '/html-preview', '/assets/webui_locales.js', '/api/config', '/api/conversations/x/attachments/y'):
             self.assertEqual(self.client.get(self.base + path).status_code, 403)
         self.assertEqual(self.client.post('/api/webui/open', json={'sessionId': 'model-a'}).status_code, 403)
         response = self.open()
@@ -87,6 +87,20 @@ class LauncherWebUITest(unittest.TestCase):
         self.assertNotIn('<iframe', parent.text)
         self.assertIn('id="webui-content"', parent.text)
         self.assertIn('<h1>模型管理</h1>', parent.text)
+
+    def test_html_preview_is_sandboxed_without_relaxing_application_policy(self):
+        self.open()
+        response = self.client.get(self.base + '/html-preview')
+        self.assertEqual(response.status_code, 200)
+        policy = response.headers['content-security-policy']
+        self.assertIn('sandbox allow-scripts', policy)
+        self.assertNotIn('allow-same-origin', policy)
+        self.assertIn("connect-src 'none'", policy)
+        self.assertIn("frame-src 'none'", policy)
+        self.assertIn("form-action 'none'", policy)
+        self.assertEqual(response.headers['cache-control'], 'no-store')
+        self.assertNotIn("'unsafe-inline'", self.client.get('/').headers['content-security-policy'])
+        self.assertNotIn("'unsafe-inline'", self.client.get(self.base + '/').headers['content-security-policy'])
 
     def test_active_model_and_credentials_are_snapshotted_on_server_side(self):
         self.open()

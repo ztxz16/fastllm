@@ -2356,6 +2356,27 @@ def create_app(args: argparse.Namespace):
             )
         return HTMLResponse(page, headers=headers)
 
+    @app.get("/html-preview", response_class=FileResponse)
+    def html_preview():
+        # A separate response avoids weakening the application's CSP. Both the
+        # header and iframe sandbox prevent preview scripts from accessing it.
+        return FileResponse(
+            Path(__file__).with_name("webui_assets") / "html-preview.html",
+            media_type="text/html",
+            headers={
+                "Content-Security-Policy": (
+                    "default-src 'none'; script-src 'unsafe-inline'; "
+                    "style-src 'unsafe-inline'; img-src data: blob:; "
+                    "media-src data: blob:; font-src data:; connect-src 'none'; "
+                    "object-src 'none'; frame-src 'none'; base-uri 'none'; "
+                    "frame-ancestors 'self'; form-action 'none'; sandbox allow-scripts"
+                ),
+                "Cache-Control": "no-store",
+                "Referrer-Policy": "no-referrer",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
     app.mount("/assets/webui", StaticFiles(directory=str(
         Path(__file__).with_name("webui_assets"))), name="webui-assets")
 

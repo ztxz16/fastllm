@@ -78,6 +78,11 @@
     <button class="agent-card" data-agent="code"><span class="agent-state" data-i18n="common.current">当前</span><span class="agent-card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="m8 9-4 3 4 3M16 9l4 3-4 3M14 5l-4 14"/></svg></span><span class="agent-card-copy"><strong data-i18n="agent.code">代码项目</strong><p data-i18n="agent.code_desc">跨文件审查、定位问题，并生成可下载但不会自动执行的补丁。</p><small>REVIEW · UNIFIED DIFF</small></span></button>
   </div>
 </dialog>
+<dialog id="htmlPreviewDialog" aria-labelledby="htmlPreviewTitle">
+  <div class="dialog-head"><h2 id="htmlPreviewTitle" data-i18n="html.preview_title">HTML 预览</h2><button class="dialog-close" id="closeHTMLPreview" aria-label="关闭" data-i18n-aria="common.close">×</button></div>
+  <p class="html-preview-hint" data-i18n="html.preview_hint">支持 HTML、CSS 和内联 JavaScript；联网资源不可用，页面存储仅在本次预览内保留。</p>
+  <div id="htmlPreviewBody"></div>
+</dialog>
 <dialog id="settingsDialog">
   <div class="dialog-head"><h2 data-i18n="settings.title">模型参数</h2><button class="dialog-close" id="closeSettings" aria-label="关闭" data-i18n-aria="common.close">×</button></div>
   <div class="dialog-body">

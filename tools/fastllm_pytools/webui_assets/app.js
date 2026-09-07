@@ -184,9 +184,25 @@ export async function mountWebUI(host, {basePath = "", embedded = false, locale 
       catch (error) { toast(error.message); }
     }
 
+    function openHTMLPreview(html) {
+      const frame = document.createElement("iframe");
+      frame.title = t("html.preview_title");
+      frame.setAttribute("sandbox", "allow-scripts");
+      frame.referrerPolicy = "no-referrer";
+      frame.src = localUrl("/html-preview");
+      frame.addEventListener("load", () => {
+        // The sandbox intentionally has an opaque origin, so targetOrigin is *.
+        // Only this frame receives the message; the receiver checks its parent.
+        frame.contentWindow.postMessage({type:"ftllm-html-preview", html}, "*");
+      }, {once:true, signal:lifecycle.signal});
+      $("#htmlPreviewBody").replaceChildren(frame);
+      $("#htmlPreviewDialog").showModal();
+    }
+
     function renderMarkdown(node, text) {
       renderMessageMarkdown(node, text, {
         t,
+        onPreview: guard(openHTMLPreview),
         onCopy: guard(async (code, button) => {
           await navigator.clipboard.writeText(code);
           button.textContent = t("common.copied");
@@ -663,6 +679,9 @@ export async function mountWebUI(host, {basePath = "", embedded = false, locale 
       state.config = await (await api("/api/config")).json();
       renderWorkspaceAvailability();
     }
+
+    $("#closeHTMLPreview").onclick = guard(() => $("#htmlPreviewDialog").close());
+    $("#htmlPreviewDialog").addEventListener("close", () => $("#htmlPreviewBody").replaceChildren(), {signal:lifecycle.signal});
 
     $("#installRuntime").onclick = guard(() => onInstallRuntime?.());
 

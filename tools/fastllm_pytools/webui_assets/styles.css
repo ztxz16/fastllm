@@ -346,8 +346,9 @@ button { -webkit-tap-highlight-color: transparent; }
 .code-block { margin: 14px 0; overflow: hidden; background: #20232c; border: 1px solid #2d313c; border-radius: 13px; box-shadow: 0 8px 25px rgba(22,24,33,.1); }
 .code-head { display: flex; justify-content: space-between; align-items: center; height: 35px; padding: 0 12px; color: #9da3b1; background: #282b35; font-size: 10px; }
 .code-actions { display: flex; align-items: center; gap: 12px; }
-.copy-code { color: #b4b9c5; background: transparent; border: 0; cursor: pointer; font-size: 11px; }
-.copy-code:hover { color: #fff; }
+.copy-code,.preview-code { color: #b4b9c5; background: transparent; border: 0; cursor: pointer; font-size: 11px; }
+.copy-code:hover,.preview-code:hover { color: #fff; }
+.preview-code { color: #9cdcfe; }
 .code-block pre { max-height: 520px; margin: 0; padding: 15px; overflow: auto; color: #e7e9ee; font-family: "SFMono-Regular",Consolas,monospace; font-size: 12px; line-height: 1.65; white-space: pre; }
 .reasoning { margin: 0 0 12px; border: 1px solid #e7e8ee; border-radius: 12px; background: rgba(248,249,251,.8); overflow: hidden; }
 .reasoning summary { padding: 9px 12px; color: #7b8190; cursor: pointer; font-size: 11px; list-style: none; }
@@ -652,3 +653,11 @@ dialog::backdrop { background: rgba(29,33,49,.3); backdrop-filter: blur(4px); }
   .agent-card, .mode-button, .dialog-button, .field input, .field select,
   .field textarea, .mode-menu, .conversation-action-menu) { border-radius: 4px; }
 :host([data-theme="dark"]) :is(.composer, dialog, .message.user .message-body, .code-block) { border-radius: 6px; }
+
+/* Keep the generated page's canvas independent of the surrounding UI theme. */
+#htmlPreviewDialog { width: min(1100px,calc(100vw - 32px)); max-width: calc(100vw - 32px); height: min(820px,calc(100dvh - 32px)); max-height: calc(100dvh - 32px); padding: 0; }
+#htmlPreviewDialog[open] { display: flex; flex-direction: column; }
+#htmlPreviewDialog .dialog-head { flex-shrink: 0; }
+.html-preview-hint { flex-shrink: 0; margin: 0; padding: 10px 20px; color: var(--muted); font-size: 11px; border-bottom: 1px solid var(--line); }
+#htmlPreviewBody { flex: 1; min-height: 0; background: #fff; }
+#htmlPreviewBody iframe { display: block; width: 100%; height: 100%; border: 0; background: #fff; }
