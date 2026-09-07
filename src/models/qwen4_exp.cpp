@@ -598,10 +598,11 @@ namespace fastllm {
         void Qwen4EnsureAppendCapacity(Data &cache, const Data &append,
                                        int axis, int quantum,
                                        int maxGrowth,
-                                       bool geometricGrowth) {
+                                       bool geometricGrowth,
+                                       int reserveTokens = 0) {
             AssertInFastLLM(!append.dims.empty() && axis >= 0 &&
                             axis < (int)append.dims.size() &&
-                            append.dims[axis] >= 0,
+                            append.dims[axis] >= 0 && reserveTokens >= 0,
                             "Qwen4-Exp cache append received an invalid tensor.\n");
             if (!cache.dims.empty()) {
                 AssertInFastLLM(cache.dims.size() == append.dims.size() &&
@@ -610,7 +611,7 @@ namespace fastllm {
             }
             const int logical = cache.dims.empty() ? 0 : cache.dims[axis];
             const int64_t required64 =
-                (int64_t)logical + append.dims[axis];
+                (int64_t)logical + append.dims[axis] + reserveTokens;
             AssertInFastLLM(required64 <= std::numeric_limits<int>::max(),
                             "Qwen4-Exp cache capacity overflow.\n");
             const int required = (int)required64;
@@ -625,7 +626,7 @@ namespace fastllm {
                     currentCapacity, required, quantum, maxGrowth);
             } else {
                 const int roundedAppend = Qwen4RoundUpCacheCapacity(
-                    append.dims[axis], quantum);
+                    append.dims[axis] + reserveTokens, quantum);
                 const int64_t legacyCapacity =
                     (int64_t)logical + roundedAppend;
                 AssertInFastLLM(
@@ -4984,14 +4985,15 @@ namespace fastllm {
                                           Data &pastValue,
                                           RequestState &state,
                                           Data &output,
-                                          Data *qsaRawKeyCapture) {
+                                          Data *qsaRawKeyCapture,
+                                          int decodeReserveTokens) {
         RunFullAttentionWithPrefix(
             layer,
             languagePrefix + "layers." + std::to_string(layer) +
                 ".self_attn.",
             input, attentionMask, positionIds,
             qsaDeviceCompatibleMask, pastKey, pastValue, state, output,
-            qsaRawKeyCapture);
+            qsaRawKeyCapture, decodeReserveTokens);
     }
 
     void Qwen4ExpModel::RunFullAttentionWithPrefix(
@@ -5005,7 +5007,8 @@ namespace fastllm {
                                           Data &pastValue,
                                           RequestState &state,
                                           Data &output,
-                                          Data *qsaRawKeyCapture) {
+                                          Data *qsaRawKeyCapture,
+                                          int decodeReserveTokens) {
         const int batch = input.dims[0];
         const int sequence = input.dims[1];
         const int previousLength = pastKey.dims.empty() ? 0 : pastKey.dims[1];
@@ -5079,12 +5082,14 @@ namespace fastllm {
             key.dataDevice == DataDevice::CUDA ? 128 : 64;
         const bool geometricGrowth =
             state.geometricCacheGrowthReadyLayers.count(stateLayer) != 0;
+        // Reserve decode headroom during final prefill without changing the
+        // logical cache length or the default allocation schedule.
         Qwen4EnsureAppendCapacity(
             pastKey, key, 1, unitLength,
-            kQwen4DenseCacheMaxGrowth, geometricGrowth);
+            kQwen4DenseCacheMaxGrowth, geometricGrowth, decodeReserveTokens);
         Qwen4EnsureAppendCapacity(
             pastValue, value, 1, unitLength,
-            kQwen4DenseCacheMaxGrowth, geometricGrowth);
+            kQwen4DenseCacheMaxGrowth, geometricGrowth, decodeReserveTokens);
         bool appendedWithStridedCudaCache = false;
 #ifdef USE_CUDA
         if (!GetKVCacheInCPU() &&
@@ -10188,6 +10193,22 @@ namespace fastllm {
             ((threadTpRank >= 0 || restoredPrefixSnapshot || verificationCapture != nullptr) &&
              Qwen4IsContiguousCausalMask(
                  attentionMask, qsaPreviousLength, inputIds.dims[1]));
+        int decodeReserveTokens = 0;
+        // Dense decode graph width depends on KV capacity. Keep its original
+        // allocation schedule and reserve only for fixed-budget sparse QSA.
+        if (threadTpRank >= 0 && allowDecodeCudaGraph &&
+            GetFastllmEnv().cudaGraph && qsaDeviceCompatibleMask &&
+            verificationCapture == nullptr &&
+            this->indexerBudget > 0 &&
+            generationConfig.input_token_length >= this->indexerBudget &&
+            qsaPreviousLength < generationConfig.input_token_length &&
+            (int64_t)qsaPreviousLength + inputIds.dims[1] ==
+                generationConfig.input_token_length) {
+            decodeReserveTokens = generationConfig.output_token_limit > 0
+                ? std::min(generationConfig.output_token_limit - 1,
+                           kQwen4DenseCacheMaxGrowth)
+                : kQwen4DenseCacheMaxGrowth;
+        }
         std::map<int, Data> cudaPositionIds;
         auto positionsFor = [&](const Data &reference) -> const Data& {
 #ifdef USE_CUDA
@@ -10328,7 +10349,8 @@ namespace fastllm {
                                  *requestState,
                                  attentionOutput,
                                  verificationCapture == nullptr ? nullptr :
-                                     &verificationCapture->qsaRawKeys[layer]);
+                                     &verificationCapture->qsaRawKeys[layer],
+                                 decodeReserveTokens);
             }
             DumpTensorIfRequested("layer_" + std::to_string(layer) +
                                   "_attention", attentionOutput);

@@ -386,7 +386,8 @@ namespace fastllm {
                               bool qsaDeviceCompatibleMask,
                               Data &pastKey, Data &pastValue,
                               RequestState &state, Data &output,
-                              Data *qsaRawKeyCapture = nullptr);
+                              Data *qsaRawKeyCapture = nullptr,
+                              int decodeReserveTokens = 0);
         void RunFullAttentionWithPrefix(
                               int stateLayer,
                               const std::string &attentionPrefix,
@@ -396,7 +397,8 @@ namespace fastllm {
                               bool qsaDeviceCompatibleMask,
                               Data &pastKey, Data &pastValue,
                               RequestState &state, Data &output,
-                              Data *qsaRawKeyCapture = nullptr);
+                              Data *qsaRawKeyCapture = nullptr,
+                              int decodeReserveTokens = 0);
         void RunLinearAttention(int layer, const Data &input,
                                 Data &pastConv, Data &pastRecurrent,
                                 Data &output,
