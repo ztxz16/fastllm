@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>FastLLM @FTLLM_VERSION@ · 绿色包使用指南</title>
+  <style>
+    :root { --ink: #202a3c; --muted: #596477; --line: #e0e4eb; --purple: #5a46d6; --teal: #087e83; }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; scroll-padding-top: 24px; }
+    body { margin: 0; background: #f6f7fa; color: var(--ink); font: 16px/1.8 system-ui, -apple-system, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; }
+    a { color: var(--purple); text-underline-offset: 4px; }
+    a:focus-visible, summary:focus-visible { outline: 3px solid var(--purple); outline-offset: 5px; border-radius: 3px; }
+    .page { max-width: 1100px; margin: auto; padding: 38px 38px 48px; }
+    .topline { display: flex; justify-content: space-between; align-items: center; gap: 20px; font-size: 13px; }
+    .brand { font-size: 21px; font-weight: 800; letter-spacing: -.6px; }
+    .brand span { color: var(--purple); }
+    .version { padding: 4px 12px; border: 1px solid var(--line); border-radius: 20px; color: var(--muted); background: #fff; }
+    header { padding: 32px 0 24px; }
+    .eyebrow { margin: 0 0 8px; color: var(--purple); font-size: 12px; font-weight: 750; letter-spacing: 1.5px; }
+    h1 { margin: 0 0 12px; font-size: clamp(30px, 5vw, 42px); line-height: 1.3; letter-spacing: -1px; }
+    .intro { margin: 0; max-width: 760px; color: var(--muted); }
+    nav { display: flex; flex-wrap: wrap; gap: 6px 24px; margin: 0 0 30px; padding: 14px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); font-size: 14px; }
+    nav a { color: var(--muted); text-decoration: none; }
+    nav a:hover { color: var(--purple); text-decoration: underline; }
+    section { margin-bottom: 34px; }
+    h2 { margin: 0 0 18px; font-size: 23px; letter-spacing: -.4px; }
+    h3 { margin: 0 0 9px; font-size: 18px; }
+    p { margin: 0 0 14px; }
+    p:last-child { margin-bottom: 0; }
+    .section-title { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px 18px; margin-bottom: 16px; }
+    .section-title h2 { margin: 0; }
+    .section-title span { color: var(--muted); font-size: 14px; }
+    .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+    .card { background: #fff; border: 1px solid var(--line); border-top: 4px solid var(--purple); border-radius: 15px; padding: 23px; }
+    .card.web { border-top-color: var(--teal); }
+    .card-head { display: flex; align-items: center; gap: 16px; margin-bottom: 16px; }
+    .card-head img { flex: none; width: 68px; height: 68px; }
+    .card-head h3 { margin: 0; font-size: 23px; }
+    .kind { color: var(--purple); font-size: 12px; font-weight: 750; letter-spacing: 1px; }
+    .web .kind { color: var(--teal); }
+    .filename { display: block; margin-bottom: 12px; font-size: 17px; font-weight: 700; overflow-wrap: anywhere; }
+    .card p { color: var(--muted); font-size: 14px; }
+    .card .hint { padding-top: 12px; border-top: 1px solid var(--line); font-size: 13px; }
+    code, pre, kbd { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
+    code { font-size: .9em; overflow-wrap: anywhere; }
+    p code, li code, td code, summary code { padding: 2px 5px; background: #eef0f5; border-radius: 4px; }
+    pre { margin: 12px 0 18px; padding: 17px 20px; overflow: auto; background: #202a3c; color: #f3f6fc; border-radius: 10px; font-size: 13px; line-height: 1.9; tab-size: 2; }
+    pre code { padding: 0; font-size: inherit; overflow-wrap: normal; }
+    .comment { color: #b7c4d9; }
+    kbd { padding: 1px 5px; border: 1px solid #ccd2dd; border-bottom-width: 2px; border-radius: 4px; background: #fff; color: var(--ink); font-size: 12px; white-space: nowrap; }
+    .cli { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px 20px; margin-top: 16px; padding: 16px 20px; border: 1px solid var(--line); border-radius: 12px; background: #fff; }
+    .cli strong { font-size: 16px; }
+    .cli p { flex: 1; min-width: 220px; color: var(--muted); font-size: 14px; }
+    .note { margin-top: 16px; padding: 14px 18px; background: #eeebfc; border-radius: 10px; color: #493f78; font-size: 14px; }
+    .panel { padding: 25px; border: 1px solid var(--line); border-radius: 14px; background: #fff; }
+    .steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 25px; list-style: none; padding: 0; margin: 0; counter-reset: steps; }
+    .steps li { counter-increment: steps; font-size: 14px; color: var(--muted); }
+    .steps li::before { content: "0" counter(steps); display: block; margin-bottom: 7px; color: var(--purple); font-size: 13px; font-weight: 750; }
+    .steps strong { display: block; margin-bottom: 5px; color: var(--ink); font-size: 16px; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; text-align: left; }
+    th, td { padding: 11px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+    th { color: var(--muted); font-size: 12px; font-weight: 600; }
+    td:first-child { white-space: nowrap; }
+    tr:last-child td { border-bottom: 0; }
+    .subtle { color: var(--muted); font-size: 14px; }
+    .columns { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+    ul { padding-left: 21px; margin: 10px 0 0; }
+    li { margin-bottom: 6px; }
+    details { padding: 17px 0; border-bottom: 1px solid var(--line); }
+    details:last-child { border-bottom: 0; padding-bottom: 0; }
+    details:first-child { padding-top: 0; }
+    summary { cursor: pointer; font-weight: 650; }
+    details[open] summary { margin-bottom: 13px; }
+    details p { color: var(--muted); font-size: 14px; }
+    footer { padding-top: 18px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; }
+    @media (max-width: 700px) {
+      .page { padding: 22px 20px 30px; }
+      header { padding-top: 25px; }
+      .cards, .columns, .steps { grid-template-columns: 1fr; }
+      .steps { gap: 15px; }
+      .card, .panel { padding: 20px; }
+      .topline { align-items: flex-start; }
+      .version { font-size: 11px; }
+      nav { gap: 8px 20px; }
+    }
+    @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+    @media print {
+      body { background: #fff; font-size: 11pt; }
+      .page { max-width: none; padding: 0; }
+      nav { display: none; }
+      .card, .panel, pre { break-inside: avoid; }
+      pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #f0f1f4; color: #202a3c; }
+      details::details-content { content-visibility: visible; }
+    }
+  </style>
+</head>
+<body>
+<div class="page">
+  <div class="topline" id="top">
+    <div class="brand">Fast<span>LLM</span></div>
+    <div class="version">v@FTLLM_VERSION@ &nbsp;·&nbsp; Linux x86_64 绿色包</div>
+  </div>
+  <header>
+    <p class="eyebrow">使用指南 / GETTING STARTED</p>
+    <h1>解压，然后开始使用。</h1>
+    <p class="intro">在符合<a href="#requirements">运行要求</a>的 Linux 机器上，完整解压后即可启动。Python、CUDA 运行库和应用依赖已随包提供，无需安装，也无需先运行初始化命令。</p>
+  </header>
+  <nav aria-label="文档目录">
+    <a href="#start">选择入口</a><a href="#models">开始使用模型</a><a href="#files">目录说明</a><a href="#commands">命令行与远程访问</a><a href="#requirements">运行要求</a><a href="#help">常见问题</a>
+  </nav>
+  <main>
+    <section id="start">
+      <div class="section-title"><h2>选择一个入口</h2><span>两个图形入口，同一个 FastLLM Launcher 界面。</span></div>
+      <div class="cards">
+        <article class="card">
+          <div class="card-head">
+            <img src="support/icons/fastllm-portable-launcher.svg" alt="FastLLM 速度 F、显示器与启动箭头，APP 标识" width="68" height="68">
+            <div><div class="kind">APP / DESKTOP</div><h3>桌面应用</h3></div>
+          </div>
+          <code class="filename">Fastllm-Launcher</code>
+          <p>双击打开独立的桌面窗口，直接管理模型和使用工作室。日常在本机使用，选择这个入口即可。</p>
+          <p class="hint">配置、日志和默认模型缓存保存在 <code>support/data/</code>，随整个目录一起移动。</p>
+        </article>
+        <article class="card web">
+          <div class="card-head">
+            <img src="support/icons/fastllm-portable-browser.svg" alt="FastLLM 速度 F、浏览器与网络地球，WEB 标识" width="68" height="68">
+            <div><div class="kind">WEB / SERVICE</div><h3>网页服务</h3></div>
+          </div>
+          <code class="filename">ftllm-launch-webui</code>
+          <p>双击启动网页服务，自动打开浏览器，并保留一个服务终端。也可以在服务器上运行后远程访问。</p>
+          <p class="hint">使用时保持终端打开；在终端按 <kbd>Ctrl</kbd> + <kbd>C</kbd> 停止服务。</p>
+        </article>
+      </div>
+      <div class="cli"><strong><code>ftllm</code> · 命令行</strong><p>在终端使用 <code>./ftllm</code>；双击可打开已配置好环境的终端。保留系统默认图标。</p><a href="#commands">查看命令 →</a></div>
+      <div class="note">首次启动会自动配置 APP / WEB 图标。在此之前，文件管理器可能显示通用应用图标；仍可直接双击启动。</div>
+    </section>
+    <section id="models">
+      <h2>开始使用模型</h2>
+      <div class="panel">
+        <ol class="steps">
+          <li><strong>完整解压</strong>把整个目录放到希望保存的位置。保留 <code>support/</code>，与根目录入口一起使用。</li>
+          <li><strong>打开 Launcher</strong>双击桌面应用或网页服务入口，在界面中选择模型目录或 GGUF 文件，并配置运行参数。</li>
+          <li><strong>启动并使用</strong>启动模型后即可使用对应服务。进入“工作室”，选择项目目录可使用目录 Agent。</li>
+        </ol>
+      </div>
+    </section>
+    <section id="files">
+      <div class="section-title"><h2>根目录，只有这些</h2><span>移动或复制时，请保留整个目录。</span></div>
+      <div class="panel table-wrap">
+        <table>
+          <thead><tr><th scope="col">文件 / 目录</th><th scope="col">用途</th></tr></thead>
+          <tbody>
+            <tr><td><code>Fastllm-Launcher</code></td><td>桌面应用，紫色 APP 图标。</td></tr>
+            <tr><td><code>ftllm-launch-webui</code></td><td>网页服务，青色 WEB 图标。</td></tr>
+            <tr><td><code>ftllm</code></td><td>命令行程序，无自定义图标。</td></tr>
+            <tr><td><code>launch.sh</code></td><td>兼容启动脚本，与 <code>ftllm-launch-webui</code> 用途和参数相同。</td></tr>
+            <tr><td><code>README.html</code></td><td>本文档。双击用浏览器打开，断网也可以阅读。</td></tr>
+            <tr><td><code>support/</code></td><td>运行时、依赖、图标、数据和辅助工具；无需手动整理。</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+    <section id="commands">
+      <h2>命令行与远程访问</h2>
+      <div class="panel">
+        <h3>在终端使用 ftllm</h3>
+        <p class="subtle">在解压目录打开终端。把 <code>/path/to/model</code> 替换为本机模型目录或 GGUF 文件。</p>
+        <pre><code>./ftllm --help
+./ftllm server /path/to/model --device cuda:0 --host 127.0.0.1 --port 8080
+./ftllm chat /path/to/model --device cuda:0
+./ftllm tui --plain</code></pre>
+        <p class="subtle"><code>server</code> 提供 OpenAI 兼容 API，地址为 <code>http://127.0.0.1:8080/v1</code>；<code>serve</code> 是它的别名。使用 <code>./ftllm server --help</code> 查看参数，按 <kbd>Ctrl</kbd> + <kbd>C</kbd> 停止前台服务。</p>
+        <h3>启动网页服务</h3>
+        <pre><code>./ftllm-launch-webui
+<span class="comment"># 与 ./ftllm launch、./launch.sh 等价；默认打开本机浏览器</span></code></pre>
+        <p class="subtle">使用 <code>./ftllm-launch-webui --help</code> 查看本包网页启动器支持的参数；使用 <code>./ftllm server --help</code> 查看模型服务参数。</p>
+        <p class="subtle">没有桌面的服务器上，可以让服务监听网络地址，再用另一台电脑的浏览器访问：</p>
+        <pre><code>./ftllm-launch-webui --no-browser --host 0.0.0.0 --port 8000</code></pre>
+        <p class="subtle">打开终端打印的访问地址，将主机地址换为服务器 IP，并保留 URL 中的 <code>token</code> 参数。确保网络和防火墙允许该端口。Launcher 可以启动进程和执行 Agent 任务，请仅向可信用户开放。</p>
+        <h3>在当前终端启用包内环境</h3>
+        <pre><code>source ./support/env.sh
+ftllm --help
+ftllm-check --require-cuda</code></pre>
+        <p class="subtle">启用后可直接使用 <code>ftllm</code>、<code>ftllm-check</code>、<code>ftllm-agent-runtime</code>、<code>python</code> 和 <code>pip</code>。双击 <code>ftllm</code> 打开的终端已启用此环境，输入 <code>exit</code> 退出。</p>
+      </div>
+    </section>
+    <section id="requirements">
+      <h2>运行要求</h2>
+      <div class="panel columns">
+        <div>
+          <h3>机器需要具备</h3>
+          <ul class="subtle">
+            <li>Linux x86_64，glibc 2.35 或更高（Ubuntu 22.04 基线）。</li>
+            <li>NVIDIA GPU 驱动 @MIN_NVIDIA_DRIVER@ 或更新版本；建议 @RECOMMENDED_NVIDIA_DRIVER@ 或更新版本。</li>
+            <li>桌面应用需要 X11 或 Wayland 图形会话；双击网页服务或命令行入口需要系统终端程序。</li>
+          </ul>
+        </div>
+        <div>
+          <h3>包内已经准备好</h3>
+          <ul class="subtle">
+            <li>Electron、Node.js、Python 和 FastLLM 的 Python 依赖。</li>
+            <li>CUDA 用户态运行库、cuBLAS、NCCL；无需另行安装 CUDA Toolkit。</li>
+            <li>Pi Agent、搜索工具 ripgrep 和 fd；无需另装 Pi 或 npm。</li>
+          </ul>
+        </div>
+      </div>
+      <p class="subtle" style="margin-top: 12px">GPU 驱动和 glibc 使用宿主系统提供的版本。命令行与 <code>--no-browser</code> 网页服务可在无桌面环境中运行。</p>
+    </section>
+    <section id="help">
+      <h2>常见问题与进阶设置</h2>
+      <div class="panel">
+        <details>
+          <summary>图标没有更新怎么办？</summary>
+          <p>首次在图形桌面启动任一入口时，会自动为当前用户注册桌面应用和网页服务的两枚图标，并通知文件管理器刷新。<code>ftllm</code> 使用系统默认图标。图标显示方式因桌面环境而异。</p>
+          <p>如需手动修复，在本机桌面终端运行以下命令，无需 <code>sudo</code>。<code>support/desktop/</code> 中的文件是辅助入口，正常使用时不需要操作。</p>
+          <pre><code>./ftllm --setup-desktop</code></pre>
+        </details>
+        <details>
+          <summary>配置、模型缓存和日志放在哪里？</summary>
+          <p>桌面应用默认使用 <code>support/data/</code> 保存配置、日志和默认模型缓存；如果包目录不可写，则自动回退到系统用户数据目录。默认桌面日志为 <code>support/data/logs/desktop.log</code>，日志中的控制令牌会被脱敏。</p>
+          <p>网页与命令行 Launcher 默认使用当前用户的配置目录。也可以用 <code>--config /path/to/config.json</code> 指定配置文件。自行选择的外部模型、项目文件仍保留在原位置。</p>
+          <p>桌面窗口会自动启动本机后台服务，使用随机端口。也可以在终端运行 <code>./Fastllm-Launcher</code> 打开窗口。</p>
+        </details>
+        <details>
+          <summary>如何检查环境或校验文件？</summary>
+          <pre><code>./ftllm --version
+./support/ftllm-check --require-cuda
+./support/ftllm-agent-runtime info
+sha256sum -c support/MANIFEST.sha256</code></pre>
+          <p>最后一条命令在解压根目录执行。构建信息、依赖清单和许可证都保留在 <code>support/</code>，包括 <code>DESKTOP-BUILD-INFO.json</code>、<code>ELECTRON-LIBRARIES.json</code>、<code>licenses/FastLLM-LICENSE</code>、<code>LICENSE</code> 和 <code>LICENSES.chromium.html</code>。</p>
+        </details>
+        <details>
+          <summary>如何设置目录 Agent？</summary>
+          <p>启动模型后，在“工作室”中选择项目目录即可使用。Agent 可以在选定目录执行命令和修改文件。</p>
+          <p>命令行启动 Launcher 时，用 <code>--agent-workspace-root /path/to/projects</code> 指定项目根目录；用 <code>--disable-workspace-agent</code> 关闭目录 Agent。</p>
+        </details>
+      </div>
+    </section>
+  </main>
+  <footer><span>FastLLM @FTLLM_VERSION@ · 本地使用指南 · 无需联网阅读</span><a href="#top">回到顶部 ↑</a></footer>
+</div>
+</body>
+</html>

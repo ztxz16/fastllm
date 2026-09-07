@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" role="img" aria-labelledby="title description">
+  <title id="title">Fastllm-Launcher · 桌面应用 APP</title>
+  <desc id="description">FastLLM 的斜体 F 与速度线位于显示器中，绿色启动箭头表示本机启动模型。</desc>
+  <defs>
+    <linearGradient id="tile" x1="16" y1="8" x2="110" y2="124" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7465ef"/><stop offset="1" stop-color="#4833b4"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="120" height="120" rx="28" fill="url(#tile)"/>
+  <rect x="5" y="5" width="118" height="118" rx="27" fill="none" stroke="#fff" stroke-opacity=".18" stroke-width="2"/>
+  <rect x="19" y="19" width="90" height="66" rx="8" fill="#252045" stroke="#f2efff" stroke-width="4"/>
+  <!-- Reuse the FastLLM F and speed trails from fastllm_icon.svg. -->
+  <g transform="translate(12 10) scale(.67)">
+    <path d="M17 91C30 82 39 73 48 59" fill="none" stroke="#9eefff" stroke-width="7" stroke-linecap="round"/>
+    <path d="M23 102C37 91 45 80 52 67" fill="none" stroke="#b6f4ff" stroke-opacity=".65" stroke-width="3" stroke-linecap="round"/>
+    <path d="M37.5 99.5 54.7 38.8c1.9-6.8 6.7-10.3 14.2-10.3h38.6l-5.2 18.2H70.2l-4.5 15.8h28l-5 17.7H60.8l-5.5 19.3Z" fill="#fff"/>
+  </g>
+  <path d="M88 53q-3-2-3 2v21q0 4 3 2l15-10q3-2 0-4Z" fill="#72efc6"/>
+  <path d="M64 87v6m-13 0h26" fill="none" stroke="#f2efff" stroke-width="4" stroke-linecap="round"/>
+  <!-- Path lettering keeps the APP label legible without installed fonts. -->
+  <path d="m40 114 6-15 6 15m-10-5h8m10 5V99h6a3.75 3.75 0 0 1 0 7.5h-6m18 7.5V99h6a3.75 3.75 0 0 1 0 7.5h-6" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

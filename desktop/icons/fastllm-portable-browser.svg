@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" role="img" aria-labelledby="title description">
+  <title id="title">ftllm-launch-webui · 网页服务 WEB</title>
+  <desc id="description">FastLLM 的斜体 F 与速度线位于浏览器中，网络地球表示通过网页访问模型服务。</desc>
+  <defs>
+    <linearGradient id="tile" x1="16" y1="8" x2="110" y2="124" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#11a6a0"/><stop offset="1" stop-color="#086873"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="120" height="120" rx="28" fill="url(#tile)"/>
+  <rect x="5" y="5" width="118" height="118" rx="27" fill="none" stroke="#fff" stroke-opacity=".18" stroke-width="2"/>
+  <rect x="19" y="19" width="90" height="66" rx="8" fill="#123e4b" stroke="#edfffb" stroke-width="4"/>
+  <path d="M21 34h86" fill="none" stroke="#edfffb" stroke-width="3"/>
+  <g fill="#9cf5df"><circle cx="28" cy="27" r="2"/><circle cx="36" cy="27" r="2"/><circle cx="44" cy="27" r="2"/></g>
+  <!-- Keep the same FastLLM mark as the desktop app, with a network badge. -->
+  <g transform="translate(14 20) scale(.60)">
+    <path d="M17 91C30 82 39 73 48 59" fill="none" stroke="#9eefff" stroke-width="7" stroke-linecap="round"/>
+    <path d="M23 102C37 91 45 80 52 67" fill="none" stroke="#b6f4ff" stroke-opacity=".65" stroke-width="3" stroke-linecap="round"/>
+    <path d="M37.5 99.5 54.7 38.8c1.9-6.8 6.7-10.3 14.2-10.3h38.6l-5.2 18.2H70.2l-4.5 15.8h28l-5 17.7H60.8l-5.5 19.3Z" fill="#fff"/>
+  </g>
+  <circle cx="96" cy="76" r="19" fill="#edfffb" stroke="#087580" stroke-width="3"/>
+  <g fill="none" stroke="#087580" stroke-width="2.5">
+    <circle cx="96" cy="76" r="12"/>
+    <ellipse cx="96" cy="76" rx="5" ry="12"/>
+    <path d="M84 76h24"/>
+  </g>
+  <!-- Path lettering keeps the WEB label legible without installed fonts. -->
+  <path d="m36 99 4 15 5-10 5 10 4-15m18 0H62v15h10m-10-7.5h8m12 7.5V99h6a3.75 3.75 0 0 1 0 7.5h-6m6 0a3.75 3.75 0 0 1 0 7.5h-6" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

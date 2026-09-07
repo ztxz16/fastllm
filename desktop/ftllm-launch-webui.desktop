@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=ftllm-launch-webui (Web Service)
+Name[zh_CN]=ftllm-launch-webui（网页服务）
+Comment=Start the FastLLM web service and open it in your browser
+Comment[zh_CN]=启动 FastLLM 网页服务并打开浏览器；保持终端打开
+Exec=sh -c "exec \\"\\$(dirname -- \\"\\$1\\")/../../ftllm-launch-webui\\"" sh %k
+Icon=fastllm-portable-browser
+Terminal=true
+Categories=Development;

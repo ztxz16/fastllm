@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Fastllm-Launcher (Desktop)
+Name[zh_CN]=Fastllm-Launcher（桌面应用）
+Comment=Open the FastLLM desktop application
+Comment[zh_CN]=打开 FastLLM 桌面应用
+Exec=sh -c "exec \\"\\$(dirname -- \\"\\$1\\")/../../Fastllm-Launcher\\"" sh %k
+Icon=fastllm-portable-launcher
+Terminal=false
+Categories=Development;

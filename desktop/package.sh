@@ -132,7 +132,7 @@ PY
 audit_glibc() {
     local bundle_dir="$1"
     local raw_report="$2"
-    local final_report="${bundle_dir}/ELF-GLIBC-REQUIREMENTS.txt"
+    local final_report="${bundle_dir}/support/ELF-GLIBC-REQUIREMENTS.txt"
     local elf_file
     local required
     local maximum="0"
@@ -184,9 +184,9 @@ create_manifest() {
     local bundle_dir="$1"
     (
         cd "$bundle_dir"
-        : > MANIFEST.sha256
+        : > support/MANIFEST.sha256
         while IFS= read -r -d '' file; do
-            sha256sum "$file" >> MANIFEST.sha256
+            sha256sum "$file" >> support/MANIFEST.sha256
         done < <(find . -type f ! -name MANIFEST.sha256 -print0 | LC_ALL=C sort -z)
     )
 }
@@ -276,6 +276,7 @@ fi
 for command in python3 unzip sha256sum readelf ldd ldconfig find sort tar sed cut install date du grep; do
     require_command "$command"
 done
+require_command "${CC:-cc}"
 if [[ "$archive_format" == "tar.gz" ]]; then
     require_command gzip
 else
@@ -343,24 +344,41 @@ runtime_source="$(
 [[ -n "$runtime_source" ]] || die "make_portable.sh 未生成运行时目录"
 
 bundle_dir="${build_root}/${bundle_name}"
-mv -- "$runtime_source" "$bundle_dir"
-unzip -q "$electron_archive_path" -d "$bundle_dir"
-[[ -x "${bundle_dir}/electron" ]] || die "Electron 归档结构异常"
-mv -- "${bundle_dir}/electron" "${bundle_dir}/FastLLM-Launcher.bin"
-rm -f -- "${bundle_dir}/resources/default_app.asar"
-mkdir -p "${bundle_dir}/resources/app"
+payload_dir="${bundle_dir}/support"
+mkdir -p "$bundle_dir"
+mv -- "$runtime_source" "$payload_dir"
+unzip -q "$electron_archive_path" -d "$payload_dir"
+[[ -x "${payload_dir}/electron" ]] || die "Electron 归档结构异常"
+mv -- "${payload_dir}/electron" "${payload_dir}/FastLLM-Launcher.bin"
+rm -f -- "${payload_dir}/resources/default_app.asar"
+mkdir -p "${payload_dir}/resources/app"
 for app_file in package.json main.js runtime.js loading.html loading.js loading.css; do
-    install -m 0644 "${SCRIPT_DIR}/app/${app_file}" "${bundle_dir}/resources/app/${app_file}"
+    install -m 0644 "${SCRIPT_DIR}/app/${app_file}" "${payload_dir}/resources/app/${app_file}"
 done
 install -m 0644 "${ROOT_DIR}/tools/fastllm_pytools/launcher_assets/launcher-icon.png" \
-    "${bundle_dir}/resources/app/icon.png"
-install -m 0755 "${SCRIPT_DIR}/launcher.sh" "${bundle_dir}/FastLLM-Launcher"
-install -m 0644 "${SCRIPT_DIR}/BUNDLE-README.md.in" "${bundle_dir}/README.md"
-mkdir -p "${bundle_dir}/licenses"
-install -m 0644 "${ROOT_DIR}/LICENSE" "${bundle_dir}/licenses/FastLLM-LICENSE"
+    "${payload_dir}/resources/app/icon.png"
+install -m 0755 "${SCRIPT_DIR}/launcher.sh" "${payload_dir}/FastLLM-Launcher"
+install -m 0755 "${SCRIPT_DIR}/terminal.sh" "${payload_dir}/terminal.sh"
+install -m 0755 "${SCRIPT_DIR}/entrypoint.sh" "${payload_dir}/entrypoint.sh"
+install -m 0644 "${SCRIPT_DIR}/setup_desktop.py" "${payload_dir}/setup_desktop.py"
+mkdir -p "${payload_dir}/icons"
+install -m 0644 "${SCRIPT_DIR}"/icons/*.svg "${payload_dir}/icons/"
+log "编译可双击的原生启动入口"
+"${CC:-cc}" -O2 -Wall -Wextra -Werror "${SCRIPT_DIR}/entrypoint.c" -o "${build_root}/entrypoint"
+for entrypoint in Fastllm-Launcher ftllm-launch-webui ftllm; do
+    install -m 0755 "${build_root}/entrypoint" "${bundle_dir}/${entrypoint}"
+done
+install -m 0755 "${SCRIPT_DIR}/launch.sh" "${bundle_dir}/launch.sh"
+mkdir -p "${payload_dir}/desktop"
+for entrypoint in 'Fastllm-Launcher.desktop' 'ftllm-launch-webui.desktop'; do
+    install -m 0755 "${SCRIPT_DIR}/${entrypoint}" "${payload_dir}/desktop/${entrypoint}"
+done
+install -m 0644 "${SCRIPT_DIR}/BUNDLE-README.html.in" "${bundle_dir}/README.html"
+mkdir -p "${payload_dir}/licenses"
+install -m 0644 "${ROOT_DIR}/LICENSE" "${payload_dir}/licenses/FastLLM-LICENSE"
 
 IFS=$'\t' read -r minimum_driver recommended_driver < <(
-    python3 - "${bundle_dir}/BUILD-INFO.json" <<'PY'
+    python3 - "${payload_dir}/BUILD-INFO.json" <<'PY'
 import json
 import sys
 
@@ -373,16 +391,16 @@ sed -i \
     -e "s/@FTLLM_VERSION@/${package_version}/g" \
     -e "s/@MIN_NVIDIA_DRIVER@/${minimum_driver}/g" \
     -e "s/@RECOMMENDED_NVIDIA_DRIVER@/${recommended_driver}/g" \
-    "${bundle_dir}/README.md"
+    "${bundle_dir}/README.html"
 
-mkdir -p "${bundle_dir}/third-party/system"
+mkdir -p "${payload_dir}/third-party/system"
 log "收集 Electron 的非 glibc 动态库闭包"
 python3 "${SCRIPT_DIR}/collect_libraries.py" \
-    --root "$bundle_dir" \
-    --output "${bundle_dir}/lib" \
-    --report "${bundle_dir}/ELECTRON-LIBRARIES.json" \
-    --copyrights "${bundle_dir}/third-party/system" \
-    --exclude "${bundle_dir}/runtime" \
+    --root "$payload_dir" \
+    --output "${payload_dir}/lib" \
+    --report "${payload_dir}/ELECTRON-LIBRARIES.json" \
+    --copyrights "${payload_dir}/third-party/system" \
+    --exclude "${payload_dir}/runtime" \
     --optional libgtk-3.so.0 \
     --optional libgdk-3.so.0 \
     --optional libXss.so.1
@@ -399,7 +417,7 @@ if [[ -n "$git_commit" ]]; then
         git_dirty=0
     fi
 fi
-python3 - "${bundle_dir}/DESKTOP-BUILD-INFO.json" "$package_name" "$package_version" \
+python3 - "${payload_dir}/DESKTOP-BUILD-INFO.json" "$package_name" "$package_version" \
     "$wheel_sha" "$ELECTRON_VERSION" "$ELECTRON_SHA256" "$git_commit" "$git_dirty" \
     "$build_epoch" <<'PY'
 import datetime
@@ -418,14 +436,15 @@ import sys
     epoch,
 ) = sys.argv[1:]
 data = {
-    "format_version": 1,
+    "format_version": 3,
     "package": {"name": name, "version": version},
     "wheel_sha256": wheel_sha,
     "electron": {"version": electron, "archive_sha256": electron_sha},
     "source_commit": commit or None,
     "built_at_utc": datetime.datetime.fromtimestamp(int(epoch), datetime.timezone.utc).isoformat(),
     "platform": {"os": "linux", "architecture": "x86_64", "glibc_minimum": "2.35"},
-    "data_directory": "data",
+    "runtime_directory": "support",
+    "data_directory": "support/data",
     "source_dirty": None if not dirty else dirty == "1",
 }
 with open(destination, "w", encoding="utf-8") as output:
@@ -436,26 +455,41 @@ PY
 audit_glibc "$bundle_dir" "${build_root}/desktop-elf.raw"
 audit_driver_boundary "$bundle_dir"
 
+# Exercise the final layout after moving it, including desktop entry paths with
+# spaces and non-ASCII characters. Moving avoids a second copy of the runtime.
+relocation_parent="${build_root}/relocation test 中文"
+mkdir -p "$relocation_parent"
+mv -- "$bundle_dir" "${relocation_parent}/${bundle_name}"
+bundle_dir="${relocation_parent}/${bundle_name}"
+payload_dir="${bundle_dir}/support"
+
 if ((run_tests)); then
     log "运行桌面包冒烟测试"
     PYTHONPATH="$ROOT_DIR" python3 -m unittest discover \
         -s "${SCRIPT_DIR}/tests" -p 'test_*.py'
-    ELECTRON_RUN_AS_NODE=1 "${bundle_dir}/FastLLM-Launcher" \
+    ELECTRON_RUN_AS_NODE=1 "${bundle_dir}/Fastllm-Launcher" \
         --test "${SCRIPT_DIR}/tests/runtime.test.js"
-    ELECTRON_RUN_AS_NODE=1 "${bundle_dir}/FastLLM-Launcher" \
+    ELECTRON_RUN_AS_NODE=1 "${bundle_dir}/Fastllm-Launcher" \
         -p 'process.versions.electron' | grep -Fx "$ELECTRON_VERSION" >/dev/null
     "${bundle_dir}/ftllm" --version
     "${bundle_dir}/ftllm" server --help >/dev/null
-    "${bundle_dir}/ftllm-check"
-    "${bundle_dir}/python" "${ROOT_DIR}/portable/smoke_launcher.py" "$bundle_dir"
-    "${bundle_dir}/python" "${ROOT_DIR}/portable/smoke_launcher.py" "$bundle_dir" --entrypoint launch.sh
-    "${bundle_dir}/python" "${ROOT_DIR}/portable/smoke_agent.py" --check-studio
+    "${bundle_dir}/ftllm-launch-webui" --help >/dev/null
+    "${payload_dir}/ftllm-check"
+    "${payload_dir}/python" "${ROOT_DIR}/portable/smoke_launcher.py" "$bundle_dir"
+    "${payload_dir}/python" "${ROOT_DIR}/portable/smoke_launcher.py" "$bundle_dir" --entrypoint ftllm-launch-webui
+    "${payload_dir}/python" "${ROOT_DIR}/portable/smoke_launcher.py" "$bundle_dir" --entrypoint launch.sh
+    "${payload_dir}/python" "${ROOT_DIR}/portable/smoke_agent.py" --check-studio
+    if command -v desktop-file-validate >/dev/null 2>&1; then
+        desktop-file-validate "${payload_dir}/desktop"/*.desktop
+    fi
     if command -v xvfb-run >/dev/null 2>&1; then
         smoke_data="${build_root}/electron-smoke-data"
         smoke_log="${build_root}/electron-smoke.log"
         set +e
-        FTLLM_LAUNCHER_DATA_DIR="$smoke_data" timeout --signal=TERM 15s \
-            xvfb-run -a "${bundle_dir}/FastLLM-Launcher" --disable-gpu >"$smoke_log" 2>&1
+        FTLLM_LAUNCHER_DATA_DIR="$smoke_data" \
+            XDG_DATA_HOME="${smoke_data}/desktop-data" XDG_CACHE_HOME="${smoke_data}/desktop-cache" \
+            timeout --signal=TERM 15s \
+            xvfb-run -a "${bundle_dir}/Fastllm-Launcher" --disable-gpu >"$smoke_log" 2>&1
         smoke_status=$?
         set -e
         if [[ "$smoke_status" != 0 && "$smoke_status" != 124 ]]; then
@@ -469,7 +503,7 @@ if ((run_tests)); then
     fi
 fi
 
-if find "${bundle_dir}/runtime" -type f \
+if find "${payload_dir}/runtime" -type f \
     \( -name '*.pyc' -o -name '*.pyo' \) -print -quit | grep -q .; then
     die "内置 Python 运行时包含冗余字节码文件"
 fi

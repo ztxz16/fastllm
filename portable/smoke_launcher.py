@@ -46,9 +46,10 @@ def stop_process_group(process: subprocess.Popen[str]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("bundle", type=Path, help="Portable bundle root")
-    parser.add_argument("--entrypoint", choices=("ftllm", "launch.sh"), default="ftllm")
+    parser.add_argument("--entrypoint", choices=("ftllm", "ftllm-launch-webui", "launch.sh"), default="ftllm")
     args = parser.parse_args()
     bundle = args.bundle.resolve()
+    runtime_root = bundle / "support" if (bundle / "support").is_dir() else bundle
     executable = bundle / args.entrypoint
     if not executable.is_file():
         parser.error(f"missing bundled ftllm executable: {executable}")
@@ -68,7 +69,7 @@ def main() -> int:
                     'source "$1/env.sh"\n'
                     '[[ "$(command -v ftllm)" == "$1/ftllm" ]]\n'
                     'ftllm server --help',
-                    "portable-cli-smoke", str(bundle),
+                    "portable-cli-smoke", str(runtime_root),
                 ],
                 check=True, timeout=30, cwd=temporary, env=environment,
                 stdout=subprocess.DEVNULL,
