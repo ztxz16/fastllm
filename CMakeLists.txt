@@ -726,6 +726,12 @@ if (UNIT_TEST)
         target_link_libraries(fp8TpRepackDeadlockRegression fastllm)
         target_include_directories(fp8TpRepackDeadlockRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 
+        add_executable(nvfp4TpSplitRegression test/ops/nvfp4TpSplitRegression.cpp)
+        target_link_libraries(nvfp4TpSplitRegression fastllm)
+        target_include_directories(nvfp4TpSplitRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME nvfp4TpSplit COMMAND nvfp4TpSplitRegression)
+        set_tests_properties(nvfp4TpSplit PROPERTIES LABELS cuda TIMEOUT 60 SKIP_RETURN_CODE 77)
+
         add_executable(ncclOddTpRegression test/ops/ncclOddTpRegression.cu)
         target_link_libraries(ncclOddTpRegression fastllm)
         target_include_directories(ncclOddTpRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

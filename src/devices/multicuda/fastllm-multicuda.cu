@@ -680,7 +680,8 @@ static void InitMultiCudaLocalTensorMeta(const fastllm::Data &src, fastllm::Data
     // carries the tensor-level dequant multipliers needed when preparing the
     // Marlin layout, so every tensor-parallel shard must retain that metadata.
     // Shape-dependent scale arrays for other formats are split below instead.
-    if (src.dataType == fastllm::DataType::NVFP4_BLOCK_16) {
+    if (src.dataType == fastllm::DataType::NVFP4_BLOCK_16 ||
+        src.dataType == fastllm::DataType::NVFP4_BLOCK_16_E4M3) {
         dst.scales = src.scales;
     }
     dst.perChannelAxis = src.perChannelAxis;
@@ -1274,8 +1275,9 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                     }
                     curLen += copyLen;
                 }
-            } else if (weight.dataType == fastllm::DataType::NVFP4 &&
-                       weight.scales.empty() && weight.blockK > 0 && weight.blockM > 0) {
+            } else if ((weight.dataType == fastllm::DataType::NVFP4 &&
+                        weight.scales.empty() && weight.blockK > 0 && weight.blockM > 0) ||
+                       weight.dataType == fastllm::DataType::NVFP4_BLOCK_16_E4M3) {
                 size_t rowBytes = fastllm::GetNVFP4WeightBytes(1, m);
                 size_t srcWeightBytes = fastllm::GetNVFP4WeightBytes(k, m);
                 size_t dstWeightBytes = fastllm::GetNVFP4WeightBytes(len, m);
@@ -1464,8 +1466,9 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                                                 sizeof(float),
                                                 k, GetCudaMemcpyType(mallocType, 1), deviceId, rootDevice);
                 }
-            } else if (weight.dataType == fastllm::DataType::NVFP4 &&
-                       weight.scales.empty() && weight.blockK > 0 && weight.blockM > 0) {
+            } else if ((weight.dataType == fastllm::DataType::NVFP4 &&
+                        weight.scales.empty() && weight.blockK > 0 && weight.blockM > 0) ||
+                       weight.dataType == fastllm::DataType::NVFP4_BLOCK_16_E4M3) {
                 size_t srcRowBytes = fastllm::GetNVFP4WeightBytes(1, m);
                 size_t dstRowBytes = fastllm::GetNVFP4WeightBytes(1, len);
                 size_t srcWeightBytes = fastllm::GetNVFP4WeightBytes(k, m);
