@@ -4445,6 +4445,9 @@ namespace fastllm {
                 } else {
                     Qwen4QSABuildMask(
                         qsaIndices, input, keyLength, qsaMask);
+                    // Data assignment does not release owned storage. The
+                    // dense fallback no longer needs these selected indices.
+                    qsaIndices.FreeSpace();
                     qsaIndices = Data();
                 }
             };
@@ -4875,6 +4878,7 @@ namespace fastllm {
             } else {
                 Qwen4QSABuildMask(
                     qsaIndices, input, keyLength, qsaMask);
+                qsaIndices.FreeSpace();
                 qsaIndices = Data();
             }
             return;
