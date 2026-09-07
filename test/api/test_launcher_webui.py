@@ -69,7 +69,8 @@ class LauncherWebUITest(unittest.TestCase):
         self.assertNotIn("'unsafe-inline'", page.headers['content-security-policy'])
         self.assertIn("frame-ancestors 'self'", page.headers['content-security-policy'])
         self.assertEqual(page.headers['cache-control'], 'no-store')
-        for asset in ('app.js', 'styles.css', 'template.html', 'standalone.js'):
+        for asset in ('app.js', 'styles.css', 'template.html', 'standalone.js',
+                      'markdown.js', 'marked.js', 'marked.LICENSE.md'):
             child = self.client.get(self.base + '/assets/webui/' + asset)
             parent = self.client.get('/assets/webui/' + asset)
             self.assertEqual(child.status_code, 200)

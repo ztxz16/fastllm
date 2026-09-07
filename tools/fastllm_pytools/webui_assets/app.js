@@ -1,4 +1,8 @@
 // Shared by ftllm webui and the Launcher conversation pane.
+// Carry Launcher's retry URL through dependencies; browsers cache failed imports.
+const markdownURL = new URL("./markdown.js", import.meta.url);
+markdownURL.search = new URL(import.meta.url).search;
+const {renderMarkdown: renderMessageMarkdown} = await import(markdownURL.href);
 let localesRetries = 0;
 function loadLocales(signal) {
   if (window.FASTLLM_LOCALES) return Promise.resolve();
@@ -180,41 +184,15 @@ export async function mountWebUI(host, {basePath = "", embedded = false, locale 
       catch (error) { toast(error.message); }
     }
 
-    function appendInline(parent, text) {
-      const pattern = /(\*\*[^*]+\*\*|`[^`]+`)/g; let cursor = 0;
-      for (const match of text.matchAll(pattern)) {
-        parent.append(document.createTextNode(text.slice(cursor, match.index)));
-        const token = match[0]; const node = document.createElement(token.startsWith("**") ? "strong" : "code");
-        node.textContent = token.startsWith("**") ? token.slice(2,-2) : token.slice(1,-1); parent.append(node);
-        cursor = match.index + token.length;
-      }
-      parent.append(document.createTextNode(text.slice(cursor)));
-    }
-
-    function appendTextBlock(parent, text) {
-      const lines = text.split("\n"); let paragraph = []; let list = null;
-      const flush = () => { if (!paragraph.length) return; const p = document.createElement("p"); appendInline(p, paragraph.join("\n")); parent.append(p); paragraph = []; };
-      for (const line of lines) {
-        const heading = line.match(/^(#{1,3})\s+(.+)$/); const item = line.match(/^\s*[-*]\s+(.+)$/);
-        if (heading) { flush(); list = null; const h = document.createElement(`h${heading[1].length}`); appendInline(h, heading[2]); parent.append(h); }
-        else if (item) { flush(); if (!list) { list = document.createElement("ul"); parent.append(list); } const li = document.createElement("li"); appendInline(li,item[1]); list.append(li); }
-        else if (!line.trim()) { flush(); list = null; }
-        else { list = null; paragraph.push(line); }
-      }
-      flush();
-    }
-
     function renderMarkdown(node, text) {
-      node.replaceChildren(); const source = String(text || ""); const fence = /```([^\n]*)\n?([\s\S]*?)```/g; let cursor = 0;
-      for (const match of source.matchAll(fence)) {
-        appendTextBlock(node, source.slice(cursor, match.index));
-        const block = document.createElement("div"); block.className = "code-block";
-        const head = document.createElement("div"); head.className = "code-head"; const language = document.createElement("span"); language.textContent = match[1].trim() || "code";
-        const copy = document.createElement("button"); copy.className = "copy-code"; copy.textContent = t("common.copy"); copy.onclick = guard(async () => { await navigator.clipboard.writeText(match[2]); copy.textContent = t("common.copied"); setTimeout(() => copy.textContent = t("common.copy"),1200); });
-        head.append(language,copy); const pre = document.createElement("pre"); const code = document.createElement("code"); code.textContent = match[2]; pre.append(code); block.append(head,pre); node.append(block);
-        cursor = match.index + match[0].length;
-      }
-      appendTextBlock(node, source.slice(cursor));
+      renderMessageMarkdown(node, text, {
+        t,
+        onCopy: guard(async (code, button) => {
+          await navigator.clipboard.writeText(code);
+          button.textContent = t("common.copied");
+          setTimeout(() => button.textContent = t("common.copy"), 1200);
+        })
+      });
     }
 
     function renderAttachments(parent, attachments) {
@@ -326,7 +304,7 @@ export async function mountWebUI(host, {basePath = "", embedded = false, locale 
       const body = document.createElement("div"); body.className = "message-body"; renderAttachments(body,message.attachments);
       const toolTrace = document.createElement("div"); toolTrace.className = "tool-trace-holder"; renderToolTrace(toolTrace,message.tool_calls,live); body.append(toolTrace);
       let reasoningDetails = null, reasoningContent = null;
-      if (message.reasoning || live) { reasoningDetails = document.createElement("details"); reasoningDetails.className = "reasoning"; reasoningDetails.hidden = !message.reasoning; const summary = document.createElement("summary"); summary.textContent = t(live ? "chat.reasoning_live" : "chat.reasoning_done"); reasoningContent = document.createElement("div"); reasoningContent.className = "reasoning-content"; reasoningContent.textContent = message.reasoning || ""; reasoningDetails.append(summary,reasoningContent); body.append(reasoningDetails); }
+      if (message.reasoning || live) { reasoningDetails = document.createElement("details"); reasoningDetails.className = "reasoning"; reasoningDetails.hidden = !message.reasoning; const summary = document.createElement("summary"); summary.textContent = t(live ? "chat.reasoning_live" : "chat.reasoning_done"); reasoningContent = document.createElement("div"); reasoningContent.className = "reasoning-content message-text"; renderMarkdown(reasoningContent, message.reasoning || ""); reasoningDetails.append(summary,reasoningContent); body.append(reasoningDetails); }
       const status = document.createElement("div"); status.className = "status-line"; status.hidden = !message.cancelled; status.textContent = message.cancelled ? t("status.generation_stopped") : ""; body.append(status);
       const text = document.createElement("div"); text.className = "message-text"; renderMarkdown(text,message.content || ""); body.append(text); renderArtifacts(body,message.artifacts); renderSources(body,message.sources); wrapper.append(body);
       return { wrapper,body,text,status,toolTrace,reasoningDetails,reasoningContent };
@@ -337,7 +315,7 @@ export async function mountWebUI(host, {basePath = "", embedded = false, locale 
       live.status.hidden = !task.showStatus; live.status.textContent = task.status || "";
       live.text.replaceChildren(); if (task.content) renderMarkdown(live.text,task.content); else live.text.innerHTML = `<span class="typing"><i></i><i></i><i></i></span>`;
       if (live.toolCallsVersion !== task.toolCallsVersion) { renderToolTrace(live.toolTrace,task.toolCalls,true); live.toolCallsVersion = task.toolCallsVersion; }
-      if (task.reasoning) { live.reasoningDetails.hidden = false; live.reasoningContent.textContent = task.reasoning; }
+      if (task.reasoning) { live.reasoningDetails.hidden = false; renderMarkdown(live.reasoningContent, task.reasoning); }
       else live.reasoningDetails.hidden = true;
       live.planHolder.replaceChildren();
       if (task.plan?.type === "data") renderDataPlan(live.planHolder,task.plan.title,task.plan.analyses);

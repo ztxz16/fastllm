@@ -11,6 +11,7 @@
   --canvas: #fbfbfc;
   --sidebar: #f5f6f9;
   --surface: rgba(255,255,255,.94);
+  --soft: #f5f6f9;
   --shadow: 0 18px 55px rgba(28,33,54,.11), 0 2px 8px rgba(28,33,54,.04);
   --sidebar-width: 276px;
 }
@@ -320,22 +321,39 @@ button { -webkit-tap-highlight-color: transparent; }
 .message-body { min-width: 0; max-width: calc(100% - 46px); }
 .message.user .message-body { max-width: min(74%,680px); padding: 11px 15px; background: linear-gradient(135deg,#f0f3ff,#f5f2ff); border: 1px solid #e3e5f7; border-radius: 18px 18px 5px 18px; }
 .message-text { color: #343844; font-size: 14px; line-height: 1.78; word-break: break-word; }
-.message-text p { margin: 0 0 12px; white-space: pre-wrap; }
+.message-text p { margin: 0 0 12px; }
 .message-text p:last-child { margin-bottom: 0; }
-.message-text h1,.message-text h2,.message-text h3 { margin: 18px 0 10px; color: #252833; line-height: 1.35; }
+.message-text :is(h1,h2,h3,h4,h5,h6) { margin: 18px 0 10px; color: var(--ink); line-height: 1.35; }
 .message-text h1 { font-size: 21px; }.message-text h2 { font-size: 18px; }.message-text h3 { font-size: 16px; }
-.message-text ul { margin: 8px 0 12px; padding-left: 21px; }
+.message-text :is(ul,ol) { margin: 8px 0 12px; padding-left: 24px; }
 .message-text li { margin: 5px 0; }
+.message-text .task-list-item { list-style: none; }
+.message-text input[type="checkbox"] { margin-left: -20px; accent-color: var(--brand); }
+.message-text blockquote { margin: 12px 0; padding: 2px 14px; border-left: 3px solid var(--brand); color: var(--muted); }
+.message-text hr { margin: 18px 0; border: 0; border-top: 1px solid var(--line); }
+.message-text a { color: var(--brand); text-decoration: underline; text-underline-offset: 3px; }
+.markdown-table { max-width: 100%; margin: 14px 0; overflow-x: auto; border: 1px solid var(--line); border-radius: 6px; }
+.markdown-table table { width: 100%; border-collapse: collapse; font-size: .94em; }
+.markdown-table :is(th,td) { min-width: 100px; padding: 9px 13px; text-align: left; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.markdown-table tr > :last-child { border-right: 0; }
+.markdown-table tbody tr:last-child td { border-bottom: 0; }
+.markdown-table th { background: var(--soft); font-weight: 650; }
+.markdown-table tbody tr:nth-child(even) { background: var(--soft); }
+.markdown-table .align-left { text-align: left; }
+.markdown-table .align-center { text-align: center; }
+.markdown-table .align-right { text-align: right; }
 .message-text code:not(pre code) { padding: 2px 5px; color: #4c56a4; background: #f0f1f6; border-radius: 5px; font-family: "SFMono-Regular",Consolas,monospace; font-size: .88em; }
 .code-block { margin: 14px 0; overflow: hidden; background: #20232c; border: 1px solid #2d313c; border-radius: 13px; box-shadow: 0 8px 25px rgba(22,24,33,.1); }
 .code-head { display: flex; justify-content: space-between; align-items: center; height: 35px; padding: 0 12px; color: #9da3b1; background: #282b35; font-size: 10px; }
-.copy-code { color: #b4b9c5; background: transparent; border: 0; cursor: pointer; font-size: 10px; }
+.code-actions { display: flex; align-items: center; gap: 12px; }
+.copy-code { color: #b4b9c5; background: transparent; border: 0; cursor: pointer; font-size: 11px; }
+.copy-code:hover { color: #fff; }
 .code-block pre { max-height: 520px; margin: 0; padding: 15px; overflow: auto; color: #e7e9ee; font-family: "SFMono-Regular",Consolas,monospace; font-size: 12px; line-height: 1.65; white-space: pre; }
 .reasoning { margin: 0 0 12px; border: 1px solid #e7e8ee; border-radius: 12px; background: rgba(248,249,251,.8); overflow: hidden; }
 .reasoning summary { padding: 9px 12px; color: #7b8190; cursor: pointer; font-size: 11px; list-style: none; }
 .reasoning summary::-webkit-details-marker { display: none; }
 .reasoning summary::before { content: "◇"; margin-right: 7px; color: #6879db; }
-.reasoning-content { max-height: 340px; padding: 0 13px 12px; overflow: auto; color: #727887; font-size: 12px; line-height: 1.7; white-space: pre-wrap; }
+.reasoning-content { max-height: 340px; padding: 0 13px 12px; overflow: auto; color: #727887; font-size: 12px; line-height: 1.7; }
 .tool-trace { margin: 0 0 12px; overflow: hidden; background: #f8f9fc; border: 1px solid #e3e5ed; border-radius: 12px; }
 .tool-trace > summary { display: flex; align-items: center; gap: 8px; padding: 9px 12px; color: #686f7e; cursor: pointer; font-size: 11px; font-weight: 620; list-style: none; }
 .tool-trace > summary::-webkit-details-marker,.tool-step > summary::-webkit-details-marker { display: none; }

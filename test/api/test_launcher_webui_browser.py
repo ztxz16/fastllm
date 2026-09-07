@@ -181,6 +181,65 @@ class LauncherWebUIBrowserTest(unittest.TestCase):
             expect(self.page.locator('#shutdown-launcher')).to_be_visible()
         self.screenshot('launcher-dark-mobile')
 
+    def test_markdown_tables_lists_links_and_streaming_code_survive_reload(self):
+        self.page.locator('#open-webui').click()
+        self.assert_loaded()
+        pane = self.page.locator('#webui-content')
+        partial = threading.Event()
+        release = threading.Event()
+        source = (
+            '## 功能介绍\n\n'
+            '| 功能 | 说明 | 分数 |\n| :--- | :---: | ---: |\n'
+            '| **操作** | 方向键 / WASD | 10 |\n'
+            '| `a\\|b` | *空格暂停*<br>继续 | 20 |\n\n'
+            '> 引用 **说明**\n\n'
+            '3. 第一步\n   - 子项目\n4. 第二步\n\n'
+            '- [x] 已完成\n- [ ] 未完成\n\n'
+            '~~旧说明~~ [参数介绍](https://example.com/parameters)\n\n'
+            '[危险链接](javascript:alert(1)) <img src=x onerror=alert(1)>\n\n'
+            '```html\n<h1>Still streaming</h1>')
+
+        def stream(*args, **kwargs):
+            yield source, '| 思考 | 状态 |\n| --- | --- |\n| 分析 | 完成 |'
+            partial.set()
+            release.wait(10)
+            yield '\n```', ''
+
+        with patch.object(self.runtime._webui_app.state.runtime.api_client, 'stream', side_effect=stream):
+            try:
+                pane.locator('#prompt').fill('Show Markdown')
+                pane.locator('#sendButton').click()
+                self.assertTrue(partial.wait(5))
+                message = pane.locator('.message.assistant > .message-body > .message-text')
+                expect(message.locator('tbody tr')).to_have_count(2)
+                expect(message.locator('th')).to_have_text(['功能', '说明', '分数'])
+                expect(message.locator('tbody td code')).to_have_text('a|b')
+                expect(message.locator('tbody td').nth(1)).to_have_css('text-align', 'center')
+                expect(message.locator('tbody td').nth(2)).to_have_css('text-align', 'right')
+                expect(message.locator('blockquote strong')).to_have_text('说明')
+                expect(message.locator('ol')).to_have_attribute('start', '3')
+                expect(message.locator('ol ul li')).to_have_text('子项目')
+                expect(message.locator('input[type="checkbox"]')).to_have_count(2)
+                expect(message.locator('input[type="checkbox"]').first).to_be_checked()
+                expect(message.locator('del')).to_have_text('旧说明')
+                expect(message.locator('a')).to_have_count(1)
+                expect(message.locator('a')).to_have_attribute('rel', 'noopener noreferrer')
+                expect(message.locator('img,script')).to_have_count(0)
+                expect(message.locator('.code-block code')).to_have_text('<h1>Still streaming</h1>')
+                pane.locator('.reasoning summary').click()
+                expect(pane.locator('.reasoning-content table')).to_be_visible()
+            finally:
+                release.set()
+            expect(pane.locator('#stopButton')).to_be_hidden()
+        self.page.reload()
+        self.page.locator('#open-webui').click()
+        expect(pane.locator('.message.assistant > .message-body > .message-text table')).to_be_visible()
+        self.page.locator('#theme-select').select_option('dark')
+        self.screenshot('markdown-dark')
+        self.page.set_viewport_size({'width': 390, 'height': 844})
+        self.assertTrue(self.page.evaluate('document.documentElement.scrollWidth <= innerWidth'))
+        self.screenshot('markdown-mobile')
+
     def test_pi_install_retry_enables_agent_and_preserves_draft(self):
         job = {'phase': 'missing', 'supported': True, 'available': False, 'error': ''}
         installed = False
@@ -717,6 +776,12 @@ class LauncherWebUIBrowserTest(unittest.TestCase):
     def test_component_module_failure_can_retry(self):
         self.assert_resource_failure_recovers('**/assets/webui/app.js')
 
+    def test_markdown_module_failure_can_retry(self):
+        self.assert_resource_failure_recovers('**/assets/webui/markdown.js')
+
+    def test_markdown_parser_failure_can_retry(self):
+        self.assert_resource_failure_recovers('**/assets/webui/marked.js')
+
     def test_component_stylesheet_failure_can_retry(self):
         self.assert_resource_failure_recovers('**/assets/webui/styles.css')
 
@@ -941,7 +1006,7 @@ class LauncherWebUIBrowserTest(unittest.TestCase):
                    'arguments': {'path': 'README.md'}}
             yield {'type': 'tool_end', 'id': 'read-project', 'name': 'read',
                    'result': 'Demo project', 'is_error': False}
-            yield {'type': 'text_delta', 'text': 'Project inspected.'}
+            yield {'type': 'text_delta', 'text': 'Project inspected.\n\n| File | State |\n| --- | --- |\n| README.md | **Read** |'}
             yield {'type': 'done', 'turns': 1}
 
         fake_pi = lambda **kwargs: SimpleNamespace(
@@ -963,6 +1028,7 @@ class LauncherWebUIBrowserTest(unittest.TestCase):
             expect(pane.locator('.message.assistant')).to_contain_text('Project inspected.')
             expect(pane.locator('#stopButton')).to_be_hidden()
             self.assertEqual(str(calls[0]['working_directory']), project)
+            expect(pane.locator('.message.assistant table td strong')).to_have_text('Read')
             self.screenshot('launcher-pi-agent')
 
     def test_workspace_unavailable_reason_explains_runtime_and_remote_policy(self):
@@ -1003,11 +1069,12 @@ class LauncherWebUIBrowserTest(unittest.TestCase):
         expect(pane.locator('.brand')).to_be_visible()
         expect(pane.locator('#languageButton')).to_be_visible()
         with patch.object(self.standalone.api_client, 'stream',
-                          side_effect=lambda *a, **k: iter([('Shared standalone reply', '')])):
+                          side_effect=lambda *a, **k: iter([('Shared standalone reply\n\n| A | B |\n| --- | --- |\n| 1 | 2 |', '')])):
             pane.locator('#prompt').fill('Hello standalone')
             pane.locator('#sendButton').click()
             expect(pane.locator('.message.assistant')).to_have_count(1)
             expect(pane.locator('#stopButton')).to_be_hidden()
+        expect(pane.locator('.message.assistant table')).to_be_visible()
         self.assertIn('/standalone/?chat=', self.page.url)
         self.screenshot('standalone-webui')
         self.page.reload()

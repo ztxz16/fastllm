@@ -90,6 +90,8 @@ ftllm bench Qwen/Qwen3-0.6B \
 
 Launcher’s **Appearance** selector offers Light and Dark modes. It defaults to Light and remembers your selection. Studio switches with Launcher while preserving the current conversation and draft.
 
+Chat, Agent replies, and reasoning support Markdown tables, headings, nested lists, task lists, blockquotes, and links, including saved conversations. The Markdown parser is bundled locally and needs no network download.
+
 Once the API Server is ready, click **Open Studio** to use chat, saved conversations, Markdown, attachments, reasoning, and agents directly in Launcher's content area. Model management navigation stays visible, so you can visit launch profiles, downloads, logs, and hardware, then return to the same conversation. Launcher and standalone `ftllm webui` share the chat component and backend; the component adapts its colors, sizing, and language to Launcher. It connects to the active model with the configured API key, without another WebUI process or port. Conversations use WebUI’s existing local storage and survive page refreshes. Stopping or switching models cancels active WebUI tasks and disposes of the old component.
 
 The WebUI does not load a model in its own process, so start an OpenAI-compatible API server first. Its optional `model` positional argument is only a model-name hint; when omitted, the WebUI discovers the model from `/v1/models`.
