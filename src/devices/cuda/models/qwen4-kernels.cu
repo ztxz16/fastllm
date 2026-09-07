@@ -3,7 +3,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#include <cub/block/block_radix_sort.cuh>
+#include <cub/block/block_scan.cuh>
 
 #include <algorithm>
 #include <cfloat>
@@ -1775,9 +1775,10 @@ namespace {
         return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
     }
 
-    // Four radix histogram passes identify the exact K-th score without
-    // sorting every compressed block. Equal scores are resolved by the lower
-    // block id, and the emitted block ids are already in ascending order.
+    // Cache a decode row in registers across the four radix passes and
+    // compaction. Each warp owns a contiguous block range and reads adjacent
+    // scores in each iteration. cachedItems == 0 handles arbitrary row sizes.
+    template <int cachedItems>
     __global__ void Qwen4QSARadixSelectKernel(
             const float *scores, int32_t *selectedBlocks,
             int rows, int blocks, int selectedK,
@@ -1787,6 +1788,9 @@ namespace {
         if (rowIndex >= rows) {
             return;
         }
+        constexpr int warps = 8;
+        const int lane = threadIdx.x % 32;
+        const int warp = threadIdx.x / 32;
         const float *row = scores + (uint64_t)rowIndex * blocks;
         int32_t *output = selectedBlocks +
                           (uint64_t)rowIndex * selectedK;
@@ -1805,116 +1809,136 @@ namespace {
             return;
         }
 
-        constexpr int sortItemsPerThread = 5;
-        constexpr int sortCapacity = 256 * sortItemsPerThread;
-        using BlockRadixSort = cub::BlockRadixSort<
-            uint32_t, 256, sortItemsPerThread>;
-        __shared__ typename BlockRadixSort::TempStorage sortStorage;
-        __shared__ uint32_t histogram[256];
+        const int items = cachedItems > 0
+            ? cachedItems : (rowBlocks + blockDim.x - 1) / blockDim.x;
+        const int begin = warp * items * 32 + lane;
+        uint32_t keys[cachedItems > 0 ? cachedItems : 1];
+#pragma unroll
+        for (int item = 0; item < cachedItems; item++) {
+            const int block = begin + item * 32;
+            keys[item] = block < rowBlocks
+                ? Qwen4QSAOrderedFloatBits(row[block]) : 0u;
+        }
+        auto keyAt = [&](int item) {
+            const int block = begin + item * 32;
+            return cachedItems > 0 ? keys[item] : (block < rowBlocks
+                ? Qwen4QSAOrderedFloatBits(row[block]) : 0u);
+        };
+        // Private warp histograms avoid inter-warp atomic contention.
+        __shared__ uint32_t histogram[warps][256];
         __shared__ uint32_t prefix;
         __shared__ uint32_t remaining;
-        __shared__ uint32_t threadHigher[256];
-        __shared__ uint32_t threadPivot[256];
-        __shared__ uint32_t threadPivotChosen[256];
-        __shared__ uint32_t threadOutputOffset[256];
-        if (rowBlocks <= sortCapacity) {
-            uint32_t keys[sortItemsPerThread];
-#pragma unroll
-            for (int item = 0; item < sortItemsPerThread; item++) {
-                const int block = threadIdx.x * sortItemsPerThread + item;
-                keys[item] = block < rowBlocks
-                    ? Qwen4QSAOrderedFloatBits(row[block]) : 0u;
-            }
-            BlockRadixSort(sortStorage).SortDescending(keys);
-            const int pivotRank = selectedK - 1;
-            if (threadIdx.x == pivotRank / sortItemsPerThread) {
-                prefix = keys[pivotRank % sortItemsPerThread];
-            }
-            __syncthreads();
-        } else {
-            if (threadIdx.x == 0) {
-                prefix = 0;
-                remaining = selectedK;
-            }
-            __syncthreads();
-#pragma unroll
-            for (int round = 0; round < 4; round++) {
-                histogram[threadIdx.x] = 0;
-                __syncthreads();
-                const int shift = 24 - round * 8;
-                const uint32_t mask = round == 0
-                    ? 0u : (~0u << (32 - round * 8));
-                const uint32_t currentPrefix = prefix;
-                for (int block = threadIdx.x; block < rowBlocks;
-                     block += blockDim.x) {
-                    const uint32_t ordered =
-                        Qwen4QSAOrderedFloatBits(row[block]);
-                    if ((ordered & mask) == currentPrefix) {
-                        atomicAdd(
-                            &histogram[(ordered >> shift) & 0xffu], 1u);
-                    }
-                }
-                __syncthreads();
-                if (threadIdx.x == 0) {
-                    uint32_t higher = 0;
-                    for (int bucket = 255; bucket >= 0; bucket--) {
-                        const uint32_t count = histogram[bucket];
-                        if (higher + count >= remaining) {
-                            prefix = currentPrefix |
-                                     ((uint32_t)bucket << shift);
-                            remaining -= higher;
-                            break;
-                        }
-                        higher += count;
-                    }
-                }
-                __syncthreads();
-            }
+        __shared__ typename cub::BlockScan<uint32_t, 256>::TempStorage scan;
+        __shared__ uint32_t warpHigher[warps];
+        __shared__ uint32_t warpEqual[warps];
+        __shared__ uint32_t warpPivotChosen[warps];
+        __shared__ uint32_t warpOutputOffset[warps];
+        if (threadIdx.x == 0) {
+            prefix = 0;
+            remaining = selectedK;
         }
-        // Emit the chosen set in physical cache order without a single CUDA
-        // thread rescanning the entire context. Give every thread a contiguous
-        // block-id range, prefix-sum its counts, then compact in parallel. The
-        // first pivot-valued block ids still win ties exactly as before.
+        __syncthreads();
+        // Expanding all radix passes also keeps their derived keys live and
+        // causes large register spills at long-context capacities.
+#pragma unroll 1
+        for (int round = 0; round < 4; round++) {
+#pragma unroll
+            for (int w = 0; w < warps; w++) {
+                histogram[w][threadIdx.x] = 0;
+            }
+            __syncthreads();
+            const int shift = 24 - round * 8;
+            const uint32_t mask = round == 0
+                ? 0u : (~0u << (32 - round * 8));
+            const uint32_t currentPrefix = prefix;
+#pragma unroll
+            for (int item = 0; item < items; item++) {
+                const int block = begin + item * 32;
+                const uint32_t ordered = keyAt(item);
+                if (block < rowBlocks &&
+                    (ordered & mask) == currentPrefix) {
+                    atomicAdd(
+                        &histogram[warp][(ordered >> shift) & 0xffu], 1u);
+                }
+            }
+            __syncthreads();
+            const int bucket = 255 - threadIdx.x;
+            const uint32_t currentRemaining = remaining;
+            uint32_t count = 0;
+#pragma unroll
+            for (int w = 0; w < warps; w++) {
+                count += histogram[w][bucket];
+            }
+            uint32_t higher;
+            cub::BlockScan<uint32_t, 256>(scan).ExclusiveSum(count, higher);
+            if (higher < currentRemaining &&
+                higher + count >= currentRemaining) {
+                prefix = currentPrefix | ((uint32_t)bucket << shift);
+                remaining = currentRemaining - higher;
+            }
+            __syncthreads();
+        }
+
         const uint32_t pivot = prefix;
-        const int chunk = (rowBlocks + blockDim.x - 1) / blockDim.x;
-        const int begin = min(rowBlocks, (int)threadIdx.x * chunk);
-        const int end = min(rowBlocks, begin + chunk);
         uint32_t higher = 0;
         uint32_t equal = 0;
-        for (int block = begin; block < end; block++) {
-            const uint32_t ordered = Qwen4QSAOrderedFloatBits(row[block]);
-            higher += ordered > pivot;
-            equal += ordered == pivot;
+#pragma unroll
+        for (int item = 0; item < items; item++) {
+            const int block = begin + item * 32;
+            const uint32_t ordered = keyAt(item);
+            higher += block < rowBlocks && ordered > pivot;
+            equal += block < rowBlocks && ordered == pivot;
         }
-        threadHigher[threadIdx.x] = higher;
-        threadPivot[threadIdx.x] = equal;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            higher += __shfl_down_sync(0xffffffffu, higher, offset);
+            equal += __shfl_down_sync(0xffffffffu, equal, offset);
+        }
+        if (lane == 0) {
+            warpHigher[warp] = higher;
+            warpEqual[warp] = equal;
+        }
         __syncthreads();
         if (threadIdx.x == 0) {
             uint32_t higherTotal = 0;
-            for (int thread = 0; thread < blockDim.x; thread++) {
-                higherTotal += threadHigher[thread];
+#pragma unroll
+            for (int w = 0; w < warps; w++) {
+                higherTotal += warpHigher[w];
             }
             uint32_t pivotRemaining = selectedK - higherTotal;
             uint32_t outputOffset = 0;
-            for (int thread = 0; thread < blockDim.x; thread++) {
-                const uint32_t chosen = min(
-                    threadPivot[thread], pivotRemaining);
-                threadPivotChosen[thread] = chosen;
-                threadOutputOffset[thread] = outputOffset;
-                outputOffset += threadHigher[thread] + chosen;
+#pragma unroll
+            for (int w = 0; w < warps; w++) {
+                const uint32_t chosen = min(warpEqual[w], pivotRemaining);
+                warpPivotChosen[w] = chosen;
+                warpOutputOffset[w] = outputOffset;
+                outputOffset += warpHigher[w] + chosen;
                 pivotRemaining -= chosen;
             }
         }
         __syncthreads();
-        uint32_t outputIndex = threadOutputOffset[threadIdx.x];
-        uint32_t pivotSeen = 0;
-        const uint32_t pivotChosen = threadPivotChosen[threadIdx.x];
-        for (int block = begin; block < end; block++) {
-            const uint32_t ordered = Qwen4QSAOrderedFloatBits(row[block]);
-            if (ordered > pivot ||
-                (ordered == pivot && pivotSeen++ < pivotChosen)) {
-                output[outputIndex++] = block;
+
+        // Compact in physical cache order. Earlier block ids win pivot ties,
+        // both across warps and across successive ballots within a warp.
+        uint32_t outputOffset = warpOutputOffset[warp];
+        uint32_t pivotRemaining = warpPivotChosen[warp];
+        const uint32_t lowerLanes = (1u << lane) - 1u;
+#pragma unroll
+        for (int item = 0; item < items; item++) {
+            const int block = begin + item * 32;
+            const uint32_t ordered = keyAt(item);
+            const uint32_t equalMask = __ballot_sync(
+                0xffffffffu, block < rowBlocks && ordered == pivot);
+            const bool chosen = block < rowBlocks &&
+                (ordered > pivot ||
+                 (ordered == pivot &&
+                  __popc(equalMask & lowerLanes) < pivotRemaining));
+            const uint32_t chosenMask = __ballot_sync(0xffffffffu, chosen);
+            if (chosen) {
+                output[outputOffset + __popc(chosenMask & lowerLanes)] = block;
             }
+            outputOffset += __popc(chosenMask);
+            pivotRemaining -= min(pivotRemaining, (uint32_t)__popc(equalMask));
         }
     }
 
@@ -2905,8 +2929,28 @@ static bool FastllmCudaQwen4QSASelectLaunch(
             rows, scoreCapacity, heads, headDim, inverseSqrt,
             queryStart, compressRatio, decodeMeta);
     }
-    Qwen4QSARadixSelectKernel<<<
-        rows, threads, 0, cudaStreamPerThread>>>(
+    // Select the register footprint from the captured capacity, so replay
+    // remains valid as decodeMeta advances without changing the graph.
+    auto selectKernel = Qwen4QSARadixSelectKernel<0>;
+    if (rows == 1) {
+        // 144/272 include KV growth beyond 128K/256K-token prompts.
+        static const struct {
+            int items;
+            decltype(selectKernel) kernel;
+        } kernels[] = {
+            {8, Qwen4QSARadixSelectKernel<8>}, {16, Qwen4QSARadixSelectKernel<16>},
+            {32, Qwen4QSARadixSelectKernel<32>}, {64, Qwen4QSARadixSelectKernel<64>},
+            {128, Qwen4QSARadixSelectKernel<128>}, {144, Qwen4QSARadixSelectKernel<144>},
+            {256, Qwen4QSARadixSelectKernel<256>}, {272, Qwen4QSARadixSelectKernel<272>}
+        };
+        for (const auto &entry : kernels) {
+            if (scoreCapacity <= threads * entry.items) {
+                selectKernel = entry.kernel;
+                break;
+            }
+        }
+    }
+    selectKernel<<<rows, threads, 0, cudaStreamPerThread>>>(
         scores, selectedBlocks, rows, scoreCapacity, selectedK,
         queryStart, compressRatio, decodeMeta);
     const int expandBlocks = std::min<uint64_t>(
