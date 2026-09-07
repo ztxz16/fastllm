@@ -656,6 +656,7 @@ extern "C" {
                 || model->model_struct == "chatglm" 
                 || model->model_struct == "llama"
                 || model->model_struct == "qwen3_moe"
+                || model->model_type == "qwen4_exp"
                 || model->model_struct == "minimax_m2"
                 // || this->model_struct == "graph" ||
                 // || this->model_struct == "cogvlm" ||
