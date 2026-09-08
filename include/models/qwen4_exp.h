@@ -75,6 +75,7 @@ namespace fastllm {
     private:
         struct PrefixSnapshot;
         struct DecodeCudaGraphState;
+        struct PleStagingState;
         struct MtpDraftCudaGraphState;
         struct QsaHostMirrorTransfer;
         struct MtpRuntimeState;
@@ -97,6 +98,7 @@ namespace fastllm {
                 const Data *precomputedEmbedding = nullptr);
 
         struct RequestState {
+            std::shared_ptr<PleStagingState> pleStaging;
             int previousToken1 = -1;
             int previousToken2 = -1;
             std::vector<float> convHistory;

@@ -1157,6 +1157,27 @@ namespace fastllm {
         }
     }
 
+    struct Qwen4ExpModel::PleStagingState {
+        int device = -1;
+        Data embedding;
+        void *host = nullptr;
+        void *ready = nullptr;
+
+        ~PleStagingState() {
+#ifdef USE_CUDA
+            const int previousDevice = FastllmCudaGetDevice();
+            if (device >= 0) FastllmCudaSetDevice(device);
+            if (ready) {
+                FastllmCudaEventSynchronize(ready);
+                FastllmCudaEventDestroy(ready);
+            }
+            if (host) FastllmCudaHostFree(host);
+            embedding.FreeSpace();
+            if (previousDevice >= 0) FastllmCudaSetDevice(previousDevice);
+#endif
+        }
+    };
+
     struct Qwen4ExpModel::DecodeCudaGraphState {
         struct Segment {
             bool warmed = false;
@@ -1770,6 +1791,21 @@ namespace fastllm {
             }
         }
         auto &caches = entry->ranks;
+        std::vector<int> hostInputTokens;
+        if (batch == 1 && inputIds.dims == std::vector<int>({1, 1})) {
+            // Embedding dispatch moves each rank's ids to CUDA. Preserve the
+            // token now so PLE does not read it back after the layer-0 graph.
+            Data convertedIds;
+            const Data *hostIds = &inputIds;
+            if (inputIds.dataDevice != DataDevice::CPU ||
+                inputIds.dataType != DataType::FLOAT32) {
+                ToDataType(inputIds, convertedIds, DataType::FLOAT32);
+                convertedIds.ToDevice(DataDevice::CPU);
+                hostIds = &convertedIds;
+            }
+            hostInputTokens.push_back((int)(
+                reinterpret_cast<const float *>(hostIds->cpuData)[0] + 0.01f));
+        }
         // Each worker owns an executor, input tensors and a stable per-thread CUDA
         // stream. Operator dispatch must never mutate the shared global executor.
         std::vector<std::exception_ptr> errors(tp.devices.size());
@@ -1836,7 +1872,8 @@ namespace fastllm {
             auto tokens = model.ForwardTarget(batch, ids, mask, positions,
                 cache, generationConfig, lastTokens,
                 r == 0 ? logits : nullptr, nullptr, nullptr, nullptr, nullptr,
-                false, true, false, nullptr, false,
+                false, true, false,
+                hostInputTokens.empty() ? nullptr : &hostInputTokens, false,
                 precomputedEmbedding ? &embedding : nullptr);
             if (r == 0) result = std::move(tokens);
             FastllmCudaSyncCurrentThreadStream();
@@ -3074,7 +3111,41 @@ namespace fastllm {
         }
 
         Data embeddingData(DataType::FLOAT32,
-                           {batch, sequence, this->pleEmbedDim}, embeddings);
+                           {batch, sequence, this->pleEmbedDim});
+#ifdef USE_CUDA
+        if (threadTpRank == 0 && sequence == 1 && hostInputTokens != nullptr &&
+            hyperInput.dataDevice == DataDevice::CUDA) {
+            const int device = threadTpOwner->devices[0];
+            FastllmCudaSetDevice(device);
+            auto &staging = state.pleStaging;
+            if (!staging || staging->device != device) {
+                staging = std::make_shared<PleStagingState>();
+                staging->device = device;
+                Qwen4PrepareDecodeGraphWorkspace(staging->embedding,
+                    DataType::FLOAT32, embeddingData.dims, device);
+                staging->host = FastllmCudaHostMalloc(embeddingData.GetBytes());
+                staging->ready = FastllmCudaEventCreate();
+            }
+            AssertInFastLLM(staging->host && staging->ready &&
+                staging->embedding.cudaData, "Qwen4 TP PLE staging allocation failed.");
+            // The TP workers complete their streams before the next forward,
+            // so this request-owned pinned row is safe to reuse. Copy and
+            // projections share a stream; the event protects host-buffer
+            // lifetime if the request exits before the copy completes.
+            std::memcpy(staging->host, embeddings.data(), embeddingData.GetBytes());
+            AssertInFastLLM(FastllmCudaCopyFromPinnedHostToDeviceAsyncCurrentThread(
+                staging->embedding.cudaData, staging->host, embeddingData.GetBytes()),
+                "Qwen4 TP PLE staging copy failed.");
+            FastllmCudaEventRecordCurrentThread(staging->ready);
+            embeddingData.FakeFrom(staging->embedding, 0);
+            embeddingData.Resize(staging->embedding.dims);
+            embeddingData.dataDeviceIds = {device};
+        } else
+#endif
+        {
+            embeddingData.Allocate(false);
+            std::memcpy(embeddingData.cpuData, embeddings.data(), embeddingData.GetBytes());
+        }
         Data key, value, keyNormed, queryNormed;
         Linear(embeddingData, this->weight[ple + "key_proj.weight"], Data(), key);
         Linear(embeddingData, this->weight[ple + "value_proj.weight"], Data(), value);

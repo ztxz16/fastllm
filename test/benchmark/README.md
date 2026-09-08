@@ -182,7 +182,7 @@ python test/benchmark/qwen4_tp_reuse.py --reference /tmp/tp-baseline.json \
   --output /tmp/tp-candidate.json
 ```
 
-测试比较完整文本和 token usage，覆盖短输入图复用、跨 2048 token 边界、不同内容和长度、取消后重入及并发请求。TP CUDA Graph 说明见 [部署指南](../../docs/qwen4.md#tp-decode-的-cuda-graph)。
+测试比较完整文本和 token usage，覆盖短输入图复用、跨 2048 token 边界、不同内容和长度、取消后重入及并发请求。TP CUDA Graph 与 PLE 搬运说明见 [部署指南](../../docs/qwen4.md#tp-decode-的-cuda-graph)。
 
 ## Qwen4 前缀缓存回归
 
