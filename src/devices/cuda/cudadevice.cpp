@@ -5079,7 +5079,9 @@ namespace fastllm {
                    !input.dims.empty() && !mixLogits.dims.empty() &&
                    weight.dims.size() == 2 && groups > 0 &&
                    input.dims.back() % groups == 0 &&
-                   rows >= 8 &&
+                   (rows >= 8 || (rows == 1 && groups == 4 &&
+                                  weight.dims[0] == 10240 &&
+                                  weight.dims[1] == 320)) &&
                    mixLogits.Count(0) / mixLogits.dims.back() ==
                        input.Count(0) / input.dims.back() &&
                    mixLogits.dims.back() == weight.dims[1] &&

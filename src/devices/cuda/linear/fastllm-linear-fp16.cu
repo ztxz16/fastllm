@@ -1473,6 +1473,87 @@ static bool FastllmCudaMatMulFloat16PairSharedInput(
     return success && cudaGetLastError() == cudaSuccess;
 }
 
+// Single-token HC up + HyperMix. Each warp reproduces the 80 active lanes
+// of the 128-thread GEMV for one projection row. Eight warps produce four
+// groups for two channels; the first warp then mixes those groups in the
+// original order without materializing the 10240-element logits tensor.
+__global__ void FastllmQwen4HyperMixDecodeKernel(
+        const float *normalized, const float *lowRank,
+        const half *weight, float *output) {
+    constexpr int channels = 2560, rank = 320, groups = 4;
+    __shared__ float projected[8];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int channel = blockIdx.x * 2 + warp / groups;
+    const int row = (warp % groups) * channels + channel;
+    float values[3];
+#pragma unroll
+    for (int part = 0; part < 3; ++part) {
+        const int i = (lane + part * 32) * 4;
+        float sum = 0.0f;
+        if (i < rank) {
+            const float4 a = *reinterpret_cast<const float4 *>(lowRank + i);
+            union_half4 b;
+            b.in = *reinterpret_cast<const uint2 *>(weight + row * rank + i);
+            sum += a.x * __low2float(b.out2[0]);
+            sum += a.y * __high2float(b.out2[0]);
+            sum += a.z * __low2float(b.out2[1]);
+            sum += a.w * __high2float(b.out2[1]);
+        }
+        values[part] = __fadd_rn(0.0f, sum);
+    }
+
+    // Legacy stride 64 pairs virtual lanes 0..31 with 64..95 and
+    // 32..63 with the zero-filled 96..127. Stride 32 consumes the upper
+    // value, not its compensation. Keep the subsequent compensated tree.
+    float reduced = values[0], difference = 0.0f;
+    float other = values[2] - difference;
+    float sum = reduced + other;
+    difference = (sum - reduced) - other;
+    reduced = sum;
+    other = __fadd_rn(values[1], 0.0f) - difference;
+    sum = reduced + other;
+    difference = (sum - reduced) - other;
+    reduced = sum;
+#pragma unroll
+    for (int stride = 16; stride > 0; stride >>= 1) {
+        const float rhs = __shfl_down_sync(0xffffffffu, reduced, stride);
+        if (lane < stride) {
+            other = rhs - difference;
+            sum = reduced + other;
+            difference = (sum - reduced) - other;
+            reduced = sum;
+        }
+    }
+    if (lane == 0) {
+        // Linear adds a zero bias before storing its float32 result.
+        projected[warp] = __fadd_rn(reduced, 0.0f);
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        const int item = lane / groups;
+        const int group = lane % groups;
+        float input = 0.0f, gate = 0.0f;
+        if (lane < 8) {
+            input = normalized[group * channels + blockIdx.x * 2 + item];
+            // Match Qwen4CudaSigmoidRounded<float>, including double
+            // addition/division and the float32 rounding before mixing.
+            gate = 1.0 / (1.0 + expf(-projected[lane]));
+        }
+        float mixed = 0.0f;
+#pragma unroll
+        for (int g = 0; g < groups; ++g) {
+            const float x = __shfl_sync(0xffffffffu, input, g, groups);
+            const float w = __shfl_sync(0xffffffffu, gate, g, groups);
+            mixed = g == 0 ? __fmul_rn(x, w) : __fmaf_rn(x, w, mixed);
+        }
+        if (lane < 8 && group == 0) {
+            output[blockIdx.x * 2 + item] = mixed / groups;
+        }
+    }
+}
+
 bool FastllmCudaQwen4HyperMixProjected(
         const fastllm::Data &normalized,
         const fastllm::Data &lowRank,
@@ -1498,7 +1579,25 @@ bool FastllmCudaQwen4HyperMixProjected(
     const int m = lowRank.dims.back();
     const int n = (int)(lowRank.Count(0) / m);
     const int k = upWeight.dims[0];
-    if (n < 8 || normalized.Count(0) != (uint64_t)n * k) {
+    if (normalized.Count(0) != (uint64_t)n * k) {
+        return false;
+    }
+    if (n == 1 && m == 320 && k == 10240 && groups == 4) {
+        if (output.dataType != fastllm::DataType::FLOAT32 ||
+            output.Count(0) != 2560 || normalized.cudaData == nullptr ||
+            lowRank.cudaData == nullptr || upWeight.cudaData == nullptr) {
+            return false;
+        }
+        output.Allocate(false);
+        if (output.cudaData == nullptr) {
+            return false;
+        }
+        FastllmQwen4HyperMixDecodeKernel<<<1280, 256>>>(
+            (const float*)normalized.cudaData, (const float*)lowRank.cudaData,
+            (const half*)upWeight.cudaData, (float*)output.cudaData);
+        return cudaGetLastError() == cudaSuccess;
+    }
+    if (n < 8) {
         return false;
     }
 

@@ -784,6 +784,12 @@ if (UNIT_TEST)
         add_test(NAME qwen4TpSampling COMMAND qwen4TpSamplingRegression)
         set_tests_properties(qwen4TpSampling PROPERTIES LABELS cuda TIMEOUT 60 SKIP_RETURN_CODE 77)
 
+        add_executable(qwen4HyperMixRegression test/ops/qwen4HyperMixRegression.cpp)
+        target_link_libraries(qwen4HyperMixRegression fastllm)
+        target_include_directories(qwen4HyperMixRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME qwen4HyperMix COMMAND qwen4HyperMixRegression)
+        set_tests_properties(qwen4HyperMix PROPERTIES LABELS cuda TIMEOUT 180 SKIP_RETURN_CODE 77)
+
         add_executable(ncclOddTpRegression test/ops/ncclOddTpRegression.cu)
         target_link_libraries(ncclOddTpRegression fastllm)
         target_include_directories(ncclOddTpRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

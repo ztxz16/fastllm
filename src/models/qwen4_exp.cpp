@@ -2937,7 +2937,11 @@ namespace fastllm {
 #if defined(USE_CUDA) && !defined(CUDA_NO_TENSOR_CORE)
         const int rows = normalized.dims.empty()
             ? 0 : (int)(normalized.Count(0) / normalized.dims.back());
-        if (!qwen4MtpDecodeEquivalentTarget && rows >= 8 &&
+        // Keep the single-token specialization limited to TP decode.
+        const bool tpDecodeMix = threadTpRank >= 0 && rows == 1 &&
+            this->hcCount == 4 && upWeight.dims.size() == 2 &&
+            upWeight.dims[0] == 10240 && upWeight.dims[1] == 320;
+        if (!qwen4MtpDecodeEquivalentTarget && (rows >= 8 || tpDecodeMix) &&
             normalized.dataDevice == DataDevice::CUDA &&
             normalized.dataType == DataType::FLOAT32 &&
             lowRank.dataType == DataType::FLOAT32 &&
