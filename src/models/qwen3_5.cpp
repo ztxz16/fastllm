@@ -5,6 +5,7 @@
 #include "utils.h"
 
 #include "qwen3_5.h"
+#include "models/qwen3_5_paged_cache.h"
 #include "blocks/baseblock.h"
 #include "executor.h"
 
@@ -17159,13 +17160,8 @@ namespace fastllm {
             std::vector<int> releasePages;
             PagedCacheManager *oldManager = cache.pagedKVCacheData;
             if (cache.isPagedKVCache && cache.pagedKVCacheData != nullptr) {
-                releasePages.reserve(cache.pageIndex.size());
-                for (int page : cache.pageIndex) {
-                    if (std::find(meta.pageIndex.begin(), meta.pageIndex.end(), page) ==
-                        meta.pageIndex.end()) {
-                        releasePages.push_back(page);
-                    }
-                }
+                releasePages = Qwen35UnreferencedPages(
+                    cache.pageIndex, meta.pageIndex);
             }
             cache.isPagedKVCache = meta.isPagedKVCache;
             cache.pageLen = meta.pageLen;
@@ -19754,12 +19750,8 @@ namespace fastllm {
             PagedCacheManager *oldManager = cache.pagedKVCacheData;
             std::vector<int> releasePages;
             if (cache.isPagedKVCache && oldManager != nullptr) {
-                for (int page : cache.pageIndex) {
-                    if (std::find(meta.pageIndex.begin(), meta.pageIndex.end(), page) ==
-                        meta.pageIndex.end()) {
-                        releasePages.push_back(page);
-                    }
-                }
+                releasePages = Qwen35UnreferencedPages(
+                    cache.pageIndex, meta.pageIndex);
             }
             assignMetaNoRelease(cache, meta);
             if (!releasePages.empty() && oldManager != nullptr) {
