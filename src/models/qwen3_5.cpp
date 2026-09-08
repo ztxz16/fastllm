@@ -29852,14 +29852,14 @@ namespace fastllm {
             return -1;
         }
 
-        // Append every K/V row before selecting the output. With the empty
-        // mask and maskType=1 below, each query sees the same full KV cache;
-        // attention and the remaining projections/MLP are row-independent.
+        // Append every K/V row before selecting the output. Only the last
+        // query of causal attention can still see the full KV cache when
+        // evaluated alone; earlier rows must retain their causal boundary.
         // Keep short KV and the 128-wide FlashInfer path's computation shapes
         // unchanged to avoid unnecessary floating-point rounding differences.
         sampleRow = std::max(0, std::min(sampleRow, seqLen - 1));
-        const bool sampleSingleRow = seqLen > 1 && head_dim == 256 &&
-                                     cache.tokens > 4096;
+        const bool sampleSingleRow = seqLen > 1 && sampleRow == seqLen - 1 &&
+                                     head_dim == 256 && cache.tokens > 4096;
         Data sampleQ, sampleGate, sampleHidden;
         if (sampleSingleRow) {
             Split(q, 1, sampleRow, sampleRow + 1, sampleQ);

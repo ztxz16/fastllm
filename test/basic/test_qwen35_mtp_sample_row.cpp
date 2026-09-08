@@ -174,6 +174,46 @@ void RunCase(DraftModel &model, int headDim, int context, int length, int sample
               << " context=" << context << " query=" << length
               << " sample_row=" << sampleRow << " max_abs=" << maxError << " PASS\n";
 }
+
+void RunCausalCase() {
+    DraftModel model(256);
+    // Uniform scores and large new V rows make a future row visible
+    // in the selected hidden state, even with thousands of cached rows.
+    Data &qNorm = model.weight["mtp.layers.0.self_attn.q_norm.weight"];
+    std::fill_n(reinterpret_cast<uint16_t *>(qNorm.cpuData),
+                qNorm.Count(0), float_to_half(0.0f));
+    Data &qkv = model.weight["mtp.layers.0.self_attn.mergeqkv.weight"];
+    auto *qkvValues = reinterpret_cast<uint16_t *>(qkv.cpuData);
+    for (uint64_t i = 26 * 256 * DraftModel::width; i < qkv.Count(0); ++i) {
+        qkvValues[i] = float_to_half(half_to_float(qkvValues[i]) * 1024.0f);
+    }
+    RunCase(model, 256, 4097, 2, 0);
+
+    DraftModel::MtpKvCache first, changedFuture;
+    InitCache(first, 4097, 256);
+    InitCache(changedFuture, 4097, 256);
+    Data hidden(FLOAT16, {1, 2, DraftModel::width});
+    Data otherHidden(FLOAT16, {1, 2, DraftModel::width});
+    Fill(hidden, 9, 0.6f);
+    Fill(otherHidden, 9, 0.6f);
+    auto *values = reinterpret_cast<uint16_t *>(otherHidden.cpuData);
+    for (int i = DraftModel::width; i < 2 * DraftModel::width; ++i) {
+        values[i] = float_to_half(-half_to_float(values[i]));
+    }
+    hidden.ToDevice(DataDevice::CUDA, {0}, true);
+    otherHidden.ToDevice(DataDevice::CUDA, {0}, true);
+    Data positions(FLOAT32, {1, 2}, {4097.0f, 4098.0f}), sampled, otherSampled;
+    int token = model.RunMtpGreedyDraft(0, {0}, first, hidden, {3, 4}, positions, 0, &sampled);
+    int otherToken = model.RunMtpGreedyDraft(0, {0}, changedFuture, otherHidden,
+                                           {3, 5}, positions, 0, &otherSampled);
+    // Both calls have identical shapes and the same visible prefix. Changing
+    // only a future row must not affect any bit of the selected first row.
+    Require(LogicalHalfData(sampled) == LogicalHalfData(otherSampled) && token == otherToken,
+            "future MTP row changed a causally earlier output");
+    Require(LogicalHalfData(first.value) != LogicalHalfData(changedFuture.value),
+            "causal test did not change the future V row");
+    std::cout << "non-last MTP output is independent of future rows PASS\n";
+}
 }
 
 int main(int argc, char **argv) {
@@ -184,6 +224,10 @@ int main(int argc, char **argv) {
         FastllmCudaSetDevice(0);
         const bool longContext = argc == 2 && std::string(argv[1]) == "--long";
         const bool useMoe = argc == 2 && std::string(argv[1]) == "--moe";
+        if (argc == 2 && std::string(argv[1]) == "--causal") {
+            RunCausalCase();
+            return 0;
+        }
         for (int headDim : {128, 256}) {
             DraftModel model(headDim, useMoe);
             // context=4094 covers appended KV lengths on both sides of 4096.
