@@ -6046,6 +6046,100 @@ namespace fastllm {
             return true;
         }
 
+        // Eager packed prefill (including MTP verification) can use the same
+        // append kernel as graph prefill. Keep routing in one reusable upload
+        // instead of splitting K/V and uploading four tensors per request batch.
+        static bool Qwen35PreparePackedPagedAppend(
+                int device, const Data &k, const Data &v,
+                const std::vector<Data*> &keys,
+                const std::vector<Data*> &values,
+                const std::vector<int> &seqLens,
+                Data &qSizes, Data &pageSizes, Data &pageIndexs,
+                Data &lastPageLens, Data *&baseTokenLens) {
+            const int batch = (int)keys.size();
+            if (batch <= 1 || values.size() != keys.size() ||
+                seqLens.size() != keys.size() ||
+                k.dataDevice != DataDevice::CUDA ||
+                v.dataDevice != DataDevice::CUDA ||
+                k.cudaData == nullptr || v.cudaData == nullptr ||
+                k.dims.size() != 3 || k.dims != v.dims ||
+                FastllmCudaGraphIsCapturingFast()) {
+                return false;
+            }
+            PagedCacheManager *keyManager = keys[0]->pagedKVCacheData;
+            PagedCacheManager *valueManager = values[0]->pagedKVCacheData;
+            int totalTokens = 0;
+            for (int b = 0; b < batch; ++b) {
+                const Data &key = *keys[b];
+                const Data &value = *values[b];
+                if (seqLens[b] <= 0 || keyManager == nullptr ||
+                    valueManager == nullptr ||
+                    key.pagedKVCacheData != keyManager ||
+                    value.pagedKVCacheData != valueManager ||
+                    key.pageLen <= 0 || key.pageLen != value.pageLen ||
+                    key.pageIndex != value.pageIndex ||
+                    key.lastPageLen != value.lastPageLen ||
+                    key.dims.size() != 3 || value.dims != key.dims ||
+                    key.dims[0] != k.dims[0] ||
+                    key.dims[2] != k.dims[2]) {
+                    return false;
+                }
+                totalTokens += seqLens[b];
+            }
+            if (totalTokens != k.dims[1]) {
+                return false;
+            }
+
+            struct Workspace {
+                Data storage, baseTokenLens;
+                std::vector<int> q, pages, indices, last, base, packed;
+            };
+            static thread_local Workspace workspace;
+            auto &w = workspace;
+            w.q.assign(batch + 1, 0);
+            w.pages.assign(batch + 1, 0);
+            w.indices.clear();
+            w.last.resize(batch);
+            w.base.resize(batch);
+            for (int b = 0; b < batch; ++b) {
+                // K/V already share page ids. Failure to reserve matching
+                // pages is a cache allocation error, not an append fallback:
+                // earlier requests may already have advanced their metadata.
+                AssertInFastLLM(
+                    Qwen35AdvanceMtpVerifyPagedCachePair(
+                        *keys[b], *values[b], seqLens[b], w.base[b]),
+                    "Qwen3.5 packed KV append could not reserve pages.\n");
+                w.q[b + 1] = w.q[b] + seqLens[b];
+                w.pages[b + 1] = w.pages[b] + keys[b]->pageIndex.size();
+                w.indices.insert(w.indices.end(), keys[b]->pageIndex.begin(),
+                                 keys[b]->pageIndex.end());
+                w.last[b] = keys[b]->lastPageLen;
+            }
+            w.packed.clear();
+            for (const auto *host : {&w.q, &w.pages, &w.indices, &w.last, &w.base}) {
+                w.packed.insert(w.packed.end(), host->begin(), host->end());
+            }
+            AssertInFastLLM(
+                Qwen35PrepareMtpVerifyGraphPackedIntTensor(
+                    w.storage, device, w.packed, (int)w.packed.size(), true),
+                "Qwen3.5 packed KV metadata upload failed.\n");
+            size_t offset = 0;
+            auto bind = [&](Data &view, const std::vector<int> &host) {
+                AssertInFastLLM(
+                    Qwen35BindMtpVerifyGraphIntView(
+                        view, w.storage, device, offset, host),
+                    "Qwen3.5 packed KV metadata view failed.\n");
+                offset += host.size();
+            };
+            bind(qSizes, w.q);
+            bind(pageSizes, w.pages);
+            bind(pageIndexs, w.indices);
+            bind(lastPageLens, w.last);
+            bind(w.baseTokenLens, w.base);
+            baseTokenLens = &w.baseTokenLens;
+            return true;
+        }
+
         struct Qwen35ExactDFlashPagedMeta {
             Data storage;
             Data insertIndexRows;
@@ -6789,19 +6883,28 @@ namespace fastllm {
                     v->Reshape({-1, seqlen, headDim});
                 }
 
-                if (externalPrefillMeta) {
+                bool packedPrefillMeta = externalPrefillMeta;
+                Data *appendBaseTokenLens = externalAppendBaseTokenLens;
+                if (!packedPrefillMeta && !repeatSinglePagedCache) {
+                    packedPrefillMeta = Qwen35PreparePackedPagedAppend(
+                        runner.DeviceId(), *k, *v,
+                        *batchPastKeys, *batchPastValues, seqLens,
+                        *qSizes, *pageSizes, *pageIndexs, *lastPageLens,
+                        appendBaseTokenLens);
+                }
+                if (packedPrefillMeta) {
                     AssertInFastLLM(
-                        externalAppendBaseTokenLens != nullptr &&
-                        externalAppendBaseTokenLens->dataDevice ==
+                        appendBaseTokenLens != nullptr &&
+                        appendBaseTokenLens->dataDevice ==
                             DataDevice::CUDA &&
-                        externalAppendBaseTokenLens->cudaData != nullptr &&
+                        appendBaseTokenLens->cudaData != nullptr &&
                         qSizes->dataDevice == DataDevice::CUDA &&
                         pageSizes->dataDevice == DataDevice::CUDA &&
                         pageIndexs->dataDevice == DataDevice::CUDA &&
                         qSizes->cudaData != nullptr &&
                         pageSizes->cudaData != nullptr &&
                         pageIndexs->cudaData != nullptr,
-                        "Qwen3.5 graph prefill requires device paged metadata.\n");
+                        "Qwen3.5 packed prefill requires device paged metadata.\n");
                     Data &pastKey = *(*batchPastKeys)[0];
                     Data &pastValue = *(*batchPastValues)[0];
                     AssertInFastLLM(
@@ -6813,14 +6916,14 @@ namespace fastllm {
                         k->dims[0] == numKeyValueHeads &&
                         v->dims[0] == numKeyValueHeads &&
                         k->dims[1] == seqlen && v->dims[1] == seqlen,
-                        "Qwen3.5 graph prefill got incompatible packed KV.\n");
+                        "Qwen3.5 packed prefill got incompatible packed KV.\n");
                     bool appendedK =
                         FastllmCudaPagedCacheAppendPackedBatch(
                             (uint8_t*)pastKey.pagedKVCacheData->cudaData,
                             (const int32_t*)qSizes->cudaData,
                             (const int32_t*)pageSizes->cudaData,
                             (const int32_t*)pageIndexs->cudaData,
-                            (const int32_t*)externalAppendBaseTokenLens->cudaData,
+                            (const int32_t*)appendBaseTokenLens->cudaData,
                             batch, seqlen, pastKey.pageLen,
                             numKeyValueHeads, headDim,
                             pastKey.pagedKVCacheData->dataType,
@@ -6831,14 +6934,14 @@ namespace fastllm {
                             (const int32_t*)qSizes->cudaData,
                             (const int32_t*)pageSizes->cudaData,
                             (const int32_t*)pageIndexs->cudaData,
-                            (const int32_t*)externalAppendBaseTokenLens->cudaData,
+                            (const int32_t*)appendBaseTokenLens->cudaData,
                             batch, seqlen, pastValue.pageLen,
                             numKeyValueHeads, headDim,
                             pastValue.pagedKVCacheData->dataType,
                             (const uint8_t*)v->cudaData, v->dataType);
                     if (!appendedK || !appendedV) {
                         throw std::runtime_error(
-                            "Qwen3.5 graph packed KV append failed.");
+                            "Qwen3.5 packed KV append failed.");
                     }
                 } else if (batch == 1) {
                     Data &pastKey = *(*batchPastKeys)[0];
@@ -6877,7 +6980,7 @@ namespace fastllm {
                 Data &vCaches = *(*batchPastValues)[0];
                 Data &qForAttention =
                     preparePagedAttentionQ(*q, kCaches.dataType);
-                if (!externalPrefillMeta) {
+                if (!packedPrefillMeta) {
                     Qwen3CudaGeneratePagedBatchParams(
                         runner, qForAttention, *batchPastKeys, batch,
                         *qSizes, *pageSizes, *pageIndexs, *lastPageLens,
