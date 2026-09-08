@@ -2249,6 +2249,16 @@ namespace fastllm {
         static bool Qwen35CanUseGPUForward(const std::map<std::string, int> &deviceMap,
                                            const std::map<std::string, int> &moeDeviceMap) {
             (void)moeDeviceMap;
+            // The fused single-GPU runner keeps every touched weight resident on
+            // one GPU (requireLocal migrates unconditionally).  A device map that
+            // mixes CUDA with a positive-weight non-CUDA entry (e.g. {'cpu':4,'cuda':6})
+            // requests layer-wise offload instead, which only the generic
+            // per-layer forward honors, so fall back to it.
+            for (auto &it : deviceMap) {
+                if (it.second > 0 && !Qwen35DeviceSpecIsCuda(it.first)) {
+                    return false;
+                }
+            }
             std::vector<int> devices;
             std::map<int, int> ratios;
             return GetQwen35GPUForwardDevices(deviceMap, devices, ratios);
