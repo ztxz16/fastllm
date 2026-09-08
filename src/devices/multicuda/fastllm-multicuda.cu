@@ -13,6 +13,7 @@
 #include <chrono>
 #include <algorithm>
 #include <cctype>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -24,7 +25,10 @@
 
 #include "fastllm-cuda.cuh"
 #include "fastllm-multicuda.cuh"
+#ifdef FASTLLM_USE_NCCL
+#include <nccl.h>
 #include "devices/multicuda/ncclsubmitrendezvous.h"
+#endif
 #include "fastllm.h"
 #include "utils.h"
 #include "gguf.h"
@@ -32,9 +36,6 @@
 #include "devices/cpu/alivethreadpool.h"
 #include "devices/cpu/cpudevice.h"
 #include "devices/cpu/computeutils.h"
-
-#include <cuda_runtime.h>
-#include <nccl.h>
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 // support tensor core
 #include "mma.h"
@@ -2077,14 +2078,17 @@ cudaStream_t *GetFastllmStream(int id) {
     return &streams[id];
 }
 
-// 全局变量存储通信器
-// Key: deviceId, Value: ncclComm_t
-static std::map<int, ncclComm_t> g_ncclComms;
 static std::map<int, int> g_ncclRanks;
+#ifndef FASTLLM_USE_NCCL
+static std::vector<int> g_ncclDevices;
+#endif
 static bool g_ncclInitialized = false;
 static int g_ncclWorldSize = 0;
 static std::atomic<uint64_t> g_ncclGeneration{0};
 static std::mutex g_ncclInitMutex;
+#ifdef FASTLLM_USE_NCCL
+// Key: deviceId, Value: ncclComm_t
+static std::map<int, ncclComm_t> g_ncclComms;
 // Follows the main communicator group's lifetime. As with g_ncclComms,
 // initialization/replacement must not overlap active collectives.
 static std::unique_ptr<fastllm::NcclSubmitRendezvous> g_ncclSubmitRendezvous;
@@ -2101,6 +2105,7 @@ struct FastllmNcclGraphPeerComms {
 static std::mutex g_ncclGraphPeerMutex;
 static std::map<std::pair<int, int>, FastllmNcclGraphPeerComms>
     g_ncclGraphPeerComms;
+#endif
 static std::mutex g_cudaPeerAccessMutex;
 static std::map<std::vector<int>, bool> g_cudaPeerAccessStates;
 
@@ -2188,10 +2193,335 @@ static size_t FastllmNcclDataTypeBytes(int dataType) {
     return 0;
 }
 
+#ifndef FASTLLM_USE_NCCL
+
+enum class FastllmHostCollectiveKind {
+    Broadcast,
+    AllReduce,
+    Reduce,
+};
+
+struct FastllmHostCollectiveState {
+    std::mutex mutex;
+    std::condition_variable condition;
+    uint64_t generation = 0;
+    int arrived = 0;
+    int completed = 0;
+    int worldSize = 0;
+    int count = 0;
+    int dataType = -1;
+    int rootRank = -1;
+    FastllmHostCollectiveKind kind = FastllmHostCollectiveKind::AllReduce;
+    bool ready = false;
+    bool failed = false;
+    std::vector<bool> arrivedRanks;
+    std::vector<std::vector<uint8_t>> inputs;
+    std::vector<uint8_t> result;
+};
+
+static FastllmHostCollectiveState g_hostCollective;
+
+static const char *FastllmHostCollectiveName(FastllmHostCollectiveKind kind) {
+    if (kind == FastllmHostCollectiveKind::Broadcast) {
+        return "broadcast";
+    }
+    if (kind == FastllmHostCollectiveKind::Reduce) {
+        return "reduce";
+    }
+    return "all-reduce";
+}
+
+static void FastllmResetHostCollectiveState() {
+    std::lock_guard<std::mutex> guard(g_hostCollective.mutex);
+    g_hostCollective.generation++;
+    g_hostCollective.arrived = 0;
+    g_hostCollective.completed = 0;
+    g_hostCollective.worldSize = 0;
+    g_hostCollective.ready = false;
+    g_hostCollective.failed = false;
+    g_hostCollective.arrivedRanks.clear();
+    g_hostCollective.inputs.clear();
+    g_hostCollective.result.clear();
+    g_hostCollective.condition.notify_all();
+}
+
+static bool FastllmHostCollectiveStreamAvailable(int deviceId) {
+    if (cudaSetDevice(deviceId) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
+    cudaError_t state = cudaStreamIsCapturing(cudaStreamPerThread,
+                                              &captureStatus);
+    if (state != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return captureStatus == cudaStreamCaptureStatusNone;
+}
+
+static bool FastllmHostCopyFromDevice(std::vector<uint8_t> &host,
+                                      const void *device, size_t bytes,
+                                      int deviceId) {
+    host.resize(bytes);
+    if (cudaSetDevice(deviceId) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    cudaError_t state = cudaMemcpyAsync(host.data(), device, bytes,
+                                        cudaMemcpyDeviceToHost,
+                                        cudaStreamPerThread);
+    if (state == cudaSuccess) {
+        state = cudaStreamSynchronize(cudaStreamPerThread);
+    }
+    if (state != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
+static bool FastllmHostCopyToDevice(void *device,
+                                    const std::vector<uint8_t> &host,
+                                    int deviceId) {
+    if (cudaSetDevice(deviceId) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    cudaError_t state = cudaMemcpyAsync(device, host.data(), host.size(),
+                                        cudaMemcpyHostToDevice,
+                                        cudaStreamPerThread);
+    if (state == cudaSuccess) {
+        state = cudaStreamSynchronize(cudaStreamPerThread);
+    }
+    if (state != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
+static float FastllmBFloat16ToFloat(uint16_t value) {
+    uint32_t bits = (uint32_t)value << 16;
+    float result = 0.0f;
+    std::memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+static uint16_t FastllmFloatToBFloat16(float value) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    // Round to nearest, ties to even, matching normal BF16 conversions.
+    bits += 0x7fffU + ((bits >> 16) & 1U);
+    return (uint16_t)(bits >> 16);
+}
+
+template <typename T>
+static void FastllmHostSumIntegral(
+        const std::vector<std::vector<uint8_t>> &inputs,
+        std::vector<uint8_t> &result, int count) {
+    for (int i = 0; i < count; ++i) {
+        int64_t sum = 0;
+        for (const auto &input : inputs) {
+            T value;
+            std::memcpy(&value, input.data() + (size_t)i * sizeof(T),
+                        sizeof(T));
+            sum += (int64_t)value;
+        }
+        T value = (T)sum;
+        std::memcpy(result.data() + (size_t)i * sizeof(T), &value,
+                    sizeof(T));
+    }
+}
+
+static bool FastllmHostSum(const std::vector<std::vector<uint8_t>> &inputs,
+                           std::vector<uint8_t> &result, int count,
+                           int dataType) {
+    if (dataType == fastllm::DataType::FLOAT32) {
+        for (int i = 0; i < count; ++i) {
+            float sum = 0.0f;
+            for (const auto &input : inputs) {
+                float value;
+                std::memcpy(&value,
+                            input.data() + (size_t)i * sizeof(float),
+                            sizeof(value));
+                sum += value;
+            }
+            std::memcpy(result.data() + (size_t)i * sizeof(float), &sum,
+                        sizeof(sum));
+        }
+        return true;
+    }
+    if (dataType == fastllm::DataType::FLOAT16 ||
+        dataType == fastllm::DataType::BFLOAT16) {
+        for (int i = 0; i < count; ++i) {
+            float sum = 0.0f;
+            for (const auto &input : inputs) {
+                uint16_t value;
+                std::memcpy(&value,
+                            input.data() + (size_t)i * sizeof(uint16_t),
+                            sizeof(value));
+                sum += dataType == fastllm::DataType::FLOAT16
+                    ? fastllm::half_to_float(value)
+                    : FastllmBFloat16ToFloat(value);
+            }
+            uint16_t value = dataType == fastllm::DataType::FLOAT16
+                ? fastllm::float_to_half(sum)
+                : FastllmFloatToBFloat16(sum);
+            std::memcpy(result.data() + (size_t)i * sizeof(uint16_t),
+                        &value, sizeof(value));
+        }
+        return true;
+    }
+    if (dataType == fastllm::DataType::INT8) {
+        FastllmHostSumIntegral<int8_t>(inputs, result, count);
+        return true;
+    }
+    if (dataType == fastllm::DataType::INT32) {
+        FastllmHostSumIntegral<int32_t>(inputs, result, count);
+        return true;
+    }
+    return false;
+}
+
+// Correctness-first fallback for Windows CUDA installations without NCCL.
+// All participating rank threads stage their input through pageable host
+// memory, rendezvous here, and synchronously copy the result back. This is not
+// intended to compete with NCCL; it keeps arbitrary supported collectives
+// functional when P2P custom all-reduce cannot be used.
+static bool FastllmRunHostCollective(FastllmHostCollectiveKind kind,
+                                     const void *send, void *recv, int count,
+                                     int dataType, int rootRank, int deviceId) {
+    auto rankIt = g_ncclRanks.find(deviceId);
+    const size_t typeBytes = FastllmNcclDataTypeBytes(dataType);
+    if (rankIt == g_ncclRanks.end() || g_ncclWorldSize <= 1 ||
+        typeBytes == 0) {
+        FastllmCudaSetThreadError();
+        return false;
+    }
+    const int rank = rankIt->second;
+    const int worldSize = g_ncclWorldSize;
+    const size_t bytes = (size_t)count * typeBytes;
+    bool localOk = FastllmHostCollectiveStreamAvailable(deviceId);
+    std::vector<uint8_t> localInput;
+    if (localOk && (kind != FastllmHostCollectiveKind::Broadcast ||
+                    rank == rootRank)) {
+        localOk = FastllmHostCopyFromDevice(localInput, send, bytes,
+                                             deviceId);
+    }
+
+    FastllmHostCollectiveState &state = g_hostCollective;
+    std::unique_lock<std::mutex> lock(state.mutex);
+    if (state.arrived == 0) {
+        state.worldSize = worldSize;
+        state.count = count;
+        state.dataType = dataType;
+        state.rootRank = rootRank;
+        state.kind = kind;
+        state.ready = false;
+        state.failed = false;
+        state.completed = 0;
+        state.arrivedRanks.assign(worldSize, false);
+        state.inputs.assign(worldSize, std::vector<uint8_t>());
+        state.result.assign(bytes, 0);
+    }
+    const uint64_t generation = state.generation;
+    bool parametersMatch = state.worldSize == worldSize &&
+        state.count == count && state.dataType == dataType &&
+        state.rootRank == rootRank && state.kind == kind &&
+        rank >= 0 && rank < worldSize && !state.arrivedRanks[rank];
+    if (!parametersMatch || !localOk) {
+        state.failed = true;
+    }
+    if (rank >= 0 && rank < worldSize && !state.arrivedRanks[rank]) {
+        state.arrivedRanks[rank] = true;
+        if (!localInput.empty()) {
+            state.inputs[rank].swap(localInput);
+        }
+        state.arrived++;
+    }
+
+    if (state.arrived == worldSize) {
+        if (!state.failed) {
+            if (kind == FastllmHostCollectiveKind::Broadcast) {
+                if (rootRank < 0 || rootRank >= worldSize ||
+                    state.inputs[rootRank].size() != bytes) {
+                    state.failed = true;
+                } else {
+                    state.result = state.inputs[rootRank];
+                }
+            } else {
+                for (const auto &input : state.inputs) {
+                    if (input.size() != bytes) {
+                        state.failed = true;
+                        break;
+                    }
+                }
+                if (!state.failed &&
+                    !FastllmHostSum(state.inputs, state.result, count,
+                                    dataType)) {
+                    state.failed = true;
+                }
+            }
+        }
+        state.ready = true;
+        state.condition.notify_all();
+    } else {
+        state.condition.wait(lock, [&state, generation]() {
+            return state.ready || state.generation != generation;
+        });
+    }
+
+    bool collectiveOk = state.generation == generation && !state.failed;
+    lock.unlock();
+    bool shouldReceive = kind != FastllmHostCollectiveKind::Reduce ||
+                         rank == rootRank;
+    bool copyOk = true;
+    if (collectiveOk && shouldReceive) {
+        copyOk = FastllmHostCopyToDevice(recv, state.result, deviceId);
+    }
+
+    lock.lock();
+    if (state.generation == generation) {
+        state.completed++;
+        if (state.completed == worldSize) {
+            state.arrived = 0;
+            state.completed = 0;
+            state.ready = false;
+            state.failed = false;
+            state.arrivedRanks.clear();
+            state.inputs.clear();
+            state.result.clear();
+            state.generation++;
+            state.condition.notify_all();
+        } else {
+            state.condition.wait(lock, [&state, generation]() {
+                return state.generation != generation;
+            });
+        }
+    }
+    lock.unlock();
+
+    if (!collectiveOk || !copyOk) {
+        FastllmCudaSetThreadError();
+        std::fprintf(stderr,
+                     "Error: host-staged CUDA %s fallback failed on GPU %d. "
+                     "CUDA Graph capture is not supported without NCCL.\n",
+                     FastllmHostCollectiveName(kind), deviceId);
+        std::fflush(stderr);
+        return false;
+    }
+    return true;
+}
+
+#endif
+
+#ifdef FASTLLM_USE_NCCL
 static ncclComm_t FindNcclCommNoLog(int deviceId) {
     auto it = g_ncclComms.find(deviceId);
     return it == g_ncclComms.end() ? nullptr : it->second;
 }
+#endif
 
 uint64_t FastllmGetNcclGeneration() {
     return g_ncclGeneration.load(std::memory_order_acquire);
@@ -2205,6 +2535,34 @@ bool FastllmInitNccl(const std::vector<int>& devices) {
     }
 
     int numGPUs = uniqueDevices.size();
+#ifndef FASTLLM_USE_NCCL
+    if (g_ncclInitialized && g_ncclDevices == uniqueDevices &&
+        g_ncclWorldSize == numGPUs) {
+        FastllmCudaCustomAllReduceInit(uniqueDevices);
+        return true;
+    }
+
+    g_ncclGeneration.fetch_add(1, std::memory_order_acq_rel);
+    FastllmCudaCustomAllReduceReset();
+    FastllmResetHostCollectiveState();
+    g_ncclRanks.clear();
+    g_ncclDevices = uniqueDevices;
+    g_ncclWorldSize = numGPUs;
+    for (int rank = 0; rank < numGPUs; ++rank) {
+        g_ncclRanks[uniqueDevices[rank]] = rank;
+        cudaSetDevice(uniqueDevices[rank]);
+        cudaFree(0);
+    }
+    g_ncclInitialized = true;
+    FastllmCudaCustomAllReduceInit(uniqueDevices);
+    std::fprintf(stderr,
+                 "[Fastllm] NCCL is not compiled in; %d GPUs will use CUDA "
+                 "P2P custom all-reduce when possible and synchronous "
+                 "host-staged collectives otherwise.\n",
+                 numGPUs);
+    std::fflush(stderr);
+    return true;
+#else
     bool ready = g_ncclInitialized && g_ncclWorldSize == numGPUs &&
                  (int)g_ncclComms.size() == numGPUs;
     if (ready) {
@@ -2275,6 +2633,7 @@ bool FastllmInitNccl(const std::vector<int>& devices) {
     FastllmCudaSetNcclActive(true);
     printf("NCCL Initialized for %d devices.\n", numGPUs);
     return true;
+#endif
 }
 
 bool FastllmInitNcclGraphPeer(int srcDevice, int dstDevice) {
@@ -2284,6 +2643,18 @@ bool FastllmInitNcclGraphPeer(int srcDevice, int dstDevice) {
     if (srcDevice == dstDevice) {
         return true;
     }
+
+#ifndef FASTLLM_USE_NCCL
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr,
+                     "[Fastllm] cross-GPU CUDA Graph copies require NCCL; "
+                     "the graph path will be disabled and eager execution "
+                     "will be used.\n");
+        std::fflush(stderr);
+    }
+    return false;
+#else
 
     int firstDevice = std::min(srcDevice, dstDevice);
     int secondDevice = std::max(srcDevice, dstDevice);
@@ -2351,6 +2722,7 @@ bool FastllmInitNcclGraphPeer(int srcDevice, int dstDevice) {
     g_ncclGraphPeerComms[key] = peer;
     FastllmCudaSetNcclActive(true);
     return true;
+#endif
 }
 
 bool FastllmNcclGraphPeerCopy(int dstDevice, void *dst,
@@ -2363,6 +2735,11 @@ bool FastllmNcclGraphPeerCopy(int dstDevice, void *dst,
         FastllmCudaSetThreadError();
         return false;
     }
+
+#ifndef FASTLLM_USE_NCCL
+    FastllmCudaSetThreadError();
+    return false;
+#else
 
     int firstDevice = std::min(srcDevice, dstDevice);
     int secondDevice = std::max(srcDevice, dstDevice);
@@ -2432,16 +2809,10 @@ bool FastllmNcclGraphPeerCopy(int dstDevice, void *dst,
         std::fflush(stderr);
     }
     return ok;
+#endif
 }
 
-ncclComm_t GetNcclComm(int deviceId) {
-    if (g_ncclComms.find(deviceId) != g_ncclComms.end()) {
-        return g_ncclComms[deviceId];
-    }
-    printf("Error: No NCCL comm found for device %d\n", deviceId);
-    return nullptr;
-}
-
+#ifdef FASTLLM_USE_NCCL
 // 集合通信发射后是否立即同步：warmup/权重加载阶段返回 true 以防跨 rank 死锁，
 // warmup 结束后返回 false，稳态前向异步发射以恢复通信/计算重叠(见 FastllmCudaSetNcclForceSync)。
 // 流捕获期间必须返回 false：cudaStreamSynchronize 属于捕获期间被禁止的调用，会直接
@@ -2463,6 +2834,7 @@ static bool FastllmNcclPostSyncEnabled(cudaStream_t stream) {
     }
     return true;
 }
+#endif
 
 namespace {
 
@@ -3006,6 +3378,30 @@ static int FastllmNcclRootRank(int root) {
     return (root >= 0 && root < g_ncclWorldSize) ? root : -1;
 }
 
+#ifndef FASTLLM_USE_NCCL
+static bool FastllmPrepareHostCollectiveGroup(void *send, void *recv,
+                                             int count, int dataType, int deviceId) {
+    std::vector<int> devices;
+    std::map<int, int> ratios;
+    FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
+    std::vector<int> uniqueDevices = FastllmUniqueNcclDevices(devices);
+    if (uniqueDevices.size() <= 1) {
+        size_t bytes = (size_t)count * FastllmNcclDataTypeBytes(dataType);
+        if (send != recv && bytes > 0) {
+            FastllmCudaCopyFromDeviceToDevice(recv, send, bytes);
+        }
+        return false;
+    }
+    if (!FastllmInitNccl(uniqueDevices) ||
+        g_ncclRanks.find(deviceId) == g_ncclRanks.end()) {
+        FastllmCudaSetThreadError();
+        return false;
+    }
+    return true;
+}
+#endif
+
+#ifdef FASTLLM_USE_NCCL
 static bool FastllmNcclResolveDataType(int dataType, ncclDataType_t &ncclType, const char *opName) {
     if (dataType == fastllm::DataType::INT8) {
         ncclType = ncclInt8;
@@ -3031,6 +3427,7 @@ static bool FastllmNcclResolveDataType(int dataType, ncclDataType_t &ncclType, c
     FastllmCudaSetThreadError();
     return false;
 }
+#endif
 
 // Broadcasts from the root's send buffer into a per-rank receive buffer.  The
 // root may use distinct send/receive pointers, which lets hybrid EP broadcast
@@ -3039,6 +3436,23 @@ void FastllmNcclBroadcastFrom(void* send, void* recv, int count, int dataType, i
     if (send == nullptr || recv == nullptr || count <= 0) {
         return;
     }
+
+#ifndef FASTLLM_USE_NCCL
+    if (!FastllmPrepareHostCollectiveGroup(send, recv, count, dataType, deviceId)) {
+        return;
+    }
+    int fallbackRootRank = FastllmNcclRootRank(root);
+    if (fallbackRootRank < 0 || fallbackRootRank >= g_ncclWorldSize) {
+        std::fprintf(stderr,
+                     "Error: invalid root %d for host-staged broadcast on "
+                     "GPU %d.\n", root, deviceId);
+        FastllmCudaSetThreadError();
+        return;
+    }
+    FastllmRunHostCollective(FastllmHostCollectiveKind::Broadcast,
+                             send, recv, count, dataType, fallbackRootRank,
+                             deviceId);
+#else
 
     ncclComm_t comm = FindNcclCommNoLog(deviceId);
     if (comm == nullptr) {
@@ -3089,6 +3503,7 @@ void FastllmNcclBroadcastFrom(void* send, void* recv, int count, int dataType, i
         cudaError_t syncState = cudaStreamSynchronize(stream);
         checkCudaErrors("Error: CUDA error when synchronizing NCCL broadcast!", syncState);
     }
+#endif
 }
 
 void FastllmNcclBroadcast(void* data, int count, int dataType, int root, int deviceId) {
@@ -3102,6 +3517,18 @@ static void FastllmNcclAllReduceImpl(void* data, void* dest, int count,
     if (data == nullptr || dest == nullptr || count <= 0) {
         return;
     }
+
+#ifndef FASTLLM_USE_NCCL
+    if (!FastllmPrepareHostCollectiveGroup(data, dest, count, dataType, deviceId)) {
+        return;
+    }
+    if (allowCustomAllReduce &&
+        FastllmCudaCustomAllReduce(data, dest, count, dataType, deviceId)) {
+        return;
+    }
+    FastllmRunHostCollective(FastllmHostCollectiveKind::AllReduce,
+                             data, dest, count, dataType, -1, deviceId);
+#else
 
     if (allowCustomAllReduce &&
         FastllmCudaCustomAllReduce(data, dest, count, dataType, deviceId)) {
@@ -3211,6 +3638,7 @@ static void FastllmNcclAllReduceImpl(void* data, void* dest, int count,
         cudaError_t syncState = cudaStreamSynchronize(stream);
         checkCudaErrors("Error: CUDA error when synchronizing NCCL allreduce!", syncState);
     }
+#endif
 }
 
 void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int deviceId) {
@@ -3229,6 +3657,23 @@ void FastllmNcclReduce(void* data, void* dest, int count, int dataType, int root
     if (data == nullptr || dest == nullptr || count <= 0) {
         return;
     }
+
+#ifndef FASTLLM_USE_NCCL
+    if (!FastllmPrepareHostCollectiveGroup(data, dest, count, dataType, deviceId)) {
+        return;
+    }
+    int fallbackRootRank = FastllmNcclRootRank(root);
+    if (fallbackRootRank < 0 || fallbackRootRank >= g_ncclWorldSize) {
+        std::fprintf(stderr,
+                     "Error: invalid root %d for host-staged reduce on GPU "
+                     "%d.\n", root, deviceId);
+        FastllmCudaSetThreadError();
+        return;
+    }
+    FastllmRunHostCollective(FastllmHostCollectiveKind::Reduce,
+                             data, dest, count, dataType, fallbackRootRank,
+                             deviceId);
+#else
 
     ncclComm_t comm = FindNcclCommNoLog(deviceId);
     if (comm == nullptr) {
@@ -3274,4 +3719,5 @@ void FastllmNcclReduce(void* data, void* dest, int count, int dataType, int root
         cudaError_t syncState = cudaStreamSynchronize(stream);
         checkCudaErrors("Error: CUDA error when synchronizing NCCL reduce!", syncState);
     }
+#endif
 }

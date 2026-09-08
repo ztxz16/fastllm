@@ -5,6 +5,12 @@ project(fastllm LANGUAGES CXX)
 option(USE_NUMAS "use numas" ON)
 
 option(USE_CUDA "use CUDA" OFF)
+if(WIN32)
+    set(FASTLLM_NCCL_DEFAULT OFF)
+else()
+    set(FASTLLM_NCCL_DEFAULT ON)
+endif()
+option(USE_NCCL "use NCCL collectives with the CUDA backend" ${FASTLLM_NCCL_DEFAULT})
 option(CUDA_NO_TENSOR_CORE "Optimize for legacy CUDA GPUs which has Tensor Core." OFF)
 option(CUDA_MEM_DEBUG "Enable CUDA memory pool debug logging" OFF)
 
@@ -116,6 +122,8 @@ endif()
 message(STATUS "USE_NUMAS: ${USE_NUMAS}")
 
 message(STATUS "USE_CUDA: ${USE_CUDA}")
+
+message(STATUS "USE_NCCL: ${USE_NCCL}")
 
 message(STATUS "USE_ROCM: ${USE_ROCM}")
 
@@ -476,7 +484,31 @@ if (USE_CUDA)
         src/devices/multicuda/fastllm-custom-allreduce.cu)
 
     add_compile_definitions(FASTLLM_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
-    set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} cublasLt cublas nccl cuda ${CMAKE_DL_LIBS})
+    set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} cublasLt cublas cuda ${CMAKE_DL_LIBS})
+    if (USE_NCCL)
+        add_compile_definitions(FASTLLM_USE_NCCL=1)
+        if (WIN32)
+            set(NCCL_ROOT "" CACHE PATH "Root of an optional Windows NCCL-compatible SDK")
+            find_path(NCCL_INCLUDE_DIR nccl.h
+                HINTS "${NCCL_ROOT}" "$ENV{NCCL_ROOT}"
+                PATH_SUFFIXES include)
+            find_library(NCCL_LIBRARY
+                NAMES nccl
+                HINTS "${NCCL_ROOT}" "$ENV{NCCL_ROOT}"
+                PATH_SUFFIXES lib lib64 lib/x64)
+            if (NOT NCCL_INCLUDE_DIR OR NOT NCCL_LIBRARY)
+                message(FATAL_ERROR
+                    "USE_NCCL=ON, but nccl.h/nccl.lib were not found. "
+                    "Set NCCL_ROOT to a compatible SDK or configure with -DUSE_NCCL=OFF.")
+            endif()
+            include_directories("${NCCL_INCLUDE_DIR}")
+            list(APPEND FASTLLM_LINKED_LIBS "${NCCL_LIBRARY}")
+        else()
+            list(APPEND FASTLLM_LINKED_LIBS nccl)
+        endif()
+    else()
+        message(STATUS "NCCL collectives: OFF (host-staged CUDA fallback enabled)")
+    endif()
     set(CMAKE_CUDA_ARCHITECTURES ${FASTLLM_CUDA_ARCHITECTURES})
 endif()
 
@@ -770,6 +802,7 @@ add_library(fastllm_tools SHARED ${FASTLLM_CXX_SOURCES} ${FASTLLM_CUDA_SOURCES} 
 target_link_libraries(fastllm_tools PUBLIC ${FASTLLM_LINKED_LIBS})
 
 set(BUILD_INFO_USE_CUDA "false")
+set(BUILD_INFO_USE_NCCL "false")
 set(BUILD_INFO_USE_ROCM "false")
 set(BUILD_INFO_USE_NUMAS "false")
 set(BUILD_INFO_USE_TFACC "false")
@@ -777,6 +810,9 @@ set(BUILD_INFO_USE_TOPS "false")
 set(BUILD_INFO_USE_IVCOREX "false")
 if (USE_CUDA)
     set(BUILD_INFO_USE_CUDA "true")
+endif()
+if (USE_CUDA AND USE_NCCL)
+    set(BUILD_INFO_USE_NCCL "true")
 endif()
 if (USE_ROCM)
     set(BUILD_INFO_USE_ROCM "true")
@@ -794,7 +830,7 @@ if (USE_IVCOREX)
     set(BUILD_INFO_USE_IVCOREX "true")
 endif()
 file(WRITE ${CMAKE_BINARY_DIR}/build_info.json
-"{\n  \"USE_CUDA\": ${BUILD_INFO_USE_CUDA},\n  \"USE_ROCM\": ${BUILD_INFO_USE_ROCM},\n  \"USE_NUMAS\": ${BUILD_INFO_USE_NUMAS},\n  \"USE_TFACC\": ${BUILD_INFO_USE_TFACC},\n  \"USE_TOPS\": ${BUILD_INFO_USE_TOPS},\n  \"USE_IVCOREX\": ${BUILD_INFO_USE_IVCOREX}\n}\n")
+"{\n  \"USE_CUDA\": ${BUILD_INFO_USE_CUDA},\n  \"USE_NCCL\": ${BUILD_INFO_USE_NCCL},\n  \"USE_ROCM\": ${BUILD_INFO_USE_ROCM},\n  \"USE_NUMAS\": ${BUILD_INFO_USE_NUMAS},\n  \"USE_TFACC\": ${BUILD_INFO_USE_TFACC},\n  \"USE_TOPS\": ${BUILD_INFO_USE_TOPS},\n  \"USE_IVCOREX\": ${BUILD_INFO_USE_IVCOREX}\n}\n")
 
 if (${CMAKE_HOST_WIN32})
     add_custom_command(

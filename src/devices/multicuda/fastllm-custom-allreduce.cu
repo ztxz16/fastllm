@@ -60,18 +60,19 @@ enum class CustomArEnableMode {
 CustomArEnableMode CustomArModeFromEnv() {
     static const CustomArEnableMode mode = []() {
         const char *env = std::getenv("FASTLLM_CUDA_CUSTOM_ALLREDUCE");
-        if (env == nullptr || env[0] == '\0') {
-            return CustomArEnableMode::Auto;
-        }
-        std::string value(env);
+        std::string value(env == nullptr ? "" : env);
         std::transform(value.begin(), value.end(), value.begin(),
                        [](unsigned char c) { return (char)std::tolower(c); });
         if (value == "1" || value == "true" || value == "on" ||
             value == "yes") {
             return CustomArEnableMode::Forced;
         }
-        if (value == "auto") {
+        if (value.empty() || value == "auto") {
+#ifdef FASTLLM_USE_NCCL
             return CustomArEnableMode::Auto;
+#else
+            return CustomArEnableMode::Forced;
+#endif
         }
         return CustomArEnableMode::Disabled;
     }();
@@ -2414,7 +2415,11 @@ bool FastllmCudaCustomAllReduceInit(const std::vector<int> &devices) {
         lock.unlock();
         std::fprintf(stderr,
                      "[Fastllm] graph-safe custom all-reduce is unavailable; "
+#ifdef FASTLLM_USE_NCCL
                      "falling back to NCCL.\n");
+#else
+                     "falling back to host-staged collectives.\n");
+#endif
         std::fflush(stderr);
         return false;
     }
