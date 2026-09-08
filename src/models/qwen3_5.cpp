@@ -4773,7 +4773,33 @@ namespace fastllm {
             if (src.dataDevice == DataDevice::CPU && src.cpuData == nullptr) {
                 return false;
             }
-            dst.CopyFrom(src);
+            if (src.dataDevice == DataDevice::CUDA) {
+                // Copy directly to the CPU snapshot, avoiding a temporary CUDA
+                // allocation and cross-device transfers between TP ranks.
+                dst.FreeSpace();
+                dst.dataType = src.dataType;
+                dst.dataDevice = DataDevice::CPU;
+                dst.dataDeviceIds.clear();
+                dst.expansionDims.clear();
+                dst.Resize(src.dims);
+                if (!src.expansionDims.empty() && src.expansionDims != src.dims) {
+                    dst.Expansion(src.expansionDims);
+                }
+                dst.Allocate(false);
+                int oldDevice = FastllmCudaGetDevice();
+                int sourceDevice = src.dataDeviceIds.empty()
+                    ? GetPointerDeviceId(src.cudaData) : src.dataDeviceIds[0];
+                if (sourceDevice >= 0) {
+                    FastllmCudaSetDevice(sourceDevice);
+                }
+                FastllmCudaCopyFromDeviceToHost(
+                    dst.cpuData, src.cudaData, dst.GetBytes());
+                FastllmCudaSetDevice(oldDevice);
+                dst.name = src.name;
+                dst.cacheUid = src.cacheUid;
+            } else {
+                dst.CopyFrom(src);
+            }
             dst.isKVCache = true;
             dst.isLinearAttention = src.isLinearAttention;
             dst.isLinearAttentionTransposed = src.isLinearAttentionTransposed;
@@ -4784,7 +4810,6 @@ namespace fastllm {
             dst.multiDeviceData = false;
             dst.multiDeviceDatas.clear();
             dst.ClearTensorParallelLayout();
-            dst.ToDevice(DataDevice::CPU, true);
             return dst.cpuData != nullptr;
         }
 
