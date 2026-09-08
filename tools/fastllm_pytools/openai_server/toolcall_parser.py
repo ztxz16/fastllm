@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from .protocal.openai_protocol import (
     ChatCompletionRequest,
+    DeltaMessage,
     ExtractedToolCallInformation,
 )
 from .tool_parsers import ToolParserManager
@@ -129,6 +130,7 @@ class FunctionCallParser:
         self.stream_text = ""
         self._stream_final_diagnostics: Optional[
             List[ToolCallDiagnostic]] = None
+        self._stream_final_result = ToolCallParseResult()
 
     @classmethod
     def from_request(
@@ -183,6 +185,10 @@ class FunctionCallParser:
     def has_valid_streamed_tool_calls(self) -> bool:
         return bool(self.valid_stream_tool_indices)
 
+    @property
+    def incomplete_tool_call(self) -> bool:
+        return bool(getattr(self.parser, "incomplete_tool_call", False))
+
     def get_token_ids(self, text: str) -> list[int]:
         get_token_ids = getattr(self.parser, "get_token_ids", None)
         if callable(get_token_ids):
@@ -231,11 +237,15 @@ class FunctionCallParser:
             strict_tool_names=tuple(strict_tool_names),
         )
 
-    def parse_non_stream(self, text: str) -> ToolCallParseResult:
+    def parse_non_stream(
+        self, text: str, *, finish_reason: Optional[str] = None,
+    ) -> ToolCallParseResult:
         if not self.has_tools or self.tool_choice == "none":
             return ToolCallParseResult(content=text)
 
         extracted = self.parser.extract_tool_calls(text, self._request)
+        if finish_reason == "length" and self.incomplete_tool_call:
+            return ToolCallParseResult(content=extracted.content)
         validation = self.validate_tool_calls(extracted.tool_calls)
         if self.has_tool_call(text) and not validation.valid_tool_calls:
             if not validation.invalid_tool_calls:
@@ -276,6 +286,11 @@ class FunctionCallParser:
             delta_token_ids=list(delta_token_ids),
             request=self._request,
         )
+        return self._validate_stream_delta(delta)
+
+    def _validate_stream_delta(
+        self, delta: Optional[DeltaMessage],
+    ) -> ToolCallParseResult:
         if delta is None:
             return ToolCallParseResult()
 
@@ -464,8 +479,10 @@ class FunctionCallParser:
             has_invalid_tool_block=has_invalid_tool_block,
         )
 
-    def finalize_stream(self) -> List[ToolCallDiagnostic]:
-        return self._finalize_stream_diagnostics()
+    def finalize_stream(
+        self, *, finish_reason: Optional[str] = None,
+    ) -> List[ToolCallDiagnostic]:
+        return self._finalize_stream_diagnostics(finish_reason=finish_reason)
 
     def flush_stream_tool_calls(self) -> ToolCallParseResult:
         diagnostics = self._finalize_stream_diagnostics()
@@ -474,35 +491,50 @@ class FunctionCallParser:
                 diagnostics=diagnostics,
                 has_invalid_tool_block=True,
             )
-        content = None
+        content = self._stream_final_result.content
+        self._stream_final_result.content = None
         content_flusher = getattr(self.parser, "flush_streaming_content", None)
         if callable(content_flusher):
-            content = content_flusher()
-        tool_calls: List[Any] = []
+            pending = content_flusher()
+            if pending:
+                content = (content or "") + pending
+        tool_calls = list(self._stream_final_result.valid_tool_calls)
+        self._stream_final_result.valid_tool_calls.clear()
         for raw_index in sorted(self.buffered_stream_tool_calls):
             tool_calls.extend(self.buffered_stream_tool_calls[raw_index])
         self.buffered_stream_tool_calls.clear()
+        tool_calls.sort(key=_tool_call_index)
         return ToolCallParseResult(
             content=content,
             tools_called=bool(tool_calls),
             valid_tool_calls=tool_calls,
         )
 
-    def _finalize_stream_diagnostics(self) -> List[ToolCallDiagnostic]:
+    def _finalize_stream_diagnostics(
+        self, *, finish_reason: Optional[str] = None,
+    ) -> List[ToolCallDiagnostic]:
         if self._stream_final_diagnostics is not None:
             return list(self._stream_final_diagnostics)
         diagnostics: List[ToolCallDiagnostic] = []
+        finalizer = getattr(self.parser, "finalize_streaming", None)
+        if (self.has_tools and self.tool_choice != "none"
+                and callable(finalizer)):
+            self._stream_final_result = self._validate_stream_delta(
+                finalizer(self._request))
+            if self._stream_final_result.invalid_tool_calls:
+                diagnostics.extend(self._stream_final_result.diagnostics)
+        truncated = finish_reason == "length" and self.incomplete_tool_call
         parser_error = None
         parser_error_fn = getattr(self.parser, "streaming_parse_error", None)
         if callable(parser_error_fn):
             parser_error = parser_error_fn()
-        if parser_error:
+        if parser_error and not truncated:
             diagnostics.append(
                 ToolCallDiagnostic(
                     code="malformed_tool_block",
                     message=str(parser_error),
                 ))
-        elif (self.has_tool_call(self.stream_text)
+        elif (not truncated and self.has_tool_call(self.stream_text)
                 and not self.valid_stream_tool_indices
                 and not self.invalid_stream_tool_indices):
             extracted = self.parser.extract_tool_calls(
@@ -516,7 +548,8 @@ class FunctionCallParser:
                             "ended before a complete tool call was parsed"
                         ),
                     ))
-        if self._requires_tool_call() and not self.has_valid_streamed_tool_calls:
+        if (not truncated and self._requires_tool_call()
+                and not self.has_valid_streamed_tool_calls):
             required_name = self._named_tool_choice()
             message = (
                 f"tool_choice requires function {required_name!r} but no "

@@ -1668,6 +1668,8 @@ class FastLLmCompletion:
       self,
       result: str,
       request: ChatCompletionRequest,
+      *,
+      finish_reason: Optional[str] = None,
   ) -> Union[ErrorResponse, ExtractedToolCallInformation]:
       if not request.tools:
           return ExtractedToolCallInformation(
@@ -1677,7 +1679,7 @@ class FastLLmCompletion:
           )
 
       parser = self._create_function_call_parser(request)
-      parsed = parser.parse_non_stream(result)
+      parsed = parser.parse_non_stream(result, finish_reason=finish_reason)
       if parsed.has_invalid_tool_block:
           diagnostics = self._format_tool_call_diagnostics(parsed.diagnostics)
           logging.warning("Invalid non-stream tool call rejected: %s",
@@ -3198,7 +3200,10 @@ class FastLLmCompletion:
           handle, response_statistics, input_token_len, completion_tokens)
       output_tokens = usage.completion_tokens or 0
 
-      tool_call_info = self._parse_non_stream_tool_calls(result, request)
+      finish_reason = self._chat_finish_reason(
+          output_tokens, request.max_tokens or 32768, stopped_by_stop_string)
+      tool_call_info = self._parse_non_stream_tool_calls(
+          result, request, finish_reason=finish_reason)
       if isinstance(tool_call_info, ErrorResponse):
           if request_id in self.conversation_handles:
               del self.conversation_handles[request_id]
@@ -3225,9 +3230,7 @@ class FastLLmCompletion:
                   reasoning_content=reasoning_content or None,
               ),
               logprobs=None,
-              finish_reason=self._chat_finish_reason(
-                  output_tokens, request.max_tokens or 32768,
-                  stopped_by_stop_string),
+              finish_reason=finish_reason,
           )
 
       response = ChatCompletionResponse(
@@ -3518,7 +3521,8 @@ class FastLLmCompletion:
             stopped_by_stop_string)
         final_stream_error_data = None
         if request.tools and tool_call_parser:
-            final_diagnostics = tool_call_parser.finalize_stream()
+            final_diagnostics = tool_call_parser.finalize_stream(
+                finish_reason=finish_reason)
             if final_diagnostics:
                 diagnostics = self._format_tool_call_diagnostics(
                     final_diagnostics)
@@ -3537,7 +3541,8 @@ class FastLLmCompletion:
                     f"Invalid tool call: {diagnostics}",
                     err_type = "invalid_tool_call",
                 )
-            elif tool_call_parser.has_valid_streamed_tool_calls:
+            elif (tool_call_parser.has_valid_streamed_tool_calls
+                  and not tool_call_parser.incomplete_tool_call):
                 finish_reason = 'tool_calls'
         if final_stream_error_data is not None:
             data = final_stream_error_data
