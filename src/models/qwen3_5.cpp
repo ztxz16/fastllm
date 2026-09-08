@@ -29852,27 +29852,43 @@ namespace fastllm {
             return -1;
         }
 
-        Attention(q, cache.key, cache.value, *GetEmptyData(), attenOutput,
-                  q.dims[0] / cache.key.dims[0], 1.0f / std::sqrt((float)this->head_dim), 1);
-        PermuteSelf(attenOutput, {1, 0, 2});
-        attenOutput.Reshape({1, seqLen, -1});
-        Sigmoid(gate, gate);
-        if (gate.dataType != attenOutput.dataType) {
-            ToDataType(gate, attenOutput.dataType);
-        }
-        MulTo(attenOutput, gate);
-        Linear(attenOutput, weight[prefix + "self_attn.o_proj.weight"], *GetEmptyData(), projected);
-        AddTo(hiddenStates, projected);
-
-        RunMtpFeedForward(device, hiddenStates);
-
+        // Append every K/V row before selecting the output. With the empty
+        // mask and maskType=1 below, each query sees the same full KV cache;
+        // attention and the remaining projections/MLP are row-independent.
+        // Keep short KV and the 128-wide FlashInfer path's computation shapes
+        // unchanged to avoid unnecessary floating-point rounding differences.
         sampleRow = std::max(0, std::min(sampleRow, seqLen - 1));
-        Data logits, sampleHidden;
-        Data *sampleHiddenPtr = &hiddenStates;
-        if (seqLen > 1) {
+        const bool sampleSingleRow = seqLen > 1 && head_dim == 256 &&
+                                     cache.tokens > 4096;
+        Data sampleQ, sampleGate, sampleHidden;
+        if (sampleSingleRow) {
+            Split(q, 1, sampleRow, sampleRow + 1, sampleQ);
+            Split(gate, 1, sampleRow, sampleRow + 1, sampleGate);
+            Split(hiddenStates, 1, sampleRow, sampleRow + 1, sampleHidden);
+        }
+        Data &query = sampleSingleRow ? sampleQ : q;
+        Data &outputGate = sampleSingleRow ? sampleGate : gate;
+        Data *sampleHiddenPtr = sampleSingleRow ? &sampleHidden : &hiddenStates;
+
+        Attention(query, cache.key, cache.value, *GetEmptyData(), attenOutput,
+                  query.dims[0] / cache.key.dims[0], 1.0f / std::sqrt((float)this->head_dim), 1);
+        PermuteSelf(attenOutput, {1, 0, 2});
+        attenOutput.Reshape({1, sampleSingleRow ? 1 : seqLen, -1});
+        Sigmoid(outputGate, outputGate);
+        if (outputGate.dataType != attenOutput.dataType) {
+            ToDataType(outputGate, attenOutput.dataType);
+        }
+        MulTo(attenOutput, outputGate);
+        Linear(attenOutput, weight[prefix + "self_attn.o_proj.weight"], *GetEmptyData(), projected);
+        AddTo(*sampleHiddenPtr, projected);
+
+        RunMtpFeedForward(device, *sampleHiddenPtr);
+
+        if (!sampleSingleRow && seqLen > 1) {
             Split(hiddenStates, 1, sampleRow, sampleRow + 1, sampleHidden);
             sampleHiddenPtr = &sampleHidden;
         }
+        Data logits;
         RMSNorm(*sampleHiddenPtr, weight["mtp.norm.weight"], rms_norm_eps, *sampleHiddenPtr);
         if (sampledHiddenStates != nullptr) {
             sampledHiddenStates->CopyFrom(*sampleHiddenPtr);

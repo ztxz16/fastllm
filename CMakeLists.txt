@@ -670,6 +670,13 @@ if (UNIT_TEST)
     target_link_libraries(contextExtensionRegression fastllm)
     add_test(NAME context_extension_cpu COMMAND contextExtensionRegression)
     if (USE_CUDA AND NOT USE_ROCM)
+        add_executable(qwen35_mtp_sample_row_test test/basic/test_qwen35_mtp_sample_row.cpp)
+        target_link_libraries(qwen35_mtp_sample_row_test PRIVATE fastllm)
+        add_test(NAME qwen35_mtp_sample_row COMMAND qwen35_mtp_sample_row_test)
+        add_test(NAME qwen35_mtp_sample_row_moe COMMAND qwen35_mtp_sample_row_test --moe)
+        set_tests_properties(qwen35_mtp_sample_row qwen35_mtp_sample_row_moe
+                             PROPERTIES LABELS cuda SKIP_RETURN_CODE 77)
+
         add_executable(qwen35_streaming_weights_test test/basic/test_qwen35_streaming_weights.cpp)
         target_link_libraries(qwen35_streaming_weights_test PRIVATE fastllm)
         add_test(NAME qwen35_streaming_tp_weights COMMAND qwen35_streaming_weights_test)
