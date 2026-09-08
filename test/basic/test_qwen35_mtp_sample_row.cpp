@@ -169,7 +169,36 @@ void RunCase(DraftModel &model, int headDim, int context, int length, int sample
                     std::fabs(a - b) <= 0.005f + 0.005f * std::fabs(b),
                 "selected hidden state differs from full-query reference");
     }
-    Require(token == batchTokens[0], "draft token differs from full-query reference");
+    if (token != batchTokens[0]) {
+        Require(headDim == 256 && context + length > 4096 && sampleRow == length - 1,
+                "draft token changed outside the split-attention path");
+        Data &head = model.weight["lm_head.weight"];
+        Require(token >= 0 && token < head.dims[0], "draft token is outside the vocabulary");
+        std::vector<uint16_t> weights(head.Count(0));
+        FastllmCudaCopyFromDeviceToHost(weights.data(), head.cudaData, weights.size() * sizeof(uint16_t));
+        std::vector<double> aScores(head.dims[0]), bScores(head.dims[0]);
+        double maxLogitDelta = 0.0;
+        for (int row = 0; row < head.dims[0]; ++row) {
+            for (int col = 0; col < DraftModel::width; ++col) {
+                double w = half_to_float(weights[row * DraftModel::width + col]);
+                aScores[row] += w * half_to_float(actual[col]);
+                bScores[row] += w * half_to_float(expected[col]);
+            }
+            maxLogitDelta = std::max(maxLogitDelta, std::abs(aScores[row] - bScores[row]));
+        }
+        auto rounded = [](double score) { return float_to_half(float(score)); };
+        // The full-query reference still uses the old FP16 PV reduction.
+        // Retain the hidden-state tolerance, check the new argmax, and only
+        // allow a reference ranking change within the measured logit error:
+        // two candidate scores can move apart by at most 2 * maxLogitDelta.
+        double referenceGap = *std::max_element(bScores.begin(), bScores.end()) - bScores[token];
+        Require(referenceGap <= 2 * maxLogitDelta &&
+                rounded(aScores[token]) == rounded(*std::max_element(aScores.begin(), aScores.end())),
+                "draft token differs beyond the measured reference-logit error");
+        std::cout << "near-equal reference logits: token=" << token
+                  << " reference=" << batchTokens[0]
+                  << " margin=" << referenceGap << " max_logit_delta=" << maxLogitDelta << '\n';
+    }
     std::cout << "moe=" << model.moe << " head_dim=" << headDim
               << " context=" << context << " query=" << length
               << " sample_row=" << sampleRow << " max_abs=" << maxError << " PASS\n";

@@ -692,6 +692,12 @@ if (UNIT_TEST)
     endif()
 
     if (USE_CUDA AND NOT USE_ROCM)
+        add_executable(cuda_single_query_attention_test test/basic/test_cuda_single_query_attention.cpp)
+        target_link_libraries(cuda_single_query_attention_test PRIVATE fastllm)
+        target_include_directories(cuda_single_query_attention_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME cuda_single_query_attention COMMAND cuda_single_query_attention_test)
+        set_tests_properties(cuda_single_query_attention PROPERTIES LABELS cuda SKIP_RETURN_CODE 77)
+
         add_executable(cudaGgufChunkedDequantRegression test/ops/cudaGgufChunkedDequantRegression.cu)
         target_link_libraries(cudaGgufChunkedDequantRegression PRIVATE fastllm)
         target_include_directories(cudaGgufChunkedDequantRegression PRIVATE src/devices/cuda)
