@@ -40,7 +40,7 @@ _WEB_TOOLS = (
 )
 _WORKSPACE_TOOLS = (
     "read",
-    "bash",
+    "powershell" if sys.platform == "win32" else "bash",
     "edit",
     "write",
     "grep",
@@ -279,14 +279,15 @@ class PiAgentRuntime:
         self.context_window = max(4_096, int(context_window))
         self.max_tokens = max(64, int(max_tokens))
         self.max_turns = max(1, int(max_turns))
-        self.binary = Path(binary).resolve() if binary else _resource_path("bin", "pi")
+        executable = "pi.exe" if sys.platform == "win32" else "pi"
+        self.binary = Path(binary).resolve() if binary else _resource_path("bin", executable)
         self.extension = _resource_path("extensions", "project_tools.ts")
         self._validate_installation()
 
     def _validate_installation(self) -> None:
         machine = platform.machine().lower()
-        if not sys.platform.startswith("linux") or machine not in {"x86_64", "amd64"}:
-            raise PiAgentError("ftllm-agent-runtime currently supports Linux x86-64 only")
+        if not (sys.platform.startswith("linux") or sys.platform == "win32") or machine not in {"x86_64", "amd64"}:
+            raise PiAgentError("ftllm-agent-runtime supports Linux and Windows x86-64 only")
         if not self.binary.is_file():
             raise PiAgentError(f"packaged Pi executable is missing: {self.binary}")
         if not os.access(self.binary, os.X_OK):
@@ -316,7 +317,7 @@ class PiAgentRuntime:
             "pi_version": detected or PI_VERSION,
             "binary": str(self.binary),
             "binary_bytes": self.binary.stat().st_size,
-            "platform": "linux_x86_64",
+            "platform": "win_amd64" if sys.platform == "win32" else "linux_x86_64",
             "tools": list(_ALL_TOOLS),
         }
 
@@ -574,6 +575,7 @@ class PiAgentRuntime:
                     encoding="utf-8",
                     errors="replace",
                     bufsize=1,
+                    **({"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}),
                 )
             except BaseException:
                 if web_bridge:

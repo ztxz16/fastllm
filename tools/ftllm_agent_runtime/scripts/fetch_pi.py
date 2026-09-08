@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch and verify the pinned Pi Linux x86-64 standalone executable."""
+"""Fetch and verify the pinned Pi Linux/Windows x86-64 standalone executable."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import sys
 import tarfile
 import tempfile
 import urllib.request
+import zipfile
 from pathlib import Path
 
 
@@ -22,6 +23,10 @@ ARCHIVE_URL = (
     f"v{PI_VERSION}/{ARCHIVE_NAME}"
 )
 ARCHIVE_SHA256 = "c2f3c3e6a1850bd87654cc3ca8811013272397c3d042a4e2a64c43ee1b423972"
+if sys.platform == "win32":
+    ARCHIVE_NAME = "pi-windows-x64.zip"
+    ARCHIVE_URL = f"https://github.com/earendil-works/pi/releases/download/v{PI_VERSION}/{ARCHIVE_NAME}"
+    ARCHIVE_SHA256 = "03b2318774f18721e959d9f8f3340a9f942e7aa516fb7030d3007a12a40a4a97"
 LICENSE_URL = (
     "https://raw.githubusercontent.com/earendil-works/pi/"
     f"v{PI_VERSION}/LICENSE"
@@ -30,7 +35,7 @@ LICENSE_SHA256 = "0457f5bcec3b3b211605dfb5d1a49042fd638f3686a410fe099c24a25af13c
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_ROOT = ROOT / "src" / "ftllm_agent_runtime"
-BINARY_PATH = PACKAGE_ROOT / "bin" / "pi"
+BINARY_PATH = PACKAGE_ROOT / "bin" / ("pi.exe" if sys.platform == "win32" else "pi")
 PACKAGE_JSON_PATH = PACKAGE_ROOT / "bin" / "package.json"
 PHOTON_WASM_PATH = PACKAGE_ROOT / "bin" / "photon_rs_bg.wasm"
 THEME_ROOT = PACKAGE_ROOT / "bin" / "theme"
@@ -60,6 +65,10 @@ def verified(data: bytes, expected: str, label: str) -> bytes:
 
 
 def extract_member(archive: bytes, name: str) -> bytes:
+    if sys.platform == "win32":
+        with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
+            member = "pi.exe" if name == "pi/pi" else name.removeprefix("pi/")
+            return bundle.read(member)
     with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as bundle:
         member = bundle.getmember(name)
         if not member.isfile():
@@ -106,7 +115,7 @@ def cached_archive(url: str, digest: str, cached: Path | None, offline: bool) ->
 def load_archive(archive_path: Path | None, cache_dir: Path | None, offline: bool) -> bytes:
     if archive_path is not None:
         return verified(archive_path.expanduser().read_bytes(), ARCHIVE_SHA256, ARCHIVE_NAME)
-    cached = cache_dir / f"pi-{PI_VERSION}-linux-x64.tar.gz" if cache_dir else None
+    cached = cache_dir / ARCHIVE_NAME.replace("pi-", f"pi-{PI_VERSION}-", 1) if cache_dir else None
     return cached_archive(ARCHIVE_URL, ARCHIVE_SHA256, cached, offline)
 
 
@@ -115,15 +124,15 @@ def main() -> int:
     parser.add_argument(
         "--archive",
         type=Path,
-        help="Use an already-downloaded pi-linux-x64.tar.gz archive",
+        help="Use an already-downloaded archive for the current platform",
     )
     parser.add_argument("--cache-dir", type=Path, help="Cache the verified pinned Pi archive")
     parser.add_argument("--offline", action="store_true", help="Use local files only")
     args = parser.parse_args()
 
     machine = platform.machine().lower()
-    if not sys.platform.startswith("linux") or machine not in {"x86_64", "amd64"}:
-        parser.error("this prototype supports only Linux x86-64")
+    if not (sys.platform.startswith("linux") or sys.platform == "win32") or machine not in {"x86_64", "amd64"}:
+        parser.error("supports only Linux and Windows x86-64")
 
     archive = load_archive(args.archive, args.cache_dir, args.offline)
 
@@ -133,6 +142,17 @@ def main() -> int:
     atomic_write(BINARY_PATH, binary, 0o755)
     atomic_write(PACKAGE_JSON_PATH, package_json, 0o644)
     atomic_write(PHOTON_WASM_PATH, photon_wasm, 0o644)
+    if sys.platform == "win32":
+        # The Windows distribution also has native clipboard modules loaded
+        # dynamically by Bun. Preserve their relative node_modules layout.
+        with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
+            for member in bundle.infolist():
+                if member.is_dir() or not member.filename.startswith("node_modules/"):
+                    continue
+                destination = (PACKAGE_ROOT / "bin" / member.filename).resolve()
+                if not destination.is_relative_to((PACKAGE_ROOT / "bin").resolve()):
+                    raise RuntimeError(f"Unsafe Pi archive member: {member.filename}")
+                atomic_write(destination, bundle.read(member), 0o644)
     for theme_name in ("dark.json", "light.json", "theme-schema.json"):
         atomic_write(
             THEME_ROOT / theme_name,
@@ -142,7 +162,8 @@ def main() -> int:
 
     license_text = b""
     if LICENSE_PATH.is_file():
-        cached_license = LICENSE_PATH.read_bytes()
+        # Git may check this text file out with CRLF on Windows.
+        cached_license = LICENSE_PATH.read_bytes().replace(b"\r\n", b"\n")
         if sha256(cached_license) == LICENSE_SHA256:
             license_text = cached_license
             print(f"Using verified cached Pi license: {LICENSE_PATH}", flush=True)

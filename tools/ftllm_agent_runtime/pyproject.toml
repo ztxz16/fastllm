@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ftllm-agent-runtime"
 version = "0.3.2"
-description = "Linux runtime bridge between FastLLM WebUI and Pi Agent"
+description = "Linux and Windows runtime bridge between FastLLM WebUI and Pi Agent"
 readme = "README.md"
 requires-python = ">=3.9"
 license = {file = "LICENSE"}
@@ -16,6 +16,7 @@ classifiers = [
   "Development Status :: 3 - Alpha",
   "License :: OSI Approved :: Apache Software License",
   "Operating System :: POSIX :: Linux",
+  "Operating System :: Microsoft :: Windows",
   "Programming Language :: Python :: 3",
 ]
 dependencies = []
@@ -33,6 +34,7 @@ where = ["src"]
 ftllm_agent_runtime = [
   "bin/*",
   "bin/theme/*.json",
+  "bin/node_modules/**/*",
   "extensions/*.ts",
   "licenses/*",
 ]

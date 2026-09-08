@@ -1,10 +1,12 @@
 # ftllm-agent-runtime
 
-Linux x86-64 companion wheel for FastLLM WebUI. It bundles the official Pi
+Linux and Windows x86-64 companion wheel for FastLLM WebUI. It bundles the official Pi
 standalone executable and exposes a small Python API over Pi's JSONL RPC mode.
 End users do not need Node.js, npm, or Bun.
 
-Runtime requirements are CPython 3.9+, Linux x86-64, and glibc 2.17 or newer.
+Runtime requirements are CPython 3.9+ and either Linux x86-64 with glibc 2.17+
+or Windows x64. The Windows portable build (`../../make_portable.ps1`) bundles
+Python, Pi, ripgrep and fd together; it uses Windows PowerShell for shell tools.
 The wheel has no additional Python package dependencies. The pinned 0.84.4
 prototype is approximately 37 MiB to download and 102 MiB after installation.
 
@@ -24,7 +26,7 @@ through an authenticated, request-scoped localhost bridge.
 
 Callers can explicitly pass `working_directory` to create a coding-agent run
 over a real directory. That opt-in mode starts Pi in the selected directory,
-loads its `AGENTS.md`/`CLAUDE.md` context, and enables `read`, `bash`, `edit`,
+loads its `AGENTS.md`/`CLAUDE.md` context, and enables `read`, `bash` (`powershell` on Windows), `edit`,
 `write`, `grep`, `find`, and `ls`. Those tools can modify files and execute
 commands with the permissions of the hosting process, so applications should
 validate and clearly display the selected directory before starting a run.
