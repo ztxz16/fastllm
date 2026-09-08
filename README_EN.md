@@ -358,7 +358,7 @@ See the [dynamic quantization guide](docs/dtype_config.md) for layer-specific co
 
 ## Build from source
 
-Building requires a C++17 compiler, Make, and CMake. GCC/G++ 9.4+ and CMake 3.23+ are recommended. Linux NUMA builds normally require `libnuma-dev`. Install a compatible CUDA Toolkit and NCCL before a CUDA build.
+Building requires a C++17 compiler and CMake; Linux builds also use Make. GCC/G++ 9.4+ and CMake 3.23+ are recommended. Linux NUMA builds normally require `libnuma-dev`. Install a compatible CUDA Toolkit before a CUDA build. Linux CUDA builds enable NCCL by default and require its development libraries. Without NCCL, explicitly pass `-DUSE_NCCL=OFF` to use the fallback collectives.
 
 ~~~bash
 # Ubuntu/Debian base dependencies
@@ -376,8 +376,21 @@ bash install.sh -DUSE_CUDA=ON -DCUDA_ARCH=89 \
 bash install.sh
 ~~~
 
+On Windows, Visual Studio 2022 and the repository PowerShell script can build a wheel directly:
+
+~~~powershell
+# CPU + CUDA (uses the fallback implementation when NCCL is unavailable)
+.\make_whl.ps1
+
+# CPU-only
+.\make_whl.ps1 -CpuOnly
+~~~
+
 Additional platform documentation:
 
+- [Windows wheel build guide](docs/windows-wheel.md)
+- [Windows portable Electron desktop application](desktop/README.md#windows-构建)
+- [Windows portable CLI runtime](docs/windows-portable.md)
 - [ROCm build and wheel packaging](docs/rocm.md)
 - [TFACC platform](docs/tfacc.md)
 - [Examples, Android, and other platforms](example/README.md)

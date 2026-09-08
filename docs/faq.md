@@ -100,21 +100,15 @@ cmake .. -DFASTLLM_LINKED_LIBS=stdc++fs
 >     self._handle = _dlopen(self._name, mode)  
 > FileNotFoundError: Could not find module 'tools\fastllm_pytools\fastllm_tools.dll' (or one of its dependencies). Try using the full path with constructor syntax.
 
-**解决办法：** 非CPU编译时，部分版本的python存在这一问题。
+**解决办法：** 新版 Windows 加载器会自动搜索 wheel 目录、`%CUDA_PATH%\bin`、
+Python 环境以及已安装的 `ftllmdepend` 包。请先确认 CUDA Toolkit 的版本与构建
+wheel 时使用的版本兼容，并确认 `%CUDA_PATH%\bin` 中存在 `cudart64_*.dll`、
+`cublas64_*.dll` 和 `cublasLt64_*.dll`。也可以把这些 DLL 所在目录加入 `PATH`，
+不再需要把系统 DLL 手工复制到 Python 包目录。
 
-GPU编译时，根据使用的CUDA版本，将cudart cublas的相关dll文件复制到fastllm_tools同一目录下，例如：
-
-* CUDA 9.2
-  * %CUDA_PATH%\bin\cublas64_92.dll
-  * %CUDA_PATH%\bin\cudart64_92.dll
-* CUDA 11.x 
-  * %CUDA_PATH%\bin\cudart64_110.dll
-  * %CUDA_PATH%\bin\cublas64_11.dll
-  * %CUDA_PATH%\bin\cublasLt64_11.dll
-* CUDA 12.x 
-  * %CUDA_PATH%\bin\cudart64_12.dll
-  * %CUDA_PATH%\bin\cublas64_12.dll
-  * %CUDA_PATH%\bin\cublasLt64_12.dll
+由 `make_whl.ps1` 生成的 CUDA wheel 同时带有 `fastllm_tools-cpu.dll`。CUDA 主库
+因依赖缺失而无法载入时会自动降级到 CPU，并在日志中说明原因。构建细节见
+[Windows wheel 构建说明](windows-wheel.md)。
 
 ## ftllm
 

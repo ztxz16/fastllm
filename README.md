@@ -361,7 +361,7 @@ ftllm export /data/models/source-moe \
 
 ## 源码安装
 
-源码构建需要 C++17 编译器、Make 和 CMake；建议 GCC/G++ 9.4+、CMake 3.23+。Linux NUMA 构建通常还需要 `libnuma-dev`。CUDA 构建请预先安装兼容的 CUDA Toolkit 和 NCCL。
+源码构建需要 C++17 编译器和 CMake；Linux 下还需要 Make，建议 GCC/G++ 9.4+、CMake 3.23+。Linux NUMA 构建通常还需要 `libnuma-dev`。CUDA 构建请预先安装兼容的 CUDA Toolkit。Linux CUDA 构建默认启用 NCCL，需要安装其开发库；未安装时须显式传入 `-DUSE_NCCL=OFF`，多卡通信将使用降级实现。
 
 ~~~bash
 # Ubuntu/Debian 基础依赖
@@ -379,8 +379,21 @@ bash install.sh -DUSE_CUDA=ON -DCUDA_ARCH=89 \
 bash install.sh
 ~~~
 
+Windows 可使用 Visual Studio 2022 和仓库内的 PowerShell 脚本直接构建 wheel：
+
+~~~powershell
+# CPU + CUDA（无 NCCL 时自动使用降级实现）
+.\make_whl.ps1
+
+# CPU-only
+.\make_whl.ps1 -CpuOnly
+~~~
+
 更多平台说明：
 
+- [Windows wheel 构建](docs/windows-wheel.md)
+- [Windows Electron 桌面绿色包](desktop/README.md#windows-构建)
+- [Windows CLI 绿色运行时](docs/windows-portable.md)
 - [ROCm 编译与 wheel 打包](docs/rocm.md)
 - [TFACC 平台](docs/tfacc.md)
 - [示例程序、Android 和其他平台](example/README.md)

@@ -6,7 +6,7 @@ Python、CUDA Toolkit、cuBLAS、NCCL 或 Python 包。
 包内同时包含 Pi Agent 和 FastLLM 桥接扩展，启动模型后可直接使用“工作室”中的目录 Agent。
 目录搜索所需的 ripgrep、fd 也会随包提供，不依赖目标机器预先安装这些工具。
 
-## 使用入口
+## Linux 使用入口
 
 解压后双击根目录应用即可使用，无需先运行初始化命令：
 
@@ -51,7 +51,50 @@ HTML 文档的样式和插图全部随包提供，断网也能正常阅读。
 `source ./support/env.sh` 后可直接输入 `ftllm`、`ftllm-check` 等命令；
 双击 `ftllm` 打开的终端会自动启用这个环境。完整使用示例见成品根目录 `README.html`。
 
-## 构建
+## Windows 构建
+
+同时发布 wheel、Electron 绿色包、校验和与验证报告时，使用仓库根目录的
+[`make_release.ps1`](../make_release.ps1)，详见 [Windows 发布流程](../docs/windows-release.md)。
+
+Windows 桌面包使用独立的 PowerShell 入口，最终双击 `FastLLM-Launcher.exe`
+打开 Electron 窗口，不打开系统浏览器：
+
+```powershell
+# 从当前源码编译并生成完整 Electron ZIP（默认多 CUDA 架构）
+powershell -NoProfile -ExecutionPolicy Bypass -File .\desktop\package.ps1
+
+# SM86 / RTX 30 系列；复用增量构建目录和下载缓存
+powershell -NoProfile -ExecutionPolicy Bypass -File .\desktop\package.ps1 `
+  -CudaArch 86 -BuildDirectory build-fastllm-benchmark-sm86 -RequireCuda
+
+# 使用已经编译好的 Windows wheel；CudaArch 应与 wheel 一致
+powershell -NoProfile -ExecutionPolicy Bypass -File .\desktop\package.ps1 `
+  -Wheel .\build-fastllm-benchmark-sm86\cuda\tools\dist\ftllm-0.1.8.2-py3-none-win_amd64.whl `
+  -CudaArch 86 -Offline
+```
+
+默认输出 `build-desktop-dist/FastLLM/`、带版本和架构的 ZIP 以及 `.zip.sha256`。
+已有目录不会覆盖；再次构建请指定新的 `-OutputDirectory`。完整解压目录后运行 EXE，
+不能只复制单个 EXE。目标机无需安装 Python、Node/npm、Electron、CUDA Toolkit、
+VC++ Redistributable 或其他包；只需要 Windows 10/11 x64 和支持 AVX2/FMA/F16C
+的 CPU，GPU 推理仍需要匹配的 NVIDIA 驱动。模型权重不随软件打包。
+
+构建机需要 Visual Studio 2022 C++/Windows SDK/CMake，以及 GPU 编译所需 CUDA 12.9；
+Python 和 Electron 由脚本下载并验证 SHA256，无需预装 Node/npm。运行时版本与校验值
+统一维护在 `portable/windows/runtime-lock.json`。`-CpuOnly` 可构建
+纯 CPU 包，`-Offline` 只使用缓存，`-CacheDirectory` 可修改缓存位置。
+
+默认验证实际 Electron BrowserWindow、隔离后的 PATH、认证 API、工作室前端模块、
+中文空格路径迁移，以及发送原生窗口关闭消息后的进程退出。`-SmokeModel 本地模型路径`
+会进一步在 GPU 上加载模型、打开内嵌工作室、执行聊天请求，并验证关闭窗口时模型也退出。
+测试期间窗口隐藏，截图和结果保留在输出目录的 `electron-test/`，不混入发布 ZIP。
+完整成品包括 Electron 的所有 PE 文件都会执行 DLL 依赖审计，运行库随包携带。
+最终归档验证同时写入输出目录的 `archive-verification.json`。
+
+Windows 内部服务只绑定回环地址，由 Electron 自动启动和停止；关闭窗口会先请求
+正常清理，再以 Windows 进程树终止作兜底。配置和日志默认位于 EXE 旁的 `data/`。
+
+## Linux 构建
 
 先生成当前源码对应的 wheel，再打桌面包：
 
