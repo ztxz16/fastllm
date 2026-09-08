@@ -11,6 +11,7 @@ const {
   buildFtllmEnvironment,
   extractControlUrl,
   isLoopbackUrl,
+  pythonExecutable,
   redactControlTokens,
 } = require("../app/runtime");
 
@@ -59,14 +60,46 @@ test("buildFtllmEnvironment isolates Python and portable data", () => {
       PYTHONHOME: "/bad",
       PYTHONPATH: "/also-bad",
       LD_LIBRARY_PATH: "/host/lib",
-    });
+    }, "linux");
     assert.equal(environment.PYTHONHOME, undefined);
     assert.equal(environment.PYTHONPATH, undefined);
     assert.equal(environment.PYTHONDONTWRITEBYTECODE, "1");
     assert.equal(environment.XDG_CONFIG_HOME, path.join(dataRoot, "config"));
-    assert.match(environment.PATH, /runtime\/bin:\/usr\/bin$/);
-    assert.match(environment.LD_LIBRARY_PATH, /nvidia\/cublas\/lib/);
+    assert.equal(environment.PATH, `${runtimeRoot}:${path.join(runtimeRoot, "runtime", "bin")}:/usr/bin`);
+    assert.ok(environment.LD_LIBRARY_PATH.includes(path.join("nvidia", "cublas", "lib")));
     assert.equal(environment.SSL_CERT_FILE, path.join(sitePackages, "certifi", "cacert.pem"));
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("LineBuffer decodes split UTF-8 Windows paths without corruption", () => {
+  const decoder = new LineBuffer();
+  const input = Buffer.from("启动 C:\\模型 a\n");
+  const lines = [];
+  for (const byte of input) lines.push(...decoder.push(Buffer.from([byte])));
+  assert.deepEqual(lines, ["启动 C:\\模型 a"]);
+  assert.deepEqual(decoder.flush(), []);
+});
+
+test("Windows runtime does not depend on host Python, CUDA or PATH casing", () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "ftllm-win-test-"));
+  try {
+    const runtimeRoot = path.join(temporary, "中文 space", "ftllm");
+    const site = path.join(runtimeRoot, "runtime", "Lib", "site-packages");
+    const cublas = path.join(site, "nvidia", "cublas", "bin");
+    fs.mkdirSync(cublas, { recursive: true });
+    const environment = buildFtllmEnvironment(runtimeRoot, temporary, {
+      Path: "C:\\Windows\\System32", PythonHome: "bad", PYTHONPATH: "bad", LD_LIBRARY_PATH: "bad",
+    }, "win32");
+    assert.deepEqual(Object.keys(environment).filter((key) => key.toUpperCase() === "PATH"), ["PATH"]);
+    assert.equal(environment.PythonHome, undefined);
+    assert.equal(environment.PYTHONPATH, undefined);
+    assert.equal(environment.LD_LIBRARY_PATH, undefined);
+    assert.equal(pythonExecutable(runtimeRoot, "win32"), path.join(runtimeRoot, "runtime", "python.exe"));
+    assert.ok(environment.PATH.split(";").includes(cublas));
+    assert.ok(environment.PATH.split(";").includes(path.join(runtimeRoot, "tools")));
+    assert.equal(environment.PATH.split(";").at(-1), "C:\\Windows\\System32");
   } finally {
     fs.rmSync(temporary, { recursive: true, force: true });
   }

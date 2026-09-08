@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.23)
+project(ftllm_portable_launcher LANGUAGES CXX)
+add_executable(ftllm launcher.cpp)
+target_compile_features(ftllm PRIVATE cxx_std_17)
+target_compile_definitions(ftllm PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+set_property(TARGET ftllm PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")

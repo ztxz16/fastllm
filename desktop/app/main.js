@@ -11,17 +11,20 @@ const {
   LineBuffer,
   buildFtllmEnvironment,
   extractControlUrl,
+  pythonExecutable,
+  pythonSitePackages,
   redactControlTokens,
 } = require("./runtime");
 
 const APP_NAME = "FastLLM Launcher";
 const STARTUP_TIMEOUT_MS = 60_000;
 const SHUTDOWN_TIMEOUT_MS = 8_000;
+const smokeTest = process.env.FTLLM_DESKTOP_SMOKE_TEST === "1";
 const loadingPagePath = path.join(__dirname, "loading.html");
 const loadingPageUrl = pathToFileURL(loadingPagePath);
 const packagedRoot = path.dirname(process.execPath);
 const runtimeRoot = path.resolve(
-  process.env.FTLLM_RUNTIME_DIR || packagedRoot,
+  process.env.FTLLM_RUNTIME_DIR || (process.platform === "win32" ? path.join(packagedRoot, "ftllm") : packagedRoot),
 );
 
 function makeWritableDataRoot(preferredRoot) {
@@ -123,7 +126,7 @@ function openChildWindow(url) {
       sandbox: true,
     },
   });
-  child.once("ready-to-show", () => child.show());
+  child.once("ready-to-show", () => { if (!smokeTest) child.show(); });
   child.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   child.webContents.on("will-navigate", (event, target) => {
     if (!isHttpUrl(target)) {
@@ -192,7 +195,7 @@ function createWindow() {
     },
   });
   attachWindowGuards(mainWindow);
-  mainWindow.once("ready-to-show", () => mainWindow && mainWindow.show());
+  mainWindow.once("ready-to-show", () => { if (mainWindow && !smokeTest) mainWindow.show(); });
   mainWindow.on("closed", () => {
     mainWindow = null;
   });
@@ -222,9 +225,9 @@ function reserveLoopbackPort() {
 }
 
 function validateRuntime() {
-  const python = path.join(runtimeRoot, "runtime", "bin", "python3");
-  const cli = path.join(runtimeRoot, "runtime", "lib");
-  if (!fs.existsSync(python) || !fs.existsSync(cli)) {
+  const python = pythonExecutable(runtimeRoot);
+  const sitePackages = pythonSitePackages(runtimeRoot);
+  if (!fs.existsSync(python) || !sitePackages || !fs.existsSync(path.join(sitePackages, "ftllm", "cli.py"))) {
     throw new Error(`Bundled FastLLM runtime is incomplete: ${runtimeRoot}`);
   }
   return python;
@@ -318,7 +321,8 @@ async function startLauncher() {
   launcherProcess = spawn(python, arguments_, {
     cwd: dataRoot,
     env: environment,
-    detached: true,
+    detached: process.platform !== "win32",
+    windowsHide: true,
     stdio: ["ignore", "pipe", "pipe"],
   });
   const child = launcherProcess;
@@ -391,6 +395,21 @@ function signalLauncher(child, signal) {
   }
 }
 
+function killWindowsProcessTree(child) {
+  return new Promise((resolve) => {
+    if (!child || !child.pid || child.exitCode !== null || child.signalCode !== null) {
+      resolve();
+      return;
+    }
+    const taskkill = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "taskkill.exe");
+    const killer = spawn(taskkill, ["/PID", String(child.pid), "/T", "/F"], {
+      windowsHide: true, stdio: "ignore", timeout: 5000,
+    });
+    killer.once("error", () => { child.kill(); resolve(); });
+    killer.once("close", resolve);
+  });
+}
+
 function stopLauncher() {
   clearTimeout(startupTimer);
   startupTimer = null;
@@ -418,14 +437,29 @@ function stopLauncher() {
       resolve();
     };
     child.once("close", finish);
-    signalLauncher(child, "SIGTERM");
-    forceTimer = setTimeout(() => {
+    if (process.platform === "win32") {
+      // Windows SIGTERM is TerminateProcess: it skips Python's cleanup handlers.
+      // The authenticated API stops model/download/agent children before exit.
+      if (launcherOrigin && launcherToken) {
+        fetch(`${launcherOrigin}/api/shutdown`, {
+          method: "POST", headers: { "X-FTLLM-Launcher-Token": launcherToken },
+          signal: AbortSignal.timeout(3000),
+        }).catch((error) => appendLog("desktop", `Graceful shutdown request: ${error.message}`));
+      }
+    } else {
+      signalLauncher(child, "SIGTERM");
+    }
+    forceTimer = setTimeout(async () => {
       if (child.exitCode === null && child.signalCode === null) {
         appendLog(
           "desktop",
           "ftllm did not stop in time; terminating its process group",
         );
-        signalLauncher(child, "SIGKILL");
+        if (process.platform === "win32") {
+          await killWindowsProcessTree(child);
+        } else {
+          signalLauncher(child, "SIGKILL");
+        }
       }
       finish();
     }, SHUTDOWN_TIMEOUT_MS).unref();
@@ -460,7 +494,7 @@ if (!hasSingleInstanceLock) {
     if (mainWindow.isMinimized()) {
       mainWindow.restore();
     }
-    mainWindow.show();
+    if (!smokeTest) mainWindow.show();
     mainWindow.focus();
   });
 
