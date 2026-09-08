@@ -124,6 +124,9 @@ namespace fastllm {
             // after that request has completed its first single-token pass,
             // so CUDA Graph capture retains the established allocation order.
             std::set<int> geometricCacheGrowthReadyLayers;
+            // TP dense graphs retain the legacy attention padding width even
+            // when physical KV storage is reserved or reused across requests.
+            int denseGraphWidth = 0;
             std::vector<int> processedTokens;
             int prefixRequestId = 0;
             int lastPrefixSnapshotLen = 0;

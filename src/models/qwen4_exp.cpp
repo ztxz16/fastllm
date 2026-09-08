@@ -595,6 +595,18 @@ namespace fastllm {
             return data.dims[axis];
         }
 
+        bool Qwen4TpDecodeFitsCapacityClass(const GenerationConfig &config,
+                                           int indexerBudget) {
+            if (indexerBudget <= 0) return false;
+            if (config.input_token_length >= indexerBudget) return true;
+            // A short request that will outgrow its idle capacity class cannot
+            // amortize retained graph variants. Keep its legacy allocation and
+            // rank-zero ownership, including unbounded generation.
+            return config.input_token_length > 0 && config.output_token_limit > 0 &&
+                (int64_t)config.input_token_length + config.output_token_limit - 1 <=
+                    2LL * Qwen4RoundUpCacheCapacity(config.input_token_length, 128);
+        }
+
         void Qwen4EnsureAppendCapacity(Data &cache, const Data &append,
                                        int axis, int quantum,
                                        int maxGrowth,
@@ -1170,7 +1182,7 @@ namespace fastllm {
         Data attentionOutput;
         Data positionIds;
         Data decodeMeta;
-        Data denseIndices;
+        std::map<int, Data> denseIndices;
         Data logits;
         std::map<int, Data> qsaScoreWorkspaces;
         std::map<int, Data> qsaSelectedWorkspaces;
@@ -1224,7 +1236,10 @@ namespace fastllm {
             attentionOutput.FreeSpace();
             positionIds.FreeSpace();
             decodeMeta.FreeSpace();
-            denseIndices.FreeSpace();
+            for (auto &item : denseIndices) {
+                item.second.FreeSpace();
+            }
+            denseIndices.clear();
             logits.FreeSpace();
             for (auto &item : qsaScoreWorkspaces) {
                 item.second.FreeSpace();
@@ -1348,7 +1363,7 @@ namespace fastllm {
             bool failed = false;
         };
         std::map<const Data *, std::unique_ptr<RequestCache>> caches;
-        // Keep at most one completed sparse request. Graphs and all buffers
+        // Keep at most one completed request. Graphs and all buffers
         // whose addresses they capture share the same lifetime. Active
         // requests never share mutable storage with this idle slot.
         std::unique_ptr<RequestCache> idleCache;
@@ -1714,12 +1729,10 @@ namespace fastllm {
         auto &entry = tp.caches[key];
         bool resetRequest = false;
         if (!entry) {
-            // Dense graph width depends on cache capacity. Retain the legacy
-            // allocation schedule for short prompts and externally supplied
-            // caches, including graph-disabled execution.
+            // Only fresh, graph-enabled TP requests own reusable rank-zero
+            // storage. Prefix/external caches keep their original ownership.
             const bool reusable = batch == 1 && GetFastllmEnv().cudaGraph &&
-                indexerBudget > 0 &&
-                generationConfig.input_token_length >= indexerBudget &&
+                Qwen4TpDecodeFitsCapacityClass(generationConfig, indexerBudget) &&
                 std::all_of(pastKeyValues.begin(), pastKeyValues.end(),
                     [](const std::pair<Data, Data> &kv) {
                         return kv.first.dims.empty() && kv.second.dims.empty();
@@ -1733,7 +1746,8 @@ namespace fastllm {
                 for (int layer = 0; layer < block_cnt; ++layer) {
                     if (!IsLinearAttentionLayer(layer) &&
                         Qwen4AxisCapacity(tp.idleCache->ranks[0][layer].first, 1) >
-                            2LL * generationConfig.input_token_length) {
+                            2LL * Qwen4RoundUpCacheCapacity(
+                                generationConfig.input_token_length, 128)) {
                         tp.ReleaseCache(nullptr, tp.idleCache);
                         break;
                     }
@@ -7845,15 +7859,16 @@ namespace fastllm {
             const int selectedBlocks = wholeDenseGraph ? 1 :
                 this->indexerBudget / this->indexerCompressRatio;
             if (wholeDenseGraph) {
-                const int width = Qwen4AxisCapacity(
-                    pastKeyValues[fullAttentionCacheStartLayer].first, 1);
-                if (graphState->denseIndices.cudaData == nullptr ||
-                    graphState->denseIndices.dims != std::vector<int>({1, width})) {
-                    if (!Qwen4PrepareDecodeGraphWorkspace(graphState->denseIndices,
+                const int width = requestState.denseGraphWidth > 0
+                    ? requestState.denseGraphWidth : Qwen4AxisCapacity(
+                        pastKeyValues[fullAttentionCacheStartLayer].first, 1);
+                Data &indicesData = graphState->denseIndices[width];
+                if (indicesData.cudaData == nullptr) {
+                    if (!Qwen4PrepareDecodeGraphWorkspace(indicesData,
                             DataType::INT32, {1, width}, device)) return false;
                     std::vector<int32_t> indices(width);
                     for (int i = 0; i < width; ++i) indices[i] = i;
-                    FastllmCudaCopyFromHostToDevice(graphState->denseIndices.cudaData,
+                    FastllmCudaCopyFromHostToDevice(indicesData.cudaData,
                         indices.data(), indices.size() * sizeof(int32_t));
                 }
             }
@@ -8077,7 +8092,9 @@ namespace fastllm {
                 this->indexerCompressRatio
             : 0;
         const int wholeGraphSparseWidth = wholeDenseGraph && wholeGraphReady
-            ? graphState->denseIndices.dims.back()
+            ? (requestState.denseGraphWidth > 0
+                ? requestState.denseGraphWidth : Qwen4AxisCapacity(
+                    pastKeyValues[fullAttentionCacheStartLayer].first, 1))
             : this->indexerBudget +
             (mtpTargetGraph ? this->indexerCompressRatio - 1
                             : wholeGraphRemainder);
@@ -8280,7 +8297,8 @@ namespace fastllm {
                 // The graph uses fixed-capacity storage and masks positions
                 // beyond the device-side logical length. Preserve dense key
                 // order; padding must never become a visible zero key.
-                Qwen4BorrowCudaStorage(qsaIndices, graphState->denseIndices);
+                Qwen4BorrowCudaStorage(qsaIndices,
+                    graphState->denseIndices.at(wholeGraphSparseWidth));
             } else {
                 qsaIndices.ToDevice(
                     DataDevice::CUDA, std::vector<int>({device}));
@@ -8684,7 +8702,7 @@ namespace fastllm {
             }
             runSegment(
                 graphStartLayer, this->block_cnt, true,
-                wholeDenseGraph ? this->indexerCompressRatio + 1 :
+                wholeDenseGraph ? this->indexerCompressRatio + wholeGraphSparseWidth :
                 mtpTargetGraph ? this->indexerCompressRatio
                                : wholeGraphRemainder);
 
@@ -10338,6 +10356,35 @@ namespace fastllm {
             ((threadTpRank >= 0 || restoredPrefixSnapshot || verificationCapture != nullptr) &&
              Qwen4IsContiguousCausalMask(
                  attentionMask, qsaPreviousLength, inputIds.dims[1]));
+        if (threadTpRank >= 0 && GetFastllmEnv().cudaGraph &&
+            indexerBudget > 0 &&
+            generationConfig.input_token_length < indexerBudget &&
+            verificationCapture == nullptr) {
+            // Track the allocation schedule of a fresh, unreserved cache.
+            // Attention's padded reduction width must not depend on a prior
+            // request's capacity or on the decode reservation below. Track
+            // eager mask fallbacks too, so a later graph sees the same width.
+            int &width = requestState->denseGraphWidth;
+            bool geometricGrowth = false;
+            for (int layer = 0; layer < block_cnt; ++layer) {
+                if (!IsLinearAttentionLayer(layer)) {
+                    geometricGrowth = requestState->geometricCacheGrowthReadyLayers.count(
+                        layer) != 0;
+                    if (width == 0 && qsaPreviousLength > 0) {
+                        width = Qwen4AxisCapacity(pastKeyValues[layer].first, 1);
+                    }
+                    break;
+                }
+            }
+            const int required = qsaPreviousLength + inputIds.dims[1];
+            if (required > width) {
+                width = geometricGrowth
+                    ? Qwen4NextCacheCapacity(width, required, 128,
+                                             kQwen4DenseCacheMaxGrowth)
+                    : qsaPreviousLength + Qwen4RoundUpCacheCapacity(
+                        inputIds.dims[1], 128);
+            }
+        }
         if (threadTpRank >= 0 && inputIds.dims[1] > 1 &&
             indexerBudget > 0 &&
             generationConfig.input_token_length >= indexerBudget &&
@@ -10351,13 +10398,13 @@ namespace fastllm {
             }
         }
         int decodeReserveTokens = 0;
-        // Dense decode graph width depends on KV capacity. Keep its original
-        // allocation schedule and reserve only for fixed-budget sparse QSA.
+        // Reserve physical KV storage before decode captures its addresses.
+        // Short TP requests use denseGraphWidth for the original math shape;
+        // hybrid inference and expert-cache allocation are unchanged.
         if (threadTpRank >= 0 && allowDecodeCudaGraph &&
             GetFastllmEnv().cudaGraph && qsaDeviceCompatibleMask &&
             verificationCapture == nullptr &&
-            this->indexerBudget > 0 &&
-            generationConfig.input_token_length >= this->indexerBudget &&
+            Qwen4TpDecodeFitsCapacityClass(generationConfig, this->indexerBudget) &&
             qsaPreviousLength < generationConfig.input_token_length &&
             (int64_t)qsaPreviousLength + inputIds.dims[1] ==
                 generationConfig.input_token_length) {
@@ -10365,6 +10412,12 @@ namespace fastllm {
                 ? std::min(generationConfig.output_token_limit - 1,
                            kQwen4DenseCacheMaxGrowth)
                 : kQwen4DenseCacheMaxGrowth;
+            if (generationConfig.input_token_length < this->indexerBudget) {
+                // Eligible short requests have a finite output limit. Bound
+                // their physical reservation to the idle capacity class.
+                decodeReserveTokens = std::min(decodeReserveTokens,
+                    Qwen4RoundUpCacheCapacity(generationConfig.input_token_length, 128));
+            }
         }
         std::map<int, Data> cudaPositionIds;
         auto positionsFor = [&](const Data &reference) -> const Data& {
