@@ -2,7 +2,7 @@
 
 [English](qwen3_en.md) · [返回 README](../README.md) · [Qwen4-Exp](qwen4.md) · [Benchmark](benchmarks/qwen3.md)
 
-本文面向当前 Qwen3.5、Qwen3.6 和 Qwen3.8 文本模型。Qwen4-Exp / Qwen3.8-Flash-Next 使用独立架构，请阅读 [Qwen4-Exp 部署说明](qwen4.md)。
+本文面向当前 Qwen3.5、Qwen3.6 和 Qwen3.8 模型，包含 GGUF 多模态部署说明。Qwen4-Exp / Qwen3.8-Flash-Next 使用独立架构，请阅读 [Qwen4-Exp 部署说明](qwen4.md)。
 
 不同 checkpoint 可能是稠密、MoE、FP8、NVFP4 或其他量化格式。首次启动建议保留 `--dtype auto`，再根据显存和实测结果调整。
 
@@ -67,6 +67,28 @@ ftllm server /data/models/qwen \
 ~~~
 
 线程数应结合物理核心数和内存带宽实测，不建议直接照搬示例值。
+
+<a id="gguf-multimodal"></a>
+
+## GGUF 多模态（`--mmproj`）
+
+GGUF 发布包通常将语言模型和视觉模块分开存放。使用不含视觉权重的主模型 GGUF 处理图片时，需要通过 `--mmproj` 显式加载配套的视觉 GGUF 文件；仅指定 `--ori` 不会加载视觉权重。
+
+~~~bash
+ftllm server /data/models/qwen3.8-27b-Q4_K_M.gguf \
+  --mmproj /data/models/mmproj-qwen3.8-27b-f16.gguf \
+  --ori /data/models/Qwen3.8-27B \
+  --model_name qwen3.8
+~~~
+
+示例中的路径和文件名需替换为实际文件。默认使用单张 GPU；双卡可追加 `--tp 2`。
+
+- **文件匹配**：主模型、mmproj 和原始配置必须来自相匹配的模型；不要混用不同尺寸或版本的视觉模块。
+- **配置来源**：推荐通过 `--ori` 指向原始 HF 配置和 tokenizer 目录，其中 `config.json` 必须包含完整的 `vision_config`。保留配套的 `preprocessor_config.json`，处理视频时也保留 `video_preprocessor_config.json`；无需为此下载原始 HF 大权重。
+- **省略 `--ori`**：当主模型 GGUF 的元数据和 tokenizer 可直接读取时，可将匹配的 `config.json` 和预处理配置放在**主模型 GGUF 所在目录**，再省略 `--ori`。当前不会仅凭 mmproj 文件自动补齐 `vision_config`，缺失时视觉推理会报配置不完整。
+- **支持范围**：`--mmproj` 当前仅接入 Qwen3.5 架构族的 GGUF，包括使用该架构的 Qwen3.6/3.8；HF 模型目录不使用此参数。当前不能与通过 `--draft` 挂载的**外部 MTP** 同时使用，此限制不等同于禁用 GGUF 内置 MTP。
+
+服务启动后可通过工作室上传图片，或使用 `/v1/chat/completions` 的 `image_url` 消息内容发送图片。
 
 ## 长上下文与缓存
 

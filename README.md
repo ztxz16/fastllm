@@ -301,6 +301,7 @@ CLI 会持续演进，`ftllm <command> --help` 是当前安装版本的最终依
 | `--chat_template` | 自定义 Jinja chat template 文件 |
 | `--cache_dir` | 在线模型的本地缓存目录 |
 | `--ori` | 读取部分 GGUF 时指定原模型配置和 tokenizer 目录 |
+| `--mmproj` | Qwen3.5 架构族 GGUF 的配套视觉模块文件；配置要求与示例见 [GGUF 多模态](docs/qwen3.md#gguf-multimodal) |
 
 ### API Server
 
@@ -331,7 +332,7 @@ ftllm download --help
 - Hugging Face 原始 Safetensors 权重，包括模型自带的 FP16、BF16 或 FP8 权重。
 - 已量化的 AWQ 模型。
 - FastLLM 导出的定精度或动态量化模型。
-- 部分 GGUF 格式；需要通过 `--ori` 指定原模型的配置和 tokenizer 目录。
+- 部分 GGUF 格式；已适配的模型可直接读取内置配置和 tokenizer，也可通过 `--ori` 指定原模型目录。Qwen3.5 架构族的 GGUF 使用独立视觉模块时，还需指定 `--mmproj` 并提供匹配的视觉配置，见 [GGUF 多模态](docs/qwen3.md#gguf-multimodal)。
 
 量化格式是否可用取决于模型结构、设备和对应 kernel。首次部署建议保留 `--dtype auto`；对于已经量化的 checkpoint，不要再次指定在线量化类型。
 

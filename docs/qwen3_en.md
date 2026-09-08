@@ -2,7 +2,7 @@
 
 [中文](qwen3.md) · [Back to README](../README_EN.md) · [Qwen4-Exp](qwen4_exp.md) · [Benchmarks](benchmarks/qwen3_en.md)
 
-This guide covers current Qwen3.5, Qwen3.6, and Qwen3.8 text models. Qwen4-Exp / Qwen3.8-Flash-Next uses a separate architecture and is documented in the [Qwen4-Exp guide](qwen4_exp.md).
+This guide covers current Qwen3.5, Qwen3.6, and Qwen3.8 models, including GGUF multimodal deployment. Qwen4-Exp / Qwen3.8-Flash-Next uses a separate architecture and is documented in the [Qwen4-Exp guide](qwen4_exp.md).
 
 Checkpoint layouts may be dense, MoE, FP8, NVFP4, or another quantized format. Keep `--dtype auto` for an initial launch, then tune from measured memory use and throughput.
 
@@ -56,6 +56,28 @@ ftllm server /data/models/qwen --device numa -t 64
 ~~~
 
 Treat the thread counts as examples and tune them for physical cores and memory bandwidth.
+
+<a id="gguf-multimodal"></a>
+
+## GGUF multimodal models (`--mmproj`)
+
+GGUF releases commonly distribute the language model and vision module separately. To process images with a main GGUF that lacks vision weights, explicitly load the matching vision GGUF with `--mmproj`; `--ori` alone does not load vision weights.
+
+~~~bash
+ftllm server /data/models/qwen3.8-27b-Q4_K_M.gguf \
+  --mmproj /data/models/mmproj-qwen3.8-27b-f16.gguf \
+  --ori /data/models/Qwen3.8-27B \
+  --model_name qwen3.8
+~~~
+
+Replace the example paths and filenames with your actual files. The default uses one GPU; append `--tp 2` for two GPUs.
+
+- **Matching files:** Use a main model, mmproj, and original configuration from matching checkpoints. Do not mix vision modules from different model sizes or versions.
+- **Configuration:** Prefer `--ori` pointing to the original HF configuration and tokenizer directory. Its `config.json` must include the complete `vision_config`. Keep the matching `preprocessor_config.json`, and `video_preprocessor_config.json` for video input. The original HF weight shards are not needed for this.
+- **Without `--ori`:** If the main GGUF provides supported model metadata and a readable tokenizer, place the matching `config.json` and preprocessing configuration alongside the **main model GGUF**, then omit `--ori`. The loader does not currently reconstruct `vision_config` from the mmproj file alone; missing vision configuration causes visual inference to fail.
+- **Scope:** `--mmproj` currently supports Qwen3.5-family GGUF models, including Qwen3.6/3.8 checkpoints using that architecture. It is not used for HF model directories. It cannot currently be combined with an **external MTP** module attached through `--draft`; this restriction does not disable MTP embedded in the main GGUF.
+
+Once the server is running, upload images in Studio or send `image_url` content through `/v1/chat/completions`.
 
 ## Long context and caching
 

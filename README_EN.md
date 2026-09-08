@@ -301,6 +301,7 @@ The CLI evolves continuously, so `ftllm <command> --help` is authoritative for t
 | `--chat_template` | Custom Jinja chat-template file |
 | `--cache_dir` | Local cache directory for online models |
 | `--ori` | Original model configuration and tokenizer directory for selected GGUF models |
+| `--mmproj` | Matching vision-module GGUF for Qwen3.5-family GGUF models; see [GGUF multimodal deployment](docs/qwen3_en.md#gguf-multimodal) for configuration requirements and an example |
 
 ### API server
 
@@ -331,7 +332,7 @@ ftllm download --help
 - Original Hugging Face Safetensors checkpoints, including model-provided FP16, BF16, or FP8 weights.
 - Quantized AWQ checkpoints.
 - Fixed-precision or dynamically quantized models exported by FastLLM.
-- Selected GGUF formats, with `--ori` pointing to the original model's configuration and tokenizer directory.
+- Selected GGUF formats can read supported embedded configuration and tokenizer metadata, or use `--ori` to select the original model directory. Qwen3.5-family GGUF models with a separate vision module also require `--mmproj` and matching vision configuration; see [GGUF multimodal deployment](docs/qwen3_en.md#gguf-multimodal).
 
 Quantization support depends on the model architecture, device, and available kernel. Keep `--dtype auto` for an initial deployment, and do not request online quantization again for an already quantized checkpoint.
 
