@@ -19908,13 +19908,15 @@ namespace fastllm {
                             localValue->dims[2] != head_k_dim) {
                             return false;
                         }
-                        int oldDevice = FastllmCudaGetDevice();
-                        FastllmCudaSetDevice(device);
-                        bool transposed =
-                            Qwen35EnsureCudaLinearAttnStateTransposed(*localValue);
-                        FastllmCudaSetDevice(oldDevice);
-                        if (!transposed) {
-                            return false;
+                        if (!localValue->isLinearAttentionTransposed) {
+                            int oldDevice = FastllmCudaGetDevice();
+                            FastllmCudaSetDevice(device);
+                            bool transposed =
+                                Qwen35EnsureCudaLinearAttnStateTransposed(*localValue);
+                            FastllmCudaSetDevice(oldDevice);
+                            if (!transposed) {
+                                return false;
+                            }
                         }
                     }
                 }
@@ -20342,6 +20344,9 @@ namespace fastllm {
                 }
             }
         } else {
+            // Sharded sampling may leave the current device on the last rank.
+            // Keep these root-only hidden slices on the draft's device.
+            FastllmCudaSetDevice(rootDevice);
             for (int b = 0; b < batch; b++) {
                 Split(speculativeHiddenStates, 1, tokenOffsets[b],
                       tokenOffsets[b] + commitLens[b],
