@@ -1,5 +1,6 @@
 """Integration checks for the original WebUI mounted inside Launcher."""
 import asyncio
+import io
 import json
 import os
 import sys
@@ -364,6 +365,36 @@ class LauncherWebUITest(unittest.TestCase):
         messages = stream.call_args.args[0]
         self.assertEqual([m['role'] for m in messages], ['user', 'assistant', 'user'])
         self.assertEqual(len(self.client.get(path).json()['messages']), 4)
+        self.assertFalse(self.client.post(path + '/cancel').json()['cancelled'])
+
+    def test_context_error_is_visible_and_preserves_complete_history(self):
+        from fastllm_pytools.generation_errors import PromptTooLongError
+
+        self.open()
+        record = self.client.post(self.base + '/api/conversations', json={}).json()
+        path = self.base + '/api/conversations/' + record['id']
+        webui = self.runtime._webui_app.state.runtime
+        with patch.object(webui.api_client, 'stream', return_value=iter([('Hello', '')])):
+            self.client.post(path + '/chat', json={'prompt': 'First'})
+        original = self.client.get(path).json()['messages']
+        error_message = str(PromptTooLongError())
+        wire = 'data: ' + json.dumps({'error': {'message': error_message, 'code': 400}}) + '\n\n'
+        for prompt in (('Long history ' * 1000).strip(), 'Continue'):
+            with patch.object(webui.api_client, '_open', return_value=io.BytesIO(wire.encode())) as opened:
+                response = self.client.post(path + '/chat', json={'prompt': prompt})
+            events = [json.loads(line) for line in response.text.splitlines()]
+            self.assertEqual([e['message'] for e in events if e['type'] == 'error'],
+                             [error_message])
+            self.assertTrue(events[-1]['message']['error'])
+            self.assertIn('上下文长度不足', events[-1]['message']['content'])
+            self.assertNotIn('思考过程未完成', events[-1]['message']['content'])
+            sent = opened.call_args.args[1]['messages']
+            self.assertEqual([m['content'] for m in sent],
+                             [m['content'] for m in original] + [prompt])
+            saved = self.client.get(path).json()['messages']
+            self.assertEqual(saved[:-2], original)
+            self.assertEqual(saved[-2]['content'], prompt)
+            original = saved
         self.assertFalse(self.client.post(path + '/cancel').json()['cancelled'])
 
 

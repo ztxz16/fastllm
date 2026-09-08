@@ -17,6 +17,11 @@ from collections import OrderedDict
 from typing import Optional, Tuple, Union, List, Callable, Dict, Any;
 
 try:
+    from .generation_errors import PromptTooLongError
+except ImportError:
+    from generation_errors import PromptTooLongError
+
+try:
     from .gguf_metadata import get_gguf_model_config, try_load_gguf_tokenizer
 except ImportError:
     from gguf_metadata import get_gguf_model_config, try_load_gguf_tokenizer
@@ -2636,6 +2641,11 @@ class model:
             "output_tokens": output_tokens.value,
         }
     
+    def _raise_prompt_too_long(self, handle):
+        if self.save_history:
+            self.current_tokenizer_cache.pop(handle, None)
+        raise PromptTooLongError()
+
     def stream_response_handle(self, handle):
         if (self._can_apply_hf_chat_template() or
                 self._uses_hf_deepseek_v4_tokenizer()):
@@ -2647,7 +2657,7 @@ class model:
                 cur = fastllm_lib.fetch_response_llm_model(self.model, handle)
                 if (cur <= -1):
                     if (cur == -2):
-                        yield "prompt too long"
+                        self._raise_prompt_too_long(handle)
                     break
                 tokens.append(cur)
                 ret = tokenizer.decode(tokens)
@@ -2666,8 +2676,10 @@ class model:
             while True:
                 if not(fastllm_lib.can_fetch_response_llm_model(self.model, handle)):
                     continue
+                token = fastllm_lib.fetch_response_llm_model(self.model, handle)
+                if token == -2:
+                    self._raise_prompt_too_long(handle)
                 if (self.save_history and handle in self.current_tokenizer_cache):
-                    token = fastllm_lib.fetch_response_llm_model(self.model, handle)
                     if (token <= -1):
                         try:
                             cur_cache = self.current_tokenizer_cache.pop(handle)
@@ -2678,7 +2690,9 @@ class model:
                     ret += self._decode_fastllm_token(token)
                     pending_tokens.append(token)
                 else:
-                    ret += fastllm_lib.fetch_response_str_llm_model(self.model, handle)
+                    if token <= -1:
+                        break
+                    ret += self._decode_fastllm_token(token)
                 cur = ""
                 try:
                     cur = ret.decode()
@@ -2741,7 +2755,7 @@ class model:
                 capture_response_statistics()
                 if count <= -1:
                     if count == -2:
-                        yield "prompt too long"
+                        self._raise_prompt_too_long(handle)
                     if (self.save_history):
                         try:
                             cur = self.current_tokenizer_cache.pop(handle)
@@ -2783,7 +2797,7 @@ class model:
                 capture_response_statistics()
                 if count <= -1:
                     if count == -2:
-                        yield "prompt too long"
+                        self._raise_prompt_too_long(handle)
                     if (self.save_history and
                             handle in self.current_tokenizer_cache):
                         try:

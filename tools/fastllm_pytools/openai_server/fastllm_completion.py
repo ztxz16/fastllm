@@ -29,6 +29,11 @@ from .protocal.openai_protocol import *
 from .protocal.anthropic_protocol import *
 
 try:
+    from ..generation_errors import PromptTooLongError
+except ImportError:
+    from generation_errors import PromptTooLongError
+
+try:
     from ..gemma4_multimodal import (
         normalize_gemma4_conversation,
         prepare_gemma4_multimodal_inputs,
@@ -2907,6 +2912,9 @@ class FastLLmCompletion:
                   request, raw_request, handle, result_generator, request_id,
                   input_token_len, parser_request,
                   response_statistics = response_statistics)
+          except PromptTooLongError as e:
+              self._release_conversation_handle(request_id, handle)
+              return self.create_error_response(str(e))
           except ValueError as e:
               return self.create_error_response(str(e))
 
@@ -3121,6 +3129,9 @@ class FastLLmCompletion:
                   input_token_len, think = need_think_prefix,
                   emit_reasoning_content = emit_reasoning_content,
                   response_statistics = response_statistics)
+          except PromptTooLongError as e:
+              self._release_conversation_handle(request_id, handle)
+              return self.create_error_response(str(e))
           except ValueError as e:
               return self.create_error_response(str(e))
 
@@ -3598,7 +3609,11 @@ class FastLLmCompletion:
                 yield f"data: {flush_data}\n\n"
         yield f"data: {data}\n\n"
       except ValueError as e:
-        if self._abort_conversation_handle(request_id, handle):
+        # A native context error is terminal: fetching it already freed the
+        # backend handle, which another request may have reused.
+        if isinstance(e, PromptTooLongError):
+          self._release_conversation_handle(request_id, handle)
+        elif self._abort_conversation_handle(request_id, handle):
           logging.info(f"Abort failed streaming request: {request_id}")
         data = self.create_streaming_error_response(str(e))
         yield f"data: {data}\n\n"
@@ -3832,7 +3847,9 @@ class FastLLmCompletion:
               "message_stop",
               MessageStopEvent())
       except ValueError as e:
-          if self._abort_conversation_handle(request_id, handle):
+          if isinstance(e, PromptTooLongError):
+              self._release_conversation_handle(request_id, handle)
+          elif self._abort_conversation_handle(request_id, handle):
               logging.info(f"Abort failed Anthropic streaming request: {request_id}")
           error_data = json.dumps({
               "type": "error",
