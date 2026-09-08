@@ -834,18 +834,6 @@ void LaunchFastllmGemmFp16FP8E4M3(half *input, uint8_t *weight, half *output, ha
     const bool exactRows = n > 1 &&
         n < fastllm::FastllmCudaGetLinearExactBatchThreshold();
 
-    // Four-token verification on SM89 benefits from more blocks and fewer
-    // registers per thread. Each output keeps the same accumulation order.
-    if (n == 4 && useBlock128 && FastllmCudaRuntimeArch() == 89) {
-        constexpr int N4_W = 2;
-        constexpr int N4_ROWS = 2;
-        const int n4Grid = (k + N4_W * N4_ROWS - 1) / (N4_W * N4_ROWS);
-        FastllmGemvHalfFP8E4M3KernelWarpMultiRowBlock128
-            <N4_W, 4, N4_ROWS><<<n4Grid, N4_W * 32>>>(
-                input, weight, output, bias, scales, m, k);
-        return;
-    }
-
     // PART=8 with four output rows per warp needs 128 registers/thread on
     // current nvcc. SM120 benefits from trading cache-resident activation
     // reloads for occupancy, with the best tradeoff depending on the output
@@ -920,8 +908,20 @@ void LaunchFastllmGemmFp16FP8E4M3(half *input, uint8_t *weight, half *output, ha
         return;
     }
 
+    // SM89 small-row verification benefits from more blocks and lower
+    // register pressure. Two/three input rows favor one output per warp;
+    // four through eight favor two. Preserve each output's accumulation order.
+    const bool narrowSm89 = n >= 2 && n <= 8 && useBlock128 &&
+                            FastllmCudaRuntimeArch() == 89;
 #define FASTLLM_FP8_WARP_LAUNCH(PARTVAL, AOFF, COFF) do { \
-    if (useBlock128) { \
+    if (narrowSm89) { \
+        constexpr bool smallPart = (PARTVAL == 2 || PARTVAL == 3); \
+        constexpr int tunedW = smallPart ? 4 : 2; \
+        constexpr int tunedRows = smallPart ? 1 : 2; \
+        FastllmGemvHalfFP8E4M3KernelWarpMultiRowBlock128<tunedW, PARTVAL, tunedRows> \
+            <<< (k + 3) / 4, tunedW * 32 >>>( \
+                input + (AOFF) * m, weight, output + (COFF) * k, bias, scales, m, k); \
+    } else if (useBlock128) { \
         FastllmGemvHalfFP8E4M3KernelWarpMultiRowBlock128<W, PARTVAL, ROWS> <<< grid, W * 32 >>>( \
             input + (AOFF) * m, weight, output + (COFF) * k, bias, scales, m, k); \
     } else { \
