@@ -550,6 +550,45 @@ namespace fastllm {
         cache.Resize({cache.dims[0], tokens, cache.dims[2]});
     }
 
+    void Qwen3_5Model::MtpKvCache::Append(const Data &k, const Data &v) {
+        int allocationUnit = 128;
+#ifdef USE_CUDA
+        // Amortize long-cache copies with at most 4 MiB of additional K/V
+        // capacity. Keep the small increment when both new buffers would
+        // not fit alongside the existing cache.
+        if (tokens >= 16384 && key.expansionDims.size() == 3 &&
+            value.expansionDims.size() == 3 &&
+            tokens + k.dims[1] > key.expansionDims[1]) {
+            const uint64_t bytesPerToken =
+                (uint64_t)k.dims[0] * k.dims[2] * k.unitSize / k.unitSizeDiv +
+                (uint64_t)v.dims[0] * v.dims[2] * v.unitSize / v.unitSizeDiv;
+            constexpr uint64_t reserveBytes = 4 * 1024 * 1024;
+            const int longUnit =
+                (int)std::min<uint64_t>(1024, reserveBytes / bytesPerToken) / 128 * 128;
+            if (longUnit > allocationUnit) {
+                const uint64_t capacity =
+                    std::max(key.expansionDims[1], value.expansionDims[1]) +
+                    ((uint64_t)k.dims[1] + longUnit - 1) / longUnit * longUnit;
+                if ((uint64_t)FastllmCudaGetFreeSize() >=
+                    capacity * bytesPerToken + reserveBytes) {
+                    allocationUnit = longUnit;
+                }
+            }
+        }
+#endif
+        Qwen35AppendDraftSequenceCache(key, k, allocationUnit);
+        Qwen35AppendDraftSequenceCache(value, v, allocationUnit);
+        tokens += k.dims[1];
+    }
+
+    void Qwen3_5Model::MtpKvCache::Truncate(int tokens) {
+        // Extra drafts may have reallocated K/V. Roll back logical length,
+        // keeping the strides and capacity of the actual backing buffers.
+        Qwen35ResizeDraftSequenceCache(key, tokens);
+        Qwen35ResizeDraftSequenceCache(value, tokens);
+        this->tokens = tokens;
+    }
+
     static bool Qwen35DisableBatchPrefill() {
         const char *env = std::getenv("FASTLLM_QWEN35_DISABLE_BATCH_PREFILL");
         return env != nullptr && Qwen35MoeIsTrueString(env);
@@ -17998,46 +18037,6 @@ namespace fastllm {
             }
             return Data(DataType::FLOAT32, {1, end - begin}, values);
         };
-        struct MtpRuntimeDataMeta {
-            std::vector<int> dims;
-            std::vector<uint64_t> strides;
-            std::vector<int> expansionDims;
-            uint64_t expansionSize = 0;
-            uint64_t expansionBytes = 0;
-        };
-        struct MtpRuntimeCacheMeta {
-            MtpRuntimeDataMeta key;
-            MtpRuntimeDataMeta value;
-            int tokens = 0;
-        };
-        auto makeMtpRuntimeDataMeta = [](const Data &data) {
-            MtpRuntimeDataMeta meta;
-            meta.dims = data.dims;
-            meta.strides = data.strides;
-            meta.expansionDims = data.expansionDims;
-            meta.expansionSize = data.expansionSize;
-            meta.expansionBytes = data.expansionBytes;
-            return meta;
-        };
-        auto restoreMtpRuntimeDataMeta = [](Data &data, const MtpRuntimeDataMeta &meta) {
-            data.dims = meta.dims;
-            data.strides = meta.strides;
-            data.expansionDims = meta.expansionDims;
-            data.expansionSize = meta.expansionSize;
-            data.expansionBytes = meta.expansionBytes;
-        };
-        auto makeMtpRuntimeCacheMeta = [&]() {
-            MtpRuntimeCacheMeta meta;
-            meta.key = makeMtpRuntimeDataMeta(mtpCache.key);
-            meta.value = makeMtpRuntimeDataMeta(mtpCache.value);
-            meta.tokens = mtpCache.tokens;
-            return meta;
-        };
-        auto restoreMtpRuntimeCacheMeta = [&](const MtpRuntimeCacheMeta &meta) {
-            restoreMtpRuntimeDataMeta(mtpCache.key, meta.key);
-            restoreMtpRuntimeDataMeta(mtpCache.value, meta.value);
-            mtpCache.tokens = meta.tokens;
-        };
         auto setNextInputWithDrafts = [&](int firstToken, const std::vector<int> &drafts) {
             nextInputTokens[0].clear();
             nextInputTokens[0].reserve(1 + drafts.size());
@@ -18064,7 +18063,7 @@ namespace fastllm {
             mtpProfileAddSpan(mtpProfileDraftFirstUs, firstDraftStart);
             drafts.push_back(draft);
             if (mtpDraftsPerStep > 1) {
-                MtpRuntimeCacheMeta runtimeMeta = makeMtpRuntimeCacheMeta();
+                const int cacheTokens = mtpCache.tokens;
                 // 双缓冲保存上一轮 draft 的 hidden state, 避免每轮多一次 CopyFrom
                 Data extraHiddenBuffers[2];
                 Data *prevHidden = &draftHidden;
@@ -18089,10 +18088,10 @@ namespace fastllm {
                         prevDraft = nextDraft;
                     }
                 } catch (...) {
-                    restoreMtpRuntimeCacheMeta(runtimeMeta);
+                    mtpCache.Truncate(cacheTokens);
                     throw;
                 }
-                restoreMtpRuntimeCacheMeta(runtimeMeta);
+                mtpCache.Truncate(cacheTokens);
             }
             return drafts;
         };
@@ -20732,30 +20731,6 @@ namespace fastllm {
             }
         }
 
-        struct RuntimeDataMeta {
-            std::vector<int> dims;
-            std::vector<uint64_t> strides;
-            std::vector<int> expansionDims;
-            uint64_t expansionSize = 0;
-            uint64_t expansionBytes = 0;
-        };
-        auto makeRuntimeDataMeta = [](const Data &data) {
-            RuntimeDataMeta meta;
-            meta.dims = data.dims;
-            meta.strides = data.strides;
-            meta.expansionDims = data.expansionDims;
-            meta.expansionSize = data.expansionSize;
-            meta.expansionBytes = data.expansionBytes;
-            return meta;
-        };
-        auto restoreRuntimeDataMeta = [](Data &data, const RuntimeDataMeta &meta) {
-            data.dims = meta.dims;
-            data.strides = meta.strides;
-            data.expansionDims = meta.expansionDims;
-            data.expansionSize = meta.expansionSize;
-            data.expansionBytes = meta.expansionBytes;
-        };
-
         acceptedTokens.assign(batch, std::vector<int>());
         nextInputTokens.assign(batch, std::vector<int>());
         keptInputLens = commitLens;
@@ -20879,20 +20854,13 @@ namespace fastllm {
             }
 
             if (draftsPerStep > 1) {
-                std::vector<RuntimeDataMeta> keyMetas(batch), valueMetas(batch);
                 std::vector<int> cacheTokens(batch, 0);
                 for (int b = 0; b < batch; b++) {
-                    keyMetas[b] = makeRuntimeDataMeta(requestMtpCaches[b]->key);
-                    valueMetas[b] = makeRuntimeDataMeta(requestMtpCaches[b]->value);
                     cacheTokens[b] = requestMtpCaches[b]->tokens;
                 }
                 auto restoreDraftCaches = [&]() {
                     for (int b = 0; b < batch; b++) {
-                        restoreRuntimeDataMeta(requestMtpCaches[b]->key,
-                                               keyMetas[b]);
-                        restoreRuntimeDataMeta(requestMtpCaches[b]->value,
-                                               valueMetas[b]);
-                        requestMtpCaches[b]->tokens = cacheTokens[b];
+                        requestMtpCaches[b]->Truncate(cacheTokens[b]);
                     }
                 };
 
@@ -29390,42 +29358,13 @@ namespace fastllm {
         v.Reshape({-1, totalTokens, this->head_dim});
 
         std::vector<Data> requestQ(batch), requestK(batch), requestV(batch);
-        auto appendMtpCache = [&](Data &past, Data &cur) {
-            if (past.dims.empty() && past.expansionDims.empty()) {
-                Data typed(cur.dataType);
-                past.CopyFrom(typed);
-                past.dataDevice = DataDevice::CUDA;
-                past.dataDeviceIds = {device};
-            }
-            const int unitLen = 128;
-            while ((past.dims.empty() &&
-                    (past.expansionDims.empty() ||
-                     cur.dims[1] > past.expansionDims[1])) ||
-                   (!past.dims.empty() &&
-                    past.dims[1] + cur.dims[1] > past.expansionDims[1])) {
-                std::vector<int> newDims;
-                if (past.Count(0) == 0 || past.dims.empty()) {
-                    newDims = {cur.dims[0],
-                               ((cur.dims[1] - 1) / unitLen + 1) * unitLen,
-                               cur.dims[2]};
-                } else {
-                    newDims = past.dims;
-                    newDims[1] +=
-                        ((cur.dims[1] - 1) / unitLen + 1) * unitLen;
-                }
-                past.Expansion(newDims);
-            }
-            CatDirect(past, cur, 1);
-        };
         for (int b = 0; b < batch; b++) {
             int begin = tokenOffsets[b];
             int end = begin + seqLens[b];
             Split(q, 1, begin, end, requestQ[b]);
             Split(k, 1, begin, end, requestK[b]);
             Split(v, 1, begin, end, requestV[b]);
-            appendMtpCache(caches[b]->key, requestK[b]);
-            appendMtpCache(caches[b]->value, requestV[b]);
-            caches[b]->tokens += seqLens[b];
+            caches[b]->Append(requestK[b], requestV[b]);
         }
 
         const int attentionWidth = num_attention_heads * this->head_dim;
@@ -29817,37 +29756,7 @@ namespace fastllm {
         k.Reshape({-1, seqLen, this->head_dim});
         v.Reshape({-1, seqLen, this->head_dim});
 
-        auto appendMtpCache = [&](Data &past, Data &cur) {
-            if (past.dims.empty() && past.expansionDims.empty()) {
-                Data typed(cur.dataType);
-                past.CopyFrom(typed);
-                past.dataDevice = DataDevice::CUDA;
-                past.dataDeviceIds = {device};
-            }
-            int unitLen = 128;
-            auto needsExpansion = [&]() {
-                if (past.dims.empty()) {
-                    return past.expansionDims.size() != cur.dims.size() ||
-                           cur.dims[1] > past.expansionDims[1];
-                }
-                return past.expansionDims.size() != past.dims.size() ||
-                       past.dims[1] + cur.dims[1] > past.expansionDims[1];
-            };
-            while (needsExpansion()) {
-                std::vector<int> newDims;
-                if (past.Count(0) == 0 || past.dims.size() == 0) {
-                    newDims = {cur.dims[0], ((cur.dims[1] - 1) / unitLen + 1) * unitLen, cur.dims[2]};
-                } else {
-                    newDims = past.dims;
-                    newDims[1] += ((cur.dims[1] - 1) / unitLen + 1) * unitLen;
-                }
-                past.Expansion(newDims);
-            }
-            CatDirect(past, cur, 1);
-        };
-        appendMtpCache(cache.key, k);
-        appendMtpCache(cache.value, v);
-        cache.tokens += seqLen;
+        cache.Append(k, v);
         if (cacheOnly) {
             return -1;
         }

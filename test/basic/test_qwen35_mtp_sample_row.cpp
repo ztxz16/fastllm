@@ -107,6 +107,7 @@ void InitCache(DraftModel::MtpKvCache &cache, int tokens, int headDim) {
 }
 
 std::vector<uint16_t> LogicalHalfData(const Data &data) {
+    if (data.dims.empty()) return {};
     Require(data.dataType == FLOAT16, "expected FP16 data");
     std::vector<uint16_t> values(data.dims[0] * data.dims[1] * data.dims[2]);
     for (int h = 0; h < data.dims[0]; ++h) {
@@ -243,6 +244,81 @@ void RunCausalCase() {
             "causal test did not change the future V row");
     std::cout << "non-last MTP output is independent of future rows PASS\n";
 }
+
+void RunRollbackCase(DraftModel &model, int headDim, int context,
+                     int batch, int accepted) {
+    std::vector<DraftModel::MtpKvCache> caches(batch), reference(batch);
+    for (int b = 0; b < batch; ++b) {
+        // The second request has a different capacity boundary.
+        InitCache(caches[b], context + b * 3, headDim);
+        InitCache(reference[b], context + b * 3, headDim);
+    }
+    auto append = [&](std::vector<DraftModel::MtpKvCache> &kv, int step) {
+        std::vector<Data> hidden(batch), positions(batch), sampled;
+        std::vector<const Data*> hiddenPtrs;
+        std::vector<Data*> positionPtrs;
+        std::vector<DraftModel::MtpKvCache*> cachePtrs;
+        std::vector<std::vector<int>> tokens(batch, {3 + step});
+        for (int b = 0; b < batch; ++b) {
+            hidden[b].dataType = FLOAT16;
+            hidden[b].Resize({1, 1, DraftModel::width});
+            Fill(hidden[b], 11 + step + b, 0.6f);
+            hidden[b].ToDevice(DataDevice::CUDA, {0}, true);
+            Data position(FLOAT32, {1, 1}, {float(kv[b].tokens)});
+            positions[b].CopyFrom(position);
+            hiddenPtrs.push_back(&hidden[b]);
+            positionPtrs.push_back(&positions[b]);
+            cachePtrs.push_back(&kv[b]);
+        }
+        // batch=1 delegates to the single-request production path.
+        model.RunMtpGreedyDraftBatch(0, {0}, cachePtrs, hiddenPtrs, tokens,
+                                     positionPtrs, std::vector<int>(batch, 0), &sampled);
+        std::vector<std::vector<uint16_t>> result;
+        for (const Data &data : sampled) result.push_back(LogicalHalfData(data));
+        return result;
+    };
+    append(caches, 0);
+    append(caches, 1);
+    for (int step = 0; step < accepted; ++step) append(reference, step);
+
+    std::vector<void*> keyPointers(batch), valuePointers(batch);
+    for (int b = 0; b < batch; ++b) {
+        auto keyCapacity = caches[b].key.expansionDims;
+        auto valueCapacity = caches[b].value.expansionDims;
+        auto keyStrides = caches[b].key.strides;
+        auto valueStrides = caches[b].value.strides;
+        auto keyBytes = caches[b].key.expansionBytes;
+        auto valueBytes = caches[b].value.expansionBytes;
+        keyPointers[b] = caches[b].key.cudaData;
+        valuePointers[b] = caches[b].value.cudaData;
+        caches[b].Truncate(context + b * 3 + accepted);
+        Require(caches[b].tokens == reference[b].tokens &&
+                    LogicalHalfData(caches[b].key) == LogicalHalfData(reference[b].key) &&
+                    LogicalHalfData(caches[b].value) == LogicalHalfData(reference[b].value),
+                "MTP rollback changed the committed K/V prefix");
+        Require(caches[b].key.expansionDims == keyCapacity &&
+                    caches[b].value.expansionDims == valueCapacity &&
+                    caches[b].key.strides == keyStrides &&
+                    caches[b].value.strides == valueStrides &&
+                    caches[b].key.expansionBytes == keyBytes &&
+                    caches[b].value.expansionBytes == valueBytes,
+                "MTP rollback restored an obsolete buffer layout");
+    }
+    Require(append(caches, 2) == append(reference, 2),
+            "MTP output after rollback differs from a cache without rejected drafts");
+    for (int b = 0; b < batch; ++b) {
+        Require(LogicalHalfData(caches[b].key) == LogicalHalfData(reference[b].key) &&
+                    LogicalHalfData(caches[b].value) == LogicalHalfData(reference[b].value),
+                "MTP append after rollback changed historical K/V");
+        if (accepted < 2) {
+            Require(caches[b].key.cudaData == keyPointers[b] &&
+                        caches[b].value.cudaData == valuePointers[b],
+                    "MTP reallocated capacity already reserved by rejected drafts");
+        }
+    }
+    std::cout << "rollback head_dim=" << headDim << " context=" << context
+              << " batch=" << batch << " accepted=" << accepted << " PASS\n";
+}
 }
 
 int main(int argc, char **argv) {
@@ -251,10 +327,27 @@ int main(int argc, char **argv) {
         SetThreads(2);
         SetCudaEmbedding(false);
         FastllmCudaSetDevice(0);
-        const bool longContext = argc == 2 && std::string(argv[1]) == "--long";
-        const bool useMoe = argc == 2 && std::string(argv[1]) == "--moe";
-        if (argc == 2 && std::string(argv[1]) == "--causal") {
+        const std::string mode = argc == 2 ? argv[1] : "";
+        const bool longContext = mode == "--long";
+        const bool useMoe = mode == "--moe";
+        if (mode == "--causal") {
             RunCausalCase();
+            return 0;
+        }
+        if (mode == "--rollback" || mode == "--rollback-long") {
+            const std::vector<int> contexts = mode == "--rollback-long"
+                ? std::vector<int>{16383, 196735}
+                : std::vector<int>{0, 127, 128, 4095};
+            for (int headDim : {128, 256}) {
+                DraftModel model(headDim);
+                for (int context : contexts) {
+                    for (int batch : {1, 2}) {
+                        for (int accepted : {0, 1, 2}) {
+                            RunRollbackCase(model, headDim, context, batch, accepted);
+                        }
+                    }
+                }
+            }
             return 0;
         }
         for (int headDim : {128, 256}) {

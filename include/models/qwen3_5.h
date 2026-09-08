@@ -234,6 +234,9 @@ namespace fastllm {
             Data key;
             Data value;
             int tokens = 0;
+
+            void Append(const Data &k, const Data &v);
+            void Truncate(int tokens);
         };
         struct DFlashContext {
             int committedTokens = 0;
