@@ -57,6 +57,8 @@ TP 调度保留当前 host token，PLE 查表无需等待 token 从 GPU 读回�
 
 `FASTLLM_CUDA_GRAPH` 统一控制是否启用图，PLE 搬运复用自动应用于单 token TP 路径。CPU/NUMA 混合推理和专家缓存的调度策略保持原有行为。
 
+TP 的 FP16 `lm_head` 自动按词表行分片，prefill 和 decode 共用；分片起点按 256 行对齐，保持 CUDA top1 的同分选择顺序。简单贪婪采样按最小输出长度要求在分片内屏蔽 EOS/stop token，再汇总各卡候选；其他采样、返回 logits 和调试 dump 在第 0 卡汇总完整 logits，再执行原逻辑。不满足分片条件的 head 保留复制方式。此优化无需额外环境变量，也不依赖 CUDA Graph。
+
 比较性能时固定实际输入/输出 token 数、提示词和采样配置，先预热再测量；Nsight Systems 波形用于解释等待来源，吞吐以未开启 profiler 的结果为准。
 
 ## PLE 磁盘模式

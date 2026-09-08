@@ -778,6 +778,12 @@ if (UNIT_TEST)
         add_test(NAME qwen4QSASelect COMMAND qwen4QSASelectRegression)
         set_tests_properties(qwen4QSASelect PROPERTIES LABELS cuda TIMEOUT 180 SKIP_RETURN_CODE 77)
 
+        add_executable(qwen4TpSamplingRegression test/ops/qwen4TpSamplingRegression.cpp)
+        target_link_libraries(qwen4TpSamplingRegression fastllm)
+        target_include_directories(qwen4TpSamplingRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME qwen4TpSampling COMMAND qwen4TpSamplingRegression)
+        set_tests_properties(qwen4TpSampling PROPERTIES LABELS cuda TIMEOUT 60 SKIP_RETURN_CODE 77)
+
         add_executable(ncclOddTpRegression test/ops/ncclOddTpRegression.cu)
         target_link_libraries(ncclOddTpRegression fastllm)
         target_include_directories(ncclOddTpRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

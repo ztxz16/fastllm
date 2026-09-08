@@ -9,6 +9,7 @@
 //
 
 #include "qwen4_exp.h"
+#include "qwen4_tp_sampling.h"
 
 #include "devices/cpu/alivethreadpool.h"
 #include "executor.h"
@@ -1380,6 +1381,12 @@ namespace fastllm {
     struct Qwen4ExpModel::ThreadTpState {
         std::vector<int> devices;
         std::vector<int> votes;
+        int vocabSize = 0;
+        std::vector<std::pair<int, float>> topCandidates;
+        std::vector<const Data *> shardLogits;
+        Data gatheredLogits;
+        bool TrySampleLogits(int rank, Data &logits,
+                const GenerationConfig &config, int cacheLength, int &token);
         std::vector<std::unique_ptr<Qwen4ExpModel>> ranks;
         using Cache = std::vector<std::pair<Data, Data>>;
         struct RequestCache {
@@ -1570,7 +1577,19 @@ namespace fastllm {
             const bool linear = name.find(".linear_attn.") != std::string::npos;
             const bool full = name.find(".self_attn.") != std::string::npos &&
                               name.find(".indexer.") == std::string::npos;
-            if (linear) {
+            if (name == "lm_head.weight" && source.dims.size() == 2 &&
+                source.dataType == DataType::FLOAT16 &&
+                source.dims[0] / 256 >= count && source.dims[0] <= (1 << 24)) {
+                // Row sharding preserves each logit's native FP32/FP16 GEMV
+                // arithmetic. Other weight formats retain the replicated head.
+                axis = 0;
+                tp.vocabSize = source.dims[0];
+                tp.topCandidates.resize(count);
+                tp.shardLogits.resize(count);
+                for (int r = 0; r < count; ++r) {
+                    scheme[devices[r]] = {qwen4_tp::VocabRange(tp.vocabSize, count, r)};
+                }
+            } else if (linear) {
                 if (name.find("in_proj_qkv.weight") != std::string::npos ||
                     name.find("conv1d.weight") != std::string::npos) {
                     scheme = qkvScheme; axis = 0;
@@ -1714,6 +1733,79 @@ namespace fastllm {
                                         [](int vote) { return vote != 0; });
         tp.Barrier();
         return result;
+    }
+
+    bool Qwen4ExpModel::ThreadTpState::TrySampleLogits(int rank, Data &logits,
+            const GenerationConfig &config, int cacheLength, int &token) {
+#ifdef USE_CUDA
+        if (vocabSize == 0) return false;
+        const auto range = qwen4_tp::VocabRange(vocabSize, devices.size(), rank);
+        AssertInFastLLM(logits.dataDevice == DataDevice::CUDA &&
+                        logits.dataType == DataType::FLOAT32 &&
+                        logits.Count(0) == (uint64_t)(range.second - range.first),
+                        "Qwen4 TP vocabulary shard has invalid logits.");
+        if (config.IsSimpleGreedy() && !config.output_logits &&
+            std::getenv("FASTLLM_QWEN4_DUMP_DIR") == nullptr) {
+            if (config.output_token_least > 0 &&
+                config.output_token_least > cacheLength - config.input_token_length) {
+                std::vector<int> localEos;
+                auto append = [&](int id) {
+                    if (id >= range.first && id < range.second) {
+                        localEos.push_back(id - range.first);
+                    }
+                };
+                append(ranks[rank]->eos_token_id);
+                for (int id : ranks[rank]->eos_token_ids) append(id);
+                for (int id : config.stop_token_ids) append(id);
+                FastllmResetLogitsOfEOSAll(1, &logits, localEos);
+            }
+            Data top;
+            TopK(logits, top, 1);
+            top.ToDevice(DataDevice::CPU);
+            const float *values = reinterpret_cast<const float *>(top.cpuData);
+            topCandidates[rank] = {(int)(values[0] + 1e-3f) + range.first, values[1]};
+            Barrier();
+            auto best = topCandidates.front();
+            for (size_t r = 1; r < topCandidates.size(); ++r) {
+                const auto &candidate = topCandidates[r];
+                if (qwen4_tp::Top1Before(candidate.first, candidate.second,
+                                         best.first, best.second)) best = candidate;
+            }
+            token = best.first;
+            return true;
+        }
+
+        // Sampling penalties, constraints, returned logits and dumps retain the
+        // original full-vocabulary CUDA sampling path on rank zero. Producers
+        // remain alive until all peer copies complete; forwardMutex serializes
+        // use of this shared gather buffer across requests.
+        shardLogits[rank] = &logits;
+        FastllmCudaSyncCurrentThreadStream();
+        Barrier();
+        if (rank == 0) {
+            auto dims = logits.dims;
+            dims.back() = vocabSize;
+            AssertInFastLLM(Qwen4PrepareDecodeGraphWorkspace(
+                                gatheredLogits, DataType::FLOAT32, dims, devices[0]),
+                            "Qwen4 TP could not allocate full sampling logits.");
+            for (int r = 0; r < (int)devices.size(); ++r) {
+                const auto part = qwen4_tp::VocabRange(vocabSize, devices.size(), r);
+                FastllmCudaMemcpyBetweenDevices(devices[0],
+                    (float *)gatheredLogits.cudaData + part.first,
+                    devices[r], shardLogits[r]->cudaData,
+                    (size_t)(part.second - part.first) * sizeof(float));
+            }
+        }
+        // The copy helper completes both peer and staged transfers before return.
+        Barrier();
+        if (rank != 0) {
+            token = -1; // Only rank zero's sampled token is returned by the parent.
+            return true;
+        }
+        logits.FreeSpace();
+        Qwen4BorrowCudaStorage(logits, gatheredLogits);
+#endif
+        return false;
     }
 
     void Qwen4ExpModel::RunThreadTpPLE(const Data &hyperInput, const Data &inputIds,
@@ -10922,6 +11014,12 @@ namespace fastllm {
 
             Linear(lastHidden, this->weight["lm_head.weight"], Data(), logits);
             ToDataType(logits, DataType::FLOAT32);
+        }
+        int tpToken;
+        if (threadTpOwner != nullptr && threadTpOwner->TrySampleLogits(
+                threadTpRank, logits, generationConfig,
+                qsaPreviousLength + inputIds.dims[1], tpToken)) {
+            return {tpToken};
         }
         if (allVerificationTokens != nullptr &&
             generationConfig.output_token_least > 0) {
