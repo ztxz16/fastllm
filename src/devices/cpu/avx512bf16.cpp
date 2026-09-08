@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <array>
+#include <limits>
 #include <vector>
 #include <cstring>
 #include <algorithm>
@@ -930,15 +931,22 @@ namespace fastllm {
         return ret;
     }
 
-    alignas(64) static const std::array<float, 256>
+    // Keep this table in read-only data: dynamic initialization in this
+    // AVX512-compiled file can execute unsupported instructions at library load.
+    // Exact powers of two also avoid a lazy-initialization guard in the kernels.
+    alignas(64) static constexpr std::array<float, 256>
     NVFP4_E8M0_COMBINED_SCALE_LOOKUP = []() {
         std::array<float, 256> values{};
-        for (int value = 0; value < 256; value++) {
-            uint32_t bits = value <= 190 ?
-                (uint32_t)(value == 0 ? 64 : value + 64) << 23 :
-                (uint32_t)value << 23;
-            memcpy(&values[value], &bits, sizeof(bits));
+        values[0] = 0x1p-63f;
+        for (int value = 1; value <= 190; value++) {
+            values[value] = values[value - 1] * 2.0f;
         }
+        // Above 190, the kernel applies the magic scale separately.
+        values[191] = 0x1p64f;
+        for (int value = 192; value <= 254; value++) {
+            values[value] = values[value - 1] * 2.0f;
+        }
+        values[255] = std::numeric_limits<float>::infinity();
         return values;
     }();
 
