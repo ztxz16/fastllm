@@ -1031,11 +1031,11 @@ bool FastllmCudaHalfAttention(const fastllm::Data &q, const fastllm::Data &k, co
     if (head_dim_qk == 256 && head_dim_vo == 256 && qo_len == 1 &&
         kv_len > 4096 && actual_batch == 1 && !use_custom_mask && maskType == 0 &&
         FastllmCudaFlashInferSupported() && !FastllmCudaGraphIsCapturing()) {
-        // CTA16's cross-warp state exceeds Turing's 64 KiB block limit.
-        // Check the actual storage type before allocating or dispatching.
+        // Only SM75 CTA16 uses compact FP16 storage. Match the dispatcher's
+        // architecture gate and preserve the original minimum on other GPUs.
         using MinSplitTraits = KernelTraits<MaskMode::kCausal, 16, 1, 1, 16, 16, 1, 4,
             PosEncodingMode::kNone, half, half, half, float, int,
-            DefaultAttention<false, false, false, false>>;
+            DefaultAttention<false, false, false, false>, true>;
         int maxSharedMemory = 0;
         cudaError_t state = cudaDeviceGetAttribute(&maxSharedMemory,
             cudaDevAttrMaxSharedMemoryPerBlockOptin, FastllmCudaGetDevice());
@@ -1048,7 +1048,13 @@ bool FastllmCudaHalfAttention(const fastllm::Data &q, const fastllm::Data &k, co
         const size_t maxChunks = ((size_t)kv_len + 255) / 256;
         const size_t bytesPerChunk = (size_t)num_qo_heads *
                                     (256 * sizeof(half) + sizeof(float));
-        if ((size_t)maxSharedMemory >= sizeof(MinSplitTraits::SharedStorage) &&
+        const auto capability = GetCudaComputeCapability();
+        const size_t minimumSharedMemory =
+            use_sm75_single_prefill_vo_split(capability.first, capability.second,
+                                             num_qo_heads / num_kv_heads)
+                ? sizeof(MinSplitTraits::SharedStorageSingle)
+                : sizeof(MinSplitTraits::SharedStorage);
+        if ((size_t)maxSharedMemory >= minimumSharedMemory &&
             maxChunks <= std::numeric_limits<size_t>::max() / bytesPerChunk) {
             void *scratch = nullptr;
             auto allocation = FastllmCudaTryMalloc(&scratch, maxChunks * bytesPerChunk);

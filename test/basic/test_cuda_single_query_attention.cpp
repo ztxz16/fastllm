@@ -4,6 +4,7 @@
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <limits>
@@ -26,9 +27,9 @@ float Value(int h, int t, int d, int pattern) {
     return Half((pattern == 0 ? 0.25f : 0.0f) +
                 float((t % 61 * 7 + d * 11 + h * 23) % 61 - 30) / 256.0f);
 }
-float Query(int h, int d, int pattern) {
+float Query(int h, int d, int pattern, int group = 6) {
     if (pattern == 0) return 0.0f;
-    if (pattern == 2) return Half(32.0f * Key(h / 6, 3, d));
+    if (pattern == 2) return Half(32.0f * Key(h / group, 3, d));
     return Half(float((h * 23 + d * 37) % 127 - 63) / 64.0f);
 }
 
@@ -58,11 +59,12 @@ std::vector<uint16_t> Read(const Data &data) {
     return result;
 }
 
-void RunReferenceCase(int dim, int length, int pattern, bool paddedQuery, int device) {
-    const int heads = 24, kvHeads = 4;
+void RunReferenceCase(int dim, int length, int pattern, bool paddedQuery, int device,
+                      int group = 6, int kvHeads = 4) {
+    const int heads = group * kvHeads;
     Data q(FLOAT16), k(FLOAT16), v(FLOAT16), output(FLOAT16), mask;
     Init(q, heads, 1, dim, paddedQuery ? 3 : 1, device,
-         [&](int h, int, int d) { return Query(h, d, pattern); });
+         [&](int h, int, int d) { return Query(h, d, pattern, group); });
     // Deliberately different physical capacities for K and V.
     Init(k, kvHeads, length, dim, length + 17, device, Key);
     Init(v, kvHeads, length, dim, length + (dim == 256 ? 129 : 17), device,
@@ -72,7 +74,7 @@ void RunReferenceCase(int dim, int length, int pattern, bool paddedQuery, int de
     output.dataDeviceIds = {device};
     output.Allocate();
     const float scale = 1.0f / std::sqrt(float(dim));
-    Require(FastllmCudaHalfAttention(q, k, v, mask, output, 6, scale, 0),
+    Require(FastllmCudaHalfAttention(q, k, v, mask, output, group, scale, 0),
             "attention failed");
     auto actual = Read(output);
 
@@ -85,7 +87,7 @@ void RunReferenceCase(int dim, int length, int pattern, bool paddedQuery, int de
         double scores[31], maxScore = -std::numeric_limits<double>::infinity();
         for (int t = 0; t < 31; ++t) {
             double dot = 0.0;
-            for (int d = 0; d < dim; ++d) dot += double(Query(h, d, pattern)) * Key(h / 6, t, d);
+            for (int d = 0; d < dim; ++d) dot += double(Query(h, d, pattern, group)) * Key(h / group, t, d);
             scores[t] = dot * scale;
             maxScore = std::max(maxScore, scores[t]);
         }
@@ -98,7 +100,7 @@ void RunReferenceCase(int dim, int length, int pattern, bool paddedQuery, int de
         }
         for (int d = 0; d < dim; ++d) {
             double numerator = 0.0;
-            for (int t = 0; t < 61; ++t) numerator += weights[t] * Value(h / 6, t, d, pattern);
+            for (int t = 0; t < 61; ++t) numerator += weights[t] * Value(h / group, t, d, pattern);
             double expected = numerator / denominator;
             double value = half_to_float(actual[h * dim + d]);
             double error = std::abs(value - expected);
@@ -111,8 +113,8 @@ void RunReferenceCase(int dim, int length, int pattern, bool paddedQuery, int de
                     "attention differs from double-precision reference");
         }
     }
-    std::printf("dim=%d kv=%d pattern=%d padded_q=%d max_abs=%.9g PASS\n",
-                dim, length, pattern, paddedQuery, maxError);
+    std::printf("dim=%d kv=%d group=%d kv_heads=%d pattern=%d padded_q=%d max_abs=%.9g PASS\n",
+                dim, length, group, kvHeads, pattern, paddedQuery, maxError);
 }
 
 void RunVisibilityCase(int rows, int maskType, bool explicitMask, int device) {
@@ -142,15 +144,47 @@ void RunVisibilityCase(int rows, int maskType, bool explicitMask, int device) {
     }
     std::printf("rows=%d mask_type=%d explicit_mask=%d PASS\n", rows, maskType, explicitMask);
 }
+
+void RunBenchmark(int device) {
+    const int heads = 24, kvHeads = 4, dim = 256, length = 65536, repeats = 200;
+    Data q(FLOAT16), k(FLOAT16), v(FLOAT16), output(FLOAT16), mask;
+    Init(q, heads, 1, dim, 1, device,
+         [](int h, int, int d) { return Query(h, d, 1); });
+    Init(k, kvHeads, length, dim, length + 1024, device, Key);
+    Init(v, kvHeads, length, dim, length + 1024, device,
+         [](int h, int t, int d) { return Value(h, t, d, 1); });
+    output.Resize({heads, 1, dim});
+    output.dataDevice = DataDevice::CUDA;
+    output.dataDeviceIds = {device};
+    output.Allocate();
+    auto attention = [&]() {
+        Require(FastllmCudaHalfAttention(q, k, v, mask, output, 6, 1.0f / 16, 0),
+                "benchmark attention failed");
+    };
+    for (int i = 0; i < 10; ++i) attention();
+    Require(cudaDeviceSynchronize() == cudaSuccess, "benchmark warmup failed");
+    const auto start = std::chrono::steady_clock::now();
+    for (int i = 0; i < repeats; ++i) attention();
+    Require(cudaDeviceSynchronize() == cudaSuccess, "benchmark synchronization failed");
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - start).count() / repeats;
+    for (uint16_t x : Read(output)) {
+        Require(std::isfinite(half_to_float(x)), "benchmark output is not finite");
+    }
+    std::printf("BENCHMARK device=%d kv=%d group=6 head_dim=%d repeats=%d wall_ms=%.6f\n",
+                device, length, dim, repeats, ms);
+}
 }
 
 int main(int argc, char **argv) {
     try {
         bool longContext = false;
+        bool benchmark = false;
         int device = 0;
         for (int i = 1; i < argc; ++i) {
             std::string arg(argv[i]);
             if (arg == "--long") longContext = true;
+            else if (arg == "--benchmark") benchmark = true;
             else if (arg == "--device=1") device = 1;
             else throw std::runtime_error("unknown argument");
         }
@@ -161,17 +195,27 @@ int main(int argc, char **argv) {
         Require(cudaDeviceGetAttribute(&maxSharedMemory,
                     cudaDevAttrMaxSharedMemoryPerBlockOptin, device) == cudaSuccess,
                 "could not query shared memory capacity");
-        // This reference tests split attention's FP32 accumulation. The old
-        // FP16 PV fallback on 64 KiB devices has different rounding error.
-        if (maxSharedMemory < 64 * 1024 + 512) return 77;
+        // Only SM75 gains compact storage. Other architectures retain the
+        // original skip threshold for this FP32-accumulation reference.
+        const int minimumSharedMemory = FastllmCudaRuntimeArch() == 75
+                                            ? 64 * 1024 : 64 * 1024 + 512;
+        if (maxSharedMemory < minimumSharedMemory) return 77;
         SetThreads(2);
+        if (benchmark) {
+            RunBenchmark(device);
+            return 0;
+        }
         for (int length : (longContext ? std::vector<int>{163840, 163841, 196608, 196609, 196615}
-                                       : std::vector<int>{4097, 4098, 8193})) {
+                                       : std::vector<int>{4097, 4098, 8193, 65535, 65536, 65537})) {
             for (int pattern = 0; pattern < 3; ++pattern) {
                 RunReferenceCase(256, length, pattern, true, device);
             }
         }
         if (!longContext) {
+            for (int group : {1, 4, 8, 16}) {
+                RunReferenceCase(256, 8193, 1, true, device, group, 1);
+                RunReferenceCase(256, 65537, 2, false, device, group);
+            }
             RunReferenceCase(256, 4095, 1, false, device);
             RunReferenceCase(256, 4096, 1, false, device);
             RunReferenceCase(128, 8193, 1, false, device);

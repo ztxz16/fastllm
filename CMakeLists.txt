@@ -706,6 +706,14 @@ if (UNIT_TEST)
         add_test(NAME cuda_single_query_attention COMMAND cuda_single_query_attention_test)
         set_tests_properties(cuda_single_query_attention PROPERTIES LABELS cuda SKIP_RETURN_CODE 77)
 
+        add_executable(cuda_single_prefill_dispatch_test test/basic/test_cuda_single_prefill_dispatch.cu)
+        target_include_directories(cuda_single_prefill_dispatch_test PRIVATE third_party)
+        set_target_properties(cuda_single_prefill_dispatch_test PROPERTIES
+            CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON
+            CUDA_ARCHITECTURES "${FASTLLM_CUDA_ARCHITECTURES}")
+        add_test(NAME cuda_single_prefill_dispatch COMMAND cuda_single_prefill_dispatch_test)
+        set_tests_properties(cuda_single_prefill_dispatch PROPERTIES LABELS cuda SKIP_RETURN_CODE 77)
+
         add_executable(cudaGgufChunkedDequantRegression test/ops/cudaGgufChunkedDequantRegression.cu)
         target_link_libraries(cudaGgufChunkedDequantRegression PRIVATE fastllm)
         target_include_directories(cudaGgufChunkedDequantRegression PRIVATE src/devices/cuda)
