@@ -10,6 +10,11 @@ snapshot.
 Only the headers needed by FastLLM's optional SM90 and SM120 kernels are kept.
 Each integration is compiled behind its own CMake architecture gate.
 
+Windows builds use MSVC's conforming preprocessor for CUDA translation units.
+The shared headers provide a host implementation of `fast_rcp` and only declare
+the unused 128-bit scalar store overload when the compiler supports that type.
+Device reciprocal instructions and the SM90/SM120 kernels are unchanged.
+
 The SM90 FP8 linear integration adds `impls/sm90_fp8_gemm_1d2d.cuh`,
 `mma/sm90.cuh`, and `ptx/wgmma.cuh` from the DeepGEMM headers bundled with
 vLLM 0.28.0. Its common dependencies are identical to the existing headers.

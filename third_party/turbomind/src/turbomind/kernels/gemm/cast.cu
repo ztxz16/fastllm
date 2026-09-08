@@ -251,7 +251,18 @@ Tensor BlockscaleToGroupscale(const Tensor& scales, DataType data_type, int bloc
             ret.data<T>(), scales.data<float>(), ret.size(), block_size);
     };
 
-    TM_DISPATCH_DTYPES(data_type, invoke, half_t, bfloat16_t);
+    // NVCC's MSVC front-end misparses the variadic dispatch macro here as a
+    // variable-template invocation. Keep the two supported cases explicit.
+    switch (data_type) {
+        case kFloat16:
+            invoke(half_t{});
+            break;
+        case kBfloat16:
+            invoke(bfloat16_t{});
+            break;
+        default:
+            TM_CHECK(0) << "unsupported type: " << to_string(data_type);
+    }
 
     return ret;
 }

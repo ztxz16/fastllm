@@ -47,6 +47,26 @@ namespace fastllm {
                strcmp(v, "off") != 0 && strcmp(v, "OFF") != 0;
     }
 
+    static bool MultiCudaStringEqualsIgnoreCase(const char *lhs, const char *rhs) {
+        if (lhs == nullptr || rhs == nullptr) {
+            return lhs == rhs;
+        }
+        while (*lhs != '\0' && *rhs != '\0') {
+            unsigned char l = static_cast<unsigned char>(*lhs++);
+            unsigned char r = static_cast<unsigned char>(*rhs++);
+            if (l >= 'A' && l <= 'Z') {
+                l = static_cast<unsigned char>(l - 'A' + 'a');
+            }
+            if (r >= 'A' && r <= 'Z') {
+                r = static_cast<unsigned char>(r - 'A' + 'a');
+            }
+            if (l != r) {
+                return false;
+            }
+        }
+        return *lhs == *rhs;
+    }
+
     static bool MultiCudaDedicatedWorkersEnabled() {
         return !MultiCudaEnvFlagEnabled("FASTLLM_DISABLE_MULTICUDA_DEDICATED_WORKERS");
     }
@@ -5000,7 +5020,8 @@ namespace fastllm {
         }
         bool useNccl = !deferReduction && FastllmInitNccl(devices);
         if (const char *disableNccl = getenv("FASTLLM_DISABLE_NCCL")) {
-            if (strcmp(disableNccl, "1") == 0 || strcasecmp(disableNccl, "true") == 0) {
+            if (strcmp(disableNccl, "1") == 0 ||
+                MultiCudaStringEqualsIgnoreCase(disableNccl, "true")) {
                 useNccl = false;
             }
         }
@@ -6804,7 +6825,8 @@ auto st = std::chrono::system_clock::now();
                               output.dataType == DataType::FLOAT32) &&
                              output.Count(0) > 0;
         if (const char *disableNccl = getenv("FASTLLM_DISABLE_NCCL")) {
-            if (strcmp(disableNccl, "1") == 0 || strcasecmp(disableNccl, "true") == 0) {
+            if (strcmp(disableNccl, "1") == 0 ||
+                MultiCudaStringEqualsIgnoreCase(disableNccl, "true")) {
                 useNcclReduce = false;
             }
         }

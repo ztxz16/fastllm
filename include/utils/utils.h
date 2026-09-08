@@ -27,7 +27,7 @@
 #endif
 #endif
 
-#if defined(_WIN32) or defined(_WIN64)
+#if defined(_WIN32) || defined(_WIN64)
 #include <Windows.h>
 #else
 #include <unistd.h>
@@ -65,7 +65,7 @@
     // If _xgetbv is not found, you might need to implement it with inline assembly.
     #ifndef _XCR_XFEATURE_ENABLED_MASK // Often defined with _xgetbv
     #define _XCR_XFEATURE_ENABLED_MASK 0
-    #if __GNUC__ < 8 and !defined(USE_ROCM)
+    #if __GNUC__ < 8 && !defined(USE_ROCM)
     static uint64_t _xgetbv(uint32_t xcr_index) {
         uint32_t eax, edx;
         __asm__ __volatile__ (

@@ -15,7 +15,11 @@ namespace turbomind::core {
 #else
 #define TM_LIKELY(expr) (__builtin_expect(bool(expr), 1))
 #define TM_UNLIKELY(expr) (__builtin_expect(bool(expr), 0))
+#if defined(_MSC_VER)
+#define TM_NOINLINE __declspec(noinline)
+#else
 #define TM_NOINLINE __attribute__((noinline))
+#endif
 #define TM_UNREACHABLE __builtin_unreachable()
 #endif
 

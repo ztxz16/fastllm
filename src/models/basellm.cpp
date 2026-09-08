@@ -20,6 +20,44 @@
 
 namespace fastllm {
     namespace {
+        static long long ScaleNonNegativeByPercent(long long value, int percent) {
+            value = std::max(0LL, value);
+            percent = std::max(0, std::min(100, percent));
+            // Split before multiplying so this remains exact without relying on
+            // GCC/Clang's non-standard __int128 extension.
+            return (value / 100) * percent + (value % 100) * percent / 100;
+        }
+
+        static bool ConsumeNonNegativeProductFromBudget(long long count,
+                                                        long long bytesPerItem,
+                                                        long long &remaining) {
+            count = std::max(0LL, count);
+            bytesPerItem = std::max(0LL, bytesPerItem);
+            if (count == 0 || bytesPerItem == 0) {
+                return true;
+            }
+            if (remaining < 0 || count > remaining / bytesPerItem) {
+                return false;
+            }
+            remaining -= count * bytesPerItem;
+            return true;
+        }
+
+        static long long SaturatingNonNegativeProduct(long long lhs, long long rhs) {
+            lhs = std::max(0LL, lhs);
+            rhs = std::max(0LL, rhs);
+            if (lhs != 0 && rhs > LLONG_MAX / lhs) {
+                return LLONG_MAX;
+            }
+            return lhs * rhs;
+        }
+
+        static long long SaturatingNonNegativeAdd(long long lhs, long long rhs) {
+            lhs = std::max(0LL, lhs);
+            rhs = std::max(0LL, rhs);
+            return rhs > LLONG_MAX - lhs ? LLONG_MAX : lhs + rhs;
+        }
+
         static bool NeedRepeatPenalty(const GenerationConfig &config) {
             float diff = config.repeat_penalty - 1.0f;
             return diff > 1e-6f || diff < -1e-6f;
@@ -4632,15 +4670,17 @@ namespace fastllm {
                 int budgetPercent = std::max(
                     1, std::min(100,
                                 this->GetAutoWarmupLinearAttentionBatchBudgetPercent()));
-                __int128 budget = (__int128)avail * budgetPercent / 100;
+                long long budget = ScaleNonNegativeByPercent(avail, budgetPercent);
                 int low = 0, high = getBaseBatchLimit();
                 while (low < high) {
                     int mid = low + (high - low + 1) / 2;
                     long long runtimeReserve = std::max(
                         0LL, this->GetAutoWarmupCudaRuntimeReserveBytes(id, mid));
-                    __int128 fixedNeed = (__int128)mid * linearBytesOnDevice +
-                                         (__int128)runtimeReserve;
-                    if (fixedNeed <= budget) {
+                    long long remaining = budget;
+                    bool fits = ConsumeNonNegativeProductFromBudget(
+                                    mid, linearBytesOnDevice, remaining) &&
+                                runtimeReserve <= remaining;
+                    if (fits) {
                         low = mid;
                     } else {
                         high = mid - 1;
@@ -4737,11 +4777,16 @@ namespace fastllm {
                 while (low < high) {
                     long long mid = (low + high + 1) / 2;
                     long long activeBatch = std::min<long long>(batchLimit, mid);
-                    __int128 need = (__int128)mid * kvBytesPerPage +
-                                    (__int128)mid * delayedCacheBytesPerPage +
-                                    (__int128)activeBatch * linearBytesOnDevice +
-                                    (__int128)runtimeReserveBytes(activeBatch);
-                    if (need <= avail) {
+                    long long remaining = avail;
+                    bool fits = ConsumeNonNegativeProductFromBudget(
+                                    mid, kvBytesPerPage, remaining) &&
+                                ConsumeNonNegativeProductFromBudget(
+                                    mid, delayedCacheBytesPerPage, remaining) &&
+                                ConsumeNonNegativeProductFromBudget(
+                                    activeBatch, linearBytesOnDevice, remaining);
+                    long long runtimeReserve = runtimeReserveBytes(activeBatch);
+                    fits = fits && runtimeReserve <= remaining;
+                    if (fits) {
                         low = mid;
                     } else {
                         high = mid - 1;
@@ -5098,12 +5143,21 @@ namespace fastllm {
                         if (bytesPerFinalPage <= 0) {
                             continue;
                         }
-                        __int128 freedCurrentCacheBytes =
-                            (__int128)currentPages * bytesPerPageOnDevice;
-                        __int128 finalPageBudget =
-                            (__int128)freeAfterWarmup[id] + freedCurrentCacheBytes - targetFree;
-                        long long pages = finalPageBudget > 0 ?
-                            (long long)(finalPageBudget / bytesPerFinalPage) : 0;
+                        long long freedCurrentCacheBytes =
+                            SaturatingNonNegativeProduct(currentPages, bytesPerPageOnDevice);
+                        long long freeBytes = std::max(0LL, freeAfterWarmup[id]);
+                        long long targetFreeBytes = std::max(0LL, targetFree);
+                        long long finalPageBudget = 0;
+                        if (freeBytes >= targetFreeBytes) {
+                            finalPageBudget = SaturatingNonNegativeAdd(
+                                freeBytes - targetFreeBytes, freedCurrentCacheBytes);
+                        } else {
+                            long long deficit = targetFreeBytes - freeBytes;
+                            if (freedCurrentCacheBytes > deficit) {
+                                finalPageBudget = freedCurrentCacheBytes - deficit;
+                            }
+                        }
+                        long long pages = finalPageBudget / bytesPerFinalPage;
                         pages = std::min<long long>(
                             pages, INT_MAX / std::max(1, pageLen));
                         deviceTargetPages[id] = pages;

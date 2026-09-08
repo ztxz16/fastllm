@@ -153,8 +153,9 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread --std=c++17 -O2")
 elseif(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     string(REPLACE "/Ob2" "/Ob1 /Gy" CMAKE_CXX_FLAGS_RELEASE ${CMAKE_CXX_FLAGS_RELEASE})
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DNOMINMAX /std:c++17 /arch:AVX2 /source-charset:utf-8")
-    if (CXX_MAJOR_VERSION GREATER_EQUAL 19 AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DNOMINMAX -D_USE_MATH_DEFINES /std:c++17 /arch:AVX2 /source-charset:utf-8")
+    if (CXX_MAJOR_VERSION GREATER_EQUAL 19 AND
+        CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
         set_source_files_properties(
             "src/devices/cpu/avx512f.cpp"
             PROPERTIES
@@ -213,6 +214,14 @@ message(STATUS "CMAKE_CXX_FLAGS: ${CMAKE_CXX_FLAGS}")
 file(GLOB GRAPH_MODEL_FILES "src/models/graph/*.cpp")
 file(GLOB BLOCK_FILES "src/blocks/*.cpp")
 file(GLOB CPU_DEVICE_FILES "src/devices/cpu/*.cpp")
+if (MSVC)
+    # gguf.cpp uses C++20 designated initializers. Keep the rest of the host
+    # runtime on C++17 so Windows u8 string literals retain their char type.
+    set_source_files_properties(
+        "third_party/gguf/gguf.cpp"
+        PROPERTIES COMPILE_OPTIONS "/std:c++20"
+    )
+endif()
 set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/contextconfig.cpp src/executor.cpp src/template.cpp src/graph.cpp src/tokenizer.cpp
         src/devices/disk/diskdevice.cpp
         src/models/graphllm.cpp src/models/chatglm.cpp src/models/moss.cpp src/models/llama.cpp src/models/qwen.cpp src/models/basellm.cpp
@@ -249,7 +258,63 @@ if (USE_SENTENCEPIECE)
 endif()
 
 if (USE_CUDA)
+    if (WIN32 AND NOT DEFINED CMAKE_CUDA_RUNTIME_LIBRARY)
+        # Match MSVC's /MD runtime and avoid mixing LIBCMT into the wheel DLL.
+        # The Python loader discovers cudart64_*.dll from CUDA_PATH at runtime.
+        set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
+    endif()
     enable_language(CUDA)
+    if (MSVC)
+        # NVCC invokes cl.exe for preprocessing too. UTF-8 Chinese comments
+        # must not be decoded as the host ANSI codepage (which can eat a newline).
+        add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
+        # CUTLASS/DeepGEMM variadic tuple macros need conforming expansion.
+        add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
+        # Parallelize architectures in the template-heavy wheel build files.
+        if (CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 11.2)
+            set_property(SOURCE
+                src/devices/cuda/gguf_mmq/fastllm-gguf-mmq.cu
+                src/devices/cuda/attention/fastllm-attention.cu
+                APPEND PROPERTY COMPILE_OPTIONS "--threads=4")
+            set_property(SOURCE src/devices/cuda/fastllm-ggml-cuda.cu
+                APPEND PROPERTY COMPILE_OPTIONS "--threads=8")
+        endif()
+        # CUDA 12.9's CCCL uses long2 for 64-bit PTX operands. On Windows
+        # long is 32-bit; provide a build-local header with longlong2 instead.
+        # Keep the installed Toolkit untouched and leave fixed SDKs alone.
+        foreach(FASTLLM_CUDA_INCLUDE IN LISTS CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES)
+            set(FASTLLM_CLC_RELATIVE "cuda/__ptx/instructions/generated/clusterlaunchcontrol.h")
+            set(FASTLLM_CLC_HEADER "${FASTLLM_CUDA_INCLUDE}/${FASTLLM_CLC_RELATIVE}")
+            if (EXISTS "${FASTLLM_CLC_HEADER}")
+                file(READ "${FASTLLM_CLC_HEADER}" FASTLLM_CLC_ORIGINAL)
+                string(REPLACE "reinterpret_cast<long2*>" "reinterpret_cast<longlong2*>"
+                    FASTLLM_CLC_FIXED "${FASTLLM_CLC_ORIGINAL}")
+                if (NOT FASTLLM_CLC_FIXED STREQUAL FASTLLM_CLC_ORIGINAL)
+                    set(FASTLLM_CUDA_COMPAT_DIR "${CMAKE_BINARY_DIR}/cuda-compat")
+                    set(FASTLLM_CLC_OUTPUT "${FASTLLM_CUDA_COMPAT_DIR}/${FASTLLM_CLC_RELATIVE}")
+                    set(FASTLLM_CLC_EXISTING "")
+                    if (EXISTS "${FASTLLM_CLC_OUTPUT}")
+                        file(READ "${FASTLLM_CLC_OUTPUT}" FASTLLM_CLC_EXISTING)
+                    endif()
+                    if (NOT FASTLLM_CLC_EXISTING STREQUAL FASTLLM_CLC_FIXED)
+                        file(WRITE "${FASTLLM_CLC_OUTPUT}" "${FASTLLM_CLC_FIXED}")
+                    endif()
+                    # Limit the override to the translation units that include
+                    # this CCCL instruction header through Thrust/CUB/FlashInfer.
+                    set_property(SOURCE
+                        src/devices/cuda/fastllm-cuda.cu
+                        src/devices/cuda/fastllm-ggml-cuda.cu
+                        src/devices/cuda/attention/fastllm-attention.cu
+                        src/devices/cuda/models/deepseekv4-kernels.cu
+                        src/devices/cuda/models/qwen4-kernels.cu
+                        third_party/turbomind/src/turbomind/kernels/gemm/context.cu
+                        APPEND PROPERTY INCLUDE_DIRECTORIES "${FASTLLM_CUDA_COMPAT_DIR}")
+                    message(STATUS "Windows CUDA cluster launch operand compatibility: ON")
+                endif()
+                break()
+            endif()
+        endforeach()
+    endif()
     if (CMAKE_BUILD_TYPE STREQUAL "Release" AND CMAKE_CUDA_FLAGS_RELEASE STREQUAL "")
         set(CMAKE_CUDA_FLAGS_RELEASE "-O3 -DNDEBUG" CACHE STRING "CUDA release flags" FORCE)
     endif()

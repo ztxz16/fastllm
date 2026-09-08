@@ -6,6 +6,7 @@
 #define ALIVETHREAD_H
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <thread>
 #include <vector>

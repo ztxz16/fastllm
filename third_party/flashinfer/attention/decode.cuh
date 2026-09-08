@@ -940,7 +940,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(Params params) {
   constexpr uint32_t kv_iter_len = bdy * bdz;
   constexpr uint32_t compute_qk_tile = bdy;
 
-  extern __attribute__((shared)) uint8_t smem[];
+  extern __shared__ uint8_t smem[];
   DTypeKV* ckv_smem = (DTypeKV*)smem;
   DTypeKV* kpe_smem = (DTypeKV*)((uint8_t*)ckv_smem +
                                  num_stages_smem * kv_iter_len * head_dim_ckv * sizeof(DTypeKV));

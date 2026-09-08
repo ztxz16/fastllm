@@ -238,7 +238,7 @@ namespace cg = cooperative_groups;
 
 // PackedType is the one used in kernel for Lamport buffer (LDG.128 or LDG.64)
 template <typename PackedType = float4, bool UseCGA = false>
-__device__ struct __attribute__((aligned(32))) LamportFlags {
+struct alignas(32) LamportFlags {
  public:
   __device__ explicit LamportFlags(uint32_t* bufferFlags, uint32_t numStages = 1)
       : mBufferFlagsPtr(bufferFlags), mFlagAccessPtr(&bufferFlags[8]) {

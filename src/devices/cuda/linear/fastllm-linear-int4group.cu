@@ -2149,7 +2149,7 @@ static int GetInt4Group128HalfBlock() {
         if (hasAVX512VNNI) {
             halfBlock = 32;
         } else {
-            __cpuid(regs, 1);
+            __cpuidex(regs, 1, 0);
             bool hasAVX2 = false;
             if (regs[2] & (1 << 27)) {
                 __cpuidex(regs, 7, 0);

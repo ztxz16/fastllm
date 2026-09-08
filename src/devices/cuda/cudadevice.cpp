@@ -136,6 +136,19 @@ namespace fastllm {
         return (int)value;
     }
 
+    // This native kernel is compiled by CMake and does not use the POSIX
+    // Triton compiler service below. Keep it available in Windows SM90 builds.
+#ifdef FASTLLM_ENABLE_DEEPGEMM_FP8_SM90
+    static bool TryCudaDeepGemmLinearFp8Sm90(
+        Data &input, Data &weight, const Data &bias, Data &output, int n, int m, int k) {
+        if (FastllmCudaDeepGemmLinearFp8Sm90(input, weight, bias, output, n, m, k)) {
+            TraceCudaLinearFp8Path("deepgemm-sm90-fp8-block128", n, m, k);
+            return true;
+        }
+        return false;
+    }
+#endif
+
 #if !defined(_WIN32) && !defined(USE_ROCM)
     static const int kCudaTritonLinearFp8Block128KernelCount = 2;
     static const char *kCudaTritonLinearFp8Block128KernelKeys[kCudaTritonLinearFp8Block128KernelCount] = {
@@ -2344,17 +2357,6 @@ namespace fastllm {
         return true;
     }
 
-#ifdef FASTLLM_ENABLE_DEEPGEMM_FP8_SM90
-    static bool TryCudaDeepGemmLinearFp8Sm90(
-        Data &input, Data &weight, const Data &bias, Data &output, int n, int m, int k) {
-        if (FastllmCudaDeepGemmLinearFp8Sm90(input, weight, bias, output, n, m, k)) {
-            TraceCudaLinearFp8Path("deepgemm-sm90-fp8-block128", n, m, k);
-            return true;
-        }
-        return false;
-    }
-#endif
-
     static bool TryCudaCutlassLinearFp8Block128(
         Data &input, Data &weight, const Data &bias, Data &output, int n, int m, int k) {
         if (!CudaEnvFlagDefaultEnabled("FASTLLM_CUDA_CUTLASS_LINEAR_FP8", true)) {
@@ -4256,6 +4258,16 @@ namespace fastllm {
             batch, topk, hidden, inter, experts);
     }
 #else
+    static bool TryCudaCutlassLinearFp8Block128(
+        Data &, Data &, const Data &, Data &, int, int, int) {
+        return false;
+    }
+
+    static bool TryCudaCutlassLinearFp8PerChannel(
+        Data &, Data &, const Data &, Data &, int, int, int) {
+        return false;
+    }
+
     bool FastllmCudaTryTritonDeepSeekV4WoA(
         const Data &, Data &, int, int, Data &) {
         return false;

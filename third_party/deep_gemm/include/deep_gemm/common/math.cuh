@@ -63,9 +63,13 @@ CUTLASS_DEVICE float2 fma2(const float2& a, const float2& b, const float2& c) {
 }
 
 CUTLASS_HOST_DEVICE float fast_rcp(const float& x) {
+#if defined(__CUDA_ARCH__)
     float ret;
     asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(ret) : "f"(x));
     return ret;
+#else
+    return 1.0f / x;
+#endif
 }
 
 /// Casting

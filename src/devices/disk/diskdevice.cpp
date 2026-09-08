@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cerrno>
 #include <cctype>
+#include <climits>
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
@@ -16,8 +17,13 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#if defined(_WIN32) || defined(_WIN64)
+#include <io.h>
+#include <malloc.h>
+#else
 #include <sys/mman.h>
 #include <unistd.h>
+#endif
 #include <unordered_map>
 #include <unordered_set>
 
@@ -30,6 +36,71 @@
 #endif
 
 namespace fastllm {
+#if defined(_WIN32) || defined(_WIN64)
+    using DiskFileOffset = __int64;
+    using DiskSSize = __int64;
+
+    static std::mutex &GetDiskPreadMutex() {
+        static std::mutex locker;
+        return locker;
+    }
+
+    static int DiskOpenFile(const std::string &fileName, int) {
+        return _open(fileName.c_str(), _O_RDONLY | _O_BINARY);
+    }
+
+    static void DiskCloseFile(int fd) {
+        _close(fd);
+    }
+
+    // MSVC has no pread. Serialize the seek/read pair because descriptors are
+    // cached and may be shared by disk-worker threads.
+    static DiskSSize DiskPread(int fd, void *buffer, size_t bytes,
+                               DiskFileOffset offset) {
+        std::lock_guard<std::mutex> guard(GetDiskPreadMutex());
+        if (_lseeki64(fd, offset, SEEK_SET) < 0) {
+            return -1;
+        }
+        const unsigned int request =
+            (unsigned int)std::min<size_t>(bytes, INT_MAX);
+        return (DiskSSize)_read(fd, buffer, request);
+    }
+
+    static void *DiskAlignedAlloc(size_t alignment, size_t bytes) {
+        return _aligned_malloc(bytes, alignment);
+    }
+
+    static void DiskAlignedFree(void *buffer) {
+        _aligned_free(buffer);
+    }
+#else
+    using DiskFileOffset = off_t;
+    using DiskSSize = ssize_t;
+
+    static int DiskOpenFile(const std::string &fileName, int flags) {
+        return open(fileName.c_str(), flags);
+    }
+
+    static void DiskCloseFile(int fd) {
+        close(fd);
+    }
+
+    static DiskSSize DiskPread(int fd, void *buffer, size_t bytes,
+                               DiskFileOffset offset) {
+        return pread(fd, buffer, bytes, offset);
+    }
+
+    static void *DiskAlignedAlloc(size_t alignment, size_t bytes) {
+        void *buffer = nullptr;
+        return posix_memalign(&buffer, alignment, bytes) == 0
+            ? buffer : nullptr;
+    }
+
+    static void DiskAlignedFree(void *buffer) {
+        free(buffer);
+    }
+#endif
+
 #ifdef USE_CUDA
     extern void DoCudaMergeMOEFromCPU(Data &input, Data &output, Data &index, Data &score,
                                       Data &w1, Data &w2, Data &w3,
@@ -140,10 +211,10 @@ namespace fastllm {
     public:
         ~DiskFileCache() {
             for (auto &it : fds) {
-                close(it.second);
+                DiskCloseFile(it.second);
             }
             for (auto &it : directFds) {
-                close(it.second);
+                DiskCloseFile(it.second);
             }
         }
 
@@ -162,7 +233,7 @@ namespace fastllm {
             if (it != cache.end()) {
                 return it->second;
             }
-            int fd = open(fileName.c_str(), flags);
+            int fd = DiskOpenFile(fileName, flags);
             if (fd < 0) {
                 ErrorInFastLLM("Disk device can't open weight file: " + fileName + "\n");
             }
@@ -184,7 +255,7 @@ namespace fastllm {
     class DiskDirectScratch {
     public:
         ~DiskDirectScratch() {
-            free(buffer);
+            DiskAlignedFree(buffer);
         }
 
         uint8_t *Acquire(size_t bytes) {
@@ -192,11 +263,11 @@ namespace fastllm {
                 return nullptr;
             }
             if (bytes > capacity) {
-                free(buffer);
+                DiskAlignedFree(buffer);
                 buffer = nullptr;
                 capacity = 0;
-                void *ptr = nullptr;
-                if (posix_memalign(&ptr, 4096, bytes) != 0) {
+                void *ptr = DiskAlignedAlloc(4096, bytes);
+                if (ptr == nullptr) {
                     return nullptr;
                 }
                 buffer = (uint8_t*)ptr;
@@ -226,7 +297,8 @@ namespace fastllm {
                             bytes <= part.bytes - offset && bytes > 0,
                             "Disk direct read range is invalid: " + part.fileName + "\n");
             const uint64_t alignment = 4096;
-            const uint64_t maxFileOffset = (uint64_t)std::numeric_limits<off_t>::max();
+            const uint64_t maxFileOffset =
+                (uint64_t)std::numeric_limits<DiskFileOffset>::max();
             AssertInFastLLM((uint64_t)part.fileOffset <= maxFileOffset &&
                             offset <= maxFileOffset - (uint64_t)part.fileOffset &&
                             bytes <= maxFileOffset - ((uint64_t)part.fileOffset + offset),
@@ -245,8 +317,8 @@ namespace fastllm {
             if (buffer != nullptr) {
                 usesScratch = true;
             } else {
-                void *ptr = nullptr;
-                AssertInFastLLM(posix_memalign(&ptr, alignment, bufferBytes) == 0 && ptr != nullptr,
+                void *ptr = DiskAlignedAlloc(alignment, bufferBytes);
+                AssertInFastLLM(ptr != nullptr,
                                 "Disk direct read buffer allocation failed.\n");
                 buffer = (uint8_t*)ptr;
             }
@@ -254,8 +326,9 @@ namespace fastllm {
             int fd = GetDiskFileCache().Get(part.fileName, true);
             size_t done = 0;
             while (done < requiredBytes) {
-                ssize_t ret = pread(fd, buffer + done, bufferBytes - done,
-                                    (off_t)(alignedOffset + done));
+                DiskSSize ret = DiskPread(
+                    fd, buffer + done, bufferBytes - done,
+                    (DiskFileOffset)(alignedOffset + done));
                 if (ret < 0) {
                     if (errno == EINTR) {
                         continue;
@@ -288,7 +361,7 @@ namespace fastllm {
             if (usesScratch) {
                 diskDirectScratch.Release();
             } else {
-                free(buffer);
+                DiskAlignedFree(buffer);
             }
             buffer = nullptr;
         }
@@ -314,8 +387,9 @@ namespace fastllm {
         int fd = GetDiskFileCache().Get(part.fileName);
         uint64_t done = 0;
         while (done < bytes) {
-            ssize_t ret = pread(fd, dst + done, bytes - done,
-                                part.fileOffset + offset + done);
+            DiskSSize ret = DiskPread(
+                fd, dst + done, (size_t)(bytes - done),
+                (DiskFileOffset)(part.fileOffset + offset + done));
             if (ret < 0) {
                 if (errno == EINTR) {
                     continue;
@@ -558,6 +632,31 @@ namespace fastllm {
                             fileOffset >= 0 && bytes > 0,
                             "Disk Linear mmap range is invalid: " + part.fileName + "\n");
             int fd = GetDiskFileCache().Get(part.fileName);
+#if defined(_WIN32) || defined(_WIN64)
+            // Windows has no POSIX mmap in the MSVC runtime. A bounded chunked
+            // read keeps the disk backend functional; the surrounding linear
+            // path already limits this range with DiskLinearChunkBytes().
+            mappedBytes = (size_t)bytes;
+            mapped = malloc(mappedBytes);
+            if (mapped == nullptr) {
+                mappedBytes = 0;
+                return;
+            }
+            size_t done = 0;
+            while (done < mappedBytes) {
+                DiskSSize ret = DiskPread(
+                    fd, (uint8_t*)mapped + done, mappedBytes - done,
+                    (DiskFileOffset)((uint64_t)fileOffset + done));
+                if (ret <= 0) {
+                    free(mapped);
+                    mapped = nullptr;
+                    mappedBytes = 0;
+                    return;
+                }
+                done += (size_t)ret;
+            }
+            data = (uint8_t*)mapped;
+#else
             long pageSizeValue = sysconf(_SC_PAGESIZE);
             size_t pageSize = pageSizeValue > 0 ? (size_t)pageSizeValue : 4096;
             uint64_t alignedOffset = (uint64_t)fileOffset / pageSize * pageSize;
@@ -575,13 +674,18 @@ namespace fastllm {
 #ifdef MADV_SEQUENTIAL
             madvise(mapped, mappedBytes, MADV_SEQUENTIAL);
 #endif
+#endif
         }
 
         ~DiskMappedRange() {
             if (mapped == nullptr) {
                 return;
             }
+#if defined(_WIN32) || defined(_WIN64)
+            free(mapped);
+#else
             munmap(mapped, mappedBytes);
+#endif
         }
 
         uint8_t *Get() const {
@@ -598,8 +702,11 @@ namespace fastllm {
         if (DiskDirectIoEnabled() || bytes == 0 || offset > part.bytes || bytes > part.bytes - offset) {
             return;
         }
+#if !defined(_WIN32) && !defined(_WIN64)
         int fd = GetDiskFileCache().Get(part.fileName);
-        posix_fadvise(fd, (off_t)(part.fileOffset + offset), (off_t)bytes, POSIX_FADV_WILLNEED);
+        posix_fadvise(fd, (off_t)(part.fileOffset + offset), (off_t)bytes,
+                      POSIX_FADV_WILLNEED);
+#endif
     }
 
     static size_t DiskPartRows(const DiskWeightPart &part) {

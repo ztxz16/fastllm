@@ -40,7 +40,9 @@ typedef struct __tile_config {
 #define ARCH_REQ_XCOMP_PERM     0x1023
 #define XFEATURE_XTILECFG       17
 #define XFEATURE_XTILEDATA      18
+#if !defined(_WIN32) && !defined(_WIN64)
 #include <sys/syscall.h>
+#endif
 
 namespace fastllm {
     extern CPUInstructInfo cpuInstructInfo;

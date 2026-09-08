@@ -3524,7 +3524,7 @@ namespace fastllm {
             if (lowMemMode && this->embeddingNames.find(name) != this->embeddingNames.end()) {
                 if (dataType == DataType::FLOAT32 || dataType == DataType::BFLOAT16 || dataType == DataType::FLOAT16) {
                     weight[name].fileName = fileName;
-#if defined(_WIN32) or defined(_WIN64)
+#if defined(_WIN32) || defined(_WIN64)
                     weight[name].filePos = _ftelli64(buffer.f);
 #else
 #ifdef USE_MMAP

@@ -2,7 +2,9 @@
 // Created by huangyuyang on 6/13/23.
 //
 
+#ifndef _USE_MATH_DEFINES
 #define _USE_MATH_DEFINES
+#endif
 #include "devices/cpu/cpudevice.h"
 #include "executor.h"
 #include "devices/cpu/computeutils.h"
@@ -16,6 +18,7 @@
 #include <cmath>
 #include <atomic>
 #include <set>
+#include <sstream>
 
 #ifdef __aarch64__
 #include <arm_neon.h>
@@ -2892,7 +2895,7 @@ namespace fastllm {
         
         // 为每个线程分配任务状态
         for (int i = 0; i < numThreads; i++) {
-            taskStates[i] = new (std::align_val_t{64}) TaskState();
+            taskStates[i] = new TaskState();
             taskStates[i]->curr.store(0, std::memory_order_relaxed);
             taskStates[i]->end = 0;
             taskStates[i]->completed.store(false, std::memory_order_relaxed);
@@ -2945,12 +2948,7 @@ namespace fastllm {
         for (int i = 0; i < numThreads; i++) {
             delete wsOps[i];
             if (taskStates[i] != nullptr) {
-                taskStates[i]->~TaskState();
-                #if __cpp_aligned_new >= 201606
-                    operator delete(taskStates[i], std::align_val_t{64});
-                #else
-                    free_aligned(taskStates[i], sizeof(TaskState));
-                #endif
+                delete taskStates[i];
             }
         }
         
@@ -5346,7 +5344,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                 std::vector<float> weightRow(embSize);
                 for (int i = 0; i < inputLen; i++) {
                     int token = getToken(i);
-#if defined(_WIN32) or defined(_WIN64)
+#if defined(_WIN32) || defined(_WIN64)
                     _fseeki64(fi, (long long)token * embSize * sizeof(float) + weight.filePos, 0);
 #else
                     fseek(fi, (long long)token * embSize * sizeof(float) + weight.filePos, 0);
@@ -5358,7 +5356,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                 std::vector<uint16_t> weightRow(embSize);
                 for (int i = 0; i < inputLen; i++) {
                     int token = getToken(i);
-#if defined(_WIN32) or defined(_WIN64)
+#if defined(_WIN32) || defined(_WIN64)
                     _fseeki64(fi, (long long)token * embSize * sizeof(uint16_t) + weight.filePos, 0);
 #else
                     fseek(fi, (long long)token * embSize * sizeof(uint16_t) + weight.filePos, 0);
@@ -5439,7 +5437,7 @@ ops += (long long)lines * inputDim * interDim * 2;
             uint8_t *outputData = (uint8_t *) output.cpuData;
             for (int i = 0; i < inputLen; i++) {
                 int token = (int) (inputData[i] + 1e-9);
-#if defined(_WIN32) or defined(_WIN64)
+#if defined(_WIN32) || defined(_WIN64)
                 _fseeki64(fi, (long long)token * embSize * unitSize + weight.filePos, 0);
 #else
                 fseek(fi, (long long)token * embSize * unitSize + weight.filePos, 0);
