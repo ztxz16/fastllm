@@ -222,10 +222,9 @@ static KernelFn PickFp4Kernel(int sizeM, int threadK, int threadN,
 
 static bool SelectTile(int sizeM, int sizeN, int sizeK, int deviceArch,
                        int &threadK, int &threadN) {
-    // A wider tile needs enough rows/columns to amortize its reduction and
-    // enough K work to benefit from four copy stages. In particular, M64 or
-    // narrow-N GEMMs can regress even on Ampere. Keep their existing tiles.
-    if (IsAmpereFp8Device(deviceArch) &&
+    // Prefer the wider prefill tile on SM75 (two copy stages) and
+    // SM80/SM86 (four stages) only when M/N/K amortize its overhead.
+    if ((deviceArch == 75 || IsAmpereFp8Device(deviceArch)) &&
         sizeM >= 256 && sizeN >= 4096 && sizeK >= 1024 &&
         sizeK % 64 == 0 && sizeN % 256 == 0) {
         threadK = 64;
