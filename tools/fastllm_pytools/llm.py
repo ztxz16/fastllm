@@ -202,8 +202,125 @@ def _preload_cuda_runtime_dependencies() -> Dict[str, Any]:
     diagnostics["unresolved"] = sorted(unresolved)
     return diagnostics
 
+_windows_dll_directory_handles = []
+
+def _discover_windows_dll_dirs() -> List[str]:
+    package_dir = os.path.dirname(os.path.realpath(__file__))
+    candidates = [
+        package_dir,
+        os.path.join(sys.prefix, "Library", "bin"),
+        os.path.join(sys.prefix, "DLLs"),
+    ]
+
+    # CUDA installers expose CUDA_PATH (and often versioned CUDA_PATH_Vxx_x).
+    for name, value in os.environ.items():
+        if name.upper() == "CUDA_PATH" or name.upper().startswith("CUDA_PATH_V"):
+            if value:
+                candidates.append(os.path.join(value, "bin"))
+        elif name.upper() == "NCCL_ROOT" and value:
+            candidates.extend([
+                os.path.join(value, "bin"),
+                os.path.join(value, "lib"),
+                os.path.join(value, "lib", "x64"),
+            ])
+
+    search_roots = []
+    try:
+        search_roots.extend(site.getsitepackages())
+    except Exception:
+        pass
+    try:
+        user_site = site.getusersitepackages()
+        if isinstance(user_site, str):
+            search_roots.append(user_site)
+    except Exception:
+        pass
+    search_roots.extend(path for path in sys.path if isinstance(path, str))
+    for root in dict.fromkeys(search_roots):
+        if not os.path.isdir(root):
+            continue
+        candidates.extend(glob.glob(os.path.join(root, "nvidia", "**", "bin"),
+                                    recursive=True))
+
+    # Dependency bundles do not have to use a particular directory layout.
+    # Discover every directory containing a DLL declared by their metadata.
+    for dist_name in [
+        "ftllmdepend",
+        "nvidia-cuda-runtime-cu12",
+        "nvidia-cublas-cu12",
+        "nvidia-nccl-cu12",
+    ]:
+        try:
+            dist = importlib_metadata.distribution(dist_name)
+            for entry in dist.files or []:
+                if str(entry).lower().endswith(".dll"):
+                    candidates.append(os.path.dirname(str(dist.locate_file(entry))))
+        except Exception:
+            continue
+
+    # ctypes.CDLL's default Windows flags do not search PATH. Register its
+    # directories explicitly as well, retaining support for PATH-only SDKs.
+    candidates.extend(path.strip('"') for path in os.environ.get("PATH", "").split(os.pathsep)
+                      if path)
+
+    result = []
+    seen = set()
+    for path in candidates:
+        if not isinstance(path, str) or not os.path.isdir(path):
+            continue
+        normalized = os.path.normcase(os.path.abspath(path))
+        if normalized not in seen:
+            seen.add(normalized)
+            result.append(os.path.abspath(path))
+    return result
+
+def _prepare_windows_dll_search_path() -> List[str]:
+    dll_dirs = _discover_windows_dll_dirs()
+    if hasattr(os, "add_dll_directory"):
+        for dll_dir in dll_dirs:
+            try:
+                # Keep handles alive for as long as the native library is used.
+                _windows_dll_directory_handles.append(
+                    os.add_dll_directory(dll_dir)
+                )
+            except OSError:
+                continue
+    current_path = os.environ.get("PATH", "")
+    existing = {os.path.normcase(path) for path in current_path.split(os.pathsep)}
+    prepend = [path for path in dll_dirs if os.path.normcase(path) not in existing]
+    if prepend:
+        os.environ["PATH"] = os.pathsep.join(prepend + [current_path])
+    return dll_dirs
+
 if platform.system() == 'Windows':
-    fastllm_lib = ctypes.CDLL(os.path.join(os.path.split(os.path.realpath(__file__))[0], "fastllm_tools.dll"), winmode=0)
+    package_dir = os.path.dirname(os.path.realpath(__file__))
+    windows_dll_dirs = _prepare_windows_dll_search_path()
+    windows_load_errors = []
+    fastllm_lib = None
+    for libname in ["fastllm_tools.dll", "fastllm_tools-cpu.dll"]:
+        libpath = os.path.join(package_dir, libname)
+        if not os.path.isfile(libpath):
+            continue
+        try:
+            fastllm_lib = ctypes.CDLL(libpath)
+            if libname == "fastllm_tools-cpu.dll":
+                logging.warning(
+                    "FastLLM CUDA DLL could not be loaded; using the bundled "
+                    "CPU fallback. Install a matching CUDA Toolkit or add its "
+                    "bin directory to PATH to enable CUDA."
+                )
+            break
+        except OSError as error:
+            windows_load_errors.append(f"{libname}: {error}")
+    if fastllm_lib is None:
+        details = "\n".join(f" - {error}" for error in windows_load_errors)
+        searched = "\n".join(f" - {path}" for path in windows_dll_dirs)
+        raise OSError(
+            "Unable to load FastLLM on Windows. Load attempts:\n"
+            f"{details or ' - no packaged FastLLM DLL was found'}\n"
+            "DLL search directories:\n"
+            f"{searched or ' - none'}"
+        )
 elif platform.system() == 'Darwin':
     fastllm_lib = ctypes.cdll.LoadLibrary(os.path.join(os.path.split(os.path.realpath(__file__))[0], "libfastllm_tools.dylib"))
 else:

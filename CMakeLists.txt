@@ -897,32 +897,19 @@ endif()
 file(WRITE ${CMAKE_BINARY_DIR}/build_info.json
 "{\n  \"USE_CUDA\": ${BUILD_INFO_USE_CUDA},\n  \"USE_NCCL\": ${BUILD_INFO_USE_NCCL},\n  \"USE_ROCM\": ${BUILD_INFO_USE_ROCM},\n  \"USE_NUMAS\": ${BUILD_INFO_USE_NUMAS},\n  \"USE_TFACC\": ${BUILD_INFO_USE_TFACC},\n  \"USE_TOPS\": ${BUILD_INFO_USE_TOPS},\n  \"USE_IVCOREX\": ${BUILD_INFO_USE_IVCOREX}\n}\n")
 
-if (${CMAKE_HOST_WIN32})
-    add_custom_command(
-            TARGET fastllm_tools
-            POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E make_directory tools
-            COMMAND ${CMAKE_COMMAND} -E make_directory tools/ftllm
-            COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/tools/fastllm_pytools ${CMAKE_BINARY_DIR}/tools/ftllm/.
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_CURRENT_SOURCE_DIR}/tools/fastllm_triton_server.py ${CMAKE_BINARY_DIR}/tools/ftllm/fastllm_triton_server.py
-            COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/tools/scripts ${CMAKE_BINARY_DIR}/tools/.
-            COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/$(Configuration)/fastllm_tools.dll ${CMAKE_BINARY_DIR}/tools/ftllm/.
-            COMMAND ${CMAKE_COMMAND} -E remove ${CMAKE_BINARY_DIR}/$(Configuration)/fastllm_tools.dll
-            COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/build_info.json ${CMAKE_BINARY_DIR}/tools/ftllm/.
-    )
-else()
-    add_custom_command(
-            TARGET fastllm_tools
-            POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E make_directory tools
-            COMMAND ${CMAKE_COMMAND} -E make_directory tools/ftllm
-            COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/tools/fastllm_pytools ${CMAKE_BINARY_DIR}/tools/ftllm/.
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_CURRENT_SOURCE_DIR}/tools/fastllm_triton_server.py ${CMAKE_BINARY_DIR}/tools/ftllm/fastllm_triton_server.py
-            COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/tools/scripts ${CMAKE_BINARY_DIR}/tools/.
-            COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/libfastllm_tools.* ${CMAKE_BINARY_DIR}/tools/ftllm/.
-            COMMAND ${CMAKE_COMMAND} -E remove ${CMAKE_BINARY_DIR}/libfastllm_tools.*
-            COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/build_info.json ${CMAKE_BINARY_DIR}/tools/ftllm/.
-    )
-endif()
+set(FASTLLM_PYTHON_STAGE_COMMANDS
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/tools
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/tools/ftllm
+        COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/tools/fastllm_pytools ${CMAKE_BINARY_DIR}/tools/ftllm
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_CURRENT_SOURCE_DIR}/tools/fastllm_triton_server.py ${CMAKE_BINARY_DIR}/tools/ftllm/fastllm_triton_server.py
+        COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/tools/scripts ${CMAKE_BINARY_DIR}/tools
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:fastllm_tools> ${CMAKE_BINARY_DIR}/tools/ftllm/$<TARGET_FILE_NAME:fastllm_tools>
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/build_info.json ${CMAKE_BINARY_DIR}/tools/ftllm/build_info.json
+)
+add_custom_command(TARGET fastllm_tools POST_BUILD ${FASTLLM_PYTHON_STAGE_COMMANDS} VERBATIM)
+# Packaging must refresh Python, assets and build metadata even when the native
+# library is already up to date. Share the staging commands with direct builds.
+add_custom_target(fastllm_python_package ${FASTLLM_PYTHON_STAGE_COMMANDS}
+        DEPENDS fastllm_tools VERBATIM)
 
 endif()

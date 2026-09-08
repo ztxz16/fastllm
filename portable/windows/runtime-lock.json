@@ -1,0 +1,38 @@
+{
+  "python": {
+    "version": "3.11.15",
+    "build": "20260718",
+    "filename": "python-windows-3.11.15.tar.gz",
+    "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260718/cpython-3.11.15%2B20260718-x86_64-pc-windows-msvc-install_only_stripped.tar.gz",
+    "source": "https://github.com/astral-sh/python-build-standalone/releases/tag/20260718",
+    "sha256": "a48c2dbe832319f61aa8557c9900caec70f7fed0cbee391a4c9ff9f98b50222d"
+  },
+  "electron": {
+    "version": "44.1.1",
+    "filename": "electron-v44.1.1-win32-x64.zip",
+    "url": "https://github.com/electron/electron/releases/download/v44.1.1/electron-v44.1.1-win32-x64.zip",
+    "source": "https://github.com/electron/electron/releases/tag/v44.1.1",
+    "sha256": "c574a22981889b74212c90a9391adcca116cd9d74e32b660ab21d0130ab50cc2"
+  },
+  "pi": {
+    "version": "0.84.4",
+    "filename": "pi-windows-x64.zip",
+    "url": "https://github.com/earendil-works/pi/releases/download/v0.84.4/pi-windows-x64.zip",
+    "source": "https://github.com/earendil-works/pi/releases/tag/v0.84.4",
+    "sha256": "03b2318774f18721e959d9f8f3340a9f942e7aa516fb7030d3007a12a40a4a97"
+  },
+  "rg": {
+    "version": "15.1.0",
+    "filename": "ripgrep-15.1.0-x86_64-pc-windows-msvc.zip",
+    "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.1.0/ripgrep-15.1.0-x86_64-pc-windows-msvc.zip",
+    "source": "https://github.com/BurntSushi/ripgrep/releases/tag/15.1.0",
+    "sha256": "124510b94b6baa3380d051fdf4650eaa80a302c876d611e9dba0b2e18d87493a"
+  },
+  "fd": {
+    "version": "10.3.0",
+    "filename": "fd-v10.3.0-x86_64-pc-windows-msvc.zip",
+    "url": "https://github.com/sharkdp/fd/releases/download/v10.3.0/fd-v10.3.0-x86_64-pc-windows-msvc.zip",
+    "source": "https://github.com/sharkdp/fd/releases/tag/v10.3.0",
+    "sha256": "318aa2a6fa664325933e81fda60d523fff29444129e91ebf0726b5b3bcd8b059"
+  }
+}

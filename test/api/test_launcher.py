@@ -94,7 +94,25 @@ class LauncherConfigTest(unittest.TestCase):
             json.dump(config, file)
         weight_path = os.path.join(directory, "model.safetensors")
         with open(weight_path, "wb") as file:
-            file.truncate(weight_gib * 1024 ** 3)
+            if os.name == "nt":
+                # Windows truncate allocates real disk space unless the file
+                # is explicitly sparse; these metadata fixtures can be 600 GB.
+                import ctypes
+                import msvcrt
+                handle = ctypes.c_void_p(msvcrt.get_osfhandle(file.fileno()))
+                returned = ctypes.c_ulong()
+                if not ctypes.windll.kernel32.DeviceIoControl(
+                    handle, 0x900C4, None, 0, None, 0, ctypes.byref(returned), None
+                ):
+                    raise ctypes.WinError()
+                # Python's Windows truncate uses _chsize_s, which writes zeroes
+                # even to sparse files. SetEndOfFile extends without doing I/O.
+                if not ctypes.windll.kernel32.SetFilePointerEx(
+                    handle, ctypes.c_longlong(weight_gib * 1024 ** 3), None, 0
+                ) or not ctypes.windll.kernel32.SetEndOfFile(handle):
+                    raise ctypes.WinError()
+            else:
+                file.truncate(weight_gib * 1024 ** 3)
 
     def test_preview_reuses_tui_command_builder(self):
         preview = self.runtime.preview(self.config(

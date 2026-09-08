@@ -5,6 +5,7 @@ import shutil
 import sqlite3
 import time
 import uuid
+from contextlib import closing
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -87,7 +88,9 @@ class ChatStore:
         return connection
 
     def _initialize(self) -> None:
-        with self._connect() as connection:
+        # SQLite's transaction context commits/rolls back but does not close
+        # the handle. Close it explicitly so Windows releases the database.
+        with closing(self._connect()) as connection, connection:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(
                 """
@@ -121,7 +124,7 @@ class ChatStore:
         now = time.time()
         normalized_settings = dict(DEFAULT_SETTINGS)
         normalized_settings.update(settings or {})
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             connection.execute(
                 "INSERT INTO conversations "
                 "(id, title, settings_json, created_at, updated_at) "
@@ -139,14 +142,14 @@ class ChatStore:
     def has_conversation(self, conversation_id: str) -> bool:
         if not conversation_id:
             return False
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             row = connection.execute(
                 "SELECT 1 FROM conversations WHERE id = ?", (conversation_id,)
             ).fetchone()
         return row is not None
 
     def list_conversations(self, limit: int = 200) -> List[Dict[str, Any]]:
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             rows = connection.execute(
                 "SELECT id, title, created_at, updated_at FROM conversations "
                 "ORDER BY updated_at DESC LIMIT ?",
@@ -155,7 +158,7 @@ class ChatStore:
         return [dict(row) for row in rows]
 
     def load_conversation(self, conversation_id: str) -> Dict[str, Any]:
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             conversation = connection.execute(
                 "SELECT * FROM conversations WHERE id = ?", (conversation_id,)
             ).fetchone()
@@ -188,7 +191,7 @@ class ChatStore:
         title: Optional[str] = None,
     ) -> None:
         now = time.time()
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             row = connection.execute(
                 "SELECT title, settings_json FROM conversations WHERE id = ?",
                 (conversation_id,),
@@ -229,7 +232,7 @@ class ChatStore:
             )
 
     def delete_conversation(self, conversation_id: str) -> None:
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
             connection.execute(
                 "DELETE FROM conversations WHERE id = ?", (conversation_id,)
             )

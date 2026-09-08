@@ -213,7 +213,7 @@ def _child_process_options(
     if cwd is not None:
         options["cwd"] = cwd
     if os.name == "nt":
-        options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
     else:
         options["start_new_session"] = True
     return options
@@ -1145,6 +1145,7 @@ class LauncherRuntime:
                     stderr=subprocess.DEVNULL,
                     timeout=8,
                     check=False,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
                 )
                 try:
                     process.wait(timeout=3)
@@ -1233,6 +1234,23 @@ def _parse_modelscope_download_progress(line: str) -> Optional[Dict[str, int]]:
 
 
 def _memory_info() -> Dict[str, int]:
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        class MemoryStatus(ctypes.Structure):
+            _fields_ = [("length", wintypes.DWORD), ("load", wintypes.DWORD)] + [
+                (name, ctypes.c_ulonglong) for name in (
+                    "total", "available", "page_total", "page_available",
+                    "virtual_total", "virtual_available", "extended_available",
+                )
+            ]
+
+        status = MemoryStatus()
+        status.length = ctypes.sizeof(status)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return {"total": status.total, "available": status.available}
+        return {"total": 0, "available": 0}
     values = {}
     try:
         with open("/proc/meminfo", "r", encoding="utf-8") as file:

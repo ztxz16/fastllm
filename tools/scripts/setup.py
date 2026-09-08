@@ -1,4 +1,5 @@
 import email
+import json
 import os
 from setuptools import setup
 
@@ -11,6 +12,29 @@ download_require = ['aria2', 'modelscope>=1.34.0,<2']
 tokenizer_require = ['tiktoken', 'blobfile', 'partial_json_parser']
 video_require = ['imageio', 'imageio-ffmpeg']
 all_require = server_require + download_require + tokenizer_require + video_require + pptx_require + document_require + data_require
+
+
+def load_build_features():
+    try:
+        with open(os.path.join("ftllm", "build_info.json"),
+                  "r", encoding="utf-8") as build_info_file:
+            return json.load(build_info_file)
+    except (OSError, ValueError, TypeError):
+        # Preserve the historical CUDA dependency set when setup.py is used
+        # outside CMake's staged package directory.
+        return {"USE_CUDA": True, "USE_NCCL": True}
+
+
+build_features = load_build_features()
+native_require = ['triton>=3.6; sys_platform == "linux"']
+if build_features.get("USE_CUDA", False):
+    native_require += [
+        'nvidia-cuda-runtime-cu12; platform_system == "Windows" or platform_system == "Linux"',
+        'nvidia-cublas-cu12; platform_system == "Windows" or platform_system == "Linux"',
+    ]
+if build_features.get("USE_CUDA", False) and build_features.get("USE_NCCL", False):
+    # NVIDIA currently publishes the NCCL runtime wheel for Linux only.
+    native_require.append('nvidia-nccl-cu12; platform_system == "Linux"')
 
 PACKAGE_INFO = {
     "release": {"name": "ftllm", "version": "0.1.8.2"},
@@ -71,14 +95,10 @@ setup (
              'launcher_assets/locales/*.json', 'webui_assets/*']
     },
     install_requires=[
-        'pyreadline3',
+        'pyreadline3; platform_system == "Windows"',
         'transformers',
         'jinja2>=3.1.0',
-        'triton>=3.6; sys_platform == "linux"',
-        'nvidia-cuda-runtime-cu12',
-        'nvidia-cublas-cu12',
-        'nvidia-nccl-cu12'
-    ] + all_require,
+    ] + native_require + all_require,
     extras_require={
         'all': all_require,
         'server': server_require,
