@@ -834,6 +834,18 @@ void LaunchFastllmGemmFp16FP8E4M3(half *input, uint8_t *weight, half *output, ha
     const bool exactRows = n > 1 &&
         n < fastllm::FastllmCudaGetLinearExactBatchThreshold();
 
+    // Four-token verification on SM89 benefits from more blocks and fewer
+    // registers per thread. Each output keeps the same accumulation order.
+    if (n == 4 && useBlock128 && FastllmCudaRuntimeArch() == 89) {
+        constexpr int N4_W = 2;
+        constexpr int N4_ROWS = 2;
+        const int n4Grid = (k + N4_W * N4_ROWS - 1) / (N4_W * N4_ROWS);
+        FastllmGemvHalfFP8E4M3KernelWarpMultiRowBlock128
+            <N4_W, 4, N4_ROWS><<<n4Grid, N4_W * 32>>>(
+                input, weight, output, bias, scales, m, k);
+        return;
+    }
+
     // PART=8 with four output rows per warp needs 128 registers/thread on
     // current nvcc. SM120 benefits from trading cache-resident activation
     // reloads for occupancy, with the best tradeoff depending on the output
