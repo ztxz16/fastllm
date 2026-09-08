@@ -479,6 +479,9 @@ namespace fastllm {
             bool materializeCausalMaskOnGraphFallback = false,
             const Data *precomputedEmbedding = nullptr);
 
+        bool TryRunThreadTpPrefixCudaGraph(
+            Data &hiddenStates,
+            std::vector<std::pair<Data, Data>> &pastKeyValues);
         bool TryRunDecodeCudaGraphBackbone(
             int graphStartLayer,
             bool startBeforeAttention,

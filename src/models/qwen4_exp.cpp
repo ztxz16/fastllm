@@ -1191,6 +1191,10 @@ namespace fastllm {
         int32_t *pinnedDecodeMeta = nullptr;
         std::map<int, Segment> segments;
 
+        // Layer 0 has no growing full-attention cache. Keep its TP graph
+        // through backbone recaptures, but release it with the request slot.
+        std::unique_ptr<DecodeCudaGraphState> tpPrefix;
+
         void DestroyGraphs() {
 #ifdef USE_CUDA
             const int previousDevice = FastllmCudaGetDevice();
@@ -7429,6 +7433,183 @@ namespace fastllm {
         return (int)(reinterpret_cast<float *>(top.cpuData)[0] + 1e-3f);
     }
 
+    bool Qwen4ExpModel::TryRunThreadTpPrefixCudaGraph(
+            Data &hiddenStates,
+            std::vector<std::pair<Data, Data>> &pastKeyValues) {
+#ifndef USE_CUDA
+        return false;
+#else
+        if (threadTpRank < 0 || !GetFastllmEnv().cudaGraph ||
+            this->pleLayer != 1 || !this->IsLinearAttentionLayer(0) ||
+            hiddenStates.dims != std::vector<int>({1, 1, this->hcCount * this->embed_dim}) ||
+            GetKVCacheInCPU() ||
+            std::getenv("FASTLLM_QWEN4_DUMP_DIR") != nullptr ||
+            !Qwen4CudaOnlyDeviceMap(this->deviceMap) ||
+            !Qwen4CudaOnlyDeviceMap(this->moeDeviceMap) ||
+            !Qwen4CudaOnlyDeviceMap(this->layeredMoeDeviceMap)) {
+            return false;
+        }
+        const int device = threadTpOwner->devices[threadTpRank];
+        auto onDevice = [&](const Data &data) {
+            return data.dataDevice == DataDevice::CUDA && data.cudaData != nullptr &&
+                !data.multiDeviceData &&
+                (data.dataDeviceIds.empty() || data.dataDeviceIds[0] == device);
+        };
+        Data &pastConv = pastKeyValues[0].first;
+        Data &pastRecurrent = pastKeyValues[0].second;
+        // Prefill initializes both recurrent buffers. Hybrid/cache policy
+        // decisions stay outside capture and continue on their existing path.
+        const bool ready = onDevice(hiddenStates) && onDevice(pastConv) &&
+            onDevice(pastRecurrent) && !pastConv.dims.empty() &&
+            !pastRecurrent.dims.empty() && !this->weights.empty() &&
+            !this->weights[0].empty() &&
+            !FastllmCudaUseMoeHybrid(this->weights[0].data(), this->weights[0].size());
+        if (!ThreadTpAllTrue(ready)) {
+            return false;
+        }
+
+        DecodeCudaGraphState *graphState;
+        {
+            std::lock_guard<std::mutex> guard(this->stateMutex);
+            auto &backbone = this->decodeCudaGraphStates[&pastKeyValues[0].first];
+            if (!backbone) backbone.reset(new DecodeCudaGraphState());
+            if (!backbone->tpPrefix) backbone->tpPrefix.reset(new DecodeCudaGraphState());
+            graphState = backbone->tpPrefix.get();
+        }
+        std::lock_guard<std::mutex> guard(graphState->mutex);
+        const std::vector<void*> cachePointers = {pastConv.cudaData, pastRecurrent.cudaData};
+        const bool sameStorage = graphState->device == device &&
+            graphState->linearCachePointers == cachePointers &&
+            graphState->hiddenStates[0].dims == hiddenStates.dims &&
+            graphState->hiddenStates[0].dataType == hiddenStates.dataType;
+        if (!ThreadTpAllTrue(sameStorage)) {
+            graphState->Reset(device);
+        }
+        graphState->linearCachePointers = cachePointers;
+        const bool prepared = Qwen4PrepareDecodeGraphTensor(
+            graphState->hiddenStates[0], hiddenStates, device);
+        if (!ThreadTpAllTrue(prepared)) {
+            return false;
+        }
+
+        auto runBody = [&]() {
+            Data &input = graphState->hiddenStates[0];
+            const std::string prefix = languagePrefix + "layers.0.";
+            const std::string attnPrefix = prefix + "attn_hyper_connection.";
+            const std::string mlpPrefix = prefix + "mlp_hyper_connection.";
+            Data norm, attnInput, attnInjection, attnOutput;
+            GroupedRMSNorm(input, this->weight[attnPrefix + "hc_norm.weight"], norm);
+            HyperMixNormalized(norm, attnPrefix, attnInput, &attnInjection);
+            norm.FreeSpace();
+            RunLinearAttention(0, attnInput, pastConv, pastRecurrent, attnOutput);
+            Data residual, mlpNorm, mlpInput, mlpInjection, mlpOutput;
+            HyperCombineRMSNorm(input, attnOutput, attnInjection,
+                this->weight[mlpPrefix + "hc_norm.weight"], residual, mlpNorm);
+            HyperMixNormalized(mlpNorm, mlpPrefix, mlpInput, &mlpInjection);
+            mlpNorm.FreeSpace();
+            RunMoE(0, mlpInput, mlpOutput);
+            HyperCombine(residual, mlpOutput, mlpInjection, graphState->hiddenStates[1]);
+        };
+        auto &segment = graphState->segments[0];
+        if (!segment.captured) {
+            FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag();
+            if (!segment.warmed || segment.disabled) {
+                runBody();
+                segment.warmed = true;
+                segment.disabled = !ThreadTpAllTrue(
+                    !segment.disabled && !FastllmCudaMergeMOEUsedGraphUnsafeFallback());
+            } else {
+                void *graph = nullptr, *exec = nullptr;
+                bool poolActive = false, captureActive = false;
+                bool ok = ThreadTpAllTrue(FastllmCudaGraphPrepareCaptureDevice());
+                if (ok) {
+                    if (threadTpRank == 0) {
+                        poolActive = FastllmCudaGraphMemoryPoolBegin();
+                        ok = poolActive;
+                    }
+                    ok = ThreadTpAllTrue(ok);
+                }
+                if (ok) {
+                    FastllmCudaClearThreadError();
+                    FastllmCudaClearGraphError();
+                    captureActive = FastllmCudaGraphBeginCapture();
+                    ok = captureActive;
+                }
+                ok = ThreadTpAllTrue(ok);
+                if (ok) {
+                    bool threw = false;
+                    const bool markers = FastllmCudaGraphSetParallelMarkersEnabled(false);
+                    try {
+                        runBody();
+                    } catch (...) {
+                        threw = true;
+                    }
+                    FastllmCudaGraphSetParallelMarkersEnabled(markers);
+                    const bool unsafe = FastllmCudaMergeMOEUsedGraphUnsafeFallback();
+                    const bool failed = threw || unsafe || FastllmCudaGetThreadError() ||
+                        FastllmCudaGetGraphError() || FastllmCudaGraphCaptureInvalidated();
+                    ok = FastllmCudaGraphEndCapture(&graph);
+                    captureActive = false;
+                    ok = ok && !failed && graph != nullptr;
+                    segment.disabled = unsafe;
+                }
+                if (captureActive) {
+                    void *discarded = nullptr;
+                    FastllmCudaGraphEndCapture(&discarded);
+                    if (discarded) FastllmCudaGraphDestroy(discarded);
+                }
+                ok = ThreadTpAllTrue(ok);
+                if (ok && threadTpRank == 0) {
+                    ok = FastllmCudaGraphMemoryPoolEnd(segment.reservedPointers);
+                    poolActive = false;
+                }
+                ok = ThreadTpAllTrue(ok);
+                if (poolActive) FastllmCudaGraphMemoryPoolAbort();
+                ThreadTpAllTrue(true);
+                if (ok) {
+                    ok = FastllmCudaGraphInstantiate(graph, &exec) && exec != nullptr;
+                }
+                ok = ThreadTpAllTrue(ok);
+                if (ok) {
+                    segment.graph = graph;
+                    segment.exec = exec;
+                    segment.captured = true;
+                } else {
+                    if (exec) FastllmCudaGraphExecDestroy(exec);
+                    if (graph) FastllmCudaGraphDestroy(graph);
+                    FastllmCudaGraphMemoryPoolRelease(segment.reservedPointers);
+                    segment.reservedPointers.clear();
+                    ++segment.captureFailures;
+                    segment.disabled = !ThreadTpAllTrue(
+                        !segment.disabled && segment.captureFailures < 3);
+                    std::fprintf(stderr,
+                        "[Fastllm] Qwen4 TP layer-0 graph capture failed on GPU %d "
+                        "(attempt %d): %s; using eager fallback.\n",
+                        device, segment.captureFailures, FastllmCudaGraphLastError());
+                    FastllmCudaClearThreadError();
+                    FastllmCudaClearGraphError();
+                    FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag();
+                    runBody();
+                    segment.disabled = !ThreadTpAllTrue(
+                        !segment.disabled && !FastllmCudaMergeMOEUsedGraphUnsafeFallback());
+                }
+            }
+        }
+        if (segment.captured) {
+            // Capturing enqueues no recurrent updates; launch exactly once.
+            // A replay error cannot safely rerun a partially submitted layer.
+            const bool launched = FastllmCudaGraphLaunch(segment.exec);
+            AssertInFastLLM(ThreadTpAllTrue(launched),
+                "Qwen4 TP layer-0 CUDA graph replay failed.");
+        }
+        hiddenStates.FreeSpace();
+        hiddenStates.FakeFrom(graphState->hiddenStates[1], 0);
+        hiddenStates.Resize(graphState->hiddenStates[1].dims);
+        hiddenStates.dataDeviceIds = {device};
+        return true;
+#endif
+    }
+
     bool Qwen4ExpModel::TryRunDecodeCudaGraphBackbone(
             int graphStartLayer,
             bool startBeforeAttention,
@@ -10448,6 +10629,12 @@ namespace fastllm {
         for (int layer = 0; layer < this->block_cnt; layer++) {
             ApplyDeviceMap(this->deviceMap, layer + 1, this->block_cnt);
 
+            if (layer == 0 && allowDecodeCudaGraph &&
+                verificationCapture == nullptr &&
+                TryRunThreadTpPrefixCudaGraph(*hiddenStates, pastKeyValues)) {
+                continue;
+            }
+
             if (layer == this->pleLayer) {
                 Data pleOutput;
                 if (verificationCapture != nullptr) {
@@ -10468,9 +10655,8 @@ namespace fastllm {
                 hasCarriedAttentionNorm = false;
                 hasCarriedAttentionProjection = false;
 
-                // PLE depends on layer-0's residual and its ngram lookup can
-                // remain on the host, so this is the earliest stable CUDA
-                // Graph boundary.  From here the standard linear-attention,
+                // PLE's host lookup separates the TP layer-0 graph from the
+                // backbone. From here the standard linear-attention,
                 // MoE and graph-safe full-attention operations can share the
                 // existing whole-backbone graph.
                 if (allowDecodeCudaGraph &&

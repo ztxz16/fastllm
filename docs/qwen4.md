@@ -44,6 +44,19 @@ ftllm server /data/models/qwen4-exp \
 
 Qwen4-Exp 的模型和 PLE 表都很大，纯 CPU/NUMA 命令主要用于容量验证与调试。线程数需要结合物理核心数和内存带宽调整。
 
+## TP Decode 的 CUDA Graph
+
+~~~bash
+FASTLLM_CUDA_GRAPH=1 ftllm server /data/models/qwen3.8-flash-next \
+  --tp 4 --atype float16 --chunked_prefill_size 1024
+~~~
+
+单 token TP decode 在支持的 CUDA 路径上分别捕获第 0 层和 PLE 后的主干。第 0 层的小图随请求 KV 缓存保留；缓存地址变化时，各 rank 一起重新捕获。捕获失败时统一回退普通算子提交。
+
+`FASTLLM_CUDA_GRAPH` 统一控制是否启用图。CPU/NUMA 混合推理和专家缓存的调度策略保持原有行为。
+
+比较性能时固定实际输入/输出 token 数、提示词和采样配置，先预热再测量；Nsight Systems 波形用于解释等待来源，吞吐以未开启 profiler 的结果为准。
+
 ## PLE 磁盘模式
 
 主机内存不足时：

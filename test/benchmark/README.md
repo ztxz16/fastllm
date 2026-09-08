@@ -172,6 +172,18 @@ python test/benchmark/decode.py --config test/benchmark/decode_config.example.js
 - 用 `prefill.py` 看长上下文是否慢；
 - 用 `decode.py` 看多 batch 下吞吐能到多少。
 
+## Qwen4 TP 请求复用回归
+
+对已启动的 TP 服务运行，先保存基线，再切换待测库：
+
+```bash
+python test/benchmark/qwen4_tp_reuse.py --output /tmp/tp-baseline.json
+python test/benchmark/qwen4_tp_reuse.py --reference /tmp/tp-baseline.json \
+  --output /tmp/tp-candidate.json
+```
+
+测试比较完整文本和 token usage，覆盖短输入图复用、跨 2048 token 边界、不同内容和长度、取消后重入及并发请求。TP CUDA Graph 说明见 [部署指南](../../docs/qwen4.md#tp-decode-的-cuda-graph)。
+
 ## Qwen4 前缀缓存回归
 
 使用已构建的 `ftllm` Python 包和支持 MTP 的 Qwen4 checkpoint，在空闲 GPU 上运行：
