@@ -92,9 +92,10 @@ class ArchiveVerificationTests(unittest.TestCase):
             root = Path(temp)
             archive = root / "desktop.zip"
             files = {
-                "FastLLM-Launcher.exe": b"executable", "resources/app/main.js": b"app",
-                "ftllm/runtime/python.exe": b"python",
-                "BUILD-INFO.json": json.dumps({"desktop": {"application_sha256": {
+                "FastLLM-Launcher.exe": b"entry", "ftllm-launch-webui.exe": b"web", "ftllm.exe": b"cli",
+                "README.html": b"guide", "support/FastLLM-Launcher.exe": b"electron",
+                "support/resources/app/main.js": b"app", "support/runtime/python.exe": b"python",
+                "support/BUILD-INFO.json": json.dumps({"desktop": {"application_sha256": {
                     "main.js": hashlib.sha256(b"app").hexdigest()}}}).encode(),
             }
             manifest = "".join(f"{hashlib.sha256(data).hexdigest()}  {name}\n" for name, data in files.items())
@@ -105,14 +106,14 @@ class ArchiveVerificationTests(unittest.TestCase):
                 with zipfile.ZipFile(archive, "w") as bundle:
                     for name, data in files.items():
                         bundle.writestr("FastLLM/" + name, data)
-                    bundle.writestr("FastLLM/MANIFEST.sha256", manifest)
+                    bundle.writestr("FastLLM/support/MANIFEST.sha256", manifest)
                 archive.with_suffix(".zip.sha256").write_text(hashlib.sha256(archive.read_bytes()).hexdigest())
 
             write_zip()
             good = subprocess.run(command, capture_output=True, text=True)
             self.assertEqual(good.returncode, 0, good.stderr)
             self.assertTrue(json.loads((root / "report.json").read_text())["passed"])
-            files["resources/app/main.js"] = b"tampered"
+            files["support/resources/app/main.js"] = b"tampered"
             write_zip()
             bad = subprocess.run(command, capture_output=True, text=True)
             self.assertNotEqual(bad.returncode, 0)

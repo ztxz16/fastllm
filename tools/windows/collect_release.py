@@ -23,8 +23,10 @@ def collect(wheel, output):
 
     wheel_info = read("wheel-verification.json")
     archive_info = read("archive-verification.json")
-    info = read("FastLLM/BUILD-INFO.json")
+    entrypoints = read("entrypoint-verification.json")
+    info = read("FastLLM/support/BUILD-INFO.json")
     require(wheel_info["passed"] and archive_info["passed"], "Release verification did not pass")
+    require(entrypoints["passed"], "Public entrypoint verification did not pass")
     require(info["package"]["version"] == wheel_info["version"], "Wheel/desktop version mismatch")
     require(info["smoke_tests"] != "skipped" and info["desktop"]["smoke_tests"] != "skipped",
             "Release requires runtime and desktop smoke tests")
@@ -63,6 +65,7 @@ def collect(wheel, output):
         "completed_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "source_revision": info["source_revision"], "source_dirty": info["source_dirty"],
         "artifacts": artifacts, "wheel_checks": wheel_info, "desktop_checks": desktop,
+        "entrypoint_checks": entrypoints,
         "archive_file_count": archive_info["file_count"],
         "gpu_inference_tested": bool(desktop.get("model")),
     }

@@ -36,9 +36,9 @@ def write_json(path, data):
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def archive_bundle(final, archive):
+def archive_bundle(final, archive, manifest_path="MANIFEST.sha256"):
     files = sorted(p for p in final.rglob("*") if p.is_file() and p.name != "MANIFEST.sha256")
-    (final / "MANIFEST.sha256").write_text("".join(f"{sha256(p)}  {p.relative_to(final).as_posix()}\n" for p in files), encoding="utf-8")
+    (final / manifest_path).write_text("".join(f"{sha256(p)}  {p.relative_to(final).as_posix()}\n" for p in files), encoding="utf-8")
     print(f"[portable] Compressing {final}", flush=True)
     partial = archive.with_suffix(".zip.part")
     with zipfile.ZipFile(partial, "w", zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as zip_out:
@@ -201,6 +201,8 @@ def main():
     for path in relocated.rglob("__pycache__"):
         shutil.rmtree(path)
     relocated.rename(final)
+    # The runtime is now outside staging; discard companion-wheel build copies.
+    shutil.rmtree(staging)
     if args.no_archive:
         print(f"[portable] Runtime prepared: {final}", flush=True)
     else:

@@ -59,6 +59,19 @@ HTML 文档的样式和插图全部随包提供，断网也能正常阅读。
 Windows 桌面包使用独立的 PowerShell 入口，最终双击 `FastLLM-Launcher.exe`
 打开 Electron 窗口，不打开系统浏览器：
 
+主目录与 Linux 版一样集中保留用户入口：
+
+```text
+FastLLM-Launcher.exe   Electron 桌面应用
+ftllm-launch-webui.exe 浏览器启动器
+ftllm.exe             命令行；双击打开已配置环境的 PowerShell
+README.html           中文离线说明
+support/              Electron、Python、DLL、许可证、构建清单和默认数据
+```
+
+三个入口均为静态链接 CRT 的原生 EXE，按自身路径定位 `support/`，支持整体移动、
+中文和空格路径。已有 PowerShell 可执行 `. .\support\env.ps1` 启用包内命令。
+
 ```powershell
 # 从当前源码编译并生成完整 Electron ZIP（默认多 CUDA 架构）
 powershell -NoProfile -ExecutionPolicy Bypass -File .\desktop\package.ps1
@@ -92,7 +105,7 @@ Python 和 Electron 由脚本下载并验证 SHA256，无需预装 Node/npm。�
 最终归档验证同时写入输出目录的 `archive-verification.json`。
 
 Windows 内部服务只绑定回环地址，由 Electron 自动启动和停止；关闭窗口会先请求
-正常清理，再以 Windows 进程树终止作兜底。配置和日志默认位于 EXE 旁的 `data/`。
+正常清理，再以 Windows 进程树终止作兜底。配置和日志默认位于 `support/data/`。
 
 ## Linux 构建
 

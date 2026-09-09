@@ -9,6 +9,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\desktop\package.ps1
 ```
 
 产物入口是 `FastLLM-Launcher.exe`，内置 Electron，不使用系统浏览器。
+桌面包主目录还提供网页与命令行入口、`README.html`，运行时和辅助文件集中在
+`support/`，与 Linux 桌面包的布局一致。
 以下 `make_portable.ps1` 是底层 CLI/浏览器运行时包，桌面脚本会复用它的运行环境。
 
 `make_portable.ps1` 构建 `ftllm launch` 的 Windows x64 ZIP。完整解压后双击

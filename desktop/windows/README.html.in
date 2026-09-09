@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FastLLM @FTLLM_VERSION@ · Windows 绿色包</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #f6f7fa; color: #202a3c; font: 16px/1.8 system-ui, "Microsoft YaHei", sans-serif; }
+  main { max-width: 1000px; margin: auto; padding: 36px 28px; }
+  h1 { font-size: 36px; line-height: 1.3; margin: 12px 0; }
+  h2 { margin-top: 34px; font-size: 24px; }
+  a { color: #5a46d6; text-underline-offset: 4px; }
+  .brand { color: #5a46d6; font-weight: 800; } .muted { color: #596477; }
+  .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  .card, .panel { background: white; border: 1px solid #e0e4eb; border-radius: 14px; padding: 24px; }
+  .card { border-top: 4px solid #5a46d6; } .web { border-top-color: #087e83; }
+  .card img { width: 66px; height: 66px; float: right; } .card h3 { margin: 0 0 12px; }
+  code, pre { font-family: Consolas, monospace; } code { overflow-wrap: anywhere; }
+  pre { padding: 18px; color: #f3f6fc; background: #202a3c; border-radius: 10px; overflow: auto; font-size: 14px; }
+  table { width: 100%; border-collapse: collapse; } td { padding: 10px; border-bottom: 1px solid #e0e4eb; vertical-align: top; }
+  footer { margin-top: 32px; border-top: 1px solid #e0e4eb; padding-top: 16px; font-size: 13px; color: #596477; }
+  @media(max-width: 680px) { .cards { grid-template-columns: 1fr; } main { padding: 24px 18px; } h1 { font-size: 30px; } }
+</style>
+<main>
+  <div class="brand">FastLLM <span class="muted">· v@FTLLM_VERSION@ · Windows x64</span></div>
+  <h1>完整解压，即可开始</h1>
+  <p class="muted">Python、Electron、CUDA 用户态运行库和应用依赖均已包含，无需安装环境。请保留整个目录，模型权重另行提供。</p>
+  <h2>选择启动方式</h2>
+  <div class="cards">
+    <div class="card">
+      <img src="support/icons/fastllm-portable-launcher.svg" alt="桌面应用">
+      <h3>桌面应用</h3><code>FastLLM-Launcher.exe</code>
+      <p>双击打开独立窗口，管理模型、启动服务并使用工作室。关闭窗口时会停止它管理的服务。</p>
+    </div>
+    <div class="card web">
+      <img src="support/icons/fastllm-portable-browser.svg" alt="网页启动器">
+      <h3>浏览器界面</h3><code>ftllm-launch-webui.exe</code>
+      <p>双击启动本机服务并打开浏览器。保留控制台窗口，结束时按 Ctrl+C。</p>
+    </div>
+  </div>
+  <p><strong><code>ftllm.exe</code> · 命令行：</strong>双击打开已配置包内环境的 PowerShell；也可在已有终端中传入命令。</p>
+  <h2>第一次使用</h2>
+  <ol><li>将 ZIP 完整解压到可写的短路径，例如 <code>D:\apps\FastLLM</code>。</li>
+      <li>双击桌面或网页入口，选择已有模型目录，或从界面下载模型。</li>
+      <li>选择设备和推理参数，启动后进入工作室。双卡模型可设置 TP=2。</li></ol>
+  <p>符合条件的 Qwen3.5/3.6/3.8 默认使用 CUDA Graph，MTP 和 DFlash 也共用此设置，无需额外配置环境变量。</p>
+  <h2>目录保持简洁</h2>
+  <div class="panel"><table>
+    <tr><td><code>FastLLM-Launcher.exe</code></td><td>桌面应用入口。</td></tr>
+    <tr><td><code>ftllm-launch-webui.exe</code></td><td>浏览器界面入口。</td></tr>
+    <tr><td><code>ftllm.exe</code></td><td>命令行入口。</td></tr>
+    <tr><td><code>README.html</code></td><td>当前离线说明。</td></tr>
+    <tr><td><code>support/</code></td><td>运行时、依赖、许可证、构建记录和默认数据；请与入口一起移动。</td></tr>
+  </table></div>
+  <h2>命令示例</h2>
+  <p>在绿色包目录的 PowerShell 中运行：</p>
+  <pre><code>.\ftllm.exe --help
+.\ftllm.exe run D:\models\Qwen3.8-27B-FP8 --tp 2 --dtype auto
+.\ftllm.exe server D:\models\MyModel --device cuda:0 --port 8080
+.\ftllm-launch-webui.exe --no-browser --host 127.0.0.1 --port 8000</code></pre>
+  <p>启用 DFlash 时，在模型命令中增加 <code>--draft D:\models\Qwen3.8-27B-DFlash2 --draft_tokens 7 --max_batch 1</code>。各子命令可通过 <code>--help</code> 查看完整参数。</p>
+  <p>已有 PowerShell 也可运行 <code>. .\support\env.ps1</code>，之后直接使用 <code>ftllm</code>、<code>python</code> 和 <code>ftllm-check</code>。退出终端即结束该环境。</p>
+  <h2>数据与运行要求</h2>
+  <p>桌面配置、日志和默认模型下载缓存保存在 <code>support/data/</code>，日志为 <code>support/data/logs/desktop.log</code>；无法写入时回退到当前用户的数据目录。已有模型可以放在其他磁盘。</p>
+  <p>需要 Windows 10/11 x64、支持 AVX2/FMA/F16C 的 CPU。GPU 推理需要系统已安装兼容的 NVIDIA 驱动；本包包含的 GPU 架构详见 <a href="support/BUILD-INFO.json">构建信息</a>。包内提供 CPU 回退库。</p>
+  <p>本地模型可以离线运行；下载模型和联网功能需要网络。无需安装 Python、Node.js、CUDA Toolkit 或 VC++ Redistributable。</p>
+  <h2>运行检查</h2>
+  <pre><code>.\support\ftllm-check.cmd --require-cuda
+.\support\python.cmd -m pip check</code></pre>
+  <p>文件校验清单位于 <code>support/MANIFEST.sha256</code>，其路径相对整个解压目录。许可证和依赖说明均保留在 <code>support/</code> 中。</p>
+  <footer>说明、样式和图标均包含在包中，可离线阅读。</footer>
+</main>
+</html>

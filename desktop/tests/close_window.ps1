@@ -13,11 +13,24 @@ public static class DesktopSmokeWindow {
 }
 '@
 $script:FoundDesktopWindow = $false
+# The root entrypoint waits for Electron in support/. Close the actual native
+# window in its process tree, then verify that the entrypoint also exits.
+$owners = [Collections.Generic.HashSet[uint32]]::new()
+[void]$owners.Add([uint32]$ProcessId)
+$processes = Get-CimInstance Win32_Process
+do {
+    $changed = $false
+    foreach ($process in $processes) {
+        if ($owners.Contains([uint32]$process.ParentProcessId)) {
+            $changed = $owners.Add([uint32]$process.ProcessId) -or $changed
+        }
+    }
+} while ($changed)
 [DesktopSmokeWindow]::EnumWindows({
     param($window, $parameter)
     [uint32]$owner = 0
     [void][DesktopSmokeWindow]::GetWindowThreadProcessId($window, [ref]$owner)
-    if ($owner -eq $ProcessId) {
+    if ($owners.Contains($owner)) {
         $title = New-Object Text.StringBuilder 256
         [void][DesktopSmokeWindow]::GetWindowText($window, $title, $title.Capacity)
         if ($title.ToString() -eq "FastLLM Launcher") {

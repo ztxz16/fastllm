@@ -62,7 +62,7 @@ SHA256 不匹配时直接报错。`-CacheDirectory`、`-Constraints` 可指定�
 默认输出目录为 `build-windows-release`：
 
 ```text
-FastLLM/                         已解压、可直接运行的 Electron 应用
+FastLLM/                         三个原生入口、README.html 和 support/，解压即可运行
 ftllm-<版本>-py3-none-win_amd64.whl
 FastLLM-Launcher-<版本>-windows-x64-<架构>-<提交>.zip
 *.sha256 / SHA256SUMS.txt         最终 wheel 与 ZIP 的 SHA256
@@ -83,6 +83,11 @@ electron-test/                   实际窗口测试、截图及退出清理结�
 
 完整解压 ZIP 后双击 `FastLLM/FastLLM-Launcher.exe`。绿色包包含用户态运行环境，
 GPU 模式仍需系统 NVIDIA 驱动，模型权重另行提供。
+
+主目录只保留 `FastLLM-Launcher.exe`、`ftllm-launch-webui.exe`、`ftllm.exe`、
+`README.html` 和 `support/`。Electron、Python、动态库、许可证和逐文件清单集中放在
+`support/`；构建信息为 `support/BUILD-INFO.json`，清单为 `support/MANIFEST.sha256`。
+外部发布日志、截图和验证报告保留在输出目录中，不放进绿色包主目录。
 
 ## 脚本职责与维护
 

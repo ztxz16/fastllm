@@ -50,7 +50,8 @@ $runtimeArgs = @{
 & (Join-Path $RepoRoot "make_portable.ps1") @runtimeArgs
 $Python = Join-Path $Cache "bootstrap/python/python.exe"
 $builderArgs = @("-I", "-B", "-X", "utf8", (Join-Path $PSScriptRoot "windows/build.py"),
-    "--runtime", (Join-Path $Stage "ftllm"), "--electron", $Electron, "--output", $Output)
+    "--runtime", (Join-Path $Stage "ftllm"), "--electron", $Electron, "--output", $Output,
+    "--entrypoints", (Join-Path $Cache "launcher-build/Release"))
 if ($SkipTests) { $builderArgs += "--skip-tests" }
 if ($SmokeModel) { $builderArgs += @("--smoke-model", (Full-Path $SmokeModel)) }
 Run $Python $builderArgs

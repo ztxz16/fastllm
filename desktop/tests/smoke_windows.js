@@ -104,7 +104,7 @@ async function main() {
     await cdp.send("Runtime.enable");
     await until(() => cdp.evaluate(`Boolean(document.querySelector('[data-view-button="webui"]'))`));
     const identity = await cdp.evaluate("({ title: document.title, ua: navigator.userAgent, node: typeof require })");
-    const buildInfo = JSON.parse(fs.readFileSync(path.join(bundle, "BUILD-INFO.json"), "utf8"));
+    const buildInfo = JSON.parse(fs.readFileSync(path.join(bundle, "support", "BUILD-INFO.json"), "utf8"));
     assert.ok(identity.ua.split(" ").includes(`Electron/${buildInfo.desktop.electron_version}`));
     assert.equal(identity.node, "undefined");
     async function api(endpoint, body) {

@@ -17,7 +17,7 @@ ELECTRON = json.loads((REPO / "portable/windows/runtime-lock.json").read_text(en
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("runtime", "electron", "output"):
+    for name in ("runtime", "electron", "output", "entrypoints"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--skip-tests", action="store_true")
     parser.add_argument("--smoke-model", type=Path)
@@ -39,40 +39,48 @@ def main():
         raise RuntimeError("Desktop output already exists; choose another output directory")
     bundle = args.runtime.parent / "测试 a" / "FastLLM"
     bundle.mkdir(parents=True)
+    support = bundle / "support"
+    args.runtime.rename(support)
     with zipfile.ZipFile(args.electron) as source:
-        source.extractall(bundle)
-    (bundle / "electron.exe").rename(bundle / "FastLLM-Launcher.exe")
+        source.extractall(support)
+    (support / "electron.exe").rename(support / "FastLLM-Launcher.exe")
     # This is the stock Electron demo, not part of this application.
-    (bundle / "resources/default_app.asar").unlink()
-    app = bundle / "resources/app"
+    (support / "resources/default_app.asar").unlink()
+    app = support / "resources/app"
     shutil.copytree(REPO / "desktop/app", app, ignore=shutil.ignore_patterns("__pycache__"))
     shutil.copy2(REPO / "tools/fastllm_pytools/launcher_assets/launcher-icon.png", app / "icon.png")
     package = json.loads((app / "package.json").read_text(encoding="utf-8"))
     package["version"] = version
     helpers["write_json"](app / "package.json", package)
-    args.runtime.rename(bundle / "ftllm")
-    # Desktop users have exactly one GUI entrypoint; the internal runtime keeps
-    # its CLI/check commands, but must not advertise a browser-launch shortcut.
-    (bundle / "ftllm/Launch.cmd").unlink()
-    helpers["copy_vc_runtime"](bundle)
-    shutil.copy2(REPO / "desktop/windows/README.txt", bundle / "README.txt")
-    shutil.copy2(REPO / "LICENSE", bundle / "LICENSE-FastLLM")
+    (support / "Launch.cmd").unlink()
+    helpers["copy_vc_runtime"](support)
+    for source, destination in (("FastLLM-Launcher.exe", "FastLLM-Launcher.exe"),
+                                ("ftllm-launch-webui.exe", "ftllm-launch-webui.exe"),
+                                ("ftllm-desktop-cli.exe", "ftllm.exe")):
+        shutil.copy2(args.entrypoints / source, bundle / destination)
+    shutil.copy2(REPO / "desktop/windows/env.ps1", support / "env.ps1")
+    shutil.copytree(REPO / "desktop/icons", support / "icons")
+    guide = (REPO / "desktop/windows/README.html.in").read_text(encoding="utf-8")
+    (bundle / "README.html").write_text(guide.replace("@FTLLM_VERSION@", version), encoding="utf-8")
     info["desktop"] = {"electron_version": ELECTRON["version"], "electron_sha256": ELECTRON["sha256"],
                        "entrypoint": "FastLLM-Launcher.exe", "platform": "win32-x64"}
     info["desktop"]["application_sha256"] = {
         p.relative_to(app).as_posix(): sha256(p) for p in sorted(app.rglob("*")) if p.is_file()
     }
-    helpers["write_json"](bundle / "BUILD-INFO.json", info)
-    python = bundle / "ftllm/runtime/python.exe"
+    helpers["write_json"](support / "BUILD-INFO.json", info)
+    python = support / "runtime/python.exe"
     # Audit Electron AND all embedded Python/Pi/compute libraries, including
     # delay-load DLLs. VC runtime must be bundled, never borrowed from the host.
     run(python, "-I", "-B", "-X", "utf8", "-c",
         "import runpy,sys; from pathlib import Path; "
         "runpy.run_path(sys.argv[1])['audit'](Path(sys.argv[2]))",
         REPO / "portable/windows/check.py", bundle)
+    (bundle / "DLL-DEPENDENCIES.txt").replace(support / "DLL-DEPENDENCIES.txt")
     if not args.skip_tests:
+        run(python, "-I", "-B", "-X", "utf8", REPO / "desktop/tests/entrypoints_windows.py",
+            bundle, "--report", args.output / "entrypoint-verification.json")
         node_env = dict(os.environ, ELECTRON_RUN_AS_NODE="1")
-        executable = bundle / "FastLLM-Launcher.exe"
+        executable = support / "FastLLM-Launcher.exe"
         def node_test(*arguments):
             # A GUI-subsystem EXE has no attached console on Windows. Pipes are
             # necessary to reliably collect Node test diagnostics under Python.
@@ -88,9 +96,9 @@ def main():
         info["desktop"]["model_tested"] = args.smoke_model.name if args.smoke_model else None
     else:
         info["desktop"]["smoke_tests"] = "skipped"
-    helpers["write_json"](bundle / "BUILD-INFO.json", info)
+    helpers["write_json"](support / "BUILD-INFO.json", info)
     bundle.rename(final)
-    helpers["archive_bundle"](final, archive)
+    helpers["archive_bundle"](final, archive, "support/MANIFEST.sha256")
     run(sys.executable, "-I", "-B", "-X", "utf8", REPO / "desktop/tests/verify_windows_archive.py", archive,
         "--report", args.output / "archive-verification.json")
 
