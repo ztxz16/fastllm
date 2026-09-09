@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from fastllm_pytools import harness_install, launcher_agent_install
 from fastllm_pytools.launcher import LauncherRuntime, create_launcher_app
 from fastllm_pytools.launcher_codex import CodexRuntime
+from fastllm_pytools.launcher_claude import ClaudeRuntime
 from fastllm_pytools.launcher_harness import HarnessRuntime
 from fastllm_pytools.launcher_opencode import OpenCodeRuntime
 from test_launcher_agents import FAKE_CODEX, SERVICE
@@ -36,7 +37,7 @@ class AgentManagementTest(unittest.TestCase):
         no_system.start(); self.addCleanup(no_system.stop)
 
     def runtimes(self):
-        for factory in (HarnessRuntime, OpenCodeRuntime, CodexRuntime):
+        for factory in (HarnessRuntime, OpenCodeRuntime, CodexRuntime, ClaudeRuntime):
             runtime = factory(self.root / factory.__name__)
             self.addCleanup(runtime.stop)
             yield runtime
@@ -130,8 +131,10 @@ class AgentManagementTest(unittest.TestCase):
                     runtime.manage("remove")
                     state = self.finish(runtime)
                     self.assertFalse(state["managed"])
-                    self.assertTrue(state["installed"])
-                    self.assertEqual(state["source"], "path")
+                    # Claude's SDK bridge requires the private SDK even when
+                    # an unrelated standalone claude CLI exists on PATH.
+                    self.assertEqual(state["installed"], runtime.agent != "claude")
+                    self.assertEqual(state["source"], "none" if runtime.agent == "claude" else "path")
                     self.assertEqual(system.read_text(), "external binary")
                 for folder in ("home", "data", "workspace"):
                     self.assertEqual((runtime.directory / folder / "keep").read_text(), "user data")
@@ -174,7 +177,7 @@ class AgentManagementTest(unittest.TestCase):
             setattr(launcher, runtime.agent, runtime)
         headers = {"X-FTLLM-Launcher-Token":"control", "X-FTLLM-Plugin-Request":"1"}
         with TestClient(create_launcher_app(launcher, "control")) as client:
-            for agent in ("harness", "opencode", "codex"):
+            for agent in ("harness", "opencode", "codex", "claude"):
                 runtime = getattr(launcher, agent)
                 url = f"/api/plugins/{agent}/runtime/install"
                 with patch.object(runtime, "manage", return_value={"phase":"installing"}) as manage:
@@ -189,7 +192,7 @@ class AgentManagementTest(unittest.TestCase):
                 self.assertEqual(response.status_code, 400, response.text)
             catalog = client.get("/api/plugins", headers=headers).json()["plugins"]
             for plugin in catalog:
-                if plugin["id"] in {"harness", "opencode", "codex"}:
+                if plugin["id"] in {"harness", "opencode", "codex", "claude"}:
                     self.assertTrue(plugin["runtime"]["manageable"])
                     self.assertTrue(plugin["runtime"]["targetVersion"])
                 else:

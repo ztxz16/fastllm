@@ -1,57 +1,57 @@
           <section id="view-codex" class="view native-agent" aria-label="Codex">
             <div class="native-agent-toolbar">
-              <span id="codex-status" role="status"></span>
+              <span id="codex-status" data-session-part="status" role="status"></span>
               <button class="small-button" type="button" data-manage-agent="codex">管理</button>
-              <button id="codex-retry" class="small-button" type="button">打开 Codex</button>
-              <button id="codex-stop" class="small-button hidden" type="button">停止 Codex</button>
+              <button id="codex-retry" data-session-part="retry" class="small-button" type="button">打开 Codex</button>
+              <button id="codex-stop" data-session-part="stop" class="small-button hidden" type="button">停止 Codex</button>
             </div>
-            <div id="codex-placeholder" class="webui-placeholder">
+            <div id="codex-placeholder" data-session-part="placeholder" class="webui-placeholder">
               <h2>Codex</h2>
               <p>使用当前模型处理编程任务，会话与工作室分别保存。</p>
-              <p id="codex-install-note" class="hidden">仅在点击安装按钮后下载独立运行环境，不修改系统安装。</p>
-              <div id="codex-progress" class="native-agent-progress hidden" role="status">
-                <span id="codex-progress-stage"></span>
-                <progress id="codex-progress-bar" aria-label="安装进度"></progress>
-                <span id="codex-progress-detail"></span>
+              <p id="codex-install-note" data-session-part="install-note" class="hidden">仅在点击安装按钮后下载独立运行环境，不修改系统安装。</p>
+              <div id="codex-progress" data-session-part="progress" class="native-agent-progress hidden" role="status">
+                <span id="codex-progress-stage" data-session-part="progress-stage"></span>
+                <progress id="codex-progress-bar" data-session-part="progress-bar" aria-label="安装进度"></progress>
+                <span id="codex-progress-detail" data-session-part="progress-detail"></span>
               </div>
-              <pre id="codex-error" class="native-agent-error hidden"></pre>
+              <pre id="codex-error" data-session-part="error" class="native-agent-error hidden"></pre>
             </div>
-            <div id="codex-content" class="native-agent-content hidden">
-              <aside id="codex-sidebar" class="codex-sessions" aria-label="Codex 项目与会话">
+            <div id="codex-content" data-session-part="content" class="native-agent-content hidden">
+              <aside id="codex-sidebar" data-session-part="sidebar" class="codex-sessions" aria-label="Codex 项目与会话">
                 <strong class="codex-sidebar-title">项目与会话</strong>
-                <button id="codex-new" class="small-button" type="button">新建会话</button>
-                <input id="codex-search" type="search" placeholder="搜索会话" aria-label="搜索 Codex 会话" />
-                <div id="codex-session-list"></div>
-                <button id="codex-more" class="small-button hidden" type="button">加载更多</button>
+                <button id="codex-new" data-session-part="new" class="small-button" type="button">新建会话</button>
+                <input id="codex-search" data-session-part="search" type="search" placeholder="搜索会话" aria-label="搜索 Codex 会话" />
+                <div id="codex-session-list" data-session-part="session-list"></div>
+                <button id="codex-more" data-session-part="more" class="small-button hidden" type="button">加载更多</button>
               </aside>
               <div class="codex-conversation">
                 <div class="codex-conversation-header">
-                  <button id="codex-toggle-sessions" class="small-button" type="button" aria-expanded="false" aria-controls="codex-sidebar">项目与会话</button>
-                  <div class="codex-conversation-heading"><strong id="codex-title">新建会话</strong><code id="codex-session-workspace"></code></div>
-                  <button id="codex-rename" class="small-button" type="button">重命名</button>
-                  <button id="codex-archive" class="small-button" type="button">归档</button>
+                  <button id="codex-toggle-sessions" data-session-part="toggle-sessions" class="small-button" type="button" aria-expanded="false" aria-controls="codex-sidebar">项目与会话</button>
+                  <div class="codex-conversation-heading"><strong id="codex-title" data-session-part="title">新建会话</strong><code id="codex-session-workspace" data-session-part="session-workspace"></code></div>
+                  <button id="codex-rename" data-session-part="rename" class="small-button" type="button">重命名</button>
+                  <button id="codex-archive" data-session-part="archive" class="small-button" type="button">归档</button>
                 </div>
-                <div id="codex-workspace-setup" class="codex-workspace-setup">
+                <div id="codex-workspace-setup" data-session-part="workspace-setup" class="codex-workspace-setup">
                   <label for="codex-workspace">会话工作目录</label>
                   <div class="codex-workspace-picker">
-                    <input id="codex-workspace" placeholder="服务器上的文件夹路径" aria-describedby="codex-workspace-hint" />
-                    <button id="codex-browse-workspace" class="small-button" type="button" aria-label="浏览工作目录" title="浏览工作目录"><svg class="icon" aria-hidden="true" viewBox="0 0 24 24"><path d="M3 6h7l2 2h9v12H3z"/></svg></button>
+                    <input id="codex-workspace" data-session-part="workspace" placeholder="服务器上的文件夹路径" aria-describedby="codex-workspace-hint" />
+                    <button id="codex-browse-workspace" data-session-part="browse-workspace" class="small-button" type="button" aria-label="浏览工作目录" title="浏览工作目录"><svg class="icon" aria-hidden="true" viewBox="0 0 24 24"><path d="M3 6h7l2 2h9v12H3z"/></svg></button>
                   </div>
-                  <small id="codex-workspace-hint">选择目录后发送第一条消息，即可在该目录中新建会话。</small>
+                  <small id="codex-workspace-hint" data-session-part="workspace-hint">选择目录后发送第一条消息，即可在该目录中新建会话。</small>
                 </div>
-                <div id="codex-messages" aria-live="polite"></div>
-                <div id="codex-approvals"></div>
-                <p id="codex-chat-error" class="native-agent-error hidden" role="alert"></p>
-                <form id="codex-compose">
-                  <textarea id="codex-prompt" rows="3" placeholder="描述编程任务…" aria-label="Codex 消息"></textarea>
+                <div id="codex-messages" data-session-part="messages" aria-live="polite"></div>
+                <div id="codex-approvals" data-session-part="approvals"></div>
+                <p id="codex-chat-error" data-session-part="chat-error" class="native-agent-error hidden" role="alert"></p>
+                <form id="codex-compose" data-session-part="compose">
+                  <textarea id="codex-prompt" data-session-part="prompt" rows="3" placeholder="描述编程任务…" aria-label="Codex 消息"></textarea>
                   <small class="codex-compose-hint">Enter 发送，Shift+Enter 换行</small>
                   <div class="codex-compose-actions">
                     <label class="codex-effort-picker" for="codex-effort"><span>思考档位</span>
-                      <select id="codex-effort" aria-label="思考档位"><option value="">模型默认</option></select>
+                      <select id="codex-effort" data-session-part="effort" aria-label="思考档位"><option value="">模型默认</option></select>
                     </label>
-                    <span id="codex-turn-status" role="status"></span>
-                    <button id="codex-cancel" class="small-button hidden" type="button">取消生成</button>
-                    <button id="codex-send" class="primary-button" type="submit">发送</button>
+                    <span id="codex-turn-status" data-session-part="turn-status" role="status"></span>
+                    <button id="codex-cancel" data-session-part="cancel" class="small-button hidden" type="button">取消生成</button>
+                    <button id="codex-send" data-session-part="send" class="primary-button" type="submit">发送</button>
                   </div>
                 </form>
               </div>

@@ -183,12 +183,13 @@ class LauncherWebUIBrowserTest(unittest.TestCase):
         from fastllm_pytools.launcher_harness import HarnessRuntime
         from fastllm_pytools.launcher_codex import CodexRuntime
         from fastllm_pytools.launcher_opencode import OpenCodeRuntime
+        from fastllm_pytools.launcher_claude import ClaudeRuntime
         from test_launcher_agent_management import installed_files
 
         self.page.clock.resume()
         self.runtime._process = None
         self.runtime._state.update(phase='stopped', ready=False, sessionId='')
-        for factory, agent in ((HarnessRuntime, 'harness'), (OpenCodeRuntime, 'opencode'), (CodexRuntime, 'codex')):
+        for factory, agent in ((HarnessRuntime, 'harness'), (OpenCodeRuntime, 'opencode'), (CodexRuntime, 'codex'), (ClaudeRuntime, 'claude')):
             setattr(self.runtime, agent, factory(Path(self.temp.name) / agent))
         released = threading.Event()
         self.addCleanup(released.set)
@@ -208,14 +209,14 @@ class LauncherWebUIBrowserTest(unittest.TestCase):
             navigation = self.page.locator('.app-shell > .sidebar > .navigation')
             expect(navigation.locator('[role="heading"]')).to_have_text(['Model management', 'agent'])
             self.assertEqual(navigation.locator('[data-view-button]').evaluate_all('(nodes) => nodes.map(n => n.dataset.viewButton)'),
-                             ['launch', 'download', 'logs', 'hardware', 'webui', 'harness', 'opencode', 'codex'])
+                             ['launch', 'download', 'logs', 'hardware', 'webui', 'harness', 'opencode', 'codex', 'claude'])
             for button in navigation.locator('[data-view-button]').all():
                 expect(button).to_be_in_viewport(ratio=1)
             expect(self.page.locator('#view-webui [data-manage-agent]')).to_have_count(0)
             navigation.locator('[data-manage-agent]').click()
             manager = self.page.locator('.plugin-runtime-manager')
             expect(manager).to_be_visible()
-            expect(manager.locator('[data-agent] option')).to_have_count(3)
+            expect(manager.locator('[data-agent] option')).to_have_count(4)
             manager.locator('[data-operation="install"]').click()
             expect(manager.locator('[data-status]')).to_have_text('Installing')
             expect(manager.locator('[data-progress]')).to_have_attribute('value', '1')
@@ -227,7 +228,7 @@ class LauncherWebUIBrowserTest(unittest.TestCase):
             expect(manager.locator('[data-status]')).to_have_text('Not installed')
             released.set()
             self.page.on('dialog', lambda dialog: dialog.accept())
-            for agent in ('harness', 'opencode', 'codex'):
+            for agent in ('harness', 'opencode', 'codex', 'claude'):
                 manager.locator('[data-agent]').select_option(agent)
                 manager.locator('[data-operation="install"]').click()
                 expect(manager.locator('[data-version]')).to_contain_text('Private runtime · old')
@@ -354,6 +355,129 @@ class LauncherWebUIBrowserTest(unittest.TestCase):
             self.page.locator('#folder-picker-select').click()
             expect(self.page.locator('#model-path')).to_have_value(str(ordinary_file))
             expect(workspace).to_have_value(str(project))
+
+    def start_claude_sdk(self):
+        import shutil
+        from pathlib import Path
+        from fastllm_pytools.launcher_claude import ClaudeRuntime
+        from test_launcher_claude import BRIDGE, FAKE_SDK
+
+        self.page.clock.resume()
+        self.runtime.claude = ClaudeRuntime(Path(self.temp.name) / 'claude')
+        sdk = Path(self.temp.name) / 'sdk.mjs'; sdk.write_text(FAKE_SDK)
+        command = patch.object(self.runtime.claude, '_command', return_value=[shutil.which('node'), str(BRIDGE), str(sdk)])
+        command.start(); self.addCleanup(command.stop)
+        metadata = patch('fastllm_pytools.launcher_agent_runtime.with_model_metadata',
+            side_effect=lambda service, key:dict(service, modelMetadata={
+                'supported_reasoning_efforts':['low', 'medium', 'xhigh']}))
+        metadata.start(); self.addCleanup(metadata.stop)
+        self.page.locator('[data-view-button="claude"]').click()
+        expect(self.page.locator('#claude-content')).to_be_visible()
+
+    def test_claude_workspace_markdown_approval_and_session_resume(self):
+        from pathlib import Path
+        self.start_claude_sdk()
+        project = Path(self.temp.name) / 'Claude project'; project.mkdir()
+        (project / 'notes.txt').write_text('not a directory')
+        self.page.locator('#claude-workspace').fill(str(project))
+        self.page.locator('#claude-browse-workspace').click()
+        expect(self.page.locator('#folder-picker-title')).to_have_text('Choose a workspace folder')
+        expect(self.page.locator('#folder-picker-modal .file-icon')).to_have_count(0)
+        self.page.locator('#folder-picker-select').click()
+        expect(self.page.locator('#claude-workspace')).to_have_value(str(project))
+        self.screenshot('claude-new-light')
+        self.page.locator('#claude-effort').select_option('low')
+        prompt = self.page.locator('#claude-prompt')
+        prompt.fill('Write a file'); prompt.press('Shift+Enter')
+        expect(prompt).to_have_value('Write a file\n')
+        prompt.press('Enter')
+        expect(self.page.locator('#claude-approvals')).to_contain_text('Write example.txt?')
+        expect(self.page.locator('#claude-messages .agentMessage h2')).to_have_text('Reply')
+        expect(self.page.locator('#claude-messages .agentMessage .codex-markdown strong')).to_have_text('Hello')
+        user = self.page.locator('#claude-messages .userMessage')
+        assistant = self.page.locator('#claude-messages .agentMessage')
+        self.assertGreater(user.bounding_box()['x'], assistant.bounding_box()['x'])
+        expect(self.page.locator('#claude-session-workspace')).to_have_text(str(project))
+        expect(self.page.locator('#claude-workspace-setup')).to_be_hidden()
+        self.screenshot('claude-approval-light')
+        self.page.locator('#claude-approvals').get_by_role('button', name='Allow once', exact=True).click()
+        expect(self.page.locator('#claude-cancel')).to_be_hidden()
+        self.page.reload()
+        self.page.locator('[data-view-button="claude"]').click()
+        expect(self.page.locator('#claude-session-workspace')).to_have_text(str(project))
+        expect(self.page.locator('#claude-messages .agentMessage h2')).to_have_text('Reply')
+        expect(self.page.locator('#claude-effort')).to_have_value('low')
+        prompt.fill('Ask a question'); prompt.press('Enter')
+        expect(self.page.locator('#claude-approvals')).to_contain_text('Which file?')
+        self.page.locator('#claude-approvals input').fill('README.md')
+        self.page.locator('#claude-approvals').get_by_role('button', name='Submit answers').click()
+        expect(self.page.locator('#claude-cancel')).to_be_hidden()
+        probe = json.loads((self.runtime.claude.directory / 'home/probe.json').read_text())
+        self.assertEqual(probe['effort'], 'low')
+        self.assertIn('resume', probe)
+
+    def test_claude_multiple_blocks_remain_distinct_after_reload(self):
+        self.start_claude_sdk()
+        self.page.locator('#claude-prompt').fill('multiple blocks')
+        self.page.locator('#claude-prompt').press('Enter')
+        expect(self.page.locator('#claude-approvals')).to_contain_text('Write example.txt?')
+
+        def assert_blocks():
+            messages = self.page.locator('#claude-messages')
+            expect(messages.locator('.agentMessage')).to_have_count(2)
+            expect(messages.locator('.agentMessage h2')).to_have_text(['Before', 'After'])
+            expect(messages.locator('.reasoning')).to_have_count(1)
+            expect(messages.locator('.reasoning .codex-markdown')).to_have_text('Check the project first.')
+            expect(messages.locator('.mcpToolCall')).to_have_count(1)
+
+        assert_blocks()
+        self.page.locator('#claude-approvals').get_by_role('button', name='Allow once', exact=True).click()
+        expect(self.page.locator('#claude-send')).to_be_enabled()
+        self.page.reload()
+        self.page.locator('[data-view-button="claude"]').click()
+        assert_blocks()
+
+    def test_claude_template_error_is_visible_and_another_message_can_be_sent(self):
+        self.start_claude_sdk()
+        prompt = self.page.locator('#claude-prompt')
+        prompt.fill('template failure')
+        prompt.press('Enter')
+        expect(self.page.locator('#claude-chat-error')).to_contain_text('Unsupported model template input')
+        expect(self.page.locator('#claude-send')).to_be_enabled()
+        expect(self.page.locator('#claude-cancel')).to_be_hidden()
+        prompt.fill('Ask a question')
+        prompt.press('Enter')
+        expect(self.page.locator('#claude-chat-error')).to_be_hidden()
+        expect(self.page.locator('#claude-approvals')).to_contain_text('Which file?')
+        self.page.locator('#claude-approvals input').fill('README.md')
+        self.page.locator('#claude-approvals').get_by_role('button', name='Submit answers').click()
+        expect(self.page.locator('#claude-send')).to_be_enabled()
+
+    def test_claude_theme_mobile_layout_drafts_and_cancel(self):
+        from pathlib import Path
+        self.start_claude_sdk()
+        project_a = Path(self.temp.name) / 'project-a'; project_a.mkdir()
+        project_b = Path(self.temp.name) / 'project-b'; project_b.mkdir()
+        workspace = self.page.locator('#claude-workspace')
+        prompt = self.page.locator('#claude-prompt')
+        workspace.fill(str(project_a)); prompt.fill('Draft A')
+        workspace.fill(str(project_b)); prompt.fill('Draft B')
+        workspace.fill(str(project_a)); expect(prompt).to_have_value('Draft A')
+        self.page.evaluate("window.ftllmLauncherTheme.setPreference('dark')")
+        expect(self.page.locator('html')).to_have_attribute('data-theme', 'dark')
+        prompt.press('Enter')
+        expect(self.page.locator('#claude-approvals')).to_contain_text('Write example.txt?')
+        self.screenshot('claude-dark')
+        self.page.locator('#claude-cancel').click()
+        expect(self.page.locator('#claude-approvals .codex-approval')).to_have_count(0)
+        expect(self.page.locator('#claude-send')).to_be_enabled()
+        self.page.set_viewport_size({'width':390, 'height':844})
+        expect(self.page.locator('#claude-toggle-sessions')).to_be_visible()
+        expect(self.page.locator('#claude-send')).to_be_in_viewport(ratio=1)
+        self.assertLessEqual(self.page.evaluate('document.documentElement.scrollWidth'), 390)
+        self.screenshot('claude-mobile-dark')
+        self.page.locator('#claude-toggle-sessions').click()
+        expect(self.page.locator('#claude-sidebar')).to_be_visible()
 
     def start_codex_projects(self):
         from pathlib import Path
@@ -641,7 +765,7 @@ for line in sys.stdin:
         turns = [r['params'] for r in requests if r.get('method') == 'turn/start']
         self.assertEqual([params['input'][0]['text'] for params in turns], [sent, 'Next draft'])
         self.page.locator('#language-select').select_option('zh-CN')
-        expect(self.page.locator('.codex-compose-hint')).to_have_text('Enter 发送，Shift+Enter 换行')
+        expect(self.page.locator('#view-codex .codex-compose-hint')).to_have_text('Enter 发送，Shift+Enter 换行')
         expect(self.page.locator('#codex-toggle-sessions')).to_have_text('项目与会话')
         self.screenshot('codex-conversation-zh-mobile')
         self.page.set_viewport_size({'width':1280, 'height':900})
@@ -2900,7 +3024,7 @@ document.querySelector('#counter').onclick = event => {
         self.assertEqual(self.page.locator('iframe').count(), 0)
         self.assertEqual(self.page.locator('[data-view-button]').evaluate_all(
             '(nodes) => nodes.map(node => node.dataset.viewButton)'),
-            ['launch', 'download', 'logs', 'hardware', 'webui', 'harness', 'opencode', 'codex'])
+            ['launch', 'download', 'logs', 'hardware', 'webui', 'harness', 'opencode', 'codex', 'claude'])
         self.screenshot('launcher-empty')
         with patch.object(self.runtime._webui_app.state.runtime.api_client, 'stream',
                           side_effect=lambda *a, **k: iter([('**Hello**\n\n```python\nprint(1)\n```', 'Reasoning')])) as stream:
@@ -2984,7 +3108,10 @@ document.querySelector('#counter').onclick = event => {
         pane.locator('#saveRename').click()
         expect(pane.locator('.conversation-title').first).to_have_text('Renamed inside Launcher')
         self.screenshot('launcher-mobile-history')
-        pane.locator('#sidebarBackdrop').click(position={'x': 380, 'y': 300})
+        backdrop = pane.locator('#sidebarBackdrop')
+        backdrop_bounds = backdrop.bounding_box()
+        backdrop.click(position={'x': backdrop_bounds['width'] - 10, 'y': backdrop_bounds['height'] / 2})
+        expect(pane.locator('#sidebar')).not_to_have_class('sidebar open')
         self.screenshot('launcher-mobile-chat')
 
     def test_stop_generation_and_switch_model_dispose_the_component(self):

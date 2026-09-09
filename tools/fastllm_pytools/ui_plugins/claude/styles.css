@@ -1,0 +1,40 @@
+/* Harness-like quiet sidebar, open transcript and a compact composer. */
+#view-claude { --claude-accent:#b56c4c; }
+#claude-content { grid-template-columns:224px minmax(0,1fr); background:var(--surface); }
+#view-claude .codex-sessions { gap:14px; background:var(--surface-soft); padding:22px 14px; }
+#view-claude .codex-sidebar-title { color:var(--ink); font-size:15px; font-weight:650; padding:0 6px; }
+#view-claude .codex-sidebar-title::before { content:"✳"; color:var(--claude-accent); font-size:22px; margin-right:9px; vertical-align:middle; }
+#view-claude .codex-sessions > .small-button { justify-content:center; padding:9px; background:var(--surface); }
+#view-claude .codex-project-toggle strong { font-weight:550; }
+#view-claude .codex-session { padding:9px 10px; }
+#view-claude .codex-session.active { border-color:var(--line); background:var(--surface); }
+#view-claude .codex-conversation-header { min-height:65px; padding:12px 24px; }
+#claude-title { font-size:14px; font-weight:550; }
+#claude-messages { order:1; gap:22px; padding:30px max(24px,calc((100% - 800px)/2)); }
+#claude-messages:empty::before { content:attr(data-empty-message); display:block; margin:auto; padding:32px 0; color:var(--muted); font-size:24px; font-weight:450; line-height:1.6; text-align:center; }
+#view-claude .codex-message.agentMessage { padding:0; border:0; border-radius:0; max-width:100%; }
+#view-claude .codex-message.userMessage { padding:11px 16px; border:0; border-radius:14px; max-width:85%; background:var(--surface-soft); }
+#view-claude .codex-message.userMessage > strong { display:none; }
+#view-claude .codex-message.userMessage .codex-markdown { margin:0; }
+#view-claude .codex-message:not(.userMessage):not(.agentMessage) { padding:10px 14px; max-width:100%; border-radius:8px; background:var(--surface-soft); }
+#claude-workspace-setup { order:2; padding:12px 24px; border-bottom:0; border-top:1px solid var(--line); }
+#claude-approvals { order:3; flex-shrink:0; }
+#claude-chat-error { order:4; }
+#claude-compose { order:5; margin:12px 24px 22px; padding:12px 14px; border:1px solid var(--line); border-radius:16px; box-shadow:0 3px 14px #00000005; }
+#claude-prompt { min-height:64px; padding:6px 2px; border:0; border-radius:0; background:transparent; outline-offset:4px; }
+#claude-prompt:focus-visible { outline:none; }
+#claude-compose:focus-within { border-color:var(--muted); box-shadow:0 0 0 1px var(--line); }
+#view-claude .codex-compose-hint { margin-top:1px; font-size:10px; }
+#view-claude .codex-compose-actions { padding-top:8px; }
+#claude-send { border-color:var(--ink); background:var(--ink); color:var(--surface); border-radius:9px; }
+#claude-send:disabled { opacity:.4; }
+:root[data-theme="dark"] #view-claude { --claude-accent:#d69b7e; }
+@media (max-width:760px) {
+  #claude-content { display:flex; }
+  #view-claude .codex-conversation-header { padding:10px 14px; }
+  #claude-messages { padding:20px 14px; }
+  #claude-messages:empty::before { font-size:20px; }
+  #claude-workspace-setup { padding:10px 14px; }
+  #claude-compose { margin:8px 12px 12px; padding:10px; }
+  #view-claude .codex-sessions { padding:12px; }
+}

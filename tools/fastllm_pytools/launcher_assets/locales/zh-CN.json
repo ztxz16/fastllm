@@ -174,7 +174,6 @@
     "思考开关": "思考开关",
     "KV Cache 上限": "KV Cache 上限",
     "采样默认值": "采样默认值",
-    "模型默认": "模型默认",
     "GGUF 原始配置目录": "GGUF 原始配置目录",
     "包含 config.json 的目录": "包含 config.json 的目录",
     "模型缓存目录": "模型缓存目录",
@@ -266,7 +265,12 @@
     "会话工作目录": "会话工作目录",
     "浏览工作目录": "浏览工作目录",
     "选择目录后发送第一条消息，即可在该目录中新建会话。": "选择目录后发送第一条消息，即可在该目录中新建会话。",
-    "Enter 发送，Shift+Enter 换行": "Enter 发送，Shift+Enter 换行"
+    "Enter 发送，Shift+Enter 换行": "Enter 发送，Shift+Enter 换行",
+    "打开 Claude Code": "打开 Claude Code",
+    "停止 Claude Code": "停止 Claude Code",
+    "Claude Code 项目与会话": "Claude Code 项目与会话",
+    "搜索 Claude Code 会话": "搜索 Claude Code 会话",
+    "Claude Code 消息": "Claude Code 消息"
   },
   "messages": {
     "Pi Agent": "Pi 智能体",
@@ -673,7 +677,12 @@
     "Medium": "中",
     "High": "高",
     "Extra high": "超高",
-    "Maximum": "最高"
+    "Maximum": "最高",
+    "Could not load Markdown. Reopen the {name} page to retry.": "Markdown 加载失败，请重新打开 {name} 页面重试。",
+    "{name} is working…": "{name} 正在处理…",
+    "{name} request failed.": "{name} 请求失败。",
+    "{name} needs your response": "{name} 等待你的回应",
+    "What would you like to work on?": "今天想完成什么？"
   },
   "patterns": [
     {

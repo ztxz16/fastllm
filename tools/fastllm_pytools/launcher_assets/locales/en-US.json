@@ -174,7 +174,6 @@
     "思考开关": "Thinking switch",
     "KV Cache 上限": "KV Cache limit",
     "采样默认值": "Sampling defaults",
-    "模型默认": "Model default",
     "GGUF 原始配置目录": "Original GGUF config directory",
     "包含 config.json 的目录": "Directory containing config.json",
     "模型缓存目录": "Model cache directory",
@@ -266,7 +265,12 @@
     "会话工作目录": "Conversation workspace",
     "浏览工作目录": "Browse workspace folders",
     "选择目录后发送第一条消息，即可在该目录中新建会话。": "Choose a folder, then send your first message to start a conversation in that workspace.",
-    "Enter 发送，Shift+Enter 换行": "Enter to send, Shift+Enter for a new line"
+    "Enter 发送，Shift+Enter 换行": "Enter to send, Shift+Enter for a new line",
+    "打开 Claude Code": "Open Claude Code",
+    "停止 Claude Code": "Stop Claude Code",
+    "Claude Code 项目与会话": "Claude Code projects and conversations",
+    "搜索 Claude Code 会话": "Search Claude Code conversations",
+    "Claude Code 消息": "Claude Code message"
   },
   "messages": {
     "Pi Agent": "Pi Agent",
@@ -485,7 +489,12 @@
     "Medium": "Medium",
     "High": "High",
     "Extra high": "Extra high",
-    "Maximum": "Maximum"
+    "Maximum": "Maximum",
+    "Could not load Markdown. Reopen the {name} page to retry.": "Could not load Markdown. Reopen the {name} page to retry.",
+    "{name} is working…": "{name} is working…",
+    "{name} request failed.": "{name} request failed.",
+    "{name} needs your response": "{name} needs your response",
+    "What would you like to work on?": "What would you like to work on?"
   },
   "patterns": [
     {

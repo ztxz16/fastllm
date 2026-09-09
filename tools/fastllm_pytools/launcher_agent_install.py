@@ -1,4 +1,4 @@
-"""Explicit installation of pinned, private OpenCode and Codex runtimes."""
+"""Explicit installation of pinned, private native agent runtimes."""
 
 import json
 import os
@@ -14,6 +14,8 @@ AGENTS = {
                  "entry": "opencode-ai/bin/opencode.exe"},
     "codex": {"name": "Codex", "package": "@openai/codex", "version": "0.153.4",
               "entry": "@openai/codex/bin/codex.js"},
+    "claude": {"name": "Claude Code", "package": "@anthropic-ai/claude-agent-sdk", "version": "0.3.266",
+               "entry": "@anthropic-ai/claude-agent-sdk/sdk.mjs"},
 }
 
 
@@ -22,6 +24,8 @@ def runtime_command(root, agent):
     node = root / ("node/node.exe" if os.name == "nt" else "node/bin/node")
     if not entry.is_file() or not node.is_file():
         return None
+    if agent == "claude":
+        return [str(node), str(Path(__file__).parent / "plugin_assets/claude-bridge.mjs"), str(entry)]
     return [str(entry)] if agent == "opencode" else [str(node), str(entry)]
 
 

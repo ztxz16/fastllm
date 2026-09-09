@@ -1,0 +1,59 @@
+          <section id="view-claude" class="view native-agent" aria-label="Claude Code">
+            <div class="native-agent-toolbar">
+              <span id="claude-status" data-session-part="status" role="status"></span>
+              <button class="small-button" type="button" data-manage-agent="claude">管理</button>
+              <button id="claude-retry" data-session-part="retry" class="small-button" type="button">打开 Claude Code</button>
+              <button id="claude-stop" data-session-part="stop" class="small-button hidden" type="button">停止 Claude Code</button>
+            </div>
+            <div id="claude-placeholder" data-session-part="placeholder" class="webui-placeholder">
+              <h2>Claude Code</h2>
+              <p>使用当前模型处理编程任务，会话与工作室分别保存。</p>
+              <p id="claude-install-note" data-session-part="install-note" class="hidden">仅在点击安装按钮后下载独立运行环境，不修改系统安装。</p>
+              <div id="claude-progress" data-session-part="progress" class="native-agent-progress hidden" role="status">
+                <span id="claude-progress-stage" data-session-part="progress-stage"></span>
+                <progress id="claude-progress-bar" data-session-part="progress-bar" aria-label="安装进度"></progress>
+                <span id="claude-progress-detail" data-session-part="progress-detail"></span>
+              </div>
+              <pre id="claude-error" data-session-part="error" class="native-agent-error hidden"></pre>
+            </div>
+            <div id="claude-content" data-session-part="content" class="native-agent-content hidden">
+              <aside id="claude-sidebar" data-session-part="sidebar" class="codex-sessions" aria-label="Claude Code 项目与会话">
+                <strong class="codex-sidebar-title">Claude Code</strong>
+                <button id="claude-new" data-session-part="new" class="small-button" type="button">新建会话</button>
+                <input id="claude-search" data-session-part="search" type="search" placeholder="搜索会话" aria-label="搜索 Claude Code 会话" />
+                <div id="claude-session-list" data-session-part="session-list"></div>
+                <button id="claude-more" data-session-part="more" class="small-button hidden" type="button">加载更多</button>
+              </aside>
+              <div class="codex-conversation">
+                <div class="codex-conversation-header">
+                  <button id="claude-toggle-sessions" data-session-part="toggle-sessions" class="small-button" type="button" aria-expanded="false" aria-controls="claude-sidebar">项目与会话</button>
+                  <div class="codex-conversation-heading"><strong id="claude-title" data-session-part="title">新建会话</strong><code id="claude-session-workspace" data-session-part="session-workspace"></code></div>
+                  <button id="claude-rename" data-session-part="rename" class="small-button" type="button">重命名</button>
+                  <button id="claude-archive" data-session-part="archive" class="small-button" type="button">归档</button>
+                </div>
+                <div id="claude-workspace-setup" data-session-part="workspace-setup" class="codex-workspace-setup">
+                  <label for="claude-workspace">会话工作目录</label>
+                  <div class="codex-workspace-picker">
+                    <input id="claude-workspace" data-session-part="workspace" placeholder="服务器上的文件夹路径" aria-describedby="claude-workspace-hint" />
+                    <button id="claude-browse-workspace" data-session-part="browse-workspace" class="small-button" type="button" aria-label="浏览工作目录" title="浏览工作目录"><svg class="icon" aria-hidden="true" viewBox="0 0 24 24"><path d="M3 6h7l2 2h9v12H3z"/></svg></button>
+                  </div>
+                  <small id="claude-workspace-hint" data-session-part="workspace-hint">选择目录后发送第一条消息，即可在该目录中新建会话。</small>
+                </div>
+                <div data-empty-message="" id="claude-messages" data-session-part="messages" aria-live="polite"></div>
+                <div id="claude-approvals" data-session-part="approvals"></div>
+                <p id="claude-chat-error" data-session-part="chat-error" class="native-agent-error hidden" role="alert"></p>
+                <form id="claude-compose" data-session-part="compose">
+                  <textarea id="claude-prompt" data-session-part="prompt" rows="3" placeholder="描述编程任务…" aria-label="Claude Code 消息"></textarea>
+                  <small class="codex-compose-hint">Enter 发送，Shift+Enter 换行</small>
+                  <div class="codex-compose-actions">
+                    <label class="codex-effort-picker" for="claude-effort"><span>思考档位</span>
+                      <select id="claude-effort" data-session-part="effort" aria-label="思考档位"><option value="">模型默认</option></select>
+                    </label>
+                    <span id="claude-turn-status" data-session-part="turn-status" role="status"></span>
+                    <button id="claude-cancel" data-session-part="cancel" class="small-button hidden" type="button">取消生成</button>
+                    <button id="claude-send" data-session-part="send" class="primary-button" type="submit">发送</button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          </section>

@@ -707,7 +707,7 @@ def install_plugin_routes(app, registry, model_client, hardware=None, runtime_st
 
     @app.get("/plugin-core/{filename}")
     def core_asset(filename: str):
-        if filename not in {"host.js", "sdk.js", "manager.js", "runtime-manager.js", "conversations.js", "styles.css", "appearance.js", "appearance.css", "preview.js", "native-agent.js", "native-agent.css"}:
+        if filename not in {"host.js", "sdk.js", "manager.js", "runtime-manager.js", "conversations.js", "styles.css", "appearance.js", "appearance.css", "preview.js", "native-agent.js", "native-agent.css", "session-agent.js", "session-agent.css"}:
             raise HTTPException(404)
         return FileResponse(CORE_ASSETS / filename, headers={"Cache-Control": "no-cache"})
 

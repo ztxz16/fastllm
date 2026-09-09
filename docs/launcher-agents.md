@@ -1,15 +1,20 @@
-# Launcher 中使用 OpenCode 和 Codex
+# Launcher 中使用 OpenCode、Codex 和 Claude Code
 
-`ftllm launch` 的导航分为“模型管理”和“agent”两组。前一组包含启动服务、下载模型、运行日志、硬件信息；后一组包含工作室、DeepSeek Harness、OpenCode、Codex。后三个工具使用 Launcher 当前启动的 FastLLM 模型，分别保存会话。
+`ftllm launch` 的导航分为“模型管理”和“agent”两组。前一组包含启动服务、下载模型、运行日志、硬件信息；后一组包含工作室、DeepSeek Harness、OpenCode、Codex、Claude Code。四个原生 agent 使用 Launcher 当前启动的 FastLLM 模型，分别保存会话。
 
 **pip 包只包含适配代码和页面。进入页面、刷新、启用插件都不会安装外部工具。** 点击 agent 分组旁或对应页面中的“管理”，可在模型服务未启动时手动安装。也可以启动模型后点击 **安装并打开 OpenCode / Codex**。安装进度、取消和失败重试与 Harness 一致。已安装时，打开栏目可直接启动工具。
 
 ## 使用
 
 1. 运行 `ftllm launch`，启动一个支持工具调用的模型 API。
-2. 点击 OpenCode 或 Codex；首次使用时手动点击安装按钮。
+2. 点击 OpenCode、Codex 或 Claude Code；首次使用时手动点击安装按钮。
 3. OpenCode 使用原生网页：点击 **Add project**，选择运行 Launcher 的机器上的目录，再创建会话。
 4. Codex 左侧按工作目录分组显示会话，右侧显示当前会话和它实际绑定的目录。点击“新建会话”，在“会话工作目录”旁点击文件夹按钮，浏览运行 Launcher 的机器并选择目录，也可直接输入路径；发送第一条消息时创建会话并绑定该目录。点击目录旁的 `+` 可直接在该目录下准备新会话。已有会话使用各自保存的目录，切换会话不会改变目录。
+5. Claude Code 使用接近 Harness 的简洁会话侧栏和聊天区，跟随 Launcher 的浅色 / 黑夜模式。目录选择、按项目分组、独立草稿、Markdown、回车发送、重命名和归档复用同一套会话界面。底部可选择当前模型声明的思考档位。
+
+Claude Code 基于官方 Agent SDK 运行，通过 FastLLM 的 `/v1/messages` 使用当前模型，无需登录 Anthropic。工具和命令由真正的 Claude Code 执行；保留默认权限检查，需要批准的操作会显示“允许一次 / 拒绝 / 取消本轮”，工具提出的问题也可在页面回答。这里的权限确认不等于操作系统沙箱。停止、刷新和重新打开后可以恢复已保存的会话；新建会话会绑定所选目录，不会修改另一会话的目录。
+
+Claude Code 的安装、升级 / 重装、删除、启用 / 停用与其他 agent 使用相同管理面板。它需要独立 SDK 运行环境，即使 PATH 中已有 `claude` 命令也不会复用该命令或用户的 `~/.claude`。删除只移除 `~/.fastllm/claude/runtime/`，保留 `home/` 中的原生会话、界面历史以及工作目录。
 
 Codex 页面支持会话搜索、切换、重命名、归档、逐项消息和工具输出、文件修改详情、审批、回答工具问题和取消生成。用户消息靠右，Codex 回复靠左；`Enter` 发送消息，`Shift+Enter` 换行，也支持 `Ctrl+Enter` / `Cmd+Enter`。中文输入法选词时的回车不会发送。每个会话的输入草稿及各目录下的新会话草稿保存在当前浏览器，完整会话由 Codex 保存；切换栏目保留页面，刷新后可以恢复会话和待审批请求。
 
@@ -34,8 +39,13 @@ agent 管理面板复用插件注册表和管理接口，也可从 **自定义�
 | --- | --- | --- | --- |
 | OpenCode | `opencode-ai@1.18.26` | `~/.fastllm/opencode/` | `/v1/chat/completions` |
 | Codex | `@openai/codex@0.153.4` | `~/.fastllm/codex/` | `/v1/responses` |
+| Claude Code | `@anthropic-ai/claude-agent-sdk@0.3.266`，内含 Claude Code `2.1.266` | `~/.fastllm/claude/` | `/v1/messages` |
 
 每个目录中的 `runtime/` 保存独立 Node/npm 和工具；`workspace/` 是默认工作目录。OpenCode 的配置、缓存、会话分别位于 `config/`、`cache/`、`data/`、`state/`；Codex 的配置和会话位于 `home/`。不覆盖用户原有的全局 OpenCode / Codex 配置和登录信息。
+
+Claude Code 的 `home/launcher-sessions/` 保存页面使用的会话目录、标题、归档状态和消息历史；原生 SDK 同时在独立 `home/` 内保存用于续聊的会话。密钥只通过子进程环境传递。模型、工作目录和权限策略由适配器设置，不加载全局或项目 settings 来替换这些选项。
+
+思考参数通过 Anthropic `output_config.effort` 传给 FastLLM，并使用与 Chat Completions 一致的模型专用规则；未声明档位时保留服务默认行为，避免 Claude Code 自动补上模型不支持的 `high`。升级这部分适配后，需要同时重启 Launcher 和模型 API 服务。
 
 安装器复用 Harness 的 Node 24.20.0 下载与 SHA-256 校验，支持 Linux、macOS、Windows 的 x64/ARM64 安装包选择；当前完整验证的平台是 Linux x64。npm 沿用用户的包源、代理和证书配置。安装在临时目录完成并验证后才切换到正式目录，失败保留原有文件；同一工具的安装使用文件锁互斥。
 
@@ -46,6 +56,8 @@ PATH 中已有的 `opencode` 或 `codex` 可以直接复用；上表版本经过
 适配器不压缩、裁剪或重新拼接会话历史。OpenCode 的自动压缩与裁剪已关闭；Codex 配置了高于模型容量的自动压缩阈值。模型或运行时报告的上下文超限会显示在页面。原生工具自身对单次命令输出的长度限制仍遵循工具的实现。
 
 ## 嵌入和部署
+
+Claude Code 与 Codex 的会话界面通过 Launcher 已有的认证接口访问 stdio 桥接，不需要开放额外网页端口。Claude Code 在 Linux x64 验证了真实 SDK 的流式回复、批准后写入文件、原生会话续聊与思考档位传递；其他平台尚未做端到端验证。参考官方 [Agent SDK](https://code.claude.com/docs/en/agent-sdk/typescript)、[网关配置](https://code.claude.com/docs/en/llm-gateway)与[环境变量](https://code.claude.com/docs/zh-CN/env-vars)。
 
 OpenCode 使用原生静态资源和 API。内部服务只监听回环地址，外部入口通过独立端口代理 HTTP、SSE 和终端 WebSocket。入口使用独立 token/HttpOnly cookie，服务密码只由后端注入。页面与 Launcher DOM 位于不同 origin。
 

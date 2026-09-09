@@ -12,6 +12,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 from fastllm_pytools.launcher import LauncherRuntime, create_launcher_app
 from fastllm_pytools.launcher_codex import CodexRuntime
+from fastllm_pytools.launcher_claude import ClaudeRuntime
 from fastllm_pytools.launcher_opencode import OpenCodeRuntime
 from fastllm_pytools import launcher_agent_install as installer
 
@@ -69,7 +70,7 @@ class AgentRuntimeTest(unittest.TestCase):
         self.fail("Timed out")
 
     def test_neither_agent_installs_on_open_and_cancelled_install_can_retry(self):
-        for factory in (CodexRuntime, OpenCodeRuntime):
+        for factory in (CodexRuntime, OpenCodeRuntime, ClaudeRuntime):
             runtime = factory(self.root / factory.__name__)
             self.addCleanup(runtime.stop)
             entered = threading.Event()

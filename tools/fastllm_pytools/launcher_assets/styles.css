@@ -43,6 +43,7 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 .brand strong { font-size: 19px; font-weight: 740; letter-spacing: -0.7px; }
 .brand small { margin-top: 5px; color: var(--muted); font-size: 8px; font-weight: 550; letter-spacing: 1.1px; }
 .navigation { display: flex; min-height: 0; flex-direction: column; gap: 4px; }
+.navigation { scroll-padding-bottom:64px; }
 .sidebar-heading { margin: 0 12px 10px; color: var(--subtle); font-size: 11px; font-weight: 550; letter-spacing: 0.6px; }
 .agent-heading { display: flex; align-items: center; justify-content: space-between; margin-top: 18px; }
 .agent-heading button { padding: 3px 6px; border-radius: 5px; background: transparent; color: var(--muted); font: inherit; cursor: pointer; }

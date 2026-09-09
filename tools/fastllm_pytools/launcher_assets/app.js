@@ -30,6 +30,7 @@ import {
 import {mountHarness} from "../ui_plugins/harness/app.js";
 import {mountOpenCode} from "../ui_plugins/opencode/app.js";
 import {mountCodex} from "../ui_plugins/codex/app.js";
+import {mountClaude} from "../ui_plugins/claude/app.js";
 
 let pluginHost, harness, nativeAgents = {};
 const locationQuery = new URLSearchParams(window.location.search);
@@ -202,9 +203,9 @@ async function initialize() {
   await initializeLocale();
   bindEvents();
   harness = mountHarness({request, getRuntime:() => state.runtime, t});
-  const agentOptions = {request, getRuntime:() => state.runtime, t};
-  nativeAgents = {opencode:mountOpenCode(agentOptions), codex:mountCodex({...agentOptions,
-    chooseDirectory:(input, trigger) => openFolderPicker(null, trigger, {input, directoriesOnly:true})})};
+  const agentOptions = {request, getRuntime:() => state.runtime, t,
+    chooseDirectory:(input, trigger) => openFolderPicker(null, trigger, {input, directoriesOnly:true})};
+  nativeAgents = {opencode:mountOpenCode(agentOptions), codex:mountCodex(agentOptions), claude:mountClaude(agentOptions)};
   pluginHost = await mountPluginHost({request, navigation:document.querySelector(".navigation"),
     container:document.querySelector(".page-scroll"), navigate:switchView,
     nativePages:{harness, ...nativeAgents},
@@ -644,7 +645,7 @@ function switchView(view) {
   for (const panel of document.querySelectorAll(".view")) {
     panel.classList.toggle("active", panel.id === `view-${view}`);
   }
-  document.querySelector(".app-shell").classList.toggle("webui-active", ["webui", "harness", "opencode", "codex"].includes(view));
+  document.querySelector(".app-shell").classList.toggle("webui-active", ["webui", "harness", "opencode", "codex", "claude"].includes(view));
   harness?.navigate(view);
   for (const agent of Object.values(nativeAgents)) agent.navigate(view);
   elements.openWebui.classList.toggle("hidden", view === "webui");
@@ -658,7 +659,7 @@ function switchView(view) {
 }
 
 function renderViewTitle() {
-  document.querySelector(".management-label").textContent = ["webui", "harness", "opencode", "codex"].includes(state.currentView)
+  document.querySelector(".management-label").textContent = ["webui", "harness", "opencode", "codex", "claude"].includes(state.currentView)
     ? "agent" : t("Model management");
   const titles = {
     launch: t("Launch service"),
@@ -666,6 +667,7 @@ function renderViewTitle() {
     harness: "DeepSeek Harness",
     opencode: "OpenCode",
     codex: "Codex",
+    claude: "Claude Code",
     download: t("Download model"),
     logs: t("Runtime logs"),
     hardware: t("Hardware")

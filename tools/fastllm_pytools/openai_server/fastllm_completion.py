@@ -20,6 +20,7 @@ from urllib.request import urlopen
 
 import shortuuid
 from fastapi import Request
+from jinja2.exceptions import TemplateError
 from openai.types.chat import (ChatCompletionContentPartParam,
                                ChatCompletionRole)
 from PIL import Image
@@ -1700,6 +1701,26 @@ class FastLLmCompletion:
           content = parsed.content,
       )
 
+  def _normalize_anthropic_system_messages(
+      self, conversation: List[ConversationMessage],
+  ) -> List[ConversationMessage]:
+      # Local model templates commonly require a single leading system message.
+      # Consolidate only explicit system instructions, in their original order;
+      # user messages and tool results keep their roles and relative positions.
+      system_parts: List[Dict[str, Any]] = []
+      messages: List[ConversationMessage] = []
+      for message in conversation:
+          if message.role != "system":
+              messages.append(message)
+          elif isinstance(message.content, str):
+              system_parts.append({"type": "text", "text": message.content})
+          elif message.content:
+              system_parts.extend(message.content)
+      if system_parts:
+          messages.insert(0, ConversationMessage(
+              role = "system", content = self._build_message_content(system_parts)))
+      return messages
+
   def _parse_anthropic_message_content(
       self,
       role: str,
@@ -2835,6 +2856,7 @@ class FastLLmCompletion:
               conversation.extend(messages)
               media.extend(message_media)
 
+          conversation = self._normalize_anthropic_system_messages(conversation)
           if len(conversation) == 0:
               raise Exception("Empty msg")
 
@@ -2870,6 +2892,29 @@ class FastLLmCompletion:
       frequency_penalty = default_gen['repetition_penalty']
       max_length = request.max_tokens if request.max_tokens else 32768
 
+      # Claude Code sends effort through Anthropic output_config. Resolve it
+      # with the same model-specific rules as Chat Completions, and use the
+      # same template arguments for token counting and generation.
+      try:
+          reasoning_request = ChatCompletionRequest(
+              model=request.model, messages=[{"role": "user", "content": ""}],
+              reasoning_effort=(request.output_config or {}).get("effort"))
+          thinking_effort = self._resolve_kimi_k3_reasoning_effort(reasoning_request)
+          template_kwargs = self._resolve_chat_template_kwargs(
+              reasoning_request, self._resolve_qwen3_5_reasoning_effort(reasoning_request),
+              self._resolve_glm5_next_reasoning_effort(reasoning_request))
+          enable_thinking = self.enable_thinking
+          if reasoning_request.reasoning_effort is not None:
+              enable_thinking = reasoning_request.reasoning_effort != "none"
+          if request.thinking is not None:
+              thinking_type = request.thinking.get("type")
+              if thinking_type not in {"enabled", "adaptive", "disabled"}:
+                  raise ValueError("thinking.type must be enabled, adaptive, or disabled")
+              enable_thinking = thinking_type != "disabled"
+      except ValueError as error:
+          self._cleanup_temp_paths(media.temp_paths)
+          return self.create_error_response(str(error))
+
       if request.stop_sequences:
           logging.warning("Anthropic stop_sequences are not supported yet and will be ignored.")
 
@@ -2881,10 +2926,12 @@ class FastLLmCompletion:
       try:
           input_token_len = self._compute_multimodal_input_token_len(
               messages,
-              enable_thinking = self.enable_thinking,
+              enable_thinking = enable_thinking,
               images = model_images,
               videos = model_videos,
-              tools = model_tools)
+              tools = model_tools,
+              thinking_effort = thinking_effort,
+              chat_template_kwargs = template_kwargs)
           launch_kwargs = {
               "max_length": max_length,
               "min_length": 0,
@@ -2895,15 +2942,25 @@ class FastLLmCompletion:
               "repeat_penalty": frequency_penalty,
               "tools": model_tools,
               "one_by_one": True,
-              "enable_thinking": self.enable_thinking,
+              "enable_thinking": enable_thinking,
               "images": model_images,
               "videos": model_videos,
           }
+          if template_kwargs is not None:
+              launch_kwargs["chat_template_kwargs"] = template_kwargs
+          if self._is_kimi_k3_model():
+              launch_kwargs["thinking_effort"] = thinking_effort
           if parser_request is not None:
               self._attach_tool_call_constraint_if_supported(
                   launch_kwargs, parser_request)
           handle = self.model.launch_stream_response(
               messages, **launch_kwargs)
+      except (ValueError, TemplateError) as error:
+          # Deterministic input/template failures must reach the SDK as a 400.
+          # An uncaught exception becomes a 500, which Claude Code retries.
+          return self.create_error_response(
+              f"Could not prepare model input: {error}",
+              err_type = "invalid_request_error")
       finally:
           self._cleanup_temp_paths(media.temp_paths)
       self.conversation_handles[request_id] = handle

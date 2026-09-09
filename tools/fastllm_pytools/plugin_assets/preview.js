@@ -71,7 +71,7 @@ export function mountPreview({container, source, basePath, request, context, get
       button.classList.toggle("active", active);
       if (active) button.setAttribute("aria-current", "page"); else button.removeAttribute("aria-current");
     }
-    scope.querySelector(".app-shell")?.classList.toggle("webui-active", ["webui", "harness", "opencode", "codex"].includes(value));
+    scope.querySelector(".app-shell")?.classList.toggle("webui-active", ["webui", "harness", "opencode", "codex", "claude"].includes(value));
     scope.querySelector("#open-webui")?.classList.toggle("hidden", value === "webui");
     const title = scope.querySelector("#current-view-title");
     if (title) title.textContent = scope.querySelector(`[data-view-button="${CSS.escape(value)}"]`)?.textContent || value;
