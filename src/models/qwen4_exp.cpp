@@ -1322,6 +1322,8 @@ namespace fastllm {
             Data attentionOutput;
             Data attentionInjection;
             Data multiHidden;
+            Data lastMultiHidden;
+            Data logits;
         };
 
         std::mutex mutex;
@@ -7235,21 +7237,27 @@ namespace fastllm {
         MtpDraftCudaGraphState::Segment *draftGraphSegment = nullptr;
         std::unique_lock<std::mutex> draftGraphLock;
 #ifdef USE_CUDA
-        const bool draftGraphEligible =
-            GetFastllmEnv().cudaGraph && sequence == 1 && sampleToken &&
-            sampledTokenOffset > 0 && deviceTokenIds != nullptr &&
+        const bool deviceDraftGraph =
+            sequence == 1 && sampledTokenOffset > 0 && deviceTokenIds != nullptr &&
             sampledTokenIds != nullptr && sampledTokenValues != nullptr &&
-            targetHiddenStates.dataDevice == DataDevice::CUDA &&
-            targetHiddenStates.cudaData != nullptr &&
             sampledTokenIds->dataDevice == DataDevice::CUDA &&
             sampledTokenIds->cudaData != nullptr &&
             sampledTokenValues->dataDevice == DataDevice::CUDA &&
-            sampledTokenValues->cudaData != nullptr &&
+            sampledTokenValues->cudaData != nullptr;
+        const bool tpDraftGraph = threadTpRank >= 0 && sequence <= 4 &&
+            !this->mtpMoeWeights.empty() &&
+            !FastllmCudaUseMoeHybrid(this->mtpMoeWeights.data(), this->mtpMoeWeights.size());
+        const bool draftGraphEligible = ThreadTpAllTrue(
+            GetFastllmEnv().cudaGraph && sampleToken &&
+            (deviceDraftGraph || tpDraftGraph) &&
+            targetHiddenStates.dataDevice == DataDevice::CUDA &&
+            targetHiddenStates.cudaData != nullptr &&
             std::getenv("FASTLLM_CUDA_SYNC") == nullptr &&
             std::getenv("FASTLLM_PRINT_PROFILE") == nullptr &&
+            std::getenv("FASTLLM_QWEN4_DUMP_DIR") == nullptr &&
             Qwen4CudaOnlyDeviceMap(this->deviceMap) &&
             Qwen4CudaOnlyDeviceMap(this->moeDeviceMap) &&
-            Qwen4CudaOnlyDeviceMap(this->layeredMoeDeviceMap);
+            Qwen4CudaOnlyDeviceMap(this->layeredMoeDeviceMap));
         if (draftGraphEligible) {
             const int device = targetHiddenStates.dataDeviceIds.empty()
                 ? FastllmCudaGetDevice()
@@ -7265,7 +7273,7 @@ namespace fastllm {
                     state.draftGraphState->Reset(device);
                 }
                 draftGraphSegment =
-                    &state.draftGraphState->segments[sampledTokenOffset];
+                    &state.draftGraphState->segments[tpDraftGraph ? -sequence : sampledTokenOffset];
             }
         }
 #endif
@@ -7366,9 +7374,9 @@ namespace fastllm {
                     (data.dataDeviceIds.empty() ||
                      data.dataDeviceIds[0] == device);
             };
-            if (!graphInputReady(projectedHidden) ||
-                !graphInputReady(attentionOutput) ||
-                !graphInputReady(attentionInjection)) {
+            if (!ThreadTpAllTrue(graphInputReady(projectedHidden) &&
+                graphInputReady(attentionOutput) &&
+                graphInputReady(attentionInjection))) {
                 draftGraphSegment = nullptr;
             }
         }
@@ -7379,7 +7387,9 @@ namespace fastllm {
         const std::string finalPrefix = "mtp.hyper_connection_mixer.";
         Data afterAttention, mlpNorm, mlpInput, mlpInjection, mlpOutput;
         Data localMultiHidden, finalNorm, sampleHidden, lastHidden;
-        Data logits, top, halfHeadInput;
+        Data localLogits, headLogits, top, halfHeadInput;
+        Data &logits = draftGraphSegment == nullptr
+            ? localLogits : draftGraphSegment->logits;
         Data &multiHidden = draftGraphSegment != nullptr
             ? draftGraphSegment->multiHidden
             : (nextMultiHidden != nullptr && sequence == 1
@@ -7404,7 +7414,8 @@ namespace fastllm {
                 finalNorm, finalPrefix, sampleHidden, nullptr);
             if (nextMultiHidden != nullptr && sequence != 1) {
                 Split(multiHidden, 1, sequence - 1, sequence,
-                      *nextMultiHidden);
+                      draftGraphSegment == nullptr ? *nextMultiHidden
+                          : draftGraphSegment->lastMultiHidden);
             }
             if (!sampleToken) {
                 return false;
@@ -7433,8 +7444,8 @@ namespace fastllm {
                     lastHidden, halfHeadInput, DataType::FLOAT16);
                 headInput = &halfHeadInput;
             }
-            Linear(*headInput, draftLmHead, Data(), logits);
-            ToDataType(logits, DataType::FLOAT32);
+            Linear(*headInput, draftLmHead, Data(), headLogits);
+            ToDataType(headLogits, logits, DataType::FLOAT32);
 #ifdef USE_CUDA
             if (sampledTokenIds != nullptr &&
                 sampledTokenValues != nullptr &&
@@ -7464,10 +7475,12 @@ namespace fastllm {
                 }
             }
 #endif
-            return false;
+            // TP graph replay leaves local logits on the device. The usual
+            // cross-rank greedy selection below runs once after replay.
+            return threadTpRank >= 0 && draftGraphSegment != nullptr;
         };
 
-        bool sampledOnDevice = false;
+        bool postAttentionReady = false;
 #ifdef USE_CUDA
         if (draftGraphSegment != nullptr) {
             MtpDraftCudaGraphState::Segment &segment =
@@ -7477,23 +7490,28 @@ namespace fastllm {
                 (uint64_t)(uintptr_t)projectedHidden.cudaData,
                 (uint64_t)(uintptr_t)attentionOutput.cudaData,
                 (uint64_t)(uintptr_t)attentionInjection.cudaData,
-                (uint64_t)(uintptr_t)sampledTokenIds->cudaData,
-                (uint64_t)(uintptr_t)sampledTokenValues->cudaData,
+                (uint64_t)(uintptr_t)(sampledTokenIds == nullptr ? nullptr : sampledTokenIds->cudaData),
+                (uint64_t)(uintptr_t)(sampledTokenValues == nullptr ? nullptr : sampledTokenValues->cudaData),
+                (uint64_t)(nextMultiHidden != nullptr),
                 (uint64_t)projectedHidden.dataType,
                 projectedHidden.Count(0),
                 attentionOutput.Count(0),
                 attentionInjection.Count(0)
             };
-            if (segment.inputSignature != signature) {
+            if (!ThreadTpAllTrue(segment.inputSignature == signature)) {
                 state.draftGraphState->DestroySegment(segment);
                 segment.inputSignature = signature;
             }
             FastllmCudaSetDevice(device);
 
-            if (segment.captured &&
-                FastllmCudaGraphLaunch(segment.exec)) {
-                sampledOnDevice = true;
-            } else {
+            if (segment.captured) {
+                postAttentionReady = FastllmCudaGraphLaunch(segment.exec);
+                if (threadTpRank >= 0) {
+                    AssertInFastLLM(ThreadTpAllTrue(postAttentionReady),
+                        "Qwen4 TP draft CUDA graph replay failed.");
+                }
+            }
+            if (!postAttentionReady) {
                 if (segment.captured) {
                     state.draftGraphState->DestroySegment(segment);
                     segment.inputSignature = signature;
@@ -7502,13 +7520,13 @@ namespace fastllm {
                     FastllmCudaClearGraphError();
                 }
                 if (segment.disabled) {
-                    sampledOnDevice = runPostAttention();
+                    postAttentionReady = runPostAttention();
                 } else if (!segment.warmed) {
-                    sampledOnDevice = runPostAttention();
+                    FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag();
+                    postAttentionReady = runPostAttention();
                     segment.warmed = true;
-                    if (!sampledOnDevice) {
-                        segment.disabled = true;
-                    }
+                    segment.disabled = !ThreadTpAllTrue(postAttentionReady &&
+                        !FastllmCudaMergeMOEUsedGraphUnsafeFallback());
                 } else {
                     void *capturedGraph = nullptr;
                     void *capturedExec = nullptr;
@@ -7516,10 +7534,15 @@ namespace fastllm {
                     bool captureActive = false;
                     bool recaptureWithoutParallelMarkers = false;
                     bool captureOk =
-                        FastllmCudaGraphPrepareCaptureDevice();
+                        ThreadTpAllTrue(FastllmCudaGraphPrepareCaptureDevice());
                     if (captureOk) {
-                        poolActive = FastllmCudaGraphMemoryPoolBegin();
-                        captureOk = poolActive;
+                        // The graph pool brackets all TP worker allocations;
+                        // rank zero alone owns its begin/end and reservation.
+                        if (threadTpRank <= 0) {
+                            poolActive = FastllmCudaGraphMemoryPoolBegin();
+                            captureOk = poolActive;
+                        }
+                        captureOk = ThreadTpAllTrue(captureOk);
                     }
                     if (captureOk) {
                         FastllmCudaClearThreadError();
@@ -7527,25 +7550,26 @@ namespace fastllm {
                         captureActive = FastllmCudaGraphBeginCapture();
                         captureOk = captureActive;
                     }
+                    captureOk = ThreadTpAllTrue(captureOk);
 
                     bool bodyThrew = false;
-                    bool bodySampled = false;
+                    bool bodyReady = false;
                     if (captureOk) {
                         FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag();
                         const bool markersEnabled =
-                            !segment.parallelRegionsUnavailable;
+                            threadTpRank < 0 && !segment.parallelRegionsUnavailable;
                         const bool previousMarkers =
                             FastllmCudaGraphSetParallelMarkersEnabled(
                                 markersEnabled);
                         try {
-                            bodySampled = runPostAttention();
+                            bodyReady = runPostAttention();
                         } catch (...) {
                             bodyThrew = true;
                         }
                         FastllmCudaGraphSetParallelMarkersEnabled(
                             previousMarkers);
                         const bool bodyFailed = bodyThrew ||
-                            !bodySampled ||
+                            !bodyReady ||
                             FastllmCudaMergeMOEUsedGraphUnsafeFallback() ||
                             FastllmCudaGetThreadError() ||
                             FastllmCudaGetGraphError() ||
@@ -7563,15 +7587,18 @@ namespace fastllm {
                             FastllmCudaGraphDestroy(discardedGraph);
                         }
                     }
-                    if (captureOk) {
+                    captureOk = ThreadTpAllTrue(captureOk);
+                    if (captureOk && threadTpRank <= 0) {
                         captureOk = FastllmCudaGraphMemoryPoolEnd(
                             segment.reservedPointers);
                         poolActive = false;
                     }
+                    captureOk = ThreadTpAllTrue(captureOk);
                     if (poolActive) {
                         FastllmCudaGraphMemoryPoolAbort();
                     }
-                    if (captureOk &&
+                    ThreadTpAllTrue(true);
+                    if (captureOk && threadTpRank < 0 &&
                         !segment.parallelRegionsUnavailable) {
                         const int optimized =
                             FastllmCudaGraphOptimizeParallelRegions(
@@ -7590,6 +7617,7 @@ namespace fastllm {
                             capturedGraph, &capturedExec) &&
                             capturedExec != nullptr;
                     }
+                    captureOk = ThreadTpAllTrue(captureOk);
 
                     if (!captureOk) {
                         if (capturedExec != nullptr) {
@@ -7611,38 +7639,43 @@ namespace fastllm {
                         }
                         FastllmCudaClearThreadError();
                         FastllmCudaClearGraphError();
-                        sampledOnDevice = runPostAttention();
+                        postAttentionReady = runPostAttention();
                         segment.warmed = true;
                     } else {
                         segment.graph = capturedGraph;
                         segment.exec = capturedExec;
                         segment.captured = true;
                         segment.captureFailures = 0;
-                        sampledOnDevice =
+                        postAttentionReady =
                             FastllmCudaGraphLaunch(segment.exec);
-                        if (!sampledOnDevice) {
+                        if (threadTpRank >= 0) {
+                            AssertInFastLLM(ThreadTpAllTrue(postAttentionReady),
+                                "Qwen4 TP draft CUDA graph replay failed.");
+                        }
+                        if (!postAttentionReady) {
                             state.draftGraphState->DestroySegment(
                                 segment);
                             segment.inputSignature = signature;
                             segment.disabled = true;
                             FastllmCudaClearThreadError();
                             FastllmCudaClearGraphError();
-                            sampledOnDevice = runPostAttention();
+                            postAttentionReady = runPostAttention();
                         }
                     }
                 }
             }
             if (nextMultiHidden != nullptr) {
                 nextMultiHidden->FreeSpace();
-                Qwen4BorrowCudaStorage(*nextMultiHidden, multiHidden);
+                Qwen4BorrowCudaStorage(*nextMultiHidden, sequence == 1
+                    ? multiHidden : segment.lastMultiHidden);
             }
         } else
 #endif
         {
-            sampledOnDevice = runPostAttention();
+            postAttentionReady = runPostAttention();
         }
 
-        if (!sampleToken || sampledOnDevice) {
+        if (!sampleToken || (threadTpRank < 0 && postAttentionReady)) {
             // CUDA draft sampling stays chained on the request stream. The
             // host materializes the compact proposal ids only after the
             // complete autoregressive chain.
