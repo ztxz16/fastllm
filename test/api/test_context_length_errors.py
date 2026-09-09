@@ -13,7 +13,7 @@ from tools.fastllm_pytools.openai_server.protocal.anthropic_protocol import (
     AnthropicMessageRequest,
 )
 from tools.fastllm_pytools.openai_server.protocal.openai_protocol import (
-    ErrorResponse,
+    ErrorResponse, ResponsesRequest,
 )
 
 
@@ -27,6 +27,25 @@ class ContextErrorModel(FakeQwen35Model):
 
 
 class ContextLengthAPITest(unittest.IsolatedAsyncioTestCase):
+    async def test_responses_context_error_has_a_terminal_failed_response(self):
+        for partial in ("", "partial output"):
+            for thinking in (False, True):
+                with self.subTest(partial=partial, thinking=thinking):
+                    instance = completion(ContextErrorModel(partial))
+                    instance.enable_thinking = thinking
+                    generator, background = await instance.create_response(
+                        ResponsesRequest(model="qwen3.5", input="answer", stream=True), RawRequest())
+                    events = [json.loads(line[6:]) async for chunk in generator
+                              for line in chunk.splitlines() if line.startswith("data: ")]
+                    self.assertEqual(events[-1]["type"], "response.failed")
+                    response = events[-1]["response"]
+                    self.assertEqual(response["status"], "failed")
+                    self.assertEqual(response["error"]["code"], "context_length_exceeded")
+                    self.assertEqual(response["error"]["message"], str(PromptTooLongError()))
+                    self.assertEqual(response["id"], events[0]["response"]["id"])
+                    self.assertFalse(any(event["type"] == "response.completed" for event in events))
+                    await background()
+
     async def test_context_error_is_reported_with_and_without_thinking(self):
         for api in ("openai", "anthropic"):
             for stream in (False, True):

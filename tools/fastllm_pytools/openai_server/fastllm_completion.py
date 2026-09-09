@@ -2661,9 +2661,20 @@ class FastLLmCompletion:
               if "error" in data:
                   for event_data in ensure_response_started():
                       yield event_data
-                  yield next_event("error", {
-                      "error": data["error"],
-                  })
+                  # Responses clients (including Codex) need a terminal
+                  # response.failed object; a Chat-style error envelope alone
+                  # is otherwise reported as an unexpectedly closed stream.
+                  response = self._responses_response_object(
+                      request, response_id, created_at, "failed", [], usage,
+                      output_text = output_text or None,
+                  )
+                  error = data["error"]
+                  response.error = {
+                      "code": ("context_length_exceeded" if error.get("type") == "context_length_exceeded"
+                               else "server_error"),
+                      "message": error.get("message", "Generation failed."),
+                  }
+                  yield next_event("response.failed", {"response": response.model_dump()})
                   return
 
               response_id = data.get("id", response_id)
@@ -3007,6 +3018,8 @@ class FastLLmCompletion:
       stop_token_ids = self._stop_token_ids_from_strings(stop_strings)
 
       enable_thinking = self.enable_thinking
+      if request.reasoning_effort and request.reasoning_effort != "none":
+          enable_thinking = True
       if request.chat_template_kwargs and "enable_thinking" in request.chat_template_kwargs:
           enable_thinking = bool(request.chat_template_kwargs["enable_thinking"])
       try:
@@ -3615,7 +3628,8 @@ class FastLLmCompletion:
           self._release_conversation_handle(request_id, handle)
         elif self._abort_conversation_handle(request_id, handle):
           logging.info(f"Abort failed streaming request: {request_id}")
-        data = self.create_streaming_error_response(str(e))
+        data = self.create_streaming_error_response(
+            str(e), err_type = "context_length_exceeded" if isinstance(e, PromptTooLongError) else "BadRequestError")
         yield f"data: {data}\n\n"
         await asyncio.sleep(0)
 
@@ -3868,12 +3882,10 @@ class FastLLmCompletion:
           message: str,
           err_type: str = "BadRequestError",
           status_code: HTTPStatus = HTTPStatus.BAD_REQUEST) -> str:
-      json_str = json.dumps({
-          "error":
-          self.create_error_response(message=message,
-                                      err_type=err_type,
-                                      status_code=status_code).model_dump()
-      })
+      error = self.create_error_response(message=message, err_type=err_type,
+                                         status_code=status_code).model_dump()
+      error["type"] = err_type
+      json_str = json.dumps({"error": error})
       return json_str
 
   def abort_conversation(self, conversation_id: str) -> bool:
