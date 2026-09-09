@@ -1382,17 +1382,19 @@ namespace fastllm {
         std::vector<int> devices;
         std::vector<int> votes;
         int vocabSize = 0;
-        std::vector<std::pair<int, float>> topCandidates;
+        std::vector<std::vector<std::pair<int, float>>> topCandidates;
         std::vector<const Data *> shardLogits;
         Data gatheredLogits;
         bool TrySampleLogits(int rank, Data &logits,
-                const GenerationConfig &config, int cacheLength, int &token);
+                const GenerationConfig &config, int cacheLength, int &token,
+                std::vector<int> *tokens = nullptr);
         std::vector<std::unique_ptr<Qwen4ExpModel>> ranks;
         using Cache = std::vector<std::pair<Data, Data>>;
         struct RequestCache {
             std::vector<Cache> ranks;
             bool ownsRankZero = false;
             bool failed = false;
+            bool mtpDisabled = false;
         };
         std::map<const Data *, std::unique_ptr<RequestCache>> caches;
         // Keep at most one completed request. Graphs and all buffers
@@ -1478,8 +1480,6 @@ namespace fastllm {
                         (num_key_value_heads % count == 0 || count % num_key_value_heads == 0),
                         "Qwen4 TP degree must divide query and linear attention heads.");
         AssertInFastLLM(!GetKVCacheInCPU(), "Qwen4 TP requires CUDA KV caches.");
-        AssertInFastLLM(Qwen4MtpDraftsPerStep() == 0,
-                        "Qwen4 TP does not support MTP drafting.");
         threadTpState.reset(new ThreadTpState());
         threadTpState->devices = std::move(devices);
 #endif
@@ -1510,6 +1510,10 @@ namespace fastllm {
             model->threadTpOwner = &tp;
             model->weight.dicts = weight.dicts;
             model->InitParams();
+            // The loader also reads stop IDs from generation/tokenizer config.
+            // Rank-local InitParams alone does not recover those IDs.
+            model->eos_token_id = eos_token_id;
+            model->eos_token_ids = eos_token_ids;
             model->dataType = dataType;
             model->kvCacheDataType = kvCacheDataType;
             model->num_k_heads = num_k_heads / count;
@@ -1531,6 +1535,16 @@ namespace fastllm {
                         ".mlp.experts." + std::to_string(expert) + ".";
                     model->weights[layer][2 + 2 * expert] = &model->weight[prefix + "gateup_proj.weight"];
                     model->weights[layer][3 + 2 * expert] = &model->weight[prefix + "down_proj.weight"];
+                }
+            }
+            if (Qwen4MtpDraftsPerStep() > 0) {
+                model->mtpWeightsStatus.store(mtpWeightsStatus.load());
+                model->mtpMoeWeights.assign(2 + 2 * num_experts, nullptr);
+                model->mtpMoeBiass = model->mtpMoeWeights;
+                for (int expert = 0; expert < num_experts; ++expert) {
+                    const std::string prefix = kMtpExpertPrefix + std::to_string(expert) + ".";
+                    model->mtpMoeWeights[2 + 2 * expert] = &model->weight[prefix + "gateup_proj.weight"];
+                    model->mtpMoeWeights[3 + 2 * expert] = &model->weight[prefix + "down_proj.weight"];
                 }
             }
             tp.ranks.push_back(std::move(model));
@@ -1560,7 +1574,8 @@ namespace fastllm {
         std::sort(names.begin(), names.end());
         for (const std::string &name : names) {
             Data &source = weight.weight.at(name);
-            if (name.find(languagePrefix) != 0 && name != "lm_head.weight") continue;
+            if (name.find(languagePrefix) != 0 && name != "lm_head.weight" &&
+                name.find("mtp.") != 0) continue;
             if (source.dims.empty()) continue;
             // The PLE lookup table remains shared and read-only on the host.
             if (name.find(".ple.ple_embedding.ngram_embedding.") != std::string::npos) {
@@ -1736,42 +1751,63 @@ namespace fastllm {
     }
 
     bool Qwen4ExpModel::ThreadTpState::TrySampleLogits(int rank, Data &logits,
-            const GenerationConfig &config, int cacheLength, int &token) {
+            const GenerationConfig &config, int cacheLength, int &token,
+            std::vector<int> *tokens) {
 #ifdef USE_CUDA
         if (vocabSize == 0) return false;
         const auto range = qwen4_tp::VocabRange(vocabSize, devices.size(), rank);
+        const int width = range.second - range.first;
+        const int rows = logits.dims.empty() ? 0 : (int)(logits.Count(0) / width);
         AssertInFastLLM(logits.dataDevice == DataDevice::CUDA &&
-                        logits.dataType == DataType::FLOAT32 &&
-                        logits.Count(0) == (uint64_t)(range.second - range.first),
+                        logits.dataType == DataType::FLOAT32 && rows > 0 &&
+                        logits.dims.back() == width && (rows == 1 || tokens != nullptr),
                         "Qwen4 TP vocabulary shard has invalid logits.");
         if (config.IsSimpleGreedy() && !config.output_logits &&
             std::getenv("FASTLLM_QWEN4_DUMP_DIR") == nullptr) {
-            if (config.output_token_least > 0 &&
-                config.output_token_least > cacheLength - config.input_token_length) {
+            if (config.output_token_least > 0) {
                 std::vector<int> localEos;
                 auto append = [&](int id) {
-                    if (id >= range.first && id < range.second) {
-                        localEos.push_back(id - range.first);
-                    }
+                    if (id >= range.first && id < range.second) localEos.push_back(id - range.first);
                 };
                 append(ranks[rank]->eos_token_id);
                 for (int id : ranks[rank]->eos_token_ids) append(id);
                 for (int id : config.stop_token_ids) append(id);
-                FastllmResetLogitsOfEOSAll(1, &logits, localEos);
+                if (rows == 1) {
+                    if (config.output_token_least > cacheLength - config.input_token_length)
+                        FastllmResetLogitsOfEOSAll(1, &logits, localEos);
+                } else if (!localEos.empty()) {
+                    std::vector<int> lengths(rows), counts(rows, localEos.size()), ids;
+                    for (int row = 0; row < rows; ++row) {
+                        lengths[row] = config.output_token_least -
+                            (cacheLength - rows + row + 1) + config.input_token_length;
+                        ids.insert(ids.end(), localEos.begin(), localEos.end());
+                    }
+                    FastllmResetLogitsOfEOS(rows, &logits, lengths, counts, ids);
+                }
             }
             Data top;
             TopK(logits, top, 1);
             top.ToDevice(DataDevice::CPU);
             const float *values = reinterpret_cast<const float *>(top.cpuData);
-            topCandidates[rank] = {(int)(values[0] + 1e-3f) + range.first, values[1]};
+            auto &local = topCandidates[rank];
+            local.resize(rows);
+            for (int row = 0; row < rows; ++row)
+                local[row] = {(int)(values[row * 2] + 1e-3f) + range.first, values[row * 2 + 1]};
             Barrier();
-            auto best = topCandidates.front();
-            for (size_t r = 1; r < topCandidates.size(); ++r) {
-                const auto &candidate = topCandidates[r];
-                if (qwen4_tp::Top1Before(candidate.first, candidate.second,
-                                         best.first, best.second)) best = candidate;
+            if (tokens) tokens->resize(rows);
+            for (int row = 0; row < rows; ++row) {
+                auto best = topCandidates.front()[row];
+                for (size_t r = 1; r < topCandidates.size(); ++r) {
+                    const auto &candidate = topCandidates[r][row];
+                    if (qwen4_tp::Top1Before(candidate.first, candidate.second,
+                                             best.first, best.second)) best = candidate;
+                }
+                token = best.first;
+                if (tokens) (*tokens)[row] = token;
             }
-            token = best.first;
+            // A following draft or verifier may resize the same candidates.
+            // All ranks must finish reading before their next sampling call.
+            if (Qwen4MtpDraftsPerStep() > 0) Barrier();
             return true;
         }
 
@@ -1848,7 +1884,8 @@ namespace fastllm {
         if (!entry) {
             // Only fresh, graph-enabled TP requests own reusable rank-zero
             // storage. Prefix/external caches keep their original ownership.
-            const bool reusable = batch == 1 && GetFastllmEnv().cudaGraph &&
+            const bool reusable = Qwen4MtpDraftsPerStep() == 0 &&
+                batch == 1 && GetFastllmEnv().cudaGraph &&
                 Qwen4TpDecodeFitsCapacityClass(generationConfig, indexerBudget) &&
                 std::all_of(pastKeyValues.begin(), pastKeyValues.end(),
                     [](const std::pair<Data, Data> &kv) {
@@ -1882,6 +1919,9 @@ namespace fastllm {
                 }
             }
         }
+        // Visual replacement embeddings cannot initialize the text draft KV.
+        // Keep subsequent decode calls on the same ordinary TP path as prefill.
+        if (precomputedEmbedding) entry->mtpDisabled = true;
         auto &caches = entry->ranks;
         std::vector<int> hostInputTokens;
         if (batch == 1 && inputIds.dims == std::vector<int>({1, 1})) {
@@ -1961,12 +2001,17 @@ namespace fastllm {
                     }
                 }
             }
-            auto tokens = model.ForwardTarget(batch, ids, mask, positions,
-                cache, generationConfig, lastTokens,
-                r == 0 ? logits : nullptr, nullptr, nullptr, nullptr, nullptr,
-                false, true, false,
-                hostInputTokens.empty() ? nullptr : &hostInputTokens, false,
-                precomputedEmbedding ? &embedding : nullptr);
+            // Every rank runs the same proposal/acceptance state machine.
+            // Global vocabulary sampling keeps rollback and collectives aligned.
+            auto tokens = Qwen4MtpDraftsPerStep() > 0 && !entry->mtpDisabled
+                ? model.ForwardBatch(batch, ids, mask, positions, cache,
+                    generationConfig, lastTokens, r == 0 ? logits : nullptr)
+                : model.ForwardTarget(batch, ids, mask, positions,
+                    cache, generationConfig, lastTokens,
+                    r == 0 ? logits : nullptr, nullptr, nullptr, nullptr, nullptr,
+                    false, true, false,
+                    hostInputTokens.empty() ? nullptr : &hostInputTokens, false,
+                    precomputedEmbedding ? &embedding : nullptr);
             if (r == 0) result = std::move(tokens);
             FastllmCudaSyncCurrentThreadStream();
         }, errors);
@@ -6025,6 +6070,10 @@ namespace fastllm {
             generationConfig.top_p > 0.0f &&
             generationConfig.top_p <= 1.0f;
         return HasMtpWeights() &&
+            // TP currently verifies exact greedy tokens. Sampling/constraints
+            // retain ordinary TP generation instead of diverging across ranks.
+            (threadTpRank < 0 || (generationConfig.IsSimpleGreedy() &&
+                std::getenv("FASTLLM_QWEN4_DUMP_DIR") == nullptr)) &&
             (generationConfig.IsSimpleGreedy() || samplingSupported) &&
             !generationConfig.output_logits &&
             generationConfig.tool_call_allowed_token_ids.empty() &&
@@ -6853,8 +6902,12 @@ namespace fastllm {
         Split(capture.pleInput, 1, 0, committedInputs,
               committedPleInput);
         Data unusedPle;
-        RunPLE(committedPleInput, committedIds, state, unusedPle,
-               &candidateTokens);
+        // Only rank zero owns the TP PLE history. The target broadcast
+        // already supplied the residual; rollback needs no second broadcast.
+        if (threadTpRank <= 0) {
+            RunPLE(committedPleInput, committedIds, state, unusedPle,
+                   &candidateTokens);
+        }
 
         for (int layer = 0; layer < this->block_cnt; layer++) {
             if (this->IsLinearAttentionLayer(layer)) {
@@ -7595,6 +7648,11 @@ namespace fastllm {
             // complete autoregressive chain.
             return -1;
         }
+        int tpToken;
+        if (threadTpOwner != nullptr && threadTpOwner->TrySampleLogits(
+                threadTpRank, logits, GenerationConfig(), 0, tpToken)) {
+            return tpToken;
+        }
         TopK(logits, top, 1);
         top.ToDevice(DataDevice::CPU);
         return (int)(reinterpret_cast<float *>(top.cpuData)[0] + 1e-3f);
@@ -8105,7 +8163,8 @@ namespace fastllm {
                     blockCache->strides[0]);
             }
         }
-        const bool wholeDenseGraph = threadTpRank >= 0 && graphSequence == 1 &&
+        const bool wholeDenseGraph = threadTpRank >= 0 &&
+            (graphSequence == 1 || mtpTargetGraph) &&
             decodePreviousLength < this->indexerBudget;
         wholeGraphReady = wholeGraphReady && graphFullLayerCount > 0 &&
             (decodePreviousLength >= this->indexerBudget || wholeDenseGraph);
@@ -8213,9 +8272,9 @@ namespace fastllm {
                 Data &indicesData = graphState->denseIndices[width];
                 if (indicesData.cudaData == nullptr) {
                     if (!Qwen4PrepareDecodeGraphWorkspace(indicesData,
-                            DataType::INT32, {1, width}, device)) return false;
-                    std::vector<int32_t> indices(width);
-                    for (int i = 0; i < width; ++i) indices[i] = i;
+                            DataType::INT32, {graphSequence, width}, device)) return false;
+                    std::vector<int32_t> indices((size_t)graphSequence * width);
+                    for (size_t i = 0; i < indices.size(); ++i) indices[i] = i % width;
                     FastllmCudaCopyFromHostToDevice(indicesData.cudaData,
                         indices.data(), indices.size() * sizeof(int32_t));
                 }
@@ -9212,7 +9271,7 @@ namespace fastllm {
     bool Qwen4ExpModel::ShouldRecordPrefixSnapshot(
             const std::vector<std::pair<Data, Data>> &pastKeyValues,
             const RequestState &state, int &cachedLen) const {
-        if (!Qwen4PrefixCacheEnabled() ||
+        if (threadTpRank >= 0 || !Qwen4PrefixCacheEnabled() ||
             (int)pastKeyValues.size() < this->block_cnt) {
             return false;
         }
@@ -10135,7 +10194,7 @@ namespace fastllm {
 #ifdef USE_CUDA
             Data &tokenEmbedding = this->weight[
                 languagePrefix + "embed_tokens.weight"];
-            if (draftCount > 0 &&
+            if (threadTpRank < 0 && draftCount > 0 &&
                 targetHidden.dataDevice == DataDevice::CUDA &&
                 targetHidden.cudaData != nullptr &&
                 tokenEmbedding.dataDevice == DataDevice::CUDA &&
@@ -10271,22 +10330,40 @@ namespace fastllm {
             }
         };
 
+        if (threadTpRank >= 0 && GetFastllmEnv().cudaGraph &&
+            !mtp.proposals.empty() && inputIds.dims[1] == 1) {
+            const int previous = pastKeyValues[this->kvCacheId].first.dims[1];
+            const int remaining = std::min(requestState->denseGraphWidth,
+                this->indexerBudget) - previous;
+            // A dense verifier must not move earlier rows to the next padded
+            // attention reduction width. Commit up to the same boundary as
+            // single-token decode, then generate a fresh proposal chain.
+            if (previous < this->indexerBudget && remaining > 0 &&
+                remaining <= (int)mtp.proposals.size()) {
+                mtp.proposals.resize(remaining - 1);
+                if (mtp.proposals.empty()) mtp.targetCheckpointPrepared = false;
+            }
+        }
         if (mtp.proposals.empty()) {
             Data targetHidden;
             std::vector<int> result = ForwardTarget(
                 batch, inputIds, attentionMask, positionIds,
                 pastKeyValues, generationConfig, lastTokens, retLogits,
                 &targetHidden, nullptr, nullptr, nullptr,
-                false, false, false);
+                false, threadTpRank >= 0, false);
 
             const std::vector<int> ids = dataToInts(inputIds);
             const std::vector<int> currentPositions =
                 dataToInts(positionIds);
             const int sequence = inputIds.dims[1];
+            // PLE history belongs to rank 0; use the replicated cache length
+            // so every TP rank takes the same prompt/draft branch.
+            const int processedLength = threadTpRank >= 0
+                ? pastKeyValues[this->kvCacheId].first.dims[1]
+                : (int)requestState->processedTokens.size();
             const bool finalPromptChunk =
                 generationConfig.input_token_length <= 0 ||
-                (int)requestState->processedTokens.size() >=
-                    generationConfig.input_token_length;
+                processedLength >= generationConfig.input_token_length;
             std::vector<int> mtpTokens;
             std::vector<int> mtpPositions;
             Data pairedHidden;
@@ -10706,8 +10783,7 @@ namespace fastllm {
                  attentionMask, qsaPreviousLength, inputIds.dims[1]));
         if (threadTpRank >= 0 && GetFastllmEnv().cudaGraph &&
             indexerBudget > 0 &&
-            generationConfig.input_token_length < indexerBudget &&
-            verificationCapture == nullptr) {
+            generationConfig.input_token_length < indexerBudget) {
             // Track the allocation schedule of a fresh, unreserved cache.
             // Attention's padded reduction width must not depend on a prior
             // request's capacity or on the decode reservation below. Track
@@ -11022,7 +11098,8 @@ namespace fastllm {
         int tpToken;
         if (threadTpOwner != nullptr && threadTpOwner->TrySampleLogits(
                 threadTpRank, logits, generationConfig,
-                qsaPreviousLength + inputIds.dims[1], tpToken)) {
+                qsaPreviousLength + inputIds.dims[1], tpToken,
+                allVerificationTokens)) {
             return {tpToken};
         }
         if (allVerificationTokens != nullptr &&

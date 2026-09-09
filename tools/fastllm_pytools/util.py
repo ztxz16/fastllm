@@ -1189,9 +1189,10 @@ def make_normal_llm_model(args, startup_progress = None):
                 text_model_type in ("qwen3_5_text", "qwen3_5_moe_text")
             )
             is_qwen38_flash_next_model = (
-                architecture == "Qwen3_8FlashNextForConditionalGeneration" or
-                model_type == "qwen3_8_flash_next" or
-                text_model_type == "qwen3_8_flash_next_text"
+                architecture in ("Qwen3_8FlashNextForConditionalGeneration",
+                                 "Qwen4ExpForConditionalGeneration") or
+                model_type in ("qwen3_8_flash_next", "qwen4_exp") or
+                text_model_type in ("qwen3_8_flash_next_text", "qwen4_exp_text")
             )
             is_deepseek_v4_model = (
                 architecture in ("DeepseekV4ForCausalLM",
@@ -1275,9 +1276,9 @@ def make_normal_llm_model(args, startup_progress = None):
                         "embedded DSpark draft weights.",
                         flush=True,
                     )
-                elif not is_qwen35_model:
+                elif not (is_qwen35_model or is_qwen38_flash_next_model):
                     raise ValueError(
-                        "MTP currently requires a Qwen3.5 target, got "
+                        "MTP currently requires a Qwen3.5 or Qwen3.8-Flash-Next target, got "
                         "architecture=%s model_type=%s" %
                         (architecture, model_type))
                 if (not is_deepseek_v4_model and speculative_draft_path and not (
