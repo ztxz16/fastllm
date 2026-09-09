@@ -821,6 +821,16 @@ if (UNIT_TEST)
         target_link_libraries(customAllReduceRegression fastllm)
         target_include_directories(customAllReduceRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 
+        if (NOT USE_NCCL)
+            add_executable(hostCollectiveRegression test/ops/hostCollectiveRegression.cpp)
+            target_link_libraries(hostCollectiveRegression PRIVATE fastllm Threads::Threads)
+            target_include_directories(hostCollectiveRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            add_test(NAME cuda_host_collective COMMAND hostCollectiveRegression)
+            set_tests_properties(cuda_host_collective PROPERTIES
+                LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 TIMEOUT 120
+                RESOURCE_LOCK cuda_multigpu)
+        endif()
+
         add_executable(fp8TpRepackDeadlockRegression test/ops/fp8TpRepackDeadlockRegression.cpp)
         target_link_libraries(fp8TpRepackDeadlockRegression fastllm)
         target_include_directories(fp8TpRepackDeadlockRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

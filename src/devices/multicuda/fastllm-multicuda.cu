@@ -3381,6 +3381,14 @@ static int FastllmNcclRootRank(int root) {
 #ifndef FASTLLM_USE_NCCL
 static bool FastllmPrepareHostCollectiveGroup(void *send, void *recv,
                                              int count, int dataType, int deviceId) {
+    // Threaded model runners initialize their TP group directly and need not
+    // populate the legacy MultiCuda operator's device list. Like the NCCL
+    // path, use an existing communicator before consulting that fallback
+    // configuration; an empty legacy list must not turn a TP sum into a copy.
+    if (g_ncclInitialized && g_ncclWorldSize > 1 &&
+        g_ncclRanks.find(deviceId) != g_ncclRanks.end()) {
+        return true;
+    }
     std::vector<int> devices;
     std::map<int, int> ratios;
     FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
