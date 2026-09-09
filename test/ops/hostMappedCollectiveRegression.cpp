@@ -127,7 +127,7 @@ void Run(const std::vector<int> &devices, int dtype, int count, int root, bool i
 }
 
 void Unsupported(const std::vector<int> &devices) {
-    constexpr int count = 65537;
+    constexpr int count = 128 * 1024 + 1;
     void *buffers[2];
     for (int r = 0; r < 2; ++r) {
         Check(cudaSetDevice(devices[r]));
@@ -155,7 +155,8 @@ void Unsupported(const std::vector<int> &devices) {
     }
 }
 template <typename T> void Types(const std::vector<int> &devices, int dtype) {
-    for (int count : {1, 513, 5120, (int)(65536 / sizeof(T))}) {
+    for (int count : {1, 513, 5120, (int)(65536 / sizeof(T)),
+                      (int)(81920 / sizeof(T)), (int)(131072 / sizeof(T))}) {
         for (int root = 0; root < 2; ++root)
             for (bool inPlace : {false, true})
                 Run<T>(devices, dtype, count, root, inPlace);
@@ -182,7 +183,7 @@ int main() {
         Types<int8_t>(devices, fastllm::DataType::INT8);
         Types<int32_t>(devices, fastllm::DataType::INT32);
     }
-    std::cout << "PASS: mapped-host collective graph regression; 61,440 collective generations per "
+    std::cout << "PASS: mapped-host collective graph regression; 92,160 collective generations per "
                  "rank\n";
     return 0;
 #endif

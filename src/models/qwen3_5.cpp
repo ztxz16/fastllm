@@ -724,15 +724,6 @@ namespace fastllm {
         return enabled;
     }
 
-    static bool Qwen35MtpVerifyCudaGraphEnabled() {
-        // Keep a dedicated switch while the MTP graph path is independent of
-        // the single-token decode graph. This also provides an exact eager
-        // fallback for unsupported shapes and A/B validation.
-        static bool enabled = Qwen35EnvDefaultEnabled(
-            "FASTLLM_QWEN35_MTP_VERIFY_CUDA_GRAPH");
-        return enabled;
-    }
-
     static bool Qwen35MtpFp8DraftHeadEnabled() {
         static bool enabled = []() {
             const char *env = std::getenv("FASTLLM_MTP_FP8_DRAFT_HEAD");
@@ -15655,10 +15646,13 @@ namespace fastllm {
         for (int len : seqLens) {
             homogeneousVerifyLength &= len == seqLens[0];
         }
+        // Worker profiling synchronizes devices; exact DFlash verification
+        // requires chronological q1 metadata. Both must execute eagerly.
         bool mtpVerifyGraphEligible =
             Qwen35CudaGraphEnabled() &&
-            Qwen35MtpVerifyCudaGraphEnabled() &&
-            !speculativeCaptureDFlashHiddenStates &&
+            Qwen35MtpWorkerProfileInterval() == 0 &&
+            (!speculativeCaptureDFlashHiddenStates ||
+                (batch == 1 && !Qwen35DFlashExactVerifyEnabled())) &&
             speculativeCollectAllLogits &&
             speculativeCaptureFirstTokenLinearState &&
             speculativeLinearStateCaptureSlots > 0 &&
@@ -15776,21 +15770,23 @@ namespace fastllm {
                     }
                     Qwen35MtpVerifyGraphDeviceState &rootGraphDevice =
                         *graphState.deviceStates[0];
-                    speculativeHiddenStates.FreeSpace();
-                    Qwen35BorrowCudaTensor(
+                    auto publishHiddenState = [](Data &output, const Data &source) {
+                        output.FreeSpace();
+                        Qwen35BorrowCudaTensor(output, source);
+                        // Keep graph storage borrowed, but let FreeSpace detach
+                        // this view before a later prefill creates owning data.
+                        output.isFake = false;
+                    };
+                    publishHiddenState(
                         speculativeHiddenStates,
                         rootGraphDevice.hiddenStates);
-                    // This persistent output must detach on the next prefill.
-                    // cudaDataBorrowed protects the graph allocation; isFake
-                    // would also suppress freeing subsequent owning copies.
-                    speculativeHiddenStates.isFake = false;
                     if (speculativeCaptureDFlashHiddenStates) {
                         speculativeDFlashHiddenStates.resize(
                             rootGraphDevice.dflashHiddenStates.size());
                         for (int feature = 0;
                              feature < (int)rootGraphDevice.dflashHiddenStates.size();
                              ++feature) {
-                            Qwen35BorrowCudaTensor(
+                            publishHiddenState(
                                 speculativeDFlashHiddenStates[feature],
                                 rootGraphDevice.dflashHiddenStates[feature]);
                         }
@@ -16113,8 +16109,9 @@ namespace fastllm {
                     if (!captureOk) {
                         std::fprintf(
                             stderr,
-                            "[Fastllm] Qwen3.5 MTP verify CUDA graph "
+                            "[Fastllm] Qwen3.5 %s verify CUDA graph "
                             "disabled at %s: %s\n",
+                            speculativeCaptureDFlashHiddenStates ? "DFlash2" : "MTP",
                             failureStage == nullptr ? "unknown stage" :
                                                       failureStage,
                             FastllmCudaGraphLastError());
@@ -16126,8 +16123,9 @@ namespace fastllm {
                         runExternalEager();
                     } else {
                         std::printf(
-                            "[Fastllm] Qwen3.5 MTP verify CUDA graph "
+                            "[Fastllm] Qwen3.5 %s verify CUDA graph "
                             "captured: batch=%d verify=%d tp=%zu.\n",
+                            speculativeCaptureDFlashHiddenStates ? "DFlash2" : "MTP",
                             batch, seqLens[0], devices.size());
                         std::fflush(stdout);
                     }
@@ -26693,12 +26691,15 @@ namespace fastllm {
             if (captured.dims[1] != tokens) {
                 Split(captured, 1, 0, tokens, selected);
                 selectedInput = &selected;
+            } else if (captured.cudaDataBorrowed &&
+                       captured.dataType != projectionInputType) {
+                selected.CopyFrom(captured);
+                selectedInput = &selected;
             }
             if (selectedInput->dataType != projectionInputType) {
-                // Captures are dedicated DFlash buffers and are released as
-                // soon as this projection completes. Converting them in place
-                // lets SM70-SM75 feed the FP16 FC directly instead of keeping
-                // another full combined-input conversion buffer alive.
+                // Split/CopyFrom gives graph outputs an owning temporary so
+                // conversion cannot alter their persistent storage or layout.
+                // Eager captures still convert in place to limit prefill memory.
                 ToDataType(*selectedInput, projectionInputType);
             }
             AssertInFastLLM(

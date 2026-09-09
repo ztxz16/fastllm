@@ -19,7 +19,7 @@ Graph。`mapped-host TP2 CUDA Graph collectives: self-test passed` 表示该 GPU
 
 - 仅 Windows NVIDIA CUDA、两个不同 GPU，设备需支持映射主机内存且计算能力
   至少为 7.0；实际拓扑还必须通过启动时的双图重复回放自检。
-- 每次集合通信每卡最多 64 KiB，支持 FP16、BF16、FP32、INT8、INT32 的 SUM
+- 每次集合通信每卡最多 128 KiB，支持 FP16、BF16、FP32、INT8、INT32 的 SUM
   all-reduce / reduce，以及 broadcast。优先保留已有 P2P 自定义 all-reduce。
 - eager 执行使用同步主机中转，其中上述五种类型的大块双卡 SUM 可以在 GPU 上计算。
   自检失败、更多 GPU、超限或不支持的数据
@@ -40,7 +40,7 @@ GPU 上的序号随实际执行递增，交替使用两组标记，完成握手�
 这使捕获、重复回放和重新捕获使用同一套同步逻辑。启动自检连续原地 SUM 32 次，
 检查每次回放产生的新结果确实参与下一次计算。自检失败不会发布该通信状态。
 
-每个有序物理 GPU 对缓存一个进程生命周期的通信状态，约 128 KiB 锁页消息区，
+每个有序物理 GPU 对缓存一个进程生命周期的通信状态，约 256 KiB 锁页消息区，
 外加标记和设备序号。切换通信组后仍保留已捕获图引用的地址；同一 GPU 对重新
 初始化或重新捕获不会再分配一个通信区。
 
@@ -54,7 +54,7 @@ INT8、INT32；消息每卡至少 64 KiB 且支持映射主机内存时，自动
 缓冲区。阈值按字节计算，与元素类型无关。每卡完成输入 D2H 后，
 两个 CPU rank 线程会合；GPU 读取本卡原输入和对端的映射缓冲区并计算 SUM。
 两卡完成读取后再次会合，才允许下一次通信复用缓冲区。该路径仍是同步通信，
-无需 P2P 或额外环境变量，也不受小消息 Graph 后端 64 KiB 上限的约束。
+无需 P2P 或额外环境变量，也不受小消息 Graph 后端 128 KiB 上限的约束。
 
 求和保持原 CPU fallback 的 rank 顺序：FP16 沿用软件转换规则，BF16 使用
 FP32 累加并按最近偶数舍入，FP32 保持逐步加法舍入，整数使用 INT64 累加后
@@ -62,6 +62,26 @@ FP32 累加并按最近偶数舍入，FP32 保持逐步加法舍入，整数使�
 符号位。锁页分配失败时，两卡共同回到原 CPU 求和路径；broadcast、更多 GPU、Linux 和 ROCm
 仍沿用原路径。每个 rank 线程保留一个按最大已见消息增长的锁页缓冲区，并在线程
 退出时释放。它不被 Graph 引用，与上述进程生命周期的小消息区相互独立。
+
+## DFlash2 验证 Graph
+
+Qwen3.5/3.6/3.8 dense 模型的单请求 DFlash2 验证阶段可复用 MTP 的 Graph、
+分页元数据和线性状态快照。Qwen3.8-27B 的 block=8、hidden=5120、FP16 激活
+每卡需要 80 KiB 通信，落在上述范围内。block 包含 anchor，实际 draft token 数为 7。
+
+```powershell
+$env:FASTLLM_CUDA_GRAPH = "1"
+ftllm run D:\models\Qwen3.8-27B-FP8 --tp 2 --dtype auto `
+  --draft D:\models\Qwen3.8-27B-DFlash2 --draft_tokens 7 --max_batch 1 --cuda_embedding
+```
+
+普通解码、MTP 和 DFlash 验证共用 `FASTLLM_CUDA_GRAPH` 总开关；不再读取
+`FASTLLM_QWEN35_MTP_VERIFY_CUDA_GRAPH`。日志中的 `DFlash2 verify CUDA graph captured`
+表示目标验证图捕获成功。draft 生成仍按现有路径执行。
+
+Graph 持有固定地址的隐藏状态输出；发布的借用视图在下一次 prefill 前可解除引用，
+draft 做类型转换时使用独立数据。batch>1 的 DFlash、显式 exact verify、worker profiling
+以及其他不满足捕获条件的配置仍走 eager 路径。
 
 ## 回归测试
 
@@ -79,9 +99,9 @@ ctest --test-dir build -C Release -R "^cuda_host_.*collective$" --output-on-fail
   大小、两种根节点和原地/非原地通信；额外检查五种类型的原始位模式、浮点
   特殊值、整数溢出、各类型的 64 KiB 前后边界、10 MiB 消息，以及同一线程中
   缓冲区扩容和大小交替。除 FP32/BF16 的 NaN 载荷外，逐位对照原 CPU 求和结果。
-- Graph 回归：五种类型、四种消息大小（含 64 KiB 边界）、两种根节点、原地/
+- Graph 回归：五种类型、六种消息大小（含 64/80/128 KiB）、两种根节点、原地/
   非原地通信、每图 32 次不同输入回放、重新捕获、交换设备顺序并切回原组，
-  共 61,440 次通信/卡；同时检查超限捕获被拒绝。FP16/BF16 包含舍入输入。
+  共 92,160 次通信/卡；同时检查超限捕获被拒绝。FP16/BF16 包含舍入输入。
 
 性能数据依赖模型、输入长度和拓扑，应分别报告 prefill 与稳定解码；只比较解码
 吞吐不能代表完整请求延迟。

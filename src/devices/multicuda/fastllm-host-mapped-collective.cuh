@@ -1,7 +1,9 @@
 // Included by fastllm-multicuda.cu after the host-collective kind declaration.
 #if defined(_WIN32) && !defined(USE_ROCM)
 namespace {
-constexpr size_t kHostMappedMaxBytes = 64 * 1024;
+// DFlash B8 verification communicates 8 * 5120 * sizeof(half) = 80 KiB
+// per rank. Keep the same bounded, single-CTA protocol for these messages.
+constexpr size_t kHostMappedMaxBytes = 128 * 1024;
 constexpr uint64_t kHostMappedTimeoutNs = 1000000000ULL;
 struct alignas(128) HostMappedFlag {
     uint32_t value;
@@ -243,7 +245,7 @@ static void FastllmInitHostMappedCollectives(const std::vector<int> &devices) {
         return;
     // A bounded, process-lifetime cache per ordered physical GPU pair keeps
     // captured addresses valid across communicator changes and graph teardown.
-    // Each pair owns only 128 KiB of pinned payload plus flags and two device
+    // Each pair owns only 256 KiB of pinned payload plus flags and two device
     // counters; recapture/model reload does not allocate another transport.
     static auto *cache = new std::map<std::vector<int>, std::unique_ptr<HostMappedState>>;
     auto existing = cache->find(devices);
