@@ -9725,6 +9725,13 @@ namespace fastllm {
                     w1, w2, weights, weightsBatch, gateType)) {
                 return;
             }
+#ifndef USE_ROCM
+            if (gateType == MoeGateSwiglu &&
+                FastllmCudaFloat32MergeMOEBFloat16Indexed(
+                    input, index, score, w3, w1, w2, output, weights, weightsBatch)) {
+                return;
+            }
+#endif
             // The NVFP4 grouped-Marlin implementation sizes and completely
             // overwrites output itself. Delay the generic zero allocation
             // until after that path so decode does not enqueue one redundant

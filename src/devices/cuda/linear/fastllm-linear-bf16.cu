@@ -183,17 +183,9 @@ __global__ void FastllmGemvFp16Bf16Kernel2MultiRow(half *A, __nv_bfloat16 *B, ha
 }
 
 template <int THREAD_PER_BLOCK, int PART>
-__global__ void FastllmGemvFp32Bf16Kernel2MultiRow(float *A, __nv_bfloat16 *B, float *C, float *bias, int m, int k) {
+__device__ __forceinline__ void FastllmGemvFp32Bf16Rows(float *A, const __nv_bfloat16 *B, float *C, float *bias, int m, int k) {
     __shared__ float sdata[PART][THREAD_PER_BLOCK];
     unsigned int tid = threadIdx.x;
-    // Exact speculative verification uses the ordinary one-row reduction
-    // tree for every candidate.  A grid-y row selector keeps those rows in a
-    // single launch without changing any arithmetic performed by PART=1.
-    if constexpr (PART == 1) {
-        const size_t gridRow = (size_t)blockIdx.y;
-        A += gridRow * m;
-        C += gridRow * k;
-    }
     float4 regA;
     union_bf16_4 regB;
 
@@ -256,6 +248,194 @@ __global__ void FastllmGemvFp32Bf16Kernel2MultiRow(float *A, __nv_bfloat16 *B, f
         }
     }
     __syncthreads();
+}
+
+template <int THREAD_PER_BLOCK, int PART>
+__global__ void FastllmGemvFp32Bf16Kernel2MultiRow(float *A, __nv_bfloat16 *B, float *C, float *bias, int m, int k) {
+    // Exact speculative batches retain the ordinary one-row reduction tree.
+    if constexpr (PART == 1) {
+        A += (size_t)blockIdx.y * m;
+        C += (size_t)blockIdx.y * k;
+    }
+    FastllmGemvFp32Bf16Rows<THREAD_PER_BLOCK, PART>(A, B, C, bias, m, k);
+}
+
+// By-value pointer chunks need no device registry or host route readback.
+// They fit the 4 KiB kernel argument limit on older CUDA architectures and
+// are owned by the graph node when captured. Only resident weights qualify.
+struct FastllmBf16ExpertPointers {
+    const __nv_bfloat16 *weights[256];
+};
+
+template <bool DOWN>
+__global__ void FastllmMoeFp32Bf16IndexedKernel(
+        float *input, float *output, const int32_t *indices,
+        FastllmBf16ExpertPointers table, int first, int count,
+        int topk, int m, int k) {
+    const int task = blockIdx.y;
+    const int expert = indices[task] - first;
+    if (expert < 0 || expert >= count) return;
+    const int row = DOWN ? task : task / topk;
+    FastllmGemvFp32Bf16Rows<256, 1>(input + (size_t)row * m,
+        table.weights[expert], output + (size_t)task * k, nullptr, m, k);
+}
+
+__device__ __forceinline__ float FastllmMoeFp32Bf16Dot4(
+        const float *input, const __nv_bfloat16 *weight) {
+    const float4 a = *reinterpret_cast<const float4 *>(input);
+    union_bf16_4 b;
+    b.in = *reinterpret_cast<const uint2 *>(weight);
+    float sum = 0.0f;
+    sum += a.x * __bfloat162float(b.out2[0].x);
+    sum += a.y * __bfloat162float(b.out2[0].y);
+    sum += a.z * __bfloat162float(b.out2[1].x);
+    sum += a.w * __bfloat162float(b.out2[1].y);
+    return sum;
+}
+
+template <int INTER>
+__global__ void FastllmMoeFp32Bf16DownWarpKernel(
+        const float *input, float *output, const int32_t *indices,
+        FastllmBf16ExpertPointers table, int first, int count, int hidden) {
+    const int task = blockIdx.y, expert = indices[task] - first;
+    const int col = blockIdx.x * 8 + threadIdx.x / 32;
+    if (expert < 0 || expert >= count || col >= hidden) return;
+    const int lane = threadIdx.x % 32;
+    input += (size_t)task * INTER;
+    const __nv_bfloat16 *weight = table.weights[expert] + (size_t)col * INTER;
+    float sum = FastllmMoeFp32Bf16Dot4(input + lane * 4, weight + lane * 4);
+    float diff = 0.0f;
+    // Only 32/64 lanes of the generic 256-thread reduction contain data.
+    // Retain its compensated tree, including the upper 32 partial sums for
+    // INTER=256, while assigning eight independent output columns per CTA.
+    if constexpr (INTER == 256) {
+        const float other = FastllmMoeFp32Bf16Dot4(
+            input + (lane + 32) * 4, weight + (lane + 32) * 4);
+        const float next = sum + other;
+        diff = (next - sum) - other;
+        sum = next;
+    }
+    for (int step = 16; step > 0; step >>= 1) {
+        const float peer = __shfl_down_sync(0xffffffffu, sum, step);
+        if (lane < step) {
+            const float other = peer - diff;
+            const float next = sum + other;
+            diff = (next - sum) - other;
+            sum = next;
+        }
+    }
+    if (lane == 0) output[(size_t)task * hidden + col] = sum;
+}
+
+__global__ void FastllmMoeFp32Bf16ReduceKernel(
+        const float *parts, const int32_t *indices, const float *scores,
+        float *output, int hidden, int topk, int experts, bool singleRow) {
+    __shared__ int order[16];
+    const int row = blockIdx.y;
+    indices += row * topk;
+    scores += row * topk;
+    if (threadIdx.x == 0) {
+        for (int i = 0; i < topk; ++i) {
+            int j = i;
+            // The multi-row fallback visits experts in ascending id order;
+            // single-row decode instead follows the router's top-k order.
+            while (!singleRow && j > 0 && indices[order[j - 1]] > indices[i]) {
+                order[j] = order[j - 1];
+                --j;
+            }
+            order[j] = i;
+        }
+    }
+    __syncthreads();
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= hidden) return;
+    float sum = 0.0f;
+    bool first = true;
+    for (int j = 0; j < topk; ++j) {
+        const int route = order[j];
+        if (indices[route] < 0 || indices[route] >= experts) continue;
+        const float value = parts[((size_t)row * topk + route) * hidden + col];
+        sum = singleRow && first ? value * scores[route]
+            : fmaf(value, scores[route], sum);
+        first = false;
+    }
+    output[(size_t)row * hidden + col] = sum;
+}
+
+bool FastllmCudaFloat32MergeMOEBFloat16Indexed(
+        const fastllm::Data &input, const fastllm::Data &index,
+        const fastllm::Data &score, fastllm::Data &gate,
+        fastllm::Data &middle, fastllm::Data &parts, fastllm::Data &output,
+        fastllm::Data **weights, int weightsBatch) {
+    using namespace fastllm;
+    if (input.dataType != FLOAT32 || input.dims.size() != 2 ||
+        input.dims[0] < 1 || input.dims[0] > 4 || input.dims[1] <= 0 ||
+        index.dataType != INT32 || score.dataType != FLOAT32 ||
+        index.dims.size() != 2 || index.dims[0] != input.dims[0] ||
+        index.dims[1] < 1 || index.dims[1] > 16 || score.dims != index.dims ||
+        weights == nullptr || weightsBatch < 4 || (weightsBatch & 1) ||
+        weights[0] != nullptr || weights[1] != nullptr || weights[2] == nullptr ||
+        weights[2]->dims.size() != 2 || weights[2]->dims[0] <= 0 ||
+        (weights[2]->dims[0] & 1)) return false;
+    const int device = FastllmCudaGetDevice();
+    auto resident = [device](const Data &data) {
+        return data.dataDevice == DataDevice::CUDA && data.cudaData != nullptr &&
+            !data.multiDeviceData && !data.lockInCPU && !data.isDiskWeight &&
+            (data.dataDeviceIds.empty() ||
+             (data.dataDeviceIds.size() == 1 && data.dataDeviceIds[0] == device));
+    };
+    if (!resident(input) || !resident(index) || !resident(score)) return false;
+    const int batch = input.dims[0], hidden = input.dims[1];
+    const int topk = index.dims[1], inter = weights[2]->dims[0] / 2;
+    const int experts = weightsBatch / 2 - 1;
+    std::vector<FastllmBf16ExpertPointers> gateTables((experts + 255) / 256);
+    std::vector<FastllmBf16ExpertPointers> downTables(gateTables.size());
+    for (int e = 0; e < experts; ++e) {
+        const Data *g = weights[2 * (e + 1)], *d = weights[2 * (e + 1) + 1];
+        if (g == nullptr || d == nullptr || g->dataType != BFLOAT16 ||
+            d->dataType != BFLOAT16 || g->dims.size() != 2 || d->dims.size() != 2 ||
+            g->dims[0] != 2 * inter || g->dims[1] != hidden ||
+            d->dims[0] != hidden || d->dims[1] != inter || !resident(*g) || !resident(*d)) return false;
+        gateTables[e / 256].weights[e % 256] = (const __nv_bfloat16 *)g->cudaData;
+        downTables[e / 256].weights[e % 256] = (const __nv_bfloat16 *)d->cudaData;
+    }
+    auto prepare = [&](Data &data, int rows, int cols) {
+        data.dataType = FLOAT32;
+        data.UpdateUnitSize();
+        data.Resize({rows, cols});
+        data.ToDevice(DataDevice::CUDA, std::vector<int>{device}, false);
+        data.Allocate(false);
+    };
+    prepare(gate, batch * topk, 2 * inter);
+    prepare(middle, batch * topk, inter);
+    prepare(parts, batch * topk, hidden);
+    prepare(output, batch, hidden);
+    for (int first = 0; first < experts; first += 256) {
+        FastllmMoeFp32Bf16IndexedKernel<false><<<dim3(2 * inter, batch * topk), 256>>>(
+            (float *)input.cudaData, (float *)gate.cudaData, (const int32_t *)index.cudaData,
+            gateTables[first / 256], first, std::min(256, experts - first), topk, hidden, 2 * inter);
+    }
+    FastllmCudaSwiglu(gate, middle);
+    for (int first = 0; first < experts; first += 256) {
+        if (inter == 128) {
+            FastllmMoeFp32Bf16DownWarpKernel<128><<<dim3((hidden + 7) / 8, batch * topk), 256>>>(
+                (const float *)middle.cudaData, (float *)parts.cudaData, (const int32_t *)index.cudaData,
+                downTables[first / 256], first, std::min(256, experts - first), hidden);
+        } else if (inter == 256) {
+            FastllmMoeFp32Bf16DownWarpKernel<256><<<dim3((hidden + 7) / 8, batch * topk), 256>>>(
+                (const float *)middle.cudaData, (float *)parts.cudaData, (const int32_t *)index.cudaData,
+                downTables[first / 256], first, std::min(256, experts - first), hidden);
+        } else {
+            FastllmMoeFp32Bf16IndexedKernel<true><<<dim3(hidden, batch * topk), 256>>>(
+                (float *)middle.cudaData, (float *)parts.cudaData, (const int32_t *)index.cudaData,
+                downTables[first / 256], first, std::min(256, experts - first), topk, inter, hidden);
+        }
+    }
+    FastllmMoeFp32Bf16ReduceKernel<<<dim3((hidden + 255) / 256, batch), 256>>>(
+        (const float *)parts.cudaData, (const int32_t *)index.cudaData,
+        (const float *)score.cudaData, (float *)output.cudaData,
+        hidden, topk, experts, batch == 1);
+    return true;
 }
 
 template <int THREAD_PER_BLOCK, int PART>
