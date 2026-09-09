@@ -3362,8 +3362,9 @@ namespace fastllm {
         const Data &combinedGateInput,
         int gateOffset, int gateHeads,
         Data &output, float eps) {
-        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON") ||
-            !CudaEnvFlagDefaultEnabled(
+        // This native CUDA fusion does not require the Triton backend.
+        // Retain the existing per-operation switches for fallback selection.
+        if (!CudaEnvFlagDefaultEnabled(
                 "FASTLLM_CUDA_TRITON_CHUNK_GDN_COMBINED_Z", true)) {
             return false;
         }
@@ -3378,8 +3379,9 @@ namespace fastllm {
         int batch, int seqLen,
         int gateOffset, int gateHeads,
         Data &output, float eps) {
-        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON") ||
-            !CudaEnvFlagDefaultEnabled(
+        // This native CUDA fusion does not require the Triton backend.
+        // Retain the existing per-operation switches for fallback selection.
+        if (!CudaEnvFlagDefaultEnabled(
                 "FASTLLM_CUDA_TRITON_CHUNK_GDN_COMBINED_Z", true) ||
             !CudaEnvFlagDefaultEnabled(
                 "FASTLLM_CUDA_TRITON_CHUNK_GDN_FUSED_OUTPUT_GATE",
