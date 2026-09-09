@@ -89,7 +89,8 @@ CUDA wheel 会声明 Windows 已有构建的 `nvidia-cuda-runtime-cu12` 和
 - 支持的多卡拓扑和张量会优先使用 FastLLM 的 CUDA P2P 自定义 all-reduce；
 - Windows 双卡通过启动自检后，CUDA Graph 中每卡不超过 64 KiB 的 broadcast、
   reduce 和 all-reduce 可以使用 GPU 协调的映射主机内存通信，不要求 P2P；
-- eager 路径仍使用主机内存同步汇聚。未通过自检的拓扑、更多 GPU 和超限消息
+- eager 路径使用主机内存同步汇聚；双卡大块 FP16/BF16/FP32/INT8/INT32 SUM 可复用锁页缓冲区并在
+  GPU 上计算。未通过自检的拓扑、更多 GPU 和超限消息
   不支持这一 Graph 后端，需要由模型退出图模式；不支持自动退出的调用方应关闭
   Graph。主机中转的性能不能按 NCCL 预期使用。
 

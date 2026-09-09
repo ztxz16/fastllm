@@ -2202,6 +2202,7 @@ enum class FastllmHostCollectiveKind {
 };
 
 #include "fastllm-host-mapped-collective.cuh"
+#include "fastllm-host-staged-sum.cuh"
 
 struct FastllmHostCollectiveState {
     std::mutex mutex;
@@ -2219,6 +2220,8 @@ struct FastllmHostCollectiveState {
     std::vector<bool> arrivedRanks;
     std::vector<std::vector<uint8_t>> inputs;
     std::vector<uint8_t> result;
+    std::vector<FastllmHostStagedInput *> pinnedInputs;
+    bool gpuSum = false;
 };
 
 static FastllmHostCollectiveState g_hostCollective;
@@ -2244,6 +2247,8 @@ static void FastllmResetHostCollectiveState() {
     g_hostCollective.arrivedRanks.clear();
     g_hostCollective.inputs.clear();
     g_hostCollective.result.clear();
+    g_hostCollective.pinnedInputs.clear();
+    g_hostCollective.gpuSum = false;
     g_hostCollective.condition.notify_all();
 }
 
@@ -2387,10 +2392,9 @@ static bool FastllmHostSum(const std::vector<std::vector<uint8_t>> &inputs,
 }
 
 // Correctness-first fallback for Windows CUDA installations without NCCL.
-// All participating rank threads stage their input through pageable host
-// memory, rendezvous here, and synchronously copy the result back. This is not
-// intended to compete with NCCL; it keeps arbitrary supported collectives
-// functional when P2P custom all-reduce cannot be used.
+// Rank threads rendezvous after staging inputs and before reusing storage.
+// Large Windows TP2 sums use reusable pinned staging and GPU reduction;
+// other cases keep the pageable-memory CPU fallback.
 static bool FastllmRunHostCollective(FastllmHostCollectiveKind kind,
                                      const void *send, void *recv, int count,
                                      int dataType, int rootRank, int deviceId) {
@@ -2410,10 +2414,23 @@ static bool FastllmRunHostCollective(FastllmHostCollectiveKind kind,
     const size_t bytes = (size_t)count * typeBytes;
     bool localOk = FastllmHostCollectiveStreamAvailable(deviceId);
     std::vector<uint8_t> localInput;
+    thread_local FastllmHostStagedInput pinnedInput;
+    bool usePinned = localOk && worldSize == 2 &&
+        bytes >= 64 * 1024 &&
+        kind != FastllmHostCollectiveKind::Broadcast && pinnedInput.Reserve(bytes);
     if (localOk && (kind != FastllmHostCollectiveKind::Broadcast ||
                     rank == rootRank)) {
-        localOk = FastllmHostCopyFromDevice(localInput, send, bytes,
-                                             deviceId);
+        if (usePinned) {
+            cudaError_t status = cudaMemcpyAsync(pinnedInput.data, send, bytes,
+                                                 cudaMemcpyDeviceToHost, cudaStreamPerThread);
+            if (status == cudaSuccess)
+                status = cudaStreamSynchronize(cudaStreamPerThread);
+            localOk = status == cudaSuccess;
+            if (!localOk)
+                cudaGetLastError();
+        } else {
+            localOk = FastllmHostCopyFromDevice(localInput, send, bytes, deviceId);
+        }
     }
 
     FastllmHostCollectiveState &state = g_hostCollective;
@@ -2429,7 +2446,9 @@ static bool FastllmRunHostCollective(FastllmHostCollectiveKind kind,
         state.completed = 0;
         state.arrivedRanks.assign(worldSize, false);
         state.inputs.assign(worldSize, std::vector<uint8_t>());
-        state.result.assign(bytes, 0);
+        state.result.clear();
+        state.pinnedInputs.assign(worldSize, nullptr);
+        state.gpuSum = false;
     }
     const uint64_t generation = state.generation;
     bool parametersMatch = state.worldSize == worldSize &&
@@ -2444,6 +2463,8 @@ static bool FastllmRunHostCollective(FastllmHostCollectiveKind kind,
         if (!localInput.empty()) {
             state.inputs[rank].swap(localInput);
         }
+        if (usePinned)
+            state.pinnedInputs[rank] = &pinnedInput;
         state.arrived++;
     }
 
@@ -2457,16 +2478,27 @@ static bool FastllmRunHostCollective(FastllmHostCollectiveKind kind,
                     state.result = state.inputs[rootRank];
                 }
             } else {
-                for (const auto &input : state.inputs) {
-                    if (input.size() != bytes) {
-                        state.failed = true;
-                        break;
+                state.gpuSum = worldSize == 2 &&
+                    state.pinnedInputs[0] != nullptr && state.pinnedInputs[1] != nullptr;
+                if (!state.gpuSum) {
+                    // A failed pinned allocation on either rank falls back
+                    // collectively. Inputs already staged in pinned memory
+                    // remain available to the original CPU implementation.
+                    for (int r = 0; r < worldSize; ++r) {
+                        if (state.pinnedInputs[r] != nullptr) {
+                            const uint8_t *input = state.pinnedInputs[r]->data;
+                            state.inputs[r].assign(input, input + bytes);
+                        }
+                        if (state.inputs[r].size() != bytes) {
+                            state.failed = true;
+                            break;
+                        }
                     }
-                }
-                if (!state.failed &&
-                    !FastllmHostSum(state.inputs, state.result, count,
-                                    dataType)) {
-                    state.failed = true;
+                    state.result.resize(bytes);
+                    if (!state.failed &&
+                        !FastllmHostSum(state.inputs, state.result, count, dataType)) {
+                        state.failed = true;
+                    }
                 }
             }
         }
@@ -2484,7 +2516,9 @@ static bool FastllmRunHostCollective(FastllmHostCollectiveKind kind,
                          rank == rootRank;
     bool copyOk = true;
     if (collectiveOk && shouldReceive) {
-        copyOk = FastllmHostCopyToDevice(recv, state.result, deviceId);
+        copyOk = state.gpuSum
+            ? FastllmHostStagedSum(send, recv, *state.pinnedInputs[1 - rank], count, dataType, rank)
+            : FastllmHostCopyToDevice(recv, state.result, deviceId);
     }
 
     lock.lock();
@@ -2498,6 +2532,8 @@ static bool FastllmRunHostCollective(FastllmHostCollectiveKind kind,
             state.arrivedRanks.clear();
             state.inputs.clear();
             state.result.clear();
+            state.pinnedInputs.clear();
+            state.gpuSum = false;
             state.generation++;
             state.condition.notify_all();
         } else {
