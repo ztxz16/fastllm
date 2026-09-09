@@ -1643,11 +1643,12 @@ namespace fastllm {
                 }
                 if (axis >= 0 && name.find(".experts.") != std::string::npos) {
                     // Grouped NVFP4 Marlin needs 128 intermediate columns. A 640
-                    // wide expert on four GPUs is 256/128/128/128, rotated per
-                    // layer to balance memory while keeping each gate/down pair
-                    // on precisely the same intermediate slice.
+                    // wide expert on four GPUs is 256/128/128/128. With more
+                    // ranks than aligned blocks, some ranks own an empty
+                    // routed slice. Rotate these slices per layer while keeping
+                    // each gate/down pair on the same intermediate range.
                     const int width = axis == 0 ? source.dims[0] / 2 : source.dims[1];
-                    AssertInFastLLM(width % 128 == 0 && width / 128 >= count,
+                    AssertInFastLLM(width > 0 && width % 128 == 0,
                                     "Qwen4 TP expert width cannot satisfy 128-column alignment.");
                     const size_t layerStart = name.find("layers.") + 7;
                     const int layer = std::atoi(name.c_str() + layerStart);
@@ -1708,6 +1709,7 @@ namespace fastllm {
                     for (int r = 0; r < count; ++r) {
                         FastllmCudaSetDevice(devices[r]);
                         auto &experts = tp.ranks[r]->weights[layer];
+                        if (experts[2]->dims[0] == 0) continue;
                         AssertInFastLLM(FastllmCudaPrepareNVFP4E4M3Moe(experts.data(), experts.size()),
                                         "Qwen4 TP could not prepare compact NVFP4 layer " + std::to_string(layer));
                     }
@@ -5989,6 +5991,18 @@ namespace fastllm {
 #ifdef USE_CUDA
         FastllmCudaGraphMarkParallelFirstDone(deviceLayer);
         FastllmCudaGraphMarkParallelSecondBegin(deviceLayer);
+        if (threadTpRank >= 0 && moeWeights.size() >= 4 &&
+            moeWeights[2] != nullptr && moeWeights[3] != nullptr &&
+            moeWeights[2]->dims == std::vector<int>({0, input.dims.back()}) &&
+            moeWeights[3]->dims == std::vector<int>({input.dims.back(), 0})) {
+            // An empty routed slice contributes zero, but its shared expert
+            // slice and the final TP collective are still required.
+            FastllmCudaGraphMarkParallelJoin(deviceLayer);
+            output.CopyFrom(sharedOutput);
+            output.Reshape(input.dims);
+            ThreadTpAllReduce(output);
+            return;
+        }
 #endif
         bool fusedRouterSelection = false;
 #ifdef USE_CUDA
