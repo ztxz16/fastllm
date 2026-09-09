@@ -442,6 +442,14 @@ namespace fastllm {
                                        int anchorToken,
                                        const GenerationConfig &generationConfig,
                                        DFlashContext &context);
+        void RunDFlashDraftForward(int device,
+                                  const std::vector<int> &devices,
+                                  int anchorToken, DFlashContext &context,
+                                  Data &candidateTopK, Data &selectorHidden);
+        bool RunDFlashDraftGraph(int device,
+                                const std::vector<int> &devices,
+                                int anchorToken, DFlashContext &context,
+                                Data &candidateTopK, Data &selectorHidden);
         std::vector<std::vector<int> > RunDFlashDraftBatch(
                 int device, const std::vector<int> &devices,
                 const std::vector<int> &anchorTokens,

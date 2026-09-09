@@ -3788,6 +3788,52 @@ namespace fastllm {
             bool externalPagedMeta = false;
         };
 
+        struct Qwen35DFlashDraftGraphState {
+            struct Rank {
+                int device = -1;
+                Data tpHidden, packed, gathered, scratch;
+                void *graph = nullptr;
+                void *exec = nullptr;
+                void *completion = nullptr;
+                ~Rank() {
+                    FastllmCudaSetDevice(device);
+                    if (completion) FastllmCudaEventDestroy(completion);
+                }
+            };
+            std::mutex mutex;
+            std::string signature;
+            std::vector<int> devices;
+            std::vector<std::unique_ptr<Rank>> ranks;
+            Data inputIds, positions, cachedTokens;
+            Data candidates, selector;
+            std::vector<void *> reservedPointers;
+            Qwen35CudaGraphBarrier barrier;
+            bool warmed = false;
+            bool captured = false;
+            bool disabled = false;
+
+            void DestroyGraph() {
+                for (auto &rank : ranks) {
+                    FastllmCudaSetDevice(rank->device);
+                    if (rank->exec) FastllmCudaGraphExecDestroy(rank->exec);
+                    if (rank->graph) FastllmCudaGraphDestroy(rank->graph);
+                    rank->exec = rank->graph = nullptr;
+                }
+                if (!reservedPointers.empty()) {
+                    FastllmCudaGraphMemoryPoolRelease(reservedPointers);
+                    reservedPointers.clear();
+                }
+                warmed = captured = false;
+            }
+            ~Qwen35DFlashDraftGraphState() { DestroyGraph(); }
+        };
+
+        // Only the root runs the draft backbone. Peer ranks capture the same
+        // ordered MLP and vocabulary collectives, avoiding nested CPU dispatch
+        // and host-staged transfers between each pair of draft layers.
+        static thread_local Qwen35DFlashDraftGraphState
+            *qwen35DFlashDraftGraphContext = nullptr;
+
         static thread_local Qwen35MtpVerifyGraphThreadContext
             *qwen35MtpVerifyGraphThreadContext = nullptr;
 
@@ -3842,6 +3888,22 @@ namespace fastllm {
         static std::mutex &Qwen35CudaGraphStatesMutex() {
             static std::mutex *statesMutex = new std::mutex();
             return *statesMutex;
+        }
+
+        static std::map<const Qwen3_5Model*,
+            std::unique_ptr<Qwen35DFlashDraftGraphState>>
+                &Qwen35DFlashDraftGraphStates() {
+            static auto *states = new std::map<const Qwen3_5Model*,
+                std::unique_ptr<Qwen35DFlashDraftGraphState>>();
+            return *states;
+        }
+
+        static Qwen35DFlashDraftGraphState &GetQwen35DFlashDraftGraphState(
+                const Qwen3_5Model *model) {
+            std::lock_guard<std::mutex> guard(Qwen35CudaGraphStatesMutex());
+            auto &state = Qwen35DFlashDraftGraphStates()[model];
+            if (!state) state.reset(new Qwen35DFlashDraftGraphState());
+            return *state;
         }
 
         static std::map<Qwen35CudaGraphStateKey, std::unique_ptr<Qwen35CudaGraphDecodeState> > &Qwen35CudaGraphStates() {
@@ -3918,6 +3980,7 @@ namespace fastllm {
 
         static void Qwen35EraseCudaGraphDecodeStates(const Qwen3_5Model *model) {
             std::lock_guard<std::mutex> guard(Qwen35CudaGraphStatesMutex());
+            Qwen35DFlashDraftGraphStates().erase(model);
             auto &states = Qwen35CudaGraphStates();
             for (auto it = states.begin(); it != states.end();) {
                 if (std::get<0>(it->first) == model) {
@@ -26540,6 +26603,72 @@ namespace fastllm {
         Linear(input, linearWeight, *GetEmptyData(), output);
     }
 
+#ifdef USE_CUDA
+    static void Qwen35DFlashGraphTensor(
+            Data &data, int device, DataType type, const std::vector<int> &dims) {
+        Qwen3CudaPrepareLocalOutput(data, device);
+        data.dataType = type;
+        data.UpdateUnitSize();
+        data.Resize(dims);
+        data.Allocate(false);
+    }
+
+    static void Qwen35DFlashGraphMlp(
+            Qwen35DFlashDraftGraphState &state, int rank, Data &input,
+            Data &gateupWeight, Data &downWeight, Data &output) {
+        const int device = state.devices[rank];
+        Data &localInput = state.ranks[rank]->tpHidden;
+        FastllmCudaSetDevice(device);
+        FastllmNcclBroadcastFrom(
+            rank == 0 ? input.cudaData : localInput.cudaData,
+            localInput.cudaData, localInput.Count(0), localInput.dataType,
+            state.devices[0], device);
+        Qwen3CudaDirectRunner runner(device);
+        Data gateup, activated;
+        qwen3cuda::Qwen3CudaLinear(runner, localInput,
+            *gateupWeight.multiDeviceDatas.at(device), *GetEmptyData(), gateup);
+        qwen3cuda::Qwen3CudaSwiglu(runner, gateup, activated);
+        qwen3cuda::Qwen3CudaLinear(runner, activated,
+            *downWeight.multiDeviceDatas.at(device), *GetEmptyData(), output);
+        FastllmNcclAllReduce(output.cudaData, output.cudaData,
+                            output.Count(0), output.dataType, device);
+    }
+
+    static void Qwen35DFlashGraphLmHead(
+            Qwen35DFlashDraftGraphState &state, int rank, Data &hidden,
+            Data &weight, Data &bias, const DivisionScheme &scheme, int topK) {
+        const int device = state.devices[rank];
+        auto &local = *state.ranks[rank];
+        const int rows = local.tpHidden.dims[1];
+        FastllmCudaSetDevice(device);
+        FastllmNcclBroadcastFrom(
+            rank == 0 ? hidden.cudaData : local.tpHidden.cudaData,
+            local.tpHidden.cudaData, local.tpHidden.Count(0),
+            local.tpHidden.dataType, state.devices[0], device);
+        Qwen3CudaDirectRunner runner(device);
+        Data logits;
+        qwen3cuda::Qwen3CudaLinear(runner, local.tpHidden,
+            *weight.multiDeviceDatas.at(device),
+            *bias.multiDeviceDatas.at(device), logits);
+        qwen3cuda::Qwen3CudaToDataType(runner, logits, DataType::FLOAT32);
+        AssertInFastLLM(FastllmCudaDFlashTopK(logits, local.packed,
+                            local.scratch, topK, scheme.at(device)[0].first),
+                        "DFlash graph local top-k failed.\n");
+        const int count = 2 * rows * topK;
+        for (int source = 0; source < (int)state.devices.size(); ++source) {
+            auto *destination = (int*)local.gathered.cudaData + source * count;
+            FastllmNcclBroadcastFrom(local.packed.cudaData, destination, count,
+                DataType::INT32, state.devices[source], device);
+        }
+        if (rank == 0) {
+            AssertInFastLLM(FastllmCudaDFlashMergeTopK(local.gathered,
+                state.candidates, state.devices.size(), rows, 1,
+                state.candidates.dims[0], topK),
+                "DFlash graph global top-k failed.\n");
+        }
+    }
+#endif
+
     bool Qwen3_5Model::RunDFlashTensorParallelMlp(
             int device, Data &input, Data &gateupWeight,
             Data &downWeight, Data &output) {
@@ -26558,6 +26687,11 @@ namespace fastllm {
             return false;
         }
 
+        if (qwen35DFlashDraftGraphContext != nullptr) {
+            Qwen35DFlashGraphMlp(*qwen35DFlashDraftGraphContext, 0,
+                                input, gateupWeight, downWeight, output);
+            return true;
+        }
         Executor &tpExecutor = Qwen35DFlashTpExecutor(
             dflashTpPreparedDevices, dflashTpPreparedRatios);
         Data swigluOutput, unusedScratch, gateupOutput;
@@ -27192,6 +27326,247 @@ namespace fastllm {
     }
 #endif
 
+    bool Qwen3_5Model::RunDFlashDraftGraph(
+            int device, const std::vector<int> &devices, int anchorToken,
+            DFlashContext &context, Data &candidateTopK, Data &selectorHidden) {
+#ifndef USE_CUDA
+        return false;
+#else
+        // This path uses the checkpoint's fixed eight-row shape and paired
+        // MLP shards. Other layouts retain the existing eager implementation.
+        if (!Qwen35CudaGraphEnabled() || Qwen35MtpWorkerProfileInterval() != 0 ||
+            devices.size() != 2 || devices[0] != device ||
+            dflashCheckpointBlockSize != 8 || dflashHeadDim != 128 ||
+            !GetCudaEmbedding() || GetLowMemMode() ||
+            !dflashTpPairedMlpPrepared || dflashTpPreparedDevices != devices ||
+            !Qwen35EnvDefaultEnabled("FASTLLM_CUDA_DFLASH_IMPLICIT_ATTENTION")) {
+            return false;
+        }
+        Data &embedding = weight[language_prefix + "embed_tokens.weight"];
+        Data *localEmbedding = &embedding;
+        if (embedding.multiDeviceData) {
+            auto it = embedding.multiDeviceDatas.find(device);
+            if (it == embedding.multiDeviceDatas.end() || !it->second) return false;
+            localEmbedding = it->second;
+        }
+        if (!localEmbedding->cudaData || localEmbedding->dataDevice != DataDevice::CUDA ||
+            localEmbedding->dataDeviceIds != std::vector<int>{device}) return false;
+        Data &lmHead = weight["lm_head.weight"];
+        Data &lmHeadBias = GetThreadTensorParallelBias("lm_head.weight.tp_bias");
+        if (!Qwen35DFlashHasTpShards(lmHead, devices)) return false;
+        for (int gpu : devices) {
+            auto it = threadTpLmHeadScheme.find(gpu);
+            if (it == threadTpLmHeadScheme.end() || it->second.size() != 1 ||
+                lmHeadBias.multiDeviceDatas.count(gpu) == 0 ||
+                lmHead.multiDeviceDatas.at(gpu)->dims[0] !=
+                    it->second[0].second - it->second[0].first) return false;
+        }
+        for (int layer = 0; layer < dflashLayers; ++layer) {
+            const std::string prefix = "dflash.layers." + std::to_string(layer) + ".mlp.";
+            auto gate = weight.weight.find(prefix + "gateup_proj.weight");
+            auto down = weight.weight.find(prefix + "down_proj.weight");
+            if (gate == weight.weight.end() || down == weight.weight.end() ||
+                !Qwen35DFlashHasTpShards(gate->second, devices) ||
+                !Qwen35DFlashHasTpShards(down->second, devices)) return false;
+        }
+        const int block = dflashCheckpointBlockSize;
+        const int slots = dflashRuntimeBlockSize - 1;
+        FastllmCudaSetDevice(device);
+        EnsureDFlashRotary(context.committedTokens + block, device);
+        const int cached = context.draftKeyValues[0].first.dims[1];
+        Data cacheRows(DataType::FLOAT16, {dflashKvHeads, block, dflashHeadDim});
+        const int allocationUnit = Qwen35DFlashCacheAllocationUnit(dflashSlidingWindow, block);
+        std::ostringstream signature;
+        signature << FastllmGetNcclGeneration() << ':' << slots << ':'
+                  << localEmbedding->cudaData << ':' << dflashSinData.cudaData << ':'
+                  << dflashCosData.cudaData << ':' << dflashRotaryCapacity;
+        for (int gpu : devices) signature << ':' << gpu;
+        for (auto &pair : context.draftKeyValues) {
+            for (Data *cache : {&pair.first, &pair.second}) {
+                if (cache->dataType != DataType::FLOAT16 || cache->dims.size() != 3 ||
+                    cache->dims[0] != dflashKvHeads || cache->dims[1] != cached ||
+                    cache->dims[2] != dflashHeadDim ||
+                    cache->dataDeviceIds != std::vector<int>{device}) return false;
+                Qwen35EnsureDraftSequenceCacheCapacity(*cache, cacheRows, allocationUnit);
+                if (cache->strides[0] != (uint64_t)cache->expansionDims[1] * dflashHeadDim)
+                    return false;
+                signature << ':' << cache->cudaData << ':' << cache->expansionDims[1];
+            }
+        }
+        auto &state = GetQwen35DFlashDraftGraphState(this);
+        std::unique_lock<std::mutex> guard(state.mutex);
+        if (state.disabled) return false;
+        auto synchronize = [&]() {
+            for (int gpu : state.devices) {
+                FastllmCudaSetDevice(gpu);
+                ForceDeviceSync();
+            }
+            FastllmCudaSetDevice(device);
+        };
+        const std::string graphSignature = signature.str();
+        if (state.signature != graphSignature) {
+            synchronize();
+            state.DestroyGraph();
+            state.ranks.clear();
+            state.devices = devices;
+            state.signature = graphSignature;
+            state.barrier.Reset(devices.size());
+            for (int gpu : devices) {
+                FastllmCudaSetDevice(gpu);
+                auto rank = std::make_unique<Qwen35DFlashDraftGraphState::Rank>();
+                rank->device = gpu;
+                rank->completion = FastllmCudaEventCreate();
+                AssertInFastLLM(rank->completion != nullptr, "DFlash graph event allocation failed.\n");
+                Qwen35DFlashGraphTensor(rank->tpHidden, gpu, DataType::BFLOAT16, {1, block, embed_dim});
+                Qwen35DFlashGraphTensor(rank->packed, gpu, DataType::INT32, {2 * block * dflashSelectorTopK});
+                Qwen35DFlashGraphTensor(rank->gathered, gpu, DataType::INT32,
+                    {(int)devices.size(), 2 * block * dflashSelectorTopK});
+                Qwen35DFlashGraphTensor(rank->scratch, gpu, DataType::INT8,
+                    {(int)FastllmCudaDFlashTopKScratchBytes(block)});
+                state.ranks.push_back(std::move(rank));
+            }
+            FastllmCudaSetDevice(device);
+            Qwen35DFlashGraphTensor(state.inputIds, device, DataType::FLOAT32, {1, block});
+            Qwen35DFlashGraphTensor(state.positions, device, DataType::FLOAT32, {1, block});
+            Qwen35DFlashGraphTensor(state.cachedTokens, device, DataType::INT32, {1});
+            Qwen35DFlashGraphTensor(state.candidates, device, DataType::FLOAT32, {slots, 2 * dflashSelectorTopK});
+            Qwen35DFlashGraphTensor(state.selector, device, DataType::FLOAT32, {1, slots, dflashSelectorRank});
+        }
+        std::vector<float> ids(block, (float)dflashMaskTokenId), positions(block);
+        ids[0] = (float)anchorToken;
+        for (int i = 0; i < block; ++i) positions[i] = (float)(context.committedTokens + i);
+        FastllmCudaCopyFromHostToDevice(state.inputIds.cudaData, ids.data(), block * sizeof(float));
+        FastllmCudaCopyFromHostToDevice(state.positions.cudaData, positions.data(), block * sizeof(float));
+        int cachedValue = cached;
+        FastllmCudaCopyFromHostToDevice(state.cachedTokens.cudaData, &cachedValue, sizeof(int));
+
+        std::vector<std::exception_ptr> errors(devices.size());
+        auto body = [&](int rank) {
+            FastllmCudaSetDevice(devices[rank]);
+            if (rank == 0) {
+                struct Scope {
+                    Qwen35DFlashDraftGraphState *previous;
+                    explicit Scope(Qwen35DFlashDraftGraphState *state) :
+                        previous(qwen35DFlashDraftGraphContext) { qwen35DFlashDraftGraphContext = state; }
+                    ~Scope() { qwen35DFlashDraftGraphContext = previous; }
+                } scope(&state);
+                Data candidates, selector;
+                RunDFlashDraftForward(device, devices, anchorToken, context, candidates, selector);
+                Qwen35PrepareGraphCudaTensor(state.selector, selector, device, true);
+            } else {
+                for (int layer = 0; layer < dflashLayers; ++layer) {
+                    const std::string prefix = "dflash.layers." + std::to_string(layer) + ".mlp.";
+                    Data unused, output;
+                    Qwen35DFlashGraphMlp(state, rank, unused,
+                        weight[prefix + "gateup_proj.weight"], weight[prefix + "down_proj.weight"], output);
+                }
+                Data unused;
+                Qwen35DFlashGraphLmHead(state, rank, unused, lmHead, lmHeadBias,
+                                        threadTpLmHeadScheme, dflashSelectorTopK);
+            }
+        };
+        auto launch = [&]() {
+            std::vector<int> launched(devices.size(), 0);
+            errors.assign(devices.size(), nullptr);
+            threadTpWorkerGroup.RunWithCaller(devices, [&](int rank) {
+                FastllmCudaSetDevice(devices[rank]);
+                state.barrier.Wait();
+                launched[rank] = FastllmCudaGraphLaunch(state.ranks[rank]->exec) ? 1 : 0;
+                if (launched[rank]) FastllmCudaEventRecordCurrentThread(state.ranks[rank]->completion);
+            }, errors);
+            const bool ok = std::all_of(launched.begin(), launched.end(), [](int v) { return v != 0; }) &&
+                std::all_of(errors.begin(), errors.end(), [](const auto &e) { return e == nullptr; });
+            if (!ok) { synchronize(); return false; }
+            for (int rank = 0; rank < (int)devices.size(); ++rank) {
+                FastllmCudaSetDevice(devices[rank]);
+                FastllmCudaCurrentThreadStreamWaitEvent(state.ranks[rank]->completion);
+            }
+            FastllmCudaSetDevice(device);
+            return true;
+        };
+        bool ok = true;
+        if (state.captured) {
+            ok = launch();
+        } else if (!state.warmed) {
+            threadTpWorkerGroup.RunWithCaller(devices, [&](int rank) {
+                body(rank);
+                FastllmCudaSetDevice(devices[rank]);
+                FastllmCudaSyncCurrentThreadStream();
+            }, errors);
+            for (auto &error : errors) if (error) std::rethrow_exception(error);
+            state.warmed = true;
+        } else {
+            synchronize();
+            FastllmCudaClearThreadError();
+            FastllmCudaClearGraphError();
+            for (int gpu : devices) {
+                FastllmCudaSetDevice(gpu);
+                ok &= FastllmCudaGraphPrepareCaptureDevice();
+            }
+            ok = ok && FastllmCudaGraphMemoryPoolBegin();
+            std::vector<int> began(devices.size(), 0), bodyOk(devices.size(), 0),
+                             ended(devices.size(), 0);
+            if (ok) {
+                threadTpWorkerGroup.RunWithCaller(devices, [&](int rank) {
+                    FastllmCudaSetDevice(devices[rank]);
+                    began[rank] = FastllmCudaGraphBeginCapture() ? 1 : 0;
+                    state.barrier.Wait();
+                    if (std::all_of(began.begin(), began.end(), [](int v) { return v != 0; })) {
+                        try { body(rank); bodyOk[rank] = 1; } catch (...) {
+                            // RunWithCaller owns its exception slots, so keep
+                            // body success separately while ending capture on
+                            // every rank, including a rank whose body threw.
+                        }
+                    }
+                    if (began[rank]) ended[rank] = FastllmCudaGraphEndCapture(&state.ranks[rank]->graph) ? 1 : 0;
+                }, errors);
+                ok = std::all_of(began.begin(), began.end(), [](int v) { return v != 0; }) &&
+                    std::all_of(bodyOk.begin(), bodyOk.end(), [](int v) { return v != 0; }) &&
+                    std::all_of(ended.begin(), ended.end(), [](int v) { return v != 0; }) &&
+                    std::all_of(errors.begin(), errors.end(), [](const auto &e) { return e == nullptr; }) &&
+                    !FastllmCudaGetThreadError() && !FastllmCudaGetGraphError();
+                if (ok) ok = FastllmCudaGraphMemoryPoolEnd(state.reservedPointers);
+                else FastllmCudaGraphMemoryPoolAbort();
+            }
+            if (ok) {
+                for (auto &rank : state.ranks) {
+                    FastllmCudaSetDevice(rank->device);
+                    ok &= rank->graph != nullptr && FastllmCudaGraphInstantiate(rank->graph, &rank->exec);
+                }
+            }
+            if (ok) {
+                state.captured = true;
+                ok = launch();
+                if (ok) {
+                    std::printf("[Fastllm] Qwen3.5 DFlash2 draft CUDA graph captured: block=%d slots=%d tp=%zu.\n",
+                                block, slots, devices.size());
+                    std::fflush(stdout);
+                }
+            }
+        }
+        if (!ok) {
+            std::fprintf(stderr, "[Fastllm] DFlash2 draft CUDA graph disabled: %s\n", FastllmCudaGraphLastError());
+            state.DestroyGraph();
+            state.disabled = true;
+            FastllmCudaClearThreadError();
+            FastllmCudaClearGraphError();
+            FastllmCudaSetDevice(device);
+            return false;
+        }
+        FastllmCudaSetDevice(device);
+        // Keep captured output storage on CUDA. Only the small selector inputs
+        // cross to the CPU; token selection retains its existing exact rules.
+        candidateTopK.dataType = selectorHidden.dataType = DataType::FLOAT32;
+        candidateTopK.Resize(state.candidates.dims);
+        selectorHidden.Resize(state.selector.dims);
+        candidateTopK.Allocate();
+        selectorHidden.Allocate();
+        FastllmCudaCopyFromDeviceToHost(candidateTopK.cpuData, state.candidates.cudaData, state.candidates.GetBytes());
+        FastllmCudaCopyFromDeviceToHost(selectorHidden.cpuData, state.selector.cudaData, state.selector.GetBytes());
+        return true;
+#endif
+    }
+
     std::vector<int> Qwen3_5Model::RunDFlashDraft(
             int device, const std::vector<int> &devices,
             int anchorToken, const GenerationConfig &generationConfig,
@@ -27216,9 +27591,34 @@ namespace fastllm {
             context.proposalCandidateProbs.clear();
             return {};
         }
+        const int slots = dflashRuntimeBlockSize - 1;
+        Data candidateTopK, selectorHidden;
+        if (!RunDFlashDraftGraph(device, devices, anchorToken, context,
+                                 candidateTopK, selectorHidden)) {
+            RunDFlashDraftForward(device, devices, anchorToken, context,
+                                   candidateTopK, selectorHidden);
+        }
+        AssertInFastLLM(
+            candidateTopK.Count(0) ==
+                    (uint64_t)slots * dflashSelectorTopK * 2 &&
+            selectorHidden.Count(0) ==
+                    (uint64_t)slots * dflashSelectorRank,
+            "DFlash selector tensor shape mismatch.\n");
+        return SelectDFlashDraftTokens(
+            (const float*)candidateTopK.cpuData,
+            (const float*)selectorHidden.cpuData,
+            anchorToken, generationConfig, context);
+#endif
+    }
+
+    void Qwen3_5Model::RunDFlashDraftForward(
+            int device, const std::vector<int> &devices, int anchorToken,
+            DFlashContext &context, Data &candidateTopK, Data &selectorHidden) {
+#ifdef USE_CUDA
         Qwen35ScopedGenericExecutor executor(
             "cuda:" + std::to_string(device));
         FastllmCudaSetDevice(device);
+        auto *draftGraph = qwen35DFlashDraftGraphContext;
         const int runtimeBlockSize = dflashRuntimeBlockSize;
         // Execute the checkpoint's trained block shape and mask any tail that
         // the runtime draft count does not use.  Besides keeping one stable
@@ -27229,12 +27629,15 @@ namespace fastllm {
         const int cacheAllocationUnit =
             Qwen35DFlashCacheAllocationUnit(
                 dflashSlidingWindow, blockSize);
-        EnsureDFlashRotary(context.committedTokens + blockSize, device);
-
-        std::vector<float> tokenValues(blockSize,
-                                       (float)dflashMaskTokenId);
-        tokenValues[0] = (float)anchorToken;
-        Data inputIds(DataType::FLOAT32, {1, blockSize}, tokenValues);
+        Data inputIds;
+        if (draftGraph != nullptr) {
+            Qwen35BorrowCudaTensor(inputIds, draftGraph->inputIds);
+        } else {
+            EnsureDFlashRotary(context.committedTokens + blockSize, device);
+            std::vector<float> tokenValues(blockSize, (float)dflashMaskTokenId);
+            tokenValues[0] = (float)anchorToken;
+            inputIds.CopyFrom(Data(DataType::FLOAT32, {1, blockSize}, tokenValues));
+        }
         Data hiddenStates;
         Data &embedWeight =
             weight[language_prefix + "embed_tokens.weight"];
@@ -27275,13 +27678,17 @@ namespace fastllm {
             ToDataType(hiddenStates, DataType::BFLOAT16);
         }
 
-        std::vector<float> positionValues(blockSize);
-        for (int token = 0; token < blockSize; token++) {
-            positionValues[token] =
-                (float)(context.committedTokens + token);
+        Data positions;
+        if (draftGraph != nullptr) {
+            Qwen35BorrowCudaTensor(positions, draftGraph->positions);
+        } else {
+            std::vector<float> positionValues(blockSize);
+            for (int token = 0; token < blockSize; token++) {
+                positionValues[token] = (float)(context.committedTokens + token);
+            }
+            positions.CopyFrom(Data(DataType::FLOAT32, {1, blockSize}, positionValues));
+            positions.ToDevice(DataDevice::CUDA, {device}, true);
         }
-        Data positions(DataType::FLOAT32, {1, blockSize}, positionValues);
-        positions.ToDevice(DataDevice::CUDA, {device}, true);
 
         int cachedTokens = context.draftKeyValues[0].first.dims.size() == 3 ?
             context.draftKeyValues[0].first.dims[1] : 0;
@@ -27461,42 +27868,59 @@ namespace fastllm {
                                 keyCache.dims[1] == cachedTokens &&
                                 valueCache.dims[1] == cachedTokens,
                             "DFlash draft KV cache is out of sync.\n");
-            int oldKeyTokens = keyCache.dims[1];
-            int oldValueTokens = valueCache.dims[1];
-            Qwen35AppendDraftSequenceCache(
-                keyCache, key, cacheAllocationUnit);
-            Qwen35AppendDraftSequenceCache(
-                valueCache, value, cacheAllocationUnit);
             Data attentionHeads;
-            bool implicitAttention = false;
-            if (useImplicitAttention) {
-                ::fastllm::Qwen3CudaPrepareLocalOutput(
-                    attentionHeads, device);
-                attentionHeads.dataType = DataType::FLOAT16;
-                attentionHeads.UpdateUnitSize();
-                attentionHeads.Resize(
+            if (draftGraph != nullptr) {
+                Data keyView, valueView;
+                Qwen35BorrowCudaTensor(keyView, keyCache);
+                Qwen35BorrowCudaTensor(valueView, valueCache);
+                keyView.Resize(keyCache.expansionDims);
+                valueView.Resize(valueCache.expansionDims);
+                Qwen35DFlashGraphTensor(attentionHeads, device, DataType::FLOAT16,
                     {dflashHeads, blockSize, dflashHeadDim});
-                attentionHeads.Allocate(false);
-                implicitAttention = FastllmCudaDFlashAttention(
-                    query, keyCache, valueCache, attentionHeads,
-                    dflashHeads / dflashKvHeads,
-                    1.0f / std::sqrt((float)dflashHeadDim),
-                    runtimeBlockSize, dflashSlidingWindow);
-                if (!implicitAttention) {
-                    attentionHeads.FreeSpace();
-                    attentionHeads.dims.clear();
-                    attentionHeads.strides.clear();
-                    attentionHeads.expansionDims.clear();
+                AssertInFastLLM(
+                    FastllmCudaDFlashAppendKVForGraph(key, keyView, draftGraph->cachedTokens) &&
+                    FastllmCudaDFlashAppendKVForGraph(value, valueView, draftGraph->cachedTokens) &&
+                    FastllmCudaDFlashAttention(query, keyView, valueView, attentionHeads,
+                        dflashHeads / dflashKvHeads, 1.0f / std::sqrt((float)dflashHeadDim),
+                        runtimeBlockSize, dflashSlidingWindow, &draftGraph->cachedTokens),
+                    "DFlash graph attention failed.\n");
+            } else {
+                int oldKeyTokens = keyCache.dims[1];
+                int oldValueTokens = valueCache.dims[1];
+                Qwen35AppendDraftSequenceCache(
+                    keyCache, key, cacheAllocationUnit);
+                Qwen35AppendDraftSequenceCache(
+                    valueCache, value, cacheAllocationUnit);
+                bool implicitAttention = false;
+                if (useImplicitAttention) {
+                    ::fastllm::Qwen3CudaPrepareLocalOutput(
+                        attentionHeads, device);
+                    attentionHeads.dataType = DataType::FLOAT16;
+                    attentionHeads.UpdateUnitSize();
+                    attentionHeads.Resize(
+                        {dflashHeads, blockSize, dflashHeadDim});
+                    attentionHeads.Allocate(false);
+                    implicitAttention = FastllmCudaDFlashAttention(
+                        query, keyCache, valueCache, attentionHeads,
+                        dflashHeads / dflashKvHeads,
+                        1.0f / std::sqrt((float)dflashHeadDim),
+                        runtimeBlockSize, dflashSlidingWindow);
+                    if (!implicitAttention) {
+                        attentionHeads.FreeSpace();
+                        attentionHeads.dims.clear();
+                        attentionHeads.strides.clear();
+                        attentionHeads.expansionDims.clear();
+                    }
                 }
+                if (!implicitAttention) {
+                    ensureAttentionMask();
+                    Attention(query, keyCache, valueCache, *attentionMask,
+                              attentionHeads, dflashHeads / dflashKvHeads,
+                              1.0f / std::sqrt((float)dflashHeadDim), 2);
+                }
+                Qwen35ResizeDraftSequenceCache(keyCache, oldKeyTokens);
+                Qwen35ResizeDraftSequenceCache(valueCache, oldValueTokens);
             }
-            if (!implicitAttention) {
-                ensureAttentionMask();
-                Attention(query, keyCache, valueCache, *attentionMask,
-                          attentionHeads, dflashHeads / dflashKvHeads,
-                          1.0f / std::sqrt((float)dflashHeadDim), 2);
-            }
-            Qwen35ResizeDraftSequenceCache(keyCache, oldKeyTokens);
-            Qwen35ResizeDraftSequenceCache(valueCache, oldValueTokens);
             PermuteSelf(attentionHeads, {1, 0, 2});
             attentionHeads.Reshape(
                 {1, blockSize, dflashHeads * dflashHeadDim});
@@ -27616,12 +28040,12 @@ namespace fastllm {
             devices.empty() ? std::vector<int>{device} : devices;
         Data fullLogits;
         Data replicatedHidden;
-        if (draftDevices.size() == 1) {
+        if (draftGraph == nullptr && draftDevices.size() == 1) {
             Linear(lmHeadHidden, weight["lm_head.weight"],
                    *GetEmptyData(), fullLogits);
             ToDataType(fullLogits, DataType::FLOAT32);
             fullLogits.Reshape({lmHeadRows, fullLogits.dims.back()});
-        } else {
+        } else if (draftGraph == nullptr) {
             AssertInFastLLM(
                 threadTpWeightsPrepared.load(std::memory_order_acquire) &&
                     threadTpPreparedDevices == draftDevices &&
@@ -27633,8 +28057,13 @@ namespace fastllm {
                 replicatedHidden, draftDevices, true);
         }
 
-        Data candidateTopK;
-        if (draftDevices.size() == 1) {
+        if (draftGraph != nullptr) {
+            Qwen35DFlashGraphLmHead(*draftGraph, 0, lmHeadHidden,
+                weight["lm_head.weight"],
+                GetThreadTensorParallelBias("lm_head.weight.tp_bias"),
+                threadTpLmHeadScheme, dflashSelectorTopK);
+            Qwen35BorrowCudaTensor(candidateTopK, draftGraph->candidates);
+        } else if (draftDevices.size() == 1) {
             bool usedCudaFastTopK = Qwen35TryCudaDFlashTopK(
                 fullLogits, candidateTopK, device, lmHeadRows,
                 1, slots, dflashSelectorTopK);
@@ -27898,22 +28327,11 @@ namespace fastllm {
                 {slots, dflashSelectorTopK * 2}, mergedTopK));
             }
         }
-        Data selectorHidden;
         Linear(slotHidden,
                weight["dflash.candidate_selector.hidden_projection.weight"],
                *GetEmptyData(), selectorHidden);
         ToDataType(selectorHidden, DataType::FLOAT32);
-        selectorHidden.ToDevice(DataDevice::CPU);
-        AssertInFastLLM(
-            candidateTopK.Count(0) ==
-                    (uint64_t)slots * dflashSelectorTopK * 2 &&
-            selectorHidden.Count(0) ==
-                    (uint64_t)slots * dflashSelectorRank,
-            "DFlash selector tensor shape mismatch.\n");
-        return SelectDFlashDraftTokens(
-            (const float*)candidateTopK.cpuData,
-            (const float*)selectorHidden.cpuData,
-            anchorToken, generationConfig, context);
+        if (draftGraph == nullptr) selectorHidden.ToDevice(DataDevice::CPU);
 #endif
     }
 

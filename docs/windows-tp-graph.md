@@ -15,6 +15,7 @@ ftllm run D:\models\Qwen3.8-27B-FP8 --tp 2 --dtype auto
 只沿用已有的 `FASTLLM_CUDA_GRAPH` 开关，通信实现自动选择。设为 `0` 可关闭
 Graph。Python/CLI 启动符合硬件条件的 Qwen3.5/3.6/3.8 CUDA 模型时，普通解码、
 MTP 和 DFlash 验证默认开启该开关；显式设置和 `--low` 等现有边界继续有效。
+满足下述双卡固定形状条件时，DFlash draft 也会捕获 Graph；其他配置保留原有路径。
 `mapped-host TP2 CUDA Graph collectives: self-test passed` 表示该 GPU
 组已通过通信自检，不等同于模型已捕获 Graph；模型的图模式仍受形状等条件限制。
 
@@ -76,23 +77,41 @@ ftllm run D:\models\Qwen3.8-27B-FP8 --tp 2 --dtype auto `
 ```
 
 日志中的 `DFlash2 verify CUDA graph captured` 表示目标验证图捕获成功。
-draft 生成仍按现有路径执行。
+draft 图有独立的捕获日志。
 
 Graph 持有固定地址的隐藏状态输出；发布的借用视图在下一次 prefill 前可解除引用，
 draft 做类型转换时使用独立数据。batch>1 的 DFlash、显式 exact verify、worker profiling
 以及其他不满足捕获条件的配置仍走 eager 路径。
+
+## DFlash2 draft Graph
+
+双卡、GPU embedding、checkpoint block=8、head dimension=128，且 draft MLP 和
+目标 lm_head 已完成 TP 分片时，draft 自动共用 `FASTLLM_CUDA_GRAPH` 开关。
+运行时 B2/B4/B8 使用 checkpoint 的八行计算形状，只选择需要的候选位置；
+worker profiling、low-memory 模式和不支持的配置沿用 eager 路径。
+`DFlash2 draft CUDA graph captured` 表示两卡 draft 图已捕获。
+
+主卡执行 draft backbone，两卡按同一顺序执行分片 MLP 和 lm_head；图内直接广播
+隐藏状态并归约结果，避免每层重新分派 CPU 任务及同步中转。目标隐藏状态入缓存
+和最终 CPU token 选择仍位于图外，选择规则保持不变。
+
+图内 KV 使用固定容量视图，实际缓存长度由 GPU 标量提供。临时 draft 行写入
+已提交前缀之后，未使用尾部清零，避免被 mask 的 NaN 污染 attention。缓存扩容、
+压缩后的地址变化、位置表扩容、通信组或运行时块大小变化都会使旧图失效，
+重新预热并捕获。图及临时内存由模型持有，模型释放时一并清理。
 
 ## 回归测试
 
 配置 `UNIT_TEST=ON`、`USE_CUDA=ON`、`USE_NCCL=OFF`，在 Windows 构建并运行：
 
 ```powershell
-cmake --build build --config Release --target hostCollectiveRegression hostMappedCollectiveRegression
-ctest --test-dir build -C Release -R "^cuda_host_.*collective$" --output-on-failure
+cmake --build build --config Release --target hostCollectiveRegression hostMappedCollectiveRegression dflashDraftGraphRegression
+ctest --test-dir build -C Release -R "^cuda_(host_.*collective|dflash_draft_graph)$" --output-on-failure
 ```
 
-无两卡环境返回跳过码 77。两个测试共享 CTest GPU 资源锁，避免并行运行时相互
-争用显卡。`hostCollectiveRegression` 也在 Linux 无 NCCL 构建注册。
+通信测试需要两卡，draft attention 测试只需要单卡；设备不足时返回跳过码 77。
+三个测试共享 CTest GPU 资源锁，避免并行运行时相互争用显卡。
+`hostCollectiveRegression` 也在 Linux 无 NCCL 构建注册。
 
 - 同步通信回归：空/过期旧设备列表、两种设备顺序、五种数据类型、四种消息
   大小、两种根节点和原地/非原地通信；额外检查五种类型的原始位模式、浮点
@@ -101,6 +120,9 @@ ctest --test-dir build -C Release -R "^cuda_host_.*collective$" --output-on-fail
 - Graph 回归：五种类型、六种消息大小（含 64/80/128 KiB）、两种根节点、原地/
   非原地通信、每图 32 次不同输入回放、重新捕获、交换设备顺序并切回原组，
   共 92,160 次通信/卡；同时检查超限捕获被拒绝。FP16/BF16 包含舍入输入。
+- Draft attention Graph 回归：B2/B4/B8、三种缓存容量、216 次改变输入及缓存长度的
+  图回放；检查前缀保留、临时行写入、NaN 尾部清零，并与紧凑 KV 的 eager attention
+  对照。单 GPU 即可运行该测试。
 
 性能数据依赖模型、输入长度和拓扑，应分别报告 prefill 与稳定解码；只比较解码
 吞吐不能代表完整请求延迟。

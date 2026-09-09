@@ -1451,7 +1451,11 @@ printf("n = %d, m = %d, k = %d, spend %f s, gops = %f\n", n, m, k, spend, gops);
 
 __global__ void FastllmDFlashImplicitAttentionMaskKernel(
         half *scores, int heads, int queries, int keys, int cachedTokens,
-        int runtimeBlockSize, int slidingWindow) {
+        int runtimeBlockSize, int slidingWindow,
+        const int *cachedTokensGpu) {
+    if (cachedTokensGpu != nullptr) {
+        cachedTokens = *cachedTokensGpu;
+    }
     int head = blockIdx.x;
     if (head >= heads) {
         return;
@@ -1474,10 +1478,70 @@ __global__ void FastllmDFlashImplicitAttentionMaskKernel(
     }
 }
 
+__global__ void FastllmDFlashAppendKVForGraphKernel(
+        const half *current, half *cache, const int *cachedTokens,
+        int heads, int rows, int capacity, int width) {
+    const int cached = *cachedTokens;
+    if (cached < 0 || cached > capacity - rows) return;
+    const int tail = capacity - cached;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x;
+         i < heads * tail * width; i += blockDim.x * gridDim.x) {
+        const int head = i / (tail * width);
+        const int offset = i % (tail * width);
+        cache[(size_t)head * capacity * width + cached * width + offset] =
+            offset < rows * width ? current[(size_t)head * rows * width + offset] :
+                                   __float2half_rn(0.0f);
+    }
+}
+
+bool FastllmCudaDFlashAppendKVForGraph(
+        const fastllm::Data &current, fastllm::Data &cache,
+        const fastllm::Data &cachedTokens) {
+    if (current.dataType != fastllm::DataType::FLOAT16 ||
+        cache.dataType != fastllm::DataType::FLOAT16 ||
+        cachedTokens.dataType != fastllm::DataType::INT32 ||
+        current.dataDevice != fastllm::DataDevice::CUDA ||
+        cache.dataDevice != fastllm::DataDevice::CUDA ||
+        cachedTokens.dataDevice != fastllm::DataDevice::CUDA ||
+        !current.cudaData || !cache.cudaData || !cachedTokens.cudaData ||
+        current.dims.size() != 3 || cache.dims.size() != 3 ||
+        current.strides.size() != 3 || cache.strides.size() != 3 ||
+        current.dims[0] <= 0 || current.dims[1] <= 0 || current.dims[2] <= 0 ||
+        current.strides[2] != 1 || cache.strides[2] != 1 ||
+        current.strides[1] != (uint64_t)current.dims[2] ||
+        cache.strides[1] != (uint64_t)cache.dims[2] ||
+        current.strides[0] != (uint64_t)current.dims[1] * current.dims[2] ||
+        cache.strides[0] != (uint64_t)cache.dims[1] * cache.dims[2] ||
+        current.dims[0] != cache.dims[0] ||
+        current.dims[2] != cache.dims[2] || current.dims[1] > cache.dims[1] ||
+        current.Count(0) != (uint64_t)current.dims[0] * current.dims[1] * current.dims[2] ||
+        cache.Count(0) != (uint64_t)cache.dims[0] * cache.dims[1] * cache.dims[2] ||
+        cachedTokens.Count(0) != 1 ||
+        current.dataDeviceIds.empty() ||
+        current.dataDeviceIds[0] != FastllmCudaGetDevice() ||
+        current.dataDeviceIds != cache.dataDeviceIds ||
+        current.dataDeviceIds != cachedTokens.dataDeviceIds) {
+        return false;
+    }
+    FastllmDFlashAppendKVForGraphKernel<<<128, 256, 0, cudaStreamPerThread>>>(
+        (const half *)current.cudaData, (half *)cache.cudaData,
+        (const int *)cachedTokens.cudaData, cache.dims[0], current.dims[1],
+        cache.dims[1], cache.dims[2]);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+
 bool FastllmCudaDFlashAttention(
         const fastllm::Data &q, const fastllm::Data &k,
         const fastllm::Data &v, fastllm::Data &output,
-        int group, float scale, int runtimeBlockSize, int slidingWindow) {
+        int group, float scale, int runtimeBlockSize, int slidingWindow,
+        const fastllm::Data *cachedTokensGpu) {
+    if (cachedTokensGpu != nullptr &&
+        (cachedTokensGpu->dataType != fastllm::DataType::INT32 ||
+         cachedTokensGpu->dataDevice != fastllm::DataDevice::CUDA ||
+         cachedTokensGpu->cudaData == nullptr || cachedTokensGpu->Count(0) != 1 ||
+         cachedTokensGpu->dataDeviceIds != q.dataDeviceIds)) {
+        return false;
+    }
     if (q.dataType != fastllm::DataType::FLOAT16 ||
         k.dataType != fastllm::DataType::FLOAT16 ||
         v.dataType != fastllm::DataType::FLOAT16 ||
@@ -1552,7 +1616,9 @@ bool FastllmCudaDFlashAttention(
         FastllmDFlashImplicitAttentionMaskKernel<<<
             heads, 256, 0, cudaStreamPerThread>>>(
                 scores, heads, queries, keys, cachedTokens,
-                runtimeBlockSize, slidingWindow);
+                runtimeBlockSize, slidingWindow,
+                cachedTokensGpu == nullptr ? nullptr :
+                    (const int *)cachedTokensGpu->cudaData);
         if (keys < 8) {
             FastllmSoftmaxKernelInner1<1><<<
                 heads * queries, 1, 0, cudaStreamPerThread>>>(

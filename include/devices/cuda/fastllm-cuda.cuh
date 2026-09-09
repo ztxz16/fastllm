@@ -1516,7 +1516,15 @@ bool FastllmCudaDFlashAttention(
                           const fastllm::Data &v,
                           fastllm::Data &output,
                           int group, float scale,
-                          int runtimeBlockSize, int slidingWindow);
+                          int runtimeBlockSize, int slidingWindow,
+                          const fastllm::Data *cachedTokens = nullptr);
+// Append draft rows to a fixed-capacity cache view without changing its host
+// shape. The GPU length is updated before replay; unused rows are zeroed so
+// masked attention cannot multiply uninitialized values by zero.
+bool FastllmCudaDFlashAppendKVForGraph(
+                          const fastllm::Data &current,
+                          fastllm::Data &cache,
+                          const fastllm::Data &cachedTokens);
 bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &output, int group, float scale, bool inited = false);
 bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches, fastllm::Data &vCaches, fastllm::Data &qSizes, fastllm::Data &pageSizes, fastllm::Data &pageIndexs, fastllm::Data &lastPageLens, fastllm::Data &output, int group, float scale, int attentionType, bool inited = false, bool sync = true, bool enableCudaGraph = false, int flashInferCudaGraph = -1, int windowLeft = -1);
 bool FastllmCudaHalfMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k, bool addTo = false);

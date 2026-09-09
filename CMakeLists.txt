@@ -821,6 +821,14 @@ if (UNIT_TEST)
         target_link_libraries(customAllReduceRegression fastllm)
         target_include_directories(customAllReduceRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 
+        add_executable(dflashDraftGraphRegression test/ops/dflashDraftGraphRegression.cpp)
+        target_link_libraries(dflashDraftGraphRegression PRIVATE fastllm)
+        target_include_directories(dflashDraftGraphRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME cuda_dflash_draft_graph COMMAND dflashDraftGraphRegression)
+        set_tests_properties(cuda_dflash_draft_graph PROPERTIES
+            LABELS "cuda;graph" SKIP_RETURN_CODE 77 TIMEOUT 120
+            RESOURCE_LOCK cuda_multigpu)
+
         if (NOT USE_NCCL)
             add_executable(hostCollectiveRegression test/ops/hostCollectiveRegression.cpp)
             target_link_libraries(hostCollectiveRegression PRIVATE fastllm Threads::Threads)
