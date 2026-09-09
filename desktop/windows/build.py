@@ -21,6 +21,7 @@ def main():
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--skip-tests", action="store_true")
     parser.add_argument("--smoke-model", type=Path)
+    parser.add_argument("--smoke-tp", type=int, default=1)
     args = parser.parse_args()
     if sys.platform != "win32":
         parser.error("Windows is required")
@@ -91,9 +92,10 @@ def main():
             result.check_returncode()
         node_test("--test", REPO / "desktop/tests/runtime.test.js")
         node_test(REPO / "desktop/tests/smoke_windows.js", bundle, args.output / "electron-test",
-                  *([args.smoke_model] if args.smoke_model else []))
+                  *([args.smoke_model, args.smoke_tp] if args.smoke_model else []))
         info["desktop"]["smoke_tests"] = "real Electron renderer, embedded Studio, isolated PATH, window close + process cleanup, relocated Unicode path"
         info["desktop"]["model_tested"] = args.smoke_model.name if args.smoke_model else None
+        info["desktop"]["model_tensor_parallel"] = args.smoke_tp if args.smoke_model else None
     else:
         info["desktop"]["smoke_tests"] = "skipped"
     helpers["write_json"](support / "BUILD-INFO.json", info)

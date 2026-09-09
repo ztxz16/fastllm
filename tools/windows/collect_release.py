@@ -48,6 +48,8 @@ def collect(wheel, output):
             "Electron startup/shutdown checks did not pass")
     require((Path(desktop["model"]).name if desktop.get("model") else None) == info["desktop"]["model_tested"],
             "Model test result does not match the packaged build")
+    require(desktop["modelTensorParallel"] == info["desktop"]["model_tensor_parallel"],
+            "Model tensor parallel test result does not match the packaged build")
     destination = output / wheel.name
     if destination.exists():
         require(sha256(destination) == wheel_sha, f"Refusing to overwrite different wheel: {destination}")

@@ -33,6 +33,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\make_release.ps1 `
 没有本机 GPU 时可以构建和核验 CUDA 包。`-RequireCuda` 要求实际加载 CUDA 后端并
 枚举到 GPU；`-SmokeModel` 额外进行 GPU 模型推理。报告中的 `gpu_inference_tested`
 只有在模型实测成功时才为 `true`。`-CpuOnly` 不接受这两个 GPU 测试参数。
+需要双卡的模型可同时指定 `-SmokeTp 2`，使用 GPU 0、1 完成桌面聊天和退出验证。
 
 ## 复用 wheel、缓存和编译结果
 

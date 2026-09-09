@@ -23,7 +23,10 @@ async function until(operation, timeout = 60_000) {
     try {
       const result = await operation();
       if (result) return result;
-    } catch (error) { lastError = error; }
+    } catch (error) {
+      if (error.fatal) throw error;
+      lastError = error;
+    }
     await delay(200);
   }
   throw lastError || new Error(`Timed out after ${timeout} ms`);
@@ -73,6 +76,8 @@ async function main() {
   const bundle = path.resolve(process.argv[2]);
   const output = path.resolve(process.argv[3]);
   const model = process.argv[4] && path.resolve(process.argv[4]);
+  const tensorParallel = Number(process.argv[5] || 1);
+  assert.ok(Number.isInteger(tensorParallel) && tensorParallel >= 1 && tensorParallel <= 64);
   fs.mkdirSync(output, { recursive: true });
   const temporary = fs.mkdtempSync(path.join(output, "run-"));
   const debugPort = await freePort();
@@ -122,13 +127,16 @@ async function main() {
     if (model) {
       modelPort = await freePort();
       await api("/api/runtime/start", {
-        command: "server", model, model_name: "electron-test", device: "cuda", dtype: "auto",
+        command: "server", model, model_name: "electron-test", dtype: "auto",
+        device: tensorParallel > 1 ? "tp" : "cuda",
+        tp: Array.from({ length: tensorParallel }, (_, index) => index).join(","),
+        max_batch: "1", enable_thinking: "false",
         host: "127.0.0.1", port: String(modelPort), threads: "4", max_context_length: "2048",
       });
       await until(async () => {
         const state = await api("/api/runtime");
         if (["failed", "error", "exited"].includes(state.phase)) {
-          throw new Error(JSON.stringify((await api("/api/logs")).entries.slice(-10)));
+          throw Object.assign(new Error(JSON.stringify((await api("/api/logs")).entries.slice(-10))), { fatal: true });
         }
         return state.ready;
       }, 240_000);
@@ -160,7 +168,8 @@ async function main() {
     assert.doesNotMatch(desktopLog, /token=(?!\[redacted\])/);
     fs.writeFileSync(path.join(temporary, "RESULT.json"), JSON.stringify({
       passed: true, electron: identity.ua, isolatedPath: environment.PATH,
-      model: model || null, nativeWindowClose: true, managedPortsClosed: true,
+      model: model || null, modelTensorParallel: model ? tensorParallel : null,
+      nativeWindowClose: true, managedPortsClosed: true,
     }, null, 2));
     console.log(`[OK] Native window close exits Electron and managed processes; report: ${temporary}`);
   } finally {

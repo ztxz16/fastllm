@@ -10,6 +10,7 @@ param(
     [string[]]$CMakeArgs = @(),
     [string]$Constraints = "portable/constraints.txt",
     [string]$SmokeModel = "",
+    [ValidateRange(1, 64)][int]$SmokeTp = 1,
     [int]$Jobs = 12,
     [switch]$Offline,
     [switch]$RequireCuda,
@@ -53,5 +54,5 @@ $builderArgs = @("-I", "-B", "-X", "utf8", (Join-Path $PSScriptRoot "windows/bui
     "--runtime", (Join-Path $Stage "ftllm"), "--electron", $Electron, "--output", $Output,
     "--entrypoints", (Join-Path $Cache "launcher-build/Release"))
 if ($SkipTests) { $builderArgs += "--skip-tests" }
-if ($SmokeModel) { $builderArgs += @("--smoke-model", (Full-Path $SmokeModel)) }
+if ($SmokeModel) { $builderArgs += @("--smoke-model", (Full-Path $SmokeModel), "--smoke-tp", "$SmokeTp") }
 Run $Python $builderArgs

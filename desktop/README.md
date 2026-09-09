@@ -100,6 +100,7 @@ Python 和 Electron 由脚本下载并验证 SHA256，无需预装 Node/npm。�
 默认验证实际 Electron BrowserWindow、隔离后的 PATH、认证 API、工作室前端模块、
 中文空格路径迁移，以及发送原生窗口关闭消息后的进程退出。`-SmokeModel 本地模型路径`
 会进一步在 GPU 上加载模型、打开内嵌工作室、执行聊天请求，并验证关闭窗口时模型也退出。
+需要双卡的模型同时使用 `-SmokeTp 2`；默认验证单卡。
 测试期间窗口隐藏，截图和结果保留在输出目录的 `electron-test/`，不混入发布 ZIP。
 完整成品包括 Electron 的所有 PE 文件都会执行 DLL 依赖审计，运行库随包携带。
 最终归档验证同时写入输出目录的 `archive-verification.json`。

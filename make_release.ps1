@@ -12,6 +12,7 @@ param(
     [string[]]$CMakeArgs = @(),
     [string]$CuobjdumpPath = "",
     [string]$SmokeModel = "",
+    [ValidateRange(1, 64)][int]$SmokeTp = 1,
     [int]$Jobs = 12,
     [switch]$Offline,
     [switch]$RequireCuda
@@ -31,6 +32,10 @@ if ($CpuOnly -and ($RequireCuda -or $SmokeModel)) {
 }
 if ($SmokeModel -and -not (Test-Path -LiteralPath (Full-Path $SmokeModel))) {
     throw "SmokeModel does not exist: $SmokeModel"
+}
+if ($SmokeModel -and (Test-Path -LiteralPath (Full-Path $SmokeModel) -PathType Container) -and
+    -not (Get-ChildItem -LiteralPath (Full-Path $SmokeModel) -Force | Select-Object -First 1)) {
+    throw "SmokeModel directory is empty: $SmokeModel"
 }
 $Output = Full-Path $OutputDirectory
 $Cache = Full-Path $CacheDirectory
@@ -75,7 +80,7 @@ try {
         Wheel = $Wheel; CpuOnly = $CpuOnly; CudaArch = $CudaArch
         OutputDirectory = $Output; CacheDirectory = $Cache; Constraints = $Constraints
         CMakePath = $CMakePath; Jobs = $Jobs; Offline = $Offline
-        RequireCuda = $RequireCuda; SmokeModel = $SmokeModel
+        RequireCuda = $RequireCuda; SmokeModel = $SmokeModel; SmokeTp = $SmokeTp
     }
     & (Join-Path $RepoRoot "desktop/package.ps1") @desktopArgs
     Write-Host "[release] Collect artifacts, checksums and verification report"
