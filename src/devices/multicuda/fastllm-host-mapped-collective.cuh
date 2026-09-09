@@ -1,17 +1,19 @@
 // Included by fastllm-multicuda.cu after the host-collective kind declaration.
 #if defined(_WIN32) && !defined(USE_ROCM)
 namespace {
-// DFlash B8 verification communicates 8 * 5120 * sizeof(half) = 80 KiB
-// per rank. Keep the same bounded, single-CTA protocol for these messages.
+// DFlash B8 verification communicates 8 * 5120 * sizeof(half) = 80 KiB.
+// Partition by bytes so every supported dtype uses the same bounded protocol.
 constexpr size_t kHostMappedMaxBytes = 128 * 1024;
+constexpr int kHostMappedPartBytes = 32 * 1024;
+constexpr int kHostMappedMaxParts = kHostMappedMaxBytes / kHostMappedPartBytes;
 constexpr uint64_t kHostMappedTimeoutNs = 1000000000ULL;
 struct alignas(128) HostMappedFlag {
     uint32_t value;
 };
 struct HostMappedShared {
-    HostMappedFlag flags[2][2][2]; // ready/done, alternating generation, rank
+    HostMappedFlag flags[kHostMappedMaxParts][2][2][2]; // partition, ready/done, generation slot, rank
     HostMappedFlag failed[2];
-    alignas(128) int parameters[2][4]; // count, dtype, operation, root rank
+    alignas(128) int parameters[kHostMappedMaxParts][2][4]; // per-partition count, dtype, operation, root rank
     alignas(128) uint8_t inputs[2][kHostMappedMaxBytes];
 };
 struct HostMappedState {
@@ -41,10 +43,10 @@ __device__ __forceinline__ uint64_t HostMappedTime() {
     return v;
 }
 template <bool FailStop>
-__device__ bool HostMappedWait(HostMappedShared *s, int phase, int slot, int rank,
+__device__ bool HostMappedWait(HostMappedShared *s, int part, int phase, int slot, int rank,
                                uint32_t sequence) {
     const uint64_t start = HostMappedTime();
-    while (HostMappedAcquire(&s->flags[phase][slot][1 - rank].value) != sequence) {
+    while (HostMappedAcquire(&s->flags[part][phase][slot][1 - rank].value) != sequence) {
         if (HostMappedAcquire(&s->failed[1 - rank].value) ||
             HostMappedTime() - start > kHostMappedTimeoutNs) {
             HostMappedRelease(&s->failed[rank].value, 1);
@@ -70,9 +72,11 @@ template <> __device__ __nv_bfloat16 HostMappedSum(__nv_bfloat16 a, __nv_bfloat1
     return __float2bfloat16_rn(__bfloat162float(a) + __bfloat162float(b));
 }
 
-// One CTA per rank owns the complete small message. No remote atomic RMW is
-// used: each naturally aligned 32-bit flag has exactly one GPU writer. System
-// release/acquire publishes mapped-memory payloads across PCIe; every writer
+// Each CTA owns a disjoint payload partition and its own sequence/handshakes.
+// The same partition keeps its byte offset across sizes and dtypes, and only
+// active partitions advance. Both ranks submit matching operations in order.
+// No grid barrier or remote atomic RMW is used: each handshake flag has exactly
+// one GPU writer. System release/acquire publishes mapped-memory payloads across PCIe; every writer
 // fences before the CTA publishes readiness. The second rendezvous prevents
 // reuse of either payload until both readers finish. Alternating flag slots
 // prevent an early next invocation from overwriting an unobserved completion.
@@ -82,16 +86,23 @@ template <typename T, bool FailStop = true>
 __global__ void FastllmHostMappedCollectiveKernel(const T *send, T *recv, int count, int dataType,
                                                   int kind, int root, int rank, HostMappedShared *s,
                                                   uint32_t *counter) {
+    const int part = blockIdx.x;
+    const int offset = part * (kHostMappedPartBytes / sizeof(T));
+    const int originalCount = count;
+    count = min(count - offset, (int)(kHostMappedPartBytes / sizeof(T)));
+    if (count <= 0) return;
+    send += offset;
+    recv += offset;
     __shared__ uint32_t sequence;
     __shared__ int ok;
     if (threadIdx.x == 0) {
-        sequence = ++*counter;
+        sequence = ++counter[part];
         ok = !HostMappedAcquire(&s->failed[rank].value) &&
              !HostMappedAcquire(&s->failed[1 - rank].value);
-        s->parameters[rank][0] = count;
-        s->parameters[rank][1] = dataType;
-        s->parameters[rank][2] = kind;
-        s->parameters[rank][3] = root;
+        s->parameters[part][rank][0] = originalCount;
+        s->parameters[part][rank][1] = dataType;
+        s->parameters[part][rank][2] = kind;
+        s->parameters[part][rank][3] = root;
     }
     __syncthreads();
     if (!ok) {
@@ -99,20 +110,27 @@ __global__ void FastllmHostMappedCollectiveKernel(const T *send, T *recv, int co
             asm volatile("trap;");
         return;
     }
-    T *local = reinterpret_cast<T *>(s->inputs[rank]);
-    const T *peer = reinterpret_cast<const T *>(s->inputs[1 - rank]);
+    T *local = reinterpret_cast<T *>(s->inputs[rank]) + offset;
+    const T *peer = reinterpret_cast<const T *>(s->inputs[1 - rank]) + offset;
+    // CUDA allocations and payload partitions are 16-byte aligned. Keep a
+    // scalar path for borrowed unaligned views and for the final few elements.
+    const bool aligned = (((uintptr_t)send | (uintptr_t)recv) & 15) == 0;
+    const int vectorCount = aligned ? count / (16 / sizeof(T)) : 0;
+    const int scalarBegin = vectorCount * (16 / sizeof(T));
     if (kind != (int)FastllmHostCollectiveKind::Broadcast || rank == root) {
-        for (int i = threadIdx.x; i < count; i += blockDim.x)
+        for (int i = threadIdx.x; i < vectorCount; i += blockDim.x)
+            reinterpret_cast<uint4 *>(local)[i] = reinterpret_cast<const uint4 *>(send)[i];
+        for (int i = scalarBegin + threadIdx.x; i < count; i += blockDim.x)
             local[i] = send[i];
     }
     __threadfence_system();
     __syncthreads();
     if (threadIdx.x == 0) {
-        HostMappedRelease(&s->flags[0][sequence & 1][rank].value, sequence);
-        ok = HostMappedWait<FailStop>(s, 0, sequence & 1, rank, sequence);
+        HostMappedRelease(&s->flags[part][0][sequence & 1][rank].value, sequence);
+        ok = HostMappedWait<FailStop>(s, part, 0, sequence & 1, rank, sequence);
         if (ok) {
             for (int i = 0; i < 4; ++i)
-                ok &= s->parameters[0][i] == s->parameters[1][i];
+                ok &= s->parameters[part][0][i] == s->parameters[part][1][i];
             if (!ok) {
                 HostMappedRelease(&s->failed[rank].value, 2);
                 if (FailStop) {
@@ -126,7 +144,24 @@ __global__ void FastllmHostMappedCollectiveKernel(const T *send, T *recv, int co
     if (!ok)
         return;
     if (kind != (int)FastllmHostCollectiveKind::Reduce || rank == root) {
-        for (int i = threadIdx.x; i < count; i += blockDim.x) {
+        for (int i = threadIdx.x; i < vectorCount; i += blockDim.x) {
+            uint4 value;
+            if (kind == (int)FastllmHostCollectiveKind::Broadcast) {
+                value = rank == root ? reinterpret_cast<const uint4 *>(send)[i]
+                                     : reinterpret_cast<const uint4 *>(peer)[i];
+            } else {
+                value = reinterpret_cast<const uint4 *>(send)[i];
+                uint4 other = reinterpret_cast<const uint4 *>(peer)[i];
+                T *a = reinterpret_cast<T *>(&value);
+                const T *b = reinterpret_cast<const T *>(&other);
+#pragma unroll
+                for (int lane = 0; lane < 16 / sizeof(T); ++lane)
+                    a[lane] = rank == 0 ? HostMappedSum(a[lane], b[lane])
+                                        : HostMappedSum(b[lane], a[lane]);
+            }
+            reinterpret_cast<uint4 *>(recv)[i] = value;
+        }
+        for (int i = scalarBegin + threadIdx.x; i < count; i += blockDim.x) {
             if (kind == (int)FastllmHostCollectiveKind::Broadcast) {
                 recv[i] = rank == root ? send[i] : peer[i];
             } else {
@@ -139,8 +174,8 @@ __global__ void FastllmHostMappedCollectiveKernel(const T *send, T *recv, int co
     }
     __syncthreads();
     if (threadIdx.x == 0) {
-        HostMappedRelease(&s->flags[1][sequence & 1][rank].value, sequence);
-        HostMappedWait<FailStop>(s, 1, sequence & 1, rank, sequence);
+        HostMappedRelease(&s->flags[part][1][sequence & 1][rank].value, sequence);
+        HostMappedWait<FailStop>(s, part, 1, sequence & 1, rank, sequence);
     }
 }
 
@@ -159,7 +194,8 @@ HostMappedState::~HostMappedState() {
 }
 
 static bool HostMappedSelfTest(HostMappedState &s) {
-    constexpr int count = 513;
+    // Exercise every partition and a scalar tail before publishing the state.
+    constexpr int count = kHostMappedMaxBytes / sizeof(float) - 1;
     constexpr int replays = 32;
     float *inputs[2] = {nullptr, nullptr};
     cudaGraph_t graphs[2] = {nullptr, nullptr};
@@ -190,7 +226,8 @@ static bool HostMappedSelfTest(HostMappedState &s) {
                 ok && cudaStreamBeginCapture(cudaStreamPerThread,
                                              cudaStreamCaptureModeThreadLocal) == cudaSuccess;
             if (began) {
-                FastllmHostMappedCollectiveKernel<float, false><<<1, 256, 0, cudaStreamPerThread>>>(
+                FastllmHostMappedCollectiveKernel<float, false>
+                    <<<kHostMappedMaxParts, 256, 0, cudaStreamPerThread>>>(
                     inputs[r], inputs[r], count, fastllm::DataType::FLOAT32,
                     (int)FastllmHostCollectiveKind::AllReduce, -1, r, s.mapped[r], s.sequences[r]);
                 ok = cudaStreamEndCapture(cudaStreamPerThread, &graphs[r]) == cudaSuccess;
@@ -245,8 +282,8 @@ static void FastllmInitHostMappedCollectives(const std::vector<int> &devices) {
         return;
     // A bounded, process-lifetime cache per ordered physical GPU pair keeps
     // captured addresses valid across communicator changes and graph teardown.
-    // Each pair owns only 256 KiB of pinned payload plus flags and two device
-    // counters; recapture/model reload does not allocate another transport.
+    // Each pair owns 256 KiB of pinned payload plus flags and device counters;
+    // recapture/model reload does not allocate another transport.
     static auto *cache = new std::map<std::vector<int>, std::unique_ptr<HostMappedState>>;
     auto existing = cache->find(devices);
     if (existing != cache->end()) {
@@ -273,8 +310,8 @@ static void FastllmInitHostMappedCollectives(const std::vector<int> &devices) {
     for (int r = 0; r < 2 && ok; ++r) {
         ok = cudaSetDevice(devices[r]) == cudaSuccess &&
              cudaHostGetDevicePointer((void **)&s.mapped[r], s.host, 0) == cudaSuccess &&
-             cudaMalloc((void **)&s.sequences[r], sizeof(uint32_t)) == cudaSuccess &&
-             cudaMemset(s.sequences[r], 0, sizeof(uint32_t)) == cudaSuccess &&
+             cudaMalloc((void **)&s.sequences[r], kHostMappedMaxParts * sizeof(uint32_t)) == cudaSuccess &&
+             cudaMemset(s.sequences[r], 0, kHostMappedMaxParts * sizeof(uint32_t)) == cudaSuccess &&
              cudaDeviceSynchronize() == cudaSuccess;
         // Resolve lazily loaded functions before model stream capture.
         cudaFuncAttributes attributes{};
@@ -326,8 +363,9 @@ static bool FastllmTryHostMappedCollective(FastllmHostCollectiveKind kind, const
     }
     if (!FastllmCudaGraphIsCapturingFast())
         return false;
+    const int parts = (int)((bytes + kHostMappedPartBytes - 1) / kHostMappedPartBytes);
 #define HOST_MAPPED_LAUNCH(T)                                                                      \
-    FastllmHostMappedCollectiveKernel<T><<<1, 256, 0, cudaStreamPerThread>>>(                      \
+    FastllmHostMappedCollectiveKernel<T><<<parts, 256, 0, cudaStreamPerThread>>>(                      \
         (const T *)send, (T *)recv, count, dataType, (int)kind, root, rank, s->mapped[rank],       \
         s->sequences[rank])
     if (dataType == fastllm::DataType::FLOAT16) {

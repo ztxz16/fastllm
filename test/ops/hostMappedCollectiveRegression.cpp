@@ -32,16 +32,26 @@ template <> float ToFloat(half x) { return __half2float(x); }
 template <> float ToFloat(__nv_bfloat16 x) { return __bfloat162float(x); }
 
 template <typename T>
-void Run(const std::vector<int> &devices, int dtype, int count, int root, bool inPlace) {
+void Run(const std::vector<int> &devices, int dtype, int count, int root, bool inPlace, bool varySizes = false, int offset = 0) {
     T *hostIn[2], *hostOut[2], *send[2], *recv[2];
     size_t bytes = (size_t)count * sizeof(T);
+    auto operationCount = [&](int op) {
+        if (!varySizes) return count;
+        // Alternate 4, 1, 3, and 2 active partitions inside one graph. A
+        // partition's sequence must resume correctly after it was skipped.
+        const int counts[] = {count, 1, (int)(81920 / sizeof(T)) + 1,
+                              (int)(32768 / sizeof(T)) + 1};
+        return counts[op];
+    };
     // No allocation may synchronize a device while its peer graph is waiting.
     for (int r = 0; r < 2; ++r) {
         Check(cudaSetDevice(devices[r]));
         Check(cudaMallocHost((void **)&hostIn[r], bytes));
         Check(cudaMallocHost((void **)&hostOut[r], bytes * 4));
-        Check(cudaMalloc((void **)&send[r], bytes));
-        Check(cudaMalloc((void **)&recv[r], bytes));
+        Check(cudaMalloc((void **)&send[r], bytes + offset * sizeof(T)));
+        Check(cudaMalloc((void **)&recv[r], bytes + offset * sizeof(T)));
+        send[r] += offset;
+        recv[r] += offset;
         Check(cudaDeviceSynchronize());
     }
     std::atomic<int> errors{0};
@@ -52,19 +62,20 @@ void Run(const std::vector<int> &devices, int dtype, int count, int root, bool i
         for (int capture = 0; capture < 2; ++capture) {
             Require(FastllmCudaGraphBeginCapture(), "begin capture failed");
             for (int op = 0; op < 4; ++op) {
+                const int elements = operationCount(op);
                 Check(cudaMemcpyAsync(send[rank], hostIn[rank], bytes, cudaMemcpyHostToDevice,
                                       cudaStreamPerThread));
                 T *destination = inPlace ? send[rank] : recv[rank];
                 if (op == 0)
-                    FastllmNcclAllReduce(send[rank], destination, count, dtype, devices[rank]);
+                    FastllmNcclAllReduce(send[rank], destination, elements, dtype, devices[rank]);
                 else if (op == 1)
-                    FastllmNcclAllReduceNoCustom(send[rank], destination, count, dtype,
+                    FastllmNcclAllReduceNoCustom(send[rank], destination, elements, dtype,
                                                  devices[rank]);
                 else if (op == 2)
-                    FastllmNcclBroadcastFrom(send[rank], destination, count, dtype, devices[root],
+                    FastllmNcclBroadcastFrom(send[rank], destination, elements, dtype, devices[root],
                                              devices[rank]);
                 else
-                    FastllmNcclReduce(send[rank], destination, count, dtype, devices[root],
+                    FastllmNcclReduce(send[rank], destination, elements, dtype, devices[root],
                                       devices[rank]);
                 if (op != 3 || rank == root)
                     Check(cudaMemcpyAsync(hostOut[rank] + op * count, destination, bytes,
@@ -89,7 +100,7 @@ void Run(const std::vector<int> &devices, int dtype, int count, int root, bool i
                 for (int op = 0; op < 4; ++op) {
                     if (op == 3 && rank != root)
                         continue;
-                    for (int i = 0; i < count; ++i) {
+                    for (int i = 0; i < operationCount(op); ++i) {
                         T expected =
                             op == 2 ? value(root, i)
                                     : FromFloat<T>(ToFloat(value(0, i)) + ToFloat(value(1, i)));
@@ -97,7 +108,8 @@ void Run(const std::vector<int> &devices, int dtype, int count, int root, bool i
                             if (errors.fetch_add(1) == 0)
                                 std::cerr << "Mismatch dtype=" << dtype << " count=" << count
                                           << " rank=" << rank << " root=" << root
-                                          << " inPlace=" << inPlace << " capture=" << capture
+                                          << " inPlace=" << inPlace << " offset=" << offset
+                                          << " varying=" << varySizes << " capture=" << capture
                                           << " iteration=" << iteration << " op=" << op
                                           << " index=" << i
                                           << " actual=" << ToFloat(hostOut[rank][op * count + i])
@@ -118,8 +130,8 @@ void Run(const std::vector<int> &devices, int dtype, int count, int root, bool i
     peer.join();
     for (int r = 0; r < 2; ++r) {
         Check(cudaSetDevice(devices[r]));
-        Check(cudaFree(send[r]));
-        Check(cudaFree(recv[r]));
+        Check(cudaFree(send[r] - offset));
+        Check(cudaFree(recv[r] - offset));
         Check(cudaFreeHost(hostIn[r]));
         Check(cudaFreeHost(hostOut[r]));
     }
@@ -161,6 +173,10 @@ template <typename T> void Types(const std::vector<int> &devices, int dtype) {
             for (bool inPlace : {false, true})
                 Run<T>(devices, dtype, count, root, inPlace);
     }
+    for (int offset : {0, 1})
+        for (int root = 0; root < 2; ++root)
+            for (bool inPlace : {false, true})
+                Run<T>(devices, dtype, 131072 / sizeof(T) - 1, root, inPlace, true, offset);
     std::cout << "PASS mapped graph type " << dtype << " on " << devices[0] << "," << devices[1]
               << std::endl;
 }
@@ -183,7 +199,7 @@ int main() {
         Types<int8_t>(devices, fastllm::DataType::INT8);
         Types<int32_t>(devices, fastllm::DataType::INT32);
     }
-    std::cout << "PASS: mapped-host collective graph regression; 92,160 collective generations per "
+    std::cout << "PASS: mapped-host collective graph regression; 122,880 collective generations per "
                  "rank\n";
     return 0;
 #endif
