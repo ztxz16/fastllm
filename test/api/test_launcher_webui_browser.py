@@ -536,6 +536,78 @@ for line in sys.stdin:
         expect(self.page.locator('.codex-session')).to_have_count(3)
         return projects
 
+    def test_codex_new_sessions_remain_visible_before_history_is_indexed(self):
+        self.start_codex_projects()
+        unindexed = {'4', '5'}
+
+        def intercept(route):
+            method = route.request.post_data_json['method']
+            if method not in ('thread/list', 'thread/start'):
+                route.continue_(); return
+            response = route.fetch()
+            result = response.json()
+            if method == 'thread/list':
+                result['data'] = [thread for thread in result['data'] if thread['id'] not in unindexed]
+            else:
+                # app-server has no preview until it records the first turn.
+                result['thread'].update(name='', preview='')
+            route.fulfill(response=response, json=result)
+
+        self.page.route('**/api/agents/codex/rpc', intercept)
+        prompt = self.page.locator('#codex-prompt')
+        search = self.page.locator('#codex-search')
+
+        def search_sessions(text):
+            with self.page.expect_response(lambda response: response.url.endswith('/api/agents/codex/rpc')
+                    and response.request.post_data_json.get('method') == 'thread/list'):
+                search.fill(text)
+
+        prompt.fill('Inspect the first project')
+        prompt.press('Enter')
+        expect(self.page.locator('#codex-messages')).to_contain_text('Reply')
+        expect(self.page.locator('#codex-cancel')).to_be_visible()
+        first = self.page.locator('#codex-session-list [data-thread-id="4"]')
+        expect(first).to_be_visible()
+        expect(first).to_contain_text('Inspect the first project')
+        expect(first).to_have_attribute('aria-current', 'page')
+        search_sessions('Inspect')
+        expect(first).to_be_visible()
+        search_sessions('Saved A')
+        expect(first).to_have_count(0)
+        search_sessions('')
+        expect(first).to_be_visible()
+
+        self.page.locator('#codex-new').click()
+        prompt.fill('Inspect the second project')
+        prompt.press('Enter')
+        second = self.page.locator('#codex-session-list [data-thread-id="5"]')
+        expect(second).to_be_visible()
+        expect(second).to_have_attribute('aria-current', 'page')
+        search_sessions('Inspect')
+        expect(first).to_be_visible()
+        expect(second).to_be_visible()
+        first.click()
+        expect(first).to_have_attribute('aria-current', 'page')
+        expect(self.page.locator('#codex-cancel')).to_be_visible()
+
+        # A finished turn can still precede the history index update.
+        search_sessions('')
+        self.page.locator('#codex-cancel').click()
+        expect(self.page.locator('#codex-send')).to_be_enabled()
+        expect(first).to_be_visible()
+        self.page.locator('#codex-archive').click()
+        expect(first).to_have_count(0)
+        search_sessions('Saved')
+        search_sessions('')
+        expect(first).to_have_count(0)
+        expect(second).to_be_visible()
+
+        # Reconcile with the indexed summary without adding a duplicate.
+        unindexed.clear()
+        search_sessions('New task')
+        expect(second).to_have_count(1)
+        expect(second).to_contain_text('New task')
+
     def test_codex_reasoning_effort_is_sent_and_remembered_per_session(self):
         def metadata(service, api_key):
             return dict(service, modelMetadata={"supported_reasoning_efforts": ["low", "medium", "xhigh"],

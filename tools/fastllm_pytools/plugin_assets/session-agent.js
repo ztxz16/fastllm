@@ -11,6 +11,8 @@ export function mountSessionAgent(options) {
   let modelName = "", effortOptions = [], defaultEffort = "";
   let generation = 0, selection = 0, searchVersion = 0, turns = {}, approvals = [], approvalSignature = "";
   const items = new Map(), nodes = new Map(), drafts = new Map(), efforts = new Map();
+  // app-server can acknowledge a new thread before its history index lists it.
+  const pendingSessions = new Map();
   const collapsedProjects = new Set();
   const markdownTypes = new Set(["userMessage", "agentMessage", "plan", "reasoning"]);
   let markdown, markdownLoading = false, markdownAttempt = 0, markdownError = "", disposed = false;
@@ -114,7 +116,9 @@ export function mountSessionAgent(options) {
     const index = sessions.findIndex(session => session.id === thread.id);
     if (index < 0) sessions.unshift(summary);
     else sessions[index] = {...sessions[index], ...summary};
-    return sessions.find(session => session.id === thread.id);
+    const current = sessions.find(session => session.id === thread.id);
+    if (pendingSessions.has(thread.id)) pendingSessions.set(thread.id, current);
+    return current;
   }
   function renderSessions() {
     $("session-list").replaceChildren();
@@ -173,7 +177,12 @@ export function mountSessionAgent(options) {
     if (more && nextCursor) params.cursor = nextCursor;
     const result = await rpc("thread/list", params);
     if (attempt !== searchVersion || instance !== generation) return;
-    sessions = more ? [...new Map([...sessions, ...result.data].map(session => [session.id, session])).values()] : result.data;
+    for (const thread of result.data) pendingSessions.delete(thread.id);
+    const search = params.searchTerm.toLowerCase();
+    const pending = [...pendingSessions.values()].reverse().filter(thread =>
+      [thread.name, thread.preview].some(text => (text || "").toLowerCase().includes(search)));
+    const indexed = more ? [...sessions, ...result.data] : result.data;
+    sessions = [...new Map([...pending, ...indexed].map(session => [session.id, session])).values()];
     nextCursor = result.nextCursor; renderSessions();
   }
   function content(item) {
@@ -212,6 +221,7 @@ export function mountSessionAgent(options) {
     if (bottom) scroller.scrollTop = scroller.scrollHeight;
   }
   function snapshot(thread, eventCursor) {
+    if (!sessions.some(session => session.id === thread.id)) pendingSessions.set(thread.id, thread);
     const current = rememberThread(thread);
     selectedWorkspace = typeof current.cwd === "string" ? current.cwd : ""; selectedReady = true;
     collapsedProjects.delete(selectedWorkspace);
@@ -242,7 +252,7 @@ export function mountSessionAgent(options) {
       if (attempt === selection && instance === generation) report(error);
     } finally { if (attempt === selection && instance === generation) { loading = false; controls(); } }
   }
-  async function create(carryDraft = false) {
+  async function create(carryDraft = false, preview = "") {
     save(); const instance = generation, attempt = selection, previous = draftKey();
     const effort = currentEffort();
     const result = await rpc("thread/start", {cwd:draftWorkspace});
@@ -252,9 +262,7 @@ export function mountSessionAgent(options) {
     selected = result.thread.id; selection++; $("prompt").value = draft;
     if (effort) efforts.set(effortKey(), effort);
     if (carryDraft) efforts.delete(effortKey(previous));
-    save(); snapshot(result.thread, result._eventCursor); await list();
-    if (instance !== generation) return;
-    if (!sessions.some(thread => thread.id === result.thread.id)) { sessions.unshift(result.thread); renderSessions(); }
+    save(); snapshot({...result.thread, preview:result.thread.preview || preview}, result._eventCursor);
     return result.thread.id;
   }
   function applyEvent(event) {
@@ -278,7 +286,9 @@ export function mountSessionAgent(options) {
       if (p.turn.error) report(new Error(p.turn.error.message));
       list().catch(report);
     } else if (method === "error") report(new Error(p.error?.message || p.message || t("{name} request failed.", {name})));
-    else if (method === "thread/name/updated") { title = p.threadName; list().catch(report); }
+    else if (method === "thread/name/updated") {
+      rememberThread({id:p.threadId, name:p.threadName}); renderSessions(); list().catch(report);
+    }
   }
   async function respond(pending, result) {
     await request(`/api/agents/${id}/respond`, {method:"POST", body:JSON.stringify({id:pending.id, result})});
@@ -355,7 +365,7 @@ export function mountSessionAgent(options) {
     try {
       await rpc("thread/name/set", {threadId:id, name:name.trim()});
       if (instance !== generation) return;
-      if (selected === id) { title = name.trim(); controls(); }
+      rememberThread({id, name:name.trim()}); renderSessions();
       await list();
     }
     catch (error) { report(error); }
@@ -365,6 +375,7 @@ export function mountSessionAgent(options) {
     try {
       await rpc("thread/archive", {threadId:id});
       if (instance !== generation) return;
+      pendingSessions.delete(id);
       sessions = sessions.filter(session => session.id !== id);
       if (selected === id && attempt === selection) beginDraft(workspace || defaultWorkspace);
       await list();
@@ -378,7 +389,7 @@ export function mountSessionAgent(options) {
     const instance = generation, effort = currentEffort();
     sending = true; controls(); report(null);
     try {
-      const id = selected || await create(true);
+      const id = selected || await create(true, text);
       if (!id || instance !== generation) return;
       const result = await rpc("turn/start", {threadId:id, text, ...(effort ? {effort} : {})});
       if (instance !== generation) return;
@@ -409,6 +420,7 @@ export function mountSessionAgent(options) {
       if (connected && (!running || becameVisible)) loadMarkdown();
       if (connected && (!running || epoch !== info.epoch)) {
         running = true; epoch = info.epoch; cursor = 0; generation++; turns = {}; approvals = []; selectedReady = false;
+        pendingSessions.clear();
         modelName = info.modelName || "";
         effortOptions = Array.isArray(info.reasoningEfforts) ? info.reasoningEfforts : [];
         defaultEffort = effortOptions.includes(info.defaultReasoningEffort) ? info.defaultReasoningEffort : effortOptions.at(-1) || "";
@@ -426,6 +438,7 @@ export function mountSessionAgent(options) {
           .catch(error => { if (instance === generation) { loading = false; report(error); controls(); } });
       } else if (!connected && running) {
         running = false; generation++; selection++; loading = false; selectedReady = false; turns = {}; approvals = [];
+        pendingSessions.clear();
         approvalSignature = ""; renderApprovals();
       }
       controls();
