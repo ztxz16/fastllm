@@ -265,6 +265,8 @@ if (USE_CUDA)
     endif()
     enable_language(CUDA)
     if (MSVC)
+        # CUDA host compilation needs the same MSVC math constants as C++.
+        add_compile_definitions($<$<COMPILE_LANGUAGE:CUDA>:_USE_MATH_DEFINES>)
         # NVCC invokes cl.exe for preprocessing too. UTF-8 Chinese comments
         # must not be decoded as the host ANSI codepage (which can eat a newline).
         add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
