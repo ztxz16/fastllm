@@ -1,7 +1,7 @@
 import {conversationStore} from "./conversations.js";
 
 // The customization subpage and recovery controls belong to the core.
-export function mountManager({root, basePath, request, refresh, getRecords, context}) {
+export function mountManager({root, basePath, request, refresh, getRecords, context, openRuntime}) {
   const slots = {page:"独立页面", studio:"工作室扩展", topbar:"主界面右上角", sidebar:"主界面侧栏", statusbar:"主界面底栏", theme:"全局皮肤与布局"};
   const page = document.createElement("main"); page.className = "plugin-manager"; page.hidden = true;
   page.setAttribute("aria-label", "自定义界面");
@@ -254,6 +254,13 @@ export function mountManager({root, basePath, request, refresh, getRecords, cont
       reference.add(new Option(plugin.name, plugin.id));
       const row = document.createElement("div"); row.className = "plugin-row"; row.dataset.pluginId = plugin.id;
       const label = document.createElement("span"); label.textContent = `${plugin.name} · ${slots[plugin.slot] || "无效配置"}`;
+      if (plugin.builtin && plugin.runtime) {
+        const phases = {installing:"安装中", upgrading:"升级中", removing:"删除中", starting:"启动中", running:"运行中", failed:"操作失败"};
+        const status = document.createElement("small"); status.className = "plugin-runtime-status";
+        status.textContent = !plugin.enabled ? "已停用" : phases[plugin.runtime.phase]
+          || (plugin.runtime.installed ? "已安装" : "未安装，需手动点击安装");
+        label.append(document.createElement("br"), status);
+      }
       row.append(label, action(plugin.enabled ? "停用" : "启用", async () => {
         await request(`/api/plugins/${encodeURIComponent(plugin.id)}/enabled`, {method:"POST", body:JSON.stringify({enabled:!plugin.enabled})}); await refresh(); await renderPreview();
       }), action("定制", async () => {
@@ -269,6 +276,9 @@ export function mountManager({root, basePath, request, refresh, getRecords, cont
           showProposal(); await validatePreview();
         }
       }));
+      if (plugin.builtin && plugin.runtime?.manageable && openRuntime) {
+        row.append(action("管理", () => openRuntime(plugin.id)));
+      }
       if (!plugin.builtin && plugin.revision) row.append(action("恢复上一版", async () => {
         await request(`/api/plugins/${plugin.id}/rollback`, {method:"POST", body:JSON.stringify({expectedRevision:plugin.revision})});
         await refresh(); await renderPreview(); report("已恢复上一版本");
@@ -493,11 +503,12 @@ export function mountManager({root, basePath, request, refresh, getRecords, cont
       else if (!busy) await restorePreview();
     }).catch(report); editor.elements.instruction.focus();
   }
-  $("[aria-label='关闭']").addEventListener("click", () => {
+  function close() {
     hide(); if (pushed && location.hash === "#customize") history.back();
     else if (location.hash === "#customize") history.replaceState(history.state, "", location.pathname + location.search);
     pushed = false;
-  }, {signal:controller.signal});
+  }
+  $("[aria-label='关闭']").addEventListener("click", close, {signal:controller.signal});
   function syncRoute() {
     if (location.hash === "#customize") open(false);
     else if (!page.hidden) hide();

@@ -1,0 +1,91 @@
+#codex-content { display:grid; grid-template-columns:250px minmax(0,1fr); }
+.codex-sessions { display:flex; flex-direction:column; gap:10px; min-height:0; overflow:auto; padding:16px; border-right:1px solid var(--line); font-size:12px; }
+.codex-sessions input, .codex-workspace-picker input { width:100%; min-width:0; padding:8px; background:var(--surface); color:var(--ink); border:1px solid var(--line); border-radius:8px; }
+.codex-sidebar-title { color:var(--muted); font-size:12px; }
+.codex-workspace-setup { display:grid; gap:8px; padding:16px 20px; border-bottom:1px solid var(--line); font-size:12px; }
+.codex-workspace-picker { display:flex; gap:6px; min-width:0; }
+.codex-workspace-picker input { flex:1; }
+.codex-workspace-picker button { flex-shrink:0; padding:0 8px; }
+#codex-workspace-hint { color:var(--muted); font-size:11px; line-height:1.5; }
+#codex-session-list { display:grid; gap:6px; }
+.codex-project { min-width:0; }
+.codex-project-heading { display:flex; align-items:center; gap:6px; padding:8px 0; }
+.codex-project-toggle { flex:1; min-width:0; padding:4px 0; text-align:left; color:var(--ink); background:transparent; cursor:pointer; }
+.codex-project-toggle strong { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.codex-project-toggle strong::before { content:"▾"; display:inline-block; width:16px; color:var(--muted); }
+.codex-project-toggle[aria-expanded="false"] strong::before { content:"▸"; }
+.codex-project-toggle small { display:block; margin:4px 0 0 16px; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:10px; }
+.codex-project-new { flex-shrink:0; padding:0 9px; }
+.codex-project-sessions { display:grid; gap:4px; padding-left:10px; border-left:1px solid var(--line); }
+.codex-project-sessions[hidden] { display:none; }
+.codex-session { width:100%; border:1px solid transparent; padding:10px; text-align:left; border-radius:8px; color:var(--ink); background:transparent; cursor:pointer; overflow-wrap:anywhere; }
+.codex-session.active { border-color:var(--primary); background:var(--surface-soft); }
+.codex-session small { display:block; color:var(--muted); margin-top:4px; }
+.codex-session > span { display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:3; overflow:hidden; }
+.codex-conversation { min-width:0; min-height:0; display:flex; flex-direction:column; }
+.codex-conversation-header { display:flex; align-items:center; gap:8px; padding:12px 18px; border-bottom:1px solid var(--line); }
+.codex-conversation-heading { flex:1; min-width:0; }
+#codex-title, #codex-session-workspace { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#codex-session-workspace { margin-top:5px; color:var(--muted); font-size:11px; }
+#codex-toggle-sessions { display:none; }
+#codex-messages { flex:1; min-height:0; overflow:auto; padding:20px; display:flex; flex-direction:column; gap:16px; }
+.codex-message { flex-shrink:0; align-self:flex-start; min-width:0; width:100%; max-width:min(92%,960px); margin:0; border:1px solid var(--line); border-radius:4px 14px 14px; padding:14px 16px; }
+.codex-message.userMessage { align-self:flex-end; width:fit-content; max-width:min(80%,720px); margin-left:auto; border-radius:14px 14px 4px; background:var(--surface-soft); }
+.codex-message > strong, .codex-message > summary { color:var(--muted); font-size:12px; cursor:default; }
+.codex-message > summary { cursor:pointer; }
+.codex-message > pre { margin:8px 0 0; white-space:pre-wrap; overflow-wrap:anywhere; font:13px/1.7 var(--font-mono,monospace); }
+.codex-markdown { margin-top:8px; min-width:0; color:var(--ink); font-size:14px; line-height:1.75; overflow-wrap:anywhere; }
+.codex-markdown.markdown-pending { white-space:pre-wrap; }
+.codex-markdown p { margin:0 0 12px; }
+.codex-markdown :is(h1,h2,h3,h4,h5,h6) { margin:18px 0 10px; line-height:1.4; }
+.codex-markdown h1 { font-size:22px; }.codex-markdown h2 { font-size:19px; }.codex-markdown h3 { font-size:16px; }
+.codex-markdown > :first-child { margin-top:0; }.codex-markdown > :last-child { margin-bottom:0; }
+.codex-markdown :is(ul,ol) { margin:8px 0 12px; padding-left:24px; }
+.codex-markdown li { margin:5px 0; }.codex-markdown .task-list-item { list-style:none; }
+.codex-markdown input[type="checkbox"] { margin-left:-20px; accent-color:var(--primary); }
+.codex-markdown blockquote { margin:12px 0; padding:2px 14px; border-left:3px solid var(--primary); color:var(--muted); }
+.codex-markdown hr { margin:18px 0; border:0; border-top:1px solid var(--line); }
+.codex-markdown a { color:var(--primary); text-decoration:underline; text-underline-offset:3px; }
+.codex-markdown code:not(pre code) { padding:2px 5px; background:var(--surface-soft); border:1px solid var(--line); border-radius:4px; font-size:.9em; }
+.codex-markdown .code-block { margin:14px 0; overflow:hidden; border:1px solid var(--line); border-radius:8px; background:var(--surface); }
+.codex-markdown .code-head { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:7px 12px; background:var(--surface-soft); color:var(--muted); font-size:12px; }
+.codex-markdown .copy-code { color:inherit; background:transparent; cursor:pointer; }.codex-markdown .copy-code:hover { color:var(--primary); }
+.codex-markdown .code-block pre { max-height:520px; margin:0; padding:12px; overflow:auto; white-space:pre; overflow-wrap:normal; font:13px/1.7 var(--font-mono,monospace); }
+.codex-markdown .markdown-table { max-width:100%; margin:14px 0; overflow-x:auto; border:1px solid var(--line); border-radius:6px; }
+.codex-markdown table { width:100%; border-collapse:collapse; font-size:13px; }
+.codex-markdown :is(th,td) { min-width:100px; padding:8px 12px; text-align:left; border:1px solid var(--line); }
+.codex-markdown th { background:var(--surface-soft); }.codex-markdown .align-center { text-align:center; }.codex-markdown .align-right { text-align:right; }
+#codex-approvals { max-height:40%; overflow:auto; padding:0 18px; }
+.codex-approval { border:1px solid var(--primary); border-radius:10px; padding:12px; margin:8px 0; }
+.codex-approval pre { white-space:pre-wrap; overflow-wrap:anywhere; font-size:12px; }
+.codex-approval label { display:grid; gap:6px; margin:12px 0; }
+.codex-approval input, .codex-approval select { padding:8px; color:var(--ink); background:var(--surface); border:1px solid var(--line); border-radius:6px; }
+.codex-approval button { margin-right:8px; }
+#codex-chat-error { padding:0 18px; }
+#codex-compose { padding:12px 18px 16px; border-top:1px solid var(--line); }
+#codex-prompt { resize:vertical; width:100%; max-height:240px; min-height:72px; padding:12px; color:var(--ink); background:var(--surface); border:1px solid var(--line); border-radius:10px; font:14px/1.5 inherit; }
+.codex-compose-hint { display:block; margin-top:5px; color:var(--muted); font-size:11px; }
+.codex-compose-actions { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-top:8px; }
+.codex-effort-picker { display:flex; align-items:center; gap:6px; color:var(--muted); font-size:12px; }
+#codex-effort { max-width:180px; padding:6px 8px; border:1px solid var(--line); border-radius:7px; color:var(--ink); background:var(--surface); font:inherit; }
+#codex-effort:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+#codex-effort:disabled { opacity:.6; }
+#codex-turn-status { flex:1; font-size:12px; color:var(--muted); }
+@media (max-width:760px) {
+  #codex-content { display:flex; flex-direction:column; }
+  .codex-conversation { flex:1; }
+  .codex-sessions { display:none; flex-shrink:0; padding:10px; max-height:200px; border-right:0; border-bottom:1px solid var(--line); }
+  #codex-content.sessions-open .codex-sessions { display:flex; }
+  #codex-toggle-sessions { display:inline-flex; flex-shrink:0; }
+  .codex-conversation-header { display:grid; grid-template-columns:minmax(0,1fr) auto auto; gap:8px; padding:8px 12px; }
+  .codex-conversation-heading { grid-column:1/-1; grid-row:1; }
+  #codex-toggle-sessions { justify-self:start; }
+  .codex-workspace-setup { padding:12px; }
+  #codex-messages { padding:12px; }
+  .codex-message { max-width:95%; padding:10px 12px; }
+  .codex-message.userMessage { max-width:85%; }
+  #codex-compose { padding:8px 12px; }
+  #codex-turn-status { order:1; flex-basis:100%; }
+  .codex-effort-picker { margin-right:auto; }
+  #codex-prompt { min-height:56px; }
+}

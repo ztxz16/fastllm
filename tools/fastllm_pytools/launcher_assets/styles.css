@@ -44,6 +44,9 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 .brand small { margin-top: 5px; color: var(--muted); font-size: 8px; font-weight: 550; letter-spacing: 1.1px; }
 .navigation { display: flex; min-height: 0; flex-direction: column; gap: 4px; }
 .sidebar-heading { margin: 0 12px 10px; color: var(--subtle); font-size: 11px; font-weight: 550; letter-spacing: 0.6px; }
+.agent-heading { display: flex; align-items: center; justify-content: space-between; margin-top: 18px; }
+.agent-heading button { padding: 3px 6px; border-radius: 5px; background: transparent; color: var(--muted); font: inherit; cursor: pointer; }
+.agent-heading button:hover, .agent-heading button:focus-visible { color: var(--primary); background: var(--primary-soft); }
 .nav-button { position: relative; display: grid; grid-template-columns: 21px minmax(0, 1fr) 7px; align-items: center; gap: 8px; width: 100%; min-height: 38px; padding: 8px 10px; border: 1px solid transparent; border-radius: 9px; background: transparent; color: var(--muted); text-align: left; cursor: pointer; transition: background .15s, color .15s; }
 .nav-button:hover { background: #edf1ee; color: var(--ink); }
 .nav-button.active { background: #e5f1e9; color: #176d4e; }
@@ -833,12 +836,14 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
   .brand { padding: 0; gap: 8px; }
   .brand-mark { width: 27px; height: 27px; border-radius: 8px; }
   .brand strong { font-size: 18px; }
-  .brand small, .sidebar-heading, .sidebar-tip, .version, .language-picker > span { display: none; }
+  .brand small, .sidebar-tip, .version, .language-picker > span { display: none; }
   .sidebar-footer { position: absolute; top: 10px; right: 16px; display: flex; align-items: center; gap: 10px; padding: 0; margin: 0; }
   .footer-row { margin: 0; padding: 0; border: 0; }
   .quiet-button { padding: 7px 0; }
   .language-picker select { padding: 6px 7px; }
-  .navigation { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 3px; margin-top: 10px; }
+  .navigation { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 3px; margin-top: 10px; }
+  .navigation > .sidebar-heading { grid-column: 1 / -1; margin: 6px 4px 2px; }
+  .navigation > .plugin-manager-button { grid-column: 1 / -1; }
   .nav-button { display: flex; flex-direction: column; justify-content: center; gap: 5px; min-height: 48px; padding: 6px 2px; }
   .nav-button > span { width: 100%; min-width: 0; }
   .nav-button strong { display: flex; align-items: center; justify-content: center; min-height: 22px; font-size: 9px; line-height: 11px; white-space: normal; overflow-wrap: anywhere; }
@@ -891,7 +896,10 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
   .toast-region { inset: auto 12px 12px; }
   .toast { min-width: 0; max-width: 100%; }
 }
-@media (max-height: 700px) and (min-width: 681px) { .sidebar-tip { display: none; } }
+@media (max-height: 920px) and (min-width: 681px) {
+  .sidebar-tip { display: none; }
+  .sidebar-footer { padding-top: 16px; }
+}
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
 }

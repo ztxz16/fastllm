@@ -24,7 +24,20 @@
 .plugin-native[hidden],.plugin-page[hidden],.plugin-studio-slot[hidden],.plugin-manager[hidden],.plugin-manager [hidden]{display:none!important}.plugin-native{display:contents}.plugin-page{min-height:320px;height:100%;position:relative}.plugin-frame{display:block;width:100%;min-height:320px;height:100%;border:0;background:transparent}.plugin-status{padding:12px;color:var(--muted,#68766f)}
 .plugin-studio-slot{display:flex;flex:0 0 auto;gap:10px;max-height:35vh;overflow:auto;padding:8px 16px;border-bottom:1px solid var(--line,#d9e4df)}.plugin-studio-slot .plugin-page{flex:1;min-width:260px;min-height:180px}.plugin-studio-slot .plugin-frame{min-height:180px;height:220px}
 @media(max-width:600px){.plugin-manager-button{padding:6px 8px}.plugin-studio-slot{padding:6px}}
-@media(max-width:680px){.navigation{max-height:170px}}
+@media(max-width:680px){.navigation{max-height:230px}}
+
+.plugin-runtime-manager{box-sizing:border-box;width:min(520px,calc(100vw - 32px));max-height:calc(100dvh - 32px);padding:24px;border:1px solid var(--line,#d9e4df);border-radius:14px;background:var(--surface,#fff);color:var(--ink,#25352e);font:14px/1.6 system-ui,sans-serif;overflow:auto}
+.plugin-runtime-manager::backdrop{background:#0007}
+.plugin-runtime-manager header{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:20px}
+.plugin-runtime-manager h2{margin:0;font-size:18px}.plugin-runtime-manager label{display:grid;gap:6px}
+.plugin-runtime-manager button,.plugin-runtime-manager select{font:inherit;color:inherit;padding:7px 12px;border:1px solid var(--line,#d9e4df);border-radius:7px;background:var(--surface,#fff)}
+.plugin-runtime-manager button{cursor:pointer}.plugin-runtime-manager button:disabled{opacity:.5;cursor:default}
+.plugin-runtime-manager select{width:100%}.plugin-runtime-manager p{margin:12px 0;overflow-wrap:anywhere}
+.plugin-runtime-manager [data-note],.plugin-runtime-manager [data-version],.plugin-runtime-manager [data-stage]{color:var(--muted,#68766f);font-size:12px}
+.plugin-runtime-manager progress{width:100%}.plugin-runtime-manager footer{display:flex;flex-wrap:wrap;gap:8px;margin-top:20px}
+.plugin-runtime-manager [data-operation="remove"],.plugin-runtime-manager [data-error]{color:#c34850}
+.plugin-runtime-manager [data-error]{white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.6 ui-monospace,monospace}
+.plugin-runtime-manager [hidden]{display:none!important}
 
 .plugin-manager h1{margin:0;font-size:18px;font-weight:650}.plugin-manager h2{font-size:14px}.plugin-heading>span{margin-left:auto;color:var(--muted);font-size:12px}
 .customizer-layout{display:grid;grid-template-columns:380px minmax(0,1fr);flex:1;min-height:0}

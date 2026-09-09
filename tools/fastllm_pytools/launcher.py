@@ -26,6 +26,9 @@ from typing import Any, Dict, List, Optional
 
 from .modelscope_download import PROGRESS_PREFIX as MODELSCOPE_PROGRESS_PREFIX
 from .agent_runtime_install import AgentRuntimeInstaller
+from .launcher_harness import HarnessRuntime
+from .launcher_opencode import OpenCodeRuntime
+from .launcher_codex import CodexRuntime
 from .launcher_mtp import detect_mtp_support
 from .startup_progress import PROGRESS_PREFIX
 from .ui_hardware import detect_hardware
@@ -421,7 +424,14 @@ class LauncherRuntime:
     def __init__(self, config_path: str = "", popen_factory=None, webui_history_dir: str = "",
                  agent_workspace_root: str = "", allow_remote_workspace_agent: bool = True,
                  disable_workspace_agent: bool = False, plugins_dir: str = ""):
-        self.plugins = PluginRegistry(plugins_dir)
+        self.harness = HarnessRuntime()
+        self.opencode = OpenCodeRuntime()
+        self.codex = CodexRuntime()
+        self.plugins = PluginRegistry(plugins_dir, on_enabled=self._plugin_enabled_changed,
+                                      runtimes={name: lambda name=name: getattr(self, name).state()
+                                                for name in ("harness", "opencode", "codex")},
+                                      runtime_actions={name: lambda operation, name=name: getattr(self, name).manage(operation)
+                                                       for name in ("harness", "opencode", "codex")})
         self.config_path = os.path.abspath(os.path.expanduser(
             config_path or get_saved_commands_path()
         ))
@@ -448,6 +458,16 @@ class LauncherRuntime:
         self._last_progress_stage = ""
         self._shutdown_callback = None
         self._agent_installer = AgentRuntimeInstaller(self._enable_installed_agent)
+
+    def _plugin_enabled_changed(self, plugin_id):
+        if plugin_id in {"harness", "opencode", "codex"}:
+            with self._lock:
+                if not self.plugins.get(plugin_id)["enabled"]:
+                    getattr(self, plugin_id).stop()
+
+    def _stop_native_agents(self):
+        for agent in (self.harness, self.opencode, self.codex):
+            agent.stop()
 
     def _enable_installed_agent(self):
         with self._lock:
@@ -508,6 +528,27 @@ class LauncherRuntime:
             self._webui_app = create_app(args)
             self._webui_session = session_id
             return self._webui_app
+
+    def open_harness(self, launcher_host, browser_origin, *, install=False):
+        return self.open_agent("harness", launcher_host, browser_origin, install=install)
+
+    def open_agent(self, agent_id, launcher_host, browser_origin, *, install=False):
+        if agent_id not in {"harness", "opencode", "codex"}:
+            raise LauncherError("Unknown agent.")
+        agent = getattr(self, agent_id)
+        name = "DeepSeek Harness" if agent_id == "harness" else agent.name
+        with self._lock:
+            if not self.plugins.get(agent_id)["enabled"]:
+                raise LauncherError(f"{name} is disabled. Enable it in Customize interface first.")
+            if (self._state["command"] != "server" or not self._state["ready"]
+                    or self._state["phase"] != "running" or self._process is None
+                    or self._process.poll() is not None):
+                raise LauncherError(f"Start an API Server before opening {name}.")
+            bind_host = "127.0.0.1" if _is_loopback_host(launcher_host) else "0.0.0.0"
+            try:
+                return agent.start(self._state, self._service_api_key, bind_host, browser_origin, install=install)
+            except RuntimeError as error:
+                raise LauncherError(str(error)) from error
 
     def download_defaults(self) -> Dict[str, Any]:
         model_id = DEFAULT_MODELSCOPE_MODEL_ID
@@ -888,6 +929,7 @@ class LauncherRuntime:
                     f"Service port {port_host}:{config.port.strip()} is already in use."
                 )
             self._close_webui_locked()
+            self._stop_native_agents()
             self._generation += 1
             self._service_api_key = api_key
             generation = self._generation
@@ -1120,6 +1162,7 @@ class LauncherRuntime:
             if generation != self._generation:
                 return
             self._close_webui_locked()
+            self._stop_native_agents()
             stopping = self._stopping_generation == generation
             command = self._state.get("command", "server")
             service_name = "WebUI" if command == "webui" else "Model service"
@@ -1143,6 +1186,7 @@ class LauncherRuntime:
     def stop(self) -> Dict[str, Any]:
         with self._lock:
             self._close_webui_locked()
+            self._stop_native_agents()
             process = self._process
             generation = self._generation
             if process is None or process.poll() is not None:
@@ -1208,6 +1252,7 @@ class LauncherRuntime:
             timer.start()
 
     def close(self):
+        self._stop_native_agents()
         self._agent_installer.close()
         self.stop_download()
         self.stop()
@@ -1895,6 +1940,7 @@ def create_launcher_app(
             response.headers["Content-Security-Policy"] = (
                 "default-src 'self'; script-src 'self'; style-src 'self'; "
                 "img-src 'self' data: blob:; media-src 'self' data: blob:; "
+                f"frame-src 'self' http://{request.url.hostname}:*; "
                 "connect-src 'self'; object-src 'none'; "
                 "base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
             )
@@ -1939,6 +1985,76 @@ def create_launcher_app(
     @app.get("/api/agent-runtime")
     async def agent_runtime_state():
         return runtime._agent_installer.state()
+
+    @app.get("/api/harness")
+    async def harness_state(request: Request):
+        try:
+            return runtime.harness.state_for_browser(str(request.base_url))
+        except RuntimeError as error:
+            raise LauncherError(str(error)) from error
+
+    @app.post("/api/harness/open")
+    async def open_harness(request: Request):
+        return await run_in_threadpool(runtime.open_harness, launcher_host, str(request.base_url))
+
+    @app.post("/api/harness/install")
+    async def install_harness(request: Request):
+        return await run_in_threadpool(runtime.open_harness, launcher_host, str(request.base_url), install=True)
+
+    @app.post("/api/harness/stop")
+    async def stop_harness():
+        return await run_in_threadpool(runtime.harness.stop)
+
+    def native_agent(agent_id):
+        if agent_id not in {"opencode", "codex"}:
+            raise LauncherError("Unknown agent.")
+        return getattr(runtime, agent_id)
+
+    @app.get("/api/agents/{agent_id}")
+    async def agent_state(agent_id: str, request: Request):
+        try:
+            return native_agent(agent_id).state_for_browser(str(request.base_url))
+        except RuntimeError as error:
+            raise LauncherError(str(error)) from error
+
+    @app.post("/api/agents/{agent_id}/open")
+    async def open_agent(agent_id: str, request: Request):
+        native_agent(agent_id)
+        return await run_in_threadpool(runtime.open_agent, agent_id, launcher_host, str(request.base_url))
+
+    @app.post("/api/agents/{agent_id}/install")
+    async def install_agent(agent_id: str, request: Request):
+        native_agent(agent_id)
+        return await run_in_threadpool(runtime.open_agent, agent_id, launcher_host, str(request.base_url), install=True)
+
+    @app.post("/api/agents/{agent_id}/stop")
+    async def stop_agent(agent_id: str):
+        return await run_in_threadpool(native_agent(agent_id).stop)
+
+    @app.get("/api/agents/codex/events")
+    async def codex_events(after: int = 0, epoch: str = ""):
+        return runtime.codex.events(after, epoch)
+
+    async def codex_operation(request, operation):
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise LauncherError("Expected a JSON object.")
+        if not runtime.plugins.get("codex")["enabled"]:
+            raise LauncherError("Codex is disabled.")
+        try:
+            if operation == "rpc":
+                return await run_in_threadpool(runtime.codex.rpc, payload.get("method"), payload.get("params", {}))
+            return await run_in_threadpool(runtime.codex.respond, payload.get("id"), payload.get("result"))
+        except RuntimeError as error:
+            raise LauncherError(str(error)) from error
+
+    @app.post("/api/agents/codex/rpc")
+    async def codex_rpc(request: Request):
+        return await codex_operation(request, "rpc")
+
+    @app.post("/api/agents/codex/respond")
+    async def codex_respond(request: Request):
+        return await codex_operation(request, "respond")
 
     @app.post("/api/agent-runtime/install")
     async def install_agent_runtime():

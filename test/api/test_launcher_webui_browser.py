@@ -144,6 +144,994 @@ class LauncherWebUIBrowserTest(unittest.TestCase):
         expect(self.page.locator('#profile-browser')).to_be_visible()
         self.assertIsNotNone(self.runtime._process)
 
+    def test_native_agents_install_only_after_click_and_use_plugin_management(self):
+        self.page.clock.resume()
+        for agent, name in (("opencode", "OpenCode"), ("codex", "Codex")):
+            state = {"phase":"stopped", "installed":False, "sessionId":"", "url":"", "error":""}
+            def start(*args, **kwargs):
+                self.assertTrue(kwargs['install'])
+                state.update(phase='installing', sessionId='model-a', stage='download', done=1048576, total=4194304)
+                return dict(state)
+            def stop():
+                state.update(phase='stopped', sessionId='', error='')
+                return dict(state)
+            runtime = getattr(self.runtime, agent)
+            with patch.object(runtime, 'state', side_effect=lambda:dict(state)), patch.object(
+                    runtime, 'start', side_effect=start) as opening, patch.object(runtime, 'stop', side_effect=stop):
+                self.page.locator(f'[data-view-button="{agent}"]').click()
+                expect(self.page.locator(f'#{agent}-retry')).to_have_text(f'Install and open {name}')
+                opening.assert_not_called()
+                self.page.locator('[data-view-button="launch"]').click()
+                self.page.locator(f'[data-view-button="{agent}"]').click()
+                opening.assert_not_called()
+                self.page.locator(f'#{agent}-retry').click()
+                expect(self.page.locator(f'#{agent}-progress-detail')).to_have_text('1.0 / 4.0 MiB')
+                self.page.locator('[data-view-button="launch"]').click()
+                self.page.locator(f'[data-view-button="{agent}"]').click()
+                expect(self.page.locator(f'#{agent}-progress')).to_be_visible()
+                self.screenshot(f'{agent}-manual-install')
+                self.page.locator(f'#{agent}-stop').click()
+                expect(self.page.locator(f'#{agent}-progress')).to_be_hidden()
+                self.assertEqual(opening.call_count, 1)
+                self.runtime.plugins.set_enabled(agent, False)
+                self.runtime.plugins.set_enabled(agent, True)
+                self.assertEqual(opening.call_count, 1)
+
+    def test_agent_groups_and_runtime_management_without_model_service(self):
+        from pathlib import Path
+        from fastllm_pytools import harness_install, launcher_agent_install
+        from fastllm_pytools.launcher_harness import HarnessRuntime
+        from fastllm_pytools.launcher_codex import CodexRuntime
+        from fastllm_pytools.launcher_opencode import OpenCodeRuntime
+        from test_launcher_agent_management import installed_files
+
+        self.page.clock.resume()
+        self.runtime._process = None
+        self.runtime._state.update(phase='stopped', ready=False, sessionId='')
+        for factory, agent in ((HarnessRuntime, 'harness'), (OpenCodeRuntime, 'opencode'), (CodexRuntime, 'codex')):
+            setattr(self.runtime, agent, factory(Path(self.temp.name) / agent))
+        released = threading.Event()
+        self.addCleanup(released.set)
+
+        def install(directory, *args, upgrade=False):
+            agent = directory.name
+            progress, cancelled = args[-2:]
+            progress('download', 1, 4)
+            while not released.wait(.02):
+                if cancelled.is_set():
+                    raise RuntimeError('cancelled')
+            installed_files(directory / 'runtime', agent, getattr(self.runtime, agent)._runtime_spec()['version'] if upgrade else 'old')
+
+        with patch('shutil.which', return_value=None), \
+                patch.object(harness_install, 'install_runtime', side_effect=install), \
+                patch.object(launcher_agent_install, 'install_runtime', side_effect=install):
+            navigation = self.page.locator('.app-shell > .sidebar > .navigation')
+            expect(navigation.locator('[role="heading"]')).to_have_text(['Model management', 'agent'])
+            self.assertEqual(navigation.locator('[data-view-button]').evaluate_all('(nodes) => nodes.map(n => n.dataset.viewButton)'),
+                             ['launch', 'download', 'logs', 'hardware', 'webui', 'harness', 'opencode', 'codex'])
+            for button in navigation.locator('[data-view-button]').all():
+                expect(button).to_be_in_viewport(ratio=1)
+            expect(self.page.locator('#view-webui [data-manage-agent]')).to_have_count(0)
+            navigation.locator('[data-manage-agent]').click()
+            manager = self.page.locator('.plugin-runtime-manager')
+            expect(manager).to_be_visible()
+            expect(manager.locator('[data-agent] option')).to_have_count(3)
+            manager.locator('[data-operation="install"]').click()
+            expect(manager.locator('[data-status]')).to_have_text('Installing')
+            expect(manager.locator('[data-progress]')).to_have_attribute('value', '1')
+            expect(manager.locator('[data-operation="upgrade"]')).to_be_disabled()
+            manager.locator('[data-close]').click()
+            navigation.locator('[data-manage-agent]').click()
+            expect(manager.locator('[data-status]')).to_have_text('Installing')
+            manager.locator('[data-operation="cancel"]').click()
+            expect(manager.locator('[data-status]')).to_have_text('Not installed')
+            released.set()
+            self.page.on('dialog', lambda dialog: dialog.accept())
+            for agent in ('harness', 'opencode', 'codex'):
+                manager.locator('[data-agent]').select_option(agent)
+                manager.locator('[data-operation="install"]').click()
+                expect(manager.locator('[data-version]')).to_contain_text('Private runtime · old')
+                manager.locator('[data-operation="upgrade"]').click()
+                expect(manager.locator('[data-version]')).to_contain_text('Private runtime · ' + getattr(self.runtime, agent)._runtime_spec()['version'])
+                workspace = getattr(self.runtime, agent).directory / 'workspace'
+                workspace.mkdir(); (workspace / 'keep.txt').write_text('keep me')
+                manager.locator('[data-operation="remove"]').click()
+                expect(manager.locator('[data-status]')).to_have_text('Not installed')
+                self.assertEqual((workspace / 'keep.txt').read_text(), 'keep me')
+                expect(manager.locator('[data-operation="remove"]')).to_be_disabled()
+            manager.locator('[data-close]').click()
+            self.page.locator('[data-view-button="codex"]').click()
+            expect(self.page.locator('.management-label')).to_have_text('agent')
+            self.page.locator('#view-codex [data-manage-agent]').click()
+            expect(manager.locator('[data-agent]')).to_have_value('codex')
+            self.page.set_viewport_size({'width':390, 'height':844})
+            expect(manager).to_be_visible()
+            box = manager.bounding_box()
+            self.assertGreaterEqual(box['x'], 0)
+            self.assertLessEqual(box['x'] + box['width'], 390)
+            self.screenshot('agent-management-mobile')
+            manager.locator('[data-close]').click()
+            self.page.locator('#language-select').select_option('zh-CN')
+            expect(navigation.locator('[role="heading"]')).to_have_text(['模型管理', 'agent'])
+            navigation.locator('[data-manage-agent]').click()
+            expect(manager.locator('h2')).to_have_text('agent 管理')
+            self.assertIsNone(self.runtime._process)
+
+    def test_codex_stream_approval_drafts_and_reload_use_app_server(self):
+        from pathlib import Path
+        from fastllm_pytools.launcher_codex import CodexRuntime
+        from test_launcher_agents import FAKE_CODEX
+        self.page.clock.resume()
+        self.runtime.codex = CodexRuntime(Path(self.temp.name) / 'codex')
+        script = Path(self.temp.name) / 'codex.py'; script.write_text(FAKE_CODEX)
+        with patch.object(self.runtime.codex, '_command', return_value=[sys.executable, str(script)]):
+            self.page.locator('[data-view-button="codex"]').click()
+            expect(self.page.locator('#codex-content')).to_be_visible()
+            self.page.locator('.codex-session[data-thread-id="thread-a"]').click()
+            self.page.locator('#codex-prompt').fill('Create a small file')
+            self.page.locator('#codex-send').click()
+            expect(self.page.locator('#codex-messages')).to_contain_text('Hello')
+            approval = self.page.locator('.codex-approval')
+            expect(approval).to_contain_text('echo hello')
+            self.screenshot('codex-command-approval')
+            approval.get_by_role('button', name='Allow once', exact=True).click()
+            expect(self.page.locator('#codex-messages')).to_contain_text('Hello complete')
+            expect(approval).to_have_count(0)
+            self.page.locator('#codex-prompt').fill('Draft for another turn')
+            self.page.locator('[data-view-button="launch"]').click()
+            self.page.locator('[data-view-button="codex"]').click()
+            expect(self.page.locator('#codex-prompt')).to_have_value('Draft for another turn')
+            process = self.runtime.codex._process
+            self.page.reload()
+            self.page.locator('[data-view-button="codex"]').click()
+            expect(self.page.locator('#codex-prompt')).to_have_value('Draft for another turn')
+            expect(self.page.locator('#codex-messages')).to_contain_text('Hello complete')
+            self.assertIs(self.runtime.codex._process, process)
+            self.screenshot('codex-session-restored')
+            self.page.set_viewport_size({'width':390, 'height':844})
+            self.screenshot('codex-mobile')
+            self.page.locator('#codex-stop').click()
+            expect(self.page.locator('#codex-content')).to_be_hidden()
+
+    def test_codex_workspace_picker_selects_server_directory_and_keeps_model_picker_independent(self):
+        from pathlib import Path
+        from fastllm_pytools.launcher_codex import CodexRuntime
+        from test_launcher_agents import FAKE_CODEX
+        self.page.clock.resume()
+        self.runtime.codex = CodexRuntime(Path(self.temp.name) / 'codex')
+        project = Path(self.temp.name) / '项目 workspace'; project.mkdir()
+        nested = project / 'nested'; nested.mkdir()
+        ordinary_file = project / 'notes.txt'; ordinary_file.write_text('not a directory')
+        script = Path(self.temp.name) / 'codex.py'
+        script.write_text(FAKE_CODEX.replace("method=request.get('method')", """method=request.get('method')
+    if method == 'thread/start':
+        thread['cwd'] = request['params']['cwd']
+        Path(os.environ['CODEX_HOME'], 'thread-cwd').write_text(thread['cwd'])"""))
+        with patch.object(self.runtime.codex, '_command', return_value=[sys.executable, str(script)]):
+            self.page.locator('[data-view-button="codex"]').click()
+            workspace = self.page.locator('#codex-workspace')
+            browse = self.page.locator('#codex-browse-workspace')
+            expect(browse).to_be_enabled()
+            workspace.fill(str(project))
+            self.page.locator('#codex-prompt').fill('Preserve my draft')
+            browse.click()
+            picker = self.page.locator('#folder-picker-modal')
+            expect(self.page.locator('#folder-picker-title')).to_have_text('Choose a workspace folder')
+            expect(picker.locator('.file-icon')).to_have_count(0)
+            picker.locator('.folder-picker-entry').filter(has_text='nested').click()
+            expect(self.page.locator('#folder-picker-current')).to_have_value(str(nested))
+            self.page.locator('#folder-picker-up').click()
+            expect(self.page.locator('#folder-picker-current')).to_have_value(str(project))
+            self.screenshot('codex-workspace-picker')
+            self.page.keyboard.press('Escape')
+            expect(picker).to_be_hidden(); expect(browse).to_be_focused()
+            expect(workspace).to_have_value(str(project))
+            browse.click()
+            # Typing a file path still selects its containing directory in this mode.
+            self.page.locator('#folder-picker-current').fill(str(ordinary_file))
+            self.page.locator('#folder-picker-current').press('Enter')
+            expect(self.page.locator('#folder-picker-current')).to_have_value(str(project))
+            expect(self.page.locator('#folder-picker-select')).to_have_text('Select this folder')
+            self.page.locator('#folder-picker-select').click()
+            expect(workspace).to_have_value(str(project)); expect(workspace).to_be_focused()
+            expect(self.page.locator('#codex-prompt')).to_have_value('Preserve my draft')
+            self.page.locator('#codex-prompt').press('Enter')
+            expect(self.page.locator('.codex-session.active')).to_have_count(1)
+            self.assertEqual((self.runtime.codex.directory / 'home/thread-cwd').read_text(), str(project.resolve()))
+            expect(self.page.locator('#codex-session-workspace')).to_have_text(str(project))
+            expect(self.page.locator('#codex-workspace-setup')).to_be_hidden()
+            self.page.reload()
+            self.page.locator('[data-view-button="codex"]').click()
+            expect(self.page.locator('#codex-session-workspace')).to_have_text(str(project))
+            self.page.locator('[data-view-button="launch"]').click()
+            self.page.locator('#new-profile').click()
+            self.page.locator('[data-config-mode][value="custom"]').check()
+            self.page.locator('#model-path').fill(str(project))
+            self.page.locator('#choose-model-folder').click()
+            expect(self.page.locator('#folder-picker-title')).to_have_text('Choose a model file or folder')
+            picker.locator('.folder-picker-entry').filter(has_text='notes.txt').click()
+            expect(self.page.locator('#folder-picker-select')).to_have_text('Select this file')
+            self.page.locator('#folder-picker-select').click()
+            expect(self.page.locator('#model-path')).to_have_value(str(ordinary_file))
+            expect(workspace).to_have_value(str(project))
+
+    def start_codex_projects(self):
+        from pathlib import Path
+        from fastllm_pytools.launcher_codex import CodexRuntime
+        self.page.clock.resume()
+        projects = [Path(self.temp.name) / name for name in ('项目 A', 'project B')]
+        for project in projects:
+            project.mkdir()
+        self.runtime.codex = CodexRuntime(Path(self.temp.name) / 'codex')
+        script = Path(self.temp.name) / 'codex-projects.py'
+        script.write_text('projects = ' + repr([str(path) for path in projects]) + '\n' + '''
+import json, os, sys
+from pathlib import Path
+def send(message):
+    print(json.dumps(message), flush=True)
+def event(method, thread, **params):
+    send({'method':method, 'params':dict(threadId=thread['id'], **params)})
+threads = {str(index):dict(id=str(index), cwd=projects[project], name=name, turns=[], updatedAt=index)
+           for index, project, name in ((1, 0, 'Saved A'), (2, 0, 'Another A'), (3, 1, 'Saved B'))}
+for line in sys.stdin:
+    request = json.loads(line)
+    with Path(os.environ['CODEX_HOME'], 'requests.jsonl').open('a') as log:
+        log.write(json.dumps(request) + '\\n')
+    method, params = request.get('method'), request.get('params', {})
+    if method == 'initialized': continue
+    result = {}
+    if method == 'thread/start':
+        key = str(len(threads) + 1)
+        threads[key] = dict(id=key, cwd=params['cwd'], name='New task', turns=[], updatedAt=len(threads)+1)
+        result = {'thread':threads[key]}
+    if method in ('thread/read', 'thread/resume'):
+        result = {'thread':threads[params['threadId']]}
+    if method == 'thread/list':
+        result = {'data':[thread for thread in threads.values() if not thread.get('archived')
+                          and params.get('searchTerm', '').lower() in thread['name'].lower()], 'nextCursor':None}
+    if method == 'thread/archive': threads[params['threadId']]['archived'] = True
+    if method == 'turn/start':
+        thread = threads[params['threadId']]
+        key = thread['id'] + '-' + str(len(thread['turns']))
+        turn = dict(id=key, status='inProgress', items=[
+            dict(id='user-'+key, type='userMessage', content=params['input']),
+            dict(id='agent-'+key, type='agentMessage', text='**Reply** from ' + thread['cwd'])])
+        thread['turns'].append(turn)
+        event('turn/started', thread, turn=turn)
+        for item in turn['items']: event('item/started', thread, turnId=key, item=item)
+        result = {'turn':turn}
+    if method == 'turn/interrupt':
+        thread = threads[params['threadId']]
+        turn = thread['turns'][-1]; turn['status'] = 'completed'
+        event('turn/completed', thread, turn=turn)
+    send({'id':request['id'], 'result':result})
+''')
+        command = patch.object(self.runtime.codex, '_command', return_value=[sys.executable, str(script)])
+        command.start(); self.addCleanup(command.stop)
+        self.page.locator('[data-view-button="codex"]').click()
+        expect(self.page.locator('.codex-session')).to_have_count(3)
+        return projects
+
+    def test_codex_reasoning_effort_is_sent_and_remembered_per_session(self):
+        def metadata(service, api_key):
+            return dict(service, modelMetadata={"supported_reasoning_efforts": ["low", "medium", "xhigh"],
+                                               "default_reasoning_effort": "xhigh"})
+        with patch('fastllm_pytools.launcher_agent_runtime.with_model_metadata', side_effect=metadata):
+            self.start_codex_projects()
+        effort = self.page.locator('#codex-effort')
+        expect(effort).to_be_enabled(); expect(effort).to_have_value('xhigh')
+        self.assertEqual(effort.locator('option').evaluate_all('(nodes) => nodes.map(n => n.value)'),
+                         ['low', 'medium', 'xhigh'])
+        self.page.locator('[data-thread-id="1"]').click()
+        effort.select_option('low')
+        self.page.locator('[data-thread-id="3"]').click()
+        expect(effort).to_have_value('xhigh')
+        effort.select_option('medium')
+        self.page.locator('[data-thread-id="1"]').click()
+        expect(effort).to_have_value('low')
+        self.page.locator('#codex-prompt').fill('Check reasoning')
+        self.page.locator('#codex-prompt').press('Enter')
+        expect(self.page.locator('#codex-messages')).to_contain_text('Reply')
+        expect(effort).to_be_disabled()
+        self.page.locator('#codex-cancel').click()
+        expect(effort).to_be_enabled()
+        self.page.locator('#codex-new').click()
+        expect(effort).to_have_value('xhigh')
+        effort.select_option('medium')
+        self.page.locator('#codex-prompt').fill('New conversation effort')
+        self.page.locator('#codex-prompt').press('Enter')
+        expect(self.page.locator('[data-thread-id="4"]')).to_have_class('codex-session active')
+        expect(self.page.locator('#codex-messages')).to_contain_text('Reply')
+        expect(effort).to_have_value('medium')
+        self.page.locator('#codex-cancel').click()
+        self.page.reload()
+        self.page.locator('[data-view-button="codex"]').click()
+        expect(effort).to_have_value('medium')
+        self.page.locator('[data-thread-id="1"]').click()
+        expect(effort).to_have_value('low')
+        self.screenshot('codex-reasoning-light')
+        self.page.locator('#theme-select').select_option('dark')
+        self.screenshot('codex-reasoning-dark')
+        self.page.set_viewport_size({'width':390, 'height':844})
+        expect(effort).to_be_visible()
+        expect(self.page.locator('#codex-send')).to_be_visible()
+        self.assertTrue(self.page.evaluate('document.documentElement.scrollWidth <= innerWidth'))
+        self.screenshot('codex-reasoning-mobile')
+        requests = [json.loads(line) for line in (self.runtime.codex.directory / 'home/requests.jsonl').read_text().splitlines()]
+        self.assertEqual([(r['params']['threadId'], r['params']['effort']) for r in requests
+                          if r.get('method') == 'turn/start'], [('1', 'low'), ('4', 'medium')])
+
+    def test_codex_unknown_model_disables_effort_with_explanation(self):
+        self.start_codex_projects()
+        effort = self.page.locator('#codex-effort')
+        expect(effort).to_be_disabled()
+        expect(effort).to_have_value('')
+        expect(effort).to_have_attribute('title', 'This model does not advertise adjustable reasoning effort.')
+
+    def test_codex_groups_threads_by_workspace_and_restores_bound_directory(self):
+        project_a, project_b = self.start_codex_projects()
+        group_a = self.page.locator('.codex-project').filter(has=self.page.locator('[data-thread-id="1"]'))
+        group_b = self.page.locator('.codex-project').filter(has=self.page.locator('[data-thread-id="3"]'))
+        expect(self.page.locator('.codex-project')).to_have_count(2)
+        expect(group_a.locator('.codex-session')).to_have_count(2)
+        expect(group_b.locator('.codex-session')).to_have_count(1)
+        prompt = self.page.locator('#codex-prompt')
+        directory = self.page.locator('#codex-session-workspace')
+        setup = self.page.locator('#codex-workspace-setup')
+        self.page.locator('[data-thread-id="1"]').click()
+        expect(directory).to_have_text(str(project_a)); expect(setup).to_be_hidden()
+        prompt.fill('Draft in A')
+        self.page.locator('[data-thread-id="3"]').click()
+        expect(directory).to_have_text(str(project_b)); expect(prompt).to_have_value('')
+        prompt.fill('Draft in B')
+        self.page.locator('[data-thread-id="1"]').click()
+        expect(prompt).to_have_value('Draft in A')
+        group_a.locator('.codex-project-new').click()
+        expect(setup).to_be_visible(); expect(directory).to_have_text(str(project_a))
+        prompt.fill('New draft in A')
+        group_b.locator('.codex-project-new').click()
+        expect(prompt).to_have_value(''); expect(directory).to_have_text(str(project_b))
+        prompt.fill('New task in B')
+        group_a.locator('.codex-project-new').click()
+        expect(prompt).to_have_value('New draft in A')
+        group_b.locator('.codex-project-new').click()
+        expect(prompt).to_have_value('New task in B')
+        expect(self.page.locator('.codex-session')).to_have_count(3)
+        prompt.press('Enter')
+        expect(self.page.locator('[data-thread-id="4"]')).to_have_class('codex-session active')
+        expect(self.page.locator('#codex-messages')).to_contain_text('Reply from ' + str(project_b))
+        expect(setup).to_be_hidden(); expect(directory).to_have_text(str(project_b))
+        expect(group_b.locator('.codex-session')).to_have_count(2)
+        self.page.locator('#codex-cancel').click()
+        expect(self.page.locator('#codex-send')).to_be_enabled()
+        self.screenshot('codex-projects-light')
+        self.page.reload()
+        self.page.locator('[data-view-button="codex"]').click()
+        expect(directory).to_have_text(str(project_b)); expect(setup).to_be_hidden()
+        expect(self.page.locator('#codex-messages')).to_contain_text('Reply from ' + str(project_b))
+        self.page.locator('#codex-archive').click()
+        expect(setup).to_be_visible(); expect(directory).to_have_text(str(project_b))
+        expect(self.page.locator('.codex-session')).to_have_count(3)
+        self.page.locator('[data-thread-id="1"]').click()
+        expect(prompt).to_have_value('Draft in A'); expect(directory).to_have_text(str(project_a))
+        self.page.locator('#codex-new').click()
+        expect(prompt).to_have_value('New draft in A')
+        self.page.locator('#codex-workspace').fill(str(project_a / 'missing'))
+        prompt.press('Enter')
+        expect(self.page.locator('#codex-chat-error')).to_be_visible()
+        expect(self.page.locator('.codex-session.active')).to_have_count(0)
+        expect(prompt).to_have_value('New draft in A')
+        self.page.locator('[data-thread-id="3"]').click()
+        expect(prompt).to_have_value('Draft in B'); expect(directory).to_have_text(str(project_b))
+        expect(self.page.locator('#codex-chat-error')).to_be_hidden()
+        self.page.locator('#codex-search').fill('Saved A')
+        expect(self.page.locator('.codex-project')).to_have_count(1)
+        expect(self.page.locator('.codex-session')).to_have_count(1)
+        expect(directory).to_have_text(str(project_b))
+        log = self.runtime.codex.directory / 'home/requests.jsonl'
+        requests = [json.loads(line) for line in log.read_text().splitlines()]
+        starts = [r['params'] for r in requests if r.get('method') == 'thread/start']
+        self.assertEqual([params['cwd'] for params in starts], [str(project_b)])
+        turns = [r['params'] for r in requests if r.get('method') == 'turn/start']
+        self.assertEqual([params['threadId'] for params in turns], ['4'])
+        for request in requests:
+            if request.get('method') in ('thread/resume', 'turn/start'):
+                self.assertNotIn('cwd', request['params'])
+
+    def test_codex_directory_changes_restore_drafts_without_overwriting_other_projects(self):
+        project_a, project_b = self.start_codex_projects()
+        project_c = project_a.parent / 'new project'; project_c.mkdir()
+        group_a = self.page.locator('.codex-project').filter(has=self.page.locator('[data-thread-id="1"]'))
+        group_b = self.page.locator('.codex-project').filter(has=self.page.locator('[data-thread-id="3"]'))
+        prompt = self.page.locator('#codex-prompt')
+        workspace = self.page.locator('#codex-workspace')
+        group_a.locator('.codex-project-new').click(); prompt.fill('Draft for A')
+        group_b.locator('.codex-project-new').click(); prompt.fill('Draft for B')
+        group_a.locator('.codex-project-new').click()
+        expect(prompt).to_have_value('Draft for A')
+
+        # A directly entered directory must restore B before persisting its input.
+        workspace.fill(str(project_b))
+        expect(prompt).to_have_value('Draft for B')
+        expect(self.page.locator('#codex-session-workspace')).to_have_text(str(project_b))
+        prompt.fill('Edited draft for B')
+
+        # The folder dialog dispatches the same input event after a selection.
+        self.page.locator('#codex-browse-workspace').click()
+        self.page.locator('#folder-picker-current').fill(str(project_a))
+        self.page.locator('#folder-picker-current').press('Enter')
+        expect(self.page.locator('#folder-picker-select')).to_be_enabled()
+        self.page.locator('#folder-picker-select').click()
+        expect(workspace).to_have_value(str(project_a))
+        expect(prompt).to_have_value('Draft for A')
+        saved = json.loads(self.page.evaluate('localStorage.getItem("ftllm.codex.sessions")'))['drafts']
+        self.assertEqual(saved['workspace:' + str(project_a)], 'Draft for A')
+        self.assertEqual(saved['workspace:' + str(project_b)], 'Edited draft for B')
+
+        # A new destination carries the input, while a deliberately empty saved
+        # draft must stay empty when revisited from a different directory.
+        workspace.fill(str(project_c))
+        expect(prompt).to_have_value('Draft for A')
+        prompt.fill('Draft for C')
+        workspace.fill(str(project_b))
+        expect(prompt).to_have_value('Edited draft for B')
+        prompt.clear()
+        workspace.fill(str(project_a))
+        expect(prompt).to_have_value('Draft for A')
+        workspace.fill(str(project_b))
+        expect(prompt).to_have_value('')
+        self.page.reload()
+        self.page.locator('[data-view-button="codex"]').click()
+        expect(workspace).to_be_enabled()
+        expect(workspace).to_have_value(str(project_b))
+        expect(prompt).to_have_value('')
+        workspace.fill(str(project_c))
+        expect(prompt).to_have_value('Draft for C')
+        workspace.fill(str(project_a))
+        expect(prompt).to_have_value('Draft for A')
+
+    def test_codex_enter_respects_composition_and_messages_align_by_role(self):
+        project_a, _ = self.start_codex_projects()
+        self.page.locator('[data-thread-id="1"]').click()
+        expect(self.page.locator('#codex-send')).to_be_enabled()
+        prompt = self.page.locator('#codex-prompt')
+        prompt.fill('First line'); prompt.press('Shift+Enter'); prompt.type('第二行')
+        expect(prompt).to_have_value('First line\n第二行')
+        prompt.dispatch_event('compositionstart')
+        prompt.press('Enter')
+        prompt.dispatch_event('keydown', {'key':'Enter', 'isComposing':True})
+        prompt.dispatch_event('compositionend')
+        prompt.dispatch_event('keydown', {'key':'Enter', 'keyCode':229})
+        prompt.dispatch_event('keydown', {'key':'Enter', 'repeat':True})
+        expect(self.page.locator('#codex-messages .userMessage')).to_have_count(0)
+        # The composition confirmation can insert a line break in a synthetic event;
+        # sending must still submit exactly the current text once.
+        sent = prompt.input_value()
+        prompt.press('Enter')
+        user = self.page.locator('#codex-messages .userMessage')
+        agent = self.page.locator('#codex-messages .agentMessage')
+        expect(user).to_have_count(1); expect(user).to_contain_text('第二行')
+        expect(agent.locator('.codex-markdown strong')).to_have_text('Reply')
+        prompt.fill('Next draft'); prompt.press('Enter')
+        expect(user).to_have_count(1); expect(prompt).to_have_value('Next draft')
+        for width, height, theme in ((1280, 900, 'light'), (1280, 900, 'dark'), (390, 844, 'dark')):
+            self.page.set_viewport_size({'width':width, 'height':height})
+            self.page.locator('#theme-select').select_option(theme)
+            user_box, agent_box = user.bounding_box(), agent.bounding_box()
+            self.assertGreater(user_box['x'], agent_box['x'])
+            self.assertGreater(user_box['x'] + user_box['width'], agent_box['x'] + agent_box['width'])
+            self.assertTrue(self.page.evaluate('document.documentElement.scrollWidth <= innerWidth'))
+            self.screenshot(f'codex-conversation-{theme}-{width}')
+        expect(self.page.locator('#codex-sidebar')).to_be_hidden()
+        self.page.locator('#codex-toggle-sessions').click()
+        expect(self.page.locator('#codex-sidebar')).to_be_visible()
+        self.page.locator('[data-thread-id="2"]').click()
+        expect(self.page.locator('#codex-sidebar')).to_be_hidden()
+        expect(self.page.locator('#codex-session-workspace')).to_have_text(str(project_a))
+        expect(prompt).to_have_value('')
+        self.page.locator('#codex-toggle-sessions').click()
+        self.page.locator('[data-thread-id="1"]').click()
+        expect(prompt).to_have_value('Next draft')
+        self.page.locator('#codex-cancel').click()
+        expect(self.page.locator('#codex-send')).to_be_enabled()
+        prompt.press('Control+Enter')
+        expect(user).to_have_count(2)
+        log = self.runtime.codex.directory / 'home/requests.jsonl'
+        requests = [json.loads(line) for line in log.read_text().splitlines()]
+        turns = [r['params'] for r in requests if r.get('method') == 'turn/start']
+        self.assertEqual([params['input'][0]['text'] for params in turns], [sent, 'Next draft'])
+        self.page.locator('#language-select').select_option('zh-CN')
+        expect(self.page.locator('.codex-compose-hint')).to_have_text('Enter 发送，Shift+Enter 换行')
+        expect(self.page.locator('#codex-toggle-sessions')).to_have_text('项目与会话')
+        self.screenshot('codex-conversation-zh-mobile')
+        self.page.set_viewport_size({'width':1280, 'height':900})
+        self.screenshot('codex-conversation-zh-dark')
+        self.page.locator('#codex-new').click()
+        expect(self.page.locator('#codex-workspace-setup')).to_be_visible()
+        expect(self.page.locator('label[for="codex-workspace"]')).to_have_text('会话工作目录')
+        self.page.locator('#theme-select').select_option('light')
+        self.screenshot('codex-new-conversation-zh-light')
+
+    def test_codex_migrates_the_old_new_conversation_draft_only_once(self):
+        # Install the legacy data after pagehide has saved the outgoing page's input.
+        self.page.add_init_script('''if (!sessionStorage.getItem('legacy-draft-seeded')) {
+            localStorage.setItem('ftllm.codex.sessions', JSON.stringify({
+                selected:'', workspace:'', drafts:{'':'Unsent draft from the previous version'}
+            }));
+            sessionStorage.setItem('legacy-draft-seeded', 'true');
+        }''')
+        self.page.reload()
+        self.start_codex_projects()
+        prompt = self.page.locator('#codex-prompt')
+        expect(prompt).to_have_value('Unsent draft from the previous version')
+        prompt.press('Enter')
+        expect(self.page.locator('#codex-messages .userMessage')).to_contain_text('Unsent draft from the previous version')
+        self.page.locator('#codex-cancel').click()
+        expect(self.page.locator('#codex-send')).to_be_enabled()
+        self.page.locator('#codex-new').click()
+        expect(prompt).to_have_value('')
+        self.page.reload()
+        self.page.locator('[data-view-button="codex"]').click()
+        expect(self.page.locator('#codex-send')).to_be_enabled()
+        expect(prompt).to_have_value('')
+
+    def test_codex_slow_resume_cannot_replace_another_conversations_workspace(self):
+        project_a, project_b = self.start_codex_projects()
+        pending = []
+
+        def intercept(route):
+            payload = route.request.post_data_json
+            if payload.get('method') == 'thread/resume' and payload['params']['threadId'] == '1':
+                pending.append(route)
+            else:
+                route.continue_()
+
+        self.page.route('**/api/agents/codex/rpc', intercept)
+        self.page.locator('[data-thread-id="1"]').click()
+        expect(self.page.locator('#codex-send')).to_be_disabled()
+        expect(self.page.locator('#codex-session-workspace')).to_have_text(str(project_a))
+        self.page.locator('#codex-prompt').fill('A draft while loading')
+        self.page.locator('[data-thread-id="3"]').click()
+        expect(self.page.locator('#codex-send')).to_be_enabled()
+        self.page.locator('#codex-prompt').fill('B draft')
+        self.assertEqual(len(pending), 1)
+        with self.page.expect_response(lambda response: response.request.post_data_json.get('method') == 'thread/resume'
+                                       if response.request.url.endswith('/codex/rpc') else False):
+            pending[0].continue_()
+        # A later request completes after the stale resume response was handled.
+        self.page.locator('#codex-search').fill('Saved')
+        expect(self.page.locator('.codex-session')).to_have_count(2)
+        expect(self.page.locator('#codex-session-workspace')).to_have_text(str(project_b))
+        expect(self.page.locator('#codex-prompt')).to_have_value('B draft')
+        expect(self.page.locator('.codex-session.active')).to_have_attribute('data-thread-id', '3')
+        self.page.unroute('**/api/agents/codex/rpc', intercept)
+        self.page.locator('[data-thread-id="1"]').click()
+        expect(self.page.locator('#codex-prompt')).to_have_value('A draft while loading')
+        expect(self.page.locator('#codex-session-workspace')).to_have_text(str(project_a))
+
+    def test_codex_markdown_streaming_and_history_use_safe_renderer(self):
+        from pathlib import Path
+        from fastllm_pytools.launcher_codex import CodexRuntime
+        from test_launcher_agents import FAKE_CODEX
+        self.page.clock.resume()
+        self.runtime.codex = CodexRuntime(Path(self.temp.name) / 'codex')
+        source = ('## Markdown answer\n\n**Bold** and *italic* with `inline code`.\n\n'
+                  '| Name | Value |\n| --- | ---: |\n| **Item** | 42 |\n\n'
+                  '> Quoted **text**\n\n1. First\n   - Nested\n2. Second\n\n'
+                  '- [x] Done\n- [ ] Pending\n\n'
+                  '[Documentation](https://example.com/docs) [Unsafe](javascript:alert(1))\n\n'
+                  '<img src=x onerror=alert(1)>\n\n```html\n<h1>Streaming code</h1>')
+        script = Path(self.temp.name) / 'codex.py'
+        script.write_text(FAKE_CODEX.replace("delta='Hello'", 'delta=' + repr(source))
+            .replace("'Hello complete'", repr(source + '\n```'))
+            .replace("event('turn/started',turn=turn)", """event('turn/started',turn=turn)
+        event('item/started',turnId='turn-a',item={'id':'user-a','type':'userMessage','content':[{'type':'text','text':'**User text**'}]})
+        event('item/started',turnId='turn-a',item={'id':'reason-a','type':'reasoning','summary':['**Thinking**']})
+        event('item/started',turnId='turn-a',item={'id':'command-a','type':'commandExecution','command':'echo test','aggregatedOutput':'**plain output** <img src=x onerror=alert(1)>'})"""))
+        with patch.object(self.runtime.codex, '_command', return_value=[sys.executable, str(script)]):
+            self.page.locator('[data-view-button="codex"]').click()
+            self.page.locator('.codex-session[data-thread-id="thread-a"]').click()
+            self.page.locator('#codex-prompt').fill('Show Markdown')
+            self.page.locator('#codex-send').click()
+            message = self.page.locator('#codex-messages .agentMessage .codex-markdown')
+            expect(message.locator('h2')).to_have_text('Markdown answer')
+            expect(message.locator('th')).to_have_text(['Name', 'Value'])
+            expect(message.locator('td').nth(1)).to_have_css('text-align', 'right')
+            expect(message.locator('blockquote strong')).to_have_text('text')
+            expect(message.locator('ol ul li')).to_have_text('Nested')
+            expect(message.locator('input[type="checkbox"]')).to_have_count(2)
+            expect(message.locator('input[type="checkbox"]').first).to_be_checked()
+            expect(message.locator('a')).to_have_count(1)
+            expect(message.locator('a')).to_have_attribute('rel', 'noopener noreferrer')
+            expect(message.locator('img,script')).to_have_count(0)
+            expect(message.locator('.code-block code')).to_have_text('<h1>Streaming code</h1>')
+            expect(self.page.locator('#codex-messages .userMessage .codex-markdown strong')).to_have_text('User text')
+            self.page.locator('#codex-messages .reasoning summary').click()
+            expect(self.page.locator('#codex-messages .reasoning .codex-markdown strong')).to_have_text('Thinking')
+            command = self.page.locator('#codex-messages .commandExecution')
+            command.locator('summary').click()
+            expect(command.locator('pre')).to_contain_text('**plain output**')
+            expect(command.locator('strong,img')).to_have_count(0)
+            self.context.grant_permissions(['clipboard-read', 'clipboard-write'])
+            message.locator('.copy-code').click()
+            expect(message.locator('.copy-code')).to_have_text('Copied')
+            self.assertEqual(self.page.evaluate('navigator.clipboard.readText()'), '<h1>Streaming code</h1>')
+            self.page.locator('.codex-approval').get_by_role('button', name='Allow once', exact=True).click()
+            expect(self.page.locator('#codex-send')).to_be_enabled()
+            self.page.reload()
+            self.page.locator('[data-view-button="codex"]').click()
+            expect(message.locator('h2')).to_have_text('Markdown answer')
+            expect(message.locator('.code-block code')).to_have_text('<h1>Streaming code</h1>')
+            self.screenshot('codex-markdown-light')
+            self.page.locator('#theme-select').select_option('dark')
+            expect(message).to_have_css('color', 'rgb(212, 212, 212)')
+            self.screenshot('codex-markdown-dark')
+            self.page.set_viewport_size({'width':390,'height':844})
+            self.assertTrue(self.page.evaluate('document.documentElement.scrollWidth <= innerWidth'))
+            expect(self.page.locator('#codex-session-workspace')).to_be_visible()
+            expect(self.page.locator('#codex-workspace-setup')).to_be_hidden()
+            expect(self.page.locator('#codex-toggle-sessions')).to_be_visible()
+            self.screenshot('codex-markdown-mobile')
+
+    def test_codex_markdown_failure_can_retry_without_blocking_the_launcher(self):
+        from pathlib import Path
+        from fastllm_pytools.launcher_codex import CodexRuntime
+        from test_launcher_agents import FAKE_CODEX
+        self.page.clock.resume()
+        self.runtime.codex = CodexRuntime(Path(self.temp.name) / 'codex')
+        script = Path(self.temp.name) / 'codex.py'; script.write_text(FAKE_CODEX.replace("delta='Hello'", "delta='**Hello**'"))
+        failure = lambda route: route.abort()
+        self.page.route('**/assets/webui/markdown.js?codex=*', failure)
+        with patch.object(self.runtime.codex, '_command', return_value=[sys.executable, str(script)]):
+            self.page.locator('[data-view-button="codex"]').click()
+            expect(self.page.locator('#codex-chat-error')).to_contain_text('Could not load Markdown')
+            self.page.locator('#codex-prompt').fill('Keep chatting')
+            self.page.locator('#codex-send').click()
+            message = self.page.locator('#codex-messages .agentMessage .codex-markdown')
+            expect(message).to_have_text('**Hello**')
+            expect(message.locator('strong')).to_have_count(0)
+            self.page.unroute('**/assets/webui/markdown.js?codex=*', failure)
+            self.page.locator('[data-view-button="launch"]').click()
+            self.page.locator('[data-view-button="codex"]').click()
+            expect(message.locator('strong')).to_have_text('Hello')
+            expect(self.page.locator('#codex-chat-error')).to_be_hidden()
+
+    def assert_codex_preserves_pending_draft(self, new_thread, pending_method):
+        from pathlib import Path
+        from fastllm_pytools.launcher_codex import CodexRuntime
+        from test_launcher_agents import FAKE_CODEX
+        self.page.clock.resume()
+        self.runtime.codex = CodexRuntime(Path(self.temp.name) / 'codex')
+        script = Path(self.temp.name) / 'codex.py'; script.write_text(FAKE_CODEX)
+        pending = []
+
+        def intercept(route):
+            if route.request.post_data_json.get('method') == pending_method:
+                pending.append(route)
+            else:
+                route.continue_()
+
+        with patch.object(self.runtime.codex, '_command', return_value=[sys.executable, str(script)]):
+            self.page.locator('[data-view-button="codex"]').click()
+            expect(self.page.locator('#codex-content')).to_be_visible()
+            if not new_thread:
+                self.page.locator('.codex-session[data-thread-id="thread-a"]').click()
+            self.page.route('**/api/agents/codex/rpc', intercept)
+            prompt = self.page.locator('#codex-prompt')
+            prompt.fill('First submitted message')
+            self.page.locator('#codex-send').click()
+            deadline = time.monotonic() + 5
+            while not pending and time.monotonic() < deadline:
+                self.page.wait_for_timeout(20)
+            self.assertEqual(len(pending), 1)
+            prompt.fill('New unsent draft while waiting')
+            pending[0].continue_()
+            expect(self.page.locator('#codex-messages')).to_contain_text('Hello')
+            expect(self.page.locator('#codex-send')).to_be_disabled()
+            expect(prompt).to_have_value('New unsent draft while waiting')
+            self.page.locator('.codex-approval').get_by_role('button', name='Allow once', exact=True).click()
+            expect(self.page.locator('#codex-send')).to_be_enabled()
+            expect(prompt).to_have_value('New unsent draft while waiting')
+            saved = json.loads(self.page.evaluate('localStorage.getItem("ftllm.codex.sessions")'))
+            self.assertEqual(saved['drafts']['thread-a'], 'New unsent draft while waiting')
+            self.page.unroute('**/api/agents/codex/rpc', intercept)
+            self.page.reload()
+            self.page.locator('[data-view-button="codex"]').click()
+            expect(prompt).to_have_value('New unsent draft while waiting')
+
+    def test_codex_preserves_edits_during_turn_start(self):
+        self.assert_codex_preserves_pending_draft(False, 'turn/start')
+
+    def test_codex_preserves_edits_during_first_thread_creation(self):
+        self.assert_codex_preserves_pending_draft(True, 'thread/start')
+
+    def test_codex_preserves_edits_during_first_turn_start(self):
+        self.assert_codex_preserves_pending_draft(True, 'turn/start')
+
+    def test_opencode_embeds_from_two_launcher_addresses_at_the_same_time(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from fastllm_pytools.launcher_agent_proxy import AgentProxy
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(b'<textarea id="draft"></textarea>')
+
+            def log_message(self, *args):
+                pass
+
+        upstream = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        threading.Thread(target=upstream.serve_forever, daemon=True).start()
+        self.addCleanup(upstream.server_close)
+        self.addCleanup(upstream.shutdown)
+        proxy = AgentProxy(f'http://127.0.0.1:{upstream.server_port}', 'test-password', '127.0.0.1',
+                           self.url.replace('127.0.0.1', 'localhost'))
+        self.addCleanup(proxy.stop)
+        proxy.start(threading.Event())
+        self.runtime.opencode._proxy = proxy
+        state = {'phase':'running', 'installed':True, 'sessionId':'model-a', 'url':proxy.url, 'error':''}
+        with patch.object(self.runtime.opencode, 'state', side_effect=lambda:dict(state)):
+            self.page.goto(self.url.replace('127.0.0.1', 'localhost') + '/?token=browser-key')
+            self.page.locator('[data-view-button="opencode"]').click()
+            first = self.page.frame_locator('#opencode-content iframe').locator('#draft')
+            first.fill('First browser draft')
+            other = self.context.new_page()
+            other.on('pageerror', lambda error:self.errors.append(str(error)))
+            other.on('console', lambda message:self.errors.append(message.text)
+                     if 'Content Security Policy' in message.text else None)
+            other.goto(self.url + '/?token=browser-key')
+            other.locator('[data-view-button="opencode"]').click()
+            second = other.frame_locator('#opencode-content iframe').locator('#draft')
+            second.fill('Second browser draft')
+            expect(self.page.locator('#opencode-content iframe')).to_have_attribute('src', re.compile(r'^http://localhost:'))
+            expect(other.locator('#opencode-content iframe')).to_have_attribute('src', re.compile(r'^http://127\.0\.0\.1:'))
+            self.page.wait_for_timeout(1200)
+            expect(first).to_have_value('First browser draft')
+            expect(second).to_have_value('Second browser draft')
+            other.close()
+
+    def test_opencode_theme_sync_keeps_the_frame_and_draft_and_rejects_other_senders(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from fastllm_pytools.launcher_agent_proxy import AgentProxy
+        self.page.clock.resume()
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/javascript' if self.path == '/native.js' else 'text/html')
+                self.send_header('Content-Security-Policy', "script-src 'self'; style-src 'self' 'unsafe-inline'")
+                self.end_headers()
+                if self.path == '/native.js':
+                    self.wfile.write(b'''window.bootID = Math.random();
+                    function apply(value) { document.documentElement.dataset.colorScheme = value || 'light'; }
+                    apply(localStorage.getItem('opencode-color-scheme'));
+                    window.addEventListener('storage', event => {
+                        if (event.key === 'opencode-color-scheme') apply(event.newValue);
+                    });''')
+                else:
+                    self.wfile.write(b'''<!doctype html><html><head><script defer src="/native.js"></script>
+                    <style>html,body{height:100%;margin:0}textarea{max-width:90%}</style></head>
+                    <body><textarea aria-label="Message" id="draft"></textarea></body></html>''')
+
+            def log_message(self, *args):
+                pass
+
+        upstream = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        threading.Thread(target=upstream.serve_forever, daemon=True).start()
+        self.addCleanup(upstream.server_close); self.addCleanup(upstream.shutdown)
+        proxy = AgentProxy(f'http://127.0.0.1:{upstream.server_port}', 'test-password', '127.0.0.1', self.url)
+        self.addCleanup(proxy.stop); proxy.start(threading.Event())
+        self.runtime.opencode._proxy = proxy
+        state = {'phase':'running', 'installed':True, 'sessionId':'model-a', 'url':proxy.url, 'error':''}
+        with patch.object(self.runtime.opencode, 'state', side_effect=lambda:dict(state)):
+            self.page.locator('[data-view-button="opencode"]').click()
+            frame = self.page.frame_locator('#opencode-content iframe')
+            root = frame.locator('html')
+            draft = frame.locator('#draft')
+            expect(root).to_have_attribute('data-color-scheme', 'light')
+            draft.fill('Keep this unsent message')
+            boot = root.evaluate('() => window.bootID')
+            for theme in ('dark', 'light', 'dark'):
+                self.page.locator('#theme-select').select_option(theme)
+                expect(root).to_have_attribute('data-color-scheme', theme)
+                expect(draft).to_have_value('Keep this unsent message')
+                self.assertEqual(root.evaluate('() => window.bootID'), boot)
+            # Matching message data from another window/origin cannot change the frame.
+            root.evaluate('''() => {
+                const data = {type:'ftllm:opencode-appearance', theme:'light'};
+                window.postMessage(data, location.origin);
+                window.dispatchEvent(new MessageEvent('message', {
+                    data, origin:'http://untrusted.example', source:parent
+                }));
+            }''')
+            self.page.locator('[data-view-button="launch"]').click()
+            self.page.locator('[data-view-button="opencode"]').click()
+            expect(root).to_have_attribute('data-color-scheme', 'dark')
+            expect(draft).to_have_value('Keep this unsent message')
+            self.assertEqual(root.evaluate('() => window.bootID'), boot)
+            # A fresh document also receives the current theme after native initialization.
+            root.evaluate('() => location.reload()')
+            expect(root).to_have_attribute('data-ftllm-theme', 'dark')
+            expect(root).to_have_attribute('data-color-scheme', 'dark')
+            self.page.set_viewport_size({'width':390, 'height':844})
+            expect(draft).to_be_visible()
+            self.assertTrue(root.evaluate('() => document.documentElement.scrollWidth <= innerWidth'))
+
+    def test_harness_uses_each_browser_address_and_reconnects_after_external_restart(self):
+        from pathlib import Path
+        from fastllm_pytools.launcher_harness import HarnessRuntime
+        from test_launcher_harness import FAKE_HARNESS
+        self.page.clock.resume()
+        runtime = self.runtime.harness = HarnessRuntime(Path(self.temp.name) / 'harness')
+        script = Path(self.temp.name) / 'harness.py'; script.write_text(FAKE_HARNESS)
+        localhost = self.url.replace('127.0.0.1', 'localhost')
+        with patch.object(runtime, '_command', return_value=[sys.executable, str(script)]):
+            self.page.goto(localhost + '/?token=browser-key')
+            self.page.locator('[data-view-button="harness"]').click()
+            first = self.page.frame_locator('#harness-content iframe').locator('#draft')
+            first.fill('First browser draft')
+            process = runtime._process
+            other = self.context.new_page()
+            self.addCleanup(other.close)
+            other.on('pageerror', lambda error:self.errors.append(str(error)))
+            other.on('console', lambda message:self.errors.append(message.text)
+                     if 'Content Security Policy' in message.text else None)
+            other.goto(self.url + '/?token=browser-key')
+            other.locator('[data-view-button="harness"]').click()
+            second = other.frame_locator('#harness-content iframe').locator('#draft')
+            second.fill('Second browser draft')
+            expect(self.page.locator('#harness-content iframe')).to_have_attribute('src', re.compile(r'^http://localhost:'))
+            expect(other.locator('#harness-content iframe')).to_have_attribute('src', re.compile(r'^http://127\.0\.0\.1:'))
+            expect(first).to_have_value('First browser draft')
+            self.assertIs(runtime._process, process)
+            # Both tabs miss the stopped/starting states, as can happen while
+            # they are in the background and a different client restarts Harness.
+            old = runtime.state_for_browser(localhost)
+            old_second = runtime.state_for_browser(self.url)
+            self.context.route('**/api/harness', lambda route:route.fulfill(
+                json=old if route.request.url.startswith(localhost + '/') else old_second))
+            runtime.stop()
+            runtime.start(self.runtime._state, '', '127.0.0.1', localhost)
+            deadline = time.monotonic() + 5
+            while runtime.state()['phase'] not in {'running', 'failed'} and time.monotonic() < deadline:
+                time.sleep(.02)
+            self.assertEqual(runtime.state()['phase'], 'running', runtime.state())
+            self.assertIsNot(runtime._process, process)
+            self.assertIsNotNone(process.poll())
+            self.context.unroute('**/api/harness')
+            new_first = runtime.state_for_browser(localhost)['url']
+            new_second = runtime.state_for_browser(self.url)['url']
+            self.assertNotEqual(new_first, old['url'])
+            expect(self.page.locator('#harness-content iframe')).to_have_attribute('src', new_first)
+            expect(other.locator('#harness-content iframe')).to_have_attribute('src', new_second)
+            expect(first).to_have_value('')
+            expect(second).to_have_value('')
+            first.fill('Draft after reconnect')
+            self.page.locator('[data-view-button="launch"]').click()
+            self.page.locator('[data-view-button="harness"]').click()
+            expect(first).to_have_value('Draft after reconnect')
+
+    def test_harness_embeds_below_studio_and_retains_page_when_switching_views(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(b'<textarea id="draft"></textarea><p id="isolation"></p><script>'
+                    b'try { parent.document.body; document.querySelector("p").textContent="unsafe"; }'
+                    b'catch (_) { document.querySelector("p").textContent="isolated"; }</script>')
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        state = {'phase': 'stopped', 'sessionId': '', 'url': '', 'error': '', 'installed': True}
+
+        def start(*args, **kwargs):
+            self.assertFalse(kwargs['install'])
+            state.update(phase='running', sessionId='model-a',
+                         url=f'http://127.0.0.1:{server.server_port}/')
+            return dict(state)
+
+        def stop():
+            state.update(phase='stopped', sessionId='', url='')
+            return dict(state)
+
+        with patch.object(self.runtime.harness, 'start', side_effect=start), \
+                patch.object(self.runtime.harness, 'state', side_effect=lambda: dict(state)), \
+                patch.object(self.runtime.harness, 'stop', side_effect=stop):
+            nav = self.page.locator('.navigation > [data-view-button="harness"]')
+            self.assertEqual(nav.evaluate('node => node.previousElementSibling.dataset.viewButton'), 'webui')
+            nav.click()
+            expect(self.page.locator('#harness-content iframe')).to_be_visible()
+            embedded = self.page.frame_locator('#harness-content iframe')
+            expect(embedded.locator('#isolation')).to_have_text('isolated')
+            embedded.locator('#draft').fill('Harness draft stays here')
+            self.page.locator('.navigation > [data-view-button="launch"]').click()
+            nav.click()
+            expect(embedded.locator('#draft')).to_have_value('Harness draft stays here')
+            self.page.locator('#harness-stop').click()
+            expect(self.page.locator('#harness-content iframe')).to_have_count(0)
+            self.assertIsNotNone(self.runtime._process)
+
+    def test_harness_installation_progress_survives_navigation_and_supports_cancel_retry(self):
+        state = {'phase':'stopped', 'sessionId':'', 'url':'', 'error':'', 'installed':False}
+
+        def start(*args, **kwargs):
+            self.assertTrue(kwargs['install'])
+            state.update(phase='installing', sessionId='model-a', stage='download',
+                         done=1048576, total=4194304, error='')
+            return dict(state)
+
+        def stop():
+            state.update(phase='stopped', stage='', sessionId='')
+            return dict(state)
+
+        with patch.object(self.runtime.harness, 'start', side_effect=start) as opening, \
+                patch.object(self.runtime.harness, 'state', side_effect=lambda: dict(state)), \
+                patch.object(self.runtime.harness, 'stop', side_effect=stop) as stopping:
+            opening.assert_not_called()
+            nav = self.page.locator('[data-view-button="harness"]')
+            nav.click()
+            expect(self.page.locator('#harness-retry')).to_have_text('Install and open Harness')
+            expect(self.page.locator('#harness-install-note')).to_be_visible()
+            self.page.clock.fast_forward(2100)
+            opening.assert_not_called()
+            expect(self.page.locator('#harness-progress')).to_be_hidden()
+            self.page.locator('[data-view-button="launch"]').click()
+            nav.click()
+            self.page.clock.fast_forward(1100)
+            opening.assert_not_called()
+            self.page.reload()
+            self.page.clock.install()
+            self.page.locator('[data-view-button="harness"]').click()
+            expect(self.page.locator('#harness-retry')).to_have_text('Install and open Harness')
+            self.page.clock.fast_forward(1100)
+            opening.assert_not_called()
+            self.page.locator('#harness-retry').click()
+            expect(self.page.locator('#harness-progress')).to_be_visible()
+            expect(self.page.locator('#harness-progress-stage')).to_have_text('Downloading the runtime…')
+            expect(self.page.locator('#harness-progress-detail')).to_have_text('1.0 / 4.0 MiB')
+            expect(self.page.locator('#harness-progress-bar')).to_have_attribute('value', '1048576')
+            expect(self.page.locator('#harness-install-note')).to_contain_text('450 MiB')
+            self.screenshot('harness-installing')
+            expect(self.page.locator('#harness-retry')).to_be_disabled()
+            self.page.locator('[data-view-button="launch"]').click()
+            nav.click()
+            expect(self.page.locator('#harness-progress')).to_be_visible()
+            opening.assert_called_once()
+            state.update(stage='dependencies', done=12, total=0)
+            self.page.clock.fast_forward(1100)
+            expect(self.page.locator('#harness-progress-detail')).to_have_text('12 package requests completed')
+            self.assertIsNone(self.page.locator('#harness-progress-bar').get_attribute('value'))
+            self.page.locator('#harness-stop').click()
+            expect(self.page.locator('#harness-progress')).to_be_hidden()
+            expect(self.page.locator('#harness-retry')).to_have_text('Install and open Harness')
+            stopping.assert_called_once()
+            self.page.locator('[data-view-button="launch"]').click()
+            nav.click()
+            self.page.clock.fast_forward(1100)
+            opening.assert_called_once()
+            self.page.locator('#harness-retry').click()
+            expect(self.page.locator('#harness-progress')).to_be_visible()
+            self.assertEqual(opening.call_count, 2)
+            state.update(phase='failed', error='Download failed')
+            self.page.clock.fast_forward(1100)
+            expect(self.page.locator('#harness-error')).to_have_text('Download failed')
+            expect(self.page.locator('#harness-retry')).to_have_text('Retry')
+            self.page.locator('#harness-retry').click()
+            expect(self.page.locator('#harness-progress')).to_be_visible()
+            self.assertEqual(opening.call_count, 3)
+            self.assertIsNotNone(self.runtime._process)
+
     def test_customizer_entry_icon_and_no_studio_entry(self):
         button = self.page.locator('.navigation > .plugin-manager-button')
         expect(button).to_have_text('自定义界面')
@@ -163,6 +1151,57 @@ class LauncherWebUIBrowserTest(unittest.TestCase):
         expect(self.page.locator('#webui-root .plugin-manager-button')).to_have_count(0)
         self.page.goto(self.url + '/standalone/#customize')
         expect(self.page.locator('#webui-root .plugin-manager')).to_be_visible()
+
+    def test_harness_is_managed_by_customizer_without_implicit_installation(self):
+        state = {'phase':'stopped', 'sessionId':'', 'url':'', 'error':'', 'installed':False}
+
+        def start(*args, **kwargs):
+            self.assertTrue(kwargs['install'])
+            state.update(phase='installing', sessionId='model-a', stage='dependencies', done=12, total=0)
+            return dict(state)
+
+        def stop():
+            state.update(phase='stopped', sessionId='', stage='')
+            return dict(state)
+
+        with patch.object(self.runtime.harness, 'start', side_effect=start) as opening, \
+                patch.object(self.runtime.harness, 'state', side_effect=lambda: dict(state)), \
+                patch.object(self.runtime.harness, 'stop', side_effect=stop) as stopping:
+            self.page.locator('body > .app-shell .navigation > .plugin-manager-button').click()
+            manager = self.page.locator('body > .plugin-manager')
+            manager.locator('.customizer-library > summary').click()
+            row = manager.locator('.plugin-row[data-plugin-id="harness"]')
+            expect(row.locator('.plugin-runtime-status')).to_have_text('未安装，需手动点击安装')
+            self.screenshot('harness-plugin-manager')
+            row.get_by_role('button', name='管理', exact=True).click()
+            runtime_manager = self.page.locator('.plugin-runtime-manager')
+            expect(runtime_manager).to_be_visible()
+            expect(runtime_manager.locator('[data-agent]')).to_have_value('harness')
+            opening.assert_not_called()
+            runtime_manager.locator('[data-close]').click()
+            manager.locator('.plugin-heading > button').click()
+            self.page.locator('[data-view-button="harness"]').click()
+            expect(self.page.locator('#harness-retry')).to_have_text('Install and open Harness')
+            opening.assert_not_called()
+            self.page.locator('#harness-retry').click()
+            expect(self.page.locator('#harness-progress')).to_be_visible()
+            self.page.locator('body > .app-shell .navigation > .plugin-manager-button').click()
+            expect(row.locator('.plugin-runtime-status')).to_have_text('安装中')
+            row.get_by_role('button', name='停用', exact=True).click()
+            expect(row.locator('.plugin-runtime-status')).to_have_text('已停用')
+            stopping.assert_called_once()
+            expect(row.get_by_role('button', name='管理', exact=True)).to_be_enabled()
+            row.get_by_role('button', name='启用', exact=True).click()
+            expect(row.locator('.plugin-runtime-status')).to_have_text('未安装，需手动点击安装')
+            opening.assert_called_once()
+            row.get_by_role('button', name='管理', exact=True).click()
+            expect(runtime_manager).to_be_visible()
+            runtime_manager.locator('[data-close]').click()
+            manager.locator('.plugin-heading > button').click()
+            expect(self.page.locator('#harness-retry')).to_be_enabled()
+            expect(self.page.locator('#harness-progress')).to_be_hidden()
+            opening.assert_called_once()
+            self.assertIsNotNone(self.runtime._process)
 
     def test_custom_plugin_delete_unloads_without_changing_studio_draft(self):
         self.install_test_plugin(slot='topbar')
@@ -1861,7 +2900,7 @@ document.querySelector('#counter').onclick = event => {
         self.assertEqual(self.page.locator('iframe').count(), 0)
         self.assertEqual(self.page.locator('[data-view-button]').evaluate_all(
             '(nodes) => nodes.map(node => node.dataset.viewButton)'),
-            ['launch', 'download', 'logs', 'hardware', 'webui'])
+            ['launch', 'download', 'logs', 'hardware', 'webui', 'harness', 'opencode', 'codex'])
         self.screenshot('launcher-empty')
         with patch.object(self.runtime._webui_app.state.runtime.api_client, 'stream',
                           side_effect=lambda *a, **k: iter([('**Hello**\n\n```python\nprint(1)\n```', 'Reasoning')])) as stream:

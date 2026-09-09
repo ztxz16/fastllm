@@ -2,6 +2,8 @@
   "locale": "zh-CN",
   "name": "简体中文",
   "static": {
+    "思考档位": "思考档位",
+    "模型默认": "模型默认",
     "界面主题": "界面主题",
     "浅色模式": "浅色模式",
     "黑夜模式": "黑夜模式",
@@ -233,7 +235,38 @@
     "打开工作室": "打开工作室",
     "自动配置时尝试启用内置 MTP": "自动配置时尝试启用内置 MTP",
     "这是自动配置偏好；是否实际开启，以生成的推测解码参数为准。": "这是自动配置偏好；是否实际开启，以生成的推测解码参数为准。",
-    "每轮 Draft Token 数": "每轮 Draft Token 数"
+    "每轮 Draft Token 数": "每轮 Draft Token 数",
+    "打开 Harness": "打开 Harness",
+    "停止 Harness": "停止 Harness",
+    "启动模型 API 后，即可在这里使用 DeepSeek Harness。会话和工作目录独立保存。": "启动模型 API 后，即可在这里使用 DeepSeek Harness。会话和工作目录独立保存。",
+    "点击“安装并打开 Harness”后才会下载安装独立运行环境，约占 450 MiB 磁盘空间。": "点击“安装并打开 Harness”后才会下载安装独立运行环境，约占 450 MiB 磁盘空间。",
+    "安装进度": "安装进度",
+    "使用当前模型处理编程任务，会话与工作室分别保存。": "使用当前模型处理编程任务，会话与工作室分别保存。",
+    "仅在点击安装按钮后下载独立运行环境，不修改系统安装。": "仅在点击安装按钮后下载独立运行环境，不修改系统安装。",
+    "Codex 项目与会话": "Codex 项目与会话",
+    "项目与会话": "项目与会话",
+    "服务器上的文件夹路径": "服务器上的文件夹路径",
+    "搜索 Codex 会话": "搜索 Codex 会话",
+    "加载更多": "加载更多",
+    "描述编程任务…": "描述编程任务…",
+    "Codex 消息": "Codex 消息",
+    "归档": "归档",
+    "打开 OpenCode": "打开 OpenCode",
+    "停止 OpenCode": "停止 OpenCode",
+    "打开 Codex": "打开 Codex",
+    "停止 Codex": "停止 Codex",
+    "新建会话": "新建会话",
+    "工作目录": "工作目录",
+    "搜索会话": "搜索会话",
+    "重命名": "重命名",
+    "发送": "发送",
+    "取消生成": "取消生成",
+    "管理": "管理",
+    "管理 agent": "管理 agent",
+    "会话工作目录": "会话工作目录",
+    "浏览工作目录": "浏览工作目录",
+    "选择目录后发送第一条消息，即可在该目录中新建会话。": "选择目录后发送第一条消息，即可在该目录中新建会话。",
+    "Enter 发送，Shift+Enter 换行": "Enter 发送，Shift+Enter 换行"
   },
   "messages": {
     "Pi Agent": "Pi 智能体",
@@ -568,29 +601,164 @@
     "A service is running. Saved changes apply on the next model start.": "服务正在运行。保存的修改将在下次启动模型时生效。",
     "Fix the highlighted fields before starting. You can still save an unfinished profile.": "请修正标红参数后再启动；未完成的配置仍可保存。",
     "Wait for automatic configuration to finish.": "请等待自动配置完成。",
-    "Choose a model before saving or starting.": "请选择模型后再保存或启动。"
+    "Choose a model before saving or starting.": "请选择模型后再保存或启动。",
+    "Start an API Server before opening DeepSeek Harness.": "请先启动模型 API，再打开 DeepSeek Harness。",
+    "Starting DeepSeek Harness…": "正在启动 DeepSeek Harness…",
+    "Connected to {model}": "已连接模型：{model}",
+    "DeepSeek Harness could not start.": "DeepSeek Harness 启动失败。",
+    "DeepSeek Harness is stopped.": "DeepSeek Harness 已停止。",
+    "Installing DeepSeek Harness…": "正在安装 DeepSeek Harness…",
+    "Harness is not installed. Click Install and open Harness to continue.": "Harness 尚未安装，请点击“安装并打开 Harness”。",
+    "Install and open Harness": "安装并打开 Harness",
+    "Open Harness": "打开 Harness",
+    "Stop Harness": "停止 Harness",
+    "Cancel installation": "取消安装",
+    "Downloading the runtime…": "正在下载运行环境…",
+    "Preparing the runtime…": "正在准备运行环境…",
+    "Installing Harness and dependencies…": "正在安装 Harness 和依赖…",
+    "Verifying the installation…": "正在验证安装…",
+    "{count} package requests completed": "已完成 {count} 个软件包请求",
+    "Retry": "重试",
+    "Start an API Server before opening {name}.": "请先启动 API 服务，再打开 {name}。",
+    "Installing {name}…": "正在安装 {name}…",
+    "Starting {name}…": "正在启动 {name}…",
+    "{name} could not start.": "{name} 启动失败。",
+    "{name} is not installed. Click Install and open to continue.": "尚未安装 {name}，请点击“安装并打开”继续。",
+    "{name} is stopped.": "{name} 已停止。",
+    "Install and open {name}": "安装并打开 {name}",
+    "Open {name}": "打开 {name}",
+    "Stop {name}": "停止 {name}",
+    "Installing {name} and dependencies…": "正在安装 {name} 及依赖…",
+    "Could not save the input in this browser. Keep this page open.": "无法在当前浏览器保存输入，请保留此页面。",
+    "New conversation": "新建会话",
+    "Codex is working…": "Codex 正在处理…",
+    "Working directory unavailable": "无法获取工作目录",
+    "Choose an existing workspace directory on the server.": "请选择服务器上已存在的工作目录。",
+    "Loading conversation…": "正在加载会话…",
+    "New conversation in {workspace}": "在 {workspace} 中新建会话",
+    "Changes and commands run in this conversation's workspace.": "文件修改和命令在当前会话的工作目录中执行。",
+    "You": "你",
+    "Thinking": "思考",
+    "Command": "命令",
+    "File changes": "文件修改",
+    "Plan": "计划",
+    "Tool": "工具",
+    "Context compaction": "上下文压缩",
+    "Exit code: {code}": "退出码：{code}",
+    "Codex request failed.": "Codex 请求失败。",
+    "Codex needs your response": "Codex 等待你的回应",
+    "Allow once": "允许一次",
+    "Decline": "拒绝",
+    "Cancel turn": "取消本轮",
+    "Choose or enter an answer": "选择或输入回答",
+    "Submit answers": "提交回答",
+    "Allow this turn": "本轮允许",
+    "This request is unsupported. Cancel the turn to continue.": "暂不支持此类请求，请取消本轮后继续。",
+    "Conversation name": "会话名称",
+    "Model management": "模型管理",
+    "Upgrading {name}…": "正在升级 {name}…",
+    "Removing {name}…": "正在删除 {name}…",
+    "Choose a workspace folder": "选择工作目录",
+    "Browse the machine running Launcher. Open a folder, then select the current folder.": "浏览运行 Launcher 的机器。点击文件夹进入，然后选择当前文件夹。",
+    "Browse the machine running Launcher. Open a folder, then select a file or use the current folder.": "浏览运行 Launcher 的机器。点击文件夹进入，选择文件或当前文件夹后确认。",
+    "Copy": "复制",
+    "Copied": "已复制",
+    "Could not copy to the clipboard.": "无法复制到剪贴板。",
+    "Could not load Markdown. Reopen the Codex page to retry.": "Markdown 加载失败，请切换栏目后重新打开 Codex 重试。",
+    "Reasoning effort for this conversation": "当前会话的思考档位",
+    "This model does not advertise adjustable reasoning effort.": "当前模型未声明可调节的思考档位。",
+    "Model default": "模型默认",
+    "Minimal": "最少",
+    "Low": "低",
+    "Medium": "中",
+    "High": "高",
+    "Extra high": "超高",
+    "Maximum": "最高"
   },
   "patterns": [
-    {"source": "^Unable to read folder: (.+)$", "target": "无法读取文件夹：$1"},
-    {"source": "^Unable to create model destination directory: (.+)$", "target": "无法创建模型保存目录：$1"},
-    {"source": "^Download command: (.+)$", "target": "下载命令：$1"},
-    {"source": "^Failed to start download process: (.+)$", "target": "启动下载进程失败：$1"},
-    {"source": "^Unable to start model download: (.+)$", "target": "无法启动模型下载：$1"},
-    {"source": "^Failed to read ModelScope (.+): (.+)$", "target": "读取 ModelScope $1 失败：$2"},
-    {"source": "^Downloading model\\.\\.\\. Overall progress ([0-9.]+)%$", "target": "正在下载模型… 总进度 $1%"},
-    {"source": "^Model download failed \\(code=(-?[0-9]+)\\)$", "target": "模型下载失败（code=$1）"},
-    {"source": "^Model saved to (.+)$", "target": "模型已保存到 $1"},
-    {"source": "^Service port (.+) is already in use\\.$", "target": "服务端口 $1 已被占用。"},
-    {"source": "^Starting ftllm (server|webui)\\.\\.\\.$", "target": "正在启动 ftllm $1…"},
-    {"source": "^Launch command: (.+)$", "target": "启动命令：$1"},
-    {"source": "^Failed to start process: (.+)$", "target": "启动进程失败：$1"},
-    {"source": "^Unable to start ftllm (server|webui): (.+)$", "target": "无法启动 ftllm $1：$2"},
-    {"source": "^Failed to read (.+): (.+)$", "target": "读取 $1 失败：$2"},
-    {"source": "^Model service exited unexpectedly \\(code=(-?[0-9]+)\\)$", "target": "模型服务异常退出（code=$1）"},
-    {"source": "^WebUI exited unexpectedly \\(code=(-?[0-9]+)\\)$", "target": "WebUI 异常退出（code=$1）"},
-    {"source": "^Failed to stop process tree: (.+)$", "target": "停止进程树失败：$1"},
-    {"source": "^额外参数无法解析: (.+)$", "target": "额外参数无法解析：$1"},
-    {"source": "^环境变量缺少 '=': (.+)$", "target": "环境变量缺少 '='：$1"},
-    {"source": "^环境变量名无效: (.+)$", "target": "环境变量名无效：$1"}
+    {
+      "source": "^Unable to read folder: (.+)$",
+      "target": "无法读取文件夹：$1"
+    },
+    {
+      "source": "^Unable to create model destination directory: (.+)$",
+      "target": "无法创建模型保存目录：$1"
+    },
+    {
+      "source": "^Download command: (.+)$",
+      "target": "下载命令：$1"
+    },
+    {
+      "source": "^Failed to start download process: (.+)$",
+      "target": "启动下载进程失败：$1"
+    },
+    {
+      "source": "^Unable to start model download: (.+)$",
+      "target": "无法启动模型下载：$1"
+    },
+    {
+      "source": "^Failed to read ModelScope (.+): (.+)$",
+      "target": "读取 ModelScope $1 失败：$2"
+    },
+    {
+      "source": "^Downloading model\\.\\.\\. Overall progress ([0-9.]+)%$",
+      "target": "正在下载模型… 总进度 $1%"
+    },
+    {
+      "source": "^Model download failed \\(code=(-?[0-9]+)\\)$",
+      "target": "模型下载失败（code=$1）"
+    },
+    {
+      "source": "^Model saved to (.+)$",
+      "target": "模型已保存到 $1"
+    },
+    {
+      "source": "^Service port (.+) is already in use\\.$",
+      "target": "服务端口 $1 已被占用。"
+    },
+    {
+      "source": "^Starting ftllm (server|webui)\\.\\.\\.$",
+      "target": "正在启动 ftllm $1…"
+    },
+    {
+      "source": "^Launch command: (.+)$",
+      "target": "启动命令：$1"
+    },
+    {
+      "source": "^Failed to start process: (.+)$",
+      "target": "启动进程失败：$1"
+    },
+    {
+      "source": "^Unable to start ftllm (server|webui): (.+)$",
+      "target": "无法启动 ftllm $1：$2"
+    },
+    {
+      "source": "^Failed to read (.+): (.+)$",
+      "target": "读取 $1 失败：$2"
+    },
+    {
+      "source": "^Model service exited unexpectedly \\(code=(-?[0-9]+)\\)$",
+      "target": "模型服务异常退出（code=$1）"
+    },
+    {
+      "source": "^WebUI exited unexpectedly \\(code=(-?[0-9]+)\\)$",
+      "target": "WebUI 异常退出（code=$1）"
+    },
+    {
+      "source": "^Failed to stop process tree: (.+)$",
+      "target": "停止进程树失败：$1"
+    },
+    {
+      "source": "^额外参数无法解析: (.+)$",
+      "target": "额外参数无法解析：$1"
+    },
+    {
+      "source": "^环境变量缺少 '=': (.+)$",
+      "target": "环境变量缺少 '='：$1"
+    },
+    {
+      "source": "^环境变量名无效: (.+)$",
+      "target": "环境变量名无效：$1"
+    }
   ]
 }

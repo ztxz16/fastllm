@@ -1,0 +1,21 @@
+          <section id="view-harness" class="view" aria-label="DeepSeek Harness">
+            <div class="harness-toolbar">
+              <span id="harness-status" role="status"></span>
+              <button class="small-button" type="button" data-manage-agent="harness">管理</button>
+              <button id="harness-retry" class="small-button" type="button">打开 Harness</button>
+              <button id="harness-stop" class="small-button hidden" type="button">停止 Harness</button>
+            </div>
+            <div id="harness-placeholder" class="webui-placeholder">
+              <svg class="icon" aria-hidden="true"><use href="#icon-terminal"/></svg>
+              <h1>DeepSeek Harness</h1>
+              <p>启动模型 API 后，即可在这里使用 DeepSeek Harness。会话和工作目录独立保存。</p>
+              <p id="harness-install-note" class="hidden">点击“安装并打开 Harness”后才会下载安装独立运行环境，约占 450 MiB 磁盘空间。</p>
+              <div id="harness-progress" class="harness-progress hidden" role="status">
+                <span id="harness-progress-stage"></span>
+                <progress id="harness-progress-bar" aria-label="安装进度"></progress>
+                <span id="harness-progress-detail"></span>
+              </div>
+              <pre id="harness-error" class="harness-error hidden"></pre>
+            </div>
+            <div id="harness-content" class="hidden"></div>
+          </section>

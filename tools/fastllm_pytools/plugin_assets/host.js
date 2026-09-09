@@ -1,13 +1,15 @@
 import {mountManager} from "./manager.js";
 import {mountAppearance} from "./appearance.js";
+import {mountRuntimeManager} from "./runtime-manager.js";
 
 export async function mountPluginHost({root = document, basePath = "", request, slot = "page",
-  navigation, container, context = () => ({}), studioCall, navigate, signal, preview = false, catalog} = {}) {
+  navigation, container, context = () => ({}), studioCall, navigate, signal, preview = false, catalog,
+  nativePages = {}} = {}) {
   const lifecycle = new AbortController();
   const abort = () => destroy();
   signal?.addEventListener("abort", abort, {once:true});
   const frames = new Map(), nativeViews = new Map();
-  let records = [], loading = false, timer, manager;
+  let records = [], loading = false, timer, manager, runtimeManager;
   const shellSlots = new Map();
   if (slot === "page") {
     for (const [name, selector] of [["topbar", ".topbar"], ["sidebar", ".sidebar"], ["statusbar", ".workspace"]]) {
@@ -38,7 +40,15 @@ export async function mountPluginHost({root = document, basePath = "", request, 
     <path d="m12 17 4-4m-5 5 1-1"/></svg></span><span>自定义界面</span>`;
   if (!preview) {
     const embedded = root.host?.hasAttribute("data-embedded");
-    if (!embedded) manager = mountManager({root, basePath, request:api, refresh, getRecords:() => records, context});
+    if (slot === "page") {
+      runtimeManager = mountRuntimeManager({root, request:api, refresh, getRecords:() => records, context});
+      root.addEventListener("click", event => {
+        const target = event.target.closest("[data-manage-agent]");
+        if (target) runtimeManager.open(target.dataset.manageAgent);
+      }, {signal:lifecycle.signal});
+    }
+    if (!embedded) manager = mountManager({root, basePath, request:api, refresh, getRecords:() => records, context,
+      openRuntime:id => runtimeManager?.open(id)});
     if (slot === "page") {
       (navigation || container).append(button);
       button.addEventListener("click", () => manager.open(), {signal:lifecycle.signal});
@@ -128,6 +138,7 @@ export async function mountPluginHost({root = document, basePath = "", request, 
     const desired = new Set();
     if (slot === "page") {
       for (const plugin of records.filter(p => p.builtin && p.view)) {
+        nativePages[plugin.id]?.setEnabled(plugin.enabled);
         const panel = root.querySelector(`#view-${plugin.view}`);
         if (!panel) continue;
         let entry = nativeViews.get(plugin.view);
@@ -167,15 +178,16 @@ export async function mountPluginHost({root = document, basePath = "", request, 
     try {
       const result = catalog ? {plugins:catalog()} : await api("/api/plugins");
       if (lifecycle.signal.aborted) return;
-      records = result.plugins; reconcile(); manager?.update(result);
+      records = result.plugins; reconcile(); manager?.update(result); runtimeManager?.update();
     } finally { loading = false; }
   }
   function destroy() {
     if (lifecycle.signal.aborted) return;
     lifecycle.abort(); clearInterval(timer); signal?.removeEventListener("abort", abort);
     for (const id of [...frames.keys()]) removeFrame(id);
+    for (const page of Object.values(nativePages)) page.destroy?.();
     for (const {panel, native, status} of nativeViews.values()) { native.replaceWith(...native.childNodes); status.remove(); }
-    manager?.destroy(); button.remove(); style.remove(); appearance.destroy();
+    manager?.destroy(); runtimeManager?.destroy(); button.remove(); style.remove(); appearance.destroy();
     for (const region of shellSlots.values()) region.remove();
   }
   await refresh().catch(error => { button.title = error.message; });

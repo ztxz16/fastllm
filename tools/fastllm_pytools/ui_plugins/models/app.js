@@ -5,6 +5,7 @@ import {
 } from "../../assets/app.js";
 
 let profileRenderSignature = "";
+let folderPickerTarget = null, folderPickerDirectoriesOnly = false;
 const AUTOMATIC_CONFIGURATION_DEFAULTS = Object.freeze({
   device: "auto",
   cuda_device_id: "0",
@@ -1138,14 +1139,17 @@ function schedulePathSuggestions(input) {
   }, 180);
 }
 
-function openFolderPicker(field, trigger) {
+function openFolderPicker(field, trigger, {input: target, directoriesOnly = false} = {}) {
   state.folderPickerField = field;
   state.folderPickerTrigger = trigger;
-  const input = elements.launchForm.querySelector(`[data-field="${field}"]`);
+  const input = target || elements.launchForm.querySelector(`[data-field="${field}"]`);
+  folderPickerTarget = input;
+  folderPickerDirectoriesOnly = directoriesOnly;
+  state.folderPickerResult = null;
   elements.folderPickerModal.classList.remove("hidden");
   document.body.classList.add("modal-open");
   elements.folderPickerTitle.focus({ preventScroll: true });
-  loadFolderPicker(input.value || collectForm().model || "");
+  loadFolderPicker(input.value || (!directoriesOnly && collectForm().model) || "");
 }
 
 function closeFolderPicker(restoreFocus = true) {
@@ -1155,7 +1159,7 @@ function closeFolderPicker(restoreFocus = true) {
   if (elements.profileEditorModal.classList.contains("hidden")) {
     document.body.classList.remove("modal-open");
   }
-  if (restoreFocus && !elements.profileEditorModal.classList.contains("hidden")) {
+  if (restoreFocus) {
     state.folderPickerTrigger?.focus({ preventScroll: true });
   }
 }
@@ -1178,7 +1182,7 @@ async function loadFolderPicker(path) {
       throw new Error(t("The folder browser response is invalid."));
     }
     state.folderPickerResult = result;
-    state.folderPickerSelectedFile = result.selectedFile || "";
+    state.folderPickerSelectedFile = folderPickerDirectoriesOnly ? "" : result.selectedFile || "";
     elements.folderPickerCurrent.value = result.path;
   } catch (error) {
     if (requestId !== state.folderPickerRequestId) return;
@@ -1191,8 +1195,14 @@ async function loadFolderPicker(path) {
 }
 
 function renderFolderPicker() {
-  elements.folderPickerTitle.textContent = state.folderPickerField === "speculative_draft_model_path"
+  elements.folderPickerTitle.textContent = folderPickerDirectoriesOnly ? t("Choose a workspace folder")
+    : state.folderPickerField === "speculative_draft_model_path"
     ? t("Choose a draft model file or folder") : t("Choose a model file or folder");
+  document.getElementById("folder-picker-description").textContent = folderPickerDirectoriesOnly
+    ? t("Browse the machine running Launcher. Open a folder, then select the current folder.")
+    : t("Browse the machine running Launcher. Open a folder, then select a file or use the current folder.");
+  elements.folderPickerModal.querySelector(".folder-picker-kicker").textContent = folderPickerDirectoriesOnly
+    ? "WORKSPACE LOCATION" : "MODEL LOCATION";
   const drives = state.folderPickerResult?.drives || [];
   elements.folderPickerDriveField.classList.toggle("hidden", !drives.length);
   elements.folderPickerDrive.replaceChildren();
@@ -1248,7 +1258,7 @@ function renderFolderPicker() {
 
   const result = state.folderPickerResult;
   const folders = result?.folders || [];
-  const files = result?.files || [];
+  const files = folderPickerDirectoriesOnly ? [] : result?.files || [];
   if (!folders.length && !files.length) {
     const empty = document.createElement("div");
     empty.className = "folder-picker-placeholder";
@@ -1298,9 +1308,10 @@ function renderFolderPicker() {
 }
 
 function selectCurrentFolder() {
+  if (state.folderPickerLoading || state.folderPickerError) return;
   const path = state.folderPickerSelectedFile || state.folderPickerResult?.path;
   if (!path) return;
-  const input = elements.launchForm.querySelector(`[data-field="${state.folderPickerField}"]`);
+  const input = folderPickerTarget;
   input.value = path;
   input.dispatchEvent(new Event("input", { bubbles: true }));
   closeFolderPicker(false);

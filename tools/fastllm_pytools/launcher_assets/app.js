@@ -27,8 +27,11 @@ import {
 import {
   mountPluginHost
 } from "../plugin-core/host.js";
+import {mountHarness} from "../ui_plugins/harness/app.js";
+import {mountOpenCode} from "../ui_plugins/opencode/app.js";
+import {mountCodex} from "../ui_plugins/codex/app.js";
 
-let pluginHost;
+let pluginHost, harness, nativeAgents = {};
 const locationQuery = new URLSearchParams(window.location.search);
 const queryToken = locationQuery.get("token") || "";
 if (queryToken) {
@@ -198,8 +201,13 @@ async function initialize() {
   captureStaticMessages();
   await initializeLocale();
   bindEvents();
+  harness = mountHarness({request, getRuntime:() => state.runtime, t});
+  const agentOptions = {request, getRuntime:() => state.runtime, t};
+  nativeAgents = {opencode:mountOpenCode(agentOptions), codex:mountCodex({...agentOptions,
+    chooseDirectory:(input, trigger) => openFolderPicker(null, trigger, {input, directoriesOnly:true})})};
   pluginHost = await mountPluginHost({request, navigation:document.querySelector(".navigation"),
     container:document.querySelector(".page-scroll"), navigate:switchView,
+    nativePages:{harness, ...nativeAgents},
     context:() => ({locale:state.locale, theme:window.ftllmLauncherTheme.getResolved()}),
     studioCall:(capability, args) => {
       if (!state.webuiComponent) throw new Error("请先打开工作室");
@@ -636,7 +644,9 @@ function switchView(view) {
   for (const panel of document.querySelectorAll(".view")) {
     panel.classList.toggle("active", panel.id === `view-${view}`);
   }
-  document.querySelector(".app-shell").classList.toggle("webui-active", view === "webui");
+  document.querySelector(".app-shell").classList.toggle("webui-active", ["webui", "harness", "opencode", "codex"].includes(view));
+  harness?.navigate(view);
+  for (const agent of Object.values(nativeAgents)) agent.navigate(view);
   elements.openWebui.classList.toggle("hidden", view === "webui");
   if (view === "webui") renderWebUIAvailability();
   if (view === "logs") scrollLogsToBottom();
@@ -648,9 +658,14 @@ function switchView(view) {
 }
 
 function renderViewTitle() {
+  document.querySelector(".management-label").textContent = ["webui", "harness", "opencode", "codex"].includes(state.currentView)
+    ? "agent" : t("Model management");
   const titles = {
     launch: t("Launch service"),
     webui: t("Studio"),
+    harness: "DeepSeek Harness",
+    opencode: "OpenCode",
+    codex: "Codex",
     download: t("Download model"),
     logs: t("Runtime logs"),
     hardware: t("Hardware")
@@ -723,6 +738,8 @@ function renderRuntime() {
   renderInferenceSpeed();
   renderContextWindow();
   renderWebUIAvailability();
+  harness?.update();
+  for (const agent of Object.values(nativeAgents)) agent.update();
   renderProfiles();
   updateActionAvailability();
 }

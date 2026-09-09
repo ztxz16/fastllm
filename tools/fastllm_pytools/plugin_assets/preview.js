@@ -7,13 +7,13 @@ export function mountPreview({container, source, basePath, request, context, get
   let hosts = [], lifecycle, version = 0, draft = null, mode = context().theme || "light";
   let view = launcher ? source.querySelector(".view.active")?.id.replace("view-", "") || "launch" : "webui";
   let scope, frameHost, studioRoots = [];
-  const ignored = "script,style,link,meta,base,iframe,object,embed,.plugin-manager,.plugin-manager-button,.plugin-shell-slot,.plugin-studio-slot,.plugin-page,.plugin-status,[data-view-button^='plugin-']";
+  const ignored = "script,style,link,meta,base,iframe,object,embed,.plugin-manager,.plugin-runtime-manager,.plugin-manager-button,.plugin-shell-slot,.plugin-studio-slot,.plugin-page,.plugin-status,[data-view-button^='plugin-']";
   function sheets(root, main = false) {
     const result = [];
     const styles = root.styleSheets || [...root.querySelectorAll('link[rel="stylesheet"]')].map(n => n.sheet).filter(Boolean);
     for (const style of styles) {
       // All application styles come from installed assets, never editable CSS.
-      if (!style.href || !new URL(style.href).pathname.match(/\/(?:assets|plugin-core)\//)) continue;
+      if (!style.href || !new URL(style.href).pathname.match(/\/(?:assets|plugin-core|ui_plugins)\//)) continue;
       const css = [...style.cssRules].filter(rule => !main || !rule.cssText.includes(":host")).map(rule => rule.cssText).join("\n");
       const sheet = new CSSStyleSheet();
       sheet.replaceSync(main ? css.replace(/:root((?:\[[^\]]+\])*)/g, (_, attrs) => attrs ? `:host(${attrs})` : ":host")
@@ -71,7 +71,7 @@ export function mountPreview({container, source, basePath, request, context, get
       button.classList.toggle("active", active);
       if (active) button.setAttribute("aria-current", "page"); else button.removeAttribute("aria-current");
     }
-    scope.querySelector(".app-shell")?.classList.toggle("webui-active", value === "webui");
+    scope.querySelector(".app-shell")?.classList.toggle("webui-active", ["webui", "harness", "opencode", "codex"].includes(value));
     scope.querySelector("#open-webui")?.classList.toggle("hidden", value === "webui");
     const title = scope.querySelector("#current-view-title");
     if (title) title.textContent = scope.querySelector(`[data-view-button="${CSS.escape(value)}"]`)?.textContent || value;

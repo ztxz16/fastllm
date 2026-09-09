@@ -162,7 +162,7 @@ def _revision(files):
 
 
 class PluginRegistry:
-    def __init__(self, directory=None):
+    def __init__(self, directory=None, *, on_enabled=None, runtimes=None, runtime_actions=None):
         self.directory = Path(directory or default_plugins_dir()).expanduser().absolute()
         # Never turn an application/package directory into an editable workspace.
         package = Path(__file__).resolve().parent
@@ -172,6 +172,22 @@ class PluginRegistry:
         self._lock = threading.RLock()
         self._last_good = {}
         self._previews = {}
+        # Only application code can register native process hooks. Manifests
+        # and editable plugins cannot provide callbacks or execution commands.
+        self._on_enabled = on_enabled
+        self._runtimes = runtimes or {}
+        self._runtime_actions = runtime_actions or {}
+
+    def manage_runtime(self, plugin_id, operation):
+        _id(plugin_id)
+        action = self._runtime_actions.get(plugin_id)
+        if not action or operation not in {"install", "upgrade", "remove", "cancel"}:
+            raise PluginError("此插件不支持该运行环境管理操作")
+        # Do not hold the registry lock while joining runtime workers.
+        try:
+            return action(operation)
+        except RuntimeError as error:
+            raise PluginConflict(str(error)) from error
 
     def preview(self, plugin_id, files):
         manifest = validate_bundle(plugin_id, files)
@@ -265,8 +281,15 @@ class PluginRegistry:
             records = []
             for path in sorted(BUNDLED_PLUGINS.glob("*/plugin.json")):
                 manifest = json.loads(path.read_text(encoding="utf-8"))
-                records.append({**manifest, "builtin": True, "enabled": state.get(manifest["id"], True),
-                                "revision": "builtin", "error": ""})
+                record = {**manifest, "builtin": True, "enabled": state.get(manifest["id"], True),
+                          "revision": "builtin", "error": ""}
+                runtime = self._runtimes.get(manifest["id"])
+                if runtime:
+                    status = runtime()
+                    record["runtime"] = {key: status.get(key) for key in
+                        ("installed", "phase", "managed", "source", "version", "targetVersion", "stage", "done", "total", "error")}
+                    record["runtime"]["manageable"] = manifest["id"] in self._runtime_actions
+                records.append(record)
             reserved = {item["id"] for item in records}
             live = set()
             for path in sorted(self._root().glob("*")):
@@ -322,7 +345,12 @@ class PluginRegistry:
                 self._disable_themes(state)
             state[plugin_id] = enabled
             self._save_state(state)
-            return self.get(plugin_id)
+            result = self.get(plugin_id)
+        # Process shutdown may join worker threads: never hold registry locks
+        # while notifying the owner, which also reads the enabled state.
+        if self._on_enabled:
+            self._on_enabled(plugin_id)
+        return result
 
     def delete(self, plugin_id, expected_revision):
         with self._lock, self._write_lock():
@@ -569,11 +597,18 @@ def install_plugin_routes(app, registry, model_client, hardware=None, runtime_st
 
     @app.post("/api/plugins/{plugin_id}/enabled")
     async def enabled(plugin_id: str, request: Request):
-        return registry.set_enabled(plugin_id, (await body(request)).get("enabled"))
+        from starlette.concurrency import run_in_threadpool
+        return await run_in_threadpool(registry.set_enabled, plugin_id, (await body(request)).get("enabled"))
 
     @app.delete("/api/plugins/{plugin_id}")
     async def delete(plugin_id: str, request: Request):
         return registry.delete(plugin_id, (await body(request)).get("expectedRevision"))
+
+    @app.post("/api/plugins/{plugin_id}/runtime/{operation}")
+    async def runtime_operation(plugin_id: str, operation: str, request: Request):
+        from starlette.concurrency import run_in_threadpool
+        await body(request)
+        return await run_in_threadpool(registry.manage_runtime, plugin_id, operation)
 
     @app.post("/api/plugins/{plugin_id}/apply")
     async def apply(plugin_id: str, request: Request):
@@ -672,7 +707,7 @@ def install_plugin_routes(app, registry, model_client, hardware=None, runtime_st
 
     @app.get("/plugin-core/{filename}")
     def core_asset(filename: str):
-        if filename not in {"host.js", "sdk.js", "manager.js", "conversations.js", "styles.css", "appearance.js", "appearance.css", "preview.js"}:
+        if filename not in {"host.js", "sdk.js", "manager.js", "runtime-manager.js", "conversations.js", "styles.css", "appearance.js", "appearance.css", "preview.js", "native-agent.js", "native-agent.css"}:
             raise HTTPException(404)
         return FileResponse(CORE_ASSETS / filename, headers={"Cache-Control": "no-cache"})
 

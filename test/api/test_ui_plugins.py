@@ -50,6 +50,10 @@ class UIPluginTest(unittest.TestCase):
         with self.assertRaises(PluginError):
             self.registry.apply("models", bundle("models"), "builtin")
         with self.assertRaises(PluginError):
+            self.registry.apply("harness", bundle("harness"), "builtin")
+        with self.assertRaises(PluginError):
+            self.registry.delete("harness", "builtin")
+        with self.assertRaises(PluginError):
             PluginRegistry(BUNDLED_PLUGINS / "modified")
         self.assertEqual(original, (BUNDLED_PLUGINS / "models" / "plugin.json").read_bytes())
 

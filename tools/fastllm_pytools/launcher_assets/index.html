@@ -9,6 +9,9 @@
     <link rel="apple-touch-icon" href="/assets/launcher-icon.png">
     <script src="/assets/theme.js"></script>
     <link rel="stylesheet" href="/assets/styles.css">
+    <link rel="stylesheet" href="/ui_plugins/harness/styles.css">
+    <link rel="stylesheet" href="/plugin-core/native-agent.css">
+    <link rel="stylesheet" href="/ui_plugins/codex/styles.css">
     <script type="module" src="/assets/app.js"></script>
   </head>
   <body>
@@ -34,7 +37,7 @@
         </div>
 
         <nav class="navigation" aria-label="主导航">
-          <p class="sidebar-heading">模型管理</p>
+          <p class="sidebar-heading" role="heading" aria-level="2">模型管理</p>
           <button class="nav-button active" type="button" data-view-button="launch" aria-current="page">
             <svg class="icon" aria-hidden="true"><use href="#icon-grid"/></svg>
             <span><strong>启动服务</strong></span>
@@ -52,9 +55,22 @@
             <svg class="icon" aria-hidden="true"><use href="#icon-cpu"/></svg>
             <span><strong>硬件信息</strong></span>
           </button>
+          <div class="sidebar-heading agent-heading"><span role="heading" aria-level="2">agent</span><button type="button" data-manage-agent="harness" aria-label="管理 agent">管理</button></div>
           <button class="nav-button" type="button" data-view-button="webui">
             <svg class="icon" aria-hidden="true"><use href="#icon-chat"/></svg>
             <span><strong>工作室</strong></span>
+          </button>
+          <button class="nav-button" type="button" data-view-button="harness">
+            <svg class="icon" aria-hidden="true"><use href="#icon-terminal"/></svg>
+            <span><strong>DeepSeek Harness</strong></span>
+          </button>
+          <button class="nav-button" type="button" data-view-button="opencode">
+            <svg class="icon" aria-hidden="true"><use href="#icon-terminal"/></svg>
+            <span><strong>OpenCode</strong></span>
+          </button>
+          <button class="nav-button" type="button" data-view-button="codex">
+            <svg class="icon" aria-hidden="true"><use href="#icon-terminal"/></svg>
+            <span><strong>Codex</strong></span>
           </button>
         </nav>
 
@@ -125,6 +141,12 @@
           <!-- plugin:models -->
 
           <!-- plugin:studio -->
+
+          <!-- plugin:harness -->
+
+          <!-- plugin:opencode -->
+
+          <!-- plugin:codex -->
 
           <!-- plugin:downloads -->
 
