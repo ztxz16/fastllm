@@ -473,7 +473,6 @@ namespace fastllm {
     static constexpr int QWEN35_MTP_PREFIX_SNAPSHOT_MAX =
         QWEN35_MTP_FAST_SEQ_MAX - 1;
     static constexpr int QWEN35_MTP_PREFIX_SNAPSHOT_BATCH_MAX = 4;
-    static constexpr int QWEN35_MTP_BATCH_ATTENTION_CACHE_MAX = 4096;
     static constexpr int QWEN35_BATCH_PREFILL_SEQ_MAX = 4096;
     static constexpr int QWEN35_DFLASH_LONG_PREFILL_CHUNK_SIZE = 2048;
 
@@ -550,42 +549,63 @@ namespace fastllm {
         cache.Resize({cache.dims[0], tokens, cache.dims[2]});
     }
 
-    void Qwen3_5Model::MtpKvCache::Append(const Data &k, const Data &v) {
-        int allocationUnit = 128;
-#ifdef USE_CUDA
-        // Amortize long-cache copies with at most 4 MiB of additional K/V
-        // capacity. Keep the small increment when both new buffers would
-        // not fit alongside the existing cache.
-        if (tokens >= 16384 && key.expansionDims.size() == 3 &&
-            value.expansionDims.size() == 3 &&
-            tokens + k.dims[1] > key.expansionDims[1]) {
-            const uint64_t bytesPerToken =
-                (uint64_t)k.dims[0] * k.dims[2] * k.unitSize / k.unitSizeDiv +
-                (uint64_t)v.dims[0] * v.dims[2] * v.unitSize / v.unitSizeDiv;
-            constexpr uint64_t reserveBytes = 4 * 1024 * 1024;
-            const int longUnit =
-                (int)std::min<uint64_t>(1024, reserveBytes / bytesPerToken) / 128 * 128;
-            if (longUnit > allocationUnit) {
-                const uint64_t capacity =
-                    std::max(key.expansionDims[1], value.expansionDims[1]) +
-                    ((uint64_t)k.dims[1] + longUnit - 1) / longUnit * longUnit;
-                if ((uint64_t)FastllmCudaGetFreeSize() >=
-                    capacity * bytesPerToken + reserveBytes) {
-                    allocationUnit = longUnit;
-                }
-            }
+    void Qwen3_5Model::MtpKvCache::Append(
+            const Data &k, const Data &v,
+            PagedCacheManager &keyPool, PagedCacheManager &valuePool) {
+        AssertInFastLLM(k.dims.size() == 3 && k.dims == v.dims &&
+                        k.dataType == v.dataType && k.dims[1] > 0,
+                        "Invalid MTP paged KV append.\n");
+        const int pageLen = keyPool.pageLen;
+        const int nextTokens = tokens + k.dims[1];
+        const int neededPages = (nextTokens + pageLen - 1) / pageLen;
+        const int extraPages = neededPages - (int)key.pageIndex.size();
+        AssertInFastLLM(keyPool.pageLen == valuePool.pageLen &&
+                        key.pageIndex == value.pageIndex &&
+                        extraPages <= keyPool.FreePageCount() &&
+                        extraPages <= valuePool.FreePageCount(),
+                        "MTP paged KV budget exhausted or K/V page tables diverged.\n");
+        auto prepare = [](Data &cache, const Data &input, PagedCacheManager &pool) {
+            AssertInFastLLM(cache.dims.empty() ||
+                            (cache.isPagedKVCache && cache.pagedKVCacheData == &pool),
+                            "MTP cache cannot change backing pools while active.\n");
+            cache.dataType = input.dataType;
+            cache.UpdateUnitSize();
+            cache.dataDevice = input.dataDevice;
+            cache.dataDeviceIds = input.dataDeviceIds;
+            if (!cache.isKVCache) cache.SetKVCache();
+        };
+        prepare(key, k, keyPool);
+        prepare(value, v, valuePool);
+        try {
+            AppendPagedCache(keyPool, key, k);
+            AppendPagedCache(valuePool, value, v);
+            AssertInFastLLM(key.pageIndex == value.pageIndex,
+                            "MTP K/V physical page indices diverged.\n");
+        } catch (...) {
+            // Neither committed prefix was overwritten. Release any newly
+            // acquired pages even if the second append failed.
+            Truncate(tokens);
+            throw;
         }
-#endif
-        Qwen35AppendDraftSequenceCache(key, k, allocationUnit);
-        Qwen35AppendDraftSequenceCache(value, v, allocationUnit);
-        tokens += k.dims[1];
+        tokens = nextTokens;
     }
 
     void Qwen3_5Model::MtpKvCache::Truncate(int tokens) {
-        // Extra drafts may have reallocated K/V. Roll back logical length,
-        // keeping the strides and capacity of the actual backing buffers.
-        Qwen35ResizeDraftSequenceCache(key, tokens);
-        Qwen35ResizeDraftSequenceCache(value, tokens);
+        AssertInFastLLM(tokens >= 0 && tokens <= this->tokens,
+                        "Invalid MTP paged KV rollback length.\n");
+        for (Data *cache : {&key, &value}) {
+            if (cache->dims.empty()) continue;
+            AssertInFastLLM(cache->isPagedKVCache && cache->pagedKVCacheData != nullptr,
+                            "MTP rollback requires a paged cache.\n");
+            const int retainedPages = (tokens + cache->pageLen - 1) / cache->pageLen;
+            // Release the suffix in its original order, identically for K/V.
+            std::vector<int> released(cache->pageIndex.begin() + retainedPages,
+                                      cache->pageIndex.end());
+            cache->pageIndex.resize(retainedPages);
+            cache->lastPageLen = tokens == 0 ? 0 : (tokens - 1) % cache->pageLen + 1;
+            cache->Resize({cache->dims[0], tokens, cache->dims[2]});
+            cache->pagedKVCacheData->ReleasePageIndices(released);
+        }
         this->tokens = tokens;
     }
 
@@ -737,18 +757,6 @@ namespace fastllm {
     static bool Qwen35MtpBatchedStateRestoreEnabled() {
         static bool enabled = Qwen35EnvDefaultEnabled(
             "FASTLLM_QWEN35_MTP_BATCHED_STATE_RESTORE");
-        return enabled;
-    }
-
-    static bool Qwen35MtpLongKvBatchAttentionEnabled() {
-        static bool enabled = Qwen35EnvDefaultEnabled(
-            "FASTLLM_QWEN35_MTP_LONG_KV_BATCH_ATTENTION");
-        return enabled;
-    }
-
-    static bool Qwen35MtpLongKvBatchExtendEnabled() {
-        static bool enabled = Qwen35EnvDefaultEnabled(
-            "FASTLLM_QWEN35_MTP_LONG_KV_BATCH_EXTEND");
         return enabled;
     }
 
@@ -4806,6 +4814,38 @@ namespace fastllm {
         static bool Qwen35SnapshotCopyTensor(const Data &src, Data &dst) {
             if (src.dims.empty()) {
                 return false;
+            }
+            if (src.isPagedKVCache) {
+                PagedCacheManager *pool = src.pagedKVCacheData;
+                if (pool == nullptr || pool->cudaData == nullptr ||
+                    src.dims.size() != 3 || src.unitSizeDiv != 1) return false;
+                dst.dataType = src.dataType;
+                dst.UpdateUnitSize();
+                dst.dataDevice = DataDevice::CPU;
+                dst.Resize(src.dims);
+                dst.Allocate();
+                const size_t headBytes = (size_t)src.dims[2] * src.unitSize;
+                const size_t tokenBytes = src.dims[0] * headBytes;
+                std::vector<uint8_t> page((size_t)src.pageLen * tokenBytes);
+                const int oldDevice = FastllmCudaGetDevice();
+                FastllmCudaSetDevice(pool->dataDeviceIds[0]);
+                int begin = 0;
+                for (int id : src.pageIndex) {
+                    const int count = std::min(src.pageLen, src.dims[1] - begin);
+                    FastllmCudaCopyFromDeviceToHost(page.data(),
+                        (uint8_t*)pool->cudaData + (size_t)id * src.pageLen * tokenBytes,
+                        (size_t)count * tokenBytes);
+                    for (int h = 0; h < src.dims[0]; ++h) {
+                        for (int t = 0; t < count; ++t) {
+                            std::memcpy(dst.cpuData + ((size_t)h * src.dims[1] + begin + t) * headBytes,
+                                        page.data() + (size_t)t * tokenBytes + h * headBytes, headBytes);
+                        }
+                    }
+                    begin += count;
+                }
+                FastllmCudaSetDevice(oldDevice);
+                dst.isKVCache = true;
+                return begin == src.dims[1];
             }
             if (src.dataDevice == DataDevice::CUDA && src.cudaData == nullptr) {
                 return false;
@@ -8936,6 +8976,8 @@ namespace fastllm {
         // Linear slot Data objects keep raw PagedCacheManager pointers. Stop
         // model work and destroy all request contexts before deleting pools.
         ShutdownRuntime();
+        mtpCaches.clear();
+        mtpPagedCachePools.clear();
         if (threadTpWorkerGroup.HasWorkers()) {
             threadTpWorkerGroup.Stop();
         }
@@ -8987,6 +9029,102 @@ namespace fastllm {
         return 25;
     }
 
+    long long Qwen3_5Model::GetAutoWarmupCudaAdditionalCacheBytesPerToken(int deviceId) const {
+#ifdef USE_CUDA
+        std::vector<int> devices;
+        std::map<int, int> ratios;
+        if (!HasDFlashWeights() && !Qwen35MtpDisabledByEnv() &&
+            Qwen35MtpDraftsPerStep() > 0 && HasMtpWeights() &&
+            GetQwen35GPUForwardDevices(this->deviceMap, devices, ratios) &&
+            !devices.empty() && devices.front() == deviceId) {
+            // The MTP transformer is on the first device, including all its
+            // KV heads, even when the target and draft LM head use TP.
+            return GetDataBytes(this->dataType, 1,
+                                (long long)2 * num_key_value_heads * head_dim);
+        }
+#endif
+        return 0;
+    }
+
+    Qwen3_5Model::MtpPagedCachePool &Qwen3_5Model::GetMtpPagedCachePool(
+            int device, const Data &shape) const {
+        AssertInFastLLM(shape.dims.size() == 3, "Invalid MTP paged pool shape.\n");
+        auto found = mtpPagedCachePools.find(device);
+        if (found != mtpPagedCachePools.end()) {
+            auto &pool = *found->second;
+            AssertInFastLLM(pool.key.dims[2] == shape.dims[0] &&
+                            pool.key.dims[3] == shape.dims[2] &&
+                            pool.key.dataType == shape.dataType,
+                            "MTP paged pool shape/dtype changed.\n");
+            return pool;
+        }
+        const int pageLen = GetPageLen();
+        const int mainPages = GetMaxTokens() > 0 ?
+            (GetMaxTokens() + pageLen - 1) / pageLen : 300;
+        const int batch = std::max(1, this->maxBatch > 0 ? this->maxBatch : 512);
+        const int draftPages = (std::max(1, Qwen35MtpDraftsPerStep()) + pageLen - 1) / pageLen;
+        const int poolPages = mainPages + batch * draftPages;
+#ifdef USE_CUDA
+        struct DeviceGuard {
+            int previous = FastllmCudaGetDevice();
+            ~DeviceGuard() { FastllmCudaSetDevice(previous); }
+        } deviceGuard;
+        FastllmCudaSetDevice(device);
+#endif
+        std::unique_ptr<MtpPagedCachePool> pool(new MtpPagedCachePool());
+        for (PagedCacheManager *manager : {&pool->key, &pool->value}) {
+            manager->type = PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE;
+            manager->dataType = shape.dataType;
+            manager->UpdateUnitSize();
+            manager->directMemory = true;
+            manager->ToDevice(DataDevice::CUDA, {device}, false);
+            manager->Resize({poolPages, pageLen, shape.dims[0], shape.dims[2]});
+            manager->Allocate();
+            manager->pageLen = pageLen;
+            manager->SetMaxPages(poolPages);
+        }
+        printf("[Qwen3.5 MTP] paged KV pool GPU %d: %d context pages + %d lookahead pages, pageLen=%d, K+V=%.2f MiB.\n",
+               device, mainPages, batch * draftPages, pageLen,
+               (pool->key.GetBytes() + pool->value.GetBytes()) / (1024.0 * 1024.0));
+        auto inserted = mtpPagedCachePools.emplace(device, std::move(pool));
+        return *inserted.first->second;
+    }
+
+    bool Qwen3_5Model::RestoreMtpPagedSnapshot(
+            MtpKvCache &cache, const Data &key, const Data &value, int device) const {
+#ifdef USE_CUDA
+        if (key.dims.size() != 3 || key.dims != value.dims ||
+            key.dataType != value.dataType || key.cpuData == nullptr ||
+            value.cpuData == nullptr || key.dims[1] <= 0) return false;
+        Qwen35ScopedGenericExecutor executor("cuda:" + std::to_string(device));
+        FastllmCudaSetDevice(device);
+        auto &pool = GetMtpPagedCachePool(device, key);
+        // Restore through bounded staging buffers, not a second full-size
+        // CUDA copy of the CPU snapshot alongside the allocated page pool.
+        for (int begin = 0; begin < key.dims[1]; begin += 128) {
+            const int count = std::min(128, key.dims[1] - begin);
+            Data k(key.dataType, {key.dims[0], count, key.dims[2]});
+            Data v(value.dataType, k.dims);
+            auto stage = [&](const Data &src, Data &dst) {
+                dst.Allocate();
+                const size_t rowBytes = GetDataBytes(src.dataType, count, src.dims[2]);
+                for (int h = 0; h < src.dims[0]; ++h) {
+                    const size_t offset = ((size_t)h * src.strides[0] +
+                                           (size_t)begin * src.strides[1]) * src.unitSize / src.unitSizeDiv;
+                    std::memcpy(dst.cpuData + h * rowBytes, src.cpuData + offset, rowBytes);
+                }
+                dst.ToDevice(DataDevice::CUDA, {device}, true);
+            };
+            stage(key, k);
+            stage(value, v);
+            cache.Append(k, v, pool.key, pool.value);
+        }
+        return cache.tokens == key.dims[1];
+#else
+        return false;
+#endif
+    }
+
     long long Qwen3_5Model::GetAutoWarmupCudaRuntimeReserveBytes(int deviceId, int batch) const {
 #ifdef USE_CUDA
         if (batch <= 0) {
@@ -9002,6 +9140,12 @@ namespace fastllm {
 
         DataType computeType = ResolveQwen35ThreadTpComputeType(this->dataType);
         long long reserveBytes = 0;
+        const long long mtpBytesPerToken = GetAutoWarmupCudaAdditionalCacheBytesPerToken(deviceId);
+        if (mtpBytesPerToken > 0) {
+            const int pageLen = GetPageLen();
+            const int draftPages = (std::max(1, Qwen35MtpDraftsPerStep()) + pageLen - 1) / pageLen;
+            reserveBytes += (long long)batch * draftPages * pageLen * mtpBytesPerToken;
+        }
         if (devices[0] == deviceId) {
             auto it = this->weight.weight.find("lm_head.weight");
             if (it == this->weight.weight.end()) {
@@ -9270,12 +9414,66 @@ namespace fastllm {
                 fflush(stdout);
             }
         }
+        // Materialize the actual paged-attention workspace before final KV
+        // calibration. The draft has all query heads on one GPU, so its
+        // persistent split workspace may differ from a TP-local target's.
+        // A temporary one-page pool avoids allocating the final token pool
+        // before its budget has been decided.
+        std::vector<int> pagedDevices;
+        std::map<int, int> pagedRatios;
+        if (GetQwen35GPUForwardDevices(this->deviceMap, pagedDevices, pagedRatios) &&
+            !pagedDevices.empty() &&
+            GetAutoWarmupCudaAdditionalCacheBytesPerToken(pagedDevices.front()) > 0) {
+            const int device = pagedDevices.front();
+            struct DeviceGuard {
+                int previous = FastllmCudaGetDevice();
+                ~DeviceGuard() { FastllmCudaSetDevice(previous); }
+            } deviceGuard;
+            Qwen35ScopedGenericExecutor executor("cuda:" + std::to_string(device));
+            FastllmCudaSetDevice(device);
+            MtpPagedCachePool pool;
+            for (PagedCacheManager *manager : {&pool.key, &pool.value}) {
+                manager->type = PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE;
+                manager->dataType = this->dataType;
+                manager->UpdateUnitSize();
+                manager->directMemory = true;
+                manager->ToDevice(DataDevice::CUDA, {device}, false);
+                manager->Resize({1, GetPageLen(), num_key_value_heads, head_dim});
+                manager->Allocate();
+                manager->pageLen = GetPageLen();
+                manager->SetMaxPages(1);
+            }
+            Data k(this->dataType, {num_key_value_heads, 1, head_dim});
+            Data q(this->dataType, {num_attention_heads, 1, head_dim});
+            for (Data *data : {&k, &q}) {
+                data->Allocate(0.0f);
+                data->ToDevice(DataDevice::CUDA, {device}, true);
+            }
+            MtpKvCache cache;
+            cache.Append(k, k, pool.key, pool.value);
+            std::vector<Data*> keys = {&cache.key};
+            Data qSizes, pageSizes, pageIndices, lastPageLens, output;
+            GeneratePagedBatchParams(q, keys, 1, qSizes, pageSizes,
+                                     pageIndices, lastPageLens, {1});
+            AttentionPagedBatch(q, cache.key, cache.value,
+                                qSizes, pageSizes, pageIndices, lastPageLens,
+                                output, num_attention_heads / num_key_value_heads,
+                                1.0f / std::sqrt((float)head_dim), 1, false);
+            ForceDeviceSync();
+            printf("[Qwen3.5 MTP] paged attention workspace materialized before KV calibration on GPU %d.\n", device);
+        }
         mtpCudaServingWarmupPrepared = true;
 #endif
     }
 
     void Qwen3_5Model::WarmupCudaServingHighWaterBuffers() {
 #ifdef USE_CUDA
+        // MTP normally disables CUDA graphs, but its paged-attention scratch
+        // still has to exist when automatic KV capacity is calibrated.
+        if (!HasDFlashWeights() && !Qwen35MtpDisabledByEnv() &&
+            Qwen35MtpDraftsPerStep() > 0 && HasMtpWeights()) {
+            PrepareMtpCudaServingWarmup();
+        }
         // CUDA graph capture owns page-backed pointers and is handled by the
         // explicit two-stage final-KV calibration. The non-graph API path can
         // safely materialize eager-serving scratch directly here.
@@ -9391,6 +9589,14 @@ namespace fastllm {
         // serving may continue to allocate normally after its high-water pass.
         PrepareCudaServingAfterWarmup();
         Qwen35ReleaseThreadLocalCudaSamplingBuffers();
+        std::vector<int> mtpDevices;
+        std::map<int, int> mtpRatios;
+        if (GetQwen35GPUForwardDevices(this->deviceMap, mtpDevices, mtpRatios) &&
+            !mtpDevices.empty() &&
+            GetAutoWarmupCudaAdditionalCacheBytesPerToken(mtpDevices.front()) > 0) {
+            Data shape(this->dataType, {num_key_value_heads, 1, head_dim});
+            GetMtpPagedCachePool(mtpDevices.front(), shape);
+        }
 #endif
     }
 
@@ -9726,11 +9932,8 @@ namespace fastllm {
                         return false;
                     }
                     MtpKvCache &mtpCache = mtpCaches[context];
-                    if (!Qwen35RestoreDraftSnapshotTensor(
-                            snapshot->mtpKey, mtpCache.key, devices[0]) ||
-                        !Qwen35RestoreDraftSnapshotTensor(
-                            snapshot->mtpValue, mtpCache.value,
-                            devices[0])) {
+                    if (!RestoreMtpPagedSnapshot(mtpCache, snapshot->mtpKey,
+                                                snapshot->mtpValue, devices[0])) {
                         mtpCaches.erase(context);
                         return false;
                     }
@@ -21250,10 +21453,37 @@ namespace fastllm {
             return true;
         };
 
+        // Target prefix pages can be shared, but restored MTP snapshots own
+        // separate pages per request. Account for the draft pool explicitly
+        // in admission and decode eviction, rather than assuming its free
+        // page count always matches the target's representative cache.
+        auto addMtpPageNeeds = [&](ResponseContext *ctx, int appendTokens,
+                                  std::map<PagedCacheManager*, int> &needs) {
+            if (schedulerUsesDFlash || ctx == nullptr || appendTokens <= 0) return;
+            auto found = model->mtpCaches.find(ctx);
+            for (auto &entry : model->mtpPagedCachePools) {
+                for (int value = 0; value < 2; ++value) {
+                    auto &pool = value ? entry.second->value : entry.second->key;
+                    const Data *cache = found == model->mtpCaches.end() ? nullptr :
+                        (value ? &found->second.value : &found->second.key);
+                    const int tokens = found == model->mtpCaches.end() ? 0 : found->second.tokens;
+                    const int pages = cache == nullptr ? 0 : (int)cache->pageIndex.size();
+                    const long long required =
+                        ((long long)tokens + appendTokens + pool.pageLen - 1) / pool.pageLen;
+                    if (required > pool.maxPages) {
+                        needs[&pool] = INT_MAX;
+                    } else if (required > pages) {
+                        needs[&pool] += (int)required - pages;
+                    }
+                }
+            }
+        };
+
         auto collectDecodePageNeeds = [&](ResponseContext *ctx) -> std::map<PagedCacheManager*, int> {
             std::map<PagedCacheManager*, int> needs;
             int decodeTokens = ctx == nullptr ? 1 :
                 std::max(1, scheduledDecodeTokens(ctx));
+            addMtpPageNeeds(ctx, decodeTokens + mtpDraftsPerStep, needs);
             // Multi-token MTP validation runs against a paged-cache view. A
             // partial last page is cloned before appending so rejected draft
             // tokens cannot overwrite the real cache.
@@ -21348,6 +21578,7 @@ namespace fastllm {
             if (ctx == nullptr || appendTokens <= 0) {
                 return needs;
             }
+            addMtpPageNeeds(ctx, appendTokens, needs);
             auto addManagerNeed = [&](PagedCacheManager *manager,
                                       int currentTokens,
                                       int currentPages) {
@@ -21982,6 +22213,7 @@ namespace fastllm {
             bool selectedIsPrompt = false;
             bool selectedMultimodal = false;
             bool prefillPageCapacityBlocked = false;
+            std::map<PagedCacheManager*, int> selectedPrefillPageNeeds;
             std::map<PagedCacheManager*, int> selectedDecodePageNeeds;
 
             attentionMasks.reserve(mtpSchedulerLanes);
@@ -22236,8 +22468,9 @@ namespace fastllm {
                             std::max(0, remainingCapacity));
                         auto pageNeeds = collectPrefillPageNeeds(
                             ctx, scheduledTokens + reserveTokens);
-                        if (!pageNeeds.empty() &&
-                            hasPagedManagerShortage(pageNeeds)) {
+                        auto combinedPageNeeds = selectedPrefillPageNeeds;
+                        accumulatePagedManagerNeeds(combinedPageNeeds, pageNeeds);
+                        if (hasPagedManagerShortage(combinedPageNeeds)) {
                             // A decode request can temporarily leave too few
                             // pages to rebuild an evicted long context. Keep
                             // the prefill pending until that request releases
@@ -22252,6 +22485,10 @@ namespace fastllm {
                         }
                         scheduledTokens =
                             (int)ctx->currentTokens.size();
+                        // Prefix restore has already acquired its pages.
+                        // Keep only still-unallocated needs for this batch.
+                        accumulatePagedManagerNeeds(selectedPrefillPageNeeds,
+                            collectPrefillPageNeeds(ctx, scheduledTokens + reserveTokens));
                     }
 
                     if (!isPrompt &&
@@ -29357,14 +29594,14 @@ namespace fastllm {
         k.Reshape({-1, totalTokens, this->head_dim});
         v.Reshape({-1, totalTokens, this->head_dim});
 
-        std::vector<Data> requestQ(batch), requestK(batch), requestV(batch);
+        std::vector<Data> requestK(batch), requestV(batch);
         for (int b = 0; b < batch; b++) {
             int begin = tokenOffsets[b];
             int end = begin + seqLens[b];
-            Split(q, 1, begin, end, requestQ[b]);
             Split(k, 1, begin, end, requestK[b]);
             Split(v, 1, begin, end, requestV[b]);
-            caches[b]->Append(requestK[b], requestV[b]);
+            auto &pool = GetMtpPagedCachePool(device, requestK[b]);
+            caches[b]->Append(requestK[b], requestV[b], pool.key, pool.value);
         }
 
         const int attentionWidth = num_attention_heads * this->head_dim;
@@ -29373,91 +29610,17 @@ namespace fastllm {
         attentionOutput.dataDeviceIds = {device};
         attentionOutput.Resize({1, totalTokens, attentionWidth});
         attentionOutput.Allocate(false);
-        bool allSingleToken = std::all_of(
-            seqLens.begin(), seqLens.end(), [](int len) { return len == 1; });
-        bool homogeneousSeqLen = std::all_of(
-            seqLens.begin(), seqLens.end(), [&](int len) {
-                return len == seqLens[0];
-            });
-        int minCacheTokens = -1;
-        int maxCacheTokens = 0;
-        for (int b = 0; b < batch; b++) {
-            if (caches[b]->key.dims.size() >= 2) {
-                int cacheTokens = caches[b]->key.dims[1];
-                minCacheTokens = minCacheTokens < 0 ? cacheTokens :
-                    std::min(minCacheTokens, cacheTokens);
-                maxCacheTokens = std::max(maxCacheTokens,
-                                          cacheTokens);
-            }
-        }
-        // Short single-token caches use the existing pointer-batched kernels.
-        // Long homogeneous sequences use grouped CUBLAS across request x
-        // KV-head matrices; multi-token draft extend additionally shares one
-        // causal softmax launch. Mixed lengths retain the per-request fallback.
-        bool useLongKvBatchAttention = batch > 1 &&
-            minCacheTokens > QWEN35_MTP_BATCH_ATTENTION_CACHE_MAX &&
-            Qwen35MtpLongKvBatchAttentionEnabled() &&
-            (allSingleToken ||
-             (homogeneousSeqLen &&
-              seqLens[0] <= QWEN35_MTP_FAST_SEQ_MAX &&
-              Qwen35MtpLongKvBatchExtendEnabled()));
-        bool useBatchAttention =
-            (allSingleToken &&
-             (batch == 1 ||
-              maxCacheTokens <= QWEN35_MTP_BATCH_ATTENTION_CACHE_MAX)) ||
-            useLongKvBatchAttention;
-        const size_t attentionRowBytes =
-            (size_t)attentionWidth * attentionOutput.unitSize /
-            attentionOutput.unitSizeDiv;
-        if (useBatchAttention) {
-            std::vector<Data*> qs(batch), keys(batch), values(batch), masks(batch, nullptr),
-                               contexts(batch);
-            std::vector<Data> outputViews(batch);
-            std::vector<Data> batchOutputs(batch);
-            for (int b = 0; b < batch; b++) {
-                qs[b] = &requestQ[b];
-                keys[b] = &caches[b]->key;
-                values[b] = &caches[b]->value;
-                if (allSingleToken) {
-                    outputViews[b].FakeFrom(
-                        attentionOutput,
-                        (size_t)tokenOffsets[b] * attentionRowBytes);
-                    contexts[b] = &outputViews[b];
-                } else {
-                    contexts[b] = &batchOutputs[b];
-                }
-            }
-            AttentionBatch(qs, keys, values, masks, contexts,
-                           requestQ[0].dims[0] / caches[0]->key.dims[0],
-                           1.0f / std::sqrt((float)this->head_dim), 1);
-            if (!allSingleToken) {
-                for (int b = 0; b < batch; b++) {
-                    PermuteSelf(batchOutputs[b], {1, 0, 2});
-                    batchOutputs[b].Reshape(
-                        {1, seqLens[b], attentionWidth});
-                    FastllmCudaCopyFromDeviceToDevice(
-                        (uint8_t*)attentionOutput.cudaData +
-                            (size_t)tokenOffsets[b] * attentionRowBytes,
-                        batchOutputs[b].cudaData,
-                        (size_t)seqLens[b] * attentionRowBytes);
-                }
-            }
-        } else {
-            for (int b = 0; b < batch; b++) {
-                Data requestOutput;
-                Attention(requestQ[b], caches[b]->key, caches[b]->value,
-                          *GetEmptyData(), requestOutput,
-                          requestQ[b].dims[0] / caches[b]->key.dims[0],
-                          1.0f / std::sqrt((float)this->head_dim), 1);
-                PermuteSelf(requestOutput, {1, 0, 2});
-                requestOutput.Reshape({1, seqLens[b], attentionWidth});
-                FastllmCudaCopyFromDeviceToDevice(
-                    (uint8_t*)attentionOutput.cudaData +
-                        (size_t)tokenOffsets[b] * attentionRowBytes,
-                    requestOutput.cudaData,
-                    (size_t)seqLens[b] * attentionRowBytes);
-            }
-        }
+        std::vector<Data*> keys(batch);
+        for (int b = 0; b < batch; ++b) keys[b] = &caches[b]->key;
+        Data qSizes, pageSizes, pageIndices, lastPageLens;
+        GeneratePagedBatchParams(q, keys, batch, qSizes, pageSizes,
+                                 pageIndices, lastPageLens, seqLens);
+        AttentionPagedBatch(q, caches[0]->key, caches[0]->value,
+                            qSizes, pageSizes, pageIndices, lastPageLens,
+                            attentionOutput, q.dims[0] / k.dims[0],
+                            1.0f / std::sqrt((float)this->head_dim), 1, false);
+        // The ragged paged batch path writes token-major output.
+        attentionOutput.Reshape({1, totalTokens, attentionWidth});
 
         Sigmoid(gate, gate);
         if (gate.dataType != attentionOutput.dataType) {
@@ -29756,7 +29919,8 @@ namespace fastllm {
         k.Reshape({-1, seqLen, this->head_dim});
         v.Reshape({-1, seqLen, this->head_dim});
 
-        cache.Append(k, v);
+        auto &pool = GetMtpPagedCachePool(device, k);
+        cache.Append(k, v, pool.key, pool.value);
         if (cacheOnly) {
             return -1;
         }
@@ -29779,9 +29943,18 @@ namespace fastllm {
         Data &outputGate = sampleSingleRow ? sampleGate : gate;
         Data *sampleHiddenPtr = sampleSingleRow ? &sampleHidden : &hiddenStates;
 
-        Attention(query, cache.key, cache.value, *GetEmptyData(), attenOutput,
-                  query.dims[0] / cache.key.dims[0], 1.0f / std::sqrt((float)this->head_dim), 1);
-        PermuteSelf(attenOutput, {1, 0, 2});
+        // Use the same paged batch entry point as target attention, including
+        // batch=1: its native decode kernel reads pages directly, whereas the
+        // legacy single-request fallback gathers the entire KV cache.
+        std::vector<Data*> keys = {&cache.key};
+        Data qSizes, pageSizes, pageIndices, lastPageLens;
+        GeneratePagedBatchParams(query, keys, 1, qSizes, pageSizes,
+                                 pageIndices, lastPageLens, {query.dims[1]});
+        AttentionPagedBatch(query, cache.key, cache.value,
+                            qSizes, pageSizes, pageIndices, lastPageLens,
+                            attenOutput, query.dims[0] / cache.key.dims[0],
+                            1.0f / std::sqrt((float)this->head_dim), 1, false);
+        // Paged batch attention writes token-major output.
         attenOutput.Reshape({1, sampleSingleRow ? 1 : seqLen, -1});
         Sigmoid(outputGate, outputGate);
         if (outputGate.dataType != attenOutput.dataType) {

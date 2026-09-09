@@ -676,9 +676,10 @@ if (UNIT_TEST)
         add_test(NAME qwen35_mtp_sample_row_moe COMMAND qwen35_mtp_sample_row_test --moe)
         add_test(NAME qwen35_mtp_sample_row_causal COMMAND qwen35_mtp_sample_row_test --causal)
         add_test(NAME qwen35_mtp_cache_rollback COMMAND qwen35_mtp_sample_row_test --rollback)
+        add_test(NAME qwen35_mtp_paged_pool COMMAND qwen35_mtp_sample_row_test --paged-pool)
         set_tests_properties(qwen35_mtp_sample_row qwen35_mtp_sample_row_moe
-                             qwen35_mtp_sample_row_causal qwen35_mtp_cache_rollback
-                             PROPERTIES LABELS cuda SKIP_RETURN_CODE 77)
+                             qwen35_mtp_sample_row_causal qwen35_mtp_cache_rollback qwen35_mtp_paged_pool
+                             PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
 
         add_executable(qwen35_streaming_weights_test test/basic/test_qwen35_streaming_weights.cpp)
         target_link_libraries(qwen35_streaming_weights_test PRIVATE fastllm)

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <random>
 #include <stdexcept>
@@ -30,12 +31,15 @@ void Fill(Data &data, int seed, float scale) {
 class DraftModel : public Qwen3_5Model {
 public:
     using Qwen3_5Model::MtpKvCache;
+    using Qwen3_5Model::GetMtpPagedCachePool;
+    using Qwen3_5Model::RestoreMtpPagedSnapshot;
     using Qwen3_5Model::RunMtpGreedyDraft;
     using Qwen3_5Model::RunMtpGreedyDraftBatch;
     static constexpr int width = 96;
     bool moe;
 
     explicit DraftModel(int headDim, bool useMoe = false) : moe(useMoe) {
+        maxBatch = 8;
         embed_dim = width;
         num_attention_heads = 12;
         num_key_value_heads = 2;
@@ -49,12 +53,16 @@ public:
         rms_norm_eps = 1e-6f;
         int seed = 0;
         auto add = [&](const std::string &name, std::vector<int> dims, bool norm = false) {
-            weight.AddEmptyWeight(name, dims, FLOAT16);
+            // Native RMSNorm reads norm weights as float, regardless of
+            // the activation dtype. Match the real model's FP32 norms.
+            weight.AddEmptyWeight(name, dims, norm ? FLOAT32 : FLOAT16);
             Data &data = weight[name];
-            Fill(data, ++seed, 0.04f);
+            ++seed;
             if (norm) {
-                std::fill_n(reinterpret_cast<uint16_t *>(data.cpuData),
-                            data.Count(0), float_to_half(1.0f));
+                data.Allocate();
+                std::fill_n(reinterpret_cast<float *>(data.cpuData), data.Count(0), 1.0f);
+            } else {
+                Fill(data, seed, 0.04f);
             }
         };
         add(language_prefix + "embed_tokens.weight", {64, width});
@@ -83,12 +91,13 @@ public:
     }
 };
 
-void InitCache(DraftModel::MtpKvCache &cache, int tokens, int headDim) {
+void InitCache(DraftModel &model, DraftModel::MtpKvCache &cache, int tokens, int headDim) {
     if (tokens == 0) return;
-    for (Data *data : {&cache.key, &cache.value}) {
+    Data key, value;
+    for (Data *data : {&key, &value}) {
         data->dataType = FLOAT16;
         data->UpdateUnitSize();
-        // Cover both spare capacity and expansion across a page boundary.
+        // A padded CPU snapshot checks stride handling during paged restore.
         data->Expansion({2, ((tokens + 127) / 128) * 128, headDim});
         data->Resize({2, tokens, headDim});
         auto *values = reinterpret_cast<uint16_t *>(data->cpuData);
@@ -101,15 +110,33 @@ void InitCache(DraftModel::MtpKvCache &cache, int tokens, int headDim) {
                 }
             }
         }
-        data->ToDevice(DataDevice::CUDA, {0}, true);
     }
-    cache.tokens = tokens;
+    Require(model.RestoreMtpPagedSnapshot(cache, key, value, 0), "MTP paged snapshot restore failed");
 }
 
 std::vector<uint16_t> LogicalHalfData(const Data &data) {
     if (data.dims.empty()) return {};
     Require(data.dataType == FLOAT16, "expected FP16 data");
     std::vector<uint16_t> values(data.dims[0] * data.dims[1] * data.dims[2]);
+    if (data.isPagedKVCache) {
+        auto *pool = data.pagedKVCacheData;
+        const size_t heads = data.dims[0], dim = data.dims[2], length = data.dims[1];
+        std::vector<uint16_t> page((size_t)data.pageLen * heads * dim);
+        size_t begin = 0;
+        for (int id : data.pageIndex) {
+            const size_t count = std::min((size_t)data.pageLen, length - begin);
+            FastllmCudaCopyFromDeviceToHost(page.data(),
+                (uint16_t*)pool->cudaData + (size_t)id * data.pageLen * heads * dim,
+                count * heads * dim * sizeof(uint16_t));
+            for (size_t t = 0; t < count; ++t)
+                for (size_t h = 0; h < heads; ++h)
+                    std::copy_n(page.data() + (t * heads + h) * dim, dim,
+                                values.data() + (h * length + begin + t) * dim);
+            begin += count;
+        }
+        Require(begin == length, "MTP page table length mismatch");
+        return values;
+    }
     for (int h = 0; h < data.dims[0]; ++h) {
         size_t count = (size_t)data.dims[1] * data.dims[2];
         FastllmCudaCopyFromDeviceToHost(values.data() + h * count,
@@ -120,10 +147,10 @@ std::vector<uint16_t> LogicalHalfData(const Data &data) {
 
 void RunCase(DraftModel &model, int headDim, int context, int length, int sampleRow) {
     DraftModel::MtpKvCache single, cacheOnly, batched, other;
-    InitCache(single, context, headDim);
-    InitCache(cacheOnly, context, headDim);
-    InitCache(batched, context, headDim);
-    InitCache(other, 7, headDim);
+    InitCache(model, single, context, headDim);
+    InitCache(model, cacheOnly, context, headDim);
+    InitCache(model, batched, context, headDim);
+    InitCache(model, other, 7, headDim);
     Data hidden(FLOAT16, {1, length, DraftModel::width});
     Fill(hidden, 9, 0.6f);
     hidden.ToDevice(DataDevice::CUDA, {0}, true);
@@ -151,8 +178,8 @@ void RunCase(DraftModel &model, int headDim, int context, int length, int sample
             LogicalHalfData(single.value) == LogicalHalfData(cacheOnly.value),
             "generation changed K/V compared with the full cache-only append");
 
-    // The mixed-length batch keeps the existing full-query attention/MLP
-    // path. It supplies an independent reference for the selected output;
+    // The mixed-length paged batch evaluates all query rows and supplies
+    // an independent reference for the selected output;
     // a batch of one would delegate to the optimized single-request path.
     std::vector<Data> reference;
     auto batchTokens = model.RunMtpGreedyDraftBatch(0, {0}, {&batched, &other},
@@ -188,8 +215,8 @@ void RunCase(DraftModel &model, int headDim, int context, int length, int sample
             maxLogitDelta = std::max(maxLogitDelta, std::abs(aScores[row] - bScores[row]));
         }
         auto rounded = [](double score) { return float_to_half(float(score)); };
-        // The full-query reference still uses the old FP16 PV reduction.
-        // Retain the hidden-state tolerance, check the new argmax, and only
+        // Different query shapes can use different reduction orders.
+        // Retain the hidden-state tolerance, check the selected argmax, and only
         // allow a reference ranking change within the measured logit error:
         // two candidate scores can move apart by at most 2 * maxLogitDelta.
         double referenceGap = *std::max_element(bScores.begin(), bScores.end()) - bScores[token];
@@ -210,8 +237,7 @@ void RunCausalCase() {
     // Uniform scores and large new V rows make a future row visible
     // in the selected hidden state, even with thousands of cached rows.
     Data &qNorm = model.weight["mtp.layers.0.self_attn.q_norm.weight"];
-    std::fill_n(reinterpret_cast<uint16_t *>(qNorm.cpuData),
-                qNorm.Count(0), float_to_half(0.0f));
+    std::fill_n(reinterpret_cast<float *>(qNorm.cpuData), qNorm.Count(0), 0.0f);
     Data &qkv = model.weight["mtp.layers.0.self_attn.mergeqkv.weight"];
     auto *qkvValues = reinterpret_cast<uint16_t *>(qkv.cpuData);
     for (uint64_t i = 26 * 256 * DraftModel::width; i < qkv.Count(0); ++i) {
@@ -220,8 +246,8 @@ void RunCausalCase() {
     RunCase(model, 256, 4097, 2, 0);
 
     DraftModel::MtpKvCache first, changedFuture;
-    InitCache(first, 4097, 256);
-    InitCache(changedFuture, 4097, 256);
+    InitCache(model, first, 4097, 256);
+    InitCache(model, changedFuture, 4097, 256);
     Data hidden(FLOAT16, {1, 2, DraftModel::width});
     Data otherHidden(FLOAT16, {1, 2, DraftModel::width});
     Fill(hidden, 9, 0.6f);
@@ -250,8 +276,8 @@ void RunRollbackCase(DraftModel &model, int headDim, int context,
     std::vector<DraftModel::MtpKvCache> caches(batch), reference(batch);
     for (int b = 0; b < batch; ++b) {
         // The second request has a different capacity boundary.
-        InitCache(caches[b], context + b * 3, headDim);
-        InitCache(reference[b], context + b * 3, headDim);
+        InitCache(model, caches[b], context + b * 3, headDim);
+        InitCache(model, reference[b], context + b * 3, headDim);
     }
     auto append = [&](std::vector<DraftModel::MtpKvCache> &kv, int step) {
         std::vector<Data> hidden(batch), positions(batch), sampled;
@@ -283,26 +309,24 @@ void RunRollbackCase(DraftModel &model, int headDim, int context,
 
     std::vector<void*> keyPointers(batch), valuePointers(batch);
     for (int b = 0; b < batch; ++b) {
-        auto keyCapacity = caches[b].key.expansionDims;
-        auto valueCapacity = caches[b].value.expansionDims;
-        auto keyStrides = caches[b].key.strides;
-        auto valueStrides = caches[b].value.strides;
-        auto keyBytes = caches[b].key.expansionBytes;
-        auto valueBytes = caches[b].value.expansionBytes;
-        keyPointers[b] = caches[b].key.cudaData;
-        valuePointers[b] = caches[b].value.cudaData;
+        auto *keyPool = caches[b].key.pagedKVCacheData;
+        auto *valuePool = caches[b].value.pagedKVCacheData;
+        const int oldPages = caches[b].key.pageIndex.size();
+        const int freePages = keyPool->FreePageCount();
+        keyPointers[b] = keyPool->cudaData;
+        valuePointers[b] = valuePool->cudaData;
         caches[b].Truncate(context + b * 3 + accepted);
         Require(caches[b].tokens == reference[b].tokens &&
                     LogicalHalfData(caches[b].key) == LogicalHalfData(reference[b].key) &&
                     LogicalHalfData(caches[b].value) == LogicalHalfData(reference[b].value),
                 "MTP rollback changed the committed K/V prefix");
-        Require(caches[b].key.expansionDims == keyCapacity &&
-                    caches[b].value.expansionDims == valueCapacity &&
-                    caches[b].key.strides == keyStrides &&
-                    caches[b].value.strides == valueStrides &&
-                    caches[b].key.expansionBytes == keyBytes &&
-                    caches[b].value.expansionBytes == valueBytes,
-                "MTP rollback restored an obsolete buffer layout");
+        const int retainedPages = (caches[b].tokens + caches[b].key.pageLen - 1) / caches[b].key.pageLen;
+        Require((int)caches[b].key.pageIndex.size() == retainedPages &&
+                    caches[b].key.pageIndex == caches[b].value.pageIndex &&
+                    keyPool->FreePageCount() == freePages + oldPages - retainedPages &&
+                    keyPool->FreePageCount() == valuePool->FreePageCount(),
+                "MTP rollback leaked pages or retained a rejected suffix");
+
     }
     Require(append(caches, 2) == append(reference, 2),
             "MTP output after rollback differs from a cache without rejected drafts");
@@ -311,13 +335,55 @@ void RunRollbackCase(DraftModel &model, int headDim, int context,
                     LogicalHalfData(caches[b].value) == LogicalHalfData(reference[b].value),
                 "MTP append after rollback changed historical K/V");
         if (accepted < 2) {
-            Require(caches[b].key.cudaData == keyPointers[b] &&
-                        caches[b].value.cudaData == valuePointers[b],
+            Require(caches[b].key.pagedKVCacheData->cudaData == keyPointers[b] &&
+                        caches[b].value.pagedKVCacheData->cudaData == valuePointers[b],
                     "MTP reallocated capacity already reserved by rejected drafts");
         }
     }
     std::cout << "rollback head_dim=" << headDim << " context=" << context
               << " batch=" << batch << " accepted=" << accepted << " PASS\n";
+}
+
+void RunPagedPoolCase() {
+    SetMaxTokens(4 * GetPageLen());
+    DraftModel model(256);
+    model.maxBatch = 2;
+    model.deviceMap = {{"cuda:0", 1}};
+    setenv("FASTLLM_QWEN35_ENABLE_MTP", "3", 1);
+    Require(model.GetAutoWarmupCudaAdditionalCacheBytesPerToken(0) == 2048 &&
+            model.GetAutoWarmupCudaAdditionalCacheBytesPerToken(1) == 0,
+            "MTP pool budget did not charge all KV heads to the draft device");
+    Data shape(FLOAT16, {2, 1, 256});
+    auto &pool = model.GetMtpPagedCachePool(0, shape);
+    Require(pool.key.maxPages == 6 && pool.value.maxPages == 6,
+            "MTP pool omitted per-request lookahead pages");
+    const int capacity = pool.key.maxPages;
+    void *keyAddress = pool.key.cudaData;
+    void *valueAddress = pool.value.cudaData;
+    for (int repeat = 0; repeat < 3; ++repeat) {
+        {
+            DraftModel::MtpKvCache cache;
+            InitCache(model, cache, capacity * GetPageLen(), 256);
+            Require(pool.key.FreePageCount() == 0 && pool.value.FreePageCount() == 0,
+                    "MTP request did not use its allocated page budget");
+            cache.Truncate(0);
+            Require(pool.key.FreePageCount() == capacity &&
+                    pool.value.FreePageCount() == capacity,
+                    "MTP rollback to zero leaked pages");
+        }
+        {
+            DraftModel::MtpKvCache cache;
+            InitCache(model, cache, GetPageLen() + 1, 256);
+        }
+        Require(pool.key.FreePageCount() == capacity &&
+                pool.value.FreePageCount() == capacity &&
+                pool.key.cudaData == keyAddress && pool.value.cudaData == valueAddress,
+                "MTP request destruction leaked pages or reallocated the pool");
+    }
+    setenv("FASTLLM_QWEN35_ENABLE_MTP", "0", 1);
+    Require(model.GetAutoWarmupCudaAdditionalCacheBytesPerToken(0) == 0,
+            "MTP-disabled inference was charged a draft KV pool");
+    std::cout << "MTP paged pool budget, rollback-to-zero and request reuse PASS\n";
 }
 }
 
@@ -328,8 +394,13 @@ int main(int argc, char **argv) {
         SetCudaEmbedding(false);
         FastllmCudaSetDevice(0);
         const std::string mode = argc == 2 ? argv[1] : "";
+        SetMaxTokens(mode == "--long" || mode == "--rollback-long" ? 1024 * 1024 : 65536);
         const bool longContext = mode == "--long";
         const bool useMoe = mode == "--moe";
+        if (mode == "--paged-pool") {
+            RunPagedPoolCase();
+            return 0;
+        }
         if (mode == "--causal") {
             RunCausalCase();
             return 0;

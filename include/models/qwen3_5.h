@@ -13,6 +13,7 @@
 #include <atomic>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <unordered_map>
@@ -113,6 +114,8 @@ namespace fastllm {
         virtual int GetBatchedPrefillTokenLimit() override;
 
         virtual long long GetAutoWarmupCudaRuntimeReserveBytes(int deviceId, int batch) const override;
+
+        virtual long long GetAutoWarmupCudaAdditionalCacheBytesPerToken(int deviceId) const override;
 
         virtual long long GetAutoWarmupCudaServingReserveBytes(int deviceId) const override;
 
@@ -235,9 +238,19 @@ namespace fastllm {
             Data value;
             int tokens = 0;
 
-            void Append(const Data &k, const Data &v);
+            void Append(const Data &k, const Data &v,
+                        PagedCacheManager &keyPool, PagedCacheManager &valuePool);
             void Truncate(int tokens);
         };
+        struct MtpPagedCachePool {
+            PagedCacheManager key;
+            PagedCacheManager value;
+        };
+        // Declared before request caches so their page references die first.
+        mutable std::map<int, std::unique_ptr<MtpPagedCachePool> > mtpPagedCachePools;
+        MtpPagedCachePool &GetMtpPagedCachePool(int device, const Data &shape) const;
+        bool RestoreMtpPagedSnapshot(MtpKvCache &cache, const Data &key,
+                                    const Data &value, int device) const;
         struct DFlashContext {
             int committedTokens = 0;
             std::vector <std::pair <Data, Data> > draftKeyValues;
