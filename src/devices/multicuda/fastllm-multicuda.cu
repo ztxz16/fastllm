@@ -2201,6 +2201,8 @@ enum class FastllmHostCollectiveKind {
     Reduce,
 };
 
+#include "fastllm-host-mapped-collective.cuh"
+
 struct FastllmHostCollectiveState {
     std::mutex mutex;
     std::condition_variable condition;
@@ -2392,6 +2394,10 @@ static bool FastllmHostSum(const std::vector<std::vector<uint8_t>> &inputs,
 static bool FastllmRunHostCollective(FastllmHostCollectiveKind kind,
                                      const void *send, void *recv, int count,
                                      int dataType, int rootRank, int deviceId) {
+    if (FastllmTryHostMappedCollective(kind, send, recv, count,
+                                      dataType, rootRank, deviceId)) {
+        return true;
+    }
     auto rankIt = g_ncclRanks.find(deviceId);
     const size_t typeBytes = FastllmNcclDataTypeBytes(dataType);
     if (rankIt == g_ncclRanks.end() || g_ncclWorldSize <= 1 ||
@@ -2505,8 +2511,8 @@ static bool FastllmRunHostCollective(FastllmHostCollectiveKind kind,
     if (!collectiveOk || !copyOk) {
         FastllmCudaSetThreadError();
         std::fprintf(stderr,
-                     "Error: host-staged CUDA %s fallback failed on GPU %d. "
-                     "CUDA Graph capture is not supported without NCCL.\n",
+                     "Error: host-staged CUDA %s failed on GPU %d. Check "
+                     "collective arguments, device copies, and capture support.\n",
                      FastllmHostCollectiveName(kind), deviceId);
         std::fflush(stderr);
         return false;
@@ -2555,10 +2561,12 @@ bool FastllmInitNccl(const std::vector<int>& devices) {
     }
     g_ncclInitialized = true;
     FastllmCudaCustomAllReduceInit(uniqueDevices);
+    FastllmInitHostMappedCollectives(uniqueDevices);
     std::fprintf(stderr,
                  "[Fastllm] NCCL is not compiled in; %d GPUs will use CUDA "
-                 "P2P custom all-reduce when possible and synchronous "
-                 "host-staged collectives otherwise.\n",
+                 "P2P custom all-reduce when possible, qualified mapped-host "
+                 "collectives during capture, and synchronous host staging "
+                 "otherwise.\n",
                  numGPUs);
     std::fflush(stderr);
     return true;

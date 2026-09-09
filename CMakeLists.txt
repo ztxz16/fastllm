@@ -829,6 +829,15 @@ if (UNIT_TEST)
             set_tests_properties(cuda_host_collective PROPERTIES
                 LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 TIMEOUT 120
                 RESOURCE_LOCK cuda_multigpu)
+            if (WIN32)
+                add_executable(hostMappedCollectiveRegression test/ops/hostMappedCollectiveRegression.cpp)
+                target_link_libraries(hostMappedCollectiveRegression PRIVATE fastllm Threads::Threads)
+                target_include_directories(hostMappedCollectiveRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+                add_test(NAME cuda_host_mapped_collective COMMAND hostMappedCollectiveRegression)
+                set_tests_properties(cuda_host_mapped_collective PROPERTIES
+                    LABELS "cuda;multigpu;graph" SKIP_RETURN_CODE 77 TIMEOUT 600
+                    RESOURCE_LOCK cuda_multigpu)
+            endif()
         endif()
 
         add_executable(fp8TpRepackDeadlockRegression test/ops/fp8TpRepackDeadlockRegression.cpp)

@@ -11,7 +11,7 @@
 | MSVC / CUDA 编译 | `CMakeLists.txt`、`include/`、CPU/CUDA 源文件 | C++17/20 分文件配置、AVX512 架构识别、UTF-8、标准预处理器、整数宽度与编译器扩展兼容 |
 | 第三方 CUDA 头文件兼容 | `third_party/flashinfer`、`deep_gemm`、`turbomind` | 标准对齐和共享内存声明、模板解析及 MSVC 不支持的语法；CUDA 12.9 CCCL 修正副本仅生成在构建目录 |
 | CPU / 磁盘运行时 | `src/devices/disk/diskdevice.cpp`、`src/models/basellm.cpp` | Windows 文件定位读取、对齐分配、分块读取，以及替代 `__int128` 的预算计算 |
-| 可选 NCCL | `src/devices/multicuda/`、`CMakeLists.txt` | Windows 默认关闭 NCCL，保留 P2P 自定义 all-reduce 和主机内存中转的集合通信 |
+| 可选 NCCL | `src/devices/multicuda/`、`CMakeLists.txt` | Windows 默认关闭 NCCL，保留 P2P、自检通过的双卡 Graph 通信和同步主机中转 |
 | Python 运行时 | `tools/fastllm_pytools/`、`tools/scripts/setup.py` | DLL 搜索、CPU 降级、按构建特性声明依赖、Windows 内存检测、后台子进程和 SQLite 连接释放 |
 | Windows Agent | `tools/ftllm_agent_runtime/` | Pi Windows 可执行文件、平台 wheel 标签、PowerShell 工具及其本地依赖 |
 | wheel 与绿色包 | `make_whl.ps1`、`make_portable.ps1`、`portable/windows/` | 原生构建、内嵌 Python、CLI 启动器、运行时版本锁定与离线缓存 |
@@ -19,8 +19,10 @@
 
 这些改动覆盖 Windows x64 的 NVIDIA CUDA 路径和 CPU 降级路径；没有实现 Windows
 AMD/ROCm 后端。Windows 下运行时 Triton 编译服务仍不可用，已有原生 CUDA 内核
-和 fallback 负责相应计算。无 NCCL 的主机中转通信包含同步和设备/主机数据复制，
-不能按 NCCL 的性能预期使用，也不支持在 CUDA Graph 中执行。
+和 fallback 负责相应计算。无 NCCL 的 eager 通信包含同步和设备/主机数据复制，
+不能按 NCCL 的性能预期使用。2026-09-09 补充了无需 P2P 的 Windows 双卡小消息
+Graph 后端，维护边界及独立验证见 [Windows 双卡 CUDA Graph](windows-tp-graph.md)。
+下文“本次验证”保留 2026-09-08 的验证记录。
 
 ## 本次冗余清理
 

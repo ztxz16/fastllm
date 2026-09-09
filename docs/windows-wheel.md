@@ -87,10 +87,15 @@ CUDA wheel 会声明 Windows 已有构建的 `nvidia-cuda-runtime-cu12` 和
 
 - 单卡 CUDA 不需要 NCCL；
 - 支持的多卡拓扑和张量会优先使用 FastLLM 的 CUDA P2P 自定义 all-reduce；
-- 其余 broadcast、reduce 和 all-reduce 会通过主机内存同步汇聚，保证功能可用，
-  但性能明显低于 NCCL；
-- 无 NCCL 时，跨 GPU CUDA Graph 通信会退出图模式并使用 eager 路径。若某个模型
-  强制启用了图模式，可在启动前设置 `$env:FASTLLM_CUDA_GRAPH="0"`。
+- Windows 双卡通过启动自检后，CUDA Graph 中每卡不超过 64 KiB 的 broadcast、
+  reduce 和 all-reduce 可以使用 GPU 协调的映射主机内存通信，不要求 P2P；
+- eager 路径仍使用主机内存同步汇聚。未通过自检的拓扑、更多 GPU 和超限消息
+  不支持这一 Graph 后端，需要由模型退出图模式；不支持自动退出的调用方应关闭
+  Graph。主机中转的性能不能按 NCCL 预期使用。
+
+通信后端自动选择，无需新增环境变量。图模式沿用 `FASTLLM_CUDA_GRAPH` 总开关；
+需要关闭时，在启动前设置 `$env:FASTLLM_CUDA_GRAPH="0"`。支持范围、测试和示例见
+[Windows 双卡 CUDA Graph](windows-tp-graph.md)。
 
 如果已有兼容 Windows 的 NCCL SDK，其中包含 `include\nccl.h`、`nccl.lib` 和运行时
 DLL，可以显式启用：
