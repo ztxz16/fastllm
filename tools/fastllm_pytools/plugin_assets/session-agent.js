@@ -424,7 +424,7 @@ export function mountSessionAgent(options) {
         modelName = info.modelName || "";
         effortOptions = Array.isArray(info.reasoningEfforts) ? info.reasoningEfforts : [];
         defaultEffort = effortOptions.includes(info.defaultReasoningEffort) ? info.defaultReasoningEffort : effortOptions.at(-1) || "";
-        const labels = {minimal:"Minimal", low:"Low", medium:"Medium", high:"High", xhigh:"Extra high", max:"Maximum"};
+        const labels = {none:"None", minimal:"Minimal", low:"Low", medium:"Medium", high:"High", xhigh:"Extra high", max:"Maximum"};
         $("effort").replaceChildren(...(effortOptions.length ? effortOptions : [""]).map(value => {
           const option = document.createElement("option"); option.value = value;
           option.textContent = value ? `${t(labels[value] || value)} (${value})` : t("Model default");

@@ -111,13 +111,14 @@ async function run(thread, turn, text, effort, controller) {
       ...(previous ? {resume:thread.id} : {sessionId:thread.id}),
       systemPrompt:{type:"preset", preset:"claude_code"}, settingSources:[],
       includePartialMessages:true, persistSession:true, permissionMode:"default",
-      ...(effort && effort !== "minimal" ? {effort, thinking:{type:"adaptive"}} : {}),
+      ...(effort === "none" ? {thinking:{type:"disabled"}}
+        : effort && effort !== "minimal" ? {effort, thinking:{type:"adaptive"}} : {}),
       // The CLI otherwise injects its generic "high" default, including for
       // models that expose no effort control. Pin the actual provider fields
       // per query; null preserves FastLLM's service default when unspecified.
       env:{...process.env, CLAUDE_CODE_EXTRA_BODY:JSON.stringify({
-        thinking:effort ? {type:"adaptive"} : null,
-        output_config:{effort:effort || null}})},
+        thinking:effort === "none" ? {type:"disabled"} : effort ? {type:"adaptive"} : null,
+        output_config:{effort:effort && effort !== "none" ? effort : null}})},
       canUseTool:(tool, input, options) => permission(thread, turn, tool, input, options, controller),
       stderr:chunk => process.stderr.write(chunk),
     }});

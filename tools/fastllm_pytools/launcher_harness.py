@@ -71,6 +71,9 @@ class HarnessRuntime(ManagedAgentRuntime):
     def _patch(service, bind_host):
         context = service.get("contextWindowTokens") or 8192
         efforts, default = reasoning_options(service)
+        # Harness names the disabled level "off"; FastLLM expects "none" on
+        # the wire so it overrides a service with thinking enabled by default.
+        default = "off" if default == "none" else default
         return [
             {"id": "webserver", "config": {"host": bind_host, "port": 0}},
             {"id": "agent-default-model", "config": {"provider": "fastllm", "model": service["modelName"],
@@ -88,7 +91,8 @@ class HarnessRuntime(ManagedAgentRuntime):
                 "apiKeyEnv": "FTLLM_HARNESS_API_KEY",
                 **({"reasoning": default} if default else {}),
                 "models": [{"id": service["modelName"], "name": service["modelName"],
-                            "reasoningEfforts": {effort: effort for effort in efforts} if efforts else False,
+                            "reasoningEfforts": {"off" if effort == "none" else effort: effort
+                                                 for effort in efforts} if efforts else False,
                             "contextWindow": context, "maxTokens": min(8192, context // 2)}],
                 "compat": {"supportsStore": False, "supportsReasoningEffort": True, "thinkingFormat": "openai"},
             }}}},

@@ -484,6 +484,7 @@
     "Reasoning effort for this conversation": "Reasoning effort for this conversation",
     "This model does not advertise adjustable reasoning effort.": "This model does not advertise adjustable reasoning effort.",
     "Model default": "Model default",
+    "None": "None",
     "Minimal": "Minimal",
     "Low": "Low",
     "Medium": "Medium",

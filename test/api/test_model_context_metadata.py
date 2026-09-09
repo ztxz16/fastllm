@@ -113,9 +113,9 @@ class FastLLmModelContextMetadataTest(unittest.TestCase):
 
         model = metadata.response["data"][0]
         self.assertEqual(
-            model["supported_reasoning_efforts"], ["low", "high", "max"])
+            model["supported_reasoning_efforts"], ["none", "low", "high", "max"])
         self.assertEqual(model["supportedReasoningEfforts"],
-                         ["low", "high", "max"])
+                         ["none", "low", "high", "max"])
         self.assertEqual(model["default_reasoning_effort"], "max")
         self.assertEqual(model["defaultReasoningEffort"], "max")
 
@@ -128,10 +128,10 @@ class FastLLmModelContextMetadataTest(unittest.TestCase):
         model = metadata.response["data"][0]
         self.assertEqual(
             model["supported_reasoning_efforts"],
-            ["low", "medium", "xhigh"])
+            ["none", "low", "medium", "xhigh"])
         self.assertEqual(
             model["supportedReasoningEfforts"],
-            ["low", "medium", "xhigh"])
+            ["none", "low", "medium", "xhigh"])
         self.assertEqual(model["default_reasoning_effort"], "xhigh")
         self.assertEqual(model["defaultReasoningEffort"], "xhigh")
 
@@ -143,9 +143,9 @@ class FastLLmModelContextMetadataTest(unittest.TestCase):
 
         model = metadata.response["data"][0]
         self.assertEqual(
-            model["supported_reasoning_efforts"], ["low", "high", "max"])
+            model["supported_reasoning_efforts"], ["none", "low", "high", "max"])
         self.assertEqual(model["supportedReasoningEfforts"],
-                         ["low", "high", "max"])
+                         ["none", "low", "high", "max"])
         self.assertEqual(model["default_reasoning_effort"], "max")
         self.assertEqual(model["defaultReasoningEffort"], "max")
 
@@ -158,10 +158,10 @@ class FastLLmModelContextMetadataTest(unittest.TestCase):
         model = metadata.response["data"][0]
         self.assertEqual(
             model["supported_reasoning_efforts"],
-            ["low", "medium", "xhigh"])
+            ["none", "low", "medium", "xhigh"])
         self.assertEqual(
             model["supportedReasoningEfforts"],
-            ["low", "medium", "xhigh"])
+            ["none", "low", "medium", "xhigh"])
         self.assertEqual(model["default_reasoning_effort"], "xhigh")
         self.assertEqual(model["defaultReasoningEffort"], "xhigh")
 

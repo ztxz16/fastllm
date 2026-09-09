@@ -17,10 +17,10 @@ class FastLLmModel:
         is_qwen_reasoning = (
             self._is_qwen3_5(model) or self._is_qwen4_exp(model))
         if is_kimi_k3 or is_glm5_next:
-            reasoning_efforts = ["low", "high", "max"]
+            reasoning_efforts = ["none", "low", "high", "max"]
             default_reasoning_effort = "max"
         elif is_qwen_reasoning:
-            reasoning_efforts = ["low", "medium", "xhigh"]
+            reasoning_efforts = ["none", "low", "medium", "xhigh"]
             default_reasoning_effort = "xhigh"
         else:
             reasoning_efforts = []

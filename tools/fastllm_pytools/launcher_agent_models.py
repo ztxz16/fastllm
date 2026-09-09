@@ -4,7 +4,7 @@ import json
 import urllib.request
 
 
-REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
+REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
 
 def with_model_metadata(service, api_key):

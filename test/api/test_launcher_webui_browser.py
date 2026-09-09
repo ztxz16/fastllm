@@ -369,7 +369,7 @@ class LauncherWebUIBrowserTest(unittest.TestCase):
         command.start(); self.addCleanup(command.stop)
         metadata = patch('fastllm_pytools.launcher_agent_runtime.with_model_metadata',
             side_effect=lambda service, key:dict(service, modelMetadata={
-                'supported_reasoning_efforts':['low', 'medium', 'xhigh']}))
+                'supported_reasoning_efforts':['none', 'low', 'medium', 'xhigh']}))
         metadata.start(); self.addCleanup(metadata.stop)
         self.page.locator('[data-view-button="claude"]').click()
         expect(self.page.locator('#claude-content')).to_be_visible()
@@ -436,6 +436,26 @@ class LauncherWebUIBrowserTest(unittest.TestCase):
         self.page.reload()
         self.page.locator('[data-view-button="claude"]').click()
         assert_blocks()
+
+    def test_claude_none_effort_is_sent_and_restored(self):
+        self.start_claude_sdk()
+        effort = self.page.locator('#claude-effort')
+        expect(effort.locator('option[value="none"]')).to_have_text('None (none)')
+        effort.select_option('none')
+        self.page.locator('#claude-prompt').fill('Reply without thinking')
+        self.page.locator('#claude-prompt').press('Enter')
+        expect(self.page.locator('#claude-approvals')).to_contain_text('Write example.txt?')
+        probe = json.loads((self.runtime.claude.directory / 'home/probe.json').read_text())
+        self.assertEqual(probe['thinking'], {'type':'disabled'})
+        self.assertEqual(probe['extraBody']['thinking'], {'type':'disabled'})
+        self.assertIsNone(probe['extraBody']['output_config']['effort'])
+        self.page.locator('#claude-approvals').get_by_role('button', name='Decline', exact=True).click()
+        expect(self.page.locator('#claude-send')).to_be_enabled()
+        self.page.reload()
+        self.page.locator('[data-view-button="claude"]').click()
+        expect(effort).to_have_value('none')
+        self.page.locator('#claude-new').click()
+        expect(effort).to_have_value('xhigh')
 
     def test_claude_template_error_is_visible_and_another_message_can_be_sent(self):
         self.start_claude_sdk()
@@ -656,6 +676,26 @@ for line in sys.stdin:
         requests = [json.loads(line) for line in (self.runtime.codex.directory / 'home/requests.jsonl').read_text().splitlines()]
         self.assertEqual([(r['params']['threadId'], r['params']['effort']) for r in requests
                           if r.get('method') == 'turn/start'], [('1', 'low'), ('4', 'medium')])
+
+    def test_codex_none_effort_is_sent_and_restored(self):
+        with patch('fastllm_pytools.launcher_agent_runtime.with_model_metadata', side_effect=lambda service, key:
+                dict(service, modelMetadata={'supported_reasoning_efforts':['none', 'low', 'medium', 'xhigh']})):
+            self.start_codex_projects()
+        effort = self.page.locator('#codex-effort')
+        expect(effort.locator('option[value="none"]')).to_have_text('None (none)')
+        effort.select_option('none')
+        self.page.locator('#codex-prompt').fill('Reply without thinking')
+        self.page.locator('#codex-prompt').press('Enter')
+        expect(self.page.locator('#codex-messages')).to_contain_text('Reply')
+        requests = [json.loads(line) for line in (self.runtime.codex.directory / 'home/requests.jsonl').read_text().splitlines()]
+        self.assertEqual([r['params']['effort'] for r in requests if r.get('method') == 'turn/start'], ['none'])
+        self.page.locator('#codex-cancel').click()
+        expect(self.page.locator('#codex-send')).to_be_enabled()
+        self.page.reload()
+        self.page.locator('[data-view-button="codex"]').click()
+        expect(effort).to_have_value('none')
+        self.page.locator('#codex-new').click()
+        expect(effort).to_have_value('xhigh')
 
     def test_codex_unknown_model_disables_effort_with_explanation(self):
         self.start_codex_projects()

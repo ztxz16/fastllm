@@ -107,7 +107,7 @@ class ClaudeRuntimeTest(unittest.TestCase):
         command.start(); self.addCleanup(command.stop)
         metadata = patch("fastllm_pytools.launcher_agent_runtime.with_model_metadata", side_effect=lambda service, key:service)
         metadata.start(); self.addCleanup(metadata.stop)
-        self.service = dict(SERVICE, modelMetadata={"supported_reasoning_efforts":["low", "medium", "xhigh"]})
+        self.service = dict(SERVICE, modelMetadata={"supported_reasoning_efforts":["none", "low", "medium", "xhigh"]})
 
     def wait(self, predicate):
         deadline = time.monotonic() + 10
@@ -213,6 +213,25 @@ class ClaudeRuntimeTest(unittest.TestCase):
                 restored = self.runtime.rpc("thread/resume", {"threadId":thread["id"]})["thread"]["turns"]
                 self.assertEqual(restored, finished)
                 self.runtime.stop()
+
+    def test_none_disables_sdk_thinking_and_can_be_changed_after_resume(self):
+        self.start()
+        thread = self.runtime.rpc("thread/start", {"cwd":str(self.root)})["thread"]
+        _, request = self.turn(thread, effort="none")
+        probe = json.loads((self.runtime.directory / "home/probe.json").read_text())
+        self.assertNotIn("effort", probe)
+        self.assertEqual(probe["thinking"], {"type":"disabled"})
+        self.assertEqual(probe["extraBody"], {"thinking":{"type":"disabled"}, "output_config":{"effort":None}})
+        self.runtime.respond(request["id"], {"decision":"decline"})
+        self.wait(lambda:not self.runtime.events()["turns"])
+        self.runtime.stop(); self.start()
+        self.assertEqual(self.runtime.rpc("thread/resume", {"threadId":thread["id"]})["reasoningEffort"], "none")
+        _, request = self.turn(thread, effort="low")
+        probe = json.loads((self.runtime.directory / "home/probe.json").read_text())
+        self.assertEqual(probe["effort"], "low")
+        self.assertEqual(probe["thinking"], {"type":"adaptive"})
+        self.runtime.respond(request["id"], {"decision":"decline"})
+        self.wait(lambda:not self.runtime.events()["turns"])
 
     def test_launcher_routes_require_auth_and_enabled_builtin(self):
         launcher = LauncherRuntime(str(self.root / "profiles.json"), plugins_dir=str(self.root / "plugins"))

@@ -396,11 +396,11 @@ class FastLLmCompletion:
       if effort is None:
           effort = template_kwargs.get(
               "thinking_effort", template_kwargs.get("reasoning_effort"))
-      if effort is None:
+      if effort in {None, "none"}:
           effort = "max"
       if effort not in {"low", "high", "max"}:
           raise ValueError(
-              "Kimi K3 reasoning_effort must be one of: low, high, max")
+              "Kimi K3 reasoning_effort must be one of: none, low, high, max")
       return effort
 
   def _resolve_qwen3_5_reasoning_effort(
@@ -413,11 +413,11 @@ class FastLLmCompletion:
       if effort is None:
           effort = template_kwargs.get(
               "reasoning_effort", template_kwargs.get("thinking_effort"))
-      if effort is None:
+      if effort in {None, "none"}:
           effort = "xhigh"
       if effort not in {"low", "medium", "xhigh"}:
           raise ValueError(
-              "Qwen reasoning_effort must be one of: low, medium, xhigh")
+              "Qwen reasoning_effort must be one of: none, low, medium, xhigh")
       return effort
 
   def _resolve_glm5_next_reasoning_effort(
@@ -430,11 +430,11 @@ class FastLLmCompletion:
       if effort is None:
           effort = template_kwargs.get(
               "reasoning_effort", template_kwargs.get("thinking_effort"))
-      if effort is None:
+      if effort in {None, "none"}:
           effort = "max"
       if effort not in {"low", "high", "max"}:
           raise ValueError(
-              "GLM-5.3 reasoning_effort must be one of: low, high, max")
+              "GLM-5.3 reasoning_effort must be one of: none, low, high, max")
       return effort
 
   def _resolve_chat_template_kwargs(
@@ -3075,8 +3075,8 @@ class FastLLmCompletion:
       stop_token_ids = self._stop_token_ids_from_strings(stop_strings)
 
       enable_thinking = self.enable_thinking
-      if request.reasoning_effort and request.reasoning_effort != "none":
-          enable_thinking = True
+      if request.reasoning_effort is not None:
+          enable_thinking = request.reasoning_effort != "none"
       if request.chat_template_kwargs and "enable_thinking" in request.chat_template_kwargs:
           enable_thinking = bool(request.chat_template_kwargs["enable_thinking"])
       try:

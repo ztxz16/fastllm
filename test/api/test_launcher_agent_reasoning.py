@@ -25,7 +25,7 @@ class AgentReasoningTest(unittest.TestCase):
         request = opening.call_args.args[0]
         self.assertEqual(request.full_url, SERVICE["endpoint"] + "/v1/models")
         self.assertEqual(request.get_header("Authorization"), "Bearer test-api-key")
-        self.assertEqual(reasoning_options(service), (["low", "medium", "xhigh"], "xhigh"))
+        self.assertEqual(reasoning_options(service), (["none", "low", "medium", "xhigh"], "xhigh"))
         self.assertNotIn("modelMetadata", SERVICE)
 
     def test_absent_or_unusable_metadata_does_not_invent_efforts(self):
@@ -46,8 +46,8 @@ class AgentReasoningTest(unittest.TestCase):
         }}), (["low", "max"], "max"))
 
     def test_native_agent_catalogs_offer_only_the_models_native_efforts(self):
-        for model_type, expected, default in (("qwen3_5", ["low", "medium", "xhigh"], "xhigh"),
-                ("kimi_k3", ["low", "high", "max"], "max"), (None, [], None)):
+        for model_type, expected, default in (("qwen3_5", ["none", "low", "medium", "xhigh"], "xhigh"),
+                ("kimi_k3", ["none", "low", "high", "max"], "max"), (None, [], None)):
             with self.subTest(model_type=model_type), tempfile.TemporaryDirectory() as directory:
                 service = dict(SERVICE, modelMetadata=FastLLmModel("my-alias",
                     _FakeModel(32768, 32768, model_type=model_type)).response["data"][0])
@@ -68,19 +68,21 @@ class AgentReasoningTest(unittest.TestCase):
                 provider = harness["llm-pi-ai"]["config"]["providers"]["fastllm"]
                 self.assertEqual(provider.get("reasoning"), default)
                 self.assertEqual(provider["models"][0]["reasoningEfforts"],
-                    {effort: effort for effort in expected} if expected else False)
+                    {"off" if effort == "none" else effort: effort for effort in expected} if expected else False)
                 self.assertEqual(harness["agent-default-model"]["config"].get("reasoningEffort"), default)
 
     def test_codex_forwards_supported_effort_and_rejects_invalid_or_stale_selections(self):
         with tempfile.TemporaryDirectory() as directory:
             runtime = CodexRuntime(directory)
-            runtime._service = dict(SERVICE, modelMetadata={"supported_reasoning_efforts": ["low", "medium", "xhigh"]})
+            runtime._service = dict(SERVICE, modelMetadata={"supported_reasoning_efforts": ["none", "low", "medium", "xhigh"]})
             connection = Mock()
             with patch.object(runtime, "_ready", return_value=connection):
                 runtime.rpc("turn/start", {"threadId": "thread-a", "text": "Hello", "effort": "xhigh"})
                 self.assertEqual(connection.call.call_args.args, ("turn/start", {
                     "threadId": "thread-a", "effort": "xhigh",
                     "input": [{"type": "text", "text": "Hello", "text_elements": []}]}))
+                runtime.rpc("turn/start", {"threadId": "thread-a", "text": "Hello", "effort": "none"})
+                self.assertEqual(connection.call.call_args.args[1]["effort"], "none")
                 for effort in ("high", "max", "", None, {}):
                     with self.subTest(effort=effort), self.assertRaises(RuntimeError):
                         runtime.rpc("turn/start", {"threadId": "thread-a", "text": "Hello", "effort": effort})

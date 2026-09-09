@@ -672,6 +672,7 @@
     "Reasoning effort for this conversation": "当前会话的思考档位",
     "This model does not advertise adjustable reasoning effort.": "当前模型未声明可调节的思考档位。",
     "Model default": "模型默认",
+    "None": "无",
     "Minimal": "最少",
     "Low": "低",
     "Medium": "中",
