@@ -2344,7 +2344,11 @@ namespace {
             const int row = vector / ((uint64_t)width * keyHeads);
             const int sourceToken = indices[
                 (uint64_t)(rowStart + row) * width + selected];
-            const bool valid = sourceToken >= 0 && sourceToken < keyLength;
+            // Dense graph indices include every allocated column. A verifier
+            // row must not see later draft rows already appended to the KV.
+            const int rowLength = decodeMeta != nullptr
+                ? decodeMeta[0] + rowStart + row + 1 : keyLength;
+            const bool valid = sourceToken >= 0 && sourceToken < rowLength;
             if (valid) {
                 const uint64_t source =
                     (uint64_t)sourceToken * headDim + column;
@@ -2387,7 +2391,9 @@ namespace {
             const int row = tokenVector / ((uint64_t)width * keyHeads);
             const int sourceToken = indices[
                 (uint64_t)(rowStart + row) * width + selected];
-            const bool valid = sourceToken >= 0 && sourceToken < keyLength;
+            const int rowLength = decodeMeta != nullptr
+                ? decodeMeta[0] + rowStart + row + 1 : keyLength;
+            const bool valid = sourceToken >= 0 && sourceToken < rowLength;
             uint4 keyVector = make_uint4(0, 0, 0, 0);
             uint4 valueVector = make_uint4(0, 0, 0, 0);
             if (valid) {
