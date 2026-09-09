@@ -39,7 +39,8 @@ class LauncherWebUIBrowserTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.runtime = LauncherRuntime(os.path.join(self.temp.name, 'profiles.json'),
-                                       webui_history_dir=os.path.join(self.temp.name, 'history'))
+                                       webui_history_dir=os.path.join(self.temp.name, 'history'),
+                                       plugins_dir=os.path.join(self.temp.name, 'plugins'))
         self.addCleanup(self.close_runtime)
         self.runtime._process = SimpleNamespace(poll=lambda: None)
         self.runtime._state.update(command='server', phase='running', ready=True,
@@ -50,6 +51,7 @@ class LauncherWebUIBrowserTest(unittest.TestCase):
         args.api_model = 'standalone-model'
         args.agent_runtime = 'builtin'
         args.history_dir = os.path.join(self.temp.name, 'standalone-history')
+        args.plugins_dir = os.path.join(self.temp.name, 'plugins')
         standalone = create_app(args)
         self.standalone = standalone.state.runtime
         self.addCleanup(self.standalone.close)
@@ -101,6 +103,734 @@ class LauncherWebUIBrowserTest(unittest.TestCase):
         self.page.clock.fast_forward(35000)
         expect(self.page.locator('#webui-content')).to_be_visible()
         expect(self.page.locator('#webui-retry')).to_be_hidden()
+
+    def install_test_plugin(self, text='first', **manifest):
+        from test_ui_plugins import bundle
+        files = bundle(text=text, **manifest)
+        files['index.html'] = '''<!doctype html><html><head></head><body>
+          <output id="value">loading</output><button id="insert">Insert</button>
+          <script>
+          (async () => {
+            let isolated = false;
+            try { parent.document.body.textContent = 'unsafe'; } catch (_) { isolated = true; }
+            const report = await ftllm.call('hardware.read');
+            document.querySelector('#value').textContent = LABEL + ':' + isolated + ':' + Boolean(report.memory);
+            document.querySelector('#insert').onclick = async () => {
+              const context = await ftllm.call('studio.context');
+              await ftllm.call('studio.insert', {text:'Plugin addition'});
+              document.querySelector('#value').textContent = context.draft;
+            };
+          })();
+          </script></body></html>'''.replace('LABEL', json.dumps(text))
+        current = next((p for p in self.runtime.plugins.list()['plugins'] if p['id'] == 'monitor'), None)
+        self.runtime.plugins.apply('monitor', files, current['revision'] if current else '')
+        self.page.clock.fast_forward(2100)
+        return files
+
+    def test_plugin_hot_add_replace_remove_and_isolation(self):
+        self.install_test_plugin()
+        nav = self.page.locator('[data-view-button="plugin-monitor"]')
+        expect(nav).to_be_visible(); nav.click()
+        self.assertLess(nav.bounding_box()['height'], 60)
+        frame = self.page.frame_locator('#view-plugin-monitor iframe')
+        expect(frame.locator('#value')).to_have_text('first:true:true')
+        self.assertIsNotNone(self.runtime._process)
+        self.install_test_plugin('second')
+        expect(frame.locator('#value')).to_have_text('second:true:true')
+        expect(nav).to_have_attribute('aria-current', 'page')
+        self.runtime.plugins.set_enabled('monitor', False)
+        self.page.clock.fast_forward(2100)
+        expect(nav).to_have_count(0)
+        expect(self.page.locator('#profile-browser')).to_be_visible()
+        self.assertIsNotNone(self.runtime._process)
+
+    def test_customizer_entry_icon_and_no_studio_entry(self):
+        button = self.page.locator('.navigation > .plugin-manager-button')
+        expect(button).to_have_text('自定义界面')
+        emblem = button.locator('.plugin-manager-emblem')
+        expect(emblem.locator('svg')).to_be_visible()
+        self.assertIn('linear-gradient', emblem.evaluate('node => getComputedStyle(node).backgroundImage'))
+        self.page.locator('#open-webui').click(); self.assert_loaded()
+        expect(self.page.locator('#webui-content .plugin-manager-button')).to_have_count(0)
+        self.screenshot('customizer-entry-light')
+        self.page.locator('#theme-select').select_option('dark')
+        button.hover()
+        self.screenshot('customizer-entry-dark')
+        self.page.emulate_media(reduced_motion='reduce')
+        expect(emblem).to_have_css('transform', 'none')
+        self.page.goto(self.url + '/standalone/')
+        expect(self.page.locator('#webui-root #prompt')).to_be_visible()
+        expect(self.page.locator('#webui-root .plugin-manager-button')).to_have_count(0)
+        self.page.goto(self.url + '/standalone/#customize')
+        expect(self.page.locator('#webui-root .plugin-manager')).to_be_visible()
+
+    def test_custom_plugin_delete_unloads_without_changing_studio_draft(self):
+        self.install_test_plugin(slot='topbar')
+        self.install_test_plugin('second', slot='topbar')
+        self.page.locator('#open-webui').click(); self.assert_loaded()
+        pane = self.page.locator('body > .app-shell #webui-content')
+        pane.locator('#prompt').fill('Keep this conversation draft')
+        self.page.locator('.navigation > .plugin-manager-button').click()
+        editor = self.page.locator('body > .plugin-manager')
+        editor.locator('.customizer-library > summary').click()
+        row = editor.locator('[data-plugin-id=monitor]')
+        expect(editor.locator('[data-plugin-id=studio] .plugin-delete')).to_have_count(0)
+        expect(editor.locator('.plugin-delete')).to_have_count(1)
+        row.locator('.plugin-delete').click()
+        row.locator('.plugin-delete-confirm').get_by_role('button', name='取消', exact=True).click()
+        self.assertTrue((self.runtime.plugins.directory / 'monitor').is_dir())
+        row.locator('.plugin-delete').click()
+        self.screenshot('custom-plugin-delete')
+        row.locator('.plugin-confirm-delete').click()
+        expect(row).to_have_count(0)
+        expect(self.page.locator('body > .app-shell .plugin-shell-topbar iframe')).to_have_count(0)
+        expect(editor.locator('.customizer-screen .plugin-shell-topbar iframe')).to_have_count(0)
+        self.assertFalse((self.runtime.plugins.directory / 'monitor').exists())
+        self.assertFalse((self.runtime.plugins.directory / '.history/monitor.json').exists())
+        expect(pane.locator('#prompt')).to_have_value('Keep this conversation draft')
+        self.assertIsNotNone(self.runtime._process)
+
+    def test_plugin_replacement_can_restore_original_page(self):
+        self.install_test_plugin(replaces='hardware')
+        self.page.locator('[data-view-button="hardware"]').click()
+        frame = self.page.frame_locator('#view-hardware iframe')
+        expect(frame.locator('#value')).to_have_text('first:true:true')
+        self.runtime.plugins.set_enabled('monitor', False)
+        self.page.clock.fast_forward(2100)
+        expect(self.page.locator('#view-hardware iframe')).to_have_count(0)
+        expect(self.page.locator('#refresh-hardware')).to_be_visible()
+
+    def test_plugin_script_error_keeps_recovery_controls_working(self):
+        from test_ui_plugins import bundle
+        files = bundle()
+        files['index.html'] = '<!doctype html><script>throw new Error("broken plugin fixture")</script>'
+        self.runtime.plugins.apply('monitor', files, '')
+        self.page.clock.fast_forward(2100)
+        self.page.locator('[data-view-button="plugin-monitor"]').click()
+        expect(self.page.locator('#view-plugin-monitor > .plugin-status')).to_contain_text('broken plugin fixture')
+        self.page.locator('.navigation > .plugin-manager-button').click()
+        expect(self.page.locator('body > .plugin-manager')).to_be_visible()
+        self.assertEqual(self.errors, ['broken plugin fixture'])
+        self.errors.clear()
+
+    def test_studio_plugin_preserves_draft_and_uses_scoped_bridge(self):
+        self.install_test_plugin(slot='studio', capabilities=['hardware.read', 'studio.context', 'studio.insert'])
+        self.page.locator('#open-webui').click(); self.assert_loaded()
+        pane = self.page.locator('#webui-content')
+        pane.locator('#prompt').fill('Keep this draft')
+        frame = self.page.frame_locator('#webui-content iframe.plugin-frame')
+        expect(frame.locator('#value')).to_have_text('first:true:true')
+        frame.locator('#insert').click()
+        expect(frame.locator('#value')).to_have_text('Keep this draft')
+        expect(pane.locator('#prompt')).to_have_value('Keep this draftPlugin addition')
+        self.runtime.plugins.set_enabled('monitor', False)
+        self.page.clock.fast_forward(2100)
+        expect(pane.locator('iframe.plugin-frame')).to_have_count(0)
+        expect(pane.locator('#prompt')).to_have_value('Keep this draftPlugin addition')
+
+    def test_plugin_model_preview_apply_and_core_recovery_ui(self):
+        from test_ui_plugins import bundle
+        files = bundle(text='Generated page')
+        self.page.locator('#open-webui').click(); self.assert_loaded()
+        model = self.runtime._webui_app.state.runtime.api_client
+        with patch.object(model, 'stream', side_effect=lambda *a, **k: iter([(json.dumps({'summary':'New monitor', 'files':files}), '')])) as complete:
+            self.page.locator('.navigation > .plugin-manager-button').click()
+            dialog = self.page.locator('body > .plugin-manager')
+            dialog.locator('.customizer-options > summary').click()
+            dialog.locator('[name="id"]').fill('monitor')
+            dialog.locator('[name="instruction"]').fill('增加一个硬件监控栏目')
+            dialog.locator('.plugin-editor [type=submit]').click()
+            expect(dialog.locator('.plugin-preview')).to_be_visible()
+            self.assertFalse((self.runtime.plugins.directory / 'monitor').exists())
+            dialog.locator('.plugin-apply').click()
+            expect(dialog.locator('.plugin-result')).to_have_text('已应用，界面已更新。')
+            self.assertEqual(complete.call_count, 1)
+            dialog.locator('.plugin-heading [aria-label="关闭"]').click()
+            self.page.clock.fast_forward(2100)
+            self.page.locator('[data-view-button="plugin-monitor"]').click()
+            expect(self.page.frame_locator('#view-plugin-monitor iframe').locator('p')).to_have_text('Generated page')
+            expect(self.page.locator('.navigation > .plugin-manager-button')).to_be_visible()
+
+    def test_customizer_stream_progress_live_draft_preview_and_manual_edits(self):
+        from test_ui_plugins import bundle
+        self.page.locator('#open-webui').click(); self.assert_loaded()
+        model = self.runtime._webui_app.state.runtime.api_client
+        files = bundle(slot='topbar')
+        files['index.html'] = '''<!doctype html><output>loading</output><script>
+          ftllm.call('hardware.read').then(value => {
+            document.querySelector('output').textContent = 'Preview memory: ' + Boolean(value.memory);
+          });</script>'''
+        content = json.dumps({'summary': 'Hardware status', 'files': files})
+        release = threading.Event(); self.addCleanup(release.set)
+        def stream(*args, **kwargs):
+            yield content[:90], ''
+            release.wait(10)
+            yield content[90:], ''
+        with patch.object(model, 'stream', side_effect=stream):
+            button = self.page.locator('.navigation > .plugin-manager-button')
+            expect(button).to_have_text('自定义界面'); button.click()
+            editor = self.page.locator('body > .plugin-manager')
+            self.assertEqual(editor.evaluate('node => node.tagName'), 'MAIN')
+            self.assertTrue(self.page.url.endswith('#customize'))
+            expect(editor.locator('.customizer-screen .app-shell')).to_be_visible()
+            editor.locator('.customizer-options > summary').click()
+            editor.locator('[name=id]').fill('monitor')
+            editor.locator('[name=target]').select_option('topbar')
+            editor.locator('[name=instruction]').fill('右上角增加硬件状态栏')
+            editor.locator('.plugin-editor [type=submit]').click()
+            expect(editor).to_have_attribute('data-stage', 'generating')
+            expect(editor.locator('.customizer-user p')).to_have_text('右上角增加硬件状态栏')
+            expect(editor.locator('.customizer-reply')).to_have_text('模型正在生成修改…')
+            expect(editor.locator('.plugin-output')).to_have_count(0)
+            expect(editor.locator('.plugin-timing')).to_contain_text('90 字符')
+            self.page.clock.fast_forward(2100)
+            expect(editor.locator('.plugin-timing')).to_contain_text('已用 2 秒')
+            self.screenshot('customizer-generating')
+            release.set()
+            expect(editor.locator('.plugin-result')).to_have_text('预览已更新，尚未应用修改。')
+            expect(editor.locator('.customizer-reply')).to_have_text('Hardware status')
+            preview = editor.frame_locator('.customizer-screen .plugin-shell-topbar iframe')
+            expect(preview.locator('output')).to_have_text('Preview memory: true')
+            self.assertFalse((self.runtime.plugins.directory / 'monitor').exists())
+            expect(self.page.locator('body > .app-shell > .workspace > .topbar iframe')).to_have_count(0)
+            expect(editor.locator('.customizer-screen #stop-runtime')).to_be_disabled()
+            editor.locator('.customizer-code > summary').click()
+            editor.locator('.plugin-files').select_option('index.html')
+            editor.locator('.plugin-after').fill('<!doctype html><output>Edited preview</output>')
+            self.page.clock.fast_forward(500)
+            expect(preview.locator('output')).to_have_text('Edited preview')
+            editor.locator('.plugin-files').select_option('plugin.json')
+            editor.locator('.plugin-after').fill('{')
+            self.page.clock.fast_forward(500)
+            expect(editor.locator('.plugin-apply')).to_be_disabled()
+            expect(editor.locator('.plugin-result')).to_contain_text('plugin.json')
+            expect(preview.locator('output')).to_have_text('Edited preview')
+            editor.locator('.plugin-after').fill(files['plugin.json'])
+            self.page.clock.fast_forward(500)
+            expect(editor.locator('.plugin-apply')).to_be_enabled()
+            self.screenshot('customizer-preview')
+            editor.locator('.plugin-apply').click()
+            expect(editor.locator('.plugin-result')).to_have_text('已应用，界面已更新。')
+            editor.locator('.plugin-heading [aria-label=关闭]').click()
+            expect(editor).to_be_hidden()
+            expect(self.page.frame_locator('body > .app-shell .plugin-shell-topbar iframe').locator('output')).to_have_text('Edited preview')
+
+    def test_customizer_conversation_keeps_rounds_and_sends_history_with_latest_draft(self):
+        from test_ui_plugins import bundle
+        first = bundle(slot='topbar', text='First version')
+        second = bundle(slot='topbar', text='Compact version')
+        self.page.locator('#open-webui').click(); self.assert_loaded()
+        model = self.runtime._webui_app.state.runtime.api_client
+        answers = [iter([(json.dumps({'summary': '已增加绿色硬件栏。', 'files': first}), '')]),
+                   iter([(json.dumps({'summary': '已缩小间距，保留绿色。', 'files': second}), '')]),
+                   iter([(json.dumps({'summary': '已调整文字大小。', 'files': second}), '')])]
+        with patch.object(model, 'stream', side_effect=answers) as generate:
+            self.page.locator('.navigation > .plugin-manager-button').click()
+            editor = self.page.locator('body > .plugin-manager')
+            editor.locator('.customizer-options > summary').click()
+            editor.locator('[name=id]').fill('monitor')
+            editor.locator('[name=instruction]').fill('增加硬件栏，使用绿色')
+            editor.locator('.plugin-editor [type=submit]').click()
+            expect(editor.locator('.plugin-apply')).to_be_enabled()
+            expect(editor.locator('[name=instruction]')).to_have_value('')
+            editor.locator('.customizer-code > summary').click()
+            editor.locator('.plugin-files').select_option('index.html')
+            manual = '<!doctype html><p>Latest manual edit</p>'
+            editor.locator('.plugin-after').fill(manual)
+            self.page.clock.fast_forward(500)
+            expect(editor.locator('.plugin-apply')).to_be_enabled()
+            editor.locator('.customizer-code > summary').click()
+            editor.locator('[name=instruction]').fill('再紧凑一点，颜色保持刚才的')
+            editor.locator('.plugin-editor [type=submit]').click()
+            expect(editor.locator('.plugin-apply')).to_be_enabled()
+            expect(editor.locator('.customizer-user p')).to_have_text(['增加硬件栏，使用绿色', '再紧凑一点，颜色保持刚才的'])
+            expect(editor.locator('.customizer-reply')).to_have_text(['已增加绿色硬件栏。', '已缩小间距，保留绿色。'])
+            messages = generate.call_args_list[1].args[0]
+            self.assertEqual(messages[1], {'role': 'user', 'content': '增加硬件栏，使用绿色'})
+            self.assertIn('已增加绿色硬件栏。', messages[2]['content'])
+            self.assertEqual(json.loads(messages[-1]['content'])['reference']['index.html'], manual)
+            self.assertFalse((self.runtime.plugins.directory / 'monitor').exists())
+            self.screenshot('customizer-conversation')
+            editor.locator('.plugin-apply').click()
+            expect(editor.locator('.customizer-turn-status').nth(1)).to_have_text('已应用到当前界面。')
+            editor.locator('.plugin-heading [aria-label=关闭]').click()
+            self.page.locator('.navigation > .plugin-manager-button').click()
+            expect(editor.locator('.customizer-turn')).to_have_count(2)
+            editor.locator('.customizer-new-chat').click()
+            expect(editor.locator('.customizer-turn')).to_have_count(0)
+            expect(editor.locator('.plugin-preview')).to_be_hidden()
+            editor.locator('.customizer-options > summary').click()
+            editor.locator('[name=id]').fill('monitor')
+            editor.locator('[name=instruction]').fill('文字再大一点')
+            editor.locator('.plugin-editor [type=submit]').click()
+            expect(editor.locator('.plugin-apply')).to_be_enabled()
+            expect(editor.locator('.customizer-turn')).to_have_count(1)
+            self.assertEqual(len(generate.call_args_list[2].args[0]), 2)
+            self.assertEqual(json.loads(generate.call_args_list[2].args[0][-1]['content'])['reference'], second)
+
+    def test_customizer_sessions_restore_drafts_rename_delete_and_survive_reload(self):
+        from test_ui_plugins import bundle
+        requests = []
+        def generate(route):
+            payload = route.request.post_data_json; requests.append(payload)
+            files = bundle(payload['id'], slot='topbar', text=payload['id'])
+            route.fulfill(status=200, content_type='application/x-ndjson', body=json.dumps({'stage': 'ready', 'proposal': {
+                'id': payload['id'], 'files': files, 'manifest': {'slot': 'topbar'}, 'summary': '完成 ' + payload['id'], 'expectedRevision': ''}}) + '\n')
+        self.page.route('**/api/plugins/propose-stream', generate)
+        self.page.locator('.navigation > .plugin-manager-button').click()
+        editor = self.page.locator('body > .plugin-manager')
+        for identifier, instruction in [('alpha', '增加硬件状态栏'), ('beta', '增加统计信息')]:
+            if identifier == 'beta':
+                editor.locator('.customizer-new-chat').click()
+                expect(editor.locator('.customizer-turn')).to_have_count(0)
+                expect(editor.locator('[name=instruction]')).to_have_value('')
+                expect(editor.locator('.plugin-preview')).to_be_hidden()
+            editor.locator('.customizer-options > summary').click()
+            editor.locator('[name=id]').fill(identifier)
+            editor.locator('[name=target]').select_option('topbar')
+            editor.locator('[name=instruction]').fill(instruction)
+            editor.locator('.plugin-editor [type=submit]').click()
+            expect(editor.locator('.plugin-apply')).to_be_enabled()
+            if identifier == 'alpha':
+                editor.locator('.customizer-code > summary').click()
+                editor.locator('.plugin-files').select_option('index.html')
+                editor.locator('.plugin-after').fill('<!doctype html><p>Alpha edited draft</p>')
+                self.page.clock.fast_forward(500)
+                expect(editor.locator('.plugin-apply')).to_be_enabled()
+                editor.locator('.customizer-code > summary').click()
+            editor.locator('[name=instruction]').fill('尚未发送：' + identifier)
+        self.assertEqual([request['history'] for request in requests], [[], []])
+        editor.locator('.customizer-toggle-sessions').click()
+        rows = editor.locator('.customizer-session')
+        expect(rows).to_have_count(2)
+        alpha = rows.filter(has_text='增加硬件状态栏')
+        alpha.locator('[data-session-action=rename]').click()
+        alpha.locator('[aria-label=对话名称]').fill('硬件监控')
+        alpha.locator('[data-session-action=save-name]').click()
+        editor.locator('.customizer-session-search').fill('硬件监控')
+        expect(rows).to_have_count(1)
+        rows.locator('[data-session-action=switch]').click()
+        expect(editor.locator('.plugin-apply')).to_be_enabled()
+        expect(editor.locator('.customizer-reply')).to_have_text('完成 alpha')
+        expect(editor.locator('[name=instruction]')).to_have_value('尚未发送：alpha')
+        expect(editor.frame_locator('.customizer-screen .plugin-shell-topbar iframe').locator('p')).to_have_text('Alpha edited draft')
+        self.page.reload()
+        expect(editor.locator('.customizer-session-title')).to_have_text('硬件监控')
+        expect(editor.locator('.plugin-apply')).to_be_enabled()
+        expect(editor.locator('[name=instruction]')).to_have_value('尚未发送：alpha')
+        expect(editor.frame_locator('.customizer-screen .plugin-shell-topbar iframe').locator('p')).to_have_text('Alpha edited draft')
+        editor.locator('.customizer-toggle-sessions').click()
+        expect(rows).to_have_count(2)
+        self.screenshot('customizer-session-management')
+        beta = rows.filter(has_text='增加统计信息')
+        beta.locator('[data-session-action=delete]').click()
+        beta.locator('[data-session-action=cancel]').click()
+        expect(rows).to_have_count(2)
+        beta.locator('[data-session-action=delete]').click()
+        beta.locator('[data-session-action=confirm-delete]').click()
+        expect(rows).to_have_count(1)
+        editor.locator('.customizer-toggle-sessions').click()
+        editor.locator('.plugin-apply').click()
+        expect(editor.locator('.plugin-result')).to_have_text('已应用，界面已更新。')
+        editor.locator('.customizer-toggle-sessions').click()
+        rows.locator('[data-session-action=delete]').click()
+        rows.locator('[data-session-action=confirm-delete]').click()
+        expect(editor.locator('.customizer-session-title')).to_have_text('新对话')
+        expect(editor.locator('.customizer-turn')).to_have_count(0)
+        self.assertEqual(self.runtime.plugins.files('alpha')['index.html'], '<!doctype html><p>Alpha edited draft</p>')
+        self.page.reload()
+        expect(editor.locator('.customizer-session-title')).to_have_text('新对话')
+        expect(editor.locator('.customizer-turn')).to_have_count(0)
+
+    def test_customizer_new_sessions_get_distinct_automatic_names_and_context(self):
+        from test_ui_plugins import bundle
+        requests = []
+        def generate(route):
+            payload = route.request.post_data_json; requests.append(payload)
+            files = bundle(payload['id'], slot='topbar')
+            route.fulfill(status=200, content_type='application/x-ndjson', body=json.dumps({'stage': 'ready', 'proposal': {
+                'id': payload['id'], 'files': files, 'manifest': {'slot': 'topbar'}, 'summary': '完成', 'expectedRevision': ''}}) + '\n')
+        self.page.route('**/api/plugins/propose-stream', generate)
+        self.page.locator('.navigation > .plugin-manager-button').click()
+        editor = self.page.locator('body > .plugin-manager')
+        for index in range(2):
+            if index:
+                editor.locator('.customizer-new-chat').click()
+            editor.locator('[name=instruction]').fill(f'增加栏目 {index}')
+            editor.locator('.plugin-editor [type=submit]').click()
+            expect(editor.locator('.plugin-apply')).to_be_enabled()
+        self.assertNotEqual(requests[0]['id'], requests[1]['id'])
+        self.assertEqual([request['history'] for request in requests], [[], []])
+        self.assertNotIn('draft', requests[1])
+        expect(editor.locator('.customizer-user p')).to_have_text('增加栏目 1')
+
+    def test_customizer_switch_ignores_old_preview_validation(self):
+        from test_ui_plugins import bundle
+        files = bundle(slot='topbar')
+        self.page.route('**/api/plugins/propose-stream', lambda route: route.fulfill(
+            status=200, content_type='application/x-ndjson', body=json.dumps({'stage': 'ready', 'proposal': {
+                'id': 'monitor', 'files': files, 'manifest': {'slot': 'topbar'}, 'summary': '硬件栏', 'expectedRevision': ''}}) + '\n'))
+        self.page.locator('.navigation > .plugin-manager-button').click()
+        editor = self.page.locator('body > .plugin-manager')
+        editor.locator('.customizer-options > summary').click()
+        editor.locator('[name=id]').fill('monitor')
+        editor.locator('[name=instruction]').fill('增加硬件栏')
+        editor.locator('.plugin-editor [type=submit]').click()
+        expect(editor.locator('.plugin-apply')).to_be_enabled()
+        pending = []
+        self.page.route('**/api/plugins/preview', lambda route: pending.append(route))
+        editor.locator('.customizer-code > summary').click()
+        editor.locator('.plugin-files').select_option('index.html')
+        editor.locator('.plugin-after').fill('<!doctype html><p>Late response</p>')
+        self.page.clock.fast_forward(500)
+        self.page.wait_for_function('true')
+        self.assertEqual(len(pending), 1)
+        editor.locator('.customizer-new-chat').click()
+        expect(editor.locator('.customizer-new-chat')).to_be_enabled()
+        expect(editor.locator('.customizer-turn')).to_have_count(0)
+        checked = self.runtime.plugins.preview('monitor', pending[0].request.post_data_json['files'])
+        pending[0].fulfill(status=200, content_type='application/json', body=json.dumps(checked))
+        expect(editor.locator('.plugin-preview')).to_be_hidden()
+        expect(editor.locator('.customizer-screen .plugin-shell-topbar iframe')).to_have_count(0)
+        expect(editor.locator('.customizer-turn')).to_have_count(0)
+        # Reopening a conversation also restores its last valid preview. That
+        # fallback must not run after the user has already selected a new chat.
+        self.page.unroute('**/api/plugins/preview')
+        editor.locator('.customizer-toggle-sessions').click()
+        editor.locator('.customizer-session').filter(has_text='增加硬件栏').locator('[data-session-action=switch]').click()
+        expect(editor.locator('.plugin-apply')).to_be_enabled()
+        editor.locator('.plugin-heading [aria-label=关闭]').click()
+        self.page.route('**/api/plugins/preview', lambda route: pending.append(route))
+        with self.page.expect_request('**/api/plugins/preview'):
+            self.page.locator('.navigation > .plugin-manager-button').click()
+        editor.locator('.customizer-new-chat').click()
+        expect(editor.locator('.customizer-new-chat')).to_be_enabled()
+        checked = self.runtime.plugins.preview('monitor', pending[1].request.post_data_json['files'])
+        pending[1].fulfill(status=200, content_type='application/json', body=json.dumps(checked))
+        self.page.wait_for_timeout(100)
+        self.assertEqual(len(pending), 2)
+        expect(editor.locator('.plugin-preview')).to_be_hidden()
+        expect(editor.locator('.customizer-turn')).to_have_count(0)
+
+    def test_customizer_restores_invalid_edit_and_last_good_preview(self):
+        from test_ui_plugins import bundle
+        files = bundle(slot='topbar', text='Good preview')
+        self.page.route('**/api/plugins/propose-stream', lambda route: route.fulfill(
+            status=200, content_type='application/x-ndjson', body=json.dumps({'stage': 'ready', 'proposal': {
+                'id': 'monitor', 'files': files, 'manifest': {'slot': 'topbar'}, 'summary': '硬件栏', 'expectedRevision': ''}}) + '\n'))
+        self.page.locator('.navigation > .plugin-manager-button').click()
+        editor = self.page.locator('body > .plugin-manager')
+        editor.locator('.customizer-options > summary').click()
+        editor.locator('[name=id]').fill('monitor')
+        editor.locator('[name=instruction]').fill('增加硬件栏')
+        editor.locator('.plugin-editor [type=submit]').click()
+        expect(editor.locator('.plugin-apply')).to_be_enabled()
+        editor.locator('.customizer-code > summary').click()
+        editor.locator('.plugin-files').select_option('plugin.json')
+        editor.locator('.plugin-after').fill('{')
+        self.page.clock.fast_forward(500)
+        expect(editor.locator('.plugin-result')).to_contain_text('plugin.json')
+        self.page.reload()
+        expect(editor.locator('.plugin-after')).to_have_value('{')
+        expect(editor.locator('.plugin-apply')).to_be_disabled()
+        expect(editor.locator('.plugin-result')).to_contain_text('plugin.json')
+        expect(editor.frame_locator('.customizer-screen .plugin-shell-topbar iframe').locator('p')).to_have_text('Good preview')
+        editor.locator('.plugin-after').fill(files['plugin.json'])
+        self.page.clock.fast_forward(500)
+        expect(editor.locator('.plugin-apply')).to_be_enabled()
+
+    def test_customizer_storage_conflict_does_not_overwrite_another_tab(self):
+        self.page.locator('.navigation > .plugin-manager-button').click()
+        editor = self.page.locator('body > .plugin-manager')
+        expect(editor.locator('.customizer-new-chat')).to_be_enabled()
+        self.page.evaluate('''async () => {
+          const db = await new Promise((resolve, reject) => {
+            const request = indexedDB.open('ftllm-interface-editor', 1);
+            request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error);
+          });
+          await new Promise((resolve, reject) => {
+            const tx = db.transaction('conversations', 'readwrite'), store = tx.objectStore('conversations');
+            const request = store.get('/');
+            request.onsuccess = () => {
+              const saved = request.result; saved.revision++;
+              saved.conversations[0].title = 'Saved in another tab'; store.put(saved, '/');
+            };
+            tx.oncomplete = resolve; tx.onerror = () => reject(tx.error);
+          }); db.close();
+        }''')
+        editor.locator('[name=instruction]').fill('This tab keeps its unsaved input')
+        self.page.clock.fast_forward(350)
+        expect(editor.locator('.customizer-storage-error')).to_contain_text('其他页面已更新')
+        expect(editor.locator('[name=instruction]')).to_have_value('This tab keeps its unsaved input')
+        self.page.reload()
+        expect(editor.locator('.customizer-session-title')).to_have_text('Saved in another tab')
+
+    def test_customizer_failed_followup_keeps_reply_and_previous_draft(self):
+        from test_ui_plugins import bundle
+        files = bundle(slot='topbar', text='Last good preview')
+        self.page.locator('#open-webui').click(); self.assert_loaded()
+        model = self.runtime._webui_app.state.runtime.api_client
+        answers = [iter([(json.dumps({'summary': '已增加硬件栏。', 'files': files}), '')]), RuntimeError('上下文长度不足')]
+        with patch.object(model, 'stream', side_effect=answers):
+            self.page.locator('.navigation > .plugin-manager-button').click()
+            editor = self.page.locator('body > .plugin-manager')
+            editor.locator('.customizer-options > summary').click()
+            editor.locator('[name=id]').fill('monitor')
+            editor.locator('[name=instruction]').fill('增加硬件栏')
+            editor.locator('.plugin-editor [type=submit]').click()
+            expect(editor.locator('.plugin-apply')).to_be_enabled()
+            editor.locator('[name=instruction]').fill('再显示一些信息')
+            editor.locator('.plugin-editor [type=submit]').click()
+            expect(editor.locator('.plugin-result')).to_have_text('上下文长度不足')
+            expect(editor.locator('.customizer-reply')).to_have_text(['已增加硬件栏。', '上下文长度不足'])
+            expect(editor.locator('.plugin-apply')).to_be_enabled()
+            expect(editor.frame_locator('.customizer-screen .plugin-shell-topbar iframe').locator('p')).to_have_text('Last good preview')
+            editor.locator('.plugin-apply').click()
+            expect(editor.locator('.customizer-turn-status').first).to_have_text('已应用到当前界面。')
+            expect(editor.locator('.customizer-reply').nth(1)).to_have_text('上下文长度不足')
+            self.assertEqual(self.runtime.plugins.files('monitor'), files)
+
+    def test_customizer_cancel_and_browser_back_preserve_studio_draft(self):
+        self.page.locator('#open-webui').click(); self.assert_loaded()
+        pane = self.page.locator('body > .app-shell #webui-content')
+        pane.locator('#prompt').fill('Keep original draft')
+        controls = []
+        def stream(*args, **kwargs):
+            control = kwargs['control']; controls.append(control)
+            yield '{"files":', ''
+            control.event.wait(10)
+            control.check()
+        model = self.runtime._webui_app.state.runtime.api_client
+        with patch.object(model, 'stream', side_effect=stream):
+            expect(pane.locator('.plugin-manager-button')).to_have_count(0)
+            self.page.locator('.navigation > .plugin-manager-button').click()
+            editor = self.page.locator('body > .plugin-manager')
+            expect(editor).to_be_visible()
+            editor.locator('[name=instruction]').fill('更换皮肤')
+            editor.locator('.plugin-editor [type=submit]').click()
+            expect(editor.locator('.plugin-timing')).to_contain_text('9 字符')
+            expect(editor.locator('.customizer-toggle-sessions')).to_be_disabled()
+            editor.locator('.plugin-cancel').click()
+            expect(editor.locator('.plugin-result')).to_have_text('已取消生成，尚未应用修改。')
+            expect(editor.locator('.customizer-user p')).to_have_text('更换皮肤')
+            expect(editor.locator('.customizer-reply')).to_have_text('已取消生成，尚未应用修改。')
+            self.assertTrue(controls[0].event.wait(2))
+            self.assertFalse(self.runtime.plugins.directory.exists())
+            self.page.go_back()
+            expect(editor).to_be_hidden()
+            expect(pane.locator('#prompt')).to_have_value('Keep original draft')
+            pane.locator('#prompt').click()
+            self.page.go_forward()
+            expect(editor).to_be_visible()
+            expect(editor.locator('.customizer-turn')).to_have_count(1)
+            editor.locator('.plugin-heading [aria-label=关闭]').click()
+
+    def test_customizer_clicks_and_forms_only_change_preview(self):
+        storage = self.page.evaluate('JSON.stringify(localStorage)')
+        writes = []
+        self.page.on('request', lambda request: writes.append(request.url)
+                     if request.method not in ('GET', 'HEAD') else None)
+        self.page.locator('.navigation > .plugin-manager-button').click()
+        editor = self.page.locator('body > .plugin-manager')
+        snapshot = editor.locator('.customizer-preview-page')
+        expect(snapshot.locator('#stop-runtime')).to_be_disabled()
+        snapshot.locator('[data-open-view=hardware]').click()
+        expect(snapshot.locator('#view-hardware')).to_have_class(re.compile(r'\bactive\b'))
+        snapshot.locator('[data-view-button=launch]').click()
+        snapshot.locator('#new-profile').click()
+        expect(snapshot.locator('#profile-editor-modal')).to_be_visible()
+        snapshot.locator('#model-path').fill('/preview/model')
+        snapshot.locator('[data-config-mode][value=custom]').check()
+        expect(snapshot.locator('#profile-parameters')).to_be_visible()
+        snapshot.locator('#enable-speculative-decoding').check()
+        expect(snapshot.locator('#enable-speculative-decoding')).to_be_checked()
+        expect(snapshot.locator('#save-profile')).to_be_disabled()
+        snapshot.locator('#model-path').press('Enter')
+        snapshot.locator('#close-profile-editor').click()
+        expect(snapshot.locator('#profile-editor-modal')).to_be_hidden()
+        snapshot.locator('#theme-select').select_option('dark')
+        snapshot.locator('[data-open-view=webui]').click()
+        expect(snapshot.locator('#view-webui')).to_have_class(re.compile(r'\bactive\b'))
+        expect(snapshot.locator('#open-webui')).to_be_hidden()
+        expect(self.page.locator('body > .app-shell #view-launch')).to_have_class(re.compile(r'\bactive\b'))
+        expect(self.page.locator('body > .app-shell #model-path')).not_to_have_value('/preview/model')
+        expect(self.page.locator('html')).to_have_attribute('data-theme', 'light')
+        self.assertEqual(self.page.evaluate('JSON.stringify(localStorage)'), storage)
+        self.assertEqual(writes, [])
+        self.screenshot('customizer-interactive-preview')
+
+    def test_customizer_previews_skin_before_apply_and_supports_mobile(self):
+        from test_ui_plugins import theme_bundle
+        files = theme_bundle(light={'background': '#eef4ff', 'primary': '#2563eb'}, dark={'background': '#101827'})
+        self.page.route('**/api/plugins/propose-stream', lambda route: route.fulfill(
+            status=200, content_type='application/x-ndjson', body=json.dumps({'stage':'ready', 'proposal':{
+                'id':'blue-skin', 'summary':'Blue skin', 'files':files, 'expectedRevision':'',
+                'manifest':{'slot':'theme'}}}) + '\n'))
+        self.page.locator('.navigation > .plugin-manager-button').click()
+        editor = self.page.locator('body > .plugin-manager')
+        editor.locator('.customizer-options > summary').click()
+        editor.locator('[name=id]').fill('blue-skin')
+        editor.locator('[name=instruction]').fill('蓝色皮肤')
+        editor.locator('.plugin-editor [type=submit]').click()
+        expect(editor.locator('.plugin-result')).to_have_text('预览已更新，尚未应用修改。')
+        snapshot = editor.locator('.customizer-preview-page')
+        expect(snapshot).to_have_css('background-color', 'rgb(238, 244, 255)')
+        expect(self.page.locator('html')).not_to_have_attribute('data-plugin-skin', 'blue-skin')
+        expect(editor.locator('.customizer-view,.customizer-mode')).to_have_count(0)
+        snapshot.locator('[data-view-button=webui]').click()
+        expect(snapshot.locator('#webui-content #prompt')).to_be_visible()
+        expect(snapshot.locator('#webui-content .main')).to_have_css('background-color', 'rgb(238, 244, 255)')
+        snapshot.locator('#theme-select').select_option('dark')
+        expect(snapshot.locator('#webui-content .main')).to_have_css('background-color', 'rgb(16, 24, 39)')
+        expect(self.page.locator('html')).to_have_attribute('data-theme', 'light')
+        editor.locator('.customizer-refresh').click()
+        expect(editor.locator('.plugin-result')).to_have_text('预览已更新，尚未应用修改。')
+        expect(snapshot.locator('#theme-select')).to_have_value('dark')
+        expect(snapshot.locator('#view-webui')).to_have_class(re.compile(r'\bactive\b'))
+        expect(snapshot.locator('#webui-content .main')).to_have_css('background-color', 'rgb(16, 24, 39)')
+        editor.locator('.customizer-size').select_option('390')
+        expect(snapshot.locator('.app-shell > .sidebar')).to_have_css('display', 'grid')
+        snapshot.locator('#mobileMenu').click()
+        expect(snapshot.locator('#sidebar')).to_have_class(re.compile(r'\bopen\b'))
+        backdrop = snapshot.locator('#sidebarBackdrop')
+        backdrop.click(position={'x': backdrop.bounding_box()['width'] - 5, 'y': 5})
+        expect(snapshot.locator('#sidebar')).not_to_have_class(re.compile(r'\bopen\b'))
+        self.screenshot('customizer-mobile-preview')
+        self.page.set_viewport_size({'width': 390, 'height': 844})
+        editor.locator('.customizer-size').scroll_into_view_if_needed()
+        expect(snapshot).to_be_visible()
+        self.assertTrue(self.page.evaluate('document.documentElement.scrollWidth <= innerWidth'))
+        self.screenshot('customizer-mobile-editor')
+
+    def test_shell_widget_stays_mounted_across_pages_and_can_move_or_unload(self):
+        self.install_test_plugin()
+        self.page.locator('[data-view-button="plugin-monitor"]').click()
+        self.install_test_plugin(slot='topbar', size={'width': 280, 'height': 44})
+        expect(self.page.locator('#profile-browser')).to_be_visible()
+        widget = self.page.locator('.plugin-shell-topbar iframe')
+        frame = self.page.frame_locator('.plugin-shell-topbar iframe')
+        expect(frame.locator('#value')).to_have_text('first:true:true')
+        expect(self.page.locator('[data-view-button="plugin-monitor"]')).to_have_count(0)
+        self.assertEqual(widget.bounding_box()['height'], 44)
+        self.page.evaluate("window.widgetIdentity = document.querySelector('.plugin-shell-topbar iframe')")
+        for view in ('webui', 'hardware', 'launch'):
+            self.page.locator(f'[data-view-button="{view}"]').click()
+            expect(widget).to_be_visible()
+            self.assertTrue(self.page.evaluate("window.widgetIdentity === document.querySelector('.plugin-shell-topbar iframe')"))
+        for width in (390, 320):
+            self.page.set_viewport_size({'width': width, 'height': 844})
+            expect(widget).to_be_visible()
+            self.assertLessEqual(widget.bounding_box()['width'], width)
+            self.assertTrue(self.page.evaluate('document.documentElement.scrollWidth <= innerWidth'))
+            self.page.locator('.navigation > .plugin-manager-button').click()
+            self.page.locator('body > .plugin-manager [aria-label="关闭"]').click()
+        self.install_test_plugin('second', slot='sidebar', size={'height': 60})
+        expect(self.page.locator('.plugin-shell-topbar')).to_be_hidden()
+        expect(self.page.frame_locator('.plugin-shell-sidebar iframe').locator('#value')).to_have_text('second:true:true')
+        self.install_test_plugin('third', slot='statusbar', size={'height': 32})
+        expect(self.page.locator('.plugin-shell-sidebar')).to_be_hidden()
+        expect(self.page.frame_locator('.plugin-shell-statusbar iframe').locator('#value')).to_have_text('third:true:true')
+        self.runtime.plugins.set_enabled('monitor', False)
+        self.page.clock.fast_forward(2100)
+        expect(self.page.locator('.plugin-shell-statusbar')).to_be_hidden()
+        self.assertIsNotNone(self.runtime._process)
+
+    def test_skin_hot_updates_launcher_and_studio_without_losing_draft(self):
+        from test_ui_plugins import bundle, theme_bundle
+        self.page.locator('#open-webui').click(); self.assert_loaded()
+        pane = self.page.locator('body > .app-shell #webui-content')
+        pane.locator('#prompt').fill('Keep draft through skin updates')
+        self.page.evaluate("window.skinHost = document.querySelector('#webui-content > div')")
+        widget = bundle(slot='topbar', capabilities=[])
+        widget['index.html'] = '''<!doctype html><output id="palette"></output><script>
+          addEventListener('ftllm-context', e => {
+            document.querySelector('#palette').textContent = e.detail.palette.primary || 'default';
+          });</script>'''
+        self.runtime.plugins.apply('monitor', widget, '')
+        palette = self.page.frame_locator('body > .app-shell .plugin-shell-topbar iframe').locator('#palette')
+        files = theme_bundle(light={'primary': '#2563eb', 'background': '#eef4ff', 'sidebar': '#dae7ff'},
+                             dark={'primary': '#60a5fa', 'background': '#101827', 'sidebar': '#18233b'},
+                             layout={'sidebarSide': 'right', 'sidebarWidth': 240, 'radius': 16, 'font': 'serif'})
+        first = self.runtime.plugins.apply('blue-skin', files, '')
+        self.page.clock.fast_forward(2100)
+        expect(self.page.locator('html')).to_have_attribute('data-plugin-skin', 'blue-skin')
+        expect(self.page.locator('body')).to_have_css('background-color', 'rgb(238, 244, 255)')
+        expect(pane.locator('.main')).to_have_css('background-color', 'rgb(238, 244, 255)')
+        expect(pane.locator('#newChat')).to_have_css('background-color', 'rgb(37, 99, 235)')
+        expect(palette).to_have_text('#2563eb')
+        sidebar = self.page.locator('.app-shell > .sidebar')
+        self.assertEqual(sidebar.bounding_box()['width'], 240)
+        self.assertGreater(sidebar.bounding_box()['x'], self.page.locator('.app-shell > .workspace').bounding_box()['x'])
+        self.screenshot('plugin-skin-light')
+        self.page.locator('#theme-select').select_option('dark')
+        expect(self.page.locator('body')).to_have_css('background-color', 'rgb(16, 24, 39)')
+        expect(pane.locator('.main')).to_have_css('background-color', 'rgb(16, 24, 39)')
+        expect(palette).to_have_text('#60a5fa')
+        self.screenshot('plugin-skin-dark')
+        for width in (390, 320):
+            self.page.set_viewport_size({'width': width, 'height': 844})
+            self.page.clock.run_for(300)
+            self.assertEqual(sidebar.bounding_box()['x'], 0)
+            self.assertTrue(self.page.evaluate('document.documentElement.scrollWidth <= innerWidth'))
+            expect(pane.locator('#prompt')).to_be_visible()
+            pane.locator('#prompt').click()
+        self.page.set_viewport_size({'width': 1280, 'height': 720})
+        second = self.runtime.plugins.apply('blue-skin', theme_bundle(dark={'background': '#24182a'}), first['revision'])
+        self.page.clock.fast_forward(2100)
+        expect(pane.locator('.main')).to_have_css('background-color', 'rgb(36, 24, 42)')
+        self.runtime.plugins.rollback('blue-skin', second['revision'])
+        self.page.clock.fast_forward(2100)
+        expect(pane.locator('.main')).to_have_css('background-color', 'rgb(16, 24, 39)')
+        self.page.locator('.navigation > .plugin-manager-button').click()
+        self.page.locator('body > .plugin-manager .customizer-library > summary').click()
+        self.page.locator('body > .plugin-manager .plugin-reset-theme').click()
+        expect(self.page.locator('html')).not_to_have_attribute('data-plugin-skin', 'blue-skin')
+        expect(palette).to_have_text('default')
+        self.page.clock.fast_forward(2100)
+        expect(pane.locator(':scope > div')).not_to_have_attribute('data-plugin-skin', 'blue-skin')
+        expect(pane.locator('#prompt')).to_have_value('Keep draft through skin updates')
+        self.assertTrue(self.page.evaluate("window.skinHost === document.querySelector('#webui-content > div')"))
+        self.assertEqual(self.page.locator('html').evaluate("e => e.style.getPropertyValue('--bg')"), '')
+
+    def test_skin_generation_preview_and_recovery_are_readable(self):
+        from test_ui_plugins import theme_bundle
+        self.page.locator('#open-webui').click(); self.assert_loaded()
+        model = self.runtime._webui_app.state.runtime.api_client
+        files = theme_bundle(light={key: '#ffffff' for key in ('primary', 'background', 'surface', 'text', 'mutedText', 'border')})
+        with patch.object(model, 'stream', side_effect=lambda *a, **k: iter([(json.dumps({'summary': 'Custom skin', 'files': files}), '')])) as complete:
+            self.page.locator('.navigation > .plugin-manager-button').click()
+            dialog = self.page.locator('body > .plugin-manager')
+            dialog.locator('.customizer-options > summary').click()
+            dialog.locator('[name="id"]').fill('blue-skin')
+            dialog.locator('[name="target"]').select_option('theme')
+            dialog.locator('[name="instruction"]').fill('更换主界面皮肤')
+            dialog.locator('.plugin-editor [type=submit]').click()
+            expect(dialog.locator('.plugin-preview')).to_be_visible()
+            self.assertFalse((self.runtime.plugins.directory / 'blue-skin').exists())
+            self.assertEqual(json.loads(complete.call_args.args[0][1]['content'])['target'], 'theme')
+            dialog.locator('.plugin-apply').click()
+            expect(self.page.locator('html')).to_have_attribute('data-plugin-skin', 'blue-skin')
+            expect(dialog).to_have_css('color', 'rgb(37, 53, 46)')
+            dialog.locator('.plugin-heading [aria-label="关闭"]').click()
+            recovery = self.page.locator('.navigation > .plugin-manager-button')
+            expect(recovery).to_have_css('color', 'rgb(37, 53, 46)')
+            recovery.click()
+            dialog.locator('.customizer-library > summary').click()
+            dialog.locator('.plugin-reset-theme').click()
+            expect(self.page.locator('html')).not_to_have_attribute('data-plugin-skin', 'blue-skin')
+
+    def test_standalone_studio_skin_applies_and_disables(self):
+        from test_ui_plugins import theme_bundle
+        self.runtime.plugins.apply('blue-skin', theme_bundle(light={'primary': '#2563eb', 'background': '#eef4ff'}), '')
+        self.page.goto(self.url + '/standalone/')
+        pane = self.page.locator('#webui-root')
+        expect(pane.locator('.main')).to_have_css('background-color', 'rgb(238, 244, 255)')
+        expect(pane.locator('#newChat')).to_have_css('background-color', 'rgb(37, 99, 235)')
+        pane.locator('#prompt').fill('Standalone draft')
+        self.runtime.plugins.set_enabled('blue-skin', False)
+        self.page.clock.fast_forward(2100)
+        expect(pane.locator('[data-plugin-skin]')).to_have_count(0)
+        expect(pane.locator('#prompt')).to_have_value('Standalone draft')
 
     def test_theme_defaults_to_light_and_remembers_choice(self):
         picker = self.page.locator('#theme-select')
@@ -1340,6 +2070,39 @@ document.querySelector('#counter').onclick = event => {
         self.screenshot('standalone-webui')
         self.page.reload()
         expect(pane.locator('.message.assistant')).to_have_count(1)
+
+    def test_standalone_customizer_previews_whole_studio_and_preserves_draft(self):
+        self.page.goto(self.url + '/standalone/')
+        pane = self.page.locator('#webui-root')
+        expect(pane.locator('.plugin-manager')).to_have_count(1)
+        pane.locator('#prompt').fill('Standalone customization draft')
+        original_system = pane.locator('#settingSystem').input_value()
+        expect(pane.locator('.plugin-manager-button')).to_have_count(0)
+        self.page.evaluate("location.hash = 'customize'")
+        editor = pane.locator('.plugin-manager')
+        expect(editor).to_be_visible()
+        snapshot = editor.locator('.customizer-screen')
+        expect(snapshot.locator('#prompt')).to_have_value('Standalone customization draft')
+        expect(snapshot.locator('#sendButton')).to_be_disabled()
+        snapshot.locator('#prompt').fill('Only in preview')
+        snapshot.locator('#prompt').press('Enter')
+        snapshot.locator('#topSettings').click()
+        expect(snapshot.locator('#settingsDialog')).to_be_visible()
+        self.assertFalse(snapshot.locator('#settingsDialog').evaluate('node => node.matches(":modal")'))
+        snapshot.locator('#settingSystem').fill('Preview settings')
+        # A preview dialog does not block the surrounding customization editor.
+        editor.locator('[name=instruction]').fill('Add a status widget')
+        snapshot.locator('#settingSystem').press('Escape')
+        expect(snapshot.locator('#settingsDialog')).to_be_hidden()
+        expect(editor).to_be_visible()
+        snapshot.locator('#topSettings').click()
+        snapshot.locator('#saveSettings').click()
+        expect(snapshot.locator('#settingsDialog')).to_be_hidden()
+        editor.locator('.plugin-heading [aria-label=关闭]').click()
+        expect(editor).to_be_hidden()
+        expect(pane.locator('#prompt')).to_have_value('Standalone customization draft')
+        expect(pane.locator('.app').locator('#messages .message.user')).to_have_count(0)
+        expect(pane.locator('#settingSystem')).to_have_value(original_system)
 
 
 if __name__ == '__main__':

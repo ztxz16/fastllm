@@ -164,6 +164,7 @@ class GenerationControl:
 
 
 def add_webui_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    parser.add_argument("--plugins-dir", default="", help="用户界面插件目录")
     parser.add_argument(
         "model", nargs="?", default="",
         help="模型路径，用于推导默认 API 模型名；可省略并从 /v1/models 发现")
@@ -2292,12 +2293,21 @@ class WebUIRuntime:
 def create_app(args: argparse.Namespace):
     from fastapi import FastAPI, HTTPException, Request
     from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
-    from fastapi.staticfiles import StaticFiles
+    try:
+        from .ui_plugins import PluginRegistry, install_plugin_routes, mount_studio_assets
+        from .ui_hardware import detect_hardware
+    except ImportError:
+        from ui_plugins import PluginRegistry, install_plugin_routes, mount_studio_assets
+        from ui_hardware import detect_hardware
 
     runtime = WebUIRuntime(args)
     app = FastAPI(title=getattr(args, "title", "FastLLM"), docs_url=None,
                   redoc_url=None)
     app.state.runtime = runtime
+    plugins = getattr(args, "ui_plugin_registry", None) or PluginRegistry(getattr(args, "plugins_dir", ""))
+    app.state.plugins = plugins
+    install_plugin_routes(app, plugins, lambda: runtime.api_client, hardware=detect_hardware,
+                          runtime_state=lambda: {"modelName": runtime.api_client.model_name})
 
     @app.exception_handler(WebUIClosedError)
     async def closed_session(request: Request, error: WebUIClosedError):
@@ -2377,8 +2387,7 @@ def create_app(args: argparse.Namespace):
             },
         )
 
-    app.mount("/assets/webui", StaticFiles(directory=str(
-        Path(__file__).with_name("webui_assets"))), name="webui-assets")
+    mount_studio_assets(app)
 
     @app.get("/assets/webui_locales.js", response_class=FileResponse)
     def webui_locales():

@@ -1,0 +1,50 @@
+/* Fixed shell adapters, not user-provided selectors or CSS. Empty slots occupy no space. */
+.plugin-shell-slot[hidden]{display:none!important}
+.plugin-shell-slot{display:flex;flex:0 1 auto;gap:8px;min-width:0;max-width:100%;overflow:auto;scrollbar-width:thin}
+.plugin-shell-slot .plugin-page{flex:0 0 auto;width:var(--plugin-width,240px);max-width:100%;height:var(--plugin-height,44px);min-height:0;overflow:hidden}
+.plugin-shell-slot .plugin-frame{height:100%;min-height:0}
+.plugin-shell-slot .plugin-status{position:absolute;inset:0;z-index:1;margin:0;padding:4px;background:var(--surface,#fff);overflow:auto;font:12px/1.4 system-ui,sans-serif}
+.plugin-shell-topbar{margin-left:auto;max-height:160px}
+.topbar:has(>.plugin-shell-topbar:not([hidden])){flex-basis:auto;min-height:54px;flex-wrap:wrap;gap:8px 20px;padding-top:5px;padding-bottom:5px}
+.plugin-shell-sidebar{flex-direction:column;flex-shrink:1;min-height:0;max-height:25vh;margin-top:12px}
+.plugin-shell-sidebar .plugin-page{width:100%;flex-shrink:0}
+.sidebar:has(>.plugin-shell-sidebar:not([hidden])) .sidebar-footer{padding-top:12px}
+.plugin-shell-statusbar{max-height:160px;padding:4px 16px;border-top:1px solid var(--line);background:var(--surface)}
+
+:root[data-plugin-skin] .sidebar{background:var(--plugin-sidebar,var(--surface-soft))}
+:root[data-plugin-skin] .topbar{background:var(--plugin-topbar,var(--surface))}
+:root[data-plugin-skin] :is(.configuration-card,.download-card,.projects-card,.launcher-address-card,.profile-editor,.folder-picker-window,.confirmation-window,.automatic-config-dialog,.hardware-card,.field input,.field select,.field textarea){background:var(--surface);color:var(--ink);border-color:var(--line)}
+:root[data-plugin-skin] :is(.sidebar-tip,.nav-button:hover){background:var(--surface-soft);border-color:var(--line)}
+:root[data-plugin-skin] .nav-button.active{background:var(--primary-soft);color:var(--primary)}
+:root[data-plugin-skin] :is(.primary-button,.project-action.start){background:var(--primary);border-color:var(--primary);color:var(--plugin-primary-text,#fff)}
+:root[data-plugin-skin] :is(.primary-button,.project-action.start):hover:not(:disabled){background:var(--primary-dark);border-color:var(--primary-dark)}
+:root[data-plugin-skin] :is(.primary-button,.secondary-button,.small-button,.nav-button,.configuration-card,.download-card,.profile-item,.sidebar-tip,.hardware-card,.field input,.field select,.field textarea){border-radius:var(--plugin-radius,var(--radius))}
+:root[data-plugin-skin] .view{width:min(100%,var(--plugin-content-width,1160px))}
+@media(min-width:681px){
+  :root[data-plugin-skin] .app-shell{grid-template-columns:var(--plugin-sidebar-width,188px) minmax(0,1fr)}
+  :root[data-plugin-sidebar="right"] .app-shell{grid-template-columns:minmax(0,1fr) var(--plugin-sidebar-width,188px)}
+  :root[data-plugin-sidebar="right"] .app-shell>.sidebar{grid-column:2;grid-row:1;border-right:0;border-left:1px solid var(--line)}
+  :root[data-plugin-sidebar="right"] .app-shell>.workspace{grid-column:1;grid-row:1}
+  :root[data-plugin-spacing="compact"] .page-scroll{padding:14px 18px}
+  :root[data-plugin-spacing="comfortable"] .page-scroll{padding:28px 32px}
+}
+@media(max-width:680px){
+  .plugin-shell-sidebar{grid-column:1/-1;grid-row:4;max-height:100px;margin-top:0;flex-direction:row}
+  .plugin-shell-sidebar .plugin-page{width:var(--plugin-width,240px)}
+  .plugin-shell-topbar{width:100%}
+  .plugin-shell-statusbar{padding:4px 10px}
+}
+
+:host([data-plugin-skin]) .sidebar{background:var(--plugin-sidebar,var(--soft));border-color:var(--line)}
+:host([data-plugin-skin]) .topbar{background:var(--plugin-topbar,var(--surface));border-color:var(--line)}
+:host([data-plugin-skin]) :is(.new-chat,.send-button){background:var(--brand);color:var(--plugin-primary-text,#fff);box-shadow:none}
+:host([data-plugin-skin]) :is(.new-agent,.conversation.active){background:var(--brand-soft);color:var(--brand);border-color:var(--line)}
+:host([data-plugin-skin]) :is(.new-chat,.new-agent,.composer,.conversation){border-radius:var(--plugin-radius,13px)}
+:host([data-plugin-skin]) .brand-copy strong{color:var(--ink)}
+:host([data-plugin-skin]) .main{background:var(--canvas)}
+:host([data-plugin-skin]) .composer-area{background:linear-gradient(180deg,transparent,var(--canvas) 30%)}
+:host([data-plugin-skin]) .composer textarea{color:var(--text)}
+:host([data-plugin-skin]) :is(.suggestion,.agent-card,.icon-button,.language-menu,dialog){background:var(--surface);color:var(--text);border-color:var(--line)}
+:host([data-plugin-skin]) :is(.field input,.field textarea,.field select,.dialog-button,.workspace-list){background:var(--soft);color:var(--text);border-color:var(--line)}
+:host([data-plugin-skin]) .dialog-button.primary{background:var(--brand);color:var(--plugin-primary-text,#fff)}
+:host([data-plugin-skin]) :is(.new-chat,.send-button,.dialog-button.primary):hover{background:var(--brand-strong)}

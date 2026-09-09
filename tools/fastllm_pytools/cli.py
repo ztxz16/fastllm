@@ -95,6 +95,7 @@ def args_parser():
     launch_parser_.add_argument(
         '--config', type = str, default = '', help = 'Custom launch profile path'
     )
+    launch_parser_.add_argument('--plugins-dir', default='', help='User UI plugin directory')
     launch_parser_.add_argument(
         '--agent-workspace-root', '--agent_workspace_root', default = '',
         help = 'Root directory for Pi Agent projects (default: current user home)'

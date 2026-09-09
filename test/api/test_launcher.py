@@ -31,6 +31,7 @@ from fastllm_pytools.launcher import (
     browse_folders,
     create_launcher_app,
     fastllm_launcher,
+    launcher_html,
     recommend_launch_config,
 )
 from fastllm_pytools.tui import DeployConfig, build_fastllm_argv, config_from_dict
@@ -534,8 +535,12 @@ class LauncherConfigTest(unittest.TestCase):
     def test_launcher_assets_are_packaged_as_external_resources(self):
         for filename in ("index.html", "styles.css", "app.js", "theme.js", "launcher-icon.png"):
             self.assertTrue((ASSET_DIRECTORY / filename).is_file(), filename)
-        html = (ASSET_DIRECTORY / "index.html").read_text(encoding="utf-8")
+        html = launcher_html()
         javascript = (ASSET_DIRECTORY / "app.js").read_text(encoding="utf-8")
+        for module in ASSET_DIRECTORY.parent.glob("ui_plugins/*/*.js"):
+            if module.parent.name == "studio" and module.name == "app.js":
+                continue
+            javascript += module.read_text(encoding="utf-8")
         self.assertIn('src="/assets/app.js"', html)
         self.assertIn('rel="icon" type="image/png" href="/assets/launcher-icon.png"', html)
         self.assertIn('class="brand-mark" src="/assets/launcher-icon.png"', html)

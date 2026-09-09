@@ -3,6 +3,7 @@
 const markdownURL = new URL("./markdown.js", import.meta.url);
 markdownURL.search = new URL(import.meta.url).search;
 const {renderMarkdown: renderMessageMarkdown} = await import(markdownURL.href);
+const {mountPluginHost} = await import(new URL("../../plugin-core/host.js", import.meta.url));
 let localesRetries = 0;
 function loadLocales(signal) {
   if (window.FASTLLM_LOCALES) return Promise.resolve();
@@ -43,9 +44,10 @@ export async function mountWebUI(host, {basePath = "", embedded = false, locale 
   host.toggleAttribute("data-embedded", embedded);
   function setTheme(value) { host.dataset.theme = value === "dark" ? "dark" : "light"; }
   setTheme(theme);
-  let observer;
+  let observer, pluginHost;
   let runtimeInstallState = {};
   function destroy() {
+    pluginHost?.destroy();
     lifecycle.abort();
     signal?.removeEventListener("abort", abort);
     observer?.disconnect();
@@ -123,7 +125,7 @@ export async function mountWebUI(host, {basePath = "", embedded = false, locale 
     }
 
     async function api(path, options = {}) {
-      const response = await fetch(localUrl(path), { ...options, signal: lifecycle.signal, headers: { "Content-Type": "application/json", ...(options.headers || {}) } });
+      const response = await fetch(localUrl(path), { ...options, signal: options.signal || lifecycle.signal, headers: { "Content-Type": "application/json", ...(options.headers || {}) } });
       if (!response.ok) {
         let message = `${response.status} ${response.statusText}`;
         try { message = (await response.json()).detail || message; } catch (_) {}
@@ -399,7 +401,7 @@ export async function mountWebUI(host, {basePath = "", embedded = false, locale 
     async function loadConversation(id) {
       if (!id) return; const sequence = ++state.loadSequence; const record = await (await api(`/api/conversations/${id}`)).json(); if (sequence !== state.loadSequence) return; state.activeId = id; state.record = record;
       const savedAgent = state.record.settings.agent_mode; state.agent = agentLabelKeys[savedAgent] ? savedAgent : "chat";
-      if (!embedded) history.replaceState(null,"",`?chat=${encodeURIComponent(id)}`); try { localStorage.setItem("fastllm.webui.activeChat",id); } catch (_) {} state.pending = []; renderPending(); renderSidebar(); renderMessages(); renderModes(); syncGenerationUI(); setSidebar(false);
+      if (!embedded) history.replaceState(null,"",`?chat=${encodeURIComponent(id)}${location.hash === "#customize" ? "#customize" : ""}`); try { localStorage.setItem("fastllm.webui.activeChat",id); } catch (_) {} state.pending = []; renderPending(); renderSidebar(); renderMessages(); renderModes(); syncGenerationUI(); setSidebar(false);
     }
 
     async function newConversation() {
@@ -703,10 +705,30 @@ export async function mountWebUI(host, {basePath = "", embedded = false, locale 
     $("#conversationList").onscroll = guard(closeConversationMenu); window.addEventListener("resize",closeConversationMenu,{signal:lifecycle.signal}); applyLocale(); await boot();
 
     if (lifecycle.signal.aborted) throw new DOMException("WebUI closed", "AbortError");
+    const extensions = document.createElement("section");
+    extensions.className = "plugin-studio-slot"; extensions.hidden = true;
+    $("#messages").before(extensions);
+    function pluginCall(capability, args) {
+      if (capability === "studio.context") return JSON.parse(JSON.stringify({conversation:state.record, draft:$("#prompt").value}));
+      if (capability === "studio.insert") {
+        if (typeof args?.text !== "string" || args.text.length > 60000) throw new Error("插入文本无效或过长");
+        const input = $("#prompt");
+        input.setRangeText(args.text, input.selectionStart, input.selectionEnd, "end");
+        resizePrompt(); input.focus(); return {ok:true};
+      }
+      throw new Error("不支持的工作室能力");
+    }
+    pluginHost = await mountPluginHost({root, basePath, slot:"studio", container:extensions,
+      navigation:root.querySelector(".top-actions"), signal:lifecycle.signal,
+      request:async (path, options) => {
+        const response = await api(path, options);
+        return options?.stream ? response : response.json();
+      },
+      context:() => ({locale:state.locale, theme:host.dataset.theme}), studioCall:pluginCall});
     observer = new ResizeObserver(() => { closeConversationMenu(); resizePrompt(); });
     observer.observe(host);
     signal?.removeEventListener("abort", abort);
-    return {destroy, setLocale: guard(setLocale), setTheme: guard(setTheme), refreshConfig: guard(refreshConfig),
+    return {destroy, pluginCall: guard(pluginCall), setLocale: guard(setLocale), setTheme: guard(setTheme), refreshConfig: guard(refreshConfig),
       setRuntimeInstallState: guard(value => { runtimeInstallState = value; renderWorkspaceAvailability(); })};
   } catch (error) {
     destroy();

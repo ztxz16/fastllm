@@ -6,7 +6,6 @@ import ipaddress
 import json
 import math
 import os
-import platform
 import re
 import secrets
 import shlex
@@ -29,6 +28,8 @@ from .modelscope_download import PROGRESS_PREFIX as MODELSCOPE_PROGRESS_PREFIX
 from .agent_runtime_install import AgentRuntimeInstaller
 from .launcher_mtp import detect_mtp_support
 from .startup_progress import PROGRESS_PREFIX
+from .ui_hardware import detect_hardware
+from .ui_plugins import BUNDLED_PLUGINS, PluginRegistry, install_plugin_routes, mount_studio_assets
 from .tui import (
     DEFAULT_MODELSCOPE_MODEL_ID,
     DeployConfig,
@@ -419,7 +420,8 @@ class LauncherRuntime:
 
     def __init__(self, config_path: str = "", popen_factory=None, webui_history_dir: str = "",
                  agent_workspace_root: str = "", allow_remote_workspace_agent: bool = True,
-                 disable_workspace_agent: bool = False):
+                 disable_workspace_agent: bool = False, plugins_dir: str = ""):
+        self.plugins = PluginRegistry(plugins_dir)
         self.config_path = os.path.abspath(os.path.expanduser(
             config_path or get_saved_commands_path()
         ))
@@ -496,6 +498,7 @@ class LauncherRuntime:
             args.api_key = self._service_api_key
             args.agent_runtime = "auto"
             args.embedded = True
+            args.ui_plugin_registry = self.plugins
             args.allow_remote_workspace_agent = self._allow_remote_workspace_agent
             args.disable_workspace_agent = self._disable_workspace_agent
             if self._agent_workspace_root:
@@ -1210,14 +1213,6 @@ class LauncherRuntime:
         self.stop()
 
 
-def _read_text(path: str) -> str:
-    try:
-        with open(path, "r", encoding="utf-8") as file:
-            return file.read().strip()
-    except OSError:
-        return ""
-
-
 def _port_is_available(host: str, port: int) -> bool:
     host = host or "0.0.0.0"
     normalized_host = host.strip("[]")
@@ -1257,118 +1252,6 @@ def _parse_modelscope_download_progress(line: str) -> Optional[Dict[str, int]]:
         result["completedFiles"], result["totalFiles"]
     )
     return result
-
-
-def _memory_info() -> Dict[str, int]:
-    values = {}
-    try:
-        with open("/proc/meminfo", "r", encoding="utf-8") as file:
-            for line in file:
-                key, raw = line.split(":", 1)
-                number = raw.strip().split()[0]
-                values[key] = int(number) * 1024
-    except (OSError, ValueError, IndexError):
-        pass
-    return {
-        "total": values.get("MemTotal", 0),
-        "available": values.get("MemAvailable", 0),
-    }
-
-
-def _gpu_info() -> List[Dict[str, Any]]:
-    executable = shutil.which("nvidia-smi")
-    if not executable:
-        return []
-    query = (
-        "index,name,memory.total,memory.free,utilization.gpu,temperature.gpu,"
-        "driver_version"
-    )
-    try:
-        result = subprocess.run(
-            [
-                executable,
-                f"--query-gpu={query}",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=4,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return []
-    if result.returncode != 0:
-        return []
-    output = []
-    for line in result.stdout.splitlines():
-        parts = [part.strip() for part in line.split(",")]
-        if len(parts) != 7:
-            continue
-        output.append({
-            "index": parts[0],
-            "name": parts[1],
-            "memoryTotalMiB": parts[2],
-            "memoryFreeMiB": parts[3],
-            "utilization": parts[4],
-            "temperature": parts[5],
-            "driver": parts[6],
-        })
-    return output
-
-
-def detect_hardware(model_path: str = "") -> Dict[str, Any]:
-    cpu_model = ""
-    try:
-        with open("/proc/cpuinfo", "r", encoding="utf-8") as file:
-            for line in file:
-                if line.lower().startswith("model name"):
-                    cpu_model = line.split(":", 1)[1].strip()
-                    break
-    except (OSError, IndexError):
-        pass
-    try:
-        affinity = len(os.sched_getaffinity(0))
-    except (AttributeError, OSError):
-        affinity = os.cpu_count() or 1
-
-    numa_nodes = []
-    node_root = Path("/sys/devices/system/node")
-    if node_root.is_dir():
-        for node in sorted(node_root.glob("node[0-9]*")):
-            numa_nodes.append({
-                "name": node.name,
-                "cpus": _read_text(str(node / "cpulist")),
-                "memory": _read_text(str(node / "meminfo")).splitlines()[:1],
-            })
-
-    disk_target = os.path.expanduser(model_path) if model_path else os.getcwd()
-    if not os.path.exists(disk_target):
-        disk_target = os.path.dirname(disk_target) or os.getcwd()
-    try:
-        disk = shutil.disk_usage(disk_target)
-        disk_info = {"path": disk_target, "total": disk.total, "free": disk.free}
-    except OSError:
-        disk_info = {"path": disk_target, "total": 0, "free": 0}
-
-    try:
-        from .env import env
-        build = dict(env.build_info)
-    except Exception:
-        build = {}
-    return {
-        "platform": platform.platform(),
-        "python": platform.python_version(),
-        "cpu": {
-            "model": cpu_model or platform.processor() or "Unknown CPU",
-            "logical": os.cpu_count() or 1,
-            "available": affinity,
-        },
-        "memory": _memory_info(),
-        "gpus": _gpu_info(),
-        "numa": numa_nodes,
-        "disk": disk_info,
-        "build": build,
-    }
 
 
 def _folder_browser_drives() -> List[Dict[str, str]]:
@@ -1933,6 +1816,12 @@ def recommend_launch_config(
     }
 
 
+def launcher_html():
+    page = (ASSET_DIRECTORY / "index.html").read_text(encoding="utf-8")
+    return re.sub(r"<!-- plugin:([a-z-]+) -->",
+                  lambda match: (BUNDLED_PLUGINS / match[1] / "page.html").read_text(encoding="utf-8"), page)
+
+
 def create_launcher_app(
     runtime: LauncherRuntime,
     control_token: str,
@@ -1941,7 +1830,7 @@ def create_launcher_app(
 ):
     try:
         from fastapi import FastAPI, Request
-        from fastapi.responses import FileResponse, JSONResponse
+        from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
         from fastapi.staticfiles import StaticFiles
         from starlette.concurrency import run_in_threadpool
     except ImportError as error:
@@ -1965,7 +1854,12 @@ def create_launcher_app(
     @app.middleware("http")
     async def protect_launcher(request: Request, call_next):
         is_webui = request.url.path.startswith("/webui/")
-        if is_webui:
+        # Opaque plugin frames cannot send the session's SameSite cookie for
+        # their scripts. These static resources contain no host credentials;
+        # every service call still goes through the authenticated parent.
+        is_plugin_asset = bool(re.match(
+            r"^/webui/[^/]+/(?:plugin-runtime/|plugin-preview/|plugin-core/sdk\.js$)", request.url.path))
+        if is_webui and not is_plugin_asset:
             supplied = request.cookies.get(webui_cookie, "")
             if not hmac.compare_digest(supplied, webui_token):
                 return JSONResponse({"detail": "Open WebUI from the Launcher."}, status_code=403)
@@ -1997,7 +1891,7 @@ def create_launcher_app(
             if "/attachments/" in request.url.path:
                 response.headers["Content-Security-Policy"] += "; sandbox allow-downloads"
             response.headers["X-Frame-Options"] = "SAMEORIGIN"
-        else:
+        elif not request.url.path.startswith(("/plugin-runtime/", "/plugin-preview/")):
             response.headers["Content-Security-Policy"] = (
                 "default-src 'self'; script-src 'self'; style-src 'self'; "
                 "img-src 'self' data: blob:; media-src 'self' data: blob:; "
@@ -2021,7 +1915,7 @@ def create_launcher_app(
 
     @app.get("/")
     async def index():
-        return FileResponse(ASSET_DIRECTORY / "index.html")
+        return HTMLResponse(launcher_html())
 
     @app.get("/api/bootstrap")
     async def bootstrap():
@@ -2175,9 +2069,15 @@ def create_launcher_app(
         runtime.request_shutdown()
         return {"ok": True}
 
-    # Both entry points serve exactly the same component resources.
-    app.mount("/assets/webui", StaticFiles(directory=str(
-        Path(__file__).with_name("webui_assets"))), name="webui-assets")
+    def plugin_model_client():
+        state = runtime.state()
+        return runtime.embedded_webui(state["sessionId"], launcher_host).state.runtime.api_client
+
+    install_plugin_routes(app, runtime.plugins, plugin_model_client,
+                          hardware=detect_hardware, runtime_state=runtime.state)
+    app.mount("/ui_plugins", StaticFiles(directory=str(BUNDLED_PLUGINS)), name="bundled-ui-plugins")
+
+    mount_studio_assets(app)
 
     @app.get("/assets/webui_locales.js")
     async def webui_locales():
@@ -2386,6 +2286,7 @@ def fastllm_launcher(args) -> int:
         agent_workspace_root=getattr(args, "agent_workspace_root", ""),
         allow_remote_workspace_agent=bool(getattr(args, "allow_remote_workspace_agent", True)),
         disable_workspace_agent=bool(getattr(args, "disable_workspace_agent", False)),
+        plugins_dir=getattr(args, "plugins_dir", ""),
     )
     launcher_addresses = _launcher_access_addresses(host, port)
     try:

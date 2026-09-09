@@ -1,0 +1,85 @@
+<section id="view-download" class="view">
+            <div class="view-hero download-hero">
+              <div>
+                <span class="eyebrow">MODELSCOPE DOWNLOAD</span>
+                <h1>把模型下载到本机</h1>
+                <p>选择一个喜欢的模型，下载后即可创建启动项目。支持断点续传。</p>
+              </div>
+              <button id="download-use-last" class="hero-secondary hidden" type="button">用于启动配置</button>
+            </div>
+
+            <div class="download-layout">
+              <form id="download-form" class="download-card">
+                <div class="card-heading">
+                  <div>
+                    <span>MODEL DOWNLOAD</span>
+                    <h2>下载设置</h2>
+                    <p>从常用模型中选择，或直接填写任意 ModelScope 模型 ID。</p>
+                  </div>
+                  <span id="download-badge" class="save-state">未开始</span>
+                </div>
+
+                <section class="form-section">
+                  <div class="form-grid two-columns">
+                    <label class="field span-2">
+                      <span>常用模型</span>
+                      <select id="download-preset">
+                        <option value="custom">自定义模型 ID</option>
+                      </select>
+                    </label>
+                    <label class="field span-2">
+                      <span>ModelScope 模型 ID <b>*</b></span>
+                      <input data-download-field="modelId" type="text" placeholder="Qwen/Qwen3-0.6B" spellcheck="false">
+                    </label>
+                    <label class="field span-2">
+                      <span>保存目录 <b>*</b></span>
+                      <input data-download-field="targetDir" data-path-input data-directories-only type="text" list="path-suggestions" placeholder="~/.cache/fastllm/modelscope/model-name" spellcheck="false">
+                      <small>目录已存在时会校验缓存并继续未完成的下载。</small>
+                    </label>
+                    <label class="field">
+                      <span>Revision</span>
+                      <input data-download-field="revision" type="text" placeholder="master" spellcheck="false">
+                    </label>
+                    <label class="field">
+                      <span>并发下载数</span>
+                      <input data-download-field="maxWorkers" type="number" min="1" max="64" inputmode="numeric">
+                    </label>
+                    <label class="field span-2">
+                      <span>Access Token</span>
+                      <input data-download-field="token" type="password" autocomplete="off" placeholder="私有模型可选">
+                      <small>Token 只保存在当前页面内存中，通过环境变量传给下载进程，不写入命令或配置文件。</small>
+                    </label>
+                  </div>
+                </section>
+
+                <section class="command-panel">
+                  <div><strong>实际下载命令</strong><small>参数不经过 Shell，Token 不显示</small></div>
+                  <pre id="download-command">正在生成命令…</pre>
+                  <div id="download-validation" class="validation-messages"></div>
+                </section>
+
+                <div class="form-actions">
+                  <button id="download-cancel" class="secondary-button danger hidden" type="button">取消下载</button>
+                  <button id="download-start" class="primary-button" type="submit">↓ 开始下载</button>
+                </div>
+              </form>
+
+              <aside class="download-status-card" aria-live="polite">
+                <div class="download-status-icon" id="download-status-icon">↓</div>
+                <span>DOWNLOAD STATUS</span>
+                <h2 id="download-status-title">尚未开始下载</h2>
+                <p id="download-status-message">模型文件可能占用较多磁盘空间，请先确认保存位置。</p>
+                <div class="download-progress-heading">
+                  <span>模型总进度</span>
+                  <strong id="download-progress-value">0%</strong>
+                </div>
+                <progress id="download-progress" class="progress-track" max="100" value="0"></progress>
+                <div class="download-stat-list">
+                  <div><span>已下载</span><strong id="download-bytes">—</strong></div>
+                  <div><span>文件</span><strong id="download-files">—</strong></div>
+                  <div><span>保存位置</span><strong id="download-destination">—</strong></div>
+                </div>
+                <button id="download-use-model" class="secondary-button hidden" type="button">使用这个模型启动</button>
+              </aside>
+            </div>
+          </section>
