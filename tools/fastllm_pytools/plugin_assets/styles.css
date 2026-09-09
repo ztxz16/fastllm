@@ -1,13 +1,16 @@
-.plugin-manager-button{display:flex;align-items:center;gap:10px;padding:8px 12px;border:1px solid var(--line,#d9e4df);border-radius:8px;background:var(--surface,#fff);color:var(--ink,#25352e);cursor:pointer;font:13px/1.6 system-ui,sans-serif;text-align:left}
-.plugin-manager-emblem{display:block;box-sizing:border-box;flex:0 0 28px;width:28px;height:28px;padding:4px;border:1px solid #ffffff60;border-radius:9px;color:#fff;background:linear-gradient(135deg,#18cea3,#4087ed 52%,#a065ed);box-shadow:0 3px 10px #527ee540;transition:transform .2s,box-shadow .2s}
+.plugin-manager-button{--button-top:#fff;--button-bottom:#eef0f2;--button-edge:#c5cbd1;--button-text:#374151;--button-highlight:#fff;--button-shadow:#00000014;--button-hover:1.03;display:flex;align-items:center;justify-content:center;gap:8px;min-height:38px;padding:7px 12px;border:1px solid var(--button-edge);border-radius:7px;background:linear-gradient(var(--button-top),var(--button-bottom));color:var(--button-text);box-shadow:inset 0 1px 0 var(--button-highlight),0 2px 0 var(--button-edge),0 3px 5px var(--button-shadow);cursor:pointer;font:600 12px/1.6 system-ui,sans-serif;text-align:center;transition:filter .15s,transform .15s,box-shadow .15s}
+.plugin-manager-emblem{display:block;box-sizing:border-box;flex:0 0 22px;width:22px;height:22px;padding:3px;border:1px solid #ffffff60;border-radius:6px;color:#fff;background:linear-gradient(135deg,#18cea3,#4087ed 52%,#a065ed)}
 .plugin-manager-emblem svg{display:block;width:100%;height:100%;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}.plugin-manager-spark{fill:currentColor;stroke-width:1}
-.plugin-manager-button:hover .plugin-manager-emblem,.plugin-manager-button:focus-visible .plugin-manager-emblem{transform:rotate(-7deg) scale(1.08);box-shadow:0 0 16px #7680ef70,0 3px 10px #18cea340}
-@media(prefers-reduced-motion:reduce){.plugin-manager-emblem{transition:none}.plugin-manager-button:hover .plugin-manager-emblem,.plugin-manager-button:focus-visible .plugin-manager-emblem{transform:none}}
+.plugin-manager-button:hover{filter:brightness(var(--button-hover));transform:translateY(-1px);box-shadow:inset 0 1px 0 var(--button-highlight),0 3px 0 var(--button-edge),0 5px 8px var(--button-shadow)}
+.plugin-manager-button:focus-visible{outline:3px solid var(--focus,#86bba4);outline-offset:3px}
+.plugin-manager-button:active{filter:brightness(.96);transform:translateY(2px);box-shadow:inset 0 1px 3px #0003}
+@media(prefers-reduced-motion:reduce){.plugin-manager-button{transition:none}}
 /* Keep recovery legible even if an edited skin uses identical text/background. */
 .plugin-manager,.plugin-manager-button{--surface:#fff;--surface-soft:#f7f9f8;--ink:#25352e;--muted:#68766f;--line:#d9e4df;color-scheme:light}
 :root[data-theme="dark"] :is(.plugin-manager,.plugin-manager-button),:host([data-theme="dark"]) :is(.plugin-manager,.plugin-manager-button){--surface:#202824;--surface-soft:#28332c;--ink:#e2ece5;--muted:#a3b6aa;--line:#46594d;color-scheme:dark}
+:root[data-theme="dark"] .plugin-manager-button,:host([data-theme="dark"]) .plugin-manager-button{--button-top:#3b3b40;--button-bottom:#303034;--button-edge:#55555e;--button-text:#e2e2e5;--button-highlight:#ffffff12;--button-shadow:#00000040;--button-hover:1.12}
 .plugin-navigation-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.navigation{overflow:auto;scrollbar-width:thin}.navigation>*{flex-shrink:0}.navigation>.plugin-manager-button{position:sticky;bottom:0;z-index:1}
+.navigation{overflow:auto;scrollbar-width:thin}.navigation>*{flex-shrink:0}.navigation>.plugin-manager-button{position:sticky;bottom:4px;z-index:1;align-self:center;justify-self:center;width:calc(100% - 12px);margin:10px 0 4px}
 /* A navigable subpage; the running application stays mounted behind it. */
 .plugin-manager{box-sizing:border-box;position:fixed;inset:0;z-index:100;display:flex;flex-direction:column;width:100%;height:100%;margin:0;padding:0;overflow:hidden;background:var(--surface,#fff);color:var(--ink,#25352e);font:13px/1.6 system-ui,sans-serif}
 .plugin-manager h2{margin:0}.plugin-manager p{margin:10px 0}.plugin-manager small{overflow-wrap:anywhere;color:var(--muted,#68766f)}

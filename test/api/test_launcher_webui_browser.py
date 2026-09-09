@@ -813,7 +813,7 @@ class LauncherWebUIBrowserTest(unittest.TestCase):
             expect(dialog).to_have_css('color', 'rgb(37, 53, 46)')
             dialog.locator('.plugin-heading [aria-label="关闭"]').click()
             recovery = self.page.locator('.navigation > .plugin-manager-button')
-            expect(recovery).to_have_css('color', 'rgb(37, 53, 46)')
+            expect(recovery).to_have_css('color', 'rgb(55, 65, 81)')
             recovery.click()
             dialog.locator('.customizer-library > summary').click()
             dialog.locator('.plugin-reset-theme').click()
