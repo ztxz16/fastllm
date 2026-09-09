@@ -225,6 +225,23 @@ class Qwen35ReasoningTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.choices[0].message.content, "42")
         self.assertEqual(template_kwargs, {"custom": "kept"})
 
+    async def test_explicit_effort_enables_thinking_unless_template_explicitly_disables_it(self):
+        for override, expected in ((None, True), ({"enable_thinking": False}, False)):
+            with self.subTest(override=override):
+                instance = completion()
+                instance.enable_thinking = False
+                response = await instance.create_chat_completion(
+                    request(reasoning_effort="xhigh", chat_template_kwargs=override), RawRequest())
+                self.assertIsInstance(response, ChatCompletionResponse)
+                self.assertEqual(instance.model.input_kwargs["enable_thinking"], expected)
+                self.assertEqual(instance.model.launch_kwargs["enable_thinking"], expected)
+
+    async def test_unspecified_effort_preserves_service_thinking_default(self):
+        instance = completion()
+        instance.enable_thinking = False
+        await instance.create_chat_completion(request(), RawRequest())
+        self.assertFalse(instance.model.launch_kwargs["enable_thinking"])
+
 
 if __name__ == "__main__":
     unittest.main()

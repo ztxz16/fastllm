@@ -75,6 +75,7 @@ namespace fastllm {
     private:
         struct PrefixSnapshot;
         struct DecodeCudaGraphState;
+        struct PleStagingState;
         struct MtpDraftCudaGraphState;
         struct QsaHostMirrorTransfer;
         struct MtpRuntimeState;
@@ -97,6 +98,7 @@ namespace fastllm {
                 const Data *precomputedEmbedding = nullptr);
 
         struct RequestState {
+            std::shared_ptr<PleStagingState> pleStaging;
             int previousToken1 = -1;
             int previousToken2 = -1;
             std::vector<float> convHistory;
@@ -124,6 +126,9 @@ namespace fastllm {
             // after that request has completed its first single-token pass,
             // so CUDA Graph capture retains the established allocation order.
             std::set<int> geometricCacheGrowthReadyLayers;
+            // TP dense graphs retain the legacy attention padding width even
+            // when physical KV storage is reserved or reused across requests.
+            int denseGraphWidth = 0;
             std::vector<int> processedTokens;
             int prefixRequestId = 0;
             int lastPrefixSnapshotLen = 0;
@@ -476,6 +481,9 @@ namespace fastllm {
             bool materializeCausalMaskOnGraphFallback = false,
             const Data *precomputedEmbedding = nullptr);
 
+        bool TryRunThreadTpPrefixCudaGraph(
+            Data &hiddenStates,
+            std::vector<std::pair<Data, Data>> &pastKeyValues);
         bool TryRunDecodeCudaGraphBackbone(
             int graphStartLayer,
             bool startBeforeAttention,

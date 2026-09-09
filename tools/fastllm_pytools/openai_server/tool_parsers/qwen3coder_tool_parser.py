@@ -100,6 +100,7 @@ class Qwen3CoderToolParser(ToolParser):
         self._stream_buffer = ""
         self._stream_error: Optional[str] = None
         self._stream_has_content_since_tool = False
+        self.incomplete_tool_call = False
 
     @staticmethod
     def _tool_parameters(
@@ -306,6 +307,8 @@ class Qwen3CoderToolParser(ToolParser):
         text: str,
         cursor: int,
         tools: Optional[list[ChatCompletionToolsParam]],
+        *,
+        at_end: bool = False,
     ) -> tuple[list[ToolCall], int]:
         if not text.startswith(self.tool_call_start_token, cursor):
             if _is_partial_token(text, cursor, self.tool_call_start_token):
@@ -322,6 +325,12 @@ class Qwen3CoderToolParser(ToolParser):
                     raise ValueError(
                         "Qwen tool-call block contains no complete function")
                 return tool_calls, cursor + len(self.tool_call_end_token)
+            # At EOF only the outer delimiter may be absent or cut short.
+            # Functions and parameters must already have closed normally.
+            if (at_end and tool_calls
+                    and _is_partial_token(text, cursor,
+                                          self.tool_call_end_token)):
+                return tool_calls, len(text)
             if text.startswith(self.tool_call_prefix, cursor):
                 tool_call, cursor = self._parse_function_at(
                     text, cursor, tools)
@@ -361,7 +370,7 @@ class Qwen3CoderToolParser(ToolParser):
             if normal_segment.strip():
                 normal_parts.append(normal_segment)
             parsed_calls, cursor = self._parse_tool_block_prefix(
-                text, start, tools)
+                text, start, tools, at_end=True)
             tool_calls.extend(parsed_calls)
 
         return "".join(normal_parts), tool_calls
@@ -371,6 +380,7 @@ class Qwen3CoderToolParser(ToolParser):
         model_output: str,
         request: ChatCompletionRequest,
     ) -> ExtractedToolCallInformation:
+        self.incomplete_tool_call = False
         marker_index = model_output.find(self.tool_call_start_token)
         if marker_index == -1:
             return ExtractedToolCallInformation(
@@ -383,6 +393,7 @@ class Qwen3CoderToolParser(ToolParser):
             normal_text, tool_calls = self._split_complete_blocks(
                 model_output, request.tools)
         except (TypeError, ValueError) as error:
+            self.incomplete_tool_call = isinstance(error, _IncompleteToolCall)
             logger.warning("Failed to parse Qwen tool call: %s", error)
             prefix = model_output[:marker_index]
             return ExtractedToolCallInformation(
@@ -434,6 +445,11 @@ class Qwen3CoderToolParser(ToolParser):
             return "Qwen tool-call stream ended inside a tool-call block"
         return None
 
+    def finalize_streaming(
+        self, request: ChatCompletionRequest,
+    ) -> Union[DeltaMessage, None]:
+        return self._drain_stream_buffer(request, at_stream_end=True)
+
     def flush_streaming_content(self) -> Optional[str]:
         """Return ordinary text held while disambiguating a partial marker."""
         if (not self._stream_buffer or self._stream_error
@@ -469,7 +485,7 @@ class Qwen3CoderToolParser(ToolParser):
         delta_token_ids: Sequence[int],
         request: ChatCompletionRequest,
     ) -> Union[DeltaMessage, None]:
-        del current_text, previous_token_ids, current_token_ids
+        del current_text, previous_token_ids, current_token_ids, delta_token_ids
         if not previous_text:
             self._reset_streaming_state()
 
@@ -477,9 +493,15 @@ class Qwen3CoderToolParser(ToolParser):
             return None
 
         self._stream_buffer += delta_text
+        # Empty decoded chunks can occur before EOF. Recovery belongs only to
+        # finalize_streaming(), after the caller has exhausted generation.
+        return self._drain_stream_buffer(request, at_stream_end=False)
+
+    def _drain_stream_buffer(
+        self, request: ChatCompletionRequest, *, at_stream_end: bool,
+    ) -> Union[DeltaMessage, None]:
         normal_parts: list[str] = []
         tool_deltas: list[DeltaToolCall] = []
-        at_stream_end = bool(not delta_text and delta_token_ids)
 
         while self._stream_buffer:
             marker_index = self._stream_buffer.find(
@@ -512,8 +534,10 @@ class Qwen3CoderToolParser(ToolParser):
                     self._stream_buffer,
                     0,
                     request.tools,
+                    at_end=at_stream_end,
                 )
             except _IncompleteToolCall:
+                self.incomplete_tool_call = at_stream_end
                 break
             except (TypeError, ValueError) as error:
                 logger.warning("Failed to parse streamed Qwen tool call: %s",

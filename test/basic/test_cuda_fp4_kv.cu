@@ -138,6 +138,76 @@ static void RunCopyFormats(fastllm::DataType srcType) {
     RunCopyCase<SrcT, __nv_fp8_e4m3>(srcType, fastllm::DataType::FP8_E4M3);
 }
 
+// Compare packed MTP/prefill writes with the original per-request append.
+// Include ragged chains, shuffled pages, page crossings and speculative
+// rollback: the second round overwrites rejected tokens from the first round.
+template <typename T>
+static void RunPackedBatchCopyCase(fastllm::DataType srcType,
+                                   fastllm::DataType dstType, int batch) {
+    using namespace fastllm;
+    const int heads = 2, dim = 256, pageLen = 16, pagesPerRequest = 5;
+    const int totalPages = batch * pagesPerRequest;
+    Data packedCache(dstType, {totalPages, pageLen, heads, dim});
+    Data reference(dstType, packedCache.dims);
+    AllocateGpu(packedCache); AllocateGpu(reference);
+    Check(cudaMemset(packedCache.cudaData, 0x5a, packedCache.GetBytes()));
+    Check(cudaMemset(reference.cudaData, 0x5a, reference.GetBytes()));
+    std::vector<int> pages(batch + 1), indices(totalPages);
+    for (int b = 0; b <= batch; ++b) pages[b] = b * pagesPerRequest;
+    for (int p = 0; p < totalPages; ++p) indices[p] = totalPages - 1 - p;
+    for (int round = 0; round < 2; ++round) {
+        std::vector<int> qs(batch + 1), base(batch), lens(batch);
+        for (int b = 0; b < batch; ++b) {
+            const int starts[] = {0, 15, 32};
+            const int lengths[] = {2, 3, 35};
+            base[b] = starts[b % 3] + round;
+            lens[b] = round == 0 ? lengths[b % 3] : 2;
+            qs[b + 1] = qs[b] + lens[b];
+        }
+        const int tokens = qs.back();
+        Data input(srcType, {heads, tokens, dim});
+        AllocateGpu(input);
+        std::vector<T> host(input.Count(0));
+        for (size_t i = 0; i < host.size(); ++i) {
+            host[i] = T(std::sin(float(i) * 0.13f + round) * 7.0f);
+        }
+        Check(cudaMemcpy(input.cudaData, host.data(), input.GetBytes(), cudaMemcpyHostToDevice));
+        Data qMeta, pageMeta, indexMeta, baseMeta;
+        InitInt(qMeta, qs); InitInt(pageMeta, pages);
+        InitInt(indexMeta, indices); InitInt(baseMeta, base);
+        Require(FastllmCudaPagedCacheAppendPackedBatch(
+            (uint8_t*)packedCache.cudaData, (int32_t*)qMeta.cudaData,
+            (int32_t*)pageMeta.cudaData, (int32_t*)indexMeta.cudaData,
+            (int32_t*)baseMeta.cudaData, batch, tokens, pageLen, heads, dim,
+            dstType, (uint8_t*)input.cudaData, srcType), "ragged packed append failed");
+        for (int b = 0; b < batch; ++b) {
+            Data slice(srcType, {heads, lens[b], dim});
+            AllocateGpu(slice);
+            std::vector<T> rows(slice.Count(0));
+            for (int h = 0; h < heads; ++h) {
+                std::copy_n(host.data() + (h * tokens + qs[b]) * dim,
+                            lens[b] * dim, rows.data() + h * lens[b] * dim);
+            }
+            Check(cudaMemcpy(slice.cudaData, rows.data(), slice.GetBytes(), cudaMemcpyHostToDevice));
+            for (int offset = 0; offset < lens[b];) {
+                int absolute = base[b] + offset;
+                int count = std::min(lens[b] - offset, pageLen - absolute % pageLen);
+                FastllmCudaPagedCacheCopy(
+                    (uint8_t*)reference.cudaData,
+                    indices[pages[b] + absolute / pageLen], pageLen, heads, dim,
+                    dstType, (uint8_t*)slice.cudaData, srcType, lens[b],
+                    offset, count, absolute % pageLen);
+                offset += count;
+            }
+        }
+        Check(cudaDeviceSynchronize());
+        std::vector<uint8_t> actual(packedCache.GetBytes()), expected(reference.GetBytes());
+        Check(cudaMemcpy(actual.data(), packedCache.cudaData, actual.size(), cudaMemcpyDeviceToHost));
+        Check(cudaMemcpy(expected.data(), reference.cudaData, expected.size(), cudaMemcpyDeviceToHost));
+        Require(actual == expected, "packed batch changed KV bytes or untouched cache slots");
+    }
+}
+
 template <typename T>
 static void RunCase(fastllm::DataType dtype, int dim, int tokens, int queries, bool packedAppend, int group = 4) {
     using namespace fastllm;
@@ -510,6 +580,16 @@ int main() {
         RunCopyFormats<half>(fastllm::DataType::FLOAT16);
         RunCopyFormats<__nv_bfloat16>(fastllm::DataType::BFLOAT16);
         std::puts("paged KV copy dispatch passed: 48 non-FP4 combinations");
+        for (int batch : {2, 3, 16}) {
+            for (auto dstType : {fastllm::DataType::FLOAT32, fastllm::DataType::FLOAT16,
+                                fastllm::DataType::BFLOAT16, fastllm::DataType::FP8_E4M3,
+                                fastllm::DataType::FP4_E2M1}) {
+                RunPackedBatchCopyCase<float>(fastllm::DataType::FLOAT32, dstType, batch);
+                RunPackedBatchCopyCase<half>(fastllm::DataType::FLOAT16, dstType, batch);
+                RunPackedBatchCopyCase<__nv_bfloat16>(fastllm::DataType::BFLOAT16, dstType, batch);
+            }
+        }
+        std::puts("packed batch KV writes passed: 45 ragged/page-crossing/rollback cases");
         for (int dim : {128, 256}) for (int tokens : {5, 65, 1025, 4097}) {
             RunCase<half>(fastllm::DataType::FLOAT16, dim, tokens, 1, false);
             RunCase<__nv_bfloat16>(fastllm::DataType::BFLOAT16, dim, tokens, std::min(tokens, 7), true);

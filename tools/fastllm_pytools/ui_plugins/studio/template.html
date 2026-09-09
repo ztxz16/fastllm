@@ -7,6 +7,7 @@
     <button class="new-chat" id="newChat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg><span data-i18n="nav.new_chat">新建对话</span></button>
     <button class="new-agent" id="newAgent"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3c.5 4.8 3.2 7.5 8 8-4.8.5-7.5 3.2-8 8-.5-4.8-3.2-7.5-8-8 4.8-.5 7.5-3.2 8-8Z"/><path d="M19 3v4M17 5h4"/></svg><span data-i18n="nav.new_agent">新建Agent</span></button>
     <p class="agent-unavailable" id="agentUnavailable" role="status" hidden></p>
+    <button class="new-agent" id="installRuntime" data-i18n="workspace.install_runtime" hidden>安装 Agent 依赖</button>
     <div class="section-label" data-i18n="nav.recent_chats">最近对话</div>
     <nav class="conversation-list" id="conversationList"></nav>
     <div class="local-note"><span class="online-dot"></span><span data-i18n="nav.local_note">模型本机运行 · 会话本地保存</span></div>
@@ -76,6 +77,11 @@
     <button class="agent-card" data-agent="ppt"><span class="agent-state" data-i18n="common.current">当前</span><span class="agent-card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M5 3h10l4 4v14H5zM15 3v5h5M8 12h8M8 16h6"/></svg></span><span class="agent-card-copy"><strong data-i18n="agent.ppt">PPT 创作</strong><p data-i18n="agent.ppt_desc">规划内容和版式，生成可继续编辑的 PowerPoint 文件。</p><small>PRESENTATION</small></span></button>
     <button class="agent-card" data-agent="code"><span class="agent-state" data-i18n="common.current">当前</span><span class="agent-card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="m8 9-4 3 4 3M16 9l4 3-4 3M14 5l-4 14"/></svg></span><span class="agent-card-copy"><strong data-i18n="agent.code">代码项目</strong><p data-i18n="agent.code_desc">跨文件审查、定位问题，并生成可下载但不会自动执行的补丁。</p><small>REVIEW · UNIFIED DIFF</small></span></button>
   </div>
+</dialog>
+<dialog id="htmlPreviewDialog" aria-labelledby="htmlPreviewTitle">
+  <div class="dialog-head"><h2 id="htmlPreviewTitle" data-i18n="html.preview_title">HTML 预览</h2><button class="dialog-close" id="closeHTMLPreview" aria-label="关闭" data-i18n-aria="common.close">×</button></div>
+  <p class="html-preview-hint" data-i18n="html.preview_hint">支持 HTML、CSS 和内联 JavaScript；联网资源不可用，页面存储仅在本次预览内保留。</p>
+  <div id="htmlPreviewBody"></div>
 </dialog>
 <dialog id="settingsDialog">
   <div class="dialog-head"><h2 data-i18n="settings.title">模型参数</h2><button class="dialog-close" id="closeSettings" aria-label="关闭" data-i18n-aria="common.close">×</button></div>

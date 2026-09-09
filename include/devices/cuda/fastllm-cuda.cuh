@@ -632,6 +632,9 @@ bool FastllmCudaQwen4HyperCombineRMSNorm(
     fastllm::Data &normalized,
     float eps, int groups,
     fastllm::Data *normalizedStorage = nullptr);
+// Merges rank-major TopK(..., 1) pairs using Qwen4's existing tie order.
+bool FastllmCudaQwen4MergeTpGreedy(const float *candidates, int *output,
+                                 float *floatOutput, int vocabulary, int ranks);
 bool FastllmCudaQwen4QSASelect(const fastllm::Data &query,
                                const fastllm::Data &compressedKeys,
                                fastllm::Data &indices, int keyLength,
@@ -1656,6 +1659,11 @@ bool FastllmCudaHalfMatMulFloatFP8E4M3(const fastllm::Data &input, fastllm::Data
 void FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(fastllm::Data &weight, const fastllm::Data &bias, int k);
 bool FastllmCudaHalfMatMulFloatFP8E4M3Swiglu(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaHalfMatMulFloatFP8E4M3AddTo(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float alpha, bool overwrite, int n, int m, int k);
+bool FastllmCudaFloat32MergeMOEBFloat16Indexed(
+    const fastllm::Data &input, const fastllm::Data &index, const fastllm::Data &score,
+    fastllm::Data &gate, fastllm::Data &middle, fastllm::Data &parts, fastllm::Data &output,
+    fastllm::Data **weights, int weightsBatch);
+
 bool FastllmCudaRegisterMoeFp8ExpertTableFromPacked(fastllm::Data **weights, int weightsBatch, int hidden, int inter,
                                                     void *packedGateWeights, void *packedGateScales,
                                                     void *packedDownWeights, void *packedDownScales,

@@ -1,0 +1,20 @@
+          <section id="view-opencode" class="view native-agent" aria-label="OpenCode">
+            <div class="native-agent-toolbar">
+              <span id="opencode-status" role="status"></span>
+              <button class="small-button" type="button" data-manage-agent="opencode">管理</button>
+              <button id="opencode-retry" class="small-button" type="button">打开 OpenCode</button>
+              <button id="opencode-stop" class="small-button hidden" type="button">停止 OpenCode</button>
+            </div>
+            <div id="opencode-placeholder" class="webui-placeholder">
+              <h2>OpenCode</h2>
+              <p>使用当前模型处理编程任务，会话与工作室分别保存。</p>
+              <p id="opencode-install-note" class="hidden">仅在点击安装按钮后下载独立运行环境，不修改系统安装。</p>
+              <div id="opencode-progress" class="native-agent-progress hidden" role="status">
+                <span id="opencode-progress-stage"></span>
+                <progress id="opencode-progress-bar" aria-label="安装进度"></progress>
+                <span id="opencode-progress-detail"></span>
+              </div>
+              <pre id="opencode-error" class="native-agent-error hidden"></pre>
+            </div>
+            <div id="opencode-content" class="native-agent-content hidden"></div>
+          </section>

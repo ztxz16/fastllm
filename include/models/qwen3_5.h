@@ -13,6 +13,7 @@
 #include <atomic>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <unordered_map>
@@ -113,6 +114,8 @@ namespace fastllm {
         virtual int GetBatchedPrefillTokenLimit() override;
 
         virtual long long GetAutoWarmupCudaRuntimeReserveBytes(int deviceId, int batch) const override;
+
+        virtual long long GetAutoWarmupCudaAdditionalCacheBytesPerToken(int deviceId) const override;
 
         virtual long long GetAutoWarmupCudaServingReserveBytes(int deviceId) const override;
 
@@ -234,7 +237,25 @@ namespace fastllm {
             Data key;
             Data value;
             int tokens = 0;
+            // TP parents keep only global shape/length; each rank owns its pages.
+            std::map<int, std::unique_ptr<MtpKvCache> > shards;
+
+            void Append(const Data &k, const Data &v,
+                        PagedCacheManager &keyPool, PagedCacheManager &valuePool);
+            void Truncate(int tokens);
+            void SetTpLength(int tokens, int heads, int headDim, DataType type);
         };
+        struct MtpPagedCachePool {
+            PagedCacheManager key;
+            PagedCacheManager value;
+        };
+        // Declared before request caches so their page references die first.
+        mutable std::map<int, std::unique_ptr<MtpPagedCachePool> > mtpPagedCachePools;
+        mutable std::mutex mtpPagedCachePoolMutex;
+        MtpPagedCachePool &GetMtpPagedCachePool(int device, const Data &shape) const;
+        bool RestoreMtpPagedSnapshot(MtpKvCache &cache, const Data &key,
+                                    const Data &value, int device) const;
+        bool SnapshotMtpPagedCache(const MtpKvCache &cache, Data &key, Data &value) const;
         struct DFlashContext {
             int committedTokens = 0;
             std::vector <std::pair <Data, Data> > draftKeyValues;
@@ -245,6 +266,11 @@ namespace fastllm {
         bool mtpWeightsPrepared = false;
         bool mtpSharedWeightsPrepared = false;
         int mtpWeightsPreparedDevice = -1;
+        bool mtpTpPrepared = false;
+        std::vector<int> mtpTpDevices;
+        std::map<int, std::vector<std::pair<int, int> > > mtpTpKvHeadScheme;
+        std::unordered_map<int, std::vector<Data*> > mtpTpMoeWeights;
+        std::unordered_map<int, std::vector<Data*> > mtpTpMoeBiass;
         std::vector <Data*> mtpMoeWeights;
         std::vector <Data*> mtpMoeBiass;
         bool speculativeCollectAllLogits = false;
@@ -293,7 +319,7 @@ namespace fastllm {
         std::unordered_map <int, std::vector <std::vector <Data*> > > singleGpuMoeBiass;
         bool moeWeightsPrepared = false;
         bool gdnMergedWeightsPrepared = false;
-        bool ggufGdnLayoutRestored = false;
+        std::set<int> ggufGdnRestoredLayers;
         std::vector <int> mrope_sections = {11, 11, 10};
         bool visionPrepared = false;
         int vision_depth = 0;
@@ -334,8 +360,8 @@ namespace fastllm {
         std::vector <std::map <int, std::vector <std::pair <int, int> > > > threadTpLinearConvSchemes;
         std::map <int, std::vector <std::pair <int, int> > > threadTpLmHeadScheme;
         std::vector <uint8_t> threadTpLinearAttentionLayers;
-        bool streamingTpLoadEnabled = false;
-        int streamingTpCurrentLoadGroup = -1;
+        bool streamingCudaLoadEnabled = false;
+        int streamingCudaCurrentLoadGroup = -1;
         std::unordered_map <int, Data*> mtpDraftLmHeadWeights;
         PersistentWorkerGroup threadTpWorkerGroup;
 
@@ -382,9 +408,11 @@ namespace fastllm {
                                              std::map <int, int> ratios);
         void PrepareFusedMoeWeightsForDevices(const std::vector <int> &devices,
                                               std::map <int, int> ratios);
-        void RestoreGgufGdnWeights();
+        void RestoreGgufGdnWeights(int firstLayer, int lastLayer);
         void PrepareGdnWeights();
+        void PrepareGdnWeights(int firstLayer, int lastLayer);
 #ifdef USE_CUDA
+        void PrepareStreamingSingleCudaLayer(int layer, int device);
         void PrepareStreamingTpLayer(
                 int layer, const std::vector<int> &devices,
                 std::map<int, int> ratios);
@@ -462,7 +490,18 @@ namespace fastllm {
         bool RequiresDFlashPrefixSnapshot(const ResponseContext *context) const;
         void AddMtpRmsNormOffset();
         void PrepareMtpWeightsForDevice(int device, bool includeSharedWeights = true);
-        void RunMtpFeedForward(int device, Data &hiddenStates);
+        void RunMtpFeedForward(int device, Data &hiddenStates,
+                               bool tensorParallel = false, bool firstRank = true);
+        bool UseMtpBackboneTp(const std::vector<int> &devices) const;
+        void PrepareMtpTpWeights(const std::vector<int> &devices);
+        std::vector<int> RunMtpTpDraft(
+                const std::vector<int> &devices,
+                const std::vector<MtpKvCache*> &caches,
+                const std::vector<const Data*> &targetHiddenStates,
+                const std::vector<std::vector<int> > &inputTokens,
+                const std::vector<Data*> &positionIds,
+                const std::vector<int> &sampleRows,
+                std::vector<Data> *sampledHiddenStates, bool cacheOnly);
         void PrepareMtpDraftLmHeadWeights(const std::vector<int> &devices);
         Data BuildMtpPositionIds(const Data &positionIds, int row, int delta);
         Data BuildMtpPositionIdsSlice(const Data &positionIds, int begin, int end, int delta);

@@ -28,6 +28,12 @@ static void Check(cudaError_t state) {
 static void Require(bool condition, const char *message) {
     if (!condition) throw std::runtime_error(message);
 }
+static void AccumulateHybridReference(float &sum, float value, float score) {
+    // ReduceHybridExperts rounds the FP32 product and sum separately. Host
+    // FMA contraction changes the oracle for cancellation-heavy route sums.
+    volatile float weighted = value * score;
+    sum += weighted;
+}
 static void AllocateGpu(fastllm::Data &data) {
     data.dataDevice = fastllm::DataDevice::CUDA;
     data.dataDeviceIds = {0};
@@ -527,12 +533,14 @@ static void CompareNumaCache(fastllm::DataType dtype, int nodes, int batch,
                     const float cpu = reinterpret_cast<float *>(cpuResult.cpuData)[c];
                     Require(std::abs(cpu - subset[r * hidden + c]) <= 1e-5f * (1 + std::abs(cpu)),
                             "NUMA subset changed expert arithmetic");
-                    lower[c] += std::min(cpu, gpuResult[c]) * routes[r];
-                    upper[c] += std::max(cpu, gpuResult[c]) * routes[r];
+                    AccumulateHybridReference(lower[c], std::min(cpu, gpuResult[c]), routes[r]);
+                    AccumulateHybridReference(upper[c], std::max(cpu, gpuResult[c]), routes[r]);
                     // Warmup populates all layers, then samples each split. Even steps have all
                     // routes resident; odd steps evict all of this table.
                     // Both cases keep original route order when admitting.
-                    exact[c] += (r < (step < tables ? topk : topk - (step - tables) % (topk + 1)) ? gpuResult[c] : cpu) * routes[r];
+                    AccumulateHybridReference(exact[c],
+                        r < (step < tables ? topk : topk - (step - tables) % (topk + 1))
+                            ? gpuResult[c] : cpu, routes[r]);
                 }
             }
             if (step % 2) {

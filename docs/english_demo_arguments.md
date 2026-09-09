@@ -9,6 +9,7 @@ Configuration related to the model, OpenAI API Server, WebUI, and conversation d
   --path ~/Qwen2-7B-Instruct/ # Reads the model from ~/Qwen2-7B-Instruct/, where the model needs to be a standard Hugging Face format model downloaded from HuggingFace, ModelScope, or other websites. Formats like AWQ, GPTQ, etc., are currently not supported.
   --path ~/model.flm # Reads the model from ~/model.flm, where the model is a Fastllm format model file
   ```
+- **GGUF vision module (`--mmproj`)**: Specifies a matching vision GGUF for Qwen3.5-family GGUF models, including corresponding Qwen3.6/3.8 checkpoints. Supply complete vision configuration through `--ori` or a `config.json` alongside the main GGUF. It cannot currently be combined with external MTP. See the [GGUF multimodal example](qwen3_en.md#gguf-multimodal).
 - **Inference Type (`--atype`)**: Sets the intermediate computation type, which can be specified as `float16` or `float32`.
 - **Weight Type (`--dtype`)**: Specifies the weight type of the model, applicable when reading Hugging Face models. It can be specified as `float16`, `int8`, `int4`, `int4g` (int4 grouped quantization), for example:
   ```bash

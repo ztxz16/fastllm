@@ -65,6 +65,8 @@ void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int d
 // prefill tensors can be bandwidth-bound on the direct-peer implementation
 // even though it is faster for decode tensors.
 void FastllmNcclAllReduceNoCustom(void* data, void* dest, int count, int dataType, int deviceId);
+// Requires an initialized TP communicator and matching submissions on every rank.
+bool FastllmNcclAllGather(const void* data, void* dest, int count, int dataType, int deviceId);
 // Returns whether the TP=2 peer-access fast path can be used for this tensor.
 // Callers use this preflight to preserve their existing NCCL fallback without
 // first changing the reduction's compute or accumulation order.

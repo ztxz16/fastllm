@@ -5,10 +5,11 @@ standalone executable and exposes a small Python API over Pi's JSONL RPC mode.
 End users do not need Node.js, npm, or Bun.
 
 Runtime requirements are CPython 3.9+ and either Linux x86-64 with glibc 2.17+
-or Windows x64. The Windows portable build (`../../make_portable.ps1`) bundles
-Python, Pi, ripgrep and fd together; it uses Windows PowerShell for shell tools.
-The wheel has no additional Python package dependencies. The pinned 0.84.4
-prototype is approximately 37 MiB to download and 102 MiB after installation.
+and SSE4.2 (Pi's Bun x64 baseline), or Windows x64. Alpine/musl, ARM64 and
+macOS need separate runtime builds. The wheel has no additional Python dependencies.
+Runtime 0.3.3 includes Pi 0.84.4; Linux wheels also bundle ripgrep 14.1.1 and
+fd 10.2.0 with their licenses. The Windows portable build (`../../make_portable.ps1`)
+bundles Python, Pi, ripgrep and fd together and uses Windows PowerShell for shell tools.
 
 The bridge keeps uploaded-file analysis isolated and read-only. It exposes
 snapshot tools plus WebUI-mediated public-web tools:
@@ -39,30 +40,73 @@ Using it with a non-loopback `--host` additionally requires the explicit
 
 ```bash
 python scripts/fetch_pi.py
-python -m build --wheel
+python scripts/fetch_tools.py
+python -m build --wheel --outdir build/wheels
 ```
 
-For an offline/repeatable build, download the pinned release archive first:
+For an offline/repeatable build, populate both archive caches once, then build
+without network access:
 
 ```bash
-python scripts/fetch_pi.py --archive /path/to/pi-linux-x64.tar.gz
-python -m build --wheel --no-isolation
+python scripts/fetch_pi.py --cache-dir /path/to/cache/pi --offline
+python scripts/fetch_tools.py --cache-dir /path/to/cache/agent-tools --offline
+python -m build --wheel --no-isolation --outdir build/wheels
 ```
 
-The fetch script verifies the upstream release archive and license using
-hard-coded SHA-256 digests before copying anything into the package tree.
+The fetch scripts verify upstream release archives using hard-coded SHA-256
+digests and copy the corresponding licenses into the package tree.
 Use `--cache-dir /path/to/cache` to retain the verified archive, and add
 `--offline` to require local files only. The repository's `make_portable.sh`
 and `desktop/package.sh` build and include this runtime automatically.
+Wheel builds reject missing binaries, extensions, themes, and licenses.
+
+Before publishing, install `build`, `auditwheel`, `patchelf`, and `twine` in
+the build environment, then audit and label the wheel:
+
+```bash
+python -m auditwheel repair --plat manylinux_2_17_x86_64 \
+  --wheel-dir dist build/wheels/ftllm_agent_runtime-0.3.3-py3-none-linux_x86_64.whl
+python -m auditwheel show dist/*-manylinux*.whl
+python -m twine check --strict dist/*-manylinux*.whl
+```
+
+Upload only the audited `manylinux` wheel, using Twine's token prompt:
+
+```bash
+python -m twine upload --username __token__ dist/*-manylinux*.whl
+```
+
+The distribution installs native executables into `platlib`, while keeping
+the Python bridge's `py3-none` tag because it has no CPython extension ABI.
+The manylinux audit checks shared-library compatibility; it does not replace
+runtime tests on supported distributions and CPUs. The runtime has been
+smoke-tested on Ubuntu 22.04 x86-64, including Pi's `read`, `find`, and `grep`.
 
 ## Install and enable in WebUI
 
+Install the companion wheel into the same Python environment as FastLLM:
+
 ```bash
-python -m pip install \
-  dist/ftllm_agent_runtime-0.3.2-py3-none-linux_x86_64.whl
+python -m pip install ftllm-agent-runtime==0.3.3
 
 ftllm webui /path/to/model
 ```
+
+For a local build, pass the audited wheel's path to `pip install` instead.
+Restart an already-running FastLLM process after installing the package.
+
+FastLLM builds that include **Launcher → Studio → Install Agent dependencies**
+install this wheel with the Launcher's Python and pip. The installer uses pip's
+configured index/mirror and cache, and installs into the current user's
+`${XDG_DATA_HOME:-~/.local/share}/ftllm/agent-runtime/` directory with `--target`.
+It verifies Pi and both search tools before activating the installation, then
+enables the current Studio without restarting the model. Failed installations
+leave any previous managed runtime intact and can be retried from the UI.
+
+The Linux companion wheel includes `rg` and `fd` beside Pi. The bridge prepends this
+directory to the child process's `PATH`, so directory searches work even when
+neither command is installed system-wide. Pi runs in offline mode and does not
+download additional tools during use.
 
 Pi is the default agent runtime for code tasks and Web Agent searches. Use
 `--agent-runtime builtin` to force the original single-model-call paths, or
@@ -100,3 +144,6 @@ ftllm-agent-runtime probe \
 Pi Agent is distributed under the MIT License. The pinned upstream license is
 committed at `src/ftllm_agent_runtime/licenses/PI_LICENSE` and included in
 built wheels.
+Search-tool license files and pinned version/source information are included
+under `ftllm_agent_runtime/licenses/agent-tools/` in Linux wheels; Windows portable
+bundles retain these licenses in `support/THIRD-PARTY/`.

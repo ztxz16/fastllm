@@ -1,3 +1,38 @@
+import {
+  resetProfileSearch, cloneConfig, fillForm, collectForm, isSimpleNewProfile,
+  configurationModeDescription, openAutomaticConfigurationDialog, closeAutomaticConfigurationDialog,
+  handleConfigurationModeChange, handleFormChange, defaultServicePort, updateConditionalFields,
+  configureProfileAutomatically, clearProfileInferenceConfiguration,
+  renderAutomaticConfigurationStatus, renderSaveState, renderProfiles, editProfile, newProfile,
+  renderProfileEditorTitle, closeProfileEditor, deleteProfile, saveProfileAndClose, schedulePreview,
+  renderLaunchValidation, focusValidationError, startSavedProfile, startRuntime, openFolderPicker,
+  closeFolderPicker, loadFolderPicker, renderFolderPicker, selectCurrentFolder
+} from "../ui_plugins/models/app.js";
+import {
+  renderDownloadValidation, renderDownloadCatalog, fillDownloadForm, selectDownloadPreset,
+  handleDownloadChange, scheduleDownloadPreview, startDownload, cancelDownload, refreshDownload,
+  renderDownload, useDownloadedModel
+} from "../ui_plugins/downloads/app.js";
+import {
+  refreshLogs, renderLogs, scrollLogsToBottom, clearLogs
+} from "../ui_plugins/logs/app.js";
+import {
+  loadHardware, renderHardwareStatus, renderHardware
+} from "../ui_plugins/hardware/app.js";
+import {
+  renderAgentRuntime, refreshAgentRuntime, installAgentRuntime, renderWebUIAvailability,
+  openEmbeddedWebUI
+} from "../ui_plugins/studio/launcher.js";
+
+import {
+  mountPluginHost
+} from "../plugin-core/host.js";
+import {mountHarness} from "../ui_plugins/harness/app.js";
+import {mountOpenCode} from "../ui_plugins/opencode/app.js";
+import {mountCodex} from "../ui_plugins/codex/app.js";
+import {mountClaude} from "../ui_plugins/claude/app.js";
+
+let pluginHost, harness, nativeAgents = {};
 const locationQuery = new URLSearchParams(window.location.search);
 const queryToken = locationQuery.get("token") || "";
 if (queryToken) {
@@ -6,54 +41,28 @@ if (queryToken) {
 }
 const controlToken = queryToken || window.sessionStorage.getItem("ftllm-launcher-token") || "";
 const ACTIVE_RUNTIME_PHASES = new Set(["starting", "running", "stopping"]);
-const ACTIVE_DOWNLOAD_PHASES = new Set(["starting", "downloading", "cancelling"]);
 const DEFAULT_LOCALE = "zh-CN";
 const SUPPORTED_LOCALES = new Set(["zh-CN", "en-US"]);
 const LOCALE_STORAGE_KEY = "ftllm-launcher-locale";
-const WEBUI_LOAD_TIMEOUT_MS = 30000;
 const INFERENCE_SPEED_TIMEOUT_MS = 3000;
-const AUTOMATIC_CONFIGURATION_DEFAULTS = Object.freeze({
-  device: "auto",
-  cuda_device_id: "0",
-  tp: "2",
-  cudapp: "2",
-  threads: "auto",
-  gpu_mem_ratio: "0.9",
-  low_gpu_mem: false,
-  max_batch: "auto",
-  max_context_length: "auto",
-  kv_cache_dtype: "auto",
-  kv_cache_limit: "auto",
-  tokens: "auto",
-  enable_moe_hybrid: false,
-  moe_device: "numa",
-  moe_device_layers: "-1",
-  moe_device_custom: "",
-  moe_atype: "auto",
-  ngram_device: "auto",
-  speculative_algorithm: "auto",
-  speculative_draft_model_path: "",
-  mtp: "auto",
-  draft_tokens: "auto"
-});
-const AUTOMATIC_CONFIGURATION_FIELDS = new Set(Object.keys(AUTOMATIC_CONFIGURATION_DEFAULTS));
 // The HTML template is the Chinese fallback; JavaScript and backend messages use
 // English message IDs. Locale resources provide the corresponding translations.
 const localeCache = new Map();
 const capturedStaticText = [];
 const capturedStaticAttributes = [];
-let profileRenderSignature = "";
-let webuiModulePromise;
-let webuiModuleRetries = 0;
-let webuiModuleLoaded = false;
 
 const state = {
   profiles: [],
   defaultProfile: null,
   currentIndex: null,
   editingConfig: null,
+  speculativeCountField: "draft_tokens",
   automaticConfigDialogPreviousStatus: null,
   runtime: null,
+  agentRuntime: null,
+  agentRuntimePolling: false,
+  agentRuntimeRequest: false,
+  agentConfigRefreshNeeded: false,
   inferenceSpeedSession: null,
   inferenceSpeedSamples: {},
   download: null,
@@ -102,6 +111,8 @@ const state = {
   folderPickerResult: null,
   folderPickerSelectedFile: "",
   folderPickerError: "",
+  folderPickerField: "model",
+  folderPickerTrigger: null,
   confirmationResolve: null,
   confirmationRestoreFocus: null
 };
@@ -117,6 +128,7 @@ async function request(path, options = {}) {
     headers.set("Content-Type", "application/json");
   }
   const response = await fetch(path, { ...options, headers });
+  if (options.stream && response.ok) return response;
   const text = await response.text();
   let payload = {};
   if (text) {
@@ -140,7 +152,8 @@ function cacheElements() {
     "open-endpoint", "stop-runtime", "profile-count", "profile-list", "new-profile",
     "current-view-title", "profile-search", "profile-results",
     "open-webui", "webui-placeholder", "webui-status",
-    "webui-content", "webui-retry",
+    "webui-content", "webui-retry", "agent-runtime-card", "agent-runtime-title",
+    "agent-runtime-message", "agent-runtime-progress", "agent-runtime-error", "install-agent-runtime",
     "config-path", "profile-editor-modal", "profile-editor-title", "launch-form",
     "close-profile-editor", "save-state", "ori-field", "auto-configure-profile",
     "clear-profile-config", "automatic-config-status",
@@ -155,10 +168,11 @@ function cacheElements() {
     "webui-max-token-field", "webui-think-field",
     "server-context-field", "server-sampling-title", "server-sampling-fields", "server-api-key-field",
     "server-hide-input-field", "launch-command-kicker", "command-preview",
-    "validation-messages", "save-profile",
+    "validation-messages", "validation-summary", "launch-action-hint", "save-profile",
+    "speculative-mtp-field", "speculative-draft-tokens-field", "speculative-path-field", "speculative-mode-hint",
     "start-runtime", "clear-logs", "log-count", "log-output",
     "refresh-hardware", "hardware-status", "hardware-grid", "path-suggestions",
-    "choose-model-folder", "folder-picker-modal", "folder-picker-title",
+    "choose-model-folder", "choose-draft-model-folder", "folder-picker-modal", "folder-picker-title",
     "folder-picker-close", "folder-picker-current", "folder-picker-up",
     "folder-picker-location", "folder-picker-drive-field", "folder-picker-drive",
     "folder-picker-list", "folder-picker-status", "folder-picker-cancel",
@@ -171,7 +185,7 @@ function cacheElements() {
     "download-cancel", "download-use-model", "download-use-last", "download-status-icon",
     "download-status-title", "download-status-message", "download-progress-value",
     "download-progress", "download-bytes", "download-files", "download-destination",
-    "launcher-address-list", "language-select"
+    "launcher-address-list", "language-select", "theme-select"
   ];
   for (const id of ids) {
     elements[toCamelCase(id)] = document.getElementById(id);
@@ -184,9 +198,22 @@ function toCamelCase(value) {
 
 async function initialize() {
   cacheElements();
+  initializeTheme();
   captureStaticMessages();
   await initializeLocale();
   bindEvents();
+  harness = mountHarness({request, getRuntime:() => state.runtime, t});
+  const agentOptions = {request, getRuntime:() => state.runtime, t,
+    chooseDirectory:(input, trigger) => openFolderPicker(null, trigger, {input, directoriesOnly:true})};
+  nativeAgents = {opencode:mountOpenCode(agentOptions), codex:mountCodex(agentOptions), claude:mountClaude(agentOptions)};
+  pluginHost = await mountPluginHost({request, navigation:document.querySelector(".navigation"),
+    container:document.querySelector(".page-scroll"), navigate:switchView,
+    nativePages:{harness, ...nativeAgents},
+    context:() => ({locale:state.locale, theme:window.ftllmLauncherTheme.getResolved()}),
+    studioCall:(capability, args) => {
+      if (!state.webuiComponent) throw new Error("请先打开工作室");
+      return state.webuiComponent.pluginCall(capability, args);
+    }});
   if (!controlToken) {
     showToast(t("Missing control token. Reopen the URL printed by ftllm launch."), "error", 10000);
   }
@@ -223,12 +250,24 @@ async function initialize() {
     window.setInterval(renderInferenceSpeed, 250);
     window.setInterval(refreshDownload, 700);
     window.setInterval(refreshLogs, 700);
+    refreshAgentRuntime();
+    window.setInterval(refreshAgentRuntime, 1000);
   } catch (error) {
     showToast(t("Launcher initialization failed: {error}", { error: friendlyError(error) }), "error", 10000);
     elements.statusTitle.textContent = t("Launcher connection failed");
     elements.statusMessage.textContent = friendlyError(error);
     elements.statusDot.className = "status-dot failed";
   }
+}
+
+function initializeTheme() {
+  const theme = window.ftllmLauncherTheme;
+  elements.themeSelect.value = theme.getPreference();
+  elements.themeSelect.addEventListener("change", () => theme.setPreference(elements.themeSelect.value));
+  window.addEventListener("ftllm-theme-change", event => {
+    elements.themeSelect.value = event.detail.preference;
+    state.webuiComponent?.setTheme(event.detail.theme);
+  });
 }
 
 function normalizeLocale(locale) {
@@ -386,6 +425,7 @@ function renderLocalizedContent() {
   renderProfileEditorTitle();
   renderSaveState();
   renderRuntime();
+  renderAgentRuntime();
   renderLauncherAddresses();
   renderDownloadCatalog();
   renderDownload();
@@ -438,6 +478,7 @@ function renderLauncherAddresses() {
 }
 
 function bindEvents() {
+  elements.installAgentRuntime.addEventListener("click", installAgentRuntime);
   document.addEventListener("click", handleDelegatedClick);
   elements.webuiRetry.addEventListener("click", () => {
     state.webuiError = "";
@@ -488,7 +529,9 @@ function bindEvents() {
   elements.profileEditorModal.addEventListener("click", (event) => {
     if (event.target === elements.profileEditorModal) closeProfileEditor();
   });
-  elements.chooseModelFolder.addEventListener("click", openFolderPicker);
+  elements.chooseModelFolder.addEventListener("click", () => openFolderPicker("model", elements.chooseModelFolder));
+  elements.chooseDraftModelFolder.addEventListener("click", () => openFolderPicker("speculative_draft_model_path", elements.chooseDraftModelFolder));
+  elements.validationSummary.addEventListener("click", () => focusValidationError());
   elements.folderPickerClose.addEventListener("click", () => closeFolderPicker());
   elements.folderPickerCancel.addEventListener("click", () => closeFolderPicker());
   elements.folderPickerSelect.addEventListener("click", selectCurrentFolder);
@@ -602,7 +645,9 @@ function switchView(view) {
   for (const panel of document.querySelectorAll(".view")) {
     panel.classList.toggle("active", panel.id === `view-${view}`);
   }
-  document.querySelector(".app-shell").classList.toggle("webui-active", view === "webui");
+  document.querySelector(".app-shell").classList.toggle("webui-active", ["webui", "harness", "opencode", "codex", "claude"].includes(view));
+  harness?.navigate(view);
+  for (const agent of Object.values(nativeAgents)) agent.navigate(view);
   elements.openWebui.classList.toggle("hidden", view === "webui");
   if (view === "webui") renderWebUIAvailability();
   if (view === "logs") scrollLogsToBottom();
@@ -614,19 +659,20 @@ function switchView(view) {
 }
 
 function renderViewTitle() {
+  document.querySelector(".management-label").textContent = ["webui", "harness", "opencode", "codex", "claude"].includes(state.currentView)
+    ? "agent" : t("Model management");
   const titles = {
     launch: t("Launch service"),
     webui: t("Studio"),
+    harness: "DeepSeek Harness",
+    opencode: "OpenCode",
+    codex: "Codex",
+    claude: "Claude Code",
     download: t("Download model"),
     logs: t("Runtime logs"),
     hardware: t("Hardware")
   };
-  elements.currentViewTitle.textContent = titles[state.currentView] || titles.launch;
-}
-
-function resetProfileSearch() {
-  state.profileQuery = "";
-  elements.profileSearch.value = "";
+  elements.currentViewTitle.textContent = pluginHost?.title(state.currentView) || titles[state.currentView] || titles.launch;
 }
 
 function createIcon(name) {
@@ -639,883 +685,6 @@ function createIcon(name) {
   return icon;
 }
 
-function cloneConfig(config) {
-  return JSON.parse(JSON.stringify(config || {}));
-}
-
-function fillForm(config) {
-  for (const input of elements.launchForm.querySelectorAll("[data-field]")) {
-    const value = config?.[input.dataset.field];
-    if (input.type === "checkbox") {
-      input.checked = Boolean(value);
-    } else {
-      input.value = value === null || value === undefined ? "" : String(value);
-    }
-  }
-  for (const input of elements.configurationModeOptions.querySelectorAll("[data-config-mode]")) {
-    input.checked = input.value === (config?.config_mode || "custom");
-  }
-  state.dirty = false;
-  renderSaveState();
-  updateConditionalFields();
-  renderProfilePresentation();
-}
-
-function collectForm() {
-  const config = { ...(state.editingConfig || {}), command: "server" };
-  for (const input of elements.launchForm.querySelectorAll("[data-field]")) {
-    config[input.dataset.field] = input.type === "checkbox" ? input.checked : input.value;
-  }
-  config.config_mode = elements.configurationModeOptions.querySelector("[data-config-mode]:checked")?.value || "custom";
-  return config;
-}
-
-function isSimpleNewProfile() {
-  return state.currentIndex === null && collectForm().config_mode !== "custom";
-}
-
-function renderProfilePresentation() {
-  const simple = isSimpleNewProfile();
-  const mode = collectForm().config_mode;
-  elements.launchForm.classList.toggle("simple-profile", simple);
-  elements.profileParameters.classList.toggle("hidden", simple);
-  elements.automaticConfigActions.classList.toggle("hidden", simple);
-  elements.configurationModeSettings.classList.toggle("hidden", state.currentIndex !== null);
-  elements.profileEditorDescription.textContent = state.currentIndex === null
-    ? t("Choose a model and configuration mode, then save or start your service.")
-    : t("Edit all settings, or click Automatic configuration to choose a mode.");
-  elements.configurationModeDescription.textContent = configurationModeDescription(mode);
-}
-
-function configurationModeDescription(mode) {
-  const descriptions = {
-    long_context: t("One conversation at a time; context capacity follows the model and available memory."),
-    high_concurrency: t("Automatic batching; context capacity follows the model and available memory."),
-    custom: t("Set parameters yourself, or use automatic configuration as a starting point.")
-  };
-  return descriptions[mode] || descriptions.custom;
-}
-
-function openAutomaticConfigurationDialog() {
-  if (state.currentIndex === null) {
-    configureProfileAutomatically();
-    return;
-  }
-  const config = collectForm();
-  const mode = config.config_mode === "high_concurrency" ? "high_concurrency" : "long_context";
-  elements.automaticModeOptions.replaceChildren();
-  for (const card of elements.configurationModeOptions.children) {
-    if (card.querySelector("input").value === "custom") continue;
-    const clone = card.cloneNode(true);
-    const input = clone.querySelector("input");
-    input.name = "automatic-configuration-mode";
-    delete input.dataset.configMode;
-    input.checked = input.value === mode;
-    elements.automaticModeOptions.append(clone);
-  }
-  elements.automaticEnableSpeculativeDecoding.checked = config.enable_speculative_decoding;
-  elements.automaticModeDescription.textContent = configurationModeDescription(mode);
-  state.automaticConfigDialogPreviousStatus = state.automaticConfigStatus;
-  elements.automaticConfigDialog.showModal();
-  renderAutomaticConfigurationStatus();
-  elements.automaticModeOptions.querySelector("input:checked")?.focus();
-}
-
-function closeAutomaticConfigurationDialog(cancelled = true) {
-  if (!elements.automaticConfigDialog.open) return;
-  if (cancelled) {
-    cancelPendingAutomaticConfiguration();
-    state.automaticConfigStatus = state.automaticConfigDialogPreviousStatus || { phase: "idle" };
-  }
-  elements.automaticConfigDialog.close();
-  state.automaticConfigDialogPreviousStatus = null;
-  renderAutomaticConfigurationStatus();
-  elements.autoConfigureProfile.focus({ preventScroll: true });
-}
-
-function handleConfigurationModeChange() {
-  cancelPendingAutomaticConfiguration();
-  state.editingConfig = collectForm();
-  state.dirty = true;
-  state.automaticConfigStatus = { phase: "idle" };
-  renderProfilePresentation();
-  if (isSimpleNewProfile()) {
-    prepareAutomaticConfigurationForNewProfile();
-    scheduleAutomaticConfiguration(0);
-  } else {
-    elements.launchForm.querySelector("#editor-advanced").open = true;
-  }
-  renderSaveState();
-  renderAutomaticConfigurationStatus();
-  schedulePreview(0);
-}
-
-function handleFormChange(event) {
-  if (!event.target.matches("[data-field]")) return;
-  const changedField = event.target.dataset.field;
-  if (event.target.dataset.field === "command") {
-    const oldCommand = state.editingConfig?.command || "server";
-    const portInput = elements.launchForm.querySelector('[data-field="port"]');
-    const oldDefaultPort = defaultServicePort(oldCommand);
-    if (!portInput.value || portInput.value === oldDefaultPort) {
-      portInput.value = defaultServicePort(event.target.value);
-    }
-  }
-  state.editingConfig = collectForm();
-  state.dirty = true;
-  renderSaveState();
-  updateConditionalFields();
-  schedulePreview();
-  if (event.target.matches("[data-path-input]")) {
-    schedulePathSuggestions(event.target);
-  }
-  if (changedField === "enable_speculative_decoding") {
-    prepareAutomaticConfigurationForNewProfile();
-    if (state.automaticConfigPending) scheduleAutomaticConfiguration(0);
-  } else if (changedField === "model" && state.automaticConfigPending) {
-    scheduleAutomaticConfiguration();
-  } else if (
-    state.automaticConfigPending
-    && AUTOMATIC_CONFIGURATION_FIELDS.has(changedField)
-  ) {
-    cancelPendingAutomaticConfiguration();
-    state.automaticConfigStatus = { phase: "cancelled" };
-    renderAutomaticConfigurationStatus();
-  }
-}
-
-function defaultServicePort(command) {
-  const preferred = command === "webui" ? 1616 : 8080;
-  const launcherPort = Number(window.location.port || (window.location.protocol === "https:" ? 443 : 80));
-  return String(preferred === launcherPort ? preferred + 1 : preferred);
-}
-
-function updateConditionalFields() {
-  const config = collectForm();
-  const isWebui = config.command === "webui";
-  elements.cudaDeviceField.classList.toggle("hidden", config.device !== "cuda");
-  elements.tpDeviceField.classList.toggle("hidden", config.device !== "tp");
-  elements.cudappDeviceField.classList.toggle("hidden", config.device !== "cudapp");
-  elements.oriField.classList.toggle("hidden", !String(config.model || "").toLowerCase().endsWith(".gguf"));
-  elements.moeDeviceField.classList.toggle("hidden", !config.enable_moe_hybrid);
-  elements.moeLayersField.classList.toggle("hidden", !config.enable_moe_hybrid);
-  elements.moeDeviceCustomField.classList.toggle(
-    "hidden",
-    !config.enable_moe_hybrid || config.moe_device !== "custom"
-  );
-  elements.serverModelNameField.classList.toggle("hidden", isWebui);
-  elements.serverHostField.classList.toggle("hidden", isWebui);
-  elements.webuiMaxTokenField.classList.toggle("hidden", !isWebui);
-  elements.webuiThinkField.classList.toggle("hidden", !isWebui);
-  elements.serverContextField.classList.toggle("hidden", isWebui);
-  elements.serverSamplingTitle.classList.toggle("hidden", isWebui);
-  elements.serverSamplingFields.classList.toggle("hidden", isWebui);
-  elements.serverApiKeyField.classList.toggle("hidden", isWebui);
-  elements.serverHideInputField.classList.toggle("hidden", isWebui);
-  elements.launchCommandKicker.textContent = isWebui ? "FTLLM WEBUI" : "FTLLM SERVER";
-}
-
-function automaticConfigurationFingerprint(config = collectForm()) {
-  const values = {
-    model: String(config.model || "").trim(),
-    config_mode: config.config_mode,
-    enable_speculative_decoding: config.enable_speculative_decoding
-  };
-  for (const field of AUTOMATIC_CONFIGURATION_FIELDS) values[field] = config[field];
-  return JSON.stringify(values);
-}
-
-function cancelPendingAutomaticConfiguration() {
-  window.clearTimeout(state.automaticConfigTimer);
-  state.automaticConfigTimer = null;
-  state.automaticConfigPending = false;
-  state.automaticConfigAppliedModel = "";
-  state.automaticConfigRequestId += 1;
-}
-
-function prepareAutomaticConfigurationForNewProfile() {
-  cancelPendingAutomaticConfiguration();
-  state.automaticConfigPending = isSimpleNewProfile();
-  state.automaticConfigStatus = { phase: state.automaticConfigPending ? "waiting" : "idle" };
-  renderAutomaticConfigurationStatus();
-}
-
-function scheduleAutomaticConfiguration(delay = 650) {
-  window.clearTimeout(state.automaticConfigTimer);
-  state.automaticConfigRequestId += 1;
-  const model = String(collectForm().model || "").trim();
-  if (!model) {
-    state.automaticConfigStatus = { phase: "waiting" };
-    renderAutomaticConfigurationStatus();
-    return;
-  }
-  if (
-    model === state.automaticConfigAppliedModel
-    && state.automaticConfigStatus?.phase === "applied"
-  ) return;
-  state.automaticConfigStatus = { phase: "waiting" };
-  renderAutomaticConfigurationStatus();
-  state.automaticConfigTimer = window.setTimeout(() => {
-    state.automaticConfigTimer = null;
-    configureProfileAutomatically({ automatic: true });
-  }, delay);
-}
-
-async function configureProfileAutomatically({ automatic = false, selection = null } = {}) {
-  const current = collectForm();
-  const requested = { ...current, ...selection };
-  const model = String(current.model || "").trim();
-  if (!model) {
-    state.automaticConfigStatus = { phase: "missing-model" };
-    renderAutomaticConfigurationStatus();
-    if (!automatic) showToast(t("Choose a local model before using automatic configuration."), "error");
-    return;
-  }
-  window.clearTimeout(state.automaticConfigTimer);
-  state.automaticConfigTimer = null;
-  const requestId = ++state.automaticConfigRequestId;
-  const fingerprint = automaticConfigurationFingerprint(current);
-  const keepAutomaticForNewProfile = state.automaticConfigPending && state.currentIndex === null;
-  state.automaticConfigStatus = { phase: "loading" };
-  renderAutomaticConfigurationStatus();
-  try {
-    const recommendation = await request("/api/recommend", {
-      method: "POST",
-      body: JSON.stringify({
-        model, name: current.name || current.model_name || "", config_mode: requested.config_mode,
-        enable_speculative_decoding: requested.enable_speculative_decoding
-      })
-    });
-    if (
-      requestId !== state.automaticConfigRequestId
-      || elements.profileEditorModal.classList.contains("hidden")
-    ) return;
-    if (fingerprint !== automaticConfigurationFingerprint()) {
-      state.automaticConfigPending = false;
-      state.automaticConfigStatus = { phase: "stale" };
-      renderAutomaticConfigurationStatus();
-      return;
-    }
-    if (!recommendation?.config || typeof recommendation.config !== "object") {
-      throw new Error(t("The automatic configuration response is invalid."));
-    }
-    const recommendedFields = {};
-    for (const [field, value] of Object.entries(recommendation.config)) {
-      if (AUTOMATIC_CONFIGURATION_FIELDS.has(field)) recommendedFields[field] = value;
-    }
-    state.editingConfig = {
-      ...collectForm(), ...selection, ...recommendedFields,
-      // Drop inherited overrides so automatic configuration uses the runtime default.
-      chunked_prefill_size: "auto"
-    };
-    fillForm(state.editingConfig);
-    state.dirty = true;
-    state.automaticConfigPending = keepAutomaticForNewProfile;
-    state.automaticConfigAppliedModel = model;
-    state.automaticConfigStatus = { phase: "applied", recommendation };
-    renderSaveState();
-    renderAutomaticConfigurationStatus();
-    updateConditionalFields();
-    schedulePreview(0);
-    showToast(
-      automatic
-        ? t("The new model was configured automatically. Review the recommendation before saving.")
-        : t("Recommended inference settings were applied. Review them before saving."),
-      "success",
-      4600
-    );
-    return true;
-  } catch (error) {
-    if (requestId !== state.automaticConfigRequestId) return;
-    state.automaticConfigStatus = {
-      phase: "error",
-      error: friendlyError(error)
-    };
-    renderAutomaticConfigurationStatus();
-    return false;
-  }
-}
-
-function clearProfileInferenceConfiguration() {
-  cancelPendingAutomaticConfiguration();
-  state.editingConfig = {
-    ...collectForm(),
-    ...AUTOMATIC_CONFIGURATION_DEFAULTS,
-    chunked_prefill_size: "auto"
-  };
-  fillForm(state.editingConfig);
-  state.dirty = true;
-  state.automaticConfigStatus = { phase: "cleared" };
-  renderSaveState();
-  renderAutomaticConfigurationStatus();
-  updateConditionalFields();
-  schedulePreview(0);
-  showToast(t("Optional inference settings were cleared."), "success");
-}
-
-function automaticRecommendationDescription(recommendation) {
-  const detected = recommendation?.detected || {};
-  const config = recommendation?.config || {};
-  const hardware = recommendation?.hardware || {};
-  const adjustments = recommendation?.adjustments || {};
-  const strategyTitles = {
-    automatic: t("Automatic device selection"),
-    cuda: t("Single-GPU configuration"),
-    tensor_parallel: t("Tensor-parallel configuration"),
-    hybrid_numa: t("GPU + NUMA hybrid inference"),
-    hybrid_cpu: t("GPU + CPU hybrid inference"),
-    hybrid_disk: t("GPU + disk hybrid inference"),
-    numa: t("NUMA CPU configuration"),
-    cpu: t("CPU configuration"),
-    cpu_disk: t("CPU + disk hybrid inference")
-  };
-  let device = t("automatic device selection");
-  if (config.device === "cuda") {
-    device = config.enable_moe_hybrid
-      ? t("CUDA GPU {device} + {moeDevice} MoE", {
-          device: config.cuda_device_id || "0",
-          moeDevice: String(config.moe_device || "CPU").toUpperCase()
-        })
-      : t("CUDA GPU {device}", { device: config.cuda_device_id || "0" });
-  } else if (config.device === "tp") {
-    device = t("GPU tensor parallelism ({devices})", { devices: config.tp || "—" });
-  } else if (config.device === "numa") {
-    device = t("NUMA CPU");
-  } else if (config.device === "cpu") {
-    device = config.enable_moe_hybrid
-      ? t("CPU + disk MoE")
-      : "CPU";
-  }
-  const kind = detected.isMoe ? t("MoE model") : t("dense model");
-  const size = Number(detected.parameterBillions || 0);
-  const summary = size > 0
-    ? t("Detected a {size}B {kind}; recommended {device}. Weight type is unchanged.", {
-        size: String(Math.round(size * 100) / 100), kind, device
-      })
-    : t("Recommended {device} from the available model and hardware information. Weight type is unchanged.", {
-        device
-      });
-  const details = [];
-  if (detected.architecture) {
-    details.push(t("Detected architecture: {architecture}.", { architecture: detected.architecture }));
-  }
-  if (Number(detected.weightGiB || 0) > 0) {
-    details.push(t("Detected model weights: {size} GiB.", { size: detected.weightGiB }));
-  }
-  if (config.device === "tp") {
-    details.push(t("The model is sharded across {count} GPUs for throughput and capacity.", {
-      count: String((hardware.selectedGpuIds || []).length || String(config.tp || "").split(",").filter(Boolean).length)
-    }));
-  }
-  if (config.enable_moe_hybrid) {
-    const placement = config.moe_device_layers === "-1"
-      ? t("all MoE layers")
-      : t("the trailing {count} MoE layers", { count: config.moe_device_layers });
-    details.push(t("MoE experts use {device}; placement: {placement}.", {
-      device: String(config.moe_device || "").toUpperCase(),
-      placement
-    }));
-  }
-  if (adjustments.ngramOnDisk) {
-    details.push(t("The large N-gram table was placed on disk to preserve host memory."));
-  }
-  if (adjustments.metadataLimited) {
-    details.push(t("Some model metadata was unavailable; verify the recommendation before launch."));
-  }
-  return {
-    title: strategyTitles[recommendation?.strategy] || t("Automatic configuration applied"),
-    summary,
-    details
-  };
-}
-
-function renderAutomaticConfigurationStatus() {
-  const status = state.automaticConfigStatus || { phase: "idle" };
-  const loading = status.phase === "loading";
-  elements.automaticConfigDialogApply.disabled = loading;
-  elements.automaticConfigDialogApply.textContent = loading ? t("Analyzing...") : t("Apply configuration");
-  elements.automaticEnableSpeculativeDecoding.disabled = loading;
-  for (const input of elements.automaticModeOptions.querySelectorAll("input")) input.disabled = loading;
-  const dialogError = status.phase === "error" ? status.error
-    : status.phase === "missing-model" ? t("Choose a local model before using automatic configuration.") : "";
-  elements.automaticConfigDialogError.textContent = dialogError || "";
-  elements.automaticConfigDialogError.classList.toggle("hidden", !dialogError);
-  elements.autoConfigureProfile.disabled = loading;
-  elements.clearProfileConfig.disabled = loading;
-  elements.autoConfigureProfile.textContent = loading
-    ? t("Analyzing...")
-    : t("Automatic configuration");
-  elements.automaticConfigStatus.className = "automatic-config-status";
-  elements.automaticConfigStatus.replaceChildren();
-  if (status.phase === "idle" || (isSimpleNewProfile() && status.phase === "waiting" && !collectForm().model.trim())) {
-    elements.automaticConfigStatus.classList.add("hidden");
-    updateActionAvailability();
-    return;
-  }
-  let title = "";
-  let message = "";
-  let details = [];
-  if (status.phase === "waiting") {
-    title = t("Automatic configuration is ready");
-    message = t("Choose a local model path. It will be configured automatically.");
-  } else if (status.phase === "missing-model") {
-    title = t("Model path required");
-    message = t("Choose a local model before using automatic configuration.");
-    elements.automaticConfigStatus.classList.add("error");
-  } else if (status.phase === "loading") {
-    title = t("Analyzing model and hardware...");
-    message = t("Reading model metadata, weight size, GPU memory, system memory, and NUMA topology.");
-    elements.automaticConfigStatus.classList.add("loading");
-  } else if (status.phase === "applied") {
-    const description = automaticRecommendationDescription(status.recommendation);
-    title = description.title;
-    message = description.summary;
-    details = description.details;
-    if (isSimpleNewProfile()) {
-      title = t("Configuration is ready");
-      message = t("Your model is configured for the selected mode. Save it or start the service.");
-      details = [];
-    }
-    if (status.recommendation?.speculative?.requested) {
-      const messages = {
-        enabled: t("Built-in MTP detected. Speculative decoding is enabled (3 draft tokens)."),
-        no_mtp: t("This model does not declare built-in MTP. Speculative decoding remains off."),
-        missing_weights: t("Built-in MTP weights are missing or incomplete. Speculative decoding remains off."),
-        unsupported_architecture: t("Automatic MTP is not supported for this model architecture. Speculative decoding remains off."),
-        cuda_required: t("MTP requires a supported CUDA configuration. Speculative decoding remains off."),
-        unverified: t("Could not verify built-in MTP from the local model files. Speculative decoding remains off.")
-      };
-      details.push(messages[status.recommendation.speculative.reason] || messages.unverified);
-    }
-    elements.automaticConfigStatus.classList.add("success");
-  } else if (status.phase === "cleared") {
-    title = t("Inference configuration cleared");
-    message = t("Optional inference settings were reset; model and service fields were preserved.");
-  } else if (status.phase === "cancelled") {
-    title = t("Automatic configuration paused");
-    message = t("Your manual inference settings were kept. Use Automatic configuration to run it again.");
-  } else if (status.phase === "stale") {
-    title = t("Recommendation was not applied");
-    message = t("The configuration changed while analysis was running. Run automatic configuration again if needed.");
-  } else if (status.phase === "error") {
-    title = t("Automatic configuration failed");
-    message = status.error || t("Unknown error");
-    elements.automaticConfigStatus.classList.add("error");
-  }
-  const heading = document.createElement("strong");
-  heading.textContent = title;
-  const copy = document.createElement("span");
-  copy.textContent = message;
-  elements.automaticConfigStatus.append(heading, copy);
-  if (details.length) {
-    const list = document.createElement("ul");
-    for (const detail of details) {
-      const item = document.createElement("li");
-      item.textContent = detail;
-      list.append(item);
-    }
-    elements.automaticConfigStatus.append(list);
-  }
-  updateActionAvailability();
-}
-
-function renderSaveState() {
-  elements.saveState.className = "save-state";
-  if (state.dirty) {
-    elements.saveState.classList.add("dirty");
-    elements.saveState.textContent = t("Unsaved");
-  } else if (state.currentIndex === null) {
-    elements.saveState.textContent = t("New profile");
-  } else {
-    elements.saveState.classList.add("saved");
-    elements.saveState.textContent = t("Saved");
-  }
-}
-
-function renderProfiles() {
-  const active = runtimeIsActive(state.runtime);
-  const runningIndex = findRunningProfileIndex();
-  const signature = JSON.stringify([
-    state.locale,
-    state.profileQuery,
-    state.profiles.map((profile) => [
-      profile.name,
-      profile.model_name,
-      profile.model,
-      profile.device,
-      profile.cuda_device_id,
-      profile.tp,
-      profile.cudapp,
-      profile.dtype,
-      profile.port
-    ]),
-    active,
-    runningIndex,
-    state.runtime?.phase || "stopped"
-  ]);
-  if (signature === profileRenderSignature) {
-    updateProfileRuntime();
-    return;
-  }
-  profileRenderSignature = signature;
-  elements.profileList.replaceChildren();
-  elements.profileCount.textContent = String(state.profiles.length);
-  const query = state.profileQuery.trim().toLocaleLowerCase();
-  const profiles = state.profiles.map((profile, index) => ({ profile, index })).filter(({ profile }) =>
-    [profile.name, profile.model_name, profile.model].some(
-      (value) => String(value || "").toLocaleLowerCase().includes(query)
-    )
-  );
-  elements.profileResults.textContent = t("{count} launch items shown", { count: profiles.length });
-  if (!profiles.length) {
-    const filtered = state.profiles.length > 0;
-    const empty = document.createElement("div");
-    empty.className = "empty-profile";
-    const icon = document.createElement("span");
-    icon.className = "empty-profile-icon";
-    icon.append(createIcon(filtered ? "search" : "grid"));
-    const title = document.createElement("strong");
-    title.textContent = filtered ? t("No matching launch items") : t("Your first model starts here");
-    const detail = document.createElement("small");
-    detail.textContent = filtered
-      ? t("Try another name or model path, or clear the search.")
-      : t("Choose a local model and save a profile to launch an API Server.");
-    const action = document.createElement("button");
-    action.type = "button";
-    action.className = "primary-button";
-    if (filtered) action.dataset.clearProfileSearch = "";
-    else action.dataset.newProfile = "";
-    action.textContent = filtered ? t("Clear search") : t("Add launch item");
-    empty.append(icon, title, detail, action);
-    elements.profileList.append(empty);
-    return;
-  }
-  profiles.forEach(({ profile, index }) => {
-    const item = document.createElement("article");
-    item.className = "profile-item";
-    const running = index === runningIndex;
-    item.classList.toggle("running", running);
-
-    const avatar = document.createElement("span");
-    avatar.className = "profile-avatar";
-    avatar.textContent = firstVisibleCharacter(profile.name || profile.model_name || "F");
-    const copy = document.createElement("div");
-    copy.className = "profile-copy";
-    const titleRow = document.createElement("div");
-    titleRow.className = "profile-title-row";
-    const title = document.createElement("strong");
-    title.textContent = profile.name || profile.model_name || t("Unnamed profile");
-    titleRow.append(title);
-    const metadata = document.createElement("div");
-    metadata.className = "profile-metadata";
-    for (const value of [profileDeviceLabel(profile), profile.dtype || "auto", t("Port {port}", { port: profile.port || "—" })]) {
-      const detail = document.createElement("span");
-      detail.textContent = value;
-      metadata.append(detail);
-    }
-    const path = document.createElement("small");
-    path.className = "profile-path";
-    path.textContent = profile.model || t("Model not set");
-    path.title = profile.model || "";
-    copy.append(titleRow, path, metadata);
-
-    const actions = document.createElement("div");
-    actions.className = "project-actions";
-    const start = profileActionButton("start", index, t("Start"), "start");
-    start.disabled = active;
-    if (running) {
-      const phaseLabels = {
-        starting: t("Starting"),
-        running: t("Running"),
-        stopping: t("Stopping")
-      };
-      const status = document.createElement("span");
-      status.className = `profile-live-status ${state.runtime?.phase || "running"}`;
-      status.textContent = phaseLabels[state.runtime?.phase] || t("Running");
-      titleRow.append(status);
-      start.textContent = phaseLabels[state.runtime?.phase] || t("Running");
-    }
-    if (active && !running) start.title = t("Stop the running service before starting another item.");
-    actions.append(
-      start,
-      profileActionButton("edit", index, t("Edit"), "edit"),
-      profileActionButton("delete", index, t("Delete"), "delete danger")
-    );
-    item.append(avatar, copy, actions);
-
-    if (running) item.append(renderProfileRuntime());
-    elements.profileList.append(item);
-  });
-}
-
-function profileActionButton(action, index, label, variant = "") {
-  const button = document.createElement("button");
-  button.type = "button";
-  button.className = `project-action ${variant}`.trim();
-  button.dataset.profileAction = action;
-  button.dataset.profileIndex = String(index);
-  button.textContent = label;
-  return button;
-}
-
-function profileDeviceLabel(profile) {
-  const devices = {
-    auto: t("Auto device"),
-    cuda: "CUDA",
-    tp: "TP",
-    cudapp: "CUDA:PP",
-    cpu: "CPU",
-    numa: "NUMA"
-  };
-  const device = devices[profile.device] || String(profile.device || t("Auto device"));
-  const ids = { cuda: profile.cuda_device_id || "0", tp: profile.tp, cudapp: profile.cudapp };
-  return ids[profile.device] ? `${device} · ${ids[profile.device]}` : device;
-}
-
-function renderProfileRuntime() {
-  const runtime = state.runtime || {};
-  const panel = document.createElement("div");
-  panel.className = "project-runtime";
-  const status = document.createElement("div");
-  status.className = "project-runtime-status";
-  const label = document.createElement("span");
-  label.className = "profile-runtime-label";
-  label.textContent = localizeServerText(runtime.progressLabel || runtime.message) || t("Starting");
-  const value = document.createElement("strong");
-  value.className = "profile-runtime-value";
-  const percent = Math.max(0, Math.min(100, Number(runtime.progress || 0)));
-  value.textContent = runtime.progressIndeterminate ? t("Processing") : `${Math.round(percent)}%`;
-  status.append(label, value);
-  panel.append(status);
-  if (runtime.phase === "starting") {
-    const progress = document.createElement("progress");
-    progress.className = "progress-track profile-runtime-progress";
-    progress.max = 100;
-    if (runtime.progressIndeterminate) {
-      progress.classList.add("indeterminate");
-    } else {
-      progress.value = percent;
-    }
-    panel.append(progress);
-  }
-  if (runtime.endpoint) {
-    const endpoint = document.createElement("code");
-    endpoint.className = "profile-runtime-endpoint";
-    endpoint.textContent = runtime.endpoint;
-    panel.append(endpoint);
-  }
-  return panel;
-}
-
-function updateProfileRuntime() {
-  const panel = elements.profileList.querySelector(".project-runtime");
-  if (!panel) return;
-  const runtime = state.runtime || {};
-  const percent = Math.max(0, Math.min(100, Number(runtime.progress || 0)));
-  const label = panel.querySelector(".profile-runtime-label");
-  const value = panel.querySelector(".profile-runtime-value");
-  const progress = panel.querySelector(".profile-runtime-progress");
-  if (label) label.textContent = localizeServerText(runtime.progressLabel || runtime.message) || t("Starting");
-  if (value) value.textContent = runtime.progressIndeterminate ? t("Processing") : `${Math.round(percent)}%`;
-  if (progress) {
-    progress.classList.toggle("indeterminate", Boolean(runtime.progressIndeterminate));
-    if (runtime.progressIndeterminate) progress.removeAttribute("value");
-    else progress.value = percent;
-  }
-  let endpoint = panel.querySelector(".profile-runtime-endpoint");
-  if (runtime.endpoint) {
-    if (!endpoint) {
-      endpoint = document.createElement("code");
-      endpoint.className = "profile-runtime-endpoint";
-      panel.append(endpoint);
-    }
-    endpoint.textContent = runtime.endpoint;
-  } else {
-    endpoint?.remove();
-  }
-}
-
-function firstVisibleCharacter(value) {
-  return Array.from(String(value).trim())[0]?.toUpperCase() || "F";
-}
-
-function findRunningProfileIndex() {
-  const runtime = state.runtime;
-  if (!runtimeIsActive(runtime)) return -1;
-  if (runtime.profileName) {
-    const namedIndex = state.profiles.findIndex((profile) => profile.name === runtime.profileName);
-    if (namedIndex >= 0) return namedIndex;
-  }
-  return runtime.model
-    ? state.profiles.findIndex((profile) => profile.model === runtime.model)
-    : -1;
-}
-
-function editProfile(index) {
-  if (!Number.isInteger(index) || index < 0 || index >= state.profiles.length) return;
-  cancelPendingAutomaticConfiguration();
-  state.automaticConfigStatus = { phase: "idle" };
-  state.currentIndex = index;
-  state.editingConfig = cloneConfig(state.profiles[index]);
-  fillForm(state.editingConfig);
-  showProfileEditor();
-  schedulePreview(0);
-  elements.profileEditorTitle.focus({ preventScroll: true });
-}
-
-function newProfile() {
-  cancelPendingAutomaticConfiguration();
-  state.currentIndex = null;
-  state.editingConfig = cloneConfig(state.defaultProfile);
-  state.editingConfig.port = defaultServicePort(state.editingConfig.command);
-  const used = new Set(state.profiles.map((item) => item.name));
-  let sequence = 1;
-  while (used.has(t("Profile {number}", { number: sequence }))) sequence += 1;
-  state.editingConfig.name = t("Profile {number}", { number: sequence });
-  fillForm(state.editingConfig);
-  state.dirty = true;
-  renderSaveState();
-  showProfileEditor();
-  prepareAutomaticConfigurationForNewProfile();
-  schedulePreview(0);
-  elements.launchForm.querySelector('[data-field="model"]').focus();
-}
-
-function showProfileEditor() {
-  renderProfileEditorTitle();
-  renderAutomaticConfigurationStatus();
-  elements.profileEditorModal.classList.remove("hidden");
-  document.body.classList.add("modal-open");
-  elements.launchForm.scrollTop = 0;
-  elements.launchForm.querySelector("#editor-advanced").open = !isSimpleNewProfile();
-}
-
-function renderProfileEditorTitle() {
-  elements.profileEditorTitle.textContent = state.currentIndex === null
-    ? t("Add launch item")
-    : t("Edit launch item");
-  renderProfilePresentation();
-}
-
-async function closeProfileEditor(force = false) {
-  if (!force && state.dirty) {
-    const discard = await showConfirmation({
-      tone: "warning",
-      icon: "↩",
-      kicker: t("Unsaved changes"),
-      title: t("Discard your changes?"),
-      message: t("Discard unsaved changes and return to the launch item list?"),
-      cancelLabel: t("Keep editing"),
-      confirmLabel: t("Discard changes")
-    });
-    if (!discard) return false;
-  }
-  closeAutomaticConfigurationDialog();
-  cancelPendingAutomaticConfiguration();
-  state.automaticConfigStatus = { phase: "idle" };
-  state.currentIndex = null;
-  state.dirty = false;
-  if (!elements.folderPickerModal.classList.contains("hidden")) {
-    closeFolderPicker(false);
-  }
-  elements.profileEditorModal.classList.add("hidden");
-  document.body.classList.remove("modal-open");
-  renderProfiles();
-  elements.newProfile.focus({ preventScroll: true });
-  return true;
-}
-
-async function deleteProfile(index) {
-  if (!Number.isInteger(index) || index < 0 || index >= state.profiles.length) return;
-  const profile = state.profiles[index];
-  const name = profile.name || t("Unnamed profile");
-  const confirmed = await showConfirmation({
-    tone: "danger",
-    icon: "×",
-    kicker: t("Delete launch item"),
-    title: t("Delete “{name}”?", { name }),
-    message: t("This removes only the saved launch configuration. Model files remain on disk."),
-    cancelLabel: t("Cancel"),
-    confirmLabel: t("Delete")
-  });
-  if (!confirmed) return;
-  try {
-    const result = await request(`/api/profiles/${index}`, { method: "DELETE" });
-    state.profiles = result.profiles;
-    renderProfiles();
-    showToast(t("Profile deleted."), "success");
-  } catch (error) {
-    showToast(friendlyError(error), "error");
-  }
-}
-
-async function saveCurrentProfile(showSuccess = false) {
-  await ensureProfileConfiguration();
-  const config = collectForm();
-  if (isSimpleNewProfile()) {
-    const base = basename(config.model) || config.name;
-    const used = new Set(state.profiles.map((profile) => profile.name));
-    config.name = base;
-    for (let suffix = 2; used.has(config.name); suffix += 1) config.name = `${base} (${suffix})`;
-  }
-  const result = await request("/api/profiles", {
-    method: "POST",
-    body: JSON.stringify({ index: state.currentIndex, config })
-  });
-  state.profiles = result.profiles;
-  state.currentIndex = result.index;
-  state.editingConfig = cloneConfig(result.profile);
-  state.dirty = false;
-  resetProfileSearch();
-  renderSaveState();
-  if (showSuccess) showToast(t("Launch profile saved."), "success");
-  return result.profile;
-}
-
-async function ensureProfileConfiguration() {
-  if (!isSimpleNewProfile()) return;
-  if (state.automaticConfigStatus?.phase === "applied"
-      && state.automaticConfigAppliedModel === String(collectForm().model || "").trim()) return;
-  if (!await configureProfileAutomatically({ automatic: true })) {
-    throw new Error(t("Automatic configuration must finish before saving. Retry or choose custom configuration."));
-  }
-}
-
-async function saveProfileAndClose() {
-  try {
-    await saveCurrentProfile(true);
-    closeProfileEditor(true);
-  } catch (error) {
-    showToast(friendlyError(error), "error");
-  }
-}
-
-function schedulePreview(delay = 160) {
-  window.clearTimeout(state.previewTimer);
-  const requestId = ++state.previewRequestId;
-  state.previewTimer = window.setTimeout(() => updatePreview(requestId), delay);
-}
-
-async function updatePreview(requestId) {
-  try {
-    const preview = await request("/api/preview", {
-      method: "POST",
-      body: JSON.stringify(collectForm())
-    });
-    if (requestId !== state.previewRequestId) return;
-    state.preview = preview;
-    elements.commandPreview.textContent = preview.command || t("Complete a valid configuration first.");
-    renderLaunchValidation(preview.errors || []);
-    updateActionAvailability();
-  } catch (error) {
-    if (requestId !== state.previewRequestId) return;
-    state.preview = { errors: [friendlyError(error)] };
-    elements.commandPreview.textContent = t("Unable to generate command.");
-    renderLaunchValidation(state.preview.errors);
-    updateActionAvailability();
-  }
-}
-
 function renderValidation(container, errors, successMessage) {
   container.replaceChildren();
   const messages = errors.length ? errors : [successMessage];
@@ -1524,77 +693,6 @@ function renderValidation(container, errors, successMessage) {
     item.className = errors.length ? "validation-message" : "validation-message ok";
     item.textContent = localizeServerText(message);
     container.append(item);
-  }
-}
-
-function renderLaunchValidation(errors) {
-  const showErrors = errors.length && (!isSimpleNewProfile() || Boolean(collectForm().model.trim()));
-  elements.validationMessages.classList.toggle("hidden", !showErrors);
-  renderValidation(elements.validationMessages, errors, t("Configuration is valid and ready to launch."));
-}
-
-function renderDownloadValidation(errors) {
-  renderValidation(elements.downloadValidation, errors, t("Download configuration is valid and ready."));
-}
-
-async function startSavedProfile(index) {
-  if (!Number.isInteger(index) || index < 0 || index >= state.profiles.length) return;
-  const config = cloneConfig(state.profiles[index]);
-  try {
-    const preview = await request("/api/preview", {
-      method: "POST",
-      body: JSON.stringify(config)
-    });
-    if (preview.errors?.length) {
-      cancelPendingAutomaticConfiguration();
-      state.automaticConfigStatus = { phase: "idle" };
-      state.currentIndex = index;
-      state.editingConfig = config;
-      fillForm(config);
-      state.preview = preview;
-      elements.commandPreview.textContent = preview.command || t("Complete a valid configuration first.");
-      renderLaunchValidation(preview.errors);
-      showProfileEditor();
-      showToast(t("Fix the configuration errors first."), "error");
-      return;
-    }
-    state.runtime = await request("/api/runtime/start", {
-      method: "POST",
-      body: JSON.stringify(config)
-    });
-    renderRuntime();
-    showToast(t("Model service is starting."), "success");
-  } catch (error) {
-    showToast(friendlyError(error), "error", 7000);
-    await refreshRuntime();
-  }
-}
-
-async function startRuntime() {
-  try {
-    await ensureProfileConfiguration();
-    const preview = await request("/api/preview", {
-      method: "POST",
-      body: JSON.stringify(collectForm())
-    });
-    state.preview = preview;
-    renderLaunchValidation(preview.errors || []);
-    if (preview.errors?.length) {
-      showToast(t("Fix the configuration errors first."), "error");
-      return;
-    }
-    const config = await saveCurrentProfile(false);
-    state.runtime = await request("/api/runtime/start", {
-      method: "POST",
-      body: JSON.stringify(config)
-    });
-    closeProfileEditor(true);
-    renderRuntime();
-    switchView("launch");
-    showToast(t("Model service is starting."), "success");
-  } catch (error) {
-    showToast(friendlyError(error), "error", 7000);
-    await refreshRuntime();
   }
 }
 
@@ -1642,6 +740,8 @@ function renderRuntime() {
   renderInferenceSpeed();
   renderContextWindow();
   renderWebUIAvailability();
+  harness?.update();
+  for (const agent of Object.values(nativeAgents)) agent.update();
   renderProfiles();
   updateActionAvailability();
 }
@@ -1705,6 +805,15 @@ function updateActionAvailability() {
   const missingModel = isSimpleNewProfile() && !String(collectForm().model || "").trim();
   elements.startRuntime.disabled = active || invalid || automaticBusy || missingModel;
   elements.saveProfile.disabled = automaticBusy || missingModel;
+  const hint = active
+    ? t("A service is running. Saved changes apply on the next model start.")
+    : invalid ? t("Fix the highlighted fields before starting. You can still save an unfinished profile.")
+    : automaticBusy ? t("Wait for automatic configuration to finish.")
+    : missingModel ? t("Choose a model before saving or starting.") : "";
+  elements.launchActionHint.textContent = hint;
+  elements.startRuntime.title = hint;
+  elements.startRuntime.setAttribute("aria-describedby", "launch-action-hint");
+  renderSaveState();
 }
 
 function runtimeIsActive(runtime) {
@@ -1721,672 +830,6 @@ function openEndpoint() {
   const endpoint = state.runtime.endpoint.replace(/\/$/, "");
   const url = state.runtime.command === "webui" ? endpoint : `${endpoint}/docs`;
   window.open(url, "_blank", "noopener,noreferrer");
-}
-
-function renderDownloadCatalog() {
-  const selected = elements.downloadPreset.value;
-  elements.downloadPreset.replaceChildren();
-  for (const group of state.downloadCatalog) {
-    const optgroup = document.createElement("optgroup");
-    optgroup.label = localizeServerText(group.label || group.id || t("Models"));
-    for (const model of group.models || []) {
-      const option = document.createElement("option");
-      option.value = model.id;
-      option.textContent = model.label || model.id;
-      optgroup.append(option);
-    }
-    if (optgroup.children.length) elements.downloadPreset.append(optgroup);
-  }
-  const custom = document.createElement("option");
-  custom.value = "custom";
-  custom.textContent = t("Custom model ID");
-  elements.downloadPreset.append(custom);
-  elements.downloadPreset.value = [...elements.downloadPreset.options].some((option) => option.value === selected)
-    ? selected
-    : "custom";
-}
-
-function fillDownloadForm(config) {
-  for (const input of elements.downloadForm.querySelectorAll("[data-download-field]")) {
-    const value = config?.[input.dataset.downloadField];
-    input.value = value === null || value === undefined ? "" : String(value);
-  }
-  const modelId = String(config?.modelId || "");
-  elements.downloadPreset.value = downloadCatalogHas(modelId) ? modelId : "custom";
-  state.downloadTargetAutomatic = true;
-}
-
-function collectDownloadForm() {
-  const config = {};
-  for (const input of elements.downloadForm.querySelectorAll("[data-download-field]")) {
-    config[input.dataset.downloadField] = input.value;
-  }
-  return config;
-}
-
-function downloadCatalogHas(modelId) {
-  return state.downloadCatalog.some((group) =>
-    (group.models || []).some((model) => model.id === modelId)
-  );
-}
-
-function downloadTargetFor(modelId) {
-  const template = String(state.downloadDefaults?.targetDir || "");
-  const templateModel = basename(state.downloadDefaults?.modelId || "");
-  const slash = Math.max(template.lastIndexOf("/"), template.lastIndexOf("\\"));
-  const root = slash >= 0 ? template.slice(0, slash) : template;
-  const separator = template.includes("\\") && !template.includes("/") ? "\\" : "/";
-  const name = basename(modelId) || templateModel || "model";
-  return root ? `${root}${separator}${name}` : name;
-}
-
-function selectDownloadPreset() {
-  if (elements.downloadPreset.value === "custom") {
-    elements.downloadForm.querySelector('[data-download-field="modelId"]').focus();
-    return;
-  }
-  const modelInput = elements.downloadForm.querySelector('[data-download-field="modelId"]');
-  const targetInput = elements.downloadForm.querySelector('[data-download-field="targetDir"]');
-  modelInput.value = elements.downloadPreset.value;
-  if (state.downloadTargetAutomatic) targetInput.value = downloadTargetFor(modelInput.value);
-  scheduleDownloadPreview(0);
-}
-
-function handleDownloadChange(event) {
-  if (!event.target.matches("[data-download-field]")) return;
-  const field = event.target.dataset.downloadField;
-  if (field === "modelId") {
-    elements.downloadPreset.value = downloadCatalogHas(event.target.value) ? event.target.value : "custom";
-    if (state.downloadTargetAutomatic) {
-      const targetInput = elements.downloadForm.querySelector('[data-download-field="targetDir"]');
-      targetInput.value = downloadTargetFor(event.target.value);
-    }
-  } else if (field === "targetDir") {
-    state.downloadTargetAutomatic = false;
-  }
-  scheduleDownloadPreview();
-  if (event.target.matches("[data-path-input]")) schedulePathSuggestions(event.target);
-}
-
-function scheduleDownloadPreview(delay = 160) {
-  window.clearTimeout(state.downloadPreviewTimer);
-  const requestId = ++state.downloadPreviewRequestId;
-  state.downloadPreviewTimer = window.setTimeout(
-    () => updateDownloadPreview(requestId),
-    delay
-  );
-}
-
-async function updateDownloadPreview(requestId) {
-  try {
-    const preview = await request("/api/download/preview", {
-      method: "POST",
-      body: JSON.stringify(collectDownloadForm())
-    });
-    if (requestId !== state.downloadPreviewRequestId) return;
-    state.downloadPreview = preview;
-    elements.downloadCommand.textContent = localizeDisplayCommand(state.downloadPreview.command)
-      || t("Complete a valid configuration first.");
-    renderDownloadValidation(state.downloadPreview.errors || []);
-  } catch (error) {
-    if (requestId !== state.downloadPreviewRequestId) return;
-    state.downloadPreview = { errors: [friendlyError(error)] };
-    elements.downloadCommand.textContent = t("Unable to generate download command.");
-    renderDownloadValidation(state.downloadPreview.errors);
-  }
-  renderDownload();
-}
-
-async function startDownload() {
-  try {
-    const preview = await request("/api/download/preview", {
-      method: "POST",
-      body: JSON.stringify(collectDownloadForm())
-    });
-    state.downloadPreview = preview;
-    elements.downloadCommand.textContent = localizeDisplayCommand(preview.command)
-      || t("Complete a valid configuration first.");
-    renderDownloadValidation(preview.errors || []);
-    if (preview.errors?.length) {
-      showToast(t("Fix the download configuration errors first."), "error");
-      return;
-    }
-    state.download = await request("/api/download/start", {
-      method: "POST",
-      body: JSON.stringify(collectDownloadForm())
-    });
-    renderDownload();
-    switchView("download");
-    showToast(t("Model download started."), "success");
-  } catch (error) {
-    showToast(friendlyError(error), "error", 7000);
-    await refreshDownload();
-  }
-}
-
-async function cancelDownload() {
-  try {
-    state.download = await request("/api/download/cancel", { method: "POST" });
-    renderDownload();
-  } catch (error) {
-    showToast(friendlyError(error), "error");
-  }
-}
-
-async function refreshDownload() {
-  if (state.pollingDownload) return;
-  state.pollingDownload = true;
-  const previousPhase = state.download?.phase;
-  try {
-    state.download = await request("/api/download");
-    if (state.download.phase !== previousPhase) {
-      if (state.download.phase === "completed") {
-        showToast(t("Model download completed and is ready to launch."), "success", 6000);
-        if (state.currentView !== "download") {
-          document.querySelector('[data-view-button="download"]').classList.add("has-activity");
-        }
-      } else if (state.download.phase === "failed") {
-        showToast(localizeServerText(state.download.message) || t("Model download failed."), "error", 7000);
-      }
-    }
-    renderDownload();
-  } catch (_error) {
-    // Ignore transient polling errors while the launcher exits.
-  } finally {
-    state.pollingDownload = false;
-  }
-}
-
-function renderDownload() {
-  const download = state.download || { phase: "idle", progress: 0, message: "Download has not started" };
-  const phase = download.phase || "idle";
-  const active = ACTIVE_DOWNLOAD_PHASES.has(phase);
-  const titles = {
-    idle: t("Download has not started"),
-    starting: t("Starting download"),
-    downloading: t("Downloading model"),
-    cancelling: t("Cancelling download"),
-    cancelled: t("Download cancelled"),
-    completed: t("Model download completed"),
-    failed: t("Model download failed")
-  };
-  const badges = {
-    idle: t("Not started"), starting: t("Connecting"), downloading: t("Downloading"), cancelling: t("Cancelling"),
-    cancelled: t("Cancelled"), completed: t("Completed"), failed: t("Failed")
-  };
-  elements.downloadBadge.className = `save-state ${phase === "completed" ? "saved" : phase}`;
-  elements.downloadBadge.textContent = badges[phase] || phase;
-  elements.downloadStatusTitle.textContent = titles[phase] || phase;
-  elements.downloadStatusMessage.textContent = localizeServerText(download.message) || "—";
-  elements.downloadStatusIcon.textContent = phase === "completed" ? "✓" : (phase === "failed" ? "!" : "↓");
-  const percent = Math.max(0, Math.min(100, Number(download.progress || 0)));
-  elements.downloadProgressValue.textContent = download.progressIndeterminate
-    ? t("Processing")
-    : `${Math.round(percent * 10) / 10}%`;
-  if (download.progressIndeterminate) {
-    elements.downloadProgress.removeAttribute("value");
-    elements.downloadProgress.classList.add("indeterminate");
-  } else {
-    elements.downloadProgress.value = percent;
-    elements.downloadProgress.classList.remove("indeterminate");
-  }
-  elements.downloadBytes.textContent = download.totalBytes
-    ? `${formatBytes(download.downloadedBytes)} / ${formatBytes(download.totalBytes)}`
-    : (download.downloadedBytes ? formatBytes(download.downloadedBytes) : "—");
-  elements.downloadFiles.textContent = download.totalFiles
-    ? `${download.completedFiles || 0} / ${download.totalFiles}`
-    : "—";
-  elements.downloadDestination.textContent = download.destination || collectDownloadForm().targetDir || "—";
-  elements.downloadStart.disabled = active || Boolean(state.downloadPreview?.errors?.length);
-  elements.downloadCancel.classList.toggle("hidden", !active);
-  elements.downloadCancel.disabled = phase === "cancelling";
-  const completed = phase === "completed" && Boolean(download.destination);
-  elements.downloadUseModel.classList.toggle("hidden", !completed);
-  elements.downloadUseLast.classList.toggle("hidden", !completed);
-  const nav = document.querySelector('[data-view-button="download"]');
-  if (active) nav.classList.add("has-activity");
-  else if (state.currentView === "download") nav.classList.remove("has-activity");
-}
-
-function useDownloadedModel() {
-  const destination = state.download?.destination;
-  if (!destination) return;
-  cancelPendingAutomaticConfiguration();
-  state.currentIndex = null;
-  state.editingConfig = cloneConfig(state.defaultProfile);
-  state.editingConfig.port = defaultServicePort(state.editingConfig.command);
-  state.editingConfig.name = basename(destination) || t("New profile");
-  state.editingConfig.model = destination;
-  fillForm(state.editingConfig);
-  const modelInput = elements.launchForm.querySelector('[data-field="model"]');
-  state.dirty = true;
-  renderSaveState();
-  updateConditionalFields();
-  schedulePreview(0);
-  switchView("launch");
-  showProfileEditor();
-  prepareAutomaticConfigurationForNewProfile();
-  scheduleAutomaticConfiguration(0);
-  modelInput.focus();
-  showToast(t("A new launch item was created and is being configured automatically."), "success");
-}
-
-async function refreshLogs() {
-  if (state.pollingLogs) return;
-  state.pollingLogs = true;
-  try {
-    const result = await request(`/api/logs?since=${state.lastLogId}`);
-    const entries = Array.isArray(result.entries) ? result.entries : [];
-    if (entries.length) {
-      const wasNearBottom = isLogNearBottom();
-      state.logs.push(...entries);
-      if (state.logs.length > 1500) state.logs.splice(0, state.logs.length - 1500);
-      state.lastLogId = Number(result.lastId || state.lastLogId);
-      renderLogs(wasNearBottom);
-    }
-  } catch (_error) {
-    // Ignore transient polling errors while the launcher exits.
-  } finally {
-    state.pollingLogs = false;
-  }
-}
-
-function renderLogs(forceBottom = true) {
-  elements.logOutput.replaceChildren();
-  elements.logCount.textContent = t("{count} entries", { count: state.logs.length });
-  if (!state.logs.length) {
-    const empty = document.createElement("div");
-    empty.className = "log-empty";
-    empty.textContent = t("Logs will appear here after the model starts.");
-    elements.logOutput.append(empty);
-    return;
-  }
-  const fragment = document.createDocumentFragment();
-  for (const entry of state.logs) {
-    const line = document.createElement("div");
-    line.className = `log-line ${entry.level || "info"}`;
-    const timestamp = document.createElement("span");
-    timestamp.className = "log-time";
-    timestamp.textContent = formatTime(entry.timestamp);
-    const source = document.createElement("span");
-    source.className = "log-source";
-    source.textContent = entry.source || "ftllm";
-    const message = document.createElement("span");
-    message.className = "log-message";
-    message.textContent = localizeDisplayCommand(localizeServerText(entry.message));
-    line.append(timestamp, source, message);
-    fragment.append(line);
-  }
-  elements.logOutput.append(fragment);
-  if (forceBottom) scrollLogsToBottom();
-}
-
-function formatTime(timestamp) {
-  const date = new Date(Number(timestamp) * 1000);
-  return Number.isNaN(date.getTime()) ? "--:--:--" : date.toLocaleTimeString(state.locale, { hour12: false });
-}
-
-function isLogNearBottom() {
-  return elements.logOutput.scrollHeight - elements.logOutput.scrollTop - elements.logOutput.clientHeight < 70;
-}
-
-function scrollLogsToBottom() {
-  window.requestAnimationFrame(() => {
-    elements.logOutput.scrollTop = elements.logOutput.scrollHeight;
-  });
-}
-
-async function clearLogs() {
-  try {
-    await request("/api/logs", { method: "DELETE" });
-    state.logs = [];
-    renderLogs();
-  } catch (error) {
-    showToast(friendlyError(error), "error");
-  }
-}
-
-function schedulePathSuggestions(input) {
-  window.clearTimeout(state.pathTimer);
-  const requestId = ++state.pathRequestId;
-  state.pathTimer = window.setTimeout(async () => {
-    const prefix = input.value || "";
-    if (!prefix) {
-      elements.pathSuggestions.replaceChildren();
-      return;
-    }
-    try {
-      const pathQuery = new URLSearchParams({
-        prefix,
-        directories_only: String(input.hasAttribute("data-directories-only"))
-      });
-      const result = await request(`/api/paths?${pathQuery}`);
-      if (requestId !== state.pathRequestId || input.value !== prefix) return;
-      elements.pathSuggestions.replaceChildren();
-      for (const value of result.paths || []) {
-        const option = document.createElement("option");
-        option.value = value;
-        elements.pathSuggestions.append(option);
-      }
-    } catch (_error) {
-      // Path completion is optional.
-    }
-  }, 180);
-}
-
-function openFolderPicker() {
-  const modelInput = elements.launchForm.querySelector('[data-field="model"]');
-  elements.folderPickerModal.classList.remove("hidden");
-  document.body.classList.add("modal-open");
-  elements.folderPickerTitle.focus({ preventScroll: true });
-  loadFolderPicker(modelInput.value || "");
-}
-
-function closeFolderPicker(restoreFocus = true) {
-  state.folderPickerRequestId += 1;
-  state.folderPickerLoading = false;
-  elements.folderPickerModal.classList.add("hidden");
-  if (elements.profileEditorModal.classList.contains("hidden")) {
-    document.body.classList.remove("modal-open");
-  }
-  if (restoreFocus && !elements.profileEditorModal.classList.contains("hidden")) {
-    elements.chooseModelFolder.focus({ preventScroll: true });
-  }
-}
-
-async function loadFolderPicker(path) {
-  const requestId = ++state.folderPickerRequestId;
-  state.folderPickerLoading = true;
-  state.folderPickerError = "";
-  state.folderPickerSelectedFile = "";
-  elements.folderPickerCurrent.value = String(path || "");
-  renderFolderPicker();
-  try {
-    const query = new URLSearchParams({ path: String(path || "") });
-    const result = await request(`/api/folders?${query}`);
-    if (
-      requestId !== state.folderPickerRequestId
-      || elements.folderPickerModal.classList.contains("hidden")
-    ) return;
-    if (!result || typeof result.path !== "string" || !Array.isArray(result.folders)) {
-      throw new Error(t("The folder browser response is invalid."));
-    }
-    state.folderPickerResult = result;
-    state.folderPickerSelectedFile = result.selectedFile || "";
-    elements.folderPickerCurrent.value = result.path;
-  } catch (error) {
-    if (requestId !== state.folderPickerRequestId) return;
-    state.folderPickerError = friendlyError(error);
-  } finally {
-    if (requestId !== state.folderPickerRequestId) return;
-    state.folderPickerLoading = false;
-    renderFolderPicker();
-  }
-}
-
-function renderFolderPicker() {
-  const drives = state.folderPickerResult?.drives || [];
-  elements.folderPickerDriveField.classList.toggle("hidden", !drives.length);
-  elements.folderPickerDrive.replaceChildren();
-  const currentDrive = elements.folderPickerCurrent.value.match(/^[a-z]:[\\/]/i)?.[0].replace("/", "\\").toUpperCase();
-  if (!drives.some((drive) => drive.path.toUpperCase() === currentDrive)) {
-    const placeholder = document.createElement("option");
-    placeholder.value = "";
-    placeholder.textContent = t("Select a drive");
-    elements.folderPickerDrive.append(placeholder);
-  }
-  for (const drive of drives) {
-    const option = document.createElement("option");
-    option.value = drive.path;
-    option.textContent = drive.name;
-    option.selected = drive.path.toUpperCase() === currentDrive;
-    elements.folderPickerDrive.append(option);
-  }
-  elements.folderPickerList.replaceChildren();
-  elements.folderPickerStatus.className = "folder-picker-status";
-  elements.folderPickerStatus.textContent = "";
-  elements.folderPickerSelect.textContent = state.folderPickerSelectedFile
-    ? t("Select this file") : t("Select this folder");
-  elements.folderPickerSelect.disabled = (
-    state.folderPickerLoading
-    || Boolean(state.folderPickerError)
-    || !state.folderPickerResult?.path
-  );
-  elements.folderPickerUp.disabled = (
-    state.folderPickerLoading
-    || Boolean(state.folderPickerError)
-    || !state.folderPickerResult?.parent
-  );
-
-  if (state.folderPickerLoading) {
-    const loading = document.createElement("div");
-    loading.className = "folder-picker-placeholder loading";
-    loading.textContent = t("Loading folders...");
-    elements.folderPickerList.append(loading);
-    return;
-  }
-
-  if (state.folderPickerError) {
-    elements.folderPickerStatus.classList.add("error");
-    elements.folderPickerStatus.textContent = t("Unable to browse folders: {error}", {
-      error: state.folderPickerError
-    });
-    const empty = document.createElement("div");
-    empty.className = "folder-picker-placeholder error";
-    empty.textContent = t("This folder could not be opened.");
-    elements.folderPickerList.append(empty);
-    return;
-  }
-
-  const result = state.folderPickerResult;
-  const folders = result?.folders || [];
-  const files = result?.files || [];
-  if (!folders.length && !files.length) {
-    const empty = document.createElement("div");
-    empty.className = "folder-picker-placeholder";
-    empty.textContent = t("This folder is empty.");
-    elements.folderPickerList.append(empty);
-  } else {
-    const fragment = document.createDocumentFragment();
-    for (const entry of [...folders.map((folder) => ({ ...folder, isDirectory: true })), ...files]) {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "folder-picker-entry";
-      button.title = entry.path;
-      button.dataset.entryPath = entry.path;
-      const selected = entry.path === state.folderPickerSelectedFile;
-      button.classList.toggle("selected", selected);
-      if (!entry.isDirectory) button.setAttribute("aria-pressed", String(selected));
-      const icon = document.createElement("span");
-      icon.className = "folder-picker-entry-icon";
-      if (!entry.isDirectory) icon.classList.add("file-icon");
-      icon.setAttribute("aria-hidden", "true");
-      const name = document.createElement("span");
-      name.className = "folder-picker-entry-name";
-      name.textContent = entry.name;
-      const arrow = document.createElement("span");
-      arrow.className = "folder-picker-entry-arrow";
-      arrow.setAttribute("aria-hidden", "true");
-      arrow.textContent = entry.isDirectory ? "›" : (selected ? "✓" : "");
-      button.append(icon, name, arrow);
-      button.addEventListener("click", () => {
-        if (entry.isDirectory) {
-          loadFolderPicker(entry.path);
-        } else {
-          state.folderPickerSelectedFile = selected ? "" : entry.path;
-          renderFolderPicker();
-          elements.folderPickerList.querySelector(`[data-entry-path="${CSS.escape(entry.path)}"]`)?.focus();
-        }
-      });
-      fragment.append(button);
-    }
-    elements.folderPickerList.append(fragment);
-  }
-  if (result?.truncated) {
-    elements.folderPickerStatus.textContent = t("Only the first {count} entries are shown.", {
-      count: String(folders.length + files.length)
-    });
-  }
-}
-
-function selectCurrentFolder() {
-  const path = state.folderPickerSelectedFile || state.folderPickerResult?.path;
-  if (!path) return;
-  const modelInput = elements.launchForm.querySelector('[data-field="model"]');
-  modelInput.value = path;
-  modelInput.dispatchEvent(new Event("input", { bubbles: true }));
-  closeFolderPicker(false);
-  modelInput.focus({ preventScroll: true });
-}
-
-async function loadHardware() {
-  elements.refreshHardware.disabled = true;
-  state.hardwareStatus = "loading";
-  state.hardwareError = "";
-  renderHardwareStatus();
-  try {
-    const modelPath = collectForm().model || "";
-    const report = await request(`/api/hardware?model_path=${encodeURIComponent(modelPath)}`);
-    state.hardwareLoaded = true;
-    state.hardwareReport = report;
-    state.hardwareStatus = "loaded";
-    renderHardware(report);
-  } catch (error) {
-    state.hardwareStatus = "failed";
-    state.hardwareError = friendlyError(error);
-  } finally {
-    renderHardwareStatus();
-    elements.refreshHardware.disabled = false;
-  }
-}
-
-function renderHardwareStatus() {
-  if (state.hardwareStatus === "loading") {
-    elements.hardwareStatus.textContent = t("Reading hardware information...");
-  } else if (state.hardwareStatus === "loaded" && state.hardwareReport) {
-    elements.hardwareStatus.textContent = t("Detection completed · {platform} · Python {python}", {
-      platform: state.hardwareReport.platform,
-      python: state.hardwareReport.python
-    });
-  } else if (state.hardwareStatus === "failed") {
-    elements.hardwareStatus.textContent = t("Detection failed: {error}", { error: state.hardwareError });
-  }
-}
-
-function renderHardware(report) {
-  elements.hardwareGrid.replaceChildren();
-  elements.hardwareGrid.append(
-    hardwareCard("CPU", "C", report.cpu?.model || t("Unknown CPU"), [
-      [t("Logical threads"), String(report.cpu?.logical || "—")],
-      [t("Currently available"), String(report.cpu?.available || "—")],
-      [t("NUMA nodes"), String(report.numa?.length || 0)]
-    ]),
-    hardwareCard(t("Memory"), "M", t("System memory"), [
-      [t("Total capacity"), formatBytes(report.memory?.total)],
-      [t("Currently available"), formatBytes(report.memory?.available)],
-      [t("Available ratio"), formatRatio(report.memory?.available, report.memory?.total)]
-    ]),
-    gpuHardwareCard(report.gpus || []),
-    hardwareCard(t("Storage and build"), "D", report.disk?.path || t("Model disk"), [
-      [t("Disk capacity"), formatBytes(report.disk?.total)],
-      [t("Disk available"), formatBytes(report.disk?.free)],
-      [t("CUDA build"), report.build?.USE_CUDA ? t("Enabled") : t("Disabled")],
-      [t("ROCm build"), report.build?.USE_ROCM ? t("Enabled") : t("Disabled")],
-      [t("NUMA build"), report.build?.USE_NUMAS ? t("Enabled") : t("Disabled")]
-    ])
-  );
-}
-
-function hardwareCard(title, icon, subtitle, rows) {
-  const card = document.createElement("article");
-  card.className = "hardware-card";
-  const heading = document.createElement("div");
-  heading.className = "hardware-card-heading";
-  const badge = document.createElement("span");
-  badge.className = "hardware-card-icon";
-  badge.textContent = icon;
-  const copy = document.createElement("div");
-  const strong = document.createElement("strong");
-  strong.textContent = title;
-  const small = document.createElement("small");
-  small.textContent = subtitle;
-  copy.append(strong, small);
-  heading.append(badge, copy);
-  const body = document.createElement("div");
-  body.className = "hardware-rows";
-  for (const [label, value] of rows) {
-    const row = document.createElement("div");
-    row.className = "hardware-row";
-    const key = document.createElement("span");
-    key.textContent = label;
-    const data = document.createElement("strong");
-    data.textContent = value;
-    row.append(key, data);
-    body.append(row);
-  }
-  card.append(heading, body);
-  return card;
-}
-
-function gpuHardwareCard(gpus) {
-  const card = document.createElement("article");
-  card.className = "hardware-card wide";
-  const heading = document.createElement("div");
-  heading.className = "hardware-card-heading";
-  const icon = document.createElement("span");
-  icon.className = "hardware-card-icon";
-  icon.textContent = "G";
-  const copy = document.createElement("div");
-  const title = document.createElement("strong");
-  title.textContent = "GPU";
-  const subtitle = document.createElement("small");
-  subtitle.textContent = gpus.length
-    ? t("{count} NVIDIA GPUs", { count: gpus.length })
-    : t("nvidia-smi or an NVIDIA GPU was not detected");
-  copy.append(title, subtitle);
-  heading.append(icon, copy);
-  const list = document.createElement("div");
-  list.className = "gpu-list";
-  if (!gpus.length) {
-    const empty = document.createElement("div");
-    empty.className = "gpu-item";
-    empty.textContent = t("No NVIDIA GPU was detected through nvidia-smi. Select other devices according to the build configuration.");
-    list.append(empty);
-  }
-  for (const gpu of gpus) {
-    const item = document.createElement("div");
-    item.className = "gpu-item";
-    const info = document.createElement("div");
-    const name = document.createElement("strong");
-    name.textContent = `GPU ${gpu.index} · ${gpu.name}`;
-    const detail = document.createElement("small");
-    detail.textContent = t("{free} / {total} MiB available · driver {driver}", {
-      free: gpu.memoryFreeMiB,
-      total: gpu.memoryTotalMiB,
-      driver: gpu.driver
-    });
-    info.append(name, detail);
-    const health = document.createElement("span");
-    health.textContent = `${gpu.utilization}% · ${gpu.temperature}℃`;
-    item.append(info, health);
-    list.append(item);
-  }
-  card.append(heading, list);
-  return card;
-}
-
-function formatBytes(value) {
-  const bytes = Number(value || 0);
-  if (!bytes) return t("Unknown");
-  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
-  const index = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
-  return `${(bytes / (1024 ** index)).toFixed(index >= 3 ? 1 : 0)} ${units[index]}`;
-}
-
-function formatRatio(value, total) {
-  const numerator = Number(value || 0);
-  const denominator = Number(total || 0);
-  return denominator ? `${Math.round(numerator * 100 / denominator)}%` : t("Unknown");
 }
 
 async function shutdownLauncher() {
@@ -2497,116 +940,9 @@ function friendlyError(error) {
   return localizeServerText(error?.message || error || t("Unknown error"));
 }
 
-function webuiIsReady() {
-  return state.runtime?.command === "server" && state.runtime?.phase === "running"
-    && state.runtime?.ready && Boolean(state.runtime?.sessionId);
-}
 
-function renderWebUIAvailability() {
-  const ready = webuiIsReady();
-  elements.openWebui.disabled = !ready;
-  if ((!ready || state.webuiSessionId !== state.runtime?.sessionId)
-      && (state.webuiSessionId || state.webuiLoading)) {
-    state.webuiRequestId += 1;
-    clearWebUILoad();
-    state.webuiSessionId = "";
-    state.webuiLoading = false;
-    state.webuiError = "";
-    destroyWebUI();
-  }
-  const loaded = ready && state.webuiSessionId === state.runtime.sessionId
-    && !state.webuiLoading && !state.webuiError;
-  elements.webuiContent.classList.toggle("hidden", !loaded);
-  elements.webuiPlaceholder.classList.toggle("hidden", loaded);
-  elements.webuiRetry.classList.toggle("hidden", !ready || !state.webuiError);
-  elements.webuiStatus.textContent = state.webuiError ? localizeServerText(state.webuiError)
-    : ready ? t("Opening WebUI…") : t("Start an API Server before opening WebUI.");
-  if (state.currentView === "webui" && ready && !state.webuiLoading && !state.webuiSessionId && !state.webuiError) {
-    openEmbeddedWebUI();
-  }
-}
-
-function destroyWebUI() {
-  state.webuiComponent?.destroy();
-  state.webuiComponent = null;
-  elements.webuiContent.replaceChildren();
-}
-
-function clearWebUILoad() {
-  clearTimeout(state.webuiLoadTimer);
-  state.webuiLoadTimer = null;
-  state.webuiAbortController?.abort();
-  state.webuiAbortController = null;
-  // Imports cannot be aborted. Retry a stalled import with a fresh URL while
-  // keeping the successfully loaded module shared across model sessions.
-  if (webuiModulePromise && !webuiModuleLoaded) {
-    webuiModulePromise = null;
-    webuiModuleRetries += 1;
-  }
-}
-
-function failWebUILoad(requestId, message = "Unable to load WebUI. Try reopening it.") {
-  if (requestId !== state.webuiRequestId || !state.webuiLoading) return;
-  state.webuiRequestId += 1;
-  clearWebUILoad();
-  state.webuiLoading = false;
-  state.webuiError = message;
-  destroyWebUI();
-  renderWebUIAvailability();
-}
-
-async function openEmbeddedWebUI() {
-  if (!webuiIsReady() || state.webuiLoading) return;
-  const sessionId = state.runtime.sessionId;
-  const requestId = ++state.webuiRequestId;
-  state.webuiSessionId = sessionId;
-  state.webuiLoading = true;
-  state.webuiError = "";
-  clearWebUILoad();
-  const controller = new AbortController();
-  state.webuiAbortController = controller;
-  state.webuiLoadTimer = setTimeout(() => {
-    failWebUILoad(requestId, "WebUI loading timed out. Try reopening it.");
-  }, WEBUI_LOAD_TIMEOUT_MS);
-  renderWebUIAvailability();
-  try {
-    const result = await request("/api/webui/open", {
-      method: "POST", body: JSON.stringify({ sessionId }), signal: controller.signal
-    });
-    if (requestId !== state.webuiRequestId || sessionId !== state.runtime?.sessionId) return;
-    if (!webuiModulePromise) {
-      const suffix = webuiModuleRetries ? `?retry=${webuiModuleRetries}` : "";
-      const pending = import(`/assets/webui/app.js${suffix}`).then(module => {
-        if (webuiModulePromise === pending) webuiModuleLoaded = true;
-        return module;
-      }, error => {
-        if (webuiModulePromise === pending) {
-          webuiModulePromise = null;
-          webuiModuleRetries += 1;
-        }
-        throw error;
-      });
-      webuiModulePromise = pending;
-    }
-    const {mountWebUI} = await webuiModulePromise;
-    if (requestId !== state.webuiRequestId) return;
-    const host = document.createElement("div");
-    elements.webuiContent.replaceChildren(host);
-    const component = await mountWebUI(host, {
-      basePath: result.url, embedded: true, locale: state.locale,
-      iconUrl: "/assets/launcher-icon.png", signal: controller.signal
-    });
-    if (requestId !== state.webuiRequestId || sessionId !== state.runtime?.sessionId) {
-      component.destroy();
-      return;
-    }
-    state.webuiComponent = component;
-    clearWebUILoad();
-    state.webuiLoading = false;
-    component.setLocale(state.locale);
-    renderWebUIAvailability();
-  } catch (error) {
-    failWebUILoad(requestId, error instanceof TypeError ? "Unable to load WebUI. Try reopening it."
-      : error?.message || "Unable to load WebUI. Try reopening it.");
-  }
-}
+export {
+  state, elements, request, t, localizeDisplayCommand, localizeServerText, switchView, createIcon,
+  renderValidation, refreshRuntime, renderRuntime, updateActionAvailability, runtimeIsActive,
+  basename, showConfirmation, showToast, friendlyError
+};

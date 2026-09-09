@@ -3364,8 +3364,9 @@ namespace fastllm {
         const Data &combinedGateInput,
         int gateOffset, int gateHeads,
         Data &output, float eps) {
-        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON") ||
-            !CudaEnvFlagDefaultEnabled(
+        // This native CUDA fusion does not require the Triton backend.
+        // Retain the existing per-operation switches for fallback selection.
+        if (!CudaEnvFlagDefaultEnabled(
                 "FASTLLM_CUDA_TRITON_CHUNK_GDN_COMBINED_Z", true)) {
             return false;
         }
@@ -3380,8 +3381,9 @@ namespace fastllm {
         int batch, int seqLen,
         int gateOffset, int gateHeads,
         Data &output, float eps) {
-        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON") ||
-            !CudaEnvFlagDefaultEnabled(
+        // This native CUDA fusion does not require the Triton backend.
+        // Retain the existing per-operation switches for fallback selection.
+        if (!CudaEnvFlagDefaultEnabled(
                 "FASTLLM_CUDA_TRITON_CHUNK_GDN_COMBINED_Z", true) ||
             !CudaEnvFlagDefaultEnabled(
                 "FASTLLM_CUDA_TRITON_CHUNK_GDN_FUSED_OUTPUT_GATE",
@@ -5089,7 +5091,9 @@ namespace fastllm {
                    !input.dims.empty() && !mixLogits.dims.empty() &&
                    weight.dims.size() == 2 && groups > 0 &&
                    input.dims.back() % groups == 0 &&
-                   rows >= 8 &&
+                   (rows >= 8 || (rows == 1 && groups == 4 &&
+                                  weight.dims[0] == 10240 &&
+                                  weight.dims[1] == 320)) &&
                    mixLogits.Count(0) / mixLogits.dims.back() ==
                        input.Count(0) / input.dims.back() &&
                    mixLogits.dims.back() == weight.dims[1] &&
@@ -9733,6 +9737,13 @@ namespace fastllm {
                     w1, w2, weights, weightsBatch, gateType)) {
                 return;
             }
+#ifndef USE_ROCM
+            if (gateType == MoeGateSwiglu &&
+                FastllmCudaFloat32MergeMOEBFloat16Indexed(
+                    input, index, score, w3, w1, w2, output, weights, weightsBatch)) {
+                return;
+            }
+#endif
             // The NVFP4 grouped-Marlin implementation sizes and completely
             // overwrites output itself. Delay the generic zero allocation
             // until after that path so decode does not enqueue one redundant

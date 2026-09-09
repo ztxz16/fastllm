@@ -22,7 +22,7 @@ from typing import Any, Dict, Iterable, Iterator, Mapping, Optional
 from urllib.parse import urlsplit
 
 
-BRIDGE_VERSION = "0.3.2"
+BRIDGE_VERSION = "0.3.3"
 PI_VERSION = "0.84.4"
 _MAX_TOOL_DETAIL_CHARS = 16 * 1024
 _MAX_IMAGES = 6
@@ -60,7 +60,7 @@ class PiAgentCancelled(PiAgentError):
 
 
 def _resource_path(*parts: str) -> Path:
-    resource = resources.files("ftllm_agent_runtime")
+    resource = resources.files(__package__)
     for part in parts:
         resource = resource.joinpath(part)
     return Path(str(resource))
@@ -534,6 +534,7 @@ class PiAgentRuntime:
             if workspace is not None:
                 active_tools.extend(_WORKSPACE_TOOLS)
             environment = os.environ.copy()
+            environment["PATH"] = str(self.binary.parent) + os.pathsep + environment.get("PATH", "")
             environment.update(
                 {
                     "FTLLM_AGENT_PROJECT_MANIFEST": json.dumps(

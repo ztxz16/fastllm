@@ -25,7 +25,9 @@ class AnthropicToolResultContentBlock(BaseModel):
 
 
 class AnthropicInputMessage(BaseModel):
-    role: Literal["user", "assistant"]
+    # Claude Code also sends mid-conversation system messages. The adapter
+    # consolidates their instructions for local model templates.
+    role: Literal["user", "assistant", "system"]
     content: Union[str, List[Dict[str, Any]]]
 
 
@@ -47,6 +49,8 @@ class AnthropicMessageRequest(BaseModel):
     stop_sequences: Optional[List[str]] = None
     metadata: Optional[Dict[str, Any]] = None
     tools: Optional[List[AnthropicToolParam]] = None
+    thinking: Optional[Dict[str, Any]] = None
+    output_config: Optional[Dict[str, Any]] = None
 
 
 class AnthropicUsage(BaseModel):

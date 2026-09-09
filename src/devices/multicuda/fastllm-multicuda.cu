@@ -3702,6 +3702,59 @@ void FastllmNcclAllReduceNoCustom(void* data, void* dest, int count,
     FastllmNcclAllReduceImpl(data, dest, count, dataType, deviceId, false);
 }
 
+bool FastllmNcclAllGather(const void* data, void* dest, int count,
+                         int dataType, int deviceId) {
+#ifndef FASTLLM_USE_NCCL
+    const size_t typeBytes = FastllmNcclDataTypeBytes(dataType);
+    if (data == nullptr || dest == nullptr || count <= 0 || typeBytes == 0 ||
+        !g_ncclInitialized || g_ncclRanks.find(deviceId) == g_ncclRanks.end()) {
+        FastllmCudaSetThreadError();
+        return false;
+    }
+    const size_t bytes = (size_t)count * typeBytes;
+    if (g_ncclWorldSize == 1) {
+        if (data != dest && cudaMemcpyAsync(dest, data, bytes,
+                cudaMemcpyDeviceToDevice, cudaStreamPerThread) != cudaSuccess) {
+            FastllmCudaSetThreadError();
+            return false;
+        }
+        return true;
+    }
+    // Concatenate in communicator rank order. The existing broadcast backend
+    // provides mapped-memory graph capture on TP2 and staged copies otherwise.
+    for (int rootRank = 0; rootRank < g_ncclWorldSize; ++rootRank) {
+        if (!FastllmRunHostCollective(FastllmHostCollectiveKind::Broadcast,
+                data, static_cast<uint8_t *>(dest) + (size_t)rootRank * bytes,
+                count, dataType, rootRank, deviceId)) {
+            return false;
+        }
+    }
+    return true;
+#else
+    ncclComm_t comm = FindNcclCommNoLog(deviceId);
+    ncclDataType_t type = ncclFloat;
+    if (data == nullptr || dest == nullptr || count <= 0 || comm == nullptr ||
+        !FastllmNcclResolveDataType(dataType, type, "AllGather")) {
+        FastllmCudaSetThreadError();
+        return false;
+    }
+    const cudaStream_t stream = cudaStreamPerThread;
+    const ncclResult_t result = ncclAllGather(data, dest, count, type, comm, stream);
+    if (result != ncclSuccess) {
+        printf("Error: ncclAllGather failed on device %d: %s\n",
+               deviceId, ncclGetErrorString(result));
+        FastllmCudaSetThreadError();
+        return false;
+    }
+    if (FastllmNcclPostSyncEnabled(stream)) {
+        const cudaError_t state = cudaStreamSynchronize(stream);
+        checkCudaErrors("Error: CUDA error when synchronizing NCCL allgather!", state);
+        return state == cudaSuccess;
+    }
+    return true;
+#endif
+}
+
 // Sums all ranks but materializes the result only on root.  This is preferable
 // to AllReduce for hybrid single-CUDA + EP execution, whose next operator
 // consumes only the layer-owning GPU's output.

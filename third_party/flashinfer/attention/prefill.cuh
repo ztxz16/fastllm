@@ -107,6 +107,32 @@ constexpr bool use_vo_split_shape(const uint32_t num_warps_kv,
          num_mma_d_vo % num_warps_kv == 0;
 }
 
+// Use the current device, including in multi-GPU processes. Do not infer the
+// architecture from its shared-memory limit: other GPUs also have 64 KiB.
+constexpr bool use_sm75_single_prefill_vo_split(int major, int minor, int64_t packed_qo_len) {
+  return major == 7 && minor == 5 && packed_qo_len > 0 && packed_qo_len <= 16;
+}
+
+template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
+          uint32_t NUM_WARPS_KV, PosEncodingMode POS_ENCODING_MODE, typename DTypeQ,
+          typename DTypeKV, typename DTypeO, typename AttentionVariant,
+          bool ENABLE_SM75_FP16_VO_SPLIT = false>
+constexpr bool use_single_prefill_vo_split() {
+  // The ordinary D256 CTA16 merge stores 64 KiB of partial outputs plus
+  // 512 bytes of softmax state. Reuse the paged path's distributed output
+  // for this FP16 shape so single-query attention also fits SM75.
+  constexpr bool compact_fp16 =
+      ENABLE_SM75_FP16_VO_SPLIT && CTA_TILE_Q == 16 &&
+      HEAD_DIM_QK == 256 && HEAD_DIM_VO == 256 &&
+      POS_ENCODING_MODE == PosEncodingMode::kNone &&
+      std::is_same_v<DTypeQ, half> && std::is_same_v<DTypeKV, half> &&
+      std::is_same_v<DTypeO, half> &&
+      std::is_same_v<AttentionVariant, DefaultAttention<false, false, false, false>>;
+  return AttentionVariant::use_softmax &&
+         use_vo_split_shape(NUM_WARPS_KV, CTA_TILE_Q, HEAD_DIM_VO) &&
+         (is_fp4_type_v<DTypeKV> || compact_fp16);
+}
+
 // NVFP4 KV-cache scale-factor staging (one UE4M3 byte per NVFP4_SF_VEC_SIZE elements), used only
 // when DTypeKV is FP4. Kept as an empty base for other dtypes so it adds 0 bytes via EBO instead
 // of a padded placeholder: at HEAD_DIM 256 the q/k/v union already fills the 64 KiB opt-in smem
@@ -249,7 +275,7 @@ template <MaskMode MASK_MODE_, uint32_t CTA_TILE_Q_, uint32_t NUM_MMA_Q_, uint32
           uint32_t NUM_MMA_D_QK_, uint32_t NUM_MMA_D_VO_, uint32_t NUM_WARPS_Q_,
           uint32_t NUM_WARPS_KV_, PosEncodingMode POS_ENCODING_MODE_, typename DTypeQ_,
           typename DTypeKV_, typename DTypeO_, typename DTypeQKAccum_, typename IdType_,
-          typename AttentionVariant_>
+          typename AttentionVariant_, bool ENABLE_SM75_FP16_VO_SPLIT_ = false>
 struct KernelTraits {
   static constexpr uint32_t NUM_STAGES = 1;  // used for BatchAttention Template
   static constexpr MaskMode MASK_MODE = MASK_MODE_;
@@ -278,7 +304,9 @@ struct KernelTraits {
   static constexpr bool USE_SOFTMAX_VO_SPLIT = USE_VO_SPLIT && AttentionVariant_::use_softmax &&
                                                ((sizeof(DTypeKV_) == 2) || is_fp4_type_v<DTypeKV_>);
   static constexpr bool USE_SINGLE_PREFILL_SOFTMAX_VO_SPLIT =
-      USE_SOFTMAX_VO_SPLIT && is_fp4_type_v<DTypeKV_>;
+      use_single_prefill_vo_split<CTA_TILE_Q_, HEAD_DIM_QK, HEAD_DIM_VO, NUM_WARPS_KV,
+                                  POS_ENCODING_MODE_, DTypeQ_, DTypeKV_, DTypeO_,
+                                  AttentionVariant_, ENABLE_SM75_FP16_VO_SPLIT_>();
   static constexpr bool USE_16B_VO_SPLIT =
       USE_VO_SPLIT && (sizeof(DTypeKV_) == 2) && AttentionVariant_::use_softmax;
   static constexpr bool USE_SHARED_ROPE_FREQ = POS_ENCODING_MODE_ == PosEncodingMode::kRoPELlama &&
@@ -339,6 +367,8 @@ struct KernelTraits {
       std::conditional_t<USE_SHARED_ROPE_FREQ,
                          SharedStorageWithRopeFreq<BaseSharedStoragePaged, NUM_MMA_D_QK / 2>,
                          BaseSharedStoragePaged>;
+  using SharedStorageSingle =
+      std::conditional_t<USE_SINGLE_PREFILL_SOFTMAX_VO_SPLIT, SharedStoragePaged, SharedStorage>;
 #ifdef FP16_QK_REDUCTION_SUPPORTED
   template <typename DT>
   static constexpr DT getNegInf() {
@@ -2461,18 +2491,16 @@ template <typename KTraits, typename Params>
 __global__ __launch_bounds__(KTraits::NUM_THREADS) void SinglePrefillWithKVCacheKernel(
     const __grid_constant__ Params params) {
   extern __shared__ uint8_t smem[];
-  using SmemStorage =
-      std::conditional_t<KTraits::USE_SINGLE_PREFILL_SOFTMAX_VO_SPLIT,
-                         typename KTraits::SharedStoragePaged, typename KTraits::SharedStorage>;
+  using SmemStorage = typename KTraits::SharedStorageSingle;
   auto& smem_storage = reinterpret_cast<SmemStorage&>(smem);
   SinglePrefillWithKVCacheDevice<KTraits>(params, smem_storage);
 }
 
 template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, PosEncodingMode POS_ENCODING_MODE,
           bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename AttentionVariant,
-          typename Params>
-cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::DTypeO* tmp,
-                                               cudaStream_t stream) {
+          bool ENABLE_SM75_FP16_VO_SPLIT, typename Params>
+cudaError_t SinglePrefillWithKVCacheDispatchedImpl(Params params, typename Params::DTypeO* tmp,
+                                                 cudaStream_t stream) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
   using DTypeO = typename Params::DTypeO;
@@ -2532,8 +2560,9 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
                                (HEAD_DIM_QK == HEAD_DIM_VO) &&
                                (sizeof(DTypeKV) == 2 || CTA_TILE_Q > 16);
     constexpr bool kSinglePrefillVOSplitDispatch =
-        AttentionVariant::use_softmax && is_fp4_type_v<DTypeKV> &&
-        use_vo_split_shape(NUM_WARPS_KV, CTA_TILE_Q, HEAD_DIM_VO);
+        use_single_prefill_vo_split<CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, NUM_WARPS_KV,
+                                    POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeO,
+                                    AttentionVariant, ENABLE_SM75_FP16_VO_SPLIT>();
     constexpr uint32_t kKVSmemPerMmaKV =
         (kKVShared ? (HEAD_DIM_QK * 16 * NUM_WARPS_KV * sizeof(DTypeKV))
                    : ((HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV))) +
@@ -2586,7 +2615,8 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
           using KTraits =
               KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
                            NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeO,
-                           DTypeQKAccum, typename Params::IdType, AttentionVariant>;
+                           DTypeQKAccum, typename Params::IdType, AttentionVariant,
+                           ENABLE_SM75_FP16_VO_SPLIT && CTA_TILE_Q == 16>;
           if constexpr (KTraits::IsInvalid()) {
             // Invalid configuration, skip
             std::ostringstream err_msg;
@@ -2601,9 +2631,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
           } else {
             constexpr uint32_t num_threads = (NUM_WARPS_Q * NUM_WARPS_KV) * WARP_SIZE;
             auto kernel = SinglePrefillWithKVCacheKernel<KTraits, Params>;
-            using SmemStorage = std::conditional_t<KTraits::USE_SINGLE_PREFILL_SOFTMAX_VO_SPLIT,
-                                                   typename KTraits::SharedStoragePaged,
-                                                   typename KTraits::SharedStorage>;
+            using SmemStorage = typename KTraits::SharedStorageSingle;
             size_t smem_size = sizeof(SmemStorage);
             if (smem_size > (size_t)max_smem_per_block_optin) {
               std::ostringstream err_msg;
@@ -2666,6 +2694,34 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
         })
   });
   return cudaSuccess;
+}
+
+template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, PosEncodingMode POS_ENCODING_MODE,
+          bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename AttentionVariant,
+          typename Params>
+cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::DTypeO* tmp,
+                                              cudaStream_t stream) {
+  // Pass an explicit specialization flag to both the host planner and kernel.
+  // Using __CUDA_ARCH__ for this would give their shared-memory layouts
+  // different sizes in a fat binary. The default specialization retains the
+  // original FP16 behavior and the existing FP4 VO-split on every architecture.
+  if constexpr (std::is_same_v<typename Params::DTypeKV, half> &&
+                !USE_FP16_QK_REDUCTION &&
+                use_single_prefill_vo_split<16, HEAD_DIM_QK, HEAD_DIM_VO, 4,
+                    POS_ENCODING_MODE, typename Params::DTypeQ, typename Params::DTypeKV,
+                    typename Params::DTypeO, AttentionVariant, true>()) {
+    const auto capability = GetCudaComputeCapability();
+    const int64_t packed_qo_len = int64_t(params.qo_len) *
+                                  (params.num_qo_heads / params.num_kv_heads);
+    if (use_sm75_single_prefill_vo_split(capability.first, capability.second, packed_qo_len)) {
+      return SinglePrefillWithKVCacheDispatchedImpl<HEAD_DIM_QK, HEAD_DIM_VO,
+          POS_ENCODING_MODE, USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant, true>(
+              params, tmp, stream);
+    }
+  }
+  return SinglePrefillWithKVCacheDispatchedImpl<HEAD_DIM_QK, HEAD_DIM_VO,
+      POS_ENCODING_MODE, USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant, false>(
+          params, tmp, stream);
 }
 
 // VO-split helpers used by large-head prefill kernels. Definitions live below the

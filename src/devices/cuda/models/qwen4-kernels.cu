@@ -15,6 +15,30 @@
 #include <vector>
 
 namespace {
+    __global__ void Qwen4MergeTpGreedyKernel(
+            const float *candidates, int *output, float *floatOutput,
+            int vocabulary, int ranks) {
+        int bestId = 0;
+        float bestScore = candidates[1];
+        for (int rank = 0; rank < ranks; ++rank) {
+            const int offset = (int)((int64_t)(vocabulary / 256) * rank / ranks) * 256;
+            const int id = (int)(candidates[rank * 2] + 1e-3f) + offset;
+            const float score = candidates[rank * 2 + 1];
+            const unsigned order = __brev((unsigned)id & 255);
+            const unsigned bestOrder = __brev((unsigned)bestId & 255);
+            // CUDA TopK keeps the left side of equal-score reductions:
+            // bit-reversed lane order, then the first row in that lane.
+            if (rank == 0 || score > bestScore ||
+                (score == bestScore &&
+                 (order < bestOrder || (order == bestOrder && id < bestId)))) {
+                bestId = id;
+                bestScore = score;
+            }
+        }
+        *output = bestId;
+        *floatOutput = (float)bestId;
+    }
+
     template <typename T>
     __device__ __forceinline__ float Qwen4CudaToFloat(T value) {
         return (float)value;
@@ -2344,7 +2368,11 @@ namespace {
             const int row = vector / ((uint64_t)width * keyHeads);
             const int sourceToken = indices[
                 (uint64_t)(rowStart + row) * width + selected];
-            const bool valid = sourceToken >= 0 && sourceToken < keyLength;
+            // Dense graph indices include every allocated column. A verifier
+            // row must not see later draft rows already appended to the KV.
+            const int rowLength = decodeMeta != nullptr
+                ? decodeMeta[0] + rowStart + row + 1 : keyLength;
+            const bool valid = sourceToken >= 0 && sourceToken < rowLength;
             if (valid) {
                 const uint64_t source =
                     (uint64_t)sourceToken * headDim + column;
@@ -2387,7 +2415,9 @@ namespace {
             const int row = tokenVector / ((uint64_t)width * keyHeads);
             const int sourceToken = indices[
                 (uint64_t)(rowStart + row) * width + selected];
-            const bool valid = sourceToken >= 0 && sourceToken < keyLength;
+            const int rowLength = decodeMeta != nullptr
+                ? decodeMeta[0] + rowStart + row + 1 : keyLength;
+            const bool valid = sourceToken >= 0 && sourceToken < rowLength;
             uint4 keyVector = make_uint4(0, 0, 0, 0);
             uint4 valueVector = make_uint4(0, 0, 0, 0);
             if (valid) {
@@ -2468,6 +2498,17 @@ namespace {
         }
     }
 
+}
+
+bool FastllmCudaQwen4MergeTpGreedy(const float *candidates, int *output,
+                                 float *floatOutput, int vocabulary, int ranks) {
+    if (candidates == nullptr || output == nullptr || floatOutput == nullptr ||
+        ranks <= 0 || vocabulary / 256 < ranks) {
+        return false;
+    }
+    Qwen4MergeTpGreedyKernel<<<1, 1, 0, cudaStreamPerThread>>>(
+        candidates, output, floatOutput, vocabulary, ranks);
+    return cudaGetLastError() == cudaSuccess;
 }
 
 bool FastllmCudaQwen4GroupedRMSNorm(

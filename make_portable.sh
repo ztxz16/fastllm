@@ -597,6 +597,9 @@ PY
 agent_fetch_args=(--cache-dir "${cache_dir}/pi")
 ((offline == 0)) || agent_fetch_args+=(--offline)
 "$python_bin" "${agent_source}/scripts/fetch_pi.py" "${agent_fetch_args[@]}"
+agent_tool_fetch_args=(--cache-dir "${cache_dir}/agent-tools")
+((offline == 0)) || agent_tool_fetch_args+=(--offline)
+"$python_bin" "${agent_source}/scripts/fetch_tools.py" "${agent_tool_fetch_args[@]}"
 agent_build_requirements=(setuptools==80.9.0 wheel==0.45.1)
 if ((! offline)); then
     "$python_bin" -m pip download --disable-pip-version-check --no-input \

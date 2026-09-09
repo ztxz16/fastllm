@@ -1,4 +1,9 @@
 // Shared by ftllm webui and the Launcher conversation pane.
+// Carry Launcher's retry URL through dependencies; browsers cache failed imports.
+const markdownURL = new URL("./markdown.js", import.meta.url);
+markdownURL.search = new URL(import.meta.url).search;
+const {renderMarkdown: renderMessageMarkdown} = await import(markdownURL.href);
+const {mountPluginHost} = await import(new URL("../../plugin-core/host.js", import.meta.url));
 let localesRetries = 0;
 function loadLocales(signal) {
   if (window.FASTLLM_LOCALES) return Promise.resolve();
@@ -27,7 +32,7 @@ function abortable(promise, signal) {
   });
 }
 
-export async function mountWebUI(host, {basePath = "", embedded = false, locale = "", iconUrl = "", signal} = {}) {
+export async function mountWebUI(host, {basePath = "", embedded = false, locale = "", theme = "light", iconUrl = "", signal, onInstallRuntime} = {}) {
   const base = new URL(basePath || "/", location.origin);
   if (base.origin !== location.origin) throw new Error("WebUI must use the current origin.");
   basePath = base.pathname.replace(/\/$/, "");
@@ -37,8 +42,12 @@ export async function mountWebUI(host, {basePath = "", embedded = false, locale 
   signal?.addEventListener("abort", abort, {once:true});
   const root = host.attachShadow({mode:"open"});
   host.toggleAttribute("data-embedded", embedded);
-  let observer;
+  function setTheme(value) { host.dataset.theme = value === "dark" ? "dark" : "light"; }
+  setTheme(theme);
+  let observer, pluginHost;
+  let runtimeInstallState = {};
   function destroy() {
+    pluginHost?.destroy();
     lifecycle.abort();
     signal?.removeEventListener("abort", abort);
     observer?.disconnect();
@@ -116,7 +125,7 @@ export async function mountWebUI(host, {basePath = "", embedded = false, locale 
     }
 
     async function api(path, options = {}) {
-      const response = await fetch(localUrl(path), { ...options, signal: lifecycle.signal, headers: { "Content-Type": "application/json", ...(options.headers || {}) } });
+      const response = await fetch(localUrl(path), { ...options, signal: options.signal || lifecycle.signal, headers: { "Content-Type": "application/json", ...(options.headers || {}) } });
       if (!response.ok) {
         let message = `${response.status} ${response.statusText}`;
         try { message = (await response.json()).detail || message; } catch (_) {}
@@ -177,41 +186,31 @@ export async function mountWebUI(host, {basePath = "", embedded = false, locale 
       catch (error) { toast(error.message); }
     }
 
-    function appendInline(parent, text) {
-      const pattern = /(\*\*[^*]+\*\*|`[^`]+`)/g; let cursor = 0;
-      for (const match of text.matchAll(pattern)) {
-        parent.append(document.createTextNode(text.slice(cursor, match.index)));
-        const token = match[0]; const node = document.createElement(token.startsWith("**") ? "strong" : "code");
-        node.textContent = token.startsWith("**") ? token.slice(2,-2) : token.slice(1,-1); parent.append(node);
-        cursor = match.index + token.length;
-      }
-      parent.append(document.createTextNode(text.slice(cursor)));
-    }
-
-    function appendTextBlock(parent, text) {
-      const lines = text.split("\n"); let paragraph = []; let list = null;
-      const flush = () => { if (!paragraph.length) return; const p = document.createElement("p"); appendInline(p, paragraph.join("\n")); parent.append(p); paragraph = []; };
-      for (const line of lines) {
-        const heading = line.match(/^(#{1,3})\s+(.+)$/); const item = line.match(/^\s*[-*]\s+(.+)$/);
-        if (heading) { flush(); list = null; const h = document.createElement(`h${heading[1].length}`); appendInline(h, heading[2]); parent.append(h); }
-        else if (item) { flush(); if (!list) { list = document.createElement("ul"); parent.append(list); } const li = document.createElement("li"); appendInline(li,item[1]); list.append(li); }
-        else if (!line.trim()) { flush(); list = null; }
-        else { list = null; paragraph.push(line); }
-      }
-      flush();
+    function openHTMLPreview(html) {
+      const frame = document.createElement("iframe");
+      frame.title = t("html.preview_title");
+      frame.setAttribute("sandbox", "allow-scripts");
+      frame.referrerPolicy = "no-referrer";
+      frame.src = localUrl("/html-preview");
+      frame.addEventListener("load", () => {
+        // The sandbox intentionally has an opaque origin, so targetOrigin is *.
+        // Only this frame receives the message; the receiver checks its parent.
+        frame.contentWindow.postMessage({type:"ftllm-html-preview", html}, "*");
+      }, {once:true, signal:lifecycle.signal});
+      $("#htmlPreviewBody").replaceChildren(frame);
+      $("#htmlPreviewDialog").showModal();
     }
 
     function renderMarkdown(node, text) {
-      node.replaceChildren(); const source = String(text || ""); const fence = /```([^\n]*)\n?([\s\S]*?)```/g; let cursor = 0;
-      for (const match of source.matchAll(fence)) {
-        appendTextBlock(node, source.slice(cursor, match.index));
-        const block = document.createElement("div"); block.className = "code-block";
-        const head = document.createElement("div"); head.className = "code-head"; const language = document.createElement("span"); language.textContent = match[1].trim() || "code";
-        const copy = document.createElement("button"); copy.className = "copy-code"; copy.textContent = t("common.copy"); copy.onclick = guard(async () => { await navigator.clipboard.writeText(match[2]); copy.textContent = t("common.copied"); setTimeout(() => copy.textContent = t("common.copy"),1200); });
-        head.append(language,copy); const pre = document.createElement("pre"); const code = document.createElement("code"); code.textContent = match[2]; pre.append(code); block.append(head,pre); node.append(block);
-        cursor = match.index + match[0].length;
-      }
-      appendTextBlock(node, source.slice(cursor));
+      renderMessageMarkdown(node, text, {
+        t,
+        onPreview: guard(openHTMLPreview),
+        onCopy: guard(async (code, button) => {
+          await navigator.clipboard.writeText(code);
+          button.textContent = t("common.copied");
+          setTimeout(() => button.textContent = t("common.copy"), 1200);
+        })
+      });
     }
 
     function renderAttachments(parent, attachments) {
@@ -323,7 +322,7 @@ export async function mountWebUI(host, {basePath = "", embedded = false, locale 
       const body = document.createElement("div"); body.className = "message-body"; renderAttachments(body,message.attachments);
       const toolTrace = document.createElement("div"); toolTrace.className = "tool-trace-holder"; renderToolTrace(toolTrace,message.tool_calls,live); body.append(toolTrace);
       let reasoningDetails = null, reasoningContent = null;
-      if (message.reasoning || live) { reasoningDetails = document.createElement("details"); reasoningDetails.className = "reasoning"; reasoningDetails.hidden = !message.reasoning; const summary = document.createElement("summary"); summary.textContent = t(live ? "chat.reasoning_live" : "chat.reasoning_done"); reasoningContent = document.createElement("div"); reasoningContent.className = "reasoning-content"; reasoningContent.textContent = message.reasoning || ""; reasoningDetails.append(summary,reasoningContent); body.append(reasoningDetails); }
+      if (message.reasoning || live) { reasoningDetails = document.createElement("details"); reasoningDetails.className = "reasoning"; reasoningDetails.hidden = !message.reasoning; const summary = document.createElement("summary"); summary.textContent = t(live ? "chat.reasoning_live" : "chat.reasoning_done"); reasoningContent = document.createElement("div"); reasoningContent.className = "reasoning-content message-text"; renderMarkdown(reasoningContent, message.reasoning || ""); reasoningDetails.append(summary,reasoningContent); body.append(reasoningDetails); }
       const status = document.createElement("div"); status.className = "status-line"; status.hidden = !message.cancelled; status.textContent = message.cancelled ? t("status.generation_stopped") : ""; body.append(status);
       const text = document.createElement("div"); text.className = "message-text"; renderMarkdown(text,message.content || ""); body.append(text); renderArtifacts(body,message.artifacts); renderSources(body,message.sources); wrapper.append(body);
       return { wrapper,body,text,status,toolTrace,reasoningDetails,reasoningContent };
@@ -334,7 +333,7 @@ export async function mountWebUI(host, {basePath = "", embedded = false, locale 
       live.status.hidden = !task.showStatus; live.status.textContent = task.status || "";
       live.text.replaceChildren(); if (task.content) renderMarkdown(live.text,task.content); else live.text.innerHTML = `<span class="typing"><i></i><i></i><i></i></span>`;
       if (live.toolCallsVersion !== task.toolCallsVersion) { renderToolTrace(live.toolTrace,task.toolCalls,true); live.toolCallsVersion = task.toolCallsVersion; }
-      if (task.reasoning) { live.reasoningDetails.hidden = false; live.reasoningContent.textContent = task.reasoning; }
+      if (task.reasoning) { live.reasoningDetails.hidden = false; renderMarkdown(live.reasoningContent, task.reasoning); }
       else live.reasoningDetails.hidden = true;
       live.planHolder.replaceChildren();
       if (task.plan?.type === "data") renderDataPlan(live.planHolder,task.plan.title,task.plan.analyses);
@@ -402,7 +401,7 @@ export async function mountWebUI(host, {basePath = "", embedded = false, locale 
     async function loadConversation(id) {
       if (!id) return; const sequence = ++state.loadSequence; const record = await (await api(`/api/conversations/${id}`)).json(); if (sequence !== state.loadSequence) return; state.activeId = id; state.record = record;
       const savedAgent = state.record.settings.agent_mode; state.agent = agentLabelKeys[savedAgent] ? savedAgent : "chat";
-      if (!embedded) history.replaceState(null,"",`?chat=${encodeURIComponent(id)}`); try { localStorage.setItem("fastllm.webui.activeChat",id); } catch (_) {} state.pending = []; renderPending(); renderSidebar(); renderMessages(); renderModes(); syncGenerationUI(); setSidebar(false);
+      if (!embedded) history.replaceState(null,"",`?chat=${encodeURIComponent(id)}${location.hash === "#customize" ? "#customize" : ""}`); try { localStorage.setItem("fastllm.webui.activeChat",id); } catch (_) {} state.pending = []; renderPending(); renderSidebar(); renderMessages(); renderModes(); syncGenerationUI(); setSidebar(false);
     }
 
     async function newConversation() {
@@ -443,6 +442,12 @@ export async function mountWebUI(host, {basePath = "", embedded = false, locale 
       $("#agentUnavailable").hidden = !reason;
       $("#agentUnavailable").textContent = reason;
       $("#agentUnavailable").title = state.config.pi_agent?.error || "";
+      $("#installRuntime").hidden = !onInstallRuntime || state.config.pi_agent?.available
+        || state.config.workspace_agent_disabled;
+      $("#installRuntime").disabled = runtimeInstallState.supported === false
+        || ["checking", "unchecked", "installing"].includes(runtimeInstallState.phase);
+      $("#installRuntime").textContent = t(runtimeInstallState.phase === "installing"
+        ? "workspace.installing_runtime" : "workspace.install_runtime");
     }
 
     async function openWorkspaceDialog() {
@@ -672,6 +677,16 @@ export async function mountWebUI(host, {basePath = "", embedded = false, locale 
       await loadConversation(target);
     }
 
+    async function refreshConfig() {
+      state.config = await (await api("/api/config")).json();
+      renderWorkspaceAvailability();
+    }
+
+    $("#closeHTMLPreview").onclick = guard(() => $("#htmlPreviewDialog").close());
+    $("#htmlPreviewDialog").addEventListener("close", () => $("#htmlPreviewBody").replaceChildren(), {signal:lifecycle.signal});
+
+    $("#installRuntime").onclick = guard(() => onInstallRuntime?.());
+
     $("#newChat").onclick = guard(newConversation); $("#newAgent").onclick = guard(openWorkspaceDialog); $("#attachButton").onclick = guard(() => $("#fileInput").click()); $("#fileInput").onchange = guard(event => uploadFiles([...event.target.files])); $("#agentButton").onclick = guard(() => { renderAgentSelection(); $("#agentDialog").showModal(); });
     $("#sendButton").onclick = guard(sendMessage); $("#stopButton").onclick = guard(stopActiveGeneration); $("#prompt").oninput = guard(resizePrompt); $("#prompt").onkeydown = guard(event => { if (event.key === "Enter" && !event.shiftKey && !event.isComposing) { event.preventDefault(); sendMessage(); } });
     for (const [button,menu] of [["#webButton","#webMenu"],["#thinkingButton","#thinkingMenu"]]) $(button).onclick = guard(event => { event.stopPropagation(); const target = $(menu); root.querySelectorAll(".mode-menu.open").forEach(item => item !== target && item.classList.remove("open")); target.classList.toggle("open"); });
@@ -690,10 +705,31 @@ export async function mountWebUI(host, {basePath = "", embedded = false, locale 
     $("#conversationList").onscroll = guard(closeConversationMenu); window.addEventListener("resize",closeConversationMenu,{signal:lifecycle.signal}); applyLocale(); await boot();
 
     if (lifecycle.signal.aborted) throw new DOMException("WebUI closed", "AbortError");
+    const extensions = document.createElement("section");
+    extensions.className = "plugin-studio-slot"; extensions.hidden = true;
+    $("#messages").before(extensions);
+    function pluginCall(capability, args) {
+      if (capability === "studio.context") return JSON.parse(JSON.stringify({conversation:state.record, draft:$("#prompt").value}));
+      if (capability === "studio.insert") {
+        if (typeof args?.text !== "string" || args.text.length > 60000) throw new Error("插入文本无效或过长");
+        const input = $("#prompt");
+        input.setRangeText(args.text, input.selectionStart, input.selectionEnd, "end");
+        resizePrompt(); input.focus(); return {ok:true};
+      }
+      throw new Error("不支持的工作室能力");
+    }
+    pluginHost = await mountPluginHost({root, basePath, slot:"studio", container:extensions,
+      navigation:root.querySelector(".top-actions"), signal:lifecycle.signal,
+      request:async (path, options) => {
+        const response = await api(path, options);
+        return options?.stream ? response : response.json();
+      },
+      context:() => ({locale:state.locale, theme:host.dataset.theme}), studioCall:pluginCall});
     observer = new ResizeObserver(() => { closeConversationMenu(); resizePrompt(); });
     observer.observe(host);
     signal?.removeEventListener("abort", abort);
-    return {destroy, setLocale: guard(setLocale)};
+    return {destroy, pluginCall: guard(pluginCall), setLocale: guard(setLocale), setTheme: guard(setTheme), refreshConfig: guard(refreshConfig),
+      setRuntimeInstallState: guard(value => { runtimeInstallState = value; renderWorkspaceAvailability(); })};
   } catch (error) {
     destroy();
     throw error;

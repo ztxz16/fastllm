@@ -5,7 +5,7 @@ import shlex
 import subprocess
 import sys
 import unicodedata
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from typing import Callable, List, Optional, Sequence, Tuple, Union
 
 try:
@@ -212,6 +212,7 @@ ENABLE_THINKING_CHOICES: Sequence[Choice] = (
 )
 
 SPECULATIVE_ALGORITHM_CHOICES: Sequence[Choice] = (
+    ("off", "关闭推测解码"),
     ("auto", "自动识别"),
     ("mtp", "MTP"),
     ("dflash", "DFlash2"),
@@ -349,7 +350,7 @@ FIELDS: Sequence[FormField] = (
         "speculative_algorithm",
         "推测算法",
         "choice",
-        "自动识别 draft checkpoint，或显式选择 MTP、DFlash2、DSpark。",
+        "关闭推测解码、自动识别 draft checkpoint，或显式选择 MTP、DFlash2、DSpark。",
         SPECULATIVE_ALGORITHM_CHOICES,
     ),
     FormField(
@@ -949,6 +950,13 @@ def normalize_moe_hybrid_config(
             config.moe_device_layers = "10000"
 
 
+def _normalize_speculative_config(config: DeployConfig) -> DeployConfig:
+    if str(config.speculative_algorithm).strip().lower() == "off":
+        return replace(config, speculative_algorithm="off", mtp="0", draft_tokens="auto",
+                       speculative_draft_model_path="", enable_speculative_decoding=False)
+    return config
+
+
 def config_from_dict(data: dict) -> DeployConfig:
     config = DeployConfig()
     valid_keys = {field.name for field in fields(DeployConfig)}
@@ -976,7 +984,7 @@ def config_from_dict(data: dict) -> DeployConfig:
         has_moe_device,
         has_moe_device_layers,
     )
-    return config
+    return _normalize_speculative_config(config)
 
 
 def config_title(config: DeployConfig) -> str:
@@ -1111,6 +1119,7 @@ def complete_path_prefix(raw_prefix: str, directories_only: bool = False) -> Lis
 
 
 def build_fastllm_argv(config: DeployConfig) -> List[str]:
+    config = _normalize_speculative_config(config)
     argv = ["ftllm", config.command]
     model = _expand_user_path(config.model.strip())
     if model:
@@ -1156,12 +1165,9 @@ def build_fastllm_argv(config: DeployConfig) -> List[str]:
     _add_option(argv, "--moe_dtype", moe_dtype)
     _add_option(argv, "-t", _optional_text(config.threads))
     _add_option(argv, "--kv_cache_limit", _optional_text(config.kv_cache_limit))
-    _add_option(argv, "--mtp", _optional_text(config.mtp))
-    _add_option(
-        argv,
-        "--speculative_algorithm",
-        _optional_text(config.speculative_algorithm),
-    )
+    if config.speculative_algorithm != "off":
+        _add_option(argv, "--mtp", _optional_text(config.mtp))
+        _add_option(argv, "--speculative_algorithm", _optional_text(config.speculative_algorithm))
     _add_option(
         argv,
         "--speculative_draft_model_path",
@@ -1189,6 +1195,9 @@ def build_fastllm_argv(config: DeployConfig) -> List[str]:
     extra_args = config.extra_args.strip()
     if extra_args:
         argv.extend(shlex.split(extra_args))
+    # An explicit Off selection also overrides old speculative flags in extra_args.
+    if config.speculative_algorithm == "off":
+        argv.extend(["--speculative_algorithm", "off"])
     return argv
 
 
@@ -1200,58 +1209,65 @@ def build_fastllm_command(config: DeployConfig) -> str:
     return " ".join(env_prefix + [shlex.quote(part) for part in build_fastllm_argv(config)])
 
 
-def validate_config(config: DeployConfig) -> List[str]:
+def validate_config(config: DeployConfig, field_errors: Optional[List[dict]] = None) -> List[str]:
+    config = _normalize_speculative_config(config)
     errors = []
+
+    def add_error(message, *field_names):
+        errors.append(message)
+        if field_errors is not None:
+            field_errors.append({"message": message, "fields": list(field_names)})
+
     model_path = _expand_user_path(config.model.strip())
     if not model_path:
-        errors.append("模型路径不能为空。")
+        add_error("模型路径不能为空。", "model")
     elif is_gguf_model(model_path):
         if not os.path.isfile(model_path):
-            errors.append("GGUF模型路径必须是已存在的本地 .gguf 文件。")
+            add_error("GGUF模型路径必须是已存在的本地 .gguf 文件。", "model")
     elif not os.path.isdir(model_path):
-        errors.append("模型路径必须是已存在的本地模型目录，或 .gguf 文件。")
+        add_error("模型路径必须是已存在的本地模型目录，或 .gguf 文件。", "model")
 
     ori_path = _expand_user_path(config.ori.strip())
     if is_gguf_model(config.model) and ori_path and not os.path.isdir(ori_path):
-        errors.append("模型配置文件夹必须是已存在的本地目录。")
+        add_error("模型配置文件夹必须是已存在的本地目录。", "ori")
 
     if config.command in ("server", "webui"):
         try:
             port = int(config.port)
             if port < 1 or port > 65535:
-                errors.append("端口必须在 1-65535 之间。")
+                add_error("端口必须在 1-65535 之间。", "port")
         except ValueError:
-            errors.append("端口必须是整数。")
+            add_error("端口必须是整数。", "port")
 
     if config.command == "webui":
         if (
             not _is_positive_int_or_auto(config.webui_max_token)
             or _is_auto_or_empty(config.webui_max_token)
         ):
-            errors.append("WebUI最大输出Token必须是正整数。")
+            add_error("WebUI最大输出Token必须是正整数。", "webui_max_token")
         if config.webui_think not in ("true", "false"):
-            errors.append("WebUI思考模式必须是 true 或 false。")
+            add_error("WebUI思考模式必须是 true 或 false。", "webui_think")
 
-    for label, value in (
-        ("预处理分片大小", config.chunked_prefill_size),
-        ("最大Batch", config.max_batch),
-        ("单会话上下文", config.max_context_length),
-        ("tokens数量", config.tokens),
-        ("线程数", config.threads),
-        ("Draft Token数", config.draft_tokens),
+    for field_name, label, value in (
+        ("chunked_prefill_size", "预处理分片大小", config.chunked_prefill_size),
+        ("max_batch", "最大Batch", config.max_batch),
+        ("max_context_length", "单会话上下文", config.max_context_length),
+        ("tokens", "tokens数量", config.tokens),
+        ("threads", "线程数", config.threads),
+        ("draft_tokens", "Draft Token数", config.draft_tokens),
     ):
         if not _is_positive_int_or_auto(value):
-            errors.append(f"{label}必须是正整数或 auto。")
+            add_error(f"{label}必须是正整数或 auto。", field_name)
 
     if not _is_mtp_value(config.mtp):
-        errors.append("MTP 必须是 0-8 的整数或 auto。")
+        add_error("MTP 必须是 0-8 的整数或 auto。", "mtp")
 
     speculative_algorithm = str(config.speculative_algorithm).strip().lower()
     if (
         speculative_algorithm
         and speculative_algorithm not in SPECULATIVE_ALGORITHM_VALUES
     ):
-        errors.append("推测算法必须是 auto、mtp、dflash 或 dspark。")
+        add_error("推测算法必须是 off、auto、mtp、dflash 或 dspark。", "speculative_algorithm")
 
     draft_path = _expand_user_path(config.speculative_draft_model_path.strip())
     draft_path_exists = bool(
@@ -1259,7 +1275,7 @@ def validate_config(config: DeployConfig) -> List[str]:
         and (os.path.isdir(draft_path) or os.path.isfile(draft_path))
     )
     if draft_path and not draft_path_exists:
-        errors.append("Draft模型路径必须是已存在的本地目录或文件。")
+        add_error("Draft模型路径必须是已存在的本地目录或文件。", "speculative_draft_model_path")
 
     try:
         mtp_tokens = int(str(config.mtp).strip())
@@ -1272,73 +1288,73 @@ def validate_config(config: DeployConfig) -> List[str]:
 
     if speculative_algorithm == "dflash":
         if not draft_path:
-            errors.append("DFlash2 必须指定 Draft模型路径。")
+            add_error("DFlash2 必须指定 Draft模型路径。", "speculative_draft_model_path")
         elif draft_path_exists and not os.path.isdir(draft_path):
-            errors.append("DFlash2 的 Draft模型路径必须是目录。")
+            add_error("DFlash2 的 Draft模型路径必须是目录。", "speculative_draft_model_path")
         if mtp_tokens > 0:
-            errors.append("DFlash2 和 MTP 不能同时启用。")
+            add_error("DFlash2 和 MTP 不能同时启用。", "speculative_algorithm", "mtp")
     elif speculative_algorithm == "mtp":
         if not draft_path and mtp_tokens <= 0:
-            errors.append("内置 MTP 必须指定 1-8 的 MTP token 数。")
+            add_error("内置 MTP 必须指定 1-8 的 MTP token 数。", "mtp")
         if mtp_tokens > 0 and draft_tokens > 0 and mtp_tokens != draft_tokens:
-            errors.append("MTP Token 数和 Draft Token 数必须一致。")
+            add_error("MTP Token 数和 Draft Token 数必须一致。", "mtp", "draft_tokens")
     elif speculative_algorithm == "dspark":
         if draft_path_exists and not os.path.isdir(draft_path):
-            errors.append("DSpark 的 Draft模型路径必须是目录。")
+            add_error("DSpark 的 Draft模型路径必须是目录。", "speculative_draft_model_path")
         if not draft_path and draft_tokens <= 0:
-            errors.append("内置 DSpark 必须指定 Draft Token 数。")
+            add_error("内置 DSpark 必须指定 Draft Token 数。", "draft_tokens")
         if mtp_tokens > 0:
-            errors.append("DSpark 和 MTP 不能同时启用。")
+            add_error("DSpark 和 MTP 不能同时启用。", "speculative_algorithm", "mtp")
 
     if not _is_ratio(config.gpu_mem_ratio):
-        errors.append("显存利用率必须是 0 到 1 之间的数字，例如 0.9。")
+        add_error("显存利用率必须是 0 到 1 之间的数字，例如 0.9。", "gpu_mem_ratio")
 
     if config.command == "server" and not config.host.strip():
-        errors.append("监听地址不能为空。")
+        add_error("监听地址不能为空。", "host")
     if config.device == "cuda" and not _is_valid_cuda_device_id(config.cuda_device_id):
-        errors.append("CUDA卡号必须是非负整数；留空表示 0。")
+        add_error("CUDA卡号必须是非负整数；留空表示 0。", "cuda_device_id")
     if config.device == "cudapp" and not _is_valid_cudapp_spec(config.cudapp):
-        errors.append("串行参数格式不对。请输入正整数卡数，例如 4；或输入至少两个卡号，例如 0,1,2。")
+        add_error("串行参数格式不对。请输入正整数卡数，例如 4；或输入至少两个卡号，例如 0,1,2。", "cudapp")
     if config.device == "tp" and not _is_valid_tp_spec(config.tp):
-        errors.append("TP卡数/ID格式不对。请输入卡数，例如 1 或 4；或输入卡号，例如 0、cuda:1、0,2,3。")
+        add_error("TP卡数/ID格式不对。请输入卡数，例如 1 或 4；或输入卡号，例如 0、cuda:1、0,2,3。", "tp")
     if config.device == "custom" and not config.device_custom.strip():
-        errors.append("选择自定义主设备时必须填写自定义主设备。")
+        add_error("选择自定义主设备时必须填写自定义主设备。", "device_custom")
     if config.enable_moe_hybrid:
         if config.moe_device not in ("cpu", "cuda", "numa", "disk", "custom"):
-            errors.append("MOE推理设备配置无效。")
+            add_error("MOE推理设备配置无效。", "moe_device")
         if (
             config.moe_device == "custom"
             and not _is_valid_custom_device_map(config.moe_device_custom)
         ):
-            errors.append("自定义MOE设备映射格式无效，请填写设备列表或正权重映射。")
+            add_error("自定义MOE设备映射格式无效，请填写设备列表或正权重映射。", "moe_device_custom")
         if not _is_valid_moe_device_layers(config.moe_device_layers):
-            errors.append("MOE设备层数格式不对。请输入正整数，例如 8；或输入 -1 表示全部 MOE 层。")
+            add_error("MOE设备层数格式不对。请输入正整数，例如 8；或输入 -1 表示全部 MOE 层。", "moe_device_layers")
     if str(config.ngram_device).strip().lower() not in ("", "auto", "cpu", "disk"):
-        errors.append("N-gram存储设备只能选择 CPU、Disk 或 auto。")
+        add_error("N-gram存储设备只能选择 CPU、Disk 或 auto。", "ngram_device")
     if config.dtype == "custom" and not config.dtype_custom.strip():
-        errors.append("选择自定义权重类型时必须填写自定义权重类型。")
+        add_error("选择自定义权重类型时必须填写自定义权重类型。", "dtype_custom")
     if config.moe_dtype == "custom" and not config.moe_dtype_custom.strip():
-        errors.append("选择自定义MOE类型时必须填写自定义MOE类型。")
+        add_error("选择自定义MOE类型时必须填写自定义MOE类型。", "moe_dtype_custom")
 
     if not _is_optional_float(config.temperature, min_value=0):
-        errors.append("temperature 必须是大于等于 0 的数字，或留空使用模型默认值。")
+        add_error("temperature 必须是大于等于 0 的数字，或留空使用模型默认值。", "temperature")
     if not _is_optional_float(config.top_p, min_value=0, max_value=1):
-        errors.append("top_p 必须是 0 到 1 之间的数字，或留空使用模型默认值。")
+        add_error("top_p 必须是 0 到 1 之间的数字，或留空使用模型默认值。", "top_p")
     if not _is_optional_positive_int(config.top_k):
-        errors.append("top_k 必须是正整数，或留空使用模型默认值。")
+        add_error("top_k 必须是正整数，或留空使用模型默认值。", "top_k")
     if not _is_optional_float(config.repeat_penalty, min_value=0):
-        errors.append("repeat_penalty 必须是大于等于 0 的数字，或留空使用模型默认值。")
+        add_error("repeat_penalty 必须是大于等于 0 的数字，或留空使用模型默认值。", "repeat_penalty")
 
     if config.extra_args.strip():
         try:
             shlex.split(config.extra_args)
         except ValueError as exc:
-            errors.append(f"额外参数无法解析: {exc}")
+            add_error(f"额外参数无法解析: {exc}", "extra_args")
     if config.env_vars.strip():
         try:
             parse_env_vars(config.env_vars)
         except ValueError as exc:
-            errors.append(str(exc))
+            add_error(str(exc), "env_vars")
     return errors
 
 

@@ -1,5 +1,6 @@
 """Integration checks for the original WebUI mounted inside Launcher."""
 import asyncio
+import io
 import json
 import os
 import sys
@@ -43,7 +44,7 @@ class LauncherWebUITest(unittest.TestCase):
         return response
 
     def test_authentication_covers_page_assets_api_and_downloads(self):
-        for path in ('/', '/assets/webui_locales.js', '/api/config', '/api/conversations/x/attachments/y'):
+        for path in ('/', '/html-preview', '/assets/webui_locales.js', '/api/config', '/api/conversations/x/attachments/y'):
             self.assertEqual(self.client.get(self.base + path).status_code, 403)
         self.assertEqual(self.client.post('/api/webui/open', json={'sessionId': 'model-a'}).status_code, 403)
         response = self.open()
@@ -69,7 +70,8 @@ class LauncherWebUITest(unittest.TestCase):
         self.assertNotIn("'unsafe-inline'", page.headers['content-security-policy'])
         self.assertIn("frame-ancestors 'self'", page.headers['content-security-policy'])
         self.assertEqual(page.headers['cache-control'], 'no-store')
-        for asset in ('app.js', 'styles.css', 'template.html', 'standalone.js'):
+        for asset in ('app.js', 'styles.css', 'template.html', 'standalone.js',
+                      'markdown.js', 'marked.js', 'marked.LICENSE.md'):
             child = self.client.get(self.base + '/assets/webui/' + asset)
             parent = self.client.get('/assets/webui/' + asset)
             self.assertEqual(child.status_code, 200)
@@ -86,6 +88,20 @@ class LauncherWebUITest(unittest.TestCase):
         self.assertNotIn('<iframe', parent.text)
         self.assertIn('id="webui-content"', parent.text)
         self.assertIn('<h1>模型管理</h1>', parent.text)
+
+    def test_html_preview_is_sandboxed_without_relaxing_application_policy(self):
+        self.open()
+        response = self.client.get(self.base + '/html-preview')
+        self.assertEqual(response.status_code, 200)
+        policy = response.headers['content-security-policy']
+        self.assertIn('sandbox allow-scripts', policy)
+        self.assertNotIn('allow-same-origin', policy)
+        self.assertIn("connect-src 'none'", policy)
+        self.assertIn("frame-src 'none'", policy)
+        self.assertIn("form-action 'none'", policy)
+        self.assertEqual(response.headers['cache-control'], 'no-store')
+        self.assertNotIn("'unsafe-inline'", self.client.get('/').headers['content-security-policy'])
+        self.assertNotIn("'unsafe-inline'", self.client.get(self.base + '/').headers['content-security-policy'])
 
     def test_active_model_and_credentials_are_snapshotted_on_server_side(self):
         self.open()
@@ -349,6 +365,36 @@ class LauncherWebUITest(unittest.TestCase):
         messages = stream.call_args.args[0]
         self.assertEqual([m['role'] for m in messages], ['user', 'assistant', 'user'])
         self.assertEqual(len(self.client.get(path).json()['messages']), 4)
+        self.assertFalse(self.client.post(path + '/cancel').json()['cancelled'])
+
+    def test_context_error_is_visible_and_preserves_complete_history(self):
+        from fastllm_pytools.generation_errors import PromptTooLongError
+
+        self.open()
+        record = self.client.post(self.base + '/api/conversations', json={}).json()
+        path = self.base + '/api/conversations/' + record['id']
+        webui = self.runtime._webui_app.state.runtime
+        with patch.object(webui.api_client, 'stream', return_value=iter([('Hello', '')])):
+            self.client.post(path + '/chat', json={'prompt': 'First'})
+        original = self.client.get(path).json()['messages']
+        error_message = str(PromptTooLongError())
+        wire = 'data: ' + json.dumps({'error': {'message': error_message, 'code': 400}}) + '\n\n'
+        for prompt in (('Long history ' * 1000).strip(), 'Continue'):
+            with patch.object(webui.api_client, '_open', return_value=io.BytesIO(wire.encode())) as opened:
+                response = self.client.post(path + '/chat', json={'prompt': prompt})
+            events = [json.loads(line) for line in response.text.splitlines()]
+            self.assertEqual([e['message'] for e in events if e['type'] == 'error'],
+                             [error_message])
+            self.assertTrue(events[-1]['message']['error'])
+            self.assertIn('上下文长度不足', events[-1]['message']['content'])
+            self.assertNotIn('思考过程未完成', events[-1]['message']['content'])
+            sent = opened.call_args.args[1]['messages']
+            self.assertEqual([m['content'] for m in sent],
+                             [m['content'] for m in original] + [prompt])
+            saved = self.client.get(path).json()['messages']
+            self.assertEqual(saved[:-2], original)
+            self.assertEqual(saved[-2]['content'], prompt)
+            original = saved
         self.assertFalse(self.client.post(path + '/cancel').json()['cancelled'])
 
 

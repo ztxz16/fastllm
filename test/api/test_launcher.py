@@ -31,6 +31,7 @@ from fastllm_pytools.launcher import (
     browse_folders,
     create_launcher_app,
     fastllm_launcher,
+    launcher_html,
     recommend_launch_config,
 )
 from fastllm_pytools.tui import DeployConfig, build_fastllm_argv, config_from_dict
@@ -212,6 +213,89 @@ class LauncherConfigTest(unittest.TestCase):
         ))
 
         self.assertTrue(any("内置 MTP" in error for error in preview["errors"]))
+
+    def test_preview_attaches_errors_to_their_fields(self):
+        preview = self.runtime.preview(self.config(
+            port="0", max_batch="0", speculative_algorithm="dflash"))
+        issues = preview["fieldErrors"]
+        self.assertEqual([item["message"] for item in issues], preview["errors"])
+        self.assertEqual({field for item in issues for field in item["fields"]},
+                         {"port", "max_batch", "speculative_draft_model_path"})
+        repaired = self.runtime.preview(self.config())
+        self.assertEqual(repaired["fieldErrors"], [])
+
+    def test_preview_compares_with_started_configuration_without_exposing_secrets(self):
+        config = self.config(port=str(unused_tcp_port()), api_key="private-start-key",
+                             env_vars="AUTH_TOKEN=private-env-token")
+        process = SimpleNamespace(pid=12345, poll=lambda: None)
+        try:
+            with patch.object(self.runtime, "_popen", return_value=process), \
+                    patch.object(self.runtime, "_start_stream_readers"), \
+                    patch.object(self.runtime, "_watch_process"), \
+                    patch.object(self.runtime, "_probe_readiness"):
+                self.runtime.start(config)
+            unchanged = self.runtime.preview(config)
+            self.assertTrue(unchanged["matchesRunningConfig"])
+            self.assertEqual(unchanged["runtimeSessionId"], self.runtime.state()["sessionId"])
+            changed = {**config, "gpu_mem_ratio": "0.8"}
+            saved = self.runtime.save_profile(None, changed)
+            self.assertFalse(self.runtime.preview(self.runtime.profiles()[saved["index"]])["matchesRunningConfig"])
+            self.assertTrue(self.runtime.preview(config)["matchesRunningConfig"])
+            # Naming or automatic-configuration preferences do not change the launch command.
+            self.assertTrue(self.runtime.preview({**config, "name": "Renamed", "enable_speculative_decoding": True})["matchesRunningConfig"])
+            serialized = json.dumps(unchanged) + json.dumps(self.runtime.state())
+            self.assertNotIn("private-start-key", serialized)
+            self.assertNotIn("private-env-token", serialized)
+            self.runtime._state["phase"] = "stopped"
+            self.assertIsNone(self.runtime.preview(changed)["matchesRunningConfig"])
+        finally:
+            # The fake process must never reach the real process termination path.
+            self.runtime._process = None
+
+    def test_disabling_speculative_decoding_clears_and_persists_old_settings(self):
+        saved = self.runtime.save_profile(None, self.config(
+            speculative_algorithm="mtp", mtp="3", draft_tokens="3",
+            speculative_draft_model_path=self.draft_path, enable_speculative_decoding=True))
+        saved = self.runtime.save_profile(saved["index"], {
+            **saved["profile"], "speculative_algorithm": "off",
+            "speculative_draft_model_path": "/missing/old-draft", "draft_tokens": "invalid"})
+        profile = self.runtime.profiles()[saved["index"]]
+        self.assertEqual(profile["speculative_algorithm"], "off")
+        self.assertEqual(profile["mtp"], "0")
+        self.assertEqual(profile["draft_tokens"], "auto")
+        self.assertEqual(profile["speculative_draft_model_path"], "")
+        self.assertFalse(profile["enable_speculative_decoding"])
+        preview = self.runtime.preview(profile)
+        self.assertEqual(preview["errors"], [])
+        self.assertIn("--speculative_algorithm off", preview["command"])
+        self.assertNotIn("--mtp", preview["command"])
+        self.assertNotIn("--draft_tokens", preview["command"])
+        self.assertNotIn("--speculative_draft_model_path", preview["command"])
+
+    def test_off_overrides_extra_speculative_arguments_in_actual_cli_parser(self):
+        from fastllm_pytools.cli import args_parser
+        from fastllm_pytools.util import make_normal_llm_model
+        config = DeployConfig(
+            speculative_algorithm="off", mtp="3", draft_tokens="5",
+            speculative_draft_model_path="/missing/old-draft",
+            extra_args="--mtp 4 --speculative-algorithm mtp --draft /missing/extra-draft --draft_tokens 7")
+        argv = build_fastllm_argv(config)
+        args = args_parser().parse_args(argv[1:])
+        with patch.dict(os.environ, {}, clear=True), redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as result:
+            make_normal_llm_model(args)
+        self.assertEqual(result.exception.code, 0)
+        self.assertEqual(args.mtp, 0)
+        self.assertEqual(args.speculative_algorithm, "")
+        self.assertEqual(args.speculative_draft_model_path, "")
+        self.assertEqual(args.draft_tokens, -1)
+
+    def test_legacy_mtp_configuration_keeps_its_behavior_until_explicitly_disabled(self):
+        for algorithm in ("auto", "mtp"):
+            with self.subTest(algorithm=algorithm):
+                config = config_from_dict(self.config(speculative_algorithm=algorithm, mtp="3"))
+                argv = build_fastllm_argv(config)
+                self.assertEqual(argv[argv.index("--mtp") + 1], "3")
+                self.assertEqual(config.speculative_algorithm, algorithm)
 
     def test_mtp_token_counts_must_match(self):
         preview = self.runtime.preview(self.config(
@@ -467,10 +551,14 @@ class LauncherConfigTest(unittest.TestCase):
                 self.runtime.start(self.config(port=str(port)))
 
     def test_launcher_assets_are_packaged_as_external_resources(self):
-        for filename in ("index.html", "styles.css", "app.js", "launcher-icon.png"):
+        for filename in ("index.html", "styles.css", "app.js", "theme.js", "launcher-icon.png"):
             self.assertTrue((ASSET_DIRECTORY / filename).is_file(), filename)
-        html = (ASSET_DIRECTORY / "index.html").read_text(encoding="utf-8")
+        html = launcher_html()
         javascript = (ASSET_DIRECTORY / "app.js").read_text(encoding="utf-8")
+        for module in ASSET_DIRECTORY.parent.glob("ui_plugins/*/*.js"):
+            if module.parent.name == "studio" and module.name == "app.js":
+                continue
+            javascript += module.read_text(encoding="utf-8")
         self.assertIn('src="/assets/app.js"', html)
         self.assertIn('rel="icon" type="image/png" href="/assets/launcher-icon.png"', html)
         self.assertIn('class="brand-mark" src="/assets/launcher-icon.png"', html)

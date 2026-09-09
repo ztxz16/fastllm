@@ -3638,8 +3638,13 @@ namespace fastllm {
         requireMatchingConfigInt("num_hidden_layers", model->block_cnt);
         requireMatchingConfigInt("num_attention_heads",
                                  model->num_attention_heads);
+        // Qwen3_5Model keeps its own KV-head member. With --ori, the base
+        // class member can still have its default value after InitParams().
+        const int configuredKvHeads = targetDictInt("num_key_value_heads");
+        const int kvHeads = configuredKvHeads > 0 ? configuredKvHeads :
+            model->num_attention_heads;
         requireMatchingConfigInt("num_key_value_heads",
-                                 model->num_key_value_heads);
+                                 kvHeads);
         requireMatchingConfigInt("head_dim", model->head_dim);
         requireMatchingConfigInt("vocab_size", targetDictInt("vocab_size"));
         requireMatchingConfigInt("intermediate_size",
@@ -3647,7 +3652,6 @@ namespace fastllm {
 
         const int hidden = model->embed_dim;
         const int heads = model->num_attention_heads;
-        const int kvHeads = model->num_key_value_heads;
         const int headDim = model->head_dim;
         const int intermediate = targetDictInt("intermediate_size");
         auto requireShape = [&](const std::string &name,
@@ -3911,8 +3915,6 @@ namespace fastllm {
                 model, externalMtpTextConfig, *externalMtpSafeTensors);
         }
 
-        int cur = 0;
-        long long totalBytes = 0;
         std::set <std::string> allWeightNames; // 所有创建了的weight name
         std::set <std::string> allFinishNames; // 转换好的weight name
 
@@ -4069,7 +4071,6 @@ namespace fastllm {
                                     model->GetWeightLoadPriority(b, {});
                          });
 
-        std::vector <std::thread*> threads;
         int threadNum = std::min(16, std::max(4, (int)GetAlivePool()->threads.size()));
         std::mutex locker;
         int cnt = 0;
@@ -4080,35 +4081,19 @@ namespace fastllm {
             ReportModelLoadProgress("weights_load", 1, 1);
         }
 
-        totalBytes = tensors.size();
-        std::vector <std::pair <int, int> > parts;
-        int start = 0;
-        for (int i = 0; i < threadNum; i++) {
-            int cur = start;
-            long long now = 0;
-            while (true) {
-                if (now * threadNum >= totalBytes || start >= tensors.size()) {
-                    break;
-                }
-
-                // now += safeTensors.itmeDict[tensors[start]].bytes;
-                now += 1;
-
-                start++;
+        // A serial group is one model-defined unit (for example, a decoder
+        // layer). Read its tensors in parallel, then let the model upload and
+        // release that group before any tensors from the next group are read.
+        auto loadGGUFWeights = [&](const std::vector<std::string> &loadTensors) {
+            if (loadTensors.empty()) {
+                return;
             }
-            parts.push_back(std::make_pair(cur, start));
-        }
-        parts.back().second = tensors.size();
-        while (parts.size() < threadNum) {
-            parts.push_back(std::make_pair(-1, -1));
-        }
-
-        // Load 
-        for (int i = 0; i < threadNum; i++) {
-            threads.push_back(
-                new std::thread([&](int st, int end) {
+            const int workers = std::min(threadNum, (int)loadTensors.size());
+            std::vector<std::thread> threads;
+            for (int worker = 0; worker < workers; worker++) {
+                threads.emplace_back([&](int st, int end) {
                     for (int i = st; i < end; i++) {
-                        auto &weightName = tensors[i];
+                        const auto &weightName = loadTensors[i];
                         uint64_t tensorBytes = 0;
                         if (readGGUFTaskDict.find(weightName) != readGGUFTaskDict.end()) {
                             auto *task = readGGUFTaskDict[weightName];
@@ -4120,6 +4105,9 @@ namespace fastllm {
                                 WeightImportGGUFTensor(task->weight, &task->tensor, task->fileName,
                                                        task->offset, task->replaceType);
                             }
+                            // TP shards inherit this flag at split time, before
+                            // the final model-wide postprocessing pass.
+                            task->weight->forceGGUFFp32Dequant = forceSafeGgufDequant;
                         } else if (externalMtpReadTaskDict.find(weightName) !=
                                    externalMtpReadTaskDict.end()) {
                             auto &task = externalMtpReadTaskDict[weightName];
@@ -4239,6 +4227,8 @@ namespace fastllm {
                                             mergeData.isGGUFData = mergeData.isGGUFData ||
                                                 model->weight[input].isGGUFData ||
                                                 model->weight[input].dataType == DATA_GGUF_FORMAT;
+                                            mergeData.forceGGUFFp32Dequant |=
+                                                model->weight[input].forceGGUFFp32Dequant;
                                         }
                                         if (AllInputsAreDiskWeights(model->weight.weight, it.inputs)) {
                                             MergeDiskWeightMeta(model->weight.weight, it.inputs, mergeData);
@@ -4267,6 +4257,8 @@ namespace fastllm {
                                             mergeData.isGGUFData = mergeData.isGGUFData ||
                                                 model->weight[input].isGGUFData ||
                                                 model->weight[input].dataType == DATA_GGUF_FORMAT;
+                                            mergeData.forceGGUFFp32Dequant |=
+                                                model->weight[input].forceGGUFFp32Dequant;
                                         }
                                         mergeData.perChannelAxis = model->weight[input0].perChannelAxis;
                                         mergeData.group = model->weight[input0].group;
@@ -4380,13 +4372,39 @@ namespace fastllm {
                             }
                         }
                     }
-                }, parts[i].first, parts[i].second)
-            );
+                }, loadTensors.size() * worker / workers,
+                   loadTensors.size() * (worker + 1) / workers);
+            }
+            for (auto &thread : threads) {
+                thread.join();
+            }
+        };
+
+        std::vector<std::string> serialTensors, parallelTensors;
+        for (const auto &name : tensors) {
+            if (model->ShouldLoadWeightSeriallyBeforeOthers(name, {})) {
+                serialTensors.push_back(name);
+            } else {
+                parallelTensors.push_back(name);
+            }
         }
-        for (int i = 0; i < threads.size(); i++) {
-            threads[i]->join();
-            delete threads[i];
+        for (size_t start = 0; start < serialTensors.size();) {
+            const int priority = model->GetWeightLoadPriority(serialTensors[start], {});
+            size_t end = start + 1;
+            while (end < serialTensors.size() &&
+                   model->GetWeightLoadPriority(serialTensors[end], {}) == priority) {
+                end++;
+            }
+            std::vector<std::string> group(serialTensors.begin() + start,
+                                           serialTensors.begin() + end);
+            model->OnWeightLoadGroupStarted(
+                std::set<std::string>(group.begin(), group.end()));
+            loadGGUFWeights(group);
+            model->OnWeightLoadGroupFinished();
+            start = end;
         }
+        loadGGUFWeights(parallelTensors);
+        model->OnWeightLoadGroupFinished();
         if (forceSafeGgufDequant) {
             for (auto &item : model->weight.weight) {
                 if (item.second.isGGUFData ||

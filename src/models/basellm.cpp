@@ -4585,6 +4585,16 @@ namespace fastllm {
                 bytesPerPage += layerBytesPerPage;
             }
 
+            for (int id : deviceIds) {
+                long long extra = std::max(0LL,
+                    this->GetAutoWarmupCudaAdditionalCacheBytesPerToken(id));
+                deviceDelayedCacheBytesPerPage[id] += extra * pageLen;
+                if (extra > 0) {
+                    printf("[Fastllm] AutoWarmup GPU %d: additional model KV pool %.2f KB/token, %.2f MB/page.\n",
+                           id, extra / 1024.0, extra * pageLen / 1e6);
+                }
+            }
+
             bool updatedPages = false;
             int calculatedMaxPages = -1;
             std::string fallbackReason = "";

@@ -3,7 +3,7 @@ import json
 import os
 from setuptools import setup
 
-server_require = ['fastapi', 'pydantic', 'openai', 'shortuuid', 'uvicorn']
+server_require = ['fastapi', 'pydantic', 'openai', 'shortuuid', 'uvicorn', 'httpx>=0.27', 'websockets>=12']
 pptx_require = ['python-pptx>=1.0.0']
 document_require = ['pypdf>=4.0.0']
 data_require = ['pandas>=2.0.0', 'openpyxl>=3.1.0', 'XlsxWriter>=3.1.0']
@@ -92,7 +92,8 @@ setup (
     package_data = {
         '': ['*.dll', '*.so', '*.dylib', '*.so.*', '*.html', '*.js', '*.svg', 'build_info.json',
              'fastllm_triton_server.py', 'launcher_assets/*',
-             'launcher_assets/locales/*.json', 'webui_assets/*']
+             'launcher_assets/locales/*.json', 'webui_assets/*',
+             'ui_plugins/*/*', 'plugin_assets/*']
     },
     install_requires=[
         'pyreadline3; platform_system == "Windows"',

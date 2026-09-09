@@ -1,0 +1,16 @@
+<section id="view-logs" class="view">
+            <div class="view-hero compact-hero">
+              <div><span class="eyebrow">LIVE OUTPUT</span><h1>运行日志</h1><p>从加载到就绪，实时了解模型服务的运行状态。</p></div>
+              <button id="clear-logs" class="secondary-button" type="button">清空日志</button>
+            </div>
+            <section class="terminal-card">
+              <div class="terminal-heading">
+                <div><span class="terminal-dot red"></span><span class="terminal-dot yellow"></span><span class="terminal-dot green"></span></div>
+                <strong>ftllm server</strong>
+                <span id="log-count">0 条</span>
+              </div>
+              <div id="log-output" class="log-output" aria-live="polite">
+                <div class="log-empty">启动模型后，日志会显示在这里。</div>
+              </div>
+            </section>
+          </section>

@@ -819,7 +819,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help = "启用模型内置 DSpark，并指定每轮 draft token 数；例如 --dspark 7")
     parser.add_argument("--speculative_algorithm", "--speculative-algorithm",
                         dest = "speculative_algorithm", type = str, default = "",
-                        help = "投机解码算法；当前支持 mtp、dspark、dflash")
+                        help = "投机解码算法；off 关闭，或选择 mtp、dspark、dflash")
     parser.add_argument("--speculative_draft_model_path", "--speculative-draft-model-path",
                         "--draft", "--draft_model_path", "--dspark_model",
                         dest = "speculative_draft_model_path", type = str, default = "",
@@ -900,6 +900,12 @@ def make_normal_llm_model(args, startup_progress = None):
 
     user_set_device = bool(args.device and args.device != "")
     user_set_moe_device = bool(args.moe_device and args.moe_device != "")
+    if str(getattr(args, "speculative_algorithm", "") or "").strip().lower() == "off":
+        # Explicitly disabling speculation takes precedence over saved draft settings.
+        args.mtp = args.dspark = 0
+        args.draft_tokens = -1
+        args.speculative_draft_model_path = ""
+        args.speculative_algorithm = ""
     mtp = _normalize_mtp_arg(getattr(args, "mtp", 0))
     args.mtp = mtp
     speculative_algorithm = str(
@@ -975,7 +981,7 @@ def make_normal_llm_model(args, startup_progress = None):
         args.dspark = dspark_tokens
     if speculative_algorithm and speculative_algorithm not in ("mtp", "dspark", "dflash"):
         raise ValueError(
-            "--speculative_algorithm currently supports mtp, dspark or dflash")
+            "--speculative_algorithm currently supports off, mtp, dspark or dflash")
     if speculative_algorithm == "dspark" and mtp > 0:
         raise ValueError("MTP and DSpark cannot be enabled together")
     if (speculative_algorithm == "dspark" and not speculative_draft_path and
@@ -1184,9 +1190,10 @@ def make_normal_llm_model(args, startup_progress = None):
                 text_model_type in ("qwen3_5_text", "qwen3_5_moe_text")
             )
             is_qwen38_flash_next_model = (
-                architecture == "Qwen3_8FlashNextForConditionalGeneration" or
-                model_type == "qwen3_8_flash_next" or
-                text_model_type == "qwen3_8_flash_next_text"
+                architecture in ("Qwen3_8FlashNextForConditionalGeneration",
+                                 "Qwen4ExpForConditionalGeneration") or
+                model_type in ("qwen3_8_flash_next", "qwen4_exp") or
+                text_model_type in ("qwen3_8_flash_next_text", "qwen4_exp_text")
             )
             is_deepseek_v4_model = (
                 architecture in ("DeepseekV4ForCausalLM",
@@ -1270,9 +1277,9 @@ def make_normal_llm_model(args, startup_progress = None):
                         "embedded DSpark draft weights.",
                         flush=True,
                     )
-                elif not is_qwen35_model:
+                elif not (is_qwen35_model or is_qwen38_flash_next_model):
                     raise ValueError(
-                        "MTP currently requires a Qwen3.5 target, got "
+                        "MTP currently requires a Qwen3.5 or Qwen3.8-Flash-Next target, got "
                         "architecture=%s model_type=%s" %
                         (architecture, model_type))
                 if (not is_deepseek_v4_model and speculative_draft_path and not (

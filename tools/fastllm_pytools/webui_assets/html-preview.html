@@ -1,0 +1,27 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+<body><script>
+// This document has an opaque sandbox origin and cannot access Launcher.
+// Supply temporary Web Storage for self-contained demos that expect it.
+for (const name of ["localStorage", "sessionStorage"]) {
+  const values = new Map();
+  const storage = {
+    get length() { return values.size; },
+    key(index) { return [...values.keys()][index] ?? null; },
+    getItem(key) { return values.get(String(key)) ?? null; },
+    setItem(key, value) { values.set(String(key), String(value)); },
+    removeItem(key) { values.delete(String(key)); },
+    clear() { values.clear(); }
+  };
+  Object.defineProperty(window, name, {value: storage, configurable: true});
+}
+function loadPreview(event) {
+  if (event.source !== parent || event.origin !== new URL(document.URL).origin ||
+      event.data?.type !== "ftllm-html-preview" || typeof event.data.html !== "string") return;
+  window.removeEventListener("message", loadPreview);
+  document.open();
+  document.write(event.data.html);
+  document.close();
+}
+window.addEventListener("message", loadPreview);
+</script></body></html>

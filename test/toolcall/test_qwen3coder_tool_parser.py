@@ -116,8 +116,7 @@ def _collect_stream(chunks, request):
         content += _merge_stream_delta(parsed, calls)
         previous = current
 
-    parsed = parser.extract_tool_calls_streaming(
-        previous, previous, "", [], [], [999], request)
+    parsed = parser.finalize_streaming(request)
     content += _merge_stream_delta(parsed, calls)
     return [calls[index] for index in sorted(calls)], content, parser
 
@@ -409,13 +408,11 @@ class Qwen3CoderToolParserTest(unittest.TestCase):
                     "content": value,
                 })
 
-    def test_non_stream_requires_complete_tool_markup(self):
+    def test_non_stream_requires_complete_function_markup(self):
         request = _request([
             _function_tool("weather", {"city": {"type": "string"}}),
         ], stream=False)
         malformed = [
-            "<tool_call><function=weather><parameter=city>北京</parameter>"
-            "</function>",
             "<tool_call><function=weather><parameter=city>北京</parameter>",
             "<tool_call><function=weather><parameter=city>北京",
             "<tool_call><function=weather></function></tool_call>"
@@ -428,6 +425,79 @@ class Qwen3CoderToolParserTest(unittest.TestCase):
                 result = parser.extract_tool_calls(wire, request)
                 self.assertFalse(result.tools_called)
                 self.assertEqual(result.tool_calls, [])
+
+    def test_missing_outer_close_is_recovered_at_every_chunk_boundary(self):
+        request = _write_request()
+        value = "Keep literal </tool_call> and <think>text</think> in the file."
+        wire = _wire_call("write", [
+            ("filePath", "/tmp/tags.txt"), ("content", value),
+        ]).removesuffix("</tool_call>")
+        for suffix in ("", "\n", "</tool_call"):
+            text = wire + suffix
+            result = Qwen3CoderToolParser(
+                _DummyTokenizer()).extract_tool_calls(text, request)
+            self.assertTrue(result.tools_called)
+            for split in range(1, len(text)):
+                with self.subTest(suffix=suffix, split=split):
+                    calls, content, parser = _collect_stream(
+                        [text[:split], text[split:]], request)
+                    self.assertIsNone(parser.streaming_parse_error())
+                    self.assertEqual(content, "")
+                    self.assertEqual(len(calls), 1)
+                    self.assertEqual(json.loads(calls[0]["arguments"]), {
+                        "filePath": "/tmp/tags.txt", "content": value,
+                    })
+
+    def test_outer_close_recovery_waits_for_eof_and_flushes_once(self):
+        request = _request([_function_tool("ping")])
+        for suffix in ("", "</tool_call>"):
+            with self.subTest(suffix=suffix):
+                parser = FunctionCallParser.from_request(
+                    request, tool_parser_name="qwen3_coder",
+                    tokenizer=_DummyTokenizer())
+                wire = "<tool_call><function=ping></function>"
+                result = parser.parse_stream_chunk(
+                    previous_text="", current_text=wire, delta_text=wire,
+                    previous_token_ids=[], current_token_ids=[],
+                    delta_token_ids=[])
+                self.assertEqual(result.valid_tool_calls, [])
+                if suffix:
+                    result = parser.parse_stream_chunk(
+                        previous_text=wire, current_text=wire + suffix,
+                        delta_text=suffix, previous_token_ids=[],
+                        current_token_ids=[], delta_token_ids=[])
+                self.assertEqual(parser.finalize_stream(), [])
+                self.assertEqual(parser.finalize_stream(), [])
+                flushed = parser.flush_stream_tool_calls()
+                self.assertEqual(
+                    len(result.valid_tool_calls) + len(flushed.valid_tool_calls), 1)
+                self.assertEqual(parser.flush_stream_tool_calls().valid_tool_calls, [])
+
+    def test_empty_chunks_do_not_trigger_eof_recovery(self):
+        request = _request([_function_tool("ping")])
+        for closing_tag in ("", "</tool_call>"):
+            with self.subTest(closing_tag=closing_tag):
+                parser = Qwen3CoderToolParser(_DummyTokenizer())
+                previous = ""
+                calls = {}
+                content = ""
+                for delta in (
+                    "<tool_call><function=ping></function>", "",
+                    "<function=ping></function>" + closing_tag, "",
+                ):
+                    current = previous + delta
+                    parsed = parser.extract_tool_calls_streaming(
+                        previous, current, delta, [], [], [0], request)
+                    if not delta:
+                        self.assertIsNone(parsed)
+                    content += _merge_stream_delta(parsed, calls)
+                    previous = current
+                content += _merge_stream_delta(
+                    parser.finalize_streaming(request), calls)
+                self.assertEqual(content, "")
+                self.assertEqual(len(calls), 2)
+                self.assertEqual([c["name"] for c in calls.values()], ["ping", "ping"])
+                self.assertIsNone(parser.streaming_parse_error())
 
     def test_bare_function_markup_is_plain_content(self):
         request = _request([_function_tool("ping")], stream=False)

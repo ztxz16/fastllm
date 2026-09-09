@@ -368,6 +368,11 @@ namespace fastllm {
 
         virtual long long GetAutoWarmupCudaRuntimeReserveBytes(int deviceId, int batch) const { return 0; }
 
+        // Token-growing pools not present in the target-model warmup caches
+        // (for example an MTP layer). Reserve these before choosing KV pages;
+        // they are materialized only after the final capacity calibration.
+        virtual long long GetAutoWarmupCudaAdditionalCacheBytesPerToken(int deviceId) const { return 0; }
+
         // Fixed per-device CUDA capacity that must still be available after
         // model-specific serving high-water warmup. Unlike runtime reserve,
         // this cost is not multiplied by the active request count.

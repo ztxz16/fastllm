@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ftllm-agent-runtime"
-version = "0.3.2"
+version = "0.3.3"
 description = "Linux and Windows runtime bridge between FastLLM WebUI and Pi Agent"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -37,4 +37,6 @@ ftllm_agent_runtime = [
   "bin/node_modules/**/*",
   "extensions/*.ts",
   "licenses/*",
+  "licenses/agent-tools/*.json",
+  "licenses/agent-tools/*/*",
 ]

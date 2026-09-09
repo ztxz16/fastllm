@@ -39,6 +39,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cuda_fp8.h>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -1024,6 +1025,71 @@ bool FastllmCudaHalfAttention(const fastllm::Data &q, const fastllm::Data &k, co
     // - stride_n (token 之间的 stride) = head_dim
     // - stride_h (head 之间的 stride) = seq_len * head_dim
 #ifdef FASTLLM_ENABLE_FLASHINFER
+    // A single HND query has the same output layout as FlashInfer's NHD
+    // output. Split long KV across CTAs instead of materializing QK and P.
+    // Keep other shapes and graph capture on their existing paths.
+    if (head_dim_qk == 256 && head_dim_vo == 256 && qo_len == 1 &&
+        kv_len > 4096 && actual_batch == 1 && !use_custom_mask && maskType == 0 &&
+        FastllmCudaFlashInferSupported() && !FastllmCudaGraphIsCapturing()) {
+        // Only SM75 CTA16 uses compact FP16 storage. Match the dispatcher's
+        // architecture gate and preserve the original minimum on other GPUs.
+        using MinSplitTraits = KernelTraits<MaskMode::kCausal, 16, 1, 1, 16, 16, 1, 4,
+            PosEncodingMode::kNone, half, half, half, float, int,
+            DefaultAttention<false, false, false, false>, true>;
+        int maxSharedMemory = 0;
+        cudaError_t state = cudaDeviceGetAttribute(&maxSharedMemory,
+            cudaDevAttrMaxSharedMemoryPerBlockOptin, FastllmCudaGetDevice());
+        if (state != cudaSuccess) {
+            throw std::runtime_error(std::string("CUDA split attention device query: ") +
+                                     cudaGetErrorString(state));
+        }
+        // The single-prefill planner uses chunks of at least 256 tokens.
+        // Each chunk stores one output vector and an FP32 LSE per Q head.
+        const size_t maxChunks = ((size_t)kv_len + 255) / 256;
+        const size_t bytesPerChunk = (size_t)num_qo_heads *
+                                    (256 * sizeof(half) + sizeof(float));
+        const auto capability = GetCudaComputeCapability();
+        const size_t minimumSharedMemory =
+            use_sm75_single_prefill_vo_split(capability.first, capability.second,
+                                             num_qo_heads / num_kv_heads)
+                ? sizeof(MinSplitTraits::SharedStorageSingle)
+                : sizeof(MinSplitTraits::SharedStorage);
+        if ((size_t)maxSharedMemory >= minimumSharedMemory &&
+            maxChunks <= std::numeric_limits<size_t>::max() / bytesPerChunk) {
+            void *scratch = nullptr;
+            auto allocation = FastllmCudaTryMalloc(&scratch, maxChunks * bytesPerChunk);
+            if (allocation == FASTLLM_CUDA_TRY_MALLOC_ERROR) {
+                throw std::runtime_error("CUDA error allocating split attention workspace");
+            }
+            if (scratch != nullptr) {
+                auto release = [](half *ptr) {
+                    // The allocator can hand this buffer to another thread.
+                    // Finish the merge before returning it to the pool.
+                    FastllmCudaSyncCurrentThreadStream();
+                    FastllmCudaFree(ptr);
+                };
+                std::unique_ptr<half, decltype(release)> tmp((half*)scratch, release);
+                SinglePrefillParams<half, half, half> params(
+                    qd, kd, vd, nullptr, od, nullptr, nullptr,
+                    num_qo_heads, num_kv_heads, 1, kv_len,
+                    q.strides[1], q.Count(1), k.strides[1], k.Count(1),
+                    256, -1, 0.0f, scale, 1.0f, 10000.0f);
+                // K and V can have different physical capacities after
+                // expansion/rollback; do not derive either stride from kv_len.
+                params.v_stride_n = v.strides[1];
+                params.v_stride_h = v.Count(1);
+                cudaError_t status = SinglePrefillWithKVCacheDispatched<
+                    256, 256, PosEncodingMode::kNone, false, MaskMode::kCausal,
+                    DefaultAttention<false, false, false, false>>(
+                        params, tmp.get(), cudaStreamPerThread);
+                if (status != cudaSuccess) {
+                    throw std::runtime_error(std::string("FlashInfer split attention: ") +
+                                             cudaGetErrorString(status));
+                }
+                return true;
+            }
+        }
+    }
     bool use_flashinfer = (head_dim_qk == 128 && head_dim_vo == 128 && !use_custom_mask) &&
                           FastllmCudaFlashInferSupported();
 #else

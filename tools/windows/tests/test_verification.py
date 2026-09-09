@@ -28,7 +28,8 @@ class WheelVerificationTests(unittest.TestCase):
         }
         for name in ("__init__.py", "cli.py", "llm.py", "launcher.py", "fastllm_tools.dll", "fastllm_triton_server.py",
                      "launcher_assets/index.html", "launcher_assets/locales/zh-CN.json",
-                     "webui_assets/app.js", "webui_assets/template.html"):
+                     "ui_plugins/studio/app.js", "ui_plugins/studio/template.html",
+                     "ui_plugins/models/plugin.json", "plugin_assets/host.js"):
             self.files["ftllm/" + name] = b"test payload"
 
     def write_wheel(self):

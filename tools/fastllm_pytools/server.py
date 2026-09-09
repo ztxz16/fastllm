@@ -172,7 +172,10 @@ async def create_anthropic_message(request: AnthropicMessageRequest,
     generator = await fastllm_completion.create_anthropic_message(
         request, raw_request)
     if isinstance(generator, ErrorResponse):
-        return JSONResponse(content = generator.model_dump(),
+        error_type = {400: "invalid_request_error", 404: "not_found_error"}.get(
+            generator.code, "api_error")
+        return JSONResponse(content = {"type": "error", "error": {
+                                "type": error_type, "message": generator.message}},
                             status_code = generator.code)
     if request.stream:
         return StreamingResponse(content = generator[0],

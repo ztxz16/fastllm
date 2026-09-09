@@ -756,6 +756,9 @@ if (UNIT_TEST)
     target_link_libraries(qwen4_mtp_weights_test PRIVATE fastllm)
     add_test(NAME qwen4_mtp_weights COMMAND qwen4_mtp_weights_test)
 
+    add_executable(qwen35_paged_cache_test test/basic/test_qwen35_paged_cache.cpp)
+    add_test(NAME qwen35_paged_cache COMMAND qwen35_paged_cache_test)
+
     add_executable(nvfp4_planar_test test/basic/test_nvfp4_planar.cpp)
     target_link_libraries(nvfp4_planar_test PRIVATE fastllm)
     add_test(NAME nvfp4_planar COMMAND nvfp4_planar_test)
@@ -766,6 +769,35 @@ if (UNIT_TEST)
     target_link_libraries(contextExtensionRegression fastllm)
     add_test(NAME context_extension_cpu COMMAND contextExtensionRegression)
     if (USE_CUDA AND NOT USE_ROCM)
+        add_executable(qwen35_mtp_tp_test test/basic/test_qwen35_mtp_tp.cpp)
+        target_link_libraries(qwen35_mtp_tp_test PRIVATE fastllm)
+        add_test(NAME qwen35_mtp_tp COMMAND qwen35_mtp_tp_test)
+        # The fused P2P residual reduction requires at least 4096 elements.
+        # Keep the broader small-model suite and exercise that path separately.
+        add_executable(qwen35_mtp_tp_wide_test test/basic/test_qwen35_mtp_tp.cpp)
+        target_compile_definitions(qwen35_mtp_tp_wide_test PRIVATE FASTLLM_TEST_MTP_WIDTH=4096)
+        target_link_libraries(qwen35_mtp_tp_wide_test PRIVATE fastllm)
+        add_test(NAME qwen35_mtp_tp_wide COMMAND qwen35_mtp_tp_wide_test --smoke)
+        set_tests_properties(qwen35_mtp_tp qwen35_mtp_tp_wide
+                             PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        add_executable(qwen35_mtp_sample_row_test test/basic/test_qwen35_mtp_sample_row.cpp)
+        target_link_libraries(qwen35_mtp_sample_row_test PRIVATE fastllm)
+        add_test(NAME qwen35_mtp_sample_row COMMAND qwen35_mtp_sample_row_test)
+        add_test(NAME qwen35_mtp_sample_row_moe COMMAND qwen35_mtp_sample_row_test --moe)
+        add_test(NAME qwen35_mtp_sample_row_causal COMMAND qwen35_mtp_sample_row_test --causal)
+        add_test(NAME qwen35_mtp_cache_rollback COMMAND qwen35_mtp_sample_row_test --rollback)
+        add_test(NAME qwen35_mtp_paged_pool COMMAND qwen35_mtp_sample_row_test --paged-pool)
+        set_tests_properties(qwen35_mtp_sample_row qwen35_mtp_sample_row_moe
+                             qwen35_mtp_sample_row_causal qwen35_mtp_cache_rollback qwen35_mtp_paged_pool
+                             PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+
+        add_executable(qwen35_streaming_weights_test test/basic/test_qwen35_streaming_weights.cpp)
+        target_link_libraries(qwen35_streaming_weights_test PRIVATE fastllm)
+        add_test(NAME qwen35_streaming_tp_weights COMMAND qwen35_streaming_weights_test)
+        add_test(NAME qwen35_streaming_single_gpu_weights COMMAND qwen35_streaming_weights_test --single)
+        set_tests_properties(qwen35_streaming_tp_weights qwen35_streaming_single_gpu_weights
+                             PROPERTIES LABELS cuda SKIP_RETURN_CODE 77)
+
         target_include_directories(regressionOps PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         target_include_directories(contextExtensionRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         add_test(NAME context_extension_cuda COMMAND contextExtensionRegression --cuda)
@@ -773,6 +805,26 @@ if (UNIT_TEST)
     endif()
 
     if (USE_CUDA AND NOT USE_ROCM)
+        add_executable(cuda_fp8_verify_test test/basic/test_cuda_fp8_verify.cpp)
+        target_link_libraries(cuda_fp8_verify_test PRIVATE fastllm)
+        target_include_directories(cuda_fp8_verify_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME cuda_fp8_verify COMMAND cuda_fp8_verify_test)
+        set_tests_properties(cuda_fp8_verify PROPERTIES LABELS cuda SKIP_RETURN_CODE 77)
+
+        add_executable(cuda_single_query_attention_test test/basic/test_cuda_single_query_attention.cpp)
+        target_link_libraries(cuda_single_query_attention_test PRIVATE fastllm)
+        target_include_directories(cuda_single_query_attention_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME cuda_single_query_attention COMMAND cuda_single_query_attention_test)
+        set_tests_properties(cuda_single_query_attention PROPERTIES LABELS cuda SKIP_RETURN_CODE 77)
+
+        add_executable(cuda_single_prefill_dispatch_test test/basic/test_cuda_single_prefill_dispatch.cu)
+        target_include_directories(cuda_single_prefill_dispatch_test PRIVATE third_party)
+        set_target_properties(cuda_single_prefill_dispatch_test PROPERTIES
+            CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON
+            CUDA_ARCHITECTURES "${FASTLLM_CUDA_ARCHITECTURES}")
+        add_test(NAME cuda_single_prefill_dispatch COMMAND cuda_single_prefill_dispatch_test)
+        set_tests_properties(cuda_single_prefill_dispatch PROPERTIES LABELS cuda SKIP_RETURN_CODE 77)
+
         add_executable(cudaGgufChunkedDequantRegression test/ops/cudaGgufChunkedDequantRegression.cu)
         target_link_libraries(cudaGgufChunkedDequantRegression PRIVATE fastllm)
         target_include_directories(cudaGgufChunkedDequantRegression PRIVATE src/devices/cuda)
@@ -863,6 +915,39 @@ if (UNIT_TEST)
         target_include_directories(qwen4QSASelectRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         add_test(NAME qwen4QSASelect COMMAND qwen4QSASelectRegression)
         set_tests_properties(qwen4QSASelect PROPERTIES LABELS cuda TIMEOUT 180 SKIP_RETURN_CODE 77)
+
+        add_executable(qwen4TpSamplingRegression test/ops/qwen4TpSamplingRegression.cpp)
+        target_link_libraries(qwen4TpSamplingRegression fastllm)
+        target_include_directories(qwen4TpSamplingRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME qwen4TpSampling COMMAND qwen4TpSamplingRegression)
+        set_tests_properties(qwen4TpSampling PROPERTIES LABELS cuda TIMEOUT 60 SKIP_RETURN_CODE 77)
+
+        add_executable(qwen4TpMtpCollectiveRegression test/ops/qwen4TpMtpCollectiveRegression.cpp)
+        target_link_libraries(qwen4TpMtpCollectiveRegression fastllm)
+        target_include_directories(qwen4TpMtpCollectiveRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME qwen4TpMtpCollective COMMAND qwen4TpMtpCollectiveRegression)
+        set_tests_properties(qwen4TpMtpCollective PROPERTIES
+            LABELS "cuda;multigpu" TIMEOUT 180 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+
+        add_executable(qwen4Tp2MtpCollectiveRegression test/ops/qwen4TpMtpCollectiveRegression.cpp)
+        target_compile_definitions(qwen4Tp2MtpCollectiveRegression PRIVATE FASTLLM_TEST_TP_RANKS=2)
+        target_link_libraries(qwen4Tp2MtpCollectiveRegression fastllm)
+        target_include_directories(qwen4Tp2MtpCollectiveRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME qwen4Tp2MtpCollective COMMAND qwen4Tp2MtpCollectiveRegression)
+        set_tests_properties(qwen4Tp2MtpCollective PROPERTIES
+            LABELS "cuda;multigpu" TIMEOUT 180 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+
+        add_executable(bf16MoeRegression test/ops/bf16MoeRegression.cpp)
+        target_link_libraries(bf16MoeRegression fastllm)
+        target_include_directories(bf16MoeRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME bf16Moe COMMAND bf16MoeRegression)
+        set_tests_properties(bf16Moe PROPERTIES LABELS cuda TIMEOUT 180 SKIP_RETURN_CODE 77)
+
+        add_executable(qwen4HyperMixRegression test/ops/qwen4HyperMixRegression.cpp)
+        target_link_libraries(qwen4HyperMixRegression fastllm)
+        target_include_directories(qwen4HyperMixRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME qwen4HyperMix COMMAND qwen4HyperMixRegression)
+        set_tests_properties(qwen4HyperMix PROPERTIES LABELS cuda TIMEOUT 180 SKIP_RETURN_CODE 77)
 
         add_executable(ncclOddTpRegression test/ops/ncclOddTpRegression.cu)
         target_link_libraries(ncclOddTpRegression fastllm)

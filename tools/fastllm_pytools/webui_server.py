@@ -164,6 +164,7 @@ class GenerationControl:
 
 
 def add_webui_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    parser.add_argument("--plugins-dir", default="", help="用户界面插件目录")
     parser.add_argument(
         "model", nargs="?", default="",
         help="模型路径，用于推导默认 API 模型名；可省略并从 /v1/models 发现")
@@ -587,13 +588,15 @@ class WebUIRuntime:
         if preference == "builtin":
             return
         try:
-            from ftllm_agent_runtime import PiAgentRuntime
+            from .agent_runtime_install import load_pi_agent_runtime
+            PiAgentRuntime = load_pi_agent_runtime()
         except (ImportError, OSError) as error:
             self.pi_agent_error = str(error)
             if preference == "pi":
                 raise RuntimeError(
-                    "已请求 Pi 代码智能体，但未安装可用的 "
-                    "ftllm-agent-runtime wheel") from error
+                    "已请求 Pi 代码智能体，但运行时尚不可用。请打开 "
+                    "ftllm launch → 工作室 → 安装 Agent 依赖，或安装配套 "
+                    "ftllm-agent-runtime wheel。") from error
             return
         self.pi_agent_class = PiAgentRuntime
         self.agent_runtime = "pi"
@@ -2290,12 +2293,21 @@ class WebUIRuntime:
 def create_app(args: argparse.Namespace):
     from fastapi import FastAPI, HTTPException, Request
     from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
-    from fastapi.staticfiles import StaticFiles
+    try:
+        from .ui_plugins import PluginRegistry, install_plugin_routes, mount_studio_assets
+        from .ui_hardware import detect_hardware
+    except ImportError:
+        from ui_plugins import PluginRegistry, install_plugin_routes, mount_studio_assets
+        from ui_hardware import detect_hardware
 
     runtime = WebUIRuntime(args)
     app = FastAPI(title=getattr(args, "title", "FastLLM"), docs_url=None,
                   redoc_url=None)
     app.state.runtime = runtime
+    plugins = getattr(args, "ui_plugin_registry", None) or PluginRegistry(getattr(args, "plugins_dir", ""))
+    app.state.plugins = plugins
+    install_plugin_routes(app, plugins, lambda: runtime.api_client, hardware=detect_hardware,
+                          runtime_state=lambda: {"modelName": runtime.api_client.model_name})
 
     @app.exception_handler(WebUIClosedError)
     async def closed_session(request: Request, error: WebUIClosedError):
@@ -2354,8 +2366,28 @@ def create_app(args: argparse.Namespace):
             )
         return HTMLResponse(page, headers=headers)
 
-    app.mount("/assets/webui", StaticFiles(directory=str(
-        Path(__file__).with_name("webui_assets"))), name="webui-assets")
+    @app.get("/html-preview", response_class=FileResponse)
+    def html_preview():
+        # A separate response avoids weakening the application's CSP. Both the
+        # header and iframe sandbox prevent preview scripts from accessing it.
+        return FileResponse(
+            Path(__file__).with_name("webui_assets") / "html-preview.html",
+            media_type="text/html",
+            headers={
+                "Content-Security-Policy": (
+                    "default-src 'none'; script-src 'unsafe-inline'; "
+                    "style-src 'unsafe-inline'; img-src data: blob:; "
+                    "media-src data: blob:; font-src data:; connect-src 'none'; "
+                    "object-src 'none'; frame-src 'none'; base-uri 'none'; "
+                    "frame-ancestors 'self'; form-action 'none'; sandbox allow-scripts"
+                ),
+                "Cache-Control": "no-store",
+                "Referrer-Policy": "no-referrer",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
+    mount_studio_assets(app)
 
     @app.get("/assets/webui_locales.js", response_class=FileResponse)
     def webui_locales():

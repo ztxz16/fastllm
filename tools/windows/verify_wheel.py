@@ -85,7 +85,8 @@ def inspect_wheel(archive, *, version=None, backend=None):
         require(actual_backend == backend, f"Expected {backend} wheel, found {actual_backend}")
     required = ["__init__.py", "cli.py", "llm.py", "launcher.py", "fastllm_tools.dll",
                 "fastllm_triton_server.py", "launcher_assets/index.html",
-                "launcher_assets/locales/zh-CN.json", "webui_assets/app.js", "webui_assets/template.html"]
+                "launcher_assets/locales/zh-CN.json", "ui_plugins/studio/app.js",
+                "ui_plugins/studio/template.html", "ui_plugins/models/plugin.json", "plugin_assets/host.js"]
     if actual_backend == "cuda":
         required.append("fastllm_tools-cpu.dll")
     for name in required:

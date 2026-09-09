@@ -908,8 +908,20 @@ void LaunchFastllmGemmFp16FP8E4M3(half *input, uint8_t *weight, half *output, ha
         return;
     }
 
+    // SM89 small-row verification benefits from more blocks and lower
+    // register pressure. Two/three input rows favor one output per warp;
+    // four through eight favor two. Preserve each output's accumulation order.
+    const bool narrowSm89 = n >= 2 && n <= 8 && useBlock128 &&
+                            FastllmCudaRuntimeArch() == 89;
 #define FASTLLM_FP8_WARP_LAUNCH(PARTVAL, AOFF, COFF) do { \
-    if (useBlock128) { \
+    if (narrowSm89) { \
+        constexpr bool smallPart = (PARTVAL == 2 || PARTVAL == 3); \
+        constexpr int tunedW = smallPart ? 4 : 2; \
+        constexpr int tunedRows = smallPart ? 1 : 2; \
+        FastllmGemvHalfFP8E4M3KernelWarpMultiRowBlock128<tunedW, PARTVAL, tunedRows> \
+            <<< (k + 3) / 4, tunedW * 32 >>>( \
+                input + (AOFF) * m, weight, output + (COFF) * k, bias, scales, m, k); \
+    } else if (useBlock128) { \
         FastllmGemvHalfFP8E4M3KernelWarpMultiRowBlock128<W, PARTVAL, ROWS> <<< grid, W * 32 >>>( \
             input + (AOFF) * m, weight, output + (COFF) * k, bias, scales, m, k); \
     } else { \

@@ -41,15 +41,15 @@ void Run(const std::vector<int> &devices, int dtype, int count, int root, bool i
         // partition's sequence must resume correctly after it was skipped.
         const int counts[] = {count, 1, (int)(81920 / sizeof(T)) + 1,
                               (int)(32768 / sizeof(T)) + 1};
-        return counts[op];
+        return counts[op % 4];
     };
     // No allocation may synchronize a device while its peer graph is waiting.
     for (int r = 0; r < 2; ++r) {
         Check(cudaSetDevice(devices[r]));
         Check(cudaMallocHost((void **)&hostIn[r], bytes));
-        Check(cudaMallocHost((void **)&hostOut[r], bytes * 4));
-        Check(cudaMalloc((void **)&send[r], bytes + offset * sizeof(T)));
-        Check(cudaMalloc((void **)&recv[r], bytes + offset * sizeof(T)));
+        Check(cudaMallocHost((void **)&hostOut[r], bytes * 6));
+        Check(cudaMalloc((void **)&send[r], bytes * 2 + offset * sizeof(T)));
+        Check(cudaMalloc((void **)&recv[r], bytes * 2 + offset * sizeof(T)));
         send[r] += offset;
         recv[r] += offset;
         Check(cudaDeviceSynchronize());
@@ -61,11 +61,12 @@ void Run(const std::vector<int> &devices, int dtype, int count, int root, bool i
         // Recapture on the same transport without resetting its GPU counters.
         for (int capture = 0; capture < 2; ++capture) {
             Require(FastllmCudaGraphBeginCapture(), "begin capture failed");
-            for (int op = 0; op < 4; ++op) {
+            for (int op = 0; op < 5; ++op) {
                 const int elements = operationCount(op);
-                Check(cudaMemcpyAsync(send[rank], hostIn[rank], bytes, cudaMemcpyHostToDevice,
-                                      cudaStreamPerThread));
                 T *destination = inPlace ? send[rank] : recv[rank];
+                T *input = op == 4 && inPlace ? destination + rank * elements : send[rank];
+                Check(cudaMemcpyAsync(input, hostIn[rank], bytes, cudaMemcpyHostToDevice,
+                                      cudaStreamPerThread));
                 if (op == 0)
                     FastllmNcclAllReduce(send[rank], destination, elements, dtype, devices[rank]);
                 else if (op == 1)
@@ -74,11 +75,15 @@ void Run(const std::vector<int> &devices, int dtype, int count, int root, bool i
                 else if (op == 2)
                     FastllmNcclBroadcastFrom(send[rank], destination, elements, dtype, devices[root],
                                              devices[rank]);
-                else
+                else if (op == 3)
                     FastllmNcclReduce(send[rank], destination, elements, dtype, devices[root],
                                       devices[rank]);
+                else
+                    Require(FastllmNcclAllGather(input, destination, elements, dtype, devices[rank]),
+                            "allgather capture failed");
                 if (op != 3 || rank == root)
-                    Check(cudaMemcpyAsync(hostOut[rank] + op * count, destination, bytes,
+                    Check(cudaMemcpyAsync(hostOut[rank] + op * count, destination,
+                                          op == 4 ? elements * sizeof(T) * 2 : bytes,
                                           cudaMemcpyDeviceToHost, cudaStreamPerThread));
             }
             Require(!FastllmCudaGetThreadError(), "collective capture reported an error");
@@ -97,13 +102,14 @@ void Run(const std::vector<int> &devices, int dtype, int count, int root, bool i
                     std::this_thread::sleep_for(std::chrono::milliseconds(3));
                 Require(FastllmCudaGraphLaunch(exec), "launch failed");
                 Check(cudaStreamSynchronize(cudaStreamPerThread));
-                for (int op = 0; op < 4; ++op) {
+                for (int op = 0; op < 5; ++op) {
                     if (op == 3 && rank != root)
                         continue;
-                    for (int i = 0; i < operationCount(op); ++i) {
-                        T expected =
-                            op == 2 ? value(root, i)
-                                    : FromFloat<T>(ToFloat(value(0, i)) + ToFloat(value(1, i)));
+                    const int elements = operationCount(op);
+                    for (int i = 0; i < elements * (op == 4 ? 2 : 1); ++i) {
+                        T expected = op == 4 ? value(i / elements, i % elements)
+                            : op == 2 ? value(root, i)
+                                      : FromFloat<T>(ToFloat(value(0, i)) + ToFloat(value(1, i)));
                         if (ToFloat(hostOut[rank][op * count + i]) != ToFloat(expected)) {
                             if (errors.fetch_add(1) == 0)
                                 std::cerr << "Mismatch dtype=" << dtype << " count=" << count
@@ -199,8 +205,7 @@ int main() {
         Types<int8_t>(devices, fastllm::DataType::INT8);
         Types<int32_t>(devices, fastllm::DataType::INT32);
     }
-    std::cout << "PASS: mapped-host collective graph regression; 122,880 collective generations per "
-                 "rank\n";
+    std::cout << "PASS: mapped-host collective graph regression including rank-ordered AllGather\n";
     return 0;
 #endif
 }

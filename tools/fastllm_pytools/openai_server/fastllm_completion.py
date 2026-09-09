@@ -20,6 +20,7 @@ from urllib.request import urlopen
 
 import shortuuid
 from fastapi import Request
+from jinja2.exceptions import TemplateError
 from openai.types.chat import (ChatCompletionContentPartParam,
                                ChatCompletionRole)
 from PIL import Image
@@ -27,6 +28,11 @@ from starlette.background import BackgroundTask
 
 from .protocal.openai_protocol import *
 from .protocal.anthropic_protocol import *
+
+try:
+    from ..generation_errors import PromptTooLongError
+except ImportError:
+    from generation_errors import PromptTooLongError
 
 try:
     from ..gemma4_multimodal import (
@@ -390,11 +396,11 @@ class FastLLmCompletion:
       if effort is None:
           effort = template_kwargs.get(
               "thinking_effort", template_kwargs.get("reasoning_effort"))
-      if effort is None:
+      if effort in {None, "none"}:
           effort = "max"
       if effort not in {"low", "high", "max"}:
           raise ValueError(
-              "Kimi K3 reasoning_effort must be one of: low, high, max")
+              "Kimi K3 reasoning_effort must be one of: none, low, high, max")
       return effort
 
   def _resolve_qwen3_5_reasoning_effort(
@@ -407,11 +413,11 @@ class FastLLmCompletion:
       if effort is None:
           effort = template_kwargs.get(
               "reasoning_effort", template_kwargs.get("thinking_effort"))
-      if effort is None:
+      if effort in {None, "none"}:
           effort = "xhigh"
       if effort not in {"low", "medium", "xhigh"}:
           raise ValueError(
-              "Qwen reasoning_effort must be one of: low, medium, xhigh")
+              "Qwen reasoning_effort must be one of: none, low, medium, xhigh")
       return effort
 
   def _resolve_glm5_next_reasoning_effort(
@@ -424,11 +430,11 @@ class FastLLmCompletion:
       if effort is None:
           effort = template_kwargs.get(
               "reasoning_effort", template_kwargs.get("thinking_effort"))
-      if effort is None:
+      if effort in {None, "none"}:
           effort = "max"
       if effort not in {"low", "high", "max"}:
           raise ValueError(
-              "GLM-5.3 reasoning_effort must be one of: low, high, max")
+              "GLM-5.3 reasoning_effort must be one of: none, low, high, max")
       return effort
 
   def _resolve_chat_template_kwargs(
@@ -1668,6 +1674,8 @@ class FastLLmCompletion:
       self,
       result: str,
       request: ChatCompletionRequest,
+      *,
+      finish_reason: Optional[str] = None,
   ) -> Union[ErrorResponse, ExtractedToolCallInformation]:
       if not request.tools:
           return ExtractedToolCallInformation(
@@ -1677,7 +1685,7 @@ class FastLLmCompletion:
           )
 
       parser = self._create_function_call_parser(request)
-      parsed = parser.parse_non_stream(result)
+      parsed = parser.parse_non_stream(result, finish_reason=finish_reason)
       if parsed.has_invalid_tool_block:
           diagnostics = self._format_tool_call_diagnostics(parsed.diagnostics)
           logging.warning("Invalid non-stream tool call rejected: %s",
@@ -1692,6 +1700,26 @@ class FastLLmCompletion:
           tool_calls = parsed.valid_tool_calls,
           content = parsed.content,
       )
+
+  def _normalize_anthropic_system_messages(
+      self, conversation: List[ConversationMessage],
+  ) -> List[ConversationMessage]:
+      # Local model templates commonly require a single leading system message.
+      # Consolidate only explicit system instructions, in their original order;
+      # user messages and tool results keep their roles and relative positions.
+      system_parts: List[Dict[str, Any]] = []
+      messages: List[ConversationMessage] = []
+      for message in conversation:
+          if message.role != "system":
+              messages.append(message)
+          elif isinstance(message.content, str):
+              system_parts.append({"type": "text", "text": message.content})
+          elif message.content:
+              system_parts.extend(message.content)
+      if system_parts:
+          messages.insert(0, ConversationMessage(
+              role = "system", content = self._build_message_content(system_parts)))
+      return messages
 
   def _parse_anthropic_message_content(
       self,
@@ -2654,9 +2682,20 @@ class FastLLmCompletion:
               if "error" in data:
                   for event_data in ensure_response_started():
                       yield event_data
-                  yield next_event("error", {
-                      "error": data["error"],
-                  })
+                  # Responses clients (including Codex) need a terminal
+                  # response.failed object; a Chat-style error envelope alone
+                  # is otherwise reported as an unexpectedly closed stream.
+                  response = self._responses_response_object(
+                      request, response_id, created_at, "failed", [], usage,
+                      output_text = output_text or None,
+                  )
+                  error = data["error"]
+                  response.error = {
+                      "code": ("context_length_exceeded" if error.get("type") == "context_length_exceeded"
+                               else "server_error"),
+                      "message": error.get("message", "Generation failed."),
+                  }
+                  yield next_event("response.failed", {"response": response.model_dump()})
                   return
 
               response_id = data.get("id", response_id)
@@ -2817,6 +2856,7 @@ class FastLLmCompletion:
               conversation.extend(messages)
               media.extend(message_media)
 
+          conversation = self._normalize_anthropic_system_messages(conversation)
           if len(conversation) == 0:
               raise Exception("Empty msg")
 
@@ -2852,6 +2892,29 @@ class FastLLmCompletion:
       frequency_penalty = default_gen['repetition_penalty']
       max_length = request.max_tokens if request.max_tokens else 32768
 
+      # Claude Code sends effort through Anthropic output_config. Resolve it
+      # with the same model-specific rules as Chat Completions, and use the
+      # same template arguments for token counting and generation.
+      try:
+          reasoning_request = ChatCompletionRequest(
+              model=request.model, messages=[{"role": "user", "content": ""}],
+              reasoning_effort=(request.output_config or {}).get("effort"))
+          thinking_effort = self._resolve_kimi_k3_reasoning_effort(reasoning_request)
+          template_kwargs = self._resolve_chat_template_kwargs(
+              reasoning_request, self._resolve_qwen3_5_reasoning_effort(reasoning_request),
+              self._resolve_glm5_next_reasoning_effort(reasoning_request))
+          enable_thinking = self.enable_thinking
+          if reasoning_request.reasoning_effort is not None:
+              enable_thinking = reasoning_request.reasoning_effort != "none"
+          if request.thinking is not None:
+              thinking_type = request.thinking.get("type")
+              if thinking_type not in {"enabled", "adaptive", "disabled"}:
+                  raise ValueError("thinking.type must be enabled, adaptive, or disabled")
+              enable_thinking = thinking_type != "disabled"
+      except ValueError as error:
+          self._cleanup_temp_paths(media.temp_paths)
+          return self.create_error_response(str(error))
+
       if request.stop_sequences:
           logging.warning("Anthropic stop_sequences are not supported yet and will be ignored.")
 
@@ -2863,10 +2926,12 @@ class FastLLmCompletion:
       try:
           input_token_len = self._compute_multimodal_input_token_len(
               messages,
-              enable_thinking = self.enable_thinking,
+              enable_thinking = enable_thinking,
               images = model_images,
               videos = model_videos,
-              tools = model_tools)
+              tools = model_tools,
+              thinking_effort = thinking_effort,
+              chat_template_kwargs = template_kwargs)
           launch_kwargs = {
               "max_length": max_length,
               "min_length": 0,
@@ -2877,15 +2942,25 @@ class FastLLmCompletion:
               "repeat_penalty": frequency_penalty,
               "tools": model_tools,
               "one_by_one": True,
-              "enable_thinking": self.enable_thinking,
+              "enable_thinking": enable_thinking,
               "images": model_images,
               "videos": model_videos,
           }
+          if template_kwargs is not None:
+              launch_kwargs["chat_template_kwargs"] = template_kwargs
+          if self._is_kimi_k3_model():
+              launch_kwargs["thinking_effort"] = thinking_effort
           if parser_request is not None:
               self._attach_tool_call_constraint_if_supported(
                   launch_kwargs, parser_request)
           handle = self.model.launch_stream_response(
               messages, **launch_kwargs)
+      except (ValueError, TemplateError) as error:
+          # Deterministic input/template failures must reach the SDK as a 400.
+          # An uncaught exception becomes a 500, which Claude Code retries.
+          return self.create_error_response(
+              f"Could not prepare model input: {error}",
+              err_type = "invalid_request_error")
       finally:
           self._cleanup_temp_paths(media.temp_paths)
       self.conversation_handles[request_id] = handle
@@ -2905,6 +2980,9 @@ class FastLLmCompletion:
                   request, raw_request, handle, result_generator, request_id,
                   input_token_len, parser_request,
                   response_statistics = response_statistics)
+          except PromptTooLongError as e:
+              self._release_conversation_handle(request_id, handle)
+              return self.create_error_response(str(e))
           except ValueError as e:
               return self.create_error_response(str(e))
 
@@ -2997,6 +3075,8 @@ class FastLLmCompletion:
       stop_token_ids = self._stop_token_ids_from_strings(stop_strings)
 
       enable_thinking = self.enable_thinking
+      if request.reasoning_effort is not None:
+          enable_thinking = request.reasoning_effort != "none"
       if request.chat_template_kwargs and "enable_thinking" in request.chat_template_kwargs:
           enable_thinking = bool(request.chat_template_kwargs["enable_thinking"])
       try:
@@ -3119,6 +3199,9 @@ class FastLLmCompletion:
                   input_token_len, think = need_think_prefix,
                   emit_reasoning_content = emit_reasoning_content,
                   response_statistics = response_statistics)
+          except PromptTooLongError as e:
+              self._release_conversation_handle(request_id, handle)
+              return self.create_error_response(str(e))
           except ValueError as e:
               return self.create_error_response(str(e))
 
@@ -3198,7 +3281,10 @@ class FastLLmCompletion:
           handle, response_statistics, input_token_len, completion_tokens)
       output_tokens = usage.completion_tokens or 0
 
-      tool_call_info = self._parse_non_stream_tool_calls(result, request)
+      finish_reason = self._chat_finish_reason(
+          output_tokens, request.max_tokens or 32768, stopped_by_stop_string)
+      tool_call_info = self._parse_non_stream_tool_calls(
+          result, request, finish_reason=finish_reason)
       if isinstance(tool_call_info, ErrorResponse):
           if request_id in self.conversation_handles:
               del self.conversation_handles[request_id]
@@ -3225,9 +3311,7 @@ class FastLLmCompletion:
                   reasoning_content=reasoning_content or None,
               ),
               logprobs=None,
-              finish_reason=self._chat_finish_reason(
-                  output_tokens, request.max_tokens or 32768,
-                  stopped_by_stop_string),
+              finish_reason=finish_reason,
           )
 
       response = ChatCompletionResponse(
@@ -3518,7 +3602,8 @@ class FastLLmCompletion:
             stopped_by_stop_string)
         final_stream_error_data = None
         if request.tools and tool_call_parser:
-            final_diagnostics = tool_call_parser.finalize_stream()
+            final_diagnostics = tool_call_parser.finalize_stream(
+                finish_reason=finish_reason)
             if final_diagnostics:
                 diagnostics = self._format_tool_call_diagnostics(
                     final_diagnostics)
@@ -3537,7 +3622,8 @@ class FastLLmCompletion:
                     f"Invalid tool call: {diagnostics}",
                     err_type = "invalid_tool_call",
                 )
-            elif tool_call_parser.has_valid_streamed_tool_calls:
+            elif (tool_call_parser.has_valid_streamed_tool_calls
+                  and not tool_call_parser.incomplete_tool_call):
                 finish_reason = 'tool_calls'
         if final_stream_error_data is not None:
             data = final_stream_error_data
@@ -3593,9 +3679,14 @@ class FastLLmCompletion:
                 yield f"data: {flush_data}\n\n"
         yield f"data: {data}\n\n"
       except ValueError as e:
-        if self._abort_conversation_handle(request_id, handle):
+        # A native context error is terminal: fetching it already freed the
+        # backend handle, which another request may have reused.
+        if isinstance(e, PromptTooLongError):
+          self._release_conversation_handle(request_id, handle)
+        elif self._abort_conversation_handle(request_id, handle):
           logging.info(f"Abort failed streaming request: {request_id}")
-        data = self.create_streaming_error_response(str(e))
+        data = self.create_streaming_error_response(
+            str(e), err_type = "context_length_exceeded" if isinstance(e, PromptTooLongError) else "BadRequestError")
         yield f"data: {data}\n\n"
         await asyncio.sleep(0)
 
@@ -3827,7 +3918,9 @@ class FastLLmCompletion:
               "message_stop",
               MessageStopEvent())
       except ValueError as e:
-          if self._abort_conversation_handle(request_id, handle):
+          if isinstance(e, PromptTooLongError):
+              self._release_conversation_handle(request_id, handle)
+          elif self._abort_conversation_handle(request_id, handle):
               logging.info(f"Abort failed Anthropic streaming request: {request_id}")
           error_data = json.dumps({
               "type": "error",
@@ -3846,12 +3939,10 @@ class FastLLmCompletion:
           message: str,
           err_type: str = "BadRequestError",
           status_code: HTTPStatus = HTTPStatus.BAD_REQUEST) -> str:
-      json_str = json.dumps({
-          "error":
-          self.create_error_response(message=message,
-                                      err_type=err_type,
-                                      status_code=status_code).model_dump()
-      })
+      error = self.create_error_response(message=message, err_type=err_type,
+                                         status_code=status_code).model_dump()
+      error["type"] = err_type
+      json_str = json.dumps({"error": error})
       return json_str
 
   def abort_conversation(self, conversation_id: str) -> bool:
