@@ -784,6 +784,13 @@ if (UNIT_TEST)
         add_test(NAME qwen4TpSampling COMMAND qwen4TpSamplingRegression)
         set_tests_properties(qwen4TpSampling PROPERTIES LABELS cuda TIMEOUT 60 SKIP_RETURN_CODE 77)
 
+        add_executable(qwen4TpMtpCollectiveRegression test/ops/qwen4TpMtpCollectiveRegression.cpp)
+        target_link_libraries(qwen4TpMtpCollectiveRegression fastllm)
+        target_include_directories(qwen4TpMtpCollectiveRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME qwen4TpMtpCollective COMMAND qwen4TpMtpCollectiveRegression)
+        set_tests_properties(qwen4TpMtpCollective PROPERTIES
+            LABELS "cuda;multigpu" TIMEOUT 180 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+
         add_executable(bf16MoeRegression test/ops/bf16MoeRegression.cpp)
         target_link_libraries(bf16MoeRegression fastllm)
         target_include_directories(bf16MoeRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

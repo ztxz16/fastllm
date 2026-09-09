@@ -632,6 +632,9 @@ bool FastllmCudaQwen4HyperCombineRMSNorm(
     fastllm::Data &normalized,
     float eps, int groups,
     fastllm::Data *normalizedStorage = nullptr);
+// Merges rank-major TopK(..., 1) pairs using Qwen4's existing tie order.
+bool FastllmCudaQwen4MergeTpGreedy(const float *candidates, int *output,
+                                 float *floatOutput, int vocabulary, int ranks);
 bool FastllmCudaQwen4QSASelect(const fastllm::Data &query,
                                const fastllm::Data &compressedKeys,
                                fastllm::Data &indices, int keyLength,

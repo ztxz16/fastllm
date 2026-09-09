@@ -10,6 +10,55 @@
 
 using namespace fastllm;
 
+static void Check(cudaError_t status) {
+    if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+}
+
+static void CheckDeviceMerge(std::vector<float> candidates, int vocabulary, int ranks,
+                              int expected) {
+    Data input(FLOAT32, {ranks, 2}, candidates), token(INT32, {1}), value(FLOAT32, {1});
+    for (Data *data : {&input, &token, &value}) {
+        data->ToDevice(DataDevice::CUDA, std::vector<int>{0});
+        data->Allocate(false);
+    }
+    auto run = [&]() {
+        if (!FastllmCudaQwen4MergeTpGreedy((float *)input.cudaData,
+                (int *)token.cudaData, (float *)value.cudaData, vocabulary, ranks))
+            throw std::runtime_error("device candidate merge failed");
+    };
+    auto verify = [&](int reference) {
+        int id; float idFloat;
+        Check(cudaMemcpy(&id, token.cudaData, sizeof(id), cudaMemcpyDeviceToHost));
+        Check(cudaMemcpy(&idFloat, value.cudaData, sizeof(idFloat), cudaMemcpyDeviceToHost));
+        if (id != reference || idFloat != (float)reference)
+            throw std::runtime_error("device TP greedy differs from host TopK merge");
+    };
+    run(); verify(expected);
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+    run();
+    Check(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+    Check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+    for (int turn = 0; turn < 3; ++turn) {
+        std::pair<int, float> best;
+        for (int rank = 0; rank < ranks; ++rank) {
+            if (turn == 1) candidates[rank * 2 + 1] = (float)rank;
+            if (turn == 2) candidates[rank * 2 + 1] = 17.0f;
+            const int id = (int)(candidates[rank * 2] + 1e-3f) +
+                qwen4_tp::VocabRange(vocabulary, ranks, rank).first;
+            const float score = candidates[rank * 2 + 1];
+            if (rank == 0 || qwen4_tp::Top1Before(id, score, best.first, best.second))
+                best = {id, score};
+        }
+        Check(cudaMemcpy(input.cudaData, candidates.data(), input.GetBytes(), cudaMemcpyHostToDevice));
+        Check(cudaGraphLaunch(exec, cudaStreamPerThread));
+        verify(best.first);
+    }
+    Check(cudaGraphExecDestroy(exec));
+    Check(cudaGraphDestroy(graph));
+}
+
 static std::pair<int, float> Top1(const std::vector<float> &values,
                                   int begin, int end) {
     Data input(FLOAT32, {1, end - begin},
@@ -60,6 +109,7 @@ int main() {
                 }
                 auto expected = Top1(values, 0, vocabulary);
                 std::pair<int, float> actual;
+                std::vector<float> candidates(ranks * 2);
                 int previousEnd = 0;
                 for (int r = 0; r < ranks; ++r) {
                     auto range = qwen4_tp::VocabRange(vocabulary, ranks, r);
@@ -67,6 +117,8 @@ int main() {
                         range.second <= range.first) throw std::runtime_error("invalid shard range");
                     previousEnd = range.second;
                     auto candidate = Top1(values, range.first, range.second);
+                    candidates[r * 2] = (float)(candidate.first - range.first);
+                    candidates[r * 2 + 1] = candidate.second;
                     if (r == 0 || qwen4_tp::Top1Before(candidate.first, candidate.second,
                                                        actual.first, actual.second)) actual = candidate;
                 }
@@ -76,9 +128,11 @@ int main() {
                               << " actual=" << actual.first << '\n';
                     throw std::runtime_error("sharded top1 differs from full CUDA TopK");
                 }
+                CheckDeviceMerge(candidates, vocabulary, ranks, expected.first);
                 ++checks;
             }
         }
     }
-    std::cout << "PASS: " << checks << " CUDA top1 comparisons, including ties/NaNs/infinities/tails\n";
+    std::cout << "PASS: " << checks << " CUDA top1 comparisons and device merges, "
+                 "including ties/NaNs/infinities/tails and changing graph inputs\n";
 }

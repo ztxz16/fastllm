@@ -7236,14 +7236,20 @@ namespace fastllm {
 
         MtpDraftCudaGraphState::Segment *draftGraphSegment = nullptr;
         std::unique_lock<std::mutex> draftGraphLock;
+        bool deviceSampling = false;
 #ifdef USE_CUDA
-        const bool deviceDraftGraph =
-            sequence == 1 && sampledTokenOffset > 0 && deviceTokenIds != nullptr &&
+        deviceSampling = sampleToken && sampledTokenOffset >= 0 &&
             sampledTokenIds != nullptr && sampledTokenValues != nullptr &&
             sampledTokenIds->dataDevice == DataDevice::CUDA &&
+            sampledTokenIds->dataType == DataType::INT32 &&
             sampledTokenIds->cudaData != nullptr &&
+            sampledTokenIds->Count(0) > (uint64_t)sampledTokenOffset &&
             sampledTokenValues->dataDevice == DataDevice::CUDA &&
-            sampledTokenValues->cudaData != nullptr;
+            sampledTokenValues->dataType == DataType::FLOAT32 &&
+            sampledTokenValues->cudaData != nullptr &&
+            sampledTokenValues->Count(0) > (uint64_t)sampledTokenOffset;
+        const bool deviceDraftGraph = threadTpRank < 0 && deviceSampling &&
+            sequence == 1 && sampledTokenOffset > 0 && deviceTokenIds != nullptr;
         const bool tpDraftGraph = threadTpRank >= 0 && sequence <= 4 &&
             !this->mtpMoeWeights.empty() &&
             !FastllmCudaUseMoeHybrid(this->mtpMoeWeights.data(), this->mtpMoeWeights.size());
@@ -7272,8 +7278,12 @@ namespace fastllm {
                 if (state.draftGraphState->device != device) {
                     state.draftGraphState->Reset(device);
                 }
-                draftGraphSegment =
-                    &state.draftGraphState->segments[tpDraftGraph ? -sequence : sampledTokenOffset];
+                // Device chaining writes a different proposal slot at each
+                // step. Keep separate graphs instead of recapturing row 1.
+                const int segmentKey = tpDraftGraph
+                    ? -sequence - 4 * (deviceSampling ? sampledTokenOffset + 1 : 0)
+                    : sampledTokenOffset;
+                draftGraphSegment = &state.draftGraphState->segments[segmentKey];
             }
         }
 #endif
@@ -7387,7 +7397,7 @@ namespace fastllm {
         const std::string finalPrefix = "mtp.hyper_connection_mixer.";
         Data afterAttention, mlpNorm, mlpInput, mlpInjection, mlpOutput;
         Data localMultiHidden, finalNorm, sampleHidden, lastHidden;
-        Data localLogits, headLogits, top, halfHeadInput;
+        Data localLogits, headLogits, top, halfHeadInput, tpCandidates;
         Data &logits = draftGraphSegment == nullptr
             ? localLogits : draftGraphSegment->logits;
         Data &multiHidden = draftGraphSegment != nullptr
@@ -7447,26 +7457,34 @@ namespace fastllm {
             Linear(*headInput, draftLmHead, Data(), headLogits);
             ToDataType(headLogits, logits, DataType::FLOAT32);
 #ifdef USE_CUDA
-            if (sampledTokenIds != nullptr &&
-                sampledTokenValues != nullptr &&
-                sampledTokenOffset >= 0 &&
-                logits.dataDevice == DataDevice::CUDA &&
-                logits.dataType == DataType::FLOAT32 &&
-                logits.cudaData != nullptr &&
-                sampledTokenIds->dataDevice == DataDevice::CUDA &&
-                sampledTokenIds->dataType == DataType::INT32 &&
-                sampledTokenIds->cudaData != nullptr &&
-                sampledTokenIds->Count(0) >
-                    (uint64_t)sampledTokenOffset &&
-                sampledTokenValues->dataDevice == DataDevice::CUDA &&
-                sampledTokenValues->dataType == DataType::FLOAT32 &&
-                sampledTokenValues->cudaData != nullptr &&
-                sampledTokenValues->Count(0) >
-                    (uint64_t)sampledTokenOffset) {
+            if (deviceSampling && logits.dataDevice == DataDevice::CUDA &&
+                logits.dataType == DataType::FLOAT32 && logits.cudaData != nullptr) {
                 int *sampledId = reinterpret_cast<int *>(
                     sampledTokenIds->cudaData) + sampledTokenOffset;
                 float *sampledValue = reinterpret_cast<float *>(
                     sampledTokenValues->cudaData) + sampledTokenOffset;
+#ifndef USE_ROCM
+                if (threadTpRank >= 0) {
+                    auto &tp = *threadTpOwner;
+                    const int device = tp.devices[threadTpRank];
+                    TopK(logits, top, 1);
+                    AssertInFastLLM(Qwen4PrepareDecodeGraphWorkspace(
+                        tpCandidates, DataType::FLOAT32,
+                        {(int)tp.devices.size(), 2}, device),
+                        "Qwen4 TP draft candidates could not be allocated.");
+                    const bool capturing = FastllmCudaGraphIsCapturingFast();
+                    if (!capturing) tp.Barrier();
+                    const bool gathered = FastllmNcclAllGather(
+                        top.cudaData, tpCandidates.cudaData, 2,
+                        DataType::FLOAT32, device);
+                    if (!capturing) tp.Barrier();
+                    AssertInFastLLM(gathered && FastllmCudaQwen4MergeTpGreedy(
+                        reinterpret_cast<const float *>(tpCandidates.cudaData),
+                        sampledId, sampledValue, tp.vocabSize, tp.devices.size()),
+                        "Qwen4 TP draft device sampling failed.");
+                    return true;
+                }
+#endif
                 if (FastllmCudaGreedySamplingWithFloatOutput(
                         reinterpret_cast<float *>(logits.cudaData),
                         sampledId, sampledValue, 1,
@@ -7492,6 +7510,7 @@ namespace fastllm {
                 (uint64_t)(uintptr_t)attentionInjection.cudaData,
                 (uint64_t)(uintptr_t)(sampledTokenIds == nullptr ? nullptr : sampledTokenIds->cudaData),
                 (uint64_t)(uintptr_t)(sampledTokenValues == nullptr ? nullptr : sampledTokenValues->cudaData),
+                (uint64_t)(deviceSampling ? sampledTokenOffset + 1 : 0),
                 (uint64_t)(nextMultiHidden != nullptr),
                 (uint64_t)projectedHidden.dataType,
                 projectedHidden.Count(0),
@@ -7675,7 +7694,8 @@ namespace fastllm {
             postAttentionReady = runPostAttention();
         }
 
-        if (!sampleToken || (threadTpRank < 0 && postAttentionReady)) {
+        if (!sampleToken || (postAttentionReady &&
+            (threadTpRank < 0 || deviceSampling))) {
             // CUDA draft sampling stays chained on the request stream. The
             // host materializes the compact proposal ids only after the
             // complete autoregressive chain.
@@ -10227,7 +10247,17 @@ namespace fastllm {
 #ifdef USE_CUDA
             Data &tokenEmbedding = this->weight[
                 languagePrefix + "embed_tokens.weight"];
-            if (threadTpRank < 0 && draftCount > 0 &&
+            bool chainBackend = threadTpRank < 0;
+#ifndef USE_ROCM
+            chainBackend = chainBackend ||
+                (threadTpOwner != nullptr && threadTpOwner->vocabSize > 0 &&
+                 Qwen4CudaOnlyDeviceMap(this->deviceMap) &&
+                 Qwen4CudaOnlyDeviceMap(this->moeDeviceMap) &&
+                 Qwen4CudaOnlyDeviceMap(this->layeredMoeDeviceMap) &&
+                 !this->mtpMoeWeights.empty() &&
+                 !FastllmCudaUseMoeHybrid(this->mtpMoeWeights.data(), this->mtpMoeWeights.size()));
+#endif
+            if (chainBackend && draftCount > 0 &&
                 targetHidden.dataDevice == DataDevice::CUDA &&
                 targetHidden.cudaData != nullptr &&
                 tokenEmbedding.dataDevice == DataDevice::CUDA &&
@@ -10243,6 +10273,7 @@ namespace fastllm {
                         sampledTokenValues, DataType::FLOAT32,
                         {draftCount}, device);
             }
+            deviceChain = ThreadTpAllTrue(deviceChain);
 #endif
             const int first = RunMtpDraft(
                 mtp, targetHidden, tokens, positions,

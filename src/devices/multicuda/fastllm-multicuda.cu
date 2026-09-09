@@ -3222,6 +3222,31 @@ void FastllmNcclAllReduceNoCustom(void* data, void* dest, int count,
     FastllmNcclAllReduceImpl(data, dest, count, dataType, deviceId, false);
 }
 
+bool FastllmNcclAllGather(const void* data, void* dest, int count,
+                         int dataType, int deviceId) {
+    ncclComm_t comm = FindNcclCommNoLog(deviceId);
+    ncclDataType_t type = ncclFloat;
+    if (data == nullptr || dest == nullptr || count <= 0 || comm == nullptr ||
+        !FastllmNcclResolveDataType(dataType, type, "AllGather")) {
+        FastllmCudaSetThreadError();
+        return false;
+    }
+    const cudaStream_t stream = cudaStreamPerThread;
+    const ncclResult_t result = ncclAllGather(data, dest, count, type, comm, stream);
+    if (result != ncclSuccess) {
+        printf("Error: ncclAllGather failed on device %d: %s\n",
+               deviceId, ncclGetErrorString(result));
+        FastllmCudaSetThreadError();
+        return false;
+    }
+    if (FastllmNcclPostSyncEnabled(stream)) {
+        const cudaError_t state = cudaStreamSynchronize(stream);
+        checkCudaErrors("Error: CUDA error when synchronizing NCCL allgather!", state);
+        return state == cudaSuccess;
+    }
+    return true;
+}
+
 // Sums all ranks but materializes the result only on root.  This is preferable
 // to AllReduce for hybrid single-CUDA + EP execution, whose next operator
 // consumes only the layer-owning GPU's output.
