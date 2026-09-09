@@ -557,11 +557,11 @@ def _configure_qwen35_auto_fast_paths(args, is_qwen35_model: bool, mtp: int):
     """Select tested Qwen3.5 CUDA fast paths without deployment env vars.
 
     Environment variables remain authoritative debugging overrides, except
-    --low_gpu_mem always disables CUDA embedding and GPU token handoff. The
-    automatic path is limited to ordinary single-GPU CUDA or CUDA thread TP,
-    no MTP or external DFlash, and no --low mode. DFlash keeps the
-    embedding table on the host by default; its target and draft paths share
-    one table dtype and only transfer the selected hidden rows.
+    --low_gpu_mem always disables CUDA embedding and GPU token handoff.
+    Graph defaults cover ordinary decode, MTP and DFlash verification on
+    single-GPU CUDA or CUDA thread TP, outside --low mode. Model code still
+    decides whether each shape supports capture. Automatic GPU token handoff
+    remains limited to ordinary decode.
     """
     tp_arg = getattr(args, "tp", "")
     device = getattr(args, "device", "")
@@ -569,10 +569,11 @@ def _configure_qwen35_auto_fast_paths(args, is_qwen35_model: bool, mtp: int):
         getattr(args, "speculative_algorithm", "") or "").strip().lower()
     cuda_execution = (_uses_thread_tp(tp_arg) or
                       _uses_single_cuda_device(device))
-    eligible = (is_qwen35_model and mtp == 0 and
-                speculative_algorithm != "dflash" and
-                not bool(getattr(args, "low", False)) and
-                cuda_execution and _uses_cuda_device(device))
+    graph_eligible = (is_qwen35_model and
+                      not bool(getattr(args, "low", False)) and
+                      cuda_execution and _uses_cuda_device(device))
+    ordinary_decode = (graph_eligible and mtp == 0 and
+                       speculative_algorithm != "dflash")
 
     handoff_env = "FASTLLM_GPU_TOKEN_HANDOFF"
     low_gpu_mem = bool(getattr(args, "low_gpu_mem", False))
@@ -584,9 +585,9 @@ def _configure_qwen35_auto_fast_paths(args, is_qwen35_model: bool, mtp: int):
             "disabled; CUDA graph selection is unchanged.",
             flush=True,
         )
-    low_memory_gguf = eligible and _qwen35_gguf_needs_low_memory_fast_paths(
+    low_memory_gguf = graph_eligible and _qwen35_gguf_needs_low_memory_fast_paths(
         args)
-    if eligible and "FASTLLM_CUDA_GRAPH" not in os.environ:
+    if graph_eligible and "FASTLLM_CUDA_GRAPH" not in os.environ:
         # Decode graph capture itself is small enough for the large-GGUF
         # configuration.  The material VRAM cost comes from implicitly moving
         # the vocabulary embedding/output tensors to CUDA.
@@ -599,7 +600,7 @@ def _configure_qwen35_auto_fast_paths(args, is_qwen35_model: bool, mtp: int):
                 "CUDA device must have compute capability greater than 7.5.",
                 flush=True,
             )
-    if eligible and handoff_env not in os.environ:
+    if ordinary_decode and handoff_env not in os.environ:
         os.environ[handoff_env] = "0" if low_memory_gguf else "1"
     if low_memory_gguf:
         print(
@@ -620,11 +621,11 @@ def _configure_qwen35_auto_fast_paths(args, is_qwen35_model: bool, mtp: int):
 
     graph_batch_env = "FASTLLM_QWEN35_CUDA_GRAPH_MAX_BATCH"
     requested_batch = int(getattr(args, "max_batch", -1) or -1)
-    if (eligible and graph_enabled and requested_batch > 0 and
+    if (ordinary_decode and graph_enabled and requested_batch > 0 and
             graph_batch_env not in os.environ):
         os.environ[graph_batch_env] = str(min(requested_batch, 64))
 
-    if eligible:
+    if graph_eligible:
         print(
             "[Fastllm] Qwen3.5 auto fast paths: cuda_graph=%s, "
             "gpu_token_handoff=%s, cuda_embedding=%s, graph_max_batch=%s."

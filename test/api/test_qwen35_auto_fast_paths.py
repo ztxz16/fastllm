@@ -269,30 +269,63 @@ class Qwen35AutoFastPathsTest(unittest.TestCase):
                 "FASTLLM_QWEN35_CUDA_GRAPH_MAX_BATCH", os.environ)
             self.assertFalse(args.cuda_embedding)
 
-    def test_does_not_enable_handoff_for_mtp(self):
-        with patch.dict(os.environ, {}, clear=True):
+    def test_mtp_defaults_to_graph_without_token_handoff(self):
+        with patch.dict(os.environ, {}, clear=True), patch(
+                "fastllm_pytools.util._cuda_graph_auto_supported",
+                return_value=True):
             args = _configure_qwen35_auto_fast_paths(
                 _args(), is_qwen35_model=True, mtp=1)
 
-            self.assertNotIn("FASTLLM_CUDA_GRAPH", os.environ)
+            self.assertEqual(os.environ["FASTLLM_CUDA_GRAPH"], "1")
             self.assertNotIn(
                 "FASTLLM_GPU_TOKEN_HANDOFF", os.environ)
-            self.assertFalse(args.cuda_embedding)
+            self.assertTrue(args.cuda_embedding)
 
-    def test_does_not_enable_fast_paths_for_dflash(self):
-        with patch.dict(os.environ, {}, clear=True):
+    def test_dflash_defaults_to_graph_without_token_handoff(self):
+        with patch.dict(os.environ, {}, clear=True), patch(
+                "fastllm_pytools.util._cuda_graph_auto_supported",
+                return_value=True):
             args = _configure_qwen35_auto_fast_paths(
                 _args(speculative_algorithm="dflash"),
                 is_qwen35_model=True,
                 mtp=0,
             )
 
-            self.assertNotIn("FASTLLM_CUDA_GRAPH", os.environ)
+            self.assertEqual(os.environ["FASTLLM_CUDA_GRAPH"], "1")
             self.assertNotIn(
                 "FASTLLM_GPU_TOKEN_HANDOFF", os.environ)
             self.assertNotIn(
                 "FASTLLM_QWEN35_CUDA_GRAPH_MAX_BATCH", os.environ)
-            self.assertFalse(args.cuda_embedding)
+            self.assertTrue(args.cuda_embedding)
+
+    def test_speculative_graph_respects_disable_and_low_mode(self):
+        for mtp, algorithm in ((3, ""), (0, "dflash")):
+            for low, overrides in ((False, {"FASTLLM_CUDA_GRAPH": "0"}),
+                                   (True, {})):
+                with self.subTest(mtp=mtp, algorithm=algorithm, low=low), patch.dict(
+                        os.environ, overrides, clear=True), patch(
+                        "fastllm_pytools.util._cuda_graph_auto_supported") as probe:
+                    args = _configure_qwen35_auto_fast_paths(
+                        _args(low=low, speculative_algorithm=algorithm),
+                        is_qwen35_model=True, mtp=mtp)
+                    probe.assert_not_called()
+                    self.assertEqual(dict(os.environ), overrides)
+                    self.assertFalse(args.cuda_embedding)
+
+    def test_speculative_graph_keeps_large_gguf_embedding_on_host(self):
+        for mtp, algorithm in ((3, ""), (0, "dflash")):
+            with self.subTest(mtp=mtp, algorithm=algorithm), patch.dict(
+                    os.environ, {}, clear=True), patch(
+                    "fastllm_pytools.util._cuda_graph_auto_supported",
+                    return_value=True), patch(
+                    "fastllm_pytools.util._qwen35_gguf_needs_low_memory_fast_paths",
+                    return_value=True):
+                args = _configure_qwen35_auto_fast_paths(
+                    _args(speculative_algorithm=algorithm),
+                    is_qwen35_model=True, mtp=mtp)
+                self.assertEqual(os.environ["FASTLLM_CUDA_GRAPH"], "1")
+                self.assertNotIn("FASTLLM_GPU_TOKEN_HANDOFF", os.environ)
+                self.assertFalse(args.cuda_embedding)
 
     def test_does_not_change_other_models(self):
         with patch.dict(os.environ, {}, clear=True):

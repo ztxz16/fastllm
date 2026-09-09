@@ -9,12 +9,13 @@ Windows 在 `USE_CUDA=ON`、`USE_NCCL=OFF` 时，可以自动使用映射主机�
 以支持 TP 和 Graph 的 Qwen 模型为例：
 
 ```powershell
-$env:FASTLLM_CUDA_GRAPH = "1"
 ftllm run D:\models\Qwen3.8-27B-FP8 --tp 2 --dtype auto
 ```
 
 只沿用已有的 `FASTLLM_CUDA_GRAPH` 开关，通信实现自动选择。设为 `0` 可关闭
-Graph。`mapped-host TP2 CUDA Graph collectives: self-test passed` 表示该 GPU
+Graph。Python/CLI 启动符合硬件条件的 Qwen3.5/3.6/3.8 CUDA 模型时，普通解码、
+MTP 和 DFlash 验证默认开启该开关；显式设置和 `--low` 等现有边界继续有效。
+`mapped-host TP2 CUDA Graph collectives: self-test passed` 表示该 GPU
 组已通过通信自检，不等同于模型已捕获 Graph；模型的图模式仍受形状等条件限制。
 
 - 仅 Windows NVIDIA CUDA、两个不同 GPU，设备需支持映射主机内存且计算能力
@@ -70,14 +71,12 @@ Qwen3.5/3.6/3.8 dense 模型的单请求 DFlash2 验证阶段可复用 MTP 的 G
 每卡需要 80 KiB 通信，落在上述范围内。block 包含 anchor，实际 draft token 数为 7。
 
 ```powershell
-$env:FASTLLM_CUDA_GRAPH = "1"
 ftllm run D:\models\Qwen3.8-27B-FP8 --tp 2 --dtype auto `
-  --draft D:\models\Qwen3.8-27B-DFlash2 --draft_tokens 7 --max_batch 1 --cuda_embedding
+  --draft D:\models\Qwen3.8-27B-DFlash2 --draft_tokens 7 --max_batch 1
 ```
 
-普通解码、MTP 和 DFlash 验证共用 `FASTLLM_CUDA_GRAPH` 总开关；不再读取
-`FASTLLM_QWEN35_MTP_VERIFY_CUDA_GRAPH`。日志中的 `DFlash2 verify CUDA graph captured`
-表示目标验证图捕获成功。draft 生成仍按现有路径执行。
+日志中的 `DFlash2 verify CUDA graph captured` 表示目标验证图捕获成功。
+draft 生成仍按现有路径执行。
 
 Graph 持有固定地址的隐藏状态输出；发布的借用视图在下一次 prefill 前可解除引用，
 draft 做类型转换时使用独立数据。batch>1 的 DFlash、显式 exact verify、worker profiling
