@@ -24,6 +24,8 @@ namespace {
 constexpr int NVFP4_GROUP_SIZE = 16;
 constexpr int NVFP4_MARLIN_CONVERT_MAX_M = 8;
 constexpr int NVFP4_MARLIN_OUTPUT_ALIGNMENT = 64;
+constexpr int NVFP4_MARLIN_LARGE_OUTPUT_ALIGNMENT = 256;
+constexpr int NVFP4_MARLIN_LARGE_OUTPUT_MIN_N = 4096;
 
 static bool Nvfp4MarlinArchitectureSupported() {
 #ifdef CUDA_NO_TENSOR_CORE
@@ -62,12 +64,19 @@ static bool HasNvfp4MarlinOnDevice(const fastllm::Data &weight) {
 }
 
 static bool GetNvfp4MarlinPackedOutputDim(int logicalN, int &packedN) {
+    // Large-M Marlin prefers an N=256 tile. Fused projections such as
+    // QKVZ+BA otherwise land on N=64 even though nearly all columns belong
+    // to the large projection. For large N, at most 192 extra columns over
+    // the existing 64 alignment unlock the wider tile. Keep small shards
+    // compact, and make the layout independent of M: small-M warmup repacks
+    // the same weights that subsequent prefill and decode calls consume.
+    const int alignment = logicalN >= NVFP4_MARLIN_LARGE_OUTPUT_MIN_N
+        ? NVFP4_MARLIN_LARGE_OUTPUT_ALIGNMENT : NVFP4_MARLIN_OUTPUT_ALIGNMENT;
     if (logicalN <= 0 ||
-        logicalN > INT_MAX - (NVFP4_MARLIN_OUTPUT_ALIGNMENT - 1)) {
+        logicalN > INT_MAX - (alignment - 1)) {
         return false;
     }
-    packedN = ((logicalN + NVFP4_MARLIN_OUTPUT_ALIGNMENT - 1) /
-               NVFP4_MARLIN_OUTPUT_ALIGNMENT) * NVFP4_MARLIN_OUTPUT_ALIGNMENT;
+    packedN = ((logicalN + alignment - 1) / alignment) * alignment;
     return true;
 }
 
