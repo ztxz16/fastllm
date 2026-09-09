@@ -670,6 +670,17 @@ if (UNIT_TEST)
     target_link_libraries(contextExtensionRegression fastllm)
     add_test(NAME context_extension_cpu COMMAND contextExtensionRegression)
     if (USE_CUDA AND NOT USE_ROCM)
+        add_executable(qwen35_mtp_tp_test test/basic/test_qwen35_mtp_tp.cpp)
+        target_link_libraries(qwen35_mtp_tp_test PRIVATE fastllm)
+        add_test(NAME qwen35_mtp_tp COMMAND qwen35_mtp_tp_test)
+        # The fused P2P residual reduction requires at least 4096 elements.
+        # Keep the broader small-model suite and exercise that path separately.
+        add_executable(qwen35_mtp_tp_wide_test test/basic/test_qwen35_mtp_tp.cpp)
+        target_compile_definitions(qwen35_mtp_tp_wide_test PRIVATE FASTLLM_TEST_MTP_WIDTH=4096)
+        target_link_libraries(qwen35_mtp_tp_wide_test PRIVATE fastllm)
+        add_test(NAME qwen35_mtp_tp_wide COMMAND qwen35_mtp_tp_wide_test --smoke)
+        set_tests_properties(qwen35_mtp_tp qwen35_mtp_tp_wide
+                             PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
         add_executable(qwen35_mtp_sample_row_test test/basic/test_qwen35_mtp_sample_row.cpp)
         target_link_libraries(qwen35_mtp_sample_row_test PRIVATE fastllm)
         add_test(NAME qwen35_mtp_sample_row COMMAND qwen35_mtp_sample_row_test)

@@ -593,6 +593,11 @@ namespace fastllm {
     void Qwen3_5Model::MtpKvCache::Truncate(int tokens) {
         AssertInFastLLM(tokens >= 0 && tokens <= this->tokens,
                         "Invalid MTP paged KV rollback length.\n");
+        if (!shards.empty()) {
+            for (auto &entry : shards) entry.second->Truncate(tokens);
+            SetTpLength(tokens, key.dims[0], key.dims[2], key.dataType);
+            return;
+        }
         for (Data *cache : {&key, &value}) {
             if (cache->dims.empty()) continue;
             AssertInFastLLM(cache->isPagedKVCache && cache->pagedKVCacheData != nullptr,
@@ -607,6 +612,16 @@ namespace fastllm {
             cache->pagedKVCacheData->ReleasePageIndices(released);
         }
         this->tokens = tokens;
+    }
+
+    void Qwen3_5Model::MtpKvCache::SetTpLength(
+            int length, int heads, int headDim, DataType type) {
+        for (Data *meta : {&key, &value}) {
+            meta->dataType = type;
+            meta->UpdateUnitSize();
+            meta->Resize({heads, length, headDim});
+        }
+        tokens = length;
     }
 
     static bool Qwen35DisableBatchPrefill() {
@@ -9036,11 +9051,15 @@ namespace fastllm {
         if (!HasDFlashWeights() && !Qwen35MtpDisabledByEnv() &&
             Qwen35MtpDraftsPerStep() > 0 && HasMtpWeights() &&
             GetQwen35GPUForwardDevices(this->deviceMap, devices, ratios) &&
-            !devices.empty() && devices.front() == deviceId) {
-            // The MTP transformer is on the first device, including all its
-            // KV heads, even when the target and draft LM head use TP.
-            return GetDataBytes(this->dataType, 1,
-                                (long long)2 * num_key_value_heads * head_dim);
+            !devices.empty()) {
+            int heads = devices.front() == deviceId ? num_key_value_heads : 0;
+            if (UseMtpBackboneTp(devices)) {
+                auto scheme = BuildQwen35GatedAttentionQkvScheme(devices, ratios,
+                    num_attention_heads, num_key_value_heads, head_dim);
+                heads = Qwen35LocalHeads(ExtractQwen35AttentionKVHeadScheme(
+                    scheme, num_attention_heads * head_dim * 2, head_dim), deviceId);
+            }
+            return GetDataBytes(this->dataType, 1, (long long)2 * heads * head_dim);
         }
 #endif
         return 0;
@@ -9048,6 +9067,7 @@ namespace fastllm {
 
     Qwen3_5Model::MtpPagedCachePool &Qwen3_5Model::GetMtpPagedCachePool(
             int device, const Data &shape) const {
+        std::lock_guard<std::mutex> guard(mtpPagedCachePoolMutex);
         AssertInFastLLM(shape.dims.size() == 3, "Invalid MTP paged pool shape.\n");
         auto found = mtpPagedCachePools.find(device);
         if (found != mtpPagedCachePools.end()) {
@@ -9090,12 +9110,91 @@ namespace fastllm {
         return *inserted.first->second;
     }
 
+    bool Qwen3_5Model::SnapshotMtpPagedCache(const MtpKvCache &cache, Data &key, Data &value) const {
+#ifdef USE_CUDA
+        if (cache.shards.empty()) {
+            return Qwen35SnapshotCopyTensor(cache.key, key) && Qwen35SnapshotCopyTensor(cache.value, value);
+        }
+        if (cache.tokens <= 0) {
+            return false;
+        }
+        for (Data *dst : {&key, &value}) {
+            dst->dataType = cache.key.dataType;
+            dst->UpdateUnitSize();
+            dst->Resize({num_key_value_heads, cache.tokens, head_dim});
+            dst->Allocate();
+        }
+        const size_t rowBytes = GetDataBytes(key.dataType, cache.tokens, head_dim);
+        for (const auto &entry : cache.shards) {
+            if (entry.second->tokens != cache.tokens) {
+                return false;
+            }
+            Data k, v;
+            if (!Qwen35SnapshotCopyTensor(entry.second->key, k) ||
+                !Qwen35SnapshotCopyTensor(entry.second->value, v)) {
+                return false;
+            }
+            int local = 0;
+            for (auto range : mtpTpKvHeadScheme.at(entry.first)) {
+                for (int h = range.first; h < range.second; ++h) {
+                    std::memcpy(key.cpuData + h * rowBytes, k.cpuData + local * rowBytes, rowBytes);
+                    std::memcpy(value.cpuData + h * rowBytes, v.cpuData + local * rowBytes, rowBytes);
+                    ++local;
+                }
+            }
+        }
+        return true;
+#else
+        return false;
+#endif
+    }
+
     bool Qwen3_5Model::RestoreMtpPagedSnapshot(
             MtpKvCache &cache, const Data &key, const Data &value, int device) const {
 #ifdef USE_CUDA
         if (key.dims.size() != 3 || key.dims != value.dims ||
             key.dataType != value.dataType || key.cpuData == nullptr ||
             value.cpuData == nullptr || key.dims[1] <= 0) return false;
+        if (mtpTpPrepared && key.dims[0] == num_key_value_heads && cache.shards.empty()) {
+            for (int gpu : mtpTpDevices) {
+                const int heads = Qwen35LocalHeads(mtpTpKvHeadScheme, gpu);
+                if (heads == 0) {
+                    continue;
+                }
+                auto &shard = cache.shards[gpu];
+                shard.reset(new MtpKvCache());
+                // Restore the leaf explicitly so a rank holding all heads
+                // cannot recursively re-enter the full-head TP branch.
+                for (int begin = 0; begin < key.dims[1]; begin += 128) {
+                    const int count = std::min(128, key.dims[1] - begin);
+                    Data k(key.dataType), v(value.dataType);
+                    for (int which = 0; which < 2; ++which) {
+                        const Data &src = which ? value : key;
+                        Data &dst = which ? v : k;
+                        dst.Resize({heads, count, head_dim});
+                        dst.Allocate();
+                        const size_t rowBytes = GetDataBytes(src.dataType, count, head_dim);
+                        int localHead = 0;
+                        for (auto range : mtpTpKvHeadScheme.at(gpu)) {
+                            for (int h = range.first; h < range.second; ++h) {
+                                const size_t offset =
+                                    GetDataBytes(src.dataType, 1,
+                                                 (size_t)h * src.strides[0] + (size_t)begin * src.strides[1]);
+                                std::memcpy(dst.cpuData + localHead++ * rowBytes, src.cpuData + offset,
+                                            rowBytes);
+                            }
+                        }
+                        dst.ToDevice(DataDevice::CUDA, {gpu}, true);
+                    }
+                    Qwen35ScopedGenericExecutor rankExecutor("cuda:" + std::to_string(gpu));
+                    FastllmCudaSetDevice(gpu);
+                    auto &pool = GetMtpPagedCachePool(gpu, k);
+                    shard->Append(k, v, pool.key, pool.value);
+                }
+            }
+            cache.SetTpLength(key.dims[1], num_key_value_heads, head_dim, key.dataType);
+            return true;
+        }
         Qwen35ScopedGenericExecutor executor("cuda:" + std::to_string(device));
         FastllmCudaSetDevice(device);
         auto &pool = GetMtpPagedCachePool(device, key);
@@ -9409,22 +9508,26 @@ namespace fastllm {
             if (GetQwen35GPUForwardDevices(this->deviceMap, devices, ratios) &&
                 !devices.empty()) {
                 int device = devices[0];
-                PrepareMtpWeightsForDevice(device, false);
+                if (UseMtpBackboneTp(devices)) PrepareMtpTpWeights(devices);
+                else PrepareMtpWeightsForDevice(device, false);
                 printf("[Qwen3.5 MTP] warmup: device=cuda:%d.\n", device);
                 fflush(stdout);
             }
         }
         // Materialize the actual paged-attention workspace before final KV
-        // calibration. The draft has all query heads on one GPU, so its
-        // persistent split workspace may differ from a TP-local target's.
+        // calibration. Each rank uses its actual local head count, including
+        // uneven head assignments; empty attention ranks need no workspace.
         // A temporary one-page pool avoids allocating the final token pool
         // before its budget has been decided.
         std::vector<int> pagedDevices;
         std::map<int, int> pagedRatios;
         if (GetQwen35GPUForwardDevices(this->deviceMap, pagedDevices, pagedRatios) &&
-            !pagedDevices.empty() &&
-            GetAutoWarmupCudaAdditionalCacheBytesPerToken(pagedDevices.front()) > 0) {
-            const int device = pagedDevices.front();
+            !pagedDevices.empty()) {
+          for (int device : pagedDevices) {
+            const long long bytes = GetAutoWarmupCudaAdditionalCacheBytesPerToken(device);
+            if (bytes == 0) continue;
+            const int localKvHeads = bytes / GetDataBytes(this->dataType, 1, 2 * head_dim);
+            const int localQHeads = localKvHeads * (num_attention_heads / num_key_value_heads);
             struct DeviceGuard {
                 int previous = FastllmCudaGetDevice();
                 ~DeviceGuard() { FastllmCudaSetDevice(previous); }
@@ -9438,13 +9541,13 @@ namespace fastllm {
                 manager->UpdateUnitSize();
                 manager->directMemory = true;
                 manager->ToDevice(DataDevice::CUDA, {device}, false);
-                manager->Resize({1, GetPageLen(), num_key_value_heads, head_dim});
+                manager->Resize({1, GetPageLen(), localKvHeads, head_dim});
                 manager->Allocate();
                 manager->pageLen = GetPageLen();
                 manager->SetMaxPages(1);
             }
-            Data k(this->dataType, {num_key_value_heads, 1, head_dim});
-            Data q(this->dataType, {num_attention_heads, 1, head_dim});
+            Data k(this->dataType, {localKvHeads, 1, head_dim});
+            Data q(this->dataType, {localQHeads, 1, head_dim});
             for (Data *data : {&k, &q}) {
                 data->Allocate(0.0f);
                 data->ToDevice(DataDevice::CUDA, {device}, true);
@@ -9461,6 +9564,7 @@ namespace fastllm {
                                 1.0f / std::sqrt((float)head_dim), 1, false);
             ForceDeviceSync();
             printf("[Qwen3.5 MTP] paged attention workspace materialized before KV calibration on GPU %d.\n", device);
+          }
         }
         mtpCudaServingWarmupPrepared = true;
 #endif
@@ -9592,10 +9696,14 @@ namespace fastllm {
         std::vector<int> mtpDevices;
         std::map<int, int> mtpRatios;
         if (GetQwen35GPUForwardDevices(this->deviceMap, mtpDevices, mtpRatios) &&
-            !mtpDevices.empty() &&
-            GetAutoWarmupCudaAdditionalCacheBytesPerToken(mtpDevices.front()) > 0) {
-            Data shape(this->dataType, {num_key_value_heads, 1, head_dim});
-            GetMtpPagedCachePool(mtpDevices.front(), shape);
+            !mtpDevices.empty()) {
+            for (int device : mtpDevices) {
+                const long long bytes = GetAutoWarmupCudaAdditionalCacheBytesPerToken(device);
+                if (bytes == 0) continue;
+                const int heads = bytes / GetDataBytes(this->dataType, 1, 2 * head_dim);
+                Data shape(this->dataType, {heads, 1, head_dim});
+                GetMtpPagedCachePool(device, shape);
+            }
         }
 #endif
     }
@@ -9759,10 +9867,7 @@ namespace fastllm {
                     mtpIt->second.value.dims.size() < 2 ||
                     mtpIt->second.key.dims[1] != currentLen ||
                     mtpIt->second.value.dims[1] != currentLen ||
-                    !Qwen35SnapshotCopyTensor(
-                        mtpIt->second.key, snapshot->mtpKey) ||
-                    !Qwen35SnapshotCopyTensor(
-                        mtpIt->second.value, snapshot->mtpValue)) {
+                    !SnapshotMtpPagedCache(mtpIt->second, snapshot->mtpKey, snapshot->mtpValue)) {
                     return false;
                 }
                 snapshot->mtpValid = true;
@@ -21464,9 +21569,13 @@ namespace fastllm {
             for (auto &entry : model->mtpPagedCachePools) {
                 for (int value = 0; value < 2; ++value) {
                     auto &pool = value ? entry.second->value : entry.second->key;
-                    const Data *cache = found == model->mtpCaches.end() ? nullptr :
-                        (value ? &found->second.value : &found->second.key);
-                    const int tokens = found == model->mtpCaches.end() ? 0 : found->second.tokens;
+                    const MtpKvCache *local = found == model->mtpCaches.end() ? nullptr : &found->second;
+                    if (local != nullptr && !local->shards.empty()) {
+                        auto shard = local->shards.find(entry.first);
+                        local = shard == local->shards.end() ? nullptr : shard->second.get();
+                    }
+                    const Data *cache = local == nullptr ? nullptr : (value ? &local->value : &local->key);
+                    const int tokens = local == nullptr ? 0 : local->tokens;
                     const int pages = cache == nullptr ? 0 : (int)cache->pageIndex.size();
                     const long long required =
                         ((long long)tokens + appendTokens + pool.pageLen - 1) / pool.pageLen;
@@ -29083,6 +29192,447 @@ namespace fastllm {
         }
     }
 
+    bool Qwen3_5Model::UseMtpBackboneTp(const std::vector<int> &devices) const {
+#ifdef USE_CUDA
+        return devices.size() > 1 && Qwen35EnvDefaultEnabled("FASTLLM_QWEN35_MTP_TP");
+#else
+        return false;
+#endif
+    }
+
+    void Qwen3_5Model::PrepareMtpTpWeights(const std::vector<int> &devices) {
+#ifdef USE_CUDA
+        if (mtpTpPrepared) {
+            AssertInFastLLM(mtpTpDevices == devices, "MTP TP devices changed after preparation.\n");
+            return;
+        }
+        AssertInFastLLM(HasMtpWeights() && UseMtpBackboneTp(devices),
+                        "MTP TP needs a supported draft and multiple CUDA devices.\n");
+        AssertInFastLLM(FastllmInitNccl(devices), "MTP TP NCCL initialization failed.\n");
+        std::map<int, int> ratios;
+        std::vector<int> configured;
+        GetQwen35GPUForwardDevices(deviceMap, configured, ratios);
+        if (configured != devices) {
+            ratios.clear();
+        }
+        // Keep the input-mixing FC on the root. Broadcast its output once;
+        // sharding FC would add a collective before the transformer even starts.
+        for (const char *name :
+             {"mtp.fc.weight", "mtp.pre_fc_norm_embedding.weight", "mtp.pre_fc_norm_hidden.weight"}) {
+            weight[name].ToDevice(DataDevice::CUDA, {devices.front()}, true);
+        }
+        auto replicate = [&](const std::string &name) {
+            if (weight.weight.count(name)) {
+                PrepareMultiCudaReplicatedData(weight[name], devices, true);
+            }
+        };
+        auto split = [&](const std::string &name, DivisionScheme scheme, int axis) {
+            auto devs = devices;
+            Data &bias = GetThreadTensorParallelBias(name + ".mtp_tp_bias");
+            AssertInFastLLM(SplitMultiCudaWeight(weight[name], bias, devs, scheme, axis, true),
+                            "MTP TP failed to split " + name + ".\n");
+        };
+        auto splitMlp = [&](const std::string &prefix) {
+            Data &gateup = weight[prefix + "gateup_proj.weight"];
+            gateup.tpPackType = TP_PACK_GATEUP;
+            auto devs = devices;
+            DivisionScheme scheme = BuildMultiCudaRowSplitScheme(gateup, devs, ratios);
+            split(prefix + "gateup_proj.weight", scheme, 0);
+            split(prefix + "down_proj.weight", ExtractQwen35FirstRangeScheme(scheme), 1);
+        };
+        const std::string prefix = "mtp.layers.0.";
+        for (const std::string &name :
+             {std::string("mtp.norm.weight"), prefix + "input_layernorm.weight",
+              prefix + "post_attention_layernorm.weight", prefix + "self_attn.q_norm.weight",
+              prefix + "self_attn.k_norm.weight"}) {
+            replicate(name);
+        }
+        // Whole GQA groups may have unequal sizes across ranks, including an
+        // empty attention shard. Q/gate, K/V and O must share this assignment.
+        DivisionScheme qkv = BuildQwen35GatedAttentionQkvScheme(devices, ratios, num_attention_heads,
+                                                                num_key_value_heads, head_dim);
+        const int qWidth = num_attention_heads * head_dim * 2;
+        const int kvWidth = num_key_value_heads * head_dim;
+        mtpTpKvHeadScheme = ExtractQwen35AttentionKVHeadScheme(qkv, qWidth, head_dim);
+        if (weight.weight.count(prefix + "self_attn.mergeqkv.weight")) {
+            weight[prefix + "self_attn.mergeqkv.weight"].tpPackType = TP_PACK_NONE;
+            split(prefix + "self_attn.mergeqkv.weight", qkv, 0);
+        } else {
+            split(prefix + "self_attn.q_proj.weight", ExtractQwen35PackedRangeScheme(qkv, 0, 0), 0);
+            split(prefix + "self_attn.k_proj.weight", ExtractQwen35PackedRangeScheme(qkv, 1, qWidth), 0);
+            split(prefix + "self_attn.v_proj.weight",
+                  ExtractQwen35PackedRangeScheme(qkv, 2, qWidth + kvWidth), 0);
+        }
+        split(prefix + "self_attn.o_proj.weight", ExtractQwen35AttentionOutputScheme(qkv), 1);
+        if (weight.weight.count(prefix + "mlp.gateup_proj.weight")) {
+            splitMlp(prefix + "mlp.");
+        } else {
+            AssertInFastLLM(HasMtpMoeWeights(), "MTP TP has incomplete MoE weights.\n");
+            replicate(prefix + "mlp.gate.weight");
+            replicate(prefix + "mlp.gate.e_score_correction_bias");
+            if (weight.weight.count(prefix + "mlp.shared_expert.gateup_proj.weight")) {
+                splitMlp(prefix + "mlp.shared_expert.");
+                replicate(prefix + "mlp.shared_expert_gate.weight");
+            }
+            for (int expert = 0; expert < num_experts; ++expert) {
+                splitMlp(prefix + "mlp.experts." + std::to_string(expert) + ".");
+            }
+            for (int device : devices) {
+                auto &ws = mtpTpMoeWeights[device];
+                ws.assign(2, nullptr);
+                for (int expert = 0; expert < num_experts; ++expert) {
+                    const std::string ep = prefix + "mlp.experts." + std::to_string(expert) + ".";
+                    Data *gateup = weight[ep + "gateup_proj.weight"].multiDeviceDatas.at(device);
+                    Data *down = weight[ep + "down_proj.weight"].multiDeviceDatas.at(device);
+                    // MergeMOE already skips null experts; zero-width GEMMs are invalid.
+                    const bool empty = gateup->dims[0] == 0;
+                    ws.push_back(empty ? nullptr : gateup);
+                    ws.push_back(empty ? nullptr : down);
+                }
+                mtpTpMoeBiass[device].assign(ws.size(), nullptr);
+            }
+        }
+        // The target normally prepares the vocabulary shards first. The same
+        // setup also makes isolated draft tests independent of a target forward.
+        if (!weight["lm_head.weight"].multiDeviceData) {
+            auto devs = devices;
+            threadTpLmHeadScheme = BuildMultiCudaRowSplitScheme(weight["lm_head.weight"], devs, ratios);
+            split("lm_head.weight", threadTpLmHeadScheme, 0);
+            PrepareMtpDraftLmHeadWeights(devices);
+        }
+        mtpTpDevices = devices;
+        mtpTpPrepared = true;
+        printf("[Qwen3.5 MTP] transformer TP=%zu, KV heads per device:", devices.size());
+        for (int device : devices) {
+            printf(" cuda:%d=%d", device, Qwen35LocalHeads(mtpTpKvHeadScheme, device));
+        }
+        printf("; two residual reductions per draft layer.\n");
+        fflush(stdout);
+#endif
+    }
+
+    std::vector<int> Qwen3_5Model::RunMtpTpDraft(const std::vector<int> &devices,
+                                                 const std::vector<MtpKvCache *> &caches,
+                                                 const std::vector<const Data *> &targetHiddenStates,
+                                                 const std::vector<std::vector<int>> &inputTokens,
+                                                 const std::vector<Data *> &positionIds,
+                                                 const std::vector<int> &sampleRows,
+                                                 std::vector<Data> *sampledHiddenStates, bool cacheOnly) {
+#ifndef USE_CUDA
+        return {};
+#else
+        PrepareMtpTpWeights(devices);
+        const int device = devices.front(), batch = caches.size();
+        AssertInFastLLM(batch > 0 && targetHiddenStates.size() == caches.size() &&
+                            inputTokens.size() == caches.size() && positionIds.size() == caches.size() &&
+                            sampleRows.size() == caches.size(),
+                        "MTP TP batch metadata mismatch.\n");
+        Qwen35ScopedGenericExecutor executor("cuda:" + std::to_string(device));
+        FastllmCudaSetDevice(device);
+        std::vector<int> seqLens(batch), offsets(batch), oldTokens(batch);
+        int total = 0;
+        for (int b = 0; b < batch; ++b) {
+            AssertInFastLLM(caches[b] && targetHiddenStates[b] && positionIds[b] && !inputTokens[b].empty(),
+                            "MTP TP received empty request data.\n");
+            seqLens[b] = inputTokens[b].size();
+            offsets[b] = total;
+            total += seqLens[b];
+            oldTokens[b] = caches[b]->tokens;
+            AssertInFastLLM(caches[b]->tokens == 0 || !caches[b]->shards.empty(),
+                            "MTP cannot switch a live cache from single GPU to TP.\n");
+        }
+        AssertInFastLLM(targetHiddenStates[0]->dims.size() == 3,
+                        "MTP TP target hidden must have three dimensions.\n");
+        const int width = targetHiddenStates[0]->dims.back();
+        Data flatHidden(dataType);
+        flatHidden.dataDevice = DataDevice::CUDA;
+        flatHidden.dataDeviceIds = {device};
+        flatHidden.Resize({1, total, width});
+        flatHidden.Allocate(false);
+        const size_t rowBytes = GetDataBytes(dataType, 1, width);
+        for (int b = 0; b < batch; ++b) {
+            const Data *src = targetHiddenStates[b];
+            Data converted;
+            AssertInFastLLM(src->dims == std::vector<int>({1, seqLens[b], width}),
+                            "MTP TP hidden shape mismatch.\n");
+            if (src->dataType != dataType) {
+                converted.CopyFrom(*src);
+                ToDataType(converted, dataType);
+                src = &converted;
+            }
+            AssertInFastLLM(src->dataDevice == DataDevice::CUDA && src->cudaData,
+                            "MTP TP target hidden must be on CUDA.\n");
+            FastllmCudaCopyFromDeviceToDevice((uint8_t *)flatHidden.cudaData + offsets[b] * rowBytes,
+                                              src->cudaData, seqLens[b] * rowBytes);
+        }
+        std::vector<float> tokenValues;
+        for (const auto &tokens : inputTokens) {
+            for (int token : tokens) {
+                tokenValues.push_back(token);
+            }
+        }
+        Data tokenIds(FLOAT32, {1, total}, tokenValues), inputEmbeds;
+        Data &embedWeight = weight[language_prefix + "embed_tokens.weight"];
+        Data *localEmbedding = &embedWeight;
+        if (embedWeight.multiDeviceData) {
+            auto it = embedWeight.multiDeviceDatas.find(device);
+            if (it != embedWeight.multiDeviceDatas.end() && it->second != nullptr) {
+                localEmbedding = it->second;
+            }
+        }
+        const bool useCudaEmbedding =
+            GetCudaEmbeddingRequested() && !GetLowMemMode() &&
+            localEmbedding->dataDevice == DataDevice::CUDA && localEmbedding->cudaData != nullptr &&
+            !localEmbedding->dataDeviceIds.empty() && localEmbedding->dataDeviceIds[0] == device;
+        if (useCudaEmbedding) {
+            tokenIds.ToDevice(DataDevice::CUDA, {device}, true);
+            Embedding(tokenIds, *localEmbedding, inputEmbeds);
+        } else {
+            Qwen35CpuEmbeddingDirect(tokenIds, embedWeight, inputEmbeds, dataType);
+            inputEmbeds.ToDevice(DataDevice::CUDA, {device}, true);
+        }
+        if (inputEmbeds.dataType != dataType) {
+            ToDataType(inputEmbeds, dataType);
+        }
+        Data normEmbeds, normHidden, fusedInput, hidden;
+        RMSNorm(inputEmbeds, weight["mtp.pre_fc_norm_embedding.weight"], rms_norm_eps, normEmbeds);
+        RMSNorm(flatHidden, weight["mtp.pre_fc_norm_hidden.weight"], rms_norm_eps, normHidden);
+        Cat(normEmbeds, normHidden, -1, fusedInput);
+        Linear(fusedInput, weight["mtp.fc.weight"], *GetEmptyData(), hidden);
+        Data positions = BuildFlattenedPositionIds(
+            positionIds, seqLens, std::all_of(seqLens.begin(), seqLens.end(), [](int n) { return n == 1; }));
+        PrepareMultiCudaReplicatedData(hidden, devices, true);
+        PrepareMultiCudaReplicatedData(positions, devices, true);
+        const bool sampleSingle = batch == 1 && seqLens[0] > 1 && sampleRows[0] == seqLens[0] - 1 &&
+                                  head_dim == 256 && oldTokens[0] + seqLens[0] > 4096;
+        std::vector<int> outputLens = sampleSingle ? std::vector<int>{1} : seqLens;
+        const int outputTotal = sampleSingle ? 1 : total;
+        std::vector<std::vector<MtpKvCache *>> localCaches(devices.size(), std::vector<MtpKvCache *>(batch));
+        for (int r = 0; r < (int)devices.size(); ++r) {
+            int heads = Qwen35LocalHeads(mtpTpKvHeadScheme, devices[r]);
+            if (heads == 0) {
+                continue;
+            }
+            Data shape(dataType, {heads, 1, head_dim});
+            GetMtpPagedCachePool(devices[r], shape);
+            for (int b = 0; b < batch; ++b) {
+                auto &shard = caches[b]->shards[devices[r]];
+                if (!shard) {
+                    shard.reset(new MtpKvCache());
+                }
+                AssertInFastLLM(shard->tokens == oldTokens[b], "MTP TP rank cache lengths diverged.\n");
+                localCaches[r][b] = shard.get();
+            }
+        }
+        std::vector<Data> sampled(devices.size()), logits(devices.size());
+        std::vector<std::vector<int>> bestIds(devices.size(), std::vector<int>(batch));
+        std::vector<std::vector<float>> bestScores(devices.size(), std::vector<float>(batch));
+        std::vector<std::exception_ptr> errors(devices.size());
+        threadTpWorkerGroup.RunWithCaller(
+            devices,
+            [&](int rank) {
+                const int gpu = devices[rank];
+                FastllmCudaSetDevice(gpu);
+                Qwen35ScopedGenericExecutor localExecutor("cuda:" + std::to_string(gpu));
+                auto w = [&](const std::string &name) -> Data & {
+                    return *weight[name].multiDeviceDatas.at(gpu);
+                };
+                Data &localHidden = *hidden.multiDeviceDatas.at(gpu);
+                Data &localPositions = *positions.multiDeviceDatas.at(gpu);
+                const std::string prefix = "mtp.layers.0.";
+                int kvHeads = Qwen35LocalHeads(mtpTpKvHeadScheme, gpu);
+                int qHeads = kvHeads * (num_attention_heads / num_key_value_heads);
+                Data selectedHidden;
+                if (sampleSingle) {
+                    Split(localHidden, 1, seqLens[0] - 1, seqLens[0], selectedHidden);
+                }
+                Data &residual = sampleSingle ? selectedHidden : localHidden;
+                Data partial(dataType);
+                if (kvHeads > 0) {
+                    Data normalized, qgate, q, gate, k, v, qkv;
+                    RMSNorm(localHidden, w(prefix + "input_layernorm.weight"), rms_norm_eps, normalized);
+                    if (weight.weight.count(prefix + "self_attn.mergeqkv.weight")) {
+                        Linear(normalized, w(prefix + "self_attn.mergeqkv.weight"), *GetEmptyData(), qkv);
+                        const int qw = qHeads * head_dim * 2, kw = kvHeads * head_dim;
+                        Split(qkv, -1, 0, qw, qgate);
+                        Split(qkv, -1, qw, qw + kw, k);
+                        Split(qkv, -1, qw + kw, qw + 2 * kw, v);
+                    } else {
+                        Linear(normalized, w(prefix + "self_attn.q_proj.weight"), *GetEmptyData(), qgate);
+                        Linear(normalized, w(prefix + "self_attn.k_proj.weight"), *GetEmptyData(), k);
+                        Linear(normalized, w(prefix + "self_attn.v_proj.weight"), *GetEmptyData(), v);
+                    }
+                    qgate.Reshape({1, total, qHeads, head_dim * 2});
+                    Split(qgate, -1, 0, head_dim, q);
+                    Split(qgate, -1, head_dim, head_dim * 2, gate);
+                    gate.Reshape({1, total, qHeads * head_dim});
+                    k.Reshape({1, total, kvHeads, head_dim});
+                    v.Reshape({1, total, kvHeads, head_dim});
+                    RMSNorm(q, w(prefix + "self_attn.q_norm.weight"), rms_norm_eps, q);
+                    RMSNorm(k, w(prefix + "self_attn.k_norm.weight"), rms_norm_eps, k);
+                    float scale = rope_type == RoPEType::LINEAR_SCALE ? rope_factor : 1.0f;
+                    ApplyMultimodalRotary(q, localPositions, scale);
+                    ApplyMultimodalRotary(k, localPositions, scale);
+                    PermuteSelf(q, {0, 2, 1, 3});
+                    PermuteSelf(k, {0, 2, 1, 3});
+                    PermuteSelf(v, {0, 2, 1, 3});
+                    q.Reshape({qHeads, total, head_dim});
+                    k.Reshape({kvHeads, total, head_dim});
+                    v.Reshape({kvHeads, total, head_dim});
+                    for (int b = 0; b < batch; ++b) {
+                        Data kb, vb;
+                        Split(k, 1, offsets[b], offsets[b] + seqLens[b], kb);
+                        Split(v, 1, offsets[b], offsets[b] + seqLens[b], vb);
+                        auto &pool = GetMtpPagedCachePool(gpu, kb);
+                        localCaches[rank][b]->Append(kb, vb, pool.key, pool.value);
+                    }
+                    if (cacheOnly) {
+                        ForceDeviceSync();
+                        return;
+                    }
+                    Data selectedQ, selectedGate;
+                    if (sampleSingle) {
+                        Split(q, 1, seqLens[0] - 1, seqLens[0], selectedQ);
+                        Split(gate, 1, seqLens[0] - 1, seqLens[0], selectedGate);
+                    }
+                    Data &query = sampleSingle ? selectedQ : q,
+                         &outputGate = sampleSingle ? selectedGate : gate;
+                    std::vector<Data *> keys;
+                    for (auto *cache : localCaches[rank]) {
+                        keys.push_back(&cache->key);
+                    }
+                    Data qs, ps, pi, last, attention;
+                    GeneratePagedBatchParams(query, keys, batch, qs, ps, pi, last, outputLens);
+                    AttentionPagedBatch(query, localCaches[rank][0]->key, localCaches[rank][0]->value, qs, ps,
+                                        pi, last, attention, qHeads / kvHeads,
+                                        1.0f / std::sqrt((float)head_dim), 1, false);
+                    attention.Reshape({1, outputTotal, qHeads * head_dim});
+                    Sigmoid(outputGate, outputGate);
+                    if (outputGate.dataType != attention.dataType) {
+                        ToDataType(outputGate, attention.dataType);
+                    }
+                    MulTo(attention, outputGate);
+                    Linear(attention, w(prefix + "self_attn.o_proj.weight"), *GetEmptyData(), partial);
+                } else {
+                    if (cacheOnly) {
+                        return;
+                    }
+                    // Empty attention ranks still join both residual reductions
+                    // and may own MLP/vocabulary shards.
+                    partial.dataDevice = DataDevice::CUDA;
+                    partial.dataDeviceIds = {gpu};
+                    partial.Resize(residual.dims);
+                    partial.Allocate(0.0f);
+                }
+                if (partial.dataType != residual.dataType) {
+                    ToDataType(partial, residual.dataType);
+                }
+                if (!qwen3cuda::Qwen3CudaTryTP2P2PAllReduceAddResidual(partial, residual, gpu)) {
+                    if (rank == 0) {
+                        AddTo(residual, partial);
+                    } else {
+                        residual.CopyFrom(partial);
+                    }
+                    FastllmNcclAllReduce(residual.cudaData, residual.cudaData, residual.Count(0),
+                                         residual.dataType, gpu);
+                }
+                RunMtpFeedForward(gpu, residual, true, rank == 0);
+                Data &sample = sampled[rank];
+                sample.dataType = dataType;
+                sample.UpdateUnitSize();
+                sample.dataDevice = DataDevice::CUDA;
+                sample.dataDeviceIds = {gpu};
+                sample.Resize({1, batch, width});
+                sample.Allocate(false);
+                for (int b = 0; b < batch; ++b) {
+                    int row =
+                        sampleSingle ? 0 : offsets[b] + std::max(0, std::min(sampleRows[b], seqLens[b] - 1));
+                    FastllmCudaCopyFromDeviceToDevice((uint8_t *)sample.cudaData + b * rowBytes,
+                                                      (uint8_t *)residual.cudaData + row * rowBytes,
+                                                      rowBytes);
+                }
+                RMSNorm(sample, w("mtp.norm.weight"), rms_norm_eps, sample);
+                Data *head = &w("lm_head.weight");
+                auto fp8 = mtpDraftLmHeadWeights.find(gpu);
+                if (fp8 != mtpDraftLmHeadWeights.end()) {
+                    head = fp8->second;
+                }
+                if (head->dims[0] == 0) {
+                    std::fill(bestIds[rank].begin(), bestIds[rank].end(), -1);
+                    std::fill(bestScores[rank].begin(), bestScores[rank].end(),
+                              -std::numeric_limits<float>::infinity());
+                    ForceDeviceSync();
+                    return;
+                }
+                Linear(sample, *head, *GetEmptyData(), logits[rank]);
+                ToDataType(logits[rank], FLOAT32);
+                Data ids(INT32), scores(FLOAT32);
+                for (Data *d : {&ids, &scores}) {
+                    d->dataDevice = DataDevice::CUDA;
+                    d->dataDeviceIds = {gpu};
+                    d->Resize({batch});
+                    d->Allocate(false);
+                }
+                bool ok = FastllmCudaGreedySamplingWithScores((float *)logits[rank].cudaData,
+                                                              (int *)ids.cudaData, (float *)scores.cudaData,
+                                                              batch, logits[rank].dims.back());
+                AssertInFastLLM(ok, "MTP TP greedy sampling failed.\n");
+                FastllmCudaCopyFromDeviceToHost(bestIds[rank].data(), ids.cudaData, batch * sizeof(int));
+                FastllmCudaCopyFromDeviceToHost(bestScores[rank].data(), scores.cudaData,
+                                                batch * sizeof(float));
+            },
+            errors);
+        for (const auto &error : errors) {
+            if (error) {
+                for (int b = 0; b < batch; ++b) {
+                    for (auto &entry : caches[b]->shards) {
+                        entry.second->Truncate(oldTokens[b]);
+                    }
+                }
+                std::rethrow_exception(error);
+            }
+        }
+        for (int b = 0; b < batch; ++b) {
+            caches[b]->SetTpLength(oldTokens[b] + seqLens[b], num_key_value_heads, head_dim, dataType);
+        }
+        if (cacheOnly) {
+            return std::vector<int>(batch, -1);
+        }
+        FastllmCudaSetDevice(device);
+        if (sampledHiddenStates) {
+            sampledHiddenStates->clear();
+            sampledHiddenStates->resize(batch);
+            for (int b = 0; b < batch; ++b) {
+                Split(sampled[0], 1, b, b + 1, (*sampledHiddenStates)[b]);
+            }
+        }
+        std::vector<int> result(batch, -1);
+        for (int b = 0; b < batch; ++b) {
+            float best = -std::numeric_limits<float>::infinity();
+            for (int rank = 0; rank < (int)devices.size(); ++rank) {
+                int local = bestIds[rank][b], global = -1;
+                if (local < 0) {
+                    continue;
+                }
+                for (auto range : threadTpLmHeadScheme.at(devices[rank])) {
+                    if (local < range.second - range.first) {
+                        global = range.first + local;
+                        break;
+                    }
+                    local -= range.second - range.first;
+                }
+                AssertInFastLLM(global >= 0, "MTP TP sampled vocabulary id outside shard.\n");
+                float score = bestScores[rank][b];
+                if (score > best || (score == best && (result[b] < 0 || global < result[b]))) {
+                    best = score;
+                    result[b] = global;
+                }
+            }
+        }
+        return result;
+#endif
+    }
+
     void Qwen3_5Model::PrepareMtpWeightsForDevice(int device, bool includeSharedWeights) {
 #ifdef USE_CUDA
         if (!HasMtpWeights()) {
@@ -29186,111 +29736,150 @@ namespace fastllm {
 #endif
     }
 
-    void Qwen3_5Model::RunMtpFeedForward(int device, Data &hiddenStates) {
+    void Qwen3_5Model::RunMtpFeedForward(int device, Data &hiddenStates, bool tensorParallel,
+                                         bool firstRank) {
 #ifndef USE_CUDA
         (void)device;
         (void)hiddenStates;
 #else
+        auto localWeight = [&](const std::string &name) -> Data & {
+            Data &root = weight[name];
+            return tensorParallel ? *root.multiDeviceDatas.at(device) : root;
+        };
+        auto addPartial = [&](Data &partial) {
+            if (partial.dataType != hiddenStates.dataType) {
+                ToDataType(partial, hiddenStates.dataType);
+            }
+            if (!tensorParallel) {
+                AddTo(hiddenStates, partial);
+                return;
+            }
+            if (!qwen3cuda::Qwen3CudaTryTP2P2PAllReduceAddResidual(partial, hiddenStates, device)) {
+                if (firstRank) {
+                    AddTo(hiddenStates, partial);
+                } else {
+                    hiddenStates.CopyFrom(partial);
+                }
+                FastllmNcclAllReduce(hiddenStates.cudaData, hiddenStates.cudaData, hiddenStates.Count(0),
+                                     hiddenStates.dataType, device);
+            }
+        };
         const std::string prefix = "mtp.layers.0.mlp.";
         Data mlpInput;
-        RMSNorm(hiddenStates,
-                weight["mtp.layers.0.post_attention_layernorm.weight"],
-                rms_norm_eps, mlpInput);
+        RMSNorm(hiddenStates, localWeight("mtp.layers.0.post_attention_layernorm.weight"), rms_norm_eps,
+                mlpInput);
 
         std::string denseGateupName = prefix + "gateup_proj.weight";
         std::string denseDownName = prefix + "down_proj.weight";
         if (weight.weight.find(denseGateupName) != weight.weight.end() &&
             weight.weight.find(denseDownName) != weight.weight.end()) {
             Data gateupResult, swigluResult;
-            MLPBlock(&mlpInput, &weight[denseGateupName], &weight[denseDownName],
-                     &gateupResult, &swigluResult, &hiddenStates);
+            if (!tensorParallel) {
+                MLPBlock(&mlpInput, &localWeight(denseGateupName), &localWeight(denseDownName), &gateupResult,
+                         &swigluResult, &hiddenStates);
+            } else {
+                Data partial(hiddenStates.dataType);
+                if (localWeight(denseGateupName).dims[0] > 0) {
+                    Qwen3CudaDirectRunner runner(device);
+                    qwen3cuda::Qwen3CudaLinearSwiglu(runner, mlpInput, localWeight(denseGateupName),
+                                                     *GetEmptyData(), gateupResult, swigluResult);
+                    Linear(swigluResult, localWeight(denseDownName), *GetEmptyData(), partial);
+                } else {
+                    partial.dataDevice = DataDevice::CUDA;
+                    partial.dataDeviceIds = {device};
+                    partial.Resize(hiddenStates.dims);
+                    partial.Allocate(0.0f);
+                }
+                addPartial(partial);
+            }
             return;
         }
 
-        AssertInFastLLM(HasMtpMoeWeights(),
-                        "Qwen3.5 MTP MoE weights are incomplete.\n");
-        AssertInFastLLM(mtpMoeWeights.size() ==
-                            (size_t)(2 + num_experts * 2) &&
-                        mtpMoeBiass.size() == mtpMoeWeights.size(),
+        AssertInFastLLM(HasMtpMoeWeights(), "Qwen3.5 MTP MoE weights are incomplete.\n");
+        auto &moeWeights = tensorParallel ? mtpTpMoeWeights.at(device) : mtpMoeWeights;
+        auto &moeBiass = tensorParallel ? mtpTpMoeBiass.at(device) : mtpMoeBiass;
+        AssertInFastLLM(moeWeights.size() == (size_t)(2 + num_experts * 2) &&
+                            moeBiass.size() == moeWeights.size(),
                         "Qwen3.5 MTP MoE weights were not prepared.\n");
 
         using namespace qwen3cuda;
         FastllmCudaSetDevice(device);
         Qwen3CudaDirectRunner cudaRunner(device);
         Data gateupResult, swigluResult, sharedOutput, sharedGate;
-        std::string sharedGateupName =
-            prefix + "shared_expert.gateup_proj.weight";
+        std::string sharedGateupName = prefix + "shared_expert.gateup_proj.weight";
         std::string sharedDownName = prefix + "shared_expert.down_proj.weight";
-        bool hasSharedExpert =
-            weight.weight.find(sharedGateupName) != weight.weight.end() &&
-            weight.weight.find(sharedDownName) != weight.weight.end();
+        bool hasSharedExpert = weight.weight.find(sharedGateupName) != weight.weight.end() &&
+                               weight.weight.find(sharedDownName) != weight.weight.end() &&
+                               (!tensorParallel || localWeight(sharedGateupName).dims[0] > 0);
         if (hasSharedExpert) {
-            Qwen3CudaLinearSwiglu(cudaRunner, mlpInput,
-                                  weight[sharedGateupName], *GetEmptyData(),
+            Qwen3CudaLinearSwiglu(cudaRunner, mlpInput, localWeight(sharedGateupName), *GetEmptyData(),
                                   gateupResult, swigluResult);
-            Qwen3CudaLinear(cudaRunner, swigluResult,
-                            weight[sharedDownName], *GetEmptyData(),
+            Qwen3CudaLinear(cudaRunner, swigluResult, localWeight(sharedDownName), *GetEmptyData(),
                             sharedOutput);
-            std::string sharedExpertGateName =
-                prefix + "shared_expert_gate.weight";
+            std::string sharedExpertGateName = prefix + "shared_expert_gate.weight";
             if (weight.weight.find(sharedExpertGateName) != weight.weight.end()) {
-                Qwen3CudaLinear(cudaRunner, mlpInput,
-                                weight[sharedExpertGateName], *GetEmptyData(),
+                Qwen3CudaLinear(cudaRunner, mlpInput, localWeight(sharedExpertGateName), *GetEmptyData(),
                                 sharedGate);
                 Qwen35CudaSigmoid(cudaRunner, sharedGate, sharedGate);
                 if (sharedGate.dataType != sharedOutput.dataType) {
-                    Qwen3CudaToDataType(cudaRunner, sharedGate,
-                                        sharedOutput.dataType);
+                    Qwen3CudaToDataType(cudaRunner, sharedGate, sharedOutput.dataType);
                 }
                 Qwen35CudaMulTo(cudaRunner, sharedOutput, sharedGate);
             }
+        }
+
+        const bool hasRoutedShard =
+            std::any_of(moeWeights.begin() + 2, moeWeights.end(), [](Data *w) { return w != nullptr; });
+        if (!hasRoutedShard) {
+            if (hasSharedExpert) {
+                addPartial(sharedOutput);
+            } else {
+                Data zero(hiddenStates.dataType);
+                zero.dataDevice = DataDevice::CUDA;
+                zero.dataDeviceIds = {device};
+                zero.Resize(hiddenStates.dims);
+                zero.Allocate(0.0f);
+                addPartial(zero);
+            }
+            return;
         }
 
         int flatBatch = mlpInput.dims[0];
         int flatLen = mlpInput.dims[1];
         mlpInput.Reshape({flatBatch * flatLen, mlpInput.dims[2]});
         Data routerLogits, routerLogitsTemp, expertIndex, expertScore;
-        Qwen3CudaLinear(cudaRunner, mlpInput, weight[prefix + "gate.weight"],
-                        *GetEmptyData(), routerLogits, true);
+        Qwen3CudaLinear(cudaRunner, mlpInput, localWeight(prefix + "gate.weight"), *GetEmptyData(),
+                        routerLogits, true);
         Data *gateBias = nullptr;
         std::string gateBiasName = prefix + "gate.e_score_correction_bias";
         if (weight.weight.find(gateBiasName) != weight.weight.end()) {
-            gateBias = &weight[gateBiasName];
+            gateBias = &localWeight(gateBiasName);
         }
-        if (!Qwen3CudaTryFusedSoftmaxSelectExpert(
-                cudaRunner, routerLogits, expertIndex, expertScore,
-                num_experts_per_tok, norm_topk_prob,
-                routed_scaling_factor, gateBias)) {
-            Qwen3CudaConvertToDataType(cudaRunner, routerLogits,
-                                       routerLogitsTemp, DataType::FLOAT32);
-            Qwen3CudaSoftmax(cudaRunner, routerLogitsTemp,
-                             routerLogitsTemp, -1);
-            Qwen3CudaSelectExpert(cudaRunner, routerLogitsTemp,
-                                  expertIndex, expertScore,
-                                  num_experts_per_tok, norm_topk_prob,
-                                  routed_scaling_factor, gateBias);
+        if (!Qwen3CudaTryFusedSoftmaxSelectExpert(cudaRunner, routerLogits, expertIndex, expertScore,
+                                                  num_experts_per_tok, norm_topk_prob, routed_scaling_factor,
+                                                  gateBias)) {
+            Qwen3CudaConvertToDataType(cudaRunner, routerLogits, routerLogitsTemp, DataType::FLOAT32);
+            Qwen3CudaSoftmax(cudaRunner, routerLogitsTemp, routerLogitsTemp, -1);
+            Qwen3CudaSelectExpert(cudaRunner, routerLogitsTemp, expertIndex, expertScore, num_experts_per_tok,
+                                  norm_topk_prob, routed_scaling_factor, gateBias);
         }
 
         Data w1, w2, w3, tempInput, tempOutput;
         Data moeInputTemp, moeOutputTemp, moeOutput;
         DataType computeType = hiddenStates.dataType;
         DataType mtpMoeAtype = useCustomMoeAtype ? moeAtype : computeType;
-        Qwen3CudaMergeMOEBlock(
-            cudaRunner, &mlpInput, &expertIndex, &expertScore,
-            &mtpMoeWeights, &mtpMoeBiass,
-            &w1, &w2, &w3, &tempInput, &tempOutput,
-            1.0f, &moeOutput, block_cnt,
-            computeType, mtpMoeAtype, &moeInputTemp, &moeOutputTemp);
+        Qwen3CudaMergeMOEBlock(cudaRunner, &mlpInput, &expertIndex, &expertScore, &moeWeights, &moeBiass, &w1,
+                               &w2, &w3, &tempInput, &tempOutput, 1.0f, &moeOutput, block_cnt, computeType,
+                               mtpMoeAtype, &moeInputTemp, &moeOutputTemp);
         moeOutput.Reshape(hiddenStates.dims);
         if (hasSharedExpert) {
             if (sharedOutput.dataType != moeOutput.dataType) {
-                Qwen3CudaToDataType(cudaRunner, sharedOutput,
-                                    moeOutput.dataType);
+                Qwen3CudaToDataType(cudaRunner, sharedOutput, moeOutput.dataType);
             }
             sharedOutput.Reshape(hiddenStates.dims);
             Qwen3CudaAddTo(cudaRunner, moeOutput, sharedOutput);
         }
-        Qwen3CudaAddTo(cudaRunner, hiddenStates, moeOutput);
+        addPartial(moeOutput);
 #endif
     }
 
@@ -29423,6 +30012,10 @@ namespace fastllm {
 #else
         std::vector<int> draftDevices =
             devices.empty() ? std::vector<int>{device} : devices;
+        if (UseMtpBackboneTp(draftDevices)) {
+            return RunMtpTpDraft(draftDevices, caches, targetHiddenStates, inputTokens,
+                                 positionIds, sampleRows, sampledHiddenStates, false);
+        }
         bool tensorParallelDraft = draftDevices.size() > 1;
         const int batch = (int)caches.size();
         AssertInFastLLM(batch > 0 &&
@@ -29827,6 +30420,14 @@ namespace fastllm {
         return -1;
 #else
         std::vector<int> draftDevices = devices.empty() ? std::vector<int>{device} : devices;
+        if (UseMtpBackboneTp(draftDevices)) {
+            std::vector<Data> sampled;
+            std::vector<int> ret = RunMtpTpDraft(draftDevices, {&cache}, {&targetHiddenStates},
+                {inputTokens}, {const_cast<Data*>(&positionIds)}, {sampleRow},
+                sampledHiddenStates ? &sampled : nullptr, cacheOnly);
+            if (sampledHiddenStates && !cacheOnly) sampledHiddenStates->CopyFrom(sampled[0]);
+            return ret[0];
+        }
         bool tensorParallelDraft = draftDevices.size() > 1;
         PrepareMtpWeightsForDevice(device, !tensorParallelDraft);
         AssertInFastLLM(HasMtpWeights(), "Qwen3.5 MTP weights are missing.\n");
