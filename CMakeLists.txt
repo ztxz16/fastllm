@@ -771,6 +771,13 @@ if (UNIT_TEST)
             endif()
         endif()
 
+        add_executable(cuda_fp8_cache_tp_test test/basic/test_cuda_fp8_cache_tp.cpp)
+        target_link_libraries(cuda_fp8_cache_tp_test PRIVATE fastllm Threads::Threads)
+        target_include_directories(cuda_fp8_cache_tp_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME cuda_fp8_cache_tp COMMAND cuda_fp8_cache_tp_test)
+        set_tests_properties(cuda_fp8_cache_tp PROPERTIES
+                             LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 30)
+
         add_executable(cuda_single_query_attention_test test/basic/test_cuda_single_query_attention.cpp)
         target_link_libraries(cuda_single_query_attention_test PRIVATE fastllm)
         target_include_directories(cuda_single_query_attention_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
