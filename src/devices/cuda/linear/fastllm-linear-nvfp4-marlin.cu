@@ -9,6 +9,7 @@
  */
 
 #include "fastllm-cuda.cuh"
+#include "fastllm-cublas-prefill.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -17,6 +18,8 @@
 #include <climits>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 
 namespace {
@@ -27,30 +30,140 @@ constexpr int NVFP4_MARLIN_OUTPUT_ALIGNMENT = 64;
 constexpr int NVFP4_MARLIN_LARGE_OUTPUT_ALIGNMENT = 256;
 constexpr int NVFP4_MARLIN_LARGE_OUTPUT_MIN_N = 4096;
 
-static bool Nvfp4MarlinArchitectureSupported() {
+static int Nvfp4MarlinRuntimeArch() {
 #ifdef CUDA_NO_TENSOR_CORE
-    return false;
+    return 0;
 #else
     int device = 0;
     if (cudaGetDevice(&device) != cudaSuccess) {
-        return false;
+        return 0;
     }
     static thread_local int cachedDevice = -1;
-    static thread_local bool cachedSupported = false;
+    static thread_local int cachedArch = 0;
     if (cachedDevice == device) {
-        return cachedSupported;
+        return cachedArch;
     }
     int major = 0, minor = 0;
     if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
                                device) != cudaSuccess ||
         cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor,
                                device) != cudaSuccess) {
-        return false;
+        return 0;
     }
     cachedDevice = device;
-    cachedSupported = major * 10 + minor >= 75;
-    return cachedSupported;
+    cachedArch = major * 10 + minor;
+    return cachedArch;
 #endif
+}
+
+static bool Nvfp4MarlinArchitectureSupported() {
+    return Nvfp4MarlinRuntimeArch() >= 75;
+}
+
+constexpr int NVFP4_PREFILL_MIN_ROWS = 2048;
+
+static bool Nvfp4PrefillEnvFlag(const char *name, bool defaultValue) {
+    const char *value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') return defaultValue;
+    return std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0 &&
+           std::strcmp(value, "FALSE") != 0 && std::strcmp(value, "off") != 0 &&
+           std::strcmp(value, "OFF") != 0;
+}
+
+static bool Nvfp4PrefillEnabled() {
+    static const bool enabled = Nvfp4PrefillEnvFlag("FASTLLM_CUDA_NVFP4_PREFILL_CUBLAS", true);
+    return enabled;
+}
+
+static bool Nvfp4PrefillFp16Accum() {
+    static const bool enabled = Nvfp4PrefillEnvFlag("FASTLLM_CUDA_NVFP4_PREFILL_FP16_ACCUM", false);
+    return enabled;
+}
+
+// FP16 accumulation is an explicit accuracy/speed tradeoff. Keep the tensor
+// scale in FP32 and apply it after GEMM so it is not rounded to a half scalar.
+// Round scaled output to FP16 before bias, matching the existing bias contract.
+template<bool HasBias>
+__global__ void Nvfp4PrefillScaleOutputKernel(half *output, const float *globalScale,
+        const half *bias, size_t count, int sizeN) {
+    size_t index = (size_t(blockIdx.x) * blockDim.x + threadIdx.x) * 2;
+    if (index >= count) return;
+    float scale = *globalScale;
+    if (index + 1 < count) {
+        float2 value = __half22float2(reinterpret_cast<half2 *>(output)[index / 2]);
+        half2 scaled = __floats2half2_rn(value.x * scale, value.y * scale);
+        if (HasBias) {
+            int col = index % sizeN;
+            scaled = __hadd2(scaled, __halves2half2(bias[col], bias[col + 1 < sizeN ? col + 1 : 0]));
+        }
+        reinterpret_cast<half2 *>(output)[index / 2] = scaled;
+    } else {
+        half scaled = __float2half_rn(__half2float(output[index]) * scale);
+        output[index] = HasBias ? __hadd(scaled, bias[index % sizeN]) : scaled;
+    }
+}
+
+#include "fastllm-nvfp4-prefill-dequant.cuh"
+
+static bool Nvfp4PrefillCublas(fastllm_cuda_prefill::State *state,
+        const half *input, const uint32_t *weight, const uint8_t *scales,
+        const float *globalScale, half *bias, half *output,
+        int rows, int sizeN, int packedN, int sizeK) {
+    using namespace fastllm_cuda_prefill;
+    if (state == nullptr || rows < NVFP4_PREFILL_MIN_ROWS) return false;
+    // SM75 scans require M >= 2048 and a full FP16 weight in scratch for a
+    // consistent win with FP32 accumulation. Smaller slices can regress.
+    if (size_t(sizeN) * sizeK * sizeof(half) > state->capacity) return false;
+    cudaStreamCaptureStatus capture;
+    CheckCuda(cudaStreamIsCapturing(cudaStreamPerThread, &capture));
+    if (capture != cudaStreamCaptureStatusNone) return false;
+    std::lock_guard<std::mutex> guard(state->mutex);
+    CheckCuda(cudaStreamWaitEvent(cudaStreamPerThread, state->completed, 0));
+    Nvfp4PrefillDequantKernel<<<dim3((sizeN + 63) / 64, (sizeK + 255) / 256),
+            256, 0, cudaStreamPerThread>>>(weight, scales, state->scratch, packedN, sizeK, sizeN);
+    CheckCuda(cudaPeekAtLastError());
+    const bool fp16Accum = Nvfp4PrefillFp16Accum();
+    if (fp16Accum) {
+        SetPointerMode(state, CUBLAS_POINTER_MODE_HOST);
+        const half alpha = __float2half_rn(1), beta = __float2half_rn(0);
+        CheckCublas(cublasGemmEx(state->handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            sizeN, rows, sizeK, &alpha, state->scratch, CUDA_R_16F, sizeK,
+            input, CUDA_R_16F, sizeK, &beta, output, CUDA_R_16F, sizeN,
+            CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        size_t count = size_t(rows) * sizeN;
+        int blocks = int((count + 511) / 512);
+        if (bias != nullptr) {
+            Nvfp4PrefillScaleOutputKernel<true><<<blocks, 256, 0, cudaStreamPerThread>>>(
+                output, globalScale, bias, count, sizeN);
+        } else {
+            Nvfp4PrefillScaleOutputKernel<false><<<blocks, 256, 0, cudaStreamPerThread>>>(
+                output, globalScale, nullptr, count, sizeN);
+        }
+    } else {
+        SetPointerMode(state, CUBLAS_POINTER_MODE_DEVICE);
+        // Match NVFP4 Marlin's FP32 accumulation and FP32 tensor-scale epilogue.
+        // Applying the global scale to FP16 weights would add a rounding step.
+        CheckCublas(cublasGemmEx(state->handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            sizeN, rows, sizeK, globalScale, state->scratch, CUDA_R_16F, sizeK,
+            input, CUDA_R_16F, sizeK, state->zero, output, CUDA_R_16F, sizeN,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        if (bias != nullptr) {
+            FastllmCudaBiasKernel<<<rows, 256, 0, cudaStreamPerThread>>>(output, bias, sizeN);
+        }
+    }
+    CheckCuda(cudaPeekAtLastError());
+    CheckCuda(cudaEventRecord(state->completed, cudaStreamPerThread));
+    if (!state->nvfp4Logged) {
+        int device = 0;
+        CheckCuda(cudaGetDevice(&device));
+        std::fprintf(stderr,
+            "[NVFP4 prefill cuBLAS] GPU %d: active, rows=%d N=%d K=%d; "
+            "%s accumulation%s, FP32 tensor scale, capacity=%zu.\n",
+            device, rows, sizeN, sizeK, fp16Accum ? "FP16" : "FP32",
+            fp16Accum ? " (opt-in)" : "", state->capacity);
+        state->nvfp4Logged = true;
+    }
+    return true;
 }
 
 static bool HasNvfp4MarlinOnDevice(const fastllm::Data &weight) {
@@ -324,7 +437,7 @@ extern "C" bool FastllmCudaTryMarlinHalfMatMulFloatNVFP4Block16(
         int n, int m, int k) {
     int packedN = 0;
     if (!GetNvfp4MarlinPackedOutputDim(k, packedN)) return false;
-    // Repacked weights must keep using Marlin, including larger prefills.
+    // Repacked weights must keep using a backend that understands Marlin layout.
     if (!HasNvfp4MarlinOnDevice(weight)) {
         if (weight.dataType != fastllm::DataType::NVFP4_BLOCK_16 ||
             weight.blockM != NVFP4_GROUP_SIZE || weight.blockK != 1 ||
@@ -345,6 +458,12 @@ extern "C" bool FastllmCudaTryMarlinHalfMatMulFloatNVFP4Block16(
         }
     }
 
+    // Initialize the shared 8 MiB cuBLAS workspace during synchronized warmup,
+    // before KV memory calibration. Decode avoids the registry entirely.
+    auto *prefill = k >= 1024 && m >= 1024 && Nvfp4PrefillEnabled() &&
+        (n >= NVFP4_PREFILL_MIN_ROWS || FastllmCudaGetNcclForceSync())
+        ? fastllm_cuda_prefill::GetState(Nvfp4MarlinRuntimeArch()) : nullptr;
+
     half *cudaInput = static_cast<half *>(FastllmCudaPrepareInput(input));
     half *cudaOutput = static_cast<half *>(FastllmCudaPrepareOutput(output));
     auto *marlinWeight = static_cast<const uint32_t *>(weight.cudaData);
@@ -363,6 +482,15 @@ extern "C" bool FastllmCudaTryMarlinHalfMatMulFloatNVFP4Block16(
             packedN != k ? &paddedOutput : nullptr)) {
         printf("Error: NVFP4 Marlin in-place metadata is unavailable.\n");
         throw("nvfp4 marlin metadata error");
+    }
+
+    half *cudaBias = bias.dims.size() > 0 && !weight.extraCudaHalfData.empty()
+        ? static_cast<half *>(weight.extraCudaHalfData[0]) : nullptr;
+    if (Nvfp4PrefillCublas(prefill, cudaInput, marlinWeight, marlinScales,
+            globalScale, cudaBias, cudaOutput, n, k, packedN, m)) {
+        FastllmCudaFinishInput(input, cudaInput);
+        FastllmCudaFinishOutput(output, cudaOutput);
+        return true;
     }
 
     bool ownPaddedOutput = false;
@@ -392,8 +520,6 @@ extern "C" bool FastllmCudaTryMarlinHalfMatMulFloatNVFP4Block16(
         throw("nvfp4 marlin gemm error");
     }
 
-    half *cudaBias = bias.dims.size() > 0 && !weight.extraCudaHalfData.empty()
-        ? static_cast<half *>(weight.extraCudaHalfData[0]) : nullptr;
     if (packedN != k) {
         const int threads = 256;
         dim3 grid((k + threads - 1) / threads, std::min(n, 65535));

@@ -83,3 +83,64 @@ selected Marlin or CPU-dequant-plus-cuBLAS reference. It covers both sides of
 the 1024/1536 row boundaries, bias, K tails, N slices, small matrices, the disable
 switch, workspace address/capacity stability, and graph capture. The 4/32/64/256
 MiB configurations run in separate processes; exit 77 skips non-SM75 GPUs.
+
+# SM75 NVFP4 prefill dispatch regression
+
+For Marlin-repacked NVFP4 block16 weights, SM75 uses dequantization plus cuBLAS
+when the current Linear row count `M>=2048`, `N>=1024`, `K>=1024`, and the full
+logical `N*K*sizeof(half)` weight fits the existing FlashInfer float workspace.
+Otherwise it retains Marlin, including graph capture. The threshold applies to
+the current prefill chunk, not total context length. Set
+`FASTLLM_CUDA_NVFP4_PREFILL_CUBLAS=0` to disable this route.
+
+The 64-by-256 transpose kernel reconstructs Marlin's normalized FP16 weights
+exactly, including its S0E5M3 block scales. GEMM retains **FP32 accumulation**
+and applies the existing **FP32 global scale after accumulation**. The tensor
+scale is not folded into FP16 weights. Output is not guaranteed bitwise equal
+to Marlin because GEMM reduction order differs; the regression checks both an
+independent CPU-dequant-plus-FP32-cuBLAS reference and error against Marlin.
+Logical N can be unaligned (for example 8240); padded rows are not written.
+
+FP8 and NVFP4 share one per-device cuBLAS handle and 8 MiB workspace, plus one
+FP32 zero scalar. These are initialized during synchronized warmup before KV
+budget calibration. The float arena retains its original address and capacity;
+no full weight cache or per-layer FP16 allocations are retained. Shared-arena
+use requires the existing per-device worker stream ordering described above.
+Host/device scalar modes are explicitly switched when alternating FP8/NVFP4.
+
+```bash
+cmake -S . -B build-sm75-tests -DUSE_CUDA=ON -DCUDA_ARCH=75 -DUNIT_TEST=ON
+cmake --build build-sm75-tests --target cudaNvfp4Sm75PrefillRegression cudaFp8Sm75PrefillRegression -j8
+ctest --test-dir build-sm75-tests -R '^cuda_(nvfp4|fp8)_sm75_prefill_' --output-on-failure
+```
+
+The NVFP4 regression covers eight shapes, M=4/1024/2047/2048/2049/4096, bias,
+logical-N padding and K tails, all finite nonnegative FP8 block-scale codes, zero
+and small/large signed inputs, alternating FP8/NVFP4, graph capture with the
+registered FastLLM memory pool, and stable scratch address/capacity. Fresh
+processes test 4/32/256 MiB arenas and the disable switch. Exit 77 skips non-SM75
+GPUs. An optional device index selects the second card; `TEST_N` restricts N
+for a targeted Compute Sanitizer run.
+
+## Optional NVFP4 FP16 accumulation
+
+Set `FASTLLM_CUDA_NVFP4_PREFILL_FP16_ACCUM=1` **before starting the process** to
+use FP16 cuBLAS accumulation in eligible SM75 NVFP4 prefills. The default is
+**off (FP32 accumulation)**. This flag retains all existing dispatch guards:
+M>=2048, N/K>=1024, full FP16 weight fitting the float arena, and no graph
+capture. `FASTLLM_CUDA_NVFP4_PREFILL_CUBLAS=0` still disables the entire route.
+It does not affect FP8's accumulation policy.
+
+The optional path uses FP16 GEMM with alpha=1 and beta=0, then applies the
+existing FP32 tensor scale in a separate kernel. Bias is fused into this
+kernel after rounding the scaled result to FP16, matching the existing bias
+contract. This avoids rounding the global scale itself to FP16 and requires
+no additional buffer. FP16 accumulation still loses precision and has a
+smaller numerical range; it is not numerically equivalent to the FP32 path.
+
+The added `cuda_nvfp4_sm75_prefill_fp16_*` CTest cases exercise 4/32/256 MiB
+arenas and the master disable switch. They compare the selected FP16 backend
+against an independent CPU-dequant, FP16-cuBLAS, CPU-FP32-scale/bias reference;
+Marlin relative L2 is bounded at 1% for the constructed input data. Default
+FP32 cases retain their tighter 0.02% bound. N=4161 additionally exercises
+pairs crossing rows and an odd final output element with and without bias.
