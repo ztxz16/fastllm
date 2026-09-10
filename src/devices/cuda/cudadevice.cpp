@@ -2720,6 +2720,16 @@ namespace fastllm {
             return false;
         }
 
+        // Honor the same minimum batch as blockwise CUTLASS FP8. Small-batch
+        // native Linear keeps FP16/BF16 activations; switching to W8A8 based
+        // only on isolated kernel timing can reduce speculative acceptance.
+        int minBatch = std::max(
+            CudaEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 8),
+            FastllmCudaGetLinearExactBatchThreshold());
+        if (n < minBatch) {
+            return false;
+        }
+
         bool cudaGraph = GetFastllmEnv().cudaGraph;
         CudaLinearFp8PerChannelAutotuneKey key = {
             FastllmCudaGetDevice(), (int)input.dataType,
