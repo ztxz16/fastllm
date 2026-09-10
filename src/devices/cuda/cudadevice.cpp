@@ -2403,8 +2403,37 @@ namespace fastllm {
                CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON_LINEAR_FP8");
     }
 
+    static std::string CudaTritonLinearFp8MatmulVariant(int arch, bool packedWeight, bool hasBias) {
+        std::string matmulVariant = arch == 89 ? "strided" : "fastllm";
+        const char *kernelEnv = std::getenv("FASTLLM_CUDA_TRITON_LINEAR_FP8_KERNEL");
+        if (kernelEnv != nullptr && kernelEnv[0] != '\0') {
+            if (strcmp(kernelEnv, "strided") == 0 || strcmp(kernelEnv, "STRIDED") == 0) {
+                matmulVariant = "strided";
+            } else if (strcmp(kernelEnv, "fastllm") == 0 || strcmp(kernelEnv, "FASTLLM") == 0) {
+                matmulVariant = "fastllm";
+            }
+        }
+        if (matmulVariant == "strided" && (packedWeight || hasBias)) {
+            matmulVariant = "fastllm";
+        }
+        return matmulVariant;
+    }
+
+    static int CudaTritonLinearFp8MaxBatch(int arch, const std::string &matmulVariant) {
+        // The SM89 strided kernel accepts dynamic row counts, so do not impose
+        // a default prefill limit. Generic SM89 and other architectures retain
+        // their conservative limits; an explicit zero also means unlimited.
+        int defaultMaxBatch = arch == 89
+            ? (matmulVariant == "strided" ? 0 : 256)
+            : 64;
+        return CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_LINEAR_FP8_MAX_BATCH", defaultMaxBatch,
+            0, std::numeric_limits<int>::max());
+    }
+
     static bool RunCudaTritonLinearFp8Block128(
-        Data &input, Data &weight, const Data &bias, Data &output, int n, int m, int k) {
+        Data &input, Data &weight, const Data &bias, Data &output, int n, int m, int k,
+        bool fromSwiglu = false) {
         int arch = CudaTritonRuntimeArch();
         if (arch < 89 || !CudaTritonLinearFp8Enabled(arch)) {
             return false;
@@ -2439,28 +2468,8 @@ namespace fastllm {
         if (!CudaTritonDataTypeName(input.dataType, inputDtype)) {
             return false;
         }
-        std::string matmulVariant = arch == 89 ? "strided" : "fastllm";
-        const char *kernelEnv = std::getenv("FASTLLM_CUDA_TRITON_LINEAR_FP8_KERNEL");
-        if (kernelEnv != nullptr && kernelEnv[0] != '\0') {
-            if (strcmp(kernelEnv, "strided") == 0 || strcmp(kernelEnv, "STRIDED") == 0) {
-                matmulVariant = "strided";
-            } else if (strcmp(kernelEnv, "fastllm") == 0 || strcmp(kernelEnv, "FASTLLM") == 0) {
-                matmulVariant = "fastllm";
-            }
-        }
-        if (matmulVariant == "strided" && (packedWeight || hasBias)) {
-            matmulVariant = "fastllm";
-        }
-
-        // The SM89 strided kernel accepts dynamic row counts, so do not impose
-        // a default prefill limit. Generic SM89 and other architectures retain
-        // their conservative limits; an explicit zero also means unlimited.
-        int defaultMaxBatch = arch == 89
-            ? (matmulVariant == "strided" ? 0 : 256)
-            : 64;
-        int maxBatch = CudaEnvIntRange(
-            "FASTLLM_CUDA_TRITON_LINEAR_FP8_MAX_BATCH", defaultMaxBatch,
-            0, std::numeric_limits<int>::max());
+        std::string matmulVariant = CudaTritonLinearFp8MatmulVariant(arch, packedWeight, hasBias);
+        int maxBatch = CudaTritonLinearFp8MaxBatch(arch, matmulVariant);
         if (maxBatch > 0 && n > maxBatch) {
             return false;
         }
@@ -2494,7 +2503,9 @@ namespace fastllm {
             meta->matmulVariant != matmulVariant) {
             return false;
         }
-        bool ok = FastllmCudaTritonLinearFP8E4M3Block128(
+        auto run = fromSwiglu ? FastllmCudaTritonLinearFP8E4M3Block128FromSwiglu
+                             : FastllmCudaTritonLinearFP8E4M3Block128;
+        bool ok = run(
             meta->kernels[0].cubinPath.c_str(), meta->kernels[0].kernelName.c_str(),
             meta->kernels[0].numWarps, meta->kernels[0].shared,
             meta->kernels[1].cubinPath.c_str(), meta->kernels[1].kernelName.c_str(),
@@ -2503,7 +2514,9 @@ namespace fastllm {
             meta->packedWeight, meta->matmulVariant == "strided",
             input, weight, bias, output, n, m, k);
         if (ok) {
-            if (meta->matmulVariant == "strided") {
+            if (fromSwiglu) {
+                TraceCudaLinearFp8Path("triton-fp8-e4m3-block128-swiglu-quant", n, m, k);
+            } else if (meta->matmulVariant == "strided") {
                 TraceCudaLinearFp8Path("triton-fp8-e4m3-block128-strided", n, m, k);
             } else {
                 TraceCudaLinearFp8Path(meta->packedWeight ? "triton-fp8-e4m3-packed-block128" :
@@ -2512,6 +2525,62 @@ namespace fastllm {
             }
         }
         return ok;
+    }
+
+    bool CanUseCudaTritonSwigluLinear(int rows, bool hasBias, bool packedWeight) {
+        int arch = CudaTritonRuntimeArch();
+#ifdef FASTLLM_ENABLE_DEEPGEMM_FP8_SM90
+        // Preserve the native backend selected ahead of Triton on Hopper.
+        if (arch == 90) {
+            return false;
+        }
+#endif
+        if (rows > 0) {
+            int minBatch = std::max(128, FastllmCudaGetLinearExactBatchThreshold());
+            minBatch = std::max(minBatch, CudaEnvInt("FASTLLM_CUDA_TRITON_LINEAR_FP8_MIN_BATCH", 0));
+            int maxBatch = CudaTritonLinearFp8MaxBatch(
+                arch, CudaTritonLinearFp8MatmulVariant(arch, packedWeight, hasBias));
+            if (rows < minBatch || (maxBatch > 0 && rows > maxBatch)) {
+                return false;
+            }
+        }
+        return arch >= 89 && CudaTritonLinearFp8Enabled(arch) &&
+               CudaEnvFlagDefaultEnabled("FASTLLM_CUDA_TRITON_LINEAR_FP8_SWIGLU_QUANT", true) &&
+               CudaEnvFlagDefaultEnabled("FASTLLM_CUDA_TRITON_LINEAR_FP8_NATIVE_QUANT", true);
+    }
+
+    bool DoCudaTritonSwigluLinear(Data &input, Data &weight, const Data &bias, Data &output) {
+        if (input.dims.empty() ||
+            input.dims.back() <= 0 || (input.dims.back() % 256) != 0 ||
+            weight.dims.size() != 2) {
+            return false;
+        }
+        std::vector<int> outputDims = input.dims;
+        outputDims.back() = weight.dims[0];
+        if (output.dims != outputDims || output.dataDevice != DataDevice::CUDA ||
+            output.cudaData == nullptr || output.cudaData == weight.cudaData) {
+            return false;
+        }
+        // The fused reader consumes contiguous [gate, up] rows.
+        for (const Data *data : {&input, &output}) {
+            uint64_t stride = 1;
+            if (data->strides.size() != data->dims.size()) {
+                return false;
+            }
+            for (int i = (int)data->dims.size() - 1; i >= 0; --i) {
+                if (data->dims[i] <= 0 || data->strides[i] != stride) {
+                    return false;
+                }
+                stride *= data->dims[i];
+            }
+        }
+        int n = input.Count(0) / input.dims.back();
+        // Keep the existing small-batch GEMV/decode dispatch.
+        if (!CanUseCudaTritonSwigluLinear(n, !bias.dims.empty(), weight.dataType == DataType::FP8_E4M3_BLOCK_128)) {
+            return false;
+        }
+        return RunCudaTritonLinearFp8Block128(
+            input, weight, bias, output, n, input.dims.back() / 2, weight.dims[0], true);
     }
 
     struct CudaLinearFp8AutotuneKey {
@@ -4258,6 +4327,14 @@ namespace fastllm {
             batch, topk, hidden, inter, experts);
     }
 #else
+    bool CanUseCudaTritonSwigluLinear(int, bool, bool) {
+        return false;
+    }
+
+    bool DoCudaTritonSwigluLinear(Data &, Data &, const Data &, Data &) {
+        return false;
+    }
+
     bool FastllmCudaTryTritonDeepSeekV4WoA(
         const Data &, Data &, int, int, Data &) {
         return false;
@@ -6363,23 +6440,36 @@ namespace fastllm {
         }
     }
 
-    static bool CanUseCudaCutlassSwigluLinearAdd(
-        const Data &input, const Data &weight, const Data &bias, const Data &output) {
-        if (!CudaEnvFlagDefaultEnabled("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_SWIGLU_QUANT", true)) {
+    bool CanUseCudaCutlassSwigluLinear(int rows, bool tensorParallel) {
+        if (!CudaEnvFlagDefaultEnabled("FASTLLM_CUDA_CUTLASS_LINEAR_FP8", true) ||
+            !CudaEnvFlagDefaultEnabled("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_SWIGLU_QUANT", true)) {
             return false;
         }
+        int minBatch = std::max(FastllmCudaGetLinearExactBatchThreshold(),
+            CudaEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 8));
+        if (tensorParallel) {
+            if (!CudaEnvFlagDefaultEnabled("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_SWIGLU_QUANT_TP", true)) {
+                return false;
+            }
+            minBatch = std::max(minBatch,
+                CudaEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_SWIGLU_QUANT_TP_MIN_BATCH", 128));
+        }
+        return rows >= minBatch && FastllmCudaCutlassLinearFP8E4M3Block128FromSwigluAvailable();
+    }
+
+    static bool CanUseCudaSwigluLinearAdd(
+        const Data &input, const Data &weight, const Data &bias, const Data &output) {
         if (input.dims.empty() || weight.dims.size() != 2 || output.dims.empty()) {
             return false;
         }
         int gateup = input.dims.back();
-        if ((gateup % 2) != 0) {
+        if (gateup <= 0 || (gateup % 2) != 0) {
             return false;
         }
         int n = input.Count(0) / gateup;
-        int minBatch = std::max(
-            CudaEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 8),
-            FastllmCudaGetLinearExactBatchThreshold());
-        if (n < minBatch) {
+        if (!CanUseCudaCutlassSwigluLinear(n) &&
+            !(CanUseCudaTritonSwigluLinear(n, !bias.dims.empty()) &&
+              !FastllmCudaHasFp8MarlinLayout(weight))) {
             return false;
         }
         int inter = gateup / 2;
@@ -6426,7 +6516,7 @@ namespace fastllm {
             biasIt->second == nullptr || outputIt->second == nullptr) {
             return false;
         }
-        return CanUseCudaCutlassSwigluLinearAdd(
+        return CanUseCudaSwigluLinearAdd(
             *inputIt->second, *weightIt->second, *biasIt->second, *outputIt->second);
     }
 
@@ -6442,7 +6532,9 @@ namespace fastllm {
         int m = input.dims.back() / 2;
         int k = weight.dims[0];
         middle.Allocate(false);
-        bool ok = FastllmCudaCutlassLinearFP8E4M3Block128FromSwiglu(input, weight, bias, middle, n, m, k);
+        bool ok = (CanUseCudaCutlassSwigluLinear(n) &&
+                   FastllmCudaCutlassLinearFP8E4M3Block128FromSwiglu(input, weight, bias, middle, n, m, k)) ||
+                  DoCudaTritonSwigluLinear(input, weight, bias, middle);
         if (!ok) {
             Data swiglu;
             DoCudaSwigluReshape(input, swiglu);

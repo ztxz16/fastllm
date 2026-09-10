@@ -18,6 +18,9 @@ namespace fastllm {
     void DoCudaLinear(Data &input, Data &weight, const Data &bias, Data &output);
     void DoCudaSwigluReshape(Data &input, Data &output);
     void DoCudaSwiglu(Data &input, Data &output);
+    bool CanUseCudaCutlassSwigluLinear(int rows, bool tensorParallel = false);
+    bool CanUseCudaTritonSwigluLinear(int rows = 0, bool hasBias = false, bool packedWeight = false);
+    bool DoCudaTritonSwigluLinear(Data &input, Data &weight, const Data &bias, Data &output);
     void DoCudaGegluReshape(Data &input, Data &output);
     void DoCudaGeglu(Data &input, Data &output);
     void DoCudaSplitReshape(Data &input, int axis, int start, int end, Data &output);

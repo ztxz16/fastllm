@@ -1873,6 +1873,13 @@ bool FastllmCudaTritonLinearFP8E4M3Block128(
     const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output,
     int n, int m, int k);
 
+bool FastllmCudaTritonLinearFP8E4M3Block128FromSwiglu(
+    const char *quantCubitPath, const char *quantKernelName, int quantNumWarps, int quantShared,
+    const char *matmulCubitPath, const char *matmulKernelName, int matmulNumWarps, int matmulShared,
+    int blockM, int blockN, int blockK, int groupSizeM, bool packedWeight, bool stridedMatmul,
+    const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output,
+    int n, int m, int k);
+
 bool FastllmCudaTritonDeepSeekV4WoA(
     const char *cubinPath, const char *kernelName, int numWarps, int shared,
     int blockTokens, int blockOut, int blockHidden,
