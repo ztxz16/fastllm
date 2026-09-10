@@ -20,6 +20,8 @@
 
 #if defined(FASTLLM_ENABLE_CUTLASS_FP8) && defined(FASTLLM_CUTLASS_FP8_ENABLE_SM89)
 
+#include "fastllm-linear-fp8-quant.cuh"
+
 // CUTLASS 2.x headers are order-sensitive. Keep this order aligned with the
 // upstream scaled-mm implementation.
 #include "cute/tensor.hpp"
@@ -225,69 +227,6 @@ static bool FastllmSm89EnsureWorkspace(
     }
     workspace = scratch.workspace;
     return true;
-}
-
-template <typename T>
-__device__ __forceinline__ float FastllmSm89ToFloat(T value);
-
-template <>
-__device__ __forceinline__ float FastllmSm89ToFloat(half value) {
-    return __half2float(value);
-}
-
-template <>
-__device__ __forceinline__ float FastllmSm89ToFloat(__nv_bfloat16 value) {
-    return __bfloat162float(value);
-}
-
-template <typename T>
-__global__ void __launch_bounds__(256) FastllmSm89QuantPerRowKernel(
-    const T *__restrict__ input, uint8_t *__restrict__ quant,
-    float *__restrict__ scales, int rows, int cols) {
-    int row = blockIdx.x;
-    if (row >= rows) {
-        return;
-    }
-    constexpr int kWarps = 8;
-    __shared__ float warpMax[kWarps];
-    __shared__ float rowScale;
-    int lane = threadIdx.x & 31;
-    int warp = threadIdx.x >> 5;
-    const T *rowInput = input + (size_t)row * cols;
-    uint8_t *rowQuant = quant + (size_t)row * cols;
-
-    float maxAbs = 0.0f;
-    for (int col = threadIdx.x; col < cols; col += blockDim.x) {
-        maxAbs = fmaxf(maxAbs, fabsf(FastllmSm89ToFloat(rowInput[col])));
-    }
-#pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        maxAbs = fmaxf(maxAbs,
-                       __shfl_down_sync(0xffffffffu, maxAbs, offset));
-    }
-    if (lane == 0) {
-        warpMax[warp] = maxAbs;
-    }
-    __syncthreads();
-    if (warp == 0) {
-        maxAbs = lane < kWarps ? warpMax[lane] : 0.0f;
-#pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            maxAbs = fmaxf(maxAbs,
-                           __shfl_down_sync(0xffffffffu, maxAbs, offset));
-        }
-        if (lane == 0) {
-            rowScale = maxAbs > 0.0f ? maxAbs * (1.0f / 448.0f) : 1.0f;
-            scales[row] = rowScale;
-        }
-    }
-    __syncthreads();
-    float invScale = 1.0f / rowScale;
-    for (int col = threadIdx.x; col < cols; col += blockDim.x) {
-        float value = FastllmSm89ToFloat(rowInput[col]) * invScale;
-        rowQuant[col] = (uint8_t)__nv_cvt_float_to_fp8(
-            value, __NV_SATFINITE, __NV_E4M3);
-    }
 }
 
 template <typename T>
@@ -596,13 +535,13 @@ bool FastllmCudaCutlassLinearFP8E4M3PerChannel(
         return false;
     }
     if (input.dataType == fastllm::DataType::FLOAT16) {
-        FastllmSm89QuantPerRowKernel<<<n, 256, 0, stream>>>(
+        FastllmSm89LaunchQuantPerRow(
             (const half *)inputData, (uint8_t *)quantInput,
-            inputScales, n, m);
+            inputScales, n, m, stream);
     } else {
-        FastllmSm89QuantPerRowKernel<<<n, 256, 0, stream>>>(
+        FastllmSm89LaunchQuantPerRow(
             (const __nv_bfloat16 *)inputData, (uint8_t *)quantInput,
-            inputScales, n, m);
+            inputScales, n, m, stream);
     }
     bool ok = cudaGetLastError() == cudaSuccess;
     const auto *cutlassWeight =

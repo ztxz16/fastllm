@@ -724,6 +724,11 @@ if (UNIT_TEST)
 
         if (FASTLLM_CUTLASS_FP8_SM89_ENABLED AND
             CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.4")
+            add_executable(cuda_fp8_perchannel_quant_test test/basic/test_cuda_fp8_perchannel_quant.cu)
+            add_test(NAME cuda_fp8_perchannel_quant COMMAND cuda_fp8_perchannel_quant_test)
+            set_tests_properties(cuda_fp8_perchannel_quant PROPERTIES LABELS cuda SKIP_RETURN_CODE 77)
+            # The quantization test is independent of CUTLASS, but dispatch
+            # requires the backend to be compiled, not just an SM89 target.
             if (NOT WIN32 AND FASTLLM_CUTLASS_FP8_SM89_BACKEND_ENABLED)
                 add_executable(cuda_fp8_perchannel_dispatch_test test/basic/test_cuda_fp8_perchannel_dispatch.cpp)
                 target_link_libraries(cuda_fp8_perchannel_dispatch_test PRIVATE fastllm)
