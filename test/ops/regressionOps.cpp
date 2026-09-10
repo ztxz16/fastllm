@@ -3993,6 +3993,8 @@ namespace {
         // Unaligned TP projections retain their logical shape while Marlin
         // pads only the packed output channels. Include odd row strides,
         // the K64/N128 tile, small scratch fallback, and the production shape.
+        // M=49/64 cover the dense prefill tile; M=1025 crosses the row-chunk
+        // boundary and verifies that its small-M tail still works in graphs.
         for (const auto &shape : std::vector<std::pair<int, int>>{
                  {208, 256}, {255, 128}, {257, 128},
                  {208, 192}, {8240, 5120}}) {
@@ -4008,7 +4010,7 @@ namespace {
                 fastllm::DataType::FLOAT32, {logicalN},
                 MakeRegressionValues(logicalN, 0.31f, 0.015f));
 
-            for (int rows : {1, 8, 31, 65}) {
+            for (int rows : {1, 8, 31, 49, 64, 65, 1025}) {
                 const std::string label = "NVFP4 Marlin padded N=" +
                     std::to_string(logicalN) + " K=" + std::to_string(sizeK) +
                     " M=" + std::to_string(rows);
@@ -4021,8 +4023,9 @@ namespace {
                 fastllm::Data observed = MakeCudaTensor(
                     fastllm::DataType::FLOAT16, {rows, logicalN},
                     std::vector<float>((size_t)rows * logicalN, 0.0f));
-                const fastllm::Data &selectedBias = rows == 1 || rows == 31
-                    ? noBias : paddedBias;
+                const fastllm::Data &selectedBias =
+                    rows == 1 || rows == 31 || rows == 49
+                        ? noBias : paddedBias;
                 FastllmCudaSetNcclForceSync(false);
                 Expect(FastllmCudaHalfMatMulFloatNVFP4Block16(
                            x, nativeWeight, selectedBias, expected,
@@ -4044,7 +4047,7 @@ namespace {
                 ExpectFloatNear(expectedValues, ToFloatVector(observed),
                                 2.0e-2f, 2.0e-3f, label);
 
-                if (rows == 8) {
+                if (rows == 8 || rows == 1025) {
                     // Exercise both tail-resident and pooled padded outputs
                     // under graph capture, repeated replay, and pool reuse.
                     FastllmCudaSetNcclForceSync(false);

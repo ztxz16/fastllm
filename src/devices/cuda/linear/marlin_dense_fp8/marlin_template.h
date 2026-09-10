@@ -238,8 +238,8 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
                              // fetch pipeline
           const int group_blocks,  // number of consecutive 16x16 blocks
                                    // with a separate quantization scale
-          const bool is_zp_float   // is zero point of float16 type?
-          >
+          const bool is_zp_float,  // is zero point of float16 type?
+          const bool dense_fp32>
 __global__ void Marlin(
     const int4* __restrict__ A0,  // fp16 input matrix of shape mxk
     const int4* __restrict__ B,   // 4bit quantized weight matrix of shape kxn
@@ -264,10 +264,13 @@ __global__ void Marlin(
     int prob_k,      // reduction dimension k
     int lda,         // A.stride(0), equal to prob_k is A is contiguous
     int* locks,      // extra global storage for barrier synchronization
-    bool has_bias,
-    bool use_atomic_add,   // whether to use atomic add to reduce
-    bool use_fp32_reduce,  // whether to use fp32 global reduce
+    bool has_bias_arg,
+    bool use_atomic_add_arg,   // whether to use atomic add to reduce
+    bool use_fp32_reduce_arg,  // whether to use fp32 global reduce
     int max_shared_mem) {
+  const bool has_bias = dense_fp32 ? false : has_bias_arg;
+  const bool use_atomic_add = dense_fp32 ? false : use_atomic_add_arg;
+  const bool use_fp32_reduce = dense_fp32 ? true : use_fp32_reduce_arg;
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
   // `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM
@@ -1785,6 +1788,16 @@ __global__ void Marlin(
     start_pipes();
   }
 
+  // SM75 has synchronous global-to-shared copies. Retiring the current
+  // fragments before fetching the next ones shortens register lifetimes in
+  // the dense prefill specialization, without changing the shared pipeline.
+  // NVFP4 has no zero point, so matmul does not use its pipe argument.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
+  constexpr bool late_fetch = dense_fp32;
+#else
+  constexpr bool late_fetch = false;
+#endif
+
   // Main loop.
   while (slice_iters) {
     // We unroll over both the global fetch and the register load pipeline to
@@ -1796,6 +1809,7 @@ __global__ void Marlin(
     for (int pipe = 0; pipe < stages;) {
   #pragma unroll
       for (int k = 0; k < b_sh_wr_iters; k++) {
+        if constexpr (late_fetch) matmul(k, pipe);
         fetch_to_registers(k + 1, pipe % stages);
         fetch_scales_to_registers(k + 1, pipe);
         fetch_zp_to_registers(k + 1, pipe);
@@ -1808,7 +1822,8 @@ __global__ void Marlin(
         }
 
         if constexpr (!is_a_8bit) {
-          matmul(k, pipe - (k >= b_sh_wr_iters - 2 ? 1 : 0));
+          if constexpr (!late_fetch)
+            matmul(k, pipe - (k >= b_sh_wr_iters - 2 ? 1 : 0));
         } else {
           static_assert(group_blocks != 0 && group_blocks != 1);
           matmul_a8(k);

@@ -151,13 +151,18 @@ static KernelFn PickKernel(int sizeM, int threadK, int threadN, int groupBlocks,
 #undef RET_K
 #undef RET_K_STAGES
 
-// Explicit FE2M1 + special FE4M3 scale, group16 (group_blocks=1).  vLLM uses
-// stages=2 on SM75 and stages=4 on every newer architecture.
-#define RET_FP4(STAGES, THREADS, TM, TN, TK, M8)                               \
-    return MARLIN_NAMESPACE_NAME::Marlin<                                     \
-        vllm::kFloat16.id(), vllm::kFE2M1f.id(), vllm::kFloat16.id(),        \
-        vllm::kFE4M3fn.id(), (THREADS), (TM), (TN), (TK), (M8),              \
-        (STAGES), 1, false>
+// Explicit FE2M1 + special FE4M3 scale, group16 (group_blocks=1).
+// Only SM75 selects stages=2; newer architectures select stages=4.
+// The SM75 64x256x64 prefill tile specializes the fixed dense reduction
+// flags to remove unused bias/atomic paths and register spills. Bias
+// remains in the outer epilogue. Small-M and SM80+ keep their pipeline.
+#define RET_FP4(STAGES, THREADS, TM, TN, TK, M8)                            \
+    return MARLIN_NAMESPACE_NAME::Marlin<                                   \
+        vllm::kFloat16.id(), vllm::kFE2M1f.id(), vllm::kFloat16.id(),       \
+        vllm::kFE4M3fn.id(), (THREADS), (TM), (TN), (TK), (M8),             \
+        (STAGES), 1, false,                                                 \
+        ((STAGES) == 2 && (THREADS) == 256 && (TM) == 4 &&                  \
+         (TN) == 16 && (TK) == 4 && !(M8))>
 #define RET_FP4_FOR_ARCH(THREADS, TM, TN, TK, M8)                             \
     do {                                                                      \
         if (stages == 2) RET_FP4(2, THREADS, TM, TN, TK, M8);                \
