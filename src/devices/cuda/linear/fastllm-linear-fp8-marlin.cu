@@ -8,6 +8,7 @@
  */
 
 #include "fastllm-cuda.cuh"
+#include "fastllm-cublas-prefill.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -18,8 +19,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <map>
-#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -90,21 +89,6 @@ static bool Fp8MarlinShouldPreserveRowMajorForTriton(int arch) {
 #endif
 }
 
-// SM75 large-M FP8 prefill. Reserve only cuBLAS's 8 MiB workspace during
-// synchronized warmup; borrow the existing FlashInfer float arena for weights.
-// KV page calibration then observes the occupied memory before serving.
-struct Fp8PrefillCublasState {
-    std::mutex mutex;
-    half *scratch = nullptr;
-    void *workspace = nullptr;
-    cublasHandle_t handle = nullptr;
-    cudaEvent_t completed = nullptr;
-    size_t capacity = 0;
-    bool initialized = false;
-    bool submitted = false;
-    bool logged = false;
-};
-
 constexpr int FP8_PREFILL_MIN_ROWS = 1024;
 constexpr int FP8_PREFILL_SMALL_WORKSPACE_MIN_ROWS = 1536;
 
@@ -119,79 +103,18 @@ static bool Fp8PrefillEnabled() {
     return enabled;
 }
 
-static void Fp8PrefillCheckCuda(cudaError_t status) {
-    if (status != cudaSuccess) {
-        std::fprintf(stderr, "FP8 prefill CUDA error: %s\n", cudaGetErrorString(status));
-        throw("fp8 prefill cuda error");
-    }
-}
-
-static void Fp8PrefillCheckCublas(cublasStatus_t status) {
-    if (status != CUBLAS_STATUS_SUCCESS) {
-        std::fprintf(stderr, "FP8 prefill cuBLAS error: %d\n", int(status));
-        throw("fp8 prefill cublas error");
-    }
-}
-
-static Fp8PrefillCublasState *Fp8PrefillState(int arch) {
-    if (arch != 75 || !Fp8PrefillEnabled()) return nullptr;
-    int device = 0;
-    Fp8PrefillCheckCuda(cudaGetDevice(&device));
-    // The global lock protects only the map. Never allocate under a cross-rank
-    // lock: CUDA allocation may wait for outstanding NCCL work on this device.
-    static std::mutex mapMutex;
-    static std::map<int, std::unique_ptr<Fp8PrefillCublasState>> states;
-    Fp8PrefillCublasState *state;
-    {
-        std::lock_guard<std::mutex> guard(mapMutex);
-        auto &entry = states[device];
-        if (!entry) entry = std::make_unique<Fp8PrefillCublasState>();
-        state = entry.get();
-    }
-    std::lock_guard<std::mutex> guard(state->mutex);
-    if (state->initialized) return state;
-    cudaStreamCaptureStatus capture;
-    Fp8PrefillCheckCuda(cudaStreamIsCapturing(cudaStreamPerThread, &capture));
-    if (!FastllmCudaGetNcclForceSync() || capture != cudaStreamCaptureStatusNone) {
-        return nullptr; // Never grow scratch while serving or capturing a graph.
-    }
-    constexpr size_t workspaceBytes = 8 * 1024 * 1024;
-    // Match the existing GGUF dequant workspace convention: per-device model
-    // operations run in order on the worker's per-thread default stream.
-    // This is not a lease for concurrent independent streams/models.
-    // Only the float arena holds disposable per-call intermediates; the int
-    // arena contains cached attention plans and must not be overwritten.
-    size_t available = 0;
-    state->scratch = static_cast<half *>(FastllmCudaGetFlashInferFloatWorkspace(&available));
-    state->capacity = available;
-    if (state->scratch == nullptr || state->capacity == 0) return nullptr;
-    // The process-lifetime float arena belongs to FlashInfer. Never free it or
-    // enlarge it here. Keep cuBLAS scratch separate because both ranges are
-    // live during GEMM. Materialize these before KV page budget calibration.
-    Fp8PrefillCheckCuda(cudaMalloc(&state->workspace, workspaceBytes));
-    Fp8PrefillCheckCublas(cublasCreate(&state->handle));
-    Fp8PrefillCheckCublas(cublasSetStream(state->handle, cudaStreamPerThread));
-    Fp8PrefillCheckCublas(cublasSetMathMode(state->handle, cublasMath_t(
-        CUBLAS_TENSOR_OP_MATH | CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION)));
-    Fp8PrefillCheckCublas(cublasSetWorkspace(state->handle, state->workspace, workspaceBytes));
-    Fp8PrefillCheckCuda(cudaEventCreateWithFlags(&state->completed, cudaEventDisableTiming));
-    state->initialized = true;
-    std::fprintf(stderr,
-        "[FP8 prefill cuBLAS] GPU %d: borrowed FlashInfer float %zu MiB scratch at %p "
-        "+ 8 MiB cuBLAS workspace during force-sync warmup; min_rows=%d.\n",
-        device, state->capacity / 1024 / 1024, static_cast<void *>(state->scratch),
-        FP8_PREFILL_MIN_ROWS);
-    return state;
-}
+using fastllm_cuda_prefill::State;
+using fastllm_cuda_prefill::CheckCuda;
+using fastllm_cuda_prefill::CheckCublas;
 
 #include "fastllm-fp8-prefill-dequant.cuh"
 
-static bool Fp8PrefillCublas(Fp8PrefillCublasState *state,
+static bool Fp8PrefillCublas(State *state,
         const half *input, const uint32_t *weight, const half *scales,
         half *output, int rows, int sizeN, int sizeK) {
     if (state == nullptr || rows < FP8_PREFILL_MIN_ROWS) return false;
     cudaStreamCaptureStatus capture;
-    Fp8PrefillCheckCuda(cudaStreamIsCapturing(cudaStreamPerThread, &capture));
+    CheckCuda(cudaStreamIsCapturing(cudaStreamPerThread, &capture));
     if (capture != cudaStreamCaptureStatusNone) return false;
     const int chunkN = int(std::min(size_t(sizeN),
         state->capacity / (size_t(sizeK) * sizeof(half))) / 64 * 64);
@@ -205,33 +128,31 @@ static bool Fp8PrefillCublas(Fp8PrefillCublasState *state,
         return false;
     }
     std::lock_guard<std::mutex> guard(state->mutex);
-    // Order FP8 submissions to the dedicated cuBLAS handle. Shared attention
-    // scratch additionally relies on the existing worker stream ordering.
-    if (state->submitted) {
-        Fp8PrefillCheckCuda(cudaStreamWaitEvent(cudaStreamPerThread, state->completed, 0));
-    }
+    // Order quantized prefill submissions to the dedicated cuBLAS handle.
+    // Shared attention scratch also relies on the existing worker stream order.
+    CheckCuda(cudaStreamWaitEvent(cudaStreamPerThread, state->completed, 0));
+    fastllm_cuda_prefill::SetPointerMode(state, CUBLAS_POINTER_MODE_HOST);
     const half alpha = __float2half_rn(1), beta = __float2half_rn(0);
     for (int offset = 0; offset < sizeN; offset += chunkN) {
         const int count = std::min(chunkN, sizeN - offset);
         Fp8PrefillDequantKernel<<<dim3(count / 64, (sizeK + 255) / 256), 256, 0, cudaStreamPerThread>>>(
             weight, scales, state->scratch, sizeN, sizeK, offset);
-        Fp8PrefillCheckCuda(cudaPeekAtLastError());
+        CheckCuda(cudaPeekAtLastError());
         // FP16 accumulation is intentional for the measured SM75 speedup.
         // Dequantized weights match Marlin, but GEMM results are not bitwise equal.
-        Fp8PrefillCheckCublas(cublasGemmEx(state->handle, CUBLAS_OP_T, CUBLAS_OP_N,
+        CheckCublas(cublasGemmEx(state->handle, CUBLAS_OP_T, CUBLAS_OP_N,
             count, rows, sizeK, &alpha, state->scratch, CUDA_R_16F, sizeK,
             input, CUDA_R_16F, sizeK, &beta, output + offset, CUDA_R_16F, sizeN,
             CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     }
-    Fp8PrefillCheckCuda(cudaEventRecord(state->completed, cudaStreamPerThread));
-    state->submitted = true;
-    if (!state->logged) {
+    CheckCuda(cudaEventRecord(state->completed, cudaStreamPerThread));
+    if (!state->fp8Logged) {
         int device = 0;
-        Fp8PrefillCheckCuda(cudaGetDevice(&device));
+        CheckCuda(cudaGetDevice(&device));
         std::fprintf(stderr,
             "[FP8 prefill cuBLAS] GPU %d: active, rows=%d N=%d K=%d; capacity=%zu.\n",
             device, rows, sizeN, sizeK, state->capacity);
-        state->logged = true;
+        state->fp8Logged = true;
     }
     return true;
 }
@@ -502,8 +423,8 @@ extern "C" bool FastllmCudaTryMarlinHalfMatMulFloatFP8E4M3(
     // though the small warmup GEMM itself still goes through Marlin/GEMV.
     // Decode avoids the state lookup and CUDA event operations entirely.
     auto *prefillState = arch == 75 && Fp8PrefillMatrixSupported(k, m) &&
-        (n >= FP8_PREFILL_MIN_ROWS || FastllmCudaGetNcclForceSync())
-        ? Fp8PrefillState(arch) : nullptr;
+        (n >= FP8_PREFILL_MIN_ROWS || FastllmCudaGetNcclForceSync()) &&
+        Fp8PrefillEnabled() ? fastllm_cuda_prefill::GetState(arch) : nullptr;
 
     // Keep batch-one decode on GEMV. Before conversion the caller can use the
     // original-layout GEMV directly; during synchronized warmup convert first
