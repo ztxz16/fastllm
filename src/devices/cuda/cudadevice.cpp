@@ -403,7 +403,7 @@ namespace fastllm {
         const std::string &matmulVariant) {
         std::ostringstream os;
         if (matmulVariant == "strided") {
-            os << "linear_fp8_block128_strided_v4_";
+            os << "linear_fp8_block128_strided_v5_";
         } else {
             os << "linear_fp8_block128_v5_";
         }
@@ -2482,8 +2482,7 @@ namespace fastllm {
         int groupSizeM = CudaEnvIntRange("FASTLLM_CUDA_TRITON_LINEAR_FP8_GROUP_SIZE_M", 32, 1, 4096);
         int quantNumWarps = CudaEnvInt("FASTLLM_CUDA_TRITON_LINEAR_FP8_QUANT_NUM_WARPS", 4);
         int matmulNumWarps = CudaEnvInt("FASTLLM_CUDA_TRITON_LINEAR_FP8_MATMUL_NUM_WARPS", 4);
-        int numStages = CudaEnvInt("FASTLLM_CUDA_TRITON_LINEAR_FP8_NUM_STAGES",
-                                   matmulVariant == "strided" ? 2 : 3);
+        int numStages = CudaEnvInt("FASTLLM_CUDA_TRITON_LINEAR_FP8_NUM_STAGES", 3);
         if (blockK != 128 || blockN <= 0 || blockM <= 0) {
             return false;
         }

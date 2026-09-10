@@ -1348,22 +1348,27 @@ if triton is not None:
         b_ptrs = B + (offs_k[:, None] + offs_bn[None, :] * stride_bn)
 
         As_ptrs = As + offs_am * stride_As_m
-        offs_bsn = offs_bn // group_n
+        # The block128 launcher guarantees group_n == group_k == 128.
+        # Keep the runtime arguments for the existing cubin launch ABI.
+        offs_bsn = offs_bn // 128
         Bs_ptrs = Bs + offs_bsn * stride_Bs_n
 
+        # Carry the next scales across iterations so their loads can overlap
+        # the matrix operand pipeline, without reordering FP32 arithmetic.
+        a_s = tl.load(As_ptrs)
+        b_s = tl.load(Bs_ptrs)
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
         for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
             a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
             b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
 
-            k_start = k * BLOCK_SIZE_K
-            offs_ks = k_start // group_k
-            a_s = tl.load(As_ptrs + offs_ks)
-            b_s = tl.load(Bs_ptrs + offs_ks)
-
             accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
             a_ptrs += BLOCK_SIZE_K
             b_ptrs += BLOCK_SIZE_K
+            # The final iteration has no next scale block, including when K
+            # ends in a partial block. Mask it instead of reading past a row.
+            a_s = tl.load(As_ptrs + k + 1, mask=k + 1 < tl.cdiv(K, BLOCK_SIZE_K), other=0.0)
+            b_s = tl.load(Bs_ptrs + k + 1, mask=k + 1 < tl.cdiv(K, BLOCK_SIZE_K), other=0.0)
 
         if C.dtype.element_ty == tl.bfloat16:
             c = accumulator.to(tl.bfloat16)
@@ -2692,7 +2697,7 @@ def linear_fp8_block128_cache_paths(payload):
         )
     else:
         name = (
-            f"linear_fp8_block128_strided_v4_{weight_layout}_{input_dtype}_bias{has_bias}_sm{arch}"
+            f"linear_fp8_block128_strided_v5_{weight_layout}_{input_dtype}_bias{has_bias}_sm{arch}"
             f"_bm{block_m}_bn{block_n}_bk{block_k}_gsm{group_size_m}"
             f"_qnw{quant_num_warps}_mnw{matmul_num_warps}_ns{num_stages}"
         )
