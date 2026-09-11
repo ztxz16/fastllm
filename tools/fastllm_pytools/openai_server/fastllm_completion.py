@@ -1701,7 +1701,7 @@ class FastLLmCompletion:
           content = parsed.content,
       )
 
-  def _normalize_anthropic_system_messages(
+  def _normalize_system_messages(
       self, conversation: List[ConversationMessage],
   ) -> List[ConversationMessage]:
       # Local model templates commonly require a single leading system message.
@@ -2856,7 +2856,7 @@ class FastLLmCompletion:
               conversation.extend(messages)
               media.extend(message_media)
 
-          conversation = self._normalize_anthropic_system_messages(conversation)
+          conversation = self._normalize_system_messages(conversation)
           if len(conversation) == 0:
               raise Exception("Empty msg")
 
@@ -3023,6 +3023,16 @@ class FastLLmCompletion:
               conversation.extend(messages)
               media.extend(message_media)
 
+          if self._is_qwen3_5_model() and any(
+                  message.role == "developer" for message in conversation):
+              # Harness/pi-ai sends developer instructions for reasoning models.
+              # Qwen3.5/3.8 templates accept one leading system message instead.
+              # Preserve native developer handling for other model families.
+              for message in conversation:
+                  if message.role == "developer":
+                      message.role = "system"
+              conversation = self._normalize_system_messages(conversation)
+
           if len(conversation) == 0:
             raise Exception("Empty msg")
           messages = []
@@ -3171,6 +3181,11 @@ class FastLLmCompletion:
                   prepare_and_launch_text_request)
           else:
               input_token_len, handle = prepare_and_launch_text_request()
+      except (ValueError, TemplateError) as error:
+          # Invalid input must not trigger the client's HTTP 500 retry loop.
+          return self.create_error_response(
+              f"Could not prepare model input: {error}",
+              err_type = "invalid_request_error")
       finally:
           self._cleanup_temp_paths(media.temp_paths)
       # Store the mapping between conversation ID and handle

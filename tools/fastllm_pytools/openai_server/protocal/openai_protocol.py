@@ -6,7 +6,7 @@ import time
 import uuid
 
 import shortuuid
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class ErrorResponse(BaseModel):
@@ -94,6 +94,7 @@ class ChatCompletionRequest(BaseModel):
     top_k: Optional[int] = None
     n: Optional[int] = 1
     max_tokens: Optional[int] = None
+    max_completion_tokens: Optional[int] = Field(default=None, gt=0)
     min_tokens: Optional[int] = 0
     stop: Optional[Union[str, List[str]]] = None
     stream: Optional[bool] = False
@@ -112,6 +113,14 @@ class ChatCompletionRequest(BaseModel):
         "none", "minimal", "low", "medium", "high", "xhigh", "max"
     ]] = None
     chat_template_kwargs: Optional[Dict[str, Any]] = None
+
+    @model_validator(mode="after")
+    def normalize_completion_token_limit(self):
+        # Modern Chat Completions clients use this field. Normalize it once so
+        # backend generation, tool parsing and finish reasons use one budget.
+        if self.max_completion_tokens is not None:
+            self.max_tokens = self.max_completion_tokens
+        return self
 
 
 class ResponsesRequest(BaseModel):

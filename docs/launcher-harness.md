@@ -37,6 +37,10 @@ ftllm launch
 
 Launcher 自动配置 FastLLM 提供方的 API 地址、模型名称、密钥和已识别的上下文容量。密钥只通过子进程环境传递。工作区选择器直接显示在嵌入页中。
 
+Launcher 设置 `compat.supportsDeveloperRole: false`，让 Harness 使用 `system` 发送系统提示词，避免 Qwen 模板拒绝 `developer` 角色。直接连接 API 时，Qwen3.5/3.8 服务也会将 `developer` 指令与显式 `system` 指令按原顺序合并为开头的系统消息，保留用户消息和工具调用记录。
+
+模型输出预算通过 `compat.maxTokensField: max_tokens` 发送，兼容只支持旧字段的 FastLLM 服务。新版服务也接受 `max_completion_tokens`；两者同时提供时，以非空的 `max_completion_tokens` 为准。
+
 ## 数据和生命周期
 
 - 默认配置和会话保存在 `~/.fastllm/deepseek-harness/home`，默认工作目录为 `~/.fastllm/deepseek-harness/workspace`，也可以在 Harness 中选择其他工作区。

@@ -86,6 +86,8 @@ class HarnessRuntimeTest(unittest.TestCase):
             model = config["providers"]["fastllm"]
             self.assertEqual(model["baseURL"], "http://127.0.0.1:8001/v1")
             self.assertEqual(model["models"][0]["contextWindow"], 32768)
+            self.assertEqual(model["compat"]["maxTokensField"], "max_tokens")
+            self.assertFalse(model["compat"]["supportsDeveloperRole"])
             self.assertEqual(next(p["config"]["host"] for p in probe["patch"] if p.get("id") == "webserver"), "127.0.0.1")
             self.assertNotIn("private-api-key", json.dumps(probe))
             self.assertEqual(probe["cwd"], str(self.root / "workspace"))

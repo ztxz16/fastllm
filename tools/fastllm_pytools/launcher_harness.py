@@ -94,7 +94,9 @@ class HarnessRuntime(ManagedAgentRuntime):
                             "reasoningEfforts": {"off" if effort == "none" else effort: effort
                                                  for effort in efforts} if efforts else False,
                             "contextWindow": context, "maxTokens": min(8192, context // 2)}],
-                "compat": {"supportsStore": False, "supportsReasoningEffort": True, "thinkingFormat": "openai"},
+                "compat": {"supportsStore": False, "supportsReasoningEffort": True,
+                           "thinkingFormat": "openai", "maxTokensField": "max_tokens",
+                           "supportsDeveloperRole": False},
             }}}},
             {"id": "session-log-deepseek", "disabled": True},
             {"id": "session-telemetry-otel", "disabled": True},
