@@ -132,8 +132,8 @@ class FastLLmModelContextMetadataTest(unittest.TestCase):
         self.assertEqual(
             model["supportedReasoningEfforts"],
             ["none", "low", "medium", "xhigh"])
-        self.assertEqual(model["default_reasoning_effort"], "xhigh")
-        self.assertEqual(model["defaultReasoningEffort"], "xhigh")
+        self.assertEqual(model["default_reasoning_effort"], "medium")
+        self.assertEqual(model["defaultReasoningEffort"], "medium")
 
     def test_glm5_next_reasoning_efforts_are_discoverable(self):
         metadata = FastLLmModel(

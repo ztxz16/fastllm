@@ -124,10 +124,10 @@ def request(**kwargs):
 
 
 class Qwen35ReasoningTest(unittest.IsolatedAsyncioTestCase):
-    def test_effort_defaults_to_xhigh_and_accepts_native_levels(self):
+    def test_effort_defaults_to_medium_and_accepts_native_levels(self):
         instance = completion()
         self.assertEqual(
-            instance._resolve_qwen3_5_reasoning_effort(request()), "xhigh")
+            instance._resolve_qwen3_5_reasoning_effort(request()), "medium")
         for effort in ("low", "medium", "xhigh"):
             with self.subTest(effort=effort):
                 self.assertEqual(

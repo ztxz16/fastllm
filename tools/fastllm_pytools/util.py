@@ -1316,6 +1316,8 @@ def make_normal_llm_model(args, startup_progress = None):
                 architecture == 'LagunaForCausalLM' or model_type == 'laguna' or
                 architecture == 'Qwen3_5MoeForConditionalGeneration' or
                 model_type == 'qwen3_5_moe' or text_model_type == 'qwen3_5_moe_text' or
+                architecture == 'Qwen3_5ForConditionalGeneration' or
+                model_type == 'qwen3_5' or text_model_type == 'qwen3_5_text' or
                 architecture == 'Qwen4ExpForConditionalGeneration' or
                 architecture == 'Qwen3_8FlashNextForConditionalGeneration' or
                 model_type in ('qwen4_exp', 'qwen3_8_flash_next') or

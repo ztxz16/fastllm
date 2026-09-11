@@ -35,7 +35,7 @@ class ReasoningNoneTest(unittest.TestCase):
                     self.assertEqual(response.status_code, 200, response.text)
                     for kwargs in (self.model.input_kwargs, self.model.launch_kwargs):
                         self.assertFalse(kwargs["enable_thinking"])
-                        self.assertEqual(kwargs["chat_template_kwargs"]["reasoning_effort"], "xhigh")
+                        self.assertEqual(kwargs["chat_template_kwargs"]["reasoning_effort"], "medium")
                     self.assertEqual(self.model.counted_prompt, self.model.generated_prompt)
                     self.assertTrue(self.model.generated_prompt.endswith("<think>\n\n</think>\n\n"))
                     self.assertTrue(self.completion.enable_thinking)
@@ -54,7 +54,7 @@ class ReasoningNoneTest(unittest.TestCase):
 
     def test_none_keeps_native_template_effort_valid_for_all_model_families(self):
         for model_type, resolver, expected in (
-                ("qwen3_5", "_resolve_qwen3_5_reasoning_effort", "xhigh"),
+                ("qwen3_5", "_resolve_qwen3_5_reasoning_effort", "medium"),
                 ("qwen4_exp", "_resolve_qwen3_5_reasoning_effort", "xhigh"),
                 ("kimi_k3", "_resolve_kimi_k3_reasoning_effort", "max"),
                 ("glm5_next", "_resolve_glm5_next_reasoning_effort", "max")):

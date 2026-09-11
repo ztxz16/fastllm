@@ -413,8 +413,11 @@ class FastLLmCompletion:
       if effort is None:
           effort = template_kwargs.get(
               "reasoning_effort", template_kwargs.get("thinking_effort"))
+      # Qwen3.8's fixed template defaults to medium; xhigh can exhaust the
+      # token budget on reasoning and return empty content.
+      default_effort = "medium" if self._is_qwen3_5_model() else "xhigh"
       if effort in {None, "none"}:
-          effort = "xhigh"
+          effort = default_effort
       if effort not in {"low", "medium", "xhigh"}:
           raise ValueError(
               "Qwen reasoning_effort must be one of: none, low, medium, xhigh")
@@ -1378,6 +1381,9 @@ class FastLLmCompletion:
               enable_thinking = enable_thinking,
               encode_vision = False,
               encode_fn = self.model.encode,
+              tools = tools,
+              tool_choice = tool_choice,
+              chat_template_kwargs = chat_template_kwargs,
           )
           return len(native_inputs["input_ids"])
       if architecture == "Step3p7ForConditionalGeneration":

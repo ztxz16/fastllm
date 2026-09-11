@@ -304,14 +304,27 @@ def normalize_qwen35_conversation(
     return updated
 
 
-def apply_chat_template_with_optional_thinking(tokenizer, conversation, add_generation_prompt, enable_thinking):
+def apply_chat_template_with_optional_thinking(
+    tokenizer, conversation, add_generation_prompt, enable_thinking,
+    tools=None, tool_choice=None, chat_template_kwargs=None,
+):
     kwargs = {
         "tokenize": False,
         "add_generation_prompt": add_generation_prompt,
     }
+    if chat_template_kwargs:
+        kwargs.update(chat_template_kwargs)
+    if tools is not None:
+        kwargs["tools"] = tools
+    if tool_choice is not None:
+        kwargs["tool_choice"] = tool_choice
+    kwargs["enable_thinking"] = enable_thinking
     try:
-        return tokenizer.apply_chat_template(conversation, enable_thinking=enable_thinking, **kwargs)
+        return tokenizer.apply_chat_template(conversation, **kwargs)
     except TypeError:
+        kwargs.pop("enable_thinking", None)
+        kwargs.pop("tool_choice", None)
+        kwargs.pop("tools", None)
         return tokenizer.apply_chat_template(conversation, **kwargs)
 
 
@@ -517,6 +530,9 @@ def build_qwen35_prompt(
     add_generation_prompt: bool,
     enable_thinking: bool,
     tokenizer_config: Optional[Dict[str, Any]] = None,
+    tools: Optional[Sequence[Dict[str, Any]]] = None,
+    tool_choice: Optional[Any] = None,
+    chat_template_kwargs: Optional[Dict[str, Any]] = None,
 ) -> str:
     sanitized = sanitize_qwen35_conversation(conversation)
     if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
@@ -525,6 +541,9 @@ def build_qwen35_prompt(
             sanitized,
             add_generation_prompt=add_generation_prompt,
             enable_thinking=enable_thinking,
+            tools=tools,
+            tool_choice=tool_choice,
+            chat_template_kwargs=chat_template_kwargs,
         )
     else:
         prompt = _render_qwen35_chat_template_fallback(
@@ -651,6 +670,9 @@ def prepare_qwen35_multimodal_inputs(
     vision_dtype: Optional[Any] = None,
     tokenizer_config: Optional[Dict[str, Any]] = None,
     encode_fn: Optional[Callable[[str], Sequence[int]]] = None,
+    tools: Optional[Sequence[Dict[str, Any]]] = None,
+    tool_choice: Optional[Any] = None,
+    chat_template_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     del encode_vision, vision_device, vision_dtype
 
@@ -676,6 +698,9 @@ def prepare_qwen35_multimodal_inputs(
         add_generation_prompt=add_generation_prompt,
         enable_thinking=enable_thinking,
         tokenizer_config=tokenizer_config,
+        tools=tools,
+        tool_choice=tool_choice,
+        chat_template_kwargs=chat_template_kwargs,
     )
     if tokenizer is not None and hasattr(tokenizer, "encode"):
         input_ids = tokenizer.encode(prompt, add_special_tokens=True)

@@ -21,7 +21,8 @@ class FastLLmModel:
             default_reasoning_effort = "max"
         elif is_qwen_reasoning:
             reasoning_efforts = ["none", "low", "medium", "xhigh"]
-            default_reasoning_effort = "xhigh"
+            default_reasoning_effort = (
+                "medium" if self._is_qwen3_5(model) else "xhigh")
         else:
             reasoning_efforts = []
             default_reasoning_effort = None

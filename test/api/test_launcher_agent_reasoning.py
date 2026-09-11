@@ -25,7 +25,7 @@ class AgentReasoningTest(unittest.TestCase):
         request = opening.call_args.args[0]
         self.assertEqual(request.full_url, SERVICE["endpoint"] + "/v1/models")
         self.assertEqual(request.get_header("Authorization"), "Bearer test-api-key")
-        self.assertEqual(reasoning_options(service), (["none", "low", "medium", "xhigh"], "xhigh"))
+        self.assertEqual(reasoning_options(service), (["none", "low", "medium", "xhigh"], "medium"))
         self.assertNotIn("modelMetadata", SERVICE)
 
     def test_absent_or_unusable_metadata_does_not_invent_efforts(self):
@@ -46,7 +46,7 @@ class AgentReasoningTest(unittest.TestCase):
         }}), (["low", "max"], "max"))
 
     def test_native_agent_catalogs_offer_only_the_models_native_efforts(self):
-        for model_type, expected, default in (("qwen3_5", ["none", "low", "medium", "xhigh"], "xhigh"),
+        for model_type, expected, default in (("qwen3_5", ["none", "low", "medium", "xhigh"], "medium"),
                 ("kimi_k3", ["none", "low", "high", "max"], "max"), (None, [], None)):
             with self.subTest(model_type=model_type), tempfile.TemporaryDirectory() as directory:
                 service = dict(SERVICE, modelMetadata=FastLLmModel("my-alias",
