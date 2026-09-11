@@ -3506,13 +3506,31 @@ namespace fastllm {
             return false;
         }
 
+        // UD dynamic quants mix GGML types inside one block (e.g. IQ4_XS
+        // ffn_gate next to Q4_K ffn_up).  Heterogeneous types make the
+        // gate/up and q/k/v merge rules skip, and the MTP forward needs the
+        // fused tensors to exist.  Dequantize the MTP block's matrices to
+        // FP16 so the merges always apply; the stack is a single layer, so
+        // the extra memory stays bounded.
+        auto forceMtpMatrixFP16 = [&task]() {
+            if (task.tensor.ne[1] > 1 && task.tensor.ne[2] <= 1 &&
+                task.tensor.ne[3] <= 1) {
+                task.replaceType =
+                    GGUFWeightReplaceRule::GGUFWeightReplaceForceFP16;
+            }
+        };
+
         // The four NextN-only tensors are already mapped to their canonical
         // mtp.* root names by the architecture rules above.  The rest of the
         // optional block follows the normal decoder-layer naming convention;
         // only its layer namespace has to become relative to the MTP stack.
         if (sourceName.compare(
                 separatorPos + 1, strlen("nextn."), "nextn.") == 0) {
-            return StartWith(task.name, "mtp.");
+            if (StartWith(task.name, "mtp.")) {
+                forceMtpMatrixFP16();
+                return true;
+            }
+            return false;
         }
 
         const std::string targetPrefix = "model.language_model.layers." +
@@ -3523,6 +3541,7 @@ namespace fastllm {
         const int mtpLayer = sourceLayer - mainLayerCount;
         task.name = "mtp.layers." + std::to_string(mtpLayer) + "." +
             task.name.substr(targetPrefix.size());
+        forceMtpMatrixFP16();
         return true;
     }
 

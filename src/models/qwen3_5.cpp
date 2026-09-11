@@ -29154,6 +29154,24 @@ namespace fastllm {
     }
 
     bool Qwen3_5Model::HasMtpWeights() const {
+        if (std::getenv("FASTLLM_DEBUG_MTP") != nullptr) {
+            static std::once_flag debugOnce;
+            std::call_once(debugOnce, [&] {
+                printf("[MTP-debug] mtp_num_hidden_layers=%d\n", mtp_num_hidden_layers);
+                std::vector<std::string> mtpNames;
+                for (auto &it : weight.weight) {
+                    if (it.first.find("mtp.") != std::string::npos) {
+                        mtpNames.push_back(it.first);
+                    }
+                }
+                std::sort(mtpNames.begin(), mtpNames.end());
+                printf("[MTP-debug] %zu mtp.* weights loaded:\n", mtpNames.size());
+                for (auto &name : mtpNames) {
+                    printf("[MTP-debug]   %s\n", name.c_str());
+                }
+                fflush(stdout);
+            });
+        }
         if (mtp_num_hidden_layers <= 0) {
             return false;
         }
