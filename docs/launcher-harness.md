@@ -41,6 +41,10 @@ Launcher 设置 `compat.supportsDeveloperRole: false`，让 Harness 使用 `syst
 
 模型输出预算通过 `compat.maxTokensField: max_tokens` 发送，兼容只支持旧字段的 FastLLM 服务。新版服务也接受 `max_completion_tokens`；两者同时提供时，以非空的 `max_completion_tokens` 为准。
 
+## 流式连接与诊断
+
+Harness 的 `llm-pi-ai.providers.fastllm.streamIdleTimeoutMs` 控制等待模型有效输出的空闲时限，默认 300000 毫秒。SSE 注释心跳只维持传输连接，不会重置这个时限。若报错包含 `pi-ai stream idle timeout`，应结合排队和 prefill 耗时调整该配置。模型以 `finish_reason: length` 结束则表示本次输出预算耗尽，与网络断开不同。
+
 ## 数据和生命周期
 
 - 默认配置和会话保存在 `~/.fastllm/deepseek-harness/home`，默认工作目录为 `~/.fastllm/deepseek-harness/workspace`，也可以在 Harness 中选择其他工作区。

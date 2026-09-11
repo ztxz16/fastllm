@@ -3237,8 +3237,8 @@ class FastLLmCompletion:
     return True
 
   async def check_disconnect(self, raw_request: Request, request_id, handle: int):
-    # Starlette runs a StreamingResponse BackgroundTask after both a normal
-    # completion and a client disconnect.  A naturally exhausted generator
+    # SSEStreamingResponse runs cleanup after completion, disconnects and
+    # response failures.  A naturally exhausted generator
     # releases ownership before its terminal SSE is yielded.  Only an
     # interrupted generator remains active here, so abort it while the
     # request_id still owns the integer handle.
