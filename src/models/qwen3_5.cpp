@@ -23153,11 +23153,51 @@ namespace fastllm {
                                 model->speculativeDFlashHiddenStates.resize(
                                     model->dflashTargetLayerIds.size());
                             }
+                            // A small trailing chunk of a chunked prefill is
+                            // pathologically slow when run as one multi-token
+                            // prefill (the chunked-cuBLAS paged attention
+                            // degenerates to a few queries over the whole
+                            // context).  Replaying those few tokens through
+                            // the single-token decode path is ~20x faster and
+                            // numerically equivalent.  The MTP seed needs the
+                            // whole chunk's hidden states, which the per-token
+                            // decode does not retain, so the seed continues to
+                            // run on the preceding full chunks.
+                            const char *finalChunkDecodeMaxEnv =
+                                std::getenv("FASTLLM_QWEN35_FINAL_CHUNK_DECODE_MAX");
+                            const int finalChunkDecodeMax =
+                                finalChunkDecodeMaxEnv == nullptr ?
+                                    64 : std::max(0, atoi(finalChunkDecodeMaxEnv));
+                            const bool finalChunkDecodeSteps =
+                                isLastChunk && curLen > 0 &&
+                                curLen <= finalChunkDecodeMax;
                             try {
-                                ret = model->ForwardGPU(1, curInput, curAttentionMasks,
-                                                        curPositionIdsVec, curSeqLens,
-                                                        curPastKeyValues, generationConfigs,
-                                                        tokensManager, &logits);
+                                if (finalChunkDecodeSteps) {
+                                    seedLongPrefillMtp = false;
+                                    seedLongPrefillDFlash = false;
+                                    for (int t = 0; t < curLen; t++) {
+                                        Data oneInput, onePos;
+                                        Split(curInput, 1, t, t + 1, oneInput);
+                                        Data *onePosPtr = nullptr;
+                                        if (positionIds[0] != nullptr) {
+                                            Split(curPositionIds, 1, t, t + 1, onePos);
+                                            onePosPtr = &onePos;
+                                        }
+                                        std::vector<Data*> oneMasks = {nullptr};
+                                        std::vector<Data*> onePosVec = {onePosPtr};
+                                        std::vector<int> oneSeq = {1};
+                                        ret = model->ForwardGPU(
+                                            1, oneInput, oneMasks, onePosVec,
+                                            oneSeq, curPastKeyValues,
+                                            generationConfigs, tokensManager,
+                                            &logits);
+                                    }
+                                } else {
+                                    ret = model->ForwardGPU(1, curInput, curAttentionMasks,
+                                                            curPositionIdsVec, curSeqLens,
+                                                            curPastKeyValues, generationConfigs,
+                                                            tokensManager, &logits);
+                                }
                             } catch (...) {
                                 model->speculativeCaptureAllHiddenStates =
                                     oldCaptureAllHiddenStates;
