@@ -4700,6 +4700,15 @@ namespace fastllm {
             Qwen35LinearPrefixSnapshotCache second;
         };
 
+        // MTP draft KV for one request. Snapshots of the same request share
+        // this buffer and record only their length, so growing a request does
+        // not duplicate the full draft KV for every snapshot.
+        struct Qwen35MtpSnapshotBuffer {
+            Data key;
+            Data value;
+            int tokens = 0;
+        };
+
         struct Qwen35LinearPrefixSnapshot {
             int cachedLen = 0;
             int requestId = 0;
@@ -4708,8 +4717,7 @@ namespace fastllm {
             std::vector<Qwen35LinearPrefixSnapshotLayer> layers;
             bool mtpValid = false;
             int mtpTokens = 0;
-            Data mtpKey;
-            Data mtpValue;
+            std::shared_ptr<Qwen35MtpSnapshotBuffer> mtpBuffer;
             bool dflashValid = false;
             int dflashTokens = 0;
             std::vector<std::pair<Data, Data> > dflashKeyValues;
@@ -5193,10 +5201,10 @@ namespace fastllm {
                 }
                 if (requireMtp &&
                     (!snapshot->mtpValid || snapshot->mtpTokens != snapshot->cachedLen ||
-                     snapshot->mtpKey.dims.size() < 2 ||
-                     snapshot->mtpValue.dims.size() < 2 ||
-                     snapshot->mtpKey.dims[1] != snapshot->cachedLen ||
-                     snapshot->mtpValue.dims[1] != snapshot->cachedLen)) {
+                     snapshot->mtpBuffer == nullptr ||
+                     snapshot->mtpBuffer->key.dims.size() < 2 ||
+                     snapshot->mtpBuffer->value.dims.size() < 2 ||
+                     snapshot->mtpBuffer->tokens < snapshot->cachedLen)) {
                     continue;
                 }
                 if (requireDFlash &&
@@ -5211,6 +5219,32 @@ namespace fastllm {
                     (snapshot->cachedLen == best->cachedLen &&
                      snapshot->timestamp > best->timestamp)) {
                     best = snapshot;
+                }
+            }
+            return best;
+        }
+
+        // The caller holds Qwen35LinearPrefixSnapshotsMutex. Reuse the MTP
+        // buffer of the newest snapshot from the same request so snapshots of
+        // one conversation do not each keep a full copy of the draft KV.
+        static std::shared_ptr<Qwen35MtpSnapshotBuffer> Qwen35FindReusableMtpSnapshotBufferLocked(
+                const Qwen3_5Model *model, int requestId) {
+            auto &all = Qwen35LinearPrefixSnapshots();
+            auto it = all.find(model);
+            if (it == all.end()) {
+                return nullptr;
+            }
+            std::shared_ptr<Qwen35MtpSnapshotBuffer> best;
+            long long bestTimestamp = -1;
+            for (auto &snapshotPtr : it->second) {
+                Qwen35LinearPrefixSnapshot *snapshot = snapshotPtr.get();
+                if (snapshot == nullptr || snapshot->requestId != requestId ||
+                    snapshot->mtpBuffer == nullptr) {
+                    continue;
+                }
+                if (snapshot->timestamp > bestTimestamp) {
+                    bestTimestamp = snapshot->timestamp;
+                    best = snapshot->mtpBuffer;
                 }
             }
             return best;
@@ -7884,6 +7918,12 @@ namespace fastllm {
             Qwen35LinearPrefixSnapshotCache second;
         };
 
+        struct Qwen35MtpSnapshotBuffer {
+            Data key;
+            Data value;
+            int tokens = 0;
+        };
+
         struct Qwen35LinearPrefixSnapshot {
             int cachedLen = 0;
             int requestId = 0;
@@ -7892,8 +7932,7 @@ namespace fastllm {
             std::vector<Qwen35LinearPrefixSnapshotLayer> layers;
             bool mtpValid = false;
             int mtpTokens = 0;
-            Data mtpKey;
-            Data mtpValue;
+            std::shared_ptr<Qwen35MtpSnapshotBuffer> mtpBuffer;
             bool dflashValid = false;
             int dflashTokens = 0;
             std::vector<std::pair<Data, Data> > dflashKeyValues;
@@ -9871,10 +9910,22 @@ namespace fastllm {
                     mtpIt->second.key.dims.size() < 2 ||
                     mtpIt->second.value.dims.size() < 2 ||
                     mtpIt->second.key.dims[1] != currentLen ||
-                    mtpIt->second.value.dims[1] != currentLen ||
-                    !SnapshotMtpPagedCache(mtpIt->second, snapshot->mtpKey, snapshot->mtpValue)) {
+                    mtpIt->second.value.dims[1] != currentLen) {
                     return false;
                 }
+                std::shared_ptr<Qwen35MtpSnapshotBuffer> mtpBuffer;
+                {
+                    std::lock_guard<std::mutex> guard(Qwen35LinearPrefixSnapshotsMutex());
+                    mtpBuffer = Qwen35FindReusableMtpSnapshotBufferLocked(this, requestId);
+                }
+                if (mtpBuffer == nullptr) {
+                    mtpBuffer = std::make_shared<Qwen35MtpSnapshotBuffer>();
+                }
+                if (!SnapshotMtpPagedCache(mtpIt->second, mtpBuffer->key, mtpBuffer->value)) {
+                    return false;
+                }
+                mtpBuffer->tokens = currentLen;
+                snapshot->mtpBuffer = mtpBuffer;
                 snapshot->mtpValid = true;
                 snapshot->mtpTokens = currentLen;
             }
@@ -10038,12 +10089,22 @@ namespace fastllm {
                         dflashCache.draftKeyValues[0].first.dims[1];
                 } else {
                     if (!snapshot->mtpValid ||
-                        snapshot->mtpTokens != cachedLen) {
+                        snapshot->mtpTokens != cachedLen ||
+                        snapshot->mtpBuffer == nullptr ||
+                        snapshot->mtpBuffer->tokens < cachedLen) {
                         return false;
                     }
+                    Data mtpKeyView, mtpValueView;
+                    auto makeMtpView = [&](const Data &buffer, Data &view) {
+                        view.FakeFrom(buffer, 0);
+                        view.dims = {buffer.dims[0], cachedLen, buffer.dims[2]};
+                        view.strides = buffer.strides;
+                    };
+                    makeMtpView(snapshot->mtpBuffer->key, mtpKeyView);
+                    makeMtpView(snapshot->mtpBuffer->value, mtpValueView);
                     MtpKvCache &mtpCache = mtpCaches[context];
-                    if (!RestoreMtpPagedSnapshot(mtpCache, snapshot->mtpKey,
-                                                snapshot->mtpValue, devices[0])) {
+                    if (!RestoreMtpPagedSnapshot(mtpCache, mtpKeyView,
+                                                mtpValueView, devices[0])) {
                         mtpCaches.erase(context);
                         return false;
                     }
