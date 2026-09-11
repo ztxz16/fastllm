@@ -4756,7 +4756,7 @@ namespace fastllm {
         }
 
         static int Qwen35LinearPrefixSnapshotIntervalTokens() {
-            int pages = Qwen35EnvInt("FASTLLM_PREFIX_CACHE_SNAPSHOT_INTERVAL_PAGES", 16);
+            int pages = Qwen35EnvInt("FASTLLM_PREFIX_CACHE_SNAPSHOT_INTERVAL_PAGES", 4);
             pages = std::max(1, pages);
             return pages * fastllm::GetPageLen();
         }

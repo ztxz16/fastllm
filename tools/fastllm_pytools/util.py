@@ -804,7 +804,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help = "是否启用前缀缓存（true/false），对应 FASTLLM_PREFIX_CACHE")
     parser.add_argument("--prefix_cache_snapshot_interval_pages", "--prefix-cache-snapshot-interval-pages",
                         dest = "prefix_cache_snapshot_interval_pages", type = int, default = -1,
-                        help = "前缀缓存快照间隔页数，对应 FASTLLM_PREFIX_CACHE_SNAPSHOT_INTERVAL_PAGES")
+                        help = "前缀缓存快照间隔页数，默认 4，对应 FASTLLM_PREFIX_CACHE_SNAPSHOT_INTERVAL_PAGES")
     parser.add_argument("--prefix_cache_snapshot_max_per_request", "--prefix-cache-snapshot-max-per-request",
                         dest = "prefix_cache_snapshot_max_per_request", type = int, default = -1,
                         help = "单请求最多保留的前缀缓存快照数，对应 FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_PER_REQUEST")
