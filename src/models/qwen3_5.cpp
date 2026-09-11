@@ -9774,6 +9774,11 @@ namespace fastllm {
                Qwen35MtpSupportsGenerationConfig(context->generationConfig);
     }
 
+    bool Qwen3_5Model::WantsPerStepPrefixSnapshot() const {
+        return Qwen35LinearPrefixCacheEnabled() &&
+               Qwen35HasLinearAttentionLayers(this, this->block_cnt);
+    }
+
     bool Qwen3_5Model::TryRecordPagedPrefixCacheExtra(ResponseContext *context) {
         if (context == nullptr ||
             !Qwen35LinearPrefixCacheEnabled() ||
