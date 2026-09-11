@@ -266,6 +266,7 @@ The CLI evolves continuously, so `ftllm <command> --help` is authoritative for t
 | --- | --- |
 | `model` / `-p, --path` | Hugging Face repository ID, local HF directory, FastLLM model, or configuration file |
 | `--device` | Main compute device; common values are `cpu`, `cuda`, and `numa` |
+| `--vision_device` | Qwen3.5 vision encoder device: `auto` (default, first forward GPU), `cpu`, `cuda`, or `cuda:N`; `cpu` keeps the tower in host RAM and saves VRAM at the cost of slower encoding |
 | `--tp` | CUDA tensor-parallel devices; accepts `0,1`, `2`, or `auto` |
 | `--moe_device` | MoE expert device: `cpu`, `cuda`, `numa`, `disk`, or a weighted combination |
 | `--moe_device_layers` | Apply `--moe_device` only to the last N MoE layers; `-1` means all |

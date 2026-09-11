@@ -322,6 +322,7 @@ namespace fastllm {
         std::set<int> ggufGdnRestoredLayers;
         std::vector <int> mrope_sections = {11, 11, 10};
         bool visionPrepared = false;
+        std::string visionDevice = "auto";
         int vision_depth = 0;
         int vision_hidden_size = 0;
         int vision_num_heads = 0;

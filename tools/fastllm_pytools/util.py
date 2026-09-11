@@ -476,6 +476,10 @@ def apply_image_embedding_cache_env(args):
     if capacity is not None:
         os.environ["FASTLLM_IMAGE_EMBEDDING_CACHE_BYTES"] = str(_memory_size_bytes(capacity))
 
+def apply_vision_device_env(args):
+    device = str(getattr(args, "vision_device", "auto") or "auto").strip()
+    os.environ["FASTLLM_QWEN35_VISION_DEVICE"] = device or "auto"
+
 
 def apply_prefix_cache_env(args):
     prefix_cache = getattr(args, "prefix_cache", "")
@@ -774,6 +778,9 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--max_batch', type = int, default = -1,  help = '每次最多同时推理的询问数量')
     parser.add_argument('--chunked_prefill_size', type = int, default = -1, help = '分块 prefill 的切片大小（首块与后续块相同），如 8192')
     parser.add_argument('--device', type = str, help = '使用的设备')
+    parser.add_argument('--vision_device', '--vision-device', dest = 'vision_device',
+                        type = str, default = 'auto',
+                        help = 'Qwen3.5 视觉编码器设备: auto/cpu/cuda/cuda:N (默认 auto, 即首个前向 GPU)')
     parser.add_argument('--tp', type = str, default = "", help = '线程级张量并行设备；裸数字X表示使用前X张卡，0表示0号卡，也可写 0,1 或 auto')
     parser.add_argument('--moe_device', type = str, default = "", help = 'moe使用的设备')
     parser.add_argument('--moe_device_layers', type = int, default = -1, help = '后面多少层moe使用moe_device，-1表示全部moe层使用moe_device')
@@ -1574,6 +1581,7 @@ def make_normal_llm_model(args, startup_progress = None):
         llm.set_page_size(args.page_size)
     apply_prefix_cache_env(args)
     apply_image_embedding_cache_env(args)
+    apply_vision_device_env(args)
     if (hasattr(args, 'gpu_mem_ratio')):
         llm.set_gpu_mem_ratio(args.gpu_mem_ratio)
     if (hasattr(args, 'cuda_slab') and hasattr(llm, 'set_cuda_slab')):
