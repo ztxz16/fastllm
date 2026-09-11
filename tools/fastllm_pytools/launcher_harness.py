@@ -69,13 +69,13 @@ class HarnessRuntime(ManagedAgentRuntime):
         return None
 
     @staticmethod
-    def _patch(service, bind_host):
+    def _patch(service, bind_host, *, experimental_recovery=False):
         context = service.get("contextWindowTokens") or 8192
         efforts, default = reasoning_options(service)
         # Harness names the disabled level "off"; FastLLM expects "none" on
         # the wire so it overrides a service with thinking enabled by default.
         default = "off" if default == "none" else default
-        return [
+        patch = [
             {"id": "webserver", "config": {"host": bind_host, "port": 0}},
             {"id": "agent-default-model", "config": {"provider": "fastllm", "model": service["modelName"],
                 **({"reasoningEffort": default} if default else {})}},
@@ -102,6 +102,13 @@ class HarnessRuntime(ManagedAgentRuntime):
             {"id": "session-log-deepseek", "disabled": True},
             {"id": "session-telemetry-otel", "disabled": True},
         ]
+        if experimental_recovery:
+            patch.insert(0, {"insert": [{
+                "id": "fastllm-harness-recovery",
+                "name": str(Path(__file__).with_name("harness_recovery.mjs").resolve()),
+                "config": {"provider": "fastllm", "maxRecoveries": 2},
+            }]})
+        return patch
 
     def _run(self, service, api_key, bind_host, browser_origin, cancelled, install):
         try:
@@ -131,7 +138,9 @@ class HarnessRuntime(ManagedAgentRuntime):
             # the Harness home and workspace survive stop/restart.
             with tempfile.TemporaryDirectory(prefix="launch-", dir=self.directory) as temporary:
                 patch = Path(temporary) / "launcher.patch.yml"
-                patch.write_text(json.dumps(self._patch(service, "127.0.0.1")), encoding="utf-8")
+                configuration = self._patch(service, "127.0.0.1", experimental_recovery=
+                    environment.get("FTLLM_HARNESS_EXPERIMENTAL_RECOVERY") == "1")
+                patch.write_text(json.dumps(configuration), encoding="utf-8")
                 log = Path(temporary) / "harness.log"
                 with log.open("wb") as output, log.open("rb") as reader:
                     with self._lock:

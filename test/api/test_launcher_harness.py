@@ -48,6 +48,10 @@ server.serve_forever()
 
 class HarnessRuntimeTest(unittest.TestCase):
     def setUp(self):
+        environment = patch.dict(os.environ)
+        environment.start()
+        self.addCleanup(environment.stop)
+        os.environ.pop("FTLLM_HARNESS_EXPERIMENTAL_RECOVERY", None)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -88,6 +92,8 @@ class HarnessRuntimeTest(unittest.TestCase):
             self.assertEqual(model["models"][0]["contextWindow"], 32768)
             self.assertEqual(model["compat"]["maxTokensField"], "max_tokens")
             self.assertFalse(model["compat"]["supportsDeveloperRole"])
+            self.assertFalse(any(entry["id"] == "fastllm-harness-recovery"
+                                 for row in probe["patch"] for entry in row.get("insert", [])))
             self.assertEqual(next(p["config"]["host"] for p in probe["patch"] if p.get("id") == "webserver"), "127.0.0.1")
             self.assertNotIn("private-api-key", json.dumps(probe))
             self.assertEqual(probe["cwd"], str(self.root / "workspace"))
@@ -101,6 +107,25 @@ class HarnessRuntimeTest(unittest.TestCase):
             retained = (self.root / "logs/latest.log").read_text()
             self.assertIn("dsh web:", retained)
             self.assertNotIn("private-launch-token", retained)
+
+    def test_recovery_extension_requires_explicit_experimental_opt_in(self):
+        script = self.root / "fake.py"
+        script.write_text(FAKE_HARNESS)
+        with patch.object(self.harness, "_command", return_value=[sys.executable, str(script)]):
+            for setting in ("0", "false", "1"):
+                with self.subTest(setting=setting), patch.dict(os.environ,
+                        {"FTLLM_HARNESS_EXPERIMENTAL_RECOVERY": setting}):
+                    self.harness.start(self.service, "", "127.0.0.1", "http://localhost:8000")
+                    result = self.wait_phase("running", "failed")
+                    self.assertEqual(result["phase"], "running", result)
+                    probe = json.loads((self.root / "home/probe.json").read_text())
+                    recovery = [entry for row in probe["patch"] for entry in row.get("insert", [])
+                                if entry["id"] == "fastllm-harness-recovery"]
+                    self.assertEqual(len(recovery), 1 if setting == "1" else 0)
+                    if recovery:
+                        self.assertTrue(Path(recovery[0]["name"]).is_file())
+                        self.assertEqual(recovery[0]["config"], {"provider": "fastllm", "maxRecoveries": 2})
+                    self.harness.stop()
 
     def test_startup_failure_redacts_tokens_and_model_key(self):
         script = self.root / "fail.py"
