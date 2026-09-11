@@ -45,6 +45,8 @@ Launcher 设置 `compat.supportsDeveloperRole: false`，让 Harness 使用 `syst
 
 Harness 的 `llm-pi-ai.providers.fastllm.streamIdleTimeoutMs` 控制等待模型有效输出的空闲时限，默认 300000 毫秒。SSE 注释心跳只维持传输连接，不会重置这个时限。若报错包含 `pi-ai stream idle timeout`，应结合排队和 prefill 耗时调整该配置。模型以 `finish_reason: length` 结束则表示本次输出预算耗尽，与网络断开不同。
 
+Harness 退出时，Launcher 将最近的日志尾部脱敏后保存到 `~/.fastllm/deepseek-harness/logs/latest.log`，上一份保存在 `previous.log`。每份读取最多 64 KiB，去掉边界处的不完整行；已知模型密钥、URL 中的令牌和 Authorization 值会隐藏。日志文件在 POSIX 上以 0600 权限创建。原始临时日志仍随启动目录清理。
+
 ## 数据和生命周期
 
 - 默认配置和会话保存在 `~/.fastllm/deepseek-harness/home`，默认工作目录为 `~/.fastllm/deepseek-harness/workspace`，也可以在 Harness 中选择其他工作区。

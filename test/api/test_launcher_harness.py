@@ -98,6 +98,9 @@ class HarnessRuntimeTest(unittest.TestCase):
             self.assertEqual(self.harness.state()["phase"], "stopped")
             self.assertTrue((self.root / "home/probe.json").exists())
             self.assertFalse(list(self.root.glob("launch-*")))
+            retained = (self.root / "logs/latest.log").read_text()
+            self.assertIn("dsh web:", retained)
+            self.assertNotIn("private-launch-token", retained)
 
     def test_startup_failure_redacts_tokens_and_model_key(self):
         script = self.root / "fail.py"
@@ -108,6 +111,27 @@ class HarnessRuntimeTest(unittest.TestCase):
         self.assertNotIn("private-api-key", result["error"])
         self.assertNotIn("private-launch-token", result["error"])
         self.assertEqual(result["url"], "")
+        retained = (self.root / "logs/latest.log").read_text()
+        self.assertIn("error", retained)
+        self.assertNotIn("private-api-key", retained)
+        self.assertNotIn("private-launch-token", retained)
+
+    def test_log_retention_is_bounded_private_and_redacted(self):
+        source = self.root / "raw.log"
+        source.write_text("x" * 70000 + "\nAuthorization: Bearer private-bearer\n"
+                          "http://localhost/?token=private-token&api_key=private-query\nprivate-key\n")
+        self.harness._save_log(source, "private-key")
+        latest = self.root / "logs/latest.log"
+        retained = latest.read_text()
+        self.assertLess(latest.stat().st_size, 65536)
+        for secret in ("private-bearer", "private-token", "private-query", "private-key"):
+            self.assertNotIn(secret, retained)
+        if os.name != "nt":
+            self.assertEqual(latest.stat().st_mode & 0o777, 0o600)
+        source.write_text("second run\n")
+        self.harness._save_log(source, "")
+        self.assertEqual(latest.read_text(), "second run\n")
+        self.assertEqual((self.root / "logs/previous.log").read_text(), retained)
 
     def test_stop_finishes_active_harness_stream_before_closing_proxy(self):
         import httpx

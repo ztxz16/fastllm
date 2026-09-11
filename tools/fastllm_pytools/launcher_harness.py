@@ -1,6 +1,7 @@
 """Fixed DeepSeek Harness integration, running outside the Launcher process."""
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -144,14 +145,56 @@ class HarnessRuntime(ManagedAgentRuntime):
                     try:
                         self._watch(process, reader, api_key, bind_host, browser_origin, cancelled)
                     finally:
-                        terminate_process(process)
+                        try:
+                            terminate_process(process)
+                        finally:
+                            self._save_log(log, api_key)
         except Exception as error:
-            diagnostic = re.sub(r"([?&]token=)[^\s)]+", r"\1[redacted]", str(error))
-            if api_key:
-                diagnostic = diagnostic.replace(api_key, "[redacted]")
+            diagnostic = self._redact_log(str(error), api_key)
             with self._lock:
                 if not cancelled.is_set():
                     self._state.update(phase="failed", url="", error=diagnostic)
+
+    @staticmethod
+    def _redact_log(text, api_key):
+        if api_key:
+            text = text.replace(api_key, "[redacted]")
+        text = re.sub(r"([?&](?:token|api_key|access_token)=)[^\s&#)]+",
+                      r"\1[redacted]", text, flags=re.IGNORECASE)
+        return re.sub(r"(Authorization\s*[:=]\s*(?:Bearer|Basic)\s+)[^\s]+",
+                      r"\1[redacted]", text, flags=re.IGNORECASE)
+
+    def _save_log(self, source, api_key):
+        # Keep a bounded diagnostic after TemporaryDirectory removes the raw log.
+        # Drop a partial leading line before redacting a bounded tail.
+        temporary = None
+        try:
+            with source.open("rb") as reader:
+                size = reader.seek(0, os.SEEK_END)
+                reader.seek(max(0, size - 65536))
+                if size > 65536:
+                    reader.readline()
+                text = reader.read().decode("utf-8", errors="replace")
+            text = self._redact_log(text, api_key)
+            directory = self.directory / "logs"
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            descriptor, temporary = tempfile.mkstemp(prefix=".harness-", dir=directory)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+                output.write(text)
+            latest = directory / "latest.log"
+            if latest.exists():
+                latest.replace(directory / "previous.log")
+            os.replace(temporary, latest)
+            temporary = None
+        except OSError as error:
+            # A diagnostic write must not mask the process's actual exit reason.
+            logging.warning("Could not retain Harness diagnostic log: %s", error)
+        finally:
+            if temporary is not None:
+                try:
+                    Path(temporary).unlink(missing_ok=True)
+                except OSError:
+                    logging.warning("Could not remove temporary Harness diagnostic log")
 
     def _watch(self, process, reader, api_key, bind_host, browser_origin, cancelled):
         deadline = time.monotonic() + 120
@@ -161,9 +204,7 @@ class HarnessRuntime(ManagedAgentRuntime):
                 chunk = reader.read(65536).decode("utf-8", errors="replace")
                 tail = (tail + chunk)[-16000:]
                 if process.poll() is not None:
-                    diagnostic = re.sub(r"([?&]token=)[^\s)]+", r"\1[redacted]", tail)
-                    if api_key:
-                        diagnostic = diagnostic.replace(api_key, "[redacted]")
+                    diagnostic = self._redact_log(tail, api_key)
                     raise RuntimeError("DeepSeek Harness exited.\n" + diagnostic[-4000:])
                 if proxy is None:
                     match = re.search(r"dsh web: (http://[^\s)]+)", tail)
