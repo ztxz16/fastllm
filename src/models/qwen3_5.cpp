@@ -4762,11 +4762,11 @@ namespace fastllm {
         }
 
         static int Qwen35LinearPrefixSnapshotMaxPerRequest() {
-            return std::max(1, Qwen35EnvInt("FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_PER_REQUEST", 4));
+            return std::max(1, Qwen35EnvInt("FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_PER_REQUEST", 32));
         }
 
         static int Qwen35LinearPrefixSnapshotMaxRecords() {
-            return std::max(1, Qwen35EnvInt("FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_RECORDS", 8));
+            return std::max(1, Qwen35EnvInt("FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_RECORDS", 64));
         }
 
         static bool Qwen35LayerIsLinearAttention(const Qwen3_5Model *model, int layer) {
