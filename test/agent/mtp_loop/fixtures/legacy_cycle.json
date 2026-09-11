@@ -1,0 +1,27 @@
+{
+  "description": "2026-09-11 最初旧采样库产生的真实思考输出；测试夹具，不是实现建议。",
+  "case": "circular_requirements_zh",
+  "model": "Qwen3.8-27B-FP8",
+  "tp": 2,
+  "mtp": 3,
+  "temperature": 0.6,
+  "top_k": 20,
+  "top_p": 0.95,
+  "reasoning_effort": "xhigh",
+  "max_tokens": 16384,
+  "finish_reason": "length",
+  "library_sha256": "d1c6b8eea7feeda686a05a03ac68d936be6722a84b13a857216dcaef6e69a6ce",
+  "response_sha256": "a44ea3d0f6ba311f75574ec9c4be94ba78bf01250974f835ef02c01c20686e69",
+  "character_cycle": {
+    "start": 17638,
+    "end": 69811,
+    "period": 9750,
+    "full_repetitions": 5
+  },
+  "token_cycle": {
+    "start": 4046,
+    "end": 16384,
+    "period": 2312,
+    "full_repetitions": 5
+  }
+}

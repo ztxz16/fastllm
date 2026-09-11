@@ -14,6 +14,8 @@
 
 这是一套本地冒烟/回归测试，不是 WebArena、SWE-bench、tau-bench 这类公开重环境 benchmark。
 
+MTP 反复思考问题的独立 API 复现、离线循环检测和真实输出夹具见 [mtp_loop/README.md](mtp_loop/README.md)。
+
 ## 目录结构
 
 - `setup.sh`: 安装 Python 依赖。

@@ -1,0 +1,518 @@
+{
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "read_file",
+        "description": "Read a source file.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "target": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "target"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "run_tests",
+        "description": "Run the requested tests.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "target": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "target"
+          ]
+        }
+      }
+    }
+  ],
+  "cases": [
+    {
+      "id": "cache_word_budget",
+      "description": "缓存一致性设计审查；要求最终答案控制在 180 个英文词以内，观察反复斟酌和计数。",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a coding agent. Analyze the available evidence, resolve the task, and give a concrete final answer. Tool results in the conversation are authoritative observations of the test fixture. If requirements conflict or evidence is missing, state that limitation and make a bounded recommendation."
+        },
+        {
+          "role": "user",
+          "content": "Review this cache invalidation plan. The client writes an item to the database and publishes its version. Readers cache by item ID and compare versions before returning. The write and publication can fail independently; messages can be delayed, duplicated, or reordered; a reader may load from a lagging replica. Choose one concrete implementation, give its invariant and the most important failure tests. All relevant information is here. Your final answer must be at most 180 English words, including any code. You may think as needed before the final answer."
+        }
+      ]
+    },
+    {
+      "id": "conflicting_tests",
+      "description": "两条测试对同一输入要求不同结果；已有修复在两种实现之间切换。",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a coding agent. Analyze the available evidence, resolve the task, and give a concrete final answer. Tool results in the conversation are authoritative observations of the test fixture. If requirements conflict or evidence is missing, state that limitation and make a bounded recommendation."
+        },
+        {
+          "role": "user",
+          "content": "Fix parse_port so the full test suite passes. Prefer the smallest change."
+        },
+        {
+          "role": "assistant",
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call_0",
+              "type": "function",
+              "function": {
+                "name": "read_file",
+                "arguments": "{\"target\": \"port.py\"}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_0",
+          "content": "def parse_port(value):\n    if value == \"\": return 8000\n    return int(value)\n"
+        },
+        {
+          "role": "assistant",
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call_1",
+              "type": "function",
+              "function": {
+                "name": "read_file",
+                "arguments": "{\"target\": \"tests/test_port.py\"}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_1",
+          "content": "Both tests run in the same process with no mocks or different configuration:\ndef test_empty_default(): assert parse_port(\"\") == 8000\ndef test_empty_invalid():\n    with pytest.raises(ValueError): parse_port(\"\")\n"
+        },
+        {
+          "role": "assistant",
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call_2",
+              "type": "function",
+              "function": {
+                "name": "run_tests",
+                "arguments": "{\"target\": \"tests/test_port.py\"}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_2",
+          "content": "Current code: test_empty_default PASSED; test_empty_invalid FAILED: DID NOT RAISE."
+        },
+        {
+          "role": "assistant",
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call_3",
+              "type": "function",
+              "function": {
+                "name": "run_tests",
+                "arguments": "{\"target\": \"candidate that raises on empty\"}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_3",
+          "content": "test_empty_default FAILED with ValueError; test_empty_invalid PASSED."
+        },
+        {
+          "role": "assistant",
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call_4",
+              "type": "function",
+              "function": {
+                "name": "run_tests",
+                "arguments": "{\"target\": \"candidate that returns 8000 on empty\"}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_4",
+          "content": "test_empty_default PASSED; test_empty_invalid FAILED: DID NOT RAISE."
+        },
+        {
+          "role": "user",
+          "content": "Everything available has been pasted above. No further tool calls are available. Explain the root cause and give the smallest defensible resolution."
+        }
+      ]
+    },
+    {
+      "id": "permission_dead_end_zh",
+      "description": "源码和远程资源均不可访问；用户要求依据已有证据给结论。",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a coding agent. Analyze the available evidence, resolve the task, and give a concrete final answer. Tool results in the conversation are authoritative observations of the test fixture. If requirements conflict or evidence is missing, state that limitation and make a bounded recommendation."
+        },
+        {
+          "role": "user",
+          "content": "查清订单重复扣款的根因，修复并验证。"
+        },
+        {
+          "role": "assistant",
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call_0",
+              "type": "function",
+              "function": {
+                "name": "read_file",
+                "arguments": "{\"target\": \"payment.py\"}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_0",
+          "content": "PermissionError: access denied. No source contents were returned."
+        },
+        {
+          "role": "assistant",
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call_1",
+              "type": "function",
+              "function": {
+                "name": "read_file",
+                "arguments": "{\"target\": \"logs/payment.log\"}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_1",
+          "content": "FileNotFoundError. No log data is available."
+        },
+        {
+          "role": "assistant",
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call_2",
+              "type": "function",
+              "function": {
+                "name": "run_tests",
+                "arguments": "{\"target\": \"payment tests\"}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_2",
+          "content": "Cannot collect tests: payment.py is inaccessible. No tests ran."
+        },
+        {
+          "role": "assistant",
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call_3",
+              "type": "function",
+              "function": {
+                "name": "read_file",
+                "arguments": "{\"target\": \"payment.py\"}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_3",
+          "content": "PermissionError: access denied. Retrying does not change the permission."
+        },
+        {
+          "role": "user",
+          "content": "现在没有更多访问权限，也没有新日志。请基于已有信息，给出你能支持的结论，以及下一步最小验证步骤。不要再调用工具。"
+        }
+      ]
+    },
+    {
+      "id": "completed_long_history",
+      "description": "较长 Agent 工具历史中修复已经完成，观察是否仍重复检查和规划。",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a coding agent. Analyze the available evidence, resolve the task, and give a concrete final answer. Tool results in the conversation are authoritative observations of the test fixture. If requirements conflict or evidence is missing, state that limitation and make a bounded recommendation."
+        },
+        {
+          "role": "user",
+          "content": "Fix average([]) so it returns 0, preserve behavior for nonempty lists, and verify it."
+        },
+        {
+          "role": "assistant",
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call_0",
+              "type": "function",
+              "function": {
+                "name": "read_file",
+                "arguments": "{\"target\": \"stats.py\"}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_0",
+          "content": "def average(values):\n    return sum(values) / len(values)\n"
+        },
+        {
+          "role": "assistant",
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call_1",
+              "type": "function",
+              "function": {
+                "name": "run_tests",
+                "arguments": "{\"target\": \"baseline\"}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_1",
+          "content": "Only test_average_empty fails: ZeroDivisionError. Other 38 tests pass."
+        },
+        {
+          "role": "assistant",
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call_2",
+              "type": "function",
+              "function": {
+                "name": "read_file",
+                "arguments": "{\"target\": \"stats.py after approved patch\"}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_2",
+          "content": "def average(values):\n    if not values:\n        return 0\n    return sum(values) / len(values)\n"
+        },
+        {
+          "role": "assistant",
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call_3",
+              "type": "function",
+              "function": {
+                "name": "run_tests",
+                "arguments": "{\"target\": \"validation batch 1\"}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_3",
+          "content": "39 passed. Empty input returns 0. Singleton, mixed signs and nonempty floats unchanged. The diff contains only the empty-list guard. No failures or additional changes."
+        },
+        {
+          "role": "assistant",
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call_4",
+              "type": "function",
+              "function": {
+                "name": "run_tests",
+                "arguments": "{\"target\": \"validation batch 2\"}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_4",
+          "content": "39 passed. Empty input returns 0. Singleton, mixed signs and nonempty floats unchanged. The diff contains only the empty-list guard. No failures or additional changes."
+        },
+        {
+          "role": "assistant",
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call_5",
+              "type": "function",
+              "function": {
+                "name": "run_tests",
+                "arguments": "{\"target\": \"validation batch 3\"}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_5",
+          "content": "39 passed. Empty input returns 0. Singleton, mixed signs and nonempty floats unchanged. The diff contains only the empty-list guard. No failures or additional changes."
+        },
+        {
+          "role": "assistant",
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call_6",
+              "type": "function",
+              "function": {
+                "name": "run_tests",
+                "arguments": "{\"target\": \"validation batch 4\"}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_6",
+          "content": "39 passed. Empty input returns 0. Singleton, mixed signs and nonempty floats unchanged. The diff contains only the empty-list guard. No failures or additional changes."
+        },
+        {
+          "role": "assistant",
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call_7",
+              "type": "function",
+              "function": {
+                "name": "run_tests",
+                "arguments": "{\"target\": \"validation batch 5\"}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_7",
+          "content": "39 passed. Empty input returns 0. Singleton, mixed signs and nonempty floats unchanged. The diff contains only the empty-list guard. No failures or additional changes."
+        },
+        {
+          "role": "assistant",
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call_8",
+              "type": "function",
+              "function": {
+                "name": "run_tests",
+                "arguments": "{\"target\": \"validation batch 6\"}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_8",
+          "content": "39 passed. Empty input returns 0. Singleton, mixed signs and nonempty floats unchanged. The diff contains only the empty-list guard. No failures or additional changes."
+        },
+        {
+          "role": "assistant",
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call_9",
+              "type": "function",
+              "function": {
+                "name": "run_tests",
+                "arguments": "{\"target\": \"validation batch 7\"}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_9",
+          "content": "39 passed. Empty input returns 0. Singleton, mixed signs and nonempty floats unchanged. The diff contains only the empty-list guard. No failures or additional changes."
+        },
+        {
+          "role": "assistant",
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call_10",
+              "type": "function",
+              "function": {
+                "name": "run_tests",
+                "arguments": "{\"target\": \"validation batch 8\"}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_10",
+          "content": "39 passed. Empty input returns 0. Singleton, mixed signs and nonempty floats unchanged. The diff contains only the empty-list guard. No failures or additional changes."
+        },
+        {
+          "role": "user",
+          "content": "The approved fix and all checks are complete. There are no additional files to inspect. Give the final change report now in at most 120 words."
+        }
+      ]
+    },
+    {
+      "id": "cancellation_race",
+      "description": "并发取消与提交竞态；多条正确性条件容易引发反复推敲。",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a coding agent. Analyze the available evidence, resolve the task, and give a concrete final answer. Tool results in the conversation are authoritative observations of the test fixture. If requirements conflict or evidence is missing, state that limitation and make a bounded recommendation."
+        },
+        {
+          "role": "user",
+          "content": "Review an async job runner. A worker computes a result and commits it to a database; a cancel request may arrive before, during, or after commit. The API must return either committed or cancelled, and callers retry after timeouts. A transaction can commit even if the client never receives its response. We have one transactional SQL database and can add fields or tables, but no distributed transaction coordinator. Propose a precise state machine, choose the linearization point of cancellation, and give deterministic interleaving tests. Clarify any guarantee that cannot be met. Provide a concrete final design in under 600 words."
+        }
+      ]
+    },
+    {
+      "id": "circular_requirements_zh",
+      "description": "需求在即时返回、确定成功和网络分区之间冲突，观察能否终止推理。",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a coding agent. Analyze the available evidence, resolve the task, and give a concrete final answer. Tool results in the conversation are authoritative observations of the test fixture. If requirements conflict or evidence is missing, state that limitation and make a bounded recommendation."
+        },
+        {
+          "role": "user",
+          "content": "评审并修正下面的订单接口方案：客户端请求必须在 50ms 内返回；只有数据库持久化成功才允许返回成功；网络可能持续分区 10 分钟；分区时不能返回失败、超时或处理中；每次请求必须返回成功或失败二选一；客户端重试不得重复创建订单。现有实现先返回成功再异步落库，被评审指出不满足持久化条件，于是改为同步等待，又被指出超过 50ms。请说明所有条件能否同时成立，给出必须调整的最小需求集合和可落地方案。最终答复控制在 500 个汉字以内。"
+        }
+      ]
+    }
+  ]
+}
