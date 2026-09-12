@@ -364,6 +364,11 @@ if hasattr(fastllm_lib, "create_llm_model_from_gguf_with_mmproj"):
         ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
     fastllm_lib.create_llm_model_from_gguf_with_mmproj.restype = ctypes.c_int
 
+if hasattr(fastllm_lib, "create_llm_model_from_gguf_with_mtp_and_mmproj"):
+    fastllm_lib.create_llm_model_from_gguf_with_mtp_and_mmproj.argtypes = [
+        ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
+    fastllm_lib.create_llm_model_from_gguf_with_mtp_and_mmproj.restype = ctypes.c_int
+
 fastllm_lib.create_llm_tokenizer_fromhf.argtypes = [ctypes.c_char_p]
 fastllm_lib.create_llm_tokenizer_fromhf.restype = ctypes.c_int
 
@@ -1252,9 +1257,25 @@ class model:
                     finally:
                         report_model_load_progress("tokenizer", 1, 1)
                 if external_mtp_path and mmproj_path:
-                    raise ValueError(
-                        "external MTP and mmproj cannot be used together")
-                if external_mtp_path:
+                    # MTP drafting and the mmproj vision tower are loaded by
+                    # independent code paths in CreateLLMModelFromGGUFFile (the
+                    # external MTP draft attaches to the text model, the
+                    # mmproj only adds the visual tower), so they can be
+                    # combined.  Prefer the combined entry point and only fall
+                    # back to the old restriction if it is unavailable.
+                    if hasattr(
+                            fastllm_lib,
+                            "create_llm_model_from_gguf_with_mtp_and_mmproj"):
+                        self.model = fastllm_lib \
+                            .create_llm_model_from_gguf_with_mtp_and_mmproj(
+                                path.encode(), ori_model_path.encode(),
+                                external_mtp_path.encode(), mmproj_path.encode())
+                        self.mmproj_path = mmproj_path
+                    else:
+                        raise ValueError(
+                            "this FastLLM build cannot combine external MTP "
+                            "and mmproj")
+                elif external_mtp_path:
                     if not hasattr(fastllm_lib, "create_llm_model_from_gguf_with_mtp"):
                         raise RuntimeError(
                             "the loaded FastLLM library does not support "

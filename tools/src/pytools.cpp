@@ -498,6 +498,16 @@ extern "C" {
         return id;
     }
 
+    DLL_EXPORT int create_llm_model_from_gguf_with_mtp_and_mmproj(
+            char *path, char *oriPath, char *mtpPath, char *mmprojPath) {
+        models.locker.lock();
+        int id = models.models.size();
+        models.models[id] = fastllm::CreateLLMModelFromGGUFFile(
+            path, oriPath, mtpPath, mmprojPath);
+        models.locker.unlock();
+        return id;
+    }
+
     DLL_EXPORT int create_llm_tokenizer_fromhf(char *path) {
         models.locker.lock();
         int id = models.models.size();
