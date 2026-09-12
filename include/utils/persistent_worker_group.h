@@ -1,8 +1,10 @@
 #ifndef FASTLLM_PERSISTENT_WORKER_GROUP_H
 #define FASTLLM_PERSISTENT_WORKER_GROUP_H
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <exception>
 #include <functional>
 #include <mutex>
@@ -177,6 +179,24 @@ namespace fastllm {
                     finishedCount = 0;
                     skippedWorkerRank = -1;
                     return;
+                }
+                // Never tear the pool down from one of its own workers: the
+                // joins below would call pthread_join() on the calling thread
+                // itself, which fails with EDEADLK ("Resource deadlock
+                // avoided") and aborts the process.  A worker asking for the
+                // pool it is running in to stop is a no-op by definition.
+                const std::thread::id self = std::this_thread::get_id();
+                for (const std::thread &worker : workers) {
+                    if (worker.get_id() == self) {
+                        static std::atomic<bool> warned(false);
+                        if (!warned.exchange(true)) {
+                            printf("[Fastllm] ignored worker group teardown "
+                                   "requested from inside one of its own "
+                                   "workers (would self-join).\n");
+                            fflush(stdout);
+                        }
+                        return;
+                    }
                 }
                 stop = true;
                 keys.clear();

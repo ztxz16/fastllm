@@ -872,7 +872,20 @@ namespace fastllm {
         }
         if (loop != nullptr) {
             if (loop->joinable()) {
-                loop->join();
+                if (loop->get_id() == std::this_thread::get_id()) {
+                    // ShutdownRuntime() was reached from the main loop thread
+                    // itself.  pthread_join() on the calling thread fails with
+                    // EDEADLK ("Resource deadlock avoided") and terminates the
+                    // process, so detach it instead: isFree was already set
+                    // above, so the loop is on its way out.
+                    printf("[Fastllm] ShutdownRuntime() called from the main "
+                           "loop thread; detaching the loop instead of "
+                           "self-joining.\n");
+                    fflush(stdout);
+                    loop->detach();
+                } else {
+                    loop->join();
+                }
             }
             delete loop;
         }
