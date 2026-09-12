@@ -694,6 +694,13 @@ if (UNIT_TEST)
                              qwen35_mtp_sample_row_causal qwen35_mtp_cache_rollback qwen35_mtp_paged_pool
                              PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
 
+        add_executable(qwen35_mtp_sampling_test test/basic/test_qwen35_mtp_sampling.cpp)
+        target_link_libraries(qwen35_mtp_sampling_test PRIVATE fastllm)
+        add_test(NAME qwen35_mtp_sampling COMMAND qwen35_mtp_sampling_test)
+        add_test(NAME qwen35_mtp_sampling_batch COMMAND qwen35_mtp_sampling_test --batch)
+        set_tests_properties(qwen35_mtp_sampling qwen35_mtp_sampling_batch PROPERTIES
+                             LABELS cuda TIMEOUT 120 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+
         add_executable(qwen35_streaming_weights_test test/basic/test_qwen35_streaming_weights.cpp)
         target_link_libraries(qwen35_streaming_weights_test PRIVATE fastllm)
         add_test(NAME qwen35_streaming_tp_weights COMMAND qwen35_streaming_weights_test)

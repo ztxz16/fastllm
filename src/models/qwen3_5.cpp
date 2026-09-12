@@ -468,8 +468,6 @@ namespace fastllm {
     static constexpr int QWEN35_MTP_LOG_INTERVAL = 64;
     static constexpr int QWEN35_MTP_MAX_DRAFTS = 8;
     static constexpr int QWEN35_MTP_FAST_SEQ_MAX = 8;
-    static constexpr float QWEN35_MTP_TYPICAL_POSTERIOR_THRESHOLD = 0.09f;
-    static constexpr float QWEN35_MTP_TYPICAL_POSTERIOR_ALPHA = 0.3f;
     static constexpr int QWEN35_MTP_PREFIX_SNAPSHOT_MAX =
         QWEN35_MTP_FAST_SEQ_MAX - 1;
     static constexpr int QWEN35_MTP_PREFIX_SNAPSHOT_BATCH_MAX = 4;
@@ -7615,10 +7613,7 @@ namespace fastllm {
                 bool allSimple,
                 const std::vector<GenerationConfig> &generationConfigs,
                 const LastTokensManager *lastTokens,
-                const std::vector<int> *typicalCandidateIds = nullptr,
-                const std::vector<int> *typicalCandidateRows = nullptr,
-                std::vector<unsigned char> *typicalAccepted = nullptr,
-                std::vector<int> *typicalRecoveredIds = nullptr) {
+                bool allowGpuTokenHandoff = true) {
             FastllmCudaSetDevice(rootDevice);
             std::vector<int> lastRet;
             lastRet.reserve(batch);
@@ -7640,8 +7635,7 @@ namespace fastllm {
                     handoff->batch == batch &&
                     handoff->outputTokenSlot >= 0 &&
                     handoff->outputTokenSlot < 2 &&
-                    typicalCandidateIds == nullptr &&
-                    typicalCandidateRows == nullptr;
+                    allowGpuTokenHandoff;
                 if (handoffSampling) {
                     static thread_local std::vector<
                         std::vector<std::pair<int, float> > > penalties;
@@ -7792,32 +7786,10 @@ namespace fastllm {
                 }
                 lastRet.resize(batch);
                 int vocabSize = fullLogits.dims.back();
-                int typicalCount = typicalCandidateIds == nullptr ? 0 :
-                    std::min(batch, (int)typicalCandidateIds->size());
-                if (typicalCandidateRows != nullptr) {
-                    typicalCount = std::min(
-                        typicalCount, (int)typicalCandidateRows->size());
-                }
-                if (typicalAccepted != nullptr) {
-                    typicalAccepted->assign(typicalCount, 0);
-                }
-                if (typicalRecoveredIds != nullptr) {
-                    typicalRecoveredIds->assign(typicalCount, 0);
-                }
-                bool sampled = FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
+                bool sampled = FastllmCudaTopKTopPSampling(
                     (float*)fullLogits.cudaData,
                     temperatures.data(), topKs.data(), topPs.data(),
-                    lastRet.data(), batch, vocabSize,
-                    typicalCount > 0 ? typicalCandidateIds->data() : nullptr,
-                    typicalCount > 0 && typicalCandidateRows != nullptr ?
-                        typicalCandidateRows->data() : nullptr,
-                    typicalCount > 0 && typicalAccepted != nullptr ?
-                        typicalAccepted->data() : nullptr,
-                    typicalCount > 0 && typicalRecoveredIds != nullptr ?
-                        typicalRecoveredIds->data() : nullptr,
-                    typicalCount,
-                    QWEN35_MTP_TYPICAL_POSTERIOR_THRESHOLD,
-                    QWEN35_MTP_TYPICAL_POSTERIOR_ALPHA);
+                    lastRet.data(), batch, vocabSize);
                 AssertInFastLLM(sampled,
                                 "Qwen3.5 CUDA top-k/top-p sampling failed.\n");
                 return lastRet;
@@ -16784,7 +16756,7 @@ namespace fastllm {
                    localLogits[0].dims.back() == vocabSize;
         };
         if (speculativeCollectAllLogits) {
-            speculativeTypicalAccepted.clear();
+            speculativeMtpAccepted.clear();
             speculativeDFlashAccepted.clear();
             AssertInFastLLM(!localLogits.empty() && !localLogits[0].dims.empty(),
                             "Qwen3.5 speculative forward did not produce logits.\n");
@@ -17046,17 +17018,15 @@ namespace fastllm {
                 mtpTargetProfileRecord(logitRows);
                 return sampled;
             }
-            std::vector<int> typicalCandidateRows;
-            std::vector<int> typicalCandidateIds;
-            std::vector<unsigned char> typicalAccepted;
-            std::vector<int> typicalRecoveredIds;
-            int typicalCandidateCount = 0;
+            std::vector<int> mtpDraftRows;
+            std::vector<int> mtpDraftIds;
+            int mtpDraftCount = 0;
             for (int b = 0; b < batch; b++) {
                 if (!generationConfigs[b].IsSimpleGreedy() && seqLens[b] > 1) {
-                    typicalCandidateCount += seqLens[b] - 1;
+                    mtpDraftCount += seqLens[b] - 1;
                 }
             }
-            if (typicalCandidateCount > 0) {
+            if (mtpDraftCount > 0) {
                 Data inputCpu;
                 inputCpu.CopyFrom(inputIds);
                 inputCpu.ToDevice(DataDevice::CPU);
@@ -17065,40 +17035,38 @@ namespace fastllm {
                     inputCpu.ToDevice(DataDevice::CPU);
                 }
                 AssertInFastLLM(inputCpu.Count(0) >= logitRows,
-                                "Qwen3.5 typical acceptance input shape mismatch.\n");
+                                "Qwen3.5 MTP acceptance input shape mismatch.\n");
                 float *inputPtr = (float*)inputCpu.cpuData;
-                typicalCandidateRows.reserve(typicalCandidateCount);
-                typicalCandidateIds.reserve(typicalCandidateCount);
+                mtpDraftRows.reserve(mtpDraftCount);
+                mtpDraftIds.reserve(mtpDraftCount);
                 int rowOffset = 0;
                 for (int b = 0; b < batch; b++) {
                     if (!generationConfigs[b].IsSimpleGreedy()) {
                         for (int token = 0; token + 1 < seqLens[b]; token++) {
-                            typicalCandidateRows.push_back(rowOffset + token);
-                            typicalCandidateIds.push_back((int)(
+                            mtpDraftRows.push_back(rowOffset + token);
+                            mtpDraftIds.push_back((int)(
                                 inputPtr[rowOffset + token + 1] + 1.0e-3f));
                         }
                     }
                     rowOffset += seqLens[b];
                 }
             }
+            // The MTP head proposes greedy (one-hot) drafts. Preserve every
+            // target draw after temperature/top-k/top-p filtering: a draft is
+            // accepted iff it matches that draw; a rejection keeps the draw as
+            // the correction token. Bonus rows retain their target samples too.
             std::vector<int> sampled = Qwen35SampleFromRootCudaLogits(
                 devices[0], *sampleLogits, logitRows, maxTopK, allSimple,
-                rowConfigs, nullptr,
-                typicalCandidateIds.empty() ? nullptr : &typicalCandidateIds,
-                typicalCandidateIds.empty() ? nullptr : &typicalCandidateRows,
-                typicalCandidateIds.empty() ? nullptr : &typicalAccepted,
-                typicalCandidateIds.empty() ? nullptr : &typicalRecoveredIds);
-            if (!typicalCandidateIds.empty()) {
+                rowConfigs, nullptr, mtpDraftIds.empty());
+            if (!mtpDraftIds.empty()) {
                 AssertInFastLLM(
-                    typicalCandidateRows.size() == typicalCandidateIds.size() &&
-                    typicalAccepted.size() == typicalCandidateIds.size() &&
-                    typicalRecoveredIds.size() == typicalCandidateIds.size(),
-                    "Qwen3.5 typical acceptance output shape mismatch.\n");
-                speculativeTypicalAccepted.assign(logitRows, 0);
-                for (int i = 0; i < (int)typicalCandidateRows.size(); i++) {
-                    int row = typicalCandidateRows[i];
-                    speculativeTypicalAccepted[row] = typicalAccepted[i];
-                    sampled[row] = typicalRecoveredIds[i];
+                    mtpDraftRows.size() == mtpDraftIds.size() &&
+                    (int)sampled.size() == logitRows,
+                    "Qwen3.5 MTP acceptance output shape mismatch.\n");
+                speculativeMtpAccepted.assign(logitRows, 0);
+                for (int i = 0; i < (int)mtpDraftRows.size(); i++) {
+                    int row = mtpDraftRows[i];
+                    speculativeMtpAccepted[row] = sampled[row] == mtpDraftIds[i];
                 }
             }
             mtpTargetProfileMark(mtpTargetProfileSamplingUs);
@@ -17390,7 +17358,7 @@ namespace fastllm {
         if (!mtpLogPrinted.exchange(true)) {
             const char *acceptance = useDFlash ?
                 "exact(greedy)/rejection(selector_q,target_p)(sampling)" :
-                "exact(greedy)/typical(posterior_threshold=0.09, posterior_alpha=0.30)(sampling)";
+                "exact(greedy)/exact(one_hot_draft,target_sample)(sampling)";
             printf("[Qwen3.5 %s] enabled: layers=%d, drafts_per_step=%d, root_device=cuda:%d, tp_devices=%zu, acceptance=%s, log_interval=%d validations.\n",
                    useDFlash ? "DFlash2" : "MTP",
                    useDFlash ? dflashLayers : mtp_num_hidden_layers,
@@ -18241,7 +18209,7 @@ namespace fastllm {
                 speculativeDFlashHiddenStates.resize(
                     dflashTargetLayerIds.size());
             }
-            speculativeTypicalAccepted.clear();
+            speculativeMtpAccepted.clear();
             speculativeDFlashAccepted.clear();
             speculativeHiddenStates.FreeSpace();
             speculativeHiddenStates.dims.clear();
@@ -18307,15 +18275,15 @@ namespace fastllm {
             bool useDFlashRejection =
                 useDFlash && !generationConfigs[0].IsSimpleGreedy() &&
                 (int)speculativeDFlashAccepted.size() >= draftTokenCount;
-            bool useTypicalAcceptance =
+            bool useMtpAcceptance =
                 !useDFlash && !generationConfigs[0].IsSimpleGreedy() &&
-                (int)speculativeTypicalAccepted.size() >= draftTokenCount;
+                (int)speculativeMtpAccepted.size() >= draftTokenCount;
             int accepted = 0;
             while (accepted < draftTokenCount) {
                 bool accept = useDFlashRejection ?
                     speculativeDFlashAccepted[accepted] != 0 :
-                    (useTypicalAcceptance ?
-                        speculativeTypicalAccepted[accepted] != 0 :
+                    (useMtpAcceptance ?
+                        speculativeMtpAccepted[accepted] != 0 :
                         targetTokens[accepted] == tokenAt(accepted + 1));
                 if (!accept) {
                     break;
@@ -20627,7 +20595,7 @@ namespace fastllm {
             useDFlash && allSampling ? requestDFlashContexts :
                                       std::vector<DFlashContext*>();
         speculativeLinearStateCaptureSlots = linearCaptureSlots;
-        speculativeTypicalAccepted.clear();
+        speculativeMtpAccepted.clear();
         speculativeDFlashAccepted.clear();
         if (useDFlash) {
             speculativeDFlashHiddenStates.clear();
@@ -20688,7 +20656,7 @@ namespace fastllm {
         }
         bool needsSamplingAcceptance = !allSimpleGreedy;
         const std::vector<unsigned char> &samplingAccepted = useDFlash ?
-            speculativeDFlashAccepted : speculativeTypicalAccepted;
+            speculativeDFlashAccepted : speculativeMtpAccepted;
         if (needsSamplingAcceptance &&
             (int)samplingAccepted.size() < totalTokens) {
             rollbackTargetCaches();

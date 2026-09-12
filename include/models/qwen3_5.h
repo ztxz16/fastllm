@@ -279,7 +279,7 @@ namespace fastllm {
         bool speculativeCacheOnlyForward = false;
         Data speculativeHiddenStates;
         std::vector <Data> speculativeDFlashHiddenStates;
-        std::vector<unsigned char> speculativeTypicalAccepted;
+        std::vector<unsigned char> speculativeMtpAccepted;
         DFlashContext *speculativeDFlashSamplingContext = nullptr;
         std::vector<DFlashContext*> speculativeDFlashSamplingContexts;
         std::vector<unsigned char> speculativeDFlashAccepted;
