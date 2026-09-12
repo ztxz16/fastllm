@@ -540,6 +540,22 @@ namespace fastllm {
                 std::vector <std::vector <int> > &nextInputTokens,
                 std::vector <int> &keptInputLens,
                 bool &usedMtpForward);
+        // Same as Qwen35ForwardMultimodal, but a media failure is expected to
+        // propagate so the public entry point can fail just that request.
+        std::vector <int> Qwen35ForwardMultimodalInternal(
+                ResponseContext *context,
+                const Data &inputIds,
+                const Data &attentionMask,
+                const Data &positionIds,
+                std::vector <std::pair <Data, Data> > &pastKeyValues,
+                const std::map <std::string, std::vector <Data*> > &multimodalInput,
+                const GenerationConfig &generationConfig,
+                const LastTokensManager &lastTokens,
+                std::vector <std::vector <float>*> *logits,
+                std::vector <std::vector <int> > &acceptedTokens,
+                std::vector <std::vector <int> > &nextInputTokens,
+                std::vector <int> &keptInputLens,
+                bool &usedMtpForward);
         bool Qwen35MTPBatchForward(
                 bool useGPUForward,
                 const std::vector <ResponseContext*> &contexts,

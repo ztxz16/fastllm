@@ -140,6 +140,17 @@ namespace fastllm {
             // failure is not recoverable at this layer, so fail the complete TP
             // process promptly; the serving supervisor can restart it and
             // clients receive a connection failure instead of an infinite wait.
+            if (fastllm::ServingModeFlag().load()) {
+                // Inside a serving request (currently only the vision encode,
+                // which is single-device) an allocation failure must fail that
+                // request instead of killing the process.  The caller catches
+                // it (Qwen35ForwardMultimodal) and returns an empty result, so
+                // one oversized image cannot take the whole server down.  The
+                // tensor-parallel hazard described below does not apply here.
+                fflush(stdout);
+                fflush(stderr);
+                throw std::runtime_error(msg);
+            }
             fprintf(stderr, "FastLLM fatal CUDA allocation error: %s", msg.c_str());
             fflush(stdout);
             fflush(stderr);
