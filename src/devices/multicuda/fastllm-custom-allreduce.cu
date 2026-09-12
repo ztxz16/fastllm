@@ -1075,6 +1075,17 @@ bool BuildCustomArRegistration(CustomArState &state,
     bool ok = true;
     for (int rank = 0; rank < (int)inputs.size(); ++rank) {
         FastllmCudaSetDevice(state.devices[rank]);
+        // Registration runs on the last arriving worker, including for its
+        // peers' devices. Their pools may contain temporaries returned while
+        // writes are still queued on another per-thread stream. Drain those
+        // writers before reusing storage for this persistent pointer table.
+        // This is only the cold registration path; cached tuples and graph
+        // replay do not synchronize here.
+        if (cudaDeviceSynchronize() != cudaSuccess) {
+            cudaGetLastError();
+            ok = false;
+            break;
+        }
         rankData[rank] = reinterpret_cast<CustomArRankData *>(
             FastllmCudaMalloc(sizeof(CustomArRankData)));
         if (rankData[rank] == nullptr) {
@@ -1084,6 +1095,14 @@ bool BuildCustomArRegistration(CustomArState &state,
         cudaError_t copyState = cudaMemcpy(rankData[rank], &hostData,
                                            sizeof(hostData),
                                            cudaMemcpyHostToDevice);
+        // The last arriving worker publishes metadata for every GPU on its
+        // own per-thread streams. A pageable H2D cudaMemcpy may return before
+        // the device copy completes; the other workers consume these tables
+        // on different streams as soon as the host rendezvous is released.
+        // Finish each cold registration before publishing the pointer tuple.
+        if (copyState == cudaSuccess) {
+            copyState = cudaStreamSynchronize(cudaStreamPerThread);
+        }
         if (copyState != cudaSuccess) {
             cudaGetLastError();
             ok = false;

@@ -838,6 +838,15 @@ if (UNIT_TEST)
         target_link_libraries(customAllReduceRegression fastllm)
         target_include_directories(customAllReduceRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 
+        if (UNIX)
+            add_executable(customArRegistrationRegression test/ops/customArRegistrationRegression.cu)
+            target_link_libraries(customArRegistrationRegression PRIVATE fastllm_tools)
+            add_test(NAME custom_ar_registration COMMAND customArRegistrationRegression)
+            add_test(NAME custom_ar_registration_pool_reuse COMMAND customArRegistrationRegression reuse)
+            set_tests_properties(custom_ar_registration custom_ar_registration_pool_reuse PROPERTIES
+                LABELS cuda TIMEOUT 30 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        endif()
+
         add_executable(fp8TpRepackDeadlockRegression test/ops/fp8TpRepackDeadlockRegression.cpp)
         target_link_libraries(fp8TpRepackDeadlockRegression fastllm)
         target_include_directories(fp8TpRepackDeadlockRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
@@ -951,6 +960,11 @@ if (${CMAKE_HOST_WIN32})
             COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/build_info.json ${CMAKE_BINARY_DIR}/tools/ftllm/.
     )
 else()
+    # Keep the linker output at its packaged location so dependent targets
+    # track a stable artifact. The generator expression also keeps that path
+    # unchanged for multi-config generators.
+    set_target_properties(fastllm_tools PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY "$<1:${CMAKE_BINARY_DIR}/tools/ftllm>")
     add_custom_command(
             TARGET fastllm_tools
             POST_BUILD
@@ -959,8 +973,6 @@ else()
             COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/tools/fastllm_pytools ${CMAKE_BINARY_DIR}/tools/ftllm/.
             COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_CURRENT_SOURCE_DIR}/tools/fastllm_triton_server.py ${CMAKE_BINARY_DIR}/tools/ftllm/fastllm_triton_server.py
             COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/tools/scripts ${CMAKE_BINARY_DIR}/tools/.
-            COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/libfastllm_tools.* ${CMAKE_BINARY_DIR}/tools/ftllm/.
-            COMMAND ${CMAKE_COMMAND} -E remove ${CMAKE_BINARY_DIR}/libfastllm_tools.*
             COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/build_info.json ${CMAKE_BINARY_DIR}/tools/ftllm/.
     )
 endif()
