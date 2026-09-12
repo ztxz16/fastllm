@@ -146,6 +146,29 @@ def _has_mtp_weights(names, text_config, layers):
     return True
 
 
+DSPARK_MTP_PREFIXES = ("mtp.0.attn.wkv.weight", "mtp.0.main_proj.weight", "mtp.0.main_norm.weight")
+
+
+def _dspark_config(model_config):
+    """DeepSeek-V4 / V4.1 的内置 DSpark 配置（V4.1 放在 text_config 里）。"""
+    text_config = model_config.get("text_config", model_config)
+    for source in (text_config, model_config):
+        block = int(source.get("dspark_block_size", 0) or 0)
+        if block > 0:
+            return source, block
+    return text_config, 0
+
+
+def _has_dspark_weights(names, layers):
+    """内置 DSpark 需要 mtp.0 的 main 投影和最后一个 stage 的 markov / confidence head。"""
+    if not set(DSPARK_MTP_PREFIXES) <= names:
+        return False
+    last = "mtp.%d." % (layers - 1)
+    return {last + "norm.weight", last + "markov_head.embed.weight",
+            last + "markov_head.head.weight",
+            last + "confidence_head.proj.weight"} <= names
+
+
 def detect_mtp_support(model_path, model_config):
     """Return a UI reason code; only architectures accepted by util.py opt in."""
     path = Path(model_path)
@@ -158,6 +181,15 @@ def detect_mtp_support(model_path, model_config):
         text_config = model_config.get("text_config", model_config)
         architectures = model_config.get("architectures", [])
         model_types = {model_config.get("model_type"), text_config.get("model_type")}
+        # DeepSeek-V4.1：草稿层是 checkpoint 自带的 mtp.0/1/2（DSpark）
+        if not is_gguf and (set(architectures) & {"DeepseekV41ForCausalLM", "DeepSeekV41ForCausalLM"}
+                            or model_types & {"deepseek_v41", "deepseek_v41_text"}):
+            dspark, block = _dspark_config(model_config)
+            layers = int(dspark.get("num_nextn_predict_layers", 0) or 0)
+            if block <= 0 or layers <= 0 or not dspark.get("dspark_target_layer_ids") \
+                    or int(dspark.get("dspark_noise_token_id", -1) or -1) < 0:
+                return "no_mtp"
+            return "enabled" if _has_dspark_weights(_hf_mtp_names(path), layers) else "missing_weights"
         if not (set(architectures) & {
             "Qwen3_5ForConditionalGeneration", "Qwen3_5MoeForConditionalGeneration",
         } or model_types & {"qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"}):

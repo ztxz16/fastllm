@@ -330,6 +330,10 @@ namespace fastllm {
             return dsparkEnabled;
         }
 
+        // 本类内置的 DSpark（DeepSeek-V4 Flash 的 mtp.0/1/2）由 FASTLLM_DSPARK_TOKENS 开启。
+        // DeepSeek-V4.1 的草稿层结构不同，由 DeepSeekV41Model 自行解析与实现，这里返回 false。
+        virtual bool UsesEmbeddedV4Dspark() const { return true; }
+
         // 推理
         virtual int Forward(
                 const Data &inputIds,

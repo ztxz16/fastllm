@@ -4590,6 +4590,17 @@ namespace fastllm {
         this->ops["DeepSeekV4BuildCompressedKVFromRaw"] = (BaseOperator*)(new CudaDeepSeekV4BuildCompressedKVFromRawOp());
         this->ops["DeepSeekV4StoreWindowKVCache"] = (BaseOperator*)(new CudaDeepSeekV4StoreWindowKVCacheOp());
         this->ops["DeepSeekV4UpdateWindowKVCache"] = (BaseOperator*)(new CudaDeepSeekV4UpdateWindowKVCacheOp());
+        this->ops["DeepSeekV41HcMix"] = (BaseOperator*)(new CudaDeepSeekV41HcMixOp());
+        this->ops["DeepSeekV41HcApplyPre"] = (BaseOperator*)(new CudaDeepSeekV41HcApplyPreOp());
+        this->ops["DeepSeekV41EngramApply"] = (BaseOperator*)(new CudaDeepSeekV41EngramApplyOp());
+        this->ops["DeepSeekV41RotaryQuant"] = (BaseOperator*)(new CudaDeepSeekV41RotaryQuantOp());
+        this->ops["DeepSeekV41Compress"] = (BaseOperator*)(new CudaDeepSeekV41CompressOp());
+        this->ops["DeepSeekV41IndexerScore"] = (BaseOperator*)(new CudaDeepSeekV41IndexerScoreOp());
+        this->ops["DeepSeekV41CandidateBlocks"] = (BaseOperator*)(new CudaDeepSeekV41CandidateBlocksOp());
+        this->ops["DeepSeekV41IndexerTopK"] = (BaseOperator*)(new CudaDeepSeekV41IndexerTopKOp());
+        this->ops["DeepSeekV41SparseAttention"] = (BaseOperator*)(new CudaDeepSeekV41SparseAttentionOp());
+        this->ops["DeepSeekV41WindowStore"] = (BaseOperator*)(new CudaDeepSeekV41WindowStoreOp());
+        this->ops["DeepSeekV41QuantizeKV"] = (BaseOperator*)(new CudaDeepSeekV41QuantizeKVOp());
         this->ops["Cat"] = (BaseOperator*)(new CudaCatOp());
         this->ops["Pad"] = (BaseOperator*)(new CudaPadOp());
         this->ops["CatDirect"] = (BaseOperator*)(new CudaCatDirectOp());
@@ -6752,6 +6763,252 @@ namespace fastllm {
         }
     }
 
+    // ==================== DeepSeek-V4.1 ====================
+
+    static Data *CudaV41Optional(const fastllm::DataDict &datas, const char *name) {
+        auto it = datas.find(name);
+        return (it == datas.end() || it->second == nullptr) ? nullptr : it->second;
+    }
+
+    static int CudaV41Int(const fastllm::IntDict &params, const char *name, int fallback) {
+        auto it = params.find(name);
+        return it == params.end() ? fallback : it->second;
+    }
+
+    static float CudaV41Float(const fastllm::FloatDict &params, const char *name, float fallback) {
+        auto it = params.find(name);
+        return it == params.end() ? fallback : it->second;
+    }
+
+    static bool CudaV41FloatType(DataType t) {
+        return t == DataType::FLOAT32 || t == DataType::FLOAT16 || t == DataType::BFLOAT16;
+    }
+
+    bool CudaDeepSeekV41HcMixOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &hcFn = *(datas.find("hcFn")->second);
+        int hcMult = CudaV41Int(intParams, "hcMult", 1);
+        return input.dims.size() == 4 && input.dims[2] == hcMult && hcMult <= 4 &&
+               CudaV41FloatType(input.dataType) && hcFn.dataType == DataType::FLOAT32;
+    }
+
+    void CudaDeepSeekV41HcMixOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        if (!FastllmCudaDeepSeekV41HcMix(*(datas.find("input")->second), *(datas.find("hcFn")->second),
+                                         *(datas.find("hcScale")->second), *(datas.find("hcBase")->second),
+                                         CudaV41Int(intParams, "hcMult", 1), CudaV41Int(intParams, "sinkhornIters", 20),
+                                         CudaV41Float(floatParams, "eps", 1e-6f), CudaV41Float(floatParams, "normEps", 1e-6f),
+                                         *(datas.find("pre")->second), *(datas.find("post")->second),
+                                         *(datas.find("comb")->second))) {
+            ErrorInFastLLM("DeepSeekV41HcMix CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaDeepSeekV41HcApplyPreOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        return input.dims.size() == 4 && CudaV41FloatType(input.dataType);
+    }
+
+    void CudaDeepSeekV41HcApplyPreOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                          const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        if (!FastllmCudaDeepSeekV41HcApplyPre(*(datas.find("input")->second), *(datas.find("pre")->second),
+                                              *(datas.find("output")->second))) {
+            ErrorInFastLLM("DeepSeekV41HcApplyPre CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaDeepSeekV41EngramApplyOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                              const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &hidden = *(datas.find("hidden")->second);
+        Data &kv = *(datas.find("kv")->second);
+        return hidden.dims.size() == 4 && hidden.dataType == DataType::BFLOAT16 && CudaV41FloatType(kv.dataType);
+    }
+
+    void CudaDeepSeekV41EngramApplyOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        if (!FastllmCudaDeepSeekV41EngramApply(*(datas.find("hidden")->second), *(datas.find("kv")->second),
+                                               *(datas.find("qWeight")->second), *(datas.find("kWeight")->second),
+                                               CudaV41Optional(datas, "mask"),
+                                               CudaV41Float(floatParams, "eps", 1e-20f),
+                                               CudaV41Float(floatParams, "clampValue", 1e-6f))) {
+            ErrorInFastLLM("DeepSeekV41EngramApply CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaDeepSeekV41RotaryQuantOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                              const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        if ((input.dims.size() != 3 && input.dims.size() != 4) || !CudaV41FloatType(input.dataType)) {
+            return false;
+        }
+        int dim = input.dims.back();
+        int quantMode = CudaV41Int(intParams, "quantMode", 0);
+        int quantBlock = CudaV41Int(intParams, "quantBlock", 32);
+        int quantDim = CudaV41Int(intParams, "quantDim", dim);
+        return dim <= 1024 && dim % 32 == 0 &&
+               (quantMode == 0 || ((quantBlock == 16 || quantBlock == 32) && quantDim % 32 == 0));
+    }
+
+    void CudaDeepSeekV41RotaryQuantOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        if (!FastllmCudaDeepSeekV41RotaryQuant(input, CudaV41Int(intParams, "ropeDim", 64),
+                                               CudaV41Float(floatParams, "ropeBase", 10000.0f),
+                                               CudaV41Int(intParams, "startPos", 0), CudaV41Int(intParams, "posStep", 1),
+                                               CudaV41Int(intParams, "inverse", 0) != 0,
+                                               CudaV41Int(intParams, "originalSeqLen", 0),
+                                               CudaV41Float(floatParams, "ropeFactor", 1.0f),
+                                               CudaV41Int(intParams, "betaFast", 32), CudaV41Int(intParams, "betaSlow", 1),
+                                               CudaV41Int(intParams, "quantMode", 0),
+                                               CudaV41Int(intParams, "quantDim", input.dims.back()),
+                                               CudaV41Int(intParams, "quantBlock", 32))) {
+            ErrorInFastLLM("DeepSeekV41RotaryQuant CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaDeepSeekV41CompressOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &kv = *(datas.find("kv")->second);
+        Data *score = CudaV41Optional(datas, "score");
+        int ratio = CudaV41Int(intParams, "compressRatio", 1);
+        return kv.dims.size() == 3 && kv.dims[2] == 512 && CudaV41FloatType(kv.dataType) &&
+               (ratio == 1 || (score != nullptr && score->dataType == kv.dataType));
+    }
+
+    void CudaDeepSeekV41CompressOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        if (!FastllmCudaDeepSeekV41Compress(*(datas.find("kv")->second), CudaV41Optional(datas, "score"),
+                                            *(datas.find("normWeight")->second),
+                                            CudaV41Int(intParams, "compressRatio", 1),
+                                            CudaV41Float(floatParams, "normEps", 1e-20f),
+                                            *(datas.find("output")->second))) {
+            ErrorInFastLLM("DeepSeekV41Compress CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaDeepSeekV41IndexerScoreOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &q = *(datas.find("q")->second);
+        Data &k = *(datas.find("k")->second);
+        Data &weights = *(datas.find("weights")->second);
+        // k 可以是 BF16/FP32 的 [b, m, 128]，也可以是量化缓存行（INT8，行宽 132 / 72 / 68）
+        const bool kQuant = k.dataType == DataType::INT8 &&
+                            (k.dims[2] == 132 || k.dims[2] == 72 || k.dims[2] == 68);
+        return q.dims.size() == 4 && k.dims.size() == 3 && q.dims[3] == 128 &&
+               weights.dataType == DataType::FLOAT32 &&
+               (q.dataType == DataType::BFLOAT16 || q.dataType == DataType::FLOAT32) &&
+               (kQuant || (k.dims[2] == 128 &&
+                           (k.dataType == DataType::BFLOAT16 || k.dataType == DataType::FLOAT32)));
+    }
+
+    void CudaDeepSeekV41IndexerScoreOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                            const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        int ratio = intParams.find("compressRatio") == intParams.end() ? 0 : intParams.find("compressRatio")->second;
+        int startPos = intParams.find("startPos") == intParams.end() ? 0 : intParams.find("startPos")->second;
+        if (!FastllmCudaDeepSeekV41IndexerScore(*(datas.find("q")->second), *(datas.find("weights")->second),
+                                                *(datas.find("k")->second), ratio, startPos,
+                                                *(datas.find("output")->second))) {
+            ErrorInFastLLM("DeepSeekV41IndexerScore CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaDeepSeekV41CandidateBlocksOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                                  const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &score = *(datas.find("score")->second);
+        return score.dims.size() == 3 && score.dataType == DataType::FLOAT32;
+    }
+
+    void CudaDeepSeekV41CandidateBlocksOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        if (!FastllmCudaDeepSeekV41CandidateBlocks(*(datas.find("score")->second),
+                                                   CudaV41Int(intParams, "blockSize", 8),
+                                                   CudaV41Int(intParams, "topkBlocks", 0),
+                                                   CudaV41Int(intParams, "compressRatio", 1),
+                                                   CudaV41Int(intParams, "startPos", 0),
+                                                   *(datas.find("output")->second))) {
+            ErrorInFastLLM("DeepSeekV41CandidateBlocks CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaDeepSeekV41IndexerTopKOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                              const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &score = *(datas.find("score")->second);
+        return score.dims.size() == 3 && score.dataType == DataType::FLOAT32;
+    }
+
+    void CudaDeepSeekV41IndexerTopKOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        if (!FastllmCudaDeepSeekV41IndexerTopK(*(datas.find("score")->second), CudaV41Optional(datas, "candidates"),
+                                               CudaV41Int(intParams, "topK", 0),
+                                               CudaV41Int(intParams, "compressRatio", 1),
+                                               CudaV41Int(intParams, "startPos", 0),
+                                               CudaV41Int(intParams, "blockSize", 8),
+                                               *(datas.find("output")->second))) {
+            ErrorInFastLLM("DeepSeekV41IndexerTopK CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaDeepSeekV41SparseAttentionOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                                  const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &q = *(datas.find("q")->second);
+        Data &chunkKV = *(datas.find("chunkKV")->second);
+        return q.dims.size() == 4 && q.dims[3] == 512 && q.dims[2] % 32 == 0 &&
+               (q.dataType == DataType::BFLOAT16 || q.dataType == DataType::FLOAT32) &&
+               chunkKV.dataType == DataType::BFLOAT16;
+    }
+
+    void CudaDeepSeekV41SparseAttentionOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        if (!FastllmCudaDeepSeekV41SparseAttention(*(datas.find("q")->second), *(datas.find("chunkKV")->second),
+                                                   CudaV41Optional(datas, "ringKV"), CudaV41Optional(datas, "compressedKV"),
+                                                   CudaV41Optional(datas, "cmpIdx"), *(datas.find("attnSink")->second),
+                                                   CudaV41Int(intParams, "windowSize", 128),
+                                                   CudaV41Int(intParams, "startPos", 0),
+                                                   CudaV41Float(floatParams, "softmaxScale", 1.0f),
+                                                   *(datas.find("output")->second))) {
+            ErrorInFastLLM("DeepSeekV41SparseAttention CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaDeepSeekV41WindowStoreOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                              const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &chunk = *(datas.find("chunk")->second);
+        return chunk.dims.size() == 3;
+    }
+
+    void CudaDeepSeekV41WindowStoreOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        if (!FastllmCudaDeepSeekV41WindowStore(*(datas.find("chunk")->second), *(datas.find("ring")->second),
+                                               CudaV41Int(intParams, "startPos", 0),
+                                               CudaV41Int(intParams, "windowSize", 128))) {
+            ErrorInFastLLM("DeepSeekV41WindowStore CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaDeepSeekV41QuantizeKVOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        auto blockIt = intParams.find("quantBlock");
+        int quantBlock = blockIt == intParams.end() ? 32 : blockIt->second;
+        return input.dims.size() == 3 && quantBlock > 0 && input.dims[2] % quantBlock == 0 &&
+               (input.dataType == DataType::BFLOAT16 || input.dataType == DataType::FLOAT32 ||
+                input.dataType == DataType::FLOAT16);
+    }
+
+    void CudaDeepSeekV41QuantizeKVOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                          const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        auto modeIt = intParams.find("quantMode");
+        auto blockIt = intParams.find("quantBlock");
+        int quantMode = modeIt == intParams.end() ? 1 : modeIt->second;
+        int quantBlock = blockIt == intParams.end() ? 32 : blockIt->second;
+        if (!FastllmCudaDeepSeekV41QuantizeKV(*(datas.find("input")->second), *(datas.find("output")->second),
+                                              quantMode, quantBlock)) {
+            ErrorInFastLLM("DeepSeekV41QuantizeKV CUDA error: kernel rejected input.\n");
+        }
+    }
+
     bool CudaDeepSeekV4HcPreOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
                                        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
@@ -7259,6 +7516,12 @@ namespace fastllm {
         std::vector<int> dims = input0.dims;
         std::vector<int> oldDims = dims;
         dims[axis] += input1.dims[axis];
+        // 追加分支原来没有容量检查（上面的"空 input0"分支是有的）。容量不够时
+        // Resize 不会重新分配，下面的 memcpy2D 直接写出界，只会在之后某个不相关的
+        // CUDA 调用上报 illegal address。这里按空分支同样的方式先拦住。
+        AssertInFastLLM(input0.expansionDims.size() == dims.size() &&
+                        dims[axis] <= input0.expansionDims[axis],
+                        "CatDirect Error: input0's expansion size is not enough.\n");
         input0.Resize(dims);
         int outer = input0.Count(0) / input0.Count(axis);
         int input0Stride = input0.Count(axis);

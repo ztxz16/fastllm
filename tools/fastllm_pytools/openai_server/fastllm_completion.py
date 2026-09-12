@@ -255,6 +255,14 @@ class FastLLmCompletion:
   def _is_deepseek_v4_reasoning_response(self, enable_thinking: bool) -> bool:
       return enable_thinking and self._is_deepseek_v4_model()
 
+  def _is_deepseek_v41_model(self) -> bool:
+      try:
+          is_deepseek_v41 = self.model._is_deepseek_v41()
+      except Exception:
+          is_deepseek_v41 = False
+      return is_deepseek_v41 and not getattr(
+          self.model, "force_chat_template", False)
+
   def _is_poolside_reasoning_response(self, enable_thinking: bool) -> bool:
       if not enable_thinking or getattr(self.model, "force_chat_template", False):
           return False
@@ -401,6 +409,48 @@ class FastLLmCompletion:
       if effort not in {"low", "high", "max"}:
           raise ValueError(
               "Kimi K3 reasoning_effort must be one of: none, low, high, max")
+      return effort
+
+  def _resolve_deepseek_v41_reasoning_effort(
+      self, request: ChatCompletionRequest
+  ) -> Optional[Union[int, str]]:
+      """DeepSeek-V4.1 takes a numeric reasoning budget.
+
+      ``encoding_dsv41.render_reasoning_effort`` accepts an int in [1, 100] or
+      one of the ``low``/``high``/``max`` aliases (50/75/100) and defaults to
+      ``high``.  Returning None keeps that default.
+      """
+      if not self._is_deepseek_v41_model():
+          return None
+      # Reuse the official alias table instead of restating it here.
+      from ftllm.encoding_dsv41 import REASONING_EFFORT_MAPPINGS
+      effort = request.reasoning_effort
+      template_kwargs = request.chat_template_kwargs or {}
+      if effort is None:
+          effort = template_kwargs.get(
+              "reasoning_effort", template_kwargs.get("thinking_effort"))
+      if effort is None or effort == "none":
+          # "none" disables thinking entirely; the effort prefix is then not
+          # rendered at all, so there is nothing left to resolve.
+          return None
+      if isinstance(effort, bool):
+          raise ValueError(
+              "DeepSeek-V4.1 reasoning_effort must be an integer in [1, 100] "
+              "or one of: none, low, high, max")
+      if isinstance(effort, str):
+          stripped = effort.strip()
+          if stripped in REASONING_EFFORT_MAPPINGS:
+              return stripped
+          try:
+              effort = int(stripped, 10)
+          except ValueError:
+              raise ValueError(
+                  "DeepSeek-V4.1 reasoning_effort must be an integer in "
+                  "[1, 100] or one of: none, low, high, max")
+      if not isinstance(effort, int) or not 1 <= effort <= 100:
+          raise ValueError(
+              "DeepSeek-V4.1 reasoning_effort must be an integer in [1, 100] "
+              "or one of: none, low, high, max")
       return effort
 
   def _resolve_qwen3_5_reasoning_effort(
@@ -1523,10 +1573,12 @@ class FastLLmCompletion:
       model_type = self.model.get_type()
       chat_template = getattr(tokenizer, "chat_template", None)
       force_type = getattr(self.model, "tool_call_parser", "auto")
+      deepseek_v4_family = {
+          "deepseek_v4", "deepseek_v41", "deepseek_v41_text"}
       allow_without_chat_template = (
-          model_type == "deepseek_v4" or
+          model_type in deepseek_v4_family or
           model_type == "kimi_k3" or
-          force_type in ("deepseek_v4", "kimi_k3")
+          force_type in (*deepseek_v4_family, "kimi_k3")
       )
       if tokenizer is None and allow_without_chat_template:
           tokenizer = _EmptyToolTokenizer()
@@ -2900,6 +2952,9 @@ class FastLLmCompletion:
               model=request.model, messages=[{"role": "user", "content": ""}],
               reasoning_effort=(request.output_config or {}).get("effort"))
           thinking_effort = self._resolve_kimi_k3_reasoning_effort(reasoning_request)
+          if thinking_effort is None:
+              thinking_effort = self._resolve_deepseek_v41_reasoning_effort(
+                  reasoning_request)
           template_kwargs = self._resolve_chat_template_kwargs(
               reasoning_request, self._resolve_qwen3_5_reasoning_effort(reasoning_request),
               self._resolve_glm5_next_reasoning_effort(reasoning_request))
@@ -2949,6 +3004,9 @@ class FastLLmCompletion:
           if template_kwargs is not None:
               launch_kwargs["chat_template_kwargs"] = template_kwargs
           if self._is_kimi_k3_model():
+              launch_kwargs["thinking_effort"] = thinking_effort
+          elif (self._is_deepseek_v41_model()
+                and thinking_effort is not None):
               launch_kwargs["thinking_effort"] = thinking_effort
           if parser_request is not None:
               self._attach_tool_call_constraint_if_supported(
@@ -3081,6 +3139,9 @@ class FastLLmCompletion:
           enable_thinking = bool(request.chat_template_kwargs["enable_thinking"])
       try:
           thinking_effort = self._resolve_kimi_k3_reasoning_effort(request)
+          if thinking_effort is None:
+              thinking_effort = (
+                  self._resolve_deepseek_v41_reasoning_effort(request))
           qwen3_5_reasoning_effort = (
               self._resolve_qwen3_5_reasoning_effort(request))
           glm5_next_reasoning_effort = (
@@ -3141,6 +3202,10 @@ class FastLLmCompletion:
               "thinking_effort": thinking_effort,
               "tool_choice": tool_choice,
           })
+      elif self._is_deepseek_v41_model() and thinking_effort is not None:
+          # llm.py forwards this to encoding_dsv41.encode_messages as
+          # reasoning_effort.
+          launch_kwargs["thinking_effort"] = thinking_effort
       self._attach_tool_call_constraint_if_supported(
           launch_kwargs, effective_request)
 

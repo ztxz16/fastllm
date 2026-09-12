@@ -630,13 +630,22 @@ void DeviceSync() {
     }
 }
 
+// 定义在 FastllmCudaGraphSetError 之后（它是本文件的 static）
+static bool FastllmCudaSwallowCaptureError(const char *stage, cudaError_t state);
+
 void ForceDeviceSync() {
     cudaError_t state = cudaDeviceSynchronize();
+    if (FastllmCudaSwallowCaptureError("cudaDeviceSynchronize", state)) {
+        return;
+    }
     checkCudaErrors("Error: CUDA error when synchronizing device!", state);
 }
 
 void FastllmCudaSyncCurrentThreadStream() {
     cudaError_t state = cudaStreamSynchronize(cudaStreamPerThread);
+    if (FastllmCudaSwallowCaptureError("cudaStreamSynchronize", state)) {
+        return;
+    }
     checkCudaErrors("Error: CUDA error when synchronizing the per-thread stream!", state);
 }
 
@@ -731,6 +740,24 @@ static bool FastllmCudaGraphSetError(const char *stage, cudaError_t err) {
     }
     fastllmCudaGraphLastError = std::string(stage) + ": " + cudaGetErrorString(err);
     return false;
+}
+// 捕获期间调用同步 CUDA API（cudaMemcpy / cudaMemset / cudaDeviceSynchronize 等）
+// 会返回 cudaErrorStreamCaptureUnsupported。这时**不能**走 checkCudaErrors：它会
+// ErrorInFastLLM -> exit()，把整个进程带走。捕获本来就是可以放弃的，记下线程错误
+// 让捕获方自己结束捕获、丢掉图、退回逐算子即可。返回 true 表示已经吞掉。
+static bool FastllmCudaSwallowCaptureError(const char *stage, cudaError_t state) {
+    if (state != cudaErrorStreamCaptureUnsupported &&
+        state != cudaErrorStreamCaptureInvalidated &&
+        state != cudaErrorStreamCaptureImplicit &&
+        state != cudaErrorStreamCaptureIsolation &&
+        state != cudaErrorStreamCaptureMerge &&
+        state != cudaErrorStreamCaptureWrongThread) {
+        return false;
+    }
+    cudaGetLastError();
+    FastllmCudaGraphSetError(stage, state);
+    FastllmCudaSetThreadError();
+    return true;
 }
 
 bool FastllmCudaGraphBeginCapture() {
@@ -1327,6 +1354,13 @@ bool FastllmCudaGraphEndCapture(void **graph) {
     if (graph != nullptr) {
         *graph = (void*)cudaGraph;
     }
+    if (state != cudaSuccess) {
+        // 捕获被判废之后，运行时的 last-error 会一直粘着（后续任何 kernel 的
+        // cudaGetLastError 都会拿到 "operation failed due to a previous error
+        // during capture"），必须在这里清掉，否则回退到逐算子的第一个算子就会
+        // 误判为 kernel 失败。
+        cudaGetLastError();
+    }
     return FastllmCudaGraphSetError("cudaStreamEndCapture", state);
 }
 
@@ -1426,6 +1460,12 @@ bool FastllmCudaTensorParallelGreedyGatherGraphCreate(
 bool FastllmCudaGraphLaunch(void *exec) {
     cudaError_t state = cudaGraphLaunch((cudaGraphExec_t)exec, cudaStreamPerThread);
     return FastllmCudaGraphSetError("cudaGraphLaunch", state);
+}
+
+// 清掉当前线程/上下文粘着的 CUDA 运行时错误。捕获失败后回退到逐算子之前必须调用，
+// 否则第一个算子的 cudaGetLastError 会拿到捕获阶段留下的错误。
+void FastllmCudaClearLastError() {
+    cudaGetLastError();
 }
 
 void FastllmCudaGraphDestroy(void *graph) {
@@ -4810,6 +4850,9 @@ void FastllmCudaMemset0(void *ret, size_t size) {
     } else {
         state = cudaMemset(ret, 0, size);
     }
+    if (FastllmCudaSwallowCaptureError("cudaMemset", state)) {
+        return;
+    }
     checkCudaErrors("Error: CUDA error when clearing device memory!", state);
 }
 
@@ -5792,6 +5835,9 @@ void FastllmCudaClearBigBufferAll() {
 
 void FastllmCudaCopyFromHostToDevice(void *dst, void *src, size_t size) {
     cudaError_t state = cudaMemcpy(dst, src, size, cudaMemcpyHostToDevice);
+    if (FastllmCudaSwallowCaptureError("cudaMemcpy(HostToDevice)", state)) {
+        return;
+    }
     checkCudaErrors("Error: CUDA error when copy from memory to GPU!", state);
     //cudaDeviceSynchronize();
 }
@@ -5813,6 +5859,9 @@ void FastllmCudaCopyFromPinnedHostToDeviceAsync(void *dst, void *src, size_t siz
 
 void FastllmCudaCopyFromDeviceToHost(void *dst, void *src, size_t size) {
     cudaError_t state = cudaMemcpy(dst, src, size, cudaMemcpyDeviceToHost);
+    if (FastllmCudaSwallowCaptureError("cudaMemcpy(DeviceToHost)", state)) {
+        return;
+    }
     checkCudaErrors("Error: CUDA error when copy from GPU to memory!", state);
     //cudaDeviceSynchronize();
 }

@@ -438,6 +438,53 @@ class LauncherConfigTest(unittest.TestCase):
         self.assertEqual(low_memory["strategy"], "hybrid_disk")
         self.assertEqual(low_memory["config"]["moe_device"], "disk")
 
+    def test_deepseek_v41_recommendation_counts_engram_and_fp4_experts(self):
+        model = os.path.join(self.temp.name, "DeepSeek-V4.1-Flash")
+        # 权重文件只写 40 GB（模拟下载中 / 缺少 index），常驻内存必须按结构估算：
+        # FP4 路由专家约 289 GB + 两张 FP8 Engram 表约 203 GB + 稠密部分约 16 GB
+        self.write_model(model, {
+            "architectures": ["DeepseekV41ForCausalLM"],
+            "model_type": "deepseek_v41",
+            "text_config": {
+                "model_type": "deepseek_v41_text",
+                "num_hidden_layers": 40,
+                "hidden_size": 5120,
+                "moe_intermediate_size": 2304,
+                "n_routed_experts": 384,
+                "n_shared_experts": 1,
+                "vocab_size": 129280,
+                "q_lora_rank": 1280,
+                "num_attention_heads": 64,
+                "head_dim": 512,
+                "o_lora_rank": 1024,
+                "index_n_heads": 32,
+                "index_head_dim": 128,
+                "engram_num_embeddings": [384006168, 384016682],
+                "engram_head_dim": 256,
+            },
+            "quantization_config": {"quant_method": "fp8", "expert_dtype": "fp4"},
+        }, 40)
+
+        recommendation = recommend_launch_config(
+            model,
+            self.hardware(gpu_memory_gib=(24, 24), memory_gib=943),
+        )
+
+        resident_gib = recommendation["detected"]["residentGiB"]
+        self.assertGreater(resident_gib, 450)
+        self.assertLess(resident_gib, 520)
+        self.assertEqual(recommendation["strategy"], "hybrid_numa")
+        self.assertEqual(recommendation["config"]["device"], "cuda")
+        self.assertEqual(recommendation["config"]["moe_device"], "numa")
+        self.assertFalse(recommendation["detected"]["usesNgram"])
+
+        low_memory = recommend_launch_config(
+            model,
+            self.hardware(gpu_memory_gib=(24, 24), memory_gib=400),
+        )
+        self.assertEqual(low_memory["strategy"], "hybrid_disk")
+        self.assertEqual(low_memory["config"]["moe_device"], "disk")
+
     def test_qwen_ngram_table_moves_to_disk_under_memory_pressure(self):
         model = os.path.join(self.temp.name, "Qwen4-Exp-30B")
         self.write_model(model, {

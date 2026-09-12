@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <algorithm>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 
 #ifdef __AVX2__
 #include "immintrin.h"
@@ -1437,4 +1439,238 @@ namespace fastllm {
         return false;
 #endif
     }
+
+    // ------------------------------------------------------------------
+    // NVFP4_BLOCK_32_E8M0 fused GEMM (AVX2 + FMA)
+    //
+    // Layout: every 32 weights occupy 17 bytes -- 16 bytes of packed E2M1
+    // (element 2i in the low nibble of byte i, element 2i+1 in the high
+    // nibble) followed by one UE8M0 scale byte.
+    //
+    // The AVX512-BF16 machine decodes into BF16 and uses vdpbf16ps.  Without
+    // AVX512 the previous fallback materialised the whole weight tile as
+    // BF16 in a temporary buffer and then ran a BF16 GEMM, which multiplies
+    // the memory traffic of an already bandwidth-bound MoE decode by ~4x.
+    // Here the nibbles are turned into FP32 inside the registers with two
+    // vpshufb table lookups and accumulated directly, so each weight byte is
+    // read exactly once and never written back.
+    // ------------------------------------------------------------------
+#ifdef __AVX2__
+    // Both tables hold the high 16 bits of the FP32 encoding of the 16 E2M1
+    // code points, split into their two bytes, duplicated across both
+    // 128-bit lanes because vpshufb indexes per lane.
+    // codes: 0, 0.5, 1, 1.5, 2, 3, 4, 6 then the negatives.
+    alignas(32) static const uint8_t kNVFP4Block32LoByteTable[32] = {
+        0x00, 0x00, 0x80, 0xC0, 0x00, 0x40, 0x80, 0xC0,
+        0x00, 0x00, 0x80, 0xC0, 0x00, 0x40, 0x80, 0xC0,
+        0x00, 0x00, 0x80, 0xC0, 0x00, 0x40, 0x80, 0xC0,
+        0x00, 0x00, 0x80, 0xC0, 0x00, 0x40, 0x80, 0xC0
+    };
+    alignas(32) static const uint8_t kNVFP4Block32HiByteTable[32] = {
+        0x00, 0x3F, 0x3F, 0x3F, 0x40, 0x40, 0x40, 0x40,
+        0x80, 0xBF, 0xBF, 0xBF, 0xC0, 0xC0, 0xC0, 0xC0,
+        0x00, 0x3F, 0x3F, 0x3F, 0x40, 0x40, 0x40, 0x40,
+        0x80, 0xBF, 0xBF, 0xBF, 0xC0, 0xC0, 0xC0, 0xC0
+    };
+
+    static inline float NVFP4E8M0ScaleToFloatAVX2(uint8_t v) {
+        uint32_t bits = v == 0 ? 0x00400000u : ((uint32_t)v << 23);
+        float ret;
+        memcpy(&ret, &bits, sizeof(ret));
+        return ret;
+    }
+
+    static const float kNVFP4E2M1ValueTableAVX2[16] = {
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+       -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+    };
+
+    // Decodes 32 packed FP4 weights into four FP32 vectors.  The element
+    // order inside the four vectors is
+    //   out[0] = e0..e3,   e16..e19
+    //   out[1] = e4..e7,   e20..e23
+    //   out[2] = e8..e11,  e24..e27
+    //   out[3] = e12..e15, e28..e31
+    // which is exactly the order produced by NVFP4Block32LoadInput_AVX2, so
+    // the two never have to be permuted back into linear order.
+    static inline void NVFP4Block32Decode_AVX2(const uint8_t *packed, __m256 *out) {
+        const __m128i bytes = _mm_loadu_si128((const __m128i*)packed);
+        const __m128i nibbleMask = _mm_set1_epi8(0x0F);
+        const __m128i lowNibbles = _mm_and_si128(bytes, nibbleMask);
+        const __m128i highNibbles =
+            _mm_and_si128(_mm_srli_epi16(bytes, 4), nibbleMask);
+        const __m256i codes = _mm256_set_m128i(
+            _mm_unpackhi_epi8(lowNibbles, highNibbles),
+            _mm_unpacklo_epi8(lowNibbles, highNibbles));
+        const __m256i loBytes = _mm256_shuffle_epi8(
+            _mm256_load_si256((const __m256i*)kNVFP4Block32LoByteTable), codes);
+        const __m256i hiBytes = _mm256_shuffle_epi8(
+            _mm256_load_si256((const __m256i*)kNVFP4Block32HiByteTable), codes);
+        const __m256i packedLo = _mm256_unpacklo_epi8(loBytes, hiBytes);
+        const __m256i packedHi = _mm256_unpackhi_epi8(loBytes, hiBytes);
+        const __m256i zero = _mm256_setzero_si256();
+        // Interleaving with zero shifts each 16-bit pattern into the high
+        // half of a 32-bit lane, which is the FP32 value itself.
+        out[0] = _mm256_castsi256_ps(_mm256_unpacklo_epi16(zero, packedLo));
+        out[1] = _mm256_castsi256_ps(_mm256_unpackhi_epi16(zero, packedLo));
+        out[2] = _mm256_castsi256_ps(_mm256_unpacklo_epi16(zero, packedHi));
+        out[3] = _mm256_castsi256_ps(_mm256_unpackhi_epi16(zero, packedHi));
+    }
+
+    static inline void NVFP4Block32LoadInput_AVX2(const uint16_t *input, __m256 *out) {
+        const __m256i first = _mm256_loadu_si256((const __m256i*)input);
+        const __m256i second = _mm256_loadu_si256((const __m256i*)(input + 16));
+        const __m256i lowLanes = _mm256_permute2x128_si256(first, second, 0x20);
+        const __m256i highLanes = _mm256_permute2x128_si256(first, second, 0x31);
+        const __m256i zero = _mm256_setzero_si256();
+        // BFLOAT16 -> FP32 is a 16-bit left shift, which the interleave does.
+        out[0] = _mm256_castsi256_ps(_mm256_unpacklo_epi16(zero, lowLanes));
+        out[1] = _mm256_castsi256_ps(_mm256_unpackhi_epi16(zero, lowLanes));
+        out[2] = _mm256_castsi256_ps(_mm256_unpacklo_epi16(zero, highLanes));
+        out[3] = _mm256_castsi256_ps(_mm256_unpackhi_epi16(zero, highLanes));
+    }
+
+    static inline float NVFP4Block32HorizontalSum_AVX2(const __m256 *acc) {
+        __m256 sum = _mm256_add_ps(_mm256_add_ps(acc[0], acc[1]),
+                                   _mm256_add_ps(acc[2], acc[3]));
+        __m128 lo = _mm256_castps256_ps128(sum);
+        __m128 hi = _mm256_extractf128_ps(sum, 1);
+        lo = _mm_add_ps(lo, hi);
+        lo = _mm_add_ps(lo, _mm_movehl_ps(lo, lo));
+        lo = _mm_add_ss(lo, _mm_shuffle_ps(lo, lo, 0x55));
+        return _mm_cvtss_f32(lo);
+    }
+
+    template <int ROWS>
+    static void FastllmGemmBFloat16NVFP4Block32E8M0_AVX2_Run(
+        const void *A, long lda, const void *B, long ldb,
+        void *C, long ldc, int m, int st, int end
+    ) {
+        const int fullBlocks = m >> 5;
+        const int tail = m & 31;
+        const uint8_t *aBase = (const uint8_t*)A;
+        for (int j = st; j < end; j++) {
+            const uint8_t *rowStart = (const uint8_t*)B + (size_t)j * ldb;
+            // The routed-expert rows are short (1.2-2.7 KB), so the hardware
+            // stream prefetcher never ramps up inside one row.  Pull the next
+            // row in while this one is being consumed.
+            if (j + 1 < end) {
+                _mm_prefetch((const char*)(rowStart + ldb), _MM_HINT_T0);
+                _mm_prefetch((const char*)(rowStart + ldb + 64), _MM_HINT_T0);
+            }
+            __m256 acc[ROWS][4];
+            for (int r = 0; r < ROWS; r++) {
+                for (int q = 0; q < 4; q++) {
+                    acc[r][q] = _mm256_setzero_ps();
+                }
+            }
+            for (int block = 0; block < fullBlocks; block++) {
+                const uint8_t *blockStart = rowStart + (size_t)block * 17;
+                _mm_prefetch((const char*)(blockStart + 256), _MM_HINT_T0);
+                __m256 weight[4];
+                NVFP4Block32Decode_AVX2(blockStart, weight);
+                const __m256 scaleVec =
+                    _mm256_set1_ps(NVFP4E8M0ScaleToFloatAVX2(blockStart[16]));
+                for (int q = 0; q < 4; q++) {
+                    weight[q] = _mm256_mul_ps(weight[q], scaleVec);
+                }
+                const int offset = block << 5;
+                for (int r = 0; r < ROWS; r++) {
+                    __m256 in[4];
+                    NVFP4Block32LoadInput_AVX2(
+                        (const uint16_t*)(aBase + (size_t)r * lda) + offset, in);
+                    for (int q = 0; q < 4; q++) {
+                        acc[r][q] = _mm256_fmadd_ps(in[q], weight[q], acc[r][q]);
+                    }
+                }
+            }
+            float sums[ROWS];
+            for (int r = 0; r < ROWS; r++) {
+                sums[r] = NVFP4Block32HorizontalSum_AVX2(acc[r]);
+            }
+            if (tail != 0) {
+                const uint8_t *blockStart = rowStart + (size_t)fullBlocks * 17;
+                const float scale = NVFP4E8M0ScaleToFloatAVX2(blockStart[16]);
+                const int base = fullBlocks << 5;
+                for (int r = 0; r < ROWS; r++) {
+                    const uint16_t *input =
+                        (const uint16_t*)(aBase + (size_t)r * lda);
+                    float now = 0.0f;
+                    for (int offset = 0; offset < tail; offset++) {
+                        const uint8_t byte = blockStart[offset >> 1];
+                        const uint8_t code =
+                            (offset & 1) ? (byte >> 4) : (byte & 0xF);
+                        uint32_t bits = (uint32_t)input[base + offset] << 16;
+                        float x;
+                        memcpy(&x, &bits, sizeof(x));
+                        now += x * kNVFP4E2M1ValueTableAVX2[code];
+                    }
+                    sums[r] += now * scale;
+                }
+            }
+            for (int r = 0; r < ROWS; r++) {
+                float *output = (float*)((uint8_t*)C + (size_t)r * ldc);
+                output[j] = sums[r];
+            }
+        }
+    }
+#endif
+
+    bool FastllmGemmBFloat16NVFP4Block32E8M0_AVX2(
+        const void *A, long lda, const void *B, long ldb,
+        void *C, long ldc, int n, int m, int k, int st, int end
+    ) {
+#ifdef __AVX2__
+        (void)k;
+        if (n <= 0 || m <= 0 || st >= end) {
+            return true;
+        }
+        // One-shot confirmation that a deployment really picked the fused
+        // path; the routed-expert GEMM is called millions of times, so this
+        // is a single predictable branch after the first call.
+        static const bool traced = []() {
+            if (std::getenv("FASTLLM_NVFP4_BLOCK32_TRACE") != nullptr) {
+                printf("[Fastllm] NVFP4 block-32: using the fused AVX2 kernel.\n");
+            }
+            return true;
+        }();
+        (void)traced;
+#define FASTLLM_RUN_NVFP4_BLOCK32_AVX2(ROWS) \
+        FastllmGemmBFloat16NVFP4Block32E8M0_AVX2_Run<ROWS>( \
+            A, lda, B, ldb, C, ldc, m, st, end); \
+        return true
+        switch (n) {
+            case 1: FASTLLM_RUN_NVFP4_BLOCK32_AVX2(1);
+            case 2: FASTLLM_RUN_NVFP4_BLOCK32_AVX2(2);
+            case 3: FASTLLM_RUN_NVFP4_BLOCK32_AVX2(3);
+            case 4: FASTLLM_RUN_NVFP4_BLOCK32_AVX2(4);
+            case 5: FASTLLM_RUN_NVFP4_BLOCK32_AVX2(5);
+            case 6: FASTLLM_RUN_NVFP4_BLOCK32_AVX2(6);
+            default: break;
+        }
+#undef FASTLLM_RUN_NVFP4_BLOCK32_AVX2
+        // Wider activations reuse each decoded weight vector six rows at a
+        // time; beyond that the accumulators no longer fit in the 16 YMM
+        // registers and spills cost more than the extra weight reads.
+        for (int row = 0; row < n; row += 6) {
+            const int rows = std::min(6, n - row);
+            const uint8_t *rowA = (const uint8_t*)A + (size_t)row * lda;
+            uint8_t *rowC = (uint8_t*)C + (size_t)row * ldc;
+            switch (rows) {
+                case 1: FastllmGemmBFloat16NVFP4Block32E8M0_AVX2_Run<1>(rowA, lda, B, ldb, rowC, ldc, m, st, end); break;
+                case 2: FastllmGemmBFloat16NVFP4Block32E8M0_AVX2_Run<2>(rowA, lda, B, ldb, rowC, ldc, m, st, end); break;
+                case 3: FastllmGemmBFloat16NVFP4Block32E8M0_AVX2_Run<3>(rowA, lda, B, ldb, rowC, ldc, m, st, end); break;
+                case 4: FastllmGemmBFloat16NVFP4Block32E8M0_AVX2_Run<4>(rowA, lda, B, ldb, rowC, ldc, m, st, end); break;
+                case 5: FastllmGemmBFloat16NVFP4Block32E8M0_AVX2_Run<5>(rowA, lda, B, ldb, rowC, ldc, m, st, end); break;
+                default: FastllmGemmBFloat16NVFP4Block32E8M0_AVX2_Run<6>(rowA, lda, B, ldb, rowC, ldc, m, st, end); break;
+            }
+        }
+        return true;
+#else
+        (void)A; (void)lda; (void)B; (void)ldb; (void)C; (void)ldc;
+        (void)n; (void)m; (void)k; (void)st; (void)end;
+        return false;
+#endif
+    }
+
 }

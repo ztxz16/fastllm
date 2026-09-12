@@ -30,7 +30,7 @@ from .launcher_harness import HarnessRuntime
 from .launcher_opencode import OpenCodeRuntime
 from .launcher_codex import CodexRuntime
 from .launcher_claude import ClaudeRuntime
-from .launcher_mtp import detect_mtp_support
+from .launcher_mtp import detect_mtp_support, _dspark_config
 from .startup_progress import PROGRESS_PREFIX
 from .ui_hardware import detect_hardware
 from .ui_plugins import BUNDLED_PLUGINS, PluginRegistry, install_plugin_routes, mount_studio_assets
@@ -123,6 +123,8 @@ MOE_MODEL_TYPES = frozenset({
     "deepseek_v2",
     "deepseek_v3",
     "deepseek_v4",
+    "deepseek_v41",
+    "deepseek_v41_text",
     "dots3_note",
     "glm5_next",
     "glm5_next_text",
@@ -1580,6 +1582,7 @@ def inspect_launch_model(model_path: str, name: str = "") -> Dict[str, Any]:
         "textModelType": text_model_type,
         "parameterBillions": parameter_billions,
         "weightBytes": weight_bytes,
+        "residentBytesLowerBound": _estimate_deepseek_v41_resident_bytes(config, text_config),
         "quantization": quantization["name"],
         "recommendedDtype": quantization["dtype"],
         "sourceBytesPerParameter": quantization["sourceBytesPerParameter"],
@@ -1590,12 +1593,60 @@ def inspect_launch_model(model_path: str, name: str = "") -> Dict[str, Any]:
     }
 
 
+DEEPSEEK_V41_MODEL_TYPES = ("deepseek_v41", "deepseek_v41_text")
+
+
+def _estimate_deepseek_v41_resident_bytes(config: Dict[str, Any], text_config: Dict[str, Any]) -> int:
+    """DeepSeek-V4.1 常驻内存下界（按 config 计算）。
+
+    FP4 路由专家（约 270 GB）与两张 FP8 Engram 表（各约 100 GB）都常驻主机内存；
+    权重文件不全（下载中、缺少 index）或按参数量估算时会漏掉这两块，导致自动模式
+    低估内存需求而选错 moe_device，所以这里直接按结构计算。
+    """
+    model_type = _first_text(config.get("model_type")).lower()
+    text_model_type = _first_text(text_config.get("model_type")).lower()
+    if model_type not in DEEPSEEK_V41_MODEL_TYPES and text_model_type not in DEEPSEEK_V41_MODEL_TYPES:
+        return 0
+    cfg = text_config if text_config else config
+    layers = int(_positive_number(cfg.get("num_hidden_layers")))
+    hidden = int(_positive_number(cfg.get("hidden_size")))
+    inter = int(_positive_number(cfg.get("moe_intermediate_size")))
+    experts = int(_positive_number(cfg.get("n_routed_experts")))
+    shared = int(_positive_number(cfg.get("n_shared_experts")))
+    vocab = int(_positive_number(cfg.get("vocab_size")))
+    if not (layers and hidden and inter):
+        return 0
+    # 路由专家：FP4（0.5 B/参数）+ 每 32 个一组的 UE8M0 scale
+    expert_bytes = layers * experts * 3 * hidden * inter * (0.5 + 1.0 / 32)
+    # Engram 表：FP8 + 每 32 列一个 UE8M0 scale，行数 = engram_num_embeddings
+    engram_rows = cfg.get("engram_num_embeddings")
+    if not isinstance(engram_rows, list):
+        engram_rows = []
+    engram_dim = int(_positive_number(cfg.get("engram_head_dim")))
+    engram_bytes = sum(_positive_number(rows) for rows in engram_rows) * engram_dim * (1.0 + 1.0 / 32)
+    # 稠密部分（embedding / head / 注意力 / indexer / 共享专家）按 fp16 反量化后计
+    q_lora = int(_positive_number(cfg.get("q_lora_rank")))
+    heads = int(_positive_number(cfg.get("num_attention_heads")))
+    head_dim = int(_positive_number(cfg.get("head_dim")))
+    o_lora = int(_positive_number(cfg.get("o_lora_rank")))
+    index_heads = int(_positive_number(cfg.get("index_n_heads")))
+    index_dim = int(_positive_number(cfg.get("index_head_dim")))
+    dense_params = 2 * vocab * hidden + layers * (
+        hidden * q_lora + q_lora * heads * head_dim + hidden * head_dim + heads * head_dim * o_lora
+        + 3 * hidden * inter * shared + 2 * hidden * index_heads * index_dim
+    )
+    dense_bytes = dense_params * 2.0
+    return int(expert_bytes + engram_bytes + dense_bytes)
+
+
 def _estimate_launch_model_bytes(metadata: Dict[str, Any]) -> int:
     weight_bytes = int(_positive_number(metadata.get("weightBytes")))
     if not weight_bytes:
         parameters = _positive_number(metadata.get("parameterBillions")) * 1e9
         source_bytes = _positive_number(metadata.get("sourceBytesPerParameter")) or 2.0
         weight_bytes = int(parameters * source_bytes)
+    # 结构决定的常驻内存下界（目前只有 DeepSeek-V4.1 提供），文件统计偏小时以它为准
+    weight_bytes = max(weight_bytes, int(_positive_number(metadata.get("residentBytesLowerBound"))))
     if weight_bytes <= 0:
         return 0
     return int(weight_bytes * 1.1 + 1.25 * GIB)
@@ -1810,8 +1861,15 @@ def recommend_launch_config(
             build = normalized_hardware["build"]
             if (config["device"] in ("cuda", "tp")
                     and build.get("USE_CUDA") is not False and not build.get("USE_ROCM")):
-                config["mtp"] = "3"
-                config["speculative_algorithm"] = "mtp"
+                model_config = _read_model_config_for_recommendation(expanded_path)
+                dspark_source, dspark_block = _dspark_config(model_config or {})
+                if dspark_block > 0:
+                    # DeepSeek-V4 / V4.1 的草稿层就在 checkpoint 里，按训练 block 校验
+                    config["draft_tokens"] = str(dspark_block)
+                    config["speculative_algorithm"] = "dspark"
+                else:
+                    config["mtp"] = "3"
+                    config["speculative_algorithm"] = "mtp"
             else:
                 speculative_reason = "cuda_required"
 
@@ -1834,6 +1892,9 @@ def recommend_launch_config(
             "modelType": metadata["modelType"],
             "parameterBillions": round(parameter_billions, 2),
             "weightGiB": round(weight_bytes / GIB, 2),
+            "residentGiB": round(
+                _positive_number(metadata.get("residentBytesLowerBound")) / GIB, 2
+            ),
             "quantization": metadata["quantization"],
             "isMoe": bool(metadata["isMoe"]),
             "usesNgram": bool(metadata["usesNgram"]),

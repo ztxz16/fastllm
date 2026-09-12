@@ -108,9 +108,12 @@ class ChatCompletionRequest(BaseModel):
         ChatCompletionNamedToolChoiceParam,
     ]] = "auto"
     parallel_tool_calls: Optional[bool] = None
-    reasoning_effort: Optional[Literal[
+    # DeepSeek-V4.1 takes a numeric reasoning budget (1-100) in addition to the
+    # named levels, so the field accepts ints as well.  Each model's resolver in
+    # fastllm_completion validates the value it actually supports.
+    reasoning_effort: Optional[Union[Literal[
         "none", "minimal", "low", "medium", "high", "xhigh", "max"
-    ]] = None
+    ], int]] = None
     chat_template_kwargs: Optional[Dict[str, Any]] = None
 
 
