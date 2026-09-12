@@ -17097,8 +17097,20 @@ namespace fastllm {
                 speculativeTypicalAccepted.assign(logitRows, 0);
                 for (int i = 0; i < (int)typicalCandidateRows.size(); i++) {
                     int row = typicalCandidateRows[i];
-                    speculativeTypicalAccepted[row] = typicalAccepted[i];
-                    sampled[row] = typicalRecoveredIds[i];
+                    // Exact rejection sampling for the one-hot (greedy MTP) draft.
+                    // sampled[row] is a real top-k/top-p draw y from the target
+                    // distribution q (FlashInfer TopKTopPSamplingFromProb), so for a
+                    // one-hot draft p = delta_d we have P(accept) = q(d) exactly, and
+                    // on rejection buildCommittedTokens() commits sampled[row] = y,
+                    // which is the residual correction token.
+                    //
+                    // Do NOT replace sampled[row] with typicalRecoveredIds[i]: that is
+                    // the row's ARGMAX, and committing it turned every non-greedy
+                    // request into a greedy stream, which locks into self-reinforcing
+                    // repetition during long thinking at long context
+                    // (upstream fastllm issue #728).
+                    speculativeTypicalAccepted[row] =
+                        (sampled[row] == typicalCandidateIds[i]) ? 1 : 0;
                 }
             }
             mtpTargetProfileMark(mtpTargetProfileSamplingUs);
