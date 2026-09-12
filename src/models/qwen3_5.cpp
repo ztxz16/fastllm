@@ -17097,8 +17097,20 @@ namespace fastllm {
                 speculativeTypicalAccepted.assign(logitRows, 0);
                 for (int i = 0; i < (int)typicalCandidateRows.size(); i++) {
                     int row = typicalCandidateRows[i];
-                    speculativeTypicalAccepted[row] = typicalAccepted[i];
-                    sampled[row] = typicalRecoveredIds[i];
+                    // Exact rejection sampling for the one-hot (greedy MTP) draft.
+                    // sampled[row] is a real top-k/top-p draw y from the target
+                    // distribution q (FlashInfer TopKTopPSamplingFromProb), so for a
+                    // one-hot draft p = delta_d we have P(accept) = q(d) exactly, and
+                    // on rejection buildCommittedTokens() commits sampled[row] = y,
+                    // which is the residual correction token.
+                    //
+                    // Do NOT replace sampled[row] with typicalRecoveredIds[i]: that is
+                    // the row's ARGMAX, and committing it turned every non-greedy
+                    // request into a greedy stream, which locks into self-reinforcing
+                    // repetition during long thinking at long context
+                    // (upstream fastllm issue #728).
+                    speculativeTypicalAccepted[row] =
+                        (sampled[row] == typicalCandidateIds[i]) ? 1 : 0;
                 }
             }
             mtpTargetProfileMark(mtpTargetProfileSamplingUs);
@@ -17313,6 +17325,28 @@ namespace fastllm {
         }
         if (generationConfigs.empty() ||
             !Qwen35MtpSupportsGenerationConfig(generationConfigs[0])) {
+            // Transient config reason (typically an active tool-call token
+            // constraint).  The previous step already appended its speculative
+            // draft row to this cache, so leaving it untouched makes it sit
+            // ahead of the target; the alignment guard would then erase the
+            // whole cache a step later and silently drop MTP for the rest of
+            // the turn (and, with requireMtp snapshots, stop recording usable
+            // prefix snapshots).  Trim it back to the committed prefix instead.
+            if (!useDFlash && HasMtpWeights()) {
+                std::lock_guard<std::mutex> mtpGuard(mtpCacheMutex);
+                auto trimIt = mtpCaches.find(context);
+                if (trimIt != mtpCaches.end() && trimIt->second.tokens > 0) {
+                    const int committedTokens = context->cacheLen +
+                        context->preTokens -
+                        (seqLens.empty() ? 0 : seqLens[0]);
+                    if (committedTokens >= 0 &&
+                        committedTokens <= trimIt->second.tokens) {
+                        trimIt->second.Truncate(committedTokens);
+                    } else {
+                        mtpCaches.erase(trimIt);
+                    }
+                }
+            }
             logMtpSkip("generation config is unsupported");
             return false;
         }
@@ -17367,9 +17401,32 @@ namespace fastllm {
         if (expectedMtpTokens < 0 || activeCacheTokens != expectedMtpTokens ||
             !validDFlashCacheShape ||
             !validMtpCacheShape) {
-            logMtpSkip("draft cache is not aligned with the target cache");
-            eraseDraftCache();
-            return false;
+            // A draft cache that is merely AHEAD of the committed prefix holds
+            // speculative rows the target never accepted (the normal state after
+            // a tool-call constraint interrupts speculative decoding).  Trim it
+            // and carry on; only a cache that is BEHIND the prefix, or malformed,
+            // has to be discarded.  Erasing in the ahead case is what silently
+            // disabled MTP for the rest of a turn and stopped requireMtp prefix
+            // snapshots from being recorded.
+            if (!useDFlash && expectedMtpTokens >= 0 &&
+                activeCacheTokens > expectedMtpTokens &&
+                validMtpCacheShape && validDFlashCacheShape) {
+                mtpCache.Truncate(expectedMtpTokens);
+                activeCacheTokens = expectedMtpTokens;
+            } else {
+                if (std::getenv("FASTLLM_DEBUG_MTP_ALIGN") != nullptr) {
+                    printf("[Qwen3.5 MTP] align mismatch: expected=%d active=%d "
+                           "cacheLen=%d preTokens=%d seqLens=%d validShape=%d\n",
+                           expectedMtpTokens, activeCacheTokens,
+                           context->cacheLen, context->preTokens,
+                           seqLens.empty() ? -1 : seqLens[0],
+                           (int)(validDFlashCacheShape && validMtpCacheShape));
+                    fflush(stdout);
+                }
+                logMtpSkip("draft cache is not aligned with the target cache");
+                eraseDraftCache();
+                return false;
+            }
         }
 
         std::vector<int> devices;
@@ -23153,11 +23210,99 @@ namespace fastllm {
                                 model->speculativeDFlashHiddenStates.resize(
                                     model->dflashTargetLayerIds.size());
                             }
+                            // A small trailing chunk of a chunked prefill is
+                            // pathologically slow when run as one multi-token
+                            // prefill (the chunked-cuBLAS paged attention
+                            // degenerates to a few queries over the whole
+                            // context).  Replaying those few tokens through
+                            // the single-token decode path is ~20x faster and
+                            // numerically equivalent.  The MTP seed needs the
+                            // whole chunk's hidden states, which the per-token
+                            // decode does not retain, so the seed continues to
+                            // run on the preceding full chunks.
+                            const char *finalChunkDecodeMaxEnv =
+                                std::getenv("FASTLLM_QWEN35_FINAL_CHUNK_DECODE_MAX");
+                            const int finalChunkDecodeMax =
+                                finalChunkDecodeMaxEnv == nullptr ?
+                                    64 : std::max(0, atoi(finalChunkDecodeMaxEnv));
+                            const bool finalChunkDecodeSteps =
+                                isLastChunk && curLen > 0 &&
+                                curLen <= finalChunkDecodeMax;
                             try {
-                                ret = model->ForwardGPU(1, curInput, curAttentionMasks,
-                                                        curPositionIdsVec, curSeqLens,
-                                                        curPastKeyValues, generationConfigs,
-                                                        tokensManager, &logits);
+                                if (finalChunkDecodeSteps) {
+                                    // Per-token decode only keeps the last hidden
+                                    // state, so the whole-chunk MTP seed below is
+                                    // impossible here.  Seed the draft KV one token
+                                    // at a time instead.  Skipping it (the earlier
+                                    // seedLongPrefillMtp=false) left the draft KV
+                                    // short of the prompt end by exactly this tail
+                                    // chunk, so the very next decode step tripped
+                                    // Qwen35MTPForward's
+                                    // "draft cache is not aligned with the target
+                                    // cache" guard, which erased the cache and
+                                    // silently dropped MTP for the turn.
+                                    seedLongPrefillDFlash = false;
+                                    for (int t = 0; t < curLen; t++) {
+                                        Data oneInput, onePos;
+                                        Split(curInput, 1, t, t + 1, oneInput);
+                                        Data *onePosPtr = nullptr;
+                                        if (positionIds[0] != nullptr) {
+                                            Split(curPositionIds, 1, t, t + 1, onePos);
+                                            onePosPtr = &onePos;
+                                        }
+                                        std::vector<Data*> oneMasks = {nullptr};
+                                        std::vector<Data*> onePosVec = {onePosPtr};
+                                        std::vector<int> oneSeq = {1};
+                                        ret = model->ForwardGPU(
+                                            1, oneInput, oneMasks, onePosVec,
+                                            oneSeq, curPastKeyValues,
+                                            generationConfigs, tokensManager,
+                                            &logits);
+                                        if (seedLongPrefillMtp &&
+                                            onePosPtr != nullptr &&
+                                            !model->speculativeHiddenStates.dims
+                                                 .empty()) {
+                                            const int nextIndex = st + t + 1;
+                                            std::vector<int> oneMtpToken(1,
+                                                nextIndex < len ?
+                                                    (int)(ids[nextIndex] +
+                                                          1e-3f) :
+                                                    ret.back());
+                                            int oneDraft = -1;
+                                            // cacheOnly except for the very last
+                                            // token, which also produces the first
+                                            // draft exactly like the chunked seed.
+                                            bool oneAppended =
+                                                appendLongPrefillMtpCache(
+                                                    model->speculativeHiddenStates,
+                                                    oneMtpToken, onePos,
+                                                    longPrefillBaseTokens + st + t,
+                                                    t + 1 < curLen, oneDraft);
+                                            if (!oneAppended) {
+                                                seedLongPrefillMtp = false;
+                                            } else if (t + 1 == curLen) {
+                                                longPrefillFirstDraft = oneDraft;
+                                                longPrefillMtpSeeded =
+                                                    oneDraft >= 0;
+                                            }
+                                        }
+                                    }
+                                    // The per-token seed above has already advanced
+                                    // the draft KV to the end of this tail chunk.
+                                    // The whole-chunk seed below still expects the
+                                    // cache to sit at the chunk start, so it would
+                                    // find a mismatch, erase the cache and return
+                                    // false while longPrefillMtpSeeded stays true --
+                                    // printing "long prefill cache seeded" for an
+                                    // empty cache, which is what silently turned MTP
+                                    // off on the very next decode step.  Suppress it.
+                                    seedLongPrefillMtp = false;
+                                } else {
+                                    ret = model->ForwardGPU(1, curInput, curAttentionMasks,
+                                                            curPositionIdsVec, curSeqLens,
+                                                            curPastKeyValues, generationConfigs,
+                                                            tokensManager, &logits);
+                                }
                             } catch (...) {
                                 model->speculativeCaptureAllHiddenStates =
                                     oldCaptureAllHiddenStates;
@@ -23320,10 +23465,20 @@ namespace fastllm {
                     if (!usedMtpForward && !selectedIsPrompt &&
                         !seqLens.empty() && seqLens[0] > 1) {
                         // The fallback advances only the target cache by one
-                        // token. Any existing draft cache still describes the
-                        // pre-fallback prefix and must not be reused next turn.
+                        // token.  Keep the draft cache: it may simply hold the
+                        // speculative rows this fallback is dropping, and the
+                        // alignment check in Qwen35MTPForward trims such a cache
+                        // back to the committed prefix on the next step instead
+                        // of erasing it, which is what used to silently disable
+                        // MTP for the rest of the turn.  DFlash state is still
+                        // dropped because only the MTP path is repaired here.
                         for (ResponseContext *ctx : tokenContexts) {
-                            eraseMtpCache(ctx);
+                            if (ctx == nullptr) {
+                                continue;
+                            }
+                            std::lock_guard<std::mutex> guard(
+                                model->mtpCacheMutex);
+                            model->dflashContexts.erase(ctx);
                         }
                         std::vector<float> fallbackIds;
                         std::vector<float> fallbackPositions;

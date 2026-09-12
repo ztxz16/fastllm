@@ -4997,6 +4997,18 @@ namespace fastllm {
                             std::max(
                                 0LL,
                                 this->GetAutoWarmupCudaServingReserveBytes(id));
+                        {
+                            const char *spareKvEnv =
+                                std::getenv("FASTLLM_AUTOWARMUP_SPARE_KV_MB");
+                            if (spareKvEnv != nullptr && spareKvEnv[0] != '\0') {
+                                long long spareKvMb = std::atoll(spareKvEnv);
+                                if (spareKvMb > 0) {
+                                    targetFree = std::max(
+                                        128LL * 1024LL * 1024LL,
+                                        targetFree - spareKvMb * 1024LL * 1024LL);
+                                }
+                            }
+                        }
                         deviceTargetFree[id] = targetFree;
 
                         long long deficit = targetFree - freeBeforeRuntime[id];
@@ -5100,6 +5112,25 @@ namespace fastllm {
                             targetFree += std::max(
                                 0LL,
                                 this->GetAutoWarmupCudaServingReserveBytes(id));
+                        }
+                        // Optional: hand residual free memory to the KV pool.
+                        // The default calibration keeps roughly 1 GB/GPU free
+                        // (runtime headroom + safety + a prospective runtime
+                        // reserve), which is more than a fixed 2-GPU serving
+                        // box needs.  FASTLLM_AUTOWARMUP_SPARE_KV_MB=N reclaims
+                        // up to N MB/GPU of that headroom for KV capacity while
+                        // keeping at least 128 MB free.
+                        {
+                            const char *spareKvEnv =
+                                std::getenv("FASTLLM_AUTOWARMUP_SPARE_KV_MB");
+                            if (spareKvEnv != nullptr && spareKvEnv[0] != '\0') {
+                                long long spareKvMb = std::atoll(spareKvEnv);
+                                if (spareKvMb > 0) {
+                                    targetFree = std::max(
+                                        128LL * 1024LL * 1024LL,
+                                        targetFree - spareKvMb * 1024LL * 1024LL);
+                                }
+                            }
                         }
                         long long delayedReservePerPage =
                             deviceDelayedCacheBytesPerPage.count(id) ? deviceDelayedCacheBytesPerPage[id] : 0;
