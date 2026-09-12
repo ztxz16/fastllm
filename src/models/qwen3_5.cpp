@@ -23287,6 +23287,16 @@ namespace fastllm {
                                             }
                                         }
                                     }
+                                    // The per-token seed above has already advanced
+                                    // the draft KV to the end of this tail chunk.
+                                    // The whole-chunk seed below still expects the
+                                    // cache to sit at the chunk start, so it would
+                                    // find a mismatch, erase the cache and return
+                                    // false while longPrefillMtpSeeded stays true --
+                                    // printing "long prefill cache seeded" for an
+                                    // empty cache, which is what silently turned MTP
+                                    // off on the very next decode step.  Suppress it.
+                                    seedLongPrefillMtp = false;
                                 } else {
                                     ret = model->ForwardGPU(1, curInput, curAttentionMasks,
                                                             curPositionIdsVec, curSeqLens,
