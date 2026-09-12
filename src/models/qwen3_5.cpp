@@ -31653,7 +31653,11 @@ namespace fastllm {
         // media metadata) fails this request only.  Without this guard the
         // exception escaped the serving thread and aborted the process, which
         // is what killed the server whenever an image arrived while no mmproj
-        // was loaded.
+        // was loaded.  ServingModeScope additionally makes internal errors
+        // (including CUDA allocation failures) throw instead of exiting: an
+        // oversized image plus the text forward it triggers must not take the
+        // whole server down.
+        ServingModeScope servingGuard;
         try {
             return Qwen35ForwardMultimodalInternal(
                 context, inputIds, attentionMask, positionIds, pastKeyValues,
