@@ -804,13 +804,13 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help = "是否启用前缀缓存（true/false），对应 FASTLLM_PREFIX_CACHE")
     parser.add_argument("--prefix_cache_snapshot_interval_pages", "--prefix-cache-snapshot-interval-pages",
                         dest = "prefix_cache_snapshot_interval_pages", type = int, default = -1,
-                        help = "前缀缓存快照间隔页数，对应 FASTLLM_PREFIX_CACHE_SNAPSHOT_INTERVAL_PAGES")
+                        help = "前缀缓存快照间隔页数，默认 2，对应 FASTLLM_PREFIX_CACHE_SNAPSHOT_INTERVAL_PAGES")
     parser.add_argument("--prefix_cache_snapshot_max_per_request", "--prefix-cache-snapshot-max-per-request",
                         dest = "prefix_cache_snapshot_max_per_request", type = int, default = -1,
-                        help = "单请求最多保留的前缀缓存快照数，对应 FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_PER_REQUEST")
+                        help = "单请求最多保留的前缀缓存快照数，默认 32，对应 FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_PER_REQUEST")
     parser.add_argument("--prefix_cache_snapshot_max_records", "--prefix-cache-snapshot-max-records",
                         dest = "prefix_cache_snapshot_max_records", type = int, default = -1,
-                        help = "全局最多保留的前缀缓存快照数，对应 FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_RECORDS")
+                        help = "全局最多保留的前缀缓存快照数，默认 64，对应 FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_RECORDS")
     parser.add_argument("--gpu_mem_ratio", type = float, default = 0.9, help = "GPU显存使用比例，如0.9表示使用90%%的显存")
     parser.add_argument("--cuda_slab", type = int, default = 0, help = "CUDA模型权重slab大小（MB），0表示关闭")
     parser.add_argument("--mtp", type = int, default = 0, help = "支持MTP的模型每步生成的draft token数，0表示关闭（默认），当前最大8")
