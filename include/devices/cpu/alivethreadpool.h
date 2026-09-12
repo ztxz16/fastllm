@@ -7,6 +7,8 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
+#include <exception>
 #include <thread>
 #include <vector>
 #if defined(_WIN32) || defined(_WIN64)
@@ -60,7 +62,25 @@ namespace fastllm {
                 uint64_t currentId = task->publishId.load(std::memory_order_acquire);
                 if (currentId != lastRunId) {
                     lastRunId = currentId;
-                    task->op->Run();
+                    // An op that fails must never abort the process: this is a
+                    // pool thread, so an escaping exception would terminate.
+                    try {
+                        task->op->Run();
+                    } catch (const std::exception &error) {
+                        static std::atomic<bool> warned(false);
+                        if (!warned.exchange(true)) {
+                            printf("[Fastllm] thread pool worker failed: %s\n",
+                                   error.what());
+                            fflush(stdout);
+                        }
+                    } catch (...) {
+                        static std::atomic<bool> warned(false);
+                        if (!warned.exchange(true)) {
+                            printf("[Fastllm] thread pool worker failed with an "
+                                   "unknown error.\n");
+                            fflush(stdout);
+                        }
+                    }
                     task->doneId.store(currentId, std::memory_order_release);
                     lastRunTime = std::chrono::system_clock::now();
                 }
@@ -145,7 +165,17 @@ namespace fastllm {
 
         void Run() {
             for (int i = 0; i < ops.size(); i++) {
-                ops[i]->Run();
+                try {
+                    ops[i]->Run();
+                } catch (const std::exception &error) {
+                    static std::atomic<bool> warned(false);
+                    if (!warned.exchange(true)) {
+                        printf("[Fastllm] thread pool op failed: %s\n",
+                               error.what());
+                        fflush(stdout);
+                    }
+                } catch (...) {
+                }
             }
         }
 

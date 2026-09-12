@@ -14,8 +14,10 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
 #include <thread>
 #include <mutex>
+#include <atomic>
 #include <vector>
 #include <deque>
 #include <array>
@@ -96,7 +98,28 @@ namespace fastllm {
         std::this_thread::sleep_for(std::chrono::seconds(t));
     }
 
+    // While a request is being served an internal error must fail that request
+    // and never terminate the process.  ErrorInFastLLM() below used to print a
+    // message, block on getchar() and exit(0) unconditionally, so one request
+    // carrying e.g. an image for a model without vision weights killed the
+    // whole server.  ServingModeScope marks such a section; the flag is global
+    // rather than thread-local because the guarded work can run on worker
+    // threads (vision encoding, tensor-parallel workers).
+    inline std::atomic<bool> &ServingModeFlag() {
+        static std::atomic<bool> flag(false);
+        return flag;
+    }
+
+    struct ServingModeScope {
+        bool previous;
+        ServingModeScope() : previous(ServingModeFlag().exchange(true)) {}
+        ~ServingModeScope() { ServingModeFlag().store(previous); }
+    };
+
     static void ErrorInFastLLM(const std::string &error) {
+        if (ServingModeFlag().load()) {
+            throw std::runtime_error(error);
+        }
         printf("FastLLM Error: %s\n", error.c_str());
         printf("Press any key to exit...\n");
         getchar();

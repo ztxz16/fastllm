@@ -25518,29 +25518,46 @@ namespace fastllm {
         if (visionPrepared) {
             return;
         }
-        AssertInFastLLM(vision_depth > 0 && vision_hidden_size > 0 && vision_num_heads > 0 &&
-                        vision_intermediate_size > 0 && vision_out_hidden_size > 0 &&
-                        vision_num_position_embeddings > 0 && vision_num_grid_per_side > 0,
-                        "Qwen3.5 vision_config is incomplete.");
-        AssertInFastLLM(vision_head_dim > 0 && vision_head_dim % 4 == 0,
-                        "Qwen3.5 vision head dim must be divisible by 4.");
-        AssertInFastLLM(vision_deepstack_visual_indexes.empty(),
-                        "Qwen3.5 deepstack vision is not supported yet.");
-        AssertInFastLLM(this->weight.weight.find(visual_prefix + "patch_embed.proj.weight") != this->weight.weight.end() &&
-                        this->weight.weight.find(visual_prefix + "patch_embed.proj.bias") != this->weight.weight.end() &&
-                        this->weight.weight.find(visual_prefix + "pos_embed.weight") != this->weight.weight.end() &&
-                        this->weight.weight.find(visual_prefix + "merger.norm.weight") != this->weight.weight.end() &&
-                        this->weight.weight.find(visual_prefix + "merger.norm.bias") != this->weight.weight.end() &&
-                        this->weight.weight.find(visual_prefix + "merger.linear_fc1.weight") != this->weight.weight.end() &&
-                        this->weight.weight.find(visual_prefix + "merger.linear_fc1.bias") != this->weight.weight.end() &&
-                        this->weight.weight.find(visual_prefix + "merger.linear_fc2.weight") != this->weight.weight.end() &&
-                        this->weight.weight.find(visual_prefix + "merger.linear_fc2.bias") != this->weight.weight.end(),
-                        "Qwen3.5 multimodal needs model.visual.* vision weights.");
+        // None of these checks may be fatal.  AssertInFastLLM() prints a
+        // message, blocks on getchar() and calls exit(0), so a single request
+        // that carried an image for a model without vision weights terminated
+        // the whole server.  That happens whenever a text GGUF is served with
+        // an external MTP draft model, because --mmproj cannot be combined
+        // with external MTP.  Throw instead: the request fails, the server
+        // keeps serving.
+        auto visionError = [](const std::string &message) -> void {
+            throw std::runtime_error(message);
+        };
+        if (!(vision_depth > 0 && vision_hidden_size > 0 &&
+              vision_num_heads > 0 && vision_intermediate_size > 0 &&
+              vision_out_hidden_size > 0 &&
+              vision_num_position_embeddings > 0 &&
+              vision_num_grid_per_side > 0)) {
+            visionError("Qwen3.5 vision_config is incomplete.");
+        }
+        if (!(vision_head_dim > 0 && vision_head_dim % 4 == 0)) {
+            visionError("Qwen3.5 vision head dim must be divisible by 4.");
+        }
+        if (!vision_deepstack_visual_indexes.empty()) {
+            visionError("Qwen3.5 deepstack vision is not supported yet.");
+        }
+        if (!(this->weight.weight.find(visual_prefix + "patch_embed.proj.weight") != this->weight.weight.end() &&
+              this->weight.weight.find(visual_prefix + "patch_embed.proj.bias") != this->weight.weight.end() &&
+              this->weight.weight.find(visual_prefix + "pos_embed.weight") != this->weight.weight.end() &&
+              this->weight.weight.find(visual_prefix + "merger.norm.weight") != this->weight.weight.end() &&
+              this->weight.weight.find(visual_prefix + "merger.norm.bias") != this->weight.weight.end() &&
+              this->weight.weight.find(visual_prefix + "merger.linear_fc1.weight") != this->weight.weight.end() &&
+              this->weight.weight.find(visual_prefix + "merger.linear_fc1.bias") != this->weight.weight.end() &&
+              this->weight.weight.find(visual_prefix + "merger.linear_fc2.weight") != this->weight.weight.end() &&
+              this->weight.weight.find(visual_prefix + "merger.linear_fc2.bias") != this->weight.weight.end())) {
+            visionError("Qwen3.5 multimodal needs model.visual.* vision weights.");
+        }
 
         Data &patchWeight = this->weight[visual_prefix + "patch_embed.proj.weight"];
         const int patchDim = 3 * vision_temporal_patch_size * vision_patch_size * vision_patch_size;
-        AssertInFastLLM(patchWeight.Count(0) == vision_hidden_size * patchDim,
-                        "Qwen3.5 vision patch embedding weight shape is invalid.");
+        if (patchWeight.Count(0) != vision_hidden_size * patchDim) {
+            visionError("Qwen3.5 vision patch embedding weight shape is invalid.");
+        }
         if (patchWeight.dims.size() != 2 ||
             patchWeight.dims[0] != vision_hidden_size ||
             patchWeight.dims[1] != patchDim) {
@@ -25624,6 +25641,10 @@ namespace fastllm {
         if (rawInputs.empty()) {
             return;
         }
+        // Any internal vision error (incomplete vision_config, missing
+        // model.visual.* weights, bad media metadata) must fail this request
+        // instead of terminating the serving process.
+        ServingModeScope servingGuard;
         PrepareVision();
         AssertInFastLLM(gridThwData != nullptr, "Qwen3.5 multimodal raw media requires grid_thw metadata.");
 
@@ -31617,6 +31638,50 @@ namespace fastllm {
             const GenerationConfig &generationConfig,
             const LastTokensManager &lastTokens,
             std::vector <std::vector <float>*> *retLogits,
+            std::vector<std::vector<int> > &acceptedTokens,
+            std::vector<std::vector<int> > &nextInputTokens,
+            std::vector<int> &keptInputLens,
+            bool &usedMtpForward) {
+        usedMtpForward = false;
+        std::vector <int> ret;
+        std::vector <float> *logits = nullptr;
+        if (retLogits != nullptr && !retLogits->empty()) {
+            logits = (*retLogits)[0];
+        }
+
+        // A media attachment the model cannot handle (no vision weights, bad
+        // media metadata) fails this request only.  Without this guard the
+        // exception escaped the serving thread and aborted the process, which
+        // is what killed the server whenever an image arrived while no mmproj
+        // was loaded.
+        try {
+            return Qwen35ForwardMultimodalInternal(
+                context, inputIds, attentionMask, positionIds, pastKeyValues,
+                multimodalInput, generationConfig, lastTokens, retLogits,
+                acceptedTokens, nextInputTokens, keptInputLens,
+                usedMtpForward);
+        } catch (const std::exception &error) {
+            printf("[Fastllm] multimodal request failed: %s "
+                   "(returning an empty response).\n", error.what());
+            fflush(stdout);
+        } catch (...) {
+            printf("[Fastllm] multimodal request failed with an unknown "
+                   "error (returning an empty response).\n");
+            fflush(stdout);
+        }
+        return ret;
+    }
+
+    std::vector <int> Qwen3_5Model::Qwen35ForwardMultimodalInternal(
+            ResponseContext *context,
+            const fastllm::Data &inputIds,
+            const fastllm::Data &attentionMask,
+            const fastllm::Data &positionIds,
+            std::vector<std::pair<Data, Data>> &pastKeyValues,
+            const std::map <std::string, std::vector <Data*> > &multimodalInput,
+            const GenerationConfig &generationConfig,
+            const LastTokensManager &lastTokens,
+            std::vector<std::vector <float>*> *retLogits,
             std::vector<std::vector<int> > &acceptedTokens,
             std::vector<std::vector<int> > &nextInputTokens,
             std::vector<int> &keptInputLens,
