@@ -387,6 +387,13 @@ static CTmpBuf &GetCTmp(int device) {
 static bool EnsureCTmp(int device, size_t elems) {
     CTmpBuf &b = GetCTmp(device);
     if (b.device == device && b.ptr != nullptr && b.elems >= elems) return true;
+    // A captured graph keeps this address even when later eager prefills use
+    // larger M tiles. Reserve the largest reduction tile on first use so the
+    // cached buffer never moves underneath an existing FP8/NVFP4 graph.
+    int sms = 0;
+    if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) !=
+            cudaSuccess || sms <= 0) return false;
+    elems = std::max(elems, (size_t)sms * 64 * 256);
     int prev = -1;
     cudaGetDevice(&prev);
     if (prev != device) cudaSetDevice(device);

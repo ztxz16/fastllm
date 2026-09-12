@@ -834,6 +834,16 @@ if (UNIT_TEST)
         target_link_libraries(cudaGraphPoolMissRegression fastllm)
         target_include_directories(cudaGraphPoolMissRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 
+        add_executable(marlinGraphScratchRegression test/ops/marlinGraphScratchRegression.cpp)
+        target_link_libraries(marlinGraphScratchRegression fastllm)
+        target_include_directories(marlinGraphScratchRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        foreach(marlin_dtype IN ITEMS nvfp4 fp8)
+            add_test(NAME marlin_graph_scratch_${marlin_dtype}
+                     COMMAND marlinGraphScratchRegression ${marlin_dtype})
+            set_tests_properties(marlin_graph_scratch_${marlin_dtype} PROPERTIES
+                LABELS cuda TIMEOUT 60 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        endforeach()
+
         add_executable(customAllReduceRegression test/ops/customAllReduceRegression.cpp)
         target_link_libraries(customAllReduceRegression fastllm)
         target_include_directories(customAllReduceRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
