@@ -2261,9 +2261,12 @@ bool FastllmInitNccl(const std::vector<int>& devices) {
         
     g_ncclInitialized = true;
     g_ncclWorldSize = numGPUs;
-    // Odd TP sizes cannot use the custom all-reduce. Keep the established
-    // even-rank path unchanged, including its NCCL fallback.
-    if (numGPUs % 2 != 0) {
+    // Every multi-rank TP group meets around NCCL submission: even-rank
+    // collectives also fall back to NCCL for large tensors, and a rank
+    // entering the next GEMM/allocator while a peer is still submitting can
+    // deadlock on the CUDA driver lock (upstream #722: TP=2 + MTP long
+    // context prefill stalled at the 256-page boundary).
+    if (numGPUs > 1) {
         g_ncclSubmitRendezvous.reset(new fastllm::NcclSubmitRendezvous(numGPUs));
     }
     // Initialize the optional graph-safe small all-reduce before any captured

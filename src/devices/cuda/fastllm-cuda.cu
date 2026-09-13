@@ -15715,6 +15715,255 @@ bool FastllmCudaDFlashRejectionSampling(
     return true;
 }
 
+// MTP distributional draft: sample the draft token by Gumbel-max over the
+// *collected candidate set*, so the sampled support is exactly the support
+// whose normalized probabilities are handed to the verifier as q.
+//
+// Gumbel-max: argmax_i (log p_i + G_i) with G_i = -log(-log U_i), U_i ~
+// Uniform(0,1), samples Categorical(p) exactly.  p <= 0 entries are outside
+// the filtered support and never win.
+__global__ void FastllmMtpDraftGumbelKernel(
+        const float *candidateProbs, const int *candidateIds, int *countPtr,
+        uint64_t seed, int *draftSlotOut) {
+    const float negInf = -__int_as_float(0x7f800000u);
+    float bestScore = negInf;
+    int bestSlot = -1;
+    const int candidateCount = *countPtr;
+    for (int i = threadIdx.x; i < candidateCount; i += blockDim.x) {
+        float p = candidateProbs[i];
+        if (p <= 0.0f) {
+            continue;
+        }
+        // splitmix64 finalizer per (seed, token id): uniform, stateless, and
+        // independent of the (atomically assigned) candidate slot order.
+        uint64_t z = seed ^ ((uint64_t)candidateIds[i] * 0x9E3779B97F4A7C15ULL);
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+        z ^= z >> 31;
+        float u = (float)(z >> 11u) * (1.0f / 9007199254740992.0f);
+        // u in (0,1) keeps -logf(u) > 0 so logf(-logf(u)) is finite; the
+        // measure-zero u == 0 drives the score to -inf and never wins.
+        float score = logf(p) - logf(-logf(u));
+        if (score > bestScore) {
+            bestScore = score;
+            bestSlot = i;
+        }
+    }
+    __shared__ float sBest[32];
+    __shared__ int sSlot[32];
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float other = __shfl_down_sync(0xffffffffu, bestScore, offset);
+        int otherSlot = __shfl_down_sync(0xffffffffu, bestSlot, offset);
+        if (other > bestScore) {
+            bestScore = other;
+            bestSlot = otherSlot;
+        }
+    }
+    if (lane == 0) {
+        sBest[warp] = bestScore;
+        sSlot[warp] = bestSlot;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        int warpCount = (int)(blockDim.x >> 5);
+        bestScore = (lane < warpCount) ? sBest[lane] : negInf;
+        bestSlot = (lane < warpCount) ? sSlot[lane] : -1;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            float other = __shfl_down_sync(0xffffffffu, bestScore, offset);
+            int otherSlot = __shfl_down_sync(0xffffffffu, bestSlot, offset);
+            if (other > bestScore) {
+                bestScore = other;
+                bestSlot = otherSlot;
+            }
+        }
+        if (lane == 0) {
+            *draftSlotOut = bestSlot;
+        }
+    }
+}
+
+// Collect the filtered support (p > 0, guaranteed <= maxK by the upstream
+// top-K filter except pivot ties) into the fixed-stride candidate arrays.
+__global__ void FastllmMtpDraftCollectKernel(
+        const float *probs, int vocabSize, int maxK,
+        int *countPtr, int *idsOut, float *probsOut, float *sumPtr) {
+    if (threadIdx.x == 0) {
+        *countPtr = 0;
+        *sumPtr = 0.0f;
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < vocabSize; i += blockDim.x) {
+        float p = probs[i];
+        if (p > 0.0f) {
+            int slot = atomicAdd(countPtr, 1);
+            if (slot >= maxK) {
+                atomicAdd(countPtr, -1);
+                continue;
+            }
+            idsOut[slot] = i;
+            probsOut[slot] = p;
+            atomicAdd(sumPtr, p);
+        }
+    }
+}
+
+bool FastllmCudaMtpDraftSpecSampling(
+                                  const float *logits,
+                                  float temperature, int topK, float topP,
+                                  uint64_t seed,
+                                  int *draftOut, int *candidateIdsOut,
+                                  float *candidateProbsOut,
+                                  int *candidateCountOut, int vocabSize) {
+    if (logits == nullptr || draftOut == nullptr ||
+        candidateIdsOut == nullptr || candidateProbsOut == nullptr ||
+        candidateCountOut == nullptr || topK <= 0 || vocabSize <= 0) {
+        return false;
+    }
+    const int K = topK;
+    float clampedTemperature = std::max(temperature, 1.0e-6f);
+    int clampedTopKValue = K;
+    float clampedTopP = std::max(1.0e-6f, std::min(topP, 1.0f));
+    const bool needTopP = clampedTopP < 1.0f;
+
+    // Same filter sequence as FastllmCudaDFlashRejectionSampling so the
+    // draft q and the verify-side target p live in one filtered space:
+    // temperature softmax -> top-K renorm -> top-p renorm (optional).
+    const size_t probBytes = (size_t)vocabSize * sizeof(float);
+    size_t scratchNeed = 0;
+    auto reserveAligned = [&](size_t bytes) {
+        size_t offset = scratchNeed;
+        scratchNeed += FastllmCudaAlignBytes(bytes, 256);
+        return offset;
+    };
+    size_t pAOffset = reserveAligned(probBytes);
+    size_t pBOffset = reserveAligned(probBytes);
+    size_t rowStatesOffset =
+        reserveAligned(sizeof(flashinfer::sampling::RadixRowState));
+    size_t temperatureOffset = reserveAligned(sizeof(float));
+    size_t topKOffset = reserveAligned(sizeof(int));
+    size_t topPOffset = reserveAligned(sizeof(float));
+    size_t draftOffset = reserveAligned(sizeof(int));
+    size_t countOffset = reserveAligned(sizeof(int));
+    size_t sumOffset = reserveAligned(sizeof(float));
+    size_t idsOffset = reserveAligned((size_t)K * sizeof(int));
+    size_t probsOffset = reserveAligned((size_t)K * sizeof(float));
+
+    size_t scratchBytes = 0;
+    bool scratchOwn = false;
+    uint8_t *scratch = (uint8_t*)FastllmBorrowDequantScratch(
+        scratchNeed, &scratchBytes, &scratchOwn);
+    if (scratch == nullptr || scratchBytes < scratchNeed) {
+        FastllmReleaseDequantScratch(scratch, scratchOwn);
+        printf("FastllmCudaMtpDraftSpecSampling: failed to borrow CUDA temp buffer.\n");
+        fflush(stdout);
+        return false;
+    }
+    float *pA = (float*)(scratch + pAOffset);
+    float *pB = (float*)(scratch + pBOffset);
+    auto *rowStates =
+        (flashinfer::sampling::RadixRowState*)(scratch + rowStatesOffset);
+    float *cudaTemperature = (float*)(scratch + temperatureOffset);
+    int *cudaTopK = (int*)(scratch + topKOffset);
+    float *cudaTopP = (float*)(scratch + topPOffset);
+    int *cudaDraft = (int*)(scratch + draftOffset);
+    int *cudaCount = (int*)(scratch + countOffset);
+    float *cudaSum = (float*)(scratch + sumOffset);
+    int *cudaIds = (int*)(scratch + idsOffset);
+    float *cudaProbs = (float*)(scratch + probsOffset);
+
+    cudaStream_t stream = cudaStreamPerThread;
+    cudaError_t state = cudaMemsetAsync(
+        rowStates, 0, sizeof(flashinfer::sampling::RadixRowState), stream);
+    FastllmCudaCopyFromHostToDevice(
+        cudaTemperature, &clampedTemperature, sizeof(float));
+    FastllmCudaCopyFromHostToDevice(cudaTopK, &clampedTopKValue, sizeof(int));
+    FastllmCudaCopyFromHostToDevice(cudaTopP, &clampedTopP, sizeof(float));
+
+    if (state == cudaSuccess) {
+        FastllmTemperatureSoftmaxKernel<1024>
+            <<<1, 1024, 0, stream>>>(
+                (float*)logits, pA, cudaTemperature, vocabSize);
+        state = cudaGetLastError();
+    }
+    float *filtered = pA;
+    if (state == cudaSuccess) {
+        state = flashinfer::sampling::RadixTopKRenormProbMultiCTA<float, int>(
+            pA, pB, cudaTopK, 1, 0, (uint32_t)vocabSize, rowStates, stream);
+        filtered = pB;
+    }
+    if (state == cudaSuccess && needTopP) {
+        state = flashinfer::sampling::TopPRenormProb<float>(
+            pB, pA, cudaTopP, 1, 1.0f, (uint32_t)vocabSize, stream);
+        filtered = pA;
+    }
+    if (state == cudaSuccess) {
+        FastllmMtpDraftCollectKernel<<<1, 1024, 0, stream>>>(
+            filtered, vocabSize, K, cudaCount, cudaIds, cudaProbs, cudaSum);
+        state = cudaGetLastError();
+    }
+    if (state == cudaSuccess) {
+        // Sample only from the collected candidates: the draft support is then
+        // exactly the reported support, so the draft law equals the q handed to
+        // the verifier (the losslessness precondition).
+        FastllmMtpDraftGumbelKernel<<<1, 1024, 0, stream>>>(
+            cudaProbs, cudaIds, cudaCount, seed, cudaDraft);
+        state = cudaGetLastError();
+    }
+    if (state != cudaSuccess) {
+        FastllmReleaseDequantScratch(scratch, scratchOwn);
+        printf("FastllmCudaMtpDraftSpecSampling: sampling failed: %s\n",
+               cudaGetErrorString(state));
+        fflush(stdout);
+        return false;
+    }
+
+    int draftSlot = -1;
+    int count = 0;
+    float sum = 0.0f;
+    std::vector<int> ids(K, -1);
+    std::vector<float> probs(K, 0.0f);
+    FastllmCudaCopyFromDeviceToHost(&draftSlot, cudaDraft, sizeof(int));
+    FastllmCudaCopyFromDeviceToHost(&count, cudaCount, sizeof(int));
+    FastllmCudaCopyFromDeviceToHost(&sum, cudaSum, sizeof(float));
+    if (count > 0 && count <= K) {
+        FastllmCudaCopyFromDeviceToHost(
+            ids.data(), cudaIds, (size_t)count * sizeof(int));
+        FastllmCudaCopyFromDeviceToHost(
+            probs.data(), cudaProbs, (size_t)count * sizeof(float));
+    }
+    DeviceSync();
+    FastllmReleaseDequantScratch(scratch, scratchOwn);
+
+    if (draftSlot < 0 || draftSlot >= count || count <= 0 || sum <= 0.0f) {
+        printf("FastllmCudaMtpDraftSpecSampling: empty result "
+               "(slot=%d count=%d).\n", draftSlot, count);
+        fflush(stdout);
+        return false;
+    }
+    // Gumbel-max runs over the collected candidates, so the sampled slot always
+    // refers to a reported candidate and the real draft law equals the
+    // normalized candidate distribution handed to the verifier.  No silent
+    // substitution back into the support is needed (or allowed).
+    int draft = ids[draftSlot];
+    if (draft < 0 || draft >= vocabSize) {
+        printf("FastllmCudaMtpDraftSpecSampling: bad draft id %d.\n", draft);
+        fflush(stdout);
+        return false;
+    }
+    for (int j = 0; j < count; j++) {
+        probs[j] /= sum;
+    }
+    *draftOut = draft;
+    *candidateCountOut = count;
+    for (int j = 0; j < K; j++) {
+        candidateIdsOut[j] = (j < count) ? ids[j] : -1;
+        candidateProbsOut[j] = (j < count) ? probs[j] : 0.0f;
+    }
+    return true;
+}
+
 template <int BLOCK_THREADS>
 __global__ void FastllmRepeatPenaltyFactorsKernel(
         float *logits, const int *penaltyIds,
