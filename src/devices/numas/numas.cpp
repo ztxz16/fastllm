@@ -92,9 +92,19 @@ namespace fastllm {
 
         NumaDetector () {
             if (numa_available() != -1) {
+                // Preserve a numactl/taskset mask: the NUMA probe must not
+                // widen the affinity inherited by subsequently created workers.
+                cpu_set_t originalAffinity;
+                if (sched_getaffinity(0, sizeof(originalAffinity), &originalAffinity) != 0) {
+                    canUseNuma = false;
+                    return;
+                }
                 if (numa_run_on_node(0) == -1) {
                     std::cerr << "Warning: NUMA node binding failed (non-privileged mode?)" << std::endl;
                     canUseNuma = false;
+                }
+                if (sched_setaffinity(0, sizeof(originalAffinity), &originalAffinity) != 0) {
+                    throw std::runtime_error("Failed to restore CPU affinity after NUMA probe");
                 }
             } else {
                 canUseNuma = false;
