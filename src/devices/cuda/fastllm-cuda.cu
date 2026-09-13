@@ -15715,62 +15715,71 @@ bool FastllmCudaDFlashRejectionSampling(
     return true;
 }
 
-// MTP distributional draft: sample the draft token from the filtered draft
-// distribution via Gumbel-max.  p <= 0 entries are outside the filtered
-// support and never win.
+// MTP distributional draft: sample the draft token by Gumbel-max over the
+// *collected candidate set*, so the sampled support is exactly the support
+// whose normalized probabilities are handed to the verifier as q.
+//
+// Gumbel-max: argmax_i (log p_i + G_i) with G_i = -log(-log U_i), U_i ~
+// Uniform(0,1), samples Categorical(p) exactly.  p <= 0 entries are outside
+// the filtered support and never win.
 __global__ void FastllmMtpDraftGumbelKernel(
-        const float *probs, int vocabSize, uint64_t seed, int *draftOut) {
+        const float *candidateProbs, const int *candidateIds, int *countPtr,
+        uint64_t seed, int *draftSlotOut) {
     const float negInf = -__int_as_float(0x7f800000u);
     float bestScore = negInf;
-    int bestId = -1;
-    for (int i = threadIdx.x; i < vocabSize; i += blockDim.x) {
-        float p = probs[i];
+    int bestSlot = -1;
+    const int candidateCount = *countPtr;
+    for (int i = threadIdx.x; i < candidateCount; i += blockDim.x) {
+        float p = candidateProbs[i];
         if (p <= 0.0f) {
             continue;
         }
-        // splitmix64 finalizer per (seed, index): uniform, stateless.
-        uint64_t z = seed ^ ((uint64_t)i * 0x9E3779B97F4A7C15ULL);
+        // splitmix64 finalizer per (seed, token id): uniform, stateless, and
+        // independent of the (atomically assigned) candidate slot order.
+        uint64_t z = seed ^ ((uint64_t)candidateIds[i] * 0x9E3779B97F4A7C15ULL);
         z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
         z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
         z ^= z >> 31;
         float u = (float)(z >> 11u) * (1.0f / 9007199254740992.0f);
-        float score = logf(p) + logf(u);
+        // u in (0,1) keeps -logf(u) > 0 so logf(-logf(u)) is finite; the
+        // measure-zero u == 0 drives the score to -inf and never wins.
+        float score = logf(p) - logf(-logf(u));
         if (score > bestScore) {
             bestScore = score;
-            bestId = i;
+            bestSlot = i;
         }
     }
     __shared__ float sBest[32];
-    __shared__ int sId[32];
+    __shared__ int sSlot[32];
     int lane = threadIdx.x & 31;
     int warp = threadIdx.x >> 5;
     for (int offset = 16; offset > 0; offset >>= 1) {
         float other = __shfl_down_sync(0xffffffffu, bestScore, offset);
-        int otherId = __shfl_down_sync(0xffffffffu, bestId, offset);
+        int otherSlot = __shfl_down_sync(0xffffffffu, bestSlot, offset);
         if (other > bestScore) {
             bestScore = other;
-            bestId = otherId;
+            bestSlot = otherSlot;
         }
     }
     if (lane == 0) {
         sBest[warp] = bestScore;
-        sId[warp] = bestId;
+        sSlot[warp] = bestSlot;
     }
     __syncthreads();
     if (warp == 0) {
         int warpCount = (int)(blockDim.x >> 5);
         bestScore = (lane < warpCount) ? sBest[lane] : negInf;
-        bestId = (lane < warpCount) ? sId[lane] : -1;
+        bestSlot = (lane < warpCount) ? sSlot[lane] : -1;
         for (int offset = 16; offset > 0; offset >>= 1) {
             float other = __shfl_down_sync(0xffffffffu, bestScore, offset);
-            int otherId = __shfl_down_sync(0xffffffffu, bestId, offset);
+            int otherSlot = __shfl_down_sync(0xffffffffu, bestSlot, offset);
             if (other > bestScore) {
                 bestScore = other;
-                bestId = otherId;
+                bestSlot = otherSlot;
             }
         }
         if (lane == 0) {
-            *draftOut = bestId;
+            *draftSlotOut = bestSlot;
         }
     }
 }
@@ -15890,13 +15899,16 @@ bool FastllmCudaMtpDraftSpecSampling(
         filtered = pA;
     }
     if (state == cudaSuccess) {
-        FastllmMtpDraftGumbelKernel<<<1, 1024, 0, stream>>>(
-            filtered, vocabSize, seed, cudaDraft);
+        FastllmMtpDraftCollectKernel<<<1, 1024, 0, stream>>>(
+            filtered, vocabSize, K, cudaCount, cudaIds, cudaProbs, cudaSum);
         state = cudaGetLastError();
     }
     if (state == cudaSuccess) {
-        FastllmMtpDraftCollectKernel<<<1, 1024, 0, stream>>>(
-            filtered, vocabSize, K, cudaCount, cudaIds, cudaProbs, cudaSum);
+        // Sample only from the collected candidates: the draft support is then
+        // exactly the reported support, so the draft law equals the q handed to
+        // the verifier (the losslessness precondition).
+        FastllmMtpDraftGumbelKernel<<<1, 1024, 0, stream>>>(
+            cudaProbs, cudaIds, cudaCount, seed, cudaDraft);
         state = cudaGetLastError();
     }
     if (state != cudaSuccess) {
@@ -15907,12 +15919,12 @@ bool FastllmCudaMtpDraftSpecSampling(
         return false;
     }
 
-    int draft = -1;
+    int draftSlot = -1;
     int count = 0;
     float sum = 0.0f;
     std::vector<int> ids(K, -1);
     std::vector<float> probs(K, 0.0f);
-    FastllmCudaCopyFromDeviceToHost(&draft, cudaDraft, sizeof(int));
+    FastllmCudaCopyFromDeviceToHost(&draftSlot, cudaDraft, sizeof(int));
     FastllmCudaCopyFromDeviceToHost(&count, cudaCount, sizeof(int));
     FastllmCudaCopyFromDeviceToHost(&sum, cudaSum, sizeof(float));
     if (count > 0 && count <= K) {
@@ -15924,30 +15936,21 @@ bool FastllmCudaMtpDraftSpecSampling(
     DeviceSync();
     FastllmReleaseDequantScratch(scratch, scratchOwn);
 
-    if (draft < 0 || draft >= vocabSize || count <= 0 || sum <= 0.0f) {
-        printf("FastllmCudaMtpDraftSpecSampling: empty result (draft=%d count=%d).\n",
-               draft, count);
+    if (draftSlot < 0 || draftSlot >= count || count <= 0 || sum <= 0.0f) {
+        printf("FastllmCudaMtpDraftSpecSampling: empty result "
+               "(slot=%d count=%d).\n", draftSlot, count);
         fflush(stdout);
         return false;
     }
-    // Pivot-tie edge: the sampled token can land outside the bounded
-    // candidate list; fall back to the strongest collected candidate so
-    // d stays inside the scatter support (q(d) > 0) by construction.
-    bool draftInCandidates = false;
-    for (int j = 0; j < count; j++) {
-        if (ids[j] == draft) {
-            draftInCandidates = true;
-            break;
-        }
-    }
-    if (!draftInCandidates) {
-        int best = 0;
-        for (int j = 1; j < count; j++) {
-            if (probs[j] > probs[best]) {
-                best = j;
-            }
-        }
-        draft = ids[best];
+    // Gumbel-max runs over the collected candidates, so the sampled slot always
+    // refers to a reported candidate and the real draft law equals the
+    // normalized candidate distribution handed to the verifier.  No silent
+    // substitution back into the support is needed (or allowed).
+    int draft = ids[draftSlot];
+    if (draft < 0 || draft >= vocabSize) {
+        printf("FastllmCudaMtpDraftSpecSampling: bad draft id %d.\n", draft);
+        fflush(stdout);
+        return false;
     }
     for (int j = 0; j < count; j++) {
         probs[j] /= sum;
