@@ -382,8 +382,11 @@ if (USE_CUDA)
         src/devices/cuda/models/dots3-note-kernels.cu
         src/devices/cuda/models/deepseekv4-kernels.cu
         src/devices/cuda/models/deepseekv41-kernels.cu
+        src/devices/cuda/models/deepseekv41-reference.cu
         src/devices/cuda/models/deepseekv41-dspark-kernels.cu
         src/devices/cuda/models/qwen4-kernels.cu)
+
+    set_source_files_properties(src/devices/cuda/models/deepseekv41-reference.cu PROPERTIES COMPILE_OPTIONS "--fmad=false")
 
     if (FASTLLM_DEEPGEMM_FP8_SM90_ENABLED AND NOT CUDA_NO_TENSOR_CORE AND
         CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8 AND
@@ -670,6 +673,17 @@ if (UNIT_TEST)
 
     add_executable(regressionOps test/ops/regressionOps.cpp)
     target_link_libraries(regressionOps fastllm)
+    add_executable(deepseekV41PrecisionRegression test/ops/deepseekV41PrecisionRegression.cpp)
+    target_link_libraries(deepseekV41PrecisionRegression fastllm)
+    add_test(NAME deepseekV41PrecisionCpu COMMAND deepseekV41PrecisionRegression)
+    add_test(NAME deepseekV41PrecisionCpuFallback COMMAND deepseekV41PrecisionRegression)
+    set_tests_properties(deepseekV41PrecisionCpuFallback PROPERTIES
+        ENVIRONMENT "FASTLLM_DSV4_DISABLE_CPU_MOE_FAST=1")
+    if (USE_CUDA)
+        target_include_directories(deepseekV41PrecisionRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME deepseekV41PrecisionCuda COMMAND deepseekV41PrecisionRegression --cuda)
+        set_tests_properties(deepseekV41PrecisionCuda PROPERTIES LABELS cuda TIMEOUT 300)
+    endif()
     add_executable(nvfp4Block32GemmRegression test/ops/nvfp4Block32GemmRegression.cpp)
     target_link_libraries(nvfp4Block32GemmRegression fastllm)
     add_test(NAME nvfp4_block32_gemm COMMAND nvfp4Block32GemmRegression)
@@ -916,6 +930,8 @@ if (UNIT_TEST)
         target_include_directories(qwen4HyperMixRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         add_test(NAME qwen4HyperMix COMMAND qwen4HyperMixRegression)
         set_tests_properties(qwen4HyperMix PROPERTIES LABELS cuda TIMEOUT 180 SKIP_RETURN_CODE 77)
+
+        set_tests_properties(deepseek_v41_ops PROPERTIES LABELS cuda)
 
         add_executable(ncclOddTpRegression test/ops/ncclOddTpRegression.cu)
         target_link_libraries(ncclOddTpRegression fastllm)

@@ -128,7 +128,8 @@ namespace fastllm {
         bool expertParallel = false,
         float swigluLimit = 0.0f,
         bool deepSeekV4Mode = false,
-        Data *pairedReduceInput = nullptr
+        Data *pairedReduceInput = nullptr, int activationQuantBlock = 128,
+        bool quantizeSharedExpert = false
     );
 
     class basellm;

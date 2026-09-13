@@ -844,6 +844,11 @@ bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, const fastllm
                                            int windowSize, int startPos, float softmaxScale,
                                            fastllm::Data &output);
 bool FastllmCudaDeepSeekV41WindowStore(const fastllm::Data &chunk, fastllm::Data &ring, int startPos, int windowSize);
+bool FastllmCudaDeepSeekV41QuantizeActivation(const fastllm::Data &input, fastllm::Data &output);
+// Input has already undergone block-32 FP8 activation quantization.
+bool FastllmCudaDeepSeekV41LinearBlock32(const fastllm::Data &input, fastllm::Data &weight,
+                                      fastllm::Data &output);
+
 bool FastllmCudaDeepSeekV41QuantizeKV(const fastllm::Data &input, fastllm::Data &output,
                                       int quantMode = 1, int quantBlock = 32);
 

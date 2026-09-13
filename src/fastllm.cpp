@@ -4147,7 +4147,7 @@ namespace fastllm {
                 Data &w1, Data &w2, Data &w3, Data &curInput, Data &curOutput,
                 float sharedScale, Data &output, int layer, MoeGateType gateType,
                 bool expertParallel, float swigluLimit, bool deepSeekV4Mode,
-                Data *pairedReduceInput) {
+                Data *pairedReduceInput, int activationQuantBlock, bool quantizeSharedExpert) {
         DataDict datas = {
                 {"input", (Data*)&input}, {"index", (Data*)&index}, {"score", (Data*)&score},
                 {"weights", (Data*)weights.data()}, {"biass", (Data*)biass.data()},
@@ -4163,7 +4163,9 @@ namespace fastllm {
                                         {{"weights___batch", (int)weights.size()}, {"biass___batch", (int)biass.size()},
                                          {"layer", layer}, {"gateType", (int)gateType},
                                          {"expertParallel", expertParallel ? 1 : 0},
-                                         {"deepSeekV4Mode", deepSeekV4Mode ? 1 : 0}});
+                                         {"deepSeekV4Mode", deepSeekV4Mode ? 1 : 0},
+                                         {"activationQuantBlock", activationQuantBlock},
+                                         {"quantizeSharedExpert", quantizeSharedExpert ? 1 : 0}});
     }
 
     void FusedMOE(const Data &input, const Data &index, const Data &score,

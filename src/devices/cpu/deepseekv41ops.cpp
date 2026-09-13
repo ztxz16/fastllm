@@ -424,6 +424,32 @@ namespace fastllm {
         }, 8);
     }
 
+    void CpuDeepSeekV41QuantizeActivationOp::Reshape(const std::string &opType, const DataDict &datas,
+                                                     const FloatDict &, const IntDict &) {
+        Data &input = *datas.at("input"), &output = *datas.at("output");
+        AssertInFastLLM(!input.dims.empty() && input.dims.back() % 32 == 0 && V41IsFloatType(input.dataType),
+                        "DeepSeekV41QuantizeActivation requires floating rows divisible by 32.\n");
+        if (output.dataType != input.dataType) {
+            output.FreeSpace();
+            output.dataType = input.dataType;
+        }
+        output.Resize(input.dims);
+    }
+
+    void CpuDeepSeekV41QuantizeActivationOp::Run(const std::string &, const DataDict &datas,
+                                                 const FloatDict &, const IntDict &) {
+        Data &input = *datas.at("input"), &output = *datas.at("output");
+        std::vector<float> values;
+        V41ReadFloat(input, values);
+        int rows = input.Count(0) / input.dims.back(), dim = input.dims.back();
+        V41ParallelFor(rows, [&](int start, int end) {
+            for (int row = start; row < end; row++)
+                DeepSeekV41FakeQuantRow(values.data() + (uint64_t)row * dim, dim, 1, 32);
+        });
+        output.Allocate();
+        V41WriteFloat(values, output);
+    }
+
     void CpuDeepSeekV41QuantizeKVOp::Reshape(const std::string &opType, const DataDict &datas,
                                              const FloatDict &floatParams, const IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
@@ -628,8 +654,9 @@ namespace fastllm {
                 for (int d = 0; d < dim; d++) {
                     float v = 0.0f;
                     for (int h = 0; h < hcMult; h++) {
-                        v += preData[(uint64_t)t * hcMult + h] *
+                        volatile float product = preData[(uint64_t)t * hcMult + h] *
                              V41ToFloat(input.cpuData, input.dataType, ((uint64_t)t * hcMult + h) * dim + d);
+                        v += product;
                     }
                     V41FromFloat(output.cpuData, output.dataType, (uint64_t)t * dim + d, v);
                 }
@@ -700,7 +727,7 @@ namespace fastllm {
     void DeepSeekV41RotaryQuantRows(float *values, int rows, int rowsPerToken, int dim,
                                     int ropeDim, float ropeBase, int startPos, int posStep, bool inverse,
                                     int originalSeqLen, float ropeFactor, int betaFast, int betaSlow,
-                                    int quantMode, int quantDim, int quantBlock) {
+                                    int quantMode, int quantDim, int quantBlock, DataType storageType) {
         auto invFreq = V41InvFreq(ropeDim, ropeBase, originalSeqLen, ropeFactor, betaFast, betaSlow);
         int pairs = ropeDim / 2;
         int off = dim - ropeDim;
@@ -718,6 +745,11 @@ namespace fastllm {
                     float a = row[2 * p], b = row[2 * p + 1];
                     row[2 * p] = a * c - b * s;
                     row[2 * p + 1] = a * s + b * c;
+                    for (int j = 0; j < 2; j++) {
+                        float &v = row[2 * p + j];
+                        if (storageType == DataType::BFLOAT16) v = RoundFloat32ToBFloat16RNE(v);
+                        else if (storageType == DataType::FLOAT16) v = half_to_float(float_to_half(v));
+                    }
                 }
                 if (quantMode > 0) {
                     DeepSeekV41FakeQuantRow(values + (uint64_t)r * dim, quantDim, quantMode, quantBlock);
@@ -753,7 +785,7 @@ namespace fastllm {
         V41ReadFloat(input, values);
         DeepSeekV41RotaryQuantRows(values.data(), rows, rowsPerToken, dim, ropeDim, ropeBase, startPos, posStep,
                                    inverse, originalSeqLen, ropeFactor, betaFast, betaSlow,
-                                   quantMode, quantDim, quantBlock);
+                                   quantMode, quantDim, quantBlock, input.dataType);
         V41WriteFloat(values, input);
     }
 
@@ -1079,12 +1111,18 @@ namespace fastllm {
             std::vector<const float*> rows;
             std::vector<float> scores;
             std::vector<float> acc(dim);
+            std::vector<float> partial(dim);
             for (int t = st; t < end; t++) {
                 int b = t / seqlen, i = t % seqlen;
                 int pos = startPos + i;
                 rows.clear();
-                for (int p = std::max(0, pos - windowSize + 1); p <= pos; p++) {
-                    if (p >= startPos) {
+                const int slots = startPos == 0 ? std::min(seqlen, windowSize) : windowSize;
+                const int first = startPos == 0 ? std::max(0, pos - windowSize + 1) : pos - windowSize + 1;
+                for (int slot = 0; slot < slots; slot++) {
+                    int p = first + slot;
+                    if (p < 0 || p > pos) {
+                        rows.push_back(nullptr);
+                    } else if (p >= startPos) {
                         rows.push_back(chunk.data() + ((uint64_t)b * seqlen + (p - startPos)) * dim);
                     } else {
                         AssertInFastLLM(hasRing, "DeepSeekV41SparseAttention error: ring cache is missing.\n");
@@ -1096,32 +1134,46 @@ namespace fastllm {
                     for (int k = 0; k < topWidth; k++) {
                         if (idx[k] >= 0 && idx[k] < cap) {
                             rows.push_back(comp.data() + ((uint64_t)b * cap + idx[k]) * dim);
+                        } else {
+                            rows.push_back(nullptr);
                         }
                     }
                 }
                 scores.resize(rows.size());
                 for (int h = 0; h < heads; h++) {
                     const float *qrow = qv.data() + ((uint64_t)t * heads + h) * dim;
-                    float mx = -std::numeric_limits<float>::infinity();
-                    for (size_t k = 0; k < rows.size(); k++) {
-                        double dot = 0.0;
-                        for (int d = 0; d < dim; d++) {
-                            dot += (double)qrow[d] * rows[k][d];
-                        }
-                        scores[k] = (float)dot * softmaxScale;
-                        mx = std::max(mx, scores[k]);
-                    }
-                    float safeMx = std::isfinite(mx) ? mx : 0.0f;
-                    double denom = std::exp((double)sink[h] - safeMx);
+                    float mx = -1e30f, denom = 0.0f;
                     std::fill(acc.begin(), acc.end(), 0.0f);
-                    for (size_t k = 0; k < rows.size(); k++) {
-                        double w = std::exp((double)scores[k] - safeMx);
-                        denom += w;
-                        for (int d = 0; d < dim; d++) {
-                            acc[d] += (float)w * rows[k][d];
+                    // The BF16 cast is inside each 64-slot softmax tile.
+                    // Neither compacting masked slots nor a global softmax
+                    // preserves this quantization boundary.
+                    for (size_t tile = 0; tile < rows.size(); tile += 64) {
+                        size_t end = std::min(rows.size(), tile + 64);
+                        float nextMx = mx;
+                        for (size_t k = tile; k < end; k++) {
+                            scores[k] = -std::numeric_limits<float>::infinity();
+                            if (rows[k] == nullptr) continue;
+                            double dot = 0.0;
+                            for (int d = 0; d < dim; d++) dot += (double)qrow[d] * rows[k][d];
+                            scores[k] = (float)dot * softmaxScale;
+                            nextMx = std::max(nextMx, scores[k]);
                         }
+                        float correction = std::exp(mx - nextMx), sum = 0.0f;
+                        std::fill(partial.begin(), partial.end(), 0.0f);
+                        for (size_t k = tile; k < end; k++) {
+                            if (rows[k] == nullptr) continue;
+                            float p = std::exp(scores[k] - nextMx);
+                            sum += p;
+                            float rounded = RoundFloat32ToBFloat16RNE(p);
+                            for (int d = 0; d < dim; d++) partial[d] += rounded * rows[k][d];
+                        }
+                        for (int d = 0; d < dim; d++) {
+                            acc[d] = acc[d] * correction + partial[d];
+                        }
+                        denom = denom * correction + sum;
+                        mx = nextMx;
                     }
-                    float inv = (float)(1.0 / std::max(denom, 1e-30));
+                    float inv = 1.0f / (denom + std::exp(sink[h] - mx));
                     uint16_t *orow = out + ((uint64_t)t * heads + h) * dim;
                     for (int d = 0; d < dim; d++) {
                         orow[d] = Float32ToBFloat16RNEBits(acc[d] * inv);

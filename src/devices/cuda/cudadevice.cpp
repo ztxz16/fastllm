@@ -7,6 +7,9 @@
 
 #include "fastllm-cuda.cuh"
 
+extern "C" bool FastllmCudaDeepSeekV41HcPost(const fastllm::Data&, const fastllm::Data&,
+    const fastllm::Data&, const fastllm::Data&, fastllm::Data&);
+
 #include "utils.h"
 #include "json11.hpp"
 
@@ -4584,6 +4587,7 @@ namespace fastllm {
         this->ops["Copy"] = (BaseOperator*)(new CudaCopyOp());
         this->ops["DeepSeekV4HcPre"] = (BaseOperator*)(new CudaDeepSeekV4HcPreOp());
         this->ops["DeepSeekV4HcPost"] = (BaseOperator*)(new CudaDeepSeekV4HcPostOp());
+        this->ops["DeepSeekV41HcPost"] = (BaseOperator*)(new CudaDeepSeekV4HcPostOp());
         this->ops["ScaleQRatory"] = (BaseOperator*)(new CudaScaleQRatoryOp());
         this->ops["DeepSeekV4RotaryQuant"] = (BaseOperator*)(new CudaDeepSeekV4RotaryQuantOp());
         this->ops["DeepSeekV4WoA"] = (BaseOperator*)(new CudaDeepSeekV4WoAOp());
@@ -4600,6 +4604,7 @@ namespace fastllm {
         this->ops["DeepSeekV41IndexerTopK"] = (BaseOperator*)(new CudaDeepSeekV41IndexerTopKOp());
         this->ops["DeepSeekV41SparseAttention"] = (BaseOperator*)(new CudaDeepSeekV41SparseAttentionOp());
         this->ops["DeepSeekV41WindowStore"] = (BaseOperator*)(new CudaDeepSeekV41WindowStoreOp());
+        this->ops["DeepSeekV41QuantizeActivation"] = (BaseOperator*)(new CudaDeepSeekV41QuantizeActivationOp());
         this->ops["DeepSeekV41QuantizeKV"] = (BaseOperator*)(new CudaDeepSeekV41QuantizeKVOp());
         this->ops["Cat"] = (BaseOperator*)(new CudaCatOp());
         this->ops["Pad"] = (BaseOperator*)(new CudaPadOp());
@@ -6987,6 +6992,18 @@ namespace fastllm {
         }
     }
 
+    bool CudaDeepSeekV41QuantizeActivationOp::CanRun(const std::string &, const DataDict &datas,
+                                                      const FloatDict &, const IntDict &) {
+        const Data &input = *datas.at("input");
+        return !input.dims.empty() && input.dims.back() % 32 == 0 && CudaV41FloatType(input.dataType);
+    }
+
+    void CudaDeepSeekV41QuantizeActivationOp::Run(const std::string &, const DataDict &datas,
+                                                  const FloatDict &, const IntDict &) {
+        if (!FastllmCudaDeepSeekV41QuantizeActivation(*datas.at("input"), *datas.at("output")))
+            ErrorInFastLLM("DeepSeekV41QuantizeActivation CUDA rejected input.\n");
+    }
+
     bool CudaDeepSeekV41QuantizeKVOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
                                              const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
@@ -7062,6 +7079,8 @@ namespace fastllm {
         Data &residual = *(datas.find("residual")->second);
         Data &post = *(datas.find("post")->second);
         Data &comb = *(datas.find("comb")->second);
+        if (opType == "DeepSeekV41HcPost" &&
+            (input.dataType != residual.dataType || (residual.dims.size() == 4 && residual.dims[2] > 4) || datas.at("output") == &input)) return false;
         if (residual.dims.size() != 4 || post.dataType != DataType::FLOAT32 ||
             comb.dataType != DataType::FLOAT32) {
             return false;
@@ -7087,6 +7106,11 @@ namespace fastllm {
         Data &comb = *(datas.find("comb")->second);
         Data &output = *(datas.find("output")->second);
         int bsz = residual.dims[0], seqlen = residual.dims[1], hcMult = residual.dims[2], dim = residual.dims[3];
+        if (opType == "DeepSeekV41HcPost") {
+            if (!FastllmCudaDeepSeekV41HcPost(input, residual, post, comb, output))
+                ErrorInFastLLM("DeepSeekV41HcPost CUDA error: kernel rejected input.\n");
+            return;
+        }
         if (!FastllmCudaDeepSeekV4HcPostCudaMix(input, residual, post, comb, bsz, seqlen, hcMult, dim, output)) {
             ErrorInFastLLM("DeepSeekV4HcPost CUDA error: kernel rejected input.\n");
         }

@@ -241,6 +241,12 @@ namespace fastllm {
         bool UseModelSpecificScheduler() const override { return false; }
 
     protected:
+        // Source FP8/FP4 linears still require block-32 FP8 activations after
+        // their weights have been decoded into the requested storage dtype.
+        std::set<std::string> quantizedLinearNames;
+        void LinearWithActivationQuant(Data &input, const std::string &weightName,
+                                       Data &output, bool replicated = false, Data *scratch = nullptr);
+
         // -------- 跨层共享 --------
         std::vector<int> kv_source_layer_ids;
         std::vector<int> index_source_layer_ids;

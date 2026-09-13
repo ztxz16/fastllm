@@ -707,11 +707,11 @@ namespace fastllm {
             }
         }
         for (const char *opName : {
-                 "DeepSeekV41HcMix", "DeepSeekV41HcApplyPre", "DeepSeekV41EngramApply",
+                 "DeepSeekV41HcMix", "DeepSeekV41HcApplyPre", "DeepSeekV41HcPost", "DeepSeekV41EngramApply",
                  "DeepSeekV41RotaryQuant", "DeepSeekV41Compress", "DeepSeekV41IndexerScore",
                  "DeepSeekV41CandidateBlocks", "DeepSeekV41IndexerTopK",
                  "DeepSeekV41SparseAttention", "DeepSeekV41WindowStore",
-                 "DeepSeekV41QuantizeKV"}) {
+                 "DeepSeekV41QuantizeKV", "DeepSeekV41QuantizeActivation"}) {
             auto cudaIt = cudaBaseDevice->ops.find(opName);
             if (cudaIt != cudaBaseDevice->ops.end()) {
                 this->ops[opName] = (BaseOperator*)(new MultiCudaDeepSeekV41Op(cudaIt->second));
@@ -4583,7 +4583,7 @@ namespace fastllm {
             for (const auto &name : outputNames) {
                 prepareOutput(name.c_str(), false);
             }
-        } else if (opType == "DeepSeekV4HcPost") {
+        } else if (opType == "DeepSeekV4HcPost" || opType == "DeepSeekV41HcPost") {
             for (const char *name : {"input", "residual", "post", "comb"}) {
                 prepareReplicated(name, true);
             }
@@ -4791,6 +4791,21 @@ namespace fastllm {
             return;
         }
 
+        if (opType == "DeepSeekV41QuantizeActivation") {
+            Data &input = *datas.at("input"), &output = *datas.at("output");
+            if (input.multiDeviceData && input.IsTensorParallelSharded()) {
+                SyncShardedLocalShapeFromRoot(input, devices);
+                for (int device : devices) {
+                    AssertInFastLLM(input.multiDeviceDatas.at(device)->dims.back() % 32 == 0,
+                                    "DeepSeekV41 activation shards must preserve block-32 boundaries.\n");
+                }
+                output.dataType = input.dataType;
+                PrepareMultiCudaShardedData(output, devices, input.dims, input.tpAxis, input.tpRanges);
+                dispatch({{"input", &input}, {"output", &output}}, {});
+                return;
+            }
+        }
+
         // ---- 其余算子：全部复制 ----
         std::vector<std::string> inputNames, inoutNames, outputNames;
         if (opType == "DeepSeekV41HcMix") {
@@ -4817,7 +4832,7 @@ namespace fastllm {
         } else if (opType == "DeepSeekV41WindowStore") {
             inputNames = {"chunk"};
             inoutNames = {"ring"};
-        } else if (opType == "DeepSeekV41QuantizeKV") {
+        } else if (opType == "DeepSeekV41QuantizeKV" || opType == "DeepSeekV41QuantizeActivation") {
             inputNames = {"input"};
             outputNames = {"output"};
         } else {

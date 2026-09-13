@@ -962,7 +962,8 @@ namespace fastllm {
                 float sharedScale, Data &output, int layer = 0, MoeGateType gateType = MoeGateSwiglu,
                 bool expertParallel = false, float swigluLimit = 0.0f,
                 bool deepSeekV4Mode = false,
-                Data *pairedReduceInput = nullptr);
+                Data *pairedReduceInput = nullptr, int activationQuantBlock = 128,
+                bool quantizeSharedExpert = false);
 
     void FusedMOE(const Data &input, const Data &index, const Data &score,
                 Data &gate, Data &up, Data &down, Data &w1,

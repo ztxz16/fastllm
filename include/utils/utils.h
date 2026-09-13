@@ -397,10 +397,10 @@ namespace fastllm {
     // Simulate the official DeepSeek FP8 activation path while retaining a
     // BF16 buffer for CPU GEMM kernels: block-128 E4M3FN, UE8M0 power-of-two
     // scale, saturating RNE conversion, then dequantize and round to BF16.
-    inline void QuantizeDequantizeFP8E4M3Block128(float *values, int len) {
+    inline void QuantizeDequantizeFP8E4M3Blocks(float *values, int len, int blockSize) {
         static const FP8E4M3ToFP32Manager fp8;
-        for (int start = 0; start < len; start += 128) {
-            int end = std::min(start + 128, len);
+        for (int start = 0; start < len; start += blockSize) {
+            int end = std::min(start + blockSize, len);
             float amax = 1e-4f;
             bool allBFloat16 = true;
             for (int i = start; i < end; i++) {
@@ -433,6 +433,10 @@ namespace fastllm {
                 }
             }
         }
+    }
+
+    inline void QuantizeDequantizeFP8E4M3Block128(float *values, int len) {
+        QuantizeDequantizeFP8E4M3Blocks(values, len, 128);
     }
 
     static double GetSpan(std::chrono::system_clock::time_point time1, std::chrono::system_clock::time_point time2) {

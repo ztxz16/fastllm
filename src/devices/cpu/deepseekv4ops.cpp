@@ -3568,7 +3568,8 @@ namespace fastllm {
 
         int bsz = residual.dims[0], seqlen = residual.dims[1], hcMult = residual.dims[2], dim = residual.dims[3];
         int tokens = bsz * seqlen;
-        if (input.dataType == DataType::BFLOAT16 &&
+        const bool fp32 = opType == "DeepSeekV41HcPost";
+        if (!fp32 && input.dataType == DataType::BFLOAT16 &&
             residual.dataType == DataType::BFLOAT16 &&
             output.dataType == DataType::BFLOAT16 &&
             input.cpuData != nullptr && residual.cpuData != nullptr &&
@@ -3617,11 +3618,23 @@ namespace fastllm {
             const float *combRow = comb.data() + (uint64_t)t * hcMult * hcMult;
             for (int target = 0; target < hcMult; target++) {
                 for (int d = 0; d < dim; d++) {
-                    double v = (double)postRow[target] * xrow[d];
-                    for (int src = 0; src < hcMult; src++) {
-                        v += (double)combRow[src * hcMult + target] * rrow[(uint64_t)src * dim + d];
+                    if (fp32) {
+                        float sum = 0.0f;
+                        for (int src = 0; src < hcMult; src++) {
+                            // Preserve the FP32 product before the reduction;
+                            // contracting this multiplication changes BF16 ties.
+                            volatile float term = combRow[src * hcMult + target] * rrow[(uint64_t)src * dim + d];
+                            sum += term;
+                        }
+                        volatile float scaled = postRow[target] * xrow[d];
+                        y[((uint64_t)t * hcMult + target) * dim + d] = scaled + sum;
+                    } else {
+                        double v = (double)postRow[target] * xrow[d];
+                        for (int src = 0; src < hcMult; src++) {
+                            v += (double)combRow[src * hcMult + target] * rrow[(uint64_t)src * dim + d];
+                        }
+                        y[((uint64_t)t * hcMult + target) * dim + d] = (float)v;
                     }
-                    y[((uint64_t)t * hcMult + target) * dim + d] = (float)v;
                 }
             }
         }
