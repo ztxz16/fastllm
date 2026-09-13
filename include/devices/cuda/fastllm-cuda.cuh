@@ -1465,6 +1465,13 @@ bool FastllmCudaDFlashRejectionSampling(
                                   int *acceptedDraftTokens,
                                   int batch, int draftTokens,
                                   int selectorTopK, int vocabSize);
+bool FastllmCudaMtpDraftSpecSampling(
+                                  const float *logits,
+                                  float temperature, int topK, float topP,
+                                  uint64_t seed,
+                                  int *draftOut, int *candidateIdsOut,
+                                  float *candidateProbsOut,
+                                  int *candidateCountOut, int vocabSize);
 bool FastllmCudaDFlashDynamicConv(
                                   const fastllm::Data &source,
                                   const fastllm::Data &dynamicProjection,

@@ -263,6 +263,18 @@ namespace fastllm {
             std::vector <int> proposalCandidateIds;
             std::vector <float> proposalCandidateProbs;
         };
+        struct MtpSpecDraftParams {
+            bool active = false;
+            float temperature = 1.0f;
+            int topK = 1;
+            float topP = 1.0f;
+            unsigned long long seed = 0;
+        };
+        struct MtpSpecDraftSample {
+            int token = -1;
+            std::vector <int> candidateIds;
+            std::vector <float> candidateProbs;
+        };
         bool mtpWeightsPrepared = false;
         bool mtpSharedWeightsPrepared = false;
         int mtpWeightsPreparedDevice = -1;
@@ -283,6 +295,10 @@ namespace fastllm {
         DFlashContext *speculativeDFlashSamplingContext = nullptr;
         std::vector<DFlashContext*> speculativeDFlashSamplingContexts;
         std::vector<unsigned char> speculativeDFlashAccepted;
+        MtpSpecDraftParams mtpSpecDraftParams;
+        MtpSpecDraftSample mtpSpecDraftLast;
+        unsigned long long mtpSpecDraftSeedBase = 0;
+        unsigned long long mtpSpecDraftSeedCounter = 0;
         bool speculativeCaptureFirstTokenLinearState = false;
         int speculativeLinearStateCaptureSlots = 0;
         std::vector<std::vector<std::pair<Data, Data> > > speculativeLinearStates;
