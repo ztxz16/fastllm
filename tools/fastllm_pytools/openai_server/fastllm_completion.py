@@ -1428,6 +1428,9 @@ class FastLLmCompletion:
               enable_thinking = enable_thinking,
               encode_vision = False,
               encode_fn = self.model.encode,
+              tools = tools,
+              tool_choice = tool_choice,
+              chat_template_kwargs = chat_template_kwargs,
           )
           return len(native_inputs["input_ids"])
       if architecture == "Step3p7ForConditionalGeneration":

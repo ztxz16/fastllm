@@ -25535,6 +25535,77 @@ namespace fastllm {
         }
         visionSinData.CopyFrom(Data(DataType::FLOAT32, {maxVisionPos, rotaryQuarter}, visionSin));
         visionCosData.CopyFrom(Data(DataType::FLOAT32, {maxVisionPos, rotaryQuarter}, visionCos));
+
+        // Resolve where the vision tower lives. The default keeps the original
+        // behavior (first forward GPU); "cpu" runs the encoder from host RAM.
+        const char *visionDeviceEnv = std::getenv("FASTLLM_QWEN35_VISION_DEVICE");
+        std::string requestedVisionDevice = visionDeviceEnv == nullptr ? "auto" : visionDeviceEnv;
+        const size_t firstDeviceChar = requestedVisionDevice.find_first_not_of(" \t\r\n\f\v");
+        requestedVisionDevice = firstDeviceChar == std::string::npos ? "auto" :
+            requestedVisionDevice.substr(firstDeviceChar,
+                requestedVisionDevice.find_last_not_of(" \t\r\n\f\v") - firstDeviceChar + 1);
+        std::transform(requestedVisionDevice.begin(), requestedVisionDevice.end(),
+                       requestedVisionDevice.begin(),
+                       [](unsigned char c) { return (char) std::tolower(c); });
+        if (requestedVisionDevice.empty()) {
+            requestedVisionDevice = "auto";
+        }
+        int visionDeviceId = -1;
+        if (requestedVisionDevice == "auto" || requestedVisionDevice == "cuda") {
+#ifdef USE_CUDA
+            std::vector<int> visionDevices;
+            std::map<int, int> visionRatios;
+            if (GetQwen35GPUForwardDevices(this->deviceMap, visionDevices, visionRatios) &&
+                !visionDevices.empty()) {
+                visionDeviceId = visionDevices.front();
+            }
+#endif
+            if (visionDeviceId < 0 && requestedVisionDevice == "cuda") {
+                visionDeviceId = 0;
+            }
+        } else if (requestedVisionDevice != "cpu") {
+            const std::string deviceIndex = StartWith(requestedVisionDevice, "cuda:")
+                ? requestedVisionDevice.substr(5) : "";
+            bool validIndex = !deviceIndex.empty();
+            int parsedIndex = 0;
+            for (char c : deviceIndex) {
+                if (c < '0' || c > '9' || parsedIndex > (INT_MAX - (c - '0')) / 10) {
+                    validIndex = false;
+                    break;
+                }
+                parsedIndex = parsedIndex * 10 + (c - '0');
+            }
+            AssertInFastLLM(validIndex,
+                            "Qwen3.5 vision device must be auto, cpu, cuda, or cuda:N (N >= 0).");
+            visionDeviceId = parsedIndex;
+        }
+        if (visionDeviceId >= 0) {
+#ifdef USE_CUDA
+            AssertInFastLLM(visionDeviceId < FastllmCudaGetDeviceCount(),
+                            "Qwen3.5 vision CUDA device index is out of range.");
+#else
+            AssertInFastLLM(false, "Qwen3.5 CUDA vision requires a CUDA build.");
+#endif
+        }
+        this->visionDevice = visionDeviceId < 0 ? "cpu" : "cuda:" + std::to_string(visionDeviceId);
+
+        for (auto &it : this->weight.weight) {
+            if (it.first.rfind(visual_prefix, 0) != 0) {
+                continue;
+            }
+            if (this->visionDevice == "cpu") {
+                it.second.ToDevice(DataDevice::CPU);
+            } else if (it.first == visual_prefix + "patch_embed.proj.weight" ||
+                       it.first == visual_prefix + "patch_embed.proj.bias") {
+                // Resolve the patch dtype before encoding, while retaining the
+                // existing lazy transfer of the remaining GPU vision weights.
+                it.second.ToDevice(DataDevice::CUDA, std::vector<int>{visionDeviceId});
+            }
+        }
+        if (this->verbose) {
+            printf("[Vision] Encoder device: %s.\n", this->visionDevice.c_str());
+        }
+
         visionPrepared = true;
     }
 
@@ -25592,7 +25663,27 @@ namespace fastllm {
         if (rawInputs.empty()) {
             return;
         }
+        // Isolate both CPU and explicit CUDA vision from the text executor.
+        // Restore the calling thread's CUDA device after initial weight moves
+        // and encoding as well, including exceptional exits.
+        struct VisionExecutorScope {
+            void *previous = GetExecutor();
+#ifdef USE_CUDA
+            int previousDevice = FastllmCudaGetDeviceCount() > 0 ? FastllmCudaGetDevice() : -1;
+#endif
+            ~VisionExecutorScope() {
+                SetCurrentThreadExecutor(previous);
+#ifdef USE_CUDA
+                if (previousDevice >= 0) {
+                    FastllmCudaSetDevice(previousDevice);
+                }
+#endif
+            }
+        } visionExecutorScope;
         PrepareVision();
+        static thread_local Executor visionExecutor;
+        visionExecutor.SetFirstDevice(this->visionDevice);
+        SetCurrentThreadExecutor(&visionExecutor);
         AssertInFastLLM(gridThwData != nullptr, "Qwen3.5 multimodal raw media requires grid_thw metadata.");
 
         Data gridCpu(*gridThwData);
@@ -25709,26 +25800,6 @@ namespace fastllm {
                             "Qwen3.5 vision patch packing size mismatch.");
 
             Data &patchWeight = this->weight[patchWeightName];
-#ifdef USE_CUDA
-            // Vision weights may still be lazy CPU tensors on the first
-            // multimodal request. Resolve the intended CUDA device before
-            // choosing the patch dtype/chunk path; checking dataDevice alone
-            // would optimize only the second request.
-            if (patchWeight.dataDevice == DataDevice::CPU) {
-                std::vector<int> visionDevices;
-                std::map<int, int> visionRatios;
-                if (GetQwen35GPUForwardDevices(
-                        this->deviceMap, visionDevices, visionRatios) &&
-                    !visionDevices.empty()) {
-                    std::vector<int> firstVisionDevice = {
-                        visionDevices.front()};
-                    patchWeight.ToDevice(
-                        DataDevice::CUDA, firstVisionDevice);
-                    this->weight[patchBiasName].ToDevice(
-                        DataDevice::CUDA, firstVisionDevice);
-                }
-            }
-#endif
             DataType pixelType = DataType::FLOAT32;
 #ifdef USE_CUDA
             // CUDA vision blocks consume FP16 activations. Converting the
@@ -25804,7 +25875,11 @@ namespace fastllm {
                 pixelOnDevice.FreeSpace();
             }
             pixelInput.FreeSpace();
-            if (hiddenStates.dataType != this->dataType) {
+            if (hiddenStates.dataDevice != DataDevice::CPU &&
+                hiddenStates.dataType != this->dataType) {
+                // CPU keeps float32 activations: DoCpuLinear has no float32
+                // input -> float16 output path, and the vision rotary/attention
+                // CPU kernels assume full precision.
                 ToDataType(hiddenStates, this->dataType);
             }
             hiddenStates.Reshape({1, patchCount, vision_hidden_size});

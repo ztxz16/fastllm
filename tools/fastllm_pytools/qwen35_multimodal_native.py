@@ -1,4 +1,5 @@
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -304,15 +305,47 @@ def normalize_qwen35_conversation(
     return updated
 
 
-def apply_chat_template_with_optional_thinking(tokenizer, conversation, add_generation_prompt, enable_thinking):
-    kwargs = {
+def apply_chat_template_with_optional_thinking(
+    tokenizer, conversation, add_generation_prompt, enable_thinking,
+    tools=None, tool_choice=None, chat_template_kwargs=None,
+):
+    kwargs = dict(chat_template_kwargs or {})
+    # These arguments control the caller's return type and generation boundary,
+    # rather than template-specific variables supplied by a request.
+    kwargs.update({
         "tokenize": False,
         "add_generation_prompt": add_generation_prompt,
-    }
+        "enable_thinking": enable_thinking,
+    })
+    if tools is not None:
+        kwargs["tools"] = tools
+    if tool_choice is not None:
+        kwargs["tool_choice"] = tool_choice
+    apply_template = tokenizer.apply_chat_template
     try:
-        return tokenizer.apply_chat_template(conversation, enable_thinking=enable_thinking, **kwargs)
-    except TypeError:
-        return tokenizer.apply_chat_template(conversation, **kwargs)
+        parameters = inspect.signature(apply_template).parameters
+    except (TypeError, ValueError):
+        parameters = None
+    if parameters is not None and not any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()
+    ):
+        accepted = {
+            name for name, p in parameters.items()
+            if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        }
+        # Old tokenizers may lack these optional template variables. Tool-choice
+        # constraints are enforced separately by the server. Preserve every
+        # supported argument, especially tools and an explicit thinking switch.
+        for name in ("enable_thinking", "tool_choice"):
+            if name not in accepted:
+                kwargs.pop(name, None)
+        if "tools" in kwargs and "tools" not in accepted:
+            if kwargs["tools"]:
+                raise ValueError("Qwen3.5 multimodal tools require a tokenizer template that accepts tools.")
+            kwargs.pop("tools")
+    # A TypeError from inside a template must propagate; retrying with fewer
+    # arguments can silently produce a different prompt.
+    return apply_template(conversation, **kwargs)
 
 
 def _render_qwen35_chat_template_fallback(
@@ -517,6 +550,9 @@ def build_qwen35_prompt(
     add_generation_prompt: bool,
     enable_thinking: bool,
     tokenizer_config: Optional[Dict[str, Any]] = None,
+    tools: Optional[Sequence[Dict[str, Any]]] = None,
+    tool_choice: Optional[Any] = None,
+    chat_template_kwargs: Optional[Dict[str, Any]] = None,
 ) -> str:
     sanitized = sanitize_qwen35_conversation(conversation)
     if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
@@ -525,8 +561,13 @@ def build_qwen35_prompt(
             sanitized,
             add_generation_prompt=add_generation_prompt,
             enable_thinking=enable_thinking,
+            tools=tools,
+            tool_choice=tool_choice,
+            chat_template_kwargs=chat_template_kwargs,
         )
     else:
+        if tools or (chat_template_kwargs or {}).get("tools"):
+            raise ValueError("Qwen3.5 multimodal tools require a tokenizer with apply_chat_template; the native fallback does not support tools.")
         prompt = _render_qwen35_chat_template_fallback(
             sanitized,
             tokenizer_config=tokenizer_config or {},
@@ -651,6 +692,9 @@ def prepare_qwen35_multimodal_inputs(
     vision_dtype: Optional[Any] = None,
     tokenizer_config: Optional[Dict[str, Any]] = None,
     encode_fn: Optional[Callable[[str], Sequence[int]]] = None,
+    tools: Optional[Sequence[Dict[str, Any]]] = None,
+    tool_choice: Optional[Any] = None,
+    chat_template_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     del encode_vision, vision_device, vision_dtype
 
@@ -676,6 +720,9 @@ def prepare_qwen35_multimodal_inputs(
         add_generation_prompt=add_generation_prompt,
         enable_thinking=enable_thinking,
         tokenizer_config=tokenizer_config,
+        tools=tools,
+        tool_choice=tool_choice,
+        chat_template_kwargs=chat_template_kwargs,
     )
     if tokenizer is not None and hasattr(tokenizer, "encode"):
         input_ids = tokenizer.encode(prompt, add_special_tokens=True)
