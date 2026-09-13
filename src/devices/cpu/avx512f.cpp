@@ -14,6 +14,126 @@
 #include "fastllm.h"
 
 namespace fastllm {
+#ifdef __AVX512F__
+    // SIMD lanes are independent output columns. Keep the scalar reference's
+    // K order and its separate product/block-scale rounding in every lane.
+    template <bool BF16Input, bool FP8Weight, int Tokens>
+    static void V41ReferenceLinearRows(const void *input, const uint8_t *weight,
+            const float *bias, float *output, int n, int m, int k, int st, int end,
+            int blockK, const float *scales, const uint8_t *scaleBytes, const float *fp8Table) {
+        const int blocks = m / 32, stride = FP8Weight ? m : m / 2;
+        const __m512 grid = _mm512_setr_ps(0,.5f,1,1.5f,2,3,4,6,0,-.5f,-1,-1.5f,-2,-3,-4,-6);
+        const __m512i lanes = _mm512_setr_epi32(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15);
+        const __m512i offsets = _mm512_mullo_epi32(lanes, _mm512_set1_epi32(stride));
+        for (int row = st; row < end; row += 16) {
+            const int width = std::min(16, end - row);
+            const __mmask16 mask = (__mmask16)((1u << width) - 1);
+            alignas(64) int scaleOffsets[16] = {};
+            for (int lane = 0; lane < width; ++lane)
+                scaleOffsets[lane] = ((row + lane) / blockK) * blocks;
+            const __m512i scaleRows = _mm512_load_si512(scaleOffsets);
+            for (int token = 0; token < n; token += Tokens) {
+                __m512 total[Tokens] = {};
+                for (int block = 0; block < blocks; ++block) {
+                    __m512 partial[Tokens] = {};
+                    if (n == 1 && block % (FP8Weight ? 2 : 4) == 0) {
+                        const int future = (block + (FP8Weight ? 8 : 16)) * (FP8Weight ? 32 : 16);
+                        if (future < stride)
+                            for (int lane = 0; lane < width; ++lane)
+                                _mm_prefetch((const char *)weight + size_t(row+lane)*stride + future, _MM_HINT_T0);
+                    }
+                    constexpr int perWord = FP8Weight ? 4 : 8;
+                    for (int j = 0; j < 32; j += perWord) {
+                        const uint8_t *base = weight + (size_t)row * stride +
+                            (block * 32 + j) / (FP8Weight ? 1 : 2);
+                        __m512i packed = _mm512_mask_i32gather_epi32(_mm512_setzero_si512(), mask, offsets, base, 1);
+                        for (int q = 0; q < perWord; ++q) {
+                            __m512i code = _mm512_and_si512(packed, _mm512_set1_epi32(FP8Weight ? 255 : 15));
+                            __m512 w;
+                            if constexpr (FP8Weight) {
+                                // Match FP8E4M3ToFP32Manager, including its
+                                // subnormal values, signed zero and code 127.
+                                __m512i magnitude = _mm512_and_si512(code, _mm512_set1_epi32(127));
+                                __m512i bits = _mm512_add_epi32(_mm512_slli_epi32(magnitude, 20),
+                                    _mm512_set1_epi32(120 << 23));
+                                __m512 small = _mm512_mul_ps(_mm512_cvtepi32_ps(magnitude), _mm512_set1_ps(1.0f/512));
+                                bits = _mm512_mask_mov_epi32(bits, _mm512_cmplt_epi32_mask(magnitude, _mm512_set1_epi32(8)),
+                                    _mm512_castps_si512(small));
+                                w = _mm512_castsi512_ps(_mm512_or_si512(bits,
+                                    _mm512_slli_epi32(_mm512_and_si512(code, _mm512_set1_epi32(128)), 24)));
+                            } else
+                                w = _mm512_permutexvar_ps(code, grid);
+                            for (int t = 0; t < Tokens && token+t < n; ++t) {
+                                const size_t index = size_t(token+t)*m + block*32+j+q;
+                                float value;
+                                if constexpr (BF16Input) {
+                                    uint32_t bits = uint32_t(((const uint16_t *)input)[index]) << 16;
+                                    memcpy(&value, &bits, sizeof(value));
+                                } else value = ((const float *)input)[index];
+                                // Embedded rounding prevents FMA contraction.
+                                __m512 product = _mm512_mul_round_ps(_mm512_set1_ps(value), w,
+                                    _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+                                partial[t] = _mm512_add_ps(partial[t], product);
+                            }
+                            packed = _mm512_srli_epi32(packed, FP8Weight ? 8 : 4);
+                        }
+                    }
+                    __m512 scale;
+                    if (scales) {
+                        scale = _mm512_mask_i32gather_ps(_mm512_setzero_ps(), mask,
+                            _mm512_add_epi32(scaleRows, _mm512_set1_epi32(block)), scales, 4);
+                    } else {
+                        alignas(64) uint32_t bits[16] = {};
+                        for (int lane = 0; lane < width; ++lane) {
+                            uint8_t v = scaleBytes[scaleOffsets[lane] + block];
+                            bits[lane] = v == 0 ? 0x00400000u : uint32_t(v) << 23;
+                        }
+                        scale = _mm512_castsi512_ps(_mm512_load_si512(bits));
+                    }
+                    for (int t = 0; t < Tokens && token+t < n; ++t) {
+                        __m512 scaled = _mm512_mul_round_ps(partial[t], scale,
+                            _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+                        total[t] = _mm512_add_ps(total[t], scaled);
+                    }
+                }
+                for (int t = 0; t < Tokens && token+t < n; ++t) {
+                    total[t] = _mm512_add_ps(total[t], bias ? _mm512_maskz_loadu_ps(mask, bias + row) : _mm512_setzero_ps());
+                    _mm512_mask_storeu_ps(output + size_t(token+t)*k + row, mask, total[t]);
+                }
+            }
+        }
+    }
+    template <bool BF16Input, bool FP8Weight>
+    static void V41ReferenceLinearDispatch(const void *input, const uint8_t *weight,
+            const float *bias, float *output, int n, int m, int k, int st, int end,
+            int blockK, const float *scales, const uint8_t *scaleBytes, const float *fp8Table) {
+        if (n > 1)
+            V41ReferenceLinearRows<BF16Input,FP8Weight,4>(input,weight,bias,output,n,m,k,st,end,blockK,scales,scaleBytes,fp8Table);
+        else
+            V41ReferenceLinearRows<BF16Input,FP8Weight,1>(input,weight,bias,output,n,m,k,st,end,blockK,scales,scaleBytes,fp8Table);
+    }
+#endif
+
+    bool V41ReferenceLinear_AVX512F(const void *input, const uint8_t *weight,
+            const float *bias, float *output, int n, int m, int k, int st, int end,
+            int blockK, const float *scales, const uint8_t *scaleBytes,
+            bool bf16Input, const float *fp8Table) {
+#ifdef __AVX512F__
+        if (m <= 0 || m % 32 || blockK <= 0 || (!scales && !scaleBytes)) return false;
+        if (fp8Table) {
+            if (!bf16Input || !scales) return false;
+            V41ReferenceLinearDispatch<true, true>(input,weight,bias,output,n,m,k,st,end,blockK,scales,scaleBytes,fp8Table);
+        } else if (bf16Input) {
+            V41ReferenceLinearDispatch<true, false>(input,weight,bias,output,n,m,k,st,end,blockK,scales,scaleBytes,nullptr);
+        } else {
+            V41ReferenceLinearDispatch<false, false>(input,weight,bias,output,n,m,k,st,end,blockK,scales,scaleBytes,nullptr);
+        }
+        return true;
+#else
+        return false;
+#endif
+    }
+
     void AddBiasAVX512(float *outputData, float *biasData, int n, int k, int st, int end) {
 #ifdef __AVX512F__
         if (biasData) {

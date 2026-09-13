@@ -54,7 +54,270 @@ namespace {
         if (i < t.work)
             Execute(t, i);
     }
-    void Launch(Task &t) { ExecuteReference<<<(t.work + 127) / 128, 128>>>(t); }
+    __global__ void ReferenceAttentionParallel(Task t) {
+        const int item = blockIdx.x, lane = threadIdx.x;
+        const int token = item / t.heads, head = item % t.heads, hd = t.dim;
+        const float *q = t.p[Input] + (size_t(token) * t.heads + head) * hd;
+        float *num = t.p[Output] + (size_t(token) * t.heads + head) * hd;
+        const int *positions = reinterpret_cast<const int *>(t.p[Indices]) + size_t(token) * t.width;
+        __shared__ float scores[64], raw[64], probs[64];
+        __shared__ int indices[64];
+        __shared__ float maximum, denominator, correction;
+        if (lane == 0) { maximum = -1e30f; denominator = 0; }
+        for (int j = lane; j < hd; j += blockDim.x) num[j] = 0;
+        __syncthreads();
+        for (int first = 0; first < t.width; first += 64) {
+            if (lane < 64) {
+                int pos = first + lane < t.width ? positions[first + lane] : -1;
+                if (pos < 0 || pos >= t.offset + t.visible) pos = -1;
+                indices[lane] = pos;
+                float dot = 0;
+                if (pos >= 0) {
+                    const float *key = pos < t.offset ? t.p[Keys] + size_t(pos) * hd
+                                                      : t.p[Values] + size_t(pos - t.offset) * hd;
+                    for (int firstK = 0; firstK < hd; firstK += 192) {
+                        float partial = 0;
+                        for (int j = firstK; j < MinI(firstK + 192, hd); ++j)
+                            partial = fmaf(q[j], key[j], partial);
+                        dot += partial;
+                    }
+                }
+                scores[lane] = pos >= 0 ? dot * t.factor : -INFINITY;
+            }
+            __syncthreads();
+            if (lane == 0) {
+                float next = maximum;
+                for (int i = 0; i < 64; ++i) next = Max(next, scores[i]);
+                correction = TensorExp(maximum - next);
+                maximum = next;
+            }
+            __syncthreads();
+            if (lane < 64) {
+                raw[lane] = TensorExp(scores[lane] - maximum);
+                probs[lane] = BF(raw[lane]);
+            }
+            __syncthreads();
+            if (lane == 0)
+                denominator = denominator * correction + Sum(64, Load{raw});
+            // Parallelize independent output channels, retaining the same
+            // 64-slot sequential FMA and the online-softmax rounding boundary.
+            for (int j = lane; j < hd; j += blockDim.x) {
+                float dot = 0;
+                for (int i = 0; i < 64; ++i) {
+                    int pos = indices[i];
+                    if (pos >= 0) {
+                        float value = pos < t.offset ? t.p[Keys][size_t(pos) * hd + j]
+                            : t.p[Values][size_t(pos - t.offset) * hd + j];
+                        dot = fmaf(probs[i], value, dot);
+                    }
+                }
+                num[j] = num[j] * correction + dot;
+            }
+            __syncthreads();
+        }
+        if (lane == 0) denominator += TensorExp(t.p[Sink][head] - maximum);
+        __syncthreads();
+        for (int j = lane; j < hd; j += blockDim.x) num[j] = BF(num[j] / denominator);
+    }
+    // The 32 threads represent the reference's four streams of eight lanes.
+    // Carry propagation and the final scalar fold retain their original order.
+    template<class Loader> __device__ float WarpReferenceSum(size_t count, const Loader &load) {
+        int lane = threadIdx.x & 31;
+        if (count < 8) {
+            float total = lane == 0 ? Sum(count, load) : 0;
+            return __shfl_sync(0xffffffff, total, 0);
+        }
+        size_t groups = count/32, bits = 0;
+        for (size_t v = groups ? groups-1 : 0; v; v >>= 1) ++bits;
+        size_t power = bits/4 > 4 ? bits/4 : 4, step = size_t(1) << power, group = 0;
+        float sums[4] = {};
+        while (group + step <= groups) {
+            for (size_t end = group+step; group < end; ++group) sums[0] += load(group*32+lane);
+            for (int level = 1; level < 4; ++level) {
+                sums[level] += sums[level-1]; sums[level-1] = 0;
+                if (group & ((step-1) << (level*power))) break;
+            }
+        }
+        for (; group < groups; ++group) sums[0] += load(group*32+lane);
+        for (int level = 1; level < 4; ++level) sums[0] += sums[level];
+        if (lane < 8)
+            for (size_t i = groups*32; i+8 <= count; i += 8) sums[0] += load(i+lane);
+        for (int stream = 1; stream < 4; ++stream) {
+            float value = __shfl_sync(0xffffffff, sums[0], (lane&7)+stream*8);
+            if (lane < 8) sums[0] += value;
+        }
+        float total = 0;
+        if (lane == 0) for (size_t i = count/8*8; i < count; ++i) total += load(i);
+        for (int i = 0; i < 8; ++i) {
+            float value = __shfl_sync(0xffffffff, sums[0], i);
+            if (lane == 0) total += value;
+        }
+        return __shfl_sync(0xffffffff, total, 0);
+    }
+    // Keep one matrix element per lane. Each row/column fold still visits
+    // elements 0, 1, 2, 3 in order; Sinkhorn iterations stay in registers.
+    __device__ void ReferenceHCMixes4(Task t, int row, float inverse) {
+        const int lane = threadIdx.x;
+        if (lane == 0) t.p[Output4][row] = inverse;
+        float mix = lane < 24 ? t.p[Mix][row*24+lane]*inverse : 0;
+        if (lane < 24) t.p[Output3][row*24+lane] = mix;
+        float postMix = __shfl_sync(0xffffffff, mix, lane+4 < 32 ? lane+4 : 0);
+        if (lane < 4) {
+            float pre = -(mix*t.p[Scale][0]+t.p[Base][lane]);
+            float post = -(postMix*t.p[Scale][1]+t.p[Base][4+lane]);
+            bool vector = row*4+lane < t.rows*4/32*32;
+            t.p[Output][row*4+lane] = 1.0f/(1.0f+(vector ? ReductionExp(pre) : Exp(pre)))+t.hcEps;
+            t.p[Output1][row*4+lane] = 2.0f/(1.0f+(vector ? ReductionExp(post) : Exp(post)));
+        }
+        float value = __shfl_sync(0xffffffff, mix, lane < 16 ? lane+8 : 0);
+        value = lane < 16 ? value*t.p[Scale][2]+t.p[Base][8+lane] : 0;
+        const int first = lane&~3, col = lane&3;
+        float maximum = -INFINITY;
+        for (int j = 0; j < 4; ++j)
+            maximum = Max(maximum, __shfl_sync(0xffffffff, value, first+j));
+        value = ReductionExp(value-maximum);
+        float total = 0;
+        for (int j = 0; j < 4; ++j) total += __shfl_sync(0xffffffff, value, first+j);
+        float reciprocal = 1.0f/total;
+        value = value*reciprocal+t.hcEps;
+        for (int it = 0; it < t.iterations; ++it) {
+            if (it) {
+                total = 0;
+                for (int j = 0; j < 4; ++j) total += __shfl_sync(0xffffffff, value, first+j);
+                value /= total+t.hcEps;
+            }
+            total = 0;
+            for (int i = 0; i < 4; ++i) total += __shfl_sync(0xffffffff, value, i*4+col);
+            value /= total+t.hcEps;
+        }
+        if (lane < 16) t.p[Output2][row*16+lane] = value;
+    }
+    __global__ void ReferenceNormParallel(Task t) {
+        const int row = blockIdx.x, lane = threadIdx.x;
+        const bool pre = t.op == V41ReferenceOp::HCPreNorm;
+        const int count = pre ? t.dim : t.cols;
+        __shared__ float inverse;
+        if (lane < 32) {
+            float total = pre ? WarpReferenceSum(count, HCPreSquares{t, size_t(row)})
+                : WarpReferenceSum(count, Load{t.p[Input]+size_t(row)*count, true});
+            if (lane == 0) inverse = 1.0f/sqrtf(total/count+t.eps);
+        }
+        __syncthreads();
+        if (t.op == V41ReferenceOp::HCMixes) {
+            if (t.h == 4) {
+                if (lane < 32) ReferenceHCMixes4(t, row, inverse);
+            } else if (lane == 0) HCMixesFromInv(t, row, inverse);
+        } else {
+            for (int j = lane; j < count; j += blockDim.x) {
+                float value = pre ? HCPreValue(t, row, j) : t.p[Input][size_t(row)*count+j];
+                t.p[Output][size_t(row)*count+j] = BF((value*inverse)*Value(t,j));
+            }
+        }
+    }
+    __global__ void ReferenceLinearFringeCoalesced(Task t) {
+        const int item = blockIdx.x, lane = threadIdx.x;
+        const int row = item%t.out, token = item/t.out;
+        if (row < t.out/16*16 && token < t.rows/2*2) return;
+        const float *a = t.p[Input]+size_t(token)*t.cols+(row/(t.out/t.groups))*t.width;
+        float partial = 0;
+        const int prefix = t.rows == 1 ? MinI(4,t.width) : 0;
+        if ((lane&3) == 0) for (int k = 0; k < prefix; ++k)
+            partial += a[k]*Value(t,size_t(row)*t.width+k);
+        // A warp loads contiguous K values. Replicate the four accumulators
+        // across its eight quads, preserving every non-fused addition.
+        for (int first = prefix; first < t.width; first += 32) {
+            int k = first+lane;
+            float product = k < t.width ? a[k]*Value(t,size_t(row)*t.width+k) : 0;
+            for (int j = 0; j < 8; ++j) {
+                float value = __shfl_sync(0xffffffff,product,j*4+(lane&3));
+                if (first+j*4+(lane&3) < t.width) partial += value;
+            }
+        }
+        float p0=__shfl_sync(0xffffffff,partial,0),p1=__shfl_sync(0xffffffff,partial,1);
+        float p2=__shfl_sync(0xffffffff,partial,2),p3=__shfl_sync(0xffffffff,partial,3);
+        if (lane == 0) t.p[Output][item]=(p0+p2)+(p1+p3);
+    }
+    __global__ void ReferenceLinearFringe(Task t) {
+        const size_t item = (size_t(blockIdx.x)*blockDim.x+threadIdx.x)/4;
+        const int lane = threadIdx.x&3;
+        if (item >= t.work) return;
+        const int row = item%t.out, token = item/t.out;
+        if (row < t.out/16*16 && token < t.rows/2*2) return;
+        const float *a = t.p[Input]+size_t(token)*t.cols+(row/(t.out/t.groups))*t.width;
+        float partial = 0;
+        const int prefix = t.rows == 1 ? MinI(4,t.width) : 0;
+        if (lane == 0) for (int k = 0; k < prefix; ++k)
+            partial += a[k]*Value(t,size_t(row)*t.width+k);
+        for (int k = prefix+lane; k < t.width; k += 4)
+            partial += a[k]*Value(t,size_t(row)*t.width+k);
+        const unsigned active = __activemask();
+        float p0 = __shfl_sync(active,partial,0,4), p1 = __shfl_sync(active,partial,1,4);
+        float p2 = __shfl_sync(active,partial,2,4), p3 = __shfl_sync(active,partial,3,4);
+        if (lane == 0) t.p[Output][item] = (p0+p2)+(p1+p3);
+    }
+    __global__ void ReferenceLinearFullBlocks(Task t) {
+        const int item = blockIdx.x, lane = threadIdx.x;
+        const int row = item%t.out, token = item/t.out;
+        if (row >= t.out/16*16 || token >= t.rows/2*2) return;
+        const float *a = t.p[Input]+size_t(token)*t.cols+(row/(t.out/t.groups))*t.width;
+        const int blocks = (t.width+191)/192;
+        extern __shared__ float partials[];
+        for (int b = lane; b < blocks; b += blockDim.x) {
+            float partial = 0;
+            for (int k = b*192; k < MinI((b+1)*192,t.width); ++k)
+                partial = fmaf(a[k],Value(t,size_t(row)*t.width+k),partial);
+            partials[b] = partial;
+        }
+        __syncthreads();
+        if (lane == 0) {
+            float total = 0;
+            for (int b = 0; b < blocks; ++b) total += partials[b];
+            t.p[Output][item] = total;
+        }
+    }
+    __global__ void ReferenceLinearBF16Blocks(Task t) {
+        const int item = blockIdx.x, lane = threadIdx.x;
+        const int row = item%t.out, token = item/t.out;
+        const float *a = t.p[Input]+size_t(token)*t.cols+(row/(t.out/t.groups))*t.width;
+        const int block = t.rows > 1 && t.width > 1024 ? 1024 : 512;
+        const int blocks = (t.width+block-1)/block;
+        extern __shared__ float partials[];
+        for (int b = lane; b < blocks; b += blockDim.x) {
+            float partial = 0;
+            for (int k = b*block; k < MinI((b+1)*block,t.width); k += 2) {
+                partial = fmaf(a[k+1],Value(t,size_t(row)*t.width+k+1),partial);
+                partial = fmaf(a[k],Value(t,size_t(row)*t.width+k),partial);
+            }
+            partials[b] = partial;
+        }
+        __syncthreads();
+        if (lane == 0) {
+            float total = 0;
+            for (int b = 0; b < blocks; ++b) total += partials[b];
+            t.p[Output][item] = BF(total);
+        }
+    }
+    void Launch(Task &t) {
+        if (t.op == V41ReferenceOp::SparseAttention)
+            ReferenceAttentionParallel<<<t.work, 128>>>(t);
+        else if (t.op == V41ReferenceOp::RMSNorm || t.op == V41ReferenceOp::HCPreNorm || t.op == V41ReferenceOp::HCMixes)
+            ReferenceNormParallel<<<t.work, 128>>>(t);
+        else if (t.op == V41ReferenceOp::Linear && t.dtype == 1 && t.mode && t.rows == 1 && !(t.width&1)) {
+            int block = t.rows > 1 && t.width > 1024 ? 1024 : 512;
+            ReferenceLinearBF16Blocks<<<t.work,32,((t.width+block-1)/block)*sizeof(float)>>>(t);
+        }
+        else if (t.op == V41ReferenceOp::Linear && t.dtype < 2 && !t.mode && t.width <= 32768) {
+            // Tiny HC projections would otherwise place all outputs on one SM.
+            if ((t.rows == 1 || t.work <= 256) && t.width >= 1024)
+                ReferenceLinearFringeCoalesced<<<t.work,32>>>(t);
+            else
+                ReferenceLinearFringe<<<(t.work+31)/32,128>>>(t);
+            if (t.rows > 1 && t.out >= 16)
+                ReferenceLinearFullBlocks<<<t.work,128,((t.width+191)/192)*sizeof(float)>>>(t);
+        }
+        else
+            ExecuteReference<<<(t.work + 127) / 128, 128>>>(t);
+    }
 
     __global__ void MakeIndices(int *out, const int *compressed, int rows, int window, int start, int slots,
                                 int width, int offset) {

@@ -1036,12 +1036,140 @@ namespace fastllm {
         }
     }
 
+    // A grouped expert prefill contains several tokens using the same weight
+    // rows. Decode each block once, then update independent token accumulators.
+    // Preserve each output's dpbf16/FMA accumulation and final reduction.
+    // COMBINE_SCALE moves the exact magic power of two onto bounded scales;
+    // other values retain the singleton kernel's separate scale multiply.
+    template <int TOKENS, int COLS, bool useLookup, bool COMBINE_SCALE>
+    static inline void LinearBFloat16NVFP4BatchCols_AVX512BF16(
+        const uint16_t *input, const uint8_t *weightRows, const float *biasData, float *output,
+        int outputCol, int m, int k, int blockK, const float *scales, const uint8_t *scaleBytes
+    ) {
+        __m512 acc[TOKENS][COLS];
+#pragma GCC unroll 8
+        for (int t = 0; t < TOKENS; ++t) {
+#pragma GCC unroll 4
+            for (int c = 0; c < COLS; ++c) acc[t][c] = _mm512_setzero_ps();
+        }
+        const int blocks = m / 32, packedM = m / 2;
+        const bool commonScale = outputCol / blockK == (outputCol + COLS - 1) / blockK;
+        const __m512 magic = _mm512_set1_ps(NVFP4_MAGIC_SCALE);
+        const __m512i lookup = NVFP4BFloat16Lookup_AVX512BF16();
+        for (int block = 0; block < blocks; ++block) {
+            __m512bh inputs[TOKENS];
+#pragma GCC unroll 8
+            for (int t = 0; t < TOKENS; ++t)
+                inputs[t] = (__m512bh)_mm512_loadu_si512(input + (size_t)t * m + block * 32);
+            auto getScale = [&](size_t index) {
+                if constexpr (COMBINE_SCALE) {
+                    return scales ? scales[index] * NVFP4_MAGIC_SCALE :
+                        NVFP4_E8M0_COMBINED_SCALE_LOOKUP[scaleBytes[index]];
+                }
+                return GetNVFP4ScaleValue(scales, scaleBytes, index);
+            };
+            const float sharedScale = getScale((size_t)(outputCol / blockK) * blocks + block);
+#pragma GCC unroll 4
+            for (int c = 0; c < COLS; ++c) {
+                const __m512bh weight = NVFP4ToBFloat16Linear_AVX512BF16<useLookup>(
+                    weightRows + (size_t)c * packedM + block * 16, lookup);
+                const __m512 scale = _mm512_set1_ps(commonScale ? sharedScale :
+                    getScale((size_t)((outputCol + c) / blockK) * blocks + block));
+#pragma GCC unroll 8
+                for (int t = 0; t < TOKENS; ++t) {
+                    const __m512 dot = _mm512_dpbf16_ps(_mm512_setzero_ps(), inputs[t], weight);
+                    if constexpr (COMBINE_SCALE)
+                        acc[t][c] = _mm512_fmadd_ps(dot, scale, acc[t][c]);
+                    else
+                        acc[t][c] = _mm512_fmadd_ps(_mm512_mul_ps(dot, magic), scale, acc[t][c]);
+                }
+            }
+        }
+#pragma GCC unroll 8
+        for (int t = 0; t < TOKENS; ++t) {
+#pragma GCC unroll 4
+            for (int c = 0; c < COLS; ++c)
+                output[(size_t)t * k + c] = (biasData ? biasData[outputCol + c] : 0.0f) +
+                    _mm512_reduce_add_ps(acc[t][c]);
+        }
+    }
+
+    template <int TOKENS, bool useLookup, bool COMBINE_SCALE>
+    static inline void LinearBFloat16NVFP4Batch_AVX512BF16(
+        const uint16_t *input, const uint8_t *weight, const float *bias, float *output,
+        int m, int k, int st, int end, int blockK, const float *scales, const uint8_t *scaleBytes
+    ) {
+        constexpr int COLS = TOKENS > 4 ? 2 : 4;
+        int row = st;
+        for (; row + COLS <= end; row += COLS)
+            LinearBFloat16NVFP4BatchCols_AVX512BF16<TOKENS, COLS, useLookup, COMBINE_SCALE>(
+                input, weight + (size_t)row * (m / 2), bias, output + row,
+                row, m, k, blockK, scales, scaleBytes);
+#define V41_NVFP4_BATCH_TAIL(COLS) \
+        case COLS: LinearBFloat16NVFP4BatchCols_AVX512BF16<TOKENS, COLS, useLookup, COMBINE_SCALE>( \
+            input, weight + (size_t)row * (m / 2), bias, output + row, \
+            row, m, k, blockK, scales, scaleBytes); break
+        switch (end - row) {
+            V41_NVFP4_BATCH_TAIL(1);
+            V41_NVFP4_BATCH_TAIL(2);
+            V41_NVFP4_BATCH_TAIL(3);
+        }
+#undef V41_NVFP4_BATCH_TAIL
+    }
+
     template <bool useLookup>
     static inline bool LinearBFloat16NVFP4_AVX512BF16_Run(
         uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
         int n, int m, int k, int st, int end, int blockK, int blockM,
         const float *scales, const uint8_t *scaleBytes, int ms
     ) {
+        static const bool reuseTokens = std::getenv("FASTLLM_DSV41_DISABLE_NVFP4_TOKEN_REUSE") == nullptr;
+        if (n > 1 && blockM == 32 && m % 32 == 0 && reuseTokens) {
+            // Multiplying by the magic power of two is exact while finite.
+            // Move it to the scale to remove a multiply per token/block, but
+            // retain the original path for inputs or scales that could overflow.
+            uint16_t maxInput = 0;
+            for (size_t i = 0; i < (size_t)n * m; ++i)
+                maxInput = std::max(maxInput, uint16_t(inputData[i] & 0x7fff));
+            bool combineScale = maxInput <= 0x7b80; // abs(input) <= 2^120, excluding NaN/Inf
+            const size_t scaleBegin = (size_t)(st / blockK) * ms;
+            const size_t scaleEnd = (size_t)((end + blockK - 1) / blockK) * ms;
+            if (scales) {
+                for (size_t i = scaleBegin; i < scaleEnd; ++i)
+                    combineScale = combineScale && std::fabs(scales[i]) <= 0x1p63f;
+            } else {
+                uint8_t minScale = 255, maxScale = 0;
+                for (size_t i = scaleBegin; i < scaleEnd; ++i) {
+                    minScale = std::min(minScale, scaleBytes[i]);
+                    maxScale = std::max(maxScale, scaleBytes[i]);
+                }
+                // E8M0 zero is a subnormal FP32 scale. Keep its original
+                // multiply so callers' denormals-are-zero mode is respected.
+                combineScale = combineScale && minScale > 0 && maxScale <= 190;
+            }
+            for (int token = 0; token < n; token += 8) {
+                const uint16_t *input = inputData + (size_t)token * m;
+                float *output = outputData + (size_t)token * k;
+#define V41_NVFP4_BATCH_TOKENS(TOKENS) \
+                case TOKENS: \
+                    if (combineScale) LinearBFloat16NVFP4Batch_AVX512BF16<TOKENS, useLookup, true>( \
+                        input, weightData, biasData, output, m, k, st, end, blockK, scales, scaleBytes); \
+                    else LinearBFloat16NVFP4Batch_AVX512BF16<TOKENS, useLookup, false>( \
+                        input, weightData, biasData, output, m, k, st, end, blockK, scales, scaleBytes); break
+                switch (std::min(8, n - token)) {
+                    V41_NVFP4_BATCH_TOKENS(1);
+                    V41_NVFP4_BATCH_TOKENS(2);
+                    V41_NVFP4_BATCH_TOKENS(3);
+                    V41_NVFP4_BATCH_TOKENS(4);
+                    V41_NVFP4_BATCH_TOKENS(5);
+                    V41_NVFP4_BATCH_TOKENS(6);
+                    V41_NVFP4_BATCH_TOKENS(7);
+                    V41_NVFP4_BATCH_TOKENS(8);
+                }
+#undef V41_NVFP4_BATCH_TOKENS
+            }
+            return true;
+        }
         int packedM = m >> 1;
         for (int i = 0; i < n; i++) {
             const uint16_t *input = inputData + (size_t)i * m;

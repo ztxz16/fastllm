@@ -3995,7 +3995,10 @@ namespace fastllm {
             bool hasSharedExpertOut = false;
             auto sharedGateupIt = weight.weight.find(pre + ".ffn.shared_experts.gateup.weight");
             auto sharedDownIt = weight.weight.find(pre + ".ffn.shared_experts.w2.weight");
-            if (GetCudaSharedExpert() && sharedGateupIt != weight.weight.end() &&
+            // Keep reference accumulation and tensor-parallel shared experts
+            // on the MoE path until the separate GPU path supports their ordering.
+            if (GetCudaSharedExpert() && !V41ReferenceMathEnabled() && !tp &&
+                sharedGateupIt != weight.weight.end() &&
                 sharedDownIt != weight.weight.end() && !sharedGateupIt->second.isDiskWeight &&
                 !sharedDownIt->second.isDiskWeight) {
                 moeWeights[0] = moeWeights[1] = nullptr;
@@ -4184,6 +4187,20 @@ namespace fastllm {
                     }
                 });
 
+            // Copy CPU expert inputs before launching the shared expert. A
+            // device-to-host copy after that launch would wait for all shared
+            // GPU work, serializing the two otherwise independent branches.
+            bool overlapShared = false;
+#ifdef USE_CUDA
+            overlapShared = hasSharedExpertOut && !graphActive &&
+                !V41EnvFlag("FASTLLM_DSV41_DISABLE_SHARED_OVERLAP") &&
+                V41DeviceSpecUsesType(this->SelectMoeDeviceForLayer(layer), "cpu");
+#endif
+            if (overlapShared) {
+                V41ReplicaToCpu(cpuMoeInput, ffnInput, tpDevices);
+                V41ReplicaToCpu(cpuMoeIndex, expertIndex, tpDevices);
+                V41ReplicaToCpu(cpuMoeScore, expertScore, tpDevices);
+            }
             auto runSharedExpert = [&]() {
             if (hasSharedExpertOut) {
                 if (tpSharedExpert) {
@@ -4193,8 +4210,14 @@ namespace fastllm {
                 }
                 Data &ww1 = ws->sharedSwiglu, &ww3 = ws->sharedGateup;
                 quantizedLinear(ffnInput, pre + ".ffn.shared_experts.gateup.weight", ww3);
+#ifdef USE_CUDA
+                AssertInFastLLM(FastllmCudaDeepSeekV41SharedSwiglu(ww3, swiglu_limit, ww1),
+                                "DeepSeekV41: CUDA shared expert activation rejected input.");
+#else
                 Swiglu(ww3, ww1);
+#endif
                 quantizedLinear(ww1, pre + ".ffn.shared_experts.w2.weight", sharedExpertOut);
+                ToDataType(sharedExpertOut, DataType::BFLOAT16);
             }
             };   // runSharedExpert
             V41RunGraphSegment(runSharedExpert, kV41GraphSegmentsPerLayer * layer + 3, hasSharedExpertOut,
@@ -4209,9 +4232,9 @@ namespace fastllm {
                 const bool routedExpertParallel = V41DeviceSpecUsesType(moeDeviceSpec, "multicuda");
                 const bool routedExpertOnCuda = routedExpertParallel ||
                                                 V41DeviceSpecUsesType(moeDeviceSpec, "cuda");
-                Data *moeInputPtr = &ffnInput;
-                Data *moeIndexPtr = &expertIndex;
-                Data *moeScorePtr = &expertScore;
+                Data *moeInputPtr = overlapShared ? &cpuMoeInput : &ffnInput;
+                Data *moeIndexPtr = overlapShared ? &cpuMoeIndex : &expertIndex;
+                Data *moeScorePtr = overlapShared ? &cpuMoeScore : &expertScore;
                 // MoE 落在 cpu / numa 时，输入必须从某张卡的副本拷出来：直接交给 CPU 算子
                 // 会让 Data::ToDevice 从复制布局已经失效的 root 上读，直接段错误。
                 const bool tpStageMoe = tp && !routedExpertParallel;

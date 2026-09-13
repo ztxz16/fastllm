@@ -36,7 +36,9 @@
 #include "gguf.h"
 
 namespace fastllm {
+    extern CPUInstructInfo cpuInstructInfo;
     void Float32ToBFloat16(float *float32, uint16_t *bfloat16, int len);
+    void BFloat16ToFloat32(uint16_t *bfloat16, float *float32, int len);
     extern bool Float32ToBFloat16_AVX512BF16_RNE(float *float32, uint16_t *bfloat16, int len);
     extern bool FastllmGemmBFloat16NVFP4Block16_AVX512BF16(
         const void *A, long lda, const void *B, long ldb, void *C, long ldc,
@@ -288,21 +290,21 @@ namespace fastllm {
     static void AppendDeepSeekV4MoeLinearTasks(
         DeepSeekV4MoeLinearTaskStorage &tasks, uint16_t *linearInput,
         Data &weight, float *linearOutput, int inputColumns, int outputRows,
-        int rowsPerTask
+        int rowsPerTask, int tokens = 1
     ) {
         for (int st = 0; st < outputRows; st += rowsPerTask) {
             int end = std::min(st + rowsPerTask, outputRows);
             if (weight.dataType == DataType::FP8_E4M3) {
                 tasks.fp8.emplace_back(
                     linearInput, weight.cpuData, nullptr, linearOutput,
-                    1, inputColumns, outputRows, st, end,
+                    tokens, inputColumns, outputRows, st, end,
                     weight.scales.data(), weight.blockK, weight.blockM);
             } else if (weight.dataType == DataType::NVFP4) {
                 float *scaleFloats =
                     weight.scales.empty() ? nullptr : weight.scales.data();
                 tasks.nvfp4.emplace_back(
                     linearInput, weight.cpuData, nullptr, linearOutput,
-                    1, inputColumns, outputRows, st, end,
+                    tokens, inputColumns, outputRows, st, end,
                     scaleFloats, GetNVFP4ScaleData(weight),
                     weight.blockK, weight.blockM);
             } else if (weight.dataType == DataType::BFLOAT16) {
@@ -342,6 +344,143 @@ namespace fastllm {
         tasks.nvfp4.reserve(nvfp4Count);
         tasks.bf16.reserve(bf16Count);
         tasks.fp16.reserve(fp16Count);
+    }
+
+    struct MultiThreadV41MoePrefillInputOp : MultiThreadBaseOp {
+        uint16_t *original, *quantized;
+        int dim, start, end;
+        MultiThreadV41MoePrefillInputOp(uint16_t *original, uint16_t *quantized, int dim, int start, int end)
+            : original(original), quantized(quantized), dim(dim), start(start), end(end) {}
+        void Run() override {
+            std::vector<float> row(dim);
+            for (int token = start; token < end; ++token) {
+                BFloat16ToFloat32(original + size_t(token)*dim, row.data(), dim);
+                QuantizeDequantizeFP8E4M3Blocks(row.data(), dim, 32);
+                Float32ToBFloat16(row.data(), quantized + size_t(token)*dim, dim);
+            }
+        }
+    };
+
+    struct MultiThreadV41MoePrefillReduceOp : MultiThreadBaseOp {
+        const float *down;
+        const int *order;
+        uint16_t *output;
+        int dim, selected, start, end;
+        MultiThreadV41MoePrefillReduceOp(const float *down, const int *order, uint16_t *output,
+                                       int dim, int selected, int start, int end)
+            : down(down), order(order), output(output), dim(dim), selected(selected), start(start), end(end) {}
+        void Run() override {
+            std::vector<float> row(dim);
+            for (int token = start; token < end; ++token) {
+                std::fill(row.begin(), row.end(), 0.0f);
+                // Tokens are independent; keep each token's original expert order.
+                for (int j = 0; j < selected; ++j) {
+                    const float *result = down + size_t(order[token*selected+j])*dim;
+                    for (int d = 0; d < dim; ++d) row[d] += RoundFloat32ToBFloat16RNE(result[d]);
+                }
+                uint16_t *dst = output + size_t(token)*dim;
+                for (int d = 0; d < dim; ++d) dst[d] = Float32ToBFloat16RNEBits(row[d]);
+            }
+        }
+    };
+
+    static bool TryV41MoePrefill(Data &input, Data &output, Data **weights,
+            int expertCount, int topk, const int32_t *indices, const float *scores,
+            float swigluLimit, bool quantizeShared) {
+        const int n = input.dims[0], dim = input.dims[1];
+        if (n < 2 || n > 512 || dim%32 || output.dataType != DataType::BFLOAT16 ||
+            !cpuInstructInfo.hasAVX512BF16 || std::getenv("FASTLLM_DSV4_DISABLE_CPU_MOE_FAST") ||
+            std::getenv("FASTLLM_DSV41_DISABLE_BATCHED_MOE")) return false;
+        const bool shared = weights[0] != nullptr;
+        const int selected = topk+int(shared), mid = weights[2]->dims[0]/2;
+        if (mid%32) return false;
+        for (int expert = shared ? 0 : 1; expert <= expertCount; ++expert) {
+            for (int part = 0; part < 2; ++part) {
+                Data *w = weights[expert*2+part];
+                if (!w || w->dims != (part ? std::vector<int>{dim,mid} : std::vector<int>{mid*2,dim}) ||
+                    w->blockM != 32 || (w->dataType != DataType::FP8_E4M3 && w->dataType != DataType::NVFP4)) return false;
+            }
+        }
+        // Group token/expert assignments for weight reuse, but retain an
+        // explicit inverse permutation for the original per-token reduction.
+        struct Route { int token, order; float scale; };
+        std::vector<std::vector<Route>> routes(expertCount+1);
+        for (int token = 0; token < n; ++token) {
+            std::vector<std::pair<int,float>> chosen;
+            for (int j = 0; j < topk; ++j)
+                chosen.emplace_back(std::max(0,std::min(int(indices[token*topk+j]),expertCount-1))+1,scores[token*topk+j]);
+            std::stable_sort(chosen.begin(),chosen.end(),[](const auto &a,const auto &b){return a.first<b.first;});
+            if (shared) chosen.emplace_back(0,1.0f);
+            for (int j = 0; j < selected; ++j)
+                routes[chosen[j].first].push_back({token,token*selected+j,chosen[j].second});
+        }
+        std::vector<uint16_t> original(size_t(n)*dim), quantized(original.size());
+        if (input.dataType == DataType::BFLOAT16)
+            memcpy(original.data(),input.cpuData,original.size()*sizeof(uint16_t));
+        else Float32ToBFloat16((float *)input.cpuData,original.data(),original.size());
+        // Small prompts cost less than the additional thread-pool round trips.
+        const bool parallelRows = n >= 256 && !V41ReferenceMathEnabled() &&
+            std::getenv("FASTLLM_DSV41_DISABLE_PARALLEL_MOE_ROWS") == nullptr;
+        const int rowsPerTask = parallelRows ? 8 : n;
+        std::vector<MultiThreadV41MoePrefillInputOp> inputTasks;
+        for (int first = 0; first < n; first += rowsPerTask)
+            inputTasks.emplace_back(original.data(),quantized.data(),dim,first,std::min(first+rowsPerTask,n));
+        std::vector<MultiThreadBaseOp*> tasks;
+        for (auto &task : inputTasks) tasks.push_back(&task);
+        if (parallelRows) ScheduleDeepSeekV4MoeTasks(tasks,false);
+        else inputTasks[0].Run();
+        const size_t count = size_t(n)*selected;
+        std::vector<uint16_t> packed(count*dim), downInput(count*mid);
+        std::vector<float> gate(count*mid*2), activation(count*mid), down(count*dim);
+        std::vector<int> order(count), begins(expertCount+2);
+        size_t slot = 0;
+        for (int expert = 0; expert <= expertCount; ++expert) {
+            begins[expert] = slot;
+            for (const Route &route : routes[expert]) {
+                const auto &source = expert == 0 && !quantizeShared ? original : quantized;
+                memcpy(packed.data()+slot*dim,source.data()+size_t(route.token)*dim,dim*sizeof(uint16_t));
+                order[route.order] = slot++;
+            }
+        }
+        begins[expertCount+1] = slot;
+        DeepSeekV4MoeLinearTaskStorage gateStorage, downStorage;
+        const int tokenBatch = V41ReferenceMathEnabled() ? 4 : 8;
+        for (int expert = 0; expert <= expertCount; ++expert) {
+            for (int first = begins[expert]; first < begins[expert+1]; first += tokenBatch) {
+                int batch = std::min(tokenBatch,begins[expert+1]-first);
+                AppendDeepSeekV4MoeLinearTasks(gateStorage,packed.data()+size_t(first)*dim,*weights[expert*2],
+                    gate.data()+size_t(first)*mid*2,dim,mid*2,128,batch);
+                AppendDeepSeekV4MoeLinearTasks(downStorage,downInput.data()+size_t(first)*mid,*weights[expert*2+1],
+                    down.data()+size_t(first)*dim,mid,dim,256,batch);
+            }
+        }
+        gateStorage.BuildPointers(tasks);
+        ScheduleDeepSeekV4MoeTasks(tasks,false);
+        std::vector<MultiThreadDeepSeekV4MoeDownPrepareOp> prepare;
+        prepare.reserve(count*((mid+127)/128));
+        for (int expert = 0; expert <= expertCount; ++expert) {
+            for (int j = 0; j < int(routes[expert].size()); ++j) {
+                size_t current = begins[expert]+j;
+                for (int st = 0; st < mid; st += 128)
+                    prepare.emplace_back(gate.data()+current*mid*2,activation.data()+current*mid,
+                        downInput.data()+current*mid,mid,st,std::min(st+128,mid),true,
+                        routes[expert][j].scale,swigluLimit,true,true,true,32);
+            }
+        }
+        tasks.clear();tasks.reserve(prepare.size());
+        for (auto &task : prepare) tasks.push_back(&task);
+        ScheduleDeepSeekV4MoeTasks(tasks,false);
+        downStorage.BuildPointers(tasks);
+        ScheduleDeepSeekV4MoeTasks(tasks,false);
+        std::vector<MultiThreadV41MoePrefillReduceOp> reduceTasks;
+        for (int first = 0; first < n; first += rowsPerTask)
+            reduceTasks.emplace_back(down.data(),order.data(),(uint16_t *)output.cpuData,
+                                     dim,selected,first,std::min(first+rowsPerTask,n));
+        tasks.clear();
+        for (auto &task : reduceTasks) tasks.push_back(&task);
+        if (parallelRows) ScheduleDeepSeekV4MoeTasks(tasks,false);
+        else reduceTasks[0].Run();
+        return true;
     }
 
     static uint64_t GetConvertedBufferBytes(const Data &data) {
@@ -3902,6 +4041,10 @@ namespace fastllm {
             int outer = n;
             float *floatInput = input.dataType == DataType::FLOAT32 ? (float*)input.cpuData : nullptr;
             output.Allocate(0.0f);
+
+            if (deepSeekV4Mode && activationQuantBlock == 32 && !useGeglu &&
+                TryV41MoePrefill(input,output,weights,routedExpertCount,topk,indexData,scoreData,
+                    swigluLimit,quantizeSharedExpert)) return;
 
             const char *dots3PrefillEnv = std::getenv(
                 "FASTLLM_DOTS3_NOTE_PREFILL_FUSED");

@@ -361,6 +361,23 @@ namespace {
         return total;
     }
 
+    template <typename T>
+    __global__ void V41SharedSwigluKernel(const T *input, __nv_bfloat16 *output,
+                                         uint64_t count, int mid, float limit) {
+        const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+        if (i >= count) return;
+        const uint64_t offset = (i / mid) * (2 * mid) + i % mid;
+        float gate = V41Bf16Round(V41Load(input, offset));
+        float up = V41Bf16Round(V41Load(input, offset + mid));
+        if (limit > 0.0f) {
+            gate = fminf(gate, limit);
+            up = fmaxf(-limit, fminf(up, limit));
+        }
+        // The shared expert has the same clamp and BF16 activation boundary
+        // as routed experts. FP8 activation quantization follows this kernel.
+        output[i] = __float2bfloat16_rn((gate / (1.0f + expf(-gate))) * up);
+    }
+
     // ---------------- HcMix ----------------
 
     constexpr int kHcThreads = 256;
@@ -608,6 +625,93 @@ namespace {
             for (int i = 0; i < HC * HC; i++) {
                 combOut[i] = cs[i];
             }
+        }
+    }
+
+    // Decode has only one token: give each dot product its own block so
+    // the 2 MB HC matrix is read across SMs. Each output retains the previous
+    // 256-thread strided accumulation and warp-reduction order.
+    template <typename T>
+    __global__ void V41HcDecodeDots(const T *x, const float *fn, int flatDim, float *mix) {
+        const int m = blockIdx.x;
+        float acc = 0.0f;
+        for (int k = threadIdx.x; k < flatDim; k += kHcThreads) {
+            const float value = V41Load(x, k);
+            acc += value * (m == 24 ? value : fn[(uint64_t)m * flatDim + k]);
+        }
+        const float sum = V41WarpSum(acc);
+        __shared__ float partial[kHcThreads / 32];
+        if ((threadIdx.x & 31) == 0) partial[threadIdx.x / 32] = sum;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float total = 0.0f;
+            for (int w = 0; w < kHcThreads / 32; ++w) total += partial[w];
+            mix[m] = total;
+        }
+    }
+
+    __global__ void V41HcDecodeFinish(const float *mix, const float *scale, const float *base,
+                                     int flatDim, int sinkhornIters, float eps, float normEps,
+                                     float *pre, float *post, float *comb) {
+        if (threadIdx.x != 0) return;
+        constexpr int HC = 4, t = 0;
+        const float rsqrtv = rsqrtf(mix[24] / flatDim + normEps);
+        float *preOut = pre + (uint64_t)t * HC;
+        float *postOut = post + (uint64_t)t * HC;
+        float *combOut = comb + (uint64_t)t * HC * HC;
+        for (int h = 0; h < HC; h++) {
+            preOut[h] = V41SigmoidDev(mix[h] * rsqrtv * scale[0] + base[h]) + eps;
+            postOut[h] = 2.0f * V41SigmoidDev(mix[h + HC] * rsqrtv * scale[1] + base[h + HC]);
+        }
+        float cs[HC * HC];
+        for (int r = 0; r < HC; r++) {
+            float rowMax = -FLT_MAX;
+            for (int c = 0; c < HC; c++) {
+                int idx = r * HC + c + 2 * HC;
+                cs[r * HC + c] = mix[idx] * rsqrtv * scale[2] + base[idx];
+                rowMax = fmaxf(rowMax, cs[r * HC + c]);
+            }
+            float rowSum = 0.0f;
+            for (int c = 0; c < HC; c++) {
+                float v = __expf(cs[r * HC + c] - rowMax);
+                cs[r * HC + c] = v;
+                rowSum += v;
+            }
+            for (int c = 0; c < HC; c++) {
+                cs[r * HC + c] = cs[r * HC + c] / rowSum + eps;
+            }
+        }
+        for (int c = 0; c < HC; c++) {
+            float colSum = 0.0f;
+            for (int r = 0; r < HC; r++) {
+                colSum += cs[r * HC + c];
+            }
+            for (int r = 0; r < HC; r++) {
+                cs[r * HC + c] /= (colSum + eps);
+            }
+        }
+        for (int it = 1; it < sinkhornIters; it++) {
+            for (int r = 0; r < HC; r++) {
+                float rowSum = 0.0f;
+                for (int c = 0; c < HC; c++) {
+                    rowSum += cs[r * HC + c];
+                }
+                for (int c = 0; c < HC; c++) {
+                    cs[r * HC + c] /= (rowSum + eps);
+                }
+            }
+            for (int c = 0; c < HC; c++) {
+                float colSum = 0.0f;
+                for (int r = 0; r < HC; r++) {
+                    colSum += cs[r * HC + c];
+                }
+                for (int r = 0; r < HC; r++) {
+                    cs[r * HC + c] /= (colSum + eps);
+                }
+            }
+        }
+        for (int i = 0; i < HC * HC; i++) {
+            combOut[i] = cs[i];
         }
     }
 
@@ -2176,6 +2280,27 @@ namespace {
 
 // ==================== 导出接口 ====================
 
+bool FastllmCudaDeepSeekV41SharedSwiglu(const fastllm::Data &input, float limit,
+                                      fastllm::Data &output) {
+    if (!V41OnCuda(input) || input.multiDeviceData || input.dims.empty() ||
+        input.dims.back() <= 0 || input.dims.back() % 2 || !V41IsFloatType(input.dataType)) return false;
+    auto dims = input.dims;
+    const int mid = dims.back() / 2;
+    dims.back() = mid;
+    if (!V41PrepareOutput(output, DataType::BFLOAT16, dims)) return false;
+    const uint64_t count = input.Count(0) / 2;
+    if (count == 0) return true;
+    const int blocks = (count + 255) / 256;
+    auto out = (__nv_bfloat16 *)output.cudaData;
+    if (input.dataType == DataType::BFLOAT16)
+        V41SharedSwigluKernel<<<blocks, 256>>>((const __nv_bfloat16 *)input.cudaData, out, count, mid, limit);
+    else if (input.dataType == DataType::FLOAT16)
+        V41SharedSwigluKernel<<<blocks, 256>>>((const half *)input.cudaData, out, count, mid, limit);
+    else
+        V41SharedSwigluKernel<<<blocks, 256>>>((const float *)input.cudaData, out, count, mid, limit);
+    return V41CheckLaunch("SharedSwiglu");
+}
+
 extern "C" bool FastllmCudaDeepSeekV41HcMix(const fastllm::Data &x, fastllm::Data &hcFn, fastllm::Data &hcScale,
                                             fastllm::Data &hcBase, int hcMult, int sinkhornIters, float eps,
                                             float normEps, fastllm::Data &pre, fastllm::Data &post,
@@ -2196,6 +2321,21 @@ extern "C" bool FastllmCudaDeepSeekV41HcMix(const fastllm::Data &x, fastllm::Dat
     hcFn.ToDevice(DataDevice::CUDA);
     hcScale.ToDevice(DataDevice::CUDA);
     hcBase.ToDevice(DataDevice::CUDA);
+    if (tokens == 1 && hcMult == 4 && !V41EnvOn("FASTLLM_DSV41_LEGACY_HCMIX") &&
+        !V41EnvOn("FASTLLM_DSV41_LEGACY_HCMIX_DECODE")) {
+        Data scratch;
+        if (!V41PrepareOutput(scratch, DataType::FLOAT32, {25})) return false;
+        float *mix = (float *)scratch.cudaData;
+        if (x.dataType == DataType::BFLOAT16)
+            V41HcDecodeDots<<<25, kHcThreads>>>((const __nv_bfloat16 *)x.cudaData, (const float *)hcFn.cudaData, hcMult * dim, mix);
+        else if (x.dataType == DataType::FLOAT16)
+            V41HcDecodeDots<<<25, kHcThreads>>>((const half *)x.cudaData, (const float *)hcFn.cudaData, hcMult * dim, mix);
+        else
+            V41HcDecodeDots<<<25, kHcThreads>>>((const float *)x.cudaData, (const float *)hcFn.cudaData, hcMult * dim, mix);
+        V41HcDecodeFinish<<<1, 32>>>(mix, (const float *)hcScale.cudaData, (const float *)hcBase.cudaData,
+            hcMult * dim, sinkhornIters, eps, normEps, (float *)pre.cudaData, (float *)post.cudaData, (float *)comb.cudaData);
+        return V41CheckLaunch("HcMixDecode");
+    }
     if (!V41EnvOn("FASTLLM_DSV41_LEGACY_HCMIX")) {
         bool launched = false;
         if (x.dataType == DataType::BFLOAT16) {

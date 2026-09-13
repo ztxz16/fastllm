@@ -30,6 +30,9 @@ namespace fastllm {
     extern FP16ToFP32Manager fp16tofp32;
     extern BF16ToFP32Manager bf16tofp32;
     extern FP8E4M3ToFP32Manager fp8e4m3tofp32;
+    extern bool V41ReferenceLinear_AVX512F(const void *input, const uint8_t *weight,
+        const float *bias, float *output, int n, int m, int k, int st, int end,
+        int blockK, const float *scales, const uint8_t *scaleBytes, bool bf16Input, const float *fp8Table);
     extern void Float16ToFloat32(uint16_t *float16, float *float32, int len);
     extern void Float32ToFloat16(float *float32, uint16_t *float16, int len);
     extern void Float32ToBFloat16(float *float32, uint16_t *bfloat16, int len);
@@ -836,6 +839,9 @@ namespace fastllm {
         int ks = (k - 1) / blockK + 1;
         int ms = (m - 1) / blockM + 1;
         if (V41ReferenceMathEnabled() && blockM == 32 && m % 32 == 0) {
+            if (cpuInstructInfo.hasAVX512F && V41ReferenceLinear_AVX512F(inputData, weightData,
+                    biasData, outputData, n, m, k, st, end, blockK, scales, nullptr, true, fp8e4m3tofp32.dict))
+                return;
             std::vector<float> values(m);
             for (int token = 0; token < n; ++token) {
                 for (int j = 0; j < m; ++j) values[j] = BFloat16BitsToFloat32(inputData[token*m+j]);
@@ -1238,6 +1244,9 @@ namespace fastllm {
 
     void MultiThreadLinearBFloat16NVFP4Op::Run() {
         if (V41ReferenceMathEnabled() && blockM == 32 && m % 32 == 0) {
+            if (cpuInstructInfo.hasAVX512F && V41ReferenceLinear_AVX512F(inputData, weightData,
+                    biasData, outputData, n, m, k, st, end, blockK, scales, scaleBytes, true, nullptr))
+                return;
             V41ReferenceNVFP4<true>(inputData,weightData,biasData,outputData,n,m,k,st,end,blockK,scales,scaleBytes);
             return;
         }
@@ -1293,6 +1302,9 @@ namespace fastllm {
 
     void MultiThreadLinearFloat32NVFP4Op::Run() {
         if (V41ReferenceMathEnabled() && blockM == 32 && m % 32 == 0) {
+            if (cpuInstructInfo.hasAVX512F && V41ReferenceLinear_AVX512F(inputData, weightData,
+                    biasData, outputData, n, m, k, st, end, blockK, scales, scaleBytes, false, nullptr))
+                return;
             V41ReferenceNVFP4<false>(inputData,weightData,biasData,outputData,n,m,k,st,end,blockK,scales,scaleBytes);
             return;
         }
