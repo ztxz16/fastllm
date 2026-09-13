@@ -11171,11 +11171,26 @@ namespace fastllm {
                 qSizesHost[1], lastPageLensHost[0]);
         }
         if (!singleBatchPrepared) {
-            FastllmCudaCopyFromHostToDevice(qSizes.cudaData, (void*)qSizesHost.data(), (batch + 1) * sizeof(int32_t));
-            FastllmCudaCopyFromHostToDevice(pageSizes.cudaData, (void*)pageSizesHost.data(), (batch + 1) * sizeof(int32_t));
-            FastllmCudaCopyFromHostToDevice(pageIndexs.cudaData, (void*)pageIndexsHost.data(), totalPageSlots * sizeof(int32_t));
-            if (!lastPageLensOnDevice) {
-                FastllmCudaCopyFromHostToDevice(lastPageLens.cudaData, (void*)lastPageLensHost.data(), batch * sizeof(int32_t));
+            // Upstream #722: the pageable H2D copies in the fallback below
+            // hold the CUDA driver lock; the kernel-parameter upload removes
+            // that window.
+            bool kernelUploaded = FastllmCudaUploadPagedIntParams(
+                    (int32_t*)qSizes.cudaData, batch + 1,
+                    (int32_t*)pageSizes.cudaData, batch + 1,
+                    (int32_t*)pageIndexs.cudaData, totalPageSlots,
+                    (int32_t*)lastPageLens.cudaData,
+                    lastPageLensOnDevice ? 0 : batch,
+                    (const int*)qSizesHost.data(),
+                    (const int*)pageSizesHost.data(),
+                    (const int*)pageIndexsHost.data(),
+                    (const int*)lastPageLensHost.data());
+            if (!kernelUploaded) {
+                FastllmCudaCopyFromHostToDevice(qSizes.cudaData, (void*)qSizesHost.data(), (batch + 1) * sizeof(int32_t));
+                FastllmCudaCopyFromHostToDevice(pageSizes.cudaData, (void*)pageSizesHost.data(), (batch + 1) * sizeof(int32_t));
+                FastllmCudaCopyFromHostToDevice(pageIndexs.cudaData, (void*)pageIndexsHost.data(), totalPageSlots * sizeof(int32_t));
+                if (!lastPageLensOnDevice) {
+                    FastllmCudaCopyFromHostToDevice(lastPageLens.cudaData, (void*)lastPageLensHost.data(), batch * sizeof(int32_t));
+                }
             }
         }
     }

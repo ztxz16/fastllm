@@ -423,6 +423,17 @@ bool FastllmCudaPreparePagedBatchParamsSingle(
     int32_t *qSizes, int32_t *pageSizes, int32_t *pageIndexs,
     int32_t *lastPageLens, const int *pageIdxHost, int pageIndexCount,
     int totalPages, int qSize, int lastPageLen);
+// Upload the paged batch parameters via a kernel carrying the values in its
+// parameter space (upstream #722): no blocking pageable H2D copy, capturable
+// by a CUDA Graph.  Returns false when a size exceeds the kernel parameter
+// budget; callers keep the memcpy fallback.
+bool FastllmCudaUploadPagedIntParams(
+    int32_t *qSizes, int qSizesCount,
+    int32_t *pageSizes, int pageSizesCount,
+    int32_t *pageIndexs, int pageIndexsCount,
+    int32_t *lastPageLens, int lastPageLensCount,
+    const int *qSizesHost, const int *pageSizesHost,
+    const int *pageIndexsHost, const int *lastPageLensHost);
 void FastllmCudaPagedCacheCopyBatch(uint8_t *pagedData, int32_t *pageIdxArray, int32_t *pageOffsetArray,
                                     int pageLen, int batch, int numHeads, int headDim,
                                     fastllm::DataType dstType, uint8_t *inputData, fastllm::DataType srcType,
@@ -1454,6 +1465,13 @@ bool FastllmCudaDFlashRejectionSampling(
                                   int *acceptedDraftTokens,
                                   int batch, int draftTokens,
                                   int selectorTopK, int vocabSize);
+bool FastllmCudaMtpDraftSpecSampling(
+                                  const float *logits,
+                                  float temperature, int topK, float topP,
+                                  uint64_t seed,
+                                  int *draftOut, int *candidateIdsOut,
+                                  float *candidateProbsOut,
+                                  int *candidateCountOut, int vocabSize);
 bool FastllmCudaDFlashDynamicConv(
                                   const fastllm::Data &source,
                                   const fastllm::Data &dynamicProjection,

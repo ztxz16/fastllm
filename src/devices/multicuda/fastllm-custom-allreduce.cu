@@ -893,6 +893,13 @@ struct CustomArState {
     int pendingCount = 0;
     int pendingType = -1;
     bool pendingMismatch = false;
+    // Per-rank call ordinals identify *which* tensor a peer is on.  The
+    // pointer tuple alone pairs ranks by arrival order, so any asymmetry in
+    // the ranks' collective call streams shifts every later round (silent
+    // wrong results, or an out-of-range read of a freed peer buffer).
+    uint64_t rankCallSequence[kCustomArMaxRanks]{};
+    uint64_t pendingSequences[kCustomArMaxRanks]{};
+    bool sequenceDesyncLogged = false;
     bool lastRegistrationOk = false;
     bool lastRegistrationMissDuringCapture = false;
     std::vector<void *> pendingInputs;
@@ -1158,6 +1165,7 @@ bool FindOrRegisterCustomArPointers(CustomArState &state, int rank,
     } else {
         state.pendingInputs[rank] = input;
         state.pendingCapturing[rank] = capturing ? 1 : 0;
+        state.pendingSequences[rank] = state.rankCallSequence[rank]++;
     }
     state.pendingMismatch = state.pendingMismatch || !captureQueryOk;
     state.arrived++;
@@ -1167,6 +1175,24 @@ bool FindOrRegisterCustomArPointers(CustomArState &state, int rank,
         bool inputsValid = !state.pendingMismatch;
         for (void *ptr : inputs) {
             inputsValid = inputsValid && ptr != nullptr;
+        }
+        // A desynchronised call stream shifts the arrival-order pairing by
+        // one; refuse the round so it falls back to NCCL instead of
+        // reducing the wrong peer tensor (or reading a freed buffer).
+        for (int other = 1; other < (int)state.devices.size() && inputsValid;
+             ++other) {
+            if (state.pendingSequences[other] != state.pendingSequences[0]) {
+                inputsValid = false;
+                state.pendingMismatch = true;
+                if (rank == 0 && !state.sequenceDesyncLogged) {
+                    state.sequenceDesyncLogged = true;
+                    std::fprintf(stderr,
+                                 "[Fastllm] custom all-reduce call "
+                                 "sequences desynchronized across ranks; "
+                                 "falling back to NCCL.\n");
+                    std::fflush(stderr);
+                }
+            }
         }
         std::vector<uintptr_t> key;
         key.reserve(inputs.size());
@@ -1453,6 +1479,11 @@ bool RunCustomArCandidate(void *data, void *dest, int count,
     if (data == nullptr || dest == nullptr || count <= 0) {
         return false;
     }
+    // The kernels access data/dest as 16-byte aligned packets; a misaligned
+    // view would fault on the device (cudaErrorMisalignedAddress, Xid 13).
+    if ((((uintptr_t)data | (uintptr_t)dest) & 15u) != 0) {
+        return false;  // fall back to NCCL
+    }
     size_t typeBytes = CustomArTypeBytes(dataType);
     size_t bytes = (size_t)count * typeBytes;
     if (typeBytes == 0 || bytes == 0 || bytes > CustomArMaxBytes() ||
@@ -1524,6 +1555,12 @@ bool RunCustomArPairAddCandidate(void *first, void *second, void *dest,
         count <= 0) {
         return false;
     }
+    // The kernel reads first/second and writes dest as 16-byte aligned
+    // packets; a misaligned view would fault on the device
+    // (cudaErrorMisalignedAddress, Xid 13).
+    if ((((uintptr_t)first | (uintptr_t)second | (uintptr_t)dest) & 15u) != 0) {
+        return false;  // fall back to NCCL
+    }
     const size_t typeBytes = CustomArTypeBytes(dataType);
     const size_t bytes = (size_t)count * typeBytes;
     if (typeBytes == 0 || bytes == 0 || bytes > CustomArMaxBytes() ||
@@ -1570,6 +1607,11 @@ bool RunCustomArAddCandidate(void *data, void *dest, int count,
                              bool requireEnabledPath = false) {
     if (data == nullptr || dest == nullptr || count <= 0) {
         return false;
+    }
+    // The kernel reads data/dest as 16-byte aligned packets; a misaligned
+    // view would fault on the device (cudaErrorMisalignedAddress, Xid 13).
+    if ((((uintptr_t)data | (uintptr_t)dest) & 15u) != 0) {
+        return false;  // fall back to NCCL
     }
     size_t typeBytes = CustomArTypeBytes(dataType);
     size_t bytes = (size_t)count * typeBytes;
@@ -2237,6 +2279,13 @@ void FastllmCudaCustomAllReduceReset() {
         state.pendingCount = 0;
         state.pendingType = -1;
         state.pendingMismatch = false;
+        for (uint64_t &sequence : state.rankCallSequence) {
+            sequence = 0;
+        }
+        for (uint64_t &sequence : state.pendingSequences) {
+            sequence = 0;
+        }
+        state.sequenceDesyncLogged = false;
         state.lastRegistrationOk = false;
         state.lastRegistrationMissDuringCapture = false;
         state.captureFallbackLogged = false;

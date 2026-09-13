@@ -803,6 +803,16 @@ namespace fastllm {
         return enabled;
     }
 
+    // MTP spec-rejection candidate-list width: the request top_k lower bound
+    // mirrors the verify-side max(1, top_k) clamps (typical path and DFlash
+    // rejection kernel both use it); the cap bounds the fixed-stride
+    // proposal arrays.
+    static int Qwen35MtpSpecRejectionK(int requestTopK) {
+        const int maxValue = 64;
+        int k = requestTopK > 0 ? requestTopK : 1;
+        return k > maxValue ? maxValue : k;
+    }
+
     static int Qwen35MtpProfileInterval() {
         static int interval = []() {
             const char *env = std::getenv("FASTLLM_QWEN35_MTP_PROFILE");
@@ -16943,14 +16953,23 @@ namespace fastllm {
                     "DFlash rejection sampling input shape mismatch.\n");
                 const float *verifyInput =
                     (const float*)verifyInputCpu.cpuData;
+                // MTP spec-rejection proposals reuse this DFlash rejection
+                // branch; their candidate width follows the request top_k,
+                // not the DFlash checkpoint selector.
+                const int effSelectorTopK =
+                    !HasDFlashWeights() &&
+                    (speculativeDFlashSamplingContext != nullptr ||
+                     !speculativeDFlashSamplingContexts.empty())
+                        ? Qwen35MtpSpecRejectionK(rowConfigs[0].top_k)
+                        : dflashSelectorTopK;
                 std::vector<int> proposalTokens;
                 std::vector<int> proposalCandidateIds;
                 std::vector<float> proposalCandidateProbs;
                 proposalTokens.reserve(batch * draftTokens);
                 proposalCandidateIds.reserve(
-                    batch * draftTokens * dflashSelectorTopK);
+                    batch * draftTokens * effSelectorTopK);
                 proposalCandidateProbs.reserve(
-                    batch * draftTokens * dflashSelectorTopK);
+                    batch * draftTokens * effSelectorTopK);
                 int rowOffset = 0;
                 for (int b = 0; b < batch; b++) {
                     DFlashContext *proposal = proposals[b];
@@ -16958,9 +16977,9 @@ namespace fastllm {
                         proposal != nullptr && seqLens[b] == draftTokens + 1 &&
                             (int)proposal->proposalTokens.size() >= draftTokens &&
                             (int)proposal->proposalCandidateIds.size() >=
-                                draftTokens * dflashSelectorTopK &&
+                                draftTokens * effSelectorTopK &&
                             (int)proposal->proposalCandidateProbs.size() >=
-                                draftTokens * dflashSelectorTopK,
+                                draftTokens * effSelectorTopK,
                         "DFlash rejection sampling is missing selector probabilities.\n");
                     for (int token = 0; token < draftTokens; token++) {
                         AssertInFastLLM(
@@ -16975,12 +16994,12 @@ namespace fastllm {
                         proposalCandidateIds.end(),
                         proposal->proposalCandidateIds.begin(),
                         proposal->proposalCandidateIds.begin() +
-                            draftTokens * dflashSelectorTopK);
+                            draftTokens * effSelectorTopK);
                     proposalCandidateProbs.insert(
                         proposalCandidateProbs.end(),
                         proposal->proposalCandidateProbs.begin(),
                         proposal->proposalCandidateProbs.begin() +
-                            draftTokens * dflashSelectorTopK);
+                            draftTokens * effSelectorTopK);
                     rowOffset += seqLens[b];
                 }
                 std::vector<float> temperatures(logitRows);
@@ -17000,7 +17019,7 @@ namespace fastllm {
                         proposalTokens.data(), proposalCandidateIds.data(),
                         proposalCandidateProbs.data(), sampled.data(),
                         acceptedDrafts.data(), batch, draftTokens,
-                        dflashSelectorTopK, vocabSize),
+                        effSelectorTopK, vocabSize),
                     "DFlash CUDA rejection sampling failed.\n");
                 speculativeDFlashAccepted.assign(logitRows, 0);
                 rowOffset = 0;
@@ -17300,6 +17319,15 @@ namespace fastllm {
         std::lock_guard<std::mutex> mtpCacheGuard(mtpCacheMutex);
         MtpKvCache &mtpCache = mtpCaches[context];
         DFlashContext &dflashContext = dflashContexts[context];
+        // MTP spec-rejection: distributional MTP drafts routed through the
+        // DFlash rejection verify branch.  Eligibility is per call (single
+        // request, non-greedy) and must be known before runTargetWithPast —
+        // on a validation call the verify forward runs before this call's own
+        // draft chain, reading the proposal the previous call's draft chain
+        // published into dflashContext.
+        const bool mtpSpecRejectionActive =
+            (int)generationConfigs.size() == 1 &&
+            !generationConfigs[0].IsSimpleGreedy();
         auto eraseDraftCache = [&]() {
             mtpCaches.erase(context);
             dflashContexts.erase(context);
@@ -18163,9 +18191,33 @@ namespace fastllm {
                 speculativeDFlashSamplingContext;
             speculativeCollectAllLogits = true;
             speculativeCaptureDFlashHiddenStates = useDFlash;
-            speculativeDFlashSamplingContext =
-                useDFlash && !generationConfigs[0].IsSimpleGreedy() ?
-                    &dflashContext : nullptr;
+            // The MTP long-prefill seeding path enqueues the first verify
+            // without ever publishing a spec proposal (see
+            // appendLongPrefillMtpCache: it drafts one token and touches
+            // only the MTP KV cache, never the DFlash context).  Keep the
+            // rejection branch inactive until the previous call's draft
+            // chain has actually filled the proposal; that single seeded
+            // verify then falls back to the classic MTP acceptance, and
+            // every later verify runs the spec-rejection path as designed.
+            {
+                const int verifyDraftTokens =
+                    std::max(0, curSeqLens[0] - 1);
+                const size_t requiredProposal =
+                    (size_t)verifyDraftTokens *
+                    (size_t)Qwen35MtpSpecRejectionK(
+                        generationConfigs[0].top_k);
+                speculativeDFlashSamplingContext =
+                    (useDFlash ||
+                     (mtpSpecRejectionActive &&
+                      (size_t)dflashContext.proposalTokens.size() >=
+                          (size_t)verifyDraftTokens &&
+                      (size_t)dflashContext.proposalCandidateIds.size() >=
+                          requiredProposal &&
+                      (size_t)dflashContext.proposalCandidateProbs.size() >=
+                          requiredProposal)) &&
+                        !generationConfigs[0].IsSimpleGreedy() ?
+                        &dflashContext : nullptr;
+            }
             if (useDFlash) {
                 speculativeDFlashHiddenStates.clear();
                 speculativeDFlashHiddenStates.resize(
@@ -18273,7 +18325,8 @@ namespace fastllm {
         auto countAcceptedDrafts = [&](const std::vector<int> &targetTokens,
                                        int draftTokenCount) {
             bool useDFlashRejection =
-                useDFlash && !generationConfigs[0].IsSimpleGreedy() &&
+                (useDFlash || mtpSpecRejectionActive) &&
+                !generationConfigs[0].IsSimpleGreedy() &&
                 (int)speculativeDFlashAccepted.size() >= draftTokenCount;
             bool useMtpAcceptance =
                 !useDFlash && !generationConfigs[0].IsSimpleGreedy() &&
@@ -18329,6 +18382,41 @@ namespace fastllm {
                                     int lastPositionRow) {
             std::vector<int> drafts;
             drafts.reserve(mtpDraftsPerStep);
+            // Distributional sampling for this chain; the per-position
+            // top-K candidates are published into dflashContext after the
+            // chain so the next call's verify forward (runTargetWithPast)
+            // can route them through the DFlash rejection branch.
+            std::vector<std::pair<std::vector<int>, std::vector<float>>> specCandidates;
+            if (mtpSpecRejectionActive) {
+                if (mtpSpecDraftSeedBase == 0) {
+                    mtpSpecDraftSeedBase = (unsigned long long)
+                        std::chrono::steady_clock::now().time_since_epoch().count();
+                }
+                const GenerationConfig &specCfg = generationConfigs[0];
+                mtpSpecDraftParams.active = true;
+                mtpSpecDraftParams.temperature = specCfg.temperature;
+                mtpSpecDraftParams.topK = Qwen35MtpSpecRejectionK(specCfg.top_k);
+                mtpSpecDraftParams.topP = specCfg.top_p;
+                mtpSpecDraftParams.seed = mtpSpecDraftSeedBase +
+                    (mtpSpecDraftSeedCounter++);
+                specCandidates.reserve(mtpDraftsPerStep);
+            } else {
+                mtpSpecDraftParams.active = false;
+            }
+            auto collectSpecCandidate = [&]() {
+                AssertInFastLLM(
+                    mtpSpecDraftLast.token >= 0 &&
+                        mtpSpecDraftLast.candidateIds.size() ==
+                            (size_t)mtpSpecDraftParams.topK &&
+                        mtpSpecDraftLast.candidateProbs.size() ==
+                            (size_t)mtpSpecDraftParams.topK,
+                    "MTP spec draft sampling returned an incomplete sample.\n");
+                specCandidates.emplace_back(
+                    std::move(mtpSpecDraftLast.candidateIds),
+                    std::move(mtpSpecDraftLast.candidateProbs));
+                mtpSpecDraftParams.seed = mtpSpecDraftSeedBase +
+                    (mtpSpecDraftSeedCounter++);
+            };
             Data draftHidden;
             auto firstDraftStart = mtpProfileEnabled ? std::chrono::steady_clock::now()
                                                      : std::chrono::steady_clock::time_point();
@@ -18338,6 +18426,9 @@ namespace fastllm {
                                           mtpDraftsPerStep > 1 ? &draftHidden : nullptr);
             mtpProfileAddSpan(mtpProfileDraftFirstUs, firstDraftStart);
             drafts.push_back(draft);
+            if (mtpSpecRejectionActive) {
+                collectSpecCandidate();
+            }
             if (mtpDraftsPerStep > 1) {
                 const int cacheTokens = mtpCache.tokens;
                 // 双缓冲保存上一轮 draft 的 hidden state, 避免每轮多一次 CopyFrom
@@ -18358,6 +18449,9 @@ namespace fastllm {
                                                           0, needNextHidden ? &extraHidden : nullptr);
                         mtpProfileAddSpan(mtpProfileDraftExtraUs, extraDraftStart);
                         drafts.push_back(nextDraft);
+                        if (mtpSpecRejectionActive) {
+                            collectSpecCandidate();
+                        }
                         if (needNextHidden) {
                             prevHidden = &extraHidden;
                         }
@@ -18365,9 +18459,24 @@ namespace fastllm {
                     }
                 } catch (...) {
                     mtpCache.Truncate(cacheTokens);
+                    mtpSpecDraftParams.active = false;
                     throw;
                 }
                 mtpCache.Truncate(cacheTokens);
+            }
+            if (mtpSpecRejectionActive) {
+                mtpSpecDraftParams.active = false;
+                dflashContext.proposalTokens = drafts;
+                dflashContext.proposalCandidateIds.clear();
+                dflashContext.proposalCandidateProbs.clear();
+                for (auto &cand : specCandidates) {
+                    dflashContext.proposalCandidateIds.insert(
+                        dflashContext.proposalCandidateIds.end(),
+                        cand.first.begin(), cand.first.end());
+                    dflashContext.proposalCandidateProbs.insert(
+                        dflashContext.proposalCandidateProbs.end(),
+                        cand.second.begin(), cand.second.end());
+                }
             }
             return drafts;
         };
@@ -29575,6 +29684,36 @@ namespace fastllm {
             }
         }
         std::vector<int> result(batch, -1);
+        if (mtpSpecDraftParams.active && batch == 1) {
+            // Distributional draft: gather the sharded draft logits to root
+            // and sample the draft + top-K candidates there, instead of the
+            // per-rank argmax merge below.
+            for (const auto &local : logits) {
+                AssertInFastLLM(local.dataDevice == DataDevice::CUDA &&
+                                    local.cudaData != nullptr && local.Count(0) > 0,
+                                "MTP TP spec draft requires non-empty logit shards "
+                                "on every rank.\n");
+            }
+            const int vocabSize = (int)weight["lm_head.weight"].dims[0];
+            Data &fullCudaLogits = Qwen35ThreadLocalCudaSamplingFullLogits();
+            Qwen35GatherShardLogitsToRootCuda(device, devices, threadTpLmHeadScheme,
+                                              logits, 1, vocabSize, fullCudaLogits);
+            const int specK = mtpSpecDraftParams.topK;
+            std::vector<int> specIds(specK, -1);
+            std::vector<float> specProbs(specK, 0.0f);
+            int specDraft = -1;
+            int specCount = 0;
+            bool specOk = FastllmCudaMtpDraftSpecSampling(
+                (float*)fullCudaLogits.cudaData, mtpSpecDraftParams.temperature,
+                specK, mtpSpecDraftParams.topP, mtpSpecDraftParams.seed,
+                &specDraft, specIds.data(), specProbs.data(), &specCount, vocabSize);
+            AssertInFastLLM(specOk, "MTP spec draft sampling failed.\n");
+            mtpSpecDraftLast.token = specDraft;
+            mtpSpecDraftLast.candidateIds = std::move(specIds);
+            mtpSpecDraftLast.candidateProbs = std::move(specProbs);
+            result[0] = specDraft;
+            return result;
+        }
         for (int b = 0; b < batch; ++b) {
             float best = -std::numeric_limits<float>::infinity();
             for (int rank = 0; rank < (int)devices.size(); ++rank) {
@@ -30564,10 +30703,35 @@ namespace fastllm {
             return draft;
         };
 
+        auto sampleDraftFromCudaLogits = [&](Data &cudaLogits) {
+            if (!mtpSpecDraftParams.active) {
+                return sampleGreedyFromCudaLogits(cudaLogits);
+            }
+            ToDataType(cudaLogits, DataType::FLOAT32);
+            AssertInFastLLM(cudaLogits.dataDevice == DataDevice::CUDA &&
+                            cudaLogits.cudaData != nullptr,
+                            "Qwen3.5 MTP spec draft logits must stay on CUDA.\n");
+            const int specK = mtpSpecDraftParams.topK;
+            std::vector<int> specIds(specK, -1);
+            std::vector<float> specProbs(specK, 0.0f);
+            int specDraft = -1;
+            int specCount = 0;
+            bool specOk = FastllmCudaMtpDraftSpecSampling(
+                (float*)cudaLogits.cudaData, mtpSpecDraftParams.temperature,
+                specK, mtpSpecDraftParams.topP, mtpSpecDraftParams.seed,
+                &specDraft, specIds.data(), specProbs.data(), &specCount,
+                (int)cudaLogits.dims.back());
+            AssertInFastLLM(specOk, "MTP spec draft sampling failed.\n");
+            mtpSpecDraftLast.token = specDraft;
+            mtpSpecDraftLast.candidateIds = std::move(specIds);
+            mtpSpecDraftLast.candidateProbs = std::move(specProbs);
+            return specDraft;
+        };
+
         Data &lmHead = weight["lm_head.weight"];
         if (!tensorParallelDraft) {
             Linear(*sampleHiddenPtr, lmHead, *GetEmptyData(), logits);
-            return sampleGreedyFromCudaLogits(logits);
+            return sampleDraftFromCudaLogits(logits);
         }
 
         AssertInFastLLM(threadTpWeightsPrepared.load(std::memory_order_acquire) &&
@@ -30637,6 +30801,36 @@ namespace fastllm {
             if (error) {
                 std::rethrow_exception(error);
             }
+        }
+        if (mtpSpecDraftParams.active) {
+            // Distributional draft: gather the sharded draft logits to root
+            // and sample the draft + top-K candidates there, instead of the
+            // per-rank argmax merge below.
+            for (const auto &local : localLogits) {
+                AssertInFastLLM(local.dataDevice == DataDevice::CUDA &&
+                                    local.cudaData != nullptr && local.Count(0) > 0,
+                                "MTP TP spec draft requires non-empty logit shards "
+                                "on every rank.\n");
+            }
+            Data &fullCudaLogits = Qwen35ThreadLocalCudaSamplingFullLogits();
+            Qwen35GatherShardLogitsToRootCuda(device, draftDevices, threadTpLmHeadScheme,
+                                              localLogits, 1, lmHead.dims[0],
+                                              fullCudaLogits);
+            const int specK = mtpSpecDraftParams.topK;
+            std::vector<int> specIds(specK, -1);
+            std::vector<float> specProbs(specK, 0.0f);
+            int specDraft = -1;
+            int specCount = 0;
+            bool specOk = FastllmCudaMtpDraftSpecSampling(
+                (float*)fullCudaLogits.cudaData, mtpSpecDraftParams.temperature,
+                specK, mtpSpecDraftParams.topP, mtpSpecDraftParams.seed,
+                &specDraft, specIds.data(), specProbs.data(), &specCount,
+                (int)lmHead.dims[0]);
+            AssertInFastLLM(specOk, "MTP spec draft sampling failed.\n");
+            mtpSpecDraftLast.token = specDraft;
+            mtpSpecDraftLast.candidateIds = std::move(specIds);
+            mtpSpecDraftLast.candidateProbs = std::move(specProbs);
+            return specDraft;
         }
         bool allBestReady = true;
         for (int ready : localBestReady) {
