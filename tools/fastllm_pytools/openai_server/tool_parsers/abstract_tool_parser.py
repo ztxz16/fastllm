@@ -223,7 +223,9 @@ class ToolParserManager:
         if (force_chat_template):
             # 如果指定了强制指定了chat_template，那么尝试检测tool调用类型
             target = ""
-            if ("<｜DSML｜tool_calls>" in chat_template):
+            if ("<｜DSML｜ calls>" in chat_template):
+                target = "deepseek_v41"
+            elif ("<｜DSML｜tool_calls>" in chat_template):
                 target = "deepseek_v4"
             elif ("<dots_function_call>" in chat_template):
                 target = "dots"
@@ -282,6 +284,8 @@ class ToolParserManager:
             target = 'kimi_k3'
         elif model_type == 'hy_v3':
             target = 'hy_v3'
+        elif model_type == 'deepseek_v41' or model_type == 'deepseek_v41_text':
+            target = 'deepseek_v41'
         elif model_type == 'deepseek_v4':
             target = 'deepseek_v4'
         elif model_type == 'deepseek_v3' or model_type == 'deepseek_v2':

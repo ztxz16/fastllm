@@ -152,6 +152,8 @@ bool FastllmCudaTensorParallelGreedyGatherGraphCreate(
         void **exec);
 bool FastllmCudaGraphLaunch(void *exec);
 void FastllmCudaGraphDestroy(void *graph);
+// 清掉当前线程粘着的 CUDA 运行时错误（捕获失败后回退到逐算子之前必须调用）
+void FastllmCudaClearLastError();
 void FastllmCudaGraphExecDestroy(void *exec);
 const char *FastllmCudaGraphLastError();
 bool FastllmCudaGraphIsCapturing();
@@ -809,6 +811,42 @@ bool FastllmCudaDeepSeekV4HashRouteScoreGraph(const fastllm::Data &logits, fastl
 // Drop every per-device CUDA copy owned by a CPU route table. Data destruction
 // calls this before the object's address can be reused by another model.
 void FastllmCudaReleaseDeepSeekV4RouteTableCache(const fastllm::Data *routeTable);
+// ---- DeepSeek-V4.1 专用 kernel（src/devices/cuda/models/deepseekv41-kernels.cu）----
+bool FastllmCudaDeepSeekV41HcMix(const fastllm::Data &x, fastllm::Data &hcFn, fastllm::Data &hcScale,
+                                 fastllm::Data &hcBase, int hcMult, int sinkhornIters, float eps,
+                                 float normEps, fastllm::Data &pre, fastllm::Data &post, fastllm::Data &comb);
+bool FastllmCudaDeepSeekV41HcApplyPre(const fastllm::Data &x, const fastllm::Data &pre, fastllm::Data &y);
+// HcApplyPre + RMSNorm 的融合（结果与两步分开做逐 bit 相同；不支持的形状返回 false）
+bool FastllmCudaDeepSeekV41HcPreNorm(const fastllm::Data &x, const fastllm::Data &pre,
+                                     fastllm::Data &normWeight, float eps, fastllm::Data &output);
+bool FastllmCudaDeepSeekV41EngramApply(fastllm::Data &hidden, const fastllm::Data &kv,
+                                       fastllm::Data &qWeight, fastllm::Data &kWeight,
+                                       const fastllm::Data *mask, float eps, float clampValue);
+bool FastllmCudaDeepSeekV41RotaryQuant(fastllm::Data &x, int ropeDim, float ropeBase, int startPos,
+                                       int posStep, bool inverse, int originalSeqLen, float ropeFactor,
+                                       int betaFast, int betaSlow, int quantMode, int quantDim, int quantBlock);
+bool FastllmCudaDeepSeekV41Compress(const fastllm::Data &kv, const fastllm::Data *score,
+                                    fastllm::Data &normWeight, int ratio, float normEps, fastllm::Data &output);
+bool FastllmCudaDeepSeekV41IndexerScore(const fastllm::Data &q, const fastllm::Data &weights,
+                                        const fastllm::Data &k, int ratio, int startPos,
+                                        fastllm::Data &output);
+bool FastllmCudaDeepSeekV41CandidateBlocks(const fastllm::Data &score, int blockSize, int topkBlocks,
+                                           int ratio, int startPos, fastllm::Data &output);
+bool FastllmCudaDeepSeekV41IndexerTopK(const fastllm::Data &score, const fastllm::Data *candidates,
+                                       int topK, int ratio, int startPos, int blockSize, fastllm::Data &output);
+// DSpark 草稿侧的 markov head 整条链（src/devices/cuda/models/deepseekv41-dspark-kernels.cu）
+bool FastllmCudaDeepSeekV41MarkovChain(const fastllm::Data &logits, const fastllm::Data &embedWeight,
+                                       const fastllm::Data &headWeight, int anchorToken, int block,
+                                       std::vector<int> &outTokens, fastllm::Data &outEmbeds);
+bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, const fastllm::Data &chunkKV,
+                                           const fastllm::Data *ringKV, const fastllm::Data *compressedKV,
+                                           const fastllm::Data *cmpIdx, fastllm::Data &attnSink,
+                                           int windowSize, int startPos, float softmaxScale,
+                                           fastllm::Data &output);
+bool FastllmCudaDeepSeekV41WindowStore(const fastllm::Data &chunk, fastllm::Data &ring, int startPos, int windowSize);
+bool FastllmCudaDeepSeekV41QuantizeKV(const fastllm::Data &input, fastllm::Data &output,
+                                      int quantMode = 1, int quantBlock = 32);
+
 bool FastllmCudaDeepSeekV4HcPre(const fastllm::Data &x, fastllm::Data &hcFn,
                                 fastllm::Data &hcScale, fastllm::Data &hcBase,
                                 int hcMult, int sinkhornIters, float eps, float normEps,

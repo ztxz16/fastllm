@@ -22,6 +22,17 @@ namespace fastllm {
         const void *A, long lda, const void *B, long ldb,
         void *C, long ldc, int n, int m, int k, int st, int end,
         bool useScaleLookup, bool allScalesFuseMagic);
+
+    // AVX2+FMA fused NVFP4_BLOCK_32_E8M0 GEMM: decodes the packed FP4 weights
+    // into FP32 inside the registers instead of materialising a temporary
+    // BF16 tile.  Returns false when the build has no AVX2 support.
+    bool FastllmGemmBFloat16NVFP4Block32E8M0_AVX2(
+        const void *A, long lda, const void *B, long ldb,
+        void *C, long ldc, int n, int m, int k, int st, int end);
+
+    // True when this CPU can run the NVFP4 block-32 layout at full speed,
+    // i.e. either the AVX512-BF16 or the AVX2 fused kernel is usable.
+    bool NVFP4Block32E8M0CpuKernelAvailable();
     
     struct MultiThreadGemmOp : MultiThreadBaseOp {
         uint8_t *inputData;   // [n * m]

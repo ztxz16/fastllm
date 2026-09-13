@@ -6,6 +6,7 @@ from .dots_tool_parser import DotsToolParser
 from .deepseekv3_tool_parser import DeepSeekV3ToolParser
 from .deepseekv31_tool_parser import DeepSeekV31ToolParser
 from .deepseekv4_tool_parser import DeepSeekV4ToolParser
+from .deepseekv41_tool_parser import DeepSeekV41ToolParser
 from .glm4_moe_tool_parser import Glm4MoeModelToolParser
 #from .granite_20b_fc_tool_parser import Granite20bFCToolParser
 #from .granite_tool_parser import GraniteToolParser
@@ -46,6 +47,7 @@ __all__ = [
     "DeepSeekV3ToolParser",
     "DeepSeekV31ToolParser",
     "DeepSeekV4ToolParser",
+    "DeepSeekV41ToolParser",
     #"xLAMToolParser",
     #"MinimaxToolParser",
     "MinimaxM2ToolParser",

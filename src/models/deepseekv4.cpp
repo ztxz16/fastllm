@@ -7259,7 +7259,10 @@ namespace fastllm {
         num_hash_layers = GetIntWithFallback(this->weight, {"num_hash_layers", "n_hash_layers"}, num_hash_layers);
         num_nextn_predict_layers = GetIntWithFallback(this->weight, {"num_nextn_predict_layers", "n_mtp_layers"}, num_nextn_predict_layers);
 
-        dsparkTokens = std::max(0, EnvInt("FASTLLM_DSPARK_TOKENS", 0));
+        // DeepSeek-V4.1 的 mtp.* 与本类的内置 DSpark 同名但结构不同（markov head 是
+        // embed + head、草稿层 128 专家 top-3、目标层取自主干），由子类自行解析与实现。
+        dsparkTokens = UsesEmbeddedV4Dspark() ?
+                       std::max(0, EnvInt("FASTLLM_DSPARK_TOKENS", 0)) : 0;
         dsparkEnabled = dsparkTokens > 0;
         if (dsparkEnabled) {
             // The model-specific scheduler can drain several already-verified

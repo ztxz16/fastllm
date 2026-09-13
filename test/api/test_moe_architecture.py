@@ -66,6 +66,23 @@ class MoeArchitectureTest(unittest.TestCase):
         )
         self.assertFalse(_prefers_multicuda_tp("UnknownArchitecture", "laguna"))
 
+    def test_deepseek_v4_uses_multicuda_tp(self):
+        self.assertTrue(_prefers_multicuda_tp("DeepseekV4ForCausalLM"))
+        self.assertTrue(
+            _prefers_multicuda_tp("UnknownArchitecture", "deepseek_v4")
+        )
+
+    def test_deepseek_v41_uses_multicuda_tp(self):
+        self.assertTrue(_prefers_multicuda_tp("DeepseekV41ForCausalLM"))
+        self.assertTrue(
+            _prefers_multicuda_tp("UnknownArchitecture", "deepseek_v41")
+        )
+        self.assertTrue(
+            _prefers_multicuda_tp(
+                "UnknownArchitecture", "unknown", "deepseek_v41_text"
+            )
+        )
+
     def test_dense_model_is_not_moe(self):
         self.assertFalse(
             _is_moe_architecture("LlamaForCausalLM", "llama")

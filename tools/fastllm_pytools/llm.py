@@ -1,5 +1,6 @@
 import ctypes
 import concurrent.futures
+import functools
 import math
 import os
 import glob
@@ -67,6 +68,19 @@ except ImportError:
         build_step3p7_prompt,
         normalize_step3p7_conversation,
         prepare_step3p7_multimodal_inputs,
+    )
+
+try:
+    from .deepseek_v41_multimodal import (
+        build_deepseek_v41_multimodal_payload,
+        normalize_deepseek_v41_conversation,
+        prepare_deepseek_v41_multimodal_inputs,
+    )
+except ImportError:
+    from deepseek_v41_multimodal import (
+        build_deepseek_v41_multimodal_payload,
+        normalize_deepseek_v41_conversation,
+        prepare_deepseek_v41_multimodal_inputs,
     )
 
 try:
@@ -1097,6 +1111,37 @@ def apply_hf_chat_template(tokenizer, conversation, add_generation_prompt = True
         ret = ret.tolist()
     return ret
 
+# transformers 会对这些模型真的去修补 pre_tokenizer 的正则，别去动它们。
+_MISTRAL_TOKENIZER_MODEL_TYPES = {
+    "mistral", "mistral3", "voxtral", "ministral", "pixtral",
+}
+
+
+def _hf_tokenizer_compat_kwargs(path):
+    """transformers>=5 对缺少 transformers_version 的本地目录会报 fix_mistral_regex 告警。
+
+    这个告警只是提示（不传该参数时 transformers 并不会改动 tokenizer），但对
+    DeepSeek 这类非 Mistral 模型是纯噪音——本地转换/裁剪出来的目录几乎都没有
+    transformers_version 字段。显式传 fix_mistral_regex=False 表示“确认不需要
+    这个修补”，从源头消掉告警，同时把行为固定下来，不再依赖调用处的全局
+    logging.disable。
+    """
+    try:
+        import transformers
+        if int(str(transformers.__version__).split(".")[0]) < 5:
+            return {}
+        config_path = os.path.join(path, "config.json")
+        if not os.path.isfile(config_path):
+            return {}
+        with open(config_path, encoding = "utf-8") as config_file:
+            model_type = str(json.load(config_file).get("model_type", ""))
+        if model_type in _MISTRAL_TOKENIZER_MODEL_TYPES:
+            return {}
+        return {"fix_mistral_regex": False}
+    except Exception:
+        return {}
+
+
 def try_load_hf_tokenizer(path):
     if _is_step3p5_model_dir(path):
         ret = _load_fast_tokenizer_from_tokenizer_json(path)
@@ -1114,7 +1159,9 @@ def try_load_hf_tokenizer(path):
             # 2. 完全禁止所有 logging 输出
             logging.disable(logging.CRITICAL)  # 禁用所有日志（包括 ERROR, WARNING, INFO, DEBUG）
             from transformers import AutoTokenizer
-            ret = AutoTokenizer.from_pretrained(path, trust_remote_code = True)
+            ret = AutoTokenizer.from_pretrained(
+                path, trust_remote_code = True,
+                **_hf_tokenizer_compat_kwargs(path))
         finally:
             logging.disable(original_level)  # 恢复原来的日志级别
             if original_use_torch is None:
@@ -1302,6 +1349,7 @@ class model:
                         self.hf_tokenizer.chat_template = chat_template
                         self.force_chat_template = True
                 skip_tokenizer = self._has_hf_chat_template()
+                self._prepare_deepseek_v41_engram_meta(path)
                 if model_json != "":
                     self.model = fastllm_lib.create_llm_model_fromhf_with_config(
                         path.encode(), fastllm_data_type_dict[dtype], int4g_groupcnt,
@@ -1557,7 +1605,42 @@ class model:
             enable_thinking=enable_thinking,
         )
 
+    def _prepare_deepseek_v41_engram_meta(self, path: str) -> None:
+        """DeepSeek-V4.1 的 Engram 哈希依赖 tokenizer 归一化派生的 token 映射，
+        C++ 侧在加载时读取 engram_meta.json；这里在模型创建前保证它存在。"""
+        config_path = os.path.join(path, "config.json")
+        if not os.path.isfile(config_path):
+            return
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+        except Exception:
+            return
+        model_type = str(config.get("model_type", ""))
+        if model_type not in ("deepseek_v41", "deepseek_v41_text"):
+            return
+        if os.environ.get("FASTLLM_DSV41_ENGRAM_META"):
+            return
+        try:
+            from ftllm.deepseek_v41_engram import ensure_engram_meta
+            meta_path = ensure_engram_meta(path)
+            os.environ["FASTLLM_DSV41_ENGRAM_META"] = meta_path
+        except Exception as e:
+            print("[ftllm] warning: failed to prepare DeepSeek-V4.1 engram meta:", e)
+
+    def _is_deepseek_v41(self) -> bool:
+        if self._get_architecture() == "DeepseekV41ForCausalLM":
+            return True
+        try:
+            mt = self.config.get("model_type", "") if isinstance(getattr(self, "config", None), dict) else ""
+            return str(mt) in ("deepseek_v41", "deepseek_v41_text")
+        except Exception:
+            return False
+
     def _is_deepseek_v4(self) -> bool:
+        """DeepSeek-V4 系列（含 V4.1）：共用 encoding 风格的 prompt 渲染与工具调用处理。"""
+        if self._is_deepseek_v41():
+            return True
         if self._get_architecture() == "DeepseekV4ForCausalLM":
             return True
         try:
@@ -1565,6 +1648,21 @@ class model:
             return str(mt) == "deepseek_v4"
         except Exception:
             return False
+
+    def _deepseek_encode_messages(self, reasoning_effort = None):
+        """返回与当前模型版本匹配的官方 encode_messages（V4.1 的 DSML 标签与 V4 不同）。
+
+        V4.1 额外支持数值 reasoning effort（1-100 或 low/high/max），由服务端
+        透传进来；V4 的 encode_messages 没有这个参数，忽略即可。
+        """
+        if self._is_deepseek_v41():
+            from ftllm.encoding_dsv41 import encode_messages
+            if reasoning_effort is not None:
+                return functools.partial(
+                    encode_messages, reasoning_effort = reasoning_effort)
+            return encode_messages
+        from ftllm.encoding_dsv4 import encode_messages
+        return encode_messages
 
     def _uses_hf_deepseek_v4_tokenizer(self) -> bool:
         """Use the checkpoint tokenizer after rendering the official V4 prompt.
@@ -1657,6 +1755,28 @@ class model:
         messages.insert(0, {"role": "system", "tools": tools})
         return messages
 
+    def _prepare_deepseek_v41_multimodal(self, conversation, images, tools, enable_thinking,
+                                         reasoning_effort = None):
+        """DeepSeek-V4.1 图文输入：官方 encode_messages 渲染带占位符的 prompt，再展开图像 span。
+        有 HF tokenizer 时与纯文本路径一样用它编码，否则退回 fastllm 原生 tokenizer。"""
+        from ftllm.encoding_dsv41 import encode_messages
+        if self.hf_tokenizer is not None:
+            encode_fn = lambda prompt: encode_hf_prompt(self.hf_tokenizer, prompt)
+        else:
+            encode_fn = lambda prompt: self.encode(prompt)
+        conversation = normalize_deepseek_v41_conversation(copy.deepcopy(conversation), len(images))
+        conversation = self._inject_deepseek_v4_tools(conversation, tools)
+        thinking_mode = "thinking" if enable_thinking else "chat"
+        return prepare_deepseek_v41_multimodal_inputs(
+            conversation = conversation,
+            images = images,
+            model_config = self.config,
+            encode_messages = encode_messages,
+            encode_fn = encode_fn,
+            thinking_mode = thinking_mode,
+            reasoning_effort = reasoning_effort,
+        )
+
     def get_prompt(self,
                    query: str,
                    history: List[Tuple[str, str]] = None) -> str:
@@ -1666,7 +1786,7 @@ class model:
 
         # DeepSeek-V4 系列模型未提供 Jinja chat_template，使用官方 encoding_dsv4 编码
         if (self._is_deepseek_v4() and not self.force_chat_template):
-            from ftllm.encoding_dsv4 import encode_messages
+            encode_messages = self._deepseek_encode_messages()
             thinking_mode = "thinking" if self.enable_thinking else "chat"
             return encode_messages(self._build_messages(query, history), thinking_mode=thinking_mode)
 
@@ -1865,6 +1985,12 @@ class model:
                 architecture = self.config["architectures"][0]
             except:
                 architecture = ""
+            if self._is_deepseek_v41():
+                if multimodal_videos:
+                    raise ValueError("DeepSeek-V4.1 does not support video input.")
+                native_inputs = self._prepare_deepseek_v41_multimodal(
+                    conversation, multimodal_images, tools, enable_thinking, thinking_effort)
+                return len(native_inputs["input_ids"])
             if architecture == "Gemma4ForConditionalGeneration":
                 if self.hf_tokenizer is None:
                     raise ValueError("Gemma4 multimodal token counting needs a Hugging Face tokenizer.")
@@ -1928,7 +2054,7 @@ class model:
         except:
             architecture = ""
         if self._uses_hf_deepseek_v4_tokenizer():
-            from ftllm.encoding_dsv4 import encode_messages
+            encode_messages = self._deepseek_encode_messages(thinking_effort)
             thinking_mode = "thinking" if enable_thinking else "chat"
             rendered_conversation = self._inject_deepseek_v4_tools(
                 copy.deepcopy(conversation), tools)
@@ -2031,7 +2157,7 @@ class model:
             return len(input_ids)
         else:
             if self._is_deepseek_v4() and not self.force_chat_template:
-                from ftllm.encoding_dsv4 import encode_messages
+                encode_messages = self._deepseek_encode_messages()
                 thinking_mode = "thinking" if enable_thinking else "chat"
                 prompt = encode_messages(conversation, thinking_mode=thinking_mode)
             elif self._is_qwen35():
@@ -2193,7 +2319,7 @@ class model:
                 prompt = ""
                 if (conversation != None and len(conversation) != 0):
                     if self._uses_hf_deepseek_v4_tokenizer():
-                        from ftllm.encoding_dsv4 import encode_messages
+                        encode_messages = self._deepseek_encode_messages()
                         thinking_mode = (
                             "thinking" if self.enable_thinking else "chat")
                         prompt = encode_messages(
@@ -2236,7 +2362,7 @@ class model:
                     prompt = self._render_qwen35_text_prompt(
                         conversation, add_generation_prompt)
                 elif self._is_deepseek_v4() and not self.force_chat_template:
-                    from ftllm.encoding_dsv4 import encode_messages
+                    encode_messages = self._deepseek_encode_messages()
                     thinking_mode = "thinking" if self.enable_thinking else "chat"
                     prompt = encode_messages(conversation, thinking_mode=thinking_mode)
                 else:
@@ -2379,6 +2505,26 @@ class model:
                                                             des.encode(), (ctypes.c_float * len(image))(*image),
                                                             max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty,
                                                             False, stop_token_len, stop_token_list)
+                return handle
+            elif self._is_deepseek_v41():
+                if (len(multimodal_videos) > 0):
+                    raise ValueError("DeepSeek-V4.1 does not support video input.")
+                if (conversation is None or len(conversation) == 0):
+                    prompt_text = query if self.direct_query else self.get_prompt(query, history)
+                    conversation = [{"role": "user", "content": prompt_text}]
+                native_inputs = self._prepare_deepseek_v41_multimodal(
+                    conversation, multimodal_images, tools, enable_thinking, thinking_effort)
+                payload_config, payload = build_deepseek_v41_multimodal_payload(native_inputs)
+                payload_json = json.dumps(payload_config)
+                payload_buffer = ctypes.create_string_buffer(payload) if payload else None
+                input = native_inputs["input_ids"]
+                stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
+                handle = fastllm_lib.launch_response_llm_model_multimodal(
+                    self.model, len(input), (ctypes.c_int * len(input))(*input),
+                    payload_json.encode(), payload_buffer,
+                    max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty,
+                    False, stop_token_len, stop_token_list
+                )
                 return handle
             elif (architecture == "Gemma4ForConditionalGeneration"):
                 tokenizer = self.hf_tokenizer
@@ -2533,7 +2679,8 @@ class model:
                     input = pending_text_input_token_cache["input_ids"]
                 elif (conversation != None and len(conversation) != 0):
                     if self._uses_hf_deepseek_v4_tokenizer():
-                        from ftllm.encoding_dsv4 import encode_messages
+                        encode_messages = self._deepseek_encode_messages(
+                            thinking_effort)
                         thinking_mode = (
                             "thinking" if enable_thinking else "chat")
                         rendered_conversation = self._inject_deepseek_v4_tools(
@@ -2591,7 +2738,8 @@ class model:
                     prompt = self._render_qwen35_text_prompt(
                         conversation, add_generation_prompt, enable_thinking)
                 elif self._is_deepseek_v4() and not self.force_chat_template:
-                    from ftllm.encoding_dsv4 import encode_messages
+                    encode_messages = self._deepseek_encode_messages(
+                        thinking_effort)
                     thinking_mode = "thinking" if enable_thinking else "chat"
                     conversation = self._inject_deepseek_v4_tools(conversation, tools)
                     prompt = encode_messages(conversation, thinking_mode=thinking_mode)

@@ -9,6 +9,7 @@
 #include "devices/cpu/kimi_k3_ops.h"
 
 #include <cstring>
+#include <cstdlib>
 #include <thread>
 #include <chrono>
 
@@ -392,6 +393,17 @@ namespace fastllm {
         this->ops["DeepSeekV4BuildCompressedKVFromRaw"] = (BaseOperator*)(new CpuDeepSeekV4BuildCompressedKVFromRawOp());
         this->ops["DeepSeekV4StoreWindowKVCache"] = (BaseOperator*)(new CpuDeepSeekV4StoreWindowKVCacheOp());
         this->ops["DeepSeekV4UpdateWindowKVCache"] = (BaseOperator*)(new CpuDeepSeekV4UpdateWindowKVCacheOp());
+        this->ops["DeepSeekV41HcMix"] = (BaseOperator*)(new CpuDeepSeekV41HcMixOp());
+        this->ops["DeepSeekV41HcApplyPre"] = (BaseOperator*)(new CpuDeepSeekV41HcApplyPreOp());
+        this->ops["DeepSeekV41EngramApply"] = (BaseOperator*)(new CpuDeepSeekV41EngramApplyOp());
+        this->ops["DeepSeekV41RotaryQuant"] = (BaseOperator*)(new CpuDeepSeekV41RotaryQuantOp());
+        this->ops["DeepSeekV41Compress"] = (BaseOperator*)(new CpuDeepSeekV41CompressOp());
+        this->ops["DeepSeekV41IndexerScore"] = (BaseOperator*)(new CpuDeepSeekV41IndexerScoreOp());
+        this->ops["DeepSeekV41CandidateBlocks"] = (BaseOperator*)(new CpuDeepSeekV41CandidateBlocksOp());
+        this->ops["DeepSeekV41IndexerTopK"] = (BaseOperator*)(new CpuDeepSeekV41IndexerTopKOp());
+        this->ops["DeepSeekV41SparseAttention"] = (BaseOperator*)(new CpuDeepSeekV41SparseAttentionOp());
+        this->ops["DeepSeekV41WindowStore"] = (BaseOperator*)(new CpuDeepSeekV41WindowStoreOp());
+        this->ops["DeepSeekV41QuantizeKV"] = (BaseOperator*)(new CpuDeepSeekV41QuantizeKVOp());
         this->ops["Cat"] = (BaseOperator*)(new CpuCatOp());
         this->ops["Pad"] = (BaseOperator*)(new CpuPadOp());
         this->ops["CatDirect"] = (BaseOperator*)(new CpuCatDirectOp());
@@ -668,6 +680,25 @@ namespace fastllm {
                 }
             }
         }
+    }
+
+    // The fused AVX2 kernel replaces the "dequantise the whole tile to BF16
+    // and run a BF16 GEMM" fallback used on CPUs without AVX512-BF16.  It is
+    // only profitable while the activation is narrow enough that the decoded
+    // weights cannot be amortised over many rows; wider GEMMs keep the old
+    // path.  FASTLLM_NVFP4_BLOCK32_AVX2_MAX_ROWS tunes the crossover and
+    // FASTLLM_DISABLE_NVFP4_BLOCK32_AVX2 restores the previous behaviour.
+    static int NVFP4Block32Avx2MaxRows() {
+        static const int value = []() {
+            if (!cpuInstructInfo.hasAVX2 ||
+                std::getenv("FASTLLM_DISABLE_NVFP4_BLOCK32_AVX2") != nullptr) {
+                return 0;
+            }
+            const char *env =
+                std::getenv("FASTLLM_NVFP4_BLOCK32_AVX2_MAX_ROWS");
+            return env != nullptr ? std::max(0, atoi(env)) : 32;
+        }();
+        return value;
     }
 
     template <int COLS, bool INPUT_BF16, bool SCALE_E8M0, bool PLANAR = false>
@@ -1756,6 +1787,13 @@ namespace fastllm {
             std::vector <uint16_t, alignedAllocator<uint16_t, 64> > dots3GatheredInput, dots3DownInput;
     } fastllmMoeDataManager;
 
+    // Registration code asks this before choosing between the compact
+    // block-32 layout and the block-16 one: the block-32 layout is only worth
+    // it when a fused kernel can consume it without a dequantisation buffer.
+    bool NVFP4Block32E8M0CpuKernelAvailable() {
+        return cpuInstructInfo.hasAVX512BF16 || NVFP4Block32Avx2MaxRows() > 0;
+    }
+
     void FastllmGemm (int n, int m, int k, 
         const void *A, long lda, // A [n * m], lda = bytes for 1 row in A
         const void *B, long ldb, // B [k * m], ldb = bytes for 1 row in B
@@ -1879,6 +1917,13 @@ namespace fastllm {
                     }
                     if (n <= 31 && cpuInstructInfo.hasAVX512BF16 &&
                         FastllmGemmBFloat16NVFP4Block32E8M0_AVX512BF16(
+                            bf16A_temp.data(), m * (long)sizeof(uint16_t),
+                            B, ldb, C, ldc, n, m, k, st, end)) {
+                        finish = true;
+                        return;
+                    }
+                    if (n <= NVFP4Block32Avx2MaxRows() &&
+                        FastllmGemmBFloat16NVFP4Block32E8M0_AVX2(
                             bf16A_temp.data(), m * (long)sizeof(uint16_t),
                             B, ldb, C, ldc, n, m, k, st, end)) {
                         finish = true;
@@ -2067,6 +2112,21 @@ namespace fastllm {
                         finish = true;
                         return;
                     }
+                    if (n <= NVFP4Block32Avx2MaxRows() &&
+                        FastllmGemmBFloat16NVFP4Block32E8M0_AVX2(
+                            A, lda, B, ldb, C, ldc,
+                            n, m, k, st, end)) {
+                        finish = true;
+                        return;
+                    }
+                    static const bool tracedFallback = []() {
+                        if (std::getenv("FASTLLM_NVFP4_BLOCK32_TRACE") != nullptr) {
+                            printf("[Fastllm] NVFP4 block-32: falling back to "
+                                   "dequantise-then-BF16-GEMM.\n");
+                        }
+                        return true;
+                    }();
+                    (void)tracedFallback;
                     std::vector<uint16_t> bf16B_temp(
                         (size_t)(end - st) * m);
                     NVFP4Block32RowsToBFloat16(

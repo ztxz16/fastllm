@@ -208,7 +208,7 @@ file(GLOB CPU_DEVICE_FILES "src/devices/cpu/*.cpp")
 set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/contextconfig.cpp src/executor.cpp src/template.cpp src/graph.cpp src/tokenizer.cpp
         src/devices/disk/diskdevice.cpp
         src/models/graphllm.cpp src/models/chatglm.cpp src/models/moss.cpp src/models/llama.cpp src/models/qwen.cpp src/models/basellm.cpp
-        src/models/glm.cpp src/models/minicpm.cpp src/models/minicpm3.cpp src/models/internlm2.cpp src/models/bert.cpp src/models/moe.cpp src/models/deepseekv2.cpp src/models/deepseekv4.cpp src/models/dots3_note.cpp
+        src/models/glm.cpp src/models/minicpm.cpp src/models/minicpm3.cpp src/models/internlm2.cpp src/models/bert.cpp src/models/moe.cpp src/models/deepseekv2.cpp src/models/deepseekv4.cpp src/models/deepseekv41.cpp src/models/deepseekv41_vision.cpp src/models/deepseekv41_dspark.cpp src/models/dots3_note.cpp
         src/models/phi3.cpp src/models/xlmroberta.cpp src/models/cogvlm.cpp src/models/qwen3.cpp src/models/qwen3_moe.cpp src/models/hy_v3.cpp src/models/qwen3_next.cpp src/models/qwen4_exp.cpp src/models/kimi_k3.cpp
         src/models/minimax.cpp src/models/hunyuan.cpp
         src/models/ernie4_5.cpp src/models/pangu_moe.cpp src/models/glm4_moe.cpp src/models/glm5_moe_dsa.cpp src/models/glm5_next.cpp src/models/gpt_oss.cpp
@@ -381,6 +381,8 @@ if (USE_CUDA)
         src/devices/cuda/linear/fastllm-linear-int4nozero.cu
         src/devices/cuda/models/dots3-note-kernels.cu
         src/devices/cuda/models/deepseekv4-kernels.cu
+        src/devices/cuda/models/deepseekv41-kernels.cu
+        src/devices/cuda/models/deepseekv41-dspark-kernels.cu
         src/devices/cuda/models/qwen4-kernels.cu)
 
     if (FASTLLM_DEEPGEMM_FP8_SM90_ENABLED AND NOT CUDA_NO_TENSOR_CORE AND
@@ -668,6 +670,16 @@ if (UNIT_TEST)
 
     add_executable(regressionOps test/ops/regressionOps.cpp)
     target_link_libraries(regressionOps fastllm)
+    add_executable(nvfp4Block32GemmRegression test/ops/nvfp4Block32GemmRegression.cpp)
+    target_link_libraries(nvfp4Block32GemmRegression fastllm)
+    add_test(NAME nvfp4_block32_gemm COMMAND nvfp4Block32GemmRegression)
+    add_executable(deepseekV41OpsRegression test/ops/deepseekV41OpsRegression.cpp)
+    target_link_libraries(deepseekV41OpsRegression fastllm)
+    if (USE_CUDA)
+        target_include_directories(deepseekV41OpsRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    endif()
+    add_test(NAME deepseek_v41_ops COMMAND deepseekV41OpsRegression)
+    set_tests_properties(deepseek_v41_ops PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
     add_executable(contextExtensionRegression test/ops/contextExtension.cpp)
     target_link_libraries(contextExtensionRegression fastllm)
     add_test(NAME context_extension_cpu COMMAND contextExtensionRegression)

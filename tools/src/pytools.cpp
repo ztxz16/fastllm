@@ -272,13 +272,27 @@ extern "C" {
 
     static bool is_supported_tool_call_constraint_format(
             const std::string &format) {
-        return format == "deepseek_v4_dsml" || format == "dots_xml";
+        return format == "deepseek_v4_dsml" ||
+               format == "deepseek_v41_dsml" || format == "dots_xml";
     }
 
     static std::vector<std::string> default_tool_call_name_prefixes(
             const std::string &format, bool parameter) {
         if (format == "dots_xml") {
             return {parameter ? "<parameter name=\"" : "<invoke name=\""};
+        }
+        if (format == "deepseek_v41_dsml") {
+            // V4.1 renames every DSML tag with a leading space.
+            if (parameter) {
+                return {
+                    "<｜DSML｜ parameter name=\"",
+                    "<\\DSML\\ parameter name=\"",
+                };
+            }
+            return {
+                "<｜DSML｜ invoke name=\"",
+                "<\\DSML\\ invoke name=\"",
+            };
         }
         if (parameter) {
             return {
@@ -1015,7 +1029,7 @@ extern "C" {
             fastllm::Data *mmTokenTypeIdsData = new fastllm::Data();
             mmTokenTypeIdsData->CopyFrom(fastllm::Data(fastllm::DataType::FLOAT32, mmTypeShape, mmTokenTypeIds));
             (*multimodalInput)["mm_token_type_ids"].push_back(mmTokenTypeIdsData);
-        } else if (mode == "qwen35") {
+        } else if (mode == "qwen35" || mode == "deepseek_v41") {
             if (multimodal_config["tensors"].is_array()) {
                 for (auto &tensorNode : multimodal_config["tensors"].array_items()) {
                     addTypedPayloadTensor(

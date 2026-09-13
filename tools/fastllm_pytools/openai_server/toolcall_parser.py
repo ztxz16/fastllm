@@ -752,6 +752,8 @@ class FunctionCallParser:
         return bool(_get_value(self._tool_function(name), "strict"))
 
     def _constraint_type(self) -> str:
+        if self.tool_parser_name in {"deepseek_v41", "deepseek_v41_text"}:
+            return "deepseek_v41_dsml"
         if self.tool_parser_name == "deepseek_v4":
             return "deepseek_v4_dsml"
         if self.tool_parser_name in {"dots", "dots3_note"}:

@@ -85,6 +85,7 @@
 | deepseek-ai/Deepseek-Coder-6.7B-Instruct    | [✔](llama_cookbook.md#deepseek-coder) | [✔](llama_cookbook.md#deepseek-coder) | ✔ |
 | deepseek-ai/Deepseek-Coder-7B-Instruct v1.5 | [✔](llama_cookbook.md#deepseek-coder) | [✔](llama_cookbook.md#deepseek-coder) | ✔ |
 | deepseek-ai/deepseek-coder-33b-instruct     | [√](llama_cookbook.md#deepseek-coder) | [√](llama_cookbook.md#deepseek-coder) | ✔ |
+| deepseek-ai/DeepSeek-V4.1-Flash（[说明](deepseek_v41.md)） | ✔ | ✔ | ✔ |
 | deepseek-ai/DeepSeek-V2-Chat                | √ | ✔ | √ |
 | deepseek-ai/DeepSeek-V2-Lite-Chat           | √ | ✔ | ✔ |
 | deepseek-ai/DeepSeek-Coder-V2-Instruct      | √ | ✔ | √ |
