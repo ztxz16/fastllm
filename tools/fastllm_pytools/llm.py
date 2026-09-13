@@ -2025,6 +2025,9 @@ class model:
                     enable_thinking = enable_thinking,
                     encode_vision = False,
                     encode_fn = self.encode,
+                    tools = tools,
+                    tool_choice = tool_choice,
+                    chat_template_kwargs = chat_template_kwargs,
                 )
                 return len(native_inputs["input_ids"])
             if architecture == "Step3p7ForConditionalGeneration":
@@ -2590,6 +2593,9 @@ class model:
                     add_generation_prompt = add_generation_prompt,
                     enable_thinking = enable_thinking,
                     encode_fn = self.encode,
+                    tools = tools,
+                    tool_choice = tool_choice,
+                    chat_template_kwargs = chat_template_kwargs,
                 )
                 payload_config, payload = build_qwen35_multimodal_payload(
                     native_inputs, tokenizer, model_config = self.config

@@ -1428,6 +1428,9 @@ class FastLLmCompletion:
               enable_thinking = enable_thinking,
               encode_vision = False,
               encode_fn = self.model.encode,
+              tools = tools,
+              tool_choice = tool_choice,
+              chat_template_kwargs = chat_template_kwargs,
           )
           return len(native_inputs["input_ids"])
       if architecture == "Step3p7ForConditionalGeneration":
@@ -2086,17 +2089,19 @@ class FastLLmCompletion:
           item_type = item.get("type")
           if item_type == "function_call":
               call_id = item.get("call_id") or item.get("id") or f"call_{shortuuid.random()}"
-              messages.append({
-                  "role": "assistant",
-                  "content": None,
-                  "tool_calls": [{
-                      "id": call_id,
-                      "type": "function",
-                      "function": {
-                          "name": item.get("name", ""),
-                          "arguments": item.get("arguments", "{}"),
-                      },
-                  }],
+              # Responses represents one assistant turn as separate text and
+              # function-call items. Keep them together for chat templates;
+              # splitting them inserts an end-of-turn marker after a progress
+              # note and teaches subsequent generations to stop there too.
+              if not messages or messages[-1].get("role") != "assistant":
+                  messages.append({"role": "assistant", "content": None})
+              messages[-1].setdefault("tool_calls", []).append({
+                  "id": call_id,
+                  "type": "function",
+                  "function": {
+                      "name": item.get("name", ""),
+                      "arguments": item.get("arguments", "{}"),
+                  },
               })
               continue
 
@@ -2126,10 +2131,17 @@ class FastLLmCompletion:
               role = item.get("role", "user")
               if role == "developer":
                   role = "system"
+              content = self._convert_responses_content_to_chat_content(
+                  item.get("content", ""))
+              if (role == "assistant" and messages
+                      and messages[-1].get("role") == "assistant"
+                      and messages[-1].get("content") is None
+                      and messages[-1].get("tool_calls")):
+                  messages[-1]["content"] = content
+                  continue
               messages.append({
                   "role": role,
-                  "content": self._convert_responses_content_to_chat_content(
-                      item.get("content", "")),
+                  "content": content,
               })
               continue
 

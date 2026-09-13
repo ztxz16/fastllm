@@ -264,6 +264,7 @@ CLI 会持续演进，`ftllm <command> --help` 是当前安装版本的最终依
 | --- | --- |
 | `model` / `-p, --path` | Hugging Face 仓库 ID、本地 HF 目录、FastLLM 模型文件或配置文件 |
 | `--device` | 主计算设备，常用值为 `cpu`、`cuda`、`numa` |
+| `--vision_device` | Qwen3.5 视觉编码器设备：`auto`（默认，首个前向 GPU）、`cpu`、`cuda`、`cuda:N`；`cpu` 时视觉塔权重常驻内存，省显存但编码变慢 |
 | `--tp` | CUDA 张量并行设备；支持 `0,1`、`2` 或 `auto` |
 | `--moe_device` | MoE 专家层设备，可使用 `cpu`、`cuda`、`numa`、`disk` 或按比例组合 |
 | `--moe_device_layers` | 仅让最后 N 个 MoE 层使用 `--moe_device`；`-1` 表示全部 |
