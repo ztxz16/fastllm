@@ -907,6 +907,14 @@ if (UNIT_TEST)
         add_test(NAME cuda_moe_cache COMMAND cuda_moe_cache_test)
         set_tests_properties(cuda_moe_cache PROPERTIES LABELS cuda)
 
+        if (USE_NUMAS)
+            add_executable(cuda_dsv41_moe_cache_test test/basic/test_cuda_dsv41_moe_cache.cu)
+            target_link_libraries(cuda_dsv41_moe_cache_test PRIVATE fastllm)
+            set_target_properties(cuda_dsv41_moe_cache_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+            add_test(NAME cuda_dsv41_moe_cache COMMAND cuda_dsv41_moe_cache_test)
+            set_tests_properties(cuda_dsv41_moe_cache PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+        endif()
+
         add_executable(cuda_fp4_kv_test test/basic/test_cuda_fp4_kv.cu)
         target_link_libraries(cuda_fp4_kv_test PRIVATE fastllm)
         set_target_properties(cuda_fp4_kv_test PROPERTIES

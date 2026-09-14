@@ -246,6 +246,7 @@ namespace fastllm {
         bool UseModelSpecificScheduler() const override { return false; }
 
     protected:
+        bool moeExpertCacheAttempted = false;
         // Source FP8/FP4 linears still require block-32 FP8 activations after
         // their weights have been decoded into the requested storage dtype.
         std::set<std::string> quantizedLinearNames;

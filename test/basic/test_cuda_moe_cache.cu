@@ -755,6 +755,18 @@ static void CheckDecodeScheduler() {
     Require(scheduler.SelectGpuCount(10, 10) == 10, "scheduler rejected a resident GPU batch");
     for (int n = 0; n < 100; ++n) scheduler.refill.Observe(300);
     Require(scheduler.SelectGpuCount(10, 0) == 0, "scheduler cannot fall back after transfer slowdown");
+    // All experts may be cached, while executing only some of them on CUDA
+    // is fastest. Never treat unused hits as negative refill costs.
+    fastllm::MoeDecodeScheduler partial;
+    partial.calls = 100;
+    partial.dispatch.Observe(5);
+    partial.refill.Observe(1000);
+    for (int n = 0; n <= 6; ++n) {
+        partial.cpu[n].Observe(n * 100);
+        partial.compute[n].Observe(n * 100);
+    }
+    Require(partial.SelectGpuCount(6, 6) == 3, "scheduler skipped the best resident subset");
+    Require(partial.SelectGpuCount(6, 2) == 2, "scheduler charged or credited nonexistent refills");
     fastllm::MoeDecodeScheduler::Estimate cold;
     cold.Observe(15000); cold.Observe(40);
     Require(cold.us == 40, "cold-start cost poisoned estimate");

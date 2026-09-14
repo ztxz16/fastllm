@@ -40,8 +40,11 @@ public:
         if (calls % 1021 == 0) return topk - (calls / 1021) % (topk + 1);
         int selected = 0;
         double best = cpu[topk].us;
-        for (int g = std::max(1, hits); g <= topk; ++g) {
-            const double gpuUs = ensure.us + compute[g].us + (g - hits) * refill.us;
+        // Residency removes refill cost; it does not require executing every
+        // resident expert on CUDA. A smaller resident subset can balance CPU
+        // and GPU work better than either all hits or the CPU-only choice.
+        for (int g = 1; g <= topk; ++g) {
+            const double gpuUs = ensure.us + compute[g].us + std::max(0, g - hits) * refill.us;
             const double expected = dispatch.us + std::max(cpu[topk - g].us, gpuUs);
             if (expected < best) { best = expected; selected = g; }
         }

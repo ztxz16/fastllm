@@ -1660,6 +1660,10 @@ bool FastllmCudaMergeMOENVFP4E4M3MarlinIndexed(
 struct FastllmCudaMoeCacheLayer {
     fastllm::Data *const *weights = nullptr;
     int weightsBatch = 0;
+    // Opt in explicitly: V4.1 applies scores before FP8 block-32 activation
+    // quantization and requires BF16 rounding at both projections.
+    bool deepSeekV41 = false;
+    float swigluLimit = 0.0f;
 };
 // One anchor plus up to eight speculative tokens. Larger prefill batches
 // keep using the configured MoE backend.
@@ -1677,8 +1681,8 @@ bool FastllmCudaPrepareMoeCache(
         const std::function<void()> &registerNumaWeights = {});
 bool FastllmCudaCanRunMoeCache(
         fastllm::Data **weights, int weightsBatch);
-// Eager single-token FP32 activation decode. Weight-format adapters execute
-// disjoint CPU/CUDA subsets; scheduling and top-k reduction are shared.
+// Eager single-token decode: generic FP32 or explicitly registered V4.1
+// BF16 math. Adapters execute disjoint CPU/CUDA subsets with shared scheduling.
 bool FastllmCudaCanRunMoeHybrid(fastllm::Data **weights, int weightsBatch);
 bool FastllmCudaMergeMOEHybrid(const fastllm::Data &input,
         const fastllm::Data &index, const fastllm::Data &score,

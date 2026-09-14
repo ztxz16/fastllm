@@ -9,20 +9,38 @@ record size, and device resource limits.
 
 Use `--moe_cuda_cache 5g` (alias `--moe-cuda-cache`) with CUDA compute and
 host/NUMA experts, or call `ftllm.llm.set_moe_cuda_cache(5 << 30)` before model
-loading. Zero disables the cache by default. The budget covers expert records;
+loading. Zero disables the cache by default. The budget covers expert records
+on each CUDA device that runs the cache;
 KV cache, common weights, workspaces and cache metadata are separate. Sizes
 use binary units and must fit in uint64. No cache-specific environment
 variables or experimental kernel switches are required. CUDA Graph uses the
 existing application setting.
 
-The adapter runs SwiGLU experts for one to nine tokens with FP32, FP16 or BF16
-activations:
+For unequal free memory, `FASTLLM_MOE_CUDA_CACHE_BYTES_<device>` overrides the
+budget on that logical CUDA device (after `CUDA_VISIBLE_DEVICES` remapping).
+Values are unsigned decimal **bytes**, without unit suffixes; unset or empty
+inherits the CLI/API budget. Zero disables that device's cache; invalid or
+overflowing values disable it with a warning. The global CLI/API budget must
+still enable cache preparation and hold at least 16 expert records. Device
+budgets are read when each cache is first used; change them before launching
+the model. For example, 12 GiB on logical GPU 0 and 2 GiB on logical GPU 1:
+
+```sh
+FASTLLM_MOE_CUDA_CACHE_BYTES_0=12884901888 \
+FASTLLM_MOE_CUDA_CACHE_BYTES_1=2147483648 \
+ftllm server /path/to/model --device "{'cuda:0':1,'cuda:1':1}" \
+  --moe_device numa --moe_cuda_cache 2g
+```
+
+The general adapters run SwiGLU experts for one to nine tokens with FP32, FP16
+or BF16 activations. The V4.1 adapter has a separate BF16 contract:
 
 | Expert weights | Host/cache record | Compute requirements |
 | --- | --- | --- |
 | `NVFP4_BLOCK_16_E4M3` | Packed E2M1 weights, planar E4M3 block scales, global scales | Existing compact NVFP4 adapter |
 | `FP8_E4M3` | Original E4M3 bytes and FP32 block-scale arrays for gate/up and down | Hidden/intermediate widths and column scale blocks divisible by 4 |
 | `FP8_E4M3_BLOCK_128` | Original interleaved 128-byte weight blocks and FP32 scales | Hidden/intermediate widths divisible by 128 |
+| DeepSeek V4.1 `NVFP4_BLOCK_32_E8M0` | 16 packed E2M1 bytes and one UE8M0 scale per 32 weights | BF16 decode and 2–8-row verification; NUMA weights and widths divisible by 32 |
 
 Records remain quantized; FP8 is not expanded to BF16 in the cache. FP8 slot
 pointer tables share one allocation before capture: two weight tables for
@@ -31,9 +49,10 @@ gate/up/down kernels read them. Cache lookup and refill produce slot IDs on the 
 changing routes do not require a per-token host pointer upload. All dependent
 work runs on `cudaStreamPerThread`.
 
-The model integration is currently in the Qwen4-Exp backbone used by
-Qwen3.8-Flash-Next. It snapshots host experts before deferred NUMA registration
-can repack or release their original storage. Prefill and unsupported layouts
+Model integration is available in DeepSeek V4.1 (described below) and the
+Qwen4-Exp backbone used by Qwen3.8-Flash-Next. Qwen4-Exp snapshots host experts
+before deferred NUMA registration can repack or release their original storage.
+Prefill and unsupported layouts
 retain the configured MoE backend. CPU-only and ROCm builds do not enable this
 NVIDIA CUDA adapter. A model must prepare its expert tables and call the cache
 dispatch/release interfaces to use the adapter; the CLI flag alone does not
@@ -71,6 +90,57 @@ For a native FP8 checkpoint, keep `--dtype auto` and use CUDA compute with
 experts than NVFP4 experts of the same shape. Capacity and performance should
 be measured per format. The mapped host snapshot also occupies system RAM in
 addition to storage used by the fallback backend.
+
+## DeepSeek V4.1
+
+Use CUDA for the main model and shared experts, and NUMA for the NVFP4 routed
+experts. A dual-GPU configuration with 8 GiB of cache on each device is:
+
+```sh
+FT_NUMAS=1 FASTLLM_DSV41_CUDA_GRAPH=0 numactl -C 0-31 -m 0 \
+  ftllm server /path/to/DeepSeek-V4.1-Flash \
+  --device "{'cuda:0':1,'cuda:1':1}" --moe_device numa --threads 30 \
+  --cuda_shared_expert true --moe_cuda_cache 8g
+```
+
+The cache borrows registered, pinned NUMA block-32 weights, without a separate
+host snapshot. The shared scheduler measures CPU/GPU compute and refill costs
+to choose disjoint expert subsets, preferring resident experts. Resident experts
+can remain on CPU when that gives a better split. A cache is not a guaranteed
+speedup: route reuse, capacity and PCIe transfers matter.
+
+Single-token decode and single-request DSpark verification with 2–8 BF16 rows
+automatically use the hybrid cache. Verify groups all rows for each expert on
+one backend, preserving CPU weight reuse, and offloads only resident groups.
+It admits at most one recurring cold expert after GPU computation when estimated
+CPU work can cover the copy. Verify has independent per-device buffers and cost
+estimates while sharing the decode cache and LRU state. Ordinary prefill, CUDA
+Graph, tensor parallelism and unsupported shapes retain the configured backend.
+The draft model does not use this routed-expert cache.
+
+Expert math preserves V4.1 block-32 FP8 activation quantization, SwiGLU clipping,
+route weighting before down-input quantization and per-expert BF16 rounding.
+Results accumulate in ascending expert-ID order in FP32 before final BF16
+rounding. CPU/GPU reduction can still introduce floating-point differences.
+The block-32 GPU prefill GEMM also accumulates into FP32 before its BF16 cast,
+preventing reduced-precision cuBLAS partial reductions. Source NVFP4 experts
+are registered before their first GPU prefill use, including when startup
+warmup is skipped. Keeping the default warmup moves this one-time packing
+cost out of the first request; `--moe_cuda_cache 0` disables the GPU cache.
+
+Optional diagnostics and tuning (the defaults require no environment flags):
+
+| Variable | Meaning |
+| --- | --- |
+| `FASTLLM_DSV41_MOE_CACHE_MODE=gpu` | Pure GPU cache for single-token decode; misses refill from NUMA. Default `hybrid`. Verify retains its NUMA fallback in pure mode. |
+| `FASTLLM_DSV41_MOE_CACHE_PREFETCH=N` | Single-token admission interval, default 31; adjusted to be coprime with the layer count. Zero disables admission for both decode and verify. Positive values enable cost-controlled verify admission each call. |
+| `FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS=N` | Override the measured split for diagnostics: 0–top-k decode routes, or up to 15 resident verify groups. Unset uses the scheduler. |
+| `FASTLLM_DSV41_MOE_CACHE_TRACE=1` | Per-device route, residency and admission counters every 1024 calls, for decode and verify. |
+
+Hybrid residency is resident routes divided by all routes; GPU-selected hits
+alone do not measure the whole workload. Pure mode reports actual cache hits
+and misses, synchronizing at entry and at reporting intervals. Pure mode can
+be slower when demand refill dominates.
 
 ## Metadata: `fastllm-cuda-expert-cache.cuh`
 
@@ -207,3 +277,10 @@ packing and CPU outputs with and without AVX512-BF16 across row-tile boundaries.
 
 Architecture compilation and execution are distinct checks: compiling these
 tests for another SM does not establish its runtime correctness or performance.
+
+The V4.1 `cuda_dsv41_moe_cache_test --dual` integration test uses an independent
+FP8/BF16 dense oracle for CPU subsets, hybrid/pure decode and 2–8-row verify.
+It covers all 4096 FP4 code/scale combinations, repeated and zero-weight routes,
+cold admission, eviction, CPU/GPU prefill, unregistered NVFP4 cold startup,
+asymmetric budgets and GPU 0/1/0 output
+movement. `--dual --verify-only` limits it to multirow verification.

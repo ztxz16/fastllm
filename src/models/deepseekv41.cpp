@@ -1171,6 +1171,7 @@ namespace fastllm {
     DeepSeekV41Model::~DeepSeekV41Model() {
         ShutdownRuntime();
         DsparkReportStats();
+        ReleaseMoeCudaCache(weights);
         {
             std::lock_guard<std::mutex> guard(v41StateMutex);
             v41States.clear();
@@ -3421,6 +3422,26 @@ namespace fastllm {
             }
         }
 
+#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
+        if (FastllmCudaMoeCacheRequested() && !moeExpertCacheAttempted) {
+            moeExpertCacheAttempted = true;
+            bool supported = !tp && !V41ReferenceMathEnabled() && GetCudaSharedExpert();
+            std::vector<std::vector<Data *>> routedWeights = weights;
+            std::vector<FastllmCudaMoeCacheLayer> cacheLayers;
+            for (int layer = 0; layer < block_cnt; ++layer) {
+                supported &= V41DeviceSpecUsesType(SelectMoeDeviceForLayer(layer), "numa") &&
+                    quantizedLinearNames.count("layers." + std::to_string(layer) + ".ffn.experts.0.w1.weight");
+                routedWeights[layer][0] = routedWeights[layer][1] = nullptr;
+                cacheLayers.push_back({routedWeights[layer].data(), (int)routedWeights[layer].size(), true, swiglu_limit});
+            }
+            if (!supported || !FastllmCudaPrepareMoeCache(cacheLayers.data(), block_cnt,
+                    [this] { WarmupNumaMoeWeights(); })) {
+                fprintf(stderr, "[Fastllm] V4.1 expert cache requires NUMA NVFP4 block32 experts, "
+                    "CUDA shared experts and ordinary single-GPU math; using the configured backend.\n");
+            }
+        }
+#endif
+
         // ---- embedding -> hc 份 ----
         // 图模式下这些张量来自常驻工作区，地址必须在两次 decode 之间保持不变。
         Data &hiddenStates = ws->hiddenStates;
@@ -4264,7 +4285,24 @@ namespace fastllm {
                     moeIndexPtr = &cpuMoeIndex;
                     moeScorePtr = &cpuMoeScore;
                 }
-                MergeMOEBlock(moeInputPtr, moeIndexPtr, moeScorePtr, &moeWeights, &biass[layer],
+                bool cacheHandled = false;
+#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
+                if (!tp && !graphActive && !V41ReferenceMathEnabled() && hasSharedExpertOut &&
+                    moeWeights[0] == nullptr && moeWeights[1] == nullptr &&
+                    V41DeviceSpecUsesType(moeDeviceSpec, "numa") &&
+                    moeInputPtr->dims.size() == 2 &&
+                    (moeInputPtr->dims[0] == 1 || (moeInputPtr->dims[0] <= 8 && single && segments[0].spec != nullptr &&
+                     segments[0].spec->wantAllTokens)) &&
+                    FastllmCudaCanRunMoeHybrid(moeWeights.data(), (int)moeWeights.size())) {
+                    // The 384-expert router can return CPU tensors. Upload its
+                    // small result before entering the device-cache adapter.
+                    moeIndexPtr->ToDevice(DataDevice::CUDA);
+                    moeScorePtr->ToDevice(DataDevice::CUDA);
+                    cacheHandled = FastllmCudaMergeMOEHybrid(*moeInputPtr, *moeIndexPtr, *moeScorePtr,
+                        ffnOut, moeWeights.data(), (int)moeWeights.size(), layer);
+                }
+#endif
+                if (!cacheHandled) MergeMOEBlock(moeInputPtr, moeIndexPtr, moeScorePtr, &moeWeights, &biass[layer],
                               &w1, &w2, &w3, &tempInput, &tempOutput, 1.0f, &ffnOut, layer,
                               ffnInput.dataType, ffnInput.dataType, &moeInputTemp, &moeOutputTemp,
                               MoeGateSwiglu, routedExpertParallel, swiglu_limit, true, nullptr,
