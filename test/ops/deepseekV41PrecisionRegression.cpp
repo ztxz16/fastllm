@@ -242,8 +242,8 @@ static std::vector<float> Expert(std::vector<float> x, bool quantized, float rou
         value = Bf(value * downCoefficient);
     return act;
 }
-static void MixedMoe() {
-    ApplyDeviceMap({{"cpu", 1}}, 0, 1);
+static void MixedMoe(bool numa = false) {
+    ApplyDeviceMap({{numa ? "numa" : "cpu", 1}}, 0, 1);
     constexpr int dim = 128;
     Data routedGate = RoutedWeight(2 * dim, dim), routedDown = RoutedWeight(dim, dim);
     std::vector<float> g(2 * dim * dim, 0.0f), d(dim * dim, 0.0f);
@@ -705,6 +705,9 @@ int main(int argc, char **argv) {
         ReferenceFp8BlockBoundary();
         ReferenceQuantizedLinearOrder();
         MixedMoe();
+#ifdef USE_NUMAS
+        if (argc > 1 && std::string(argv[1]) == "--numa") MixedMoe(true);
+#endif
         ReferenceMoeBatchOrder();
         NVFP4TokenReuseOrder();
         std::cout << "V4.1 precision regression PASS: " << checks << " checks\n";

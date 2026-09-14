@@ -4006,6 +4006,16 @@ bool FastllmCudaBFloat16MatMulNVFP4Block16E8M0(const fastllm::Data &input, fastl
 
     float h_alpha = 1.0f, h_beta = 0.0f;
     cudaDataType_t AType = CUDA_R_16BF, BType = CUDA_R_16BF, CType = CUDA_R_16BF, ComputeType = CUDA_R_32F;
+    // BF16 output lets cuBLAS reduce partial sums in BF16 even with FP32
+    // compute. V4.1 requires FP32 accumulation followed by one BF16 cast.
+    // A FP32 destination preserves that boundary without changing the shared
+    // cuBLAS handle's math mode or disabling tensor cores.
+    fastllm::Data floatOutput(fastllm::DataType::FLOAT32, {n, k});
+    if (block32) {
+        floatOutput.ToDevice(fastllm::DataDevice::CUDA);
+        floatOutput.Allocate();
+        CType = CUDA_R_32F;
+    }
     cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
     int dequantThreads = std::min(256, m);
 
@@ -4021,7 +4031,7 @@ bool FastllmCudaBFloat16MatMulNVFP4Block16E8M0(const fastllm::Data &input, fastl
                               &h_alpha, cudaBF16Weight, AType,
                               m, cudaInput, BType,
                               m, &h_beta,
-                              cudaOutput + kOff, CType,
+                              block32 ? (void*)((float*)floatOutput.cudaData + kOff) : (void*)(cudaOutput + kOff), CType,
                               k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
         if (status != CUBLAS_STATUS_SUCCESS) {
             printf("Error: cublas error (BFloat16MatMulNVFP4Block16E8M0).\n");
@@ -4030,6 +4040,9 @@ bool FastllmCudaBFloat16MatMulNVFP4Block16E8M0(const fastllm::Data &input, fastl
         }
     }
 
+    if (block32) {
+        FastllmFloatToBF16(floatOutput.cudaData, cudaOutput, (size_t)n * k);
+    }
     if (cudaBiasData != nullptr) {
         FastllmCudaBiasKernel <<< n, 256 >>>(cudaOutput, cudaBiasData, k);
     }

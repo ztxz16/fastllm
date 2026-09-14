@@ -37,7 +37,8 @@ namespace fastllm {
                                       bool setZero, const std::unordered_set<int> &experts,
                                       bool isCrossSwiglu, MoeGateType gateType,
                                       bool deepSeekV4Mode = false,
-                                      float swigluLimit = 0.0f);
+                                      float swigluLimit = 0.0f,
+                                      int activationQuantBlock = 128, bool quantizeSharedExpert = false);
 #endif
 
     DiskDevice::DiskDevice() {

@@ -894,6 +894,7 @@ bool DeepSeekV4PrepareWoAQuantizedInput(const fastllm::Data &input,
 // DeepSeek-V4 applies the routed score before its second dynamic activation
 // quantization; moving the score after the GEMM is not equivalent once the
 // UE8M0 scale and E4M3 rounding are observable.
+template<int QuantBlock>
 __global__ void DeepSeekV4PrepareMoeDownInputKernel(
         const __nv_bfloat16 *__restrict__ gateUp,
         __nv_bfloat16 *__restrict__ downInput,
@@ -901,10 +902,10 @@ __global__ void DeepSeekV4PrepareMoeDownInputKernel(
         int intermediateDimension, float swigluLimit, bool quantize) {
     __shared__ float warpMax[4];
     __shared__ float quantScale;
-    const int blocksPerRow = intermediateDimension / 128;
+    const int blocksPerRow = intermediateDimension / QuantBlock;
     const int row = blockIdx.x / blocksPerRow;
     const int blockInRow = blockIdx.x - row * blocksPerRow;
-    const int dimension = blockInRow * 128 + threadIdx.x;
+    const int dimension = blockInRow * QuantBlock + threadIdx.x;
     const uint64_t gateUpOffset =
         (uint64_t)row * intermediateDimension * 2 + dimension * 2;
     const uint64_t outputOffset =
@@ -941,14 +942,18 @@ __global__ void DeepSeekV4PrepareMoeDownInputKernel(
     }
     __syncthreads();
     if (warp == 0) {
-        maximum = lane < 4 ? warpMax[lane] : 0.0f;
+        maximum = lane < QuantBlock / 32 ? warpMax[lane] : 0.0f;
         for (int delta = 16; delta > 0; delta >>= 1) {
             maximum = fmaxf(
                 maximum,
                 __shfl_down_sync(0xffffffffu, maximum, delta));
         }
         if (lane == 0) {
-            quantScale = exp2f(ceilf(log2f(maximum / 448.0f)));
+            if constexpr (QuantBlock == 32) {
+                const unsigned bits = __float_as_uint(maximum / 448.0f);
+                const int exponent = int((bits >> 23) & 255) - 127 + ((bits & 0x7fffff) != 0);
+                quantScale = exp2f(float(exponent));
+            } else quantScale = exp2f(ceilf(log2f(maximum / 448.0f)));
         }
     }
     __syncthreads();
@@ -958,7 +963,7 @@ __global__ void DeepSeekV4PrepareMoeDownInputKernel(
 
 bool DeepSeekV4PrepareMoeDownInputImpl(
         const fastllm::Data &gateUp, fastllm::Data &downInput,
-        const float *routeScales, float swigluLimit, bool quantize) {
+        const float *routeScales, float swigluLimit, bool quantize, int activationQuantBlock) {
     if (gateUp.dataDevice != fastllm::DataDevice::CUDA ||
         gateUp.dataType != fastllm::DataType::BFLOAT16 ||
         gateUp.cudaData == nullptr || routeScales == nullptr ||
@@ -968,17 +973,23 @@ bool DeepSeekV4PrepareMoeDownInputImpl(
     }
     const int rows = gateUp.dims[0];
     const int intermediateDimension = gateUp.dims[1] / 2;
-    if ((intermediateDimension & 127) != 0 ||
+    if ((activationQuantBlock != 32 && activationQuantBlock != 128) ||
+        intermediateDimension % activationQuantBlock != 0 ||
         !DeepSeekV4PrepareCudaOutput(
             downInput, fastllm::DataType::BFLOAT16,
             {rows, intermediateDimension})) {
         return false;
     }
-    const int blocks = rows * intermediateDimension / 128;
-    DeepSeekV4PrepareMoeDownInputKernel<<<blocks, 128>>>(
-        (const __nv_bfloat16*)gateUp.cudaData,
-        (__nv_bfloat16*)downInput.cudaData,
-        routeScales, intermediateDimension, swigluLimit, quantize);
+    const int blocks = rows * intermediateDimension / activationQuantBlock;
+    if (activationQuantBlock == 32) {
+        DeepSeekV4PrepareMoeDownInputKernel<32><<<blocks, 32>>>(
+            (const __nv_bfloat16*)gateUp.cudaData, (__nv_bfloat16*)downInput.cudaData,
+            routeScales, intermediateDimension, swigluLimit, quantize);
+    } else {
+        DeepSeekV4PrepareMoeDownInputKernel<128><<<blocks, 128>>>(
+            (const __nv_bfloat16*)gateUp.cudaData, (__nv_bfloat16*)downInput.cudaData,
+            routeScales, intermediateDimension, swigluLimit, quantize);
+    }
     return cudaGetLastError() == cudaSuccess;
 }
 
@@ -7112,9 +7123,9 @@ bool DeepSeekV4LaunchHcHeadDotsByWeight(const fastllm::Data &x,
 
 extern "C" bool FastllmCudaDeepSeekV4PrepareMoeDownInput(
         const fastllm::Data &gateUp, fastllm::Data &downInput,
-        const float *routeScales, float swigluLimit, bool quantize) {
+        const float *routeScales, float swigluLimit, bool quantize, int activationQuantBlock) {
     return DeepSeekV4PrepareMoeDownInputImpl(
-        gateUp, downInput, routeScales, swigluLimit, quantize);
+        gateUp, downInput, routeScales, swigluLimit, quantize, activationQuantBlock);
 }
 
 extern "C" bool FastllmCudaDeepSeekV4DsparkMarkovLocalArgmax(

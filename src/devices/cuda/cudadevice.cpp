@@ -8811,7 +8811,9 @@ namespace fastllm {
 
     void DoCudaMergeMOEFromCPU (Data &input, Data &output, Data &index, Data &score, Data &w1, Data &w2, Data &w3, 
         Data **weights, Data **biass, float sharedScale, bool setZero, const std::unordered_set<int> &experts, bool isCrossSwiglu,
-        MoeGateType gateType, bool deepSeekV4Mode, float swigluLimit) {
+        MoeGateType gateType, bool deepSeekV4Mode, float swigluLimit,
+        int activationQuantBlock, bool quantizeSharedExpert) {
+        const bool deepSeekV41Mode = deepSeekV4Mode && activationQuantBlock == 32;
         int curDeviceId = FastllmCudaGetDevice();
         CudaMergeMoeFromCpuWorkspace &workspace =
             GetCudaMergeMoeFromCpuWorkspace(curDeviceId);
@@ -9035,6 +9037,21 @@ namespace fastllm {
             tempOutput.Allocate();
         }
 
+        if (deepSeekV41Mode) {
+            AssertInFastLLM(input.dataType == DataType::BFLOAT16 && output.dataType == DataType::BFLOAT16,
+                            "V4.1 NUMA GPU prefill requires BF16 activations.");
+            tempFloatOutput.dataType = DataType::FLOAT32;
+            tempFloatOutput.Resize(output.dims);
+            tempFloatOutput.ToDevice(DataDevice::CUDA, {curDeviceId}, false);
+            tempFloatOutput.Allocate(false);
+            floatOutput.dataType = DataType::FLOAT32;
+            floatOutput.Resize(output.dims);
+            floatOutput.ToDevice(DataDevice::CUDA, {curDeviceId}, false);
+            floatOutput.Allocate(false);
+            if (setZero) FastllmCudaMemset0(floatOutput.cudaData, floatOutput.GetBytes());
+            else FastllmBF16ToFloat(output.cudaData, floatOutput.cudaData, output.Count(0));
+        }
+
         void *copyStream = FastllmCudaStreamCreate(true);
         void *computeDoneEvent = FastllmCudaEventCreate();
         int curExpert = findNextValidExpert(-1);
@@ -9062,6 +9079,10 @@ namespace fastllm {
                 GetDataBytes(input.dataType, 1, input.dims[1]), 
                 cudaIndex + startIdx[i]
             );
+            if (deepSeekV41Mode && (i != 0 || quantizeSharedExpert)) {
+                AssertInFastLLM(FastllmCudaDeepSeekV41QuantizeActivation(tempInput, tempInput),
+                                "V4.1 GPU prefill input quantization failed.");
+            }
             if (accurateFp8Moe) {
                 int expertBatch = (int)expertTasks[i].size();
                 int hidden = tempInput.dims[1];
@@ -9105,8 +9126,8 @@ namespace fastllm {
                         FastllmCudaDeepSeekV4PrepareMoeDownInput(
                             tempMiddle, tempSwiglu,
                             cudaScales + startIdx[i], swigluLimit,
-                            IsDeepSeekV4CudaQuantizedWeight(
-                                *weights[i * 2 + 1])),
+                            IsDeepSeekV4CudaQuantizedWeight(*weights[i * 2 + 1]) ||
+                                (i == 0 && quantizeSharedExpert), activationQuantBlock),
                         "DeepSeek-V4 failed to prepare its CUDA MoE down input.");
                 } else {
                     ApplyCudaMoeGate(
@@ -9120,7 +9141,12 @@ namespace fastllm {
                     *GetEmptyData(), tempOutput);
             }
 
-            if (accurateFp8Moe) {
+            if (deepSeekV41Mode) {
+                tempFloatOutput.Resize(tempOutput.dims);
+                FastllmBF16ToFloat(tempOutput.cudaData, tempFloatOutput.cudaData, tempOutput.Count(0));
+                FastllmCudaPickOutputFloat((float*)tempFloatOutput.cudaData, (float*)floatOutput.cudaData,
+                    expertTasks[i].size(), output.dims[1], cudaIndex + startIdx[i], cudaUnitScales + startIdx[i]);
+            } else if (accurateFp8Moe) {
                 FastllmCudaPickOutputFloat(
                     (float*)tempFloatOutput.cudaData,
                     (float*)floatOutput.cudaData,
@@ -9161,7 +9187,7 @@ namespace fastllm {
             weights[prevExpert * 2]->FreeCudaTemporary({}, false);
             weights[prevExpert * 2 + 1]->FreeCudaTemporary({}, false);
         }
-        if (accurateFp8Moe) {
+        if (accurateFp8Moe || deepSeekV41Mode) {
             FastllmFloatToBF16(
                 floatOutput.cudaData, output.cudaData,
                 output.Count(0));

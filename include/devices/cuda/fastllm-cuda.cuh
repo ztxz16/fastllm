@@ -1152,7 +1152,7 @@ bool FastllmCudaDeepSeekV4PrepareMoeDownInput(
                               fastllm::Data &downInput,
                               const float *routeScales,
                               float swigluLimit,
-                              bool quantize);
+                              bool quantize, int activationQuantBlock = 128);
 #ifdef FASTLLM_ENABLE_DSV4_WOA_DEEPGEMM_SM120
 extern "C" bool FastllmCudaDeepSeekV4WoADeepGemmSm120(
                               const fastllm::Data &o,
