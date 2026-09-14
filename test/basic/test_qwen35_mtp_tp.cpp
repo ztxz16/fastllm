@@ -299,15 +299,16 @@ namespace {
             Data position(FLOAT32, {1, 1}, {float(127 + step)});
             model.RunMtpDraft(0, {0}, reference, step ? expected[step - 1] : hidden,
                 {step ? tokens[step - 1] : 3}, position, 0, &expected[step]);
-            Compare(ReadHidden(actual[step]), ReadHidden(expected[step]), "GPU token handoff used stale input");
+            Compare(ReadHidden(actual[step]), ReadHidden(expected[step]), "GPU token handoff or graph replay used stale input");
         }
         std::vector<float> actualQ(3 * 64), expectedQ(3 * 64);
         FastllmCudaCopyFromDeviceToHost(actualQ.data(), gpu.proposalProbs.cudaData, actualQ.size() * sizeof(float));
         FastllmCudaCopyFromDeviceToHost(expectedQ.data(), reference.proposalProbs.cudaData, expectedQ.size() * sizeof(float));
         for (int i = 0; i < 3 * 64; ++i)
             Require(std::fabs(actualQ[i] - expectedQ[i]) < .004f, "GPU chain cached the wrong proposal logits");
+        Require(!gpu.prefixGraphs.empty(), "prefix graph test did not enable its path");
         SetCudaEmbedding(false);
-        std::cout << "GPU draft tokens and dynamic positions vs CPU token input: PASS\n";
+        std::cout << "GPU draft tokens, dynamic positions, prefix capture/replay vs eager: PASS\n";
         ++cases;
     }
     void RunSampling(DraftModel &single, DraftModel &tp, int heads, int dim, int &cases) {

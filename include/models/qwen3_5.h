@@ -233,6 +233,7 @@ namespace fastllm {
 
         int num_k_heads, num_v_heads, head_k_dim, head_v_dim;
         int mtp_num_hidden_layers = 0;
+        struct MtpDraftPrefixGraph;
         struct MtpKvCache {
             Data key;
             Data value;
@@ -247,6 +248,7 @@ namespace fastllm {
             Data proposalLogsumexp;
             Data proposalDeviceTokens;
             Data proposalFloatTokens;
+            std::map<int, std::shared_ptr<MtpDraftPrefixGraph> > prefixGraphs;
             std::vector<int> proposalTokens;
             void BeginProposal(const GenerationConfig &config) {
                 sampleProposal = !config.IsSimpleGreedy();

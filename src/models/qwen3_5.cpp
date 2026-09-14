@@ -30690,6 +30690,59 @@ namespace fastllm {
 #endif
     }
 
+#ifdef USE_CUDA
+    // Per-request, per-query-length buffers keep every captured input/output
+    // address stable. KV append and page routing deliberately stay outside.
+    struct Qwen3_5Model::MtpDraftPrefixGraph {
+        int device = -1;
+        bool warmed = false, disabled = false;
+        void *graph = nullptr, *exec = nullptr;
+        std::vector<void*> reserved;
+        Data tokenIds, hiddenInput, positionIds;
+        Data inputEmbeds, normEmbeds, normHidden, fusedInput, hiddenStates;
+        Data attenInput, qgate, q, gate, k, v, mergedQkv;
+        ~MtpDraftPrefixGraph() {
+            if (device >= 0 && (graph || exec || !reserved.empty())) {
+                FastllmCudaSetDevice(device); ForceDeviceSync();
+                if (exec) FastllmCudaGraphExecDestroy(exec);
+                if (graph) FastllmCudaGraphDestroy(graph);
+                if (!reserved.empty()) FastllmCudaGraphMemoryPoolRelease(reserved);
+            }
+        }
+        void Run(const std::function<void()> &body) {
+            Qwen35CudaGraphPointerTableScope pointerScope(this);
+            if (disabled || !warmed) { body(); warmed = true; return; }
+            if (exec) {
+                AssertInFastLLM(FastllmCudaGraphLaunch(exec), "MTP prefix graph replay failed.\n");
+                return;
+            }
+            FastllmCudaClearThreadError(); FastllmCudaClearGraphError();
+            bool pool = FastllmCudaGraphPrepareCaptureDevice() && FastllmCudaGraphMemoryPoolBegin();
+            if (pool && FastllmCudaGraphBeginCapture()) {
+                try { body(); }
+                catch (...) {
+                    void *failed = nullptr;
+                    FastllmCudaGraphEndCapture(&failed);
+                    if (failed) FastllmCudaGraphDestroy(failed);
+                    FastllmCudaGraphMemoryPoolAbort(); disabled = true; throw;
+                }
+                if (FastllmCudaGraphEndCapture(&graph) && graph &&
+                    FastllmCudaGraphMemoryPoolEnd(reserved) &&
+                    FastllmCudaGraphInstantiate(graph, &exec)) {
+                    AssertInFastLLM(FastllmCudaGraphLaunch(exec), "MTP prefix graph launch failed.\n");
+                    return;
+                }
+            }
+            if (pool) FastllmCudaGraphMemoryPoolAbort();
+            disabled = true;
+            printf("[Qwen3.5 MTP] prefix graph unavailable: %s; using eager prefix.\n",
+                FastllmCudaGraphLastError());
+            FastllmCudaClearThreadError(); FastllmCudaClearGraphError();
+            body();
+        }
+    };
+#endif
+
     int Qwen3_5Model::RunMtpDraft(int device, const std::vector<int> &devices,
                                         MtpKvCache &cache,
                                         const Data &targetHiddenStates,
@@ -30773,21 +30826,49 @@ namespace fastllm {
             embedWeightForMtp->dataDeviceIds[0] == device;
         AssertInFastLLM(!gpuInput || useCudaEmbeddingForMtp,
             "MTP GPU chain requires CUDA embedding.\n");
-        Data inputEmbeds, normEmbeds, normHidden, fusedInput, hiddenStates;
-        Data attenInput, qgate, q, gate, k, v, attenOutput, projected, mergedQkv;
+        const bool prefixGraphEnabled = cache.deferProposalTokens && useCudaEmbeddingForMtp &&
+            GetFastllmEnv().cudaGraph && Qwen35EnvDefaultEnabled("FASTLLM_MTP_PREFIX_GRAPH");
+        MtpDraftPrefixGraph eagerBuffers;
+        MtpDraftPrefixGraph *prefixState = &eagerBuffers;
+        if (prefixGraphEnabled) {
+            auto &entry = cache.prefixGraphs[seqLen];
+            if (!entry) entry = std::make_shared<MtpDraftPrefixGraph>();
+            prefixState = entry.get(); prefixState->device = device;
+        }
+        auto &buf = *prefixState;
+        const Data *prefixTokens = &tokenIds, *prefixHidden = hiddenInput, *prefixPositions = &mtpPositionIds;
+        if (prefixGraphEnabled) {
+            tokenIds.ToDevice(DataDevice::CUDA, {device}, true);
+            auto copyInput = [&](Data &dst, const Data &src) {
+                dst.dataType = src.dataType; dst.UpdateUnitSize();
+                Qwen3CudaPrepareLocalOutput(dst, device);
+                dst.Resize(src.dims); dst.Allocate();
+                AssertInFastLLM(FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
+                    dst.cudaData, src.cudaData, src.GetBytes()), "MTP graph input copy failed.\n");
+            };
+            copyInput(buf.tokenIds, tokenIds); copyInput(buf.hiddenInput, *hiddenInput);
+            copyInput(buf.positionIds, mtpPositionIds);
+            prefixTokens = &buf.tokenIds; prefixHidden = &buf.hiddenInput; prefixPositions = &buf.positionIds;
+        }
+        Data &inputEmbeds = buf.inputEmbeds, &normEmbeds = buf.normEmbeds;
+        Data &normHidden = buf.normHidden, &fusedInput = buf.fusedInput, &hiddenStates = buf.hiddenStates;
+        Data &attenInput = buf.attenInput, &qgate = buf.qgate, &q = buf.q, &gate = buf.gate;
+        Data &k = buf.k, &v = buf.v, &mergedQkv = buf.mergedQkv;
+        Data attenOutput, projected;
         std::string prefix = "mtp.layers.0.";
+        auto runPrefix = [&]() {
         if (!useCudaEmbeddingForMtp) {
             Qwen35CpuEmbeddingDirect(tokenIds, embedWeight, inputEmbeds, hiddenInput->dataType);
             inputEmbeds.ToDevice(DataDevice::CUDA, {device}, true);
         } else {
             tokenIds.ToDevice(DataDevice::CUDA, {device}, true);
-            Embedding(tokenIds, *embedWeightForMtp, inputEmbeds);
+            Embedding(*prefixTokens, *embedWeightForMtp, inputEmbeds);
         }
         if (inputEmbeds.dataType != hiddenInput->dataType) {
             ToDataType(inputEmbeds, hiddenInput->dataType);
         }
         RMSNorm(inputEmbeds, weight["mtp.pre_fc_norm_embedding.weight"], rms_norm_eps, normEmbeds);
-        RMSNorm(*hiddenInput, weight["mtp.pre_fc_norm_hidden.weight"], rms_norm_eps, normHidden);
+        RMSNorm(*prefixHidden, weight["mtp.pre_fc_norm_hidden.weight"], rms_norm_eps, normHidden);
         Cat(normEmbeds, normHidden, -1, fusedInput);
         Linear(fusedInput, weight["mtp.fc.weight"], *GetEmptyData(), hiddenStates);
 
@@ -30815,14 +30896,17 @@ namespace fastllm {
         RMSNorm(q, weight[prefix + "self_attn.q_norm.weight"], rms_norm_eps, q);
         RMSNorm(k, weight[prefix + "self_attn.k_norm.weight"], rms_norm_eps, k);
         float ropeScale = (rope_type == RoPEType::LINEAR_SCALE) ? rope_factor : 1.0f;
-        ApplyMultimodalRotary(q, mtpPositionIds, ropeScale);
-        ApplyMultimodalRotary(k, mtpPositionIds, ropeScale);
+        ApplyMultimodalRotary(q, *prefixPositions, ropeScale);
+        ApplyMultimodalRotary(k, *prefixPositions, ropeScale);
         PermuteSelf(q, {0, 2, 1, 3});
         PermuteSelf(k, {0, 2, 1, 3});
         PermuteSelf(v, {0, 2, 1, 3});
         q.Reshape({-1, seqLen, this->head_dim});
         k.Reshape({-1, seqLen, this->head_dim});
         v.Reshape({-1, seqLen, this->head_dim});
+        };
+        if (prefixGraphEnabled) buf.Run(runPrefix);
+        else runPrefix();
 
         auto &pool = GetMtpPagedCachePool(device, k);
         cache.Append(k, v, pool.key, pool.value);
