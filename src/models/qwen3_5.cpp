@@ -16969,10 +16969,12 @@ namespace fastllm {
                 // MTP spec-rejection proposals reuse this DFlash rejection
                 // branch; their candidate width follows the request top_k,
                 // not the DFlash checkpoint selector.
-                const int effSelectorTopK =
+                const bool mtpSpecRejectionPath =
                     !HasDFlashWeights() &&
                     (speculativeDFlashSamplingContext != nullptr ||
-                     !speculativeDFlashSamplingContexts.empty())
+                     !speculativeDFlashSamplingContexts.empty());
+                const int effSelectorTopK =
+                    mtpSpecRejectionPath
                         ? Qwen35MtpSpecRejectionK(rowConfigs[0].top_k)
                         : dflashSelectorTopK;
                 std::vector<int> proposalTokens;
@@ -17032,7 +17034,8 @@ namespace fastllm {
                         proposalTokens.data(), proposalCandidateIds.data(),
                         proposalCandidateProbs.data(), sampled.data(),
                         acceptedDrafts.data(), batch, draftTokens,
-                        effSelectorTopK, vocabSize),
+                        effSelectorTopK, vocabSize,
+                        mtpSpecRejectionPath),
                     "DFlash CUDA rejection sampling failed.\n");
                 speculativeDFlashAccepted.assign(logitRows, 0);
                 rowOffset = 0;

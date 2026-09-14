@@ -1453,6 +1453,16 @@ bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
                                   int typicalCount,
                                   float typicalPosteriorThreshold,
                                   float typicalPosteriorAlpha);
+// 投机解码验证侧（DFlash 权重路径 / MTP 分布化草稿路径共用）。
+// jointFilterOrder 选择目标分布 p 的过滤语义：
+//   false → 链式过滤：top-k 重归一化 → 再 top-p 重归一化（DFlash 既有语义，保持不变）
+//   true  → 联合过滤：在**原始** temperature-softmax 概率上同时判定
+//           `#{p_y > p_x} < top_k` 与 `Σ_{p_y > p_x} p_y < top_p`，随后按原始 p 归一化
+//           —— 与普通采样路径 flashinfer::sampling::TopKTopPSamplingFromProb 的判据
+//           逐条一致。MTP 分布化草稿路径必须传 true：只有这样"开 MTP"与"关 MTP"
+//           才是同一个采样算子（否则同一组 (temperature, top_k, top_p) 下两者分布不同）。
+// 实现：TopPRenormProb(原始 p) → RadixTopKRenormProbMultiCTA，两个条件都是原始概率
+// 降序前缀约束，取交即联合判据保留集，概率 ∝ 原始 p。
 bool FastllmCudaDFlashRejectionSampling(
                                   float *logits,
                                   const float *temperatures,
@@ -1464,7 +1474,8 @@ bool FastllmCudaDFlashRejectionSampling(
                                   int *outputTokenIds,
                                   int *acceptedDraftTokens,
                                   int batch, int draftTokens,
-                                  int selectorTopK, int vocabSize);
+                                  int selectorTopK, int vocabSize,
+                                  bool jointFilterOrder);
 bool FastllmCudaMtpDraftSpecSampling(
                                   const float *logits,
                                   float temperature, int topK, float topP,

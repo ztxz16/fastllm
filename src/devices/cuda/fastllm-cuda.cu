@@ -15529,7 +15529,8 @@ bool FastllmCudaDFlashRejectionSampling(
                                   int *outputTokenIds,
                                   int *acceptedDraftTokens,
                                   int batch, int draftTokens,
-                                  int selectorTopK, int vocabSize) {
+                                  int selectorTopK, int vocabSize,
+                                  bool jointFilterOrder) {
     if (logits == nullptr || temperatures == nullptr ||
         topKArr == nullptr || topPArr == nullptr ||
         draftTokenIds == nullptr || draftCandidateIds == nullptr ||
@@ -15615,6 +15616,12 @@ bool FastllmCudaDFlashRejectionSampling(
     clampedTemperatures.resize(targetRows);
     clampedTopKs.resize(targetRows);
     clampedTopPs.resize(targetRows);
+    // needTopP 是一行的「是否任何一行 top_p<1」聚合开关——top_p 是 batch
+    // 共享的解码参数，正常路径下 batch 内所有行 top_p 一致；即便出现
+    // 极端混合（如某一行的 top_p==1 被卷入），flashinfer::TopPRenormProb
+    // 对 top_p==1.0 是 no-op fast-path（核等于整行），所以即便开启
+    // top-p-then-top-k 顺序，top_p==1 行也不引入差异——这是安全的
+    // 工程折中（避免为每行复制条件分支）。
     bool needTopP = false;
     for (int row = 0; row < targetRows; row++) {
         clampedTemperatures[row] =
@@ -15665,15 +15672,44 @@ bool FastllmCudaDFlashRejectionSampling(
     FastllmTemperatureSoftmaxKernel<1024>
         <<<targetRows, 1024, 0, stream>>>(
             logits, targetA, cudaTemperatures, vocabSize);
-    state = flashinfer::sampling::RadixTopKRenormProbMultiCTA<float, int>(
-        targetA, targetB, cudaTopKs, (uint32_t)targetRows, 0,
-        (uint32_t)vocabSize, rowStates, stream);
-    float *targetProbs = targetB;
-    if (state == cudaSuccess && needTopP) {
-        state = flashinfer::sampling::TopPRenormProb<float>(
-            targetB, targetA, cudaTopPs, (uint32_t)targetRows,
-            1.0f, (uint32_t)vocabSize, stream);
-        targetProbs = targetA;
+    float *targetProbs = nullptr;
+    if (jointFilterOrder) {
+        // 联合过滤语义（与普通采样路径 flashinfer::sampling::
+        // TopKTopPSamplingFromProb 的判据逐条一致）：
+        //   保留 ⇔ #{y : p_y > p_x} < top_k 且 Σ_{y : p_y > p_x} p_y < top_p，
+        //   随后按原始 p 在保留集上归一化采样。
+        // 两个条件都是"原始概率降序前缀"约束，故实现为：
+        //   先对原始 p 做 top-p nucleus，再在其结果上取 top-k 并重归一化。
+        // 结果集合 = 两个前缀的交 = 联合判据的保留集；概率 ∝ 原始 p。
+        if (needTopP) {
+            state = flashinfer::sampling::TopPRenormProb<float>(
+                targetA, targetB, cudaTopPs, (uint32_t)targetRows,
+                1.0f, (uint32_t)vocabSize, stream);
+            if (state == cudaSuccess) {
+                state = flashinfer::sampling::RadixTopKRenormProbMultiCTA<float, int>(
+                    targetB, targetA, cudaTopKs, (uint32_t)targetRows, 0,
+                    (uint32_t)vocabSize, rowStates, stream);
+            }
+            targetProbs = targetA;
+        } else {
+            state = flashinfer::sampling::RadixTopKRenormProbMultiCTA<float, int>(
+                targetA, targetB, cudaTopKs, (uint32_t)targetRows, 0,
+                (uint32_t)vocabSize, rowStates, stream);
+            targetProbs = targetB;
+        }
+    } else {
+        // 链式过滤（DFlash 权重路径既有语义）：
+        // 先 top-k 重归一化，再 top-p 重归一化。
+        state = flashinfer::sampling::RadixTopKRenormProbMultiCTA<float, int>(
+            targetA, targetB, cudaTopKs, (uint32_t)targetRows, 0,
+            (uint32_t)vocabSize, rowStates, stream);
+        targetProbs = targetB;
+        if (state == cudaSuccess && needTopP) {
+            state = flashinfer::sampling::TopPRenormProb<float>(
+                targetB, targetA, cudaTopPs, (uint32_t)targetRows,
+                1.0f, (uint32_t)vocabSize, stream);
+            targetProbs = targetA;
+        }
     }
     if (state != cudaSuccess) {
         FastllmReleaseDequantScratch(scratch, scratchOwn);
@@ -15827,9 +15863,10 @@ bool FastllmCudaMtpDraftSpecSampling(
     float clampedTopP = std::max(1.0e-6f, std::min(topP, 1.0f));
     const bool needTopP = clampedTopP < 1.0f;
 
-    // Same filter sequence as FastllmCudaDFlashRejectionSampling so the
-    // draft q and the verify-side target p live in one filtered space:
-    // temperature softmax -> top-K renorm -> top-p renorm (optional).
+    // JOINT filter sequence (same as FastllmCudaDFlashRejectionSampling with
+    // jointFilterOrder=true): draft q and target p live in one filtered space:
+    // temperature softmax -> top-P renorm (optional) -> top-K renorm.
+    // This matches flashinfer::TopKTopPSamplingFromProb semantics.
     const size_t probBytes = (size_t)vocabSize * sizeof(float);
     size_t scratchNeed = 0;
     auto reserveAligned = [&](size_t bytes) {
@@ -15888,15 +15925,23 @@ bool FastllmCudaMtpDraftSpecSampling(
         state = cudaGetLastError();
     }
     float *filtered = pA;
-    if (state == cudaSuccess) {
+    // JOINT filter sequence: first top-p nucleus on the original distribution,
+    // then top-k on the nucleus. This differs from the chain order (top-k first,
+    // then top-p) but is equivalent to the MTP-off path, so the draft q lives in
+    // the same filtered space as the MTP-off target p.
+    if (state == cudaSuccess && needTopP) {
+        state = flashinfer::sampling::TopPRenormProb<float>(
+            pA, pB, cudaTopP, 1, 1.0f, (uint32_t)vocabSize, stream);
+        filtered = pB;
+        if (state == cudaSuccess) {
+            state = flashinfer::sampling::RadixTopKRenormProbMultiCTA<float, int>(
+                pB, pA, cudaTopK, 1, 0, (uint32_t)vocabSize, rowStates, stream);
+            filtered = pA;
+        }
+    } else if (state == cudaSuccess) {
         state = flashinfer::sampling::RadixTopKRenormProbMultiCTA<float, int>(
             pA, pB, cudaTopK, 1, 0, (uint32_t)vocabSize, rowStates, stream);
         filtered = pB;
-    }
-    if (state == cudaSuccess && needTopP) {
-        state = flashinfer::sampling::TopPRenormProb<float>(
-            pB, pA, cudaTopP, 1, 1.0f, (uint32_t)vocabSize, stream);
-        filtered = pA;
     }
     if (state == cudaSuccess) {
         FastllmMtpDraftCollectKernel<<<1, 1024, 0, stream>>>(
