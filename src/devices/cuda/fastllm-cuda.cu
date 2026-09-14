@@ -15740,9 +15740,9 @@ __global__ void FastllmMtpDraftGumbelKernel(
         z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
         z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
         z ^= z >> 31;
-        float u = (float)(z >> 11u) * (1.0f / 9007199254740992.0f);
-        // u in (0,1) keeps -logf(u) > 0 so logf(-logf(u)) is finite; the
-        // measure-zero u == 0 drives the score to -inf and never wins.
+        // Exactly representable midpoints keep both endpoints out after
+        // conversion to float, avoiding log(0) and infinite Gumbel scores.
+        float u = ((float)(z >> 41u) + 0.5f) * (1.0f / 8388608.0f);
         float score = logf(p) - logf(-logf(u));
         if (score > bestScore) {
             bestScore = score;

@@ -803,6 +803,19 @@ namespace fastllm {
         return enabled;
     }
 
+    // Opt-in: broader draft support can improve acceptance, but its sampling
+    // overhead slows workloads whose one-hot proposals already nearly all pass.
+    static bool Qwen35MtpRandomDraftEnabled() {
+        static const bool enabled = []() {
+            const char *value = std::getenv("FASTLLM_QWEN35_MTP_RANDOM_DRAFT");
+            const bool active = value != nullptr && std::string(value) == "1";
+            printf("[Qwen3.5 MTP] random_draft=%d\n", active ? 1 : 0);
+            fflush(stdout);
+            return active;
+        }();
+        return enabled;
+    }
+
     // MTP spec-rejection candidate-list width: the request top_k lower bound
     // mirrors the verify-side max(1, top_k) clamps (typical path and DFlash
     // rejection kernel both use it); the cap bounds the fixed-stride
@@ -17326,6 +17339,7 @@ namespace fastllm {
         // draft chain, reading the proposal the previous call's draft chain
         // published into dflashContext.
         const bool mtpSpecRejectionActive =
+            !useDFlash && Qwen35MtpRandomDraftEnabled() &&
             (int)generationConfigs.size() == 1 &&
             !generationConfigs[0].IsSimpleGreedy();
         auto eraseDraftCache = [&]() {
@@ -17386,7 +17400,9 @@ namespace fastllm {
         if (!mtpLogPrinted.exchange(true)) {
             const char *acceptance = useDFlash ?
                 "exact(greedy)/rejection(selector_q,target_p)(sampling)" :
-                "exact(greedy)/exact(one_hot_draft,target_sample)(sampling)";
+                (Qwen35MtpRandomDraftEnabled() ?
+                    "exact(greedy)/rejection(mtp_q,target_p)(sampling)" :
+                    "exact(greedy)/exact(one_hot_draft,target_sample)(sampling)");
             printf("[Qwen3.5 %s] enabled: layers=%d, drafts_per_step=%d, root_device=cuda:%d, tp_devices=%zu, acceptance=%s, log_interval=%d validations.\n",
                    useDFlash ? "DFlash2" : "MTP",
                    useDFlash ? dflashLayers : mtp_num_hidden_layers,
@@ -18387,6 +18403,10 @@ namespace fastllm {
             // chain so the next call's verify forward (runTargetWithPast)
             // can route them through the DFlash rejection branch.
             std::vector<std::pair<std::vector<int>, std::vector<float>>> specCandidates;
+            struct ResetDraftSampling {
+                MtpSpecDraftParams &params;
+                ~ResetDraftSampling() { params.active = false; }
+            } resetDraftSampling{mtpSpecDraftParams};
             if (mtpSpecRejectionActive) {
                 if (mtpSpecDraftSeedBase == 0) {
                     mtpSpecDraftSeedBase = (unsigned long long)

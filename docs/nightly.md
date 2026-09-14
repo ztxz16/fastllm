@@ -209,6 +209,18 @@ ftllm server DeepSeek-V3-0324-Q4_K_M-00001-of-00009.gguf --ori DeepSeek-V3
   - **默认值**: `auto`（根据模型自动选择）
   - **示例**: `--tool_call_parser auto`
 
+### Qwen3.5 MTP 随机草稿
+
+默认 MTP 使用贪心草稿；目标模型仍按请求的 temperature/top-k/top-p 进行精确采样。对于草稿接受率较低的写作等场景，可以尝试随机草稿：
+
+```sh
+FASTLLM_QWEN35_MTP_RANDOM_DRAFT=1 ftllm server /path/to/model --tp 2 --mtp 5 --speculative_algorithm mtp
+```
+
+环境变量必须在启动前设置为 `1`；未设置或设为 `0` 时使用默认策略。该选项仅对已有 MTP 支持的单请求、非贪心 CUDA 路径生效，使用请求的温度及 top-k/top-p 过滤，最多保存 64 个草稿候选，并按实际草稿概率做拒绝验证。greedy 请求、DFlash 和多请求批处理沿用各自原有策略。
+
+随机草稿会增加过滤、抽样和候选传输开销；接受率接近 100% 的复制或固定格式输出通常没有收益。应按实际负载比较解码速度，不能只比较接受率。长预填充的首次单 token 播种仍使用贪心草稿，随后进入所选草稿策略。
+
 ### 服务部署参数
 
 以下参数在使用 `ftllm server` 部署 API 服务时可用。
