@@ -2894,6 +2894,8 @@ bool FastllmCudaPreparePagedBatchParamsSingle(
 // can deadlock a long-context prefill.  Carry the values in kernel parameters
 // instead: no blocking copy, and the launch is capturable by a CUDA Graph.
 constexpr int kFastllmPagedIntParamsMaxSmall = 64;
+constexpr int kFastllmPagedIntParamsChunkPages = 512;
+constexpr int kFastllmPagedIntParamsMaxPages = 4096;
 
 template <int MaxPages>
 struct FastllmPagedIntParamsList {
@@ -2902,6 +2904,11 @@ struct FastllmPagedIntParamsList {
     int32_t lastPageLens[kFastllmPagedIntParamsMaxSmall];
     int32_t pageIdx[MaxPages];
 };
+
+// Leave space for pointer/count arguments on pre-Volta and older toolchains.
+// Bounded launches also work in fat binaries containing both sm_60 and sm_75.
+static_assert(sizeof(FastllmPagedIntParamsList<kFastllmPagedIntParamsChunkPages>)
+                  + 128 <= 4096, "Paged upload kernel exceeds legacy parameter space");
 
 template <int MaxPages>
 __global__ void FastllmUploadPagedIntParamsKernel(
@@ -2953,16 +2960,7 @@ static bool UploadPagedIntParamsKernel(
         qSizes, qSizesCount, pageSizes, pageSizesCount,
         pageIndexs, pageIndexsCount, lastPageLens, lastPageLensCount,
         values);
-    // Mirror the single-kernel paged-params path, but skip the device sync
-    // while a stream is being captured (the sync would fail the capture).
-    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
-    if (cudaStreamIsCapturing(cudaStreamPerThread, &capture) == cudaSuccess &&
-        capture == cudaStreamCaptureStatusNone) {
-        DeviceSync();
-    } else {
-        cudaGetLastError();
-    }
-    return true;
+    return cudaGetLastError() == cudaSuccess;
 }
 
 bool FastllmCudaUploadPagedIntParams(
@@ -2980,6 +2978,7 @@ bool FastllmCudaUploadPagedIntParams(
         lastPageLensCount < 0 ||
         lastPageLensCount > kFastllmPagedIntParamsMaxSmall ||
         pageIndexsCount < 0 ||
+        pageIndexsCount > kFastllmPagedIntParamsMaxPages ||
         (qSizesCount > 0 && qSizesHost == nullptr) ||
         (pageSizesCount > 0 && pageSizesHost == nullptr) ||
         (pageIndexsCount > 0 && pageIndexsHost == nullptr) ||
@@ -2987,39 +2986,45 @@ bool FastllmCudaUploadPagedIntParams(
          (lastPageLens == nullptr || lastPageLensHost == nullptr))) {
         return false;
     }
-    // Kernel parameter space is 32 KiB on sm_70+; the largest list
-    // (MaxPages=4096, ~17 KiB) leaves headroom for the small arrays.
+    // Launch only small by-value parameter lists. This preserves capture and
+    // avoids pageable H2D copies without requiring large kernel-argument support.
+    // Metadata is written once; following launches upload disjoint page chunks.
+    bool uploaded = true;
     if (pageIndexsCount <= 256) {
-        return UploadPagedIntParamsKernel<256>(
+        uploaded = UploadPagedIntParamsKernel<256>(
             qSizes, qSizesCount, pageSizes, pageSizesCount, pageIndexs,
             pageIndexsCount, lastPageLens, lastPageLensCount, qSizesHost,
             pageSizesHost, pageIndexsHost, lastPageLensHost);
+    } else {
+        for (int offset = 0; offset < pageIndexsCount;
+             offset += kFastllmPagedIntParamsChunkPages) {
+            const bool first = offset == 0;
+            const int count = std::min(kFastllmPagedIntParamsChunkPages,
+                                       pageIndexsCount - offset);
+            uploaded = UploadPagedIntParamsKernel<kFastllmPagedIntParamsChunkPages>(
+                qSizes, first ? qSizesCount : 0,
+                pageSizes, first ? pageSizesCount : 0,
+                pageIndexs + offset, count,
+                lastPageLens, first ? lastPageLensCount : 0,
+                qSizesHost, pageSizesHost, pageIndexsHost + offset,
+                lastPageLensHost);
+            if (!uploaded) {
+                break;
+            }
+        }
     }
-    if (pageIndexsCount <= 512) {
-        return UploadPagedIntParamsKernel<512>(
-            qSizes, qSizesCount, pageSizes, pageSizesCount, pageIndexs,
-            pageIndexsCount, lastPageLens, lastPageLensCount, qSizesHost,
-            pageSizesHost, pageIndexsHost, lastPageLensHost);
+    if (!uploaded) {
+        return false;
     }
-    if (pageIndexsCount <= 1024) {
-        return UploadPagedIntParamsKernel<1024>(
-            qSizes, qSizesCount, pageSizes, pageSizesCount, pageIndexs,
-            pageIndexsCount, lastPageLens, lastPageLensCount, qSizesHost,
-            pageSizesHost, pageIndexsHost, lastPageLensHost);
+    // Honor debug synchronization once after all launches, outside capture.
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(cudaStreamPerThread, &capture) != cudaSuccess) {
+        return false;
     }
-    if (pageIndexsCount <= 2048) {
-        return UploadPagedIntParamsKernel<2048>(
-            qSizes, qSizesCount, pageSizes, pageSizesCount, pageIndexs,
-            pageIndexsCount, lastPageLens, lastPageLensCount, qSizesHost,
-            pageSizesHost, pageIndexsHost, lastPageLensHost);
+    if (capture == cudaStreamCaptureStatusNone) {
+        DeviceSync();
     }
-    if (pageIndexsCount <= 4096) {
-        return UploadPagedIntParamsKernel<4096>(
-            qSizes, qSizesCount, pageSizes, pageSizesCount, pageIndexs,
-            pageIndexsCount, lastPageLens, lastPageLensCount, qSizesHost,
-            pageSizesHost, pageIndexsHost, lastPageLensHost);
-    }
-    return false;
+    return true;
 }
 
 // CUDA kernel for batch copying data from input to paged KV cache

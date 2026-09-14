@@ -424,9 +424,9 @@ bool FastllmCudaPreparePagedBatchParamsSingle(
     int32_t *lastPageLens, const int *pageIdxHost, int pageIndexCount,
     int totalPages, int qSize, int lastPageLen);
 // Upload the paged batch parameters via a kernel carrying the values in its
-// parameter space (upstream #722): no blocking pageable H2D copy, capturable
-// by a CUDA Graph.  Returns false when a size exceeds the kernel parameter
-// budget; callers keep the memcpy fallback.
+// parameter space (upstream #722): bounded chunks fit legacy 4 KiB limits,
+// avoid blocking pageable H2D copies, and can be captured by a CUDA Graph.
+// Returns false for unsupported sizes; callers keep the memcpy fallback.
 bool FastllmCudaUploadPagedIntParams(
     int32_t *qSizes, int qSizesCount,
     int32_t *pageSizes, int pageSizesCount,
