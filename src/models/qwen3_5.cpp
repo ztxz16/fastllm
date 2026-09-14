@@ -18419,6 +18419,18 @@ namespace fastllm {
             auto firstDraftStart = mtpProfileEnabled ? std::chrono::steady_clock::now()
                                                      : std::chrono::steady_clock::time_point();
             mtpCache.BeginProposal(generationConfigs[0]);
+            Data &embedding = weight[language_prefix + "embed_tokens.weight"];
+            Data *localEmbedding = &embedding;
+            if (embedding.multiDeviceData) {
+                auto it = embedding.multiDeviceDatas.find(device);
+                if (it != embedding.multiDeviceDatas.end() && it->second) localEmbedding = it->second;
+            }
+            mtpCache.deferProposalTokens = mtpCache.sampleProposal &&
+                Qwen35EnvDefaultEnabled("FASTLLM_MTP_GUMBEL") &&
+                Qwen35EnvDefaultEnabled("FASTLLM_MTP_GPU_CHAIN") &&
+                !UseMtpBackboneTp(devices) && GetCudaEmbeddingRequested() && !GetLowMemMode() &&
+                localEmbedding->dataDevice == DataDevice::CUDA && localEmbedding->cudaData &&
+                localEmbedding->dataDeviceIds == std::vector<int>{device};
             int draft = RunMtpDraft(device, devices, mtpCache, targetHiddenStates,
                                           mtpInputTokens, mtpPositionIds,
                                           sampleRow,
@@ -18451,10 +18463,19 @@ namespace fastllm {
                         prevDraft = nextDraft;
                     }
                 } catch (...) {
+                    mtpCache.deferProposalTokens = false;
                     mtpCache.Truncate(cacheTokens);
                     throw;
                 }
                 mtpCache.Truncate(cacheTokens);
+            }
+            if (mtpCache.deferProposalTokens) {
+                FastllmCudaCopyFromDeviceToHost(drafts.data(), mtpCache.proposalDeviceTokens.cudaData,
+                    drafts.size() * sizeof(int));
+                for (int token : drafts) AssertInFastLLM(token >= 0 && token < weight["lm_head.weight"].dims[0],
+                    "MTP GPU chain produced an invalid token.\n");
+                mtpCache.proposalTokens = drafts;
+                mtpCache.deferProposalTokens = false;
             }
             return drafts;
         };
@@ -29501,6 +29522,7 @@ namespace fastllm {
                     data.Resize({capacity}); data.Allocate();
                 };
                 prepare(cache.proposalDeviceTokens, DataType::INT32);
+                prepare(cache.proposalFloatTokens, DataType::FLOAT32);
                 if (!cache.sampleProposal) {
                     FastllmCudaGreedySampling((float*)logits.cudaData + (size_t)b * vocab,
                         (int*)cache.proposalDeviceTokens.cudaData, 1, vocab);
@@ -29514,12 +29536,15 @@ namespace fastllm {
                     (float*)logits.cudaData + (size_t)b * vocab, destinations[b],
                     (float*)cache.proposalLogsumexp.cudaData + slot,
                     (int*)cache.proposalDeviceTokens.cudaData + slot,
-                    nullptr,
+                    (float*)cache.proposalFloatTokens.cudaData + slot,
                     &temperatures[b], 1, vocab), "MTP Gumbel proposal sampling failed.\n");
-                FastllmCudaCopyFromDeviceToHost(&tokens[b],
-                    (int*)cache.proposalDeviceTokens.cudaData + slot, sizeof(int));
-                AssertInFastLLM(tokens[b] >= 0 && tokens[b] < vocab,
-                    "MTP Gumbel proposal has no finite token.\n");
+                tokens[b] = -1;
+                if (!cache.deferProposalTokens) {
+                    FastllmCudaCopyFromDeviceToHost(&tokens[b],
+                        (int*)cache.proposalDeviceTokens.cudaData + slot, sizeof(int));
+                    AssertInFastLLM(tokens[b] >= 0 && tokens[b] < vocab,
+                        "MTP Gumbel proposal has no finite token.\n");
+                }
                 cache.proposalTokens.push_back(tokens[b]);
             }
             return tokens;
@@ -30706,7 +30731,19 @@ namespace fastllm {
         for (int i = 0; i < seqLen; i++) {
             tokenValues[i] = (float)inputTokens[i];
         }
-        Data tokenIds(DataType::FLOAT32, {1, seqLen}, tokenValues);
+        Data tokenIds(DataType::FLOAT32);
+        const bool gpuInput = cache.deferProposalTokens && !cache.proposalTokens.empty();
+        if (gpuInput) {
+            AssertInFastLLM(seqLen == 1 && cache.proposalUsesLogits,
+                "MTP GPU input must reference the preceding draft.\n");
+            Qwen3CudaPrepareLocalOutput(tokenIds, device);
+            tokenIds.Resize({1, 1}); tokenIds.Allocate();
+            AssertInFastLLM(FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(tokenIds.cudaData,
+                (float*)cache.proposalFloatTokens.cudaData + cache.proposalTokens.size() - 1,
+                sizeof(float)), "MTP GPU token input copy failed.\n");
+        } else {
+            tokenIds.CopyFrom(Data(DataType::FLOAT32, {1, seqLen}, tokenValues));
+        }
         Data convertedHidden;
         const Data *hiddenInput = &targetHiddenStates;
         if (targetHiddenStates.dataType != this->dataType) {
@@ -30734,6 +30771,8 @@ namespace fastllm {
             embedWeightForMtp->cudaData != nullptr &&
             !embedWeightForMtp->dataDeviceIds.empty() &&
             embedWeightForMtp->dataDeviceIds[0] == device;
+        AssertInFastLLM(!gpuInput || useCudaEmbeddingForMtp,
+            "MTP GPU chain requires CUDA embedding.\n");
         Data inputEmbeds, normEmbeds, normHidden, fusedInput, hiddenStates;
         Data attenInput, qgate, q, gate, k, v, attenOutput, projected, mergedQkv;
         std::string prefix = "mtp.layers.0.";

@@ -241,16 +241,19 @@ namespace fastllm {
             // Truncate only changes KV, never the saved proposal or tokens.
             bool sampleProposal = false;
             bool proposalUsesLogits = false;
+            bool deferProposalTokens = false;
             GenerationConfig proposalConfig;
             Data proposalProbs;
             Data proposalLogsumexp;
             Data proposalDeviceTokens;
+            Data proposalFloatTokens;
             std::vector<int> proposalTokens;
             void BeginProposal(const GenerationConfig &config) {
                 sampleProposal = !config.IsSimpleGreedy();
                 proposalConfig = config;
                 proposalTokens.clear();
                 proposalUsesLogits = false;
+                deferProposalTokens = false;
             }
             // TP parents keep only global shape/length; each rank owns its pages.
             std::map<int, std::unique_ptr<MtpKvCache> > shards;

@@ -276,6 +276,40 @@ namespace {
         std::cout << "ragged kv_heads=" << heads << " dim=" << dim << " PASS\n";
         ++cases;
     }
+    void RunGpuChain(DraftModel &model, int heads, int dim, int &cases) {
+        SetCudaEmbedding(true);
+        model.weight[Qwen3_5Model::language_prefix + "embed_tokens.weight"].ToDevice(DataDevice::CUDA, {0}, true);
+        DraftModel::MtpKvCache gpu, reference;
+        Init(model, gpu, heads, dim, 127); Init(model, reference, heads, dim, 127);
+        GenerationConfig config; config.top_k = 20; config.top_p = .95f; config.temperature = .8f;
+        gpu.BeginProposal(config); reference.BeginProposal(config); gpu.deferProposalTokens = true;
+        Data hidden(FLOAT16, {1, 1, DraftModel::width}); Fill(hidden, 982, .6f);
+        hidden.ToDevice(DataDevice::CUDA, {0}, true);
+        Data actual[3], expected[3];
+        for (int step = 0; step < 3; ++step) {
+            Data position(FLOAT32, {1, 1}, {float(127 + step)});
+            int token = model.RunMtpDraft(0, {0}, gpu, step ? actual[step - 1] : hidden,
+                {step ? -1 : 3}, position, 0, &actual[step]);
+            Require(token == -1 && gpu.proposalTokens.size() == size_t(step + 1), "draft unexpectedly returned to CPU");
+        }
+        int tokens[3];
+        FastllmCudaCopyFromDeviceToHost(tokens, gpu.proposalDeviceTokens.cudaData, sizeof(tokens));
+        for (int step = 0; step < 3; ++step) {
+            Require(tokens[step] >= 0 && tokens[step] < 64, "GPU chain returned an invalid token");
+            Data position(FLOAT32, {1, 1}, {float(127 + step)});
+            model.RunMtpDraft(0, {0}, reference, step ? expected[step - 1] : hidden,
+                {step ? tokens[step - 1] : 3}, position, 0, &expected[step]);
+            Compare(ReadHidden(actual[step]), ReadHidden(expected[step]), "GPU token handoff used stale input");
+        }
+        std::vector<float> actualQ(3 * 64), expectedQ(3 * 64);
+        FastllmCudaCopyFromDeviceToHost(actualQ.data(), gpu.proposalProbs.cudaData, actualQ.size() * sizeof(float));
+        FastllmCudaCopyFromDeviceToHost(expectedQ.data(), reference.proposalProbs.cudaData, expectedQ.size() * sizeof(float));
+        for (int i = 0; i < 3 * 64; ++i)
+            Require(std::fabs(actualQ[i] - expectedQ[i]) < .004f, "GPU chain cached the wrong proposal logits");
+        SetCudaEmbedding(false);
+        std::cout << "GPU draft tokens and dynamic positions vs CPU token input: PASS\n";
+        ++cases;
+    }
     void RunSampling(DraftModel &single, DraftModel &tp, int heads, int dim, int &cases) {
         DraftModel::MtpKvCache a, b;
         Init(single, a, heads, dim, 127);
@@ -380,6 +414,7 @@ int main(int argc, char **argv) {
                         if (!longOnly) {
                             RunBatch(single, tp, heads, dim, cases);
                             RunSampling(single, tp, heads, dim, cases);
+                            if (smoke && !moe) RunGpuChain(single, heads, dim, cases);
                         }
                         for (auto &entry : tp.mtpPagedCachePools) {
                             Require(entry.second->key.FreePageCount() == entry.second->key.maxPages &&
