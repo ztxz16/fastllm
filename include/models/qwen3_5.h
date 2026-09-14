@@ -302,6 +302,8 @@ namespace fastllm {
         bool speculativeCaptureFirstTokenLinearState = false;
         int speculativeLinearStateCaptureSlots = 0;
         std::vector<std::vector<std::pair<Data, Data> > > speculativeLinearStates;
+        // Verify graphs capture addresses in this scratch storage.
+        unsigned long long speculativeLinearStateGeneration = 0;
         std::vector<std::vector<int> > speculativeLinearCaptureMask;
         std::vector<std::pair<Data, Data> > speculativeFirstTokenLinearStates;
         std::vector<int> speculativeFirstTokenLinearCaptureMask;

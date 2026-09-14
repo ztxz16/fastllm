@@ -16168,6 +16168,9 @@ namespace fastllm {
                         "Qwen3.5 failed to prepare dynamic MTP graph paged metadata.\n");
                 }
 
+                // Growing the shared rollback scratch for a larger batch also
+                // invalidates graphs captured for smaller batches, even when
+                // their live request cache pointers have not changed.
                 std::ostringstream graphSignature;
                 graphSignature << "batch=" << batch
                                << ";verify=" << seqLens[0]
@@ -16175,7 +16178,9 @@ namespace fastllm {
                                << ";dflash="
                                << (speculativeCaptureDFlashHiddenStates ? 1 : 0)
                                << ";captureSlots="
-                               << speculativeLinearStateCaptureSlots;
+                               << speculativeLinearStateCaptureSlots
+                               << ";linearScratchGeneration="
+                               << speculativeLinearStateGeneration;
                 for (int r = 0; r < (int)devices.size(); ++r) {
                     graphSignature << ";gpu=" << devices[r]
                                    << ";packedMeta="
@@ -18725,6 +18730,7 @@ namespace fastllm {
                 }
             }
             if (rebuildLinearCaptureScratch) {
+                ++speculativeLinearStateGeneration;
                 speculativeLinearStates.clear();
                 speculativeLinearStates.resize(block_cnt);
                 for (int i = 0; i < block_cnt; i++) {
@@ -19618,6 +19624,7 @@ namespace fastllm {
         int oldLinearStateCaptureSlots = speculativeLinearStateCaptureSlots;
         auto clearSpeculativeLinearCapture = [&]() {
             speculativeLinearStateCaptureSlots = oldLinearStateCaptureSlots;
+            ++speculativeLinearStateGeneration;
             speculativeLinearStates.clear();
             speculativeLinearCaptureMask.clear();
         };
@@ -19684,6 +19691,7 @@ namespace fastllm {
             speculativeCaptureFirstTokenLinearState = true;
             int linearCaptureSlots = std::max(1, seqLen - 1);
             speculativeLinearStateCaptureSlots = linearCaptureSlots;
+            ++speculativeLinearStateGeneration;
             speculativeLinearStates.clear();
             speculativeLinearStates.resize(block_cnt);
             speculativeLinearCaptureMask.clear();
@@ -20473,6 +20481,7 @@ namespace fastllm {
             }
         }
         if (rebuildScratch) {
+            ++speculativeLinearStateGeneration;
             speculativeLinearStates.clear();
             speculativeLinearStates.resize(block_cnt);
             for (int layer = 0; layer < block_cnt; layer++) {

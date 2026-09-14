@@ -18,6 +18,17 @@ for test_name in test_paged_int_params test_mtp_draft_sampling; do
 done
 ```
 
+真实模型的单请求/批处理切换回归覆盖两条采样请求，以及采样/贪心混合请求。指定已安装本次构建的 Python 环境和模型路径，保证两张 GPU 空闲：
+
+```sh
+python test/cuda/test_mtp_scheduler_transition.py \
+    -p /path/to/Qwen3.8-27B-FP8 --tp 2 --mtp 3 --max_batch 2 --threads 8 \
+    --cuda_embedding --kv_cache_dtype float16 --prefix_cache false --cache_history false \
+    --max_context_length 8192 --chunked_prefill_size 2048
+```
+
+测试应输出最后的 `PASS: MTP sampling and mixed requests across scheduler transitions`。开启 CUDA Graph 时同时检查日志确实捕获了 `batch=2` 的 MTP 验证图，避免将普通解码回退误记为批处理验证通过。
+
 编译兼容性检查使用仍支持 sm_60 的 nvcc（本次验证为 CUDA 12.4），不需要 GPU：
 
 ```sh
