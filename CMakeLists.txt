@@ -645,6 +645,10 @@ target_link_libraries(quant fastllm)
 
 if (UNIT_TEST)
     enable_testing()
+    add_executable(device_operator_lifetime_test test/basic/test_device_operator_lifetime.cpp)
+    target_link_libraries(device_operator_lifetime_test PRIVATE fastllm)
+    add_test(NAME device_operator_lifetime COMMAND device_operator_lifetime_test)
+
     find_package(Threads REQUIRED)
     add_executable(ncclSubmitRendezvousRegression test/ops/ncclSubmitRendezvousRegression.cpp)
     target_include_directories(ncclSubmitRendezvousRegression PRIVATE include)
