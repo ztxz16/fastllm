@@ -16,6 +16,91 @@ template<class T> void array(const std::vector<T> &v) {
     std::cout << ']';
 }
 struct Case { const char *name; std::vector<float> p, q; int draftK; float temperature=1, topP=1; int verifyK=-1; };
+
+// ---- 过滤语义 CPU 模型（与 flashinfer kernel 判据逐条对齐，供结构性断言使用）----
+// 严格不等前缀语义：以"严格大于"计数/求和，同值（tie）整组同判定：
+//   JOINT: 保留 y <=> #{z: p_z > p_y} < K 且 Σ_{z: p_z > p_y} p_z < P
+//          （"先 top-p 再 top-k"与之等价，因为两个条件都是原始概率的降序前缀约束）
+//   CHAIN: 先取 top-K（p >= 第 K 大值，tie 整组），重归一后再在该分布上做 top-p
+// topP >= 1 对应 TopPRenormProb 的 fast-path（整行保留后按行和归一），不产生截断。
+static std::vector<double> toDist(const std::vector<float> &p, float temperature) {
+    std::vector<double> d(p.size(), 0.0);
+    double s = 0;
+    for (size_t j = 0; j < p.size(); ++j) {
+        d[j] = std::pow((double)p[j], 1.0 / (double)temperature);
+        s += d[j];
+    }
+    if (s > 0) {
+        for (double &x : d) x /= s;
+    }
+    return d;
+}
+// cntGt[y] = #{z: d_z > d_y}，sumGt[y] = Σ_{z: d_z > d_y} d_z
+static void strictGreaterStats(const std::vector<double> &d, std::vector<int> &cntGt,
+                               std::vector<double> &sumGt) {
+    cntGt.assign(d.size(), 0);
+    sumGt.assign(d.size(), 0.0);
+    for (size_t y = 0; y < d.size(); ++y) {
+        int c = 0;
+        double s = 0;
+        for (size_t z = 0; z < d.size(); ++z) {
+            if (d[z] > d[y]) { ++c; s += d[z]; }
+        }
+        cntGt[y] = c;
+        sumGt[y] = s;
+    }
+}
+static std::vector<char> jointKeep(const std::vector<double> &d, int K, double P) {
+    std::vector<int> cntGt;
+    std::vector<double> sumGt;
+    strictGreaterStats(d, cntGt, sumGt);
+    std::vector<char> keep(d.size(), 0);
+    for (size_t y = 0; y < d.size(); ++y) {
+        keep[y] = (cntGt[y] < K && (P >= 1.0 || sumGt[y] < P)) ? 1 : 0;
+    }
+    return keep;
+}
+static std::vector<char> chainKeep(const std::vector<double> &d, int K, double P) {
+    std::vector<double> sorted = d;
+    std::sort(sorted.rbegin(), sorted.rend());
+    std::vector<char> topK(d.size(), 0);
+    if (K >= (int)d.size()) {
+        for (size_t y = 0; y < d.size(); ++y) topK[y] = (d[y] > 0) ? 1 : 0;
+    } else {
+        double pivot = sorted[K - 1];
+        for (size_t y = 0; y < d.size(); ++y) topK[y] = (d[y] > 0 && d[y] >= pivot) ? 1 : 0;
+    }
+    double s = 0;
+    for (size_t y = 0; y < d.size(); ++y) {
+        if (topK[y]) s += d[y];
+    }
+    std::vector<double> q(d.size(), 0.0);
+    if (s > 0) {
+        for (size_t y = 0; y < d.size(); ++y) {
+            if (topK[y]) q[y] = d[y] / s;
+        }
+    }
+    std::vector<int> cntGt;
+    std::vector<double> sumGt;
+    strictGreaterStats(q, cntGt, sumGt);
+    std::vector<char> keep(d.size(), 0);
+    for (size_t y = 0; y < d.size(); ++y) {
+        keep[y] = (topK[y] && (P >= 1.0 || sumGt[y] < P)) ? 1 : 0;
+    }
+    return keep;
+}
+static std::vector<double> filteredDist(const std::vector<double> &d, const std::vector<char> &keep) {
+    std::vector<double> out(d.size(), 0.0);
+    double s = 0;
+    for (size_t y = 0; y < d.size(); ++y) {
+        if (keep[y]) { out[y] = d[y]; s += d[y]; }
+    }
+    if (s > 0) {
+        for (double &x : out) x /= s;
+    }
+    return out;
+}
+
 int main() {
     check(cudaSetDevice(0));
     constexpr int vocab=128, samples=6000;
@@ -32,8 +117,10 @@ int main() {
     };
     // 可区分 JOINT/CHAIN 的 case：128 维几何偏斜分布（r=0.9），topK=20 < 128，
     // topP=0.95 的 nucleus 边界（~第 29 位）落在 top-K 之外：
-    //   JOINT 保留 top-20；CHAIN 先取 top-20 再在重归一化后做 nucleus，
-    //   会切掉 top-20 的尾部（~第 18-19 位），TV≈0.03，Z 检验可捕获。
+    //   JOINT 保留 top-20（|R_joint|=20）；CHAIN 先取 top-20 再在重归一化后做 nucleus，
+    //   保留 top-18（|R_chain|=18），JOINT-only 尾部 = {18,19}（按 JOINT 重归一后的草稿律
+    //   尾部质量 3.25%，N=6000 约 195 条，真卡实测 204 条），
+    //   TV≈0.03；真卡实测：验证侧退化为 CHAIN 时 max_z≈10.2 > 7（阈值）被捕获。
     {
         std::vector<float> p(vocab);
         double ps=0;
@@ -80,36 +167,29 @@ int main() {
             }
         }
         for(double &p:expectedP)p/=pSum;
-        // 自校验：当 top-k 与 top-p 同时生效时，JOINT 与 CHAIN 保留集必须不同，
-        // 否则该 case 无法捕获"验证侧 JOINT 分支退化为 CHAIN"的回归
+        // 过滤语义 CPU 模型（与上面 expectedP 同源，见文件头 helper）：
+        //   verifyJoint / verifyChain = 验证侧目标分布的 JOINT / CHAIN 保留集
+        //   draftJoint               = 草稿侧 q 的 JOINT 保留集（草稿采样走 JOINT 顺序）
+        std::vector<double> verifyDist = toDist(c.p, c.temperature);
+        std::vector<char> verifyJoint = jointKeep(verifyDist, verifyK, c.topP);
+        std::vector<char> verifyChain = chainKeep(verifyDist, verifyK, c.topP);
+        std::vector<double> verifyJointProb = filteredDist(verifyDist, verifyJoint);
+        std::vector<double> draftDist = toDist(c.q, c.temperature);
+        std::vector<char> draftJoint = jointKeep(draftDist, c.draftK, c.topP);
+        std::vector<double> draftJointProb = filteredDist(draftDist, draftJoint);
+        int draftKeepSize = 0, verifyTailSize = 0;
+        for (size_t y = 0; y < draftJoint.size(); ++y) if (draftJoint[y]) ++draftKeepSize;
         if (verifyK < (int)c.p.size() && c.topP < 1.0f) {
-            auto jointSet = [&c]() {
-                std::vector<int> s(c.p.size(),0);
-                for (size_t y=0;y<c.p.size();++y) {
-                    double cnt=0,sm=0;
-                    for (size_t z=0;z<c.p.size();++z) if (c.p[z]>c.p[y]) {cnt++;sm+=c.p[z];}
-                    if (cnt < c.verifyK && sm < c.topP) s[y]=1;
-                }
-                return s;
-            };
-            auto chainSet = [&c]() {
-                std::vector<double> sorted(c.p.begin(),c.p.end());
-                std::sort(sorted.rbegin(),sorted.rend());
-                double pivot = sorted[c.verifyK-1];
-                std::vector<double> q(c.p.size());
-                double s=0;
-                for (size_t j=0;j<q.size();++j) { if (c.p[j]>=pivot) q[j]=c.p[j]; s+=q[j]; }
-                for (auto &x:q) x/=s;
-                std::vector<int> r(q.size(),0);
-                for (size_t y=0;y<q.size();++y) {
-                    double sm=0;
-                    for (size_t z=0;z<q.size();++z) if (q[z]>q[y]) sm+=q[z];
-                    if (sm < c.topP) r[y]=1;
-                }
-                return r;
-            };
-            require(jointSet() != chainSet(),
-                "case cannot distinguish joint from chain filter order");
+            for (size_t y = 0; y < verifyJoint.size(); ++y) {
+                if (verifyJoint[y] && !verifyChain[y]) ++verifyTailSize;
+            }
+        }
+        // 自校验：当 top-k 与 top-p 同时生效时，JOINT 与 CHAIN 保留集必须不同且
+        // JOINT-only 尾部（R_joint \ R_chain）非空，否则该 case 无法捕获
+        // "验证侧 JOINT 分支退化为 CHAIN"的回归（尾部为空时二元断言恒真 = 空转）
+        if (verifyK < (int)c.p.size() && c.topP < 1.0f) {
+            require(verifyJoint != verifyChain && verifyTailSize > 0,
+                "case cannot distinguish joint from chain filter order (empty JOINT-only tail)");
         }
         double maxSumError=0;
         for (int i=0;i<samples;++i) {
@@ -122,11 +202,23 @@ int main() {
             for (int j=0;j<count;++j) {
                 int id=ids[i*c.draftK+j]; float probability=probabilities[i*c.draftK+j];
                 require(id>=0&&id<vocab&&!seen[id]&&probability>0,"invalid candidate set");
+                require(id<(int)draftJoint.size()&&draftJoint[id],
+                    "draft candidate is outside the JOINT keep set");
                 seen[id]=true; sum+=probability;
                 expectedDraft[id]+=probability;draftVariance[id]+=probability*(1.0-probability);
                 inSupport |= id==drafts[i];
             }
             require(inSupport,"draft is outside reported q support");
+            // 草稿侧 JOINT 覆盖断言：|R_joint| <= draftK 时候选集必须恰好覆盖 R_joint。
+            // master 的链式顺序会把 R_joint \ R_chain 的尾部 token（本 case = {18,19}）
+            // 从候选集中剔除（候选数只剩 |R_chain|），而"概率和 == 1"这类自洽检查
+            // 抓不到该回归——只有覆盖断言能抓到。
+            if (draftKeepSize <= c.draftK) {
+                for (int y=0;y<(int)draftJoint.size();++y) {
+                    require(!draftJoint[y]||(bool)seen[y],
+                        "draft candidates do not cover the JOINT keep set (chain-order regression?)");
+                }
+            }
             maxSumError=std::max(maxSumError,std::abs(sum-1));
             ++draftCounts[drafts[i]];
         }
@@ -150,52 +242,52 @@ int main() {
             ++verifiedCounts[output[2*i]];
             if(accepted[i]) { require(output[2*i]==drafts[i],"accepted token differs from draft"); ++acceptedTotal; }
         }
-        // JOINT/CHAIN 二元接收率测试：草稿来自 JOINT 过滤（保留 top-K=20），
-        // 因此 draft ∈ {0..19}。当 JOINT+CHAIN 退化时，CHAIN 在 top-K 内
-        // 重归一化后做 nucleus，会切掉 JOINT-only 尾部（典型 skewed_128_k20_p95
-        // 的 {18,19}）。此时：
-        //   - jointFilterOrder=true  下这些 token 的目标分布 p_J(d) > 0，
-        //     u·q(d) < p_J(d) ≈ 1（p_J 与 q 来自同一过滤），接收概率 ≈ 1；
-        //   - jointFilterOrder=false 下这些 token 的目标分布 p_C(d) = 0，
-        //     u·q(d) < 0 恒假，接收概率 = 0。
-        // 所以「draft ∈ JOINT-only 尾部」这一组在两种过滤下的接收数差异
-        // 接近 ±N，是稳定可分的二元信号（Fisher/Binomial N≈100 即 p<1e-30），
-        // 比分布 Z-test 灵敏几个数量级——后者要 N≈30K。
-        // 仅对 verifyK<支撑集 && topP<1 的 case 启用（否则 JOINT=CHAIN）。
+        // JOINT-only 尾部（R_joint \ R_chain）二元接收率测试：
+        // 草稿来自 JOINT 过滤，因此 draft 会落在 R_joint \ R_chain 的尾部
+        // （skewed_128_k20_p95：R_joint = {0..19}、R_chain = {0..17}，尾部 = {18,19}，
+        //  按 JOINT 重归一后的草稿律，尾部质量 3.25%，N=6000 约 195 条，真卡实测 204 条）。
+        //  该尾部在两个过滤顺序下的目标分布不同：
+        //   - jointFilterOrder=true （JOINT）：p_J(d) > 0，接收概率 = min(1, p_J(d)/q(d))；
+        //     草稿侧与验证侧同分布时 p_J(d) == q(d) → 恒收（结构性硬约束）；
+        //   - jointFilterOrder=false（CHAIN）：p_C(d) = 0 → 恒拒（结构性硬约束）。
+        // 判据必须是「在 R_joint 内但不在 R_chain 内」——不能写成「在 top-K 内但在
+        // 原始 nucleus 外」：后者在 JOINT 下同样被拒（JOINT 保留集本身含 nucleus 条件），
+        // 且对 nucleus 边界落在 top-K 之外的分布恒为空集，断言会退化成恒真（空转）。
+        // 仅对 verifyK<支撑集 && topP<1 的 case 启用（否则 JOINT == CHAIN）。
         int joBndAccept = 0, joBndTotal = 0, chBndAccept = 0;
-        if (verifyK < (int)c.p.size() && c.topP < 1.0f) {
-            // JOINT 保留集 = {rank<verifyK} ∩ {cumsum<topP}；其外的尾部 = JOINT-only
-            auto isJointTail = [&](int t) {
-                if (t < 0 || t >= (int)c.p.size()) return false;
-                // 排名 t 的"更大概率"个数 = rank
-                int rank = 0;
-                for (int z = 0; z < (int)c.p.size(); ++z)
-                    if (c.p[z] > c.p[t]) ++rank;
-                if (rank >= verifyK) return false;  // 已在 top-K 之外，永远拒
-                double sm = 0.0;
-                for (int z = 0; z < (int)c.p.size(); ++z)
-                    if (c.p[z] > c.p[t]) sm += c.p[z];
-                return sm >= c.topP;  // 在 top-K 内但在 nucleus 外 → JOINT 收、CHAIN 不收
-            };
-            // 链式组已在 line 142-145 调用过 accepted_chain/output_chain；这里直接用。
+        double joBndExpected = 0.0, joBndVariance = 0.0;
+        bool tailAlwaysAccepted = true;
+        if (verifyTailSize > 0) {
             for (int i = 0; i < samples; ++i) {
-                if (!isJointTail(drafts[i])) continue;
+                int d = drafts[i];
+                if (d < 0 || d >= (int)verifyJoint.size()) continue;
+                if (!verifyJoint[d] || verifyChain[d]) continue;
                 ++joBndTotal;
                 if (accepted[i]) ++joBndAccept;
                 require(accepted_chain[i] == 0,
-                    "joint-tail draft was accepted under CHAIN filter (expected 0); "
+                    "joint-only-tail draft was accepted under CHAIN filter (expected 0); "
                     "this signals jointFilterOrder=false is treating tail as in-support");
                 if (accepted_chain[i]) ++chBndAccept;
+                // Leviathan 接收概率 min(1, p_J(d)/q(d))；两侧同分布时恒为 1
+                double r = (draftJointProb[d] > 0) ?
+                    std::min(1.0, verifyJointProb[d]/draftJointProb[d]) : 0.0;
+                joBndExpected += r; joBndVariance += r*(1.0-r);
+                if (r < 1.0 - 1e-12) tailAlwaysAccepted = false;
             }
-            // 二元信号断言：CHAIN 必须把 JOINT-only 尾部的所有 draft 拒掉
-            // （一个都不收是 CHAIN 路径的硬约束；JOINT 全收是它的硬约束）。
-            // 这两道断言都来自过滤集合的定义，是结构性保证而非统计估计。
+            // 硬断言 1：CHAIN 必须把 JOINT-only 尾部的所有 draft 拒掉（一个都不收）
             require(chBndAccept == 0,
                 "CHAIN filter accepted a JOINT-only-tail draft; "
                 "jointFilterOrder=false path is inconsistent with nucleus boundary");
-            require(joBndAccept == joBndTotal,
-                "JOINT filter rejected a JOINT-only-tail draft; "
-                "jointFilterOrder=true path is wrong (should accept all in-keep-set drafts)");
+            if (tailAlwaysAccepted) {
+                // 硬断言 2：草稿与目标在同一 JOINT 保留集上同分布 → JOINT 必须全收
+                require(joBndAccept == joBndTotal,
+                    "JOINT filter rejected a JOINT-only-tail draft; "
+                    "jointFilterOrder=true path is wrong (should accept all in-keep-set drafts)");
+            } else {
+                // 异分布时按 Leviathan 期望值 min(1, p_J/q) 做 3σ 下界检验
+                require(joBndAccept >= joBndExpected - 3.0*std::sqrt(joBndVariance) - 3.0,
+                    "JOINT acceptance count is far below the Leviathan expectation");
+            }
         }
         double maxZ=0, ordinaryMaxZ=0, draftMaxZ=0;
         bool ok=maxSumError<1e-5;
@@ -216,6 +308,8 @@ int main() {
                   << ",\"draft_k\":" << c.draftK << ",\"accepted\":" << acceptedTotal
                   << ",\"max_q_sum_error\":" << maxSumError << ",\"max_z\":" << maxZ
                   << ",\"draft_max_z\":" << draftMaxZ << ",\"ordinary_max_z\":" << ordinaryMaxZ
+                  << ",\"draft_keep_size\":" << draftKeepSize
+                  << ",\"verify_joint_only_tail\":" << verifyTailSize
                   << ",\"joint_tail_drafts\":" << joBndTotal
                   << ",\"joint_tail_accepted_JOINT\":" << joBndAccept
                   << ",\"joint_tail_accepted_CHAIN\":" << chBndAccept
