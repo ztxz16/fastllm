@@ -1261,7 +1261,7 @@ def make_normal_llm_model(args, startup_progress = None):
                 model_type == "deepseek_v4"
             )
             # DeepSeek-V4.1 的内置 DSpark 草稿层同样存放在 mtp.*，但配置在 text_config 里，
-            # 且运行时的 block 可以小于 checkpoint 的训练 block（每轮少校验几个候选）
+            # 校验较短前缀时保留训练 block；候选数更大时扩展整个运行时草稿 block。
             is_deepseek_v41_model = (
                 architecture in ("DeepseekV41ForCausalLM",
                                  "DeepSeekV41ForCausalLM") or
@@ -1296,11 +1296,10 @@ def make_normal_llm_model(args, startup_progress = None):
                             "DeepSeek-V4 checkpoint is missing embedded DSpark "
                             "configuration")
                     if is_deepseek_v41_model:
-                        if not 1 <= dspark_tokens <= checkpoint_block:
+                        if dspark_tokens < 1:
                             raise ValueError(
-                                "DeepSeek-V4.1 DSpark draft tokens must be in "
-                                "[1, checkpoint block size] (requested=%d, checkpoint=%d)" %
-                                (dspark_tokens, checkpoint_block))
+                                "DeepSeek-V4.1 DSpark draft tokens must be positive "
+                                "(requested=%d)" % dspark_tokens)
                     elif dspark_tokens < checkpoint_block:
                         raise ValueError(
                             "DSpark draft tokens must be at least the checkpoint training "

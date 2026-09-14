@@ -28,6 +28,7 @@
 using namespace fastllm;
 
 #ifdef USE_CUDA
+#include "devices/cuda/fastllm-cuda.cuh"
 // 融合 kernel 直接调用（模型里也是这样用的：拒绝时退回 HcApplyPre + RMSNorm 两步）
 extern "C" bool FastllmCudaDeepSeekV41HcPreNorm(const fastllm::Data &x, const fastllm::Data &pre,
                                      fastllm::Data &normWeight, float eps, fastllm::Data &output);
@@ -576,6 +577,148 @@ static void CheckHcPreNormFused() {
 }
 #endif
 
+
+#ifdef USE_CUDA
+static void CheckWoASmallBatch() {
+    std::mt19937 rng(1730);
+    std::normal_distribution<float> normal(0, .25f);
+    setenv("FASTLLM_DSV4_DISABLE_CUDA_WOA_GEMM", "1", 1);
+    for (DataType xt : {DataType::FLOAT32, DataType::FLOAT16, DataType::BFLOAT16}) {
+        for (DataType wt : {DataType::FLOAT32, DataType::FLOAT16, DataType::BFLOAT16}) {
+            for (int rank : {11, 12}) {
+                std::vector<float> wv(2 * rank * 128);
+                for (float &v : wv)
+                    v = normal(rng);
+                Data w(DataType::FLOAT32, {2, rank, 128}, wv);
+                ToDataType(w, wt);
+                ToDev(w, true);
+                for (auto shape : {std::pair<int, int>{1, 1},
+                                   {2, 1},
+                                   {7, 1},
+                                   {1, 2},
+                                   {1, 3},
+                                   {1, 4},
+                                   {1, 5},
+                                   {1, 6},
+                                   {1, 7},
+                                   {2, 4},
+                                   {3, 3},
+                                   {1, 10},
+                                   {1, 11},
+                                   {1, 12},
+                                   {1, 13},
+                                   {1, 14},
+                                   {1, 15},
+                                   {2, 8},
+                                   {1, 33}}) {
+                    int bs = shape.first, rows = shape.second;
+                    std::vector<float> xv(bs * rows * 8 * 32);
+                    for (float &v : xv)
+                        v = normal(rng);
+                    Data x(DataType::FLOAT32, {bs, rows, 8, 32}, xv);
+                    ToDataType(x, xt);
+                    ToDev(x, true);
+                    Data ref, out;
+                    setenv("FASTLLM_DSV4_DISABLE_CUDA_WOA_PAIR_BLOCK", "1", 1);
+                    Require(FastllmCudaDeepSeekV4WoA(x, w, 2, rank, ref), "WoA baseline rejected input");
+                    unsetenv("FASTLLM_DSV4_DISABLE_CUDA_WOA_PAIR_BLOCK");
+                    Require(FastllmCudaDeepSeekV4WoA(x, w, 2, rank, out), "WoA small batch rejected input");
+                    Require(ref.dims == out.dims && BitEqual(ReadFloats(ref), ReadFloats(out)),
+                            "WoA small batch changed BF16 result or output layout");
+                }
+            }
+        }
+    }
+    // Actual projection geometry, every small-batch size and GEMM boundary.
+    for (DataType wt : {DataType::FLOAT16, DataType::BFLOAT16}) {
+        std::vector<float> wv(size_t(8) * 1024 * 4096);
+        for (float &v : wv)
+            v = normal(rng);
+        Data w(DataType::FLOAT32, {8, 1024, 4096}, wv);
+        ToDataType(w, wt);
+        ToDev(w, true);
+        for (int rows : {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}) {
+            std::vector<float> xv(rows * 64 * 512);
+            for (float &v : xv)
+                v = normal(rng);
+            Data x(DataType::FLOAT32, {1, rows, 64, 512}, xv);
+            ToDataType(x, DataType::BFLOAT16);
+            ToDev(x, true);
+            Data ref, out;
+            setenv("FASTLLM_DSV4_DISABLE_CUDA_WOA_PAIR_BLOCK", "1", 1);
+            Require(FastllmCudaDeepSeekV4WoA(x, w, 8, 1024, ref), "WoA full-size baseline rejected");
+            unsetenv("FASTLLM_DSV4_DISABLE_CUDA_WOA_PAIR_BLOCK");
+            Require(FastllmCudaDeepSeekV4WoA(x, w, 8, 1024, out), "WoA full-size optimized rejected");
+            Require(BitEqual(ReadFloats(ref), ReadFloats(out)), "WoA full-size BF16 mismatch");
+        }
+    }
+    unsetenv("FASTLLM_DSV4_DISABLE_CUDA_WOA_GEMM");
+    std::cout
+        << "  [cuda] WoA small batch: all float dtypes, odd ranks, batch layout and real geometry bit-identical\n";
+}
+
+static void CheckHcSmallBatch() {
+    std::mt19937 rng(1729);
+    std::normal_distribution<float> normal(0.0f, 0.5f);
+    for (DataType dtype : {DataType::FLOAT32, DataType::FLOAT16, DataType::BFLOAT16}) {
+        for (int dim : {65, 5120}) {
+            for (auto shape : {std::pair<int, int>{1, 1},
+                               {1, 2},
+                               {1, 3},
+                               {1, 4},
+                               {1, 5},
+                               {1, 6},
+                               {1, 7},
+                               {2, 3},
+                               {2, 4},
+                               {1, 9},
+                               {1, 33}}) {
+                const int bs = shape.first, rows = shape.second;
+                std::vector<float> xv(bs * rows * 4 * dim), fv(24 * 4 * dim), bv(24);
+                for (float &v : xv)
+                    v = normal(rng);
+                for (float &v : fv)
+                    v = normal(rng) * 0.02f;
+                for (float &v : bv)
+                    v = normal(rng);
+                Data x(DataType::FLOAT32, {bs, rows, 4, dim}, xv);
+                ToDataType(x, dtype);
+                ToDev(x, true);
+                Data fn(DataType::FLOAT32, {24, 4 * dim}, fv);
+                Data scale(DataType::FLOAT32, {3}, std::vector<float>{0.7f, 1.1f, 0.9f});
+                Data base(DataType::FLOAT32, {24}, bv);
+                for (int iterations : {1, 20}) {
+                    std::vector<std::vector<float>> expected;
+                    const char *flag = "FASTLLM_DSV41_LEGACY_HCMIX_DECODE";
+                    for (bool legacy : {true, false}) {
+                        if (legacy)
+                            setenv(flag, "1", 1);
+                        else
+                            unsetenv(flag);
+                        Data pre, post, comb;
+                        Require(FastllmCudaDeepSeekV41HcMix(x, fn, scale, base, 4, iterations, 1e-6f, 1e-5f, pre, post,
+                                                            comb),
+                                "HC small-batch rejected input");
+                        Require(pre.dims == std::vector<int>({bs, rows, 4}) &&
+                                    comb.dims == std::vector<int>({bs, rows, 4, 4}),
+                                "HC batch output shape mismatch");
+                        std::vector<std::vector<float>> values = {ReadFloats(pre), ReadFloats(post), ReadFloats(comb)};
+                        if (legacy)
+                            expected = values;
+                        else
+                            for (size_t j = 0; j < values.size(); ++j)
+                                Require(BitEqual(values[j], expected[j]),
+                                        "HC small-batch differs from original reduction");
+                    }
+                    unsetenv(flag);
+                }
+            }
+        }
+    }
+    std::cout << "  [cuda] HC small batch: all dtypes, batch/token layout, 1-8 rows and fallback bit-identical\n";
+}
+#endif
+
 int main() {
     try {
         gHasCuda = Exec().HasDevice("cuda");
@@ -614,6 +757,8 @@ int main() {
 #ifdef USE_CUDA
             std::cout << "== HcApplyPre + RMSNorm 融合 ==\n";
             CheckHcPreNormFused();
+            CheckHcSmallBatch();
+            CheckWoASmallBatch();
 #endif
         } else {
             std::cout << "(未编译 / 未检测到 CUDA，跳过 GPU 部分)\n";

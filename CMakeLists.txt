@@ -718,6 +718,12 @@ if (UNIT_TEST)
         add_test(NAME qwen35_prefix_managers COMMAND qwen35_prefix_managers_test)
         # Manager tensors stay on CPU, but Qwen model destruction touches CUDA.
         set_tests_properties(qwen35_prefix_managers PROPERTIES LABELS cuda RUN_SERIAL TRUE TIMEOUT 120)
+        add_executable(deepseekV41SamplingRegression test/ops/deepseekV41SamplingRegression.cpp)
+        target_include_directories(deepseekV41SamplingRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        target_link_libraries(deepseekV41SamplingRegression PRIVATE fastllm)
+        add_test(NAME deepseek_v41_sampling COMMAND deepseekV41SamplingRegression)
+        set_tests_properties(deepseek_v41_sampling PROPERTIES
+                             LABELS cuda TIMEOUT 300 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
         add_executable(qwen35_mtp_tp_test test/basic/test_qwen35_mtp_tp.cpp)
         target_link_libraries(qwen35_mtp_tp_test PRIVATE fastllm)
         add_test(NAME qwen35_mtp_tp COMMAND qwen35_mtp_tp_test)

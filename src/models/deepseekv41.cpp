@@ -4347,21 +4347,32 @@ namespace fastllm {
         }
 #endif
 
-        // ---- DSpark 校验片段：对本片段的每个位置都出贪心 token ----
-        // 只在单片段（单请求）时启用，见 ForwardSingle。要求请求是简单贪心，因此
-        // 这里的 RMSNorm + head + TopK 与 LLMSamplingBlock 的 allSimple 分支等价。
-        if (numSegments == 1 && segments[0].spec != nullptr && segments[0].spec->wantAllGreedy) {
+        // ---- DSpark 校验片段：计算每个位置的目标 logits ----
+        // Greedy uses argmax; sampling uses the same target filtering as
+        // LLMSamplingBlock and the shared Qwen chain-rejection implementation.
+        if (numSegments == 1 && segments[0].spec != nullptr && segments[0].spec->wantAllTokens) {
             Data allHidden, normed, allLogits, topk;
             V41HcApplyPre(*curHidden, *preMixPtr, allHidden);
             RMSNorm(allHidden, weight["norm.weight"], rms_norm_eps, normed);
-            // DSpark 校验分支自己做 TopK，需要完整 logits，这里让 head 走复制布局
+            // DSpark 校验自己做 argmax / 拒绝采样，需要完整 logits，head 走复制布局
             if (tp) {
                 weight["head.weight"].tpLinearType = TP_LINEAR_NONE;
             }
             quantizedLinear(normed, "head.weight", allLogits, tp);
             ToDataType(allLogits, DataType::FLOAT32);
-            segments[0].spec->greedy.resize(seqlen);
-            if (tp && allLogits.multiDeviceData && allLogits.IsTensorParallelReplicated()) {
+            segments[0].spec->tokens.resize(seqlen);
+            const GenerationConfig sampling = DsparkSamplingConfig(generationConfigsIn[0]);
+            if (!sampling.IsSimpleGreedy()) {
+                Data rootLogits;
+                Data *samplingLogits = &allLogits;
+                if (tp && allLogits.multiDeviceData && allLogits.IsTensorParallelReplicated()) {
+                    V41ReplicaToCpu(rootLogits, allLogits, tpDevices);
+                    rootLogits.ToDevice(DataDevice::CUDA, std::vector<int>{tpDevices[0]});
+                    samplingLogits = &rootLogits;
+                }
+                DsparkSampleVerify(*samplingLogits, *segments[0].state->dspark,
+                                    *segments[0].spec, sampling);
+            } else if (tp && allLogits.multiDeviceData && allLogits.IsTensorParallelReplicated()) {
                 // TopK 没有 multicuda 实现，会退回单卡读复制布局已失效的 root；
                 // 这里直接从副本拷到 CPU 上自己取 argmax。
                 Data cpuLogits;
@@ -4376,7 +4387,7 @@ namespace fastllm {
                             best = v;
                         }
                     }
-                    segments[0].spec->greedy[i] = best;
+                    segments[0].spec->tokens[i] = best;
                 }
             } else {
                 TopK(allLogits, topk, 1);
@@ -4384,13 +4395,15 @@ namespace fastllm {
                 const int stride = topk.dims[topk.dims.size() - 1];
                 const float *topkData = (const float*)topk.cpuData;
                 for (int i = 0; i < seqlen; i++) {
-                    segments[0].spec->greedy[i] = (int)(topkData[(uint64_t)i * stride] + 1e-3);
+                    segments[0].spec->tokens[i] = (int)(topkData[(uint64_t)i * stride] + 1e-3);
                 }
             }
             for (auto &seg : segments) {
                 seg.state->totalLen += seg.seqlen;
             }
-            return std::vector<int>{segments[0].spec->greedy[seqlen - 1]};
+            const int last = segments[0].spec->acceptedDrafts >= 0 ?
+                segments[0].spec->acceptedDrafts : seqlen - 1;
+            return std::vector<int>{segments[0].spec->tokens[last]};
         }
 
         // ---- head（每个片段只取最后一个 token）----
@@ -4414,9 +4427,7 @@ namespace fastllm {
         std::vector<int> samplingSeqLens(numSegments, 1);
         std::vector<GenerationConfig> generationConfigs = generationConfigsIn;
         for (auto &config : generationConfigs) {
-            if (config.do_sample && config.top_k <= 1 && config.temperature > 1e-6f) {
-                config.top_k = 5;
-            }
+            config = DsparkSamplingConfig(config);
         }
         // head 按行切分：两张卡各算一半词表，LLMSamplingBlock 的
         // SampleTensorParallelGreedyLogits / GatherTensorParallelLogitsToRoot 负责合并。

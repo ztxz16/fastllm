@@ -628,12 +628,14 @@ namespace {
         }
     }
 
-    // Decode has only one token: give each dot product its own block so
-    // the 2 MB HC matrix is read across SMs. Each output retains the previous
-    // 256-thread strided accumulation and warp-reduction order.
+    // Small decode/verify batches need parallelism across dot products as
+    // well as tokens: the four-token kernel otherwise uses only one SM.
+    // Retain each output's 256-thread strided accumulation and reduction order.
     template <typename T>
     __global__ void V41HcDecodeDots(const T *x, const float *fn, int flatDim, float *mix) {
         const int m = blockIdx.x;
+        x += (uint64_t)blockIdx.y * flatDim;
+        mix += (uint64_t)blockIdx.y * 25;
         float acc = 0.0f;
         for (int k = threadIdx.x; k < flatDim; k += kHcThreads) {
             const float value = V41Load(x, k);
@@ -654,7 +656,9 @@ namespace {
                                      int flatDim, int sinkhornIters, float eps, float normEps,
                                      float *pre, float *post, float *comb) {
         if (threadIdx.x != 0) return;
-        constexpr int HC = 4, t = 0;
+        constexpr int HC = 4;
+        const int t = blockIdx.x;
+        mix += (uint64_t)t * 25;
         const float rsqrtv = rsqrtf(mix[24] / flatDim + normEps);
         float *preOut = pre + (uint64_t)t * HC;
         float *postOut = post + (uint64_t)t * HC;
@@ -2321,18 +2325,18 @@ extern "C" bool FastllmCudaDeepSeekV41HcMix(const fastllm::Data &x, fastllm::Dat
     hcFn.ToDevice(DataDevice::CUDA);
     hcScale.ToDevice(DataDevice::CUDA);
     hcBase.ToDevice(DataDevice::CUDA);
-    if (tokens == 1 && hcMult == 4 && !V41EnvOn("FASTLLM_DSV41_LEGACY_HCMIX") &&
+    if (tokens >= 1 && tokens <= 8 && hcMult == 4 && !V41EnvOn("FASTLLM_DSV41_LEGACY_HCMIX") &&
         !V41EnvOn("FASTLLM_DSV41_LEGACY_HCMIX_DECODE")) {
         Data scratch;
-        if (!V41PrepareOutput(scratch, DataType::FLOAT32, {25})) return false;
+        if (!V41PrepareOutput(scratch, DataType::FLOAT32, {tokens, 25})) return false;
         float *mix = (float *)scratch.cudaData;
         if (x.dataType == DataType::BFLOAT16)
-            V41HcDecodeDots<<<25, kHcThreads>>>((const __nv_bfloat16 *)x.cudaData, (const float *)hcFn.cudaData, hcMult * dim, mix);
+            V41HcDecodeDots<<<dim3(25, tokens), kHcThreads>>>((const __nv_bfloat16 *)x.cudaData, (const float *)hcFn.cudaData, hcMult * dim, mix);
         else if (x.dataType == DataType::FLOAT16)
-            V41HcDecodeDots<<<25, kHcThreads>>>((const half *)x.cudaData, (const float *)hcFn.cudaData, hcMult * dim, mix);
+            V41HcDecodeDots<<<dim3(25, tokens), kHcThreads>>>((const half *)x.cudaData, (const float *)hcFn.cudaData, hcMult * dim, mix);
         else
-            V41HcDecodeDots<<<25, kHcThreads>>>((const float *)x.cudaData, (const float *)hcFn.cudaData, hcMult * dim, mix);
-        V41HcDecodeFinish<<<1, 32>>>(mix, (const float *)hcScale.cudaData, (const float *)hcBase.cudaData,
+            V41HcDecodeDots<<<dim3(25, tokens), kHcThreads>>>((const float *)x.cudaData, (const float *)hcFn.cudaData, hcMult * dim, mix);
+        V41HcDecodeFinish<<<tokens, 32>>>(mix, (const float *)hcScale.cudaData, (const float *)hcBase.cudaData,
             hcMult * dim, sinkhornIters, eps, normEps, (float *)pre.cudaData, (float *)post.cudaData, (float *)comb.cudaData);
         return V41CheckLaunch("HcMixDecode");
     }

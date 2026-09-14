@@ -592,8 +592,11 @@ decode 吞吐从 209 tok/s（1 并发）提高到 573 tok/s（8 并发）。
 ## DSpark 投机解码
 
 `config.json` 的 `text_config` 里 `dspark_block_size > 0` 且 checkpoint 带 `mtp.*` 权重时可以开启。
-启动加 `--speculative_algorithm dspark --dspark 5`（5 = `dspark_block_size`，也可以更小，
-每轮少校验几个候选）：
+启动加 `--speculative_algorithm dspark --dspark 5`。`--dspark N` 指每轮最多校验 N 个候选，
+运行时草稿长度取 `max(dspark_block_size, N)`：小于训练块时只校验前缀，
+大于训练块时扩展整个草稿前向，包含双向注意力和 Markov 链。
+本 checkpoint 训练块为 5，已验证 `--dspark 7`；全部接受时一轮最多输出 8 个 token。
+更长草稿的速度取决于接受率与校验成本，训练配置本身不需要修改。
 
 ```bash
 ftllm server /path/to/DeepSeek-V4.1-Flash \
@@ -603,7 +606,8 @@ ftllm server /path/to/DeepSeek-V4.1-Flash \
 
 `ftllm` 的自动配置（launcher）在 `enable_speculative_decoding` 时会识别 V4.1 的内置 DSpark，
 按 checkpoint 的训练 block size 填 `--draft_tokens`。不加 `--dspark` / `--draft_tokens` 时
-不加载 `mtp.*`（省下约 30 GB 权重）。
+不加载 `mtp.*`。本次量化 checkpoint 的草稿原始张量（含 scale）约 7.39 GiB；
+实际占用还受加载 dtype、权重转换和运行缓冲影响。
 
 ### 结构
 
@@ -619,13 +623,20 @@ MoE 是 `dspark_n_routed_experts` = 128 专家 top-3，embedding 与 lm_head 与
 
 一次 proposal：把 `block_size` 个位置的输入 token 置为 `dspark_noise_token_id`（第 0 个位置放锚点
 token，即目标模型刚产出、还没进 KV 缓存的那个 token），一次前向产出 `block_size` 组 logits；
-再用 markov head 逐位置做 bigram 修正后贪心采样，得到 `block_size` 个候选 token；
+再用 markov head 逐位置做 bigram 修正，得到 `block_size` 个候选 token；
 `confidence_head` 对每个位置给出一个 sigmoid 后的置信度。
+
+贪心请求取 argmax 草稿；采样请求按实际草稿分布逐位置抽样并保存候选 ID 与概率。
+每一步 Markov 修正使用上一步实际抽到的 token。草稿支持集最多 64 项，目标分布仍使用
+请求自己的 `temperature`、`top_k`、`top_p`。无需额外环境变量开启随机草稿或拒绝采样。
 
 ### 校验与回滚
 
 候选与锚点拼成一个 `1 + N` 长度的片段一次喂给目标模型（`ForwardSegments` 天然支持一次多 token），
-逐位置贪心比对，第一个不匹配处截断。接受 n 个候选时这一轮提交 n + 1 个 token、产出 n + 1 个输出
+贪心请求逐位置比较 argmax，第一个不匹配处截断。采样请求复用 `qwen3_5.cpp` 的链式拒绝采样：
+实际草稿概率为 q，目标条件概率为 p，以 `min(1, p(token)/q(token))` 接受候选；首次拒绝时从
+归一化的 `max(p-q, 0)` 抽取替代 token，全部接受时从额外目标行抽取 bonus token。
+接受 n 个候选时这一轮提交 n + 1 个 token、产出 n + 1 个输出
 token：第一个立刻返回，其余进入请求的待发队列，调度器之后每轮直接出队，不再前向。
 
 校验前向按完整 block 更新缓存，接受长度确定后要把多算的部分退回：
@@ -636,15 +647,16 @@ token：第一个立刻返回，其余进入请求的待发队列，调度器之
   （旧 `rawTail` + 本次新行）重建 `rawTail`；
 - Engram 历史与各层 `totalLen`：截断到接受后的长度。
 
-投机解码是精确的：接受的 token 就是目标模型在同一次前向里算出的贪心 token，因此开启 DSpark 与
-关闭时的贪心输出一致。唯一的差异来源与批量 decode 相同——一次多 token 的前向与逐 token 前向会
-选到不同的 GEMM kernel，BF16 舍入可能让几乎并列的 argmax 翻转（这一点不开 DSpark 时，
-一次大 prefill 与逐 token 解码之间同样存在）。
+拒绝采样在目标条件概率相同的前提下保持目标输出分布，不要求草稿分布等于目标分布。
+这不代表开启与关闭 DSpark 的原始 logits 逐 bit 一样，也不保证相同随机种子给出相同序列。
+一次多 token 与逐 token 前向会选择不同的 GEMM / MoE 路径，浮点舍入可能改变 logits，
+也可能翻转接近并列的 argmax；分布测试与浮点前向误差需要分别验证。
 
 ### 限制
 
-- 只对**简单贪心**请求生效：`do_sample` / `top_k > 1` / 重复惩罚 / 工具约束 / `output_logits` /
-  `output_token_least` 中任何一项打开，该请求就退回普通解码（草稿侧仍然保持滑窗同步）；
+- 支持简单贪心及 CUDA 上的 temperature / top-k / top-p 采样。重复惩罚、工具约束、
+  `output_logits`、正的 `output_token_least`、非有限采样参数会退回普通解码；CPU 采样也走普通路径。
+  与普通解码一样，`do_sample=true`、正温度且 `top_k<=1` 时将 top-k 规范化为 5；
 - 只在**单请求**前向里产生候选。批量 decode 的那一轮不投机，但仍然采集 main hidden，
   让草稿滑窗跟上目标缓存；已经校验通过的 token 在批量路径里也能正常出队；
 - 图文请求不投机；
@@ -668,7 +680,7 @@ token：第一个立刻返回，其余进入请求的待发队列，调度器之
 真实 checkpoint 的 `mtp.*`（3 个 stage × 128 专家，共 2401 个张量）已核对：加载器需要的 1221 个
 张量全部存在，量化格式与主干一致（稠密 FP8 32x32 + UE8M0 scale、路由专家 FP4 沿 K 每 32 个一组），
 `markov_head.embed/head` 为 BF16 `[129280, 256]`、`confidence_head.proj` 为 BF16 `[1, 5376]`。
-真实权重下的接受率与吞吐尚未测（需要双卡 + 全量权重）。
+真实权重下已验证双卡 NUMA 混合缓存与随机采样；吞吐和接受率随任务及采样参数变化。
 
 ### 接受率与分段计时
 
@@ -818,6 +830,12 @@ PYTHONPATH=build/tools python test/basic/deepseek_v41_dspark.py \
 - 迷你模型的 logits 是 BF16（分辨率约 1/32），几乎并列的 argmax 会因 GEMM 选核不同而翻转，
   脚本把"差距在 3 个 BF16 ulp 以内"的分歧判为并列，以 DSpark 的输出为新前缀重新跑基准继续比较；
 - 默认用 `--dtype float32` 与 2 专家 top-2、`index_topk` 大于压缩块数，减少随机权重下的并列。
+
+采样内核与 V4.1 接入分别用 `test/cuda/test_mtp_draft_sampling.cpp` 和
+`test/ops/deepseekV41SamplingRegression.cpp` 验证。前者检查 Gumbel-max 草稿支持集、
+temperature/top-k/top-p 与拒绝校正；后者对 3/4/5/7 个候选检查前三个输出的条件联合分布，
+覆盖固定 q、不同 p/q、相同 p/q，并检查请求回退和滑窗、压缩 KV、raw tail、Engram 的回滚。
+统计测试使用已知目标概率，不将随机序列逐 token 相同作为通过标准。
 
 - `--real-vision /path/to/DeepSeek-V4.1-Flash --image-size 640x480,1600x1200` 用真实 ViT 权重
   （aligner 维度依赖文本侧 dim，仍为随机）验证 32 层 ViT，包括接近 1024 token 上限的大图；
@@ -997,3 +1015,16 @@ ctest -R deepseekV41Ops                     # 无 CUDA 设备时以 77 跳过
 | `FT_MOE_ASSIST_DEVICES` / `FT_MOE_ASSIST_OVERLAP` / `FT_MOE_ASSIST_BALANCE` / `FT_EXPERT_LIMIT_AUTO` | NUMA MoE 的多卡专家流，见"prefill 的多卡专家流" |
 | `FASTLLM_NUMAS_MOE_ASSIST_PROFILE` | 按层打印 NUMA MoE prefill 的分阶段耗时（stage / limit / prep / cpu / join / reduce） |
 | `FASTLLM_NUMAS_MOE_GPU_TRACE` | 打印每层的 CPU / GPU 专家划分与各卡拿到的专家数 |
+
+## DSpark 与专家缓存验证
+
+CUDA + NUMA 混合专家缓存会自动处理 2–8 行 verify，配置和命中率口径见
+[CUDA 专家缓存](cuda-expert-cache.md#deepseek-v41)。HC mix 支持 1–8 行小批量；
+WoA 对小于 16 行的批次复用权重，保持各输出的累加顺序，其他形状走已有路径。
+草稿的稠密层、路由专家、共享专家与 HC post 复用主干的量化和 BF16 舍入语义。
+
+`deepseekV41SamplingRegression` 检查实际 CUDA 拒绝采样器的输出分布、部分拒绝、
+bonus token 和缓存回滚；`deepseekV41OpsRegression` 检查小批量算子与原归约路径；
+`cuda_dsv41_moe_cache_test --dual` 检查独立数值参考和跨卡缓存切换。
+编程模板在 top-p 截断后可能只剩一个候选，因此高接受率本身不能证明使用了贪心验证；
+评估时应记录采样参数、拒绝轮数和代码功能结果，分别检查采样校正与前向浮点误差。

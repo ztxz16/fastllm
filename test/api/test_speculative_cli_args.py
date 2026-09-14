@@ -230,6 +230,35 @@ class SpeculativeDraftCliAliasesTest(unittest.TestCase):
                 self.assertEqual(
                     fake_llm.model.call_args.kwargs["external_mtp_path"], "")
 
+    def test_deepseek_v41_dspark_accepts_shorter_and_longer_blocks(self):
+        with tempfile.TemporaryDirectory() as model_path:
+            self.write_draft_config(model_path, {
+                "architectures": ["DeepseekV41ForCausalLM"],
+                "model_type": "deepseek_v41",
+                "text_config": {
+                    "dspark_block_size": 5,
+                    "dspark_target_layer_ids": [40, 41, 42],
+                    "dspark_noise_token_id": 128799,
+                },
+            })
+            for tokens in (3, 5, 7):
+                with self.subTest(tokens=tokens):
+                    args = make_normal_parser("test").parse_args([
+                        model_path, "--device", "cuda", "--dspark", str(tokens),
+                    ])
+                    fake_model = MagicMock()
+                    fake_model.get_max_input_len.return_value = 4096
+                    fake_model.get_max_batch.return_value = 1
+                    fake_ftllm = types.ModuleType("ftllm")
+                    fake_ftllm.llm = MagicMock()
+                    fake_ftllm.llm.model.return_value = fake_model
+                    with patch.dict(os.environ, {}, clear=True), \
+                            patch.dict(sys.modules, {"ftllm": fake_ftllm}), \
+                            redirect_stdout(io.StringIO()):
+                        self.assertIs(make_normal_llm_model(args), fake_model)
+                        self.assertEqual(os.environ["FASTLLM_DSPARK_TOKENS"], str(tokens))
+                        self.assertEqual(args.speculative_algorithm, "dspark")
+
     def test_deepseek_v4_mtp_rejects_shorter_than_trained_block(self):
         with tempfile.TemporaryDirectory() as model_path:
             self.write_draft_config(model_path, {
