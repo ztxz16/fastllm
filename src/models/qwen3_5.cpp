@@ -36,6 +36,7 @@
 #ifdef USE_CUDA
 #include "models/qwen3_cuda_common.h"
 #include "devices/cuda/fastllm-cuda-fp8.h"
+#include "devices/cuda/fastllm-cuda-mtp.cuh"
 #endif
 
 #ifdef USE_TFACC
@@ -17074,11 +17075,21 @@ namespace fastllm {
                         std::vector<float> temperatures(rows, config.temperature), topPs(rows, config.top_p);
                         std::vector<int> topKs(rows, config.top_k);
                         int accepted = 0;
-                        bool ok = FastllmCudaMtpRejectionSampling(
-                            rowLogits, (float*)proposal->proposalProbs.cudaData,
-                            temperatures.data(), topKs.data(), topPs.data(),
-                            proposal->proposalTokens.data(), sampled.data() + offset,
-                            &accepted, 1, drafts, vocabSize);
+                        bool ok;
+                        if (proposal->proposalUsesLogits) {
+                            ok = FastllmCudaMtpRejectionSamplingLogits(rowLogits,
+                                (float*)proposal->proposalProbs.cudaData,
+                                (float*)proposal->proposalLogsumexp.cudaData,
+                                (int*)proposal->proposalDeviceTokens.cudaData,
+                                temperatures.data(), topKs.data(), topPs.data(),
+                                sampled.data() + offset, &accepted, 1, drafts, vocabSize);
+                        } else {
+                            ok = FastllmCudaMtpRejectionSampling(
+                                rowLogits, (float*)proposal->proposalProbs.cudaData,
+                                temperatures.data(), topKs.data(), topPs.data(),
+                                proposal->proposalTokens.data(), sampled.data() + offset,
+                                &accepted, 1, drafts, vocabSize);
+                        }
                         AssertInFastLLM(ok, "MTP CUDA rejection sampling failed.\n");
                         for (int i = 0; i < accepted; ++i)
                             speculativeMtpAccepted[offset + i] = 1;
@@ -29478,6 +29489,40 @@ namespace fastllm {
                 topPs[b] = config.top_p;
                 topKs[b] = config.top_k;
             }
+        }
+        if (Qwen35EnvDefaultEnabled("FASTLLM_MTP_GUMBEL")) {
+            for (int b = 0; b < batch; ++b) {
+                MtpKvCache &cache = *caches[b];
+                const int capacity = std::max(1, Qwen35MtpDraftsPerStep());
+                const int slot = cache.proposalTokens.size();
+                auto prepare = [&](Data &data, DataType type) {
+                    data.dataType = type; data.UpdateUnitSize();
+                    Qwen3CudaPrepareLocalOutput(data, device);
+                    data.Resize({capacity}); data.Allocate();
+                };
+                prepare(cache.proposalDeviceTokens, DataType::INT32);
+                if (!cache.sampleProposal) {
+                    FastllmCudaGreedySampling((float*)logits.cudaData + (size_t)b * vocab,
+                        (int*)cache.proposalDeviceTokens.cudaData, 1, vocab);
+                    FastllmCudaCopyFromDeviceToHost(&tokens[b],
+                        cache.proposalDeviceTokens.cudaData, sizeof(int));
+                    continue;
+                }
+                prepare(cache.proposalLogsumexp, DataType::FLOAT32);
+                cache.proposalUsesLogits = true;
+                AssertInFastLLM(FastllmCudaMtpSampleDraftLogits(
+                    (float*)logits.cudaData + (size_t)b * vocab, destinations[b],
+                    (float*)cache.proposalLogsumexp.cudaData + slot,
+                    (int*)cache.proposalDeviceTokens.cudaData + slot,
+                    nullptr,
+                    &temperatures[b], 1, vocab), "MTP Gumbel proposal sampling failed.\n");
+                FastllmCudaCopyFromDeviceToHost(&tokens[b],
+                    (int*)cache.proposalDeviceTokens.cudaData + slot, sizeof(int));
+                AssertInFastLLM(tokens[b] >= 0 && tokens[b] < vocab,
+                    "MTP Gumbel proposal has no finite token.\n");
+                cache.proposalTokens.push_back(tokens[b]);
+            }
+            return tokens;
         }
         Data probabilities(DataType::FLOAT32);
         float *sampleProbs = batch == 1 ? destinations[0] : nullptr;

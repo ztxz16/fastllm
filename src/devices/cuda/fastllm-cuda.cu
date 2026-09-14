@@ -7,6 +7,7 @@
 
 #define FASTLLM_CUDA_NO_MALLOC_CHECK_MACRO
 #include "fastllm-cuda.cuh"
+#include "fastllm-cuda-mtp.cuh"
 #ifndef USE_ROCM
 #include "fastllm-cuda-ordered-reduce.cuh"
 #endif
@@ -15957,6 +15958,21 @@ bool FastllmCudaMtpRejectionSampling(float *logits, float *proposalProbs,
                 output[b * (draftTokens + 1) + i] >= vocabSize) return false;
     }
     return true;
+}
+
+bool FastllmCudaMtpRejectionSamplingLogits(float *logits,
+        const float *proposalLogits, const float *proposalLogsumexp,
+        const int *deviceDraftTokens, const float *temperatures,
+        const int *topKs, const float *topPs, int *output, int *accepted,
+        int batch, int drafts, int vocab) {
+    if (!logits || !proposalLogits || !proposalLogsumexp || !deviceDraftTokens ||
+        !temperatures || !topKs || !topPs || !output || !accepted ||
+        batch <= 0 || drafts <= 0 || drafts > 8 || vocab <= 0) return false;
+    const int rows = batch * (drafts + 1);
+    FastllmMtpSamplingWorkspace ws(rows, vocab);
+    if (!ws.Prepare(logits, temperatures, topKs, topPs, rows, vocab)) return false;
+    return FastllmCudaMtpRejectionFromProbs(ws.a, proposalLogits, proposalLogsumexp,
+        deviceDraftTokens, output, accepted, batch, drafts, vocab);
 }
 
 struct FastllmGreedyPartial {

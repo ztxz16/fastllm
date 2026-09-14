@@ -240,13 +240,17 @@ namespace fastllm {
             // The actual proposal distribution belongs to this chain.
             // Truncate only changes KV, never the saved proposal or tokens.
             bool sampleProposal = false;
+            bool proposalUsesLogits = false;
             GenerationConfig proposalConfig;
             Data proposalProbs;
+            Data proposalLogsumexp;
+            Data proposalDeviceTokens;
             std::vector<int> proposalTokens;
             void BeginProposal(const GenerationConfig &config) {
                 sampleProposal = !config.IsSimpleGreedy();
                 proposalConfig = config;
                 proposalTokens.clear();
+                proposalUsesLogits = false;
             }
             // TP parents keep only global shape/length; each rank owns its pages.
             std::map<int, std::unique_ptr<MtpKvCache> > shards;

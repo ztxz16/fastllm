@@ -219,7 +219,7 @@ ftllm server /path/to/model --tp 2 --mtp 5 --speculative_algorithm mtp
 
 greedy 请求仍使用贪心草稿和精确匹配验证。DFlash 使用自己的提案状态和验证路径。
 
-随机草稿保存经过请求温度及 top-k/top-p 过滤的完整概率数组 q，验证时按该实际分布进行拒绝采样。长预填充首次播种也保存对应的 q，供随后验证使用。
+默认通过 Gumbel-max 融合生成随机草稿，并保存温度缩放后的 logits 和归一化常数；此时 q 不做 top-k/top-p 截断，目标 p 仍保留请求的全部过滤。设置 `FASTLLM_MTP_GUMBEL=0` 可使用保存完整概率数组的实现，q 此时也经过 top-k/top-p 过滤；两者均按实际 q 做拒绝采样，关闭 Gumbel 不会切回贪心草稿。长预填充首次播种也保存对应的 q，供随后验证使用。
 
 NVIDIA SM75 及以下（包括 RTX 2080 Ti）默认关闭 CUDA Graph；普通 Qwen3.5 系列推理仅在所有参与 GPU 的算力均大于 7.5 且满足自动启用条件时开启，MTP 模式不自动开启。可通过 `FASTLLM_CUDA_GRAPH=1` 显式开启或 `FASTLLM_CUDA_GRAPH=0` 显式关闭。全局 Graph 关闭时，随机草稿和完整分布拒绝采样仍然生效。
 

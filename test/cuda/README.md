@@ -1,6 +1,6 @@
 # CUDA 分页与草稿采样回归检查
 
-`test_paged_int_params.cpp` 检查分页上传的 0/256/512/1024/2048/4096 边界、最大元数据长度、越界保护、4097 页回退，以及修改主机数组后的 Graph 重放。MTP 分布检查使用 `test/basic/test_cuda_mtp_rejection.cpp`，覆盖实际草稿 q、完整分布拒绝采样、温度、联合 top-k/top-p、残差和 bonus。旧候选集 MTP 采样接口及其专用测试已移除。
+`test_paged_int_params.cpp` 检查分页上传的 0/256/512/1024/2048/4096 边界、最大元数据长度、越界保护、4097 页回退，以及修改主机数组后的 Graph 重放。MTP 分布检查使用 `test/basic/test_cuda_mtp_gumbel.cpp` 和 `test/basic/test_cuda_mtp_rejection.cpp`，覆盖实际草稿 q、完整分布拒绝采样、温度、联合 top-k/top-p、残差、bonus 和 Graph 随机性。旧候选集 MTP 采样接口及其专用测试已移除。
 
 `test/basic/test_qwen35_mtp_sampling.cpp` 直接通过模型 `ForwardGPU` 验证目标采样和贪心草稿接受，包括重复状态的退出概率、目标分布之外的草稿、bonus、混合请求长度和无草稿请求。对应 CTest 为 `qwen35_mtp_sampling` 和 `qwen35_mtp_sampling_batch`，无需额外的公开采样辅助接口。
 
@@ -9,7 +9,7 @@
 ```sh
 FASTLLM_TEST_LIBRARY_DIR="$PWD/build"
 FASTLLM_TEST_CUDA_DIR=/usr/local/cuda
-for test_source in test/cuda/test_paged_int_params.cpp test/basic/test_cuda_mtp_rejection.cpp; do
+for test_source in test/cuda/test_paged_int_params.cpp test/basic/test_cuda_mtp_gumbel.cpp test/basic/test_cuda_mtp_rejection.cpp; do
     test_name=$(basename "$test_source" .cpp)
     g++ -O2 -std=c++17 -DUSE_CUDA -pthread -Iinclude -Ithird_party/json11 \
         -I"$FASTLLM_TEST_CUDA_DIR/include" "$test_source" \

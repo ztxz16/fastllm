@@ -296,6 +296,16 @@ namespace {
         FastllmCudaCopyFromDeviceToHost(qa.data(), a.proposalProbs.cudaData, 64 * sizeof(float));
         FastllmCudaCopyFromDeviceToHost(qb.data(), b.proposalProbs.cudaData, 64 * sizeof(float));
         const auto saved = qb;
+        if (a.proposalUsesLogits) {
+            float lse;
+            FastllmCudaCopyFromDeviceToHost(&lse, a.proposalLogsumexp.cudaData, sizeof(float));
+            for (float &x : qa) x = std::exp(x - lse);
+        }
+        if (b.proposalUsesLogits) {
+            float lse;
+            FastllmCudaCopyFromDeviceToHost(&lse, b.proposalLogsumexp.cudaData, sizeof(float));
+            for (float &x : qb) x = std::exp(x - lse);
+        }
         float sum = 0;
         for (int i = 0; i < 64; ++i) {
             Require(std::isfinite(qb[i]) && qb[i] >= 0 && std::fabs(qa[i] - qb[i]) < .002f,
