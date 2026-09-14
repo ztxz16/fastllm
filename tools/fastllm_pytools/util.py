@@ -825,6 +825,8 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--kv_cache_limit', type = str, default = "auto",  help = 'kv缓存最大使用量')
     parser.add_argument('--max_batch', type = int, default = -1,  help = '每次最多同时推理的询问数量')
     parser.add_argument('--chunked_prefill_size', type = int, default = -1, help = '分块 prefill 的切片大小（首块与后续块相同），如 8192')
+    parser.add_argument('--fast_prefill', '--fast-prefill', action = 'store_true',
+                        help = '启用DeepSeek-V4.1近似 prefill：后段层只计算末尾滑窗，可能改变 logits；默认关闭')
     parser.add_argument('--device', type = str, help = '使用的设备')
     parser.add_argument('--vision_device', '--vision-device', dest = 'vision_device',
                         type = _vision_device, default = None,
@@ -1594,6 +1596,8 @@ def make_normal_llm_model(args, startup_progress = None):
         args.moe_device = expand_cudapp_device(args.moe_device)
     _configure_sm89_fp8_linear_triton(args)
     _configure_qwen35_auto_fast_paths(args, is_qwen35_model, mtp)
+    os.environ["FASTLLM_DSV41_DECODER_SWA_BOUNDED_REPLAY"] = (
+        "1" if _arg_enabled(getattr(args, "fast_prefill", False)) else "0")
     from ftllm import llm
     if hasattr(llm, "set_cuda_graph"):
         llm.set_cuda_graph(_fastllm_env_flag_enabled("FASTLLM_CUDA_GRAPH"))

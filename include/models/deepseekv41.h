@@ -104,6 +104,7 @@ namespace fastllm {
         bool captureMain = false;     // 采集 dspark_target_layer_ids 各层的 main hidden
         bool deferWindow = false;     // 滑窗写入延后到接受长度确定之后
         bool wantAllTokens = false;   // head 对本片段的每个位置计算目标 logits
+        int mainHiddenStartPos = -1;  // bounded prefill 只采集末尾窗口，记录其绝对起点
         std::vector<Data> mainHidden;         // [目标层数]，每个 [1, seqlen, dim]
         std::vector<Data> windowKV;           // [block_cnt]，本次前向的滑窗 KV（延后写入）
         std::vector<Data> rawKV, rawScore;    // kv source 层：压缩器的原始输入流（含旧 rawTail）
@@ -256,6 +257,7 @@ namespace fastllm {
         // -------- 跨层共享 --------
         std::vector<int> kv_source_layer_ids;
         std::vector<int> index_source_layer_ids;
+        int decoderSwaTailLayer = -1; // 可选近似 prefill：此层起只计算各片段的末尾窗口
         int candidate_source_layer_id = -1;
         int candidate_topk_blocks = 0;
         int candidate_block_size = 0;
@@ -341,7 +343,7 @@ namespace fastllm {
         // inputEmbeds 非空时直接作为嵌入（[1, tokens, dim]，供视觉输入使用）；
         // imageMask 非空时标记每个 token 是否为图像 token（Engram 历史置 -1，路由改用 gate.bias_vl）。
         std::vector<int> ForwardSegments(
-                std::vector<DeepSeekV41Segment> &segments,
+                const std::vector<DeepSeekV41Segment> &inputSegments,
                 const Data &inputIds,
                 const Data *inputEmbeds,
                 const std::vector<int> *imageMask,

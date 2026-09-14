@@ -1174,6 +1174,9 @@ namespace fastllm {
 
     void DeepSeekV41Model::DsparkAdvance(DeepSeekV41RequestState &state, DeepSeekV41SpecScratch &scratch,
                                          int startPos, int committed, int anchorToken, const GenerationConfig &config) {
+        if (scratch.mainHiddenStartPos >= 0) {
+            startPos = scratch.mainHiddenStartPos;
+        }
         auto dsparkPtr = GetOrCreateDsparkState(state, startPos);
         DeepSeekV41DsparkState &dspark = *dsparkPtr;
         dspark.drafts.clear();

@@ -227,6 +227,26 @@ prefill 接近减半；decode 变慢，因为 multicuda 的 eager 调度对**每
 TP=2 的 decode 从 7.4 ms/token 降到 4.5 ms/token。**长上下文 / prefill 为主的负载开 `--tp 2`；
 纯 decode 负载开 `--tp 2` 时建议同时打开 CUDA Graph。**
 
+## 快速 prefill（`--fast_prefill`）
+
+```bash
+ftllm server /path/to/DeepSeek-V4.1-Flash --device cuda --moe_device numa \
+  --fast_prefill
+```
+
+默认关闭，也支持 `--fast-prefill` 写法，启动时以参数为准。
+开启后使用 decoder SWA bounded replay：每个文本 prefill chunk 完整计算到最后一个
+KV source 层，后续层只计算各请求末尾 `sliding_window` 个 token。V4.1-Flash 对应
+第 0–20 层处理完整 chunk，第 21–39 层处理末尾至多 128 token。
+长度不超过窗口的片段、包含图像嵌入或图像掩码的前向保持完整计算。
+
+压缩 KV 和 indexer key 仍完整保留，RoPE、缓存槽位和请求长度使用原始绝对位置。
+支持分块 prefill、混合批次、前缀缓存恢复及 DSpark；DSpark 的 main hidden 同步取尾部，
+verify 始终计算全部候选位置。单 token decode 和 CUDA Graph 的执行范围不变。
+
+这是**近似计算**：后段层的局部 attention 在保留窗口的起点截断，可能改变 logits，
+差异不局限于浮点舍入。开启后应按实际任务验证质量，并固定输入与 chunk 配置对比速度。
+
 ## 单 token decode 的 CUDA Graph
 
 ```bash
@@ -786,6 +806,14 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 - 21 环境下服务模式若加载不到 HF tokenizer，会退回 fastllm 原生 tokenizer 编码 prompt（两者对占位符的 id 相同）。
 
 ## 数值验证
+
+`--fast_prefill` 的 CPU 回归复用现有微型模型，覆盖窗口边界、分块 / 混合批次、前缀缓存恢复、
+FP8 / FP4 KV，以及 DSpark 的特征采集和完整 verify：
+
+```bash
+cmake --build build --target deepseekV41BoundedReplayRegression -j
+python test/basic/test_deepseek_v41_bounded_replay.py --binary build/deepseekV41BoundedReplayRegression
+```
 
 `test/basic/deepseek_v41_reference.py` 用官方 `inference/model.py` 的模块（把 tilelang kernel 换成纯 torch 实现）
 构造随机初始化的迷你 V4.1 模型，与 FastLLM 逐步比较 logits，并可逐层比较中间张量：

@@ -1256,6 +1256,19 @@ namespace fastllm {
                             "DeepSeekV41: every kv source layer must also be an index source layer.");
         }
 
+        decoderSwaTailLayer = -1;
+        if (V41EnvFlag("FASTLLM_DSV41_DECODER_SWA_BOUNDED_REPLAY")) {
+            AssertInFastLLM(!kv_source_layer_ids.empty() && window_size > 0,
+                            "DeepSeekV41: decoder SWA bounded replay needs KV sources and a sliding window.");
+            decoderSwaTailLayer = *std::max_element(kv_source_layer_ids.begin(), kv_source_layer_ids.end()) + 1;
+            for (int layer = decoderSwaTailLayer; layer < block_cnt; layer++) {
+                AssertInFastLLM(compress_ratios[layer] <= 1,
+                                "DeepSeekV41: decoder SWA bounded replay requires late layers with ratio 0 or 1.");
+            }
+            printf("[Fastllm] DeepSeek-V4.1 approximate decoder SWA bounded replay: layer %d onward, window %d\n",
+                   decoderSwaTailLayer, window_size);
+        }
+
         // 5. 这些小权重保持源精度
         for (int i = 0; i < block_cnt; i++) {
             std::string pre = "layers." + std::to_string(i);
@@ -3151,7 +3164,7 @@ namespace fastllm {
     }
 #endif
 
-    std::vector<int> DeepSeekV41Model::ForwardSegments(std::vector<DeepSeekV41Segment> &segments,
+    std::vector<int> DeepSeekV41Model::ForwardSegments(const std::vector<DeepSeekV41Segment> &inputSegments,
                                                        const Data &inputIds,
                                                        const Data *inputEmbeds,
                                                        const std::vector<int> *imageMask,
@@ -3159,17 +3172,31 @@ namespace fastllm {
                                                        const LastTokensManager &lastTokens,
                                                        std::vector<std::vector<float>*> *retLogits,
                                                        std::vector<std::pair<Data*, Data*> > &samplingPastKeyValues) {
-        const int numSegments = (int)segments.size();
+        const int numSegments = (int)inputSegments.size();
         AssertInFastLLM(numSegments >= 1 && (int)generationConfigsIn.size() == numSegments,
                         "DeepSeekV41Model::ForwardSegments: bad segments.");
+        bool boundedPrefill = decoderSwaTailLayer >= 0 && decoderSwaTailLayer < block_cnt &&
+                              inputEmbeds == nullptr && imageMask == nullptr;
+        bool hasLongSegment = false;
         int total = 0;
-        for (auto &seg : segments) {
+        for (const auto &seg : inputSegments) {
             AssertInFastLLM(seg.state && seg.seqlen > 0 && seg.offset == total && seg.state->totalLen == seg.startPos,
                             "DeepSeekV41Model::ForwardSegments: inconsistent segment.");
             total += seg.seqlen;
+            hasLongSegment |= seg.seqlen > window_size;
+            if (seg.spec != nullptr && (seg.spec->wantAllTokens || seg.spec->deferWindow)) {
+                boundedPrefill = false; // verify 必须计算每个候选位置
+            }
         }
+        boundedPrefill &= hasLongSegment;
+        // 只裁剪本次前向的视图，调用方仍按完整片段提交请求 / DSpark 的逻辑位置。
+        std::vector<DeepSeekV41Segment> tailSegments;
+        if (boundedPrefill) {
+            tailSegments = inputSegments;
+        }
+        const auto &segments = boundedPrefill ? tailSegments : inputSegments;
         const bool single = numSegments == 1;
-        const int seqlen = total;   // 拼接后的 token 总数
+        int seqlen = total;   // 当前层实际计算的 token 数；请求长度仍由 inputSegments 保留
         // 图像 token（掩码按拼接后的全局下标）：Engram 置 -1，专家选择改用 gate.bias_vl
         AssertInFastLLM(imageMask == nullptr || (int)imageMask->size() == seqlen,
                         "DeepSeekV41Model::ForwardSegments: imageMask length mismatch.");
@@ -3673,6 +3700,48 @@ namespace fastllm {
             const int ratio = compress_ratios[layer];
             const V41RopeParams &rope = ratio > 0 ? compressRope : windowRope;
 
+            if (boundedPrefill && layer == decoderSwaTailLayer) {
+                // 跨层共享 KV 已完整生成；hidden / HC pre 与逐 query 的索引同步取尾部。
+                auto trimBatch = [&](Data &data) {
+                    std::vector<Data> parts(numSegments);
+                    for (int s = 0; s < numSegments; s++) {
+                        const auto &seg = segments[s];
+                        const int end = seg.offset + seg.seqlen;
+                        Split(data, 1, end - std::min(seg.seqlen, window_size), end, parts[s]);
+                    }
+                    Data tmp[2];
+                    V41Assign(data, *catSegments(parts, tmp), tpDevices);
+                };
+                trimBatch(*curHidden);
+                trimBatch(*preMixPtr);
+                seqlen = 0;
+                for (int s = 0; s < numSegments; s++) {
+                    auto &seg = tailSegments[s];
+                    const int skip = std::max(0, seg.seqlen - window_size);
+                    if (skip > 0) {
+                        auto trimRows = [&](Data &data) {
+                            if (data.dims.size() >= 3 && data.dims[1] == seg.seqlen) {
+                                Data tmp;
+                                Split(data, 1, skip, seg.seqlen, tmp);
+                                V41Assign(data, tmp, tpDevices);
+                            }
+                        };
+                        trimRows(segTopK[s]);
+                        trimRows(segCandidate[s]);
+                        if (seg.spec != nullptr && seg.spec->captureMain) {
+                            for (Data &hidden : seg.spec->mainHidden) {
+                                trimRows(hidden); // 目标层也可能位于裁剪边界之前
+                            }
+                            seg.spec->mainHiddenStartPos = seg.startPos + skip;
+                        }
+                        seg.startPos += skip;
+                        seg.seqlen -= skip;
+                    }
+                    seg.offset = seqlen;
+                    seqlen += seg.seqlen;
+                }
+            }
+
             // ---- Engram ----
             for (size_t l = 0; l < engram_layer_ids.size(); l++) {
                 if (engram_layer_ids[l] == layer) {
@@ -3789,7 +3858,7 @@ namespace fastllm {
 
             // ---- attention（按片段）----
             for (int s = 0; s < numSegments; s++) {
-                DeepSeekV41Segment &seg = segments[s];
+                const DeepSeekV41Segment &seg = segments[s];
                 DeepSeekV41LayerCache &cache = seg.state->layers[layer];
                 const int startPos = seg.startPos;
                 const int segLen = seg.seqlen;
@@ -3973,8 +4042,12 @@ namespace fastllm {
                 }
 
                 Data *attnOutSeg = single ? &attnOut : &segAttnOut[s];
-                V41SparseAttention(*qSeg, *kvSeg, startPos > 0 ? &cache.windowKV : nullptr, compressedKV, cmpIdx,
-                                   weight[pre + ".attn.attn_sink"], window_size, startPos, softmaxScale, *attnOutSeg);
+                // 裁剪后边界之前的局部 KV 未计算，不能读取上一 chunk 的旧环形槽。
+                // attention 的 startPos 只用于局部窗口寻址；RoPE、indexer 和压缩 KV
+                // 的因果筛选已经按绝对位置完成。以新窗口起点 0 执行局部 attention。
+                const int windowStart = seg.seqlen < inputSegments[s].seqlen ? 0 : startPos;
+                V41SparseAttention(*qSeg, *kvSeg, windowStart > 0 ? &cache.windowKV : nullptr, compressedKV, cmpIdx,
+                                   weight[pre + ".attn.attn_sink"], window_size, windowStart, softmaxScale, *attnOutSeg);
                 if (dumpDebug) {
                     std::string tag = "fl_layer" + std::to_string(layer);
                     V41DumpTensor(*qSeg, tag + "_q" + dumpSuffix);
@@ -4006,7 +4079,7 @@ namespace fastllm {
                     V41WindowStore(*windowRows, cache.windowKV, startPos, window_size);
                 }
                 V41RotaryQuant(*attnOutSeg, rope, startPos, 1, true, 0, 32);
-                cache.totalLen += segLen;
+                cache.totalLen = startPos + segLen;
             }
 
             Data *attnOutAll = single ? &attnOut : catSegments(segAttnOut, catTmp);
@@ -4490,7 +4563,7 @@ namespace fastllm {
                          rms_norm_eps, numSegments, true, samplingSeqLens, samplingPastKeyValues,
                          generationConfigs, lastTokens, retLogits, ret, precomputedHeadLogits);
 
-        for (auto &seg : segments) {
+        for (const auto &seg : inputSegments) {
             seg.state->totalLen += seg.seqlen;
         }
         // FASTLLM_DSV41_KV_STATS=1：打印实际占用的长期 KV 字节数（用于核对每 token 的缓存开销）

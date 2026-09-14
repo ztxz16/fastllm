@@ -680,6 +680,8 @@ if (UNIT_TEST)
 
     add_executable(regressionOps test/ops/regressionOps.cpp)
     target_link_libraries(regressionOps fastllm)
+    add_executable(deepseekV41BoundedReplayRegression test/ops/deepseekV41BoundedReplayRegression.cpp)
+    target_link_libraries(deepseekV41BoundedReplayRegression fastllm)
     add_executable(deepseekV41PrecisionRegression test/ops/deepseekV41PrecisionRegression.cpp)
     target_link_libraries(deepseekV41PrecisionRegression fastllm)
     add_test(NAME deepseekV41PrecisionCpu COMMAND deepseekV41PrecisionRegression)
