@@ -15,6 +15,7 @@ struct Access : DeepSeekV41Model {
     using DeepSeekV41Model::v41DsparkEnabled;
     using DeepSeekV41Model::v41DsparkTargetLayerIds;
     using DeepSeekV41Model::v41IsDsparkTarget;
+    using DeepSeekV41Model::quantizedLinearNames;
 };
 static int checks = 0;
 static void Check(bool ok, const char *why) {
@@ -162,6 +163,17 @@ int main(int argc, char **argv) {
                 CompareForward(model, {a}, {b}, {length});
             }
         }
+        // Exercise quantized activation scratch reuse across layers and its
+        // release at the tail boundary using the existing unquantized fixture.
+        for (int layer = 0; layer < model.block_cnt; layer++) {
+            for (const char *suffix : {".attn.wq_a.weight", ".attn.wq_b.weight", ".attn.wkv.weight",
+                                       ".attn.wo_b.weight", ".ffn.shared_experts.gateup.weight",
+                                       ".ffn.shared_experts.w2.weight"}) {
+                (model.*(&Access::quantizedLinearNames)).insert("layers." + std::to_string(layer) + suffix);
+            }
+        }
+        auto a = NewState(5), b = NewState(5);
+        for (int length : {40, 17, 1}) CompareForward(model, {a}, {b}, {length});
         std::cout << "PASS: bounded prefill, mixed batch, cache restore, DSpark capture/verify ("
                   << checks << " checks)\n";
     } catch (const std::exception &e) {

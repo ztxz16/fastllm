@@ -30,6 +30,7 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <initializer_list>
 #include <limits>
 #include <mutex>
 #include <set>
@@ -2807,7 +2808,8 @@ namespace fastllm {
         Data sharedGateup, sharedSwiglu, sharedExpertOut;
         Data w1, w2, w3, tempInput, tempOutput, moeInputTemp, moeOutputTemp;
         Data cpuMoeInput, cpuMoeIndex, cpuMoeScore;
-        // CUDA graph captures retain these buffers for the lifetime of the graph.
+        Data quantizedActivation;
+        // TP and CUDA graphs retain one buffer per weight.
         std::map<std::string, Data> quantizedActivations;
     };
 
@@ -3568,7 +3570,34 @@ namespace fastllm {
         std::vector<Data> segQ(numSegments), segKV(numSegments), segAttnOut(numSegments);
         Data catTmp[2];
         auto quantizedLinear = [&](Data &input, const std::string &name, Data &output, bool replicated = false) {
-            LinearWithActivationQuant(input, name, output, replicated, &ws->quantizedActivations[name]);
+            // Ordinary stages share one scratch; TP/graphs keep their existing layout and addresses.
+            LinearWithActivationQuant(input, name, output, replicated,
+                ws == &localWorkspace && !tp ? &ws->quantizedActivation : &ws->quantizedActivations[name]);
+        };
+        auto releasePrefill = [&](std::initializer_list<Data *> tensors) {
+            if (ws != &localWorkspace || tp || dumpDebug || seqlen <= window_size) return;
+            for (Data *data : tensors) {
+                if (data->isFake || data == preMixPtr) continue;
+#ifdef USE_CUDA
+                // MoE workers may allocate on other streams. Wait for this
+                // tensor's consumers via a pool event before allowing reuse.
+                if (data->cudaData != nullptr && !data->cudaDataBorrowed) {
+                    const int original = FastllmCudaGetDevice();
+                    const int device = data->dataDeviceIds.empty() ? original : data->dataDeviceIds[0];
+                    FastllmCudaSetDevice(device);
+                    if (!data->directMemory && FastllmCudaFreeAfterCurrentThreadStream(data->cudaData)) {
+                        data->cudaData = nullptr;
+                    } else {
+                        FastllmCudaSyncDevice(device);
+                    }
+                    FastllmCudaSetDevice(original);
+                }
+#endif
+                data->FreeSpace();
+                data->expansionDims.clear();
+                data->dims.clear();
+                data->strides.clear();
+            }
         };
 
 #ifdef USE_CUDA
@@ -3714,6 +3743,11 @@ namespace fastllm {
                 };
                 trimBatch(*curHidden);
                 trimBatch(*preMixPtr);
+                // Other intermediates were released after their last use. Drop
+                // the remaining full-chunk scratch before switching to tail rows.
+                releasePrefill({&preMix, &attnPre, &expertIndex, &expertScore,
+                                &w1, &w2, &w3, &tempInput, &tempOutput, &moeInputTemp, &moeOutputTemp,
+                                &cpuMoeInput, &cpuMoeIndex, &cpuMoeScore});
                 seqlen = 0;
                 for (int s = 0; s < numSegments; s++) {
                     auto &seg = tailSegments[s];
@@ -3856,6 +3890,7 @@ namespace fastllm {
                     }
                 });
 
+            releasePrefill({&x, &qr, &qNorm, &ws->attnInputFloat, &ws->idxWeights});
             // ---- attention（按片段）----
             for (int s = 0; s < numSegments; s++) {
                 const DeepSeekV41Segment &seg = segments[s];
@@ -4082,6 +4117,8 @@ namespace fastllm {
                 cache.totalLen = startPos + segLen;
             }
 
+            releasePrefill({&q, &kv, &attnInput, &rawKVAll, &rawScoreAll, &qIdxAll, &idxWeightsAll});
+            for (int s = 0; s < numSegments; s++) releasePrefill({&segQ[s], &segKV[s]});
             Data *attnOutAll = single ? &attnOut : catSegments(segAttnOut, catTmp);
             // 【CUDA Graph 的 post 段】wo_a 到共享专家之间同样与 token 位置无关。
             // MergeMOEBlock（可能在 CPU / NUMA 上）与其后的 hc 残差留在段外。
@@ -4118,6 +4155,8 @@ namespace fastllm {
             }
 #endif
             if (!referenceWoA) DeepSeekV4WoA(*attnOutAll, weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
+            releasePrefill({&attnOut, &catTmp[0], &catTmp[1]});
+            for (Data &part : segAttnOut) releasePrefill({&part});
             // 切分时 woAOut 是分片的，MultiCudaLinearOp 自动走 column + all-reduce；
             // 不切分时 woAOut 是复制的，必须显式要求复制布局，否则会退回单卡 CUDA
             // 读到已经失效的 root。
@@ -4133,6 +4172,7 @@ namespace fastllm {
             }
             V41HcPost(attnProj, *curHidden, attnPost, attnComb, *nextHidden);
             std::swap(curHidden, nextHidden);
+            releasePrefill({&woAOut, &attnProj, &attnPost, &attnComb});
             if (dumpDebug) {
                 V41DumpTensor(*curHidden, "fl_layer" + std::to_string(layer) + "_hidden_attn" + dumpSuffix);
             }
@@ -4317,6 +4357,8 @@ namespace fastllm {
             V41RunGraphSegment(runSharedExpert, kV41GraphSegmentsPerLayer * layer + 3, hasSharedExpertOut,
                 [](DeepSeekV41GraphSegmentMeta &) {},
                 [](const DeepSeekV41GraphSegmentMeta &) {});
+            releasePrefill({&x, &ws->gateInput, &ws->gateLogits, &ws->sharedGateup, &ws->sharedSwiglu,
+                            &ws->quantizedActivation});
 
             {
                 this->ApplyMoeDeviceMapForLayer(layer);
@@ -4416,6 +4458,7 @@ namespace fastllm {
             V41HcPost(ffnOut, *curHidden, ffnPost, ffnComb, *nextHidden);
             std::swap(curHidden, nextHidden);
             preMixPtr = &ffnPre;
+            releasePrefill({&ffnInput, &ffnOut, &ffnPost, &ffnComb, &ws->sharedExpertOut, nextHidden});
             if (dumpDebug) {
                 V41DumpTensor(*curHidden, "fl_layer" + std::to_string(layer) + dumpSuffix);
             }
