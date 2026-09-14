@@ -149,7 +149,8 @@ int main(int argc, char **argv) {
     try {
         const bool batched = argc == 2 && std::string(argv[1]) == "--batch";
         const std::vector<Scenario> scenarios = {
-            {513, 1, 3, 1.0f, 1.0f, {0.6, 0.3, 0.1}},
+            // Token 0 repeats a state; MTP must preserve the 40% exit probability.
+            {513, 0, 3, 1.0f, 1.0f, {0.6, 0.3, 0.1}},
             {257, 3, 3, 1.0f, 1.0f, {0.6, 0.3, 0.1}},
             {385, 1, 2, 0.75f, 1.0f, {2.0 / 3.0, 1.0 / 3.0, 0.0}},
             {129, 1, 1, 1.0f, 0.0f, {1.0, 0.0, 0.0}},

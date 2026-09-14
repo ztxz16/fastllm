@@ -33,8 +33,8 @@ public:
     using Qwen3_5Model::MtpKvCache;
     using Qwen3_5Model::GetMtpPagedCachePool;
     using Qwen3_5Model::RestoreMtpPagedSnapshot;
-    using Qwen3_5Model::RunMtpGreedyDraft;
-    using Qwen3_5Model::RunMtpGreedyDraftBatch;
+    using Qwen3_5Model::RunMtpDraft;
+    using Qwen3_5Model::RunMtpDraftBatch;
     static constexpr int width = 96;
     bool moe;
 
@@ -166,9 +166,9 @@ void RunCase(DraftModel &model, int headDim, int context, int length, int sample
     Data positionIds(FLOAT32, {1, length}, positions);
     Data otherPosition(FLOAT32, {1, 1}, {7.0f});
     Data sampled;
-    int token = model.RunMtpGreedyDraft(0, {0}, single, hidden, tokens,
+    int token = model.RunMtpDraft(0, {0}, single, hidden, tokens,
                                         positionIds, sampleRow, &sampled);
-    Require(model.RunMtpGreedyDraft(0, {0}, cacheOnly, hidden, tokens,
+    Require(model.RunMtpDraft(0, {0}, cacheOnly, hidden, tokens,
                 positionIds, sampleRow, nullptr, true) == -1, "cache-only sampled a token");
     Require(single.tokens == context + length && cacheOnly.tokens == single.tokens,
             "sample-row selection truncated the KV append");
@@ -182,7 +182,7 @@ void RunCase(DraftModel &model, int headDim, int context, int length, int sample
     // an independent reference for the selected output;
     // a batch of one would delegate to the optimized single-request path.
     std::vector<Data> reference;
-    auto batchTokens = model.RunMtpGreedyDraftBatch(0, {0}, {&batched, &other},
+    auto batchTokens = model.RunMtpDraftBatch(0, {0}, {&batched, &other},
         {&hidden, &otherHidden}, {tokens, {11}}, {&positionIds, &otherPosition},
         {sampleRow, 0}, &reference);
     auto actual = LogicalHalfData(sampled);
@@ -259,8 +259,8 @@ void RunCausalCase() {
     hidden.ToDevice(DataDevice::CUDA, {0}, true);
     otherHidden.ToDevice(DataDevice::CUDA, {0}, true);
     Data positions(FLOAT32, {1, 2}, {4097.0f, 4098.0f}), sampled, otherSampled;
-    int token = model.RunMtpGreedyDraft(0, {0}, first, hidden, {3, 4}, positions, 0, &sampled);
-    int otherToken = model.RunMtpGreedyDraft(0, {0}, changedFuture, otherHidden,
+    int token = model.RunMtpDraft(0, {0}, first, hidden, {3, 4}, positions, 0, &sampled);
+    int otherToken = model.RunMtpDraft(0, {0}, changedFuture, otherHidden,
                                            {3, 5}, positions, 0, &otherSampled);
     // Both calls have identical shapes and the same visible prefix. Changing
     // only a future row must not affect any bit of the selected first row.
@@ -297,7 +297,7 @@ void RunRollbackCase(DraftModel &model, int headDim, int context,
             cachePtrs.push_back(&kv[b]);
         }
         // batch=1 delegates to the single-request production path.
-        model.RunMtpGreedyDraftBatch(0, {0}, cachePtrs, hiddenPtrs, tokens,
+        model.RunMtpDraftBatch(0, {0}, cachePtrs, hiddenPtrs, tokens,
                                      positionPtrs, std::vector<int>(batch, 0), &sampled);
         std::vector<std::vector<uint16_t>> result;
         for (const Data &data : sampled) result.push_back(LogicalHalfData(data));

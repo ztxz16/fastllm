@@ -211,15 +211,17 @@ ftllm server DeepSeek-V3-0324-Q4_K_M-00001-of-00009.gguf --ori DeepSeek-V3
 
 ### Qwen3.5 MTP 随机草稿
 
-默认 MTP 使用贪心草稿；目标模型仍按请求的 temperature/top-k/top-p 进行精确采样。对于草稿接受率较低的写作等场景，可以尝试随机草稿：
+MTP 对非贪心采样请求默认使用随机草稿，并保存每一步的实际草稿分布 q。目标分布 p 遵守请求的 temperature/top-k/top-p，按 `min(1, p/q)` 接受草稿；首次拒绝后从归一化的 `max(p-q, 0)` 补采，并丢弃后续草稿。单请求和多请求批处理使用同一套提案状态与拒绝采样路径。
 
 ```sh
-FASTLLM_QWEN35_MTP_RANDOM_DRAFT=1 ftllm server /path/to/model --tp 2 --mtp 5 --speculative_algorithm mtp
+ftllm server /path/to/model --tp 2 --mtp 5 --speculative_algorithm mtp
 ```
 
-环境变量必须在启动前设置为 `1`；未设置或设为 `0` 时使用默认策略。该选项仅对已有 MTP 支持的单请求、非贪心 CUDA 路径生效，使用请求的温度及 top-k/top-p 过滤，最多保存 64 个草稿候选，并按实际草稿概率做拒绝验证。greedy 请求、DFlash 和多请求批处理沿用各自原有策略。
+greedy 请求仍使用贪心草稿和精确匹配验证。DFlash 使用自己的提案状态和验证路径。
 
-随机草稿会增加过滤、抽样和候选传输开销；接受率接近 100% 的复制或固定格式输出通常没有收益。应按实际负载比较解码速度，不能只比较接受率。长预填充的首次单 token 播种仍使用贪心草稿，随后进入所选草稿策略。
+随机草稿保存经过请求温度及 top-k/top-p 过滤的完整概率数组 q，验证时按该实际分布进行拒绝采样。长预填充首次播种也保存对应的 q，供随后验证使用。
+
+NVIDIA SM75 及以下（包括 RTX 2080 Ti）默认关闭 CUDA Graph；普通 Qwen3.5 系列推理仅在所有参与 GPU 的算力均大于 7.5 且满足自动启用条件时开启，MTP 模式不自动开启。可通过 `FASTLLM_CUDA_GRAPH=1` 显式开启或 `FASTLLM_CUDA_GRAPH=0` 显式关闭。全局 Graph 关闭时，随机草稿和完整分布拒绝采样仍然生效。
 
 ### 服务部署参数
 

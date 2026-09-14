@@ -1,5 +1,6 @@
 """Real-model regression for MTP proposal state across 1 -> 2 -> 1 requests.
 
+Sampling requests use random drafts and full-distribution rejection by default.
 Covers sampling pairs and mixed sampling/greedy pairs on the same model.
 Requires a CUDA Qwen3.5/Qwen3.8 checkpoint with MTP and --max_batch 2.
 """

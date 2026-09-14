@@ -1441,6 +1441,17 @@ bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,
                                   int *topKArr, float *topPArr,
                                   int *output,
                                   int batch, int vocabSize);
+// proposalProbs is a persistent CUDA buffer; other arrays except logits are host arrays.
+// Draft sampling and verification intersect top-k/top-p on the original softmax.
+bool FastllmCudaMtpSampleDraft(float *logits, float *proposalProbs,
+                              const float *temperatures, const int *topKs,
+                              const float *topPs, int *output, int batch, int vocabSize);
+bool FastllmCudaMtpRejectionSampling(float *logits, float *proposalProbs,
+                                    const float *temperatures, const int *topKs,
+                                    const float *topPs, const int *draftTokenIds,
+                                    int *output, int *acceptedDraftTokens,
+                                    int batch, int draftTokens, int vocabSize);
+
 bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
                                   float *logits, float *temperatures,
                                   int *topKArr, float *topPArr,
@@ -1465,13 +1476,6 @@ bool FastllmCudaDFlashRejectionSampling(
                                   int *acceptedDraftTokens,
                                   int batch, int draftTokens,
                                   int selectorTopK, int vocabSize);
-bool FastllmCudaMtpDraftSpecSampling(
-                                  const float *logits,
-                                  float temperature, int topK, float topP,
-                                  uint64_t seed,
-                                  int *draftOut, int *candidateIdsOut,
-                                  float *candidateProbsOut,
-                                  int *candidateCountOut, int vocabSize);
 bool FastllmCudaDFlashDynamicConv(
                                   const fastllm::Data &source,
                                   const fastllm::Data &dynamicProjection,

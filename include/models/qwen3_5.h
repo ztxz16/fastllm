@@ -237,6 +237,17 @@ namespace fastllm {
             Data key;
             Data value;
             int tokens = 0;
+            // The actual proposal distribution belongs to this chain.
+            // Truncate only changes KV, never the saved proposal or tokens.
+            bool sampleProposal = false;
+            GenerationConfig proposalConfig;
+            Data proposalProbs;
+            std::vector<int> proposalTokens;
+            void BeginProposal(const GenerationConfig &config) {
+                sampleProposal = !config.IsSimpleGreedy();
+                proposalConfig = config;
+                proposalTokens.clear();
+            }
             // TP parents keep only global shape/length; each rank owns its pages.
             std::map<int, std::unique_ptr<MtpKvCache> > shards;
 
@@ -263,18 +274,6 @@ namespace fastllm {
             std::vector <int> proposalCandidateIds;
             std::vector <float> proposalCandidateProbs;
         };
-        struct MtpSpecDraftParams {
-            bool active = false;
-            float temperature = 1.0f;
-            int topK = 1;
-            float topP = 1.0f;
-            unsigned long long seed = 0;
-        };
-        struct MtpSpecDraftSample {
-            int token = -1;
-            std::vector <int> candidateIds;
-            std::vector <float> candidateProbs;
-        };
         bool mtpWeightsPrepared = false;
         bool mtpSharedWeightsPrepared = false;
         int mtpWeightsPreparedDevice = -1;
@@ -292,13 +291,10 @@ namespace fastllm {
         Data speculativeHiddenStates;
         std::vector <Data> speculativeDFlashHiddenStates;
         std::vector<unsigned char> speculativeMtpAccepted;
+        std::vector<MtpKvCache*> speculativeMtpSamplingContexts;
         DFlashContext *speculativeDFlashSamplingContext = nullptr;
         std::vector<DFlashContext*> speculativeDFlashSamplingContexts;
         std::vector<unsigned char> speculativeDFlashAccepted;
-        MtpSpecDraftParams mtpSpecDraftParams;
-        MtpSpecDraftSample mtpSpecDraftLast;
-        unsigned long long mtpSpecDraftSeedBase = 0;
-        unsigned long long mtpSpecDraftSeedCounter = 0;
         bool speculativeCaptureFirstTokenLinearState = false;
         int speculativeLinearStateCaptureSlots = 0;
         std::vector<std::vector<std::pair<Data, Data> > > speculativeLinearStates;
@@ -513,17 +509,19 @@ namespace fastllm {
                 const std::vector<Data*> &positionIds,
                 const std::vector<int> &sampleRows,
                 std::vector<Data> *sampledHiddenStates, bool cacheOnly);
+        std::vector<int> SampleMtpDraftLogits(int device, Data &logits,
+                                             const std::vector<MtpKvCache*> &caches);
         void PrepareMtpDraftLmHeadWeights(const std::vector<int> &devices);
         Data BuildMtpPositionIds(const Data &positionIds, int row, int delta);
         Data BuildMtpPositionIdsSlice(const Data &positionIds, int begin, int end, int delta);
-        int RunMtpGreedyDraft(int device, const std::vector<int> &devices,
+        int RunMtpDraft(int device, const std::vector<int> &devices,
                               MtpKvCache &cache,
                               const Data &targetHiddenStates,
                               const std::vector<int> &inputTokens,
                               const Data &positionIds, int sampleRow,
                               Data *sampledHiddenStates = nullptr,
                               bool cacheOnly = false);
-        std::vector<int> RunMtpGreedyDraftBatch(
+        std::vector<int> RunMtpDraftBatch(
                               int device,
                               const std::vector<int> &devices,
                               const std::vector<MtpKvCache*> &caches,

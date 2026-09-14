@@ -43,8 +43,8 @@ namespace {
         using Qwen3_5Model::mtpTpKvHeadScheme;
         using Qwen3_5Model::PrepareMtpTpWeights;
         using Qwen3_5Model::RestoreMtpPagedSnapshot;
-        using Qwen3_5Model::RunMtpGreedyDraft;
-        using Qwen3_5Model::RunMtpGreedyDraftBatch;
+        using Qwen3_5Model::RunMtpDraft;
+        using Qwen3_5Model::RunMtpDraftBatch;
         using Qwen3_5Model::SnapshotMtpPagedCache;
         static constexpr int width = FASTLLM_TEST_MTP_WIDTH;
         bool moe;
@@ -202,8 +202,8 @@ namespace {
         }
         Data pos(FLOAT32, {1, length}, positions), expected, actual;
         FastllmCudaSetDevice(0);
-        int ref = single.RunMtpGreedyDraft(0, {0}, a, hidden, tokens, pos, row, &expected);
-        int result = tp.RunMtpGreedyDraft(0, {0, 1}, b, hidden, tokens, pos, row, &actual);
+        int ref = single.RunMtpDraft(0, {0}, a, hidden, tokens, pos, row, &expected);
+        int result = tp.RunMtpDraft(0, {0, 1}, b, hidden, tokens, pos, row, &actual);
         float error = Compare(ReadHidden(actual), ReadHidden(expected), "TP hidden mismatch");
         Require(result >= 0 && result < 64 && ref >= 0 && ref < 64, "invalid draft token");
         // Check the selected token against CPU logits for the returned hidden state.
@@ -220,7 +220,7 @@ namespace {
         }
         Require(*std::max_element(scores.begin(), scores.end()) - scores[result] < 0.002f,
                 "TP greedy token is not a valid argmax");
-        Require(tp.RunMtpGreedyDraft(0, {0, 1}, only, hidden, tokens, pos, row, nullptr, true) == -1,
+        Require(tp.RunMtpDraft(0, {0, 1}, only, hidden, tokens, pos, row, nullptr, true) == -1,
                 "cache-only produced a token");
         Data ak, av, bk, bv, ck, cv;
         Require(single.SnapshotMtpPagedCache(a, ak, av) && tp.SnapshotMtpPagedCache(b, bk, bv) &&
@@ -266,14 +266,57 @@ namespace {
             pos[i].CopyFrom(Data(FLOAT32, {1, (int)positions.size()}, positions));
         }
         std::vector<Data> expected, actual;
-        single.RunMtpGreedyDraftBatch(0, {0}, {&a[0], &a[1]}, {&hidden[0], &hidden[1]}, tokens,
+        single.RunMtpDraftBatch(0, {0}, {&a[0], &a[1]}, {&hidden[0], &hidden[1]}, tokens,
                                       {&pos[0], &pos[1]}, {0, 0}, &expected);
-        tp.RunMtpGreedyDraftBatch(0, {0, 1}, {&b[0], &b[1]}, {&hidden[0], &hidden[1]}, tokens,
+        tp.RunMtpDraftBatch(0, {0, 1}, {&b[0], &b[1]}, {&hidden[0], &hidden[1]}, tokens,
                                   {&pos[0], &pos[1]}, {0, 0}, &actual);
         for (int i = 0; i < 2; ++i) {
             Compare(ReadHidden(actual[i]), ReadHidden(expected[i]), "ragged TP mismatch");
         }
         std::cout << "ragged kv_heads=" << heads << " dim=" << dim << " PASS\n";
+        ++cases;
+    }
+    void RunSampling(DraftModel &single, DraftModel &tp, int heads, int dim, int &cases) {
+        DraftModel::MtpKvCache a, b;
+        Init(single, a, heads, dim, 127);
+        Init(tp, b, heads, dim, 127);
+        GenerationConfig config;
+        config.top_k = 64; config.top_p = 1; config.temperature = .8f;
+        a.BeginProposal(config); b.BeginProposal(config);
+        Data hidden(FLOAT16, {1, 1, DraftModel::width});
+        Fill(hidden, 451, .6f);
+        hidden.ToDevice(DataDevice::CUDA, {0}, true);
+        Data pos(FLOAT32, {1, 1}, {127.f});
+        int x = single.RunMtpDraft(0, {0}, a, hidden, {3}, pos, 0);
+        int y = tp.RunMtpDraft(0, {0, 1}, b, hidden, {3}, pos, 0);
+        Require(a.proposalTokens == std::vector<int>{x} && b.proposalTokens == std::vector<int>{y},
+                "draft token was not paired with its probability cache");
+        std::vector<float> qa(64), qb(64);
+        FastllmCudaSetDevice(0);
+        FastllmCudaCopyFromDeviceToHost(qa.data(), a.proposalProbs.cudaData, 64 * sizeof(float));
+        FastllmCudaCopyFromDeviceToHost(qb.data(), b.proposalProbs.cudaData, 64 * sizeof(float));
+        const auto saved = qb;
+        float sum = 0;
+        for (int i = 0; i < 64; ++i) {
+            Require(std::isfinite(qb[i]) && qb[i] >= 0 && std::fabs(qa[i] - qb[i]) < .002f,
+                    "TP proposal probability disagrees with single GPU");
+            sum += qb[i];
+        }
+        Require(std::fabs(sum - 1) < 1e-5 && qb[y] > 0, "invalid saved proposal distribution");
+        b.Truncate(127);
+        std::vector<float> after(64);
+        FastllmCudaCopyFromDeviceToHost(after.data(), b.proposalProbs.cudaData, 64 * sizeof(float));
+        Require(after == saved && b.proposalTokens.size() == 1, "KV rollback corrupted saved q");
+        // Mixed greedy/sampling requests share a draft forward, but keep separate q.
+        GenerationConfig greedy; greedy.top_k = 1;
+        DraftModel::MtpKvCache mixedGreedy;
+        Init(tp, mixedGreedy, heads, dim, 127);
+        mixedGreedy.BeginProposal(greedy); b.BeginProposal(config);
+        auto result = tp.RunMtpDraftBatch(0, {0, 1}, {&mixedGreedy, &b}, {&hidden, &hidden},
+                                          {{4}, {5}}, {&pos, &pos}, {0, 0});
+        Require(result.size() == 2 && mixedGreedy.proposalTokens.empty() && b.proposalTokens.size() == 1 &&
+                    b.proposalTokens[0] == result[1], "mixed draft contexts were crossed");
+        std::cout << "sampling q, TP, rollback, mixed batch kv_heads=" << heads << " PASS\n";
         ++cases;
     }
 } // namespace
@@ -326,6 +369,7 @@ int main(int argc, char **argv) {
                         }
                         if (!longOnly) {
                             RunBatch(single, tp, heads, dim, cases);
+                            RunSampling(single, tp, heads, dim, cases);
                         }
                         for (auto &entry : tp.mtpPagedCachePools) {
                             Require(entry.second->key.FreePageCount() == entry.second->key.maxPages &&
