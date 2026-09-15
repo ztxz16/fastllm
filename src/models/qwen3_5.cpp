@@ -9144,6 +9144,51 @@ namespace fastllm {
 
     bool Qwen3_5Model::SnapshotMtpPagedCache(const MtpKvCache &cache, Data &key, Data &value) const {
 #ifdef USE_CUDA
+        if (mtpTpPrepared || !cache.shards.empty()) {
+            if (!mtpTpPrepared || cache.tokens <= 0 ||
+                cache.key.dataType != cache.value.dataType) {
+                return false;
+            }
+            // A TP snapshot contains every global KV head. Validate its
+            // producers before allocating destinations or copying any shard.
+            std::vector<bool> covered(num_key_value_heads, false);
+            size_t activeRanks = 0;
+            for (int device : mtpTpDevices) {
+                auto local = mtpTpKvHeadScheme.find(device);
+                if (local == mtpTpKvHeadScheme.end()) {
+                    return false;
+                }
+                int heads = 0;
+                for (const auto &range : local->second) {
+                    if (range.first < 0 || range.second < range.first ||
+                        range.second > num_key_value_heads) {
+                        return false;
+                    }
+                    for (int head = range.first; head < range.second; ++head) {
+                        if (covered[head]) return false;
+                        covered[head] = true;
+                        ++heads;
+                    }
+                }
+                if (heads == 0) continue;
+                ++activeRanks;
+                auto shard = cache.shards.find(device);
+                if (shard == cache.shards.end() || !shard->second ||
+                    shard->second->tokens != cache.tokens) {
+                    return false;
+                }
+                for (const Data *src : {&shard->second->key, &shard->second->value}) {
+                    if (src->dims != std::vector<int>({heads, cache.tokens, head_dim}) ||
+                        src->dataType != cache.key.dataType) {
+                        return false;
+                    }
+                }
+            }
+            if (cache.shards.size() != activeRanks ||
+                std::find(covered.begin(), covered.end(), false) != covered.end()) {
+                return false;
+            }
+        }
         if (cache.shards.empty()) {
             return Qwen35SnapshotCopyTensor(cache.key, key) && Qwen35SnapshotCopyTensor(cache.value, value);
         }
@@ -9777,13 +9822,36 @@ namespace fastllm {
             std::vector<std::pair<int, PagedCacheManager*> > ret;
             int ranks = this->threadTpPreparedDevices.empty() ? 1 : (int)this->threadTpPreparedDevices.size();
             for (int r = 0; r < ranks; r++) {
+                int device = r < (int)this->threadTpPreparedDevices.size() ? this->threadTpPreparedDevices[r] : -1;
+                if (ranks > 1) {
+                    if (layerIndex >= (int)threadTpAttentionKVHeadSchemes.size()) {
+                        return {};
+                    }
+                    const auto &scheme = threadTpAttentionKVHeadSchemes[layerIndex];
+                    auto local = scheme.find(device);
+                    if (local == scheme.end()) {
+                        return {};
+                    }
+                    int heads = 0;
+                    for (const auto &range : local->second) {
+                        if (range.first < 0 || range.second < range.first ||
+                            range.second > num_key_value_heads) {
+                            return {};
+                        }
+                        heads += range.second - range.first;
+                    }
+                    // ForwardSingleGPU intentionally creates no paged manager
+                    // for a rank assigned zero KV heads in this layer.
+                    if (heads == 0) {
+                        continue;
+                    }
+                }
                 PagedCacheManager *manager = GetPagedCacheManager(
                     (this->threadTpPagedCacheBase + r * this->block_cnt + layerIndex) * 2 + (isKey ? 0 : 1));
                 if (manager == nullptr) {
                     ret.clear();
                     break;
                 }
-                int device = r < (int)this->threadTpPreparedDevices.size() ? this->threadTpPreparedDevices[r] : -1;
                 if (device < 0) {
                     Data *managerData = (Data*)manager;
                     if (!managerData->dataDeviceIds.empty()) {
@@ -9982,6 +10050,32 @@ namespace fastllm {
     }
 
     int Qwen3_5Model::QueryPagedPrefixCacheExtra(ResponseContext *context, int maxCachedLen) const {
+        if (context != nullptr && maxCachedLen > 0 &&
+            threadTpPreparedDevices.size() > 1) {
+            // Both schedulers call this before restoring any state. An empty
+            // attention layer means an active rank is missing, not that this
+            // layer can be omitted from the collective prefix restore.
+            int pageLen = 0;
+            for (int layer = 0; layer < block_cnt; ++layer) {
+                if (Qwen35LayerIsLinearAttention(this, layer)) {
+                    continue;
+                }
+                auto keys = GetPagedKVCacheManagers(layer, true);
+                auto values = GetPagedKVCacheManagers(layer, false);
+                if (keys.empty() || keys.size() != values.size()) {
+                    return 0;
+                }
+                for (size_t rank = 0; rank < keys.size(); ++rank) {
+                    if (keys[rank].first != values[rank].first ||
+                        keys[rank].second->pageLen <= 0 ||
+                        keys[rank].second->pageLen != values[rank].second->pageLen ||
+                        (pageLen != 0 && keys[rank].second->pageLen != pageLen)) {
+                        return 0;
+                    }
+                    pageLen = keys[rank].second->pageLen;
+                }
+            }
+        }
         if (context == nullptr || maxCachedLen <= 0 ||
             !Qwen35HasLinearAttentionLayers(this, this->block_cnt)) {
             return maxCachedLen;

@@ -24,6 +24,8 @@ CUDA_VISIBLE_DEVICES=0,1,2 ftllm server /path/to/model \
 
 视觉最终特征保持 FP32 CPU 格式，图片 embedding 缓存继续驻留 CPU，文本 prefill 按分块上传。图片特征命中与 KV 命中分别统计；现有多模态 KV 安全 miss 行为保留。MTP、跨卡 KV/线性状态恢复和工具调用使用原有接口。
 
+当 TP 卡数多于 KV heads 时，没有 KV 分片的卡不阻止前缀复用；保存 MTP 快照和恢复前缀前，会检查所有有效 K/V 与 MTP 分片是否齐全。
+
 ## 回归入口
 
 - [原生分片、舍入与缓存测试](../test/basic/test_qwen35_vision_tp.cpp)
