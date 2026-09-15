@@ -9,6 +9,8 @@
 
 #include "fastllm-cuda.cuh"
 #include "fastllm-cublas-prefill.cuh"
+#include "devices/cuda/fastllm-cuda-fp8.h"
+#include "fastllm-fp8-marlin-gemv.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -101,6 +103,13 @@ static bool Fp8PrefillEnabled() {
     static const bool enabled = Fp8MarlinEnvFlagDefaultEnabled(
         "FASTLLM_CUDA_FP8_PREFILL_CUBLAS", true);
     return enabled;
+}
+
+static bool Fp8UseMultiRowGemv(int arch, int rows, int sizeN, int sizeK) {
+    if ((arch != 80 && arch != 86) || rows < 2 || rows > 3) return false;
+    // SM86 measurements favor GEMV at 2-3 tokens on wide expansion matrices.
+    // Down/narrow projections and >=4 rows retain Marlin GEMM by default.
+    return sizeN >= 16384 && sizeK >= 4096 && sizeK <= sizeN / 2;
 }
 
 using fastllm_cuda_prefill::State;
@@ -384,6 +393,19 @@ static bool EnsureFp8MarlinOnDevice(fastllm::Data &weight, int m, int k) {
 
 }  // namespace
 
+bool FastllmCudaDequantFp8MarlinForCublas(fastllm::Data &weight, void *destination) {
+    if (weight.dataType != fastllm::DataType::FP8_E4M3 ||
+        weight.dims.size() != 2 || !destination || !HasFp8MarlinOnDevice(weight) ||
+        weight.blockM != 128 || weight.blockK != 128 ||
+        weight.dims[0] % 64 || weight.dims[1] % 128) return false;
+    Fp8PrefillDequantKernel<<<dim3(weight.dims[0] / 64, (weight.dims[1] + 255) / 256),
+                              256, 0, cudaStreamPerThread>>>(
+        static_cast<const uint32_t *>(weight.cudaData),
+        static_cast<const half *>(weight.extraCudaHalfData[FP8_MARLIN_SCALES_HALF_IDX]),
+        static_cast<half *>(destination), weight.dims[0], weight.dims[1], 0);
+    return true;
+}
+
 extern "C" bool FastllmCudaHasFp8MarlinLayout(
         const fastllm::Data &weight) {
     return HasFp8MarlinOnDevice(weight);
@@ -422,14 +444,14 @@ extern "C" bool FastllmCudaTryMarlinHalfMatMulFloatFP8E4M3(
     // Warm the dedicated handle before the KV budget is calibrated, even
     // though the small warmup GEMM itself still goes through Marlin/GEMV.
     // Decode avoids the state lookup and CUDA event operations entirely.
-    auto *prefillState = arch == 75 && Fp8PrefillMatrixSupported(k, m) &&
+    auto *prefillState = (arch == 75 || arch == 80 || arch == 86) && Fp8PrefillMatrixSupported(k, m) &&
         (n >= FP8_PREFILL_MIN_ROWS || FastllmCudaGetNcclForceSync()) &&
-        Fp8PrefillEnabled() ? fastllm_cuda_prefill::GetState(arch) : nullptr;
+        Fp8PrefillEnabled() ? fastllm_cuda_prefill::GetState(arch, true) : nullptr;
 
-    // Keep batch-one decode on GEMV. Before conversion the caller can use the
+    // Keep small decode on the packed layout. Before conversion the caller can use the
     // original-layout GEMV directly; during synchronized warmup convert first
     // and use the coalesced GEMV above, avoiding a second CUDA module path.
-    if (n == 1) {
+    if (n == 1 || Fp8UseMultiRowGemv(arch, n, k, m)) {
         if (!HasFp8MarlinOnDevice(weight)) {
             if (!FastllmCudaGetNcclForceSync() ||
                 !EnsureFp8MarlinOnDevice(weight, m, k)) {
@@ -443,10 +465,20 @@ extern "C" bool FastllmCudaTryMarlinHalfMatMulFloatFP8E4M3(
         auto *cudaScales = (const float *)weight.extraCudaData[0];
         auto *cudaBias = bias.dims.empty()
             ? nullptr : (const half *)weight.extraCudaHalfData[0];
-        FastllmFp8MarlinLayoutGemvKernel<<<k / 8, 256, 0, cudaStreamPerThread>>>(
-            cudaInput, marlinWeight, cudaScales, cudaBias, cudaOutput, k, m);
+        if (n == 1) {
+            FastllmFp8MarlinLayoutGemvKernel<<<k / 8, 256, 0, cudaStreamPerThread>>>(
+                cudaInput, marlinWeight, cudaScales, cudaBias, cudaOutput, k, m);
+        } else {
+            if (n == 2) {
+                fastllm_fp8_marlin::MultiRowGemv<2><<<k / 8, 256, 0, cudaStreamPerThread>>>(
+                    cudaInput, marlinWeight, cudaScales, cudaBias, cudaOutput, k, m);
+            } else {
+                fastllm_fp8_marlin::MultiRowGemv<3><<<k / 8, 256, 0, cudaStreamPerThread>>>(
+                    cudaInput, marlinWeight, cudaScales, cudaBias, cudaOutput, k, m);
+            }
+        }
         if (cudaPeekAtLastError() != cudaSuccess) {
-            printf("Error: FP8 Marlin-layout batch-one GEMV launch failed.\n");
+            printf("Error: FP8 Marlin-layout GEMV launch failed (rows=%d).\n", n);
             throw("fp8 marlin-layout gemv error");
         }
         FastllmCudaFinishInput(input, cudaInput);

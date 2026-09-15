@@ -38,8 +38,8 @@ inline void CheckCublas(cublasStatus_t status) {
     }
 }
 
-inline State *GetState(int arch) {
-    if (arch != 75) return nullptr;
+inline State *GetState(int arch, bool fp8 = false) {
+    if (arch != 75 && !(fp8 && (arch == 80 || arch == 86))) return nullptr;
     int device = 0;
     CheckCuda(cudaGetDevice(&device));
     // The global lock protects only the map. Never allocate under a cross-rank

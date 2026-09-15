@@ -826,6 +826,20 @@ if (UNIT_TEST)
             LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
             ENVIRONMENT "FT_FLOAT_WORKSPACE_SIZE=256M;FASTLLM_CUDA_FP8_PREFILL_CUBLAS=0")
 
+        # Reuse the FP8 prefill suite for the SM80/86 extension and real MLP shapes.
+        add_test(NAME cuda_fp8_mlp_prefill COMMAND cudaFp8Sm75PrefillRegression 0 mlp)
+        set_tests_properties(cuda_fp8_mlp_prefill PROPERTIES
+            LABELS cuda TIMEOUT 180 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
+            ENVIRONMENT "FT_FLOAT_WORKSPACE_SIZE=256M")
+
+        add_executable(cudaFp8MarlinMultiRowRegression test/ops/cudaFp8MarlinMultiRowRegression.cu)
+        target_link_libraries(cudaFp8MarlinMultiRowRegression PRIVATE fastllm)
+        set_target_properties(cudaFp8MarlinMultiRowRegression PROPERTIES
+            CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME cuda_fp8_marlin_multirow COMMAND cudaFp8MarlinMultiRowRegression)
+        set_tests_properties(cuda_fp8_marlin_multirow PROPERTIES
+            LABELS cuda TIMEOUT 120 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+
         add_executable(cudaNvfp4Sm75PrefillRegression test/ops/cudaNvfp4Sm75PrefillRegression.cu)
         target_link_libraries(cudaNvfp4Sm75PrefillRegression PRIVATE fastllm)
         set_target_properties(cudaNvfp4Sm75PrefillRegression PROPERTIES

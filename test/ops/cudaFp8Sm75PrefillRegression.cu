@@ -1,5 +1,6 @@
 #include "fastllm.h"
 #include "executor.h"
+#include "devices/cuda/fastllm-cuda-fp8.h"
 #include "devices/cuda/fastllm-cuda.cuh"
 
 #include <algorithm>
@@ -42,7 +43,7 @@ std::vector<half> Read(const void *ptr, size_t count) {
     return result;
 }
 
-void Run(int gpu) {
+void Run(int gpu, bool mlpShapes) {
     using namespace fastllm;
     FastllmCudaSetDevice(gpu);
     Executor executor;
@@ -67,7 +68,10 @@ void Run(int gpu) {
     CheckBlas(cublasSetWorkspace(handle, blasWorkspace, 8ULL << 20));
 
     struct Shape { int n, k; };
-    for (Shape shape : {Shape{1024, 1024}, Shape{4160, 4224}, Shape{512, 512}}) {
+    const std::vector<Shape> shapes = mlpShapes
+        ? std::vector<Shape>{{17408, 5120}, {5120, 8704}}
+        : std::vector<Shape>{{1024, 1024}, {4160, 4224}, {512, 512}};
+    for (Shape shape : shapes) {
         for (bool withBias : {false, true}) {
             int n = shape.n, k = shape.k;
             std::mt19937 rng(n + k);
@@ -117,6 +121,13 @@ void Run(int gpu) {
             half *referenceWeight;
             Check(cudaMalloc(&referenceWeight, fp16.size() * sizeof(half)));
             Check(cudaMemcpy(referenceWeight, fp16.data(), fp16.size() * sizeof(half), cudaMemcpyHostToDevice));
+            half *dequantized;
+            Check(cudaMalloc(&dequantized, fp16.size() * sizeof(half)));
+            Expect(FastllmCudaDequantFp8MarlinForCublas(weight, dequantized), "packed dequant rejected");
+            auto decoded = Read(dequantized, fp16.size());
+            Expect(!std::memcmp(decoded.data(), fp16.data(), fp16.size() * sizeof(half)),
+                   "packed dequant differs from independent CPU reference");
+            Check(cudaFree(dequantized));
             auto reference = [&](int rows, bool useCublas) {
                 if (useCublas) {
                     int chunk = std::min(n, int(capacity / (size_t(k) * 2)) / 64 * 64);
@@ -136,13 +147,19 @@ void Run(int gpu) {
                 if (withBias) AddReferenceBias<<<rows, 256, 0, cudaStreamPerThread>>>(
                     (half *)expected.cudaData, (half *)weight.extraCudaHalfData[0], n);
             };
-            for (int rows : {1, 4, 960, 1023, 1024, 1025, 1535, 1536, 2048}) {
-                bool useCublas = !disabled && n != 512 && rows >= 1024;
-                if (n == 4160 && capacity == (4ULL << 20)) useCublas = false;
-                if (n == 4160 && capacity == (32ULL << 20) && rows < 1536) useCublas = false;
+            std::vector<half> smallBefore[2];
+            const std::vector<int> rowsToCheck = mlpShapes
+                ? std::vector<int>{1, 4, 2048}
+                : std::vector<int>{1, 4, 960, 1023, 1024, 1025, 1535, 1536, 2048};
+            for (int rows : rowsToCheck) {
+                int chunk = std::min(n, int(capacity / (size_t(k) * 2))) / 64 * 64;
+                bool useCublas = !disabled && n >= 1024 && k >= 1024 && rows >= 1024 && chunk >= 1024;
+                if (chunk < n && capacity < (64ULL << 20) &&
+                    (capacity < (32ULL << 20) || rows < 1536)) useCublas = false;
                 Check(cudaMemsetAsync(arena, 0xa5, capacity, cudaStreamPerThread));
                 Expect(FastllmCudaHalfMatMulFloatFP8E4M3(input, weight, bias, actual, rows, k, n), "dispatch failed");
                 auto output = Read(actual.cudaData, size_t(rows) * n);
+                if (rows == 1 || rows == 4) smallBefore[rows == 4] = output;
                 auto first = Read(arena, 32);
                 bool overwritten = false;
                 for (half value : first) {
@@ -162,6 +179,12 @@ void Run(int gpu) {
                 }
                 std::cout << "PASS N=" << n << " K=" << k << " M=" << rows
                           << " bias=" << withBias << " backend=" << (useCublas ? "cublas" : rows == 1 ? "gemv" : "marlin") << std::endl;
+            }
+            for (int rows : {1, 4}) {
+                Expect(FastllmCudaHalfMatMulFloatFP8E4M3(input, weight, bias, actual, rows, k, n), "post-prefill decode failed");
+                auto after = Read(actual.cudaData, size_t(rows) * n);
+                Expect(!std::memcmp(after.data(), smallBefore[rows == 4].data(), after.size() * sizeof(half)),
+                       "decode changed after prefill");
             }
             // Capture must keep Marlin and must not overwrite shared attention scratch.
             reference(1024, false);
@@ -199,12 +222,13 @@ int main(int argc, char **argv) {
     int gpu = argc > 1 ? std::atoi(argv[1]) : 0;
     cudaDeviceProp properties;
     if (cudaGetDeviceProperties(&properties, gpu) != cudaSuccess ||
-        properties.major != 7 || properties.minor != 5) {
+        !((properties.major == 7 && properties.minor == 5) ||
+          (properties.major == 8 && (properties.minor == 0 || properties.minor == 6)))) {
         return 77;
     }
     try {
-        Run(gpu);
-        std::cout << "SM75 FP8 prefill regression PASS\n";
+        Run(gpu, argc > 2 && std::strcmp(argv[2], "mlp") == 0);
+        std::cout << "SM75/80/86 FP8 prefill regression PASS\n";
         return 0;
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';
