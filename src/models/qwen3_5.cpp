@@ -26873,6 +26873,85 @@ namespace fastllm {
         return allPositionIds;
     }
 
+    void Qwen3_5Model::BuildMultimodalTextEmbeddings(const Data &inputIds,
+                                                   Data &hiddenStates) {
+        Data idsCpu(inputIds);
+        idsCpu.ToDevice(DataDevice::CPU);
+        if (idsCpu.dataType != DataType::FLOAT32) {
+            ToDataTypeForceCPU(idsCpu, DataType::FLOAT32);
+        }
+        AssertInFastLLM(idsCpu.dims.size() == 2 && idsCpu.dims[0] == 1,
+                        "Qwen3.5 multimodal embedding expects one prompt.\n");
+        Data *embedWeight = &this->weight[language_prefix + "embed_tokens.weight"];
+        int embedDevice = -1;
+#ifdef USE_CUDA
+        if (GetCudaEmbedding() && !GetLowMemMode() &&
+            embedWeight->IsTensorParallelReplicated() && embedWeight->multiDeviceData) {
+            Data *replica = nullptr;
+            for (const auto &entry : embedWeight->multiDeviceDatas) {
+                if (entry.second && entry.second->dataDevice == DataDevice::CUDA &&
+                    entry.second->cudaData) {
+                    embedDevice = entry.first;
+                    replica = entry.second;
+                    break;
+                }
+            }
+            AssertInFastLLM(replica != nullptr,
+                            "Qwen3.5 multimodal is missing a CUDA embedding replica.\n");
+            embedWeight = replica;
+        }
+#endif
+        const int tokens = idsCpu.dims[1];
+        const int width = embedWeight->dims.back();
+        hiddenStates.FreeSpace();
+        hiddenStates.dataDevice = DataDevice::CPU;
+        hiddenStates.dataType = this->dataType;
+        hiddenStates.UpdateUnitSize();
+        hiddenStates.Resize({1, tokens, width});
+        hiddenStates.Allocate();
+        // The complete prompt is CPU staging storage. Chunk extraction below
+        // explicitly uses CPU operators instead of automatic device dispatch.
+        const size_t rowBytes = (size_t)width * hiddenStates.unitSize / hiddenStates.unitSizeDiv;
+        const int chunkSize = std::max(1, std::min(2048, GetChunkedPrefillSize() > 0
+                                                      ? GetChunkedPrefillSize() : 2048));
+        const float *ids = (const float*)idsCpu.cpuData;
+        for (int start = 0; start < tokens; start += chunkSize) {
+            const int count = std::min(chunkSize, tokens - start);
+            Data chunkIds(DataType::FLOAT32, {1, count},
+                          std::vector<float>(ids + start, ids + start + count));
+            Data embedding;
+#ifdef USE_CUDA
+            if (embedDevice >= 0) {
+                Qwen35ScopedGenericExecutor executor("cuda:" + std::to_string(embedDevice));
+                Embedding(chunkIds, *embedWeight, embedding);
+            } else
+#endif
+            {
+                Embedding(chunkIds, *embedWeight, embedding);
+            }
+#ifdef USE_CUDA
+            if (embedding.dataDevice == DataDevice::CUDA) {
+                FastllmCudaSyncCurrentThreadStream();
+            }
+#endif
+            embedding.ToDevice(DataDevice::CPU);
+            if (embedding.dataType != hiddenStates.dataType) {
+                ToDataTypeForceCPU(embedding, hiddenStates.dataType);
+            }
+            memcpy(hiddenStates.cpuData + (size_t)start * rowBytes,
+                   embedding.cpuData, (size_t)count * rowBytes);
+        }
+    }
+
+    void Qwen3_5Model::SplitMultimodalTextEmbeddings(const Data &hiddenStates,
+                                                    int start, int end, Data &chunk) {
+        // lockInCPU is conditional on KV/history cache flags in Executor::Run.
+        // Force the CPU operator so text TP only uploads this prefill chunk.
+        ((Executor*)GetExecutor())->RunOnDevice("cpu", "Split",
+            {{"input", (Data*)&hiddenStates}, {"output", &chunk}}, {},
+            {{"axis", 1}, {"start", start}, {"end", end}});
+    }
+
     void Qwen3_5Model::MergeMultimodalFeaturesIntoText(const Data &mmTokenTypeIds,
                                                        const Data *imageEmbeds,
                                                        const Data *videoEmbeds,
@@ -26880,10 +26959,7 @@ namespace fastllm {
         Data mmCpu(mmTokenTypeIds);
         mmCpu.ToDevice(DataDevice::CPU);
         if (mmCpu.dataType != DataType::FLOAT32) {
-            // 注意: ToDataType 经过 Executor 调度可能优先在 CUDA 上完成,
-            // 转换后会释放 CPU 镜像, 因此后续访问 cpuData 前要再次 ToDevice(CPU).
-            ToDataType(mmCpu, DataType::FLOAT32);
-            mmCpu.ToDevice(DataDevice::CPU);
+            ToDataTypeForceCPU(mmCpu, DataType::FLOAT32);
         }
         DataType hiddenType = hiddenStates.dataType;
         hiddenStates.ToDevice(DataDevice::CPU);
@@ -26910,11 +26986,10 @@ namespace fastllm {
             }
             dst.CopyFrom(*src);
             dst.ToDevice(DataDevice::CPU);
+            // Feature merging reads CPU pointers. Converting a whole image
+            // batch through CUDA can allocate several GiB on the first rank.
             if (dst.dataType != hiddenType) {
-                // 注意: ToDataType 可能会通过 Executor 自动把数据搬到 CUDA 上完成转换,
-                // 之后 cpuData 会被释放. 因此完成转换后要再次显式 ToDevice(CPU).
-                ToDataType(dst, hiddenType);
-                dst.ToDevice(DataDevice::CPU);
+                ToDataTypeForceCPU(dst, hiddenType);
             }
             if (dst.dims.size() == 3 && dst.dims[0] == 1) {
                 dst.Reshape({dst.dims[1], dst.dims[2]});
@@ -32351,37 +32426,8 @@ namespace fastllm {
         }
 
         Data hiddenStates;
-        Data embeddingResult;
-        Data &multimodalEmbedWeight = this->weight[language_prefix + "embed_tokens.weight"];
-#ifdef USE_CUDA
-        if (GetCudaEmbedding() && !GetLowMemMode() &&
-            multimodalEmbedWeight.IsTensorParallelReplicated() &&
-            multimodalEmbedWeight.multiDeviceData) {
-            // TP owns one full embedding table per GPU. The parent tensor is
-            // metadata; generic Embedding must use an actual local replica.
-            Data *localEmbed = nullptr;
-            int embedDevice = -1;
-            for (const auto &entry : multimodalEmbedWeight.multiDeviceDatas) {
-                if (entry.second != nullptr &&
-                    entry.second->dataDevice == DataDevice::CUDA &&
-                    entry.second->cudaData != nullptr) {
-                    embedDevice = entry.first;
-                    localEmbed = entry.second;
-                    break;
-                }
-            }
-            AssertInFastLLM(localEmbed != nullptr,
-                            "Qwen3.5 multimodal is missing a CUDA embedding replica.\n");
-            Qwen35ScopedGenericExecutor executor("cuda:" + std::to_string(embedDevice));
-            Embedding(inputIds, *localEmbed, embeddingResult);
-        } else
-#endif
-        {
-            Embedding(inputIds, multimodalEmbedWeight, embeddingResult);
-        }
-        ToDataType(embeddingResult, hiddenStates, this->dataType);
+        BuildMultimodalTextEmbeddings(inputIds, hiddenStates);
         MergeMultimodalFeaturesIntoText(*mmTypeIt->second[0], imageEmbeds, videoEmbeds, hiddenStates);
-        embeddingResult.FreeSpace();
         imageFeatures.FreeSpace();
         videoFeatures.FreeSpace();
 
@@ -32575,8 +32621,8 @@ namespace fastllm {
                     Split(inputIds, 1, st, st + curLen, curInputIds);
                     Split(mropePositionIds, 1, st, st + curLen,
                           curPositionIds);
-                    Split(hiddenStates, 1, st, st + curLen,
-                          curHiddenStates);
+                    SplitMultimodalTextEmbeddings(hiddenStates, st, st + curLen,
+                                                  curHiddenStates);
                     std::vector<Data*> curAttentionMasks = {nullptr};
                     std::vector<Data*> curPositionIdVec = {
                         &curPositionIds
@@ -32720,8 +32766,8 @@ namespace fastllm {
                     Split(inputIds, 1, st, st + curLen, curInputIds);
                     Split(mropePositionIds, 1, st, st + curLen,
                           curPositionIds);
-                    Split(hiddenStates, 1, st, st + curLen,
-                          curHiddenStates);
+                    SplitMultimodalTextEmbeddings(hiddenStates, st, st + curLen,
+                                                  curHiddenStates);
 
                     std::vector<Data*> curAttentionMasks = {nullptr};
                     std::vector<Data*> curPositionIdsVec = {

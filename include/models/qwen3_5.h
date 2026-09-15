@@ -442,6 +442,8 @@ namespace fastllm {
                 std::map<int, int> ratios);
 #endif
         void PrepareVision();
+        void BuildMultimodalTextEmbeddings(const Data &inputIds, Data &hiddenStates);
+        void SplitMultimodalTextEmbeddings(const Data &hiddenStates, int start, int end, Data &chunk);
         Data BuildFlattenedPositionIds(const std::vector <Data*> &positionIds,
                                       const std::vector <int> &seqLens,
                                       bool all1);
