@@ -3149,16 +3149,33 @@ static size_t ParseSizeFromEnv(const char* env_name, size_t default_size) {
 
 struct FlashInferWorkSpaceManager {
     const size_t float_workspace_size = ParseSizeFromEnv("FT_FLOAT_WORKSPACE_SIZE", 256 * 1024 * 1024);
-    const size_t int_workspace_size = 64 * 1024 * 1024;     // 64 MB
+    size_t int_workspace_size = 1024 * 1024;
 
     std::mutex plan_mutex;
     void* d_float_workspace = nullptr;
     void* d_int_workspace = nullptr;
     void* h_page_locked_int_workspace = nullptr;
 
+    // Integer schedules are usually only a few KiB. Size the staging arena
+    // from the counting planner; keep the float arena (kernel split policy)
+    // unchanged. Call under plan_mutex, outside stream capture.
+    void EnsureIntCapacity(size_t required) {
+        if (required <= int_workspace_size) return;
+        size_t capacity = ((required + (1 << 20) - 1) >> 20) << 20;
+        checkCudaErrors("FlashInfer integer workspace resize sync", cudaDeviceSynchronize());
+        void *device = FastllmCudaDirectMalloc(capacity);
+        void *host = nullptr;
+        checkCudaErrors("FlashInfer integer host workspace resize", cudaMallocHost(&host, capacity));
+        FastllmCudaDirectFree(d_int_workspace);
+        checkCudaErrors("FlashInfer integer host workspace release", cudaFreeHost(h_page_locked_int_workspace));
+        d_int_workspace = device;
+        h_page_locked_int_workspace = host;
+        int_workspace_size = capacity;
+    }
+
     FlashInferWorkSpaceManager() {
         d_float_workspace = FastllmCudaMalloc(float_workspace_size);
-        d_int_workspace = FastllmCudaMalloc(int_workspace_size);
+        d_int_workspace = FastllmCudaDirectMalloc(int_workspace_size);
         cudaError_t err = cudaMallocHost(&h_page_locked_int_workspace, int_workspace_size);
         if (err != cudaSuccess || h_page_locked_int_workspace == nullptr) {
             printf("FlashInferWorkSpaceManager: Failed to allocate h_page_locked_int_workspace: %s\n", cudaGetErrorString(err));
@@ -3168,7 +3185,7 @@ struct FlashInferWorkSpaceManager {
 
     ~FlashInferWorkSpaceManager() {
         FastllmCudaFree(d_float_workspace);
-        FastllmCudaFree(d_int_workspace);
+        FastllmCudaDirectFree(d_int_workspace);
         cudaFreeHost(h_page_locked_int_workspace);
     }
 };
@@ -3593,6 +3610,14 @@ bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::
         int current_device_id = -1;
         cudaGetDevice(&current_device_id);
         if (!inited || !plan_inited_map[current_device_id]) {
+            std::lock_guard<std::mutex> workspace_guard(workspace.plan_mutex);
+            size_t floatBytes = 0, intBytes = 0;
+            checkCudaErrors("FlashInfer prefill workspace size",
+                PrefillPlanWorkspaceSize<uint32_t>(floatBytes, intBytes,
+                    q_indptr_host.data(), indptr_host.data(), total_num_rows,
+                    batch_size, num_qo_heads_per_batch, numHeads, headDim, headDim,
+                    pageLen, false, sizeof(QType), -1, -1, false, 0, 0, stream));
+            workspace.EnsureIntCapacity(intBytes);
             cudaError_t plan_status = PrefillPlan<uint32_t>(
                 workspace.d_float_workspace, workspace.float_workspace_size, workspace.d_int_workspace, workspace.h_page_locked_int_workspace,
                 workspace.int_workspace_size, plan_info_map[current_device_id], q_indptr_host.data(), indptr_host.data(), 
@@ -4217,6 +4242,13 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
             // on different GPUs never block each other while one rank waits
             // for its plan staging copies to finish.
             std::lock_guard<std::mutex> workspace_guard(workspace.plan_mutex);
+            size_t floatBytes = 0, intBytes = 0;
+            checkCudaErrors("FlashInfer batch prefill workspace size",
+                PrefillPlanWorkspaceSize<uint32_t>(floatBytes, intBytes,
+                    (uint32_t*)qSizes.cpuIntDatas.data(), (uint32_t*)pageSizes.cpuIntDatas.data(),
+                    total_num_rows, batch_size, num_qo_heads_per_batch, numHeads, headDim, headDim,
+                    pageLen, useFlashInferCudaGraph, sizeof(QType), windowLeft, -1, false, 0, 0, stream));
+            workspace.EnsureIntCapacity(intBytes);
             PrefillPlanInfo created_plan_info;
             cudaError_t plan_status = PrefillPlan<uint32_t>(
                     workspace.d_float_workspace, workspace.float_workspace_size, workspace.d_int_workspace, workspace.h_page_locked_int_workspace,
@@ -4551,6 +4583,9 @@ bool FastllmCudaMLAPaged(const fastllm::Data &qNope, const fastllm::Data &qPe, c
     std::vector<int32_t> kv_len_arr_h = {kvLen};
     const uint32_t batch_size = 1;
 
+    // MLA uses a separate scheduler without a counting interface.
+    std::lock_guard<std::mutex> workspace_guard(workspace.plan_mutex);
+    workspace.EnsureIntCapacity(64ULL << 20);
     MLAPlanInfo plan_info;
     cudaError_t plan_status = MLAPlan<int32_t>(
         workspace.d_float_workspace, workspace.float_workspace_size, workspace.d_int_workspace, workspace.h_page_locked_int_workspace,

@@ -5104,6 +5104,34 @@ namespace fastllm {
                         }
                         long long delayedReservePerPage =
                             deviceDelayedCacheBytesPerPage.count(id) ? deviceDelayedCacheBytesPerPage[id] : 0;
+                        if (servingFootprintMaterialized) {
+                            // The provisional estimate allows one late KV layer.
+                            // Release it only after verifying every local K/V
+                            // manager has the full calibrated allocation. Extra
+                            // model-specific caches (e.g. MTP) keep their reserve.
+                            int allocatedLayers = 0;
+                            for (int layer = 0; layer < block_cnt; ++layer) {
+                                if (layerElementsPerToken[layer] <= 0) continue;
+                                bool keyReady = false, valueReady = false;
+                                for (bool isKey : {true, false}) {
+                                    auto managers = this->GetPagedKVCacheManagers(layer, isKey);
+                                    for (auto &entry : managers) {
+                                        auto *manager = entry.second;
+                                        if (entry.first == id && manager != nullptr &&
+                                            manager->cudaData != nullptr &&
+                                            manager->maxPages >= currentPages) {
+                                            (isKey ? keyReady : valueReady) = true;
+                                        }
+                                    }
+                                }
+                                if (keyReady && valueReady) ++allocatedLayers;
+                            }
+                            if (allocatedLayers > 0 &&
+                                allocatedLayers == deviceLayerCount[id]) {
+                                delayedReservePerPage = std::max(0LL,
+                                    this->GetAutoWarmupCudaAdditionalCacheBytesPerToken(id)) * pageLen;
+                            }
+                        }
                         delayedReservePerPage = std::max(0LL, delayedReservePerPage);
                         long long bytesPerFinalPage = bytesPerPageOnDevice + delayedReservePerPage;
                         if (bytesPerFinalPage <= 0) {

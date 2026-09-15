@@ -14,6 +14,7 @@
 #include <chrono>
 #include <climits>
 #include <exception>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -9238,11 +9239,20 @@ namespace fastllm {
                     reserveBytes += (long long)batch * Qwen35MtpDraftsPerStep() *
                                     vocabSize * sizeof(float);
                 }
-                reserveBytes +=
-                    (long long)batch * vocabSize * (long long)sizeof(float) +
-                    localLogitsBytes +
-                    (long long)batch * (long long)sizeof(int) +
-                    Qwen35CudaRuntimeScratchReserveBytes();
+                // Final calibration observes the allocated serving high-water
+                // footprint. Do not charge the ordinary sampling estimate twice.
+                // Speculative serving retains its separate conservative reserve.
+                bool samplingMaterialized = cudaServingPrepared &&
+                    cudaServingHighWaterPrepared && !HasDFlashWeights() &&
+                    (!HasMtpWeights() || Qwen35MtpDraftsPerStep() <= 0 ||
+                     Qwen35MtpDisabledByEnv());
+                if (!samplingMaterialized) {
+                    reserveBytes +=
+                        (long long)batch * vocabSize * (long long)sizeof(float) +
+                        localLogitsBytes +
+                        (long long)batch * (long long)sizeof(int) +
+                        Qwen35CudaRuntimeScratchReserveBytes();
+                }
             }
         }
 
@@ -12347,6 +12357,92 @@ namespace fastllm {
 #endif
     }
 
+#ifdef USE_CUDA
+    // Ordinary prefill runs attention and MLP sequentially on one worker
+    // stream. Keep one owning allocation and lend dense slices to each phase.
+    // Unlike FakeFrom, borrowed CUDA storage survives output preparation.
+    class Qwen35PrefillScratchArena {
+    public:
+        struct Slot {
+            std::initializer_list<Data*> outputs;
+            uint64_t elements;
+        };
+
+        explicit Qwen35PrefillScratchArena(int device) : device(device) {
+            storage.dataType = DataType::FLOAT16;
+            storage.dataDevice = DataDevice::CUDA;
+            storage.dataDeviceIds = {device};
+        }
+
+        void Begin(std::initializer_list<Slot> slots) {
+            // A previous phase's views must be detached, including outputs
+            // which a fallback might use without explicitly rebinding them.
+            for (Data *output : outputs) {
+                Detach(*output);
+            }
+            outputs.clear();
+            uint64_t elements = 0;
+            for (const Slot &slot : slots) {
+                elements += Align(slot.elements);
+            }
+            AssertInFastLLM(elements <= (uint64_t)INT_MAX,
+                            "Qwen3.5 prefill scratch is too large.\n");
+            storage.Resize({(int)elements});
+            storage.Allocate(false);
+            uint64_t offset = 0;
+            for (const Slot &slot : slots) {
+                if (slot.elements != 0) {
+                    for (Data *output : slot.outputs) {
+                        Borrow(*output, storage, offset, slot.elements);
+                    }
+                }
+                offset += Align(slot.elements);
+            }
+        }
+
+        void Borrow(Data &output, Data &owner,
+                    uint64_t offset, uint64_t elements) {
+            AssertInFastLLM(&output != &owner && owner.cudaData != nullptr &&
+                                (offset + elements) * sizeof(uint16_t) <=
+                                    owner.expansionBytes,
+                            "Qwen3.5 prefill scratch slice is out of bounds.\n");
+            // These are temporary outputs, never caches or model weights.
+            Detach(output);
+            output.dataType = DataType::FLOAT16;
+            output.UpdateUnitSize();
+            output.dataDevice = DataDevice::CUDA;
+            output.dataDeviceIds = {device};
+            output.cudaData = (uint8_t*)owner.cudaData +
+                              offset * sizeof(uint16_t);
+            output.cudaDataBorrowed = true;
+            output.expansionSize = elements;
+            output.expansionBytes = elements * sizeof(uint16_t);
+            outputs.push_back(&output);
+        }
+
+    private:
+        static void Detach(Data &output) {
+            if (output.isFake) {
+                output.isFake = false;
+                output.cpuData = nullptr;
+                output.cudaData = nullptr;
+                output.deviceData = nullptr;
+            }
+            output.FreeSpace();
+            output.expansionDims.clear();
+            output.dims.clear();
+            output.strides.clear();
+        }
+
+        static uint64_t Align(uint64_t elements) {
+            return (elements + 127) & ~uint64_t(127); // 256-byte slices
+        }
+        int device;
+        Data storage; // Declared before the borrowed Data at the call site.
+        std::vector<Data*> outputs;
+    };
+#endif
+
     void Qwen3_5Model::ForwardSingleGPU(
             int gpuId,
             std::map <int, int> ratios,
@@ -12508,15 +12604,36 @@ namespace fastllm {
         }
         mtpWorkerProfileSyncMark(mtpWorkerProfileSetupUs);
 
-        Data attenInput, merged, qgate, gate, q, k, v, attenOutput, attenLastOutput;
+        // Attention projections and the following MLP projection have disjoint
+        // lifetimes. Reuse owning Data objects so output preparation preserves
+        // their capacity (a FakeFrom view would be detached by CUDA operators).
+        Qwen35PrefillScratchArena prefillScratch(gpuId);
+        const bool reusePrefillScratch =
+            isPrefill && batch == 1 && !all1 && num_experts == 0 &&
+            !speculativeCollectAllLogits &&
+            !speculativeCaptureFirstTokenLinearState &&
+            !speculativeCaptureDFlashHiddenStates &&
+            mtpVerifyGraphDeviceState == nullptr &&
+            computeType == DataType::FLOAT16 &&
+            hiddenStates.dims.size() == 3 && hiddenStates.dims[0] == 1 &&
+            seqLens.size() == 1 && seqLens[0] == hiddenStates.dims[1] &&
+            seqLens[0] > 1;
+        const uint64_t prefillResidualElements =
+            !tensorParallel || firstTensorParallelRank ?
+                hiddenStates.Count(0) : 0;
+        Data projectionScratch, residualScratch;
+        Data &merged = projectionScratch, &gdnMerged = projectionScratch;
+        Data &gateupResult = projectionScratch;
+        Data &attenLastOutput = residualScratch, &mlpPart = residualScratch;
+        Data attenInput, qgate, gate, q, k, v, attenOutput;
         Data qForAttentionHolder;
-        Data gateupResult, swigluResult, mlpPart;
+        Data swigluResult;
         Data routerLogits, routerLogitsTemp, expertIndex, expertScore;
         Data w1, w2, w3, tempInput, tempOutput, moeInputTemp, moeOutputTemp;
         Data moeFinal, sharedGate, sharedOutput;
         Data qSizes, pageSizes, pageIndexs, lastPageLens;
         Data insertIndexs, insertPositions;
-        Data gdnMerged, baMerged, qkvConvInput, qkvConvInputPermuted;
+        Data baMerged, qkvConvInput, qkvConvInputPermuted;
         Data z, b, a, g, conv, convOutput, convOutputPermuted;
         Data coreAttnOut, coreTemp, gatedCoreAttnOut;
         Qwen35ExactDFlashPagedMeta exactDFlashPagedMeta;
@@ -12690,6 +12807,16 @@ namespace fastllm {
                     Data *activeLastPageLens = graphPagedLayer != nullptr ?
                         &graphPagedLayer->lastPageLens : &lastPageLens;
                     int localQHeads = localKVHeads * (num_attention_heads / num_key_value_heads);
+                    if (reusePrefillScratch) {
+                        uint64_t qElements = (uint64_t)seqlen * localQHeads * head_dim;
+                        uint64_t kvElements = (uint64_t)seqlen * localKVHeads * head_dim;
+                        prefillScratch.Begin({
+                            {{&merged}, 2 * (qElements + kvElements)},
+                            {{&q}, qElements}, {{&gate}, qElements},
+                            {{&k}, kvElements}, {{&v}, kvElements},
+                            {{&attenOutput}, qElements},
+                            {{&attenLastOutput}, prefillResidualElements}});
+                    }
                     const bool exactDFlashVerifierAttention =
                         exactSmallDFlashVerifier &&
                         mtpVerifyGraphDeviceState == nullptr &&
@@ -13054,6 +13181,54 @@ namespace fastllm {
                     hasMergedGdnInLinear || hasQkvzGdnInLinear ||
                         hasSeparateQkvZGdnInLinear,
                     "Qwen3.5 ForwardSingleGPU requires qkvzba, qkvz/ba, or qkv/z/ba weights.\n");
+                const char *tritonEnv = std::getenv("FASTLLM_CUDA_TRITON");
+                const bool compactGdnScratch = reusePrefillScratch &&
+                    !hasSeparateQkvZGdnInLinear &&
+                    head_k_dim == 128 && head_v_dim == 128 &&
+                    Qwen35SinglePrefillFusedConvEnabled() &&
+                    !GetFastllmEnv().cudaTriton &&
+                    (tritonEnv == nullptr || !Qwen35MoeIsTrueString(tritonEnv)) &&
+                    Qwen35EnvDefaultEnabled(
+                        "FASTLLM_CUDA_TRITON_CHUNK_GDN_POSTCONV") &&
+                    Qwen35EnvDefaultEnabled(
+                        "FASTLLM_CUDA_QWEN35_GDN_FUSED_RMSNORM_POSTCONV");
+                if (reusePrefillScratch) {
+                    uint64_t paddedSeq = ((uint64_t)seqlen + 63) / 64 * 64;
+                    uint64_t kElements = paddedSeq * localValueHeads * head_k_dim;
+                    uint64_t vElements = paddedSeq * localValueHeads * head_v_dim;
+                    uint64_t matrixElements = paddedSeq * localValueHeads * 64;
+                    uint64_t convElements = (uint64_t)seqlen * localQkvDim;
+                    uint64_t gateElements = (uint64_t)seqlen * localVd;
+                    uint64_t projectionElements = hasSeparateQkvZGdnInLinear ? 0 :
+                        (uint64_t)seqlen * (localQkvDim + localVd +
+                            (hasMergedGdnInLinear ? 2 * localValueHeads : 0));
+                    if (compactGdnScratch) {
+                        // Conv input is dead before post-conv produces kBeta;
+                        // kBeta is dead before the final output gate. Native
+                        // recompute finishes reading vBeta before kCumdecay.
+                        prefillScratch.Begin({
+                            {{&gdnMerged}, projectionElements},
+                            {{&qkvConvInput, &kBeta, &gatedCoreAttnOut},
+                                std::max(convElements, std::max(kElements, gateElements))},
+                            {{&qq}, kElements}, {{&kkPad}, kElements},
+                            {{&vvPad}, vElements},
+                            {{&vBeta, &kCumdecay}, std::max(kElements, vElements)},
+                            {{&at}, matrixElements}, {{&decayMask}, matrixElements},
+                            {{&attn}, matrixElements},
+                            {{&attenLastOutput}, prefillResidualElements}});
+                    } else {
+                        prefillScratch.Begin({
+                            {{&gdnMerged}, projectionElements},
+                            {{&qkvConvInput}, convElements},
+                            {{&qq}, kElements}, {{&kkPad}, kElements},
+                            {{&vvPad}, vElements}, {{&kBeta}, kElements},
+                            {{&vBeta}, vElements}, {{&kCumdecay}, kElements},
+                            {{&at}, matrixElements}, {{&decayMask}, matrixElements},
+                            {{&attn}, matrixElements}, {{&coreAttnOut}, vElements},
+                            {{&gatedCoreAttnOut}, gateElements},
+                            {{&attenLastOutput}, prefillResidualElements}});
+                    }
+                }
                 bool fusedInputProjection =
                     hasMergedGdnInLinear &&
                     Qwen3CudaEnvDefaultEnabled(
@@ -14153,6 +14328,17 @@ namespace fastllm {
                         }
                     }
 
+                    // Keep convOutput owning storage so the existing fused
+                    // conv path remains eligible. Only lend it to the core
+                    // after post-conv has consumed it, on the same stream.
+                    uint64_t coreElements = (uint64_t)localValueHeads *
+                        ((seqlen + 63) / 64 * 64) * head_v_dim;
+                    if (compactGdnScratch && fusedPostConv &&
+                        coreElements * sizeof(uint16_t) <=
+                            convOutputForRecurrent->expansionBytes) {
+                        prefillScratch.Borrow(coreAttnOut,
+                            *convOutputForRecurrent, 0, coreElements);
+                    }
                     if (!fusedPostConv) {
                         pbb->Resize(
                             {pbb->dims[0], pbb->dims[1], pbb->dims[2], 1});
@@ -14221,7 +14407,10 @@ namespace fastllm {
                     if (!recomputeInternalExp) {
                         Qwen35CudaExp(cudaRunner, *pgg, gExp);
                     }
-                    if (!FastllmCudaTryTritonChunkGdnRecompute(
+                    // Compact scratch aliases vBeta and kCumdecay; only
+                    // the sequential native recompute supports that alias.
+                    if (compactGdnScratch ||
+                        !FastllmCudaTryTritonChunkGdnRecompute(
                             attn, vBeta, kBeta, gExp, *pgg,
                             vvPad, kCumdecay)) {
                         if (recomputeInternalExp) {
@@ -14739,6 +14928,14 @@ namespace fastllm {
             bool hasMergedDenseMlp =
                 weight.weight.find(swigluWeightName) != weight.weight.end() &&
                 weight.weight.find(downWeightName) != weight.weight.end();
+            if (hasMergedDenseMlp && reusePrefillScratch) {
+                Data &localGateUp = *requireLocal(weight[swigluWeightName], swigluWeightName);
+                uint64_t gateUpElements = (uint64_t)seqlen * localGateUp.dims[0];
+                prefillScratch.Begin({
+                    {{&gateupResult}, gateUpElements},
+                    {{&swigluResult}, gateUpElements / 2},
+                    {{&mlpPart}, prefillResidualElements}});
+            }
             if (hasMergedDenseMlp) {
                 Data &gateUpWeight = *requireLocal(
                     weight[swigluWeightName], swigluWeightName);
