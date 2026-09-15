@@ -1024,6 +1024,28 @@ PYTHONPATH=build/tools python test/basic/deepseek_v41_fixture_gen.py \
 ctest -R deepseekV41Ops                     # 无 CUDA 设备时以 77 跳过
 ```
 
+## Decode 算子与兼容性
+
+单 token indexer 使用 head 作为 MMA 矩阵行。注意力将输出维度分成四份；候选较多且临时空间
+充足时，先并行计算 QK，再保持原有的 64 槽在线 softmax、BF16 概率舍入和 PV 顺序。
+BF16 5120 维、1–8 行 RMSNorm 与四路 HC Finish 使用保持归约顺序的专用内核。
+
+MMA 路径检查设备及实际加载内核的架构、线程数和共享内存限制；不满足时使用原 FP32 标量路径。
+非 decode 形状使用通用 MMA，注意力临时内存不足时退回无需该空间的融合 MMA；执行错误正常上报。
+RMSNorm 其他类型、维度和批量保留原路径，不满足向量读取对齐时使用标量读取。
+CUDA 构建仍需包含目标显卡支持的代码镜像，并使用支持该架构的工具链。
+
+```bash
+./build/deepseekV41OpsRegression
+ctest --test-dir build -R 'deepseekV41(Precision|Tp|DecodeOptimization)' --output-on-failure
+python test/basic/test_deepseek_v41_tp_graph.py --binary ./build/deepseekV41TpGraphRegression
+```
+
+Graph fixture 需要 PyTorch、safetensors、numpy 和两张 CUDA GPU；覆盖不同长度的连续请求、
+eager / Graph 切换和共享专家重叠。`--hc-mult 2` 可补测两路 HC，默认四路。
+算子回归检查通用路径与 decode 对齐、独立 CPU RMSNorm 参考、量化 KV、远端 logits 同步、
+缓冲复用、并发 Graph 及捕获期间临时空间不足时的回退。
+
 ## 调试环境变量
 
 | 变量 | 作用 |
@@ -1035,7 +1057,6 @@ ctest -R deepseekV41Ops                     # 无 CUDA 设备时以 77 跳过
 | `FASTLLM_DSV41_LEGACY_TOPK` | indexer top-k 退回旧的「全 visible 扫描 + 8 轮 4-bit radix」kernel |
 | `FASTLLM_DSV41_LEGACY_ROTARY` | 旋转 / 伪量化退回旧的「一行一个 block + 共享内存」kernel |
 | `FASTLLM_DSV41_DISABLE_HCPRENORM` | 不融合 HcApplyPre 与 RMSNorm，退回两个算子分开做 |
-| `FASTLLM_DSV41_ATTN_SPLITS` | 手动指定稀疏注意力候选维的 split-K 份数（默认自动） |
 | `FASTLLM_DSV41_INDEX_SCORE_MB` | indexer 分数矩阵的显存预算（MB，默认 128），决定 token 维分块大小 |
 | `FASTLLM_DSV41_INDEX_CHUNK` | 直接指定 indexer 的 token 分块大小（覆盖上面的预算推算） |
 | `FASTLLM_DSV41_ENGRAM_META` | Engram 元数据 JSON 路径 |

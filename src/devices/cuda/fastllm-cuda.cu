@@ -3857,6 +3857,93 @@ __global__ void FastllmRMSNormKernelInner1(__nv_bfloat16 *input, float *weight, 
 }
 
 #ifndef USE_ROCM
+// Odd row strides are not aligned for float4/half2/bfloat162 accesses. Scalar
+// loads preserve arbitrary row alignment; the general even-width path stays
+// unchanged. No tensor-core instructions are required.
+template <typename T>
+__global__ void FastllmRMSNormUnalignedKernel(const T *input, const float *weight,
+                                            T *output, int channels, float eps) {
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    input += (uint64_t)blockIdx.x * channels;
+    output += (uint64_t)blockIdx.x * channels;
+    __shared__ float partial[8], scale;
+    float sum = 0.0f;
+    for (int i = tid; i < channels; i += 256) {
+        float v = (float)input[i]; sum += v * v;
+    }
+    for (int offset = 16; offset; offset >>= 1) sum += __shfl_down_sync(0xffffffff, sum, offset);
+    if (lane == 0) partial[warp] = sum;
+    __syncthreads();
+    if (warp == 0) {
+        sum = lane < 8 ? partial[lane] : 0.0f;
+        for (int offset = 16; offset; offset >>= 1) sum += __shfl_down_sync(0xffffffff, sum, offset);
+        if (lane == 0) scale = rsqrtf(sum / channels + eps);
+    }
+    __syncthreads();
+    for (int i = tid; i < channels; i += 256) output[i] = (T)((float)input[i] * scale * weight[i]);
+}
+
+// Emulate the original 1024 lanes with fewer physical threads. Independent
+// virtual-lane sums are interleaved to hide shuffle latency; inputs stay in
+// registers until the scale is ready. The reduction tree is unchanged.
+template <int THREADS>
+__global__ __launch_bounds__(THREADS) void FastllmRMSNormBFloat16Decode5120Kernel(
+        const __nv_bfloat16 *input, const float *weight, __nv_bfloat16 *output, float eps) {
+    constexpr int channels = 5120, groups = 1024 / THREADS;
+    input += (uint64_t)blockIdx.x * channels;
+    output += (uint64_t)blockIdx.x * channels;
+    const auto *pairs = reinterpret_cast<const __nv_bfloat162*>(input);
+    __shared__ float warpSums[32];
+    __shared__ float scale;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    float sums[groups];
+    __nv_bfloat162 values[groups][3];
+#pragma unroll
+    for (int g = 0; g < groups; ++g) {
+        sums[g] = 0.0f;
+#pragma unroll
+        for (int step = 0; step < 3; ++step) {
+            const int i = tid + g * THREADS + step * 1024;
+            if (i < channels / 2) {
+                values[g][step] = pairs[i];
+                float lo = __bfloat162float(values[g][step].x), hi = __bfloat162float(values[g][step].y);
+                sums[g] += lo * lo + hi * hi;
+            }
+        }
+    }
+#pragma unroll
+    for (int offset = 16; offset; offset >>= 1) {
+#pragma unroll
+        for (int g = 0; g < groups; ++g) sums[g] += __shfl_down_sync(0xffffffff, sums[g], offset);
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int g = 0; g < groups; ++g) warpSums[g * (THREADS / 32) + warp] = sums[g];
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float sum = warpSums[lane];
+#pragma unroll
+        for (int offset = 16; offset; offset >>= 1) sum += __shfl_down_sync(0xffffffff, sum, offset);
+        if (lane == 0) scale = rsqrtf(sum / channels + eps);
+    }
+    __syncthreads();
+    auto *out = reinterpret_cast<__nv_bfloat162*>(output);
+#pragma unroll
+    for (int g = 0; g < groups; ++g) {
+#pragma unroll
+        for (int step = 0; step < 3; ++step) {
+            const int i = tid + g * THREADS + step * 1024;
+            if (i < channels / 2) {
+                __nv_bfloat162 result;
+                result.x = __float2bfloat16_rn(__bfloat162float(values[g][step].x) * scale * __ldg(weight + 2 * i));
+                result.y = __float2bfloat16_rn(__bfloat162float(values[g][step].y) * scale * __ldg(weight + 2 * i + 1));
+                out[i] = result;
+            }
+        }
+    }
+}
+
 // hidden=3072 uses three bfloat162 values per thread in the legacy 512-thread
 // kernel.  A physical thread evaluates two independent legacy thread lanes and
 // keeps all six packed values in registers until the scale is available.  The
@@ -7743,6 +7830,13 @@ bool FastllmCudaCumSumDecayMaskNegMulCausal(
 static bool LaunchFastllmRMSNormFloat16(
         const half *input, const float *weight, half *output,
         int outer, int channels, float eps, int threadCount) {
+#ifndef USE_ROCM
+    if (threadCount == 0 && ((channels & 1) || ((uintptr_t)input | (uintptr_t)output) % 4)) {
+        FastllmRMSNormUnalignedKernel<half><<<outer, 256>>>(input, weight, output, channels, eps);
+        return true;
+    }
+#endif
+
     if (channels == 128 && threadCount == 32) {
         FastllmRMSNormHalf128ExactKernel<<<outer, 32>>>(
             input, weight, output, eps);
@@ -7791,6 +7885,14 @@ static bool LaunchFastllmRMSNormBFloat16(
         __nv_bfloat16 *input, float *weight, __nv_bfloat16 *output,
         int outer, int channels, float eps, int threadCount) {
 #ifndef USE_ROCM
+    if (threadCount == 0 && ((channels & 1) || ((uintptr_t)input | (uintptr_t)output) % 4)) {
+        FastllmRMSNormUnalignedKernel<__nv_bfloat16><<<outer, 256>>>(input, weight, output, channels, eps);
+        return true;
+    }
+    if (threadCount == 0 && channels == 5120 && outer > 0 && outer <= 8) {
+        FastllmRMSNormBFloat16Decode5120Kernel<512><<<outer, 512>>>(input, weight, output, eps);
+        return true;
+    }
     if (channels == 3072 && threadCount == 256) {
         FastllmRMSNormBFloat16Hidden3072ExactKernel<<<outer, 256>>>(
             input, weight, output, eps);
@@ -7873,6 +7975,12 @@ bool FastllmCudaRMSNorm(const fastllm::Data &input, fastllm::Data &weight, fastl
     int channels = input.dims[axis];
 
     if (input.dataType == fastllm::DataType::FLOAT32) {
+#ifndef USE_ROCM
+        if (channels % 4 || ((uintptr_t)cudaInput | (uintptr_t)cudaOutput | (uintptr_t)weight.cudaData) % 16) {
+            FastllmRMSNormUnalignedKernel<float><<<outer, 256>>>(
+                cudaInput, (const float*)weight.cudaData, cudaOutput, channels, eps);
+        } else
+#endif
         if (channels < 64) {
             FastllmRMSNormKernelInner1<1> <<< outer, 1 >>>(cudaInput, (float *) weight.cudaData, cudaOutput, outer,
                                                            channels, eps);
