@@ -3,6 +3,7 @@
 //
 
 #include "model.h"
+#include "devices/disk/diskdevice.h"
 
 #include <cstring>
 #include <csignal>
@@ -98,6 +99,17 @@ extern "C" {
 
     DLL_EXPORT void set_moe_cuda_cache(uint64_t bytes) {
         fastllm::SetMoeCudaCacheBytes(bytes);
+    }
+
+    DLL_EXPORT void set_moe_cpu_cache(uint64_t bytes) {
+        fastllm::SetMoeCpuCacheBytes(bytes);
+    }
+
+    DLL_EXPORT void get_disk_moe_cache_stats(uint64_t *values) {
+        auto s = fastllm::GetDiskMoeCacheStats();
+        uint64_t result[] = {s.cpuBytes, s.cudaBytes, s.cpuHits, s.cudaHits, s.misses,
+            s.diskBytes, s.uploads, s.cpuEvictions, s.cudaEvictions};
+        std::copy(result, result + 9, values);
     }
 
     DLL_EXPORT void disable_cuda_malloc() {

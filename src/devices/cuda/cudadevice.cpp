@@ -9052,13 +9052,21 @@ namespace fastllm {
             else FastllmBF16ToFloat(output.cudaData, floatOutput.cudaData, output.Count(0));
         }
 
+        // Temporary uploads preserve host storage; disk-cache residents have
+        // none and must keep their device allocation after this invocation.
+        auto uploadWeight = [](Data *weight, void *stream = nullptr) {
+            if (weight->cpuData || !weight->numasData.empty()) weight->ToCudaTemporary({}, true, stream);
+        };
+        auto releaseWeight = [](Data *weight) {
+            if (weight->cpuData || !weight->numasData.empty()) weight->FreeCudaTemporary({}, false);
+        };
         void *copyStream = FastllmCudaStreamCreate(true);
         void *computeDoneEvent = FastllmCudaEventCreate();
         int curExpert = findNextValidExpert(-1);
 
         if (curExpert >= 0) {
-            weights[curExpert * 2]->ToCudaTemporary({}, true);
-            weights[curExpert * 2 + 1]->ToCudaTemporary({}, true);
+            uploadWeight(weights[curExpert * 2]);
+            uploadWeight(weights[curExpert * 2 + 1]);
         }
 
         int prevExpert = -1;
@@ -9066,8 +9074,8 @@ namespace fastllm {
             int nextExpert = findNextValidExpert(curExpert);
 
             if (nextExpert >= 0) {
-                weights[nextExpert * 2]->ToCudaTemporary({}, true, copyStream);
-                weights[nextExpert * 2 + 1]->ToCudaTemporary({}, true, copyStream);
+                uploadWeight(weights[nextExpert * 2], copyStream);
+                uploadWeight(weights[nextExpert * 2 + 1], copyStream);
             }
 
             int i = curExpert;
@@ -9174,8 +9182,8 @@ namespace fastllm {
             }
 
             if (prevExpert >= 0) {
-                weights[prevExpert * 2]->FreeCudaTemporary({}, false);
-                weights[prevExpert * 2 + 1]->FreeCudaTemporary({}, false);
+                releaseWeight(weights[prevExpert * 2]);
+                releaseWeight(weights[prevExpert * 2 + 1]);
             }
 
             prevExpert = curExpert;
@@ -9184,8 +9192,8 @@ namespace fastllm {
 
         if (prevExpert >= 0) {
             FastllmCudaEventSynchronize(computeDoneEvent);
-            weights[prevExpert * 2]->FreeCudaTemporary({}, false);
-            weights[prevExpert * 2 + 1]->FreeCudaTemporary({}, false);
+            releaseWeight(weights[prevExpert * 2]);
+            releaseWeight(weights[prevExpert * 2 + 1]);
         }
         if (accurateFp8Moe || deepSeekV41Mode) {
             FastllmFloatToBF16(

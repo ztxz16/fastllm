@@ -6,6 +6,7 @@
 
 #include "fastllm.h"
 #include "contextconfig.h"
+#include "devices/disk/diskdevice.h"
 
 #include "executor.h"
 
@@ -17,6 +18,7 @@
 #include <climits>
 #include <thread>
 #include <algorithm>
+#include <atomic>
 #include <queue>
 
 #ifdef USE_MMAP
@@ -289,7 +291,8 @@ namespace fastllm {
     static bool cudaEmbedding = false;
     static bool cudaSharedExpert = false;
     static int cudaSlabMB = 0;
-    static uint64_t moeCudaCacheBytes = 0;
+    static std::atomic<uint64_t> moeCudaCacheBytes{0};
+    static std::atomic<uint64_t> moeCpuCacheBytes{0};
     static bool enableAMX = false;
     static int maxTokens = -1;
     static int defaultPageLen = 128;
@@ -438,10 +441,20 @@ namespace fastllm {
 
     void SetMoeCudaCacheBytes(uint64_t bytes) {
         moeCudaCacheBytes = bytes;
+        TrimDiskMoeCache();
     }
 
     uint64_t GetMoeCudaCacheBytes() {
         return moeCudaCacheBytes;
+    }
+
+    void SetMoeCpuCacheBytes(uint64_t bytes) {
+        moeCpuCacheBytes = bytes;
+        TrimDiskMoeCache();
+    }
+
+    uint64_t GetMoeCpuCacheBytes() {
+        return moeCpuCacheBytes;
     }
 
     void SetCudaSharedExpert(bool v) {
@@ -2331,6 +2344,9 @@ namespace fastllm {
     }
 
     Data::~Data() {
+        if (this->isDiskWeight) {
+            ReleaseDiskMoeCache(this);
+        }
 #ifdef USE_CUDA
         // Hash-route tables keep per-device CUDA replicas while the owning
         // Data is alive. Retire them before either this object or its CPU

@@ -840,6 +840,10 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         dest = 'moe_cuda_cache', type = _memory_size_bytes,
                         default = 0,
                         help = '混合推理时用于缓存MoE专家的CUDA显存，如3g；0表示关闭')
+    parser.add_argument('--moe_cpu_cache', '--moe-cpu-cache',
+                        dest = 'moe_cpu_cache', type = _memory_size_bytes,
+                        default = 0,
+                        help = 'moe_device=disk 时的专家内存缓存总上限，如32g；0表示关闭')
     parser.add_argument('--image-embedding-cache', '--image_embedding_cache',
                         dest = 'image_embedding_cache', type = _memory_size_bytes, default = None,
                         help = 'Qwen3.5图片embedding的CPU缓存上限，如512m或1g；默认512m，0关闭')
@@ -1604,6 +1608,8 @@ def make_normal_llm_model(args, startup_progress = None):
     llm.set_moe_device_layers(-1)
     llm.set_moe_cuda_cache(
         _memory_size_bytes(getattr(args, "moe_cuda_cache", 0)))
+    llm.set_moe_cpu_cache(
+        _memory_size_bytes(getattr(args, "moe_cpu_cache", 0)))
     llm.set_ngram_device(args.ngram_device)
     if (args.device and args.device != ""):
         try:

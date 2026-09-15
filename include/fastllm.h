@@ -102,6 +102,8 @@ namespace fastllm {
     int GetCudaSlabMB();
     void SetMoeCudaCacheBytes(uint64_t bytes);
     uint64_t GetMoeCudaCacheBytes();
+    void SetMoeCpuCacheBytes(uint64_t bytes);
+    uint64_t GetMoeCpuCacheBytes();
     int GetThreads();
     bool GetKVCacheInCPU();
     bool GetHistoryCacheInCPU();

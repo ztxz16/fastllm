@@ -3452,7 +3452,8 @@ namespace fastllm {
         }
 
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
-        if (FastllmCudaMoeCacheRequested() && !moeExpertCacheAttempted) {
+        if (FastllmCudaMoeCacheRequested() && !moeExpertCacheAttempted &&
+            !weights[0][2]->isDiskWeight) {
             moeExpertCacheAttempted = true;
             bool supported = !tp && !V41ReferenceMathEnabled() && GetCudaSharedExpert();
             std::vector<std::vector<Data *>> routedWeights = weights;

@@ -458,6 +458,8 @@ fastllm_lib.set_layered_moe_device_map.argtypes = [ctypes.c_int, ctypes.c_void_p
 fastllm_lib.set_moe_device_layers.argtypes = [ctypes.c_int]
 fastllm_lib.set_ngram_device.argtypes = [ctypes.c_char_p]
 fastllm_lib.set_moe_cuda_cache.argtypes = [ctypes.c_uint64]
+fastllm_lib.set_moe_cpu_cache.argtypes = [ctypes.c_uint64]
+fastllm_lib.get_disk_moe_cache_stats.argtypes = [ctypes.POINTER(ctypes.c_uint64)]
 
 fastllm_lib.apply_chat_template.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
 fastllm_lib.apply_chat_template.restype = ctypes.c_char_p
@@ -623,6 +625,19 @@ def set_moe_cuda_cache(bytes_: int):
     if bytes_ < 0 or bytes_ > (1 << 64) - 1:
         raise ValueError("MoE CUDA cache size must fit in uint64")
     fastllm_lib.set_moe_cuda_cache(ctypes.c_uint64(bytes_));
+
+def set_moe_cpu_cache(bytes_: int):
+    bytes_ = int(bytes_)
+    if bytes_ < 0 or bytes_ > (1 << 64) - 1:
+        raise ValueError("MoE CPU cache size must fit in uint64")
+    fastllm_lib.set_moe_cpu_cache(ctypes.c_uint64(bytes_))
+
+def get_disk_moe_cache_stats():
+    """Process-wide cumulative route counts and resident expert payload bytes."""
+    values = (ctypes.c_uint64 * 9)()
+    fastllm_lib.get_disk_moe_cache_stats(values)
+    return dict(zip(("cpu_bytes", "cuda_bytes", "cpu_hits", "cuda_hits", "misses",
+                     "disk_bytes", "uploads", "cpu_evictions", "cuda_evictions"), values))
 
 def disable_cuda_malloc():
     fastllm_lib.disable_cuda_malloc();

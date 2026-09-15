@@ -6,6 +6,16 @@
 #include "devices/cpu/kimi_k3_ops.h"
 
 namespace fastllm {
+    struct DiskMoeCacheStats {
+        uint64_t cpuBytes = 0, cudaBytes = 0;
+        uint64_t cpuHits = 0, cudaHits = 0, misses = 0;
+        uint64_t diskBytes = 0, uploads = 0, cpuEvictions = 0, cudaEvictions = 0;
+    };
+    // CUDA bytes are summed across devices; the configured CUDA budget is per GPU.
+    DiskMoeCacheStats GetDiskMoeCacheStats();
+    void TrimDiskMoeCache();
+    void ReleaseDiskMoeCache(const Data *weight);
+
     class DiskDevice : BaseDevice {
     public:
         DiskDevice();
@@ -18,6 +28,8 @@ namespace fastllm {
     };
 
     class DiskMergeMOE : CpuMergeMOE {
+        void RunCached(const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    public:
         bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
