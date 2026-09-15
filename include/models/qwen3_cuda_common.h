@@ -14,6 +14,7 @@
 #include "devices/cpu/cpudevice.h"
 #include "devices/cuda/cudadevice.h"
 #include "devices/multicuda/fastllm-multicuda.cuh"
+#include "devices/multicuda/tp2prefill.h"
 #endif
 
 namespace fastllm {
@@ -546,15 +547,17 @@ namespace fastllm {
         int n = gateUpResult.Count(0) / gateUpResult.dims.back();
         int m = gateUpResult.dims.back() / 2;
         int k = down.dims[0];
+        bool useQuant = FastllmCanUseTP2WHT6AllReduceAdd(
+            hiddenStates.Count(0), (int)hiddenStates.dataType, gpuId);
         bool useP2P = FastllmCanUseTP2P2PAllReduceAdd(
                 hiddenStates.Count(0),
                 (int)hiddenStates.dataType, gpuId);
         bool directPartialOutput =
-            !firstTensorParallelRank && !useP2P &&
+            !firstTensorParallelRank && !useP2P && !useQuant &&
             (!cutlass || Qwen3CudaEnvDefaultEnabled(
                 "FASTLLM_CUDA_CUTLASS_LINEAR_FP8_TP_DIRECT_OUTPUT"));
         bool exactResidual = false;
-        if (cutlass && firstTensorParallelRank && !useP2P &&
+        if (cutlass && firstTensorParallelRank && !useP2P && !useQuant &&
             Qwen3CudaCanUseTpFp8ExactResidual(
                 gateUpResult, down, downBias, hiddenStates, gpuId, true)) {
             exactResidual =
@@ -573,6 +576,9 @@ namespace fastllm {
             return false;
         }
 
+        if (useQuant && FastllmTryTP2WHT6AllReduceAdd(middle, hiddenStates, gpuId)) {
+            return true;
+        }
         if (useP2P &&
             FastllmTryTP2P2PAllReduceAdd(
                 middle.cudaData, hiddenStates.cudaData,
@@ -645,18 +651,20 @@ namespace fastllm {
         middle.Resize(hiddenStates.dims);
         middle.Allocate(false);
 
+        bool useQuant = FastllmCanUseTP2WHT6AllReduceAdd(
+            hiddenStates.Count(0), (int)hiddenStates.dataType, gpuId);
         bool useP2P = FastllmCanUseTP2P2PAllReduceAdd(
             hiddenStates.Count(0),
             (int)hiddenStates.dataType, gpuId);
         bool directPartialOutput =
-            !firstTensorParallelRank && !useP2P &&
+            !firstTensorParallelRank && !useP2P && !useQuant &&
             Qwen3CudaEnvDefaultEnabled(
                 "FASTLLM_CUDA_CUTLASS_LINEAR_FP8_TP_DIRECT_OUTPUT");
         int exactMinTokens = Qwen3CudaEnvInt(
             "FASTLLM_CUDA_CUTLASS_LINEAR_FP8_EXACT_RESIDUAL_TP_MIN_BATCH",
             128);
         bool exactResidual = false;
-        if (firstTensorParallelRank && !useP2P &&
+        if (firstTensorParallelRank && !useP2P && !useQuant &&
             n >= exactMinTokens &&
             Qwen3CudaEnvDefaultEnabled(
                 "FASTLLM_CUDA_CUTLASS_LINEAR_FP8_EXACT_RESIDUAL_TP")) {
@@ -676,6 +684,9 @@ namespace fastllm {
             return false;
         }
 
+        if (useQuant && FastllmTryTP2WHT6AllReduceAdd(middle, hiddenStates, gpuId)) {
+            return true;
+        }
         if (useP2P &&
             FastllmTryTP2P2PAllReduceAdd(
                 middle.cudaData, hiddenStates.cudaData,
@@ -895,6 +906,18 @@ namespace fastllm {
             bool forceNativeNccl = false) {
         DataType residualType = hiddenStates.dataType;
         bool canAddDirectly = input.dataType == residualType;
+
+        // Quantized transport must see the rank-local contribution before a fused residual add
+        // or rank-1 direct output overwrites the replicated residual.
+        if (tensorParallel && !forceNativeNccl &&
+            FastllmCanUseTP2WHT6AllReduceAdd(
+                hiddenStates.Count(0), (int)residualType, gpuId)) {
+            Qwen3CudaLinear(runner, input, weight, bias, middle);
+            Qwen3CudaToDataType(runner, middle, residualType);
+            if (FastllmTryTP2WHT6AllReduceAdd(middle, hiddenStates, gpuId)) {
+                return;
+            }
+        }
 
         if (tensorParallel && enableTP2P2PAllReduce &&
             FastllmCanUseTP2P2PAllReduceAdd(

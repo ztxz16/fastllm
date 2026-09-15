@@ -11244,7 +11244,8 @@ namespace fastllm {
                     Qwen3CudaToDataType(cudaRunner, partial, buf.hiddenStates.dataType);
                 }
                 if (tensorParallel) {
-                    if (!Qwen3CudaTryTP2P2PAllReduceAddResidual(
+                    if (!FastllmTryTP2WHT6AllReduceAdd(partial, buf.hiddenStates, gpuId) &&
+                        !Qwen3CudaTryTP2P2PAllReduceAddResidual(
                             partial, buf.hiddenStates, gpuId)) {
                         if (firstTensorParallelRank) {
                             Qwen3CudaAddTo(cudaRunner, buf.hiddenStates, partial);
@@ -12573,7 +12574,8 @@ namespace fastllm {
                 Qwen3CudaToDataType(cudaRunner, partial, hiddenStates.dataType);
             }
             if (tensorParallel) {
-                if (!Qwen3CudaTryTP2P2PAllReduceAddResidual(
+                if (!FastllmTryTP2WHT6AllReduceAdd(partial, hiddenStates, gpuId) &&
+                    !Qwen3CudaTryTP2P2PAllReduceAddResidual(
                         partial, hiddenStates, gpuId)) {
                     if (firstTensorParallelRank) {
                         Qwen3CudaAddTo(cudaRunner, hiddenStates, partial);
@@ -14772,6 +14774,12 @@ namespace fastllm {
                                                  swigluWeightName + ".tp_bias");
                 Data &downWeight = *requireLocal(weight[downWeightName], downWeightName);
                 Data &downBias = *requireLocal(GetThreadTensorParallelBias(downBiasName), downBiasName);
+                if (tensorParallel && FastllmTryTP2MlpOverlap(
+                        attenInput, gateUpWeight, gateUpBias, downWeight, downBias,
+                        hiddenStates, gpuId)) {
+                    captureDFlashHidden(i);
+                    continue;
+                }
                 bool fusedTpMlp =
                     Qwen3CudaTryTpSwigluLinearResidualReduce(
                         cudaRunner, attenInput,

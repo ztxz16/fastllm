@@ -977,6 +977,21 @@ if (UNIT_TEST)
         target_include_directories(ncclOddTpRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         add_test(NAME ncclOddTp COMMAND ncclOddTpRegression)
         set_tests_properties(ncclOddTp PROPERTIES LABELS cuda TIMEOUT 180 SKIP_RETURN_CODE 77)
+        add_executable(tp2WHT6AllReduceRegression test/ops/tp2WHT6AllReduceRegression.cu)
+        target_include_directories(tp2WHT6AllReduceRegression PRIVATE include)
+        target_link_libraries(tp2WHT6AllReduceRegression PRIVATE nccl Threads::Threads)
+        add_test(NAME tp2WHT6AllReduce COMMAND tp2WHT6AllReduceRegression)
+        set_tests_properties(tp2WHT6AllReduce PROPERTIES
+            LABELS "cuda;multigpu" TIMEOUT 60 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+
+        add_executable(tp2MlpOverlapRegression test/ops/tp2MlpOverlapRegression.cu)
+        target_include_directories(tp2MlpOverlapRegression PRIVATE include)
+        target_link_libraries(tp2MlpOverlapRegression PRIVATE cublas nccl Threads::Threads)
+        foreach(tp2_backend IN ITEMS nccl wht6)
+            add_test(NAME tp2_mlp_overlap_${tp2_backend} COMMAND tp2MlpOverlapRegression ${tp2_backend})
+            set_tests_properties(tp2_mlp_overlap_${tp2_backend} PROPERTIES
+                LABELS "cuda;multigpu" TIMEOUT 120 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        endforeach()
     endif()
 endif()
 
