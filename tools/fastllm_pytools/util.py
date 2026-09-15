@@ -840,6 +840,9 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument("--gpu_mem_ratio", type = float, default = 0.9, help = "GPU显存使用比例，如0.9表示使用90%%的显存")
     parser.add_argument("--cuda_slab", type = int, default = 0, help = "CUDA模型权重slab大小（MB），0表示关闭")
     parser.add_argument("--mtp", type = int, default = 0, help = "支持MTP的模型每步生成的draft token数，0表示关闭（默认），当前最大8")
+    parser.add_argument("--mtp_fp8_draft_head", "--mtp-fp8-draft-head",
+                        type = int, choices = [0, 1], default = None,
+                        help = "Qwen3.5 系列多卡 MTP 的 FP8 draft 输出头；1 开启，0 复用原输出头以节省显存；未指定时沿用 FASTLLM_MTP_FP8_DRAFT_HEAD（默认开启）")
     parser.add_argument("--dspark", type = int, default = 0,
                         help = "启用模型内置 DSpark，并指定每轮 draft token 数；例如 --dspark 7")
     parser.add_argument("--speculative_algorithm", "--speculative-algorithm",
@@ -1628,6 +1631,10 @@ def make_normal_llm_model(args, startup_progress = None):
     if (hasattr(args, 'cuda_slab') and hasattr(llm, 'set_cuda_slab')):
         llm.set_cuda_slab(args.cuda_slab)
     os.environ["FASTLLM_QWEN35_ENABLE_MTP"] = str(mtp)
+    mtp_fp8_draft_head = getattr(args, "mtp_fp8_draft_head", None)
+    if mtp_fp8_draft_head is not None:
+        # Explicit arguments override the environment; omission preserves it.
+        os.environ["FASTLLM_MTP_FP8_DRAFT_HEAD"] = "1" if _arg_enabled(mtp_fp8_draft_head) else "0"
     os.environ["FASTLLM_QWEN4_ENABLE_MTP"] = str(
         mtp if is_qwen38_flash_next_model else 0)
     os.environ["FASTLLM_GLM5_NEXT_ENABLE_MTP"] = str(mtp)

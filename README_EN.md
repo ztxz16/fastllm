@@ -301,6 +301,7 @@ The CLI evolves continuously, so `ftllm <command> --help` is authoritative for t
 | --- | --- |
 | `--enable_thinking` | Control the model's thinking template when supported |
 | `--mtp` | Draft tokens per step for models with MTP support; `0` disables it and the current maximum is 8 |
+| `--mtp_fp8_draft_head` / `--mtp-fp8-draft-head` | FP8 draft output head for Qwen3.5-family multi-GPU MTP: `1` enables it; `0` reuses the original head to save VRAM, potentially reducing generation speed. Does not change the MTP draft count. An explicit value overrides `FASTLLM_MTP_FP8_DRAFT_HEAD`; otherwise the environment is preserved, with the head enabled by default |
 | `--dspark` | Enable embedded DSpark and set draft tokens per step |
 | `--draft` / `--draft_model_path` | External MTP, DSpark, or DFlash checkpoint; MTP may point directly to `mtp.safetensors` |
 | `--draft_tokens` | Maximum draft tokens per step; defaults to the draft configuration |
