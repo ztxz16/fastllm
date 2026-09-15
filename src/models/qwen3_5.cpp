@@ -13,6 +13,8 @@
 #include <atomic>
 #include <chrono>
 #include <climits>
+#include <condition_variable>
+#include <thread>
 #include <exception>
 #include <initializer_list>
 #include <limits>
@@ -37,6 +39,7 @@
 #ifdef USE_CUDA
 #include "models/qwen3_cuda_common.h"
 #include "devices/cuda/cudaworkspace.h"
+#include "devices/cuda/fastllm-cuda-vision.h"
 #include "devices/cuda/fastllm-cuda-fp8.h"
 #include "devices/cuda/fastllm-cuda-mtp.cuh"
 #endif
@@ -46,6 +49,57 @@
 #endif
 
 namespace fastllm {
+
+#ifdef USE_CUDA
+    struct Qwen35VisionTPState {
+        struct Rank {
+            int device = 0;
+            int heads = 0;
+            int intermediate = 0;
+            int mergerIntermediate = 0;
+            std::unordered_map<std::string, Data> weights;
+            Data sin, cos;
+            std::shared_ptr<CudaWorkspace> workspace;
+        };
+        std::vector<std::unique_ptr<Rank>> ranks;
+    };
+
+    // In addition to NCCL's submission rendezvous, keep allocations outside
+    // outstanding collectives and propagate failures before their next call.
+    class Qwen35VisionBarrier {
+        std::mutex mutex;
+        std::condition_variable condition;
+        const int ranks;
+        int arrived = 0;
+        int generation = 0;
+        std::exception_ptr failure;
+    public:
+        explicit Qwen35VisionBarrier(int ranks) : ranks(ranks) {}
+        void Cancel(std::exception_ptr error) {
+            std::lock_guard<std::mutex> guard(mutex);
+            if (!failure) failure = error;
+            condition.notify_all();
+        }
+        void Wait() {
+            std::unique_lock<std::mutex> lock(mutex);
+            if (failure) std::rethrow_exception(failure);
+            const int current = generation;
+            if (++arrived == ranks) {
+                arrived = 0;
+                ++generation;
+                condition.notify_all();
+            } else {
+                condition.wait(lock, [&] { return failure || generation != current; });
+            }
+            if (failure) std::rethrow_exception(failure);
+        }
+        void Check() {
+            std::lock_guard<std::mutex> guard(mutex);
+            if (failure) std::rethrow_exception(failure);
+        }
+    };
+#endif
+
 #ifdef USE_NUMAS
     extern void RegisterNumas(fastllm::Data *data, std::string weightType);
 #endif
@@ -25844,25 +25898,48 @@ namespace fastllm {
                 throw std::runtime_error("Multimodal patch budget is smaller than one merged image token");
             }
             const size_t elementBytes = this->dataType == DataType::FLOAT32 ? 4 : 2;
-            // Budget QKV/residual/rotary temporaries, MLP buffers and allocator
-            // fragmentation conservatively. The maximum-size encode below
-            // validates this reservation before any KV cache is committed.
-            const size_t channels = std::max((size_t)vision_hidden_size * 10,
-                                             (size_t)vision_intermediate_size * 2);
             const size_t granularity = 64ULL * 1024 * 1024;
-            size_t bytes = (size_t)visionWorkspaceMaxPatches * channels * elementBytes +
-                           512ULL * 1024 * 1024;
-            bytes = (bytes + granularity - 1) / granularity * granularity;
-            visionWorkspace = std::make_shared<CudaWorkspace>(device, bytes);
+            auto reserveWorkspace = [&](int gpu, int heads, int intermediate) {
+                // Six full hidden buffers cover FP32 partial output (2x),
+                // half residual (1x), and its half->FP32 copy transition (3x).
+                // MLP keeps FP32 output (2x), norm input and residual (1x each);
+                // its bounded 2048-row scratch fits the fixed margin below.
+                // QKV and attention storage follow the actual head shard.
+                const size_t channels = visionTP
+                    ? std::max((size_t)vision_hidden_size * 6 +
+                                   (size_t)heads * vision_head_dim * 4,
+                               (size_t)vision_hidden_size * 4 + (size_t)intermediate * 2)
+                    : std::max((size_t)vision_hidden_size * 10,
+                               (size_t)vision_intermediate_size * 2);
+                size_t bytes = (size_t)visionWorkspaceMaxPatches * channels * elementBytes +
+                               512ULL * 1024 * 1024;
+                bytes = (bytes + granularity - 1) / granularity * granularity;
+                auto workspace = std::make_shared<CudaWorkspace>(gpu, bytes);
+                printf("[Vision] Multimodal warmup before KV cache: cuda:%d, heads=%d, max patches=%d, fixed workspace=%.2f MiB.\n",
+                       gpu, heads, visionWorkspaceMaxPatches, bytes / 1048576.0);
+                return workspace;
+            };
+            if (visionTP) {
+                for (auto &rank : visionTP->ranks) {
+                    rank->workspace = reserveWorkspace(rank->device, rank->heads, rank->intermediate);
+                }
+            } else {
+                visionWorkspace = reserveWorkspace(device, vision_num_heads, vision_intermediate_size);
+            }
             const int units = visionWorkspaceMaxPatches / (merge * merge);
             const int gridH = std::max(1, (int)std::sqrt((double)units));
             const int gridW = std::max(1, units / gridH);
-            printf("[Vision] Multimodal warmup before KV cache: %s, max patches=%d, fixed workspace=%.2f MiB.\n",
-                   visionDevice.c_str(), visionWorkspaceMaxPatches, bytes / 1048576.0);
             fflush(stdout);
             warmImage(gridH * merge, gridW * merge);
-            printf("[Vision] Multimodal workspace ready: peak=%.2f MiB, live=%.2f MiB; remaining memory is available for KV cache.\n",
-                   visionWorkspace->PeakBytes() / 1048576.0, visionWorkspace->LiveBytes() / 1048576.0);
+            auto reportWorkspace = [&](int gpu, const std::shared_ptr<CudaWorkspace> &workspace) {
+                printf("[Vision] Multimodal workspace ready: cuda:%d, peak=%.2f MiB, live=%.2f MiB; remaining memory is available for KV cache.\n",
+                       gpu, workspace->PeakBytes() / 1048576.0, workspace->LiveBytes() / 1048576.0);
+            };
+            if (visionTP) {
+                for (auto &rank : visionTP->ranks) reportWorkspace(rank->device, rank->workspace);
+            } else {
+                reportWorkspace(device, visionWorkspace);
+            }
             fflush(stdout);
         }
 #endif
@@ -25923,8 +26000,7 @@ namespace fastllm {
         visionSinData.CopyFrom(Data(DataType::FLOAT32, {maxVisionPos, rotaryQuarter}, visionSin));
         visionCosData.CopyFrom(Data(DataType::FLOAT32, {maxVisionPos, rotaryQuarter}, visionCos));
 
-        // Resolve where the vision tower lives. The default keeps the original
-        // behavior (first forward GPU); "cpu" runs the encoder from host RAM.
+        // CUDA vision follows ordinary text TP; "cpu" runs from host RAM.
         const char *visionDeviceEnv = std::getenv("FASTLLM_QWEN35_VISION_DEVICE");
         std::string requestedVisionDevice = visionDeviceEnv == nullptr ? "auto" : visionDeviceEnv;
         const size_t firstDeviceChar = requestedVisionDevice.find_first_not_of(" \t\r\n\f\v");
@@ -25974,6 +26050,29 @@ namespace fastllm {
             AssertInFastLLM(false, "Qwen3.5 CUDA vision requires a CUDA build.");
 #endif
         }
+#ifdef USE_CUDA
+        std::vector<int> tpDevices;
+        std::map<int, int> tpRatios;
+        if (visionDeviceId >= 0 && GetQwen35GPUForwardDevices(this->deviceMap, tpDevices, tpRatios) &&
+            tpDevices.size() > 1) {
+            // CUDA vision follows text TP, including when an older caller
+            // supplies cuda:N. CPU remains an explicit host execution choice.
+            visionDeviceId = tpDevices.front();
+            // Generic CPU Split copies dense elements only. Packed quantized
+            // and GGUF storage also needs scale/layout metadata and must not
+            // enter this path as if it were an ordinary floating tensor.
+            for (const auto &item : this->weight.weight) {
+                if (!StartWith(item.first, visual_prefix)) continue;
+                const Data &tensor = item.second;
+                if (tensor.isGGUFData ||
+                    (tensor.dataType != DataType::FLOAT32 &&
+                     tensor.dataType != DataType::FLOAT16 &&
+                     tensor.dataType != DataType::BFLOAT16)) {
+                    throw std::runtime_error("Qwen3.5 CUDA vision TP requires unpacked floating weights: " + item.first);
+                }
+            }
+        }
+#endif
         this->visionDevice = visionDeviceId < 0 ? "cpu" : "cuda:" + std::to_string(visionDeviceId);
 
         for (auto &it : this->weight.weight) {
@@ -25989,14 +26088,101 @@ namespace fastllm {
                 it.second.ToDevice(DataDevice::CUDA, std::vector<int>{visionDeviceId});
             }
         }
+#ifdef USE_CUDA
+        if (visionDeviceId >= 0 && tpDevices.size() > 1) {
+            AssertInFastLLM(FastllmInitNccl(tpDevices), "Qwen3.5 vision TP NCCL initialization failed.");
+            auto state = std::make_shared<Qwen35VisionTPState>();
+            const auto headPoints = FastllmMultiCudaGetSplitPoints(tpDevices, tpRatios, vision_num_heads, 1);
+            const auto mlpPoints = FastllmMultiCudaGetSplitPoints(tpDevices, tpRatios, vision_intermediate_size, vision_intermediate_size % 16 == 0 ? 16 : 1);
+            const int mergerWidth = vision_hidden_size * vision_spatial_merge_size * vision_spatial_merge_size;
+            const auto mergerPoints = FastllmMultiCudaGetSplitPoints(tpDevices, tpRatios, mergerWidth, mergerWidth % 16 == 0 ? 16 : 1);
+            // Slice on CPU once. No shared mutable Data (including rotary
+            // tables and lazily converted weights) is used by CUDA workers.
+            Executor cpuExecutor;
+            cpuExecutor.SetFirstDevice("cpu");
+            auto slice = [&](Data &source, int axis, int begin, int end, Data &target) {
+                if (begin == end) {
+                    target.dataType = source.dataType;
+                    auto dims = source.dims;
+                    dims[axis] = 0;
+                    target.Resize(dims);
+                } else {
+                    cpuExecutor.RunOnDevice("cpu", "Split", {{"input", &source}, {"output", &target}}, {},
+                                            {{"axis", axis}, {"start", begin}, {"end", end}});
+                }
+            };
+            for (size_t index = 0; index < tpDevices.size(); ++index) {
+                auto rank = std::make_unique<Qwen35VisionTPState::Rank>();
+                rank->device = tpDevices[index];
+                rank->heads = headPoints[index + 1] - headPoints[index];
+                rank->intermediate = mlpPoints[index + 1] - mlpPoints[index];
+                rank->mergerIntermediate = mergerPoints[index + 1] - mergerPoints[index];
+                rank->sin.CopyFrom(visionSinData);
+                rank->cos.CopyFrom(visionCosData);
+                rank->sin.ToDevice(DataDevice::CUDA, std::vector<int>{rank->device});
+                rank->cos.ToDevice(DataDevice::CUDA, std::vector<int>{rank->device});
+                for (auto &item : this->weight.weight) {
+                    if (!StartWith(item.first, visual_prefix)) continue;
+                    item.second.ToDevice(DataDevice::CPU);
+                    Data &target = rank->weights[item.first];
+                    const std::string &name = item.first;
+                    if (name.find(".attn.qkv.") != std::string::npos) {
+                        const int width = rank->heads * vision_head_dim;
+                        if (width == 0) {
+                            slice(item.second, 0, 0, 0, target);
+                        } else {
+                            for (int part = 0; part < 3; ++part) {
+                                Data shard;
+                                const int begin = part * vision_hidden_size + headPoints[index] * vision_head_dim;
+                                slice(item.second, 0, begin, begin + width, shard);
+                                if (part == 0) target.CopyFrom(shard);
+                                else {
+                                    Data joined;
+                                    cpuExecutor.RunOnDevice("cpu", "Cat", {{"input0", &target}, {"input1", &shard}, {"output", &joined}}, {}, {{"axis", 0}});
+                                    target.CopyFrom(joined);
+                                }
+                            }
+                        }
+                    } else if (name.find(".attn.proj.weight") != std::string::npos) {
+                        slice(item.second, 1, headPoints[index] * vision_head_dim,
+                              headPoints[index + 1] * vision_head_dim, target);
+                    } else if (name.find(".mlp.linear_fc1.") != std::string::npos) {
+                        slice(item.second, 0, mlpPoints[index], mlpPoints[index + 1], target);
+                    } else if (name.find(".mlp.linear_fc2.weight") != std::string::npos) {
+                        slice(item.second, 1, mlpPoints[index], mlpPoints[index + 1], target);
+                    } else if (name.find("merger.linear_fc1.") != std::string::npos) {
+                        slice(item.second, 0, mergerPoints[index], mergerPoints[index + 1], target);
+                    } else if (name.find("merger.linear_fc2.weight") != std::string::npos) {
+                        slice(item.second, 1, mergerPoints[index], mergerPoints[index + 1], target);
+                    } else {
+                        target.CopyFrom(item.second);
+                    }
+                    if (name.find(".attn.proj.bias") != std::string::npos ||
+                        name.find("linear_fc2.bias") != std::string::npos) {
+                        ToDataTypeForceCPU(target, DataType::FLOAT32);
+                    }
+                    if (name != visual_prefix + "pos_embed.weight" && target.Count(0) > 0) {
+                        target.ToDevice(DataDevice::CUDA, std::vector<int>{rank->device});
+                    }
+                }
+                state->ranks.push_back(std::move(rank));
+            }
+            visionTP = std::move(state);
+        }
+#endif
         if (this->verbose) {
-            printf("[Vision] Encoder device: %s.\n", this->visionDevice.c_str());
+            printf("[Vision] Encoder device: %s", this->visionDevice.c_str());
+#ifdef USE_CUDA
+            if (visionTP) printf(" (TP=%zu)", visionTP->ranks.size());
+#endif
+            printf(".\n");
         }
 
         visionPrepared = true;
     }
 
-    void Qwen3_5Model::ApplyVisionRotary(Data &input, const Data &posX, const Data &posY) {
+    void Qwen3_5Model::ApplyVisionRotary(Data &input, const Data &posX, const Data &posY,
+                                          Data &sinData, Data &cosData) {
         AssertInFastLLM(input.dims.size() == 4 && input.dims.back() % 4 == 0,
                         "Qwen3.5 vision rotary expects [batch, seq, heads, dim] with dim divisible by 4.");
         int axis = (int) input.dims.size() - 1;
@@ -26017,8 +26203,8 @@ namespace fastllm {
         Cat(b, d, axis, colPair);
         b.FreeSpace();
         d.FreeSpace();
-        LlamaRotatePosition2DPart(rowPair, posX, visionSinData, visionCosData, quarter, half);
-        LlamaRotatePosition2DPart(colPair, posY, visionSinData, visionCosData, quarter, half);
+        LlamaRotatePosition2DPart(rowPair, posX, sinData, cosData, quarter, half);
+        LlamaRotatePosition2DPart(colPair, posY, sinData, cosData, quarter, half);
 
         Data rotatedA, rotatedB, rotatedC, rotatedD, firstHalf, secondHalf, rotated;
         Split(rowPair, axis, 0, quarter, rotatedA);
@@ -26121,7 +26307,7 @@ namespace fastllm {
             };
             gridThwList.push_back(grid);
             const long long mediaPatches = (long long)grid[0] * grid[1] * grid[2];
-            if (visionWorkspace && mediaPatches > visionWorkspaceMaxPatches) {
+            if (visionWorkspaceMaxPatches > 0 && mediaPatches > visionWorkspaceMaxPatches) {
                 throw std::runtime_error("Image/video exceeds the startup multimodal patch budget; resize media before encoding");
             }
 
@@ -26193,7 +26379,250 @@ namespace fastllm {
             AssertInFastLLM((int) patchTokens.size() == patchCount * patchDim,
                             "Qwen3.5 vision patch packing size mismatch.");
 
-            Data &patchWeight = this->weight[patchWeightName];
+            const bool tensorParallel =
+#ifdef USE_CUDA
+                visionTP != nullptr;
+            const int rankCount = tensorParallel ? (int)visionTP->ranks.size() : 1;
+            Qwen35VisionBarrier barrier(rankCount);
+#else
+                false;
+#endif
+            auto encodeRank = [&](int rankIndex) {
+#ifdef USE_CUDA
+                auto *rank = tensorParallel ? visionTP->ranks[rankIndex].get() : nullptr;
+                Executor rankExecutor;
+                // A new worker has no calling CUDA context to restore. In
+                // particular, switching it back to default device 0 can create
+                // an unrelated primary context during thread teardown.
+                struct RestoreRankExecutor {
+                    void *previous = GetExecutor();
+                    ~RestoreRankExecutor() { SetCurrentThreadExecutor(previous); }
+                } rankExecutorScope;
+                if (rank) {
+                    FastllmCudaSetDevice(rank->device);
+                    FastllmCudaClearThreadError();
+                    rankExecutor.SetFirstDevice("cuda:" + std::to_string(rank->device));
+                    SetCurrentThreadExecutor(&rankExecutor);
+                }
+                CudaWorkspaceScope rankWorkspaceScope(rank ? rank->workspace : visionWorkspace);
+                auto &visionWeights = rank ? rank->weights : this->weight.weight;
+                Data &rotarySin = rank ? rank->sin : visionSinData;
+                Data &rotaryCos = rank ? rank->cos : visionCosData;
+                const int localHeads = rank ? rank->heads : vision_num_heads;
+                const int localIntermediate = rank ? rank->intermediate : vision_intermediate_size;
+                const int localMergerIntermediate = rank ? rank->mergerIntermediate :
+                    vision_hidden_size * vision_spatial_merge_size * vision_spatial_merge_size;
+                auto partialProjection = [&](Data &input, Data &projectionWeight, Data &output) {
+                    // Linear normally returns a half (or even BF16-rounded)
+                    // output. TP must retain the unrounded partial sum instead.
+                    if (input.dataType != DataType::FLOAT16) {
+                        Linear(input, projectionWeight, Data(), output);
+                        ToDataType(output, DataType::FLOAT32);
+                        return;
+                    }
+                    const int rows = input.Count(0) / input.dims.back();
+                    const bool nativeBf16 = projectionWeight.dataType == DataType::BFLOAT16 &&
+                        (rows < 8 || (rows > 1 && rows < FastllmCudaGetLinearExactBatchThreshold()));
+                    if (projectionWeight.dataType == DataType::FLOAT32 || nativeBf16) {
+                        Data floatInput(input);
+                        ToDataType(floatInput, DataType::FLOAT32);
+                        if (!nativeBf16 || rows < 8) {
+                            Linear(floatInput, projectionWeight, Data(), output);
+                        } else {
+                            // The native half x BF16 path keeps half inputs
+                            // intact even for exact-row batches >=8. The
+                            // float32 x BF16 GEMV does the same one row at a time.
+                            output.dataType = DataType::FLOAT32;
+                            auto dims = input.dims;
+                            dims.back() = projectionWeight.dims[0];
+                            output.Resize(dims);
+                            Qwen35ToDeviceLike(output, input, false);
+                            output.Allocate(false);
+                            for (int row = 0; row < rows; ++row) {
+                                Data view, projected;
+                                view.FakeFrom(floatInput, (size_t)row * input.dims.back() * sizeof(float));
+                                view.Resize({1, input.dims.back()});
+                                view.dataDeviceIds = input.dataDeviceIds;
+                                Linear(view, projectionWeight, Data(), projected);
+                                AssertInFastLLM(FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
+                                    (float*)output.cudaData + (size_t)row * dims.back(),
+                                    projected.cudaData, (size_t)dims.back() * sizeof(float)),
+                                    "Vision TP native FP32 projection copy failed");
+                                FastllmCudaSyncCurrentThreadStream();
+                            }
+                        }
+                        return;
+                    }
+                    Data converted;
+                    Data *operand = &input;
+                    if (projectionWeight.dataType != input.dataType) {
+                        // Preserve the unsharded half x BF16 GEMM's input cast.
+                        converted.CopyFrom(input);
+                        ToDataType(converted, projectionWeight.dataType);
+                        operand = &converted;
+                    }
+                    output.dataType = DataType::FLOAT32;
+                    auto dims = input.dims;
+                    dims.back() = projectionWeight.dims[0];
+                    output.Resize(dims);
+                    Qwen35ToDeviceLike(output, input, false);
+                    output.Allocate(false);
+                    if (!FastllmCudaVisionLinearFloat32(*operand, projectionWeight, output)) {
+                        throw std::runtime_error("Vision TP FP32 partial projection failed");
+                    }
+                };
+                auto reduceOutput = [&](Data &output, Data &bias, DataType outputType,
+                                        Data &projectionWeight, Data *residual = nullptr, int epilogueChunkSize = 0) {
+                    ToDataType(output, DataType::FLOAT32);
+                    FastllmCudaSyncCurrentThreadStream();
+                    if (FastllmCudaGetThreadError()) throw std::runtime_error("Vision TP CUDA error before all-reduce");
+                    barrier.Wait();
+                    FastllmNcclAllReduceNoCustom(output.cudaData, output.cudaData,
+                                                output.Count(0), output.dataType, rank->device);
+                    FastllmCudaSyncCurrentThreadStream();
+                    if (FastllmCudaGetThreadError()) throw std::runtime_error("Vision TP CUDA all-reduce failed");
+                    barrier.Wait();
+                    auto finishOutput = [&](Data &value, Data *addResidual) {
+                        const auto dims = value.dims;
+                        const int width = dims.back();
+                        const int rows = value.Count(0) / width;
+                        const bool half = outputType == DataType::FLOAT16;
+                        const bool nativeHalf = half && projectionWeight.dataType == DataType::FLOAT16 &&
+                            FastllmCudaResolveLinearFp16AutoPath(rows, projectionWeight.dims[1], width,
+                                addResidual != nullptr, true) == FASTLLM_CUDA_LINEAR_FP16_PATH_NATIVE;
+                        const bool nativeBf16 = half && projectionWeight.dataType == DataType::BFLOAT16 &&
+                            (rows < 8 || (rows > 1 && rows < FastllmCudaGetLinearExactBatchThreshold()));
+                        bool halfBlasTruncates = false;
+#ifdef CUDA_NO_TENSOR_CORE
+                        // The established no-tensor-core BLAS path casts its
+                        // FP32 GEMM toward zero, then adds half residual/bias.
+                        halfBlasTruncates = half && projectionWeight.dataType == DataType::FLOAT16 &&
+                                            !nativeHalf;
+#endif
+                        const bool fusedResidual = addResidual != nullptr && half &&
+                            projectionWeight.dataType == DataType::FLOAT16 && !halfBlasTruncates;
+                        const bool nearestHalf = nativeBf16 || (half &&
+                            projectionWeight.dataType == DataType::FLOAT16 && !halfBlasTruncates);
+                        const bool floatWeightHalf = half && projectionWeight.dataType == DataType::FLOAT32;
+                        Data roundedBias(bias);
+                        if (half && !floatWeightHalf) ToDataType(roundedBias, DataType::FLOAT16);
+                        auto addBias = [&](DataType type) {
+                            ToDataType(roundedBias, type);
+                            value.Reshape({rows, width});
+                            roundedBias.Reshape({1, width});
+                            RepeatAddTo(value, roundedBias, 0, rows);
+                            value.Reshape(dims);
+                        };
+                        // Match the unsharded native/BLAS epilogues: native GEMV
+                        // adds rounded-half bias before its value cast; BLAS
+                        // casts first and adds half bias afterwards. A fused
+                        // FP16 attention addResidual belongs in the complete sum,
+                        // never in each rank's separately rounded partial.
+                        if (nativeHalf || nativeBf16 || floatWeightHalf) addBias(DataType::FLOAT32);
+                        if (fusedResidual) {
+                            Data floatResidual(*addResidual);
+                            ToDataType(floatResidual, DataType::FLOAT32);
+                            AddTo(value, floatResidual);
+                        }
+                        if (half && projectionWeight.dataType == DataType::BFLOAT16 && !nativeBf16) {
+                            ToDataType(value, DataType::BFLOAT16);
+                        }
+                        if (nearestHalf) {
+                            // Native GEMV and half-output cuBLAS round to
+                            // nearest even. ToDataType(FLOAT16) uses RZ and
+                            // would systematically truncate this full sum.
+                            Data rounded(DataType::FLOAT16);
+                            rounded.Resize(value.dims);
+                            Qwen35ToDeviceLike(rounded, value, false);
+                            rounded.Allocate(false);
+                            AssertInFastLLM(FastllmCudaVisionFloat32ToHalf(value, rounded),
+                                            "Vision TP projection rounding failed");
+                            value.FreeSpace();
+                            value.CopyFrom(rounded);
+                        } else {
+                            ToDataType(value, outputType);
+                        }
+                        if (halfBlasTruncates && addResidual != nullptr) AddTo(value, *addResidual);
+                        if (!nativeHalf && !nativeBf16 && !floatWeightHalf) addBias(outputType);
+                        if (addResidual != nullptr) {
+                            if (fusedResidual || halfBlasTruncates) addResidual->CopyFrom(value);
+                            else AddTo(*addResidual, value);
+                        }
+                    };
+                    const int rows = output.Count(0) / output.dims.back();
+                    if (epilogueChunkSize > 0 && rows > epilogueChunkSize) {
+                        // Preserve the original last GEMM chunk's native/BLAS
+                        // cast order while still using one full all-reduce.
+                        Data finalized(outputType);
+                        finalized.Resize(output.dims);
+                        Qwen35ToDeviceLike(finalized, output, false);
+                        finalized.Allocate(false);
+                        const int width = output.dims.back();
+                        const size_t rowBytes = (size_t)width * finalized.unitSize / finalized.unitSizeDiv;
+                        for (int start = 0; start < rows; start += epilogueChunkSize) {
+                            const int count = std::min(epilogueChunkSize, rows - start);
+                            Data view, chunk;
+                            view.FakeFrom(output, (size_t)start * width * sizeof(float));
+                            view.Resize({count, width});
+                            view.dataDeviceIds = output.dataDeviceIds;
+                            chunk.CopyFrom(view);
+                            finishOutput(chunk, nullptr);
+                            AssertInFastLLM(FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
+                                (uint8_t*)finalized.cudaData + (size_t)start * rowBytes,
+                                chunk.cudaData, (size_t)count * rowBytes),
+                                "Vision TP epilogue copy failed");
+                            FastllmCudaSyncCurrentThreadStream();
+                        }
+                        output.FreeSpace();
+                        output.CopyFrom(finalized);
+                    } else {
+                        finishOutput(output, residual);
+                    }
+                };
+#else
+                auto &visionWeights = this->weight.weight;
+                Data &rotarySin = visionSinData;
+                Data &rotaryCos = visionCosData;
+                const int localHeads = vision_num_heads;
+                const int localIntermediate = vision_intermediate_size;
+                const int localMergerIntermediate = vision_hidden_size * vision_spatial_merge_size * vision_spatial_merge_size;
+#endif
+                const int localHidden = localHeads * vision_head_dim;
+                auto columnProjection = [&](Data &input, Data &projectionWeight, Data &bias,
+                                            Data &output, bool consumeInput = false) {
+#ifdef USE_CUDA
+                    const int rows = input.Count(0) / input.dims.back();
+                    const bool nativeRows = rows < 8 ||
+                        (rows > 1 && rows < FastllmCudaGetLinearExactBatchThreshold());
+                    if (tensorParallel && input.dataType == DataType::FLOAT16 &&
+                        projectionWeight.dataType == DataType::BFLOAT16 && !nativeRows) {
+                        // BF16-output cuBLAS can round intermediate reductions
+                        // differently for narrow column shards. Keep the whole
+                        // dot in FP32, then apply the established BF16/half
+                        // output and bias conversions exactly once.
+                        partialProjection(input, projectionWeight, output);
+                        // QKV's norm input is consumed here. Free it before the
+                        // cast: residual H + output/cast 9*localH stays within
+                        // 6H + 4*localH even when one rank owns every head.
+                        if (consumeInput) input.FreeSpace();
+                        ToDataType(output, DataType::BFLOAT16);
+                        ToDataType(output, DataType::FLOAT16);
+                        if (!bias.dims.empty()) {
+                            Data halfBias(bias);
+                            ToDataType(halfBias, DataType::FLOAT16);
+                            const auto dims = output.dims;
+                            const int width = dims.back();
+                            output.Reshape({rows, width});
+                            halfBias.Reshape({1, width});
+                            RepeatAddTo(output, halfBias, 0, rows);
+                            output.Reshape(dims);
+                        }
+                        return;
+                    }
+#endif
+                    Linear(input, projectionWeight, bias, output);
+                };
+            Data &patchWeight = visionWeights[patchWeightName];
             DataType pixelType = DataType::FLOAT32;
 #ifdef USE_CUDA
             // CUDA vision blocks consume FP16 activations. Converting the
@@ -26206,7 +26635,7 @@ namespace fastllm {
             }
 #endif
             Data pixelInput(pixelType, {patchCount, patchDim}, patchTokens);
-            std::vector<float>().swap(patchTokens);
+
 
             constexpr int visionTokenChunkSize = 2048;
             constexpr int visionMergerChunkSize = 512;
@@ -26239,7 +26668,7 @@ namespace fastllm {
                     pixelOnDevice.CopyFrom(pixelView);
                     Qwen35ToDeviceLike(pixelOnDevice, patchWeight);
                     Linear(pixelOnDevice, patchWeight,
-                           this->weight[patchBiasName], chunkOutput);
+                           visionWeights[patchBiasName], chunkOutput);
                     pixelOnDevice.FreeSpace();
                     if (chunkOutput.dataType != hiddenStates.dataType) {
                         ToDataType(chunkOutput, hiddenStates.dataType);
@@ -26265,7 +26694,7 @@ namespace fastllm {
                     Qwen35ToDeviceLike(pixelOnDevice, patchWeight);
                 }
                 Linear(pixelOnDevice, patchWeight,
-                       this->weight[patchBiasName], hiddenStates);
+                       visionWeights[patchBiasName], hiddenStates);
                 pixelOnDevice.FreeSpace();
             }
             pixelInput.FreeSpace();
@@ -26278,7 +26707,7 @@ namespace fastllm {
             }
             hiddenStates.Reshape({1, patchCount, vision_hidden_size});
 
-            Data posWeightCpu(this->weight[visual_prefix + "pos_embed.weight"]);
+            Data posWeightCpu(visionWeights[visual_prefix + "pos_embed.weight"]);
             posWeightCpu.ToDevice(DataDevice::CPU);
             if (posWeightCpu.dataType != DataType::FLOAT32) {
                 // ToDataType 经 Executor 调度可能在 CUDA 上完成并释放 CPU 镜像,
@@ -26373,7 +26802,7 @@ namespace fastllm {
                 // In particular, return the one-shot packed-pixel allocation
                 // before the QKV/MLP high-water phase begins.
                 FastllmCudaSyncCurrentThreadStream();
-                FastllmCudaClearBigBufferAll();
+                if (!tensorParallel) FastllmCudaClearBigBufferAll();
             }
 #endif
 
@@ -26389,12 +26818,14 @@ namespace fastllm {
                 const std::string pre = visual_prefix + "blocks." + std::to_string(layer);
                 Mul(hiddenStates, 1.0f, residual);
                 LayerNorm(hiddenStates,
-                          this->weight[pre + ".norm1.weight"],
-                          this->weight[pre + ".norm1.bias"],
+                          visionWeights[pre + ".norm1.weight"],
+                          visionWeights[pre + ".norm1.bias"],
                           -1,
                           blockInput);
                 hiddenStates.FreeSpace();
-                Linear(blockInput, this->weight[pre + ".attn.qkv.weight"], this->weight[pre + ".attn.qkv.bias"], qkv);
+                if (localHeads > 0) {
+                columnProjection(blockInput, visionWeights[pre + ".attn.qkv.weight"],
+                                 visionWeights[pre + ".attn.qkv.bias"], qkv, true);
                 blockInput.FreeSpace();
                 // Qwen3.5 vision uses a 72-wide head. Process one vision head
                 // at a time so FlashInfer only needs one set of 128-wide padded
@@ -26422,9 +26853,9 @@ namespace fastllm {
                     // 65536 patches (especially important on SM70, which has
                     // no FlashInfer workspace to lend as scratch storage).
                     attnOutput.Resize(
-                        {1, patchCount, vision_hidden_size});
+                        {1, patchCount, localHidden});
                 } else {
-                    attnOutput.Resize({vision_num_heads * temporalChunks,
+                    attnOutput.Resize({localHeads * temporalChunks,
                                        spatialPatchCount, vision_head_dim});
                 }
                 Qwen35ToDeviceLike(attnOutput, qkv, false);
@@ -26433,10 +26864,10 @@ namespace fastllm {
                     (size_t)temporalChunks * spatialPatchCount *
                     vision_head_dim * attnOutput.unitSize /
                     attnOutput.unitSizeDiv;
-                for (int head = 0; head < vision_num_heads; head++) {
+                for (int head = 0; head < localHeads; head++) {
                     const int qStart = head * vision_head_dim;
-                    const int kStart = vision_hidden_size + qStart;
-                    const int vStart = vision_hidden_size * 2 + qStart;
+                    const int kStart = localHidden + qStart;
+                    const int vStart = localHidden * 2 + qStart;
                     Data headOutput;
                     if (!scatterCudaVisionHeads) {
                         headOutput.FakeFrom(
@@ -26448,7 +26879,7 @@ namespace fastllm {
                     Split(qkv, -1, qStart, qStart + vision_head_dim, q);
                     Split(qkv, -1, kStart, kStart + vision_head_dim, k);
                     Split(qkv, -1, vStart, vStart + vision_head_dim, v);
-                    if (head + 1 == vision_num_heads) {
+                    if (head + 1 == localHeads) {
                         // The final three copies have been queued on the same
                         // CUDA stream, so the large fused QKV buffer can be
                         // retired before rotary/attention allocations.
@@ -26457,8 +26888,8 @@ namespace fastllm {
 
                     q.Reshape({1, patchCount, 1, vision_head_dim});
                     k.Reshape({1, patchCount, 1, vision_head_dim});
-                    ApplyVisionRotary(q, posHData, posWData);
-                    ApplyVisionRotary(k, posHData, posWData);
+                    ApplyVisionRotary(q, posHData, posWData, rotarySin, rotaryCos);
+                    ApplyVisionRotary(k, posHData, posWData, rotarySin, rotaryCos);
                     // Tokens for one head are already contiguous in
                     // [time, spatial, dim] order; no full-tensor Permute is
                     // needed here.
@@ -26502,7 +26933,7 @@ namespace fastllm {
                         const size_t headRowBytes =
                             (size_t)vision_head_dim * elementBytes;
                         const size_t outputRowBytes =
-                            (size_t)vision_hidden_size * elementBytes;
+                            (size_t)localHidden * elementBytes;
                         AssertInFastLLM(
                             FastllmCudaMemcpy2DDeviceToDeviceAsyncCurrentThread(
                                 (uint8_t*)attnOutput.cudaData +
@@ -26520,19 +26951,35 @@ namespace fastllm {
 
                 }
                 if (!scatterCudaVisionHeads) {
-                    attnOutput.Reshape({vision_num_heads, temporalChunks,
+                    attnOutput.Reshape({localHeads, temporalChunks,
                                         spatialPatchCount, vision_head_dim});
                     PermuteSelf(attnOutput, {1, 2, 0, 3});
                     attnOutput.Reshape(
-                        {1, patchCount, vision_hidden_size});
+                        {1, patchCount, localHidden});
+                }
+                } else {
+                    blockInput.FreeSpace();
                 }
                 Data projectedAttn;
 #ifdef USE_CUDA
-                if (attnOutput.dataDevice == DataDevice::CUDA &&
+                if (tensorParallel) {
+                    if (localHeads > 0) {
+                        partialProjection(attnOutput, visionWeights[pre + ".attn.proj.weight"], projectedAttn);
+                    } else {
+                        projectedAttn.dataType = residual.dataType;
+                        projectedAttn.Resize(residual.dims);
+                        Qwen35ToDeviceLike(projectedAttn, residual, false);
+                        projectedAttn.Allocate(0.0f);
+                    }
+                    attnOutput.FreeSpace();
+                    reduceOutput(projectedAttn, visionWeights[pre + ".attn.proj.bias"], residual.dataType,
+                                 visionWeights[pre + ".attn.proj.weight"], &residual);
+                    projectedAttn.FreeSpace();
+                } else if (attnOutput.dataDevice == DataDevice::CUDA &&
                     CanRunLinearAdd(
                         attnOutput,
-                        this->weight[pre + ".attn.proj.weight"],
-                        this->weight[pre + ".attn.proj.bias"],
+                        visionWeights[pre + ".attn.proj.weight"],
+                        visionWeights[pre + ".attn.proj.bias"],
                         residual)) {
                     // Accumulate the output projection straight into the
                     // residual.  Besides avoiding another 144 MiB tensor at
@@ -26540,8 +26987,8 @@ namespace fastllm {
                     // GEMM (Linear(attnOutput, ..., attnOutput)).
                     LinearAdd(
                         attnOutput,
-                        this->weight[pre + ".attn.proj.weight"],
-                        this->weight[pre + ".attn.proj.bias"],
+                        visionWeights[pre + ".attn.proj.weight"],
+                        visionWeights[pre + ".attn.proj.bias"],
                         projectedAttn, residual);
                     attnOutput.FreeSpace();
                     projectedAttn.FreeSpace();
@@ -26549,8 +26996,8 @@ namespace fastllm {
 #endif
                 {
                     Linear(attnOutput,
-                           this->weight[pre + ".attn.proj.weight"],
-                           this->weight[pre + ".attn.proj.bias"],
+                           visionWeights[pre + ".attn.proj.weight"],
+                           visionWeights[pre + ".attn.proj.bias"],
                            projectedAttn);
                     attnOutput.FreeSpace();
                     if (projectedAttn.dataType != residual.dataType) {
@@ -26563,15 +27010,16 @@ namespace fastllm {
 
                 Mul(hiddenStates, 1.0f, residual);
                 LayerNorm(hiddenStates,
-                          this->weight[pre + ".norm2.weight"],
-                          this->weight[pre + ".norm2.bias"],
+                          visionWeights[pre + ".norm2.weight"],
+                          visionWeights[pre + ".norm2.bias"],
                           -1,
                           blockInput);
                 hiddenStates.FreeSpace();
                 auto runMlpChunk = [&](Data &input, Data &output) {
-                    Linear(input,
-                           this->weight[pre + ".mlp.linear_fc1.weight"],
-                           this->weight[pre + ".mlp.linear_fc1.bias"],
+                    if (localIntermediate > 0) {
+                    columnProjection(input,
+                           visionWeights[pre + ".mlp.linear_fc1.weight"],
+                           visionWeights[pre + ".mlp.linear_fc1.bias"],
                            mlpHidden);
                     bool useHalfGeluNew = false;
 #ifdef USE_CUDA
@@ -26584,16 +27032,58 @@ namespace fastllm {
                         ToDataType(mlpHidden, DataType::FLOAT32);
                     }
                     GeluNew(mlpHidden, mlpHidden);
+#ifdef USE_CUDA
+                    if (tensorParallel) {
+                        partialProjection(mlpHidden, visionWeights[pre + ".mlp.linear_fc2.weight"], output);
+                    } else
+#endif
                     Linear(mlpHidden,
-                           this->weight[pre + ".mlp.linear_fc2.weight"],
-                           this->weight[pre + ".mlp.linear_fc2.bias"],
+                           visionWeights[pre + ".mlp.linear_fc2.weight"],
+                           visionWeights[pre + ".mlp.linear_fc2.bias"],
                            output);
                     mlpHidden.FreeSpace();
-                    if (output.dataType != residual.dataType) {
+                    } else {
+                        output.dataType = tensorParallel ? DataType::FLOAT32 : residual.dataType;
+                        output.Resize(input.dims);
+                        Qwen35ToDeviceLike(output, input, false);
+                        output.Allocate(0.0f);
+                    }
+                    if (!tensorParallel && output.dataType != residual.dataType) {
                         ToDataType(output, residual.dataType);
                     }
                 };
 
+#ifdef USE_CUDA
+                if (tensorParallel) {
+                    // Keep GEMM chunks bounded, but communicate one complete
+                    // block output so large images do not need one collective
+                    // for every 2048-token chunk.
+                    mlpOutput.dataType = DataType::FLOAT32;
+                    mlpOutput.Resize(residual.dims);
+                    Qwen35ToDeviceLike(mlpOutput, residual, false);
+                    mlpOutput.Allocate(false);
+                    const size_t inputRowBytes = (size_t)vision_hidden_size * blockInput.unitSize / blockInput.unitSizeDiv;
+                    const size_t outputRowBytes = (size_t)vision_hidden_size * sizeof(float);
+                    for (int start = 0; start < patchCount; start += visionTokenChunkSize) {
+                        const int rows = std::min(visionTokenChunkSize, patchCount - start);
+                        Data inputView, partial;
+                        inputView.FakeFrom(blockInput, (size_t)start * inputRowBytes);
+                        inputView.Resize({1, rows, vision_hidden_size});
+                        inputView.dataDeviceIds = blockInput.dataDeviceIds;
+                        runMlpChunk(inputView, partial);
+                        AssertInFastLLM(FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
+                            (uint8_t*)mlpOutput.cudaData + (size_t)start * outputRowBytes,
+                            partial.cudaData, (size_t)rows * outputRowBytes),
+                            "Qwen3.5 vision TP MLP output copy failed.");
+                        FastllmCudaSyncCurrentThreadStream();
+                    }
+                    blockInput.FreeSpace();
+                    reduceOutput(mlpOutput, visionWeights[pre + ".mlp.linear_fc2.bias"], residual.dataType,
+                                 visionWeights[pre + ".mlp.linear_fc2.weight"], nullptr, visionTokenChunkSize);
+                    AddTo(residual, mlpOutput);
+                    mlpOutput.FreeSpace();
+                } else
+#endif
                 if (useCudaVisionChunks &&
                     patchCount > visionTokenChunkSize) {
                     const size_t inputRowBytes =
@@ -26638,10 +27128,11 @@ namespace fastllm {
                 // merger. Do not retain the allocator's normal 300 MiB cache
                 // at this explicit phase boundary.
                 FastllmCudaSyncCurrentThreadStream();
-                FastllmCudaClearBigBufferAll();
+                if (!tensorParallel) FastllmCudaClearBigBufferAll();
             }
 #endif
             auto appendMergerOutput = [&](Data &mergerOutput) {
+                if (rankIndex != 0) return;
 #ifdef USE_CUDA
                 // CUDA kernels and cuBLAS run on cudaStreamPerThread, while
                 // the generic CUDA->CPU transfer uses the legacy default
@@ -26674,10 +27165,12 @@ namespace fastllm {
                     (uint64_t)(vision_hidden_size * mergeUnit));
                 mergerInput.Reshape(
                     {mergerRows, vision_hidden_size * mergeUnit});
-                Linear(mergerInput,
-                       this->weight[
+                const DataType mergerType = mergerInput.dataType;
+                if (localMergerIntermediate > 0) {
+                columnProjection(mergerInput,
+                       visionWeights[
                            visual_prefix + "merger.linear_fc1.weight"],
-                       this->weight[
+                       visionWeights[
                            visual_prefix + "merger.linear_fc1.bias"],
                        mergerHidden);
                 mergerInput.FreeSpace();
@@ -26694,13 +27187,29 @@ namespace fastllm {
                 // Vision blocks use gelu_pytorch_tanh, but the official patch
                 // merger uses torch.nn.GELU's exact formulation.
                 Gelu(mergerHidden, mergerHidden);
+#ifdef USE_CUDA
+                if (tensorParallel) {
+                    partialProjection(mergerHidden, visionWeights[visual_prefix + "merger.linear_fc2.weight"], mergerOutput);
+                } else
+#endif
                 Linear(mergerHidden,
-                       this->weight[
+                       visionWeights[
                            visual_prefix + "merger.linear_fc2.weight"],
-                       this->weight[
+                       visionWeights[
                            visual_prefix + "merger.linear_fc2.bias"],
                        mergerOutput);
                 mergerHidden.FreeSpace();
+                } else {
+                    mergerOutput.dataType = mergerType;
+                    mergerOutput.Resize({mergerRows, vision_out_hidden_size});
+                    Qwen35ToDeviceLike(mergerOutput, mergerInput, false);
+                    mergerOutput.Allocate(0.0f);
+                    mergerInput.FreeSpace();
+                }
+#ifdef USE_CUDA
+                if (tensorParallel) reduceOutput(mergerOutput, visionWeights[visual_prefix + "merger.linear_fc2.bias"],
+                                                mergerType, visionWeights[visual_prefix + "merger.linear_fc2.weight"]);
+#endif
             };
 
             if (useCudaVisionChunks &&
@@ -26724,9 +27233,9 @@ namespace fastllm {
                     hiddenView.dataDeviceIds = hiddenStates.dataDeviceIds;
                     LayerNorm(
                         hiddenView,
-                        this->weight[
+                        visionWeights[
                             visual_prefix + "merger.norm.weight"],
-                        this->weight[
+                        visionWeights[
                             visual_prefix + "merger.norm.bias"],
                         -1, mergerInput);
                     runMerger(mergerInput, mergerOutput);
@@ -26737,14 +27246,43 @@ namespace fastllm {
                 Data mergerInput, mergerOutput;
                 LayerNorm(
                     hiddenStates,
-                    this->weight[
+                    visionWeights[
                         visual_prefix + "merger.norm.weight"],
-                    this->weight[
+                    visionWeights[
                         visual_prefix + "merger.norm.bias"],
                     -1, mergerInput);
                 hiddenStates.FreeSpace();
                 runMerger(mergerInput, mergerOutput);
                 appendMergerOutput(mergerOutput);
+            }
+
+#ifdef USE_CUDA
+                if (tensorParallel) {
+                    FastllmCudaSyncCurrentThreadStream();
+                    if (FastllmCudaGetThreadError()) throw std::runtime_error("Vision TP CUDA encoder failed");
+                    barrier.Wait();
+                }
+#endif
+            };
+#ifdef USE_CUDA
+            if (tensorParallel) {
+                std::vector<std::thread> workers;
+                try {
+                    for (int index = 0; index < rankCount; ++index) {
+                        workers.emplace_back([&, index] {
+                            try { encodeRank(index); }
+                            catch (...) { barrier.Cancel(std::current_exception()); }
+                        });
+                    }
+                } catch (...) {
+                    barrier.Cancel(std::current_exception());
+                }
+                for (auto &worker : workers) worker.join();
+                barrier.Check();
+            } else
+#endif
+            {
+                encodeRank(0);
             }
             if (!imageCacheKey.empty()) {
                 size_t count = mergedFeatures.size() - featureStart;
@@ -26764,6 +27302,28 @@ namespace fastllm {
         if (totalFeatureCount > 0) {
             features.CopyFrom(Data(DataType::FLOAT32, {1, totalFeatureCount, vision_out_hidden_size}, mergedFeatures));
         }
+#ifdef USE_CUDA
+        if (this->verbose) {
+            // All encoding workers and their temporary tensors have finished.
+            // Read host-side arena counters only; the high-water mark includes
+            // startup warmup and earlier encodes, rather than this request alone.
+            auto reportWorkspace = [&](const std::shared_ptr<CudaWorkspace> &workspace) {
+                if (!workspace) return;
+                printf("[Vision] Multimodal workspace after encode: cuda:%d, capacity=%.2f MiB, "
+                       "peak_cumulative=%.2f MiB, live=%.2f MiB, media=%zu, feature_tokens=%d "
+                       "(peak includes startup warmup).\n",
+                       workspace->Device(), workspace->Capacity() / 1048576.0,
+                       workspace->PeakBytes() / 1048576.0, workspace->LiveBytes() / 1048576.0,
+                       rawInputs.size(), totalFeatureCount);
+            };
+            if (visionTP) {
+                for (auto &rank : visionTP->ranks) reportWorkspace(rank->workspace);
+            } else {
+                reportWorkspace(visionWorkspace);
+            }
+            fflush(stdout);
+        }
+#endif
     }
 
     void Qwen3_5Model::BuildMultimodalPositionData(const Data &inputIds,

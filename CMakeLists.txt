@@ -357,6 +357,7 @@ if (USE_CUDA)
     #message(${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
     set(FASTLLM_CUDA_SOURCES src/devices/cuda/cudadevice.cpp src/devices/cuda/cudadevicebatch.cpp 
         src/devices/cuda/cudaworkspace.cpp
+        src/devices/cuda/fastllm-cuda-vision.cu
         src/devices/cuda/fastllm-cuda.cu
         src/devices/cuda/fastllm-cuda-mtp.cu
         src/devices/cuda/fastllm-triton-cuda.cu
@@ -708,6 +709,10 @@ if (UNIT_TEST)
         target_link_libraries(multimodal_workspace_test PRIVATE fastllm)
         add_test(NAME multimodal_workspace COMMAND multimodal_workspace_test)
         set_tests_properties(multimodal_workspace PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        add_executable(qwen35_vision_tp_test test/basic/test_qwen35_vision_tp.cpp)
+        target_link_libraries(qwen35_vision_tp_test PRIVATE fastllm)
+        add_test(NAME qwen35_vision_tp COMMAND qwen35_vision_tp_test)
+        set_tests_properties(qwen35_vision_tp PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 300)
         add_executable(qwen35_mtp_tp_test test/basic/test_qwen35_mtp_tp.cpp)
         target_link_libraries(qwen35_mtp_tp_test PRIVATE fastllm)
         add_test(NAME qwen35_mtp_tp COMMAND qwen35_mtp_tp_test)

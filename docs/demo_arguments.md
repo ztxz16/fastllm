@@ -14,7 +14,7 @@
 - **图片 embedding 缓存 (`--image-embedding-cache`)**: Qwen3.5 native 图片路径的 CPU 缓存上限，默认 `512m`，例如 `--image-embedding-cache 1g`；设为 `0` 关闭。首次处理图片请求时才创建，按实际内容分配内存，不额外常驻 GPU 显存。命中后跳过 native 图片预处理和视觉编码；图片解码、传输及语言模型预填充仍可能执行。配置、作用范围与验证方式见[多模态缓存](multimodal-cache.md)。
 - **启动多模态预分配 (`--multimodal`)**: Qwen3.5 架构族（包括相应 Qwen3.8）的视觉权重与 CUDA 临时工作区在 KV cache 定容前分配，后续视觉编码复用固定工作区。默认关闭；开启后启动时间增加，可用 KV 容量相应减少。工作区按 processor 的单张图片/单个视频像素上限确定，多张图片逐张复用；修改 processor 上限后需重启，超出预算的 native 输入会报错。
   多模态特征和完整文本 embedding 保留在 CPU，文本 prefill 只上传当前分块。图片总量仍受上下文长度和系统内存限制，工作区不限制文本侧其他缓存。
-  `--tp` 仅分摊语言模型；视觉默认在首卡运行，可用 `--vision_device cuda:N` 指定其他可见卡。CPU 视觉只预先加载权重，不分配 CUDA 工作区。
+  CUDA 视觉跟随普通 `--tp` 的设备与比例，支持奇数卡；多卡时不再由 `--vision_device cuda:N` 单独覆盖视觉放置。各卡在 KV 定容前完成视觉预热和工作区预留。CPU 视觉只预先加载权重，不分配 CUDA 工作区。
 - **权重类型 (`--dtype`)**: 指定模型的权重类型，适用于读取Hugging Face模型时。可以指定为`float16`, `int8`, `int4`, `int4g`(int4分组量化)，例如：
 ```bash
 --dtype float16  # 使用float16权重（不量化）

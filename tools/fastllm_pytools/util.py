@@ -828,7 +828,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--device', type = str, help = '使用的设备')
     parser.add_argument('--vision_device', '--vision-device', dest = 'vision_device',
                         type = _vision_device, default = None,
-                        help = 'Qwen3.5 视觉编码器设备: auto/cpu/cuda/cuda:N (默认 auto, 即首个前向 GPU)')
+                        help = 'Qwen3.5 视觉编码器设备: auto/cpu/cuda/cuda:N；默认auto，CUDA视觉随普通TP设备与比例，多卡时cuda:N不单独覆盖')
     parser.add_argument('--multimodal', action = 'store_true',
                         help = 'Qwen3.5/Qwen3.8启动时加载视觉权重并预分配工作区，再分配KV cache；按processor的图片/视频像素上限预热')
     parser.add_argument('--tp', type = str, default = "", help = '线程级张量并行设备；裸数字X表示使用前X张卡，0表示0号卡，也可写 0,1 或 auto')

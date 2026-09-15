@@ -21,6 +21,7 @@
 
 namespace fastllm {
     class CudaWorkspace;
+    struct Qwen35VisionTPState;
     class Qwen3_5Model: public basellm {
     public:
     Qwen3_5Model (); // 构造函数
@@ -350,6 +351,7 @@ namespace fastllm {
         bool multimodalWarmedUp = false;
         int visionWorkspaceMaxPatches = 0;
         std::shared_ptr<CudaWorkspace> visionWorkspace;
+        std::shared_ptr<Qwen35VisionTPState> visionTP;
         std::string visionDevice = "auto";
         int vision_depth = 0;
         int vision_hidden_size = 0;
@@ -456,7 +458,8 @@ namespace fastllm {
                                              const Data *imageEmbeds,
                                              const Data *videoEmbeds,
                                              Data &hiddenStates);
-        void ApplyVisionRotary(Data &input, const Data &posX, const Data &posY);
+        void ApplyVisionRotary(Data &input, const Data &posX, const Data &posY,
+                               Data &sinData, Data &cosData);
         void EncodeVisualItems(const std::vector <Data*> &rawInputs,
                                const Data *gridThwData,
                                bool isVideo,
