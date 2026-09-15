@@ -204,6 +204,21 @@ namespace fastllm {
             size_t elementBytes = logits.unitSize / logits.unitSizeDiv;
             AssertInFastLLM(logits.unitSizeDiv == 1 && elementBytes > 0,
                             "Tensor-parallel logits must use a byte-aligned data type.\n");
+            // Worker completion is ordered on each device's caller stream.
+            // A peer copy on the root stream does not inherit the other
+            // device's waits. Join those producers before reading their shards.
+            static thread_local auto *sourceReady = new std::map<int, void*>();
+            for (const auto &deviceData : logits.multiDeviceDatas) {
+                FastllmCudaSetDevice(deviceData.first);
+                void *&event = (*sourceReady)[deviceData.first];
+                if (event == nullptr) event = FastllmCudaEventCreate();
+                AssertInFastLLM(event != nullptr, "Cannot create TP logits readiness event.\n");
+                FastllmCudaEventRecordCurrentThread(event);
+            }
+            FastllmCudaSetDevice(rootDevice);
+            for (const auto &deviceData : logits.multiDeviceDatas) {
+                FastllmCudaCurrentThreadStreamWaitEvent(sourceReady->at(deviceData.first));
+            }
             for (auto &deviceData : logits.multiDeviceDatas) {
                 int device = deviceData.first;
                 Data *local = deviceData.second;
@@ -237,6 +252,10 @@ namespace fastllm {
                                 "Tensor-parallel logits shard size mismatch.\n");
             }
 
+            // Reset returns source shards to their device memory pools. Keep
+            // them alive until all root-stream peer reads have completed.
+            FastllmCudaSetDevice(rootDevice);
+            FastllmCudaSyncCurrentThreadStream();
             logits.ResetMultiDeviceState();
             logits.dataDevice = DataDevice::CUDA;
             logits.dataDeviceIds = {rootDevice};

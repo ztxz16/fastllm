@@ -152,16 +152,14 @@ ftllm server /path/to/DeepSeek-V4.1-Flash \
 行为验证（贪心解码）：中英文常识、算术、代码生成、逻辑推理均正确；31k 与 123k 上下文的"大海捞针"命中
 （这两个长度都会激活候选块两级 top-k）；工具调用能正确产出 `tool_calls`；图像输入能正确描述图中的形状与颜色。
 
-## 张量并行（已跑通，但尚未优化）
+## 张量并行
 
-> **状态**：真实 40 层权重上输出正确、31k 与 123k 大海捞针命中，但 **decode 吞吐只有单卡的 0.72 倍**
-> （9.3–9.5 对 12.7–13.1 tokens/s），每卡显存 11.1 / 9.3 GB 也高于按层切分的 7.2 / 8.1 GB。
-> 代价是 multicuda 每个算子都要唤醒两个 worker 并同步，40 层上千个算子累积约 30 ms，
-> 超过了分担计算省下的时间。**多卡推荐用下面的「按层切分」**；张量并行当前的价值是代码完备性，
-> 以及在算子更少、GPU 占比更高的模型或硬件上结论可能反过来。
+支持 GPU 共享专家、单 token 异步调度与分段 CUDA Graph。吞吐收益取决于 GPU、卡间通信和
+CPU 专家占比，应在相同配置下分别测量 decode 与首 token 延迟。
 
 ```bash
-ftllm server /path/to/DeepSeek-V4.1-Flash --tp 2 --moe_device numa --dtype float16
+FASTLLM_DSV41_CUDA_GRAPH=1 ftllm server /path/to/DeepSeek-V4.1-Flash \
+  --tp 2 --moe_device numa --cuda_shared_expert true --dtype float16
 ```
 
 `--tp 2` 会把主 device 归一化成 `multicuda:0,1` 并设置 `FASTLLM_TP`（触发加载期的权重切分）。
@@ -202,14 +200,27 @@ ftllm server /path/to/DeepSeek-V4.1-Flash --tp 2 --moe_device numa --dtype float
 
 ### 约束
 
-CUDA 稀疏注意力 kernel 每个 block 处理 32 个 head，所以 `num_attention_heads / tp` 必须是 32 的倍数，
+TP 当前要求 `num_attention_heads / tp` 是 32 的倍数，以兼容 CUDA 稀疏注意力的回退路径，
 并且要对齐到 `o_group`。真实模型 64 头、`o_groups=8`，TP=2 满足（每卡 32 头 = 4 个 o_group）；
 TP=4 不满足。不满足时模型会打印一行说明并**整体退回单卡**（撤销注意力与 head 的 TP 权重注册，
 把 device map 改回 `cuda:<第一张卡>`），而不是做"只切 FFN"的半张量并行。
 
 视觉编码器（ViT + aligner）与 DSpark 草稿层还不是张量并行感知的，图文请求下视觉部分仍在单卡上算。
 
-### 收益与代价
+### 混合推理的 decode 调度
+
+TP 的共享专家 gate/up 按中间维度切分，down 执行 all-reduce；路由专家仍使用配置的 CPU / NUMA 后端。
+输入先暂存，再发射 GPU 共享专家，使两条分支重叠。单 token TP 默认使用常驻 worker 与流事件，
+保持 Graph 和段外算子使用的 GPU 地址稳定，并在采样前等待所有 logits 分片的生产完成。
+
+CPU 专家结果上传、共享结果相加与 HC post 在一次 worker 调用中执行，保留 AddTo 的中间舍入。
+单向量输入直接 D2H，CPU MoE 输出保持二维以复用 GPU 副本；每次上传覆盖新结果。
+不支持的布局、类型或设备使用原路径。同步 H2D 保证 CPU 源在回调返回后即可复用。
+这些优化不改变 prefill 的动态专家分配。
+
+比较 TP 与按层分卡时，应保持共享专家位置、CPU 线程、NUMA、KV 类型和 prefill 分块相同。
+
+### 早期同步调度的测量
 
 迷你模型（`--perf-config`：4 层、64 头、`o_groups=8`，与真实模型同构）在 2 x RTX 3090 Ti 上：
 
@@ -470,6 +481,9 @@ FT_MOE_ASSIST_DEVICES=0,1 ftllm server ... --device cuda --moe_device numa
 然后枚举阈值 t，用与实际分配一致的贪心把 GPU 专家摊到各卡上，取 `max(cpuMs, gpuMs)` 最小的 t。
 样本不足（前几层）时退回原来的合成估计。`FT_EXPERT_LIMIT=<n>` 的显式覆盖优先级最高，
 两种自动估计都不会执行。
+
+动态 prefill 分配可能改变专家归约和舍入路径。数值比较应使用相同输入及生成历史，结合 logits
+误差与任务结果判断；不要仅为逐字节复现而关闭动态分配。生成历史分歧之后的 logits 不能直接比较。
 
 ### 实测（2 x RTX 3090 Ti，NVLink，6 层真实 MoE 尺寸的模型）
 

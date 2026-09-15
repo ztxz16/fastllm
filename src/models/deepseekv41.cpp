@@ -531,6 +531,11 @@ namespace fastllm {
         // 从复制布局的某一张卡副本拷到 CPU（root 在复制布局下只有形状信息）
         void V41ReplicaToCpu(Data &dst, const Data &src, const std::vector<int> &tpDevices) {
 #ifdef USE_CUDA
+            // Preserve prefill's allocation / staging behavior. In particular,
+            // retaining its large CPU buffers changes dynamic expert staging.
+            // The optimization targets one activation vector during decode.
+            if (!src.dims.empty() && src.Count(0) == (uint64_t)src.dims.back() &&
+                MultiCudaCopyReplicaToCpu(dst, src, tpDevices)) return;
             if (!tpDevices.empty() && src.multiDeviceData && src.IsTensorParallelReplicated()) {
                 for (int device : tpDevices) {
                     auto it = src.multiDeviceDatas.find(device);
@@ -3230,6 +3235,27 @@ namespace fastllm {
         ApplyDeviceMap(this->deviceMap, 1, block_cnt);
         const std::vector<int> tpDevices = V41TpDevices(this->deviceMap);
         const bool tp = !tpDevices.empty();
+#ifdef USE_CUDA
+        // Keep the per-rank CUDA queues running between decode operators.
+        // The dispatcher orders caller/worker streams with events; a device
+        // synchronize at every operator would serialize the TP launch threads.
+        struct ScopedTpDecodeDispatch {
+            bool enabled, previous = false;
+            const std::vector<int> &devices;
+            ScopedTpDecodeDispatch(bool enabled, const std::vector<int> &devices)
+                : enabled(enabled), devices(devices) {
+                if (enabled) previous = MultiCudaSetPersistentAsyncDispatch(true);
+            }
+            ~ScopedTpDecodeDispatch() {
+                if (enabled) {
+                    const int originalDevice = FastllmCudaGetDevice();
+                    for (int device : devices) FastllmCudaSyncDevice(device);
+                    FastllmCudaSetDevice(originalDevice);
+                    MultiCudaSetPersistentAsyncDispatch(previous);
+                }
+            }
+        } tpDecodeDispatch(tp && single && seqlen == 1, tpDevices);
+#endif
         // 注意力能否按 head 切分：CUDA 稀疏注意力 kernel 每个 block 处理 32 个 head，
         // 要求每张卡分到的 head 数是 32 的倍数；wo_a 又要求 head 区间对齐到 o_group。
         // 不满足时（例如 32 头的迷你模型、或 64 头开 TP=4）注意力退回"每卡各算一份"，
@@ -4127,9 +4153,9 @@ namespace fastllm {
             bool hasSharedExpertOut = false;
             auto sharedGateupIt = weight.weight.find(pre + ".ffn.shared_experts.gateup.weight");
             auto sharedDownIt = weight.weight.find(pre + ".ffn.shared_experts.w2.weight");
-            // Keep reference accumulation and tensor-parallel shared experts
-            // on the MoE path until the separate GPU path supports their ordering.
-            if (GetCudaSharedExpert() && !V41ReferenceMathEnabled() && !tp &&
+            // Keep the shared expert on CUDA in TP as well. Mixing its FP16
+            // weights with the routed NVFP4 experts disables the NUMA fast path.
+            if (GetCudaSharedExpert() && !V41ReferenceMathEnabled() &&
                 sharedGateupIt != weight.weight.end() &&
                 sharedDownIt != weight.weight.end() && !sharedGateupIt->second.isDiskWeight &&
                 !sharedDownIt->second.isDiskWeight) {
@@ -4327,9 +4353,11 @@ namespace fastllm {
             // GPU work, serializing the two otherwise independent branches.
             bool overlapShared = false;
 #ifdef USE_CUDA
-            overlapShared = hasSharedExpertOut && !graphActive &&
+            const std::string overlapMoeDevice = this->SelectMoeDeviceForLayer(layer);
+            overlapShared = hasSharedExpertOut &&
                 !V41EnvFlag("FASTLLM_DSV41_DISABLE_SHARED_OVERLAP") &&
-                V41DeviceSpecUsesType(this->SelectMoeDeviceForLayer(layer), "cpu");
+                (V41DeviceSpecUsesType(overlapMoeDevice, "cpu") ||
+                 (tp && V41DeviceSpecUsesType(overlapMoeDevice, "numa")));
 #endif
             if (overlapShared) {
                 V41ReplicaToCpu(cpuMoeInput, ffnInput, tpDevices);
@@ -4344,14 +4372,17 @@ namespace fastllm {
                     sharedDownIt->second.tpLinearType = TP_LINEAR_COLUMN;
                 }
                 Data &ww1 = ws->sharedSwiglu, &ww3 = ws->sharedGateup;
-                quantizedLinear(ffnInput, pre + ".ffn.shared_experts.gateup.weight", ww3);
+                quantizedLinear(ffnInput, pre + ".ffn.shared_experts.gateup.weight", ww3,
+                                tp && !tpSharedExpert);
 #ifdef USE_CUDA
-                AssertInFastLLM(FastllmCudaDeepSeekV41SharedSwiglu(ww3, swiglu_limit, ww1),
+                AssertInFastLLM(tp ? MultiCudaDeepSeekV41SharedSwiglu(ww3, swiglu_limit, ww1) :
+                                    FastllmCudaDeepSeekV41SharedSwiglu(ww3, swiglu_limit, ww1),
                                 "DeepSeekV41: CUDA shared expert activation rejected input.");
 #else
                 Swiglu(ww3, ww1);
 #endif
-                quantizedLinear(ww1, pre + ".ffn.shared_experts.w2.weight", sharedExpertOut);
+                quantizedLinear(ww1, pre + ".ffn.shared_experts.w2.weight", sharedExpertOut,
+                                tp && !tpSharedExpert);
                 ToDataType(sharedExpertOut, DataType::BFLOAT16);
             }
             };   // runSharedExpert
@@ -4361,6 +4392,10 @@ namespace fastllm {
             releasePrefill({&x, &ws->gateInput, &ws->gateLogits, &ws->sharedGateup, &ws->sharedSwiglu,
                             &ws->quantizedActivation});
 
+            bool combineFfnPostDispatch = false;
+#ifdef USE_CUDA
+            combineFfnPostDispatch = tp && single && seqlen == 1 && hasSharedExpertOut && !dumpDebug;
+#endif
             {
                 this->ApplyMoeDeviceMapForLayer(layer);
                 // 路由专家在 multicuda 上按专家并行（每卡一部分专家 + all-reduce），
@@ -4375,15 +4410,15 @@ namespace fastllm {
                 // MoE 落在 cpu / numa 时，输入必须从某张卡的副本拷出来：直接交给 CPU 算子
                 // 会让 Data::ToDevice 从复制布局已经失效的 root 上读，直接段错误。
                 const bool tpStageMoe = tp && !routedExpertParallel;
-                bool stageMoeInput = tpStageMoe;
-                bool stageMoeRoute = tpStageMoe;
+                bool stageMoeInput = !overlapShared && tpStageMoe;
+                bool stageMoeRoute = !overlapShared && tpStageMoe;
 #ifdef USE_CUDA
                 // 图模式下 ffnInput / expertIndex / expertScore 是 post 段的输出，地址被烤
                 // 进图里；而 DoCudaMergeMOE 一定会把 index / score 搬到 CPU 上分桶
                 // （cpu / numa 上的 MoE 还会连输入一起搬走），Data::ToDevice 顺手就把显存
                 // 释放了，下一次回放于是写到别人的缓冲上。所以先拷到独立的暂存缓冲再交出去。
-                stageMoeRoute = stageMoeRoute || graphActive;
-                stageMoeInput = stageMoeInput || (graphActive && !routedExpertOnCuda);
+                stageMoeRoute = stageMoeRoute || (!overlapShared && graphActive);
+                stageMoeInput = stageMoeInput || (!overlapShared && graphActive && !routedExpertOnCuda);
 #endif
                 if (stageMoeInput) {
                     V41ReplicaToCpu(cpuMoeInput, ffnInput, tpDevices);
@@ -4426,13 +4461,15 @@ namespace fastllm {
                               quantizedLinearNames.count(pre + ".ffn.shared_experts.w1.weight") != 0);
                 ApplyDeviceMap(this->deviceMap, layer + 1, block_cnt);
 #ifdef USE_CUDA
-                if (tp && ffnOut.dataDevice == DataDevice::CPU && ffnOut.cpuData != nullptr) {
+                if (tp && !combineFfnPostDispatch && ffnOut.dataDevice == DataDevice::CPU && ffnOut.cpuData != nullptr) {
                     // CPU / NUMA 上算出的路由专家结果只有一份，广播到两张卡后才能
                     // 与复制布局的共享专家输出、hc 残差相加。
+                    // A previous decode may have retained replicas; upload the new CPU payload.
+                    V41ResetMultiDevice(ffnOut);
                     PrepareMultiCudaReplicatedData(ffnOut, tpDevices, true);
                 }
 #endif
-                if (hasSharedExpertOut) {
+                if (hasSharedExpertOut && !combineFfnPostDispatch) {
                     if (!(tp && ffnOut.multiDeviceData && sharedExpertOut.multiDeviceData)) {
                         ffnOut.ToDevice(sharedExpertOut.dataDevice);
                     }
@@ -4446,7 +4483,13 @@ namespace fastllm {
                 }
 #endif
             }
-            ffnOut.Reshape(ffnDims);
+            // HcPost uses residual's shape and input's element count. Keep the
+            // CPU MoE output flat so next layer's MergeMOEBlock does not discard
+            // its replicas solely because [tokens, dim] became [1, tokens, dim].
+            // The joint callback refreshes these buffers before every AddTo.
+            const bool retainCpuMoeReplicas = combineFfnPostDispatch &&
+                ffnOut.dataDevice == DataDevice::CPU && ffnOut.cpuData != nullptr;
+            if (!retainCpuMoeReplicas) ffnOut.Reshape(ffnDims);
             if (dumpDebug) {
                 V41DumpTensor(ffnInput, "fl_layer" + std::to_string(layer) + "_ffn_in" + dumpSuffix);
                 V41DumpTensor(ffnOut, "fl_layer" + std::to_string(layer) + "_ffn" + dumpSuffix);
@@ -4456,7 +4499,24 @@ namespace fastllm {
                 V41DumpTensor(ffnPost, "fl_layer" + std::to_string(layer) + "_ffn_post" + dumpSuffix);
                 V41DumpTensor(ffnComb, "fl_layer" + std::to_string(layer) + "_ffn_comb" + dumpSuffix);
             }
-            V41HcPost(ffnOut, *curHidden, ffnPost, ffnComb, *nextHidden);
+            bool ffnPostDone = false;
+#ifdef USE_CUDA
+            if (combineFfnPostDispatch) {
+                ffnPostDone = MultiCudaDeepSeekV41AddHcPost(
+                    ffnOut, sharedExpertOut, *curHidden, ffnPost, ffnComb, *nextHidden);
+                if (!ffnPostDone) {
+                    if (ffnOut.dataDevice == DataDevice::CPU && ffnOut.cpuData != nullptr) {
+                        // Rejection occurs before AddTo. Rebuild the old view
+                        // and upload fresh data before using the separate operators.
+                        V41ResetMultiDevice(ffnOut);
+                        ffnOut.Reshape(ffnDims);
+                        PrepareMultiCudaReplicatedData(ffnOut, tpDevices, true);
+                    }
+                    AddTo(ffnOut, sharedExpertOut);
+                }
+            }
+#endif
+            if (!ffnPostDone) V41HcPost(ffnOut, *curHidden, ffnPost, ffnComb, *nextHidden);
             std::swap(curHidden, nextHidden);
             preMixPtr = &ffnPre;
             releasePrefill({&ffnInput, &ffnOut, &ffnPost, &ffnComb, &ws->sharedExpertOut, nextHidden});
