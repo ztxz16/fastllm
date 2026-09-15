@@ -7,6 +7,7 @@
 
 #define FASTLLM_CUDA_NO_MALLOC_CHECK_MACRO
 #include "fastllm-cuda.cuh"
+#include "devices/cuda/cudaworkspace.h"
 #include "fastllm-cuda-mtp.cuh"
 #ifndef USE_ROCM
 #include "fastllm-cuda-ordered-reduce.cuh"
@@ -4834,6 +4835,7 @@ FastllmCudaTryMallocResult FastllmCudaTryDirectMalloc(
 }
 
 void FastllmCudaDirectFree(void *ret) {
+    if (fastllm::TryFreeCudaWorkspace(ret)) return;
 #ifdef CUDA_MEM_DEBUG
     CudaMemDebugRemove(ret);
 #endif
@@ -5182,6 +5184,20 @@ static void *FastllmCudaMallocImpl(
         FastllmCudaGraphCurrentCaptureIdentity();
     const bool capturePoolOnly = captureIdentity.valid ||
         FastllmCudaGraphIsCapturingFast();
+    void *workspacePointer = nullptr;
+    if (fastllm::TryAllocateCudaWorkspace(id, size, &workspacePointer)) {
+        // Arena suballocations have eager stream lifetimes; graph replay must
+        // continue to use the existing graph-owned allocation mechanism.
+        if (capturePoolOnly) {
+            if (workspacePointer) fastllm::TryFreeCudaWorkspace(workspacePointer);
+            FastllmCudaSetThreadError();
+            return nullptr;
+        }
+        if (workspacePointer) return allocationSucceeded(workspacePointer);
+        if (tryResult) *tryResult = FASTLLM_CUDA_TRY_MALLOC_CAPACITY_FAILURE;
+        else FastllmCudaSetThreadError();
+        return nullptr;
+    }
     const bool useAnyFittingPooledBuffer = capturePoolOnly ||
         fastllmCudaMallocDisabled.load(std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(*view.lock);
@@ -5399,6 +5415,7 @@ void FastllmCudaForceFree(void *ret) {
     if (ret == nullptr) {
         return;
     }
+    if (fastllm::TryFreeCudaWorkspace(ret)) return;
     if (FastllmCudaTryFreeWeightSlabPtr(ret)) {
         return;
     }
@@ -5487,6 +5504,11 @@ bool FastllmCudaFreeAfterStream(void *ret, cudaStream_t stream) {
     if (ret == nullptr) {
         return true;
     }
+    if (fastllm::IsCudaWorkspacePointer(ret)) {
+        cudaError_t state = cudaStreamSynchronize(stream);
+        checkCudaErrors("Error: synchronizing CUDA workspace release", state);
+        return state == cudaSuccess && fastllm::TryFreeCudaWorkspace(ret);
+    }
     FastllmCudaGraphCaptureIdentity captureIdentity =
         FastllmCudaGraphCurrentCaptureIdentity();
     if (captureIdentity.valid || FastllmCudaGraphIsCapturingFast()) {
@@ -5553,6 +5575,7 @@ void FastllmCudaFree(void *ret) {
     if (ret == nullptr) {
         return;
     }
+    if (fastllm::TryFreeCudaWorkspace(ret)) return;
     if (FastllmCudaTryFreeWeightSlabPtr(ret)) {
         return;
     }
