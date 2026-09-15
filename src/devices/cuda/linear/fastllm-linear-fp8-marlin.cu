@@ -319,21 +319,26 @@ static bool EnsureFp8MarlinOnDevice(fastllm::Data &weight, int m, int k) {
     FastllmCudaClearThreadError();
     std::vector<half> hostScales;
     BuildFp8MarlinPermutedScales(weight, m, k, hostScales);
-    half *marlinScales = (half *)FastllmCudaMalloc(hostScales.size() * sizeof(half));
+    // Long-lived auxiliary data must not pin oversized pooled temporaries.
+    half *marlinScales = (half *)FastllmCudaDirectMalloc(hostScales.size() * sizeof(half));
     if (marlinScales == nullptr || FastllmCudaGetThreadError()) {
+        if (marlinScales != nullptr) FastllmCudaDirectFree(marlinScales);
         FastllmCudaClearThreadError();
         return false;
     }
     FastllmCudaCopyFromHostToDevice(marlinScales, hostScales.data(),
-                                    hostScales.size() * sizeof(half));
+                                  hostScales.size() * sizeof(half));
 
     int sms = 0, dev = 0;
     cudaGetDevice(&dev);
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
     int workspaceInts = std::max(1, sms * 4);
-    int *workspace = (int *)FastllmCudaMalloc((size_t)workspaceInts * sizeof(int));
+    // These locks live as long as the weight. Do not pin a much larger idle
+    // temporary from the small-buffer pool for a roughly 1 KiB allocation.
+    int *workspace = (int *)FastllmCudaDirectMalloc((size_t)workspaceInts * sizeof(int));
     if (workspace == nullptr || FastllmCudaGetThreadError()) {
-        FastllmCudaFree(marlinScales);
+        if (workspace != nullptr) FastllmCudaDirectFree(workspace);
+        FastllmCudaDirectFree(marlinScales);
         FastllmCudaClearThreadError();
         return false;
     }
@@ -350,8 +355,8 @@ static bool EnsureFp8MarlinOnDevice(fastllm::Data &weight, int m, int k) {
     uint32_t *stdQWeight = (uint32_t *)FastllmCudaMalloc(qweightBytes);
     if (stdQWeight == nullptr || FastllmCudaGetThreadError()) {
         if (stdQWeight) FastllmCudaFree(stdQWeight);
-        FastllmCudaFree(workspace);
-        FastllmCudaFree(marlinScales);
+        FastllmCudaDirectFree(workspace);
+        FastllmCudaDirectFree(marlinScales);
         FastllmCudaClearThreadError();
         return false;
     }
@@ -368,8 +373,8 @@ static bool EnsureFp8MarlinOnDevice(fastllm::Data &weight, int m, int k) {
     // intentionally retain up to 300 MB of idle big buffers per device.
     FastllmCudaForceFree(stdQWeight);
     if (!repacked || syncState != cudaSuccess) {
-        FastllmCudaFree(workspace);
-        FastllmCudaFree(marlinScales);
+        FastllmCudaDirectFree(workspace);
+        FastllmCudaDirectFree(marlinScales);
         if (syncState != cudaSuccess) {
             printf("Error: FP8 Marlin in-place repack failed: %s.\n",
                    cudaGetErrorString(syncState));
