@@ -142,6 +142,56 @@ alone do not measure the whole workload. Pure mode reports actual cache hits
 and misses, synchronizing at entry and at reporting intervals. Pure mode can
 be slower when demand refill dominates.
 
+## Disk-backed multilevel cache
+
+`MergeMOE` models can retain a budgeted subset of disk-backed experts in RAM
+and VRAM:
+
+```sh
+FT_NUMAS=1 numactl -C 0-31 -m 0 \
+  ftllm server /path/to/DeepSeek-V4.1-Flash \
+  --device "{'cuda:0':1,'cuda:1':1}" --moe_device disk --threads 30 \
+  --cuda_shared_expert true --moe_cuda_cache 4g --moe_cpu_cache 32g
+```
+
+`--moe_cpu_cache` sets the process-wide RAM budget; `--moe_cuda_cache` sets
+VRAM **per GPU**. Both default to zero. A GPU hit executes on that GPU, a RAM
+hit executes on CPU, and a miss loads the expert from disk. Cold prefill can
+stream missing experts through CUDA using the existing disk GPU-prefill
+setting. NUMA-cache modes and per-device environment overrides do not apply
+to this backend.
+
+Gate/up and down weights are cached together. Replacement prefers the lowest
+batch-normalized frequency score, then the least recently used entry. Scores
+halve every 4096 expert lookups. RAM replacement requires a second visit and
+a strictly hotter candidate; CUDA promotion also requires a second visit,
+admits at most one expert per layer invocation, and requires a score advantage
+greater than 16 for replacement. Promotion releases the RAM copy, increasing
+combined coverage; another GPU can load it again if needed.
+
+Budgets cover retained expert payload, excluding other model weights, KV/Engram
+tables, metadata and temporary buffers. Computation stages at most 256 rows
+per expert and prefetches one missing expert. Cache reads default to `O_DIRECT`
+where available; `FASTLLM_DISK_DIRECT_IO=0` selects buffered reads. Shrinking or
+disabling a cache releases excess entries, and model unload releases its
+entries. On glibc, retired buffers are periodically returned to the OS.
+
+CUDA residency supports compact NVFP4 with block-32 UE8M0 scales, block-128
+FP8 (native or packed), FP32, FP16 and BF16. Other formats use CPU execution.
+`KimiK3RoutedExperts` does not use this cache. V4.1 retains its quantization,
+route-weight placement and ordered reduction; CPU/CUDA matrix products can
+have floating-point rounding differences.
+
+Python callers can set budgets with `llm.set_moe_cpu_cache(bytes)` and
+`llm.set_moe_cuda_cache(bytes)` before loading. `llm.get_disk_moe_cache_stats()`
+returns cumulative `cpu_hits`, `cuda_hits`, `misses`, `disk_bytes`, `uploads`,
+`cpu_evictions` and `cuda_evictions`, plus current `cpu_bytes` and `cuda_bytes`
+(summed across GPUs). Hits count token/expert routes, including disk-backed
+shared experts; GPU hits are excluded from CPU hits. Use snapshot differences
+for request statistics. `disk_bytes` counts checkpoint payload read on misses,
+`uploads` counts retained GPU promotions, and evictions include explicit
+capacity changes and model unload.
+
 ## Metadata: `fastllm-cuda-expert-cache.cuh`
 
 `ExpertCacheView` owns no memory. The caller supplies a global key-to-slot map,

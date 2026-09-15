@@ -17,6 +17,7 @@ class MoeCudaCacheCliTest(unittest.TestCase):
     def test_disabled_by_default(self):
         args = make_normal_parser("test").parse_args([])
         self.assertEqual(args.moe_cuda_cache, 0)
+        self.assertEqual(args.moe_cpu_cache, 0)
 
     def test_binary_size_units(self):
         expected = {
@@ -44,6 +45,13 @@ class MoeCudaCacheCliTest(unittest.TestCase):
             with self.subTest(value=value):
                 with self.assertRaises(argparse.ArgumentTypeError):
                     _memory_size_bytes(value)
+
+    def test_disk_cache_budgets_are_independent(self):
+        for option in ("--moe_cpu_cache", "--moe-cpu-cache"):
+            args = make_normal_parser("test").parse_args([
+                "--moe_device", "disk", "--moe_cuda_cache", "3g", option, "32g"])
+            self.assertEqual(args.moe_cuda_cache, 3 << 30)
+            self.assertEqual(args.moe_cpu_cache, 32 << 30)
 
     def test_exact_large_byte_counts(self):
         maximum = (1 << 64) - 1
