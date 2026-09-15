@@ -483,6 +483,35 @@ def apply_vision_device_env(args):
     os.environ["FASTLLM_QWEN35_VISION_DEVICE"] = _vision_device(device)
 
 
+def apply_multimodal_warmup_env(args, is_qwen35_model):
+    if not getattr(args, "multimodal", False):
+        os.environ.pop("FASTLLM_QWEN35_MM_MAX_PATCHES", None)
+        return
+    if not is_qwen35_model:
+        raise ValueError("--multimodal startup preallocation currently supports Qwen3.5/Qwen3.8 models")
+    try:
+        from .qwen35_multimodal_native import get_qwen35_multimodal_config
+    except ImportError:
+        from qwen35_multimodal_native import get_qwen35_multimodal_config
+    model_config = {}
+    processor_path = args.path
+    if not os.path.isdir(processor_path):
+        processor_path = getattr(args, "ori", "") or os.path.dirname(processor_path)
+    config_path = os.path.join(processor_path, "config.json")
+    if os.path.isfile(config_path):
+        with open(config_path, encoding="utf-8") as handle:
+            model_config = json.load(handle)
+    config = get_qwen35_multimodal_config(processor_path, model_config)
+    if min(config["patch_size"], config["temporal_patch_size"], config["merge_size"]) <= 0:
+        raise ValueError("Invalid multimodal patch size in processor configuration")
+    patch_area = config["patch_size"] ** 2
+    # Do not divide the video limit by temporal_patch_size: short clips
+    # are padded after resizing and can consume the full pixel budget.
+    max_pixels = max(config["image_max_pixels"], config["video_max_pixels"])
+    max_patches = max((max_pixels + patch_area - 1) // patch_area, config["merge_size"] ** 2)
+    os.environ["FASTLLM_QWEN35_MM_MAX_PATCHES"] = str(max_patches)
+
+
 def _vision_device(value):
     device = str(value).strip().lower() or "auto"
     if device in ("auto", "cpu", "cuda"):
@@ -800,6 +829,8 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--vision_device', '--vision-device', dest = 'vision_device',
                         type = _vision_device, default = None,
                         help = 'Qwen3.5 视觉编码器设备: auto/cpu/cuda/cuda:N (默认 auto, 即首个前向 GPU)')
+    parser.add_argument('--multimodal', action = 'store_true',
+                        help = 'Qwen3.5/Qwen3.8启动时加载视觉权重并预分配工作区，再分配KV cache；按processor的图片/视频像素上限预热')
     parser.add_argument('--tp', type = str, default = "", help = '线程级张量并行设备；裸数字X表示使用前X张卡，0表示0号卡，也可写 0,1 或 auto')
     parser.add_argument('--moe_device', type = str, default = "", help = 'moe使用的设备')
     parser.add_argument('--moe_device_layers', type = int, default = -1, help = '后面多少层moe使用moe_device，-1表示全部moe层使用moe_device')
@@ -1626,6 +1657,7 @@ def make_normal_llm_model(args, startup_progress = None):
     apply_prefix_cache_env(args)
     apply_image_embedding_cache_env(args)
     apply_vision_device_env(args)
+    apply_multimodal_warmup_env(args, is_qwen35_model)
     if (hasattr(args, 'gpu_mem_ratio')):
         llm.set_gpu_mem_ratio(args.gpu_mem_ratio)
     if (hasattr(args, 'cuda_slab') and hasattr(llm, 'set_cuda_slab')):

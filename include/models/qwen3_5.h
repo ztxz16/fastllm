@@ -20,6 +20,7 @@
 #include <vector>
 
 namespace fastllm {
+    class CudaWorkspace;
     class Qwen3_5Model: public basellm {
     public:
     Qwen3_5Model (); // 构造函数
@@ -99,6 +100,7 @@ namespace fastllm {
         virtual bool NeedAttentionMask(int qlen, int klen);
 
         virtual void WarmUp(); // 预热
+        void Prepare() override; // 在 KV cache 定容前预分配视觉工作区
 
         virtual bool CanUseGPUForward() const override;
 
@@ -345,6 +347,9 @@ namespace fastllm {
         std::set<int> ggufGdnRestoredLayers;
         std::vector <int> mrope_sections = {11, 11, 10};
         bool visionPrepared = false;
+        bool multimodalWarmedUp = false;
+        int visionWorkspaceMaxPatches = 0;
+        std::shared_ptr<CudaWorkspace> visionWorkspace;
         std::string visionDevice = "auto";
         int vision_depth = 0;
         int vision_hidden_size = 0;

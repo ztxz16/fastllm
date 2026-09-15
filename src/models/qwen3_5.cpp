@@ -36,6 +36,7 @@
 
 #ifdef USE_CUDA
 #include "models/qwen3_cuda_common.h"
+#include "devices/cuda/cudaworkspace.h"
 #include "devices/cuda/fastllm-cuda-fp8.h"
 #include "devices/cuda/fastllm-cuda-mtp.cuh"
 #endif
@@ -25809,6 +25810,65 @@ namespace fastllm {
         }
     }
 
+    void Qwen3_5Model::Prepare() {
+        const char *patchBudget = std::getenv("FASTLLM_QWEN35_MM_MAX_PATCHES");
+        const int maxPatches = patchBudget == nullptr ? 0 : std::atoi(patchBudget);
+        if (multimodalWarmedUp || maxPatches <= 0) return;
+#ifdef USE_CUDA
+        struct RestoreDevice {
+            int previous = FastllmCudaGetDeviceCount() > 0 ? FastllmCudaGetDevice() : -1;
+            ~RestoreDevice() { if (previous >= 0) FastllmCudaSetDevice(previous); }
+        } restoreDevice;
+#endif
+        PrepareVision();
+#ifdef USE_CUDA
+        if (StartWith(visionDevice, "cuda:")) {
+            const int device = std::stoi(visionDevice.substr(5));
+            FastllmCudaSetDevice(device);
+            auto warmImage = [&](int gridH, int gridW) {
+                Data pixels(DataType::FLOAT32,
+                            {gridH * vision_patch_size, gridW * vision_patch_size, 3});
+                pixels.Allocate();
+                std::fill_n((float*)pixels.cpuData, pixels.Count(0), 0.5f);
+                Data grid(DataType::FLOAT32, {1, 3}, {1.0f, (float)gridH, (float)gridW});
+                Data features;
+                std::vector<std::vector<int>> grids;
+                EncodeVisualItems({&pixels}, &grid, false, features, grids);
+                FastllmCudaSyncDevice(device);
+            };
+            // Load vision weights and initialize lazy operators outside the workspace.
+            warmImage(vision_spatial_merge_size, vision_spatial_merge_size);
+            const int merge = vision_spatial_merge_size;
+            visionWorkspaceMaxPatches = maxPatches;
+            if (visionWorkspaceMaxPatches < merge * merge) {
+                throw std::runtime_error("Multimodal patch budget is smaller than one merged image token");
+            }
+            const size_t elementBytes = this->dataType == DataType::FLOAT32 ? 4 : 2;
+            // Budget QKV/residual/rotary temporaries, MLP buffers and allocator
+            // fragmentation conservatively. The maximum-size encode below
+            // validates this reservation before any KV cache is committed.
+            const size_t channels = std::max((size_t)vision_hidden_size * 10,
+                                             (size_t)vision_intermediate_size * 2);
+            const size_t granularity = 64ULL * 1024 * 1024;
+            size_t bytes = (size_t)visionWorkspaceMaxPatches * channels * elementBytes +
+                           512ULL * 1024 * 1024;
+            bytes = (bytes + granularity - 1) / granularity * granularity;
+            visionWorkspace = std::make_shared<CudaWorkspace>(device, bytes);
+            const int units = visionWorkspaceMaxPatches / (merge * merge);
+            const int gridH = std::max(1, (int)std::sqrt((double)units));
+            const int gridW = std::max(1, units / gridH);
+            printf("[Vision] Multimodal warmup before KV cache: %s, max patches=%d, fixed workspace=%.2f MiB.\n",
+                   visionDevice.c_str(), visionWorkspaceMaxPatches, bytes / 1048576.0);
+            fflush(stdout);
+            warmImage(gridH * merge, gridW * merge);
+            printf("[Vision] Multimodal workspace ready: peak=%.2f MiB, live=%.2f MiB; remaining memory is available for KV cache.\n",
+                   visionWorkspace->PeakBytes() / 1048576.0, visionWorkspace->LiveBytes() / 1048576.0);
+            fflush(stdout);
+        }
+#endif
+        multimodalWarmedUp = true;
+    }
+
     void Qwen3_5Model::PrepareVision() {
         if (visionPrepared) {
             return;
@@ -26008,6 +26068,9 @@ namespace fastllm {
             }
         } visionExecutorScope;
         PrepareVision();
+#ifdef USE_CUDA
+        CudaWorkspaceScope workspaceScope(visionWorkspace);
+#endif
         static thread_local Executor visionExecutor;
         visionExecutor.SetFirstDevice(this->visionDevice);
         SetCurrentThreadExecutor(&visionExecutor);
@@ -26057,6 +26120,10 @@ namespace fastllm {
                 readGridValue(mediaIndex * 3 + 2),
             };
             gridThwList.push_back(grid);
+            const long long mediaPatches = (long long)grid[0] * grid[1] * grid[2];
+            if (visionWorkspace && mediaPatches > visionWorkspaceMaxPatches) {
+                throw std::runtime_error("Image/video exceeds the startup multimodal patch budget; resize media before encoding");
+            }
 
             std::string imageCacheKey;
             if (imageCache != nullptr) {
@@ -34034,6 +34101,7 @@ namespace fastllm {
     }
 
     void Qwen3_5Model::WarmUp() {
+        Prepare();
         Data inputIds = Data(DataType::FLOAT32, {1, 1}, {1});
         Data attentionMask = Data(this->dataType, {1, 1}, {0});
         Data positionIds = Data(this->dataType, {1, 1}, {0, 0});
