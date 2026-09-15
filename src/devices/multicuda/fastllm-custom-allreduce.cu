@@ -1957,9 +1957,12 @@ bool CheckCustomArCorrectnessTyped(const CustomArState &state,
             expected[index] += CustomArHostToFloat<T>(host[index]);
         }
         FastllmCudaSetDevice(state.devices[rank]);
+        // The rank workers consume these buffers on other per-thread streams.
+        // Pageable H2D copies and memset may still be running when they return.
         ok = cudaMemcpy(buffers.inputs[rank], host.data(), bytes,
                         cudaMemcpyHostToDevice) == cudaSuccess &&
-             cudaMemset(buffers.outputs[rank], 0, bytes) == cudaSuccess;
+             cudaMemset(buffers.outputs[rank], 0, bytes) == cudaSuccess &&
+             cudaStreamSynchronize(cudaStreamPerThread) == cudaSuccess;
         if (!ok) {
             cudaGetLastError();
         }

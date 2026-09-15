@@ -925,7 +925,8 @@ if (UNIT_TEST)
             target_link_libraries(customArRegistrationRegression PRIVATE fastllm_tools)
             add_test(NAME custom_ar_registration COMMAND customArRegistrationRegression)
             add_test(NAME custom_ar_registration_pool_reuse COMMAND customArRegistrationRegression reuse)
-            set_tests_properties(custom_ar_registration custom_ar_registration_pool_reuse PROPERTIES
+            add_test(NAME custom_ar_selftest_upload COMMAND customArRegistrationRegression selftest)
+            set_tests_properties(custom_ar_registration custom_ar_registration_pool_reuse custom_ar_selftest_upload PROPERTIES
                 LABELS cuda TIMEOUT 30 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
         endif()
 

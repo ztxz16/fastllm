@@ -1,5 +1,5 @@
-// Exercise the production registration with delayed H2D completion and old
-// pool writers. Both use different streams from the registering thread.
+// Exercise production registration and startup self-test with delayed H2D
+// completion and old pool writers on different per-thread streams.
 #include <cuda_runtime.h>
 #include <chrono>
 #include <cstdio>
@@ -9,20 +9,27 @@
 namespace {
 void *staging[2] = {};
 bool delayMetadata = false;
+bool delaySelfTestInput = false;
+int delayedSelfTestCopies = 0;
+constexpr size_t kSelfTestBytes = 1024 * 1024;
 
 void DelayCopy(void *) {
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 }
 
-cudaError_t DelayedMetadataCopy(void *dest, const void *source, size_t bytes,
-                                cudaMemcpyKind kind) {
-    if (!delayMetadata || bytes != 8 * sizeof(void *) || kind != cudaMemcpyHostToDevice) {
+cudaError_t DelayedHostCopy(void *dest, const void *source, size_t bytes,
+                           cudaMemcpyKind kind) {
+    const bool metadata = delayMetadata && bytes == 8 * sizeof(void *);
+    const bool selfTestInput = delaySelfTestInput && bytes == kSelfTestBytes;
+    if ((!metadata && !selfTestInput) || kind != cudaMemcpyHostToDevice) {
         return cudaMemcpy(dest, source, bytes, kind);
     }
     int device = -1;
     cudaError_t status = cudaGetDevice(&device);
     if (status != cudaSuccess || device < 0 || device >= 2) return cudaErrorInvalidDevice;
-    // Start with a known incomplete table; keep the staged source alive until
+    if (selfTestInput && device != 1) return cudaMemcpy(dest, source, bytes, kind);
+    if (selfTestInput) ++delayedSelfTestCopies;
+    // Start with a known incomplete upload; keep the staged source alive until
     // every queued DMA finishes. No CUDA API is called by the host callback.
     status = cudaMemsetAsync(dest, 0, bytes, cudaStreamPerThread);
     if (status != cudaSuccess) return status;
@@ -40,7 +47,7 @@ cudaError_t DelayedMetadataCopy(void *dest, const void *source, size_t bytes,
 #ifdef cudaMemcpy
 #undef cudaMemcpy
 #endif
-#define cudaMemcpy DelayedMetadataCopy
+#define cudaMemcpy DelayedHostCopy
 #ifndef CUSTOM_AR_SOURCE
 #define CUSTOM_AR_SOURCE "../../src/devices/multicuda/fastllm-custom-allreduce.cu"
 #endif
@@ -54,10 +61,71 @@ static void Require(cudaError_t status, const char *where) {
     }
 }
 
+static int RunSelfTestUploadRegression() {
+    for (int device = 0; device < 2; ++device) {
+        int peer = 0;
+        Require(cudaDeviceCanAccessPeer(&peer, device, 1 - device), "peer access query");
+        if (!peer) return 77;
+    }
+    // Skip auto tuning here: exercise its real correctness check directly,
+    // with a cached pointer tuple so cold registration cannot mask the race.
+    setenv("FASTLLM_CUDA_CUSTOM_ALLREDUCE", "1", 1);
+    if (!FastllmInitNccl({0, 1}) || !FastllmCudaCustomAllReduceEnabled()) return 1;
+    CustomArState &state = GetCustomArState();
+    for (int device = 0; device < 2; ++device) {
+        Require(cudaSetDevice(device), "staging device");
+        Require(cudaHostAlloc(&staging[device], kSelfTestBytes, 0), "input staging allocation");
+    }
+    bool passed = true;
+    const int types[] = {(int)fastllm::DataType::FLOAT16,
+                         (int)fastllm::DataType::BFLOAT16,
+                         (int)fastllm::DataType::FLOAT32};
+    const char *names[] = {"FP16", "BF16", "FP32"};
+    for (int type = 0; type < 3; ++type) {
+        CustomArBenchBuffers buffers;
+        if (!AllocateCustomArBenchBuffers(state.devices, kSelfTestBytes, buffers)) return 1;
+        for (int device = 0; device < 2; ++device) {
+            Require(cudaSetDevice(device), "warmup device");
+            Require(cudaMemset(buffers.inputs[device], 0, kSelfTestBytes), "warmup input");
+            Require(cudaStreamSynchronize(cudaStreamPerThread), "warmup input completion");
+        }
+        const int count = (int)(kSelfTestBytes / CustomArTypeBytes(types[type]));
+        float ignoredUs = 0.0f;
+        if (!RunCustomArRankOperation(state.devices, 1, [&](int rank) {
+                return RunCustomArCandidate(buffers.inputs[rank], buffers.outputs[rank],
+                    count, types[type], state.devices[rank]);
+            }, ignoredUs)) return 1;
+        const size_t registrations = state.registrations.size();
+        const int copiesBefore = delayedSelfTestCopies;
+        delaySelfTestInput = true;
+        bool checked = CheckCustomArCorrectness(state, buffers, kSelfTestBytes, types[type]);
+        delaySelfTestInput = false;
+        const bool cached = registrations == state.registrations.size();
+        const bool delayed = delayedSelfTestCopies == copiesBefore + 1;
+        bool casePassed = checked && cached && delayed;
+        passed = passed && casePassed;
+        std::printf("%s: %s startup self-test waits for input upload (cached=%d, delayed=%d)\n",
+                    casePassed ? "PASS" : "FAIL", names[type], cached, delayed);
+        // The negative control can finish its worker reads before the upload.
+        for (int device = 0; device < 2; ++device) {
+            Require(cudaSetDevice(device), "cleanup device");
+            Require(cudaStreamSynchronize(cudaStreamPerThread), "pending input upload");
+        }
+        FreeCustomArBenchBuffers(state.devices, buffers);
+    }
+    FastllmCudaCustomAllReduceReset();
+    for (int device = 0; device < 2; ++device) {
+        Require(cudaSetDevice(device), "staging cleanup device");
+        Require(cudaFreeHost(staging[device]), "input staging cleanup");
+    }
+    return passed ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
     const bool reuse = argc > 1 && std::strcmp(argv[1], "reuse") == 0;
     int count = 0;
     if (cudaGetDeviceCount(&count) != cudaSuccess || count < 2) return 77;
+    if (argc > 1 && std::strcmp(argv[1], "selftest") == 0) return RunSelfTestUploadRegression();
     CustomArState state;
     state.devices = {0, 1};
     std::vector<void *> inputs(2);
