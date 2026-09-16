@@ -17760,6 +17760,16 @@ namespace fastllm {
         if (seqLens.size() != 1 || context == nullptr) {
             return false;
         }
+        // Multimodal requests fall back to plain target decoding. The draft
+        // model never sees the image, and mixing DFlash capture/validation with
+        // vision tokens corrupts the target's image perception (green reported
+        // as blue, etc.). vLLM avoids this by never feeding multimodal
+        // embeddings to the draft; here the equivalent safe behaviour is to
+        // skip speculation for the request entirely. See DFLASH_TP_BALANCE.md.
+        if (!context->multimodalInput.empty()) {
+            logMtpSkip("multimodal input: speculative decoding disabled");
+            return false;
+        }
         if (generationConfigs.empty() ||
             !Qwen35MtpSupportsGenerationConfig(generationConfigs[0])) {
             logMtpSkip("generation config is unsupported");
@@ -20323,6 +20333,15 @@ namespace fastllm {
             (int)generationConfigs.size() < batch ||
             (int)pastKeyValues.size() < batch * block_cnt) {
             return false;
+        }
+        // See the single-request guard: speculative decoding is disabled for
+        // multimodal requests because DFlash + vision corrupts image
+        // perception.
+        for (int b = 0; b < batch; b++) {
+            if (contexts[b] != nullptr &&
+                !contexts[b]->multimodalInput.empty()) {
+                return false;
+            }
         }
 
         const bool useDFlash = HasDFlashWeights();
