@@ -148,6 +148,12 @@ namespace fastllm {
 
         std::pair<std::vector<float>, std::vector<float>> UpdateRotaryPosEmb(float base, float factor, int seqLen = 0); // 更新位置编码
 
+        // EPD encoder 入口：只执行视觉塔，输出按序合并的 image embeddings（不触碰 LM 权重）
+        void EncodeImages(const std::vector <Data*> &rawInputs,
+                          const Data *gridThwData,
+                          Data &features,
+                          std::vector<std::vector<int>> &gridThwList);
+
         static const std::string language_prefix;
         static const std::string visual_prefix;
 

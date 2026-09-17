@@ -4,11 +4,13 @@
 
 #include "model.h"
 #include "devices/disk/diskdevice.h"
+#include "qwen3_5.h"
 
 #include <cstring>
 #include <csignal>
 #include <cstdint>
 #include <exception>
+#include <fstream>
 #include <string>
 
 #ifdef USE_CUDA
@@ -1098,6 +1100,177 @@ extern "C" {
 
         int ret = model->LaunchResponseTokens(input, config, *multimodalInput);
         return ret;
+    }
+
+    // EPD encoder 专用导出：只执行 qwen3_5 视觉塔，不触碰 LM。
+    // 输入 payload 与 launch_response_llm_model_multimodal 的 qwen35 tensors 形式相同
+    // （image_frames 每图一个 tensor + image_grid_thw [n,3]）。
+    // 合并后的 features(fp32 [1,T,H]) 原始字节写入 out_features_path；
+    // meta JSON {"grid_thw":[[t,h,w]...],"tokens":T,"hidden":H,"dtype":"float32"} 写入 out_meta_json。
+    // 返回 0 成功，负数为错误码（输入校验一律用返回码，避免断言终止服务进程）。
+    DLL_EXPORT int encode_visual_items_llm_model(int modelId,
+                                  char *multimodal_json, uint8_t *multimodal_data,
+                                  char *out_features_path, char *out_meta_json, int out_meta_max) {
+        auto model = models.GetModel(modelId);
+        if (model == nullptr) {
+            return -1;
+        }
+        if (model->model_struct != "qwen3_5") {
+            return -2;
+        }
+
+        std::string error;
+        auto multimodal_config = json11::Json::parse(multimodal_json, error);
+        if (!error.empty()) {
+            return -3;
+        }
+
+        std::map <std::string, std::vector <fastllm::Data*> > multimodalInput;
+        auto cleanupInputs = [&]() {
+            for (auto &it : multimodalInput) {
+                for (auto *ptr : it.second) {
+                    delete ptr;
+                }
+            }
+            multimodalInput.clear();
+        };
+        auto readShape = [](const json11::Json &node) {
+            std::vector<int> shape;
+            for (auto &item : node.array_items()) {
+                shape.push_back(item.int_value());
+            }
+            return shape;
+        };
+        auto shapeCount = [](const std::vector<int> &shape) {
+            if (shape.empty()) {
+                return 0;
+            }
+            int total = 1;
+            for (int dim : shape) {
+                total *= dim;
+            }
+            return total;
+        };
+        auto parseDataType = [](const std::string &dtype) {
+            if (dtype == "float32") {
+                return fastllm::DataType::FLOAT32;
+            }
+            if (dtype == "float16") {
+                return fastllm::DataType::FLOAT16;
+            }
+            if (dtype == "bfloat16") {
+                return fastllm::DataType::BFLOAT16;
+            }
+            if (dtype == "int32") {
+                return fastllm::DataType::INT32;
+            }
+            return fastllm::DataType::FLOAT32;
+        };
+        auto dataTypeBytes = [](fastllm::DataType dataType) -> int {
+            switch (dataType) {
+                case fastllm::DataType::FLOAT32:
+                case fastllm::DataType::INT32:
+                    return 4;
+                case fastllm::DataType::FLOAT16:
+                case fastllm::DataType::BFLOAT16:
+                    return 2;
+                default:
+                    return 0;
+            }
+        };
+        bool payloadOk = true;
+        auto addTypedPayloadTensor = [&](const std::string &name, fastllm::DataType dataType,
+                                         const std::vector<int> &shape, int offsetBytes, int nbytes) {
+            int expectedBytes = shapeCount(shape) * dataTypeBytes(dataType);
+            if (expectedBytes != nbytes) {
+                payloadOk = false;
+                return;
+            }
+            if (nbytes == 0) {
+                return;
+            }
+            fastllm::Data *tensorData = new fastllm::Data(dataType, shape);
+            tensorData->Allocate(false);
+            memcpy(tensorData->cpuData, multimodal_data + offsetBytes, (size_t) nbytes);
+            multimodalInput[name].push_back(tensorData);
+        };
+
+        if (multimodal_config["tensors"].is_array()) {
+            for (auto &tensorNode : multimodal_config["tensors"].array_items()) {
+                addTypedPayloadTensor(
+                    tensorNode["name"].string_value(),
+                    parseDataType(tensorNode["dtype"].string_value()),
+                    readShape(tensorNode["shape"]),
+                    tensorNode["offset_bytes"].int_value(),
+                    tensorNode["nbytes"].int_value()
+                );
+            }
+        }
+        if (!payloadOk) {
+            cleanupInputs();
+            return -4;
+        }
+
+        auto rawImageIt = multimodalInput.find("image_frames");
+        auto imageGridIt = multimodalInput.find("image_grid_thw");
+        if (rawImageIt == multimodalInput.end() || rawImageIt->second.empty() ||
+            imageGridIt == multimodalInput.end() || imageGridIt->second.empty()) {
+            cleanupInputs();
+            return -5;
+        }
+
+        fastllm::Data features;
+        std::vector<std::vector<int>> gridThwList;
+        try {
+            static_cast<fastllm::Qwen3_5Model*>(model)->EncodeImages(
+                rawImageIt->second, imageGridIt->second[0], features, gridThwList);
+        } catch (...) {
+            cleanupInputs();
+            return -6;
+        }
+
+        features.ToDevice(fastllm::DataDevice::CPU);
+        if (features.dataType != fastllm::DataType::FLOAT32 || features.cpuData == nullptr ||
+            features.dims.size() < 2) {
+            cleanupInputs();
+            return -7;
+        }
+
+        {
+            std::ofstream out(out_features_path, std::ios::binary | std::ios::trunc);
+            if (!out.good()) {
+                cleanupInputs();
+                return -8;
+            }
+            out.write((const char*) features.cpuData, (std::streamsize) features.GetBytes());
+            out.close();
+            if (!out.good()) {
+                cleanupInputs();
+                return -8;
+            }
+        }
+
+        json11::Json::array grids;
+        for (auto &g : gridThwList) {
+            if (g.size() == 3) {
+                grids.push_back(json11::Json::array {g[0], g[1], g[2]});
+            }
+        }
+        json11::Json meta = json11::Json::object {
+            {"grid_thw", grids},
+            {"tokens", features.dims[features.dims.size() - 2]},
+            {"hidden", features.dims[features.dims.size() - 1]},
+            {"dtype", "float32"}
+        };
+        std::string metaStr = meta.dump();
+        if ((int) metaStr.size() + 1 > out_meta_max) {
+            cleanupInputs();
+            return -9;
+        }
+        memcpy(out_meta_json, metaStr.c_str(), metaStr.size() + 1);
+
+        cleanupInputs();
+        return 0;
     }
 
     DLL_EXPORT int fetch_response_llm_model(int modelId, int handleId) {
