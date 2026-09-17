@@ -1637,10 +1637,6 @@ namespace fastllm {
             for (int c = 0; c < COLS; c++) {
                 const uint8_t *blockStart = weightBase +
                     (size_t)(col0 + c) * ldb + (size_t)block * 12;
-                if (c + 1 == COLS && block + 2 < fullBlocks) {
-                    // Prefetch within the short expert-weight row.
-                    _mm_prefetch((const char*)(blockStart + 24), _MM_HINT_T0);
-                }
                 const __m128i packed =
                     _mm_loadl_epi64((const __m128i*)blockStart);
                 const __m128i lowNibbles = _mm_and_si128(packed, nibbleMask);
@@ -1863,25 +1859,19 @@ namespace fastllm {
             const uint16_t *input = (const uint16_t*)((const uint8_t*)A + (size_t)row * lda);
             float *output = (float*)((uint8_t*)C + (size_t)row * ldc);
             int col = st;
-            // Short expert rows benefit from two-column groups on AVX2;
-            // longer rows amortize input loads across four columns.
-            if (m <= 640) {
+            // Stream short weight rows sequentially. For longer rows, reuse
+            // each BF16 input vector across six output columns.
+            if (m > 640) {
+                for (; col + 6 <= end; col += 6) {
+                    NVFP4Block16GemmCols_AVX2<6>(
+                        input, (const uint8_t*)B, ldb, output, col, fullBlocks, tail);
+                }
                 for (; col + 2 <= end; col += 2) {
                     NVFP4Block16GemmCols_AVX2<2>(
                         input, (const uint8_t*)B, ldb, output, col, fullBlocks, tail);
                 }
-            } else {
-                for (; col + 4 <= end; col += 4) {
-                    NVFP4Block16GemmCols_AVX2<4>(
-                        input, (const uint8_t*)B, ldb, output, col, fullBlocks, tail);
-                }
             }
-            if (col + 2 <= end) {
-                NVFP4Block16GemmCols_AVX2<2>(
-                    input, (const uint8_t*)B, ldb, output, col, fullBlocks, tail);
-                col += 2;
-            }
-            if (col < end) {
+            for (; col < end; col++) {
                 NVFP4Block16GemmCols_AVX2<1>(
                     input, (const uint8_t*)B, ldb, output, col, fullBlocks, tail);
             }
