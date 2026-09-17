@@ -3,7 +3,9 @@
 // or comparisons between different floating-point forward kernels.
 #include "models/deepseekv41.h"
 #include "executor.h"
+#include "baseblock.h"
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/multicuda/fastllm-multicuda.cuh"
 #include <cuda_runtime.h>
 #ifdef __linux__
 #include <sys/prctl.h>
@@ -22,6 +24,8 @@ static void Check(bool ok, const char *msg) {
 }
 struct Probe : DeepSeekV41Model {
     using DeepSeekV41Model::DsparkCommitPrefix;
+    using DeepSeekV41Model::DsparkAdvance;
+    using DeepSeekV41Model::DsparkProjectHead;
     using DeepSeekV41Model::DsparkAcceptedDraftCount;
     using DeepSeekV41Model::DsparkMaskToolLogits;
     using DeepSeekV41Model::DsparkDraftConfig;
@@ -33,12 +37,41 @@ struct Probe : DeepSeekV41Model {
         v41DsparkEnabled = true;
         deviceMap = {{"cuda:0", 1}};
     }
-    void CacheSetup() {
+    void HeadSetup() {
+        deviceMap = {{"multicuda:0,1", 1}};
+        v41DsparkTpDevices = {0, 1};
+    }
+    void MainFeatureSetup(bool tp, int firstDevice) {
+        if (tp) {
+            deviceMap = {{"multicuda:" + std::to_string(firstDevice) + "," + std::to_string(1 - firstDevice), 1}};
+            v41DsparkTpDevices = {firstDevice, 1 - firstDevice};
+        } else {
+            deviceMap = {{"cuda:" + std::to_string(firstDevice), 1}};
+        }
+        embed_dim = head_dim_full = 128;
+        qk_rope_head_dim = 32;
+        window_size = 8;
+        v41DsparkLayers = 1;
+        v41DsparkTargetLayerIds = {0, 1, 2};
+        std::vector<float> projection(128 * 384), identity(128 * 128);
+        for (int i = 0; i < 128; ++i) {
+            for (int layer = 0; layer < 3; ++layer)
+                projection[i * 384 + layer * 128 + i] = (layer + 1) / 8.0f;
+            identity[i * 128 + i] = 1.0f;
+        }
+        weight["mtp.0.main_proj.weight"].CopyFrom(Data(DataType::FLOAT32, {128, 384}, projection));
+        weight["mtp.0.attn.wkv.weight"].CopyFrom(Data(DataType::FLOAT32, {128, 128}, identity));
+        for (const char *name : {"mtp.0.main_norm.weight", "mtp.0.attn.kv_norm.weight"})
+            weight[name].CopyFrom(Data(DataType::FLOAT32, {128}, std::vector<float>(128, 1.0f)));
+    }
+    void CacheSetup(bool tp) {
         block_cnt = 2;
         window_size = 8;
         compress_ratios = {4, 16};
         isKvSource = {true, true};
         engram_layer_ids = {0};
+        deviceMap = {{tp ? "multicuda:0,1" : "cuda:0", 1}};
+        v41DsparkTpDevices = tp ? std::vector<int>{0, 1} : std::vector<int>{};
     }
 };
 static std::array<double, 4> Target(int prev) {
@@ -127,10 +160,103 @@ static void Sampling(Probe &model, int drafts, int mode) {
     std::cout << " PASS\n" << std::flush;
 }
 static std::vector<float> Read(Data &data) {
+    if (data.multiDeviceData) {
+        Check(data.IsTensorParallelReplicated() && data.multiDeviceDatas.size() == 2, "TP cache layout");
+        auto values = Read(*data.multiDeviceDatas.at(0));
+        for (auto &replica : data.multiDeviceDatas) {
+            Check(replica.second->dims == data.dims, "TP cache shape rollback");
+            Check(Read(*replica.second) == values, "TP cache replicas differ");
+        }
+        return values;
+    }
     Data cpu;
     cpu.CopyFrom(data);
+    ToDataType(cpu, DataType::FLOAT32);
     cpu.ToDevice(DataDevice::CPU);
     return {(float *)cpu.cpuData, (float *)cpu.cpuData + cpu.Count(0)};
+}
+// Feed identical, distinct per-layer features through the ordinary and TP
+// draft cache update. This detects missing uploads when crossing from TP to
+// one GPU, even when target verification still produces correct output tokens.
+static void MainFeatures() {
+    for (int firstDevice : {0, 1}) {
+        Probe single, tp;
+        single.MainFeatureSetup(false, firstDevice);
+        tp.MainFeatureSetup(true, firstDevice);
+        DeepSeekV41RequestState singleState, tpState;
+        int start = 0;
+        for (auto lengths : {std::pair<int, int>{22, 22}, {1, 1}, {6, 3}, {6, 1}, {6, 6}}) {
+            int rows = lengths.first, accepted = lengths.second;
+            DeepSeekV41SpecScratch reference, distributed;
+            reference.mainHidden.resize(3);
+            distributed.mainHidden.resize(3);
+            for (int layer = 0; layer < 3; ++layer) {
+                std::vector<float> values(rows * 128);
+                for (int i = 0; i < rows * 128; ++i)
+                    values[i] = ((i * (layer * 2 + 1) + start * 7 + layer * 11) % 53 - 26) / 16.0f;
+                Data host(DataType::BFLOAT16, {1, rows, 128}, values);
+                reference.mainHidden[layer].CopyFrom(host);
+                distributed.mainHidden[layer].CopyFrom(host);
+                PrepareMultiCudaReplicatedData(distributed.mainHidden[layer], {0, 1}, true);
+            }
+            single.DsparkAdvance(singleState, reference, start, start + accepted, -1, GenerationConfig());
+            // Include a TP -> single-GPU transition with the other GPU current.
+            ((Executor *)GetExecutor())->SetFirstDevice("multicuda:0,1");
+            Check(cudaSetDevice(1 - firstDevice) == cudaSuccess, "main feature source device");
+            tp.DsparkAdvance(tpState, distributed, start, start + accepted, -1, GenerationConfig());
+            Check(tpState.dspark && !tpState.dspark->disabled, "main feature TP draft disabled");
+            auto expected = Read(singleState.dspark->layers[0].windowKV);
+            auto actual = Read(tpState.dspark->layers[0].windowKV);
+            Check(actual == expected, "TP main features changed draft window KV");
+            for (float value : actual) Check(std::isfinite(value), "nonfinite draft window KV");
+            Check(tpState.dspark->committed == start + accepted, "main feature commit length");
+            start += accepted;
+        }
+    }
+    std::cout << "TP main feature transfer, chunking and accepted prefixes PASS\n";
+}
+
+// A sparse head has an exact oracle independent of GEMM and gather code.
+static void DraftHead() {
+    constexpr int vocab = 256, width = 128;
+    for (auto type : {DataType::BFLOAT16, DataType::FLOAT16, DataType::FLOAT32}) {
+        Probe model;
+        model.HeadSetup();
+        std::vector<float> weights(vocab * width);
+        for (int row = 0; row < vocab; ++row)
+            weights[row * width + row % width] = (row + 1) / 256.0f;
+        auto &head = model.weight["head.weight"];
+        head.CopyFrom(Data(type, {vocab, width}, weights));
+        head.tpLinearType = TP_LINEAR_ROW;
+        for (bool async : {false, true}) for (bool replicated : {false, true}) {
+            const bool previousAsync = MultiCudaSetPersistentAsyncDispatch(async);
+            Data output;
+            for (int tokens : {1, 5, 6, 1}) {
+                std::vector<float> values(tokens * width);
+                for (int i = 0; i < tokens * width; ++i) values[i] = (i % 4) - 2;
+                Data input(DataType::BFLOAT16, {1, tokens, width}, values);
+                input.ToDevice(DataDevice::CUDA, std::vector<int>{0});
+                if (replicated) PrepareMultiCudaReplicatedData(input, {0, 1}, true);
+                Check(cudaSetDevice(1) == cudaSuccess, "head starts on remote rank");
+                model.DsparkProjectHead(input, output);
+                Check(output.dims == std::vector<int>({1, tokens, vocab}) && !output.multiDeviceData,
+                      "draft head gather layout");
+                auto actual = Read(output);
+                std::vector<float> expected(tokens * vocab);
+                for (int t = 0; t < tokens; ++t)
+                    for (int row = 0; row < vocab; ++row)
+                        expected[t * vocab + row] = values[t * width + row % width] * weights[row * width + row % width];
+                Data rounded(DataType::BFLOAT16, {1, tokens, vocab}, expected);
+                auto reference = Read(rounded);
+                Check(actual == reference, "draft head gathered wrong logits");
+                Check(head.multiDeviceData && head.multiDeviceDatas.size() == 2,
+                      "draft head discarded vocabulary shards");
+            }
+            Check(MultiCudaSetPersistentAsyncDispatch(previousAsync) == async,
+                  "draft head changed async dispatch setting");
+        }
+    }
+    std::cout << "draft TP head PASS\n";
 }
 static void DeviceSelection(Probe &model, int devices) {
     constexpr int drafts = 7, vocab = 128, token = 17;
@@ -167,8 +293,8 @@ static void DeviceSelection(Probe &model, int devices) {
     Check(cudaSetDevice(0) == cudaSuccess, "restore device");
     std::cout << "device selection count=" << std::min(devices, 2) << " PASS\n";
 }
-static void Rollback(Probe &model) {
-    model.CacheSetup();
+static void Rollback(Probe &model, bool tp = false) {
+    model.CacheSetup(tp);
     ApplyDeviceMap({{"cuda:0", 1}}, 0, 1);
     int cases = 0;
     for (int drafts : {1, 3, 4, 5, 7})
@@ -207,8 +333,16 @@ static void Rollback(Probe &model) {
                         v += 1000;
                     scratch.rawScore[layer].CopyFrom(Data(DataType::FLOAT32, {1, (int)raw.size(), 1}, raw));
                     int blocks = (start + forwarded) / ratio;
-                    cache.compressedKV.CopyFrom(Data(DataType::FLOAT32, {1, blocks, 1}, std::vector<float>(blocks)));
-                    cache.indexK.CopyFrom(Data(DataType::FLOAT32, {1, blocks, 1}, std::vector<float>(blocks)));
+                    std::vector<float> compressed(blocks);
+                    std::iota(compressed.begin(), compressed.end(), 0);
+                    cache.compressedKV.CopyFrom(Data(DataType::FLOAT32, {1, blocks, 1}, compressed));
+                    cache.indexK.CopyFrom(Data(DataType::FLOAT32, {1, blocks, 1}, compressed));
+                    if (tp) {
+                        for (Data *data : {&cache.windowKV, &cache.compressedKV, &cache.indexK,
+                                           &scratch.windowKV[layer], &scratch.rawKV[layer], &scratch.rawScore[layer]}) {
+                            PrepareMultiCudaReplicatedData(*data, {0, 1}, true);
+                        }
+                    }
                 }
                 model.DsparkCommitPrefix(state, scratch, start, accepted, forwarded);
                 Check(state.totalLen == end && state.engramHistory.size() == end, "history/total rollback");
@@ -221,6 +355,10 @@ static void Rollback(Probe &model) {
                           "cache counters rollback");
                     Check(cache.compressedKV.dims[1] == end / ratio && cache.indexK.dims[1] == end / ratio,
                           "compressed/index rollback");
+                    auto compressed = Read(cache.compressedKV), index = Read(cache.indexK);
+                    for (int i = 0; i < end / ratio; ++i) {
+                        Check(compressed[i] == i && index[i] == i, "compressed/index prefix changed");
+                    }
                     auto ring = Read(cache.windowKV);
                     for (int pos = end - 8; pos < end; ++pos)
                         Check(ring[(pos + 8) % 8] == pos, "window rollback");
@@ -235,7 +373,7 @@ static void Rollback(Probe &model) {
                 }
                 ++cases;
             }
-    std::cout << "rollback cases=" << cases << " PASS\n";
+    std::cout << "rollback tp=" << tp << " cases=" << cases << " PASS\n";
 }
 // Cross invoke/parameter boundaries inside a block, including a second
 // parameter and a closed invocation. No model weights needed.
@@ -441,5 +579,10 @@ int main() {
         for (int mode = 0; mode < 3; ++mode)
             Sampling(model, drafts, mode);
     Rollback(model);
+    if (devices >= 2) {
+        MainFeatures();
+        Rollback(model, true);
+        DraftHead();
+    }
     std::cout << "DeepSeek V4.1 sampling regression PASS\n";
 }

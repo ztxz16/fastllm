@@ -4022,6 +4022,12 @@ namespace fastllm {
                 localStart == len,
                 "MultiCudaDoOutputGatherLinearOp: output ranges do not match "
                 "the local shard.\n");
+            if (deviceId != rootDevice) {
+                // Peer copies run on the root; the worker boundary only waits
+                // for deviceId, so finish this stream before returning to it.
+                FastllmCudaSyncCurrentThreadStream();
+                FastllmCudaSetDevice(deviceId);
+            }
         }
     };
 
@@ -4063,7 +4069,12 @@ namespace fastllm {
                 n, k, len, divisionScheme[device],
                 (uint8_t*)output.cudaData, device, devices.front()));
         }
+        // This gather owns temporary shard outputs and copies across devices.
+        // Finish them before releasing localOutput, even inside async decode;
+        // the persistent dispatch completion events cover only each rank's stream.
+        const bool previousAsync = MultiCudaSetPersistentAsyncDispatch(false);
         RunMultiCudaDeviceOpsAndDelete(devices, ops);
+        MultiCudaSetPersistentAsyncDispatch(previousAsync);
         return true;
     }
 

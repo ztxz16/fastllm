@@ -93,7 +93,7 @@ static int AddHcPostChecks() {
     int checks = 0;
     for (auto type : {DataType::BFLOAT16, DataType::FLOAT16, DataType::FLOAT32}) {
         Data output;
-        for (int tokens : {1, 5, 33, 1}) {
+        for (int tokens : {1, 2, 3, 4, 5, 6, 33, 1}) {
             constexpr int dim = 5120;
             ApplyDeviceMap({{"cuda:0", 1}}, 0, 1);
             auto input = Make(type, {1, tokens, dim}, tokens + 3);
@@ -160,7 +160,7 @@ static int HandoffChecks() {
     for (auto type : {DataType::BFLOAT16, DataType::FLOAT16, DataType::FLOAT32}) {
         for (int hc : {2, 4}) {
             Data output, input;
-            for (int tokens : {1, 5, 1, 1}) {
+            for (int tokens : {1, 2, 3, 4, 5, 6, 1, 6}) {
                 ApplyDeviceMap({{"cuda:0", 1}}, 0, 1);
                 auto original = Make(type, {1, tokens, 513}, tokens + checks);
                 auto shared = Make(type, original.dims, 29);
@@ -282,7 +282,7 @@ int main() {
                 }
             }
         }
-        std::cout << "PASS HC post and shared expert activation: " << checks << " checks; BF16/FP16/FP32; token lengths 1,5,33,1; both ranks bitwise match CUDA\n";
+        std::cout << "PASS HC post and shared expert activation: " << checks << " checks; BF16/FP16/FP32; decode/verify/prefill shapes; both ranks bitwise match CUDA\n";
         return 0;
     } catch (const std::exception &e) {
         std::cerr << "FAIL: " << e.what() << '\n';

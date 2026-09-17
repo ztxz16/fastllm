@@ -37,6 +37,7 @@
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
+#include "devices/multicuda/fastllm-multicuda.cuh"
 #endif
 
 #include <algorithm>
@@ -707,6 +708,17 @@ namespace fastllm {
                             "DeepSeekV41 DSpark: draft layers must use pure sliding-window attention.");
         }
         v41DsparkEnabled = true;
+        const std::string device = SelectDeviceFromMap(this->deviceMap, block_cnt, block_cnt);
+        v41DsparkTpDevices.clear();
+        if (device == "multicuda" || device.find("multicuda:") == 0) {
+            std::map<int, int> ratios;
+            v41DsparkTpDevices = ParseDeviceIds(device, "multicuda", ratios);
+#ifdef USE_CUDA
+            if (v41DsparkTpDevices.empty()) {
+                for (int i = 0; i < FastllmCudaGetDeviceCount(); i++) v41DsparkTpDevices.push_back(i);
+            }
+#endif
+        }
         v41DsparkConfidenceThreshold =
             DsEnvFloat("FASTLLM_DSPARK_CONFIDENCE_THRESHOLD", 0.0f);
         if (!(v41DsparkConfidenceThreshold >= 0.0f && v41DsparkConfidenceThreshold <= 1.0f)) {
@@ -751,6 +763,53 @@ namespace fastllm {
         }
         printf("], confidence threshold %.3f\n", v41DsparkConfidenceThreshold);
         fflush(stdout);
+    }
+
+    void DeepSeekV41Model::ApplyDsparkDevice() {
+        if (v41DsparkTpDevices.empty()) {
+            ApplyDeviceMap(this->deviceMap, block_cnt, block_cnt);
+            return;
+        }
+        // The draft backbone owns ordinary single-device buffers. Only its
+        // shared output head uses the target model's existing TP shards.
+        // Leave the CUDA executor's device list empty: TP worker kernels use
+        // their own current device when moving rank-local weights to CUDA.
+#ifdef USE_CUDA
+        if (DsExecutor().GetFirstDeviceType() == "multicuda") {
+            // Finish both caller streams before crossing into the single-GPU
+            // draft path or gathering logits on the first rank.
+            for (int device : v41DsparkTpDevices) FastllmCudaSyncDevice(device);
+        }
+#endif
+        DsExecutor().SetFirstDevice("cuda");
+#ifdef USE_CUDA
+        FastllmCudaSetDevice(v41DsparkTpDevices.front());
+#endif
+    }
+
+    void DeepSeekV41Model::DsparkProjectHead(Data &input, Data &output) {
+        if (v41DsparkTpDevices.empty()) {
+            LinearWithActivationQuant(input, "head.weight", output);
+            return;
+        }
+        ApplyDeviceMap(this->deviceMap, block_cnt, block_cnt);
+        Data quantized;
+        Data *source = &input;
+        if (quantizedLinearNames.count("head.weight")) {
+            DsExecutor().Run("DeepSeekV41QuantizeActivation",
+                {{"input", &input}, {"output", &quantized}}, {}, {});
+            source = &quantized;
+        }
+        // Quantization and target operators can leave another rank current.
+        // Drain their streams and allocate the gather destination on rank 0.
+        ApplyDsparkDevice();
+        ApplyDeviceMap(this->deviceMap, block_cnt, block_cnt);
+        // Keep the vocabulary shards intact and gather complete logits on the
+        // first GPU, as in Qwen's draft output-gather linear path.
+        DsExecutor().Run("Linear",
+            {{"input", source}, {"weight", &weight["head.weight"]},
+             {"bias", GetEmptyData()}, {"output", &output}}, {}, {{"forceOutputGather", 1}});
+        ApplyDsparkDevice();
     }
 
     bool DeepSeekV41Model::DsparkTensorNeeded(const std::string &name) const {
@@ -1231,15 +1290,23 @@ namespace fastllm {
                                               int startPos, int accept, int forwarded) {
         AssertInFastLLM(accept >= 1 && accept <= forwarded,
                         "DeepSeekV41 DSpark: invalid accepted prefix length.");
+        ApplyDeviceMap(this->deviceMap, block_cnt, block_cnt);
         const int newLen = startPos + accept;
+        // Rejected suffixes require temporary prefix copies. Keep every copy
+        // alive until the whole commit completes, rather than synchronizing
+        // both ranks after each layer's WindowStore.
+        std::vector<Data> acceptedRows(accept < forwarded ? block_cnt : 0);
+#ifdef USE_CUDA
+        ScopedTpDispatch commitDispatch(v41DsparkTpDevices.size() > 1, v41DsparkTpDevices);
+#endif
         for (int layer = 0; layer < block_cnt; layer++) {
             DeepSeekV41LayerCache &cache = state.layers[layer];
             // 1) 滑窗环形缓冲：只写入被接受的行
             if (layer < (int)scratch.windowKV.size() && scratch.windowKV[layer].dims.size() == 3) {
-                Data rows;
                 if (accept == forwarded) {
                     DsWindowStore(scratch.windowKV[layer], cache.windowKV, startPos, window_size);
                 } else {
+                    Data &rows = acceptedRows[layer];
                     Split(scratch.windowKV[layer], 1, 0, accept, rows);
                     DsWindowStore(rows, cache.windowKV, startPos, window_size);
                 }
@@ -1256,25 +1323,28 @@ namespace fastllm {
             const int blocks = total / ratio;
             const int rem = total - blocks * ratio;
             cache.compressedBlocks = prevBlocks + blocks;
-            if (cache.compressedKV.dims.size() == 3 && cache.compressedKV.dims[1] > cache.compressedBlocks) {
-                cache.compressedKV.Resize({cache.compressedKV.dims[0], cache.compressedBlocks,
-                                           cache.compressedKV.dims[2]});
-            }
-            if (cache.indexK.dims.size() == 3 && cache.indexK.dims[1] > cache.compressedBlocks) {
-                cache.indexK.Resize({cache.indexK.dims[0], cache.compressedBlocks, cache.indexK.dims[2]});
+            for (Data *buffer : {&cache.compressedKV, &cache.indexK}) {
+                if (buffer->dims.size() != 3 || buffer->dims[1] <= cache.compressedBlocks) {
+                    continue;
+                }
+                const std::vector<int> dims = {buffer->dims[0], cache.compressedBlocks, buffer->dims[2]};
+                buffer->Resize(dims);
+                // CatDirect appends to each rank's local length on the next forward.
+                // Roll back those lengths along with the root metadata.
+                if (buffer->multiDeviceData) {
+                    for (auto &replica : buffer->multiDeviceDatas) {
+                        replica.second->Resize(dims);
+                    }
+                }
             }
             cache.rawTail = rem;
             if (rem > 0) {
                 AssertInFastLLM(scratch.rawKV[layer].dims.size() == 3 &&
                                 scratch.rawKV[layer].dims[1] >= total,
                                 "DeepSeekV41 DSpark: the compressor rollback buffer is too short.");
-                Data tail;
-                Split(scratch.rawKV[layer], 1, total - rem, total, tail);
-                cache.rawTailKV.CopyFrom(tail);
+                Split(scratch.rawKV[layer], 1, total - rem, total, cache.rawTailKV);
                 if (ratio > 1) {
-                    Data tailScore;
-                    Split(scratch.rawScore[layer], 1, total - rem, total, tailScore);
-                    cache.rawTailScore.CopyFrom(tailScore);
+                    Split(scratch.rawScore[layer], 1, total - rem, total, cache.rawTailScore);
                 }
             }
             AssertInFastLLM(cache.compressedBlocks == newLen / ratio,
@@ -1318,15 +1388,29 @@ namespace fastllm {
         }
 
         const double advanceStart = DsTick();
+        ApplyDsparkDevice();
 
         // 1) main_x = main_norm(main_proj(cat(mean_hc(h_37), mean_hc(h_38), mean_hc(h_39))))
         Data combined, tmp;
         for (size_t k = 0; k < scratch.mainHidden.size(); k++) {
+            Data localHidden;
+            Data *hidden = &scratch.mainHidden[k];
+#ifdef USE_CUDA
+            if (hidden->multiDeviceData) {
+                // Replicated tensors only carry shape metadata at the root.
+                // Read an actual rank buffer before entering the draft path.
+                AssertInFastLLM(MultiCudaCopyReplicaToCpu(localHidden, *hidden, v41DsparkTpDevices),
+                                "DeepSeekV41 DSpark: cannot read the target TP hidden state.");
+                // A bare {0} selects the bool overload and disables the upload.
+                localHidden.ToDevice(DataDevice::CUDA, std::vector<int>{v41DsparkTpDevices.front()});
+                hidden = &localHidden;
+            }
+#endif
             Data part;
-            if (rows == scratch.mainHidden[k].dims[1]) {
-                part.CopyFrom(scratch.mainHidden[k]);
+            if (rows == hidden->dims[1]) {
+                part.CopyFrom(*hidden);
             } else {
-                Split(scratch.mainHidden[k], 1, 0, rows, part);
+                Split(*hidden, 1, 0, rows, part);
             }
             if (k == 0) {
                 combined.CopyFrom(part);
@@ -1398,6 +1482,7 @@ namespace fastllm {
             return;
         }
         DsparkBuildMoeWeights();
+        ApplyDsparkDevice();
         const int dim = embed_dim;
         const int headDim = head_dim_full;
         const float softmaxScale = 1.0f / std::sqrt((float)headDim);
@@ -1464,7 +1549,7 @@ namespace fastllm {
         for (int stage = 0; stage < v41DsparkLayers; stage++) {
             const std::string pre = "mtp." + std::to_string(stage);
             const int layerId = std::max(0, block_cnt - v41DsparkLayers + stage);
-            ApplyDeviceMap(this->deviceMap, block_cnt, block_cnt);
+            ApplyDsparkDevice();
 
             DsHcMix(*curHidden, weight[pre + ".hc_attn_fn"], weight[pre + ".hc_attn_scale"],
                     weight[pre + ".hc_attn_base"], hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
@@ -1597,7 +1682,7 @@ namespace fastllm {
                               MoeGateSwiglu, false, swiglu_limit, true, nullptr,
                               quantizedLinearNames.count(pre + ".ffn.experts.0.w1.weight") ? 32 : 128,
                               quantizedLinearNames.count(pre + ".ffn.shared_experts.w1.weight") != 0);
-                ApplyDeviceMap(this->deviceMap, block_cnt, block_cnt);
+                ApplyDsparkDevice();
                 if (hasSharedExpertOut) {
                     ffnOut.ToDevice(sharedExpertOut.dataDevice);
                     AddTo(ffnOut, sharedExpertOut);
@@ -1618,7 +1703,11 @@ namespace fastllm {
         DsHcApplyPre(*curHidden, preMix, headHidden);       // confidence head 的输入（未归一化）
         Data normed, logits;
         DsRMSNormBF16(headHidden, weight[last + ".norm.weight"], rms_norm_eps, normed);
-        Linear(normed, weight["head.weight"], *GetEmptyData(), logits);
+        if (v41DsparkTpDevices.empty()) {
+            Linear(normed, weight["head.weight"], *GetEmptyData(), logits);
+        } else {
+            DsparkProjectHead(normed, logits);
+        }
         ToDataType(logits, DataType::FLOAT32);
 
         DsDraftTimingSlot().head = DsElapsed(headStart);

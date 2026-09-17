@@ -17,6 +17,9 @@
   CUDA_VISIBLE_DEVICES=1 PYTHONPATH=build/tools python test/basic/deepseek_v41_dspark.py \\
       --work-dir /root/v41-tiny-dspark --tokenizer-dir /root/v41-tokenizer \\
       --reference-dir /mnt/shared2/models/DeepSeek-V4.1-Flash/inference --regenerate
+
+双卡另用一个 work-dir，并加 --tp 2 --prefill 48 --decode 24（64 头、o_groups=8）。
+双卡夹具保留两半词表中均匀分布的输出候选，减少随机大词表的 BF16 并列。
 """
 
 import argparse
@@ -68,6 +71,8 @@ def parse_args():
     parser.add_argument("--dtype", default="float32")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--moe-device", default="cuda")
+    parser.add_argument("--tp", choices=("", "2"), default="",
+                        help="使用双卡主干 TP 验证 DSpark 及缓存回滚")
     parser.add_argument("--threads", type=int, default=16)
     parser.add_argument("--dspark-tokens", type=int, default=5)
     parser.add_argument("--regenerate", action="store_true")
@@ -80,9 +85,11 @@ def parse_args():
 
 # ---------------- checkpoint ----------------
 
-def build_tiny_config():
+def build_tiny_config(tp=False):
     tiny = dict(ref.TINY)
     tiny.update(DSPARK_TINY)
+    if tp:
+        tiny.update(n_heads=64, o_groups=8)
     n_layers = tiny["n_layers"]
     # 草稿层的 compress_ratio 必须是 0（纯滑窗注意力）
     tiny["compress_ratios"] = tuple(list(tiny["compress_ratios"]) + [0] * tiny["n_mtp_layers"])
@@ -160,6 +167,10 @@ def generate_checkpoint(args, tiny, engram_mod, model_mod, tokenizer):
             value = torch.randn(shape) * 0.5
         elif name == "head.weight":
             value = torch.randn(shape) * (1.0 / math.sqrt(shape[1]))
+            if args.tp:
+                # Keep the full head shape and candidates on both TP ranks,
+                # but avoid 129k random logits competing within a BF16 ULP.
+                value[torch.arange(shape[0]) % 512 != 0] = 0
         elif len(shape) == 2:
             value = torch.randn(shape) * (1.0 / math.sqrt(shape[1]))
         else:
@@ -206,6 +217,8 @@ def run_fastllm(args, prompt, decode_steps, want_logits=False):
     parser = make_normal_parser("v41 dspark")
     argv = ["--path", args.work_dir, "--dtype", args.dtype, "--device", args.device,
             "--moe_device", args.moe_device, "-t", str(args.threads)]
+    if args.tp:
+        argv += ["--tp", args.tp]
     # DSpark 走正式的启动参数（ftllm 的 --speculative_algorithm dspark --dspark N），
     # util.py 会清掉直接设置的 FASTLLM_DSPARK_TOKENS，所以不能只靠环境变量
     dspark = int(os.environ.get("V41_TEST_DSPARK_TOKENS", "0") or 0)
@@ -282,6 +295,8 @@ def run_child(args, prompt, decode_steps, env, want_logits=False):
                 "--reference-dir", args.reference_dir, "--dtype", args.dtype,
                 "--device", args.device, "--moe-device", args.moe_device,
                 "--threads", str(args.threads), "--child", base]
+        if args.tp:
+            argv += ["--tp", args.tp]
         result = subprocess.run(argv, env=child_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         text = result.stdout.decode("utf-8", "replace")
         if result.returncode != 0 or not os.path.exists(base + ".out"):
@@ -497,13 +512,19 @@ def main():
         print("PASS" if not problems else "")
         sys.exit(1 if problems else 0)
 
-    tiny = build_tiny_config()
+    tiny = build_tiny_config(bool(args.tp))
     need_generate = args.regenerate or not os.path.exists(os.path.join(args.work_dir, "model.safetensors"))
     if need_generate:
         from transformers import AutoTokenizer
         tokenizer_hf = AutoTokenizer.from_pretrained(args.tokenizer_dir)
         engram_mod, model_mod = ref.install_shims(args.reference_dir)
         generate_checkpoint(args, tiny, engram_mod, model_mod, tokenizer_hf)
+    if args.tp:
+        with open(os.path.join(args.work_dir, "config.json")) as f:
+            text_config = json.load(f)["text_config"]
+        assert text_config["num_attention_heads"] == tiny["n_heads"] and \
+            text_config["o_groups"] == tiny["o_groups"], \
+            "TP 测试需要 64 头、o_groups=8 的迷你模型，请加 --regenerate 重新生成"
     from tokenizers import Tokenizer
     tokenizer = Tokenizer.from_file(os.path.join(args.tokenizer_dir, "tokenizer.json"))
 

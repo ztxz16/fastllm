@@ -319,11 +319,22 @@ namespace fastllm {
                                                                              // OnResponseContextCreated 接管
         DeepSeekV41HistoryCacheManager v41HistoryCache;
 
-        // -------- 单 token decode 的 CUDA Graph --------
-        // 捕获的两段（见 ForwardSegments 里的说明）只读写权重与解码工作区，不碰任何
-        // 请求私有的 KV 缓存，因此整个模型共用一份图；状态自带互斥量，抢不到锁的并发
-        // 前向直接退回逐算子执行。
-        std::shared_ptr<void> v41CudaGraphSlot;
+        // -------- decode / DSpark 校验的 CUDA Graph --------
+        // 每种 token 数一份图与工作区，跨请求复用；KV 更新与回滚留在图外。
+        // 捕获和回放共用互斥量，抢不到锁的前向退回逐算子。
+        std::mutex v41CudaGraphMutex;
+        std::map<int, std::shared_ptr<void>> v41CudaGraphSlots;
+
+        // Retain tensor storage until this scope drains all TP ranks.
+        class ScopedTpDispatch {
+            bool enabled, previous = false;
+            const std::vector<int> &devices;
+        public:
+            ScopedTpDispatch(bool enabled, const std::vector<int> &devices);
+            ~ScopedTpDispatch();
+            ScopedTpDispatch(const ScopedTpDispatch &) = delete;
+            ScopedTpDispatch &operator=(const ScopedTpDispatch &) = delete;
+        };
 
         std::shared_ptr<DeepSeekV41RequestState> GetOrCreateState(
                 std::vector<std::pair<Data, Data> > &pastKeyValues, bool reset);
@@ -390,6 +401,7 @@ namespace fastllm {
         int v41DsparkTopk = 0;                // dspark_num_experts_per_tok
         float v41DsparkConfidenceThreshold = 0.0f;
         std::vector<int> v41DsparkTargetLayerIds;
+        std::vector<int> v41DsparkTpDevices;
         std::vector<char> v41IsDsparkTarget;  // [block_cnt]
         std::vector<std::vector<Data*> > v41DsparkMoeWeights, v41DsparkMoeBiass;
         std::atomic<long long> v41DsparkRounds{0};
@@ -398,6 +410,8 @@ namespace fastllm {
         std::atomic<long long> v41DsparkVerifyRounds{0};
 
         void InitDsparkParams();
+        void ApplyDsparkDevice();
+        void DsparkProjectHead(Data &input, Data &output);
         bool DsparkTensorNeeded(const std::string &name) const;
         // 支持贪心 / CUDA 采样及逐位置工具名、参数名约束
         bool DsparkSupportsRequest(const GenerationConfig &config,

@@ -7,6 +7,7 @@ exercise Engram, shared KV, both indexer stages and changing request lengths.
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -78,7 +79,11 @@ def main():
         if result.returncode == 77:
             raise SystemExit(77)
         result.check_returncode()
+        assert 'PASS: DSpark graph shapes 1..6, main features and rollback match across requests' in result.stdout
         assert 'decode CUDA graph captured:' in result.stdout, 'graph was not exercised'
+        for tokens in range(1, 7):
+            assert re.search(r'graph captured:.*tokens=%d\b' % tokens, result.stdout), 'missing graph shape %d' % tokens
+            assert 'graph replay: tokens=%d' % tokens in result.stdout, 'shape %d never replayed' % tokens
         assert 'giving up' not in result.stdout and 'graph disabled' not in result.stdout
 
 

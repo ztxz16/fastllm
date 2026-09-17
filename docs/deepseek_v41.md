@@ -52,7 +52,7 @@
 
 尚未实现：
 
-- CUDA Graph（V4 已有）；张量并行只覆盖主干，视觉编码器与 DSpark 草稿层仍是单卡；
+- 视觉编码器与 DSpark 草稿层的张量并行及 CUDA Graph；主干 decode / DSpark 校验已支持分段图；
 - DSpark 与批量 decode 的组合（批内不产生候选，只保持草稿缓存同步）、DSpark 与采样 / 图文请求的组合。
 
 ## Engram 元数据
@@ -214,7 +214,16 @@ TP 当前要求 `num_attention_heads / tp` 是 32 的倍数，以兼容 CUDA 稀
 TP=4 不满足。不满足时模型会打印一行说明并**整体退回单卡**（撤销注意力与 head 的 TP 权重注册，
 把 device map 改回 `cuda:<第一张卡>`），而不是做"只切 FFN"的半张量并行。
 
-视觉编码器（ViT + aligner）与 DSpark 草稿层还不是张量并行感知的，图文请求下视觉部分仍在单卡上算。
+视觉编码器（ViT + aligner）与 DSpark 草稿层仍在单卡上算。`--tp 2 --dspark 5` 可以组合使用：
+目标模型按上述方式张量并行，草稿层在第一张卡运行，共享的 `head.weight` 沿用两卡词表分片，
+完整 logits 汇总到第一张卡进行候选生成与校验。校验回滚同时截断两张卡上的缓存副本。
+
+TP 主模型特征传回草稿 GPU 时显式指定设备，避免 `ToDevice` 的布尔重载跳过上传；
+回归覆盖两种首卡顺序、预填充、不同接受长度及缓存副本一致性。
+
+组合优化的自由生成轨迹存在差异，真实模型端到端逐 token 一致性及标准精度评估尚未完成；
+算子、主特征传输、Graph 与 KV 回滚回归通过。
+
 
 ### 混合推理的 decode 调度
 
@@ -223,8 +232,11 @@ TP 的共享专家 gate/up 按中间维度切分，down 执行 all-reduce；路�
 保持 Graph 和段外算子使用的 GPU 地址稳定，并在采样前等待所有 logits 分片的生产完成。
 
 CPU 专家结果上传、共享结果相加与 HC post 在一次 worker 调用中执行，保留 AddTo 的中间舍入。
-单向量输入直接 D2H，CPU MoE 输出保持二维以复用 GPU 副本；每次上传覆盖新结果。
+普通单 token 和 DSpark verify 共用该路径。输入直接 D2H，CPU MoE 输出保持二维以复用 GPU 副本；每次上传覆盖新结果。
 不支持的布局、类型或设备使用原路径。同步 H2D 保证 CPU 源在回调返回后即可复用。
+
+DSpark 提交 KV 时复用同一套异步 TP 派发，在整轮提交结束后同步两张卡。
+部分接受时，截取的 KV 行保留到同步结束，避免逐层同步以及临时缓冲提前释放。
 这些优化不改变 prefill 的动态专家分配。
 
 比较 TP 与按层分卡时，应保持共享专家位置、CPU 线程、NUMA、KV 类型和 prefill 分块相同。
@@ -269,13 +281,13 @@ verify 始终计算全部候选位置。单 token decode 和 CUDA Graph 的执�
 这是**近似计算**：后段层的局部 attention 在保留窗口的起点截断，可能改变 logits，
 差异不局限于浮点舍入。开启后应按实际任务验证质量，并固定输入与 chunk 配置对比速度。
 
-## 单 token decode 的 CUDA Graph
+## decode 与 DSpark 校验的 CUDA Graph
 
 ```bash
 FASTLLM_DSV41_CUDA_GRAPH=1 ftllm server /path/to/DeepSeek-V4.1-Flash --device cuda --moe_device numa
 ```
 
-把单 token decode 里与位置无关的那部分 GPU 计算捕获成 CUDA Graph，一次启动代替上千次
+把 decode 和 DSpark 校验里与位置无关的那部分 GPU 计算捕获成 CUDA Graph，按 token 数分别缓存，减少
 kernel launch。**单卡有收益（省下每步上千次 launch），TP 下收益大得多**——multicuda 每个算子
 要唤醒两个 worker 并同步一次，进图之后这笔钱一次付清。
 
@@ -285,12 +297,11 @@ kernel launch。**单卡有收益（省下每步上千次 launch），TP 下收�
 | --- | --- | --- |
 | `FASTLLM_DSV41_CUDA_GRAPH` | 跟随 `FASTLLM_CUDA_GRAPH` | `1` 开、`0` 关。不设置时跟随全局开关 |
 | `FASTLLM_DSV41_CUDA_GRAPH_WARMUP` | 2 | 捕获前的预热轮数（让显存池、权重量化缓存达到稳态） |
-| `FASTLLM_DSV41_CUDA_GRAPH_DEBUG` | 关 | 打印捕获 / 失效 / 关闭事件 |
-| `FASTLLM_DSV41_CUDA_GRAPH_REPLAY_MASK` | 7 | 排查用：按位选择回放哪几种段（bit0 pre / bit1 post / bit2 route），其余走逐算子 |
+| `FASTLLM_DSV41_CUDA_GRAPH_DEBUG` | 关 | 打印捕获 / 首次重放的 token 数，以及失效 / 关闭事件 |
+| `FASTLLM_DSV41_CUDA_GRAPH_REPLAY_MASK` | 15 | 排查用：按位选择回放哪几种段（bit0 pre / bit1 post / bit2 route / bit3 sharedExpert），其余走逐算子 |
 | `FASTLLM_DSV41_CUDA_GRAPH_FAIL_AT` | 关 | 排查用：让第 N 段捕获强制失败，验证回退路径 |
 | `FASTLLM_DSV41_CUDA_GRAPH_INVALIDATE_EVERY` | 关 | 排查用：每 N 次回放强制失效一次，验证重捕获路径 |
 | `FASTLLM_DSV41_CUDA_GRAPH_FORCE_ROUTE_CAPTURE` | 关 | 排查用：强行捕获本来进不了图的路由，验证撞上非法同步 D2H 时的回退 |
-| `FASTLLM_DSV41_CUDA_GRAPH_ALLOW_PIPELINE` | 关 | 排查用：按层切分下强行开图（只会捕获失败后回退） |
 
 ### 捕获了什么、没捕获什么
 
@@ -299,7 +310,7 @@ kernel launch。**单卡有收益（省下每步上千次 launch），TP 下收�
 两级 indexer 的候选数随上下文增长、路由专家还可能落在 cpu / numa 上。这些"随 token 变化"的
 部分集中在每层的注意力核心与 MoE 两处。
 
-因此按层做**分段捕获**，每层捕获三段与 token 位置完全无关的纯 GPU 计算：
+因此按层做**分段捕获**，每层捕获四段与 token 位置完全无关的纯 GPU 计算：
 
 | 段 | 内容 |
 | --- | --- |
@@ -329,23 +340,22 @@ kernel launch。**单卡有收益（省下每步上千次 launch），TP 下收�
 
 只有同时满足下面全部条件的前向才会走图，其余一律逐算子执行：
 
-- 单请求、单片段、`seqlen == 1` 且 `startPos > 0`（即真正的单 token decode）；
+- 单请求、单片段、`startPos > 0`，且为单 token decode 或 DSpark 多 token 校验；
 - 单卡，或 multicuda 张量并行。**按层切分（`--device "{'cuda:0':1,'cuda:1':1}"`）不支持**：
   一段图只能属于一张卡，而按层切分下每层跑在不同的卡上，层间的跨卡拷贝在捕获期需要
-  预先建好的 NCCL 通信子。默认自动不启用；`FASTLLM_DSV41_CUDA_GRAPH_ALLOW_PIPELINE=1`
-  可以强行打开，但结果只会是捕获失败后回退到逐算子；
+  预先建好的 NCCL 通信子，因此按层切分时不启用图；
 - 纯文本（图像 token 走 CPU 参考路由，无法进图）；
-- 不是 DSpark 的多 token 校验前向（那是 `seqlen > 1`，形状不同）；
 - 模型主体确实跑在 CUDA / multicuda 上（`--device cpu` 时不启用）；
 - 没有开 `FASTLLM_DSV41_DUMP_DIR`、`FASTLLM_CUDA_SYNC`、`FASTLLM_PRINT_PROFILE`
   （它们会在捕获中插入 host 侧拷贝或同步）。
 
-开了 DSpark 时，校验前向逐算子执行、其间的单 token decode 仍然走图，两者可以共存。
-批量 decode（`batch > 1`）不走图。
+DSpark 校验按本轮 token 数（已确定的一个 token 加候选数）各自预热、捕获和重放，
+置信度截断或剩余输出长度变化时复用对应形状。目标层特征采集、KV 更新、回滚和草稿层仍在图外。
+批量 decode（`batch > 1`）和普通多 token prefill 不走图。
 
 ### 失效与回退
 
-- 整个模型共用一份图（图只碰权重与常驻解码工作区，不碰任何请求私有的缓存），
+- 整个模型按 token 数共用图与常驻工作区（不碰任何请求私有的缓存），
   并发前向用 `try_lock` 抢工作区，抢不到的直接逐算子执行；
 - 每次回放前核对全部边界张量的设备地址，任何一个搬了家（设备迁移、重新分配）就销毁重捕获，
   连续失效超过三次彻底关图；
@@ -721,7 +731,7 @@ token：第一个立刻返回，其余进入请求的待发队列，调度器之
 - 校验提交在首个 EOS / stop token 处截断，避免结束时缓存超出真实输出。
   请求若因长度上限在待发队列还没取完时结束，这一轮多算的 token 仍可能让缓存长度超过
   `allTokens`，该请求的前缀缓存记录会被跳过；
-- 尚未接入 CUDA Graph 与张量并行。
+- 支持与主干张量并行组合（`--tp 2`），草稿层仍在第一张卡运行；目标校验支持分段 CUDA Graph，草稿层仍逐算子执行。
 
 ### 实测
 
@@ -1074,7 +1084,8 @@ python test/basic/test_deepseek_v41_tp_graph.py --binary ./build/deepseekV41TpGr
 ```
 
 Graph fixture 需要 PyTorch、safetensors、numpy 和两张 CUDA GPU；覆盖不同长度的连续请求、
-eager / Graph 切换和共享专家重叠。`--hc-mult 2` 可补测两路 HC，默认四路。
+eager / Graph 切换和共享专家重叠，以及 DSpark 的 1～6 token 图重放、目标层特征与部分接受后的 KV 回滚。
+`--hc-mult 2` 可补测两路 HC，默认四路。
 算子回归检查通用路径与 decode 对齐、独立 CPU RMSNorm 参考、量化 KV、远端 logits 同步、
 缓冲复用、并发 Graph 及捕获期间临时空间不足时的回退。
 
@@ -1101,7 +1112,7 @@ eager / Graph 切换和共享专家重叠。`--hc-mult 2` 可补测两路 HC，�
 | `FASTLLM_DSV41_DUMP_DIR` | 把每层中间张量写到该目录（对齐调试） |
 | `FASTLLM_DSV41_DISABLE_TP_ATTENTION` | 张量并行时不切分注意力 head（排查用，注意力改为每卡各算一份） |
 | `FASTLLM_DSV41_DISABLE_TP_SHARED_EXPERT` | 张量并行时不切分共享专家（排查用） |
-| `FASTLLM_DSV41_CUDA_GRAPH` 等 | 单 token decode 的 CUDA Graph，见"单 token decode 的 CUDA Graph" |
+| `FASTLLM_DSV41_CUDA_GRAPH` 等 | decode 与 DSpark 校验的 CUDA Graph，见对应章节 |
 | `FASTLLM_TRACE_OPS` | 逐算子打印"算子名 / 落在哪个设备 / 权重名"（排查 TP 落点用） |
 | `FASTLLM_DSV41_DISABLE_PREFIX_CACHE` 等 | 前缀缓存相关，见"多请求与前缀缓存" |
 | `FASTLLM_DSPARK_*` | DSpark 投机解码相关，见"DSpark 投机解码" |
