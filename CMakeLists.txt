@@ -945,6 +945,12 @@ if (UNIT_TEST)
         endif()
 
 
+
+        add_executable(cuda_fp8_row_test test/basic/test_cuda_fp8_row.cu)
+        target_link_libraries(cuda_fp8_row_test PRIVATE fastllm)
+        set_target_properties(cuda_fp8_row_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME cuda_fp8_row COMMAND cuda_fp8_row_test)
+        set_tests_properties(cuda_fp8_row PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
         add_executable(cuda_rmsnorm_decode_test test/basic/test_cuda_rmsnorm_decode.cu)
         target_link_libraries(cuda_rmsnorm_decode_test PRIVATE fastllm)
         set_target_properties(cuda_rmsnorm_decode_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)

@@ -12,6 +12,8 @@
 #include <map>
 #include <mutex>
 #include <cuda_fp8.h>
+#include "devices/cuda/fastllm-fp8-row.cuh"
+#include <cstdlib>
 
 #ifdef __CUDACC__
 #include <cuda_bf16.h>
@@ -797,7 +799,64 @@ void LaunchFastllmGemmFp32FP8E4M3(float *input, uint8_t *weight, float *output, 
     }
 }
 
+// All capability checks precede the sole launch; an unsupported path leaves
+// output untouched and the caller continues through the established GEMV.
+template <class T, int Values>
+static bool CanRunFastllmRowFP8(const T *input, const uint8_t *weight, const T *output, const T *bias,
+                                const float *scales, int batch, int K, int N, int blockM, int blockK) {
+    const char *flag = std::getenv("FASTLLM_CUDA_FP8_ROW_GEMV");
+    if (flag && (!std::strcmp(flag, "0") || !std::strcmp(flag, "false")))
+        return false;
+    if (batch != 1 || K < 512 || K > 32768 || K % 512 || N < 4096 || blockM != K || blockK != 1 || !input ||
+        !weight || !output || !scales || reinterpret_cast<uintptr_t>(input) % 4 ||
+        reinterpret_cast<uintptr_t>(weight) % 16 || reinterpret_cast<uintptr_t>(output) % 2 ||
+        reinterpret_cast<uintptr_t>(scales) % 4 || (bias && reinterpret_cast<uintptr_t>(bias) % 2))
+        return false;
+    auto overlaps = [](const void *a, size_t as, const void *b, size_t bs) {
+        uintptr_t x = reinterpret_cast<uintptr_t>(a), y = reinterpret_cast<uintptr_t>(b);
+        return x < y + bs && y < x + as;
+    };
+    if (overlaps(output, size_t(N) * 2, input, size_t(K) * 2) ||
+        overlaps(output, size_t(N) * 2, weight, size_t(N) * K) ||
+        overlaps(output, size_t(N) * 2, scales, size_t(N) * 4) ||
+        (bias && overlaps(output, size_t(N) * 2, bias, size_t(N) * 2)))
+        return false;
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess)
+        return false;
+    static thread_local std::map<int, bool> available;
+    auto it = available.find(device);
+    if (it == available.end()) {
+        cudaFuncAttributes attr{};
+        auto status = cudaFuncGetAttributes(&attr, fastllm::fp8row::Kernel<T, 8, 1, 2, Values>);
+        if (status != cudaSuccess)
+            cudaGetLastError();
+        it = available.emplace(device, status == cudaSuccess && attr.maxThreadsPerBlock >= 256).first;
+    }
+    return it->second;
+}
+template <class T>
+static bool TryFastllmRowFP8(T *input, uint8_t *weight, T *output, T *bias, float *scales, int batch, int K,
+                             int N, int blockM, int blockK) {
+    if (N >= 131072) {
+        if (!CanRunFastllmRowFP8<T, 8>(input, weight, output, bias, scales, batch, K, N, blockM, blockK))
+            return false;
+        fastllm::fp8row::Kernel<T, 8, 1, 2, 8>
+            <<<(N + 7) / 8, 256>>>(input, weight, scales, bias, output, K, N);
+    } else {
+        if (!CanRunFastllmRowFP8<T, 16>(input, weight, output, bias, scales, batch, K, N, blockM, blockK))
+            return false;
+        fastllm::fp8row::Kernel<T, 8, 1, 2, 16>
+            <<<(N + 7) / 8, 256>>>(input, weight, scales, bias, output, K, N);
+    }
+    return true;
+}
+
 void LaunchFastllmGemmFp16FP8E4M3(half *input, uint8_t *weight, half *output, half *bias, float *scales, int n, int m, int k, int blockM, int blockK) {
+    if (TryFastllmRowFP8(input, weight, output, bias, scales, n, m, k, blockM, blockK)) {
+        return;
+    }
+
     // m 不是 16 的倍数时, 无法安全使用 uint4 向量化加载, 回退到旧 kernel。
     if ((m & 15) != 0) {
         const bool exactRows = n > 1 &&
@@ -1993,6 +2052,10 @@ static void LaunchFastllmGemmBF16FP8E4M3SmallBatch(
 }
 
 void LaunchFastllmGemmBF16FP8E4M3(__nv_bfloat16 *input, uint8_t *weight, __nv_bfloat16 *output, __nv_bfloat16 *bias, float *scales, int n, int m, int k, int blockM, int blockK) {
+    if (TryFastllmRowFP8(input, weight, output, bias, scales, n, m, k, blockM, blockK)) {
+        return;
+    }
+
     if (n > 1 &&
         n < fastllm::FastllmCudaGetLinearExactBatchThreshold()) {
         if (n <= 65535) {
