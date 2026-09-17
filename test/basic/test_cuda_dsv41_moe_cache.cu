@@ -573,7 +573,37 @@ int main(int argc, char **argv) {
                 index.ToDevice(DataDevice::CUDA, {device}, true);
                 scores.ToDevice(DataDevice::CUDA, {device}, true);
                 FastllmCudaSetDevice(device);
+                Data parallelOutput(FLOAT32, {1});
+                parallelOutput.ToDevice(DataDevice::CUDA, {device}, false);
+                parallelOutput.Allocate(false);
+                cudaGraph_t parallelGraph;
+                cudaGraphExec_t parallelExec;
+                Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+                Check(cudaMemsetAsync(parallelOutput.cudaData, 0, parallelOutput.GetBytes(), cudaStreamPerThread));
+                Check(cudaStreamEndCapture(cudaStreamPerThread, &parallelGraph));
+                Check(cudaGraphInstantiate(&parallelExec, parallelGraph, nullptr, nullptr, 0));
+                auto runVerify = [&](bool parallel = true) {
+                    int callbacks = 0;
+                    Data replicaView;
+                    replicaView.FakeFrom(bx, 0);
+                    replicaView.Resize(bx.dims);
+                    replicaView.dataDeviceIds = {device};
+                    auto launchParallel = [&] {
+                        ++callbacks;
+                        Check(cudaGraphLaunch(parallelExec, cudaStreamPerThread));
+                        if (dual) Check(cudaSetDevice(1 - device));
+                    };
+                    const bool accepted = FastllmCudaMergeMOEHybrid(replicaView, bi, bs, verifyOutput,
+                        weights[t].data(), weights[t].size(), t,
+                        parallel ? std::function<void()>(launchParallel) : std::function<void()>());
+                    Require(callbacks == (accepted && parallel ? 1 : 0), "verify parallel handoff count mismatch");
+                    int current;
+                    Check(cudaGetDevice(&current));
+                    Require(current == device, "verify callback changed cache output device");
+                    return accepted;
+                };
                 auto checkResult = [&] {
+                    Require(verifyOutput.dims == std::vector<int>({rows, hidden}), "verify output lost rows");
                     std::vector<__nv_bfloat16> result(rows * hidden);
                     Check(cudaMemcpy(result.data(), verifyOutput.cudaData, result.size() * 2, cudaMemcpyDeviceToHost));
                     for (size_t c = 0; c < actual.size(); ++c)
@@ -583,13 +613,12 @@ int main(int argc, char **argv) {
                 };
                 setenv("FASTLLM_DSV41_MOE_CACHE_MODE", "hybrid", 1);
                 setenv("FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS", "0", 1);
-                Require(!FastllmCudaMergeMOEHybrid(bx, bi, bs, verifyOutput, weights[t].data(), weights[t].size(), t),
+                Require(!runVerify(),
                         "verify all-CPU fallback rejected");
                 if (pass == 0) {
                     setenv("FASTLLM_DSV41_MOE_CACHE_PREFETCH", "1", 1);
                     for (int repeat = 0; repeat < 3; ++repeat) {
-                        if (FastllmCudaMergeMOEHybrid(bx, bi, bs, verifyOutput, weights[t].data(), weights[t].size(),
-                                                      t)) {
+                        if (runVerify()) {
                             checkResult();
                             ++admissionChecks;
                         }
@@ -597,7 +626,7 @@ int main(int argc, char **argv) {
                     setenv("FASTLLM_DSV41_MOE_CACHE_PREFETCH", "0", 1);
                 }
                 setenv("FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS", "15", 1);
-                if (FastllmCudaMergeMOEHybrid(bx, bi, bs, verifyOutput, weights[t].data(), weights[t].size(), t))
+                if (runVerify())
                     checkResult();
                 // Seed all ten experts through the ordinary pure-cache path;
                 // every selected verify group must now be resident.
@@ -617,27 +646,32 @@ int main(int argc, char **argv) {
                 for (const char *split : {"1", "3", "15"}) {
                     setenv("FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS", split, 1);
                     for (int repeat = 0; repeat < 2; ++repeat) {
-                        Require(FastllmCudaMergeMOEHybrid(bx, bi, bs, verifyOutput, weights[t].data(),
-                                                          weights[t].size(), t),
+                        Check(cudaMemsetAsync(parallelOutput.cudaData, 0xff, parallelOutput.GetBytes(), cudaStreamPerThread));
+                        Require(runVerify(repeat == 0),
                                 "resident verify rejected");
                         checkResult();
+                        float parallelValue;
+                        Check(cudaMemcpy(&parallelValue, parallelOutput.cudaData, sizeof(float), cudaMemcpyDeviceToHost));
+                        Require(repeat == 0 ? parallelValue == 0 : std::isnan(parallelValue),
+                                "verify parallel graph execution mismatch");
                     }
                 }
                 bx.dataType = FLOAT16;
-                Require(!FastllmCudaMergeMOEHybrid(bx, bi, bs, verifyOutput, weights[t].data(), weights[t].size(), t),
+                Require(!runVerify(),
                         "verify wrong dtype accepted");
                 bx.dataType = BFLOAT16;
                 bx.dims[0] = bi.dims[0] = bs.dims[0] = 9;
-                Require(!FastllmCudaMergeMOEHybrid(bx, bi, bs, verifyOutput, weights[t].data(), weights[t].size(), t),
+                Require(!runVerify(),
                         "verify oversized batch accepted");
                 bx.dims[0] = bi.dims[0] = bs.dims[0] = rows;
                 Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
-                const bool captureAccepted =
-                    FastllmCudaMergeMOEHybrid(bx, bi, bs, verifyOutput, weights[t].data(), weights[t].size(), t);
+                const bool captureAccepted = runVerify();
                 cudaGraph_t graph;
                 Check(cudaStreamEndCapture(cudaStreamPerThread, &graph));
                 Check(cudaGraphDestroy(graph));
                 Require(!captureAccepted, "verify capture accepted");
+                Check(cudaGraphExecDestroy(parallelExec));
+                Check(cudaGraphDestroy(parallelGraph));
             }
         }
         Require(admissionChecks > 0, "verify admission overlap was not exercised");

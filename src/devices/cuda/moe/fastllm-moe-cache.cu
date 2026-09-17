@@ -1707,7 +1707,8 @@ __global__ void LookupVerifyRoutes(const int32_t *indices, const int32_t *keys, 
 }
 
 bool TryV41VerifyHybrid(const fastllm::Data &input, const fastllm::Data &index, const fastllm::Data &score,
-                        fastllm::Data &output, fastllm::Data **weights, int weightsBatch, int layer) {
+                        fastllm::Data &output, fastllm::Data **weights, int weightsBatch, int layer,
+                        const std::function<void()> &launchParallel) {
     if (!SupportedCacheInput(input) || input.dataType != fastllm::DataType::BFLOAT16 || input.dims[0] < 2 ||
         input.dims[0] > kMaxVerifyRows || !PackedCacheRows(index) || index.dims[0] != input.dims[0] ||
         index.dims[1] < 1 || index.dims[1] > kMaxTopK || index.dataType != fastllm::DataType::INT32 ||
@@ -1921,6 +1922,12 @@ bool TryV41VerifyHybrid(const fastllm::Data &input, const fastllm::Data &index, 
         w.previousPrefetch = true;
         ++w.admissions;
     }
+    // Finish routing reads and all fallback decisions before launching TP
+    // shared experts; their GPU work can overlap the remaining NUMA subset.
+    if (launchParallel) {
+        launchParallel();
+        checkCudaErrors("Verify restore device", cudaSetDevice(cache->device));
+    }
     const auto start = HybridNowUs();
     fastllm::NumasMoeVerifyExperts(hostInput, cpu, rows, weights, weightsBatch, ids, gpuIds, scores, topk, layer,
                                    layout.swigluLimit, gpu > 0);
@@ -1951,9 +1958,8 @@ bool FastllmCudaMergeMOEHybrid(const fastllm::Data &input,
         fastllm::Data &output, fastllm::Data **weights, int weightsBatch, int layer,
         const std::function<void()> &launchParallel) {
 #ifdef USE_NUMAS
-    if (launchParallel && (input.dims.size() != 2 || input.dims[0] != 1)) return false;
     if (input.dims.size() == 2 && input.dims[0] > 1)
-        return TryV41VerifyHybrid(input, index, score, output, weights, weightsBatch, layer);
+        return TryV41VerifyHybrid(input, index, score, output, weights, weightsBatch, layer, launchParallel);
     cudaStreamCaptureStatus capturing;
     if (cudaStreamIsCapturing(cudaStreamPerThread, &capturing) != cudaSuccess ||
         capturing != cudaStreamCaptureStatusNone) return false;

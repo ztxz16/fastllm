@@ -143,14 +143,22 @@ int main(int argc, char **argv) {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < 2) return 77;
     try {
-        if (argc != 2) throw std::runtime_error("usage: deepseekV41TpGraphRegression FIXTURE_DIR");
+        const bool expertCache = argc == 3 && std::string(argv[2]) == "--expert-cache";
+        if (argc != 2 && !expertCache)
+            throw std::runtime_error("usage: deepseekV41TpGraphRegression FIXTURE_DIR [--expert-cache]");
         unsetenv("FASTLLM_DSV41_CUDA_GRAPH");
         setenv("FASTLLM_DSV41_DISABLE_SHARED_OVERLAP", "1", 1);
         SetCudaGraph(false);
         SetThreads(2);
         SetCudaSharedExpert(true);
         SetDeviceMap({{"multicuda:0,1", 1}});
-        SetMoeDeviceMap({{"cpu", 1}});
+        SetMoeDeviceMap({{expertCache ? "numa" : "cpu", 1}});
+        if (expertCache) {
+            SetMoeCudaCacheBytes(16ULL << 20);
+            // Keep the split deterministic while testing graph replay and KV.
+            setenv("FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS", "2", 1);
+            setenv("FASTLLM_DSV41_MOE_CACHE_PREFETCH", "0", 1);
+        }
         auto base = CreateLLMModelFromHF(argv[1], DataType::FLOAT16);
         auto &model = dynamic_cast<DeepSeekV41Model &>(*base);
         // Initialize weight shards and kernel plans before comparing dispatch.

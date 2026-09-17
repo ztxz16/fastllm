@@ -4421,7 +4421,8 @@ namespace fastllm {
             };
             bool tpCacheHandled = false;
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
-            if (tp && FastllmCudaMoeCacheRequested() && single && seqlen == 1 && !dumpDebug && hasSharedExpertOut &&
+            if (tp && FastllmCudaMoeCacheRequested() && single &&
+                (seqlen == 1 || (dsparkVerify && seqlen <= 8)) && !dumpDebug && hasSharedExpertOut &&
                 !V41ReferenceMathEnabled() &&
                 moeWeights[0] == nullptr && moeWeights[1] == nullptr &&
                 V41DeviceSpecUsesType(SelectMoeDeviceForLayer(layer), "numa") &&
@@ -4442,13 +4443,13 @@ namespace fastllm {
                     cache.score.ToDevice(DataDevice::CUDA, {cacheDevice}, true);
                     Data input;
                     input.FakeFrom(*local->second, 0);
-                    input.Resize({1, dim});
+                    input.Resize({seqlen, dim});
                     input.dataDeviceIds = {cacheDevice};
                     tpCacheHandled = FastllmCudaMergeMOEHybrid(input, cache.index, cache.score, cache.output,
                         moeWeights.data(), (int)moeWeights.size(), layer, runSharedSegment);
                     if (tpCacheHandled) {
                         // Keep the CPU buffer and its GPU replicas reusable.
-                        // This portable 10 KiB staging copy also completes the
+                        // This staging copy also completes the
                         // cache producer before the joint AddTo/HcPost dispatch.
                         if (ffnOut.dataDevice != DataDevice::CPU || ffnOut.dataType != input.dataType ||
                             ffnOut.expansionBytes < cache.output.GetBytes()) {
@@ -4459,7 +4460,7 @@ namespace fastllm {
                             ffnOut.dataType = input.dataType;
                             ffnOut.UpdateUnitSize();
                         }
-                        ffnOut.Resize({1, dim});
+                        ffnOut.Resize({seqlen, dim});
                         ffnOut.Allocate(false);
                         FastllmCudaCopyFromDeviceToHost(ffnOut.cpuData, cache.output.cudaData, cache.output.GetBytes());
                     }

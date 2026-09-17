@@ -1138,7 +1138,7 @@ eager / Graph 切换和共享专家重叠，以及 DSpark 的 1～6 token 图重
 
 ## DSpark 与专家缓存验证
 
-CUDA + NUMA 混合专家缓存会自动处理 2–8 行 verify，配置和命中率口径见
+CUDA + NUMA 混合专家缓存会自动处理 2–8 行 verify，包含 TP + CUDA Graph 路径，配置和命中率口径见
 [CUDA 专家缓存](cuda-expert-cache.md#deepseek-v41)。HC mix 支持 1–8 行小批量；
 WoA 对小于 16 行的批次复用权重，保持各输出的累加顺序，其他形状走已有路径。
 草稿的稠密层、路由专家、共享专家与 HC post 复用主干的量化和 BF16 舍入语义。
@@ -1146,5 +1146,7 @@ WoA 对小于 16 行的批次复用权重，保持各输出的累加顺序，其
 `deepseekV41SamplingRegression` 检查实际 CUDA 拒绝采样器的输出分布、部分拒绝、
 bonus token 和缓存回滚；`deepseekV41OpsRegression` 检查小批量算子与原归约路径；
 `cuda_dsv41_moe_cache_test --dual` 检查独立数值参考和跨卡缓存切换。
+`test/basic/test_deepseek_v41_tp_graph.py --binary build-fastllm/deepseekV41TpGraphRegression --expert-cache`
+使用 NVFP4 专家检查 TP verify 缓存、1–6 行 Graph 重放、主模型特征与 KV 回滚。
 编程模板在 top-p 截断后可能只剩一个候选，因此高接受率本身不能证明使用了贪心验证；
 评估时应记录采样参数、拒绝轮数和代码功能结果，分别检查采样校正与前向浮点误差。
