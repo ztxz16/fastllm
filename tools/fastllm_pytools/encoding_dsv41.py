@@ -539,6 +539,7 @@ def render_message(
     thinking_mode: str,
     drop_thinking: bool = True,
     reasoning_effort: Union[str, int, None] = None,
+    tool_history=None,
 ) -> str:
     """
     Render a single message at the given index into its V4.1 encoded string form.
@@ -645,7 +646,14 @@ def render_message(
             else:
                 thinking_part = ""
 
-        if wo_eos:
+        # Only server-recorded output with matching call IDs and semantics is
+        # eligible. Client-supplied private fields never override the template.
+        raw = (tool_history.restore(msg, thinking=thinking_mode == "thinking")
+               if tool_history is not None and (thinking_mode == "chat" or thinking_part)
+               else None)
+        if raw is not None:
+            prompt += raw + ("" if wo_eos else eos_token)
+        elif wo_eos:
             prompt += assistant_msg_wo_eos_template.format(
                 reasoning=thinking_part,
                 content=summary_content,
@@ -725,6 +733,7 @@ def _encode_messages_text(
     drop_thinking: bool = True,
     add_default_bos_token: bool = True,
     reasoning_effort: Union[str, int, None] = None,
+    tool_history=None,
 ) -> str:
     """Encode preprocessed (text-only) messages into the V4.1 prompt format."""
     context = context if context else []
@@ -760,6 +769,7 @@ def _encode_messages_text(
             thinking_mode=thinking_mode,
             drop_thinking=effective_drop_thinking,
             reasoning_effort=reasoning_effort,
+            tool_history=tool_history,
         )
 
     return prompt
@@ -773,6 +783,7 @@ def encode_messages(
     add_default_bos_token: bool = True,
     reasoning_effort: Union[str, int, None] = None,
     return_multi_modal_data: bool = False,
+    tool_history=None,
 ) -> Any:
     """Encode text or multimodal messages into the DeepSeek-V4.1 prompt format.
 
@@ -789,6 +800,7 @@ def encode_messages(
         drop_thinking=drop_thinking,
         add_default_bos_token=add_default_bos_token,
         reasoning_effort=reasoning_effort,
+        tool_history=tool_history,
     )
     if return_multi_modal_data:
         return prompt, {"images": images}

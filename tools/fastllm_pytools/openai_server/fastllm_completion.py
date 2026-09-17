@@ -3347,6 +3347,7 @@ class FastLLmCompletion:
            logging.info(f"Abort request: {request_id}")
            return self.create_error_response("Client disconnected")
 
+      history_raw = result
       if self._is_kimi_k3_model():
           if emit_reasoning_content:
               result, reasoning_content = self._split_kimi_k3_reasoning(
@@ -3383,6 +3384,11 @@ class FastLLmCompletion:
           return tool_call_info
 
       if tool_call_info.tools_called:
+          remember = getattr(self.model, "remember_deepseek_v41_tool_output", None)
+          if callable(remember):
+              remember(history_raw if emit_reasoning_content else result, tool_call_info.content,
+                       [call.model_dump(exclude_none=True) for call in tool_call_info.tool_calls],
+                       thinking=emit_reasoning_content, reasoning_content=reasoning_content)
           choice_data = ChatCompletionResponseChoice(
               index=0,
               message=ChatMessage(
@@ -3507,6 +3513,12 @@ class FastLLmCompletion:
         current_token_ids = []
         previous_text = ""
         current_text = ""
+        remember = (getattr(self.model, "remember_deepseek_v41_tool_output", None)
+                    if request.tools and self._is_deepseek_v41_model() else None)
+        history_content = ""
+        history_tool_calls = []
+        history_raw_parts = []
+        history_reasoning_parts = []
         reasoning_format = "kimi_k3" if self._is_kimi_k3_model() else "think"
         reasoning_state = {
             "active": emit_reasoning_content,
@@ -3525,11 +3537,15 @@ class FastLLmCompletion:
         async for res in result_generator:
             res = self._normalize_model_delta(res)
             completion_tokens += 1
+            if remember:
+                history_raw_parts.append(res)
             delta_text = res
 
             reasoning_delta_messages, delta_text = self._consume_tagged_reasoning_delta(
                 delta_text, reasoning_state)
             for reasoning_delta_message in reasoning_delta_messages:
+                if remember:
+                    history_reasoning_parts.append(reasoning_delta_message.reasoning_content or "")
                 choice_data = ChatCompletionResponseStreamChoice(
                     index = 0,
                     delta = reasoning_delta_message,
@@ -3573,6 +3589,9 @@ class FastLLmCompletion:
                                 current_token_ids = current_token_ids,
                                 delta_token_ids = now_ids)
 
+                if remember:
+                    history_content += parse_result.content or ""
+                    history_tool_calls.extend(call.model_dump(exclude_none=True) for call in parse_result.valid_tool_calls)
                 previous_text += delta_text
                 previous_token_ids += now_ids
                 if parse_result.has_invalid_tool_block:
@@ -3750,6 +3769,11 @@ class FastLLmCompletion:
         if (final_stream_error_data is None and request.tools
                 and tool_call_parser):
             flush_result = tool_call_parser.flush_stream_tool_calls()
+            if remember and finish_reason == 'tool_calls':
+                history_content += flush_result.content or ""
+                history_tool_calls.extend(call.model_dump(exclude_none=True) for call in flush_result.valid_tool_calls)
+                remember("".join(history_raw_parts), history_content, history_tool_calls,
+                         thinking=emit_reasoning_content, reasoning_content="".join(history_reasoning_parts))
             if flush_result.content or flush_result.valid_tool_calls:
                 delta_message = DeltaMessage(
                     content = flush_result.content,

@@ -82,6 +82,7 @@ class DeepSeekV41ToolParser(ToolParser):
         self.streamed_args_for_tool: list[str] = []
         self.current_tool_index: int = 0
         self._sent_content_idx: int = 0
+        self._stream_text: str = ""
         self.tool_call_start_tokens = [
             self.tool_call_start_token,
             self.alt_tool_call_start_token,
@@ -142,6 +143,15 @@ class DeepSeekV41ToolParser(ToolParser):
             if text.find(token) >= 0
         ]
         return min(positions) if positions else -1
+
+    @staticmethod
+    def _content_end(text: str, tool_start: int) -> int:
+        # The official encoder owns the two-newline separator before DSML.
+        # Returning it as assistant content duplicates it on the next turn,
+        # changing the token prefix and invalidating the V4.1 KV snapshot.
+        if tool_start >= 2 and text[tool_start - 2:tool_start] == "\n\n":
+            return tool_start - 2
+        return tool_start
 
     def _extract_with_official_parser(
         self,
@@ -228,7 +238,7 @@ class DeepSeekV41ToolParser(ToolParser):
                 return ExtractedToolCallInformation(
                     tools_called=False, tool_calls=[], content=model_output)
 
-            content = model_output[:first_tool_idx] if first_tool_idx > 0 else None
+            content = model_output[:self._content_end(model_output, first_tool_idx)] or None
             return ExtractedToolCallInformation(
                 tools_called=True, tool_calls=tool_calls, content=content)
         except Exception:
@@ -239,6 +249,7 @@ class DeepSeekV41ToolParser(ToolParser):
     def _reset_streaming_state(self):
         self.current_tool_index = 0
         self._sent_content_idx = 0
+        self._stream_text = ""
         self.prev_tool_call_arr.clear()
         self.streamed_args_for_tool.clear()
 
@@ -278,14 +289,27 @@ class DeepSeekV41ToolParser(ToolParser):
             overlap = _partial_tags_overlap(
                 current_text, self.tool_call_start_tokens)
             sendable_idx = len(current_text) - overlap
+            # Hold at most two newlines, including when the following tag is
+            # split across chunks. Plain-text endings are flushed at EOF.
+            pending_start = sendable_idx
+            while (sendable_idx > 0 and pending_start - sendable_idx < 2
+                   and current_text[sendable_idx - 1] == "\n"):
+                sendable_idx -= 1
         else:
-            sendable_idx = first_tool_idx
+            sendable_idx = self._content_end(current_text, first_tool_idx)
 
         if sendable_idx > self._sent_content_idx:
             content = current_text[self._sent_content_idx:sendable_idx]
             self._sent_content_idx = sendable_idx
             return content
         return None
+
+    def flush_streaming_content(self) -> Optional[str]:
+        if self._find_tool_call_start(self._stream_text) >= 0:
+            return None
+        content = self._stream_text[self._sent_content_idx:]
+        self._sent_content_idx = len(self._stream_text)
+        return content or None
 
     def extract_tool_calls_streaming(
         self,
@@ -300,6 +324,7 @@ class DeepSeekV41ToolParser(ToolParser):
         if not previous_text:
             self._reset_streaming_state()
 
+        self._stream_text = current_text
         content = self._extract_content(current_text)
         delta_tool_calls = self._extract_delta_tool_calls(current_text)
 

@@ -1664,6 +1664,18 @@ class model:
         except Exception:
             return False
 
+    def remember_deepseek_v41_tool_output(self, raw, content, tool_calls,
+                                          thinking=False, reasoning_content=None):
+        if not self._is_deepseek_v41():
+            return
+        if not hasattr(self, "_deepseek_v41_tool_history"):
+            from ftllm.deepseek_v41_history import ToolHistory
+            self._deepseek_v41_tool_history = ToolHistory()
+        self._deepseek_v41_tool_history.remember(raw, {
+            "content": content, "tool_calls": tool_calls,
+            "reasoning_content": reasoning_content,
+        }, thinking=thinking)
+
     def _deepseek_encode_messages(self, reasoning_effort = None):
         """返回与当前模型版本匹配的官方 encode_messages（V4.1 的 DSML 标签与 V4 不同）。
 
@@ -1672,10 +1684,9 @@ class model:
         """
         if self._is_deepseek_v41():
             from ftllm.encoding_dsv41 import encode_messages
-            if reasoning_effort is not None:
-                return functools.partial(
-                    encode_messages, reasoning_effort = reasoning_effort)
-            return encode_messages
+            return functools.partial(
+                encode_messages, reasoning_effort=reasoning_effort,
+                tool_history=getattr(self, "_deepseek_v41_tool_history", None))
         from ftllm.encoding_dsv4 import encode_messages
         return encode_messages
 

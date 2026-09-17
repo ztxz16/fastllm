@@ -241,6 +241,9 @@ def run_streaming(text, chunk_size):
                 tool_calls.append(
                     (call.function.name, json.loads(call.function.arguments)))
         previous = current
+    pending = parser.flush_streaming_content()
+    if pending:
+        content_parts.append(pending)
     return "".join(content_parts), tool_calls
 
 
@@ -254,7 +257,7 @@ def test_streaming_every_chunk_size():
     for chunk_size in list(range(1, 12)) + [17, 33, 64, len(text)]:
         content, streamed = run_streaming(text, chunk_size)
         assert streamed == calls, f"chunk_size={chunk_size}: {streamed}"
-        assert content.startswith("稍等，我查一下。"), (
+        assert content == "稍等，我查一下。", (
             f"chunk_size={chunk_size}: {content!r}")
         # 工具调用块本身绝不能作为 content 流出去
         assert dsml_token not in content, f"chunk_size={chunk_size}"
@@ -283,9 +286,43 @@ def test_streaming_partial_start_tag_is_not_leaked():
 def test_streaming_matches_non_streaming():
     calls = [("记录", {"标题": "中文", "payload": {"a": [1, 2]}})]
     text = build_completion(calls, summary="好的")
-    _, streamed = run_streaming(text, 2)
+    content, streamed = run_streaming(text, 2)
     info = make_parser().extract_tool_calls(text, make_request())
     assert streamed == parsed_calls(info)
+    assert content == info.content
+
+
+def test_tool_separator_roundtrip():
+    calls = [("lookup", {"query": "value", "limit": 2})]
+    # Native decoding also emits the ASCII spelling. That takes the tolerant
+    # parser path; both paths must exclude exactly the template separator.
+    for summary in ("", "Checking.", "Checking.\n", "Checking.\n\n", "Checking.\n\n\n"):
+        canonical = build_completion(calls, summary=summary, with_eos=False)
+        for text in (canonical, canonical.replace(dsml_token, "\\DSML\\")):
+            info = make_parser().extract_tool_calls(text, make_request())
+            assert (info.content or "") == summary
+            assert parsed_calls(info) == calls
+            # Rendering parsed content must reproduce the original completion,
+            # including intentional newlines that precede the separator.
+            assert build_completion(parsed_calls(info), summary=info.content or "",
+                                    with_eos=False) == canonical
+            for chunk_size in (1, 2, 3, 7, 17, len(text)):
+                content, streamed = run_streaming(text, chunk_size)
+                assert content == summary, (summary, chunk_size, repr(content))
+                assert streamed == calls
+
+
+def test_streaming_plain_trailing_newlines_flush():
+    for text in ("answer\n", "answer\n\n", "answer\n\n\n", "\n\n", "answer\n\nnext"):
+        for chunk_size in (1, 2, 7, len(text)):
+            content, calls = run_streaming(text, chunk_size)
+            assert content == text
+            assert calls == []
+    parser = make_parser()
+    parser.extract_tool_calls_streaming("", "answer\n\n", "answer\n\n",
+                                        [0], [0], [0], make_request())
+    assert parser.flush_streaming_content() == "\n\n"
+    assert parser.flush_streaming_content() is None
 
 
 # ------------------------------------------------------------------
