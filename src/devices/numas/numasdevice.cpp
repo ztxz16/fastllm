@@ -665,6 +665,36 @@ namespace fastllm {
     static void QuantizeNumasV41Input(uint8_t *input, DataType type, int rows, int columns) {
         AssertInFastLLM(type == DataType::BFLOAT16 || type == DataType::FLOAT32 || type == DataType::FLOAT16,
                         "V4.1 NUMA activation quantization requires floating point input.\n");
+        if (type == DataType::BFLOAT16 && rows > 1 && columns >= 1024 &&
+            (int64_t)rows * columns >= 8192 && columns % 32 == 0) {
+            // Each block has its own scale. Split only at block boundaries so
+            // verify rows keep exactly the scalar quantizer's BF16 results.
+            // Small inputs stay serial to avoid worker dispatch overhead.
+            struct QuantizeOp : MultiThreadBaseOp {
+                uint16_t *values = nullptr;
+                int count = 0;
+                void Run() override {
+                    QuantizeDeepSeekV4FP8ActivationBFloat16(values, count, 32);
+                }
+            };
+            const int blocks = rows * columns / 32;
+            const int threads = std::min(GetNumaConfig()->threads, blocks / 32);
+            if (threads > 1) {
+                static thread_local std::vector<QuantizeOp> ops;
+                ops.resize(threads);
+                const int per = (blocks + threads - 1) / threads;
+                auto *pool = GetAlivePool();
+                for (int i = 0; i < threads; ++i) {
+                    const int start = std::min(i * per, blocks);
+                    const int end = std::min(start + per, blocks);
+                    ops[i].values = (uint16_t*)input + start * 32;
+                    ops[i].count = (end - start) * 32;
+                    pool->PushOp(i, &ops[i]);
+                }
+                for (int i = 0; i < threads; ++i) pool->Wait(i);
+                return;
+            }
+        }
         std::vector<float> row(type == DataType::BFLOAT16 ? 0 : columns);
         for (int r = 0; r < rows; ++r) {
             if (type == DataType::BFLOAT16) {

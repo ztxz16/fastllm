@@ -13771,7 +13771,8 @@ namespace {
             fastllm::DataDevice *mergeOutputDevice = nullptr,
             bool keepCudaInputMirror = false,
             int cudaInputDevice = -1,
-            bool prefetchCudaInput = false) {
+            bool prefetchCudaInput = false,
+            int activationQuantBlock = 128) {
         const int inputDim = weights.routedGate.dims[1];
         const int outputDim = weights.routedDown.dims[0];
         fastllm::Data input = MakeTensor(
@@ -13843,7 +13844,7 @@ namespace {
                 input, index, score, weightPtrs, biasPtrs,
                 w1, w2, w3, curInput, curOutput,
                 0.0f, output, 0, fastllm::MoeGateSwiglu,
-                false, 7.0f, true);
+                false, 7.0f, true, nullptr, activationQuantBlock);
         }
         Expect(output.dataType == fastllm::DataType::BFLOAT16,
                "DeepSeek-V4 NUMA MergeMOE output dtype mismatch.");
@@ -14055,6 +14056,20 @@ namespace {
                    "DeepSeek-V4 NUMA FP8 grouped decode changed BF16 "
                    "output bits at batch " +
                        std::to_string(smallBatch) + ".");
+        }
+        // Cover block-32 quantization when verifier rows span CPU workers.
+        for (int dim : {1024, 5120}) {
+            MoeWeights v41Weights = {
+                MakeDeepSeekV4Nvfp4MoeWeight(interDim * 2, dim, 37, "test.v41_parallel_quant_gate"),
+                MakeDeepSeekV4Nvfp4MoeWeight(dim, interDim, 43, "test.v41_parallel_quant_down")
+            };
+            for (int rows : {2, 3, 5, 6, 8, 2}) {
+                setenv("FASTLLM_DSV4_DISABLE_NUMAS_MOE_GROUPED_DECODE", "1", 1);
+                auto reference = RunNumasDeepSeekV4LargeMoeCase(v41Weights, rows, nullptr, false, -1, false, 32);
+                unsetenv("FASTLLM_DSV4_DISABLE_NUMAS_MOE_GROUPED_DECODE");
+                auto actual = RunNumasDeepSeekV4LargeMoeCase(v41Weights, rows, nullptr, false, -1, false, 32);
+                Expect(reference == actual, "V4.1 parallel block-32 quantization changed BF16 output bits.");
+            }
         }
         if (hadGroupedDecodeDisable) {
             setenv("FASTLLM_DSV4_DISABLE_NUMAS_MOE_GROUPED_DECODE",
