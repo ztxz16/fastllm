@@ -1948,18 +1948,20 @@ bool TryV41VerifyHybrid(const fastllm::Data &input, const fastllm::Data &index, 
 
 bool FastllmCudaMergeMOEHybrid(const fastllm::Data &input,
         const fastllm::Data &index, const fastllm::Data &score,
-        fastllm::Data &output, fastllm::Data **weights, int weightsBatch, int layer) {
+        fastllm::Data &output, fastllm::Data **weights, int weightsBatch, int layer,
+        const std::function<void()> &launchParallel) {
 #ifdef USE_NUMAS
+    if (launchParallel && (input.dims.size() != 2 || input.dims[0] != 1)) return false;
     if (input.dims.size() == 2 && input.dims[0] > 1)
         return TryV41VerifyHybrid(input, index, score, output, weights, weightsBatch, layer);
+    cudaStreamCaptureStatus capturing;
+    if (cudaStreamIsCapturing(cudaStreamPerThread, &capturing) != cudaSuccess ||
+        capturing != cudaStreamCaptureStatusNone) return false;
     if ((input.dataType != fastllm::DataType::FLOAT32 && input.dataType != fastllm::DataType::BFLOAT16) ||
         input.dims.size() != 2 ||
         input.dims[0] != 1 || !FastllmCudaCanRunMoeHybrid(weights, weightsBatch) ||
         !FastllmCudaCanRunMoeCacheSmallBatch(
             input, index, score, weights, weightsBatch, fastllm::MoeGateSwiglu)) return false;
-    cudaStreamCaptureStatus capturing;
-    if (cudaStreamIsCapturing(cudaStreamPerThread, &capturing) != cudaSuccess ||
-        capturing != cudaStreamCaptureStatusNone) return false;
     int tableId;
     auto *group = FindGroup(weights, weightsBatch, &tableId);
     auto *cache = GetDeviceCache(*group);
@@ -2045,6 +2047,10 @@ bool FastllmCudaMergeMOEHybrid(const fastllm::Data &input,
                 (unsigned long long)work.pureCalls, (unsigned long long)work.pureRoutes,
                 (unsigned long long)(counts[0] - work.pureBaseHits),
                 (unsigned long long)(counts[1] - work.pureBaseMisses), cache->slots, cache->device);
+        }
+        if (launchParallel) {
+            launchParallel();
+            checkCudaErrors("Pure MoE restore device", cudaSetDevice(cache->device));
         }
         return true;
     }
@@ -2196,6 +2202,13 @@ bool FastllmCudaMergeMOEHybrid(const fastllm::Data &input,
         checkCudaErrors("Hybrid MoE prefetch", cudaEventRecord(work.prefetchDone, cudaStreamPerThread));
         work.previousPrefetch = true;
         ++work.prefetchedExperts;
+    }
+    // All cache rejection and host routing reads precede this handoff. The
+    // callback may enqueue a TP graph on other devices, so restore our device
+    // before recording the CPU subset and uploading its result.
+    if (launchParallel) {
+        launchParallel();
+        checkCudaErrors("Hybrid MoE restore device", cudaSetDevice(cache->device));
     }
     const double cpuStart = HybridNowUs();
     fastllm::NumasMoeDecodeExperts(work.host, cpuOutput, weights,

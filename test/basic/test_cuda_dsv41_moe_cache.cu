@@ -288,6 +288,25 @@ int main(int argc, char **argv) {
         Require(!supported(), "wrong hidden width accepted");
         input.dims[1] = hidden;
         Require(supported(), "fallback validation damaged cache");
+        int rejectedCallbacks = 0;
+        auto rejectedCallback = [&] { ++rejectedCallbacks; };
+        input.dataType = FLOAT16;
+        Require(!FastllmCudaMergeMOEHybrid(input, index, scores, output,
+                    weights[0].data(), weights[0].size(), 0, rejectedCallback),
+                "parallel hybrid accepted unsupported dtype");
+        input.dataType = BFLOAT16;
+        input.dims[0] = 2;
+        Require(!FastllmCudaMergeMOEHybrid(input, index, scores, output,
+                    weights[0].data(), weights[0].size(), 0, rejectedCallback),
+                "parallel hybrid accepted a multirow callback");
+        input.dims[0] = 1;
+        Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+        const bool parallelCapture = FastllmCudaMergeMOEHybrid(input, index, scores, output,
+            weights[0].data(), weights[0].size(), 0, rejectedCallback);
+        cudaGraph_t rejectedGraph;
+        Check(cudaStreamEndCapture(cudaStreamPerThread, &rejectedGraph));
+        Check(cudaGraphDestroy(rejectedGraph));
+        Require(!parallelCapture && rejectedCallbacks == 0, "rejected hybrid launched parallel work");
         const bool verifyOnly = argc > 2 && std::string(argv[2]) == "--verify-only";
         for (int pass = 0; pass < (verifyOnly ? 0 : 48); ++pass) {
             const int t = pass % tables;
@@ -367,6 +386,9 @@ int main(int argc, char **argv) {
                     scores.ToDevice(DataDevice::CUDA, {device}, true);
                     FastllmCudaSetDevice(device);
                 }
+                Data parallelOutput(FLOAT32, {1, 1});
+                parallelOutput.ToDevice(DataDevice::CUDA, {device}, false);
+                parallelOutput.Allocate(false);
                 // Enter pure mode with cold/evicted routes, enqueue repeatedly,
                 // then return to CPU/hybrid on the same tensors and cache.
                 // Alternate which mode sees misses so the adaptive policy still
@@ -376,10 +398,31 @@ int main(int argc, char **argv) {
                     setenv("FASTLLM_DSV41_MOE_CACHE_MODE", split < 0 ? "gpu" : "hybrid", 1);
                     const auto value = std::to_string(split);
                     setenv("FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS", value.c_str(), 1);
-                    for (int repeat = 0; repeat < (split < 0 ? 3 : 1); ++repeat)
-                        Require(FastllmCudaMergeMOEHybrid(input, index, scores, output, weights[t].data(),
-                                                          weights[t].size(), t),
-                                "cache mode rejected");
+                    for (int repeat = 0; repeat < (split < 0 ? 3 : 1); ++repeat) {
+                        int callbacks = 0;
+                        Data replicaView;
+                        replicaView.FakeFrom(input, 0);
+                        replicaView.Resize(input.dims);
+                        replicaView.dataDeviceIds = {device};
+                        auto launchParallel = [&] {
+                            ++callbacks;
+                            Check(cudaMemsetAsync(parallelOutput.cudaData, 0, sizeof(float), cudaStreamPerThread));
+                            // TP shared work may leave another GPU current.
+                            if (dual) Check(cudaSetDevice(1 - device));
+                        };
+                        const bool accepted = repeat == 0
+                            ? FastllmCudaMergeMOEHybrid(replicaView, index, scores, output,
+                                weights[t].data(), weights[t].size(), t, launchParallel)
+                            : FastllmCudaMergeMOEHybrid(input, index, scores, output,
+                                weights[t].data(), weights[t].size(), t);
+                        Require(accepted && callbacks == (repeat == 0 ? 1 : 0), "cache parallel handoff failed");
+                        int current;
+                        Check(cudaGetDevice(&current));
+                        Require(current == device, "parallel callback changed cache output device");
+                    }
+                    float parallelValue = 1.0f;
+                    Check(cudaMemcpy(&parallelValue, parallelOutput.cudaData, sizeof(float), cudaMemcpyDeviceToHost));
+                    Require(parallelValue == 0.0f, "parallel GPU work did not complete");
                     Check(cudaMemcpy(actual.data(), output.cudaData, hidden * 2, cudaMemcpyDeviceToHost));
                     std::vector<float> values(hidden);
                     for (int c = 0; c < hidden; ++c)

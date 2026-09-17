@@ -115,8 +115,23 @@ one backend, preserving CPU weight reuse, and offloads only resident groups.
 It admits at most one recurring cold expert after GPU computation when estimated
 CPU work can cover the copy. Verify has independent per-device buffers and cost
 estimates while sharing the decode cache and LRU state. Ordinary prefill, CUDA
-Graph, tensor parallelism and unsupported shapes retain the configured backend.
+Graph outside TP, TP verification and unsupported shapes retain the configured backend.
 The draft model does not use this routed-expert cache.
+
+TP single-token decode also supports the hybrid cache, including segmented
+CUDA Graph execution:
+
+```sh
+FT_NUMAS=1 FASTLLM_DSV41_CUDA_GRAPH=1 numactl -C 0-31 -m 0 \
+  ftllm server /path/to/DeepSeek-V4.1-Flash \
+  --tp 2 --moe_device numa --threads 30 \
+  --cuda_shared_expert true --moe_cuda_cache 8g
+```
+
+Layers distribute their cache ownership across TP devices. Routing copies finish
+before shared-expert work launches, allowing it to overlap the CPU expert subset.
+Results use CPU staging and replica upload without requiring peer access. Cache
+work stays outside graph capture and preserves captured tensor addresses.
 
 Expert math preserves V4.1 block-32 FP8 activation quantization, SwiGLU clipping,
 route weighting before down-input quantization and per-expert BF16 rounding.

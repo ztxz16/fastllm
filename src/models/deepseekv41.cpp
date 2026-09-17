@@ -2813,6 +2813,8 @@ namespace fastllm {
         Data sharedGateup, sharedSwiglu, sharedExpertOut;
         Data w1, w2, w3, tempInput, tempOutput, moeInputTemp, moeOutputTemp;
         Data cpuMoeInput, cpuMoeIndex, cpuMoeScore;
+        struct MoeCacheWorkspace { Data index, score, output; };
+        std::map<int, MoeCacheWorkspace> moeCache;
         Data quantizedActivation;
         // TP and CUDA graphs retain one buffer per weight.
         std::map<std::string, Data> quantizedActivations;
@@ -3481,7 +3483,7 @@ namespace fastllm {
         if (FastllmCudaMoeCacheRequested() && !moeExpertCacheAttempted &&
             !weights[0][2]->isDiskWeight) {
             moeExpertCacheAttempted = true;
-            bool supported = !tp && !V41ReferenceMathEnabled() && GetCudaSharedExpert();
+            bool supported = !V41ReferenceMathEnabled() && GetCudaSharedExpert();
             std::vector<std::vector<Data *>> routedWeights = weights;
             std::vector<FastllmCudaMoeCacheLayer> cacheLayers;
             for (int layer = 0; layer < block_cnt; ++layer) {
@@ -3493,7 +3495,7 @@ namespace fastllm {
             if (!supported || !FastllmCudaPrepareMoeCache(cacheLayers.data(), block_cnt,
                     [this] { WarmupNumaMoeWeights(); })) {
                 fprintf(stderr, "[Fastllm] V4.1 expert cache requires NUMA NVFP4 block32 experts, "
-                    "CUDA shared experts and ordinary single-GPU math; using the configured backend.\n");
+                    "CUDA shared experts and ordinary math; using the configured backend.\n");
             }
         }
 #endif
@@ -4359,11 +4361,6 @@ namespace fastllm {
                 (V41DeviceSpecUsesType(overlapMoeDevice, "cpu") ||
                  (tp && V41DeviceSpecUsesType(overlapMoeDevice, "numa")));
 #endif
-            if (overlapShared) {
-                V41ReplicaToCpu(cpuMoeInput, ffnInput, tpDevices);
-                V41ReplicaToCpu(cpuMoeIndex, expertIndex, tpDevices);
-                V41ReplicaToCpu(cpuMoeScore, expertScore, tpDevices);
-            }
             auto runSharedExpert = [&]() {
             if (hasSharedExpertOut) {
                 if (tpSharedExpert) {
@@ -4386,9 +4383,67 @@ namespace fastllm {
                 ToDataType(sharedExpertOut, DataType::BFLOAT16);
             }
             };   // runSharedExpert
-            V41RunGraphSegment(runSharedExpert, kV41GraphSegmentsPerLayer * layer + 3, hasSharedExpertOut,
-                [](DeepSeekV41GraphSegmentMeta &) {},
-                [](const DeepSeekV41GraphSegmentMeta &) {});
+            auto runSharedSegment = [&]() {
+                V41RunGraphSegment(runSharedExpert, kV41GraphSegmentsPerLayer * layer + 3, hasSharedExpertOut,
+                    [](DeepSeekV41GraphSegmentMeta &) {},
+                    [](const DeepSeekV41GraphSegmentMeta &) {});
+            };
+            bool tpCacheHandled = false;
+#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
+            if (tp && FastllmCudaMoeCacheRequested() && single && seqlen == 1 && !dumpDebug && hasSharedExpertOut &&
+                !V41ReferenceMathEnabled() &&
+                moeWeights[0] == nullptr && moeWeights[1] == nullptr &&
+                V41DeviceSpecUsesType(SelectMoeDeviceForLayer(layer), "numa") &&
+                ffnInput.multiDeviceData && ffnInput.IsTensorParallelReplicated()) {
+                // Each layer has one cache owner, using both cards' capacity.
+                // CPU experts run once; the existing CPU-result handoff then
+                // refreshes every TP replica, including GPUs without peer access.
+                const int cacheDevice = tpDevices[(size_t)layer * tpDevices.size() / block_cnt];
+                auto local = ffnInput.multiDeviceDatas.find(cacheDevice);
+                const int originalDevice = FastllmCudaGetDevice();
+                FastllmCudaSetDevice(cacheDevice);
+                if (local != ffnInput.multiDeviceDatas.end() && local->second && local->second->cudaData &&
+                    FastllmCudaCanRunMoeHybrid(moeWeights.data(), (int)moeWeights.size())) {
+                    auto &cache = ws->moeCache[cacheDevice];
+                    V41ReplicaToCpu(cache.index, expertIndex, tpDevices);
+                    V41ReplicaToCpu(cache.score, expertScore, tpDevices);
+                    cache.index.ToDevice(DataDevice::CUDA, {cacheDevice}, true);
+                    cache.score.ToDevice(DataDevice::CUDA, {cacheDevice}, true);
+                    Data input;
+                    input.FakeFrom(*local->second, 0);
+                    input.Resize({1, dim});
+                    input.dataDeviceIds = {cacheDevice};
+                    tpCacheHandled = FastllmCudaMergeMOEHybrid(input, cache.index, cache.score, cache.output,
+                        moeWeights.data(), (int)moeWeights.size(), layer, runSharedSegment);
+                    if (tpCacheHandled) {
+                        // Keep the CPU buffer and its GPU replicas reusable.
+                        // This portable 10 KiB staging copy also completes the
+                        // cache producer before the joint AddTo/HcPost dispatch.
+                        if (ffnOut.dataDevice != DataDevice::CPU || ffnOut.dataType != input.dataType ||
+                            ffnOut.expansionBytes < cache.output.GetBytes()) {
+                            V41ResetMultiDevice(ffnOut);
+                            ffnOut.FreeSpace();
+                            ffnOut.dataDevice = DataDevice::CPU;
+                            ffnOut.dataDeviceIds.clear();
+                            ffnOut.dataType = input.dataType;
+                            ffnOut.UpdateUnitSize();
+                        }
+                        ffnOut.Resize({1, dim});
+                        ffnOut.Allocate(false);
+                        FastllmCudaCopyFromDeviceToHost(ffnOut.cpuData, cache.output.cudaData, cache.output.GetBytes());
+                    }
+                }
+                FastllmCudaSetDevice(originalDevice);
+            }
+#endif
+            if (!tpCacheHandled) {
+                if (overlapShared) {
+                    V41ReplicaToCpu(cpuMoeInput, ffnInput, tpDevices);
+                    V41ReplicaToCpu(cpuMoeIndex, expertIndex, tpDevices);
+                    V41ReplicaToCpu(cpuMoeScore, expertScore, tpDevices);
+                }
+                runSharedSegment();
+            }
             releasePrefill({&x, &ws->gateInput, &ws->gateLogits, &ws->sharedGateup, &ws->sharedSwiglu,
                             &ws->quantizedActivation});
 
@@ -4396,7 +4451,7 @@ namespace fastllm {
 #ifdef USE_CUDA
             combineFfnPostDispatch = tp && single && seqlen == 1 && hasSharedExpertOut && !dumpDebug;
 #endif
-            {
+            if (!tpCacheHandled) {
                 this->ApplyMoeDeviceMapForLayer(layer);
                 // 路由专家在 multicuda 上按专家并行（每卡一部分专家 + all-reduce），
                 // 在 cpu / numa 上仍然是单份计算，结果随后广播回两张卡。

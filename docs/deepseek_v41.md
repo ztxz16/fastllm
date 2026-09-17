@@ -115,6 +115,13 @@ ftllm server /path/to/DeepSeek-V4.1-Flash \
 - 内存需求：Engram 表约 200 GB + 路由专家（FP4）约 270 GB + 加载临时空间；
 - 首次启动会生成 `engram_meta.json`（约 1 分钟）并读入两张 Engram 表。
 
+CPU / NUMA 专家使用 FastLLM 自有线程池，由 `--threads` 控制；CLI 会自动设置 `FT_THREADS`，无需重复指定。
+常规推理不调用 OpenMP / MKL，`OMP_NUM_THREADS`、`MKL_NUM_THREADS`、`OMP_WAIT_POLICY`、`KMP_BLOCKTIME`
+可从上述命令中省略。Tokenizer 的 Python 依赖可能加载带 OpenMP / MKL 的 PyTorch，但不承担模型前向。
+NumPy 会加载 OpenBLAS，建议保留 `OPENBLAS_NUM_THREADS=1` 以免建立额外的大线程池。
+前缀缓存默认未禁用，无需 `FASTLLM_DSV41_DISABLE_PREFIX_CACHE=0`；`FASTLLM_DSV41_PREFIX_CACHE_DEBUG`
+及 `FASTLLM_DSPARK_STATS*` 仅用于诊断。`FT_NUMAS`、Engram mmap 和自定义元数据路径则按部署需要保留。
+
 ### 实测（DeepSeek-V4.1-Flash 真实权重，2026-09-12）
 
 主机：EPYC 7C13（Zen 3，无 AVX512，128 线程）+ 943 GB 内存 + 2 x RTX 3090 Ti（SM86，24 GB），
