@@ -849,7 +849,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help = 'Qwen3.5图片embedding的CPU缓存上限，如512m或1g；默认512m，0关闭')
     parser.add_argument('--ngram_device', '--ngram-device', dest = 'ngram_device',
                         choices = ['cpu', 'disk'], default = 'cpu',
-                        help = 'ngram表存放位置；disk从checkpoint按行读取以显著降低内存占用')
+                        help = 'ngram表存放位置；cpu常驻内存（默认），disk从checkpoint按行读取以降低内存占用')
     parser.add_argument('--moe_experts', type = int, default = -1, help = 'moe使用的专家数')
     parser.add_argument("--cache_history", type = str, default = "", help = "缓存历史对话")
     parser.add_argument("--cache_fast", type = str, default = "", help = "是否启用快速缓存（会消耗一定显存）")

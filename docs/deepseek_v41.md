@@ -65,13 +65,14 @@ python -m ftllm.deepseek_v41_engram /path/to/DeepSeek-V4.1-Flash
 # 生成 /path/to/DeepSeek-V4.1-Flash/engram_meta.json（压缩词表大小应为 99092）
 ```
 
-通过 `ftllm` 启动时会自动生成（模型目录只读时写到 `~/.cache/fastllm/engram/`），也可以用环境变量
-`FASTLLM_DSV41_ENGRAM_META=/path/engram_meta.json` 显式指定。素数桶布局由 C++ 侧按官方算法推导，
-并与 `engram_num_embeddings` 做一致性校验。
+通过 `ftllm` 启动时自动读取模型目录的 `engram_meta.json`，缺失时自动生成；模型目录只读时写到
+`~/.cache/fastllm/engram/`，C++ 侧自动从该缓存目录读取。素数桶布局由 C++ 侧按官方算法推导，
+并与 `engram_num_embeddings` 做一致性校验，无需指定元数据环境变量。
 
-Engram 表（两层，各约 100 GB）不经过通用加载器，而是由模型直接从 safetensors 读入内存，
-以 FP8 + UE8M0 scale 原样保存；查表在 CPU 完成，`wkv` 投影与门控在 GPU 完成。
-设置 `FASTLLM_DSV41_ENGRAM_MMAP=1` 可改为 mmap（首次访问慢，节省常驻内存）。
+Engram 表（两层，各约 100 GB）以 FP8 + UE8M0 scale 原样保存；查表在 CPU 完成，
+`wkv` 投影与门控在 GPU 完成。默认 `--ngram_device cpu` 将表常驻内存；
+`--ngram_device disk` 与 Qwen4 PLE 共用通用磁盘权重加载和 `EmbeddingDirect` 算子，
+按行读取权重及 scale，不加载整张表。磁盘读取可能增加延迟，访问过的数据仍可能占用操作系统页缓存。
 
 ### Engram 的分段计时与几个开关
 
@@ -91,8 +92,8 @@ FP8→BF16）、`wkv`（投影）、`apply`（门控写回）。后两段在 GPU
 | 开关 | 作用 |
 |---|---|
 | `FASTLLM_DSV41_ENGRAM_POOL`（默认开，=0 关） | 查表改用 fastllm 的常驻线程池，替掉每次调用现场 create/join 最多 32 个 `std::thread` 的写法。输出逐位相同，prefill 收益最明显。 |
-| `FASTLLM_DSV41_ENGRAM_PREFETCH=1` | 跨层预取。n-gram 哈希只依赖 token 历史，两个 Engram 层（默认层 1 与层 14）的行号在进入第 0 层之前就已经全部确定，所以可以在前一个 Engram 层计算时用后台线程把下一层的行号算好、并把要用的表行摸进 cache。后台线程只看历史窗口的快照，不引用请求状态。 |
-| `FASTLLM_DSV41_ENGRAM_MADVISE=random / hugepage / both` | 表是纯随机访问：`random` 打 `MADV_RANDOM` 关掉内核预读（mmap 模式下最有用）；`hugepage` 让常驻表改用匿名 mmap + `MADV_HUGEPAGE` 分配（100 GB 用 4 KB 页要 2500 万个 PTE，随机查表几乎每次 TLB miss），顺带省掉 `std::vector` 的 100 GB 清零，加载也更快。 |
+| `FASTLLM_DSV41_ENGRAM_PREFETCH=1` | 跨层预取。后台线程提前计算下一层的 n-gram 行号；常驻表还会在缓存预算内预读表行，磁盘模式只预计算行号。后台线程只看历史窗口的快照，不引用请求状态。 |
+| `FASTLLM_DSV41_ENGRAM_MADVISE=random / hugepage / both` | 仅作用于常驻表：`random` 设置 `MADV_RANDOM`；`hugepage` 使用匿名 mmap + `MADV_HUGEPAGE` 分配，减少页表与 TLB 开销，并省掉 `std::vector` 的清零。 |
 | `FASTLLM_DSV41_ENGRAM_WKV_FP8`（默认开，=0 关） | `layers.{1,14}.engram.wkv.weight` 在真实权重里本来就是 F8_E4M3 + UE8M0 块 scale（`[25600, 6144]`，block 32x32），默认会被解量化成启动 dtype（float16），每层 157 MB 变 314 MB。打开后按原样保留 FP8，**不做任何重量化**——权重数值就是 checkpoint 里的那份，比解成 float16 还少一次舍入；省下每层 157 MB 显存与同样多的每步带宽。只有伴随的 `.scale` 张量存在时才切换，权重是 BF16 的迷你模型不受影响。 |
 
 ## 启动
@@ -121,7 +122,7 @@ CPU / NUMA 专家使用 FastLLM 自有线程池，由 `--threads` 控制；CLI �
 NumPy 会加载 OpenBLAS，建议保留 `OPENBLAS_NUM_THREADS=1` 以免建立额外的大线程池。
 前缀缓存默认未禁用，无需 `FASTLLM_DSV41_DISABLE_PREFIX_CACHE=0`；`FASTLLM_DSV41_PREFIX_CACHE_DEBUG` 仅用于诊断。
 DSpark 默认每 32 轮校验打印位置接受率，无需设置 `FASTLLM_DSPARK_STATS` / `FASTLLM_DSPARK_STATS_EVERY`。
-`FT_NUMAS`、Engram mmap 和自定义元数据路径则按部署需要保留。
+`FT_NUMAS` 按部署需要设置；Engram 表的存放方式使用 `--ngram_device cpu|disk` 控制。
 
 ### 实测（DeepSeek-V4.1-Flash 真实权重，2026-09-12）
 
@@ -1017,6 +1018,8 @@ indexer 分数矩阵的分块效果（65536 token prefill，扣掉同卡其它�
 PYTHONPATH=build/tools python test/basic/test_deepseek_v41_cpu_fixture.py
 ```
 
+追加 `--ngram-device disk` 可用同一份 fixture 校验磁盘 Engram 加载与按行读取。
+
 退出码 0 表示通过，1 表示失败；fixture 缺失时打印重新生成的命令并以 0 退出（跳过）。
 fixture 里的模型是 5 层、dim 128、词表 128、2 专家，覆盖 V4.1 的全部结构特性：
 `compress_ratios = (0, 2, 2, 1, 1)`（三种压缩层）、`kv_source_layer_ids = (1, 3)`（层 2 / 4 跨层复用压缩 KV）、
@@ -1086,8 +1089,6 @@ eager / Graph 切换和共享专家重叠。`--hc-mult 2` 可补测两路 HC，�
 | `FASTLLM_DSV41_DISABLE_HCPRENORM` | 不融合 HcApplyPre 与 RMSNorm，退回两个算子分开做 |
 | `FASTLLM_DSV41_INDEX_SCORE_MB` | indexer 分数矩阵的显存预算（MB，默认 128），决定 token 维分块大小 |
 | `FASTLLM_DSV41_INDEX_CHUNK` | 直接指定 indexer 的 token 分块大小（覆盖上面的预算推算） |
-| `FASTLLM_DSV41_ENGRAM_META` | Engram 元数据 JSON 路径 |
-| `FASTLLM_DSV41_ENGRAM_MMAP` | 以 mmap 方式访问 Engram 表 |
 | `FASTLLM_DSV41_ENGRAM_PROFILE` | Engram 查表 / 转换 / 投影分段计时（见 "Engram 元数据"） |
 | `FASTLLM_DSV41_ENGRAM_POOL` | Engram 查表改用常驻线程池 |
 | `FASTLLM_DSV41_ENGRAM_PREFETCH` | 跨层预取下一个 Engram 层的行号与表行 |

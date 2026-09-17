@@ -71,8 +71,7 @@ def main():
         directory = Path(path)
         prepare(directory, args.hc_mult)
         env = dict(os.environ, FASTLLM_SKIP_WARMUP='1', FASTLLM_DSV41_REFERENCE_MATH='0',
-                   FASTLLM_DSV41_DISABLE_FAKE_QUANT='1', FASTLLM_DSV41_CUDA_GRAPH_DEBUG='1',
-                   FASTLLM_DSV41_ENGRAM_META=str(directory / 'engram_meta.json'))
+                   FASTLLM_DSV41_DISABLE_FAKE_QUANT='1', FASTLLM_DSV41_CUDA_GRAPH_DEBUG='1')
         result = subprocess.run([args.binary, str(directory)], env=env,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180)
         print(result.stdout)

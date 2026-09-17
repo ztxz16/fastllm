@@ -1634,12 +1634,9 @@ class model:
         model_type = str(config.get("model_type", ""))
         if model_type not in ("deepseek_v41", "deepseek_v41_text"):
             return
-        if os.environ.get("FASTLLM_DSV41_ENGRAM_META"):
-            return
         try:
             from ftllm.deepseek_v41_engram import ensure_engram_meta
-            meta_path = ensure_engram_meta(path)
-            os.environ["FASTLLM_DSV41_ENGRAM_META"] = meta_path
+            ensure_engram_meta(path)
         except Exception as e:
             print("[ftllm] warning: failed to prepare DeepSeek-V4.1 engram meta:", e)
 

@@ -607,7 +607,6 @@ def run_fastllm(args, prompt, vocab_size):
     from ftllm.util import make_normal_llm_model, make_normal_parser
 
     os.environ.setdefault("FASTLLM_SKIP_WARMUP", "1")
-    os.environ["FASTLLM_DSV41_ENGRAM_META"] = os.path.join(args.work_dir, "engram_meta.json")
     if args.dump_dir:
         os.makedirs(args.dump_dir, exist_ok=True)
         os.environ["FASTLLM_DSV41_DUMP_DIR"] = args.dump_dir

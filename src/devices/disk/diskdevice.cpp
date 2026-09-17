@@ -637,7 +637,7 @@ namespace fastllm {
 
     static bool IsDiskEmbeddingStorageType(DataType type, bool direct) {
         return IsDiskFloatStorageType(type) ||
-               (direct && type == DataType::FP8_E4M3);
+               (direct && (type == DataType::FP8_E4M3 || type == DataType::INT8));
     }
 
     static bool CanConvertDiskStorageType(DataType dst, DataType src) {

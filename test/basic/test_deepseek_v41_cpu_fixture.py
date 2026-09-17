@@ -42,6 +42,8 @@ def parse_args():
     p.add_argument("--keep", action="store_true", help="保留解包出来的模型目录")
     p.add_argument("--device", default="", help="覆盖 fixture 记录的 device（调试用，默认 cpu）")
     p.add_argument("--moe-device", default="", help="覆盖 moe_device（调试用）")
+    p.add_argument("--ngram-device", choices=("cpu", "disk"), default="cpu",
+                   help="Engram 表常驻内存或通过磁盘 Embedding 按行读取")
     p.add_argument("--dtype", default="", help="覆盖 dtype（调试用）")
     p.add_argument("--save-logits", default="", help="把 fastllm 的 logits 存成 npy（调试用）")
     p.add_argument("--verbose", action="store_true")
@@ -57,9 +59,8 @@ def unpack(fixture_path, dst):
     return meta, data["ref_logits"], data["ref_tokens"]
 
 
-def run_fastllm(model_dir, meta, threads, device="", moe_device="", dtype=""):
+def run_fastllm(model_dir, meta, threads, device="", moe_device="", dtype="", ngram_device="cpu"):
     os.environ.setdefault("FASTLLM_SKIP_WARMUP", "1")
-    os.environ["FASTLLM_DSV41_ENGRAM_META"] = os.path.join(model_dir, "engram_meta.json")
     for k, v in meta["fastllm"].get("env", {}).items():
         os.environ[k] = v
 
@@ -70,7 +71,10 @@ def run_fastllm(model_dir, meta, threads, device="", moe_device="", dtype=""):
     argv = ["--path", model_dir, "--dtype", dtype or meta["fastllm"]["dtype"],
             "--device", device or meta["fastllm"]["device"],
             "--moe_device", moe_device or meta["fastllm"]["moe_device"],
+            "--ngram_device", ngram_device,
             "-t", str(threads)]
+    if (device or meta["fastllm"]["device"]) == "cpu":
+        argv += ["--cuda_shared_expert", "false"]
     fargs = parser.parse_args(argv)
     if fargs.max_batch <= 0:
         fargs.max_batch = 1
@@ -167,7 +171,7 @@ def main():
             len(meta["prompt"]), meta["decode_steps"], meta["fastllm"]["device"],
             meta["fastllm"]["dtype"]))
         fl_logits, fl_tokens = run_fastllm(work, meta, args.threads,
-                                           args.device, args.moe_device, args.dtype)
+                                           args.device, args.moe_device, args.dtype, args.ngram_device)
         if args.save_logits:
             np.save(args.save_logits, fl_logits)
         failures = compare(ref_logits, ref_tokens, fl_logits, fl_tokens, args, meta["margins"])

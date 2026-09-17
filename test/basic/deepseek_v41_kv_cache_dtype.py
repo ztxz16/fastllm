@@ -64,7 +64,6 @@ def run_single(args, prompt):
     from ftllm.util import make_normal_llm_model, make_normal_parser
 
     os.environ.setdefault("FASTLLM_SKIP_WARMUP", "1")
-    os.environ["FASTLLM_DSV41_ENGRAM_META"] = os.path.join(args.work_dir, "engram_meta.json")
     if args.no_fake_quant:
         os.environ["FASTLLM_DSV41_DISABLE_FAKE_QUANT"] = "1"
     parser = make_normal_parser("v41 kv cache dtype")

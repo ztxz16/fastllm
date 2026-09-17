@@ -201,7 +201,6 @@ def run_fastllm(args, prompt, decode_steps, want_logits=False):
     from ftllm.util import make_normal_llm_model, make_normal_parser
 
     os.environ.setdefault("FASTLLM_SKIP_WARMUP", "1")
-    os.environ["FASTLLM_DSV41_ENGRAM_META"] = os.path.join(args.work_dir, "engram_meta.json")
     # 两次运行都关闭伪量化，避免量化边界翻转掩盖真正的实现差异
     os.environ.setdefault("FASTLLM_DSV41_DISABLE_FAKE_QUANT", "1")
     parser = make_normal_parser("v41 dspark")

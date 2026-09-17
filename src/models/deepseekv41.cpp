@@ -4,7 +4,7 @@
 // 本文件实现通用（CUDA / CPU 混合）路径：
 //   * 注意力、Hyper-Connections、indexer 等在执行器选择的设备上运行（通常是 GPU）；
 //   * 路由专家通过 MergeMOEBlock 交给 MoE 设备（cpu / numa / cuda）；
-//   * Engram 哈希表以 FP8 + UE8M0 scale 原样保存在 CPU 内存中（每层约 100GB），
+//   * Engram 哈希表以 FP8 + UE8M0 scale 常驻 CPU 内存或通过磁盘 Embedding 按行读取，
 //     查表在 CPU 完成，后续 wkv 投影与门控在 GPU 完成。
 //
 
@@ -39,6 +39,7 @@
 
 #if !defined(_WIN32) && !defined(_WIN64)
 #include <fcntl.h>
+#include <pwd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -212,7 +213,7 @@ namespace fastllm {
 
         // ---------------- Engram 表的内存访问提示 ----------------
         // FASTLLM_DSV41_ENGRAM_MADVISE=random / hugepage / both（默认 off，行为不变）。
-        //   random   ：表是纯随机访问，MADV_RANDOM 关掉内核的顺序预读（mmap 模式下最有用）。
+        //   random   ：对常驻表设置 MADV_RANDOM 提示。
         //   hugepage ：常驻模式下改用匿名 mmap + MADV_HUGEPAGE 分配 100 GB 的表，
         //              4 KB 页要 2500 万个 PTE，随机查表几乎每次都 TLB miss；
         //              顺带省掉 std::vector 的 100 GB 清零，加载也更快。
@@ -972,7 +973,8 @@ namespace fastllm {
             int64_t rows = 0;
             int dim = 0;
             int scaleBlock = 32;
-            bool fileMapped = false;            // 表是文件 mmap（缺页可能要读盘）还是常驻内存
+            Data *diskWeight = nullptr;
+            Data diskScale;
             const uint8_t *data = nullptr;      // FP8 E4M3, [rows, dim]
             const uint8_t *scale = nullptr;     // UE8M0, [rows, dim / scaleBlock]
             std::vector<uint8_t> dataStorage;
@@ -1076,29 +1078,6 @@ namespace fastllm {
                 done += cur;
             }
             fclose(fi);
-        }
-
-        bool V41MapFileRange(const std::string &fileName, uint64_t offset, uint64_t bytes,
-                             void *&mapping, size_t &mapLen, const uint8_t *&ptr) {
-#if defined(_WIN32) || defined(_WIN64)
-            return false;
-#else
-            int fd = open(fileName.c_str(), O_RDONLY);
-            if (fd < 0) {
-                return false;
-            }
-            long pageSize = sysconf(_SC_PAGESIZE);
-            uint64_t alignedOffset = offset / pageSize * pageSize;
-            mapLen = (size_t)(bytes + (offset - alignedOffset));
-            mapping = mmap(nullptr, mapLen, PROT_READ, MAP_PRIVATE, fd, (off_t)alignedOffset);
-            close(fd);
-            if (mapping == MAP_FAILED) {
-                mapping = nullptr;
-                return false;
-            }
-            ptr = (const uint8_t*)mapping + (offset - alignedOffset);
-            return true;
-#endif
         }
 
         bool V41IsPrime(int64_t x) {
@@ -1400,12 +1379,31 @@ namespace fastllm {
             return;
         }
         std::string metaPath;
-        if (const char *env = std::getenv("FASTLLM_DSV41_ENGRAM_META")) {
-            metaPath = env;
-        } else if (V41HasKey(this->weight, "engram_meta_path")) {
+        if (V41HasKey(this->weight, "engram_meta_path")) {
             metaPath = this->weight.dicts["engram_meta_path"];
         } else if (V41HasKey(this->weight, "model_directory")) {
             metaPath = this->weight.dicts["model_directory"] + "engram_meta.json";
+            if (!FileExists(metaPath)) {
+                // 与 Python ensure_engram_meta 的只读模型目录回退路径一致。
+#if defined(_WIN32) || defined(_WIN64)
+                const char *homeDir = std::getenv("USERPROFILE");
+#else
+                const char *homeDir = std::getenv("HOME");
+                if (homeDir == nullptr) {
+                    const auto *user = getpwuid(getuid());
+                    homeDir = user != nullptr ? user->pw_dir : nullptr;
+                }
+#endif
+                if (homeDir != nullptr) {
+                    const auto modelName = fs::absolute(metaPath)
+                        .lexically_normal().parent_path().filename();
+                    const auto cachedPath = fs::path(homeDir) / ".cache" / "fastllm" /
+                        "engram" / (modelName.string() + "_engram_meta.json");
+                    if (FileExists(cachedPath.string())) {
+                        metaPath = cachedPath.string();
+                    }
+                }
+            }
         }
         if (metaPath.empty()) {
             return;
@@ -1512,8 +1510,12 @@ namespace fastllm {
                 result[name].push_back({name,DataType::BFLOAT16});
                 continue;
             }
-            // Engram 表由模型自行读取（超出通用加载器的 int32 scale 索引范围）
+            // 磁盘表复用通用惰性加载；常驻表保留紧凑 UE8M0 scale，避免展开整张 scale 表。
             if (name.find(".engram.embed.") != std::string::npos) {
+                if (this->ngramDevice == "disk" && V41EndsWith(name, ".weight")) {
+                    result[name].push_back({name, DataType::FP8_E4M3});
+                    this->ngramWeights.insert(name);
+                }
                 continue;
             }
             if (wkvFp8 && V41EndsWith(name, ".engram.wkv.weight") &&
@@ -1587,12 +1589,37 @@ namespace fastllm {
         AssertInFastLLM(V41HasKey(this->weight, "model_directory"),
                         "DeepSeekV41: model directory is unknown, can't load engram tables.");
         std::string dir = this->weight.dicts["model_directory"];
-        bool useMmap = V41EnvFlag("FASTLLM_DSV41_ENGRAM_MMAP");
         V41EngramMadviseCfg madviseCfg = V41EngramMadvise();
         engramTables.clear();
         for (size_t l = 0; l < engram_layer_ids.size(); l++) {
             int layer = engram_layer_ids[l];
             std::string base = "layers." + std::to_string(layer) + ".engram.embed.";
+            auto table = std::make_shared<V41EngramTable>();
+            if (this->ngramDevice == "disk") {
+                Data &embedding = this->weight[base + "weight"];
+                AssertInFastLLM(embedding.isDiskWeight && embedding.cpuData == nullptr &&
+                                embedding.dataType == DataType::FP8_E4M3 && embedding.dims.size() == 2 &&
+                                embedding.dims[1] == engram_head_dim && embedding.blockK == 1 &&
+                                embedding.blockM > 0 && embedding.dims[1] % embedding.blockM == 0 &&
+                                embedding.diskWeightParts.size() == 2,
+                                "DeepSeekV41: invalid disk engram table " + base + "weight");
+                table->rows = embedding.dims[0];
+                table->dim = embedding.dims[1];
+                table->scaleBlock = embedding.blockM;
+                table->diskWeight = &embedding;
+                auto scalePart = embedding.diskWeightParts[1];
+                AssertInFastLLM(scalePart.isScalePart && scalePart.sourceDataType == DataType::INT8 &&
+                                scalePart.bytes == (uint64_t)table->rows * (table->dim / table->scaleBlock),
+                                "DeepSeekV41: invalid disk engram scale " + base + "scale");
+                scalePart.isScalePart = false;
+                table->diskScale = Data(DataType::INT8, scalePart.dims);
+                table->diskScale.isDiskWeight = true;
+                table->diskScale.weightType = WeightType::EMBEDDING;
+                table->diskScale.diskWeightParts.push_back(std::move(scalePart));
+                printf("[Fastllm] DeepSeek-V4.1: engram table for layer %d ready (disk).\n", layer);
+                engramTables.push_back(std::static_pointer_cast<void>(table));
+                continue;
+            }
             V41SafeTensorInfo weightInfo, scaleInfo;
             AssertInFastLLM(V41FindSafeTensor(dir, base + "weight", weightInfo) &&
                             V41FindSafeTensor(dir, base + "scale", scaleInfo),
@@ -1602,26 +1629,17 @@ namespace fastllm {
                             scaleInfo.shape.size() == 2 && scaleInfo.shape[0] == weightInfo.shape[0] &&
                             weightInfo.shape[1] % scaleInfo.shape[1] == 0,
                             "DeepSeekV41: unsupported engram table format for " + base + "weight");
-            auto table = std::make_shared<V41EngramTable>();
             table->rows = weightInfo.shape[0];
             table->dim = (int)weightInfo.shape[1];
             table->scaleBlock = (int)(weightInfo.shape[1] / scaleInfo.shape[1]);
             AssertInFastLLM(table->dim == engram_head_dim && weightInfo.bytes == (uint64_t)table->rows * table->dim &&
                             scaleInfo.bytes == (uint64_t)table->rows * (table->dim / table->scaleBlock),
                             "DeepSeekV41: engram table byte count mismatch for " + base + "weight");
-            printf("[Fastllm] DeepSeek-V4.1: loading engram table for layer %d (%.1f GB, %s%s%s)...\n",
-                   layer, (weightInfo.bytes + scaleInfo.bytes) / 1e9, useMmap ? "mmap" : "resident",
+            printf("[Fastllm] DeepSeek-V4.1: loading engram table for layer %d (%.1f GB, resident%s%s)...\n",
+                   layer, (weightInfo.bytes + scaleInfo.bytes) / 1e9,
                    madviseCfg.random ? " +random" : "", madviseCfg.hugePage ? " +hugepage" : "");
             fflush(stdout);
-            bool mapped = false;
-            if (useMmap) {
-                mapped = V41MapFileRange(weightInfo.fileName, weightInfo.offset, weightInfo.bytes,
-                                         table->mmapData, table->mmapDataLen, table->data) &&
-                         V41MapFileRange(scaleInfo.fileName, scaleInfo.offset, scaleInfo.bytes,
-                                         table->mmapScale, table->mmapScaleLen, table->scale);
-                table->fileMapped = mapped;
-            }
-            if (!mapped) {
+            {
                 // 常驻：默认用 std::vector；开了 hugepage 提示时改用匿名 mmap，
                 // 这样可以在读入之前 madvise(MADV_HUGEPAGE)，还省掉 vector 的清零。
                 uint8_t *dataPtr = nullptr, *scalePtr = nullptr;
@@ -1751,12 +1769,10 @@ namespace fastllm {
         }
 
         // 把要用到的表行摸一遍（每 64 字节一次），把页表项与 cache line 提前拉进来。
-        // mmap 模式下这一步把缺页代价挪到后台线程，多大的批都值得做；
-        // 常驻模式下靠的是 cache/TLB 命中，一旦要摸的数据超过末级缓存，等真正查表时
-        // 早就被挤出去了，白白多跑一遍内存带宽——所以给一个预算，超了就只算行号不摸表。
+        // 常驻表超过缓存预算或使用磁盘 Embedding 时，后台只计算行号。
         void V41TouchEngramRows(const V41EngramTable &table, const std::vector<int64_t> &rows) {
             const uint64_t budget = 32ULL << 20;
-            if (!table.fileMapped && rows.size() * (uint64_t)table.dim > budget) {
+            if (table.diskWeight != nullptr || rows.size() * (uint64_t)table.dim > budget) {
                 return;
             }
             const int dim = table.dim;
@@ -1829,7 +1845,7 @@ namespace fastllm {
         }
         AssertInFastLLM(engramLayerIndex >= 0 && engramLayerIndex < (int)engramTables.size(),
                         "DeepSeekV41: engram table for layer " + std::to_string(layer) + " is not loaded.");
-        const V41EngramTable &table = *std::static_pointer_cast<V41EngramTable>(engramTables[engramLayerIndex]);
+        V41EngramTable &table = *std::static_pointer_cast<V41EngramTable>(engramTables[engramLayerIndex]);
         const int cols = (int)(rows.size() / std::max(1, tokens));
         const int dim = table.dim;
         const int scaleCols = dim / table.scaleBlock;
@@ -1842,14 +1858,28 @@ namespace fastllm {
         }
         uint16_t *dst = (uint16_t*)output.cpuData;
         static const FP8E4M3ToFP32Manager fp8;
+        Data diskValues, diskScales;
+        if (table.diskWeight != nullptr) {
+            Data lookupRows(DataType::INT32, {tokens, cols});
+            lookupRows.Allocate(false);
+            for (size_t i = 0; i < rows.size(); i++) {
+                AssertInFastLLM(rows[i] >= 0 && rows[i] < table.rows, "DeepSeekV41: engram hash out of range.");
+                ((int32_t*)lookupRows.cpuData)[i] = (int32_t)rows[i];
+            }
+            V41Executor().RunOnDevice("disk", "EmbeddingDirect",
+                {{"input", &lookupRows}, {"weight", table.diskWeight}, {"output", &diskValues}}, {}, {});
+            V41Executor().RunOnDevice("disk", "EmbeddingDirect",
+                {{"input", &lookupRows}, {"weight", &table.diskScale}, {"output", &diskScales}}, {}, {});
+        }
 
         const std::function<void(int, int)> worker = [&](int st, int end) {
             for (int t = st; t < end; t++) {
                 for (int c = 0; c < cols; c++) {
                     int64_t row = rows[(size_t)t * cols + c];
                     AssertInFastLLM(row >= 0 && row < table.rows, "DeepSeekV41: engram hash out of range.");
-                    const uint8_t *src = table.data + (uint64_t)row * dim;
-                    const uint8_t *sc = table.scale + (uint64_t)row * scaleCols;
+                    const uint64_t sourceRow = table.diskWeight != nullptr ? (uint64_t)t * cols + c : row;
+                    const uint8_t *src = (table.diskWeight != nullptr ? diskValues.cpuData : table.data) + sourceRow * dim;
+                    const uint8_t *sc = (table.diskWeight != nullptr ? diskScales.cpuData : table.scale) + sourceRow * scaleCols;
                     uint16_t *out = dst + ((uint64_t)t * cols + c) * dim;
                     for (int d = 0; d < dim; d++) {
                         float v = fp8.dict[src[d]] * V41E8M0ToFloat(sc[d / table.scaleBlock]);
@@ -1914,7 +1944,7 @@ namespace fastllm {
                                      Data &hiddenStates) {
         AssertInFastLLM(engramMeta.loaded,
                         "DeepSeekV41: engram meta is not loaded. Generate engram_meta.json with "
-                        "`python -m ftllm.deepseek_v41_engram <model_dir>` or set FASTLLM_DSV41_ENGRAM_META.");
+                        "`python -m ftllm.deepseek_v41_engram <model_dir>`.");
         static const bool prefetchEnabled = V41EnvFlag("FASTLLM_DSV41_ENGRAM_PREFETCH");
         V41EngramProfiler &profiler = V41Profiler();
         const bool profiling = profiler.level > 0;
