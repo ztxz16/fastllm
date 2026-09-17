@@ -2205,6 +2205,96 @@ static ncclComm_t FindNcclCommNoLog(int deviceId) {
     return it == g_ncclComms.end() ? nullptr : it->second;
 }
 
+// 通信域建立后做一次带数值校验的自检：ncclCommInitAll 成功并不代表集合通信可用
+//（例如 NCCL 与 CUDA 运行时主版本不匹配时，NCCL 内部检查会在每次发射时报错）。
+// 若此时放任继续，TP 各 rank 会拿着未归约的部分和静默输出错误结果（复读、乱码），
+// 且故障只能通过网络输出质量侧面发现，排查代价极高。
+static bool FastllmNcclSelfTest(const std::vector<int> &devices) {
+    const int numGPUs = (int)devices.size();
+    const int count = 1024;
+    float expect = 0.0f;
+    for (int i = 0; i < numGPUs; ++i) {
+        expect += (float)(i + 1);
+    }
+
+    bool ok = true;
+    std::vector<void*> buffers(numGPUs, nullptr);
+    std::vector<float> host(count);
+    int originalDevice = -1;
+    cudaGetDevice(&originalDevice);
+
+    for (int i = 0; i < numGPUs && ok; ++i) {
+        if (cudaSetDevice(devices[i]) != cudaSuccess) {
+            cudaGetLastError();
+            ok = false;
+            break;
+        }
+        std::fill(host.begin(), host.end(), (float)(i + 1));
+        if (cudaMalloc(&buffers[i], count * sizeof(float)) != cudaSuccess ||
+            cudaMemcpy(buffers[i], host.data(), count * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) {
+            cudaGetLastError();
+            ok = false;
+        }
+    }
+    // 单线程依次向多个 comm 发射时必须包在 group 里，否则先发射的 rank 会在
+    // 主机侧等待尚未发射的对端（NCCL 2.31 对称内存路径），造成初始化死锁。
+    ncclGroupStart();
+    for (int i = 0; i < numGPUs && ok; ++i) {
+        if (cudaSetDevice(devices[i]) != cudaSuccess) {
+            cudaGetLastError();
+            ok = false;
+            break;
+        }
+        ncclResult_t res = ncclAllReduce(buffers[i], buffers[i], count, ncclFloat, ncclSum,
+                                         g_ncclComms[devices[i]], cudaStreamPerThread);
+        if (res != ncclSuccess) {
+            printf("Error: NCCL self-test launch failed on device %d: %s\n",
+                   devices[i], ncclGetErrorString(res));
+            ok = false;
+        }
+    }
+    ncclResult_t groupRes = ncclGroupEnd();
+    if (ok && groupRes != ncclSuccess) {
+        printf("Error: NCCL self-test group launch failed: %s\n", ncclGetErrorString(groupRes));
+        ok = false;
+    }
+    for (int i = 0; i < numGPUs && ok; ++i) {
+        if (cudaSetDevice(devices[i]) != cudaSuccess) {
+            cudaGetLastError();
+            ok = false;
+            break;
+        }
+        if (cudaDeviceSynchronize() != cudaSuccess ||
+            cudaMemcpy(host.data(), buffers[i], count * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+            cudaGetLastError();
+            ok = false;
+            break;
+        }
+        for (int j = 0; j < count; ++j) {
+            float diff = host[j] - expect;
+            if (diff < 0.0f) {
+                diff = -diff;
+            }
+            if (diff > 1e-3f) {
+                printf("Error: NCCL self-test mismatch on device %d at element %d: expected %f, got %f\n",
+                       devices[i], j, expect, host[j]);
+                ok = false;
+                break;
+            }
+        }
+    }
+    for (int i = 0; i < numGPUs; ++i) {
+        if (buffers[i] != nullptr) {
+            cudaSetDevice(devices[i]);
+            cudaFree(buffers[i]);
+        }
+    }
+    if (originalDevice >= 0) {
+        cudaSetDevice(originalDevice);
+    }
+    return ok;
+}
+
 uint64_t FastllmGetNcclGeneration() {
     return g_ncclGeneration.load(std::memory_order_acquire);
 }
@@ -2274,7 +2364,24 @@ bool FastllmInitNccl(const std::vector<int>& devices) {
         g_ncclComms[uniqueDevices[i]] = comms[i];
         g_ncclRanks[uniqueDevices[i]] = i;
     }
-        
+
+    // 集合通信自检：确认发射与数值结果都正确，否则后续每次归约都会静默产出
+    // 未归约的部分和（表现为输出退化重复），宁可在此明确失败也不带病运行。
+    if (!FastllmNcclSelfTest(uniqueDevices)) {
+        printf("Error: NCCL 通信自检失败：ncclCommInitAll 成功但集合通信不可用或结果错误。\n"
+               "Error: 这通常意味着 NCCL 与当前 CUDA 运行时/驱动版本不匹配（例如 NCCL 2.18+cuda12 搭配 CUDA 13）。\n"
+               "Error: 继续运行会让 TP 各卡静默使用未归约的部分结果，导致输出退化重复。\n"
+               "Error: 请安装与 CUDA 版本匹配的 NCCL 后重试。\n");
+        for (int i = 0; i < numGPUs; ++i) {
+            if (comms[i] != nullptr) {
+                ncclCommDestroy(comms[i]);
+            }
+        }
+        g_ncclComms.clear();
+        g_ncclRanks.clear();
+        fastllm::ErrorInFastLLM("NCCL self-test failed, aborting to avoid silently corrupted tensor-parallel results.");
+    }
+
     g_ncclInitialized = true;
     g_ncclWorldSize = numGPUs;
     // Every multi-rank TP group meets around NCCL submission: even-rank
