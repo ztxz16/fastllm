@@ -1,4 +1,5 @@
 #include "devices/cuda/fastllm-cuda-gdn.h"
+#include "devices/cuda/fastllm-cuda-rmsnorm-small-linear.h"
 #include "devices/cuda/fastllm-cuda-fp8-linear-add.h"
 #include "devices/cuda/fastllm-cuda-nvfp4-fused.h"
 //
@@ -4581,6 +4582,7 @@ namespace fastllm {
         this->ops["Linear"] = (BaseOperator*)(new CudaLinearOp());
         this->ops["LinearAdd"] = (BaseOperator*)(new CudaLinearAddOp());
         this->ops["SwigluLinearAdd"] = (BaseOperator*)(new CudaSwigluLinearAddOp());
+        this->ops["RMSNormSmallLinear"] = new CudaRMSNormSmallLinearOp();
         this->ops["GdnInputConv"] = new CudaGdnInputConvOp();
         this->ops["LinearSwiglu"] = (BaseOperator*)(new CudaLinearSwigluOp());
         this->ops["Conv1DPerChannel"] = (BaseOperator*)(new CudaConv1DPerChannel());

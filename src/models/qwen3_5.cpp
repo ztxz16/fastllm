@@ -39,6 +39,7 @@
 #ifdef USE_CUDA
 #include "models/qwen3_cuda_common.h"
 #include "devices/cuda/fastllm-cuda-gdn.h"
+#include "devices/cuda/fastllm-cuda-rmsnorm-small-linear.h"
 #include "devices/cuda/cudaworkspace.h"
 #include "devices/cuda/fastllm-cuda-vision.h"
 #include "devices/cuda/fastllm-cuda-fp8.h"
@@ -11580,10 +11581,18 @@ namespace fastllm {
                                     qkvzbaWeightName + ".tp_bias"),
                                 qkvzbaWeightName + ".tp_bias"),
                             buf.gdnMerged);
-                    if (!fusedInputProjection) {
-                        Qwen3CudaRMSNorm(
-                            cudaRunner, buf.hiddenStates, inputRmsWeight,
-                            rms_norm_eps, buf.attenInput);
+                    // The Block materializes both normalized input and the small
+                    // projection, including on its complete unfused fallback.
+                    bool preparedBa = !fusedInputProjection && !hasMergedGdnInLinear;
+                    if (preparedBa) {
+                        CudaRMSNormSmallLinearBlock(buf.hiddenStates, inputRmsWeight,
+                            *requireLocal(weight[baWeightName], baWeightName),
+                            *requireLocal(GetThreadTensorParallelBias(baWeightName + ".tp_bias"),
+                                          baWeightName + ".tp_bias"),
+                            buf.attenInput, buf.ba, rms_norm_eps);
+                    } else if (!fusedInputProjection) {
+                        Qwen3CudaRMSNorm(cudaRunner, buf.hiddenStates, inputRmsWeight,
+                                        rms_norm_eps, buf.attenInput);
                     }
                     PagedCacheManager *inputConvPool = Qwen35FindLinearSlotPool(
                         this, gpuId, i, QWEN35_LINEAR_SLOT_CONV, linearSlotCapacity);
@@ -11673,7 +11682,7 @@ namespace fastllm {
                                        localQkvDim + localVd +
                                            localValueHeads * 2,
                                        buf.ba);
-                    } else {
+                    } else if (!preparedBa) {
                         Qwen3CudaLinear(cudaRunner, buf.attenInput,
                                         *requireLocal(weight[baWeightName], baWeightName),
                                         *requireLocal(GetThreadTensorParallelBias(baWeightName + ".tp_bias"),
