@@ -945,6 +945,12 @@ if (UNIT_TEST)
         endif()
 
 
+        add_executable(cuda_rmsnorm_decode_test test/basic/test_cuda_rmsnorm_decode.cu)
+        target_link_libraries(cuda_rmsnorm_decode_test PRIVATE fastllm)
+        set_target_properties(cuda_rmsnorm_decode_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME cuda_rmsnorm_decode COMMAND cuda_rmsnorm_decode_test)
+        set_tests_properties(cuda_rmsnorm_decode PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+
         add_executable(cuda_nvfp4_fused_test test/basic/test_cuda_nvfp4_fused.cu)
         target_link_libraries(cuda_nvfp4_fused_test PRIVATE fastllm)
         set_target_properties(cuda_nvfp4_fused_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)

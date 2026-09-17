@@ -11,6 +11,7 @@
 #include "fastllm-cuda-mtp.cuh"
 #ifndef USE_ROCM
 #include "fastllm-cuda-ordered-reduce.cuh"
+#include "fastllm-rmsnorm-decode.cuh"
 #endif
 #include "fastllm.h"
 #include "utils/utils.h"
@@ -7827,6 +7828,48 @@ bool FastllmCudaCumSumDecayMaskNegMulCausal(
     return true;
 }
 
+#ifndef USE_ROCM
+// The existing generic kernels remain the fallback for all other shapes,
+// explicit thread-count overrides, alignments, and opt-out configurations.
+template <class T>
+static bool TryLaunchFastllmRMSNormDecode(const T *input, const float *weight, T *output,
+                                        int outer, int channels, float eps) {
+    if (outer != 1 || channels != 5120 ||
+        reinterpret_cast<uintptr_t>(input) % alignof(uint32_t) ||
+        reinterpret_cast<uintptr_t>(output) % alignof(uint32_t) ||
+        reinterpret_cast<uintptr_t>(weight) % alignof(float2)) {
+        return false;
+    }
+    const char *flag = std::getenv("FASTLLM_CUDA_RMSNORM_DECODE");
+    if (flag != nullptr && flag[0] != '\0' &&
+        !FastllmCudaEnvFlagEnabled("FASTLLM_CUDA_RMSNORM_DECODE")) {
+        return false;
+    }
+    // Query the actual specialization once per host thread/device/type. No tensor
+    // allocation or writes occur here, including during graph capture.
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        return false;
+    }
+    static thread_local std::map<int, bool> available;
+    auto it = available.find(device);
+    if (it == available.end()) {
+        cudaFuncAttributes attributes{};
+        cudaError_t status = cudaFuncGetAttributes(&attributes, fastllm::normdecode::Kernel<T>);
+        bool supported = status == cudaSuccess && attributes.maxThreadsPerBlock >= 512;
+        if (status != cudaSuccess) {
+            cudaGetLastError(); // Do not leave an unavailable-image error on the fallback path.
+        }
+        it = available.emplace(device, supported).first;
+    }
+    if (!it->second) {
+        return false;
+    }
+    fastllm::normdecode::Kernel<T><<<1, 512>>>(input, weight, output, eps);
+    return true;
+}
+#endif
+
 static bool LaunchFastllmRMSNormFloat16(
         const half *input, const float *weight, half *output,
         int outer, int channels, float eps, int threadCount) {
@@ -7845,6 +7888,11 @@ static bool LaunchFastllmRMSNormFloat16(
     if (threadCount != 0) {
         return false;
     }
+#ifndef USE_ROCM
+    if (TryLaunchFastllmRMSNormDecode(input, weight, output, outer, channels, eps)) {
+        return true;
+    }
+#endif
     if (channels < 512) {
         FastllmRMSNormKernelInner1<64><<<outer, 64>>>(
             (half*)input, (float*)weight, output, outer, channels, eps);
@@ -7902,6 +7950,11 @@ static bool LaunchFastllmRMSNormBFloat16(
     if (threadCount != 0) {
         return false;
     }
+#ifndef USE_ROCM
+    if (TryLaunchFastllmRMSNormDecode(input, weight, output, outer, channels, eps)) {
+        return true;
+    }
+#endif
     if (channels < 512) {
         FastllmRMSNormKernelInner1<64><<<outer, 64>>>(
             input, weight, output, outer, channels, eps);
