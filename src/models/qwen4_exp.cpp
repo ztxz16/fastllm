@@ -19,6 +19,7 @@
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
+#include "fastllm-cuda-mtp.cuh"
 #ifndef USE_ROCM
 #include "devices/cuda/fastllm-cuda-moe-policy.h"
 #endif
@@ -972,9 +973,6 @@ namespace fastllm {
             return std::max(0, std::min(
                 8, Qwen4EnvInt("FASTLLM_QWEN4_ENABLE_MTP", 0)));
         }
-
-        constexpr float QWEN4_MTP_TYPICAL_POSTERIOR_THRESHOLD = 0.09f;
-        constexpr float QWEN4_MTP_TYPICAL_POSTERIOR_ALPHA = 0.3f;
 
         const std::string kMtpExpertPrefix = "mtp.layers.0.mlp.experts.";
         const std::string kMtpPackedGateName = kMtpExpertPrefix + "gate_up_proj";
@@ -4464,6 +4462,10 @@ namespace fastllm {
                         if (capacity > sequence) {
                             rawKeyCapture->Expansion(
                                 {capacity, this->indexerHeadDim});
+                        } else {
+                            // CatDirect needs capacity metadata when this
+                            // buffer is reset to zero rows and reused.
+                            rawKeyCapture->expansionDims = rawKeyCapture->dims;
                         }
                         rawKeyCapture->Resize(
                             {sequence, this->indexerHeadDim});
@@ -6462,6 +6464,28 @@ namespace fastllm {
         state.processedTokens = checkpoint.processedTokens;
     }
 
+#ifdef USE_CUDA
+    namespace {
+        struct Qwen4CudaCopyBatch {
+            std::vector<void *> destinations;
+            std::vector<const void *> sources;
+            std::vector<size_t> sizes;
+
+            void Add(Data &destination, const Data &source) {
+                destinations.push_back(destination.cudaData);
+                sources.push_back(source.cudaData);
+                sizes.push_back(source.GetBytes());
+            }
+
+            bool Copy() const {
+                return FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
+                    destinations.data(), sources.data(), sizes.data(),
+                    (int)destinations.size());
+            }
+        };
+    }
+#endif
+
     void Qwen4ExpModel::CaptureTargetRuntimeCheckpoint(
             std::vector<std::pair<Data, Data>> &pastKeyValues,
             RequestState &state,
@@ -6473,9 +6497,8 @@ namespace fastllm {
         checkpoint.linearFirst.resize(this->block_cnt);
         checkpoint.linearSecond.resize(this->block_cnt);
 #ifdef USE_CUDA
-        std::vector<void *> checkpointDestinations;
-        std::vector<const void *> checkpointSources;
-        std::vector<size_t> checkpointSizes;
+        // Each copy kernel may only access state on its own CUDA device.
+        std::map<int, Qwen4CudaCopyBatch> checkpointCopies;
         auto captureLinearState = [&](Data &destination,
                                       const Data &source) {
             const bool reusable =
@@ -6500,9 +6523,9 @@ namespace fastllm {
             destination.expansionDims = source.expansionDims;
             destination.expansionSize = source.expansionSize;
             destination.expansionBytes = source.expansionBytes;
-            checkpointDestinations.push_back(destination.cudaData);
-            checkpointSources.push_back(source.cudaData);
-            checkpointSizes.push_back(source.GetBytes());
+            const int device = source.dataDeviceIds.empty()
+                ? FastllmCudaGetDevice() : source.dataDeviceIds[0];
+            checkpointCopies[device].Add(destination, source);
         };
 #endif
         std::map<int, int> qsaLengths;
@@ -6531,14 +6554,10 @@ namespace fastllm {
             qsaLengths[layer] = checkpoint.keyLengths[layer];
         }
 #ifdef USE_CUDA
-        if (!checkpointDestinations.empty()) {
-            const bool copied =
-                FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
-                    checkpointDestinations.data(),
-                    checkpointSources.data(), checkpointSizes.data(),
-                    (int)checkpointDestinations.size());
+        for (const auto &copy : checkpointCopies) {
+            Qwen4CudaDeviceGuard deviceGuard({copy.first});
             AssertInFastLLM(
-                copied,
+                copy.second.Copy(),
                 "Qwen4-Exp failed to batch its MTP linear checkpoints.");
             if (synchronize) {
                 // ForwardTarget may dispatch a later layer from another host
@@ -6556,9 +6575,7 @@ namespace fastllm {
             std::vector<std::pair<Data, Data>> &pastKeyValues,
             const TargetRuntimeCheckpoint &checkpoint) {
 #ifdef USE_CUDA
-        std::vector<void *> destinations;
-        std::vector<const void *> sources;
-        std::vector<size_t> sizes;
+        std::map<int, Qwen4CudaCopyBatch> copies;
 #endif
         for (int layer = 0; layer < this->block_cnt; layer++) {
             if (!this->IsLinearAttentionLayer(layer)) {
@@ -6581,22 +6598,19 @@ namespace fastllm {
                 destination.GetBytes() == source.GetBytes() &&
                 destination.dataDeviceIds == source.dataDeviceIds;
             if (reusable) {
-                destinations.push_back(destination.cudaData);
-                sources.push_back(source.cudaData);
-                sizes.push_back(source.GetBytes());
+                const int device = source.dataDeviceIds.empty()
+                    ? FastllmCudaGetDevice() : source.dataDeviceIds[0];
+                copies[device].Add(destination, source);
                 continue;
             }
 #endif
             destination.CopyFrom(source);
         }
 #ifdef USE_CUDA
-        if (!destinations.empty()) {
-            const bool copied =
-                FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
-                    destinations.data(), sources.data(), sizes.data(),
-                    (int)destinations.size());
+        for (const auto &copy : copies) {
+            Qwen4CudaDeviceGuard deviceGuard({copy.first});
             AssertInFastLLM(
-                copied,
+                copy.second.Copy(),
                 "Qwen4-Exp failed to commit its MTP recurrent state.");
         }
 #endif
@@ -6783,6 +6797,7 @@ namespace fastllm {
         for (int replayIndex = cudaReplayedLayerCount;
              replayIndex < (int)linearReplayLayers.size(); replayIndex++) {
                 const int layer = linearReplayLayers[replayIndex];
+                ApplyDeviceMap(this->deviceMap, layer + 1, this->block_cnt);
                 pastKeyValues[layer].first.CopyFrom(
                     checkpoint.linearFirst[layer]);
                 if (linearStateCheckpoints[layer] !=
@@ -6865,6 +6880,7 @@ namespace fastllm {
         // Only rank zero owns the TP PLE history. The target broadcast
         // already supplied the residual; rollback needs no second broadcast.
         if (threadTpRank <= 0) {
+            ApplyDeviceMap(this->deviceMap, this->pleLayer + 1, this->block_cnt);
             RunPLE(committedPleInput, committedIds, state, unusedPle,
                    &candidateTokens);
         }
@@ -6905,6 +6921,7 @@ namespace fastllm {
                 captured != capture.qsaRawKeys.end() &&
                 !captured->second.dims.empty(),
                 "Qwen4-Exp MTP QSA capture is incomplete.");
+            ApplyDeviceMap(this->deviceMap, layer + 1, this->block_cnt);
             Data rawKeyPrefix, qsaPositions;
             Split(captured->second, 0, 0, committedInputs,
                   rawKeyPrefix);
@@ -7157,6 +7174,8 @@ namespace fastllm {
             Data *sampledTokenIds,
             Data *sampledTokenValues,
             int sampledTokenOffset) {
+        // Rejection replay can finish on an earlier pipeline device.
+        ApplyDeviceMap(this->deviceMap, this->block_cnt, this->block_cnt);
         const int sequence = (int)inputTokens.size();
         AssertInFastLLM(
             sequence > 0 && positions.size() == inputTokens.size() &&
@@ -7195,6 +7214,7 @@ namespace fastllm {
         MtpDraftCudaGraphState::Segment *draftGraphSegment = nullptr;
         std::unique_lock<std::mutex> draftGraphLock;
         bool deviceSampling = false;
+        int sampledProposalToken = -1;
 #ifdef USE_CUDA
         deviceSampling = sampleToken && sampledTokenOffset >= 0 &&
             sampledTokenIds != nullptr && sampledTokenValues != nullptr &&
@@ -7212,7 +7232,8 @@ namespace fastllm {
             !this->mtpMoeWeights.empty() &&
             !FastllmCudaUseMoeHybrid(this->mtpMoeWeights.data(), this->mtpMoeWeights.size());
         const bool draftGraphEligible = ThreadTpAllTrue(
-            GetFastllmEnv().cudaGraph && sampleToken &&
+            // Sampling scratch and RNG must remain outside a captured graph.
+            GetFastllmEnv().cudaGraph && sampleToken && !state.sampleProposal &&
             (deviceDraftGraph || tpDraftGraph) &&
             targetHiddenStates.dataDevice == DataDevice::CUDA &&
             targetHiddenStates.cudaData != nullptr &&
@@ -7415,6 +7436,43 @@ namespace fastllm {
             Linear(*headInput, draftLmHead, Data(), headLogits);
             ToDataType(headLogits, logits, DataType::FLOAT32);
 #ifdef USE_CUDA
+            if (state.sampleProposal) {
+                AssertInFastLLM(threadTpRank < 0 &&
+                    logits.dataDevice == DataDevice::CUDA && logits.cudaData != nullptr,
+                    "Qwen4-Exp sampled MTP proposals require full CUDA logits.");
+                const int device = logits.dataDeviceIds.empty()
+                    ? FastllmCudaGetDevice() : logits.dataDeviceIds[0];
+                Qwen4CudaDeviceGuard samplingDeviceGuard({device});
+                const int capacity = Qwen4MtpDraftsPerStep();
+                const int slot = state.proposalCount;
+                const int vocab = logits.dims.back();
+                AssertInFastLLM(slot < capacity &&
+                    (!deviceSampling || sampledTokenOffset == slot),
+                    "Qwen4-Exp MTP proposal slot is out of sync.");
+                AssertInFastLLM(
+                    Qwen4PrepareDecodeGraphWorkspace(state.proposalLogits,
+                        DataType::FLOAT32, {capacity, vocab}, device) &&
+                    Qwen4PrepareDecodeGraphWorkspace(state.proposalLogsumexp,
+                        DataType::FLOAT32, {capacity}, device) &&
+                    Qwen4PrepareDecodeGraphWorkspace(state.sampledTokenIds,
+                        DataType::INT32, {capacity}, device) &&
+                    Qwen4PrepareDecodeGraphWorkspace(state.sampledTokenValues,
+                        DataType::FLOAT32, {capacity}, device),
+                    "Qwen4-Exp MTP proposal buffers could not be allocated.");
+                AssertInFastLLM(FastllmCudaMtpSampleDraftLogits(
+                    (const float*)logits.cudaData,
+                    (float*)state.proposalLogits.cudaData + (size_t)slot * vocab,
+                    (float*)state.proposalLogsumexp.cudaData + slot,
+                    (int*)state.sampledTokenIds.cudaData + slot,
+                    (float*)state.sampledTokenValues.cudaData + slot,
+                    &state.proposalTemperature, 1, vocab),
+                    "Qwen4-Exp MTP proposal sampling failed.");
+                state.proposalCount++;
+                if (deviceSampling) return true;
+                FastllmCudaCopyFromDeviceToHost(&sampledProposalToken,
+                    (int*)state.sampledTokenIds.cudaData + slot, sizeof(int));
+                return false;
+            }
             if (deviceSampling && logits.dataDevice == DataDevice::CUDA &&
                 logits.dataType == DataType::FLOAT32 && logits.cudaData != nullptr) {
                 int *sampledId = reinterpret_cast<int *>(
@@ -7659,6 +7717,7 @@ namespace fastllm {
             // complete autoregressive chain.
             return -1;
         }
+        if (state.sampleProposal) return sampledProposalToken;
         int tpToken;
         if (threadTpOwner != nullptr && threadTpOwner->TrySampleLogits(
                 threadTpRank, logits, GenerationConfig(), 0, tpToken)) {
@@ -10189,6 +10248,9 @@ namespace fastllm {
                                          const std::vector<int> &tokens,
                                          const std::vector<int> &positions) {
             mtp.proposals.clear();
+            mtp.sampleProposal = !generationConfig.IsSimpleGreedy();
+            mtp.proposalTemperature = generationConfig.temperature;
+            mtp.proposalCount = 0;
             std::vector<Data> hiddenStates(2);
             int currentHidden = 0;
             Data &sampledTokenIds = mtp.sampledTokenIds;
@@ -11196,32 +11258,39 @@ namespace fastllm {
                     rows, std::max(1, generationConfig.top_k));
                 std::vector<float> topPs(rows, generationConfig.top_p);
                 const int candidateCount = rows - 1;
-                std::vector<int> candidateIds(candidateCount);
-                std::vector<int> candidateRows(candidateCount);
+                AssertInFastLLM(requestState->mtpState != nullptr,
+                    "Qwen4-Exp MTP verification has no proposal state.");
+                MtpRuntimeState &proposal = *requestState->mtpState;
+                AssertInFastLLM(proposal.sampleProposal &&
+                    proposal.proposalCount == candidateCount &&
+                    (int)proposal.proposals.size() == candidateCount &&
+                    proposal.proposalLogits.dims ==
+                        std::vector<int>({candidateCount, logits.dims.back()}),
+                    "Qwen4-Exp MTP verification is missing its actual proposal distribution.");
                 for (int row = 0; row < candidateCount; row++) {
-                    candidateIds[row] = (*hostInputTokens)[row + 1];
-                    candidateRows[row] = row;
+                    AssertInFastLLM(proposal.proposals[row] == (*hostInputTokens)[row + 1],
+                        "Qwen4-Exp MTP proposal tokens are out of sync.");
+                }
+                for (Data *data : {&proposal.proposalLogits,
+                                  &proposal.proposalLogsumexp,
+                                  &proposal.sampledTokenIds}) {
+                    data->ToDevice(DataDevice::CUDA, std::vector<int>{device});
                 }
                 allVerificationTokens->assign(rows, -1);
                 verificationAccepted->assign(candidateCount, 0);
-                std::vector<int> recoveredIds(candidateCount, -1);
-                AssertInFastLLM(
-                    FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
-                        reinterpret_cast<float *>(logits.cudaData),
-                        temperatures.data(), topKs.data(), topPs.data(),
-                        allVerificationTokens->data(), rows,
-                        logits.dims.back(), candidateIds.data(),
-                        candidateRows.data(),
-                        verificationAccepted->data(), recoveredIds.data(),
-                        candidateCount,
-                        QWEN4_MTP_TYPICAL_POSTERIOR_THRESHOLD,
-                        QWEN4_MTP_TYPICAL_POSTERIOR_ALPHA),
+                int accepted = 0;
+                AssertInFastLLM(FastllmCudaMtpRejectionSamplingLogits(
+                    (float*)logits.cudaData,
+                    (const float*)proposal.proposalLogits.cudaData,
+                    (const float*)proposal.proposalLogsumexp.cudaData,
+                    (const int*)proposal.sampledTokenIds.cudaData,
+                    temperatures.data(), topKs.data(), topPs.data(),
+                    allVerificationTokens->data(), &accepted,
+                    1, candidateCount, logits.dims.back()),
                     "Qwen4-Exp CUDA MTP rejection sampling failed.");
-                // Match Qwen3.5: accepted rows commit their draft token;
-                // the first rejected row recovers with the target argmax.
-                for (int row = 0; row < candidateCount; row++) {
-                    (*allVerificationTokens)[row] = recoveredIds[row];
-                }
+                AssertInFastLLM(accepted >= 0 && accepted <= candidateCount,
+                    "Qwen4-Exp MTP returned an invalid accepted prefix length.");
+                std::fill_n(verificationAccepted->begin(), accepted, 1);
 #else
                 AssertInFastLLM(
                     false,

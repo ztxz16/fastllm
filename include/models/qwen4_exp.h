@@ -195,6 +195,12 @@ namespace fastllm {
             // the host reads only the compact token-id prefix.
             Data sampledTokenIds;
             Data sampledTokenValues;
+            // Actual temperature-scaled draft distribution, as in Qwen3.5.
+            Data proposalLogits;
+            Data proposalLogsumexp;
+            float proposalTemperature = 1.0f;
+            bool sampleProposal = false;
+            int proposalCount = 0;
             std::shared_ptr<MtpDraftCudaGraphState> draftGraphState;
             std::vector<int> proposals;
             std::deque<int> pendingOutputTokens;
