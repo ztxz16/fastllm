@@ -1030,17 +1030,16 @@ __global__ void FastllmGemvFp32Fp16HyperProjectKernel(
 }
 
 // The Qwen hyper-connection up projection is a particularly skinny
-// FP32xFP16 GEMV (M=320) repeated for four verifier rows. The generic kernel
+// FP32xFP16 GEMV (M=320) for one to seven input rows. The generic kernel
 // assigns one 256-thread CTA to every output even though only 80 legacy lanes
 // load data. One warp below reproduces those 80 lanes locally, including the
 // compensated 64->32 and final warp reduction order, and a CTA handles eight
 // adjacent outputs. This is a shape specialization only; all other devices
 // and shapes retain the generic path.
-template <int WARPS_PER_BLOCK = 8>
+template <int PART, int WARPS_PER_BLOCK = 8>
 __global__ __launch_bounds__(WARPS_PER_BLOCK * 32)
-void FastllmGemvFp32Fp16M320MultiRow4WarpRowsKernel(
+void FastllmGemvFp32Fp16M320MultiRowWarpRowsKernel(
         const float *A, const half *B, float *C, const float *bias, int k) {
-    constexpr int PART = 4;
     constexpr int INPUT_SIZE = 320;
     constexpr int VALUES_PER_LOAD = 4;
     constexpr int VIRTUAL_LANES = 3;
@@ -1126,11 +1125,10 @@ void FastllmGemvFp32Fp16M320MultiRow4WarpRowsKernel(
 // Companion specialization for M=640. Five virtual 32-lane groups represent
 // the 160 active lanes of the legacy CTA; zero-filled groups reproduce the
 // unused upper lanes in the 256-thread compensated reduction tree.
-template <int WARPS_PER_BLOCK = 8>
+template <int PART, int WARPS_PER_BLOCK = 8>
 __global__ __launch_bounds__(WARPS_PER_BLOCK * 32)
-void FastllmGemvFp32Fp16M640MultiRow4WarpRowsKernel(
+void FastllmGemvFp32Fp16M640MultiRowWarpRowsKernel(
         const float *A, const half *B, float *C, const float *bias, int k) {
-    constexpr int PART = 4;
     constexpr int INPUT_SIZE = 640;
     constexpr int VALUES_PER_LOAD = 4;
     constexpr int VIRTUAL_LANES = 5;
@@ -1255,48 +1253,43 @@ static void FastllmCudaFP16EnsureBiasHalfOnDevice(fastllm::Data &weight, const f
     }
 }
 
-void LaunchFastllmGemmFp32Fp16(float *input, half *weight, float *output, float *bias, int n, int m, int k) {
-    if (n == 1) {
-        // With four input elements per thread, m <= 512 needs at most 128
-        // active lanes. The old 256-thread launch reduced an all-zero upper
-        // half before doing exactly the same 128-lane reduction. Keeping the
-        // load mapping and reduction tree below 128 unchanged preserves the
-        // float accumulation order while doubling resident blocks for small
-        // decode GEMVs such as HyperConnection's 320 -> hidden projection.
-        if (m <= 512 && m % 4 == 0) {
-            FastllmGemvFp32Fp16Kernel2MultiRow<128, 1> <<< k, 128 >>>(input, weight, output, bias, m, k);
-        } else {
-            FastllmGemvFp32Fp16Kernel2MultiRow<256, 1> <<< k, 256 >>>(input, weight, output, bias, m, k);
-        }
-    } else if (n == 2) {
-        FastllmGemvFp32Fp16Kernel2MultiRow<256, 2> <<< k, 256 >>>(input, weight, output, bias, m, k);
-    } else if (n == 3) {
-        FastllmGemvFp32Fp16Kernel2MultiRow<256, 3> <<< k, 256 >>>(input, weight, output, bias, m, k);
-    } else if (n == 4 && m == 320) {
-        FastllmGemvFp32Fp16M320MultiRow4WarpRowsKernel<8>
+// Share skinny/fixed-width projections across all small GEMV batches.
+template <int PART>
+static void LaunchFastllmGemmFp32Fp16SmallRows(
+        float *input, half *weight, float *output, float *bias, int m, int k) {
+    if (m == 320) {
+        FastllmGemvFp32Fp16M320MultiRowWarpRowsKernel<PART>
             <<<(k + 7) / 8, 256>>>(input, weight, output, bias, k);
-    } else if (n == 4 && m == 640) {
-        FastllmGemvFp32Fp16M640MultiRow4WarpRowsKernel<8>
+    } else if (m == 640) {
+        FastllmGemvFp32Fp16M640MultiRowWarpRowsKernel<PART>
             <<<(k + 7) / 8, 256>>>(input, weight, output, bias, k);
-    } else if (n == 4 && m == 2560 && k <= 2560) {
-        FastllmGemvFp32Fp16Kernel2MultiRow<256, 4, 2560>
+    } else if (m == 2560 && k <= 2560) {
+        FastllmGemvFp32Fp16Kernel2MultiRow<256, PART, 2560>
             <<<k, 256>>>(input, weight, output, bias, m, k);
-    } else if (n == 4) {
-        FastllmGemvFp32Fp16Kernel2MultiRow<256, 4> <<< k, 256 >>>(input, weight, output, bias, m, k);
-    } else if (n == 5) {
-        FastllmGemvFp32Fp16Kernel2MultiRow<256, 5> <<< k, 256 >>>(input, weight, output, bias, m, k);
-    } else if (n == 6) {
-        FastllmGemvFp32Fp16Kernel2MultiRow<256, 6> <<< k, 256 >>>(input, weight, output, bias, m, k);
-    } else if (n == 7) {
-        FastllmGemvFp32Fp16Kernel2MultiRow<256, 7> <<< k, 256 >>>(input, weight, output, bias, m, k);
+    } else if (PART == 1 && m <= 512 && m % 4 == 0) {
+        FastllmGemvFp32Fp16Kernel2MultiRow<128, 1>
+            <<<k, 128>>>(input, weight, output, bias, m, k);
     } else {
-        for (int i = 0; i < n; i++) {
-            FastllmGemvFp32Fp16Kernel2MultiRow<256, 1> <<< k, 256 >>>(input + i * m, weight, output + i * k, bias, m, k);
-        }
-        return;
+        FastllmGemvFp32Fp16Kernel2MultiRow<256, PART>
+            <<<k, 256>>>(input, weight, output, bias, m, k);
+    }
+}
 
-        printf("Error: LaunchFastllmGemmFp32Fp16: n > 7.\n");
-        exit(0);
+void LaunchFastllmGemmFp32Fp16(float *input, half *weight, float *output, float *bias, int n, int m, int k) {
+    switch (n) {
+        case 1: LaunchFastllmGemmFp32Fp16SmallRows<1>(input, weight, output, bias, m, k); break;
+        case 2: LaunchFastllmGemmFp32Fp16SmallRows<2>(input, weight, output, bias, m, k); break;
+        case 3: LaunchFastllmGemmFp32Fp16SmallRows<3>(input, weight, output, bias, m, k); break;
+        case 4: LaunchFastllmGemmFp32Fp16SmallRows<4>(input, weight, output, bias, m, k); break;
+        case 5: LaunchFastllmGemmFp32Fp16SmallRows<5>(input, weight, output, bias, m, k); break;
+        case 6: LaunchFastllmGemmFp32Fp16SmallRows<6>(input, weight, output, bias, m, k); break;
+        case 7: LaunchFastllmGemmFp32Fp16SmallRows<7>(input, weight, output, bias, m, k); break;
+        default:
+            for (int i = 0; i < n; i++) {
+                FastllmGemvFp32Fp16Kernel2MultiRow<256, 1>
+                    <<<k, 256>>>(input + i * m, weight, output + i * k, bias, m, k);
+            }
+            break;
     }
 }
 
@@ -1759,9 +1752,27 @@ bool FastllmCudaQwen4HyperProject(
                 FASTLLM_QWEN4_HYPER_PROJECT_LAUNCH(4);
             }
             break;
-        case 5: FASTLLM_QWEN4_HYPER_PROJECT_LAUNCH(5); break;
-        case 6: FASTLLM_QWEN4_HYPER_PROJECT_LAUNCH(6); break;
-        case 7: FASTLLM_QWEN4_HYPER_PROJECT_LAUNCH(7); break;
+        case 5:
+            if (m == 10240) {
+                FASTLLM_QWEN4_HYPER_PROJECT_FIXED_LAUNCH(5);
+            } else {
+                FASTLLM_QWEN4_HYPER_PROJECT_LAUNCH(5);
+            }
+            break;
+        case 6:
+            if (m == 10240) {
+                FASTLLM_QWEN4_HYPER_PROJECT_FIXED_LAUNCH(6);
+            } else {
+                FASTLLM_QWEN4_HYPER_PROJECT_LAUNCH(6);
+            }
+            break;
+        case 7:
+            if (m == 10240) {
+                FASTLLM_QWEN4_HYPER_PROJECT_FIXED_LAUNCH(7);
+            } else {
+                FASTLLM_QWEN4_HYPER_PROJECT_LAUNCH(7);
+            }
+            break;
         default: break;
     }
 #undef FASTLLM_QWEN4_HYPER_PROJECT_FIXED_LAUNCH
