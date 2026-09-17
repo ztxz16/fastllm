@@ -26,46 +26,46 @@ bool Bias(const Data &b, int n, int device) {
     return b.dims.empty() ||
            (b.dataType == DataType::FLOAT32 && b.dims == std::vector<int>{n} && DenseCuda(b, device, 4));
 }
-template <class T, int BT, int W, int R, int V, int Chains = 4>
+template <class T, int BT, int W, int R, int V, int Chains = 4, bool Dynamic = false>
 void Launch(Data &input, Data &weight, const Data &bias, const Data &cw, const Data &cb, Data &cache,
             const Data *slots, Data &out, Data &z, int batch) {
-    gdn::InputConvKernel<T, BT, W, R, V, Chains>
-        <<<dim3(16384 / (W * R), (batch + BT - 1) / BT), W * 32, 0, cudaStreamPerThread>>>(
+    gdn::InputConvKernel<T, BT, W, R, V, Chains, Dynamic>
+        <<<dim3((weight.dims[0] + W * R - 1) / (W * R), (batch + BT - 1) / BT), W * 32, 0, cudaStreamPerThread>>>(
             (const T *)input.cudaData, (const uint8_t *)weight.cudaData,
             (const float *)weight.extraCudaData[0],
             bias.dims.empty() ? nullptr : (const float *)bias.cudaData, (const float *)cw.cudaData,
             cb.dims.empty() ? nullptr : (const float *)cb.cudaData, (T *)cache.cudaData,
-            slots ? (const int *)slots->cudaData : nullptr, (T *)out.cudaData, (T *)z.cudaData, batch);
+            slots ? (const int *)slots->cudaData : nullptr, (T *)out.cudaData, (T *)z.cudaData, batch, weight.dims[1], cw.dims[0], weight.dims[0] - cw.dims[0]);
 }
-template <class T>
+template <class T, bool Dynamic = false>
 void Dispatch(Data &input, Data &weight, const Data &bias, const Data &cw, const Data &cb, Data &cache,
               const Data *slots, Data &out, Data &z, int batch) {
     // All tiles are exact: never dispatch a rounded-up partial batch.
     switch (batch) {
     case 1:
-        Launch<T, 1, 8, 2, 8>(input, weight, bias, cw, cb, cache, slots, out, z, batch);
+        Launch<T, 1, 8, 2, 8, 4, Dynamic>(input, weight, bias, cw, cb, cache, slots, out, z, batch);
         break;
     case 2:
-        Launch<T, 2, 4, 2, 8>(input, weight, bias, cw, cb, cache, slots, out, z, batch);
+        Launch<T, 2, 4, 2, 8, 4, Dynamic>(input, weight, bias, cw, cb, cache, slots, out, z, batch);
         break;
     case 3:
-        Launch<T, 3, 4, 2, 8>(input, weight, bias, cw, cb, cache, slots, out, z, batch);
+        Launch<T, 3, 4, 2, 8, 4, Dynamic>(input, weight, bias, cw, cb, cache, slots, out, z, batch);
         break;
     case 4:
-        Launch<T, 4, 4, 2, 8>(input, weight, bias, cw, cb, cache, slots, out, z, batch);
+        Launch<T, 4, 4, 2, 8, 4, Dynamic>(input, weight, bias, cw, cb, cache, slots, out, z, batch);
         break;
     case 5:
-        Launch<T, 5, 4, 2, 8>(input, weight, bias, cw, cb, cache, slots, out, z, batch);
+        Launch<T, 5, 4, 2, 8, 4, Dynamic>(input, weight, bias, cw, cb, cache, slots, out, z, batch);
         break;
     case 6:
-        Launch<T, 6, 4, 2, 8>(input, weight, bias, cw, cb, cache, slots, out, z, batch);
+        Launch<T, 6, 4, 2, 8, 4, Dynamic>(input, weight, bias, cw, cb, cache, slots, out, z, batch);
         break;
     case 7:
-        Launch<T, 7, 4, 2, 8>(input, weight, bias, cw, cb, cache, slots, out, z, batch);
+        Launch<T, 7, 4, 2, 8, 4, Dynamic>(input, weight, bias, cw, cb, cache, slots, out, z, batch);
         break;
     case 8:
         // More rows share each activation load; one chain limits register use.
-        Launch<T, 8, 8, 4, 8, 1>(input, weight, bias, cw, cb, cache, slots, out, z, batch);
+        Launch<T, 8, 8, 4, 8, 1, Dynamic>(input, weight, bias, cw, cb, cache, slots, out, z, batch);
         break;
     default:
         AssertInFastLLM(false, "Unsupported fused GDN batch.\n");
@@ -138,9 +138,14 @@ bool FastllmCudaGdnInputConvCanRun(const Data &input, const Data &weight, const 
     if (enabled && (!std::strcmp(enabled, "0") || !std::strcmp(enabled, "false")))
         return false;
     if (batch > 8 || !FastllmCudaGdnInputConvValidInputs(input, weight, bias, cw, cb, cache, slots, batch) ||
-        weight.dataType != DataType::FP8_E4M3 || weight.dims != std::vector<int>({16384, 5120}) ||
-        weight.blockK != 1 || weight.blockM != 5120 || weight.IsRepacked || weight.scales.size() != 16384 ||
-        cw.dims[0] != 10240)
+        weight.dataType != DataType::FP8_E4M3 || weight.dims[1] < 256 || weight.dims[1] > 32768 ||
+        weight.dims[1] % 256 != 0 || weight.dims[0] > 65536 ||
+        weight.blockK != 1 || weight.blockM != weight.dims[1] || weight.IsRepacked ||
+        weight.scales.size() != size_t(weight.dims[0]))
+        return false;
+    const char *generic = std::getenv("FASTLLM_CUDA_TP_FUSIONS");
+    if (generic && (!std::strcmp(generic, "0") || !std::strcmp(generic, "false")) &&
+        (weight.dims != std::vector<int>({16384, 5120}) || cw.dims[0] != 10240))
         return false;
     int device = 0;
     if (cudaGetDevice(&device) != cudaSuccess)
@@ -158,7 +163,7 @@ bool FastllmCudaGdnInputConvCanRun(const Data &input, const Data &weight, const 
         // the same architecture list. Querying one verifies a loadable image,
         // including builds whose CUDA_ARCH does not cover this device.
         cudaFuncAttributes attributes{};
-        cudaError_t status = cudaFuncGetAttributes(&attributes, gdn::InputConvKernel<half, 1>);
+        cudaError_t status = cudaFuncGetAttributes(&attributes, gdn::InputConvKernel<half, 1, 8, 2, 8, 4, true>);
         if (status != cudaSuccess) {
             // An unsupported image is a capability miss, not a failed launch.
             cudaGetLastError();
@@ -177,8 +182,13 @@ bool FastllmCudaGdnInputConvCanRun(const Data &input, const Data &weight, const 
 }
 void FastllmCudaGdnInputConv(Data &input, Data &weight, const Data &bias, const Data &cw, const Data &cb,
                              Data &cache, const Data *slots, Data &out, Data &z, int batch) {
-    FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(weight, bias, 16384);
-    if (input.dataType == DataType::FLOAT16)
+    FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(weight, bias, weight.dims[0]);
+    if (weight.dims != std::vector<int>({16384, 5120}) || cw.dims[0] != 10240) {
+        if (input.dataType == DataType::FLOAT16)
+            Dispatch<half, true>(input, weight, bias, cw, cb, cache, slots, out, z, batch);
+        else
+            Dispatch<__nv_bfloat16, true>(input, weight, bias, cw, cb, cache, slots, out, z, batch);
+    } else if (input.dataType == DataType::FLOAT16)
         Dispatch<half>(input, weight, bias, cw, cb, cache, slots, out, z, batch);
     else
         Dispatch<__nv_bfloat16>(input, weight, bias, cw, cb, cache, slots, out, z, batch);

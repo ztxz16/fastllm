@@ -32,8 +32,9 @@ template <class T> static std::vector<T> Download(Data &d) {
     return v;
 }
 
-template <class T> void Run(DataType type) {
-    constexpr int K = 5120, N = 16384, C = 10240, Z = 6144, S = 16;
+template <class T> void Run(DataType type, int K, int N, int C) {
+    const int Z = N - C, S = 16;
+    printf("SHAPE type=%d K=%d N=%d C=%d\n", int(type), K, N, C);
     Data w(DataType::FP8_E4M3, {N, K}), cw(DataType::FLOAT32, {C, 4}), bias(DataType::FLOAT32, {N}),
         cb(DataType::FLOAT32, {C});
     w.blockK = 1;
@@ -65,8 +66,7 @@ template <class T> void Run(DataType type) {
     Upload(cw, conv);
     Upload(bias, pb);
     Upload(cb, bc);
-    std::vector<int> rows = {0,    1,    31,    127,   128,   2047,  2048,  4095, 4096,
-                             6143, 8191, 10238, 10239, 10240, 12288, 16382, 16383};
+    std::vector<int> rows = {0, 1, 31, 127, N / 2, C - 1, C, N - 2, N - 1};
     for (int testBatch : {1, 2, 3, 4, 5, 6, 7, 8, 9, -1}) {
         int batch = std::abs(testBatch);
         bool forcedFallback = testBatch < 0;
@@ -212,8 +212,12 @@ int main() {
         if (properties.major * 10 + properties.minor < 75)
             return 77;
         setenv("FASTLLM_CUDA_GDN_INPUT_CONV", "1", 1);
-        Run<half>(DataType::FLOAT16);
-        Run<__nv_bfloat16>(DataType::BFLOAT16);
+        for (auto shape : {std::vector<int>{5120,16384,10240}, {5120,8192,5120},
+                           {5120,6144,3840}, {5120,5120,3200}, {5120,4096,2560},
+                           {3072,4111,2567}}) {
+            Run<half>(DataType::FLOAT16, shape[0], shape[1], shape[2]);
+            Run<__nv_bfloat16>(DataType::BFLOAT16, shape[0], shape[1], shape[2]);
+        }
     } catch (const std::exception &e) {
         std::fprintf(stderr, "FAIL: %s\n", e.what());
         return 1;

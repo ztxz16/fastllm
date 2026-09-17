@@ -11597,8 +11597,9 @@ namespace fastllm {
                     PagedCacheManager *inputConvPool = Qwen35FindLinearSlotPool(
                         this, gpuId, i, QWEN35_LINEAR_SLOT_CONV, linearSlotCapacity);
                     bool projectedConvBlock = !fusedInputProjection && !hasMergedGdnInLinear &&
-                        hasQkvzGdnInLinear && localQkvDim == 10240 &&
-                        buf.attenInput.dims.back() == 5120 && inputConvPool != nullptr &&
+                        hasQkvzGdnInLinear && (localQkvDim == 10240 ||
+                            Qwen3CudaEnvDefaultEnabled("FASTLLM_CUDA_TP_FUSIONS")) &&
+                        buf.attenInput.dims.back() % 256 == 0 && inputConvPool != nullptr &&
                         workspace.linearSlotIds.cudaData != nullptr &&
                         (computeType == DataType::FLOAT16 || computeType == DataType::BFLOAT16);
                     if (projectedConvBlock) {
@@ -13446,7 +13447,8 @@ namespace fastllm {
                         rms_norm_eps, attenInput);
                 }
                 bool projectedConvBlock = !fusedInputProjection && !hasMergedGdnInLinear &&
-                    hasQkvzGdnInLinear && localQkvDim == 10240 && attenInput.dims.back() == 5120 &&
+                    hasQkvzGdnInLinear && (localQkvDim == 10240 ||
+                            Qwen3CudaEnvDefaultEnabled("FASTLLM_CUDA_TP_FUSIONS")) && attenInput.dims.back() % 256 == 0 &&
                     batch == 1 && all1 && !isPrefill &&
                     !speculativeCaptureFirstTokenLinearState && !speculativeCollectAllLogits &&
                     pastKeyValues[i].first->dims == std::vector<int>({1, localQkvDim, 4}) &&

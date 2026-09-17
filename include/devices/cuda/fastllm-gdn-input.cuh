@@ -12,17 +12,17 @@ namespace gdn {
 template <class T> __device__ __forceinline__ float Load(T x) { return float(x); }
 template <class T> __device__ __forceinline__ T Round(float x) { return T(x); }
 
-template <class T, int BatchTile, int Warps = 8, int Rows = 2, int Values = 8, int Chains = 4>
+template <class T, int BatchTile, int Warps = 8, int Rows = 2, int Values = 8, int Chains = 4, bool Dynamic = false>
 __global__ __launch_bounds__(Warps * 32, 2) void InputConvKernel(
     const T *__restrict__ input, const uint8_t *__restrict__ weight, const float *__restrict__ scales,
     const float *__restrict__ projectionBias, const float *__restrict__ convWeight,
     const float *__restrict__ convBias, T *__restrict__ cache, const int *__restrict__ slots,
-    T *__restrict__ convOutput, T *__restrict__ z, int /*batch*/) {
+    T *__restrict__ convOutput, T *__restrict__ z, int /*batch*/, int inputWidth = 5120, int channels = 10240, int zWidth = 6144) {
     static_assert(Chains > 0 && (Chains & (Chains - 1)) == 0);
     static_assert(Values == 8 || Values == 16);
     static_assert(BatchTile >= 1 && BatchTile <= 8);
-    static_assert((16384 % (Warps * Rows)) == 0);
-    constexpr int K = 5120, C = 10240, Z = 6144;
+    const int K = Dynamic ? inputWidth : 5120;
+    const int C = Dynamic ? channels : 10240, Z = Dynamic ? zWidth : 6144;
     int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     int row = blockIdx.x * (Warps * Rows) + warp * Rows;
     int firstBatch = blockIdx.y * BatchTile;
@@ -34,11 +34,15 @@ __global__ __launch_bounds__(Warps * 32, 2) void InputConvKernel(
 #pragma unroll
         for (int r = 0; r < Rows; ++r) {
             if constexpr (Values == 8) {
-                uint2 x = *reinterpret_cast<const uint2 *>(weight + (size_t)(row + r) * K + col);
+                uint2 x = {};
+                if (!Dynamic || row + r < C + Z)
+                    x = *reinterpret_cast<const uint2 *>(weight + (size_t)(row + r) * K + col);
                 codes[r][0] = x.x;
                 codes[r][1] = x.y;
             } else {
-                uint4 x = *reinterpret_cast<const uint4 *>(weight + (size_t)(row + r) * K + col);
+                uint4 x = {};
+                if (!Dynamic || row + r < C + Z)
+                    x = *reinterpret_cast<const uint4 *>(weight + (size_t)(row + r) * K + col);
                 codes[r][0] = x.x;
                 codes[r][1] = x.y;
                 codes[r][2] = x.z;
@@ -100,6 +104,7 @@ __global__ __launch_bounds__(Warps * 32, 2) void InputConvKernel(
     for (int index = threadIdx.x; index < BatchTile * Warps * Rows; index += Warps * 32) {
         int b = index / (Warps * Rows), local = index % (Warps * Rows);
         int n = blockIdx.x * (Warps * Rows) + local, request = firstBatch + b;
+        if (Dynamic && n >= C + Z) continue;
         float sum = totals[b][local];
         T projected = Round<T>(sum * scales[n] + (projectionBias ? projectionBias[n] : 0.f));
         if (n < C) {
