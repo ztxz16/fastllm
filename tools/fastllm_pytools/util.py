@@ -344,10 +344,31 @@ def _configure_multicuda_worker_affinity(tp, threads):
         target_node = min(target_node, len(node_paths) - 1)
 
         used_cpus = set()
-        per_node_threads = max(0, int(threads) // len(node_paths))
-        for node_path in node_paths:
+        numa_count = int(os.environ.get("FT_NUMAS", len(node_paths)))
+        if not 0 < numa_count <= len(node_paths):
+            numa_count = len(node_paths)
+        numa_threads = threads
+        if "FASTLLM_NUMA_THREADS" in os.environ:
+            numa_threads = int(os.environ["FASTLLM_NUMA_THREADS"]) * numa_count
+        numa_threads = int(os.environ.get("FT_THREADS", numa_threads))
+        if numa_threads <= 0:
+            return
+        per_node_threads = max(0, numa_threads // numa_count)
+        for node_path in node_paths[:numa_count]:
             with open(os.path.join(node_path, "cpulist"), "r", encoding="utf-8") as f:
-                used_cpus.update(_parse_cpu_list(f.read())[:per_node_threads])
+                node_cpus = _parse_cpu_list(f.read())
+            if "FASTLLM_NUMAS_DISABLE_LLC_SPREAD" not in os.environ:
+                cache_ids = set()
+                for cpu in node_cpus:
+                    with open(f"/sys/devices/system/cpu/cpu{cpu}/cache/index3/id",
+                              "r", encoding="utf-8") as f:
+                        cache_ids.add(int(f.read()))
+                if len(cache_ids) > 1:
+                    # NumaConfig spreads workers across LLCs instead of taking
+                    # the first N CPUs. Do not reserve a falsely "unused" core.
+                    print("[tp] NUMA uses LLC-spread placement; MultiCuda launch workers keep inherited CPU affinity")
+                    return
+            used_cpus.update(node_cpus[:per_node_threads])
 
         allowed = set(os.sched_getaffinity(0))
         physical_cpus = []
