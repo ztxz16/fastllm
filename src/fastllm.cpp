@@ -5168,10 +5168,10 @@ namespace fastllm {
         }, {}, {{"rotaryDim", rotaryDim}, {"part", part}});
     }
 
-    void RopeEncoding(Data &input, const Data &positionIds, int rotaryDim, float ropeTheta, float ropeScale) {
+    void RopeEncoding(Data &input, const Data &positionIds, int rotaryDim, float ropeTheta, float ropeScale, bool preciseFreq) {
         curExecutor->Run("RopeEncoding", {
             {"input", &input}, {"positionIds", (Data*)&positionIds}
-        }, {{"ropeTheta", ropeTheta}, {"ropeScale", ropeScale}}, {{"rotaryDim", rotaryDim}});
+        }, {{"ropeTheta", ropeTheta}, {"ropeScale", ropeScale}}, {{"rotaryDim", rotaryDim}, {"preciseFreq", preciseFreq}});
     }
 
     void Llama3RopeEncoding(Data &input, const Data &positionIds, int rotaryDim, float ropeTheta,

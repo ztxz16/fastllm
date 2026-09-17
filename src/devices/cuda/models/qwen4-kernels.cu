@@ -1,4 +1,5 @@
 #include "fastllm-cuda.cuh"
+#include "fastllm-cuda-rope.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -2161,11 +2162,11 @@ namespace {
     __global__ __launch_bounds__(64)
     void Qwen4QSAAppendCompress4ExactKernel(
             const float *rawKeys, const float *positions,
-            const float *normWeight, const float *sin, const float *cos,
+            const float *normWeight, float ropeTheta,
             const int32_t *decodeMeta, int previousLength,
             float *tailKeys,
             float *tailPositions, float *compressedKeys,
-            int compressedCapacity, int sinCosStride, float eps) {
+            int compressedCapacity, float eps) {
         constexpr int kSequence = 4;
         constexpr int kHeadDim = 128;
         constexpr int kRotaryPart = 64;
@@ -2260,10 +2261,10 @@ namespace {
         const int block = commitBlock;
         if (block >= 0 && block < compressedCapacity) {
             if (tid < kRotaryPart / 2) {
-                const float currentSin =
-                    sin[(uint64_t)ropeIndex * sinCosStride + tid];
-                const float currentCos =
-                    cos[(uint64_t)ropeIndex * sinCosStride + tid];
+                const float angle = FastllmPreciseRopeAngle(
+                    (float)ropeIndex, tid, kRotaryPart, ropeTheta);
+                const float currentSin = sinf(angle);
+                const float currentCos = cosf(angle);
                 const float low = normalized[tid];
                 const float high = normalized[
                     tid + kRotaryPart / 2];
@@ -3220,8 +3221,7 @@ static bool FastllmCudaQwen4QSAAppendCompress4Launch(
         const fastllm::Data &rawKeys,
         const fastllm::Data &positions,
         const fastllm::Data &normWeight,
-        const fastllm::Data &sinData,
-        const fastllm::Data &cosData,
+        float ropeTheta,
         const int32_t *decodeMeta, int previousLength,
         fastllm::Data &tailKeys,
         fastllm::Data &tailPositions,
@@ -3245,29 +3245,23 @@ static bool FastllmCudaQwen4QSAAppendCompress4Launch(
         rawKeys.dataDevice != fastllm::DataDevice::CUDA ||
         positions.dataDevice != fastllm::DataDevice::CUDA ||
         normWeight.dataDevice != fastllm::DataDevice::CUDA ||
-        sinData.dataDevice != fastllm::DataDevice::CUDA ||
-        cosData.dataDevice != fastllm::DataDevice::CUDA ||
         tailKeys.dataDevice != fastllm::DataDevice::CUDA ||
         tailPositions.dataDevice != fastllm::DataDevice::CUDA ||
         compressedKeys.dataDevice != fastllm::DataDevice::CUDA ||
         rawKeys.cudaData == nullptr || positions.cudaData == nullptr ||
-        normWeight.cudaData == nullptr || sinData.cudaData == nullptr ||
-        cosData.cudaData == nullptr || tailKeys.cudaData == nullptr ||
+        normWeight.cudaData == nullptr || tailKeys.cudaData == nullptr ||
         tailPositions.cudaData == nullptr ||
         compressedKeys.cudaData == nullptr ||
         rawKeys.dataType != fastllm::DataType::FLOAT32 ||
         positions.dataType != fastllm::DataType::FLOAT32 ||
         normWeight.dataType != fastllm::DataType::FLOAT32 ||
-        sinData.dataType != fastllm::DataType::FLOAT32 ||
-        cosData.dataType != fastllm::DataType::FLOAT32 ||
         tailKeys.dataType != fastllm::DataType::FLOAT32 ||
         tailPositions.dataType != fastllm::DataType::FLOAT32 ||
         compressedKeys.dataType != fastllm::DataType::FLOAT32 ||
         rawKeys.dims != std::vector<int>({sequence, headDim}) ||
         positions.Count(0) < sequence ||
         normWeight.Count(0) != headDim ||
-        sinData.dims.size() != 2 || cosData.dims != sinData.dims ||
-        sinData.dims[1] < 32 || tailCapacity < sequence ||
+        ropeTheta <= 0.0f || tailCapacity < sequence ||
         positionCapacity < sequence || compressedCapacity <= 0 ||
         (decodeMeta == nullptr &&
          previousLength / sequence + 1 > compressedCapacity) ||
@@ -3282,13 +3276,12 @@ static bool FastllmCudaQwen4QSAAppendCompress4Launch(
         (const float *)rawKeys.cudaData,
         (const float *)positions.cudaData,
         (const float *)normWeight.cudaData,
-        (const float *)sinData.cudaData,
-        (const float *)cosData.cudaData,
+        ropeTheta,
         decodeMeta, previousLength,
         (float *)tailKeys.cudaData,
         (float *)tailPositions.cudaData,
         (float *)compressedKeys.cudaData,
-        compressedCapacity, sinData.dims[1], eps);
+        compressedCapacity, eps);
     DeviceSync();
     return cudaGetLastError() == cudaSuccess;
 }
@@ -3297,15 +3290,14 @@ bool FastllmCudaQwen4QSAAppendCompress4(
         const fastllm::Data &rawKeys,
         const fastllm::Data &positions,
         const fastllm::Data &normWeight,
-        const fastllm::Data &sinData,
-        const fastllm::Data &cosData,
+        float ropeTheta,
         int previousLength,
         fastllm::Data &tailKeys,
         fastllm::Data &tailPositions,
         fastllm::Data &compressedKeys,
         float eps) {
     return FastllmCudaQwen4QSAAppendCompress4Launch(
-        rawKeys, positions, normWeight, sinData, cosData,
+        rawKeys, positions, normWeight, ropeTheta,
         nullptr, previousLength, tailKeys, tailPositions,
         compressedKeys, eps);
 }
@@ -3314,8 +3306,7 @@ bool FastllmCudaQwen4QSAAppendCompress4Graph(
         const fastllm::Data &rawKeys,
         const fastllm::Data &positions,
         const fastllm::Data &normWeight,
-        const fastllm::Data &sinData,
-        const fastllm::Data &cosData,
+        float ropeTheta,
         const int32_t *decodeMeta,
         fastllm::Data &tailKeys,
         fastllm::Data &tailPositions,
@@ -3325,7 +3316,7 @@ bool FastllmCudaQwen4QSAAppendCompress4Graph(
         return false;
     }
     return FastllmCudaQwen4QSAAppendCompress4Launch(
-        rawKeys, positions, normWeight, sinData, cosData,
+        rawKeys, positions, normWeight, ropeTheta,
         decodeMeta, 0, tailKeys, tailPositions,
         compressedKeys, eps);
 }

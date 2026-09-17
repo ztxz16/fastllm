@@ -2283,17 +2283,6 @@ namespace fastllm {
                 base, base, this->rotary_dim / 2 - base * 2};
         }
         this->rope_base = Qwen4DictFloat(weight.dicts, "rope_theta", 10000000.0f);
-        auto rope = this->UpdateRotaryPosEmb(this->rope_base, 1.0f);
-        this->qsaSinValues = rope.first;
-        this->qsaCosValues = rope.second;
-        this->sinData.ToDevice(DataDevice::CPU);
-        this->cosData.ToDevice(DataDevice::CPU);
-        this->sinData.CopyFrom(Data(DataType::FLOAT32,
-            {(int)this->sin.size(), (int)this->sin[0].size()},
-            this->qsaSinValues));
-        this->cosData.CopyFrom(Data(DataType::FLOAT32,
-            {(int)this->cos.size(), (int)this->cos[0].size()},
-            this->qsaCosValues));
 
         this->linearLayers.assign(this->block_cnt, true);
         for (int layer = 0; layer < this->block_cnt; layer++) {
@@ -3582,31 +3571,6 @@ namespace fastllm {
             patchWeight.Reshape({this->visionHiddenSize, patchDim});
         }
 
-        const int maxVisionPosition = 8192;
-        const int rotaryQuarter = this->visionHeadDim / 4;
-        std::vector<float> inverseFrequencies;
-        inverseFrequencies.reserve(rotaryQuarter);
-        for (int index = 0; index < this->visionHeadDim / 2; index += 2) {
-            inverseFrequencies.push_back(
-                1.0f / std::pow(10000.0f,
-                                (float)index /
-                                    (this->visionHeadDim / 2)));
-        }
-        std::vector<float> sine;
-        std::vector<float> cosine;
-        sine.reserve((size_t)maxVisionPosition * rotaryQuarter);
-        cosine.reserve((size_t)maxVisionPosition * rotaryQuarter);
-        for (int position = 0; position < maxVisionPosition; position++) {
-            for (float inverseFrequency : inverseFrequencies) {
-                const float angle = position * inverseFrequency;
-                sine.push_back(std::sin(angle));
-                cosine.push_back(std::cos(angle));
-            }
-        }
-        this->visionSinData.CopyFrom(Data(
-            DataType::FLOAT32, {maxVisionPosition, rotaryQuarter}, sine));
-        this->visionCosData.CopyFrom(Data(
-            DataType::FLOAT32, {maxVisionPosition, rotaryQuarter}, cosine));
         this->visionPrepared = true;
     }
 
@@ -3625,12 +3589,8 @@ namespace fastllm {
         Split(input, axis, half + quarter, input.dims.back(), fourth);
         Cat(first, third, axis, heightPair);
         Cat(second, fourth, axis, widthPair);
-        LlamaRotatePosition2DPart(
-            heightPair, positionH, this->visionSinData,
-            this->visionCosData, quarter, half);
-        LlamaRotatePosition2DPart(
-            widthPair, positionW, this->visionSinData,
-            this->visionCosData, quarter, half);
+        RopeEncoding(heightPair, positionH, half, 10000.0f, 1.0f, true);
+        RopeEncoding(widthPair, positionW, half, 10000.0f, 1.0f, true);
 
         Data rotatedFirst, rotatedSecond, rotatedThird, rotatedFourth;
         Data firstHalf, secondHalf, rotated;
@@ -3652,9 +3612,8 @@ namespace fastllm {
                 this->mropeSections[0], this->mropeSections[1],
                 this->mropeSections[2], this->rope_base, 1.0f);
         } else {
-            LlamaRotatePosition2DPart(
-                input, positionIds, this->sinData, this->cosData,
-                this->rotary_dim, this->rotary_dim);
+            RopeEncoding(input, positionIds,
+                this->rotary_dim, this->rope_base, 1.0f, true);
         }
     }
 
@@ -4363,14 +4322,14 @@ namespace fastllm {
                             (size_t)this->indexerHeadDim,
                         "Qwen4-Exp QSA key norm host cache is unavailable.");
         const float *keyNorm = normIt->second.data();
-        const float *sinValues = this->qsaSinValues.data();
-        const float *cosValues = this->qsaCosValues.data();
-        const int rotaryStride = this->sinData.dims.back();
-        AssertInFastLLM(!this->qsaSinValues.empty() &&
-                        this->qsaSinValues.size() == this->qsaCosValues.size() &&
-                        rotaryStride >= this->rotary_dim &&
-                        this->rotary_dim % 2 == 0,
-                        "Qwen4-Exp QSA received invalid rotary tables.");
+        AssertInFastLLM(this->rotary_dim > 0 && this->rotary_dim % 2 == 0 &&
+                        this->rotary_dim <= this->indexerHeadDim,
+                        "Qwen4-Exp QSA received invalid rotary dimensions.");
+        auto rotaryAngle = [&](int position, int column) {
+            const float inverse = (float)(1.0 / ::pow((double)this->rope_base,
+                (double)((float)(2 * column) / this->rotary_dim)));
+            return (float)position * inverse;
+        };
         const int rotaryHalf = this->rotary_dim / 2;
 
         auto updateHostBlockCache = [&](int hostKeyLength) {
@@ -4443,14 +4402,10 @@ namespace fastllm {
                             positionCache[mropePositions
                                 ? (size_t)groupStart * 3 + positionAxis
                                 : (size_t)groupStart] + 0.01f);
-                        AssertInFastLLM(
-                            position >= 0 &&
-                                position < this->sinData.dims[0],
-                            "Qwen4-Exp QSA position exceeds its rotary table.");
-                        const float sine = sinValues[
-                            (size_t)position * rotaryStride + column];
-                        const float cosine = cosValues[
-                            (size_t)position * rotaryStride + column];
+                        AssertInFastLLM(position >= 0, "Qwen4-Exp QSA received a negative position.");
+                        const float angle = rotaryAngle(position, column);
+                        const float sine = ::sin(angle);
+                        const float cosine = ::cos(angle);
                         destination[column] =
                             pooled[column] * cosine -
                             pooled[column + rotaryHalf] * sine;
@@ -4740,14 +4695,11 @@ namespace fastllm {
                     tailKeys != nullptr && tailPositions != nullptr &&
                     blockCache != nullptr && sameDevice(*tailKeys) &&
                     sameDevice(*tailPositions) && sameDevice(*blockCache) &&
-                    sameDevice(normWeight) && sameDevice(this->sinData) &&
-                    sameDevice(this->cosData) &&
+                    sameDevice(normWeight) &&
                     tailKeys->dataType == DataType::FLOAT32 &&
                     tailPositions->dataType == DataType::FLOAT32 &&
                     blockCache->dataType == DataType::FLOAT32 &&
                     normWeight.dataType == DataType::FLOAT32 &&
-                    this->sinData.dataType == DataType::FLOAT32 &&
-                    this->cosData.dataType == DataType::FLOAT32 &&
                     Qwen4AxisCapacity(*tailKeys, 0) >= ratio &&
                     Qwen4AxisCapacity(*tailPositions, 0) >= ratio &&
                     Qwen4AxisCapacity(*blockCache, 0) >= requiredBlocks &&
@@ -4785,7 +4737,7 @@ namespace fastllm {
                     const bool fused =
                         FastllmCudaQwen4QSAAppendCompress4(
                             currentKeysFloat, currentPositionsFloat,
-                            normWeight, this->sinData, this->cosData,
+                            normWeight, this->rope_base,
                             previousLength, *tailKeys, *tailPositions,
                             *blockCache, this->rms_norm_eps);
                     AssertInFastLLM(
@@ -4878,10 +4830,8 @@ namespace fastllm {
                 firstPositions.Reshape({1, newBlockCount});
                 normalized.Reshape(
                     {1, newBlockCount, 1, this->indexerHeadDim});
-                LlamaRotatePosition2DPart(
-                    normalized, firstPositions,
-                    this->sinData, this->cosData,
-                    this->rotary_dim, this->rotary_dim);
+                RopeEncoding(normalized, firstPositions,
+                    this->rotary_dim, this->rope_base, 1.0f, true);
                 normalized.Reshape(
                     {newBlockCount, this->indexerHeadDim});
 #ifdef USE_CUDA
@@ -5283,21 +5233,15 @@ namespace fastllm {
                 const int groupStart = visibleIndices[
                     block * this->indexerCompressRatio];
                 const int position = (int)(positionCache[groupStart] + 0.01f);
-                AssertInFastLLM(position >= 0 &&
-                                position < this->sinData.dims[0],
-                                "Qwen4-Exp QSA position exceeds its rotary table.");
-                const float *sinRow = sinValues +
-                    (size_t)position * rotaryStride;
-                const float *cosRow = cosValues +
-                    (size_t)position * rotaryStride;
+                AssertInFastLLM(position >= 0, "Qwen4-Exp QSA received a negative position.");
                 std::copy(rotated.begin(), rotated.end(), pooled.begin());
                 for (int column = 0; column < rotaryHalf; column++) {
-                    rotated[column] = pooled[column] * cosRow[column] -
-                        pooled[column + rotaryHalf] * sinRow[column];
+                    const float angle = rotaryAngle(position, column);
+                    const float sine = ::sin(angle), cosine = ::cos(angle);
+                    rotated[column] = pooled[column] * cosine -
+                        pooled[column + rotaryHalf] * sine;
                     rotated[column + rotaryHalf] =
-                        pooled[column + rotaryHalf] *
-                            cosRow[column + rotaryHalf] +
-                        pooled[column] * sinRow[column + rotaryHalf];
+                        pooled[column + rotaryHalf] * cosine + pooled[column] * sine;
                 }
 
                 float score = 0.0f;
@@ -8645,10 +8589,8 @@ namespace fastllm {
                 indexQuery,
                 this->weight[indexer + "q_layernorm.weight"],
                 this->rms_norm_eps, indexQuery);
-            LlamaRotatePosition2DPart(
-                indexQuery, graphState->positionIds,
-                this->sinData, this->cosData,
-                this->rotary_dim, this->rotary_dim);
+            RopeEncoding(indexQuery, graphState->positionIds,
+                this->rotary_dim, this->rope_base, 1.0f, true);
 
             Data currentKeysFloat;
             ToDataType(
@@ -8692,7 +8634,7 @@ namespace fastllm {
                     FastllmCudaQwen4QSAAppendCompress4Graph(
                         currentKeysFloat, graphState->positionIds,
                         this->weight[indexer + "k_layernorm.weight"],
-                        this->sinData, this->cosData, decodeMeta,
+                        this->rope_base, decodeMeta,
                         tailKeys, tailPositions, blockCache,
                         this->rms_norm_eps);
                 if (!compressed) {
@@ -8751,10 +8693,8 @@ namespace fastllm {
                     firstPosition.Reshape({1, 1});
                     normalized.Reshape(
                         {1, 1, 1, this->indexerHeadDim});
-                    LlamaRotatePosition2DPart(
-                        normalized, firstPosition,
-                        this->sinData, this->cosData,
-                        this->rotary_dim, this->rotary_dim);
+                    RopeEncoding(normalized, firstPosition,
+                        this->rotary_dim, this->rope_base, 1.0f, true);
                     normalized.Reshape({1, this->indexerHeadDim});
                     if (!FastllmCudaQwen4QSACommitGraph(
                             normalized, decodeMeta, token, ratio,
@@ -8818,14 +8758,10 @@ namespace fastllm {
             RMSNorm(
                 key, this->weight[attention + "k_norm.weight"],
                 this->rms_norm_eps, key);
-            LlamaRotatePosition2DPart(
-                query, graphState->positionIds,
-                this->sinData, this->cosData,
-                this->rotary_dim, this->rotary_dim);
-            LlamaRotatePosition2DPart(
-                key, graphState->positionIds,
-                this->sinData, this->cosData,
-                this->rotary_dim, this->rotary_dim);
+            RopeEncoding(query, graphState->positionIds,
+                this->rotary_dim, this->rope_base, 1.0f, true);
+            RopeEncoding(key, graphState->positionIds,
+                this->rotary_dim, this->rope_base, 1.0f, true);
             PermuteSelf(query, {0, 2, 1, 3});
             PermuteSelf(key, {0, 2, 1, 3});
             PermuteSelf(value, {0, 2, 1, 3});

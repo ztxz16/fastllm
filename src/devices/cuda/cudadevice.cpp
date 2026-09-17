@@ -8295,7 +8295,8 @@ namespace fastllm {
         float ropeTheta = floatParams.find("ropeTheta") != floatParams.end() ? floatParams.find("ropeTheta")->second : 10000.0f;
         float ropeScale = floatParams.find("ropeScale") != floatParams.end() ? floatParams.find("ropeScale")->second : 1.0f;
 
-        FastllmCudaRopeEncoding(data, positionIds, rotaryDim, ropeTheta, ropeScale);
+        const bool preciseFreq = intParams.count("preciseFreq") && intParams.at("preciseFreq");
+        FastllmCudaRopeEncoding(data, positionIds, rotaryDim, ropeTheta, ropeScale, preciseFreq);
     }
 
     void CudaLlama3RopeEncodingOp::Run(const std::string &opType, const fastllm::DataDict &datas,
