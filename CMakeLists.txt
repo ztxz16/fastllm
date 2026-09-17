@@ -368,6 +368,7 @@ if (USE_CUDA)
         src/devices/cuda/linear/fastllm-linear-fp32.cu
         src/devices/cuda/linear/fastllm-linear-fp16.cu
         src/devices/cuda/linear/fastllm-linear-bf16.cu
+        src/devices/cuda/linear/fastllm-gdn-input.cu
         src/devices/cuda/linear/fastllm-linear-fp8.cu
         src/devices/cuda/linear/fastllm-linear-fp8-marlin.cu
         src/devices/cuda/linear/fastllm-linear-nvfp4-marlin.cu
@@ -940,6 +941,12 @@ if (UNIT_TEST)
             add_test(NAME cuda_dsv41_moe_cache COMMAND cuda_dsv41_moe_cache_test)
             set_tests_properties(cuda_dsv41_moe_cache PROPERTIES LABELS cuda RUN_SERIAL TRUE)
         endif()
+
+        add_executable(cuda_gdn_input_conv_test test/basic/test_cuda_gdn_input_conv.cu)
+        target_link_libraries(cuda_gdn_input_conv_test PRIVATE fastllm)
+        set_target_properties(cuda_gdn_input_conv_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME cuda_gdn_input_conv COMMAND cuda_gdn_input_conv_test)
+        set_tests_properties(cuda_gdn_input_conv PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
 
         add_executable(cuda_quantized_kv_graph_test test/basic/test_cuda_quantized_kv_graph.cu)
         target_link_libraries(cuda_quantized_kv_graph_test PRIVATE fastllm)
