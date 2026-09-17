@@ -1617,16 +1617,6 @@ namespace fastllm {
 
     // Interleaved block-16: 8 packed FP4 bytes followed by a float scale.
     // Reuse each input vector across columns and reduce only after the full dot product.
-    static inline __m256 NVFP4Block16CodesToFloat_AVX2(__m256i codes) {
-        const __m256 table = _mm256_loadu_ps(kNVFP4E2M1ValueTableAVX2);
-        const __m256i index = _mm256_and_si256(codes, _mm256_set1_epi32(0x7));
-        const __m256i sign = _mm256_slli_epi32(
-            _mm256_and_si256(codes, _mm256_set1_epi32(0x8)), 28);
-        return _mm256_xor_ps(
-            _mm256_permutevar8x32_ps(table, index),
-            _mm256_castsi256_ps(sign));
-    }
-
     template <int COLS>
     static inline void NVFP4Block16GemmCols_AVX2(
         const uint16_t *input, const uint8_t *weightBase, long ldb,
@@ -1658,10 +1648,18 @@ namespace fastllm {
                     _mm_and_si128(_mm_srli_epi16(packed, 4), nibbleMask);
                 const __m128i codes =
                     _mm_unpacklo_epi8(lowNibbles, highNibbles);
-                const __m256 weightLo = NVFP4Block16CodesToFloat_AVX2(
-                    _mm256_cvtepu8_epi32(codes));
-                const __m256 weightHi = NVFP4Block16CodesToFloat_AVX2(
-                    _mm256_cvtepu8_epi32(_mm_srli_si128(codes, 8)));
+                // Every E2M1 value is exactly representable in BF16. Decode its
+                // low/high bytes with two lookups, preserving the sign of zero.
+                const __m128i lowTable = _mm_setr_epi8(
+                    0, 0, -128, -64, 0, 64, -128, -64,
+                    0, 0, -128, -64, 0, 64, -128, -64);
+                const __m128i highTable = _mm_setr_epi8(
+                    0, 63, 63, 63, 64, 64, 64, 64,
+                    -128, -65, -65, -65, -64, -64, -64, -64);
+                const __m128i loBytes = _mm_shuffle_epi8(lowTable, codes);
+                const __m128i hiBytes = _mm_shuffle_epi8(highTable, codes);
+                const __m256 weightLo = bf16_to_fp32_avx2(_mm_unpacklo_epi8(loBytes, hiBytes));
+                const __m256 weightHi = bf16_to_fp32_avx2(_mm_unpackhi_epi8(loBytes, hiBytes));
                 float scale;
                 memcpy(&scale, blockStart + 8, sizeof(scale));
                 const __m256 scaleVec = _mm256_set1_ps(scale);
@@ -1771,9 +1769,18 @@ namespace fastllm {
             const uint16_t *input = (const uint16_t*)((const uint8_t*)A + (size_t)row * lda);
             float *output = (float*)((uint8_t*)C + (size_t)row * ldc);
             int col = st;
-            for (; col + 4 <= end; col += 4) {
-                NVFP4Block16GemmCols_AVX2<4>(
-                    input, (const uint8_t*)B, ldb, output, col, fullBlocks, tail);
+            // Short expert rows benefit from two-column groups on AVX2;
+            // longer rows amortize input loads across four columns.
+            if (m <= 640) {
+                for (; col + 2 <= end; col += 2) {
+                    NVFP4Block16GemmCols_AVX2<2>(
+                        input, (const uint8_t*)B, ldb, output, col, fullBlocks, tail);
+                }
+            } else {
+                for (; col + 4 <= end; col += 4) {
+                    NVFP4Block16GemmCols_AVX2<4>(
+                        input, (const uint8_t*)B, ldb, output, col, fullBlocks, tail);
+                }
             }
             if (col + 2 <= end) {
                 NVFP4Block16GemmCols_AVX2<2>(
