@@ -22,10 +22,14 @@ static void Check(bool ok, const char *msg) {
 }
 struct Probe : DeepSeekV41Model {
     using DeepSeekV41Model::DsparkCommitPrefix;
+    using DeepSeekV41Model::DsparkAcceptedDraftCount;
+    using DeepSeekV41Model::DsparkMaskToolLogits;
+    using DeepSeekV41Model::DsparkDraftConfig;
     using DeepSeekV41Model::DsparkSampleVerify;
     using DeepSeekV41Model::DsparkSamplingConfig;
     using DeepSeekV41Model::DsparkSupportsRequest;
     Probe() {
+        eos_token_id = -1;
         v41DsparkEnabled = true;
         deviceMap = {{"cuda:0", 1}};
     }
@@ -62,7 +66,8 @@ static void Sampling(Probe &model, int drafts, int mode) {
     for (int sample = 0; sample < samples; ++sample) {
         DeepSeekV41DsparkState proposal;
         DeepSeekV41SpecScratch scratch;
-        proposal.proposalTopK = mode == 0 ? 1 : 4;
+        proposal.sampledProposal = mode != 0;
+        std::vector<float> probabilities(drafts * vocab, 0.0f);
         int previous = 0;
         for (int row = 0; row <= drafts; ++row) {
             auto p = Target(previous);
@@ -74,15 +79,17 @@ static void Sampling(Probe &model, int drafts, int mode) {
             int token = mode == 0 ? (previous + 1) % 4 : Draw(q, rng);
             proposal.proposalTokens.push_back(token);
             scratch.draftTokens.push_back(token);
-            for (int t = 0; t < proposal.proposalTopK; ++t) {
-                proposal.proposalCandidateIds.push_back(mode == 0 ? token : t);
-                proposal.proposalCandidateProbs.push_back(mode == 0 ? 1.0f : q[t]);
-            }
+            for (int t = 0; t < 4; ++t)
+                probabilities[row * vocab + t] = q[t];
             previous = token;
         }
         Check(cudaMemcpy(gpu.cudaData, logits.data(), logits.size() * sizeof(float), cudaMemcpyHostToDevice) ==
                   cudaSuccess,
               "logits upload");
+        if (proposal.sampledProposal) {
+            proposal.proposalProbs.CopyFrom(Data(DataType::FLOAT32, {drafts, vocab}, probabilities));
+            proposal.proposalProbs.ToDevice(DataDevice::CUDA, std::vector<int>{0});
+        }
         model.DsparkSampleVerify(gpu, proposal, scratch, config);
         ++acceptance.at(scratch.acceptedDrafts);
         // Every emitted prefix is retained. Complete short prefixes with the
@@ -138,13 +145,18 @@ static void DeviceSelection(Probe &model, int devices) {
         logits.ToDevice(DataDevice::CUDA, std::vector<int>{device});
         DeepSeekV41DsparkState proposal;
         DeepSeekV41SpecScratch scratch;
-        proposal.proposalTopK = 1;
         proposal.proposalTokens.assign(drafts, token);
-        proposal.proposalCandidateIds.assign(drafts, token);
-        proposal.proposalCandidateProbs.assign(drafts, 1.0f);
         scratch.draftTokens.assign(drafts, token);
         // Simulate a preceding operator leaving a different device current.
         Check(cudaSetDevice((device + 1) % devices) == cudaSuccess, "device switch");
+        model.DsparkSampleVerify(logits, proposal, scratch, config);
+        // Save more rows than verification consumes, on a different GPU.
+        // This covers confidence/output-length truncation and portable staging.
+        std::vector<float> q((drafts + 2) * vocab, 0.0f);
+        for (int row = 0; row < drafts + 2; ++row) q[row * vocab + token] = 1.0f;
+        proposal.sampledProposal = true;
+        proposal.proposalProbs.CopyFrom(Data(DataType::FLOAT32, {drafts + 2, vocab}, q));
+        proposal.proposalProbs.ToDevice(DataDevice::CUDA, std::vector<int>{(device + 1) % devices});
         model.DsparkSampleVerify(logits, proposal, scratch, config);
         int current = -1;
         Check(cudaGetDevice(&current) == cudaSuccess, "device query");
@@ -225,6 +237,157 @@ static void Rollback(Probe &model) {
             }
     std::cout << "rollback cases=" << cases << " PASS\n";
 }
+// Cross invoke/parameter boundaries inside a block, including a second
+// parameter and a closed invocation. No model weights needed.
+static void ToolConstraints(Probe &model) {
+    for (const std::string marker : {std::string("｜DSML｜ "), std::string("\\DSML\\ ")}) {
+        const std::string invoke = "<" + marker + "invoke name=\"";
+        const std::string param = "<" + marker + "parameter name=\"";
+        const std::string closeParam = "</" + marker + "parameter>";
+        const std::string closeInvoke = "</" + marker + "invoke>";
+        std::vector<std::string> pieces = {"read", "\">" + param, "path",
+            "\">value" + closeParam + param, "mode", "\">x" + closeParam + closeInvoke,
+            "INVALID", "write", "\""};
+        model.weight.tokenizer.Clear();
+        for (int i = 0; i < (int)pieces.size(); ++i) model.weight.tokenizer.Insert(pieces[i], i);
+        GenerationConfig c;
+        c.tool_call_name_constraint_enabled = true;
+        c.tool_call_parameter_name_constraint_enabled = true;
+        c.tool_call_allowed_names = {"read", "write"};
+        c.tool_call_allowed_parameter_names = {{"read", {"path", "mode"}}, {"write", {"data"}}};
+        c.tool_call_invoke_name_prefixes = {invoke};
+        c.tool_call_parameter_name_prefixes = {param};
+        c.tool_call_generated_text = invoke;
+        c.top_k = 1;
+        DeepSeekV41RequestState state;
+        Check(model.DsparkSupportsRequest(c, state), "tool constraints disabled DSpark");
+        const int vocab = pieces.size();
+        std::vector<float> scores(7 * vocab, 0);
+        for (int row = 0; row < 7; ++row) {
+            scores[row * vocab + row] = 10;
+            if (row % 2 == 0) scores[row * vocab + 6] = 100;
+        }
+        Data logits(DataType::FLOAT32, {1, 7, vocab}, scores);
+        model.DsparkMaskToolLogits(logits, c, {0, 1, 2, 3, 4, 5});
+        auto *v = (float*)logits.cpuData;
+        for (int row : {0, 2, 4}) {
+            Check(std::isinf(v[row * vocab + 6]) && v[row * vocab + 6] < 0, "invalid tool token not masked");
+            Check(v[row * vocab + row] == 10, "valid tool token masked");
+        }
+        Check(v[6 * vocab + 6] == 100, "mask leaked past invocation end");
+        // Private speculative text includes accepted tokens + correction, not
+        // rejected drafts; the scheduler-owned snapshot stays unchanged.
+        DeepSeekV41SpecScratch scratch;
+        scratch.wantAllTokens = true;
+        scratch.draftTokens = {0, 1, 2, 3, 4, 5};
+        scratch.tokens = {0, 1, 4, 3, 4, 5, 6};
+        for (int accepted : {0, 1, 2, 6}) {
+            scratch.acceptedDrafts = accepted;
+            auto next = model.DsparkDraftConfig(c, scratch, scratch.tokens[accepted]);
+            std::string expected = invoke;
+            for (int i = 0; i <= accepted; ++i) expected += pieces[scratch.tokens[i]];
+            Check(next.tool_call_generated_text == expected, "accepted prefix snapshot mismatch");
+            Check(c.tool_call_generated_text == invoke, "speculation changed emitted prefix");
+        }
+        scratch.acceptedDrafts = -1;
+        Check(model.DsparkDraftConfig(c, scratch, 4).tool_call_generated_text == invoke + pieces[0] + pieces[1] + pieces[4],
+              "greedy rejection snapshot mismatch");
+        scratch.wantAllTokens = false;
+        Check(model.DsparkDraftConfig(c, scratch, 0).tool_call_generated_text == invoke + pieces[0], "anchor duplicated/missing");
+        // Invalid forced q must be rejected, including at a constrained bonus.
+        c.top_k = 2;
+        DeepSeekV41DsparkState proposal;
+        proposal.proposalTokens = {6};
+        scratch.draftTokens = {6};
+        std::vector<float> twoRows(2 * vocab, 0);
+        twoRows[6] = 2000;
+        twoRows[0] = 1000;
+        Data gpu(DataType::FLOAT32, {1, 2, vocab}, twoRows);
+        gpu.ToDevice(DataDevice::CUDA, std::vector<int>{0});
+        model.DsparkSampleVerify(gpu, proposal, scratch, c);
+        Check(scratch.acceptedDrafts == 0 && scratch.tokens[0] == 0, "invalid draft accepted through tool mask");
+        proposal.proposalTokens = {0};
+        scratch.draftTokens = {0};
+        twoRows[vocab + 6] = 2000;
+        twoRows[vocab + 8] = 1000;
+        Check(cudaMemcpy(gpu.cudaData, twoRows.data(), twoRows.size() * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess, "bonus logits upload");
+        model.DsparkSampleVerify(gpu, proposal, scratch, c);
+        Check(scratch.acceptedDrafts == 1 && scratch.tokens[1] == 8, "bonus used stale tool constraint");
+    }
+    // Nontrivial top-k/top-p law: masked CPU decoding renormalizes the top-k
+    // BEFORE top-p. [0.4,0.3,0.2,0.1], k=2,p=.6 must retain both a and b.
+    model.weight.tokenizer.Clear();
+    for (int i = 0; i < 4; ++i) model.weight.tokenizer.Insert(std::string(1, 'a' + i) + "\"", i);
+    GenerationConfig c;
+    c.tool_call_name_constraint_enabled = true;
+    c.tool_call_allowed_names = {"a", "b", "c", "d"};
+    c.tool_call_invoke_name_prefixes = {"<invoke name=\""};
+    c.tool_call_generated_text = "<invoke name=\"";
+    c.top_k = 2; c.top_p = .6; c.temperature = 1;
+    constexpr int vocab = 128, trials = 4000;
+    int counts[2] = {0, 0};
+    std::vector<float> raw(2 * vocab, -1000);
+    for (int i = 0; i < 4; ++i) raw[i] = std::log((4 - i) / 10.0f);
+    Data gpu(DataType::FLOAT32, {1, 2, vocab}, raw);
+    gpu.ToDevice(DataDevice::CUDA, std::vector<int>{0});
+    std::vector<float> draftRaw(vocab, -1000);
+    draftRaw[0] = std::log(.55f); draftRaw[1] = std::log(.45f);
+    Data draftLogits(DataType::FLOAT32, {1, 1, vocab}, draftRaw);
+    draftLogits.ToDevice(DataDevice::CUDA, std::vector<int>{0});
+    model.DsparkMaskToolLogits(draftLogits, c, {});
+    for (int i = 0; i < trials; ++i) {
+        Check(cudaMemcpy(gpu.cudaData, raw.data(), raw.size() * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess, "masked logits upload");
+        DeepSeekV41DsparkState proposal;
+        proposal.proposalTokens = {0}; // deterministic q, rejection exercises residual b
+        DeepSeekV41SpecScratch scratch;
+        scratch.draftTokens = {0};
+        if (i % 2) {
+            proposal.sampledProposal = true;
+            proposal.proposalProbs.CopyFrom(Data(DataType::FLOAT32, {1, vocab}, std::vector<float>(vocab, 0)));
+            proposal.proposalProbs.ToDevice(DataDevice::CUDA, std::vector<int>{0});
+            int token = -1;
+            Check(FastllmCudaMtpSampleDraft((float*)draftLogits.cudaData, (float*)proposal.proposalProbs.cudaData,
+                &c.temperature, &c.top_k, &c.top_p, &token, 1, vocab), "constrained draft sampling failed");
+            Check(token == 0 || token == 1, "constrained draft support mismatch");
+            proposal.proposalTokens = scratch.draftTokens = {token};
+        }
+        model.DsparkSampleVerify(gpu, proposal, scratch, c);
+        Check(scratch.tokens[0] >= 0 && scratch.tokens[0] < 2, "masked top-k/top-p support mismatch");
+        ++counts[scratch.tokens[0]];
+    }
+    Check(std::fabs((double)counts[0] / trials - 4.0 / 7) < .035, "constrained rejection distribution mismatch");
+    std::cout << "tool boundary/state/rejection and top-k/top-p distribution PASS\n";
+}
+static void StopPrefix(Probe &model) {
+    const int originalEos = model.eos_token_id;
+    const auto originalStops = model.eos_token_ids;
+    model.eos_token_id = 99;
+    model.eos_token_ids = {100};
+    GenerationConfig c;
+    c.stop_token_ids = {101};
+    for (int stop : {99, 100, 101}) {
+        for (int at = 0; at <= 5; ++at) {
+            for (bool greedy : {false, true}) {
+                DeepSeekV41SpecScratch scratch;
+                scratch.tokens = {0, 1, 2, 3, 4, 5};
+                scratch.tokens[at] = stop;
+                scratch.draftTokens.assign(scratch.tokens.begin(), scratch.tokens.end() - 1);
+                scratch.acceptedDrafts = greedy ? -1 : 5;
+                Check(model.DsparkAcceptedDraftCount(scratch, c) == at, "committed past stop token");
+            }
+        }
+    }
+    DeepSeekV41SpecScratch scratch;
+    scratch.tokens = {0, 1, 2, 99, 4, 5};
+    scratch.draftTokens = {0, 1, 9, 99, 4};
+    scratch.acceptedDrafts = 2;
+    Check(model.DsparkAcceptedDraftCount(scratch, c) == 2, "stop in rejected suffix changed prefix");
+    scratch.acceptedDrafts = -1;
+    Check(model.DsparkAcceptedDraftCount(scratch, c) == 2, "greedy rejected suffix changed prefix");
+    model.eos_token_id = originalEos;
+    model.eos_token_ids = originalStops;
+    std::cout << "EOS/stop prefix truncation PASS\n";
+}
 static void Configs(Probe &model) {
     GenerationConfig c;
     DeepSeekV41RequestState state;
@@ -237,6 +400,13 @@ static void Configs(Probe &model) {
     c.temperature = .8;
     Check(model.DsparkSupportsRequest(c, state), "sampled request disabled");
     auto good = c;
+    c.tool_call_allowed_token_ids = {1, 2};
+    Check(!model.DsparkSupportsRequest(c, state), "standalone mask must fall back");
+    c.tool_call_name_constraint_enabled = true;
+    Check(model.DsparkSupportsRequest(c, state), "active tool mask disabled DSpark");
+    Check(model.DsparkSamplingConfig(c).tool_call_allowed_token_ids == c.tool_call_allowed_token_ids,
+          "ordinary normalization dropped tool mask");
+    c = good;
     c.repeat_penalty = 1.1;
     Check(!model.DsparkSupportsRequest(c, state), "repeat penalty fallback");
     c = good;
@@ -265,6 +435,8 @@ int main() {
     Probe model;
     Configs(model);
     DeviceSelection(model, devices);
+    ToolConstraints(model);
+    StopPrefix(model);
     for (int drafts : {3, 4, 5, 7})
         for (int mode = 0; mode < 3; ++mode)
             Sampling(model, drafts, mode);

@@ -184,6 +184,8 @@ namespace fastllm {
 
             static const std::vector<std::string> dsmlParameterCloseTags = {
                     "</｜DSML｜parameter>",
+                    "</｜DSML｜ parameter>",
+                    "</\\DSML\\ parameter>",
                     "</\\DSML\\parameter>",
             };
             auto closePos = FindLastNeedleBefore(
@@ -251,6 +253,8 @@ namespace fastllm {
             }
             static const std::vector<std::string> dsmlInvokeCloseTags = {
                 "</｜DSML｜invoke>",
+                "</｜DSML｜ invoke>",
+                "</\\DSML\\ invoke>",
                 "</\\DSML\\invoke>",
             };
             auto closePos = FindLastNeedleBefore(
@@ -518,21 +522,25 @@ namespace fastllm {
     }
 
     void basellm::PrepareToolCallConstraint(ResponseContext *context, GenerationConfig &generationConfig) {
+        generationConfig.tool_call_generated_text = context ? context->toolCallConstraintGeneratedText : "";
+        PrepareToolCallConstraint(generationConfig);
+    }
+
+    void basellm::PrepareToolCallConstraint(GenerationConfig &generationConfig) {
         generationConfig.tool_call_allowed_token_ids.clear();
-        if (context == nullptr ||
-            (!generationConfig.tool_call_name_constraint_enabled &&
-             !generationConfig.tool_call_parameter_name_constraint_enabled)) {
+        if (!generationConfig.tool_call_name_constraint_enabled &&
+            !generationConfig.tool_call_parameter_name_constraint_enabled) {
             return;
         }
         std::string partial;
         std::vector<std::string> allowedValues;
         if (!FindActiveToolCallParameterNamePartial(
-                    context->toolCallConstraintGeneratedText,
+                    generationConfig.tool_call_generated_text,
                     generationConfig,
                     partial,
                     allowedValues)) {
             if (!FindActiveToolCallNamePartial(
-                        context->toolCallConstraintGeneratedText,
+                        generationConfig.tool_call_generated_text,
                         generationConfig,
                         partial)) {
                 return;
@@ -568,12 +576,14 @@ namespace fastllm {
             tokenId < 0) {
             return;
         }
-        context->toolCallConstraintGeneratedText += this->weight.tokenizer.DecodeTokens(std::vector<int>{tokenId});
+        AdvanceToolCallConstraintText(context->toolCallConstraintGeneratedText, tokenId);
+    }
+
+    void basellm::AdvanceToolCallConstraintText(std::string &text, int tokenId) {
+        if (tokenId < 0) return;
+        text += this->weight.tokenizer.DecodeTokens(std::vector<int>{tokenId});
         const size_t maxTrackedBytes = 8192;
-        if (context->toolCallConstraintGeneratedText.size() > maxTrackedBytes) {
-            context->toolCallConstraintGeneratedText.erase(
-                    0, context->toolCallConstraintGeneratedText.size() - maxTrackedBytes);
-        }
+        if (text.size() > maxTrackedBytes) text.erase(0, text.size() - maxTrackedBytes);
     }
 
     void basellm::RemoveResponseContext(int handleId) {

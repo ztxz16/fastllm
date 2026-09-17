@@ -177,7 +177,7 @@ namespace fastllm {
         }
 
         // ---------------- 接受率与分段计时 ----------------
-        // FASTLLM_DSPARK_STATS=1 累计统计（退出时与每 N 轮打印一次），=2 额外逐轮打印一行。
+        // FASTLLM_DSPARK_STATS=1 仅打印逐位置接受率；=2 打印详细统计及逐轮耗时。
         // FASTLLM_DSPARK_STATS_EVERY=N 控制中途汇总的频率（默认 64，0 表示只在退出时打印）。
         //
         // 草稿阶段（三个草稿层 + markov head + confidence head）与校验阶段分开计时。
@@ -201,6 +201,7 @@ namespace fastllm {
             uint64_t proposed = 0;          // 实际参与校验的候选数
             uint64_t accepted = 0;
             uint64_t generatedByDraft = 0;  // 由草稿模型产出、还没经过置信度筛选的候选数
+            std::vector<uint64_t> verifyOfferHist;
             std::vector<uint64_t> acceptHist;   // 接受长度 0..blockSize
             std::vector<uint64_t> offerHist;    // 置信度截断后送去校验的候选数 0..blockSize
             uint64_t noProposal = 0;        // 该轮没有可用候选（还没生成 / 锚点不匹配）
@@ -283,6 +284,7 @@ namespace fastllm {
                 if (blockSize != n) {
                     blockSize = n;
                     stat.acceptHist.assign((size_t)n + 1, 0);
+                    stat.verifyOfferHist.assign((size_t)n + 1, 0);
                     stat.offerHist.assign((size_t)n + 1, 0);
                 }
             }
@@ -381,6 +383,7 @@ namespace fastllm {
                     return;
                 }
                 stat.verifyRounds++;
+                if (drafts >= 0 && drafts < (int)stat.verifyOfferHist.size()) ++stat.verifyOfferHist[drafts];
                 stat.proposed += (uint64_t)drafts;
                 stat.accepted += (uint64_t)accepted;
                 stat.verifyForward += forwardMs;
@@ -407,6 +410,21 @@ namespace fastllm {
             void ReportLocked(const char *tag) {
                 const DsparkStat &s = stat;
                 if (s.verifyRounds == 0 && s.plainRounds == 0 && s.draftCalls == 0) {
+                    return;
+                }
+                if (level == 1) {
+                    printf("[DeepSeek-V4.1 DSpark] pos_accept_rate=[");
+                    for (int i = 0; i < blockSize; ++i) {
+                        uint64_t attempts = 0, accepts = 0;
+                        for (int j = i + 1; j <= blockSize; ++j) {
+                            attempts += s.verifyOfferHist[j];
+                            accepts += s.acceptHist[j];
+                        }
+                        printf("%s%.2f%%", i == 0 ? "" : ", ",
+                               attempts ? 100.0 * (double)accepts / attempts : 0.0);
+                    }
+                    printf("].\n");
+                    fflush(stdout);
                     return;
                 }
                 const double verify = (double)std::max<uint64_t>(s.verifyRounds, 1);
@@ -794,11 +812,10 @@ namespace fastllm {
         if (!v41DsparkEnabled) {
             return false;
         }
-        // Prefix-dependent masks/penalties and logits-return requests retain
-        // the ordinary path until their per-position state is represented.
+        // Repetition penalties and content-dependent sampling remain unsupported.
         if (!std::isfinite(config.repeat_penalty) || std::fabs(config.repeat_penalty - 1.0f) > 1e-8f ||
-            !config.tool_call_allowed_token_ids.empty() || config.tool_call_name_constraint_enabled ||
-            config.tool_call_parameter_name_constraint_enabled || config.tool_call_content_sampling_enabled ||
+            (!config.tool_call_allowed_token_ids.empty() && !config.tool_call_name_constraint_enabled &&
+             !config.tool_call_parameter_name_constraint_enabled) || config.tool_call_content_sampling_enabled ||
             config.tool_call_content_sampling_active || config.output_logits || config.output_token_least > 0) {
             return false;
         }
@@ -806,7 +823,7 @@ namespace fastllm {
         if (!std::isfinite(sampling.temperature) || !std::isfinite(sampling.top_p)) {
             return false;
         }
-        if (!sampling.IsSimpleGreedy()) {
+        if (sampling.top_k > 1) {
 #ifdef USE_CUDA
             // The shared Qwen rejection/sampling kernels operate on CUDA logits.
             const std::string device = SelectDeviceFromMap(this->deviceMap, block_cnt, block_cnt);
@@ -823,19 +840,97 @@ namespace fastllm {
         return true;
     }
 
+    int DeepSeekV41Model::DsparkAcceptedDraftCount(const DeepSeekV41SpecScratch &scratch,
+            const GenerationConfig &config) const {
+        int accepted = scratch.acceptedDrafts;
+        if (accepted < 0) {
+            accepted = 0;
+            while (accepted < (int)scratch.draftTokens.size() &&
+                   scratch.tokens[accepted] == scratch.draftTokens[accepted]) ++accepted;
+        }
+        // EOS/stop is returned to the scheduler, but is not appended to
+        // allTokens. Commit only the inputs preceding that output. Otherwise
+        // the cache can run beyond allTokens and cannot be snapshotted.
+        for (int i = 0; i <= accepted; ++i) {
+            const int token = scratch.tokens[i];
+            if (token == eos_token_id || eos_token_ids.count(token) || config.stop_token_ids.count(token))
+                return i;
+        }
+        return accepted;
+    }
+
+    GenerationConfig DeepSeekV41Model::DsparkDraftConfig(const GenerationConfig &config,
+            const DeepSeekV41SpecScratch &scratch, int anchorToken) {
+        GenerationConfig next = DsparkSamplingConfig(config);
+        if (next.tool_call_name_constraint_enabled || next.tool_call_parameter_name_constraint_enabled) {
+            // The scheduler has not emitted this round yet. Include the entire
+            // accepted output (including the correction/bonus), exactly once.
+            if (scratch.wantAllTokens) {
+                const int accepted = DsparkAcceptedDraftCount(scratch, config);
+                for (int i = 0; i <= accepted; ++i)
+                    AdvanceToolCallConstraintText(next.tool_call_generated_text, scratch.tokens[i]);
+            } else {
+                AdvanceToolCallConstraintText(next.tool_call_generated_text, anchorToken);
+            }
+        }
+        return next;
+    }
+
+    void DeepSeekV41Model::DsparkMaskToolLogits(Data &logits, const GenerationConfig &config,
+            const std::vector<int> &prefixTokens) {
+        if (!config.tool_call_name_constraint_enabled && !config.tool_call_parameter_name_constraint_enabled) return;
+        GenerationConfig step = config;
+        const int vocab = logits.dims.back(), rows = logits.Count(0) / vocab;
+        AssertInFastLLM((int)prefixTokens.size() == rows - 1, "DSpark: invalid constraint prefix.");
+        std::vector<float> values;
+        for (int row = 0; row < rows; ++row) {
+            PrepareToolCallConstraint(step);
+            const auto &allowed = step.tool_call_allowed_token_ids;
+            if (!allowed.empty()) {
+                values.resize(vocab);
+                float *cpuRow = logits.cpuData ? (float*)logits.cpuData + (size_t)row * vocab : nullptr;
+#ifdef USE_CUDA
+                float *gpuRow = logits.cudaData ? (float*)logits.cudaData + (size_t)row * vocab : nullptr;
+                if (logits.dataDevice == DataDevice::CUDA) {
+                    if (!logits.dataDeviceIds.empty()) FastllmCudaSetDevice(logits.dataDeviceIds[0]);
+                    FastllmCudaCopyFromDeviceToHost(values.data(), gpuRow, vocab * sizeof(float));
+                } else
+#endif
+                std::copy(cpuRow, cpuRow + vocab, values.begin());
+                std::vector<int> candidates;
+                for (int id : allowed) if (id >= 0 && id < vocab) candidates.push_back(id);
+                if (!candidates.empty()) {
+                    // Ordinary constrained LLMSampling applies top-p after
+                    // renormalizing top-k. Prune first so CUDA uses that same law.
+                    const int k = std::min((int)candidates.size(), std::max(1, config.top_k));
+                    std::partial_sort(candidates.begin(), candidates.begin() + k, candidates.end(),
+                        [&](int a, int b) { return values[a] > values[b] || (values[a] == values[b] && a < b); });
+                    std::vector<float> masked(vocab, -std::numeric_limits<float>::infinity());
+                    for (int i = 0; i < k; ++i) masked[candidates[i]] = values[candidates[i]];
+#ifdef USE_CUDA
+                    if (logits.dataDevice == DataDevice::CUDA)
+                        FastllmCudaCopyFromHostToDevice(gpuRow, masked.data(), vocab * sizeof(float));
+                    else
+#endif
+                    std::copy(masked.begin(), masked.end(), cpuRow);
+                }
+            }
+            if (row + 1 < rows) AdvanceToolCallConstraintText(step.tool_call_generated_text, prefixTokens[row]);
+        }
+    }
+
     void DeepSeekV41Model::DsparkSampleVerify(Data &logits, const DeepSeekV41DsparkState &proposal,
             DeepSeekV41SpecScratch &scratch, const GenerationConfig &config) {
 #ifdef USE_CUDA
         const GenerationConfig sampling = DsparkSamplingConfig(config);
         const int drafts = (int)scratch.draftTokens.size();
-        const int rows = drafts + 1, width = proposal.proposalTopK;
+        const int rows = drafts + 1;
         AssertInFastLLM(logits.dataDevice == DataDevice::CUDA && logits.cudaData &&
                         logits.dataType == DataType::FLOAT32 && !logits.dims.empty() &&
                         logits.Count(0) == (uint64_t)rows * logits.dims.back() && drafts > 0 &&
-                        width > 0 && width <= 64 && (int)proposal.proposalTokens.size() >= drafts &&
-                        (int)proposal.proposalCandidateIds.size() >= drafts * width &&
-                        proposal.proposalCandidateProbs.size() == proposal.proposalCandidateIds.size(),
+                        (int)proposal.proposalTokens.size() >= drafts,
                         "DeepSeekV41 DSpark: invalid rejection sampling proposal/logits shape.");
+        DsparkMaskToolLogits(logits, sampling, scratch.draftTokens);
         for (int i = 0; i < drafts; ++i) {
             AssertInFastLLM(scratch.draftTokens[i] == proposal.proposalTokens[i],
                             "DeepSeekV41 DSpark: rejection proposal is out of sync.");
@@ -845,10 +940,39 @@ namespace fastllm {
         scratch.tokens.assign(rows, -1);
         scratch.acceptedDrafts = -1;
         if (!logits.dataDeviceIds.empty()) FastllmCudaSetDevice(logits.dataDeviceIds[0]);
-        AssertInFastLLM(FastllmCudaDFlashRejectionSampling((float*)logits.cudaData,
+        const int device = FastllmCudaGetDevice(), vocab = logits.dims.back();
+        Data localProbs(DataType::FLOAT32);
+        float *probs = (float*)proposal.proposalProbs.cudaData;
+        if (proposal.sampledProposal) {
+            const Data &q = proposal.proposalProbs;
+            AssertInFastLLM(q.dataType == DataType::FLOAT32 && q.dataDevice == DataDevice::CUDA &&
+                q.cudaData && q.dims.size() == 2 && q.dims[0] >= drafts && q.dims[1] == vocab &&
+                q.dataDeviceIds.size() == 1,
+                "DeepSeekV41 DSpark: invalid saved proposal probabilities.");
+            if (q.dataDeviceIds[0] != device) {
+                // Layer placement can put the draft head on another GPU.
+                // Stage through CPU so peer access is not required.
+                localProbs.Resize({drafts, vocab});
+                localProbs.Allocate();
+                FastllmCudaSetDevice(q.dataDeviceIds[0]);
+                FastllmCudaCopyFromDeviceToHost(localProbs.cpuData, q.cudaData, localProbs.GetBytes());
+                localProbs.ToDevice(DataDevice::CUDA, std::vector<int>{device});
+                probs = (float*)localProbs.cudaData;
+            }
+        } else {
+            std::vector<float> oneHot((size_t)drafts * vocab, 0.0f);
+            for (int i = 0; i < drafts; ++i) {
+                const int token = scratch.draftTokens[i];
+                AssertInFastLLM(token >= 0 && token < vocab, "DeepSeekV41 DSpark: invalid forced token.");
+                oneHot[(size_t)i * vocab + token] = 1.0f;
+            }
+            localProbs.CopyFrom(Data(DataType::FLOAT32, {drafts, vocab}, oneHot));
+            localProbs.ToDevice(DataDevice::CUDA, std::vector<int>{device});
+            probs = (float*)localProbs.cudaData;
+        }
+        AssertInFastLLM(FastllmCudaMtpRejectionSampling((float*)logits.cudaData, probs,
             temperatures.data(), topKs.data(), topPs.data(), scratch.draftTokens.data(),
-            proposal.proposalCandidateIds.data(), proposal.proposalCandidateProbs.data(),
-            scratch.tokens.data(), &scratch.acceptedDrafts, 1, drafts, width, logits.dims.back()),
+            scratch.tokens.data(), &scratch.acceptedDrafts, 1, drafts, vocab),
             "DeepSeekV41 DSpark: CUDA rejection sampling failed.");
         AssertInFastLLM(scratch.acceptedDrafts >= 0 && scratch.acceptedDrafts <= drafts,
                         "DeepSeekV41 DSpark: invalid accepted prefix length.");
@@ -955,10 +1079,8 @@ namespace fastllm {
                 count = (int)forced.size();
                 // A forced test proposal is deterministic, hence its actual
                 // q is one-hot even when the request uses random sampling.
-                dspark.proposalTopK = 1;
+                dspark.sampledProposal = false;
                 dspark.proposalTokens = forced;
-                dspark.proposalCandidateIds = forced;
-                dspark.proposalCandidateProbs.assign(count, 1.0f);
             }
         }
         std::vector<float> values;
@@ -1065,13 +1187,8 @@ namespace fastllm {
             DeepSeekV41SpecScratch &scratch = scratches[0];
             AssertInFastLLM((int)scratch.tokens.size() == drafts + 1,
                             "DeepSeekV41 DSpark: the verifier did not return per-position tokens.");
-            int accepted = scratch.acceptedDrafts;
-            if (accepted < 0) {
-                accepted = 0;
-                while (accepted < drafts && scratch.tokens[accepted] == draftTokens[accepted]) {
-                    accepted++;
-                }
-            }
+            const int accepted = DsparkAcceptedDraftCount(scratch, generationConfigs[0]);
+            scratch.acceptedDrafts = accepted;
             const int commitCount = accepted + 1;
             const double commitStart = DsTick();
             DsparkCommitPrefix(state, scratch, startPos, commitCount, drafts + 1);
@@ -1089,7 +1206,10 @@ namespace fastllm {
             state.dspark->proposed += drafts;
             state.dspark->accepted += accepted;
             DsparkDebugDumpState(state, "verify");
-            DsparkAdvance(state, scratch, startPos, startPos + commitCount, scratch.tokens[accepted], generationConfigs[0]);
+            const int anchor = scratch.tokens[accepted];
+            const bool stopped = anchor == eos_token_id || eos_token_ids.count(anchor) ||
+                generationConfigs[0].stop_token_ids.count(anchor);
+            DsparkAdvance(state, scratch, startPos, startPos + commitCount, stopped ? -1 : anchor, generationConfigs[0]);
             segments[0].seqlen = 1;
             return ret;
         }
@@ -1181,10 +1301,8 @@ namespace fastllm {
         DeepSeekV41DsparkState &dspark = *dsparkPtr;
         dspark.drafts.clear();
         dspark.confidence.clear();
-        dspark.proposalTopK = 0;
+        dspark.sampledProposal = false;
         dspark.proposalTokens.clear();
-        dspark.proposalCandidateIds.clear();
-        dspark.proposalCandidateProbs.clear();
         dspark.anchor = -1;
         dspark.anchorPos = -1;
         if (dspark.disabled) {
@@ -1256,7 +1374,7 @@ namespace fastllm {
         std::vector<float> confidence;
         DsDraftTimingSlot().Reset();
         const double draftStart = DsTick();
-        DsparkRunDraft(dspark, anchorToken, tokens, confidence, DsparkSamplingConfig(config));
+        DsparkRunDraft(dspark, anchorToken, tokens, confidence, DsparkDraftConfig(config, scratch, anchorToken));
         const double draftMs = DsElapsed(draftStart);
         if (DsProfiler().On()) {
             DsProfiler().AddDraft(mainMs + draftMs, mainMs, DsDraftTimingSlot());
@@ -1266,11 +1384,6 @@ namespace fastllm {
         }
         dspark.drafts = tokens;
         dspark.proposalTokens = tokens;
-        if (dspark.proposalTopK == 0) {
-            dspark.proposalTopK = 1;
-            dspark.proposalCandidateIds = tokens;
-            dspark.proposalCandidateProbs.assign(tokens.size(), 1.0f);
-        }
         dspark.confidence = confidence;
         dspark.anchor = anchorToken;
         dspark.anchorPos = dspark.committed;
@@ -1521,14 +1634,19 @@ namespace fastllm {
         // 也才几毫秒。所以 CUDA 上走一个把整条链留在设备上的融合 kernel，
         // 主机只在最后取回一次；其它设备（或 dtype / 布局不满足前提时）退回下面的通用实现。
         const double markovStart = DsTick();
-        const bool randomDraft = !config.IsSimpleGreedy();
+        const bool randomDraft = config.top_k > 1;
+        dspark.sampledProposal = randomDraft;
+#ifdef USE_CUDA
         if (randomDraft) {
-            // Like Qwen3.5 MTP, cap q's sparse support, while p keeps the
-            // request's full top-k. The rejection residual covers p outside q.
-            dspark.proposalTopK = std::min(64, std::max(1, config.top_k));
-            dspark.proposalCandidateIds.assign(block * dspark.proposalTopK, -1);
-            dspark.proposalCandidateProbs.assign(block * dspark.proposalTopK, 0.0f);
+            AssertInFastLLM(logits.dataDevice == DataDevice::CUDA && logits.cudaData,
+                            "DeepSeekV41 DSpark: random draft logits must be on CUDA.");
+            const int device = logits.dataDeviceIds.empty() ? FastllmCudaGetDevice() : logits.dataDeviceIds[0];
+            FastllmCudaSetDevice(device);
+            dspark.proposalProbs.ToDevice(DataDevice::CUDA, {device}, false);
+            dspark.proposalProbs.Resize({block, logits.dims.back()});
+            dspark.proposalProbs.Allocate();
         }
+#endif
         Data &markovEmbedWeight = weight[last + ".markov_head.embed.weight"];
         Data &markovHeadWeight = weight[last + ".markov_head.head.weight"];
         const int markovRank = markovEmbedWeight.dims.size() == 2 ? markovEmbedWeight.dims[1]
@@ -1536,7 +1654,8 @@ namespace fastllm {
         Data markovAll;                 // [1, block, rank]，confidence head 的输入
         bool fusedMarkov = false;
 #ifdef USE_CUDA
-        if (!randomDraft && !DsEnvFlag("FASTLLM_DSPARK_DISABLE_FUSED_MARKOV") && logits.dataDevice == DataDevice::CUDA) {
+        if (!randomDraft && !config.tool_call_name_constraint_enabled &&
+            !config.tool_call_parameter_name_constraint_enabled && !DsEnvFlag("FASTLLM_DSPARK_DISABLE_FUSED_MARKOV") && logits.dataDevice == DataDevice::CUDA) {
             markovEmbedWeight.ToDevice(DataDevice::CUDA);
             markovHeadWeight.ToDevice(DataDevice::CUDA);
             fusedMarkov = FastllmCudaDeepSeekV41MarkovChain(logits, markovEmbedWeight, markovHeadWeight,
@@ -1547,6 +1666,7 @@ namespace fastllm {
         if (!fusedMarkov) {
             std::vector<Data> markovEmbeds(block);
             int previous = anchorToken;
+            GenerationConfig stepConfig = config;
             tokens.clear();
             tokens.reserve(block);
             for (int i = 0; i < block; i++) {
@@ -1559,6 +1679,7 @@ namespace fastllm {
                 ToDataType(bias, DataType::FLOAT32);
                 Split(logits, 1, i, i + 1, stepLogits);
                 AddTo(stepLogits, bias);
+                DsparkMaskToolLogits(stepLogits, stepConfig, {});
                 DsDraftTimingSlot().markovBias += DsElapsed(biasStart);
                 const double argmaxStart = DsTick();
                 std::vector<int> best;
@@ -1566,16 +1687,12 @@ namespace fastllm {
                 if (randomDraft) {
                     AssertInFastLLM(stepLogits.dataDevice == DataDevice::CUDA && stepLogits.cudaData,
                                     "DeepSeekV41 DSpark: random draft logits must be on CUDA.");
-                    static std::atomic<uint64_t> nextSeed((uint64_t)
-                        std::chrono::steady_clock::now().time_since_epoch().count());
-                    const int width = dspark.proposalTopK;
-                    int token = -1, candidates = 0;
+                    int token = -1;
                     if (!stepLogits.dataDeviceIds.empty()) FastllmCudaSetDevice(stepLogits.dataDeviceIds[0]);
-                    AssertInFastLLM(FastllmCudaMtpDraftSpecSampling((const float*)stepLogits.cudaData,
-                        config.temperature, width, config.top_p, nextSeed.fetch_add(1), &token,
-                        dspark.proposalCandidateIds.data() + i * width,
-                        dspark.proposalCandidateProbs.data() + i * width, &candidates, stepLogits.dims.back()) &&
-                        candidates > 0 && candidates <= width,
+                    const int vocab = stepLogits.dims.back();
+                    AssertInFastLLM(FastllmCudaMtpSampleDraft((float*)stepLogits.cudaData,
+                        (float*)dspark.proposalProbs.cudaData + (size_t)i * vocab,
+                        &config.temperature, &config.top_k, &config.top_p, &token, 1, vocab),
                         "DeepSeekV41 DSpark: random draft sampling failed.");
                     best.push_back(token);
                 } else
@@ -1587,6 +1704,8 @@ namespace fastllm {
                 AssertInFastLLM(best.size() == 1, "DeepSeekV41 DSpark: draft sampling failed.");
                 previous = best[0];
                 tokens.push_back(previous);
+                if (config.tool_call_name_constraint_enabled || config.tool_call_parameter_name_constraint_enabled)
+                    AdvanceToolCallConstraintText(stepConfig.tool_call_generated_text, previous);
             }
             Data tmp;
             for (int i = 0; i < block; i++) {

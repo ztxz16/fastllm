@@ -87,10 +87,10 @@ namespace fastllm {
         // 只有下一次前向的起始位置为 committed 且首个 token 为 anchor 时才可用
         std::vector<int> drafts;
         std::vector<float> confidence;
-        // 与 drafts 同步发布。消费 drafts 后仍保留到本轮 verify 完成；零概率槽用 -1 填充。
-        int proposalTopK = 0;
-        std::vector<int> proposalTokens, proposalCandidateIds;
-        std::vector<float> proposalCandidateProbs;
+        // 与 drafts 同步发布，保留实际采样的完整 q，直到本轮 verify 完成。
+        bool sampledProposal = false;
+        std::vector<int> proposalTokens;
+        Data proposalProbs;           // CUDA FP32 [block, vocab]；确定性候选在 verify 构造 one-hot
         int anchor = -1;
         int anchorPos = -1;
         // 已经校验通过、等待调度器逐个取走的 token：(期望的输入 token, 应返回的 token)
@@ -399,10 +399,16 @@ namespace fastllm {
 
         void InitDsparkParams();
         bool DsparkTensorNeeded(const std::string &name) const;
-        // 支持贪心 / CUDA 采样；无 logits 输出、前缀相关约束或图文输入
+        // 支持贪心 / CUDA 采样及逐位置工具名、参数名约束
         bool DsparkSupportsRequest(const GenerationConfig &config,
                                    const DeepSeekV41RequestState &state) const;
         static GenerationConfig DsparkSamplingConfig(const GenerationConfig &config);
+        void DsparkMaskToolLogits(Data &logits, const GenerationConfig &config,
+                                  const std::vector<int> &prefixTokens);
+        int DsparkAcceptedDraftCount(const DeepSeekV41SpecScratch &scratch,
+                                     const GenerationConfig &config) const;
+        GenerationConfig DsparkDraftConfig(const GenerationConfig &config,
+                                          const DeepSeekV41SpecScratch &scratch, int anchorToken);
         void DsparkSampleVerify(Data &logits, const DeepSeekV41DsparkState &proposal,
                                 DeepSeekV41SpecScratch &scratch, const GenerationConfig &config);
         std::shared_ptr<DeepSeekV41DsparkState> GetOrCreateDsparkState(

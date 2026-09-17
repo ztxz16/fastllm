@@ -660,9 +660,11 @@ token，即目标模型刚产出、还没进 KV 缓存的那个 token），一�
 再用 markov head 逐位置做 bigram 修正，得到 `block_size` 个候选 token；
 `confidence_head` 对每个位置给出一个 sigmoid 后的置信度。
 
-贪心请求取 argmax 草稿；采样请求按实际草稿分布逐位置抽样并保存候选 ID 与概率。
-每一步 Markov 修正使用上一步实际抽到的 token。草稿支持集最多 64 项，目标分布仍使用
-请求自己的 `temperature`、`top_k`、`top_p`。无需额外环境变量开启随机草稿或拒绝采样。
+贪心请求取 argmax；采样请求在 GPU 保存完整草稿分布 q，通过共用的 MTP 采样与拒绝采样内核校验，
+不再限制草稿支持集为 64 项。Markov 修正使用上一步实际抽到的 token；草稿与目标均使用请求的
+`temperature`、`top_k`、`top_p`，无工具掩码时与普通 CUDA 采样一致。
+工具名、参数名约束按位置更新：在允许集合内取 top-k 并重新归一化后取 top-p，草稿、校验和 bonus
+使用各自前缀；拒绝和待发队列不会错误推进约束状态。强制候选测试使用 one-hot q，无需额外开关。
 
 ### 校验与回滚
 
@@ -688,15 +690,17 @@ token：第一个立刻返回，其余进入请求的待发队列，调度器之
 
 ### 限制
 
-- 支持简单贪心及 CUDA 上的 temperature / top-k / top-p 采样。重复惩罚、工具约束、
-  `output_logits`、正的 `output_token_least`、非有限采样参数会退回普通解码；CPU 采样也走普通路径。
+- 支持简单贪心及 CUDA 上的 temperature / top-k / top-p 采样，也支持默认工具名、参数名约束。
+  重复惩罚、工具内容采样、没有前缀状态的独立 token 白名单、`output_logits`、正的
+  `output_token_least`、非有限采样参数会退回普通解码；CPU 采样也走普通路径。
   与普通解码一样，`do_sample=true`、正温度且 `top_k<=1` 时将 top-k 规范化为 5；
 - 只在**单请求**前向里产生候选。批量 decode 的那一轮不投机，但仍然采集 main hidden，
   让草稿滑窗跟上目标缓存；已经校验通过的 token 在批量路径里也能正常出队；
 - 图文请求不投机；
 - 前缀缓存命中恢复出来的前缀没有草稿侧的滑窗（`main_x` 无法从目标缓存反推），
   草稿注意力只看得到恢复之后新增的位置，接受率会在最初的 `window_size` 个 token 内偏低；
-- 请求在待发队列还没取完时结束（EOS / 长度上限），这一轮多算的 token 会让缓存长度超过
+- 校验提交在首个 EOS / stop token 处截断，避免结束时缓存超出真实输出。
+  请求若因长度上限在待发队列还没取完时结束，这一轮多算的 token 仍可能让缓存长度超过
   `allTokens`，该请求的前缀缓存记录会被跳过；
 - 尚未接入 CUDA Graph 与张量并行。
 
@@ -718,7 +722,13 @@ token：第一个立刻返回，其余进入请求的待发队列，调度器之
 
 ### 接受率与分段计时
 
-`FASTLLM_DSPARK_STATS=1` 打开后会周期性打印一组统计，用来判断收益到底卡在哪：
+`FASTLLM_DSPARK_STATS=1` 使用与 Qwen3.5 相同的简洁位置接受率格式：
+
+```text
+[DeepSeek-V4.1 DSpark] pos_accept_rate=[90.00%, 80.00%, 70.00%, 60.00%, 50.00%].
+```
+
+需要排查耗时时，设 `FASTLLM_DSPARK_STATS=2` 才会打印逐轮和分段统计：
 
 ```
 [DSpark 进行中] 前向 640 次（校验 612 + 普通 28），出队 918，共产出 1558 个 token；每次前向 2.434 个 token（已跳过 3 轮预热）
@@ -776,7 +786,7 @@ CUDA 上因此走一个把整条链留在设备上的融合 kernel（token 一�
 | --- | --- |
 | `FASTLLM_DSPARK_TOKENS` | 每轮校验的候选数（由 `--dspark` / `--draft_tokens` 设置，不要直接设） |
 | `FASTLLM_DSPARK_CONFIDENCE_THRESHOLD` | 置信度低于该值的候选之后不再校验；0 表示总是用满 block |
-| `FASTLLM_DSPARK_STATS` | `1` 累计统计接受率与分段耗时，`2` 额外逐轮打印一行。默认关闭，见下文"接受率与分段计时" |
+| `FASTLLM_DSPARK_STATS` | `1` 仅打印逐位置接受率，`2` 打印详细分段耗时与逐轮记录。默认关闭，见下文"接受率与分段计时" |
 | `FASTLLM_DSPARK_STATS_EVERY` | 每累计 N 轮校验打印一次（默认 64，0 表示只在退出时打印） |
 | `FASTLLM_DSPARK_STATS_WARMUP` | 统计前跳过的轮数（默认 3）。第一次 decode 含 CUDA context / 显存池 / 权重量化缓存的一次性开销，会把均值拉偏 |
 | `FASTLLM_DSPARK_DISABLE_FUSED_MARKOV` | 关掉 markov head 的融合 kernel，退回通用算子（对拍 / 排查用；两条路径输出逐 bit 一致） |
@@ -873,9 +883,9 @@ PYTHONPATH=build/tools python test/basic/deepseek_v41_dspark.py \
   脚本把"差距在 3 个 BF16 ulp 以内"的分歧判为并列，以 DSpark 的输出为新前缀重新跑基准继续比较；
 - 默认用 `--dtype float32` 与 2 专家 top-2、`index_topk` 大于压缩块数，减少随机权重下的并列。
 
-采样内核与 V4.1 接入分别用 `test/cuda/test_mtp_draft_sampling.cpp` 和
-`test/ops/deepseekV41SamplingRegression.cpp` 验证。前者检查 Gumbel-max 草稿支持集、
-temperature/top-k/top-p 与拒绝校正；后者对 3/4/5/7 个候选检查前三个输出的条件联合分布，
+采样内核与 V4.1 接入分别用 `test/basic/test_cuda_mtp_rejection.cpp` 和
+`test/ops/deepseekV41SamplingRegression.cpp` 验证。前者检查实际保存的 q、普通采样分布、
+temperature/top-k/top-p 与拒绝校正；后者检查跨卡概率传递、截断候选，并对 3/4/5/7 个候选检查前三个输出的条件联合分布，
 覆盖固定 q、不同 p/q、相同 p/q，并检查请求回退和滑窗、压缩 KV、raw tail、Engram 的回滚。
 统计测试使用已知目标概率，不将随机序列逐 token 相同作为通过标准。
 

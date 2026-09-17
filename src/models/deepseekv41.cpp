@@ -4577,7 +4577,7 @@ namespace fastllm {
             ToDataType(allLogits, DataType::FLOAT32);
             segments[0].spec->tokens.resize(seqlen);
             const GenerationConfig sampling = DsparkSamplingConfig(generationConfigsIn[0]);
-            if (!sampling.IsSimpleGreedy()) {
+            if (sampling.top_k > 1) {
                 Data rootLogits;
                 Data *samplingLogits = &allLogits;
                 if (tp && allLogits.multiDeviceData && allLogits.IsTensorParallelReplicated()) {
@@ -4592,6 +4592,7 @@ namespace fastllm {
                 // 这里直接从副本拷到 CPU 上自己取 argmax。
                 Data cpuLogits;
                 V41ReplicaToCpu(cpuLogits, allLogits, tpDevices);
+                DsparkMaskToolLogits(cpuLogits, sampling, segments[0].spec->draftTokens);
                 const int vocab = cpuLogits.dims.back();
                 const float *values = (const float*)cpuLogits.cpuData;
                 for (int i = 0; i < seqlen; i++) {
@@ -4605,6 +4606,7 @@ namespace fastllm {
                     segments[0].spec->tokens[i] = best;
                 }
             } else {
+                DsparkMaskToolLogits(allLogits, sampling, segments[0].spec->draftTokens);
                 TopK(allLogits, topk, 1);
                 topk.ToDevice(DataDevice::CPU);
                 const int stride = topk.dims[topk.dims.size() - 1];
