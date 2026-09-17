@@ -7790,10 +7790,14 @@ namespace fastllm {
                                 gateTasks, false);
                         }
                     } else {
-                        std::vector<MultiThreadBaseOp*> ops(
-                            numaConfig->threads);
-                        for (int i = 0; i < (int)ops.size(); i++) {
-                            ops[i] = new MultiThreadMultiOps();
+                        auto &workers = fastllmMoeDataManagerNumas.decodeWorkers;
+                        auto &taskStorage = fastllmMoeDataManagerNumas.gateSwigluTaskStorage;
+                        workers.resize(numaConfig->threads);
+                        taskStorage.resize(numaConfig->threads);
+                        for (int i = 0; i < numaConfig->threads; i++) {
+                            workers[i].tasks.clear();
+                            taskStorage[i].clear();
+                            taskStorage[i].reserve(totalExperts);
                         }
                         for (int nid = 0;
                              nid < numaConfig->numaCnt; nid++) {
@@ -7846,42 +7850,18 @@ namespace fastllm {
                                                         downInputDataType,
                                                         1, interDim) :
                                             nullptr;
-                                    AssertInFastLLM(
-                                        (int)weights[e * 2]->
-                                                numasData.size() >
-                                            nid &&
-                                        weights[e * 2]->
-                                                numasData[nid] !=
-                                            nullptr,
-                                        "NumasMergeMOE small batch gate "
-                                        "weight missing NUMA shard: " +
-                                            weights[e * 2]->name +
-                                            "\n");
-                                    ((MultiThreadMultiOps*)ops[
-                                        numaConfig->
-                                            numaToCpuDict[nid][tid]
-                                                .first])->
-                                        ops.push_back(
-                                            new MultiThreadGemmAndCrossSwigluOp(
-                                                (uint8_t*)
-                                                    expertInput(e),
-                                                startDataType,
-                                                weights[e * 2]->
-                                                    numasData[nid],
-                                                weights[e * 2]->
-                                                    GetDataType(),
-                                                (uint8_t*)
-                                                        gateUpOutput.data() +
-                                                    outputOffset,
-                                                DataType::FLOAT32,
-                                                swigluOutput.data() +
-                                                    expertIdx *
-                                                        interDim,
-                                                1, inputDim, k,
-                                                expertStartRow,
-                                                expertEndRow, base,
-                                                dstPtr,
-                                                downInputDataType));
+                                    if ((int)weights[e * 2]->numasData.size() <= nid ||
+                                            weights[e * 2]->numasData[nid] == nullptr) {
+                                        ErrorInFastLLM("NumasMergeMOE small batch gate weight missing NUMA shard: " +
+                                                       weights[e * 2]->name + "\n");
+                                    }
+                                    taskStorage[numaConfig->numaToCpuDict[nid][tid].first].emplace_back(
+                                        (uint8_t*)expertInput(e), startDataType,
+                                        weights[e * 2]->numasData[nid], weights[e * 2]->GetDataType(),
+                                        (uint8_t*)gateUpOutput.data() + outputOffset, DataType::FLOAT32,
+                                        swigluOutput.data() + expertIdx * interDim,
+                                        1, inputDim, k, expertStartRow, expertEndRow, base,
+                                        dstPtr, downInputDataType);
                                     rowStart +=
                                         expertEndRow -
                                         expertStartRow;
@@ -7893,13 +7873,17 @@ namespace fastllm {
                                 currentRow = endRow;
                             }
                         }
-                        profileLap(profileGatePrepMs);
-                        for (int i = 0; i < (int)ops.size(); i++) {
-                            pool->PushOp(i, ops[i]);
+                        for (int i = 0; i < numaConfig->threads; i++) {
+                            for (auto &task : taskStorage[i]) {
+                                workers[i].tasks.push_back(&task);
+                            }
                         }
-                        for (int i = 0; i < (int)ops.size(); i++) {
+                        profileLap(profileGatePrepMs);
+                        for (int i = 0; i < numaConfig->threads; i++) {
+                            pool->PushOp(i, &workers[i]);
+                        }
+                        for (int i = 0; i < numaConfig->threads; i++) {
                             pool->Wait(i);
-                            delete ops[i];
                         }
                     }
                     profileLap(profileGateMs);
@@ -8159,10 +8143,14 @@ namespace fastllm {
                                 downTasks, false);
                         }
                     } else {
-                        std::vector<MultiThreadBaseOp*> ops(
-                            numaConfig->threads);
-                        for (int i = 0; i < (int)ops.size(); i++) {
-                            ops[i] = new MultiThreadMultiOps();
+                        auto &workers = fastllmMoeDataManagerNumas.decodeWorkers;
+                        auto &taskStorage = fastllmMoeDataManagerNumas.gemmTaskStorage;
+                        workers.resize(numaConfig->threads);
+                        taskStorage.resize(numaConfig->threads);
+                        for (int i = 0; i < numaConfig->threads; i++) {
+                            workers[i].tasks.clear();
+                            taskStorage[i].clear();
+                            taskStorage[i].reserve(totalExperts);
                         }
                         for (int nid = 0;
                              nid < numaConfig->numaCnt; nid++) {
@@ -8205,57 +8193,34 @@ namespace fastllm {
                                             GetDataBytes(
                                                 DataType::FLOAT32,
                                                 1, base);
-                                        AssertInFastLLM(
-                                            (int)weights[
-                                                e * 2 + 1]->
-                                                    numasData.size() >
-                                                nid &&
-                                            weights[e * 2 + 1]->
-                                                    numasData[nid] !=
-                                                nullptr,
-                                            "NumasMergeMOE small "
-                                            "batch down weight missing "
-                                            "NUMA shard: " +
-                                                weights[e * 2 + 1]->
-                                                    name +
-                                                "\n");
-                                        ((MultiThreadMultiOps*)ops[
-                                            numaConfig->
-                                                numaToCpuDict[nid][tid]
-                                                    .first])->
-                                            ops.push_back(
-                                                new MultiThreadGemmOp(
-                                                    downInput.data() +
-                                                        inputOffset,
-                                                    downInputDataType,
-                                                    weights[
-                                                        e * 2 + 1]->
-                                                        numasData[nid],
-                                                    weights[
-                                                        e * 2 + 1]->
-                                                        GetDataType(),
-                                                    (uint8_t*)
-                                                            downOutput
-                                                                .data() +
-                                                        outputOffset,
-                                                    DataType::FLOAT32,
-                                                    1, interDim, k,
-                                                    rowInExpert,
-                                                    rowInExpert +
-                                                        rowsToProcess));
+                                        if ((int)weights[e * 2 + 1]->numasData.size() <= nid ||
+                                                weights[e * 2 + 1]->numasData[nid] == nullptr) {
+                                            ErrorInFastLLM("NumasMergeMOE small batch down weight missing NUMA shard: " +
+                                                           weights[e * 2 + 1]->name + "\n");
+                                        }
+                                        taskStorage[numaConfig->numaToCpuDict[nid][tid].first].emplace_back(
+                                            downInput.data() + inputOffset, downInputDataType,
+                                            weights[e * 2 + 1]->numasData[nid],
+                                            weights[e * 2 + 1]->GetDataType(),
+                                            (uint8_t*)downOutput.data() + outputOffset, DataType::FLOAT32,
+                                            1, interDim, k, rowInExpert, rowInExpert + rowsToProcess);
                                     }
                                     row += rowsToProcess;
                                 }
                                 currentRow = endRow;
                             }
                         }
-                        profileLap(profileDownPrepMs);
-                        for (int i = 0; i < (int)ops.size(); i++) {
-                            pool->PushOp(i, ops[i]);
+                        for (int i = 0; i < numaConfig->threads; i++) {
+                            for (auto &task : taskStorage[i]) {
+                                workers[i].tasks.push_back(&task);
+                            }
                         }
-                        for (int i = 0; i < (int)ops.size(); i++) {
+                        profileLap(profileDownPrepMs);
+                        for (int i = 0; i < numaConfig->threads; i++) {
+                            pool->PushOp(i, &workers[i]);
+                        }
+                        for (int i = 0; i < numaConfig->threads; i++) {
                             pool->Wait(i);
-                            delete ops[i];
                         }
                     }
                     profileLap(profileDownMs);
