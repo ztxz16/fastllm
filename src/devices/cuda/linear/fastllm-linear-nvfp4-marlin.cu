@@ -9,6 +9,7 @@
  */
 
 #include "fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-nvfp4-fused.h"
 #include "fastllm-cublas-prefill.cuh"
 
 #include <cuda_fp16.h>
@@ -437,6 +438,12 @@ extern "C" bool FastllmCudaTryMarlinHalfMatMulFloatNVFP4Block16(
         int n, int m, int k) {
     int packedN = 0;
     if (!GetNvfp4MarlinPackedOutputDim(k, packedN)) return false;
+    // Admit only already-prepared, dense CUDA tensors. Cold weights and all
+    // other shapes continue through the complete Marlin preparation/launch path.
+    if (n == 1 && fastllm::FastllmCudaNvfp4ShapeGemvCanRun(input, weight, bias, output)) {
+        fastllm::FastllmCudaNvfp4ShapeGemv(input, weight, output);
+        return true;
+    }
     // Repacked weights must keep using a backend that understands Marlin layout.
     if (!HasNvfp4MarlinOnDevice(weight)) {
         if (weight.dataType != fastllm::DataType::NVFP4_BLOCK_16 ||

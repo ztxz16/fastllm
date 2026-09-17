@@ -39,13 +39,16 @@ template <class T> __device__ __forceinline__ float2 LoadPair(const T *p) {
     else
         return __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 *>(&b));
 }
-template <class T, int N, int K, bool Gate, int W, int Chains, int Unroll, int NW = 1>
+template <class T, int StaticN, int StaticK, bool Gate, int W, int Chains, int Unroll, int NW = 1, bool AddResidual = true>
 __global__ __launch_bounds__(W * 32,
                              2) void GemvEpilogue(const T *__restrict__ x, const uint32_t *__restrict__ q,
                                                   const uint8_t *__restrict__ s,
-                                                  const float *__restrict__ global, T *__restrict__ y) {
-    static_assert(W % NW == 0 && 8 % NW == 0 && K % 16 == 0 && N % 128 == 0);
-    constexpr int Rows = Gate ? 4 : 2, Groups = K / 16;
+                                                  const float *__restrict__ global, T *__restrict__ y,
+                                                  int runtimeN = 0, int runtimeK = 0) {
+    static_assert(W % NW == 0 && 8 % NW == 0 && StaticK % 16 == 0 && StaticN % 128 == 0);
+    const int N = StaticN ? StaticN : runtimeN, K = StaticK ? StaticK : runtimeK;
+    constexpr int Rows = Gate ? 4 : 2;
+    const int Groups = K / 16;
     // Adjacent lanes read adjacent words of the Marlin tile. Four lanes select
     // N quadrants, the next two bits select K pairs, and the last bit selects
     // a second K group. NW warps cover adjacent N pairs; remaining warps split K.
@@ -113,8 +116,10 @@ __global__ __launch_bounds__(W * 32,
         if constexpr (Gate) {
             float g = float(val), up = float(T(u * scale)), e = __expf(-fabsf(g));
             y[dst] = T((g >= 0 ? g : g * e) * __fdividef(1, 1 + e) * up);
-        } else
+        } else if constexpr (AddResidual)
             y[dst] = T(float(val) + float(y[dst]));
+        else
+            y[dst] = val;
     }
 }
 } // namespace nvfused

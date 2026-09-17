@@ -239,7 +239,8 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
           const int group_blocks,  // number of consecutive 16x16 blocks
                                    // with a separate quantization scale
           const bool is_zp_float,  // is zero point of float16 type?
-          const bool dense_fp32>
+          const bool dense_fp32,
+          const bool add_residual>
 __global__ void Marlin(
     const int4* __restrict__ A0,  // fp16 input matrix of shape mxk
     const int4* __restrict__ B,   // 4bit quantized weight matrix of shape kxn
@@ -268,6 +269,8 @@ __global__ void Marlin(
     bool use_atomic_add_arg,   // whether to use atomic add to reduce
     bool use_fp32_reduce_arg,  // whether to use fp32 global reduce
     int max_shared_mem) {
+  static_assert(!add_residual || (dense_fp32 && m_block_size_8 &&
+      b_type_id == vllm::kFE2M1f.id() && c_type_id == vllm::kFloat16.id()));
   const bool has_bias = dense_fp32 ? false : has_bias_arg;
   const bool use_atomic_add = dense_fp32 ? false : use_atomic_add_arg;
   const bool use_fp32_reduce = dense_fp32 ? true : use_fp32_reduce_arg;
@@ -1739,7 +1742,20 @@ __global__ void Marlin(
             atomicAdd(&C_half2[a], sh_red_half2[a]);
           }
         } else {
-          C[c_gl_wr] = sh_red[c_sh_rd];
+          if constexpr (add_residual) {
+            // Only the final FP32 reduction owner writes C. Intermediate
+            // partial sums live in C_tmp, so the original residual is intact.
+            // sh_red already contains the rounded Linear result: preserve the
+            // separate Linear + AddTo rounding before adding the residual.
+            int4 value = sh_red[c_sh_rd], residual = C[c_gl_wr];
+            auto *v = reinterpret_cast<half2*>(&value);
+            const auto *r = reinterpret_cast<const half2*>(&residual);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) v[j] = __hadd2(v[j], r[j]);
+            C[c_gl_wr] = value;
+          } else {
+            C[c_gl_wr] = sh_red[c_sh_rd];
+          }
         }
         c_gl_wr += c_gl_wr_delta;
         c_sh_rd += c_sh_rd_delta;
