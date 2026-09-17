@@ -370,6 +370,7 @@ if (USE_CUDA)
         src/devices/cuda/linear/fastllm-linear-bf16.cu
         src/devices/cuda/linear/fastllm-gdn-input.cu
         src/devices/cuda/linear/fastllm-fp8-linear-add.cu
+        src/devices/cuda/linear/fastllm-nvfp4-fused.cu
         src/devices/cuda/linear/fastllm-linear-fp8.cu
         src/devices/cuda/linear/fastllm-linear-fp8-marlin.cu
         src/devices/cuda/linear/fastllm-linear-nvfp4-marlin.cu
@@ -943,6 +944,12 @@ if (UNIT_TEST)
             set_tests_properties(cuda_dsv41_moe_cache PROPERTIES LABELS cuda RUN_SERIAL TRUE)
         endif()
 
+
+        add_executable(cuda_nvfp4_fused_test test/basic/test_cuda_nvfp4_fused.cu)
+        target_link_libraries(cuda_nvfp4_fused_test PRIVATE fastllm)
+        set_target_properties(cuda_nvfp4_fused_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME cuda_nvfp4_fused COMMAND cuda_nvfp4_fused_test)
+        set_tests_properties(cuda_nvfp4_fused PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
 
         add_executable(cuda_fp8_linear_add_test test/basic/test_cuda_fp8_linear_add.cu)
         target_link_libraries(cuda_fp8_linear_add_test PRIVATE fastllm)

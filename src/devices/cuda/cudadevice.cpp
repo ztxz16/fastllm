@@ -1,5 +1,6 @@
 #include "devices/cuda/fastllm-cuda-gdn.h"
 #include "devices/cuda/fastllm-cuda-fp8-linear-add.h"
+#include "devices/cuda/fastllm-cuda-nvfp4-fused.h"
 //
 // Created by huangyuyang on 6/14/23.
 //
@@ -6461,6 +6462,10 @@ namespace fastllm {
         Data &middle = *(datas.find("middle")->second);
         Data &bias = *(datas.find("bias")->second);
 
+        if (weight.dataType == DataType::NVFP4_BLOCK_16) {
+            CudaNvfp4LinearAddBlock(input, weight, bias, middle, output);
+            return;
+        }
         if (DoCudaLinearAdd(input, weight, bias, output)) { 
             return;
         } else {
@@ -6638,6 +6643,10 @@ namespace fastllm {
         Data &middle = *(datas.find("middle")->second);
         Data &bias = *(datas.find("bias")->second);
 
+        if (weight.dataType == DataType::NVFP4_BLOCK_16) {
+            CudaNvfp4LinearSwigluBlock(input, weight, bias, middle, output);
+            return;
+        }
         if (DoCudaLinearSwiglu(input, weight, bias, middle, output)) {
             return;
         } else {
