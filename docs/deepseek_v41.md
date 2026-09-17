@@ -119,8 +119,9 @@ CPU / NUMA 专家使用 FastLLM 自有线程池，由 `--threads` 控制；CLI �
 常规推理不调用 OpenMP / MKL，`OMP_NUM_THREADS`、`MKL_NUM_THREADS`、`OMP_WAIT_POLICY`、`KMP_BLOCKTIME`
 可从上述命令中省略。Tokenizer 的 Python 依赖可能加载带 OpenMP / MKL 的 PyTorch，但不承担模型前向。
 NumPy 会加载 OpenBLAS，建议保留 `OPENBLAS_NUM_THREADS=1` 以免建立额外的大线程池。
-前缀缓存默认未禁用，无需 `FASTLLM_DSV41_DISABLE_PREFIX_CACHE=0`；`FASTLLM_DSV41_PREFIX_CACHE_DEBUG`
-及 `FASTLLM_DSPARK_STATS*` 仅用于诊断。`FT_NUMAS`、Engram mmap 和自定义元数据路径则按部署需要保留。
+前缀缓存默认未禁用，无需 `FASTLLM_DSV41_DISABLE_PREFIX_CACHE=0`；`FASTLLM_DSV41_PREFIX_CACHE_DEBUG` 仅用于诊断。
+DSpark 默认每 32 轮校验打印位置接受率，无需设置 `FASTLLM_DSPARK_STATS` / `FASTLLM_DSPARK_STATS_EVERY`。
+`FT_NUMAS`、Engram mmap 和自定义元数据路径则按部署需要保留。
 
 ### 实测（DeepSeek-V4.1-Flash 真实权重，2026-09-12）
 
@@ -737,13 +738,14 @@ token：第一个立刻返回，其余进入请求的待发队列，调度器之
 
 ### 接受率与分段计时
 
-`FASTLLM_DSPARK_STATS=1` 使用与 Qwen3.5 相同的简洁位置接受率格式：
+默认开启位置接受率统计，每累计 32 轮校验打印一次（仍跳过前 3 轮预热），等同于
+`FASTLLM_DSPARK_STATS=1 FASTLLM_DSPARK_STATS_EVERY=32`。格式与 Qwen3.5 相同：
 
 ```text
 [DeepSeek-V4.1 DSpark] pos_accept_rate=[90.00%, 80.00%, 70.00%, 60.00%, 50.00%].
 ```
 
-需要排查耗时时，设 `FASTLLM_DSPARK_STATS=2` 才会打印逐轮和分段统计：
+设置 `FASTLLM_DSPARK_STATS=0` 可关闭统计；需要排查耗时时，设为 `2` 打印逐轮和分段统计：
 
 ```
 [DSpark 进行中] 前向 640 次（校验 612 + 普通 28），出队 918，共产出 1558 个 token；每次前向 2.434 个 token（已跳过 3 轮预热）
@@ -801,8 +803,8 @@ CUDA 上因此走一个把整条链留在设备上的融合 kernel（token 一�
 | --- | --- |
 | `FASTLLM_DSPARK_TOKENS` | 每轮校验的候选数（由 `--dspark` / `--draft_tokens` 设置，不要直接设） |
 | `FASTLLM_DSPARK_CONFIDENCE_THRESHOLD` | 置信度低于该值的候选之后不再校验；0 表示总是用满 block |
-| `FASTLLM_DSPARK_STATS` | `1` 仅打印逐位置接受率，`2` 打印详细分段耗时与逐轮记录。默认关闭，见下文"接受率与分段计时" |
-| `FASTLLM_DSPARK_STATS_EVERY` | 每累计 N 轮校验打印一次（默认 64，0 表示只在退出时打印） |
+| `FASTLLM_DSPARK_STATS` | 默认 `1`，仅打印逐位置接受率；`0` 关闭，`2` 打印详细分段耗时与逐轮记录。见上文"接受率与分段计时" |
+| `FASTLLM_DSPARK_STATS_EVERY` | 每累计 N 轮校验打印一次（默认 32，0 表示只在退出时打印） |
 | `FASTLLM_DSPARK_STATS_WARMUP` | 统计前跳过的轮数（默认 3）。第一次 decode 含 CUDA context / 显存池 / 权重量化缓存的一次性开销，会把均值拉偏 |
 | `FASTLLM_DSPARK_DISABLE_FUSED_MARKOV` | 关掉 markov head 的融合 kernel，退回通用算子（对拍 / 排查用；两条路径输出逐 bit 一致） |
 | `FASTLLM_DSPARK_PROBE_EVERY` | 每 N 轮故意不带候选走一次普通单 token 前向，给"校验 N 个候选"提供同等缓存状态下的对照基线。默认 0（关闭），只在诊断时打开 |

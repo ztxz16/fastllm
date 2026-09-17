@@ -177,8 +177,8 @@ namespace fastllm {
         }
 
         // ---------------- 接受率与分段计时 ----------------
-        // FASTLLM_DSPARK_STATS=1 仅打印逐位置接受率；=2 打印详细统计及逐轮耗时。
-        // FASTLLM_DSPARK_STATS_EVERY=N 控制中途汇总的频率（默认 64，0 表示只在退出时打印）。
+        // FASTLLM_DSPARK_STATS 默认 1，仅打印逐位置接受率；=0 关闭，=2 打印详细统计及逐轮耗时。
+        // FASTLLM_DSPARK_STATS_EVERY=N 控制中途汇总的频率（默认 32，0 表示只在退出时打印）。
         //
         // 草稿阶段（三个草稿层 + markov head + confidence head）与校验阶段分开计时。
         // 草稿层的路由专家跑在 moe_device 上：放 cpu / numa 时是同步的，计时准确；
@@ -234,8 +234,8 @@ namespace fastllm {
         }
 
         struct DsparkProfiler {
-            int level = 0;
-            uint64_t reportEvery = 64;
+            int level = 1;
+            uint64_t reportEvery = 32;
             std::mutex mutex;
             DsparkStat stat;
             uint64_t sinceReport = 0;
@@ -247,11 +247,8 @@ namespace fastllm {
 
             DsparkProfiler() {
                 const char *v = std::getenv("FASTLLM_DSPARK_STATS");
-                if (v != nullptr && v[0] != '\0' && strcmp(v, "0") != 0) {
-                    level = atoi(v);
-                    if (level <= 0) {
-                        level = 1;
-                    }
+                if (v != nullptr && v[0] != '\0') {
+                    level = strcmp(v, "0") == 0 ? 0 : std::max(1, atoi(v));
                 }
                 const char *e = std::getenv("FASTLLM_DSPARK_STATS_EVERY");
                 if (e != nullptr && e[0] != '\0') {
