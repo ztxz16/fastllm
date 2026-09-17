@@ -414,6 +414,20 @@ __global__ void FastllmCudaFP8E4M32HalfKernel(uint8_t* a, float *scales, half *b
     int ms = (m - 1) / blockM + 1;
     scales += (st / blockK) * ms;
 
+    // Odd TP row widths and scale boundaries cannot use four-byte loads
+    // or unconditional four-element stores, including on the final row.
+    const uint8_t *row = a + size_t(st) * m;
+    if ((m % 4 != 0) || (blockM % 4 != 0) ||
+        (reinterpret_cast<uintptr_t>(row) % alignof(uint32_t) != 0)) {
+        for (int i = tid; i < m; i += blockDim.x) {
+            const unsigned int code = row[i];
+            const half value = __ushort_as_half(
+                ((code & 0x80u) << 8) | ((code & 0x7fu) << 7));
+            b[size_t(st) * m + i] = __float2half(float(value) * scales[i / blockM]);
+        }
+        return;
+    }
+
     for (int i = tid * 4; i < m; i += blockDim.x * 4) {
         float curScale = scales[i / blockM];
         uint32_t ori = *(uint32_t*)(a + st * m + i);
@@ -512,29 +526,48 @@ __global__ void FastllmGemvHalfFP8E4M3Kernel1MultiRow(half *A, uint8_t *B, half 
     scales += (st / blockK) * ms;
 
     const uint8_t *baseB = (uint8_t*)B + st * m;
-    union_half4 regA;
-    for (int i = tid * 4; i < m; i += THREAD_PER_BLOCK * 4) {
-        float curScale = scales[i / blockM];
-        uint32_t bb = ((uint32_t*)(baseB + i))[0];
-        __half2 B01 = make_half2(__short_as_half( (((bb >> 0) & 0x80) << 8) | (((bb >> 0) & 0x7F) << 7) ), 
-                                __short_as_half( (((bb >> 8) & 0x80) << 8) | (((bb >> 8) & 0x7F) << 7) ));
-        __half2 B23 = make_half2(__short_as_half( (((bb >> 16) & 0x80) << 8) | (((bb >> 16) & 0x7F) << 7) ), 
-                                __short_as_half( (((bb >> 24) & 0x80) << 8) | (((bb >> 24) & 0x7F) << 7) ));        
+    // Uneven TP shards may have odd K. The vector path requires both
+    // weight rows (uint32_t) and activation rows (uint2) to stay aligned.
+    // A non-multiple-of-four scale block also needs element-wise indexing.
+    const bool scalarLoads = (m % 4 != 0) || (blockM % 4 != 0) ||
+        (reinterpret_cast<uintptr_t>(baseB) % alignof(uint32_t) != 0) ||
+        (reinterpret_cast<uintptr_t>(A) % alignof(uint2) != 0);
+    if (scalarLoads) {
+        for (int i = tid; i < m; i += THREAD_PER_BLOCK) {
+            const unsigned int code = baseB[i];
+            const half value = __short_as_half(
+                ((code & 0x80u) << 8) | ((code & 0x7fu) << 7));
+            const float scale = scales[i / blockM];
 #pragma unroll
-        for (int x = 0; x < PART; x++) {
-            regA.in = *reinterpret_cast<const uint2 *>(A + x * m + i);
-#if (CUDART_VERSION < 12000) || defined(CUDA_NO_TENSOR_CORE)
-            sdata[x][tid] += ((float)regA.out[0] * (float)B01.x + 
-                                (float)regA.out[1] * (float)B01.y +
-                                (float)regA.out[2] * (float)B23.x +
-                                (float)regA.out[3] * (float)B23.y) * curScale;
-#else
-            __half2 p01 = __hmul2(regA.out2[0], B01); // {a0b0, a1b1}
-            __half2 p23 = __hmul2(regA.out2[1], B23); // {a2b2, a3b3}
-            __half2 sum_halves_vec = __hadd2(p01, p23); // {a0b0+a2b2, a1b1+a3b3}
-            __half sum_h = __hadd(sum_halves_vec.x, sum_halves_vec.y); // (a0b0+a2b2) + (a1b1+a3b3)
-            sdata[x][tid] += __half2float(sum_h) * curScale;
-#endif
+            for (int x = 0; x < PART; ++x) {
+                sdata[x][tid] += float(A[size_t(x) * m + i]) * float(value) * scale;
+            }
+        }
+    } else {
+        union_half4 regA;
+        for (int i = tid * 4; i < m; i += THREAD_PER_BLOCK * 4) {
+            float curScale = scales[i / blockM];
+            uint32_t bb = ((uint32_t*)(baseB + i))[0];
+            __half2 B01 = make_half2(__short_as_half( (((bb >> 0) & 0x80) << 8) | (((bb >> 0) & 0x7F) << 7) ),
+                                    __short_as_half( (((bb >> 8) & 0x80) << 8) | (((bb >> 8) & 0x7F) << 7) ));
+            __half2 B23 = make_half2(__short_as_half( (((bb >> 16) & 0x80) << 8) | (((bb >> 16) & 0x7F) << 7) ),
+                                    __short_as_half( (((bb >> 24) & 0x80) << 8) | (((bb >> 24) & 0x7F) << 7) ));
+    #pragma unroll
+            for (int x = 0; x < PART; x++) {
+                regA.in = *reinterpret_cast<const uint2 *>(A + x * m + i);
+    #if (CUDART_VERSION < 12000) || defined(CUDA_NO_TENSOR_CORE)
+                sdata[x][tid] += ((float)regA.out[0] * (float)B01.x +
+                                    (float)regA.out[1] * (float)B01.y +
+                                    (float)regA.out[2] * (float)B23.x +
+                                    (float)regA.out[3] * (float)B23.y) * curScale;
+    #else
+                __half2 p01 = __hmul2(regA.out2[0], B01); // {a0b0, a1b1}
+                __half2 p23 = __hmul2(regA.out2[1], B23); // {a2b2, a3b3}
+                __half2 sum_halves_vec = __hadd2(p01, p23); // {a0b0+a2b2, a1b1+a3b3}
+                __half sum_h = __hadd(sum_halves_vec.x, sum_halves_vec.y); // (a0b0+a2b2) + (a1b1+a3b3)
+                sdata[x][tid] += __half2float(sum_h) * curScale;
+    #endif
+            }
         }
     }
     __syncthreads();
@@ -807,11 +840,14 @@ static bool CanRunFastllmRowFP8(const T *input, const uint8_t *weight, const T *
     const char *flag = std::getenv("FASTLLM_CUDA_FP8_ROW_GEMV");
     if (flag && (!std::strcmp(flag, "0") || !std::strcmp(flag, "false")))
         return false;
-    if (batch != 1 || K < 512 || K > 32768 || K % 512 || N < 4096 || blockM != K || blockK != 1 || !input ||
+    if (batch != 1 || K < 512 || K > 32768 || N < 4096 || blockM < K || blockK != 1 || !input ||
         !weight || !output || !scales || reinterpret_cast<uintptr_t>(input) % 4 ||
         reinterpret_cast<uintptr_t>(weight) % 16 || reinterpret_cast<uintptr_t>(output) % 2 ||
         reinterpret_cast<uintptr_t>(scales) % 4 || (bias && reinterpret_cast<uintptr_t>(bias) % 2))
         return false;
+    const char *generic = std::getenv("FASTLLM_CUDA_TP_FUSIONS");
+    if (generic && (!std::strcmp(generic, "0") || !std::strcmp(generic, "false")) &&
+        (K % 512 || blockM != K)) return false;
     auto overlaps = [](const void *a, size_t as, const void *b, size_t bs) {
         uintptr_t x = reinterpret_cast<uintptr_t>(a), y = reinterpret_cast<uintptr_t>(b);
         return x < y + bs && y < x + as;
@@ -829,16 +865,25 @@ static bool CanRunFastllmRowFP8(const T *input, const uint8_t *weight, const T *
     if (it == available.end()) {
         cudaFuncAttributes attr{};
         auto status = cudaFuncGetAttributes(&attr, fastllm::fp8row::Kernel<T, 8, 1, 2, Values>);
-        if (status != cudaSuccess)
+        cudaFuncAttributes tailAttr{};
+        auto tailStatus = cudaFuncGetAttributes(&tailAttr, fastllm::fp8row::TailKernel<T>);
+        if (status != cudaSuccess || tailStatus != cudaSuccess)
             cudaGetLastError();
-        it = available.emplace(device, status == cudaSuccess && attr.maxThreadsPerBlock >= 256).first;
+        it = available.emplace(device, status == cudaSuccess && attr.maxThreadsPerBlock >= 256 &&
+                                      tailStatus == cudaSuccess && tailAttr.maxThreadsPerBlock >= 256).first;
     }
     return it->second;
 }
 template <class T>
 static bool TryFastllmRowFP8(T *input, uint8_t *weight, T *output, T *bias, float *scales, int batch, int K,
                              int N, int blockM, int blockK) {
-    if (N >= 131072) {
+    if (K % 256) {
+        if (!CanRunFastllmRowFP8<T, 16>(input, weight, output, bias, scales, batch, K, N, blockM, blockK))
+            return false;
+        fastllm::fp8row::TailKernel<T><<<(N + 7) / 8, 256>>>(input, weight, scales, bias, output, K, N);
+        return true;
+    }
+    if (N >= 131072 || K % 512) {
         if (!CanRunFastllmRowFP8<T, 8>(input, weight, output, bias, scales, batch, K, N, blockM, blockK))
             return false;
         fastllm::fp8row::Kernel<T, 8, 1, 2, 8>
@@ -1758,7 +1803,7 @@ bool FastllmCudaHalfMatMulFloatFP8E4M3(const fastllm::Data &input, fastllm::Data
                                     k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
 
             if (status != CUBLAS_STATUS_SUCCESS) {
-                printf("Error: cublas error.\n");
+                fprintf(stderr, "Error: cublas %s failed: status=%d, n=%d, m=%d, k=%d.\n", __func__, int(status), n, m, k);
                 throw("cublas error");
                 exit(0);
             }
@@ -1825,26 +1870,39 @@ __global__ void FastllmGemvBF16FP8E4M3Kernel1MultiRow(__nv_bfloat16 *A, uint8_t 
     scales += (st / blockK) * ms;
 
     const uint8_t *baseB = (uint8_t*)B + st * m;
-    union_bf16_4_fp8 regA;
-    for (int i = tid * 4; i < m; i += THREAD_PER_BLOCK * 4) {
-        float curScale = scales[i / blockM];
-        uint32_t bb = ((uint32_t*)(baseB + i))[0];
-        uint16_t b0_bits = (((bb >> 0) & 0x80) << 8) | (((bb >> 0) & 0x7F) << 4);
-        uint16_t b1_bits = (((bb >> 8) & 0x80) << 8) | (((bb >> 8) & 0x7F) << 4);
-        uint16_t b2_bits = (((bb >> 16) & 0x80) << 8) | (((bb >> 16) & 0x7F) << 4);
-        uint16_t b3_bits = (((bb >> 24) & 0x80) << 8) | (((bb >> 24) & 0x7F) << 4);
-        float bf0 = __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&b0_bits));
-        float bf1 = __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&b1_bits));
-        float bf2 = __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&b2_bits));
-        float bf3 = __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&b3_bits));
+    // Preserve a safe BF16 fallback for uneven TP widths as well.
+    if (m % 4 || blockM % 4 || reinterpret_cast<uintptr_t>(baseB) % 4 ||
+        reinterpret_cast<uintptr_t>(A) % alignof(uint2)) {
+        for (int i = tid; i < m; i += THREAD_PER_BLOCK) {
+            const unsigned int code = baseB[i];
+            const uint16_t bits = ((code & 0x80u) << 8) | ((code & 0x7fu) << 4);
+            const float value = __bfloat162float(*reinterpret_cast<const __nv_bfloat16 *>(&bits));
+#pragma unroll
+            for (int x = 0; x < PART; ++x)
+                sdata[x][tid] += float(A[size_t(x) * m + i]) * value * scales[i / blockM];
+        }
+    } else {
+        union_bf16_4_fp8 regA;
+        for (int i = tid * 4; i < m; i += THREAD_PER_BLOCK * 4) {
+            float curScale = scales[i / blockM];
+            uint32_t bb = ((uint32_t*)(baseB + i))[0];
+            uint16_t b0_bits = (((bb >> 0) & 0x80) << 8) | (((bb >> 0) & 0x7F) << 4);
+            uint16_t b1_bits = (((bb >> 8) & 0x80) << 8) | (((bb >> 8) & 0x7F) << 4);
+            uint16_t b2_bits = (((bb >> 16) & 0x80) << 8) | (((bb >> 16) & 0x7F) << 4);
+            uint16_t b3_bits = (((bb >> 24) & 0x80) << 8) | (((bb >> 24) & 0x7F) << 4);
+            float bf0 = __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&b0_bits));
+            float bf1 = __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&b1_bits));
+            float bf2 = __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&b2_bits));
+            float bf3 = __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&b3_bits));
 
 #pragma unroll
-        for (int x = 0; x < PART; x++) {
-            regA.in = *reinterpret_cast<const uint2 *>(A + x * m + i);
-            sdata[x][tid] += (__bfloat162float(regA.out[0]) * bf0 +
-                              __bfloat162float(regA.out[1]) * bf1 +
-                              __bfloat162float(regA.out[2]) * bf2 +
-                              __bfloat162float(regA.out[3]) * bf3) * curScale;
+            for (int x = 0; x < PART; x++) {
+                regA.in = *reinterpret_cast<const uint2 *>(A + x * m + i);
+                sdata[x][tid] += (__bfloat162float(regA.out[0]) * bf0 +
+                                  __bfloat162float(regA.out[1]) * bf1 +
+                                  __bfloat162float(regA.out[2]) * bf2 +
+                                  __bfloat162float(regA.out[3]) * bf3) * curScale;
+            }
         }
     }
     __syncthreads();
@@ -2024,7 +2082,9 @@ static void LaunchFastllmGemmBF16FP8E4M3SmallBatch(
         // Halving the resident warps wins when there is ample output-level
         // parallelism and each warp's two virtual halves stay short.  Keep
         // the 64-thread kernel for narrow or reduction-heavy projections.
-        if (k >= 2048 && m <= k / 2) {
+        if (k >= 2048 && m <= k / 2 && m % 4 == 0 && blockM % 4 == 0 &&
+            reinterpret_cast<uintptr_t>(input) % alignof(uint2) == 0 &&
+            reinterpret_cast<uintptr_t>(weight) % 4 == 0) {
             constexpr int warpsPerBlock = 8;
             const int grid =
                 (k + warpsPerBlock - 1) / warpsPerBlock;

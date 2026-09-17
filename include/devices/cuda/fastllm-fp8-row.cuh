@@ -6,12 +6,12 @@
 namespace fastllm {
 namespace fp8row {
 // Row-scaled FP8 GEMV, with FP32 accumulation and one scale application
-// per output. K is a multiple of 512; arbitrary N is masked at the tail.
+// per output. K is a multiple of 32 * Values; arbitrary N is masked at the tail.
 // Ordinary SIMT operations, with software FP8 conversion on older SMs.
-template <class T, int Warps = 8, int Rows = 1, int Chains = 2, int Values = 16>
+template <class T, int Warps = 8, int Rows = 1, int Chains = 2, int Values = 16, bool Add = false, class BiasT = T>
 __global__ __launch_bounds__(Warps * 32,
                              2) void Kernel(const T *__restrict__ input, const uint8_t *__restrict__ weight,
-                                            const float *__restrict__ scales, const T *__restrict__ bias,
+                                            const float *__restrict__ scales, const BiasT *__restrict__ bias,
                                             T *__restrict__ output, int K, int N) {
     static_assert(__is_same(T, half) || __is_same(T, __nv_bfloat16));
     static_assert(Values == 8 || Values == 16);
@@ -86,9 +86,52 @@ __global__ __launch_bounds__(Warps * 32,
             if (lane == 0 && row + r < N) {
                 int n = row + r;
                 T projected = T(sum * scales[n] + (bias ? float(bias[n]) : 0.f));
-                output[n] = projected;
+                if constexpr (Add)
+                    output[n] = T(float(output[n]) + float(projected));
+                else
+                    output[n] = projected;
             }
         }
+    }
+}
+// Arbitrary K fallback for row-scaled weights, including uneven TP shards.
+// Byte loads avoid requiring FP8 rows to have aligned starting addresses.
+// Pairwise activations are aligned; the final odd element is explicitly masked.
+template <class T, bool Add = false, class BiasT = T>
+__global__ __launch_bounds__(256, 2) void TailKernel(
+        const T *__restrict__ input, const uint8_t *__restrict__ weight,
+        const float *__restrict__ scales, const BiasT *__restrict__ bias,
+        T *__restrict__ output, int K, int N) {
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * 8 + (threadIdx.x >> 5);
+    if (row >= N) return;
+    float a0 = 0, a1 = 0;
+#pragma unroll 2
+    for (int col = lane * 2; col < K; col += 64) {
+        const uint8_t *w = weight + size_t(row) * K + col;
+        __nv_fp8x2_e4m3 code;
+        code.__x = uint16_t(w[0]) | (uint16_t(col + 1 < K ? w[1] : 0) << 8);
+        float2 v = static_cast<float2>(code);
+        float2 x;
+        if (col + 1 < K) {
+            uint32_t bits = __ldg(reinterpret_cast<const uint32_t *>(input + col));
+            if constexpr (__is_same(T, half)) x = __half22float2(*reinterpret_cast<half2 *>(&bits));
+            else x = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 *>(&bits));
+        } else {
+            x = make_float2(float(input[col]), 0.f);
+        }
+        a0 = fmaf(v.x, x.x, a0);
+        a1 = fmaf(v.y, x.y, a1);
+    }
+    float sum = a0 + a1;
+#pragma unroll
+    for (int d = 16; d > 0; d >>= 1) sum += __shfl_down_sync(0xffffffff, sum, d);
+    if (lane == 0) {
+        T projected = T(sum * scales[row] + (bias ? float(bias[row]) : 0.f));
+        if constexpr (Add)
+            output[row] = T(float(output[row]) + float(projected));
+        else
+            output[row] = projected;
     }
 }
 } // namespace fp8row

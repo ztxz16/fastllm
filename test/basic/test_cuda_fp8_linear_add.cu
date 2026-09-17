@@ -35,14 +35,13 @@ template <class T> std::vector<T> Download(Data &d) {
     Check(cudaMemcpy(v.data(), d.cudaData, v.size() * sizeof(T), cudaMemcpyDeviceToHost));
     return v;
 }
-template <class T> void Run(DataType type, int K, bool hasBias) {
-    const int N = 5120;
+template <class T> void Run(DataType type, int K, bool hasBias, int N = 5120, int scaleBlock = 0) {
     Data w(DataType::FP8_E4M3, {N, K}), x(type, {1, 1, K}), o(type, {1, 1, N}), middle(type),
         bias(DataType::FLOAT32);
     if (hasBias)
         bias.Resize({N});
     w.blockK = 1;
-    w.blockM = K;
+    w.blockM = scaleBlock ? scaleBlock : K;
     w.scales.resize(N);
     std::vector<uint8_t> codes(size_t(N) * K);
     std::vector<float> table(256), hb(N);
@@ -103,7 +102,7 @@ template <class T> void Run(DataType type, int K, bool hasBias) {
     x.cudaData = aligned;
     w.blockM = 128;
     Require(!can(), "block scales admitted");
-    w.blockM = K;
+    w.blockM = scaleBlock ? scaleBlock : K;
     w.IsRepacked = true;
     Require(!can(), "repacked admitted");
     w.IsRepacked = false;
@@ -143,7 +142,8 @@ template <class T> void Run(DataType type, int K, bool hasBias) {
         auto actual = Download<T>(o);
         for (T f : actual)
             Require(std::isfinite(float(f)), "nonfinite");
-        for (int r : {0, 1, 7, 15, 16, 31, 127, 128, 511, 1023, 2047, 2048, 4095, 5118, 5119}) {
+        for (int r : {0, 1, 7, 15, 16, 31, 127, 128, 511, 1023, 2047, 2048, 4095, N - 2, N - 1}) {
+            if (r >= N) continue;
             double sum = 0;
             for (int c = 0; c < K; ++c)
                 sum += double(table[codes[size_t(r) * K + c]]) * float(hx[c]);
@@ -202,10 +202,10 @@ template <class T> void Run(DataType type, int K, bool hasBias) {
     Check(cudaDeviceSynchronize());
     auto disabled = Download<T>(bo);
     Require(!std::memcmp(fallback.data(), disabled.data(), 2 * N * sizeof(T)), "batch fallback differs");
-    // K=5120 is valid for generic LinearAdd, but outside this fusion's two geometries.
-    w.Resize({N, 5120});
-    w.blockM = 5120;
-    bx.Resize({1, 1, 5120});
+    // K=256 is valid for generic LinearAdd, but below this fusion's minimum reduction width.
+    w.Resize({N, 256});
+    w.blockM = 256;
+    bx.Resize({1, 1, 256});
     bo.Resize({1, 1, N});
     std::vector<T> smallResidual(N, T(.1f));
     setenv("FASTLLM_CUDA_FP8_LINEAR_ADD", "1", 1);
@@ -237,11 +237,13 @@ int main(int argc, char **argv) {
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0)
         return 77;
     try {
-        for (int k : {6144, 17408})
+        for (int k : {6144, 17408, 1536, 1920, 2048, 2304, 3072, 4352, 5802, 5803, 8704})
             for (bool bias : {false, true}) {
                 Run<half>(DataType::FLOAT16, k, bias);
                 Run<__nv_bfloat16>(DataType::BFLOAT16, k, bias);
             }
+        Run<half>(DataType::FLOAT16, 5803, false, 4099, 17408);
+        Run<__nv_bfloat16>(DataType::BFLOAT16, 5803, false, 4099, 17408);
         puts("ALL PASS");
     } catch (const std::exception &e) {
         fprintf(stderr, "FAIL: %s\n", e.what());

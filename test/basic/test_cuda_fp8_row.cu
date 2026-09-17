@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <cuda.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -8,13 +9,15 @@
 #include <cstring>
 #include <vector>
 #include <stdexcept>
+#include <string>
 extern void LaunchFastllmGemmFp16FP8E4M3(half *, uint8_t *, half *, half *, float *, int, int, int, int, int);
 extern void LaunchFastllmGemmBF16FP8E4M3(__nv_bfloat16 *, uint8_t *, __nv_bfloat16 *, __nv_bfloat16 *,
                                          float *, int, int, int, int, int);
-void Check(cudaError_t e) {
+void CheckAt(cudaError_t e, int line) {
     if (e != cudaSuccess)
-        throw std::runtime_error(cudaGetErrorString(e));
+        throw std::runtime_error(std::to_string(line) + ": " + cudaGetErrorString(e));
 }
+#define Check(e) CheckAt(e, __LINE__)
 void Req(bool b, const char *m) {
     if (!b)
         throw std::runtime_error(m);
@@ -31,10 +34,10 @@ template <class T> void Launch(T *x, uint8_t *w, T *y, T *b, float *s, int M, in
     else
         LaunchFastllmGemmBF16FP8E4M3(x, w, y, b, s, M, K, N, bm, bk);
 }
-template <class T> void Run(int K, int N, int M, bool bias, bool block, bool expected) {
+template <class T> void Run(int K, int N, int M, bool bias, bool block, bool expected, int scaleBlock = 0) {
     if (std::getenv("EXPECT_FUSED") && !std::strcmp(std::getenv("EXPECT_FUSED"), "0"))
         expected = false;
-    int bm = block ? 128 : K, bk = block ? 128 : 1, cols = (K + bm - 1) / bm;
+    int bm = block ? 128 : (scaleBlock ? scaleBlock : K), bk = block ? 128 : 1, cols = (K + bm - 1) / bm;
     std::vector<T> x(M * K), b(N);
     std::vector<uint8_t> w(size_t(N) * K);
     std::vector<float> s(size_t((N + bk - 1) / bk) * cols);
@@ -70,15 +73,13 @@ template <class T> void Run(int K, int N, int M, bool bias, bool block, bool exp
             cudaGraphNodeType nt;
             Check(cudaGraphNodeGetType(node, &nt));
             if (nt == cudaGraphNodeTypeKernel) {
-                cudaKernelNodeParams p;
-                Check(cudaGraphKernelNodeGetParams(node, &p));
-#if CUDART_VERSION >= 13000
+                // Driver handles remain valid across separate static runtimes.
+                CUDA_KERNEL_NODE_PARAMS p{};
+                Req(cuGraphKernelNodeGetParams((CUgraphNode)node, &p) == CUDA_SUCCESS,
+                    "driver graph kernel params");
                 const char *name = nullptr;
-                Check(cudaFuncGetName(&name, p.func));
+                Req(cuFuncGetName(&name, p.func) == CUDA_SUCCESS, "driver kernel name");
                 seen |= std::strstr(name, "fp8row") != nullptr;
-#else
-                seen |= p.blockDim.x == 256 && p.gridDim.x == (N + 7) / 8;
-#endif
             }
         }
         Req(seen == (bool(mode) && expected), "graph dispatch mismatch");
@@ -144,7 +145,7 @@ int main() {
     Run<T>(5120, 14336, 1, false, false, true);                                                              \
     Run<T>(5120, 248320, 1, false, false, true);                                                             \
     Run<T>(1024, 4099, 1, true, false, true);                                                                \
-    Run<T>(768, 4096, 1, false, false, false);                                                               \
+    Run<T>(768, 4096, 1, false, false, true);                                                               \
     Run<T>(1024, 4096, 2, true, false, false);                                                               \
     Run<T>(1024, 4096, 1, false, true, false)
         RUN(half);
@@ -155,6 +156,12 @@ int main() {
         Run<__nv_bfloat16>(32768, 4099, 1, true, false, true);
         Run<half>(1024, 4095, 1, false, false, false);
         Run<__nv_bfloat16>(1024, 4095, 1, false, false, false);
+        for (int K : {1536, 1920, 2048, 2304, 3072, 4352, 5802, 5803, 8704}) {
+            Run<half>(K, 5120, 1, true, false, true, 17408);
+            Run<__nv_bfloat16>(K, 5120, 1, true, false, true, 17408);
+        }
+        Run<half>(5803, 4099, 2, true, false, false, 17408);
+        Run<__nv_bfloat16>(5803, 4099, 2, true, false, false, 17408);
         puts("PASS row FP8");
     } catch (const std::exception &e) {
         fprintf(stderr, "FAIL %s\n", e.what());
