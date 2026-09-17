@@ -941,6 +941,14 @@ if (UNIT_TEST)
             set_tests_properties(cuda_dsv41_moe_cache PROPERTIES LABELS cuda RUN_SERIAL TRUE)
         endif()
 
+        add_executable(cuda_quantized_kv_graph_test test/basic/test_cuda_quantized_kv_graph.cu)
+        target_link_libraries(cuda_quantized_kv_graph_test PRIVATE fastllm)
+        set_target_properties(cuda_quantized_kv_graph_test PROPERTIES
+            CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME cuda_quantized_kv_graph COMMAND cuda_quantized_kv_graph_test)
+        set_tests_properties(cuda_quantized_kv_graph PROPERTIES
+            LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+
         add_executable(cuda_fp4_kv_test test/basic/test_cuda_fp4_kv.cu)
         target_link_libraries(cuda_fp4_kv_test PRIVATE fastllm)
         set_target_properties(cuda_fp4_kv_test PROPERTIES

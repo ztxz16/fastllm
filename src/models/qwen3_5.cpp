@@ -10879,6 +10879,9 @@ namespace fastllm {
             }
         }
 
+        // Quantized FP8/FP4 KV uses the same stable page buffers and device-side
+        // FlashInfer planner as FP16/BF16. Replay refreshes the plan from device
+        // indptr; attention reads updated last-page lengths when pages grow.
         int firstAttentionLayer = attentionLayers[0];
         int currentTokens = 0;
         for (int layer : attentionLayers) {
@@ -10891,8 +10894,6 @@ namespace fastllm {
                     pastKey->pageIndex.empty() || pastValue->pageIndex.empty() ||
                     pastKey->dataDevice != DataDevice::CUDA ||
                     pastValue->dataDevice != DataDevice::CUDA ||
-                    pastKey->dataType == DataType::FP8_E4M3 ||
-                    pastValue->dataType == DataType::FP8_E4M3 ||
                     pastKey->pageLen <= 0 || pastKey->pageLen != pastValue->pageLen ||
                     pastKey->pageIndex.size() != pastValue->pageIndex.size() ||
                     pastKey->lastPageLen != pastValue->lastPageLen) {
