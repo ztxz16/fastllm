@@ -1,4 +1,5 @@
 #include "devices/cuda/fastllm-cuda-gdn.h"
+#include "devices/cuda/fastllm-cuda-fp8-linear-add.h"
 //
 // Created by huangyuyang on 6/14/23.
 //
@@ -6382,6 +6383,10 @@ namespace fastllm {
     }
 
     bool DoCudaLinearAdd(Data &input, Data &weight, const Data &bias, Data &output) {
+        if (FastllmCudaFP8LinearAddCanRun(input, weight, bias, output)) {
+            FastllmCudaFP8LinearAdd(input, weight, bias, output);
+            return true;
+        }
         int n = input.Count(0) / input.dims.back();
         int m = input.dims.back();
         int k = output.dims.back();
