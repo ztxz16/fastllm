@@ -49,6 +49,9 @@ namespace fastllm {
     extern bool FastllmGemmBFloat16NVFP4Block32E8M0_AVX512BF16(
         const void *A, long lda, const void *B, long ldb, void *C, long ldc,
         int n, int m, int k, int st, int end);
+    extern bool FastllmGemmBFloat16NVFP4Block16_AVX2(
+        const void *A, long lda, const void *B, long ldb, void *C, long ldc,
+        int n, int m, int k, int st, int end);
     extern bool FastllmGemmFloat32NVFP4Block16_AVX512BF16(
         const void *A, long lda, const void *B, long ldb, void *C, long ldc,
         int n, int m, int k, int st, int end, bool planar);
@@ -2332,6 +2335,12 @@ namespace fastllm {
                             finish = true;
                             return;
                         }
+                    }
+                    if (cpuInstructInfo.hasAVX2 && !scaleE8M0 && !planar &&
+                        FastllmGemmBFloat16NVFP4Block16_AVX2(
+                            A, lda, B, ldb, C, ldc, n, m, k, st, end)) {
+                        finish = true;
+                        return;
                     }
                     if (scaleE8M0) {
                         GemmNVFP4Block16_CPU_Run<true, true>(A, lda, B, ldb, C, ldc, n, m, st, end);
