@@ -2036,6 +2036,7 @@ class FastLLmCompletion:
   ) -> List[Dict[str, Any]]:
       system_parts: List[str] = []
       normalized: List[Dict[str, Any]] = []
+      preserve_system_order = self._is_deepseek_v41_model()
       for message in messages:
           if not isinstance(message, dict):
               normalized.append({"role": "user", "content": str(message)})
@@ -2048,7 +2049,12 @@ class FastLLmCompletion:
               text = self._responses_system_content_to_text(
                   message.get("content", ""))
               if text:
-                  system_parts.append(text)
+                  # V4.1 supports mid-conversation system messages. Hoisting
+                  # Codex's new-turn instructions changes the cached prefix.
+                  if preserve_system_order and normalized:
+                      normalized.append({"role": "system", "content": text})
+                  else:
+                      system_parts.append(text)
               continue
 
           message = dict(message)
