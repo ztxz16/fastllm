@@ -14,6 +14,8 @@
 #include <cuda_fp8.h>
 #include "devices/cuda/fastllm-fp8-row.cuh"
 #include <cstdlib>
+#include "fastllm-native-lowbit-prefill.cuh"
+#include "devices/cuda/fastllm-cuda-native-prefill.h"
 
 #ifdef __CUDACC__
 #include <cuda_bf16.h>
@@ -1723,6 +1725,41 @@ bool FastllmCudaMatMulFloatFP8E4M3(const fastllm::Data &input, fastllm::Data &we
 bool FastllmCudaHalfMatMulFloatFP8E4M3(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
     FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(weight, bias, k);
     FastllmCudaFP8E4M3EnsureHalfBiasOnDevice(weight, bias, k);
+
+    int nativeDevice = -1;
+    if (fastllm_native_prefill::LinearPrefillEnabled(8, n, k, m))
+        cudaGetDevice(&nativeDevice);
+    auto nativeDense = [&](const fastllm::Data &d) {
+        if (d.dataDevice != fastllm::DataDevice::CUDA || !d.cudaData || d.multiDeviceData ||
+            d.dims.empty() || d.strides.size() != d.dims.size() ||
+            (!d.dataDeviceIds.empty() && (d.dataDeviceIds.size() != 1 || d.dataDeviceIds[0] != nativeDevice))) return false;
+        uint64_t stride = 1;
+        for (int i = (int)d.dims.size() - 1; i >= 0; --i) {
+            if (d.dims[i] <= 0 || d.strides[i] != stride) return false;
+            stride *= d.dims[i];
+        }
+        return true;
+    };
+    auto nativeDisjoint = [](const fastllm::Data &a, const fastllm::Data &b) {
+        uintptr_t ap = (uintptr_t)a.cudaData, bp = (uintptr_t)b.cudaData;
+        return ap >= bp + b.GetBytes() || bp >= ap + a.GetBytes();
+    };
+    if (n > 0 && m > 0 && k > 0 && nativeDevice >= 0 &&
+        weight.dims == std::vector<int>({k, m}) &&
+        input.Count(0) == (uint64_t)n * m && output.Count(0) == (uint64_t)n * k &&
+        nativeDense(input) && nativeDense(weight) && nativeDense(output) &&
+        nativeDisjoint(input, output) && nativeDisjoint(weight, output) &&
+        !weight.IsRepacked && weight.blockM >= m && weight.blockK == 1 &&
+        input.dataType == fastllm::DataType::FLOAT16 &&
+        output.dataType == fastllm::DataType::FLOAT16 &&
+        input.cudaData && weight.cudaData && output.cudaData &&
+        fastllm_native_prefill::Fp8(static_cast<const half *>(input.cudaData),
+            static_cast<const uint8_t *>(weight.cudaData),
+            static_cast<const float *>(weight.extraCudaData[0]),
+            bias.dims.empty() ? nullptr : static_cast<const half *>(weight.extraCudaHalfData[0]),
+            static_cast<half *>(output.cudaData), n, k, m)) {
+        return true;
+    }
 
     // SM75+: weight-only FP8 Marlin (vLLM-style W8A16). SM<75 skips at runtime
     // and keeps GEMV. Conversion reuses cudaData for the Marlin layout.
@@ -3895,6 +3932,7 @@ bool FastllmCudaMatMulFloatNVFP4Block16E8M0(const fastllm::Data &input, fastllm:
 
 bool FastllmCudaHalfMatMulFloatNVFP4Block16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
     FastllmCudaFP8E4M3Block128EnsureHalfBiasOnDevice(weight, bias, k);
+    if (fastllm::FastllmCudaTryNativeNvfp4Linear(input, weight, bias, output, n, m, k)) return true;
 
     if (FastllmCudaTryNVFP4Sm70TurboMind(
             input, weight, bias, output, n, m, k)) {
@@ -4174,4 +4212,28 @@ bool FastllmCudaBFloat16MatMulNVFP4Block16E8M0(const fastllm::Data &input, fastl
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
     return true;
+}
+
+namespace fastllm {
+bool FastllmCudaNativeFp8FusedCanRun(const Data &input,const Data &weight,const Data &bias,const Data &output,bool gate) {
+    if(!fastllm_native_prefill::Supported(8))return false;
+    if(weight.dataType!=DataType::FP8_E4M3 || weight.IsRepacked || weight.dims.size()!=2 || input.dims.empty() || output.dims.empty() || !bias.dims.empty() || weight.extraCudaData.empty() || !weight.extraCudaData[0])return false;
+    int n=weight.dims[0],k=weight.dims[1];if(n<=0 || k<=0 || n%16 || k%16 || weight.blockM<k || weight.blockK!=1)return false;
+    int width=gate?n/2:n;uint64_t rows=input.Count(0)/k;
+    if(rows>4096 || !fastllm_native_prefill::LinearPrefillEnabled(8, int(rows), n, k))return false;
+    if(rows<32 || rows>4096 || input.Count(0)!=rows*k || input.dims.back()!=k || output.dims.back()!=width || output.Count(0)!=rows*width)return false;
+    if(input.dataType!=DataType::FLOAT16 || output.dataType!=DataType::FLOAT16)return false;
+    int device=0;if(cudaGetDevice(&device)!=cudaSuccess)return false;
+    auto dense=[&](const Data &d,size_t align){
+        if(d.dataDevice!=DataDevice::CUDA || !d.cudaData || d.multiDeviceData || uintptr_t(d.cudaData)%align || d.strides.size()!=d.dims.size() || (!d.dataDeviceIds.empty() && (d.dataDeviceIds.size()!=1 || d.dataDeviceIds[0]!=device)))return false;
+        uint64_t stride=1;for(int i=int(d.dims.size())-1;i>=0;i--){if(d.dims[i]<=0 || d.strides[i]!=stride)return false;stride*=d.dims[i];}return true;
+    };
+    if(!dense(input,16) || !dense(weight,16) || !dense(output,4))return false;
+    auto overlap=[](const Data&a,const Data&b){auto ap=uintptr_t(a.cudaData),bp=uintptr_t(b.cudaData);return ap<bp+b.GetBytes() && bp<ap+a.GetBytes();};
+    return !overlap(input,weight) && !overlap(input,output) && !overlap(weight,output);
+}
+bool FastllmCudaNativeFp8Fused(Data &input,Data &weight,Data &output,bool gate) {
+    int n=weight.dims[0],k=weight.dims[1];
+    return fastllm_native_prefill::Fp8(static_cast<const half*>(input.cudaData),static_cast<const uint8_t*>(weight.cudaData),static_cast<const float*>(weight.extraCudaData[0]),nullptr,static_cast<half*>(output.cudaData),input.Count(0)/k,n,k,gate?1:2);
+}
 }

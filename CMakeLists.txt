@@ -369,6 +369,8 @@ if (USE_CUDA)
         src/devices/cuda/linear/fastllm-linear-fp16.cu
         src/devices/cuda/linear/fastllm-linear-bf16.cu
         src/devices/cuda/linear/fastllm-rmsnorm-small-linear.cu
+        src/devices/cuda/linear/fastllm-native-lowbit-prefill.cu
+        src/devices/cuda/linear/fastllm-native-nvfp4-layout.cu
         src/devices/cuda/linear/fastllm-gdn-input.cu
         src/devices/cuda/linear/fastllm-fp8-linear-add.cu
         src/devices/cuda/linear/fastllm-nvfp4-fused.cu
@@ -422,7 +424,11 @@ if (USE_CUDA)
         set(FASTLLM_CUDA_SM120_SOURCES
             ${FASTLLM_DSV4_SPARSE_MLA_SM120_SOURCE}
             ${FASTLLM_DSV4_MOE_DEEPGEMM_SM120_SOURCE}
-            ${FASTLLM_DSV4_WOA_DEEPGEMM_SM120_SOURCE})
+            ${FASTLLM_DSV4_WOA_DEEPGEMM_SM120_SOURCE}
+            src/devices/cuda/linear/fastllm-native-nvfp4-tma-sm120.cu)
+        set_source_files_properties(
+            src/devices/cuda/linear/fastllm-native-lowbit-prefill.cu
+            PROPERTIES COMPILE_DEFINITIONS FASTLLM_NATIVE_PREFILL_SM120)
         add_compile_definitions(FASTLLM_ENABLE_DSV4_SPARSE_MLA_SM120)
         add_compile_definitions(FASTLLM_ENABLE_DSV4_MOE_DEEPGEMM_SM120)
         add_compile_definitions(FASTLLM_ENABLE_DSV4_WOA_DEEPGEMM_SM120)

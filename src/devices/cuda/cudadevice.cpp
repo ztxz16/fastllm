@@ -2,6 +2,7 @@
 #include "devices/cuda/fastllm-cuda-rmsnorm-small-linear.h"
 #include "devices/cuda/fastllm-cuda-fp8-linear-add.h"
 #include "devices/cuda/fastllm-cuda-nvfp4-fused.h"
+#include "devices/cuda/fastllm-cuda-native-prefill.h"
 //
 // Created by huangyuyang on 6/14/23.
 //
@@ -6245,6 +6246,7 @@ namespace fastllm {
     }
 
     void DoCudaLinear(Data &input, Data &weight, const Data &bias, Data &output) {
+        if (weight.cudaNativeNvfp4Layout && input.dataType != DataType::FLOAT16) FastllmCudaRestoreNativeNvfp4(weight);
         output.Allocate(false);
         int n = input.Count(0) / input.dims.back();
         int m = input.dims.back();
@@ -6464,6 +6466,8 @@ namespace fastllm {
         Data &middle = *(datas.find("middle")->second);
         Data &bias = *(datas.find("bias")->second);
 
+        if (FastllmCudaNativeFp8FusedCanRun(input, weight, bias, output, false) &&
+            FastllmCudaNativeFp8Fused(input, weight, output, false)) return;
         if (weight.dataType == DataType::NVFP4_BLOCK_16) {
             CudaNvfp4LinearAddBlock(input, weight, bias, middle, output);
             return;
@@ -6645,6 +6649,8 @@ namespace fastllm {
         Data &middle = *(datas.find("middle")->second);
         Data &bias = *(datas.find("bias")->second);
 
+        if (FastllmCudaNativeFp8FusedCanRun(input, weight, bias, output, true) &&
+            FastllmCudaNativeFp8Fused(input, weight, output, true)) return;
         if (weight.dataType == DataType::NVFP4_BLOCK_16) {
             CudaNvfp4LinearSwigluBlock(input, weight, bias, middle, output);
             return;
