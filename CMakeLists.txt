@@ -371,6 +371,7 @@ if (USE_CUDA)
         src/devices/cuda/linear/fastllm-rmsnorm-small-linear.cu
         src/devices/cuda/linear/fastllm-native-lowbit-prefill.cu
         src/devices/cuda/linear/fastllm-native-nvfp4-layout.cu
+        src/devices/cuda/linear/fastllm-gdn-prepare-wy.cu
         src/devices/cuda/linear/fastllm-gdn-input.cu
         src/devices/cuda/linear/fastllm-fp8-linear-add.cu
         src/devices/cuda/linear/fastllm-nvfp4-fused.cu

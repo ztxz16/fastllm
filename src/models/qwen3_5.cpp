@@ -39,6 +39,7 @@
 #ifdef USE_CUDA
 #include "models/qwen3_cuda_common.h"
 #include "devices/cuda/fastllm-cuda-gdn.h"
+#include "devices/cuda/fastllm-cuda-gdn-prepare.h"
 #include "devices/cuda/fastllm-cuda-rmsnorm-small-linear.h"
 #include "devices/cuda/cudaworkspace.h"
 #include "devices/cuda/fastllm-cuda-vision.h"
@@ -14554,71 +14555,79 @@ namespace fastllm {
 
                     bool tryFusedCumSumDecayNegMask =
                         Qwen35CudaUseCumSumDecayNegMulCausalMask();
-                    if (!tryFusedCumSumDecayNegMask) {
-                        if (!Qwen35CudaTryCumSumMakeDecayMask(
-                                cudaRunner, *pgg, decayMask)) {
-                            Qwen35CudaCumSumLastDim(cudaRunner, *pgg);
-                            Qwen35CudaMakeDecayMask(
-                                cudaRunner, *pgg, decayMask);
-                        }
-                    }
-                    if (logicalRagged) {
-                        AssertInFastLLM(
-                            FastllmCudaMappedGdnKkt(
-                                kBeta, *pkk,
-                                localValueHeads / localKeyHeads, at),
-                            "Qwen3.5 mapped ragged GDN KKT is unavailable.\n");
-                    } else {
-                        Qwen35CudaMatMulTransB(
-                            cudaRunner, kBeta, *pkk, at);
-                    }
-                    if (!tryFusedCumSumDecayNegMask ||
-                        !Qwen35CudaTryCumSumDecayNegMulCausalMask(
-                            cudaRunner, *pgg, at,
-                            decayMask, attn)) {
-                        if (tryFusedCumSumDecayNegMask &&
-                            !Qwen35CudaTryCumSumMakeDecayMask(
-                                cudaRunner, *pgg, decayMask)) {
-                            Qwen35CudaCumSumLastDim(cudaRunner, *pgg);
-                            Qwen35CudaMakeDecayMask(
-                                cudaRunner, *pgg, decayMask);
-                        }
-                        if (!Qwen35CudaTryNegMulCausalMask(
-                                cudaRunner, at, decayMask,
-                                0, 0.0f, attn)) {
-                            Qwen35CudaMul(cudaRunner, at, -1.0f, attn);
-                            if (!Qwen35CudaTryMulToCausalMask(
-                                    attn, decayMask, 0, 0.0f)) {
-                                Qwen35CudaMulTo(
-                                    cudaRunner, attn, decayMask);
-                                Qwen35CudaCausalMask(
-                                    cudaRunner, attn, 0, 0.0f);
+                    bool nativePrepare = !logicalRagged && tryFusedCumSumDecayNegMask &&
+                        FastllmCudaTryGdnPrepareFromKey(
+                            *pkk, vBeta, kBeta, *pgg, decayMask, vvPad, kCumdecay);
+                    if (!nativePrepare) {
+                        if (!tryFusedCumSumDecayNegMask) {
+                            if (!Qwen35CudaTryCumSumMakeDecayMask(
+                                    cudaRunner, *pgg, decayMask)) {
+                                Qwen35CudaCumSumLastDim(cudaRunner, *pgg);
+                                Qwen35CudaMakeDecayMask(
+                                    cudaRunner, *pgg, decayMask);
                             }
                         }
-                    }
-                    Qwen35CudaTransferAttn(cudaRunner, attn);
-                    bool recomputeInternalExp =
-                        GetFastllmEnv().cudaTriton &&
-                        Qwen3CudaEnvDefaultEnabled(
-                            "FASTLLM_CUDA_TRITON_CHUNK_GDN_"
-                            "RECOMPUTE_INTERNAL_EXP");
-                    if (!recomputeInternalExp) {
-                        Qwen35CudaExp(cudaRunner, *pgg, gExp);
-                    }
-                    // Compact scratch aliases vBeta and kCumdecay; only
-                    // the sequential native recompute supports that alias.
-                    if (compactGdnScratch ||
-                        !FastllmCudaTryTritonChunkGdnRecompute(
-                            attn, vBeta, kBeta, gExp, *pgg,
-                            vvPad, kCumdecay)) {
-                        if (recomputeInternalExp) {
-                            Qwen35CudaExp(cudaRunner, *pgg, gExp);
+                        if (logicalRagged) {
+                            AssertInFastLLM(
+                                FastllmCudaMappedGdnKkt(
+                                    kBeta, *pkk,
+                                    localValueHeads / localKeyHeads, at),
+                                "Qwen3.5 mapped ragged GDN KKT is unavailable.\n");
+                        } else {
+                            Qwen35CudaMatMulTransB(
+                                cudaRunner, kBeta, *pkk, at);
                         }
-                        Qwen35CudaMatMul(
-                            cudaRunner, attn, vBeta, vvPad);
-                        Qwen35CudaMulTo(cudaRunner, kBeta, gExp);
-                        Qwen35CudaMatMul(
-                            cudaRunner, attn, kBeta, kCumdecay);
+                        if (!tryFusedCumSumDecayNegMask ||
+                            !Qwen35CudaTryCumSumDecayNegMulCausalMask(
+                                cudaRunner, *pgg, at,
+                                decayMask, attn)) {
+                            if (tryFusedCumSumDecayNegMask &&
+                                !Qwen35CudaTryCumSumMakeDecayMask(
+                                    cudaRunner, *pgg, decayMask)) {
+                                Qwen35CudaCumSumLastDim(cudaRunner, *pgg);
+                                Qwen35CudaMakeDecayMask(
+                                    cudaRunner, *pgg, decayMask);
+                            }
+                            if (!Qwen35CudaTryNegMulCausalMask(
+                                    cudaRunner, at, decayMask,
+                                    0, 0.0f, attn)) {
+                                Qwen35CudaMul(cudaRunner, at, -1.0f, attn);
+                                if (!Qwen35CudaTryMulToCausalMask(
+                                        attn, decayMask, 0, 0.0f)) {
+                                    Qwen35CudaMulTo(
+                                        cudaRunner, attn, decayMask);
+                                    Qwen35CudaCausalMask(
+                                        cudaRunner, attn, 0, 0.0f);
+                                }
+                            }
+                        }
+                        if (!FastllmCudaTryGdnPrepareWy(
+                                attn, vBeta, kBeta, *pgg, vvPad, kCumdecay)) {
+                            Qwen35CudaTransferAttn(cudaRunner, attn);
+                            bool recomputeInternalExp =
+                                GetFastllmEnv().cudaTriton &&
+                                Qwen3CudaEnvDefaultEnabled(
+                                    "FASTLLM_CUDA_TRITON_CHUNK_GDN_"
+                                    "RECOMPUTE_INTERNAL_EXP");
+                            if (!recomputeInternalExp) {
+                                Qwen35CudaExp(cudaRunner, *pgg, gExp);
+                            }
+                            // Compact scratch aliases vBeta and kCumdecay; only
+                            // the sequential native recompute supports that alias.
+                            if (compactGdnScratch ||
+                                !FastllmCudaTryTritonChunkGdnRecompute(
+                                    attn, vBeta, kBeta, gExp, *pgg,
+                                    vvPad, kCumdecay)) {
+                                if (recomputeInternalExp) {
+                                    Qwen35CudaExp(cudaRunner, *pgg, gExp);
+                                }
+                                Qwen35CudaMatMul(
+                                    cudaRunner, attn, vBeta, vvPad);
+                                Qwen35CudaMulTo(cudaRunner, kBeta, gExp);
+                                Qwen35CudaMatMul(
+                                    cudaRunner, attn, kBeta, kCumdecay);
+                            }
+                        }
                     }
                     const char *directOutputQkKey =
                         "FASTLLM_CUDA_TRITON_CHUNK_GDN_"
