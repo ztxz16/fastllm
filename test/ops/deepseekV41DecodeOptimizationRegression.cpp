@@ -369,6 +369,38 @@ static void AttentionCapacityFallbackCheck() {
     std::cout << "PASS attention optional workspace capacity fallback during graph capture\n";
 }
 
+static void SharedSwigluQuantizationChecks() {
+    int checks = 0;
+    for (int dev = 0; dev < deviceCount; ++dev) {
+        SelectDevice(dev);
+        for (auto type : {DataType::BFLOAT16, DataType::FLOAT16, DataType::FLOAT32})
+            for (int rows : {1, 5, 32}) for (int mid : {32, 96, 2304})
+                for (float limit : {0.f, .5f, 10.f}) {
+                    auto input = Random(type, {rows, 2 * mid}, rows + mid, 20.f);
+                    Data swiglu, expected(DataType::BFLOAT16, {rows, mid}), actual;
+                    Check(FastllmCudaDeepSeekV41SharedSwiglu(input, limit, swiglu), "shared SwiGLU reference");
+                    expected.ToDevice(DataDevice::CUDA, {dev}); expected.Allocate();
+                    Check(FastllmCudaDeepSeekV41QuantizeActivation(swiglu, expected), "shared quantization reference");
+                    const auto bytes = Bytes(expected);
+                    auto run = [&]() {
+                        Check(FastllmCudaDeepSeekV41SharedSwigluQuantized(input, limit, actual), "fused shared quantization");
+                    };
+                    run();
+                    Check(bytes == Bytes(actual), "shared SwiGLU/quantization rounding changed");
+                    if (type == DataType::BFLOAT16 && rows == 1 && mid == 2304 && limit == 10.f) {
+                        ReplayGraph(run);
+                        Check(bytes == Bytes(actual), "shared quantization graph mismatch");
+                    }
+                    ++checks;
+                }
+        auto unaligned = Random(DataType::BFLOAT16, {1, 62}, 197);
+        Data output;
+        Check(!FastllmCudaDeepSeekV41SharedSwigluQuantized(unaligned, 10.f, output),
+              "partial quantization groups must be rejected");
+    }
+    std::cout << "PASS shared SwiGLU + quantization: " << checks << " bitwise comparisons and graph replay\n";
+}
+
 int main(int argc, char **argv) {
     if (cudaGetDeviceCount(&deviceCount) != cudaSuccess || deviceCount < 1) return 77;
     try {
@@ -378,13 +410,14 @@ int main(int argc, char **argv) {
         Check(argc <= 2, "usage: deepseekV41DecodeOptimizationRegression [section]");
         Check(section == "all" || section == "attention" ||
               section == "indexer" || section == "fallback" || section == "rmsnorm" ||
-              section == "capacity", "unknown section");
+              section == "capacity" || section == "shared", "unknown section");
         if (section == "all" || section == "attention") AttentionChecks();
         if (section == "all" || section == "attention") AttentionGraphLifetimeChecks();
         if (section == "all" || section == "indexer") IndexerChecks();
         if (section == "all" || section == "fallback") FallbackChecks();
         if (section == "all" || section == "rmsnorm") RmsNormChecks();
         if (section == "all" || section == "capacity") AttentionCapacityFallbackCheck();
+        if (section == "all" || section == "shared") SharedSwigluQuantizationChecks();
         return 0;
     } catch (const std::exception &e) { std::cerr << "FAIL " << e.what() << '\n'; return 1; }
 }

@@ -1557,12 +1557,15 @@ namespace fastllm {
     }
 
     void DeepSeekV41Model::LinearWithActivationQuant(Data &input, const std::string &weightName,
-                                                    Data &output, bool replicated, Data *scratch) {
+                                                    Data &output, bool replicated, Data *scratch,
+                                                    bool inputQuantized) {
         Data local;
         Data *source = &input;
         if (quantizedLinearNames.count(weightName)) {
-            source = scratch != nullptr ? scratch : &local;
-            V41Executor().Run("DeepSeekV41QuantizeActivation", {{"input", &input}, {"output", source}}, {}, {});
+            if (!inputQuantized) {
+                source = scratch != nullptr ? scratch : &local;
+                V41Executor().Run("DeepSeekV41QuantizeActivation", {{"input", &input}, {"output", source}}, {}, {});
+            }
 #ifdef USE_CUDA
             // Keep checkpoint block boundaries when checking numerical alignment.
             // A full-K GEMM can cross a BF16 rounding boundary even though both
@@ -2846,6 +2849,7 @@ namespace fastllm {
         struct MoeCacheWorkspace { Data index, score, output; };
         std::map<int, MoeCacheWorkspace> moeCache;
         Data quantizedActivation;
+        Data attnInputQuantized, qNormQuantized;
         // TP and CUDA graphs retain one buffer per weight.
         std::map<std::string, Data> quantizedActivations;
     };
@@ -3616,13 +3620,14 @@ namespace fastllm {
         Data &cpuMoeInput = ws->cpuMoeInput, &cpuMoeIndex = ws->cpuMoeIndex, &cpuMoeScore = ws->cpuMoeScore;
         std::vector<Data> segQ(numSegments), segKV(numSegments), segAttnOut(numSegments);
         Data catTmp[2];
-        auto quantizedLinear = [&](Data &input, const std::string &name, Data &output, bool replicated = false) {
+        auto quantizedLinear = [&](Data &input, const std::string &name, Data &output, bool replicated = false,
+                                   Data *scratch = nullptr, bool inputQuantized = false) {
             // Graphs and asynchronous TP decode need stable per-weight buffers.
             // Synchronous TP prefill can release each full-chunk temporary as
             // soon as its linear completes, instead of retaining all layers.
             LinearWithActivationQuant(input, name, output, replicated,
-                ws == &localWorkspace && (!tp || seqlen > 1) ?
-                    (tp ? nullptr : &ws->quantizedActivation) : &ws->quantizedActivations[name]);
+                scratch != nullptr ? scratch : (ws == &localWorkspace && (!tp || seqlen > 1) ?
+                    (tp ? nullptr : &ws->quantizedActivation) : &ws->quantizedActivations[name]), inputQuantized);
         };
         auto releasePrefill = [&](std::initializer_list<Data *> tensors) {
             if (ws != &localWorkspace || tp || dumpDebug || seqlen <= window_size) return;
@@ -3874,6 +3879,14 @@ namespace fastllm {
             // 【CUDA Graph 的 pre 段】这里到 RoPE 之前全部与 token 位置无关，整段可捕获。
             bool needIndexer = ratio > 0 && isIndexSource[layer];
             auto runAttentionPre = [&]() {
+            const bool reuseQuantized = !tp && seqlen <= 8 &&
+                !V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH");
+            Data *attnQuant = reuseQuantized &&
+                quantizedLinearNames.count(pre + ".attn.wq_a.weight") &&
+                quantizedLinearNames.count(pre + ".attn.wkv.weight") ? &ws->attnInputQuantized : nullptr;
+            Data *qQuant = reuseQuantized && needIndexer &&
+                quantizedLinearNames.count(pre + ".attn.wq_b.weight") &&
+                quantizedLinearNames.count(pre + ".attn.indexer.wq_b.weight") ? &ws->qNormQuantized : nullptr;
             V41HcMix(*curHidden, weight[pre + ".hc_attn_fn"], weight[pre + ".hc_attn_scale"],
                      weight[pre + ".hc_attn_base"], hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
                      attnPre, attnPost, attnComb);
@@ -3882,14 +3895,14 @@ namespace fastllm {
 
             // wq_a / wkv 是复制的（KV 是 MLA 式的单份 latent，与 head 无关）；
             // wq_b 按行切 -> q 的 head 维分片，Reshape 会把 tpAxis 从最后一维换算到 head 维。
-            quantizedLinear(attnInput, pre + ".attn.wq_a.weight", qr, tp);
+            quantizedLinear(attnInput, pre + ".attn.wq_a.weight", qr, tp, attnQuant);
             V41RMSNormBF16(qr, weight[pre + ".attn.q_norm.weight"], rms_norm_eps, qNorm);
             if (tpAttention) {
                 weight[pre + ".attn.wq_b.weight"].tpLinearType = TP_LINEAR_ROW;
             }
             // 不切分注意力时 wq_b 也必须显式走复制布局：否则 MultiCudaLinearOp 会按
             // "大权重通用切分 + gather"处理，而那条路径读的是复制张量已失效的 root。
-            quantizedLinear(qNorm, pre + ".attn.wq_b.weight", q, tp && !tpAttention);
+            quantizedLinear(qNorm, pre + ".attn.wq_b.weight", q, tp && !tpAttention, qQuant);
             if (dumpDebug) {
                 const std::string tag = "fl_layer" + std::to_string(layer);
                 V41DumpTensor(qr, tag + "_qr" + dumpSuffix);
@@ -3901,7 +3914,8 @@ namespace fastllm {
             }
             q.Reshape({1, seqlen, num_attention_heads, headDim});
 
-            quantizedLinear(attnInput, pre + ".attn.wkv.weight", kv, tp);
+            quantizedLinear(attnQuant ? *attnQuant : attnInput, pre + ".attn.wkv.weight", kv,
+                            tp, nullptr, attnQuant != nullptr);
             V41RMSNormBF16(kv, weight[pre + ".attn.kv_norm.weight"], rms_norm_eps, kv);
             kv.Reshape({1, seqlen, headDim});
 
@@ -3923,7 +3937,8 @@ namespace fastllm {
                 // indexer 在每张卡上各算一份：它选出的候选块要供后续所有层复用，
                 // 切 index head 就得对 [token, m] 的分数矩阵做 all-reduce，
                 // 通信量远大于重复计算，而且两卡 top-k 必须逐位一致。
-                quantizedLinear(qNorm, ipre + ".wq_b.weight", qIdxAll, tp);
+                quantizedLinear(qQuant ? *qQuant : qNorm, ipre + ".wq_b.weight", qIdxAll,
+                                tp, nullptr, qQuant != nullptr);
                 qIdxAll.Reshape({1, seqlen, index_n_heads, index_head_dim});
                 Data &idxWeights = ws->idxWeights;
                 quantizedLinear(attnInput, ipre + ".weights_proj.weight", idxWeights, tp);
@@ -4390,7 +4405,8 @@ namespace fastllm {
             overlapShared = hasSharedExpertOut &&
                 !V41EnvFlag("FASTLLM_DSV41_DISABLE_SHARED_OVERLAP") &&
                 (V41DeviceSpecUsesType(overlapMoeDevice, "cpu") ||
-                 (tp && V41DeviceSpecUsesType(overlapMoeDevice, "numa")));
+                 (V41DeviceSpecUsesType(overlapMoeDevice, "numa") &&
+                  (tp || (single && seqlen == 1 && !FastllmCudaMoeCacheRequested()))));
 #endif
             auto runSharedExpert = [&]() {
             if (hasSharedExpertOut) {
@@ -4400,17 +4416,22 @@ namespace fastllm {
                     sharedDownIt->second.tpLinearType = TP_LINEAR_COLUMN;
                 }
                 Data &ww1 = ws->sharedSwiglu, &ww3 = ws->sharedGateup;
+                bool sharedQuantized = false;
                 quantizedLinear(ffnInput, pre + ".ffn.shared_experts.gateup.weight", ww3,
                                 tp && !tpSharedExpert);
 #ifdef USE_CUDA
-                AssertInFastLLM(tp ? MultiCudaDeepSeekV41SharedSwiglu(ww3, swiglu_limit, ww1) :
-                                    FastllmCudaDeepSeekV41SharedSwiglu(ww3, swiglu_limit, ww1),
+                sharedQuantized = !tp && !V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH") &&
+                    quantizedLinearNames.count(pre + ".ffn.shared_experts.w2.weight") &&
+                    !ww3.dims.empty() && ww3.dims.back() % 64 == 0;
+                AssertInFastLLM(sharedQuantized ? FastllmCudaDeepSeekV41SharedSwigluQuantized(ww3, swiglu_limit, ww1) :
+                    (tp ? MultiCudaDeepSeekV41SharedSwiglu(ww3, swiglu_limit, ww1) :
+                          FastllmCudaDeepSeekV41SharedSwiglu(ww3, swiglu_limit, ww1)),
                                 "DeepSeekV41: CUDA shared expert activation rejected input.");
 #else
                 Swiglu(ww3, ww1);
 #endif
                 quantizedLinear(ww1, pre + ".ffn.shared_experts.w2.weight", sharedExpertOut,
-                                tp && !tpSharedExpert);
+                                tp && !tpSharedExpert, nullptr, sharedQuantized);
                 ToDataType(sharedExpertOut, DataType::BFLOAT16);
             }
             };   // runSharedExpert

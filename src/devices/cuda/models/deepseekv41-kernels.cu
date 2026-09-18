@@ -363,7 +363,7 @@ namespace {
         return total;
     }
 
-    template <typename T>
+    template <typename T, bool QUANTIZE = false>
     __global__ void V41SharedSwigluKernel(const T *input, __nv_bfloat16 *output,
                                          uint64_t count, int mid, float limit) {
         const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -375,9 +375,16 @@ namespace {
             gate = fminf(gate, limit);
             up = fmaxf(-limit, fminf(up, limit));
         }
-        // The shared expert has the same clamp and BF16 activation boundary
-        // as routed experts. FP8 activation quantization follows this kernel.
-        output[i] = __float2bfloat16_rn((gate / (1.0f + expf(-gate))) * up);
+        // Keep the BF16 boundary before finding each group-32 FP8 scale.
+        __nv_bfloat16 result = __float2bfloat16_rn((gate / (1.0f + expf(-gate))) * up);
+        if constexpr (QUANTIZE) {
+            const float value = __bfloat162float(result);
+            float maximum = fabsf(value);
+            for (int offset = 16; offset; offset >>= 1)
+                maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, offset));
+            result = __float2bfloat16_rn(V41QuantValueDev(value, V41QuantScaleDev(maximum, 1), 1));
+        }
+        output[i] = result;
     }
 
     // ---------------- HcMix ----------------
@@ -1908,6 +1915,18 @@ namespace {
     };
 
 
+    // Materialized QK needs only the current output slice of V, not Q or
+    // the other value slices. Keep the original online-softmax order.
+    template <int VALUE_SPLITS>
+    struct V41MmaPvShared {
+        __nv_bfloat16 kvs[kMmaNC][kMmaDim / VALUE_SPLITS + 8];
+        __nv_bfloat16 ps[kMmaHeads][kMmaPStride];
+        float sc[kMmaHeads][kMmaNC];
+        float mx[kMmaHeads], lsum[kMmaHeads], alpha[kMmaHeads];
+        int valid[kMmaNC];
+    };
+
+
     // Independent candidate tiles materialize QK once. The consumer keeps
     // the original 64-slot online softmax and BF16 probability sequence.
     __global__ void __launch_bounds__(kMmaThreads)
@@ -2043,7 +2062,8 @@ namespace {
                                 const float *scores = nullptr) {
 #if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800)
         extern __shared__ char v41MmaSharedRaw[];
-        V41MmaShared &sh = *reinterpret_cast<V41MmaShared*>(v41MmaSharedRaw);
+        using Shared = typename std::conditional<MATERIALIZED, V41MmaPvShared<VALUE_SPLITS>, V41MmaShared>::type;
+        Shared &sh = *reinterpret_cast<Shared*>(v41MmaSharedRaw);
 
         const int t = blockIdx.x;                       // b * seqlen + i
         const int b = t / seqlen, i = t % seqlen;
@@ -2077,6 +2097,8 @@ namespace {
         constexpr int kMmaDimSlice = kMmaDim / (kMmaWarps * VALUE_SPLITS);
         constexpr int kMmaPvTiles = kMmaDimSlice / 8;
         const int valueBase = blockIdx.z * (kMmaDim / VALUE_SPLITS);
+        constexpr int loadDim = MATERIALIZED ? kMmaDim / VALUE_SPLITS : kMmaDim;
+        const int loadBase = MATERIALIZED ? valueBase : 0;
         const int pvM = 0, pvSlice = warp;
         const int qkM = 0, qkN = warp;
         float acc[kMmaPvTiles][4];
@@ -2130,23 +2152,23 @@ namespace {
                     }
                 }
                 if (!ok) {
-                    for (int v = lane; v < kMmaDim / 8; v += 32) {
+                    for (int v = lane; v < loadDim / 8; v += 32) {
                         *((float4*)&sh.kvs[slot][v * 8]) = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
                     }
                 } else if (src8 != nullptr) {
                     // 就地解到 BF16 片段再进 mma；FP4 的值在 BF16 上是精确的
                     if (vecUnpack) {
-                        // 一个 lane 负责 16 个值（head_dim 512 / 32 lane），整行一趟：
-                        // 一次数据读 + 一次 scale 读 -> 两个 float4 写进 mma 片段
-                        V41LoadKvRow16Bf16(src8, kMmaDim, lane * 16, src8Mode, &sh.kvs[slot][lane * 16]);
+                        // Decode only the current output slice in 16-value groups.
+                        for (int v = lane; v < loadDim / 16; v += 32)
+                            V41LoadKvRow16Bf16(src8, kMmaDim, loadBase + v * 16, src8Mode, &sh.kvs[slot][v * 16]);
                     } else {
-                        for (int d = lane; d < kMmaDim; d += 32) {
-                            sh.kvs[slot][d] = __float2bfloat16_rn(V41LoadKvRow(src8, kMmaDim, d, src8Mode));
+                        for (int d = lane; d < loadDim; d += 32) {
+                            sh.kvs[slot][d] = __float2bfloat16_rn(V41LoadKvRow(src8, kMmaDim, loadBase + d, src8Mode));
                         }
                     }
                 } else {
-                    for (int v = lane; v < kMmaDim / 8; v += 32) {
-                        *((float4*)&sh.kvs[slot][v * 8]) = *((const float4*)src + v);
+                    for (int v = lane; v < loadDim / 8; v += 32) {
+                        *((float4*)&sh.kvs[slot][v * 8]) = *((const float4*)(src + loadBase) + v);
                     }
                 }
                 if (lane == 0) {
@@ -2244,7 +2266,7 @@ namespace {
 #pragma unroll
                     for (int n = 0; n < kMmaPvTiles; n++) {
                         uint32_t bb[2];
-                        V41LdmX2T(bb, &sh.kvs[k + pvBRow][valueBase + pvSlice * kMmaDimSlice + n * 8]);
+                        V41LdmX2T(bb, &sh.kvs[k + pvBRow][(MATERIALIZED ? 0 : valueBase) + pvSlice * kMmaDimSlice + n * 8]);
                         V41MmaBf16(acc[n], a, bb);
                     }
                 }
@@ -2491,12 +2513,13 @@ namespace {
 
 // ==================== 导出接口 ====================
 
-bool FastllmCudaDeepSeekV41SharedSwiglu(const fastllm::Data &input, float limit,
-                                      fastllm::Data &output) {
+template <bool QUANTIZE>
+static bool V41RunSharedSwiglu(const fastllm::Data &input, float limit, fastllm::Data &output) {
     if (!V41OnCuda(input) || input.multiDeviceData || input.dims.empty() ||
         input.dims.back() <= 0 || input.dims.back() % 2 || !V41IsFloatType(input.dataType)) return false;
     auto dims = input.dims;
     const int mid = dims.back() / 2;
+    if (QUANTIZE && mid % 32 != 0) return false;
     dims.back() = mid;
     if (!V41PrepareOutput(output, DataType::BFLOAT16, dims)) return false;
     const uint64_t count = input.Count(0) / 2;
@@ -2504,12 +2527,20 @@ bool FastllmCudaDeepSeekV41SharedSwiglu(const fastllm::Data &input, float limit,
     const int blocks = (count + 255) / 256;
     auto out = (__nv_bfloat16 *)output.cudaData;
     if (input.dataType == DataType::BFLOAT16)
-        V41SharedSwigluKernel<<<blocks, 256>>>((const __nv_bfloat16 *)input.cudaData, out, count, mid, limit);
+        V41SharedSwigluKernel<__nv_bfloat16, QUANTIZE><<<blocks, 256>>>((const __nv_bfloat16 *)input.cudaData, out, count, mid, limit);
     else if (input.dataType == DataType::FLOAT16)
-        V41SharedSwigluKernel<<<blocks, 256>>>((const half *)input.cudaData, out, count, mid, limit);
+        V41SharedSwigluKernel<half, QUANTIZE><<<blocks, 256>>>((const half *)input.cudaData, out, count, mid, limit);
     else
-        V41SharedSwigluKernel<<<blocks, 256>>>((const float *)input.cudaData, out, count, mid, limit);
+        V41SharedSwigluKernel<float, QUANTIZE><<<blocks, 256>>>((const float *)input.cudaData, out, count, mid, limit);
     return V41CheckLaunch("SharedSwiglu");
+}
+
+bool FastllmCudaDeepSeekV41SharedSwiglu(const fastllm::Data &input, float limit, fastllm::Data &output) {
+    return V41RunSharedSwiglu<false>(input, limit, output);
+}
+
+bool FastllmCudaDeepSeekV41SharedSwigluQuantized(const fastllm::Data &input, float limit, fastllm::Data &output) {
+    return V41RunSharedSwiglu<true>(input, limit, output);
 }
 
 extern "C" bool FastllmCudaDeepSeekV41HcMix(const fastllm::Data &x, fastllm::Data &hcFn, fastllm::Data &hcScale,
@@ -3019,11 +3050,12 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
         bool launched = false;
         auto launch = [&](auto splitTag) {
             constexpr int splits = decltype(splitTag)::value;
+            using PvShared = V41MmaPvShared<splits>;
             const int candidateTiles = ((startPos == 0 ? std::min(seqlen, windowSize) : windowSize) + topWidth + 63) / 64;
             const uint64_t scratchBytes = (uint64_t)tokens * heads * candidateTiles * 64 * sizeof(float);
             if (tokens == 1 && candidateTiles >= 4 && scratchBytes <= 4 * 1024 * 1024 &&
                 V41MmaKernelReady<V41SparseAttentionScoresKernel, kMmaThreads, sizeof(V41MmaShared)>() &&
-                V41MmaKernelReady<V41SparseAttentionMmaKernel<splits, true>, kMmaThreads, sizeof(V41MmaShared)>()) {
+                V41MmaKernelReady<V41SparseAttentionMmaKernel<splits, true>, kMmaThreads, sizeof(PvShared)>()) {
                 void *allocation = nullptr;
                 const auto allocated = FastllmCudaTryMalloc(&allocation, scratchBytes);
                 if (allocated == FASTLLM_CUDA_TRY_MALLOC_ERROR) return false;
@@ -3048,7 +3080,7 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
                         seqlen, heads, windowSize, cap, topWidth, startPos, scores,
                         ringMode, ringRowBytes, cmpMode, cmpRowBytes, vecUnpack ? 1 : 0);
                     if (!V41CheckLaunch("SparseAttentionScores")) return false;
-                    V41SparseAttentionMmaKernel<splits, true><<<dim3(tokens, headBlocks, splits), kMmaThreads, sizeof(V41MmaShared)>>>(
+                    V41SparseAttentionMmaKernel<splits, true><<<dim3(tokens, headBlocks, splits), kMmaThreads, sizeof(PvShared)>>>(
                         (const __nv_bfloat16*)q.cudaData, (const __nv_bfloat16*)chunkKV.cudaData,
                         hasRing && !ringFp8 ? (const __nv_bfloat16*)ringKV->cudaData : nullptr,
                         hasCmp && !cmpFp8 ? (const __nv_bfloat16*)compressedKV->cudaData : nullptr,
@@ -3079,7 +3111,7 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
                 ringMode, ringRowBytes, cmpMode, cmpRowBytes, vecUnpack ? 1 : 0);
             return V41CheckLaunch("SparseAttentionMma");
         };
-        const bool ok = tokens == 1 ? launch(std::integral_constant<int, 4>{})
+        const bool ok = tokens == 1 ? launch(std::integral_constant<int, 8>{})
                                     : launch(std::integral_constant<int, 1>{});
         // An unsupported image/resource configuration has submitted nothing.
         // Never retry a failed kernel launch: its execution state is unknown.

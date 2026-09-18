@@ -252,7 +252,8 @@ namespace fastllm {
         // their weights have been decoded into the requested storage dtype.
         std::set<std::string> quantizedLinearNames;
         void LinearWithActivationQuant(Data &input, const std::string &weightName,
-                                       Data &output, bool replicated = false, Data *scratch = nullptr);
+                                       Data &output, bool replicated = false, Data *scratch = nullptr,
+                                       bool inputQuantized = false);
 
         // -------- 跨层共享 --------
         std::vector<int> kv_source_layer_ids;
