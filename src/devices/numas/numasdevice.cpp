@@ -303,16 +303,16 @@ namespace fastllm {
         bool pinnedWeight;
     };
 
-    // 多卡专家流的重叠开关。默认全部关闭，行为与合入前完全一致。
-    //   FT_MOE_ASSIST_OVERLAP=1  assist 卡的输入 staging 与输出归约改成事件
-    //                            依赖，从主线程关键路径上移走。
+    // 多卡专家流默认开启搬运重叠，其他调度策略默认关闭。
+    //   FT_MOE_ASSIST_OVERLAP=0  关闭 assist 卡输入 staging 与输出归约的
+    //                            事件依赖重叠，恢复主线程串行搬运。
     //   FT_MOE_ASSIST_BALANCE=1  按各卡实测的每专家耗时分配 GPU 专家，而不是
     //                            固定按 route 数均分。
     //   FT_EXPERT_LIMIT_AUTO=1   用真实层反馈出的 CPU/GPU 速度算 expertLimit，
     //                            取代单专家合成 benchmark 的估计。
     //   FASTLLM_NUMAS_MOE_ASSIST_PROFILE=1  打印 prefill 各阶段耗时。
     struct NumasMoeAssistConfig {
-        bool overlap = false;
+        bool overlap = true;
         bool balance = false;
         bool profile = false;
         bool autoExpertLimit = false;
@@ -320,10 +320,10 @@ namespace fastllm {
 
     static const NumasMoeAssistConfig &GetNumasMoeAssistConfig() {
         static const NumasMoeAssistConfig config = []() {
-            auto readBool = [](const char *name) {
+            auto readBool = [](const char *name, bool defaultValue = false) {
                 const char *value = std::getenv(name);
                 if (value == nullptr || value[0] == '\0') {
-                    return false;
+                    return defaultValue;
                 }
                 std::string lowered(value);
                 std::transform(
@@ -333,7 +333,7 @@ namespace fastllm {
                        lowered != "off" && lowered != "no";
             };
             NumasMoeAssistConfig parsed;
-            parsed.overlap = readBool("FT_MOE_ASSIST_OVERLAP");
+            parsed.overlap = readBool("FT_MOE_ASSIST_OVERLAP", parsed.overlap);
             parsed.balance = readBool("FT_MOE_ASSIST_BALANCE");
             parsed.profile = readBool("FASTLLM_NUMAS_MOE_ASSIST_PROFILE");
             parsed.autoExpertLimit = readBool("FT_EXPERT_LIMIT_AUTO");

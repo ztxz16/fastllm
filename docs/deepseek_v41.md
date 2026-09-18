@@ -486,9 +486,12 @@ FT_MOE_ASSIST_DEVICES=0,1 ftllm server ... --device cuda --moe_device numa
 只把第二张卡加进来是不够的：每层会多出两段**只在主线程上串行**的搬运，正好把算子级省下来的时间
 还回去。
 
+输入搬运与 partial 归约的重叠现在默认开启，无需设置环境变量；可用
+`FT_MOE_ASSIST_OVERLAP=0` 恢复原来的串行搬运。下面另外两项调度策略仍默认关闭。
+
 | 变量 | 作用 |
 | --- | --- |
-| `FT_MOE_ASSIST_OVERLAP=1` | assist 卡的输入 staging 与 partial 归约改成事件依赖，从主线程关键路径上移走 |
+| `FT_MOE_ASSIST_OVERLAP=0` | 关闭默认启用的输入 staging 与 partial 归约重叠 |
 | `FT_MOE_ASSIST_BALANCE=1` | 按各卡实测的「每专家毫秒」分配 GPU 专家，而不是按 route 数均分 |
 | `FT_EXPERT_LIMIT_AUTO=1` | 用真实层反馈出的 CPU / GPU 速度算 expertLimit，取代单专家合成 benchmark |
 
@@ -529,6 +532,8 @@ FT_MOE_ASSIST_DEVICES=0,1 ftllm server ... --device cuda --moe_device numa
 误差与任务结果判断；不要仅为逐字节复现而关闭动态分配。生成历史分歧之后的 logits 不能直接比较。
 
 ### 实测（2 x RTX 3090 Ti，NVLink，6 层真实 MoE 尺寸的模型）
+
+以下为默认开启前、逐项启用各优化的历史测试结果。
 
 模型：hidden 5120 / moe_intermediate_size 2304 / top-6 / 64 个路由专家 + 1 个共享专家，
 路由专家 NVFP4 block-32（每专家约 18.8 MB），16384 token prefill、4096 分块（共 4 个 chunk x 6 层）。
