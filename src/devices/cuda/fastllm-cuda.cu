@@ -9508,14 +9508,16 @@ __global__ __launch_bounds__(32) void FastllmRMSNormSiluMulHalf128CombinedGateEx
 // Fuse [batch, heads, paddedSeq, 128] -> [batch, seq, heads, 128]
 // with the exact output RMSNorm and z gate.  This avoids the temporary copy
 // required by an in-place head/sequence transpose.
-__global__ __launch_bounds__(32) void FastllmRMSNormSiluMulHalf128HeadMajorCombinedGateExactKernel(
+template<int Warps>
+__global__ __launch_bounds__(32*Warps) void FastllmRMSNormSiluMulHalf128HeadMajorCombinedGateExactKernel(
         const half *headMajorInput, const float *weight,
         const half *combinedGateInput, half *output,
         int seqLen, int paddedSeqLen,
-        int gateStride, int gateOffset, int gateHeads, float eps) {
+        int gateStride, int gateOffset, int gateHeads, float eps,int rows) {
     constexpr int CHANNELS = 128;
-    int row = blockIdx.x;
-    int lane = threadIdx.x;
+    int row = blockIdx.x*Warps+threadIdx.x/32;
+    if(row>=rows)return;
+    int lane = threadIdx.x&31;
     int token = row / gateHeads;
     int head = row - token * gateHeads;
     int batch = token / seqLen;
@@ -9784,14 +9786,26 @@ bool FastllmCudaRMSNormSiluMulFloat16HeadMajorCombinedGate(
         return false;
     }
 
-    FastllmRMSNormSiluMulHalf128HeadMajorCombinedGateExactKernel<<<(
-        int)outer64, 32>>>(
+    const char *multirowEnv = std::getenv("FASTLLM_CUDA_GDN_NORM_MULTIROW");
+    bool multirow = multirowEnv == nullptr || multirowEnv[0] == '\0' ||
+        FastllmCudaEnvFlagEnabled("FASTLLM_CUDA_GDN_NORM_MULTIROW");
+    if (multirow && outer64 >= 64) {
+        FastllmRMSNormSiluMulHalf128HeadMajorCombinedGateExactKernel<4><<<((int)outer64 + 3) / 4, 128>>>(
         (const half *)headMajorInput.cudaData,
         (const float *)weight.cudaData,
         (const half *)combinedGateInput.cudaData,
         (half *)output.cudaData,
         seqLen, paddedSeqLen,
-        gateStride, gateOffset, gateHeads, eps);
+        gateStride, gateOffset, gateHeads, eps, (int)outer64);
+    } else {
+        FastllmRMSNormSiluMulHalf128HeadMajorCombinedGateExactKernel<1><<<(int)outer64, 32>>>(
+        (const half *)headMajorInput.cudaData,
+        (const float *)weight.cudaData,
+        (const half *)combinedGateInput.cudaData,
+        (half *)output.cudaData,
+        seqLen, paddedSeqLen,
+        gateStride, gateOffset, gateHeads, eps, (int)outer64);
+    }
     checkCudaErrors(
         "Error: CUDA error in "
         "FastllmCudaRMSNormSiluMulFloat16HeadMajorCombinedGate.",
