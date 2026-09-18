@@ -25,6 +25,9 @@
 #endif
 #include "fastllm-multicuda.cuh"
 #endif
+#ifdef USE_NUMAS
+#include "devices/numas/numasdevice.h"
+#endif
 #ifdef USE_TFACC
 #include "fastllm-tfacc.h"
 #endif
@@ -5903,6 +5906,43 @@ namespace fastllm {
         // SelectExpert contract requires it). Keep only the narrow router
         // tensor in float32 while larger activations retain their dtype.
         ToDataType(routerLogits, DataType::FLOAT32);
+        auto selectExperts = [&]() {
+            bool fusedRouterSelection = false;
+#ifdef USE_CUDA
+            if (routerLogits.dataDevice == DataDevice::CUDA &&
+                routerLogits.dataType == DataType::FLOAT32 &&
+                !routerLogits.dims.empty() &&
+                routerLogits.dims.back() == 512 &&
+                this->num_experts_per_tok == 10) {
+                FusedSoftmaxSelectExpert(
+                    routerLogits, expertIndex, expertScore,
+                    this->num_experts_per_tok, this->norm_topk_prob,
+                    this->routed_scaling_factor, nullptr);
+                fusedRouterSelection = true;
+            }
+#endif
+            if (!fusedRouterSelection) {
+                Softmax(routerLogits, routerLogits, -1);
+                SelectExpert(routerLogits, expertIndex, expertScore,
+                             this->num_experts_per_tok,
+                             this->norm_topk_prob,
+                             this->routed_scaling_factor, nullptr);
+            }
+        };
+        bool selectedBeforeShared = false;
+#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
+        const std::string moeDevice = SelectMoeDeviceForLayer(deviceLayer);
+        if (threadTpRank < 0 && batch * sequence <= kNumasMoePrefetchMaxRows &&
+            flattened.dataDevice == DataDevice::CUDA &&
+            (moeDevice == "numa" || moeDevice.rfind("numa:", 0) == 0) &&
+            !FastllmCudaMoeCacheRequested() &&
+            !FastllmCudaGraphIsCapturing()) {
+            selectExperts();
+            PrefetchNumasMoeDecodeInput(
+                flattened, expertIndex, expertScore, deviceLayer);
+            selectedBeforeShared = true;
+        }
+#endif
 #ifdef USE_CUDA
         // Shared and routed experts consume the same normalized input and
         // router result but do not depend on one another. During CUDA graph
@@ -5961,26 +6001,8 @@ namespace fastllm {
             return;
         }
 #endif
-        bool fusedRouterSelection = false;
-#ifdef USE_CUDA
-        if (routerLogits.dataDevice == DataDevice::CUDA &&
-            routerLogits.dataType == DataType::FLOAT32 &&
-            !routerLogits.dims.empty() &&
-            routerLogits.dims.back() == 512 &&
-            this->num_experts_per_tok == 10) {
-            FusedSoftmaxSelectExpert(
-                routerLogits, expertIndex, expertScore,
-                this->num_experts_per_tok, this->norm_topk_prob,
-                this->routed_scaling_factor, nullptr);
-            fusedRouterSelection = true;
-        }
-#endif
-        if (!fusedRouterSelection) {
-            Softmax(routerLogits, routerLogits, -1);
-            SelectExpert(routerLogits, expertIndex, expertScore,
-                         this->num_experts_per_tok,
-                         this->norm_topk_prob,
-                         this->routed_scaling_factor, nullptr);
+        if (!selectedBeforeShared) {
+            selectExperts();
         }
         const std::string outputDevice = SelectDeviceFromMap(
             this->deviceMap, deviceLayer + 1, this->block_cnt);
