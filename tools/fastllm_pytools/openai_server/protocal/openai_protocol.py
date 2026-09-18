@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, model_validator
 
 class ErrorResponse(BaseModel):
     object: str = "error"
+    type: str = "BadRequestError"
     message: str
     code: int
 
@@ -116,6 +117,7 @@ class ChatCompletionRequest(BaseModel):
         "none", "minimal", "low", "medium", "high", "xhigh", "max"
     ], int]] = None
     chat_template_kwargs: Optional[Dict[str, Any]] = None
+    response_format: Optional[Dict[str, Any]] = None
 
     @model_validator(mode="after")
     def normalize_completion_token_limit(self):

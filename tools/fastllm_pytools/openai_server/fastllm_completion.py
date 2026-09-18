@@ -28,6 +28,9 @@ from starlette.background import BackgroundTask
 
 from .protocal.openai_protocol import *
 from .protocal.anthropic_protocol import *
+from .structured_output import (prepare_structured_output,
+                                responses_response_format,
+                                validate_structured_output)
 
 try:
     from ..generation_errors import PromptTooLongError
@@ -2225,6 +2228,7 @@ class FastLLmCompletion:
           tools = self._convert_responses_tools(request.tools),
           tool_choice = self._convert_responses_tool_choice(request.tool_choice),
           reasoning_effort = reasoning_effort,
+          response_format = responses_response_format(request.text),
       )
 
   def _response_token_counts(
@@ -3138,6 +3142,8 @@ class FastLLmCompletion:
                 msg_dict["reasoning_content"] = msg.reasoning_content
             messages.append(msg_dict)
 
+          messages = prepare_structured_output(messages, request.response_format)
+
       except Exception as e:
           logging.error("Error in applying chat template from request: %s", e)
           traceback.print_exc()
@@ -3283,11 +3289,14 @@ class FastLLmCompletion:
       emit_reasoning_content = self._uses_tagged_reasoning_response(enable_thinking)
       # Streaming response
       if request.stream:
-          return (self.chat_completion_stream_generator(
+          stream = self.chat_completion_stream_generator(
               effective_request, raw_request, result_generator, request_id,
               input_token_len, think = need_think_prefix,
               emit_reasoning_content = emit_reasoning_content,
-              handle = handle, response_statistics = response_statistics),
+              handle = handle, response_statistics = response_statistics)
+          if request.response_format and request.response_format.get("type") != "text":
+              stream = self._structured_output_stream(stream, request.response_format)
+          return (stream,
               BackgroundTask(self.check_disconnect, raw_request, request_id, handle))
       else:
           try:
@@ -3407,6 +3416,14 @@ class FastLLmCompletion:
               finish_reason='tool_calls',
           )
       else:
+          if finish_reason != "length":
+              try:
+                  validate_structured_output(tool_call_info.content, request.response_format)
+              except ValueError as error:
+                  self._release_conversation_handle(request_id, handle)
+                  return self.create_error_response(
+                      str(error), err_type="invalid_response_format",
+                      status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
           choice_data = ChatCompletionResponseChoice(
               index=0,
               message=ChatMessage(
@@ -3432,7 +3449,33 @@ class FastLLmCompletion:
           # logging.info(f"Removed completed conversation from tracking: {request_id}")
 
       return response
-      
+
+  async def _structured_output_stream(self, stream, format_spec):
+      content = []
+      try:
+          async for chunk in stream:
+              for line in chunk.splitlines():
+                  if not line.startswith("data: ") or line == "data: [DONE]":
+                      continue
+                  data = json.loads(line[6:])
+                  for choice in data.get("choices", []):
+                      delta = choice.get("delta") or {}
+                      if delta.get("content"):
+                          content.append(delta["content"])
+                      if choice.get("finish_reason") == "stop":
+                          try:
+                              validate_structured_output("".join(content), format_spec)
+                          except ValueError as error:
+                              data = self.create_streaming_error_response(
+                                  str(error), err_type="invalid_response_format",
+                                  status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+                              yield f"data: {data}\n\n"
+                              yield "data: [DONE]\n\n"
+                              return
+              yield chunk
+      finally:
+          await stream.aclose()
+
             
   async def chat_completion_stream_generator(
           self, request: ChatCompletionRequest, raw_request: Request,
