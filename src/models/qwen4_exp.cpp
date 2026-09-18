@@ -2973,11 +2973,11 @@ namespace fastllm {
 #if defined(USE_CUDA) && !defined(CUDA_NO_TENSOR_CORE)
         const int rows = normalized.dims.empty()
             ? 0 : (int)(normalized.Count(0) / normalized.dims.back());
-        // Keep the single-token specialization limited to TP decode.
-        const bool tpDecodeMix = threadTpRank >= 0 && rows == 1 &&
+        // Match the exact single-token GEMV reduction in serial and TP decode.
+        const bool decodeMix = rows == 1 &&
             this->hcCount == 4 && upWeight.dims.size() == 2 &&
             upWeight.dims[0] == 10240 && upWeight.dims[1] == 320;
-        if (!qwen4MtpDecodeEquivalentTarget && (rows >= 8 || tpDecodeMix) &&
+        if (!qwen4MtpDecodeEquivalentTarget && (rows >= 8 || decodeMix) &&
             normalized.dataDevice == DataDevice::CUDA &&
             normalized.dataType == DataType::FLOAT32 &&
             lowRank.dataType == DataType::FLOAT32 &&
@@ -5652,7 +5652,8 @@ namespace fastllm {
             Data gatedCore;
             Data *outputCore = &core;
 #ifdef USE_CUDA
-            if (sequentialMtpDecode &&
+            if ((fusedDecode || sequentialMtpDecode) &&
+                this->dataType == DataType::FLOAT16 &&
                 core.dataDevice == DataDevice::CUDA &&
                 core.dataType == DataType::FLOAT32 &&
                 z.dataDevice == DataDevice::CUDA &&
