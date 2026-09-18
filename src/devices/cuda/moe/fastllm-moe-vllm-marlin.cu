@@ -100,31 +100,49 @@ static MarlinMoeKernelFn GetAwqMarlinMoeKernel(bool gate, bool smallBatch,
         128, 2, 8, 4, false, 4, 2, false>;
 }
 
-static MarlinMoeKernelFn GetNvfp4E4M3MarlinMoeKernel(
+template<int Stages>
+static MarlinMoeKernelFn GetNvfp4E4M3MarlinMoeKernelImpl(
         bool gate, bool smallBatch, int &threads) {
     if (smallBatch) {
         threads = 256;
         return marlin_kernel::Marlin<
             marlin_types::kFloat16.id(), marlin_types::kFE2M1f.id(),
             marlin_types::kFloat16.id(), marlin_types::kFE4M3fn.id(),
-            256, 1, 8, 8, true, 4, 1, false>;
+            256, 1, 8, 8, true, Stages, 1, false>;
     }
     if (gate) {
         threads = 256;
         return marlin_kernel::Marlin<
             marlin_types::kFloat16.id(), marlin_types::kFE2M1f.id(),
             marlin_types::kFloat16.id(), marlin_types::kFE4M3fn.id(),
-            256, 4, 16, 4, false, 4, 1, false>;
+            256, 4, 16, 4, false, Stages, 1, false>;
     }
     threads = 128;
     return marlin_kernel::Marlin<
         marlin_types::kFloat16.id(), marlin_types::kFE2M1f.id(),
         marlin_types::kFloat16.id(), marlin_types::kFE4M3fn.id(),
-        128, 2, 8, 4, false, 4, 1, false>;
+        128, 2, 8, 4, false, Stages, 1, false>;
+}
+
+static bool Nvfp4MarlinIsSm75(int device) {
+    int major = 0, minor = 0;
+    return cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) == cudaSuccess &&
+           cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) == cudaSuccess &&
+           major == 7 && minor == 5;
+}
+
+static MarlinMoeKernelFn GetNvfp4E4M3MarlinMoeKernel(
+        bool gate, bool smallBatch, int &threads) {
+    return Nvfp4MarlinIsSm75(FastllmCudaGetDevice())
+        ? GetNvfp4E4M3MarlinMoeKernelImpl<2>(gate, smallBatch, threads)
+        : GetNvfp4E4M3MarlinMoeKernelImpl<4>(gate, smallBatch, threads);
 }
 
 static int GetNvfp4E4M3MarlinMoeSharedMemorySize(
         bool gate, bool smallBatch) {
+    if (Nvfp4MarlinIsSm75(FastllmCudaGetDevice())) {
+        return smallBatch ? 22656 : (gate ? 53248 : 18432);
+    }
     return smallBatch ? 45184 : (gate ? 71680 : 35328);
 }
 
@@ -223,7 +241,7 @@ static bool PrepareAwqMarlinMoeKernels(int device) {
 }
 
 static bool PrepareNvfp4E4M3MarlinMoeKernels(int device) {
-    if (!MarlinMoeDeviceSupported(device)) {
+    if (!MarlinMoeDeviceSupported(device) && !Nvfp4MarlinIsSm75(device)) {
         return false;
     }
     int maxSharedMemory = 0;

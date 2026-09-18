@@ -36,10 +36,10 @@
 
 namespace MARLIN_NAMESPACE_NAME {
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
 
 // FastLLM can be built as a multi-architecture CUDA binary.  Keep an
-// ABI-identical no-op specialization below SM80 so the translation unit still
+// ABI-identical no-op specialization below SM75 so the translation unit still
 // compiles; the host launcher rejects those devices before dispatch.
 template <const fastllm_marlin_moe_types::ScalarTypeId a_type_id,
           const fastllm_marlin_moe_types::ScalarTypeId b_type_id,
@@ -278,6 +278,12 @@ __global__ void Marlin(
   // configurations, while requiring as few slow global cross-threadblock
   // reductions as possible.
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
+  // Only the FP16 NVFP4 two-stage specializations are dispatched on Turing.
+  // Discard unsupported BF16 / four-stage bodies in fat-binary builds.
+  if constexpr (a_type_id == fastllm_marlin_moe_types::kFloat16.id() &&
+                s_type_id == fastllm_marlin_moe_types::kFE4M3fn.id() && stages == 2) {
+#endif
   #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
   // FP8 computation is only supported for Ada Lovelace or newer architectures.
   if constexpr (a_type_id == fastllm_marlin_moe_types::kFE4M3fn.id()) return;
@@ -2219,6 +2225,9 @@ __global__ void Marlin(
       }
     }
   }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
+  }
+#endif
 }
 
 }  // namespace MARLIN_NAMESPACE_NAME
