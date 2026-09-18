@@ -2877,11 +2877,23 @@ static bool BuildNvfp4E4M3LayerCache(
         temporaryFloats * sizeof(float) +
         (size_t)sms * 4 * sizeof(int) +
         (size_t)experts * 3 * sizeof(int32_t);
+    const size_t gateSourceBytes = gateWeightBytes + gateScaleValues;
+    const size_t downSourceBytes = downWeightBytes + downScaleValues;
+    const size_t expertSourceBytes = gateSourceBytes + downSourceBytes;
+    const size_t sourceBytes = expertSourceBytes * experts;
+    const size_t transposeBytes = std::max(gateWeightBytes, downWeightBytes);
     size_t freeMemory = 0;
     size_t totalMemory = 0;
+    if (cudaMemGetInfo(&freeMemory, &totalMemory) != cudaSuccess) {
+        return false;
+    }
     constexpr size_t reserveBytes = (size_t)1024 << 20;
-    if (cudaMemGetInfo(&freeMemory, &totalMemory) != cudaSuccess ||
-        freeMemory < persistentBytes + reserveBytes) {
+    const bool stageSource =
+        freeMemory < persistentBytes + transposeBytes + reserveBytes;
+    const size_t scratchBytes =
+        transposeBytes + (stageSource ? expertSourceBytes : 0);
+    if (freeMemory + (stageSource ? sourceBytes : 0) <
+        persistentBytes + scratchBytes + reserveBytes) {
         static std::atomic<unsigned long long> warnedDevices {0};
         unsigned long long bit = device < 64 ? (1ull << device) : 0;
         if (bit == 0 ||
@@ -2897,6 +2909,45 @@ static bool BuildNvfp4E4M3LayerCache(
         }
         return false;
     }
+
+    auto releaseSourceWeights = [&]() {
+        for (int slot = 2; slot < weightsBatch; ++slot) {
+            fastllm::Data &weight = *weights[slot];
+            cache.sourceDirectWeights += weight.directMemory ? 1 : 0;
+            cache.sourceWeightBytes += weight.GetBytes();
+            ReleaseAwqOriginalWeight(weight);
+        }
+    };
+    // Keep the fast GPU-only repack when it fits. Under memory pressure,
+    // retain one layer on the host before releasing any source allocation.
+    // The device then only needs one expert's compact weights as scratch.
+    std::vector<uint8_t> hostSource;
+    if (stageSource) {
+        hostSource.resize(sourceBytes);
+        for (int expert = 0; expert < experts; ++expert) {
+            float commonGlobal = 0.0f;
+            if (!GetNvfp4E4M3CommonGlobal(*weights[2 + expert * 2], commonGlobal) ||
+                !GetNvfp4E4M3CommonGlobal(*weights[3 + expert * 2], commonGlobal) ||
+                cudaMemcpy(hostSource.data() + expertSourceBytes * expert,
+                           weights[2 + expert * 2]->cudaData, gateSourceBytes,
+                           cudaMemcpyDeviceToHost) != cudaSuccess ||
+                cudaMemcpy(hostSource.data() + expertSourceBytes * expert + gateSourceBytes,
+                           weights[3 + expert * 2]->cudaData, downSourceBytes,
+                           cudaMemcpyDeviceToHost) != cudaSuccess) {
+                return false;
+            }
+        }
+        releaseSourceWeights();
+    }
+    // Once the originals are released, a failed build cannot use the
+    // source-layout fallback. Report the failure instead of dispatching it.
+    auto failBuild = [&]() {
+        ReleaseNvfp4E4M3CacheStorage(cache);
+        if (stageSource) {
+            FailNvfp4E4M3MarlinAfterRepack("host-staged weight repack", &cache);
+        }
+        return false;
+    };
 
     cache.device = device;
     cache.experts = experts;
@@ -2930,8 +2981,7 @@ static bool BuildNvfp4E4M3LayerCache(
         cache.expertCounts == nullptr || cache.expertStarts == nullptr ||
         cache.workspace == nullptr ||
         cache.temporaryOutput == nullptr) {
-        ReleaseNvfp4E4M3CacheStorage(cache);
-        return false;
+        return failBuild();
     }
 
     const size_t gateQWeightCount =
@@ -2939,10 +2989,9 @@ static bool BuildNvfp4E4M3LayerCache(
     const size_t downQWeightCount =
         (size_t)(intermediate / 8) * hidden;
     uint32_t *standardQWeight = (uint32_t *)AllocateDirect(
-        std::max(gateQWeightCount, downQWeightCount) * sizeof(uint32_t));
+        scratchBytes);
     if (standardQWeight == nullptr) {
-        ReleaseNvfp4E4M3CacheStorage(cache);
-        return false;
+        return failBuild();
     }
 
     std::vector<float> gateGlobals(experts);
@@ -2966,10 +3015,24 @@ static bool BuildNvfp4E4M3LayerCache(
         gateGlobals[expert] = gateCommon * 128.0f;
         downGlobals[expert] = downCommon * 128.0f;
 
+        const uint8_t *gateSource = (const uint8_t *)gate.cudaData;
+        const uint8_t *downSource = (const uint8_t *)down.cudaData;
+        if (stageSource) {
+            auto *sourceScratch = (uint8_t *)standardQWeight + transposeBytes;
+            success = cudaMemcpyAsync(
+                sourceScratch, hostSource.data() + expertSourceBytes * expert,
+                expertSourceBytes, cudaMemcpyHostToDevice, stream) == cudaSuccess;
+            if (!success) {
+                break;
+            }
+            gateSource = sourceScratch;
+            downSource = sourceScratch + gateSourceBytes;
+        }
+
         TransposePackedFp4Kernel<<<
             (gateQWeightCount + threads - 1) / threads,
             threads, 0, stream>>>(
-            (const uint32_t *)gate.cudaData, standardQWeight,
+            (const uint32_t *)gateSource, standardQWeight,
             gateRows, hidden / 8);
         success = cudaGetLastError() == cudaSuccess &&
                   FastllmCudaGptqMarlinRepackStream(
@@ -2982,7 +3045,7 @@ static bool BuildNvfp4E4M3LayerCache(
         BuildNvfp4E4M3MarlinScalesKernel<<<
             (gateScaleValues + threads - 1) / threads,
             threads, 0, stream>>>(
-            (const uint8_t *)gate.cudaData + gateWeightBytes,
+            gateSource + gateWeightBytes,
             cache.gateScale + gateScaleValues * expert,
             gateRows, hidden / 16, 2,
             gate.scales[0], gate.scales[1], gateCommon);
@@ -2994,7 +3057,7 @@ static bool BuildNvfp4E4M3LayerCache(
         TransposePackedFp4Kernel<<<
             (downQWeightCount + threads - 1) / threads,
             threads, 0, stream>>>(
-            (const uint32_t *)down.cudaData, standardQWeight,
+            (const uint32_t *)downSource, standardQWeight,
             hidden, intermediate / 8);
         success = cudaGetLastError() == cudaSuccess &&
                   FastllmCudaGptqMarlinRepackStream(
@@ -3007,7 +3070,7 @@ static bool BuildNvfp4E4M3LayerCache(
         BuildNvfp4E4M3MarlinScalesKernel<<<
             (downScaleValues + threads - 1) / threads,
             threads, 0, stream>>>(
-            (const uint8_t *)down.cudaData + downWeightBytes,
+            downSource + downWeightBytes,
             cache.downScale + downScaleValues * expert,
             hidden, intermediate / 16, 1,
             down.scales[0], down.scales[0], downCommon);
@@ -3026,20 +3089,19 @@ static bool BuildNvfp4E4M3LayerCache(
     success = success && syncState == cudaSuccess;
     ReleaseDirect(standardQWeight);
     if (!success) {
-        ReleaseNvfp4E4M3CacheStorage(cache);
-        return false;
+        return failBuild();
     }
 
-    for (int expert = 0; expert < experts; ++expert) {
-        fastllm::Data *gate = weights[2 + expert * 2];
-        fastllm::Data *down = weights[3 + expert * 2];
-        cache.sourceDirectWeights += gate->directMemory ? 1 : 0;
-        cache.sourceDirectWeights += down->directMemory ? 1 : 0;
-        cache.sourceWeightBytes += gate->GetBytes() + down->GetBytes();
-        ReleaseAwqOriginalWeight(*gate);
-        ReleaseAwqOriginalWeight(*down);
+    if (!stageSource) {
+        releaseSourceWeights();
     }
 
+    if (stageSource) {
+        std::fprintf(stderr,
+                     "[FastLLM] NVFP4 E4M3 Marlin repacked via CPU staging on GPU %d "
+                     "(%.1f MiB source, %.1f MiB device scratch).\n",
+                     device, sourceBytes / 1048576.0, scratchBytes / 1048576.0);
+    }
     cache.ready = true;
     static std::atomic<unsigned long long> announcedDevices {0};
     unsigned long long bit = device < 64 ? (1ull << device) : 0;
