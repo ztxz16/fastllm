@@ -368,6 +368,13 @@ if (USE_CUDA)
         src/devices/cuda/linear/fastllm-linear-fp32.cu
         src/devices/cuda/linear/fastllm-linear-fp16.cu
         src/devices/cuda/linear/fastllm-linear-bf16.cu
+        src/devices/cuda/linear/fastllm-rmsnorm-small-linear.cu
+        src/devices/cuda/linear/fastllm-native-lowbit-prefill.cu
+        src/devices/cuda/linear/fastllm-native-nvfp4-layout.cu
+        src/devices/cuda/linear/fastllm-gdn-prepare-wy.cu
+        src/devices/cuda/linear/fastllm-gdn-input.cu
+        src/devices/cuda/linear/fastllm-fp8-linear-add.cu
+        src/devices/cuda/linear/fastllm-nvfp4-fused.cu
         src/devices/cuda/linear/fastllm-linear-fp8.cu
         src/devices/cuda/linear/fastllm-linear-fp8-marlin.cu
         src/devices/cuda/linear/fastllm-linear-nvfp4-marlin.cu
@@ -418,7 +425,11 @@ if (USE_CUDA)
         set(FASTLLM_CUDA_SM120_SOURCES
             ${FASTLLM_DSV4_SPARSE_MLA_SM120_SOURCE}
             ${FASTLLM_DSV4_MOE_DEEPGEMM_SM120_SOURCE}
-            ${FASTLLM_DSV4_WOA_DEEPGEMM_SM120_SOURCE})
+            ${FASTLLM_DSV4_WOA_DEEPGEMM_SM120_SOURCE}
+            src/devices/cuda/linear/fastllm-native-nvfp4-tma-sm120.cu)
+        set_source_files_properties(
+            src/devices/cuda/linear/fastllm-native-lowbit-prefill.cu
+            PROPERTIES COMPILE_DEFINITIONS FASTLLM_NATIVE_PREFILL_SM120)
         add_compile_definitions(FASTLLM_ENABLE_DSV4_SPARSE_MLA_SM120)
         add_compile_definitions(FASTLLM_ENABLE_DSV4_MOE_DEEPGEMM_SM120)
         add_compile_definitions(FASTLLM_ENABLE_DSV4_WOA_DEEPGEMM_SM120)
@@ -940,6 +951,49 @@ if (UNIT_TEST)
             add_test(NAME cuda_dsv41_moe_cache COMMAND cuda_dsv41_moe_cache_test)
             set_tests_properties(cuda_dsv41_moe_cache PROPERTIES LABELS cuda RUN_SERIAL TRUE)
         endif()
+
+
+
+        add_executable(cuda_fp8_row_test test/basic/test_cuda_fp8_row.cu)
+        target_link_libraries(cuda_fp8_row_test PRIVATE fastllm)
+        set_target_properties(cuda_fp8_row_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME cuda_fp8_row COMMAND cuda_fp8_row_test)
+        set_tests_properties(cuda_fp8_row PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        add_executable(cuda_rmsnorm_small_linear_test test/basic/test_cuda_rmsnorm_small_linear.cu)
+        target_link_libraries(cuda_rmsnorm_small_linear_test PRIVATE fastllm)
+        set_target_properties(cuda_rmsnorm_small_linear_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME cuda_rmsnorm_small_linear COMMAND cuda_rmsnorm_small_linear_test)
+        set_tests_properties(cuda_rmsnorm_small_linear PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        add_executable(cuda_rmsnorm_decode_test test/basic/test_cuda_rmsnorm_decode.cu)
+        target_link_libraries(cuda_rmsnorm_decode_test PRIVATE fastllm)
+        set_target_properties(cuda_rmsnorm_decode_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME cuda_rmsnorm_decode COMMAND cuda_rmsnorm_decode_test)
+        set_tests_properties(cuda_rmsnorm_decode PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+
+        add_executable(cuda_nvfp4_fused_test test/basic/test_cuda_nvfp4_fused.cu)
+        target_link_libraries(cuda_nvfp4_fused_test PRIVATE fastllm)
+        set_target_properties(cuda_nvfp4_fused_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME cuda_nvfp4_fused COMMAND cuda_nvfp4_fused_test)
+        set_tests_properties(cuda_nvfp4_fused PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+
+        add_executable(cuda_fp8_linear_add_test test/basic/test_cuda_fp8_linear_add.cu)
+        target_link_libraries(cuda_fp8_linear_add_test PRIVATE fastllm)
+        set_target_properties(cuda_fp8_linear_add_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME cuda_fp8_linear_add COMMAND cuda_fp8_linear_add_test)
+        set_tests_properties(cuda_fp8_linear_add PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        add_executable(cuda_gdn_input_conv_test test/basic/test_cuda_gdn_input_conv.cu)
+        target_link_libraries(cuda_gdn_input_conv_test PRIVATE fastllm)
+        set_target_properties(cuda_gdn_input_conv_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME cuda_gdn_input_conv COMMAND cuda_gdn_input_conv_test)
+        set_tests_properties(cuda_gdn_input_conv PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+
+        add_executable(cuda_quantized_kv_graph_test test/basic/test_cuda_quantized_kv_graph.cu)
+        target_link_libraries(cuda_quantized_kv_graph_test PRIVATE fastllm)
+        set_target_properties(cuda_quantized_kv_graph_test PROPERTIES
+            CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME cuda_quantized_kv_graph COMMAND cuda_quantized_kv_graph_test)
+        set_tests_properties(cuda_quantized_kv_graph PROPERTIES
+            LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
 
         add_executable(cuda_fp4_kv_test test/basic/test_cuda_fp4_kv.cu)
         target_link_libraries(cuda_fp4_kv_test PRIVATE fastllm)

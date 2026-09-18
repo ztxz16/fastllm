@@ -589,6 +589,8 @@ namespace fastllm {
         void *ggmlTensor = nullptr;
         int ggmlType = -1;
         bool IsRepacked = false;
+        // CUDA-only in-place NVFP4 row-major codes + tiled E4M3 scales.
+        bool cudaNativeNvfp4Layout = false;
         bool disableGGUFRepack = false;
         bool forceGGUFFp32Dequant = false;
 

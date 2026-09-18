@@ -1,3 +1,8 @@
+#include "devices/cuda/fastllm-cuda-gdn.h"
+#include "devices/cuda/fastllm-cuda-rmsnorm-small-linear.h"
+#include "devices/cuda/fastllm-cuda-fp8-linear-add.h"
+#include "devices/cuda/fastllm-cuda-nvfp4-fused.h"
+#include "devices/cuda/fastllm-cuda-native-prefill.h"
 //
 // Created by huangyuyang on 6/14/23.
 //
@@ -4578,6 +4583,8 @@ namespace fastllm {
         this->ops["Linear"] = (BaseOperator*)(new CudaLinearOp());
         this->ops["LinearAdd"] = (BaseOperator*)(new CudaLinearAddOp());
         this->ops["SwigluLinearAdd"] = (BaseOperator*)(new CudaSwigluLinearAddOp());
+        this->ops["RMSNormSmallLinear"] = new CudaRMSNormSmallLinearOp();
+        this->ops["GdnInputConv"] = new CudaGdnInputConvOp();
         this->ops["LinearSwiglu"] = (BaseOperator*)(new CudaLinearSwigluOp());
         this->ops["Conv1DPerChannel"] = (BaseOperator*)(new CudaConv1DPerChannel());
         this->ops["Conv2D"] = (BaseOperator*)(new CudaConv2DOp());
@@ -6239,6 +6246,7 @@ namespace fastllm {
     }
 
     void DoCudaLinear(Data &input, Data &weight, const Data &bias, Data &output) {
+        if (weight.cudaNativeNvfp4Layout && input.dataType != DataType::FLOAT16) FastllmCudaRestoreNativeNvfp4(weight);
         output.Allocate(false);
         int n = input.Count(0) / input.dims.back();
         int m = input.dims.back();
@@ -6380,6 +6388,10 @@ namespace fastllm {
     }
 
     bool DoCudaLinearAdd(Data &input, Data &weight, const Data &bias, Data &output) {
+        if (FastllmCudaFP8LinearAddCanRun(input, weight, bias, output)) {
+            FastllmCudaFP8LinearAdd(input, weight, bias, output);
+            return true;
+        }
         int n = input.Count(0) / input.dims.back();
         int m = input.dims.back();
         int k = output.dims.back();
@@ -6454,6 +6466,12 @@ namespace fastllm {
         Data &middle = *(datas.find("middle")->second);
         Data &bias = *(datas.find("bias")->second);
 
+        if (FastllmCudaNativeFp8FusedCanRun(input, weight, bias, output, false) &&
+            FastllmCudaNativeFp8Fused(input, weight, output, false)) return;
+        if (weight.dataType == DataType::NVFP4_BLOCK_16) {
+            CudaNvfp4LinearAddBlock(input, weight, bias, middle, output);
+            return;
+        }
         if (DoCudaLinearAdd(input, weight, bias, output)) { 
             return;
         } else {
@@ -6631,6 +6649,12 @@ namespace fastllm {
         Data &middle = *(datas.find("middle")->second);
         Data &bias = *(datas.find("bias")->second);
 
+        if (FastllmCudaNativeFp8FusedCanRun(input, weight, bias, output, true) &&
+            FastllmCudaNativeFp8Fused(input, weight, output, true)) return;
+        if (weight.dataType == DataType::NVFP4_BLOCK_16) {
+            CudaNvfp4LinearSwigluBlock(input, weight, bias, middle, output);
+            return;
+        }
         if (DoCudaLinearSwiglu(input, weight, bias, middle, output)) {
             return;
         } else {

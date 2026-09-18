@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <mutex>
+#include <map>
 
 #define MARLIN_NAMESPACE_NAME fastllm_marlin_dense_fp8
 #include "marlin_dense_fp8/kernel.h"
@@ -222,6 +223,25 @@ static KernelFn PickFp4Kernel(int sizeM, int threadK, int threadN,
     }
     return nullptr;
 }
+// Only instantiate the m<=8 residual variants. The original kernel table
+// and its prefill / non-residual dispatch remain unchanged.
+static KernelFn PickFp4AddKernel(int threadK, int threadN, int stages, int &threads) {
+#define ADD_KERNEL(STAGES, THREADS, TN, TK) \
+    MARLIN_NAMESPACE_NAME::Marlin<vllm::kFloat16.id(), vllm::kFE2M1f.id(), \
+        vllm::kFloat16.id(), vllm::kFE4M3fn.id(), THREADS, 1, TN, TK, true, \
+        STAGES, 1, false, true, true>
+#define PICK_ADD(THREADS, TN, TK) \
+    do { threads = THREADS; return stages == 2 ? ADD_KERNEL(2, THREADS, TN, TK) \
+                                              : ADD_KERNEL(4, THREADS, TN, TK); } while (0)
+    if (stages != 2 && stages != 4) return nullptr;
+    if (threadK == 128 && threadN == 128) PICK_ADD(256, 8, 8);
+    if (threadK == 64 && threadN == 128) PICK_ADD(128, 8, 4);
+    if (threadK == 128 && threadN == 64) PICK_ADD(128, 4, 8);
+    return nullptr;
+#undef PICK_ADD
+#undef ADD_KERNEL
+}
+
 #undef RET_FP4_FOR_ARCH
 #undef RET_FP4
 
@@ -563,5 +583,57 @@ extern "C" bool FastllmCudaMarlinHalfNVFP4Gemm(
         row += chunkM;
         remaining -= chunkM;
     }
+    return true;
+}
+
+extern "C" bool FastllmCudaMarlinNVFP4AddSupported(int size_n, int size_k) {
+    if (!DeviceOk() || size_n <= 0 || size_k <= 0 || size_n % 128 || size_k % 128)
+        return false;
+    int device = 0, maxShared = 0, threadK = 0, threadN = 0, threads = 0;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        !SelectFp4Tile(8, size_n, size_k, threadK, threadN)) return false;
+    KernelFn kernel = PickFp4AddKernel(threadK, threadN, DeviceArch() == 75 ? 2 : 4, threads);
+    if (!kernel) return false;
+    static thread_local std::map<std::pair<int, KernelFn>, bool> ready;
+    const auto key = std::make_pair(device, kernel);
+    auto it = ready.find(key);
+    if (it != ready.end()) return it->second;
+    cudaStreamCaptureStatus capture;
+    if (cudaStreamIsCapturing(cudaStreamPerThread, &capture) != cudaSuccess ||
+        capture != cudaStreamCaptureStatusNone) return false;
+    cudaFuncAttributes attr{};
+    bool ok = cudaDeviceGetAttribute(&maxShared, cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                                     device) == cudaSuccess && maxShared > 0 &&
+        cudaFuncGetAttributes(&attr, kernel) == cudaSuccess && attr.maxThreadsPerBlock >= threads &&
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             maxShared) == cudaSuccess;
+    if (!ok) cudaGetLastError();
+    ready.emplace(key, ok);
+    return ok;
+}
+
+extern "C" bool FastllmCudaMarlinHalfNVFP4Add(
+        const void *a, const uint32_t *b_q_weight, const void *b_scales,
+        const float *global_scale, void *c, int size_m, int size_n, int size_k,
+        int *workspace, void *c_tmp) {
+    if (size_m < 2 || size_m > 8 || !a || !b_q_weight || !b_scales ||
+        !global_scale || !c || !workspace || !c_tmp ||
+        !FastllmCudaMarlinNVFP4AddSupported(size_n, size_k)) return false;
+    int device = 0, sms = 0, maxShared = 0, threadK = 0, threadN = 0, threads = 0;
+    cudaGetDevice(&device);
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+    cudaDeviceGetAttribute(&maxShared, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    if (sms <= 0 || maxShared <= 0 ||
+        !SelectFp4Tile(size_m, size_n, size_k, threadK, threadN)) return false;
+    KernelFn kernel = PickFp4AddKernel(threadK, threadN, DeviceArch() == 75 ? 2 : 4, threads);
+    if (!kernel) return false;
+    kernel<<<sms, threads, maxShared, cudaStreamPerThread>>>(
+        reinterpret_cast<const int4*>(a), reinterpret_cast<const int4*>(b_q_weight),
+        reinterpret_cast<int4*>(c), reinterpret_cast<int4*>(c_tmp), nullptr, nullptr,
+        reinterpret_cast<const int4*>(b_scales), global_scale, nullptr, nullptr,
+        size_k / 16, size_m, size_n, size_k, size_k, workspace,
+        false, false, true, maxShared);
+    // After a launch, failures are errors: never retry by adding residual twice.
+    if (cudaGetLastError() != cudaSuccess) throw "NVFP4 residual GEMM launch failed";
     return true;
 }

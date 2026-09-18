@@ -9,7 +9,10 @@
  */
 
 #include "fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-nvfp4-fused.h"
 #include "fastllm-cublas-prefill.cuh"
+#include "fastllm-native-lowbit-prefill.cuh"
+#include "devices/cuda/fastllm-cuda-native-prefill.h"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -173,7 +176,7 @@ static bool HasNvfp4MarlinOnDevice(const fastllm::Data &weight) {
     return weight.cudaData != nullptr &&
            weight.dataType == fastllm::DataType::NVFP4_BLOCK_16 &&
            weight.blockM == NVFP4_GROUP_SIZE && weight.blockK == 1 &&
-           weight.IsRepacked && Nvfp4MarlinArchitectureSupported();
+           weight.IsRepacked && !weight.cudaNativeNvfp4Layout && Nvfp4MarlinArchitectureSupported();
 }
 
 static bool GetNvfp4MarlinPackedOutputDim(int logicalN, int &packedN) {
@@ -435,8 +438,18 @@ extern "C" bool FastllmCudaTryMarlinHalfMatMulFloatNVFP4Block16(
         const fastllm::Data &input, fastllm::Data &weight,
         const fastllm::Data &bias, fastllm::Data &output,
         int n, int m, int k) {
+    // Process-start option: do not change an already-repacked weight's layout.
+    // With Marlin disabled, untouched weights use the existing raw GEMV/GEMM path.
+    static const bool marlinEnabled = Nvfp4PrefillEnvFlag("FASTLLM_CUDA_NVFP4_MARLIN", true);
+    if (!marlinEnabled && !HasNvfp4MarlinOnDevice(weight)) return false;
     int packedN = 0;
     if (!GetNvfp4MarlinPackedOutputDim(k, packedN)) return false;
+    // Admit only already-prepared, dense CUDA tensors. Cold weights and all
+    // other shapes continue through the complete Marlin preparation/launch path.
+    if (n == 1 && fastllm::FastllmCudaNvfp4ShapeGemvCanRun(input, weight, bias, output)) {
+        fastllm::FastllmCudaNvfp4ShapeGemv(input, weight, output);
+        return true;
+    }
     // Repacked weights must keep using a backend that understands Marlin layout.
     if (!HasNvfp4MarlinOnDevice(weight)) {
         if (weight.dataType != fastllm::DataType::NVFP4_BLOCK_16 ||
@@ -486,6 +499,12 @@ extern "C" bool FastllmCudaTryMarlinHalfMatMulFloatNVFP4Block16(
 
     half *cudaBias = bias.dims.size() > 0 && !weight.extraCudaHalfData.empty()
         ? static_cast<half *>(weight.extraCudaHalfData[0]) : nullptr;
+    if (fastllm_native_prefill::Fp4(cudaInput, marlinWeight, marlinScales,
+            globalScale, cudaBias, cudaOutput, n, k, packedN, m, 0)) {
+        FastllmCudaFinishInput(input, cudaInput);
+        FastllmCudaFinishOutput(output, cudaOutput);
+        return true;
+    }
     if (Nvfp4PrefillCublas(prefill, cudaInput, marlinWeight, marlinScales,
             globalScale, cudaBias, cudaOutput, n, k, packedN, m)) {
         FastllmCudaFinishInput(input, cudaInput);
@@ -534,4 +553,35 @@ extern "C" bool FastllmCudaTryMarlinHalfMatMulFloatNVFP4Block16(
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
     return true;
+}
+
+namespace fastllm {
+bool FastllmCudaNativeNvfp4FusedCanRun(const Data &input,const Data &weight,const Data &bias,const Data &output,bool gate) {
+    if(weight.cudaNativeNvfp4Layout)return FastllmCudaNativeNvfp4LayoutFusedCanRun(input,weight,bias,output,gate);
+    if(!fastllm_native_prefill::Supported(4))return false;
+    if(weight.dims.size()!=2 || input.dims.empty() || output.dims.empty() || !bias.dims.empty() || !HasNvfp4MarlinOnDevice(weight))return false;
+    int n=weight.dims[0],k=weight.dims[1],width=gate?n/2:n;
+    if(n<=0 || k<=0)return false;
+    uint64_t rows=input.Count(0)/k;
+    if(rows>4096 || !fastllm_native_prefill::LinearPrefillEnabled(4, int(rows), n, k))return false;
+    if(rows<128 || rows>4096 || rows%128 || n%256 || k%64 || input.Count(0)!=rows*k || input.dims.back()!=k || output.dims.back()!=width || output.Count(0)!=rows*width)return false;
+    if(input.dataType!=DataType::FLOAT16 || output.dataType!=DataType::FLOAT16)return false;
+    int device=0;if(cudaGetDevice(&device)!=cudaSuccess)return false;
+    auto dense=[&](const Data &d,size_t align){
+        if(d.dataDevice!=DataDevice::CUDA || !d.cudaData || d.multiDeviceData || uintptr_t(d.cudaData)%align || d.strides.size()!=d.dims.size() || (!d.dataDeviceIds.empty() && (d.dataDeviceIds.size()!=1 || d.dataDeviceIds[0]!=device)))return false;
+        uint64_t stride=1;for(int i=int(d.dims.size())-1;i>=0;i--){if(d.dims[i]<=0 || d.strides[i]!=stride)return false;stride*=d.dims[i];}return true;
+    };
+    if(!dense(input,16) || !dense(weight,16) || !dense(output,4))return false;
+    auto overlap=[](const Data&a,const Data&b){auto ap=uintptr_t(a.cudaData),bp=uintptr_t(b.cudaData);return ap<bp+b.GetBytes() && bp<ap+a.GetBytes();};
+    return !overlap(input,weight) && !overlap(input,output) && !overlap(weight,output);
+}
+bool FastllmCudaNativeNvfp4Fused(Data &input,Data &weight,Data &output,bool gate) {
+    if(weight.cudaNativeNvfp4Layout)return FastllmCudaNativeNvfp4LayoutFused(input,weight,output,gate);
+    int n=weight.dims[0],k=weight.dims[1],device=0,sms=0,packedN=0;
+    if(!GetNvfp4MarlinPackedOutputDim(n,packedN) || cudaGetDevice(&device)!=cudaSuccess || cudaDeviceGetAttribute(&sms,cudaDevAttrMultiProcessorCount,device)!=cudaSuccess)return false;
+    int *workspace=nullptr;float *global=nullptr,*tmp=nullptr;
+    int rows=input.Count(0)/k;
+    if(!GetNvfp4MarlinTailPointers(weight,k,packedN,sms,rows,workspace,global,tmp))return false;
+    return fastllm_native_prefill::Fp4(static_cast<const half*>(input.cudaData),static_cast<const uint32_t*>(weight.cudaData),static_cast<const uint8_t*>(weight.cudaData)+size_t(packedN)*k/2,global,nullptr,static_cast<half*>(output.cudaData),rows,n,packedN,k,gate?1:2);
+}
 }

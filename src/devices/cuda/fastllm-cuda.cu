@@ -12,6 +12,7 @@
 #include "fastllm-cuda-mtp.cuh"
 #ifndef USE_ROCM
 #include "fastllm-cuda-ordered-reduce.cuh"
+#include "fastllm-rmsnorm-decode.cuh"
 #endif
 #include "fastllm.h"
 #include "utils/utils.h"
@@ -7831,6 +7832,48 @@ bool FastllmCudaCumSumDecayMaskNegMulCausal(
     return true;
 }
 
+#ifndef USE_ROCM
+// The existing generic kernels remain the fallback for all other shapes,
+// explicit thread-count overrides, alignments, and opt-out configurations.
+template <class T>
+static bool TryLaunchFastllmRMSNormDecode(const T *input, const float *weight, T *output,
+                                        int outer, int channels, float eps) {
+    if (outer != 1 || channels != 5120 ||
+        reinterpret_cast<uintptr_t>(input) % alignof(uint32_t) ||
+        reinterpret_cast<uintptr_t>(output) % alignof(uint32_t) ||
+        reinterpret_cast<uintptr_t>(weight) % alignof(float2)) {
+        return false;
+    }
+    const char *flag = std::getenv("FASTLLM_CUDA_RMSNORM_DECODE");
+    if (flag != nullptr && flag[0] != '\0' &&
+        !FastllmCudaEnvFlagEnabled("FASTLLM_CUDA_RMSNORM_DECODE")) {
+        return false;
+    }
+    // Query the actual specialization once per host thread/device/type. No tensor
+    // allocation or writes occur here, including during graph capture.
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        return false;
+    }
+    static thread_local std::map<int, bool> available;
+    auto it = available.find(device);
+    if (it == available.end()) {
+        cudaFuncAttributes attributes{};
+        cudaError_t status = cudaFuncGetAttributes(&attributes, fastllm::normdecode::Kernel<T>);
+        bool supported = status == cudaSuccess && attributes.maxThreadsPerBlock >= 512;
+        if (status != cudaSuccess) {
+            cudaGetLastError(); // Do not leave an unavailable-image error on the fallback path.
+        }
+        it = available.emplace(device, supported).first;
+    }
+    if (!it->second) {
+        return false;
+    }
+    fastllm::normdecode::Kernel<T><<<1, 512>>>(input, weight, output, eps);
+    return true;
+}
+#endif
+
 static bool LaunchFastllmRMSNormFloat16(
         const half *input, const float *weight, half *output,
         int outer, int channels, float eps, int threadCount) {
@@ -7849,6 +7892,11 @@ static bool LaunchFastllmRMSNormFloat16(
     if (threadCount != 0) {
         return false;
     }
+#ifndef USE_ROCM
+    if (TryLaunchFastllmRMSNormDecode(input, weight, output, outer, channels, eps)) {
+        return true;
+    }
+#endif
     if (channels < 512) {
         FastllmRMSNormKernelInner1<64><<<outer, 64>>>(
             (half*)input, (float*)weight, output, outer, channels, eps);
@@ -7906,6 +7954,11 @@ static bool LaunchFastllmRMSNormBFloat16(
     if (threadCount != 0) {
         return false;
     }
+#ifndef USE_ROCM
+    if (TryLaunchFastllmRMSNormDecode(input, weight, output, outer, channels, eps)) {
+        return true;
+    }
+#endif
     if (channels < 512) {
         FastllmRMSNormKernelInner1<64><<<outer, 64>>>(
             input, weight, output, outer, channels, eps);
@@ -9459,14 +9512,16 @@ __global__ __launch_bounds__(32) void FastllmRMSNormSiluMulHalf128CombinedGateEx
 // Fuse [batch, heads, paddedSeq, 128] -> [batch, seq, heads, 128]
 // with the exact output RMSNorm and z gate.  This avoids the temporary copy
 // required by an in-place head/sequence transpose.
-__global__ __launch_bounds__(32) void FastllmRMSNormSiluMulHalf128HeadMajorCombinedGateExactKernel(
+template<int Warps>
+__global__ __launch_bounds__(32*Warps) void FastllmRMSNormSiluMulHalf128HeadMajorCombinedGateExactKernel(
         const half *headMajorInput, const float *weight,
         const half *combinedGateInput, half *output,
         int seqLen, int paddedSeqLen,
-        int gateStride, int gateOffset, int gateHeads, float eps) {
+        int gateStride, int gateOffset, int gateHeads, float eps,int rows) {
     constexpr int CHANNELS = 128;
-    int row = blockIdx.x;
-    int lane = threadIdx.x;
+    int row = blockIdx.x*Warps+threadIdx.x/32;
+    if(row>=rows)return;
+    int lane = threadIdx.x&31;
     int token = row / gateHeads;
     int head = row - token * gateHeads;
     int batch = token / seqLen;
@@ -9735,14 +9790,26 @@ bool FastllmCudaRMSNormSiluMulFloat16HeadMajorCombinedGate(
         return false;
     }
 
-    FastllmRMSNormSiluMulHalf128HeadMajorCombinedGateExactKernel<<<(
-        int)outer64, 32>>>(
+    const char *multirowEnv = std::getenv("FASTLLM_CUDA_GDN_NORM_MULTIROW");
+    bool multirow = multirowEnv == nullptr || multirowEnv[0] == '\0' ||
+        FastllmCudaEnvFlagEnabled("FASTLLM_CUDA_GDN_NORM_MULTIROW");
+    if (multirow && outer64 >= 64) {
+        FastllmRMSNormSiluMulHalf128HeadMajorCombinedGateExactKernel<4><<<((int)outer64 + 3) / 4, 128>>>(
         (const half *)headMajorInput.cudaData,
         (const float *)weight.cudaData,
         (const half *)combinedGateInput.cudaData,
         (half *)output.cudaData,
         seqLen, paddedSeqLen,
-        gateStride, gateOffset, gateHeads, eps);
+        gateStride, gateOffset, gateHeads, eps, (int)outer64);
+    } else {
+        FastllmRMSNormSiluMulHalf128HeadMajorCombinedGateExactKernel<1><<<(int)outer64, 32>>>(
+        (const half *)headMajorInput.cudaData,
+        (const float *)weight.cudaData,
+        (const half *)combinedGateInput.cudaData,
+        (half *)output.cudaData,
+        seqLen, paddedSeqLen,
+        gateStride, gateOffset, gateHeads, eps, (int)outer64);
+    }
     checkCudaErrors(
         "Error: CUDA error in "
         "FastllmCudaRMSNormSiluMulFloat16HeadMajorCombinedGate.",
