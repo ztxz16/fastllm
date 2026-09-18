@@ -5919,6 +5919,16 @@ namespace fastllm {
         Data sharedGateUp, sharedHidden, sharedGate;
         auto runSharedExpert = [&](Data &sharedInput,
                                    Data &sharedResult) {
+#ifdef USE_CUDA
+            if (FastllmCudaQwen4SharedExpert(
+                    sharedInput,
+                    this->weight[mlp + "shared_expert.gateup_proj.weight"],
+                    this->weight[mlp + "shared_expert.down_proj.weight"],
+                    this->weight[mlp + "shared_expert_gate.weight"],
+                    sharedGateUp, sharedHidden, sharedGate, sharedResult)) {
+                return;
+            }
+#endif
             Linear(sharedInput,
                    this->weight[mlp +
                                 "shared_expert.gateup_proj.weight"],

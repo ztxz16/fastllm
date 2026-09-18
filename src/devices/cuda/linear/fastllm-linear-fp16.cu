@@ -768,8 +768,11 @@ __global__ void FastllmGemvFp16Fp16AddToNoBiasKernel2MultiRow(half *A, half *B, 
     __syncthreads();
 }
 
-template <int THREAD_PER_BLOCK, int PART, int FIXED_INPUT_SIZE = 0>
-__global__ void FastllmGemvFp32Fp16Kernel2MultiRow(float *A, half *B, float *C, float *bias, int m, int k) {
+template <int THREAD_PER_BLOCK, int PART, int FIXED_INPUT_SIZE = 0,
+          bool EXTRA_GATE = false>
+__global__ void FastllmGemvFp32Fp16Kernel2MultiRow(
+        float *A, half *B, float *C, float *bias, int m, int k,
+        const half *gateWeight = nullptr, float *gateOutput = nullptr) {
     __shared__ float sdata[PART][THREAD_PER_BLOCK];
     unsigned int tid = threadIdx.x;
     const half zero = __float2half_rn(0.0);
@@ -783,7 +786,8 @@ __global__ void FastllmGemvFp32Fp16Kernel2MultiRow(float *A, half *B, float *C, 
     for (int x = 0; x < PART; x++) sdata[x][tid] = 0;
         
     const int inputSize = FIXED_INPUT_SIZE > 0 ? FIXED_INPUT_SIZE : m;
-    const half *baseB = B + p * inputSize;
+    const half *baseB = EXTRA_GATE && p == k
+        ? gateWeight : B + (size_t)p * inputSize;
     if (FIXED_INPUT_SIZE > 0) {
 #pragma unroll
         for (int i = tid * 4; i + 3 < FIXED_INPUT_SIZE;
@@ -878,7 +882,13 @@ __global__ void FastllmGemvFp32Fp16Kernel2MultiRow(float *A, half *B, float *C, 
     }
 
     if (tid == 0) {
-        if (bias == nullptr) {
+        if (EXTRA_GATE && p == k) {
+#pragma unroll
+            for (int x = 0; x < PART; x++) {
+                const float projected = __fadd_rn(sdata[x][0], 0.0f);
+                gateOutput[x] = 1.0 / (1.0 + expf(-projected));
+            }
+        } else if (bias == nullptr) {
             for (int x = 0; x < PART; x++) C[p + k * x] = sdata[x][0];
         } else {
 #pragma unroll
@@ -1125,10 +1135,11 @@ void FastllmGemvFp32Fp16M320MultiRowWarpRowsKernel(
 // Companion specialization for M=640. Five virtual 32-lane groups represent
 // the 160 active lanes of the legacy CTA; zero-filled groups reproduce the
 // unused upper lanes in the 256-thread compensated reduction tree.
-template <int PART, int WARPS_PER_BLOCK = 8>
+template <int PART, int WARPS_PER_BLOCK = 8, bool GATED = false>
 __global__ __launch_bounds__(WARPS_PER_BLOCK * 32)
 void FastllmGemvFp32Fp16M640MultiRowWarpRowsKernel(
-        const float *A, const half *B, float *C, const float *bias, int k) {
+        const float *A, const half *B, float *C, const float *bias, int k,
+        const float *gate = nullptr) {
     constexpr int INPUT_SIZE = 640;
     constexpr int VALUES_PER_LOAD = 4;
     constexpr int VIRTUAL_LANES = 5;
@@ -1212,7 +1223,13 @@ void FastllmGemvFp32Fp16M640MultiRowWarpRowsKernel(
             bias == nullptr ? 0.0f : __ldg(bias + row);
 #pragma unroll
         for (int x = 0; x < PART; ++x) {
-            C[row + (size_t)k * x] = reduced[x] + biasValue;
+            const float projected = __fadd_rn(reduced[x], biasValue);
+            if (GATED) {
+                // Preserve the separate FP32 Linear and SigmoidMulTo rounding.
+                C[row + (size_t)k * x] = projected * gate[x];
+            } else {
+                C[row + (size_t)k * x] = projected;
+            }
         }
     }
 }
@@ -1291,6 +1308,76 @@ void LaunchFastllmGemmFp32Fp16(float *input, half *weight, float *output, float 
             }
             break;
     }
+}
+
+bool FastllmCudaQwen4SharedExpert(
+        const fastllm::Data &input, fastllm::Data &gateUpWeight,
+        fastllm::Data &downWeight, fastllm::Data &gateWeight,
+        fastllm::Data &gateUp, fastllm::Data &hidden,
+        fastllm::Data &gate, fastllm::Data &output) {
+    using namespace fastllm;
+    if (input.dataDevice != DataDevice::CUDA ||
+        input.dataType != DataType::FLOAT32 || input.multiDeviceData ||
+        input.dims.empty() || input.dims.back() != 2560 ||
+        gateUpWeight.dims != std::vector<int>({1280, 2560}) ||
+        downWeight.dims != std::vector<int>({2560, 640}) ||
+        gateWeight.dims != std::vector<int>({1, 2560})) {
+        return false;
+    }
+    // These workspaces hold FP32 projections and probabilities. Leave other
+    // output dtypes to the regular path rather than reuse a smaller allocation.
+    for (const Data *workspace : {&gateUp, &hidden, &gate, &output}) {
+        if (workspace->dataType != DataType::FLOAT32 || workspace->isFake ||
+            workspace->multiDeviceData) {
+            return false;
+        }
+    }
+    const int rows = input.Count(0) / 2560;
+    if (rows < 1 || rows > 7 || input.cudaData == nullptr) {
+        return false;
+    }
+    for (const Data *weight : {&gateUpWeight, &downWeight, &gateWeight}) {
+        if (weight->dataDevice != DataDevice::CUDA ||
+            weight->dataType != DataType::FLOAT16 || weight->multiDeviceData ||
+            weight->cudaData == nullptr ||
+            weight->dataDeviceIds != input.dataDeviceIds) {
+            return false;
+        }
+    }
+    Data *outputs[] = {&gateUp, &hidden, &gate, &output};
+    const int widths[] = {1280, 640, 1, 2560};
+    for (int i = 0; i < 4; ++i) {
+        outputs[i]->ToDevice(DataDevice::CUDA, input.dataDeviceIds, false);
+        auto dims = input.dims;
+        dims.back() = widths[i];
+        outputs[i]->Resize(dims);
+        outputs[i]->Allocate(false);
+    }
+#define LAUNCH_PROJECT(N) case N: \
+        FastllmGemvFp32Fp16Kernel2MultiRow<256, N, 2560, true> \
+            <<<1281, 256>>>((float *)input.cudaData, \
+                (half *)gateUpWeight.cudaData, (float *)gateUp.cudaData, \
+                nullptr, 2560, 1280, (half *)gateWeight.cudaData, \
+                (float *)gate.cudaData); break
+    switch (rows) {
+        LAUNCH_PROJECT(1); LAUNCH_PROJECT(2); LAUNCH_PROJECT(3);
+        LAUNCH_PROJECT(4); LAUNCH_PROJECT(5); LAUNCH_PROJECT(6);
+        LAUNCH_PROJECT(7);
+    }
+#undef LAUNCH_PROJECT
+    FastllmCudaSwiglu(gateUp, hidden);
+#define LAUNCH_DOWN(N) case N: \
+        FastllmGemvFp32Fp16M640MultiRowWarpRowsKernel<N, 8, true> \
+            <<<320, 256>>>((float *)hidden.cudaData, \
+                (half *)downWeight.cudaData, (float *)output.cudaData, \
+                nullptr, 2560, (float *)gate.cudaData); break
+    switch (rows) {
+        LAUNCH_DOWN(1); LAUNCH_DOWN(2); LAUNCH_DOWN(3);
+        LAUNCH_DOWN(4); LAUNCH_DOWN(5); LAUNCH_DOWN(6);
+        LAUNCH_DOWN(7);
+    }
+#undef LAUNCH_DOWN
+    return true;
 }
 
 bool FastllmCudaMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {

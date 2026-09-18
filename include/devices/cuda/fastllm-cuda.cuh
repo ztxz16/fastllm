@@ -2192,4 +2192,11 @@ extern __global__ void FastllmCudaBiasKernel(__nv_bfloat16* a, __nv_bfloat16* bi
 #endif
 #endif
 
+// Exact small-batch FP32 activation / FP16 weight shared expert fusion.
+bool FastllmCudaQwen4SharedExpert(
+    const fastllm::Data &input, fastllm::Data &gateUpWeight,
+    fastllm::Data &downWeight, fastllm::Data &gateWeight,
+    fastllm::Data &gateUp, fastllm::Data &hidden,
+    fastllm::Data &gate, fastllm::Data &output);
+
 #endif // FASTLLM_CUDA_CUH
