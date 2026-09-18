@@ -2880,21 +2880,6 @@ namespace fastllm {
     }
 
     namespace {
-        // 开关：FASTLLM_DSV41_CUDA_GRAPH=1/0 显式开关；未设置时跟随全局 FASTLLM_CUDA_GRAPH。
-        bool V41DecodeCudaGraphEnabled() {
-            static const int mode = []() -> int {
-                const char *env = std::getenv("FASTLLM_DSV41_CUDA_GRAPH");
-                if (env == nullptr || env[0] == '\0') {
-                    return -1;
-                }
-                return strcmp(env, "0") == 0 ? 0 : 1;
-            }();
-            if (mode >= 0) {
-                return mode != 0;
-            }
-            return GetFastllmEnv().cudaGraph;
-        }
-
         int V41DecodeCudaGraphWarmupRounds() {
             static const int rounds = []() -> int {
                 const char *env = std::getenv("FASTLLM_DSV41_CUDA_GRAPH_WARMUP");
@@ -3336,7 +3321,7 @@ namespace fastllm {
             // 按层切分不支持分段图；仅允许单卡或 multicuda 张量并行。
             (V41DeviceMapUsesMultiCuda(this->deviceMap) ||
              V41DeviceMapCudaDeviceCount(this->deviceMap) <= 1) &&
-            !V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH") && V41DecodeCudaGraphEnabled()) {
+            !V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH") && GetFastllmEnv().cudaGraph) {
             graphLock = std::unique_lock<std::mutex>(v41CudaGraphMutex, std::try_to_lock);
             if (graphLock.owns_lock()) {
                 graphState = V41GetCudaGraphState(v41CudaGraphSlots[seqlen]);

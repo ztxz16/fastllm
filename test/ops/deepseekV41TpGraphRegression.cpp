@@ -146,7 +146,6 @@ int main(int argc, char **argv) {
         const bool expertCache = argc == 3 && std::string(argv[2]) == "--expert-cache";
         if (argc != 2 && !expertCache)
             throw std::runtime_error("usage: deepseekV41TpGraphRegression FIXTURE_DIR [--expert-cache]");
-        unsetenv("FASTLLM_DSV41_CUDA_GRAPH");
         setenv("FASTLLM_DSV41_DISABLE_SHARED_OVERLAP", "1", 1);
         SetCudaGraph(false);
         SetThreads(2);

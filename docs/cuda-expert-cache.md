@@ -122,7 +122,7 @@ TP single-token decode and single-request DSpark verification with 2–8 rows
 also support the hybrid cache, including segmented CUDA Graph execution:
 
 ```sh
-FT_NUMAS=1 FASTLLM_DSV41_CUDA_GRAPH=1 numactl -C 0-31 -m 0 \
+FT_NUMAS=1 FASTLLM_CUDA_GRAPH=1 numactl -C 0-31 -m 0 \
   ftllm server /path/to/DeepSeek-V4.1-Flash \
   --tp 2 --moe_device numa --threads 30 \
   --moe_cuda_cache 8g --dspark 5

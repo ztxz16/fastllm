@@ -167,7 +167,7 @@ DSpark 默认每 32 轮校验打印位置接受率，无需设置 `FASTLLM_DSPAR
 CPU 专家占比，应在相同配置下分别测量 decode 与首 token 延迟。
 
 ```bash
-FASTLLM_DSV41_CUDA_GRAPH=1 ftllm server /path/to/DeepSeek-V4.1-Flash \
+FASTLLM_CUDA_GRAPH=1 ftllm server /path/to/DeepSeek-V4.1-Flash \
   --tp 2 --moe_device numa --cuda_shared_expert true --dtype float16
 ```
 
@@ -300,7 +300,7 @@ verify 始终计算全部候选位置。单 token decode 和 CUDA Graph 的执�
 ## decode 与 DSpark 校验的 CUDA Graph
 
 ```bash
-FASTLLM_DSV41_CUDA_GRAPH=1 ftllm server /path/to/DeepSeek-V4.1-Flash --device cuda --moe_device numa
+FASTLLM_CUDA_GRAPH=1 ftllm server /path/to/DeepSeek-V4.1-Flash --device cuda --moe_device numa
 ```
 
 把 decode 和 DSpark 校验里与位置无关的那部分 GPU 计算捕获成 CUDA Graph，按 token 数分别缓存，减少
@@ -311,7 +311,7 @@ kernel launch。**单卡有收益（省下每步上千次 launch），TP 下收�
 
 | 变量 | 默认 | 作用 |
 | --- | --- | --- |
-| `FASTLLM_DSV41_CUDA_GRAPH` | 跟随 `FASTLLM_CUDA_GRAPH` | `1` 开、`0` 关。不设置时跟随全局开关 |
+| `FASTLLM_CUDA_GRAPH` | 关 | 统一控制 decode 与 DSpark 校验的 CUDA Graph，`1` 开、`0` 关 |
 | `FASTLLM_DSV41_CUDA_GRAPH_WARMUP` | 2 | 捕获前的预热轮数（让显存池、权重量化缓存达到稳态） |
 | `FASTLLM_DSV41_CUDA_GRAPH_DEBUG` | 关 | 打印捕获 / 首次重放的 token 数，以及失效 / 关闭事件 |
 | `FASTLLM_DSV41_CUDA_GRAPH_REPLAY_MASK` | 15 | 排查用：按位选择回放哪几种段（bit0 pre / bit1 post / bit2 route / bit3 sharedExpert），其余走逐算子 |
@@ -369,6 +369,10 @@ DSpark 校验按本轮 token 数（已确定的一个 token 加候选数）各�
 置信度截断或剩余输出长度变化时复用对应形状。目标层特征采集、KV 更新、回滚和草稿层仍在图外。
 批量 decode（`batch > 1`）和普通多 token prefill 不走图。
 
+按层切分请保持 `FASTLLM_CUDA_GRAPH=0`（默认值）。全局开关为 `1` 时还会隐式启用
+CUDA embedding，即使当前布局不捕获图也会生效。DSpark 的主模型与草稿使用不同 GPU 时，
+共享 embedding 权重会随两条路径的切换反复跨卡搬运，造成明显降速。
+
 ### 失效与回退
 
 - 整个模型按 token 数共用图与常驻工作区（不碰任何请求私有的缓存），
@@ -398,7 +402,8 @@ logits 的 `max|diff|` / `cos` 与关图逐位相同——图没有改变任何�
 
 ### 真实权重上的实测（DeepSeek-V4.1-Flash，单卡 3090 Ti + `--moe_device numa` + `--kv_cache_dtype fp4_e2m1`）
 
-同一棵代码树、同一份配置，只切 `FASTLLM_DSV41_CUDA_GRAPH`：
+以下为统一开关前的历史实测：同一棵代码树、同一份配置，只切换当时 V4.1 的分段图开关。
+全局开关还会影响 CUDA embedding，因此此表不能视为当前全局开关的直接对照结果。
 
 | | 关图 | 开图 |
 | --- | --- | --- |
@@ -420,7 +425,8 @@ GPU 侧只有 25–30 ms，而逐算子的 launch 是异步下发的、正好被
 ## 按层切分（推荐的多卡方案，已在真实权重上验证）
 
 ```bash
-ftllm server /path/to/DeepSeek-V4.1-Flash --device "{'cuda:0':1,'cuda:1':1}" --moe_device numa
+FASTLLM_CUDA_GRAPH=0 ftllm server /path/to/DeepSeek-V4.1-Flash \
+  --device "{'cuda:0':1,'cuda:1':1}" --moe_device numa
 ```
 
 用普通的 device map 就能把层平均分到两张卡上（`SelectDeviceFromMap` 按权重划分层区间），
@@ -1128,7 +1134,7 @@ eager / Graph 切换和共享专家重叠，以及 DSpark 的 1～6 token 图重
 | `FASTLLM_DSV41_DUMP_DIR` | 把每层中间张量写到该目录（对齐调试） |
 | `FASTLLM_DSV41_DISABLE_TP_ATTENTION` | 张量并行时不切分注意力 head（排查用，注意力改为每卡各算一份） |
 | `FASTLLM_DSV41_DISABLE_TP_SHARED_EXPERT` | 张量并行时不切分共享专家（排查用） |
-| `FASTLLM_DSV41_CUDA_GRAPH` 等 | decode 与 DSpark 校验的 CUDA Graph，见对应章节 |
+| `FASTLLM_CUDA_GRAPH` 等 | decode 与 DSpark 校验的 CUDA Graph，见对应章节 |
 | `FASTLLM_TRACE_OPS` | 逐算子打印"算子名 / 落在哪个设备 / 权重名"（排查 TP 落点用） |
 | `FASTLLM_DSV41_DISABLE_PREFIX_CACHE` 等 | 前缀缓存相关，见"多请求与前缀缓存" |
 | `FASTLLM_DSPARK_*` | DSpark 投机解码相关，见"DSpark 投机解码" |
