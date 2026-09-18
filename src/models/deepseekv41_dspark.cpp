@@ -178,7 +178,7 @@ namespace fastllm {
         }
 
         // ---------------- 接受率与分段计时 ----------------
-        // FASTLLM_DSPARK_STATS 默认 1，仅打印逐位置接受率；=0 关闭，=2 打印详细统计及逐轮耗时。
+        // FASTLLM_DSPARK_STATS 默认 1，打印总体及逐位置接受率；=0 关闭，=2 打印详细统计及逐轮耗时。
         // FASTLLM_DSPARK_STATS_EVERY=N 控制中途汇总的频率（默认 32，0 表示只在退出时打印）。
         //
         // 草稿阶段（三个草稿层 + markov head + confidence head）与校验阶段分开计时。
@@ -411,7 +411,9 @@ namespace fastllm {
                     return;
                 }
                 if (level == 1) {
-                    printf("[DeepSeek-V4.1 DSpark] pos_accept_rate=[");
+                    printf("[DeepSeek-V4.1 DSpark] accept_rate=%.2f%% (%llu/%llu), pos_accept_rate=[",
+                           s.proposed > 0 ? 100.0 * (double)s.accepted / (double)s.proposed : 0.0,
+                           (unsigned long long)s.accepted, (unsigned long long)s.proposed);
                     for (int i = 0; i < blockSize; ++i) {
                         uint64_t attempts = 0, accepts = 0;
                         for (int j = i + 1; j <= blockSize; ++j) {

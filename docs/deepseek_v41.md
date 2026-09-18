@@ -121,7 +121,7 @@ CPU / NUMA 专家使用 FastLLM 自有线程池，由 `--threads` 控制；CLI �
 可从上述命令中省略。Tokenizer 的 Python 依赖可能加载带 OpenMP / MKL 的 PyTorch，但不承担模型前向。
 NumPy 会加载 OpenBLAS，建议保留 `OPENBLAS_NUM_THREADS=1` 以免建立额外的大线程池。
 前缀缓存默认未禁用，无需 `FASTLLM_DSV41_DISABLE_PREFIX_CACHE=0`；`FASTLLM_DSV41_PREFIX_CACHE_DEBUG` 仅用于诊断。
-DSpark 默认每 32 轮校验打印位置接受率，无需设置 `FASTLLM_DSPARK_STATS` / `FASTLLM_DSPARK_STATS_EVERY`。
+DSpark 默认每 32 轮校验打印总体及逐位置接受率，无需设置 `FASTLLM_DSPARK_STATS` / `FASTLLM_DSPARK_STATS_EVERY`。
 `FT_NUMAS` 按部署需要设置；Engram 表的存放方式使用 `--ngram_device cpu|disk` 控制。
 
 ### 实测（DeepSeek-V4.1-Flash 真实权重，2026-09-12）
@@ -778,12 +778,17 @@ token：第一个立刻返回，其余进入请求的待发队列，调度器之
 
 ### 接受率与分段计时
 
-默认开启位置接受率统计，每累计 32 轮校验打印一次（仍跳过前 3 轮预热），等同于
-`FASTLLM_DSPARK_STATS=1 FASTLLM_DSPARK_STATS_EVERY=32`。格式与 Qwen3.5 相同：
+默认开启总体及逐位置接受率统计，每累计 32 轮校验打印一次（仍跳过前 3 轮预热），等同于
+`FASTLLM_DSPARK_STATS=1 FASTLLM_DSPARK_STATS_EVERY=32`：
 
 ```text
-[DeepSeek-V4.1 DSpark] pos_accept_rate=[90.00%, 80.00%, 70.00%, 60.00%, 50.00%].
+[DeepSeek-V4.1 DSpark] accept_rate=70.00% (350/500), pos_accept_rate=[90.00%, 80.00%, 70.00%, 60.00%, 50.00%].
 ```
+
+`accept_rate` 为累计接受的候选数除以实际送检的候选数，不包含被置信度阈值提前筛掉的候选。
+
+服务还会在每次 prefill 完成时打印 `[Prompt]` 日志，包含实际计算的 token 数、耗时和 tokens/s；
+分块 prefill 额外打印每块的进度和速度。历史缓存命中的 token 不计入 prefill 吞吐，prefill 耗时也不计入后续的 `[Decode]` 速度。
 
 设置 `FASTLLM_DSPARK_STATS=0` 可关闭统计；需要排查耗时时，设为 `2` 打印逐轮和分段统计：
 
@@ -843,7 +848,7 @@ CUDA 上因此走一个把整条链留在设备上的融合 kernel（token 一�
 | --- | --- |
 | `FASTLLM_DSPARK_TOKENS` | 每轮校验的候选数（由 `--dspark` / `--draft_tokens` 设置，不要直接设） |
 | `FASTLLM_DSPARK_CONFIDENCE_THRESHOLD` | 置信度低于该值的候选之后不再校验；0 表示总是用满 block |
-| `FASTLLM_DSPARK_STATS` | 默认 `1`，仅打印逐位置接受率；`0` 关闭，`2` 打印详细分段耗时与逐轮记录。见上文"接受率与分段计时" |
+| `FASTLLM_DSPARK_STATS` | 默认 `1`，打印总体及逐位置接受率；`0` 关闭，`2` 打印详细分段耗时与逐轮记录。见上文"接受率与分段计时" |
 | `FASTLLM_DSPARK_STATS_EVERY` | 每累计 N 轮校验打印一次（默认 32，0 表示只在退出时打印） |
 | `FASTLLM_DSPARK_STATS_WARMUP` | 统计前跳过的轮数（默认 3）。第一次 decode 含 CUDA context / 显存池 / 权重量化缓存的一次性开销，会把均值拉偏 |
 | `FASTLLM_DSPARK_DISABLE_FUSED_MARKOV` | 关掉 markov head 的融合 kernel，退回通用算子（对拍 / 排查用；两条路径输出逐 bit 一致） |
