@@ -20205,12 +20205,10 @@ namespace fastllm {
         int singleScratchScopeToken = 0;
         std::unique_ptr<int, decltype(releaseSingleScratch)> singleScratchScope(
             &singleScratchScopeToken, releaseSingleScratch);
+        // Keep one committed prefix plus the base metadata for rollback.
         std::vector<std::pair<Data*, Data*> > validationPastKeyValues(block_cnt);
         std::vector<CacheMeta> baseKeyMetas(block_cnt), baseValueMetas(block_cnt);
-        std::vector<std::vector<CacheMeta> > prefixKeyMetas(
-            seqLen + 1, std::vector<CacheMeta>(block_cnt));
-        std::vector<std::vector<CacheMeta> > prefixValueMetas(
-            seqLen + 1, std::vector<CacheMeta>(block_cnt));
+        std::vector<CacheMeta> committedKeyMetas(block_cnt), committedValueMetas(block_cnt);
         auto releaseValidationPagedViews = [&](const std::vector<CacheMeta> &keepKeyMetas,
                                                const std::vector<CacheMeta> &keepValueMetas) {
             for (int i = 0; i < block_cnt; i++) {
@@ -20231,16 +20229,15 @@ namespace fastllm {
         };
         std::vector<uint8_t> singleKeyUsesPrefix(block_cnt, 0);
         std::vector<uint8_t> singleValueUsesPrefix(block_cnt, 0);
-        int singleCleanupPrefixTokens = 0;
         auto cleanupSingleValidationPaged = [&]() {
             for (int i = 0; i < block_cnt; i++) {
                 if (!isAttentionLayerAt(i)) {
                     continue;
                 }
                 const CacheMeta &keepKey = singleKeyUsesPrefix[i] ?
-                    prefixKeyMetas[singleCleanupPrefixTokens][i] : baseKeyMetas[i];
+                    committedKeyMetas[i] : baseKeyMetas[i];
                 const CacheMeta &keepValue = singleValueUsesPrefix[i] ?
-                    prefixValueMetas[singleCleanupPrefixTokens][i] : baseValueMetas[i];
+                    committedValueMetas[i] : baseValueMetas[i];
                 releaseUncommittedPagedPages(validationPastStorage[i].first, keepKey);
                 releaseUncommittedPagedPages(validationPastStorage[i].second, keepValue);
             }
@@ -20336,8 +20333,6 @@ namespace fastllm {
             eraseDraftCache();
             throw;
         }
-        prefixKeyMetas[0] = baseKeyMetas;
-        prefixValueMetas[0] = baseValueMetas;
         mtpProfileMark(mtpProfileCachePrepUs);
         try {
             speculativeCaptureFirstTokenLinearState = true;
@@ -20380,6 +20375,12 @@ namespace fastllm {
             eraseDraftCache();
             return false;
         }
+        // Acceptance is already known from the verifier. Only the selected
+        // prefix can be committed (including by the partial-commit cleanup).
+        // Keep base metadata intact until every selected prefix is validated.
+        const int draftTokenCount = seqLen - 1;
+        const int matchedDrafts = countAcceptedDrafts(targetRet, draftTokenCount);
+        const int commitLen = matchedDrafts == draftTokenCount ? seqLen : matchedDrafts + 1;
         bool prefixMetaOk = true;
         std::string prefixMetaError;
         try {
@@ -20387,22 +20388,15 @@ namespace fastllm {
                 if (!isAttentionLayerAt(i)) {
                     continue;
                 }
-                for (int tokens = 1; tokens <= seqLen; tokens++) {
-                    if (!tryPrefixTokenMetaFromTemp(baseKeyMetas[i],
-                                                    validationPastStorage[i].first,
-                                                    tokens,
-                                                    prefixKeyMetas[tokens][i],
-                                                    &prefixMetaError) ||
-                        !tryPrefixTokenMetaFromTemp(baseValueMetas[i],
-                                                    validationPastStorage[i].second,
-                                                    tokens,
-                                                    prefixValueMetas[tokens][i],
-                                                    &prefixMetaError)) {
-                        prefixMetaOk = false;
-                        break;
-                    }
-                }
-                if (!prefixMetaOk) {
+                if (!tryPrefixTokenMetaFromTemp(baseKeyMetas[i],
+                                                validationPastStorage[i].first,
+                                                commitLen, committedKeyMetas[i],
+                                                &prefixMetaError) ||
+                    !tryPrefixTokenMetaFromTemp(baseValueMetas[i],
+                                                validationPastStorage[i].second,
+                                                commitLen, committedValueMetas[i],
+                                                &prefixMetaError)) {
+                    prefixMetaOk = false;
                     break;
                 }
             }
@@ -20443,11 +20437,11 @@ namespace fastllm {
             }
             return true;
         };
-        auto commitValidationCachePrefix = [&](int tokens) {
-            AssertInFastLLM(tokens > 0 && tokens <= seqLen,
+        auto commitValidationCachePrefix = [&]() {
+            AssertInFastLLM(commitLen > 0 && commitLen <= seqLen,
                             "Qwen3.5 MTP validation got invalid commit prefix.\n");
-            bool useValidationLinearFinal = tokens == seqLen;
-            int slot = tokens - 1;
+            bool useValidationLinearFinal = commitLen == seqLen;
+            int slot = commitLen - 1;
             std::vector<void*> copyDsts;
             std::vector<const void*> copySrcs;
             std::vector<size_t> copySizes;
@@ -20469,9 +20463,9 @@ namespace fastllm {
             };
             for (int i = 0; i < block_cnt; i++) {
                 if (isAttentionLayerAt(i)) {
-                    restoreMeta(*pastKeyValues[i].first, prefixKeyMetas[tokens][i]);
+                    restoreMeta(*pastKeyValues[i].first, committedKeyMetas[i]);
                     singleKeyUsesPrefix[i] = 1;
-                    restoreMeta(*pastKeyValues[i].second, prefixValueMetas[tokens][i]);
+                    restoreMeta(*pastKeyValues[i].second, committedValueMetas[i]);
                     singleValueUsesPrefix[i] = 1;
                 } else if (useValidationLinearFinal) {
                     commitLinearState(*pastKeyValues[i].first,
@@ -20494,10 +20488,8 @@ namespace fastllm {
                     FastllmCudaCopyFromDeviceToDevice(copyDsts[j], const_cast<void*>(copySrcs[j]), copySizes[j]);
                 }
             }
-            releaseValidationPagedViews(prefixKeyMetas[tokens], prefixValueMetas[tokens]);
+            releaseValidationPagedViews(committedKeyMetas, committedValueMetas);
         };
-        int draftTokenCount = seqLen - 1;
-        int matchedDrafts = countAcceptedDrafts(targetRet, draftTokenCount);
         for (int i = 0; i < draftTokenCount && i < QWEN35_MTP_MAX_DRAFTS; i++) {
             mtpDraftPositionAttempts[i].fetch_add(1, std::memory_order_relaxed);
             if (matchedDrafts > i) {
@@ -20505,12 +20497,10 @@ namespace fastllm {
             }
         }
         mtpProfileMark(mtpProfileMatchUs);
-        int commitLen = matchedDrafts == draftTokenCount ? seqLen : matchedDrafts + 1;
         std::vector<int> committedRet = buildCommittedTokens(
             targetRet, draftTokenCount, matchedDrafts);
         if (matchedDrafts == draftTokenCount) {
-            singleCleanupPrefixTokens = seqLen;
-            commitValidationCachePrefix(seqLen);
+            commitValidationCachePrefix();
             mtpProfileMark(mtpProfileCommitUs);
             std::vector<int> mtpInputTokens;
             mtpInputTokens.reserve(seqLen);
@@ -20566,8 +20556,7 @@ namespace fastllm {
                 replayOldCaptureFirstTokenLinearState;
             mtpProfileMark(mtpProfileRetryUs);
         } else {
-            singleCleanupPrefixTokens = commitLen;
-            commitValidationCachePrefix(commitLen);
+            commitValidationCachePrefix();
             mtpProfileMark(mtpProfileRollbackUs);
         }
         Data hiddenForMtp;
