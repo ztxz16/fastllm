@@ -26377,6 +26377,13 @@ namespace fastllm {
         input.CopyFrom(rotated);
     }
 
+    void Qwen3_5Model::EncodeImages(const std::vector <Data*> &rawInputs,
+                                    const Data *gridThwData,
+                                    Data &features,
+                                    std::vector<std::vector<int>> &gridThwList) {
+        EncodeVisualItems(rawInputs, gridThwData, false, features, gridThwList, nullptr);
+    }
+
     void Qwen3_5Model::EncodeVisualItems(const std::vector <Data*> &rawInputs,
                                          const Data *gridThwData,
                                          bool isVideo,
@@ -33180,6 +33187,54 @@ namespace fastllm {
             imageEmbeds = imageFeatures.dims.empty() ? nullptr : &imageFeatures;
             videoEmbeds = videoFeatures.dims.empty() ? nullptr : &videoFeatures;
         } else {
+            bool missingPositionData =
+                mmTypeIt == multimodalInput.end() || mmTypeIt->second.empty() ||
+                mropeIt == multimodalInput.end() || mropeIt->second.empty();
+            if (missingPositionData &&
+                imageGridIt != multimodalInput.end() && !imageGridIt->second.empty()) {
+                // EPD consumer 路径：encoder 实例已算好 image_embeds，
+                // 这里用 image_grid_thw 补算 mm_token_type_ids / mrope_position_ids / mrope_position_delta
+                Data gridCpu(*imageGridIt->second[0]);
+                gridCpu.ToDevice(DataDevice::CPU);
+                AssertInFastLLM(gridCpu.dims.size() == 2 && gridCpu.dims[1] == 3,
+                                "Qwen3.5 grid_thw should have shape [count, 3].");
+                AssertInFastLLM(gridCpu.dataType == DataType::FLOAT32 ||
+                                gridCpu.dataType == DataType::INT32 ||
+                                gridCpu.dataType == DataType::INT32PARAM,
+                                "Qwen3.5 grid_thw should use float32 or int32 values.");
+                for (int i = 0; i < gridCpu.dims[0]; i++) {
+                    std::vector<int> grid(3);
+                    for (int j = 0; j < 3; j++) {
+                        if (gridCpu.dataType == DataType::FLOAT32) {
+                            grid[j] = (int) ((float*) gridCpu.cpuData)[i * 3 + j];
+                        } else {
+                            grid[j] = ((int*) gridCpu.cpuData)[i * 3 + j];
+                        }
+                    }
+                    imageGridThwList.push_back(grid);
+                }
+
+                Data computedMmTokenTypeIds, computedMropePositionIds, computedMropePositionDelta;
+                BuildMultimodalPositionData(
+                    inputIds,
+                    imageGridThwList,
+                    videoGridThwList,
+                    computedMmTokenTypeIds,
+                    computedMropePositionIds,
+                    computedMropePositionDelta
+                );
+
+                mutableMultimodalInput["mm_token_type_ids"].clear();
+                mutableMultimodalInput["mrope_position_ids"].clear();
+                mutableMultimodalInput["mrope_position_delta"].clear();
+                mutableMultimodalInput["mm_token_type_ids"].push_back(new Data(computedMmTokenTypeIds));
+                mutableMultimodalInput["mrope_position_ids"].push_back(new Data(computedMropePositionIds));
+                mutableMultimodalInput["mrope_position_delta"].push_back(new Data(computedMropePositionDelta));
+
+                mmTypeIt = mutableMultimodalInput.find("mm_token_type_ids");
+                mropeIt = mutableMultimodalInput.find("mrope_position_ids");
+            }
+
             AssertInFastLLM(mmTypeIt != multimodalInput.end() && !mmTypeIt->second.empty(),
                             "Qwen3.5 multimodal requires mm_token_type_ids.");
             AssertInFastLLM(mropeIt != multimodalInput.end() && !mropeIt->second.empty(),

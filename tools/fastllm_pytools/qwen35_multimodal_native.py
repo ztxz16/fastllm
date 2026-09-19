@@ -3,6 +3,8 @@ import inspect
 import json
 import math
 import os
+import shutil
+import tempfile
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -770,6 +772,23 @@ def _append_payload_tensor(
     return current_offset + int(payload_array.nbytes)
 
 
+def compute_qwen35_image_cache_digest(
+    image_array: np.ndarray,
+    grid_thw: Any,
+    multimodal_config: Dict[str, Any],
+) -> bytes:
+    image_array = np.ascontiguousarray(image_array, dtype=np.float32)
+    metadata = {
+        "version": 1,
+        "shape": list(image_array.shape),
+        "grid": np.asarray(grid_thw).tolist(),
+        "processor": multimodal_config or {},
+    }
+    digest = hashlib.sha256(json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode())
+    digest.update(memoryview(image_array).cast("B"))
+    return digest.digest()
+
+
 def build_qwen35_multimodal_payload(
     native_inputs: Dict[str, Any],
     tokenizer,
@@ -812,15 +831,12 @@ def build_qwen35_multimodal_payload(
     for image_index, image_array in enumerate(native_inputs.get("image_arrays", [])):
         image_array = np.ascontiguousarray(image_array, dtype=np.float32)
         if cache_enabled:
-            metadata = {
-                "version": 1,
-                "shape": list(image_array.shape),
-                "grid": native_inputs["image_grid_thw"][image_index].tolist(),
-                "processor": native_inputs.get("multimodal_config", {}),
-            }
-            digest = hashlib.sha256(json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode())
-            digest.update(memoryview(image_array).cast("B"))
-            image_cache_keys.append(np.frombuffer(digest.digest(), dtype=np.int32))
+            digest = compute_qwen35_image_cache_digest(
+                image_array,
+                native_inputs["image_grid_thw"][image_index],
+                native_inputs.get("multimodal_config", {}),
+            )
+            image_cache_keys.append(np.frombuffer(digest, dtype=np.int32))
         offset = _append_payload_tensor(arrays, descriptors, "image_frames", image_array, np.float32, offset)
 
     if image_cache_keys:
@@ -839,5 +855,203 @@ def build_qwen35_multimodal_payload(
         "vision_start_token_id": vision_start_token_id,
         "vision_end_token_id": vision_end_token_id,
         "tensors": descriptors,
+    }
+    return payload_config, payload
+
+
+# ---------------------------------------------------------------------------
+# EPD（Encode 独立部署）共享缓存：encoder 实例写、consumer 实例读。
+# 目录布局：<cache_dir>/<sha256hex>/embeddings.fp16 + meta.json
+# 缓存键与进程内 ImageEmbeddingCache 同源（compute_qwen35_image_cache_digest），
+# 两侧只要跑同一套预处理，键就天然一致。
+# ---------------------------------------------------------------------------
+
+EPD_EMBEDS_FILENAME = "embeddings.fp16"
+EPD_META_FILENAME = "meta.json"
+
+
+def qwen35_epd_model_scope(
+    model_dir: str,
+    model_config: Optional[Dict[str, Any]] = None,
+) -> str:
+    """模型指纹：EPD 缓存按 <cache_dir>/<scope>/<key> 布局，换模型自动隔离，
+    避免跨模型读到错误 embeddings。config 含 quantization_config 可区分量化了
+    同一底模的不同版本；shard 文件大小可区分同配置的不同权重（如微调）。"""
+    try:
+        config = model_config or _load_json(os.path.join(model_dir, "config.json"))
+        shards = sorted(
+            (name, os.path.getsize(os.path.join(model_dir, name)))
+            for name in os.listdir(model_dir)
+            if name.endswith(".safetensors")
+        )
+        payload = {"config": config, "shards": shards}
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()[:16]
+    except Exception:
+        return ""
+
+
+def qwen35_epd_scoped_cache_dir(
+    cache_dir: str,
+    model_dir: str,
+    model_config: Optional[Dict[str, Any]] = None,
+) -> str:
+    scope = qwen35_epd_model_scope(model_dir, model_config)
+    return os.path.join(cache_dir, scope) if scope else cache_dir
+
+
+
+def write_qwen35_epd_entries(
+    cache_dir: str,
+    image_arrays: Sequence[np.ndarray],
+    image_grid_thw: np.ndarray,
+    multimodal_config: Dict[str, Any],
+    features: np.ndarray,
+) -> List[str]:
+    """把 encoder 输出的按序拼接 features（fp32 [total_tokens, hidden]）逐图切分，
+    以 fp16 原子写入 EPD 缓存目录，返回每张图对应的 cache key（与 features 顺序一致）。"""
+    merge_size = int(multimodal_config.get("merge_size", 2))
+    image_grid_thw = np.asarray(image_grid_thw)
+    entries = []
+    offset = 0
+    for index, image_array in enumerate(image_arrays):
+        grid = [int(v) for v in image_grid_thw[index]]
+        token_count = grid[0] * (grid[1] // merge_size) * (grid[2] // merge_size)
+        part = features[offset:offset + token_count]
+        if part.shape[0] != token_count:
+            raise ValueError(
+                f"EPD features size mismatch at image {index}: "
+                f"need {token_count} tokens, only {features.shape[0] - offset} left."
+            )
+        offset += token_count
+        key = compute_qwen35_image_cache_digest(
+            image_array, image_grid_thw[index], multimodal_config
+        ).hex()
+        entries.append((key, grid, token_count, part))
+    if offset != int(features.shape[0]):
+        raise ValueError(
+            f"EPD features trailing data: consumed {offset}, total {features.shape[0]}."
+        )
+
+    os.makedirs(cache_dir, exist_ok=True)
+    keys = []
+    for key, grid, token_count, part in entries:
+        target_dir = os.path.join(cache_dir, key)
+        if os.path.isfile(os.path.join(target_dir, EPD_EMBEDS_FILENAME)) and os.path.isfile(
+            os.path.join(target_dir, EPD_META_FILENAME)
+        ):
+            keys.append(key)
+            continue
+        tmp_dir = tempfile.mkdtemp(prefix=".epd-tmp-", dir=cache_dir)
+        try:
+            part.astype(np.float16).tofile(os.path.join(tmp_dir, EPD_EMBEDS_FILENAME))
+            meta = {
+                "version": 1,
+                "grid_thw": grid,
+                "tokens": int(token_count),
+                "hidden": int(part.shape[1]),
+                "dtype": "float16",
+            }
+            with open(os.path.join(tmp_dir, EPD_META_FILENAME), "w", encoding="utf-8") as f:
+                json.dump(meta, f)
+            try:
+                os.replace(tmp_dir, target_dir)
+            except OSError:
+                # 并发请求已发布同键条目，保留先到者
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+        finally:
+            if os.path.isdir(tmp_dir):
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+        keys.append(key)
+    return keys
+
+
+def try_build_qwen35_epd_payload(
+    native_inputs: Dict[str, Any],
+    cache_dir: str,
+    tokenizer=None,
+    model_config: Optional[Dict[str, Any]] = None,
+    tokenizer_config: Optional[Dict[str, Any]] = None,
+) -> Optional[Tuple[Dict[str, Any], bytes]]:
+    """consumer 侧：若 native_inputs 里的图片全部命中 EPD 缓存，则构造
+    image_embeds + image_grid_thw 形式的 payload（不含 image_frames，C++ 跳过 ViT）；
+    否则返回 None（调用方回退到原始 raw 路径，consumer 自跑 ViT）。"""
+    image_arrays = list(native_inputs.get("image_arrays") or [])
+    if not image_arrays:
+        return None
+    if native_inputs.get("video_arrays"):
+        return None
+    image_grid_thw = native_inputs.get("image_grid_thw")
+    if image_grid_thw is None or len(image_grid_thw) != len(image_arrays):
+        return None
+
+    merge_size = int(native_inputs.get("multimodal_config", {}).get("merge_size", 2))
+    embed_parts: List[np.ndarray] = []
+    hidden_size: Optional[int] = None
+    for image_index, image_array in enumerate(image_arrays):
+        grid = [int(v) for v in image_grid_thw[image_index]]
+        key = compute_qwen35_image_cache_digest(
+            image_array, image_grid_thw[image_index], native_inputs.get("multimodal_config", {})
+        ).hex()
+        embeds_path = os.path.join(cache_dir, key, EPD_EMBEDS_FILENAME)
+        meta_path = os.path.join(cache_dir, key, EPD_META_FILENAME)
+        if not (os.path.isfile(embeds_path) and os.path.isfile(meta_path)):
+            return None
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            tokens = int(meta["tokens"])
+            hidden = int(meta["hidden"])
+            meta_grid = [int(v) for v in meta["grid_thw"]]
+        except Exception:
+            return None
+        expected_tokens = grid[0] * (grid[1] // merge_size) * (grid[2] // merge_size)
+        if tokens != expected_tokens or meta_grid != grid:
+            return None
+        if hidden_size is None:
+            hidden_size = hidden
+        elif hidden_size != hidden:
+            return None
+        try:
+            part = np.fromfile(embeds_path, dtype=np.float16)
+        except Exception:
+            return None
+        if part.size != tokens * hidden:
+            return None
+        embed_parts.append(part.reshape(tokens, hidden))
+
+    if hidden_size is None:
+        return None
+    image_embeds = np.concatenate(embed_parts, axis=0).reshape(1, -1, hidden_size)
+
+    arrays: List[np.ndarray] = []
+    descriptors: List[Dict[str, Any]] = []
+    offset = 0
+    offset = _append_payload_tensor(arrays, descriptors, "image_grid_thw", image_grid_thw, np.int32, offset)
+    offset = _append_payload_tensor(arrays, descriptors, "image_embeds", image_embeds, np.float16, offset)
+
+    payload = b"".join(array.tobytes(order="C") for array in arrays)
+    tokenizer_config = tokenizer_config or native_inputs.get("tokenizer_config") or {}
+    payload_config = {
+        "mode": "qwen35",
+        "image_token_id": _get_special_token_id(
+            tokenizer, "image_token_id", "image_token", "<|image_pad|>",
+            model_config=model_config, tokenizer_config=tokenizer_config
+        ),
+        "video_token_id": _get_special_token_id(
+            tokenizer, "video_token_id", "video_token", "<|video_pad|>",
+            model_config=model_config, tokenizer_config=tokenizer_config
+        ),
+        "vision_start_token_id": _get_special_token_id(
+            tokenizer, "vision_start_token_id", "vision_start_token", "<|vision_start|>",
+            model_config=model_config, tokenizer_config=tokenizer_config
+        ),
+        "vision_end_token_id": _get_special_token_id(
+            tokenizer, "vision_end_token_id", "vision_end_token", "<|vision_end|>",
+            model_config=model_config, tokenizer_config=tokenizer_config
+        ),
+        "tensors": descriptors,
+        "epd": True,
     }
     return payload_config, payload
