@@ -1517,6 +1517,63 @@ namespace fastllm {
         out[3] = _mm256_castsi256_ps(_mm256_unpackhi_epi16(zero, packedHi));
     }
 
+    // 256 scales x (16 low bytes + 16 high bytes) = 8 KiB. Normal E8M0
+    // scales times E2M1 values are exactly representable as BF16. Preserve
+    // the original multiply for subnormal / overflow / infinity cases.
+    struct NVFP4Block32ScaledByteTableAVX2 {
+        alignas(64) uint8_t bytes[256][32] = {};
+        NVFP4Block32ScaledByteTableAVX2() {
+            for (int scale = 2; scale <= 252; scale++) {
+                for (int code = 0; code < 16; code++) {
+                    float value = kNVFP4E2M1ValueTableAVX2[code] *
+                        NVFP4E8M0ScaleToFloatAVX2(scale);
+                    uint32_t bits;
+                    memcpy(&bits, &value, sizeof(bits));
+                    bytes[scale][code] = (uint8_t)(bits >> 16);
+                    bytes[scale][code + 16] = (uint8_t)(bits >> 24);
+                }
+            }
+        }
+    };
+    static const NVFP4Block32ScaledByteTableAVX2 kNVFP4Block32ScaledBytesAVX2;
+
+    static inline void NVFP4Block32DecodeScaled_AVX2(const uint8_t *packed, __m256 *out) {
+        // Preserve subnormal/overflow behavior under every MXCSR mode.
+        if ((unsigned)(packed[16] - 2) > 250) {
+            NVFP4Block32Decode_AVX2(packed, out);
+            const __m256 scale = _mm256_set1_ps(
+                NVFP4E8M0ScaleToFloatAVX2(packed[16]));
+            for (int q = 0; q < 4; q++) {
+                out[q] = _mm256_mul_ps(out[q], scale);
+            }
+            return;
+        }
+        const __m128i bytes = _mm_loadu_si128((const __m128i*)packed);
+        const __m128i nibbleMask = _mm_set1_epi8(0x0F);
+        const __m128i lowNibbles = _mm_and_si128(bytes, nibbleMask);
+        const __m128i highNibbles =
+            _mm_and_si128(_mm_srli_epi16(bytes, 4), nibbleMask);
+        const __m256i codes = _mm256_set_m128i(
+            _mm_unpackhi_epi8(lowNibbles, highNibbles),
+            _mm_unpacklo_epi8(lowNibbles, highNibbles));
+        const uint8_t *table = kNVFP4Block32ScaledBytesAVX2.bytes[packed[16]];
+        const __m256i loBytes = _mm256_shuffle_epi8(
+            _mm256_broadcastsi128_si256(
+                _mm_load_si128((const __m128i*)table)), codes);
+        const __m256i hiBytes = _mm256_shuffle_epi8(
+            _mm256_broadcastsi128_si256(
+                _mm_load_si128((const __m128i*)(table + 16))), codes);
+        const __m256i packedLo = _mm256_unpacklo_epi8(loBytes, hiBytes);
+        const __m256i packedHi = _mm256_unpackhi_epi8(loBytes, hiBytes);
+        const __m256i zero = _mm256_setzero_si256();
+        // Interleaving with zero shifts each 16-bit pattern into the high
+        // half of a 32-bit lane, which is the FP32 value itself.
+        out[0] = _mm256_castsi256_ps(_mm256_unpacklo_epi16(zero, packedLo));
+        out[1] = _mm256_castsi256_ps(_mm256_unpackhi_epi16(zero, packedLo));
+        out[2] = _mm256_castsi256_ps(_mm256_unpacklo_epi16(zero, packedHi));
+        out[3] = _mm256_castsi256_ps(_mm256_unpackhi_epi16(zero, packedHi));
+    }
+
     static inline void NVFP4Block32LoadInput_AVX2(const uint16_t *input, __m256 *out) {
         const __m256i first = _mm256_loadu_si256((const __m256i*)input);
         const __m256i second = _mm256_loadu_si256((const __m256i*)(input + 16));
@@ -1612,6 +1669,104 @@ namespace fastllm {
                 float *output = (float*)((uint8_t*)C + (size_t)r * ldc);
                 output[j] = sums[r];
             }
+        }
+    }
+
+    // Expand the small activation tile once, instead of repeating BF16
+    // conversion and lane permutations for every expert output column.
+    // Keep the same four accumulators and reduction order as the direct
+    // block-32 kernel: packing changes data reuse, not the dot product.
+    template <int ROWS, int COLS>
+    static void NVFP4Block32GemmPacked_AVX2(
+        const float *input, const uint8_t *weights, long ldb,
+        float *output, long ldc, int m, int st, int end
+    ) {
+        for (int col = st; col < end; col += COLS) {
+            if constexpr (COLS > 1) {
+                if (col + COLS > end) {
+                    NVFP4Block32GemmPacked_AVX2<ROWS, 1>(
+                        input, weights, ldb, output, ldc, m, col, end);
+                    break;
+                }
+            }
+            __m256 acc[ROWS][COLS][4];
+            for (int r = 0; r < ROWS; r++) {
+                for (int c = 0; c < COLS; c++) {
+                    for (int q = 0; q < 4; q++) {
+                        acc[r][c][q] = _mm256_setzero_ps();
+                    }
+                }
+            }
+            for (int block = 0; block < m / 32; block++) {
+                __m256 in[ROWS][4];
+                for (int r = 0; r < ROWS; r++) {
+                    for (int q = 0; q < 4; q++) {
+                        in[r][q] = _mm256_load_ps(
+                            input + (size_t)r * m + block * 32 + q * 8);
+                    }
+                }
+                for (int c = 0; c < COLS; c++) {
+                    const uint8_t *packed = weights +
+                        (size_t)(col + c) * ldb + (size_t)block * 17;
+                    __m256 weight[4];
+                    NVFP4Block32DecodeScaled_AVX2(packed, weight);
+                    for (int r = 0; r < ROWS; r++) {
+                        for (int q = 0; q < 4; q++) {
+                            acc[r][c][q] = _mm256_fmadd_ps(
+                                in[r][q], weight[q], acc[r][c][q]);
+                        }
+                    }
+                }
+            }
+            for (int r = 0; r < ROWS; r++) {
+                float *rowOutput = (float*)((uint8_t*)output + (size_t)r * ldc);
+                for (int c = 0; c < COLS; c++) {
+                    rowOutput[col + c] = NVFP4HorizontalSum_AVX2(_mm256_add_ps(
+                        _mm256_add_ps(acc[r][c][0], acc[r][c][1]),
+                        _mm256_add_ps(acc[r][c][2], acc[r][c][3])));
+                }
+            }
+        }
+    }
+
+    static void NVFP4Block32GemmPackInput_AVX2(
+        const void *A, long lda, const void *B, long ldb,
+        void *C, long ldc, int n, int m, int st, int end
+    ) {
+        static thread_local std::vector<float, alignedAllocator<float, 64>> input;
+        input.resize((size_t)n * m);
+        for (int r = 0; r < n; r++) {
+            const uint16_t *src = (const uint16_t*)((const uint8_t*)A + (size_t)r * lda);
+            for (int offset = 0; offset < m; offset += 32) {
+                __m256 values[4];
+                NVFP4Block32LoadInput_AVX2(src + offset, values);
+                for (int q = 0; q < 4; q++) {
+                    _mm256_store_ps(input.data() + (size_t)r * m + offset + q * 8, values[q]);
+                }
+            }
+        }
+        if (n == 1) {
+            // Once the input is packed, one streaming weight row avoids
+            // the extra register pressure of a single-row column tile.
+            NVFP4Block32GemmPacked_AVX2<1, 1>(
+                input.data(), (const uint8_t*)B, ldb, (float*)C, ldc, m, st, end);
+            return;
+        }
+        // Two output columns share activation loads; matching token rows
+        // share weight decoding. Limit each tile to 3/4 rows instead of
+        // carrying the accumulators for all verification rows at once.
+        for (int row = 0; row < n;) {
+            const int remaining = n - row;
+            const int rows = remaining == 4 || remaining == 7 ? 4 : std::min(3, remaining);
+            const float *src = input.data() + (size_t)row * m;
+            float *dst = (float*)((uint8_t*)C + (size_t)row * ldc);
+            switch (rows) {
+                case 1: NVFP4Block32GemmPacked_AVX2<1, 1>(src, (const uint8_t*)B, ldb, dst, ldc, m, st, end); break;
+                case 2: NVFP4Block32GemmPacked_AVX2<2, 2>(src, (const uint8_t*)B, ldb, dst, ldc, m, st, end); break;
+                case 3: NVFP4Block32GemmPacked_AVX2<3, 2>(src, (const uint8_t*)B, ldb, dst, ldc, m, st, end); break;
+                case 4: NVFP4Block32GemmPacked_AVX2<4, 2>(src, (const uint8_t*)B, ldb, dst, ldc, m, st, end); break;
+            }
+            row += rows;
         }
     }
 
@@ -1788,6 +1943,19 @@ namespace fastllm {
             return true;
         }();
         (void)traced;
+        // Amortize packing over model-sized expert tiles. Small/tail shapes
+        // and larger batches retain the direct kernel below.
+        // With only 16 vector registers, splitting five/six rows into two
+        // packed tiles costs more than the direct kernel's weight reuse.
+#ifdef __AVX512F__
+        const bool usePackedRows = true;
+#else
+        const bool usePackedRows = n != 5 && n != 6;
+#endif
+        if (usePackedRows && n <= 8 && m >= 1024 && (m & 31) == 0 && end - st >= 16) {
+            NVFP4Block32GemmPackInput_AVX2(A, lda, B, ldb, C, ldc, n, m, st, end);
+            return true;
+        }
 #define FASTLLM_RUN_NVFP4_BLOCK32_AVX2(ROWS) \
         FastllmGemmBFloat16NVFP4Block32E8M0_AVX2_Run<ROWS>( \
             A, lda, B, ldb, C, ldc, m, st, end); \
