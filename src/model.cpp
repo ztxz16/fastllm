@@ -3904,12 +3904,14 @@ namespace fastllm {
         // correct yet for these primary quantization families. Mark this
         // model's GGUF weights for the established dequant + cuBLAS path;
         // higher-bit models stay on the low-memory fast path.
+        // IQ3_S (26) is deliberately excluded: its MMQ fast path was validated
+        // against a stable llama.cpp build with greedy token-by-token A/B, and
+        // the safe dequant + cuBLAS path is several times slower for it.
         const bool forceSafeGgufDequant =
             arch == "qwen3_5" &&
             (ggufFileType == 10 || // Q2_K
              (ggufFileType >= 11 && ggufFileType <= 13) || // Q3_K S/M/L
              ggufFileType == 23 || // IQ3_XXS
-             ggufFileType == 26 || // IQ3_S
              ggufFileType == 30);  // IQ4_XS
         if (forceSafeGgufDequant) {
             printf("[Fastllm] Qwen3.5 GGUF file type %d: use safe CUDA dequant path.\n",
