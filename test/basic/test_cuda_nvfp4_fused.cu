@@ -294,6 +294,8 @@ int main() {
             for (int batch : {1, 2, 3, 4, 5, 6, 7, 8}) Run(false, 5120, 8704, true, batch);
             puts("PASS"); return 0;
         }
+        for (int batch : {2, 3, 4, 5, 6, 7, 8}) Run(false, 5120, 17408, true, batch);
+        Run(false, 5120, 17408, false, 9);
         for (int batch : {2, 3, 4, 5, 6, 7, 8}) Run(false, 5120, 8704, true, batch);
         Run(false, 5120, 8704, false, 9);
         for (int n : {34816, 17408, 8704, 1536}) Run(true, n, 5120);

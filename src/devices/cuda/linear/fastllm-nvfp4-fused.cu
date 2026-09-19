@@ -76,7 +76,8 @@ bool FastllmCudaNvfp4FusedCanRun(const Data &input, const Data &weight, const Da
         output.dims.empty() || output.strides.size() != output.dims.size()) return false;
     const uint64_t count = input.Count(0);
     const uint64_t batch = count / k;
-    const bool smallBatch = !gate && n == 5120 && k == 8704 && ShapeTuningEnabled();
+    const bool smallBatch = !gate && n == 5120 &&
+        (k == 8704 || k == 17408) && ShapeTuningEnabled();
     if (count % k || batch < 1 || batch > (smallBatch ? 8 : 1)) return false;
     if (input.dataType != DataType::FLOAT16 || output.dataType != input.dataType || input.dims.empty() ||
         output.dims.empty() || weight.dataType != DataType::NVFP4_BLOCK_16 ||
@@ -120,7 +121,8 @@ void FastllmCudaNvfp4Fused(Data &input, Data &weight, Data &output, bool gate) {
     // Specializing both matrix dimensions removes runtime packed-weight
     // and scale address arithmetic. Keep the same warp layout and FP32 reduction
     // order as the generic fusion. Select by local shape, not by TP rank count.
-    if (tuneShape && !gate && n == 5120 && k == 8704) {
+    if (tuneShape && !gate && n == 5120 && (k == 8704 ||
+        (k == 17408 && input.Count(0) / k > 1))) {
         const int batch = input.Count(0) / k;
         if (batch > 1) {
             auto *workspace = (int *)(scales + size_t(n) * k / 16);
