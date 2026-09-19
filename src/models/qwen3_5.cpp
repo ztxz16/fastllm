@@ -13448,7 +13448,17 @@ namespace fastllm {
                                 qkvzWeightName + ".tp_bias"),
                             gdnMerged);
                 }
-                if (!fusedInputProjection) {
+                // The existing Block owns both outputs and the complete fallback.
+                // Keep large prefill on its existing norm/projection path.
+                const bool preparedBa = !fusedInputProjection && !hasMergedGdnInLinear &&
+                    seqlen >= 1 && seqlen <= 8;
+                if (preparedBa) {
+                    CudaRMSNormSmallLinearBlock(hiddenStates, inputRmsWeight,
+                        *requireLocal(weight[baWeightName], baWeightName),
+                        *requireLocal(GetThreadTensorParallelBias(baWeightName + ".tp_bias"),
+                                      baWeightName + ".tp_bias"),
+                        attenInput, baMerged, rms_norm_eps);
+                } else if (!fusedInputProjection) {
                     Qwen3CudaRMSNorm(
                         cudaRunner, hiddenStates, inputRmsWeight,
                         rms_norm_eps, attenInput);
@@ -13655,11 +13665,13 @@ namespace fastllm {
                         baSplitReady = true;
                     }
                 } else {
-                    Qwen3CudaLinear(cudaRunner, attenInput,
+                    if (!preparedBa) {
+                        Qwen3CudaLinear(cudaRunner, attenInput,
                                     *requireLocal(weight[baWeightName], baWeightName),
                                     *requireLocal(GetThreadTensorParallelBias(baWeightName + ".tp_bias"),
                                                   baWeightName + ".tp_bias"),
                                     baMerged);
+                    }
                     if (!keepCombinedBa &&
                         !deferBaSplitForPrefill) {
                         Qwen3CudaSplit(cudaRunner, baMerged, -1, 0, localValueHeads, b);
