@@ -312,6 +312,12 @@ namespace fastllm {
         std::vector<std::vector<std::pair<Data, Data> > > speculativeLinearStates;
         // Verify graphs capture addresses in this scratch storage.
         unsigned long long speculativeLinearStateGeneration = 0;
+        // Single-request verification scratch, serialized by mtpCacheMutex.
+        // Paged-cache views are detached on scope exit; only owned GDN storage
+        // and fully overwritten prefix snapshots survive between rounds.
+        int singleMtpScratchDevice = -1;
+        std::vector<std::pair<Data, Data> > singleMtpValidationScratch;
+        std::vector<std::vector<std::pair<Data, Data> > > singleMtpPrefixScratch;
         std::vector<std::vector<int> > speculativeLinearCaptureMask;
         std::vector<std::pair<Data, Data> > speculativeFirstTokenLinearStates;
         std::vector<int> speculativeFirstTokenLinearCaptureMask;

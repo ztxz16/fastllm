@@ -4085,8 +4085,11 @@ namespace fastllm {
         static void Qwen35PrepareGraphCudaTensor(Data &dst, const Data &src,
                                                  int device,
                                                  bool asyncCopy = false) {
-            AssertInFastLLM(src.dataDevice == DataDevice::CUDA && src.cudaData != nullptr,
-                            "Qwen3.5 CUDA graph requires CUDA source tensor.\n");
+            const bool hostSource = src.dataDevice == DataDevice::CPU &&
+                                    src.cpuData != nullptr;
+            AssertInFastLLM(hostSource ||
+                            (src.dataDevice == DataDevice::CUDA && src.cudaData != nullptr),
+                            "Qwen3.5 CUDA graph requires a populated source tensor.\n");
             FastllmCudaSetDevice(device);
 
             bool needReset = dst.isFake || dst.dataDevice != DataDevice::CUDA ||
@@ -4119,7 +4122,10 @@ namespace fastllm {
             dst.expansionDims.clear();
             dst.Resize(src.dims);
             dst.Allocate(false);
-            if (asyncCopy) {
+            if (hostSource) {
+                FastllmCudaCopyFromHostToDevice(dst.cudaData, src.cpuData,
+                                                src.GetBytes());
+            } else if (asyncCopy) {
                 AssertInFastLLM(
                     FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
                         dst.cudaData, src.cudaData, src.GetBytes()),
@@ -4152,6 +4158,14 @@ namespace fastllm {
                 const std::vector<int> &devices) {
             if (devices.empty()) {
                 return false;
+            }
+            // Single-device verify inputs are constructed on the CPU. Stage
+            // directly into the graph's persistent allocation, so replay keeps
+            // the same address without allocating an intermediate CUDA tensor.
+            if (devices.size() == 1 && !src.multiDeviceData &&
+                src.dataDevice == DataDevice::CPU && src.cpuData != nullptr) {
+                Qwen35PrepareGraphCudaTensor(dst, src, devices[0], false);
+                return true;
             }
             dst.dataType = src.dataType;
             dst.UpdateUnitSize();
@@ -16661,9 +16675,43 @@ namespace fastllm {
                                << ";dflash="
                                << (speculativeCaptureDFlashHiddenStates ? 1 : 0)
                                << ";captureSlots="
-                               << speculativeLinearStateCaptureSlots
-                               << ";linearScratchGeneration="
-                               << speculativeLinearStateGeneration;
+                               << speculativeLinearStateCaptureSlots;
+                if (tensorParallel) {
+                    graphSignature << ";linearScratchGeneration="
+                                   << speculativeLinearStateGeneration;
+                } else {
+                    // Single-device scratch is swapped into the model every
+                    // round. Its generation changes, but its allocations stay
+                    // alive. Invalidate only when a captured address/layout
+                    // actually changes.
+                    std::string scratchSignature;
+                    scratchSignature.reserve(16384);
+                    auto appendField = [&](const auto &value) {
+                        scratchSignature.append(
+                            reinterpret_cast<const char*>(&value), sizeof(value));
+                    };
+                    appendField(speculativeLinearStates.size());
+                    for (const auto &layer : speculativeLinearStates) {
+                        appendField(layer.size());
+                        for (const auto &slot : layer) {
+                            for (const Data *snapshot : {&slot.first, &slot.second}) {
+                                appendField(snapshot->cudaData);
+                                appendField(snapshot->dataType);
+                                appendField(snapshot->isLinearAttentionTransposed);
+                                appendField(snapshot->dims.size());
+                                if (!snapshot->dims.empty()) {
+                                    scratchSignature.append(
+                                        reinterpret_cast<const char*>(snapshot->dims.data()),
+                                        snapshot->dims.size() * sizeof(int));
+                                }
+                            }
+                        }
+                    }
+                    // This is an exact byte key, not a hash: pointer/layout
+                    // changes cannot collide, and no text formatting is needed
+                    // on the hot replay path.
+                    graphSignature.write(scratchSignature.data(), scratchSignature.size());
+                }
                 for (int r = 0; r < (int)devices.size(); ++r) {
                     graphSignature << ";gpu=" << devices[r]
                                    << ";packedMeta="
@@ -20088,7 +20136,75 @@ namespace fastllm {
             return true;
         }
 
-        std::vector<std::pair<Data, Data> > validationPastStorage(block_cnt);
+        // Reuse only the single-device short FP16 path whose snapshot kernels
+        // fully overwrite each slot. Unsupported state layouts keep the local
+        // allocation path below, including its original cleanup semantics.
+        const int singleScratchDevice = FastllmCudaGetDevice();
+        bool reuseSingleScratch = !useDFlash && seqLen >= 2 &&
+            seqLen <= QWEN35_MTP_FAST_SEQ_MAX;
+        for (int i = 0; reuseSingleScratch && i < block_cnt; ++i) {
+            if (isAttentionLayerAt(i)) continue;
+            for (const Data *state : {pastKeyValues[i].first, pastKeyValues[i].second}) {
+                bool dense = state != nullptr && !state->dims.empty();
+                uint64_t stride = 1;
+                if (dense && state->strides.size() != state->dims.size()) dense = false;
+                for (int d = dense ? int(state->dims.size()) - 1 : -1; d >= 0; --d) {
+                    dense &= state->dims[d] > 0 && state->strides[d] == stride;
+                    stride *= state->dims[d];
+                }
+                if (!dense || state->isFake || state->cudaDataBorrowed ||
+                    state->multiDeviceData || state->isPagedKVCache ||
+                    state->dataType != DataType::FLOAT16 ||
+                    state->dataDevice != DataDevice::CUDA || state->cudaData == nullptr ||
+                    state->dataDeviceIds != std::vector<int>{singleScratchDevice} ||
+                    state->expansionSize != state->Count(0)) {
+                    reuseSingleScratch = false;
+                    break;
+                }
+            }
+        }
+        if (reuseSingleScratch) {
+            bool sameLayout = singleMtpScratchDevice == singleScratchDevice &&
+                singleMtpValidationScratch.size() == size_t(block_cnt);
+            for (int i = 0; sameLayout && i < block_cnt; ++i) {
+                if (isAttentionLayerAt(i)) continue;
+                const auto &old = singleMtpValidationScratch[i];
+                const auto &now = pastKeyValues[i];
+                sameLayout = old.first.dims == now.first->dims &&
+                    old.second.dims == now.second->dims &&
+                    old.first.dataType == now.first->dataType &&
+                    old.second.dataType == now.second->dataType &&
+                    old.first.isLinearAttentionTransposed == now.first->isLinearAttentionTransposed &&
+                    old.second.isLinearAttentionTransposed == now.second->isLinearAttentionTransposed;
+            }
+            if (!sameLayout) {
+                singleMtpValidationScratch.clear();
+                singleMtpPrefixScratch.clear();
+                singleMtpValidationScratch.resize(block_cnt);
+                singleMtpScratchDevice = singleScratchDevice;
+            }
+            // Keep this workspace separate from TP and batched capture scratch.
+            speculativeLinearStates.swap(singleMtpPrefixScratch);
+            ++speculativeLinearStateGeneration;
+        }
+        std::vector<std::pair<Data, Data> > localValidationPastStorage;
+        if (!reuseSingleScratch) localValidationPastStorage.resize(block_cnt);
+        auto &validationPastStorage = reuseSingleScratch ?
+            singleMtpValidationScratch : localValidationPastStorage;
+        auto releaseSingleScratch = [&](int*) noexcept {
+            if (!reuseSingleScratch) return;
+            for (int i = 0; i < block_cnt; ++i) {
+                if (isAttentionLayerAt(i)) {
+                    detachPagedCacheView(validationPastStorage[i].first);
+                    detachPagedCacheView(validationPastStorage[i].second);
+                }
+            }
+            speculativeLinearStates.swap(singleMtpPrefixScratch);
+            ++speculativeLinearStateGeneration;
+        };
+        int singleScratchScopeToken = 0;
+        std::unique_ptr<int, decltype(releaseSingleScratch)> singleScratchScope(
+            &singleScratchScopeToken, releaseSingleScratch);
         std::vector<std::pair<Data*, Data*> > validationPastKeyValues(block_cnt);
         std::vector<CacheMeta> baseKeyMetas(block_cnt), baseValueMetas(block_cnt);
         std::vector<std::vector<CacheMeta> > prefixKeyMetas(
@@ -20110,7 +20226,7 @@ namespace fastllm {
         auto clearSpeculativeLinearCapture = [&]() {
             speculativeLinearStateCaptureSlots = oldLinearStateCaptureSlots;
             ++speculativeLinearStateGeneration;
-            speculativeLinearStates.clear();
+            if (!reuseSingleScratch) speculativeLinearStates.clear();
             speculativeLinearCaptureMask.clear();
         };
         std::vector<uint8_t> singleKeyUsesPrefix(block_cnt, 0);
@@ -20228,7 +20344,7 @@ namespace fastllm {
             int linearCaptureSlots = std::max(1, seqLen - 1);
             speculativeLinearStateCaptureSlots = linearCaptureSlots;
             ++speculativeLinearStateGeneration;
-            speculativeLinearStates.clear();
+            if (!reuseSingleScratch) speculativeLinearStates.clear();
             speculativeLinearStates.resize(block_cnt);
             speculativeLinearCaptureMask.clear();
             speculativeLinearCaptureMask.resize(block_cnt);
@@ -20236,7 +20352,10 @@ namespace fastllm {
                 if (isAttentionLayerAt(i)) {
                     continue;
                 }
-                speculativeLinearStates[i].resize(linearCaptureSlots);
+                if (!reuseSingleScratch ||
+                    speculativeLinearStates[i].size() < size_t(linearCaptureSlots)) {
+                    speculativeLinearStates[i].resize(linearCaptureSlots);
+                }
                 speculativeLinearCaptureMask[i].assign(linearCaptureSlots, 0);
             }
             speculativeFirstTokenLinearStates.clear();
