@@ -6194,6 +6194,8 @@ namespace fastllm {
                    weightType == DataType::FLOAT16 ||
                    weightType == DataType::BFLOAT16 ||
                    weightType == DataType::INT8 ||
+                   weightType == DataType::INT8_PERCHANNEL_S8 ||
+                   weightType == DataType::INT8_PERCHANNEL_S8_W8A16 ||
                    weightType == DataType::INT4_GROUP ||
                    weightType == DataType::INT4_GROUP32 ||
                    weightType == DataType::INT4_GROUP128 ||
@@ -6231,6 +6233,8 @@ namespace fastllm {
             return weightType == DataType::BFLOAT16 ||
                    weightType == DataType::FLOAT32 ||
                    weightType == DataType::FLOAT16 ||
+                   weightType == DataType::INT8_PERCHANNEL_S8 ||
+                   weightType == DataType::INT8_PERCHANNEL_S8_W8A16 ||
                    weightType == DataType::INT4_GROUP32 ||
                    weightType == DataType::FP8_E4M3 ||
                    weightType == DataType::FP8_E4M3_BLOCK_128 ||
@@ -6265,6 +6269,20 @@ namespace fastllm {
                 FastllmCudaHalfMatMulBFloat16(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::INT8) {
                 FastllmCudaHalfMatMulFloatInt8(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::INT8_PERCHANNEL_S8) {
+                if (!FastllmCudaHalfMatMulFloatInt8PerChannelS8(
+                        input, weight, bias, output, n, m, k)) {
+                    ErrorInFastLLM(
+                        "Linear error: INT8_PERCHANNEL_S8 CUDA path failed." +
+                        dataTypeInfo);
+                }
+            } else if (weight.dataType == DataType::INT8_PERCHANNEL_S8_W8A16) {
+                if (!FastllmCudaHalfMatMulFloatInt8PerChannelS8W8A16(
+                        input, weight, bias, output, n, m, k)) {
+                    ErrorInFastLLM(
+                        "Linear error: INT8_PERCHANNEL_S8_W8A16 CUDA path failed." +
+                        dataTypeInfo);
+                }
             } else if (weight.dataType == DataType::INT4_GROUP) {
                 FastllmCudaHalfMatMulFloatInt4Group(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::INT4_GROUP32) {
@@ -6350,6 +6368,20 @@ namespace fastllm {
                 FastllmCudaBFloat16MatMulFloat16(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::INT4_GROUP32) {
                 FastllmCudaBFloat16MatMulInt4Group32(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::INT8_PERCHANNEL_S8) {
+                if (!FastllmCudaBFloat16MatMulInt8PerChannelS8(
+                        input, weight, bias, output, n, m, k)) {
+                    ErrorInFastLLM(
+                        "Linear error: INT8_PERCHANNEL_S8 BF16 CUDA path failed." +
+                        dataTypeInfo);
+                }
+            } else if (weight.dataType == DataType::INT8_PERCHANNEL_S8_W8A16) {
+                if (!FastllmCudaBFloat16MatMulInt8PerChannelS8W8A16(
+                        input, weight, bias, output, n, m, k)) {
+                    ErrorInFastLLM(
+                        "Linear error: INT8_PERCHANNEL_S8_W8A16 BF16 CUDA path failed." +
+                        dataTypeInfo);
+                }
             } else if (weight.dataType == DataType::FP8_E4M3) {
                 if (
 #ifdef FASTLLM_ENABLE_DEEPGEMM_FP8_SM90

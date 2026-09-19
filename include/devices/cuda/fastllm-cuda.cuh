@@ -1620,6 +1620,14 @@ bool FastllmCudaQwen35RouterSharedGateFloat16(const fastllm::Data &input, fastll
 bool FastllmCudaHalfMatMulFloat16AddToNoBias(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaHalfMatMulBFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaHalfMatMulFloatInt8(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
+// Signed symmetric INT8 per-channel weights (compressed-tensors checkpoints).
+// The W8A8 variants quantize activations per token for prefill batches; the
+// W8A16 variants keep FP16/BF16 activations in every batch size.  All four
+// entry points use a fused signed GEMV for decode and small batches.
+bool FastllmCudaHalfMatMulFloatInt8PerChannelS8(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
+bool FastllmCudaBFloat16MatMulInt8PerChannelS8(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
+bool FastllmCudaHalfMatMulFloatInt8PerChannelS8W8A16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
+bool FastllmCudaBFloat16MatMulInt8PerChannelS8W8A16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaHalfMergeMOEInt8Batch1Indexed(const fastllm::Data &input,
                                               fastllm::Data &scratch,
                                               fastllm::Data &output,

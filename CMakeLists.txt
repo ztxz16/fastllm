@@ -385,6 +385,7 @@ if (USE_CUDA)
         src/devices/cuda/moe/fastllm-moe-cache.cu
         src/devices/cuda/moe/fastllm-moe-vllm-marlin.cu
         src/devices/cuda/linear/fastllm-linear-int8.cu
+        src/devices/cuda/linear/fastllm-linear-int8perchannel.cu
         src/devices/cuda/linear/fastllm-linear-int4.cu
         src/devices/cuda/linear/fastllm-linear-int4group.cu
         src/devices/cuda/linear/fastllm-marlin.cu
