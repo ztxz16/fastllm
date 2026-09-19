@@ -24,6 +24,7 @@
 #define GGML_COMMON_IMPL_CUDA
 #include "gguf.h"
 #include "fastllm-gguf-dequant.cuh"
+#include "fastllm-gguf-gemv.cuh"
 
 static __device__ __forceinline__ float warp_reduce_max(float x) {
 #pragma unroll
@@ -367,7 +368,6 @@ static __device__ __forceinline__ int2 get_int_from_table_16(const int & q4, con
 #endif
 }
 
-static constexpr __device__ int8_t kvalues_iq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 
 static __device__ __forceinline__ int2 get_int_from_table_16(const int & q4) {
     return get_int_from_table_16(q4, kvalues_iq4nl);
@@ -1489,228 +1489,53 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
 }
 
 template<typename dst_t>
-struct DequantizeCast;
-
-template<>
-struct DequantizeCast<float> {
-    static __device__ __forceinline__ float cast(float v) {
-        return v;
-    }
-};
-
-template<>
-struct DequantizeCast<half> {
-    static __device__ __forceinline__ half cast(float v) {
-        return __float2half_rn(v);
-    }
-};
-
-template<>
-struct DequantizeCast<__nv_bfloat16> {
-    static __device__ __forceinline__ __nv_bfloat16 cast(float v) {
-        return __float2bfloat16_rn(v);
-    }
-};
-
-template<typename dst_t>
 static __global__ void dequantize_block_q4_0(const void * __restrict__ vx,
                                               dst_t * __restrict__ yy,
                                               int64_t blockCount) {
-    const int64_t group = blockIdx.x;
-    const int64_t il = threadIdx.x / 8;
-    const int64_t ir = threadIdx.x % 8;
-    const int64_t block = 8 * group + ir;
-    if (block >= blockCount) {
-        return;
-    }
-
-    const block_q4_0 *x = (const block_q4_0 *)vx + block;
-    dst_t *y = yy + 256 * group + 32 * ir + 4 * il;
-    const float d = __half2float(x->d);
-    const float minimum = -8.0f * d;
-    const uint8_t *q = x->qs + 4 * il;
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        y[j] = DequantizeCast<dst_t>::cast(
-            d * (q[j] & 0x0f) + minimum);
-        y[j + 16] = DequantizeCast<dst_t>::cast(
-            d * (q[j] >> 4) + minimum);
-    }
+    dequantize_block_q4_0_impl<dst_t>(vx, yy, blockCount, blockIdx.x, threadIdx.x);
 }
 
 template<typename dst_t>
 static __global__ void dequantize_block_q4_1(const void * __restrict__ vx,
                                               dst_t * __restrict__ yy,
                                               int64_t blockCount) {
-    const int64_t group = blockIdx.x;
-    const int64_t il = threadIdx.x / 8;
-    const int64_t ir = threadIdx.x % 8;
-    const int64_t block = 8 * group + ir;
-    if (block >= blockCount) {
-        return;
-    }
-
-    const block_q4_1 *x = (const block_q4_1 *)vx + block;
-    dst_t *y = yy + 256 * group + 32 * ir + 4 * il;
-    const float2 dm = __half22float2(x->dm);
-    const uint8_t *q = x->qs + 4 * il;
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        y[j] = DequantizeCast<dst_t>::cast(
-            dm.x * (q[j] & 0x0f) + dm.y);
-        y[j + 16] = DequantizeCast<dst_t>::cast(
-            dm.x * (q[j] >> 4) + dm.y);
-    }
+    dequantize_block_q4_1_impl<dst_t>(vx, yy, blockCount, blockIdx.x, threadIdx.x);
 }
 
 template<typename dst_t>
 static __global__ void dequantize_block_iq2_xxs(const void * __restrict__ vx,
                                                  dst_t * __restrict__ yy) {
-    const int64_t block = blockIdx.x;
-    const block_iq2_xxs *x = (const block_iq2_xxs *)vx + block;
-    const int il = threadIdx.x / 8;
-    const int ib = threadIdx.x % 8;
-    dst_t *y = yy + block * QK_K + 32 * ib + 8 * il;
-
-    const uint16_t *q2 = x->qs + 4 * ib;
-    const uint32_t low = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
-    const uint32_t aux = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
-    const unsigned gridIndex = (low >> (8u * (unsigned)il)) & 0xffu;
-    const uint64_t grid = iq2xxs_grid[gridIndex];
-    const uint8_t signs = ksigns_iq2xs[(aux >> (7 * il)) & 0x7f];
-    const float d = __half2float(x->d) * (0.5f + (aux >> 28)) * 0.25f;
-#pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        const int q = (int)((grid >> (8u * (unsigned)j)) & 0xffu);
-        const float sign = (signs & (1u << j)) ? -1.0f : 1.0f;
-        y[j] = DequantizeCast<dst_t>::cast(d * q * sign);
-    }
+    dequantize_block_iq2_xxs_impl<dst_t>(vx, yy, blockIdx.x, threadIdx.x);
 }
 
 template<typename dst_t>
 static __global__ void dequantize_block_iq2_xs(const void * __restrict__ vx,
                                                 dst_t * __restrict__ yy) {
-    const int64_t block = blockIdx.x;
-    const block_iq2_xs *x = (const block_iq2_xs *)vx + block;
-    const int il = threadIdx.x / 8;
-    const int ib = threadIdx.x % 8;
-    dst_t *y = yy + block * QK_K + 32 * ib + 8 * il;
-
-    const uint16_t q2 = x->qs[4 * ib + il];
-    const uint64_t grid = iq2xs_grid[q2 & 0x1ff];
-    const uint8_t signs = ksigns_iq2xs[q2 >> 9];
-    const int scale = (x->scales[ib] >> (4 * (il / 2))) & 0x0f;
-    const float d = __half2float(x->d) * (0.5f + scale) * 0.25f;
-#pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        const int q = (int)((grid >> (8u * (unsigned)j)) & 0xffu);
-        const float sign = (signs & (1u << j)) ? -1.0f : 1.0f;
-        y[j] = DequantizeCast<dst_t>::cast(d * q * sign);
-    }
+    dequantize_block_iq2_xs_impl<dst_t>(vx, yy, blockIdx.x, threadIdx.x);
 }
 
 template<typename dst_t>
 static __global__ void dequantize_block_iq2_s(const void * __restrict__ vx,
                                                dst_t * __restrict__ yy) {
-    const int64_t block = blockIdx.x;
-    const block_iq2_s *x = (const block_iq2_s *)vx + block;
-    const int il = threadIdx.x / 8;
-    const int ib = threadIdx.x % 8;
-    dst_t *y = yy + block * QK_K + 32 * ib + 8 * il;
-
-    const unsigned gridIndex =
-        x->qs[4 * ib + il] |
-        (((unsigned)x->qh[ib] << (8 - 2 * il)) & 0x300u);
-    const uint64_t grid = iq2s_grid[gridIndex];
-    const uint8_t signs = x->qs[QK_K / 8 + 4 * ib + il];
-    const int scale = (x->scales[ib] >> (4 * (il / 2))) & 0x0f;
-    const float d = __half2float(x->d) * (0.5f + scale) * 0.25f;
-#pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        const int q = (int)((grid >> (8u * (unsigned)j)) & 0xffu);
-        const float sign = (signs & (1u << j)) ? -1.0f : 1.0f;
-        y[j] = DequantizeCast<dst_t>::cast(d * q * sign);
-    }
+    dequantize_block_iq2_s_impl<dst_t>(vx, yy, blockIdx.x, threadIdx.x);
 }
 
 template<typename dst_t>
 static __global__ void dequantize_block_iq3_xxs(const void * __restrict__ vx,
                                                  dst_t * __restrict__ yy) {
-    const int64_t block = blockIdx.x;
-    const block_iq3_xxs *x = (const block_iq3_xxs *)vx + block;
-    const int il = threadIdx.x / 8;
-    const int ib = threadIdx.x % 8;
-    dst_t *y = yy + block * QK_K + 32 * ib + 8 * il;
-
-    const uint8_t *qs = x->qs + 8 * ib;
-    const uint8_t *gas = x->qs + QK_K / 4 + 4 * ib;
-    const uint32_t aux =
-        (uint32_t)gas[0] | ((uint32_t)gas[1] << 8) |
-        ((uint32_t)gas[2] << 16) | ((uint32_t)gas[3] << 24);
-    const uint32_t grid0 = iq3xxs_grid[qs[2 * il + 0]];
-    const uint32_t grid1 = iq3xxs_grid[qs[2 * il + 1]];
-    const uint8_t signs = ksigns_iq2xs[(aux >> (7 * il)) & 0x7f];
-    const float d = __half2float(x->d) * (0.5f + (aux >> 28)) * 0.5f;
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const int q0 = (int)((grid0 >> (8u * (unsigned)j)) & 0xffu);
-        const int q1 = (int)((grid1 >> (8u * (unsigned)j)) & 0xffu);
-        const float sign0 = (signs & (1u << j)) ? -1.0f : 1.0f;
-        const float sign1 = (signs & (1u << (j + 4))) ? -1.0f : 1.0f;
-        y[j] = DequantizeCast<dst_t>::cast(d * q0 * sign0);
-        y[j + 4] = DequantizeCast<dst_t>::cast(d * q1 * sign1);
-    }
+    dequantize_block_iq3_xxs_impl<dst_t>(vx, yy, blockIdx.x, threadIdx.x);
 }
 
 template<typename dst_t>
 static __global__ void dequantize_block_iq1_s(const void * __restrict__ vx,
                                                dst_t * __restrict__ yy) {
-    const int64_t block = blockIdx.x;
-    const block_iq1_s *x = (const block_iq1_s *)vx + block;
-    const int il = threadIdx.x / 8;
-    const int ib = threadIdx.x % 8;
-    dst_t *y = yy + block * QK_K + 32 * ib + 8 * il;
-
-    const uint16_t qh = x->qh[ib];
-    const unsigned gridIndex =
-        x->qs[4 * ib + il] | (((qh >> (3 * il)) & 0x07u) << 8);
-    const uint64_t grid = iq1s_grid[gridIndex];
-    const float delta =
-        (qh & 0x8000u) ? -IQ1S_DELTA : IQ1S_DELTA;
-    const float d = __half2float(x->d) * (2 * ((qh >> 12) & 7) + 1);
-#pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        const int q = (int)(int8_t)((grid >> (8u * (unsigned)j)) & 0xffu);
-        y[j] = DequantizeCast<dst_t>::cast(d * (q + delta));
-    }
+    dequantize_block_iq1_s_impl<dst_t>(vx, yy, blockIdx.x, threadIdx.x);
 }
 
 template<typename dst_t>
 static __global__ void dequantize_block_iq1_m(const void * __restrict__ vx,
                                                dst_t * __restrict__ yy) {
-    const int64_t block = blockIdx.x;
-    const block_iq1_m *x = (const block_iq1_m *)vx + block;
-    const int il = threadIdx.x / 8;
-    const int ib = threadIdx.x % 8;
-    dst_t *y = yy + block * QK_K + 32 * ib + 8 * il;
-
-    const uint16_t *sc = (const uint16_t *)x->scales;
-    iq1m_scale_t scale;
-    scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) |
-                ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
-    const int ib16 = 2 * ib + il / 2;
-    const float d = __half2float(scale.f16) *
-        (2 * ((sc[ib16 / 4] >> (3 * (ib16 % 4))) & 0x07) + 1);
-    const uint8_t qh = x->qh[2 * ib + il / 2] >> (4 * (il % 2));
-    const unsigned gridIndex = x->qs[4 * ib + il] | ((qh & 0x07u) << 8);
-    const uint64_t grid = iq1s_grid[gridIndex];
-    const float delta =
-        (qh & 0x08u) ? -IQ1M_DELTA : IQ1M_DELTA;
-#pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        const int q = (int)(int8_t)((grid >> (8u * (unsigned)j)) & 0xffu);
-        y[j] = DequantizeCast<dst_t>::cast(d * (q + delta));
-    }
+    dequantize_block_iq1_m_impl<dst_t>(vx, yy, blockIdx.x, threadIdx.x);
 }
 
 template<typename dst_t>
@@ -1755,31 +1580,7 @@ template<typename dst_t>
 static __global__ void dequantize_block_iq4_nl(const void * __restrict__ vx,
                                                 dst_t * __restrict__ y,
                                                 const int64_t k) {
-    const int64_t group = blockIdx.x;
-    const int64_t groupOffset = group * QK_K;
-    if (groupOffset >= k) {
-        return;
-    }
-
-    const block_iq4_nl *x = (const block_iq4_nl *)vx +
-                            group * (QK_K / QK4_NL);
-    const int il = threadIdx.x / 8;
-    const int ib = threadIdx.x % 8;
-    const int64_t outputOffset = groupOffset + 32 * ib + 4 * il;
-    const uint8_t *q4 = x[ib].qs + 4 * il;
-    const float d = __half2float(x[ib].d);
-
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        if (outputOffset + j < k) {
-            y[outputOffset + j] = DequantizeCast<dst_t>::cast(
-                d * kvalues_iq4nl[q4[j] & 0x0f]);
-        }
-        if (outputOffset + j + 16 < k) {
-            y[outputOffset + j + 16] = DequantizeCast<dst_t>::cast(
-                d * kvalues_iq4nl[q4[j] >> 4]);
-        }
-    }
+    dequantize_block_iq4_nl_impl<dst_t>(vx, y, k, blockIdx.x, threadIdx.x);
 }
 
 template<typename dst_t>
@@ -1796,33 +1597,7 @@ template<typename dst_t>
 static __global__ void dequantize_block_iq4_xs(const void * __restrict__ vx,
                                                 dst_t * __restrict__ y,
                                                 const int64_t k) {
-    const int64_t block = blockIdx.x;
-    const int64_t blockOffset = block * QK_K;
-    if (blockOffset >= k) {
-        return;
-    }
-
-    const block_iq4_xs *x = (const block_iq4_xs *)vx + block;
-    const int il = threadIdx.x / 8;
-    const int ib = threadIdx.x % 8;
-    const int64_t outputOffset = blockOffset + 32 * ib + 4 * il;
-    const uint8_t *q4 = x->qs + 16 * ib + 4 * il;
-    const int scale =
-        ((x->scales_l[ib / 2] >> (4 * (ib % 2))) & 0x0f) |
-        (((x->scales_h >> (2 * ib)) & 0x03) << 4);
-    const float d = __half2float(x->d) * (scale - 32);
-
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        if (outputOffset + j < k) {
-            y[outputOffset + j] = DequantizeCast<dst_t>::cast(
-                d * kvalues_iq4nl[q4[j] & 0x0f]);
-        }
-        if (outputOffset + j + 16 < k) {
-            y[outputOffset + j + 16] = DequantizeCast<dst_t>::cast(
-                d * kvalues_iq4nl[q4[j] >> 4]);
-        }
-    }
+    dequantize_block_iq4_xs_impl<dst_t>(vx, y, k, blockIdx.x, threadIdx.x);
 }
 
 template<typename dst_t>
@@ -1896,200 +1671,36 @@ static void dequantize_block_q8_0_f32_cuda(const void * __restrict__ vx,
 }
 
 
-static inline __device__ void get_scale_min_k4(int j, const uint8_t * q, uint8_t & d, uint8_t & m) {
-    if (j < 4) {
-        d = q[j] & 63; m = q[j + 4] & 63;
-    } else {
-        d = (q[j+4] & 0xF) | ((q[j-4] >> 6) << 4);
-        m = (q[j+4] >>  4) | ((q[j-0] >> 6) << 4);
-    }
-}
-
 template<typename dst_t>
 static __global__ void dequantize_block_q2_K(const void * __restrict__ vx, dst_t * __restrict__ yy) {
-    const block_q2_K * x = (const block_q2_K *) vx;
-
-    const int64_t i = blockIdx.x;
-    const int tid = threadIdx.x;
-
-    const float d = __low2float(x[i].dm);
-    const float dmin = __high2float(x[i].dm);
-    dst_t * y = yy + i * QK_K;
-
-    for (int idx = tid; idx < QK_K; idx += blockDim.x) {
-        const int ib128 = idx / 128;
-        const int i128 = idx - ib128 * 128;
-        const int scale_idx = ib128 * 8 + i128 / 16;
-        const int shift = 2 * (i128 / 32);
-        const int qidx = ib128 * 32 + (i128 & 15) + ((i128 & 31) >= 16 ? 16 : 0);
-
-        const uint8_t sc = x[i].scales[scale_idx];
-        const float dl = d * (sc & 0xF);
-        const float ml = dmin * (sc >> 4);
-        const int q = (x[i].qs[qidx] >> shift) & 0x3;
-
-        y[idx] = DequantizeCast<dst_t>::cast(dl * q - ml);
-    }
+    dequantize_block_q2_K_impl<dst_t>(vx, yy, blockIdx.x, threadIdx.x, blockDim.x);
 }
 
 template<typename dst_t>
 static __global__ void dequantize_block_q3_K(const void * __restrict__ vx,
                                               dst_t * __restrict__ yy) {
-    const int64_t block = blockIdx.x;
-    const block_q3_K *x = (const block_q3_K *)vx;
-
-    const int64_t r = threadIdx.x / 4;
-    const int64_t tid = r / 2;
-    const int64_t is0 = r % 2;
-    const int64_t l0 = 16 * is0 + 4 * (threadIdx.x % 4);
-    const int64_t n = tid / 4;
-    const int64_t j = tid - 4 * n;
-
-    const uint8_t mask = 1 << (4 * n + j);
-    const int64_t is = 8 * n + 2 * j + is0;
-    const int shift = 2 * j;
-
-    const int8_t packedScale =
-        is < 4 ? (x[block].scales[is] & 0x0f) |
-                       (((x[block].scales[is + 8] >> 0) & 0x03) << 4) :
-        is < 8 ? (x[block].scales[is] & 0x0f) |
-                       (((x[block].scales[is + 4] >> 2) & 0x03) << 4) :
-        is < 12 ? (x[block].scales[is - 8] >> 4) |
-                        (((x[block].scales[is] >> 4) & 0x03) << 4) :
-                  (x[block].scales[is - 8] >> 4) |
-                        (((x[block].scales[is - 4] >> 6) & 0x03) << 4);
-    const float scale = __half2float(x[block].d) * (packedScale - 32);
-
-    dst_t *y = yy + block * QK_K + 128 * n + 32 * j;
-    const uint8_t *q = x[block].qs + 32 * n;
-    const uint8_t *highMask = x[block].hmask;
-#pragma unroll
-    for (int l = l0; l < l0 + 4; ++l) {
-        const int value = (int)((q[l] >> shift) & 0x03) -
-                          ((highMask[l] & mask) ? 0 : 4);
-        y[l] = DequantizeCast<dst_t>::cast(scale * value);
-    }
+    dequantize_block_q3_K_impl<dst_t>(vx, yy, blockIdx.x, threadIdx.x);
 }
 
 template<typename dst_t>
 static __global__ void dequantize_block_q4_K(const void * __restrict__ vx, dst_t * __restrict__ yy) {
-    const block_q4_K * x = (const block_q4_K *) vx;
-
-    const int64_t i = blockIdx.x;
-
-    // assume 32 threads
-    const int64_t tid = threadIdx.x;
-    const int64_t il  = tid/8;
-    const int64_t ir  = tid%8;
-    const int64_t is  = 2*il;
-    const int64_t n   = 4;
-
-    dst_t * y = yy + i*QK_K + 64*il + n*ir;
-
-    const float dall = __low2half(x[i].dm);
-    const float dmin = __high2half(x[i].dm);
-
-    const uint8_t * q = x[i].qs + 32*il + n*ir;
-
-    uint8_t sc, m;
-    get_scale_min_k4(is + 0, x[i].scales, sc, m);
-    const float d1 = dall * sc; const float m1 = dmin * m;
-    get_scale_min_k4(is + 1, x[i].scales, sc, m);
-    const float d2 = dall * sc; const float m2 = dmin * m;
-    for (int l = 0; l < n; ++l) {
-        y[l + 0] = DequantizeCast<dst_t>::cast(d1 * (q[l] & 0xF) - m1);
-        y[l +32] = DequantizeCast<dst_t>::cast(d2 * (q[l] >>  4) - m2);
-    }
+    dequantize_block_q4_K_impl<dst_t>(vx, yy, blockIdx.x, threadIdx.x);
 }
 
 template<typename dst_t>
 static __global__ void dequantize_block_q5_K(const void * __restrict__ vx, dst_t * __restrict__ yy) {
-    const block_q5_K * x = (const block_q5_K *) vx;
-
-    const int64_t i = blockIdx.x;
-
-    // assume 64 threads - this is very slightly better than the one below
-    const int64_t tid = threadIdx.x;
-    const int64_t il  = tid/16;   // il is in 0...3
-    const int64_t ir  = tid%16;   // ir is in 0...15
-    const int64_t is  = 2*il;     // is is in 0...6
-
-    dst_t * y = yy + i*QK_K + 64*il + 2*ir;
-
-    const float dall = __low2half(x[i].dm);
-    const float dmin = __high2half(x[i].dm);
-
-    const uint8_t * ql = x[i].qs + 32*il + 2*ir;
-    const uint8_t * qh = x[i].qh + 2*ir;
-
-    uint8_t sc, m;
-    get_scale_min_k4(is + 0, x[i].scales, sc, m);
-    const float d1 = dall * sc; const float m1 = dmin * m;
-    get_scale_min_k4(is + 1, x[i].scales, sc, m);
-    const float d2 = dall * sc; const float m2 = dmin * m;
-
-    uint8_t   hm  = 1 << (2*il);
-    y[ 0] = DequantizeCast<dst_t>::cast(d1 * ((ql[ 0] & 0xF) + (qh[ 0] & hm ? 16 : 0)) - m1);
-    y[ 1] = DequantizeCast<dst_t>::cast(d1 * ((ql[ 1] & 0xF) + (qh[ 1] & hm ? 16 : 0)) - m1);
-    hm <<= 1;
-    y[32] = DequantizeCast<dst_t>::cast(d2 * ((ql[ 0] >>  4) + (qh[ 0] & hm ? 16 : 0)) - m2);
-    y[33] = DequantizeCast<dst_t>::cast(d2 * ((ql[ 1] >>  4) + (qh[ 1] & hm ? 16 : 0)) - m2);
+    dequantize_block_q5_K_impl<dst_t>(vx, yy, blockIdx.x, threadIdx.x);
 }
 
 template<typename dst_t>
 static __global__ void dequantize_block_q6_K(const void * __restrict__ vx, dst_t * __restrict__ yy) {
-    const block_q6_K * x = (const block_q6_K *) vx;
-
-    const int64_t i = blockIdx.x;
-
-    // assume 64 threads - this is very slightly better than the one below
-    const int64_t tid = threadIdx.x;
-    const int64_t ip  = tid/32;   // ip is 0 or 1
-    const int64_t il  = tid - 32*ip; // 0...32
-    const int64_t is  = 8*ip + il/16;
-
-    dst_t * y = yy + i*QK_K + 128*ip + il;
-
-    const float d = x[i].d;
-
-    const uint8_t * ql = x[i].ql + 64*ip + il;
-    const uint8_t   qh = x[i].qh[32*ip + il];
-    const int8_t  * sc = x[i].scales + is;
-
-    y[ 0] = DequantizeCast<dst_t>::cast(d * sc[0] * ((int8_t)((ql[ 0] & 0xF) | (((qh >> 0) & 3) << 4)) - 32));
-    y[32] = DequantizeCast<dst_t>::cast(d * sc[2] * ((int8_t)((ql[32] & 0xF) | (((qh >> 2) & 3) << 4)) - 32));
-    y[64] = DequantizeCast<dst_t>::cast(d * sc[4] * ((int8_t)((ql[ 0]  >> 4) | (((qh >> 4) & 3) << 4)) - 32));
-    y[96] = DequantizeCast<dst_t>::cast(d * sc[6] * ((int8_t)((ql[32]  >> 4) | (((qh >> 6) & 3) << 4)) - 32));
+    dequantize_block_q6_K_impl<dst_t>(vx, yy, blockIdx.x, threadIdx.x);
 }
 
 template<typename dst_t>
 static __global__ void dequantize_block_iq3_s(const void * __restrict__ vx,
                                                dst_t * __restrict__ yy) {
-    const int64_t block = blockIdx.x;
-    const block_iq3_s *x = (const block_iq3_s *)vx;
-
-    const int64_t tid = threadIdx.x;
-    const int64_t il = tid / 8;
-    const int64_t ib = tid % 8;
-    dst_t *y = yy + block * QK_K + 32 * ib + 8 * il;
-    const uint8_t *qs = x[block].qs + 8 * ib;
-    const uint8_t *grid1 = (const uint8_t *)(
-        iq3s_grid +
-        (qs[2 * il] | ((x[block].qh[ib] << (8 - 2 * il)) & 0x100)));
-    const uint8_t *grid2 = (const uint8_t *)(
-        iq3s_grid +
-        (qs[2 * il + 1] |
-         ((x[block].qh[ib] << (7 - 2 * il)) & 0x100)));
-    const float scale = __half2float(x[block].d) *
-        (1 + 2 * ((x[block].scales[ib / 2] >> (4 * (ib % 2))) & 0x0f));
-    const uint8_t signs = x[block].signs[4 * ib + il];
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const float sign0 = (signs & kmask_iq2xs[j]) ? -1.0f : 1.0f;
-        const float sign1 = (signs & kmask_iq2xs[j + 4]) ? -1.0f : 1.0f;
-        y[j] = DequantizeCast<dst_t>::cast(scale * grid1[j] * sign0);
-        y[j + 4] = DequantizeCast<dst_t>::cast(scale * grid2[j] * sign1);
-    }
+    dequantize_block_iq3_s_impl<dst_t>(vx, yy, blockIdx.x, threadIdx.x);
 }
 
 template<typename dst_t>
@@ -2671,17 +2282,24 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
     ggml_backend_cuda_context ctx;
 
     ggml_type ggufType = (ggml_type)weight.ggmlType;
-    const bool forceFp32Dequant = weight.forceGGUFFp32Dequant;
-    auto dequantFp32 = forceFp32Dequant ? ggml_get_to_fp32_cuda(ggufType) : nullptr;
+    // The model-wide safety flag still selects dequantization for prefill.
+    // Single-token decode uses the existing quantized GEMV implementations.
+    const bool forceFp32Dequant = n != 1 && weight.forceGGUFFp32Dequant;
+    auto dequantFp32 = weight.forceGGUFFp32Dequant ? ggml_get_to_fp32_cuda(ggufType) : nullptr;
     auto dequantFp16 = ggml_get_to_fp16_cuda(ggufType);
     auto has_vec_dot = get_has_vec_dot_q_cuda((ggml_type)weight.ggmlType);
     cudaStream_t stream = cudaStreamPerThread;
+    // has_vec_dot covers only the legacy dispatcher. Try extended MMVQ
+    // before the direct fallback so IQ2/IQ1 and Q4_0/Q4_1 are not shadowed.
     const bool usedExtendedMmvq = !forceFp32Dequant &&
         FastllmCudaFloatMatMulGGUFMMVQ(
             cudaInput, weight.cudaData, cudaOutput, weight.ggmlType,
             n, m, k, stream);
+    const bool usedDirectGemv = n == 1 && !usedExtendedMmvq && !has_vec_dot &&
+        FastllmGgufDirectGemv(cudaInput, weight.cudaData, cudaOutput,
+                             ggufType, m, k, stream);
 
-    if (!usedExtendedMmvq &&
+    if (!usedDirectGemv && !usedExtendedMmvq &&
         (forceFp32Dequant || n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) &&
         dequantFp32 != nullptr) {
         auto fastllmCublasHandle = getFastllmCublasHandle();
@@ -2716,7 +2334,7 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
                 throw("cublas error");
             }
         }
-    } else if (!usedExtendedMmvq &&
+    } else if (!usedDirectGemv && !usedExtendedMmvq &&
                (n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) &&
                dequantFp16 != nullptr) {
         auto fastllmCublasHandle = getFastllmCublasHandle();
@@ -2760,7 +2378,7 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
                 throw("cublas error");
             }
         }
-    } else if (!usedExtendedMmvq) {
+    } else if (!usedDirectGemv && !usedExtendedMmvq) {
         q8Input = (block_q8_1*)FastllmCudaMalloc(n * m * sizeof(half));
         quantize_row_q8_1_cuda (
             cudaInput, q8Input, m, n, 1, m, GGML_TYPE_Q8_1, stream
@@ -2845,11 +2463,10 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
     ggml_backend_cuda_context ctx;
 
     const ggml_type ggufType = (ggml_type)weight.ggmlType;
-    const bool forceDequant = weight.forceGGUFFp32Dequant;
+    const bool forceDequant = n != 1 && weight.forceGGUFFp32Dequant;
     auto dequant = ggml_get_to_fp16_cuda(ggufType);
     auto has_vec_dot = get_has_vec_dot_q_cuda(ggufType);
     cudaStream_t stream = cudaStreamPerThread;
-
     const bool usedMmq = !forceDequant &&
         FastllmCudaHalfMatMulGGUFMMQ(
             cudaInput, weight.cudaData, cudaOutput, weight.ggmlType,
@@ -2859,7 +2476,11 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
             cudaInput, weight.cudaData, cudaOutput, weight.ggmlType,
             n, m, k, stream);
 
-    if (!usedMmq && !usedExtendedMmvq &&
+    const bool usedDirectGemv = n == 1 && !usedMmq && !usedExtendedMmvq && !has_vec_dot &&
+        FastllmGgufDirectGemv(cudaInput, weight.cudaData, cudaOutput,
+                             ggufType, m, k, stream);
+
+    if (!usedDirectGemv && !usedMmq && !usedExtendedMmvq &&
         (forceDequant || n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) &&
         dequant != nullptr) {
         auto handle = getFastllmCublasHandle();
@@ -2869,7 +2490,7 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
         FastllmGGUFDequantGemm(
                 cudaInput, weight, cudaOutput, n, m, k,
                 workspace, workspaceBytes, dequant, handle, stream);
-    } else if (!usedMmq && !usedExtendedMmvq) {
+    } else if (!usedDirectGemv && !usedMmq && !usedExtendedMmvq) {
         q8Input = (block_q8_1*)FastllmCudaMalloc(n * m * sizeof(half));
         quantize_row_q8_1_cuda (
             cudaInput, q8Input, m, n, 1, m, GGML_TYPE_Q8_1, stream
@@ -3297,11 +2918,10 @@ bool FastllmCudaBFloat16MatMulGGUF(const fastllm::Data &input, fastllm::Data &we
     ggml_backend_cuda_context ctx;
 
     const ggml_type ggufType = (ggml_type)weight.ggmlType;
-    const bool forceDequant = weight.forceGGUFFp32Dequant;
+    const bool forceDequant = n != 1 && weight.forceGGUFFp32Dequant;
     auto dequant = ggml_get_to_bf16_cuda(ggufType);
     auto has_vec_dot = get_has_vec_dot_q_cuda(ggufType);
     cudaStream_t stream = cudaStreamPerThread;
-
     const bool usedMmq = !forceDequant &&
         FastllmCudaBFloat16MatMulGGUFMMQ(
             cudaInput, weight.cudaData, cudaOutput, weight.ggmlType,
@@ -3311,7 +2931,11 @@ bool FastllmCudaBFloat16MatMulGGUF(const fastllm::Data &input, fastllm::Data &we
             cudaInput, weight.cudaData, cudaOutput, weight.ggmlType,
             n, m, k, stream);
 
-    if (!usedMmq && !usedExtendedMmvq &&
+    const bool usedDirectGemv = n == 1 && !usedMmq && !usedExtendedMmvq && !has_vec_dot &&
+        FastllmGgufDirectGemv(cudaInput, weight.cudaData, cudaOutput,
+                             ggufType, m, k, stream);
+
+    if (!usedDirectGemv && !usedMmq && !usedExtendedMmvq &&
         (forceDequant || n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) &&
         dequant != nullptr) {
         auto handle = getFastllmCublasHandle();
@@ -3321,7 +2945,7 @@ bool FastllmCudaBFloat16MatMulGGUF(const fastllm::Data &input, fastllm::Data &we
         FastllmGGUFDequantGemm(
                 cudaInput, weight, cudaOutput, n, m, k,
                 workspace, workspaceBytes, dequant, handle, stream);
-    } else if (!usedMmq && !usedExtendedMmvq) {
+    } else if (!usedDirectGemv && !usedMmq && !usedExtendedMmvq) {
         q8Input = (block_q8_1 *)FastllmCudaMalloc(n * m * sizeof(__nv_bfloat16));
         quantize_row_q8_1_cuda(
             cudaInput, q8Input, m, n, 1, m, GGML_TYPE_Q8_1, stream
