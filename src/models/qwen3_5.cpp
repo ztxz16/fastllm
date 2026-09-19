@@ -13740,7 +13740,13 @@ namespace fastllm {
                 if (!combinedGdnZCandidate) {
                     ensureProjectedZSplit();
                 }
-                if (batchedConvSequence) {
+                if (projectedConvBlock) {
+                    // The GDN input Block already produced convOutput and z,
+                    // including its unfused fallback for weight types the fused
+                    // FP8 kernel cannot consume (for example signed INT8
+                    // per-channel weights).  There is no materialized
+                    // qkvConvInput to reshape on this path.
+                } else if (batchedConvSequence) {
                     // Keep the flattened token-major projection. Each request
                     // is handled independently before its cache update.
                 } else if (batch == 1 && all1 && pastKey.dims.size() > 0) {
@@ -13757,7 +13763,11 @@ namespace fastllm {
                         {bsz, seqlen, localValueHeads, head_v_dim});
                 }
 
-                if (batchedRaggedPrefill) {
+                if (projectedConvBlock) {
+                    // CudaGdnInputConvBlock already produced convOutput and z
+                    // and owns the conv-cache update on both the fused and the
+                    // unfused fallback path.
+                } else if (batchedRaggedPrefill) {
                     std::vector<Data*> requestPastKeys(batch);
                     for (int rb = 0; rb < batch; rb++) {
                         Data *requestPastKey =
@@ -14047,7 +14057,10 @@ namespace fastllm {
                 }
 
                 Data *convOutputForRecurrent = &convOutput;
-                if (batchedConvSequence) {
+                if (projectedConvBlock) {
+                    // convOutput already carries the [1, batch, channels]
+                    // layout produced by the GDN input Block.
+                } else if (batchedConvSequence) {
                     // Request-local outputs are already [1, seq, channels]
                     // and concatenated in flattened request order.
                 } else if (batch == 1 && all1 && pastKey.dims.size() > 0) {
