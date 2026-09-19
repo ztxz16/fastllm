@@ -6799,16 +6799,36 @@ namespace fastllm {
                 qgatekv.dataType != DataType::FLOAT16 ||
                 qgatekv.dims.size() != 3 ||
                 qgatekv.dims[0] != 1 ||
-                qgatekv.dims[1] <
-                    Qwen3CudaEnvInt(
-                        "FASTLLM_CUDA_QWEN35_FUSED_ATTN_PREFILL_MIN_BATCH",
-                        128) ||
                 (headDim != 128 && headDim != 256) ||
                 rotaryDim <= 0 || rotaryDim > headDim ||
                 (rotaryDim % 2) != 0) {
                 return false;
             }
             int seqlen = qgatekv.dims[1];
+            const char *minimumEnv = std::getenv(
+                "FASTLLM_CUDA_QWEN35_FUSED_ATTN_PREFILL_MIN_BATCH");
+            const bool smallSequence =
+                (!minimumEnv || !*minimumEnv) && seqlen >= 1 && seqlen <= 8;
+            if (seqlen < Qwen3CudaEnvInt(
+                    "FASTLLM_CUDA_QWEN35_FUSED_ATTN_PREFILL_MIN_BATCH", 128) &&
+                !smallSequence) {
+                return false;
+            }
+            // CanRun: reject unsupported storage before touching outputs or KV.
+            auto denseLocal = [&](const Data &data) {
+                if (data.dataDevice != DataDevice::CUDA || !data.cudaData ||
+                    data.multiDeviceData || reinterpret_cast<uintptr_t>(data.cudaData) % 4 ||
+                    data.dataDeviceIds != std::vector<int>{runner.DeviceId()} ||
+                    data.dims.empty() || data.strides.size() != data.dims.size()) return false;
+                uint64_t stride = 1;
+                for (int i = (int)data.dims.size() - 1; i >= 0; --i) {
+                    if (data.dims[i] <= 0 || data.strides[i] != stride) return false;
+                    stride *= data.dims[i];
+                }
+                return true;
+            };
+            if (!denseLocal(qgatekv) || !denseLocal(qNormWeight) ||
+                !denseLocal(kNormWeight) || !denseLocal(positionIds)) return false;
             auto prepareOutput = [&](Data &output,
                                      const std::vector<int> &dims) {
                 Qwen3CudaPrepareLocalOutput(output, runner.DeviceId());
