@@ -18206,7 +18206,8 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16(
         snap->dataType = cache.dataType;
         snap->Resize(cache.dims);
         snap->ToDevice(cache.dataDevice, std::vector<int>{cacheDevice});
-        snap->Allocate();
+        // The kernel fully overwrites the snapshot before it is read.
+        snap->Allocate(false);
         snap->isLinearAttentionTransposed = false;
         if (snap->cudaData == nullptr || !FastllmCudaDataHasDenseStrides(*snap) ||
             !FastllmCudaDataCanShareDevice(cache, *snap)) {
@@ -18338,7 +18339,8 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16BatchPointers(
             snapshot->Resize(first.dims);
             snapshot->ToDevice(fastllm::DataDevice::CUDA,
                                std::vector<int>{device});
-            snapshot->Allocate();
+            // The kernel fully overwrites the snapshot before it is read.
+            snapshot->Allocate(false);
             snapshot->isLinearAttentionTransposed = false;
             if (snapshot->cudaData == nullptr ||
                 !FastllmCudaDataHasDenseStrides(*snapshot) ||
@@ -21361,7 +21363,8 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16Snapshots(
         snap->dataType = last_recurrent_state.dataType;
         snap->Resize(last_recurrent_state.dims);
         snap->ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{stateDevice});
-        snap->Allocate();
+        // The kernel fully overwrites the snapshot before it is read.
+        snap->Allocate(false);
         snap->isLinearAttentionTransposed = true;
         if (snap->cudaData == nullptr || !FastllmCudaDataHasDenseStrides(*snap) ||
             !FastllmCudaDataCanShareDevice(last_recurrent_state, *snap)) {
@@ -21491,7 +21494,8 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnaps
             snapshot->Resize(first.dims);
             snapshot->ToDevice(fastllm::DataDevice::CUDA,
                                std::vector<int>{device});
-            snapshot->Allocate();
+            // The kernel fully overwrites the snapshot before it is read.
+            snapshot->Allocate(false);
             snapshot->isLinearAttentionTransposed = true;
             if (snapshot->cudaData == nullptr ||
                 !FastllmCudaDataHasDenseStrides(*snapshot) ||
