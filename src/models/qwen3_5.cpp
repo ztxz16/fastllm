@@ -13753,6 +13753,38 @@ namespace fastllm {
                         (speculativeLinearStateCaptureSlots == 0 ||
                          expectedCaptureSlots <= speculativeLinearStateCaptureSlots);
                 }
+                // Each TP rank owns its projection, convolution cache and snapshots.
+                // Short single-request verify can consume that local projection directly.
+                // A rejected Try call retains the original Split/Permute path.
+                bool directSingleVerifyConv = false;
+                if (batch == 1 && bsz == 1 &&
+                    speculativeCollectAllLogits && captureLinearState &&
+                    seqlen > 1 && seqlen <= QWEN35_MTP_FAST_SEQ_MAX &&
+                    !hasSeparateQkvZGdnInLinear &&
+                    gdnMerged.dims.size() == 3 && gdnMerged.dims[0] == 1 &&
+                    gdnMerged.dims[1] == seqlen) {
+                    int captureTokens = std::min(
+                        std::min(seqlen, linearStateCaptureSlots),
+                        QWEN35_MTP_PREFIX_SNAPSHOT_MAX);
+                    std::vector<Data*> snapshots;
+                    snapshots.reserve(captureTokens);
+                    for (int token = 0; token < captureTokens; ++token) {
+                        snapshots.push_back(getLinearCaptureSlot(token, true));
+                    }
+                    directSingleVerifyConv =
+                        FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16BatchPointers(
+                            {&pastKey}, gdnMerged,
+                            *requireLocal(weight[conv1dWeightName], conv1dWeightName),
+                            *requireLocal(GetThreadTensorParallelBias(conv1dBiasName), conv1dBiasName),
+                            convOutput, snapshots, captureTokens, 0);
+                    if (directSingleVerifyConv) {
+                        for (int token = 0; token < captureTokens; ++token) {
+                            snapshots[token]->cacheUid = pastKey.cacheUid;
+                            Qwen35PrepareLinearAttentionCache(*snapshots[token], computeType);
+                            markLinearCaptured(token, 1);
+                        }
+                    }
+                }
                 bool batchedConvSequence =
                     batchedSpeculativeSequence || batchedPrefill ||
                     singleFusedConvPrefill;
@@ -13771,12 +13803,12 @@ namespace fastllm {
                      tokenMajorBatchedSpeculativeConv);
                 bool mtpCombinedGdnZCandidate =
                     !hasSeparateQkvZGdnInLinear &&
-                    tokenMajorBatchedSpeculativeConv &&
+                    (tokenMajorBatchedSpeculativeConv || directSingleVerifyConv) &&
                     Qwen35MtpCombinedZGateEnabled();
                 bool combinedGdnZCandidate =
                     (!hasSeparateQkvZGdnInLinear && uniformPrefill) ||
                     mtpCombinedGdnZCandidate;
-                if (!combinedGdnConvCandidate) {
+                if (!combinedGdnConvCandidate && !directSingleVerifyConv) {
                     ensureProjectedQkvSplit();
                 }
                 if (!combinedGdnZCandidate) {
@@ -13784,7 +13816,7 @@ namespace fastllm {
                 }
                 if (projectedConvBlock) {
                     // The Block does not materialize qkvConvInput.
-                } else if (batchedConvSequence) {
+                } else if (batchedConvSequence || directSingleVerifyConv) {
                     // Keep the flattened token-major projection. Each request
                     // is handled independently before its cache update.
                 } else if (batch == 1 && all1 && pastKey.dims.size() > 0) {
@@ -13804,6 +13836,9 @@ namespace fastllm {
                 if (projectedConvBlock) {
                     // Both Block implementations already updated the cache and
                     // produced the activated convolution output.
+                } else if (directSingleVerifyConv) {
+                    // Output and prefix snapshots were produced above in the
+                    // recurrent consumer's [batch, token, channel] layout.
                 } else if (batchedRaggedPrefill) {
                     std::vector<Data*> requestPastKeys(batch);
                     for (int rb = 0; rb < batch; rb++) {
@@ -14096,7 +14131,7 @@ namespace fastllm {
                 Data *convOutputForRecurrent = &convOutput;
                 if (projectedConvBlock) {
                     // Block output is already [1, batch, channels].
-                } else if (batchedConvSequence) {
+                } else if (batchedConvSequence || directSingleVerifyConv) {
                     // Request-local outputs are already [1, seq, channels]
                     // and concatenated in flattened request order.
                 } else if (batch == 1 && all1 && pastKey.dims.size() > 0) {

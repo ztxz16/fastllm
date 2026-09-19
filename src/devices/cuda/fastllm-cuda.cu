@@ -17479,8 +17479,16 @@ __global__ void FastllmShiftAppendConv1DPerChannelSiluMultiTokenHalfPointerKerne
     cacheRow[3] = x3;
 }
 
+// One request and at most seven prefix snapshots fit in launch parameters.
+// This avoids staging a device pointer table for the single-request path.
+struct FastllmInlineConvCachePointers {
+    half *values[8];
+    __device__ half *operator[](int index) const { return values[index]; }
+};
+
+template <typename PointerTable>
 __global__ void FastllmShiftAppendConv1DPerChannelSiluMultiTokenMajorHalfPointerKernel(
-    half **pointers, const half *newTokens, const float *weight,
+    PointerTable pointers, const half *newTokens, const float *weight,
     const float *bias, half *output, int batch, int channels,
     int numTokens, int inputChannels, int inputOffset, int numSnaps) {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
@@ -18352,6 +18360,26 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16BatchPointers(
     if (output.cudaData == nullptr || !FastllmCudaDataHasDenseStrides(output) ||
         !FastllmCudaDataCanShareDevice(first, output)) {
         return false;
+    }
+    if (batch == 1 && tokenMajorInput && numTokenCaches > 0 &&
+        numTokens <= FASTLLM_CUDA_MTP_FAST_SEQ_MAX && pointers.size() <= 8) {
+        FastllmInlineConvCachePointers inlinePointers = {};
+        for (size_t i = 0; i < pointers.size(); ++i) {
+            inlinePointers.values[i] = static_cast<half*>(pointers[i]);
+        }
+        FastllmShiftAppendConv1DPerChannelSiluMultiTokenMajorHalfPointerKernel
+            <<<(channels + 255) / 256, 256>>>(
+                inlinePointers, (const half*)newTokens.cudaData,
+                (const float*)weight.cudaData,
+                bias.dims.empty() ? nullptr : (const float*)bias.cudaData,
+                (half*)output.cudaData, batch, channels, numTokens,
+                newTokens.dims[2], tokenMajorInputOffset, numTokenCaches);
+        cudaError_t state = cudaGetLastError();
+        if (state != cudaSuccess) {
+            checkCudaErrors("Error: CUDA error in single-request token-major conv.", state);
+            return false;
+        }
+        return true;
     }
     void **devicePointers = FastllmCudaStagePointers(pointers);
     int total = batch * channels;
