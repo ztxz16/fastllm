@@ -804,6 +804,15 @@ bool get_has_vec_dot_q_cuda(ggml_type type) {
     }
 }
 
+// Only ordinary, block-aligned 2..8-row verification may bypass the model's
+// dequant safety flag. Extended MMVQ must still succeed before fallback is
+// skipped; unsupported types/layouts and larger prefill retain that fallback.
+static bool FastllmGGUFSmallMmvqShape(ggml_type type, int n, int m, int k) {
+    const int blockSize = ggml_blck_size(type);
+    return n >= 2 && n <= MMVQ_MAX_BATCH_SIZE && m > 0 && k > 0 &&
+           blockSize > 0 && m % blockSize == 0 && m % QK8_1 == 0;
+}
+
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
     switch (type) {        
         case GGML_TYPE_Q2_K   : return vec_dot_q2_K_q8_1;
@@ -973,7 +982,11 @@ static __device__ void mul_mat_vec_q(
         for (int j = 0; j < ncols_y; ++j) {
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp[j][i] += vec_dot_q_cuda(vx, &y[j*blocks_per_col_y + kby], (row0 + i)*blocks_per_row_x + kbx, kqs);
+                // The final two-row tile may contain only one weight row.
+                // Mask the read as well as the output store below.
+                if (rows_per_cuda_block == 1 || row0 + i < nrows_x) {
+                    tmp[j][i] += vec_dot_q_cuda(vx, &y[j*blocks_per_col_y + kby], (row0 + i)*blocks_per_row_x + kbx, kqs);
+                }
             }
         }
     }
@@ -2306,16 +2319,17 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
     ggml_backend_cuda_context ctx;
 
     ggml_type ggufType = (ggml_type)weight.ggmlType;
-    // The model-wide safety flag still selects dequantization for prefill.
-    // Single-token decode uses the existing quantized GEMV implementations.
-    const bool forceFp32Dequant = n != 1 && weight.forceGGUFFp32Dequant;
+    const bool allowSmallMmvq = weight.forceGGUFFp32Dequant &&
+        FastllmGGUFSmallMmvqShape(ggufType, n, m, k);
+    const bool forceFp32Dequant = n != 1 && weight.forceGGUFFp32Dequant &&
+        !(allowSmallMmvq && get_has_vec_dot_q_cuda(ggufType));
     auto dequantFp32 = weight.forceGGUFFp32Dequant ? ggml_get_to_fp32_cuda(ggufType) : nullptr;
     auto dequantFp16 = ggml_get_to_fp16_cuda(ggufType);
     auto has_vec_dot = get_has_vec_dot_q_cuda((ggml_type)weight.ggmlType);
     cudaStream_t stream = cudaStreamPerThread;
     // has_vec_dot covers only the legacy dispatcher. Try extended MMVQ
     // before the direct fallback so IQ2/IQ1 and Q4_0/Q4_1 are not shadowed.
-    const bool usedExtendedMmvq = !forceFp32Dequant &&
+    const bool usedExtendedMmvq = (!forceFp32Dequant || allowSmallMmvq) &&
         FastllmCudaFloatMatMulGGUFMMVQ(
             cudaInput, weight.cudaData, cudaOutput, weight.ggmlType,
             n, m, k, stream);
@@ -2487,15 +2501,18 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
     ggml_backend_cuda_context ctx;
 
     const ggml_type ggufType = (ggml_type)weight.ggmlType;
-    const bool forceDequant = n != 1 && weight.forceGGUFFp32Dequant;
+    const bool allowSmallMmvq = weight.forceGGUFFp32Dequant &&
+        FastllmGGUFSmallMmvqShape(ggufType, n, m, k);
+    const bool forceDequant = n != 1 && weight.forceGGUFFp32Dequant &&
+        !(allowSmallMmvq && get_has_vec_dot_q_cuda(ggufType));
     auto dequant = ggml_get_to_fp16_cuda(ggufType);
     auto has_vec_dot = get_has_vec_dot_q_cuda(ggufType);
     cudaStream_t stream = cudaStreamPerThread;
-    const bool usedMmq = !forceDequant &&
+    const bool usedMmq = !forceDequant && !allowSmallMmvq &&
         FastllmCudaHalfMatMulGGUFMMQ(
             cudaInput, weight.cudaData, cudaOutput, weight.ggmlType,
             n, m, k, stream);
-    const bool usedExtendedMmvq = !forceDequant && !usedMmq &&
+    const bool usedExtendedMmvq = (!forceDequant || allowSmallMmvq) && !usedMmq &&
         FastllmCudaHalfMatMulGGUFMMVQ(
             cudaInput, weight.cudaData, cudaOutput, weight.ggmlType,
             n, m, k, stream);
@@ -2941,15 +2958,18 @@ bool FastllmCudaBFloat16MatMulGGUF(const fastllm::Data &input, fastllm::Data &we
     ggml_backend_cuda_context ctx;
 
     const ggml_type ggufType = (ggml_type)weight.ggmlType;
-    const bool forceDequant = n != 1 && weight.forceGGUFFp32Dequant;
+    const bool allowSmallMmvq = weight.forceGGUFFp32Dequant &&
+        FastllmGGUFSmallMmvqShape(ggufType, n, m, k);
+    const bool forceDequant = n != 1 && weight.forceGGUFFp32Dequant &&
+        !(allowSmallMmvq && get_has_vec_dot_q_cuda(ggufType));
     auto dequant = ggml_get_to_bf16_cuda(ggufType);
     auto has_vec_dot = get_has_vec_dot_q_cuda(ggufType);
     cudaStream_t stream = cudaStreamPerThread;
-    const bool usedMmq = !forceDequant &&
+    const bool usedMmq = !forceDequant && !allowSmallMmvq &&
         FastllmCudaBFloat16MatMulGGUFMMQ(
             cudaInput, weight.cudaData, cudaOutput, weight.ggmlType,
             n, m, k, stream);
-    const bool usedExtendedMmvq = !forceDequant && !usedMmq &&
+    const bool usedExtendedMmvq = (!forceDequant || allowSmallMmvq) && !usedMmq &&
         FastllmCudaBFloat16MatMulGGUFMMVQ(
             cudaInput, weight.cudaData, cudaOutput, weight.ggmlType,
             n, m, k, stream);

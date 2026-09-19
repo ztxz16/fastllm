@@ -42,17 +42,24 @@ static std::vector<float> ReadOutput(fastllm::Data data) {
     return {p, p + data.Count(0)};
 }
 static void Run(const fastllm::Data &x, fastllm::Data &w, fastllm::Data &y,
-                fastllm::DataType dtype, int cols, int rows) {
+                fastllm::DataType dtype, int cols, int rows, int tokens) {
     fastllm::Data bias;
-    bool ok = dtype == fastllm::DataType::FLOAT16 ? FastllmCudaHalfMatMulGGUF(x,w,bias,y,1,cols,rows) :
-              dtype == fastllm::DataType::BFLOAT16 ? FastllmCudaBFloat16MatMulGGUF(x,w,bias,y,1,cols,rows) :
-              FastllmCudaMatMulFloatGGUF(x,w,bias,y,1,cols,rows);
+    bool ok = dtype == fastllm::DataType::FLOAT16 ? FastllmCudaHalfMatMulGGUF(x,w,bias,y,tokens,cols,rows) :
+              dtype == fastllm::DataType::BFLOAT16 ? FastllmCudaBFloat16MatMulGGUF(x,w,bias,y,tokens,cols,rows) :
+              FastllmCudaMatMulFloatGGUF(x,w,bias,y,tokens,cols,rows);
     if (!ok) throw std::runtime_error("GGUF entry returned false");
     FastllmCudaSyncCurrentThreadStream();
     if (cudaGetLastError() != cudaSuccess) throw std::runtime_error("CUDA failure");
 }
 int main(int argc, char **argv) try {
-    if (argc != 2) throw std::runtime_error("usage: test-fastpath fixtures.bin");
+    if (argc < 2 || argc > 3) throw std::runtime_error("usage: test-fastpath fixtures.bin [tokens:1..9]");
+    const int tokens = argc == 3 ? std::stoi(argv[2]) : 1;
+    if (tokens < 1 || tokens > 9) throw std::runtime_error("tokens must be in [1,9]");
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, 0);
+    // On Blackwell, unflagged batch 8 can choose MMQ while flagged batch 8
+    // explicitly chooses MMVQ. Compare both to the CPU reference there.
+    const bool compareFlagBits = tokens < 8 || (tokens == 8 && prop.major < 12);
     FastllmCudaSetDevice(0);
     std::ifstream f(argv[1], std::ios::binary);
     f.exceptions(std::ios::failbit | std::ios::badbit);
@@ -75,10 +82,10 @@ int main(int argc, char **argv) try {
             std::mt19937 rng(1921+cols);
             std::normal_distribution<float> normal(0,.2f);
             for (int pattern = 0; pattern < 3; ++pattern) {
-                std::vector<float> input(cols), quantized(cols);
-                std::vector<double> sumDelta(cols/32);
-                for (int j=0;j<cols;++j) input[j]=RoundInput(pattern==0 ? normal(rng) : pattern==1 ? ((j%3)-1)*.125f : 0.f,dtype);
-                for (int j=0;j<cols;j+=32) {
+                std::vector<float> input(tokens*cols), quantized(tokens*cols);
+                std::vector<double> sumDelta(tokens*cols/32);
+                for (int j=0;j<tokens*cols;++j) input[j]=RoundInput(pattern==0 ? normal(rng) : pattern==1 ? ((j%3)-1)*.125f : 0.f,dtype);
+                for (int j=0;j<tokens*cols;j+=32) {
                     float maxabs=0;
                     for(int k=0;k<32;++k) maxabs=std::max(maxabs,std::abs(input[j+k]));
                     float d=maxabs/127.f, stored=__half2float(__float2half_rn(d));
@@ -87,27 +94,34 @@ int main(int argc, char **argv) try {
                     for(int k=0;k<32;++k) { originalSum+=input[j+k]; reconstructedSum+=quantized[j+k]; }
                     sumDelta[j/32]=__half2float(__float2half_rn(originalSum))-reconstructedSum;
                 }
-                fastllm::Data x(dtype,{1,cols},input);
+                fastllm::Data x(dtype,{tokens,cols},input);
                 x.ToDevice(fastllm::DataDevice::CUDA,std::vector<int>{0},true);
                 for (int count : {1,std::min(7,rows),rows}) {
                     std::vector<float> previous;
                     for (bool flag : {false,true}) {
-                        fastllm::Data y(dtype,{1,count+2},std::vector<float>(count+2,-17.f));
+                        // Nine rows must retain the flagged dequant path.
+                        if (tokens == 9 && !flag) continue;
+                        const int outputCount = tokens*count;
+                        fastllm::Data y(dtype,{1,outputCount+2},std::vector<float>(outputCount+2,-17.f));
                         y.ToDevice(fastllm::DataDevice::CUDA,std::vector<int>{0},true);
                         w.forceGGUFFp32Dequant=flag;
-                        Run(x,w,y,dtype,cols,count);
+                        Run(x,w,y,dtype,cols,count,tokens);
                         auto actual=ReadOutput(y);
-                        if(actual[count]!=-17.f || actual[count+1]!=-17.f) throw std::runtime_error("output guard overwritten");
-                        if(flag && actual!=previous) throw std::runtime_error("single-token result depends on prefill safety flag");
+                        if(actual[outputCount]!=-17.f || actual[outputCount+1]!=-17.f) throw std::runtime_error("output guard overwritten");
+                        if(flag && compareFlagBits && actual!=previous) throw std::runtime_error("MMVQ result depends on prefill safety flag");
                         previous=actual;
                         double e2=0,r2=0,a2=0;
-                        for(int i=0;i<count;++i) {
+                        for(int i=0;i<outputCount;++i) {
+                            const int row = i % count, token = i / count;
                             double expected=0,absSum=0;
                             for(int j=0;j<cols;++j) {
-                                double term=double(weights[size_t(i)*cols+j])*quantized[j];
+                                const float activation = tokens == 9 ? input[token*cols+j] : quantized[token*cols+j];
+                                const float decodedWeight = weights[size_t(row)*cols+j];
+                                const float referenceWeight = tokens == 9 ? RoundInput(decodedWeight, dtype) : decodedWeight;
+                                double term=double(referenceWeight)*activation;
                                 expected+=term; absSum+=std::abs(term);
                             }
-                            for(int j=0;j<cols;j+=32) expected+=AffineSumCorrection(type,packed.data()+size_t(i)*(packed.size()/rows),j,sumDelta[j/32]);
+                            if (tokens <= 8) for(int j=0;j<cols;j+=32) expected+=AffineSumCorrection(type,packed.data()+size_t(row)*(packed.size()/rows),j,sumDelta[(token*cols+j)/32]);
                             if(!std::isfinite(actual[i])) throw std::runtime_error("nonfinite output");
                             e2+=std::pow(actual[i]-expected,2);r2+=expected*expected;a2+=absSum*absSum;
                         }
@@ -128,6 +142,6 @@ int main(int argc, char **argv) try {
         std::cout<<"CASE "<<ci<<" type="<<type<<" cols="<<cols<<" failures="<<failures<<"\n";
     }
     for(auto [type,rel]:worst) std::cout<<"TYPE_WORST type="<<type<<" random_full_rows_relative_L2="<<rel<<"\n";
-    std::cout<<"RESULT cases="<<cases<<" checks="<<checks<<" failures="<<failures<<"\n";
+    std::cout<<"RESULT tokens="<<tokens<<" cases="<<cases<<" checks="<<checks<<" failures="<<failures<<"\n";
     return failures ? 1 : 0;
 } catch(const std::exception &e) { std::cerr<<e.what()<<"\n"; return 1; }
