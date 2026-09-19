@@ -180,13 +180,13 @@ template <class T> void Run(DataType type, int K, bool hasBias, int N = 5120, in
     cudaGraphExecDestroy(exec);
     cudaGraphDestroy(graph);
     // Unsupported batches must remain in the original complete LinearAdd path.
-    Data bx(type, {1, 2, K}), bo(type, {1, 2, N}), bm(type);
+    Data bx(type, {1, 9, K}), bo(type, {1, 9, N}), bm(type);
     Allocate(bx);
     Allocate(bo);
-    std::vector<T> bxx(2 * K, T(.01f)), boo(2 * N, T(.1f));
+    std::vector<T> bxx(9 * K, T(.01f)), boo(9 * N, T(.1f));
     Upload(bx, bxx);
     Upload(bo, boo);
-    Require(!FastllmCudaFP8LinearAddCanRun(bx, w, bias, bo), "batch two admitted");
+    Require(!FastllmCudaFP8LinearAddCanRun(bx, w, bias, bo), "batch nine admitted");
     op.RunOnDevice("cuda", "LinearAdd",
                    {{"input", &bx}, {"weight", &w}, {"bias", &bias}, {"middle", &bm}, {"output", &bo}}, {},
                    {});
@@ -201,7 +201,7 @@ template <class T> void Run(DataType type, int K, bool hasBias, int N = 5120, in
                    {});
     Check(cudaDeviceSynchronize());
     auto disabled = Download<T>(bo);
-    Require(!std::memcmp(fallback.data(), disabled.data(), 2 * N * sizeof(T)), "batch fallback differs");
+    Require(!std::memcmp(fallback.data(), disabled.data(), 9 * N * sizeof(T)), "batch fallback differs");
     // K=256 is valid for generic LinearAdd, but below this fusion's minimum reduction width.
     w.Resize({N, 256});
     w.blockM = 256;
@@ -228,6 +228,77 @@ template <class T> void Run(DataType type, int K, bool hasBias, int N = 5120, in
            hasBias, worst, baseRms);
     fflush(stdout);
 }
+template <class T> void SmallRows(DataType type, int M, int N = 5120, int K = 6144) {
+    Data w(DataType::FP8_E4M3, {N, K}), x(type, {1, M, K}), o(type, {1, M, N}), bias(DataType::FLOAT32),
+        middle(type);
+    w.blockK = 1;
+    w.blockM = K;
+    w.scales.resize(N);
+    std::vector<uint8_t> codes(size_t(N) * K);
+    std::vector<float> hb(N);
+    for (int n = 0; n < N; ++n) {
+        w.scales[n] = .003f * (1 + (n % 5));
+        hb[n] = (n % 7 - 3) * .007f;
+        std::fill(codes.begin() + size_t(n) * K, codes.begin() + size_t(n + 1) * K, n % 2 ? 0xb8 : 0x38);
+    }
+    if (M % 2) {
+        bias.Resize({N});
+        Allocate(bias);
+        Upload(bias, hb);
+    }
+    std::vector<T> hx(M * K), res(M * N, T(.125f));
+    for (int t = 0; t < M; ++t)
+        for (int k = 0; k < K; ++k)
+            hx[t * K + k] = T(.1f * std::sin(k * .017f + t));
+    Allocate(w);
+    Allocate(x);
+    Allocate(o);
+    Upload(w, codes);
+    Upload(x, hx);
+    Upload(o, res);
+    setenv("FASTLLM_CUDA_FP8_LINEAR_ADD", "1", 1);
+    Require(FastllmCudaFP8LinearAddCanRun(x, w, bias, o) == expectFused, "small rows admission");
+    Executor op;
+    auto launch = [&] {
+        op.RunOnDevice("cuda", "LinearAdd",
+                       {{"input", &x}, {"weight", &w}, {"bias", &bias}, {"middle", &middle}, {"output", &o}},
+                       {}, {});
+    };
+    launch();
+    Check(cudaDeviceSynchronize());
+    Upload(o, res);
+    cudaGraph_t g;
+    cudaGraphExec_t e;
+    Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+    launch();
+    Check(cudaStreamEndCapture(cudaStreamPerThread, &g));
+    Check(cudaGraphInstantiate(&e, g, nullptr, nullptr, 0));
+    Check(cudaGraphLaunch(e, cudaStreamPerThread));
+    Check(cudaStreamSynchronize(cudaStreamPerThread));
+    auto out = Download<T>(o);
+    for (int t = 0; t < M; ++t) {
+        double sum = 0;
+        for (int k = 0; k < K; ++k)
+            sum += float(hx[t * K + k]);
+        for (int n = 0; n < N; ++n) {
+            float ref =
+                float(T(.125f + float(T(sum * (n % 2 ? -1 : 1) * w.scales[n] + (M % 2 ? hb[n] : 0.f)))));
+            Require(std::abs(float(out[t * N + n]) - ref) < .01f * (1 + std::abs(ref)),
+                    "small rows reference");
+        }
+    }
+    setenv("FASTLLM_CUDA_FP8_SMALL_T", "0", 1);
+    Require(!FastllmCudaFP8LinearAddCanRun(x, w, bias, o), "small rows disable ignored");
+    Upload(o, res);
+    launch();
+    Check(cudaDeviceSynchronize());
+    for (T v : Download<T>(o))
+        Require(std::isfinite(float(v)), "small rows fallback nonfinite");
+    unsetenv("FASTLLM_CUDA_FP8_SMALL_T");
+    Check(cudaGraphExecDestroy(e));
+    Check(cudaGraphDestroy(g));
+    printf("PASS small rows M=%d dtype=%d\n", M, int(type));
+}
 int main(int argc, char **argv) {
     if (argc == 2 && !std::strcmp(argv[1], "--expect-fallback"))
         expectFused = false;
@@ -244,6 +315,12 @@ int main(int argc, char **argv) {
             }
         Run<half>(DataType::FLOAT16, 5803, false, 4099, 17408);
         Run<__nv_bfloat16>(DataType::BFLOAT16, 5803, false, 4099, 17408);
+        for (int M = 2; M <= 8; ++M) {
+            SmallRows<half>(DataType::FLOAT16, M);
+            SmallRows<__nv_bfloat16>(DataType::BFLOAT16, M);
+        }
+        SmallRows<half>(DataType::FLOAT16, 5, 513, 768);
+        SmallRows<__nv_bfloat16>(DataType::BFLOAT16, 7, 513, 768);
         puts("ALL PASS");
     } catch (const std::exception &e) {
         fprintf(stderr, "FAIL: %s\n", e.what());

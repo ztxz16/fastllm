@@ -3,6 +3,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include "devices/cuda/fastllm-fp8-small-t.cuh"
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -79,7 +80,7 @@ template <class T> void Run(int K, int N, int M, bool bias, bool block, bool exp
                     "driver graph kernel params");
                 const char *name = nullptr;
                 Req(cuFuncGetName(&name, p.func) == CUDA_SUCCESS, "driver kernel name");
-                seen |= std::strstr(name, "fp8row") != nullptr;
+                seen |= (std::strstr(name, "fp8row") != nullptr || std::strstr(name, "fp8small") != nullptr);
             }
         }
         Req(seen == (bool(mode) && expected), "graph dispatch mismatch");
@@ -141,12 +142,20 @@ int main() {
         int n = 0;
         if (cudaGetDeviceCount(&n) != cudaSuccess || !n)
             return 77;
+        int device = 0;
+        Check(cudaGetDevice(&device));
+        Req(!fastllm::fp8small::KernelAvailable<
+                fastllm::fp8small::MmaKernel<half, 8, 16>, 1025>(device),
+            "unsupported block size admitted");
+        Req(!fastllm::fp8small::CanRun<half>(device, 512, 513, 9),
+            "unsupported row count admitted");
+        Check(cudaGetLastError());
 #define RUN(T)                                                                                               \
     Run<T>(5120, 14336, 1, false, false, true);                                                              \
     Run<T>(5120, 248320, 1, false, false, true);                                                             \
     Run<T>(1024, 4099, 1, true, false, true);                                                                \
     Run<T>(768, 4096, 1, false, false, true);                                                               \
-    Run<T>(1024, 4096, 2, true, false, false);                                                               \
+    Run<T>(1024, 4096, 2, true, false, true);                                                               \
     Run<T>(1024, 4096, 1, false, true, false)
         RUN(half);
         RUN(__nv_bfloat16);
@@ -162,6 +171,14 @@ int main() {
         }
         Run<half>(5803, 4099, 2, true, false, false, 17408);
         Run<__nv_bfloat16>(5803, 4099, 2, true, false, false, 17408);
+        for (int M=2; M<=8; ++M) {
+            Run<half>(5120, 16384, M, M%2, false, true);
+            Run<__nv_bfloat16>(5120, 14336, M, M%2, false, true);
+            Run<half>(768, 4099, M, true, false, true);
+        }
+        Run<half>(5120,14336,9,false,false,false);
+        Run<half>(5120,3584,4,false,false,true);
+        Run<__nv_bfloat16>(1536,513,8,true,false,true);
         puts("PASS row FP8");
     } catch (const std::exception &e) {
         fprintf(stderr, "FAIL %s\n", e.what());

@@ -1,3 +1,4 @@
+#include "devices/cuda/fastllm-fp8-small-t.cuh"
 //
 // Created by huangyuyang on 2/6/26.
 //
@@ -842,7 +843,9 @@ static bool CanRunFastllmRowFP8(const T *input, const uint8_t *weight, const T *
     const char *flag = std::getenv("FASTLLM_CUDA_FP8_ROW_GEMV");
     if (flag && (!std::strcmp(flag, "0") || !std::strcmp(flag, "false")))
         return false;
-    if (batch != 1 || K < 512 || K > 32768 || N < 4096 || blockM < K || blockK != 1 || !input ||
+    if (batch != 1 && (batch < 2 || batch > 8 || K % 256 || N > 65536))
+        return false;
+    if (K < 512 || K > 32768 || N < (batch == 1 ? 4096 : 512) || blockM < K || blockK != 1 || !input ||
         !weight || !output || !scales || reinterpret_cast<uintptr_t>(input) % 4 ||
         reinterpret_cast<uintptr_t>(weight) % 16 || reinterpret_cast<uintptr_t>(output) % 2 ||
         reinterpret_cast<uintptr_t>(scales) % 4 || (bias && reinterpret_cast<uintptr_t>(bias) % 2))
@@ -854,14 +857,16 @@ static bool CanRunFastllmRowFP8(const T *input, const uint8_t *weight, const T *
         uintptr_t x = reinterpret_cast<uintptr_t>(a), y = reinterpret_cast<uintptr_t>(b);
         return x < y + bs && y < x + as;
     };
-    if (overlaps(output, size_t(N) * 2, input, size_t(K) * 2) ||
-        overlaps(output, size_t(N) * 2, weight, size_t(N) * K) ||
-        overlaps(output, size_t(N) * 2, scales, size_t(N) * 4) ||
-        (bias && overlaps(output, size_t(N) * 2, bias, size_t(N) * 2)))
+    if (overlaps(output, size_t(batch) * N * 2, input, size_t(batch) * K * 2) ||
+        overlaps(output, size_t(batch) * N * 2, weight, size_t(N) * K) ||
+        overlaps(output, size_t(batch) * N * 2, scales, size_t(N) * 4) ||
+        (bias && overlaps(output, size_t(batch) * N * 2, bias, size_t(N) * 2)))
         return false;
     int device = 0;
     if (cudaGetDevice(&device) != cudaSuccess)
         return false;
+    if (batch > 1)
+        return fastllm::fp8small::CanRun<T>(device, K, N, batch);
     static thread_local std::map<int, bool> available;
     auto it = available.find(device);
     if (it == available.end()) {
@@ -879,6 +884,12 @@ static bool CanRunFastllmRowFP8(const T *input, const uint8_t *weight, const T *
 template <class T>
 static bool TryFastllmRowFP8(T *input, uint8_t *weight, T *output, T *bias, float *scales, int batch, int K,
                              int N, int blockM, int blockK) {
+    if (batch > 1) {
+        if (!CanRunFastllmRowFP8<T, 8>(input, weight, output, bias, scales, batch, K, N, blockM, blockK))
+            return false;
+        fastllm::fp8small::Dispatch<T>(input, weight, scales, bias, output, K, N, batch, cudaStreamPerThread);
+        return true;
+    }
     if (K % 256) {
         if (!CanRunFastllmRowFP8<T, 16>(input, weight, output, bias, scales, batch, K, N, blockM, blockK))
             return false;

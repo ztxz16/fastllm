@@ -1,3 +1,4 @@
+#include "devices/cuda/fastllm-fp8-small-t.cuh"
 #include "devices/cuda/fastllm-cuda-fp8-linear-add.h"
 #include "devices/cuda/fastllm-fp8-linear-add.cuh"
 #include "devices/cuda/fastllm-fp8-row.cuh"
@@ -33,6 +34,13 @@ template <class T, int K> void Launch(Data &input, Data &weight, const Data &bia
         bias.dims.empty() ? nullptr : (const float *)bias.cudaData, (T *)output.cudaData);
 }
 template <class T> void Dispatch(Data &input, Data &weight, const Data &bias, Data &output) {
+    int tokens = int(input.Count(0) / weight.dims[1]);
+    if (tokens > 1) {
+        fp8small::Dispatch<T,true,float>((const T*)input.cudaData, (const uint8_t*)weight.cudaData,
+            (const float*)weight.extraCudaData[0], bias.dims.empty() ? nullptr : (const float*)bias.cudaData,
+            (T*)output.cudaData, weight.dims[1], weight.dims[0], tokens, cudaStreamPerThread);
+        return;
+    }
     if (weight.dims[0] != 5120 || (weight.dims[1] != 6144 && weight.dims[1] != 17408)) {
         const int K = weight.dims[1], N = weight.dims[0];
         const auto *x = (const T *)input.cudaData;
@@ -66,10 +74,13 @@ bool FastllmCudaFP8LinearAddCanRun(const Data &input, const Data &weight, const 
         weight.dims[0] < 512 || weight.dims[0] > 65536 || weight.dims[1] < 512 || weight.dims[1] > 32768 ||
         weight.IsRepacked || weight.blockK != 1 ||
         weight.blockM < weight.dims[1] || weight.scales.size() != size_t(weight.dims[0]) ||
-        input.dims.back() != weight.dims[1] || input.Count(0) != uint64_t(weight.dims[1]) ||
-        output.dims.back() != weight.dims[0] || output.Count(0) != uint64_t(weight.dims[0]))
+        input.dims.back() != weight.dims[1] || input.Count(0) % weight.dims[1] != 0 || input.Count(0) / weight.dims[1] > 8 ||
+        output.dims.back() != weight.dims[0] || output.Count(0) != input.Count(0) / weight.dims[1] * weight.dims[0])
         return false;
     const int N = weight.dims[0];
+    const int tokens = int(input.Count(0) / weight.dims[1]);
+    if (tokens < 1 || (tokens > 1 && weight.dims[1] % 256))
+        return false;
     const char *generic = std::getenv("FASTLLM_CUDA_TP_FUSIONS");
     if (generic && (!std::strcmp(generic, "0") || !std::strcmp(generic, "false")) &&
         (N != 5120 || (weight.dims[1] != 6144 && weight.dims[1] != 17408) || weight.blockM != weight.dims[1]))
@@ -81,28 +92,36 @@ bool FastllmCudaFP8LinearAddCanRun(const Data &input, const Data &weight, const 
     if (!bias.dims.empty() && (bias.dataType != DataType::FLOAT32 || bias.dims != std::vector<int>{N} ||
                                !DenseCuda(bias, device, 4)))
         return false;
-    if (Overlap(input, input.Count(0) * 2, output, size_t(N) * 2) ||
-        Overlap(weight, weight.Count(0), output, size_t(N) * 2) ||
-        (!bias.dims.empty() && Overlap(bias, size_t(N) * 4, output, size_t(N) * 2)))
+    if (Overlap(input, input.Count(0) * 2, output, output.Count(0) * 2) ||
+        Overlap(weight, weight.Count(0), output, output.Count(0) * 2) ||
+        (!bias.dims.empty() && Overlap(bias, size_t(N) * 4, output, output.Count(0) * 2)))
         return false;
-    static thread_local std::map<int, bool> supported;
-    auto it = supported.find(device);
-    if (it == supported.end()) {
-        int major = 0, minor = 0;
-        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
-            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess)
+    if (tokens > 1) {
+        bool supported = input.dataType == DataType::FLOAT16
+            ? fp8small::CanRun<half, true, float>(device, weight.dims[1], N, tokens)
+            : fp8small::CanRun<__nv_bfloat16, true, float>(device, weight.dims[1], N, tokens);
+        if (!supported)
             return false;
-        if (major * 10 + minor < 75)
+    } else {
+        static thread_local std::map<int, bool> supported;
+        auto it = supported.find(device);
+        if (it == supported.end()) {
+            int major = 0, minor = 0;
+            if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
+                cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess)
+                return false;
+            if (major * 10 + minor < 75)
+                return false;
+            // All dispatch variants are compiled together for the same architecture list.
+            cudaFuncAttributes attributes{};
+            auto status = cudaFuncGetAttributes(&attributes, fp8row::TailKernel<half, true, float>);
+            if (status != cudaSuccess)
+                cudaGetLastError();
+            it = supported.emplace(device, status == cudaSuccess && attributes.maxThreadsPerBlock >= 256).first;
+        }
+        if (!it->second)
             return false;
-        // All dispatch variants are compiled together for the same architecture list.
-        cudaFuncAttributes attributes{};
-        auto status = cudaFuncGetAttributes(&attributes, fp8row::TailKernel<half, true, float>);
-        if (status != cudaSuccess)
-            cudaGetLastError();
-        it = supported.emplace(device, status == cudaSuccess && attributes.maxThreadsPerBlock >= 256).first;
     }
-    if (!it->second)
-        return false;
     // Allocation/copies are forbidden during capture; warmup prepares the scale cache.
     cudaStreamCaptureStatus capture;
     if (cudaStreamIsCapturing(cudaStreamPerThread, &capture) != cudaSuccess)
