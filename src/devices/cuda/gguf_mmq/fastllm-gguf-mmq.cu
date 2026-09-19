@@ -7,6 +7,7 @@
 namespace fastllm_gguf_mmq {
 
 #include "mmq.cuh"
+#include "fastllm-gguf-iq2-gemv.cuh"
 
 constexpr int kQuantizeBlockSize = 128;
 constexpr int kBlackwellDirectTileThreshold = 1000;
@@ -410,6 +411,13 @@ static void launch_extended_mmvq_type(
         const void *weight, const block_q8_1 *input, OutputType *output,
         int rows, int input_columns, int output_rows,
         cudaStream_t stream) {
+    if constexpr (type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_S) {
+        if (rows == 1 && iq2_decode::Supports(input, input_columns, output_rows)) {
+            iq2_decode::Launch<type, false>(weight, nullptr, input, output,
+                                          input_columns, output_rows, stream);
+            return;
+        }
+    }
     const int nwarps = rows <= 4 ? 4 : 1;
     if (nwarps == 4) {
         launch_extended_mmvq_rows<type, 4>(
@@ -427,6 +435,13 @@ static void launch_extended_gate_up_type(
         const void *gate_weight, const void *up_weight,
         const block_q8_1 *input, half *output, int rows,
         int input_columns, int output_rows, cudaStream_t stream) {
+    if constexpr (type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_S) {
+        if (rows == 1 && iq2_decode::Supports(input, input_columns, output_rows)) {
+            iq2_decode::Launch<type, true>(gate_weight, up_weight, input, output,
+                                          input_columns, output_rows, stream);
+            return;
+        }
+    }
     const int nwarps = rows <= 4 ? 4 : 1;
     if (nwarps == 4) {
         launch_extended_gate_up_rows<type, 4>(
