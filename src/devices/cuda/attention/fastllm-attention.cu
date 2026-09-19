@@ -4270,7 +4270,7 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
         // one entry per device makes mixed full/sliding models rebuild at every
         // layer boundary.  Use a stable signature for the cache slot and keep
         // the complete key above as that slot's current contents.
-        std::array<uint32_t, 12> eager_slot_key = {
+        std::vector<uint32_t> eager_slot_key = {
             batch_size,
             num_qo_heads_per_batch,
             (uint32_t)numHeads,
@@ -4284,6 +4284,13 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
             (uint32_t)pagedKVCacheK->dataType,
             (uint32_t)windowLeft
         };
+
+        // Different query lengths alternate during speculative decoding. Keep
+        // each query distribution in its own bounded LRU slot; KV page changes
+        // still rebuild that slot using the complete plan_key above.
+        for (uint32_t i = 0; i <= batch_size; ++i) {
+            eager_slot_key.push_back((uint32_t)qSizes.cpuIntDatas[i]);
+        }
 
         struct PrefillPlanCacheEntry {
             PrefillPlanInfo plan_info;
@@ -4350,7 +4357,7 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
             uint64_t last_use = 0;
         };
         struct EagerPlanDeviceCache {
-            std::map<std::array<uint32_t, 12>, EagerPlanCacheSlot> slots;
+            std::map<std::vector<uint32_t>, EagerPlanCacheSlot> slots;
             uint64_t use_counter = 0;
         };
         static thread_local std::map<int, EagerPlanDeviceCache> eager_plan_caches;
