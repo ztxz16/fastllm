@@ -21373,28 +21373,35 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16Snapshots(
         snaps[t] = (half*)snap->cudaData;
     }
 
-    constexpr int tileV = 16;
-    int threadsPerBlock = tileV * 32;
     size_t sharedMemSize = seqLen * (2 * (size_t)headKDim + 8) * sizeof(float);
-    dim3 gridDim(numVHeads, (headVDim + tileV - 1) / tileV);
 
     cudaError_t pendingState = cudaGetLastError();
     if (pendingState != cudaSuccess) {
         checkCudaErrors("Error: stale CUDA error before FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16.", pendingState);
         return false;
     }
-    FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWarpKernel<tileV><<<gridDim, threadsPerBlock, sharedMemSize>>>(
-        (const half*)convOutput.cudaData,
-        (const half*)ba.cudaData,
-        (const float*)normWeight.cudaData,
-        (const float*)aLog.cudaData,
-        (const float*)dtBias.cudaData,
-        (half*)last_recurrent_state.cudaData, nullptr,
-        (half*)core_attn_out.cudaData,
-        seqLen, numKHeads, numVHeads, headKDim, headVDim, eps, qScale,
-        snaps[0], snaps[1], snaps[2], snaps[3], snaps[4], snaps[5], snaps[6],
-        nullptr, numTokenStates
-    );
+    auto launch = [&](auto tile) {
+        constexpr int tileV = decltype(tile)::value;
+        FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWarpKernel<tileV>
+            <<<dim3(numVHeads, (headVDim + tileV - 1) / tileV), tileV * 32, sharedMemSize>>>(
+                (const half*)convOutput.cudaData,
+                (const half*)ba.cudaData,
+                (const float*)normWeight.cudaData,
+                (const float*)aLog.cudaData,
+                (const float*)dtBias.cudaData,
+                (half*)last_recurrent_state.cudaData, nullptr,
+                (half*)core_attn_out.cudaData,
+                seqLen, numKHeads, numVHeads, headKDim, headVDim, eps, qScale,
+                snaps[0], snaps[1], snaps[2], snaps[3], snaps[4], snaps[5], snaps[6],
+                nullptr, numTokenStates);
+    };
+    // Use eight warps for 128-wide states, including per-rank TP shards.
+    // Keep the existing tile for other value dimensions.
+    if (headVDim == 128) {
+        launch(std::integral_constant<int, 8>{});
+    } else {
+        launch(std::integral_constant<int, 16>{});
+    }
 
     cudaError_t launchState = cudaGetLastError();
     if (launchState != cudaSuccess) {
