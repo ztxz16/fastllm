@@ -18180,6 +18180,13 @@ namespace fastllm {
             }
         };
 
+        struct PendingValidationCopies {
+            int device = -1;
+            std::vector<void*> dsts;
+            std::vector<const void*> srcs;
+            std::vector<size_t> sizes;
+        };
+        PendingValidationCopies *pendingValidationCopies = nullptr;
         auto copyPagedCachePage = [&](Data &cache, int srcPage, int dstPage) {
             PagedCacheManager *manager = cache.pagedKVCacheData;
             AssertInFastLLM(manager != nullptr && manager->dims.size() == 4,
@@ -18188,6 +18195,14 @@ namespace fastllm {
                                manager->dims[3] * manager->unitSize / manager->unitSizeDiv;
             size_t srcOffset = (size_t)srcPage * pageBytes;
             size_t dstOffset = (size_t)dstPage * pageBytes;
+            if (pendingValidationCopies != nullptr &&
+                manager->dataDevice == DataDevice::CUDA && manager->cudaData != nullptr &&
+                manager->dataDeviceIds == std::vector<int>{pendingValidationCopies->device}) {
+                pendingValidationCopies->dsts.push_back((uint8_t*)manager->cudaData + dstOffset);
+                pendingValidationCopies->srcs.push_back((uint8_t*)manager->cudaData + srcOffset);
+                pendingValidationCopies->sizes.push_back(pageBytes);
+                return;
+            }
             if (manager->dataDevice == DataDevice::CUDA) {
                 int oldDevice = FastllmCudaGetDevice();
                 if (!manager->dataDeviceIds.empty()) {
@@ -20127,6 +20142,51 @@ namespace fastllm {
         std::unique_ptr<int, decltype(singleCleanupDeleter)> singleCleanupGuard(
             &singleCleanupToken, singleCleanupDeleter);
         try {
+            PendingValidationCopies copies;
+            auto &copyDsts = copies.dsts;
+            auto &copySrcs = copies.srcs;
+            auto &copySizes = copies.sizes;
+            const int copyDevice = FastllmCudaGetDevice();
+            copies.device = copyDevice;
+            pendingValidationCopies = &copies;
+            auto resetPendingCopies = [&](int*) noexcept { pendingValidationCopies = nullptr; };
+            int pendingCopiesToken = 0;
+            std::unique_ptr<int, decltype(resetPendingCopies)> pendingCopiesScope(
+                &pendingCopiesToken, resetPendingCopies);
+            copyDsts.reserve(block_cnt * 2);
+            copySrcs.reserve(block_cnt * 2);
+            copySizes.reserve(block_cnt * 2);
+            auto copyValidationState = [&](Data &dst, const Data &src) {
+                // Only plain, tightly allocated single-device state tensors use
+                // deferred copies. Preserve CopyFrom for every other layout.
+                bool dense = !src.dims.empty();
+                uint64_t stride = 1;
+                if (src.strides.size() != src.dims.size()) dense = false;
+                for (int axis = int(src.dims.size()) - 1; dense && axis >= 0; --axis) {
+                    dense = src.dims[axis] > 0 && src.strides[axis] == stride;
+                    stride *= src.dims[axis];
+                }
+                if (!dense || src.isFake || src.multiDeviceData || src.isPagedKVCache ||
+                    src.dataDevice != DataDevice::CUDA || !src.cudaData ||
+                    src.dataDeviceIds != std::vector<int>{copyDevice} ||
+                    src.expansionSize != src.Count(0) ||
+                    (src.dataType != DataType::FLOAT16 && src.dataType != DataType::BFLOAT16 &&
+                     src.dataType != DataType::FLOAT32)) {
+                    dst.CopyFrom(src);
+                    return;
+                }
+                dst.dataType = src.dataType;
+                dst.UpdateUnitSize();
+                dst.dataDevice = DataDevice::CUDA;
+                dst.dataDeviceIds = {copyDevice};
+                dst.Resize(src.dims);
+                dst.Allocate(false);
+                dst.name = src.name;
+                copyTensorMetaIntoExistingStorage(dst, src);
+                copyDsts.push_back(dst.cudaData);
+                copySrcs.push_back(src.cudaData);
+                copySizes.push_back(src.GetBytes());
+            };
             for (int i = 0; i < block_cnt; i++) {
                 Data *realKey = pastKeyValues[i].first;
                 Data *realValue = pastKeyValues[i].second;
@@ -20138,13 +20198,19 @@ namespace fastllm {
                     copyPagedCacheForValidation(validationPastStorage[i].first, *realKey);
                     copyPagedCacheForValidation(validationPastStorage[i].second, *realValue);
                 } else {
-                    validationPastStorage[i].first.CopyFrom(*realKey);
-                    validationPastStorage[i].second.CopyFrom(*realValue);
+                    copyValidationState(validationPastStorage[i].first, *realKey);
+                    copyValidationState(validationPastStorage[i].second, *realValue);
                 }
                 validationPastKeyValues[i] = {
                     &validationPastStorage[i].first,
                     &validationPastStorage[i].second
                 };
+            }
+            if (!copyDsts.empty() && !FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
+                    copyDsts.data(), copySrcs.data(), copySizes.data(), int(copyDsts.size()))) {
+                for (size_t j = 0; j < copyDsts.size(); ++j) {
+                    FastllmCudaCopyFromDeviceToDevice(copyDsts[j], const_cast<void*>(copySrcs[j]), copySizes[j]);
+                }
             }
         } catch (...) {
             speculativeCaptureFirstTokenLinearState = oldCaptureFirstTokenLinearState;
@@ -20263,6 +20329,25 @@ namespace fastllm {
                             "Qwen3.5 MTP validation got invalid commit prefix.\n");
             bool useValidationLinearFinal = tokens == seqLen;
             int slot = tokens - 1;
+            std::vector<void*> copyDsts;
+            std::vector<const void*> copySrcs;
+            std::vector<size_t> copySizes;
+            const int copyDevice = FastllmCudaGetDevice();
+            auto commitLinearState = [&](Data &dst, const Data &src) {
+                if (dst.isFake || src.isFake || dst.multiDeviceData || src.multiDeviceData ||
+                    dst.dataDevice != DataDevice::CUDA || src.dataDevice != DataDevice::CUDA ||
+                    !dst.cudaData || !src.cudaData || dst.dataType != src.dataType ||
+                    dst.dims != src.dims || dst.GetBytes() != src.GetBytes() ||
+                    dst.dataDeviceIds != std::vector<int>{copyDevice} ||
+                    src.dataDeviceIds != std::vector<int>{copyDevice}) {
+                    copyTensorIntoExistingStorage(dst, src);
+                    return;
+                }
+                copyDsts.push_back(dst.cudaData);
+                copySrcs.push_back(src.cudaData);
+                copySizes.push_back(src.GetBytes());
+                copyTensorMetaIntoExistingStorage(dst, src);
+            };
             for (int i = 0; i < block_cnt; i++) {
                 if (isAttentionLayerAt(i)) {
                     restoreMeta(*pastKeyValues[i].first, prefixKeyMetas[tokens][i]);
@@ -20270,18 +20355,24 @@ namespace fastllm {
                     restoreMeta(*pastKeyValues[i].second, prefixValueMetas[tokens][i]);
                     singleValueUsesPrefix[i] = 1;
                 } else if (useValidationLinearFinal) {
-                    copyTensorIntoExistingStorage(*pastKeyValues[i].first,
+                    commitLinearState(*pastKeyValues[i].first,
                                                   validationPastStorage[i].first);
-                    copyTensorIntoExistingStorage(*pastKeyValues[i].second,
+                    commitLinearState(*pastKeyValues[i].second,
                                                   validationPastStorage[i].second);
                 } else {
                     AssertInFastLLM(i < (int)speculativeLinearStates.size() &&
                                     slot < (int)speculativeLinearStates[i].size(),
                                     "Qwen3.5 MTP validation missing linear state slot.\n");
-                    copyTensorIntoExistingStorage(*pastKeyValues[i].first,
+                    commitLinearState(*pastKeyValues[i].first,
                                                   speculativeLinearStates[i][slot].first);
-                    copyTensorIntoExistingStorage(*pastKeyValues[i].second,
+                    commitLinearState(*pastKeyValues[i].second,
                                                   speculativeLinearStates[i][slot].second);
+                }
+            }
+            if (!copyDsts.empty() && !FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
+                    copyDsts.data(), copySrcs.data(), copySizes.data(), int(copyDsts.size()))) {
+                for (size_t j = 0; j < copyDsts.size(); ++j) {
+                    FastllmCudaCopyFromDeviceToDevice(copyDsts[j], const_cast<void*>(copySrcs[j]), copySizes[j]);
                 }
             }
             releaseValidationPagedViews(prefixKeyMetas[tokens], prefixValueMetas[tokens]);
