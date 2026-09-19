@@ -1091,12 +1091,36 @@ static void mul_mat_vec_q_cuda_T(
     }
 }
 
+static __device__ __forceinline__ half FastllmGgufHalfSiluMulValue(
+        half gate, half up) {
+    // Preserve the exact operation order of FastllmSiluKernel(half) followed
+    // by FastllmMulToKernel(half). In particular, SiLU is rounded to FP16
+    // before the final FP16 multiply.
+    const half activated = __hdiv(
+        gate, __hadd(__float2half(1.0f), hexp(-gate)));
+    return __hmul(activated, up);
+}
+
+#if !defined(USE_ROCM)
+#include "fastllm-gguf-iq3-gemv.cuh"
+#endif
+
 template <ggml_type type, typename OType>
 static void mul_mat_vec_q_cuda(
     const void * vx, const void * vy, OType * dst, const char * ids_data,
     const int ncols_x, const int nrows_x, const int nrows_y, const int ncols_y, const int nrows_dst,
     const int ne2, const uint64_t nb02, const uint64_t nb12, const uint64_t nb2, const int64_t ids_nb0,
     cudaStream_t stream) {
+#if !defined(USE_ROCM)
+    if constexpr (type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ3_XXS) {
+        if (ncols_y == 1 && ne2 == 1 && ids_data == nullptr &&
+            fastllm_gguf_iq3::Supports(vy, ncols_x, nrows_x)) {
+            fastllm_gguf_iq3::Launch<type, false>(
+                vx, nullptr, (const block_q8_1 *)vy, dst, ncols_x, nrows_x, stream);
+            return;
+        }
+    }
+#endif
     // Up to four input rows benefit from four-way K reduction. B5-B8 has
     // twice the live accumulator state after packing two output rows per
     // block, so a single warp preserves occupancy. Batched expert slices
@@ -2543,16 +2567,6 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
     return true;   
 }
 
-static __device__ __forceinline__ half FastllmGgufHalfSiluMulValue(
-        half gate, half up) {
-    // Preserve the exact operation order of FastllmSiluKernel(half) followed
-    // by FastllmMulToKernel(half). In particular, SiLU is rounded to FP16
-    // before the final FP16 multiply.
-    const half activated = __hdiv(
-        gate, __hadd(__float2half(1.0f), hexp(-gate)));
-    return __hmul(activated, up);
-}
-
 static __global__ void FastllmGgufHalfSiluMulKernel(
         half *gate, const half *up, int len) {
     const int index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2629,6 +2643,15 @@ static void FastllmLaunchGgufFusedGateUpMmvq(
         const void *gateWeight, const void *upWeight,
         const block_q8_1 *input, half *output,
         int inputColumns, int outputRows, cudaStream_t stream) {
+#if !defined(USE_ROCM)
+    if constexpr (type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ3_XXS) {
+        if (fastllm_gguf_iq3::Supports(input, inputColumns, outputRows)) {
+            fastllm_gguf_iq3::Launch<type, true>(
+                gateWeight, upWeight, input, output, inputColumns, outputRows, stream);
+            return;
+        }
+    }
+#endif
     constexpr int nwarps = 4;
     FastllmGgufFusedGateUpMmvqKernel<type, nwarps><<<
         outputRows, dim3(WARP_SIZE, nwarps, 1), 0, stream>>>(
