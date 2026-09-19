@@ -1119,6 +1119,42 @@ namespace fastllm {
         return instance;
     }
 
+    // Enumerate nearby chunk counts so the selected experts form complete
+    // worker waves. Round the corresponding width up to a small column tile;
+    // deriving it from the count avoids the nearly empty last task produced
+    // by keeping the original width. If no nearby partition fits, retain it.
+    static int SelectNumasMoeGateRowsPerTask(
+        int columns, int experts, int workers, int preferredRows
+    ) {
+        if (columns <= 0 || experts <= 0 || workers <= 0 || preferredRows <= 0) {
+            return preferredRows;
+        }
+        constexpr int alignment = 8;
+        const int minRows = std::max(alignment, preferredRows / 2);
+        const int maxRows = preferredRows * 2;
+        const int preferredChunks = (columns + preferredRows - 1) / preferredRows;
+        const int maxChunks = (columns + minRows - 1) / minRows;
+        int bestRows = preferredRows;
+        int bestChunkDistance = INT_MAX;
+        int bestRowDistance = INT_MAX;
+        for (int chunks = 1; chunks <= maxChunks; ++chunks) {
+            if ((int64_t)experts * chunks % workers != 0) continue;
+            const int rows = ((columns + chunks - 1) / chunks + alignment - 1) /
+                alignment * alignment;
+            if (rows < minRows || rows > maxRows ||
+                (columns + rows - 1) / rows != chunks) continue;
+            const int chunkDistance = std::abs(chunks - preferredChunks);
+            const int rowDistance = std::abs(rows - preferredRows);
+            if (chunkDistance < bestChunkDistance ||
+                (chunkDistance == bestChunkDistance && rowDistance < bestRowDistance)) {
+                bestRows = rows;
+                bestChunkDistance = chunkDistance;
+                bestRowDistance = rowDistance;
+            }
+        }
+        return bestRows;
+    }
+
     struct DeepSeekV4NumasGroupedGemmExpert {
         int expert;
         int rowOffset;
@@ -7603,10 +7639,8 @@ namespace fastllm {
                         useDeepSeekV4MoeFast;
                     bool useDirectBFloat16Prepare =
                         useDeepSeekV4MoeFast;
-                    // On the 20 workers per NUMA node used by -t 40, the gate
-                    // uses ten chunks per expert (60 tasks, three waves).
-                    // The smaller down chunks trade a little queue overhead
-                    // for a much more even tail across those workers.
+                    // Keep the general defaults. Eligible decode shapes may
+                    // select a balanced gate width for each node below.
                     int gateRowsPerTask = 208;
                     int downRowsPerTask = 128;
                     // Keep each activation task on one gate-output NUMA
@@ -7619,6 +7653,18 @@ namespace fastllm {
                     int totalExperts = v.size();
                     int k = interDim * 2;
                     int kPer = k / numaConfig->numaCnt;
+                    const bool balanceV41GateTasks =
+                        useDirectGemmQueue && activationQuantBlock == 32 &&
+                        totalExperts == 6 && inputDim == 5120 &&
+                        interDim == 2304 && outputDim == 5120 &&
+                        startDataType == DataType::BFLOAT16 &&
+                        GetCPUInstructInfo()->hasAVX2 &&
+                        !GetCPUInstructInfo()->hasAVX512BF16 &&
+                        std::all_of(v.begin(), v.end(),
+                            [weights](const auto &expert) {
+                                return weights[expert.first * 2]->GetDataType() ==
+                                    DataType::NVFP4_BLOCK_32_E8M0;
+                            });
                     // GLM-5.3 decode selects eight routed experts.  With one
                     // NUMA node and 24 workers, 172 gate rows create exactly
                     // 192 tasks (eight waves), while 152 down rows create 216
@@ -7711,7 +7757,12 @@ namespace fastllm {
                                     realInput.data(), 0,
                                     startDataType, gateUpOutput.data(),
                                     0, nid, inputDim, k, kPer,
-                                    gateRowsPerTask);
+                                    balanceV41GateTasks ?
+                                        SelectNumasMoeGateRowsPerTask(
+                                            kPer, totalExperts,
+                                            (int)numaConfig->numaToCpuDict[nid].size(),
+                                            gateRowsPerTask) :
+                                        gateRowsPerTask);
                             }
                             profileLap(profileGatePrepMs);
                             ScheduleDeepSeekV4NumasGemmQueue(
