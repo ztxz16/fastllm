@@ -7926,7 +7926,7 @@ bool FastllmCudaCumSumDecayMaskNegMulCausal(
 template <class T>
 static bool TryLaunchFastllmRMSNormDecode(const T *input, const float *weight, T *output,
                                         int outer, int channels, float eps) {
-    if (outer != 1 || channels != 5120 ||
+    if (outer < 1 || outer > 8 || channels != 5120 ||
         reinterpret_cast<uintptr_t>(input) % alignof(uint32_t) ||
         reinterpret_cast<uintptr_t>(output) % alignof(uint32_t) ||
         reinterpret_cast<uintptr_t>(weight) % alignof(float2)) {
@@ -7957,7 +7957,7 @@ static bool TryLaunchFastllmRMSNormDecode(const T *input, const float *weight, T
     if (!it->second) {
         return false;
     }
-    fastllm::normdecode::Kernel<T><<<1, 512>>>(input, weight, output, eps);
+    fastllm::normdecode::Kernel<T><<<outer, 512>>>(input, weight, output, eps);
     return true;
 }
 #endif

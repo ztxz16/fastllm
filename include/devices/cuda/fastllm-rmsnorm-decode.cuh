@@ -2,10 +2,11 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cstdint>
+#include <cstddef>
 
 namespace fastllm {
 namespace normdecode {
-// Single-row decode specialization. FP32 norm weights remain FP32; only the
+// Small-row decode/verify specialization. FP32 norm weights remain FP32; only the
 // reduction order changes. Cache every input/weight before the one block barrier,
 // so input == output is safe. All warps then read the small shared partial sum
 // array themselves, avoiding a second block barrier and a warp-0 bottleneck.
@@ -14,6 +15,8 @@ __global__ __launch_bounds__(B) void Kernel(const T *input, const float *weight,
     static_assert(__is_same(T, half) || __is_same(T, __nv_bfloat16));
     static_assert(D % (2 * B) == 0 && B % 32 == 0);
     constexpr int Pairs = D / (2 * B), Warps = B / 32;
+    input += size_t(blockIdx.x) * D;
+    output += size_t(blockIdx.x) * D;
     int tid = threadIdx.x;
     uint32_t values[Pairs];
     float2 weights[Pairs];
