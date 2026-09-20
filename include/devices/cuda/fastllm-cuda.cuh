@@ -1321,6 +1321,14 @@ bool FastllmCudaMatMulBFloat16(const fastllm::Data &input, fastllm::Data &weight
 bool FastllmCudaMatMulFloatFP8E4M3(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaQuantizeLinearWeightFP8E4M3Block128(
     const fastllm::Data &input, fastllm::Data &output);
+// Requires dense, unrepacked weights on a single CUDA device.
+// Supports FP16/BF16, per-row FP8, and INT4/INT4_NOZERO/INT4_GROUP.
+// INT4 uses FP16 dequantization semantics, with FP16 group metadata for INT4_GROUP.
+// Empty selection quantizes all rows; nonempty selection preserves its row order.
+bool FastllmCudaQuantizeLinearWeightNVFP4Block16Rows(
+        const fastllm::Data &input, fastllm::Data &output,
+        const std::vector<int> &selectedRows);
+
 bool FastllmCudaQuantizeLinearWeightNVFP4Block16(
     const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
