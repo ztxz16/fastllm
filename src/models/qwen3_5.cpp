@@ -11602,7 +11602,13 @@ namespace fastllm {
                             Qwen3CudaEnvDefaultEnabled("FASTLLM_CUDA_TP_FUSIONS")) &&
                         buf.attenInput.dims.back() % 256 == 0 && inputConvPool != nullptr &&
                         workspace.linearSlotIds.cudaData != nullptr &&
-                        (computeType == DataType::FLOAT16 || computeType == DataType::BFLOAT16);
+                        (computeType == DataType::FLOAT16 || computeType == DataType::BFLOAT16) &&
+                        FastllmCudaGdnInputConvValidInputs(buf.attenInput,
+                            *requireLocal(weight[qkvzWeightName], qkvzWeightName),
+                            *requireLocal(GetThreadTensorParallelBias(qkvzWeightName + ".tp_bias"), qkvzWeightName + ".tp_bias"),
+                            *requireLocal(weight[conv1dWeightName], conv1dWeightName),
+                            *requireLocal(GetThreadTensorParallelBias(conv1dBiasName), conv1dBiasName),
+                            *inputConvPool, &workspace.linearSlotIds, batch);
                     if (projectedConvBlock) {
                         CudaGdnInputConvBlock(buf.attenInput,
                             *requireLocal(weight[qkvzWeightName], qkvzWeightName),
@@ -13453,7 +13459,13 @@ namespace fastllm {
                     batch == 1 && all1 && !isPrefill &&
                     !speculativeCaptureFirstTokenLinearState && !speculativeCollectAllLogits &&
                     pastKeyValues[i].first->dims == std::vector<int>({1, localQkvDim, 4}) &&
-                    (computeType == DataType::FLOAT16 || computeType == DataType::BFLOAT16);
+                    (computeType == DataType::FLOAT16 || computeType == DataType::BFLOAT16) &&
+                    FastllmCudaGdnInputConvValidInputs(attenInput,
+                        *requireLocal(weight[qkvzWeightName], qkvzWeightName),
+                        *requireLocal(GetThreadTensorParallelBias(qkvzWeightName + ".tp_bias"), qkvzWeightName + ".tp_bias"),
+                        *requireLocal(weight[conv1dWeightName], conv1dWeightName),
+                        *requireLocal(GetThreadTensorParallelBias(conv1dBiasName), conv1dBiasName),
+                        *pastKeyValues[i].first, nullptr, batch);
                 if (projectedConvBlock) {
                     CudaGdnInputConvBlock(attenInput,
                         *requireLocal(weight[qkvzWeightName], qkvzWeightName),
@@ -13606,9 +13618,7 @@ namespace fastllm {
                     !batchedUniformPrefill;
                 int raggedPrefillTotalTokens = 0;
                 int raggedPrefillTotalChunks = 0;
-                if (projectedConvBlock) {
-                    convOutput.Reshape({1, batch, localQkvDim});
-                } else if (batchedRaggedPrefill) {
+                if (batchedRaggedPrefill) {
                     for (int len : seqLens) {
                         batchedRaggedPrefill &=
                             len > 1 && len <= QWEN35_BATCH_PREFILL_SEQ_MAX;
@@ -13740,7 +13750,9 @@ namespace fastllm {
                 if (!combinedGdnZCandidate) {
                     ensureProjectedZSplit();
                 }
-                if (batchedConvSequence) {
+                if (projectedConvBlock) {
+                    // The Block does not materialize qkvConvInput.
+                } else if (batchedConvSequence) {
                     // Keep the flattened token-major projection. Each request
                     // is handled independently before its cache update.
                 } else if (batch == 1 && all1 && pastKey.dims.size() > 0) {
@@ -13757,7 +13769,10 @@ namespace fastllm {
                         {bsz, seqlen, localValueHeads, head_v_dim});
                 }
 
-                if (batchedRaggedPrefill) {
+                if (projectedConvBlock) {
+                    // Both Block implementations already updated the cache and
+                    // produced the activated convolution output.
+                } else if (batchedRaggedPrefill) {
                     std::vector<Data*> requestPastKeys(batch);
                     for (int rb = 0; rb < batch; rb++) {
                         Data *requestPastKey =
@@ -14047,7 +14062,9 @@ namespace fastllm {
                 }
 
                 Data *convOutputForRecurrent = &convOutput;
-                if (batchedConvSequence) {
+                if (projectedConvBlock) {
+                    // Block output is already [1, batch, channels].
+                } else if (batchedConvSequence) {
                     // Request-local outputs are already [1, seq, channels]
                     // and concatenated in flattened request order.
                 } else if (batch == 1 && all1 && pastKey.dims.size() > 0) {
