@@ -29220,10 +29220,15 @@ namespace fastllm {
         static thread_local std::uniform_real_distribution<float>
             selectorUniform(0.0f, 1.0f);
         int previousToken = anchorToken;
+        std::vector<float> predecessorHidden(dflashSelectorRank);
         for (int position = 0; position < slots; ++position) {
             AssertInFastLLM(
                 previousToken >= 0 && previousToken < predecessor.dims[0],
                 "DFlash selector predecessor id is out of range.\n");
+            const float *positionHidden = selectorHidden + size_t(position) * dflashSelectorRank;
+            for (int rank = 0; rank < dflashSelectorRank; ++rank) {
+                predecessorHidden[rank] = codebookValue(predecessor, previousToken, rank) * positionHidden[rank];
+            }
             std::vector<float> scores(dflashSelectorTopK);
             float bestScore = -std::numeric_limits<float>::infinity();
             int bestCandidate = 0;
@@ -29237,12 +29242,8 @@ namespace fastllm {
                     candidateToken >= 0 && candidateToken < successor.dims[0],
                     "DFlash selector candidate id is out of range.\n");
                 float score = candidateTopK[topKOffset + 1];
-                const float *positionHidden = selectorHidden +
-                    (size_t)position * dflashSelectorRank;
                 for (int rank = 0; rank < dflashSelectorRank; ++rank) {
-                    score += codebookValue(
-                                 predecessor, previousToken, rank) *
-                             positionHidden[rank] *
+                    score += predecessorHidden[rank] *
                              codebookValue(
                                  successor, candidateToken, rank);
                 }
