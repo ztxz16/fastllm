@@ -17,6 +17,7 @@
 #include <thread>
 #include <exception>
 #include <initializer_list>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -31433,16 +31434,54 @@ namespace fastllm {
         if (!mtpNvfp4DraftLmHead.dims.empty()) {
             mtpNvfp4DraftLmHead.ToDevice(DataDevice::CUDA, {device}, true);
         } else if (supported(head)) {
-            bool converted = FastllmCudaQuantizeLinearWeightNVFP4Block16(head, mtpNvfp4DraftLmHead);
+            std::vector<int> selectedRows;
+            const char *tokenIdsPath = std::getenv("FASTLLM_MTP_DRAFT_TOKEN_IDS");
+            if (tokenIdsPath && *tokenIdsPath && std::string(tokenIdsPath) != "0") {
+                std::ifstream idsFile(tokenIdsPath);
+                bool valid = idsFile.is_open();
+                std::string token;
+                while (valid && idsFile >> token) {
+                    long long id = -1;
+                    size_t consumed = 0;
+                    try {
+                        id = std::stoll(token, &consumed);
+                    } catch (const std::exception &) {
+                        valid = false;
+                        break;
+                    }
+                    if (consumed != token.size() || id < 0 || id >= head.dims[0] || selectedRows.size() >= size_t(head.dims[0])) {
+                        valid = false;
+                        break;
+                    }
+                    selectedRows.push_back(int(id));
+                }
+                valid = valid && idsFile.eof() && !selectedRows.empty();
+                // Ascending IDs preserve full-vocabulary greedy tie breaking.
+                std::sort(selectedRows.begin(), selectedRows.end());
+                valid = valid && std::adjacent_find(selectedRows.begin(), selectedRows.end()) == selectedRows.end()
+                        && selectedRows.size() < size_t(head.dims[0])
+                        && FastllmCudaMarlinNVFP4Supported(int(selectedRows.size()), head.dims[1]);
+                if (!valid) {
+                    printf("[Qwen3.5 MTP NVFP4] invalid or unsupported token shortlist; using full vocabulary.\n");
+                    selectedRows.clear();
+                }
+            }
+            bool converted = FastllmCudaQuantizeLinearWeightNVFP4Block16Rows(head, mtpNvfp4DraftLmHead, selectedRows);
+            if (!converted && !selectedRows.empty()) {
+                selectedRows.clear();
+                converted = FastllmCudaQuantizeLinearWeightNVFP4Block16(head, mtpNvfp4DraftLmHead);
+            }
             if (converted) {
+                mtpDraftTokenIds = std::move(selectedRows);
                 mtpNvfp4DraftLmHead.name = head.name + ".mtp_draft_nvfp4";
                 mtpNvfp4DraftLmHead.weightType = WeightType::LINEAR;
                 mtpNvfp4DraftLmHead.isModelWeight = true;
-                printf("[Qwen3.5 MTP NVFP4] full-vocabulary head [%d,%d] %.3f GB; target head retained.\n",
+                printf("[Qwen3.5 MTP NVFP4] %s head [%d,%d] %.3f GB; target head retained.\n",
+                       mtpDraftTokenIds.empty() ? "full-vocabulary" : "shortlist (greedy only)",
                        mtpNvfp4DraftLmHead.dims[0], head.dims[1], mtpNvfp4DraftLmHead.GetBytes()/1.0e9);
             } else {
                 mtpNvfp4DraftLmHead.FreeSpace();
-                mtpNvfp4DraftLmHead.Resize({});
+                mtpNvfp4DraftLmHead.dims.clear();
                 printf("[Qwen3.5 MTP NVFP4] head conversion unavailable; using the original head.\n");
             }
         }
@@ -32100,9 +32139,18 @@ namespace fastllm {
         Data &lmHead = weight["lm_head.weight"];
         if (!tensorParallelDraft) {
             Data logits;
-            Data &draftHead = mtpNvfp4DraftLmHead.dims.empty() ? lmHead : mtpNvfp4DraftLmHead;
+            const bool shortlist = !mtpDraftTokenIds.empty() && !sampleProposal;
+            Data &draftHead = mtpNvfp4DraftLmHead.dims.empty() ||
+                (!mtpDraftTokenIds.empty() && sampleProposal) ? lmHead : mtpNvfp4DraftLmHead;
             Linear(sampleHiddenBatch, draftHead, *GetEmptyData(), logits);
-            return sampleDraftFromCudaLogits(logits);
+            auto drafts = sampleDraftFromCudaLogits(logits);
+            if (shortlist) {
+                for (int &id : drafts) {
+                    AssertInFastLLM(id >= 0 && size_t(id) < mtpDraftTokenIds.size(), "Invalid MTP shortlist index.\n");
+                    id = mtpDraftTokenIds[id];
+                }
+            }
+            return drafts;
         }
 
         AssertInFastLLM(threadTpWeightsPrepared.load(std::memory_order_acquire) &&
@@ -32527,9 +32575,16 @@ namespace fastllm {
 
         Data &lmHead = weight["lm_head.weight"];
         if (!tensorParallelDraft) {
-            Data &draftHead = mtpNvfp4DraftLmHead.dims.empty() ? lmHead : mtpNvfp4DraftLmHead;
+            const bool shortlist = !mtpDraftTokenIds.empty() && !cache.sampleProposal;
+            Data &draftHead = mtpNvfp4DraftLmHead.dims.empty() ||
+                (!mtpDraftTokenIds.empty() && cache.sampleProposal) ? lmHead : mtpNvfp4DraftLmHead;
             Linear(*sampleHiddenPtr, draftHead, *GetEmptyData(), logits);
-            return sampleDraftFromCudaLogits(logits);
+            int draft = sampleDraftFromCudaLogits(logits);
+            if (shortlist) {
+                AssertInFastLLM(draft >= 0 && size_t(draft) < mtpDraftTokenIds.size(), "Invalid MTP shortlist index.\n");
+                draft = mtpDraftTokenIds[draft];
+            }
+            return draft;
         }
 
         AssertInFastLLM(threadTpWeightsPrepared.load(std::memory_order_acquire) &&

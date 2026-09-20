@@ -316,6 +316,7 @@ Optional NVFP4 draft conversion for single-GPU dense Qwen3.5-family MTP uses env
 | Environment variable | Default | Description |
 | --- | --- | --- |
 | `FASTLLM_MTP_DRAFT_QUANT` | `off` | `off` disables NVFP4 conversion; `nvfp4_head` converts only the separate draft output head; `nvfp4` converts the draft backbone and head. The target output head retains its original weights; unsupported weights keep their original implementation |
+| `FASTLLM_MTP_DRAFT_TOKEN_IDS` | Unset | Optional draft vocabulary token-ID file, used only when NVFP4 conversion is enabled. Unset or `0` keeps the full vocabulary. The shortlist is used only for greedy drafts; sampling uses the full output head |
 
 For example, prefix the existing launch command with `FASTLLM_MTP_DRAFT_QUANT=nvfp4`. These settings do not change the existing multi-GPU FP8 draft-head switch; `off` disables only this NVFP4 conversion.
 

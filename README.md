@@ -317,6 +317,7 @@ Qwen3.5 系列的可选单卡、稠密 MTP 草稿 NVFP4 转换通过环境变量
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `FASTLLM_MTP_DRAFT_QUANT` | `off` | `off` 关闭 NVFP4 转换；`nvfp4_head` 只转换独立草稿输出头；`nvfp4` 转换草稿主干和输出头。目标模型输出头保持原权重，不支持的权重保留原实现 |
+| `FASTLLM_MTP_DRAFT_TOKEN_IDS` | 未设置 | 可选的草稿词表 token ID 文件，仅在启用 NVFP4 转换时使用；未设置或为 `0` 时使用完整词表。筛选词表只用于贪心草稿，随机采样使用完整输出头 |
 
 例如，在现有启动命令前加 `FASTLLM_MTP_DRAFT_QUANT=nvfp4`。以上配置不改变既有多卡 FP8 草稿输出头开关；`off` 仅关闭这里的 NVFP4 转换。
 

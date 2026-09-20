@@ -524,6 +524,7 @@ namespace fastllm {
         void PrepareMtpWeightsForDevice(int device, bool includeSharedWeights = true);
         void PrepareMtpNvfp4DraftWeights(int device);
         Data mtpNvfp4DraftLmHead;
+        std::vector<int> mtpDraftTokenIds;
         void RunMtpFeedForward(int device, Data &hiddenStates,
                                bool tensorParallel = false, bool firstRank = true);
         bool UseMtpBackboneTp(const std::vector<int> &devices) const;
