@@ -7659,7 +7659,6 @@ namespace fastllm {
                         interDim == 2304 && outputDim == 5120 &&
                         startDataType == DataType::BFLOAT16 &&
                         GetCPUInstructInfo()->hasAVX2 &&
-                        !GetCPUInstructInfo()->hasAVX512BF16 &&
                         std::all_of(v.begin(), v.end(),
                             [weights](const auto &expert) {
                                 return weights[expert.first * 2]->GetDataType() ==
