@@ -2544,12 +2544,24 @@ namespace fastllm {
             return local;
         }
 
-        static void PrepareQwen35SingleCudaCache(Data &cache, int device, DataType localDataType) {
+        static void PrepareQwen35SingleCudaCache(
+                Data &cache, int device, DataType localDataType,
+                bool preparedOwnedStorage = false) {
             cache.isKVCache = true;
             cache.lockInCPU = false;
             if (cache.dataType != localDataType && cache.dims.empty()) {
                 cache.dataType = localDataType;
                 cache.UpdateUnitSize();
+            }
+            // Validation scratch was allocated/copied on this device by the
+            // current MTP call. Borrowed views and caller-owned caches still
+            // need ToDevice's actual pointer-device check.
+            if (preparedOwnedStorage && !cache.isFake && !cache.cudaDataBorrowed &&
+                !cache.multiDeviceData && !cache.isPagedKVCache &&
+                cache.dataDevice == DataDevice::CUDA && cache.cudaData != nullptr &&
+                cache.dataDeviceIds.size() == 1 && cache.dataDeviceIds[0] == device &&
+                cache.dataType == localDataType && !cache.dims.empty()) {
+                return;
             }
             cache.ToDevice(DataDevice::CUDA, {device}, false);
         }
@@ -3876,6 +3888,7 @@ namespace fastllm {
         struct Qwen35MtpVerifyGraphState {
             std::mutex mutex;
             std::string signature;
+            std::string nextSignature;
             bool warmed = false;
             bool captured = false;
             bool disabled = false;
@@ -16680,8 +16693,15 @@ namespace fastllm {
                     valueCacheType = ResolveQwen35ThreadTpCacheType(
                         pastKeyValues[idx].second->dataType, computeType);
                 }
-                PrepareQwen35SingleCudaCache(*pastKeyValues[idx].first, device, keyCacheType);
-                PrepareQwen35SingleCudaCache(*pastKeyValues[idx].second, device, valueCacheType);
+                const bool preparedScratch = speculativeCollectAllLogits &&
+                    singleMtpScratchDevice == device &&
+                    pastKeyValues.size() == singleMtpValidationScratch.size() &&
+                    pastKeyValues[idx].first == &singleMtpValidationScratch[idx].first &&
+                    pastKeyValues[idx].second == &singleMtpValidationScratch[idx].second;
+                PrepareQwen35SingleCudaCache(
+                    *pastKeyValues[idx].first, device, keyCacheType, preparedScratch);
+                PrepareQwen35SingleCudaCache(
+                    *pastKeyValues[idx].second, device, valueCacheType, preparedScratch);
             }
         }
         mtpTargetProfileMark(mtpTargetProfileCacheLocalUs);
@@ -16743,28 +16763,26 @@ namespace fastllm {
                 // Growing the shared rollback scratch for a larger batch also
                 // invalidates graphs captured for smaller batches, even when
                 // their live request cache pointers have not changed.
-                std::ostringstream graphSignature;
-                graphSignature << "batch=" << batch
-                               << ";verify=" << seqLens[0]
-                               << ";tp=" << devices.size()
-                               << ";dflash="
-                               << (speculativeCaptureDFlashHiddenStates ? 1 : 0)
-                               << ";captureSlots="
-                               << speculativeLinearStateCaptureSlots;
+                // Exact byte key: retain every captured pointer/layout field
+                // without formatting addresses or allocating a stream each round.
+                // The graph mutex protects both reusable signature buffers.
+                std::string &nextSignature = graphState.nextSignature;
+                nextSignature.clear();
+                auto appendField = [&](const auto &value) {
+                    nextSignature.append(
+                        reinterpret_cast<const char*>(&value), sizeof(value));
+                };
+                appendField(batch);
+                appendField(seqLens[0]);
+                appendField(devices.size());
+                appendField(speculativeCaptureDFlashHiddenStates);
+                appendField(speculativeLinearStateCaptureSlots);
+                appendField(tensorParallel);
                 if (tensorParallel) {
-                    graphSignature << ";linearScratchGeneration="
-                                   << speculativeLinearStateGeneration;
+                    appendField(speculativeLinearStateGeneration);
                 } else {
-                    // Single-device scratch is swapped into the model every
-                    // round. Its generation changes, but its allocations stay
-                    // alive. Invalidate only when a captured address/layout
-                    // actually changes.
-                    std::string scratchSignature;
-                    scratchSignature.reserve(16384);
-                    auto appendField = [&](const auto &value) {
-                        scratchSignature.append(
-                            reinterpret_cast<const char*>(&value), sizeof(value));
-                    };
+                    // Swapping single-device scratch changes its generation,
+                    // but only address/layout changes invalidate the graph.
                     appendField(speculativeLinearStates.size());
                     for (const auto &layer : speculativeLinearStates) {
                         appendField(layer.size());
@@ -16775,74 +16793,50 @@ namespace fastllm {
                                 appendField(snapshot->isLinearAttentionTransposed);
                                 appendField(snapshot->dims.size());
                                 if (!snapshot->dims.empty()) {
-                                    scratchSignature.append(
+                                    nextSignature.append(
                                         reinterpret_cast<const char*>(snapshot->dims.data()),
                                         snapshot->dims.size() * sizeof(int));
                                 }
                             }
                         }
                     }
-                    // This is an exact byte key, not a hash: pointer/layout
-                    // changes cannot collide, and no text formatting is needed
-                    // on the hot replay path.
-                    graphSignature.write(scratchSignature.data(), scratchSignature.size());
                 }
+                appendField(block_cnt);
                 for (int r = 0; r < (int)devices.size(); ++r) {
-                    graphSignature << ";gpu=" << devices[r]
-                                   << ";packedMeta="
-                                   << graphState.deviceStates[r]
-                                          ->packedPagedMeta.cudaData;
+                    appendField(devices[r]);
+                    appendField(graphState.deviceStates[r]->packedPagedMeta.cudaData);
                     std::vector<std::pair<Data*, Data*> > &rankPast =
                         tensorParallel ? localPastKeyValues[r] : pastKeyValues;
                     for (int layer = 0; layer < block_cnt; ++layer) {
                         Data *key = rankPast[layer].first;
                         Data *value = rankPast[layer].second;
+                        appendField(linearAttentionLayers[layer]);
                         if (linearAttentionLayers[layer] != 0) {
                             for (int b = 0; b < batch; ++b) {
                                 key = rankPast[b * block_cnt + layer].first;
                                 value = rankPast[b * block_cnt + layer].second;
-                                graphSignature << ";l" << layer << "b" << b
-                                               << "k="
-                                               << (key == nullptr ? nullptr :
-                                                   key->cudaData)
-                                               << "v="
-                                               << (value == nullptr ? nullptr :
-                                                   value->cudaData);
+                                appendField(key == nullptr ? nullptr : key->cudaData);
+                                appendField(value == nullptr ? nullptr : value->cudaData);
                             }
                         } else {
                             Qwen35MtpVerifyGraphPagedLayerState *meta =
                                 graphState.deviceStates[r]->pagedLayers[layer].get();
-                            graphSignature << ";a" << layer << "k="
-                                           << (key == nullptr ? nullptr :
-                                               key->pagedKVCacheData)
-                                           << "v="
-                                           << (value == nullptr ? nullptr :
-                                               value->pagedKVCacheData)
-                                           << "q="
-                                           << (meta == nullptr ? nullptr :
-                                               meta->qSizes.cudaData)
-                                           << "p="
-                                           << (meta == nullptr ? nullptr :
-                                               meta->pageSizes.cudaData)
-                                           << "i="
-                                           << (meta == nullptr ? nullptr :
-                                               meta->pageIndexs.cudaData)
-                                           << "n="
-                                           << (meta == nullptr ? nullptr :
-                                               meta->lastPageLens.cudaData)
-                                           << "b="
-                                           << (meta == nullptr ? nullptr :
-                                               meta->baseTokenLens.cudaData);
+                            appendField(key == nullptr ? nullptr : key->pagedKVCacheData);
+                            appendField(value == nullptr ? nullptr : value->pagedKVCacheData);
+                            appendField(meta == nullptr ? nullptr : meta->qSizes.cudaData);
+                            appendField(meta == nullptr ? nullptr : meta->pageSizes.cudaData);
+                            appendField(meta == nullptr ? nullptr : meta->pageIndexs.cudaData);
+                            appendField(meta == nullptr ? nullptr : meta->lastPageLens.cudaData);
+                            appendField(meta == nullptr ? nullptr : meta->baseTokenLens.cudaData);
                         }
                     }
                 }
-                std::string nextSignature = graphSignature.str();
                 if (!graphState.signature.empty() &&
                     graphState.signature != nextSignature) {
                     graphState.DestroyCapturedGraph();
                     graphState.disabled = false;
                 }
-                graphState.signature = nextSignature;
+                graphState.signature.swap(nextSignature);
 
                 for (int r = 0; r < (int)devices.size(); ++r) {
                     graphState.deviceStates[r]->dflashHiddenStates.resize(
