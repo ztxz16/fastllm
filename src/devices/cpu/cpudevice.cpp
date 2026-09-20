@@ -1043,7 +1043,7 @@ namespace fastllm {
             vst1_f16((float16_t*)float16 + i, output_vec);
         }
 #endif
-#ifdef __AVX__
+#if defined(__F16C__) || (defined(_MSC_VER) && defined(__AVX2__))
         for (; i + 7 < len; i += 8) {
             __m256 input_vec = _mm256_loadu_ps(float32 + i);  // 加载 8 个 float32
             __m128i output_vec = _mm256_cvtps_ph(input_vec, _MM_FROUND_TO_NEAREST_INT);  // 转换为 8 个 float16
@@ -1081,7 +1081,7 @@ namespace fastllm {
         }
 #endif
     
-#ifdef __AVX__
+#ifdef __AVX2__
         for (; i + 7 < len; i += 8) {
             __m256i float_vec = _mm256_loadu_si256((__m256i*)&float32[i]);
             __m256i lsb = _mm256_and_si256(_mm256_srli_epi32(float_vec, 16),
@@ -7845,7 +7845,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                     for (int j = 0; j < k; j++) {
                         float now = 0.0f;
                         int l = 0;
-#if defined(__AVX__)
+#if defined(__F16C__) || (defined(_MSC_VER) && defined(__AVX2__))
                         __m256 vsum = _mm256_set1_ps(0.0f);
                         for (; l + 7 < m; l += 8) {
                             __m256 vx = _mm256_cvtph_ps(_mm_loadu_si128((__m128i *) (input0Data + i * input0Stride + l)));
