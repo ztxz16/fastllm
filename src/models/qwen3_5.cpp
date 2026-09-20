@@ -17536,22 +17536,20 @@ namespace fastllm {
                 mtpTargetProfileRecord(logitRows);
                 return sampled;
             }
-            void *oldExecutor = GetExecutor();
-            Executor samplingExecutor;
-            samplingExecutor.SetFirstDevice("cuda:" + std::to_string(devices[0]));
-            SetCurrentThreadExecutor(&samplingExecutor);
             Data *sampleLogits = nullptr;
             Data &fullCudaLogits = Qwen35ThreadLocalCudaSamplingFullLogits();
-            if (singleDeviceHasFullVocabLogits()) {
-                sampleLogits = &localLogits[0];
-            } else {
-                Qwen35GatherShardLogitsToRootCuda(devices[0], devices, *lmHeadScheme,
-                                                  localLogits, logitRows, vocabSize,
-                                                  fullCudaLogits);
-                sampleLogits = &fullCudaLogits;
+            {
+                Qwen35ScopedGenericExecutor samplingExecutor("cuda:" + std::to_string(devices[0]));
+                if (singleDeviceHasFullVocabLogits()) {
+                    sampleLogits = &localLogits[0];
+                } else {
+                    Qwen35GatherShardLogitsToRootCuda(devices[0], devices, *lmHeadScheme,
+                                                      localLogits, logitRows, vocabSize,
+                                                      fullCudaLogits);
+                    sampleLogits = &fullCudaLogits;
+                }
+                resetMtpLogitsOfEos(sampleLogits);
             }
-            resetMtpLogitsOfEos(sampleLogits);
-            SetCurrentThreadExecutor(oldExecutor);
             if (allRowsSimpleGreedy && qwen35GpuTokenHandoffControl == nullptr) {
                 Data greedyIds(DataType::INT32), greedyScratch;
                 Qwen3CudaPrepareLocalOutput(greedyIds, devices[0]);
