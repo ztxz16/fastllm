@@ -28815,7 +28815,8 @@ namespace fastllm {
         combined.UpdateUnitSize();
         const int combinedWidth = embed_dim *
             (int)speculativeDFlashHiddenStates.size();
-        combined.Resize({1, tokens, combinedWidth});
+        const int projectionTokens = std::max(8, tokens);
+        combined.Resize({1, projectionTokens, combinedWidth});
         combined.Allocate(false);
         // Fill one final-width allocation directly. This replaces the old Cat
         // + Copy growth pattern, which retained two buffers at every
@@ -28827,6 +28828,19 @@ namespace fastllm {
             (size_t)embed_dim * elementBytes;
         const size_t combinedRowBytes =
             (size_t)combinedWidth * elementBytes;
+        if (projectionTokens > tokens) {
+            FastllmCudaMemset0(static_cast<uint8_t*>(combined.cudaData) +
+                size_t(tokens) * combinedRowBytes,
+                size_t(projectionTokens - tokens) * combinedRowBytes);
+        }
+        std::vector<void*> copyDsts;
+        std::vector<const void*> copySrcs;
+        std::vector<size_t> copySizes;
+        const bool batchCopies = tokens <= 8;
+        if (batchCopies) {
+            const size_t count = size_t(tokens) * speculativeDFlashHiddenStates.size();
+            copyDsts.reserve(count); copySrcs.reserve(count); copySizes.reserve(count);
+        }
         for (int feature = 0;
              feature < (int)speculativeDFlashHiddenStates.size(); feature++) {
             Data &captured = speculativeDFlashHiddenStates[feature];
@@ -28835,49 +28849,48 @@ namespace fastllm {
                                 captured.dims[1] >= tokens &&
                                 captured.dims[2] == embed_dim,
                             "DFlash captured target hidden shape is invalid.\n");
-            Data selected;
-            Data *selectedInput = &captured;
-            if (captured.dims[1] != tokens) {
-                Split(captured, 1, 0, tokens, selected);
-                selectedInput = &selected;
-            }
-            if (selectedInput->dataType != projectionInputType) {
+            // The 2-D copy already selects the committed prefix. Elementwise
+            // conversion may cover unused tail rows without materializing a slice.
+            if (captured.dataType != projectionInputType) {
                 // Captures are dedicated DFlash buffers and are released as
                 // soon as this projection completes. Converting them in place
                 // lets SM70-SM75 feed the FP16 FC directly instead of keeping
                 // another full combined-input conversion buffer alive.
-                ToDataType(*selectedInput, projectionInputType);
+                ToDataType(captured, projectionInputType);
             }
             AssertInFastLLM(
-                selectedInput->dataDevice == DataDevice::CUDA &&
-                    selectedInput->cudaData != nullptr &&
-                    selectedInput->strides.size() == 3 &&
-                    selectedInput->unitSizeDiv == 1 &&
-                    selectedInput->unitSize == (int)elementBytes,
+                captured.dataDevice == DataDevice::CUDA &&
+                    captured.cudaData != nullptr &&
+                    captured.strides.size() == 3 &&
+                    captured.unitSizeDiv == 1 &&
+                    captured.unitSize == (int)elementBytes,
                 "DFlash selected target hidden layout is invalid.\n");
-            FastllmCudaMemcpy2DDeviceToDevice(
-                (uint8_t*)combined.cudaData +
-                    (size_t)feature * featureRowBytes,
-                combinedRowBytes,
-                selectedInput->cudaData,
-                (size_t)selectedInput->strides[1] * elementBytes,
-                featureRowBytes, tokens);
+            if (batchCopies) {
+                for (int row = 0; row < tokens; ++row) {
+                    copyDsts.push_back(static_cast<uint8_t*>(combined.cudaData) +
+                        size_t(row) * combinedRowBytes + size_t(feature) * featureRowBytes);
+                    copySrcs.push_back(static_cast<const uint8_t*>(captured.cudaData) +
+                        size_t(row) * captured.strides[1] * elementBytes);
+                    copySizes.push_back(featureRowBytes);
+                }
+            } else {
+                FastllmCudaMemcpy2DDeviceToDevice(
+                    (uint8_t*)combined.cudaData +
+                        (size_t)feature * featureRowBytes,
+                    combinedRowBytes,
+                    captured.cudaData,
+                    (size_t)captured.strides[1] * elementBytes,
+                    featureRowBytes, tokens);
+            }
         }
-        const int projectionTokens = std::max(8, tokens);
-        Data projectionInput;
-        Data *projectionSource = &combined;
-        // The preallocated combined tensor is already contiguous at its final
-        // width. Only the short decode path needs a padded projection input.
-        if (projectionTokens != tokens) {
-            Data zeroRow, padding;
-            Split(combined, 1, 0, 1, zeroRow);
-            Mul(zeroRow, 0.0f, zeroRow);
-            Repeat(zeroRow, 1, projectionTokens - tokens, padding);
-            Cat(combined, padding, 1, projectionInput);
-            projectionSource = &projectionInput;
+        if (batchCopies && !FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
+                copyDsts.data(), copySrcs.data(), copySizes.data(), int(copyDsts.size()))) {
+            for (size_t i = 0; i < copyDsts.size(); ++i) {
+                FastllmCudaCopyFromDeviceToDevice(copyDsts[i], const_cast<void*>(copySrcs[i]), copySizes[i]);
+            }
         }
         Data projected, projectedContextHidden;
-        Linear(*projectionSource, projectionWeight,
+        Linear(combined, projectionWeight,
                *GetEmptyData(), projected);
         if (projected.dataType != DataType::BFLOAT16) {
             ToDataType(projected, DataType::BFLOAT16);
