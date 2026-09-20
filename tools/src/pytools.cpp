@@ -44,6 +44,13 @@ static thread_local std::string fastllmPytoolsWarmupError;
 static thread_local std::string fastllmPytoolsContextResult;
 
 extern "C" {
+    DLL_EXPORT int get_persistent_prefix_cache_version() {
+#if defined(FASTLLM_DISK_PREFIX_CACHE) && defined(USE_CUDA)
+        return 2;
+#else
+        return 0;
+#endif
+    }
     typedef void (*FastllmModelLoadProgressCallback)(const char *stage,
                                                      uint64_t current,
                                                      uint64_t total,
@@ -886,6 +893,16 @@ extern "C" {
     DLL_EXPORT void abort_response_llm_model(int modelId, int handleId) {
         auto model = models.GetModel(modelId);
         model->AbortResponse(handleId);
+    }
+
+    DLL_EXPORT bool wait_persistent_prefix_cache(int modelId, int timeoutMs) {
+        return models.GetModel(modelId)->WaitPersistentPrefixCache(timeoutMs);
+    }
+
+    DLL_EXPORT const char *get_persistent_prefix_cache_statistics(int modelId) {
+        static thread_local std::string result;
+        result = models.GetModel(modelId)->PersistentPrefixCacheStatistics();
+        return result.c_str();
     }
 
     DLL_EXPORT char *fetch_response_str_llm_model(int modelId, int handleId) {

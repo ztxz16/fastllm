@@ -114,6 +114,15 @@ class FastLLMUvicornServer(uvicorn.Server):
         super().__init__(config)
         self.startup_progress = startup_progress
 
+    async def shutdown(self, sockets=None):
+        await super().shutdown(sockets)
+        completion = globals().get("fastllm_completion")
+        model = getattr(completion, "model", None)
+        if model is not None and hasattr(model, "wait_persistent_prefix_cache"):
+            finished = await asyncio.to_thread(model.wait_persistent_prefix_cache, 30.0)
+            if not finished:
+                logging.warning("SSD prefix cache drain timed out; only committed checkpoints survive restart")
+
     async def startup(self, sockets = None):
         global request_executor
         loop = asyncio.get_running_loop()

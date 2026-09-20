@@ -202,6 +202,21 @@ endif()
 
 
 message(STATUS "CMAKE_CXX_FLAGS: ${CMAKE_CXX_FLAGS}")
+# Native persistent prefix snapshots use the system SHA-256 implementation.
+if (UNIX AND NOT APPLE)
+    find_package(OpenSSL QUIET)
+    find_package(SQLite3 QUIET HINTS "$ENV{CONDA_PREFIX}")
+    if (NOT SQLite3_FOUND)
+        find_path(SQLite3_INCLUDE_DIR sqlite3.h HINTS "$ENV{CONDA_PREFIX}/include")
+        find_library(SQLite3_LIBRARY sqlite3 HINTS "$ENV{CONDA_PREFIX}/lib")
+        find_package(SQLite3 QUIET)
+    endif()
+    if (OpenSSL_FOUND AND SQLite3_FOUND)
+        add_compile_definitions(FASTLLM_DISK_PREFIX_CACHE)
+        list(APPEND FASTLLM_LINKED_LIBS OpenSSL::Crypto SQLite::SQLite3)
+    endif()
+endif()
+
 file(GLOB GRAPH_MODEL_FILES "src/models/graph/*.cpp")
 file(GLOB BLOCK_FILES "src/blocks/*.cpp")
 file(GLOB CPU_DEVICE_FILES "src/devices/cpu/*.cpp")
@@ -219,6 +234,12 @@ set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/context
         ${CPU_DEVICE_FILES}
         ${BLOCK_FILES}
         ${GRAPH_MODEL_FILES})
+
+if (OpenSSL_FOUND AND SQLite3_FOUND AND UNIX AND NOT APPLE)
+    list(APPEND FASTLLM_CXX_SOURCES src/utils/disk_prefix_cache.cpp
+        third_party/lmcache_fs/fs/connector.cpp)
+    include_directories(third_party/lmcache_fs)
+endif()
 
 include_directories(include)
 include_directories(include/utils)
@@ -699,8 +720,30 @@ if (UNIT_TEST)
     target_link_libraries(qwen4_mtp_weights_test PRIVATE fastllm)
     add_test(NAME qwen4_mtp_weights COMMAND qwen4_mtp_weights_test)
 
+    add_executable(qwen35_text_weights_test test/basic/test_qwen35_text_weights.cpp)
+    target_link_libraries(qwen35_text_weights_test PRIVATE fastllm)
+    add_test(NAME qwen35_text_weights COMMAND qwen35_text_weights_test)
+    set_tests_properties(qwen35_text_weights PROPERTIES TIMEOUT 60
+        ENVIRONMENT "CUDA_VISIBLE_DEVICES=;FASTLLM_TP=off;FASTLLM_QWEN35_ENABLE_MTP=0")
+
     add_executable(qwen35_paged_cache_test test/basic/test_qwen35_paged_cache.cpp)
     add_test(NAME qwen35_paged_cache COMMAND qwen35_paged_cache_test)
+
+    add_executable(multimodal_prefix_cache_test test/basic/test_multimodal_prefix_cache.cpp)
+    if (OpenSSL_FOUND AND SQLite3_FOUND AND UNIX AND NOT APPLE)
+        add_executable(disk_prefix_cache_test test/basic/test_disk_prefix_cache.cpp
+            src/utils/disk_prefix_cache.cpp third_party/lmcache_fs/fs/connector.cpp
+            third_party/json11/json11.cpp)
+        target_link_libraries(disk_prefix_cache_test PRIVATE OpenSSL::Crypto SQLite::SQLite3 Threads::Threads)
+        add_test(NAME disk_prefix_cache COMMAND disk_prefix_cache_test)
+        set_tests_properties(disk_prefix_cache PROPERTIES TIMEOUT 90)
+    endif()
+    add_test(NAME multimodal_prefix_cache COMMAND multimodal_prefix_cache_test)
+    add_executable(paged_media_identity_test test/basic/test_paged_media_identity.cpp)
+    target_link_libraries(paged_media_identity_test PRIVATE fastllm)
+    add_test(NAME paged_media_identity COMMAND paged_media_identity_test)
+    set_tests_properties(multimodal_prefix_cache paged_media_identity PROPERTIES TIMEOUT 60
+        ENVIRONMENT "CUDA_VISIBLE_DEVICES=;FASTLLM_TP=off;FASTLLM_ACTIVATE_NUMA=OFF")
 
     add_executable(nvfp4_planar_test test/basic/test_nvfp4_planar.cpp)
     target_link_libraries(nvfp4_planar_test PRIVATE fastllm)
@@ -1148,6 +1191,12 @@ endif()
 
 add_library(fastllm_tools SHARED ${FASTLLM_CXX_SOURCES} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_CUDA_SM120_OBJECTS} ${FASTLLM_CUDA_SM90_OBJECTS} ${FASTLLM_TFACC_SOURCES} ${FASTLLM_TOPS_SOURCES} tools/src/pytools.cpp)
 target_link_libraries(fastllm_tools PUBLIC ${FASTLLM_LINKED_LIBS})
+if (TARGET qwen35_text_weights_test)
+    add_dependencies(fastllm_tools qwen35_text_weights_test)
+endif()
+if (TARGET disk_prefix_cache_test)
+    add_dependencies(fastllm_tools disk_prefix_cache_test multimodal_prefix_cache_test paged_media_identity_test)
+endif()
 
 set(BUILD_INFO_USE_CUDA "false")
 set(BUILD_INFO_USE_ROCM "false")

@@ -141,6 +141,50 @@ class Qwen35AutoFastPathsTest(unittest.TestCase):
                 self.assertEqual(os.environ["FASTLLM_CUDA_GRAPH"], "1")
                 self.assertEqual(os.environ["FASTLLM_GPU_TOKEN_HANDOFF"], "0")
 
+    def test_text_checkpoint_uses_qwen35_launcher_without_changing_precision(self):
+        cases = [
+            {"model_type": "qwen3_5_text", "architectures": ["Qwen3_5ForCausalLM"]},
+            {"model_type": "qwen3_5_text"},
+            {"architectures": ["Qwen3_5ForCausalLM"]},
+        ]
+        for config in cases:
+            with self.subTest(config=config), tempfile.TemporaryDirectory() as model_dir:
+                config.update({
+                    "max_position_embeddings": 262144,
+                    "quantization_config": {
+                        "quant_method": "fp8", "fmt": "e4m3",
+                        "weight_block_size": [128, 128],
+                    },
+                })
+                with open(os.path.join(model_dir, "config.json"), "w") as handle:
+                    json.dump(config, handle)
+                fake_llm = MagicMock()
+                fake_llm.model.return_value.get_max_input_len.return_value = 262144
+                fake_llm.model.return_value.get_max_batch.return_value = 1
+                # Every hardware/model call is mocked: no CUDA context is created.
+                with patch.dict(sys.modules, {"ftllm": SimpleNamespace(llm=fake_llm)}), patch.dict(
+                        os.environ, {"FASTLLM_CUDA_GRAPH": "0"}, clear=True), patch(
+                        "fastllm_pytools.util._has_cuda_device", return_value=True), patch(
+                        "fastllm_pytools.util._configure_triton_compiler_python"), redirect_stdout(io.StringIO()):
+                    args = make_normal_parser("test").parse_args([
+                        model_dir, "--atype", "float16", "--kv_cache_dtype", "fp8_e4m3",
+                        "--mtp", "0", "--max_batch", "1",
+                    ])
+                    make_normal_llm_model(args)
+                    self.assertEqual(args.device, "cuda")
+                    self.assertEqual(os.environ["FASTLLM_GPU_TOKEN_HANDOFF"], "1")
+                    self.assertEqual(os.environ["FASTLLM_CUDA_GRAPH"], "0")
+                    self.assertEqual(os.environ["FASTLLM_QWEN35_ENABLE_MTP"], "0")
+                    # The upstream single-stage path need not materialize this env
+                    # override. Either omission or explicit 1 preserves TP4 x PP1.
+                    self.assertEqual(os.environ.get("FASTLLM_PP", "1"), "1")
+                    fake_llm.set_cuda_embedding.assert_called_once_with(True)
+                    kwargs = fake_llm.model.call_args.kwargs
+                    self.assertEqual(kwargs["dtype"], "fp8_e4m3")
+                    self.assertEqual(kwargs["kv_cache_dtype"], "fp8_e4m3")
+                    self.assertEqual(kwargs["max_context_length"], -1)
+                    self.assertEqual(kwargs["rope_scaling"], "")
+
     def test_enables_tested_cuda_tp_defaults(self):
         capabilities = {0: 80, 1: 89}
         with patch.dict(os.environ, {}, clear=True), patch(
