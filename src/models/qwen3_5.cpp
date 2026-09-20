@@ -3653,12 +3653,16 @@ namespace fastllm {
             Data inputIds;
             Data positionIds;
             Data embeddingHiddenStates;
+            // Keep warmed attention outputs owned by this device graph.
+            Data attentionQ, attentionGate, attentionK, attentionV;
+            Data attentionOutput;
             Data packedPagedMeta;
             Data packedPagedMetaUpload;
             std::vector<int> packedPagedMetaHost;
             std::vector<std::unique_ptr<
                 Qwen35MtpVerifyGraphPagedLayerState> > pagedLayers;
             Data logits;
+            Data headLogits;
             Data hiddenStates;
             std::vector<Data> dflashHiddenStates;
             void *graph = nullptr;
@@ -12847,7 +12851,18 @@ namespace fastllm {
         Data &merged = projectionScratch, &gdnMerged = projectionScratch;
         Data &gateupResult = projectionScratch;
         Data &attenLastOutput = residualScratch, &mlpPart = residualScratch;
-        Data attenInput, qgate, gate, q, k, v, attenOutput;
+        Data attenInput, qgate;
+        Data localGate, localQ, localK, localV, localAttenOutput;
+        Data &gate = mtpVerifyGraphDeviceState != nullptr ?
+            mtpVerifyGraphDeviceState->attentionGate : localGate;
+        Data &q = mtpVerifyGraphDeviceState != nullptr ?
+            mtpVerifyGraphDeviceState->attentionQ : localQ;
+        Data &k = mtpVerifyGraphDeviceState != nullptr ?
+            mtpVerifyGraphDeviceState->attentionK : localK;
+        Data &v = mtpVerifyGraphDeviceState != nullptr ?
+            mtpVerifyGraphDeviceState->attentionV : localV;
+        Data &attenOutput = mtpVerifyGraphDeviceState != nullptr ?
+            mtpVerifyGraphDeviceState->attentionOutput : localAttenOutput;
         Data qForAttentionHolder;
         Data swigluResult;
         Data routerLogits, routerLogitsTemp, expertIndex, expertScore;
@@ -15581,12 +15596,21 @@ namespace fastllm {
                            lastHiddenStates);
             headInput = &lastHiddenStates;
         }
+        // Graph capture must retain both compute-type and FP32 logits.
+        // In-place conversion would replace the warmed output allocation.
+        Data &headOutput = mtpVerifyGraphDeviceState != nullptr ?
+            mtpVerifyGraphDeviceState->headLogits : logits;
         Qwen3CudaLinear(cudaRunner, *headInput,
                         *requireLocal(weight["lm_head.weight"], "lm_head.weight"),
                         *requireLocal(GetThreadTensorParallelBias("lm_head.weight.tp_bias"),
                                       "lm_head.weight.tp_bias"),
-                        logits);
-        Qwen3CudaToDataType(cudaRunner, logits, DataType::FLOAT32);
+                        headOutput);
+        if (mtpVerifyGraphDeviceState != nullptr) {
+            Qwen3CudaConvertToDataType(
+                cudaRunner, headOutput, logits, DataType::FLOAT32);
+        } else {
+            Qwen3CudaToDataType(cudaRunner, logits, DataType::FLOAT32);
+        }
         mtpWorkerProfileSyncMark(mtpWorkerProfileHeadUs);
         mtpWorkerProfileRecord();
 #endif
@@ -16849,6 +16873,18 @@ namespace fastllm {
                     errors.assign(devices.size(), nullptr);
                     auto runRank = [&](int r) {
                         FastllmCudaSetDevice(devices[r]);
+                        FastllmCudaClearThreadError();
+                        if (graphState.disabled) {
+                            // A failed capture may leave placeholder pointers
+                            // or capacity metadata from an incomplete cast.
+                            auto &state = *graphState.deviceStates[r];
+                            for (Data *data : {&state.attentionQ,
+                                    &state.attentionGate, &state.attentionK,
+                                    &state.attentionV, &state.attentionOutput,
+                                    &state.headLogits, &state.logits}) {
+                                data->FreeSpace();
+                            }
+                        }
                         if (graphState.deviceStates[r]
                                 ->metadataReadyRecorded) {
                             FastllmCudaCurrentThreadStreamWaitEvent(
@@ -17010,6 +17046,7 @@ namespace fastllm {
                         FastllmCudaClearGraphError();
                         auto captureRank = [&](int r) {
                             FastllmCudaSetDevice(devices[r]);
+                            FastllmCudaClearThreadError();
                             if (graphState.deviceStates[r]
                                     ->metadataReadyRecorded) {
                                 FastllmCudaCurrentThreadStreamWaitEvent(
