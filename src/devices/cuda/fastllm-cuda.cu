@@ -16276,18 +16276,19 @@ __device__ __forceinline__ bool FastllmGreedyIsBetter(
            (value == bestValue && id < bestId);
 }
 
-template <int THREAD_PER_BLOCK>
-__global__ void FastllmGreedySamplingKernel(float *logits, int *output,
-                                            float *floatOutput, int vocabSize) {
+template <int THREAD_PER_BLOCK, typename T = float>
+__global__ void FastllmGreedySamplingKernel(const T *logits, int *output,
+                                            float *floatOutput, int vocabSize,
+                                            const int *tokenMap = nullptr) {
     int b = blockIdx.x;
     int tid = threadIdx.x;
-    float *row = logits + (long long)b * vocabSize;
+    const T *row = logits + (long long)b * vocabSize;
 
     __shared__ float maxData[THREAD_PER_BLOCK];
     __shared__ int idData[THREAD_PER_BLOCK];
     float localMax = -INFINITY;
     int localId = 0;
-    for (int i = tid; i < vocabSize; i += THREAD_PER_BLOCK) {
+    for (int64_t i = tid; i < vocabSize; i += THREAD_PER_BLOCK) {
         float v = row[i];
         // Token IDs increase monotonically in this loop, so strict greater
         // already preserves the smallest ID for equal values in one lane.
@@ -16311,9 +16312,10 @@ __global__ void FastllmGreedySamplingKernel(float *logits, int *output,
     }
 
     if (tid == 0) {
-        output[b] = idData[0];
+        int token = tokenMap ? tokenMap[idData[0]] : idData[0];
+        output[b] = token;
         if (floatOutput != nullptr) {
-            floatOutput[b] = (float)idData[0];
+            floatOutput[b] = (float)token;
         }
     }
 }
@@ -16330,20 +16332,20 @@ __device__ __forceinline__ void FastllmGreedyWarpReduce(
     }
 }
 
-template <int THREAD_PER_BLOCK>
+template <int THREAD_PER_BLOCK, typename T = float>
 __global__ void FastllmGreedySamplingPartialKernel(
-        const float *logits, FastllmGreedyPartial *partials,
+        const T *logits, FastllmGreedyPartial *partials,
         int vocabSize, int partCount) {
     int part = blockIdx.x;
     int batch = blockIdx.y;
-    int chunk = (vocabSize + partCount - 1) / partCount;
+    int chunk = (vocabSize - 1) / partCount + 1;
     int start = part * chunk;
-    int end = min(vocabSize, start + chunk);
-    const float *row = logits + (int64_t)batch * vocabSize;
+    int end = start + min(chunk, vocabSize - start);
+    const T *row = logits + (int64_t)batch * vocabSize;
 
     float localMax = -INFINITY;
-    int localId = start;
-    for (int i = start + threadIdx.x; i < end;
+    int localId = 0;
+    for (int64_t i = (int64_t)start + threadIdx.x; i < end;
          i += THREAD_PER_BLOCK) {
         float value = row[i];
         if (value > localMax) {
@@ -16376,22 +16378,25 @@ __global__ void FastllmGreedySamplingPartialKernel(
 
 __global__ void FastllmGreedySamplingFinalizeKernel(
         const FastllmGreedyPartial *partials, int *output,
-        float *floatOutput, int partCount) {
+        float *floatOutput, int partCount, const int *tokenMap = nullptr) {
     int batch = blockIdx.x;
     int lane = threadIdx.x;
     float localMax = -INFINITY;
     int localId = 0;
-    if (lane < partCount) {
+    for (int part = lane; part < partCount; part += 32) {
         FastllmGreedyPartial partial =
-            partials[(int64_t)batch * partCount + lane];
-        localMax = partial.value;
-        localId = partial.id;
+            partials[(int64_t)batch * partCount + part];
+        if (FastllmGreedyIsBetter(partial.value, partial.id, localMax, localId)) {
+            localMax = partial.value;
+            localId = partial.id;
+        }
     }
     FastllmGreedyWarpReduce(localMax, localId);
     if (lane == 0) {
-        output[batch] = localId;
+        int token = tokenMap ? tokenMap[localId] : localId;
+        output[batch] = token;
         if (floatOutput != nullptr) {
-            floatOutput[batch] = (float)localId;
+            floatOutput[batch] = (float)token;
         }
     }
 }
@@ -16471,6 +16476,66 @@ bool FastllmCudaGreedySamplingWithFloatOutput(float *logits, int *output,
         return false;
     }
     return true;
+}
+
+// Shape-based dispatch; no vocabulary/model-specific assumptions. Small
+// vocabularies and larger batches keep a single CTA per row to avoid the
+// extra launch when row parallelism is already sufficient.
+static int FastllmGreedyTypedPartCount(int batch, int vocabSize) {
+    if (batch <= 0 || batch > 8 || vocabSize < 16384) return 1;
+    return vocabSize >= 196608 ? 128 : (vocabSize >= 65536 ? 64 : 32);
+}
+
+size_t FastllmCudaGreedySamplingWorkspaceBytes(int batch, int vocabSize) {
+    if (batch <= 0 || vocabSize <= 0) return 0;
+    int parts = FastllmGreedyTypedPartCount(batch, vocabSize);
+    return parts == 1 ? 0 : (size_t)batch * parts * sizeof(FastllmGreedyPartial);
+}
+
+template <typename T>
+static bool FastllmLaunchTypedGreedy(
+        const T *logits, int *output, float *floatOutput,
+        const int *tokenMap, int batch, int vocabSize,
+        void *scratch, size_t scratchBytes) {
+    int parts = FastllmGreedyTypedPartCount(batch, vocabSize);
+    size_t required = FastllmCudaGreedySamplingWorkspaceBytes(batch, vocabSize);
+    // Insufficient scratch is rejected before any work is submitted.
+    if (required && (!scratch || scratchBytes < required ||
+                     reinterpret_cast<uintptr_t>(scratch) % alignof(FastllmGreedyPartial))) {
+        return false;
+    }
+    if (parts == 1) {
+        FastllmGreedySamplingKernel<256><<<batch, 256>>>(
+            logits, output, floatOutput, vocabSize, tokenMap);
+    } else {
+        FastllmGreedySamplingPartialKernel<256><<<dim3(parts, batch), 256>>>(
+            logits, (FastllmGreedyPartial*)scratch, vocabSize, parts);
+        if (cudaGetLastError() != cudaSuccess) return false;
+        FastllmGreedySamplingFinalizeKernel<<<batch, 32>>>(
+            (const FastllmGreedyPartial*)scratch, output, floatOutput, parts, tokenMap);
+    }
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool FastllmCudaGreedySamplingTyped(
+        const void *logits, fastllm::DataType type, int *output,
+        float *floatOutput, const int *tokenMap, int batch, int vocabSize,
+        void *scratch, size_t scratchBytes) {
+    if (batch == 0) return true;
+    if (batch < 0 || vocabSize <= 0 || !logits || !output) return false;
+    switch (type) {
+        case fastllm::DataType::FLOAT32:
+            return FastllmLaunchTypedGreedy((const float*)logits, output,
+                floatOutput, tokenMap, batch, vocabSize, scratch, scratchBytes);
+        case fastllm::DataType::FLOAT16:
+            return FastllmLaunchTypedGreedy((const half*)logits, output,
+                floatOutput, tokenMap, batch, vocabSize, scratch, scratchBytes);
+        case fastllm::DataType::BFLOAT16:
+            return FastllmLaunchTypedGreedy((const __nv_bfloat16*)logits, output,
+                floatOutput, tokenMap, batch, vocabSize, scratch, scratchBytes);
+        default:
+            return false;
+    }
 }
 
 struct FastllmGreedyCandidate {

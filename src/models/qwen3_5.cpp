@@ -7724,6 +7724,38 @@ namespace fastllm {
             return ret;
         }
 
+        static bool Qwen35TryTypedGreedySampling(
+                const Data &logits, int *output, float *floatOutput,
+                const int *tokenMap, int rows, Data &scratch) {
+            if (logits.dims.empty() || rows <= 0 ||
+                logits.dataDevice != DataDevice::CUDA || !logits.cudaData ||
+                logits.dataDeviceIds.size() != 1 ||
+                (logits.dataType != DataType::FLOAT32 &&
+                 logits.dataType != DataType::FLOAT16 &&
+                 logits.dataType != DataType::BFLOAT16)) return false;
+            const int vocab = logits.dims.back();
+            if (vocab <= 0 || logits.strides.size() != logits.dims.size() ||
+                logits.Count(0) != (uint64_t)rows * vocab) return false;
+            uint64_t stride = 1;
+            for (int axis = (int)logits.dims.size() - 1; axis >= 0; --axis) {
+                if (logits.dims[axis] <= 0 || logits.strides[axis] != stride) return false;
+                stride *= logits.dims[axis];
+            }
+            const size_t bytes = FastllmCudaGreedySamplingWorkspaceBytes(rows, vocab);
+            if (bytes) {
+                Qwen3CudaPrepareLocalOutput(scratch, logits.dataDeviceIds[0]);
+                scratch.dataType = DataType::INT8;
+                scratch.UpdateUnitSize();
+                scratch.Resize({(int)bytes});
+                scratch.Allocate(false);
+            }
+            AssertInFastLLM(FastllmCudaGreedySamplingTyped(
+                logits.cudaData, logits.dataType, output, floatOutput, tokenMap,
+                rows, vocab, bytes ? scratch.cudaData : nullptr, bytes),
+                "Qwen3.5 typed greedy sampling failed.\n");
+            return true;
+        }
+
         static std::vector<int> Qwen35SampleFromRootCudaLogits(
                 int rootDevice,
                 Data &fullLogits,
@@ -17525,6 +17557,24 @@ namespace fastllm {
             }
             resetMtpLogitsOfEos(sampleLogits);
             SetCurrentThreadExecutor(oldExecutor);
+            if (allRowsSimpleGreedy && qwen35GpuTokenHandoffControl == nullptr) {
+                Data greedyIds(DataType::INT32), greedyScratch;
+                Qwen3CudaPrepareLocalOutput(greedyIds, devices[0]);
+                greedyIds.Resize({logitRows});
+                greedyIds.Allocate(false);
+                if (Qwen35TryTypedGreedySampling(*sampleLogits,
+                        (int*)greedyIds.cudaData, nullptr, nullptr,
+                        logitRows, greedyScratch)) {
+                    std::vector<int> sampled(logitRows);
+                    // This synchronization also bounds the local workspace
+                    // lifetime; concurrent calls never share its scratch.
+                    FastllmCudaCopyFromDeviceToHost(sampled.data(), greedyIds.cudaData,
+                                                  (size_t)logitRows * sizeof(int));
+                    mtpTargetProfileMark(mtpTargetProfileSamplingUs);
+                    mtpTargetProfileRecord(logitRows);
+                    return sampled;
+                }
+            }
             bool allSimple = allRowsSimpleGreedy;
             int maxTopK = 1;
             for (const GenerationConfig &config : rowConfigs) {

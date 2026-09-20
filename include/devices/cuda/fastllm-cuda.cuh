@@ -2202,6 +2202,14 @@ int FastllmCudaGetHostNumaNode(int device);
 }
 #endif
 
+// Scratch belongs to the caller and must outlive execution (and graph replay).
+// Different in-flight calls must use disjoint scratch and output buffers.
+size_t FastllmCudaGreedySamplingWorkspaceBytes(int batch, int vocabSize);
+bool FastllmCudaGreedySamplingTyped(
+    const void *logits, fastllm::DataType type, int *output,
+    float *floatOutput, const int *tokenMap, int batch, int vocabSize,
+    void *scratch, size_t scratchBytes);
+
 #ifdef __CUDACC__
 /* CUDA kernel declarations (shared by linear/ggml/attention .cu files) */
 extern __global__ void FastllmCudaFloat2HalfKernel(float* a, half *b, int len);
