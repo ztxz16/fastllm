@@ -990,7 +990,10 @@ static bool CanRunFastllmRowFP8(const T *input, const uint8_t *weight, const T *
     const char *flag = std::getenv("FASTLLM_CUDA_FP8_ROW_GEMV");
     if (flag && (!std::strcmp(flag, "0") || !std::strcmp(flag, "false")))
         return false;
-    if (batch != 1 && (batch < 2 || batch > 8 || K % 256 || N > 65536))
+    // The eight-row MMA path also amortizes weight loads across wide
+    // vocabulary projections.
+    if (batch != 1 && (batch < 2 || batch > 8 || K % 256 ||
+        (N > 65536 && batch != 8)))
         return false;
     if (K < 512 || K > 32768 || N < (batch == 1 ? 4096 : 512) || blockM < K || blockK != 1 || !input ||
         !weight || !output || !scales || reinterpret_cast<uintptr_t>(input) % 4 ||
