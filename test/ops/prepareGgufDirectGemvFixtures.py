@@ -4,6 +4,8 @@ import numpy as np
 from gguf import GGUFReader,GGMLQuantizationType,GGML_QUANT_SIZES
 parser=argparse.ArgumentParser(description='Generate independent llama.cpp CPU reference fixtures for direct GGUF GEMV')
 parser.add_argument('model');parser.add_argument('llama_library');parser.add_argument('output_dir')
+parser.add_argument('--extra-columns', type=int, nargs='*', default=[],
+                    help='Additional widths, formed by repeating valid quantization blocks')
 args=parser.parse_args()
 work=Path(args.output_dir);work.mkdir(parents=True,exist_ok=True)
 ref=ctypes.CDLL(args.llama_library)
@@ -39,6 +41,18 @@ for name in names:
         raw[:,:,dpos:dpos+2]=np.frombuffer(np.float16(.002).tobytes(),np.uint8)
         if name in ('Q4_1','Q5_K'):raw[:,:,2:4]=np.frombuffer(np.float16(.001).tobytes(),np.uint8)
         add(name,columns,raw.reshape(33,-1),'synthetic valid blocks')
+# Decode the extended packed rows with the independent CPU implementation,
+# including widths beyond the original model and incomplete CUDA input tiles.
+for name in names:
+    tp=GGMLQuantizationType[name];qk,bs=GGML_QUANT_SIZES[tp]
+    source=next(c for c in cases if c[0]==int(tp))
+    _,rows,columns,data,_,label=source
+    raw=np.frombuffer(data,np.uint8).reshape(rows,-1)
+    for width in sorted(set(args.extra_columns)):
+        if width<=0 or width%qk:raise ValueError(f'{name}: width must be a positive multiple of {qk}')
+        if any(c[0]==int(tp) and c[2]==width for c in cases):continue
+        expanded=np.tile(raw,(1,(width+columns-1)//columns))[:,:width//qk*bs]
+        add(name,width,expanded,label+' (repeated blocks)')
 with (work/'gemv-cases.bin').open('wb') as f:
     f.write(struct.pack('<I',len(cases)))
     for tp,rows,cols,data,reference,_ in cases:
