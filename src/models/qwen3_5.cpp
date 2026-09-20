@@ -6767,13 +6767,31 @@ namespace fastllm {
                 }
                 Qwen35MtpVerifyGraphPagedLayerState &meta =
                     *deviceState.pagedLayers[layer];
+                size_t qSizesOffset = meta.qSizesOffset;
+                size_t pageSizesOffset = meta.pageSizesOffset;
+                // Share only equal logical indptr inputs, within this
+                // graph state/device. Physical page indices stay private.
+                // Recheck every replay; changed aliases are already part
+                // of ForwardGPU's graph signature and force recapture.
+                // The attention plan key separately checks heads, dtype,
+                // page size, window and all other planning parameters.
+                for (int previous = 0; previous < layer; ++previous) {
+                    if (linearAttentionLayers[previous] != 0) continue;
+                    const auto &candidate = *deviceState.pagedLayers[previous];
+                    if (candidate.qSizesHost == meta.qSizesHost &&
+                        candidate.pageSizesHost == meta.pageSizesHost) {
+                        qSizesOffset = candidate.qSizesOffset;
+                        pageSizesOffset = candidate.pageSizesOffset;
+                        break;
+                    }
+                }
                 if (!Qwen35BindMtpVerifyGraphIntView(
                         meta.qSizes, deviceState.packedPagedMeta,
-                        deviceState.device, meta.qSizesOffset,
+                        deviceState.device, qSizesOffset,
                         meta.qSizesHost) ||
                     !Qwen35BindMtpVerifyGraphIntView(
                         meta.pageSizes, deviceState.packedPagedMeta,
-                        deviceState.device, meta.pageSizesOffset,
+                        deviceState.device, pageSizesOffset,
                         meta.pageSizesHost) ||
                     !Qwen35BindMtpVerifyGraphIntView(
                         meta.pageIndexs, deviceState.packedPagedMeta,
