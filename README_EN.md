@@ -311,6 +311,14 @@ The CLI evolves continuously, so `ftllm <command> --help` is authoritative for t
 | `--ori` | Original model configuration and tokenizer directory for selected GGUF models |
 | `--mmproj` | Matching vision-module GGUF for Qwen3.5-family GGUF models; see [GGUF multimodal deployment](docs/qwen3_en.md#gguf-multimodal) for configuration requirements and an example |
 
+Optional NVFP4 draft conversion for single-GPU dense Qwen3.5-family MTP uses environment variables and requires `--mtp`:
+
+| Environment variable | Default | Description |
+| --- | --- | --- |
+| `FASTLLM_MTP_DRAFT_QUANT` | `off` | `off` disables NVFP4 conversion; `nvfp4_head` converts only the separate draft output head; `nvfp4` converts the draft backbone and head. The target output head retains its original weights; unsupported weights keep their original implementation |
+
+For example, prefix the existing launch command with `FASTLLM_MTP_DRAFT_QUANT=nvfp4`. These settings do not change the existing multi-GPU FP8 draft-head switch; `off` disables only this NVFP4 conversion.
+
 ### API server
 
 | Option | Default | Description |

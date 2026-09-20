@@ -31363,6 +31363,96 @@ namespace fastllm {
 #endif
     }
 
+    // Experimental single-GPU draft quantization. The target head is never replaced.
+    void Qwen3_5Model::PrepareMtpNvfp4DraftWeights(int device) {
+#ifdef USE_CUDA
+        const char *setting = std::getenv("FASTLLM_MTP_DRAFT_QUANT");
+        const std::string mode = setting ? setting : "off";
+        if (mode.empty() || mode == "off") return;
+        AssertInFastLLM(mode == "nvfp4_head" || mode == "nvfp4",
+            "FASTLLM_MTP_DRAFT_QUANT must be off, nvfp4_head, or nvfp4.\n");
+        if (num_experts != 0) return;
+        FastllmCudaSetDevice(device);
+        auto supported = [&](const Data &w) {
+            return !w.multiDeviceData && w.dims.size() == 2 &&
+                w.dataDevice == DataDevice::CUDA && w.cudaData &&
+                FastllmCudaMarlinNVFP4Supported(w.dims[0], w.dims[1]);
+        };
+        auto prepareLayout = [&](Data &w) {
+            if (this->dataType != DataType::FLOAT16 || FastllmCudaHasNVFP4MarlinLayout(w)) return;
+            // New draft weights are created after serving warmup. Prepare their
+            // fast layout once here, never during graph capture or steady decode.
+            Data x(DataType::FLOAT16, {1, w.dims[1]});
+            Data y(DataType::FLOAT16, {1, w.dims[0]});
+            for (Data *d : {&x, &y}) {
+                d->dataDevice = DataDevice::CUDA; d->dataDeviceIds = {device}; d->Allocate(false);
+            }
+            FastllmCudaMemset0(x.cudaData, x.GetBytes());
+            const bool previousSync = FastllmCudaGetNcclForceSync();
+            FastllmCudaSetNcclForceSync(true);
+            bool prepared = false;
+            try {
+                prepared = FastllmCudaTryMarlinHalfMatMulFloatNVFP4Block16(
+                    x, w, *GetEmptyData(), y, 1, w.dims[1], w.dims[0]);
+            } catch (...) {
+                FastllmCudaSetNcclForceSync(previousSync);
+                throw;
+            }
+            FastllmCudaSetNcclForceSync(previousSync);
+            printf("[Qwen3.5 MTP NVFP4] %s fast layout: %s\n",
+                   w.name.c_str(), prepared ? "ready" : "generic fallback");
+        };
+        if (mode == "nvfp4") {
+            std::vector<std::string> names = {"mtp.fc.weight"};
+            for (int layer = 0; layer < mtp_num_hidden_layers; ++layer) {
+                const std::string prefix = "mtp.layers." + std::to_string(layer) + ".";
+                for (const char *suffix : {"self_attn.mergeqkv.weight", "self_attn.q_proj.weight",
+                        "self_attn.k_proj.weight", "self_attn.v_proj.weight", "self_attn.o_proj.weight",
+                        "mlp.gateup_proj.weight", "mlp.down_proj.weight"}) names.push_back(prefix + suffix);
+            }
+            for (const std::string &name : names) {
+                auto it = weight.weight.find(name);
+                if (it == weight.weight.end()) continue;
+                Data &w = it->second;
+                if (!supported(w) || (w.dataType != DataType::FLOAT16 && w.dataType != DataType::BFLOAT16)) continue;
+                Data q;
+                if (!FastllmCudaQuantizeLinearWeightNVFP4Block16(w, q)) continue;
+                q.name = w.name;
+                q.tpPackType = w.tpPackType;
+                q.tpLinearType = w.tpLinearType;
+                const auto scales = q.scales;
+                w.CopyFrom(q);
+                w.blockK = 1; w.blockM = 16; w.scales = scales;
+                w.weightType = WeightType::LINEAR; w.isModelWeight = true;
+                prepareLayout(w);
+                printf("[Qwen3.5 MTP NVFP4] backbone %s [%d,%d] %.3f GB\n",
+                       name.c_str(), w.dims[0], w.dims[1], w.GetBytes()/1.0e9);
+            }
+        }
+        Data &head = weight["lm_head.weight"];
+        if (!mtpNvfp4DraftLmHead.dims.empty()) {
+            mtpNvfp4DraftLmHead.ToDevice(DataDevice::CUDA, {device}, true);
+        } else if (supported(head)) {
+            bool converted = FastllmCudaQuantizeLinearWeightNVFP4Block16(head, mtpNvfp4DraftLmHead);
+            if (converted) {
+                mtpNvfp4DraftLmHead.name = head.name + ".mtp_draft_nvfp4";
+                mtpNvfp4DraftLmHead.weightType = WeightType::LINEAR;
+                mtpNvfp4DraftLmHead.isModelWeight = true;
+                printf("[Qwen3.5 MTP NVFP4] full-vocabulary head [%d,%d] %.3f GB; target head retained.\n",
+                       mtpNvfp4DraftLmHead.dims[0], head.dims[1], mtpNvfp4DraftLmHead.GetBytes()/1.0e9);
+            } else {
+                mtpNvfp4DraftLmHead.FreeSpace();
+                mtpNvfp4DraftLmHead.Resize({});
+                printf("[Qwen3.5 MTP NVFP4] head conversion unavailable; using the original head.\n");
+            }
+        }
+        if (!mtpNvfp4DraftLmHead.dims.empty()) prepareLayout(mtpNvfp4DraftLmHead);
+        fflush(stdout);
+#else
+        (void)device;
+#endif
+    }
+
     void Qwen3_5Model::PrepareMtpWeightsForDevice(int device, bool includeSharedWeights) {
 #ifdef USE_CUDA
         if (!HasMtpWeights()) {
@@ -31458,6 +31548,7 @@ namespace fastllm {
                 moveWeight(language_prefix + "embed_tokens.weight");
             }
             moveWeight("lm_head.weight");
+            PrepareMtpNvfp4DraftWeights(device);
             mtpSharedWeightsPrepared = true;
         }
 #else
@@ -32009,7 +32100,8 @@ namespace fastllm {
         Data &lmHead = weight["lm_head.weight"];
         if (!tensorParallelDraft) {
             Data logits;
-            Linear(sampleHiddenBatch, lmHead, *GetEmptyData(), logits);
+            Data &draftHead = mtpNvfp4DraftLmHead.dims.empty() ? lmHead : mtpNvfp4DraftLmHead;
+            Linear(sampleHiddenBatch, draftHead, *GetEmptyData(), logits);
             return sampleDraftFromCudaLogits(logits);
         }
 
@@ -32435,7 +32527,8 @@ namespace fastllm {
 
         Data &lmHead = weight["lm_head.weight"];
         if (!tensorParallelDraft) {
-            Linear(*sampleHiddenPtr, lmHead, *GetEmptyData(), logits);
+            Data &draftHead = mtpNvfp4DraftLmHead.dims.empty() ? lmHead : mtpNvfp4DraftLmHead;
+            Linear(*sampleHiddenPtr, draftHead, *GetEmptyData(), logits);
             return sampleDraftFromCudaLogits(logits);
         }
 

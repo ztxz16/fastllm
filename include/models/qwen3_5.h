@@ -522,6 +522,8 @@ namespace fastllm {
         bool RequiresDFlashPrefixSnapshot(const ResponseContext *context) const;
         void AddMtpRmsNormOffset();
         void PrepareMtpWeightsForDevice(int device, bool includeSharedWeights = true);
+        void PrepareMtpNvfp4DraftWeights(int device);
+        Data mtpNvfp4DraftLmHead;
         void RunMtpFeedForward(int device, Data &hiddenStates,
                                bool tensorParallel = false, bool firstRank = true);
         bool UseMtpBackboneTp(const std::vector<int> &devices) const;
