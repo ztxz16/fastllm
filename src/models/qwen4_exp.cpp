@@ -2543,6 +2543,55 @@ namespace fastllm {
         if ((weightName != kMtpPackedGateName && weightName != kMtpPackedDownName) ||
             finishedWeightNames.count(kMtpPackedGateName) == 0 ||
             finishedWeightNames.count(kMtpPackedDownName) == 0) {
+#ifdef USE_CUDA
+            // TP needs host weights; routed experts have their own placement path.
+            if (threadTpState || threadTpRank >= 0 ||
+                weightName.find(".mlp.experts.") != std::string::npos ||
+                (weightName != "lm_head.weight" &&
+                 !Qwen4StartsWith(weightName, languagePrefix) &&
+                 !Qwen4StartsWith(weightName, "mtp."))) {
+                return;
+            }
+            auto found = this->weight.weight.find(weightName);
+            if (found == this->weight.weight.end()) return;
+            Data &data = found->second;
+            // Norms, embeddings and PLE metadata still have CPU consumers.
+            if (!data.isModelWeight || data.isFake || data.isDiskWeight ||
+                data.dataDevice != DataDevice::CPU || data.cpuData == nullptr ||
+                data.dims.size() != 2 ||
+                this->weight.GetWeightType(weightName) != WeightType::LINEAR) {
+                return;
+            }
+            int layer = this->block_cnt - 1;
+            const std::string layersPrefix = languagePrefix + "layers.";
+            if (Qwen4StartsWith(weightName, layersPrefix)) {
+                const char *start = weightName.c_str() + layersPrefix.size();
+                char *end = nullptr;
+                const long parsed = std::strtol(start, &end, 10);
+                if (end == start || *end != '.' || parsed < 0 ||
+                    parsed >= this->block_cnt) return;
+                layer = (int)parsed;
+            }
+            const std::string device = SelectDeviceFromMap(
+                this->deviceMap, layer + 1, this->block_cnt);
+            if (device != "cuda" && !Qwen4StartsWith(device, "cuda:")) return;
+            std::map<int, int> ratios;
+            const std::vector<int> devices = ParseDeviceIds(device, "cuda", ratios);
+            // ToDevice resolves bare "cuda"; splitting still needs the host source.
+            if (devices.size() > 1 || (!devices.empty() &&
+                (devices[0] < 0 || devices[0] >= FastllmCudaGetDeviceCount()))) return;
+            for (const auto &rule : this->weightMergeRules) {
+                if (rule.allInputs.count(weightName)) return;
+            }
+            // Merged outputs also reach this callback. Release their host storage
+            // now instead of retaining all dense weights until warmup.
+            const int previousDevice = FastllmCudaGetDevice();
+            // Long-lived weights should not fill the reusable workspace pool.
+            // Preserve an explicitly configured model-weight slab.
+            if (FastllmCudaGetWeightSlabBytes() == 0) data.directMemory = true;
+            data.ToDevice(DataDevice::CUDA, devices);
+            FastllmCudaSetDevice(previousDevice);
+#endif
             return;
         }
         auto gate = this->weight.weight.find(kMtpPackedGateName);
