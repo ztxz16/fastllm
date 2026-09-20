@@ -642,6 +642,8 @@ void LaunchFastllmGemmBf16Bf16(__nv_bfloat16 *input, __nv_bfloat16 *weight, __nv
         FastllmGemvBf16Bf16Kernel2MultiRow<256, 6> <<<k, 256>>>(input, weight, output, bias, m, k);
     } else if (n == 7) {
         FastllmGemvBf16Bf16Kernel2MultiRow<256, 7> <<<k, 256>>>(input, weight, output, bias, m, k);
+    } else if (n == 8) {
+        FastllmGemvBf16Bf16Kernel2MultiRow<256, 8> <<<k, 256>>>(input, weight, output, bias, m, k);
     } else {
         for (int i = 0; i < n; i++) {
             FastllmGemvBf16Bf16Kernel2MultiRow<256, 1> <<<k, 256>>>(input + i * m, weight, output + i * k, bias, m, k);
@@ -789,14 +791,23 @@ bool FastllmCudaHalfMatMulBFloat16(const fastllm::Data &input, fastllm::Data &we
         cudaDataType_t AType = CUDA_R_16BF, BType = CUDA_R_16BF, CType = CUDA_R_16BF, ComputeType = CUDA_R_32F;
         cublasStatus_t status;
 
-        status = cublasGemmEx(fastllmCublasHandle,
-                                CUBLAS_OP_T, CUBLAS_OP_N,
-                                k, n, m,
-                                &h_alpha, weightPtr, AType,
-                                m, cudaBF16Input, BType,
-                                m, &h_beta,
-                                cudaBF16Output, CType,
-                                k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+        // Tiny output projections otherwise select a severely underfilled
+        // BF16 GEMM at eight verification rows. Retain the GEMM path's BF16
+        // input/output rounding and post-conversion bias semantics.
+        if (n == 8 && k <= 1024) {
+            LaunchFastllmGemmBf16Bf16(cudaBF16Input, weightPtr, cudaBF16Output,
+                                     nullptr, n, m, k);
+            status = CUBLAS_STATUS_SUCCESS;
+        } else {
+            status = cublasGemmEx(fastllmCublasHandle,
+                                    CUBLAS_OP_T, CUBLAS_OP_N,
+                                    k, n, m,
+                                    &h_alpha, weightPtr, AType,
+                                    m, cudaBF16Input, BType,
+                                    m, &h_beta,
+                                    cudaBF16Output, CType,
+                                    k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+        }
         if (status != CUBLAS_STATUS_SUCCESS) {
             printf("Error: cublas error.\n");
             throw("cublas error");
@@ -835,6 +846,12 @@ bool FastllmCudaBFloat16MatMulBFloat16(const fastllm::Data &input, fastllm::Data
         n < fastllm::FastllmCudaGetLinearExactBatchThreshold();
     if (n < 8 || exactRows) {
         LaunchFastllmGemmBf16Bf16(cudaInput, weightPtr, cudaOutput, cudaBiasData, n, m, k);
+    } else if (n == 8 && k <= 1024) {
+        LaunchFastllmGemmBf16Bf16(cudaInput, weightPtr, cudaOutput, nullptr, n, m, k);
+        // Match the GEMM branch: round the dot product before adding bias.
+        if (bias.dims.size() > 0) {
+            FastllmCudaBiasKernel <<<n, 256>>>(cudaOutput, cudaBiasData, k);
+        }
     } else {
         auto fastllmCublasHandle = getFastllmCublasHandle();
         cublasStatus_t status;
