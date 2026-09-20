@@ -1093,6 +1093,21 @@ if (UNIT_TEST)
         target_include_directories(ncclOddTpRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         add_test(NAME ncclOddTp COMMAND ncclOddTpRegression)
         set_tests_properties(ncclOddTp PROPERTIES LABELS cuda TIMEOUT 180 SKIP_RETURN_CODE 77)
+        if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            add_executable(ncclInitRegression test/ops/ncclInitRegression.cpp)
+            target_link_libraries(ncclInitRegression PRIVATE fastllm ${CMAKE_DL_LIBS})
+            target_include_directories(ncclInitRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            # Export executable interposers for calls made from CUDA/NCCL DSOs.
+            set_target_properties(ncclInitRegression PROPERTIES
+                ENABLE_EXPORTS ON CUDA_RUNTIME_LIBRARY Shared)
+            foreach(nccl_init_case IN ITEMS normal nan inf wrong_value init_error allocation_error
+                    launch_error partial_launch_error
+                    group_start group_end async_error init_hang group_hang stream_hang abort_hang)
+                add_test(NAME nccl_init_${nccl_init_case} COMMAND ncclInitRegression ${nccl_init_case})
+                set_tests_properties(nccl_init_${nccl_init_case} PROPERTIES
+                    LABELS "cuda;multigpu" TIMEOUT 20 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+            endforeach()
+        endif()
         add_executable(tp2WHT6AllReduceRegression test/ops/tp2WHT6AllReduceRegression.cu)
         target_include_directories(tp2WHT6AllReduceRegression PRIVATE include)
         target_link_libraries(tp2WHT6AllReduceRegression PRIVATE nccl Threads::Threads)
