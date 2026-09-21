@@ -440,6 +440,11 @@ namespace fastllm {
         virtual bool TryRecordPagedPrefixCacheExtra(ResponseContext *context);
         virtual int QueryPagedPrefixCacheExtra(ResponseContext *context, int maxCachedLen) const;
         virtual bool RestorePagedPrefixCacheExtra(ResponseContext *context, int cachedLen) const;
+        // Models with non-paged recurrent state (for example Qwen3.5 linear
+        // attention) must snapshot while decoding too; otherwise the tokens
+        // generated in a turn can only be cached when the next turn re-prefills
+        // them.
+        virtual bool WantsPerStepPrefixSnapshot() const { return false; }
 
         virtual void PrepareToolCallConstraint(ResponseContext *context, GenerationConfig &generationConfig);
 
