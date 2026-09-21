@@ -858,9 +858,11 @@ if (UNIT_TEST)
         target_link_libraries(cuda_prefill_paths_test PRIVATE fastllm)
         target_include_directories(cuda_prefill_paths_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         add_test(NAME cuda_prefill_gdn_long COMMAND cuda_prefill_paths_test gdn)
+        add_test(NAME cuda_prefill_gdn_sm75 COMMAND cuda_prefill_paths_test gdn_sm75)
         add_test(NAME cuda_prefill_sparse_strides COMMAND cuda_prefill_paths_test sparse)
-        set_tests_properties(cuda_prefill_gdn_long cuda_prefill_sparse_strides PROPERTIES
+        set_tests_properties(cuda_prefill_gdn_long cuda_prefill_gdn_sm75 cuda_prefill_sparse_strides PROPERTIES
                              LABELS "cuda;triton" SKIP_RETURN_CODE 77)
+        set_tests_properties(cuda_prefill_gdn_sm75 PROPERTIES RUN_SERIAL TRUE TIMEOUT 300)
         add_test(NAME cuda_prefill_gdn_large_fp32 COMMAND cuda_prefill_paths_test gdn_large_fp32)
         add_test(NAME cuda_prefill_gdn_large_fp16 COMMAND cuda_prefill_paths_test gdn_large_fp16)
         set_tests_properties(cuda_prefill_gdn_large_fp32 cuda_prefill_gdn_large_fp16 PROPERTIES

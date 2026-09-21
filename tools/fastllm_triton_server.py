@@ -2510,7 +2510,7 @@ def chunk_gdn_prefill_cache_paths(payload):
         raise ValueError("chunk_gdn_prefill block_v must be 32 or 64")
     cache_dir = Path(payload.get("cache_dir") or default_cache_dir()).expanduser()
     name = (
-        f"chunk_gdn_prefill_v8_{dtype}_state{state_dtype}_sm{arch}"
+        f"chunk_gdn_prefill_v{9 if arch == 75 else 8}_{dtype}_state{state_dtype}_sm{arch}"
         f"_c{chunks}_t{chunk_size}_k{k_dim}_v{v_dim}_bv{block_v}"
         f"_nw{num_warps}_ns{num_stages}"
     )
@@ -3002,6 +3002,14 @@ def compile_chunk_gdn_prefill(payload):
             cubin_paths["o_fused_decay_mask"],
         ),
     }
+    # Recent Triton versions can silently lower SM75 dots to scalar FMA.
+    # Those kernels are much slower than the native path; do not publish
+    # metadata that would make Qwen4 select mixed-precision prefill for them.
+    if arch == 75 and any("mma.sync" not in cc.asm["ptx"] for cc in ccinfos.values()):
+        raise RuntimeError(
+            "SM75 GDN requires a Triton compiler with tensor-core MMA support "
+            "(tested with Triton 3.2.0)"
+        )
     kernels = {
         key: {
             "cubin": str(cubin_paths[key]),
@@ -3016,6 +3024,7 @@ def compile_chunk_gdn_prefill(payload):
         "op": "chunk_gdn_prefill",
         "kernels": kernels,
         "arch": arch,
+        "sm75_mma": arch == 75,
         "dtype": dtype,
         "state_dtype": state_dtype,
         "chunks": chunks,
@@ -3495,7 +3504,14 @@ def _compile_cubin(
         for i, name in enumerate(fn.arg_names)
         if str(signature.get(name, "")).startswith("*") or name in extra_divisible_by_16
     }
-    src = ASTSource(fn=fn, signature=signature, constexprs=constexprs, attrs=attrs)
+    # Triton 3.2 supports SM75 tensor cores and uses the older AST API.
+    if arch == 75 and "constants" in ASTSource.__init__.__code__.co_varnames:
+        from triton.backends.compiler import AttrsDescriptor
+        hints = {key[0]: 16 for key in attrs}
+        src = ASTSource(fn=fn, signature=signature, constants=constexprs,
+                        attrs=AttrsDescriptor.from_hints(hints))
+    else:
+        src = ASTSource(fn=fn, signature=signature, constexprs=constexprs, attrs=attrs)
     target = GPUTarget("cuda", arch, 32)
     backend = triton.compiler.make_backend(target)
     options = backend.parse_options({"num_warps": num_warps, "num_stages": num_stages})

@@ -430,7 +430,9 @@ namespace fastllm {
         int arch, int chunks, int chunkSize, int kDim, int vDim,
         int blockV, int numWarps, int numStages, bool floatState) {
         std::ostringstream os;
-        os << "chunk_gdn_prefill_v8_fp16_state"
+        // SM75 v9 only accepts kernels compiled with tensor-core MMA.
+        os << (arch == 75 ? "chunk_gdn_prefill_v9_fp16_state" :
+                           "chunk_gdn_prefill_v8_fp16_state")
            << (floatState ? "fp32" : "fp16") << "_sm";
         os << arch
            << "_c" << chunks << "_t" << chunkSize
@@ -620,7 +622,9 @@ namespace fastllm {
         json11::Json json = json11::Json::parse(text, err);
         if (!err.empty() || !json["ok"].bool_value() ||
             json["op"].string_value() != "chunk_gdn_prefill" ||
-            json["dtype"].string_value() != "fp16") {
+            json["dtype"].string_value() != "fp16" ||
+            (json["arch"].int_value() == 75 &&
+             !json["sm75_mma"].bool_value())) {
             return false;
         }
         std::string stateDtype = json["state_dtype"].string_value();
@@ -1365,7 +1369,8 @@ namespace fastllm {
         std::string err;
         json11::Json response = json11::Json::parse(body, err);
         if (status != 200 || !err.empty() ||
-            !response["ok"].bool_value()) {
+            !response["ok"].bool_value() ||
+            (arch == 75 && !response["sm75_mma"].bool_value())) {
             static bool warned = false;
             if (!warned) {
                 printf("Fastllm Triton: chunk GDN prefill compile failed; "
@@ -1414,10 +1419,14 @@ namespace fastllm {
         const CudaTritonChunkGdnPrefillMeta *&meta) {
         static std::mutex mutex;
         static std::map<std::string, CudaTritonChunkGdnPrefillMeta> cachedMeta;
+        static std::set<std::string> failedSm75Meta;
         meta = nullptr;
         std::string metaPath = CudaTritonJoinPath(cacheDir, base + ".json");
         {
             std::lock_guard<std::mutex> guard(mutex);
+            if (arch == 75 && failedSm75Meta.count(metaPath)) {
+                return false;
+            }
             auto it = cachedMeta.find(metaPath);
             if (it != cachedMeta.end()) {
                 meta = &it->second;
@@ -1430,6 +1439,11 @@ namespace fastllm {
             if (!CudaTritonRequestChunkGdnPrefillKernel(
                     cacheDir, arch, chunks, chunkSize, kDim, vDim,
                     blockV, numWarps, numStages, floatState, loaded)) {
+                // Unsupported compilers must not retry once per model layer.
+                if (arch == 75) {
+                    std::lock_guard<std::mutex> guard(mutex);
+                    failedSm75Meta.insert(metaPath);
+                }
                 return false;
             }
         }
@@ -3081,7 +3095,12 @@ namespace fastllm {
         }
 
         config.arch = CudaTritonRuntimeArch();
-        if (config.arch < 80) {
+        // The shared FP16 H/O kernels also compile to Turing tensor-core
+        // instructions. Keep this new path opt-in: Qwen4's eligibility probe
+        // also selects FP16 prefill activations instead of its FP32 fallback.
+        // Preserve the existing automatic behavior on Ampere and newer GPUs.
+        if (config.arch < 80 &&
+            (config.arch != 75 || !CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON"))) {
             return false;
         }
         config.blockV = CudaEnvIntRange(

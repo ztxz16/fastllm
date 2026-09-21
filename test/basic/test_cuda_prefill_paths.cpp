@@ -51,8 +51,9 @@ void Near(const std::vector<float> &a, const std::vector<float> &b, float atol, 
     }
     std::printf(" max_error=%g", maximum);
 }
-void Gdn(int chunks, int batch, DataType stateType) {
-    constexpr int heads = 2, tile = 64, dim = 128;
+void Gdn(int chunks, int batch, DataType stateType, int heads = 2,
+         bool fuseDecayMask = false) {
+    constexpr int tile = 64, dim = 128;
     auto q = Tensor(FLOAT16, {batch, heads, chunks, tile, dim}, .02f, 1);
     auto k = Tensor(FLOAT16, q.dims, .02f, 2);
     auto v = Tensor(FLOAT16, q.dims, .03f, 3);
@@ -65,17 +66,39 @@ void Gdn(int chunks, int batch, DataType stateType) {
     auto referenceState = Tensor(stateType, {batch, heads, dim, dim}, .02f, 7);
     auto actualState = Tensor(stateType, referenceState.dims, .02f, 7);
     Require(FastllmCudaCanUseTritonChunkGdnPrefill(batch, chunks, tile, dim, dim, stateType == FLOAT32), "long GDN fast path rejected");
-    Data reference, actual;
-    FastllmChunkGatedDeltaRulePrefill(q, k, v, g, a, kc, referenceState, reference);
     static_cast<Executor *>(GetExecutor())->SetFirstDevice("cuda:0");
-    ChunkGatedDeltaRulePrefill(q, k, v, g, a, kc, actualState, actual);
-    std::printf("GDN chunks=%d batch=%d state=%d output", chunks, batch, int(stateType));
+    Data reference, actual, decayMask, maskedAttention;
+    Data *referenceAttention = &a;
+    if (fuseDecayMask) {
+        MakeDecayMask(g, decayMask);
+        Mul(a, 1.0f, maskedAttention);
+        MulTo(maskedAttention, decayMask);
+        CausalMask(maskedAttention, 1, 0.0f);
+        referenceAttention = &maskedAttention;
+    }
+    auto runActual = [&]() {
+        if (fuseDecayMask) {
+            // Qwen3.5 supplies the mask for H's shared scale preparation and
+            // O's fused masking; Qwen4 supplies already-masked attention.
+            static_cast<Executor *>(GetExecutor())->Run("ChunkGatedDeltaRulePrefill",
+                {{"q", &q}, {"k", &k}, {"v", &v}, {"g", &g},
+                 {"attn", &a}, {"decay_mask", &decayMask},
+                 {"k_cumdecay", &kc}, {"last_recurrent_state", &actualState},
+                 {"core_attn_out", &actual}}, {}, {{"fuse_decay_mask", 1}});
+        } else {
+            ChunkGatedDeltaRulePrefill(q, k, v, g, a, kc, actualState, actual);
+        }
+    };
+    FastllmChunkGatedDeltaRulePrefill(q, k, v, g, *referenceAttention, kc, referenceState, reference);
+    runActual();
+    std::printf("GDN chunks=%d batch=%d heads=%d state=%d fused_mask=%d output",
+                chunks, batch, heads, int(stateType), int(fuseDecayMask));
     Near(Read(actual), Read(reference), 1e-4f, .01f);
     std::printf(" state"); Near(Read(actualState), Read(referenceState), 1e-4f, .01f);
     // Continue a second prefill from the computed state. This observes state
     // commits and persistent scratch reuse, not just one output tensor.
-    FastllmChunkGatedDeltaRulePrefill(q, k, v, g, a, kc, referenceState, reference);
-    ChunkGatedDeltaRulePrefill(q, k, v, g, a, kc, actualState, actual);
+    FastllmChunkGatedDeltaRulePrefill(q, k, v, g, *referenceAttention, kc, referenceState, reference);
+    runActual();
     std::printf(" continued_output"); Near(Read(actual), Read(reference), 1e-4f, .01f);
     std::printf(" continued_state"); Near(Read(actualState), Read(referenceState), 1e-4f, .01f);
     std::puts(" PASS");
@@ -212,6 +235,26 @@ int main(int argc, char **argv) {
     if (FastllmCudaGetDeviceCount() < 1) return 77;
     try {
         FastllmCudaSetDevice(0); SetThreads(2);
+        if (argc >= 2 && std::strcmp(argv[1], "gdn_sm75") == 0) {
+            if (FastllmCudaRuntimeArch() != 75) return 77;
+#ifndef _WIN32
+            unsetenv("FASTLLM_CUDA_TRITON");
+            Require(!FastllmCudaCanUseTritonChunkGdnPrefill(1, 8, 64, 128, 128, true),
+                    "SM75 GDN must remain opt-in");
+            setenv("FASTLLM_CUDA_TRITON", "1", 1);
+            setenv("FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL", "0", 1);
+            Require(!FastllmCudaCanUseTritonChunkGdnPrefill(1, 8, 64, 128, 128, true),
+                    "GDN per-op disable ignored");
+            unsetenv("FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL");
+#endif
+            Require(!FastllmCudaCanUseTritonChunkGdnPrefill(1, 1, 64, 128, 128, true),
+                    "single-chunk decode path must stay native");
+            for (int chunks : {3, 8, 32, 65}) Gdn(chunks, 1, FLOAT32, 48);
+            Gdn(8, 2, FLOAT32, 48);
+            Gdn(8, 1, FLOAT16, 48, true);
+            Gdn(32, 1, FLOAT16, 48, true);
+            return 0;
+        }
         if (argc >= 2 && std::strcmp(argv[1], "gdn_large_fp32") == 0)
             return GdnLargeOffsets(FLOAT32);
         if (argc >= 2 && std::strcmp(argv[1], "gdn_large_fp16") == 0)
