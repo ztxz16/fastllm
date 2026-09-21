@@ -311,14 +311,14 @@ The CLI evolves continuously, so `ftllm <command> --help` is authoritative for t
 | `--ori` | Original model configuration and tokenizer directory for selected GGUF models |
 | `--mmproj` | Matching vision-module GGUF for Qwen3.5-family GGUF models; see [GGUF multimodal deployment](docs/qwen3_en.md#gguf-multimodal) for configuration requirements and an example |
 
-Optional NVFP4 draft conversion for single-GPU dense Qwen3.5-family MTP uses environment variables and requires `--mtp`:
+Qwen3.5 MTP and DFlash drafts share the following NVFP4 conversion setting. Set it before startup and enable the corresponding draft algorithm:
 
 | Environment variable | Default | Description |
 | --- | --- | --- |
-| `FASTLLM_MTP_DRAFT_QUANT` | `off` | `off` disables NVFP4 conversion; `nvfp4_head` converts only the separate draft output head; `nvfp4` converts the draft backbone and head. The target output head retains its original weights; unsupported weights keep their original implementation |
-| `FASTLLM_MTP_DRAFT_TOKEN_IDS` | Unset | Optional draft vocabulary token-ID file, used only when NVFP4 conversion is enabled. Unset or `0` keeps the full vocabulary. The shortlist is used only for greedy drafts; sampling uses the full output head |
+| `FASTLLM_DRAFT_QUANT` | `off` | `off` disables NVFP4 conversion; `nvfp4_head` converts only the separate draft output head; `nvfp4` converts the draft backbone and head. The target output head retains its original weights; unsupported weights keep their original implementation |
+| `FASTLLM_MTP_DRAFT_TOKEN_IDS` | Unset | Optional single-GPU MTP draft vocabulary token-ID file, used only when NVFP4 conversion is enabled. Unset or `0` keeps the full vocabulary. The shortlist is used only for greedy drafts; sampling uses the full output head |
 
-For example, prefix the existing launch command with `FASTLLM_MTP_DRAFT_QUANT=nvfp4`. These settings do not change the existing multi-GPU FP8 draft-head switch; `off` disables only this NVFP4 conversion.
+For example, prefix the existing launch command with `FASTLLM_DRAFT_QUANT=nvfp4`. Both single-GPU and multi-GPU runs are supported. Eligible draft shards are converted after splitting; separate draft-head copies preserve the target head shards. Dense MTP requires FP16 compute for multi-GPU NVFP4. Unsupported shapes or types retain their existing path. Explicit NVFP4 conversion takes precedence for eligible MTP head shards; `off` disables only NVFP4 conversion, leaving the existing multi-GPU FP8 draft-head switch in effect.
 
 ### API server
 

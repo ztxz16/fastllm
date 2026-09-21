@@ -404,6 +404,9 @@ namespace fastllm {
 
         bool dflashEnabled = false;
         bool dflashWeightsPrepared = false;
+        Data dflashNvfp4DraftLmHead;
+        std::unordered_map<int, Data> dflashNvfp4TpLmHeads;
+        std::unordered_map<std::string, Data> dflashNvfp4ViewWeights;
         int dflashWeightsPreparedDevice = -1;
         bool dflashTpBackboneDecisionMade = false;
         bool dflashTpBackbonePrepared = false;
@@ -490,6 +493,8 @@ namespace fastllm {
         int DFlashDraftsPerStep() const;
         void PrepareDFlashWeightsForDevice(int device);
         void PrepareDFlashBackboneTensorParallelWeights(int device);
+        void RunDFlashLmHead(int device, Data &input, Data &originalHead, const Data &bias, Data &output);
+        void RunDFlashLinear(Data &input, Data &weight, const Data &bias, Data &output);
         void RunDFlashGateupLinear(int device, Data &input,
                                    Data &linearWeight, Data &output);
         bool RunDFlashTensorParallelMlp(int device, Data &input,

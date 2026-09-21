@@ -28302,6 +28302,111 @@ namespace fastllm {
         return HasDFlashWeights() ? dflashRuntimeBlockSize - 1 : 0;
     }
 
+    static std::string Qwen35DraftQuantMode() {
+        const char *setting = std::getenv("FASTLLM_DRAFT_QUANT");
+        const std::string mode = setting ? setting : "off";
+        AssertInFastLLM(mode.empty() || mode == "off" || mode == "nvfp4_head" || mode == "nvfp4",
+                       "FASTLLM_DRAFT_QUANT must be off, nvfp4_head, or nvfp4.\n");
+        return mode.empty() ? "off" : mode;
+    }
+
+    // Quantized draft projections keep their original BF16 activation boundary.
+    // The existing NVFP4 Marlin route consumes FP16; never feed its packed
+    // weights to the generic BF16 GEMV implementation.
+    void Qwen3_5Model::RunDFlashLinear(Data &input, Data &originalWeight, const Data &bias, Data &output) {
+        const auto it = dflashNvfp4ViewWeights.find(originalWeight.name);
+        Data &linearWeight = it == dflashNvfp4ViewWeights.end() ? originalWeight : it->second;
+        if (linearWeight.dataType != DataType::NVFP4_BLOCK_16) {
+            Linear(input, linearWeight, bias, output);
+            return;
+        }
+        Data halfInput;
+        Data *source = &input;
+        if (input.dataType != DataType::FLOAT16) {
+            ToDataType(input, halfInput, DataType::FLOAT16);
+            source = &halfInput;
+        }
+        Linear(*source, linearWeight, bias, output);
+        ToDataType(output, input.dataType);
+    }
+
+#ifdef USE_CUDA
+    static void Qwen35PrepareDraftNvfp4Layout(Data &weight, int device) {
+        if (FastllmCudaHasNVFP4MarlinLayout(weight))
+            return;
+        Data x(DataType::FLOAT16, {1, weight.dims[1]});
+        Data y(DataType::FLOAT16, {1, weight.dims[0]});
+        for (Data *d : {&x, &y}) {
+            d->dataDevice = DataDevice::CUDA;
+            d->dataDeviceIds = {device};
+            d->Allocate(false);
+        }
+        FastllmCudaMemset0(x.cudaData, x.GetBytes());
+        const bool oldSync = FastllmCudaGetNcclForceSync();
+        FastllmCudaSetNcclForceSync(true);
+        bool ready = false;
+        try {
+            ready = FastllmCudaTryMarlinHalfMatMulFloatNVFP4Block16(x, weight, *GetEmptyData(), y, 1,
+                                                                    weight.dims[1], weight.dims[0]);
+        } catch (...) {
+            FastllmCudaSetNcclForceSync(oldSync);
+            throw;
+        }
+        FastllmCudaSetNcclForceSync(oldSync);
+        printf("[Qwen3.5 draft NVFP4] %s fast layout: %s\n", weight.name.c_str(),
+               ready ? "ready" : "generic fallback");
+    }
+
+    static bool Qwen35QuantizeDraftWeights(const std::vector<Data*> &weights) {
+        struct RestoreDevice {
+            int previous = FastllmCudaGetDevice();
+            ~RestoreDevice() { if (previous >= 0) FastllmCudaSetDevice(previous); }
+        } restore;
+        std::vector<Data*> locals;
+        for (Data *w : weights) {
+            if (w->multiDeviceData) {
+                if (w->multiDeviceDatas.empty()) return false;
+                for (const auto &entry : w->multiDeviceDatas) locals.push_back(entry.second);
+            } else {
+                locals.push_back(w);
+            }
+        }
+        for (Data *w : locals) {
+            if (!w || w->multiDeviceData || w->isFake || w->cudaDataBorrowed ||
+                w->dataDevice != DataDevice::CUDA || w->dataDeviceIds.size() != 1 ||
+                !w->cudaData || w->dims.size() != 2 ||
+                (w->dataType != DataType::FLOAT16 && w->dataType != DataType::BFLOAT16)) return false;
+            FastllmCudaSetDevice(w->dataDeviceIds[0]);
+            if (!FastllmCudaMarlinNVFP4Supported(w->dims[0], w->dims[1])) return false;
+        }
+        std::vector<Data> converted(locals.size());
+        for (size_t i = 0; i < locals.size(); ++i) {
+            if (!FastllmCudaQuantizeLinearWeightNVFP4Block16(*locals[i], converted[i])) return false;
+        }
+        for (size_t i = 0; i < locals.size(); ++i) {
+            Data &w = *locals[i], &q = converted[i];
+            const int device = w.dataDeviceIds[0];
+            FastllmCudaSetDevice(device);
+            q.name = w.name;
+            q.tpPackType = w.tpPackType;
+            q.tpLinearType = w.tpLinearType;
+            const auto scales = q.scales;
+            w.CopyFrom(q);
+            w.blockK = 1; w.blockM = 16; w.scales = scales;
+            w.weightType = WeightType::LINEAR; w.isModelWeight = true;
+            Qwen35PrepareDraftNvfp4Layout(w, device);
+        }
+        for (Data *w : weights) {
+            if (w->multiDeviceData) {
+                w->dataType = DataType::NVFP4_BLOCK_16;
+                w->blockK = 1; w->blockM = 16;
+                w->UpdateUnitSize();
+            }
+        }
+        return true;
+    }
+#endif
+
     void Qwen3_5Model::PrepareDFlashWeightsForDevice(int device) {
 #ifdef USE_CUDA
         if (!HasDFlashWeights()) {
@@ -28488,6 +28593,99 @@ namespace fastllm {
             DataDevice::CPU);
         weight["dflash.candidate_selector.successor_codebook"].ToDevice(
             DataDevice::CPU);
+        const std::string quantMode = Qwen35DraftQuantMode();
+        if (quantMode != "off") {
+            auto supported = [&](const Data &w) {
+                return !w.multiDeviceData && w.dims.size() == 2 &&
+                    w.dataDevice == DataDevice::CUDA && w.cudaData &&
+                    FastllmCudaMarlinNVFP4Supported(w.dims[0], w.dims[1]);
+            };
+            if (quantMode == "nvfp4") {
+                // These projections are views into the fused BF16 allocation.
+                // Keep that allocation and its view metadata intact; only the
+                // draft linear adapter uses the independent quantized copies.
+                std::vector<std::string> viewNames = {"dflash.all_kv.weight"};
+                for (int layer = 0; layer < dflashLayers; ++layer) {
+                    viewNames.push_back("dflash.layers." + std::to_string(layer) +
+                                        ".self_attn.mergeqkv.weight");
+                }
+                for (const auto &name : viewNames) {
+                    auto source = weight.weight.find(name);
+                    if (source == weight.weight.end() || !supported(source->second)) continue;
+                    Data &q = dflashNvfp4ViewWeights[name];
+                    if (!q.dims.empty()) q.ToDevice(DataDevice::CUDA, {device}, true);
+                    if (q.dims.empty() && !FastllmCudaQuantizeLinearWeightNVFP4Block16(source->second, q)) {
+                        dflashNvfp4ViewWeights.erase(name);
+                        continue;
+                    }
+                    q.name = name + ".draft_nvfp4";
+                    q.weightType = WeightType::LINEAR;
+                    q.isModelWeight = true;
+                    Qwen35PrepareDraftNvfp4Layout(q, device);
+                }
+                // Start with owning projections. The fused KV/QKV weights
+                // and their byte-offset views retain their original layout.
+                std::vector<std::string> names = {"dflash.fc.weight"};
+                for (int layer = 0; layer < dflashLayers; ++layer) {
+                    const std::string prefix = "dflash.layers." + std::to_string(layer) + ".";
+                    for (const char *suffix : {"self_attn.o_proj.weight",
+                            "mlp.gateup_proj.weight", "mlp.gate_proj.weight",
+                            "mlp.up_proj.weight", "mlp.down_proj.weight",
+                            "attention_conv.kernel_projection.weight",
+                            "mlp_conv.kernel_projection.weight"}) {
+                        names.push_back(prefix + suffix);
+                    }
+                }
+                for (const auto &name : names) {
+                    auto it = weight.weight.find(name);
+                    if (it == weight.weight.end()) continue;
+                    Data &w = it->second;
+                    if (!w.multiDeviceData) Qwen35QuantizeDraftWeights({&w});
+                }
+            }
+            Data &head = weight["lm_head.weight"];
+            if (head.multiDeviceData) {
+                for (int tpDevice : tpDevices) {
+                    auto local = head.multiDeviceDatas.find(tpDevice);
+                    if (local == head.multiDeviceDatas.end() || !local->second) continue;
+                    FastllmCudaSetDevice(tpDevice);
+                    if (!supported(*local->second)) continue;
+                    Data &q = dflashNvfp4TpLmHeads[tpDevice];
+                    if (q.dims.empty() && !FastllmCudaQuantizeLinearWeightNVFP4Block16(*local->second, q)) {
+                        dflashNvfp4TpLmHeads.erase(tpDevice);
+                        continue;
+                    }
+                    q.name = "dflash.draft_lm_head_nvfp4.cuda:" + std::to_string(tpDevice);
+                    q.weightType = WeightType::LINEAR;
+                    q.isModelWeight = true;
+                    Qwen35PrepareDraftNvfp4Layout(q, tpDevice);
+                }
+                FastllmCudaSetDevice(device);
+                printf("[Qwen3.5 DFlash2 NVFP4] %zu/%zu draft head shards; target head retained.\n",
+                       dflashNvfp4TpLmHeads.size(), tpDevices.size());
+            }
+            if (!dflashNvfp4DraftLmHead.dims.empty()) {
+                dflashNvfp4DraftLmHead.ToDevice(DataDevice::CUDA, {device}, true);
+                Qwen35PrepareDraftNvfp4Layout(dflashNvfp4DraftLmHead, device);
+            }
+            if (dflashNvfp4DraftLmHead.dims.empty() && supported(head)) {
+                const bool converted = FastllmCudaQuantizeLinearWeightNVFP4Block16(
+                    head, dflashNvfp4DraftLmHead);
+                if (converted) {
+                    dflashNvfp4DraftLmHead.name = "dflash.draft_lm_head_nvfp4";
+                    dflashNvfp4DraftLmHead.weightType = WeightType::LINEAR;
+                    dflashNvfp4DraftLmHead.isModelWeight = true;
+                    Qwen35PrepareDraftNvfp4Layout(dflashNvfp4DraftLmHead, device);
+                    printf("[Qwen3.5 DFlash2 NVFP4] draft head [%d,%d]; target head retained.\n",
+                           dflashNvfp4DraftLmHead.dims[0], head.dims[1]);
+                } else {
+                    dflashNvfp4DraftLmHead.FreeSpace();
+                    dflashNvfp4DraftLmHead.dims.clear();
+                    printf("[Qwen3.5 DFlash2 NVFP4] head conversion unavailable; using original weights.\n");
+                }
+            }
+            fflush(stdout);
+        }
         dflashWeightsPrepared = true;
         dflashWeightsPreparedDevice = device;
         PrepareDFlashBackboneTensorParallelWeights(device);
@@ -28646,6 +28844,18 @@ namespace fastllm {
             shardedBytes += linearWeight.GetBytes();
         }
 
+        if (Qwen35DraftQuantMode() == "nvfp4") {
+            for (auto &item : weight.weight) {
+                Data &gateup = item.second;
+                if (!Qwen35DFlashTpLinearEligible(item.first, gateup) ||
+                    !Qwen35DFlashHasTpShards(gateup, devices)) continue;
+                if (pairedGateupNames.count(item.first)) {
+                    Qwen35QuantizeDraftWeights({&gateup, &weight[Qwen35DFlashTpDownWeightName(item.first)]});
+                } else {
+                    Qwen35QuantizeDraftWeights({&gateup});
+                }
+            }
+        }
         dflashTpPreparedDevices = devices;
         dflashTpPreparedRatios = ratios;
         dflashTpBackbonePrepared = true;
@@ -28677,6 +28887,31 @@ namespace fastllm {
 #endif
     }
 
+    void Qwen3_5Model::RunDFlashLmHead(int device, Data &input, Data &originalHead,
+                                      const Data &bias, Data &output) {
+#ifdef USE_CUDA
+        Data *head = &originalHead;
+        auto local = dflashNvfp4TpLmHeads.find(device);
+        if (local != dflashNvfp4TpLmHeads.end()) {
+            head = &local->second;
+        } else if (!weight["lm_head.weight"].multiDeviceData && !dflashNvfp4DraftLmHead.dims.empty()) {
+            head = &dflashNvfp4DraftLmHead;
+        }
+        Qwen3CudaDirectRunner runner(device);
+        Data halfInput;
+        Data *source = &input;
+        if (head->dataType == DataType::NVFP4_BLOCK_16 && input.dataType != DataType::FLOAT16) {
+            halfInput.CopyFrom(input);
+            qwen3cuda::Qwen3CudaToDataType(runner, halfInput, DataType::FLOAT16);
+            source = &halfInput;
+        }
+        qwen3cuda::Qwen3CudaLinear(runner, *source, *head, bias, output);
+#else
+        (void)device;
+        Linear(input, originalHead, bias, output);
+#endif
+    }
+
     void Qwen3_5Model::RunDFlashGateupLinear(
             int device, Data &input, Data &linearWeight, Data &output) {
 #ifdef USE_CUDA
@@ -28687,20 +28922,27 @@ namespace fastllm {
                 linearWeight, dflashTpPreparedDevices)) {
             Executor &tpExecutor = Qwen35DFlashTpExecutor(
                 dflashTpPreparedDevices, dflashTpPreparedRatios);
+            Data halfInput;
+            Data *source = &input;
+            if (linearWeight.dataType == DataType::NVFP4_BLOCK_16 && input.dataType != DataType::FLOAT16) {
+                ToDataType(input, halfInput, DataType::FLOAT16);
+                source = &halfInput;
+            }
             tpExecutor.Run(
                 "Linear",
-                {{"input", &input},
+                {{"input", source},
                  {"weight", &linearWeight},
                  {"bias", GetEmptyData()},
                  {"output", &output}},
                 {}, {{"forceOutputGather", 1}});
             FastllmCudaSetDevice(device);
+            ToDataType(output, input.dataType);
             return;
         }
 #else
         (void)device;
 #endif
-        Linear(input, linearWeight, *GetEmptyData(), output);
+        RunDFlashLinear(input, linearWeight, *GetEmptyData(), output);
     }
 
     bool Qwen3_5Model::RunDFlashTensorParallelMlp(
@@ -28727,10 +28969,16 @@ namespace fastllm {
         // Ordered worker dispatch joins producer and completion streams with
         // events. This avoids the generic per-MLP device synchronizations;
         // the MultiCUDA MLP then defers replica reuse behind those waits.
+        Data halfInput;
+        Data *source = &input;
+        if (gateupWeight.dataType == DataType::NVFP4_BLOCK_16 && input.dataType != DataType::FLOAT16) {
+            ToDataType(input, halfInput, DataType::FLOAT16);
+            source = &halfInput;
+        }
         Qwen35ScopedMultiCudaAsyncDispatch asyncDispatch;
         tpExecutor.Run(
             "MLP",
-            {{"input", &input},
+            {{"input", source},
              {"output", &output},
              {"weight0", &gateupWeight},
              {"bias0", GetEmptyData()},
@@ -28741,6 +28989,7 @@ namespace fastllm {
              {"w3", &gateupOutput}},
             {}, {});
         FastllmCudaSetDevice(device);
+        ToDataType(output, input.dataType);
         return true;
 #else
         (void)device;
@@ -28818,8 +29067,9 @@ namespace fastllm {
 
         Data &projectionWeight = weight["dflash.fc.weight"];
         const bool useFp16ProjectionInput =
-            projectionWeight.dataType == DataType::FLOAT16 &&
-            tokens > dflashCheckpointBlockSize;
+            projectionWeight.dataType == DataType::NVFP4_BLOCK_16 ||
+            (projectionWeight.dataType == DataType::FLOAT16 &&
+             tokens > dflashCheckpointBlockSize);
         const DataType projectionInputType =
             useFp16ProjectionInput ?
                 DataType::FLOAT16 : DataType::BFLOAT16;
@@ -28904,7 +29154,7 @@ namespace fastllm {
             }
         }
         Data projected, projectedContextHidden;
-        Linear(combined, projectionWeight,
+        RunDFlashLinear(combined, projectionWeight,
                *GetEmptyData(), projected);
         if (projected.dataType != DataType::BFLOAT16) {
             ToDataType(projected, DataType::BFLOAT16);
@@ -28936,7 +29186,7 @@ namespace fastllm {
                         dflashLayers * 2 * kvRows &&
                     allKvWeightIt->second.dims[1] == embed_dim,
                 "DFlash fused KV projection weight shape is invalid.\n");
-            Linear(projectedContextHidden, allKvWeightIt->second,
+            RunDFlashLinear(projectedContextHidden, allKvWeightIt->second,
                    *GetEmptyData(), projectedAllKv);
         }
         auto allKNormIt = weight.weight.find("dflash.all_k_norm.weight");
@@ -29531,7 +29781,7 @@ namespace fastllm {
             Data normalized, attentionDynamic, attentionInput;
             RMSNorm(hiddenStates, weight[prefix + "input_layernorm.weight"],
                     dflashRmsNormEps, normalized);
-            Linear(normalized,
+            RunDFlashLinear(normalized,
                    weight[prefix +
                           "attention_conv.kernel_projection.weight"],
                    *GetEmptyData(), attentionDynamic);
@@ -29547,7 +29797,7 @@ namespace fastllm {
             if (mergedQkvIt != weight.weight.end()) {
                 const int qChannels = dflashHeads * dflashHeadDim;
                 const int kvChannels = dflashKvHeads * dflashHeadDim;
-                Linear(attentionInput, mergedQkvIt->second,
+                RunDFlashLinear(attentionInput, mergedQkvIt->second,
                        *GetEmptyData(), mergedQkv);
                 if (::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled(
                         "FASTLLM_CUDA_DFLASH_FUSED_QKV_PREPARE")) {
@@ -29676,7 +29926,7 @@ namespace fastllm {
                 {1, blockSize, dflashHeads * dflashHeadDim});
             ToDataType(attentionHeads, DataType::BFLOAT16);
             Data attentionOutput, convolvedAttention;
-            Linear(attentionHeads,
+            RunDFlashLinear(attentionHeads,
                    weight[prefix + "self_attn.o_proj.weight"],
                    *GetEmptyData(), attentionOutput);
             dynamicConvolve(
@@ -29689,7 +29939,7 @@ namespace fastllm {
                     weight[prefix + "post_attention_layernorm.weight"],
                     dflashRmsNormEps, normalized);
             Data mlpDynamic, mlpInput;
-            Linear(normalized,
+            RunDFlashLinear(normalized,
                    weight[prefix + "mlp_conv.kernel_projection.weight"],
                    *GetEmptyData(), mlpDynamic);
             dynamicConvolve(
@@ -29738,11 +29988,11 @@ namespace fastllm {
                               2 * dflashIntermediateSize, up);
                     }
                 } else {
-                    Linear(
+                    RunDFlashLinear(
                         mlpInput,
                         weight[prefix + "mlp.gate_proj.weight"],
                         *GetEmptyData(), gate);
-                    Linear(
+                    RunDFlashLinear(
                         mlpInput,
                         weight[prefix + "mlp.up_proj.weight"],
                         *GetEmptyData(), up);
@@ -29754,7 +30004,7 @@ namespace fastllm {
                     MulTo(gate, up);
                     ToDataType(gate, DataType::BFLOAT16);
                 }
-                Linear(gate, weight[prefix + "mlp.down_proj.weight"],
+                RunDFlashLinear(gate, weight[prefix + "mlp.down_proj.weight"],
                        *GetEmptyData(), mlpOutput);
             }
             dynamicConvolve(
@@ -29791,8 +30041,7 @@ namespace fastllm {
         Data fullLogits;
         Data replicatedHidden;
         if (draftDevices.size() == 1) {
-            Linear(lmHeadHidden, weight["lm_head.weight"],
-                   *GetEmptyData(), fullLogits);
+            RunDFlashLmHead(device, lmHeadHidden, weight["lm_head.weight"], *GetEmptyData(), fullLogits);
             ToDataType(fullLogits, DataType::FLOAT32);
             fullLogits.Reshape({lmHeadRows, fullLogits.dims.back()});
         } else {
@@ -29872,9 +30121,8 @@ namespace fastllm {
                     FastllmCudaSetDevice(localDevice);
                     Qwen3CudaDirectRunner runner(localDevice);
                     Data localLogits;
-                    qwen3cuda::Qwen3CudaLinear(
-                        runner, *hiddenIt->second, *weightIt->second,
-                        *biasIt->second, localLogits);
+                    RunDFlashLmHead(localDevice, *hiddenIt->second, *weightIt->second,
+                                  *biasIt->second, localLogits);
                     qwen3cuda::Qwen3CudaToDataType(
                         runner, localLogits, DataType::FLOAT32);
 
@@ -29996,9 +30244,8 @@ namespace fastllm {
                 FastllmCudaSetDevice(localDevice);
                 Qwen3CudaDirectRunner runner(localDevice);
                 Data localLogits;
-                qwen3cuda::Qwen3CudaLinear(
-                    runner, *hiddenIt->second, *weightIt->second,
-                    *biasIt->second, localLogits);
+                RunDFlashLmHead(localDevice, *hiddenIt->second, *weightIt->second,
+                                  *biasIt->second, localLogits);
                 qwen3cuda::Qwen3CudaToDataType(
                     runner, localLogits, DataType::FLOAT32);
                 qwen3cuda::Qwen3CudaTopK(
@@ -30272,7 +30519,7 @@ namespace fastllm {
             RMSNorm(hiddenStates,
                     weight[prefix + "input_layernorm.weight"],
                     dflashRmsNormEps, normalized);
-            Linear(normalized,
+            RunDFlashLinear(normalized,
                    weight[prefix +
                           "attention_conv.kernel_projection.weight"],
                    *GetEmptyData(), attentionDynamic);
@@ -30288,7 +30535,7 @@ namespace fastllm {
             if (mergedQkvIt != weight.weight.end()) {
                 const int qChannels = dflashHeads * dflashHeadDim;
                 const int kvChannels = dflashKvHeads * dflashHeadDim;
-                Linear(attentionInput, mergedQkvIt->second,
+                RunDFlashLinear(attentionInput, mergedQkvIt->second,
                        *GetEmptyData(), mergedQkv);
                 if (::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled(
                         "FASTLLM_CUDA_DFLASH_FUSED_QKV_PREPARE")) {
@@ -30443,7 +30690,7 @@ namespace fastllm {
             }
 
             Data attentionOutput, convolvedAttention;
-            Linear(attentionHeads,
+            RunDFlashLinear(attentionHeads,
                    weight[prefix + "self_attn.o_proj.weight"],
                    *GetEmptyData(), attentionOutput);
             dynamicConvolve(
@@ -30456,7 +30703,7 @@ namespace fastllm {
                     weight[prefix + "post_attention_layernorm.weight"],
                     dflashRmsNormEps, normalized);
             Data mlpDynamic, mlpInput;
-            Linear(normalized,
+            RunDFlashLinear(normalized,
                    weight[prefix +
                           "mlp_conv.kernel_projection.weight"],
                    *GetEmptyData(), mlpDynamic);
@@ -30507,11 +30754,11 @@ namespace fastllm {
                               2 * dflashIntermediateSize, up);
                     }
                 } else {
-                    Linear(
+                    RunDFlashLinear(
                         mlpInput,
                         weight[prefix + "mlp.gate_proj.weight"],
                         *GetEmptyData(), gate);
-                    Linear(
+                    RunDFlashLinear(
                         mlpInput,
                         weight[prefix + "mlp.up_proj.weight"],
                         *GetEmptyData(), up);
@@ -30523,7 +30770,7 @@ namespace fastllm {
                     MulTo(gate, up);
                     ToDataType(gate, DataType::BFLOAT16);
                 }
-                Linear(gate,
+                RunDFlashLinear(gate,
                        weight[prefix + "mlp.down_proj.weight"],
                        *GetEmptyData(), mlpOutput);
             }
@@ -30600,8 +30847,7 @@ namespace fastllm {
         Data candidateTopK;
         if (draftDevices.size() == 1) {
             Data fullLogits, allTopK;
-            Linear(lmHeadHidden, weight["lm_head.weight"],
-                   *GetEmptyData(), fullLogits);
+            RunDFlashLmHead(device, lmHeadHidden, weight["lm_head.weight"], *GetEmptyData(), fullLogits);
             ToDataType(fullLogits, DataType::FLOAT32);
             fullLogits.Reshape(
                 {totalLmHeadRows, fullLogits.dims.back()});
@@ -30663,9 +30909,8 @@ namespace fastllm {
                 FastllmCudaSetDevice(localDevice);
                 Qwen3CudaDirectRunner runner(localDevice);
                 Data localLogits;
-                qwen3cuda::Qwen3CudaLinear(
-                    runner, *hiddenIt->second, *weightIt->second,
-                    *biasIt->second, localLogits);
+                RunDFlashLmHead(localDevice, *hiddenIt->second, *weightIt->second,
+                                  *biasIt->second, localLogits);
                 qwen3cuda::Qwen3CudaToDataType(
                     runner, localLogits, DataType::FLOAT32);
 
@@ -30956,6 +31201,15 @@ namespace fastllm {
             threadTpLmHeadScheme = BuildMultiCudaRowSplitScheme(weight["lm_head.weight"], devs, ratios);
             split("lm_head.weight", threadTpLmHeadScheme, 0);
             PrepareMtpDraftLmHeadWeights(devices);
+        }
+        if (Qwen35DraftQuantMode() == "nvfp4" && num_experts == 0 && this->dataType == DataType::FLOAT16) {
+            Qwen35QuantizeDraftWeights({&weight["mtp.fc.weight"]});
+            for (const char *suffix : {"self_attn.mergeqkv.weight", "self_attn.q_proj.weight",
+                                      "self_attn.k_proj.weight", "self_attn.v_proj.weight",
+                                      "self_attn.o_proj.weight", "mlp.gateup_proj.weight", "mlp.down_proj.weight"}) {
+                auto it = weight.weight.find(prefix + suffix);
+                if (it != weight.weight.end()) Qwen35QuantizeDraftWeights({&it->second});
+            }
         }
         mtpTpDevices = devices;
         mtpTpPrepared = true;
@@ -31411,11 +31665,8 @@ namespace fastllm {
     // Experimental single-GPU draft quantization. The target head is never replaced.
     void Qwen3_5Model::PrepareMtpNvfp4DraftWeights(int device) {
 #ifdef USE_CUDA
-        const char *setting = std::getenv("FASTLLM_MTP_DRAFT_QUANT");
-        const std::string mode = setting ? setting : "off";
-        if (mode.empty() || mode == "off") return;
-        AssertInFastLLM(mode == "nvfp4_head" || mode == "nvfp4",
-            "FASTLLM_MTP_DRAFT_QUANT must be off, nvfp4_head, or nvfp4.\n");
+        const std::string mode = Qwen35DraftQuantMode();
+        if (mode == "off") return;
         if (num_experts != 0) return;
         FastllmCudaSetDevice(device);
         auto supported = [&](const Data &w) {
@@ -31424,28 +31675,7 @@ namespace fastllm {
                 FastllmCudaMarlinNVFP4Supported(w.dims[0], w.dims[1]);
         };
         auto prepareLayout = [&](Data &w) {
-            if (this->dataType != DataType::FLOAT16 || FastllmCudaHasNVFP4MarlinLayout(w)) return;
-            // New draft weights are created after serving warmup. Prepare their
-            // fast layout once here, never during graph capture or steady decode.
-            Data x(DataType::FLOAT16, {1, w.dims[1]});
-            Data y(DataType::FLOAT16, {1, w.dims[0]});
-            for (Data *d : {&x, &y}) {
-                d->dataDevice = DataDevice::CUDA; d->dataDeviceIds = {device}; d->Allocate(false);
-            }
-            FastllmCudaMemset0(x.cudaData, x.GetBytes());
-            const bool previousSync = FastllmCudaGetNcclForceSync();
-            FastllmCudaSetNcclForceSync(true);
-            bool prepared = false;
-            try {
-                prepared = FastllmCudaTryMarlinHalfMatMulFloatNVFP4Block16(
-                    x, w, *GetEmptyData(), y, 1, w.dims[1], w.dims[0]);
-            } catch (...) {
-                FastllmCudaSetNcclForceSync(previousSync);
-                throw;
-            }
-            FastllmCudaSetNcclForceSync(previousSync);
-            printf("[Qwen3.5 MTP NVFP4] %s fast layout: %s\n",
-                   w.name.c_str(), prepared ? "ready" : "generic fallback");
+            if (this->dataType == DataType::FLOAT16) Qwen35PrepareDraftNvfp4Layout(w, device);
         };
         if (mode == "nvfp4") {
             std::vector<std::string> names = {"mtp.fc.weight"};
@@ -31814,8 +32044,10 @@ namespace fastllm {
             mtpDraftLmHeadWeights.clear();
         };
         clearPrepared();
+        const bool useNvfp4 = Qwen35DraftQuantMode() != "off" &&
+            num_experts == 0 && this->dataType == DataType::FLOAT16;
         if (devices.size() <= 1 || Qwen35MtpDisabledByEnv() ||
-            !Qwen35MtpFp8DraftHeadEnabled()) {
+            (!useNvfp4 && !Qwen35MtpFp8DraftHeadEnabled())) {
             restoreDevice();
             return;
         }
@@ -31829,37 +32061,42 @@ namespace fastllm {
         size_t originalBytes = 0, quantizedBytes = 0;
         for (int device : devices) {
             auto localIt = lmHeadIt->second.multiDeviceDatas.find(device);
-            if (localIt == lmHeadIt->second.multiDeviceDatas.end() ||
-                localIt->second == nullptr ||
-                localIt->second->dataDevice != DataDevice::CUDA ||
-                localIt->second->cudaData == nullptr ||
-                localIt->second->dims.size() != 2 ||
-                localIt->second->dims[1] % 128 != 0 ||
-                (localIt->second->dataType != DataType::FLOAT16 &&
-                 localIt->second->dataType != DataType::BFLOAT16)) {
-                clearPrepared();
-                restoreDevice();
-                return;
+            if (localIt == lmHeadIt->second.multiDeviceDatas.end() || !localIt->second) {
+                if (useNvfp4) continue;
+                clearPrepared(); restoreDevice(); return;
             }
-            Data *draftWeight = new Data(DataType::FP8_E4M3_BLOCK_128);
-            if (!FastllmCudaQuantizeLinearWeightFP8E4M3Block128(
-                    *localIt->second, *draftWeight)) {
+            Data &source = *localIt->second;
+            FastllmCudaSetDevice(device);
+            Data *draftWeight = new Data();
+            // NVFP4 also accepts supported INT4 and per-row FP8 sources. Do
+            // not filter them through the older FP16/BF16-only FP8 converter.
+            bool converted = useNvfp4 && source.dims.size() == 2 &&
+                FastllmCudaMarlinNVFP4Supported(source.dims[0], source.dims[1]) &&
+                FastllmCudaQuantizeLinearWeightNVFP4Block16(source, *draftWeight);
+            const bool quantizeNvfp4 = converted;
+            if (!converted && Qwen35MtpFp8DraftHeadEnabled() &&
+                source.dataDevice == DataDevice::CUDA && source.cudaData &&
+                source.dims.size() == 2 && source.dims[1] % 128 == 0 &&
+                (source.dataType == DataType::FLOAT16 || source.dataType == DataType::BFLOAT16)) {
+                converted = FastllmCudaQuantizeLinearWeightFP8E4M3Block128(source, *draftWeight);
+            }
+            if (!converted) {
                 delete draftWeight;
-                clearPrepared();
-                restoreDevice();
-                return;
+                if (useNvfp4) continue;
+                clearPrepared(); restoreDevice(); return;
             }
-            draftWeight->name = localIt->second->name + ".mtp_draft_fp8";
+            draftWeight->name = source.name + (quantizeNvfp4 ? ".mtp_draft_nvfp4" : ".mtp_draft_fp8");
             draftWeight->weightType = WeightType::LINEAR;
             draftWeight->isModelWeight = true;
-            draftWeight->tpLinearType = localIt->second->tpLinearType;
-            draftWeight->tpPackType = localIt->second->tpPackType;
-            originalBytes += localIt->second->GetBytes();
+            draftWeight->tpLinearType = source.tpLinearType;
+            draftWeight->tpPackType = source.tpPackType;
+            originalBytes += source.GetBytes();
             quantizedBytes += draftWeight->GetBytes();
+            if (quantizeNvfp4) Qwen35PrepareDraftNvfp4Layout(*draftWeight, device);
             mtpDraftLmHeadWeights[device] = draftWeight;
         }
-        printf("[Qwen3.5 MTP] FP8 draft lm_head prepared on %zu GPUs "
-               "(source retained: %.2f GB, extra FP8 copy: %.2f GB).\n",
+        printf("[Qwen3.5 MTP] quantized draft lm_head prepared on %zu GPUs "
+               "(source retained: %.2f GB, extra draft copy: %.2f GB).\n",
                mtpDraftLmHeadWeights.size(), originalBytes / 1.0e9,
                quantizedBytes / 1.0e9);
         fflush(stdout);

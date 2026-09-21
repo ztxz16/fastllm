@@ -312,14 +312,14 @@ CLI 会持续演进，`ftllm <command> --help` 是当前安装版本的最终依
 | `--ori` | 读取部分 GGUF 时指定原模型配置和 tokenizer 目录 |
 | `--mmproj` | Qwen3.5 架构族 GGUF 的配套视觉模块文件；配置要求与示例见 [GGUF 多模态](docs/qwen3.md#gguf-multimodal) |
 
-Qwen3.5 系列的可选单卡、稠密 MTP 草稿 NVFP4 转换通过环境变量配置，需同时启用 `--mtp`：
+Qwen3.5 系列的 MTP 和 DFlash 草稿共用以下 NVFP4 转换开关，需在启动前设置，并启用相应的草稿算法：
 
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `FASTLLM_MTP_DRAFT_QUANT` | `off` | `off` 关闭 NVFP4 转换；`nvfp4_head` 只转换独立草稿输出头；`nvfp4` 转换草稿主干和输出头。目标模型输出头保持原权重，不支持的权重保留原实现 |
-| `FASTLLM_MTP_DRAFT_TOKEN_IDS` | 未设置 | 可选的草稿词表 token ID 文件，仅在启用 NVFP4 转换时使用；未设置或为 `0` 时使用完整词表。筛选词表只用于贪心草稿，随机采样使用完整输出头 |
+| `FASTLLM_DRAFT_QUANT` | `off` | `off` 关闭 NVFP4 转换；`nvfp4_head` 只转换独立草稿输出头；`nvfp4` 转换草稿主干和输出头。目标模型输出头保持原权重，不支持的权重保留原实现 |
+| `FASTLLM_MTP_DRAFT_TOKEN_IDS` | 未设置 | 可选的单卡 MTP 草稿词表 token ID 文件，仅在启用 NVFP4 转换时使用；未设置或为 `0` 时使用完整词表。筛选词表只用于贪心草稿，随机采样使用完整输出头 |
 
-例如，在现有启动命令前加 `FASTLLM_MTP_DRAFT_QUANT=nvfp4`。以上配置不改变既有多卡 FP8 草稿输出头开关；`off` 仅关闭这里的 NVFP4 转换。
+例如，在现有启动命令前加 `FASTLLM_DRAFT_QUANT=nvfp4`。单卡和多卡均可使用；多卡在切分后转换符合条件的草稿分片，输出头使用独立副本，目标模型分片保持原样。稠密 MTP 的多卡 NVFP4 路径要求 FP16 计算；不支持的形状或类型保留原路径。显式启用 NVFP4 时，符合条件的 MTP 输出头优先使用 NVFP4；`off` 仅关闭 NVFP4 转换，既有多卡 FP8 草稿输出头开关仍有效。
 
 ### API Server
 
