@@ -894,6 +894,12 @@ if (UNIT_TEST)
         add_test(NAME cuda_masked_attention COMMAND cuda_masked_attention_test)
         set_tests_properties(cuda_masked_attention PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 TIMEOUT 180)
 
+        add_executable(cuda_qwen4_gdn_sequence_test test/basic/test_cuda_qwen4_gdn_sequence.cpp)
+        target_link_libraries(cuda_qwen4_gdn_sequence_test PRIVATE fastllm)
+        target_include_directories(cuda_qwen4_gdn_sequence_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME cuda_qwen4_gdn_sequence COMMAND cuda_qwen4_gdn_sequence_test)
+        set_tests_properties(cuda_qwen4_gdn_sequence PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 TIMEOUT 180)
+
         add_executable(cuda_single_prefill_dispatch_test test/basic/test_cuda_single_prefill_dispatch.cu)
         target_include_directories(cuda_single_prefill_dispatch_test PRIVATE third_party)
         set_target_properties(cuda_single_prefill_dispatch_test PROPERTIES

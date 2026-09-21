@@ -1189,14 +1189,14 @@ namespace {
         }
     }
 
-    // Exact SM120 short-sequence mapping.  A warp owns 32 adjacent value
+    // Sequence state tiling. A warp owns 32 adjacent value
     // channels, so each lane retains the generic kernel's strictly increasing
     // K reduction order.  Four independent blocks per value head expose the
     // same 128 lanes to four times as many SMs while caching each state tile
     // across all speculative tokens.
     template <typename T, bool OUT_OF_PLACE_STATE>
     __global__ __launch_bounds__(32)
-    void Qwen4GatedDeltaRuleSequenceValueTileSm120Kernel(
+    void Qwen4GatedDeltaRuleSequenceValueTileKernel(
             const float *qkv, const T *alpha, const T *beta,
             const float *aLog, const float *dtBias, float *state,
             float *stateOutput, float *output,
@@ -2472,11 +2472,11 @@ namespace {
             fastllm::Data *stateOutput, fastllm::Data &output,
             int blocks, int keyHeads, int valueHeads, int sequence,
             float recurrentEps, float inverseHead,
-            bool useValueTileSm120) {
+            bool useValueTile) {
         float *nextState = OUT_OF_PLACE_STATE
             ? (float*)stateOutput->cudaData : nullptr;
-        if (useValueTileSm120) {
-            Qwen4GatedDeltaRuleSequenceValueTileSm120Kernel<
+        if (useValueTile) {
+            Qwen4GatedDeltaRuleSequenceValueTileKernel<
                 T, OUT_OF_PLACE_STATE><<<
                     blocks * 4, 32, 0, cudaStreamPerThread>>>(
                 (const float*)qkv.cudaData, (const T*)alpha.cudaData,
@@ -3990,52 +3990,44 @@ bool FastllmCudaQwen4GatedDeltaRuleDecode(
     // as both the RMSNorm weight and the subsequent query scale.  Passing the
     // same host result avoids the one-ULP difference of device rsqrtf().
     const float inverseHead = 1.0f / std::sqrt((float)keyDim);
-    int device = -1;
-    int major = 0;
-    int minor = 0;
-    const bool useValueTileSm120 = sequence > 1 && sequence <= 9 &&
-        cudaGetDevice(&device) == cudaSuccess &&
-        cudaDeviceGetAttribute(
-            &major, cudaDevAttrComputeCapabilityMajor, device) ==
-            cudaSuccess &&
-        cudaDeviceGetAttribute(
-            &minor, cudaDevAttrComputeCapabilityMinor, device) ==
-            cudaSuccess &&
-        major == 12 && minor == 0;
+    // Keep a state tile on chip across recurrent steps. The benefit comes
+    // from state reuse and additional independent blocks, not an ISA or a
+    // particular speculative width. Single-token decode keeps its mapping.
+    const bool useValueTile = sequence > 1;
     if (alpha.dataType == fastllm::DataType::FLOAT32) {
         if (stateOutput == nullptr) {
             Qwen4LaunchGatedDeltaRule<float, false>(
                 qkv, alpha, beta, aLog, dtBias, state, nullptr, output,
                 blocks, keyHeads, valueHeads, sequence, recurrentEps,
-                inverseHead, useValueTileSm120);
+                inverseHead, useValueTile);
         } else {
             Qwen4LaunchGatedDeltaRule<float, true>(
                 qkv, alpha, beta, aLog, dtBias, state, stateOutput, output,
                 blocks, keyHeads, valueHeads, sequence, recurrentEps,
-                inverseHead, useValueTileSm120);
+                inverseHead, useValueTile);
         }
     } else if (alpha.dataType == fastllm::DataType::FLOAT16) {
         if (stateOutput == nullptr) {
             Qwen4LaunchGatedDeltaRule<half, false>(
                 qkv, alpha, beta, aLog, dtBias, state, nullptr, output,
                 blocks, keyHeads, valueHeads, sequence, recurrentEps,
-                inverseHead, useValueTileSm120);
+                inverseHead, useValueTile);
         } else {
             Qwen4LaunchGatedDeltaRule<half, true>(
                 qkv, alpha, beta, aLog, dtBias, state, stateOutput, output,
                 blocks, keyHeads, valueHeads, sequence, recurrentEps,
-                inverseHead, useValueTileSm120);
+                inverseHead, useValueTile);
         }
     } else if (stateOutput == nullptr) {
         Qwen4LaunchGatedDeltaRule<__nv_bfloat16, false>(
             qkv, alpha, beta, aLog, dtBias, state, nullptr, output,
             blocks, keyHeads, valueHeads, sequence, recurrentEps,
-            inverseHead, useValueTileSm120);
+            inverseHead, useValueTile);
     } else {
         Qwen4LaunchGatedDeltaRule<__nv_bfloat16, true>(
             qkv, alpha, beta, aLog, dtBias, state, stateOutput, output,
             blocks, keyHeads, valueHeads, sequence, recurrentEps,
-            inverseHead, useValueTileSm120);
+            inverseHead, useValueTile);
     }
     DeviceSync();
     return cudaGetLastError() == cudaSuccess;
