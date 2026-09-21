@@ -3026,7 +3026,11 @@ namespace fastllm {
                             dictLocker.unlock();
                             forwardLocker.lock();
 #ifdef USE_CUDA
-                            FastllmCudaClearBigBuffer();
+                            if (model->RetainCudaWorkspace()) {
+                                FastllmCudaTrimBigBuffer();
+                            } else {
+                                FastllmCudaClearBigBuffer();
+                            }
 #endif
                             Data inputIds = Data(DataType::FLOAT32, {1, (int) ids.size()}, ids);
                             std::vector<int> ret;

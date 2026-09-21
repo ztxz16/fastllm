@@ -25,6 +25,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -5892,7 +5893,8 @@ void FastllmCudaMallocBigBuffer(size_t size) {
     bigBuffers.push_back(CudaMemoryBuffer(ret, size, false));
 }
 
-static void FastllmCudaClearBigBufferWithRetain(size_t retainBytes, bool currentDeviceOnly) {
+static void FastllmCudaClearBigBufferWithRetain(
+        size_t retainBytes, bool currentDeviceOnly, bool boundedRetain = false) {
     if (fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
         return;
     }
@@ -5919,12 +5921,31 @@ static void FastllmCudaClearBigBufferWithRetain(size_t retainBytes, bool current
         std::vector <CudaMemoryBuffer> temp;
         size_t littleMemSum = 0;
         size_t littleMemSumLimit = retainBytes; // 留一小部分复用
+        size_t idleBytes = 0;
         std::vector <std::pair <std::size_t, int > > v;
         for (int i = 0; i < bigBuffers.size(); i++) {
             if (!bigBuffers[i].busy && bigBuffers[i].graphPins == 0 &&
                 FastllmCudaBufferReadyForReuseLocked(bigBuffers[i])) {
                 v.push_back(std::make_pair(bigBuffers[i].size, i));
+                idleBytes += bigBuffers[i].size;
             }
+        }
+        if (boundedRetain) {
+            // Device capacity is constant; keep this cache local to callers
+            // that opt into reuse, without extending every pool view.
+            static thread_local std::map<int, size_t> capacities;
+            size_t &capacity = capacities[view.device];
+            if (capacity == 0) {
+                cudaDeviceProp prop;
+                state = cudaGetDeviceProperties(&prop, view.device);
+                checkCudaErrors("Error: CUDA error when reading workspace capacity!", state);
+                capacity = prop.totalGlobalMem;
+            }
+            // Retain reusable workspaces within a device-relative budget. Do not
+            // query free memory on every forward: that may wait for queued GPU
+            // work. Allocation pressure is handled by the idle-pool OOM retry.
+            littleMemSumLimit = capacity / 4;
+            if (idleBytes <= littleMemSumLimit) continue;
         }
         std::sort(v.begin(), v.end());
         std::set <int> littleMemIds;
@@ -5959,6 +5980,10 @@ static void FastllmCudaClearBigBufferWithRetain(size_t retainBytes, bool current
 
 void FastllmCudaClearBigBuffer() {
     FastllmCudaClearBigBufferWithRetain(300ULL * 1024ULL * 1024ULL, false);
+}
+
+void FastllmCudaTrimBigBuffer() {
+    FastllmCudaClearBigBufferWithRetain(0, false, true);
 }
 
 void FastllmCudaClearBigBufferCurrentDevice() {
@@ -19221,6 +19246,27 @@ int GetPointerDeviceId(void *ptr) {
         cudaGetLastError();
         return -1;
     }
+}
+
+int FastllmCudaGetHostNumaNode(int device) {
+#if defined(__linux__) && !defined(USE_ROCM)
+    char busId[32];
+    if (cudaDeviceGetPCIBusId(busId, sizeof(busId), device) != cudaSuccess) {
+        return -1;
+    }
+    unsigned domain, bus, slot, function;
+    if (std::sscanf(busId, "%x:%x:%x.%x", &domain, &bus, &slot, &function) != 4) {
+        return -1;
+    }
+    char path[128];
+    std::snprintf(path, sizeof(path),
+        "/sys/bus/pci/devices/%04x:%02x:%02x.%x/numa_node",
+        domain, bus, slot, function);
+    int node = -1;
+    std::ifstream file(path);
+    if (file >> node) return node;
+#endif
+    return -1;
 }
 
 int FastllmCudaGetDeviceCount() {

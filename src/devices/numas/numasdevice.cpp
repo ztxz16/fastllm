@@ -31,6 +31,10 @@
 #include <set>
 #include <numeric>
 #include <fstream>
+#ifdef __linux__
+#include <pthread.h>
+#include <sched.h>
+#endif
 
 #ifdef __aarch64__
 #include <arm_neon.h>
@@ -545,6 +549,85 @@ namespace fastllm {
         numaConfigLocker.unlock();
         
         return fastllmNumaConfig;
+    }
+
+    std::vector<std::vector<int>> GetNumasCudaWorkerCpuSets(
+            const std::vector<int> &devices) {
+        std::vector<std::vector<int>> result(devices.size());
+        if (devices.empty()) return result;
+#if defined(USE_CUDA) && defined(__linux__)
+        cpu_set_t allowed;
+        if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) return result;
+        auto coreOf = [](int cpu, std::pair<int, int> &core) {
+            const auto base = "/sys/devices/system/cpu/cpu" +
+                std::to_string(cpu) + "/topology/";
+            std::ifstream package(base + "physical_package_id");
+            std::ifstream id(base + "core_id");
+            return bool(package >> core.first) && bool(id >> core.second);
+        };
+        std::set<std::pair<int, int>> occupied;
+        auto *pool = GetAlivePool();
+        for (const auto &node : GetNumaConfig()->numaToCpuDict) {
+            for (const auto &worker : node) {
+                cpu_set_t workerCpus;
+                if (worker.first < 0 || worker.first >= (int)pool->threads.size() ||
+                    pthread_getaffinity_np(pool->threads[worker.first]->native_handle(),
+                        sizeof(workerCpus), &workerCpus) != 0) return result;
+                // A restricted container can reject the preferred expert pin.
+                // Use the actual mask, including a NUMA-wide fallback, instead
+                // of assuming that its requested single-core binding worked.
+                for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+                    if (!CPU_ISSET(cpu, &workerCpus)) continue;
+                    std::pair<int, int> core;
+                    if (!coreOf(cpu, core)) return result;
+                    occupied.insert(core);
+                }
+            }
+        }
+        std::map<int, std::vector<int>> available;
+        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+            if (!CPU_ISSET(cpu, &allowed)) continue;
+            std::pair<int, int> core;
+            if (!coreOf(cpu, core)) return result;
+            // Keep one logical CPU per unused physical core. SMT siblings of
+            // an expert worker must not compete with its vector kernels.
+            if (occupied.insert(core).second) {
+                const int node = numa_node_of_cpu(cpu);
+                if (node >= 0) available[node].push_back(cpu);
+            }
+        }
+        std::vector<int> nodes;
+        std::map<int, int> ranksPerNode;
+        for (int device : devices) {
+            int node = FastllmCudaGetHostNumaNode(device);
+            nodes.push_back(node);
+            ++ranksPerNode[node];
+        }
+        for (size_t rank = 0; rank < devices.size(); ++rank) {
+            const int node = nodes[rank];
+            if (node >= 0 && available[node].size() >= (size_t)ranksPerNode[node]) {
+                result[rank] = available[node];
+            }
+        }
+#endif
+        return result;
+    }
+
+    bool BindNumasWorkerCpuSet(const std::vector<int> &cpus) {
+#ifdef __linux__
+        cpu_set_t allowed, selected;
+        if (cpus.empty() || sched_getaffinity(0, sizeof(allowed), &allowed) != 0) return false;
+        CPU_ZERO(&selected);
+        for (int cpu : cpus) {
+            if (cpu >= 0 && cpu < CPU_SETSIZE && CPU_ISSET(cpu, &allowed)) {
+                CPU_SET(cpu, &selected);
+            }
+        }
+        return CPU_COUNT(&selected) > 0 &&
+            sched_setaffinity(0, sizeof(selected), &selected) == 0;
+#else
+        return false;
+#endif
     }
 
     NumasDevice::NumasDevice() {

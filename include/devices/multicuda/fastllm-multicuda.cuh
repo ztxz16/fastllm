@@ -64,6 +64,8 @@ void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int d
 // Runs NCCL directly, bypassing the graph-safe custom all-reduce. Large TP
 // prefill tensors can be bandwidth-bound on the direct-peer implementation
 // even though it is faster for decode tensors.
+// Multi-rank eager calls rendezvous before and after NCCL host submission;
+// callers do not need another pair of host barriers. Capture bypasses both.
 void FastllmNcclAllReduceNoCustom(void* data, void* dest, int count, int dataType, int deviceId);
 // Requires an initialized TP communicator and matching submissions on every rank.
 bool FastllmNcclAllGather(const void* data, void* dest, int count, int dataType, int deviceId);

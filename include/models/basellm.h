@@ -401,6 +401,9 @@ namespace fastllm {
 
         virtual void WarmupCudaRuntimeBuffers(int batch) {}
 
+        // Preserve the default cleanup unless a model opts into bounded reuse.
+        virtual bool RetainCudaWorkspace() const { return false; }
+
         // Materialize model-specific serving scratch before the final automatic
         // KV-cache calibration so its actual pool footprint is observable.
         virtual void WarmupCudaServingHighWaterBuffers() {}

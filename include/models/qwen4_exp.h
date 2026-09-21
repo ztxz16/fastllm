@@ -24,6 +24,7 @@ namespace fastllm {
         ~Qwen4ExpModel() override;
 
         void InitParams() override;
+        bool RetainCudaWorkspace() const override;
 
         std::map<std::string, std::vector<std::pair<std::string, DataType>>>
         GetTensorMap(const std::vector<std::string> &tensorNames) override;
@@ -410,12 +411,14 @@ namespace fastllm {
                                 Data *alphaCapture = nullptr,
                                 Data *betaCapture = nullptr,
                                 Data *recurrentStateOutput = nullptr);
-        void RunMoE(int layer, const Data &input, Data &output);
+        void RunMoE(int layer, const Data &input, Data &output,
+                    bool reduceOutput = true);
         void RunMoEWithPrefix(int deviceLayer,
                               const std::string &mlpPrefix,
                               std::vector<Data *> &moeWeights,
                               std::vector<Data *> &moeBiass,
-                              const Data &input, Data &output);
+                              const Data &input, Data &output,
+                              bool reduceOutput = true);
 
         bool HasMtpWeights() const;
         bool MtpSupportsGenerationConfig(

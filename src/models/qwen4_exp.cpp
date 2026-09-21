@@ -33,6 +33,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -1199,6 +1200,15 @@ namespace fastllm {
         std::vector<void*> linearCachePointers;
         std::vector<uint64_t> fullCacheSignature;
         bool wholeGraphMode = false;
+        bool hybridDenseMode = false;
+        struct HybridBoundary {
+            Data input;
+            Data injection;
+            Data output;
+        };
+        // CPU experts execute between dense graphs. Each boundary owns stable
+        // storage, with dtype and shape established by its eager warmup.
+        std::map<int, HybridBoundary> hybridBoundaries;
         Data hiddenStates[2];
         Data attentionInput;
         Data attentionInjection;
@@ -1258,6 +1268,8 @@ namespace fastllm {
 #endif
             hiddenStates[0].FreeSpace();
             hiddenStates[1].FreeSpace();
+            hybridBoundaries.clear();
+            hybridDenseMode = false;
             attentionInput.FreeSpace();
             attentionInjection.FreeSpace();
             attentionOutput.FreeSpace();
@@ -1383,6 +1395,8 @@ namespace fastllm {
     // and the immutable host PLE table. No rank starts a second scheduler.
     struct Qwen4ExpModel::ThreadTpState {
         std::vector<int> devices;
+        std::vector<std::vector<int>> workerCpus;
+        bool hostMoe = false;
         std::vector<int> votes;
         int vocabSize = 0;
         std::vector<std::vector<std::pair<int, float>>> topCandidates;
@@ -1406,7 +1420,7 @@ namespace fastllm {
         std::unique_ptr<RequestCache> idleCache;
         std::mutex forwardMutex, barrierMutex;
         std::condition_variable barrierCv;
-        unsigned generation = 0;
+        std::atomic<unsigned> generation{0};
         int arrived = 0;
         // Destroy workers before the rank models and synchronization state.
         PersistentWorkerGroup workers;
@@ -1430,16 +1444,31 @@ namespace fastllm {
 
         void Barrier() {
             std::unique_lock<std::mutex> lock(barrierMutex);
-            unsigned previous = generation;
+            unsigned previous = generation.load(std::memory_order_acquire);
             if (++arrived == (int)devices.size()) {
                 arrived = 0;
-                generation++;
+                generation.fetch_add(1, std::memory_order_release);
                 barrierCv.notify_all();
-            } else if (!barrierCv.wait_for(lock, std::chrono::seconds(60), [&] {
-                           return generation != previous;
-                       })) {
-                std::fprintf(stderr, "Qwen4 TP rank rendezvous timed out.\n");
-                std::abort();
+            } else {
+                // Short eager collectives usually arrive a few microseconds
+                // apart. Avoid a scheduler round trip while retaining the
+                // blocking wait for long prefill and host-expert work.
+                lock.unlock();
+                for (int spin = 0; spin < 2048; ++spin) {
+                    if (generation.load(std::memory_order_acquire) != previous) return;
+#if defined(__x86_64__) || defined(__i386__)
+                    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+                    asm volatile("yield");
+#endif
+                }
+                lock.lock();
+                if (!barrierCv.wait_for(lock, std::chrono::seconds(60), [&] {
+                        return generation.load(std::memory_order_acquire) != previous;
+                    })) {
+                    std::fprintf(stderr, "Qwen4 TP rank rendezvous timed out.\n");
+                    std::abort();
+                }
             }
         }
     };
@@ -1469,14 +1498,23 @@ namespace fastllm {
         AssertInFastLLM(std::set<int>(devices.begin(), devices.end()).size() == devices.size(),
                         "Qwen4 TP device IDs must be unique.");
         if (devices.size() <= 1) return;
-        // Validate before loading weights; rank-local placement cannot honor
-        // CPU/NUMA offload, layered placement or a shared expert cache.
+        const bool hostMoe =
+            std::any_of(moeDeviceMap.begin(), moeDeviceMap.end(), [](const auto &item) {
+                return item.second > 0;
+            }) &&
+            std::all_of(moeDeviceMap.begin(), moeDeviceMap.end(), [](const auto &item) {
+                return item.second <= 0 || item.first == "cpu" ||
+                    item.first == "numa" || item.first.rfind("numa:", 0) == 0;
+            });
+        // Host experts remain whole and are scheduled once across all ranks.
+        // Mixed layer placement and rank-local expert caches need a separate
+        // ownership scheme, so reject them before loading weights.
         AssertInFastLLM(Qwen4CudaOnlyDeviceMap(deviceMap) &&
-                        Qwen4CudaOnlyDeviceMap(moeDeviceMap) &&
+                        (Qwen4CudaOnlyDeviceMap(moeDeviceMap) || hostMoe) &&
                         moeDeviceLayers < 0 && layeredMoeDeviceMap.empty() &&
                         GetMoeCudaCacheBytes() == 0,
-                        "Qwen4 TP requires CUDA-only weights without layered MoE placement or --moe_cuda_cache. "
-                        "Remove --tp for CPU/NUMA hybrid inference.");
+                        "Qwen4 TP requires CUDA dense weights and either CUDA or CPU/NUMA experts, "
+                        "without layered MoE placement or --moe_cuda_cache.");
         const int count = devices.size();
         AssertInFastLLM(num_k_heads % count == 0 && num_v_heads % count == 0 &&
                         num_attention_heads % count == 0 &&
@@ -1485,12 +1523,17 @@ namespace fastllm {
         AssertInFastLLM(!GetKVCacheInCPU(), "Qwen4 TP requires CUDA KV caches.");
         threadTpState.reset(new ThreadTpState());
         threadTpState->devices = std::move(devices);
+        threadTpState->hostMoe = hostMoe;
 #endif
     }
 
     bool Qwen4ExpModel::ShouldDelaySpecialWeightCudaMove(const std::string &) const {
         // Splitting directly from host storage avoids loading all experts on rank 0.
         return threadTpState != nullptr;
+    }
+
+    bool Qwen4ExpModel::RetainCudaWorkspace() const {
+        return threadTpState != nullptr && threadTpState->hostMoe;
     }
 
     void Qwen4ExpModel::PrepareThreadTp() {
@@ -1500,6 +1543,15 @@ namespace fastllm {
         auto &devices = tp.devices;
         const int count = devices.size();
         PrepareWeights();
+        tp.workerCpus.resize(count);
+#ifdef USE_NUMAS
+        const bool numaExperts = tp.hostMoe &&
+            std::all_of(moeDeviceMap.begin(), moeDeviceMap.end(), [](const auto &item) {
+                return item.second <= 0 || item.first == "numa" ||
+                    item.first.rfind("numa:", 0) == 0;
+            });
+        if (numaExperts) tp.workerCpus = GetNumasCudaWorkerCpuSets(devices);
+#endif
         tp.votes.resize(count);
         AssertInFastLLM(FastllmInitNccl(devices), "Qwen4 TP NCCL initialization failed.");
         for (int device : devices) {
@@ -1524,7 +1576,7 @@ namespace fastllm {
             model->num_attention_heads = num_attention_heads / count;
             model->num_key_value_heads = std::max(1, num_key_value_heads / count);
             model->deviceMap = {{"cuda:" + std::to_string(devices[rank]), 1}};
-            model->moeDeviceMap = model->deviceMap;
+            model->moeDeviceMap = tp.hostMoe ? moeDeviceMap : model->deviceMap;
             model->ngramDevice = ngramDevice;
             model->pleNgramDiskWeight = pleNgramDiskWeight;
             model->pleNgramDiskWeight.isFake = true;
@@ -1533,6 +1585,13 @@ namespace fastllm {
             model->weights.assign(block_cnt, std::vector<Data *>(2 + 2 * num_experts, nullptr));
             model->biass = model->weights;
             for (int layer = 0; layer < block_cnt; ++layer) {
+                if (tp.hostMoe) {
+                    // The parent outlives its ranks and owns NUMA registration.
+                    // Only rank zero executes these shared, unsplit experts.
+                    model->weights[layer] = weights[layer];
+                    model->biass[layer] = biass[layer];
+                    continue;
+                }
                 for (int expert = 0; expert < num_experts; ++expert) {
                     const std::string prefix = languagePrefix + "layers." + std::to_string(layer) +
                         ".mlp.experts." + std::to_string(expert) + ".";
@@ -1544,7 +1603,11 @@ namespace fastllm {
                 model->mtpWeightsStatus.store(mtpWeightsStatus.load());
                 model->mtpMoeWeights.assign(2 + 2 * num_experts, nullptr);
                 model->mtpMoeBiass = model->mtpMoeWeights;
-                for (int expert = 0; expert < num_experts; ++expert) {
+                if (tp.hostMoe) {
+                    model->mtpMoeWeights = mtpMoeWeights;
+                    model->mtpMoeBiass = mtpMoeBiass;
+                }
+                for (int expert = 0; !tp.hostMoe && expert < num_experts; ++expert) {
                     const std::string prefix = kMtpExpertPrefix + std::to_string(expert) + ".";
                     model->mtpMoeWeights[2 + 2 * expert] = &model->weight[prefix + "gateup_proj.weight"];
                     model->mtpMoeWeights[3 + 2 * expert] = &model->weight[prefix + "down_proj.weight"];
@@ -1580,6 +1643,10 @@ namespace fastllm {
             if (name.find(languagePrefix) != 0 && name != "lm_head.weight" &&
                 name.find("mtp.") != 0) continue;
             if (source.dims.empty()) continue;
+            if (tp.hostMoe && name.find(".mlp.experts.") != std::string::npos) {
+                // Keep the original host layout and NUMA weight registrations.
+                continue;
+            }
             // The PLE lookup table remains shared and read-only on the host.
             if (name.find(".ple.ple_embedding.ngram_embedding.") != std::string::npos) {
                 for (auto &model : tp.ranks) {
@@ -1732,15 +1799,13 @@ namespace fastllm {
                         data.Count(0) <= std::numeric_limits<int>::max(),
                         "Qwen4 TP reduction has invalid storage.");
         const int device = threadTpOwner->devices[threadTpRank];
-        // Eager NCCL submissions from several CPU threads need the same issue
-        // order. Capture records GPU collectives and must not synchronize streams.
-        const bool capture = FastllmCudaGraphIsCapturingFast();
-        if (!capture) threadTpOwner->Barrier();
+        // The NCCL wrapper owns both host submission boundaries and bypasses
+        // them during capture. Repeating those waits here adds another rank
+        // wakeup without extending the protected submission interval.
         // Use the same reduction tree for eager and captured execution; custom
         // all-reduce registration depends on temporary-pointer reuse across requests.
         FastllmNcclAllReduceNoCustom(data.cudaData, data.cudaData,
                                    data.Count(0), data.dataType, device);
-        if (!capture) threadTpOwner->Barrier();
 #endif
     }
 
@@ -1887,10 +1952,11 @@ namespace fastllm {
         auto &entry = tp.caches[key];
         bool resetRequest = false;
         if (!entry) {
-            // Only fresh, graph-enabled TP requests own reusable rank-zero
-            // storage. Prefix/external caches keep their original ownership.
+            // Fresh TP requests can reuse storage without reusing contents.
+            // Host experts cannot enter a whole CUDA graph, but their KV and
+            // pinned QSA buffers have the same reusable lifetime.
             const bool reusable = Qwen4MtpDraftsPerStep() == 0 &&
-                batch == 1 && GetFastllmEnv().cudaGraph &&
+                batch == 1 && (GetFastllmEnv().cudaGraph || tp.hostMoe) &&
                 Qwen4TpDecodeFitsCapacityClass(generationConfig, indexerBudget) &&
                 std::all_of(pastKeyValues.begin(), pastKeyValues.end(),
                     [](const std::pair<Data, Data> &kv) {
@@ -1948,12 +2014,27 @@ namespace fastllm {
         std::vector<std::exception_ptr> errors(tp.devices.size());
         std::vector<int> result;
         tp.workers.Run(tp.devices, [&](int r) {
+#ifdef USE_NUMAS
+            // These threads belong to this TP group for their whole lifetime.
+            // Place CUDA submission near the GPU without occupying CPU expert
+            // cores; keep a CPU set so prefill helpers can still run in parallel.
+            static thread_local bool placementReady = false;
+            if (!placementReady) {
+                BindNumasWorkerCpuSet(tp.workerCpus[r]);
+                placementReady = true;
+            }
+#endif
             FastllmCudaSetDevice(tp.devices[r]);
             static thread_local Executor executor;
             struct Restore {
-                void *old; bool oldTp;
-                ~Restore() { SetCurrentThreadExecutor(old); qwen4ThreadTpExecution = oldTp; }
-            } restore{GetExecutor(), qwen4ThreadTpExecution};
+                void *old; bool oldTp; bool oldCaptureMode;
+                ~Restore() {
+                    SetCurrentThreadExecutor(old);
+                    qwen4ThreadTpExecution = oldTp;
+                    FastllmCudaGraphSetManagedCaptureOnly(oldCaptureMode);
+                }
+            } restore{GetExecutor(), qwen4ThreadTpExecution,
+                      FastllmCudaGraphSetManagedCaptureOnly(true)};
             qwen4ThreadTpExecution = true;
             SetCurrentThreadExecutor(&executor);
             executor.SetFirstDevice("cuda:" + std::to_string(tp.devices[r]));
@@ -2053,7 +2134,7 @@ namespace fastllm {
         // would otherwise pin its large KV and graph allocations unnecessarily.
         bool reusable = tp.caches.size() == 1 &&
             cache->ownsRankZero && !cache->failed;
-        for (size_t r = 0; reusable && r < tp.ranks.size(); ++r) {
+        for (size_t r = 0; reusable && !tp.hostMoe && r < tp.ranks.size(); ++r) {
             const auto &graphs = tp.ranks[r]->decodeCudaGraphStates;
             auto graph = graphs.find(&cache->ranks[r].front().first);
             reusable = graph != graphs.end() && graph->second &&
@@ -2154,9 +2235,11 @@ namespace fastllm {
             this->decodeCudaGraphStates.clear();
             this->requestStates.clear();
         }
-        ReleaseMoeCudaCache(this->weights);
+        if (threadTpRank < 0 || !threadTpOwner->hostMoe) {
+            ReleaseMoeCudaCache(this->weights);
+        }
 #ifdef USE_CUDA
-        if (threadTpRank >= 0) {
+        if (threadTpRank >= 0 && !threadTpOwner->hostMoe) {
             FastllmCudaSetDevice(threadTpOwner->devices[threadTpRank]);
             for (auto &layer : this->weights) {
                 if (layer.size() > 2 && layer[2] != nullptr)
@@ -5983,18 +6066,19 @@ namespace fastllm {
         ThreadTpAllReduce(output);
     }
 
-    void Qwen4ExpModel::RunMoE(int layer, const Data &input, Data &output) {
+    void Qwen4ExpModel::RunMoE(int layer, const Data &input, Data &output,
+                               bool reduceOutput) {
         RunMoEWithPrefix(
             layer,
             languagePrefix + "layers." + std::to_string(layer) + ".mlp.",
-            this->weights[layer], this->biass[layer], input, output);
+            this->weights[layer], this->biass[layer], input, output, reduceOutput);
     }
 
     void Qwen4ExpModel::RunMoEWithPrefix(
             int deviceLayer, const std::string &mlp,
             std::vector<Data *> &moeWeights,
             std::vector<Data *> &moeBiass,
-            const Data &input, Data &output) {
+            const Data &input, Data &output, bool reduceOutput) {
         const int batch = input.dims[0];
         const int sequence = input.dims[1];
         Data flattened;
@@ -6002,13 +6086,17 @@ namespace fastllm {
         flattened.Resize(input.dims);
         flattened.Reshape({batch * sequence, input.dims.back()});
 
+        const bool hostMoe = threadTpRank >= 0 && threadTpOwner->hostMoe;
+        const bool runRoutedExperts = !hostMoe || threadTpRank == 0;
         Data routerLogits, expertIndex, expertScore, sharedOutput;
-        Linear(flattened, this->weight[mlp + "gate.weight"],
-               Data(), routerLogits);
+        if (runRoutedExperts) {
+            Linear(flattened, this->weight[mlp + "gate.weight"],
+                   Data(), routerLogits);
+        }
         // Expert selection is defined in float32 (and the generic
         // SelectExpert contract requires it). Keep only the narrow router
         // tensor in float32 while larger activations retain their dtype.
-        ToDataType(routerLogits, DataType::FLOAT32);
+        if (runRoutedExperts) ToDataType(routerLogits, DataType::FLOAT32);
         auto selectExperts = [&]() {
             bool fusedRouterSelection = false;
 #ifdef USE_CUDA
@@ -6035,7 +6123,7 @@ namespace fastllm {
         bool selectedBeforeShared = false;
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
         const std::string moeDevice = SelectMoeDeviceForLayer(deviceLayer);
-        if (threadTpRank < 0 && batch * sequence <= kNumasMoePrefetchMaxRows &&
+        if (runRoutedExperts && batch * sequence <= kNumasMoePrefetchMaxRows &&
             flattened.dataDevice == DataDevice::CUDA &&
             (moeDevice == "numa" || moeDevice.rfind("numa:", 0) == 0) &&
             !FastllmCudaMoeCacheRequested() &&
@@ -6086,21 +6174,22 @@ namespace fastllm {
                    Data(), sharedGate);
             SigmoidMulTo(sharedResult, sharedGate);
         };
-        runSharedExpert(flattened, sharedOutput);
+        runSharedExpert(flattened, runRoutedExperts ? sharedOutput : output);
 
 #ifdef USE_CUDA
         FastllmCudaGraphMarkParallelFirstDone(deviceLayer);
         FastllmCudaGraphMarkParallelSecondBegin(deviceLayer);
-        if (threadTpRank >= 0 && moeWeights.size() >= 4 &&
+        if (!runRoutedExperts || (threadTpRank >= 0 && moeWeights.size() >= 4 &&
             moeWeights[2] != nullptr && moeWeights[3] != nullptr &&
             moeWeights[2]->dims == std::vector<int>({0, input.dims.back()}) &&
-            moeWeights[3]->dims == std::vector<int>({input.dims.back(), 0})) {
-            // An empty routed slice contributes zero, but its shared expert
-            // slice and the final TP collective are still required.
+            moeWeights[3]->dims == std::vector<int>({input.dims.back(), 0}))) {
+            // Host experts contribute once on rank zero; other ranks retain
+            // their shared-expert slice and join the same final reduction.
+            // Empty CUDA routed slices use the same additive identity.
             FastllmCudaGraphMarkParallelJoin(deviceLayer);
-            output.CopyFrom(sharedOutput);
+            if (runRoutedExperts) output.CopyFrom(sharedOutput);
             output.Reshape(input.dims);
-            ThreadTpAllReduce(output);
+            if (reduceOutput) ThreadTpAllReduce(output);
             return;
         }
 #endif
@@ -6120,9 +6209,10 @@ namespace fastllm {
         const bool useMoeCudaCache = hybridMoe || TryApplyMoeCudaCache(
             flattened, expertIndex, expertScore, moeWeights,
             outputDevice, MoeGateSwiglu);
-        const std::string routedDevice = useMoeCudaCache
-            ? outputDevice : this->SelectMoeDeviceForLayer(deviceLayer);
-        const bool writeRoutedDirectly = routedDevice == outputDevice;
+        // Host TP ranks own the result before reduction. Preserve the existing
+        // output transfer and ownership for serial layer transitions.
+        const bool writeRoutedDirectly = hostMoe || useMoeCudaCache ||
+            this->SelectMoeDeviceForLayer(deviceLayer) == outputDevice;
         if (!useMoeCudaCache) {
             this->ApplyMoeDeviceMapForLayer(deviceLayer);
         }
@@ -6154,7 +6244,7 @@ namespace fastllm {
         }
         Qwen4CastLike(sharedOutput, output);
         AddTo(output, sharedOutput);
-        ThreadTpAllReduce(output);
+        if (reduceOutput) ThreadTpAllReduce(output);
     }
 
     bool Qwen4ExpModel::MtpSupportsGenerationConfig(
@@ -8081,19 +8171,25 @@ namespace fastllm {
             (hiddenStates.dims[1] == 1 || mtpTargetGraph) &&
             !this->weights.empty() && !this->weights[0].empty() &&
             MoeCudaCacheAvailable(this->weights[0]);
+        const bool hybridDenseGraph = threadTpRank >= 0 &&
+            threadTpOwner != nullptr && threadTpOwner->hostMoe &&
+            hiddenStates.dims.size() == 3 && hiddenStates.dims[1] == 1 &&
+            verificationCapture == nullptr && Qwen4MtpDraftsPerStep() == 0;
         const bool moeDeviceMapGraphCompatible =
             (Qwen4CudaOnlyDeviceMap(this->moeDeviceMap) &&
              Qwen4CudaOnlyDeviceMap(this->layeredMoeDeviceMap)) ||
             (moeCudaCache &&
              Qwen4CudaOrNumaOnlyDeviceMap(this->moeDeviceMap) &&
-             Qwen4CudaOrNumaOnlyDeviceMap(this->layeredMoeDeviceMap));
+             Qwen4CudaOrNumaOnlyDeviceMap(this->layeredMoeDeviceMap)) ||
+            hybridDenseGraph;
         // Host decisions and NUMA execution cannot be captured in the full
         // backbone graph. MTP and prefill retain their existing paths.
         const bool hybridMoe = Qwen4MtpDraftsPerStep() == 0 &&
             !this->weights.empty() && !this->weights[0].empty() &&
             FastllmCudaUseMoeHybrid(this->weights[0].data(), this->weights[0].size());
         if (!GetFastllmEnv().cudaGraph ||
-            hybridMoe ||
+            (hybridMoe && !hybridDenseGraph) ||
+            (hybridDenseGraph && !startBeforeAttention) ||
             !supportedStart ||
             hiddenStates.dims.size() != 3 || hiddenStates.dims[0] != 1 ||
             (hiddenStates.dims[1] != 1 && !mtpTargetGraph) ||
@@ -8395,11 +8491,18 @@ namespace fastllm {
             wholeGraphReady = false;
         }
 
+        // Hybrid graphs must use dynamic full-attention metadata; the old
+        // segmented body includes MoE and cannot capture host experts.
+        if (hybridDenseGraph && !ThreadTpAllTrue(wholeGraphReady)) {
+            return false;
+        }
+
         const bool workspaceShapeChanged =
             graphState->hiddenStates[0].cudaData != nullptr &&
             (graphState->hiddenStates[0].dataType != hiddenStates.dataType ||
              graphState->hiddenStates[0].dims != hiddenStates.dims);
         const bool resetGraph = graphState->device != device || workspaceShapeChanged ||
+            graphState->hybridDenseMode != hybridDenseGraph ||
             graphState->graphStartLayer != graphStartLayer ||
             graphState->startBeforeAttention != startBeforeAttention ||
             (!graphState->linearCachePointers.empty() &&
@@ -8419,6 +8522,7 @@ namespace fastllm {
         graphState->startBeforeAttention = startBeforeAttention;
         graphState->linearCachePointers = linearCachePointers;
         graphState->wholeGraphMode = wholeGraphReady;
+        graphState->hybridDenseMode = hybridDenseGraph;
         graphState->fullCacheSignature = fullCacheSignature;
         if (!Qwen4PrepareDecodeGraphTensor(
                 graphState->hiddenStates[0], hiddenStates, device) ||
@@ -9099,28 +9203,18 @@ namespace fastllm {
         };
 
         bool captureAttempted = false;
-        auto runSegment = [&](int startLayer, int nextFullLayer,
-                              bool wholeGraph, int wholeGraphVariant) {
-            const int segmentKey = wholeGraph
-                ? -1 - wholeGraphVariant : startLayer;
-            auto runBody = [&]() {
-                if (wholeGraph) {
-                    runWholeGraphBody();
-                } else {
-                    runSegmentBody(
-                        startLayer, nextFullLayer,
-                        startLayer != graphStartLayer ||
-                            !startBeforeAttention);
-                }
-            };
+        auto runCapturedSegment = [&](int segmentKey, const auto &runBody) {
             DecodeCudaGraphState::Segment &segment =
                 graphState->segments[segmentKey];
             FastllmCudaSetDevice(device);
 
             if (segment.captured) {
-                if (FastllmCudaGraphLaunch(segment.exec)) {
-                    return;
+                const bool launched = FastllmCudaGraphLaunch(segment.exec);
+                if (threadTpRank >= 0) {
+                    AssertInFastLLM(ThreadTpAllTrue(launched),
+                        "Qwen4 TP decode CUDA graph replay failed.");
                 }
+                if (launched) return;
                 std::fprintf(
                     stderr,
                     "[Fastllm] Qwen4 decode CUDA graph replay failed "
@@ -9288,7 +9382,12 @@ namespace fastllm {
             segment.exec = capturedExec;
             segment.captured = true;
             segment.captureFailures = 0;
-            if (!FastllmCudaGraphLaunch(segment.exec)) {
+            const bool launched = FastllmCudaGraphLaunch(segment.exec);
+            if (threadTpRank >= 0) {
+                AssertInFastLLM(ThreadTpAllTrue(launched),
+                    "Qwen4 TP decode CUDA graph first launch failed.");
+            }
+            if (!launched) {
                 std::fprintf(
                     stderr,
                     "[Fastllm] Qwen4 decode CUDA graph first launch "
@@ -9304,6 +9403,86 @@ namespace fastllm {
             }
         };
 
+        auto runSegment = [&](int startLayer, int nextFullLayer,
+                              bool wholeGraph, int wholeGraphVariant) {
+            const int segmentKey = wholeGraph
+                ? -1 - wholeGraphVariant : startLayer;
+            runCapturedSegment(segmentKey, [&]() {
+                if (wholeGraph) {
+                    runWholeGraphBody();
+                } else {
+                    runSegmentBody(startLayer, nextFullLayer,
+                        startLayer != graphStartLayer || !startBeforeAttention);
+                }
+            });
+        };
+
+        auto runHybridDenseBody = [&](int layer) {
+            ApplyDeviceMap(this->deviceMap, layer + 1, this->block_cnt);
+            const std::string attentionHyperPrefix = languagePrefix +
+                "layers." + std::to_string(layer) + ".attn_hyper_connection.";
+            Data attentionNorm;
+            if (layer == graphStartLayer) {
+                GroupedRMSNorm(graphState->hiddenStates[0],
+                    this->weight[attentionHyperPrefix + "hc_norm.weight"],
+                    attentionNorm);
+            } else {
+                // Complete the preceding host MoE in the same submission as
+                // its dense consumers, after the stable boundary copy.
+                ThreadTpAllReduce(graphState->hybridBoundaries[layer - 1].output);
+                HyperCombineRMSNorm(graphState->hiddenStates[1],
+                    graphState->hybridBoundaries[layer - 1].output,
+                    graphState->hybridBoundaries[layer - 1].injection,
+                    this->weight[attentionHyperPrefix + "hc_norm.weight"],
+                    graphState->hiddenStates[0], attentionNorm);
+            }
+            Data input, injection, output;
+            HyperMixNormalized(attentionNorm, attentionHyperPrefix,
+                input, &injection);
+            attentionNorm.FreeSpace();
+            if (this->IsLinearAttentionLayer(layer)) {
+                RunLinearAttention(layer, input,
+                    pastKeyValues[layer].first, pastKeyValues[layer].second,
+                    output);
+            } else if (wholeDenseGraph) {
+                // Padding the dense KV length changes GEMM reduction shapes.
+                // Preserve the ordinary path until QSA selects a fixed width;
+                // linear-attention segments remain independently capturable.
+                RunFullAttention(layer, input, attentionMask,
+                    graphState->positionIds, qsaDeviceCompatibleMask,
+                    pastKeyValues[layer].first, pastKeyValues[layer].second,
+                    requestState, output);
+            } else if (!runFullAttentionGraph(layer, input,
+                    pastKeyValues[layer].first, pastKeyValues[layer].second,
+                    output)) {
+                FastllmCudaSetThreadError();
+                return;
+            }
+            const std::string mlpHyperPrefix = languagePrefix +
+                "layers." + std::to_string(layer) + ".mlp_hyper_connection.";
+            Data mlpNorm;
+            HyperCombineRMSNorm(graphState->hiddenStates[0], output,
+                injection, this->weight[mlpHyperPrefix + "hc_norm.weight"],
+                graphState->hiddenStates[1], mlpNorm);
+            HyperMixNormalized(mlpNorm, mlpHyperPrefix,
+                graphState->hybridBoundaries[layer].input,
+                &graphState->hybridBoundaries[layer].injection);
+        };
+        auto runHybridFinalBody = [&]() {
+            ThreadTpAllReduce(graphState->hybridBoundaries[this->block_cnt - 1].output);
+            const std::string prefix = languagePrefix + "hyper_connection_mixer.";
+            Data normalized, finalHidden;
+            HyperCombineRMSNorm(graphState->hiddenStates[1],
+                graphState->hybridBoundaries[this->block_cnt - 1].output,
+                graphState->hybridBoundaries[this->block_cnt - 1].injection,
+                this->weight[prefix + "hc_norm.weight"],
+                graphState->hiddenStates[0], normalized);
+            HyperMixNormalized(normalized, prefix, finalHidden, nullptr);
+            Linear(finalHidden, this->weight["lm_head.weight"], Data(),
+                graphState->logits);
+            ToDataType(graphState->logits, DataType::FLOAT32);
+        };
+
         if (wholeGraphReady) {
             if (mtpTargetGraph) {
                 for (int layer = fullAttentionCacheStartLayer;
@@ -9314,11 +9493,35 @@ namespace fastllm {
                     }
                 }
             }
-            runSegment(
-                graphStartLayer, this->block_cnt, true,
-                wholeDenseGraph ? this->indexerCompressRatio + wholeGraphSparseWidth :
-                mtpTargetGraph ? this->indexerCompressRatio
-                               : wholeGraphRemainder);
+            if (hybridDenseGraph) {
+                for (int layer = graphStartLayer; layer < this->block_cnt; ++layer) {
+                    const bool linearAttention = this->IsLinearAttentionLayer(layer);
+                    if (wholeDenseGraph && !linearAttention) {
+                        runHybridDenseBody(layer);
+                    } else {
+                        const int variant = linearAttention ? 0 : wholeGraphRemainder;
+                        const int key = layer + (this->block_cnt + 1) * variant;
+                        runCapturedSegment(key, [&]() { runHybridDenseBody(layer); });
+                    }
+                    Data moeOutput;
+                    auto &boundary = graphState->hybridBoundaries[layer];
+                    RunMoE(layer, boundary.input, moeOutput, false);
+                    // Expert backends own their result and may return a new
+                    // allocation. Copy into the next graph's stable input.
+                    const void *previous = boundary.output.cudaData;
+                    AssertInFastLLM(Qwen4PrepareDecodeGraphTensor(
+                        boundary.output, moeOutput, device) &&
+                        (previous == nullptr || previous == boundary.output.cudaData),
+                        "Qwen4 hybrid MoE graph boundary changed storage.");
+                }
+                runCapturedSegment(this->block_cnt, runHybridFinalBody);
+            } else {
+                runSegment(
+                    graphStartLayer, this->block_cnt, true,
+                    wholeDenseGraph ? this->indexerCompressRatio + wholeGraphSparseWidth :
+                    mtpTargetGraph ? this->indexerCompressRatio
+                                   : wholeGraphRemainder);
+            }
 
             const int keyLength =
                 decodePreviousLength + graphSequence;
@@ -9334,7 +9537,8 @@ namespace fastllm {
                 this->indexerCompressRatio;
             for (int layer = fullAttentionCacheStartLayer;
                  layer < this->block_cnt; layer++) {
-                if (this->IsLinearAttentionLayer(layer)) {
+                if (this->IsLinearAttentionLayer(layer) ||
+                    (hybridDenseGraph && wholeDenseGraph)) {
                     continue;
                 }
                 Data &pastKey = pastKeyValues[layer].first;

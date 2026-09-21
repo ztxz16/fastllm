@@ -9,6 +9,12 @@
 #include "devices/cpu/cpudevice.h"
 
 namespace fastllm {
+    // Plan local CPU sets for CUDA submission, excluding expert-worker cores
+    // and respecting the caller's affinity. Empty sets preserve OS placement.
+    std::vector<std::vector<int>> GetNumasCudaWorkerCpuSets(
+        const std::vector<int> &devices);
+    bool BindNumasWorkerCpuSet(const std::vector<int> &cpus);
+
     class NumasDevice : BaseDevice {
     public:
         NumasDevice();

@@ -242,6 +242,8 @@ bool FastllmCudaGetGraphError();
 int FastllmCudaTryMallocBigBuffers(size_t size, int count);
 void FastllmCudaMallocBigBuffer(size_t size);
 void FastllmCudaClearBigBuffer();
+// Bounded workspace reuse for models that explicitly opt in between forwards.
+void FastllmCudaTrimBigBuffer();
 void FastllmCudaClearBigBufferCurrentDevice();
 void FastllmCudaClearBigBufferAll();
 #ifdef __CUDACC__
@@ -2194,6 +2196,8 @@ int GetPointerDeviceId(void *ptr);
 bool FastllmCudaValidatePointerRange(const void *ptr, size_t bytes,
                                      int expectedDevice);
 int FastllmCudaGetDeviceCount();
+// Host NUMA node nearest this GPU, or -1 when PCI locality is unavailable.
+int FastllmCudaGetHostNumaNode(int device);
 #ifdef  __cplusplus
 }
 #endif

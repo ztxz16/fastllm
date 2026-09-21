@@ -945,6 +945,14 @@ if (UNIT_TEST)
         add_test(NAME cuda_qwen4_shared_expert COMMAND cuda_qwen4_shared_expert_test)
         set_tests_properties(cuda_qwen4_shared_expert PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
 
+        if (USE_NUMAS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            add_executable(numas_cuda_affinity_test test/basic/test_numas_cuda_affinity.cpp)
+            target_link_libraries(numas_cuda_affinity_test PRIVATE fastllm)
+            add_test(NAME numas_cuda_affinity COMMAND numas_cuda_affinity_test)
+            set_tests_properties(numas_cuda_affinity PROPERTIES LABELS cuda
+                ENVIRONMENT "FT_NUMAS=2;FT_THREADS=6" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 60)
+        endif()
+
         add_executable(cuda_bf16_bias_multigpu_test test/basic/test_cuda_bf16_bias_multigpu.cpp)
         target_link_libraries(cuda_bf16_bias_multigpu_test PRIVATE fastllm)
         target_include_directories(cuda_bf16_bias_multigpu_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
