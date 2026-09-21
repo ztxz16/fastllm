@@ -5573,7 +5573,8 @@ ops += (long long)lines * inputDim * interDim * 2;
         AssertInFastLLM(weight.dims.size() == 2, "Embedding's weight's dim should be 2.\n");
         AssertInFastLLM(weight.dataType == DataType::FLOAT32 ||
                         weight.dataType == DataType::FLOAT16 ||
-                        weight.dataType == DataType::BFLOAT16, "Embedding's weight's type should be float32 or float16 or bfloat16.\n");
+                        weight.dataType == DataType::BFLOAT16 ||
+                        weight.dataType == DataType::DATA_GGUF_FORMAT, "Embedding's weight's type should be float32 or float16 or bfloat16 or GGUF quantized.\n");
         AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
                         input.dataType == DataType::FLOAT16, 
                         "Embedding's input's type should be float32 or float16.\n");
@@ -5683,6 +5684,8 @@ ops += (long long)lines * inputDim * interDim * 2;
         };
 
         if (GetLowMemMode() && !weight.fileName.empty()) {
+            AssertInFastLLM(weight.dataType != DataType::DATA_GGUF_FORMAT,
+                            "Embedding error: GGUF quantized weight doesn't support low memory mode.\n");
             FILE *fi = fopen(weight.fileName.c_str(), "rb");
             if (fi == nullptr) {
                 ErrorInFastLLM("Embedding error: failed to open low-memory weight file " + weight.fileName + ".\n");
@@ -5713,6 +5716,19 @@ ops += (long long)lines * inputDim * interDim * 2;
                 }
             }
             fclose(fi);
+        } else if (weight.dataType == DataType::DATA_GGUF_FORMAT) {
+            // GGUF 量化权重只反量化被选中的行
+            auto toFloat = ggml_type_to_float((ggml_type) weight.ggmlType);
+            AssertInFastLLM(toFloat != nullptr,
+                            "Embedding error: GGUF type " + std::string(ggml_type_name((ggml_type) weight.ggmlType)) + " has no fp32 dequant func.\n");
+            size_t rowBytes = ggml_row_size((ggml_type) weight.ggmlType, embSize);
+            uint8_t *quantWeightData = (uint8_t *) weight.cpuData;
+            std::vector <float> quantRow(embSize);
+            for (int i = 0; i < inputLen; i++) {
+                int token = getToken(i);
+                toFloat(quantWeightData + (uint64_t)token * rowBytes, quantRow.data(), embSize);
+                writeFloatOutputRow(i, quantRow.data());
+            }
         } else {
             if (weight.dataType == DataType::FLOAT32) {
                 float *weightData = (float *) weight.cpuData;
@@ -5739,7 +5755,8 @@ ops += (long long)lines * inputDim * interDim * 2;
         AssertInFastLLM(weight.dims.size() == 2, "EmbeddingDirect's weight's dim should be 2.\n");
         AssertInFastLLM(weight.dataType == DataType::FLOAT32 ||
                         weight.dataType == DataType::FLOAT16 ||
-                        weight.dataType == DataType::BFLOAT16, "EmbeddingDirect's weight's type should be float32 or float16 or bfloat16.\n");
+                        weight.dataType == DataType::BFLOAT16 ||
+                        weight.dataType == DataType::DATA_GGUF_FORMAT, "EmbeddingDirect's weight's type should be float32 or float16 or bfloat16 or GGUF quantized.\n");
         AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
                         input.dataType == DataType::FLOAT16, 
                         "EmbeddingDirect's input's type should be float32 or float16.\n");
@@ -5749,7 +5766,8 @@ ops += (long long)lines * inputDim * interDim * 2;
         std::vector <int> dims = input.dims;
         dims.push_back(embSize);
 
-        output.dataType = weight.dataType;
+        // GGUF 量化权重会被反量化，输出类型跟随 input
+        output.dataType = (weight.dataType == DataType::DATA_GGUF_FORMAT) ? input.dataType : weight.dataType;
         output.Resize(dims);
     }
 
@@ -5780,6 +5798,8 @@ ops += (long long)lines * inputDim * interDim * 2;
 
         int unitSize = weight.unitSize;
         if (GetLowMemMode()) {
+            AssertInFastLLM(weight.dataType != DataType::DATA_GGUF_FORMAT,
+                            "EmbeddingDirect error: GGUF quantized weight doesn't support low memory mode.\n");
             FILE *fi = fopen(weight.fileName.c_str(), "rb");
             uint8_t *outputData = (uint8_t *) output.cpuData;
             for (int i = 0; i < inputLen; i++) {
@@ -5792,6 +5812,28 @@ ops += (long long)lines * inputDim * interDim * 2;
                 int ret = fread(outputData + (uint64_t)i * embSize * unitSize, unitSize, embSize, fi);
             }
             fclose(fi);
+        } else if (weight.dataType == DataType::DATA_GGUF_FORMAT) {
+            // GGUF 量化权重只反量化被选中的行，再按 input 类型写出
+            auto toFloat = ggml_type_to_float((ggml_type) weight.ggmlType);
+            AssertInFastLLM(toFloat != nullptr,
+                            "EmbeddingDirect error: GGUF type " + std::string(ggml_type_name((ggml_type) weight.ggmlType)) + " has no fp32 dequant func.\n");
+            size_t rowBytes = ggml_row_size((ggml_type) weight.ggmlType, embSize);
+            uint8_t *quantWeightData = (uint8_t *) weight.cpuData;
+            std::vector <float> quantRow(embSize);
+            for (int i = 0; i < inputLen; i++) {
+                int token = (int) (inputData[i] + 1e-9);
+                toFloat(quantWeightData + (uint64_t)token * rowBytes, quantRow.data(), embSize);
+                uint64_t offset = (uint64_t)i * embSize;
+                if (output.dataType == DataType::FLOAT32) {
+                    memcpy((float *)output.cpuData + offset, quantRow.data(), (uint64_t)embSize * sizeof(float));
+                } else if (output.dataType == DataType::FLOAT16) {
+                    Float32ToFloat16(quantRow.data(), (uint16_t *)output.cpuData + offset, embSize);
+                } else if (output.dataType == DataType::BFLOAT16) {
+                    Float32ToBFloat16(quantRow.data(), (uint16_t *)output.cpuData + offset, embSize);
+                } else {
+                    ErrorInFastLLM("EmbeddingDirect error: unsupport output dataType.\n");
+                }
+            }
         } else {
             uint8_t *outputData = (uint8_t *) output.cpuData;
             uint8_t *weightData = (uint8_t *) weight.cpuData;

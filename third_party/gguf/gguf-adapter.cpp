@@ -146,7 +146,8 @@ namespace fastllm {
                     GGUFWeightReplaceRule (
                         std::regex(R"(^token_embd\.weight$)"),
                         "model.language_model.embed_tokens.weight",
-                        GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32
+                        // 保留 GGUF 量化字节，由 Embedding 算子按行反量化，避免整表展开为 FP32
+                        GGUFWeightReplaceRule::GGUFWeightReplaceDirect
                     ),
                     GGUFWeightReplaceRule (
                         std::regex(R"(^output\.weight$)"),
