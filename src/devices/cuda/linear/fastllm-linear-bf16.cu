@@ -652,8 +652,14 @@ void LaunchFastllmGemmBf16Bf16(__nv_bfloat16 *input, __nv_bfloat16 *weight, __nv
 }
 
 bool FastllmCudaMatMulBFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
-    FastllmCudaBF16EnsureBiasOnDevice(weight, bias, k);
-    float *cudaBiasData = (float *)weight.extraCudaData[0];
+    // CPU MoE experts can be uploaded to a different GPU on the next request.
+    // A cached zero bias belongs to the previous GPU; the bias-free kernel
+    // needs no allocation and must not dereference that device's pointer.
+    float *cudaBiasData = nullptr;
+    if (!bias.dims.empty()) {
+        FastllmCudaBF16EnsureBiasOnDevice(weight, bias, k);
+        cudaBiasData = (float *)weight.extraCudaData[0];
+    }
     float *cudaInput = (float *)FastllmCudaPrepareInput(input);
     float *cudaOutput = (float *)FastllmCudaPrepareOutput(output);
 

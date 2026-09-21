@@ -927,6 +927,13 @@ if (UNIT_TEST)
         add_test(NAME cuda_qwen4_attention_fusion COMMAND cuda_qwen4_attention_fusion_test)
         set_tests_properties(cuda_qwen4_attention_fusion PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
 
+        add_executable(cuda_bf16_bias_multigpu_test test/basic/test_cuda_bf16_bias_multigpu.cpp)
+        target_link_libraries(cuda_bf16_bias_multigpu_test PRIVATE fastllm)
+        target_include_directories(cuda_bf16_bias_multigpu_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME cuda_bf16_bias_multigpu COMMAND cuda_bf16_bias_multigpu_test)
+        set_tests_properties(cuda_bf16_bias_multigpu PROPERTIES
+            LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 60)
+
         add_executable(cuda_single_prefill_dispatch_test test/basic/test_cuda_single_prefill_dispatch.cu)
         target_include_directories(cuda_single_prefill_dispatch_test PRIVATE third_party)
         set_target_properties(cuda_single_prefill_dispatch_test PROPERTIES
