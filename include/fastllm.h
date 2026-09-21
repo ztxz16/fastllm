@@ -348,6 +348,9 @@ namespace fastllm {
         // Internal NUMA layout: each 32-row tile stores packed block-16
         // weights, then FP32 scales, retaining gate/up row interleaving.
         NVFP4_BLOCK_16_PLANAR = 1011,
+        // Internal CPU row layout: one FP32 global multiplier followed by
+        // [8 packed E2M1 bytes, 1 raw E4M3 scale byte] per block of 16.
+        NVFP4_BLOCK_16_E4M3_PACKED = 1012,
         INF_INT8_PERCHANNEL = 2000, // 推理用的int8, per channel量化
         INF_INT8_GROUP128 = 2001, // 推理用的int8, per group量化，group = 128
         INF_INT8_GROUP32 = 2002, // 推理用的int8, per group量化，group = 32
@@ -414,7 +417,7 @@ namespace fastllm {
         const std::vector<float> &globalScales,
         int blockK, int blockM, uint8_t *destination,
         int destinationRowStart, int destinationRows,
-        bool crossSwiglu = false, bool planar = false);
+        bool crossSwiglu = false, bool planar = false, bool compactScales = false);
     void ConvertCompactE4M3NVFP4ToBlock16(
         Data &data, bool crossSwiglu = false);
 

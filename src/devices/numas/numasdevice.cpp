@@ -599,6 +599,7 @@ namespace fastllm {
                weight.dataType == DataType::NVFP4 ||
                weight.dataType == DataType::NVFP4_BLOCK_16 ||
                weight.dataType == DataType::NVFP4_BLOCK_16_PLANAR ||
+               weight.dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED ||
                weight.dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
                weight.dataType == DataType::NVFP4_BLOCK_16_E4M3 ||
                weight.dataType == DataType::NVFP4_BLOCK_32_E8M0;
@@ -2434,6 +2435,7 @@ namespace fastllm {
                     data->dataType == DataType::INT4_PERCHANNEL ||
                     data->dataType == DataType::INT4_GROUP128 ||
                     data->dataType == DataType::NVFP4_BLOCK_16 ||
+                    data->dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED ||
                     data->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
                     data->dataType == DataType::NVFP4_BLOCK_32_E8M0 ||
                     data->dataType == DataType::INT4_GROUP32) {
@@ -2485,9 +2487,7 @@ namespace fastllm {
                         sourceBlockK > 0 && sourceBlockM == 16 &&
                         scaleBytes != nullptr && !data->scales.empty(),
                         "RegisterNumas received invalid compact E4M3 NVFP4 metadata.\n");
-                    data->dataType = GetMoeCudaCacheBytes() > 0 &&
-                        kPerNuma % NVFP4_PLANAR_TILE_ROWS == 0
-                        ? DataType::NVFP4_BLOCK_16_PLANAR : DataType::NVFP4_BLOCK_16;
+                    data->dataType = DataType::NVFP4_BLOCK_16_E4M3_PACKED;
                     const size_t packedBytesPerRow =
                         GetDataBytes(data->dataType, 1, m);
                     for (int i = 0; i < numaConfig->numaCnt; i++) {
@@ -2497,7 +2497,7 @@ namespace fastllm {
                             k, m, data->cpuData, scaleBytes, data->scales,
                             sourceBlockK, sourceBlockM,
                             data->numasData[i], i * kPerNuma, kPerNuma,
-                            isCrossSwiglu, data->dataType == DataType::NVFP4_BLOCK_16_PLANAR);
+                            isCrossSwiglu, false, true);
                     }
                     data->blockK = 1;
                     data->blockM = 16;
@@ -3097,6 +3097,7 @@ namespace fastllm {
             (weight->dataType == DataType::NVFP4 ||
              weight->dataType == DataType::NVFP4_BLOCK_16 ||
              weight->dataType == DataType::NVFP4_BLOCK_16_PLANAR ||
+             weight->dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED ||
              weight->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
              weight->dataType == DataType::NVFP4_BLOCK_16_E4M3 ||
              weight->dataType == DataType::NVFP4_BLOCK_32_E8M0)) {
@@ -3260,6 +3261,7 @@ namespace fastllm {
             case DataType::FP8_E4M3_PERCHANNEL:
             case DataType::NVFP4_BLOCK_16:
             case DataType::NVFP4_BLOCK_16_PLANAR:
+            case DataType::NVFP4_BLOCK_16_E4M3_PACKED:
             case DataType::NVFP4_BLOCK_16_E8M0:
             case DataType::NVFP4_BLOCK_16_E4M3:
             case DataType::NVFP4_BLOCK_32_E8M0:
@@ -3890,8 +3892,7 @@ namespace fastllm {
                     DataType::NVFP4_BLOCK_16_E8M0;
             }
             if (weight.dataType == DataType::NVFP4_BLOCK_16_E4M3) {
-                // Only the allocation size is needed; planar tiles use the same bytes.
-                return DataType::NVFP4_BLOCK_16;
+                return DataType::NVFP4_BLOCK_16_E4M3_PACKED;
             }
             if (weight.dataType == DataType::INT8) {
                 return DataType::INT8_PERCHANNEL;

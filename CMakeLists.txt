@@ -950,6 +950,8 @@ if (UNIT_TEST)
             CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
         add_test(NAME cuda_moe_cache COMMAND cuda_moe_cache_test)
         set_tests_properties(cuda_moe_cache PROPERTIES LABELS cuda)
+        add_test(NAME cuda_moe_cache_compact COMMAND cuda_moe_cache_test --compact)
+        set_tests_properties(cuda_moe_cache_compact PROPERTIES LABELS cuda RUN_SERIAL TRUE)
 
         if (USE_NUMAS)
             add_executable(cuda_dsv41_moe_cache_test test/basic/test_cuda_dsv41_moe_cache.cu)
