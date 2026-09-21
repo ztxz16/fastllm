@@ -706,6 +706,16 @@ if (UNIT_TEST)
     target_link_libraries(nvfp4_planar_test PRIVATE fastllm)
     add_test(NAME nvfp4_planar COMMAND nvfp4_planar_test)
 
+    if (USE_NUMAS)
+        add_executable(numas_nvfp4_moe_test test/basic/test_numas_nvfp4_moe.cpp)
+        target_link_libraries(numas_nvfp4_moe_test PRIVATE fastllm)
+        add_test(NAME numas_nvfp4_moe COMMAND numas_nvfp4_moe_test)
+        add_test(NAME numas_nvfp4_moe_avx2 COMMAND numas_nvfp4_moe_test --avx2)
+        set_tests_properties(numas_nvfp4_moe numas_nvfp4_moe_avx2 PROPERTIES
+            ENVIRONMENT "FT_NUMAS=2;FT_THREADS=6;FT_GPU_PREFILL=0"
+            SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+    endif()
+
     add_executable(regressionOps test/ops/regressionOps.cpp)
     target_link_libraries(regressionOps fastllm)
     add_executable(deepseekV41BoundedReplayRegression test/ops/deepseekV41BoundedReplayRegression.cpp)
