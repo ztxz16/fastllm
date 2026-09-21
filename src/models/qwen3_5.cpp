@@ -16721,7 +16721,10 @@ namespace fastllm {
         bool mtpVerifyGraphEligible =
             Qwen35CudaGraphEnabled() &&
             Qwen35MtpVerifyCudaGraphEnabled() &&
-            !speculativeCaptureDFlashHiddenStates &&
+            (!speculativeCaptureDFlashHiddenStates ||
+             (batch == 1 && devices.size() == 1 &&
+              ResolveQwen35ThreadTpComputeType(this->dataType) == DataType::FLOAT16 &&
+              !Qwen35DFlashExactVerifyEnabled())) &&
             speculativeCollectAllLogits &&
             speculativeCaptureFirstTokenLinearState &&
             speculativeLinearStateCaptureSlots > 0 &&
@@ -16869,6 +16872,7 @@ namespace fastllm {
                             Qwen35BorrowCudaTensor(
                                 speculativeDFlashHiddenStates[feature],
                                 rootGraphDevice.dflashHiddenStates[feature]);
+                            speculativeDFlashHiddenStates[feature].isFake = false;
                         }
                     }
                 };
@@ -20262,7 +20266,7 @@ namespace fastllm {
         // fully overwrite each slot. Unsupported state layouts keep the local
         // allocation path below, including its original cleanup semantics.
         const int singleScratchDevice = FastllmCudaGetDevice();
-        bool reuseSingleScratch = !useDFlash && seqLen >= 2 &&
+        bool reuseSingleScratch = seqLen >= 2 &&
             seqLen <= QWEN35_MTP_FAST_SEQ_MAX;
         for (int i = 0; reuseSingleScratch && i < block_cnt; ++i) {
             if (isAttentionLayerAt(i)) continue;
@@ -20292,6 +20296,16 @@ namespace fastllm {
                 if (isAttentionLayerAt(i)) continue;
                 const auto &old = singleMtpValidationScratch[i];
                 const auto &now = pastKeyValues[i];
+                // A new prefill may leave recurrent state in KV order while
+                // the previous short verifier used VK. Normalize that owning
+                // state before deciding whether persistent scratch can be
+                // reused; the transpose changes only storage order.
+                if (useDFlash && Qwen35CudaGraphEnabled() && Qwen35MtpVerifyCudaGraphEnabled() &&
+                    old.second.dims == now.second->dims &&
+                    old.second.dataType == now.second->dataType &&
+                    old.second.isLinearAttentionTransposed && !now.second->isLinearAttentionTransposed) {
+                    Qwen35EnsureCudaLinearAttnStateTransposed(*now.second);
+                }
                 sameLayout = old.first.dims == now.first->dims &&
                     old.second.dims == now.second->dims &&
                     old.first.dataType == now.first->dataType &&
