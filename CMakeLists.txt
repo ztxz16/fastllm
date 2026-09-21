@@ -706,6 +706,11 @@ if (UNIT_TEST)
     target_link_libraries(nvfp4_planar_test PRIVATE fastllm)
     add_test(NAME nvfp4_planar COMMAND nvfp4_planar_test)
 
+    add_executable(reduce_batch_test test/basic/test_reduce_batch.cpp)
+    target_link_libraries(reduce_batch_test PRIVATE fastllm)
+    add_test(NAME reduce_batch COMMAND reduce_batch_test)
+    set_tests_properties(reduce_batch PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+
     if (USE_NUMAS)
         add_executable(numas_nvfp4_moe_test test/basic/test_numas_nvfp4_moe.cpp)
         target_link_libraries(numas_nvfp4_moe_test PRIVATE fastllm)

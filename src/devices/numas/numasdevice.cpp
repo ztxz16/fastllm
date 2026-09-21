@@ -6816,9 +6816,11 @@ namespace fastllm {
                 }
             }
 
-            // 有一些token不会被关联到任何专家，也需要先清零
+            // ReduceBatch initializes every output element, including rows
+            // without an active expert. A main-thread memset would pull the
+            // workers' output cache lines back to the controller before each
+            // reduction, adding cross-NUMA traffic on larger batches.
             float *lastOutput = output.dataType == DataType::FLOAT32 ? (float*)finalCpuOutput : reduceOutput.data();
-            memset(lastOutput, 0, bs * dim * sizeof(float));
 
             // 调用多线程函数
             MultiThreadReduceBatch(

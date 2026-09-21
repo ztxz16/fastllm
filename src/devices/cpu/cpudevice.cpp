@@ -2680,14 +2680,29 @@ namespace fastllm {
                     float *weights, float *lastOutput,
                     int *pos, int bsz, int k,
                     int hidden_size) {
+        if (bsz <= 0 || hidden_size <= 0) return;
         auto *pool = GetAlivePool();
-        int threadNum = pool->threads.size();
+        const int first = pool->curActivateThreadInterval.first;
+        const int available = pool->curActivateThreadInterval.second - first;
+        const uint64_t elements = (uint64_t)bsz * hidden_size;
+        const uint64_t work = elements * std::max(1, k);
+        constexpr uint64_t elementsPerWorker = 16 * 1024;
+        const int threadNum = (int)std::min<uint64_t>(
+            std::min<uint64_t>(std::max(1, available), elements),
+            std::max<uint64_t>(1, (work + elementsPerWorker - 1) / elementsPerWorker));
+        if (threadNum == 1) {
+            MultiThreadReduceBatchOp op(downOutData, downOutDataType,
+                weights, lastOutput, pos, bsz, k, hidden_size,
+                0, bsz, 0, hidden_size);
+            op.Run();
+            return;
+        }
         
         // 决定如何划分：尝试创建一个接近正方形的网格
         int batch_blocks = 1, hidden_blocks = threadNum;
         
         // 简单的启发式：如果bsz足够大，尝试在两个维度上划分
-        if (bsz >= 4 && threadNum >= 4) {
+        if (bsz > 1 && threadNum > 1) {
             // 找到最佳的2D网格划分
             for (int b = 2; b <= std::min(bsz, threadNum); b++) {
                 if (threadNum % b == 0) {
@@ -2700,36 +2715,41 @@ namespace fastllm {
             }
         }
         
-        std::vector<fastllm::MultiThreadReduceBatchOp*> ops;
+        thread_local std::vector<MultiThreadReduceBatchOp> ops;
+        ops.clear();
         ops.reserve(threadNum);
         
         int batch_per = bsz / batch_blocks;
         int hidden_per = hidden_size / hidden_blocks;
+        const int batch_extra = bsz % batch_blocks;
+        const int hidden_extra = hidden_size % hidden_blocks;
         
-        int op_idx = 0;
         for (int b = 0; b < batch_blocks; b++) {
-            int batch_st = b * batch_per;
-            int batch_end = (b == batch_blocks - 1) ? bsz : (b + 1) * batch_per;
+            // Spread the remainder across workers. Giving it all to the last
+            // worker makes, for example, 64 rows / 40 workers end in 25 rows.
+            int batch_st = b * batch_per + std::min(b, batch_extra);
+            int batch_end = batch_st + batch_per + (b < batch_extra);
             
             for (int h = 0; h < hidden_blocks; h++) {
-                int hidden_st = h * hidden_per;
-                int hidden_end = (h == hidden_blocks - 1) ? hidden_size : (h + 1) * hidden_per;
+                int hidden_st = h * hidden_per + std::min(h, hidden_extra);
+                int hidden_end = hidden_st + hidden_per + (h < hidden_extra);
                 
-                ops.push_back(new MultiThreadReduceBatchOp(
+                ops.emplace_back(
                     downOutData, downOutDataType,
                     weights, lastOutput,
                     pos, bsz, k,
                     hidden_size,
                     batch_st, batch_end,
-                    hidden_st, hidden_end));
-                
-                pool->PushOp(op_idx++, ops.back());
+                    hidden_st, hidden_end);
             }
         }
-        
+        // Publish only after vector growth is finished. Retain each token's
+        // existing expert reduction order and distribute workers over NUMA.
         for (int i = 0; i < threadNum; i++) {
-            pool->Wait(i);
-            delete ops[i];
+            pool->PushOp(first + i * available / threadNum, &ops[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(first + i * available / threadNum);
         }
     }
 
