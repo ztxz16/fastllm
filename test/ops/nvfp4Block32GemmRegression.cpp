@@ -182,9 +182,8 @@ static void Correctness() {
     }
 }
 
-// A 16-column call selects input packing; two 8-column calls retain the
-// direct kernel. Compare their results for every scale, including the LUT
-// boundaries and encodings that produce subnormals, overflow, or NaN.
+// Splitting the output range must preserve results for every scale,
+// including encodings that produce subnormals, overflow, or NaN.
 static void ScaleCorrectness() {
     constexpr int m = 1024, k = 16;
     const size_t rowBytes = Block32RowBytes(m);
@@ -213,29 +212,29 @@ static void ScaleCorrectness() {
                 weights[offset] = (uint8_t)scale;
             }
             for (int n : {1, 4, 8}) {
-                std::vector<float> packed(n * k), direct(n * k);
+                std::vector<float> whole(n * k), split(n * k);
                 auto run = [&](std::vector<float> &out, int st, int end) {
                     return FastllmGemmBFloat16NVFP4Block32E8M0_AVX2(
                         input.data(), m * 2, weights.data(), (long)rowBytes,
                         out.data(), k * 4, n, m, k, st, end);
                 };
-                if (!run(packed, 0, k) || !run(direct, 0, k / 2) ||
-                    !run(direct, k / 2, k)) {
+                if (!run(whole, 0, k) || !run(split, 0, k / 2) ||
+                    !run(split, k / 2, k)) {
 #ifdef __SSE__
                     _mm_setcsr(original);
 #endif
                     printf("[SKIP] AVX2 scale checks unavailable in this build\n");
                     return;
                 }
-                for (size_t i = 0; i < packed.size(); i++) {
-                    valid &= memcmp(&packed[i], &direct[i], sizeof(float)) == 0 ||
-                        (std::isnan(packed[i]) && std::isnan(direct[i]));
+                for (size_t i = 0; i < whole.size(); i++) {
+                    valid &= memcmp(&whole[i], &split[i], sizeof(float)) == 0 ||
+                        (std::isnan(whole[i]) && std::isnan(split[i]));
                 }
             }
         }
         char description[128];
         snprintf(description, sizeof(description),
-                 "AVX2 packed/direct all 256 scales, FP mode=%d", mode);
+                 "AVX2 whole/split range all 256 scales, FP mode=%d", mode);
         Check(valid, description);
     }
 #ifdef __SSE__
@@ -244,8 +243,8 @@ static void ScaleCorrectness() {
 }
 
 // NUMA workers write a slice of the expert's full output matrix. Exercise
-// nonzero/odd column ranges, byte strides, and the boundaries between the
-// packed-input and direct kernels; untouched columns/padding are guards.
+// nonzero/odd column ranges, byte strides, and full/partial blocks;
+// untouched columns/padding are guards.
 static void StridedCorrectness() {
     std::mt19937 rng(20260919);
     const int shapes[][4] = {

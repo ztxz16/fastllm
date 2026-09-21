@@ -1623,12 +1623,9 @@ namespace fastllm {
                 const uint8_t *blockStart = rowStart + (size_t)block * 17;
                 _mm_prefetch((const char*)(blockStart + 256), _MM_HINT_T0);
                 __m256 weight[4];
-                NVFP4Block32Decode_AVX2(blockStart, weight);
-                const __m256 scaleVec =
-                    _mm256_set1_ps(NVFP4E8M0ScaleToFloatAVX2(blockStart[16]));
-                for (int q = 0; q < 4; q++) {
-                    weight[q] = _mm256_mul_ps(weight[q], scaleVec);
-                }
+                // The scale table is independent of row count and matrix
+                // width; exceptional scales retain the original multiply.
+                NVFP4Block32DecodeScaled_AVX2(blockStart, weight);
                 const int offset = block << 5;
                 for (int r = 0; r < ROWS; r++) {
                     __m256 in[4];
@@ -1669,104 +1666,6 @@ namespace fastllm {
                 float *output = (float*)((uint8_t*)C + (size_t)r * ldc);
                 output[j] = sums[r];
             }
-        }
-    }
-
-    // Expand the small activation tile once, instead of repeating BF16
-    // conversion and lane permutations for every expert output column.
-    // Keep the same four accumulators and reduction order as the direct
-    // block-32 kernel: packing changes data reuse, not the dot product.
-    template <int ROWS, int COLS>
-    static void NVFP4Block32GemmPacked_AVX2(
-        const float *input, const uint8_t *weights, long ldb,
-        float *output, long ldc, int m, int st, int end
-    ) {
-        for (int col = st; col < end; col += COLS) {
-            if constexpr (COLS > 1) {
-                if (col + COLS > end) {
-                    NVFP4Block32GemmPacked_AVX2<ROWS, 1>(
-                        input, weights, ldb, output, ldc, m, col, end);
-                    break;
-                }
-            }
-            __m256 acc[ROWS][COLS][4];
-            for (int r = 0; r < ROWS; r++) {
-                for (int c = 0; c < COLS; c++) {
-                    for (int q = 0; q < 4; q++) {
-                        acc[r][c][q] = _mm256_setzero_ps();
-                    }
-                }
-            }
-            for (int block = 0; block < m / 32; block++) {
-                __m256 in[ROWS][4];
-                for (int r = 0; r < ROWS; r++) {
-                    for (int q = 0; q < 4; q++) {
-                        in[r][q] = _mm256_load_ps(
-                            input + (size_t)r * m + block * 32 + q * 8);
-                    }
-                }
-                for (int c = 0; c < COLS; c++) {
-                    const uint8_t *packed = weights +
-                        (size_t)(col + c) * ldb + (size_t)block * 17;
-                    __m256 weight[4];
-                    NVFP4Block32DecodeScaled_AVX2(packed, weight);
-                    for (int r = 0; r < ROWS; r++) {
-                        for (int q = 0; q < 4; q++) {
-                            acc[r][c][q] = _mm256_fmadd_ps(
-                                in[r][q], weight[q], acc[r][c][q]);
-                        }
-                    }
-                }
-            }
-            for (int r = 0; r < ROWS; r++) {
-                float *rowOutput = (float*)((uint8_t*)output + (size_t)r * ldc);
-                for (int c = 0; c < COLS; c++) {
-                    rowOutput[col + c] = NVFP4HorizontalSum_AVX2(_mm256_add_ps(
-                        _mm256_add_ps(acc[r][c][0], acc[r][c][1]),
-                        _mm256_add_ps(acc[r][c][2], acc[r][c][3])));
-                }
-            }
-        }
-    }
-
-    static void NVFP4Block32GemmPackInput_AVX2(
-        const void *A, long lda, const void *B, long ldb,
-        void *C, long ldc, int n, int m, int st, int end
-    ) {
-        static thread_local std::vector<float, alignedAllocator<float, 64>> input;
-        input.resize((size_t)n * m);
-        for (int r = 0; r < n; r++) {
-            const uint16_t *src = (const uint16_t*)((const uint8_t*)A + (size_t)r * lda);
-            for (int offset = 0; offset < m; offset += 32) {
-                __m256 values[4];
-                NVFP4Block32LoadInput_AVX2(src + offset, values);
-                for (int q = 0; q < 4; q++) {
-                    _mm256_store_ps(input.data() + (size_t)r * m + offset + q * 8, values[q]);
-                }
-            }
-        }
-        if (n == 1) {
-            // Once the input is packed, one streaming weight row avoids
-            // the extra register pressure of a single-row column tile.
-            NVFP4Block32GemmPacked_AVX2<1, 1>(
-                input.data(), (const uint8_t*)B, ldb, (float*)C, ldc, m, st, end);
-            return;
-        }
-        // Two output columns share activation loads; matching token rows
-        // share weight decoding. Limit each tile to 3/4 rows instead of
-        // carrying the accumulators for all verification rows at once.
-        for (int row = 0; row < n;) {
-            const int remaining = n - row;
-            const int rows = remaining == 4 || remaining == 7 ? 4 : std::min(3, remaining);
-            const float *src = input.data() + (size_t)row * m;
-            float *dst = (float*)((uint8_t*)C + (size_t)row * ldc);
-            switch (rows) {
-                case 1: NVFP4Block32GemmPacked_AVX2<1, 1>(src, (const uint8_t*)B, ldb, dst, ldc, m, st, end); break;
-                case 2: NVFP4Block32GemmPacked_AVX2<2, 2>(src, (const uint8_t*)B, ldb, dst, ldc, m, st, end); break;
-                case 3: NVFP4Block32GemmPacked_AVX2<3, 2>(src, (const uint8_t*)B, ldb, dst, ldc, m, st, end); break;
-                case 4: NVFP4Block32GemmPacked_AVX2<4, 2>(src, (const uint8_t*)B, ldb, dst, ldc, m, st, end); break;
-            }
-            row += rows;
         }
     }
 
@@ -1943,19 +1842,6 @@ namespace fastllm {
             return true;
         }();
         (void)traced;
-        // Amortize packing over model-sized expert tiles. Small/tail shapes
-        // and larger batches retain the direct kernel below.
-        // With only 16 vector registers, splitting five/six rows into two
-        // packed tiles costs more than the direct kernel's weight reuse.
-#ifdef __AVX512F__
-        const bool usePackedRows = true;
-#else
-        const bool usePackedRows = n != 5 && n != 6;
-#endif
-        if (usePackedRows && n <= 8 && m >= 1024 && (m & 31) == 0 && end - st >= 16) {
-            NVFP4Block32GemmPackInput_AVX2(A, lda, B, ldb, C, ldc, n, m, st, end);
-            return true;
-        }
 #define FASTLLM_RUN_NVFP4_BLOCK32_AVX2(ROWS) \
         FastllmGemmBFloat16NVFP4Block32E8M0_AVX2_Run<ROWS>( \
             A, lda, B, ldb, C, ldc, m, st, end); \
@@ -1970,9 +1856,9 @@ namespace fastllm {
             default: break;
         }
 #undef FASTLLM_RUN_NVFP4_BLOCK32_AVX2
-        // Wider activations reuse each decoded weight vector six rows at a
-        // time; beyond that the accumulators no longer fit in the 16 YMM
-        // registers and spills cost more than the extra weight reads.
+        // Wider activations reuse each decoded weight vector in bounded row
+        // tiles. Keep the accumulator working set independent of the total
+        // batch size.
         for (int row = 0; row < n; row += 6) {
             const int rows = std::min(6, n - row);
             const uint8_t *rowA = (const uint8_t*)A + (size_t)row * lda;
