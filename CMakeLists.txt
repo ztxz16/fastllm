@@ -934,6 +934,14 @@ if (UNIT_TEST)
         set_tests_properties(cuda_bf16_bias_multigpu PROPERTIES
             LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 60)
 
+        add_executable(cuda_marlin_sm75_ldmatrix_test test/basic/test_cuda_marlin_sm75_ldmatrix.cu)
+        target_include_directories(cuda_marlin_sm75_ldmatrix_test PRIVATE src/devices/cuda/moe/marlin_moe)
+        set_target_properties(cuda_marlin_sm75_ldmatrix_test PROPERTIES
+            CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME cuda_marlin_sm75_ldmatrix COMMAND cuda_marlin_sm75_ldmatrix_test)
+        set_tests_properties(cuda_marlin_sm75_ldmatrix PROPERTIES
+            LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 30)
+
         add_executable(cuda_single_prefill_dispatch_test test/basic/test_cuda_single_prefill_dispatch.cu)
         target_include_directories(cuda_single_prefill_dispatch_test PRIVATE third_party)
         set_target_properties(cuda_single_prefill_dispatch_test PROPERTIES
