@@ -731,10 +731,17 @@ static thread_local std::string fastllmCudaGraphLastError;
 // on a negative query: tensor-parallel code can temporarily inspect a different
 // device's per-thread stream while the original stream is active.
 static thread_local bool fastllmCudaGraphCaptureMayBeActive = false;
+static thread_local bool fastllmCudaGraphManagedCaptureOnly = false;
+
+bool FastllmCudaGraphSetManagedCaptureOnly(bool enabled) {
+    const bool previous = fastllmCudaGraphManagedCaptureOnly;
+    fastllmCudaGraphManagedCaptureOnly = enabled;
+    return previous;
+}
 
 static bool FastllmCudaGraphCaptureQueryRequired() {
     return fastllmCudaGraphCaptureMayBeActive ||
-           fastllm::GetFastllmEnv().cudaGraph;
+           (!fastllmCudaGraphManagedCaptureOnly && fastllm::GetFastllmEnv().cudaGraph);
 }
 
 static bool FastllmCudaGraphSetError(const char *stage, cudaError_t err) {
@@ -4467,7 +4474,9 @@ static size_t FastllmCudaReleaseIdleBigBuffersLocked(int id, std::vector<CudaMem
         cudaDeviceSynchronize();
     }
     for (auto &buffer : bigBuffers) {
-        if (buffer.busy || !FastllmCudaBufferReadyForReuseLocked(buffer)) {
+        if (buffer.busy || buffer.graphPins > 0 ||
+            !FastllmCudaBufferReadyForReuseLocked(buffer) ||
+            FastllmCudaGraphPoolPointerProtectedLocked(buffer.data)) {
             keep.push_back(buffer);
             continue;
         }

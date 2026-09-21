@@ -1114,6 +1114,7 @@ namespace fastllm {
         this->UpdateUnitSize();
         this->isFake = true;
         this->dataDevice = ori.dataDevice;
+        this->dataDeviceIds = ori.dataDeviceIds;
         this->ClearTensorParallelLayout();
         if (this->dataDevice == DataDevice::CPU) {
             this->cpuData = ori.cpuData + offset;

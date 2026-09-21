@@ -1110,6 +1110,9 @@ if (UNIT_TEST)
         add_executable(cudaGraphPoolMissRegression test/ops/cudaGraphPoolMissRegression.cpp)
         target_link_libraries(cudaGraphPoolMissRegression fastllm)
         target_include_directories(cudaGraphPoolMissRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME cudaGraphPoolMiss COMMAND cudaGraphPoolMissRegression)
+        set_tests_properties(cudaGraphPoolMiss PROPERTIES LABELS cuda
+            SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
 
         add_executable(marlinGraphScratchRegression test/ops/marlinGraphScratchRegression.cpp)
         target_link_libraries(marlinGraphScratchRegression fastllm)

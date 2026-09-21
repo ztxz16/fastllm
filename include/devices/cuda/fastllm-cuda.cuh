@@ -161,6 +161,9 @@ bool FastllmCudaGraphIsCapturing();
 // and no capture has been observed on this thread, this avoids a CUDA runtime
 // call. External capturers should call the exact query above once first.
 bool FastllmCudaGraphIsCapturingFast();
+// For owned worker streams whose captures always use FastLLM's begin/end
+// wrappers. Returns the previous mode so callers can restore it on exit.
+bool FastllmCudaGraphSetManagedCaptureOnly(bool enabled);
 bool FastllmCudaGraphCaptureInvalidated();
 // Give pointer-batched kernels a stable, bounded set of device pointer tables
 // while warming/capturing one whole-step graph. Scopes may be nested and must

@@ -131,13 +131,59 @@ bool RunDeferredBigBufferClearRegression() {
     return true;
 }
 
+bool RunPinnedWorkspaceOomRegression() {
+    FastllmCudaSetDevice(0);
+    struct RestoreCaptureMode {
+        bool previous = FastllmCudaGraphSetManagedCaptureOnly(true);
+        ~RestoreCaptureMode() { FastllmCudaGraphSetManagedCaptureOnly(previous); }
+    } restore;
+    constexpr size_t bytes = 4ULL * 1024ULL * 1024ULL;
+    void *buffer = FastllmCudaMalloc(bytes);
+    FastllmCudaFree(buffer);
+    if (!FastllmCudaGraphMemoryPoolBegin() || !FastllmCudaGraphBeginCapture()) return false;
+    buffer = FastllmCudaMalloc(bytes);
+    if (cudaMemsetAsync(buffer, 0x5a, bytes, cudaStreamPerThread) != cudaSuccess) return false;
+    FastllmCudaFree(buffer);
+    void *graph = nullptr, *exec = nullptr;
+    std::vector<void *> pins;
+    if (!FastllmCudaGraphEndCapture(&graph) || !FastllmCudaGraphMemoryPoolEnd(pins) ||
+        std::find(pins.begin(), pins.end(), buffer) == pins.end() ||
+        !FastllmCudaGraphInstantiate(graph, &exec)) return false;
+
+    // The tensor released its workspace, but the graph still owns the address.
+    // Force the allocator's OOM retry without consuming the device's capacity.
+    size_t freeBytes = 0, totalBytes = 0;
+    void *probe = nullptr;
+    bool passed = cudaMemGetInfo(&freeBytes, &totalBytes) == cudaSuccess &&
+        totalBytes < std::numeric_limits<size_t>::max() &&
+        FastllmCudaTryDirectMalloc(&probe, totalBytes + 1) ==
+            FASTLLM_CUDA_TRY_MALLOC_CAPACITY_FAILURE && probe == nullptr;
+    cudaPointerAttributes attributes;
+    passed = passed && cudaPointerGetAttributes(&attributes, buffer) == cudaSuccess;
+#if CUDART_VERSION < 10000
+    passed = passed && attributes.memoryType == cudaMemoryTypeDevice;
+#else
+    passed = passed && attributes.type == cudaMemoryTypeDevice;
+#endif
+    unsigned char value = 0;
+    passed = passed && FastllmCudaGraphLaunch(exec) &&
+        cudaStreamSynchronize(cudaStreamPerThread) == cudaSuccess &&
+        cudaMemcpy(&value, buffer, 1, cudaMemcpyDeviceToHost) == cudaSuccess && value == 0x5a;
+    FastllmCudaGraphExecDestroy(exec);
+    FastllmCudaGraphDestroy(graph);
+    FastllmCudaGraphMemoryPoolRelease(pins);
+    if (!passed) std::cerr << "OOM retry released a graph-owned workspace\n";
+    else std::cout << "graph-owned workspace survives OOM retry: PASS\n";
+    return passed;
+}
+
 }  // namespace
 
 int main() {
     int deviceCount = 0;
     if (cudaGetDeviceCount(&deviceCount) != cudaSuccess || deviceCount <= 0) {
         std::cerr << "no CUDA device available for graph pool-miss regression\n";
-        return 2;
+        return 77;
     }
     if (!RunExternalCaptureQueryRegression()) {
         return 17;
@@ -255,6 +301,9 @@ int main() {
 
     if (!RunDeferredBigBufferClearRegression()) {
         return 7;
+    }
+    if (!RunPinnedWorkspaceOomRegression()) {
+        return 22;
     }
 
     size_t freeBytes = 0, totalBytes = 0;
