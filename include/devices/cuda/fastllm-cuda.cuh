@@ -675,6 +675,8 @@ bool FastllmCudaQwen4QSACommitGraph(
         const fastllm::Data &compressedKey, const int32_t *decodeMeta,
         int tokenOffset, int compressRatio,
         fastllm::Data &compressedKeys);
+// Append 1..4 rows to a ratio-4 QSA cache, compressing a completed group
+// with the same FP32 reduction and RoPE order as the separate operators.
 bool FastllmCudaQwen4QSAAppendCompress4(
         const fastllm::Data &rawKeys,
         const fastllm::Data &positions,

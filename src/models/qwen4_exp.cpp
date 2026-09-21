@@ -4707,11 +4707,10 @@ namespace fastllm {
             };
 
 #ifdef USE_CUDA
-            // The four-row verifier always completes exactly one QSA
-            // compression group. Reuse the graph-safe exact kernel on the
-            // eager path as well, avoiding the temporary concatenations,
-            // split reductions, normalization, RoPE and cache copies below.
-            if (sequence == 4 && ratio == 4 &&
+            // Decode and small verification batches append at most one
+            // group. Reuse its tail storage and compress directly when the
+            // incoming rows complete it, keeping the exact CUDA arithmetic.
+            if (sequence > 0 && sequence <= ratio && ratio == 4 &&
                 this->indexerHeadDim == 128 &&
                 this->rotary_dim == 64) {
                 const int device = currentKeysFloat.dataDeviceIds.empty()
@@ -4742,7 +4741,9 @@ namespace fastllm {
                         {0, this->indexerHeadDim});
                 }
 
-                const int requiredBlocks = cachedBlocks + 1;
+                const int completedBlocks = (oldTailCount + sequence) / ratio;
+                const int remainingRows = (oldTailCount + sequence) % ratio;
+                const int requiredBlocks = cachedBlocks + completedBlocks;
                 if (blockCache != nullptr && sameDevice(*blockCache) &&
                     blockCache->dataType == DataType::FLOAT32 &&
                     blockCache->dims.size() == 2 &&
@@ -4773,10 +4774,12 @@ namespace fastllm {
                     blockCache->strides.size() == 2 &&
                     blockCache->strides[0] == this->indexerHeadDim;
                 if (canFuse) {
-                    // Preserve the completed raw group in the pinned mirror
-                    // before the fused kernel rotates the four tail slots.
+                    // Preserve rows before rotation only when a new partial
+                    // group will overwrite them. If no rows remain, the
+                    // completed group stays in the tail and can be mirrored
+                    // in two contiguous copies after the kernel.
                     int mirroredRows = previousLength - oldTailCount;
-                    if (oldTailCount > 0) {
+                    if (completedBlocks > 0 && remainingRows > 0 && oldTailCount > 0) {
                         Data oldKeys, oldPositions;
                         oldKeys.FakeFrom(*tailKeys, 0);
                         oldKeys.Resize(
@@ -4788,16 +4791,17 @@ namespace fastllm {
                             oldTailCount, this->indexerHeadDim);
                         mirroredRows += oldTailCount;
                     }
-                    const int newRows = ratio - oldTailCount;
-                    Data newKeys, newPositions;
-                    newKeys.FakeFrom(currentKeysFloat, 0);
-                    newKeys.Resize(
-                        {newRows, this->indexerHeadDim});
-                    newPositions.FakeFrom(currentPositionsFloat, 0);
-                    newPositions.Resize({newRows});
-                    hostTransfer->Queue(
-                        newKeys, newPositions, mirroredRows,
-                        newRows, this->indexerHeadDim);
+                    if (completedBlocks > 0 && remainingRows > 0) {
+                        const int newRows = ratio - oldTailCount;
+                        Data newKeys, newPositions;
+                        newKeys.FakeFrom(currentKeysFloat, 0);
+                        newKeys.Resize({newRows, this->indexerHeadDim});
+                        newPositions.FakeFrom(currentPositionsFloat, 0);
+                        newPositions.Resize({newRows});
+                        hostTransfer->Queue(
+                            newKeys, newPositions, mirroredRows,
+                            newRows, this->indexerHeadDim);
+                    }
 
                     const bool fused =
                         FastllmCudaQwen4QSAAppendCompress4(
@@ -4808,9 +4812,13 @@ namespace fastllm {
                     AssertInFastLLM(
                         fused,
                         "Qwen4-Exp exact QSA compression rejected a validated input.");
-                    tailKeys->Resize(
-                        {oldTailCount, this->indexerHeadDim});
-                    tailPositions->Resize({oldTailCount});
+                    if (completedBlocks > 0 && remainingRows == 0) {
+                        hostTransfer->Queue(
+                            *tailKeys, *tailPositions, mirroredRows,
+                            ratio, this->indexerHeadDim);
+                    }
+                    tailKeys->Resize({remainingRows, this->indexerHeadDim});
+                    tailPositions->Resize({remainingRows});
                     blockCache->Resize(
                         {requiredBlocks, this->indexerHeadDim});
                     finishDeviceQsa();
@@ -8813,7 +8821,7 @@ namespace fastllm {
             // conditionally commits completed groups. Keep all per-row views
             // and work tensors alive until the QSA/attention join below.
             const bool fusedCompress =
-                sequence == 4 && ratio == 4 &&
+                sequence > 0 && sequence <= ratio && ratio == 4 &&
                 this->indexerHeadDim == 128 &&
                 this->rotary_dim == 64;
             if (fusedCompress) {
@@ -8921,9 +8929,20 @@ namespace fastllm {
             }
 
             Data qGate, query, key, value, gate;
-            Linear(
-                typedInput, this->weight[attention + "q_proj.weight"],
-                Data(), qGate);
+            const Data *projectionWeights[] = {
+                &this->weight[attention + "q_proj.weight"],
+                &this->weight[attention + "k_proj.weight"],
+                &this->weight[attention + "v_proj.weight"]};
+            Data *projectionOutputs[] = {&qGate, &key, &value};
+            const bool fusedProjections =
+                (sequence == 1 || qwen4MtpDecodeEquivalentTarget) &&
+                Qwen4TryExactCudaMultiLinear(
+                    typedInput, projectionWeights, projectionOutputs, 3);
+            if (!fusedProjections) {
+                Linear(typedInput, this->weight[attention + "q_proj.weight"], Data(), qGate);
+                Linear(typedInput, this->weight[attention + "k_proj.weight"], Data(), key);
+                Linear(typedInput, this->weight[attention + "v_proj.weight"], Data(), value);
+            }
             qGate.Reshape(
                 {batch, sequence, -1, this->head_dim * 2});
             Split(qGate, -1, 0, this->head_dim, query);
@@ -8931,12 +8950,6 @@ namespace fastllm {
                 qGate, -1, this->head_dim,
                 this->head_dim * 2, gate);
             gate.Reshape({batch, sequence, -1});
-            Linear(
-                typedInput, this->weight[attention + "k_proj.weight"],
-                Data(), key);
-            Linear(
-                typedInput, this->weight[attention + "v_proj.weight"],
-                Data(), value);
             key.Reshape({batch, sequence, -1, this->head_dim});
             value.Reshape({batch, sequence, -1, this->head_dim});
             RMSNorm(
@@ -9040,13 +9053,17 @@ namespace fastllm {
                     return false;
                 }
             }
-            PermuteSelf(context, {1, 0, 2});
-            context.Reshape({sequence, batch, -1});
-            PermuteSelf(context, {1, 0, 2});
-            SigmoidMulTo(context, gate);
-            Linear(
-                context, this->weight[attention + "o_proj.weight"],
-                Data(), output);
+            Data gatedContext;
+            const bool fusedOutput = FastllmCudaQwen4AttentionOutput(
+                context, gate, gatedContext);
+            if (!fusedOutput) {
+                PermuteSelf(context, {1, 0, 2});
+                context.Reshape({sequence, batch, -1});
+                PermuteSelf(context, {1, 0, 2});
+                SigmoidMulTo(context, gate);
+            }
+            Linear(fusedOutput ? gatedContext : context,
+                this->weight[attention + "o_proj.weight"], Data(), output);
             ThreadTpAllReduce(output);
             return true;
         };
