@@ -811,6 +811,120 @@ __global__ void FastllmSoftmaxKernelInner1(half* input, half *output, int outer,
 }
 
 template <int THREAD_PER_BLOCK>
+__global__ void FastllmMaskedSoftmaxHalfKernel(
+        half *scores, const half *mask, int queries, int keys,
+        int headsPerMask, uint64_t maskBatchStride, uint64_t maskRowStride) {
+    const int row = blockIdx.x;
+    const int head = row / queries;
+    const half *maskRow = mask + (head / headsPerMask) * maskBatchStride +
+                          (row % queries) * maskRowStride;
+    half *scoreRow = scores + (uint64_t)row * keys;
+    for (int column = threadIdx.x; column < keys; column += THREAD_PER_BLOCK) {
+        if (__half2float(maskRow[column]) > 0.99f) {
+            scoreRow[column] = __float2half_rn(-10000.0f);
+        }
+    }
+    __syncthreads();
+    // Keep the existing FP16 score/probability boundaries and reduction tree.
+    FastllmSoftmaxKernelInner1Func<THREAD_PER_BLOCK>(
+        scoreRow, scoreRow, keys, nullptr, nullptr);
+}
+
+__global__ void FastllmMaskedAttentionPointersKernel(
+        half **pointers, half *q, half *k, half *v, half *output, half *scores,
+        int heads, int group, uint64_t queryStride, uint64_t keyStride,
+        uint64_t valueStride, uint64_t outputStride, uint64_t scoreStride) {
+    const int head = blockIdx.x * blockDim.x + threadIdx.x;
+    if (head < heads) {
+        pointers[head] = k + (head / group) * keyStride;
+        pointers[heads + head] = q + head * queryStride;
+        pointers[2 * heads + head] = scores + head * scoreStride;
+        pointers[3 * heads + head] = v + (head / group) * valueStride;
+        pointers[4 * heads + head] = output + head * outputStride;
+    }
+}
+
+static bool TryBatchedMaskedHalfAttention(
+        const fastllm::Data &q, const fastllm::Data &k,
+        const fastllm::Data &v, const fastllm::Data &mask,
+        const fastllm::Data &output, int group, float scale) {
+    if (q.dims.size() != 3 || k.dims.size() != 3 || v.dims.size() != 3 ||
+        (mask.dims.size() != 2 && mask.dims.size() != 3) ||
+        mask.dataType != fastllm::DataType::FLOAT16 || mask.cudaData == nullptr ||
+        q.dims[0] <= 0 || q.dims[1] <= 1 || q.dims[2] <= 0 ||
+        group <= 0 || q.dims[0] != k.dims[0] * group ||
+        v.dims[0] != k.dims[0] || v.dims[1] != k.dims[1] ||
+        v.dims[2] <= 0 || output.dims != std::vector<int>({q.dims[0], q.dims[1], v.dims[2]}) ||
+        q.dims[2] != k.dims[2] || k.dims[1] <= 0 ||
+        q.strides.size() != 3 || k.strides.size() != 3 || v.strides.size() != 3 ||
+        output.strides.size() != 3 || mask.strides.size() != mask.dims.size() ||
+        q.strides[2] != 1 || k.strides[2] != 1 || v.strides[2] != 1 ||
+        output.strides[2] != 1 ||
+        q.strides[1] < q.dims[2] || k.strides[1] < k.dims[2] ||
+        v.strides[1] < v.dims[2] || output.strides[1] < v.dims[2] ||
+        mask.strides.back() != 1 || mask.dims.back() != k.dims[1] ||
+        mask.dims[mask.dims.size() - 2] != q.dims[1] ||
+        FastllmCudaGraphIsCapturing()) {
+        return false;
+    }
+    const int heads = q.dims[0], queries = q.dims[1], keys = k.dims[1];
+    const int batches = mask.dims.size() == 3 ? mask.dims[0] : 1;
+    if (batches <= 0 || heads % batches != 0) return false;
+    // Batch heads only while the complete score workspace is small. Large
+    // prefill/long-KV shapes retain the bounded, per-head implementation.
+    constexpr size_t scratchLimit = 8ULL * 1024 * 1024;
+    const uint64_t scoreRowBytes = (uint64_t)keys * sizeof(half);
+    const uint64_t rows = (uint64_t)heads * queries;
+    if (rows > scratchLimit / scoreRowBytes) return false;
+    const size_t pointerOffset = (rows * scoreRowBytes + 255) / 256 * 256;
+    const size_t scratchBytes = pointerOffset + 5 * (size_t)heads * sizeof(half *);
+    void *scratch = nullptr;
+    if (FastllmCudaTryMalloc(&scratch, scratchBytes) !=
+            FASTLLM_CUDA_TRY_MALLOC_SUCCESS || scratch == nullptr) return false;
+    half *scores = (half *)scratch;
+    half **pointers = (half **)((uint8_t *)scratch + pointerOffset);
+    const half zero = __float2half_rn(0), one = __float2half_rn(1);
+    const half hscale = __float2half_rn(scale);
+    auto handle = getFastllmCublasHandle();
+    FastllmMaskedAttentionPointersKernel<<<(heads + 127) / 128, 128>>>(
+        pointers, (half *)q.cudaData, (half *)k.cudaData, (half *)v.cudaData,
+        (half *)output.cudaData, scores, heads, group, q.strides[0],
+        k.strides[0], v.strides[0], output.strides[0], (uint64_t)queries * keys);
+    // Keep each head's GEMM shape instead of concatenating the GQA query
+    // group. Pointer batching also respects independent K/V head capacities.
+    auto status = cublasHgemmBatched(
+        handle, CUBLAS_OP_T, CUBLAS_OP_N,
+        keys, queries, q.dims[2], &hscale,
+        (const half **)pointers, k.strides[1],
+        (const half **)(pointers + heads), q.strides[1],
+        &zero, pointers + 2 * heads, keys, heads);
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        const uint64_t maskBatchStride = mask.dims.size() == 3 ? mask.strides[0] : 0;
+        const uint64_t maskRowStride = mask.strides[mask.dims.size() - 2];
+#define FASTLLM_MASKED_SOFTMAX(THREADS) \
+        FastllmMaskedSoftmaxHalfKernel<THREADS><<<rows, THREADS>>>( \
+            scores, (const half *)mask.cudaData, queries, keys, heads / batches, \
+            maskBatchStride, maskRowStride)
+        if (keys < 8) { FASTLLM_MASKED_SOFTMAX(1); }
+        else if (keys < 64) { FASTLLM_MASKED_SOFTMAX(8); }
+        else if (keys < 512) { FASTLLM_MASKED_SOFTMAX(64); }
+        else { FASTLLM_MASKED_SOFTMAX(256); }
+#undef FASTLLM_MASKED_SOFTMAX
+        status = cublasHgemmBatched(
+            handle, CUBLAS_OP_N, CUBLAS_OP_N,
+            v.dims[2], queries, keys, &one,
+            (const half **)(pointers + 3 * heads), v.strides[1],
+            (const half **)(pointers + 2 * heads), keys,
+            &zero, pointers + 4 * heads, output.strides[1], heads);
+    }
+    // The allocator may hand the returned buffer to another PTDS. Complete
+    // its consumers before releasing it; graph capture keeps its old path.
+    FastllmCudaSyncCurrentThreadStream();
+    FastllmCudaFree(scratch);
+    return status == CUBLAS_STATUS_SUCCESS;
+}
+
+template <int THREAD_PER_BLOCK>
 __global__ void FastllmSoftmaxKernelInner1(half* input, half *output, int outer, int channels, float *maxp, float *sump) {
     int o = blockIdx.x;
     FastllmSoftmaxKernelInner1Func <THREAD_PER_BLOCK> (input + o * channels, output + o * channels, channels, maxp + o, sump + o);
@@ -1214,6 +1328,10 @@ FastllmCudaPermute(*((fastllm::Data*)&output), {1, 0, 2});
     
     // Fallback 到原始实现
     half beta = __float2half_rn(0.0f), one = __float2half_rn(1.0f), hscale = __float2half_rn(scale);
+
+    if (use_custom_mask && TryBatchedMaskedHalfAttention(q, k, v, mask, output, group, scale)) {
+        return true;
+    }
 
     // Vision self-attention is non-causal and can have tens of thousands of
     // queries.  The legacy fallback below processes one head at a time, but it
