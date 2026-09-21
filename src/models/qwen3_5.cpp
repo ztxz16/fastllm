@@ -28302,6 +28302,66 @@ namespace fastllm {
         return HasDFlashWeights() ? dflashRuntimeBlockSize - 1 : 0;
     }
 
+#ifdef USE_CUDA
+    struct Qwen35DraftCudaGraphState {
+        int device = -1;
+        bool warmed = false, disabled = false;
+        void *graph = nullptr, *exec = nullptr;
+        std::vector<void *> reserved;
+        // Called from each derived destructor while its Data buffers are alive.
+        void Release() {
+            if (device >= 0 && (graph || exec || !reserved.empty())) {
+                FastllmCudaSetDevice(device);
+                ForceDeviceSync();
+                if (exec) FastllmCudaGraphExecDestroy(exec);
+                if (graph) FastllmCudaGraphDestroy(graph);
+                if (!reserved.empty()) FastllmCudaGraphMemoryPoolRelease(reserved);
+            }
+        }
+        void Run(const std::function<void()> &body) {
+            Qwen35CudaGraphPointerTableScope pointerScope(this);
+            if (disabled || !warmed) {
+                body();
+                warmed = true;
+                return;
+            }
+            if (exec) {
+                AssertInFastLLM(FastllmCudaGraphLaunch(exec), "draft compute graph replay failed.\n");
+                return;
+            }
+            FastllmCudaClearThreadError();
+            FastllmCudaClearGraphError();
+            bool pool = FastllmCudaGraphPrepareCaptureDevice() && FastllmCudaGraphMemoryPoolBegin();
+            if (pool && FastllmCudaGraphBeginCapture()) {
+                try {
+                    body();
+                } catch (...) {
+                    void *failed = nullptr;
+                    FastllmCudaGraphEndCapture(&failed);
+                    if (failed)
+                        FastllmCudaGraphDestroy(failed);
+                    FastllmCudaGraphMemoryPoolAbort();
+                    disabled = true;
+                    throw;
+                }
+                if (FastllmCudaGraphEndCapture(&graph) && graph && FastllmCudaGraphMemoryPoolEnd(reserved) &&
+                    FastllmCudaGraphInstantiate(graph, &exec)) {
+                    AssertInFastLLM(FastllmCudaGraphLaunch(exec), "draft compute graph launch failed.\n");
+                    return;
+                }
+            }
+            if (pool)
+                FastllmCudaGraphMemoryPoolAbort();
+            disabled = true;
+            printf("[Qwen3.5] draft compute graph unavailable: %s; using eager execution.\n",
+                   FastllmCudaGraphLastError());
+            FastllmCudaClearThreadError();
+            FastllmCudaClearGraphError();
+            body();
+        }
+    };
+#endif
+
     static std::string Qwen35DraftQuantMode() {
         const char *setting = std::getenv("FASTLLM_DRAFT_QUANT");
         const std::string mode = setting ? setting : "off";
@@ -32571,54 +32631,12 @@ namespace fastllm {
 #ifdef USE_CUDA
     // Per-request, per-query-length buffers keep every captured input/output
     // address stable. KV append and page routing deliberately stay outside.
-    struct Qwen3_5Model::MtpDraftPrefixGraph {
-        int device = -1;
-        bool warmed = false, disabled = false;
-        void *graph = nullptr, *exec = nullptr;
-        std::vector<void*> reserved;
+    struct Qwen3_5Model::MtpDraftPrefixGraph : Qwen35DraftCudaGraphState {
         Data tokenIds, hiddenInput, positionIds;
         Data inputEmbeds, normEmbeds, normHidden, fusedInput, hiddenStates;
         Data attenInput, qgate, q, gate, k, v, mergedQkv;
         Data greedyScratch;
-        ~MtpDraftPrefixGraph() {
-            if (device >= 0 && (graph || exec || !reserved.empty())) {
-                FastllmCudaSetDevice(device); ForceDeviceSync();
-                if (exec) FastllmCudaGraphExecDestroy(exec);
-                if (graph) FastllmCudaGraphDestroy(graph);
-                if (!reserved.empty()) FastllmCudaGraphMemoryPoolRelease(reserved);
-            }
-        }
-        void Run(const std::function<void()> &body) {
-            Qwen35CudaGraphPointerTableScope pointerScope(this);
-            if (disabled || !warmed) { body(); warmed = true; return; }
-            if (exec) {
-                AssertInFastLLM(FastllmCudaGraphLaunch(exec), "MTP prefix graph replay failed.\n");
-                return;
-            }
-            FastllmCudaClearThreadError(); FastllmCudaClearGraphError();
-            bool pool = FastllmCudaGraphPrepareCaptureDevice() && FastllmCudaGraphMemoryPoolBegin();
-            if (pool && FastllmCudaGraphBeginCapture()) {
-                try { body(); }
-                catch (...) {
-                    void *failed = nullptr;
-                    FastllmCudaGraphEndCapture(&failed);
-                    if (failed) FastllmCudaGraphDestroy(failed);
-                    FastllmCudaGraphMemoryPoolAbort(); disabled = true; throw;
-                }
-                if (FastllmCudaGraphEndCapture(&graph) && graph &&
-                    FastllmCudaGraphMemoryPoolEnd(reserved) &&
-                    FastllmCudaGraphInstantiate(graph, &exec)) {
-                    AssertInFastLLM(FastllmCudaGraphLaunch(exec), "MTP prefix graph launch failed.\n");
-                    return;
-                }
-            }
-            if (pool) FastllmCudaGraphMemoryPoolAbort();
-            disabled = true;
-            printf("[Qwen3.5 MTP] prefix graph unavailable: %s; using eager prefix.\n",
-                FastllmCudaGraphLastError());
-            FastllmCudaClearThreadError(); FastllmCudaClearGraphError();
-            body();
-        }
+        ~MtpDraftPrefixGraph() { Release(); }
     };
 #endif
 
