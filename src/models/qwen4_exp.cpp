@@ -2552,6 +2552,17 @@ namespace fastllm {
                  !Qwen4StartsWith(weightName, "mtp."))) {
                 return;
             }
+            // GPU experts can retain their source layout until warmup repacks
+            // them. Streaming all dense weights now would overlap those sources
+            // and consume the headroom needed by loading and repacking.
+            // Keep the host-memory optimization for CPU/NUMA/disk experts.
+            for (int i = 0; i < this->block_cnt; ++i) {
+                const std::string moeDevice = this->SelectMoeDeviceForLayer(i);
+                if (moeDevice == "cuda" || Qwen4StartsWith(moeDevice, "cuda:") ||
+                    moeDevice == "multicuda" || Qwen4StartsWith(moeDevice, "multicuda:")) {
+                    return;
+                }
+            }
             auto found = this->weight.weight.find(weightName);
             if (found == this->weight.weight.end()) return;
             Data &data = found->second;

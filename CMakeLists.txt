@@ -835,6 +835,12 @@ if (UNIT_TEST)
         set_tests_properties(qwen35_streaming_tp_weights qwen35_streaming_single_gpu_weights
                              PROPERTIES LABELS cuda SKIP_RETURN_CODE 77)
 
+        add_executable(qwen4_streaming_weights_test test/basic/test_qwen4_streaming_weights.cpp)
+        target_link_libraries(qwen4_streaming_weights_test PRIVATE fastllm)
+        add_test(NAME qwen4_streaming_weights COMMAND qwen4_streaming_weights_test)
+        set_tests_properties(qwen4_streaming_weights PROPERTIES
+                             LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+
         target_include_directories(regressionOps PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         target_include_directories(contextExtensionRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         add_test(NAME context_extension_cuda COMMAND contextExtensionRegression --cuda)
