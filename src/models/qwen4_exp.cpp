@@ -5418,34 +5418,18 @@ namespace fastllm {
             Linear(typedInput, kWeight, Data(), key);
             Linear(typedInput, vWeight, Data(), value);
         }
-        qGate.Reshape({batch, sequence, -1, this->head_dim * 2});
-        Split(qGate, -1, 0, this->head_dim, query);
-        Split(qGate, -1, this->head_dim, this->head_dim * 2, gate);
-        gate.Reshape({batch, sequence, -1});
-
-        key.Reshape({batch, sequence, -1, this->head_dim});
-        value.Reshape({batch, sequence, -1, this->head_dim});
-
-        RMSNorm(query, this->weight[attention + "q_norm.weight"],
-                this->rms_norm_eps, query);
-        RMSNorm(key, this->weight[attention + "k_norm.weight"],
-                this->rms_norm_eps, key);
-        ApplyTextRotary(query, positionIds);
-        ApplyTextRotary(key, positionIds);
-
-        PermuteSelf(query, {0, 2, 1, 3});
-        PermuteSelf(key, {0, 2, 1, 3});
-        PermuteSelf(value, {0, 2, 1, 3});
-        query.Reshape({-1, sequence, this->head_dim});
-        key.Reshape({-1, sequence, this->head_dim});
-        value.Reshape({-1, sequence, this->head_dim});
-
+        // Reserve using the final head-major shape before preparing Q/K/V.
+        // This lets the fused path write K/V directly into the existing cache.
+        Data keyCacheDesc(key.dataType);
+        keyCacheDesc.Resize({batch * key.dims.back() / this->head_dim,
+                             sequence, this->head_dim});
+        keyCacheDesc.dataDevice = key.dataDevice;
         if (GetKVCacheInCPU()) {
             pastKey.lockInCPU = true;
             pastValue.lockInCPU = true;
         }
-        if (pastKey.dims.empty() && pastKey.dataType != key.dataType) {
-            pastKey.dataType = key.dataType;
+        if (pastKey.dims.empty() && pastKey.dataType != keyCacheDesc.dataType) {
+            pastKey.dataType = keyCacheDesc.dataType;
             pastKey.UpdateUnitSize();
         }
         if (pastValue.dims.empty() && pastValue.dataType != value.dataType) {
@@ -5453,44 +5437,85 @@ namespace fastllm {
             pastValue.UpdateUnitSize();
         }
         const int unitLength = !GetKVCacheInCPU() &&
-            key.dataDevice == DataDevice::CUDA ? 128 : 64;
+            keyCacheDesc.dataDevice == DataDevice::CUDA ? 128 : 64;
         const bool geometricGrowth =
             state.geometricCacheGrowthReadyLayers.count(stateLayer) != 0;
         // Reserve decode headroom during final prefill without changing the
         // logical cache length or the default allocation schedule.
         Qwen4EnsureAppendCapacity(
-            pastKey, key, 1, unitLength,
+            pastKey, keyCacheDesc, 1, unitLength,
             kQwen4DenseCacheMaxGrowth, geometricGrowth, decodeReserveTokens);
         Qwen4EnsureAppendCapacity(
-            pastValue, value, 1, unitLength,
+            pastValue, keyCacheDesc, 1, unitLength,
             kQwen4DenseCacheMaxGrowth, geometricGrowth, decodeReserveTokens);
-        bool appendedWithStridedCudaCache = false;
+        bool fusedPrepared = false;
 #ifdef USE_CUDA
-        if (!GetKVCacheInCPU() &&
-            key.dataDevice == DataDevice::CUDA &&
+        if (!GetKVCacheInCPU() && key.dataDevice == DataDevice::CUDA &&
             value.dataDevice == DataDevice::CUDA) {
-            pastKey.ToDevice(
-                DataDevice::CUDA, key.dataDeviceIds,
-                previousLength > 0);
-            pastValue.ToDevice(
-                DataDevice::CUDA, value.dataDeviceIds,
-                previousLength > 0);
+            pastKey.ToDevice(DataDevice::CUDA, key.dataDeviceIds, previousLength > 0);
+            pastValue.ToDevice(DataDevice::CUDA, value.dataDeviceIds, previousLength > 0);
         }
-        if (!GetKVCacheInCPU() &&
-            key.dataDevice == DataDevice::CUDA &&
-            value.dataDevice == DataDevice::CUDA &&
-            pastKey.dataDevice == DataDevice::CUDA &&
-            pastValue.dataDevice == DataDevice::CUDA) {
-            appendedWithStridedCudaCache = FastllmCudaQwen4KVAppend(
-                key, value, previousLength, pastKey, pastValue);
+        if (!GetKVCacheInCPU() && qGate.dataDevice == DataDevice::CUDA) {
+            Qwen4CudaDeviceGuard deviceGuard(qGate.dataDeviceIds);
+            Data &qNorm = this->weight[attention + "q_norm.weight"];
+            Data &kNorm = this->weight[attention + "k_norm.weight"];
+            qNorm.ToDevice(DataDevice::CUDA, qGate.dataDeviceIds);
+            kNorm.ToDevice(DataDevice::CUDA, qGate.dataDeviceIds);
+            const Data *positions = &positionIds;
+            Data cudaPositions;
+            if (positionIds.dataDevice != DataDevice::CUDA) {
+                cudaPositions.CopyFrom(positionIds);
+                cudaPositions.ToDevice(DataDevice::CUDA, qGate.dataDeviceIds);
+                positions = &cudaPositions;
+            }
+            fusedPrepared = FastllmCudaQwen4AttentionPrepare(
+                qGate, key, value, qNorm, kNorm, *positions,
+                query, gate, pastKey, pastValue, this->head_dim, this->rotary_dim,
+                this->mropeSections[1], this->mropeSections[2],
+                this->rms_norm_eps, this->rope_base, previousLength);
         }
 #endif
+        bool appendedWithStridedCudaCache = fusedPrepared;
+        if (!fusedPrepared) {
+            qGate.Reshape({batch, sequence, -1, this->head_dim * 2});
+            Split(qGate, -1, 0, this->head_dim, query);
+            Split(qGate, -1, this->head_dim, this->head_dim * 2, gate);
+            gate.Reshape({batch, sequence, -1});
+
+            key.Reshape({batch, sequence, -1, this->head_dim});
+            value.Reshape({batch, sequence, -1, this->head_dim});
+
+            RMSNorm(query, this->weight[attention + "q_norm.weight"],
+                    this->rms_norm_eps, query);
+            RMSNorm(key, this->weight[attention + "k_norm.weight"],
+                    this->rms_norm_eps, key);
+            ApplyTextRotary(query, positionIds);
+            ApplyTextRotary(key, positionIds);
+
+            PermuteSelf(query, {0, 2, 1, 3});
+            PermuteSelf(key, {0, 2, 1, 3});
+            PermuteSelf(value, {0, 2, 1, 3});
+            query.Reshape({-1, sequence, this->head_dim});
+            key.Reshape({-1, sequence, this->head_dim});
+            value.Reshape({-1, sequence, this->head_dim});
+
+#ifdef USE_CUDA
+            if (!GetKVCacheInCPU() &&
+                key.dataDevice == DataDevice::CUDA &&
+                value.dataDevice == DataDevice::CUDA &&
+                pastKey.dataDevice == DataDevice::CUDA &&
+                pastValue.dataDevice == DataDevice::CUDA) {
+                appendedWithStridedCudaCache = FastllmCudaQwen4KVAppend(
+                    key, value, previousLength, pastKey, pastValue);
+            }
+#endif
+        }
         if (appendedWithStridedCudaCache) {
             pastKey.Resize(
-                {key.dims[0], previousLength + sequence,
+                {keyCacheDesc.dims[0], previousLength + sequence,
                  this->head_dim});
             pastValue.Resize(
-                {value.dims[0], previousLength + sequence,
+                {keyCacheDesc.dims[0], previousLength + sequence,
                  this->head_dim});
         } else {
             CatDirect(pastKey, key, 1);
@@ -5512,12 +5537,22 @@ namespace fastllm {
             Attention(query, pastKey, pastValue, qsaMask, context,
                       attentionGroup, attentionScale, 1);
         }
-        PermuteSelf(context, {1, 0, 2});
-        context.Reshape({sequence, batch, -1});
-        PermuteSelf(context, {1, 0, 2});
-
-        SigmoidMulTo(context, gate);
-        Linear(context, this->weight[attention + "o_proj.weight"], Data(), output);
+        Data gatedContext;
+        bool fusedOutput = false;
+#ifdef USE_CUDA
+        if (context.dataDevice == DataDevice::CUDA) {
+            Qwen4CudaDeviceGuard deviceGuard(context.dataDeviceIds);
+            fusedOutput = FastllmCudaQwen4AttentionOutput(context, gate, gatedContext);
+        }
+#endif
+        if (!fusedOutput) {
+            PermuteSelf(context, {1, 0, 2});
+            context.Reshape({sequence, batch, -1});
+            PermuteSelf(context, {1, 0, 2});
+            SigmoidMulTo(context, gate);
+        }
+        Linear(fusedOutput ? gatedContext : context,
+               this->weight[attention + "o_proj.weight"], Data(), output);
         ThreadTpAllReduce(output);
     }
 

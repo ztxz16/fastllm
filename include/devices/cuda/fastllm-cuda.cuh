@@ -701,6 +701,19 @@ bool FastllmCudaQwen4KVAppend(
         const fastllm::Data &key, const fastllm::Data &value,
         int previousLength,
         fastllm::Data &keyCache, fastllm::Data &valueCache);
+// Token-major projections -> normalized/rotated head-major Q and strided KV
+// cache. Preserve the separate RMSNorm and RoPE rounding boundaries.
+bool FastllmCudaQwen4AttentionPrepare(
+        const fastllm::Data &qGate, const fastllm::Data &key,
+        const fastllm::Data &value, const fastllm::Data &qNorm,
+        const fastllm::Data &kNorm, const fastllm::Data &positions,
+        fastllm::Data &query, fastllm::Data &gate,
+        fastllm::Data &keyCache, fastllm::Data &valueCache,
+        int headDim, int rotaryDim, int sectionH, int sectionW,
+        float eps, float ropeTheta, int previousLength);
+bool FastllmCudaQwen4AttentionOutput(
+        const fastllm::Data &context, const fastllm::Data &gate,
+        fastllm::Data &output);
 bool FastllmCudaQwen4KVAppendGraph(
         const fastllm::Data &key, const fastllm::Data &value,
         const int32_t *decodeMeta,
