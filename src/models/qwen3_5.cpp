@@ -410,11 +410,52 @@ namespace fastllm {
             data.GetBytes() < Qwen35DFlashTpMinWeightBytes()) {
             return false;
         }
-        // Restrict backbone TP to the five large, repeated fused gate/up
-        // projections. They either use output-gather directly or pair with
-        // the matching down projection; attention, selector and context
-        // projections stay on the root until separately validated.
+        // Restrict the paired MLP path to the five fused gate/up projections.
+        // They pair with the matching down projection; the remaining draft
+        // projections use the standalone output-gather path below.
         return true;
+    }
+
+    static uint64_t Qwen35DFlashTpOutputGatherMinWeightBytes() {
+        const char *value =
+            std::getenv("FASTLLM_CUDA_DFLASH_TP_MIN_GATHER_MB");
+        long megabytes = 4;
+        if (value != nullptr && value[0] != '\0') {
+            char *end = nullptr;
+            long parsed = std::strtol(value, &end, 10);
+            if (end != value) {
+                megabytes = std::max(0L, parsed);
+            }
+        }
+        return (uint64_t)megabytes * 1024ULL * 1024ULL;
+    }
+
+    static bool Qwen35DFlashTpOutputGatherEligible(
+            const std::string &name, const Data &data) {
+        if (name.rfind("dflash.", 0) != 0 || data.dims.size() != 2 ||
+            data.isFake || data.cudaDataBorrowed ||
+            data.GetBytes() < Qwen35DFlashTpOutputGatherMinWeightBytes()) {
+            return false;
+        }
+        // These are the draft weights the upstream vLLM/SGLang draft models
+        // shard under their TP group. They all reduce over the input channel,
+        // so splitting dim 0 and gathering the activation keeps the arithmetic
+        // identical to a single-GPU run while balancing weight memory.
+        if (name == "dflash.fc.weight" || name == "dflash.all_kv.weight") {
+            return true;
+        }
+        for (const std::string &suffix : {
+                 ".self_attn.mergeqkv.weight",
+                 ".self_attn.o_proj.weight",
+                 ".attention_conv.kernel_projection.weight",
+                 ".mlp_conv.kernel_projection.weight"}) {
+            if (name.size() >= suffix.size() &&
+                name.compare(name.size() - suffix.size(), suffix.size(),
+                             suffix) == 0) {
+                return true;
+            }
+        }
+        return false;
     }
 
     static std::string Qwen35DFlashTpDownWeightName(
@@ -9500,9 +9541,15 @@ namespace fastllm {
                 }
                 const long long bytes =
                     (long long)item.second.GetBytes();
+                // The fused KV/QKV staging tensor is materialized as owned
+                // all_kv/mergeqkv views and then split, so reserve it like the
+                // other sharded weights rather than as a full root copy.
                 const bool sharded = useDFlashTp &&
                     (Qwen35DFlashTpLinearEligible(item.first, item.second) ||
-                     pairedDownWeightNames.count(item.first) != 0);
+                     pairedDownWeightNames.count(item.first) != 0 ||
+                     Qwen35DFlashTpOutputGatherEligible(
+                         item.first, item.second) ||
+                     item.first == "dflash.fused_kv_qkv.weight");
                 if (sharded) {
                     reserveBytes +=
                         (bytes * localRatio + ratioSum - 1) / ratioSum +
@@ -17788,6 +17835,16 @@ namespace fastllm {
         if (seqLens.size() != 1 || context == nullptr) {
             return false;
         }
+        // Multimodal requests fall back to plain target decoding. The draft
+        // model never sees the image, and mixing DFlash capture/validation with
+        // vision tokens corrupts the target's image perception (green reported
+        // as blue, etc.). vLLM avoids this by never feeding multimodal
+        // embeddings to the draft; here the equivalent safe behaviour is to
+        // skip speculation for the request entirely. See DFLASH_TP_BALANCE.md.
+        if (!context->multimodalInput.empty()) {
+            logMtpSkip("multimodal input: speculative decoding disabled");
+            return false;
+        }
         if (generationConfigs.empty() ||
             !Qwen35MtpSupportsGenerationConfig(generationConfigs[0])) {
             logMtpSkip("generation config is unsupported");
@@ -20351,6 +20408,15 @@ namespace fastllm {
             (int)generationConfigs.size() < batch ||
             (int)pastKeyValues.size() < batch * block_cnt) {
             return false;
+        }
+        // See the single-request guard: speculative decoding is disabled for
+        // multimodal requests because DFlash + vision corrupts image
+        // perception.
+        for (int b = 0; b < batch; b++) {
+            if (contexts[b] != nullptr &&
+                !contexts[b]->multimodalInput.empty()) {
+                return false;
+            }
         }
 
         const bool useDFlash = HasDFlashWeights();
@@ -27912,10 +27978,20 @@ namespace fastllm {
         std::set<std::string> deferredTpLinearWeights;
         std::vector<int> tpDevices;
         std::map<int, int> tpRatios;
-        if (GetQwen35GPUForwardDevices(
+        const bool tpBackboneEnabled =
+            GetQwen35GPUForwardDevices(
                 this->deviceMap, tpDevices, tpRatios) &&
             !tpDevices.empty() && tpDevices.front() == device &&
-            Qwen35DFlashBackboneTpEnabledFor(tpDevices, tpRatios)) {
+            Qwen35DFlashBackboneTpEnabledFor(tpDevices, tpRatios);
+        auto markOutputGatherWeightsDeferred = [&]() {
+            for (const auto &item : weight.weight) {
+                if (Qwen35DFlashTpOutputGatherEligible(
+                        item.first, item.second)) {
+                    deferredTpLinearWeights.insert(item.first);
+                }
+            }
+        };
+        if (tpBackboneEnabled) {
             for (const auto &item : weight.weight) {
                 if (!Qwen35DFlashTpLinearEligible(
                         item.first, item.second)) {
@@ -27934,6 +28010,9 @@ namespace fastllm {
                     deferredTpLinearWeights.insert(downName);
                 }
             }
+            // fc / o_proj / conv projections split straight from their
+            // CPU/mmap source like the paired MLP weights.
+            markOutputGatherWeightsDeferred();
         }
         auto move = [&](const std::string &name) {
             auto it = weight.weight.find(name);
@@ -27969,7 +28048,17 @@ namespace fastllm {
         auto fusedKvQkvIt = weight.weight.find(
             "dflash.fused_kv_qkv.weight");
         if (fusedKvQkvIt != weight.weight.end()) {
-            moveLinear("dflash.fused_kv_qkv.weight");
+            if (tpBackboneEnabled) {
+                // Keep the staging tensor on the host. Moving the full fused
+                // copy to the root GPU only to slice and free it leaves a
+                // ~0.7 GiB allocator high-water mark that the paged KV sizing
+                // can never reclaim. The owned views below split straight from
+                // the host source like the paired MLP weights.
+                deferredTpLinearWeights.insert(
+                    "dflash.fused_kv_qkv.weight");
+            } else {
+                moveLinear("dflash.fused_kv_qkv.weight");
+            }
             Data &fusedWeight = fusedKvQkvIt->second;
             const int qRows = dflashHeads * dflashHeadDim;
             const int kvRows = dflashKvHeads * dflashHeadDim;
@@ -27983,26 +28072,55 @@ namespace fastllm {
                 "DFlash fused KV/QKV weight shape is invalid.\n");
             const size_t rowBytes =
                 fusedWeight.GetBytes() / fusedWeight.dims[0];
-            Data &allKvWeight = weight["dflash.all_kv.weight"];
-            allKvWeight.FakeFrom(fusedWeight, 0);
-            allKvWeight.Resize({allKvRows, embed_dim});
-            allKvWeight.dataDeviceIds = fusedWeight.dataDeviceIds;
-            allKvWeight.name = "dflash.all_kv.weight";
-            allKvWeight.isModelWeight = true;
+            // The fused staging tensor holds the per-layer merged QKV and the
+            // context KV projection as contiguous row ranges. Building them as
+            // fake views keeps the single-GPU path allocation-free, but the
+            // TP path needs owned tensors so each range can be split across
+            // the ranks and the staging buffer released.
+            auto installFusedView = [&](const std::string &name,
+                                        size_t offset,
+                                        const std::vector<int> &dims) {
+                if (!tpBackboneEnabled) {
+                    Data &target = weight[name];
+                    target.FakeFrom(fusedWeight, offset);
+                    target.Resize(dims);
+                    target.dataDeviceIds = fusedWeight.dataDeviceIds;
+                    target.name = name;
+                    target.isModelWeight = true;
+                    return;
+                }
+                Data view;
+                view.FakeFrom(fusedWeight, offset);
+                view.Resize(dims);
+                Data &target = weight[name];
+                target.CopyFrom(view);
+                target.isFake = false;
+                target.dataDeviceIds = fusedWeight.dataDeviceIds;
+                target.name = name;
+                target.isModelWeight = true;
+            };
+            installFusedView(
+                "dflash.all_kv.weight", 0, {allKvRows, embed_dim});
             for (int layerIndex = 0; layerIndex < dflashLayers;
                  layerIndex++) {
                 const std::string name = "dflash.layers." +
                     std::to_string(layerIndex) +
                     ".self_attn.mergeqkv.weight";
-                Data &layerWeight = weight[name];
                 const size_t offsetRows = (size_t)allKvRows +
                     (size_t)layerIndex * qkvRows;
-                layerWeight.FakeFrom(
-                    fusedWeight, offsetRows * rowBytes);
-                layerWeight.Resize({qkvRows, embed_dim});
-                layerWeight.dataDeviceIds = fusedWeight.dataDeviceIds;
-                layerWeight.name = name;
-                layerWeight.isModelWeight = true;
+                installFusedView(
+                    name, offsetRows * rowBytes, {qkvRows, embed_dim});
+            }
+            if (tpBackboneEnabled) {
+                // Every consumer now owns its rows, so return the staging
+                // buffer instead of pinning it on the root GPU.
+                fusedWeight.FreeSpace();
+                fusedWeight.dims.clear();
+                fusedWeight.strides.clear();
+                fusedWeight.expansionDims.clear();
+                // The materialized views are now real weights and joined the
+                // output-gather TP set.
+                markOutputGatherWeightsDeferred();
             }
         }
         for (int layerIndex = 0; layerIndex < dflashLayers; layerIndex++) {
@@ -28244,6 +28362,39 @@ namespace fastllm {
             shardedBytes += linearWeight.GetBytes();
         }
 
+        // Attention QKV/O, the conv kernel projections, the draft input
+        // projection and the fused context KV projection. All of them reduce
+        // over the input channel, so dim-0 output-gather reproduces the
+        // single-GPU arithmetic exactly while halving the root weight memory.
+        for (auto &item : weight.weight) {
+            Data &linearWeight = item.second;
+            if (!Qwen35DFlashTpOutputGatherEligible(
+                    item.first, linearWeight)) {
+                continue;
+            }
+            if (linearWeight.multiDeviceData) {
+                AssertInFastLLM(
+                    Qwen35DFlashHasTpShards(linearWeight, devices),
+                    "DFlash output-gather TP found an incomplete existing "
+                    "shard set for " + item.first + ".\n");
+            } else {
+                std::vector<int> deviceCopy = devices;
+                DivisionScheme scheme = BuildMultiCudaRowSplitScheme(
+                    linearWeight, deviceCopy, ratios);
+                Data emptyBias;
+                AssertInFastLLM(
+                    SplitMultiCudaWeight(
+                        linearWeight, emptyBias, deviceCopy, scheme, 0,
+                        true, true),
+                    "DFlash output-gather TP failed to split " +
+                        item.first + ".\n");
+            }
+            convertTpShardsToFp16(linearWeight);
+            shardedWeights++;
+            outputGatherWeights++;
+            shardedBytes += linearWeight.GetBytes();
+        }
+
         dflashTpPreparedDevices = devices;
         dflashTpPreparedRatios = ratios;
         dflashTpBackbonePrepared = true;
@@ -28275,7 +28426,7 @@ namespace fastllm {
 #endif
     }
 
-    void Qwen3_5Model::RunDFlashGateupLinear(
+    void Qwen3_5Model::RunDFlashTpLinear(
             int device, Data &input, Data &linearWeight, Data &output) {
 #ifdef USE_CUDA
         if (dflashTpBackbonePrepared &&
@@ -28489,8 +28640,8 @@ namespace fastllm {
             projectionSource = &projectionInput;
         }
         Data projected, projectedContextHidden;
-        Linear(*projectionSource, projectionWeight,
-               *GetEmptyData(), projected);
+        RunDFlashTpLinear(device, *projectionSource, projectionWeight,
+                          projected);
         if (projected.dataType != DataType::BFLOAT16) {
             ToDataType(projected, DataType::BFLOAT16);
         }
@@ -28521,8 +28672,9 @@ namespace fastllm {
                         dflashLayers * 2 * kvRows &&
                     allKvWeightIt->second.dims[1] == embed_dim,
                 "DFlash fused KV projection weight shape is invalid.\n");
-            Linear(projectedContextHidden, allKvWeightIt->second,
-                   *GetEmptyData(), projectedAllKv);
+            RunDFlashTpLinear(
+                device, projectedContextHidden, allKvWeightIt->second,
+                projectedAllKv);
         }
         auto allKNormIt = weight.weight.find("dflash.all_k_norm.weight");
         const bool canFuseKvMaterialization =
@@ -29115,10 +29267,12 @@ namespace fastllm {
             Data normalized, attentionDynamic, attentionInput;
             RMSNorm(hiddenStates, weight[prefix + "input_layernorm.weight"],
                     dflashRmsNormEps, normalized);
-            Linear(normalized,
-                   weight[prefix +
-                          "attention_conv.kernel_projection.weight"],
-                   *GetEmptyData(), attentionDynamic);
+            Data attentionConvInput;
+            Copy(normalized, attentionConvInput);
+            RunDFlashTpLinear(
+                device, attentionConvInput,
+                weight[prefix + "attention_conv.kernel_projection.weight"],
+                attentionDynamic);
             dynamicConvolve(
                 normalized, attentionDynamic,
                 weight[prefix + "attention_conv.base_kernel"], 0,
@@ -29131,8 +29285,9 @@ namespace fastllm {
             if (mergedQkvIt != weight.weight.end()) {
                 const int qChannels = dflashHeads * dflashHeadDim;
                 const int kvChannels = dflashKvHeads * dflashHeadDim;
-                Linear(attentionInput, mergedQkvIt->second,
-                       *GetEmptyData(), mergedQkv);
+                RunDFlashTpLinear(
+                    device, attentionInput, mergedQkvIt->second,
+                    mergedQkv);
                 if (::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled(
                         "FASTLLM_CUDA_DFLASH_FUSED_QKV_PREPARE")) {
                     for (auto item : {
@@ -29260,9 +29415,10 @@ namespace fastllm {
                 {1, blockSize, dflashHeads * dflashHeadDim});
             ToDataType(attentionHeads, DataType::BFLOAT16);
             Data attentionOutput, convolvedAttention;
-            Linear(attentionHeads,
-                   weight[prefix + "self_attn.o_proj.weight"],
-                   *GetEmptyData(), attentionOutput);
+            RunDFlashTpLinear(
+                device, attentionHeads,
+                weight[prefix + "self_attn.o_proj.weight"],
+                attentionOutput);
             dynamicConvolve(
                 attentionOutput, attentionDynamic,
                 weight[prefix + "attention_conv.base_kernel"], 1,
@@ -29273,9 +29429,12 @@ namespace fastllm {
                     weight[prefix + "post_attention_layernorm.weight"],
                     dflashRmsNormEps, normalized);
             Data mlpDynamic, mlpInput;
-            Linear(normalized,
-                   weight[prefix + "mlp_conv.kernel_projection.weight"],
-                   *GetEmptyData(), mlpDynamic);
+            Data mlpConvInput;
+            Copy(normalized, mlpConvInput);
+            RunDFlashTpLinear(
+                device, mlpConvInput,
+                weight[prefix + "mlp_conv.kernel_projection.weight"],
+                mlpDynamic);
             dynamicConvolve(
                 normalized, mlpDynamic,
                 weight[prefix + "mlp_conv.base_kernel"], 0,
@@ -29295,8 +29454,8 @@ namespace fastllm {
                 Data gate, up, gateup;
                 bool fusedGateupPrepared = false;
                 if (gateupIt != weight.weight.end()) {
-                    RunDFlashGateupLinear(device, mlpInput,
-                                          gateupIt->second, gateup);
+                    RunDFlashTpLinear(device, mlpInput,
+                                      gateupIt->second, gateup);
                     if (::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled(
                             "FASTLLM_CUDA_DFLASH_FUSED_GATEUP_PREPARE")) {
                         ::fastllm::Qwen3CudaPrepareLocalOutput(gate, device);
@@ -29856,10 +30015,12 @@ namespace fastllm {
             RMSNorm(hiddenStates,
                     weight[prefix + "input_layernorm.weight"],
                     dflashRmsNormEps, normalized);
-            Linear(normalized,
-                   weight[prefix +
-                          "attention_conv.kernel_projection.weight"],
-                   *GetEmptyData(), attentionDynamic);
+            Data attentionConvInput;
+            Copy(normalized, attentionConvInput);
+            RunDFlashTpLinear(
+                device, attentionConvInput,
+                weight[prefix + "attention_conv.kernel_projection.weight"],
+                attentionDynamic);
             dynamicConvolve(
                 normalized, attentionDynamic,
                 weight[prefix + "attention_conv.base_kernel"], 0,
@@ -29872,8 +30033,9 @@ namespace fastllm {
             if (mergedQkvIt != weight.weight.end()) {
                 const int qChannels = dflashHeads * dflashHeadDim;
                 const int kvChannels = dflashKvHeads * dflashHeadDim;
-                Linear(attentionInput, mergedQkvIt->second,
-                       *GetEmptyData(), mergedQkv);
+                RunDFlashTpLinear(
+                    device, attentionInput, mergedQkvIt->second,
+                    mergedQkv);
                 if (::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled(
                         "FASTLLM_CUDA_DFLASH_FUSED_QKV_PREPARE")) {
                     for (auto item : {
@@ -30027,9 +30189,10 @@ namespace fastllm {
             }
 
             Data attentionOutput, convolvedAttention;
-            Linear(attentionHeads,
-                   weight[prefix + "self_attn.o_proj.weight"],
-                   *GetEmptyData(), attentionOutput);
+            RunDFlashTpLinear(
+                device, attentionHeads,
+                weight[prefix + "self_attn.o_proj.weight"],
+                attentionOutput);
             dynamicConvolve(
                 attentionOutput, attentionDynamic,
                 weight[prefix + "attention_conv.base_kernel"], 1,
@@ -30040,10 +30203,12 @@ namespace fastllm {
                     weight[prefix + "post_attention_layernorm.weight"],
                     dflashRmsNormEps, normalized);
             Data mlpDynamic, mlpInput;
-            Linear(normalized,
-                   weight[prefix +
-                          "mlp_conv.kernel_projection.weight"],
-                   *GetEmptyData(), mlpDynamic);
+            Data mlpConvInput;
+            Copy(normalized, mlpConvInput);
+            RunDFlashTpLinear(
+                device, mlpConvInput,
+                weight[prefix + "mlp_conv.kernel_projection.weight"],
+                mlpDynamic);
             dynamicConvolve(
                 normalized, mlpDynamic,
                 weight[prefix + "mlp_conv.base_kernel"], 0,
@@ -30063,7 +30228,7 @@ namespace fastllm {
                 Data gate, up, gateup;
                 bool fusedGateupPrepared = false;
                 if (gateupIt != weight.weight.end()) {
-                    RunDFlashGateupLinear(
+                    RunDFlashTpLinear(
                         device, mlpInput, gateupIt->second, gateup);
                     if (::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled(
                             "FASTLLM_CUDA_DFLASH_FUSED_GATEUP_PREPARE")) {

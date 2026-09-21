@@ -365,8 +365,12 @@ class FastLLmCompletion:
       return self._is_qwen3_5_model() or self._is_qwen4_exp_model()
 
   def _is_qwen3_5_reasoning_response(self, enable_thinking: bool) -> bool:
-      return (enable_thinking and self._is_qwen_reasoning_model()
-              and not getattr(self.model, "force_chat_template", False))
+      # A user-supplied --chat_template (force_chat_template) must not disable
+      # reasoning separation: the official Qwen3.5 templates still emit
+      # <think>...</think>, so reasoning_content can be split out exactly like
+      # the built-in path. Without this, --enable_thinking leaks </think> into
+      # message.content.
+      return enable_thinking and self._is_qwen_reasoning_model()
 
   def _is_dots3_note_model(self) -> bool:
       try:
@@ -3171,6 +3175,59 @@ class FastLLmCompletion:
           enable_thinking = request.reasoning_effort != "none"
       if request.chat_template_kwargs and "enable_thinking" in request.chat_template_kwargs:
           enable_thinking = bool(request.chat_template_kwargs["enable_thinking"])
+      media_count = len(getattr(media, "images", []) or [])
+      logging.info(
+          "Multimodal request: images=%d videos=%d (speculation is skipped "
+          "server-side for multimodal requests).",
+          media_count, len(getattr(media, "videos", []) or []))
+      # Note: thinking is intentionally left enabled for multimodal requests.
+      # With speculation disabled server-side (see Qwen35MTPForward), keeping
+      # thinking lets the model re-examine the image and override a wrong
+      # earlier answer in the conversation history, matching vLLM behavior.
+      # Forcing thinking off makes it copy the stale history answer instead.
+      if media_count:
+          preview = []
+          for msg in messages:
+              content = msg.get("content")
+              if isinstance(content, list):
+                  pieces = []
+                  for part in content:
+                      if (part.get("type") in ("image_url", "input_image")
+                              or "image_url" in part or "image" in part):
+                          pieces.append("IMG")
+                      else:
+                          pieces.append(
+                              "T:" + (part.get("text") or "")[:20].replace("\n", " "))
+                  preview.append("%s[%s]" % (msg.get("role"), "|".join(pieces)))
+              else:
+                  preview.append("%s(T:%d)" % (msg.get("role"), len(content or "")))
+          sizes = []
+          for image in getattr(media, "images", []) or []:
+              try:
+                  sizes.append("%dx%d" % image.size)
+              except Exception:
+                  sizes.append("?")
+          logging.info(
+              "Multimodal detail: effort=%s temp=%s top_k=%s enable_thinking=%s "
+              "image_sizes=%s msgs=%s",
+              request.reasoning_effort, temperature, top_k, enable_thinking,
+              ",".join(sizes), " ; ".join(preview))
+          dump_dir = os.environ.get("FASTLLM_VISION_DUMP_DIR", "")
+          if dump_dir:
+              try:
+                  os.makedirs(dump_dir, exist_ok=True)
+                  stamp = time.strftime("%H%M%S")
+                  for idx, image in enumerate(media.images):
+                      image.save(os.path.join(
+                          dump_dir, "img_%s_%d.png" % (stamp, idx)))
+                  with open(os.path.join(
+                          dump_dir, "req_%s.json" % stamp), "w") as handle:
+                      json.dump(request.model_dump(), handle,
+                                ensure_ascii=False, default=str)
+                  logging.info("Vision images/request dumped to %s (stamp %s)",
+                               dump_dir, stamp)
+              except Exception:
+                  logging.exception("Vision image dump failed")
       try:
           thinking_effort = self._resolve_kimi_k3_reasoning_effort(request)
           if thinking_effort is None:

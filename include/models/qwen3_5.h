@@ -484,8 +484,8 @@ namespace fastllm {
         int DFlashDraftsPerStep() const;
         void PrepareDFlashWeightsForDevice(int device);
         void PrepareDFlashBackboneTensorParallelWeights(int device);
-        void RunDFlashGateupLinear(int device, Data &input,
-                                   Data &linearWeight, Data &output);
+        void RunDFlashTpLinear(int device, Data &input,
+                               Data &linearWeight, Data &output);
         bool RunDFlashTensorParallelMlp(int device, Data &input,
                                        Data &gateupWeight,
                                        Data &downWeight, Data &output);
