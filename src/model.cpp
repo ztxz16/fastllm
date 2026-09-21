@@ -1511,6 +1511,114 @@ namespace fastllm {
             fclose(file);
         }
 
+        // Signed symmetric int8 sources from compressed-tensors:
+        //   * ``int-quantized`` W8A8: raw I8 [out, in] plus ``weight_scale``;
+        //   * ``pack-quantized`` W8A16: I32 [out, in / 4] words holding four
+        //     int8 values that are stored offset by +128, plus
+        //     ``weight_scale``/``weight_shape``.
+        // ``dstType`` selects the payload FastLLM keeps in memory:
+        //   * INT8_PERCHANNEL_S8 / INT8_PERCHANNEL_S8_W8A16: signed int8 payload
+        //     with per-output-channel FP32 scales in scalesBuffer;
+        //   * FLOAT16/BFLOAT16/FLOAT32: dequantized payload without scales.
+        // The caller must have materialized ``scale`` as FLOAT32 already.
+        void CreateBufferWithInt8PerChannelScale(SafeTensorItem &scale,
+                                                 DataType dstType,
+                                                 bool packed,
+                                                 SafeTensorItem *weightShape = nullptr) {
+            AssertInFastLLM(scale.buffer != nullptr,
+                            "CreateBufferWithInt8PerChannelScale error: scale buffer is empty.");
+            AssertInFastLLM(this->shape.size() == 2,
+                            "CreateBufferWithInt8PerChannelScale error: weight should be 2D.");
+            long long rows = this->shape[0], packedCols = this->shape[1];
+            long long columns = packed ? packedCols * 4 : packedCols;
+            AssertInFastLLM(rows > 0 && columns > 0,
+                            "CreateBufferWithInt8PerChannelScale error: empty weight.");
+            if (packed) {
+                AssertInFastLLM(weightShape != nullptr &&
+                                weightShape->dtype == "I64" &&
+                                weightShape->len == 2,
+                                "CreateBufferWithInt8PerChannelScale error: packed int8 requires weight_shape.");
+                int64_t originalShape[2] = {0, 0};
+                weightShape->ReadRawData(originalShape, sizeof(originalShape));
+                AssertInFastLLM(originalShape[0] == rows &&
+                                originalShape[1] == columns,
+                                "CreateBufferWithInt8PerChannelScale error: weight_shape does not match packed weight.");
+                AssertInFastLLM(this->dtype == "I32" &&
+                                this->bytes == (size_t)rows * packedCols * sizeof(uint32_t),
+                                "CreateBufferWithInt8PerChannelScale error: packed weight dtype/byte mismatch.");
+            } else {
+                AssertInFastLLM(this->dtype == "I8" &&
+                                this->bytes == (size_t)rows * columns,
+                                "CreateBufferWithInt8PerChannelScale error: raw weight dtype/byte mismatch.");
+            }
+            AssertInFastLLM(scale.len == (uint64_t)rows,
+                            "CreateBufferWithInt8PerChannelScale error: scale length mismatch.");
+
+            ClearBuffer();
+            FILE *file = fopen(this->fileName.c_str(), "rb");
+            AssertInFastLLM(file != nullptr,
+                            "CreateBufferWithInt8PerChannelScale error: cannot open weight file.");
+#if defined(_WIN32) || defined(_WIN64)
+            _fseeki64(file, this->data_offsets[0], 0);
+#else
+            fseek(file, this->data_offsets[0], 0);
+#endif
+            std::vector<uint8_t> raw(this->bytes);
+            const size_t readBytes = fread(raw.data(), 1, this->bytes, file);
+            fclose(file);
+            AssertInFastLLM(readBytes == this->bytes,
+                            "CreateBufferWithInt8PerChannelScale error: read weight failed.");
+
+            const float *sourceScales = (const float*)scale.buffer;
+            const bool keepInt8 = dstType == DataType::INT8_PERCHANNEL_S8 ||
+                                  dstType == DataType::INT8_PERCHANNEL_S8_W8A16;
+            int64_t unit = 1;
+            if (!keepInt8) {
+                AssertInFastLLM(dstType == DataType::FLOAT16 ||
+                                dstType == DataType::BFLOAT16 ||
+                                dstType == DataType::FLOAT32,
+                                "CreateBufferWithInt8PerChannelScale error: unsupported destination type.");
+                unit = dstType == DataType::FLOAT32 ? 4 : 2;
+            }
+            buffer = new uint8_t[(size_t)rows * columns * unit];
+            auto sourceValue = [&](long long index) -> int32_t {
+                if (!packed) {
+                    return (int32_t)(int8_t)raw[index];
+                }
+                uint32_t word = 0;
+                memcpy(&word, raw.data() + (index / 4) * sizeof(uint32_t),
+                       sizeof(word));
+                // compressed-tensors stores int8 values offset by +128.
+                return (int32_t)((word >> (8 * (index % 4))) & 0xFF) - 128;
+            };
+            for (long long row = 0; row < rows; row++) {
+                const float rowScale = sourceScales[row];
+                for (long long column = 0; column < columns; column++) {
+                    const int32_t value = sourceValue(row * columns + column);
+                    if (keepInt8) {
+                        buffer[row * columns + column] = (uint8_t)(int8_t)value;
+                    } else if (dstType == DataType::FLOAT16) {
+                        uint16_t halfValue = float_to_half(rowScale * (float)value);
+                        memcpy(buffer + (row * columns + column) * 2,
+                               &halfValue, sizeof(halfValue));
+                    } else if (dstType == DataType::BFLOAT16) {
+                        uint16_t bf16Value = Float32ToBFloat16RNEBits(
+                            rowScale * (float)value);
+                        memcpy(buffer + (row * columns + column) * 2,
+                               &bf16Value, sizeof(bf16Value));
+                    } else {
+                        float fp32Value = rowScale * (float)value;
+                        memcpy(buffer + (row * columns + column) * 4,
+                               &fp32Value, sizeof(fp32Value));
+                    }
+                }
+            }
+            if (keepInt8) {
+                scalesBuffer = new float[rows];
+                memcpy(scalesBuffer, sourceScales, rows * sizeof(float));
+            }
+        }
+
         void ReadRawData(void *output, size_t outputBytes) const {
             AssertInFastLLM(
                 output != nullptr && outputBytes == this->bytes,
@@ -1930,6 +2038,154 @@ namespace fastllm {
         return DataType::INT4_GROUP;
     }
 
+    struct PackedInt8PerChannelInfo {
+        std::string scaleTensorName;
+        std::string shapeTensorName;
+        int rows = 0;
+        int columns = 0;
+    };
+
+    // Cache the tiny I64 ``weight_shape`` payload so repeated quant-tensor
+    // probes during model load do not reopen the safetensors file for the same
+    // tensor.  Keyed by file and offset so entries never leak across models.
+    static void ReadCachedWeightShape(const SafeTensorItem &shape, int64_t out[2]) {
+        static std::mutex cacheMutex;
+        static std::map<std::string, std::pair<int64_t, int64_t>> cache;
+        const std::string key =
+            shape.fileName + "#" + std::to_string(shape.data_offsets[0]);
+        std::lock_guard<std::mutex> lock(cacheMutex);
+        auto it = cache.find(key);
+        if (it == cache.end()) {
+            int64_t values[2] = {0, 0};
+            shape.ReadRawData(values, sizeof(values));
+            it = cache.emplace(key, std::make_pair(values[0], values[1])).first;
+        }
+        out[0] = it->second.first;
+        out[1] = it->second.second;
+    }
+
+    // compressed-tensors ``pack-quantized`` 8-bit INT weights: an I32
+    // ``weight_packed`` [out, in / 4] tensor whose words hold four int8 values
+    // (element j occupies bits [8 * j, 8 * j + 8)), a ``weight_scale`` with one
+    // value per output channel and an I64 ``weight_shape`` [out, in] that
+    // records the unpacked shape.  The stored bytes are offset by +128, so the
+    // loader converts them back to signed int8.
+    static bool TryGetPackedInt8PerChannelInfo(const SafeTensors &safeTensors,
+                                               const std::string &name,
+                                               PackedInt8PerChannelInfo &info) {
+        info = PackedInt8PerChannelInfo();
+        auto weightIt = safeTensors.itmeDict.find(name);
+        if (weightIt == safeTensors.itmeDict.end() ||
+            weightIt->second.dtype != "I32" ||
+            !StringEndWith(name, ".weight_packed") ||
+            weightIt->second.shape.size() != 2) {
+            return false;
+        }
+        const std::string prefix =
+            name.substr(0, name.size() - strlen(".weight_packed"));
+        auto scaleIt = safeTensors.itmeDict.find(prefix + ".weight_scale");
+        auto shapeIt = safeTensors.itmeDict.find(prefix + ".weight_shape");
+        if (scaleIt == safeTensors.itmeDict.end() ||
+            shapeIt == safeTensors.itmeDict.end() ||
+            safeTensors.itmeDict.find(prefix + ".weight_zero_point") !=
+                safeTensors.itmeDict.end() ||
+            safeTensors.itmeDict.find(prefix + ".weight_g_idx") !=
+                safeTensors.itmeDict.end()) {
+            return false;
+        }
+        const SafeTensorItem &weight = weightIt->second;
+        const SafeTensorItem &scale = scaleIt->second;
+        const SafeTensorItem &shape = shapeIt->second;
+        if ((scale.dtype != "F32" && scale.dtype != "F16" &&
+             scale.dtype != "BF16") ||
+            shape.dtype != "I64" || shape.shape.size() != 1 ||
+            shape.shape[0] != 2 || shape.bytes != 2 * sizeof(int64_t)) {
+            return false;
+        }
+        const uint64_t rows = weight.shape[0];
+        const uint64_t packedColumns = weight.shape[1];
+        if (rows == 0 || packedColumns == 0 ||
+            rows > (uint64_t)INT_MAX ||
+            packedColumns > (uint64_t)INT_MAX / 4 ||
+            weight.bytes != rows * packedColumns * sizeof(uint32_t) ||
+            scale.shape.size() < 2 || scale.shape[0] != rows ||
+            scale.shape.back() != 1 ||
+            scale.len != rows * scale.shape.back()) {
+            return false;
+        }
+        int64_t originalShape[2] = {0, 0};
+        ReadCachedWeightShape(shape, originalShape);
+        const uint64_t columns = packedColumns * 4;
+        if (originalShape[0] != (int64_t)rows ||
+            originalShape[1] != (int64_t)columns) {
+            return false;
+        }
+        info.scaleTensorName = prefix + ".weight_scale";
+        info.shapeTensorName = prefix + ".weight_shape";
+        info.rows = (int)rows;
+        info.columns = (int)columns;
+        return true;
+    }
+
+    struct RawInt8PerChannelInfo {
+        std::string scaleTensorName;
+        int rows = 0;
+        int columns = 0;
+    };
+
+    // compressed-tensors ``int-quantized`` 8-bit INT weights: a raw signed I8
+    // ``weight`` [out, in] tensor plus a ``weight_scale`` with one value per
+    // output channel.  This is the W8A8 layout whose activations are quantized
+    // dynamically per token.
+    static bool TryGetRawInt8PerChannelInfo(const SafeTensors &safeTensors,
+                                            const std::string &name,
+                                            RawInt8PerChannelInfo &info) {
+        info = RawInt8PerChannelInfo();
+        auto weightIt = safeTensors.itmeDict.find(name);
+        if (weightIt == safeTensors.itmeDict.end() ||
+            weightIt->second.dtype != "I8" ||
+            !StringEndWith(name, ".weight") ||
+            weightIt->second.shape.size() < 2) {
+            return false;
+        }
+        const std::string prefix =
+            name.substr(0, name.size() - strlen(".weight"));
+        auto scaleIt = safeTensors.itmeDict.find(prefix + ".weight_scale");
+        if (scaleIt == safeTensors.itmeDict.end()) {
+            return false;
+        }
+        const SafeTensorItem &weight = weightIt->second;
+        const SafeTensorItem &scale = scaleIt->second;
+        if (safeTensors.itmeDict.find(prefix + ".weight_zero_point") !=
+                safeTensors.itmeDict.end() ||
+            safeTensors.itmeDict.find(prefix + ".weight_g_idx") !=
+                safeTensors.itmeDict.end() ||
+            (scale.dtype != "F32" && scale.dtype != "F16" &&
+             scale.dtype != "BF16") ||
+            scale.shape.empty() || scale.shape.back() != 1) {
+            return false;
+        }
+        int64_t rows = 1;
+        for (int i = 0; i + 1 < (int)weight.shape.size(); i++) {
+            rows *= (int64_t)weight.shape[i];
+        }
+        const int64_t columns = (int64_t)weight.shape.back();
+        int64_t scaleRows = 1;
+        for (int i = 0; i + 1 < (int)scale.shape.size(); i++) {
+            scaleRows *= (int64_t)scale.shape[i];
+        }
+        if (rows <= 0 || rows > INT_MAX || columns <= 0 ||
+            columns > INT_MAX || scaleRows != rows ||
+            scale.len != (uint64_t)(rows * scale.shape.back()) ||
+            weight.bytes != (uint64_t)(rows * columns)) {
+            return false;
+        }
+        info.scaleTensorName = prefix + ".weight_scale";
+        info.rows = (int)rows;
+        info.columns = (int)columns;
+        return true;
+    }
+
     struct PackedInt4GroupInfo {
         bool isAffine = false;
         int groupCnt = -1;
@@ -1943,6 +2199,12 @@ namespace fastllm {
             const SafeTensors &safeTensors, const std::string &name,
             PackedInt4GroupInfo &info) {
         info = PackedInt4GroupInfo();
+        PackedInt8PerChannelInfo packedInt8Info;
+        if (TryGetPackedInt8PerChannelInfo(safeTensors, name, packedInt8Info)) {
+            // 8-bit pack-quantized tensors have four int8 values per I32 word,
+            // not eight int4 values; never reinterpret them as INT4_GROUP.
+            return false;
+        }
         if (TryGetPackedAffineInt4GroupCnt(
                 safeTensors, name, info.groupCnt)) {
             const std::string prefix =
@@ -1998,10 +2260,17 @@ namespace fastllm {
         auto isQuantTensor = [&](const std::string &candidate) {
             auto it = safeTensors.itmeDict.find(candidate);
             PackedInt4GroupInfo packedInt4Info;
+            PackedInt8PerChannelInfo packedInt8Info;
+            RawInt8PerChannelInfo rawInt8Info;
             return it != safeTensors.itmeDict.end() &&
-                   (it->second.dtype == "F8_E4M3" || IsPackedFP4StorageDType(it->second.dtype) ||
+                   (it->second.dtype == "F8_E4M3" ||
+                    IsPackedFP4StorageDType(it->second.dtype) ||
                     TryGetPackedInt4GroupInfo(
-                        safeTensors, candidate, packedInt4Info));
+                        safeTensors, candidate, packedInt4Info) ||
+                    TryGetPackedInt8PerChannelInfo(
+                        safeTensors, candidate, packedInt8Info) ||
+                    TryGetRawInt8PerChannelInfo(
+                        safeTensors, candidate, rawInt8Info));
         };
         if (StringEndWith(name, ".weight_scale")) {
             std::string prefix = name.substr(0, name.size() - strlen(".weight_scale"));
@@ -2032,9 +2301,13 @@ namespace fastllm {
             std::string prefix =
                 name.substr(0, name.size() - strlen(".weight_shape"));
             PackedInt4GroupInfo packedInt4Info;
+            PackedInt8PerChannelInfo packedInt8Info;
             return TryGetPackedInt4GroupInfo(
-                safeTensors, prefix + ".weight_packed",
-                packedInt4Info);
+                       safeTensors, prefix + ".weight_packed",
+                       packedInt4Info) ||
+                   TryGetPackedInt8PerChannelInfo(
+                       safeTensors, prefix + ".weight_packed",
+                       packedInt8Info);
         }
         if (StringEndWith(name, "_scale_inv")) {
             return isQuantTensor(name.substr(0, name.size() - strlen("_scale_inv")));
@@ -4807,11 +5080,21 @@ namespace fastllm {
             PackedInt4GroupInfo packedInt4Info;
             bool isPackedInt4Group = TryGetPackedInt4GroupInfo(
                 safeTensors, tensorName, packedInt4Info);
+            PackedInt8PerChannelInfo packedInt8Info;
+            const bool isPackedInt8Source =
+                TryGetPackedInt8PerChannelInfo(safeTensors, tensorName,
+                                               packedInt8Info);
+            RawInt8PerChannelInfo rawInt8Info;
+            const bool isRawInt8Source =
+                !isPackedInt8Source &&
+                TryGetRawInt8PerChannelInfo(safeTensors, tensorName,
+                                            rawInt8Info);
             auto oriDataType = DataType::FLOAT32;
             for (auto &it : tensorMap[tensorName]) {
                 std::string weightName = it.first;
                 allWeightNames.insert(weightName);
                 auto dataType = it.second;
+                const DataType requestedDataType = it.second;
                 int ggmlType = -1;
                 if (canApplyDtypeRule(weightName, dataType) &&
                     dtypeRules.size() > 0) {
@@ -4856,9 +5139,30 @@ namespace fastllm {
                 if (tensor.dtype == "I64") {
                     dataType = DataType::INT32PARAM;
                 }
+                if (isPackedInt8Source || isRawInt8Source) {
+                    // compressed-tensors INT8 sources keep their signed
+                    // per-channel layout when the caller asked for an auto
+                    // linear dtype; an explicit floating-point request
+                    // dequantizes while loading instead.
+                    if (requestedDataType >= DataType::DATA_AUTO_NONE) {
+                        dataType = isPackedInt8Source
+                            ? DataType::INT8_PERCHANNEL_S8_W8A16
+                            : DataType::INT8_PERCHANNEL_S8;
+                    } else if (dataType == DataType::FLOAT32 ||
+                               dataType == DataType::FLOAT16 ||
+                               dataType == DataType::BFLOAT16) {
+                        // keep the resolved floating-point target
+                    } else {
+                        dataType = DataType::FLOAT16;
+                    }
+                }
                 if (it.second == DATA_AUTO_CONV) {
                     std::vector <int> realShape = tensor.intShape;
                     std::swap(realShape[0], realShape[1]);
+                    model->weight.AddEmptyWeight(weightName, realShape, dataType);
+                } else if (isPackedInt8Source) {
+                    std::vector<int> realShape = tensor.intShape;
+                    realShape.back() *= 4;
                     model->weight.AddEmptyWeight(weightName, realShape, dataType);
                 } else if (IsPackedFP4Tensor(safeTensors, tensorName)) {
                     std::vector<int> realShape = tensor.intShape;
@@ -5007,11 +5311,21 @@ namespace fastllm {
                             TryGetPackedInt4GroupInfo(
                                 safeTensors, tensorName,
                                 packedInt4Info);
+                        PackedInt8PerChannelInfo packedInt8Info;
+                        const bool isPackedInt8Source =
+                            TryGetPackedInt8PerChannelInfo(
+                                safeTensors, tensorName, packedInt8Info);
+                        RawInt8PerChannelInfo rawInt8Info;
+                        const bool isRawInt8Source =
+                            !isPackedInt8Source &&
+                            TryGetRawInt8PerChannelInfo(
+                                safeTensors, tensorName, rawInt8Info);
 
                         for (auto &it : tensorMap[tensorName]) {
                             auto oriDataType = DataType::FLOAT32;
                             std::string weightName = it.first;
                             auto dataType = it.second;
+                            const DataType requestedDataType = it.second;
                             int ggmlType = -1;
 
                             bool isMoeLinear = model->moeLinears.find(weightName) != model->moeLinears.end();
@@ -5091,6 +5405,25 @@ namespace fastllm {
                                 scaleTensorName =
                                     packedInt4Info.scaleTensorName;
                             }
+                            if (isPackedInt8Source || isRawInt8Source) {
+                                // compressed-tensors INT8 source. Keep signed
+                                // per-channel int8 for auto linear requests,
+                                // otherwise dequantize to the requested
+                                // floating-point type while loading.
+                                if (requestedDataType >= DataType::DATA_AUTO_NONE) {
+                                    dataType = isPackedInt8Source
+                                        ? DataType::INT8_PERCHANNEL_S8_W8A16
+                                        : DataType::INT8_PERCHANNEL_S8;
+                                } else if (dataType != DataType::FLOAT32 &&
+                                           dataType != DataType::FLOAT16 &&
+                                           dataType != DataType::BFLOAT16) {
+                                    dataType = DataType::FLOAT16;
+                                }
+                                oriDataType = dataType;
+                                scaleTensorName = isPackedInt8Source
+                                    ? packedInt8Info.scaleTensorName
+                                    : rawInt8Info.scaleTensorName;
+                            }
 
                             if (tensor.dtype == "I32" && isAwqModel && StringEndWith(tensorName, "qweight")) {
                                 std::string name = tensorName.substr(0, tensorName.size() - strlen("qweight"));
@@ -5105,8 +5438,11 @@ namespace fastllm {
                                 }
                             }
 
-                            WeightType diskLazyWeightType = GetDiskLazyWeightType(
-                                model, weightName, tensor.bytes);
+                            WeightType diskLazyWeightType =
+                                (isPackedInt8Source || isRawInt8Source)
+                                    ? WeightType::NONE
+                                    : GetDiskLazyWeightType(
+                                          model, weightName, tensor.bytes);
                             bool diskLazyWeight = diskLazyWeightType != WeightType::NONE;
                             if (diskLazyWeight) {
                                 if (packedInt4Info.isAffine) {
@@ -5169,6 +5505,19 @@ namespace fastllm {
                                     scaleTensor.ClearBuffer();
                                 } else if (scaleTensorName == "") {
                                     tensor.CreateBuffer(oriDataType);
+                                } else if (isPackedInt8Source || isRawInt8Source) {
+                                    auto &scaleTensor =
+                                        safeTensors.itmeDict[scaleTensorName];
+                                    scaleTensor.CreateBuffer(DataType::FLOAT32);
+                                    SafeTensorItem *weightShapeTensor = nullptr;
+                                    if (isPackedInt8Source) {
+                                        weightShapeTensor = &safeTensors.itmeDict[
+                                            packedInt8Info.shapeTensorName];
+                                    }
+                                    tensor.CreateBufferWithInt8PerChannelScale(
+                                        scaleTensor, oriDataType,
+                                        isPackedInt8Source, weightShapeTensor);
+                                    scaleTensor.ClearBuffer();
                                 } else if(!isAwqModel) {
                                     auto &scaleTensor = safeTensors.itmeDict[scaleTensorName];
                                     AssertInFastLLM(scaleTensor.dtype == "F32" || scaleTensor.dtype == "BF16" ||

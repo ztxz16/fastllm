@@ -385,6 +385,7 @@ if (USE_CUDA)
         src/devices/cuda/moe/fastllm-moe-cache.cu
         src/devices/cuda/moe/fastllm-moe-vllm-marlin.cu
         src/devices/cuda/linear/fastllm-linear-int8.cu
+        src/devices/cuda/linear/fastllm-linear-int8perchannel.cu
         src/devices/cuda/linear/fastllm-linear-int4.cu
         src/devices/cuda/linear/fastllm-linear-int4group.cu
         src/devices/cuda/linear/fastllm-marlin.cu
@@ -1183,6 +1184,20 @@ if (UNIT_TEST)
         target_include_directories(ncclOddTpRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         add_test(NAME ncclOddTp COMMAND ncclOddTpRegression)
         set_tests_properties(ncclOddTp PROPERTIES LABELS cuda TIMEOUT 180 SKIP_RETURN_CODE 77)
+
+        add_executable(cudaInt8PerChannelRegression test/ops/cudaInt8PerChannelRegression.cu)
+        target_link_libraries(cudaInt8PerChannelRegression fastllm)
+        target_include_directories(cudaInt8PerChannelRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME cudaInt8PerChannel COMMAND cudaInt8PerChannelRegression)
+        set_tests_properties(cudaInt8PerChannel PROPERTIES LABELS cuda TIMEOUT 600 SKIP_RETURN_CODE 77)
+
+        add_executable(qwen38Int8PerChannelCheck test/ops/qwen38Int8PerChannelCheck.cpp)
+        target_link_libraries(qwen38Int8PerChannelCheck fastllm)
+        add_test(NAME qwen38Int8PerChannelModel COMMAND qwen38Int8PerChannelCheck
+                 "$ENV{FASTLLM_INT8_MODEL_DIR}")
+        set_tests_properties(qwen38Int8PerChannelModel PROPERTIES
+            LABELS "cuda;multigpu" TIMEOUT 1800 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+
         if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
             add_executable(ncclInitRegression test/ops/ncclInitRegression.cpp)
             target_link_libraries(ncclInitRegression PRIVATE fastllm ${CMAKE_DL_LIBS})
@@ -1198,6 +1213,7 @@ if (UNIT_TEST)
                     LABELS "cuda;multigpu" TIMEOUT 20 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
             endforeach()
         endif()
+
         add_executable(tp2WHT6AllReduceRegression test/ops/tp2WHT6AllReduceRegression.cu)
         target_include_directories(tp2WHT6AllReduceRegression PRIVATE include)
         target_link_libraries(tp2WHT6AllReduceRegression PRIVATE nccl Threads::Threads)

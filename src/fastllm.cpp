@@ -570,6 +570,8 @@ namespace fastllm {
         {DataType::FP8_E4M3_BLOCK_128, {"fp8_e4m3_block_128"}}, {DataType::AWQ_4BIT_128, {"awq_4bit_128"}},
         {DataType::INT4_PERCHANNEL, {"int4_perchannel"}}, {DataType::FP8_E4M3_PERCHANNEL, {"fp8_e4m3_perchannel"}},
         {DataType::INT4_GROUP128, {"int4_group128"}}, {DataType::INT8_PERCHANNEL, {"int8_perchannel"}},
+        {DataType::INT8_PERCHANNEL_S8, {"int8_perchannel_s8"}},
+        {DataType::INT8_PERCHANNEL_S8_W8A16, {"int8_perchannel_s8_w8a16"}},
         {DataType::NVFP4_BLOCK_16, {"nvfp4_block_16"}},
         {DataType::NVFP4_BLOCK_16_PLANAR, {"nvfp4_block_16_planar"}},
         {DataType::NVFP4_BLOCK_16_E4M3_PACKED, {"nvfp4_block_16_e4m3_packed"}},
@@ -807,6 +809,11 @@ namespace fastllm {
             return rows * (columns / 2 + 2 * sizeof(float));
         } else if (type == DataType::INT8_PERCHANNEL) {
             return rows * (columns + 2 * sizeof(float));
+        } else if (type == DataType::INT8_PERCHANNEL_S8 ||
+                   type == DataType::INT8_PERCHANNEL_S8_W8A16) {
+            // Plain signed int8 weights; per-output-channel scales live in
+            // Data::scales and are not part of the tensor byte stream.
+            return rows * columns;
         } else if (type == DataType::INT4_GROUP128) {
             rows *= (columns / 128);
             columns = 128;
@@ -1609,6 +1616,24 @@ namespace fastllm {
                     data.scales.resize(ks * ms);
                     memcpy(data.scales.data(), oriScales, ks * ms * sizeof(float));
                 }
+            } else if (dataType == DataType::INT8_PERCHANNEL_S8 ||
+                       dataType == DataType::INT8_PERCHANNEL_S8_W8A16) {
+                // Symmetric signed int8 with one FP32 scale per output channel.
+                // The scale vector is device-independent metadata; the payload
+                // is a plain [out, in] row-major int8 tensor.
+                int rows = 1;
+                for (int i = 0; i + 1 < (int)this->dims.size(); i++) {
+                    rows *= this->dims[i];
+                }
+                AssertInFastLLM(oriScales != nullptr,
+                                "INT8_PERCHANNEL_S8 requires per-channel scales.\n");
+                data.perChannelAxis = 0;
+                data.group = -1;
+                data.groupCnt = -1;
+                data.scales.resize(rows);
+                memcpy(data.scales.data(), oriScales, rows * sizeof(float));
+                data.mins.clear();
+                data.zeros.clear();
             }
         } else if (oriDataType == DataType::BFLOAT16
                 && dataType == DataType::FLOAT16) {
@@ -1867,7 +1892,9 @@ namespace fastllm {
             this->unitSize = 2;
             this->unitSizeDiv = 1;
         } else if (this->dataType == DataType::INT8 || this->dataType == DataType::FP8_E4M3 ||
-                   this->dataType == DataType::FP8_E4M3_PERCHANNEL) {
+                   this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
+                   this->dataType == DataType::INT8_PERCHANNEL_S8 ||
+                   this->dataType == DataType::INT8_PERCHANNEL_S8_W8A16) {
             this->unitSize = 1;
             this->unitSizeDiv = 1;
         } else if (this->dataType == DataType::NVFP4) {
@@ -3284,6 +3311,13 @@ namespace fastllm {
         } else if (this->dataType == DataType::INT4_PERCHANNEL ||
                     this->dataType == DataType::INT8_PERCHANNEL) {
             return DataType::INF_INT8_PERCHANNEL;
+        } else if (this->dataType == DataType::INT8_PERCHANNEL_S8 ||
+                   this->dataType == DataType::INT8_PERCHANNEL_S8_W8A16) {
+            // CUDA-only activation format: the FP16/BF16 hidden state is
+            // consumed directly (prefill quantizes it per token inside the
+            // device op). Keep a defined value so graph/device queries do not
+            // fail before the CUDA dispatch decides whether it can run.
+            return DataType::FLOAT16;
         } else if (this->dataType == DataType::INT4_GROUP128) {
             return DataType::INF_INT8_GROUP128;
         } else if (this->dataType == DataType::INT4_GROUP32) {
