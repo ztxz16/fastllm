@@ -839,6 +839,12 @@ if (UNIT_TEST)
     endif()
 
     if (USE_CUDA AND NOT USE_ROCM)
+        add_executable(cuda_data_transfer_test test/basic/test_cuda_data_transfer.cpp)
+        target_link_libraries(cuda_data_transfer_test PRIVATE fastllm)
+        target_include_directories(cuda_data_transfer_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME cuda_data_transfer COMMAND cuda_data_transfer_test)
+        set_tests_properties(cuda_data_transfer PROPERTIES LABELS cuda SKIP_RETURN_CODE 77)
+
         if (NOT WIN32)
             add_executable(cuda_swiglu_fp8_test test/basic/test_cuda_swiglu_fp8.cpp)
             target_link_libraries(cuda_swiglu_fp8_test PRIVATE fastllm)

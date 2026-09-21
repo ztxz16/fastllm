@@ -2292,7 +2292,11 @@ namespace fastllm {
             // every request and layer, which is especially expensive during
             // batched prefill.
             if (v == 0.0f) {
-                FastllmCudaMemset0(this->cudaData, this->expansionBytes);
+                const uint64_t bytes = this->expansionDims.empty() &&
+                    !this->isModelWeight && !this->isKVCache
+                    ? std::min(this->GetBytes(), this->expansionBytes)
+                    : this->expansionBytes;
+                FastllmCudaMemset0(this->cudaData, bytes);
             } else if (this->dataType == DataType::FLOAT32) {
                 std::vector <float> f = std::vector <float> (Count(0), v);
                 FastllmCudaCopyFromHostToDevice(cudaData, f.data(), Count(0) * sizeof(float));
@@ -2787,6 +2791,16 @@ namespace fastllm {
 
         if (this->expansionBytes != 0) {
 #ifdef USE_CUDA
+            // Reused scratch tensors can shrink after prefill. Keep their
+            // allocation, but transfer only the current tensor, not the
+            // largest batch ever allocated. Explicitly expanded storage and
+            // persistent weights/KV caches retain their full-copy semantics.
+            auto bytesToCopy = [&]() -> uint64_t {
+                return this->expansionDims.empty() &&
+                    !this->isModelWeight && !this->isKVCache
+                    ? std::min(this->GetBytes(), this->expansionBytes)
+                    : this->expansionBytes;
+            };
             if (this->dataDevice == DataDevice::CPU) {
                 if (device == DataDevice::CUDA) {
                     int destDevice = deviceIds.size() == 0 ? FastllmCudaGetDevice() : deviceIds[0];
@@ -2804,12 +2818,13 @@ namespace fastllm {
                         }
                     }
                     if (copyData) {
+                        const uint64_t copyBytes = bytesToCopy();
                         uint8_t *cpuData = this->cpuData;
                         bool ownedCpuDataCopy = false;
 #ifdef USE_MMAP
                         if (this->cpuData != nullptr && this->mapFile != nullptr) {
-                            cpuData = new uint8_t[expansionBytes];
-                            memcpy(cpuData, this->cpuData, expansionBytes);
+                            cpuData = new uint8_t[copyBytes];
+                            memcpy(cpuData, this->cpuData, copyBytes);
                             ownedCpuDataCopy = true;
                         }
 #endif
@@ -2820,7 +2835,7 @@ namespace fastllm {
                         }
 
                         if (cpuData != nullptr) {
-                            FastllmCudaCopyFromHostToDevice(this->cudaData, cpuData, expansionBytes);
+                            FastllmCudaCopyFromHostToDevice(this->cudaData, cpuData, copyBytes);
                         } else if (!this->numasData.empty() && this->dims.size() == 2) {
                             int numaCnt = this->numasData.size();
                             int k = this->dims[0], m = this->dims[1];
@@ -2866,7 +2881,7 @@ namespace fastllm {
                         this->cpuData = new uint8_t[expansionBytes];
                     }
                     if (copyData) {
-                        FastllmCudaCopyFromDeviceToHost(this->cpuData, this->cudaData, expansionBytes);
+                        FastllmCudaCopyFromDeviceToHost(this->cpuData, this->cudaData, bytesToCopy());
                     }
 
                     if (this->isModelWeight || this->isKVCache) {
@@ -2888,7 +2903,7 @@ namespace fastllm {
                                         void *newCudaData = CudaMallocForData(*this, expansionBytes);
                                         CheckCudaMallocForData(*this, newCudaData, expansionBytes, "Data::ToDevice CUDA->CUDA");
                                         if (copyData) {
-                                            FastllmCudaMemcpyBetweenDevices(destDevice, newCudaData, sourceDevice, this->cudaData, expansionBytes);
+                                            FastllmCudaMemcpyBetweenDevices(destDevice, newCudaData, sourceDevice, this->cudaData, bytesToCopy());
                                         }
                                         FastllmCudaSetDevice(sourceDevice);
                                         CudaFreeForData(*this, this->cudaData);

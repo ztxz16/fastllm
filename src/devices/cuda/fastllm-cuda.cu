@@ -4259,16 +4259,26 @@ __global__ void FastllmCatBatchKernel(uint8_t **inputs, uint8_t *output, int out
     }
 }
 
+static uint64_t FastllmCudaHostTransferBytes(const fastllm::Data &data) {
+    // Match Data::ToDevice: a scratch tensor may retain a prefill-sized
+    // allocation while only one decode row is live. Persistent/expanded
+    // storage keeps its full-copy semantics.
+    return data.expansionDims.empty() && !data.isModelWeight && !data.isKVCache
+        ? std::min(data.GetBytes(), data.expansionBytes)
+        : data.expansionBytes;
+}
+
 void *FastllmCudaPrepareInput(const fastllm::Data &input) {
     void *ret;
     if (input.dataDevice == fastllm::DataDevice::CUDA) {
         ret = (void*)input.cudaData;
     } else {
-        ret = FastllmCudaMalloc(input.expansionBytes);
+        const uint64_t bytes = FastllmCudaHostTransferBytes(input);
+        ret = FastllmCudaMalloc(bytes);
         if (ret == nullptr) {
             return nullptr;
         }
-        auto state = cudaMemcpy(ret, input.cpuData, input.expansionBytes, cudaMemcpyHostToDevice);
+        auto state = cudaMemcpy(ret, input.cpuData, bytes, cudaMemcpyHostToDevice);
         if (cudaSuccess != state) {
             checkCudaErrors("Error: CUDA error when copy from memory to GPU!", state);
             FastllmCudaFree(ret);
@@ -4289,14 +4299,15 @@ void *FastllmCudaPrepareOutput(fastllm::Data &output) {
     if (output.dataDevice == fastllm::DataDevice::CUDA) {
         ret = (float*)output.cudaData;
     } else {
-        ret = (float*)FastllmCudaMalloc(output.expansionBytes);
+        ret = (float*)FastllmCudaMalloc(FastllmCudaHostTransferBytes(output));
     }
     return ret;
 }
 
 void FastllmCudaFinishOutput(fastllm::Data &output, void *data) {
     if (output.dataDevice != fastllm::DataDevice::CUDA) {
-        auto state = cudaMemcpy(output.cpuData, data, output.expansionBytes, cudaMemcpyDeviceToHost);
+        auto state = cudaMemcpy(output.cpuData, data,
+                                FastllmCudaHostTransferBytes(output), cudaMemcpyDeviceToHost);
         checkCudaErrors("Error: CUDA error when copy from GPU to memory!", state);
         FastllmCudaFree(data);
     }
