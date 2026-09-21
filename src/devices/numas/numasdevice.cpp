@@ -6,6 +6,7 @@
 #include <fcntl.h>
 
 #include "devices/numas/numasdevice.h"
+#include "moeexpertpartition.h"
 #include "devices/cpu/cpudevice.h"
 #include "devices/cpu/alivethreadpool.h"
 
@@ -5636,82 +5637,20 @@ namespace fastllm {
                 }
                 // printf("MoE dynamic expertLimit benchmark initialized: N=%d, bs=%d, topk=%d\n", profile.maxN, input.dims[0], topk);
             }
-            // Precompute per-expert interpolated times to avoid repeated map lookups
-            int numExperts = (int)expertTasks.size();
-            std::vector<int> expertSz(numExperts);
-            std::vector<double> expertCpu(numExperts, 0.0);
-            std::vector<double> expertGpu(numExperts, 0.0);
-            std::vector<bool> expertValid(numExperts, false);
-            for (int e = 0; e < numExperts; e++) {
-                if (e * 2 >= weightsBatch || weights[e * 2] == nullptr) {
+            std::vector<detail::MoeExpertCost> expertCosts;
+            expertCosts.reserve(expertTasks.size());
+            for (int e = 0; e < (int)expertTasks.size(); e++) {
+                if (e * 2 >= weightsBatch || weights[e * 2] == nullptr ||
+                    expertTasks[e].empty()) {
                     continue;
                 }
-                expertValid[e] = true;
-                expertSz[e] = (int)expertTasks[e].size();
-                expertCpu[e] = InterpolateFromMap(profile.cpuTimeUs, expertSz[e]);
-                expertGpu[e] = InterpolateFromMap(profile.gpuTimeUs, expertSz[e]);
+                const int routes = (int)expertTasks[e].size();
+                expertCosts.push_back({routes,
+                    InterpolateFromMap(profile.cpuTimeUs, routes),
+                    InterpolateFromMap(profile.gpuTimeUs, routes)});
             }
-
-            int bestLimit = defaultExpertLimit;
-            double bestMetric = DBL_MAX;
-            double bestCpuTime = 0.0;
-            double bestGpuTime = 0.0;
-            int activeExpertCount = 0;
-            for (int e = 0; e < numExperts; e++) {
-                if (expertValid[e] && expertSz[e] > 0) {
-                    activeExpertCount++;
-                }
-            }
-            maxTaskSize = std::min(maxTaskSize, defaultExpertLimit);
-            for (int t = 1; t <= maxTaskSize + 1; t++) {
-                double cpuTime = 0.0;
-                std::vector<std::pair<double, int> > gpuJobs;
-                for (int e = 0; e < numExperts; e++) {
-                    if (!expertValid[e]) {
-                        continue;
-                    }
-                    if (expertSz[e] < t) {
-                        cpuTime += expertCpu[e];
-                    } else {
-                        gpuJobs.push_back({expertGpu[e], e});
-                    }
-                }
-                if (gpuCount > 1 && activeExpertCount >= gpuCount &&
-                    (int)gpuJobs.size() < gpuCount) {
-                    continue;
-                }
-                std::sort(
-                    gpuJobs.begin(), gpuJobs.end(),
-                    [](const std::pair<double, int> &a,
-                       const std::pair<double, int> &b) {
-                        if (a.first != b.first) {
-                            return a.first > b.first;
-                        }
-                        return a.second < b.second;
-                    });
-                std::vector<double> gpuLoads(gpuCount, 0.0);
-                for (const auto &job : gpuJobs) {
-                    auto loadIt = std::min_element(
-                        gpuLoads.begin(), gpuLoads.end());
-                    *loadIt += job.first;
-                }
-                double gpuTime = gpuLoads.empty() ? 0.0 :
-                    *std::max_element(gpuLoads.begin(), gpuLoads.end());
-                double metric = gpuCount == 1 ?
-                    std::fabs(cpuTime - gpuTime) :
-                    std::max(cpuTime, gpuTime);
-                if (metric < bestMetric) {
-                    bestMetric = metric;
-                    bestLimit = t;
-                    bestCpuTime = cpuTime;
-                    bestGpuTime = gpuTime;
-                }
-            }
-            if (profile.lastPrintedLimit != bestLimit) {
-                // printf("MoE dynamic expertLimit=%d, predict cpu=%.2fus gpu=%.2fus\n", bestLimit, bestCpuTime, bestGpuTime);
-                profile.lastPrintedLimit = bestLimit;
-            }
-            return bestLimit;
+            // Explicit FT_EXPERT_LIMIT bypasses this measured search.
+            return detail::SelectMoeExpertLimit(expertCosts, defaultExpertLimit, gpuCount);
 #else
             (void)input;
             (void)output;
@@ -5733,7 +5672,6 @@ namespace fastllm {
         struct BenchmarkProfile {
             int maxN = 0;
             bool initialized = false;
-            int lastPrintedLimit = -1;
             std::map<int, double> cpuTimeUs;
             std::map<int, double> gpuTimeUs;
         };
@@ -5928,7 +5866,6 @@ namespace fastllm {
 
             // printf("MoE benchmark: cpu samples=%d, gpu samples=%d\n", (int)profile.cpuTimeUs.size(), (int)profile.gpuTimeUs.size());
             profile.initialized = true;
-            profile.lastPrintedLimit = -1;
             return true;
         }
     };
@@ -8605,14 +8542,13 @@ namespace fastllm {
                     profileInput.cudaData = profileReplica.cudaData;
                     profileInput.cudaDataBorrowed = true;
                     profileInput.dataDeviceIds = {profileReplica.deviceId};
-                    expertLimit = std::min(expertLimit,
+                    expertLimit =
                         MoeExpertSpeedEstimator::GetInstance().GetDynamicExpertLimit(
                             profileInput, output, w1, w2, w3,
                             weights, biass, weightsBatch, topk, sharedScale,
                             expertTasks, expertLimit,
                             (int)cudaInputReplicas.size()
-                        )
-                    );
+                        );
                 }
 #endif
             }
