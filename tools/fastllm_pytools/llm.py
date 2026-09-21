@@ -439,6 +439,11 @@ fastllm_lib.get_response_statistics_llm_model.argtypes = [
     ctypes.POINTER(ctypes.c_int)
 ]
 fastllm_lib.get_response_statistics_llm_model.restype = ctypes.c_bool
+if hasattr(fastllm_lib, "wait_persistent_prefix_cache"):
+    fastllm_lib.wait_persistent_prefix_cache.argtypes = [ctypes.c_int, ctypes.c_int]
+    fastllm_lib.wait_persistent_prefix_cache.restype = ctypes.c_bool
+    fastllm_lib.get_persistent_prefix_cache_statistics.argtypes = [ctypes.c_int]
+    fastllm_lib.get_persistent_prefix_cache_statistics.restype = ctypes.c_char_p
 
 fastllm_lib.abort_response_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
 
@@ -2800,6 +2805,17 @@ class model:
             except:
                 pass
         fastllm_lib.abort_response_llm_model(self.model, handle)
+
+    def wait_persistent_prefix_cache(self, timeout=30.0):
+        function = getattr(fastllm_lib, "wait_persistent_prefix_cache", None)
+        return True if function is None else bool(function(self.model, max(0, int(timeout * 1000))))
+
+    def get_persistent_prefix_cache_statistics(self):
+        function = getattr(fastllm_lib, "get_persistent_prefix_cache_statistics", None)
+        if function is None:
+            return {}
+        payload = function(self.model)
+        return json.loads(payload.decode("utf-8")) if payload else {}
 
     def get_response_statistics(self, handle):
         cached_input_tokens = ctypes.c_int(0)

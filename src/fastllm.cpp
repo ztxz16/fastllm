@@ -6071,7 +6071,15 @@ namespace fastllm {
         return hash;
     }
 
-    void PagedCacheManager::Record(const std::vector<int> &tokens, const std::vector<int> &pages) {
+    static uint64_t HashPrefixExtra(uint64_t hash, const std::string &key) {
+        for (unsigned char byte : key) {
+            hash = (hash ^ byte) * 1099511628211ULL;
+        }
+        return hash;
+    }
+
+    void PagedCacheManager::Record(const std::vector<int> &tokens, const std::vector<int> &pages,
+                                   const std::vector<std::string> *extraKeys) {
         std::lock_guard<std::mutex> guard(this->pageIndexLocker);
         this->currentTimestamp++;
         long long ts = this->currentTimestamp;
@@ -6080,21 +6088,27 @@ namespace fastllm {
         if ((int)pages.size() < numPages) {
             numPages = (int)pages.size();
         }
+        if (extraKeys != nullptr) numPages = std::min(numPages, (int)extraKeys->size());
 
         CacheTrieNode *cur = this->trieRoot;
         for (int i = 0; i < numPages; i++) {
             uint64_t h = HashTokenPage(tokens.data() + i * this->pageLen, this->pageLen);
+            const std::string extra = extraKeys == nullptr ? std::string() : (*extraKeys)[i];
+            h = HashPrefixExtra(h, extra);
             int pid = pages[i];
 
             auto it = cur->children.find(h);
             CacheTrieNode *child;
             if (it == cur->children.end()) {
                 child = new CacheTrieNode();
+                child->extraKey = extra;
                 child->parent = cur;
                 child->edgeHash = h;
                 cur->children[h] = child;
             } else {
                 child = it->second;
+                // A hash collision is a safe miss, never a media identity match.
+                if (child->extraKey != extra) return;
                 if (child->pageId != -1 && child->pageId != pid) {
                     int oldPid = child->pageId;
                     this->pageToTrieNode.erase(oldPid);
@@ -6139,15 +6153,19 @@ namespace fastllm {
         }
     }
 
-    void PagedCacheManager::Query(const std::vector<int> &tokens, std::vector<int> &cachedPageIds) {
+    void PagedCacheManager::Query(const std::vector<int> &tokens, std::vector<int> &cachedPageIds,
+                                  const std::vector<std::string> *extraKeys) {
         std::lock_guard<std::mutex> guard(this->pageIndexLocker);
         cachedPageIds.clear();
 
         int numPages = (int)tokens.size() / this->pageLen;
+        if (extraKeys != nullptr) numPages = std::min(numPages, (int)extraKeys->size());
         CacheTrieNode *cur = this->trieRoot;
 
         for (int i = 0; i < numPages; i++) {
             uint64_t h = HashTokenPage(tokens.data() + i * this->pageLen, this->pageLen);
+            const std::string extra = extraKeys == nullptr ? std::string() : (*extraKeys)[i];
+            h = HashPrefixExtra(h, extra);
 
             auto it = cur->children.find(h);
             if (it == cur->children.end()) {
@@ -6155,6 +6173,7 @@ namespace fastllm {
             }
 
             CacheTrieNode *child = it->second;
+            if (child->extraKey != extra) break;
             if (child->pageId == -1) {
                 break;
             }

@@ -886,6 +886,14 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument("--page_size", type = int, default = -1, help = "设置paged cache每页的大小（token数），默认multicuda为16，其它设备使用后端默认值")
     parser.add_argument("--prefix_cache", "--prefix-cache", dest = "prefix_cache", type = str, default = "",
                         help = "是否启用前缀缓存（true/false），对应 FASTLLM_PREFIX_CACHE")
+    parser.add_argument("--prefix_cache_dir", "--prefix-cache-dir", default=None,
+                        help="Qwen3.5/Qwen3.8 SSD cache directory; defaults to FASTLLM_PREFIX_CACHE_DIR")
+    parser.add_argument("--prefix_cache_disk_gb", "--prefix-cache-disk-gb",
+                        type=float, default=None,
+                        help="SSD quota in GiB; overrides FASTLLM_PREFIX_CACHE_DISK_BYTES (default 256 GiB)")
+    parser.add_argument("--prefix_cache_restore_policy", "--prefix-cache-restore-policy",
+                        choices=("auto", "always", "never"), default=None,
+                        help="SSD restore policy; defaults to FASTLLM_PREFIX_CACHE_RESTORE_POLICY or auto")
     parser.add_argument("--prefix_cache_snapshot_interval_pages", "--prefix-cache-snapshot-interval-pages",
                         dest = "prefix_cache_snapshot_interval_pages", type = int, default = -1,
                         help = "前缀缓存快照间隔页数，对应 FASTLLM_PREFIX_CACHE_SNAPSHOT_INTERVAL_PAGES")
@@ -1271,9 +1279,10 @@ def make_normal_llm_model(args, startup_progress = None):
             is_qwen35_model = (
                 architecture in (
                     "Qwen3_5ForConditionalGeneration",
+                    "Qwen3_5ForCausalLM",
                     "Qwen3_5MoeForConditionalGeneration",
                 ) or
-                model_type in ("qwen3_5", "qwen3_5_moe") or
+                model_type in ("qwen3_5", "qwen3_5_text", "qwen3_5_moe") or
                 text_model_type in ("qwen3_5_text", "qwen3_5_moe_text")
             )
             is_qwen38_flash_next_model = (
@@ -1433,8 +1442,8 @@ def make_normal_llm_model(args, startup_progress = None):
                 model_type == 'kimi_k3'):
                 if (args.enable_thinking == ""):
                     args.enable_thinking = "true"
-            if ((architecture == 'Qwen3_5ForConditionalGeneration' or
-                 model_type == 'qwen3_5' or text_model_type == 'qwen3_5_text') and
+            if ((architecture in ('Qwen3_5ForConditionalGeneration', 'Qwen3_5ForCausalLM') or
+                 model_type in ('qwen3_5', 'qwen3_5_text') or text_model_type == 'qwen3_5_text') and
                 (not user_set_device) and _has_cuda_device()):
                 args.device = "cuda"
             if (architecture == 'Qwen3MoeForCausalLM' or model_type == 'qwen3_moe' or
@@ -1725,18 +1734,22 @@ def make_normal_llm_model(args, startup_progress = None):
     # Explicit RoPE options must reach the constructor's capability check.
     legacy_context_limit = (max_context_length > 0 and not rope_scaling and
                             (graph is not None or not os.path.isdir(args.path)))
+    from .persistent_prefix import persistent_prefix_environment
+    native_library = getattr(llm, "fastllm_lib", None)
+    library_path = getattr(native_library, "_name", "")
     model = None
     try:
-        model = llm.model(args.path, dtype = args.dtype, kv_cache_dtype = args.kv_cache_dtype,
-                            moe_dtype = args.moe_dtype, graph = graph, tokenizer_type = "auto", lora = args.lora,
-                            dtype_config = args.dtype_config, ori_model_path = args.ori,
-                            chat_template = args.chat_template,
-                            tool_call_parser = args.tool_call_parser,
-                            external_mtp_path = (speculative_draft_path
-                                if speculative_algorithm == "mtp" else ""),
-                            mmproj_path = args.mmproj,
-                            max_context_length = -1 if legacy_context_limit else max_context_length,
-                            rope_scaling = rope_scaling)
+        with persistent_prefix_environment(args, is_qwen35_model, library_path, native_library):
+            model = llm.model(args.path, dtype = args.dtype, kv_cache_dtype = args.kv_cache_dtype,
+                              moe_dtype = args.moe_dtype, graph = graph, tokenizer_type = "auto", lora = args.lora,
+                              dtype_config = args.dtype_config, ori_model_path = args.ori,
+                              chat_template = args.chat_template,
+                              tool_call_parser = args.tool_call_parser,
+                              external_mtp_path = (speculative_draft_path
+                                  if speculative_algorithm == "mtp" else ""),
+                              mmproj_path = args.mmproj,
+                              max_context_length = -1 if legacy_context_limit else max_context_length,
+                              rope_scaling = rope_scaling)
         llm.report_model_load_progress("weights_finalize", 0, 1)
         if (args.enable_thinking.lower() in ["", "false", "0", "off"]):
             model.enable_thinking = False

@@ -85,7 +85,12 @@ namespace fastllm {
         return ret;
     }
 
-    void ConvertDataType(uint8_t *src, DataType srcDtype, uint8_t *dst, DataType dstDtype, uint64_t len) {
+    void ConvertDataType(uint8_t *src, DataType srcDtype, uint8_t *dst, DataType dstDtype, uint64_t len,
+                         const std::string &tensorName = "") {
+        const std::string tensorTag = tensorName.empty() ? std::string() : (" tensor=\"" + tensorName + "\"");
+#define FASTLLM_CONVERT_DT_ERROR() ErrorInFastLLM("ConvertDataType Failed. (" + \
+            std::to_string(srcDtype) + " -> " + std::to_string(dstDtype) + ")" + tensorTag)
+
         if (srcDtype == dstDtype) {
             int unitSize = 4;
             if (dstDtype == DataType::FLOAT32) {
@@ -93,11 +98,11 @@ namespace fastllm {
             } else if (dstDtype == DataType::FLOAT16 || dstDtype == DataType::BFLOAT16) {
                 unitSize = 2;
             } else {
-                ErrorInFastLLM("ConvertDataType Failed. (" + std::to_string(srcDtype) + " -> " + std::to_string(dstDtype) + ")");    
+                FASTLLM_CONVERT_DT_ERROR();
             }
             memcpy(dst, src, len * unitSize);
         } else if (srcDtype == DataType::FP8_E4M3 && dstDtype == DataType::FLOAT16) {
-            ErrorInFastLLM("ConvertDataType Failed. (" + std::to_string(srcDtype) + " -> " + std::to_string(dstDtype) + ")");
+            FASTLLM_CONVERT_DT_ERROR();
         } else if (srcDtype == DataType::BFLOAT16 && dstDtype == DataType::FLOAT32) {
             uint16_t *u16dst = (uint16_t*)dst;
             uint16_t *u16src = (uint16_t*)src;
@@ -118,7 +123,7 @@ namespace fastllm {
                 fdst[i] = half_to_float(u16src[i]);
             }
         } else {
-            ErrorInFastLLM("ConvertDataType Failed. (" + std::to_string(srcDtype) + " -> " + std::to_string(dstDtype) + ")");
+            FASTLLM_CONVERT_DT_ERROR();
         }
     }
 
@@ -938,9 +943,12 @@ namespace fastllm {
         } else if (modelType == "qwen3") {
             model = new Qwen3Model();
             model->model_type = "qwen3";
-        } else if (modelType == "qwen3_5" || modelType == "qwen3_5_moe" || modelType == "qwen3_5_moe_text") {
+        } else if (modelType == "qwen3_5" || modelType == "qwen3_5_text" ||
+                   modelType == "qwen3_5_moe" || modelType == "qwen3_5_moe_text") {
             model = new Qwen3_5Model();
-            model->model_type = modelType;
+            // Keep the text-only checkpoint on the canonical Qwen3.5 path.
+            model->model_type = modelType == "qwen3_5_text" ?
+                "qwen3_5" : modelType;
         } else if (modelType == "step3p5" || modelType == "step3p7") {
             model = new Step3p5Model();
             model->model_type = "step3p5";
@@ -1703,7 +1711,7 @@ namespace fastllm {
             } else {
                 uint8_t *ori = new uint8_t[this->bytes];
                 ret = fread(ori, 1, this->bytes, fi);
-                ConvertDataType(ori, srcType, buffer, dstType, len);
+                ConvertDataType(ori, srcType, buffer, dstType, len, this->tensorName);
                 delete[] ori;
             }
             fclose(fi);
@@ -5070,6 +5078,20 @@ namespace fastllm {
                                 || dataType == DataType::DATA_GGUF_FORMAT)) {
                                 oriDataType = DataType::FLOAT32;
                                 scaleTensorName = FindSafeTensorScaleTensorName(safeTensors, tensorName);
+                            }
+                            if (tensor.dtype == "F8_E4M3" &&
+                                dataType == DataType::BFLOAT16) {
+                                // 逐张量 FP8（compressed-tensors，例如 DFlash2-FP8 draft）：
+                                // 引擎没有 FP8 源的转换出口，按配套标量 scale 反量化成 FP16
+                                // （与 pre-Ampere 的 BF16→FP16 权重路径一致）。
+                                std::string fp8ScaleName =
+                                    FindSafeTensorScaleTensorName(safeTensors, tensorName);
+                                AssertInFastLLM(
+                                    !fp8ScaleName.empty(),
+                                    "Tensor error: FP8 tensor has no scale: " + tensorName);
+                                oriDataType = DataType::FLOAT32;
+                                dataType = DataType::FLOAT16;
+                                scaleTensorName = fp8ScaleName;
                             }
                             if (tensor.dtype == "F8_E4M3" && 
                                 (dataType == FP8_E4M3)) {

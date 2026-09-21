@@ -512,7 +512,7 @@ namespace fastllm {
     }
 
     void basellm::TryRecordResponseContext(ResponseContext *context) {
-        if (context == nullptr) {
+        if (context == nullptr || !context->multimodalInput.empty()) {
             return;
         }
         this->TryRecordHistoryCache(context->allTokens);
@@ -595,6 +595,7 @@ namespace fastllm {
     }
 
     void ResponseContext::TryRecordPagedCache(basellm *model) {
+        if (!CanUsePagedPrefixCache()) return;
         bool hasLinearAttentionCache = false;
         bool hasBoundedAttentionCache = false;
         for (int i = 0; i < (int)this->pastKeyValues.size(); i++) {
@@ -681,7 +682,16 @@ namespace fastllm {
             }
             if (cache.pagedKVCacheData != nullptr && !cache.pageIndex.empty() &&
                 cache.pagedKVCacheData->type == PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE) {
-                cache.pagedKVCacheData->Record(this->allTokens, cache.pageIndex);
+                if (PrefixCachePageKeys() == nullptr) {
+                    cache.pagedKVCacheData->Record(this->allTokens, cache.pageIndex);
+                } else {
+                    // Text persistence/conversion also supplies full page
+                    // identities. Never drop them merely because no image is present.
+                    // Do not publish uncomputed prompt tokens during a chunked prefill.
+                    const int length = std::min((int)this->allTokens.size(), pagedCacheTokenLen(cache));
+                    std::vector<int> committed(this->allTokens.begin(), this->allTokens.begin() + length);
+                    cache.pagedKVCacheData->Record(committed, cache.pageIndex, PrefixCachePageKeys());
+                }
             }
         };
         for (int i = 0; i < (int)this->pastKeyValues.size(); i++) {
@@ -1295,6 +1305,17 @@ namespace fastllm {
         exit(0);
     }
 
+    std::vector<int> basellm::ForwardMultimodalContext(
+            ResponseContext *context, const Data &inputIds,
+            const Data &attentionMask, const Data &positionIds,
+            const GenerationConfig &generationConfig,
+            const LastTokensManager &lastTokens,
+            std::vector<std::vector<float>*> *logits) {
+        return ForwardMultimodal(inputIds, attentionMask, positionIds,
+            context->pastKeyValues, context->multimodalInput,
+            generationConfig, lastTokens, logits);
+    }
+
     void basellm::NewMainLoop() {
         RunNewMainLoop(false);
     }
@@ -1901,7 +1922,8 @@ namespace fastllm {
                     }
 
                     if (isPrompt) {
-                        if (ctx->cacheLen == 0 &&
+                        model->PreparePersistentPrefixCache(ctx);
+                        if (ctx->cacheLen == 0 && ctx->CanUsePagedPrefixCache() &&
                             ctx->intParams.find("paged_prefix_restore_disabled") ==
                                 ctx->intParams.end()) {
                             PagedCacheManager *probeManager = nullptr;
@@ -1935,7 +1957,7 @@ namespace fastllm {
                                     auto it = queriedPages.find(manager);
                                     if (it == queriedPages.end()) {
                                         std::vector<int> pages;
-                                        manager->Query(ctx->currentTokens, pages);
+                                        manager->Query(ctx->currentTokens, pages, ctx->PrefixCachePageKeys());
                                         it = queriedPages.insert(std::make_pair(manager, std::move(pages))).first;
                                     }
                                     return it->second;
@@ -2189,6 +2211,7 @@ namespace fastllm {
                                             ctx->currentTokens.begin(),
                                             ctx->currentTokens.begin() + cachedLen);
                                         ctx->cacheLen = cachedLen;
+                                        model->OnPersistentPrefixRestored(ctx);
                                     } else {
                                         // A prefix hit is useful only when its
                                         // complete model state can be restored.
@@ -2497,12 +2520,11 @@ namespace fastllm {
                     ClearProfiler();
                 }
                 if (isSingleMultimodal) {
-                    ret = model->ForwardMultimodal(
+                    ret = model->ForwardMultimodalContext(
+                        singleContext,
                         inputIds,
                         attentionMasks[0] == nullptr ? Data() : *attentionMasks[0],
                         positionIds[0] == nullptr ? Data() : *positionIds[0],
-                        singleContext->pastKeyValues,
-                        singleContext->multimodalInput,
                         generationConfigs[0],
                         tokensManager,
                         &logits
@@ -3213,9 +3235,10 @@ namespace fastllm {
         context->multimodalInput = multimodalInput;
         context->tokens = LastTokensUnit(generationConfig.last_n);
 
-        bool restoredNativeHistory = this->TryRestoreHistoryCache(context->currentTokens, context->cacheLen);
+        bool restoredNativeHistory = multimodalInput.empty() &&
+            this->TryRestoreHistoryCache(context->currentTokens, context->cacheLen);
 
-        auto cache = restoredNativeHistory || !this->UseGenericHistoryCache() ?
+        auto cache = !multimodalInput.empty() || restoredNativeHistory || !this->UseGenericHistoryCache() ?
                      std::make_pair((PastKVCacheMemory*)nullptr, 0) :
                      pastKVCacheManager.Get(inputTokens);
         if (cache.first != nullptr && cache.second > 0) {

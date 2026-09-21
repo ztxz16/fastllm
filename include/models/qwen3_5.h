@@ -22,7 +22,10 @@
 namespace fastllm {
     class CudaWorkspace;
     struct Qwen35VisionTPState;
+    class Qwen35PersistentCache;
     class Qwen3_5Model: public basellm {
+        friend class Qwen35PersistentCache;
+        std::shared_ptr<Qwen35PersistentCache> persistentPrefixCache;
     public:
     Qwen3_5Model (); // 构造函数
         virtual ~Qwen3_5Model();
@@ -97,6 +100,14 @@ namespace fastllm {
                 const LastTokensManager &lastTokens = LastTokensManager(),
                 std::vector <std::vector <float>*> *logits = nullptr) override;
         
+        std::vector<int> ForwardMultimodalContext(
+                ResponseContext *context, const Data &inputIds,
+                const Data &attentionMask, const Data &positionIds,
+                const GenerationConfig &generationConfig,
+                const LastTokensManager &lastTokens,
+                std::vector<std::vector<float>*> *logits) override;
+        void PrepareMultimodalPrefixCache(ResponseContext *context);
+
         // 是否需要生成AttentionMask
         virtual bool NeedAttentionMask(int qlen, int klen);
 
@@ -112,6 +123,11 @@ namespace fastllm {
         virtual bool TryRecordPagedPrefixCacheExtra(ResponseContext *context) override;
         virtual int QueryPagedPrefixCacheExtra(ResponseContext *context, int maxCachedLen) const override;
         virtual bool RestorePagedPrefixCacheExtra(ResponseContext *context, int cachedLen) const override;
+        void PreparePersistentPrefixCache(ResponseContext *context) override;
+        void OnPersistentPrefixRestored(ResponseContext *context) override;
+        bool WaitPersistentPrefixCache(int timeoutMs) override;
+        std::string PersistentPrefixCacheStatistics() const override;
+        void ObservePersistentPrefill(int tokens, double milliseconds);
         virtual int GetChunkedPrefillSize() override;
 
         virtual int GetBatchedPrefillTokenLimit() override;

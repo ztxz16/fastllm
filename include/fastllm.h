@@ -705,6 +705,7 @@ namespace fastllm {
     struct CacheTrieNode {
         int pageId = -1;
         long long timestamp = 0;
+        std::string extraKey; // Full media/position identity; empty for text.
         std::unordered_map<uint64_t, CacheTrieNode*> children;
         CacheTrieNode *parent = nullptr;
         uint64_t edgeHash = 0;
@@ -755,8 +756,10 @@ namespace fastllm {
             void Pick(std::vector<int> &pageIds);
 
             static uint64_t HashTokenPage(const int *tokens, int len);
-            void Record(const std::vector<int> &tokens, const std::vector<int> &pages);
-            void Query(const std::vector<int> &tokens, std::vector<int> &cachedPageIds);
+            void Record(const std::vector<int> &tokens, const std::vector<int> &pages,
+                        const std::vector<std::string> *extraKeys = nullptr);
+            void Query(const std::vector<int> &tokens, std::vector<int> &cachedPageIds,
+                       const std::vector<std::string> *extraKeys = nullptr);
     };
 
     struct PartitionLinkNode {
