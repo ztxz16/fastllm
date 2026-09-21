@@ -60,24 +60,13 @@
 #elif defined(__GNUC__) || defined(__clang__)
     #include <cpuid.h> // For __get_cpuid, __get_cpuid_count
     #include <x86intrin.h> // For _xgetbv (usually included by cpuid.h or available)
-    // GCC/Clang might not have _xgetbv as an intrinsic like MSVC,
-    // or it might be in a different header.
-    // If _xgetbv is not found, you might need to implement it with inline assembly.
-    #ifndef _XCR_XFEATURE_ENABLED_MASK // Often defined with _xgetbv
-    #define _XCR_XFEATURE_ENABLED_MASK 0
-    #if __GNUC__ < 8 and !defined(USE_ROCM)
-    static uint64_t _xgetbv(uint32_t xcr_index) {
+    // This helper is called only after checking CPUID.OSXSAVE. Inline assembly
+    // keeps CPU detection buildable even when the baseline has no XSAVE/AVX.
+    static inline uint64_t fastllm_xgetbv(uint32_t xcr_index) {
         uint32_t eax, edx;
-        __asm__ __volatile__ (
-            "xgetbv"
-            : "=a" (eax), "=d" (edx)  // Output operands: eax, edx
-            : "c" (xcr_index)         // Input operand: ecx (xcr_index)
-            :                         // Clobbered registers (none explicitly clobbered by xgetbv beyond outputs)
-        );
+        __asm__ __volatile__("xgetbv" : "=a"(eax), "=d"(edx) : "c"(xcr_index));
         return ((uint64_t)edx << 32) | eax;
     }
-    #endif
-    #endif
 #else
     #warning "CPUID detection not implemented for this compiler."
 #endif
@@ -166,7 +155,11 @@ namespace fastllm {
             bool os_amx_enabled = false; // OS state support for AMX
 
             if (os_supports_xsave) {
-                uint64_t xcr0 = _xgetbv(_XCR_XFEATURE_ENABLED_MASK);
+#if defined(_MSC_VER)
+                uint64_t xcr0 = _xgetbv(0);
+#else
+                uint64_t xcr0 = fastllm_xgetbv(0);
+#endif
                 
                 // Check for AVX support (bits 1 and 2)
                 if ((xcr0 & 0x6) == 0x6) {

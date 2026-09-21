@@ -8,6 +8,7 @@ namespace fastllm_gguf_mmq {
 
 #include "mmq.cuh"
 #include "fastllm-gguf-iq2-gemv.cuh"
+#include "../fastllm-gguf-small-mmvq.cuh"
 
 constexpr int kQuantizeBlockSize = 128;
 constexpr int kBlackwellDirectTileThreshold = 1000;
@@ -411,6 +412,15 @@ static void launch_extended_mmvq_type(
         const void *weight, const block_q8_1 *input, OutputType *output,
         int rows, int input_columns, int output_rows,
         cudaStream_t stream) {
+    if constexpr (type == GGML_TYPE_IQ1_M || type == GGML_TYPE_IQ2_XS ||
+                  type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_S) {
+        if (rows >= 2 && rows <= 8 && fastllm_gguf_small_mmvq::Supports(
+                input, input_columns, output_rows, input_columns, output_rows)) {
+            fastllm_gguf_small_mmvq::LaunchBatch<type>(weight, input, output,
+                input_columns, output_rows, rows, input_columns, output_rows, stream);
+            return;
+        }
+    }
     if constexpr (type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_S) {
         if (rows == 1 && iq2_decode::Supports(input, input_columns, output_rows)) {
             iq2_decode::Launch<type, false>(weight, nullptr, input, output,

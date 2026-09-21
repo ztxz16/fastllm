@@ -6,6 +6,7 @@
 #define ALIVETHREAD_H
 
 #include <atomic>
+#include <algorithm>
 #include <cstdint>
 #include <thread>
 #include <vector>
@@ -232,23 +233,49 @@ namespace fastllm {
     };
 
     static void RunMultiThreadMemcpyMultiLines(std::vector <MultiThreadMemcpyMultiLinesTask> &tasks, AliveThreadPool *pool) {
-        int threadNum = pool->threads.size();
-        int n = tasks.size();
-        int per = n / pool->threads.size();
+        const int n = (int)tasks.size();
+        if (n == 0) return;
+        size_t bytes = 0;
+        for (const auto &task : tasks) bytes += task.len;
+        const int first = pool->curActivateThreadInterval.first;
+        const int available = pool->curActivateThreadInterval.second - first;
+        // Give each worker enough bytes to amortize publishing and waiting.
+        // This depends on the copy workload, not the model or routing shape.
+        constexpr size_t bytesPerWorker = 64 * 1024;
+        const int threadNum = (int)std::min<size_t>(
+            std::max(1, std::min(n, available)),
+            std::max<size_t>(1, (bytes + bytesPerWorker - 1) / bytesPerWorker));
+        if (threadNum == 1) {
+            MultiThreadMemcpyMultiLinesOp op(tasks.data(), 0, n);
+            op.Run();
+            return;
+        }
+        // Calls are synchronous; retain storage per submitting thread, and
+        // finish constructing all tasks before handing out their addresses.
+        thread_local std::vector<MultiThreadMemcpyMultiLinesOp> ops;
+        ops.clear();
+        ops.reserve(threadNum);
         int cur = 0;
-        std::vector<fastllm::MultiThreadMemcpyMultiLinesOp*> ops;
+        size_t remaining = bytes;
         for (int i = 0; i < threadNum; i++) {
-            int end = (i == threadNum - 1 ? n : cur + per + (cur + per * (threadNum - i) < n));
-            ops.push_back(new MultiThreadMemcpyMultiLinesOp(
-                tasks.data(), cur, end));
+            const size_t target = (remaining + threadNum - i - 1) / (threadNum - i);
+            size_t copied = 0;
+            int end = cur;
+            do {
+                copied += tasks[end++].len;
+            } while (end < n - (threadNum - i - 1) && copied < target);
+            if (i == threadNum - 1) end = n;
+            ops.emplace_back(tasks.data(), cur, end);
+            remaining -= copied;
             cur = end;
         }
+        // Spread a reduced set of workers across the active interval, which
+        // also avoids concentrating small NUMA copies on only the first node.
         for (int i = 0; i < threadNum; i++) {
-            pool->PushOp(i, ops[i]);
+            pool->PushOp(first + i * available / threadNum, &ops[i]);
         }
         for (int i = 0; i < threadNum; i++) {
-            pool->Wait(i);
-            delete ops[i];
+            pool->Wait(first + i * available / threadNum);
         }
     }
 

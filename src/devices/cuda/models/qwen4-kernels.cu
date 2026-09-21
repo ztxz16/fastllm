@@ -1,5 +1,6 @@
 #include "fastllm-cuda.cuh"
 #include "fastllm-cuda-rope.cuh"
+#include "utils.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -1189,14 +1190,14 @@ namespace {
         }
     }
 
-    // Exact SM120 short-sequence mapping.  A warp owns 32 adjacent value
+    // Sequence state tiling. A warp owns 32 adjacent value
     // channels, so each lane retains the generic kernel's strictly increasing
     // K reduction order.  Four independent blocks per value head expose the
     // same 128 lanes to four times as many SMs while caching each state tile
     // across all speculative tokens.
     template <typename T, bool OUT_OF_PLACE_STATE>
     __global__ __launch_bounds__(32)
-    void Qwen4GatedDeltaRuleSequenceValueTileSm120Kernel(
+    void Qwen4GatedDeltaRuleSequenceValueTileKernel(
             const float *qkv, const T *alpha, const T *beta,
             const float *aLog, const float *dtBias, float *state,
             float *stateOutput, float *output,
@@ -2297,6 +2298,135 @@ namespace {
         }
     }
 
+    // Each block owns one Q or K head of one token. The 64-thread reduction
+    // matches the public RMSNorm kernels for head widths below 512, including
+    // their pair/quad grouping. Materialize the normalized activation in its
+    // original dtype before applying RoPE, just as the unfused path does.
+    template <typename T>
+    __global__ void Qwen4AttentionPrepareKernel(
+            const T *qGate, const T *key, const T *value,
+            const float *qWeight, const float *kWeight,
+            const float *positions, T *query, T *gate,
+            T *keyCache, T *valueCache, int sequence,
+            int qHeads, int kvHeads, int headDim, int rotaryDim,
+            int positionStride, bool interleaved, int sectionH, int sectionW,
+            float eps, float ropeTheta, int previousLength,
+            uint64_t keyHeadStride, uint64_t valueHeadStride) {
+        const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+        const int row = blockIdx.x / (qHeads + kvHeads);
+        const int head = blockIdx.x % (qHeads + kvHeads);
+        const bool isQuery = head < qHeads;
+        const int h = isQuery ? head : head - qHeads;
+        const int batch = row / sequence, token = row % sequence;
+        const T *input = isQuery
+            ? qGate + ((uint64_t)row * qHeads + h) * headDim * 2
+            : key + ((uint64_t)row * kvHeads + h) * headDim;
+        const float *weight = isQuery ? qWeight : kWeight;
+        __shared__ float warpSums[2], scale, normalized[512];
+        float sum = 0.0f;
+        if constexpr (std::is_same<T, float>::value) {
+            for (int i = tid * 4; i < headDim; i += 64 * 4) {
+                const float x = input[i], y = input[i + 1];
+                const float z = input[i + 2], w = input[i + 3];
+                sum += x * x + y * y + z * z + w * w;
+            }
+        } else {
+            for (int i = tid * 2; i < headDim; i += 64 * 2) {
+                const float x = Qwen4CudaToFloat(input[i]);
+                const float y = Qwen4CudaToFloat(input[i + 1]);
+                sum += x * x + y * y;
+            }
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum += __shfl_down_sync(0xffffffffu, sum, offset);
+        }
+        if (lane == 0) warpSums[warp] = sum;
+        __syncthreads();
+        if (warp == 0) {
+            float total = lane < 2 ? warpSums[lane] : 0.0f;
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                total += __shfl_down_sync(0xffffffffu, total, offset);
+            }
+            if (lane == 0) scale = rsqrtf(total / headDim + eps);
+        }
+        __syncthreads();
+        for (int d = tid; d < headDim; d += 64) {
+            normalized[d] = Qwen4CudaToFloat(Qwen4CudaFromFloat<T>(
+                Qwen4CudaToFloat(input[d]) * scale * weight[d]));
+        }
+        __syncthreads();
+        T *destination = isQuery
+            ? query + ((uint64_t)(batch * qHeads + h) * sequence + token) * headDim
+            : keyCache + (uint64_t)(batch * kvHeads + h) * keyHeadStride +
+                         (uint64_t)(previousLength + token) * headDim;
+        const int halfDim = rotaryDim / 2;
+        for (int d = tid; d < halfDim; d += 64) {
+            float angle;
+            if (interleaved) {
+                const int axis = d % 3 == 1 && d < sectionH * 3 ? 1 :
+                                 d % 3 == 2 && d < sectionW * 3 ? 2 : 0;
+                angle = positions[axis * positionStride + token] /
+                        powf(ropeTheta, (float)(2 * d) / rotaryDim);
+            } else {
+                const float position = (float)(int)positions[batch * positionStride + token];
+                angle = FastllmPreciseRopeAngle(position, d, rotaryDim, ropeTheta);
+            }
+            const float sn = sinf(angle), cs = cosf(angle);
+            const float a = normalized[d], b = normalized[d + halfDim];
+            destination[d] = Qwen4CudaFromFloat<T>(a * cs - b * sn);
+            destination[d + halfDim] = Qwen4CudaFromFloat<T>(a * sn + b * cs);
+        }
+        for (int d = rotaryDim + tid; d < headDim; d += 64) {
+            destination[d] = Qwen4CudaFromFloat<T>(normalized[d]);
+        }
+        for (int d = tid; d < headDim; d += 64) {
+            if (isQuery) {
+                gate[((uint64_t)row * qHeads + h) * headDim + d] = input[headDim + d];
+            } else {
+                valueCache[(uint64_t)(batch * kvHeads + h) * valueHeadStride +
+                           (uint64_t)(previousLength + token) * headDim + d] =
+                    value[((uint64_t)row * kvHeads + h) * headDim + d];
+            }
+        }
+    }
+
+    template <typename T>
+    __device__ __forceinline__ T Qwen4AttentionGate(T x, T gate) {
+        if constexpr (std::is_same<T, half>::value) {
+#ifdef CUDA_NO_TENSOR_CORE
+            const half probability = __float2half_rn(1.0 / (1.0 + expf(-__half2float(gate))));
+            return __float2half_rn(__half2float(x) * __half2float(probability));
+#else
+            return __hmul(x, __hdiv(__float2half(1.0f),
+                __hadd(__float2half(1.0f), hexp(-gate))));
+#endif
+        } else if constexpr (std::is_same<T, float>::value) {
+            const float probability = 1.0 / (1.0 + expf(-gate));
+            return x * probability;
+        } else {
+            const T probability = Qwen4CudaFromFloat<T>(
+                1.0f / (1.0f + expf(-Qwen4CudaToFloat(gate))));
+            return Qwen4CudaFromFloat<T>(
+                Qwen4CudaToFloat(x) * Qwen4CudaToFloat(probability));
+        }
+    }
+
+    template <typename T>
+    __global__ void Qwen4AttentionOutputKernel(
+            const T *context, const T *gate, T *output,
+            uint64_t count, int heads, int sequence, int headDim,
+            uint64_t contextHeadStride) {
+        for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+             i < count; i += (uint64_t)blockDim.x * gridDim.x) {
+            const int d = i % headDim, head = (i / headDim) % heads;
+            const uint64_t row = i / (headDim * heads);
+            const int token = row % sequence, batch = row / sequence;
+            const uint64_t source = (batch * heads + head) * contextHeadStride +
+                                    (uint64_t)token * headDim + d;
+            output[i] = Qwen4AttentionGate(context[source], gate[i]);
+        }
+    }
+
     template <typename T>
     __global__ void Qwen4KVAppendKernel(
             const T *key, const T *value, const int32_t *decodeMeta,
@@ -2472,11 +2602,11 @@ namespace {
             fastllm::Data *stateOutput, fastllm::Data &output,
             int blocks, int keyHeads, int valueHeads, int sequence,
             float recurrentEps, float inverseHead,
-            bool useValueTileSm120) {
+            bool useValueTile) {
         float *nextState = OUT_OF_PLACE_STATE
             ? (float*)stateOutput->cudaData : nullptr;
-        if (useValueTileSm120) {
-            Qwen4GatedDeltaRuleSequenceValueTileSm120Kernel<
+        if (useValueTile) {
+            Qwen4GatedDeltaRuleSequenceValueTileKernel<
                 T, OUT_OF_PLACE_STATE><<<
                     blocks * 4, 32, 0, cudaStreamPerThread>>>(
                 (const float*)qkv.cudaData, (const T*)alpha.cudaData,
@@ -3376,6 +3506,133 @@ bool FastllmCudaQwen4QSASelectGraph(
         capacity * compressRatio);
 }
 
+static bool Qwen4AttentionCudaData(const fastllm::Data &data, int device,
+                                  bool dense = true) {
+    if (data.dataDevice != fastllm::DataDevice::CUDA || !data.cudaData ||
+        data.multiDeviceData || (!data.dataDeviceIds.empty() &&
+        data.dataDeviceIds[0] != device) ||
+        (dense && data.strides.size() != data.dims.size())) {
+        return false;
+    }
+    if (dense) {
+        uint64_t stride = 1;
+        for (int i = (int)data.dims.size() - 1; i >= 0; --i) {
+            if (data.strides[i] != stride) return false;
+            stride *= data.dims[i];
+        }
+    }
+    return true;
+}
+
+static void Qwen4AttentionAllocate(fastllm::Data &data,
+                                   const fastllm::Data &reference,
+                                   const std::vector<int> &shape) {
+    data.dataType = reference.dataType;
+    data.UpdateUnitSize();
+    data.Resize(shape);
+    data.ToDevice(fastllm::DataDevice::CUDA, reference.dataDeviceIds, false);
+    data.Allocate();
+}
+
+bool FastllmCudaQwen4AttentionPrepare(
+        const fastllm::Data &qGate, const fastllm::Data &key,
+        const fastllm::Data &value, const fastllm::Data &qNorm,
+        const fastllm::Data &kNorm, const fastllm::Data &positions,
+        fastllm::Data &query, fastllm::Data &gate,
+        fastllm::Data &keyCache, fastllm::Data &valueCache,
+        int headDim, int rotaryDim, int sectionH, int sectionW,
+        float eps, float ropeTheta, int previousLength) {
+    const int device = FastllmCudaGetDevice();
+    if (headDim <= 0 || headDim >= 512 || headDim % 4 ||
+        rotaryDim <= 0 || rotaryDim > headDim || rotaryDim % 2 ||
+        !std::isfinite(eps) || eps <= 0 || !std::isfinite(ropeTheta) || ropeTheta <= 0 ||
+        !Qwen4CudaActivationType(qGate.dataType) ||
+        qGate.dims.size() != 3 || key.dims.size() != 3 ||
+        key.dataType != qGate.dataType || value.dataType != qGate.dataType ||
+        value.dims != key.dims || qGate.dims[0] != key.dims[0] ||
+        qGate.dims[1] != key.dims[1] || qGate.dims[0] <= 0 || qGate.dims[1] <= 0 ||
+        qGate.dims[2] <= 0 || qGate.dims[2] % (headDim * 2) ||
+        key.dims[2] <= 0 || key.dims[2] % headDim ||
+        qNorm.dataType != fastllm::DataType::FLOAT32 || kNorm.dataType != qNorm.dataType ||
+        qNorm.dims != std::vector<int>({headDim}) || kNorm.dims != qNorm.dims ||
+        positions.dataType != fastllm::DataType::FLOAT32 || positions.dims.size() != 2) {
+        return false;
+    }
+    const int batch = qGate.dims[0], sequence = qGate.dims[1];
+    const int qHeads = qGate.dims[2] / (headDim * 2), kvHeads = key.dims[2] / headDim;
+    const bool interleaved = positions.dims[0] == 3;
+    if (positions.dims[1] < sequence || qHeads % kvHeads ||
+        (interleaved ? (batch != 1 || sectionH < 0 || sectionW < 0 ||
+                        sectionH + sectionW > rotaryDim / 2)
+                     : positions.dims[0] != batch)) return false;
+    for (const auto *data : {&qGate, &key, &value, &qNorm, &kNorm, &positions}) {
+        if (!Qwen4AttentionCudaData(*data, device)) return false;
+    }
+    for (const auto *cache : {&keyCache, &valueCache}) {
+        const auto &capacity = cache->expansionDims.empty() ? cache->dims : cache->expansionDims;
+        if (!Qwen4AttentionCudaData(*cache, device, false) ||
+            cache->dataType != qGate.dataType || capacity.size() != 3 ||
+            capacity[0] != batch * kvHeads || capacity[2] != headDim ||
+            cache->strides.size() != 3 || cache->strides[2] != 1 ||
+            cache->strides[1] != (uint64_t)headDim ||
+            cache->strides[0] < (uint64_t)capacity[1] * headDim ||
+            previousLength < 0 || (int64_t)previousLength + sequence > capacity[1]) return false;
+    }
+    Qwen4AttentionAllocate(query, qGate, {batch * qHeads, sequence, headDim});
+    Qwen4AttentionAllocate(gate, qGate, {batch, sequence, qHeads * headDim});
+    auto launch = [&](auto scalar) {
+        using T = decltype(scalar);
+        Qwen4AttentionPrepareKernel<T><<<batch * sequence * (qHeads + kvHeads), 64, 0, cudaStreamPerThread>>>(
+            (const T*)qGate.cudaData, (const T*)key.cudaData, (const T*)value.cudaData,
+            (const float*)qNorm.cudaData, (const float*)kNorm.cudaData,
+            (const float*)positions.cudaData, (T*)query.cudaData, (T*)gate.cudaData,
+            (T*)keyCache.cudaData, (T*)valueCache.cudaData, sequence, qHeads, kvHeads,
+            headDim, rotaryDim, positions.dims[1], interleaved, sectionH, sectionW,
+            eps, ropeTheta, previousLength, keyCache.strides[0], valueCache.strides[0]);
+    };
+    if (qGate.dataType == fastllm::DataType::FLOAT32) launch(float{});
+    else if (qGate.dataType == fastllm::DataType::FLOAT16) launch(half{});
+    else launch(__nv_bfloat16{});
+    DeviceSync();
+    fastllm::AssertInFastLLM(cudaGetLastError() == cudaSuccess,
+                            "Qwen4 fused attention preparation failed.");
+    return true;
+}
+
+bool FastllmCudaQwen4AttentionOutput(
+        const fastllm::Data &context, const fastllm::Data &gate,
+        fastllm::Data &output) {
+    const int device = FastllmCudaGetDevice();
+    if (context.dims.size() != 3 || gate.dims.size() != 3 ||
+        !Qwen4CudaActivationType(context.dataType) || gate.dataType != context.dataType ||
+        !Qwen4AttentionCudaData(context, device, false) ||
+        !Qwen4AttentionCudaData(gate, device) || gate.dims[0] <= 0 ||
+        context.dims[0] <= 0 || context.dims[0] % gate.dims[0] ||
+        context.dims[1] <= 0 || context.dims[2] <= 0 ||
+        context.dims[1] != gate.dims[1] ||
+        gate.dims[2] != context.dims[0] / gate.dims[0] * context.dims[2] ||
+        context.strides[2] != 1 || context.strides[1] != (uint64_t)context.dims[2] ||
+        context.strides[0] < (uint64_t)context.dims[1] * context.dims[2] ||
+        &output == &context || &output == &gate) return false;
+    Qwen4AttentionAllocate(output, gate, gate.dims);
+    const uint64_t count = gate.Count(0);
+    const int blocks = std::min<uint64_t>(65535, (count + 255) / 256);
+    auto launch = [&](auto scalar) {
+        using T = decltype(scalar);
+        Qwen4AttentionOutputKernel<T><<<blocks, 256, 0, cudaStreamPerThread>>>(
+            (const T*)context.cudaData, (const T*)gate.cudaData, (T*)output.cudaData,
+            count, context.dims[0] / gate.dims[0], context.dims[1], context.dims[2],
+            context.strides[0]);
+    };
+    if (context.dataType == fastllm::DataType::FLOAT32) launch(float{});
+    else if (context.dataType == fastllm::DataType::FLOAT16) launch(half{});
+    else launch(__nv_bfloat16{});
+    DeviceSync();
+    fastllm::AssertInFastLLM(cudaGetLastError() == cudaSuccess,
+                            "Qwen4 fused attention output failed.");
+    return true;
+}
+
 static bool FastllmCudaQwen4KVAppendImpl(
         const fastllm::Data &key, const fastllm::Data &value,
         const int32_t *decodeMeta, int previousLength,
@@ -3990,52 +4247,44 @@ bool FastllmCudaQwen4GatedDeltaRuleDecode(
     // as both the RMSNorm weight and the subsequent query scale.  Passing the
     // same host result avoids the one-ULP difference of device rsqrtf().
     const float inverseHead = 1.0f / std::sqrt((float)keyDim);
-    int device = -1;
-    int major = 0;
-    int minor = 0;
-    const bool useValueTileSm120 = sequence > 1 && sequence <= 9 &&
-        cudaGetDevice(&device) == cudaSuccess &&
-        cudaDeviceGetAttribute(
-            &major, cudaDevAttrComputeCapabilityMajor, device) ==
-            cudaSuccess &&
-        cudaDeviceGetAttribute(
-            &minor, cudaDevAttrComputeCapabilityMinor, device) ==
-            cudaSuccess &&
-        major == 12 && minor == 0;
+    // Keep a state tile on chip across recurrent steps. The benefit comes
+    // from state reuse and additional independent blocks, not an ISA or a
+    // particular speculative width. Single-token decode keeps its mapping.
+    const bool useValueTile = sequence > 1;
     if (alpha.dataType == fastllm::DataType::FLOAT32) {
         if (stateOutput == nullptr) {
             Qwen4LaunchGatedDeltaRule<float, false>(
                 qkv, alpha, beta, aLog, dtBias, state, nullptr, output,
                 blocks, keyHeads, valueHeads, sequence, recurrentEps,
-                inverseHead, useValueTileSm120);
+                inverseHead, useValueTile);
         } else {
             Qwen4LaunchGatedDeltaRule<float, true>(
                 qkv, alpha, beta, aLog, dtBias, state, stateOutput, output,
                 blocks, keyHeads, valueHeads, sequence, recurrentEps,
-                inverseHead, useValueTileSm120);
+                inverseHead, useValueTile);
         }
     } else if (alpha.dataType == fastllm::DataType::FLOAT16) {
         if (stateOutput == nullptr) {
             Qwen4LaunchGatedDeltaRule<half, false>(
                 qkv, alpha, beta, aLog, dtBias, state, nullptr, output,
                 blocks, keyHeads, valueHeads, sequence, recurrentEps,
-                inverseHead, useValueTileSm120);
+                inverseHead, useValueTile);
         } else {
             Qwen4LaunchGatedDeltaRule<half, true>(
                 qkv, alpha, beta, aLog, dtBias, state, stateOutput, output,
                 blocks, keyHeads, valueHeads, sequence, recurrentEps,
-                inverseHead, useValueTileSm120);
+                inverseHead, useValueTile);
         }
     } else if (stateOutput == nullptr) {
         Qwen4LaunchGatedDeltaRule<__nv_bfloat16, false>(
             qkv, alpha, beta, aLog, dtBias, state, nullptr, output,
             blocks, keyHeads, valueHeads, sequence, recurrentEps,
-            inverseHead, useValueTileSm120);
+            inverseHead, useValueTile);
     } else {
         Qwen4LaunchGatedDeltaRule<__nv_bfloat16, true>(
             qkv, alpha, beta, aLog, dtBias, state, stateOutput, output,
             blocks, keyHeads, valueHeads, sequence, recurrentEps,
-            inverseHead, useValueTileSm120);
+            inverseHead, useValueTile);
     }
     DeviceSync();
     return cudaGetLastError() == cudaSuccess;

@@ -4259,16 +4259,26 @@ __global__ void FastllmCatBatchKernel(uint8_t **inputs, uint8_t *output, int out
     }
 }
 
+static uint64_t FastllmCudaHostTransferBytes(const fastllm::Data &data) {
+    // Match Data::ToDevice: a scratch tensor may retain a prefill-sized
+    // allocation while only one decode row is live. Persistent/expanded
+    // storage keeps its full-copy semantics.
+    return data.expansionDims.empty() && !data.isModelWeight && !data.isKVCache
+        ? std::min(data.GetBytes(), data.expansionBytes)
+        : data.expansionBytes;
+}
+
 void *FastllmCudaPrepareInput(const fastllm::Data &input) {
     void *ret;
     if (input.dataDevice == fastllm::DataDevice::CUDA) {
         ret = (void*)input.cudaData;
     } else {
-        ret = FastllmCudaMalloc(input.expansionBytes);
+        const uint64_t bytes = FastllmCudaHostTransferBytes(input);
+        ret = FastllmCudaMalloc(bytes);
         if (ret == nullptr) {
             return nullptr;
         }
-        auto state = cudaMemcpy(ret, input.cpuData, input.expansionBytes, cudaMemcpyHostToDevice);
+        auto state = cudaMemcpy(ret, input.cpuData, bytes, cudaMemcpyHostToDevice);
         if (cudaSuccess != state) {
             checkCudaErrors("Error: CUDA error when copy from memory to GPU!", state);
             FastllmCudaFree(ret);
@@ -4289,14 +4299,15 @@ void *FastllmCudaPrepareOutput(fastllm::Data &output) {
     if (output.dataDevice == fastllm::DataDevice::CUDA) {
         ret = (float*)output.cudaData;
     } else {
-        ret = (float*)FastllmCudaMalloc(output.expansionBytes);
+        ret = (float*)FastllmCudaMalloc(FastllmCudaHostTransferBytes(output));
     }
     return ret;
 }
 
 void FastllmCudaFinishOutput(fastllm::Data &output, void *data) {
     if (output.dataDevice != fastllm::DataDevice::CUDA) {
-        auto state = cudaMemcpy(output.cpuData, data, output.expansionBytes, cudaMemcpyDeviceToHost);
+        auto state = cudaMemcpy(output.cpuData, data,
+                                FastllmCudaHostTransferBytes(output), cudaMemcpyDeviceToHost);
         checkCudaErrors("Error: CUDA error when copy from GPU to memory!", state);
         FastllmCudaFree(data);
     }
@@ -6254,37 +6265,67 @@ void FastllmCudaMemcpyBetweenDevices(int dstId, void *dst, int srcId, void *src,
         cudaGetLastError();
     }
 
-    uint8_t *cpuData = new uint8_t[size];
-    state = cudaSetDevice(srcId);
-    failedStage = "cudaSetDevice(src)";
-    if (state == cudaSuccess) {
-        state = cudaMemcpyAsync(cpuData, src, size, cudaMemcpyDeviceToHost,
-                                cudaStreamPerThread);
-        failedStage = "cudaMemcpyAsyncDeviceToHost";
+    // Bound pinned memory independently of tensor size. The caller waits for
+    // each destination copy before reusing this thread's staging allocation,
+    // preserving the synchronous handoff to other per-thread CUDA streams.
+    struct StagingBuffer {
+        uint8_t *data = nullptr;
+        size_t capacity = 0;
+        ~StagingBuffer() { if (data != nullptr) cudaFreeHost(data); }
+    };
+    static thread_local StagingBuffer staging;
+    constexpr size_t maxStagingBytes = 64ULL << 20;
+    const size_t partBytes = std::min(size, maxStagingBytes);
+    if (staging.capacity < partBytes) {
+        void *replacement = nullptr;
+        state = cudaHostAlloc(&replacement, partBytes, cudaHostAllocPortable);
+        if (state == cudaSuccess) {
+            if (staging.data != nullptr) cudaFreeHost(staging.data);
+            staging.data = (uint8_t *)replacement;
+            staging.capacity = partBytes;
+        } else {
+            cudaGetLastError();
+        }
     }
-    if (state == cudaSuccess) {
-        state = cudaStreamSynchronize(cudaStreamPerThread);
-        failedStage = "cudaStreamSynchronize(src)";
+    // Pinned allocation is an optimization; retain a bounded pageable
+    // fallback on hosts where pinning is unavailable or exhausted.
+    std::unique_ptr<uint8_t[]> pageable;
+    uint8_t *cpuData = staging.data;
+    size_t capacity = staging.capacity;
+    if (cpuData == nullptr) {
+        pageable.reset(new uint8_t[partBytes]);
+        cpuData = pageable.get();
+        capacity = partBytes;
     }
-    if (state == cudaSuccess) {
-        state = cudaSetDevice(dstId);
-        failedStage = "cudaSetDevice(dst)";
+    state = cudaSuccess;
+    for (size_t offset = 0; offset < size && state == cudaSuccess;) {
+        const size_t bytes = std::min(capacity, size - offset);
+        state = cudaSetDevice(srcId);
+        failedStage = "cudaSetDevice(src)";
+        if (state == cudaSuccess) {
+            state = cudaMemcpyAsync(cpuData, (uint8_t *)src + offset, bytes,
+                                    cudaMemcpyDeviceToHost, cudaStreamPerThread);
+            failedStage = "cudaMemcpyAsyncDeviceToHost";
+        }
+        if (state == cudaSuccess) {
+            state = cudaStreamSynchronize(cudaStreamPerThread);
+            failedStage = "cudaStreamSynchronize(src)";
+        }
+        if (state == cudaSuccess) {
+            state = cudaSetDevice(dstId);
+            failedStage = "cudaSetDevice(dst)";
+        }
+        if (state == cudaSuccess) {
+            state = cudaMemcpyAsync((uint8_t *)dst + offset, cpuData, bytes,
+                                    cudaMemcpyHostToDevice, cudaStreamPerThread);
+            failedStage = "cudaMemcpyAsyncHostToDevice";
+        }
+        if (state == cudaSuccess) {
+            state = cudaStreamSynchronize(cudaStreamPerThread);
+            failedStage = "cudaStreamSynchronize(dst)";
+        }
+        offset += bytes;
     }
-    if (state == cudaSuccess) {
-        state = cudaMemcpyAsync(dst, cpuData, size, cudaMemcpyHostToDevice,
-                                cudaStreamPerThread);
-        failedStage = "cudaMemcpyAsyncHostToDevice";
-    }
-    if (state == cudaSuccess) {
-        // The destination is consumed by a persistent TP worker whose
-        // per-thread default stream differs from this caller's stream.  A
-        // pageable H2D cudaMemcpy may return after host staging but before the
-        // DMA reaches device memory, so complete it before handing the tensor
-        // to that worker.
-        state = cudaStreamSynchronize(cudaStreamPerThread);
-        failedStage = "cudaStreamSynchronize(dst)";
-    }
-    delete[] cpuData;
     if (state != cudaSuccess) {
         printf("Error: CUDA copy Between GPUs failed in %s. dstId = %d, srcId = %d, "
                "dst = %p, src = %p, size = %lu, canPeerAccess = %d.\n",

@@ -574,6 +574,7 @@ namespace fastllm {
         {DataType::INT8_PERCHANNEL_S8_W8A16, {"int8_perchannel_s8_w8a16"}},
         {DataType::NVFP4_BLOCK_16, {"nvfp4_block_16"}},
         {DataType::NVFP4_BLOCK_16_PLANAR, {"nvfp4_block_16_planar"}},
+        {DataType::NVFP4_BLOCK_16_E4M3_PACKED, {"nvfp4_block_16_e4m3_packed"}},
         {DataType::NVFP4_BLOCK_16_E8M0, {"nvfp4_block_16_e8m0"}},
         {DataType::NVFP4_BLOCK_16_E4M3, {"nvfp4_block_16_e4m3"}},
         {DataType::INT4_GROUP32, {"int4_group32"}},
@@ -655,7 +656,7 @@ namespace fastllm {
             const std::vector<float> &globalScales,
             int blockK, int blockM, uint8_t *destination,
             int destinationRowStart, int destinationRows,
-            bool crossSwiglu, bool planar) {
+            bool crossSwiglu, bool planar, bool compactScales) {
         AssertInFastLLM(
             rows > 0 && columns > 0 && weights != nullptr &&
             scaleBytes != nullptr && !globalScales.empty() &&
@@ -663,7 +664,8 @@ namespace fastllm {
             destinationRowStart >= 0 && destinationRows >= 0 &&
             destinationRowStart + destinationRows <= rows &&
             (!crossSwiglu || (rows & 1) == 0) &&
-            (!planar || destinationRows % NVFP4_PLANAR_TILE_ROWS == 0),
+            (!planar || destinationRows % NVFP4_PLANAR_TILE_ROWS == 0) &&
+            !(planar && compactScales),
             "Compact E4M3 NVFP4 block-16 packing received invalid metadata.\n");
         const int packedBlocks = (columns - 1) / 16 + 1;
         const int scaleRows = (rows - 1) / blockK + 1;
@@ -671,7 +673,8 @@ namespace fastllm {
         const int globalCount = (int)globalScales.size();
         const size_t rawBytesPerRow = GetNVFP4WeightBytes(1, columns);
         const size_t packedBytesPerRow =
-            GetDataBytes(DataType::NVFP4_BLOCK_16, 1, columns);
+            GetDataBytes(compactScales ? DataType::NVFP4_BLOCK_16_E4M3_PACKED :
+                DataType::NVFP4_BLOCK_16, 1, columns);
         static const FP8E4M3ToFP32Manager fp8ToFloat;
 
         for (int localRow = 0; localRow < destinationRows; localRow++) {
@@ -690,6 +693,12 @@ namespace fastllm {
                 weights + (size_t)sourceRow * rawBytesPerRow;
             uint8_t *rowDestination =
                 destination + (size_t)localRow * packedBytesPerRow;
+            if (compactScales) {
+                const size_t usedBytes = sizeof(float) + (size_t)packedBlocks * 9;
+                memset(rowDestination + usedBytes, 0, packedBytesPerRow - usedBytes);
+                memcpy(rowDestination, &globalScale, sizeof(float));
+                rowDestination += sizeof(float);
+            }
             for (int block = 0; block < packedBlocks; block++) {
                 const int blockStart = block * 16;
                 const int blockElements =
@@ -703,13 +712,17 @@ namespace fastllm {
 
                 const size_t scaleIndex =
                     (size_t)scaleRow * scaleColumns + block;
-                const float scale =
-                    fp8ToFloat.dict[scaleBytes[scaleIndex]] * globalScale;
-                uint8_t *scaleDestination = planar
-                    ? destination + NVFP4PlanarScaleOffset(localRow, packedBlocks, block)
-                    : blockDestination + 8;
-                memcpy(scaleDestination, &scale, sizeof(scale));
-                rowDestination += 8 + sizeof(scale);
+                if (compactScales) {
+                    blockDestination[8] = scaleBytes[scaleIndex];
+                } else {
+                    const float scale =
+                        fp8ToFloat.dict[scaleBytes[scaleIndex]] * globalScale;
+                    uint8_t *scaleDestination = planar
+                        ? destination + NVFP4PlanarScaleOffset(localRow, packedBlocks, block)
+                        : blockDestination + 8;
+                    memcpy(scaleDestination, &scale, sizeof(scale));
+                }
+                rowDestination += 8 + (compactScales ? 1 : sizeof(float));
             }
         }
     }
@@ -784,6 +797,9 @@ namespace fastllm {
             return rows * blocks * (8 + sizeof(uint8_t));
         } else if (type == DataType::NVFP4_BLOCK_16_E4M3) {
             return GetNVFP4StorageBytes(rows, columns, 1, 16);
+        } else if (type == DataType::NVFP4_BLOCK_16_E4M3_PACKED) {
+            // Keep each row-global FP32 multiplier aligned for CUDA loads.
+            return rows * ((sizeof(float) + ((columns + 15) / 16) * 9 + 3) & ~size_t(3));
         } else if (type == DataType::NVFP4_BLOCK_32_E8M0) {
             int blocks = (columns - 1) / 32 + 1;
             return rows * blocks * (16 + sizeof(uint8_t));
@@ -1492,6 +1508,7 @@ namespace fastllm {
         if (dataType == oriDataType &&
             (dataType == DataType::NVFP4 || dataType == DataType::NVFP4_BLOCK_16 ||
              dataType == DataType::NVFP4_BLOCK_16_PLANAR ||
+             dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED ||
              dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
              dataType == DataType::NVFP4_BLOCK_16_E4M3 ||
              dataType == DataType::NVFP4_BLOCK_32_E8M0 ||
@@ -1502,6 +1519,7 @@ namespace fastllm {
                 this->scales.clear();
             } else if (dataType == DataType::NVFP4_BLOCK_16 ||
                        dataType == DataType::NVFP4_BLOCK_16_PLANAR ||
+                       dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED ||
                        dataType == DataType::NVFP4_BLOCK_16_E4M3) {
                 // NVFP4_BLOCK_16 keeps its block scales inline.  oriScales, when
                 // present, contains only the tensor-level dequant multiplier
@@ -1888,6 +1906,7 @@ namespace fastllm {
         } else if (this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
                    this->dataType == DataType::NVFP4_BLOCK_16 ||
                    this->dataType == DataType::NVFP4_BLOCK_16_PLANAR ||
+                   this->dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED ||
                    this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
                    this->dataType == DataType::NVFP4_BLOCK_16_E4M3 ||
                    this->dataType == DataType::NVFP4_BLOCK_32_E8M0 ||
@@ -1919,6 +1938,7 @@ namespace fastllm {
              this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
              this->dataType == DataType::NVFP4_BLOCK_16 ||
              this->dataType == DataType::NVFP4_BLOCK_16_PLANAR ||
+             this->dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED ||
              this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
              this->dataType == DataType::NVFP4_BLOCK_16_E4M3 ||
              this->dataType == DataType::NVFP4_BLOCK_32_E8M0 ||
@@ -2156,6 +2176,7 @@ namespace fastllm {
              this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
              this->dataType == DataType::NVFP4_BLOCK_16 ||
              this->dataType == DataType::NVFP4_BLOCK_16_PLANAR ||
+             this->dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED ||
              this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
              this->dataType == DataType::NVFP4_BLOCK_16_E4M3 ||
              this->dataType == DataType::NVFP4_BLOCK_32_E8M0 ||
@@ -2177,6 +2198,7 @@ namespace fastllm {
              this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
              this->dataType == DataType::NVFP4_BLOCK_16 ||
              this->dataType == DataType::NVFP4_BLOCK_16_PLANAR ||
+             this->dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED ||
              this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
              this->dataType == DataType::NVFP4_BLOCK_16_E4M3 ||
              this->dataType == DataType::NVFP4_BLOCK_32_E8M0 ||
@@ -2297,7 +2319,11 @@ namespace fastllm {
             // every request and layer, which is especially expensive during
             // batched prefill.
             if (v == 0.0f) {
-                FastllmCudaMemset0(this->cudaData, this->expansionBytes);
+                const uint64_t bytes = this->expansionDims.empty() &&
+                    !this->isModelWeight && !this->isKVCache
+                    ? std::min(this->GetBytes(), this->expansionBytes)
+                    : this->expansionBytes;
+                FastllmCudaMemset0(this->cudaData, bytes);
             } else if (this->dataType == DataType::FLOAT32) {
                 std::vector <float> f = std::vector <float> (Count(0), v);
                 FastllmCudaCopyFromHostToDevice(cudaData, f.data(), Count(0) * sizeof(float));
@@ -2792,6 +2818,16 @@ namespace fastllm {
 
         if (this->expansionBytes != 0) {
 #ifdef USE_CUDA
+            // Reused scratch tensors can shrink after prefill. Keep their
+            // allocation, but transfer only the current tensor, not the
+            // largest batch ever allocated. Explicitly expanded storage and
+            // persistent weights/KV caches retain their full-copy semantics.
+            auto bytesToCopy = [&]() -> uint64_t {
+                return this->expansionDims.empty() &&
+                    !this->isModelWeight && !this->isKVCache
+                    ? std::min(this->GetBytes(), this->expansionBytes)
+                    : this->expansionBytes;
+            };
             if (this->dataDevice == DataDevice::CPU) {
                 if (device == DataDevice::CUDA) {
                     int destDevice = deviceIds.size() == 0 ? FastllmCudaGetDevice() : deviceIds[0];
@@ -2809,12 +2845,13 @@ namespace fastllm {
                         }
                     }
                     if (copyData) {
+                        const uint64_t copyBytes = bytesToCopy();
                         uint8_t *cpuData = this->cpuData;
                         bool ownedCpuDataCopy = false;
 #ifdef USE_MMAP
                         if (this->cpuData != nullptr && this->mapFile != nullptr) {
-                            cpuData = new uint8_t[expansionBytes];
-                            memcpy(cpuData, this->cpuData, expansionBytes);
+                            cpuData = new uint8_t[copyBytes];
+                            memcpy(cpuData, this->cpuData, copyBytes);
                             ownedCpuDataCopy = true;
                         }
 #endif
@@ -2825,7 +2862,7 @@ namespace fastllm {
                         }
 
                         if (cpuData != nullptr) {
-                            FastllmCudaCopyFromHostToDevice(this->cudaData, cpuData, expansionBytes);
+                            FastllmCudaCopyFromHostToDevice(this->cudaData, cpuData, copyBytes);
                         } else if (!this->numasData.empty() && this->dims.size() == 2) {
                             int numaCnt = this->numasData.size();
                             int k = this->dims[0], m = this->dims[1];
@@ -2871,7 +2908,7 @@ namespace fastllm {
                         this->cpuData = new uint8_t[expansionBytes];
                     }
                     if (copyData) {
-                        FastllmCudaCopyFromDeviceToHost(this->cpuData, this->cudaData, expansionBytes);
+                        FastllmCudaCopyFromDeviceToHost(this->cpuData, this->cudaData, bytesToCopy());
                     }
 
                     if (this->isModelWeight || this->isKVCache) {
@@ -2893,7 +2930,7 @@ namespace fastllm {
                                         void *newCudaData = CudaMallocForData(*this, expansionBytes);
                                         CheckCudaMallocForData(*this, newCudaData, expansionBytes, "Data::ToDevice CUDA->CUDA");
                                         if (copyData) {
-                                            FastllmCudaMemcpyBetweenDevices(destDevice, newCudaData, sourceDevice, this->cudaData, expansionBytes);
+                                            FastllmCudaMemcpyBetweenDevices(destDevice, newCudaData, sourceDevice, this->cudaData, bytesToCopy());
                                         }
                                         FastllmCudaSetDevice(sourceDevice);
                                         CudaFreeForData(*this, this->cudaData);
@@ -3266,6 +3303,7 @@ namespace fastllm {
         } else if (this->dataType == DataType::NVFP4 ||
                    this->dataType == DataType::NVFP4_BLOCK_16 ||
                    this->dataType == DataType::NVFP4_BLOCK_16_PLANAR ||
+                   this->dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED ||
                    this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
                    this->dataType == DataType::NVFP4_BLOCK_16_E4M3 ||
                    this->dataType == DataType::NVFP4_BLOCK_32_E8M0) {

@@ -2543,6 +2543,66 @@ namespace fastllm {
         if ((weightName != kMtpPackedGateName && weightName != kMtpPackedDownName) ||
             finishedWeightNames.count(kMtpPackedGateName) == 0 ||
             finishedWeightNames.count(kMtpPackedDownName) == 0) {
+#ifdef USE_CUDA
+            // TP needs host weights; routed experts have their own placement path.
+            if (threadTpState || threadTpRank >= 0 ||
+                weightName.find(".mlp.experts.") != std::string::npos ||
+                (weightName != "lm_head.weight" &&
+                 !Qwen4StartsWith(weightName, languagePrefix) &&
+                 !Qwen4StartsWith(weightName, "mtp."))) {
+                return;
+            }
+            // GPU experts can retain their source layout until warmup repacks
+            // them. Streaming all dense weights now would overlap those sources
+            // and consume the headroom needed by loading and repacking.
+            // Keep the host-memory optimization for CPU/NUMA/disk experts.
+            for (int i = 0; i < this->block_cnt; ++i) {
+                const std::string moeDevice = this->SelectMoeDeviceForLayer(i);
+                if (moeDevice == "cuda" || Qwen4StartsWith(moeDevice, "cuda:") ||
+                    moeDevice == "multicuda" || Qwen4StartsWith(moeDevice, "multicuda:")) {
+                    return;
+                }
+            }
+            auto found = this->weight.weight.find(weightName);
+            if (found == this->weight.weight.end()) return;
+            Data &data = found->second;
+            // Norms, embeddings and PLE metadata still have CPU consumers.
+            if (!data.isModelWeight || data.isFake || data.isDiskWeight ||
+                data.dataDevice != DataDevice::CPU || data.cpuData == nullptr ||
+                data.dims.size() != 2 ||
+                this->weight.GetWeightType(weightName) != WeightType::LINEAR) {
+                return;
+            }
+            int layer = this->block_cnt - 1;
+            const std::string layersPrefix = languagePrefix + "layers.";
+            if (Qwen4StartsWith(weightName, layersPrefix)) {
+                const char *start = weightName.c_str() + layersPrefix.size();
+                char *end = nullptr;
+                const long parsed = std::strtol(start, &end, 10);
+                if (end == start || *end != '.' || parsed < 0 ||
+                    parsed >= this->block_cnt) return;
+                layer = (int)parsed;
+            }
+            const std::string device = SelectDeviceFromMap(
+                this->deviceMap, layer + 1, this->block_cnt);
+            if (device != "cuda" && !Qwen4StartsWith(device, "cuda:")) return;
+            std::map<int, int> ratios;
+            const std::vector<int> devices = ParseDeviceIds(device, "cuda", ratios);
+            // ToDevice resolves bare "cuda"; splitting still needs the host source.
+            if (devices.size() > 1 || (!devices.empty() &&
+                (devices[0] < 0 || devices[0] >= FastllmCudaGetDeviceCount()))) return;
+            for (const auto &rule : this->weightMergeRules) {
+                if (rule.allInputs.count(weightName)) return;
+            }
+            // Merged outputs also reach this callback. Release their host storage
+            // now instead of retaining all dense weights until warmup.
+            const int previousDevice = FastllmCudaGetDevice();
+            // Long-lived weights should not fill the reusable workspace pool.
+            // Preserve an explicitly configured model-weight slab.
+            if (FastllmCudaGetWeightSlabBytes() == 0) data.directMemory = true;
+            data.ToDevice(DataDevice::CUDA, devices);
+            FastllmCudaSetDevice(previousDevice);
+#endif
             return;
         }
         auto gate = this->weight.weight.find(kMtpPackedGateName);
@@ -5369,34 +5429,18 @@ namespace fastllm {
             Linear(typedInput, kWeight, Data(), key);
             Linear(typedInput, vWeight, Data(), value);
         }
-        qGate.Reshape({batch, sequence, -1, this->head_dim * 2});
-        Split(qGate, -1, 0, this->head_dim, query);
-        Split(qGate, -1, this->head_dim, this->head_dim * 2, gate);
-        gate.Reshape({batch, sequence, -1});
-
-        key.Reshape({batch, sequence, -1, this->head_dim});
-        value.Reshape({batch, sequence, -1, this->head_dim});
-
-        RMSNorm(query, this->weight[attention + "q_norm.weight"],
-                this->rms_norm_eps, query);
-        RMSNorm(key, this->weight[attention + "k_norm.weight"],
-                this->rms_norm_eps, key);
-        ApplyTextRotary(query, positionIds);
-        ApplyTextRotary(key, positionIds);
-
-        PermuteSelf(query, {0, 2, 1, 3});
-        PermuteSelf(key, {0, 2, 1, 3});
-        PermuteSelf(value, {0, 2, 1, 3});
-        query.Reshape({-1, sequence, this->head_dim});
-        key.Reshape({-1, sequence, this->head_dim});
-        value.Reshape({-1, sequence, this->head_dim});
-
+        // Reserve using the final head-major shape before preparing Q/K/V.
+        // This lets the fused path write K/V directly into the existing cache.
+        Data keyCacheDesc(key.dataType);
+        keyCacheDesc.Resize({batch * key.dims.back() / this->head_dim,
+                             sequence, this->head_dim});
+        keyCacheDesc.dataDevice = key.dataDevice;
         if (GetKVCacheInCPU()) {
             pastKey.lockInCPU = true;
             pastValue.lockInCPU = true;
         }
-        if (pastKey.dims.empty() && pastKey.dataType != key.dataType) {
-            pastKey.dataType = key.dataType;
+        if (pastKey.dims.empty() && pastKey.dataType != keyCacheDesc.dataType) {
+            pastKey.dataType = keyCacheDesc.dataType;
             pastKey.UpdateUnitSize();
         }
         if (pastValue.dims.empty() && pastValue.dataType != value.dataType) {
@@ -5404,44 +5448,85 @@ namespace fastllm {
             pastValue.UpdateUnitSize();
         }
         const int unitLength = !GetKVCacheInCPU() &&
-            key.dataDevice == DataDevice::CUDA ? 128 : 64;
+            keyCacheDesc.dataDevice == DataDevice::CUDA ? 128 : 64;
         const bool geometricGrowth =
             state.geometricCacheGrowthReadyLayers.count(stateLayer) != 0;
         // Reserve decode headroom during final prefill without changing the
         // logical cache length or the default allocation schedule.
         Qwen4EnsureAppendCapacity(
-            pastKey, key, 1, unitLength,
+            pastKey, keyCacheDesc, 1, unitLength,
             kQwen4DenseCacheMaxGrowth, geometricGrowth, decodeReserveTokens);
         Qwen4EnsureAppendCapacity(
-            pastValue, value, 1, unitLength,
+            pastValue, keyCacheDesc, 1, unitLength,
             kQwen4DenseCacheMaxGrowth, geometricGrowth, decodeReserveTokens);
-        bool appendedWithStridedCudaCache = false;
+        bool fusedPrepared = false;
 #ifdef USE_CUDA
-        if (!GetKVCacheInCPU() &&
-            key.dataDevice == DataDevice::CUDA &&
+        if (!GetKVCacheInCPU() && key.dataDevice == DataDevice::CUDA &&
             value.dataDevice == DataDevice::CUDA) {
-            pastKey.ToDevice(
-                DataDevice::CUDA, key.dataDeviceIds,
-                previousLength > 0);
-            pastValue.ToDevice(
-                DataDevice::CUDA, value.dataDeviceIds,
-                previousLength > 0);
+            pastKey.ToDevice(DataDevice::CUDA, key.dataDeviceIds, previousLength > 0);
+            pastValue.ToDevice(DataDevice::CUDA, value.dataDeviceIds, previousLength > 0);
         }
-        if (!GetKVCacheInCPU() &&
-            key.dataDevice == DataDevice::CUDA &&
-            value.dataDevice == DataDevice::CUDA &&
-            pastKey.dataDevice == DataDevice::CUDA &&
-            pastValue.dataDevice == DataDevice::CUDA) {
-            appendedWithStridedCudaCache = FastllmCudaQwen4KVAppend(
-                key, value, previousLength, pastKey, pastValue);
+        if (!GetKVCacheInCPU() && qGate.dataDevice == DataDevice::CUDA) {
+            Qwen4CudaDeviceGuard deviceGuard(qGate.dataDeviceIds);
+            Data &qNorm = this->weight[attention + "q_norm.weight"];
+            Data &kNorm = this->weight[attention + "k_norm.weight"];
+            qNorm.ToDevice(DataDevice::CUDA, qGate.dataDeviceIds);
+            kNorm.ToDevice(DataDevice::CUDA, qGate.dataDeviceIds);
+            const Data *positions = &positionIds;
+            Data cudaPositions;
+            if (positionIds.dataDevice != DataDevice::CUDA) {
+                cudaPositions.CopyFrom(positionIds);
+                cudaPositions.ToDevice(DataDevice::CUDA, qGate.dataDeviceIds);
+                positions = &cudaPositions;
+            }
+            fusedPrepared = FastllmCudaQwen4AttentionPrepare(
+                qGate, key, value, qNorm, kNorm, *positions,
+                query, gate, pastKey, pastValue, this->head_dim, this->rotary_dim,
+                this->mropeSections[1], this->mropeSections[2],
+                this->rms_norm_eps, this->rope_base, previousLength);
         }
 #endif
+        bool appendedWithStridedCudaCache = fusedPrepared;
+        if (!fusedPrepared) {
+            qGate.Reshape({batch, sequence, -1, this->head_dim * 2});
+            Split(qGate, -1, 0, this->head_dim, query);
+            Split(qGate, -1, this->head_dim, this->head_dim * 2, gate);
+            gate.Reshape({batch, sequence, -1});
+
+            key.Reshape({batch, sequence, -1, this->head_dim});
+            value.Reshape({batch, sequence, -1, this->head_dim});
+
+            RMSNorm(query, this->weight[attention + "q_norm.weight"],
+                    this->rms_norm_eps, query);
+            RMSNorm(key, this->weight[attention + "k_norm.weight"],
+                    this->rms_norm_eps, key);
+            ApplyTextRotary(query, positionIds);
+            ApplyTextRotary(key, positionIds);
+
+            PermuteSelf(query, {0, 2, 1, 3});
+            PermuteSelf(key, {0, 2, 1, 3});
+            PermuteSelf(value, {0, 2, 1, 3});
+            query.Reshape({-1, sequence, this->head_dim});
+            key.Reshape({-1, sequence, this->head_dim});
+            value.Reshape({-1, sequence, this->head_dim});
+
+#ifdef USE_CUDA
+            if (!GetKVCacheInCPU() &&
+                key.dataDevice == DataDevice::CUDA &&
+                value.dataDevice == DataDevice::CUDA &&
+                pastKey.dataDevice == DataDevice::CUDA &&
+                pastValue.dataDevice == DataDevice::CUDA) {
+                appendedWithStridedCudaCache = FastllmCudaQwen4KVAppend(
+                    key, value, previousLength, pastKey, pastValue);
+            }
+#endif
+        }
         if (appendedWithStridedCudaCache) {
             pastKey.Resize(
-                {key.dims[0], previousLength + sequence,
+                {keyCacheDesc.dims[0], previousLength + sequence,
                  this->head_dim});
             pastValue.Resize(
-                {value.dims[0], previousLength + sequence,
+                {keyCacheDesc.dims[0], previousLength + sequence,
                  this->head_dim});
         } else {
             CatDirect(pastKey, key, 1);
@@ -5463,12 +5548,22 @@ namespace fastllm {
             Attention(query, pastKey, pastValue, qsaMask, context,
                       attentionGroup, attentionScale, 1);
         }
-        PermuteSelf(context, {1, 0, 2});
-        context.Reshape({sequence, batch, -1});
-        PermuteSelf(context, {1, 0, 2});
-
-        SigmoidMulTo(context, gate);
-        Linear(context, this->weight[attention + "o_proj.weight"], Data(), output);
+        Data gatedContext;
+        bool fusedOutput = false;
+#ifdef USE_CUDA
+        if (context.dataDevice == DataDevice::CUDA) {
+            Qwen4CudaDeviceGuard deviceGuard(context.dataDeviceIds);
+            fusedOutput = FastllmCudaQwen4AttentionOutput(context, gate, gatedContext);
+        }
+#endif
+        if (!fusedOutput) {
+            PermuteSelf(context, {1, 0, 2});
+            context.Reshape({sequence, batch, -1});
+            PermuteSelf(context, {1, 0, 2});
+            SigmoidMulTo(context, gate);
+        }
+        Linear(fusedOutput ? gatedContext : context,
+               this->weight[attention + "o_proj.weight"], Data(), output);
         ThreadTpAllReduce(output);
     }
 
@@ -10817,6 +10912,9 @@ namespace fastllm {
         Data embedding, hiddenBuffers[2];
         Data *hiddenStates = &hiddenBuffers[0];
         Data *nextHiddenStates = &hiddenBuffers[1];
+        // The previous request/chunk may have left the last layer's device
+        // selected. Expand the embedding on the first layer's device.
+        ApplyDeviceMap(this->deviceMap, 1, this->block_cnt);
         DumpTensorIfRequested("input_ids", inputIds);
         DumpTensorIfRequested("position_ids", positionIds);
         if (precomputedEmbedding != nullptr) {
@@ -11143,7 +11241,11 @@ namespace fastllm {
                     *nextHiddenStates, finalHyperNorm);
                 hasFinalHyperNorm = true;
                 hasCarriedAttentionNorm = false;
-            } else if (layer + 1 != this->pleLayer) {
+            } else if (layer + 1 != this->pleLayer &&
+                       SelectDeviceFromMap(this->deviceMap, layer + 1,
+                                           this->block_cnt) ==
+                       SelectDeviceFromMap(this->deviceMap, layer + 2,
+                                           this->block_cnt)) {
                 const std::string nextAttentionHyperPrefix =
                     languagePrefix + "layers." +
                     std::to_string(layer + 1) +
@@ -11162,8 +11264,10 @@ namespace fastllm {
                 hasCarriedAttentionProjection =
                     carriedProjectionStorage != nullptr;
             } else {
-                // PLE changes the residual before the next attention norm, so
-                // this single boundary cannot be normalized ahead of time.
+                // PLE changes the residual before the next attention norm.
+                // At a device boundary, carry only the residual and compute
+                // the norm/projection on the receiving device; carrying both
+                // intermediates would transfer the large activation again.
                 HyperCombine(*hiddenStates, mlpOutput, mlpInjection,
                              *nextHiddenStates);
                 hasCarriedAttentionNorm = false;

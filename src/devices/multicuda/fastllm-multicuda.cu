@@ -11,6 +11,9 @@
 #include <stdio.h>
 #include <vector>
 #include <chrono>
+#include <condition_variable>
+#include <cmath>
+#include <cerrno>
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
@@ -2247,6 +2250,165 @@ static ncclComm_t FindNcclCommNoLog(int deviceId) {
     return it == g_ncclComms.end() ? nullptr : it->second;
 }
 
+// Blocking NCCL calls (including GroupEnd/CommAbort) cannot be bounded by
+// polling their return value. A watchdog bounds the whole startup attempt;
+// timed-out collectives cannot safely fall back to inference in this process.
+class FastllmNcclInitWatchdog {
+public:
+    FastllmNcclInitWatchdog() {
+        long timeoutMs = 60000;
+        if (const char *value = std::getenv("FASTLLM_NCCL_INIT_TIMEOUT_MS")) {
+            char *end = nullptr;
+            errno = 0;
+            long parsed = std::strtol(value, &end, 10);
+            if (errno == 0 && end != value && *end == '\0' &&
+                parsed > 0 && parsed <= 3600000) {
+                timeoutMs = parsed;
+            } else {
+                std::fprintf(stderr, "[Fastllm] Invalid FASTLLM_NCCL_INIT_TIMEOUT_MS; using 60000 ms.\n");
+            }
+        }
+        worker = std::thread([this, timeoutMs] {
+            std::unique_lock<std::mutex> lock(mutex);
+            if (!cv.wait_for(lock, std::chrono::milliseconds(timeoutMs),
+                             [this] { return finished; })) {
+                std::fprintf(stderr,
+                    "[Fastllm] NCCL initialization/self-test timed out after %ld ms; terminating to avoid invalid TP results.\n",
+                    timeoutMs);
+                std::fflush(stderr);
+                // Do not run CUDA/NCCL cleanup or static destructors while
+                // another thread may be stuck inside the driver/library.
+                std::_Exit(EXIT_FAILURE);
+            }
+        });
+    }
+    ~FastllmNcclInitWatchdog() { Finish(); }
+    void Finish() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            finished = true;
+        }
+        cv.notify_one();
+        if (worker.joinable()) worker.join();
+    }
+private:
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool finished = false;
+    std::thread worker;
+};
+
+[[noreturn]] static void FastllmNcclInitFailed(
+        const std::vector<ncclComm_t> &comms, const char *reason) {
+    std::fprintf(stderr,
+        "[Fastllm] NCCL %s. Check the loaded NCCL library, CUDA runtime/driver and GPU connectivity.\n",
+        reason);
+    std::fflush(stderr);
+    // NCCL itself may write its detailed diagnostic to buffered stdout.
+    std::fflush(stdout);
+    // A failed group may still have outstanding work. Abort before releasing
+    // anything it can access; the startup watchdog also bounds this cleanup.
+    for (ncclComm_t comm : comms) {
+        if (comm != nullptr) ncclCommAbort(comm);
+    }
+    // Failure must not wait for stdin, report success, or run CUDA destructors.
+    // The driver reclaims startup buffers when this process exits.
+    std::_Exit(EXIT_FAILURE);
+}
+
+static bool FastllmNcclSelfTest(const std::vector<int> &devices) {
+    const int numGPUs = (int)devices.size();
+    const int count = 1024;
+    const float expect = (float)numGPUs * (numGPUs + 1) / 2.0f;
+    std::vector<void*> buffers(numGPUs, nullptr);
+    std::vector<float> host(count);
+    auto cudaOk = [](cudaError_t result, const char *stage, int device) {
+        if (result == cudaSuccess) return true;
+        std::fprintf(stderr, "[Fastllm] NCCL self-test %s on device %d: %s\n",
+                     stage, device, cudaGetErrorString(result));
+        return false;
+    };
+    auto ncclOk = [](ncclResult_t result, const char *stage, int device) {
+        if (result == ncclSuccess) return true;
+        std::fprintf(stderr, "[Fastllm] NCCL self-test %s on device %d: %s\n",
+                     stage, device, ncclGetErrorString(result));
+        return false;
+    };
+    int originalDevice = -1;
+    bool ok = cudaOk(cudaGetDevice(&originalDevice), "get device", -1);
+    for (int i = 0; i < numGPUs && ok; ++i) {
+        std::fill(host.begin(), host.end(), (float)(i + 1));
+        ok = cudaOk(cudaSetDevice(devices[i]), "select device", devices[i]) &&
+             cudaOk(cudaMalloc(&buffers[i], count * sizeof(float)), "allocate", devices[i]) &&
+             cudaOk(cudaMemcpy(buffers[i], host.data(), count * sizeof(float),
+                               cudaMemcpyHostToDevice), "upload", devices[i]);
+    }
+    if (ok && ncclOk(ncclGroupStart(), "group start", -1)) {
+        // One host thread submits all ranks: grouping is required even for
+        // older NCCL versions, otherwise the first rank may wait for peers.
+        for (int i = 0; i < numGPUs && ok; ++i) {
+            ok = cudaOk(cudaSetDevice(devices[i]), "select device", devices[i]) &&
+                 ncclOk(ncclAllReduce(buffers[i], buffers[i], count, ncclFloat, ncclSum,
+                                     g_ncclComms[devices[i]], cudaStreamPerThread),
+                        "all-reduce launch", devices[i]);
+        }
+        // Always close a successfully opened group, including a partial launch.
+        bool groupOk = ncclOk(ncclGroupEnd(), "group end", -1);
+        ok = ok && groupOk;
+    } else {
+        ok = false;
+    }
+
+    // CUDA synchronization alone can wait forever on an NCCL async error.
+    // Poll every outstanding rank so a failure on any peer is noticed early.
+    std::vector<bool> complete(numGPUs, false);
+    int remaining = numGPUs;
+    while (ok && remaining > 0) {
+        for (int i = 0; i < numGPUs && ok; ++i) {
+            if (complete[i]) continue;
+            ncclResult_t asyncError = ncclSuccess;
+            ok = ncclOk(ncclCommGetAsyncError(g_ncclComms[devices[i]], &asyncError),
+                        "query async error", devices[i]) &&
+                 ncclOk(asyncError, "async error", devices[i]) &&
+                 cudaOk(cudaSetDevice(devices[i]), "select device", devices[i]);
+            if (!ok) break;
+            cudaError_t status = cudaStreamQuery(cudaStreamPerThread);
+            if (status == cudaSuccess) {
+                complete[i] = true;
+                --remaining;
+            } else if (status != cudaErrorNotReady) {
+                ok = cudaOk(status, "query completion", devices[i]);
+            }
+        }
+        if (ok && remaining > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    for (int i = 0; i < numGPUs && ok; ++i) {
+        ok = cudaOk(cudaSetDevice(devices[i]), "select device", devices[i]) &&
+             cudaOk(cudaMemcpy(host.data(), buffers[i], count * sizeof(float),
+                               cudaMemcpyDeviceToHost), "read result", devices[i]);
+        if (!ok) break;
+        for (int j = 0; j < count; ++j) {
+            if (!std::isfinite(host[j]) || std::fabs(host[j] - expect) > 1e-3f) {
+                std::fprintf(stderr,
+                    "[Fastllm] NCCL self-test mismatch on device %d at element %d: expected %f, got %f\n",
+                    devices[i], j, expect, host[j]);
+                ok = false;
+                break;
+            }
+        }
+    }
+    // On failure the caller aborts all communicators and terminates. Do not
+    // cudaFree buffers that an incomplete collective could still be using.
+    if (!ok) return false;
+    for (int i = 0; i < numGPUs; ++i) {
+        if (!cudaOk(cudaSetDevice(devices[i]), "select device", devices[i]) ||
+            !cudaOk(cudaFree(buffers[i]), "free buffer", devices[i])) return false;
+    }
+    return cudaOk(cudaSetDevice(originalDevice), "restore device", originalDevice);
+}
+
 uint64_t FastllmGetNcclGeneration() {
     return g_ncclGeneration.load(std::memory_order_acquire);
 }
@@ -2274,6 +2436,8 @@ bool FastllmInitNccl(const std::vector<int>& devices) {
         FastllmCudaCustomAllReduceInit(uniqueDevices);
         return true;
     }
+
+    FastllmNcclInitWatchdog startupWatchdog;
 
     // Publish a new generation before tearing down the old group. Even if a
     // future initialization error prevents custom state from being rebuilt,
@@ -2307,8 +2471,8 @@ bool FastllmInitNccl(const std::vector<int>& devices) {
     // 注意：这会阻塞，直到所有卡都就绪
     ncclResult_t initRes = ncclCommInitAll(comms.data(), numGPUs, uniqueDevices.data());
     if (initRes != ncclSuccess) {
-        printf("Error: ncclCommInitAll failed: %s\n", ncclGetErrorString(initRes));
-        return false;
+        std::fprintf(stderr, "[Fastllm] ncclCommInitAll failed: %s\n", ncclGetErrorString(initRes));
+        FastllmNcclInitFailed(comms, "communicator initialization failed");
     }
 
     // 将生成的 comms 存入 map，方便后续通过 deviceId 查找
@@ -2316,7 +2480,12 @@ bool FastllmInitNccl(const std::vector<int>& devices) {
         g_ncclComms[uniqueDevices[i]] = comms[i];
         g_ncclRanks[uniqueDevices[i]] = i;
     }
-        
+
+    if (!FastllmNcclSelfTest(uniqueDevices)) {
+        FastllmNcclInitFailed(comms, "self-test failed");
+    }
+    startupWatchdog.Finish();
+
     g_ncclInitialized = true;
     g_ncclWorldSize = numGPUs;
     // Every multi-rank TP group meets around NCCL submission: even-rank

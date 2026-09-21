@@ -507,18 +507,6 @@ static bool FastllmPagedCublasLinearKvEnabled() {
     return defaultEnabled != 0;
 }
 
-static bool FastllmPagedCublasFragmentedLinearKvEnabled() {
-    const char *env = std::getenv("FASTLLM_PAGED_CUBLAS_FRAGMENTED_LINEAR_KV");
-    if (env != nullptr && env[0] != '\0') {
-        return env[0] != '0';
-    }
-    static thread_local int defaultEnabled = -1;
-    if (defaultEnabled < 0) {
-        defaultEnabled = FastllmCudaRuntimeArch() == 70 ? 1 : 0;
-    }
-    return defaultEnabled != 0;
-}
-
 static int FastllmPagedLinearPageDirection(const std::vector<int32_t> &pageIndices) {
     if (pageIndices.empty()) {
         return 0;
@@ -539,11 +527,15 @@ static int FastllmPagedLinearPageDirection(const std::vector<int32_t> &pageIndic
     return direction;
 }
 
-static int FastllmPagedLinearPrefixRunCount(
-    const std::vector<int32_t> &pageIndices,
-    int pageCount,
-    int stopAfter) {
-    int runCount = 0;
+struct FastllmPagedPhysicalRun {
+    int firstPage;
+    int pageCount;
+};
+
+static std::vector<FastllmPagedPhysicalRun> FastllmPagedPhysicalPrefixRuns(
+    const std::vector<int32_t> &pageIndices, int pageCount, size_t &logicalRunCount) {
+    std::vector<FastllmPagedPhysicalRun> runs;
+    runs.reserve(std::min(pageCount, 16));
     for (int first = 0; first < pageCount;) {
         int end = first + 1;
         int direction = 0;
@@ -559,12 +551,26 @@ static int FastllmPagedLinearPrefixRunCount(
                 end++;
             }
         }
+        runs.push_back({std::min(pageIndices[first], pageIndices[end - 1]), end - first});
         first = end;
-        if (++runCount > stopAfter) {
-            break;
+    }
+    logicalRunCount = runs.size();
+    // Only fully visible prefix pages may be reordered. Coalesce physical
+    // neighbors before estimating cost: many logical runs can be one span.
+    std::sort(runs.begin(), runs.end(),
+              [](const FastllmPagedPhysicalRun &a, const FastllmPagedPhysicalRun &b) {
+                  return a.firstPage < b.firstPage;
+              });
+    size_t merged = 0;
+    for (const auto &run : runs) {
+        if (merged > 0 && runs[merged - 1].firstPage + runs[merged - 1].pageCount == run.firstPage) {
+            runs[merged - 1].pageCount += run.pageCount;
+        } else {
+            runs[merged++] = run;
         }
     }
-    return runCount;
+    runs.resize(merged);
+    return runs;
 }
 
 static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
@@ -644,23 +650,34 @@ static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
         FastllmPagedLinearPageDirection(pageIndices) : 0;
     const int fullyVisiblePages = pageLen > 0 ? std::max(0, std::min(
         numPages, (kvLen - qoLen) / pageLen)) : 0;
-    // Direct cuBLAS calls save the gather traffic only while the physical
-    // prefix consists of a small number of runs. Bound the unmerged logical
-    // run count so adversarial fragmentation cannot turn one gather chunk
-    // into hundreds of tiny GEMMs. Physical sorting may merge this upper
-    // bound further below.
-    const int maxFragmentedRuns = 8;
-    const int fragmentedPrefixRuns = linearKvCandidate && linearPageDirection == 0 ?
-        FastllmPagedLinearPrefixRunCount(
-            pageIndices, fullyVisiblePages, maxFragmentedRuns) : 0;
-    const bool useLinearKv = linearKvCandidate &&
-        (linearPageDirection != 0 ||
-         (FastllmPagedCublasFragmentedLinearKvEnabled() &&
-          fragmentedPrefixRuns <= maxFragmentedRuns));
+    const int linearChunk = FastllmPagedCublasLinearKvChunkSizeFromEnv(32768);
+    const int gatherChunk = FastllmPagedCublasChunkSizeFromEnv(8192);
+    std::vector<FastllmPagedPhysicalRun> prefixRuns;
+    bool useLinearKv = linearKvCandidate && linearPageDirection != 0;
+    if (linearKvCandidate && linearPageDirection == 0) {
+        size_t logicalRunCount = 0;
+        prefixRuns = FastllmPagedPhysicalPrefixRuns(pageIndices, fullyVisiblePages, logicalRunCount);
+        // Retain the established small-run path: on medium contexts, fewer
+        // gathered blocks can still cost more than direct reads.
+        useLinearKv = logicalRunCount <= 8;
+        if (!useLinearKv) {
+            long long directBlocks = 0;
+            for (const auto &run : prefixRuns) {
+                directBlocks += ((long long)run.pageCount * pageLen + linearChunk - 1) / linearChunk;
+            }
+            // Include the causal tail, which must retain logical page order.
+            for (int page = fullyVisiblePages; page < numPages; page++) {
+                int tokens = page == numPages - 1 ? lastPageLen : pageLen;
+                directBlocks += ((long long)tokens + linearChunk - 1) / linearChunk;
+            }
+            const long long gatherBlocks = ((long long)kvLen + gatherChunk - 1) / gatherChunk;
+            // Extend direct reads when coalescing avoids extra GEMM/softmax
+            // launches. Truly scattered pages retain bounded gathering.
+            useLinearKv = directBlocks <= gatherBlocks;
+        }
+    }
 
-    const int configuredChunk = useLinearKv ?
-        FastllmPagedCublasLinearKvChunkSizeFromEnv(32768) :
-        FastllmPagedCublasChunkSizeFromEnv(8192);
+    const int configuredChunk = useLinearKv ? linearChunk : gatherChunk;
     // There is no benefit in reserving workspace beyond the current KV
     // length, especially for short requests using the larger linear-KV
     // decode default.
@@ -752,126 +769,39 @@ static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
     std::vector<LinearKvChunk> linearKvChunks;
     if (useLinearKv) {
         linearKvChunks.reserve((kvLen + maxChunk - 1) / maxChunk + 2);
-        if (linearPageDirection > 0) {
-            for (int start = 0; start < kvLen; start += maxChunk) {
-                int length = std::min(maxChunk, kvLen - start);
+        auto appendLinearRange = [&](int logicalStart, int tokens, size_t physicalOffset) {
+            for (int start = 0; start < tokens; start += maxChunk) {
                 linearKvChunks.push_back({
-                    start,
-                    length,
-                    (size_t)pageIndices[0] * linearPageStride +
-                        (size_t)start * linearTokenStride
+                    logicalStart + start,
+                    std::min(maxChunk, tokens - start),
+                    physicalOffset + (size_t)start * linearTokenStride
                 });
             }
-        } else if (linearPageDirection < 0) {
-            // Attention reduction is invariant to the order of pages before
-            // the first query token. Scan that prefix in ascending physical
-            // order, then process the one or two causal-tail pages in logical
-            // order. This also covers a verify step crossing a page.
-            int prefixLen = fullyVisiblePages * pageLen;
-            if (prefixLen > 0) {
-                size_t prefixBase =
-                    (size_t)pageIndices[fullyVisiblePages - 1] * linearPageStride;
-                for (int start = 0; start < prefixLen; start += maxChunk) {
-                    int length = std::min(maxChunk, prefixLen - start);
-                    linearKvChunks.push_back({
-                        start,
-                        length,
-                        prefixBase + (size_t)start * linearTokenStride
-                    });
-                }
-            }
-            for (int page = fullyVisiblePages; page < numPages; page++) {
-                int pageTokens = page == numPages - 1 ? lastPageLen : pageLen;
-                for (int start = 0; start < pageTokens; start += maxChunk) {
-                    int length = std::min(maxChunk, pageTokens - start);
-                    linearKvChunks.push_back({
-                        page * pageLen + start,
-                        length,
-                        (size_t)pageIndices[page] * linearPageStride +
-                            (size_t)start * linearTokenStride
-                    });
-                }
-            }
+        };
+        if (linearPageDirection > 0) {
+            appendLinearRange(0, kvLen, (size_t)pageIndices[0] * linearPageStride);
         } else {
-            // A released short request can split the next request's page list
-            // into several physically contiguous runs. All pages before the
-            // causal tail are visible to every query token, so their reduction
-            // order is immaterial. Reorder only that prefix into ascending
-            // physical runs and expose each run directly to cuBLAS.
-            struct PhysicalPageRun {
-                int firstPage;
-                int pageCount;
-            };
-            std::vector<PhysicalPageRun> prefixRuns;
-            prefixRuns.reserve(std::min(fullyVisiblePages, 16));
-            for (int first = 0; first < fullyVisiblePages;) {
-                int end = first + 1;
-                int direction = 0;
-                if (end < fullyVisiblePages) {
-                    int delta = pageIndices[end] - pageIndices[first];
-                    if (delta == 1 || delta == -1) {
-                        direction = delta;
-                    }
+            // Only fully visible prefix pages may be reduced in physical
+            // order. Descending pages form one run; fragmented pages reuse
+            // the coalesced runs used for the cost estimate above.
+            if (linearPageDirection < 0) {
+                if (fullyVisiblePages > 0) {
+                    appendLinearRange(0, fullyVisiblePages * pageLen,
+                        (size_t)pageIndices[fullyVisiblePages - 1] * linearPageStride);
                 }
-                if (direction != 0) {
-                    while (end < fullyVisiblePages &&
-                           pageIndices[end] == pageIndices[end - 1] + direction) {
-                        end++;
-                    }
-                }
-                prefixRuns.push_back({
-                    std::min(pageIndices[first], pageIndices[end - 1]),
-                    end - first
-                });
-                first = end;
-            }
-            std::sort(prefixRuns.begin(), prefixRuns.end(),
-                      [](const PhysicalPageRun &a, const PhysicalPageRun &b) {
-                          return a.firstPage < b.firstPage;
-                      });
-            size_t mergedRunCount = 0;
-            for (const auto &run : prefixRuns) {
-                if (mergedRunCount > 0) {
-                    PhysicalPageRun &last = prefixRuns[mergedRunCount - 1];
-                    if (last.firstPage + last.pageCount == run.firstPage) {
-                        last.pageCount += run.pageCount;
-                        continue;
-                    }
-                }
-                prefixRuns[mergedRunCount++] = run;
-            }
-            prefixRuns.resize(mergedRunCount);
-
-            int logicalStart = 0;
-            for (const auto &run : prefixRuns) {
-                int runTokens = run.pageCount * pageLen;
-                for (int start = 0; start < runTokens; start += maxChunk) {
-                    int length = std::min(maxChunk, runTokens - start);
-                    linearKvChunks.push_back({
-                        logicalStart,
-                        length,
-                        (size_t)run.firstPage * linearPageStride +
-                            (size_t)start * linearTokenStride
-                    });
-                    logicalStart += length;
+            } else {
+                int logicalStart = 0;
+                for (const auto &run : prefixRuns) {
+                    int runTokens = run.pageCount * pageLen;
+                    appendLinearRange(logicalStart, runTokens, (size_t)run.firstPage * linearPageStride);
+                    logicalStart += runTokens;
                 }
             }
-
             // qoLen <= pageLen leaves at most two causal-tail pages. Preserve
-            // their logical order so each query token sees exactly its causal
-            // prefix even when those pages are physically unrelated.
+            // their logical order, including queries crossing a page boundary.
             for (int page = fullyVisiblePages; page < numPages; page++) {
-                int pageTokens = page == numPages - 1 ? lastPageLen : pageLen;
-                for (int start = 0; start < pageTokens; start += maxChunk) {
-                    int length = std::min(maxChunk, pageTokens - start);
-                    linearKvChunks.push_back({
-                        logicalStart,
-                        length,
-                        (size_t)pageIndices[page] * linearPageStride +
-                            (size_t)start * linearTokenStride
-                    });
-                    logicalStart += length;
-                }
+                int tokens = page == numPages - 1 ? lastPageLen : pageLen;
+                appendLinearRange(page * pageLen, tokens, (size_t)pageIndices[page] * linearPageStride);
             }
         }
     }

@@ -270,6 +270,11 @@ bool BindSharedNVFP4(const OffloadLayout &l, const fastllm::Data &w, int part,
         view.tileStride = view.tileRows * ((columns + 15) / 16) * 12;
         view.rowStride = ((columns + 15) / 16) * 8;
         view.blockBytes = view.blockStride = view.rowStride;
+    } else if (w.dataType == fastllm::DataType::NVFP4_BLOCK_16_E4M3_PACKED) {
+        view.tileStride = view.rowStride = fastllm::GetDataBytes(w.dataType, 1, columns);
+        view.sourceOffset = sizeof(float);
+        view.blockBytes = 8;
+        view.blockStride = 9;
     } else if (w.dataType == fastllm::DataType::NVFP4_BLOCK_16) {
         view.tileStride = view.rowStride = ((columns + 15) / 16) * 12;
         view.blockBytes = 8; view.blockStride = 12;

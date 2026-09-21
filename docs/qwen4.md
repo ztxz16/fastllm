@@ -86,6 +86,30 @@ ftllm server /data/models/qwen4-exp \
 
 `--triton` 只在当前 Python 环境能导入 Triton 时启用，否则自动回退到内置 CUDA。实际上下文仍受模型原生上限和 KV Cache 容量限制。
 
+SM75（如 RTX 2080 Ti）的 chunk GDN prefill 需要支持 SM75 Tensor Core 的
+Triton（已验证 3.2.0）。由于 FastLLM 默认依赖 Triton 3.6 以上，建议单独
+安装编译器，保留以下两个必要的环境变量：
+
+~~~bash
+python3 -m venv ~/.venvs/fastllm-triton-sm75
+~/.venvs/fastllm-triton-sm75/bin/pip install 'triton==3.2.0' setuptools
+
+FASTLLM_CUDA_TRITON=1 \
+FASTLLM_CUDA_TRITON_PYTHON="$HOME/.venvs/fastllm-triton-sm75/bin/python" \
+ftllm server /data/models/qwen3.8-flash-next \
+  --device cuda --moe_device numa
+~~~
+
+此命令不要再加 `--triton`，该参数会改用运行 FastLLM 的 Python 环境。
+端口、缓存目录和日志无需额外配置。若编译器仅生成标量乘加，FastLLM 会
+回退原生 CUDA，同一进程内失败的形状不会逐层重试。更换编译器后，应停止
+旧编译服务并重启 FastLLM。
+
+该路径要求 FP16 激活、chunk 大小 64、K/V head dimension 128，至少两个 chunk。
+Qwen4 的 recurrent state 保持 FP32，但 prefill 激活由原路径的 FP32 改为 FP16，
+因此输出不保证逐位一致。
+单 token 解码、MTP 验证和 SM80 及更新 GPU 的原有选择规则不变。
+
 ## MTP 推测解码
 
 ~~~bash
