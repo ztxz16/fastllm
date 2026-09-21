@@ -2252,6 +2252,15 @@ extern "C" bool FastllmCudaTritonQwen4SparseAttention(
     const fastllm::Data &query, const fastllm::Data &key,
     const fastllm::Data &value, const fastllm::Data &indices,
     int group, float scale, fastllm::Data &output) {
+    auto rowMajor = [](const fastllm::Data &data) {
+        if (data.dims.empty() || data.strides.size() != data.dims.size() ||
+            data.strides.back() != 1) return false;
+        for (int i = (int)data.dims.size() - 1; i >= 0; --i) {
+            if (data.dims[i] <= 0 || (i > 0 && data.strides[i - 1] <
+                    (uint64_t)data.dims[i] * data.strides[i])) return false;
+        }
+        return true;
+    };
     const int queryHeads = query.dims.size() == 3 ? query.dims[0] : 0;
     const int sequence = query.dims.size() == 3 ? query.dims[1] : 0;
     const int headDim = query.dims.size() == 3 ? query.dims[2] : 0;
@@ -2272,17 +2281,14 @@ extern "C" bool FastllmCudaTritonQwen4SparseAttention(
         value.cudaData == nullptr || indices.cudaData == nullptr ||
         query.dims.size() != 3 || key.dims.size() != 3 ||
         value.dims != key.dims || indices.dims.size() != 2 ||
-        queryHeads <= 0 || kvHeads <= 0 || group <= 0 ||
+        queryHeads <= 0 || kvHeads <= 0 || group <= 0 || group > 16 ||
         queryHeads != kvHeads * group || sequence <= 1 ||
         keyLength <= 0 || headDim < 16 || headDim > 256 ||
         (headDim & (headDim - 1)) != 0 ||
         key.dims[2] != headDim || indices.dims[0] != sequence ||
         topk <= 0 || topk > 3072 || !std::isfinite(scale) ||
-        query.Count(0) !=
-            (uint64_t)queryHeads * sequence * headDim ||
-        key.Count(0) !=
-            (uint64_t)kvHeads * keyLength * headDim ||
-        indices.Count(0) != (uint64_t)sequence * topk) {
+        !rowMajor(query) || !rowMajor(key) || !rowMajor(value) ||
+        !rowMajor(indices)) {
         return false;
     }
 
@@ -2326,6 +2332,11 @@ extern "C" bool FastllmCudaTritonQwen4SparseAttention(
     CUdeviceptr valuePtr = (CUdeviceptr)valueData;
     CUdeviceptr indicesPtr = (CUdeviceptr)indicesData;
     CUdeviceptr outputPtr = (CUdeviceptr)outputData;
+    int64_t qHeadStride = query.strides[0], qRowStride = query.strides[1];
+    int64_t kHeadStride = key.strides[0], kRowStride = key.strides[1];
+    int64_t vHeadStride = value.strides[0], vRowStride = value.strides[1];
+    int64_t indexRowStride = indices.strides[0];
+    int64_t outHeadStride = output.strides[0], outRowStride = output.strides[1];
     int32_t sequenceArg = sequence;
     int32_t keyLengthArg = keyLength;
     CUdeviceptr globalScratch = 0;
@@ -2333,6 +2344,9 @@ extern "C" bool FastllmCudaTritonQwen4SparseAttention(
     void *args[] = {
         &queryPtr, &keyPtr, &valuePtr, &indicesPtr, &outputPtr,
         &sequenceArg, &keyLengthArg, &scale,
+        &qHeadStride, &qRowStride, &kHeadStride, &kRowStride,
+        &vHeadStride, &vRowStride, &indexRowStride,
+        &outHeadStride, &outRowStride,
         &globalScratch, &profileScratch,
     };
     CUstream stream = reinterpret_cast<CUstream>(cudaStreamPerThread);
@@ -2695,7 +2709,14 @@ extern "C" bool FastllmCudaTritonChunkGatedDeltaRulePrefill(
         return false;
     }
 
-    int batchHeads = q.dims[0] * q.dims[1];
+    // H uses batch*heads in grid.y and O uses it in grid.z. Check before
+    // narrowing the product or allocating scratch, including direct callers.
+    const int64_t batchHeads64 = (int64_t)q.dims[0] * q.dims[1];
+    if (q.dims[0] <= 0 || q.dims[1] <= 0 ||
+        batchHeads64 > 65535 || chunks > 65535) {
+        return false;
+    }
+    const int batchHeads = (int)batchHeads64;
     TritonChunkGdnScaleScratch *scaleScratch =
         FindTritonChunkGdnScaleScratch();
     bool usePrecomputedScale =

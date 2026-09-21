@@ -86,18 +86,22 @@ if triton is not None:
         sequence,
         key_length,
         scale,
+        q_head_stride, q_row_stride,
+        k_head_stride, k_row_stride,
+        v_head_stride, v_row_stride,
+        index_row_stride,
+        out_head_stride, out_row_stride,
         GROUP_SIZE: tl.constexpr,
         HEAD_DIM: tl.constexpr,
         TOPK: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
     ):
-        """Qwen4 sparse GQA over FastLLM's contiguous head-major KV cache.
+        """Direct-index GQA over head-major tensors with reserved KV capacity.
 
-        One program owns one query row and one KV head.  It follows vLLM's
-        direct-indexed QSA prefill design: selected logical token indices load
-        K/V in place, while FP32 online softmax avoids materializing gathered
-        caches, logits, probabilities, or padding masks.
+        Each program owns a query row and a KV head. Online FP32 softmax
+        avoids materializing per-query KV copies, scores, or padding masks.
+        Runtime strides keep physical cache capacity out of the compile key.
         """
         row = tl.program_id(0)
         kv_head = tl.program_id(1)
@@ -108,8 +112,8 @@ if triton is not None:
 
         query = tl.load(
             q_ptr
-            + ((first_head + head_offsets[:, None]) * sequence + row)
-            * HEAD_DIM
+            + (first_head + head_offsets[:, None]) * q_head_stride
+            + row * q_row_stride
             + dim_offsets[None, :],
             mask=head_offsets[:, None] < GROUP_SIZE,
             other=0.0,
@@ -122,7 +126,7 @@ if triton is not None:
         for tile in range(0, (TOPK + BLOCK_N - 1) // BLOCK_N):
             columns = tile * BLOCK_N + column_offsets
             logical_token = tl.load(
-                indices_ptr + row * TOPK + columns,
+                indices_ptr + row * index_row_stride + columns,
                 mask=columns < TOPK,
                 other=-1,
             )
@@ -130,14 +134,14 @@ if triton is not None:
             safe_token = tl.maximum(logical_token, 0).to(tl.int64)
             keys = tl.load(
                 k_ptr
-                + (kv_head * key_length + safe_token[None, :]) * HEAD_DIM
+                + kv_head * k_head_stride + safe_token[None, :] * k_row_stride
                 + dim_offsets[:, None],
                 mask=valid[None, :],
                 other=0.0,
             )
             values = tl.load(
                 v_ptr
-                + (kv_head * key_length + safe_token[:, None]) * HEAD_DIM
+                + kv_head * v_head_stride + safe_token[:, None] * v_row_stride
                 + dim_offsets[None, :],
                 mask=valid[:, None],
                 other=0.0,
@@ -163,8 +167,8 @@ if triton is not None:
         output = accumulator / tl.maximum(normalizer[:, None], 1.0e-20)
         tl.store(
             output_ptr
-            + ((first_head + head_offsets[:, None]) * sequence + row)
-            * HEAD_DIM
+            + (first_head + head_offsets[:, None]) * out_head_stride
+            + row * out_row_stride
             + dim_offsets[None, :],
             output,
             mask=head_offsets[:, None] < GROUP_SIZE,
@@ -197,7 +201,9 @@ if triton is not None:
         chunks, and uses tensor-core dot products for both recurrence GEMMs.
         """
         v_block = tl.program_id(0)
-        batch_head = tl.program_id(1)
+        # Saved states can exceed 2^31 elements even when each grid dimension
+        # is valid. Widen before multiplying by CHUNKS and the head dimensions.
+        batch_head = tl.program_id(1).to(tl.int64)
         v_offsets = v_block * BLOCK_V + tl.arange(0, BLOCK_V)
         t_offsets = tl.arange(0, CHUNK_SIZE)
         k_offsets = tl.arange(0, 64)
@@ -338,8 +344,8 @@ if triton is not None:
     ):
         """Compute chunk outputs from saved states and updated values."""
         v_block = tl.program_id(0)
-        chunk = tl.program_id(1)
-        batch_head = tl.program_id(2)
+        chunk = tl.program_id(1).to(tl.int64)
+        batch_head = tl.program_id(2).to(tl.int64)
         v_offsets = v_block * BLOCK_V + tl.arange(0, BLOCK_V)
         t_offsets = tl.arange(0, CHUNK_SIZE)
         k_offsets = tl.arange(0, 64)
@@ -2503,18 +2509,11 @@ def chunk_gdn_prefill_cache_paths(payload):
     if block_v not in {32, 64}:
         raise ValueError("chunk_gdn_prefill block_v must be 32 or 64")
     cache_dir = Path(payload.get("cache_dir") or default_cache_dir()).expanduser()
-    if state_dtype == dtype:
-        name = (
-            f"chunk_gdn_prefill_v6_{dtype}_sm{arch}"
-            f"_c{chunks}_t{chunk_size}_k{k_dim}_v{v_dim}_bv{block_v}"
-            f"_nw{num_warps}_ns{num_stages}"
-        )
-    else:
-        name = (
-            f"chunk_gdn_prefill_v7_{dtype}_state{state_dtype}_sm{arch}"
-            f"_c{chunks}_t{chunk_size}_k{k_dim}_v{v_dim}_bv{block_v}"
-            f"_nw{num_warps}_ns{num_stages}"
-        )
+    name = (
+        f"chunk_gdn_prefill_v8_{dtype}_state{state_dtype}_sm{arch}"
+        f"_c{chunks}_t{chunk_size}_k{k_dim}_v{v_dim}_bv{block_v}"
+        f"_nw{num_warps}_ns{num_stages}"
+    )
     cubins = {
         key: cache_dir / f"{name}_{key}.cubin"
         for key in CHUNK_GDN_PREFILL_KERNEL_ORDER
@@ -2596,7 +2595,7 @@ def qwen4_sparse_attention_cache_paths(payload):
     num_stages = require_int(payload, "num_stages", 2)
     if group_size <= 0 or group_size > 16:
         raise ValueError("qwen4_sparse_attention requires group_size in [1, 16]")
-    block_m = 1 << (group_size - 1).bit_length()
+    block_m = 16
     if head_dim < 16 or head_dim > 256 or head_dim & (head_dim - 1):
         raise ValueError(
             "qwen4_sparse_attention requires a power-of-two head_dim in [16, 256]"
@@ -2607,7 +2606,7 @@ def qwen4_sparse_attention_cache_paths(payload):
         raise ValueError("qwen4_sparse_attention block_n must be 16, 32, 64, or 128")
     cache_dir = Path(payload.get("cache_dir") or default_cache_dir()).expanduser()
     name = (
-        f"qwen4_sparse_attention_v1_{dtype}_sm{arch}"
+        f"qwen4_sparse_attention_v2_{dtype}_sm{arch}"
         f"_g{group_size}_d{head_dim}_w{topk}"
         f"_bm{block_m}_bn{block_n}_nw{num_warps}_ns{num_stages}"
     )
@@ -3275,7 +3274,7 @@ def compile_qwen4_sparse_attention(payload):
     if cubin_path.exists() and meta_path.exists():
         return json.loads(meta_path.read_text())
 
-    block_m = 1 << (group_size - 1).bit_length()
+    block_m = 16
     cubin_path.parent.mkdir(parents=True, exist_ok=True)
     signature = {
         "q_ptr": f"*{dtype}",
@@ -3286,6 +3285,15 @@ def compile_qwen4_sparse_attention(payload):
         "sequence": "i32",
         "key_length": "i32",
         "scale": "fp32",
+        "q_head_stride": "i64",
+        "q_row_stride": "i64",
+        "k_head_stride": "i64",
+        "k_row_stride": "i64",
+        "v_head_stride": "i64",
+        "v_row_stride": "i64",
+        "index_row_stride": "i64",
+        "out_head_stride": "i64",
+        "out_row_stride": "i64",
         "GROUP_SIZE": "constexpr",
         "HEAD_DIM": "constexpr",
         "TOPK": "constexpr",

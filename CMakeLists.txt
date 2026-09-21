@@ -845,6 +845,18 @@ if (UNIT_TEST)
         add_test(NAME cuda_data_transfer COMMAND cuda_data_transfer_test)
         set_tests_properties(cuda_data_transfer PROPERTIES LABELS cuda SKIP_RETURN_CODE 77)
 
+        add_executable(cuda_prefill_paths_test test/basic/test_cuda_prefill_paths.cpp)
+        target_link_libraries(cuda_prefill_paths_test PRIVATE fastllm)
+        target_include_directories(cuda_prefill_paths_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME cuda_prefill_gdn_long COMMAND cuda_prefill_paths_test gdn)
+        add_test(NAME cuda_prefill_sparse_strides COMMAND cuda_prefill_paths_test sparse)
+        set_tests_properties(cuda_prefill_gdn_long cuda_prefill_sparse_strides PROPERTIES
+                             LABELS "cuda;triton" SKIP_RETURN_CODE 77)
+        add_test(NAME cuda_prefill_gdn_large_fp32 COMMAND cuda_prefill_paths_test gdn_large_fp32)
+        add_test(NAME cuda_prefill_gdn_large_fp16 COMMAND cuda_prefill_paths_test gdn_large_fp16)
+        set_tests_properties(cuda_prefill_gdn_large_fp32 cuda_prefill_gdn_large_fp16 PROPERTIES
+                             LABELS "cuda;triton;large_memory" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+
         if (NOT WIN32)
             add_executable(cuda_swiglu_fp8_test test/basic/test_cuda_swiglu_fp8.cpp)
             target_link_libraries(cuda_swiglu_fp8_test PRIVATE fastllm)

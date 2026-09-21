@@ -430,11 +430,8 @@ namespace fastllm {
         int arch, int chunks, int chunkSize, int kDim, int vDim,
         int blockV, int numWarps, int numStages, bool floatState) {
         std::ostringstream os;
-        if (floatState) {
-            os << "chunk_gdn_prefill_v7_fp16_statefp32_sm";
-        } else {
-            os << "chunk_gdn_prefill_v6_fp16_sm";
-        }
+        os << "chunk_gdn_prefill_v8_fp16_state"
+           << (floatState ? "fp32" : "fp16") << "_sm";
         os << arch
            << "_c" << chunks << "_t" << chunkSize
            << "_k" << kDim << "_v" << vDim
@@ -472,12 +469,9 @@ namespace fastllm {
     static std::string CudaTritonQwen4SparseAttentionBaseName(
         const std::string &dtype, int arch, int groupSize, int headDim,
         int topk, int blockN, int numWarps, int numStages) {
-        int blockM = 1;
-        while (blockM < groupSize) {
-            blockM <<= 1;
-        }
+        constexpr int blockM = 16;
         std::ostringstream os;
-        os << "qwen4_sparse_attention_v1_" << dtype << "_sm" << arch
+        os << "qwen4_sparse_attention_v2_" << dtype << "_sm" << arch
            << "_g" << groupSize
            << "_d" << headDim << "_w" << topk
            << "_bm" << blockM << "_bn" << blockN
@@ -1773,10 +1767,7 @@ namespace fastllm {
                 return false;
             }
         }
-        int expectedBlockM = 1;
-        while (expectedBlockM < groupSize) {
-            expectedBlockM <<= 1;
-        }
+        constexpr int expectedBlockM = 16;
         if (loaded.dtype != dtype || loaded.groupSize != groupSize ||
             loaded.headDim != headDim || loaded.topk != topk ||
             loaded.blockM != expectedBlockM || loaded.blockN != blockN ||
@@ -3083,9 +3074,9 @@ namespace fastllm {
         }
         int minBatch = CudaEnvIntRange(
             "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_MIN_BATCH", 1, 1, 4096);
-        int maxChunks = CudaEnvIntRange(
-            "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_MAX_CHUNKS", 64, 1, 256);
-        if (batch < minBatch || chunks > maxChunks) {
+        // The recurrent kernel loops over chunks; 64 is not a kernel limit.
+        // Kernels use 64-bit offsets; grid.y still limits the chunk count.
+        if (batch < minBatch || chunks > 65535) {
             return false;
         }
 
@@ -3181,7 +3172,8 @@ namespace fastllm {
         // Keep the single-chunk path on the native kernels.  It is also used
         // by decode/CUDA-graph warmup, where the Triton prefill scratch and
         // driver launches would prevent the optimized decode graph path.
-        if (batch <= 0 || heads <= 0 || chunks < 2 ||
+        if (batch <= 0 || heads <= 0 ||
+            (int64_t)batch * heads > 65535 || chunks < 2 ||
             chunkSize != 64 || kDim != 128 || vDim != 128 ||
             v.dims != std::vector<int>({batch, heads, chunks,
                                         chunkSize, vDim}) ||
@@ -3609,23 +3601,21 @@ namespace fastllm {
                 "FASTLLM_CUDA_TRITON_QWEN4_SPARSE_ATTENTION", true)) {
             return false;
         }
-        auto isDense = [](const Data &data) {
-            if (data.dims.empty() ||
-                data.strides.size() != data.dims.size()) {
+        // Rows must be contiguous, but reserved cache capacity may pad the
+        // head/row strides independently for Q, K, and V.
+        auto isCudaRowMajor = [](const Data &data) {
+            if (data.dataDevice != DataDevice::CUDA || data.cudaData == nullptr ||
+                data.dims.empty() || data.strides.size() != data.dims.size() ||
+                data.strides.back() != 1) {
                 return false;
             }
-            uint64_t expected = 1;
-            for (int i = (int)data.dims.size() - 1; i >= 0; i--) {
-                if (data.strides[i] != expected) {
+            for (int i = (int)data.dims.size() - 1; i >= 0; --i) {
+                if (data.dims[i] <= 0 || (i > 0 && data.strides[i - 1] <
+                        (uint64_t)data.dims[i] * data.strides[i])) {
                     return false;
                 }
-                expected *= (uint64_t)data.dims[i];
             }
             return true;
-        };
-        auto isCudaDense = [&](const Data &data) {
-            return data.dataDevice == DataDevice::CUDA &&
-                   data.cudaData != nullptr && isDense(data);
         };
         if (query.dims.size() != 3 || key.dims.size() != 3 ||
             value.dims != key.dims || indices.dims.size() != 2 ||
@@ -3633,8 +3623,8 @@ namespace fastllm {
             query.dataType != value.dataType ||
             query.dataType != DataType::FLOAT16 ||
             indices.dataType != DataType::INT32 ||
-            !isCudaDense(query) || !isCudaDense(key) ||
-            !isCudaDense(value) || !isCudaDense(indices) ||
+            !isCudaRowMajor(query) || !isCudaRowMajor(key) ||
+            !isCudaRowMajor(value) || !isCudaRowMajor(indices) ||
             group <= 0 || group > 16 ||
             query.dims[0] != key.dims[0] * group ||
             query.dims[1] != indices.dims[0] ||
