@@ -29735,6 +29735,7 @@ namespace fastllm {
             selectorUniform(0.0f, 1.0f);
         int previousToken = anchorToken;
         std::vector<float> predecessorHidden(dflashSelectorRank);
+        std::vector<float> scoreProducts(dflashSelectorRank);
         for (int position = 0; position < slots; ++position) {
             AssertInFastLLM(
                 previousToken >= 0 && previousToken < predecessor.dims[0],
@@ -29756,9 +29757,15 @@ namespace fastllm {
                     candidateToken >= 0 && candidateToken < successor.dims[0],
                     "DFlash selector candidate id is out of range.\n");
                 float score = candidateTopK[topKOffset + 1];
+                // Materialize products before the ordered reduction. This
+                // allows BF16 conversion/multiplication to be vectorized,
+                // while preserving the original per-rank addition order.
                 for (int rank = 0; rank < dflashSelectorRank; ++rank) {
-                    score += predecessorHidden[rank] *
-                             codebookValue(successor, candidateToken, rank);
+                    scoreProducts[rank] = predecessorHidden[rank] *
+                        codebookValue(successor, candidateToken, rank);
+                }
+                for (int rank = 0; rank < dflashSelectorRank; ++rank) {
+                    score += scoreProducts[rank];
                 }
                 scores[candidate] = score;
                 context.proposalCandidateIds.push_back(candidateToken);
