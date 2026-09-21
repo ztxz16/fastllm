@@ -6265,37 +6265,67 @@ void FastllmCudaMemcpyBetweenDevices(int dstId, void *dst, int srcId, void *src,
         cudaGetLastError();
     }
 
-    uint8_t *cpuData = new uint8_t[size];
-    state = cudaSetDevice(srcId);
-    failedStage = "cudaSetDevice(src)";
-    if (state == cudaSuccess) {
-        state = cudaMemcpyAsync(cpuData, src, size, cudaMemcpyDeviceToHost,
-                                cudaStreamPerThread);
-        failedStage = "cudaMemcpyAsyncDeviceToHost";
+    // Bound pinned memory independently of tensor size. The caller waits for
+    // each destination copy before reusing this thread's staging allocation,
+    // preserving the synchronous handoff to other per-thread CUDA streams.
+    struct StagingBuffer {
+        uint8_t *data = nullptr;
+        size_t capacity = 0;
+        ~StagingBuffer() { if (data != nullptr) cudaFreeHost(data); }
+    };
+    static thread_local StagingBuffer staging;
+    constexpr size_t maxStagingBytes = 64ULL << 20;
+    const size_t partBytes = std::min(size, maxStagingBytes);
+    if (staging.capacity < partBytes) {
+        void *replacement = nullptr;
+        state = cudaHostAlloc(&replacement, partBytes, cudaHostAllocPortable);
+        if (state == cudaSuccess) {
+            if (staging.data != nullptr) cudaFreeHost(staging.data);
+            staging.data = (uint8_t *)replacement;
+            staging.capacity = partBytes;
+        } else {
+            cudaGetLastError();
+        }
     }
-    if (state == cudaSuccess) {
-        state = cudaStreamSynchronize(cudaStreamPerThread);
-        failedStage = "cudaStreamSynchronize(src)";
+    // Pinned allocation is an optimization; retain a bounded pageable
+    // fallback on hosts where pinning is unavailable or exhausted.
+    std::unique_ptr<uint8_t[]> pageable;
+    uint8_t *cpuData = staging.data;
+    size_t capacity = staging.capacity;
+    if (cpuData == nullptr) {
+        pageable.reset(new uint8_t[partBytes]);
+        cpuData = pageable.get();
+        capacity = partBytes;
     }
-    if (state == cudaSuccess) {
-        state = cudaSetDevice(dstId);
-        failedStage = "cudaSetDevice(dst)";
+    state = cudaSuccess;
+    for (size_t offset = 0; offset < size && state == cudaSuccess;) {
+        const size_t bytes = std::min(capacity, size - offset);
+        state = cudaSetDevice(srcId);
+        failedStage = "cudaSetDevice(src)";
+        if (state == cudaSuccess) {
+            state = cudaMemcpyAsync(cpuData, (uint8_t *)src + offset, bytes,
+                                    cudaMemcpyDeviceToHost, cudaStreamPerThread);
+            failedStage = "cudaMemcpyAsyncDeviceToHost";
+        }
+        if (state == cudaSuccess) {
+            state = cudaStreamSynchronize(cudaStreamPerThread);
+            failedStage = "cudaStreamSynchronize(src)";
+        }
+        if (state == cudaSuccess) {
+            state = cudaSetDevice(dstId);
+            failedStage = "cudaSetDevice(dst)";
+        }
+        if (state == cudaSuccess) {
+            state = cudaMemcpyAsync((uint8_t *)dst + offset, cpuData, bytes,
+                                    cudaMemcpyHostToDevice, cudaStreamPerThread);
+            failedStage = "cudaMemcpyAsyncHostToDevice";
+        }
+        if (state == cudaSuccess) {
+            state = cudaStreamSynchronize(cudaStreamPerThread);
+            failedStage = "cudaStreamSynchronize(dst)";
+        }
+        offset += bytes;
     }
-    if (state == cudaSuccess) {
-        state = cudaMemcpyAsync(dst, cpuData, size, cudaMemcpyHostToDevice,
-                                cudaStreamPerThread);
-        failedStage = "cudaMemcpyAsyncHostToDevice";
-    }
-    if (state == cudaSuccess) {
-        // The destination is consumed by a persistent TP worker whose
-        // per-thread default stream differs from this caller's stream.  A
-        // pageable H2D cudaMemcpy may return after host staging but before the
-        // DMA reaches device memory, so complete it before handing the tensor
-        // to that worker.
-        state = cudaStreamSynchronize(cudaStreamPerThread);
-        failedStage = "cudaStreamSynchronize(dst)";
-    }
-    delete[] cpuData;
     if (state != cudaSuccess) {
         printf("Error: CUDA copy Between GPUs failed in %s. dstId = %d, srcId = %d, "
                "dst = %p, src = %p, size = %lu, canPeerAccess = %d.\n",

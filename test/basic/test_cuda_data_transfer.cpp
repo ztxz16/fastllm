@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -190,6 +191,42 @@ void CheckPersistentTransfer(int kind, int devices) {
     Check(cudaMemcpy(actual.data(), data.cudaData, capacity, cudaMemcpyDeviceToHost));
     ExpectBytes(actual.data(), capacity, 0);
 }
+
+void CheckLargePeerTransfer(int devices) {
+    if (devices < 2) return;
+    // Exercise multiple staging chunks, an odd tail, buffer reuse, and both
+    // directions. A second host thread consumes the completed destination.
+    const size_t capacity = (65ULL << 20) + 17;
+    void *buffers[2] = {nullptr, nullptr};
+    for (int device = 0; device < 2; ++device) {
+        Check(cudaSetDevice(device));
+        Check(cudaMalloc(&buffers[device], capacity));
+    }
+    for (int pass = 0; pass < 4; ++pass) {
+        const int src = pass % 2, dst = 1 - src;
+        const size_t bytes = pass < 2 ? capacity : 65539;
+        Check(cudaSetDevice(src));
+        Check(cudaMemsetAsync(buffers[src], 0x31 + pass, bytes, cudaStreamPerThread));
+        FastllmCudaMemcpyBetweenDevices(dst, buffers[dst], src, buffers[src], bytes);
+        int restored = -1; Check(cudaGetDevice(&restored));
+        if (restored != src) throw std::runtime_error("peer copy changed current device");
+        std::exception_ptr error;
+        std::thread reader([&]() {
+            try {
+                Check(cudaSetDevice(dst));
+                std::vector<uint8_t> actual(bytes);
+                Check(cudaMemcpy(actual.data(), buffers[dst], bytes, cudaMemcpyDeviceToHost));
+                ExpectBytes(actual.data(), bytes, 0x31 + pass);
+            } catch (...) { error = std::current_exception(); }
+        });
+        reader.join();
+        if (error) std::rethrow_exception(error);
+    }
+    for (int device = 0; device < 2; ++device) {
+        Check(cudaSetDevice(device)); Check(cudaFree(buffers[device]));
+    }
+    std::puts("PASS large peer transfer, tail, reuse and cross-thread handoff");
+}
 }
 
 int main() {
@@ -212,6 +249,7 @@ int main() {
                         fastllm::GetDataTypeName(type).c_str());
         }
         for (int kind = 0; kind < 3; ++kind) CheckPersistentTransfer(kind, devices);
+        CheckLargePeerTransfer(devices);
         std::puts("CUDA scratch, host staging, RMSNorm, zero fill and persistent transfer tests passed");
         return 0;
     } catch (const std::exception &error) {
