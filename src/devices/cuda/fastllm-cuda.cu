@@ -5407,6 +5407,7 @@ static void *FastllmCudaMallocImpl(
         return allocationSucceeded(ret);
     }
     auto &cudaBuffers = *view.smallBuffers;
+    int selectedSmall = -1;
     for (int i = *view.minId; i < cudaBuffers.size(); i++) {
         if (cudaBuffers[i].size >= size && !cudaBuffers[i].busy &&
             cudaBuffers[i].graphPins == 0 &&
@@ -5414,20 +5415,28 @@ static void *FastllmCudaMallocImpl(
                 cudaBuffers[i], captureIdentity.valid) &&
             FastllmCudaGraphPoolPointerReusableLocked(
                 cudaBuffers[i].data, captureIdentity)) {
-            cudaBuffers[i].busy = true;
-            FastllmCudaGraphPoolAfterAllocLocked(
-                cudaBuffers[i].data, captureIdentity);
-            *view.noBusy -= cudaBuffers[i].size;
-            while (*view.minId < cudaBuffers.size() &&
-                   (cudaBuffers[*view.minId].busy ||
-                    cudaBuffers[*view.minId].graphPins > 0)) {
-                (*view.minId)++;
+            if (selectedSmall < 0 || cudaBuffers[i].size < cudaBuffers[selectedSmall].size) {
+                selectedSmall = i;
             }
-#ifdef CUDA_MEM_DEBUG
-            CudaMemDebugRecord(cudaBuffers[i].data, size);
-#endif
-            return allocationSucceeded(cudaBuffers[i].data);
+            // Capture cannot allocate a new block. Preserve larger idle
+            // blocks for later temporaries instead of consuming the first fit.
+            // Keep eager allocation/reuse order unchanged.
+            if (!capturePoolOnly || cudaBuffers[i].size == size) break;
         }
+    }
+    if (selectedSmall >= 0) {
+        auto &buffer = cudaBuffers[selectedSmall];
+        buffer.busy = true;
+        FastllmCudaGraphPoolAfterAllocLocked(buffer.data, captureIdentity);
+        *view.noBusy -= buffer.size;
+        while (*view.minId < cudaBuffers.size() &&
+               (cudaBuffers[*view.minId].busy || cudaBuffers[*view.minId].graphPins > 0)) {
+            (*view.minId)++;
+        }
+#ifdef CUDA_MEM_DEBUG
+        CudaMemDebugRecord(buffer.data, size);
+#endif
+        return allocationSucceeded(buffer.data);
     }
     if (useAnyFittingPooledBuffer) {
         auto &bigBuffers = *view.bigBuffers;
@@ -6399,6 +6408,10 @@ void FastllmCudaMemcpy2DDeviceToDevice(void * 	dst, size_t 	dpitch, const void *
 
     cudaError_t state = cudaSuccess;
     if (FastllmCudaGraphIsCapturingFast()) {
+        // A failed managed capture can carry undersized allocation-failure
+        // placeholders until every TP rank reaches the common abort barrier.
+        // Do not submit a copy against those addresses; the graph is discarded.
+        if (FastllmCudaGetThreadError()) return;
         state = cudaMemcpy2DAsync(dst, dpitch, src, spitch, width, height,
                                   cudaMemcpyDeviceToDevice, cudaStreamPerThread);
         checkCudaErrors("Error: CUDA error when async 2D copy on GPU!", state);

@@ -12,6 +12,58 @@
 
 namespace {
 
+bool RunCaptureMixedSizePoolRegression() {
+    FastllmCudaSetDevice(0);
+    constexpr size_t largeBytes = 64 * 1024;
+    constexpr size_t smallBytes = 4 * 1024;
+    // Seed the larger block first. Capture must leave it for the larger request.
+    void *large = FastllmCudaMalloc(largeBytes);
+    void *small = FastllmCudaMalloc(smallBytes);
+    if (large == nullptr || small == nullptr) return false;
+    FastllmCudaFree(large);
+    FastllmCudaFree(small);
+    if (!FastllmCudaGraphPrepareCaptureDevice() ||
+        !FastllmCudaGraphMemoryPoolBegin() || !FastllmCudaGraphBeginCapture()) {
+        return false;
+    }
+    void *first = FastllmCudaMalloc(smallBytes);
+    void *second = FastllmCudaMalloc(largeBytes);
+    bool passed = first != nullptr && second != nullptr &&
+                  !FastllmCudaGetThreadError();
+    if (passed) {
+        passed = cudaMemsetAsync(first, 0x35, smallBytes, cudaStreamPerThread) == cudaSuccess &&
+                 cudaMemsetAsync(second, 0x79, largeBytes, cudaStreamPerThread) == cudaSuccess;
+    }
+    FastllmCudaFree(first);
+    FastllmCudaFree(second);
+    void *graph = nullptr;
+    passed = FastllmCudaGraphEndCapture(&graph) && graph != nullptr && passed;
+    std::vector<void*> pins;
+    void *exec = nullptr;
+    passed = passed && FastllmCudaGraphMemoryPoolEnd(pins);
+    if (!passed) FastllmCudaGraphMemoryPoolAbort();
+    if (passed) {
+        unsigned char values[2] = {};
+        passed = FastllmCudaGraphInstantiate(graph, &exec) &&
+                 FastllmCudaGraphLaunch(exec) &&
+                 cudaStreamSynchronize(cudaStreamPerThread) == cudaSuccess &&
+                 cudaMemcpy(values, first, 1, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                 cudaMemcpy(values + 1, second, 1, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                 values[0] == 0x35 && values[1] == 0x79;
+    }
+    if (exec != nullptr) FastllmCudaGraphExecDestroy(exec);
+    if (graph != nullptr) FastllmCudaGraphDestroy(graph);
+    FastllmCudaGraphMemoryPoolRelease(pins);
+    FastllmCudaClearThreadError();
+    FastllmCudaClearGraphError();
+    // Leave the pool cold for the deliberate allocation-failure test below.
+    FastllmCudaForceFree(large);
+    FastllmCudaForceFree(small);
+    if (!passed) std::cerr << "capture exhausted a pool with sufficient mixed-size capacity\n";
+    else std::cout << "mixed-size capture pool and replay: PASS\n";
+    return passed;
+}
+
 bool RunExternalCaptureQueryRegression() {
     bool passed = false;
     std::string error;
@@ -246,6 +298,9 @@ int main() {
     if (!RunExternalCaptureQueryRegression()) {
         return 17;
     }
+    if (!RunCaptureMixedSizePoolRegression()) {
+        return 18;
+    }
     const int participants = std::min(deviceCount, 4);
     FastllmCudaSetDevice(0);
     if (!FastllmCudaGraphMemoryPoolBegin()) {
@@ -257,19 +312,30 @@ int main() {
     std::vector<std::string> captureErrors(participants);
     std::vector<std::unique_ptr<fastllm::Data> > capturedData(participants);
     std::vector<std::unique_ptr<fastllm::Data> > capturedDirectData(participants);
+    std::vector<void *> copySources(participants, nullptr);
+    std::vector<void *> scoreWorkspaces(participants, nullptr);
     std::vector<std::thread> workers;
     workers.reserve(participants);
     for (int device = 0; device < participants; device++) {
         workers.emplace_back([&, device]() {
             FastllmCudaSetDevice(device);
+            if (cudaMalloc(&copySources[device], 4096) != cudaSuccess) {
+                captureErrors[device] = "failed to prepare the copy source";
+                return;
+            }
+            scoreWorkspaces[device] = FastllmCudaMalloc(2);
+            if (scoreWorkspaces[device] == nullptr) {
+                captureErrors[device] = "failed to prepare the score workspace";
+                return;
+            }
+            FastllmCudaFree(scoreWorkspaces[device]);
             if (!FastllmCudaGraphBeginCapture()) {
                 captureErrors[device] = "failed to begin CUDA stream capture";
                 return;
             }
 
-            // A fresh process has no reusable FastLLM pool entries on any
-            // device. Every rank therefore takes the same deterministic
-            // capture-time pool-miss path.
+            // The only pooled block is two bytes: every Data allocation below
+            // misses, and attention can allocate only one of its two scores.
             capturedData[device] = std::make_unique<fastllm::Data>(
                 fastllm::DataType::FLOAT32, std::vector<int>{1024});
             fastllm::Data &data = *capturedData[device];
@@ -303,6 +369,24 @@ int main() {
                 return;
             }
 
+            // This copy exceeds the placeholder. Keep the failed capture valid
+            // until all ranks can abort, including a partial score allocation.
+            FastllmCudaMemcpy2DDeviceToDevice(data.cudaData, 4096,
+                copySources[device], 4096, 4096, 1);
+            fastllm::Data halfInput(fastllm::DataType::FLOAT16, {1, 1, 256});
+            halfInput.dataDevice = fastllm::DataDevice::CUDA;
+            halfInput.dataDeviceIds = {device};
+            halfInput.cudaData = data.cudaData;
+            halfInput.cudaDataBorrowed = true;
+            fastllm::Data emptyMask;
+            if (FastllmCudaHalfAttention(halfInput, halfInput, halfInput,
+                    emptyMask, halfInput, 1, 0.0625f, 1) ||
+                cudaPeekAtLastError() != cudaSuccess ||
+                FastllmCudaGraphCaptureInvalidated()) {
+                captureErrors[device] = "pool miss escaped to a CUDA copy or cuBLAS call";
+                return;
+            }
+
             void *graph = nullptr;
             if (!FastllmCudaGraphEndCapture(&graph) || graph == nullptr) {
                 captureErrors[device] =
@@ -317,11 +401,18 @@ int main() {
         worker.join();
     }
     FastllmCudaGraphMemoryPoolAbort();
-
-    for (int device = 0; device < participants; device++) {
+    for (int device = 0; device < participants; ++device) {
+        FastllmCudaSetDevice(device);
+        if (copySources[device] != nullptr) cudaFree(copySources[device]);
         if (!capturePassed[device]) {
             std::cerr << "GPU " << device << ": " << captureErrors[device]
                       << "\n";
+            return 4;
+        }
+        void *reused = FastllmCudaMalloc(2);
+        FastllmCudaFree(reused);
+        if (reused != scoreWorkspaces[device]) {
+            std::cerr << "GPU " << device << ": failed attention capture leaked its score workspace\n";
             return 4;
         }
     }

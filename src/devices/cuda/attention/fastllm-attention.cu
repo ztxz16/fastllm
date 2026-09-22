@@ -1572,6 +1572,13 @@ printf("n = %d, m = %d, k = %d, spend %f s, gops = %f\n", n, m, k, spend, gops);
     if (true) {
         half *qk = (half *) FastllmCudaMalloc(q0 * q1 * k1 * sizeof(half));
         half *temp = (half *) FastllmCudaMalloc(q0 * q1 * k1 * sizeof(half));
+        if (qk == nullptr || temp == nullptr) {
+            FastllmCudaFree(qk);
+            FastllmCudaFree(temp);
+            // Let all TP ranks reach the capture abort without passing null to cuBLAS.
+            if (FastllmCudaGraphIsCapturingFast()) return false;
+            throw std::runtime_error("CUDA half attention could not allocate score workspace");
+        }
         auto fastllmCublasHandle = getFastllmCublasHandle();
         cublasStatus_t status;
 
