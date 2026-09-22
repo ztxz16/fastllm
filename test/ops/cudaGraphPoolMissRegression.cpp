@@ -131,6 +131,64 @@ bool RunDeferredBigBufferClearRegression() {
     return true;
 }
 
+bool RunExpansionWorkspaceReuseRegression() {
+    FastllmCudaSetDevice(0);
+    FastllmCudaClearBigBufferAll();
+    constexpr size_t bytes = 304ULL * 1024ULL * 1024ULL;
+    size_t freeBytes = 0, totalBytes = 0;
+    if (cudaMemGetInfo(&freeBytes, &totalBytes) != cudaSuccess ||
+        bytes > totalBytes / 4 || freeBytes < bytes + 128ULL * 1024ULL * 1024ULL) {
+        cudaGetLastError();
+        std::cout << "expansion workspace reuse: SKIP (insufficient free memory)\n";
+        return true;
+    }
+    auto isLive = [](void *pointer) {
+        cudaPointerAttributes attributes;
+        if (cudaPointerGetAttributes(&attributes, pointer) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+#if CUDART_VERSION < 10000
+        return attributes.memoryType == cudaMemoryTypeDevice;
+#else
+        return attributes.type == cudaMemoryTypeDevice;
+#endif
+    };
+
+    // A small KV-like tensor grows while a much larger operator workspace is
+    // idle. Growth must preserve both the tensor contents and workspace reuse.
+    const std::vector<float> expected = {1.0f, -2.0f, 3.0f, -4.0f};
+    fastllm::Data cache(fastllm::DataType::FLOAT32, {1, 4}, expected);
+    cache.ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{0});
+    void *workspace = FastllmCudaMalloc(bytes);
+    FastllmCudaFree(workspace);
+    cache.Expansion({2, 4});
+    std::vector<float> actual(4);
+    bool passed = cudaMemcpy(actual.data(), cache.cudaData, 4 * sizeof(float),
+                            cudaMemcpyDeviceToHost) == cudaSuccess && actual == expected;
+    passed = passed && isLive(workspace);
+    if (!passed) {
+        std::cerr << "tensor growth discarded a reusable workspace or changed contents\n";
+        return false;
+    }
+    void *reused = FastllmCudaMalloc(bytes);
+    passed = reused == workspace;
+    FastllmCudaFree(reused);
+
+    // Retention is a cache, not a reservation: pressure must reclaim idle
+    // workspace while preserving the live tensor and graph-owned allocations.
+    void *probe = nullptr;
+    passed = passed && totalBytes < std::numeric_limits<size_t>::max() &&
+        FastllmCudaTryDirectMalloc(&probe, totalBytes + 1) ==
+            FASTLLM_CUDA_TRY_MALLOC_CAPACITY_FAILURE && probe == nullptr &&
+        !isLive(workspace) && isLive(cache.cudaData);
+    passed = passed && cudaMemcpy(actual.data(), cache.cudaData, 4 * sizeof(float),
+                                 cudaMemcpyDeviceToHost) == cudaSuccess && actual == expected;
+    if (!passed) std::cerr << "retained workspace was not reusable or reclaimable\n";
+    else std::cout << "expansion retains reusable and reclaimable workspace: PASS\n";
+    return passed;
+}
+
 bool RunPinnedWorkspaceOomRegression() {
     FastllmCudaSetDevice(0);
     struct RestoreCaptureMode {
@@ -301,6 +359,9 @@ int main() {
 
     if (!RunDeferredBigBufferClearRegression()) {
         return 7;
+    }
+    if (!RunExpansionWorkspaceReuseRegression()) {
+        return 23;
     }
     if (!RunPinnedWorkspaceOomRegression()) {
         return 22;
