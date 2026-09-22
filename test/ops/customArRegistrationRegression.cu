@@ -121,11 +121,67 @@ static int RunSelfTestUploadRegression() {
     return passed ? 0 : 1;
 }
 
+// Speculative decode presents a fresh activation address to the collective on
+// every step. The pointer-tuple registration cache must stay bounded: a miss
+// allocates a device pointer table per rank, and those tables are released only
+// when an entry is evicted. Churn far more unique tuples than the limit allows
+// and require the cache (and therefore the device allocations) to stay bounded.
+static int RunRegistrationChurnRegression() {
+    for (int device = 0; device < 2; ++device) {
+        int peer = 0;
+        Require(cudaDeviceCanAccessPeer(&peer, device, 1 - device), "peer access query");
+        if (!peer) return 77;
+    }
+    setenv("FASTLLM_CUDA_CUSTOM_ALLREDUCE", "1", 1);
+    if (!FastllmInitNccl({0, 1}) || !FastllmCudaCustomAllReduceEnabled()) return 1;
+    CustomArState &state = GetCustomArState();
+    constexpr int kUniqueTuples = 300;
+    constexpr size_t kChurnBytes = 80 * 1024;
+    const int count = (int)(kChurnBytes / sizeof(half));
+    std::vector<std::vector<void *> > inputs(2);
+    bool ok = true;
+    for (int device = 0; device < 2 && ok; ++device) {
+        Require(cudaSetDevice(device), "churn set device");
+        inputs[device].reserve(kUniqueTuples);
+        for (int i = 0; i < kUniqueTuples && ok; ++i) {
+            void *buffer = nullptr;
+            if (cudaMalloc(&buffer, kChurnBytes) != cudaSuccess) {
+                cudaGetLastError();
+                ok = false;
+                break;
+            }
+            inputs[device].push_back(buffer);
+        }
+    }
+    for (int i = 0; i < kUniqueTuples && ok; ++i) {
+        float ignoredUs = 0.0f;
+        ok = RunCustomArRankOperation(state.devices, 1, [&](int rank) {
+            return RunCustomArCandidate(inputs[rank][i], inputs[rank][i], count,
+                (int)fastllm::DataType::FLOAT16, state.devices[rank]);
+        }, ignoredUs);
+    }
+    const size_t registrations = state.registrations.size();
+    const bool bounded = registrations <= (size_t)kCustomArMaxRegistrations;
+    std::printf("%s: registration cache bounded after %d unique tuples "
+                "(entries=%zu limit=%zu)\n",
+                (ok && bounded) ? "PASS" : "FAIL", kUniqueTuples,
+                registrations, (size_t)kCustomArMaxRegistrations);
+    for (int device = 0; device < 2; ++device) {
+        Require(cudaSetDevice(device), "churn cleanup device");
+        for (void *buffer : inputs[device]) {
+            Require(cudaFree(buffer), "churn buffer cleanup");
+        }
+    }
+    FastllmCudaCustomAllReduceReset();
+    return (ok && bounded) ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
     const bool reuse = argc > 1 && std::strcmp(argv[1], "reuse") == 0;
     int count = 0;
     if (cudaGetDeviceCount(&count) != cudaSuccess || count < 2) return 77;
     if (argc > 1 && std::strcmp(argv[1], "selftest") == 0) return RunSelfTestUploadRegression();
+    if (argc > 1 && std::strcmp(argv[1], "churn") == 0) return RunRegistrationChurnRegression();
     CustomArState state;
     state.devices = {0, 1};
     std::vector<void *> inputs(2);
