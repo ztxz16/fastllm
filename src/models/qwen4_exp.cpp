@@ -4645,7 +4645,7 @@ namespace fastllm {
                     currentKeysFloat.dataDeviceIds[0];
             };
             auto reserveFirstAxis = [](Data &data, int capacity) {
-                if (data.dims.empty() || capacity <= data.dims[0]) {
+                if (data.dims.empty() || capacity <= Qwen4AxisCapacity(data, 0)) {
                     return;
                 }
                 std::vector<int> expanded = data.dims;
@@ -4723,8 +4723,6 @@ namespace fastllm {
                         DataDevice::CUDA, currentKeysFloat.dataDeviceIds);
                     tailPositions->ToDevice(
                         DataDevice::CUDA, currentKeysFloat.dataDeviceIds);
-                    reserveFirstAxis(*tailKeys, ratio);
-                    reserveFirstAxis(*tailPositions, ratio);
                 } else {
                     tailKeys.reset();
                     tailPositions.reset();
@@ -4741,6 +4739,11 @@ namespace fastllm {
                     blockCache.reset();
                 }
             }
+
+            // Prefix snapshots store compact tails. Restore append capacity
+            // before either the fused or generic path reuses those tensors.
+            if (tailKeys != nullptr) reserveFirstAxis(*tailKeys, ratio);
+            if (tailPositions != nullptr) reserveFirstAxis(*tailPositions, ratio);
 
             auto finishDeviceQsa = [&]() {
                 const int completeKeyBlocks = keyLength / ratio;
