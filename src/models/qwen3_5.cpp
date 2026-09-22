@@ -22343,6 +22343,47 @@ namespace fastllm {
                 return 0;
             }
 
+            // 分页前缀缓存只以 token id 为键（PagedCacheManager::Record/Query），
+            // 所以纯文字请求种下的分页会被后来的多模态请求命中。
+            // Qwen3.5 的多轴 RoPE 会把第一个视觉 token 之后的所有位置整体位移
+            // mrope_position_delta，因此只有当视觉 token 完全落在未命中段时，
+            // 这段已缓存前缀才与冷请求等价；否则退回冷路径做全量 prefill。
+            if (!ctx->multimodalInput.empty()) {
+                bool visualInsidePrefix = false;
+                const int scanLen = std::min(cachedLen, (int) ctx->currentTokens.size());
+                for (int i = 0; i < scanLen; i++) {
+                    const int token = ctx->currentTokens[i];
+                    if (token == model->image_token_id ||
+                        token == model->video_token_id) {
+                        visualInsidePrefix = true;
+                        break;
+                    }
+                }
+                if (visualInsidePrefix) {
+                    if (model->verbose) {
+                        printf("[Qwen3.5] prefix cache rejected: visual token inside cached prefix (%d tokens).\n", cachedLen);
+                        fflush(stdout);
+                    }
+                    return 0;
+                }
+                // 长尾护栏：命中前缀后，未缓存段走一次算完（不分块）的前向路径，
+                // 未缓存段太长会在 GPU0 上 OOM（2026-09-22 实测：未缓存 21,747 token 崩溃，6,734 正常）。
+                // 超过阈值就放弃前缀、走分块的冷路径。阈值可用环境变量 FASTLLM_MM_PREFIX_MAX_TAIL 调整。
+                {
+                    static const int maxTail = [] {
+                        const char *e = getenv("FASTLLM_MM_PREFIX_MAX_TAIL");
+                        int v = e ? atoi(e) : 4096;
+                        return v > 0 ? v : 4096;
+                    }();
+                    const int tailLen = (int) ctx->currentTokens.size() - cachedLen;
+                    if (tailLen > maxTail) {
+                        printf("[Qwen3.5] prefix cache skipped for multimodal prompt: uncached tail %d > %d tokens.\n", tailLen, maxTail);
+                        fflush(stdout);
+                        return 0;
+                    }
+                }
+            }
+
             int extraCachedLen = model->QueryPagedPrefixCacheExtra(ctx, cachedLen);
             extraCachedLen = std::max(0, std::min(extraCachedLen, cachedLen));
             minCachedPages = extraCachedLen / probeManager->pageLen;
@@ -33098,7 +33139,30 @@ namespace fastllm {
             logits = (*retLogits)[0];
         }
 
-        if (pastKeyValues.size() > 0 && pastKeyValues[0].second.dims.size() > 0) {
+        // prefix cache 命中时调度器已经把命中的前缀从 currentTokens 剥掉，
+        // 这一发的 inputIds 只剩未命中段 [cacheLen, promptLen)，而还原后的
+        // pastKeyValues 早就 dims>0。原本这里只看「有没有 KV」，于是
+        // 「命中缓存后的第一发 prompt」被当成 decode 步，跳过整个视觉合并。
+        // 用与 canSeedDraftCache 相同的判据把这一发认出来，走完整多模态前向。
+        int promptOffset = 0;
+        if (context != nullptr && context->cacheLen > 0 &&
+            !multimodalInput.empty() &&
+            context->preTokens == (int) inputIds.Count(0) &&
+            inputIds.Count(0) > 1) {
+            promptOffset = context->cacheLen;
+#ifdef USE_CUDA
+            // 命中的 draft KV 是纯文字 prefill 种的，草稿模型没看到图，
+            // 直接作废；这一发走普通目标前向。
+            {
+                std::lock_guard<std::mutex> guard(mtpCacheMutex);
+                mtpCaches.erase(context);
+                dflashContexts.erase(context);
+            }
+#endif
+        }
+
+        if (promptOffset == 0 &&
+            pastKeyValues.size() > 0 && pastKeyValues[0].second.dims.size() > 0) {
             Data adjustedPositionIds;
             auto deltaIt = multimodalInput.find("mrope_position_delta");
             if (deltaIt != multimodalInput.end() && !deltaIt->second.empty()) {
@@ -33176,8 +33240,25 @@ namespace fastllm {
             );
 
             Data computedMmTokenTypeIds, computedMropePositionIds, computedMropePositionDelta;
+            // 视觉 token 的三轴位置要接在「已缓存的文字位置」之后，delta 也是
+            // 相对整段 prompt 的，所以位置数据一律按整段算，之后再切未命中段。
+            Data fullPromptIds;
+            const Data *positionSource = &inputIds;
+            if (promptOffset > 0) {
+                std::vector <float> fullIds;
+                fullIds.reserve(context->allTokens.size());
+                for (int token : context->allTokens) {
+                    fullIds.push_back((float) token);
+                }
+                AssertInFastLLM((int) fullIds.size() ==
+                                    promptOffset + inputIds.dims[1],
+                                "Qwen3.5 multimodal prefix cache tail does not match its prompt.");
+                fullPromptIds.CopyFrom(
+                    Data(DataType::FLOAT32, {1, (int) fullIds.size()}, fullIds));
+                positionSource = &fullPromptIds;
+            }
             BuildMultimodalPositionData(
-                inputIds,
+                *positionSource,
                 imageGridThwList,
                 videoGridThwList,
                 computedMmTokenTypeIds,
@@ -33221,14 +33302,29 @@ namespace fastllm {
             SetCudaEmbedding(true);
         }
 
+        // 未命中段的 hiddenStates 只覆盖 [promptOffset, promptLen)，所以合并索引
+        // 与三轴位置都要按同一个 offset 切出来，否则图片会被贴到序列开头，
+        // 且 mm_token_type_ids 长度不等于序列长度会直接触发 Assert。
+        Data mmTypesForTail;
+        Data fullMropePositionIds;
+        if (promptOffset > 0) {
+            mmTypesForTail.CopyFrom(BuildMtpPositionIdsSlice(
+                *mmTypeIt->second[0], promptOffset, mmTypeIt->second[0]->dims[1], 0));
+            fullMropePositionIds.CopyFrom(BuildMtpPositionIdsSlice(
+                *mropeIt->second[0], promptOffset, mropeIt->second[0]->dims[1], 0));
+        } else {
+            mmTypesForTail.CopyFrom(*mmTypeIt->second[0]);
+            fullMropePositionIds.CopyFrom(*mropeIt->second[0]);
+        }
+
         Data hiddenStates;
         BuildMultimodalTextEmbeddings(inputIds, hiddenStates);
-        MergeMultimodalFeaturesIntoText(*mmTypeIt->second[0], imageEmbeds, videoEmbeds, hiddenStates);
+        MergeMultimodalFeaturesIntoText(mmTypesForTail, imageEmbeds, videoEmbeds, hiddenStates);
         imageFeatures.FreeSpace();
         videoFeatures.FreeSpace();
 
         Data mropePositionIds;
-        mropePositionIds.CopyFrom(*mropeIt->second[0]);
+        mropePositionIds.CopyFrom(fullMropePositionIds);
         mropePositionIds.ToDevice(DataDevice::CPU);
         if (mropePositionIds.dataType != DataType::FLOAT32) {
             // ToDataType 经 Executor 调度可能优先在 CUDA 上完成转换并释放 cpuData,
@@ -33554,7 +33650,9 @@ namespace fastllm {
             FastllmCudaClearBigBuffer();
 
             const int chunkSize = GetChunkedPrefillSize();
-            if (chunkSize > 0 && totalLen > chunkSize) {
+            // 分块循环每个 chunk 传 nullptr mask（假设 causal 全在 chunk 内），
+            // 前缀已在 chunk 之外时不适用；退回下面带真实 mask 的单发路径。
+            if (chunkSize > 0 && totalLen > chunkSize && promptOffset == 0) {
                 std::vector<int> chunkRet;
                 for (int st = 0; st < totalLen; st += chunkSize) {
                     const int curLen = std::min(chunkSize, totalLen - st);

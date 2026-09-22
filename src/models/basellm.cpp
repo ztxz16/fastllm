@@ -596,6 +596,12 @@ namespace fastllm {
     }
 
     void ResponseContext::TryRecordPagedCache(basellm *model) {
+        // 分页前缀键只有 token id，图片内容不进键。多模态请求若把图片
+        // placeholder token 的位置种进前缀，下一发「同文字、不同图」的请求会
+        // 直接读到上一张图的 KV。护栏：多模态请求一概不种前缀。
+        if (!this->multimodalInput.empty()) {
+            return;
+        }
         bool hasLinearAttentionCache = false;
         bool hasBoundedAttentionCache = false;
         for (int i = 0; i < (int)this->pastKeyValues.size(); i++) {
