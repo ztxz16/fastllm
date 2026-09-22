@@ -1420,6 +1420,7 @@ namespace fastllm {
         std::vector<int> devices;
         std::vector<std::vector<int>> workerCpus;
         bool hostMoe = false;
+        std::vector<bool> hostMoeLayers;
         std::vector<int> votes;
         int vocabSize = 0;
         std::vector<std::vector<std::pair<int, float>>> topCandidates;
@@ -1522,16 +1523,19 @@ namespace fastllm {
         AssertInFastLLM(std::set<int>(devices.begin(), devices.end()).size() == devices.size(),
                         "Qwen4 TP device IDs must be unique.");
         if (devices.size() <= 1) return;
-        const bool hostMoe = Qwen4HostOnlyDeviceMap(moeDeviceMap);
-        // Host experts remain whole and are scheduled once across all ranks.
-        // Mixed layer placement and rank-local expert caches need a separate
-        // ownership scheme, so reject them before loading weights.
         AssertInFastLLM(Qwen4CudaOnlyDeviceMap(deviceMap) &&
-                        (Qwen4CudaOnlyDeviceMap(moeDeviceMap) || hostMoe) &&
-                        moeDeviceLayers < 0 && layeredMoeDeviceMap.empty() &&
                         GetMoeCudaCacheBytes() == 0,
-                        "Qwen4 TP requires CUDA dense weights and either CUDA or CPU/NUMA experts, "
-                        "without layered MoE placement or --moe_cuda_cache.");
+                        "Qwen4 TP requires CUDA dense weights without --moe_cuda_cache.");
+        std::vector<bool> hostMoeLayers(block_cnt, false);
+        for (int layer = 0; layer < block_cnt; ++layer) {
+            const std::string device = SelectMoeDeviceForLayer(layer);
+            const bool host = device == "cpu" || device == "numa" ||
+                device.rfind("numa:", 0) == 0;
+            AssertInFastLLM(host || device.empty() || device == "cuda" ||
+                            device.rfind("cuda:", 0) == 0,
+                            "Qwen4 TP requires CUDA or CPU/NUMA experts in every layer.");
+            hostMoeLayers[layer] = host;
+        }
         const int count = devices.size();
         AssertInFastLLM(num_k_heads % count == 0 && num_v_heads % count == 0 &&
                         num_attention_heads % count == 0 &&
@@ -1540,7 +1544,9 @@ namespace fastllm {
         AssertInFastLLM(!GetKVCacheInCPU(), "Qwen4 TP requires CUDA KV caches.");
         threadTpState.reset(new ThreadTpState());
         threadTpState->devices = std::move(devices);
-        threadTpState->hostMoe = hostMoe;
+        threadTpState->hostMoe = std::any_of(hostMoeLayers.begin(), hostMoeLayers.end(),
+                                          [](bool host) { return host; });
+        threadTpState->hostMoeLayers = std::move(hostMoeLayers);
 #endif
     }
 
@@ -1550,6 +1556,8 @@ namespace fastllm {
     }
 
     bool Qwen4ExpModel::RetainCudaWorkspace() const {
+        if (threadTpState) return threadTpState->hostMoe;
+        if (threadTpRank >= 0) return threadTpOwner->hostMoe;
         // Serial hybrid decoding reuses the same GPU workspaces as TP.
         // Reclaiming them between forwards adds a prefill-to-decode stall.
         return Qwen4CudaOnlyDeviceMap(deviceMap) &&
@@ -1565,12 +1573,13 @@ namespace fastllm {
         PrepareWeights();
         tp.workerCpus.resize(count);
 #ifdef USE_NUMAS
-        const bool numaExperts = tp.hostMoe &&
-            std::all_of(moeDeviceMap.begin(), moeDeviceMap.end(), [](const auto &item) {
-                return item.second <= 0 || item.first == "numa" ||
-                    item.first.rfind("numa:", 0) == 0;
-            });
-        if (numaExperts) tp.workerCpus = GetNumasCudaWorkerCpuSets(devices);
+        for (int layer = 0; layer < block_cnt; ++layer) {
+            const std::string device = SelectMoeDeviceForLayer(layer);
+            if (device == "numa" || device.rfind("numa:", 0) == 0) {
+                tp.workerCpus = GetNumasCudaWorkerCpuSets(devices);
+                break;
+            }
+        }
 #endif
         tp.votes.resize(count);
         AssertInFastLLM(FastllmInitNccl(devices), "Qwen4 TP NCCL initialization failed.");
@@ -1596,7 +1605,20 @@ namespace fastllm {
             model->num_attention_heads = num_attention_heads / count;
             model->num_key_value_heads = std::max(1, num_key_value_heads / count);
             model->deviceMap = {{"cuda:" + std::to_string(devices[rank]), 1}};
-            model->moeDeviceMap = tp.hostMoe ? moeDeviceMap : model->deviceMap;
+            // Preserve the layer boundaries, but execute every CUDA expert
+            // shard on its own rank's device. Host layers retain their policy.
+            auto localMoeMap = [&](const std::map<std::string, int> &source) {
+                std::map<std::string, int> result;
+                for (const auto &item : source) {
+                    if (item.second <= 0) continue;
+                    const bool cuda = item.first == "cuda" || item.first.rfind("cuda:", 0) == 0;
+                    result[cuda ? model->deviceMap.begin()->first : item.first] += item.second;
+                }
+                return result;
+            };
+            model->moeDeviceMap = localMoeMap(moeDeviceMap);
+            model->layeredMoeDeviceMap = localMoeMap(layeredMoeDeviceMap);
+            model->moeDeviceLayers = moeDeviceLayers;
             model->ngramDevice = ngramDevice;
             model->pleNgramDiskWeight = pleNgramDiskWeight;
             model->pleNgramDiskWeight.isFake = true;
@@ -1605,7 +1627,7 @@ namespace fastllm {
             model->weights.assign(block_cnt, std::vector<Data *>(2 + 2 * num_experts, nullptr));
             model->biass = model->weights;
             for (int layer = 0; layer < block_cnt; ++layer) {
-                if (tp.hostMoe) {
+                if (tp.hostMoeLayers[layer]) {
                     // The parent outlives its ranks and owns NUMA registration.
                     // Only rank zero executes these shared, unsplit experts.
                     model->weights[layer] = weights[layer];
@@ -1623,14 +1645,15 @@ namespace fastllm {
                 model->mtpWeightsStatus.store(mtpWeightsStatus.load());
                 model->mtpMoeWeights.assign(2 + 2 * num_experts, nullptr);
                 model->mtpMoeBiass = model->mtpMoeWeights;
-                if (tp.hostMoe) {
+                if (tp.hostMoeLayers.back()) {
                     model->mtpMoeWeights = mtpMoeWeights;
                     model->mtpMoeBiass = mtpMoeBiass;
-                }
-                for (int expert = 0; !tp.hostMoe && expert < num_experts; ++expert) {
-                    const std::string prefix = kMtpExpertPrefix + std::to_string(expert) + ".";
-                    model->mtpMoeWeights[2 + 2 * expert] = &model->weight[prefix + "gateup_proj.weight"];
-                    model->mtpMoeWeights[3 + 2 * expert] = &model->weight[prefix + "down_proj.weight"];
+                } else {
+                    for (int expert = 0; expert < num_experts; ++expert) {
+                        const std::string prefix = kMtpExpertPrefix + std::to_string(expert) + ".";
+                        model->mtpMoeWeights[2 + 2 * expert] = &model->weight[prefix + "gateup_proj.weight"];
+                        model->mtpMoeWeights[3 + 2 * expert] = &model->weight[prefix + "down_proj.weight"];
+                    }
                 }
             }
             tp.ranks.push_back(std::move(model));
@@ -1663,7 +1686,11 @@ namespace fastllm {
             if (name.find(languagePrefix) != 0 && name != "lm_head.weight" &&
                 name.find("mtp.") != 0) continue;
             if (source.dims.empty()) continue;
-            if (tp.hostMoe && name.find(".mlp.experts.") != std::string::npos) {
+            const bool expertWeight = name.find(".mlp.experts.") != std::string::npos;
+            const bool mtpExpert = expertWeight && name.rfind("mtp.", 0) == 0;
+            const int expertLayer = expertWeight ? (mtpExpert ? block_cnt - 1 :
+                std::atoi(name.c_str() + name.find("layers.") + 7)) : -1;
+            if (expertWeight && tp.hostMoeLayers.at(expertLayer)) {
                 // Keep the original host layout and NUMA weight registrations.
                 continue;
             }
@@ -1729,7 +1756,7 @@ namespace fastllm {
                 } else if (name.find("down_proj.weight") != std::string::npos) {
                     axis = 1;
                 }
-                if (axis >= 0 && name.find(".experts.") != std::string::npos) {
+                if (axis >= 0 && expertWeight) {
                     // Grouped NVFP4 Marlin needs 128 intermediate columns. A 640
                     // wide expert on four GPUs is 256/128/128/128. With more
                     // ranks than aligned blocks, some ranks own an empty
@@ -1738,12 +1765,10 @@ namespace fastllm {
                     const int width = axis == 0 ? source.dims[0] / 2 : source.dims[1];
                     AssertInFastLLM(width > 0 && width % 128 == 0,
                                     "Qwen4 TP expert width cannot satisfy 128-column alignment.");
-                    const size_t layerStart = name.find("layers.") + 7;
-                    const int layer = std::atoi(name.c_str() + layerStart);
                     int offset = 0;
                     for (int r = 0; r < count; ++r) {
                         const int blocks = width / 128 / count +
-                            ((r + layer) % count < (width / 128) % count ? 1 : 0);
+                            ((r + expertLayer) % count < (width / 128) % count ? 1 : 0);
                         const int end = offset + blocks * 128;
                         scheme[devices[r]] = {{offset, end}};
                         if (axis == 0) scheme[devices[r]].push_back({width + offset, width + end});
@@ -1789,14 +1814,14 @@ namespace fastllm {
                 }
             }
             if (source.dataType == DataType::NVFP4_BLOCK_16_E4M3 &&
-                name.find(".experts.") != std::string::npos) {
-                const int layer = std::atoi(name.c_str() + name.find("layers.") + 7);
+                expertWeight) {
+                const int layer = mtpExpert ? block_cnt : expertLayer;
                 if (++compactLayerCounts[layer] == num_experts * 2) {
                     // Repack each layer immediately to release small source
                     // allocations before their CUDA page overhead exhausts memory.
                     for (int r = 0; r < count; ++r) {
                         FastllmCudaSetDevice(devices[r]);
-                        auto &experts = tp.ranks[r]->weights[layer];
+                        auto &experts = mtpExpert ? tp.ranks[r]->mtpMoeWeights : tp.ranks[r]->weights[layer];
                         if (experts[2]->dims[0] == 0) continue;
                         AssertInFastLLM(FastllmCudaPrepareNVFP4E4M3Moe(experts.data(), experts.size()),
                                         "Qwen4 TP could not prepare compact NVFP4 layer " + std::to_string(layer));
@@ -2269,12 +2294,16 @@ namespace fastllm {
             ReleaseMoeCudaCache(this->weights);
         }
 #ifdef USE_CUDA
-        if (threadTpRank >= 0 && !threadTpOwner->hostMoe) {
+        if (threadTpRank >= 0) {
             FastllmCudaSetDevice(threadTpOwner->devices[threadTpRank]);
-            for (auto &layer : this->weights) {
+            for (int i = 0; i < (int)this->weights.size(); ++i) {
+                if (threadTpOwner->hostMoeLayers[i]) continue;
+                auto &layer = this->weights[i];
                 if (layer.size() > 2 && layer[2] != nullptr)
                     FastllmCudaReleaseMergeMOEVllmMarlinCache(layer[2]);
             }
+            if (!threadTpOwner->hostMoeLayers.back() && mtpMoeWeights.size() > 2 && mtpMoeWeights[2])
+                FastllmCudaReleaseMergeMOEVllmMarlinCache(mtpMoeWeights[2]);
         }
 #endif
     }
@@ -6130,7 +6159,7 @@ namespace fastllm {
         flattened.Resize(input.dims);
         flattened.Reshape({batch * sequence, input.dims.back()});
 
-        const bool hostMoe = threadTpRank >= 0 && threadTpOwner->hostMoe;
+        const bool hostMoe = threadTpRank >= 0 && threadTpOwner->hostMoeLayers[deviceLayer];
         const bool runRoutedExperts = !hostMoe || threadTpRank == 0;
         Data routerLogits, expertIndex, expertScore, sharedOutput;
         if (runRoutedExperts) {
