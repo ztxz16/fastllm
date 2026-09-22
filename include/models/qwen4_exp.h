@@ -79,6 +79,7 @@ namespace fastllm {
         struct PleStagingState;
         struct MtpDraftCudaGraphState;
         struct QsaHostMirrorTransfer;
+        struct ServingCache;
         struct MtpRuntimeState;
         struct ThreadTpState;
         std::unique_ptr<ThreadTpState> threadTpState;
@@ -99,6 +100,8 @@ namespace fastllm {
                 const Data *precomputedEmbedding = nullptr);
 
         struct RequestState {
+            // Exclusive request lease on the model's startup allocation.
+            std::shared_ptr<ServingCache> servingCache;
             std::shared_ptr<PleStagingState> pleStaging;
             int previousToken1 = -1;
             int previousToken2 = -1;
@@ -144,6 +147,19 @@ namespace fastllm {
             std::shared_ptr<MtpRuntimeState> mtpState;
             bool mtpDisabled = false;
         };
+
+        struct ServingCache {
+            std::vector<std::pair<Data, Data>> layers;
+            std::pair<Data, Data> mtp;
+            std::map<int, std::shared_ptr<QsaHostMirrorTransfer>> hostMirrors;
+        };
+        std::shared_ptr<ServingCache> servingCache;
+        void ClearWarmupCache(std::vector<std::pair<Data, Data>> &cache);
+        void ReserveServingCache(std::vector<std::pair<Data, Data>> &warmupCache);
+        void AcquireServingCache(std::vector<std::pair<Data, Data>> &cache,
+                                 RequestState &state);
+        std::shared_ptr<QsaHostMirrorTransfer> &GetQsaHostMirror(
+                RequestState &state, int layer);
 
         struct RequestRuntimeCheckpoint {
             int previousToken1 = -1;

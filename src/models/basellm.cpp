@@ -4,6 +4,7 @@
 
 #include "basellm.h"
 #include "utils.h"
+#include "utils/cuda_cache_budget.h"
 #include <sstream>
 #include <cstring>
 #include <cstdlib>
@@ -4734,17 +4735,8 @@ namespace fastllm {
             auto freeSizes = FastllmCudaGetFreeSizes();
             auto totalSizes = FastllmCudaGetTotalSizes();
             auto getCudaRuntimeHeadroom = [&](int id, long long avail) -> long long {
-                if (avail <= 0) {
-                    return 0;
-                }
-
-                long long headroom = 512LL * 1024LL * 1024LL;
-                if (id >= 0 && id < (int)totalSizes.size()) {
-                    headroom = std::max(headroom, totalSizes[id] / 100);
-                }
-                headroom = std::min(headroom, 2LL * 1024LL * 1024LL * 1024LL);
-                headroom = std::min(headroom, avail / 4);
-                return std::max(0LL, headroom);
+                return CudaCacheRuntimeHeadroom(
+                    id >= 0 && id < (int)totalSizes.size() ? totalSizes[id] : 0, avail);
             };
             auto fitPagesWithLinearReserve = [&](int id, long long avail, long long kvBytesPerPage) -> int {
                 if (avail <= 0 || kvBytesPerPage <= 0) {
