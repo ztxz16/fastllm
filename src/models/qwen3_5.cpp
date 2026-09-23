@@ -56,6 +56,12 @@
 namespace fastllm {
 
 #ifdef USE_CUDA
+    // Query the existing SM70 backend without including CUDA runtime types in
+    // this C++ translation unit. Defined in awq_sm70/fastllm-awq-sm70.cu.
+    namespace awq_sm70 {
+        bool Nvfp4Supported();
+    }
+
     struct Qwen35VisionTPState {
         struct Rank {
             int device = 0;
@@ -28442,7 +28448,8 @@ namespace fastllm {
 
 #ifdef USE_CUDA
     static void Qwen35PrepareDraftNvfp4Layout(Data &weight, int device) {
-        if (FastllmCudaHasNVFP4MarlinLayout(weight))
+        const bool sm70 = awq_sm70::Nvfp4Supported();
+        if (FastllmCudaHasNVFP4MarlinLayout(weight) || (sm70 && weight.IsRepacked))
             return;
         Data x(DataType::FLOAT16, {1, weight.dims[1]});
         Data y(DataType::FLOAT16, {1, weight.dims[0]});
@@ -28456,8 +28463,16 @@ namespace fastllm {
         FastllmCudaSetNcclForceSync(true);
         bool ready = false;
         try {
-            ready = FastllmCudaTryMarlinHalfMatMulFloatNVFP4Block16(x, weight, *GetEmptyData(), y, 1,
-                                                                    weight.dims[1], weight.dims[0]);
+            if (sm70) {
+                // Use normal dispatch so synchronized warmup prepares the
+                // TurboMind layout; Marlin is unavailable on Volta.
+                FastllmCudaHalfMatMulFloatNVFP4Block16(x, weight, *GetEmptyData(), y, 1,
+                                                     weight.dims[1], weight.dims[0]);
+                ready = weight.IsRepacked;
+            } else {
+                ready = FastllmCudaTryMarlinHalfMatMulFloatNVFP4Block16(x, weight, *GetEmptyData(), y, 1,
+                                                                        weight.dims[1], weight.dims[0]);
+            }
         } catch (...) {
             FastllmCudaSetNcclForceSync(oldSync);
             throw;
@@ -31980,13 +31995,18 @@ namespace fastllm {
         // adapter for using the FP16 Marlin layout with BF16/FP32 inputs.
         if (num_experts != 0 || this->dataType != DataType::FLOAT16) return;
         FastllmCudaSetDevice(device);
+        // This preparation destructively packs draft weights for an A16
+        // backend. Restrict the new SM70 route to FP16 model activations and
+        // aligned shapes; other configurations retain the prior checks.
+        const bool sm70 = awq_sm70::Nvfp4Supported();
+        auto supportedShape = [&](int n, int k) {
+            return (sm70 && n > 0 && k > 0 && n % 32 == 0 && k % 16 == 0) ||
+                   FastllmCudaMarlinNVFP4Supported(n, k);
+        };
         auto supported = [&](const Data &w) {
             return !w.multiDeviceData && w.dims.size() == 2 &&
                 w.dataDevice == DataDevice::CUDA && w.cudaData &&
-                FastllmCudaMarlinNVFP4Supported(w.dims[0], w.dims[1]);
-        };
-        auto prepareLayout = [&](Data &w) {
-            if (this->dataType == DataType::FLOAT16) Qwen35PrepareDraftNvfp4Layout(w, device);
+                supportedShape(w.dims[0], w.dims[1]);
         };
         if (mode == "nvfp4") {
             std::vector<std::string> names = {"mtp.fc.weight"};
@@ -32010,7 +32030,7 @@ namespace fastllm {
                 w.CopyFrom(q);
                 w.blockK = 1; w.blockM = 16; w.scales = scales;
                 w.weightType = WeightType::LINEAR; w.isModelWeight = true;
-                prepareLayout(w);
+                Qwen35PrepareDraftNvfp4Layout(w, device);
                 printf("[Qwen3.5 MTP NVFP4] backbone %s [%d,%d] %.3f GB\n",
                        name.c_str(), w.dims[0], w.dims[1], w.GetBytes()/1.0e9);
             }
@@ -32045,7 +32065,7 @@ namespace fastllm {
                 std::sort(selectedRows.begin(), selectedRows.end());
                 valid = valid && std::adjacent_find(selectedRows.begin(), selectedRows.end()) == selectedRows.end()
                         && selectedRows.size() < size_t(head.dims[0])
-                        && FastllmCudaMarlinNVFP4Supported(int(selectedRows.size()), head.dims[1]);
+                        && supportedShape(int(selectedRows.size()), head.dims[1]);
                 if (!valid) {
                     printf("[Qwen3.5 MTP NVFP4] invalid or unsupported token shortlist; using full vocabulary.\n");
                     selectedRows.clear();
@@ -32070,7 +32090,7 @@ namespace fastllm {
                 printf("[Qwen3.5 MTP NVFP4] head conversion unavailable; using the original head.\n");
             }
         }
-        if (!mtpNvfp4DraftLmHead.dims.empty()) prepareLayout(mtpNvfp4DraftLmHead);
+        if (!mtpNvfp4DraftLmHead.dims.empty()) Qwen35PrepareDraftNvfp4Layout(mtpNvfp4DraftLmHead, device);
         if (!mtpDraftTokenIds.empty()) {
             // One immutable integer map, shared across requests; no weight copy.
             mtpDraftTokenIdsCuda.dataType = DataType::INT32;
