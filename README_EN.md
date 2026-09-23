@@ -322,6 +322,8 @@ Qwen3.5 MTP and DFlash drafts share the following NVFP4 conversion setting. Set 
 
 For example, prefix the existing launch command with `FASTLLM_DRAFT_QUANT=nvfp4`. Both single-GPU and multi-GPU runs are supported. Eligible draft shards are converted after splitting; separate draft-head copies preserve the target head shards. Dense MTP requires FP16 compute for multi-GPU NVFP4. Unsupported shapes or types retain their existing path. Explicit NVFP4 conversion takes precedence for eligible MTP head shards; `off` disables only NVFP4 conversion, leaving the existing multi-GPU FP8 draft-head switch in effect.
 
+NVFP4 small-matrix decode tuning is enabled by default on SM75 devices with 68 SMs, such as the RTX 2080 Ti. It covers M=1–8 for fused SwiGLU with N×K=17408×5120 and Linear with N×K=5120×8704 or 5120×3072, subject to the runtime block-residency check. Other architectures, shapes, and prefill with an original M>8 retain their existing paths. Set `FASTLLM_CUDA_NVFP4_SM75_DECODE_TUNE=0` to disable tuning, `1` to explicitly enable both parts, or `linear` / `swiglu` to select one part. The multirow SwiGLU fusion entry remains controlled separately by `FASTLLM_CUDA_NVFP4_SWIGLU_MULTIROW`.
+
 ### API server
 
 | Option | Default | Description |

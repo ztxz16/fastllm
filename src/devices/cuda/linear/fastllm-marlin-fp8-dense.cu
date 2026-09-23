@@ -303,12 +303,13 @@ static bool SelectFp4Tile(int sizeM, int sizeN, int sizeK,
 // The original launch reserves all 64 KiB of SM75 shared memory for one
 // resident CTA. These measured M=1..8 shapes can use two resident CTAs without
 // changing the weight layout or growing the per-weight reduction scratch.
-// Keep the opt-in local to the measured 68-SM Turing device and leave all
-// other shapes, prefill, and architectures on their existing dispatch.
+// Enable tuning by default only for the measured 68-SM Turing device and
+// shapes. Other shapes, prefill, and architectures keep their dispatch;
+// FASTLLM_CUDA_NVFP4_SM75_DECODE_TUNE=0 restores the untuned launch.
 static int Sm75Nvfp4DecodeTuneMode() {
     static const int mode = []() {
         const char *value = std::getenv("FASTLLM_CUDA_NVFP4_SM75_DECODE_TUNE");
-        if (value == nullptr) return 0;
+        if (value == nullptr) return 3;
         if (!std::strcmp(value, "1")) return 3;
         if (!std::strcmp(value, "linear")) return 1;
         if (!std::strcmp(value, "swiglu")) return 2;

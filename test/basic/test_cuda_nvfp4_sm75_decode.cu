@@ -94,8 +94,8 @@ static void Run(int gpu, int n, int k, bool fused, bool writeReference,
                 file.read(reinterpret_cast<char *>(reference.data()), reference.size() * sizeof(half));
                 Require(file.gcount() == std::streamsize(reference.size() * sizeof(half)), "Missing/truncated reference");
                 const char *mode = std::getenv("FASTLLM_CUDA_NVFP4_SM75_DECODE_TUNE");
-                const bool linear = mode && (!std::strcmp(mode, "1") || !std::strcmp(mode, "linear"));
-                const bool swiglu = mode && (!std::strcmp(mode, "1") || !std::strcmp(mode, "swiglu"));
+                const bool linear = !mode || !std::strcmp(mode, "1") || !std::strcmp(mode, "linear");
+                const bool swiglu = !mode || !std::strcmp(mode, "1") || !std::strcmp(mode, "swiglu");
                 const bool tunedReduction =
                     (linear && m >= 1 && m <= 8 && !fused && n == 5120 && (k == 3072 || k == 8704)) ||
                     (swiglu && m == 1 && fused && n == 17408 && k == 5120);

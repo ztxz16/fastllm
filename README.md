@@ -323,6 +323,8 @@ Qwen3.5 系列的 MTP 和 DFlash 草稿共用以下 NVFP4 转换开关，需在�
 
 例如，在现有启动命令前加 `FASTLLM_DRAFT_QUANT=nvfp4`。单卡和多卡均可使用；多卡在切分后转换符合条件的草稿分片，输出头使用独立副本，目标模型分片保持原样。稠密 MTP 的多卡 NVFP4 路径要求 FP16 计算；不支持的形状或类型保留原路径。显式启用 NVFP4 时，符合条件的 MTP 输出头优先使用 NVFP4；`off` 仅关闭 NVFP4 转换，既有多卡 FP8 草稿输出头开关仍有效。
 
+NVFP4 小矩阵解码默认在 SM75、68 个 SM 的设备（如 RTX 2080 Ti）上启用已验证的调优，覆盖 M=1～8、N×K 为 17408×5120 的融合 SwiGLU，以及 5120×8704、5120×3072 的 Linear。运行时还需满足线程块驻留条件；其他架构、形状和原始 M>8 的 prefill 保持原路径。可用 `FASTLLM_CUDA_NVFP4_SM75_DECODE_TUNE=0` 关闭，`1` 显式开启全部，或用 `linear` / `swiglu` 仅开启对应部分。多行 SwiGLU 的融合入口仍由 `FASTLLM_CUDA_NVFP4_SWIGLU_MULTIROW` 单独控制。
+
 ### API Server
 
 | 参数 | 默认值 | 说明 |
