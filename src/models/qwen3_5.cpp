@@ -28412,7 +28412,9 @@ namespace fastllm {
 
     static std::string Qwen35DraftQuantMode() {
         const char *setting = std::getenv("FASTLLM_DRAFT_QUANT");
-        const std::string mode = setting ? setting : "off";
+        // Conversion sites retain their device, model and dtype checks.
+        // An explicit off (or empty value) preserves the original draft weights.
+        const std::string mode = setting ? setting : "nvfp4";
         AssertInFastLLM(mode.empty() || mode == "off" || mode == "nvfp4_head" || mode == "nvfp4",
                        "FASTLLM_DRAFT_QUANT must be off, nvfp4_head, or nvfp4.\n");
         return mode.empty() ? "off" : mode;
@@ -31962,12 +31964,14 @@ namespace fastllm {
 #endif
     }
 
-    // Experimental single-GPU draft quantization. The target head is never replaced.
+    // Single-GPU draft quantization. The target head is never replaced.
     void Qwen3_5Model::PrepareMtpNvfp4DraftWeights(int device) {
 #ifdef USE_CUDA
         const std::string mode = Qwen35DraftQuantMode();
         if (mode == "off") return;
-        if (num_experts != 0) return;
+        // Match the TP MTP fast path: unlike DFlash, MTP has no activation
+        // adapter for using the FP16 Marlin layout with BF16/FP32 inputs.
+        if (num_experts != 0 || this->dataType != DataType::FLOAT16) return;
         FastllmCudaSetDevice(device);
         auto supported = [&](const Data &w) {
             return !w.multiDeviceData && w.dims.size() == 2 &&

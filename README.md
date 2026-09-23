@@ -312,11 +312,11 @@ CLI 会持续演进，`ftllm <command> --help` 是当前安装版本的最终依
 | `--ori` | 读取部分 GGUF 时指定原模型配置和 tokenizer 目录 |
 | `--mmproj` | Qwen3.5 架构族 GGUF 的配套视觉模块文件；配置要求与示例见 [GGUF 多模态](docs/qwen3.md#gguf-multimodal) |
 
-Qwen3.5 系列的 MTP 和 DFlash 草稿共用以下 NVFP4 转换开关，需在启动前设置，并启用相应的草稿算法：
+Qwen3.5 系列的 MTP 和 DFlash 草稿支持以下设置。启用相应的草稿算法后，兼容路径默认使用 NVFP4；环境变量可在启动前覆盖默认值：
 
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `FASTLLM_DRAFT_QUANT` | `off` | `off` 关闭 NVFP4 转换；`nvfp4_head` 只转换独立草稿输出头；`nvfp4` 转换草稿主干和输出头。目标模型输出头保持原权重，不支持的权重保留原实现 |
+| `FASTLLM_DRAFT_QUANT` | `nvfp4` | `off` 关闭 NVFP4 转换；`nvfp4_head` 只转换独立草稿输出头；`nvfp4` 转换草稿主干和输出头。目标模型输出头保持原权重，不支持的设备、类型或形状保留原路径 |
 | `FASTLLM_CUDA_NVFP4_SWIGLU_MULTIROW` | `1` | 允许多行 NVFP4 Linear + SwiGLU 融合，`0` 关闭。当前多行内核仅支持 SM75、FP16 输入、M=2～8，并检查形状、布局和临时空间；其他情况回退 |
 | `FASTLLM_TP_NVFP4_MLP_SWIGLU` | `1` | TP MLP 尝试 NVFP4 Linear + SwiGLU 融合，`0` 关闭；由底层能力检查选择内核，不支持时执行原 Linear + SwiGLU |
 | `FASTLLM_TP_NATIVE_GREEDY` | `1` | Qwen3.5 TP 贪心采样支持原生类型 logits；eager 推测验证省去 FP16→FP32 转换，`0` 关闭。随机采样、返回 logits、Graph 和 GPU token handoff 仍保持 FP32 路径 |
@@ -325,7 +325,7 @@ Qwen3.5 系列的 MTP 和 DFlash 草稿共用以下 NVFP4 转换开关，需在�
 | `FASTLLM_DFLASH_DRAFT_TOKEN_IDS` | 未设置 | 多卡 DFlash2 的可选 NVFP4 草稿词表清单，仅用于贪心请求；要求每个连续词表分片至少有 selector top-k 个候选。top-k 前移除对齐填充，选择后恢复原 token ID。随机采样使用完整原始头；非法或不支持的清单回退完整词表 |
 | `FASTLLM_DFLASH_ATTENTION` | 未设置：SM75 开，其余关 | DFlash FP16 融合滑窗 attention 的统一开关：`0` 关闭，`1` 在支持的设备上开启。要求 head_dim=128、query 数 1～16、query 数×GQA 分组数≤64、query 数≤窗口≤4096，且 FlashInfer 可用；不匹配时回退原路径。SM80 及以上的 Q64 路径尚无实机正确性或速度验证；SM70 及以下始终保持原路径 |
 
-例如，在现有启动命令前加 `FASTLLM_DRAFT_QUANT=nvfp4`。单卡和多卡均可使用；多卡在切分后转换符合条件的草稿分片，输出头使用独立副本，目标模型分片保持原样。稠密 MTP 的多卡 NVFP4 路径要求 FP16 计算；不支持的形状或类型保留原路径。显式启用 NVFP4 时，符合条件的 MTP 输出头优先使用 NVFP4；`off` 仅关闭 NVFP4 转换，既有多卡 FP8 草稿输出头开关仍有效。
+上述五项无需再写入启动命令，也不额外按 SM 设置不同默认值；内核本身的能力限制仍然有效。单卡和多卡均可使用草稿 NVFP4；多卡在切分后转换符合条件的分片。MTP 限于稠密模型、FP16 计算；DFlash 的量化 Linear 通过 FP16 适配后恢复原激活类型。量化会影响草稿接受率，独立输出头和视图副本也会改变显存占用，不保证所有模型提速；目标模型权重与完整词表验证保持原样。可用 `FASTLLM_DRAFT_QUANT=off` 保留原草稿精度，既有多卡 FP8 草稿输出头开关仍有效。
 
 NVFP4 小矩阵解码默认在 SM75、68 个 SM 的设备（如 RTX 2080 Ti）上启用已验证的调优，覆盖 M=1～8、N×K 为 17408×5120 的融合 SwiGLU，以及 5120×8704、5120×3072 的 Linear。运行时还需满足线程块驻留条件；其他架构、形状和原始 M>8 的 prefill 保持原路径。可用 `FASTLLM_CUDA_NVFP4_SM75_DECODE_TUNE=0` 关闭，`1` 显式开启全部，或用 `linear` / `swiglu` 仅开启对应部分。多行 SwiGLU 的融合入口仍由 `FASTLLM_CUDA_NVFP4_SWIGLU_MULTIROW` 单独控制。
 
