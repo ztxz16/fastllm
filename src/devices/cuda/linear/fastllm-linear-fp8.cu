@@ -1,5 +1,6 @@
 #include <climits>
 #include "devices/cuda/fastllm-fp8-small-t.cuh"
+#include "devices/cuda/fastllm-fp8-sm70.cuh"
 //
 // Created by huangyuyang on 2/6/26.
 //
@@ -1061,6 +1062,10 @@ static bool TryFastllmRowFP8(T *input, uint8_t *weight, T *output, T *bias, floa
 }
 
 void LaunchFastllmGemmFp16FP8E4M3(half *input, uint8_t *weight, half *output, half *bias, float *scales, int n, int m, int k, int blockM, int blockK) {
+    if (fastllm::fp8sm70::Try(input, weight, scales, bias, output,
+                            m, k, n, blockM, blockK, cudaStreamPerThread)) {
+        return;
+    }
     if (TryFastllmRowFP8(input, weight, output, bias, scales, n, m, k, blockM, blockK)) {
         return;
     }

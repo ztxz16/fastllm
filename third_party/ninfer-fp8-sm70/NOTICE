@@ -1,0 +1,15 @@
+FastLLM SM70 row-scaled FP8 kernel attribution
+
+Adapted from https://github.com/dollarwong/ninfer-v100 at commit
+f17d37fc98b78cc025a1037e8adb1f4fb83813fb, Apache License 2.0:
+  src/ops/linear/fp8/fp8_volta_qpn_gemm.cuh
+  src/ops/common/volta_mma.cuh
+
+The Volta mma.sync primitive and fragment geometry derive from llama.cpp,
+Copyright (c) 2023-2026 The ggml authors, MIT License.
+Both license texts are included in this directory.
+
+FastLLM modifications (2026-09-23): coalesced reads and warp-local shared-memory
+transpose of unmodified row-major FP8 weights; FP32 per-row scales; FP16 bias
+and output; shape, alignment, alias and SM70 runtime guards; fallback switch.
+No persistent prepacked weight allocation or weight requantization is required.
