@@ -6,6 +6,7 @@
 
 #include "qwen3_5.h"
 #include "models/qwen3_5_paged_cache.h"
+#include "models/qwen3_5_mtp_shortlist.h"
 #include "blocks/baseblock.h"
 #include "executor.h"
 
@@ -7445,6 +7446,12 @@ namespace fastllm {
                 int shardWidth = 0;
                 for (const auto &range : schemeIt->second) shardWidth += range.second - range.first;
                 if (shardWidth == 0) continue;
+                // Mixed EOS policies may fall back from native TP greedy to
+                // a gathered FP32 path. Convert each rank before byte copies.
+                if (localLogits[r].dataType != DataType::FLOAT32) {
+                    FastllmCudaSetDevice(device);
+                    ToDataType(localLogits[r], DataType::FLOAT32);
+                }
                 AssertInFastLLM(localLogits[r].dataDevice == DataDevice::CUDA &&
                                 localLogits[r].cudaData != nullptr,
                                 "Qwen3.5 CUDA sampling: local logits must stay on CUDA.\n");
@@ -7490,11 +7497,13 @@ namespace fastllm {
             static thread_local std::vector<Data> cudaBestIds;
             static thread_local std::vector<Data> cudaBestScores;
             static thread_local std::vector<Data> cudaPackedCandidates;
+            static thread_local std::vector<Data> cudaGreedyScratch;
             localBestIds.resize(devices.size());
             localBestScores.resize(devices.size());
             cudaBestIds.resize(devices.size());
             cudaBestScores.resize(devices.size());
             cudaPackedCandidates.resize(devices.size());
+            cudaGreedyScratch.resize(devices.size());
 
             Qwen35GpuTokenHandoffControl *handoff =
                 qwen35GpuTokenHandoffControl;
@@ -7552,6 +7561,12 @@ namespace fastllm {
                                 "Qwen3.5 CUDA greedy shard sampling batch mismatch.\n");
 
                 FastllmCudaSetDevice(device);
+                // Existing EOS masking and GPU handoff kernels take FP32.
+                // Keep them intact; unmasked host-return greedy stays native.
+                if ((handoffSampling || resetEos) &&
+                    localLogits[r].dataType != DataType::FLOAT32) {
+                    ToDataType(localLogits[r], DataType::FLOAT32);
+                }
                 if (resetEos && !eosIds.empty()) {
                     std::vector<int> localEosIds;
                     int localOffset = 0;
@@ -7597,11 +7612,33 @@ namespace fastllm {
                     cudaBestScores[r].Resize({batch});
                     cudaBestIds[r].Allocate();
                     cudaBestScores[r].Allocate();
-                    sampled = FastllmCudaGreedySamplingWithScores(
-                        (float*)localLogits[r].cudaData,
-                        (int*)cudaBestIds[r].cudaData,
-                        (float*)cudaBestScores[r].cudaData,
-                        batch, localVocab);
+                    const char *nativeGreedyFlag = std::getenv("FASTLLM_TP_NATIVE_GREEDY");
+                    if (nativeGreedyFlag && Qwen35MoeIsTrueString(nativeGreedyFlag)) {
+                        size_t bytes = FastllmCudaGreedySamplingWorkspaceBytes(batch, localVocab);
+                        Data &scratch = cudaGreedyScratch[r];
+                        Qwen3CudaPrepareLocalOutput(scratch, device);
+                        scratch.dataType = DataType::INT8;
+                        scratch.UpdateUnitSize();
+                        scratch.Resize({(int)std::max<size_t>(1, bytes)});
+                        scratch.Allocate(false);
+                        sampled = FastllmCudaGreedySamplingTypedWithScores(
+                            localLogits[r].cudaData, localLogits[r].dataType,
+                            (int*)cudaBestIds[r].cudaData,
+                            (float*)cudaBestScores[r].cudaData,
+                            batch, localVocab, scratch.cudaData, bytes);
+                        static thread_local std::set<int> loggedNativeDevices;
+                        if (sampled && localLogits[r].dataType == DataType::FLOAT16 &&
+                            loggedNativeDevices.insert(device).second) {
+                            printf("[TP greedy] native FP16 logits on GPU %d, rows=%d vocab=%d\n",
+                                device, batch, localVocab);
+                        }
+                    } else {
+                        sampled = FastllmCudaGreedySamplingWithScores(
+                            (float*)localLogits[r].cudaData,
+                            (int*)cudaBestIds[r].cudaData,
+                            (float*)cudaBestScores[r].cudaData,
+                            batch, localVocab);
+                    }
                 }
                 AssertInFastLLM(sampled,
                                 "Qwen3.5 CUDA greedy shard sampling failed.\n");
@@ -12747,7 +12784,8 @@ namespace fastllm {
             bool firstTensorParallelRank,
             int pagedCacheLayerOffset,
             Data &logits,
-            Data *precomputedHiddenStates) {
+            Data *precomputedHiddenStates,
+            bool preserveNativeLogits) {
 #ifndef USE_CUDA
         ErrorInFastLLM("Qwen3.5 ForwardSingleGPU requires CUDA.\n");
 #else
@@ -15672,7 +15710,7 @@ namespace fastllm {
         if (mtpVerifyGraphDeviceState != nullptr) {
             Qwen3CudaConvertToDataType(
                 cudaRunner, headOutput, logits, DataType::FLOAT32);
-        } else {
+        } else if (!preserveNativeLogits) {
             Qwen3CudaToDataType(cudaRunner, logits, DataType::FLOAT32);
         }
         mtpWorkerProfileSyncMark(mtpWorkerProfileHeadUs);
@@ -17259,6 +17297,16 @@ namespace fastllm {
             if (coordinateNormalDecodeGraph) {
                 tpDecodeGraphContext.Reset(devices);
             }
+            // Only eager TP speculative greedy consumes native-type shards.
+            // Sampling, returned logits, graphs and GPU handoff retain FP32.
+            const char *nativeGreedyFlag = std::getenv("FASTLLM_TP_NATIVE_GREEDY");
+            bool preserveNativeLogits = speculativeCollectAllLogits &&
+                tensorParallel && activeGpuTokenHandoff == nullptr &&
+                nativeGreedyFlag && Qwen35MoeIsTrueString(nativeGreedyFlag) &&
+                std::all_of(generationConfigs.begin(), generationConfigs.end(),
+                    [](const GenerationConfig &config) {
+                        return config.IsSimpleGreedy() && !config.output_logits;
+                    });
             threadTpWorkerGroup.RunWithCaller(devices, [&](int r) {
                 Qwen35ScopedGpuTokenHandoffControl handoffScope(
                     activeGpuTokenHandoff);
@@ -17269,7 +17317,7 @@ namespace fastllm {
                     allPositionIds, seqLens, localPastKeyValues[r],
                     all1, isPrefill, tensorParallel, r == 0,
                     threadTpPagedCacheBase + r * block_cnt,
-                    localLogits[r], precomputedHiddenStates);
+                    localLogits[r], precomputedHiddenStates, preserveNativeLogits);
                 FastllmCudaSetDevice(devices[r]);
                 if (pipelineGpuTokenHandoff) {
                     activeGpuTokenHandoff->RecordForwardReady(r);
@@ -28467,6 +28515,98 @@ namespace fastllm {
     }
 #endif
 
+    bool Qwen3_5Model::PrepareDFlashDraftShortlist(const std::vector<int> &devices) {
+#ifdef USE_CUDA
+        if (!dflashDraftTokenIds.empty()) dflashNvfp4TpLmHeads.clear();
+        dflashDraftTokenIds.clear();
+        const char *path = std::getenv("FASTLLM_DFLASH_DRAFT_TOKEN_IDS");
+        if (!path || !*path || std::string(path) == "0") return false;
+        const int previousDevice = FastllmCudaGetDevice();
+        struct Restore {
+            int device;
+            ~Restore() { if (device >= 0) FastllmCudaSetDevice(device); }
+        } restore{previousDevice};
+        Data &head = weight["lm_head.weight"];
+        std::vector<int> ids;
+        std::map<int, mtp_shortlist::Shard> plans;
+        bool valid = devices.size() > 1 && head.multiDeviceData && head.dims.size() == 2 &&
+            dflashSelectorTopK > 0 && mtp_shortlist::Read(path, head.dims[0], ids);
+        auto bias = weight.weight.find("lm_head.bias");
+        valid = valid && (bias == weight.weight.end() || bias->second.dims.empty());
+        size_t selected = 0;
+        for (int device : devices) {
+            if (!valid) break;
+            auto local = head.multiDeviceDatas.find(device);
+            auto scheme = threadTpLmHeadScheme.find(device);
+            valid = local != head.multiDeviceDatas.end() && local->second &&
+                local->second->dims.size() == 2 && scheme != threadTpLmHeadScheme.end() &&
+                scheme->second.size() == 1 && mtp_shortlist::Project(ids, scheme->second,
+                    local->second->dims[0], head.dims[0], plans[device]);
+            if (valid) {
+                const auto &plan = plans.at(device);
+                // Every rank must supply a complete top-k. Unsupported/empty
+                // shards fall back together; do not merge sentinel token IDs.
+                valid = plan.logicalSize >= dflashSelectorTopK &&
+                    FastllmCudaMarlinNVFP4Supported((int)plan.rows.size(), local->second->dims[1]);
+                selected += plan.logicalSize;
+            }
+        }
+        valid = valid && selected == ids.size();
+        std::unordered_map<int, Data> pending;
+        for (int device : devices) {
+            if (!valid) break;
+            FastllmCudaSetDevice(device);
+            Data &q = pending[device];
+            valid = FastllmCudaQuantizeLinearWeightNVFP4Block16Rows(
+                *head.multiDeviceDatas.at(device), q, plans.at(device).rows);
+            if (!valid) break;
+            q.name = "dflash.draft_lm_head_nvfp4_shortlist.cuda:" + std::to_string(device);
+            q.weightType = WeightType::LINEAR;
+            q.isModelWeight = true;
+            Qwen35PrepareDraftNvfp4Layout(q, device);
+        }
+        if (!valid) {
+            printf("[Qwen3.5 DFlash2 shortlist] invalid or unsupported TP shortlist; using full vocabulary.\n");
+            return false;
+        }
+        dflashNvfp4TpLmHeads.swap(pending);
+        size_t bytes = 0;
+        for (int device : devices) {
+            auto &plan = plans.at(device);
+            printf("[Qwen3.5 DFlash2 shortlist] GPU %d: selected=%d padded=%zu source=%d.\n",
+                device, plan.logicalSize, plan.rows.size(), head.multiDeviceDatas.at(device)->dims[0]);
+            plan.tokenIds.resize(plan.logicalSize);
+            dflashDraftTokenIds[device] = std::move(plan.tokenIds);
+            bytes += dflashNvfp4TpLmHeads.at(device).GetBytes();
+        }
+        printf("[Qwen3.5 DFlash2 shortlist] ready: %zu/%d tokens, %.3f GB extra; greedy only, target head retained.\n",
+            ids.size(), head.dims[0], bytes / 1.0e9);
+        fflush(stdout);
+        return true;
+#else
+        (void)devices;
+        return false;
+#endif
+    }
+
+    void Qwen3_5Model::MapDFlashShortlistCandidates(Data &candidates) const {
+        AssertInFastLLM(candidates.dataDevice == DataDevice::CPU &&
+            candidates.dataType == DataType::FLOAT32 && candidates.Count(0) % 2 == 0,
+            "DFlash shortlist candidates must be host token/score pairs.\n");
+        float *pairs = reinterpret_cast<float*>(candidates.cpuData);
+        for (uint64_t i = 0; i < candidates.Count(0); i += 2) {
+            const int proxy = (int)(pairs[i] + 1.0e-3f);
+            int token = -1;
+            for (const auto &entry : dflashDraftTokenIds) {
+                const auto &ranges = threadTpLmHeadScheme.at(entry.first);
+                token = mtp_shortlist::MapProxyId(proxy, ranges[0].first, entry.second);
+                if (token >= 0) break;
+            }
+            AssertInFastLLM(token >= 0, "DFlash shortlist candidate ID outside logical rows.\n");
+            pairs[i] = (float)token;
+        }
+    }
+
     void Qwen3_5Model::PrepareDFlashWeightsForDevice(int device) {
 #ifdef USE_CUDA
         if (!HasDFlashWeights()) {
@@ -28475,6 +28615,10 @@ namespace fastllm {
         if (dflashWeightsPrepared && dflashWeightsPreparedDevice == device) {
             PrepareDFlashBackboneTensorParallelWeights(device);
             return;
+        }
+        if (!dflashDraftTokenIds.empty()) {
+            dflashNvfp4TpLmHeads.clear();
+            dflashDraftTokenIds.clear();
         }
         std::set<std::string> deferredTpLinearWeights;
         std::vector<int> tpDevices;
@@ -28704,7 +28848,7 @@ namespace fastllm {
                 }
             }
             Data &head = weight["lm_head.weight"];
-            if (head.multiDeviceData) {
+            if (head.multiDeviceData && !PrepareDFlashDraftShortlist(tpDevices)) {
                 for (int tpDevice : tpDevices) {
                     auto local = head.multiDeviceDatas.find(tpDevice);
                     if (local == head.multiDeviceDatas.end() || !local->second) continue;
@@ -28947,17 +29091,33 @@ namespace fastllm {
 #endif
     }
 
-    void Qwen3_5Model::RunDFlashLmHead(int device, Data &input, Data &originalHead,
-                                      const Data &bias, Data &output) {
 #ifdef USE_CUDA
+    static Qwen3CudaDirectRunner &Qwen35DFlashThreadLocalRunner(int device) {
+        // The runner owns the CUDA operator table, not request tensors. Reuse
+        // it on each worker/device instead of rebuilding the table per draft.
+        static thread_local std::map<int, std::unique_ptr<Qwen3CudaDirectRunner>> runners;
+        auto &runner = runners[device];
+        if (runner == nullptr) {
+            runner.reset(new Qwen3CudaDirectRunner(device));
+        }
+        return *runner;
+    }
+#endif
+
+    void Qwen3_5Model::RunDFlashLmHead(int device, Data &input, Data &originalHead,
+                                      const Data &bias, Data &output, bool useShortlist) {
+#ifdef USE_CUDA
+        auto selected = dflashDraftTokenIds.find(device);
+        const bool compact = useShortlist && selected != dflashDraftTokenIds.end();
         Data *head = &originalHead;
         auto local = dflashNvfp4TpLmHeads.find(device);
-        if (local != dflashNvfp4TpLmHeads.end()) {
+        if (local != dflashNvfp4TpLmHeads.end() &&
+            (selected == dflashDraftTokenIds.end() || compact)) {
             head = &local->second;
         } else if (!weight["lm_head.weight"].multiDeviceData && !dflashNvfp4DraftLmHead.dims.empty()) {
             head = &dflashNvfp4DraftLmHead;
         }
-        Qwen3CudaDirectRunner runner(device);
+        Qwen3CudaDirectRunner &runner = Qwen35DFlashThreadLocalRunner(device);
         Data halfInput;
         Data *source = &input;
         if (head->dataType == DataType::NVFP4_BLOCK_16 && input.dataType != DataType::FLOAT16) {
@@ -28965,9 +29125,18 @@ namespace fastllm {
             qwen3cuda::Qwen3CudaToDataType(runner, halfInput, DataType::FLOAT16);
             source = &halfInput;
         }
-        qwen3cuda::Qwen3CudaLinear(runner, *source, *head, bias, output);
+        Data paddedOutput;
+        Data &projection = compact ? paddedOutput : output;
+        qwen3cuda::Qwen3CudaLinear(runner, *source, *head, bias, projection);
+        if (compact) {
+            // Padding repeats weights for GEMM alignment. It must be removed
+            // before top-k so one token cannot occupy several candidate slots.
+            qwen3cuda::Qwen3CudaSplit(runner, paddedOutput, -1, 0,
+                (int)selected->second.size(), output);
+        }
 #else
         (void)device;
+        (void)useShortlist;
         Linear(input, originalHead, bias, output);
 #endif
     }
@@ -29526,6 +29695,14 @@ namespace fastllm {
                 predecessor.dims[1] == dflashSelectorRank &&
                 successor.dims[1] == dflashSelectorRank,
             "DFlash selector codebook shape mismatch.\n");
+        // Validate once: neither codebook's dtype changes during selection.
+        // Keeping validation outside the rank loop also lets the compiler
+        // specialize the BF16 and FP32 loads without changing score order.
+        for (const Data *table : {&predecessor, &successor}) {
+            AssertInFastLLM(table->dataType == DataType::BFLOAT16 ||
+                                table->dataType == DataType::FLOAT32,
+                            "DFlash selector codebook dtype is unsupported.\n");
+        }
         auto codebookValue = [&](const Data &table, int token, int rank) {
             const size_t index =
                 (size_t)token * dflashSelectorRank + rank;
@@ -29533,8 +29710,6 @@ namespace fastllm {
                 return BFloat16BitsToFloat32(
                     ((const uint16_t*)table.cpuData)[index]);
             }
-            AssertInFastLLM(table.dataType == DataType::FLOAT32,
-                            "DFlash selector codebook dtype is unsupported.\n");
             return ((const float*)table.cpuData)[index];
         };
 
@@ -29581,8 +29756,7 @@ namespace fastllm {
                 float score = candidateTopK[topKOffset + 1];
                 for (int rank = 0; rank < dflashSelectorRank; ++rank) {
                     score += predecessorHidden[rank] *
-                             codebookValue(
-                                 successor, candidateToken, rank);
+                             codebookValue(successor, candidateToken, rank);
                 }
                 scores[candidate] = score;
                 context.proposalCandidateIds.push_back(candidateToken);
@@ -29689,6 +29863,7 @@ namespace fastllm {
         return {};
 #else
         PrepareDFlashWeightsForDevice(device);
+        const bool useShortlist = !dflashDraftTokenIds.empty() && generationConfig.IsSimpleGreedy();
         AssertInFastLLM(HasDFlashWeights() &&
                             (int)context.draftKeyValues.size() == dflashLayers,
                         "DFlash draft weights or KV context are incomplete.\n");
@@ -30101,7 +30276,7 @@ namespace fastllm {
         Data fullLogits;
         Data replicatedHidden;
         if (draftDevices.size() == 1) {
-            RunDFlashLmHead(device, lmHeadHidden, weight["lm_head.weight"], *GetEmptyData(), fullLogits);
+            RunDFlashLmHead(device, lmHeadHidden, weight["lm_head.weight"], *GetEmptyData(), fullLogits, useShortlist);
             ToDataType(fullLogits, DataType::FLOAT32);
             fullLogits.Reshape({lmHeadRows, fullLogits.dims.back()});
         } else {
@@ -30116,6 +30291,38 @@ namespace fastllm {
                 replicatedHidden, draftDevices, true);
         }
 
+        Data selectorHidden;
+        auto projectSelector = [&]() {
+            Linear(slotHidden,
+                   weight["dflash.candidate_selector.hidden_projection.weight"],
+                   *GetEmptyData(), selectorHidden);
+            ToDataType(selectorHidden, DataType::FLOAT32);
+        };
+        // Independent of candidate top-k. On TP, use rank 0's head worker
+        // stream: generic CUDA temporary arenas are shared per device, so
+        // overlapping this projection with that rank's head on the scheduler
+        // stream would race. Queue it before the worker join/top-k readback.
+        const char *earlySelectorFlag = std::getenv("FASTLLM_DFLASH_TP_EARLY_SELECTOR");
+        const bool earlyTpSelector = draftDevices.size() > 1 &&
+            earlySelectorFlag && Qwen35MoeIsTrueString(earlySelectorFlag);
+        bool selectorProjected = false;
+        auto projectSelectorOnWorker = [&](Qwen3CudaDirectRunner &runner) {
+            qwen3cuda::Qwen3CudaLinear(runner, slotHidden,
+                weight["dflash.candidate_selector.hidden_projection.weight"],
+                *GetEmptyData(), selectorHidden);
+            qwen3cuda::Qwen3CudaToDataType(runner, selectorHidden, DataType::FLOAT32);
+            selectorProjected = true; // rank 0 only; read after WorkerGroup joins.
+            static thread_local bool loggedTpSelector = false;
+            if (!loggedTpSelector) {
+                printf("[DFlash] TP selector projection queued on rank 0 before top-k readback\n");
+                loggedTpSelector = true;
+            }
+        };
+        if (draftDevices.size() == 1) {
+            FastllmCudaSetDevice(device);
+            projectSelector();
+            selectorProjected = true;
+        }
         Data candidateTopK;
         if (draftDevices.size() == 1) {
             bool usedCudaFastTopK = Qwen35TryCudaDFlashTopK(
@@ -30179,10 +30386,10 @@ namespace fastllm {
                             biasIt->second != nullptr,
                         "DFlash fast top-k is missing local lm_head data.\n");
                     FastllmCudaSetDevice(localDevice);
-                    Qwen3CudaDirectRunner runner(localDevice);
+                    Qwen3CudaDirectRunner &runner = Qwen35DFlashThreadLocalRunner(localDevice);
                     Data localLogits;
                     RunDFlashLmHead(localDevice, *hiddenIt->second, *weightIt->second,
-                                  *biasIt->second, localLogits);
+                                  *biasIt->second, localLogits, useShortlist);
                     qwen3cuda::Qwen3CudaToDataType(
                         runner, localLogits, DataType::FLOAT32);
 
@@ -30206,6 +30413,7 @@ namespace fastllm {
                     bool selected = FastllmCudaDFlashTopK(
                         localLogits, localPacked[rank], localScratch[rank],
                         dflashSelectorTopK, globalOffsets[rank]);
+                    if (earlyTpSelector && rank == 0) projectSelectorOnWorker(runner);
                     FastllmCudaSyncCurrentThreadStream();
                     ready[rank] = selected ? 1 : 0;
                 }, fastErrors);
@@ -30302,15 +30510,17 @@ namespace fastllm {
                         biasIt->second != nullptr,
                     "DFlash TP draft is missing local lm_head data.\n");
                 FastllmCudaSetDevice(localDevice);
-                Qwen3CudaDirectRunner runner(localDevice);
+                Qwen3CudaDirectRunner &runner = Qwen35DFlashThreadLocalRunner(localDevice);
                 Data localLogits;
                 RunDFlashLmHead(localDevice, *hiddenIt->second, *weightIt->second,
-                                  *biasIt->second, localLogits);
+                                  *biasIt->second, localLogits, useShortlist);
                 qwen3cuda::Qwen3CudaToDataType(
                     runner, localLogits, DataType::FLOAT32);
                 qwen3cuda::Qwen3CudaTopK(
                     runner, localLogits, localTopKs[rank],
                     dflashSelectorTopK);
+                if (earlyTpSelector && rank == 0 && !selectorProjected)
+                    projectSelectorOnWorker(runner);
                 FastllmCudaSyncCurrentThreadStream();
                 FastllmCudaCopyFromDeviceToHost(
                     hostTopKs[rank].data(), localTopKs[rank].cudaData,
@@ -30379,11 +30589,11 @@ namespace fastllm {
                 {slots, dflashSelectorTopK * 2}, mergedTopK));
             }
         }
-        Data selectorHidden;
-        Linear(slotHidden,
-               weight["dflash.candidate_selector.hidden_projection.weight"],
-               *GetEmptyData(), selectorHidden);
-        ToDataType(selectorHidden, DataType::FLOAT32);
+        if (!selectorProjected) {
+            FastllmCudaSetDevice(device);
+            projectSelector();
+        }
+        if (useShortlist) MapDFlashShortlistCandidates(candidateTopK);
         selectorHidden.ToDevice(DataDevice::CPU);
         AssertInFastLLM(
             candidateTopK.Count(0) ==
@@ -30425,6 +30635,9 @@ namespace fastllm {
         }
 
         PrepareDFlashWeightsForDevice(device);
+        const bool useShortlist = !dflashDraftTokenIds.empty() &&
+            std::all_of(generationConfigs.begin(), generationConfigs.end(),
+                [](const GenerationConfig *config) { return config && config->IsSimpleGreedy(); });
         AssertInFastLLM(HasDFlashWeights(),
                         "DFlash draft weights are incomplete.\n");
         const int runtimeBlockSize = dflashRuntimeBlockSize;
@@ -30907,7 +31120,7 @@ namespace fastllm {
         Data candidateTopK;
         if (draftDevices.size() == 1) {
             Data fullLogits, allTopK;
-            RunDFlashLmHead(device, lmHeadHidden, weight["lm_head.weight"], *GetEmptyData(), fullLogits);
+            RunDFlashLmHead(device, lmHeadHidden, weight["lm_head.weight"], *GetEmptyData(), fullLogits, useShortlist);
             ToDataType(fullLogits, DataType::FLOAT32);
             fullLogits.Reshape(
                 {totalLmHeadRows, fullLogits.dims.back()});
@@ -30970,7 +31183,7 @@ namespace fastllm {
                 Qwen3CudaDirectRunner runner(localDevice);
                 Data localLogits;
                 RunDFlashLmHead(localDevice, *hiddenIt->second, *weightIt->second,
-                                  *biasIt->second, localLogits);
+                                  *biasIt->second, localLogits, useShortlist);
                 qwen3cuda::Qwen3CudaToDataType(
                     runner, localLogits, DataType::FLOAT32);
 
@@ -31057,6 +31270,7 @@ namespace fastllm {
             candidateTopK.ToDevice(DataDevice::CPU);
         }
 
+        if (useShortlist) MapDFlashShortlistCandidates(candidateTopK);
         Data selectorHidden;
         Linear(slotHidden,
                weight[
@@ -31388,6 +31602,29 @@ namespace fastllm {
 #endif
     }
 
+#ifdef USE_CUDA
+    // Compact logits cannot be gathered using the target's full-vocab shard
+    // scheme. Keep a complete CPU argmax fallback if the CUDA sampler declines.
+    static void Qwen35ReadShortlistGreedyOnHost(Data &logits, int batch,
+                                               int *ids, float *scores) {
+        Data cpu;
+        cpu.CopyFrom(logits);
+        cpu.ToDevice(DataDevice::CPU);
+        AssertInFastLLM(cpu.dataType == DataType::FLOAT32 && cpu.dims.back() > 0,
+                        "MTP TP shortlist fallback requires FP32 logits.\n");
+        const int width = cpu.dims.back();
+        const float *values = reinterpret_cast<const float*>(cpu.cpuData);
+        for (int b = 0; b < batch; ++b) {
+            ids[b] = 0;
+            scores[b] = -std::numeric_limits<float>::infinity();
+            for (int i = 0; i < width; ++i) {
+                const float score = values[size_t(b) * width + i];
+                if (score > scores[b]) { scores[b] = score; ids[b] = i; }
+            }
+        }
+    }
+#endif
+
     std::vector<int> Qwen3_5Model::RunMtpTpDraft(const std::vector<int> &devices,
                                                  const std::vector<MtpKvCache *> &caches,
                                                  const std::vector<const Data *> &targetHiddenStates,
@@ -31633,10 +31870,14 @@ namespace fastllm {
                 RMSNorm(sample, w("mtp.norm.weight"), rms_norm_eps, sample);
                 Data *head = &w("lm_head.weight");
                 auto fp8 = mtpDraftLmHeadWeights.find(gpu);
-                if (fp8 != mtpDraftLmHeadWeights.end()) {
+                if (fp8 != mtpDraftLmHeadWeights.end() &&
+                    (!sampleProposal || mtpDraftTpTokenIds.empty())) {
                     head = fp8->second;
                 }
-                if (head->dims[0] == 0) {
+                auto selected = mtpDraftTpTokenIds.find(gpu);
+                const bool emptyShortlist = !sampleProposal && selected != mtpDraftTpTokenIds.end() &&
+                    selected->second.empty();
+                if (head->dims[0] == 0 || emptyShortlist) {
                     std::fill(bestIds[rank].begin(), bestIds[rank].end(), -1);
                     std::fill(bestScores[rank].begin(), bestScores[rank].end(),
                               -std::numeric_limits<float>::infinity());
@@ -31659,10 +31900,15 @@ namespace fastllm {
                 bool ok = FastllmCudaGreedySamplingWithScores((float *)logits[rank].cudaData,
                                                               (int *)ids.cudaData, (float *)scores.cudaData,
                                                               batch, logits[rank].dims.back());
-                AssertInFastLLM(ok, "MTP TP greedy sampling failed.\n");
-                FastllmCudaCopyFromDeviceToHost(bestIds[rank].data(), ids.cudaData, batch * sizeof(int));
-                FastllmCudaCopyFromDeviceToHost(bestScores[rank].data(), scores.cudaData,
-                                                batch * sizeof(float));
+                if (!ok && !mtpDraftTpTokenIds.empty()) {
+                    Qwen35ReadShortlistGreedyOnHost(logits[rank], batch,
+                        bestIds[rank].data(), bestScores[rank].data());
+                } else {
+                    AssertInFastLLM(ok, "MTP TP greedy sampling failed.\n");
+                    FastllmCudaCopyFromDeviceToHost(bestIds[rank].data(), ids.cudaData, batch * sizeof(int));
+                    FastllmCudaCopyFromDeviceToHost(bestScores[rank].data(), scores.cudaData,
+                                                    batch * sizeof(float));
+                }
             },
             errors);
         for (const auto &error : errors) {
@@ -31703,13 +31949,7 @@ namespace fastllm {
                 if (local < 0) {
                     continue;
                 }
-                for (auto range : threadTpLmHeadScheme.at(devices[rank])) {
-                    if (local < range.second - range.first) {
-                        global = range.first + local;
-                        break;
-                    }
-                    local -= range.second - range.first;
-                }
+                global = MapMtpDraftTpToken(devices[rank], local);
                 AssertInFastLLM(global >= 0, "MTP TP sampled vocabulary id outside shard.\n");
                 float score = bestScores[rank][b];
                 if (score > best || (score == best && (result[b] < 0 || global < result[b]))) {
@@ -32087,6 +32327,23 @@ namespace fastllm {
 #endif
     }
 
+    int Qwen3_5Model::MapMtpDraftTpToken(int device, int localId) const {
+        if (localId < 0) return -1;
+        auto selected = mtpDraftTpTokenIds.find(device);
+        if (selected != mtpDraftTpTokenIds.end()) {
+            AssertInFastLLM(size_t(localId) < selected->second.size(), "MTP TP shortlist ID out of range.\n");
+            return selected->second[localId];
+        }
+        auto scheme = threadTpLmHeadScheme.find(device);
+        AssertInFastLLM(scheme != threadTpLmHeadScheme.end(), "MTP TP missing head split scheme.\n");
+        for (auto range : scheme->second) {
+            if (localId < range.second - range.first) return range.first + localId;
+            localId -= range.second - range.first;
+        }
+        AssertInFastLLM(false, "MTP TP greedy ID outside head shard.\n");
+        return -1;
+    }
+
     void Qwen3_5Model::PrepareMtpDraftLmHeadWeights(
             const std::vector<int> &devices) {
 #ifdef USE_CUDA
@@ -32102,6 +32359,7 @@ namespace fastllm {
                 delete it.second;
             }
             mtpDraftLmHeadWeights.clear();
+            mtpDraftTpTokenIds.clear();
         };
         clearPrepared();
         const bool useNvfp4 = Qwen35DraftQuantMode() != "off" &&
@@ -32116,6 +32374,73 @@ namespace fastllm {
             !lmHeadIt->second.multiDeviceData) {
             restoreDevice();
             return;
+        }
+
+        const char *idsPath = std::getenv("FASTLLM_MTP_DRAFT_TOKEN_IDS");
+        if (useNvfp4 && idsPath && *idsPath && std::string(idsPath) != "0") {
+            std::vector<int> ids;
+            std::map<int, mtp_shortlist::Shard> plans;
+            const int vocab = lmHeadIt->second.dims[0];
+            bool valid = mtp_shortlist::Read(idsPath, vocab, ids);
+            size_t totalSelected = 0;
+            for (int device : devices) {
+                if (!valid) break;
+                auto source = lmHeadIt->second.multiDeviceDatas.find(device);
+                auto scheme = threadTpLmHeadScheme.find(device);
+                valid = source != lmHeadIt->second.multiDeviceDatas.end() && source->second &&
+                    source->second->dims.size() == 2 && scheme != threadTpLmHeadScheme.end() &&
+                    mtp_shortlist::Project(ids, scheme->second, source->second->dims[0], vocab, plans[device]);
+                if (valid) {
+                    const auto &plan = plans.at(device);
+                    valid = plan.rows.empty() || FastllmCudaMarlinNVFP4Supported(
+                        int(plan.rows.size()), source->second->dims[1]);
+                    totalSelected += plan.logicalSize;
+                }
+            }
+            valid = valid && totalSelected == ids.size();
+            std::unordered_map<int, Data*> pending;
+            auto releasePending = [&]() {
+                for (auto &it : pending) { FastllmCudaSetDevice(it.first); delete it.second; }
+                pending.clear();
+            };
+            size_t bytes = 0;
+            try {
+                for (int device : devices) {
+                    if (!valid) break;
+                    const auto &plan = plans.at(device);
+                    if (plan.rows.empty()) continue;
+                    Data &source = *lmHeadIt->second.multiDeviceDatas.at(device);
+                    FastllmCudaSetDevice(device);
+                    auto *draft = new Data();
+                    pending[device] = draft;
+                    valid = FastllmCudaQuantizeLinearWeightNVFP4Block16Rows(source, *draft, plan.rows);
+                    if (!valid) break;
+                    draft->name = source.name + ".mtp_draft_nvfp4_shortlist";
+                    draft->weightType = WeightType::LINEAR;
+                    draft->isModelWeight = true;
+                    draft->tpLinearType = source.tpLinearType;
+                    draft->tpPackType = source.tpPackType;
+                    Qwen35PrepareDraftNvfp4Layout(*draft, device);
+                    bytes += draft->GetBytes();
+                }
+            } catch (...) {
+                releasePending(); restoreDevice(); throw;
+            }
+            if (valid) {
+                mtpDraftLmHeadWeights = std::move(pending);
+                for (int device : devices) {
+                    auto &plan = plans.at(device);
+                    printf("[Qwen3.5 MTP TP shortlist] GPU %d: selected=%d padded=%zu source=%d.\n",
+                        device, plan.logicalSize, plan.rows.size(), lmHeadIt->second.multiDeviceDatas.at(device)->dims[0]);
+                    mtpDraftTpTokenIds[device] = std::move(plan.tokenIds);
+                }
+                printf("[Qwen3.5 MTP TP shortlist] ready: %zu/%d tokens, %.3f GB extra; greedy only, target head retained.\n",
+                    ids.size(), vocab, bytes / 1.0e9);
+                fflush(stdout);
+                restoreDevice(); return;
+            }
+            releasePending();
+            printf("[Qwen3.5 MTP TP shortlist] invalid or unsupported configuration; using full vocabulary.\n");
         }
 
         size_t originalBytes = 0, quantizedBytes = 0;
@@ -32538,8 +32863,16 @@ namespace fastllm {
             Data *draftLmHead = weightIt->second;
             auto draftWeightIt = mtpDraftLmHeadWeights.find(localDevice);
             if (draftWeightIt != mtpDraftLmHeadWeights.end() &&
-                draftWeightIt->second != nullptr) {
+                draftWeightIt->second != nullptr &&
+                (!sampleProposal || mtpDraftTpTokenIds.empty())) {
                 draftLmHead = draftWeightIt->second;
+            }
+            auto selected = mtpDraftTpTokenIds.find(localDevice);
+            if (!sampleProposal && selected != mtpDraftTpTokenIds.end() && selected->second.empty()) {
+                localBestReady[r] = 1;
+                FastllmCudaSetDevice(localDevice);
+                ForceDeviceSync();
+                return;
             }
             FastllmCudaSetDevice(localDevice);
             Qwen3CudaDirectRunner cudaRunner(localDevice);
@@ -32570,6 +32903,10 @@ namespace fastllm {
                     localBestScores[r].data(), localBestScore.cudaData,
                     (size_t)batch * sizeof(float));
                 localBestReady[r] = 1;
+            } else if (!mtpDraftTpTokenIds.empty()) {
+                Qwen35ReadShortlistGreedyOnHost(localLogits[r], batch,
+                    localBestIds[r].data(), localBestScores[r].data());
+                localBestReady[r] = 1;
             } else {
                 ForceDeviceSync();
             }
@@ -32592,20 +32929,8 @@ namespace fastllm {
                 for (int r = 0; r < tpSize; r++) {
                     int localDevice = draftDevices[r];
                     int localId = localBestIds[r][b];
-                    int globalId = -1;
-                    int localOffset = 0;
-                    auto schemeIt = threadTpLmHeadScheme.find(localDevice);
-                    AssertInFastLLM(schemeIt != threadTpLmHeadScheme.end(),
-                                    "Qwen3.5 batched MTP TP draft missing lm_head split scheme.\n");
-                    for (auto &range : schemeIt->second) {
-                        int len = range.second - range.first;
-                        if (localId >= localOffset &&
-                            localId < localOffset + len) {
-                            globalId = range.first + (localId - localOffset);
-                            break;
-                        }
-                        localOffset += len;
-                    }
+                    if (localId < 0) continue;
+                    int globalId = MapMtpDraftTpToken(localDevice, localId);
                     AssertInFastLLM(globalId >= 0,
                                     "Qwen3.5 batched MTP TP draft local greedy id is out of range.\n");
                     float score = localBestScores[r][b];
@@ -32965,8 +33290,16 @@ namespace fastllm {
             Data *draftLmHead = weightIt->second;
             auto draftWeightIt = mtpDraftLmHeadWeights.find(localDevice);
             if (draftWeightIt != mtpDraftLmHeadWeights.end() &&
-                draftWeightIt->second != nullptr) {
+                draftWeightIt->second != nullptr &&
+                (!cache.sampleProposal || mtpDraftTpTokenIds.empty())) {
                 draftLmHead = draftWeightIt->second;
+            }
+            auto selected = mtpDraftTpTokenIds.find(localDevice);
+            if (!cache.sampleProposal && selected != mtpDraftTpTokenIds.end() && selected->second.empty()) {
+                localBestReady[r] = 1;
+                FastllmCudaSetDevice(localDevice);
+                ForceDeviceSync();
+                return;
             }
             FastllmCudaSetDevice(localDevice);
             Qwen3CudaDirectRunner cudaRunner(localDevice);
@@ -32997,6 +33330,10 @@ namespace fastllm {
                                                 localBestScore.cudaData,
                                                 sizeof(float));
                 localBestReady[r] = 1;
+            } else if (!mtpDraftTpTokenIds.empty()) {
+                Qwen35ReadShortlistGreedyOnHost(localLogits[r], 1,
+                    &localBestIds[r], &localBestScores[r]);
+                localBestReady[r] = 1;
             } else {
                 ForceDeviceSync();
             }
@@ -33016,19 +33353,8 @@ namespace fastllm {
             for (int r = 0; r < (int)draftDevices.size(); r++) {
                 int localDevice = draftDevices[r];
                 int localId = localBestIds[r];
-                int globalId = -1;
-                int localOffset = 0;
-                auto schemeIt = threadTpLmHeadScheme.find(localDevice);
-                AssertInFastLLM(schemeIt != threadTpLmHeadScheme.end(),
-                                "Qwen3.5 MTP TP draft missing lm_head split scheme.\n");
-                for (auto &range : schemeIt->second) {
-                    int len = range.second - range.first;
-                    if (localId >= localOffset && localId < localOffset + len) {
-                        globalId = range.first + (localId - localOffset);
-                        break;
-                    }
-                    localOffset += len;
-                }
+                if (localId < 0) continue;
+                int globalId = MapMtpDraftTpToken(localDevice, localId);
                 AssertInFastLLM(globalId >= 0,
                                 "Qwen3.5 MTP TP draft local greedy id is out of range.\n");
                 if (localBestScores[r] > bestScore ||

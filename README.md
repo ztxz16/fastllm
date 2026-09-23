@@ -317,7 +317,8 @@ Qwen3.5 系列的 MTP 和 DFlash 草稿共用以下 NVFP4 转换开关，需在�
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `FASTLLM_DRAFT_QUANT` | `off` | `off` 关闭 NVFP4 转换；`nvfp4_head` 只转换独立草稿输出头；`nvfp4` 转换草稿主干和输出头。目标模型输出头保持原权重，不支持的权重保留原实现 |
-| `FASTLLM_MTP_DRAFT_TOKEN_IDS` | 未设置 | 可选的单卡 MTP 草稿词表 token ID 文件，仅在启用 NVFP4 转换时使用；未设置或为 `0` 时使用完整词表。筛选词表只用于贪心草稿，随机采样使用完整输出头 |
+| `FASTLLM_MTP_DRAFT_TOKEN_IDS` | 未设置 | 可选的单卡或多卡 MTP 草稿词表 token ID 文件，仅在启用 NVFP4 转换时使用；未设置或为 `0` 时使用完整词表。多卡按原词表分片筛选并映射回全局 token ID，对齐填充只重复已有候选。筛选词表只用于贪心草稿，随机采样使用完整输出头，目标模型仍使用完整词表验证 |
+| `FASTLLM_DFLASH_DRAFT_TOKEN_IDS` | 未设置 | 多卡 DFlash2 的可选 NVFP4 草稿词表清单，仅用于贪心请求；要求每个连续词表分片至少有 selector top-k 个候选。top-k 前移除对齐填充，选择后恢复原 token ID。随机采样使用完整原始头；非法或不支持的清单回退完整词表 |
 | `FASTLLM_DFLASH_ATTENTION` | 未设置：SM75 开，其余关 | DFlash FP16 融合滑窗 attention 的统一开关：`0` 关闭，`1` 在支持的设备上开启。要求 head_dim=128、query 数 1～16、query 数×GQA 分组数≤64、query 数≤窗口≤4096，且 FlashInfer 可用；不匹配时回退原路径。SM80 及以上的 Q64 路径尚无实机正确性或速度验证；SM70 及以下始终保持原路径 |
 
 例如，在现有启动命令前加 `FASTLLM_DRAFT_QUANT=nvfp4`。单卡和多卡均可使用；多卡在切分后转换符合条件的草稿分片，输出头使用独立副本，目标模型分片保持原样。稠密 MTP 的多卡 NVFP4 路径要求 FP16 计算；不支持的形状或类型保留原路径。显式启用 NVFP4 时，符合条件的 MTP 输出头优先使用 NVFP4；`off` 仅关闭 NVFP4 转换，既有多卡 FP8 草稿输出头开关仍有效。

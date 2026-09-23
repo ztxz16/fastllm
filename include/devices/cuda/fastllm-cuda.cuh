@@ -2225,6 +2225,11 @@ bool FastllmCudaGreedySamplingTyped(
     const void *logits, fastllm::DataType type, int *output,
     float *floatOutput, const int *tokenMap, int batch, int vocabSize,
     void *scratch, size_t scratchBytes);
+// Returns local token IDs and their FP32 scores for tensor-parallel merging.
+// Unlike floatOutput above, scores contains maxima, not floating token IDs.
+bool FastllmCudaGreedySamplingTypedWithScores(
+    const void *logits, fastllm::DataType type, int *output, float *scores,
+    int batch, int vocabSize, void *scratch, size_t scratchBytes);
 
 #ifdef __CUDACC__
 /* CUDA kernel declarations (shared by linear/ggml/attention .cu files) */

@@ -24,7 +24,7 @@ template<class T> void checkShape(fastllm::DataType type,int rows,int vocab,int 
     CK(cudaMalloc(&fout,rows*sizeof(float))); CK(cudaMalloc(&map,vocab*sizeof(int)));
     if(bytes) CK(cudaMalloc(&scratch,bytes));
     std::vector<T> host(n); std::vector<int> mapping(vocab),want(rows),got(rows);
-    std::vector<float> fg(rows); for(int i=0;i<vocab;i++)mapping[i]=vocab-i;
+    std::vector<float> fg(rows), wantScore(rows); for(int i=0;i<vocab;i++)mapping[i]=vocab-i;
     CK(cudaMemcpy(map,mapping.data(),vocab*sizeof(int),cudaMemcpyHostToDevice));
     auto launch=[&](bool mapped,bool floating){ return FastllmCudaGreedySamplingTyped(x,type,out,floating?fout:nullptr,mapped?map:nullptr,rows,vocab,scratch,bytes); };
     for(int test=0;test<7;test++) {
@@ -38,16 +38,24 @@ template<class T> void checkShape(fastllm::DataType type,int rows,int vocab,int 
             if(test==6)v=col==vocab-1?INFINITY:-INFINITY;
             host[i]=convert<T>(v);
         }
-        for(int r=0;r<rows;r++){float best=-INFINITY;int id=0;for(int c=0;c<vocab;c++){float v=(float)host[(size_t)r*vocab+c];if(v>best){best=v;id=c;}}want[r]=id;}
+        for(int r=0;r<rows;r++){float best=-INFINITY;int id=0;for(int c=0;c<vocab;c++){float v=(float)host[(size_t)r*vocab+c];if(v>best){best=v;id=c;}}want[r]=id;wantScore[r]=best;}
         CK(cudaMemcpy(x,host.data(),n*sizeof(T),cudaMemcpyHostToDevice));
         for(bool mapped:{false,true})for(bool floating:{false,true}){
             REQUIRE(launch(mapped,floating)); CK(cudaMemcpy(got.data(),out,rows*sizeof(int),cudaMemcpyDeviceToHost));
             if(floating)CK(cudaMemcpy(fg.data(),fout,rows*sizeof(float),cudaMemcpyDeviceToHost));
             for(int r=0;r<rows;r++){int w=mapped?mapping[want[r]]:want[r];if(got[r]!=w || (floating && fg[r]!=(float)w)){fprintf(stderr,"dtype=%d rows=%d vocab=%d case=%d row=%d got=%d want=%d\n",(int)type,rows,vocab,test,r,got[r],w);std::abort();}}
         }
+        REQUIRE(FastllmCudaGreedySamplingTypedWithScores(x,type,out,fout,rows,vocab,scratch,bytes));
+        CK(cudaMemcpy(got.data(),out,rows*sizeof(int),cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(fg.data(),fout,rows*sizeof(float),cudaMemcpyDeviceToHost));
+        for(int r=0;r<rows;r++){REQUIRE(got[r]==want[r]);REQUIRE(fg[r]==wantScore[r]);}
     }
     if(bytes){REQUIRE(!FastllmCudaGreedySamplingTyped(x,type,out,nullptr,nullptr,rows,vocab,nullptr,0));REQUIRE(!FastllmCudaGreedySamplingTyped(x,type,out,nullptr,nullptr,rows,vocab,scratch,bytes-1));}
     REQUIRE(!FastllmCudaGreedySamplingTyped(x,fastllm::DataType::INT8,out,nullptr,nullptr,rows,vocab,scratch,bytes));
+    if(bytes){REQUIRE(!FastllmCudaGreedySamplingTypedWithScores(x,type,out,fout,rows,vocab,nullptr,0));REQUIRE(!FastllmCudaGreedySamplingTypedWithScores(x,type,out,fout,rows,vocab,scratch,bytes-1));}
+    REQUIRE(!FastllmCudaGreedySamplingTypedWithScores(x,fastllm::DataType::INT8,out,fout,rows,vocab,scratch,bytes));
+    // The SM75 TP2 eager regression can skip graph capture entirely.
+    if(!std::getenv("SKIP_GREEDY_GRAPH")) {
     // Stable graph, changing inputs and map contents across replays.
     cudaGraph_t graph; cudaGraphExec_t exec;
     CK(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal)); REQUIRE(launch(true,true));
@@ -61,14 +69,17 @@ template<class T> void checkShape(fastllm::DataType type,int rows,int vocab,int 
         CK(cudaMemcpy(fg.data(),fout,rows*sizeof(float),cudaMemcpyDeviceToHost));
         for(int r=0;r<rows;r++){REQUIRE(got[r]==mapping[want[r]]);REQUIRE(fg[r]==(float)got[r]);}
     }
-    CK(cudaGraphExecDestroy(exec));CK(cudaGraphDestroy(graph));CK(cudaFree(x));CK(cudaFree(out));CK(cudaFree(fout));CK(cudaFree(map));if(scratch)CK(cudaFree(scratch));
+    CK(cudaGraphExecDestroy(exec));CK(cudaGraphDestroy(graph));
+    }
+    CK(cudaFree(x));CK(cudaFree(out));CK(cudaFree(fout));CK(cudaFree(map));if(scratch)CK(cudaFree(scratch));
 }
-int main(int argc,char **argv){int device=argc>1?std::atoi(argv[1]):0;CK(cudaSetDevice(device));
+int main(int argc,char **argv){int count=0;if(cudaGetDeviceCount(&count)!=cudaSuccess || count==0)return 77;
+    int device=argc>1?std::atoi(argv[1]):0;CK(cudaSetDevice(device));
     int cases=0;
-    for(int rows:{1,4,8,9,17})for(int vocab:{1,31,257,4097,16383,16384,32771,65536,131073,248320}){
+    for(int rows:{1,2,4,8,9,17})for(int vocab:{1,31,257,4097,16383,16384,32771,65536,124160,131073,248320}){
         checkShape<float>(fastllm::DataType::FLOAT32,rows,vocab,123);checkShape<half>(fastllm::DataType::FLOAT16,rows,vocab,456);checkShape<__nv_bfloat16>(fastllm::DataType::BFLOAT16,rows,vocab,789);cases+=3;
     }
     std::thread a([&]{CK(cudaSetDevice(device));for(int i=0;i<5;i++)checkShape<half>(fastllm::DataType::FLOAT16,4,248320,100+i);});
     std::thread b([&]{CK(cudaSetDevice(device));for(int i=0;i<5;i++)checkShape<float>(fastllm::DataType::FLOAT32,1,131073,200+i);});a.join();b.join();
-    printf("PASS device=%d shapes=%d types=FP32/FP16/BF16 special_values=7 mapped_and_float=4 graph_replay=3 concurrent_threads=2\n",device,cases);return 0;
+    printf("PASS device=%d shapes=%d types=FP32/FP16/BF16 special_values=7 mapped_and_float=4 scores=checked graph_replay=%d concurrent_threads=2\n",device,cases,std::getenv("SKIP_GREEDY_GRAPH")?0:3);return 0;
 }

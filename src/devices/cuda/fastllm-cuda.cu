@@ -16279,7 +16279,8 @@ __device__ __forceinline__ bool FastllmGreedyIsBetter(
 template <int THREAD_PER_BLOCK, typename T = float>
 __global__ void FastllmGreedySamplingKernel(const T *logits, int *output,
                                             float *floatOutput, int vocabSize,
-                                            const int *tokenMap = nullptr) {
+                                            const int *tokenMap = nullptr,
+                                            float *scores = nullptr) {
     int b = blockIdx.x;
     int tid = threadIdx.x;
     const T *row = logits + (long long)b * vocabSize;
@@ -16314,6 +16315,7 @@ __global__ void FastllmGreedySamplingKernel(const T *logits, int *output,
     if (tid == 0) {
         int token = tokenMap ? tokenMap[idData[0]] : idData[0];
         output[b] = token;
+        if (scores != nullptr) scores[b] = maxData[0];
         if (floatOutput != nullptr) {
             floatOutput[b] = (float)token;
         }
@@ -16378,7 +16380,8 @@ __global__ void FastllmGreedySamplingPartialKernel(
 
 __global__ void FastllmGreedySamplingFinalizeKernel(
         const FastllmGreedyPartial *partials, int *output,
-        float *floatOutput, int partCount, const int *tokenMap = nullptr) {
+        float *floatOutput, int partCount, const int *tokenMap = nullptr,
+        float *scores = nullptr) {
     int batch = blockIdx.x;
     int lane = threadIdx.x;
     float localMax = -INFINITY;
@@ -16395,6 +16398,7 @@ __global__ void FastllmGreedySamplingFinalizeKernel(
     if (lane == 0) {
         int token = tokenMap ? tokenMap[localId] : localId;
         output[batch] = token;
+        if (scores != nullptr) scores[batch] = localMax;
         if (floatOutput != nullptr) {
             floatOutput[batch] = (float)token;
         }
@@ -16496,7 +16500,7 @@ template <typename T>
 static bool FastllmLaunchTypedGreedy(
         const T *logits, int *output, float *floatOutput,
         const int *tokenMap, int batch, int vocabSize,
-        void *scratch, size_t scratchBytes) {
+        void *scratch, size_t scratchBytes, float *scores = nullptr) {
     int parts = FastllmGreedyTypedPartCount(batch, vocabSize);
     size_t required = FastllmCudaGreedySamplingWorkspaceBytes(batch, vocabSize);
     // Insufficient scratch is rejected before any work is submitted.
@@ -16506,13 +16510,13 @@ static bool FastllmLaunchTypedGreedy(
     }
     if (parts == 1) {
         FastllmGreedySamplingKernel<256><<<batch, 256>>>(
-            logits, output, floatOutput, vocabSize, tokenMap);
+            logits, output, floatOutput, vocabSize, tokenMap, scores);
     } else {
         FastllmGreedySamplingPartialKernel<256><<<dim3(parts, batch), 256>>>(
             logits, (FastllmGreedyPartial*)scratch, vocabSize, parts);
         if (cudaGetLastError() != cudaSuccess) return false;
         FastllmGreedySamplingFinalizeKernel<<<batch, 32>>>(
-            (const FastllmGreedyPartial*)scratch, output, floatOutput, parts, tokenMap);
+            (const FastllmGreedyPartial*)scratch, output, floatOutput, parts, tokenMap, scores);
     }
     return cudaGetLastError() == cudaSuccess;
 }
@@ -16535,6 +16539,25 @@ bool FastllmCudaGreedySamplingTyped(
                 floatOutput, tokenMap, batch, vocabSize, scratch, scratchBytes);
         default:
             return false;
+    }
+}
+
+bool FastllmCudaGreedySamplingTypedWithScores(
+        const void *logits, fastllm::DataType type, int *output, float *scores,
+        int batch, int vocabSize, void *scratch, size_t scratchBytes) {
+    if (batch == 0) return true;
+    if (batch < 0 || vocabSize <= 0 || !logits || !output || !scores) return false;
+    switch (type) {
+        case fastllm::DataType::FLOAT32:
+            return FastllmLaunchTypedGreedy((const float*)logits, output,
+                nullptr, nullptr, batch, vocabSize, scratch, scratchBytes, scores);
+        case fastllm::DataType::FLOAT16:
+            return FastllmLaunchTypedGreedy((const half*)logits, output,
+                nullptr, nullptr, batch, vocabSize, scratch, scratchBytes, scores);
+        case fastllm::DataType::BFLOAT16:
+            return FastllmLaunchTypedGreedy((const __nv_bfloat16*)logits, output,
+                nullptr, nullptr, batch, vocabSize, scratch, scratchBytes, scores);
+        default: return false;
     }
 }
 
