@@ -635,18 +635,25 @@ static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
     const int groupedRows = useGroupedGqa ? group * qoLen : qoLen;
 
     // Paged KV is laid out as [page, token, kv_head, dim].  For the tested
-    // SM70 Qwen3.5 MTP shape, consecutive FP16 pages can be exposed directly
-    // to cuBLAS with tokenStride as the leading dimension.  The page allocator
+    // SM70 Qwen3.5 MTP shapes (single GPU or TP2), consecutive FP16 pages can
+    // be exposed directly to cuBLAS with tokenStride as the leading dimension. The page allocator
     // alternates between ascending and descending runs after a request is
     // released; both directions are handled below. On SM70, fragmented,
     // fully-visible prefix pages are also coalesced into physical runs.
     // Cache dtypes needing conversion retain the gather path.
+    // Extra prefix/tail GEMMs can outweigh gathering on short reversed page
+    // lists. Extend the four-KV-head single-GPU path only from 8K onward.
+    const bool linearKvHeads = numKvHeads == 2 || (numKvHeads == 4 && kvLen >= 8192);
     const bool linearKvShape = useGroupedGqa &&
-        group == 6 && numKvHeads == 2 && headDim == 256 &&
+        group == 6 && linearKvHeads && headDim == 256 &&
         qoLen <= pageLen &&
         pagedKVCacheK->dataType == fastllm::DataType::FLOAT16 &&
         pagedKVCacheV->dataType == fastllm::DataType::FLOAT16;
-    const bool linearKvCandidate = linearKvShape && FastllmPagedCublasLinearKvEnabled();
+    // Keep the new four-head policy on SM70 even with the environment override.
+    // Check the existing enable gate first to avoid per-layer device queries
+    // on architectures where direct reads are disabled by default.
+    const bool linearKvCandidate = linearKvShape && FastllmPagedCublasLinearKvEnabled() &&
+        (numKvHeads == 2 || FastllmCudaRuntimeArch() == 70);
     const int linearPageDirection = linearKvCandidate ?
         FastllmPagedLinearPageDirection(pageIndices) : 0;
     const int fullyVisiblePages = pageLen > 0 ? std::max(0, std::min(
@@ -674,7 +681,13 @@ static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
             const long long gatherBlocks = ((long long)kvLen + gatherChunk - 1) / gatherChunk;
             // Extend direct reads when coalescing avoids extra GEMM/softmax
             // launches. Truly scattered pages retain bounded gathering.
-            useLinearKv = directBlocks <= gatherBlocks;
+            // With four KV heads, avoiding the gather traffic pays for a few
+            // additional direct GEMMs on long contexts. Prefix reuse and a
+            // causal tail crossing a page boundary can otherwise move the
+            // same request repeatedly across the strict block-count cutoff.
+            const long long directBlockBudget = numKvHeads == 4 && kvLen >= 32768 ?
+                gatherBlocks + gatherBlocks / 2 : gatherBlocks;
+            useLinearKv = directBlocks <= directBlockBudget;
         }
     }
 
