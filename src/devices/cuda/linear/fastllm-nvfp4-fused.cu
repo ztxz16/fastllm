@@ -76,12 +76,13 @@ bool FastllmCudaNvfp4FusedCanRun(const Data &input, const Data &weight, const Da
         output.dims.empty() || output.strides.size() != output.dims.size()) return false;
     const uint64_t count = input.Count(0);
     const uint64_t batch = count / k;
-    // Opt in until end-to-end decode measurements justify a default change.
-    // This enables the SM75 multirow path. Single-row kernel selection is
-    // controlled separately by FASTLLM_CUDA_NVFP4_SM75_DECODE_TUNE.
+    // Enable supported multirow kernels by default. The capability, layout
+    // and scratch checks below still decide whether fusion can run.
+    // Single-row tuning is controlled separately by
+    // FASTLLM_CUDA_NVFP4_SM75_DECODE_TUNE.
     const char *multiGateFlag = std::getenv("FASTLLM_CUDA_NVFP4_SWIGLU_MULTIROW");
     const bool multiGate = gate && n % 256 == 0 &&
-        multiGateFlag && !std::strcmp(multiGateFlag, "1");
+        (!multiGateFlag || !std::strcmp(multiGateFlag, "1"));
     const bool smallBatch = !gate && n == 5120 &&
         (k == 8704 || k == 17408) && ShapeTuningEnabled();
     if (count % k || batch < 1 || batch > ((smallBatch || multiGate) ? 8 : 1)) return false;

@@ -41,9 +41,10 @@ namespace fastllm {
     static thread_local void *currentMultiCudaDedicatedWorker = nullptr;
     static thread_local bool multiCudaPersistentAsyncDispatch = false;
 
-    static bool MultiCudaEnvFlagEnabled(const char *name) {
+    static bool MultiCudaEnvFlagEnabled(const char *name, bool defaultValue = false) {
         const char *v = std::getenv(name);
-        return v != nullptr && v[0] != '\0' && strcmp(v, "0") != 0 &&
+        if (v == nullptr) return defaultValue;
+        return v[0] != '\0' && strcmp(v, "0") != 0 &&
                strcmp(v, "false") != 0 && strcmp(v, "FALSE") != 0 &&
                strcmp(v, "off") != 0 && strcmp(v, "OFF") != 0;
     }
@@ -3694,7 +3695,7 @@ namespace fastllm {
             DoCudaSwigluReshape(*w3, *w1);
             bool fused = false;
             if (weight0->dataType == DataType::NVFP4_BLOCK_16 &&
-                MultiCudaEnvFlagEnabled("FASTLLM_TP_NVFP4_MLP_SWIGLU")) {
+                MultiCudaEnvFlagEnabled("FASTLLM_TP_NVFP4_MLP_SWIGLU", true)) {
                 // CanRun requires the final shape and allocation, including
                 // its owning rank. The block performs the complete fallback
                 // itself when the layout, architecture or bias is unsupported.

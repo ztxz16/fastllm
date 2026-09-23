@@ -7613,7 +7613,7 @@ namespace fastllm {
                     cudaBestIds[r].Allocate();
                     cudaBestScores[r].Allocate();
                     const char *nativeGreedyFlag = std::getenv("FASTLLM_TP_NATIVE_GREEDY");
-                    if (nativeGreedyFlag && Qwen35MoeIsTrueString(nativeGreedyFlag)) {
+                    if (!nativeGreedyFlag || Qwen35MoeIsTrueString(nativeGreedyFlag)) {
                         size_t bytes = FastllmCudaGreedySamplingWorkspaceBytes(batch, localVocab);
                         Data &scratch = cudaGreedyScratch[r];
                         Qwen3CudaPrepareLocalOutput(scratch, device);
@@ -17302,7 +17302,7 @@ namespace fastllm {
             const char *nativeGreedyFlag = std::getenv("FASTLLM_TP_NATIVE_GREEDY");
             bool preserveNativeLogits = speculativeCollectAllLogits &&
                 tensorParallel && activeGpuTokenHandoff == nullptr &&
-                nativeGreedyFlag && Qwen35MoeIsTrueString(nativeGreedyFlag) &&
+                (!nativeGreedyFlag || Qwen35MoeIsTrueString(nativeGreedyFlag)) &&
                 std::all_of(generationConfigs.begin(), generationConfigs.end(),
                     [](const GenerationConfig &config) {
                         return config.IsSimpleGreedy() && !config.output_logits;
@@ -30304,7 +30304,7 @@ namespace fastllm {
         // stream would race. Queue it before the worker join/top-k readback.
         const char *earlySelectorFlag = std::getenv("FASTLLM_DFLASH_TP_EARLY_SELECTOR");
         const bool earlyTpSelector = draftDevices.size() > 1 &&
-            earlySelectorFlag && Qwen35MoeIsTrueString(earlySelectorFlag);
+            (!earlySelectorFlag || Qwen35MoeIsTrueString(earlySelectorFlag));
         bool selectorProjected = false;
         auto projectSelectorOnWorker = [&](Qwen3CudaDirectRunner &runner) {
             qwen3cuda::Qwen3CudaLinear(runner, slotHidden,

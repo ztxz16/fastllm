@@ -93,7 +93,7 @@ void Run(bool gate, int n, int k, bool profitable = true, int batch = 1) {
     setenv(flag, "1", 1);
     if (gate && batch > 1 && useFusion) {
         unsetenv("FASTLLM_CUDA_NVFP4_SWIGLU_MULTIROW");
-        Require(!can(), "multirow fusion enabled by default");
+        Require(can(), "multirow fusion disabled by default");
         for (const char *disabled : {"0", "false"}) {
             setenv("FASTLLM_CUDA_NVFP4_SWIGLU_MULTIROW", disabled, 1);
             Require(!can(), "multirow disable ignored");
