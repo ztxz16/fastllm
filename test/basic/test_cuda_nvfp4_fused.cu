@@ -91,6 +91,15 @@ void Run(bool gate, int n, int k, bool profitable = true, int batch = 1) {
     setenv(flag, "0", 1);
     Require(!can(), "disable flag ignored");
     setenv(flag, "1", 1);
+    if (gate && batch > 1 && useFusion) {
+        unsetenv("FASTLLM_CUDA_NVFP4_SWIGLU_MULTIROW");
+        Require(!can(), "multirow fusion enabled by default");
+        for (const char *disabled : {"0", "false"}) {
+            setenv("FASTLLM_CUDA_NVFP4_SWIGLU_MULTIROW", disabled, 1);
+            Require(!can(), "multirow disable ignored");
+        }
+        setenv("FASTLLM_CUDA_NVFP4_SWIGLU_MULTIROW", "1", 1);
+    }
     auto old = x.dataType;
     x.dataType = BFLOAT16;
     Require(!can(), "BF16 admitted");
@@ -119,12 +128,15 @@ void Run(bool gate, int n, int k, bool profitable = true, int batch = 1) {
     std::vector<uint8_t> packed(size_t(n) * k * 9 / 16), packedAfter(packed.size());
     Check(cudaMemcpy(packed.data(), w.cudaData, packed.size(), cudaMemcpyDeviceToHost));
     std::vector<half> hx(inputCount), res(outputCount);
-    cudaGraph_t graph;
-    cudaGraphExec_t exec;
-    Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
-    Require(block(y) == useFusion, "graph dispatch incorrect");
-    Check(cudaStreamEndCapture(cudaStreamPerThread, &graph));
-    Check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+    const bool eagerOnly = std::getenv("SM75_SWIGLU_ONLY") != nullptr;
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    if (!eagerOnly) {
+        Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+        Require(block(y) == useFusion, "graph dispatch incorrect");
+        Check(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+        Check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+    }
     for (int step = 0; step < 3; ++step) {
         for (int i = 0; i < inputCount; ++i)
             hx[i] = half(.15f * sinf(i * .017f + step * .7f));
@@ -136,26 +148,35 @@ void Run(bool gate, int n, int k, bool profitable = true, int batch = 1) {
         setenv(flag, "0", 1);
         Require(!block(ref), "disabled block fused");
         setenv(flag, "1", 1);
-        Check(cudaGraphLaunch(exec, cudaStreamPerThread));
+        if (eagerOnly) Require(block(y) == useFusion, "eager dispatch incorrect");
+        else Check(cudaGraphLaunch(exec, cudaStreamPerThread));
         Check(cudaDeviceSynchronize());
         auto a = Read(y), b = Read(ref);
         double se = 0, sr = 0;
         float max = 0;
+        int mismatches = 0;
         for (int i = 0; i < outputCount; ++i) {
             float av = float(a[i]), bv = float(b[i]);
             Require(std::isfinite(av) && std::isfinite(bv), "nonfinite output");
             se += (av - bv) * (av - bv);
             sr += bv * bv;
             max = fmaxf(max, fabsf(av - bv));
+            mismatches += Bits(a[i]) != Bits(b[i]);
         }
         double rel = sqrt(se / (sr + 1e-30));
         printf("gate=%d replay=%d fallback_rel_rms=%.9g max_abs=%.9g\n", gate, step, rel, max);
+        if (eagerOnly) printf("BITWISE mismatches=%d/%d\n", mismatches, outputCount);
         Require(rel < .003, "fallback disagreement");
+        if (gate && batch > 1 && useFusion) {
+            // Pairing columns can change split-K reduction order on some
+            // shapes, but must not introduce a new FP16 post-op rounding.
+            Require(rel < .00002, "multirow fusion rounding disagreement");
+            if (k == 5120 && (n == 17408 || n == 34816))
+                Require(mismatches == 0, "model-shape fixture changed bits");
+        }
         // Independently reconstruct selected logical rows from original bytes, using the
         // same representable normalized half weights as the Marlin conversion.
-        auto dot = [&](int r) {
-            const int row = gate ? 0 : r / out;
-            if (!gate) r %= out;
+        auto dot = [&](int row, int r) {
             double sum = 0;
             for (int g = 0; g < groups; ++g) {
                 auto p = raw.data() + (size_t(r) * groups + g) * 12;
@@ -176,10 +197,10 @@ void Run(bool gate, int n, int k, bool profitable = true, int batch = 1) {
         double ce = 0, cr = 0;
         for (int i = 0; i < 100; ++i) {
             int r = (i * 7919 + 7) % outputCount;
-            float v = dot(r);
+            float v = dot(r / out, r % out);
             if (gate) {
                 float e = expf(-fabsf(v));
-                v = (v >= 0 ? v : v * e) / (1 + e) * dot(r + n / 2);
+                v = (v >= 0 ? v : v * e) / (1 + e) * dot(r / out, r % out + n / 2);
             } else
                 v += float(res[r]);
             float expected = float(half(v)), err = float(a[r]) - expected;
@@ -271,8 +292,24 @@ void Run(bool gate, int n, int k, bool profitable = true, int batch = 1) {
         setenv("FASTLLM_CUDA_NVFP4_ADD", "1", 1);
         setenv("FASTLLM_CUDA_NVFP4_SHAPE_TUNING", "1", 1);
     }
-    Check(cudaGraphExecDestroy(exec));
-    Check(cudaGraphDestroy(graph));
+    if (eagerOnly && gate && batch > 1 && profitable && std::getenv("SM75_SWIGLU_BENCH")) {
+        for (bool enabled : {false, true, true, false}) {
+            setenv("FASTLLM_CUDA_NVFP4_SWIGLU_MULTIROW", enabled ? "1" : "0", 1);
+            Require(can() == enabled, "multirow override ignored");
+            for (int i = 0; i < 10; ++i) block(y);
+            cudaEvent_t start, end;
+            Check(cudaEventCreate(&start)); Check(cudaEventCreate(&end));
+            Check(cudaEventRecord(start, cudaStreamPerThread));
+            for (int i = 0; i < 100; ++i) block(y);
+            Check(cudaEventRecord(end, cudaStreamPerThread)); Check(cudaEventSynchronize(end));
+            float ms = 0; Check(cudaEventElapsedTime(&ms, start, end));
+            printf("SWIGLU_BENCH M=%d N=%d K=%d enabled=%d us=%.6f\n", batch, n, k, enabled, ms*10);
+            Check(cudaEventDestroy(start)); Check(cudaEventDestroy(end));
+        }
+        setenv("FASTLLM_CUDA_NVFP4_SWIGLU_MULTIROW", "1", 1);
+    }
+    if (exec) Check(cudaGraphExecDestroy(exec));
+    if (graph) Check(cudaGraphDestroy(graph));
     Check(cudaMemcpy(packedAfter.data(), w.cudaData, packedAfter.size(), cudaMemcpyDeviceToHost));
     Require(packed == packedAfter, "packed weights or scales changed");
 }
@@ -290,6 +327,26 @@ int main() {
             return 77; // This regression exercises the Marlin layout, not the SM70 backend.
         Executor executor;
         executor.SetFirstDevice("cuda:0");
+        if (std::getenv("SM75_SWIGLU_ONLY")) {
+            if (major * 10 + minor != 75) return 77;
+            setenv("FASTLLM_CUDA_NVFP4_SWIGLU_MULTIROW", "1", 1);
+            Run(true, 4096, 1024, true, 4);
+            if (std::getenv("SM75_SWIGLU_SMOKE")) { puts("PASS"); return 0; }
+            for (int n : {17408, 34816}) {
+                for (int batch = 2; batch <= 8; ++batch) Run(true, n, 5120, true, batch);
+                Run(true, n, 5120, false, 9);
+            }
+            // Different slice counts and K reductions exercise the virtual
+            // gate/up column mapping beyond the current model's two shapes.
+            for (int batch : {2, 8}) Run(true, 1024, 8192, true, batch);
+            for (int batch : {3, 7}) Run(true, 1536, 4096, true, batch);
+            Run(true, 8704, 5120, true, 4);
+            Run(true, 1408, 8192, false, 4); // gate/up split not aligned to 128 columns
+            Run(true, 11776, 5120, false, 4);
+            Run(true, 34816, 5120, true, 1);
+            Run(false, 5120, 17408, true, 4);
+            puts("PASS"); return 0;
+        }
         if (std::getenv("SMALL_BATCH_ONLY")) {
             for (int batch : {1, 2, 3, 4, 5, 6, 7, 8}) Run(false, 5120, 8704, true, batch);
             puts("PASS"); return 0;

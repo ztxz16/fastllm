@@ -5,6 +5,7 @@
 #include "devices/cpu/cpudevice.h"
 #include "devices/cuda/cudadevice.h"
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-nvfp4-fused.h"
 #include "devices/multicuda/multicudadevice.h"
 
 #include "fastllm-multicuda.cuh"
@@ -3690,14 +3691,27 @@ namespace fastllm {
             AssertInFastLLM(input->cudaData != nullptr, "MultiCudaDoMergeMLPOp: local input should be prepared.\n");
 
             DoCudaLinearReshape(*input, *weight0, *w3);
-            if (bias0 == nullptr) {
-                DoCudaLinear(*input, *weight0, *GetEmptyData(), *w3);
-            } else {
-                DoCudaLinear(*input, *weight0, *bias0, *w3);
-            }
-
             DoCudaSwigluReshape(*w3, *w1);
-            DoCudaSwiglu(*w3, *w1);
+            bool fused = false;
+            if (weight0->dataType == DataType::NVFP4_BLOCK_16 &&
+                MultiCudaEnvFlagEnabled("FASTLLM_TP_NVFP4_MLP_SWIGLU")) {
+                // CanRun requires the final shape and allocation, including
+                // its owning rank. The block performs the complete fallback
+                // itself when the layout, architecture or bias is unsupported.
+                w1->Allocate();
+                fused = CudaNvfp4LinearSwigluBlock(*input, *weight0,
+                    bias0 == nullptr ? *GetEmptyData() : *bias0, *w3, *w1);
+                static thread_local std::set<int> loggedDevices;
+                if (fused && loggedDevices.insert(deviceId).second) {
+                    printf("[TP MLP] NVFP4 Linear+SwiGLU fused on GPU %d, rows=%llu N=%d K=%d\n",
+                        deviceId, (unsigned long long)(input->Count(0) / weight0->dims[1]),
+                        weight0->dims[0], weight0->dims[1]);
+                }
+            } else {
+                DoCudaLinear(*input, *weight0,
+                    bias0 == nullptr ? *GetEmptyData() : *bias0, *w3);
+                DoCudaSwiglu(*w3, *w1);
+            }
 
             DoCudaLinearReshape(*w1, *weight1, *output);
             output->Allocate();

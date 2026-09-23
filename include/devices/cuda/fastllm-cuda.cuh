@@ -354,6 +354,14 @@ bool FastllmCudaMarlinHalfNVFP4Gemm(const void *a,
                                     int size_m, int size_n, int size_k,
                                     int *workspace, void *c_tmp);
 bool FastllmCudaMarlinNVFP4Supported(int size_n, int size_k);
+// Process-start opt-in for measured SM75 M=1..8 shapes. Also used by the
+// single-row dispatcher so its GEMV shortcut cannot bypass the tuned GEMM.
+bool FastllmCudaMarlinNVFP4DecodeTuneEnabled(int size_m, int size_n, int size_k,
+                                          bool swiglu);
+bool FastllmCudaMarlinNVFP4SwigluSupported(int size_n, int size_k);
+bool FastllmCudaMarlinHalfNVFP4Swiglu(const void *a, const uint32_t *b_q_weight,
+    const void *b_scales, const float *global_scale, void *c,
+    int size_m, int size_n, int size_k, int *workspace, void *c_tmp);
 bool FastllmCudaHasFp8MarlinLayout(const fastllm::Data &weight);
 bool FastllmCudaTryMarlinHalfMatMulFloatFP8E4M3(const fastllm::Data &input,
                                                 fastllm::Data &weight,

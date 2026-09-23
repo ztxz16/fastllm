@@ -76,9 +76,15 @@ bool FastllmCudaNvfp4FusedCanRun(const Data &input, const Data &weight, const Da
         output.dims.empty() || output.strides.size() != output.dims.size()) return false;
     const uint64_t count = input.Count(0);
     const uint64_t batch = count / k;
+    // Opt in until end-to-end decode measurements justify a default change.
+    // This enables the SM75 multirow path. Single-row kernel selection is
+    // controlled separately by FASTLLM_CUDA_NVFP4_SM75_DECODE_TUNE.
+    const char *multiGateFlag = std::getenv("FASTLLM_CUDA_NVFP4_SWIGLU_MULTIROW");
+    const bool multiGate = gate && n % 256 == 0 &&
+        multiGateFlag && !std::strcmp(multiGateFlag, "1");
     const bool smallBatch = !gate && n == 5120 &&
         (k == 8704 || k == 17408) && ShapeTuningEnabled();
-    if (count % k || batch < 1 || batch > (smallBatch ? 8 : 1)) return false;
+    if (count % k || batch < 1 || batch > ((smallBatch || multiGate) ? 8 : 1)) return false;
     if (input.dataType != DataType::FLOAT16 || output.dataType != input.dataType || input.dims.empty() ||
         output.dims.empty() || weight.dataType != DataType::NVFP4_BLOCK_16 ||
         weight.dims.size() != 2 || weight.dims[0] != n || weight.dims[1] != k || weight.blockK != 1 || weight.blockM != 16 ||
@@ -96,12 +102,15 @@ bool FastllmCudaNvfp4FusedCanRun(const Data &input, const Data &weight, const Da
     // byte scales and per-SM lock workspace in the source allocation's reclaimed tail.
     size_t required =
         size_t(n) * k / 2 + size_t(n) * k / 16 + size_t(info.sms) * 4 * sizeof(int) + sizeof(float);
-    if (batch > 1) {
+    const bool tunedSingleGate = gate && batch == 1 &&
+        FastllmCudaMarlinNVFP4DecodeTuneEnabled(1, n, k, true);
+    if (batch > 1 || tunedSingleGate) {
         // Small-batch Tensor Core reduction uses scratch already reclaimed by
         // the Marlin repack. Admission must never allocate during capture.
         const size_t scratchEnd = ((required + 15) & ~size_t(15)) + size_t(info.sms) * 8 * 256 * sizeof(float);
         if (!Dense(output, device, 16) || weight.GetBytes() < scratchEnd ||
-            !FastllmCudaMarlinNVFP4AddSupported(n, k))
+            !(gate ? FastllmCudaMarlinNVFP4SwigluSupported(n, k) :
+                      FastllmCudaMarlinNVFP4AddSupported(n, k)))
             return false;
     }
     if (weight.GetBytes() < required || Overlap(input, batch * k * 2, weight, weight.GetBytes()) ||
@@ -118,6 +127,15 @@ void FastllmCudaNvfp4Fused(Data &input, Data &weight, Data &output, bool gate) {
     auto scales = (const uint8_t *)weight.cudaData + size_t(n) * k / 2;
     auto global = (const float *)(scales + size_t(n) * k / 16 + size_t(info.sms) * 4 * sizeof(int));
     const bool tuneShape = info.supported && ShapeTuningEnabled();
+    if (gate && (input.Count(0) / k > 1 ||
+        FastllmCudaMarlinNVFP4DecodeTuneEnabled(1, n, k, true))) {
+        auto *workspace = (int *)(scales + size_t(n) * k / 16);
+        auto *scratch = (void *)((reinterpret_cast<uintptr_t>(global) + sizeof(float) + 15) & ~uintptr_t(15));
+        AssertInFastLLM(FastllmCudaMarlinHalfNVFP4Swiglu(input.cudaData, q, scales, global,
+            output.cudaData, input.Count(0) / k, n, k, workspace, scratch),
+            "NVFP4 SwiGLU GEMM unavailable after admission.\n");
+        return;
+    }
     // Specializing both matrix dimensions removes runtime packed-weight
     // and scale address arithmetic. Keep the same warp layout and FP32 reduction
     // order as the generic fusion. Select by local shape, not by TP rank count.
@@ -157,7 +175,8 @@ bool FastllmCudaNvfp4ShapeGemvCanRun(const Data &input, const Data &weight, cons
     if ((flag && (!std::strcmp(flag, "0") || !std::strcmp(flag, "false"))) ||
         weight.dims.size() != 2 || weight.dims[0] != 5120 || weight.dims[1] != 8704 ||
         input.dims.empty() || input.strides.size() != input.dims.size() || input.Count(0) != 8704 ||
-        !FastllmCudaNvfp4FusedCanRun(input, weight, bias, output, false))
+        !FastllmCudaNvfp4FusedCanRun(input, weight, bias, output, false) ||
+        FastllmCudaMarlinNVFP4DecodeTuneEnabled(1, 5120, 8704, false))
         return false;
     int device = 0;
     return cudaGetDevice(&device) == cudaSuccess && Info(device).supported;

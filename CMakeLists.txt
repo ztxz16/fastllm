@@ -1090,10 +1090,19 @@ if (UNIT_TEST)
         set_tests_properties(cuda_rmsnorm_decode PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
 
         add_executable(cuda_nvfp4_fused_test test/basic/test_cuda_nvfp4_fused.cu)
+        # Baseline/candidate numerical comparison uses separate processes:
+        # cuda_nvfp4_sm75_decode_test GPU write|check REFERENCE_DIR [quick]
+        add_executable(cuda_nvfp4_sm75_decode_test test/basic/test_cuda_nvfp4_sm75_decode.cu)
+        target_link_libraries(cuda_nvfp4_sm75_decode_test PRIVATE fastllm)
+        set_target_properties(cuda_nvfp4_sm75_decode_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
         target_link_libraries(cuda_nvfp4_fused_test PRIVATE fastllm)
         set_target_properties(cuda_nvfp4_fused_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
         fastllm_add_checked_test(cuda_nvfp4_fused cuda_nvfp4_fused_test "PASS" 600)
         set_tests_properties(cuda_nvfp4_fused PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+        fastllm_add_checked_test(cuda_nvfp4_swiglu_sm75 cuda_nvfp4_fused_test "PASS" 600)
+        set_tests_properties(cuda_nvfp4_swiglu_sm75 PROPERTIES
+            LABELS cuda RUN_SERIAL TRUE
+            ENVIRONMENT "SM75_SWIGLU_ONLY=1;FASTLLM_CUDA_GRAPH=0;FASTLLM_CUDA_NVFP4_SWIGLU_MULTIROW=1")
 
         add_executable(cuda_fp8_linear_add_test test/basic/test_cuda_fp8_linear_add.cu)
         target_link_libraries(cuda_fp8_linear_add_test PRIVATE fastllm)
