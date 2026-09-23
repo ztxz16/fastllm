@@ -2050,7 +2050,8 @@ __global__ void FastllmCudaFP8E4M32BF16Kernel(uint8_t* a, float *scales, __nv_bf
     }
 }
 
-template <int THREAD_PER_BLOCK, int PART, bool USE_WARP_REDUCE = false>
+template <int THREAD_PER_BLOCK, int PART, bool USE_WARP_REDUCE = false,
+          bool POWER_OF_TWO_BLOCKS = false>
 __global__ void FastllmGemvBF16FP8E4M3Kernel1MultiRow(__nv_bfloat16 *A, uint8_t *B, __nv_bfloat16 *C,
                                                     __nv_bfloat16 *bias, float *scales,
                                                     int m, int k, int blockM, int blockK) {
@@ -2068,9 +2069,12 @@ __global__ void FastllmGemvBF16FP8E4M3Kernel1MultiRow(__nv_bfloat16 *A, uint8_t 
     int st = blockIdx.x;
 #pragma unroll
     for (int x = 0; x < PART; x++) sdata[x][tid] = 0;
-    int ms = (m - 1) / blockM + 1;
+    const int shiftM = POWER_OF_TWO_BLOCKS ? __ffs(blockM) - 1 : 0;
+    const int shiftK = POWER_OF_TWO_BLOCKS ? __ffs(blockK) - 1 : 0;
+    int ms = POWER_OF_TWO_BLOCKS ? ((m - 1) >> shiftM) + 1
+                               : (m - 1) / blockM + 1;
     const float magicScaleConstant = exp2f(120.0f);
-    scales += (st / blockK) * ms;
+    scales += (POWER_OF_TWO_BLOCKS ? st >> shiftK : st / blockK) * ms;
 
     const uint8_t *baseB = (uint8_t*)B + st * m;
     // Preserve a safe BF16 fallback for uneven TP widths as well.
@@ -2082,12 +2086,12 @@ __global__ void FastllmGemvBF16FP8E4M3Kernel1MultiRow(__nv_bfloat16 *A, uint8_t 
             const float value = __bfloat162float(*reinterpret_cast<const __nv_bfloat16 *>(&bits));
 #pragma unroll
             for (int x = 0; x < PART; ++x)
-                sdata[x][tid] += float(A[size_t(x) * m + i]) * value * scales[i / blockM];
+                sdata[x][tid] += float(A[size_t(x) * m + i]) * value * scales[POWER_OF_TWO_BLOCKS ? i >> shiftM : i / blockM];
         }
     } else {
         union_bf16_4_fp8 regA;
         for (int i = tid * 4; i < m; i += THREAD_PER_BLOCK * 4) {
-            float curScale = scales[i / blockM];
+            float curScale = scales[POWER_OF_TWO_BLOCKS ? i >> shiftM : i / blockM];
             uint32_t bb = ((uint32_t*)(baseB + i))[0];
             uint16_t b0_bits = (((bb >> 0) & 0x80) << 8) | (((bb >> 0) & 0x7F) << 4);
             uint16_t b1_bits = (((bb >> 8) & 0x80) << 8) | (((bb >> 8) & 0x7F) << 4);
@@ -2276,11 +2280,138 @@ __global__ void FastllmGemvBF16FP8E4M3KernelWarpRows(
     }
 }
 
+// Group output channels without serializing their two 32-thread partials.
+// The input traversal, FMA order and compensated 64-thread reduction match
+// Kernel1MultiRow. Callers guarantee four-element input/weight alignment.
+template <int ROWS, int PART, bool POWER_OF_TWO_BLOCKS>
+__global__ void FastllmGemvBF16FP8E4M3KernelRegisterRows(
+        const __nv_bfloat16 *__restrict__ A, const uint8_t *__restrict__ B,
+        __nv_bfloat16 *__restrict__ C, const __nv_bfloat16 *__restrict__ bias,
+        const float *__restrict__ scales, int m, int k, int blockM, int blockK) {
+    const int tid = threadIdx.x % 64;
+    const int lane = tid % 32;
+    const int row = threadIdx.x / 64;
+    const int outputRow = blockIdx.x * ROWS + row;
+    // Inactive tail rows still participate in the block-wide barrier.
+    const int st = min(outputRow, k - 1);
+    const int shiftM = POWER_OF_TWO_BLOCKS ? __ffs(blockM) - 1 : 0;
+    const int shiftK = POWER_OF_TWO_BLOCKS ? __ffs(blockK) - 1 : 0;
+    const int ms = POWER_OF_TWO_BLOCKS ? ((m - 1) >> shiftM) + 1
+                                     : (m - 1) / blockM + 1;
+    const float *rowScales = scales + (POWER_OF_TWO_BLOCKS ? st >> shiftK : st / blockK) * ms;
+    const uint8_t *baseB = B + (size_t)st * m;
+    float partial[PART];
+#pragma unroll
+    for (int x = 0; x < PART; x++) partial[x] = 0.0f;
+    union_bf16_4_fp8 regA;
+    for (int i = tid * 4; i < m; i += 256) {
+        const float curScale = rowScales[POWER_OF_TWO_BLOCKS ? i >> shiftM : i / blockM];
+        const uint32_t bb = *(const uint32_t*)(baseB + i);
+        const uint16_t b0Bits =
+            (((bb >> 0) & 0x80) << 8) | (((bb >> 0) & 0x7F) << 4);
+        const uint16_t b1Bits =
+            (((bb >> 8) & 0x80) << 8) | (((bb >> 8) & 0x7F) << 4);
+        const uint16_t b2Bits =
+            (((bb >> 16) & 0x80) << 8) | (((bb >> 16) & 0x7F) << 4);
+        const uint16_t b3Bits =
+            (((bb >> 24) & 0x80) << 8) | (((bb >> 24) & 0x7F) << 4);
+        const float bf0 = __bfloat162float(
+            *reinterpret_cast<const __nv_bfloat16*>(&b0Bits));
+        const float bf1 = __bfloat162float(
+            *reinterpret_cast<const __nv_bfloat16*>(&b1Bits));
+        const float bf2 = __bfloat162float(
+            *reinterpret_cast<const __nv_bfloat16*>(&b2Bits));
+        const float bf3 = __bfloat162float(
+            *reinterpret_cast<const __nv_bfloat16*>(&b3Bits));
+#pragma unroll
+        for (int x = 0; x < PART; x++) {
+            regA.in = *reinterpret_cast<const uint2*>(
+                A + (size_t)x * m + i);
+            partial[x] +=
+                (__bfloat162float(regA.out[0]) * bf0 +
+                 __bfloat162float(regA.out[1]) * bf1 +
+                 __bfloat162float(regA.out[2]) * bf2 +
+                 __bfloat162float(regA.out[3]) * bf3) * curScale;
+        }
+    }
+    // Keep accumulation in registers. Only the upper half of the original
+    // 64-thread reduction crosses warps; the compensated tree is unchanged.
+    __shared__ float high[ROWS][PART][32];
+    if (tid >= 32) {
+#pragma unroll
+        for (int x = 0; x < PART; x++) high[row][x][lane] = partial[x];
+    }
+    __syncthreads();
+    if (tid >= 32) return;
+    const float magicScaleConstant = exp2f(120.0f);
+#pragma unroll
+    for (int x = 0; x < PART; x++) {
+        float sum = partial[x];
+        float other = high[row][x][lane];
+        float tmp = sum + other;
+        float diff = (tmp - sum) - other;
+        sum = tmp;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            const float source = __shfl_down_sync(0xffffffffu, sum, offset);
+            if (lane < offset) {
+                other = source - diff;
+                tmp = sum + other;
+                diff = (tmp - sum) - other;
+                sum = tmp;
+            }
+        }
+        if (lane == 0 && outputRow < k) {
+            float result = sum * magicScaleConstant;
+            if (bias != nullptr) result += __bfloat162float(bias[st]);
+            C[st + (size_t)k * x] = __float2bfloat16_rn(result);
+        }
+    }
+}
+
 template <int PART>
 static void LaunchFastllmGemmBF16FP8E4M3SmallBatch(
         __nv_bfloat16 *input, uint8_t *weight, __nv_bfloat16 *output,
         __nv_bfloat16 *bias, float *scales, int m, int k,
         int blockM, int blockK) {
+    // Power-of-two quantization blocks need only shifts for scale indexing.
+    // Other layouts and unaligned TP slices retain the established fallback.
+    const bool alignedPowerOfTwoBlocks = m > 0 && k > 0 &&
+        blockM > 0 && (blockM & (blockM - 1)) == 0 &&
+        blockK > 0 && (blockK & (blockK - 1)) == 0 &&
+        m % 4 == 0 && blockM % 4 == 0 &&
+        reinterpret_cast<uintptr_t>(input) % alignof(uint2) == 0 &&
+        reinterpret_cast<uintptr_t>(weight) % 4 == 0;
+    if (alignedPowerOfTwoBlocks) {
+        if constexpr (PART == 2 || PART == 3) {
+            // Short batches benefit from parallel input traversal with the
+            // existing per-channel block layout.
+            FastllmGemvBF16FP8E4M3Kernel1MultiRow<64, PART, PART == 3, true>
+                <<<k, 64>>>(input, weight, output, bias, scales,
+                            m, k, blockM, blockK);
+            return;
+        }
+        if constexpr (PART == 5) {
+            // Five-row eager/draft calls are sensitive to weight-cache misses.
+            // Retain the original block layout and accumulation; simplify
+            // scale indexing only on wide output projections.
+            if (m <= k / 2) {
+                FastllmGemvBF16FP8E4M3Kernel1MultiRow<64, PART, true, true>
+                    <<<k, 64>>>(input, weight, output, bias, scales,
+                                m, k, blockM, blockK);
+                return;
+            }
+        }
+        // Six-row wide expansions already have a competitive warp-row path.
+        if (PART != 5 && !(PART == 6 && k >= 2048 && m <= k / 2)) {
+            constexpr int rowsPerBlock = 2;
+            // At seven rows, integer-division code schedules better than the
+            // shift variant on the measured register-accumulation path.
+            FastllmGemvBF16FP8E4M3KernelRegisterRows<rowsPerBlock, PART, PART != 7>
+                <<<(k + rowsPerBlock - 1) / rowsPerBlock, rowsPerBlock * 64>>>(
+                    input, weight, output, bias, scales, m, k, blockM, blockK);
+            return;
+        }
+    }
     if constexpr (PART == 6) {
         // Halving the resident warps wins when there is ample output-level
         // parallelism and each warp's two virtual halves stay short.  Keep
