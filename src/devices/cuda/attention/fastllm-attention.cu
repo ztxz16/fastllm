@@ -1665,6 +1665,101 @@ __global__ void FastllmDFlashImplicitAttentionMaskKernel(
     }
 }
 
+#ifdef FASTLLM_ENABLE_FLASHINFER
+namespace fastllm_dflash_attention {
+// Reuse FlashInfer's attention and split-KV merge kernels. DFlash is
+// bidirectional within the draft block; inactive draft
+// slots are masked, and each query has its own sliding-window boundary.
+struct Params : flashinfer::SinglePrefillParams<half, half, half> {
+    int runtimeBlockSize;
+    int slidingWindow;
+};
+
+template <bool SyncOutput = false>
+struct Attention : flashinfer::DefaultAttention<false, true, false, false> {
+    // Opt into the shared-reduction/output-stage synchronization required by
+    // the SM75 Q32 tile. Generic prefill attention policies stay unchanged.
+    static constexpr bool dflash_sync_output = SyncOutput;
+    template <class P>
+    __host__ __device__ Attention(const P &p, unsigned batch, uint8_t *smem)
+        : flashinfer::DefaultAttention<false, true, false, false>(p, batch, smem) {}
+    REGISTER_LOGITS_MASK(p, batch, qi, ki, qh, kh, {
+        int cached = int(p.kv_len) - int(p.qo_len);
+        int distance = int(ki) - (cached + int(qi));
+        return ki < unsigned(cached + p.runtimeBlockSize) && distance > -p.slidingWindow &&
+               distance < p.slidingWindow;
+    })
+};
+
+__global__ void ToHnd(const uint4 *input, uint4 *output, int heads, int queries) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < heads * queries * 16) {
+        int d = i % 16, q = (i / 16) % queries, h = i / (16 * queries);
+        output[i] = input[(q * heads + h) * 16 + d];
+    }
+}
+
+template <int TileQ = 64>
+inline cudaError_t Run(const half *q, const half *k, const half *v, half *out, half *scratch,
+                       int heads, int kvHeads, int queries, int keys, int kStrideH, int vStrideH,
+                       int runtimeBlock, int window, float scale, cudaStream_t stream) {
+    // SM75 uses 32 query rows and two KV warps. B8 with GQA=4
+    // exactly fills that tile; it avoids the 64-row tile's inactive Q work.
+    // FlashInfer's half MMA uses m16n8k8 and synchronous shared loads on
+    // SM75. Keep FP32 QK/softmax accumulation and the custom window mask.
+    constexpr int MmaKV = 2, Chunk = 128;
+    int trim = std::max(0, keys - queries - window + 1);
+    k += trim * 128;
+    v += trim * 128;
+    keys -= trim;
+    constexpr int WQ = TileQ / 16, WK = 4 / WQ;
+    using Traits = flashinfer::KernelTraits<flashinfer::MaskMode::kCustom, TileQ, 1, MmaKV, 8, 8,
+                                            WQ, WK, flashinfer::PosEncodingMode::kNone, half, half,
+                                            half, float, int, Attention<TileQ == 32>>;
+    // IsInvalid also prunes Q=32 for the *generic* prefill tile selector,
+    // which never selects it for head_dim=128. This fixed DFlash tile is
+    // instantiated directly: two Q warps, two KV warps, one MMA Q tile,
+    // FP16 operands and a bounded register/shared-memory footprint.
+    static_assert(TileQ == 32 ?
+        (Traits::NUM_THREADS == 128 && Traits::NUM_MMA_Q == 1 &&
+         Traits::HEAD_DIM_QK == 128 && Traits::HEAD_DIM_VO == 128 &&
+         Traits::NUM_MMA_Q * (8 * Traits::NUM_MMA_D_VO_TILE +
+                             2 * sizeof(float) * MmaKV) < 256) :
+        !Traits::IsInvalid());
+    static_assert(sizeof(typename Traits::SharedStorageSingle) <= 49152);
+    int splits = (keys + Chunk - 1) / Chunk;
+    half *nhd = scratch, *partition = scratch + heads * queries * 128;
+    Params p;
+    static_cast<flashinfer::SinglePrefillParams<half, half, half> &>(p) =
+        flashinfer::SinglePrefillParams<half, half, half>(
+            const_cast<half *>(q), const_cast<half *>(k), const_cast<half *>(v), nullptr,
+            splits > 1 ? partition : nhd, nullptr, nullptr, heads, kvHeads, queries, keys, 128,
+            queries * 128, 128, kStrideH, 128, window - 1, 0, scale, 1, 10000);
+    p.v_stride_h = vStrideH;
+    p.runtimeBlockSize = runtimeBlock;
+    p.slidingWindow = window;
+    p.partition_kv = splits > 1;
+    p.lse = splits > 1 ? reinterpret_cast<float *>(partition + splits * heads * queries * 128)
+                       : nullptr;
+    flashinfer::SinglePrefillWithKVCacheKernel<Traits, Params>
+        <<<dim3((queries * (heads / kvHeads) + TileQ - 1) / TileQ, splits, kvHeads),
+           dim3(32, WQ, WK), sizeof(typename Traits::SharedStorageSingle), stream>>>(p);
+    auto status = cudaGetLastError();
+    if (status != cudaSuccess)
+        return status;
+    if (splits > 1) {
+        status = flashinfer::MergeStates(partition, p.lse, nhd, nullptr, splits, queries, heads,
+                                         128, stream);
+        if (status != cudaSuccess)
+            return status;
+    }
+    ToHnd<<<(heads * queries * 16 + 255) / 256, 256, 0, stream>>>(
+        reinterpret_cast<uint4 *>(nhd), reinterpret_cast<uint4 *>(out), heads, queries);
+    return cudaGetLastError();
+}
+} // namespace fastllm_dflash_attention
+#endif
+
 bool FastllmCudaDFlashAttention(
         const fastllm::Data &q, const fastllm::Data &k,
         const fastllm::Data &v, fastllm::Data &output,
@@ -1715,6 +1810,62 @@ bool FastllmCudaDFlashAttention(
     const int headDim = q.dims[2];
     const int valueDim = v.dims[2];
     const int cachedTokens = keys - queries;
+#ifdef FASTLLM_ENABLE_FLASHINFER
+    const auto capability = flashinfer::GetCudaComputeCapability();
+    const bool isSm75 = capability.first == 7 && capability.second == 5;
+    const char *attentionFlag = std::getenv("FASTLLM_DFLASH_ATTENTION");
+    const bool useFusedAttention = attentionFlag ?
+        std::strcmp(attentionFlag, "1") == 0 : isSm75;
+    const bool useSm75Tile = isSm75 && useFusedAttention;
+    const bool useSm80Tile = capability.first >= 8 && useFusedAttention;
+    // One switch controls both tiles: 0 restores cuBLAS, 1 opts in on
+    // supported devices. When unset, only the validated SM75 Q32 path
+    // defaults on. Unsupported shapes/architectures keep cuBLAS.
+    if (queries > 0 && queries <= 16 && group <= 64 / queries &&
+        heads > 0 && k.dims[0] <= 65535 &&
+        slidingWindow >= queries && slidingWindow <= 4096 &&
+        k.Count(1) <= std::numeric_limits<int>::max() &&
+        v.Count(1) <= std::numeric_limits<int>::max() &&
+        (useSm75Tile || useSm80Tile) &&
+        FastllmCudaFlashInferSupported()) {
+        // Crop keys invisible to every query, preserving the independent
+        // physical K/V head strides after expansion or rollback.
+        const size_t visibleKeys = std::min(cachedTokens, slidingWindow - 1) + queries;
+        const size_t chunks = (visibleKeys + 127) / 128;
+        const size_t rows = (size_t)heads * queries;
+        const size_t workspaceBytes = rows * 128 * sizeof(half) * (chunks + 1) +
+                                      rows * chunks * sizeof(float);
+        size_t availableBytes = 0;
+        bool own = false;
+        half *workspace = (half*)FastllmBorrowCudaTempBuffer(workspaceBytes, &availableBytes, &own);
+        if (workspace != nullptr && availableBytes >= workspaceBytes) {
+            const cudaError_t state = useSm75Tile ?
+                fastllm_dflash_attention::Run<32>(
+                    (const half*)q.cudaData, (const half*)k.cudaData,
+                    (const half*)v.cudaData, (half*)output.cudaData, workspace,
+                    heads, k.dims[0], queries, keys, k.Count(1), v.Count(1),
+                    runtimeBlockSize, slidingWindow, scale, cudaStreamPerThread) :
+                fastllm_dflash_attention::Run<64>(
+                    (const half*)q.cudaData, (const half*)k.cudaData,
+                    (const half*)v.cudaData, (half*)output.cudaData, workspace,
+                    heads, k.dims[0], queries, keys, k.Count(1), v.Count(1),
+                    runtimeBlockSize, slidingWindow, scale, cudaStreamPerThread);
+            FastllmReleaseCudaTempBuffer(workspace, own);
+            if (state != cudaSuccess) {
+                throw std::runtime_error(std::string("DFlash FlashInfer attention: ") +
+                                         cudaGetErrorString(state));
+            }
+            static thread_local std::map<int, bool> loggedSm75;
+            if (useSm75Tile && !loggedSm75[device]) {
+                printf("[DFlash attention] SM75 FP16 tileQ=32 on GPU %d, queries=%d heads=%d\n",
+                    device, queries, heads);
+                loggedSm75[device] = true;
+            }
+            return true;
+        }
+        FastllmReleaseCudaTempBuffer(workspace, own);
+    }
+#endif
     const size_t scoreElements = (size_t)heads * queries * keys;
     const size_t scratchBytes = scoreElements * sizeof(half) * 2;
     size_t availableBytes = 0;
