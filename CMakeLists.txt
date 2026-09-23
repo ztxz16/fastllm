@@ -661,6 +661,15 @@ if (UNIT_TEST)
     add_executable(moe_expert_partition_test test/basic/test_moe_expert_partition.cpp)
     target_include_directories(moe_expert_partition_test PRIVATE src)
     add_test(NAME moe_expert_partition COMMAND moe_expert_partition_test)
+    function(fastllm_add_checked_test name target pass_regex timeout)
+        add_test(NAME ${name} COMMAND "${CMAKE_COMMAND}"
+            "-DTEST_EXECUTABLE=$<TARGET_FILE:${target}>"
+            "-DTEST_PASS_REGEX=${pass_regex}" "-DTEST_TIMEOUT=${timeout}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/test/basic/run_checked_test.cmake")
+        math(EXPR outer_timeout "${timeout} + 10")
+        set_tests_properties(${name} PROPERTIES TIMEOUT ${outer_timeout}
+            SKIP_REGULAR_EXPRESSION "FASTLLM_TEST_SKIP_NO_DEVICE")
+    endfunction()
     if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|i[3-6]86)$")
         add_executable(cpu_isa_compat_test test/basic/test_cpu_isa_compat.cpp)
         target_link_libraries(cpu_isa_compat_test PRIVATE fastllm)
@@ -1083,8 +1092,8 @@ if (UNIT_TEST)
         add_executable(cuda_nvfp4_fused_test test/basic/test_cuda_nvfp4_fused.cu)
         target_link_libraries(cuda_nvfp4_fused_test PRIVATE fastllm)
         set_target_properties(cuda_nvfp4_fused_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
-        add_test(NAME cuda_nvfp4_fused COMMAND cuda_nvfp4_fused_test)
-        set_tests_properties(cuda_nvfp4_fused PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        fastllm_add_checked_test(cuda_nvfp4_fused cuda_nvfp4_fused_test "PASS" 600)
+        set_tests_properties(cuda_nvfp4_fused PROPERTIES LABELS cuda RUN_SERIAL TRUE)
 
         add_executable(cuda_fp8_linear_add_test test/basic/test_cuda_fp8_linear_add.cu)
         target_link_libraries(cuda_fp8_linear_add_test PRIVATE fastllm)
