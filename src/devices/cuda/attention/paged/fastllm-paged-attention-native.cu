@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cuda_fp8.h>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -2012,7 +2013,7 @@ FastllmPagedAttentionSplitGQAKernel(
 static const int FASTLLM_PAGED_SM70_GQA_D256_SUBGROUP = 3;
 static const int FASTLLM_PAGED_SM70_GQA_D256_WARPS = 4;
 
-template <typename QType, typename KVType>
+template <typename QType, typename KVType, bool SmallT = false>
 __global__ void __launch_bounds__(128, 4)
 FastllmPagedAttentionSplitSm70GqaD256Kernel(
     const QType *qd,
@@ -2030,7 +2031,11 @@ FastllmPagedAttentionSplitSm70GqaD256Kernel(
     constexpr int kWarps = FASTLLM_PAGED_SM70_GQA_D256_WARPS;
     constexpr int kDimsPerLane = kHeadDim / 32;
 
-    int b = blockIdx.x;
+    // SmallT is single-sequence verification: grid.x enumerates query tokens.
+    // Keep the original decode instantiation and its arithmetic unchanged.
+    int b = SmallT ? 0 : blockIdx.x;
+    int queryOffset = SmallT ? blockIdx.x : 0;
+    int scratchRow = blockIdx.x;
     int packedGroup = blockIdx.y;
     int split = blockIdx.z;
     int tid = threadIdx.x;
@@ -2048,6 +2053,10 @@ FastllmPagedAttentionSplitSm70GqaD256Kernel(
     int numPages = pageSizes[b + 1] - pageStart;
     int kvLen = (numPages > 0) ? ((numPages - 1) * pageLen + lastPageLens[b]) : 0;
 
+    // The cache already includes all verification tokens. Each query can only
+    // see the prefix ending at its own position, including across page edges.
+    if constexpr (SmallT) kvLen = max(0, kvLen - qoLen + queryOffset + 1);
+
     __shared__ float sQ[kSubgroup * kHeadDim];
     __shared__ float sM[kSubgroup * kWarps];
     __shared__ float sL[kSubgroup * kWarps];
@@ -2060,7 +2069,7 @@ FastllmPagedAttentionSplitSm70GqaD256Kernel(
     if (qoLen <= 0 || numPages <= 0 || kvLen <= 0 || kvStart >= kvEnd) {
         for (int g = 0; g < kSubgroup; g++) {
             int h = firstQHead + g;
-            float *slot = scratch + ((size_t)(b * H + h) * S + split) * headDimPlus;
+            float *slot = scratch + ((size_t)(scratchRow * H + h) * S + split) * headDimPlus;
             for (int d = tid; d < kHeadDim; d += blockDim.x) {
                 slot[d] = 0.0f;
             }
@@ -2072,7 +2081,7 @@ FastllmPagedAttentionSplitSm70GqaD256Kernel(
         return;
     }
 
-    int token = tokenStart; // 仅用于 qoLen==1 的 decode。
+    int token = tokenStart + queryOffset;
     for (int idx = tid; idx < kSubgroup * kHeadDim; idx += blockDim.x) {
         int g = idx / kHeadDim;
         int d = idx - g * kHeadDim;
@@ -2197,7 +2206,7 @@ FastllmPagedAttentionSplitSm70GqaD256Kernel(
     #pragma unroll
     for (int g = 0; g < kSubgroup; g++) {
         int h = firstQHead + g;
-        float *slot = scratch + ((size_t)(b * H + h) * S + split) * headDimPlus;
+        float *slot = scratch + ((size_t)(scratchRow * H + h) * S + split) * headDimPlus;
         float M = -1e30f;
         #pragma unroll
         for (int w = 0; w < kWarps; w++) {
@@ -2715,7 +2724,7 @@ __global__ void FastllmPagedAttentionCombineExp2OutputKernel(
 }
 
 // phase2（GQA）：每个 block 合并一个 kv head 下 group 个 Q head 的 S 段，launch 数 H/group。
-template <typename QType, int GROUP_MAX>
+template <typename QType, int GROUP_MAX, bool SmallT = false>
 __global__ void FastllmPagedAttentionCombineGQAKernel(
     const float *scratch,
     QType *od,
@@ -2724,7 +2733,7 @@ __global__ void FastllmPagedAttentionCombineGQAKernel(
     int b = blockIdx.x;
     int kvh = blockIdx.y;
     int tid = threadIdx.x;
-    int token = qSizes[b];
+    int token = SmallT ? qSizes[0] + b : qSizes[b];
     int headDimPlus = headDim + 2;
 
     __shared__ float sMs[FASTLLM_PAGED_MAX_SPLITS];
@@ -3234,6 +3243,49 @@ bool FastllmCudaHalfPagedAttentionBatchFastllmFallback(
             capturing = true;
         } else {
             cudaGetLastError();
+        }
+    }
+    // Small verification batches are not prefill. Reuse each paged KV load
+    // across three GQA heads and fuse QK, causal softmax and PV in a split
+    // kernel, followed by the existing merge. Device metadata stays on GPU.
+    const char *smallTFlag = std::getenv("FASTLLM_PAGED_SM70_SMALL_T");
+    if ((!smallTFlag || (std::strcmp(smallTFlag, "0") && std::strcmp(smallTFlag, "false"))) &&
+        batch_size == 1 && group == 6 && q.dims.size() == 3 &&
+        q.dims[1] >= 2 && q.dims[1] <= 8 && q.dims[2] == 256 &&
+        kCaches.dims.size() == 3 && kCaches.dims[1] <= 4096 &&
+        q.dataType == fastllm::DataType::FLOAT16 && output.dataType == q.dataType &&
+        kCaches.pagedKVCacheData && vCaches.pagedKVCacheData &&
+        kCaches.pagedKVCacheData->dataType == fastllm::DataType::FLOAT16 &&
+        vCaches.pagedKVCacheData->dataType == fastllm::DataType::FLOAT16 &&
+        kCaches.pagedKVCacheData->dims.size() == 4 &&
+        kCaches.pagedKVCacheData->dims[3] == 256 &&
+        vCaches.pagedKVCacheData->dims == kCaches.pagedKVCacheData->dims &&
+        kCaches.pageLen > 0 && kCaches.pageLen == vCaches.pageLen &&
+        q.dims[0] == group * kCaches.dims[0] && FastllmCudaRuntimeArch() == 70) {
+        const int T = q.dims[1], H = q.dims[0], kvHeads = kCaches.dims[0];
+        const int S = FastllmChoosePagedSplits(T, kvHeads * 2, FASTLLM_PAGED_SPLIT_TARGET_BLOCKS_GQA);
+        int device = -1;
+        cudaGetDevice(&device);
+        size_t slots = 0;
+        float *unusedStats = nullptr;
+        float *scratch = FastllmGetPagedSplitScratch(device, H, 32, 256, false,
+                                                     slots, unusedStats, capturing);
+        if (scratch && slots >= size_t(T) * H * S) {
+            const int qStrideH = q.strides.size() >= 1 ? q.strides[0] : T * 256;
+            const int qStrideT = q.strides.size() >= 2 ? q.strides[1] : 256;
+            FastllmPagedAttentionSplitSm70GqaD256Kernel<half, half, true>
+                <<<dim3(T, kvHeads * 2, S), 128>>>(
+                    (half*)q.cudaData, (half*)kCaches.pagedKVCacheData->cudaData,
+                    (half*)vCaches.pagedKVCacheData->cudaData, scratch,
+                    (int32_t*)qSizes.cudaData, (int32_t*)pageSizes.cudaData,
+                    (int32_t*)pageIndexs.cudaData, (int32_t*)lastPageLens.cudaData,
+                    H, group, kvHeads, kCaches.pageLen, qStrideH, qStrideT, scale, S);
+            // Parallelize the merge across Q heads as well as query tokens.
+            FastllmPagedAttentionCombineGQAKernel<half, 1, true>
+                <<<dim3(T, H), 256>>>(scratch, (half*)output.cudaData,
+                    (int32_t*)qSizes.cudaData, H, 1, 256, S);
+            output.Resize({T, H, 256});
+            return true;
         }
     }
     bool isDecode = (q.dims.size() >= 2 && (int)q.dims[1] == (int)batch_size);
