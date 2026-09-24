@@ -4709,7 +4709,30 @@ namespace fastllm {
 
         // 4.1 读取权重
         auto tensors = safeTensors.GetSortedItemNames();
-        
+
+        // EPD encoder-only 模式：只加载视觉塔权重，跳过 LM 全部 tensor
+        if (std::getenv("FASTLLM_VISION_ONLY") != nullptr &&
+            std::string(std::getenv("FASTLLM_VISION_ONLY")) == "1") {
+            tensors.erase(
+                std::remove_if(tensors.begin(), tensors.end(),
+                    [](const std::string &name) {
+                        return name.rfind("model.visual.", 0) != 0;
+                    }),
+                tensors.end());
+        }
+
+        // EPD consumer 无兜底模式：跳过视觉塔权重（省显存；
+        // 此时缓存未命中的带图请求由 Python 层拒绝，不能再自跑 ViT）
+        if (std::getenv("FASTLLM_SKIP_VISION") != nullptr &&
+            std::string(std::getenv("FASTLLM_SKIP_VISION")) == "1") {
+            tensors.erase(
+                std::remove_if(tensors.begin(), tensors.end(),
+                    [](const std::string &name) {
+                        return name.rfind("model.visual.", 0) == 0;
+                    }),
+                tensors.end());
+        }
+
         // tensorMap[name]代表本名为name的tensor，创建后的名字以及类型
         // 有些tensor被共享，可能需要创建多次
         auto tensorMap = model->GetTensorMap(tensors);

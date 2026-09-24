@@ -46,6 +46,8 @@ try:
         build_qwen35_prompt,
         normalize_qwen35_conversation,
         prepare_qwen35_multimodal_inputs,
+        qwen35_epd_scoped_cache_dir,
+        try_build_qwen35_epd_payload,
     )
 except ImportError:
     from qwen35_multimodal_native import (
@@ -53,6 +55,8 @@ except ImportError:
         build_qwen35_prompt,
         normalize_qwen35_conversation,
         prepare_qwen35_multimodal_inputs,
+        qwen35_epd_scoped_cache_dir,
+        try_build_qwen35_epd_payload,
     )
 
 try:
@@ -401,6 +405,11 @@ fastllm_lib.launch_response_llm_model_multimodal.argtypes = [ctypes.c_int, ctype
                                                             ctypes.c_float, ctypes.c_float, ctypes.c_bool,
                                                             ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
 fastllm_lib.launch_response_llm_model_multimodal.restype = ctypes.c_int
+
+if hasattr(fastllm_lib, "encode_visual_items_llm_model"):
+    fastllm_lib.encode_visual_items_llm_model.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p,
+                                                          ctypes.c_char_p, ctypes.c_void_p, ctypes.c_int]
+    fastllm_lib.encode_visual_items_llm_model.restype = ctypes.c_int
 
 
 fastllm_lib.add_cache_llm_model.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
@@ -2620,9 +2629,35 @@ class model:
                     tool_choice = tool_choice,
                     chat_template_kwargs = chat_template_kwargs,
                 )
-                payload_config, payload = build_qwen35_multimodal_payload(
-                    native_inputs, tokenizer, model_config = self.config
-                )
+                epd_payload = None
+                epd_cache_dir = os.environ.get("FASTLLM_EPD_CACHE_DIR", "").strip()
+                if epd_cache_dir and native_inputs.get("image_arrays"):
+                    scoped_key = ("epd", epd_cache_dir)
+                    if getattr(self, "_epd_scoped_cache_key", None) != scoped_key:
+                        self._epd_scoped_cache_key = scoped_key
+                        self._epd_scoped_cache_dir = qwen35_epd_scoped_cache_dir(
+                            epd_cache_dir, self.model_path, self.config
+                        )
+                    try:
+                        epd_payload = try_build_qwen35_epd_payload(
+                            native_inputs, self._epd_scoped_cache_dir,
+                            tokenizer = tokenizer, model_config = self.config
+                        )
+                    except Exception:
+                        epd_payload = None
+                if epd_payload is not None:
+                    payload_config, payload = epd_payload
+                    print(f"[EPD] consumer hit encoder cache: {len(native_inputs['image_arrays'])} image(s), skip ViT", flush=True)
+                else:
+                    if (epd_cache_dir and native_inputs.get("image_arrays")
+                            and os.environ.get("FASTLLM_SKIP_VISION", "").strip() == "1"):
+                        raise ValueError(
+                            "EPD encoder cache miss: consumer 未加载视觉塔（FASTLLM_SKIP_VISION=1），"
+                            "带图请求要求 encoder 已预编码该图。请确认 encoder 服务正常后重试。"
+                        )
+                    payload_config, payload = build_qwen35_multimodal_payload(
+                        native_inputs, tokenizer, model_config = self.config
+                    )
                 payload_json = json.dumps(payload_config)
                 payload_buffer = ctypes.create_string_buffer(payload) if payload else None
                 input = native_inputs["input_ids"]
