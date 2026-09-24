@@ -1,7 +1,10 @@
+import base64
+import io
 import os
 import sys
 import unittest
 from types import SimpleNamespace
+from PIL import Image
 
 TEST_API_DIR = os.path.abspath(os.path.dirname(__file__))
 ORIGINAL_SYS_PATH = list(sys.path)
@@ -26,6 +29,52 @@ def call(call_id, name, arguments):
 
 
 class ResponsesHistoryTest(unittest.TestCase):
+    def test_tool_output_images_are_loaded_in_order_with_their_call_ids(self):
+        def image_part(color):
+            buffer = io.BytesIO()
+            Image.new('RGB', (8, 8), color).save(buffer, format='PNG')
+            return {'type': 'input_image', 'image_url':
+                    'data:image/png;base64,' + base64.b64encode(buffer.getvalue()).decode()}
+
+        messages = self.convert([
+            message('user', 'Inspect the returned images.'),
+            call('first', 'read_images', '{"paths":["red.png","blue.png"]}'),
+            call('second', 'read_images', '{"paths":["green.png"]}'),
+            {'type': 'function_call_output', 'call_id': 'first', 'output': [
+                {'type': 'input_text', 'text': 'First pair:'},
+                image_part((255, 0, 0)), image_part((0, 0, 255)),
+            ]},
+            {'type': 'function_call_output', 'call_id': 'second', 'output': [
+                image_part((0, 255, 0)), {'type': 'input_text', 'text': 'Last image.'},
+            ]},
+        ])
+        completion = object.__new__(FastLLmCompletion)
+        pixels = []
+        for msg, call_id in zip(messages[2:], ['first', 'second']):
+            parsed, media = completion._parse_chat_message_content(**msg)
+            self.assertEqual(parsed[0].tool_call_id, call_id)
+            pixels.extend(image.getpixel((0, 0)) for image in media.images)
+        self.assertEqual(pixels, [(255, 0, 0), (0, 0, 255), (0, 255, 0)])
+        self.assertEqual([part['type'] for part in messages[2]['content']],
+                         ['text', 'image_url', 'image_url'])
+        self.assertEqual([part['type'] for part in messages[3]['content']],
+                         ['image_url', 'text'])
+
+    def test_text_and_structured_tool_outputs_keep_existing_representation(self):
+        for output, expected in [
+            ('plain text', 'plain text'),
+            ([{'type': 'input_text', 'text': 'one'},
+              {'type': 'output_text', 'text': 'two'}], 'one\ntwo'),
+            ({'ok': True}, '{"ok": true}'),
+            (None, ''),
+        ]:
+            with self.subTest(output=output):
+                messages = self.convert([
+                    call('test', 'run_test', '{}'),
+                    {'type': 'function_call_output', 'call_id': 'test', 'output': output},
+                ])
+                self.assertEqual(messages[-1]['content'], expected)
+
     def convert(self, items, *, native_v41=False, force_chat_template=False,
                 instructions=None):
         completion = object.__new__(FastLLmCompletion)

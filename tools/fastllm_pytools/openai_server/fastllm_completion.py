@@ -2121,7 +2121,7 @@ class FastLLmCompletion:
               messages.append({
                   "role": "tool",
                   "tool_call_id": item.get("call_id") or item.get("id"),
-                  "content": self._stringify_responses_tool_output(
+                  "content": self._convert_responses_content_to_chat_content(
                       item.get("output", "")),
               })
               continue
