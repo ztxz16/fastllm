@@ -835,6 +835,11 @@ namespace fastllm {
         return enabled;
     }
 
+    static bool Qwen35MtpBatchSamplingEnabled() {
+        static bool enabled = Qwen35EnvDefaultEnabled("FASTLLM_MTP_BATCH_SAMPLING");
+        return enabled;
+    }
+
     static bool Qwen35MtpBatchedStateRestoreEnabled() {
         static bool enabled = Qwen35EnvDefaultEnabled(
             "FASTLLM_QWEN35_MTP_BATCHED_STATE_RESTORE");
@@ -17828,6 +17833,52 @@ namespace fastllm {
                 AssertInFastLLM(inputCpu.Count(0) >= (uint64_t)logitRows,
                                 "MTP rejection sampling input is incomplete.\n");
                 speculativeMtpAccepted.assign(logitRows, 0);
+                bool batchLogits = batch > 1 && Qwen35MtpBatchSamplingEnabled();
+                const int batchDrafts = seqLens[0] - 1;
+                for (int b = 0; b < batch && batchLogits; ++b) {
+                    const MtpKvCache *q = speculativeMtpSamplingContexts[b];
+                    batchLogits = !generationConfigs[b].IsSimpleGreedy() &&
+                        seqLens[b] == batchDrafts + 1 && batchDrafts > 0 && batchDrafts <= 8 &&
+                        q && q->sampleProposal && q->proposalUsesLogits &&
+                        (int)q->proposalTokens.size() >= batchDrafts &&
+                        q->proposalProbs.dataDevice == DataDevice::CUDA &&
+                        q->proposalProbs.dataDeviceIds == std::vector<int>{devices[0]} &&
+                        q->proposalProbs.dims.size() == 2 &&
+                        q->proposalProbs.dims[0] >= batchDrafts && q->proposalProbs.dims[1] == vocabSize &&
+                        q->proposalProbs.cudaData && q->proposalLogsumexp.cudaData &&
+                        q->proposalDeviceTokens.cudaData;
+                }
+                if (batchLogits) {
+                    std::vector<FastllmMtpProposalView> proposals(batch);
+                    std::vector<float> temperatures(logitRows), topPs(logitRows);
+                    std::vector<int> topKs(logitRows), accepted(batch);
+                    int rowOffset = 0;
+                    for (int b = 0; b < batch; ++b) {
+                        const MtpKvCache &q = *speculativeMtpSamplingContexts[b];
+                        proposals[b] = {(const float*)q.proposalProbs.cudaData,
+                            (const float*)q.proposalLogsumexp.cudaData,
+                            (const int*)q.proposalDeviceTokens.cudaData};
+                        for (int i = 0; i < batchDrafts; ++i)
+                            AssertInFastLLM(q.proposalTokens[i] == (int)(input[rowOffset + i + 1] + 1.0e-3f),
+                                "MTP batched proposal is out of sync.\n");
+                        for (int i = 0; i <= batchDrafts; ++i) {
+                            temperatures[rowOffset+i] = generationConfigs[b].temperature;
+                            topKs[rowOffset+i] = generationConfigs[b].top_k;
+                            topPs[rowOffset+i] = generationConfigs[b].top_p;
+                        }
+                        rowOffset += batchDrafts + 1;
+                    }
+                    AssertInFastLLM(FastllmCudaMtpRejectionSamplingLogitsBatch(
+                        (float*)sampleLogits->cudaData, proposals.data(), temperatures.data(),
+                        topKs.data(), topPs.data(), sampled.data(), accepted.data(), batch, batchDrafts, vocabSize),
+                        "MTP batched CUDA rejection sampling failed.\n");
+                    for (int b = 0; b < batch; ++b)
+                        for (int i = 0; i < accepted[b]; ++i)
+                            speculativeMtpAccepted[b * (batchDrafts + 1) + i] = 1;
+                    mtpTargetProfileMark(mtpTargetProfileSamplingUs);
+                    mtpTargetProfileRecord(logitRows);
+                    return sampled;
+                }
                 int offset = 0;
                 for (int b = 0; b < batch; ++b) {
                     int rows = seqLens[b], drafts = rows - 1;
@@ -32008,6 +32059,38 @@ namespace fastllm {
             }
         }
         if (Qwen35EnvDefaultEnabled("FASTLLM_MTP_GUMBEL")) {
+            if (batch > 1 && Qwen35MtpBatchSamplingEnabled() &&
+                std::all_of(caches.begin(), caches.end(), [](const MtpKvCache *c) { return c->sampleProposal; })) {
+                std::vector<FastllmMtpDraftOutput> outputs(batch);
+                bool needHost = false;
+                for (int b = 0; b < batch; ++b) {
+                    MtpKvCache &cache = *caches[b];
+                    const int slot = cache.proposalTokens.size();
+                    const int capacity = std::max(1, Qwen35MtpDraftsPerStep());
+                    auto prepare = [&](Data &data, DataType type) {
+                        data.dataType = type; data.UpdateUnitSize();
+                        Qwen3CudaPrepareLocalOutput(data, device);
+                        data.Resize({capacity}); data.Allocate();
+                    };
+                    prepare(cache.proposalDeviceTokens, DataType::INT32);
+                    prepare(cache.proposalFloatTokens, DataType::FLOAT32);
+                    prepare(cache.proposalLogsumexp, DataType::FLOAT32);
+                    outputs[b] = {destinations[b], (float*)cache.proposalLogsumexp.cudaData + slot,
+                        (int*)cache.proposalDeviceTokens.cudaData + slot,
+                        (float*)cache.proposalFloatTokens.cudaData + slot};
+                    cache.proposalUsesLogits = true;
+                    needHost |= !cache.deferProposalTokens;
+                }
+                AssertInFastLLM(FastllmCudaMtpSampleDraftLogitsBatch(
+                    (float*)logits.cudaData, outputs.data(), temperatures.data(),
+                    needHost ? tokens.data() : nullptr, batch, vocab), "MTP batched proposal sampling failed.\n");
+                for (int b = 0; b < batch; ++b) {
+                    if (caches[b]->deferProposalTokens) tokens[b] = -1;
+                    else AssertInFastLLM(tokens[b] >= 0 && tokens[b] < vocab, "MTP batched proposal has no finite token.\n");
+                    caches[b]->proposalTokens.push_back(tokens[b]);
+                }
+                return tokens;
+            }
             for (int b = 0; b < batch; ++b) {
                 MtpKvCache &cache = *caches[b];
                 const int capacity = std::max(1, Qwen35MtpDraftsPerStep());

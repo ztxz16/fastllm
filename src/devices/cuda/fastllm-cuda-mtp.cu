@@ -21,6 +21,8 @@ struct Workspace {
     int *results = nullptr, *hostResults = nullptr;
     float *temperatures = nullptr;
     unsigned long long *counter = nullptr;
+    void *descriptors = nullptr;
+    size_t descriptorCapacity = 0;
     size_t partialCapacity = 0, resultCapacity = 0, temperatureCapacity = 0;
     std::vector<float> savedTemperatures;
     unsigned long long seed = std::mt19937_64(std::random_device{}())();
@@ -29,7 +31,7 @@ struct Workspace {
         int previous = device;
         cudaGetDevice(&previous); cudaSetDevice(device);
         cudaFree(partials); cudaFree(results); cudaFreeHost(hostResults);
-        cudaFree(temperatures); cudaFree(counter);
+        cudaFree(temperatures); cudaFree(counter); cudaFree(descriptors);
         cudaSetDevice(previous);
     }
     bool Prepare(size_t partialCount, size_t resultCount) {
@@ -74,6 +76,15 @@ struct Workspace {
         }
         return true;
     }
+    bool SetDescriptors(const void *host, size_t bytes) {
+        if (bytes > descriptorCapacity) {
+            cudaFree(descriptors); descriptors = nullptr; descriptorCapacity = 0;
+            if (cudaMalloc(&descriptors, bytes) != cudaSuccess) return false;
+            descriptorCapacity = bytes;
+        }
+        // Complete staging before the caller reuses its host descriptor array.
+        return cudaMemcpy(descriptors, host, bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+    }
 };
 Workspace &GetWorkspace() {
     int device = 0; cudaGetDevice(&device);
@@ -106,10 +117,15 @@ __device__ Partial Reduce(Partial v, Partial *shared) {
     }
     return shared[0];
 }
+template<bool Indirect = false>
 __global__ void DraftKernel(const float *logits, float *saved, Partial *partials,
         const float *temperatures, float temperature, int vocab, int blocks,
-        unsigned long long seed, const unsigned long long *counter) {
+        unsigned long long seed, const unsigned long long *counter,
+        const FastllmMtpDraftOutput *outputs = nullptr) {
     int row = blockIdx.y, tile = blockIdx.x, tid = threadIdx.x;
+    float *savedRow;
+    if constexpr (Indirect) savedRow = outputs[row].logits;
+    else savedRow = saved + (size_t)row * vocab;
     float t = temperatures ? temperatures[row] : temperature;
     curandStatePhilox4_32_10_t rng;
     curand_init(seed, ((unsigned long long)row * blocks + tile) * Threads + tid,
@@ -123,7 +139,7 @@ __global__ void DraftKernel(const float *logits, float *saved, Partial *partials
         int id = tile * Tile + tid + i * Threads;
         float x = id < vocab ? logits[(size_t)row * vocab + id] / t : -INFINITY;
         values[i] = x;
-        if (id < vocab) saved[(size_t)row * vocab + id] = x;
+        if (id < vocab) savedRow[id] = x;
         local.max = fmaxf(local.max, x);
         float score = x + Gumbel(randoms[i]);
         if (id < vocab && Better(score, id, local.best, local.token)) {
@@ -137,8 +153,10 @@ __global__ void DraftKernel(const float *logits, float *saved, Partial *partials
     Partial reduced = Reduce(local, shared);
     if (tid == 0) partials[(size_t)row * blocks + tile] = reduced;
 }
+template<bool Indirect = false>
 __global__ void FinishDraftKernel(const Partial *partials, float *lse, int *output,
-        float *floatOutput, int blocks, unsigned long long *counter) {
+        float *floatOutput, int blocks, unsigned long long *counter,
+        const FastllmMtpDraftOutput *outputs = nullptr) {
     int row = blockIdx.x, tid = threadIdx.x;
     Partial v{-INFINITY, 0, -INFINITY, 0x7fffffff};
     for (int b = tid; b < blocks; b += Threads) {
@@ -151,27 +169,47 @@ __global__ void FinishDraftKernel(const Partial *partials, float *lse, int *outp
     __shared__ Partial shared[Threads];
     Partial reduced = Reduce(v, shared);
     if (tid == 0) {
-        lse[row] = reduced.max + logf(reduced.sum);
-        output[row] = isfinite(reduced.best) ? reduced.token : -1;
-        if (floatOutput) floatOutput[row] = (float)output[row];
+        const float normalizer = reduced.max + logf(reduced.sum);
+        const int token = isfinite(reduced.best) ? reduced.token : -1;
+        if constexpr (Indirect) {
+            *outputs[row].logsumexp = normalizer;
+            *outputs[row].token = token;
+            if (outputs[row].floatToken) *outputs[row].floatToken = (float)token;
+            if (output) output[row] = token;
+        } else {
+            lse[row] = normalizer;
+            output[row] = token;
+            if (floatOutput) floatOutput[row] = (float)token;
+        }
         // Increment on device so graph replays never repeat the same noise.
         if (row == 0) ++*counter;
     }
 }
+template<bool Indirect = false>
 __global__ void AcceptKernel(const float *p, const float *logits, const float *lse,
         const int *draftIds, int *result, int drafts, int vocab, int batch,
-        unsigned long long seed, const unsigned long long *counter) {
+        unsigned long long seed, const unsigned long long *counter,
+        const FastllmMtpProposalView *proposals = nullptr) {
     if (threadIdx.x) return;
     int b = blockIdx.x, offset = b * (drafts + 1), accepted = 0;
+    const float *qLogits, *qLse;
+    const int *ids;
+    if constexpr (Indirect) {
+        qLogits = proposals[b].logits; qLse = proposals[b].logsumexp;
+        ids = proposals[b].tokens;
+    } else {
+        qLogits = logits + (size_t)b * drafts * vocab;
+        qLse = lse + b * drafts; ids = draftIds + b * drafts;
+    }
     for (int i = 0; i <= drafts; ++i) result[offset + i] = -1;
     curandStatePhilox4_32_10_t rng;
     // Keep acceptance uniforms disjoint from both draft and residual Gumbels.
     curand_init(seed ^ 0xd2b74407b1ce6e93ULL, b, *counter * 16, &rng);
     for (int i = 0; i < drafts; ++i) {
-        int token = draftIds[b * drafts + i];
+        int token = ids[i];
         if (token < 0 || token >= vocab) break;
         float target = p[(size_t)(offset + i) * vocab + token];
-        float logq = logits[(size_t)(b * drafts + i) * vocab + token] - lse[b * drafts + i];
+        float logq = qLogits[(size_t)i * vocab + token] - qLse[i];
         float logp = logf(target);
         float logu = logf(Uniform(curand(&rng)));
         // Subtract first: adding a tiny log(u) to a large negative log(q)
@@ -181,15 +219,26 @@ __global__ void AcceptKernel(const float *p, const float *logits, const float *l
     }
     result[batch * (drafts + 1) + b] = accepted;
 }
+template<bool Indirect = false>
 __global__ void ResidualKernel(const float *p, const float *logits, const float *lse,
         const int *result, Partial *partials, int drafts, int vocab, int batch,
-        int blocks, unsigned long long seed, const unsigned long long *counter) {
+        int blocks, unsigned long long seed, const unsigned long long *counter,
+        const FastllmMtpProposalView *proposals = nullptr) {
     int b = blockIdx.y, tile = blockIdx.x, tid = threadIdx.x;
     int accepted = result[batch * (drafts + 1) + b];
     const float *target = p + (size_t)(b * (drafts + 1) + accepted) * vocab;
     bool bonus = accepted == drafts;
-    const float *proposal = logits + (size_t)(b * drafts + accepted) * vocab;
-    float normalizer = bonus ? 0 : lse[b * drafts + accepted];
+    const float *proposal = nullptr;
+    float normalizer = 0;
+    if (!bonus) {
+        if constexpr (Indirect) {
+            proposal = proposals[b].logits + (size_t)accepted * vocab;
+            normalizer = proposals[b].logsumexp[accepted];
+        } else {
+            proposal = logits + (size_t)(b * drafts + accepted) * vocab;
+            normalizer = lse[b * drafts + accepted];
+        }
+    }
     curandStatePhilox4_32_10_t rng;
     curand_init(seed ^ 0x9e3779b97f4a7c15ULL,
         ((unsigned long long)b * blocks + tile) * Threads + tid, *counter * 4, &rng);
@@ -242,10 +291,10 @@ bool FastllmCudaMtpSampleDraftLogits(const float *logits, float *saved, float *l
     bool uniform = false;
     if (!ws.Prepare((size_t)batch * blocks, 0) ||
         !ws.SetTemperatures(temperatures, batch, uniform)) return false;
-    DraftKernel<<<dim3(blocks, batch), Threads, 0, cudaStreamPerThread>>>(
+    DraftKernel<false><<<dim3(blocks, batch), Threads, 0, cudaStreamPerThread>>>(
         logits, saved, ws.partials, uniform ? nullptr : ws.temperatures,
         temperatures[0], vocab, blocks, ws.seed, ws.counter);
-    FinishDraftKernel<<<batch, Threads, 0, cudaStreamPerThread>>>(
+    FinishDraftKernel<false><<<batch, Threads, 0, cudaStreamPerThread>>>(
         ws.partials, lse, output, floatOutput, blocks, ws.counter);
     return cudaGetLastError() == cudaSuccess;
 }
@@ -258,10 +307,71 @@ bool FastllmCudaMtpRejectionFromProbs(const float *p, const float *logits,
     auto &ws = GetWorkspace();
     int blocks = (vocab + Tile - 1) / Tile, count = batch * (drafts + 2);
     if (!ws.Prepare((size_t)batch * blocks, count)) return false;
-    AcceptKernel<<<batch, 32, 0, cudaStreamPerThread>>>(p, logits, lse, draftIds,
+    AcceptKernel<false><<<batch, 32, 0, cudaStreamPerThread>>>(p, logits, lse, draftIds,
         ws.results, drafts, vocab, batch, ws.seed, ws.counter);
-    ResidualKernel<<<dim3(blocks, batch), Threads, 0, cudaStreamPerThread>>>(
+    ResidualKernel<false><<<dim3(blocks, batch), Threads, 0, cudaStreamPerThread>>>(
         p, logits, lse, ws.results, ws.partials, drafts, vocab, batch, blocks, ws.seed, ws.counter);
+    FinishResidualKernel<<<batch, Threads, 0, cudaStreamPerThread>>>(
+        ws.partials, ws.results, drafts, batch, blocks, ws.counter);
+    if (cudaGetLastError() != cudaSuccess ||
+        cudaMemcpyAsync(ws.hostResults, ws.results, count * sizeof(int), cudaMemcpyDeviceToHost,
+            cudaStreamPerThread) != cudaSuccess || cudaStreamSynchronize(cudaStreamPerThread) != cudaSuccess)
+        return false;
+    std::copy_n(ws.hostResults, batch * (drafts + 1), output);
+    std::copy_n(ws.hostResults + batch * (drafts + 1), batch, accepted);
+    for (int b = 0; b < batch; ++b)
+        for (int i = 0; i <= accepted[b]; ++i)
+            if (output[b * (drafts + 1) + i] < 0 || output[b * (drafts + 1) + i] >= vocab) return false;
+    return true;
+}
+
+bool FastllmCudaMtpSampleDraftLogitsBatch(const float *logits,
+        const FastllmMtpDraftOutput *outputs, const float *temperatures,
+        int *hostTokens, int batch, int vocab) {
+    if (!logits || !outputs || !temperatures || batch <= 0 || vocab <= 0) return false;
+    for (int b = 0; b < batch; ++b)
+        if (!outputs[b].logits || !outputs[b].logsumexp || !outputs[b].token) return false;
+    auto &ws = GetWorkspace();
+    int blocks = (vocab + Tile - 1) / Tile;
+    bool uniform = false;
+    if (!ws.Prepare((size_t)batch * blocks, hostTokens ? batch : 0) ||
+        !ws.SetTemperatures(temperatures, batch, uniform) ||
+        !ws.SetDescriptors(outputs, (size_t)batch * sizeof(*outputs))) return false;
+    auto *deviceOutputs = static_cast<const FastllmMtpDraftOutput*>(ws.descriptors);
+    DraftKernel<true><<<dim3(blocks, batch), Threads, 0, cudaStreamPerThread>>>(
+        logits, nullptr, ws.partials, uniform ? nullptr : ws.temperatures,
+        temperatures[0], vocab, blocks, ws.seed, ws.counter, deviceOutputs);
+    FinishDraftKernel<true><<<batch, Threads, 0, cudaStreamPerThread>>>(
+        ws.partials, nullptr, hostTokens ? ws.results : nullptr, nullptr,
+        blocks, ws.counter, deviceOutputs);
+    if (cudaGetLastError() != cudaSuccess) return false;
+    if (hostTokens) {
+        if (cudaMemcpyAsync(ws.hostResults, ws.results, batch * sizeof(int),
+                cudaMemcpyDeviceToHost, cudaStreamPerThread) != cudaSuccess ||
+            cudaStreamSynchronize(cudaStreamPerThread) != cudaSuccess) return false;
+        std::copy_n(ws.hostResults, batch, hostTokens);
+    }
+    return true;
+}
+
+bool FastllmCudaMtpRejectionFromProbsBatch(const float *p,
+        const FastllmMtpProposalView *proposals, int *output, int *accepted,
+        int batch, int drafts, int vocab) {
+    if (!p || !proposals || !output || !accepted || batch <= 0 ||
+        drafts <= 0 || drafts > 8 || vocab <= 0) return false;
+    for (int b = 0; b < batch; ++b)
+        if (!proposals[b].logits || !proposals[b].logsumexp || !proposals[b].tokens) return false;
+    auto &ws = GetWorkspace();
+    int blocks = (vocab + Tile - 1) / Tile, count = batch * (drafts + 2);
+    if (!ws.Prepare((size_t)batch * blocks, count) ||
+        !ws.SetDescriptors(proposals, (size_t)batch * sizeof(*proposals))) return false;
+    auto *deviceProposals = static_cast<const FastllmMtpProposalView*>(ws.descriptors);
+    AcceptKernel<true><<<batch, 32, 0, cudaStreamPerThread>>>(
+        p, nullptr, nullptr, nullptr, ws.results, drafts, vocab, batch,
+        ws.seed, ws.counter, deviceProposals);
+    ResidualKernel<true><<<dim3(blocks, batch), Threads, 0, cudaStreamPerThread>>>(
+        p, nullptr, nullptr, ws.results, ws.partials, drafts, vocab, batch,
+        blocks, ws.seed, ws.counter, deviceProposals);
     FinishResidualKernel<<<batch, Threads, 0, cudaStreamPerThread>>>(
         ws.partials, ws.results, drafts, batch, blocks, ws.counter);
     if (cudaGetLastError() != cudaSuccess ||

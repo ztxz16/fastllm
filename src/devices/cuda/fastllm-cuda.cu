@@ -16307,6 +16307,19 @@ bool FastllmCudaMtpRejectionSamplingLogits(float *logits,
         deviceDraftTokens, output, accepted, batch, drafts, vocab);
 }
 
+bool FastllmCudaMtpRejectionSamplingLogitsBatch(float *logits,
+        const FastllmMtpProposalView *proposals, const float *temperatures,
+        const int *topKs, const float *topPs, int *output, int *accepted,
+        int batch, int drafts, int vocab) {
+    if (!logits || !proposals || !temperatures || !topKs || !topPs ||
+        !output || !accepted || batch <= 0 || drafts <= 0 || drafts > 8 || vocab <= 0) return false;
+    const int rows = batch * (drafts + 1);
+    FastllmMtpSamplingWorkspace ws(rows, vocab);
+    if (!ws.Prepare(logits, temperatures, topKs, topPs, rows, vocab)) return false;
+    return FastllmCudaMtpRejectionFromProbsBatch(ws.a, proposals,
+        output, accepted, batch, drafts, vocab);
+}
+
 struct FastllmGreedyPartial {
     float value;
     int id;
