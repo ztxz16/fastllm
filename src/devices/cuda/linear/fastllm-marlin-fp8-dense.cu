@@ -182,6 +182,25 @@ static KernelFn PickFp4Kernel(int sizeM, int threadK, int threadN,
     const bool useM8 = m8 || sizeM <= 8;
 
     if (useM8) {
+        // These dense calls always have no bias/atomics and use FP32 reduction.
+        // Specialize those fixed flags without changing the tile, weight layout,
+        // or scratch requirements. Keep other architectures on their old path.
+        if (stages == 4 && DeviceArch() == 120) {
+#define RET_FP4_DENSE(THREADS, TN, TK) \
+            return MARLIN_NAMESPACE_NAME::Marlin< \
+                vllm::kFloat16.id(), vllm::kFE2M1f.id(), vllm::kFloat16.id(), \
+                vllm::kFE4M3fn.id(), THREADS, 1, TN, TK, true, 4, 1, false, true>
+            if (threadK == 128 && threadN == 128) {
+                threads = 256; RET_FP4_DENSE(256, 8, 8);
+            }
+            if (threadK == 64 && threadN == 128) {
+                threads = 128; RET_FP4_DENSE(128, 8, 4);
+            }
+            if (threadK == 128 && threadN == 64) {
+                threads = 128; RET_FP4_DENSE(128, 4, 8);
+            }
+#undef RET_FP4_DENSE
+        }
         if (threadK == 128 && threadN == 128) {
             threads = 256;
             RET_FP4_FOR_ARCH(256, 1, 8, 8, true);
@@ -245,10 +264,13 @@ static KernelFn PickFp4AddKernel(int threadK, int threadN, int stages, int &thre
 #undef ADD_KERNEL
 }
 
-static KernelFn PickFp4SwigluKernel() {
-    return MARLIN_NAMESPACE_NAME::Marlin<vllm::kFloat16.id(), vllm::kFE2M1f.id(),
-        vllm::kFloat16.id(), vllm::kFE4M3fn.id(), 256, 1, 8, 8, true,
-        2, 1, false, true, false, true>;
+static KernelFn PickFp4SwigluKernel(int stages) {
+#define FP4_SWIGLU(STAGES) \
+    MARLIN_NAMESPACE_NAME::Marlin<vllm::kFloat16.id(), vllm::kFE2M1f.id(), \
+        vllm::kFloat16.id(), vllm::kFE4M3fn.id(), 256, 1, 8, 8, true, \
+        STAGES, 1, false, true, false, true>
+    return stages == 2 ? FP4_SWIGLU(2) : FP4_SWIGLU(4);
+#undef FP4_SWIGLU
 }
 
 #undef RET_FP4_FOR_ARCH
@@ -286,6 +308,21 @@ static bool SelectTile(int sizeM, int sizeN, int sizeK, int deviceArch,
 
 static bool SelectFp4Tile(int sizeM, int sizeN, int sizeK,
                           int &threadK, int &threadN) {
+    // A narrower N tile gives small-M matrices more independent output
+    // stripes and less cross-CTA reduction. Bound this policy to the tested
+    // SM120 shape range; wide matrices and other architectures keep their
+    // original priority. The limit scales with the device's SM count.
+    if (sizeM >= 1 && sizeM <= 8 && sizeN >= 2048 && sizeN % 64 == 0 &&
+        sizeK >= 1024 && sizeK <= 32768 && sizeK % 128 == 0 && DeviceArch() == 120) {
+        int device = 0, sms = 0;
+        if (cudaGetDevice(&device) == cudaSuccess &&
+            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) == cudaSuccess &&
+            sizeN / 64 <= sms) {
+            threadK = 128;
+            threadN = 64;
+            return true;
+        }
+    }
     static const int smallM[][2] = {{128, 128}, {64, 128}, {128, 64}};
     static const int largeM[][2] = {{64, 256}, {64, 128}, {128, 64}};
     const int (*configs)[2] = sizeM <= 16 ? smallM : largeM;
@@ -742,8 +779,13 @@ extern "C" bool FastllmCudaMarlinHalfNVFP4Add(
 }
 
 extern "C" bool FastllmCudaMarlinNVFP4SwigluSupported(int size_n, int size_k) {
-    if (!DeviceOk() || DeviceArch() != 75 || size_n < 256 || size_n % 256 ||
+    const int arch = DeviceArch();
+    if (!DeviceOk() || (arch != 75 && arch != 120) || size_n < 256 || size_n % 256 ||
         size_k < 128 || size_k % 128) return false;
+    // Pair gate/up tiles only in the measured wide-matrix range on SM120.
+    // Small matrices keep their existing narrow tile and separate activation.
+    if (arch == 120 && (size_n < 16384 || size_n > 65536 ||
+                       size_k < 4096 || size_k > 32768)) return false;
     int device = 0, maxShared = 0;
     if (cudaGetDevice(&device) != cudaSuccess) return false;
     static thread_local std::map<int, bool> ready;
@@ -753,7 +795,7 @@ extern "C" bool FastllmCudaMarlinNVFP4SwigluSupported(int size_n, int size_k) {
     if (cudaStreamIsCapturing(cudaStreamPerThread, &capture) != cudaSuccess ||
         capture != cudaStreamCaptureStatusNone) return false;
     cudaFuncAttributes attr{};
-    KernelFn kernel = PickFp4SwigluKernel();
+    KernelFn kernel = PickFp4SwigluKernel(DeviceArch() == 75 ? 2 : 4);
     bool ok = cudaDeviceGetAttribute(&maxShared, cudaDevAttrMaxSharedMemoryPerBlockOptin,
                                      device) == cudaSuccess && maxShared > 0 &&
         cudaFuncGetAttributes(&attr, kernel) == cudaSuccess && attr.maxThreadsPerBlock >= 256 &&
@@ -777,10 +819,10 @@ extern "C" bool FastllmCudaMarlinHalfNVFP4Swiglu(
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
     cudaDeviceGetAttribute(&maxShared, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
     if (sms <= 0 || maxShared <= 0) return false;
-    KernelFn kernel = PickFp4SwigluKernel();
+    KernelFn kernel = PickFp4SwigluKernel(DeviceArch() == 75 ? 2 : 4);
     int threads = 256, blocks = sms, launchShared = maxShared;
     TuneSm75Nvfp4DecodeLaunch(
-        device, 75, size_m, size_n, size_k, sms, true,
+        device, DeviceArch(), size_m, size_n, size_k, sms, true,
         kernel, threads, blocks, launchShared);
     kernel<<<blocks, threads, launchShared, cudaStreamPerThread>>>(
         reinterpret_cast<const int4*>(a), reinterpret_cast<const int4*>(b_q_weight),

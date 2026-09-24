@@ -665,6 +665,7 @@ if (UNIT_TEST)
         add_test(NAME ${name} COMMAND "${CMAKE_COMMAND}"
             "-DTEST_EXECUTABLE=$<TARGET_FILE:${target}>"
             "-DTEST_PASS_REGEX=${pass_regex}" "-DTEST_TIMEOUT=${timeout}"
+            "-DTEST_ARGUMENTS=${ARGN}"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/test/basic/run_checked_test.cmake")
         math(EXPR outer_timeout "${timeout} + 10")
         set_tests_properties(${name} PROPERTIES TIMEOUT ${outer_timeout}
@@ -1125,6 +1126,11 @@ if (UNIT_TEST)
         set_tests_properties(cuda_nvfp4_swiglu_sm75 PROPERTIES
             LABELS cuda RUN_SERIAL TRUE
             ENVIRONMENT "SM75_SWIGLU_ONLY=1;FASTLLM_CUDA_GRAPH=0;FASTLLM_CUDA_NVFP4_SWIGLU_MULTIROW=1")
+
+        fastllm_add_checked_test(cuda_nvfp4_sm120_tiles cuda_nvfp4_fused_test "PASS SM120 NVFP4 tiles" 600 sm120-tiles)
+        fastllm_add_checked_test(cuda_nvfp4_swiglu_sm120 cuda_nvfp4_fused_test "PASS SM120 SwiGLU" 600 sm120-swiglu)
+        set_tests_properties(cuda_nvfp4_sm120_tiles cuda_nvfp4_swiglu_sm120 PROPERTIES
+            LABELS cuda RUN_SERIAL TRUE)
 
         add_executable(cuda_fp8_linear_add_test test/basic/test_cuda_fp8_linear_add.cu)
         target_link_libraries(cuda_fp8_linear_add_test PRIVATE fastllm)
