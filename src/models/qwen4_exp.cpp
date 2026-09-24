@@ -6168,6 +6168,7 @@ namespace fastllm {
 
         const bool hostMoe = threadTpRank >= 0 && threadTpOwner->hostMoeLayers[deviceLayer];
         const bool runRoutedExperts = !hostMoe || threadTpRank == 0;
+        const std::string moeDevice = SelectMoeDeviceForLayer(deviceLayer);
         Data routerLogits, expertIndex, expertScore, sharedOutput;
         if (runRoutedExperts) {
             Linear(flattened, this->weight[mlp + "gate.weight"],
@@ -6177,7 +6178,9 @@ namespace fastllm {
         // SelectExpert contract requires it). Keep only the narrow router
         // tensor in float32 while larger activations retain their dtype.
         if (runRoutedExperts) ToDataType(routerLogits, DataType::FLOAT32);
+        bool expertsSelected = false;
         auto selectExperts = [&]() {
+            if (!runRoutedExperts || expertsSelected) return;
             bool fusedRouterSelection = false;
 #ifdef USE_CUDA
             if (routerLogits.dataDevice == DataDevice::CUDA &&
@@ -6199,19 +6202,18 @@ namespace fastllm {
                              this->norm_topk_prob,
                              this->routed_scaling_factor, nullptr);
             }
+            expertsSelected = true;
         };
-        bool selectedBeforeShared = false;
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
-        const std::string moeDevice = SelectMoeDeviceForLayer(deviceLayer);
+        const bool numaMoe = moeDevice == "numa" || moeDevice.rfind("numa:", 0) == 0;
         if (runRoutedExperts && batch * sequence <= kNumasMoePrefetchMaxRows &&
             flattened.dataDevice == DataDevice::CUDA &&
-            (moeDevice == "numa" || moeDevice.rfind("numa:", 0) == 0) &&
+            numaMoe &&
             !FastllmCudaMoeCacheRequested() &&
             !FastllmCudaGraphIsCapturing()) {
             selectExperts();
             PrefetchNumasMoeDecodeInput(
                 flattened, expertIndex, expertScore, deviceLayer);
-            selectedBeforeShared = true;
         }
 #endif
 #ifdef USE_CUDA
@@ -6257,10 +6259,7 @@ namespace fastllm {
         if (hostMoe && &moeWeights != &this->mtpMoeWeights && threadTpOwner->expertParallel &&
             batch * sequence <= FASTLLM_CUDA_MOE_CACHE_MAX_BATCH &&
             MoeCudaCacheRequested()) {
-            if (runRoutedExperts && !selectedBeforeShared) {
-                selectExperts();
-                selectedBeforeShared = true;
-            }
+            selectExperts();
             if (FastllmCudaMergeMOEExpertParallel(*threadTpOwner->expertParallel,
                     threadTpRank, flattened, expertIndex, expertScore, output,
                     moeWeights.data(), moeWeights.size(), deviceLayer,
@@ -6279,12 +6278,8 @@ namespace fastllm {
         runSharedExpert(runRoutedExperts ? sharedOutput : output);
 
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
-        if (hostMoe && batch * sequence >= kNumasMoeGpuPrefillMinRows &&
-            (moeDevice == "numa" || moeDevice.rfind("numa:", 0) == 0)) {
-            if (runRoutedExperts && !selectedBeforeShared) {
-                selectExperts();
-                selectedBeforeShared = true;
-            }
+        if (hostMoe && numaMoe && batch * sequence >= kNumasMoeGpuPrefillMinRows) {
+            selectExperts();
             // NUMA prefill launches expert workers on both TP devices. Their
             // streams share the temporary pool with the rank streams, whose
             // released intermediates may still be in use by queued kernels.
@@ -6313,9 +6308,7 @@ namespace fastllm {
             return;
         }
 #endif
-        if (!selectedBeforeShared) {
-            selectExperts();
-        }
+        selectExperts();
         const std::string outputDevice = SelectDeviceFromMap(
             this->deviceMap, deviceLayer + 1, this->block_cnt);
         bool hybridMoe = false;
@@ -6332,7 +6325,7 @@ namespace fastllm {
         // Host TP ranks own the result before reduction. Preserve the existing
         // output transfer and ownership for serial layer transitions.
         const bool writeRoutedDirectly = hostMoe || useMoeCudaCache ||
-            this->SelectMoeDeviceForLayer(deviceLayer) == outputDevice;
+            moeDevice == outputDevice;
         if (!useMoeCudaCache) {
             this->ApplyMoeDeviceMapForLayer(deviceLayer);
         }
