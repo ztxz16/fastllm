@@ -4,6 +4,7 @@
 #include "fastllm-cuda-shared-weight.cuh"
 #include "devices/cpu/cpudevice.h"
 #include "devices/cuda/cudadevice.h"
+#include "models/qwen4_exp.h"
 #ifdef USE_NUMAS
 #include "devices/numas/numasdevice.h"
 #include "devices/numas/numas.h"
@@ -46,6 +47,36 @@ static size_t ExpertRecordBytes(const fastllm::Data &gate, const fastllm::Data &
     const size_t scaleBytes = gate.dataType == fastllm::DataType::FP8_E4M3_BLOCK_128 ? 0 :
         (gate.scales.size() + down.scales.size()) * sizeof(float);
     return (scalesOffset + scaleBytes + 127) / 128 * 128;
+}
+
+static void CheckLayeredModelCache(std::vector<fastllm::Data *> &hostWeights) {
+    fastllm::Qwen4ExpModel model;
+    model.block_cnt = 2;
+    model.deviceMap = model.moeDeviceMap = {{"cuda:0", 1}};
+    model.layeredMoeDeviceMap = {{"cpu", 1}};
+    model.moeDeviceLayers = 1;
+    // The first table represents a GPU layer that must never be snapshotted.
+    std::vector<std::vector<fastllm::Data *>> layers{
+        std::vector<fastllm::Data *>(hostWeights.size(), nullptr), hostWeights};
+    int devices = 0;
+    Check(cudaGetDeviceCount(&devices));
+    devices = std::min(devices, 2);
+    for (int pass = 0; pass < 2; ++pass) {
+        Require(model.PrepareMoeCudaCache(layers), "host layer after CUDA layer not registered");
+        for (int device = 0; device < devices; ++device) {
+            Check(cudaSetDevice(device));
+            Require(model.MoeCudaCacheAvailable(layers[1]), "per-device cache unavailable");
+            Require(!model.MoeCudaCacheAvailable(layers[0]), "CUDA layer was registered");
+        }
+        model.ReleaseMoeCudaCache(layers);
+        for (int device = 0; device < devices; ++device) {
+            Check(cudaSetDevice(device));
+            Require(!model.MoeCudaCacheAvailable(layers[1]), "later host layer cache leaked");
+        }
+        Check(cudaSetDevice(0));
+    }
+    model.moeDeviceLayers = 0;
+    Require(!model.PrepareMoeCudaCache(layers), "all-CUDA placement prepared host cache");
 }
 
 template<class T>
@@ -182,6 +213,9 @@ static void Run(fastllm::DataType dtype, int hidden, int inter,
     FastllmCudaReleaseMoeCache(weights.data(), weights.size());
     Require(!supported(), "released table still registered");
     FastllmCudaReleaseMoeCache(weights.data(), weights.size());
+    if (dtype == fastllm::DataType::FLOAT32 && hidden == 128 && batch == 1) {
+        CheckLayeredModelCache(weights);
+    }
     fastllm::SetMoeCudaCacheBytes(0);
     std::printf("PASS adapter weight=%d dtype=%d hidden=%d inter=%d batch=%d, graph/eviction/release/validation\n",
                 int(weightType), int(dtype), hidden, inter, batch);

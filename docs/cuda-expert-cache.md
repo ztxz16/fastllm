@@ -63,7 +63,7 @@ eligible for CUDA Graph when the remaining graph requirements are satisfied.
 Larger batches retain the configured MoE backend. MTP draft expert tables are
 not registered with this cache and retain their separately configured placement.
 
-For supported compact NVFP4 experts assigned entirely to NUMA, preparation
+For supported compact NVFP4 host tables assigned entirely to NUMA, preparation
 copies only original E4M3/global scales, invokes the model's NUMA registration
 callback, then borrows its pinned block-16 shards. Refill restores compact GPU
 records without rounding. With the cache enabled, complete 32-row tiles place
@@ -332,6 +332,8 @@ aligned and odd widths; FP8 covers its supported layouts. Random FP8 tests
 compare gate and output bytes against the original all-resident GPU backend
 for FP16/BF16, including two layer tables, repeated expert IDs, changing inputs
 and scores, eviction and both eager execution and graph replay.
+Layered model checks exclude CUDA-resident tables, initialize per-device caches,
+and verify release/reprepare when the first registered host table is not layer 0.
 
 `test/benchmark/qwen4_tp_short_requests.py` exercises a real Qwen checkpoint
 with 512/2040-token inputs, 1/2/8-token outputs and repeated cache/MTP switches.
