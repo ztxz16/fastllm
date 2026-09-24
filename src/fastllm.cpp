@@ -376,11 +376,6 @@ namespace fastllm {
         if (useFusedGdnPrefillEnv != nullptr && std::strcmp(useFusedGdnPrefillEnv, "0") == 0) {
             this->useFusedGdnPrefill = false;
         }
-
-        const char *debugTokenIdEnv = std::getenv("FASTLLM_DEBUG_TOKEN_ID");
-        if (debugTokenIdEnv != nullptr) {
-            this->debugTokenId = debugTokenIdEnv;
-        }
     }
 
     const FastllmEnv &GetFastllmEnv() {

@@ -49,7 +49,6 @@ namespace fastllm {
         bool cudaTriton = false;
         bool useFusedTransferAttn = true;
         bool useFusedGdnPrefill = true;
-        std::string debugTokenId;
     };
 
     const FastllmEnv &GetFastllmEnv();
