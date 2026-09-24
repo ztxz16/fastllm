@@ -29695,6 +29695,45 @@ namespace fastllm {
         output.CopyFrom(joined);
     }
 
+    namespace {
+    // Independent candidates can be accumulated together without reordering
+    // the rank sum. Keep separate multiply/add rounding, as in the BF16
+    // selector reference, while allowing conversion across candidates to SIMD.
+#if defined(__GNUC__) && !defined(__clang__)
+    __attribute__((optimize("fp-contract=off")))
+#endif
+    static void Qwen35DFlashBf16Scores(
+            const uint16_t *book, const int *ids, const float *hidden,
+            float *scores, int rank, int count) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+        constexpr int block = 8;
+        int candidate = 0;
+        for (; candidate + block <= count; candidate += block) {
+            const uint16_t *rows[block];
+            float sums[block];
+            for (int j = 0; j < block; ++j) {
+                rows[j] = book + (size_t)ids[candidate + j] * rank;
+                sums[j] = scores[candidate + j];
+            }
+            for (int r = 0; r < rank; ++r) {
+                for (int j = 0; j < block; ++j)
+                    sums[j] += hidden[r] * BFloat16BitsToFloat32(rows[j][r]);
+            }
+            for (int j = 0; j < block; ++j)
+                scores[candidate + j] = sums[j];
+        }
+        for (; candidate < count; ++candidate) {
+            const uint16_t *row = book + (size_t)ids[candidate] * rank;
+            float sum = scores[candidate];
+            for (int r = 0; r < rank; ++r)
+                sum += hidden[r] * BFloat16BitsToFloat32(row[r]);
+            scores[candidate] = sum;
+        }
+    }
+    } // namespace
+
     std::vector<int> Qwen3_5Model::SelectDFlashDraftTokens(
             const float *candidateTopK, const float *selectorHidden,
             int anchorToken, const GenerationConfig &generationConfig,
@@ -29772,20 +29811,29 @@ namespace fastllm {
                     candidateToken >= 0 && candidateToken < successor.dims[0],
                     "DFlash selector candidate id is out of range.\n");
                 float score = candidateTopK[topKOffset + 1];
-                // Materialize products before the ordered reduction. This
-                // allows BF16 conversion/multiplication to be vectorized,
-                // while preserving the original per-rank addition order.
-                for (int rank = 0; rank < dflashSelectorRank; ++rank) {
-                    scoreProducts[rank] = predecessorHidden[rank] *
-                        codebookValue(successor, candidateToken, rank);
-                }
-                for (int rank = 0; rank < dflashSelectorRank; ++rank) {
-                    score += scoreProducts[rank];
+                if (successor.dataType != DataType::BFLOAT16) {
+                    // Preserve upstream's vectorizable products and ordered
+                    // reduction for the FP32 selector path.
+                    for (int rank = 0; rank < dflashSelectorRank; ++rank) {
+                        scoreProducts[rank] = predecessorHidden[rank] *
+                            codebookValue(successor, candidateToken, rank);
+                    }
+                    for (int rank = 0; rank < dflashSelectorRank; ++rank)
+                        score += scoreProducts[rank];
                 }
                 scores[candidate] = score;
                 context.proposalCandidateIds.push_back(candidateToken);
-                if (score > bestScore) {
-                    bestScore = score;
+            }
+            if (successor.dataType == DataType::BFLOAT16) {
+                Qwen35DFlashBf16Scores(
+                    (const uint16_t*)successor.cpuData,
+                    context.proposalCandidateIds.data() + (size_t)position * dflashSelectorTopK,
+                    predecessorHidden.data(), scores.data(),
+                    dflashSelectorRank, dflashSelectorTopK);
+            }
+            for (int candidate = 0; candidate < dflashSelectorTopK; ++candidate) {
+                if (scores[candidate] > bestScore) {
+                    bestScore = scores[candidate];
                     bestCandidate = candidate;
                 }
             }
