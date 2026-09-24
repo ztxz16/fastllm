@@ -21,8 +21,10 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <climits>
 #include <chrono>
+#include <condition_variable>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -763,10 +765,11 @@ OffloadGroup *FindGroup(fastllm::Data **weights, int weightsBatch,
     return group;
 }
 
-OffloadGroup *FindHybridGroup(fastllm::Data **weights, int weightsBatch) {
+OffloadGroup *FindHybridGroup(fastllm::Data **weights, int weightsBatch,
+                             int *tableId = nullptr) {
 #ifdef USE_NUMAS
     if (!FastllmCudaMoeCacheRequested()) return nullptr;
-    auto *group = FindGroup(weights, weightsBatch);
+    auto *group = FindGroup(weights, weightsBatch, tableId);
     if (!group || !group->cpuDecodeReady) return nullptr;
     const auto *backend = FindExpertCacheBackend(group->layout.weightType);
     return backend && backend->supportsHybrid(group->layout) ? group : nullptr;
@@ -1603,14 +1606,15 @@ bool EnsureCachedExperts(OffloadGroup *group, DeviceCache *cache, int tableId,
 }
 
 __global__ void LookupHybridRoutes(const int32_t *indices, const int32_t *keys,
-        const int32_t *slotKeys, int32_t *result, int base, int experts, int topk) {
+        const int32_t *slotKeys, int32_t *result, int base, int experts, int topk,
+        int resultStride = kMaxTopK) {
     const int r = threadIdx.x;
     if (r < topk) {
         const int expert = indices[r];
         const int key = base + expert;
         const int slot = expert >= 0 && expert < experts ? keys[key] : -1;
         result[r] = expert;
-        result[kMaxTopK + r] = slot >= 0 && slotKeys[slot] == key ? slot : -1;
+        result[resultStride + r] = slot >= 0 && slotKeys[slot] == key ? slot : -1;
     }
 }
 
@@ -1640,12 +1644,353 @@ __global__ void ReduceHybridExperts(const float *cpu, const float *gpu,
     output[col] = sum;
 }
 
+__global__ void ReduceExpertParallel(const float *cpu, const float *gpu,
+        const int32_t *owners, const float *scores, float *output,
+        int hidden, int topk, int rank) {
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= hidden) return;
+    const int row = blockIdx.y;
+    cpu += size_t(row) * topk * hidden;
+    gpu += size_t(row) * topk * hidden;
+    owners += row * topk;
+    scores += row * topk;
+    output += row * hidden;
+    float sum = 0;
+    for (int r = 0; r < topk; ++r) {
+        if (owners[r] == rank || (owners[r] < 0 && rank == 0)) {
+            const float value = (owners[r] < 0 ? cpu : gpu)[r * hidden + col];
+            // Preserve NUMA's fused FP32 weighted accumulation. Splitting the
+            // product and sum adds a rounding even when every route is on CPU.
+            sum = __fmaf_rn(value, scores[r], sum);
+        }
+    }
+    output[col] = sum;
+}
+
 double HybridNowUs() {
     return std::chrono::duration<double, std::micro>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 } // namespace
+
+struct FastllmCudaMoeExpertParallel {
+    static constexpr int maxRows = FASTLLM_CUDA_MOE_CACHE_MAX_BATCH;
+    static constexpr int maxRoutes = maxRows * kMaxTopK;
+    struct Rank {
+        fastllm::Data ids, selected, scores, owners, lookup, gate;
+        float *host = nullptr, *device = nullptr;
+        int32_t *routes = nullptr;
+        cudaEvent_t done = nullptr, copyStart = nullptr, copyEnd = nullptr;
+        int cudaDevice = -1, hidden = 0, rows = 0, topk = 0, table = -1;
+        bool pending = false, ready = false, admitted = false;
+        OffloadGroup *group = nullptr;
+        DeviceCache *cache = nullptr;
+        std::vector<unsigned> heat;
+        fastllm::MoeDecodeScheduler::Estimate refill;
+        uint64_t calls = 0, gpuRoutes = 0, admissions = 0;
+
+        float *CpuOutput() { return host + maxRows * hidden; }
+        float *GpuOutput() { return device + size_t(maxRoutes) * hidden; }
+        int32_t *Indices() { return routes; }
+        int32_t *Resident() { return Indices() + maxRoutes; }
+        float *Scores() { return reinterpret_cast<float *>(Resident() + maxRoutes); }
+        int32_t *Selected() { return reinterpret_cast<int32_t *>(Scores() + maxRoutes); }
+        int32_t *Owners() { return Selected() + maxRoutes; }
+
+        ~Rank() {
+            int previous = 0;
+            cudaGetDevice(&previous);
+            if (cudaDevice >= 0) cudaSetDevice(cudaDevice);
+            if (pending) cudaEventSynchronize(done);
+            ids.FreeSpace(); selected.FreeSpace(); scores.FreeSpace();
+            owners.FreeSpace(); lookup.FreeSpace(); gate.FreeSpace();
+            cudaFreeHost(host); cudaFreeHost(routes); cudaFree(device);
+            if (done) cudaEventDestroy(done);
+            if (copyStart) cudaEventDestroy(copyStart);
+            if (copyEnd) cudaEventDestroy(copyEnd);
+            cudaSetDevice(previous);
+        }
+
+        bool Prepare(int width) {
+            if (pending) {
+                checkCudaErrors("EP completion", cudaEventSynchronize(done));
+                if (admitted) {
+                    float ms = 0;
+                    checkCudaErrors("EP refill timing", cudaEventElapsedTime(&ms, copyStart, copyEnd));
+                    refill.Observe(ms * 1000);
+                }
+                pending = false;
+            }
+            // Peers read Selected() until the next routing rendezvous. Keep
+            // routing storage stable when activation workspaces change size.
+            if (!routes && cudaMallocHost(&routes, 5 * maxRoutes * sizeof(int32_t)) != cudaSuccess)
+                return false;
+            if (hidden == width && host && device && done && copyStart && copyEnd) return true;
+            cudaFreeHost(host); host = nullptr;
+            cudaFree(device); device = nullptr;
+            hidden = width;
+            return cudaMallocHost(&host, (maxRoutes + maxRows) * size_t(hidden) * sizeof(float)) == cudaSuccess &&
+                cudaMalloc(&device, 2 * maxRoutes * size_t(hidden) * sizeof(float)) == cudaSuccess &&
+                (done || cudaEventCreateWithFlags(&done, cudaEventDisableTiming) == cudaSuccess) &&
+                (copyStart || cudaEventCreate(&copyStart) == cudaSuccess) &&
+                (copyEnd || cudaEventCreate(&copyEnd) == cudaSuccess);
+        }
+    };
+
+    std::vector<std::unique_ptr<Rank>> ranks;
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::atomic<unsigned> generation{0};
+    int arrived = 0;
+    uint64_t steps = 0, cpuRoutes = 0, multiGpuSteps = 0;
+    fastllm::MoeDecodeScheduler::Estimate cpuTime;
+
+    explicit FastllmCudaMoeExpertParallel(int count) {
+        for (int r = 0; r < count; ++r) ranks.emplace_back(new Rank());
+    }
+    void Barrier() {
+        std::unique_lock<std::mutex> lock(mutex);
+        const unsigned previous = generation.load(std::memory_order_acquire);
+        if (++arrived == (int)ranks.size()) {
+            arrived = 0;
+            generation.fetch_add(1, std::memory_order_release);
+            cv.notify_all();
+        } else {
+            lock.unlock();
+            for (int spin = 0; spin < 2048; ++spin) {
+                if (generation.load(std::memory_order_acquire) != previous) return;
+#if defined(__x86_64__) || defined(__i386__)
+                __builtin_ia32_pause();
+#endif
+            }
+            lock.lock();
+            fastllm::AssertInFastLLM(cv.wait_for(lock, std::chrono::seconds(60),
+                [&] { return generation.load(std::memory_order_acquire) != previous; }),
+                "MoE expert-parallel rendezvous timed out.\n");
+        }
+    }
+};
+
+std::shared_ptr<FastllmCudaMoeExpertParallel> FastllmCudaCreateMoeExpertParallel(int ranks) {
+    return ranks > 1 ? std::make_shared<FastllmCudaMoeExpertParallel>(ranks) : nullptr;
+}
+
+FastllmCudaMoeExpertParallelStats FastllmCudaGetMoeExpertParallelStats(
+        const FastllmCudaMoeExpertParallel &state) {
+    FastllmCudaMoeExpertParallelStats result;
+    result.steps = state.steps;
+    result.cpuRoutes = state.cpuRoutes;
+    result.multiGpuSteps = state.multiGpuSteps;
+    for (const auto &rank : state.ranks) {
+        result.gpuRoutes.push_back(rank->gpuRoutes);
+        result.admissions.push_back(rank->admissions);
+    }
+    return result;
+}
+
+bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int rank,
+        const fastllm::Data &input, const fastllm::Data &index, const fastllm::Data &score,
+        fastllm::Data &output, fastllm::Data **weights, int weightsBatch, int layer,
+        const std::function<void()> &launchParallel) {
+#ifdef USE_NUMAS
+    using namespace fastllm;
+    const int count = state.ranks.size();
+    AssertInFastLLM(rank >= 0 && rank < count, "Invalid MoE EP rank.\n");
+    auto &work = *state.ranks[rank];
+    auto &root = *state.ranks[0];
+    constexpr int maxRoutes = FastllmCudaMoeExpertParallel::maxRoutes;
+    cudaStreamCaptureStatus capture;
+    int device = -1;
+    cudaGetDevice(&device);
+    work.ready = FastllmCudaMoeCacheRequested() && SupportedCacheInput(input) &&
+        input.dataType == FLOAT32 &&
+        cudaStreamIsCapturing(cudaStreamPerThread, &capture) == cudaSuccess &&
+        capture == cudaStreamCaptureStatusNone;
+    work.group = work.ready ? FindHybridGroup(weights, weightsBatch, &work.table) : nullptr;
+    work.ready = work.ready && work.group && !work.group->layout.deepSeekV41 &&
+        input.dims[1] == work.group->layout.hidden &&
+        (work.cudaDevice < 0 || work.cudaDevice == device);
+    if (work.ready) {
+        work.cudaDevice = device;
+        work.rows = input.dims[0];
+        work.ready = work.Prepare(input.dims[1]);
+    }
+    work.cache = work.ready ? GetDeviceCache(*work.group) : nullptr;
+    if (rank == 0 && work.ready) {
+        work.ready = PackedCacheRows(index) && PackedCacheRows(score) &&
+            index.dims[0] == work.rows && index.dims == score.dims &&
+            index.dims[1] > 0 && index.dims[1] <= kMaxTopK &&
+            index.dataDevice == DataDevice::CUDA && index.dataType == INT32 && index.cudaData &&
+            score.dataDevice == DataDevice::CUDA && score.dataType == FLOAT32 && score.cudaData;
+        if (work.ready) {
+            work.topk = index.dims[1];
+            const int routes = work.rows * work.topk;
+            checkCudaErrors("EP routes", cudaMemcpyAsync(work.Indices(), index.cudaData,
+                routes * sizeof(int32_t), cudaMemcpyDeviceToHost, cudaStreamPerThread));
+            checkCudaErrors("EP scores", cudaMemcpyAsync(work.Scores(), score.cudaData,
+                routes * sizeof(float), cudaMemcpyDeviceToHost, cudaStreamPerThread));
+            checkCudaErrors("EP input", cudaMemcpyAsync(work.host, input.cudaData,
+                work.rows * work.hidden * sizeof(float), cudaMemcpyDeviceToHost, cudaStreamPerThread));
+            checkCudaErrors("EP routing", cudaStreamSynchronize(cudaStreamPerThread));
+            for (int r = 0; r < routes; ++r)
+                work.ready &= work.Indices()[r] >= 0 && work.Indices()[r] < work.group->layout.experts;
+        }
+    }
+    state.Barrier();
+    bool ready = root.ready, anyCache = false;
+    for (int r = 0; r < count; ++r) {
+        const auto &other = *state.ranks[r];
+        ready &= other.ready && other.group == root.group && other.table == root.table &&
+            other.hidden == root.hidden && other.rows == root.rows;
+        anyCache |= other.cache != nullptr;
+        for (int j = 0; j < r; ++j) ready &= other.cudaDevice != state.ranks[j]->cudaDevice;
+    }
+    // A second rendezvous protects the shared validation fields from the next
+    // layer when one rank rejects before the others have inspected them.
+    if (!ready || !anyCache) { state.Barrier(); return false; }
+    const int topk = root.topk, hidden = root.hidden;
+    const int rows = root.rows, routes = rows * topk;
+    const auto &layout = root.group->layout;
+    const double cpuBudget = state.cpuTime.us;
+    auto allocate = [&](Data &tensor, DataType type, std::vector<int> shape) {
+        tensor.dataType = type;
+        tensor.Resize(shape);
+        tensor.ToDevice(DataDevice::CUDA, {device}, false);
+        tensor.Allocate(false);
+    };
+    allocate(work.ids, INT32, {rows, topk});
+    allocate(work.selected, INT32, {rows, topk});
+    allocate(work.scores, FLOAT32, {rows, topk});
+    allocate(work.owners, INT32, {rows, topk});
+    allocate(work.lookup, INT32, {2 * maxRoutes});
+    if (rank != 0) {
+        std::copy(root.Scores(), root.Scores() + routes, work.Scores());
+        std::copy(root.Indices(), root.Indices() + routes, work.Indices());
+    }
+    for (int r = 0; r < routes; ++r) {
+        work.Selected()[r] = work.Indices()[r] % count == rank ? work.Indices()[r] : -1;
+    }
+    checkCudaErrors("EP score upload", cudaMemcpyAsync(work.scores.cudaData, work.Scores(),
+        routes * sizeof(float), cudaMemcpyHostToDevice, cudaStreamPerThread));
+    int candidate = -1;
+    if (work.cache) {
+        checkCudaErrors("EP route upload", cudaMemcpyAsync(work.ids.cudaData, work.Selected(),
+            routes * sizeof(int32_t), cudaMemcpyHostToDevice, cudaStreamPerThread));
+        LookupHybridRoutes<<<1, 256, 0, cudaStreamPerThread>>>(
+            static_cast<int32_t *>(work.ids.cudaData), work.cache->keyToSlot, work.cache->slotKeys,
+            static_cast<int32_t *>(work.lookup.cudaData), work.table * layout.experts, layout.experts, routes, maxRoutes);
+        checkCudaErrors("EP residency", cudaMemcpyAsync(work.Resident(),
+            static_cast<int32_t *>(work.lookup.cudaData) + maxRoutes,
+            routes * sizeof(int32_t), cudaMemcpyDeviceToHost, cudaStreamPerThread));
+        checkCudaErrors("EP residency", cudaStreamSynchronize(cudaStreamPerThread));
+        if (work.heat.size() != work.group->totalRecords) work.heat.assign(work.group->totalRecords, 0);
+        unsigned bestHeat = 0;
+        for (int r = 0; r < routes; ++r) {
+            const int expert = work.Selected()[r];
+            if (expert < 0) continue;
+            unsigned &heat = work.heat[work.table * layout.experts + expert];
+            heat = std::min(heat + 1, 65535u);
+            if (work.Resident()[r] < 0) {
+                work.Selected()[r] = -1;
+                if (heat >= 2 && heat > bestHeat) { bestHeat = heat; candidate = r; }
+            }
+        }
+        // Prefer copies hidden by CPU work. Sparse probes still warm a cold
+        // cache when one refill costs more than the current CPU subset. A
+        // coprime interval must visit every layer, not the same few layers.
+        int interval = 31;
+        while (std::gcd(interval, int(work.group->tableKeys.size())) != 1) ++interval;
+        if (work.refill.initialized && cpuBudget > 0 && work.refill.us > cpuBudget &&
+            work.calls % interval != 0) candidate = -1;
+    } else {
+        std::fill_n(work.Selected(), routes, -1);
+    }
+    state.Barrier();
+    int cpuCount = 0, activeRanks = 0;
+    if (rank == 0) {
+        for (const auto &other : state.ranks) {
+            activeRanks += std::any_of(other->Selected(), other->Selected() + routes,
+                [](int expert) { return expert >= 0; });
+        }
+    }
+    for (int r = 0; r < routes; ++r) {
+        const int owner = work.Indices()[r] % count;
+        work.Owners()[r] = state.ranks[owner]->Selected()[r] >= 0 ? owner : -1;
+        cpuCount += work.Owners()[r] < 0;
+    }
+    allocate(output, FLOAT32, {rows, hidden});
+    checkCudaErrors("EP selected upload", cudaMemcpyAsync(work.selected.cudaData, work.Selected(),
+        routes * sizeof(int32_t), cudaMemcpyHostToDevice, cudaStreamPerThread));
+    checkCudaErrors("EP owner upload", cudaMemcpyAsync(work.owners.cudaData, work.Owners(),
+        routes * sizeof(int32_t), cudaMemcpyHostToDevice, cudaStreamPerThread));
+    const int gpuCount = std::count_if(work.Selected(), work.Selected() + routes,
+        [](int expert) { return expert >= 0; });
+    if (gpuCount) {
+        allocate(work.gate, FLOAT32, {topk, layout.inter});
+        // Snapshot residency for the entire verifier before any admission.
+        // Repeated experts consequently keep one owner across all rows and
+        // CPU rows can share weight reads in the grouped NUMA path.
+        for (int row = 0; row < rows; ++row) {
+            if (std::none_of(work.Selected() + row * topk,
+                    work.Selected() + (row + 1) * topk, [](int expert) { return expert >= 0; })) continue;
+            Data inputRow, outputRow;
+            inputRow.FakeFrom(input, size_t(row) * hidden * sizeof(float));
+            inputRow.Resize({1, hidden}); inputRow.dataDeviceIds = input.dataDeviceIds;
+            outputRow.FakeFrom(output, size_t(row) * hidden * sizeof(float));
+            outputRow.Resize({1, hidden}); outputRow.dataDeviceIds = output.dataDeviceIds;
+            AssertInFastLLM(EnsureCachedExperts(work.group, work.cache, work.table,
+                static_cast<int32_t *>(work.selected.cudaData) + row * topk, topk), "EP resident lookup failed.\n");
+            AssertInFastLLM(FindExpertCacheBackend(layout.weightType)->compute(inputRow, work.gate, outputRow,
+                layout, *work.cache, static_cast<float *>(work.scores.cudaData) + row * topk, topk,
+                work.GpuOutput() + size_t(row) * topk * hidden), "EP expert compute failed.\n");
+        }
+    }
+    work.admitted = candidate >= 0 && cpuCount > 0;
+    if (work.admitted) {
+        checkCudaErrors("EP refill start", cudaEventRecord(work.copyStart, cudaStreamPerThread));
+        BuildHybridPrefetchRoutes<<<1, 32, 0, cudaStreamPerThread>>>(
+            static_cast<int32_t *>(work.ids.cudaData) + (candidate / topk) * topk,
+            work.cache->keyToSlot, work.cache->slotKeys,
+            static_cast<int32_t *>(work.lookup.cudaData), work.table * layout.experts,
+            layout.experts, topk, candidate % topk);
+        AssertInFastLLM(EnsureCachedExperts(work.group, work.cache, work.table,
+            static_cast<int32_t *>(work.lookup.cudaData), topk), "EP cache admission failed.\n");
+        checkCudaErrors("EP refill end", cudaEventRecord(work.copyEnd, cudaStreamPerThread));
+        ++work.admissions;
+    }
+    if (launchParallel) launchParallel();
+    checkCudaErrors("EP restore device", cudaSetDevice(device));
+    if (rank == 0) {
+        const double start = HybridNowUs();
+        if (cpuCount) {
+            NumasMoeDecodeExpertsBatch(root.host, root.CpuOutput(), rows, weights, weightsBatch,
+                root.Indices(), root.Owners(), root.Scores(), topk, layer);
+            state.cpuTime.Observe(HybridNowUs() - start);
+            checkCudaErrors("EP CPU output", cudaMemcpyAsync(work.device, root.CpuOutput(),
+                size_t(routes) * hidden * sizeof(float), cudaMemcpyHostToDevice, cudaStreamPerThread));
+        }
+        ++state.steps;
+        state.cpuRoutes += cpuCount;
+        state.multiGpuSteps += activeRanks > 1;
+    }
+    ReduceExpertParallel<<<dim3((hidden + 255) / 256, rows), 256, 0, cudaStreamPerThread>>>(
+        work.device, work.GpuOutput(),
+        static_cast<int32_t *>(work.owners.cudaData), static_cast<float *>(work.scores.cudaData),
+        static_cast<float *>(output.cudaData), hidden, topk, rank);
+    checkCudaErrors("EP reduction", cudaGetLastError());
+    checkCudaErrors("EP done", cudaEventRecord(work.done, cudaStreamPerThread));
+    work.pending = true;
+    work.gpuRoutes += gpuCount;
+    ++work.calls;
+    // Each rank has its own copy of the authoritative routes. GPU decisions
+    // are overwritten only after the next call's first rendezvous, so peers
+    // may enqueue their TP collective while rank 0 finishes the CPU subset.
+    return true;
+#else
+    return false;
+#endif
+}
 
 void *FastllmCudaBeginMoeDecode(fastllm::Data **weights, int weightsBatch, int topk) {
     if (topk < 1 || topk > kMaxTopK) return nullptr;

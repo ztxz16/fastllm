@@ -6965,6 +6965,34 @@ namespace fastllm {
         }
     }
 
+    void NumasMoeDecodeExpertsBatch(const float *input, float *output, int rows,
+        Data **weights, int weightsBatch, const int32_t *indices,
+        const int32_t *gpuIndices, const float *scores, int topk, int layer) {
+        const int hidden = weights[2]->dims[1];
+        // Reuse the existing grouped NVFP4 arithmetic where supported. Other
+        // formats/CPUs retain their exact single-row activation conversion.
+        if (!CanUseNumasMoeExactSmallBatch(rows) ||
+            !IsNumasGroupedNVFP4Weight(weights[2]) ||
+            !IsNumasGroupedNVFP4Weight(weights[3])) {
+            for (int row = 0; row < rows; ++row)
+                NumasMoeDecodeExperts(input + size_t(row) * hidden,
+                    output + size_t(row) * topk * hidden, weights,
+                    indices + row * topk, gpuIndices + row * topk, topk, layer);
+            return;
+        }
+        std::unordered_set<int> cpuExperts;
+        for (int r = 0; r < rows * topk; ++r)
+            if (gpuIndices[r] < 0) cpuExperts.insert(indices[r] + 1);
+        if (cpuExperts.empty()) return;
+        Data x(FLOAT32, {rows, hidden}, DataDevice::CPU, (void *)input);
+        Data ids(INT32, {rows, topk}, DataDevice::CPU, (void *)indices);
+        Data routes(FLOAT32, {rows, topk}, DataDevice::CPU, (void *)scores);
+        Data result(FLOAT32, {rows, hidden}, DataDevice::CPU, output);
+        DoNumasMergeMOEOnCPU(x, result, ids, routes, weights, nullptr, 1.0f,
+            weightsBatch, topk, cpuExperts, GetNumasMoeRuntimeCache()[layer % 2],
+            nullptr, 0.0f, false, 128, false, output);
+    }
+
     void NumasMoeVerifyExperts(const uint16_t *input, void *output, int rows,
         Data **weights, int weightsBatch, const int32_t *indices,
         const int32_t *gpuIndices, const float *scores, int topk, int layer,

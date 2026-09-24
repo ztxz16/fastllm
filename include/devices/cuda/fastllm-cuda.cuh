@@ -1731,6 +1731,25 @@ bool FastllmCudaMergeMOEHybrid(const fastllm::Data &input,
         const fastllm::Data &index, const fastllm::Data &score,
         fastllm::Data &output, fastllm::Data **weights, int weightsBatch, int layer,
         const std::function<void()> &launchParallel = {});
+// Cooperative eager decode/verify: every TP rank calls once with the same
+// context and row count (up to FASTLLM_CUDA_MOE_CACHE_MAX_BATCH).
+// Rank 0 supplies authoritative routes and executes the single NUMA subset.
+// Each GPU computes its resident experts (expert ID modulo rank count); the
+// caller sums the returned rank-local contributions with its TP collective.
+// Rejection is collective and precedes every launchParallel callback.
+struct FastllmCudaMoeExpertParallel;
+struct FastllmCudaMoeExpertParallelStats {
+    uint64_t steps = 0, cpuRoutes = 0, multiGpuSteps = 0;
+    std::vector<uint64_t> gpuRoutes, admissions;
+};
+std::shared_ptr<FastllmCudaMoeExpertParallel> FastllmCudaCreateMoeExpertParallel(int ranks);
+// Read only between calls, after all ranks have finished expert dispatch.
+FastllmCudaMoeExpertParallelStats FastllmCudaGetMoeExpertParallelStats(
+        const FastllmCudaMoeExpertParallel &state);
+bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int rank,
+        const fastllm::Data &input, const fastllm::Data &index, const fastllm::Data &score,
+        fastllm::Data &output, fastllm::Data **weights, int weightsBatch, int layer,
+        const std::function<void()> &launchParallel = {});
 bool FastllmCudaCanRunMoeCacheSmallBatch(
         const fastllm::Data &input, const fastllm::Data &index,
         const fastllm::Data &score, fastllm::Data **weights,

@@ -69,6 +69,12 @@ namespace fastllm {
         int topk, int layer, const float *routeScores = nullptr,
         float swigluLimit = 0.0f);
 
+    // FP32 verifier subset, returning unweighted [row, route, hidden] values.
+    // An expert must have the same CPU/GPU ownership in every input row.
+    void NumasMoeDecodeExpertsBatch(const float *input, float *output, int rows,
+        Data **weights, int weightsBatch, const int32_t *indices,
+        const int32_t *gpuIndices, const float *scores, int topk, int layer);
+
     // V4.1 verifier: keep all rows for a CPU expert in one grouped GEMM.
     // perRoute returns BF16-rounded FP32 expert outputs at [row, route, hidden];
     // otherwise all routes must be on CPU and output is the usual BF16 sum.
