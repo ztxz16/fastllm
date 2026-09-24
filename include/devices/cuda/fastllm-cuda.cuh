@@ -1525,13 +1525,15 @@ bool FastllmCudaDFlashDynamicConv(
                                   int side, int blockSize,
                                   int hiddenSize, int groupSize,
                                   int kernelSize);
+bool FastllmCudaDFlashApplyRope(fastllm::Data &input,
+                                const fastllm::Data &positionIds,
+                                const fastllm::Data &ropeInvFreq);
 bool FastllmCudaDFlashPrepareQKV(
                                   const fastllm::Data &qkv,
                                   const fastllm::Data &qNormWeight,
                                   const fastllm::Data &kNormWeight,
                                   const fastllm::Data &positionIds,
-                                  const fastllm::Data &sinData,
-                                  const fastllm::Data &cosData,
+                                  const fastllm::Data &ropeInvFreq,
                                   fastllm::Data &query,
                                   fastllm::Data &key,
                                   fastllm::Data &value,
@@ -1545,8 +1547,7 @@ bool FastllmCudaDFlashMaterializeKV(
                                   const fastllm::Data &projectedKv,
                                   const fastllm::Data &kNormWeights,
                                   const fastllm::Data &positionIds,
-                                  const fastllm::Data &sinData,
-                                  const fastllm::Data &cosData,
+                                  const fastllm::Data &ropeInvFreq,
                                   fastllm::Data &output,
                                   int layers, int tokens,
                                   int kvHeads, int headDim, float eps);
@@ -1554,8 +1555,7 @@ bool FastllmCudaDFlashMaterializeKVToCache(
                                   const fastllm::Data &projectedKv,
                                   const fastllm::Data &kNormWeights,
                                   const fastllm::Data &positionIds,
-                                  const fastllm::Data &sinData,
-                                  const fastllm::Data &cosData,
+                                  const fastllm::Data &ropeInvFreq,
                                   const std::vector<fastllm::Data*> &caches,
                                   int layers, int tokens,
                                   int kvHeads, int headDim, float eps);

@@ -14997,18 +14997,80 @@ bool FastllmCudaDFlashDynamicConv(
     return true;
 }
 
+// A position-independent frequency vector preserves the former host powf
+// rounding. Evaluate only the requested positions; no context-sized table or
+// pointers that change at position-capacity boundaries are needed.
+__device__ __forceinline__ void FastllmDFlashRopeSinCos(
+        int position, float inverseFrequency, float &sine, float &cosine) {
+    const float angle = __fmul_rn((float)position, inverseFrequency);
+    double s, c;
+    sincos((double)angle, &s, &c);
+    sine = __double2float_rn(s);
+    cosine = __double2float_rn(c);
+}
+
+template <typename T>
+__global__ void FastllmDFlashApplyRopeKernel(
+        T *input, const float *positions, const float *inverseFrequency,
+        size_t pairs, int heads, int headDim) {
+    const size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= pairs) return;
+    const int halfDim = headDim / 2;
+    const int channel = index % halfDim;
+    const size_t row = index / halfDim;
+    const int position = (int)positions[row / heads];
+    float sine, cosine;
+    FastllmDFlashRopeSinCos(position, inverseFrequency[channel], sine, cosine);
+    T *values = input + row * headDim;
+    const float first = FastllmCudaValueToFloat(values[channel]);
+    const float second = FastllmCudaValueToFloat(values[channel + halfDim]);
+    values[channel] = FastllmCudaFloatToValue<T>(first * cosine - second * sine);
+    values[channel + halfDim] = FastllmCudaFloatToValue<T>(first * sine + second * cosine);
+}
+
+bool FastllmCudaDFlashApplyRope(
+        fastllm::Data &input, const fastllm::Data &positionIds,
+        const fastllm::Data &ropeInvFreq) {
+    if (input.dims.size() != 4 || input.dims[0] <= 0 || input.dims[1] <= 0 ||
+        input.dims[2] <= 0 || input.dims[3] <= 0 || input.dims[3] % 2 ||
+        positionIds.dims != std::vector<int>({input.dims[0], input.dims[1]}) ||
+        positionIds.dataType != fastllm::DataType::FLOAT32 ||
+        ropeInvFreq.dataType != fastllm::DataType::FLOAT32 ||
+        ropeInvFreq.dims != std::vector<int>({input.dims[3] / 2}) ||
+        !FastllmCudaDataHasDenseStrides(input) ||
+        !FastllmCudaDataHasDenseStrides(positionIds) ||
+        !FastllmCudaDataHasDenseStrides(ropeInvFreq) ||
+        !FastllmCudaDataCanShareDevice(input, positionIds) ||
+        !FastllmCudaDataCanShareDevice(input, ropeInvFreq)) return false;
+    int device = -1;
+    if (!FastllmCudaResolveDataDeviceId(input, device) ||
+        FastllmCudaGetDevice() != device) return false;
+    const size_t pairs = (size_t)input.dims[0] * input.dims[1] * input.dims[2] * (input.dims[3] / 2);
+    const unsigned int blocks = (unsigned int)((pairs + 255) / 256);
+#define DFLASH_APPLY_ROPE(TYPE) FastllmDFlashApplyRopeKernel<TYPE><<<blocks, 256, 0, cudaStreamPerThread>>>( \
+        (TYPE*)input.cudaData, (const float*)positionIds.cudaData, (const float*)ropeInvFreq.cudaData, \
+        pairs, input.dims[2], input.dims[3])
+    if (input.dataType == fastllm::DataType::BFLOAT16) { DFLASH_APPLY_ROPE(__nv_bfloat16); }
+    else if (input.dataType == fastllm::DataType::FLOAT16) { DFLASH_APPLY_ROPE(half); }
+    else if (input.dataType == fastllm::DataType::FLOAT32) { DFLASH_APPLY_ROPE(float); }
+    else return false;
+#undef DFLASH_APPLY_ROPE
+    cudaError_t state = cudaPeekAtLastError();
+    if (state != cudaSuccess) { cudaGetLastError(); return false; }
+    return true;
+}
+
 __global__ void FastllmDFlashPrepareQkvBf16Kernel(
         const __nv_bfloat16 *__restrict__ qkv,
         const float *__restrict__ qNormWeight,
         const float *__restrict__ kNormWeight,
         const float *__restrict__ positionIds,
-        const float *__restrict__ sinData,
-        const float *__restrict__ cosData,
+        const float *__restrict__ ropeInvFreq,
         half *__restrict__ query,
         half *__restrict__ key,
         half *__restrict__ value,
         int tokens, int projectionStride, int queryHeads,
-        int kvHeads, int headDim, int sinCosStride, float eps) {
+        int kvHeads, int headDim, float eps) {
     const int outputHead = blockIdx.x / tokens;
     const int token = blockIdx.x % tokens;
     int kind;
@@ -15089,9 +15151,8 @@ __global__ void FastllmDFlashPrepareQkvBf16Kernel(
     const int halfHeadDim = headDim / 2;
     if (tid < halfHeadDim) {
         const int position = (int)positionIds[token];
-        const float sine = sinData[(size_t)position * sinCosStride + tid];
-        const float cosine =
-            cosData[(size_t)position * sinCosStride + tid];
+        float sine, cosine;
+        FastllmDFlashRopeSinCos(position, ropeInvFreq[tid], sine, cosine);
         const float first = __bfloat162float(normalized[tid]);
         const float second =
             __bfloat162float(normalized[tid + halfHeadDim]);
@@ -15111,8 +15172,7 @@ bool FastllmCudaDFlashPrepareQKV(
         const fastllm::Data &qNormWeight,
         const fastllm::Data &kNormWeight,
         const fastllm::Data &positionIds,
-        const fastllm::Data &sinData,
-        const fastllm::Data &cosData,
+        const fastllm::Data &ropeInvFreq,
         fastllm::Data &query,
         fastllm::Data &key,
         fastllm::Data &value,
@@ -15122,8 +15182,7 @@ bool FastllmCudaDFlashPrepareQKV(
         qNormWeight.dataType != fastllm::DataType::FLOAT32 ||
         kNormWeight.dataType != fastllm::DataType::FLOAT32 ||
         positionIds.dataType != fastllm::DataType::FLOAT32 ||
-        sinData.dataType != fastllm::DataType::FLOAT32 ||
-        cosData.dataType != fastllm::DataType::FLOAT32 ||
+        ropeInvFreq.dataType != fastllm::DataType::FLOAT32 ||
         query.dataType != fastllm::DataType::FLOAT16 ||
         key.dataType != fastllm::DataType::FLOAT16 ||
         value.dataType != fastllm::DataType::FLOAT16 ||
@@ -15132,8 +15191,7 @@ bool FastllmCudaDFlashPrepareQKV(
         qNormWeight.dims != std::vector<int>({headDim}) ||
         kNormWeight.dims != std::vector<int>({headDim}) ||
         positionIds.dims != std::vector<int>({1, tokens}) ||
-        sinData.dims.size() != 2 || cosData.dims != sinData.dims ||
-        sinData.dims[1] < headDim ||
+        ropeInvFreq.dims != std::vector<int>({headDim / 2}) ||
         query.dims != std::vector<int>({queryHeads, tokens, headDim}) ||
         key.dims != std::vector<int>({kvHeads, tokens, headDim}) ||
         value.dims != std::vector<int>({kvHeads, tokens, headDim}) ||
@@ -15141,16 +15199,14 @@ bool FastllmCudaDFlashPrepareQKV(
         !FastllmCudaDataHasDenseStrides(qNormWeight) ||
         !FastllmCudaDataHasDenseStrides(kNormWeight) ||
         !FastllmCudaDataHasDenseStrides(positionIds) ||
-        !FastllmCudaDataHasDenseStrides(sinData) ||
-        !FastllmCudaDataHasDenseStrides(cosData) ||
+        !FastllmCudaDataHasDenseStrides(ropeInvFreq) ||
         !FastllmCudaDataHasDenseStrides(query) ||
         !FastllmCudaDataHasDenseStrides(key) ||
         !FastllmCudaDataHasDenseStrides(value) ||
         !FastllmCudaDataCanShareDevice(qkv, qNormWeight) ||
         !FastllmCudaDataCanShareDevice(qkv, kNormWeight) ||
         !FastllmCudaDataCanShareDevice(qkv, positionIds) ||
-        !FastllmCudaDataCanShareDevice(qkv, sinData) ||
-        !FastllmCudaDataCanShareDevice(qkv, cosData) ||
+        !FastllmCudaDataCanShareDevice(qkv, ropeInvFreq) ||
         !FastllmCudaDataCanShareDevice(qkv, query) ||
         !FastllmCudaDataCanShareDevice(qkv, key) ||
         !FastllmCudaDataCanShareDevice(qkv, value)) {
@@ -15169,12 +15225,11 @@ bool FastllmCudaDFlashPrepareQKV(
             (const float *)qNormWeight.cudaData,
             (const float *)kNormWeight.cudaData,
             (const float *)positionIds.cudaData,
-            (const float *)sinData.cudaData,
-            (const float *)cosData.cudaData,
+            (const float *)ropeInvFreq.cudaData,
             (half *)query.cudaData, (half *)key.cudaData,
             (half *)value.cudaData,
             tokens, qkv.dims[2], queryHeads, kvHeads, headDim,
-            sinData.dims[1], eps);
+            eps);
     cudaError_t state = cudaPeekAtLastError();
     if (state != cudaSuccess) {
         cudaGetLastError();
@@ -15258,12 +15313,11 @@ __global__ void FastllmDFlashMaterializeKvBf16Kernel(
         const __nv_bfloat16 *__restrict__ projectedKv,
         const float *__restrict__ kNormWeights,
         const float *__restrict__ positionIds,
-        const float *__restrict__ sinData,
-        const float *__restrict__ cosData,
+        const float *__restrict__ ropeInvFreq,
         half *__restrict__ output,
         FastllmDFlashKvCacheOutput cacheOutput,
         int tokens, int projectionStride, int kvHeads,
-        int headDim, int sinCosStride, float eps) {
+        int headDim, float eps) {
     int item = blockIdx.x;
     int kind = item & 1;
     item >>= 1;
@@ -15345,8 +15399,8 @@ __global__ void FastllmDFlashMaterializeKvBf16Kernel(
     const int halfHeadDim = headDim / 2;
     if (tid < halfHeadDim) {
         const int position = (int)positionIds[token];
-        const float sine = sinData[(size_t)position * sinCosStride + tid];
-        const float cosine = cosData[(size_t)position * sinCosStride + tid];
+        float sine, cosine;
+        FastllmDFlashRopeSinCos(position, ropeInvFreq[tid], sine, cosine);
         const float first = __bfloat162float(normalized[tid]);
         const float second =
             __bfloat162float(normalized[tid + halfHeadDim]);
@@ -15365,16 +15419,14 @@ bool FastllmCudaDFlashMaterializeKV(
         const fastllm::Data &projectedKv,
         const fastllm::Data &kNormWeights,
         const fastllm::Data &positionIds,
-        const fastllm::Data &sinData,
-        const fastllm::Data &cosData,
+        const fastllm::Data &ropeInvFreq,
         fastllm::Data &output,
         int layers, int tokens, int kvHeads, int headDim, float eps) {
     if (layers <= 0 || tokens <= 0 || kvHeads <= 0 || headDim != 128 ||
         projectedKv.dataType != fastllm::DataType::BFLOAT16 ||
         kNormWeights.dataType != fastllm::DataType::FLOAT32 ||
         positionIds.dataType != fastllm::DataType::FLOAT32 ||
-        sinData.dataType != fastllm::DataType::FLOAT32 ||
-        cosData.dataType != fastllm::DataType::FLOAT32 ||
+        ropeInvFreq.dataType != fastllm::DataType::FLOAT32 ||
         output.dataType != fastllm::DataType::FLOAT16 ||
         projectedKv.dims.size() != 3 || projectedKv.dims[0] != 1 ||
         projectedKv.dims[1] < tokens ||
@@ -15382,20 +15434,17 @@ bool FastllmCudaDFlashMaterializeKV(
         kNormWeights.dims != std::vector<int>({layers, headDim}) ||
         positionIds.dims.size() != 2 || positionIds.dims[0] != 1 ||
         positionIds.dims[1] < tokens ||
-        sinData.dims.size() != 2 || cosData.dims != sinData.dims ||
-        sinData.dims[1] < headDim ||
+        ropeInvFreq.dims != std::vector<int>({headDim / 2}) ||
         output.dims !=
             std::vector<int>({layers, 2, kvHeads, tokens, headDim}) ||
         !FastllmCudaDataHasDenseStrides(projectedKv) ||
         !FastllmCudaDataHasDenseStrides(kNormWeights) ||
         !FastllmCudaDataHasDenseStrides(positionIds) ||
-        !FastllmCudaDataHasDenseStrides(sinData) ||
-        !FastllmCudaDataHasDenseStrides(cosData) ||
+        !FastllmCudaDataHasDenseStrides(ropeInvFreq) ||
         !FastllmCudaDataHasDenseStrides(output) ||
         !FastllmCudaDataCanShareDevice(projectedKv, kNormWeights) ||
         !FastllmCudaDataCanShareDevice(projectedKv, positionIds) ||
-        !FastllmCudaDataCanShareDevice(projectedKv, sinData) ||
-        !FastllmCudaDataCanShareDevice(projectedKv, cosData) ||
+        !FastllmCudaDataCanShareDevice(projectedKv, ropeInvFreq) ||
         !FastllmCudaDataCanShareDevice(projectedKv, output)) {
         return false;
     }
@@ -15412,11 +15461,10 @@ bool FastllmCudaDFlashMaterializeKV(
             (const __nv_bfloat16 *)projectedKv.cudaData,
             (const float *)kNormWeights.cudaData,
             (const float *)positionIds.cudaData,
-            (const float *)sinData.cudaData,
-            (const float *)cosData.cudaData,
+            (const float *)ropeInvFreq.cudaData,
             (half *)output.cudaData, cacheOutput,
             tokens, projectedKv.dims[2], kvHeads, headDim,
-            sinData.dims[1], eps);
+            eps);
     cudaError_t state = cudaPeekAtLastError();
     if (state != cudaSuccess) {
         cudaGetLastError();
@@ -15429,8 +15477,7 @@ bool FastllmCudaDFlashMaterializeKVToCache(
         const fastllm::Data &projectedKv,
         const fastllm::Data &kNormWeights,
         const fastllm::Data &positionIds,
-        const fastllm::Data &sinData,
-        const fastllm::Data &cosData,
+        const fastllm::Data &ropeInvFreq,
         const std::vector<fastllm::Data*> &caches,
         int layers, int tokens, int kvHeads, int headDim, float eps) {
     if (layers != 5 || tokens <= 0 || kvHeads <= 0 || headDim != 128 ||
@@ -15438,21 +15485,18 @@ bool FastllmCudaDFlashMaterializeKVToCache(
         projectedKv.dataType != fastllm::DataType::BFLOAT16 ||
         kNormWeights.dataType != fastllm::DataType::FLOAT32 ||
         positionIds.dataType != fastllm::DataType::FLOAT32 ||
-        sinData.dataType != fastllm::DataType::FLOAT32 ||
-        cosData.dataType != fastllm::DataType::FLOAT32 ||
+        ropeInvFreq.dataType != fastllm::DataType::FLOAT32 ||
         projectedKv.dims.size() != 3 || projectedKv.dims[0] != 1 ||
         projectedKv.dims[1] < tokens ||
         projectedKv.dims[2] != layers * 2 * kvHeads * headDim ||
         kNormWeights.dims != std::vector<int>({layers, headDim}) ||
         positionIds.dims.size() != 2 || positionIds.dims[0] != 1 ||
         positionIds.dims[1] < tokens ||
-        sinData.dims.size() != 2 || cosData.dims != sinData.dims ||
-        sinData.dims[1] < headDim ||
+        ropeInvFreq.dims != std::vector<int>({headDim / 2}) ||
         !FastllmCudaDataHasDenseStrides(projectedKv) ||
         !FastllmCudaDataHasDenseStrides(kNormWeights) ||
         !FastllmCudaDataHasDenseStrides(positionIds) ||
-        !FastllmCudaDataHasDenseStrides(sinData) ||
-        !FastllmCudaDataHasDenseStrides(cosData)) {
+        !FastllmCudaDataHasDenseStrides(ropeInvFreq)) {
         return false;
     }
     int device = -1;
@@ -15460,8 +15504,7 @@ bool FastllmCudaDFlashMaterializeKVToCache(
         FastllmCudaGetDevice() != device ||
         !FastllmCudaDataCanShareDevice(projectedKv, kNormWeights) ||
         !FastllmCudaDataCanShareDevice(projectedKv, positionIds) ||
-        !FastllmCudaDataCanShareDevice(projectedKv, sinData) ||
-        !FastllmCudaDataCanShareDevice(projectedKv, cosData)) {
+        !FastllmCudaDataCanShareDevice(projectedKv, ropeInvFreq)) {
         return false;
     }
 
@@ -15505,11 +15548,10 @@ bool FastllmCudaDFlashMaterializeKVToCache(
             (const __nv_bfloat16 *)projectedKv.cudaData,
             (const float *)kNormWeights.cudaData,
             (const float *)positionIds.cudaData,
-            (const float *)sinData.cudaData,
-            (const float *)cosData.cudaData,
+            (const float *)ropeInvFreq.cudaData,
             nullptr, cacheOutput,
             tokens, projectedKv.dims[2], kvHeads, headDim,
-            sinData.dims[1], eps);
+            eps);
     cudaError_t state = cudaPeekAtLastError();
     if (state != cudaSuccess) {
         cudaGetLastError();

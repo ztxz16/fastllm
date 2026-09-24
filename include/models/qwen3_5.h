@@ -435,9 +435,8 @@ namespace fastllm {
         float dflashRmsNormEps = 1e-6f;
         float dflashRopeTheta = 10000000.0f;
         std::vector <int> dflashTargetLayerIds;
-        Data dflashSinData;
-        Data dflashCosData;
-        int dflashRotaryCapacity = 0;
+        Data dflashRopeInvFreq;
+        float dflashRopeInvFreqTheta = 0.0f;
 
         void SplitFusedMoeWeightsIfNeeded(const std::string &layerPrefix);
         void PrepareMoeWeights();
@@ -516,7 +515,7 @@ namespace fastllm {
                 const float *candidateTopK, const float *selectorHidden,
                 int anchorToken, const GenerationConfig &generationConfig,
                 DFlashContext &context);
-        void EnsureDFlashRotary(int positions, int device);
+        void PrepareDFlashRotary(int device);
         void AppendDFlashTargetHidden(int device, int tokens,
                                       DFlashContext &context);
         std::vector<int> RunDFlashDraft(int device,

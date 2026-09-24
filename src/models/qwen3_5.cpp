@@ -9668,9 +9668,7 @@ namespace fastllm {
             }
             if (deviceId == devices.front()) {
                 reserveBytes += largestFallbackSource;
-                const int rotaryPositions = std::min(max_positions, 4096);
-                reserveBytes += (long long)rotaryPositions * dflashHeadDim *
-                                2LL * (long long)sizeof(float);
+                reserveBytes += (long long)(dflashHeadDim / 2) * sizeof(float);
             }
         }
         return reserveBytes;
@@ -9736,8 +9734,8 @@ namespace fastllm {
                 !devices.empty()) {
                 int device = devices[0];
                 PrepareDFlashWeightsForDevice(device);
-                EnsureDFlashRotary(std::min(max_positions, 4096), device);
-                printf("[Qwen3.5 DFlash2] warmup: weights and rotary table on cuda:%d.\n",
+                PrepareDFlashRotary(device);
+                printf("[Qwen3.5 DFlash2] warmup: weights and RoPE frequencies on cuda:%d.\n",
                        device);
                 fflush(stdout);
             }
@@ -29290,47 +29288,30 @@ namespace fastllm {
 #endif
     }
 
-    void Qwen3_5Model::EnsureDFlashRotary(int positions, int device) {
+    void Qwen3_5Model::PrepareDFlashRotary(int device) {
 #ifdef USE_CUDA
-        if (positions <= dflashRotaryCapacity &&
-            dflashSinData.dataDevice == DataDevice::CUDA &&
-            !dflashSinData.dataDeviceIds.empty() &&
-            dflashSinData.dataDeviceIds[0] == device) {
-            return;
-        }
-        int capacity = std::max(4096, dflashRotaryCapacity);
-        while (capacity < positions) {
-            capacity = std::max(capacity + 1, capacity * 2);
-            AssertInFastLLM(capacity <= max_positions ||
-                                positions <= max_positions,
-                            "DFlash position exceeds the target context window.");
-        }
-        std::vector<float> sinValues(
-            (size_t)capacity * dflashHeadDim, 0.0f);
-        std::vector<float> cosValues(
-            (size_t)capacity * dflashHeadDim, 0.0f);
-        for (int position = 0; position < capacity; position++) {
-            for (int channel = 0; channel < dflashHeadDim / 2; channel++) {
-                const int sourceChannel = channel * 2;
-                float inverseFrequency = 1.0f / std::pow(
-                    dflashRopeTheta,
-                    (float)sourceChannel / (float)dflashHeadDim);
-                float angle = (float)position * inverseFrequency;
-                sinValues[(size_t)position * dflashHeadDim + channel] =
-                    std::sin(angle);
-                cosValues[(size_t)position * dflashHeadDim + channel] =
-                    std::cos(angle);
+        // Frequencies are independent of position. Keep the host powf rounding
+        // of the original implementation, but never allocate a position table.
+        const int halfDim = dflashHeadDim / 2;
+        AssertInFastLLM(dflashHeadDim > 0 && dflashHeadDim % 2 == 0 &&
+                           std::isfinite(dflashRopeTheta) && dflashRopeTheta > 0.0f,
+                       "Invalid DFlash RoPE parameters.\n");
+        if (dflashRopeInvFreq.dims != std::vector<int>({halfDim}) ||
+            dflashRopeInvFreqTheta != dflashRopeTheta) {
+            std::vector<float> frequencies(halfDim);
+            for (int channel = 0; channel < halfDim; ++channel) {
+                frequencies[channel] = 1.0f / std::pow(
+                    dflashRopeTheta, (float)(channel * 2) / (float)dflashHeadDim);
             }
+            dflashRopeInvFreq.CopyFrom(Data(
+                DataType::FLOAT32, {halfDim}, frequencies));
+            dflashRopeInvFreqTheta = dflashRopeTheta;
         }
-        dflashSinData.CopyFrom(Data(
-            DataType::FLOAT32, {capacity, dflashHeadDim}, sinValues));
-        dflashCosData.CopyFrom(Data(
-            DataType::FLOAT32, {capacity, dflashHeadDim}, cosValues));
-        dflashSinData.ToDevice(DataDevice::CUDA, {device}, true);
-        dflashCosData.ToDevice(DataDevice::CUDA, {device}, true);
-        dflashRotaryCapacity = capacity;
+        if (dflashRopeInvFreq.dataDevice != DataDevice::CUDA ||
+            dflashRopeInvFreq.dataDeviceIds != std::vector<int>({device})) {
+            dflashRopeInvFreq.ToDevice(DataDevice::CUDA, {device}, true);
+        }
 #else
-        (void)positions;
         (void)device;
 #endif
     }
@@ -29452,7 +29433,9 @@ namespace fastllm {
                 dflashRmsNormEps, projectedContextHidden);
 
         const int startPosition = context.committedTokens;
-        EnsureDFlashRotary(startPosition + tokens, device);
+        AssertInFastLLM(startPosition >= 0 && tokens <= max_positions - startPosition,
+                       "DFlash context exceeds the target position limit.\n");
+        PrepareDFlashRotary(device);
         std::vector<float> positionValues(tokens);
         for (int token = 0; token < tokens; token++) {
             positionValues[token] = (float)(startPosition + token);
@@ -29512,7 +29495,7 @@ namespace fastllm {
             directKvMaterialized =
                 FastllmCudaDFlashMaterializeKVToCache(
                     projectedAllKv, allKNormIt->second, positions,
-                    dflashSinData, dflashCosData, caches,
+                    dflashRopeInvFreq, caches,
                     dflashLayers, tokens, dflashKvHeads,
                     dflashHeadDim, dflashRmsNormEps);
             if (directKvMaterialized) {
@@ -29536,7 +29519,7 @@ namespace fastllm {
             materializedKv.Allocate(false);
             fusedKvMaterialized = FastllmCudaDFlashMaterializeKV(
                 projectedAllKv, allKNormIt->second, positions,
-                dflashSinData, dflashCosData, materializedKv,
+                dflashRopeInvFreq, materializedKv,
                 dflashLayers, tokens, dflashKvHeads, dflashHeadDim,
                 dflashRmsNormEps);
         }
@@ -29616,8 +29599,8 @@ namespace fastllm {
                 RMSNorm(key,
                         weight[prefix + "self_attn.k_norm.weight"],
                         dflashRmsNormEps, key);
-                LlamaRotatePosition2D(key, positions, dflashSinData,
-                                      dflashCosData, dflashHeadDim);
+                AssertInFastLLM(FastllmCudaDFlashApplyRope(key, positions, dflashRopeInvFreq),
+                                      "DFlash RoPE input is unsupported.\n");
                 PermuteSelf(key, {0, 2, 1, 3});
                 PermuteSelf(value, {0, 2, 1, 3});
                 key.Reshape({dflashKvHeads, tokens, dflashHeadDim});
@@ -30003,7 +29986,7 @@ namespace fastllm {
         const int cacheAllocationUnit =
             Qwen35DFlashCacheAllocationUnit(
                 dflashSlidingWindow, blockSize);
-        EnsureDFlashRotary(context.committedTokens + blockSize, device);
+        PrepareDFlashRotary(device);
 
         std::vector<float> tokenValues(blockSize,
                                        (float)dflashMaskTokenId);
@@ -30167,7 +30150,7 @@ namespace fastllm {
                         mergedQkv,
                         weight[prefix + "self_attn.q_norm.weight"],
                         weight[prefix + "self_attn.k_norm.weight"],
-                        positions, dflashSinData, dflashCosData,
+                        positions, dflashRopeInvFreq,
                         query, key, value, blockSize, dflashHeads,
                         dflashKvHeads, dflashHeadDim, dflashRmsNormEps);
                     if (!fusedQkvPrepared) {
@@ -30210,10 +30193,10 @@ namespace fastllm {
                 RMSNorm(key,
                         weight[prefix + "self_attn.k_norm.weight"],
                         dflashRmsNormEps, key);
-                LlamaRotatePosition2D(query, positions, dflashSinData,
-                                      dflashCosData, dflashHeadDim);
-                LlamaRotatePosition2D(key, positions, dflashSinData,
-                                      dflashCosData, dflashHeadDim);
+                AssertInFastLLM(FastllmCudaDFlashApplyRope(query, positions, dflashRopeInvFreq),
+                                      "DFlash RoPE input is unsupported.\n");
+                AssertInFastLLM(FastllmCudaDFlashApplyRope(key, positions, dflashRopeInvFreq),
+                                      "DFlash RoPE input is unsupported.\n");
                 PermuteSelf(query, {0, 2, 1, 3});
                 PermuteSelf(key, {0, 2, 1, 3});
                 PermuteSelf(value, {0, 2, 1, 3});
@@ -30761,7 +30744,6 @@ namespace fastllm {
         const int totalTokens = batch * blockSize;
         const int cacheAllocationUnit = Qwen35DFlashCacheAllocationUnit(
             dflashSlidingWindow, blockSize);
-        int maxRotaryPosition = 0;
         std::vector<int> cachedTokens(batch), cacheStarts(batch);
         for (int b = 0; b < batch; ++b) {
             AssertInFastLLM(
@@ -30775,14 +30757,12 @@ namespace fastllm {
                 contexts[b]->draftKeyValues[0].first.dims.size() == 3 ?
                     contexts[b]->draftKeyValues[0].first.dims[1] : 0;
             cacheStarts[b] = contexts[b]->committedTokens - cachedTokens[b];
-            maxRotaryPosition = std::max(
-                maxRotaryPosition, contexts[b]->committedTokens + blockSize);
         }
 
         Qwen35ScopedGenericExecutor executor(
             "cuda:" + std::to_string(device));
         FastllmCudaSetDevice(device);
-        EnsureDFlashRotary(maxRotaryPosition, device);
+        PrepareDFlashRotary(device);
 
         std::vector<float> tokenValues(totalTokens,
                                        (float)dflashMaskTokenId);
@@ -30943,7 +30923,7 @@ namespace fastllm {
                         mergedQkv,
                         weight[prefix + "self_attn.q_norm.weight"],
                         weight[prefix + "self_attn.k_norm.weight"],
-                        positions, dflashSinData, dflashCosData,
+                        positions, dflashRopeInvFreq,
                         query, key, value, totalTokens, dflashHeads,
                         dflashKvHeads, dflashHeadDim, dflashRmsNormEps);
                     if (!fusedQkvPrepared) {
@@ -30986,10 +30966,10 @@ namespace fastllm {
                 RMSNorm(key,
                         weight[prefix + "self_attn.k_norm.weight"],
                         dflashRmsNormEps, key);
-                LlamaRotatePosition2D(query, positions, dflashSinData,
-                                      dflashCosData, dflashHeadDim);
-                LlamaRotatePosition2D(key, positions, dflashSinData,
-                                      dflashCosData, dflashHeadDim);
+                AssertInFastLLM(FastllmCudaDFlashApplyRope(query, positions, dflashRopeInvFreq),
+                                      "DFlash RoPE input is unsupported.\n");
+                AssertInFastLLM(FastllmCudaDFlashApplyRope(key, positions, dflashRopeInvFreq),
+                                      "DFlash RoPE input is unsupported.\n");
                 PermuteSelf(query, {0, 2, 1, 3});
                 PermuteSelf(key, {0, 2, 1, 3});
                 PermuteSelf(value, {0, 2, 1, 3});
