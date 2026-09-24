@@ -20953,7 +20953,89 @@ static bool LaunchFastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedHalfWar
     return true;
 }
 
-template <int TILE_V, bool RESTORE = false>
+// Keep the same two-warp reduction order as the fused sequence kernel.
+// Prepared values stay FP32; state rounding still occurs after every token.
+__global__ void FastllmGdnSequencePrepare128Kernel(
+    const half *conv, const half *ba, const float *norm,
+    const float *aLog, const float *dtBias, float *qk, float *coeff,
+    int seqLen, int numKHeads, int numVHeads, int headVDim, float eps) {
+    const int head = blockIdx.x, token = blockIdx.y, batch = blockIdx.z;
+    const int tid = threadIdx.x, lane = tid & 31;
+    constexpr int headKDim = 128;
+    const int channels = 2 * numKHeads * headKDim + numVHeads * headVDim;
+    const half *row = conv + ((size_t)batch * seqLen + token) * channels;
+    const float2 q = __half22float2(
+        reinterpret_cast<const half2*>(row + head * headKDim)[tid]);
+    const float2 k = __half22float2(
+        reinterpret_cast<const half2*>(row + (numKHeads + head) * headKDim)[tid]);
+    float qSum = q.x * q.x + q.y * q.y;
+    float kSum = k.x * k.x + k.y * k.y;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        qSum += __shfl_down_sync(0xffffffff, qSum, offset);
+        kSum += __shfl_down_sync(0xffffffff, kSum, offset);
+    }
+    __shared__ float sums[4];
+    if (lane == 0) {
+        sums[tid >> 5] = qSum;
+        sums[2 + (tid >> 5)] = kSum;
+    }
+    __syncthreads();
+    const float qScale = rsqrtf((sums[0] + sums[1]) / headKDim + eps);
+    const float kScale = rsqrtf((sums[2] + sums[3]) / headKDim + eps);
+    const float w0 = __ldg(norm + tid * 2), w1 = __ldg(norm + tid * 2 + 1);
+    float *dst = qk +
+        (((size_t)batch * seqLen + token) * numKHeads + head) * 2 * headKDim;
+    dst[tid * 2] = q.x * qScale * w0;
+    dst[tid * 2 + 1] = q.y * qScale * w1;
+    dst[headKDim + tid * 2] = k.x * kScale * w0;
+    dst[headKDim + tid * 2 + 1] = k.y * kScale * w1;
+    const int group = numVHeads / numKHeads;
+    for (int index = tid; index < group; index += 64) {
+        const int valueHead = head * group + index;
+        const half *input = ba + ((size_t)batch * seqLen + token) * numVHeads * 2;
+        const float bRaw = __half2float(input[valueHead]);
+        const float aRaw = __half2float(input[numVHeads + valueHead]);
+        const float gRaw = -__expf(aLog[valueHead]) *
+            softplus_fast(aRaw + dtBias[valueHead]);
+        float *output = coeff +
+            (((size_t)batch * seqLen + token) * numVHeads + valueHead) * 2;
+        output[0] = 1.0f / (1.0f + __expf(-bRaw));
+        output[1] = __expf(gRaw);
+    }
+}
+
+static float *FastllmGdnSequencePrepareScratch(int device, size_t count) {
+    struct Scratch {
+        void *data = nullptr;
+        size_t bytes = 0;
+        int device = -1;
+        ~Scratch() {
+            if (data == nullptr) return;
+            int previous = 0;
+            cudaGetDevice(&previous);
+            cudaSetDevice(device);
+            FastllmCudaFree(data);
+            cudaSetDevice(previous);
+        }
+    };
+    // Each worker launches on its own per-thread default stream. Reusing this
+    // workspace between layers is safe there; graph scopes retain the old path.
+    static thread_local std::map<int, Scratch> scratches;
+    Scratch &scratch = scratches[device];
+    const size_t bytes = count * sizeof(float);
+    if (scratch.bytes < bytes) {
+        if (scratch.data != nullptr) {
+            FastllmCudaSyncCurrentThreadStream();
+            FastllmCudaFree(scratch.data);
+        }
+        scratch.data = FastllmCudaMalloc(bytes);
+        scratch.bytes = scratch.data == nullptr ? 0 : bytes;
+        scratch.device = device;
+    }
+    return (float*)scratch.data;
+}
+
+template <int TILE_V, bool RESTORE = false, bool PREPARED = false>
 __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWarpKernel(
     const half *convOutput,
     const half *ba,
@@ -20967,7 +21049,8 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
     half *snap0, half *snap1, half *snap2, half *snap3, half *snap4,
     half *snap5, half *snap6,
     half **snapshotPointers, int numSnaps,
-    void **prefixLengths = nullptr, half **initialStates = nullptr) {
+    void **prefixLengths = nullptr, half **initialStates = nullptr,
+    const float *preparedQk = nullptr, const float *preparedBa = nullptr) {
     int head_idx = blockIdx.x;
     int v_base = blockIdx.y * TILE_V;
     if (head_idx >= numVHeads || v_base >= headVDim) {
@@ -21005,76 +21088,92 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
     const half *initialRow = RESTORE ?
         initialStates[batchIndex] + stateHeadBase + (size_t)v_col * headKDim : state_row;
 
-    // Normalize the short sequence together. Once these shared values are
-    // ready, each warp owns its state row and needs no block-wide barriers
-    // between recurrent steps.
-    for (int token = tid / 64; token < restoreLen; token += blockDim.x / 64) {
-        int convBase = (batchIndex * seqLen + token) * qkvDim;
-        int qOffset = convBase + qHead * headKDim;
-        int kOffset = convBase + numKHeads * headKDim + qHead * headKDim;
-        int normTid = tid % 64;
-        const half2 *q_h2 = reinterpret_cast<const half2*>(convOutput + qOffset);
-        const half2 *k_h2 = reinterpret_cast<const half2*>(convOutput + kOffset);
-        half2 qh = q_h2[normTid];
-        half2 kh = k_h2[normTid];
-        float2 qf = __half22float2(qh);
-        float2 kf = __half22float2(kh);
-        float q_sum2 = qf.x * qf.x + qf.y * qf.y;
-        float k_sum2 = kf.x * kf.x + kf.y * kf.y;
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            q_sum2 += __shfl_down_sync(0xffffffff, q_sum2, offset);
-            k_sum2 += __shfl_down_sync(0xffffffff, k_sum2, offset);
+    // The batched eager path prepares each Q/K head once instead of repeating
+    // its normalization and gate activations in every V-state tile. The
+    // existing path remains available for single requests, restore and graphs.
+    const float *qValues = q_norm;
+    const float *kValues = k_norm;
+    const float *gateValues = ba_values;
+    const int qTokenStride = PREPARED ? numKHeads * 2 * headKDim : headKDim;
+    const int gateTokenStride = PREPARED ? numVHeads * 2 : 2;
+    if constexpr (PREPARED) {
+        qValues = preparedQk +
+            ((size_t)batchIndex * seqLen * numKHeads + qHead) * 2 * headKDim;
+        kValues = qValues + headKDim;
+        gateValues = preparedBa +
+            ((size_t)batchIndex * seqLen * numVHeads + head_idx) * 2;
+    } else {
+        // Normalize the short sequence together. Once these shared values are
+        // ready, each warp owns its state row and needs no block-wide barriers
+        // between recurrent steps.
+        for (int token = tid / 64; token < restoreLen; token += blockDim.x / 64) {
+            int convBase = (batchIndex * seqLen + token) * qkvDim;
+            int qOffset = convBase + qHead * headKDim;
+            int kOffset = convBase + numKHeads * headKDim + qHead * headKDim;
+            int normTid = tid % 64;
+            const half2 *q_h2 = reinterpret_cast<const half2*>(convOutput + qOffset);
+            const half2 *k_h2 = reinterpret_cast<const half2*>(convOutput + kOffset);
+            half2 qh = q_h2[normTid];
+            half2 kh = k_h2[normTid];
+            float2 qf = __half22float2(qh);
+            float2 kf = __half22float2(kh);
+            float q_sum2 = qf.x * qf.x + qf.y * qf.y;
+            float k_sum2 = kf.x * kf.x + kf.y * kf.y;
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                q_sum2 += __shfl_down_sync(0xffffffff, q_sum2, offset);
+                k_sum2 += __shfl_down_sync(0xffffffff, k_sum2, offset);
+            }
+            if (lane_id == 0) {
+                int norm_warp = normTid >> 5;
+                warp_q[token * 2 + norm_warp] = q_sum2;
+                warp_k[token * 2 + norm_warp] = k_sum2;
+            }
         }
-        if (lane_id == 0) {
-            int norm_warp = normTid >> 5;
-            warp_q[token * 2 + norm_warp] = q_sum2;
-            warp_k[token * 2 + norm_warp] = k_sum2;
-        }
-    }
-    __syncthreads();
+        __syncthreads();
 
-    for (int token = warp_id; token < restoreLen; token += TILE_V) {
-        float q_val = lane_id < 2 ? warp_q[token * 2 + lane_id] : 0.0f;
-        float k_val = lane_id < 2 ? warp_k[token * 2 + lane_id] : 0.0f;
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            q_val += __shfl_down_sync(0xffffffff, q_val, offset);
-            k_val += __shfl_down_sync(0xffffffff, k_val, offset);
+        for (int token = warp_id; token < restoreLen; token += TILE_V) {
+            float q_val = lane_id < 2 ? warp_q[token * 2 + lane_id] : 0.0f;
+            float k_val = lane_id < 2 ? warp_k[token * 2 + lane_id] : 0.0f;
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                q_val += __shfl_down_sync(0xffffffff, q_val, offset);
+                k_val += __shfl_down_sync(0xffffffff, k_val, offset);
+            }
+            if (lane_id == 0) {
+                scales[token * 2] = rsqrtf(q_val / headKDim + eps);
+                scales[token * 2 + 1] = rsqrtf(k_val / headKDim + eps);
+                const half *baRow = ba +
+                    (size_t)(batchIndex * seqLen + token) * (numVHeads * 2);
+                float bRaw = __half2float(baRow[head_idx]);
+                float aRaw = __half2float(baRow[numVHeads + head_idx]);
+                float gRaw = -__expf(aLog[head_idx]) * softplus_fast(aRaw + dtBias[head_idx]);
+                ba_values[token * 2] = 1.0f / (1.0f + __expf(-bRaw));
+                ba_values[token * 2 + 1] = __expf(gRaw);
+            }
         }
-        if (lane_id == 0) {
-            scales[token * 2] = rsqrtf(q_val / headKDim + eps);
-            scales[token * 2 + 1] = rsqrtf(k_val / headKDim + eps);
-            const half *baRow = ba +
-                (size_t)(batchIndex * seqLen + token) * (numVHeads * 2);
-            float bRaw = __half2float(baRow[head_idx]);
-            float aRaw = __half2float(baRow[numVHeads + head_idx]);
-            float gRaw = -__expf(aLog[head_idx]) * softplus_fast(aRaw + dtBias[head_idx]);
-            ba_values[token * 2] = 1.0f / (1.0f + __expf(-bRaw));
-            ba_values[token * 2 + 1] = __expf(gRaw);
-        }
-    }
-    __syncthreads();
+        __syncthreads();
 
-    for (int index = tid; index < restoreLen * 64; index += blockDim.x) {
-        int token = index / 64;
-        int normTid = index % 64;
-        int convBase = (batchIndex * seqLen + token) * qkvDim;
-        int qOffset = convBase + qHead * headKDim;
-        int kOffset = convBase + numKHeads * headKDim + qHead * headKDim;
-        const half2 *q_h2 = reinterpret_cast<const half2*>(convOutput + qOffset);
-        const half2 *k_h2 = reinterpret_cast<const half2*>(convOutput + kOffset);
-        half2 qh = q_h2[normTid];
-        half2 kh = k_h2[normTid];
-        float2 qf = __half22float2(qh);
-        float2 kf = __half22float2(kh);
-        float w0 = __ldg(&normWeight[normTid * 2]);
-        float w1 = __ldg(&normWeight[normTid * 2 + 1]);
-        int normIndex = token * headKDim + normTid * 2;
-        q_norm[normIndex] = qf.x * scales[token * 2] * w0;
-        q_norm[normIndex + 1] = qf.y * scales[token * 2] * w1;
-        k_norm[normIndex] = kf.x * scales[token * 2 + 1] * w0;
-        k_norm[normIndex + 1] = kf.y * scales[token * 2 + 1] * w1;
+        for (int index = tid; index < restoreLen * 64; index += blockDim.x) {
+            int token = index / 64;
+            int normTid = index % 64;
+            int convBase = (batchIndex * seqLen + token) * qkvDim;
+            int qOffset = convBase + qHead * headKDim;
+            int kOffset = convBase + numKHeads * headKDim + qHead * headKDim;
+            const half2 *q_h2 = reinterpret_cast<const half2*>(convOutput + qOffset);
+            const half2 *k_h2 = reinterpret_cast<const half2*>(convOutput + kOffset);
+            half2 qh = q_h2[normTid];
+            half2 kh = k_h2[normTid];
+            float2 qf = __half22float2(qh);
+            float2 kf = __half22float2(kh);
+            float w0 = __ldg(&normWeight[normTid * 2]);
+            float w1 = __ldg(&normWeight[normTid * 2 + 1]);
+            int normIndex = token * headKDim + normTid * 2;
+            q_norm[normIndex] = qf.x * scales[token * 2] * w0;
+            q_norm[normIndex + 1] = qf.y * scales[token * 2] * w1;
+            k_norm[normIndex] = kf.x * scales[token * 2 + 1] * w0;
+            k_norm[normIndex + 1] = kf.y * scales[token * 2 + 1] * w1;
+        }
+        __syncthreads();
     }
-    __syncthreads();
 
     if (activeV) {
         // The entry points require headKDim == 128. Preserve the reference
@@ -21088,9 +21187,9 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
             int convBase = (batchIndex * seqLen + token) * qkvDim;
             int vOffset = convBase + 2 * numKHeads * headKDim + head_idx * headVDim;
             int outBase = ((batchIndex * seqLen + token) * numVHeads + head_idx) * headVDim;
-            const float *qToken = q_norm + token * headKDim;
-            const float *kToken = k_norm + token * headKDim;
-            float gVal = ba_values[token * 2 + 1];
+            const float *qToken = qValues + token * qTokenStride;
+            const float *kToken = kValues + token * qTokenStride;
+            float gVal = gateValues[token * gateTokenStride + 1];
             float sumK = 0.0f;
 #pragma unroll
             for (int j = 0; j < 4; j++) {
@@ -21100,7 +21199,7 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
                 sumK += __shfl_down_sync(0xffffffff, sumK, offset);
             }
             float delta = (__half2float(convOutput[vOffset + v_col]) -
-                           __shfl_sync(0xffffffff, sumK, 0)) * ba_values[token * 2];
+                           __shfl_sync(0xffffffff, sumK, 0)) * gateValues[token * gateTokenStride];
 
             float sumQ = 0.0f;
             half *snapBase = nullptr;
@@ -21770,6 +21869,39 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnaps
         !FastllmCudaDataHasDenseStrides(coreAttnOut) ||
         !FastllmCudaDataCanShareDevice(first, coreAttnOut)) {
         return false;
+    }
+    static const bool prepareEnabled = []() {
+        const char *value = std::getenv("FASTLLM_CUDA_GDN_SEQUENCE_PREPARE");
+        return value == nullptr || value[0] == '\0' ||
+            FastllmCudaEnvFlagEnabled("FASTLLM_CUDA_GDN_SEQUENCE_PREPARE");
+    }();
+    const bool prepare = prepareEnabled && batch >= 4 && headVDim == 128 &&
+        fastllmCudaGraphPointerTableScopes.empty() && !FastllmCudaGraphIsCapturingFast();
+    if (prepare) {
+        const size_t qkCount = (size_t)batch * seqLen * numKHeads * headKDim * 2;
+        const size_t gateCount = (size_t)batch * seqLen * numVHeads * 2;
+        float *prepared = FastllmGdnSequencePrepareScratch(device, qkCount + gateCount);
+        if (prepared != nullptr) {
+            FastllmGdnSequencePrepare128Kernel<<<dim3(numKHeads, seqLen, batch), 64>>>(
+                (const half*)convOutput.cudaData, (const half*)ba.cudaData,
+                (const float*)normWeight.cudaData, (const float*)aLog.cudaData,
+                (const float*)dtBias.cudaData, prepared, prepared + qkCount,
+                seqLen, numKHeads, numVHeads, headVDim, eps);
+            constexpr int tileV = 8;
+            dim3 grid(numVHeads, (headVDim + tileV - 1) / tileV, batch);
+            FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWarpKernel<tileV, false, true>
+                <<<grid, tileV * 32>>>(
+                    (const half*)convOutput.cudaData, (const half*)ba.cudaData,
+                    (const float*)normWeight.cudaData, (const float*)aLog.cudaData,
+                    (const float*)dtBias.cudaData, nullptr, (half**)devicePointers,
+                    (half*)coreAttnOut.cudaData,
+                    seqLen, numKHeads, numVHeads, headKDim, headVDim, eps, qScale,
+                    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                    (half**)(devicePointers + batch), numTokenStates,
+                    nullptr, nullptr, prepared, prepared + qkCount);
+            checkCudaErrors("Error: CUDA error in prepared batched GDN sequence.", cudaGetLastError());
+            return true;
+        }
     }
     constexpr int tileV = 16;
     int threads = tileV * 32;

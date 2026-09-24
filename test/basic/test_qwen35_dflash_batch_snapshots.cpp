@@ -2,6 +2,7 @@
 #include "utils/utils.h"
 
 #include <cmath>
+#include <cstdint>
 #include <iostream>
 #include <stdexcept>
 #include <vector>
@@ -53,18 +54,25 @@ void Near(const std::vector<float> &actual, const std::vector<float> &expected) 
     }
 }
 
-void Run(int device, int batch, int length) {
+void Run(int device, int batch, int length, int kHeads = 2,
+         int vHeads = 4, int vDim = 128) {
     FastllmCudaSetDevice(device);
     // Two K heads/four V heads exercise grouped heads and rank-local layouts.
-    constexpr int kHeads = 2, vHeads = 4, kDim = 128, vDim = 128;
-    constexpr int channels = 2 * kHeads * kDim + vHeads * vDim;
-    constexpr int stateSize = vHeads * kDim * vDim;
-    constexpr int outSize = vHeads * vDim;
+    constexpr int kDim = 128;
+    const int channels = 2 * kHeads * kDim + vHeads * vDim;
+    const int stateSize = vHeads * kDim * vDim;
+    const int outSize = vHeads * vDim;
     const int slots = length - 1;
     const float scale = 1.0f / std::sqrt(float(kDim));
     Data norm = Tensor(FLOAT32, {kDim}, std::vector<float>(kDim, 0.9f), device);
-    Data aLog = Tensor(FLOAT32, {vHeads}, {-0.7f, -0.5f, -0.4f, -0.6f}, device);
-    Data dtBias = Tensor(FLOAT32, {vHeads}, {0.1f, -0.2f, 0.3f, -0.1f}, device);
+    std::vector<float> aValues(vHeads), dtValues(vHeads);
+    const float aPattern[] = {-0.7f, -0.5f, -0.4f, -0.6f};
+    const float dtPattern[] = {0.1f, -0.2f, 0.3f, -0.1f};
+    for (int h = 0; h < vHeads; ++h) {
+        aValues[h] = aPattern[h % 4]; dtValues[h] = dtPattern[h % 4];
+    }
+    Data aLog = Tensor(FLOAT32, {vHeads}, aValues, device);
+    Data dtBias = Tensor(FLOAT32, {vHeads}, dtValues, device);
     std::vector<float> conv(batch * length * channels), ba(batch * length * vHeads * 2);
     for (size_t i = 0; i < conv.size(); ++i)
         conv[i] = 0.13f * std::sin(float(i + 11 * length) * 0.019f);
@@ -147,6 +155,33 @@ void Run(int device, int batch, int length) {
             }
         }
     }
+    // Cross-process fingerprints let the same executable compare the prepared
+    // path with FASTLLM_CUDA_GDN_SEQUENCE_PREPARE=0, including every output and
+    // prefix state. The independent single-token and compact-restore checks
+    // below still validate the recurrence and mixed acceptance lengths.
+    uint64_t digest = 14695981039346656037ULL;
+    auto hashValues = [&](const std::vector<float> &values) {
+        for (float value : values) {
+            digest ^= float_to_half(value);
+            digest *= 1099511628211ULL;
+        }
+    };
+    hashValues(actual);
+    for (int b = 0; b < batch; ++b) {
+        hashValues(Read(states[b]));
+        for (int t = 0; t < slots; ++t) hashValues(Read(snapshots[b * slots + t]));
+    }
+    for (int b = 0; b < batch; ++b) states[b].CopyFrom(initialStates[b]);
+    Data withoutSnapshots;
+    Require(FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnapshots(
+                convSequence, baSequence, norm, aLog, dtBias, statePtrs, withoutSnapshots,
+                {}, 0, kHeads, vHeads, kDim, vDim, 1e-6f, scale),
+            "no-snapshot sequence rejected");
+    Require(Read(withoutSnapshots) == actual, "no-snapshot output not exact");
+    hashValues(Read(withoutSnapshots));
+    for (int b = 0; b < batch; ++b) hashValues(Read(states[b]));
+    std::cout << "gdn_digest " << device << ':' << batch << ':' << length
+              << ':' << kHeads << ':' << vHeads << ':' << vDim << '=' << digest << '\n';
     std::vector<Data> finalKeys(batch), finalStates(batch);
     for (int b = 0; b < batch; ++b) {
         finalKeys[b].CopyFrom(convKeys[b]); finalStates[b].CopyFrom(states[b]);
@@ -222,6 +257,18 @@ int main() {
                 ++cases;
             }
             std::cout << "device " << device << " PASS\n";
+        }
+        // Current TP2 heads, all verification lengths, small batches and V-tail
+        // fallback. Return to smaller shapes after growth to exercise scratch reuse.
+        for (int device = 0; device < devices; ++device) {
+            for (int batch : {4, 8, 16, 3}) for (int length = 2; length <= 8; ++length) {
+                Run(device, batch, length, 8, 24, 128);
+                ++cases;
+            }
+            for (int vDim : {96, 192}) {
+                Run(device, 4, 4, 2, 4, vDim);
+                ++cases;
+            }
         }
         std::cout << "DFlash batch snapshots: PASS (" << cases << " cases)\n";
         return 0;
