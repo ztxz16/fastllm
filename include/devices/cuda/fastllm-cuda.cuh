@@ -2167,6 +2167,17 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16Snapshots(
     fastllm::Data **tokenStates, int numTokenStates,
     int numKHeads, int numVHeads, int headKDim, int headVDim,
     float eps, float qScale = 1.0f);
+// Restore independent accepted prefixes from cached verify activations. Full
+// prefixes are untouched; rollback states remain read-only. Memory is O(B*T*D).
+bool FastllmCudaDFlashRestoreLinearPrefixes(
+    fastllm::Data &input, fastllm::Data &conv, fastllm::Data &ba,
+    fastllm::Data &norm, fastllm::Data &aLog, fastllm::Data &dtBias,
+    const std::vector<fastllm::Data*> &keys,
+    const std::vector<fastllm::Data*> &values,
+    const std::vector<fastllm::Data*> &initialKeys,
+    const std::vector<fastllm::Data*> &initialValues,
+    const std::vector<int> &prefixLengths,
+    int keyHeads, int valueHeads, int headKDim, int headVDim, float eps);
 bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnapshots(
     fastllm::Data &convOutput, fastllm::Data &ba, fastllm::Data &normWeight,
     fastllm::Data &aLog, fastllm::Data &dtBias,

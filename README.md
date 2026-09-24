@@ -321,6 +321,7 @@ Qwen3.5 系列的 MTP 和 DFlash 草稿支持以下设置。启用相应的草�
 | `FASTLLM_TP_NVFP4_MLP_SWIGLU` | `1` | TP MLP 尝试 NVFP4 Linear + SwiGLU 融合，`0` 关闭；由底层能力检查选择内核，不支持时执行原 Linear + SwiGLU |
 | `FASTLLM_TP_NATIVE_GREEDY` | `1` | Qwen3.5 TP 贪心采样支持原生类型 logits；eager 推测验证省去 FP16→FP32 转换，`0` 关闭。随机采样、返回 logits、Graph 和 GPU token handoff 仍保持 FP32 路径 |
 | `FASTLLM_DFLASH_TP_EARLY_SELECTOR` | `1` | DFlash2 TP 在 rank 0 输出头工作流中提前提交 selector 投影，`0` 关闭；不限定 SM |
+| `FASTLLM_DFLASH_BATCH_PREFIX_SNAPSHOTS` | `1` | DFlash2 CUDA 批量验证按各请求接受长度恢复线性状态，避免拒绝后的主模型重算。max_batch≤4 使用逐位置状态快照；更大配置保存紧凑激活、批量恢复卷积/GDN 状态，实际 batch 缩小时仍沿用该路径，无 16 路上限。自动预留恢复缓冲与草稿滑窗 KV 显存，相应减少主模型 KV 容量。`0` 回退到完整前缀重算；单请求路径不变。不限定 SM；状态算子已在 SM75 验证到 32 路 |
 | `FASTLLM_MTP_DRAFT_TOKEN_IDS` | 未设置 | 可选的单卡或多卡 MTP 草稿词表 token ID 文件，仅在启用 NVFP4 转换时使用；未设置或为 `0` 时使用完整词表。多卡按原词表分片筛选并映射回全局 token ID，对齐填充只重复已有候选。筛选词表只用于贪心草稿，随机采样使用完整输出头，目标模型仍使用完整词表验证 |
 | `FASTLLM_DFLASH_DRAFT_TOKEN_IDS` | 未设置 | 多卡 DFlash2 的可选 NVFP4 草稿词表清单，仅用于贪心请求；要求每个连续词表分片至少有 selector top-k 个候选。top-k 前移除对齐填充，选择后恢复原 token ID。随机采样使用完整原始头；非法或不支持的清单回退完整词表 |
 | `FASTLLM_DFLASH_ATTENTION` | 未设置：SM75 开，其余关 | DFlash FP16 融合滑窗 attention 的统一开关：`0` 关闭，`1` 在支持的设备上开启。要求 head_dim=128、query 数 1～16、query 数×GQA 分组数≤64、query 数≤窗口≤4096，且 FlashInfer 可用；不匹配时回退原路径。SM80 及以上的 Q64 路径尚无实机正确性或速度验证；SM70 及以下始终保持原路径 |

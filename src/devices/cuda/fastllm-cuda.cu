@@ -20940,7 +20940,7 @@ static bool LaunchFastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedHalfWar
     return true;
 }
 
-template <int TILE_V>
+template <int TILE_V, bool RESTORE = false>
 __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWarpKernel(
     const half *convOutput,
     const half *ba,
@@ -20953,13 +20953,17 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
     float eps, float qScale,
     half *snap0, half *snap1, half *snap2, half *snap3, half *snap4,
     half *snap5, half *snap6,
-    half **snapshotPointers, int numSnaps) {
+    half **snapshotPointers, int numSnaps,
+    void **prefixLengths = nullptr, half **initialStates = nullptr) {
     int head_idx = blockIdx.x;
     int v_base = blockIdx.y * TILE_V;
     if (head_idx >= numVHeads || v_base >= headVDim) {
         return;
     }
 
+    int batchIndex = blockIdx.z;
+    int restoreLen = RESTORE ? (int)(size_t)prefixLengths[batchIndex] : seqLen;
+    if (RESTORE && restoreLen == seqLen) return;
     int tid = threadIdx.x;
     int warp_id = tid >> 5;
     int lane_id = tid & 31;
@@ -20977,7 +20981,6 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
     float *scales = warp_k + seqLen * 2;
     float *ba_values = scales + seqLen * 2;
 
-    int batchIndex = blockIdx.z;
     if (statePointers != nullptr) {
         last_recurrent_state = statePointers[batchIndex];
     }
@@ -20986,10 +20989,13 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
         last_recurrent_state + stateHeadBase + (size_t)v_col * headKDim :
         last_recurrent_state;
 
+    const half *initialRow = RESTORE ?
+        initialStates[batchIndex] + stateHeadBase + (size_t)v_col * headKDim : state_row;
+
     // Normalize the short sequence together. Once these shared values are
     // ready, each warp owns its state row and needs no block-wide barriers
     // between recurrent steps.
-    for (int token = tid / 64; token < seqLen; token += blockDim.x / 64) {
+    for (int token = tid / 64; token < restoreLen; token += blockDim.x / 64) {
         int convBase = (batchIndex * seqLen + token) * qkvDim;
         int qOffset = convBase + qHead * headKDim;
         int kOffset = convBase + numKHeads * headKDim + qHead * headKDim;
@@ -21014,7 +21020,7 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
     }
     __syncthreads();
 
-    for (int token = warp_id; token < seqLen; token += TILE_V) {
+    for (int token = warp_id; token < restoreLen; token += TILE_V) {
         float q_val = lane_id < 2 ? warp_q[token * 2 + lane_id] : 0.0f;
         float k_val = lane_id < 2 ? warp_k[token * 2 + lane_id] : 0.0f;
         for (int offset = 16; offset > 0; offset >>= 1) {
@@ -21035,7 +21041,7 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
     }
     __syncthreads();
 
-    for (int index = tid; index < seqLen * 64; index += blockDim.x) {
+    for (int index = tid; index < restoreLen * 64; index += blockDim.x) {
         int token = index / 64;
         int normTid = index % 64;
         int convBase = (batchIndex * seqLen + token) * qkvDim;
@@ -21063,9 +21069,9 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
         half stateValues[4];
 #pragma unroll
         for (int j = 0; j < 4; j++) {
-            stateValues[j] = state_row[lane_id + j * 32];
+            stateValues[j] = initialRow[lane_id + j * 32];
         }
-        for (int token = 0; token < seqLen; token++) {
+        for (int token = 0; token < restoreLen; token++) {
             int convBase = (batchIndex * seqLen + token) * qkvDim;
             int vOffset = convBase + 2 * numKHeads * headKDim + head_idx * headVDim;
             int outBase = ((batchIndex * seqLen + token) * numVHeads + head_idx) * headVDim;
@@ -21115,7 +21121,7 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
             for (int offset = 16; offset > 0; offset >>= 1) {
                 sumQ += __shfl_down_sync(0xffffffff, sumQ, offset);
             }
-            if (lane_id == 0) {
+            if (!RESTORE && lane_id == 0) {
                 core_attn_out[outBase + v_col] = __float2half_rn(sumQ);
             }
         }
@@ -21124,6 +21130,101 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
             state_row[lane_id + j * 32] = stateValues[j];
         }
     }
+}
+
+__global__ void FastllmDFlashRestoreConvPrefixesKernel(
+    void **pointers, const half *input, int batch, int seqLen,
+    int channels, int inputStride) {
+    int b = blockIdx.y;
+    int accepted = (int)(size_t)pointers[4 * batch + b];
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (accepted == seqLen || index >= channels * 4) return;
+    int channel = index / 4;
+    int token = accepted + index % 4 - 4;
+    half *dst = (half*)pointers[2 * batch + b];
+    const half *src = (const half*)pointers[3 * batch + b];
+    dst[index] = token < 0 ? src[channel * 4 + token + 4] :
+        input[((size_t)b * seqLen + token) * inputStride + channel];
+}
+
+bool FastllmCudaDFlashRestoreLinearPrefixes(
+    fastllm::Data &input, fastllm::Data &conv, fastllm::Data &ba,
+    fastllm::Data &norm, fastllm::Data &aLog, fastllm::Data &dtBias,
+    const std::vector<fastllm::Data*> &keys,
+    const std::vector<fastllm::Data*> &values,
+    const std::vector<fastllm::Data*> &initialKeys,
+    const std::vector<fastllm::Data*> &initialValues,
+    const std::vector<int> &prefixLengths,
+    int keyHeads, int valueHeads, int headKDim, int headVDim, float eps) {
+    const int batch = (int)keys.size();
+    if (batch <= 0 || values.size() != keys.size() ||
+        initialKeys.size() != keys.size() || initialValues.size() != keys.size() ||
+        prefixLengths.size() != keys.size() || keyHeads <= 0 ||
+        valueHeads <= 0 || valueHeads % keyHeads != 0 || headKDim != 128 ||
+        headVDim <= 0 || !std::isfinite(eps) || eps < 0 ||
+        conv.dims.size() != 3 || conv.dims[0] != batch ||
+        input.dims.size() != 3 || ba.dims.size() != 3) return false;
+    int seqLen = conv.dims[1];
+    int channels = keyHeads * headKDim * 2 + valueHeads * headVDim;
+    if (seqLen < 2 || seqLen > FASTLLM_CUDA_MTP_FAST_SEQ_MAX ||
+        conv.dims[2] != channels || input.dims[0] != batch ||
+        input.dims[1] != seqLen || input.dims[2] < channels ||
+        ba.dims != std::vector<int>({batch, seqLen, valueHeads * 2}) ||
+        norm.dims != std::vector<int>({headKDim}) ||
+        aLog.dims != std::vector<int>({valueHeads}) || dtBias.dims != aLog.dims)
+        return false;
+    int device = -1;
+    if (!FastllmCudaResolveDataDeviceId(conv, device) ||
+        FastllmCudaGetDevice() != device) return false;
+    auto valid = [&](const fastllm::Data *data, fastllm::DataType type) {
+        return data != nullptr && data->dataType == type &&
+            data->cudaData != nullptr && FastllmCudaDataHasDenseStrides(*data) &&
+            FastllmCudaDataCanShareDevice(conv, *data);
+    };
+    for (auto *data : {&input, &conv, &ba})
+        if (!valid(data, fastllm::DataType::FLOAT16)) return false;
+    for (auto *data : {&norm, &aLog, &dtBias})
+        if (!valid(data, fastllm::DataType::FLOAT32)) return false;
+    std::vector<void*> pointers(batch * 5);
+    std::set<void*> states;
+    for (int b = 0; b < batch; b++) {
+        if (prefixLengths[b] < 0 || prefixLengths[b] > seqLen) return false;
+        for (auto *key : {keys[b], initialKeys[b]}) {
+            if (!valid(key, fastllm::DataType::FLOAT16) ||
+                key->dims != std::vector<int>({1, channels, 4}) ||
+                !states.insert(key->cudaData).second) return false;
+        }
+        for (auto *value : {values[b], initialValues[b]}) {
+            if (!valid(value, fastllm::DataType::FLOAT16) ||
+                value->dims != std::vector<int>({1, valueHeads, headKDim, headVDim}) ||
+                !value->isLinearAttentionTransposed ||
+                !states.insert(value->cudaData).second) return false;
+        }
+        pointers[b] = values[b]->cudaData;
+        pointers[batch + b] = initialValues[b]->cudaData;
+        pointers[2 * batch + b] = keys[b]->cudaData;
+        pointers[3 * batch + b] = initialKeys[b]->cudaData;
+        pointers[4 * batch + b] = (void*)(size_t)prefixLengths[b];
+    }
+    void **devicePointers = FastllmCudaStagePointers(pointers);
+    dim3 convGrid((channels * 4 + 255) / 256, batch);
+    FastllmDFlashRestoreConvPrefixesKernel<<<convGrid, 256>>>(
+        devicePointers, (const half*)input.cudaData, batch, seqLen,
+        channels, input.dims[2]);
+    constexpr int tileV = 16;
+    size_t sharedBytes = seqLen * (2 * (size_t)headKDim + 8) * sizeof(float);
+    dim3 grid(valueHeads, (headVDim + tileV - 1) / tileV, batch);
+    FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWarpKernel<tileV, true>
+        <<<grid, tileV * 32, sharedBytes>>>(
+            (const half*)conv.cudaData, (const half*)ba.cudaData,
+            (const float*)norm.cudaData, (const float*)aLog.cudaData,
+            (const float*)dtBias.cudaData, nullptr, (half**)devicePointers, nullptr,
+            seqLen, keyHeads, valueHeads, headKDim, headVDim, eps,
+            1.0f / std::sqrt((float)headKDim),
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+            nullptr, 0, devicePointers + 4 * batch, (half**)(devicePointers + batch));
+    checkCudaErrors("Error restoring DFlash linear prefixes.", cudaGetLastError());
+    return true;
 }
 
 bool FastllmRecurrentGatedDeltaRuleBatchFromConvBaDevicePointers(

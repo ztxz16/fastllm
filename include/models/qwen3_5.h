@@ -311,6 +311,17 @@ namespace fastllm {
         bool speculativeCaptureFirstTokenLinearState = false;
         int speculativeLinearStateCaptureSlots = 0;
         std::vector<std::vector<std::pair<Data, Data> > > speculativeLinearStates;
+        // Large DFlash batches retain small activations instead of one full
+        // recurrent matrix per candidate token. Entries are rank-local and
+        // prepared before TP workers run; workers never mutate the map itself.
+        struct DFlashLinearReplay {
+            Data input, conv, ba;
+            Data *norm = nullptr, *aLog = nullptr, *dtBias = nullptr;
+            int keyHeads = 0, valueHeads = 0;
+            bool ready = false;
+        };
+        bool speculativeCaptureLinearReplay = false;
+        std::vector<std::map<int, std::unique_ptr<DFlashLinearReplay>>> dflashLinearReplay;
         // Verify graphs capture addresses in this scratch storage.
         unsigned long long speculativeLinearStateGeneration = 0;
         // Single-request verification scratch, serialized by mtpCacheMutex.

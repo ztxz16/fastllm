@@ -593,8 +593,8 @@ namespace fastllm {
                 (cache.expansionDims.size() == cache.dims.size() ?
                      cache.expansionDims : cache.dims);
             if (!cache.dims.empty()) {
-                expanded[1] +=
-                    ((appendTokens - 1) / allocationUnit + 1) * allocationUnit;
+                expanded[1] = ((cache.dims[1] + appendTokens - 1) /
+                               allocationUnit + 1) * allocationUnit;
             }
             cache.Expansion(expanded);
         }
@@ -838,6 +838,12 @@ namespace fastllm {
     static bool Qwen35MtpBatchedStateRestoreEnabled() {
         static bool enabled = Qwen35EnvDefaultEnabled(
             "FASTLLM_QWEN35_MTP_BATCHED_STATE_RESTORE");
+        return enabled;
+    }
+
+    static bool Qwen35DFlashBatchPrefixSnapshotsEnabled() {
+        static bool enabled = Qwen35EnvDefaultEnabled(
+            "FASTLLM_DFLASH_BATCH_PREFIX_SNAPSHOTS");
         return enabled;
     }
 
@@ -9506,13 +9512,40 @@ namespace fastllm {
             }
         }
 
-        int mtpDrafts = Qwen35MtpDraftsPerStep();
-        if (!Qwen35MtpDisabledByEnv() && mtpDrafts > 0 && HasMtpWeights() &&
+        const bool dflash = HasDFlashWeights();
+        if (dflash && deviceId == devices.front() && dflashSlidingWindow > 0) {
+            // Draft attention keeps its own FP16 window on the root GPU even
+            // when its linear layers use TP. These per-request caches are not
+            // target paged KV and were previously absent from auto budgeting.
+            const int prefillTokens = std::max(1, std::min(
+                chunkedPrefillSize >= 0 ? chunkedPrefillSize : defaultChunkedPrefillSize,
+                QWEN35_DFLASH_LONG_PREFILL_CHUNK_SIZE));
+            const int appendTokens = std::max(prefillTokens, dflashCheckpointBlockSize);
+            const long long unit = Qwen35DFlashCacheAllocationUnit(
+                dflashSlidingWindow, dflashCheckpointBlockSize);
+            const long long capacity =
+                ((Qwen35DFlashCacheTrimThreshold(dflashSlidingWindow) +
+                  appendTokens + unit - 1) / unit) * unit;
+            reserveBytes += (long long)batch * capacity * dflashLayers *
+                            2 * dflashKvHeads * dflashHeadDim * sizeof(uint16_t);
+            // One append projects selected target features into all draft KV
+            // layers. Its transient buffers are shared, not multiplied by B.
+            reserveBytes += (long long)prefillTokens * sizeof(uint16_t) *
+                ((long long)embed_dim * (2 * dflashTargetLayerIds.size() + 4) +
+                 (long long)4 * dflashLayers * dflashKvHeads * dflashHeadDim);
+        }
+        const int mtpDrafts = dflash ?
+            std::min(DFlashDraftsPerStep(), QWEN35_MTP_PREFIX_SNAPSHOT_MAX) :
+            Qwen35MtpDraftsPerStep();
+        const bool speculative = dflash ||
+            (!Qwen35MtpDisabledByEnv() && HasMtpWeights());
+        if (speculative && mtpDrafts > 0 &&
             num_k_heads > 0 && num_v_heads > 0 &&
             num_v_heads % num_k_heads == 0 &&
             head_k_dim > 0 && head_v_dim > 0) {
             bool tensorParallel = devices.size() > 1;
             long long linearStateBytes = 0;
+            long long replayActivationBytes = 0;
             for (int layer = 0; layer < block_cnt; layer++) {
                 std::string prefix = language_prefix + "layers." +
                                      std::to_string(layer) + ".";
@@ -9555,9 +9588,28 @@ namespace fastllm {
                     (long long)localValueHeads * head_k_dim * head_v_dim;
                 linearStateBytes += (long long)GetDataBytes(
                     computeType, 1, (size_t)(keyElements + valueElements));
+                // Merged QKVZ(+BA), convolution output and BA. The extra BA
+                // allowance also covers loaders with a fully fused projection.
+                replayActivationBytes += (long long)GetDataBytes(computeType, 1,
+                    (size_t)batch * (mtpDrafts + 1) *
+                    (localKd * 4 + localVd * 3 + localValueHeads * 4));
             }
             long long scratchSlots = 0;
-            if (tensorParallel) {
+            if (dflash) {
+                // DFlash keeps prefix states only for bounded small batches.
+                // Reserve their rank-local high-water footprint before sizing
+                // KV pages, including the per-request rollback states. Larger
+                // batches retain one rollback state per request. A single live
+                // request still uses its existing prefix-snapshot path. While
+                // auto max_batch is unresolved, also cover a later small-batch
+                // deployment so calibration cannot under-reserve snapshots.
+                const int snapshotBatch = Qwen35DFlashBatchPrefixSnapshotsEnabled() &&
+                    (maxBatch <= 0 || maxBatch <= QWEN35_MTP_PREFIX_SNAPSHOT_BATCH_MAX) ?
+                    std::min(batch, QWEN35_MTP_PREFIX_SNAPSHOT_BATCH_MAX) : 1;
+                scratchSlots = std::max(
+                    (long long)batch,
+                    (long long)snapshotBatch * (mtpDrafts + 1));
+            } else if (tensorParallel) {
                 // TP keeps every prefix snapshot so rejected requests do not
                 // need another synchronized target-model replay.
                 scratchSlots = (long long)batch * (mtpDrafts + 1);
@@ -9571,6 +9623,10 @@ namespace fastllm {
                     snapshotBatch * (long long)(mtpDrafts + 1));
             }
             reserveBytes += scratchSlots * linearStateBytes;
+            if (dflash && Qwen35DFlashBatchPrefixSnapshotsEnabled() &&
+                (maxBatch <= 0 || maxBatch > QWEN35_MTP_PREFIX_SNAPSHOT_BATCH_MAX)) {
+                reserveBytes += replayActivationBytes;
+            }
         }
         return reserveBytes;
 #else
@@ -13690,6 +13746,19 @@ namespace fastllm {
                         localQkvDim, localQkvDim + localVd, z);
                     projectedZSplitReady = true;
                 };
+                DFlashLinearReplay *linearReplay = speculativeCaptureLinearReplay ?
+                    dflashLinearReplay.at(i).at(gpuId).get() : nullptr;
+                auto saveReplayActivation = [&](Data &dst, const Data &src) {
+                    dst.dataType = src.dataType;
+                    dst.Resize(src.dims);
+                    dst.ToDevice(DataDevice::CUDA, std::vector<int>{gpuId});
+                    dst.Allocate(false);
+                    const size_t bytes = src.GetBytes();
+                    AssertInFastLLM(
+                        FastllmCudaMemcpy2DDeviceToDeviceAsyncCurrentThread(
+                            dst.cudaData, bytes, src.cudaData, bytes, bytes, 1),
+                        "Qwen3.5 DFlash activation capture failed.\n");
+                };
                 bool captureLinearState =
                     speculativeCaptureFirstTokenLinearState;
                 int linearStateCaptureSlots =
@@ -14041,6 +14110,8 @@ namespace fastllm {
                         gdnMerged.Reshape(
                             {batch, requestSeqLen,
                              gdnMerged.dims.back()});
+                        if (linearReplay != nullptr)
+                            saveReplayActivation(linearReplay->input, gdnMerged);
                         if (tokenMajorBatchedSpeculativeConv) {
                             fused =
                                 FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16BatchPointers(
@@ -14072,6 +14143,8 @@ namespace fastllm {
                         qkvConvInput.Reshape(
                             {batch, requestSeqLen,
                              qkvConvInput.dims.back()});
+                        if (linearReplay != nullptr)
+                            saveReplayActivation(linearReplay->input, qkvConvInput);
                         if (!tokenMajorBatchConv) {
                             Qwen3CudaPermuteSelf(
                                 cudaRunner, qkvConvInput,
@@ -14349,6 +14422,16 @@ namespace fastllm {
                                 markLinearCaptured(captureOffset + tokenIndex, 2);
                             }
                         }
+                    }
+                    if (linearReplay != nullptr) {
+                        saveReplayActivation(linearReplay->conv, *convOutputForRecurrent);
+                        saveReplayActivation(linearReplay->ba, baMerged);
+                        linearReplay->norm = requireLocal(inv_scale_data, "linear_attn.inv_scale");
+                        linearReplay->aLog = requireLocal(weight[aLogName], aLogName);
+                        linearReplay->dtBias = requireLocal(weight[dtBiasName], dtBiasName);
+                        linearReplay->keyHeads = localKeyHeads;
+                        linearReplay->valueHeads = localValueHeads;
+                        linearReplay->ready = true;
                     }
                     coreAttnOut.Reshape(
                         {1, seqlen, localValueHeads, head_v_dim});
@@ -21104,10 +21187,10 @@ namespace fastllm {
             if (copies.empty()) {
                 return;
             }
-            // This path has been validated for the rank-local TP MTP states.
-            // DFlash and single-GPU replay keep their established synchronous
-            // restore semantics until they have dedicated coverage.
-            if (!tensorParallel || useDFlash ||
+            // Both MTP and DFlash restore the same rank-local conv/recurrent
+            // tensors. Preserve the rank synchronization below before draft
+            // work or the next validation can use a different PTDS.
+            if (!tensorParallel ||
                 !Qwen35MtpBatchedStateRestoreEnabled()) {
                 for (const BatchStateTensorCopy &copy : copies) {
                     copyTensor(*copy.dst, *copy.src, copy.device);
@@ -21289,14 +21372,29 @@ namespace fastllm {
             }
         }
 
-        // Prefix snapshots avoid an extra target-model replay after a rejected
-        // draft.  They are especially valuable for small batches, where there
-        // are too few rejected requests to amortize a grouped replay.  Keep the
-        // large-batch single-GPU path on one rollback state per request so the
-        // snapshot scratch footprint stays bounded.
-        const bool useLinearPrefixSnapshots = !useDFlash &&
-            (tensorParallel ||
-             batch <= QWEN35_MTP_PREFIX_SNAPSHOT_BATCH_MAX);
+        // Small deployments keep exact matrix snapshots. Larger DFlash
+        // deployments also use compact recovery when their live batch shrinks,
+        // avoiding the retained 4 * 8 full-state snapshot high-water footprint.
+        // Replay only conv/GDN state from per-layer activations, never
+        // the target projections/attention/MLP. No concurrency limit is needed.
+        const bool useLinearPrefixSnapshots = useDFlash ?
+            (Qwen35DFlashBatchPrefixSnapshotsEnabled() && maxBatch > 0 &&
+             maxBatch <= QWEN35_MTP_PREFIX_SNAPSHOT_BATCH_MAX &&
+             batch <= QWEN35_MTP_PREFIX_SNAPSHOT_BATCH_MAX) :
+            (tensorParallel || batch <= QWEN35_MTP_PREFIX_SNAPSHOT_BATCH_MAX);
+        const bool useLinearReplay = useDFlash && !useLinearPrefixSnapshots &&
+            Qwen35DFlashBatchPrefixSnapshotsEnabled();
+        if (useLinearReplay) {
+            dflashLinearReplay.resize(block_cnt);
+            for (int layer = 0; layer < block_cnt; layer++) {
+                if (isAttentionLayerAt(layer)) continue;
+                for (int device : devices) {
+                    auto &entry = dflashLinearReplay[layer][device];
+                    if (!entry) entry.reset(new DFlashLinearReplay());
+                    entry->ready = false;
+                }
+            }
+        }
         const int linearCaptureSlots =
             useLinearPrefixSnapshots ? captureSlots : 0;
         const int rollbackSlotBase = linearCaptureSlots;
@@ -21579,6 +21677,8 @@ namespace fastllm {
         auto oldMtpSamplingContexts = speculativeMtpSamplingContexts;
         speculativeMtpSamplingContexts = useDFlash ?
             std::vector<MtpKvCache*>() : requestMtpCaches;
+        bool oldCaptureReplay = speculativeCaptureLinearReplay;
+        speculativeCaptureLinearReplay = useLinearReplay;
         bool oldCollectAllLogits = speculativeCollectAllLogits;
         bool oldCaptureLinearState = speculativeCaptureFirstTokenLinearState;
         bool oldCaptureDFlash = speculativeCaptureDFlashHiddenStates;
@@ -21612,6 +21712,7 @@ namespace fastllm {
                                    seqLens, pastKeyValues, generationConfigs,
                                    LastTokensManager(), nullptr);
         } catch (const Qwen35MtpBatchFastPathUnavailable &) {
+            speculativeCaptureLinearReplay = oldCaptureReplay;
             speculativeLinearStateCaptureSlots = oldCaptureSlots;
             speculativeCaptureFirstTokenLinearState = oldCaptureLinearState;
             speculativeMtpSamplingContexts = oldMtpSamplingContexts;
@@ -21622,6 +21723,7 @@ namespace fastllm {
             rollbackTargetCaches();
             return false;
         } catch (...) {
+            speculativeCaptureLinearReplay = oldCaptureReplay;
             speculativeLinearStateCaptureSlots = oldCaptureSlots;
             speculativeCaptureFirstTokenLinearState = oldCaptureLinearState;
             speculativeMtpSamplingContexts = oldMtpSamplingContexts;
@@ -21631,6 +21733,7 @@ namespace fastllm {
             speculativeCollectAllLogits = oldCollectAllLogits;
             throw;
         }
+        speculativeCaptureLinearReplay = oldCaptureReplay;
         speculativeLinearStateCaptureSlots = oldCaptureSlots;
         speculativeCaptureFirstTokenLinearState = oldCaptureLinearState;
         speculativeMtpSamplingContexts = oldMtpSamplingContexts;
@@ -21727,7 +21830,7 @@ namespace fastllm {
             }
         }
 
-        if (useLinearPrefixSnapshots) {
+        if (useLinearPrefixSnapshots || useLinearReplay) {
             std::vector<MetaByLayer> prefixRootKeys(batch, MetaByLayer(block_cnt));
             std::vector<MetaByLayer> prefixRootValues(batch, MetaByLayer(block_cnt));
             std::vector<LocalMetaByLayer> prefixLocalKeys(
@@ -21741,7 +21844,8 @@ namespace fastllm {
                 if (commitLens[b] == seqLens[b]) {
                     continue;
                 }
-                int captureSlot = captureOffsets[b] + commitLens[b] - 1;
+                int captureSlot = useLinearReplay ? rollbackSlotBase + b :
+                    captureOffsets[b] + commitLens[b] - 1;
                 for (int layer = 0; layer < block_cnt; layer++) {
                     Data *rootKey = pastKeyValues[b * block_cnt + layer].first;
                     Data *rootValue = pastKeyValues[b * block_cnt + layer].second;
@@ -21809,7 +21913,8 @@ namespace fastllm {
                 if (commitLens[b] == seqLens[b]) {
                     continue;
                 }
-                int captureSlot = captureOffsets[b] + commitLens[b] - 1;
+                int captureSlot = useLinearReplay ? rollbackSlotBase + b :
+                    captureOffsets[b] + commitLens[b] - 1;
                 for (int layer = 0; layer < block_cnt; layer++) {
                     Data *rootKey = pastKeyValues[b * block_cnt + layer].first;
                     Data *rootValue = pastKeyValues[b * block_cnt + layer].second;
@@ -21837,7 +21942,7 @@ namespace fastllm {
                                             prefixLocalValues[b][layer].at(device));
                             }
                         }
-                    } else {
+                    } else if (!useLinearReplay) {
                         for (int device : devices) {
                             prefixStateRestores.push_back({
                                 getLocalCache(*rootKey, device),
@@ -21857,10 +21962,53 @@ namespace fastllm {
             }
             copyStateTensors(prefixStateRestores);
 
+            if (useLinearReplay && rejectedRequests > 0) {
+                // Each rank consumes activations on its persistent PTDS. The
+                // backup is read directly by the recovery kernel, avoiding a
+                // separate recurrent-state D2D restore for every request.
+                std::vector<std::exception_ptr> replayErrors(devices.size());
+                auto restoreLinear = [&](int rank) {
+                    int device = devices[rank];
+                    FastllmCudaSetDevice(device);
+                    for (int layer = 0; layer < block_cnt; layer++) {
+                        if (isAttentionLayerAt(layer)) continue;
+                        auto &cache = *dflashLinearReplay[layer].at(device);
+                        std::vector<Data*> keys(batch), values(batch);
+                        std::vector<Data*> initialKeys(batch), initialValues(batch);
+                        for (int b = 0; b < batch; b++) {
+                            keys[b] = getLocalCache(*pastKeyValues[b * block_cnt + layer].first, device);
+                            values[b] = getLocalCache(*pastKeyValues[b * block_cnt + layer].second, device);
+                            initialKeys[b] = getLocalCache(
+                                speculativeLinearStates[layer][rollbackSlotBase + b].first, device);
+                            initialValues[b] = getLocalCache(
+                                speculativeLinearStates[layer][rollbackSlotBase + b].second, device);
+                        }
+                        if (!cache.ready || !FastllmCudaDFlashRestoreLinearPrefixes(
+                                cache.input, cache.conv, cache.ba,
+                                *cache.norm, *cache.aLog, *cache.dtBias,
+                                keys, values, initialKeys, initialValues, commitLens,
+                                cache.keyHeads, cache.valueHeads,
+                                head_k_dim, head_v_dim, rms_norm_eps)) {
+                            throw std::runtime_error("Qwen3.5 DFlash compact state recovery failed.");
+                        }
+                    }
+                    // Later request-cache maintenance may run on another PTDS.
+                    FastllmCudaSyncCurrentThreadStream();
+                };
+                if (tensorParallel) {
+                    threadTpWorkerGroup.RunWithCaller(devices, restoreLinear, replayErrors);
+                } else {
+                    try { restoreLinear(0); }
+                    catch (...) { replayErrors[0] = std::current_exception(); }
+                }
+                for (auto &error : replayErrors) if (error) std::rethrow_exception(error);
+            }
+
         } else {
             // Without prefix snapshots, restore every request whose validated
             // suffix is longer than its committed prefix, then replay that
-            // prefix. DFlash uses this bounded-memory path at every batch size.
+            // prefix. This remains the fallback when optimized recovery is
+            // explicitly disabled.
             std::vector<BatchStateTensorCopy> rollbackStateRestores;
             rollbackStateRestores.reserve(
                 rejectedRequests * block_cnt * devices.size() * 2);
@@ -22265,9 +22413,9 @@ namespace fastllm {
         int mtpSchedulerLanes = 1;
         if (canUseMtpBatchForward) {
             if (schedulerUsesDFlash) {
-                // DFlash keeps one rollback state per request and replays only
-                // rejected prefixes, so it can use every configured lane
-                // without the batch x draft prefix-snapshot footprint.
+                // Small DFlash batches retain prefix snapshots. Larger batches
+                // replay rejected prefixes, so the snapshot limit does not
+                // limit the number of scheduler lanes.
                 mtpSchedulerLanes = configuredMtpSchedulerLanes;
             } else {
                 // The single-GPU path keeps prefix snapshots only for small
