@@ -32012,6 +32012,25 @@ namespace fastllm {
                 if (it != weight.weight.end()) Qwen35QuantizeDraftWeights({&it->second});
             }
         }
+        // Draft TP shards are created after the target's synchronized warmup.
+        // Their first call may have hundreds of rows, and steady calls have
+        // force-sync disabled, so lazy FP8 packing never becomes eligible.
+        // Prepare each private shard once, before any draft forward uses it.
+        if (Qwen35EnvDefaultEnabled("FASTLLM_MTP_FP8_MARLIN")) {
+            int prepared = 0;
+            for (const char *suffix : {"self_attn.mergeqkv.weight", "self_attn.q_proj.weight",
+                                      "self_attn.k_proj.weight", "self_attn.v_proj.weight",
+                                      "self_attn.o_proj.weight", "mlp.gateup_proj.weight", "mlp.down_proj.weight"}) {
+                auto it = weight.weight.find(prefix + suffix);
+                if (it == weight.weight.end() || !it->second.multiDeviceData) continue;
+                for (const auto &shard : it->second.multiDeviceDatas) {
+                    FastllmCudaSetDevice(shard.first);
+                    if (shard.second && FastllmCudaPrepareFp8MarlinLayout(*shard.second)) ++prepared;
+                }
+            }
+            FastllmCudaSetDevice(devices.front());
+            if (prepared) printf("[Qwen3.5 MTP] prepared %d FP8 draft TP shards in Marlin layout.\n", prepared);
+        }
         mtpTpDevices = devices;
         mtpTpPrepared = true;
         printf("[Qwen3.5 MTP] transformer TP=%zu, KV heads per device:", devices.size());

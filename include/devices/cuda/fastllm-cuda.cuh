@@ -363,6 +363,8 @@ bool FastllmCudaMarlinHalfNVFP4Swiglu(const void *a, const uint32_t *b_q_weight,
     const void *b_scales, const float *global_scale, void *c,
     int size_m, int size_n, int size_k, int *workspace, void *c_tmp);
 bool FastllmCudaHasFp8MarlinLayout(const fastllm::Data &weight);
+// Initialization of bias-free weights only, before use by other streams.
+bool FastllmCudaPrepareFp8MarlinLayout(fastllm::Data &weight);
 bool FastllmCudaTryMarlinHalfMatMulFloatFP8E4M3(const fastllm::Data &input,
                                                 fastllm::Data &weight,
                                                 const fastllm::Data &bias,

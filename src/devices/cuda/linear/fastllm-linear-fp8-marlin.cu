@@ -24,6 +24,9 @@
 #include <mutex>
 #include <vector>
 
+void FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(
+    fastllm::Data &weight, const fastllm::Data &bias, int k);
+
 namespace {
 
 constexpr int FP8_MARLIN_WORKSPACE_IDX = 3;
@@ -414,6 +417,27 @@ bool FastllmCudaDequantFp8MarlinForCublas(fastllm::Data &weight, void *destinati
 extern "C" bool FastllmCudaHasFp8MarlinLayout(
         const fastllm::Data &weight) {
     return HasFp8MarlinOnDevice(weight);
+}
+
+extern "C" bool FastllmCudaPrepareFp8MarlinLayout(fastllm::Data &weight) {
+    int arch = 0, device = -1;
+    if (!Fp8MarlinDeviceSupported(arch) ||
+        weight.dataType != fastllm::DataType::FP8_E4M3 || weight.dims.size() != 2 ||
+        weight.multiDeviceData || weight.isFake || !weight.cudaData ||
+        weight.dataDevice != fastllm::DataDevice::CUDA || weight.dataDeviceIds.size() != 1 ||
+        weight.blockM != FP8_GROUP_SIZE || weight.blockK != FP8_GROUP_SIZE ||
+        weight.dims[0] <= 0 || weight.dims[1] <= 0 || weight.dims[0] % 64 ||
+        weight.dims[1] % FP8_GROUP_SIZE ||
+        cudaGetDevice(&device) != cudaSuccess || device != weight.dataDeviceIds[0]) return false;
+    if (HasFp8MarlinOnDevice(weight)) return true;
+    // Keep the same native/Triton architecture preferences as the dispatcher.
+    if (Fp8MarlinShouldPreserveRowMajorForTriton(arch)) return false;
+#if defined(FASTLLM_ENABLE_DEEPGEMM_FP8_SM90)
+    if (arch == 90 && weight.dims[0] % 128 == 0) return false;
+#endif
+    fastllm::Data emptyBias;
+    FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(weight, emptyBias, weight.dims[0]);
+    return EnsureFp8MarlinOnDevice(weight, weight.dims[1], weight.dims[0]);
 }
 
 extern "C" bool FastllmCudaTryMarlinHalfMatMulFloatFP8E4M3(
