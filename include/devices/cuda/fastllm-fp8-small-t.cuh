@@ -24,6 +24,21 @@ template <auto Function, int Threads> inline bool KernelAvailable(int device) {
     return found->second;
 }
 
+// The wider reduction tile was measured for long-K, wide-output M=8
+// matrices on SM120. Cache the architecture query per device.
+inline bool UseWideMma16(int device) {
+    static thread_local std::map<int, bool> supported;
+    auto found = supported.find(device);
+    if (found == supported.end()) {
+        int major = 0, minor = 0;
+        bool ok = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) == cudaSuccess &&
+                  cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) == cudaSuccess;
+        if (!ok) cudaGetLastError();
+        found = supported.emplace(device, ok && major == 12 && minor == 0).first;
+    }
+    return found->second;
+}
+
 // Callers validate dense row-scaled FP8, 1..8 rows, K divisible by 256,
 // and non-overlapping input/output buffers before dispatch. No global workspace
 // or reordered weight copy is allocated by these kernels.
@@ -277,7 +292,9 @@ inline bool Launch(const T *x, const uint8_t *w, const float *scales, const Bias
     } while (false)
     if constexpr (Tokens >= 5) {
         if (N < 16384 || Tokens == 8) {
-            if ((N > 8192 && N < 16384) || (N <= 8192 && Tokens == 8))
+            if ((N > 8192 && N < 16384) || (N <= 8192 && Tokens == 8) ||
+                (Tokens == 8 && N >= 16384 && N <= 65536 && K >= 4096 && K <= 32768 &&
+                 UseWideMma16(device)))
                 FASTLLM_FP8_SMALL_LAUNCH((N + 15) / 16, 512, MmaKernel<T, Tokens, 16, Add, BiasT>);
             else
                 FASTLLM_FP8_SMALL_LAUNCH((N + 15) / 16, 256, MmaKernel<T, Tokens, 8, Add, BiasT>);
