@@ -4312,41 +4312,76 @@ namespace fastllm {
                     const float *bias = (const float*)gateBias.cpuData;
                     std::vector<int> indices((uint64_t)seqlen * num_experts_per_tok);
                     std::vector<float> scores((uint64_t)seqlen * num_experts_per_tok);
-                    std::vector<float> original(num_experts), select(num_experts);
-                    for (int t = 0; t < seqlen; t++) {
-                        const float *tokenBias = (gateBiasVl != nullptr && (*imageMask)[t] != 0) ?
-                                                 (const float*)gateBiasVl->cpuData : bias;
-                        for (int e = 0; e < num_experts; e++) {
-                            const float value = raw[(uint64_t)t * num_experts + e];
-                            original[e] = V41ReferenceMathEnabled()
-                                ? V41CPUMath().Sqrt(value > 20.0f ? value : V41CPUMath().Log1p(V41CPUMath().Exp(value)))
-                                : std::sqrt(V41Softplus(value));
-                            select[e] = original[e] + tokenBias[e];
-                        }
-                        float sum = 0.0f;
-                        for (int k = 0; k < num_experts_per_tok; k++) {
-                            int best = 0;
-                            for (int e = 1; e < num_experts; e++) {
-                                if (select[e] > select[best]) {
-                                    best = e;
+                    // 每个 token 只写 indices / scores 里属于自己的那段，token 之间没有
+                    // 任何依赖；original / select 是每 token 的临时数组，必须每线程各一份。
+                    // 于是按 token 区间切开是逐位等价的，不是近似。
+                    // prefill 下这里是热路径：真实模型 384 个专家超过 CUDA 路由 kernel 的
+                    // 256 上限，整段路由只能走这条 CPU 实现，而 top-k 是 O(k·E) 的重复扫描。
+                    std::function<void(int, int)> routeWorker = [&](int tSt, int tEnd) {
+                        std::vector<float> original(num_experts), select(num_experts);
+                        for (int t = tSt; t < tEnd; t++) {
+                            const float *tokenBias = (gateBiasVl != nullptr && (*imageMask)[t] != 0) ?
+                                                     (const float*)gateBiasVl->cpuData : bias;
+                            for (int e = 0; e < num_experts; e++) {
+                                const float value = raw[(uint64_t)t * num_experts + e];
+                                original[e] = V41ReferenceMathEnabled()
+                                    ? V41CPUMath().Sqrt(value > 20.0f ? value : V41CPUMath().Log1p(V41CPUMath().Exp(value)))
+                                    : std::sqrt(V41Softplus(value));
+                                select[e] = original[e] + tokenBias[e];
+                            }
+                            float sum = 0.0f;
+                            for (int k = 0; k < num_experts_per_tok; k++) {
+                                int best = 0;
+                                for (int e = 1; e < num_experts; e++) {
+                                    if (select[e] > select[best]) {
+                                        best = e;
+                                    }
                                 }
+                                indices[(uint64_t)t * num_experts_per_tok + k] = best;
+                                scores[(uint64_t)t * num_experts_per_tok + k] = original[best];
+                                sum += original[best];
+                                select[best] = -std::numeric_limits<float>::infinity();
                             }
-                            indices[(uint64_t)t * num_experts_per_tok + k] = best;
-                            scores[(uint64_t)t * num_experts_per_tok + k] = original[best];
-                            sum += original[best];
-                            select[best] = -std::numeric_limits<float>::infinity();
-                        }
-                        if (V41ReferenceMathEnabled()) {
-                            sum = V41ReferenceSum(num_experts_per_tok, [&](size_t k) {
-                                return scores[(uint64_t)t * num_experts_per_tok + k];
-                            });
-                        }
-                        for (int k = 0; k < num_experts_per_tok; k++) {
-                            float &v = scores[(uint64_t)t * num_experts_per_tok + k];
-                            if (norm_topk_prob && num_experts_per_tok > 1) {
-                                v /= (sum + 1e-20f);
+                            if (V41ReferenceMathEnabled()) {
+                                sum = V41ReferenceSum(num_experts_per_tok, [&](size_t k) {
+                                    return scores[(uint64_t)t * num_experts_per_tok + k];
+                                });
                             }
-                            v *= routed_scaling_factor;
+                            for (int k = 0; k < num_experts_per_tok; k++) {
+                                float &v = scores[(uint64_t)t * num_experts_per_tok + k];
+                                if (norm_topk_prob && num_experts_per_tok > 1) {
+                                    v /= (sum + 1e-20f);
+                                }
+                                v *= routed_scaling_factor;
+                            }
+                        }
+                    };
+                    AliveThreadPool *routePool = GetAlivePool();
+                    int routeThreads = 1;
+                    if (routePool != nullptr && !V41EnvFlag("FASTLLM_DSV41_DISABLE_PARALLEL_ROUTE")) {
+                        int threadSt = routePool->curActivateThreadInterval.first;
+                        int threadLen = routePool->curActivateThreadInterval.second - threadSt;
+                        routeThreads = std::min(seqlen, std::max(1, threadLen));
+                    }
+                    // decode（seqlen=1）与短片段下派发开销大于收益，直接串行。
+                    if (routeThreads <= 1 || seqlen < 64) {
+                        routeWorker(0, seqlen);
+                    } else {
+                        int threadSt = routePool->curActivateThreadInterval.first;
+                        std::vector<V41EngramGatherOp*> routeOps;
+                        int per = (seqlen + routeThreads - 1) / routeThreads;
+                        for (int i = 0; i < routeThreads; i++) {
+                            int st = i * per, end = std::min(seqlen, st + per);
+                            if (st < end) {
+                                routeOps.push_back(new V41EngramGatherOp(&routeWorker, st, end));
+                            }
+                        }
+                        for (size_t i = 0; i < routeOps.size(); i++) {
+                            routePool->PushOp(threadSt + (int)i, routeOps[i]);
+                        }
+                        for (size_t i = 0; i < routeOps.size(); i++) {
+                            routePool->Wait(threadSt + (int)i);
+                            delete routeOps[i];
                         }
                     }
                     Data idxData(DataType::INT32, {seqlen, num_experts_per_tok});

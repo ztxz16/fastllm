@@ -2805,6 +2805,13 @@ namespace fastllm {
                     auto lastRecordTime = std::chrono::system_clock::now();
                     long long genTokens = 0;
                     const bool printProfile = GetFastllmEnv().printProfile;
+                    // 选批时一旦选中 prompt 就会跳过本轮全部 decode（见下面 isPrompt 循环里
+                    // 的第一个 continue），而这一轮可能很长：实测 3 路 8k prompt 并发进来时
+                    // 正在输出的请求被饿死 32 秒，1 路时则完全不受影响。
+                    // 这个闩锁复刻新引擎 RunNewMainLoop 里的 forceDecodeThisIteration：
+                    // 跑过一轮带 prompt 的前向后，强制下一轮只做 decode，然后清位。
+                    // 于是 prefill 与 decode 严格交替，已在输出的请求不会被新请求饿死。
+                    bool needDecodeYield = false;
                     while (true) {
                         if (model->isFree) {
                             break;
@@ -2845,14 +2852,23 @@ namespace fastllm {
                                 currentActivate++;
                             }
                         }
+                        // 选批过程中 currentActivate 会因为本轮选中的请求自增，
+                        // 「是否有别的请求正在输出」必须用选批之前的快照。
+                        const int activeBeforeSelection = currentActivate;
                         std::vector <std::pair <int, int> > orders;
                         for (auto &it : model->responseContextDict.dicts) {
                             orders.push_back(std::make_pair(-(int)it.second->currentTokens.size(), it.first));
                         }
                         sort(orders.begin(), orders.end());
 
+                        // 上一轮做过 prompt，本轮让给 decode：跳过 prompt 那一遍，
+                        // seqLens 保持为空，于是下面 isPrompt==0 的一遍正常执行。
+                        const bool forceDecodeThisIteration = needDecodeYield && activeBeforeSelection > 0;
                         for (int isPrompt = 1; isPrompt >= 0; isPrompt--) {
                             int cnt = 0;
+                            if (isPrompt == 1 && forceDecodeThisIteration) {
+                                continue;
+                            }
                             if (isPrompt == 0 && seqLens.size() > 0) {
                                 continue;
                             }
@@ -3019,6 +3035,12 @@ namespace fastllm {
                                 }
                             }
                         }
+                        // 闩锁在这里更新，而不是前向之后：空批会走下面那个 else 分支，
+                        // 放在前向块里会让闩锁永远卡在置位状态，反过来把 prompt 饿死。
+                        // 本轮选了 prompt 且还有别的请求在输出 -> 下一轮强制让给 decode；
+                        // 其余情况（纯 decode、空批、没有别的活跃请求）一律清位。
+                        needDecodeYield = (prefillTokens > 0 && activeBeforeSelection > 0);
+
                         if (seqLens.size() > 0) {
                             std::vector <std::pair <Data, Data> > *pastKeyValue1;
                             if (seqLens.size() == 1) {
