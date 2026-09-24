@@ -6249,6 +6249,24 @@ namespace fastllm {
         };
         runSharedExpert(flattened, runRoutedExperts ? sharedOutput : output);
 
+#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
+        if (hostMoe && batch * sequence >= kNumasMoeGpuPrefillMinRows &&
+            (moeDevice == "numa" || moeDevice.rfind("numa:", 0) == 0)) {
+            if (runRoutedExperts && !selectedBeforeShared) {
+                selectExperts();
+                selectedBeforeShared = true;
+            }
+            // NUMA prefill launches expert workers on both TP devices. Their
+            // streams share the temporary pool with the rank streams, whose
+            // released intermediates may still be in use by queued kernels.
+            // Drain both producers before either device's worker can reuse
+            // those buffers. Single-row decode and MTP verification stay on
+            // their existing stream-local paths.
+            FastllmCudaSyncCurrentThreadStream();
+            threadTpOwner->Barrier();
+        }
+#endif
+
 #ifdef USE_CUDA
         FastllmCudaGraphMarkParallelFirstDone(deviceLayer);
         FastllmCudaGraphMarkParallelSecondBegin(deviceLayer);

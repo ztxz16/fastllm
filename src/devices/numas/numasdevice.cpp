@@ -7597,7 +7597,7 @@ namespace fastllm {
             return;
         }
 
-        if (input.dims[0] < 32) {
+        if (input.dims[0] < kNumasMoeGpuPrefillMinRows) {
             waitForCpuInput();
             Data *cpuOutput = &output;
 #ifdef USE_CUDA

@@ -84,6 +84,7 @@ namespace fastllm {
     // Keep this bound aligned with the NUMA grouped-decode path.  It is an
     // algorithmic limit rather than a device-specific tuning parameter.
     constexpr int kNumasMoePrefetchMaxRows = 8;
+    constexpr int kNumasMoeGpuPrefillMinRows = 32;
 
     // Whether the active CPU kernels can preserve one-token decode arithmetic
     // for a grouped MoE batch of this size.

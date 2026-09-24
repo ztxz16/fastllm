@@ -333,6 +333,11 @@ compare gate and output bytes against the original all-resident GPU backend
 for FP16/BF16, including two layer tables, repeated expert IDs, changing inputs
 and scores, eviction and both eager execution and graph replay.
 
+`test/benchmark/qwen4_tp_short_requests.py` exercises a real Qwen checkpoint
+with 512/2040-token inputs, 1/2/8-token outputs and repeated cache/MTP switches.
+It checks the TP/NUMA prefill handoff without per-operator synchronization,
+which would mask premature cross-thread reuse of CUDA temporary buffers.
+
 Shared-NUMA NVFP4 cases compare gate/output bytes with a full snapshot across
 NUMA shard counts, verifier sizes, eviction and eager/graph replay, including a
 2560-by-640 expert. They cover distinct gate/up scales, invalid shards,
