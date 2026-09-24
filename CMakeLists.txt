@@ -1118,6 +1118,13 @@ if (UNIT_TEST)
         fastllm_add_checked_test(cuda_dflash_sm75 cuda_dflash_sm75_test "PASS DFlash SM75 attention" 600)
         set_tests_properties(cuda_dflash_sm75 PROPERTIES LABELS cuda RUN_SERIAL TRUE
             ENVIRONMENT "FASTLLM_CUDA_GRAPH=0")
+        add_executable(cuda_dflash_attention_test test/basic/test_cuda_dflash_attention.cu)
+        target_link_libraries(cuda_dflash_attention_test PRIVATE fastllm)
+        set_target_properties(cuda_dflash_attention_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        fastllm_add_checked_test(cuda_dflash_attention cuda_dflash_attention_test "PASS DFlash attention" 600)
+        set_tests_properties(cuda_dflash_attention PROPERTIES LABELS cuda RUN_SERIAL TRUE
+            ENVIRONMENT "DFLASH_ATTN_NO_BENCH=1")
+
         target_link_libraries(cuda_nvfp4_fused_test PRIVATE fastllm)
         set_target_properties(cuda_nvfp4_fused_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
         fastllm_add_checked_test(cuda_nvfp4_fused cuda_nvfp4_fused_test "PASS" 600)

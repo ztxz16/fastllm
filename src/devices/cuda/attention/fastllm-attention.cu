@@ -1815,12 +1815,12 @@ bool FastllmCudaDFlashAttention(
     const bool isSm75 = capability.first == 7 && capability.second == 5;
     const char *attentionFlag = std::getenv("FASTLLM_DFLASH_ATTENTION");
     const bool useFusedAttention = attentionFlag ?
-        std::strcmp(attentionFlag, "1") == 0 : isSm75;
+        std::strcmp(attentionFlag, "1") == 0 : (isSm75 || capability.first >= 8);
     const bool useSm75Tile = isSm75 && useFusedAttention;
     const bool useSm80Tile = capability.first >= 8 && useFusedAttention;
     // One switch controls both tiles: 0 restores cuBLAS, 1 opts in on
-    // supported devices. When unset, only the validated SM75 Q32 path
-    // defaults on. Unsupported shapes/architectures keep cuBLAS.
+    // supported devices. The Q32 (SM75) and Q64 (SM80+) fused paths default
+    // on. Unsupported shapes/architectures keep cuBLAS.
     if (queries > 0 && queries <= 16 && group <= 64 / queries &&
         heads > 0 && k.dims[0] <= 65535 &&
         slidingWindow >= queries && slidingWindow <= 4096 &&
