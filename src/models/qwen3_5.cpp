@@ -28544,6 +28544,45 @@ namespace fastllm {
             ~Restore() { if (device >= 0) FastllmCudaSetDevice(device); }
         } restore{previousDevice};
         Data &head = weight["lm_head.weight"];
+        if (devices.size() == 1 && !head.multiDeviceData) {
+            std::vector<int> ids;
+            mtp_shortlist::Shard plan;
+            const auto bias = weight.weight.find("lm_head.bias");
+            bool valid = head.dims.size() == 2 && dflashSelectorTopK > 0 &&
+                (bias == weight.weight.end() || bias->second.dims.empty()) &&
+                mtp_shortlist::Read(path, head.dims[0], ids) &&
+                mtp_shortlist::Project(ids, {{0, head.dims[0]}},
+                    head.dims[0], head.dims[0], plan) &&
+                plan.logicalSize >= dflashSelectorTopK &&
+                FastllmCudaMarlinNVFP4Supported((int)plan.rows.size(), head.dims[1]);
+            const int device = devices.front();
+            std::unordered_map<int, Data> pending;
+            if (valid) {
+                FastllmCudaSetDevice(device);
+                valid = FastllmCudaQuantizeLinearWeightNVFP4Block16Rows(
+                    head, pending[device], plan.rows);
+            }
+            if (!valid) {
+                printf("[Qwen3.5 DFlash2 shortlist] invalid or unsupported single-GPU shortlist; using full vocabulary.\n");
+                return false;
+            }
+            Data &q = pending.at(device);
+            q.name = "dflash.draft_lm_head_nvfp4_shortlist.cuda:" + std::to_string(device);
+            q.weightType = WeightType::LINEAR;
+            q.isModelWeight = true;
+            Qwen35PrepareDraftNvfp4Layout(q, device);
+            const uint64_t bytes = q.GetBytes();
+            const size_t paddedRows = plan.rows.size();
+            plan.tokenIds.resize(plan.logicalSize);
+            dflashNvfp4TpLmHeads.swap(pending);
+            dflashDraftTokenIds[device] = std::move(plan.tokenIds);
+            printf("[Qwen3.5 DFlash2 shortlist] GPU %d: selected=%d padded=%zu source=%d.\n",
+                device, plan.logicalSize, paddedRows, head.dims[0]);
+            printf("[Qwen3.5 DFlash2 shortlist] ready: %zu/%d tokens, %.3f GB extra; greedy only, full heads retained.\n",
+                ids.size(), head.dims[0], bytes / 1.0e9);
+            fflush(stdout);
+            return true;
+        }
         std::vector<int> ids;
         std::map<int, mtp_shortlist::Shard> plans;
         bool valid = devices.size() > 1 && head.multiDeviceData && head.dims.size() == 2 &&
@@ -28610,13 +28649,14 @@ namespace fastllm {
         AssertInFastLLM(candidates.dataDevice == DataDevice::CPU &&
             candidates.dataType == DataType::FLOAT32 && candidates.Count(0) % 2 == 0,
             "DFlash shortlist candidates must be host token/score pairs.\n");
+        const bool single = !weight.weight.at("lm_head.weight").multiDeviceData;
         float *pairs = reinterpret_cast<float*>(candidates.cpuData);
         for (uint64_t i = 0; i < candidates.Count(0); i += 2) {
             const int proxy = (int)(pairs[i] + 1.0e-3f);
             int token = -1;
             for (const auto &entry : dflashDraftTokenIds) {
-                const auto &ranges = threadTpLmHeadScheme.at(entry.first);
-                token = mtp_shortlist::MapProxyId(proxy, ranges[0].first, entry.second);
+                const int start = single ? 0 : threadTpLmHeadScheme.at(entry.first)[0].first;
+                token = mtp_shortlist::MapProxyId(proxy, start, entry.second);
                 if (token >= 0) break;
             }
             AssertInFastLLM(token >= 0, "DFlash shortlist candidate ID outside logical rows.\n");
@@ -28865,6 +28905,9 @@ namespace fastllm {
                 }
             }
             Data &head = weight["lm_head.weight"];
+            if (!head.multiDeviceData && supported(head)) {
+                PrepareDFlashDraftShortlist({device});
+            }
             if (head.multiDeviceData && !PrepareDFlashDraftShortlist(tpDevices)) {
                 for (int tpDevice : tpDevices) {
                     auto local = head.multiDeviceDatas.find(tpDevice);
