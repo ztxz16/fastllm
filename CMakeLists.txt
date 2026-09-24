@@ -1118,6 +1118,7 @@ if (UNIT_TEST)
         fastllm_add_checked_test(cuda_dflash_sm75 cuda_dflash_sm75_test "PASS DFlash SM75 attention" 600)
         set_tests_properties(cuda_dflash_sm75 PROPERTIES LABELS cuda RUN_SERIAL TRUE
             ENVIRONMENT "FASTLLM_CUDA_GRAPH=0")
+
         foreach(dflash_test IN ITEMS attention rope)
             add_executable(cuda_dflash_${dflash_test}_test test/basic/test_cuda_dflash_${dflash_test}.cu)
             target_link_libraries(cuda_dflash_${dflash_test}_test PRIVATE fastllm)
@@ -1130,6 +1131,23 @@ if (UNIT_TEST)
             LABELS cuda RUN_SERIAL TRUE)
         set_tests_properties(cuda_dflash_attention PROPERTIES ENVIRONMENT "DFLASH_ATTN_NO_BENCH=1")
 
+        if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            add_executable(cuda_dflash_graph_test test/basic/test_cuda_dflash_graph.cu)
+            # fastllm is an OBJECT library. ELF link wrapping lets this test
+            # observe real CUDA graph calls without production instrumentation.
+            target_link_libraries(cuda_dflash_graph_test PRIVATE fastllm
+                "-Wl,--wrap=cudaGraphInstantiate"
+                "-Wl,--wrap=cudaGraphLaunch"
+                "-Wl,--wrap=cudaGraphExecDestroy")
+            set_target_properties(cuda_dflash_graph_test PROPERTIES
+                CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+            fastllm_add_checked_test(cuda_dflash_graph cuda_dflash_graph_test "ALL_PASS full draft graph lifecycle" 600)
+            set_tests_properties(cuda_dflash_graph PROPERTIES LABELS cuda RUN_SERIAL TRUE
+                ENVIRONMENT "FASTLLM_CUDA_DFLASH_FUSED_CONV=1;FASTLLM_CUDA_DFLASH_FUSED_QKV_PREPARE=1;FASTLLM_CUDA_DFLASH_FUSED_GATEUP_PREPARE=1")
+        else()
+            message(STATUS "DFlash graph execution-observation test requires Linux ELF link wrapping")
+        endif()
+
         target_link_libraries(cuda_nvfp4_fused_test PRIVATE fastllm)
         set_target_properties(cuda_nvfp4_fused_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
         fastllm_add_checked_test(cuda_nvfp4_fused cuda_nvfp4_fused_test "PASS" 600)
@@ -1138,7 +1156,6 @@ if (UNIT_TEST)
         set_tests_properties(cuda_nvfp4_swiglu_sm75 PROPERTIES
             LABELS cuda RUN_SERIAL TRUE
             ENVIRONMENT "SM75_SWIGLU_ONLY=1;FASTLLM_CUDA_GRAPH=0;FASTLLM_CUDA_NVFP4_SWIGLU_MULTIROW=1")
-
         fastllm_add_checked_test(cuda_nvfp4_sm120_tiles cuda_nvfp4_fused_test "PASS SM120 NVFP4 tiles" 600 sm120-tiles)
         fastllm_add_checked_test(cuda_nvfp4_swiglu_sm120 cuda_nvfp4_fused_test "PASS SM120 SwiGLU" 600 sm120-swiglu)
         set_tests_properties(cuda_nvfp4_sm120_tiles cuda_nvfp4_swiglu_sm120 PROPERTIES

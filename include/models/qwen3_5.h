@@ -502,7 +502,7 @@ namespace fastllm {
         void MapDFlashShortlistCandidates(Data &candidates) const;
         void RunDFlashLmHead(int device, Data &input, Data &originalHead, const Data &bias, Data &output,
                             bool useShortlist = false);
-        void RunDFlashLinear(Data &input, Data &weight, const Data &bias, Data &output);
+        void RunDFlashLinear(Data &input, Data &weight, const Data &bias, Data &output, Data *halfInputScratch = nullptr);
         void RunDFlashGateupLinear(int device, Data &input,
                                    Data &linearWeight, Data &output);
         bool RunDFlashTensorParallelMlp(int device, Data &input,

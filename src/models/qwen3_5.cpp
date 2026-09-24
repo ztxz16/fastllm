@@ -3528,7 +3528,9 @@ namespace fastllm {
         // Keep one device workspace per model/GPU and only retain graph objects
         // plus host-side metadata per batch.  Capturing the largest batch first
         // gives every Data object enough capacity for the smaller graph shapes.
+        struct Qwen35DFlashComputeWorkspace;
         struct Qwen35CudaGraphWorkspace {
+            std::shared_ptr<Qwen35DFlashComputeWorkspace> dflashCompute;
             std::mutex mutex;
             Qwen35CudaGraphDecodeState *activeState = nullptr;
             int capacityBatch = 0;
@@ -28427,14 +28429,15 @@ namespace fastllm {
     // Quantized draft projections keep their original BF16 activation boundary.
     // The existing NVFP4 Marlin route consumes FP16; never feed its packed
     // weights to the generic BF16 GEMV implementation.
-    void Qwen3_5Model::RunDFlashLinear(Data &input, Data &originalWeight, const Data &bias, Data &output) {
+    void Qwen3_5Model::RunDFlashLinear(Data &input, Data &originalWeight, const Data &bias, Data &output, Data *halfInputScratch) {
         const auto it = dflashNvfp4ViewWeights.find(originalWeight.name);
         Data &linearWeight = it == dflashNvfp4ViewWeights.end() ? originalWeight : it->second;
         if (linearWeight.dataType != DataType::NVFP4_BLOCK_16) {
             Linear(input, linearWeight, bias, output);
             return;
         }
-        Data halfInput;
+        Data temporaryHalfInput;
+        Data &halfInput = halfInputScratch ? *halfInputScratch : temporaryHalfInput;
         Data *source = &input;
         if (input.dataType != DataType::FLOAT16) {
             ToDataType(input, halfInput, DataType::FLOAT16);
@@ -29948,6 +29951,111 @@ namespace fastllm {
     }
 #endif
 
+#ifdef USE_CUDA
+    namespace {
+    // Reuse the model/device graph workspace and its existing reset lifecycle.
+    // Calls are serialized by the model's mtpCacheMutex.
+    // KV routing and CPU proposal selection remain outside these small graphs.
+    struct Qwen35DFlashComputeWorkspace {
+        struct Graph {
+            void *graph = nullptr, *exec = nullptr;
+            bool warmed = false, disabled = false;
+            std::vector<void*> reserved;
+
+            void Clear() {
+                if (exec) FastllmCudaGraphExecDestroy(exec);
+                if (graph) FastllmCudaGraphDestroy(graph);
+                if (!reserved.empty()) FastllmCudaGraphMemoryPoolRelease(reserved);
+                exec = graph = nullptr;
+                reserved.clear();
+                warmed = false;
+            }
+
+            template<class Body> void Run(Body &&body) {
+                Qwen35CudaGraphPointerTableScope pointerScope(this);
+                if (disabled || !warmed) {
+                    body();
+                    warmed = true;
+                    return;
+                }
+                auto launch = [&]() {
+                    if (!FastllmCudaGraphLaunch(exec))
+                        throw std::runtime_error("DFlash compute graph launch failed");
+                };
+                if (exec) { launch(); return; }
+                FastllmCudaClearThreadError();
+                FastllmCudaClearGraphError();
+                bool pool = FastllmCudaGraphPrepareCaptureDevice() &&
+                            FastllmCudaGraphMemoryPoolBegin();
+                bool captured = false;
+                if (pool && FastllmCudaGraphBeginCapture()) {
+                    try {
+                        body();
+                    } catch (...) {
+                        const bool captureFailure = FastllmCudaGraphCaptureInvalidated();
+                        void *failed = nullptr;
+                        FastllmCudaGraphEndCapture(&failed);
+                        if (failed) FastllmCudaGraphDestroy(failed);
+                        FastllmCudaGraphMemoryPoolAbort();
+                        if (!captureFailure) throw;
+                        pool = false;
+                    }
+                    if (pool) {
+                        captured = FastllmCudaGraphEndCapture(&graph) && graph &&
+                            !FastllmCudaGetThreadError();
+                        if (captured) {
+                            captured = FastllmCudaGraphMemoryPoolEnd(reserved);
+                            pool = false;
+                        }
+                        if (captured)
+                            captured = FastllmCudaGraphInstantiate(graph, &exec);
+                    }
+                }
+                if (captured) { launch(); return; }
+                if (pool) FastllmCudaGraphMemoryPoolAbort();
+                Clear();
+                disabled = true;
+                FastllmCudaClearThreadError();
+                FastllmCudaClearGraphError();
+                // Capture never executed the in-place residual operations.
+                // Retry the shared body once against the unchanged input.
+                body();
+            }
+        };
+
+        struct Layer {
+            Data normalized, attentionDynamic, attentionInput;
+            Data query, key, value, mergedQkv;
+            Data attentionHeads, tailInputHalf, tailInput, attentionOutput, convolvedAttention;
+            void *attentionHeadsPointer = nullptr;
+            Data mlpDynamic, mlpInput, mlpOutput, convolvedMlp;
+            Data gate, up, gateup;
+            Data halfAttentionDynamic, halfQkv, halfOutput;
+            Data halfMlpDynamic, halfGateup, halfDown;
+            Graph prefix, tail;
+        };
+        int device = -1, blockSize = 0;
+        bool logged = false;
+        void *ropeInvFreqPointer = nullptr, *hiddenPointer = nullptr;
+        Data embedding, hidden, positions;
+        std::vector<Layer> layers;
+        ~Qwen35DFlashComputeWorkspace() {
+            if (device < 0) return;
+            const int previous = FastllmCudaGetDevice();
+            FastllmCudaSetDevice(device);
+            ForceDeviceSync();
+            for (auto &layer : layers) {
+                layer.prefix.Clear();
+                layer.tail.Clear();
+            }
+            layers.clear();
+            embedding.FreeSpace(); hidden.FreeSpace(); positions.FreeSpace();
+            FastllmCudaSetDevice(previous);
+        }
+    };
+    } // namespace
+#endif
+
     std::vector<int> Qwen3_5Model::RunDFlashDraft(
             int device, const std::vector<int> &devices,
             int anchorToken, const GenerationConfig &generationConfig,
@@ -29988,11 +30096,6 @@ namespace fastllm {
                 dflashSlidingWindow, blockSize);
         PrepareDFlashRotary(device);
 
-        std::vector<float> tokenValues(blockSize,
-                                       (float)dflashMaskTokenId);
-        tokenValues[0] = (float)anchorToken;
-        Data inputIds(DataType::FLOAT32, {1, blockSize}, tokenValues);
-        Data hiddenStates;
         Data &embedWeight =
             weight[language_prefix + "embed_tokens.weight"];
         Data *draftEmbedWeight = &embedWeight;
@@ -30009,9 +30112,64 @@ namespace fastllm {
             draftEmbedWeight->cudaData != nullptr &&
             !draftEmbedWeight->dataDeviceIds.empty() &&
             draftEmbedWeight->dataDeviceIds[0] == device;
+        Qwen35DFlashComputeWorkspace *compute = nullptr;
+        const bool computeGraphs = useCudaEmbedding &&
+            (draftEmbedWeight->dataType == DataType::BFLOAT16 ||
+             draftEmbedWeight->dataType == DataType::FLOAT16) &&
+            Qwen35CudaGraphEnabled() &&
+            devices.size() <= 1 &&
+            (!threadTpWeightsPrepared.load(std::memory_order_acquire) ||
+             threadTpPreparedDevices.size() <= 1) &&
+            blockSize >= 1 && blockSize <= 16 &&
+            dflashHeadDim == 128 &&
+            ::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled("FASTLLM_CUDA_DFLASH_FUSED_CONV") &&
+            ::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled("FASTLLM_CUDA_DFLASH_FUSED_QKV_PREPARE") &&
+            ::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled("FASTLLM_CUDA_DFLASH_FUSED_GATEUP_PREPARE") &&
+            !FastllmCudaGraphIsCapturing();
+        if (computeGraphs) {
+            auto &entry = GetQwen35CudaGraphWorkspace(this, device).dflashCompute;
+            if (entry && (entry->device != device || entry->blockSize != blockSize || entry->layers.size() != size_t(dflashLayers) ||
+                          entry->ropeInvFreqPointer != dflashRopeInvFreq.cudaData))
+                entry.reset();
+            if (!entry) {
+                bool ready = true;
+                for (int layer = 0; ready && layer < dflashLayers; ++layer) {
+                    for (const char *suffix : {"attention_conv.kernel_projection.weight", "self_attn.mergeqkv.weight",
+                                              "self_attn.o_proj.weight", "mlp_conv.kernel_projection.weight",
+                                              "mlp.gateup_proj.weight", "mlp.down_proj.weight"}) {
+                        const std::string name = "dflash.layers." + std::to_string(layer) + "." + suffix;
+                        auto found = weight.weight.find(name);
+                        if (found == weight.weight.end()) { ready = false; break; }
+                        auto view = dflashNvfp4ViewWeights.find(found->second.name);
+                        const Data &w = view == dflashNvfp4ViewWeights.end() ? found->second : view->second;
+                        if (w.multiDeviceData || w.dataDevice != DataDevice::CUDA || !w.cudaData ||
+                            w.dataDeviceIds != std::vector<int>{device} ||
+                            w.dataType != DataType::NVFP4_BLOCK_16 || !FastllmCudaHasNVFP4MarlinLayout(w)) {
+                            ready = false; break;
+                        }
+                    }
+                }
+                if (ready) {
+                    entry = std::make_shared<Qwen35DFlashComputeWorkspace>();
+                    entry->device = device;
+                    entry->blockSize = blockSize;
+                    entry->ropeInvFreqPointer = dflashRopeInvFreq.cudaData;
+                    entry->layers.resize(dflashLayers);
+                }
+            }
+            compute = entry.get();
+        }
+
+        std::vector<float> tokenValues(blockSize,
+                                       (float)dflashMaskTokenId);
+        tokenValues[0] = (float)anchorToken;
+        Data inputIds(DataType::FLOAT32, {1, blockSize}, tokenValues);
+        Data eagerHiddenStates;
+        Data &embeddingOutput = compute ? compute->embedding : eagerHiddenStates;
+        Data &hiddenStates = compute ? compute->hidden : eagerHiddenStates;
         if (useCudaEmbedding) {
             inputIds.ToDevice(DataDevice::CUDA, {device}, true);
-            Embedding(inputIds, *draftEmbedWeight, hiddenStates);
+            Embedding(inputIds, *draftEmbedWeight, embeddingOutput);
         } else {
             // Keep the host table in the target path's established type.
             // Alternating the full 248k x hidden table between FP16 and BF16
@@ -30028,17 +30186,35 @@ namespace fastllm {
                 hostEmbeddingType);
             hiddenStates.ToDevice(DataDevice::CUDA, {device}, true);
         }
-        if (hiddenStates.dataType != DataType::BFLOAT16) {
+        if (compute) {
+            // BF16 embedding weights can produce FP32 output. Keep that
+            // allocation separate from the fixed-width BF16 graph input.
+            ToDataType(embeddingOutput, hiddenStates, DataType::BFLOAT16);
+        } else if (hiddenStates.dataType != DataType::BFLOAT16) {
             ToDataType(hiddenStates, DataType::BFLOAT16);
         }
 
+        if (compute && compute->hiddenPointer != hiddenStates.cudaData) {
+            for (auto &layer : compute->layers) { layer.prefix.Clear(); layer.tail.Clear(); }
+            compute->hiddenPointer = hiddenStates.cudaData;
+        }
         std::vector<float> positionValues(blockSize);
         for (int token = 0; token < blockSize; token++) {
             positionValues[token] =
                 (float)(context.committedTokens + token);
         }
-        Data positions(DataType::FLOAT32, {1, blockSize}, positionValues);
-        positions.ToDevice(DataDevice::CUDA, {device}, true);
+        Data eagerPositions(DataType::FLOAT32, {1, blockSize}, positionValues);
+        Data &positions = compute ? compute->positions : eagerPositions;
+        if (compute) {
+            Qwen3CudaPrepareLocalOutput(positions, device);
+            positions.dataType = DataType::FLOAT32;
+            positions.UpdateUnitSize();
+            positions.Resize({1, blockSize});
+            positions.Allocate(false);
+            FastllmCudaCopyFromHostToDevice(positions.cudaData, positionValues.data(), blockSize * sizeof(float));
+        } else {
+            positions.ToDevice(DataDevice::CUDA, {device}, true);
+        }
 
         int cachedTokens = context.draftKeyValues[0].first.dims.size() == 3 ?
             context.draftKeyValues[0].first.dims[1] : 0;
@@ -30079,6 +30255,7 @@ namespace fastllm {
             ensureAttentionMask();
         }
 
+        bool computeCompatible = true;
         auto dynamicConvolve = [&](const Data &source,
                                    Data &dynamicProjection,
                                    Data &baseKernel,
@@ -30103,6 +30280,7 @@ namespace fastllm {
                     return;
                 }
             }
+            computeCompatible = false;
             RunDFlashDynamicConvolutionFallback(
                 source, dynamicProjection, baseKernel, side, blockSize,
                 output);
@@ -30111,105 +30289,116 @@ namespace fastllm {
         for (int layerIndex = 0; layerIndex < dflashLayers; layerIndex++) {
             const std::string prefix = "dflash.layers." +
                 std::to_string(layerIndex) + ".";
-            Data normalized, attentionDynamic, attentionInput;
-            RMSNorm(hiddenStates, weight[prefix + "input_layernorm.weight"],
-                    dflashRmsNormEps, normalized);
-            RunDFlashLinear(normalized,
-                   weight[prefix +
-                          "attention_conv.kernel_projection.weight"],
-                   *GetEmptyData(), attentionDynamic);
-            dynamicConvolve(
-                normalized, attentionDynamic,
-                weight[prefix + "attention_conv.base_kernel"], 0,
-                attentionInput);
+            Qwen35DFlashComputeWorkspace::Layer eagerLayer;
+            auto &buffers = compute ? compute->layers[layerIndex] : eagerLayer;
+            Data &normalized = buffers.normalized, &attentionDynamic = buffers.attentionDynamic;
+            Data &attentionInput = buffers.attentionInput;
+            Data &query = buffers.query, &key = buffers.key, &value = buffers.value, &mergedQkv = buffers.mergedQkv;
+            auto runPrefix = [&]() {
+                RMSNorm(hiddenStates, weight[prefix + "input_layernorm.weight"],
+                        dflashRmsNormEps, normalized);
+                RunDFlashLinear(normalized,
+                       weight[prefix +
+                              "attention_conv.kernel_projection.weight"],
+                       *GetEmptyData(), attentionDynamic, compute ? &buffers.halfAttentionDynamic : nullptr);
+                dynamicConvolve(
+                    normalized, attentionDynamic,
+                    weight[prefix + "attention_conv.base_kernel"], 0,
+                    attentionInput);
 
-            Data query, key, value, mergedQkv;
-            bool fusedQkvPrepared = false;
-            auto mergedQkvIt = weight.weight.find(
-                prefix + "self_attn.mergeqkv.weight");
-            if (mergedQkvIt != weight.weight.end()) {
-                const int qChannels = dflashHeads * dflashHeadDim;
-                const int kvChannels = dflashKvHeads * dflashHeadDim;
-                RunDFlashLinear(attentionInput, mergedQkvIt->second,
-                       *GetEmptyData(), mergedQkv);
-                if (::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled(
-                        "FASTLLM_CUDA_DFLASH_FUSED_QKV_PREPARE")) {
-                    for (auto item : {
-                             std::make_pair(&query, dflashHeads),
-                             std::make_pair(&key, dflashKvHeads),
-                             std::make_pair(&value, dflashKvHeads)}) {
-                        ::fastllm::Qwen3CudaPrepareLocalOutput(
-                            *item.first, device);
-                        item.first->dataType = DataType::FLOAT16;
-                        item.first->UpdateUnitSize();
-                        item.first->Resize(
-                            {item.second, blockSize, dflashHeadDim});
-                        item.first->Allocate(false);
-                    }
-                    fusedQkvPrepared = FastllmCudaDFlashPrepareQKV(
-                        mergedQkv,
-                        weight[prefix + "self_attn.q_norm.weight"],
-                        weight[prefix + "self_attn.k_norm.weight"],
-                        positions, dflashRopeInvFreq,
-                        query, key, value, blockSize, dflashHeads,
-                        dflashKvHeads, dflashHeadDim, dflashRmsNormEps);
-                    if (!fusedQkvPrepared) {
-                        for (Data *output : {&query, &key, &value}) {
-                            output->FreeSpace();
-                            output->dims.clear();
-                            output->strides.clear();
-                            output->expansionDims.clear();
+                bool fusedQkvPrepared = false;
+                auto mergedQkvIt = weight.weight.find(
+                    prefix + "self_attn.mergeqkv.weight");
+                if (mergedQkvIt != weight.weight.end()) {
+                    const int qChannels = dflashHeads * dflashHeadDim;
+                    const int kvChannels = dflashKvHeads * dflashHeadDim;
+                    RunDFlashLinear(attentionInput, mergedQkvIt->second,
+                           *GetEmptyData(), mergedQkv, compute ? &buffers.halfQkv : nullptr);
+                    if (::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled(
+                            "FASTLLM_CUDA_DFLASH_FUSED_QKV_PREPARE")) {
+                        for (auto item : {
+                                 std::make_pair(&query, dflashHeads),
+                                 std::make_pair(&key, dflashKvHeads),
+                                 std::make_pair(&value, dflashKvHeads)}) {
+                            ::fastllm::Qwen3CudaPrepareLocalOutput(
+                                *item.first, device);
+                            item.first->dataType = DataType::FLOAT16;
+                            item.first->UpdateUnitSize();
+                            item.first->Resize(
+                                {item.second, blockSize, dflashHeadDim});
+                            item.first->Allocate(false);
+                        }
+                        fusedQkvPrepared = FastllmCudaDFlashPrepareQKV(
+                            mergedQkv,
+                            weight[prefix + "self_attn.q_norm.weight"],
+                            weight[prefix + "self_attn.k_norm.weight"],
+                            positions, dflashRopeInvFreq,
+                            query, key, value, blockSize, dflashHeads,
+                            dflashKvHeads, dflashHeadDim, dflashRmsNormEps);
+                        if (!fusedQkvPrepared) {
+                            computeCompatible = false;
+                            for (Data *output : {&query, &key, &value}) {
+                                output->FreeSpace();
+                                output->dims.clear();
+                                output->strides.clear();
+                                output->expansionDims.clear();
+                            }
                         }
                     }
+                    if (!fusedQkvPrepared) {
+                        Split(mergedQkv, -1, 0, qChannels, query);
+                        Split(mergedQkv, -1, qChannels,
+                              qChannels + kvChannels, key);
+                        Split(mergedQkv, -1, qChannels + kvChannels,
+                              qChannels + 2 * kvChannels, value);
+                    }
+                } else {
+                    Linear(attentionInput,
+                           weight[prefix + "self_attn.q_proj.weight"],
+                           *GetEmptyData(), query);
+                    Linear(attentionInput,
+                           weight[prefix + "self_attn.k_proj.weight"],
+                           *GetEmptyData(), key);
+                    Linear(attentionInput,
+                           weight[prefix + "self_attn.v_proj.weight"],
+                           *GetEmptyData(), value);
                 }
                 if (!fusedQkvPrepared) {
-                    Split(mergedQkv, -1, 0, qChannels, query);
-                    Split(mergedQkv, -1, qChannels,
-                          qChannels + kvChannels, key);
-                    Split(mergedQkv, -1, qChannels + kvChannels,
-                          qChannels + 2 * kvChannels, value);
+                    query.Reshape(
+                        {1, blockSize, dflashHeads, dflashHeadDim});
+                    key.Reshape(
+                        {1, blockSize, dflashKvHeads, dflashHeadDim});
+                    value.Reshape(
+                        {1, blockSize, dflashKvHeads, dflashHeadDim});
+                    RMSNorm(query,
+                            weight[prefix + "self_attn.q_norm.weight"],
+                            dflashRmsNormEps, query);
+                    RMSNorm(key,
+                            weight[prefix + "self_attn.k_norm.weight"],
+                            dflashRmsNormEps, key);
+                    AssertInFastLLM(FastllmCudaDFlashApplyRope(query, positions, dflashRopeInvFreq),
+                                      "DFlash RoPE input is unsupported.\n");
+                    AssertInFastLLM(FastllmCudaDFlashApplyRope(key, positions, dflashRopeInvFreq),
+                                      "DFlash RoPE input is unsupported.\n");
+                    PermuteSelf(query, {0, 2, 1, 3});
+                    PermuteSelf(key, {0, 2, 1, 3});
+                    PermuteSelf(value, {0, 2, 1, 3});
+                    query.Reshape(
+                        {dflashHeads, blockSize, dflashHeadDim});
+                    key.Reshape(
+                        {dflashKvHeads, blockSize, dflashHeadDim});
+                    value.Reshape(
+                        {dflashKvHeads, blockSize, dflashHeadDim});
+                    ToDataType(query, DataType::FLOAT16);
+                    ToDataType(key, DataType::FLOAT16);
+                    ToDataType(value, DataType::FLOAT16);
                 }
-            } else {
-                Linear(attentionInput,
-                       weight[prefix + "self_attn.q_proj.weight"],
-                       *GetEmptyData(), query);
-                Linear(attentionInput,
-                       weight[prefix + "self_attn.k_proj.weight"],
-                       *GetEmptyData(), key);
-                Linear(attentionInput,
-                       weight[prefix + "self_attn.v_proj.weight"],
-                       *GetEmptyData(), value);
-            }
-            if (!fusedQkvPrepared) {
-                query.Reshape(
-                    {1, blockSize, dflashHeads, dflashHeadDim});
-                key.Reshape(
-                    {1, blockSize, dflashKvHeads, dflashHeadDim});
-                value.Reshape(
-                    {1, blockSize, dflashKvHeads, dflashHeadDim});
-                RMSNorm(query,
-                        weight[prefix + "self_attn.q_norm.weight"],
-                        dflashRmsNormEps, query);
-                RMSNorm(key,
-                        weight[prefix + "self_attn.k_norm.weight"],
-                        dflashRmsNormEps, key);
-                AssertInFastLLM(FastllmCudaDFlashApplyRope(query, positions, dflashRopeInvFreq),
-                                      "DFlash RoPE input is unsupported.\n");
-                AssertInFastLLM(FastllmCudaDFlashApplyRope(key, positions, dflashRopeInvFreq),
-                                      "DFlash RoPE input is unsupported.\n");
-                PermuteSelf(query, {0, 2, 1, 3});
-                PermuteSelf(key, {0, 2, 1, 3});
-                PermuteSelf(value, {0, 2, 1, 3});
-                query.Reshape(
-                    {dflashHeads, blockSize, dflashHeadDim});
-                key.Reshape(
-                    {dflashKvHeads, blockSize, dflashHeadDim});
-                value.Reshape(
-                    {dflashKvHeads, blockSize, dflashHeadDim});
-                ToDataType(query, DataType::FLOAT16);
-                ToDataType(key, DataType::FLOAT16);
-                ToDataType(value, DataType::FLOAT16);
-            }
+
+            };
+            if (compute) {
+                buffers.prefix.Run(runPrefix);
+                if (!computeCompatible) buffers.prefix.disabled = true;
+            } else runPrefix();
 
             Data &keyCache = context.draftKeyValues[layerIndex].first;
             Data &valueCache = context.draftKeyValues[layerIndex].second;
@@ -30224,7 +30413,8 @@ namespace fastllm {
                 keyCache, key, cacheAllocationUnit);
             Qwen35AppendDraftSequenceCache(
                 valueCache, value, cacheAllocationUnit);
-            Data attentionHeads;
+            Data eagerAttentionHeads;
+            Data &attentionHeads = compute ? buffers.attentionHeads : eagerAttentionHeads;
             bool implicitAttention = false;
             if (useImplicitAttention) {
                 ::fastllm::Qwen3CudaPrepareLocalOutput(
@@ -30254,97 +30444,134 @@ namespace fastllm {
             }
             Qwen35ResizeDraftSequenceCache(keyCache, oldKeyTokens);
             Qwen35ResizeDraftSequenceCache(valueCache, oldValueTokens);
-            PermuteSelf(attentionHeads, {1, 0, 2});
-            attentionHeads.Reshape(
-                {1, blockSize, dflashHeads * dflashHeadDim});
-            ToDataType(attentionHeads, DataType::BFLOAT16);
-            Data attentionOutput, convolvedAttention;
-            RunDFlashLinear(attentionHeads,
-                   weight[prefix + "self_attn.o_proj.weight"],
-                   *GetEmptyData(), attentionOutput);
-            dynamicConvolve(
-                attentionOutput, attentionDynamic,
-                weight[prefix + "attention_conv.base_kernel"], 1,
-                convolvedAttention);
-            AddTo(hiddenStates, convolvedAttention);
+            Data *tailInput = &attentionHeads;
+            if (compute) {
+                if (buffers.attentionHeadsPointer != attentionHeads.cudaData) {
+                    buffers.tail.Clear();
+                    buffers.attentionHeadsPointer = attentionHeads.cudaData;
+                }
+                tailInput = &buffers.tailInput;
+            } else {
+                PermuteSelf(attentionHeads, {1, 0, 2});
+                attentionHeads.Reshape({1, blockSize, dflashHeads * dflashHeadDim});
+                ToDataType(attentionHeads, DataType::BFLOAT16);
+            }
+            auto runTail = [&]() {
+                if (compute) {
+                    Qwen3CudaPrepareLocalOutput(buffers.tailInputHalf, device);
+                    buffers.tailInputHalf.dataType = DataType::FLOAT16;
+                    buffers.tailInputHalf.UpdateUnitSize();
+                    buffers.tailInputHalf.Resize({1, blockSize, dflashHeads, dflashHeadDim});
+                    buffers.tailInputHalf.Allocate(false);
+                    attentionHeads.Reshape({1, dflashHeads, blockSize, dflashHeadDim});
+                    const bool permuted = FastllmCudaPermuteTo(
+                        attentionHeads, buffers.tailInputHalf, {0, 2, 1, 3});
+                    attentionHeads.Reshape({dflashHeads, blockSize, dflashHeadDim});
+                    AssertInFastLLM(permuted, "DFlash graph attention transpose failed.");
+                    buffers.tailInputHalf.Reshape({1, blockSize, dflashHeads * dflashHeadDim});
+                    ToDataType(buffers.tailInputHalf, buffers.tailInput, DataType::BFLOAT16);
+                }
+                Data &attentionOutput = buffers.attentionOutput;
+                RunDFlashLinear(*tailInput,
+                       weight[prefix + "self_attn.o_proj.weight"],
+                       *GetEmptyData(), attentionOutput, compute ? &buffers.halfOutput : nullptr);
+                dynamicConvolve(attentionOutput, attentionDynamic,
+                    weight[prefix + "attention_conv.base_kernel"], 1, buffers.convolvedAttention);
+                AddTo(hiddenStates, buffers.convolvedAttention);
 
-            RMSNorm(hiddenStates,
-                    weight[prefix + "post_attention_layernorm.weight"],
-                    dflashRmsNormEps, normalized);
-            Data mlpDynamic, mlpInput;
-            RunDFlashLinear(normalized,
-                   weight[prefix + "mlp_conv.kernel_projection.weight"],
-                   *GetEmptyData(), mlpDynamic);
-            dynamicConvolve(
-                normalized, mlpDynamic,
-                weight[prefix + "mlp_conv.base_kernel"], 0,
-                mlpInput);
-            Data mlpOutput, convolvedMlp;
-            auto gateupIt = weight.weight.find(
-                prefix + "mlp.gateup_proj.weight");
-            auto downIt = weight.weight.find(
-                prefix + "mlp.down_proj.weight");
-            bool pairedTpMlp =
-                gateupIt != weight.weight.end() &&
-                downIt != weight.weight.end() &&
-                RunDFlashTensorParallelMlp(
-                    device, mlpInput, gateupIt->second,
-                    downIt->second, mlpOutput);
-            if (!pairedTpMlp) {
-                Data gate, up, gateup;
-                bool fusedGateupPrepared = false;
-                if (gateupIt != weight.weight.end()) {
-                    RunDFlashGateupLinear(device, mlpInput,
-                                          gateupIt->second, gateup);
-                    if (::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled(
-                            "FASTLLM_CUDA_DFLASH_FUSED_GATEUP_PREPARE")) {
-                        ::fastllm::Qwen3CudaPrepareLocalOutput(gate, device);
-                        gate.dataType = DataType::BFLOAT16;
-                        gate.UpdateUnitSize();
-                        gate.Resize(
-                            {1, blockSize, dflashIntermediateSize});
-                        gate.Allocate(false);
-                        fusedGateupPrepared =
-                            FastllmCudaDFlashPrepareGateup(
-                                gateup, gate, blockSize,
-                                dflashIntermediateSize);
-                        if (!fusedGateupPrepared) {
-                            gate.FreeSpace();
-                            gate.dims.clear();
-                            gate.strides.clear();
-                            gate.expansionDims.clear();
+                RMSNorm(hiddenStates,
+                        weight[prefix + "post_attention_layernorm.weight"],
+                        dflashRmsNormEps, normalized);
+                Data &mlpDynamic = buffers.mlpDynamic, &mlpInput = buffers.mlpInput;
+                RunDFlashLinear(normalized,
+                       weight[prefix + "mlp_conv.kernel_projection.weight"],
+                       *GetEmptyData(), mlpDynamic, compute ? &buffers.halfMlpDynamic : nullptr);
+                dynamicConvolve(
+                    normalized, mlpDynamic,
+                    weight[prefix + "mlp_conv.base_kernel"], 0,
+                    mlpInput);
+                Data &mlpOutput = buffers.mlpOutput;
+                auto gateupIt = weight.weight.find(
+                    prefix + "mlp.gateup_proj.weight");
+                auto downIt = weight.weight.find(
+                    prefix + "mlp.down_proj.weight");
+                bool pairedTpMlp =
+                    gateupIt != weight.weight.end() &&
+                    downIt != weight.weight.end() &&
+                    RunDFlashTensorParallelMlp(
+                        device, mlpInput, gateupIt->second,
+                        downIt->second, mlpOutput);
+                if (!pairedTpMlp) {
+                    Data &gate = buffers.gate, &up = buffers.up, &gateup = buffers.gateup;
+                    bool fusedGateupPrepared = false;
+                    if (gateupIt != weight.weight.end()) {
+                        if (compute)
+                            RunDFlashLinear(mlpInput, gateupIt->second, *GetEmptyData(), gateup,
+                                            &buffers.halfGateup);
+                        else
+                            RunDFlashGateupLinear(device, mlpInput, gateupIt->second, gateup);
+                        if (::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled(
+                                "FASTLLM_CUDA_DFLASH_FUSED_GATEUP_PREPARE")) {
+                            ::fastllm::Qwen3CudaPrepareLocalOutput(gate, device);
+                            gate.dataType = DataType::BFLOAT16;
+                            gate.UpdateUnitSize();
+                            gate.Resize(
+                                {1, blockSize, dflashIntermediateSize});
+                            gate.Allocate(false);
+                            fusedGateupPrepared =
+                                FastllmCudaDFlashPrepareGateup(
+                                    gateup, gate, blockSize,
+                                    dflashIntermediateSize);
+                            if (!fusedGateupPrepared) {
+                                gate.FreeSpace();
+                                gate.dims.clear();
+                                gate.strides.clear();
+                                gate.expansionDims.clear();
+                            }
                         }
+                        if (!fusedGateupPrepared) {
+                            Split(gateup, -1, 0, dflashIntermediateSize, gate);
+                            Split(gateup, -1, dflashIntermediateSize,
+                                  2 * dflashIntermediateSize, up);
+                        }
+                    } else {
+                        RunDFlashLinear(
+                            mlpInput,
+                            weight[prefix + "mlp.gate_proj.weight"],
+                            *GetEmptyData(), gate);
+                        RunDFlashLinear(
+                            mlpInput,
+                            weight[prefix + "mlp.up_proj.weight"],
+                            *GetEmptyData(), up);
                     }
                     if (!fusedGateupPrepared) {
-                        Split(gateup, -1, 0, dflashIntermediateSize, gate);
-                        Split(gateup, -1, dflashIntermediateSize,
-                              2 * dflashIntermediateSize, up);
+                        computeCompatible = false;
+                        ToDataType(gate, DataType::FLOAT16);
+                        ToDataType(up, DataType::FLOAT16);
+                        Silu(gate, gate);
+                        MulTo(gate, up);
+                        ToDataType(gate, DataType::BFLOAT16);
                     }
-                } else {
-                    RunDFlashLinear(
-                        mlpInput,
-                        weight[prefix + "mlp.gate_proj.weight"],
-                        *GetEmptyData(), gate);
-                    RunDFlashLinear(
-                        mlpInput,
-                        weight[prefix + "mlp.up_proj.weight"],
-                        *GetEmptyData(), up);
+                    RunDFlashLinear(gate, weight[prefix + "mlp.down_proj.weight"],
+                           *GetEmptyData(), mlpOutput, compute ? &buffers.halfDown : nullptr);
                 }
-                if (!fusedGateupPrepared) {
-                    ToDataType(gate, DataType::FLOAT16);
-                    ToDataType(up, DataType::FLOAT16);
-                    Silu(gate, gate);
-                    MulTo(gate, up);
-                    ToDataType(gate, DataType::BFLOAT16);
-                }
-                RunDFlashLinear(gate, weight[prefix + "mlp.down_proj.weight"],
-                       *GetEmptyData(), mlpOutput);
-            }
-            dynamicConvolve(
-                mlpOutput, mlpDynamic,
-                weight[prefix + "mlp_conv.base_kernel"], 1,
-                convolvedMlp);
-            AddTo(hiddenStates, convolvedMlp);
+                dynamicConvolve(mlpOutput, mlpDynamic,
+                    weight[prefix + "mlp_conv.base_kernel"], 1, buffers.convolvedMlp);
+                AddTo(hiddenStates, buffers.convolvedMlp);
+            };
+            if (compute) {
+                buffers.tail.Run(runTail);
+                if (!computeCompatible) buffers.tail.disabled = true;
+            } else runTail();
+        }
+
+        if (compute && !compute->logged && std::all_of(
+                compute->layers.begin(), compute->layers.end(), [](const auto &layer) {
+                    return layer.prefix.exec != nullptr && layer.tail.exec != nullptr;
+                })) {
+            printf("[DFlash] compute CUDA graphs ready: device=%d layers=%d rows=%d.\n",
+                   device, dflashLayers, blockSize);
+            compute->logged = true;
         }
 
         RMSNorm(hiddenStates, weight["dflash.norm.weight"],
