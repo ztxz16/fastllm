@@ -3820,7 +3820,13 @@ namespace fastllm {
             }
             RunMultiCudaDeviceOpsAndDelete(opDevices, ops);
 
-            SyncReplicatedRootFromReplica(output, devices);
+            // An explicit persistent-workspace caller consumes the root
+            // replica directly and retains all replicas for the next call.
+            // The root allocation is not updated in this mode.
+            auto keep = intParams.find("keepReplicatedOutput");
+            if (keep == intParams.end() || !keep->second) {
+                SyncReplicatedRootFromReplica(output, devices);
+            }
         }
     }
 

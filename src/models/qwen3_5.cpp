@@ -29498,12 +29498,12 @@ namespace fastllm {
              {"bias1", GetEmptyData()},
              {"w1", &buffers.swigluOutput},
              {"w3", &buffers.gateupOutput}},
-            {}, {});
+            {}, {{"keepReplicatedOutput", workspace != nullptr}});
         FastllmCudaSetDevice(device);
         if (workspace) {
             // Keep the root reduction result separate from the stable BF16
             // consumer allocation retained by the local epilogue graph.
-            ToDataType(tpOutput, output, input.dataType);
+            ToDataType(*tpOutput.multiDeviceDatas.at(device), output, input.dataType);
         } else {
             ToDataType(output, input.dataType);
         }
@@ -30199,7 +30199,9 @@ namespace fastllm {
                 warmed = false;
             }
 
-            template<class Body> void Run(Body &&body) {
+            template<class Body> void Run(Body &&body, bool enabled) {
+                // Persistent eager buffers do not require graph capture.
+                if (!enabled) { body(); return; }
                 Qwen35CudaGraphPointerTableScope pointerScope(this);
                 if (disabled || !warmed) {
                     body();
@@ -30343,10 +30345,11 @@ namespace fastllm {
             !draftEmbedWeight->dataDeviceIds.empty() &&
             draftEmbedWeight->dataDeviceIds[0] == device;
         Qwen35DFlashComputeWorkspace *compute = nullptr;
-        const bool computeGraphs = useCudaEmbedding &&
+        const bool useComputeGraphs = Qwen35CudaGraphEnabled();
+        const bool useComputeWorkspace = useCudaEmbedding &&
             (draftEmbedWeight->dataType == DataType::BFLOAT16 ||
              draftEmbedWeight->dataType == DataType::FLOAT16) &&
-            Qwen35CudaGraphEnabled() &&
+            (useComputeGraphs || dflashTpBackbonePrepared) &&
             // Sharded MLPs stay outside the local graphs. Their persistent
             // output feeds a separate convolution/residual epilogue graph.
             (!dflashTpBackbonePrepared || dflashTpPairedMlpPrepared) &&
@@ -30356,7 +30359,7 @@ namespace fastllm {
             ::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled("FASTLLM_CUDA_DFLASH_FUSED_QKV_PREPARE") &&
             ::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled("FASTLLM_CUDA_DFLASH_FUSED_GATEUP_PREPARE") &&
             !FastllmCudaGraphIsCapturing();
-        if (computeGraphs) {
+        if (useComputeWorkspace) {
             auto &entry = GetQwen35CudaGraphWorkspace(this, device).dflashCompute;
             if (entry && (entry->device != device || entry->blockSize != blockSize || entry->layers.size() != size_t(dflashLayers) ||
                           entry->ropeInvFreqPointer != dflashRopeInvFreq.cudaData ||
@@ -30644,7 +30647,7 @@ namespace fastllm {
 
             };
             if (compute) {
-                buffers.prefix.Run(runPrefix);
+                buffers.prefix.Run(runPrefix, useComputeGraphs);
                 if (!computeCompatible) buffers.prefix.disabled = true;
             } else runPrefix();
 
@@ -30812,19 +30815,19 @@ namespace fastllm {
                 AddTo(hiddenStates, buffers.convolvedMlp);
             };
             if (compute && compute->tpBackbone) {
-                buffers.tail.Run(runTail);
+                buffers.tail.Run(runTail, useComputeGraphs);
                 if (!computeCompatible) buffers.tail.disabled = true;
                 runMlp();
                 if (buffers.mlpOutputPointer != mlpOutput.cudaData) {
                     buffers.mlpTail.Clear();
                     buffers.mlpOutputPointer = mlpOutput.cudaData;
                 }
-                buffers.mlpTail.Run(runMlpTail);
+                buffers.mlpTail.Run(runMlpTail, useComputeGraphs);
                 if (!computeCompatible) buffers.mlpTail.disabled = true;
             } else {
                 auto runFullTail = [&]() { runTail(); runMlp(); runMlpTail(); };
                 if (compute) {
-                    buffers.tail.Run(runFullTail);
+                    buffers.tail.Run(runFullTail, useComputeGraphs);
                     if (!computeCompatible) buffers.tail.disabled = true;
                 } else runFullTail();
             }
