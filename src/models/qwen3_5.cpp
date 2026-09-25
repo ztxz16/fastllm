@@ -22509,6 +22509,11 @@ namespace fastllm {
                         }
                         continue;
                     }
+                    // TP validation converts a dense FP16 KV state to VK
+                    // layout before running in place. Prefill/prefix restore
+                    // may leave it untransposed; requiring VK here budgets an
+                    // unnecessary COW page and repeatedly rebuilds a full pool.
+                    // A fake tensor cannot be passed to the transpose helper.
                     if (localKey == nullptr || localValue == nullptr ||
                         localKey->dataDevice != DataDevice::CUDA ||
                         localValue->dataDevice != DataDevice::CUDA ||
@@ -22523,7 +22528,8 @@ namespace fastllm {
                         localValue->dims[1] <= 0 ||
                         localValue->dims[2] != model->head_k_dim ||
                         localValue->dims[3] != model->head_v_dim ||
-                        !localValue->isLinearAttentionTransposed ||
+                        (!localValue->isLinearAttentionTransposed &&
+                         localValue->isFake) ||
                         !hasDenseStrides(*localKey) || !hasDenseStrides(*localValue)) {
                         return false;
                     }

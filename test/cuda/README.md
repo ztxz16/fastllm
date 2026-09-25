@@ -32,6 +32,20 @@ python test/cuda/test_mtp_scheduler_transition.py \
 
 测试应输出最后的 `PASS: MTP sampling and mixed requests across scheduler transitions`。采样请求默认使用随机草稿和完整分布拒绝采样，并在单请求与批处理切换时保持实际 q 同步。开启 CUDA Graph 时同时检查日志确实捕获了 `batch=2` 的 MTP 验证图，避免将普通解码回退误记为批处理验证通过。
 
+`test_qwen35_speculative_kv_capacity.py` 覆盖 #754 的双卡 DFlash 容量边界：输入 4079 token，KV 池与上下文上限均为 4096，依次执行一次首次解码和两次前缀缓存复用。Prefill/前缀恢复后的线性注意力状态可能尚未转置，但 TP 验证能够转换后原地运行；调度器不应因此误算额外复制页并反复重建请求。
+
+```sh
+PYTHONPATH="$PWD/build-fastllm/tools" OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 \
+    MKL_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false \
+    numactl -C 0-31 -m 0 python3 test/cuda/test_qwen35_speculative_kv_capacity.py \
+    /path/to/Qwen3.8-27B-FP8 --device cuda --tp 0,1 --threads 4 \
+    --draft /path/to/Qwen3.8-27B-DFlash2 --kv_cache_dtype fp8_e4m3 \
+    --max_batch 1 --gpu_mem_ratio 0.90 --tokens 4096 --max_context_length 4096 \
+    --chunked_prefill_size 1024 --prefix_cache true --image_embedding_cache 0
+```
+
+按本机调整 Python 包路径、模型路径和 NUMA/CPU 绑定。测试检查实际 TP 设备数和 KV 池容量、首次解码不恢复前缀、缓存请求各恢复一次，以及生成过程中缓存统计稳定。每个请求申请 64 个输出，但受上下文上限约束只输出剩余 17 个。失败判定不依赖机器速度。将 `--tokens` 改为 `4224` 可对照多留一页的配置；增加 `--sampling` 可检查拒绝采样路径。各配置应串行运行。贪心结果的 token ID 会打印为 `KV_CAPACITY_RESULT`，可核对紧池与多一页配置的输出一致性。
+
 编译兼容性检查使用仍支持 sm_60 的 nvcc（本次验证为 CUDA 12.4），不需要 GPU：
 
 ```sh
