@@ -628,10 +628,19 @@ class PiAgentRuntime:
             deadline = time.monotonic() + self.timeout
             stdout_closed = False
             saw_agent_end = False
+            saw_agent_settled = False
+            expects_agent_settled = False
             saw_assistant_output = False
+            last_assistant_message = None
+
+            def record_assistant_message(message):
+                nonlocal last_assistant_message
+                if isinstance(message, dict) and message.get("role") == "assistant":
+                    last_assistant_message = message
+
             turns = 0
             try:
-                while not saw_agent_end:
+                while not saw_agent_settled:
                     if cancel_event is not None and cancel_event.is_set():
                         raise PiAgentCancelled("Pi agent request was cancelled")
                     remaining = deadline - time.monotonic()
@@ -671,6 +680,9 @@ class PiAgentRuntime:
                             raise PiAgentError(
                                 f"Pi agent exceeded the {self.max_turns} turn limit"
                             )
+                        saw_assistant_output = False
+                        saw_agent_end = False
+                        last_assistant_message = None
                         yield {"type": "turn_start"}
                     elif event_type == "message_update":
                         update = event.get("assistantMessageEvent", {}) or {}
@@ -681,11 +693,12 @@ class PiAgentRuntime:
                             yield {"type": "text_delta", "text": delta}
                         elif update_type == "thinking_delta":
                             delta = str(update.get("delta", ""))
-                            saw_assistant_output = saw_assistant_output or bool(delta)
                             yield {
                                 "type": "thinking_delta",
                                 "text": delta,
                             }
+                    elif event_type == "message_end":
+                        record_assistant_message(event.get("message"))
                     elif event_type == "tool_execution_start":
                         arguments, arguments_truncated = (
                             _bounded_tool_arguments(event.get("args", {}))
@@ -728,18 +741,53 @@ class PiAgentRuntime:
                                 "sources": web_bridge.public_sources(),
                             }
                     elif event_type == "turn_end":
+                        record_assistant_message(event.get("message"))
                         turns += 1
                     elif event_type == "agent_end":
+                        for message in reversed(event.get("messages") or []):
+                            if isinstance(message, dict) and message.get("role") == "assistant":
+                                record_assistant_message(message)
+                                break
                         saw_agent_end = True
+                        # Pi 0.84.4 marks every agent_end with willRetry. Even
+                        # false may precede length recovery / compaction, so
+                        # only agent_settled ends this protocol's full run.
+                        expects_agent_settled = (
+                            expects_agent_settled or "willRetry" in event)
+                        if not expects_agent_settled:
+                            # Legacy RPC streams have only an unannotated
+                            # agent_end and no agent_settled event.
+                            saw_agent_settled = True
+                    elif event_type == "agent_settled":
+                        saw_agent_settled = saw_agent_end
 
                 return_code = process.poll()
-                if not saw_agent_end:
+                if not saw_agent_settled:
                     details = "\n".join(stderr_tail).strip()
                     suffix = f": {details}" if details else ""
                     state = "closed stdout" if stdout_closed else f"exited {return_code}"
-                    raise PiAgentError(f"Pi agent {state} before agent_end{suffix}")
+                    terminal = "agent_settled" if expects_agent_settled else "agent_end"
+                    raise PiAgentError(f"Pi agent {state} before {terminal}{suffix}")
+                # A settled run may still have failed. Inspect the final
+                # attempt, after Pi has finished any retry or compaction.
+                if last_assistant_message is not None:
+                    reason = last_assistant_message.get("stopReason")
+                    if reason == "length":
+                        raise PiAgentError(
+                            "Pi model reached the output token limit before completing the task"
+                        )
+                    if reason in {"error", "aborted"}:
+                        detail = last_assistant_message.get("errorMessage") or "no details"
+                        raise PiAgentError(f"Pi model response {reason}: {detail}")
+                    content = last_assistant_message.get("content")
+                    if isinstance(content, list):
+                        saw_assistant_output = any(
+                            isinstance(part, dict) and part.get("type") == "text"
+                            and str(part.get("text") or "").strip()
+                            for part in content
+                        )
                 if not saw_assistant_output:
-                    raise PiAgentError("Pi agent completed without assistant output")
+                    raise PiAgentError("Pi agent stopped without an answer or usable assistant output")
                 done_event: Dict[str, Any] = {"type": "done", "turns": turns}
                 if web_bridge:
                     done_event["web_sources"] = web_bridge.public_sources()

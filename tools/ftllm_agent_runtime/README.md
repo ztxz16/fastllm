@@ -112,6 +112,20 @@ Pi is the default agent runtime for code tasks and Web Agent searches. Use
 `--agent-runtime auto` to prefer Pi while allowing a missing package fallback.
 Library callers can pass a `threading.Event` as `cancel_event` to
 `PiAgentRuntime.stream()`; setting it terminates the request-scoped Pi process.
+An `agent_end` event alone does not indicate success: the bridge checks the
+final assistant response and raises `PiAgentError` for a token-limit stop,
+backend error, aborted response, or thinking without a visible answer. Partial
+text is preserved in the emitted events, but these outcomes do not emit `done`.
+For Pi 0.84.4, an `agent_end` carrying `willRetry` is intermediate even when
+that field is false: length recovery / compaction can still follow it. The
+bridge waits for `agent_settled` before checking the final response, allowing
+Pi's own retries to recover. A closed stream without this event is an error.
+Legacy RPC streams with unannotated `agent_end` retain their older boundary.
+The default bridge limits remain 4096 output tokens per response, 8 model turns
+and 300 seconds per task. In FastLLM WebUI these are controlled by `--max_token`,
+`--pi_agent_max_turns` and `--pi_agent_timeout`; the Pi path currently uses a
+4096-token fallback when `--max_token` is nonpositive. These limits can end a
+long coding task before its work is complete.
 Tool activity is normalized into `tool_start`, `tool_update`, and `tool_end`
 events with stable call IDs, bounded arguments, output text, and error state.
 The optional `images` argument accepts image paths and MIME types and forwards
