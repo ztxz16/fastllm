@@ -103,6 +103,8 @@ def main():
     parser.add_argument('--expert-cache', action='store_true')
     parser.add_argument('--fp8-dense', action='store_true',
                         help='exercise block-32 FP8 weights and persistent activation quantization buffers')
+    parser.add_argument('--eager-only', action='store_true',
+                        help='compare synchronous/asynchronous TP verification without CUDA Graph')
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix='v41-tp-graph-') as path:
         directory = Path(path)
@@ -113,6 +115,8 @@ def main():
         command = [args.binary, str(directory)] + (['--expert-cache'] if args.expert_cache else [])
         if args.fp8_dense:
             command.append('--fp8-dense')
+        if args.eager_only:
+            command.append('--eager-only')
         if args.expert_cache:
             env.update(FT_NUMAS='1', FT_THREADS='2', FASTLLM_DSV41_MOE_CACHE_TRACE='1')
         result = subprocess.run(command, env=env,
@@ -121,11 +125,15 @@ def main():
         if result.returncode == 77:
             raise SystemExit(77)
         result.check_returncode()
-        assert 'PASS: DSpark graph shapes 1..8, main features and rollback match across requests' in result.stdout
-        assert 'decode CUDA graph captured:' in result.stdout, 'graph was not exercised'
-        for tokens in range(1, 9):
-            assert re.search(r'graph captured:.*tokens=%d\b' % tokens, result.stdout), 'missing graph shape %d' % tokens
-            assert 'graph replay: tokens=%d' % tokens in result.stdout, 'shape %d never replayed' % tokens
+        assert 'PASS: synchronous/asynchronous TP verification 1..8, features and rollback match across requests' in result.stdout
+        if args.eager_only:
+            assert 'decode CUDA graph captured:' not in result.stdout
+        else:
+            assert 'PASS: DSpark graph shapes 1..8, main features and rollback match across requests' in result.stdout
+            assert 'decode CUDA graph captured:' in result.stdout, 'graph was not exercised'
+            for tokens in range(1, 9):
+                assert re.search(r'graph captured:.*tokens=%d\b' % tokens, result.stdout), 'missing graph shape %d' % tokens
+                assert 'graph replay: tokens=%d' % tokens in result.stdout, 'shape %d never replayed' % tokens
         assert 'giving up' not in result.stdout and 'graph disabled' not in result.stdout
         if args.expert_cache:
             assert re.search(r'V4.1 verify cache:.* [1-9]\d* GPU routes', result.stdout), 'verify never used GPU experts'

@@ -187,6 +187,13 @@ peer access. Cache work stays outside graph capture and preserves captured tenso
 addresses. Unsupported inputs or unprofitable splits fall back before launching
 shared work, so the shared expert runs exactly once on either path.
 
+Eager TP DSpark verification with 2–8 rows reuses one workspace across candidate
+counts and requests. Per-weight activation quantization buffers stay alive
+through event-ordered device dispatch, and both devices finish before the
+workspace lock is released. Long prefill keeps synchronous dispatch. Set
+`FASTLLM_DSV41_DISABLE_TP_VERIFY_ASYNC=1` to compare with the synchronous eager
+verification path without changing CUDA Graph or expert-cache settings.
+
 Expert math preserves V4.1 block-32 FP8 activation quantization, SwiGLU clipping,
 route weighting before down-input quantization and per-expert BF16 rounding.
 Results accumulate in ascending expert-ID order in FP32 before final BF16

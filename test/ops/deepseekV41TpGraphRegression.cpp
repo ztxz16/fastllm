@@ -18,6 +18,7 @@ struct Access : DeepSeekV41Model {
     using DeepSeekV41Model::v41IsDsparkTarget;
     using DeepSeekV41Model::v41DsparkTpDevices;
     using DeepSeekV41Model::v41CudaGraphSlots;
+    using DeepSeekV41Model::v41TpVerifyWorkspace;
 };
 
 static void AppendTensor(std::vector<float> &result, const Data &input) {
@@ -143,13 +144,14 @@ int main(int argc, char **argv) {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < 2) return 77;
     try {
-        bool expertCache = false, fp8Dense = false;
+        bool expertCache = false, fp8Dense = false, eagerOnly = false;
         if (argc < 2)
-            throw std::runtime_error("usage: deepseekV41TpGraphRegression FIXTURE_DIR [--expert-cache] [--fp8-dense]");
+            throw std::runtime_error("usage: deepseekV41TpGraphRegression FIXTURE_DIR [--expert-cache] [--fp8-dense] [--eager-only]");
         for (int i = 2; i < argc; ++i) {
             const std::string option = argv[i];
             if (option == "--expert-cache") expertCache = true;
             else if (option == "--fp8-dense") fp8Dense = true;
+            else if (option == "--eager-only") eagerOnly = true;
             else throw std::runtime_error("unknown option: " + option);
         }
         setenv("FASTLLM_DSV41_DISABLE_SHARED_OVERLAP", "1", 1);
@@ -171,15 +173,27 @@ int main(int argc, char **argv) {
         const auto expected = RunRequests(model, {7, 17, 33, 7});
         unsetenv("FASTLLM_DSV41_DISABLE_SHARED_OVERLAP");
         Compare(expected, RunRequests(model, {7, 17, 33, 7}));
-        SetCudaGraph(true);
-        Compare(expected, RunRequests(model, {7, 17, 33, 7}));
+        if (!eagerOnly) {
+            SetCudaGraph(true);
+            Compare(expected, RunRequests(model, {7, 17, 33, 7}));
+            SetCudaGraph(false);
+            Compare(expected, RunRequests(model, {7, 17, 33, 7}));
+            SetCudaGraph(true);
+            Compare(expected, RunRequests(model, {7, 17, 33, 7}));
+            std::cout << "PASS: eager/graph switching and shared overlap match across 4 requests, 52 steps each\n";
+        }
         SetCudaGraph(false);
-        Compare(expected, RunRequests(model, {7, 17, 33, 7}));
-        SetCudaGraph(true);
-        Compare(expected, RunRequests(model, {7, 17, 33, 7}));
-        std::cout << "PASS: eager/graph switching and shared overlap match across 4 requests, 52 steps each\n";
-        SetCudaGraph(false);
-        const auto verifyEight = RunDsparkRequests(model);
+        setenv("FASTLLM_DSV41_DISABLE_TP_VERIFY_ASYNC", "1", 1);
+        const auto verifyEight = RunDsparkRequests(model, 8);
+        unsetenv("FASTLLM_DSV41_DISABLE_TP_VERIFY_ASYNC");
+        Compare(verifyEight, RunDsparkRequests(model, 8));
+        auto *workspace = (model.*(&Access::v41TpVerifyWorkspace)).get();
+        if (!workspace) throw std::runtime_error("asynchronous verifier was not exercised");
+        Compare(verifyEight, RunDsparkRequests(model, 8));
+        if ((model.*(&Access::v41TpVerifyWorkspace)).get() != workspace)
+            throw std::runtime_error("verifier workspace was not reused");
+        std::cout << "PASS: synchronous/asynchronous TP verification 1..8, features and rollback match across requests\n";
+        if (eagerOnly) return 0;
         SetCudaGraph(true);
         Compare(verifyEight, RunDsparkRequests(model));
         if ((model.*(&Access::v41CudaGraphSlots)).size() != 8)
