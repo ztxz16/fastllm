@@ -30355,9 +30355,6 @@ namespace fastllm {
             (!dflashTpBackbonePrepared || dflashTpPairedMlpPrepared) &&
             blockSize >= 1 && blockSize <= 16 &&
             dflashHeadDim == 128 &&
-            ::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled("FASTLLM_CUDA_DFLASH_FUSED_CONV") &&
-            ::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled("FASTLLM_CUDA_DFLASH_FUSED_QKV_PREPARE") &&
-            ::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled("FASTLLM_CUDA_DFLASH_FUSED_GATEUP_PREPARE") &&
             !FastllmCudaGraphIsCapturing();
         if (useComputeWorkspace) {
             auto &entry = GetQwen35CudaGraphWorkspace(this, device).dflashCompute;
@@ -30512,9 +30509,7 @@ namespace fastllm {
                                    Data &baseKernel,
                                    int side,
                                    Data &output) {
-            if (::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled(
-                    "FASTLLM_CUDA_DFLASH_FUSED_CONV") &&
-                source.dataDevice == DataDevice::CUDA &&
+            if (source.dataDevice == DataDevice::CUDA &&
                 dynamicProjection.dataDevice == DataDevice::CUDA &&
                 baseKernel.dataDevice == DataDevice::CUDA &&
                 source.dataType == DataType::BFLOAT16 &&
@@ -30565,38 +30560,33 @@ namespace fastllm {
                     const int kvChannels = dflashKvHeads * dflashHeadDim;
                     RunDFlashLinear(attentionInput, mergedQkvIt->second,
                            *GetEmptyData(), mergedQkv, compute ? &buffers.halfQkv : nullptr);
-                    if (::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled(
-                            "FASTLLM_CUDA_DFLASH_FUSED_QKV_PREPARE")) {
-                        for (auto item : {
-                                 std::make_pair(&query, dflashHeads),
-                                 std::make_pair(&key, dflashKvHeads),
-                                 std::make_pair(&value, dflashKvHeads)}) {
-                            ::fastllm::Qwen3CudaPrepareLocalOutput(
-                                *item.first, device);
-                            item.first->dataType = DataType::FLOAT16;
-                            item.first->UpdateUnitSize();
-                            item.first->Resize(
-                                {item.second, blockSize, dflashHeadDim});
-                            item.first->Allocate(false);
-                        }
-                        fusedQkvPrepared = FastllmCudaDFlashPrepareQKV(
-                            mergedQkv,
-                            weight[prefix + "self_attn.q_norm.weight"],
-                            weight[prefix + "self_attn.k_norm.weight"],
-                            positions, dflashRopeInvFreq,
-                            query, key, value, blockSize, dflashHeads,
-                            dflashKvHeads, dflashHeadDim, dflashRmsNormEps);
-                        if (!fusedQkvPrepared) {
-                            computeCompatible = false;
-                            for (Data *output : {&query, &key, &value}) {
-                                output->FreeSpace();
-                                output->dims.clear();
-                                output->strides.clear();
-                                output->expansionDims.clear();
-                            }
-                        }
+                    for (auto item : {
+                             std::make_pair(&query, dflashHeads),
+                             std::make_pair(&key, dflashKvHeads),
+                             std::make_pair(&value, dflashKvHeads)}) {
+                        ::fastllm::Qwen3CudaPrepareLocalOutput(
+                            *item.first, device);
+                        item.first->dataType = DataType::FLOAT16;
+                        item.first->UpdateUnitSize();
+                        item.first->Resize(
+                            {item.second, blockSize, dflashHeadDim});
+                        item.first->Allocate(false);
                     }
+                    fusedQkvPrepared = FastllmCudaDFlashPrepareQKV(
+                        mergedQkv,
+                        weight[prefix + "self_attn.q_norm.weight"],
+                        weight[prefix + "self_attn.k_norm.weight"],
+                        positions, dflashRopeInvFreq,
+                        query, key, value, blockSize, dflashHeads,
+                        dflashKvHeads, dflashHeadDim, dflashRmsNormEps);
                     if (!fusedQkvPrepared) {
+                        computeCompatible = false;
+                        for (Data *output : {&query, &key, &value}) {
+                            output->FreeSpace();
+                            output->dims.clear();
+                            output->strides.clear();
+                            output->expansionDims.clear();
+                        }
                         Split(mergedQkv, -1, 0, qChannels, query);
                         Split(mergedQkv, -1, qChannels,
                               qChannels + kvChannels, key);
@@ -30763,26 +30753,21 @@ namespace fastllm {
                                             &buffers.halfGateup);
                         else
                             RunDFlashGateupLinear(device, mlpInput, gateupIt->second, gateup);
-                        if (::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled(
-                                "FASTLLM_CUDA_DFLASH_FUSED_GATEUP_PREPARE")) {
-                            ::fastllm::Qwen3CudaPrepareLocalOutput(gate, device);
-                            gate.dataType = DataType::BFLOAT16;
-                            gate.UpdateUnitSize();
-                            gate.Resize(
-                                {1, blockSize, dflashIntermediateSize});
-                            gate.Allocate(false);
-                            fusedGateupPrepared =
-                                FastllmCudaDFlashPrepareGateup(
-                                    gateup, gate, blockSize,
-                                    dflashIntermediateSize);
-                            if (!fusedGateupPrepared) {
-                                gate.FreeSpace();
-                                gate.dims.clear();
-                                gate.strides.clear();
-                                gate.expansionDims.clear();
-                            }
-                        }
+                        ::fastllm::Qwen3CudaPrepareLocalOutput(gate, device);
+                        gate.dataType = DataType::BFLOAT16;
+                        gate.UpdateUnitSize();
+                        gate.Resize(
+                            {1, blockSize, dflashIntermediateSize});
+                        gate.Allocate(false);
+                        fusedGateupPrepared =
+                            FastllmCudaDFlashPrepareGateup(
+                                gateup, gate, blockSize,
+                                dflashIntermediateSize);
                         if (!fusedGateupPrepared) {
+                            gate.FreeSpace();
+                            gate.dims.clear();
+                            gate.strides.clear();
+                            gate.expansionDims.clear();
                             Split(gateup, -1, 0, dflashIntermediateSize, gate);
                             Split(gateup, -1, dflashIntermediateSize,
                                   2 * dflashIntermediateSize, up);
@@ -30886,19 +30871,10 @@ namespace fastllm {
         }
 
         Data selectorHidden;
-        auto projectSelector = [&]() {
-            Linear(slotHidden,
-                   weight["dflash.candidate_selector.hidden_projection.weight"],
-                   *GetEmptyData(), selectorHidden);
-            ToDataType(selectorHidden, DataType::FLOAT32);
-        };
         // Independent of candidate top-k. On TP, use rank 0's head worker
         // stream: generic CUDA temporary arenas are shared per device, so
         // overlapping this projection with that rank's head on the scheduler
         // stream would race. Queue it before the worker join/top-k readback.
-        const char *earlySelectorFlag = std::getenv("FASTLLM_DFLASH_TP_EARLY_SELECTOR");
-        const bool earlyTpSelector = draftDevices.size() > 1 &&
-            (!earlySelectorFlag || Qwen35MoeIsTrueString(earlySelectorFlag));
         bool selectorProjected = false;
         auto projectSelectorOnWorker = [&](Qwen3CudaDirectRunner &runner) {
             qwen3cuda::Qwen3CudaLinear(runner, slotHidden,
@@ -30914,8 +30890,10 @@ namespace fastllm {
         };
         if (draftDevices.size() == 1) {
             FastllmCudaSetDevice(device);
-            projectSelector();
-            selectorProjected = true;
+            Linear(slotHidden,
+                   weight["dflash.candidate_selector.hidden_projection.weight"],
+                   *GetEmptyData(), selectorHidden);
+            ToDataType(selectorHidden, DataType::FLOAT32);
         }
         Data candidateTopK;
         if (draftDevices.size() == 1) {
@@ -31007,7 +30985,7 @@ namespace fastllm {
                     bool selected = FastllmCudaDFlashTopK(
                         localLogits, localPacked[rank], localScratch[rank],
                         dflashSelectorTopK, globalOffsets[rank]);
-                    if (earlyTpSelector && rank == 0) projectSelectorOnWorker(runner);
+                    if (rank == 0) projectSelectorOnWorker(runner);
                     FastllmCudaSyncCurrentThreadStream();
                     ready[rank] = selected ? 1 : 0;
                 }, fastErrors);
@@ -31113,7 +31091,7 @@ namespace fastllm {
                 qwen3cuda::Qwen3CudaTopK(
                     runner, localLogits, localTopKs[rank],
                     dflashSelectorTopK);
-                if (earlyTpSelector && rank == 0 && !selectorProjected)
+                if (rank == 0 && !selectorProjected)
                     projectSelectorOnWorker(runner);
                 FastllmCudaSyncCurrentThreadStream();
                 FastllmCudaCopyFromDeviceToHost(
@@ -31182,10 +31160,6 @@ namespace fastllm {
                 DataType::FLOAT32,
                 {slots, dflashSelectorTopK * 2}, mergedTopK));
             }
-        }
-        if (!selectorProjected) {
-            FastllmCudaSetDevice(device);
-            projectSelector();
         }
         if (useShortlist) MapDFlashShortlistCandidates(candidateTopK);
         selectorHidden.ToDevice(DataDevice::CPU);
@@ -31351,9 +31325,7 @@ namespace fastllm {
                                    Data &baseKernel,
                                    int side,
                                    Data &output) {
-            if (::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled(
-                    "FASTLLM_CUDA_DFLASH_FUSED_CONV") &&
-                source.dataDevice == DataDevice::CUDA &&
+            if (source.dataDevice == DataDevice::CUDA &&
                 dynamicProjection.dataDevice == DataDevice::CUDA &&
                 baseKernel.dataDevice == DataDevice::CUDA &&
                 source.dataType == DataType::BFLOAT16 &&
@@ -31401,37 +31373,32 @@ namespace fastllm {
                 const int kvChannels = dflashKvHeads * dflashHeadDim;
                 RunDFlashLinear(attentionInput, mergedQkvIt->second,
                        *GetEmptyData(), mergedQkv);
-                if (::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled(
-                        "FASTLLM_CUDA_DFLASH_FUSED_QKV_PREPARE")) {
-                    for (auto item : {
-                             std::make_pair(&query, dflashHeads),
-                             std::make_pair(&key, dflashKvHeads),
-                             std::make_pair(&value, dflashKvHeads)}) {
-                        ::fastllm::Qwen3CudaPrepareLocalOutput(
-                            *item.first, device);
-                        item.first->dataType = DataType::FLOAT16;
-                        item.first->UpdateUnitSize();
-                        item.first->Resize(
-                            {item.second, totalTokens, dflashHeadDim});
-                        item.first->Allocate(false);
-                    }
-                    fusedQkvPrepared = FastllmCudaDFlashPrepareQKV(
-                        mergedQkv,
-                        weight[prefix + "self_attn.q_norm.weight"],
-                        weight[prefix + "self_attn.k_norm.weight"],
-                        positions, dflashRopeInvFreq,
-                        query, key, value, totalTokens, dflashHeads,
-                        dflashKvHeads, dflashHeadDim, dflashRmsNormEps);
-                    if (!fusedQkvPrepared) {
-                        for (Data *output : {&query, &key, &value}) {
-                            output->FreeSpace();
-                            output->dims.clear();
-                            output->strides.clear();
-                            output->expansionDims.clear();
-                        }
-                    }
+                for (auto item : {
+                         std::make_pair(&query, dflashHeads),
+                         std::make_pair(&key, dflashKvHeads),
+                         std::make_pair(&value, dflashKvHeads)}) {
+                    ::fastllm::Qwen3CudaPrepareLocalOutput(
+                        *item.first, device);
+                    item.first->dataType = DataType::FLOAT16;
+                    item.first->UpdateUnitSize();
+                    item.first->Resize(
+                        {item.second, totalTokens, dflashHeadDim});
+                    item.first->Allocate(false);
                 }
+                fusedQkvPrepared = FastllmCudaDFlashPrepareQKV(
+                    mergedQkv,
+                    weight[prefix + "self_attn.q_norm.weight"],
+                    weight[prefix + "self_attn.k_norm.weight"],
+                    positions, dflashRopeInvFreq,
+                    query, key, value, totalTokens, dflashHeads,
+                    dflashKvHeads, dflashHeadDim, dflashRmsNormEps);
                 if (!fusedQkvPrepared) {
+                    for (Data *output : {&query, &key, &value}) {
+                        output->FreeSpace();
+                        output->dims.clear();
+                        output->strides.clear();
+                        output->expansionDims.clear();
+                    }
                     Split(mergedQkv, -1, 0, qChannels, query);
                     Split(mergedQkv, -1, qChannels,
                           qChannels + kvChannels, key);
@@ -31592,26 +31559,21 @@ namespace fastllm {
                 if (gateupIt != weight.weight.end()) {
                     RunDFlashGateupLinear(
                         device, mlpInput, gateupIt->second, gateup);
-                    if (::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled(
-                            "FASTLLM_CUDA_DFLASH_FUSED_GATEUP_PREPARE")) {
-                        ::fastllm::Qwen3CudaPrepareLocalOutput(gate, device);
-                        gate.dataType = DataType::BFLOAT16;
-                        gate.UpdateUnitSize();
-                        gate.Resize(
-                            {1, totalTokens, dflashIntermediateSize});
-                        gate.Allocate(false);
-                        fusedGateupPrepared =
-                            FastllmCudaDFlashPrepareGateup(
-                                gateup, gate, totalTokens,
-                                dflashIntermediateSize);
-                        if (!fusedGateupPrepared) {
-                            gate.FreeSpace();
-                            gate.dims.clear();
-                            gate.strides.clear();
-                            gate.expansionDims.clear();
-                        }
-                    }
+                    ::fastllm::Qwen3CudaPrepareLocalOutput(gate, device);
+                    gate.dataType = DataType::BFLOAT16;
+                    gate.UpdateUnitSize();
+                    gate.Resize(
+                        {1, totalTokens, dflashIntermediateSize});
+                    gate.Allocate(false);
+                    fusedGateupPrepared =
+                        FastllmCudaDFlashPrepareGateup(
+                            gateup, gate, totalTokens,
+                            dflashIntermediateSize);
                     if (!fusedGateupPrepared) {
+                        gate.FreeSpace();
+                        gate.dims.clear();
+                        gate.strides.clear();
+                        gate.expansionDims.clear();
                         Split(gateup, -1, 0,
                               dflashIntermediateSize, gate);
                         Split(gateup, -1, dflashIntermediateSize,
