@@ -725,6 +725,14 @@ if (UNIT_TEST)
     add_executable(qwen35_paged_cache_test test/basic/test_qwen35_paged_cache.cpp)
     add_test(NAME qwen35_paged_cache COMMAND qwen35_paged_cache_test)
 
+    add_executable(multimodal_history_cache_test test/basic/test_multimodal_history_cache.cpp)
+    target_link_libraries(multimodal_history_cache_test PRIVATE fastllm)
+    add_test(NAME multimodal_history_cache COMMAND multimodal_history_cache_test)
+
+    add_executable(qwen4_multimodal_cache_test test/basic/test_qwen4_multimodal_cache.cpp)
+    target_link_libraries(qwen4_multimodal_cache_test PRIVATE fastllm)
+    add_test(NAME qwen4_multimodal_cache COMMAND qwen4_multimodal_cache_test)
+
     add_executable(nvfp4_planar_test test/basic/test_nvfp4_planar.cpp)
     target_link_libraries(nvfp4_planar_test PRIVATE fastllm)
     add_test(NAME nvfp4_planar COMMAND nvfp4_planar_test)

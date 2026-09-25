@@ -9795,7 +9795,8 @@ namespace fastllm {
     bool Qwen4ExpModel::ShouldRecordPrefixSnapshot(
             const std::vector<std::pair<Data, Data>> &pastKeyValues,
             const RequestState &state, int &cachedLen) const {
-        if (autoWarmupRunning.load() || threadTpRank >= 0 || !Qwen4PrefixCacheEnabled() ||
+        if (state.hasMultimodalInput || autoWarmupRunning.load() ||
+            threadTpRank >= 0 || !Qwen4PrefixCacheEnabled() ||
             (int)pastKeyValues.size() < this->block_cnt) {
             return false;
         }
@@ -10239,7 +10240,8 @@ namespace fastllm {
     bool Qwen4ExpModel::RestorePrefixSnapshot(
             ResponseContext *context,
             const std::shared_ptr<PrefixSnapshot> &snapshot) {
-        if (context == nullptr || snapshot == nullptr ||
+        if (context == nullptr || !context->multimodalInput.empty() ||
+            snapshot == nullptr || snapshot->state.hasMultimodalInput ||
             snapshot->cachedLen <= 0 ||
             snapshot->cachedLen != context->cacheLen ||
             (int)snapshot->layers.size() < this->block_cnt ||
@@ -10454,6 +10456,14 @@ namespace fastllm {
         AssertInFastLLM(
             (int)pastKeyValues.size() >= this->block_cnt,
             "Qwen4-Exp multimodal inference received too few cache slots.");
+
+        // Independent prefix snapshots are also recorded inside ForwardTarget,
+        // after the first visual prefill. Mark the whole request, including
+        // callers that use ForwardMultimodal without a ResponseContext.
+        {
+            std::lock_guard<std::mutex> guard(this->stateMutex);
+            this->requestStates[&pastKeyValues[0].first].hasMultimodalInput = true;
+        }
 
         // The payload remains attached to the response context during decode.
         // Only the first call has an empty target cache and needs the visual
@@ -11927,8 +11937,9 @@ namespace fastllm {
         {
             std::lock_guard<std::mutex> guard(this->stateMutex);
             if (!context->pastKeyValues.empty()) {
-                this->requestStates[&context->pastKeyValues[0].first] =
-                    RequestState();
+                auto &state = this->requestStates[&context->pastKeyValues[0].first];
+                state = RequestState();
+                state.hasMultimodalInput = !context->multimodalInput.empty();
             }
         }
     }

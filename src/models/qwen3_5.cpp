@@ -22947,7 +22947,11 @@ namespace fastllm {
         };
 
         auto tryRestorePrefixCache = [&](ResponseContext *ctx) -> int {
-            if (ctx == nullptr || ctx->cacheLen != 0 || ctx->currentTokens.empty()) {
+            // Restoring text-only KV here makes Qwen35ForwardMultimodal take
+            // its decode branch, skipping vision encoding and chunked prefill.
+            // Media-aware cache keys and position state are required first.
+            if (ctx == nullptr || !ctx->multimodalInput.empty() ||
+                ctx->cacheLen != 0 || ctx->currentTokens.empty()) {
                 return 0;
             }
             auto probeRefs = model->GetPagedKVCacheManagers(model->kvCacheId, true);

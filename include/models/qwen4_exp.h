@@ -74,6 +74,7 @@ namespace fastllm {
         bool UseGenericHistoryCache() const override { return false; }
 
     private:
+        friend struct Qwen4PrefixCacheTestAccess;
         struct PrefixSnapshot;
         struct DecodeCudaGraphState;
         struct PleStagingState;
@@ -133,6 +134,9 @@ namespace fastllm {
             // TP dense graphs retain the legacy attention padding width even
             // when physical KV storage is reserved or reused across requests.
             int denseGraphWidth = 0;
+            // Token IDs cannot identify image/video embeddings or M-RoPE state.
+            // Keep this flag through decode, including direct C++ forwards.
+            bool hasMultimodalInput = false;
             std::vector<int> processedTokens;
             int prefixRequestId = 0;
             int lastPrefixSnapshotLen = 0;
