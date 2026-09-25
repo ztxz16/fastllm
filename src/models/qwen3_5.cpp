@@ -29464,7 +29464,7 @@ namespace fastllm {
 
         Executor &tpExecutor = Qwen35DFlashTpExecutor(
             dflashTpPreparedDevices, dflashTpPreparedRatios);
-        Data swigluOutput, unusedScratch, gateupOutput;
+        Data swigluOutput, gateupOutput;
         // Ordered worker dispatch joins producer and completion streams with
         // events. This avoids the generic per-MLP device synchronizations;
         // the MultiCUDA MLP then defers replica reuse behind those waits.
@@ -29484,7 +29484,6 @@ namespace fastllm {
              {"weight1", &downWeight},
              {"bias1", GetEmptyData()},
              {"w1", &swigluOutput},
-             {"w2", &unusedScratch},
              {"w3", &gateupOutput}},
             {}, {});
         FastllmCudaSetDevice(device);
