@@ -47,6 +47,18 @@ server.serve_forever()
 
 
 class HarnessRuntimeTest(unittest.TestCase):
+    def test_output_budget_allows_long_reasoning_with_context_headroom(self):
+        for context, expected in [(131072, 32768), (65536, 32768),
+                                  (32768, 16384), (16384, 8192),
+                                  (8192, 4096), (1, 1), (None, 4096)]:
+            with self.subTest(context=context):
+                config = HarnessRuntime._patch({
+                    'modelName': 'qwen3.5', 'endpoint': 'http://127.0.0.1:8000',
+                    'contextWindowTokens': context}, '127.0.0.1')
+                provider = next(item for item in config if item.get('id') == 'llm-pi-ai')
+                model = provider['config']['providers']['fastllm']['models'][0]
+                self.assertEqual(model['maxTokens'], expected)
+
     def setUp(self):
         environment = patch.dict(os.environ)
         environment.start()
