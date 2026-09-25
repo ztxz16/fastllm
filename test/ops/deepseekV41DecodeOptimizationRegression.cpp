@@ -289,7 +289,7 @@ static void RmsNormChecks() {
     for (int dev = 0; dev < deviceCount; ++dev) {
         SelectDevice(dev);
         for (auto type : {DataType::BFLOAT16, DataType::FLOAT16, DataType::FLOAT32})
-            for (int channels : {1280,4096,5120,5121}) for (int tokens : {1,2,8,9,64}) {
+            for (int channels : {1280,4096,5120,5121}) for (int tokens : {1,2,3,4,5,6,7,8,9,64}) {
                 auto input = Random(type, {tokens,channels}, tokens + channels);
                 auto weight = Random(DataType::FLOAT32, {channels}, 928);
                 Data out; out.CopyFrom(input);
@@ -300,13 +300,15 @@ static void RmsNormChecks() {
                 Check(FastllmCudaRMSNorm(batched, weight, reference, 1e-6f), "batched RMSNorm rejected");
                 auto expected = Bytes(reference); expected.resize(input.GetBytes());
                 run();
-                Check(expected == Bytes(out), "RMSNorm reduction/rounding mismatch");
+                Check(expected == Bytes(out), "RMSNorm reduction/rounding mismatch device=" +
+                    std::to_string(dev) + " dtype=" + std::to_string((int)type) +
+                    " channels=" + std::to_string(channels) + " tokens=" + std::to_string(tokens));
                 RmsCpuReference(input, weight, out);
                 Data inplace; inplace.CopyFrom(input);
                 Check(FastllmCudaRMSNorm(inplace, weight, inplace, 1e-6f), "in-place RMSNorm rejected");
                 Check(expected == Bytes(inplace), "in-place RMSNorm mismatch");
                 ++checks;
-                if (type == DataType::BFLOAT16 && channels == 5120 && tokens == 1) {
+                if (type != DataType::FLOAT32 && channels == 5120 && tokens <= 8) {
                     ReplayGraph(run); Check(expected == Bytes(out), "RMSNorm graph mismatch");
                 }
             }

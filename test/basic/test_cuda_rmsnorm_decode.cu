@@ -81,6 +81,9 @@ template <class T> void Run(DataType type, int D, int M, bool inplace) {
         Check(cudaGraphLaunch(exec, cudaStreamPerThread));
         Check(cudaDeviceSynchronize());
         auto a = Read<T>(out), b = Read<T>(ref);
+        if (type == FLOAT16 && D == 5120 && M <= 8)
+            Require(memcmp(a.data(), b.data(), a.size() * sizeof(T)) == 0,
+                    "decode RMSNorm differs bitwise from the generic reduction");
         double sq = 0, den = 0, ce = 0, cd = 0;
         for (int row = 0; row < M; ++row) {
             double ss = 0;
