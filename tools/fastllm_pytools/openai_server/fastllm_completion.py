@@ -243,7 +243,9 @@ class FastLLmCompletion:
       max_length: Optional[int],
       stopped_by_stop_string: bool = False,
   ) -> str:
-      if (not stopped_by_stop_string and max_length is not None
+      # Negative legacy budgets select native unlimited output. They must not
+      # turn a natural EOS into a truncation signal for agent clients.
+      if (not stopped_by_stop_string and max_length is not None and max_length > 0
               and completion_tokens >= max_length):
           return "length"
       return "stop"
@@ -1910,7 +1912,7 @@ class FastLLmCompletion:
 
   def _get_anthropic_stop_reason(self, completion_tokens: int,
                                  max_tokens: Optional[int]) -> str:
-      if max_tokens is not None and completion_tokens >= max_tokens:
+      if max_tokens is not None and max_tokens > 0 and completion_tokens >= max_tokens:
           return "max_tokens"
       return "end_turn"
 
