@@ -3689,6 +3689,9 @@ namespace fastllm {
             // Keep warmed attention outputs owned by this device graph.
             Data attentionQ, attentionGate, attentionK, attentionV;
             Data attentionOutput;
+            // Preserve the all-reduce input addresses registered during warmup
+            // so capture can reuse the fused collective.
+            Data residualScratch;
             Data packedPagedMeta;
             Data packedPagedMetaUpload;
             std::vector<int> packedPagedMetaHost;
@@ -13016,7 +13019,9 @@ namespace fastllm {
         const uint64_t prefillResidualElements =
             !tensorParallel || firstTensorParallelRank ?
                 hiddenStates.Count(0) : 0;
-        Data projectionScratch, residualScratch;
+        Data projectionScratch, localResidualScratch;
+        Data &residualScratch = mtpVerifyGraphDeviceState != nullptr ?
+            mtpVerifyGraphDeviceState->residualScratch : localResidualScratch;
         Data &merged = projectionScratch, &gdnMerged = projectionScratch;
         Data &gateupResult = projectionScratch;
         Data &attenLastOutput = residualScratch, &mlpPart = residualScratch;
@@ -16854,8 +16859,7 @@ namespace fastllm {
             Qwen35CudaGraphEnabled() &&
             Qwen35MtpVerifyCudaGraphEnabled() &&
             (!speculativeCaptureDFlashHiddenStates ||
-             (batch == 1 && devices.size() == 1 &&
-              ResolveQwen35ThreadTpComputeType(this->dataType) == DataType::FLOAT16 &&
+             (batch == 1 && computeType == DataType::FLOAT16 &&
               !Qwen35DFlashExactVerifyEnabled())) &&
             speculativeCollectAllLogits &&
             speculativeCaptureFirstTokenLinearState &&
@@ -17062,7 +17066,8 @@ namespace fastllm {
                             for (Data *data : {&state.attentionQ,
                                     &state.attentionGate, &state.attentionK,
                                     &state.attentionV, &state.attentionOutput,
-                                    &state.headLogits, &state.logits}) {
+                                    &state.residualScratch, &state.headLogits,
+                                    &state.logits}) {
                                 data->FreeSpace();
                             }
                         }
