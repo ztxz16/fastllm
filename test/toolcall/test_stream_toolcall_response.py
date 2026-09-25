@@ -328,7 +328,7 @@ class StreamToolCallResponseTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(content, raw_output)
         self.assertEqual(self._finish_reason(chunks), "stop")
 
-    async def test_unknown_tool_name_is_suppressed(self):
+    async def test_unknown_tool_name_is_rejected_instead_of_silent_stop(self):
         with self.assertLogs(level="WARNING") as logs:
             chunks, saw_done = await self._collect_stream(
                 _weather_call("get_wearher"),
@@ -337,10 +337,15 @@ class StreamToolCallResponseTest(unittest.IsolatedAsyncioTestCase):
 
         serialized = json.dumps(chunks, ensure_ascii=False)
         self.assertTrue(saw_done)
-        self.assertEqual(self._finish_reason(chunks), "stop")
+        self.assertFalse([choice.get("finish_reason") for chunk in chunks
+                          for choice in chunk.get("choices", [])
+                          if choice.get("finish_reason")])
         self.assertEqual(self._reconstruct_tool_calls(chunks), {})
         self.assertNotIn("DSML", serialized)
-        self.assertNotIn("get_wearher", serialized)
+        errors = [chunk["error"] for chunk in chunks if "error" in chunk]
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["type"], "invalid_tool_call")
+        self.assertIn("get_wearher", errors[0]["message"])
         self.assertIn("invalid_tool_name", "\n".join(logs.output))
 
     async def test_forward_unknown_tools_streams_raw_unknown_name(self):

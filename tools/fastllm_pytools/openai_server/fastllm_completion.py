@@ -3886,15 +3886,20 @@ class FastLLmCompletion:
            logging.info(f"Abort request: {request_id}")
            return self.create_error_response("Client disconnected")
 
+      usage = self._anthropic_usage(
+          handle, response_statistics, input_token_len, completion_tokens)
+      self._release_conversation_handle(request_id, handle)
       if request.tools and parser_request is not None:
-          tool_parser = self._create_tool_parser()
-          tool_call_info = tool_parser.extract_tool_calls(result, parser_request)
+          tool_call_info = self._parse_non_stream_tool_calls(
+              result, parser_request,
+              finish_reason=self._chat_finish_reason(
+                  usage.output_tokens, request.max_tokens or 32768))
+          if isinstance(tool_call_info, ErrorResponse):
+              return tool_call_info
       else:
           tool_call_info = ExtractedToolCallInformation(
               tools_called = False, tool_calls = [], content = result)
 
-      usage = self._anthropic_usage(
-          handle, response_statistics, input_token_len, completion_tokens)
       response = AnthropicMessageResponse(
           id = request_id,
           content = self._build_anthropic_response_blocks(
@@ -3927,11 +3932,6 @@ class FastLLmCompletion:
       tool_blocks: Dict[int, Dict[str, Any]] = {}
       emitted_tool_use = False
 
-      previous_token_ids = []
-      current_token_ids = []
-      previous_text = ""
-      current_text = ""
-
       try:
           message = AnthropicMessageResponse(
               id = request_id,
@@ -3946,38 +3946,55 @@ class FastLLmCompletion:
               "message_start", MessageStartEvent(message = message))
 
           tool_parser = (
-              self._create_tool_parser()
+              self._create_function_call_parser(parser_request)
               if request.tools and parser_request is not None
               else None
           )
 
-          async for res in result_generator:
-              if (res == "[unused16]"):
-                  res = "<think>"
-              elif (res == "[unused17]"):
-                  res = "</think>"
-              completion_tokens += 1
-              delta_text = res
-
-              if request.tools and parser_request is not None and tool_parser:
+          async def parsed_deltas():
+              nonlocal completion_tokens
+              previous_text = ""
+              previous_token_ids = []
+              async for res in result_generator:
+                  delta_text = self._normalize_model_delta(res)
+                  completion_tokens += 1
+                  if tool_parser is None:
+                      yield DeltaMessage(content=delta_text)
+                      continue
                   now_ids = tool_parser.get_token_ids(delta_text)
-                  current_text += delta_text
-                  current_token_ids += now_ids
-
-                  delta_message = tool_parser.extract_tool_calls_streaming(
-                                  previous_text = previous_text,
-                                  current_text = current_text,
-                                  delta_text = delta_text,
-                                  previous_token_ids = previous_token_ids,
-                                  current_token_ids = current_token_ids,
-                                  delta_token_ids = [0],
-                                  request = parser_request)
-
+                  parsed = tool_parser.parse_stream_chunk(
+                      previous_text=previous_text,
+                      current_text=previous_text + delta_text,
+                      delta_text=delta_text,
+                      previous_token_ids=previous_token_ids,
+                      current_token_ids=previous_token_ids + now_ids,
+                      delta_token_ids=now_ids)
                   previous_text += delta_text
                   previous_token_ids += now_ids
-              else:
-                  delta_message = DeltaMessage(content = delta_text)
+                  yield DeltaMessage(content=parsed.content,
+                                     tool_calls=parsed.valid_tool_calls)
 
+              # A terminal native handle may be reused before we yield the
+              # parser's last buffered call or the closing SSE events.
+              self._release_conversation_handle(request_id, handle)
+              if tool_parser is None:
+                  return
+              usage = self._anthropic_usage(
+                  handle, response_statistics, input_token_len, completion_tokens)
+              diagnostics = tool_parser.finalize_stream(
+                  finish_reason=self._chat_finish_reason(
+                      usage.output_tokens, request.max_tokens or 32768))
+              if diagnostics:
+                  raise ValueError("Invalid tool call: " +
+                                   self._format_tool_call_diagnostics(diagnostics))
+              # Qwen can finish after </function> with the outer delimiter
+              # absent. Without finalization, clients see only the preceding
+              # text and end_turn, silently dropping the intended action.
+              parsed = tool_parser.flush_stream_tool_calls()
+              yield DeltaMessage(content=parsed.content,
+                                 tool_calls=parsed.valid_tool_calls)
+
+          async for delta_message in parsed_deltas():
               if not delta_message:
                   continue
 
