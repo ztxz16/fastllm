@@ -59,6 +59,22 @@ class HarnessRuntimeTest(unittest.TestCase):
                 model = provider['config']['providers']['fastllm']['models'][0]
                 self.assertEqual(model['maxTokens'], expected)
 
+    def test_model_input_modalities_follow_server_metadata(self):
+        for metadata, expected in [
+            ({"input_modalities": ["text", "image"]}, ["text", "image"]),
+            ({"inputModalities": ["text", "image"]}, ["text", "image"]),
+            ({"input_modalities": ["text"]}, ["text"]),
+            ({"input_modalities": ["text", "audio"]}, ["text"]),
+            ({}, ["text"]),
+        ]:
+            with self.subTest(metadata=metadata):
+                config = HarnessRuntime._patch({
+                    "modelName": "custom-alias", "endpoint": "http://localhost:8000",
+                    "modelMetadata": metadata}, "127.0.0.1")
+                provider = next(row for row in config if row.get("id") == "llm-pi-ai")
+                model = provider["config"]["providers"]["fastllm"]["models"][0]
+                self.assertEqual(model.get("input"), expected)
+
     def setUp(self):
         environment = patch.dict(os.environ)
         environment.start()
