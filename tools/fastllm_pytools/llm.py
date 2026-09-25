@@ -2468,7 +2468,8 @@ class model:
                         images: List = None, videos: List = None, tools: List = None, enable_thinking = None,
                         thinking_effort = None, tool_choice = None,
                         chat_template_kwargs = None,
-                        tool_call_constraint: Optional[Dict[str, Any]] = None):
+                        tool_call_constraint: Optional[Dict[str, Any]] = None,
+                        output_logits: bool = False):
         if enable_thinking is None:
             enable_thinking = self.enable_thinking
         pending_text_input_token_cache = getattr(
@@ -2756,7 +2757,7 @@ class model:
             stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
             handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input),
                                                         max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty,
-                                                        False, stop_token_len, stop_token_list)
+                                                        output_logits, stop_token_len, stop_token_list)
             if (self.save_history):
                 self.current_tokenizer_cache[handle] = [[prompt], [input]]
             return handle
@@ -2781,13 +2782,13 @@ class model:
                 input = self.tokenizer_cache.tokenize_with_cache(self, prompt)
                 handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input),
                                                             ctypes.c_int(max_length), ctypes.c_int(min_length), ctypes.c_bool(do_sample), ctypes.c_float(top_p), ctypes.c_int(top_k),
-                                                            ctypes.c_float(temperature), ctypes.c_float(repeat_penalty), ctypes.c_bool(False),
+                                                            ctypes.c_float(temperature), ctypes.c_float(repeat_penalty), ctypes.c_bool(output_logits),
                                                             stop_token_len, stop_token_list)
                 self.current_tokenizer_cache[handle] = [[prompt], [input]]
             else:
                 handle = fastllm_lib.launch_response_str_llm_model(self.model, prompt.encode(),
                                                                 ctypes.c_int(max_length), ctypes.c_int(min_length), ctypes.c_bool(do_sample), ctypes.c_float(top_p), ctypes.c_int(top_k),
-                                                                ctypes.c_float(temperature), ctypes.c_float(repeat_penalty), ctypes.c_bool(False),
+                                                                ctypes.c_float(temperature), ctypes.c_float(repeat_penalty), ctypes.c_bool(output_logits),
                                                                 stop_token_len, stop_token_list)
             return handle
     
@@ -2888,6 +2889,34 @@ class model:
                     self.current_tokenizer_cache[handle][1].append([] + pending_tokens)
                     pending_tokens.clear()
                 yield cur
+
+    async def stream_response_handle_logits_async(self, handle, response_statistics=None):
+        """Consume token IDs and their logits together; either fetch consumes the token."""
+        # HF-tokenized models may not populate fastllm's native tokenizer.
+        tokenizer = self.hf_tokenizer
+        vocab_size = (len(tokenizer.get_vocab()) if tokenizer is not None else
+                      fastllm_lib.get_tokenizer_vocab_size(self.model))
+        # Match response_logits: native code writes a model-dependent padded vector.
+        array = (ctypes.c_float * (vocab_size * 4))()
+
+        def fetch():
+            token = fastllm_lib.fetch_response_logits_llm_model(
+                self.model, handle, array)
+            return token, list(array)[:vocab_size] if token >= 0 else None
+
+        while True:
+            token, logits = await asyncio.to_thread(fetch)
+            if response_statistics is not None:
+                statistics = self.get_response_statistics(handle)
+                if statistics is not None:
+                    response_statistics.update(statistics)
+            if token < 0:
+                if token == -2:
+                    self._raise_prompt_too_long(handle)
+                if self.save_history:
+                    self.current_tokenizer_cache.pop(handle, None)
+                break
+            yield token, logits
 
     async def stream_response_handle_async(self, handle, response_statistics = None):
         import time

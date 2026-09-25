@@ -4,8 +4,10 @@ import binascii
 import copy
 import inspect
 import io
+import heapq
 import json
 import logging
+import math
 import os
 import re
 import tempfile
@@ -133,7 +135,8 @@ class FastLLmCompletion:
                model,
                think,
                hide_input,
-               enable_thinking = None):
+               enable_thinking = None,
+               max_logprobs = 20):
     self.model_name = model_name
     self.model = model
     self.init_fast_llm_model()
@@ -142,6 +145,7 @@ class FastLLmCompletion:
         enable_thinking = getattr(model, "enable_thinking", True)
     self.enable_thinking = enable_thinking
     self.hide_input = hide_input
+    self.max_logprobs = max_logprobs
     # Store mapping between conversation IDs and handles
     self.conversation_handles = {}
     
@@ -3086,6 +3090,18 @@ class FastLLmCompletion:
       error_check_ret = await self._check_model(request)
       if error_check_ret is not None:
           return error_check_ret
+      if request.top_logprobs is not None and request.top_logprobs < 0:
+          return self.create_error_response("top_logprobs must be at least 0")
+      if request.top_logprobs is not None and not request.logprobs:
+          return self.create_error_response(
+              "top_logprobs requires logprobs=true")
+      if request.top_logprobs is not None and request.top_logprobs > self.max_logprobs:
+          return self.create_error_response(
+              f"Requested sample logprobs of {request.top_logprobs}, "
+              f"which is greater than max allowed: {self.max_logprobs}")
+      if request.logprobs and request.stream:
+          return self.create_error_response(
+              "Streaming logprobs are not supported; use stream=false")
       
       query:str = ""
       if request.prompt:
@@ -3198,6 +3214,10 @@ class FastLLmCompletion:
 
       model_images = media.images if media.images else None
       model_videos = media.videos if media.videos else None
+      if request.logprobs and (model_images or model_videos or request.tools):
+          self._cleanup_temp_paths(media.temp_paths)
+          return self.create_error_response(
+              "logprobs currently supports text chat without tools")
 
       tools = [tool.model_dump(exclude_none=True) for tool in request.tools] if request.tools is not None else None
       messages = self._apply_kimi_k3_auto_tool_guidance(
@@ -3231,6 +3251,7 @@ class FastLLmCompletion:
           "images": model_images,
           "videos": model_videos,
           "stop_token_ids": stop_token_ids,
+          "output_logits": request.logprobs,
       }
       if chat_template_kwargs is not None:
           launch_kwargs["chat_template_kwargs"] = chat_template_kwargs
@@ -3284,8 +3305,10 @@ class FastLLmCompletion:
       self.conversation_handles[request_id] = handle
       # logging.info(f"Created conversation: {request_id}, handle: {handle}")
       response_statistics: Dict[str, int] = {}
-      result_generator = self._stream_response_handle_with_statistics(
-          handle, response_statistics)
+      result_generator = (self.model.stream_response_handle_logits_async(
+          handle, response_statistics = response_statistics)
+          if request.logprobs else self._stream_response_handle_with_statistics(
+              handle, response_statistics))
       # --think 是用户显式指定"在输出前补 <think>\n 起始标签"的开关，
       # 严格按用户意愿执行，与 enable_thinking（是否进入思考模式）解耦。
       need_think_prefix = self.think
@@ -3341,6 +3364,36 @@ class FastLLmCompletion:
       return
     logging.info(f"Abort disconnected request: {request_id}")
       
+  def _chat_logprob_entry(self, token_id: int, logits: List[float], top_count: int) -> Dict[str, Any]:
+      if token_id >= len(logits):
+          raise ValueError(f"Generated token {token_id} exceeds logits size {len(logits)}")
+      maximum = max(logits)
+      log_normalizer = maximum + math.log(sum(
+          math.exp(value - maximum) for value in logits))
+      tokenizer = getattr(self.model, "hf_tokenizer", None)
+
+      def item(index):
+          if tokenizer is not None:
+              token = tokenizer.decode([index], skip_special_tokens=False)
+              token_bytes = list(token.encode("utf-8"))
+          else:
+              raw = self.model._decode_fastllm_token(index)
+              token = raw.decode("utf-8", errors="replace")
+              token_bytes = list(raw)
+          return {"token": token,
+                  "logprob": float(logits[index] - log_normalizer),
+                  "bytes": token_bytes}
+
+      selected = heapq.nlargest(top_count, range(len(logits)), key=logits.__getitem__)
+      return {**item(token_id), "top_logprobs": [item(index) for index in selected]}
+
+  def _decode_chat_token_ids(self, token_ids: List[int]) -> str:
+      tokenizer = getattr(self.model, "hf_tokenizer", None)
+      if tokenizer is not None:
+          return tokenizer.decode(token_ids, skip_special_tokens=False)
+      return b"".join(self.model._decode_fastllm_token(i) for i in token_ids).decode(
+          "utf-8", errors="replace")
+
   async def chat_completion_full_generator(
               self, request: ChatCompletionRequest, raw_request: Request,
               handle: int,
@@ -3355,15 +3408,32 @@ class FastLLmCompletion:
       created_time = int(time.time())
       result = "" if emit_reasoning_content else ("<think>\n" if think else "")
       completion_tokens = 0
-      async for res in result_generator:
-        res = self._normalize_model_delta(res)
-        result += res
-        completion_tokens += 1
-        if await raw_request.is_disconnected():
-           print("is_disconnected!!!")
-           self.model.abort_handle(handle)
-           logging.info(f"Abort request: {request_id}")
-           return self.create_error_response("Client disconnected")
+      logprob_content = []
+      if request.logprobs:
+          token_ids = []
+          try:
+              async for token_id, logits in result_generator:
+                  token_ids.append(token_id)
+                  logprob_content.append(self._chat_logprob_entry(
+                      token_id, logits, request.top_logprobs or 0))
+                  completion_tokens += 1
+                  if await raw_request.is_disconnected():
+                      self._abort_conversation_handle(request_id, handle)
+                      return self.create_error_response("Client disconnected")
+          except Exception:
+              self._abort_conversation_handle(request_id, handle)
+              raise
+          result += self._decode_chat_token_ids(token_ids)
+      else:
+          async for res in result_generator:
+            res = self._normalize_model_delta(res)
+            result += res
+            completion_tokens += 1
+            if await raw_request.is_disconnected():
+               print("is_disconnected!!!")
+               self.model.abort_handle(handle)
+               logging.info(f"Abort request: {request_id}")
+               return self.create_error_response("Client disconnected")
 
       history_raw = result
       if self._is_kimi_k3_model():
@@ -3415,7 +3485,7 @@ class FastLLmCompletion:
                   reasoning_content=reasoning_content or None,
                   tool_calls=tool_call_info.tool_calls,
               ),
-              logprobs=None,
+              logprobs={"content": logprob_content} if request.logprobs else None,
               finish_reason='tool_calls',
           )
       else:
@@ -3434,7 +3504,7 @@ class FastLLmCompletion:
                   content=tool_call_info.content,
                   reasoning_content=reasoning_content or None,
               ),
-              logprobs=None,
+              logprobs={"content": logprob_content} if request.logprobs else None,
               finish_reason=finish_reason,
           )
 
