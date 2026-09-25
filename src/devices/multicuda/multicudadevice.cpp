@@ -5357,10 +5357,19 @@ namespace fastllm {
 
         DoCudaLinearReshape(input, weight, output);
         int outputAxis = (int)output.dims.size() - 1;
+        // Attention views a row-linear output as [..., heads, headDim].
+        // Flattening that view for the next projection must retain the local
+        // allocations: captured kernels still write to those addresses.
+        auto flattenShardDims = [](std::vector<int> dims, int axis) {
+            if (axis < 0 || axis >= (int)dims.size()) return std::vector<int>();
+            for (int i = axis + 1; i < (int)dims.size(); ++i) dims[axis] *= dims[i];
+            dims.resize(axis + 1);
+            return dims;
+        };
         bool reuseOutput = output.multiDeviceData &&
                            output.IsTensorParallelSharded() &&
-                           output.tpAxis == outputAxis &&
-                           output.tpGlobalDims == output.dims;
+                           flattenShardDims(output.tpGlobalDims, output.tpAxis) == output.dims &&
+                           output.multiDeviceDatas.size() == devices.size();
         if (reuseOutput) {
             for (int device : devices) {
                 std::vector<int> localDims = output.dims;
@@ -5372,7 +5381,8 @@ namespace fastllm {
                 auto it = output.multiDeviceDatas.find(device);
                 if (it == output.multiDeviceDatas.end() || it->second == nullptr ||
                     it->second->dataType != output.dataType ||
-                    it->second->dims != localDims ||
+                    flattenShardDims(it->second->dims, output.tpAxis) != localDims ||
+                    (it->second->dims != localDims && !it->second->expansionDims.empty()) ||
                     it->second->dataDevice != DataDevice::CUDA ||
                     it->second->cudaData == nullptr) {
                     reuseOutput = false;
@@ -5388,6 +5398,11 @@ namespace fastllm {
             // not; keep its address stable for whole-step CUDA graph capture.
             output.tpRanges = divisionScheme;
             output.tpGlobalDims = output.dims;
+            output.tpAxis = outputAxis;
+            for (int device : devices) {
+                auto *local = output.multiDeviceDatas.at(device);
+                local->Reshape(flattenShardDims(local->dims, outputAxis));
+            }
             output.cudaData = nullptr;
         }
 
