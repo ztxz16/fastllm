@@ -22,6 +22,8 @@
 namespace fastllm {
     class CudaWorkspace;
     struct Qwen35VisionTPState;
+    struct Qwen35DFlashTpMlpWorkspace;
+
     class Qwen3_5Model: public basellm {
     public:
     Qwen3_5Model (); // 构造函数
@@ -518,7 +520,8 @@ namespace fastllm {
                                    Data &linearWeight, Data &output);
         bool RunDFlashTensorParallelMlp(int device, Data &input,
                                        Data &gateupWeight,
-                                       Data &downWeight, Data &output);
+                                       Data &downWeight, Data &output,
+                                       Qwen35DFlashTpMlpWorkspace *workspace = nullptr);
         void RunDFlashDynamicConvolutionFallback(
                 const Data &source, Data &dynamicProjection,
                 Data &baseKernel, int side, int blockSize, Data &output);

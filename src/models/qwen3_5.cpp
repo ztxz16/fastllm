@@ -29449,9 +29449,13 @@ namespace fastllm {
         RunDFlashLinear(input, linearWeight, *GetEmptyData(), output);
     }
 
+    struct Qwen35DFlashTpMlpWorkspace {
+        Data halfOutput, swigluOutput, gateupOutput;
+    };
+
     bool Qwen3_5Model::RunDFlashTensorParallelMlp(
             int device, Data &input, Data &gateupWeight,
-            Data &downWeight, Data &output) {
+            Data &downWeight, Data &output, Qwen35DFlashTpMlpWorkspace *workspace) {
 #ifdef USE_CUDA
         if (!dflashTpBackbonePrepared ||
             !dflashTpPairedMlpPrepared ||
@@ -29469,30 +29473,40 @@ namespace fastllm {
 
         Executor &tpExecutor = Qwen35DFlashTpExecutor(
             dflashTpPreparedDevices, dflashTpPreparedRatios);
-        Data swigluOutput, gateupOutput;
+        std::optional<Qwen35DFlashTpMlpWorkspace> eagerWorkspace;
+        auto &buffers = workspace ? *workspace : eagerWorkspace.emplace();
         // Ordered worker dispatch joins producer and completion streams with
         // events. This avoids the generic per-MLP device synchronizations;
         // the MultiCUDA MLP then defers replica reuse behind those waits.
+        // Replica contents are not refreshed by MultiCUDA when the shape
+        // is unchanged. Keep the changing input local to this invocation.
         Data halfInput;
         Data *source = &input;
         if (gateupWeight.dataType == DataType::NVFP4_BLOCK_16 && input.dataType != DataType::FLOAT16) {
             ToDataType(input, halfInput, DataType::FLOAT16);
             source = &halfInput;
         }
+        Data &tpOutput = workspace ? buffers.halfOutput : output;
         Qwen35ScopedMultiCudaAsyncDispatch asyncDispatch;
         tpExecutor.Run(
             "MLP",
             {{"input", source},
-             {"output", &output},
+             {"output", &tpOutput},
              {"weight0", &gateupWeight},
              {"bias0", GetEmptyData()},
              {"weight1", &downWeight},
              {"bias1", GetEmptyData()},
-             {"w1", &swigluOutput},
-             {"w3", &gateupOutput}},
+             {"w1", &buffers.swigluOutput},
+             {"w3", &buffers.gateupOutput}},
             {}, {});
         FastllmCudaSetDevice(device);
-        ToDataType(output, input.dataType);
+        if (workspace) {
+            // Keep the root reduction result separate from the stable BF16
+            // consumer allocation retained by the local epilogue graph.
+            ToDataType(tpOutput, output, input.dataType);
+        } else {
+            ToDataType(output, input.dataType);
+        }
         return true;
 #else
         (void)device;
@@ -29500,6 +29514,7 @@ namespace fastllm {
         (void)gateupWeight;
         (void)downWeight;
         (void)output;
+        (void)workspace;
         return false;
 #endif
     }
@@ -30240,15 +30255,16 @@ namespace fastllm {
             Data normalized, attentionDynamic, attentionInput;
             Data query, key, value, mergedQkv;
             Data attentionHeads, tailInputHalf, tailInput, attentionOutput, convolvedAttention;
-            void *attentionHeadsPointer = nullptr;
+            void *attentionHeadsPointer = nullptr, *mlpOutputPointer = nullptr;
             Data mlpDynamic, mlpInput, mlpOutput, convolvedMlp;
             Data gate, up, gateup;
             Data halfAttentionDynamic, halfQkv, halfOutput;
             Data halfMlpDynamic, halfGateup, halfDown;
-            Graph prefix, tail;
+            Qwen35DFlashTpMlpWorkspace tpMlp;
+            Graph prefix, tail, mlpTail;
         };
         int device = -1, blockSize = 0;
-        bool logged = false;
+        bool logged = false, tpBackbone = false;
         void *ropeInvFreqPointer = nullptr, *hiddenPointer = nullptr;
         Data embedding, hidden, positions;
         std::vector<Layer> layers;
@@ -30260,6 +30276,7 @@ namespace fastllm {
             for (auto &layer : layers) {
                 layer.prefix.Clear();
                 layer.tail.Clear();
+                layer.mlpTail.Clear();
             }
             layers.clear();
             embedding.FreeSpace(); hidden.FreeSpace(); positions.FreeSpace();
@@ -30330,9 +30347,9 @@ namespace fastllm {
             (draftEmbedWeight->dataType == DataType::BFLOAT16 ||
              draftEmbedWeight->dataType == DataType::FLOAT16) &&
             Qwen35CudaGraphEnabled() &&
-            devices.size() <= 1 &&
-            (!threadTpWeightsPrepared.load(std::memory_order_acquire) ||
-             threadTpPreparedDevices.size() <= 1) &&
+            // Sharded MLPs stay outside the local graphs. Their persistent
+            // output feeds a separate convolution/residual epilogue graph.
+            (!dflashTpBackbonePrepared || dflashTpPairedMlpPrepared) &&
             blockSize >= 1 && blockSize <= 16 &&
             dflashHeadDim == 128 &&
             ::fastllm::qwen3cuda::Qwen3CudaEnvDefaultEnabled("FASTLLM_CUDA_DFLASH_FUSED_CONV") &&
@@ -30342,7 +30359,8 @@ namespace fastllm {
         if (computeGraphs) {
             auto &entry = GetQwen35CudaGraphWorkspace(this, device).dflashCompute;
             if (entry && (entry->device != device || entry->blockSize != blockSize || entry->layers.size() != size_t(dflashLayers) ||
-                          entry->ropeInvFreqPointer != dflashRopeInvFreq.cudaData))
+                          entry->ropeInvFreqPointer != dflashRopeInvFreq.cudaData ||
+                          entry->tpBackbone != dflashTpBackbonePrepared))
                 entry.reset();
             if (!entry) {
                 bool ready = true;
@@ -30353,6 +30371,20 @@ namespace fastllm {
                         const std::string name = "dflash.layers." + std::to_string(layer) + "." + suffix;
                         auto found = weight.weight.find(name);
                         if (found == weight.weight.end()) { ready = false; break; }
+                        if (dflashTpBackbonePrepared &&
+                            (std::string(suffix) == "mlp.gateup_proj.weight" ||
+                             std::string(suffix) == "mlp.down_proj.weight")) {
+                            const Data &w = found->second;
+                            const bool gateup = std::string(suffix) == "mlp.gateup_proj.weight";
+                            if (dflashTpPreparedDevices.size() <= 1 ||
+                                dflashTpPreparedDevices.front() != device ||
+                                w.dataType != DataType::NVFP4_BLOCK_16 ||
+                                w.tpLinearType != (gateup ? TP_LINEAR_ROW : TP_LINEAR_COLUMN) ||
+                                (gateup && w.tpPackType != TP_PACK_GATEUP) ||
+                                !Qwen35DFlashHasTpShards(w, dflashTpPreparedDevices))
+                                ready = false;
+                            continue;
+                        }
                         auto view = dflashNvfp4ViewWeights.find(found->second.name);
                         const Data &w = view == dflashNvfp4ViewWeights.end() ? found->second : view->second;
                         if (w.multiDeviceData || w.dataDevice != DataDevice::CUDA || !w.cudaData ||
@@ -30366,6 +30398,7 @@ namespace fastllm {
                     entry = std::make_shared<Qwen35DFlashComputeWorkspace>();
                     entry->device = device;
                     entry->blockSize = blockSize;
+                    entry->tpBackbone = dflashTpBackbonePrepared;
                     entry->ropeInvFreqPointer = dflashRopeInvFreq.cudaData;
                     entry->layers.resize(dflashLayers);
                 }
@@ -30408,7 +30441,9 @@ namespace fastllm {
         }
 
         if (compute && compute->hiddenPointer != hiddenStates.cudaData) {
-            for (auto &layer : compute->layers) { layer.prefix.Clear(); layer.tail.Clear(); }
+            for (auto &layer : compute->layers) {
+                layer.prefix.Clear(); layer.tail.Clear(); layer.mlpTail.Clear();
+            }
             compute->hiddenPointer = hiddenStates.cudaData;
         }
         std::vector<float> positionValues(blockSize);
@@ -30502,8 +30537,8 @@ namespace fastllm {
         for (int layerIndex = 0; layerIndex < dflashLayers; layerIndex++) {
             const std::string prefix = "dflash.layers." +
                 std::to_string(layerIndex) + ".";
-            Qwen35DFlashComputeWorkspace::Layer eagerLayer;
-            auto &buffers = compute ? compute->layers[layerIndex] : eagerLayer;
+            std::optional<Qwen35DFlashComputeWorkspace::Layer> eagerLayer;
+            auto &buffers = compute ? compute->layers[layerIndex] : eagerLayer.emplace();
             Data &normalized = buffers.normalized, &attentionDynamic = buffers.attentionDynamic;
             Data &attentionInput = buffers.attentionInput;
             Data &query = buffers.query, &key = buffers.key, &value = buffers.value, &mergedQkv = buffers.mergedQkv;
@@ -30669,6 +30704,8 @@ namespace fastllm {
                 attentionHeads.Reshape({1, blockSize, dflashHeads * dflashHeadDim});
                 ToDataType(attentionHeads, DataType::BFLOAT16);
             }
+            Data &mlpDynamic = buffers.mlpDynamic, &mlpInput = buffers.mlpInput;
+            Data &mlpOutput = buffers.mlpOutput;
             auto runTail = [&]() {
                 if (compute) {
                     Qwen3CudaPrepareLocalOutput(buffers.tailInputHalf, device);
@@ -30695,7 +30732,6 @@ namespace fastllm {
                 RMSNorm(hiddenStates,
                         weight[prefix + "post_attention_layernorm.weight"],
                         dflashRmsNormEps, normalized);
-                Data &mlpDynamic = buffers.mlpDynamic, &mlpInput = buffers.mlpInput;
                 RunDFlashLinear(normalized,
                        weight[prefix + "mlp_conv.kernel_projection.weight"],
                        *GetEmptyData(), mlpDynamic, compute ? &buffers.halfMlpDynamic : nullptr);
@@ -30703,7 +30739,8 @@ namespace fastllm {
                     normalized, mlpDynamic,
                     weight[prefix + "mlp_conv.base_kernel"], 0,
                     mlpInput);
-                Data &mlpOutput = buffers.mlpOutput;
+            };
+            auto runMlp = [&]() {
                 auto gateupIt = weight.weight.find(
                     prefix + "mlp.gateup_proj.weight");
                 auto downIt = weight.weight.find(
@@ -30713,7 +30750,7 @@ namespace fastllm {
                     downIt != weight.weight.end() &&
                     RunDFlashTensorParallelMlp(
                         device, mlpInput, gateupIt->second,
-                        downIt->second, mlpOutput);
+                        downIt->second, mlpOutput, compute ? &buffers.tpMlp : nullptr);
                 if (!pairedTpMlp) {
                     Data &gate = buffers.gate, &up = buffers.up, &gateup = buffers.gateup;
                     bool fusedGateupPrepared = false;
@@ -30768,19 +30805,35 @@ namespace fastllm {
                     RunDFlashLinear(gate, weight[prefix + "mlp.down_proj.weight"],
                            *GetEmptyData(), mlpOutput, compute ? &buffers.halfDown : nullptr);
                 }
+            };
+            auto runMlpTail = [&]() {
                 dynamicConvolve(mlpOutput, mlpDynamic,
                     weight[prefix + "mlp_conv.base_kernel"], 1, buffers.convolvedMlp);
                 AddTo(hiddenStates, buffers.convolvedMlp);
             };
-            if (compute) {
+            if (compute && compute->tpBackbone) {
                 buffers.tail.Run(runTail);
                 if (!computeCompatible) buffers.tail.disabled = true;
-            } else runTail();
+                runMlp();
+                if (buffers.mlpOutputPointer != mlpOutput.cudaData) {
+                    buffers.mlpTail.Clear();
+                    buffers.mlpOutputPointer = mlpOutput.cudaData;
+                }
+                buffers.mlpTail.Run(runMlpTail);
+                if (!computeCompatible) buffers.mlpTail.disabled = true;
+            } else {
+                auto runFullTail = [&]() { runTail(); runMlp(); runMlpTail(); };
+                if (compute) {
+                    buffers.tail.Run(runFullTail);
+                    if (!computeCompatible) buffers.tail.disabled = true;
+                } else runFullTail();
+            }
         }
 
         if (compute && !compute->logged && std::all_of(
-                compute->layers.begin(), compute->layers.end(), [](const auto &layer) {
-                    return layer.prefix.exec != nullptr && layer.tail.exec != nullptr;
+                compute->layers.begin(), compute->layers.end(), [&](const auto &layer) {
+                    return layer.prefix.exec != nullptr && layer.tail.exec != nullptr &&
+                        (!compute->tpBackbone || layer.mlpTail.exec != nullptr);
                 })) {
             printf("[DFlash] compute CUDA graphs ready: device=%d layers=%d rows=%d.\n",
                    device, dflashLayers, blockSize);
