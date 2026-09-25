@@ -468,11 +468,12 @@ class FastLLmCompletion:
       if effort is None:
           effort = template_kwargs.get(
               "reasoning_effort", template_kwargs.get("thinking_effort"))
-      if effort in {None, "none"}:
+      # Generic clients may send high/max/minimal or a numeric budget. Keep
+      # Qwen's native default instead of rejecting an otherwise valid request.
+      # "none" controls enable_thinking separately; the template still needs
+      # a supported effort even when thinking is disabled.
+      if effort not in ("low", "medium", "xhigh"):
           effort = "xhigh"
-      if effort not in {"low", "medium", "xhigh"}:
-          raise ValueError(
-              "Qwen reasoning_effort must be one of: none, low, medium, xhigh")
       return effort
 
   def _resolve_glm5_next_reasoning_effort(

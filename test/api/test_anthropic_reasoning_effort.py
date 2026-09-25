@@ -23,10 +23,12 @@ class AnthropicReasoningEffortTest(unittest.IsolatedAsyncioTestCase):
                         async for chunk in generator: pass
                         await background()
 
-    async def test_disabled_thinking_and_invalid_effort(self):
+    async def test_thinking_override_and_effort_fallback(self):
         for thinking, effort, enabled, error in ((None, None, False, False),
                 ({"type":"disabled"}, "low", False, False),
-                ({"type":"adaptive"}, "high", None, True)):
+                ({"type":"adaptive"}, "high", True, False),
+                ({"type":"disabled"}, "max", False, False),
+                ({"type":"invalid"}, "high", None, True)):
             with self.subTest(thinking=thinking, effort=effort):
                 instance = completion(); instance.enable_thinking = False
                 result = await instance.create_anthropic_message(AnthropicMessageRequest(
@@ -36,4 +38,8 @@ class AnthropicReasoningEffortTest(unittest.IsolatedAsyncioTestCase):
                     self.assertIsInstance(result, ErrorResponse)
                     self.assertIsNone(instance.model.launch_kwargs)
                 else:
+                    self.assertNotIsInstance(result, ErrorResponse)
                     self.assertEqual(instance.model.launch_kwargs["enable_thinking"], enabled)
+                    self.assertEqual(
+                        instance.model.launch_kwargs["chat_template_kwargs"]["reasoning_effort"],
+                        "low" if effort == "low" else "xhigh")
