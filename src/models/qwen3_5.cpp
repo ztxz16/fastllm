@@ -2428,6 +2428,8 @@ namespace fastllm {
         static void PrepareQwen35EmbeddingWeightType(Data &embedWeight,
                                                      DataType outputType,
                                                      bool requireCpu) {
+            // GGUF 量化权重由 Embedding 算子按行反量化，不做整体类型转换
+            bool quantized = (embedWeight.dataType == DataType::DATA_GGUF_FORMAT);
             if (requireCpu || embedWeight.dataType != outputType) {
                 if (embedWeight.multiDeviceData) {
                     embedWeight.ResetMultiDeviceState();
@@ -2436,7 +2438,7 @@ namespace fastllm {
                     embedWeight.ToDevice(DataDevice::CPU);
                 }
             }
-            if (embedWeight.dataType != outputType) {
+            if (!quantized && embedWeight.dataType != outputType) {
                 ToDataTypeForceCPU(embedWeight, outputType);
             }
         }
@@ -2455,6 +2457,10 @@ namespace fastllm {
 
         static void PrepareQwen35CudaEmbeddingWeightType(Data &embedWeight,
                                                          DataType outputType) {
+            // GGUF 量化权重由 Embedding 算子按行反量化，保持量化数据与所在设备
+            if (embedWeight.dataType == DataType::DATA_GGUF_FORMAT) {
+                return;
+            }
             if (embedWeight.dataType != outputType) {
                 embedWeight.ResetMultiDeviceState();
                 if (embedWeight.dataDevice != DataDevice::CPU) {

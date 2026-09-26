@@ -3246,3 +3246,48 @@ bool FastllmCudaBFloat16MergeMOEGGUFBatch1(const fastllm::Data &input, fastllm::
     return FastllmCudaTypedMergeMOEGGUFBatch1<__nv_bfloat16>(
         input, w1, output, gateups, downs, scores, scoresOnCuda, topk, hidden, inter);
 }
+
+// GGUF 量化 embedding：token id 拷回 host 后按行反量化，复用线性层同一套反量化核
+bool FastllmCudaEmbeddingGGUF(const fastllm::Data &input, const fastllm::Data &weight, fastllm::Data &output) {
+    int vocabSize = weight.dims[0], embSize = weight.dims[1];
+    uint64_t inputLen = input.Count(0);
+    ggml_type ggufType = (ggml_type)weight.ggmlType;
+    size_t rowBytes = ggml_row_size(ggufType, embSize);
+    const char *weightData = (const char *)weight.cudaData;
+
+    std::vector<float> tokens(inputLen);
+    cudaMemcpy(tokens.data(), input.cudaData, sizeof(float) * inputLen, cudaMemcpyDeviceToHost);
+
+    bool ok = true;
+    auto runRows = [&](auto *outPtr, auto dequant, const char *outTypeName) {
+        if (dequant == nullptr) {
+            printf("FastLLM Error: Embedding error: GGUF type %s has no %s dequant func.\n",
+                   ggml_type_name(ggufType), outTypeName);
+            ok = false;
+            return;
+        }
+        for (uint64_t i = 0; i < inputLen; i++) {
+            int token = (int)(tokens[i] + 1e-9);
+            if (token < 0 || token >= vocabSize) {
+                printf("FastLLM Error: Embedding error: token out of range. token = %d\n", token);
+                ok = false;
+                return;
+            }
+            dequant(weightData + (size_t)token * rowBytes, outPtr + i * embSize, 1, embSize, nullptr);
+        }
+    };
+
+    if (output.dataType == fastllm::DataType::FLOAT32) {
+        runRows((float *)output.cudaData, ggml_get_to_fp32_cuda(ggufType), "fp32");
+    } else if (output.dataType == fastllm::DataType::FLOAT16) {
+        runRows((half *)output.cudaData, ggml_get_to_fp16_cuda(ggufType), "fp16");
+    } else if (output.dataType == fastllm::DataType::BFLOAT16) {
+        runRows((__nv_bfloat16 *)output.cudaData, ggml_get_to_bf16_cuda(ggufType), "bf16");
+    } else {
+        printf("FastLLM Error: Embedding error: unsupport output dataType for GGUF weight.\n");
+        ok = false;
+    }
+
+    DeviceSync();
+    return ok;
+}

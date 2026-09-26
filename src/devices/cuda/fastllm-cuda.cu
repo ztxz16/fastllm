@@ -12576,6 +12576,9 @@ bool FastllmHalfToBF16(void *a, void *b, int len) {
     return true;
 }
 
+// 实现在 fastllm-ggml-cuda.cu，复用 GGUF 反量化分派
+bool FastllmCudaEmbeddingGGUF(const fastllm::Data &input, const fastllm::Data &weight, fastllm::Data &output);
+
 bool FastllmCudaEmbedding(const fastllm::Data &input, const fastllm::Data &weight,fastllm::Data &output) {
     int vocabSize = weight.dims[0], embSize = weight.dims[1];
     uint64_t inputLen = input.Count(0);
@@ -12604,6 +12607,8 @@ bool FastllmCudaEmbedding(const fastllm::Data &input, const fastllm::Data &weigh
         __nv_bfloat16 *weightData = (__nv_bfloat16 *) weight.cudaData;
         FastllmCudaBFloat16EmbeddingToFloatKernel<128><<<inputLen, 128>>>(
             inputData, weightData, outputData, embSize);
+    } else if (weight.dataType == fastllm::DataType::DATA_GGUF_FORMAT) {
+        return FastllmCudaEmbeddingGGUF(input, weight, output);
     } else {
         
     }
@@ -12642,6 +12647,8 @@ bool FastllmCudaEmbeddingDirect(const fastllm::Data &input, const fastllm::Data 
             FastllmCudaFloatEmbeddingKernel<128><<<inputLen, 128>>>(
                 inputData, weightData, outputData, embSize);
         }
+    } else if (weight.dataType == fastllm::DataType::DATA_GGUF_FORMAT) {
+        return FastllmCudaEmbeddingGGUF(input, weight, output);
     }
 
     DeviceSync();
