@@ -22444,7 +22444,7 @@ namespace fastllm {
 #endif
     }
 
-    void Qwen3_5Model::Qwen35MTPLoop() {
+    void Qwen3_5Model::Qwen35MTPLoop(std::atomic<bool> *helperStop) {
 #ifndef USE_CUDA
         NewMainLoop();
 #else
@@ -22495,6 +22495,11 @@ namespace fastllm {
         const int mtpBatchDecodeTokens = std::min(
             mtpDraftsPerStep + 1, QWEN35_MTP_FAST_SEQ_MAX);
         int prefillChunkSize = model->GetChunkedPrefillSize();
+        const int longPrefillChunkSize = schedulerUsesDFlash ?
+            std::max(1, std::min(
+                prefillChunkSize,
+                QWEN35_DFLASH_LONG_PREFILL_CHUNK_SIZE)) :
+            prefillChunkSize;
 
         auto releasePagedCachePages = [](Data &cache, bool clearDims = false) {
             std::set<std::pair<PagedCacheManager*, int> > releasedPages;
@@ -23483,7 +23488,7 @@ namespace fastllm {
             return gpuTokenHandoffPendingCanChain;
         };
         while (true) {
-            if (model->isFree) {
+            if (model->isFree || (helperStop != nullptr && helperStop->load())) {
                 clearGpuTokenHandoffPending(true);
                 break;
             }
@@ -23564,6 +23569,15 @@ namespace fastllm {
             for (auto &it : model->responseContextDict.dicts) {
                 ResponseContext *ctx = it.second;
                 if (ctx == nullptr) {
+                    continue;
+                }
+                // The main scheduler owns this paused prefill until its final
+                // chunk. It does not occupy a helper execution lane: the helper
+                // may batch up to mtpSchedulerLanes short requests while the
+                // main thread waits at a chunk boundary. Its KV pages remain
+                // resident and are still checked by the page-capacity guard.
+                if (helperStop != nullptr &&
+                    model->cooperativeLongPrefillHandles.count(it.first) != 0) {
                     continue;
                 }
                 if (ctx->isAbort) {
@@ -23735,6 +23749,12 @@ namespace fastllm {
 
                     int scheduledTokens = isPrompt ?
                         (int)ctx->currentTokens.size() : scheduledDecodeTokens(ctx);
+                    // A helper only handles short arrivals; a second long prefill
+                    // waits for the main scheduler so helpers never nest.
+                    if (helperStop != nullptr && isPrompt &&
+                        scheduledTokens > longPrefillChunkSize) {
+                        continue;
+                    }
                     if (isPrompt && gpuTokenHandoffConfigured &&
                         !seqLens.empty() &&
                         (scheduledTokens > prefillChunkSize ||
@@ -23979,11 +23999,6 @@ namespace fastllm {
                 bool consumeGpuTokenHandoff = gpuTokenHandoffPending &&
                     !handles.empty() && seqLens.size() == handles.size() &&
                     tokenContexts.size() == handles.size();
-                const int longPrefillChunkSize = schedulerUsesDFlash ?
-                    std::max(1, std::min(
-                        prefillChunkSize,
-                        QWEN35_DFLASH_LONG_PREFILL_CHUNK_SIZE)) :
-                    prefillChunkSize;
                 if (consumeGpuTokenHandoff) {
                     for (int i = 0; i < (int)handles.size(); i++) {
                         consumeGpuTokenHandoff &= seqLens[i] == 1 &&
@@ -24083,13 +24098,63 @@ namespace fastllm {
                            seqLens[0] > longPrefillChunkSize &&
                            singleContext != nullptr) {
                     int len = seqLens[0];
+                    std::atomic<bool> stopHelper{false};
+                    struct HelperGuard {
+                        Qwen3_5Model *model;
+                        int handle;
+                        std::atomic<bool> &stop;
+                        std::mutex &forwardLocker;
+                        std::thread thread;
+                        bool registered = false;
+
+                        ~HelperGuard() {
+                            if (!registered) {
+                                return;
+                            }
+                            {
+                                std::lock_guard<std::mutex> lock(model->dictLocker);
+                                stop.store(true);
+                            }
+                            forwardLocker.unlock();
+                            model->dictCV.notify_all();
+                            if (thread.joinable()) {
+                                thread.join();
+                            }
+                            forwardLocker.lock();
+                            std::lock_guard<std::mutex> lock(model->dictLocker);
+                            model->cooperativeLongPrefillHandles.erase(handle);
+                        }
+                    } helperGuard{model, handles[0], stopHelper, forwardLocker};
                     std::vector<std::pair<Data, Data> > *pastKeyValue1 = nullptr;
                     dictLocker.lock();
                     auto contextIt = model->responseContextDict.dicts.find(handles[0]);
+                    const char *cooperativeEnv =
+                        std::getenv("FASTLLM_COOPERATIVE_LONG_PREFILL");
+                    const bool enableCooperativePrefill =
+                        helperStop == nullptr && schedulerUsesDFlash &&
+                        cooperativeEnv != nullptr &&
+                        std::atoi(cooperativeEnv) > 0;
                     if (contextIt != model->responseContextDict.dicts.end()) {
                         pastKeyValue1 = &contextIt->second->pastKeyValues;
+                        if (enableCooperativePrefill) {
+                            model->cooperativeLongPrefillHandles.insert(handles[0]);
+                            helperGuard.registered = true;
+                        }
                     }
                     dictLocker.unlock();
+                    if (pastKeyValue1 != nullptr && enableCooperativePrefill) {
+                        try {
+                            helperGuard.thread = std::thread([model, &stopHelper]() {
+                                model->Qwen35MTPLoop(&stopHelper);
+                            });
+                        } catch (const std::exception &error) {
+                            std::lock_guard<std::mutex> lock(model->dictLocker);
+                            model->cooperativeLongPrefillHandles.erase(handles[0]);
+                            helperGuard.registered = false;
+                            fprintf(stderr, "[Qwen3.5 DFlash] helper thread unavailable: %s\n",
+                                    error.what());
+                        }
+                    }
                     if (pastKeyValue1 == nullptr) {
                         ret.push_back(model->eos_token_id);
                     } else {
@@ -24286,8 +24351,9 @@ namespace fastllm {
                         bool longPrefillDFlashSeeded = false;
                         auto prefillStartTime = std::chrono::system_clock::now();
                         for (int st = 0; st < len; ) {
-                            // AbortResponse writes isAbort under dictLocker.
-                            // Stop before starting another expensive chunk.
+                            // AbortResponse writes isAbort under dictLocker. Check at
+                            // each chunk boundary while the main scheduler still owns
+                            // this context; the helper must never remove it here.
                             {
                                 std::lock_guard<std::mutex> guard(model->dictLocker);
                                 cancelledLongPrefill = singleContext->isAbort;
@@ -24458,6 +24524,15 @@ namespace fastllm {
                                 (void)totalSpend;
                                 printf("[Prompt] Long Prefill ... (%d/%d, %d%%). Speed: %f tokens / s.\n",
                                        st, len, st * 100 / len, chunkSpeed);
+                            }
+                            if (helperGuard.thread.joinable() && st < len) {
+                                // Both model and draft state are at a chunk boundary.
+                                // Let the helper schedule one short request while
+                                // forwardLocker serializes access to CUDA scratch.
+                                forwardLocker.unlock();
+                                model->dictCV.notify_all();
+                                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                                forwardLocker.lock();
                             }
                         }
                         if (longPrefillDFlashSeeded) {
@@ -24689,8 +24764,9 @@ namespace fastllm {
                 dictLocker.lock();
 
                 if (cancelledLongPrefill) {
-                    // The context destructor releases paged KV references;
-                    // OnResponseContextRemoved drops remaining draft snapshots.
+                    // Do not publish an incomplete prefix or a generated token.
+                    // The context destructor releases its paged KV references;
+                    // OnResponseContextRemoved erases DFlash and MTP snapshots.
                     model->RemoveResponseContext(handles[0]);
                     model->dictCV.notify_all();
                     releasePendingResultLogits(logits);
@@ -24835,6 +24911,11 @@ namespace fastllm {
             if (seqLens.empty()) {
                 if (!orders.empty()) {
                     model->dictCV.wait_for(dictLocker, std::chrono::milliseconds(10));
+                } else if (helperStop != nullptr) {
+                    model->dictCV.wait_for(
+                        dictLocker, std::chrono::milliseconds(10), [&]() {
+                            return model->isFree || helperStop->load();
+                        });
                 } else {
                     model->dictCV.wait(dictLocker);
                 }
