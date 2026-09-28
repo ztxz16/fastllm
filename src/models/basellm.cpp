@@ -2671,6 +2671,9 @@ namespace fastllm {
                         ctx->resultTokenQueue.push(curRet);
                         QueueGeneratedResultLogits(ctx, logits, i);
                         ctx->allTokens.push_back(curRet);
+                        if (model->WantsPerStepPrefixSnapshot()) {
+                            ctx->TryRecordPagedCache(model);
+                        }
                         if (NeedRepeatPenalty(ctx->generationConfig)) {
                             ctx->tokens.Push(curRet);
                         }
