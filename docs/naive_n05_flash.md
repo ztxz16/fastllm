@@ -25,9 +25,69 @@ FT_NUMAS=1 numactl -C 0-31 -m 0 \
 - 滑窗注意力保留 127 个历史 token，计入 attention sink 和 value scaling。
 - 全局层支持 FP8 indexer、因果约束及稳定的 top-2048 选择；索引键保存在对应请求的 KV cache 中。
 - NUMA 专家使用动态 W8A8：每 128 个激活使用独立 FP32 缩放系数，在 GEMM 中应用激活和权重的缩放，并对齐原始实现的 BF16 舍入顺序。参考 FP8 内核使用的 FP32 → FP16 向零截断 → FP8 舍入也在 NUMA 路径中保留。
-- 默认以 2048 token 分块 prefill，可用 `--chunked_prefill_size` 覆盖；每次 Forward 处理一条序列，关闭通用历史前缀缓存。HTTP 请求由现有调度器处理。
+- 默认以 2048 token 分块 prefill，可用 `--chunked_prefill_size` 覆盖；每次 Forward 处理一条序列。跨请求前缀复用使用模型专用的 CPU KV 归档，HTTP 请求由现有调度器处理。
 
 当前稀疏索引在 GPU 计算分数、在 CPU 做稳定 top-k。超长上下文的索引开销还可以优化。本文的完整模型验证覆盖到 2057 token，不代表已经验证配置中的 1M 上下文。
+
+## 工具调用与跨请求前缀缓存
+
+默认启动自动根据 Naive 的 XML 模板选择 `qwen3_coder` 工具解析器，支持 `tools`、
+工具结果消息和流式增量；`tool_choice=required` 或指定函数时复用 XML 工具选择引导。
+也可以通过已有的 `--tool_call_parser` 显式覆盖解析器。
+Python 接口也会把工具历史中的 JSON 参数字符串转换为模板所需的对象。
+请求通过 `chat_template_kwargs.enable_thinking=true` 开启思考时，思考内容放入
+`reasoning_content`，工具调用仍放入 `tool_calls`；默认启动不开启思考。
+
+MoE 启动默认启用 `--cache_history true`；可用 `--cache_history false` 关闭。
+完成或中止请求时，仅记录已经执行 Forward 的 token，排除尚未计算 KV 的最后一个输出。
+后续请求按 token ID 匹配最长公共前缀，支持相同请求、追加工具结果、较短请求和分支请求。
+相同请求仍保留一个输入 token 重新计算 logits。
+
+归档在 CPU 分块保存滑窗裁剪前的 K/V，以及全局层打包的索引键；命中时全局层恢复完整
+前缀，滑窗层只恢复边界前所需的 127 个 token，并恢复绝对位置和调度状态。
+不可变归档块可在分支请求之间共享，当前请求的 KV 独立分配。
+恢复过程只操作 CPU 内存，不等待其他请求的 GPU Forward。
+
+归档最多保留 5 条记录，条目计费合计上限 1 GiB，按最近使用顺序淘汰；每个活动请求
+最多另建 1 GiB 归档。超出容量后只缓存已保存的前缀，其余输入正常计算。
+该模型的归档始终使用 CPU 内存，不受 `--cache_fast` 影响，不额外常驻 GPU KV 副本。
+API 的 `usage.prompt_tokens_details.cached_tokens` 表示本次命中的输入 token 数。
+
+`tools/naive_n05_flash_bench.py` 默认关闭历史缓存来测量完整 prefill；增加
+`--cache_history true` 可测试复用，并在结果中查看 `cached_input_tokens`。
+
+### 缓存与工具实测（2026-09-29）
+
+沿用 CPU 0–31、单 NUMA、28 线程、RTX 4090；排除模型加载和预热，直接记录首个
+输出 token 的时间。以下为单次测量；2057 token 使用重复拼接输入。
+
+| 请求 | 输入 token | 命中 token | 首 token |
+| --- | ---: | ---: | ---: |
+| 短请求，缓存关闭 | 54 | 0 | 0.929 s |
+| 短请求，开启缓存但未命中 | 54 | 0 | 0.938 s |
+| 重复短请求 | 54 | 53 | 0.106 s |
+| 长请求，开启缓存但未命中 | 2057 | 0 | 6.073 s |
+| 重复长请求 | 2057 | 2056 | **0.129 s** |
+| 分支请求，滑窗边界 | 148 | 128 | 0.486 s |
+| 分支请求，分块边界 | 2057 | 2048 | 0.307 s |
+
+重复长请求一行关闭 logits 采集；其开启 logits 的对应测量为 0.135 s。
+缓存减少的是前缀 prefill，未命中的后缀和后续 decode 仍需计算。
+
+开启缓存但不命中时，短样例的 logits 与关闭缓存逐位一致；在 2048-token 边界
+恢复后，分支请求的 logits 也与完整重算逐位一致。任意边界会改变计算批大小和
+浮点累加顺序，结果不保证逐位一致。缓存命中后与原始 FP8 参考比较：54-token
+样例 5 个位置最大 KL 为 **0.02859**，2057-token 样例 2 个位置为 **0.002745**，
+最大绝对 logits 差分别为 2.0、3.9375，7 个位置的 top-1 均相同。
+
+完整模型通过自动调用、流式 `required`、指定函数、双工具调用、`none` 和工具结果
+回传测试。工具回传的一组请求命中 344 token；实际 HTTP 服务中两个并发工具结果
+请求各命中 284 token，分别正确回答 25°C、26°C。默认配置的非流式和 SSE 请求均
+返回正确工具调用。开启思考的真实模型输出也成功解析工具；最后补充的思考字段分离
+通过响应生成器回归验证，覆盖单字符流式分块及思考截断。
+
+逐次时间、命中数、logits 误差和 API 结果见
+[缓存与工具验证数据](benchmarks/naive_n05_flash_history.json)。
 
 ## 服务验证
 
@@ -118,12 +178,19 @@ Nsight 采集的一次 54 token prefill 加 7 步 decode 中，GPU kernel 总时
 
 ```bash
 cmake -S . -B build-fastllm -DUNIT_TEST=ON
-cmake --build build-fastllm --target naive_n05_attention_test numas_fp8_eager_moe_test -j16
-ctest --test-dir build-fastllm -R 'naive_n05_attention|numas_fp8_eager_moe' --output-on-failure
+cmake --build build-fastllm --target naive_n05_attention_test naive_n05_history_test numas_fp8_eager_moe_test -j16
+ctest --test-dir build-fastllm -R 'naive_n05_(attention|history)|numas_fp8_eager_moe' --output-on-failure
 ```
 
 CUDA 测试覆盖部分 RoPE、GQA、滑窗边界、attention sink、稀疏因果掩码、FP8/BF16 indexer 与分数相同时的稳定选择。
 NUMA 测试以独立标量参考覆盖 W8A8 量化、FP8 次正规数、BF16 舍入、专家分组和请求规模变化，同时运行 AVX512 与 AVX2 路径。
+
+新增的 `naive_n05_history_test` 验证真实请求初始化和缓存钩子，覆盖精确重复、短请求、
+任意公共前缀、127/128 滑窗边界、跨块恢复、分支互不影响、多模态隔离、关闭清空、
+命中与重复记录时的 LRU 更新，以及 CPU 恢复不等待 Forward 锁。
+工具解析回归可运行 `python3 -m unittest discover -s test/toolcall -p 'test_qwen*.py'`。
+Naive 思考与工具混合输出回归：
+`python3 -m unittest discover -s test/api -p 'test_naive_n05_tools.py'`。
 
 
 ## Nsight Systems 定位与算子优化（2026-09-29）

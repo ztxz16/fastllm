@@ -1,0 +1,982 @@
+{
+  "model": "Naive-N0.5-Flash-FP8",
+  "configuration": {
+    "ft_numas": 1,
+    "cpus": "0-31",
+    "threads": 28,
+    "device": "cuda",
+    "moe_device": "numa",
+    "cache_device": "cpu",
+    "history_record_limit": 5,
+    "history_byte_limit": 1073741824
+  },
+  "library_sha256": "8375b62ff635324dd2f7cfd0a2f3dbabfe3b94793bafefc2ef04708663c38234",
+  "method": "Greedy direct-runtime captures; disabling set_save_history clears records. Cache counts are sampled at launch (long_miss shares 38 tokens). Speed-only runs disable logits capture. ASGI tests disable thinking but explicitly prepend the legacy <think> tag; HTTP tests use CLI defaults with both disabled. Final reasoning-field separation is covered by full and single-character streaming response-generator tests.",
+  "input_ids": {
+    "natural": [
+      151644,
+      8948,
+      198,
+      25139,
+      287,
+      30022,
+      371,
+      25,
+      7487,
+      151645,
+      151644,
+      8948,
+      198,
+      2610,
+      525,
+      12812,
+      533,
+      11250,
+      15,
+      13,
+      20,
+      12,
+      23876,
+      11,
+      264,
+      10950,
+      15235,
+      17847,
+      44936,
+      553,
+      12812,
+      533,
+      15235,
+      13,
+      151645,
+      151644,
+      872,
+      198,
+      14880,
+      98237,
+      30534,
+      104136,
+      100678,
+      101916,
+      20412,
+      105681,
+      9370,
+      1773,
+      151645,
+      151644,
+      77091,
+      198,
+      151667,
+      151668
+    ],
+    "long_pattern": [
+      151644,
+      8948,
+      198,
+      25139,
+      287,
+      30022,
+      371,
+      25,
+      7487,
+      151645,
+      151644,
+      8948,
+      198,
+      2610,
+      525,
+      12812,
+      533,
+      11250,
+      15,
+      13,
+      20,
+      12,
+      23876,
+      11,
+      264,
+      10950,
+      15235,
+      17847,
+      44936,
+      553,
+      12812,
+      533,
+      15235,
+      13,
+      151645,
+      151644,
+      872,
+      198,
+      108386,
+      37945,
+      11622,
+      105321,
+      100157,
+      107828,
+      1773,
+      151645,
+      151644,
+      77091,
+      198
+    ],
+    "long_repeat_to": 2057,
+    "branch_definition": "copy long[:min(2057, boundary+20)]; set token at boundary to 42; boundaries 127,128,2048"
+  },
+  "runs": [
+    {
+      "name": "warmup",
+      "input_tokens": 54,
+      "output_ids": [
+        198,
+        101916,
+        104401
+      ],
+      "token_seconds": [
+        8.563962841999455,
+        8.618292171999201,
+        8.672609139997803
+      ],
+      "ttft_seconds": 8.563962841999455,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 54
+      },
+      "logits_enabled": false
+    },
+    {
+      "name": "natural_off",
+      "input_tokens": 54,
+      "output_ids": [
+        198,
+        101916,
+        104401,
+        105681,
+        3837
+      ],
+      "token_seconds": [
+        0.9294811539984948,
+        0.9839736629983236,
+        1.0383258900001238,
+        1.0927105890004896,
+        1.1470716730000277
+      ],
+      "ttft_seconds": 0.9294811539984948,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 54
+      },
+      "logits_enabled": true
+    },
+    {
+      "name": "long_off",
+      "input_tokens": 2057,
+      "output_ids": [
+        198,
+        151667
+      ],
+      "token_seconds": [
+        6.913430780998169,
+        6.978477636999742
+      ],
+      "ttft_seconds": 6.913430780998169,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 2057
+      },
+      "logits_enabled": true
+    },
+    {
+      "name": "natural_miss",
+      "input_tokens": 54,
+      "output_ids": [
+        198,
+        101916,
+        104401,
+        105681,
+        3837
+      ],
+      "token_seconds": [
+        0.9377170089974243,
+        0.9934586279996438,
+        1.0489670599999954,
+        1.104412095999578,
+        1.1599734919982438
+      ],
+      "ttft_seconds": 0.9377170089974243,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 54
+      },
+      "logits_enabled": true
+    },
+    {
+      "name": "natural_hit",
+      "input_tokens": 54,
+      "output_ids": [
+        198,
+        101916,
+        104401,
+        105681,
+        3837
+      ],
+      "token_seconds": [
+        0.10627071800263366,
+        0.16152521500043804,
+        0.21706290600195643,
+        0.2723493760022393,
+        0.3279325690018595
+      ],
+      "ttft_seconds": 0.10627071800263366,
+      "statistics": {
+        "cached_input_tokens": 53,
+        "missed_input_tokens": 1
+      },
+      "logits_enabled": true
+    },
+    {
+      "name": "long_miss",
+      "input_tokens": 2057,
+      "output_ids": [
+        198,
+        151667
+      ],
+      "token_seconds": [
+        7.196851001997857,
+        7.284808503998647
+      ],
+      "ttft_seconds": 7.196851001997857,
+      "statistics": {
+        "cached_input_tokens": 38,
+        "missed_input_tokens": 2019
+      },
+      "logits_enabled": true
+    },
+    {
+      "name": "long_hit",
+      "input_tokens": 2057,
+      "output_ids": [
+        198,
+        151667
+      ],
+      "token_seconds": [
+        0.13520983000125852,
+        0.20466131800276344
+      ],
+      "ttft_seconds": 0.13520983000125852,
+      "statistics": {
+        "cached_input_tokens": 2056,
+        "missed_input_tokens": 1
+      },
+      "logits_enabled": true
+    },
+    {
+      "name": "long_hit_speed",
+      "input_tokens": 2057,
+      "output_ids": [
+        198,
+        151667,
+        198,
+        785,
+        1196,
+        374,
+        10161,
+        752
+      ],
+      "token_seconds": [
+        0.1294440769997891,
+        0.19865208599730977,
+        0.2680938419980521,
+        0.33736382499773754,
+        0.4068754479994823,
+        0.47606181999799446,
+        0.5454464279973763,
+        0.6149156219980796
+      ],
+      "ttft_seconds": 0.1294440769997891,
+      "statistics": {
+        "cached_input_tokens": 2056,
+        "missed_input_tokens": 1
+      },
+      "logits_enabled": false
+    },
+    {
+      "name": "branch_127_off",
+      "input_tokens": 147,
+      "output_ids": [
+        151667
+      ],
+      "token_seconds": [
+        1.7376465369998186
+      ],
+      "ttft_seconds": 1.7376465369998186,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 147
+      },
+      "logits_enabled": true
+    },
+    {
+      "name": "seed_127",
+      "input_tokens": 2057,
+      "output_ids": [
+        198
+      ],
+      "token_seconds": [
+        6.1360568730015075
+      ],
+      "ttft_seconds": 6.1360568730015075,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 2057
+      },
+      "logits_enabled": false
+    },
+    {
+      "name": "branch_127_hit",
+      "input_tokens": 147,
+      "output_ids": [
+        151667
+      ],
+      "token_seconds": [
+        0.49155653300113045
+      ],
+      "ttft_seconds": 0.49155653300113045,
+      "statistics": {
+        "cached_input_tokens": 127,
+        "missed_input_tokens": 20
+      },
+      "logits_enabled": true
+    },
+    {
+      "name": "branch_128_off",
+      "input_tokens": 148,
+      "output_ids": [
+        198
+      ],
+      "token_seconds": [
+        1.754449920001207
+      ],
+      "ttft_seconds": 1.754449920001207,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 148
+      },
+      "logits_enabled": true
+    },
+    {
+      "name": "seed_128",
+      "input_tokens": 2057,
+      "output_ids": [
+        198
+      ],
+      "token_seconds": [
+        6.073560683998949
+      ],
+      "ttft_seconds": 6.073560683998949,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 2057
+      },
+      "logits_enabled": false
+    },
+    {
+      "name": "branch_128_hit",
+      "input_tokens": 148,
+      "output_ids": [
+        198
+      ],
+      "token_seconds": [
+        0.48606526300136466
+      ],
+      "ttft_seconds": 0.48606526300136466,
+      "statistics": {
+        "cached_input_tokens": 128,
+        "missed_input_tokens": 20
+      },
+      "logits_enabled": true
+    },
+    {
+      "name": "branch_2048_off",
+      "input_tokens": 2057,
+      "output_ids": [
+        198
+      ],
+      "token_seconds": [
+        5.963789211997209
+      ],
+      "ttft_seconds": 5.963789211997209,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 2057
+      },
+      "logits_enabled": true
+    },
+    {
+      "name": "seed_2048",
+      "input_tokens": 2057,
+      "output_ids": [
+        198
+      ],
+      "token_seconds": [
+        6.073050557999522
+      ],
+      "ttft_seconds": 6.073050557999522,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 2057
+      },
+      "logits_enabled": false
+    },
+    {
+      "name": "branch_2048_hit",
+      "input_tokens": 2057,
+      "output_ids": [
+        198
+      ],
+      "token_seconds": [
+        0.30653607299973373
+      ],
+      "ttft_seconds": 0.30653607299973373,
+      "statistics": {
+        "cached_input_tokens": 2048,
+        "missed_input_tokens": 9
+      },
+      "logits_enabled": true
+    }
+  ],
+  "cache_vs_no_cache": [
+    {
+      "name": "previous_version",
+      "bitwise_equal": true,
+      "steps": [
+        {
+          "mae": 0.0,
+          "max_abs": 0.0,
+          "cosine": 1.0000000000000002,
+          "kl": 0.0,
+          "top1_equal": true
+        },
+        {
+          "mae": 0.0,
+          "max_abs": 0.0,
+          "cosine": 1.0000000000000002,
+          "kl": 0.0,
+          "top1_equal": true
+        },
+        {
+          "mae": 0.0,
+          "max_abs": 0.0,
+          "cosine": 1.0,
+          "kl": 0.0,
+          "top1_equal": true
+        },
+        {
+          "mae": 0.0,
+          "max_abs": 0.0,
+          "cosine": 1.0,
+          "kl": 0.0,
+          "top1_equal": true
+        },
+        {
+          "mae": 0.0,
+          "max_abs": 0.0,
+          "cosine": 1.0000000000000002,
+          "kl": 0.0,
+          "top1_equal": true
+        }
+      ]
+    },
+    {
+      "name": "natural_miss",
+      "bitwise_equal": true,
+      "steps": [
+        {
+          "mae": 0.0,
+          "max_abs": 0.0,
+          "cosine": 1.0000000000000002,
+          "kl": 0.0,
+          "top1_equal": true
+        },
+        {
+          "mae": 0.0,
+          "max_abs": 0.0,
+          "cosine": 1.0000000000000002,
+          "kl": 0.0,
+          "top1_equal": true
+        },
+        {
+          "mae": 0.0,
+          "max_abs": 0.0,
+          "cosine": 1.0,
+          "kl": 0.0,
+          "top1_equal": true
+        },
+        {
+          "mae": 0.0,
+          "max_abs": 0.0,
+          "cosine": 1.0,
+          "kl": 0.0,
+          "top1_equal": true
+        },
+        {
+          "mae": 0.0,
+          "max_abs": 0.0,
+          "cosine": 1.0000000000000002,
+          "kl": 0.0,
+          "top1_equal": true
+        }
+      ]
+    },
+    {
+      "name": "natural_hit",
+      "bitwise_equal": false,
+      "steps": [
+        {
+          "mae": 0.21732660094994877,
+          "max_abs": 1.75,
+          "cosine": 0.9975480433633539,
+          "kl": 0.00744357739902981,
+          "top1_equal": true
+        },
+        {
+          "mae": 0.1477905918094767,
+          "max_abs": 1.06982421875,
+          "cosine": 0.9966238011333576,
+          "kl": 0.02294195119455758,
+          "top1_equal": true
+        },
+        {
+          "mae": 0.0993407093775271,
+          "max_abs": 0.70703125,
+          "cosine": 0.9991219242904229,
+          "kl": 0.0033550996172749836,
+          "top1_equal": false
+        },
+        {
+          "mae": 0.07783519283180038,
+          "max_abs": 0.75,
+          "cosine": 0.9992815843394276,
+          "kl": 4.248070661166543e-05,
+          "top1_equal": true
+        },
+        {
+          "mae": 0.07551957516784111,
+          "max_abs": 0.625,
+          "cosine": 0.999546964576816,
+          "kl": 0.0061131266056627005,
+          "top1_equal": true
+        }
+      ]
+    },
+    {
+      "name": "long_miss",
+      "bitwise_equal": false,
+      "steps": [
+        {
+          "mae": 0.39854604709149655,
+          "max_abs": 2.8125,
+          "cosine": 0.9893721507732802,
+          "kl": 0.0011396581603309868,
+          "top1_equal": true
+        },
+        {
+          "mae": 0.5090098802967937,
+          "max_abs": 3.9375,
+          "cosine": 0.9529458259942444,
+          "kl": 2.825143305532289e-14,
+          "top1_equal": true
+        }
+      ]
+    },
+    {
+      "name": "long_hit",
+      "bitwise_equal": false,
+      "steps": [
+        {
+          "mae": 0.4270566749357581,
+          "max_abs": 2.875,
+          "cosine": 0.9882641420174724,
+          "kl": 0.0034393571266837816,
+          "top1_equal": true
+        },
+        {
+          "mae": 0.47664579943556107,
+          "max_abs": 4.181640625,
+          "cosine": 0.9589104713247024,
+          "kl": 5.9644913840051586e-15,
+          "top1_equal": true
+        }
+      ]
+    },
+    {
+      "name": "branch_127",
+      "bitwise_equal": false,
+      "steps": [
+        {
+          "mae": 0.4085696302631701,
+          "max_abs": 4.625,
+          "cosine": 0.9833298238632784,
+          "kl": 4.9764719430051475e-12,
+          "top1_equal": true
+        }
+      ]
+    },
+    {
+      "name": "branch_128",
+      "bitwise_equal": false,
+      "steps": [
+        {
+          "mae": 0.5106780420830193,
+          "max_abs": 4.5703125,
+          "cosine": 0.9734207523219363,
+          "kl": 0.0013222549196668385,
+          "top1_equal": true
+        }
+      ]
+    },
+    {
+      "name": "branch_2048",
+      "bitwise_equal": true,
+      "steps": [
+        {
+          "mae": 0.0,
+          "max_abs": 0.0,
+          "cosine": 0.9999999999999998,
+          "kl": 0.0,
+          "top1_equal": true
+        }
+      ]
+    }
+  ],
+  "cached_vs_original_fp8": {
+    "natural": [
+      {
+        "mae": 0.19321251141169926,
+        "rmse": 0.24432372979903202,
+        "max_abs": 2.0,
+        "cosine": 0.9978327066155191,
+        "kl_ref_actual": 0.007414432471322257,
+        "top1_reference": 198,
+        "top1_actual": 198,
+        "top10_overlap": 8
+      },
+      {
+        "mae": 0.1686923153875802,
+        "rmse": 0.21577981434987045,
+        "max_abs": 1.375,
+        "cosine": 0.9958104704788043,
+        "kl_ref_actual": 0.028592955705496078,
+        "top1_reference": 101916,
+        "top1_actual": 101916,
+        "top10_overlap": 10
+      },
+      {
+        "mae": 0.10056043510604962,
+        "rmse": 0.12700373315257413,
+        "max_abs": 0.75,
+        "cosine": 0.998955954228883,
+        "kl_ref_actual": 0.005490268774076713,
+        "top1_reference": 100827,
+        "top1_actual": 100827,
+        "top10_overlap": 9
+      },
+      {
+        "mae": 0.08146130248604205,
+        "rmse": 0.10339712489692884,
+        "max_abs": 0.9375,
+        "cosine": 0.9992213040729182,
+        "kl_ref_actual": 2.0565921273180495e-05,
+        "top1_reference": 105681,
+        "top1_actual": 105681,
+        "top10_overlap": 10
+      },
+      {
+        "mae": 0.06557300702735919,
+        "rmse": 0.08322237829612784,
+        "max_abs": 0.46875,
+        "cosine": 0.9995831181155989,
+        "kl_ref_actual": 0.006518838461279434,
+        "top1_reference": 3837,
+        "top1_actual": 3837,
+        "top10_overlap": 10
+      }
+    ],
+    "long": [
+      {
+        "mae": 0.5204911377636837,
+        "rmse": 0.660586708578465,
+        "max_abs": 3.9375,
+        "cosine": 0.9835195849138786,
+        "kl_ref_actual": 0.0027445711971651834,
+        "top1_reference": 198,
+        "top1_actual": 198,
+        "top10_overlap": 7
+      },
+      {
+        "mae": 0.4686450700657661,
+        "rmse": 0.5833386679165415,
+        "max_abs": 3.0703125,
+        "cosine": 0.9648220748310558,
+        "kl_ref_actual": 3.953896105191653e-15,
+        "top1_reference": 151667,
+        "top1_actual": 151667,
+        "top10_overlap": 9
+      }
+    ]
+  },
+  "api": [
+    {
+      "name": "auto",
+      "seconds": 3.902295996002067,
+      "usage": {
+        "prompt_tokens": 344,
+        "total_tokens": 365,
+        "completion_tokens": 21,
+        "prompt_tokens_details": {
+          "cached_tokens": 33,
+          "missed_tokens": 311
+        }
+      },
+      "message": {
+        "role": "assistant",
+        "content": "<think>\n\n\n",
+        "tool_calls": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "arguments": "{\"city\": \"北京\"}"
+            }
+          }
+        ]
+      },
+      "finish_reason": "tool_calls"
+    },
+    {
+      "name": "tool_result",
+      "seconds": 2.4493353459984064,
+      "usage": {
+        "prompt_tokens": 395,
+        "total_tokens": 418,
+        "completion_tokens": 23,
+        "prompt_tokens_details": {
+          "cached_tokens": 344,
+          "missed_tokens": 51
+        }
+      },
+      "message": {
+        "role": "assistant",
+        "content": "<think>\n\n\n北京的实时天气如下：\n\n- **天气状况**：晴\n- **温度**：25°C"
+      },
+      "finish_reason": "stop"
+    },
+    {
+      "name": "stream_required",
+      "seconds": 4.498231638001016,
+      "tool_calls": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "arguments": "{\"city\": \"北京\"}"
+          }
+        }
+      ],
+      "finish_reasons": [
+        "tool_calls"
+      ]
+    },
+    {
+      "name": "named",
+      "seconds": 4.280983355998615,
+      "usage": {
+        "prompt_tokens": 430,
+        "total_tokens": 451,
+        "completion_tokens": 21,
+        "prompt_tokens_details": {
+          "cached_tokens": 35,
+          "missed_tokens": 395
+        }
+      },
+      "message": {
+        "role": "assistant",
+        "content": "<think>\n\n\n",
+        "tool_calls": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "arguments": "{\"city\": \"北京\"}"
+            }
+          }
+        ]
+      },
+      "finish_reason": "tool_calls"
+    },
+    {
+      "name": "parallel",
+      "seconds": 5.712327062999975,
+      "tool_calls": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "arguments": "{\"city\": \"北京\"}"
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "get_time",
+            "arguments": "{\"city\": \"东京\"}"
+          }
+        }
+      ],
+      "finish_reasons": [
+        "tool_calls"
+      ]
+    },
+    {
+      "name": "none",
+      "seconds": 2.856781480000791,
+      "usage": {
+        "prompt_tokens": 336,
+        "total_tokens": 339,
+        "completion_tokens": 3,
+        "prompt_tokens_details": {
+          "cached_tokens": 13,
+          "missed_tokens": 323
+        }
+      },
+      "message": {
+        "role": "assistant",
+        "content": "<think>\n\n\n42"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "tests": {
+    "cpp": "5 passed: history, attention, AVX512 MoE, AVX2 MoE, hybrid MoE",
+    "python": "64 Qwen XML parser/guidance/truncation tests passed, including Naive auto/named/override selection",
+    "reasoning": "3 Naive response tests and 14 shared Qwen reasoning tests passed",
+    "python_history": "Installed Python normalization: JSON object, empty and null arguments accepted; malformed JSON and non-object arguments rejected; caller input not mutated"
+  },
+  "http_default": {
+    "thinking_enabled": false,
+    "cases": [
+      {
+        "name": "default_auto",
+        "seconds": 11.575733360001323,
+        "usage": {
+          "prompt_tokens": 284,
+          "total_tokens": 305,
+          "completion_tokens": 21,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "missed_tokens": 284
+          }
+        },
+        "message": {
+          "role": "assistant",
+          "tool_calls": [
+            {
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "arguments": "{\"city\": \"北京\"}"
+              }
+            }
+          ]
+        },
+        "finish_reason": "tool_calls"
+      },
+      {
+        "name": "default_auto_stream",
+        "seconds": 1.325046564998047,
+        "usage": {
+          "prompt_tokens": 284,
+          "total_tokens": 305,
+          "completion_tokens": 21,
+          "prompt_tokens_details": {
+            "cached_tokens": 283,
+            "missed_tokens": 1
+          }
+        },
+        "tool_calls": [
+          {
+            "type": "function",
+            "index": 0,
+            "function": {
+              "name": "get_weather",
+              "arguments": "{\"city\": \"北京\"}"
+            }
+          }
+        ],
+        "finish_reasons": [
+          "tool_calls"
+        ]
+      },
+      {
+        "name": "concurrent_tool_result_25",
+        "seconds": 3.6766831830027513,
+        "usage": {
+          "prompt_tokens": 338,
+          "total_tokens": 367,
+          "completion_tokens": 29,
+          "prompt_tokens_details": {
+            "cached_tokens": 284,
+            "missed_tokens": 54
+          }
+        },
+        "message": {
+          "role": "assistant",
+          "content": "\n\n北京的实时天气如下：\n\n- **城市**：北京\n- **天气**：晴\n- **温度**：25°C"
+        },
+        "finish_reason": "stop"
+      },
+      {
+        "name": "concurrent_tool_result_26",
+        "seconds": 4.951024017002055,
+        "usage": {
+          "prompt_tokens": 338,
+          "total_tokens": 361,
+          "completion_tokens": 23,
+          "prompt_tokens_details": {
+            "cached_tokens": 284,
+            "missed_tokens": 54
+          }
+        },
+        "message": {
+          "role": "assistant",
+          "content": "\n\n北京的实时天气如下：\n\n- **天气状况**：晴\n- **温度**：26°C"
+        },
+        "finish_reason": "stop"
+      }
+    ]
+  },
+  "http_thinking": {
+    "thinking_enabled": true,
+    "seconds": 7.449440696000238,
+    "tool_calls": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "arguments": "{\"city\": \"北京\"}"
+        }
+      }
+    ],
+    "finish_reason": "tool_calls",
+    "usage": {
+      "prompt_tokens": 285,
+      "total_tokens": 372,
+      "completion_tokens": 87,
+      "prompt_tokens_details": {
+        "cached_tokens": 77,
+        "missed_tokens": 208
+      }
+    },
+    "note": "Captured before the reasoning-field fix: real model thinking and XML tool calls were parsed successfully, but thinking remained in content. Final reasoning-field separation is verified by the response-generator regression tests."
+  }
+}
