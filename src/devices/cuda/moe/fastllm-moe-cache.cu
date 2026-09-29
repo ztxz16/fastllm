@@ -195,6 +195,7 @@ struct DeviceCache {
     void **numaPointers = nullptr;
     std::unique_ptr<HybridWorkspace> hybrid;
     std::unique_ptr<VerifyWorkspace> verify;
+    std::shared_ptr<FastllmCudaMoeExpertParallel> batchHybrid;
     std::unique_ptr<DecodePolicyState> decode;
 };
 
@@ -537,6 +538,7 @@ void ReleaseDeviceCache(DeviceCache &cache) {
     }
     cache.hybrid.reset();
     cache.verify.reset();
+    cache.batchHybrid.reset();
     cache.decode.reset();
     cudaFree(cache.records);
     cudaFree(cache.keyToSlot);
@@ -2308,8 +2310,22 @@ bool FastllmCudaMergeMOEHybrid(const fastllm::Data &input,
         fastllm::Data &output, fastllm::Data **weights, int weightsBatch, int layer,
         const std::function<void()> &launchParallel) {
 #ifdef USE_NUMAS
-    if (input.dims.size() == 2 && input.dims[0] > 1)
-        return TryV41VerifyHybrid(input, index, score, output, weights, weightsBatch, layer, launchParallel);
+    if (input.dims.size() == 2 && input.dims[0] > 1) {
+        if (input.dataType == fastllm::DataType::BFLOAT16)
+            return TryV41VerifyHybrid(input, index, score, output, weights, weightsBatch, layer, launchParallel);
+        if (input.dataType != fastllm::DataType::FLOAT32 || !SupportedCacheInput(input)) return false;
+        auto *group = FindHybridGroup(weights, weightsBatch);
+        if (!group || group->layout.deepSeekV41) return false;
+        auto *cache = GetDeviceCache(*group);
+        if (!cache) return false;
+        // Use the same resident-only GPU routing and grouped NUMA fallback
+        // as TP verification. Demand-refilling every row serializes cold
+        // weight copies on the verifier's critical path on a single GPU.
+        if (!cache->batchHybrid)
+            cache->batchHybrid = std::make_shared<FastllmCudaMoeExpertParallel>(1);
+        return FastllmCudaMergeMOEExpertParallel(*cache->batchHybrid, 0,
+            input, index, score, output, weights, weightsBatch, layer, launchParallel);
+    }
     cudaStreamCaptureStatus capturing;
     if (cudaStreamIsCapturing(cudaStreamPerThread, &capturing) != cudaSuccess ||
         capturing != cudaStreamCaptureStatusNone) return false;

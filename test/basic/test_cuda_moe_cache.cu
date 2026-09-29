@@ -352,11 +352,12 @@ static void CompareFP8(fastllm::DataType dtype, fastllm::DataType weightType,
 static void CheckExpertParallel(std::vector<fastllm::Data *> &reference,
                                 std::vector<fastllm::Data *> &weights,
                                 bool disableSecondDevice, bool reverseDevices = false,
-                                int maxRows = 1) {
+                                int maxRows = 1, bool singleDeviceHybrid = false) {
     using namespace fastllm;
+    const int ranks = singleDeviceHybrid ? 1 : 2;
     int devices = 0;
     Check(cudaGetDeviceCount(&devices));
-    if (devices < 2) return;
+    if (devices < ranks) return;
     const char *overrideName = "FASTLLM_MOE_CUDA_CACHE_BYTES_1";
     const char *previous = std::getenv(overrideName);
     const bool hadOverride = previous != nullptr;
@@ -368,7 +369,7 @@ static void CheckExpertParallel(std::vector<fastllm::Data *> &reference,
     Data ids(INT32, {maxRows, topk}), scores(FLOAT32, {maxRows, topk}), results[2];
     Data refIds(INT32, {maxRows, topk}), refScores(FLOAT32, {maxRows, topk}), refInput(FLOAT32, {maxRows, hidden});
     Data refGate, refOutput;
-    for (int r = 0; r < 2; ++r) {
+    for (int r = 0; r < ranks; ++r) {
         Check(cudaSetDevice(reverseDevices ? 1 - r : r));
         inputs[r].ToDevice(DataDevice::CUDA, std::vector<int>{reverseDevices ? 1 - r : r});
         inputs[r].Allocate(false);
@@ -401,7 +402,7 @@ static void CheckExpertParallel(std::vector<fastllm::Data *> &reference,
                     (reverseDevices ? 0 : 1);
             routeScores[r] = k == 3 ? 0 : k == 5 ? -.125f : float(k + 1) / 32;
         }
-        for (int r = 0; r < 2; ++r) {
+        for (int r = 0; r < ranks; ++r) {
             Check(cudaSetDevice(reverseDevices ? 1 - r : r));
             Check(cudaMemcpy(inputs[r].cudaData, activation.data(), rows * hidden * sizeof(float), cudaMemcpyHostToDevice));
         }
@@ -436,9 +437,9 @@ static void CheckExpertParallel(std::vector<fastllm::Data *> &reference,
             }
         }
         const bool reject = step >= 16;
-        if (step == 16) inputs[1].dataType = FLOAT16;
+        if (step == 16) inputs[ranks - 1].dataType = FLOAT16;
         if (step == 17) SetMoeCudaCacheBytes(0);
-        if (step == 18) inputs[1].Resize({rows == 1 ? 2 : 1, hidden});
+        if (step == 18) inputs[ranks - 1].Resize({rows == 1 ? 2 : 1, hidden});
         if (step == 19) {
             Check(cudaSetDevice(reverseDevices ? 1 : 0));
             const int32_t invalid = weights.size() / 2;
@@ -450,25 +451,33 @@ static void CheckExpertParallel(std::vector<fastllm::Data *> &reference,
             try {
                 Check(cudaSetDevice(reverseDevices ? 1 - rank : rank));
                 Data empty;
-                accepted[rank] = FastllmCudaMergeMOEExpertParallel(*context, rank, inputs[rank],
-                    rank == 0 ? ids : empty, rank == 0 ? scores : empty, results[rank],
-                    weights.data(), weights.size(), 0, [&] { ++callbacks[rank]; });
+                if (singleDeviceHybrid) {
+                    accepted[rank] = FastllmCudaMergeMOEHybrid(inputs[rank], ids, scores, results[rank],
+                        weights.data(), weights.size(), 0, [&] { ++callbacks[rank]; });
+                } else {
+                    accepted[rank] = FastllmCudaMergeMOEExpertParallel(*context, rank, inputs[rank],
+                        rank == 0 ? ids : empty, rank == 0 ? scores : empty, results[rank],
+                        weights.data(), weights.size(), 0, [&] { ++callbacks[rank]; });
+                }
                 if (accepted[rank]) Check(cudaMemcpy(actual[rank].data(), results[rank].cudaData,
                     rows * hidden * sizeof(float), cudaMemcpyDeviceToHost));
             } catch (...) { errors[rank] = std::current_exception(); }
         };
-        std::thread first(run, 0), second(run, 1);
-        first.join(); second.join();
-        inputs[1].dataType = FLOAT32;
+        if (singleDeviceHybrid) run(0);
+        else {
+            std::thread first(run, 0), second(run, 1);
+            first.join(); second.join();
+        }
+        inputs[ranks - 1].dataType = FLOAT32;
         SetMoeCudaCacheBytes(budget);
-        for (int rank = 0; rank < 2; ++rank) {
+        for (int rank = 0; rank < ranks; ++rank) {
             if (errors[rank]) std::rethrow_exception(errors[rank]);
             Require(accepted[rank] == !reject, "EP rejection was not collective");
             Require(callbacks[rank] == int(!reject), "EP shared expert callback count changed");
         }
         if (reject) continue;
         const auto after = FastllmCudaGetMoeExpertParallelStats(*context);
-        Require(after.cpuRoutes - before.cpuRoutes +
+        Require(singleDeviceHybrid || after.cpuRoutes - before.cpuRoutes +
             after.gpuRoutes[0] - before.gpuRoutes[0] + after.gpuRoutes[1] - before.gpuRoutes[1] == routes,
             "EP route ownership is not exclusive and complete");
         if (disableSecondDevice && step == 12) {
@@ -486,7 +495,7 @@ static void CheckExpertParallel(std::vector<fastllm::Data *> &reference,
             }
         }
         for (int c = 0; c < rows * hidden; ++c) {
-            const float result = actual[0][c] + actual[1][c];
+            const float result = actual[0][c] + (singleDeviceHybrid ? 0 : actual[1][c]);
             const float tolerance = 3e-5f * (1 + std::max(std::abs(lower[c]), std::abs(upper[c])));
             Require(std::isfinite(result) && result >= lower[c] - tolerance && result <= upper[c] + tolerance,
                     "EP duplicated or lost an expert contribution");
@@ -496,15 +505,15 @@ static void CheckExpertParallel(std::vector<fastllm::Data *> &reference,
     if (disableSecondDevice) {
         Require(stats.gpuRoutes[reverseDevices ? 0 : 1] == 0, "disabled EP device executed experts");
         Require(stats.gpuRoutes[reverseDevices ? 1 : 0] > 0, "EP disabled both devices");
-    } else {
+    } else if (!singleDeviceHybrid) {
         Require(stats.gpuRoutes[0] && stats.gpuRoutes[1] && stats.multiGpuSteps,
                 "EP never computed one layer on both GPUs");
     }
     context.reset();
     if (hadOverride) setenv(overrideName, previousValue.c_str(), 1); else unsetenv(overrideName);
     Check(cudaSetDevice(0));
-    std::printf("PASS expert parallel: asymmetric=%d reverse=%d rows=1/%d, two GPU subsets + one NUMA subset, duplicates/zero/negative scores, rejection\n",
-                disableSecondDevice, reverseDevices, maxRows);
+    std::printf("PASS expert parallel: ranks=%d asymmetric=%d reverse=%d rows=1/%d, CPU/GPU subsets, duplicates/zero/negative scores, rejection\n",
+                ranks, disableSecondDevice, reverseDevices, maxRows);
 }
 #endif
 
@@ -772,6 +781,8 @@ static void CompareNumaCache(fastllm::DataType dtype, int nodes, int batch,
     }
 #ifdef USE_NUMAS
     if (hybrid) {
+        CheckExpertParallel(weights[0][0], weights[1][0], false, false, 4, true);
+        CheckExpertParallel(weights[0][0], weights[1][0], false, false, FASTLLM_CUDA_MOE_CACHE_MAX_BATCH, true);
         CheckExpertParallel(weights[0][0], weights[1][0], planar);
         CheckExpertParallel(weights[0][0], weights[1][0], planar, false, 4);
         CheckExpertParallel(weights[0][0], weights[1][0], planar, false, FASTLLM_CUDA_MOE_CACHE_MAX_BATCH);

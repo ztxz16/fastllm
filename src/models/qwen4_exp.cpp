@@ -6409,8 +6409,7 @@ namespace fastllm {
             this->deviceMap, deviceLayer + 1, this->block_cnt);
         bool hybridMoe = false;
 #if defined(USE_CUDA) && !defined(USE_ROCM)
-        if (Qwen4MtpDraftsPerStep() == 0 &&
-            outputDevice.find("cuda") == 0) {
+        if (outputDevice.find("cuda") == 0) {
             hybridMoe = FastllmCudaMergeMOEHybrid(flattened, expertIndex, expertScore,
                 output, moeWeights.data(), moeWeights.size(), deviceLayer);
         }
@@ -8399,8 +8398,8 @@ namespace fastllm {
              Qwen4CudaOrNumaOnlyDeviceMap(this->layeredMoeDeviceMap)) ||
             hybridDenseGraph;
         // Host decisions and NUMA execution cannot be captured in the full
-        // backbone graph. MTP and prefill retain their existing paths.
-        const bool hybridMoe = !tpHostMoe && Qwen4MtpDraftsPerStep() == 0 &&
+        // backbone graph, including multi-row MTP verification.
+        const bool hybridMoe = !tpHostMoe &&
             !this->weights.empty() && !this->weights[0].empty() &&
             FastllmCudaUseMoeHybrid(this->weights[0].data(), this->weights[0].size());
         if (!GetFastllmEnv().cudaGraph ||
