@@ -1,8 +1,8 @@
-# Qwen4-Exp / Qwen3.8-Flash-Next FP8
+# Qwen4-Exp / Qwen3.8-Flash-Next FP8 / NVFP4 / GGUF
 
 [中文部署指南](qwen4.md) · [Back to README](../README_EN.md) · [Benchmark](benchmarks/qwen4_exp_en.md)
 
-FastLLM supports the Qwen4-Exp / Qwen3.8-Flash-Next text decoder implemented
+FastLLM supports FP8, NVFP4 and `qwen4exp` GGUF checkpoints of the Qwen4-Exp / Qwen3.8-Flash-Next text decoder implemented
 in `src/models/qwen4_exp.cpp`. Vision tensors in composite checkpoints are not
 loaded. For `Qwen3_8FlashNextForConditionalGeneration` checkpoints, MTP
 tensors are loaded on demand only when `--mtp` is greater than zero.
@@ -14,7 +14,7 @@ tensors are loaded on demand only when `--mtp` is greater than zero.
 - separate Q/K/V/Z/b/a Gated DeltaNet projections, depthwise causal
   convolution, recurrent state, L2-normalized Q/K, and sigmoid output gate;
 - partial RoPE GQA and the long-context QSA block indexer;
-- 512 routed FP8 experts plus the shared expert;
+- 512 routed experts plus the shared expert;
 - PLE hashed 2/3-gram lookup, raw BF16/E4M3 host or disk-backed shards, the
   checkpoint's common scalar, EOS-aware history, signed hash remainder, gated
   injection, and dilated depthwise convolution;
@@ -39,6 +39,73 @@ ftllm benchmark "$MODEL" \
 Disk mode lowers process RSS by avoiding the resident table allocation.  The
 operating-system page cache may still use otherwise-free memory, and decode
 performs small random reads, so an SSD is recommended when this mode is used.
+
+## GGUF checkpoints
+
+The Unsloth `UD-Q2_K_XL` three-shard checkpoint can be loaded directly by passing
+`Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf`. Keep all three shards in the
+same directory with their original filenames. The metadata-only first shard is
+valid; merging shards or supplying an HF configuration is unnecessary.
+
+Use `--device cudapp=2 --moe_device numa --moe_cuda_cache 0 --ngram_device disk
+--mtp 0 --atype float16 --threads 28 --chunked_prefill_size 4096` on the dual
+22 GiB RTX 2080 Ti machine. See the [complete command](qwen4.md#ggufunsloth-ud-q2_k_xl).
+
+Routed experts retain their mixed IQ2_XS/IQ3_XXS/IQ4_NL storage. Disk PLE decodes
+selected IQ4_NL rows into FP32, while dense projections are imported as FP16.
+The importer restores GDN head ordering, joins QSA Q/K projections, preserves
+GGUF normalization offsets, and uses the checkpoint's exact PLE hash metadata.
+NUMA GPU prefill also supports the CPU's IQ2_XS/IQ3_XXS R4 layout.
+
+These three shards contain no MTP weights; deploy them as a text model with
+`--mtp 0`. The NVFP4 expert-cache, resident-layer and performance results below
+are separate configurations.
+
+On 2026-09-29, one measured run per phase (after warmup) on the dual 22 GiB
+2080 Ti host achieved **801.56 token/s prefill** (4096-token chunk) and
+**20.50 token/s decode** (512 input / 512 output). Decode TTFT was 1.29 s,
+process VmHWM was 55.58 GiB, and peak GPU usage was 8192/8754 MiB, with no swap.
+Arithmetic and structured JSON tasks completed correctly with natural stops.
+These tests validate this configuration, not the maximum context length.
+
+This run includes the IQ4_NL multi-row CPU down kernel, with unchanged weight
+formats and deployment parameters. Decode improved by 7.5% over the initial
+GGUF candidate's 19.07 token/s. A separate short profile measured total down
+time across 48 layers falling from 12.97 to 9.82 ms/token. The full requests
+share their first 96 output tokens but diverge afterward; these single runs
+do not establish a fixed speedup for every workload.
+
+## Hybrid deployment on two GPUs
+
+For `Qwen3.8-Flash-Next-NVFP4`, `--device cudapp=2` places consecutive decoder
+layers on two GPUs (24/24 layers); one request traverses them sequentially.
+`--tp 2` instead uses both GPUs to compute each layer. Do not combine these
+two modes, and clear an inherited `FASTLLM_TP` before using `cudapp`.
+
+Both modes support `--moe_device numa --moe_cuda_cache 0` for host experts,
+or `--moe_device numa --moe_cuda_cache 8g` for an 8 GiB expert cache **per GPU**.
+Expert caching is independent of `--prefix_cache`, which reuses request
+prefix state. The expert budget does not include other weights, KV or workspace.
+
+With TP2, `--moe_device numa --moe_device_layers 36 --moe_cuda_cache 0`
+keeps all experts of the first 12 layers on the GPUs and the last 36 layers
+on NUMA. The GPU experts are tensor-parallel shards, not whole layers split
+between the cards. The MTP experts remain on NUMA.
+
+For sequential placement, use the validated aligned layout:
+`--device cudapp=1:7 --moe_device "{'cuda:0':6,'cuda:1':6,'numa':36}" --moe_cuda_cache 0`.
+Decoder layers 0–5 and their experts use GPU0; decoder layers 6–47 use GPU1,
+with only experts of layers 6–11 resident there. Avoid the `moe_device_layers`
+shorthand with this sequential mapping, and do not change the decoder split
+to 24/24 while keeping the 6/6 expert mapping: that combination previously
+hit an invalid memory access.
+
+See the [deployment commands](qwen4.md) and
+[two-2080-Ti measurements](benchmarks/qwen4_exp_en.md) for the common settings,
+4096-token prefill, decode and memory figures. The test cards have **22 GiB
+each**, not the standard 11 GiB. Fixed expert placement reserves every expert
+in selected layers; dynamic caching can retain active experts across layers.
+Lower steady-state host RSS does not imply an equally low loading peak.
 
 ## MTP speculative decoding
 

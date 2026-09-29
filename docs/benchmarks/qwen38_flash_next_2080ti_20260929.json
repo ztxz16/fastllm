@@ -1,0 +1,536 @@
+{
+  "date": "2026-09-29",
+  "source_commit": "d6ef5c784950aa2804c6b8ade695a62f99cdb1e0",
+  "model": "Qwen3.8-Flash-Next-NVFP4",
+  "hardware": {
+    "gpu": "2 x RTX 2080 Ti, 22528 MiB each",
+    "cpu": "AMD EPYC 7452, 32 cores / 64 threads",
+    "numa_nodes": 1,
+    "ram_kib": 131807108,
+    "driver": "595.84",
+    "os": "Ubuntu 24.04.4 LTS"
+  },
+  "settings": {
+    "graph": false,
+    "triton": false,
+    "threads": 28,
+    "ngram_device": "disk",
+    "atype": "float16",
+    "batch": 1,
+    "kv_cache_gib": 1,
+    "gpu_mem_ratio": 0.95,
+    "prefill_input_tokens": 4096,
+    "chunked_prefill_size": 4096,
+    "prefill_mtp": 0,
+    "decode_input_tokens": 512,
+    "decode_output_tokens": 512,
+    "mtp_modes": [
+      0,
+      3
+    ],
+    "measured_rounds": 1,
+    "warmup_decode_output_tokens": 128,
+    "prefix_cache": false,
+    "history_cache": false,
+    "mtp_weights_loaded_in_both_modes": true
+  },
+  "cases": [
+    {
+      "name": "serial-cache0",
+      "label": "双卡串行，关闭专家缓存",
+      "complete": true,
+      "native_sha256": "aa20ca1a0a954a6d9adcdfedb0b477a5542f86f920e27216f70a6d25d23c2ad9",
+      "exit_code": 0,
+      "monitor_error": null,
+      "prefill": {
+        "tokens": 4096,
+        "seconds_printed": 4.455,
+        "tokens_per_second": 919.43,
+        "source_line": "[Prompt] 4096 Tokens. Time: 4.455 s. Speed: 919.43 tokens / s."
+      },
+      "prefill_ttft_s": 4.456299294019118,
+      "decode": {
+        "0": {
+          "name": "cache0g-mtp0-benchmark-1",
+          "cache_gib_per_gpu": 0,
+          "mtp": 0,
+          "phase": "benchmark",
+          "repeat": 1,
+          "input_tokens": 512,
+          "output_tokens": 512,
+          "started_at": 1790667932.2033925,
+          "ended_at": 1790667956.2798748,
+          "ttft_s": 1.222215326037258,
+          "elapsed_s": 24.075519469100982,
+          "decode_s": 22.8525158429984,
+          "decode_tps": 22.360776533782,
+          "end_to_end_tps": 21.26641548304332,
+          "generated_sha256": "31d20b82c5e38cb439c61728f86e831a8cb45e7ecd48daa3f4134b5357280834"
+        },
+        "3": {
+          "name": "cache0g-mtp3-benchmark-1",
+          "cache_gib_per_gpu": 0,
+          "mtp": 3,
+          "phase": "benchmark",
+          "repeat": 1,
+          "input_tokens": 512,
+          "output_tokens": 512,
+          "started_at": 1790667956.2823532,
+          "ended_at": 1790667974.5584514,
+          "ttft_s": 1.2863750038668513,
+          "elapsed_s": 18.27512105880305,
+          "decode_s": 16.987072756048292,
+          "decode_tps": 30.081698438482118,
+          "end_to_end_tps": 28.0162302811872,
+          "generated_sha256": "31d20b82c5e38cb439c61728f86e831a8cb45e7ecd48daa3f4134b5357280834"
+        }
+      },
+      "decode_modes_tokens_equal": true,
+      "placement": {
+        "maps": [
+          {
+            "kind": "main",
+            "value": {
+              "cuda:0": 1,
+              "cuda:1": 1
+            }
+          },
+          {
+            "kind": "moe",
+            "value": "numa"
+          }
+        ],
+        "tp": null,
+        "serial": "1"
+      },
+      "gpu_peak_mib": {
+        "0": 8000,
+        "1": 10494
+      },
+      "allocated_expert_cache_gib": [],
+      "error_lines": [],
+      "host_hwm_gib": 72.86397933959961,
+      "decode_rss_gib": 72.59860610961914,
+      "max_swap_gib": 0.0,
+      "input_hashes": {
+        "prompt.json": "3793ac4d1a75963bab4ca8788ffd5de16eb073642aa696c49574e149381270df",
+        "prefill-prompt.json": "f9e45ebc9176d19c1c37e3019f16d9ecf8bddf83f1b71423ce990bcdd006811a"
+      }
+    },
+    {
+      "name": "serial-cache8",
+      "label": "双卡串行，每卡8GiB专家缓存",
+      "complete": true,
+      "native_sha256": "aa20ca1a0a954a6d9adcdfedb0b477a5542f86f920e27216f70a6d25d23c2ad9",
+      "exit_code": 0,
+      "monitor_error": null,
+      "prefill": {
+        "tokens": 4096,
+        "seconds_printed": 4.536,
+        "tokens_per_second": 902.92,
+        "source_line": "[Prompt] 4096 Tokens. Time: 4.536 s. Speed: 902.92 tokens / s."
+      },
+      "prefill_ttft_s": 4.5376953079830855,
+      "decode": {
+        "0": {
+          "name": "cache8g-mtp0-benchmark-1",
+          "cache_gib_per_gpu": 8,
+          "mtp": 0,
+          "phase": "benchmark",
+          "repeat": 1,
+          "input_tokens": 512,
+          "output_tokens": 512,
+          "started_at": 1790668362.1044204,
+          "ended_at": 1790668382.8824537,
+          "ttft_s": 1.223450310062617,
+          "elapsed_s": 20.776860676007345,
+          "decode_s": 19.552477770019323,
+          "decode_tps": 26.13479508891394,
+          "end_to_end_tps": 24.642798928292674,
+          "generated_sha256": "3efaeb8da47aae7f3edd37f3375ab800ecc2e5982bdc364e88386189a194d491"
+        },
+        "3": {
+          "name": "cache8g-mtp3-benchmark-1",
+          "cache_gib_per_gpu": 8,
+          "mtp": 3,
+          "phase": "benchmark",
+          "repeat": 1,
+          "input_tokens": 512,
+          "output_tokens": 512,
+          "started_at": 1790668382.8862202,
+          "ended_at": 1790668397.0124245,
+          "ttft_s": 1.2963696939405054,
+          "elapsed_s": 14.125163283897564,
+          "decode_s": 12.827150980010629,
+          "decode_tps": 39.83737314672011,
+          "end_to_end_tps": 36.24736859386758,
+          "generated_sha256": "1fc192b58df10c450e54e9e7a7600979ca97e9fb9e3a9ddac0d87314000e6d47"
+        }
+      },
+      "decode_modes_tokens_equal": false,
+      "placement": {
+        "maps": [
+          {
+            "kind": "main",
+            "value": {
+              "cuda:0": 1,
+              "cuda:1": 1
+            }
+          },
+          {
+            "kind": "moe",
+            "value": "numa"
+          }
+        ],
+        "tp": null,
+        "serial": "1"
+      },
+      "gpu_peak_mib": {
+        "0": 16214,
+        "1": 18702
+      },
+      "allocated_expert_cache_gib": [
+        7.998,
+        7.998
+      ],
+      "error_lines": [],
+      "host_hwm_gib": 80.42146301269531,
+      "decode_rss_gib": 79.63698196411133,
+      "max_swap_gib": 0.0,
+      "input_hashes": {
+        "prompt.json": "3793ac4d1a75963bab4ca8788ffd5de16eb073642aa696c49574e149381270df",
+        "prefill-prompt.json": "f9e45ebc9176d19c1c37e3019f16d9ecf8bddf83f1b71423ce990bcdd006811a"
+      }
+    },
+    {
+      "name": "serial-resident12",
+      "label": "双卡串行，固定前12层专家在GPU",
+      "complete": true,
+      "native_sha256": "aa20ca1a0a954a6d9adcdfedb0b477a5542f86f920e27216f70a6d25d23c2ad9",
+      "exit_code": 0,
+      "monitor_error": null,
+      "prefill": {
+        "tokens": 4096,
+        "seconds_printed": 4.262,
+        "tokens_per_second": 960.99,
+        "source_line": "[Prompt] 4096 Tokens. Time: 4.262 s. Speed: 960.99 tokens / s."
+      },
+      "prefill_ttft_s": 4.273031494114548,
+      "decode": {
+        "0": {
+          "name": "cache0g-mtp0-benchmark-1",
+          "cache_gib_per_gpu": 0,
+          "mtp": 0,
+          "phase": "benchmark",
+          "repeat": 1,
+          "input_tokens": 512,
+          "output_tokens": 512,
+          "started_at": 1790668743.016359,
+          "ended_at": 1790668765.4231682,
+          "ttft_s": 1.1085165699478239,
+          "elapsed_s": 22.405870812013745,
+          "decode_s": 21.296657402068377,
+          "decode_tps": 23.994375753557016,
+          "end_to_end_tps": 22.85115380230935,
+          "generated_sha256": "56ebc12624590c42b5aed3293d961815798d0ac0224d48d530bc484d40f61ecc"
+        },
+        "3": {
+          "name": "cache0g-mtp3-benchmark-1",
+          "cache_gib_per_gpu": 0,
+          "mtp": 3,
+          "phase": "benchmark",
+          "repeat": 1,
+          "input_tokens": 512,
+          "output_tokens": 512,
+          "started_at": 1790668765.4256835,
+          "ended_at": 1790668782.1093838,
+          "ttft_s": 1.1596796978265047,
+          "elapsed_s": 16.682772483909503,
+          "decode_s": 15.521707460051402,
+          "decode_tps": 32.92163580038943,
+          "end_to_end_tps": 30.69034241723448,
+          "generated_sha256": "f33eb2fbcb1d6de89778f692644004ccc1d5f06435c926cec7f2186b519c5f1f"
+        }
+      },
+      "decode_modes_tokens_equal": false,
+      "placement": {
+        "maps": [
+          {
+            "kind": "main",
+            "value": {
+              "cuda:0": 1,
+              "cuda:1": 7
+            }
+          },
+          {
+            "kind": "moe",
+            "value": {
+              "cuda:0": 6,
+              "cuda:1": 6,
+              "numa": 36
+            }
+          }
+        ],
+        "tp": null,
+        "serial": "1"
+      },
+      "gpu_peak_mib": {
+        "0": 12764,
+        "1": 20786
+      },
+      "allocated_expert_cache_gib": [],
+      "error_lines": [],
+      "host_hwm_gib": 65.04640579223633,
+      "decode_rss_gib": 56.564632415771484,
+      "max_swap_gib": 0.0,
+      "input_hashes": {
+        "prompt.json": "3793ac4d1a75963bab4ca8788ffd5de16eb073642aa696c49574e149381270df",
+        "prefill-prompt.json": "f9e45ebc9176d19c1c37e3019f16d9ecf8bddf83f1b71423ce990bcdd006811a"
+      }
+    },
+    {
+      "name": "tp-cache0",
+      "label": "TP2，关闭专家缓存",
+      "complete": true,
+      "native_sha256": "aa20ca1a0a954a6d9adcdfedb0b477a5542f86f920e27216f70a6d25d23c2ad9",
+      "exit_code": 0,
+      "monitor_error": null,
+      "prefill": {
+        "tokens": 4096,
+        "seconds_printed": 3.301,
+        "tokens_per_second": 1240.71,
+        "source_line": "[Prompt] 4096 Tokens. Time: 3.301 s. Speed: 1240.71 tokens / s."
+      },
+      "prefill_ttft_s": 3.3027473110705614,
+      "decode": {
+        "0": {
+          "name": "cache0g-mtp0-benchmark-1",
+          "cache_gib_per_gpu": 0,
+          "mtp": 0,
+          "phase": "benchmark",
+          "repeat": 1,
+          "input_tokens": 512,
+          "output_tokens": 512,
+          "started_at": 1790667142.5548823,
+          "ended_at": 1790667168.427843,
+          "ttft_s": 1.0709933650214225,
+          "elapsed_s": 25.872103420086205,
+          "decode_s": 24.80099987005815,
+          "decode_tps": 20.604008010859356,
+          "end_to_end_tps": 19.789654968776173,
+          "generated_sha256": "6c48bf2a7606c144ad6c3f1efc3c13b40385f8ba5f3ac685c02fd38a4436f838"
+        },
+        "3": {
+          "name": "cache0g-mtp3-benchmark-1",
+          "cache_gib_per_gpu": 0,
+          "mtp": 3,
+          "phase": "benchmark",
+          "repeat": 1,
+          "input_tokens": 512,
+          "output_tokens": 512,
+          "started_at": 1790667168.430363,
+          "ended_at": 1790667185.2213516,
+          "ttft_s": 1.1235061730258167,
+          "elapsed_s": 16.790116308955476,
+          "decode_s": 15.662656822940335,
+          "decode_tps": 32.625371657991195,
+          "end_to_end_tps": 30.49413062891712,
+          "generated_sha256": "458133621fd4721d03a8490cc877662414947c9b4c52eeae3b426d1c833ff48a"
+        }
+      },
+      "decode_modes_tokens_equal": false,
+      "placement": {
+        "maps": [
+          {
+            "kind": "main",
+            "value": "cuda:0,1"
+          },
+          {
+            "kind": "moe",
+            "value": "numa"
+          }
+        ],
+        "tp": "cuda:0,1",
+        "serial": "0"
+      },
+      "gpu_peak_mib": {
+        "0": 11016,
+        "1": 11104
+      },
+      "allocated_expert_cache_gib": [],
+      "error_lines": [],
+      "host_hwm_gib": 80.78866577148438,
+      "decode_rss_gib": 77.04558563232422,
+      "max_swap_gib": 0.0,
+      "input_hashes": {
+        "prompt.json": "3793ac4d1a75963bab4ca8788ffd5de16eb073642aa696c49574e149381270df",
+        "prefill-prompt.json": "f9e45ebc9176d19c1c37e3019f16d9ecf8bddf83f1b71423ce990bcdd006811a"
+      }
+    },
+    {
+      "name": "tp-cache8",
+      "label": "TP2，每卡8GiB专家缓存",
+      "complete": true,
+      "native_sha256": "aa20ca1a0a954a6d9adcdfedb0b477a5542f86f920e27216f70a6d25d23c2ad9",
+      "exit_code": 0,
+      "monitor_error": null,
+      "prefill": {
+        "tokens": 4096,
+        "seconds_printed": 3.265,
+        "tokens_per_second": 1254.39,
+        "source_line": "[Prompt] 4096 Tokens. Time: 3.265 s. Speed: 1254.39 tokens / s."
+      },
+      "prefill_ttft_s": 3.2666505419183522,
+      "decode": {
+        "0": {
+          "name": "cache8g-mtp0-benchmark-1",
+          "cache_gib_per_gpu": 8,
+          "mtp": 0,
+          "phase": "benchmark",
+          "repeat": 1,
+          "input_tokens": 512,
+          "output_tokens": 512,
+          "started_at": 1790666739.8626869,
+          "ended_at": 1790666759.3389995,
+          "ttft_s": 1.036847281968221,
+          "elapsed_s": 19.47532154712826,
+          "decode_s": 18.438330796081573,
+          "decode_tps": 27.714005440698315,
+          "end_to_end_tps": 26.28968147000875,
+          "generated_sha256": "4e0da28c728e874acdcca681f64df451227c658b485b542a08df90e168c27a9c"
+        },
+        "3": {
+          "name": "cache8g-mtp3-benchmark-1",
+          "cache_gib_per_gpu": 8,
+          "mtp": 3,
+          "phase": "benchmark",
+          "repeat": 1,
+          "input_tokens": 512,
+          "output_tokens": 512,
+          "started_at": 1790666759.3417203,
+          "ended_at": 1790666771.4785368,
+          "ttft_s": 1.094146901043132,
+          "elapsed_s": 12.136090973159298,
+          "decode_s": 11.038991834968328,
+          "decode_tps": 46.29045909621022,
+          "end_to_end_tps": 42.18821374463666,
+          "generated_sha256": "407901f0031463256eedad77aededbd50aa2b104ed4c5a974f86df1948fa99f9"
+        }
+      },
+      "decode_modes_tokens_equal": false,
+      "placement": {
+        "maps": [
+          {
+            "kind": "main",
+            "value": "cuda:0,1"
+          },
+          {
+            "kind": "moe",
+            "value": "numa"
+          }
+        ],
+        "tp": "cuda:0,1",
+        "serial": "0"
+      },
+      "gpu_peak_mib": {
+        "0": 19230,
+        "1": 19310
+      },
+      "allocated_expert_cache_gib": [
+        7.998,
+        7.998
+      ],
+      "error_lines": [],
+      "host_hwm_gib": 88.36567306518555,
+      "decode_rss_gib": 84.09027481079102,
+      "max_swap_gib": 0.0,
+      "input_hashes": {
+        "prompt.json": "3793ac4d1a75963bab4ca8788ffd5de16eb073642aa696c49574e149381270df",
+        "prefill-prompt.json": "f9e45ebc9176d19c1c37e3019f16d9ecf8bddf83f1b71423ce990bcdd006811a"
+      }
+    },
+    {
+      "name": "tp-resident12",
+      "label": "TP2，固定前12层专家在GPU",
+      "complete": true,
+      "native_sha256": "aa20ca1a0a954a6d9adcdfedb0b477a5542f86f920e27216f70a6d25d23c2ad9",
+      "exit_code": 0,
+      "monitor_error": null,
+      "prefill": {
+        "tokens": 4096,
+        "seconds_printed": 3.101,
+        "tokens_per_second": 1321.08,
+        "source_line": "[Prompt] 4096 Tokens. Time: 3.101 s. Speed: 1321.08 tokens / s."
+      },
+      "prefill_ttft_s": 3.1019736758898944,
+      "decode": {
+        "0": {
+          "name": "cache0g-mtp0-benchmark-1",
+          "cache_gib_per_gpu": 0,
+          "mtp": 0,
+          "phase": "benchmark",
+          "repeat": 1,
+          "input_tokens": 512,
+          "output_tokens": 512,
+          "started_at": 1790667530.7015848,
+          "ended_at": 1790667554.2867582,
+          "ttft_s": 0.9435498300008476,
+          "elapsed_s": 23.58418402913958,
+          "decode_s": 22.64048400009051,
+          "decode_tps": 22.570188870430385,
+          "end_to_end_tps": 21.709464248048413,
+          "generated_sha256": "4e0da28c728e874acdcca681f64df451227c658b485b542a08df90e168c27a9c"
+        },
+        "3": {
+          "name": "cache0g-mtp3-benchmark-1",
+          "cache_gib_per_gpu": 0,
+          "mtp": 3,
+          "phase": "benchmark",
+          "repeat": 1,
+          "input_tokens": 512,
+          "output_tokens": 512,
+          "started_at": 1790667554.2894218,
+          "ended_at": 1790667568.7936697,
+          "ttft_s": 0.9879066699650139,
+          "elapsed_s": 14.503285215934739,
+          "decode_s": 13.511827280046418,
+          "decode_tps": 37.818719068043364,
+          "end_to_end_tps": 35.30234649439745,
+          "generated_sha256": "c7663e159b3a1596d468fb3a904fa37b4d7255b37bfd19c84597a414facb0e91"
+        }
+      },
+      "decode_modes_tokens_equal": false,
+      "placement": {
+        "maps": [
+          {
+            "kind": "main",
+            "value": "cuda:0,1"
+          },
+          {
+            "kind": "moe",
+            "value": "cuda:0,1"
+          },
+          {
+            "kind": "layered_moe",
+            "value": "numa"
+          }
+        ],
+        "tp": "cuda:0,1",
+        "serial": "0"
+      },
+      "gpu_peak_mib": {
+        "0": 18766,
+        "1": 18848
+      },
+      "allocated_expert_cache_gib": [],
+      "error_lines": [],
+      "host_hwm_gib": 80.622314453125,
+      "decode_rss_gib": 61.049217224121094,
+      "max_swap_gib": 0.0,
+      "input_hashes": {
+        "prompt.json": "3793ac4d1a75963bab4ca8788ffd5de16eb073642aa696c49574e149381270df",
+        "prefill-prompt.json": "f9e45ebc9176d19c1c37e3019f16d9ecf8bddf83f1b71423ce990bcdd006811a"
+      }
+    }
+  ]
+}
