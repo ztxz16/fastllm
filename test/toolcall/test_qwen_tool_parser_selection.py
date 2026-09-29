@@ -57,7 +57,7 @@ class QwenToolParserSelectionTest(unittest.TestCase):
         before = copy.deepcopy((messages, tools))
         self.assertIs(
             completion._resolve_tool_parser_class(), Qwen3CoderToolParser)
-        guided, selected = completion._apply_qwen4_tool_choice(
+        guided, selected = completion._apply_qwen_xml_tool_choice(
             messages, tools, "required")
         self.assertEqual((messages, tools), before)
         self.assertEqual(guided[1:], messages)
@@ -67,13 +67,34 @@ class QwenToolParserSelectionTest(unittest.TestCase):
     def _assert_no_guidance(self, completion, choice="required", tools=None):
         messages = [{"role": "user", "content": "Call get_weather."}]
         tools = _tools() if tools is None else tools
-        guided, selected = completion._apply_qwen4_tool_choice(
+        guided, selected = completion._apply_qwen_xml_tool_choice(
             messages, tools, choice)
         self.assertIs(guided, messages)
         self.assertIs(selected, tools)
 
     def test_auto_xml_parser_enables_guidance(self):
         self._assert_xml_guidance(_completion())
+
+    def test_naive_auto_xml_parser_and_required_guidance(self):
+        self._assert_xml_guidance(_completion(model_type="naive_n05_flash"))
+
+    def test_naive_explicit_parser_override(self):
+        completion = _completion(model_type="naive_n05_flash", parser="hermes")
+        self.assertIs(completion._resolve_tool_parser_class(), Hermes2ProToolParser)
+        self._assert_no_guidance(completion)
+
+    def test_naive_named_tool_filters_other_tools(self):
+        completion = _completion(model_type="naive_n05_flash")
+        tools = _tools()
+        other = copy.deepcopy(tools[0])
+        other["function"]["name"] = "get_time"
+        tools.append(other)
+        guided, selected = completion._apply_qwen_xml_tool_choice(
+            [{"role": "user", "content": "查询天气"}], tools,
+            {"type": "function", "function": {"name": "get_weather"}})
+        self.assertEqual([t["function"]["name"] for t in selected], ["get_weather"])
+        self.assertEqual(len(tools), 2)
+        self.assertIn("get_weather", guided[0]["content"])
 
     def test_auto_hermes_parser_does_not_receive_xml_guidance(self):
         completion = _completion(template=JSON_TEMPLATE)
@@ -123,7 +144,7 @@ class QwenToolParserSelectionTest(unittest.TestCase):
                 (_tools(), "auto"), (_tools(), "none"), (_tools(), None),
             ):
                 with self.subTest(choice=choice, has_tools=bool(tools)):
-                    guided, selected = completion._apply_qwen4_tool_choice(
+                    guided, selected = completion._apply_qwen_xml_tool_choice(
                         messages, tools, choice)
                     self.assertIs(guided, messages)
                     self.assertIs(selected, tools)
@@ -146,7 +167,7 @@ class QwenToolParserSelectionTest(unittest.TestCase):
             return_value=CustomQwenParser,
         ):
             messages = [{"role": "user", "content": "Call get_weather."}]
-            guided, _ = completion._apply_qwen4_tool_choice(
+            guided, _ = completion._apply_qwen_xml_tool_choice(
                 messages, _tools(), "required")
             self.assertIn("<function=FUNCTION_NAME>", guided[0]["content"])
 

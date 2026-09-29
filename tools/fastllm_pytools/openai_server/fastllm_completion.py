@@ -366,6 +366,12 @@ class FastLLmCompletion:
   def _is_qwen_reasoning_model(self) -> bool:
       return self._is_qwen3_5_model() or self._is_qwen4_exp_model()
 
+  def _is_naive_n05_model(self) -> bool:
+      try:
+          return self.model.get_type() == "naive_n05_flash"
+      except Exception:
+          return False
+
   def _is_qwen3_5_reasoning_response(self, enable_thinking: bool) -> bool:
       return (enable_thinking and self._is_qwen_reasoning_model()
               and not getattr(self.model, "force_chat_template", False))
@@ -397,6 +403,8 @@ class FastLLmCompletion:
               or self._is_kimi_k3_reasoning_response(enable_thinking)
               or self._is_glm5_next_reasoning_response()
               or self._is_qwen3_5_reasoning_response(enable_thinking)
+              or (enable_thinking and self._is_naive_n05_model()
+                  and not getattr(self.model, "force_chat_template", False))
               or self._is_dots3_note_reasoning_response(enable_thinking))
 
   def _resolve_kimi_k3_reasoning_effort(
@@ -1606,10 +1614,10 @@ class FastLLmCompletion:
           force_chat_template = self.model.force_chat_template,
           force_type = getattr(self.model, "tool_call_parser", "auto"))
 
-  def _apply_qwen4_tool_choice(
+  def _apply_qwen_xml_tool_choice(
       self, messages, tools, tool_choice, parallel_tool_calls=None,
   ):
-      if self.model.get_type() != "qwen4_exp" or not tools:
+      if self.model.get_type() not in ("qwen4_exp", "naive_n05_flash") or not tools:
           return messages, tools
       if tool_choice != "required" and not isinstance(tool_choice, dict):
           return messages, tools
@@ -3209,7 +3217,7 @@ class FastLLmCompletion:
       try:
           messages, tools = self._apply_dots_tool_choice(
               messages, tools, tool_choice)
-          messages, tools = self._apply_qwen4_tool_choice(
+          messages, tools = self._apply_qwen_xml_tool_choice(
               messages, tools, tool_choice, request.parallel_tool_calls)
       except ValueError as error:
           self._cleanup_temp_paths(media.temp_paths)
@@ -3377,7 +3385,7 @@ class FastLLmCompletion:
               if not request.tools:
                   result = self._strip_kimi_k3_response_wrapper(result)
       elif (self._is_qwen_reasoning_model()
-            or self._is_dots3_note_model()):
+            or self._is_dots3_note_model() or self._is_naive_n05_model()):
           result, reasoning_content = self._split_qwen3_5_reasoning(
               result, emit_reasoning_content)
       elif self._is_glm5_next_model():

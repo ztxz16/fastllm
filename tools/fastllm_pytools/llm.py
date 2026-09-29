@@ -1967,7 +1967,7 @@ class model:
             for i in range(len(conversation)):
                 if ("content" in conversation[i] and isinstance(conversation[i]["content"], str)):
                     conversation[i]["content"] = [{"type": "text", "text": conversation[i]["content"]}]
-        elif model_struct in ("dots3_note", "glm5_next"):
+        elif model_struct in ("dots3_note", "glm5_next", "naive_n05_flash"):
             # These chat templates iterate over argument objects, while the
             # OpenAI wire protocol stores function.arguments as a JSON string.
             # Normalize assistant tool-call history before rendering so a
