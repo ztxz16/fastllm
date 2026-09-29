@@ -1,0 +1,313 @@
+{
+  "model": "Naive-N0.5-Flash-FP8",
+  "date": "2026-09-29",
+  "checkpoint_config_sha256": "24a510d6dbe9c7b6c36fefe7dec33b8ce6a12e8815ded1cec7dcc2b90e1e7783",
+  "fastllm": {
+    "device": "cuda",
+    "moe_device": "numa",
+    "FT_NUMAS": 1,
+    "cpu_affinity": "0-31",
+    "threads": 32,
+    "activation": "bfloat16",
+    "kv_cache": "bfloat16",
+    "moe_arithmetic": "FP8 W8A8 with BF16 projection/activation/route rounding",
+    "chunked_prefill_size": 128
+  },
+  "reference": {
+    "implementation": "checkpoint Transformers model, FP8Experts eager",
+    "transformers": "5.17.0",
+    "torch": "2.10.0+cu128",
+    "kernels": "0.16.0",
+    "fp8_kernel_revision": "8c178950e8710e26a2210e4e909cd02dc16c8715",
+    "gpu": "NVIDIA GeForce RTX 4090 / 4090 D"
+  },
+  "short_input_ids": [
+    151644,
+    8948,
+    198,
+    25139,
+    287,
+    30022,
+    371,
+    25,
+    7487,
+    151645,
+    151644,
+    8948,
+    198,
+    2610,
+    525,
+    12812,
+    533,
+    11250,
+    15,
+    13,
+    20,
+    12,
+    23876,
+    11,
+    264,
+    10950,
+    15235,
+    17847,
+    44936,
+    553,
+    12812,
+    533,
+    15235,
+    13,
+    151645,
+    151644,
+    872,
+    198,
+    108386,
+    37945,
+    11622,
+    105321,
+    100157,
+    107828,
+    1773,
+    151645,
+    151644,
+    77091,
+    198
+  ],
+  "natural_input_ids": [
+    151644,
+    8948,
+    198,
+    25139,
+    287,
+    30022,
+    371,
+    25,
+    7487,
+    151645,
+    151644,
+    8948,
+    198,
+    2610,
+    525,
+    12812,
+    533,
+    11250,
+    15,
+    13,
+    20,
+    12,
+    23876,
+    11,
+    264,
+    10950,
+    15235,
+    17847,
+    44936,
+    553,
+    12812,
+    533,
+    15235,
+    13,
+    151645,
+    151644,
+    872,
+    198,
+    14880,
+    98237,
+    30534,
+    104136,
+    100678,
+    101916,
+    20412,
+    105681,
+    9370,
+    1773,
+    151645,
+    151644,
+    77091,
+    198,
+    151667,
+    151668
+  ],
+  "long_input_recipe": "repeat short_input_ids to 2057 tokens",
+  "repeat_request_max_abs": 0.0,
+  "cases": [
+    {
+      "name": "short_thinking",
+      "input_tokens": 49,
+      "steps": 3,
+      "actual_output_ids": [
+        151667,
+        198,
+        1654
+      ],
+      "top1_matches": 3,
+      "reference_file": "/tmp/naive-reference-short.npz",
+      "actual_file": "/tmp/naive-w8a8-short.npz",
+      "metrics": [
+        {
+          "mae": 0.3499607341778121,
+          "rmse": 0.4355126491337412,
+          "max_abs": 2.5,
+          "cosine": 0.9915454214664179,
+          "kl_ref_actual": 1.4045740303717166e-09,
+          "top1_reference": 151667,
+          "top1_actual": 151667,
+          "top10_overlap": 9
+        },
+        {
+          "mae": 0.3763201779853115,
+          "rmse": 0.478557762815602,
+          "max_abs": 3.0,
+          "cosine": 0.9876405492950806,
+          "kl_ref_actual": 3.3074938423312153e-07,
+          "top1_reference": 198,
+          "top1_actual": 198,
+          "top10_overlap": 10
+        },
+        {
+          "mae": 0.25643122396056833,
+          "rmse": 0.3298821761028476,
+          "max_abs": 1.72802734375,
+          "cosine": 0.9889909706825577,
+          "kl_ref_actual": 0.012848648201521854,
+          "top1_reference": 1654,
+          "top1_actual": 1654,
+          "top10_overlap": 9
+        }
+      ],
+      "top1_ties": []
+    },
+    {
+      "name": "long_sparse",
+      "input_tokens": 2057,
+      "steps": 2,
+      "actual_output_ids": [
+        198,
+        151667
+      ],
+      "top1_matches": 2,
+      "reference_file": "/tmp/naive-reference-long.npz",
+      "actual_file": "/tmp/naive-w8a8-long.npz",
+      "metrics": [
+        {
+          "mae": 0.38365120119778534,
+          "rmse": 0.4824364342321256,
+          "max_abs": 3.0625,
+          "cosine": 0.9906420377569697,
+          "kl_ref_actual": 0.00192840400678221,
+          "top1_reference": 198,
+          "top1_actual": 198,
+          "top10_overlap": 9
+        },
+        {
+          "mae": 0.3641158519336179,
+          "rmse": 0.4596147770980205,
+          "max_abs": 2.75,
+          "cosine": 0.9782900168071161,
+          "kl_ref_actual": 4.225509551833256e-15,
+          "top1_reference": 151667,
+          "top1_actual": 151667,
+          "top10_overlap": 10
+        }
+      ],
+      "top1_ties": []
+    },
+    {
+      "name": "natural_teacher_forced",
+      "input_tokens": 54,
+      "steps": 5,
+      "actual_output_ids": [
+        198,
+        101916,
+        104401,
+        105681,
+        3837
+      ],
+      "top1_matches": 5,
+      "reference_file": "/tmp/naive-reference-natural-forced.npz",
+      "actual_file": "/tmp/naive-w8a8-natural.npz",
+      "metrics": [
+        {
+          "mae": 0.22213809446614524,
+          "rmse": 0.2829132791825253,
+          "max_abs": 2.0,
+          "cosine": 0.997543956965194,
+          "kl_ref_actual": 0.007650359905533729,
+          "top1_reference": 198,
+          "top1_actual": 198,
+          "top10_overlap": 8
+        },
+        {
+          "mae": 0.1876775239627096,
+          "rmse": 0.23914949453148157,
+          "max_abs": 1.578125,
+          "cosine": 0.9947523290102186,
+          "kl_ref_actual": 0.02163294867954448,
+          "top1_reference": 101916,
+          "top1_actual": 101916,
+          "top10_overlap": 10
+        },
+        {
+          "mae": 0.09674975566015948,
+          "rmse": 0.123176662750276,
+          "max_abs": 0.875,
+          "cosine": 0.9989892867922653,
+          "kl_ref_actual": 0.013092608466410713,
+          "top1_reference": 100827,
+          "top1_actual": 100827,
+          "top10_overlap": 10
+        },
+        {
+          "mae": 0.057958101995926874,
+          "rmse": 0.07375292506861096,
+          "max_abs": 0.5625,
+          "cosine": 0.9995415006725095,
+          "kl_ref_actual": 3.0604395422288645e-06,
+          "top1_reference": 105681,
+          "top1_actual": 105681,
+          "top10_overlap": 10
+        },
+        {
+          "mae": 0.11874994611322268,
+          "rmse": 0.1499464825538551,
+          "max_abs": 0.875,
+          "cosine": 0.9992062687858376,
+          "kl_ref_actual": 0.006607479374280254,
+          "top1_reference": 3837,
+          "top1_actual": 3837,
+          "top10_overlap": 10
+        }
+      ],
+      "top1_ties": [
+        {
+          "step": 2,
+          "reference": [
+            100827,
+            104401
+          ],
+          "actual": [
+            100827,
+            104401
+          ]
+        }
+      ]
+    }
+  ],
+  "server_checks": [
+    {
+      "stream": false,
+      "prompt": "计算 17 + 25，只输出结果。",
+      "text": "\n\n42"
+    },
+    {
+      "stream": true,
+      "prompt": "请简要解释为什么天空是蓝色的。",
+      "text": "\n天空呈现蓝色，主要是因为**瑞利散射**。\n\n简单来说，太阳光包含所有颜色的光"
+    }
+  ],
+  "operator_tests": [
+    "naive_n05_attention",
+    "numas_fp8_eager_moe",
+    "numas_fp8_eager_moe_avx2"
+  ]
+}
