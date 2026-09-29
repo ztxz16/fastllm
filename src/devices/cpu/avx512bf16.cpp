@@ -721,35 +721,61 @@ namespace fastllm {
     }
 
 #ifdef __AVX512BF16__
+    template<int Rows, int Cols>
+    static inline void GemmEagerFP8Tile(const uint16_t *a, const float *scales, const uint8_t *b,
+                                       long ldb, uint8_t *c, long ldc, int m, int col) {
+        const int blocks = (m + 127) / 128;
+        float sums[Rows][Cols] = {};
+        for (int block = 0; block < blocks; ++block) {
+            const int start = block * 128, count = std::min(128, m - start);
+            __m512 accum[Rows][Cols];
+#pragma GCC unroll 8
+            for (int r = 0; r < Rows; ++r)
+#pragma GCC unroll 4
+                for (int j = 0; j < Cols; ++j) accum[r][j] = _mm512_setzero_ps();
+            for (int i = 0; i < count; i += 32) {
+                __m512bh inputs[Rows];
+#pragma GCC unroll 8
+                for (int r = 0; r < Rows; ++r)
+                    inputs[r] = (__m512bh)_mm512_loadu_si512(a + (size_t)r * m + start + i);
+#pragma GCC unroll 4
+                for (int j = 0; j < Cols; ++j) {
+                    const __m512bh weights = FP8E4M3ToBFloat16_AVX512BF16(
+                        _mm256_loadu_si256((const __m256i *)(b + (size_t)(col + j) * ldb + block * 132 + i)));
+#pragma GCC unroll 8
+                    for (int r = 0; r < Rows; ++r)
+                        accum[r][j] = _mm512_dpbf16_ps(accum[r][j], inputs[r], weights);
+                }
+            }
+#pragma GCC unroll 4
+            for (int j = 0; j < Cols; ++j) {
+                float bs;
+                std::memcpy(&bs, b + (size_t)(col + j) * ldb + block * 132 + count, sizeof(bs));
+#pragma GCC unroll 8
+                for (int r = 0; r < Rows; ++r) {
+                    // Preserve the dot reduction and separate scale rounding.
+                    float dot = _mm512_reduce_add_ps(accum[r][j]);
+                    sums[r][j] += (dot * scales[r * blocks + block]) * bs;
+                }
+            }
+        }
+        for (int r = 0; r < Rows; ++r)
+            for (int j = 0; j < Cols; ++j) ((float *)(c + r * ldc))[col + j] = sums[r][j];
+    }
+
     template<int Rows>
     static void GemmEagerFP8Rows(const uint16_t *a, const float *scales, const uint8_t *b,
                                 long ldb, uint8_t *c, long ldc, int m, int st, int end) {
-        const int blocks = (m + 127) / 128;
-        for (int col = st; col < end; ++col) {
-            float sums[Rows] = {};
-            for (int block = 0; block < blocks; ++block) {
-                const int start = block * 128, count = std::min(128, m - start);
-                const uint8_t *weight = b + (size_t)col * ldb + block * 132;
-                __m512 accum[Rows];
-                for (int r = 0; r < Rows; ++r) accum[r] = _mm512_setzero_ps();
-                for (int i = 0; i < count; i += 32) {
-                    const __m512bh vb = FP8E4M3ToBFloat16_AVX512BF16(
-                        _mm256_loadu_si256((const __m256i *)(weight + i)));
-                    for (int r = 0; r < Rows; ++r) {
-                        const __m512bh va = (__m512bh)_mm512_loadu_si512(a + (size_t)r * m + start + i);
-                        accum[r] = _mm512_dpbf16_ps(accum[r], va, vb);
-                    }
-                }
-                float bs;
-                std::memcpy(&bs, weight + count, sizeof(bs));
-                for (int r = 0; r < Rows; ++r) {
-                    // Retain the per-block reduction and scale multiplication
-                    // order of the scalar/untiled path.
-                    float dot = _mm512_reduce_add_ps(accum[r]);
-                    sums[r] += (dot * scales[r * blocks + block]) * bs;
-                }
-            }
-            for (int r = 0; r < Rows; ++r) ((float *)(c + r * ldc))[col] = sums[r];
+        // Tile both tokens and outputs, sharing weight conversion across tokens
+        // and activation loads across outputs without spilling vector registers.
+        constexpr int Cols = Rows <= 2 ? 1 : (Rows <= 4 ? 4 : 2);
+        int col = st;
+        for (; col + Cols <= end; col += Cols)
+            GemmEagerFP8Tile<Rows, Cols>(a, scales, b, ldb, c, ldc, m, col);
+        switch (end - col) {
+            case 3: GemmEagerFP8Tile<Rows, 3>(a, scales, b, ldb, c, ldc, m, col); break;
+            case 2: GemmEagerFP8Tile<Rows, 2>(a, scales, b, ldb, c, ldc, m, col); break;
+            case 1: GemmEagerFP8Tile<Rows, 1>(a, scales, b, ldb, c, ldc, m, col); break;
         }
     }
     // Transpose 16 BF16-pair vectors, using the same unpack/shuffle stages
@@ -778,31 +804,42 @@ namespace fastllm {
         }
     }
 
-    template<int Rows>
+    template<int Rows, int Cols>
     static inline void GemmEagerFP8PackedTile(
             const uint16_t *a, const uint16_t *b, const float *as,
             const float *bs, float *output, int m, int blocks,
             int columns, int count) {
-        __m512 accum[Rows];
-        for (int r = 0; r < Rows; ++r) accum[r] = _mm512_setzero_ps();
+        __m512 accum[Rows][Cols];
+#pragma GCC unroll 8
+        for (int r = 0; r < Rows; ++r)
+#pragma GCC unroll 2
+            for (int c = 0; c < Cols; ++c) accum[r][c] = _mm512_setzero_ps();
         for (int pair = 0; pair < count / 2; ++pair) {
-            const __m512bh weights = (__m512bh)_mm512_loadu_si512(b + pair * 32);
+            __m512bh weights[Cols];
+#pragma GCC unroll 2
+            for (int c = 0; c < Cols; ++c)
+                weights[c] = (__m512bh)_mm512_loadu_si512(b + c * 16 * 128 + pair * 32);
+#pragma GCC unroll 8
             for (int r = 0; r < Rows; ++r) {
                 uint32_t activation;
                 std::memcpy(&activation, a + (size_t)r * m + pair * 2, sizeof(activation));
-                accum[r] = _mm512_dpbf16_ps(accum[r],
-                    (__m512bh)_mm512_set1_epi32(activation), weights);
+                const __m512bh value = (__m512bh)_mm512_set1_epi32(activation);
+#pragma GCC unroll 2
+                for (int c = 0; c < Cols; ++c)
+                    accum[r][c] = _mm512_dpbf16_ps(accum[r][c], value, weights[c]);
             }
         }
-        const __m512 weightScale = _mm512_loadu_ps(bs);
-        for (int r = 0; r < Rows; ++r) {
-            // Apply both scales in FP32 after each 128-element dot. Keeping
-            // BF16 values unscaled avoids the extra precision loss of
-            // dequantizing a scaled FP8 weight to BF16 before the GEMM.
-            __m512 value = _mm512_mul_ps(accum[r], _mm512_set1_ps(as[r * blocks]));
-            value = _mm512_mul_ps(value, weightScale);
-            _mm512_storeu_ps(output + r * columns,
-                _mm512_add_ps(_mm512_loadu_ps(output + r * columns), value));
+#pragma GCC unroll 2
+        for (int c = 0; c < Cols; ++c) {
+            const __m512 weightScale = _mm512_loadu_ps(bs + c * 16);
+#pragma GCC unroll 8
+            for (int r = 0; r < Rows; ++r) {
+                // Scale only after the 128-element dot, in the original order.
+                __m512 value = _mm512_mul_ps(accum[r][c], _mm512_set1_ps(as[r * blocks]));
+                value = _mm512_mul_ps(value, weightScale);
+                float *out = output + r * columns + c * 16;
+                _mm512_storeu_ps(out, _mm512_add_ps(_mm512_loadu_ps(out), value));
+            }
         }
     }
 
@@ -859,13 +896,15 @@ namespace fastllm {
                             (size_t)(st + col + j) * ldb + block * 132 + count, sizeof(float));
                 }
             }
-            for (int row = 0; row < n; row += 8) for (int col = 0; col < columns; col += 16) {
+            for (int row = 0; row < n; row += 8) for (int col = 0; col < columns; col += 32) {
                 const uint16_t *a = activationData + (size_t)row * m + start;
                 const uint16_t *b = packedData + col * 128;
                 const float *as = activationScaleData + row * blocks + block;
                 const float *bs = weightScaleData + col;
                 float *out = sumData + (size_t)row * columns + col;
-#define FASTLLM_EAGER_FP8_TILE(R) GemmEagerFP8PackedTile<R>(a, b, as, bs, out, m, blocks, columns, count)
+#define FASTLLM_EAGER_FP8_TILE(R) \
+                if (col + 32 <= columns) GemmEagerFP8PackedTile<R, 2>(a, b, as, bs, out, m, blocks, columns, count); \
+                else GemmEagerFP8PackedTile<R, 1>(a, b, as, bs, out, m, blocks, columns, count)
                 switch (std::min(8, n - row)) {
                     case 8: FASTLLM_EAGER_FP8_TILE(8); break;
                     case 7: FASTLLM_EAGER_FP8_TILE(7); break;
@@ -896,29 +935,38 @@ namespace fastllm {
             GemmEagerFP8Prefill(A, lda, B, ldb, C, ldc, n, m, st, end);
             return true;
         }
-        // Decode each activation once per task, instead of once per output
-        // column. Four token rows share each weight load and FP8 conversion.
+        // Small and ragged expert groups use up to eight rows per weight pass.
         thread_local std::vector<uint16_t> decoded;
         thread_local std::vector<float> scales;
         const int blocks = (m + 127) / 128;
-        decoded.resize((size_t)std::min(n, 4) * m);
-        scales.resize((size_t)std::min(n, 4) * blocks);
-        for (int row = 0; row < n; row += 4) {
-            const int rows = std::min(4, n - row);
+        decoded.resize((size_t)std::min(n, 8) * m);
+        scales.resize((size_t)std::min(n, 8) * blocks);
+        uint16_t *decodedData = decoded.data();
+        float *scaleData = scales.data();
+        for (int row = 0; row < n; row += 8) {
+            const int rows = std::min(8, n - row);
             for (int r = 0; r < rows; ++r) for (int block = 0; block < blocks; ++block) {
                 const int start = block * 128, count = std::min(128, m - start);
                 const uint8_t *a = (const uint8_t *)A + (size_t)(row + r) * lda + block * 132;
                 for (int i = 0; i < count; i += 32) {
-                    _mm512_storeu_si512(decoded.data() + (size_t)r * m + start + i,
+                    _mm512_storeu_si512(decodedData + (size_t)r * m + start + i,
                         (__m512i)FP8E4M3ToBFloat16_AVX512BF16(_mm256_loadu_si256((const __m256i *)(a + i))));
                 }
-                std::memcpy(&scales[r * blocks + block], a + count, sizeof(float));
+                std::memcpy(scaleData + r * blocks + block, a + count, sizeof(float));
             }
             uint8_t *c = (uint8_t *)C + (size_t)row * ldc;
-            if (rows == 4) GemmEagerFP8Rows<4>(decoded.data(), scales.data(), (const uint8_t *)B, ldb, c, ldc, m, st, end);
-            else if (rows == 3) GemmEagerFP8Rows<3>(decoded.data(), scales.data(), (const uint8_t *)B, ldb, c, ldc, m, st, end);
-            else if (rows == 2) GemmEagerFP8Rows<2>(decoded.data(), scales.data(), (const uint8_t *)B, ldb, c, ldc, m, st, end);
-            else GemmEagerFP8Rows<1>(decoded.data(), scales.data(), (const uint8_t *)B, ldb, c, ldc, m, st, end);
+#define FASTLLM_FP8_ROWS(R) case R: GemmEagerFP8Rows<R>(decodedData, scaleData, (const uint8_t *)B, ldb, c, ldc, m, st, end); break
+            switch (rows) {
+                FASTLLM_FP8_ROWS(1);
+                FASTLLM_FP8_ROWS(2);
+                FASTLLM_FP8_ROWS(3);
+                FASTLLM_FP8_ROWS(4);
+                FASTLLM_FP8_ROWS(5);
+                FASTLLM_FP8_ROWS(6);
+                FASTLLM_FP8_ROWS(7);
+                FASTLLM_FP8_ROWS(8);
+            }
+#undef FASTLLM_FP8_ROWS
         }
         return true;
 #else

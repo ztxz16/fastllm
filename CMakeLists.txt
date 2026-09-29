@@ -768,6 +768,8 @@ if (UNIT_TEST)
     set_tests_properties(reduce_batch PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
 
     if (USE_NUMAS)
+        add_executable(numas_fp8_moe_bench tools/numas_fp8_moe_bench.cpp)
+        target_link_libraries(numas_fp8_moe_bench PRIVATE fastllm)
         add_executable(numas_fp8_eager_moe_test test/basic/test_numas_fp8_eager_moe.cpp)
         target_link_libraries(numas_fp8_eager_moe_test PRIVATE fastllm)
         add_test(NAME numas_fp8_eager_moe COMMAND numas_fp8_eager_moe_test)

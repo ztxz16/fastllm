@@ -6388,10 +6388,10 @@ namespace fastllm {
                 "FASTLLM_DSV4_DISABLE_NUMAS_MOE_GROUPED_DECODE") ==
                 nullptr;
         const bool useGroupedGemmQueue =
-            useDeepSeekV4GroupedDecodeFast || nvfp4Grouped;
+            useDeepSeekV4GroupedDecodeFast || nvfp4Grouped || (fp8EagerMode && bs > 1 && bs < 16);
         // A verifier layer can otherwise allocate and free hundreds of
         // fine-grained GEMM task objects. Store those exact same tasks in
-        // contiguous vectors for every 2-8 row DeepSeek-V4 group.
+        // contiguous vectors for small grouped decode/verification batches.
         if (useDeepSeekV4GroupedDecodeFast) {
             // Match the tuned small-batch queue granularity.  The generic
             // grouped path's 64-column chunks create thousands of fine-grained
@@ -6515,7 +6515,7 @@ namespace fastllm {
         // DeepSeek-V4 sorting threshold.
         if (useGroupedGemmQueue &&
             groupedGemmExperts.size() > 1 &&
-            (nvfp4Grouped || groupedThreadsPerNode * 2 >=
+            (nvfp4Grouped || fp8EagerMode || groupedThreadsPerNode * 2 >=
                 (int)groupedGemmExperts.size())) {
             const int firstRows = groupedGemmExperts.front().rows;
             const bool unevenRows = std::any_of(
@@ -6547,7 +6547,7 @@ namespace fastllm {
                     expandInput.data(), inputRowBytes,
                     startDataType, gateUpOutput.data(),
                     0, nid, inputDim, gateCols,
-                    gateColsPerNuma, nvfp4Grouped ?
+                    gateColsPerNuma, (nvfp4Grouped || fp8EagerMode) ?
                         SelectNumasMoeGroupedColumnsPerTask(gateColsPerNuma,
                             groupedGemmExperts.size(),
                             numaConfig->numaToCpuDict[nid].size()) : stride);
@@ -6764,7 +6764,7 @@ namespace fastllm {
                     downInput.data(), downRowBytes,
                     downInputDataType, downOutput.data(),
                     1, nid, interDim, dim,
-                    dim / numaConfig->numaCnt, nvfp4Grouped ?
+                    dim / numaConfig->numaCnt, (nvfp4Grouped || fp8EagerMode) ?
                         SelectNumasMoeGroupedColumnsPerTask(dim / numaConfig->numaCnt,
                             groupedGemmExperts.size(),
                             numaConfig->numaToCpuDict[nid].size()) : stride);

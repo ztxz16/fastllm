@@ -119,7 +119,7 @@ static void TestTiledGemm() {
     std::mt19937 rng(9271);
     FP8E4M3ToFP32Manager fp8;
     // Exercise both dispatch paths and every 1..7-row packed-kernel tail.
-    for (int m : {32, 96, 128, 160, 384, 4096}) for (int n : {1, 2, 3, 4, 8, 9, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 64}) {
+    for (int m : {32, 96, 128, 160, 384, 4096}) for (int n : {1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 64}) {
         const int k = 43, st = 3, end = 37;
         size_t stride = GetDataBytes(FP8_E4M3_BLOCK_128, 1, m);
         std::vector<uint8_t> a(n * stride), b(k * stride);
