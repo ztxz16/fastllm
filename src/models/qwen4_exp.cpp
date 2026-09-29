@@ -13,6 +13,7 @@
 
 #include "devices/cpu/alivethreadpool.h"
 #include "executor.h"
+#include "gguf.h"
 #include "json11.hpp"
 #include "utils.h"
 #include "utils/cuda_cache_budget.h"
@@ -1144,7 +1145,8 @@ namespace fastllm {
         }
 
         void Qwen4AddOne(Data &data) {
-            if (data.dims.empty()) {
+            // GGUF contains the effective gamma, including HF's +1 offset.
+            if (data.dims.empty() || data.isGGUFData) {
                 return;
             }
             data.ToDevice(DataDevice::CPU);
@@ -2450,8 +2452,8 @@ namespace fastllm {
         this->ngramHeadDim = this->pleEmbedDim / this->ngramHeads;
         this->ngramVocabBase = Qwen4DictInt(weight.dicts, "ngram_vocab_size_base", 20000000);
         this->ngramShardCount = Qwen4DictInt(weight.dicts, "split_ngram_parts", 128);
-        this->eosToken = Qwen4DictInt(weight.dicts, "eos_token_id", 248044);
-        this->eos_token_id = this->eosToken;
+        this->eos_token_id = Qwen4DictInt(weight.dicts, "eos_token_id", 248044);
+        this->eosToken = Qwen4DictInt(weight.dicts, "ple_eos_token_id", this->eos_token_id);
         this->pleSeed = Qwen4DictInt(weight.dicts, "seed", 1234);
         this->indexerHeads = Qwen4DictInt(weight.dicts, "indexer_n_heads", 4);
         this->indexerKvHeads = Qwen4DictInt(weight.dicts, "indexer_kv_heads", 1);
@@ -2577,40 +2579,75 @@ namespace fastllm {
             std::vector<float>(this->head_k_dim, linearInvScale));
         this->linearInvScaleData.CopyFrom(linearInvScaleData);
 
-        // Deterministic PLE hash metadata.  Rebuilding it avoids truncating the
-        // checkpoint's uint64 multipliers through FastLLM's int32 parameter
-        // representation.
-        this->pleMultipliers.clear();
-        uint64_t unigramVocab = (uint64_t)Qwen4DictInt(weight.dicts, "vocab_size", 248320);
-        uint64_t maxLong = (uint64_t)std::numeric_limits<int64_t>::max();
-        uint64_t multiplierMax = maxLong / std::max<uint64_t>(unigramVocab, 1);
-        uint64_t halfBound = std::max<uint64_t>(1, multiplierMax / 2);
-        uint64_t baseSeed = (uint64_t)this->pleSeed; // PLE index is zero here.
-        for (int index = 0; index < this->ngramSize; index++) {
-            uint64_t value = baseSeed + kSplitMixGamma * (uint64_t)(index + 1);
-            this->pleMultipliers.push_back(
-                2 * (Qwen4SplitMix64(value) % halfBound) + 1);
-        }
+        const bool ggufModel = weight.dicts["gguf_architecture"] == "qwen4exp";
+        if (ggufModel) {
+            auto integers = [&](const std::string &name, size_t count) {
+                std::string error;
+                const auto array = json11::Json::parse(weight.dicts[name], error);
+                AssertInFastLLM(error.empty() && array.is_array() && array.array_items().size() == count,
+                                "Qwen4 GGUF invalid PLE metadata: " + name);
+                std::vector<uint64_t> values;
+                for (const auto &item : array.array_items()) {
+                    const double number = item.number_value();
+                    AssertInFastLLM(item.is_number() && number >= 0 && number <= 9007199254740991.0 &&
+                                    number == std::floor(number), "Qwen4 GGUF PLE integer is not exactly representable.");
+                    values.push_back((uint64_t)number);
+                }
+                return values;
+            };
+            AssertInFastLLM(ngramSize >= 2 && ngramSize <= 3 && pleLayer >= 0 && pleLayer < block_cnt,
+                            "Qwen4 GGUF has an unsupported PLE layout.");
+            pleMultipliers = integers("ple_layer_multipliers", ngramSize);
+            const auto offsets = integers("ple_head_offsets", ngramHeads);
+            const auto sizes = integers("ple_head_vocab_sizes", ngramHeads);
+            pleHeadOffsets.assign(offsets.begin(), offsets.end());
+            pleHeadVocabSizes.assign(sizes.begin(), sizes.end());
+            for (int head = 0; head < ngramHeads; head++) {
+                AssertInFastLLM(sizes[head] > 0 && offsets[head] + sizes[head] <= INT32_MAX,
+                                "Qwen4 GGUF PLE head range is invalid.");
+            }
+        } else {
+            // Rebuild HF hash metadata without truncating uint64 multipliers
+            // through the int32 parameter representation.
+            this->pleMultipliers.clear();
+            uint64_t unigramVocab = (uint64_t)Qwen4DictInt(weight.dicts, "vocab_size", 248320);
+            uint64_t maxLong = (uint64_t)std::numeric_limits<int64_t>::max();
+            uint64_t multiplierMax = maxLong / std::max<uint64_t>(unigramVocab, 1);
+            uint64_t halfBound = std::max<uint64_t>(1, multiplierMax / 2);
+            uint64_t baseSeed = (uint64_t)this->pleSeed; // PLE index is zero here.
+            for (int index = 0; index < this->ngramSize; index++) {
+                uint64_t value = baseSeed + kSplitMixGamma * (uint64_t)(index + 1);
+                this->pleMultipliers.push_back(
+                    2 * (Qwen4SplitMix64(value) % halfBound) + 1);
+            }
 
-        this->pleHeadVocabSizes.clear();
-        this->pleHeadOffsets.clear();
-        int64_t candidate = (int64_t)this->ngramVocabBase - 1;
-        int64_t offset = 0;
-        for (int head = 0; head < this->ngramHeads; head++) {
-            do {
-                candidate++;
-            } while (!Qwen4IsPrime(candidate));
-            this->pleHeadVocabSizes.push_back(candidate);
-            this->pleHeadOffsets.push_back(offset);
-            offset += candidate;
+            this->pleHeadVocabSizes.clear();
+            this->pleHeadOffsets.clear();
+            int64_t candidate = (int64_t)this->ngramVocabBase - 1;
+            int64_t offset = 0;
+            for (int head = 0; head < this->ngramHeads; head++) {
+                do {
+                    candidate++;
+                } while (!Qwen4IsPrime(candidate));
+                this->pleHeadVocabSizes.push_back(candidate);
+                this->pleHeadOffsets.push_back(offset);
+                offset += candidate;
+            }
         }
 
         this->weights.clear();
         this->biass.clear();
         this->preparedWeights = false;
+        this->ggufWeightsRestored = false;
         this->mtpWeightsStatus.store(-1, std::memory_order_release);
 
         for (int layer = 0; layer < this->block_cnt; layer++) {
+            if (ggufModel && !IsLinearAttentionLayer(layer)) {
+                const std::string indexer = languagePrefix + "layers." + std::to_string(layer) + ".self_attn.indexer.";
+                this->weightMergeRules.push_back(WeightMergeRule({WeightMergeRuleSingle(
+                    {indexer + "index_q_proj.weight", indexer + "index_k_proj.weight"},
+                    indexer + "index_qk_proj.weight", std::string("linear"))}));
+            }
             const std::string mlp = languagePrefix + "layers." +
                                     std::to_string(layer) + ".mlp.";
             const std::string sharedGate = mlp + "shared_expert.gate_proj.weight";
@@ -2907,7 +2944,82 @@ namespace fastllm {
         this->weight.weight.erase(kMtpPackedDownName);
     }
 
+    void Qwen4ExpModel::RestoreGgufWeights() {
+        if (ggufWeightsRestored || weight.dicts["gguf_architecture"] != "qwen4exp") return;
+        // GGUF's GDN value heads are tiled [value-within-group, key-head],
+        // while FastLLM uses the HF grouped order. Dense weights were imported
+        // as floating point; restore both row and column permutations once,
+        // before any TP split or CUDA upload of these projections.
+        const int perKey = num_v_heads / num_k_heads;
+        auto restoreRows = [&](Data &data, int offset, int headDim) {
+            AssertInFastLLM(data.dataDevice == DataDevice::CPU && data.cpuData &&
+                            !data.dims.empty() && offset >= 0 &&
+                            offset + num_v_heads * headDim <= data.dims[0],
+                            "Qwen4 GGUF GDN row layout is invalid.");
+            const size_t rowBytes = data.GetBytes() / data.dims[0];
+            const size_t headBytes = rowBytes * headDim;
+            std::vector<uint8_t> rows(num_v_heads * headBytes);
+            for (int head = 0; head < num_v_heads; head++) {
+                const int tiled = (head % perKey) * num_k_heads + head / perKey;
+                std::memcpy(rows.data() + head * headBytes,
+                    data.cpuData + offset * rowBytes + tiled * headBytes, headBytes);
+            }
+            std::memcpy(data.cpuData + offset * rowBytes, rows.data(), rows.size());
+        };
+        for (int layer = 0; layer < block_cnt; layer++) {
+            const std::string prefix = languagePrefix + "layers." + std::to_string(layer) + ".";
+            auto &gate = weight[prefix + "mlp.shared_expert_gate.weight"];
+            if (gate.dims.size() == 1) gate.Reshape({1, embed_dim});
+            if (layer == pleLayer) {
+                Data &conv = weight[prefix + "ple.conv1d.weight"];
+                AssertInFastLLM(conv.dims.size() == 2 && conv.dims[1] == pleConvKernel,
+                                "Qwen4 GGUF PLE convolution has an invalid layout.");
+                conv.Reshape({conv.dims[0], 1, conv.dims[1]});
+            }
+            if (!IsLinearAttentionLayer(layer)) continue;
+            const std::string linear = prefix + "linear_attn.";
+            auto get = [&](const char *suffix) -> Data & {
+                auto it = weight.weight.find(linear + suffix);
+                AssertInFastLLM(it != weight.weight.end() && it->second.isGGUFData,
+                                "Qwen4 GGUF GDN weight is missing: " + linear + suffix);
+                return it->second;
+            };
+            restoreRows(get("in_proj_qkv.weight"), 2 * num_k_heads * head_k_dim, head_v_dim);
+            restoreRows(get("in_proj_z.weight"), 0, head_v_dim);
+            restoreRows(get("in_proj_a.weight"), 0, 1);
+            restoreRows(get("in_proj_b.weight"), 0, 1);
+            restoreRows(get("conv1d.weight"), 2 * num_k_heads * head_k_dim, head_v_dim);
+            restoreRows(get("dt_bias"), 0, 1);
+            Data &a = get("A_log");
+            restoreRows(a, 0, 1);
+            AssertInFastLLM(a.dataType == DataType::FLOAT32, "Qwen4 GGUF ssm_a must be FP32.");
+            float *values = reinterpret_cast<float *>(a.cpuData);
+            for (uint64_t i = 0; i < a.Count(0); i++) {
+                AssertInFastLLM(std::isfinite(values[i]) && values[i] < 0,
+                                "Qwen4 GGUF ssm_a contains an invalid decay.");
+                values[i] = std::log(-values[i]);
+            }
+            Data &out = get("out_proj.weight");
+            AssertInFastLLM(out.dataType == DataType::FLOAT16 && out.cpuData &&
+                            out.dims.size() == 2 && out.dims[1] == num_v_heads * head_v_dim,
+                            "Qwen4 GGUF GDN output projection has an invalid layout.");
+            const size_t rowBytes = out.dims[1] * sizeof(uint16_t);
+            const size_t headBytes = head_v_dim * sizeof(uint16_t);
+            std::vector<uint8_t> row(rowBytes);
+            for (int r = 0; r < out.dims[0]; r++) {
+                uint8_t *source = out.cpuData + r * rowBytes;
+                for (int head = 0; head < num_v_heads; head++) {
+                    const int tiled = (head % perKey) * num_k_heads + head / perKey;
+                    std::memcpy(row.data() + head * headBytes, source + tiled * headBytes, headBytes);
+                }
+                std::memcpy(source, row.data(), rowBytes);
+            }
+        }
+        ggufWeightsRestored = true;
+    }
+
     void Qwen4ExpModel::OnModelWeightsLoaded() {
+        RestoreGgufWeights();
         if (this->ngramDevice != "disk") {
             if (MoeCudaCacheRequested()) {
                 PrepareWeights();
@@ -2952,6 +3064,16 @@ namespace fastllm {
             "Qwen4-Exp disk PLE table is too large for int32 row indices.\n");
 
         this->pleNgramDiskWeight.dataType = dataType;
+        if (dataType == DataType::DATA_GGUF_FORMAT) {
+            const Data &first = weight[embeddingPrefix + "shard_0.weight"];
+            AssertInFastLLM(ngramShardCount == 1 && first.ggmlTensor,
+                            "Qwen4 GGUF requires one contiguous PLE tensor.");
+            pleNgramDiskWeight.isGGUFData = true;
+            pleNgramDiskWeight.ggmlType = first.ggmlType;
+            if (pleNgramDiskWeight.ggmlTensor == nullptr) pleNgramDiskWeight.ggmlTensor = new ggml_tensor();
+            *static_cast<ggml_tensor *>(pleNgramDiskWeight.ggmlTensor) =
+                *static_cast<ggml_tensor *>(first.ggmlTensor);
+        }
         this->pleNgramDiskWeight.UpdateUnitSize();
         this->pleNgramDiskWeight.Resize(
             {(int)totalRows, this->ngramHeadDim});
@@ -3402,8 +3524,9 @@ namespace fastllm {
         Data &firstShard = this->weight[embeddingPrefix + "shard_0.weight"];
         const bool fp8Embedding = firstShard.dataType == DataType::FP8_E4M3;
         const bool bf16Embedding = firstShard.dataType == DataType::BFLOAT16;
+        const bool ggufEmbedding = firstShard.dataType == DataType::DATA_GGUF_FORMAT;
         const bool diskEmbedding = firstShard.isDiskWeight;
-        AssertInFastLLM((fp8Embedding || bf16Embedding) &&
+        AssertInFastLLM((fp8Embedding || bf16Embedding || ggufEmbedding) &&
                         firstShard.dims.size() == 2 &&
                         firstShard.dims[1] == this->ngramHeadDim,
                         "Qwen4-Exp PLE shard has an unexpected dtype or shape.");
@@ -3481,7 +3604,12 @@ namespace fastllm {
                     shard.ToDevice(DataDevice::CPU);
                     float *destination = embeddings.data() +
                         lookupIndex * this->ngramHeadDim;
-                    if (fp8Embedding) {
+                    if (ggufEmbedding) {
+                        const auto toFloat = ggml_type_to_float((ggml_type)shard.ggmlType);
+                        AssertInFastLLM(toFloat != nullptr, "Qwen4 GGUF PLE type cannot be decoded.");
+                        const size_t rowBytes = ggml_row_size((ggml_type)shard.ggmlType, ngramHeadDim);
+                        toFloat(shard.cpuData + shardRow * rowBytes, destination, ngramHeadDim);
+                    } else if (fp8Embedding) {
                         const uint8_t *source = shard.cpuData +
                             (size_t)shardRow * this->ngramHeadDim;
                         for (int column = 0; column < this->ngramHeadDim; column++) {
@@ -3528,14 +3656,16 @@ namespace fastllm {
             AssertInFastLLM(
                 diskValues.dataDevice == DataDevice::CPU &&
                     diskValues.cpuData != nullptr &&
-                    diskValues.dataType == firstShard.dataType &&
+                    diskValues.dataType == (ggufEmbedding ? DataType::FLOAT32 : firstShard.dataType) &&
                     diskValues.Count(0) ==
                         (uint64_t)diskRows.size() * this->ngramHeadDim,
                 "Qwen4-Exp disk PLE lookup returned an invalid tensor.");
 
             const size_t valueCount =
                 diskRows.size() * (size_t)this->ngramHeadDim;
-            if (fp8Embedding) {
+            if (ggufEmbedding) {
+                std::memcpy(embeddings.data(), diskValues.cpuData, valueCount * sizeof(float));
+            } else if (fp8Embedding) {
                 const uint8_t *source = diskValues.cpuData;
                 for (size_t i = 0; i < valueCount; i++) {
                     embeddings[i] =

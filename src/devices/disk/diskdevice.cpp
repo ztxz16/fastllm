@@ -637,6 +637,7 @@ namespace fastllm {
 
     static bool IsDiskEmbeddingStorageType(DataType type, bool direct) {
         return IsDiskFloatStorageType(type) ||
+               type == DataType::DATA_GGUF_FORMAT ||
                (direct && (type == DataType::FP8_E4M3 || type == DataType::INT8));
     }
 
@@ -1092,7 +1093,7 @@ namespace fastllm {
         Data &weight = *(datas.find("weight")->second);
         AssertInFastLLM(weight.dims.size() == 2 &&
                             IsDiskEmbeddingStorageType(weight.dataType, direct),
-                        "Disk Embedding expects a 2D floating-point weight.\n");
+                        "Disk Embedding expects a supported 2D weight.\n");
         AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
                         input.dataType == DataType::FLOAT16 ||
                         input.dataType == DataType::INT32,
@@ -1100,6 +1101,9 @@ namespace fastllm {
         std::vector<int> dims = input.dims;
         dims.push_back(weight.dims[1]);
         output.dataType = direct ? weight.dataType : input.dataType;
+        if (weight.dataType == DataType::DATA_GGUF_FORMAT) {
+            output.dataType = DataType::FLOAT32;
+        }
         if (!direct && weight.dataType == DataType::FLOAT16) {
             output.dataType = DataType::FLOAT16;
         }
@@ -1169,7 +1173,11 @@ namespace fastllm {
             }
 
             uint8_t *dst = output.cpuData + (size_t)i * outputRowBytes;
-            if (output.dataType == weight.dataType) {
+            if (weight.dataType == DataType::DATA_GGUF_FORMAT) {
+                const auto toFloat = ggml_type_to_float((ggml_type)weight.ggmlType);
+                AssertInFastLLM(toFloat != nullptr, "Disk Embedding GGUF type cannot be decoded.\n");
+                toFloat(targetRow.data(), reinterpret_cast<float *>(dst), columns);
+            } else if (output.dataType == weight.dataType) {
                 memcpy(dst, targetRow.data(), outputRowBytes);
             } else {
                 for (int column = 0; column < columns; column++) {

@@ -2071,6 +2071,63 @@ static void dequantize_row_q6_K_r4_cuda(const void * vx, dst_t * y, const int64_
     dequantize_block_q6_K_r4<<<nblocks, 128, 0, stream>>>(vx, y, n_per_row);
 }
 
+// CPU MoE kernels interleave four IQ rows and scramble the seven sign bits.
+// Decode that storage directly so NUMA GPU prefill can reuse the packed weights.
+static __device__ __forceinline__ uint8_t iq_r4_signs(uint8_t packed) {
+    const uint8_t original = (packed ^ (packed << 1)) & 127;
+    return ksigns_iq2xs[original];
+}
+
+template<typename dst_t, bool iq3>
+static __global__ void dequantize_block_iq_r4(const void * __restrict__ vx,
+                                              dst_t * __restrict__ output,
+                                              const int64_t n_per_row) {
+    const int64_t block = blockIdx.x;
+    const int row = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int ib = lane % 8;
+    const int il = lane / 8;
+    const int64_t blocksPerRow = n_per_row / QK_K;
+    dst_t *y = output + (block / blocksPerRow * 4 + row) * n_per_row +
+        block % blocksPerRow * QK_K + 32 * ib + 8 * il;
+    if constexpr (iq3) {
+        const block_iq3_xxs_r4 &x = static_cast<const block_iq3_xxs_r4 *>(vx)[block];
+        const uint8_t *sas = x.sas + 16 * ib + 4 * row;
+        const int scale = (sas[0] & 1) | ((sas[1] & 1) << 1) |
+                          ((sas[2] & 1) << 2) | ((sas[3] & 1) << 3);
+        const uint8_t signs = iq_r4_signs(sas[il] >> 1);
+        const uint8_t *qs = x.qs + 32 * ib + 8 * row + 2 * il;
+        const uint32_t grid0 = iq3xxs_grid[qs[0]], grid1 = iq3xxs_grid[qs[1]];
+        const float d = __half2float(x.d[row]) * (0.5f + scale) * 0.5f;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int q0 = (grid0 >> (8 * j)) & 255;
+            const int q1 = (grid1 >> (8 * j)) & 255;
+            y[j] = DequantizeCast<dst_t>::cast(d * q0 * ((signs & (1 << j)) ? -1.0f : 1.0f));
+            y[j + 4] = DequantizeCast<dst_t>::cast(d * q1 * ((signs & (1 << (j + 4))) ? -1.0f : 1.0f));
+        }
+    } else {
+        const block_iq2_xs_r4 &x = static_cast<const block_iq2_xs_r4 *>(vx)[block];
+        const uint16_t q2 = x.qs[16 * ib + 4 * row + il];
+        const uint64_t grid = iq2xs_grid[q2 & 511];
+        const uint8_t signs = iq_r4_signs(q2 >> 9);
+        const int scale = (x.scales[4 * ib + row] >> (4 * (il / 2))) & 15;
+        const float d = __half2float(x.d[row]) * (0.5f + scale) * 0.25f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int q = (grid >> (8 * j)) & 255;
+            y[j] = DequantizeCast<dst_t>::cast(d * q * ((signs & (1 << j)) ? -1.0f : 1.0f));
+        }
+    }
+}
+
+template<typename dst_t, bool iq3>
+static void dequantize_row_iq_r4_cuda(const void *vx, dst_t *y, const int64_t nrows,
+                                     const int64_t n_per_row, cudaStream_t stream) {
+    const int64_t blocks = nrows * n_per_row / (4 * QK_K);
+    dequantize_block_iq_r4<dst_t, iq3><<<blocks, 128, 0, stream>>>(vx, y, n_per_row);
+}
+
 static void *FastllmGGUFGetDequantWorkspace(size_t *workspaceBytes,
                                             const fastllm::Data &weight,
                                             const char *context) {
@@ -2086,6 +2143,10 @@ static void *FastllmGGUFGetDequantWorkspace(size_t *workspaceBytes,
 
 to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
     switch (type) {
+        case GGML_TYPE_IQ2_XS_R4:
+            return dequantize_row_iq_r4_cuda<float, false>;
+        case GGML_TYPE_IQ3_XXS_R4:
+            return dequantize_row_iq_r4_cuda<float, true>;
         case GGML_TYPE_Q4_0:
             return dequantize_row_q4_0_cuda;
         case GGML_TYPE_Q4_1:
@@ -2141,6 +2202,10 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
 
 to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
     switch (type) {
+        case GGML_TYPE_IQ2_XS_R4:
+            return dequantize_row_iq_r4_cuda<half, false>;
+        case GGML_TYPE_IQ3_XXS_R4:
+            return dequantize_row_iq_r4_cuda<half, true>;
         case GGML_TYPE_Q4_0:
             return dequantize_row_q4_0_cuda;
         case GGML_TYPE_Q4_1:
@@ -2251,6 +2316,10 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
 
 to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
     switch (type) {
+        case GGML_TYPE_IQ2_XS_R4:
+            return dequantize_row_iq_r4_cuda<__nv_bfloat16, false>;
+        case GGML_TYPE_IQ3_XXS_R4:
+            return dequantize_row_iq_r4_cuda<__nv_bfloat16, true>;
         case GGML_TYPE_Q4_0:
             return dequantize_row_q4_0_cuda;
         case GGML_TYPE_Q4_1:

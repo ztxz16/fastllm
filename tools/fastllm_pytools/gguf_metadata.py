@@ -151,6 +151,7 @@ _ARCHITECTURE_CONFIGS = {
     "qwen3_5": ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
     "qwen35moe": ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
     "qwen3_5_moe": ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
+    "qwen4exp": ("qwen4_exp", "Qwen4ExpForCausalLM"),
     "deepseek2": ("deepseek_v2", "DeepseekV2ForCausalLM"),
     "deepseek_v2": ("deepseek_v2", "DeepseekV2ForCausalLM"),
     "deepseek_v3": ("deepseek_v3", "DeepseekV3ForCausalLM"),

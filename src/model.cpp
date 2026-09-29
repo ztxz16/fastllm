@@ -3113,6 +3113,7 @@ namespace fastllm {
             {"qwen3moe", "qwen3_moe"}, {"qwen3_moe", "qwen3_moe"}, // qwen3_moe
             {"qwen35", "qwen3_5"}, {"qwen3_5", "qwen3_5"}, // qwen3.5
             {"qwen35moe", "qwen3_5_moe"}, {"qwen3_5_moe", "qwen3_5_moe"},
+            {"qwen4exp", "qwen4_exp"},
             {"glm4_moe", "glm4_moe"}, // glm4_moe
             {"glm-dsa", "glm_moe_dsa"}, {"glm_moe_dsa", "glm_moe_dsa"}, // glm_moe_dsa
             {"minimax_m2", "minimax_m2"}, // minimax_m2
@@ -3168,6 +3169,8 @@ namespace fastllm {
 
         AddGGUFDictIfMissing(model, "model_type",
                              ConvertGGUFTypeToFastllmType(arch));
+        AddGGUFDictIfMissing(model, "gguf_architecture",
+                             params["general.architecture"].string_value());
 
         auto addAlias = [&](const std::string &dictKey,
                             const std::string &ggufSuffix) {
@@ -3209,6 +3212,43 @@ namespace fastllm {
         };
         for (const auto &alias : aliases) {
             addAlias(alias.first, alias.second);
+        }
+
+        if (model->model_struct == "qwen4_exp") {
+            for (const auto &alias : std::vector<std::pair<std::string, std::string>>{
+                     {"hc_count", "hyper_connection.count"}, {"hc_lowrank", "hyper_connection.low_rank"},
+                     {"indexer_n_heads", "attention.indexer.head_count"},
+                     {"indexer_head_dim", "attention.indexer.key_length"},
+                     {"indexer_budget", "attention.indexer.top_k"},
+                     {"ngram_size", "ple.ngram_size"}, {"heads_per_ngram", "ple.heads_per_ngram"},
+                     {"ple_conv_kernel_size", "ple.conv_kernel"}, {"ple_eos_token_id", "ple.eos_token_id"},
+                     {"image_token_id", "ple.image_token_id"},
+                     {"ple_layer_multipliers", "ple.layer_multipliers"},
+                     {"ple_head_offsets", "ple.head_offsets"}, {"ple_head_vocab_sizes", "ple.head_vocab_sizes"}}) {
+                addAlias(alias.first, alias.second);
+            }
+            const auto pleLayers = GetGGUFArchParam(params, arch, "ple.layers").array_items();
+            AssertInFastLLM(pleLayers.size() == 1, "Qwen4 GGUF requires exactly one PLE layer.");
+            AddGGUFDictIfMissing(model, "ple_layer_ids", "[" + std::to_string(pleLayers[0].int_value() + 1) + "]");
+            AddGGUFDictIfMissing(model, "split_ngram_parts", "1");
+            const int heads = (GetGGUFArchParam(params, arch, "ple.ngram_size").int_value() - 1) *
+                GetGGUFArchParam(params, arch, "ple.heads_per_ngram").int_value();
+            AddGGUFDictIfMissing(model, "ple_embed_dim", std::to_string(heads *
+                GetGGUFArchParam(params, arch, "embedding_length_per_layer_input").int_value()));
+            const auto ratios = GetGGUFArchParam(params, arch, "attention.compress_ratios").array_items();
+            AssertInFastLLM(ratios.size() == (size_t)GetGGUFArchParam(params, arch, "block_count").int_value(),
+                            "Qwen4 GGUF attention layout is incomplete.");
+            std::vector<json11::Json> types;
+            int ratio = 0;
+            for (const auto &item : ratios) {
+                const int current = item.int_value();
+                AssertInFastLLM(current >= 0 && (current == 0 || ratio == 0 || current == ratio),
+                                "Qwen4 GGUF has incompatible QSA compression ratios.");
+                if (current > 0) ratio = current;
+                types.emplace_back(current == 0 ? "linear_attention" : "full_attention");
+            }
+            AddGGUFDictIfMissing(model, "layer_types", json11::Json(types).dump());
+            if (ratio > 0) AddGGUFDictIfMissing(model, "indexer_compress_ratio", std::to_string(ratio));
         }
 
         int blockCount = GetGGUFArchParam(params, arch, "block_count").int_value();
@@ -3953,6 +3993,13 @@ namespace fastllm {
         }
         uint64_t totalLoadBytes = 0;
         for (int i = 0; i < readGGUFTasks.size(); i++) {
+            if (model->model_struct == "qwen4_exp" &&
+                readGGUFTasks[i].name == "model.language_model.ple_embedding.weight") {
+                const auto layers = GetGGUFArchParam(params, arch, "ple.layers").array_items();
+                readGGUFTasks[i].name = "model.language_model.layers." +
+                    std::to_string(layers[0].int_value()) + ".ple.ple_embedding.ngram_embedding.shard_0.weight";
+                model->ngramWeights.insert(readGGUFTasks[i].name);
+            }
             bool isEmbeddedMtpTask = false;
             if (arch == "qwen3_5") {
                 isEmbeddedMtpTask = RemapQwen35GGUFMtpTask(
@@ -4112,9 +4159,11 @@ namespace fastllm {
                         if (readGGUFTaskDict.find(weightName) != readGGUFTaskDict.end()) {
                             auto *task = readGGUFTaskDict[weightName];
                             tensorBytes = ggml_nbytes(&task->tensor);
-                            if (IsDiskMoeWeight(model, weightName) &&
+                            const WeightType diskType = GetDiskLazyWeightType(model, weightName, tensorBytes);
+                            if (diskType != WeightType::NONE &&
                                 task->replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceDirect) {
                                 SetDiskGGUFWeightMeta(*task->weight, task->tensor, task->fileName, task->offset);
+                                task->weight->weightType = diskType;
                             } else {
                                 WeightImportGGUFTensor(task->weight, &task->tensor, task->fileName,
                                                        task->offset, task->replaceType);

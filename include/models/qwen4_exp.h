@@ -75,6 +75,7 @@ namespace fastllm {
 
     private:
         friend struct Qwen4PrefixCacheTestAccess;
+        friend struct Qwen4GGUFTestAccess;
         struct PrefixSnapshot;
         struct DecodeCudaGraphState;
         struct PleStagingState;
@@ -310,6 +311,8 @@ namespace fastllm {
         std::vector<float> visionImageStd = {0.5f, 0.5f, 0.5f};
 
         bool preparedWeights = false;
+        bool ggufWeightsRestored = false;
+        void RestoreGgufWeights();
         std::atomic<int> mtpWeightsStatus{-1};
         std::mutex prepareMutex;
         mutable std::mutex stateMutex;

@@ -2,8 +2,62 @@
 #include "executor.h"
 
 namespace fastllm {
+    static std::vector<GGUFWeightReplaceRule> Qwen4GGUFWeightRules() {
+        using Rule = GGUFWeightReplaceRule;
+        const std::string base = "model.language_model.";
+        const std::string layer = base + "layers.$1.";
+        std::vector<Rule> rules;
+        auto add = [&](const std::string &pattern, const std::string &name,
+                       Rule::GGUFWeightReplaceType type = Rule::GGUFWeightReplaceForceFP16) {
+            rules.emplace_back(std::regex("^" + pattern + "$"), name, type);
+        };
+        // Keep the large expert and PLE tensors packed. Dense projections are
+        // imported as FP16 so GDN column permutations and TP splitting do not
+        // requantize independently quantized GGUF blocks.
+        add(R"(token_embd\.weight)", base + "embed_tokens.weight", Rule::GGUFWeightReplaceForceFP32);
+        add(R"(output\.weight)", "lm_head.weight");
+        add(R"(per_layer_token_embd\.weight)", base + "ple_embedding.weight", Rule::GGUFWeightReplaceDirect);
+        add(R"(output_hc_norm\.weight)", base + "hyper_connection_mixer.hc_norm.weight", Rule::GGUFWeightReplaceForceFP32);
+        for (const auto &kind : {"down", "up"}) {
+            add("output_hc_" + std::string(kind) + R"(\.weight)",
+                base + "hyper_connection_mixer.input_mix_weight_" + kind + ".weight");
+        }
+        for (const auto &connection : {std::pair<std::string, std::string>{"attn", "attn_hyper_connection"},
+                                      {"ffn", "mlp_hyper_connection"}}) {
+            const std::string source = R"(blk\.(\d+)\.hc_)" + connection.first;
+            const std::string target = layer + connection.second + ".";
+            add(source + R"(_norm\.weight)", target + "hc_norm.weight", Rule::GGUFWeightReplaceForceFP32);
+            add(source + R"(_(down|up)\.weight)", target + "input_mix_weight_$2.weight");
+            add(source + R"(_inject\.weight)", target + "block_inject_weight.weight");
+        }
+        add(R"(blk\.(\d+)\.attn_(q|k|v)\.weight)", layer + "self_attn.$2_proj.weight");
+        add(R"(blk\.(\d+)\.attn_output\.weight)", layer + "self_attn.o_proj.weight");
+        add(R"(blk\.(\d+)\.attn_(q|k)_norm\.weight)", layer + "self_attn.$2_norm.weight", Rule::GGUFWeightReplaceForceFP32);
+        add(R"(blk\.(\d+)\.indexer\.(q|k)_proj\.weight)", layer + "self_attn.indexer.index_$2_proj.weight");
+        add(R"(blk\.(\d+)\.indexer\.(q|k)_norm\.weight)", layer + "self_attn.indexer.$2_layernorm.weight", Rule::GGUFWeightReplaceForceFP32);
+        add(R"(blk\.(\d+)\.attn_qkv\.weight)", layer + "linear_attn.in_proj_qkv.weight");
+        add(R"(blk\.(\d+)\.attn_gate\.weight)", layer + "linear_attn.in_proj_z.weight");
+        add(R"(blk\.(\d+)\.ssm_beta\.weight)", layer + "linear_attn.in_proj_b.weight");
+        add(R"(blk\.(\d+)\.ssm_alpha\.weight)", layer + "linear_attn.in_proj_a.weight");
+        add(R"(blk\.(\d+)\.ssm_out\.weight)", layer + "linear_attn.out_proj.weight");
+        add(R"(blk\.(\d+)\.ssm_conv1d\.weight)", layer + "linear_attn.conv1d.weight", Rule::GGUFWeightReplaceForceFP32);
+        add(R"(blk\.(\d+)\.ssm_a)", layer + "linear_attn.A_log", Rule::GGUFWeightReplaceForceFP32);
+        add(R"(blk\.(\d+)\.ssm_dt\.bias)", layer + "linear_attn.dt_bias", Rule::GGUFWeightReplaceForceFP32);
+        add(R"(blk\.(\d+)\.ssm_norm\.weight)", layer + "linear_attn.norm.weight", Rule::GGUFWeightReplaceForceFP32);
+        add(R"(blk\.(\d+)\.ffn_gate_inp\.weight)", layer + "mlp.gate.weight");
+        add(R"(blk\.(\d+)\.ffn_gate_inp_shexp\.weight)", layer + "mlp.shared_expert_gate.weight");
+        add(R"(blk\.(\d+)\.ffn_(gate|up|down)_shexp\.weight)", layer + "mlp.shared_expert.$2_proj.weight");
+        rules.emplace_back(std::regex(R"(^blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$)"),
+            std::vector<std::string>{layer + "mlp.experts.", ".$2_proj.weight"}, Rule::GGUFWeightReplacePacked);
+        add(R"(blk\.(\d+)\.ple_(key|value)\.weight)", layer + "ple.$2_proj.weight");
+        add(R"(blk\.(\d+)\.ple_norm_(key|query|conv)\.weight)", layer + "ple.norm_$2.weight", Rule::GGUFWeightReplaceForceFP32);
+        add(R"(blk\.(\d+)\.ple_conv1d\.weight)", layer + "ple.conv1d.weight", Rule::GGUFWeightReplaceForceFP32);
+        return rules;
+    }
+
     std::vector <GGUFWeightReplaceRule> GetGGUFWeightReplaceRules(const std::string &arch) {
         static std::map <std::string, std::vector <GGUFWeightReplaceRule> > originalArchRulesDict = {
+            {"qwen4_exp", Qwen4GGUFWeightRules()},
             {
                 "default", 
                 {

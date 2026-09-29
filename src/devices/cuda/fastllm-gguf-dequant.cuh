@@ -21,7 +21,8 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type);
 
 inline bool FastllmGGUFIsR4Type(ggml_type type) {
     return type == GGML_TYPE_Q2_K_R4 || type == GGML_TYPE_Q4_K_R4 ||
-           type == GGML_TYPE_Q5_K_R4 || type == GGML_TYPE_Q6_K_R4;
+           type == GGML_TYPE_Q5_K_R4 || type == GGML_TYPE_Q6_K_R4 ||
+           type == GGML_TYPE_IQ2_XS_R4 || type == GGML_TYPE_IQ3_XXS_R4;
 }
 
 inline size_t FastllmGGUFAlignBytes(size_t bytes) {
