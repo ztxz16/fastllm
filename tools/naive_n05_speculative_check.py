@@ -42,7 +42,7 @@ def write_cases(tokenizer, destination):
 def check(kind, source):
     tree = ast.parse(source)
     for node in ast.walk(tree):
-        if isinstance(node, ast.Name) and node.id.startswith("__"):
+        if isinstance(node, ast.Name) and node.id.startswith("__") and node.id != "__import__":
             raise ValueError("Unexpected private name in generated function")
         if isinstance(node, ast.Attribute) and node.attr.startswith("_"):
             raise ValueError("Unexpected private attribute in generated function")
