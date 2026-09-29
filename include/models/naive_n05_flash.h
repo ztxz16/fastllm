@@ -2,11 +2,13 @@
 #define FASTLLM_NAIVE_N05_FLASH_H
 
 #include "basellm.h"
+#include <memory>
 
 namespace fastllm {
     class NaiveN05FlashModel : public basellm {
     public:
         NaiveN05FlashModel();
+        ~NaiveN05FlashModel() override;
         void InitParams() override;
         std::map<std::string, std::vector<std::pair<std::string, DataType>>>
         GetTensorMap(const std::vector<std::string> &names) override;
@@ -17,9 +19,14 @@ namespace fastllm {
                     const LastTokensManager &lastTokens = LastTokensManager(),
                     std::vector<float> *logits = nullptr) override;
         bool NeedAttentionMask(int, int) override { return false; }
-        // Sliding caches contain an absolute suffix; the generic prefix cache
-        // cannot restore them. All DSA state lives in the ordinary KV tensors.
+        // The history archive also retains keys discarded by sliding attention.
         bool UseGenericHistoryCache() const override { return false; }
+        bool TryRestoreHistoryCache(std::vector<int> &tokens, int &cacheLen) override;
+        void TryRecordResponseContext(ResponseContext *context) override;
+        void OnResponseContextCreated(ResponseContext *context) override;
+        void OnResponseContextRemoved(ResponseContext *context) override;
+        bool SetSaveHistoryChat(bool save) override;
+        void AddPromptCache(const std::vector<int> &tokens) override;
         int GetKVCacheRetainedTokens(int layer) const override;
         void WarmUp() override;
         std::string MakeInput(const std::string &history, int,
@@ -28,7 +35,42 @@ namespace fastllm {
                                 const std::string &input,
                                 const std::string &output) override { return history + input + output; }
 
+    protected:
+        struct HistoryChunk {
+            int length = 0;
+            size_t bytes = 0;
+            std::vector<std::pair<Data, Data>> layers;
+        };
+        std::shared_ptr<HistoryChunk> BeginHistoryChunk(
+            const std::vector<std::pair<Data, Data>> &kv, int past, int length);
+        static void CopyHistoryTensor(const Data &source, Data &target, int length);
+        void FinishHistoryChunk(const std::vector<std::pair<Data, Data>> &kv,
+                                const std::shared_ptr<HistoryChunk> &chunk);
+
     private:
+        struct HistorySpan {
+            std::shared_ptr<const HistoryChunk> chunk;
+            int length;
+        };
+        struct HistoryMemory {
+            std::vector<int> tokens;
+            std::vector<HistorySpan> spans;
+            int length = 0;
+            size_t bytes = 0;
+        };
+        // Archives use host memory, never a second persistent GPU KV copy.
+        // An active request may build one additional archive of this size.
+        static constexpr size_t historyByteLimit = 1ULL << 30;
+        static constexpr size_t historyRecordLimit = 5;
+        size_t historyBytesPerToken = 0;
+        std::mutex historyMutex;
+        // Oldest first; completed records and their chunks are immutable.
+        std::vector<std::shared_ptr<const HistoryMemory>> history;
+        // LaunchResponseTokens holds dictLocker across lookup and creation.
+        std::shared_ptr<const HistoryMemory> pendingHistory;
+        std::map<const std::vector<std::pair<Data, Data>> *,
+                 HistoryMemory> activeHistory;
+
         struct AttentionConfig {
             int heads, kvHeads, headDim, valueDim;
             float theta;

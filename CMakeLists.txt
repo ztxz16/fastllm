@@ -209,7 +209,7 @@ set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/context
         src/devices/disk/diskdevice.cpp
         src/models/graphllm.cpp src/models/chatglm.cpp src/models/moss.cpp src/models/llama.cpp src/models/qwen.cpp src/models/basellm.cpp
         src/models/glm.cpp src/models/minicpm.cpp src/models/minicpm3.cpp src/models/internlm2.cpp src/models/bert.cpp src/models/moe.cpp src/models/deepseekv2.cpp src/models/deepseekv4.cpp src/models/deepseekv41.cpp src/models/deepseekv41_vision.cpp src/models/deepseekv41_dspark.cpp src/models/dots3_note.cpp
-        src/models/phi3.cpp src/models/xlmroberta.cpp src/models/cogvlm.cpp src/models/qwen3.cpp src/models/qwen3_moe.cpp src/models/hy_v3.cpp src/models/qwen3_next.cpp src/models/qwen4_exp.cpp src/models/kimi_k3.cpp src/models/naive_n05_flash.cpp
+        src/models/phi3.cpp src/models/xlmroberta.cpp src/models/cogvlm.cpp src/models/qwen3.cpp src/models/qwen3_moe.cpp src/models/hy_v3.cpp src/models/qwen3_next.cpp src/models/qwen4_exp.cpp src/models/kimi_k3.cpp src/models/naive_n05_flash.cpp src/models/naive_n05_history.cpp
         src/models/minimax.cpp src/models/hunyuan.cpp
         src/models/ernie4_5.cpp src/models/pangu_moe.cpp src/models/glm4_moe.cpp src/models/glm5_moe_dsa.cpp src/models/glm5_next.cpp src/models/gpt_oss.cpp
         src/models/minimax_m2.cpp src/models/qwen2.cpp src/models/qwen3_5.cpp src/models/gemma4.cpp src/models/step3p5.cpp src/models/laguna.cpp
@@ -748,6 +748,11 @@ if (UNIT_TEST)
     add_executable(multimodal_history_cache_test test/basic/test_multimodal_history_cache.cpp)
     target_link_libraries(multimodal_history_cache_test PRIVATE fastllm)
     add_test(NAME multimodal_history_cache COMMAND multimodal_history_cache_test)
+
+    add_executable(naive_n05_history_test test/basic/test_naive_n05_history.cpp)
+    target_link_libraries(naive_n05_history_test PRIVATE fastllm)
+    add_test(NAME naive_n05_history COMMAND naive_n05_history_test)
+    set_tests_properties(naive_n05_history PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
 
     add_executable(qwen4_multimodal_cache_test test/basic/test_qwen4_multimodal_cache.cpp)
     target_link_libraries(qwen4_multimodal_cache_test PRIVATE fastllm)

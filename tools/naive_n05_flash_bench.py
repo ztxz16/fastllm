@@ -5,6 +5,7 @@ Uses normal ftllm model arguments, plus --bench-input-ids / --bench-report.
 Run under nsys with --capture-range=cudaProfilerApi and --bench-profile to
 exclude loading and warmup. Ordinary speed measurements should run without
 nsys, --bench-profile, FASTLLM_PRINT_PROFILE or FASTLLM_PROFILE_NUMAS_MOE.
+History reuse is disabled by default; pass --cache_history true to measure hits.
 """
 import ctypes
 import datetime
@@ -20,6 +21,7 @@ def main():
     from ftllm.util import make_normal_parser, make_normal_llm_model
 
     parser = make_normal_parser(__doc__)
+    parser.set_defaults(cache_history="false")
     parser.add_argument('--bench-input-ids', required=True)
     parser.add_argument('--bench-report', required=True)
     parser.add_argument('--bench-output-tokens', type=int, default=32)
@@ -59,6 +61,7 @@ def main():
         handle = llm.fastllm_lib.launch_response_llm_model(
             model.model, len(ids), (ctypes.c_int * len(ids))(*ids),
             tokens, 0, False, 1.0, 1, 1.0, 1.0, False, 0, None)
+        cache = model.get_response_statistics(handle)
         generated, times = [], []
         while True:
             token = llm.fastllm_lib.fetch_response_llm_model(model.model, handle)
@@ -74,6 +77,8 @@ def main():
             'input_tokens_per_ttft_second': len(ids) / times[0] if times else None,
             'decode_tokens_per_second': len(intervals) / sum(intervals) if intervals else None,
             'median_inter_token_seconds': statistics.median(intervals) if intervals else None,
+            'cached_input_tokens': cache['cached_input_tokens'] if cache else 0,
+            'missed_input_tokens': cache['missed_input_tokens'] if cache else len(ids),
         }
         report['runs'].append(result)
         destination.write_text(json.dumps(report, indent=2) + '\n')

@@ -3124,7 +3124,7 @@ class model:
         fastllm_lib.release_memory(self.model)
     
     def set_save_history(self, save: bool):
-        self.save_history = True
+        self.save_history = bool(save)
         fastllm_lib.set_save_history(self.model, save)
 
     def set_atype(self, atype: str):

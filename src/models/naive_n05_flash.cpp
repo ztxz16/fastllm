@@ -67,6 +67,10 @@ NaiveN05FlashModel::NaiveN05FlashModel() {
     };
 }
 
+NaiveN05FlashModel::~NaiveN05FlashModel() {
+    ShutdownRuntime();
+}
+
 void NaiveN05FlashModel::InitParams() {
     basellm::InitParams();
     auto number = [&](const std::string &name, float fallback) {
@@ -100,6 +104,12 @@ void NaiveN05FlashModel::InitParams() {
     norm_topk_prob = weight.dicts["norm_topk_prob"] != "false";
     max_positions = number("max_position_embeddings", 1048576);
     indexFp8 = weight.dicts["indexer_activation_dtype"] != "bf16";
+    historyBytesPerToken = 0;
+    for (int layer = 0; layer < block_cnt; ++layer) {
+        const auto &cfg = slidingLayers[layer] ? sliding : full;
+        historyBytesPerToken += sizeof(uint16_t) *
+            (cfg.kvHeads * (cfg.headDim + cfg.valueDim) + (slidingLayers[layer] ? 0 : indexDim));
+    }
     AssertInFastLLM(window > 0 && indexDim == 128 && indexTopK > 0 &&
                     full.heads % full.kvHeads == 0 && sliding.heads % sliding.kvHeads == 0 &&
                     (int)(full.headDim * partialRotary) <= indexDim &&
@@ -158,6 +168,7 @@ int NaiveN05FlashModel::Forward(
                     "Naive-N0.5 expects one unpadded sequence and a complete KV cache.");
     int length = inputIds.dims[1];
     int pastLength = pastKeyValues[0].first.dims.empty() ? 0 : pastKeyValues[0].first.dims[1];
+    auto historyChunk = BeginHistoryChunk(pastKeyValues, pastLength, length);
     AssertInFastLLM(!slidingLayers[0] && pastLength + length <= max_positions,
                     "Naive-N0.5 requires a DSA first layer and input within the context window.");
     if (moeWeights.empty()) {
@@ -215,6 +226,10 @@ int NaiveN05FlashModel::Forward(
             Cat(k, indexKey, 2, packed);
         } else {
             packed.CopyFrom(k);
+        }
+        if (historyChunk) {
+            CopyHistoryTensor(packed, historyChunk->layers[layer].first, historyChunk->length);
+            CopyHistoryTensor(v, historyChunk->layers[layer].second, historyChunk->length);
         }
         auto &pastKey = pastKeyValues[layer].first;
         auto &pastValue = pastKeyValues[layer].second;
@@ -293,6 +308,7 @@ int NaiveN05FlashModel::Forward(
             AddTo(hidden, moeOutput);
         }
     }
+    FinishHistoryChunk(pastKeyValues, historyChunk);
     if (isIntermediateChunkedPrefill) return 0;
     Data last, logits, top;
     Split(hidden, 1, length - 1, length, last);
