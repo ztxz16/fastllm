@@ -1174,9 +1174,16 @@ def try_load_hf_tokenizer(path):
             # 2. 完全禁止所有 logging 输出
             logging.disable(logging.CRITICAL)  # 禁用所有日志（包括 ERROR, WARNING, INFO, DEBUG）
             from transformers import AutoTokenizer
-            ret = AutoTokenizer.from_pretrained(
-                path, trust_remote_code = True,
-                **_hf_tokenizer_compat_kwargs(path))
+            compat_kwargs = _hf_tokenizer_compat_kwargs(path)
+            try:
+                ret = AutoTokenizer.from_pretrained(
+                    path, trust_remote_code = True, **compat_kwargs)
+            except TypeError as error:
+                # Newer Qwen2 tokenizers already supply this keyword to their
+                # backend. Retry without our compatibility override.
+                if "fix_mistral_regex" not in compat_kwargs or "multiple values" not in str(error) or "fix_mistral_regex" not in str(error):
+                    raise
+                ret = AutoTokenizer.from_pretrained(path, trust_remote_code = True)
         finally:
             logging.disable(original_level)  # 恢复原来的日志级别
             if original_use_torch is None:

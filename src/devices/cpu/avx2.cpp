@@ -368,19 +368,67 @@ namespace fastllm {
         return true;
     }
 
+#ifdef __AVX2__
+    static inline __m256 FP8E4M3ToFloat_AVX2(__m128i bytes) {
+        const __m256i words = _mm256_cvtepu8_epi32(bytes);
+        const __m256i magnitude = _mm256_and_si256(words, _mm256_set1_epi32(0x7f));
+        const __m256i sign = _mm256_slli_epi32(
+            _mm256_and_si256(words, _mm256_set1_epi32(0x80)), 24);
+        const __m256 normal = _mm256_castsi256_ps(_mm256_add_epi32(
+            _mm256_slli_epi32(magnitude, 20), _mm256_set1_epi32(120 << 23)));
+        const __m256 subnormal = _mm256_mul_ps(_mm256_cvtepi32_ps(magnitude), _mm256_set1_ps(1.0f / 512));
+        const __m256 tiny = _mm256_castsi256_ps(_mm256_cmpgt_epi32(_mm256_set1_epi32(8), magnitude));
+        return _mm256_or_ps(_mm256_blendv_ps(normal, subnormal, tiny), _mm256_castsi256_ps(sign));
+    }
+#endif
+
+    bool FastllmGemmFP8Block128_AVX2(
+            const void *A, long lda, const void *B, long ldb, void *C, long ldc,
+            int n, int m, int st, int end) {
+#ifdef __AVX2__
+        if (m % 8 != 0) return false;
+        for (int row = 0; row < n; row++) {
+            float *out = (float *)((uint8_t *)C + (size_t)row * ldc);
+            for (int col = st; col < end; col++) {
+                float sum = 0;
+                for (int start = 0; start < m; start += 128) {
+                    const uint8_t *a = (const uint8_t *)A + (size_t)row * lda + (start / 128) * 132;
+                    const uint8_t *b = (const uint8_t *)B + (size_t)col * ldb + (start / 128) * 132;
+                    int count = std::min(128, m - start);
+                    __m256 accum = _mm256_setzero_ps();
+                    for (int c = 0; c < count; c += 8) {
+                        __m256 va = FP8E4M3ToFloat_AVX2(_mm_loadl_epi64((const __m128i *)(a + c)));
+                        __m256 vb = FP8E4M3ToFloat_AVX2(_mm_loadl_epi64((const __m128i *)(b + c)));
+                        accum = _mm256_fmadd_ps(va, vb, accum);
+                    }
+                    __m128 half = _mm_add_ps(_mm256_castps256_ps128(accum), _mm256_extractf128_ps(accum, 1));
+                    half = _mm_hadd_ps(half, half);
+                    half = _mm_hadd_ps(half, half);
+                    float dot = _mm_cvtss_f32(half);
+                    float as, bs;
+                    std::memcpy(&as, a + count, sizeof(as));
+                    std::memcpy(&bs, b + count, sizeof(bs));
+                    sum += (dot * as) * bs;
+                }
+                out[col] = sum;
+            }
+        }
+        return true;
+#else
+        return false;
+#endif
+    }
+
     bool LinearBFloat16_FP8E4M3BLOCK128_AVX2_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
                         int n, int m, int k, int st, int end) {
 #ifdef __AVX2__
         static int block_size = 128;
         size_t perRow = GetDataBytes(DataType::FP8_E4M3_BLOCK_128, 1, m);
-        float magicScale = pow(2, 120);
         
         for (int i = 0; i < n; i++) {
             uint16_t *bf16A = inputData + i * m;
             float *floatC = outputData + i * k;
             int j = st;
-            __m128i v_a_mask_byte = _mm_set1_epi8(0x80); 
-            __m128i v_b_mask_byte = _mm_set1_epi8(0x7F); 
             
             for (; j < end; j++) {
                 float now = 0.0f;
@@ -429,34 +477,9 @@ namespace fastllm {
                         // 2. Load 16 FP8 weights from current block
                         __m128i va_bytes = _mm_loadu_si128((__m128i*)(fp8B + (l - blockStart)));
                         
-                        // Extract sign and mantissa for FP8 conversion
-                        __m128i va_masked_bytes = _mm_and_si128(va_bytes, v_a_mask_byte);
-                        __m128i vb_masked_bytes = _mm_and_si128(va_bytes, v_b_mask_byte);
-                        
-                        // Convert to 16-bit for BF16 format
-                        // Low 8 bytes
-                        __m128i va_low_bytes = _mm_unpacklo_epi8(va_masked_bytes, _mm_setzero_si128());
-                        __m128i vb_low_bytes = _mm_unpacklo_epi8(vb_masked_bytes, _mm_setzero_si128());
-                        __m128i v_a_term_low = _mm_slli_epi16(va_low_bytes, 8);
-                        __m128i v_b_term_low = _mm_slli_epi16(vb_low_bytes, 4);
-                        __m128i v_result_low = _mm_or_si128(v_a_term_low, v_b_term_low);
-                        
-                        // High 8 bytes
-                        __m128i va_high_bytes = _mm_unpackhi_epi8(va_masked_bytes, _mm_setzero_si128());
-                        __m128i vb_high_bytes = _mm_unpackhi_epi8(vb_masked_bytes, _mm_setzero_si128());
-                        __m128i v_a_term_high = _mm_slli_epi16(va_high_bytes, 8);
-                        __m128i v_b_term_high = _mm_slli_epi16(vb_high_bytes, 4);
-                        __m128i v_result_high = _mm_or_si128(v_a_term_high, v_b_term_high);
-                        
-                        // Convert BF16 weights to float32
-                        __m256i v_weight_low_32 = _mm256_cvtepu16_epi32(v_result_low);
-                        __m256i v_weight_low_shifted = _mm256_slli_epi32(v_weight_low_32, 16);
-                        __m256 v_weight_float_low = _mm256_castsi256_ps(v_weight_low_shifted);
-                        
-                        __m256i v_weight_high_32 = _mm256_cvtepu16_epi32(v_result_high);
-                        __m256i v_weight_high_shifted = _mm256_slli_epi32(v_weight_high_32, 16);
-                        __m256 v_weight_float_high = _mm256_castsi256_ps(v_weight_high_shifted);
-                        
+                        __m256 v_weight_float_low = FP8E4M3ToFloat_AVX2(va_bytes);
+                        __m256 v_weight_float_high = FP8E4M3ToFloat_AVX2(_mm_srli_si128(va_bytes, 8));
+
                         // 3. Compute dot product: multiply and accumulate
                         __m256 v_mul_low = _mm256_mul_ps(v_input_float_low, v_weight_float_low);
                         __m256 v_mul_high = _mm256_mul_ps(v_input_float_high, v_weight_float_high);
@@ -473,14 +496,13 @@ namespace fastllm {
                         
                         // Convert FP8 weight to BF16 then to float
                         uint8_t fp8_val = fp8B[l - blockStart];
-                        uint16_t sign_and_exp = (fp8_val & 0x80) << 8;
-                        uint16_t mantissa = (fp8_val & 0x7F) << 4;
-                        uint16_t bf16_val = sign_and_exp | mantissa;
-                        uint32_t weight_val = ((uint32_t)bf16_val) << 16;
-                        float weight_float = *((float*)&weight_val);
-                        
-                        // Accumulate
-                        now += input_float * weight_float;
+                        int exponent = (fp8_val >> 3) & 15, mantissa = fp8_val & 7;
+                        float weight_float = exponent ? std::ldexp(1.0f + mantissa / 8.0f, exponent - 7)
+                                                      : mantissa / 512.0f;
+                        if (fp8_val & 0x80) weight_float = -weight_float;
+                        float scale;
+                        std::memcpy(&scale, fp8B + blockM, sizeof(scale));
+                        now += input_float * weight_float * scale;
                     }
                     
                     float curScale = *(float*)(fp8B + blockM);  // scale在128个FP8之后
@@ -495,7 +517,7 @@ namespace fastllm {
                 sum_128 = _mm_hadd_ps(sum_128, sum_128);
                 sum_128 = _mm_hadd_ps(sum_128, sum_128);
                 
-                now += _mm_cvtss_f32(sum_128) * magicScale;
+                now += _mm_cvtss_f32(sum_128);
                 floatC[j] = now;
             }
         }

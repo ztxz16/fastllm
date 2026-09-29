@@ -669,7 +669,8 @@ extern "C" {
 #else
             if (model->model_type == "laguna" ||
                 model->model_type == "kimi_k3" ||
-                model->model_type == "dots3_note") {
+                model->model_type == "dots3_note" ||
+                model->model_type == "naive_n05_flash") {
                 // Laguna's late-layer activations exceed the finite FP16
                 // range, while Kimi-K3's dedicated CUDA kernels and the
                 // Dots3-Note reference path consume BF16. Preserve BF16 in

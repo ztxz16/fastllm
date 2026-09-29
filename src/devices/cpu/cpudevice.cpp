@@ -1993,6 +1993,31 @@ namespace fastllm {
         int st, int end, // calc C[0 : n, st : end]
         DataType AType, DataType BType, DataType CType
     ) {
+        if (AType == DataType::FP8_E4M3_BLOCK_128 && BType == AType && CType == DataType::FLOAT32) {
+            if (cpuInstructInfo.hasAVX512BF16 && FastllmGemmFP8Block128_AVX512BF16(
+                    A, lda, B, ldb, C, ldc, n, m, st, end)) return;
+            if (cpuInstructInfo.hasAVX2 && FastllmGemmFP8Block128_AVX2(
+                    A, lda, B, ldb, C, ldc, n, m, st, end)) return;
+            for (int row = 0; row < n; row++) {
+                float *out = (float *)((uint8_t *)C + (size_t)row * ldc);
+                for (int col = st; col < end; col++) {
+                    float sum = 0;
+                    for (int start = 0; start < m; start += 128) {
+                        const uint8_t *a = (const uint8_t *)A + (size_t)row * lda + (start / 128) * 132;
+                        const uint8_t *b = (const uint8_t *)B + (size_t)col * ldb + (start / 128) * 132;
+                        int count = std::min(128, m - start);
+                        float dot = 0, as, bs;
+                        for (int c = 0; c < count; c++)
+                            dot += fp8e4m3tofp32.dict[a[c]] * fp8e4m3tofp32.dict[b[c]];
+                        memcpy(&as, a + count, sizeof(as));
+                        memcpy(&bs, b + count, sizeof(bs));
+                        sum += (dot * as) * bs;
+                    }
+                    out[col] = sum;
+                }
+            }
+            return;
+        }
         bool finish = false;
 // printf("into fastllm gemm %s %s %s\n", GetDataTypeName(AType).c_str(), GetDataTypeName(BType).c_str(), GetDataTypeName(CType).c_str());
         if (AType >= DataType::DATA_GGUF_FORMAT && AType < DataType::DATA_GGUF_FORMAT_END) {

@@ -38,6 +38,7 @@
 #include "deepseekv4.h"
 #include "deepseekv41.h"
 #include "dots3_note.h"
+#include "naive_n05_flash.h"
 #include "glm5_moe_dsa.h"
 #include "glm5_next.h"
 #include "qwen.h"
@@ -933,6 +934,8 @@ namespace fastllm {
         } else if (modelType == "deepseek_v41" || modelType == "deepseek_v41_text") {
             model = (basellm*)(new DeepSeekV41Model());
             model->model_type = modelType;
+        } else if (modelType == "naive_n05_flash") {
+            model = new NaiveN05FlashModel();
         } else if (modelType == "dots3_note") {
             model = (basellm*)(new Dots3NoteModel());
         } else if (modelType == "qwen2") {
@@ -4561,7 +4564,28 @@ namespace fastllm {
         std::string stIndexFile = path + "model.safetensors.index.json";
         std::string error;
         if (!FileExists(stIndexFile)) {
-            stFiles.insert(path + "model.safetensors");
+            if (FileExists(path + "model.safetensors")) {
+                stFiles.insert(path + "model.safetensors");
+            } else {
+                // Some checkpoints ship all numbered shards without an index.
+                // Accept only a complete, unambiguous canonical shard set.
+                std::regex shardPattern(R"(^model-(\d{5})-of-(\d{5})\.safetensors$)");
+                int shardCount = 0;
+                for (const auto &entry : fs::directory_iterator(modelPath)) {
+                    std::smatch match;
+                    std::string name = entry.path().filename().string();
+                    if (!fs::is_regular_file(entry) || !std::regex_match(name, match, shardPattern)) continue;
+                    int count = std::stoi(match[2]);
+                    int index = std::stoi(match[1]);
+                    AssertInFastLLM(count > 0 && index > 0 && index <= count &&
+                                    (shardCount == 0 || shardCount == count),
+                                    "Inconsistent safetensors shard set in " + modelPath);
+                    shardCount = count;
+                    stFiles.insert(entry.path().string());
+                }
+                AssertInFastLLM(shardCount > 0 && (int)stFiles.size() == shardCount,
+                                "Missing safetensors weights or incomplete shard set in " + modelPath);
+            }
         } else {
             auto stIndex = json11::Json::parse(ReadAllFile(stIndexFile), error)["weight_map"];
             for (auto it : stIndex.object_items()) {

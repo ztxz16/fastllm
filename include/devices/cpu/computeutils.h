@@ -18,6 +18,16 @@ namespace fastllm {
         int st, int end, // calc C[0 : n, st : end]
         DataType AType, DataType BType, DataType CType);
 
+    // Dynamic amax/448 quantization with FP16 RTZ followed by E4M3 RNE.
+    bool QuantizeEagerFP8_AVX512BF16(const float *values, uint8_t *output, int rows, int columns);
+    // Both operands contain 128 E4M3 bytes followed by one FP32 scale.
+    bool FastllmGemmFP8Block128_AVX512BF16(
+        const void *A, long lda, const void *B, long ldb, void *C, long ldc,
+        int n, int m, int st, int end);
+    bool FastllmGemmFP8Block128_AVX2(
+        const void *A, long lda, const void *B, long ldb, void *C, long ldc,
+        int n, int m, int st, int end);
+
     bool FastllmGemmBFloat16NVFP4Block32E8M0FullBlocks_AVX512BF16(
         const void *A, long lda, const void *B, long ldb,
         void *C, long ldc, int n, int m, int k, int st, int end,

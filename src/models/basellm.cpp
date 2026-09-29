@@ -3623,6 +3623,7 @@ namespace fastllm {
                             this->model_struct == "deepseek_v2" ||
                             this->model_struct == "deepseek_v4" ||
                             this->model_struct == "dots3_note" ||
+                            this->model_struct == "naive_n05_flash" ||
                             this->model_struct == "qwen3_moe" ||
                             this->model_struct == "minimax_m2" ||
                             this->model_struct == "hunyuan" ||

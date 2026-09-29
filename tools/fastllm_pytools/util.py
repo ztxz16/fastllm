@@ -809,7 +809,7 @@ def _is_moe_architecture(architecture: str, model_type: str = "", text_model_typ
         "Glm5NextForConditionalGeneration",
     ] or model_type in [
         "deepseek_v4", "deepseek_v41", "glm_moe_dsa", "qwen3_5_moe", "hy_v3", "laguna",
-        "kimi_k3", "dots3_note", "glm5_next", "glm5_next_text", "qwen4_exp",
+        "kimi_k3", "dots3_note", "naive_n05_flash", "glm5_next", "glm5_next_text", "qwen4_exp",
         "qwen3_8_flash_next",
     ] or text_model_type in [
         "deepseek_v41_text", "qwen3_5_moe_text", "glm5_next_text", "qwen4_exp_text",
@@ -1550,6 +1550,12 @@ def make_normal_llm_model(args, startup_progress = None):
                 import glob
                 numa_nodes = sorted(glob.glob("/sys/devices/system/node/node[0-9]*"))
                 numa_count = len(numa_nodes)
+                try:
+                    requested_numas = int(os.environ.get("FT_NUMAS", "0"))
+                except ValueError:
+                    requested_numas = 0
+                if 0 < requested_numas <= numa_count:
+                    numa_count = requested_numas
                 if numa_count > 0:
                     physical_cores_per_numa = set()
                     for entry in os.listdir(numa_nodes[0]):
@@ -1560,6 +1566,11 @@ def make_normal_llm_model(args, startup_progress = None):
                                     physical_cores_per_numa.add(f.read().strip())
                     cpus_per_numa = len(physical_cores_per_numa) if physical_cores_per_numa else 1
                     args.threads = max(1, numa_count * (cpus_per_numa - 4))
+                    if hasattr(os, "sched_getaffinity"):
+                        # Workers spin between tasks. Leave CPUs available for
+                        # the inference/CUDA controller even under numactl.
+                        available_cpus = len(os.sched_getaffinity(0))
+                        args.threads = min(args.threads, max(1, available_cpus - 4))
                 else:
                     args.threads = 4
             except:

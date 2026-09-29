@@ -209,7 +209,7 @@ set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/context
         src/devices/disk/diskdevice.cpp
         src/models/graphllm.cpp src/models/chatglm.cpp src/models/moss.cpp src/models/llama.cpp src/models/qwen.cpp src/models/basellm.cpp
         src/models/glm.cpp src/models/minicpm.cpp src/models/minicpm3.cpp src/models/internlm2.cpp src/models/bert.cpp src/models/moe.cpp src/models/deepseekv2.cpp src/models/deepseekv4.cpp src/models/deepseekv41.cpp src/models/deepseekv41_vision.cpp src/models/deepseekv41_dspark.cpp src/models/dots3_note.cpp
-        src/models/phi3.cpp src/models/xlmroberta.cpp src/models/cogvlm.cpp src/models/qwen3.cpp src/models/qwen3_moe.cpp src/models/hy_v3.cpp src/models/qwen3_next.cpp src/models/qwen4_exp.cpp src/models/kimi_k3.cpp
+        src/models/phi3.cpp src/models/xlmroberta.cpp src/models/cogvlm.cpp src/models/qwen3.cpp src/models/qwen3_moe.cpp src/models/hy_v3.cpp src/models/qwen3_next.cpp src/models/qwen4_exp.cpp src/models/kimi_k3.cpp src/models/naive_n05_flash.cpp
         src/models/minimax.cpp src/models/hunyuan.cpp
         src/models/ernie4_5.cpp src/models/pangu_moe.cpp src/models/glm4_moe.cpp src/models/glm5_moe_dsa.cpp src/models/glm5_next.cpp src/models/gpt_oss.cpp
         src/models/minimax_m2.cpp src/models/qwen2.cpp src/models/qwen3_5.cpp src/models/gemma4.cpp src/models/step3p5.cpp src/models/laguna.cpp
@@ -390,6 +390,8 @@ if (USE_CUDA)
         src/devices/cuda/linear/fastllm-marlin.cu
         src/devices/cuda/linear/fastllm-linear-int4nozero.cu
         src/devices/cuda/models/dots3-note-kernels.cu
+        src/devices/cuda/models/naive-n05-kernels.cu
+        src/devices/cuda/models/naive-n05-experts.cu
         src/devices/cuda/models/deepseekv4-kernels.cu
         src/devices/cuda/models/deepseekv41-kernels.cu
         src/devices/cuda/models/deepseekv41-reference.cu
@@ -761,6 +763,20 @@ if (UNIT_TEST)
     set_tests_properties(reduce_batch PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
 
     if (USE_NUMAS)
+        add_executable(numas_fp8_eager_moe_test test/basic/test_numas_fp8_eager_moe.cpp)
+        target_link_libraries(numas_fp8_eager_moe_test PRIVATE fastllm)
+        add_test(NAME numas_fp8_eager_moe COMMAND numas_fp8_eager_moe_test)
+        add_test(NAME numas_fp8_eager_moe_avx2 COMMAND numas_fp8_eager_moe_test --avx2)
+        set_tests_properties(numas_fp8_eager_moe numas_fp8_eager_moe_avx2 PROPERTIES
+            ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4;FT_GPU_PREFILL=0;FASTLLM_ACTIVATE_NUMA=ON"
+            SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 60)
+        if (USE_CUDA)
+            target_include_directories(numas_fp8_eager_moe_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            add_test(NAME numas_fp8_eager_moe_hybrid COMMAND numas_fp8_eager_moe_test --hybrid)
+            set_tests_properties(numas_fp8_eager_moe_hybrid PROPERTIES
+                ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4;FT_GPU_PREFILL=1;FASTLLM_ACTIVATE_NUMA=ON"
+                LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+        endif()
         add_executable(numas_nvfp4_moe_test test/basic/test_numas_nvfp4_moe.cpp)
         target_link_libraries(numas_nvfp4_moe_test PRIVATE fastllm)
         add_test(NAME numas_nvfp4_moe COMMAND numas_nvfp4_moe_test)
@@ -995,6 +1011,12 @@ if (UNIT_TEST)
         target_include_directories(cuda_qwen4_attention_fusion_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         add_test(NAME cuda_qwen4_attention_fusion COMMAND cuda_qwen4_attention_fusion_test)
         set_tests_properties(cuda_qwen4_attention_fusion PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+
+        add_executable(naive_n05_attention_test test/basic/test_naive_n05_attention.cpp)
+        target_link_libraries(naive_n05_attention_test PRIVATE fastllm)
+        target_include_directories(naive_n05_attention_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME naive_n05_attention COMMAND naive_n05_attention_test)
+        set_tests_properties(naive_n05_attention PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
 
         add_executable(cuda_qwen4_shared_expert_test test/basic/test_cuda_qwen4_shared_expert.cpp)
         target_link_libraries(cuda_qwen4_shared_expert_test PRIVATE fastllm)
