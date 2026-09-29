@@ -4684,8 +4684,9 @@ namespace fastllm {
         AddDictRecursion(model, "", config);
         if (!dsparkPath.empty()) {
             AssertInFastLLM(
-                model->model_type == "kimi_k3" || modelType == "kimi_k3",
-                "The current DSpark integration requires a Kimi-K3 target model.");
+                model->model_type == "kimi_k3" || modelType == "kimi_k3" ||
+                model->model_type == "naive_n05_flash",
+                "DSpark requires a supported Kimi-K3 or Naive-N0.5 target model.");
             std::string dsparkConfigError;
             auto dsparkConfig = json11::Json::parse(
                 ReadAllFile(dsparkPath + "config.json"),

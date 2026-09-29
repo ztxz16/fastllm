@@ -85,14 +85,14 @@ __device__ int KeyIndex(const int *indices, int query, int slot, int count,
 
 __global__ void AttentionScores(const BF16 *q, const BF16 *k, const int *indices,
                                 float *scores, int heads, int kvHeads, int dim,
-                                int keyStride, int keys, int count, int past, int window) {
+                                int keyStride, int keys, int count, int past, int window, bool causal) {
     int query = blockIdx.y, h = blockIdx.x;
     int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     int kvHead = h / (heads / kvHeads);
     for (int slot = warp; slot < count; slot += 8) {
         int key = KeyIndex(indices, query, slot, count, past, window);
         float dot = 0;
-        bool valid = key >= 0 && key < keys && key <= past + query;
+        bool valid = key >= 0 && key < keys && (!causal || key <= past + query);
         if (valid) {
             for (int d = lane; d < dim; d += 32)
                 dot += (float)q[((size_t)query * heads + h) * dim + d] *
@@ -145,14 +145,14 @@ __global__ void AttentionSoftmax(float *scores, const float *sink, int heads, in
 __global__ void AttentionShort(const BF16 *q, const BF16 *k, const BF16 *v,
                                const int *indices, const float *sink, BF16 *out,
                                int heads, int kvHeads, int dim, int valueDim,
-                               int keyStride, int keys, int count, int past, int window) {
+                               int keyStride, int keys, int count, int past, int window, bool causal) {
     __shared__ float scores[256], scratch[256];
     int query = blockIdx.y, h = blockIdx.x, t = threadIdx.x;
     int lane = t % 32, warp = t / 32, kvHead = h / (heads / kvHeads);
     for (int slot = warp; slot < count; slot += 8) {
         int key = KeyIndex(indices, query, slot, count, past, window);
         float dot = 0;
-        bool valid = key >= 0 && key < keys && key <= past + query;
+        bool valid = key >= 0 && key < keys && (!causal || key <= past + query);
         if (valid) for (int d = lane; d < dim; d += 32)
             dot += (float)q[((size_t)query * heads + h) * dim + d] *
                    (float)k[(size_t)key * keyStride + kvHead * dim + d];
@@ -185,7 +185,7 @@ __global__ void AttentionShort(const BF16 *q, const BF16 *k, const BF16 *v,
         float value = 0;
         for (int slot = 0; slot < count; ++slot) {
             int key = KeyIndex(indices, query, slot, count, past, window);
-            if (key >= 0 && key < keys && key <= past + query)
+            if (key >= 0 && key < keys && (!causal || key <= past + query))
                 value += scores[slot] * (float)v[((size_t)key * kvHeads + kvHead) * valueDim + d];
         }
         out[((size_t)query * heads + h) * valueDim + d] = __float2bfloat16(value);
@@ -194,7 +194,7 @@ __global__ void AttentionShort(const BF16 *q, const BF16 *k, const BF16 *v,
 
 __global__ void AttentionValues(const float *prob, const BF16 *v, const int *indices,
                                 BF16 *out, int heads, int kvHeads, int dim,
-                                int keys, int count, int past, int window) {
+                                int keys, int count, int past, int window, bool causal) {
     int query = blockIdx.y, h = blockIdx.x, d = threadIdx.x;
     if (d >= dim) return;
     int kvHead = h / (heads / kvHeads);
@@ -202,7 +202,7 @@ __global__ void AttentionValues(const float *prob, const BF16 *v, const int *ind
     const float *p = prob + ((size_t)query * heads + h) * count;
     for (int slot = 0; slot < count; slot++) {
         int key = KeyIndex(indices, query, slot, count, past, window);
-        if (key >= 0 && key < keys && key <= past + query)
+        if (key >= 0 && key < keys && (!causal || key <= past + query))
             sum += p[slot] * (float)v[((size_t)key * kvHeads + kvHead) * dim + d];
     }
     out[((size_t)query * heads + h) * dim + d] = __float2bfloat16(sum);
@@ -265,17 +265,17 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
                               const fastllm::Data &value, const fastllm::Data &indices,
                               const fastllm::Data &sink, int heads, int kvHeads,
                               int dim, int valueDim, int pastLength, int window,
-                              fastllm::Data &output) {
+                              fastllm::Data &output, bool causal) {
     using namespace fastllm;
     int queries = query.dims[1], keys = key.dims[1];
-    int count = indices.dims.empty() ? (window ? std::min(window, keys) : keys) : indices.dims[1];
+    int count = indices.dims.empty() ? (window ? std::min(window + (causal ? 0 : queries - 1), keys) : keys) : indices.dims[1];
     const int *selected = indices.dims.empty() ? nullptr : (const int *)indices.cudaData;
     Output(output, DataType::BFLOAT16, {1, queries, heads * valueDim});
     if (count <= 256) {
         AttentionShort<<<dim3(heads, queries), 256>>>((const BF16 *)query.cudaData,
             (const BF16 *)key.cudaData, (const BF16 *)value.cudaData, selected,
             sink.dims.empty() ? nullptr : (const float *)sink.cudaData, (BF16 *)output.cudaData,
-            heads, kvHeads, dim, valueDim, key.dims[2], keys, count, pastLength, window);
+            heads, kvHeads, dim, valueDim, key.dims[2], keys, count, pastLength, window, causal);
         CheckLaunch();
         return;
     }
@@ -283,11 +283,11 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
     Output(scores, DataType::FLOAT32, {queries, heads, count});
     AttentionScores<<<dim3(heads, queries), 256>>>((const BF16 *)query.cudaData,
         (const BF16 *)key.cudaData, selected, (float *)scores.cudaData,
-        heads, kvHeads, dim, key.dims[2], keys, count, pastLength, window);
+        heads, kvHeads, dim, key.dims[2], keys, count, pastLength, window, causal);
     AttentionSoftmax<<<queries * heads, 256>>>((float *)scores.cudaData,
         sink.dims.empty() ? nullptr : (const float *)sink.cudaData, heads, count);
     AttentionValues<<<dim3(heads, queries), 256>>>((const float *)scores.cudaData,
         (const BF16 *)value.cudaData, selected, (BF16 *)output.cudaData,
-        heads, kvHeads, valueDim, keys, count, pastLength, window);
+        heads, kvHeads, valueDim, keys, count, pastLength, window, causal);
     CheckLaunch();
 }

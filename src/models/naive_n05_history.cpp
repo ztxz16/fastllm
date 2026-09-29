@@ -118,6 +118,28 @@ void NaiveN05FlashModel::OnResponseContextCreated(ResponseContext *context) {
             remaining -= length;
         }
         AssertInFastLLM(remaining == 0, "Incomplete Naive history archive.");
+        if (draftEnabled) {
+            auto draft = std::make_shared<DraftContext>();
+            draft->committed = state.length;
+            int first = std::max(0, state.length - draftWindow + 1);
+            draft->restoredHidden = Data(BFLOAT16, {1, state.length - first, embed_dim});
+            draft->restoredHidden.Allocate();
+            int offset = 0;
+            for (const auto &span : state.spans) {
+                int begin = std::max(first, offset), end = offset + span.length;
+                if (begin < end) {
+                    const Data &source = span.chunk->draftHidden;
+                    AssertInFastLLM(source.dims.size() == 3 && source.dims[1] >= span.length,
+                                    "Missing Naive draft history features.");
+                    std::memcpy(draft->restoredHidden.cpuData + (size_t)(begin - first) * embed_dim * 2,
+                                source.cpuData + (size_t)(begin - offset) * embed_dim * 2,
+                                (size_t)(end - begin) * embed_dim * 2);
+                }
+                offset = end;
+            }
+            std::lock_guard<std::mutex> guard(historyMutex);
+            draftContexts[&context->pastKeyValues] = std::move(draft);
+        }
         for (int layer = 0; layer < block_cnt; ++layer) {
             int first = slidingLayers[layer] ? std::max(0, state.length - window + 1) : 0;
             int length = state.length - first;
@@ -157,25 +179,49 @@ void NaiveN05FlashModel::OnResponseContextCreated(ResponseContext *context) {
 void NaiveN05FlashModel::OnResponseContextRemoved(ResponseContext *context) {
     std::lock_guard<std::mutex> guard(historyMutex);
     activeHistory.erase(&context->pastKeyValues);
+    auto draft = draftContexts.find(&context->pastKeyValues);
+    if (draft != draftContexts.end()) {
+        const auto &s = *draft->second;
+        if (verbose && s.rounds)
+            std::cout << "[Naive DSpark] rounds=" << s.rounds << " proposed=" << s.proposed
+                      << " accepted=" << s.accepted << " acceptance=" << (double)s.accepted / s.proposed
+                      << " tokens_per_round=" << 1.0 + (double)s.accepted / s.rounds << std::endl;
+        draftContexts.erase(draft);
+    }
 }
 
 void NaiveN05FlashModel::TryRecordResponseContext(ResponseContext *context) {
     std::lock_guard<std::mutex> guard(historyMutex);
     if (!saveHistoryChat || !context || !context->multimodalInput.empty()) return;
     auto active = activeHistory.find(&context->pastKeyValues);
-    if (active == activeHistory.end() || active->second.length <= 0 ||
-        active->second.length > (int)context->allTokens.size()) return;
+    if (active == activeHistory.end() || active->second.length <= 0) return;
+    // A speculative block may have committed KV ahead of the scheduler when
+    // a request stops or is cancelled. Publish only the emitted prefix.
+    int length = std::min<int>(active->second.length, context->allTokens.size());
+    if (length <= 0) return;
     // allTokens may include the last sampled token, whose KV has not run yet.
-    auto tokenEnd = context->allTokens.begin() + active->second.length;
+    auto tokenEnd = context->allTokens.begin() + length;
     for (auto it = history.begin(); it != history.end(); ++it) {
         const auto &entry = *it;
-        if (entry->tokens.size() >= active->second.length &&
+        if (entry->tokens.size() >= length &&
             std::equal(context->allTokens.begin(), tokenEnd, entry->tokens.begin())) {
             std::rotate(it, it + 1, history.end());
             return;
         }
     }
     auto memory = std::make_shared<HistoryMemory>(active->second);
+    memory->length = length;
+    memory->bytes = 0;
+    int remaining = length;
+    size_t count = 0;
+    for (auto &span : memory->spans) {
+        if (!remaining) break;
+        span.length = std::min(span.length, remaining);
+        remaining -= span.length;
+        memory->bytes += span.chunk->bytes;
+        ++count;
+    }
+    memory->spans.resize(count);
     memory->tokens.assign(context->allTokens.begin(), tokenEnd);
     // A descendant covers every prefix of its ancestor, sharing the same
     // immutable chunks. Retiring the ancestor avoids duplicate LRU accounting.

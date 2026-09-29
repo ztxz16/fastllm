@@ -1301,10 +1301,10 @@ def make_normal_llm_model(args, startup_progress = None):
             if speculative_algorithm == "dspark":
                 if speculative_draft_path:
                     if (architecture != "KimiK3ForConditionalGeneration" and
-                            model_type != "kimi_k3"):
+                            model_type not in ("kimi_k3", "naive_n05_flash")):
                         raise ValueError(
                             "external DSpark draft checkpoints currently target "
-                            "Kimi-K3, got architecture=%s model_type=%s" %
+                            "Kimi-K3 / Naive-N0.5, got architecture=%s model_type=%s" %
                             (architecture, model_type))
                 else:
                     if not (is_deepseek_v4_model or is_deepseek_v41_model):

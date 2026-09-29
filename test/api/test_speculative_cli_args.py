@@ -230,6 +230,32 @@ class SpeculativeDraftCliAliasesTest(unittest.TestCase):
                 self.assertEqual(
                     fake_llm.model.call_args.kwargs["external_mtp_path"], "")
 
+    def test_naive_external_dspark_accepts_full_anchor_first_block(self):
+        with tempfile.TemporaryDirectory() as model_path, tempfile.TemporaryDirectory() as draft_path:
+            self.write_draft_config(model_path, {
+                "architectures": ["NaiveN05FlashForCausalLM"],
+                "model_type": "naive_n05_flash",
+            })
+            self.write_draft_config(draft_path, {
+                "architectures": ["DSparkDraftModel"], "block_size": 7,
+            })
+            args = make_normal_parser("test").parse_args([
+                model_path, "--device", "cuda", "--moe_device", "numa",
+                "--draft", draft_path, "--draft_tokens", "7", "-t", "4",
+            ])
+            fake_model = MagicMock()
+            fake_model.get_max_input_len.return_value = 4096
+            fake_model.get_max_batch.return_value = 1
+            fake_ftllm = types.ModuleType("ftllm")
+            fake_ftllm.llm = MagicMock()
+            fake_ftllm.llm.model.return_value = fake_model
+            with patch.dict(os.environ, {}, clear=True), \
+                    patch.dict(sys.modules, {"ftllm": fake_ftllm}), redirect_stdout(io.StringIO()):
+                self.assertIs(make_normal_llm_model(args), fake_model)
+                self.assertEqual(args.speculative_algorithm, "dspark")
+                self.assertEqual(os.environ["FASTLLM_DSPARK_MODEL_PATH"], draft_path)
+                self.assertEqual(os.environ["FASTLLM_DSPARK_TOKENS"], "7")
+
     def test_deepseek_v41_dspark_accepts_shorter_and_longer_blocks(self):
         with tempfile.TemporaryDirectory() as model_path:
             self.write_draft_config(model_path, {

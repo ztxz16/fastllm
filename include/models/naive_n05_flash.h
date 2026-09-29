@@ -3,6 +3,8 @@
 
 #include "basellm.h"
 #include <memory>
+#include <deque>
+#include <random>
 
 namespace fastllm {
     class NaiveN05FlashModel : public basellm {
@@ -40,12 +42,51 @@ namespace fastllm {
             int length = 0;
             size_t bytes = 0;
             std::vector<std::pair<Data, Data>> layers;
+            Data draftHidden;
         };
         std::shared_ptr<HistoryChunk> BeginHistoryChunk(
             const std::vector<std::pair<Data, Data>> &kv, int past, int length);
         static void CopyHistoryTensor(const Data &source, Data &target, int length);
         void FinishHistoryChunk(const std::vector<std::pair<Data, Data>> &kv,
                                 const std::shared_ptr<HistoryChunk> &chunk);
+
+        struct TargetCapture {
+            bool verifying = false;
+            std::map<int, Data> hidden;
+            std::shared_ptr<HistoryChunk> history;
+        };
+        struct DraftContext {
+            int committed = 0;
+            std::vector<std::pair<Data, Data>> kv;
+            Data restoredHidden;
+            std::deque<std::pair<int, int>> pending;
+            std::mt19937_64 random{std::random_device{}()};
+            uint64_t rounds = 0, proposed = 0, accepted = 0;
+            double Uniform() { return std::generate_canonical<double, 53>(random); }
+        };
+        Data RunTarget(const Data &inputIds, const Data &positions,
+                       std::vector<std::pair<Data, Data>> &kv, TargetCapture *capture);
+        static void AppendCache(Data &cache, Data &input);
+        static void TrimCache(Data &cache, int length);
+        int SampleTarget(Data &logits, std::vector<std::pair<Data, Data>> &kv,
+                         const GenerationConfig &config, const LastTokensManager &lastTokens,
+                         std::vector<float> *retLogits);
+        void InitDraft();
+        void AppendDraftContext(Data &hidden, int start, DraftContext &context);
+        void CommitDraftContext(TargetCapture &capture, int tokens, DraftContext &context,
+                                std::vector<std::pair<Data, Data>> &kv);
+        Data RunDraft(int anchor, DraftContext &context);
+        int ForwardDraft(const Data &inputIds, const Data &positions,
+                         std::vector<std::pair<Data, Data>> &kv,
+                         const GenerationConfig &config, const LastTokensManager &lastTokens,
+                         std::vector<float> *retLogits);
+        bool draftEnabled = false;
+        int draftLayers = 0, draftBlock = 0, draftTokens = 0;
+        int draftHeads = 0, draftKvHeads = 0, draftHeadDim = 0, draftWindow = 0;
+        float draftEps = 1e-5f, draftTheta = 10000;
+        float draftConfidenceThreshold = 0.5f;
+        std::vector<int> draftTargetLayers;
+        std::map<const std::vector<std::pair<Data, Data>> *, std::shared_ptr<DraftContext>> draftContexts;
 
     private:
         struct HistorySpan {

@@ -122,6 +122,13 @@ int main() {
         Require(media->cacheLen == 0 && media->currentTokens == tokens, "Multimodal request reused text KV");
         model.TryRecordResponseContext(media);
 
+        // A completed speculative verify can be ahead of the last token
+        // emitted by the scheduler. Never publish its unconsumed suffix.
+        auto shortRequest = model.Create({101, 102, 103, 104, 105});
+        model.Feed(shortRequest, 0, 8);
+        model.TryRecordResponseContext(shortRequest);
+        auto shortHit = model.Create({101, 102, 103, 104, 105, 900});
+        model.CheckRestored(shortHit, 5);
         model.SetSaveHistoryChat(false);
         Require(model.Create(tokens)->cacheLen == 0, "Disabled history cache still hit");
         model.SetSaveHistoryChat(true);

@@ -60,7 +60,7 @@ static void TestRope() {
         }
     }
 }
-static void TestAttention(int past, int window, bool sparse, bool withSink, int queries = 3) {
+static void TestAttention(int past, int window, bool sparse, bool withSink, int queries = 3, bool causal = true) {
     const int heads = 4, kvHeads = 2, dim = 192, vd = 128;
     int keys = past + queries, keyStride = kvHeads * dim + (window ? 0 : 128);
     auto q = Values(queries * heads * dim, 7);
@@ -70,7 +70,7 @@ static void TestAttention(int past, int window, bool sparse, bool withSink, int 
     Upload(kd, {1, keys, keyStride}, k);
     Upload(vdta, {1, keys, kvHeads * vd}, v);
     if (withSink) Upload(sink, {heads}, {1, -1, 0, 3});
-    int count = sparse ? 2048 : window ? std::min(window, keys) : keys;
+    int count = sparse ? 2048 : window ? std::min(window + (causal ? 0 : queries - 1), keys) : keys;
     std::vector<int> selected(queries * count);
     if (sparse) {
         idx.Resize({queries, count}); idx.Allocate();
@@ -81,14 +81,14 @@ static void TestAttention(int past, int window, bool sparse, bool withSink, int 
         std::memcpy(idx.cpuData, selected.data(), selected.size() * sizeof(int));
         idx.ToDevice(DataDevice::CUDA, {0}, true);
     }
-    FastllmCudaNaiveAttention(qd, kd, vdta, idx, sink, heads, kvHeads, dim, vd, past, window, out);
+    FastllmCudaNaiveAttention(qd, kd, vdta, idx, sink, heads, kvHeads, dim, vd, past, window, out, causal);
     auto actual = ReadBF(out);
     const float sinks[] = {1, -1, 0, 3};
     for (int row = 0; row < queries; row++) for (int h = 0; h < heads; h++) {
         std::vector<double> prob(keys, 0);
         double denominator = withSink ? std::exp(sinks[h]) : 0;
         for (int t = 0; t < keys; t++) {
-            bool allowed = t <= past + row && (!window || past + row - t < window);
+            bool allowed = (!causal || t <= past + row) && (!window || past + row - t < window);
             if (sparse) allowed &= std::find(selected.begin() + row * count,
                 selected.begin() + (row + 1) * count, t) != selected.begin() + (row + 1) * count;
             if (!allowed) continue;
@@ -164,6 +164,8 @@ int main() {
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
     try {
         TestRope();
+        TestAttention(15, 0, false, false, 7, false);
+        TestAttention(1023, 1024, false, false, 7, false);
         TestAttention(0, 128, false, true);
         TestAttention(127, 128, false, true);
         TestAttention(7, 0, false, false);

@@ -17,7 +17,7 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query,
                               const fastllm::Data &sink,
                               int heads, int kvHeads, int dim, int valueDim,
                               int pastLength, int window,
-                              fastllm::Data &output);
+                              fastllm::Data &output, bool causal = true);
 
 // NUMA FP8 weights are row-packed [128 E4M3 bytes, FP32 scale]. Gate/up
 // output rows are interleaved. Route ids index the original [token, top-k].

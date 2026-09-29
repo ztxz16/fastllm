@@ -6,6 +6,7 @@
 #include <cmath>
 #ifdef USE_CUDA
 #include "devices/cuda/naive-n05-cuda.cuh"
+#include "devices/cuda/fastllm-cuda.cuh"
 #endif
 
 namespace fastllm {
@@ -26,25 +27,27 @@ namespace {
         for (auto &value : values.array_items()) result.push_back(value.int_value());
         return result;
     }
-    void AppendCache(Data &cache, Data &input) {
-        int oldLength = cache.dims.empty() ? 0 : cache.dims[1];
-        int length = oldLength + input.dims[1];
-        cache.dataType = input.dataType;
-        cache.UpdateUnitSize();
-        cache.ToDevice(input.dataDevice, input.dataDeviceIds);
-        if (cache.expansionDims.empty() || cache.expansionDims[1] < length) {
-            cache.Expansion({1, ((length + 127) / 128) * 128, input.dims[2]});
-        }
-        CatDirect(cache, input, 1);
-        cache.isKVCache = true;
+}
+
+void NaiveN05FlashModel::AppendCache(Data &cache, Data &input) {
+    int oldLength = cache.dims.empty() ? 0 : cache.dims[1];
+    int length = oldLength + input.dims[1];
+    cache.dataType = input.dataType;
+    cache.UpdateUnitSize();
+    cache.ToDevice(input.dataDevice, input.dataDeviceIds);
+    if (cache.expansionDims.empty() || cache.expansionDims[1] < length) {
+        cache.Expansion({1, ((length + 127) / 128) * 128, input.dims[2]});
     }
-    void TrimCache(Data &cache, int length) {
-        if (cache.dims[1] <= length) return;
-        Data suffix;
-        Split(cache, 1, cache.dims[1] - length, cache.dims[1], suffix);
-        cache.CopyFrom(suffix);
-        cache.isKVCache = true;
-    }
+    CatDirect(cache, input, 1);
+    cache.isKVCache = true;
+}
+
+void NaiveN05FlashModel::TrimCache(Data &cache, int length) {
+    if (cache.dims[1] <= length) return;
+    Data suffix;
+    Split(cache, 1, cache.dims[1] - length, cache.dims[1], suffix);
+    cache.CopyFrom(suffix);
+    cache.isKVCache = true;
 }
 
 NaiveN05FlashModel::NaiveN05FlashModel() {
@@ -104,7 +107,8 @@ void NaiveN05FlashModel::InitParams() {
     norm_topk_prob = weight.dicts["norm_topk_prob"] != "false";
     max_positions = number("max_position_embeddings", 1048576);
     indexFp8 = weight.dicts["indexer_activation_dtype"] != "bf16";
-    historyBytesPerToken = 0;
+    InitDraft();
+    historyBytesPerToken = draftEnabled ? embed_dim * sizeof(uint16_t) : 0;
     for (int layer = 0; layer < block_cnt; ++layer) {
         const auto &cfg = slidingLayers[layer] ? sliding : full;
         historyBytesPerToken += sizeof(uint16_t) *
@@ -137,7 +141,14 @@ std::map<std::string, std::vector<std::pair<std::string, DataType>>>
 NaiveN05FlashModel::GetTensorMap(const std::vector<std::string> &names) {
     auto result = basellm::GetTensorMap(names);
     for (auto &name : names) {
-        if (name.find(".mlp.gate.") != std::string::npos) {
+        if (draftEnabled && (name.rfind("layers.", 0) == 0 ||
+                name.rfind("markov_head.", 0) == 0 || name.rfind("confidence_head.", 0) == 0 ||
+                name == "fc.weight" || name == "hidden_norm.weight" ||
+                name == "norm.weight" || name == "mask_embedding")) {
+            auto type = (name.find("norm.weight") != std::string::npos ||
+                         name.rfind("confidence_head.", 0) == 0) ? DataType::FLOAT32 : DataType::BFLOAT16;
+            result[name] = {{"dspark." + name, type}};
+        } else if (name.find(".mlp.gate.") != std::string::npos) {
             result[name] = {{name, DataType::FLOAT32}};
         } else if (name.find(".mlp.experts.") == std::string::npos &&
                    (weight.GetWeightType(name) == WeightType::LINEAR ||
@@ -157,9 +168,19 @@ int NaiveN05FlashModel::Forward(
         std::vector<std::pair<Data, Data>> &pastKeyValues,
         const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
         std::vector<float> *retLogits) {
+    if (draftEnabled)
+        return ForwardDraft(inputIds, positionIds, pastKeyValues, generationConfig, lastTokens, retLogits);
+    Data logits = RunTarget(inputIds, positionIds, pastKeyValues, nullptr);
+    if (isIntermediateChunkedPrefill) return 0;
+    return SampleTarget(logits, pastKeyValues, generationConfig, lastTokens, retLogits);
+}
+
+Data NaiveN05FlashModel::RunTarget(
+        const Data &inputIds, const Data &positionIds,
+        std::vector<std::pair<Data, Data>> &pastKeyValues, TargetCapture *capture) {
 #ifndef USE_CUDA
     ErrorInFastLLM("Naive-N0.5 currently requires the CUDA backend for attention.");
-    return -1;
+    return Data();
 #else
     AssertInFastLLM(dataType == DataType::BFLOAT16 && kvCacheDataType == DataType::BFLOAT16,
                     "Naive-N0.5 requires BF16 activations and KV cache (use auto or bfloat16).");
@@ -167,8 +188,19 @@ int NaiveN05FlashModel::Forward(
                     (int)pastKeyValues.size() == block_cnt,
                     "Naive-N0.5 expects one unpadded sequence and a complete KV cache.");
     int length = inputIds.dims[1];
+    const int previousExactThreshold = FastllmCudaGetLinearExactBatchThreshold();
+    struct RestoreExactThreshold {
+        int value;
+        ~RestoreExactThreshold() { FastllmCudaSetLinearExactBatchThreshold(value); }
+    } restoreExactThreshold{previousExactThreshold};
+    // Verification must use the decode reduction tree, including the FP32
+    // router. Different GEMM rounding can change expert selection and amplify
+    // logit differences even when every cache and attention mask is correct.
+    if (capture && capture->verifying)
+        FastllmCudaSetLinearExactBatchThreshold(std::max(previousExactThreshold, length + 1));
     int pastLength = pastKeyValues[0].first.dims.empty() ? 0 : pastKeyValues[0].first.dims[1];
     auto historyChunk = BeginHistoryChunk(pastKeyValues, pastLength, length);
+    if (capture) capture->history = historyChunk;
     AssertInFastLLM(!slidingLayers[0] && pastLength + length <= max_positions,
                     "Naive-N0.5 requires a DSA first layer and input within the context window.");
     if (moeWeights.empty()) {
@@ -256,7 +288,7 @@ int NaiveN05FlashModel::Forward(
         FastllmCudaNaiveAttention(q, pastKey, pastValue, *selected, sink,
                                   cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
                                   localPast, slidingLayers[layer] ? window : 0, attn);
-        if (slidingLayers[layer]) {
+        if (slidingLayers[layer] && (!capture || !capture->verifying)) {
             TrimCache(pastKey, window - 1);
             TrimCache(pastValue, window - 1);
         }
@@ -307,14 +339,26 @@ int NaiveN05FlashModel::Forward(
             moeOutput.Reshape(hidden.dims);
             AddTo(hidden, moeOutput);
         }
+        if (capture && std::find(draftTargetLayers.begin(), draftTargetLayers.end(), layer) != draftTargetLayers.end())
+            Copy(hidden, capture->hidden[layer]);
     }
-    FinishHistoryChunk(pastKeyValues, historyChunk);
-    if (isIntermediateChunkedPrefill) return 0;
-    Data last, logits, top;
-    Split(hidden, 1, length - 1, length, last);
+    if (!capture) FinishHistoryChunk(pastKeyValues, historyChunk);
+    if (isIntermediateChunkedPrefill) return Data();
+    Data last, logits;
+    if (capture && capture->verifying) Copy(hidden, last);
+    else Split(hidden, 1, length - 1, length, last);
     KimiK3RMSNorm(last, weight["model.norm.weight"], rms_norm_eps, last);
     Linear(last, weight["lm_head.weight"], Data(), logits);
     ToDataType(logits, DataType::FLOAT32);
+    return logits;
+#endif
+}
+
+int NaiveN05FlashModel::SampleTarget(
+        Data &logits, std::vector<std::pair<Data, Data>> &pastKeyValues,
+        const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
+        std::vector<float> *retLogits) {
+    Data top;
     if (generationConfig.output_logits && retLogits) {
         logits.ToDevice(DataDevice::CPU);
         retLogits->assign((float *)logits.cpuData, (float *)logits.cpuData + logits.Count(0));
@@ -328,7 +372,6 @@ int NaiveN05FlashModel::Forward(
     LastTokensUnit empty;
     return LLMSampling(logits, 0, generationConfig,
                        lastTokens.units.empty() ? empty : lastTokens.units[0]);
-#endif
 }
 
 void NaiveN05FlashModel::WarmUp() {
@@ -338,6 +381,11 @@ void NaiveN05FlashModel::WarmUp() {
     for (int layer = 0; layer < block_cnt; layer++)
         cache.emplace_back(Data(kvCacheDataType), Data(kvCacheDataType));
     Forward(ids, Data(), positions, cache);
+    if (draftEnabled) {
+        auto context = draftContexts.at(&cache);
+        RunDraft(1, *context);
+        draftContexts.erase(&cache);
+    }
     elementsInKVCachePerToken = 0;
     for (int layer = 0; layer < block_cnt; layer++) {
         if (!slidingLayers[layer])
