@@ -89,6 +89,125 @@ API 的 `usage.prompt_tokens_details.cached_tokens` 表示本次命中的输入 
 逐次时间、命中数、logits 误差和 API 结果见
 [缓存与工具验证数据](benchmarks/naive_n05_flash_history.json)。
 
+## DSpark 推测解码
+
+支持配套的 `Naive-N0.5-Flash-FP8-Draft` checkpoint，沿用现有命令行参数：
+
+```bash
+FT_NUMAS=1 numactl -C 0-31 -m 0 \
+  ftllm server ~/hfmodels/Naive-N0.5-Flash-FP8 \
+  --device cuda --moe_device numa --threads 28 \
+  --draft ~/hfmodels/Naive-N0.5-Flash-FP8-Draft --draft_tokens 7
+```
+
+Draft 使用 5 层 BF16 Qwen3 骨干、1024-token 滑窗、学习的 mask embedding 和
+vanilla Markov head。目标模型的 8 个中间层输出经投影成为 draft 上下文；目标模型的
+embedding 和输出头共享。DSpark 从 anchor 所在的第 0 个位置开始预测，7 个位置均可
+作为候选，与仅使用后续 mask 位置的 DFlash 不同。
+默认置信度阈值为 0.5，可用已有的 `--speculative_dspark_confidence_threshold` 调整。
+
+随机采样采用[标准拒绝采样](https://arxiv.org/abs/2211.17192)：候选来自完整归一化的
+draft 分布 `q`，以 `min(1, p(token)/q(token))` 接受；拒绝时从归一化的
+`max(p-q, 0)` 采样，全部接受则额外从目标模型分布采样一个 token。
+目标和 draft 均应用温度、top-k、top-p、重复惩罚及最低生成长度限制。
+贪心分布是此算法的退化情形。拒绝后的 KV 和中间特征按实际接受长度回退。
+
+验证阶段的线性层使用与逐 token decode 相同的归约顺序，避免 BF16 舍入改变路由并
+逐层放大。历史缓存同时归档 draft 的投影特征，命中后只恢复最后 1023 个位置；
+请求提前结束时不把未输出的候选发布到前缀缓存。
+需要工具名称/参数约束或工具正文采样的请求，以及要求返回 logits 的请求，使用逐 token
+目标推理；这些请求仍可使用 draft 上下文归档和前缀缓存。
+
+NUMA FP8 W8A8 内核按行数选择小块及打包路径，小块共享最多 8 行的权重解码，
+同时复用多列的激活读取；较大块复用 8 行 × 32 列的 BF16 点积。
+不均匀专家组使用现有分组任务队列并优先处理较大的组。优化覆盖不同 token 行数和尾块，
+不依赖固定的候选数量。
+
+### 验证结果（2026-09-29）
+
+EPYC 9374F、CPU 0–31、单 NUMA、28 线程、RTX 4090，候选上限 7、置信度阈值 0.5。
+以下为两条路径均运行过完整回答后的第二组配对结果；并发 1，排除加载和首 token，
+普通解码与推测解码使用相同权重、输入及贪心采样参数。
+
+| 编程任务 | 输出 token | 普通解码 token/s | 推测解码 token/s | 加速比 | 候选接受率 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 合并闭区间 | 100 | 17.19 | 24.44 | 1.42× | 79.8% |
+| 二分查找首个匹配 | 105 | 17.88 | 29.76 | 1.66× | 95.8% |
+| 最小字典序拓扑排序 | 163 | 17.39 | 23.53 | 1.35× | 75.1% |
+
+三题的贪心输出与普通解码逐 token 相同。随机采样另测 `top_k=50, top_p=0.95,
+temperature=0.8`，本轮候选接受率为 79.8%–87.5%。18 份普通/推测、贪心/随机采样
+输出全部通过独立代码测试，合计 48,948 项检查（区间合并每份 504 项、二分查找每份
+7500 项、拓扑排序每份 154 项）。
+
+这些是稳态结果。专家权重按需整理，首次访问新专家仍可能很慢：本轮完全冷的第一道题
+首 token 为 216.89 s；第一次推测生成为 12.90 token/s，再次执行为 24.44 token/s。
+复现脚本因此分别预热普通和推测两条路径，原始记录保留全部预热及首次执行数据。
+开启推测解码不等于消除冷启动成本，短任务第一次执行不保证提速。
+
+- 标准拒绝采样进行 100 万次独立采样检验，覆盖分布相同、完全不相交、部分重叠和贪心
+  分布；输出频率及接受率均通过检查。
+- 在 87、127、2057 token 前缀后分别验证 8 个位置，整块验证与逐 token 目标推理的全部
+  logits 逐位一致，24 个位置的最大绝对差和 KL 均为 0。
+- Draft 骨干使用原 checkpoint 的 Torch 实现独立对照，1030-token 合成上下文跨过滑窗
+  边界；输出余弦相似度为 0.998645、RMSE 为 0.169031。相同输入下参考实现自身
+  BF16 与 FP32 的 RMSE 为 0.170619。此测试验证骨干和上下文缓存，不是完整模型 logits 对照。
+- 跨请求分别复用 118、1199、2056 个 token，24-token 输出与关闭缓存、首次记录时均相同，
+  最后一项同时跨过 2048-token 分块 prefill 边界。
+- 原生 AVX512BF16、AVX2 回退、CPU/GPU 混合 MoE、非因果 draft 注意力及历史缓存回归通过。
+
+不均匀路由的单层 NUMA FP8 微基准：hidden=4096、intermediate=2048、64 个专家，
+每行选择 8 个专家，其中 4 个公共专家，其余按固定种子独立选择。排除初始化和权重整理，
+预热 3 轮后计时 40 轮；基线为 `7aeb14b3`。重复使用单层权重，不能代替完整模型测速。
+
+| 行数 | 优化前 ms | 优化后 ms | 耗时减少 |
+| ---: | ---: | ---: | ---: |
+| 1 | 0.771 | 0.674 | 12.6% |
+| 2 | 1.217 | 1.071 | 12.0% |
+| 4 | 2.057 | 1.823 | 11.4% |
+| 7 | 3.306 | 2.806 | 15.1% |
+| 8 | 3.556 | 3.076 | 13.5% |
+| 12 | 5.219 | 4.405 | 15.6% |
+| 16 | 5.495 | 5.001 | 9.0% |
+| 32 | 8.961 | 8.004 | 10.7% |
+| 64 | 14.244 | 12.262 | 13.9% |
+
+逐项数值与复现输入见 [DSpark 验证数据](benchmarks/naive_n05_speculative.json)。
+
+### 复现与验证
+
+开启 `UNIT_TEST` 后编译以下目标。配对基准在同一个进程内加载同一组目标和 draft 权重，
+每题分别完整生成普通和推测回答预热，再交替测量两条路径，关闭历史缓存，记录各 token
+时间、候选接受率和完整输出。生成后的代码在独立子进程执行测试。
+代码检查工具也接受已保存的汇总报告
+`--report docs/benchmarks/naive_n05_speculative.json`，可直接复验其中的生成代码。
+
+```bash
+cmake -S . -B build-fastllm -DUNIT_TEST=ON
+cmake --build build-fastllm -j16 --target naive_n05_speculative_bench \
+  numas_fp8_moe_bench speculative_sampling_test naive_n05_draft_test
+python3 tools/naive_n05_speculative_check.py \
+  --model ~/hfmodels/Naive-N0.5-Flash-FP8 --write-cases /tmp/naive-cases.json
+FT_NUMAS=1 FT_THREADS=28 numactl -C 0-31 -m 0 \
+  build-fastllm/naive_n05_speculative_bench \
+  ~/hfmodels/Naive-N0.5-Flash-FP8 ~/hfmodels/Naive-N0.5-Flash-FP8-Draft \
+  /tmp/naive-cases.json /tmp/naive-results.json
+python3 tools/naive_n05_speculative_check.py \
+  --model ~/hfmodels/Naive-N0.5-Flash-FP8 \
+  --report /tmp/naive-results.json --output /tmp/naive-code-checks
+
+# 不均匀路由：7 行、64 个专家、每行选 8 个，其中 4 个为公共专家。
+FT_NUMAS=1 FT_THREADS=28 FT_GPU_PREFILL=0 numactl -C 0-31 -m 0 \
+  build-fastllm/numas_fp8_moe_bench 7 40 64 4
+
+# 使用原 checkpoint 自带的 Torch 实现导出 draft 骨干参考。
+python3 tools/naive_n05_draft_fixture.py \
+  --draft ~/hfmodels/Naive-N0.5-Flash-FP8-Draft --output /tmp/naive-draft-fixture
+build-fastllm/naive_n05_draft_test /tmp/naive-draft-fixture
+ctest --test-dir build-fastllm --output-on-failure \
+  -R '^(speculative_sampling|naive_n05_history|naive_n05_attention|numas_fp8_eager_moe(_avx2|_hybrid)?)$'
+```
+
 ## 服务验证
 
 已验证完整模型预热、`/v1/models`、非流式和 SSE 流式 `chat/completions`。
