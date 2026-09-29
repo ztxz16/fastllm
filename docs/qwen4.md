@@ -120,7 +120,13 @@ ftllm server /data/models/qwen3.8-flash-next \
 
 `--mtp` 设置每轮 draft token 数，当前最大为 8。Qwen3.8-Flash-Next MTP 目前要求简单贪婪采样，目标网络运行在 CUDA，MoE 可放在 CUDA 或 NUMA；条件不满足时会自动回退普通解码。
 
-Qwen3.8-Flash-Next 复用跨请求前缀快照时，该请求会回退普通解码；采用 Qwen3.5 架构的 Qwen3.8 不受此限制。
+Qwen3.8-Flash-Next 的跨请求前缀快照保存目标网络和可用的 MTP 状态。开启 MTP 后遇到不含草稿状态的旧快照，会先重算并生成兼容快照，后续请求可继续使用 MTP。
+
+## TP 混合推理的前缀缓存
+
+`--tp 2 --moe_device numa --prefix_cache true` 支持跨请求复用前缀。所有 rank 必须持有同一 token 前缀的完整快照，才会恢复各自的 KV、线性注意力和 QSA 状态，以及第 0 卡的 PLE 历史；缺失或恢复失败时重新计算。图片、视频请求不使用仅按 token 匹配的跨请求快照。
+
+`FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_MB` 是整个 TP 实例的快照预算（默认 4096 MiB），按 rank 均分。默认快照间隔为 16 页，默认页长 128，即至少累计 2048 个 token 才记录；较短请求不一定产生快照。命中后仍至少计算一个未缓存 token，重复完整提示词时可复用更早的分块快照。
 
 ## 思考与工具调用
 

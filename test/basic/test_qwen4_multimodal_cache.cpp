@@ -43,6 +43,72 @@ struct Qwen4PrefixCacheTestAccess {
     static bool RestoreFirst(Qwen4ExpModel &model, ResponseContext &context) {
         return model.RestorePrefixSnapshot(&context, model.prefixSnapshots.at(0));
     }
+
+    static bool TestRankSnapshots(int length) {
+        Qwen4ExpModel rank0, rank1;
+        Configure(rank0);
+        Configure(rank1);
+        rank0.threadTpRank = 0;
+        rank1.threadTpRank = 1;
+        struct ResetRanks {
+            int &a, &b;
+            ~ResetRanks() { a = b = -1; }
+        } resetRanks{rank0.threadTpRank, rank1.threadTpRank};
+        ResponseContext a, b;
+        a.Init(1, FLOAT32, FLOAT32);
+        b.Init(1, FLOAT32, FLOAT32);
+        Fill(rank0, a, length, 1200);
+        Fill(rank1, b, length, 1200);
+        // The shards deliberately differ: restoring rank 0 on both ranks
+        // would pass token-boundary checks but silently corrupt attention.
+        reinterpret_cast<float *>(b.pastKeyValues[0].second.cpuData)[0] = 7.0f;
+        auto &state1 = rank1.requestStates[&b.pastKeyValues[0].first];
+        state1.previousToken1 = 91;
+        state1.convHistory = {8.0f, 9.0f};
+        if (Record(rank0, a.pastKeyValues) != 1) return false;
+        const std::vector<Qwen4ExpModel *> models{&rank0, &rank1};
+        auto tokens = a.allTokens;
+        tokens.push_back(99);
+        if (Qwen4ExpModel::FindCommonPrefixSnapshot(models, tokens, length)) return false;
+        if (Record(rank1, b.pastKeyValues) != 1) return false;
+        auto pinned = Qwen4ExpModel::FindCommonPrefixSnapshot(models, tokens, length);
+        if (!pinned || pinned->ranks.size() != 2 || pinned->cachedLen != length) return false;
+
+        // A newer snapshot on one rank must fall back to the older complete
+        // set. Divergent token histories must never match by length alone.
+        Fill(rank0, a, length * 2, 1200);
+        if (Record(rank0, a.pastKeyValues) != 2) return false;
+        auto common = Qwen4ExpModel::FindCommonPrefixSnapshot(models, a.allTokens, length * 2);
+        if (!common || common->cachedLen != length) return false;
+        auto divergent = a.allTokens;
+        divergent[0] = -1;
+        if (Qwen4ExpModel::FindCommonPrefixSnapshot(models, divergent, length * 2)) return false;
+        rank1.prefixSnapshots.clear();
+        if (Qwen4ExpModel::FindCommonPrefixSnapshot(models, tokens, length)) return false;
+
+        // Pending hits pin every shard even if the store evicts them. A new
+        // request receives independent writable CPU tensors and PLE history.
+        ResponseContext restored0, restored1, again;
+        for (auto *context : {&restored0, &restored1, &again}) context->Init(1, FLOAT32, FLOAT32);
+        if (!rank0.RestorePrefixSnapshot(restored0.pastKeyValues, GenerationConfig(), pinned->ranks[0]) ||
+            !rank1.RestorePrefixSnapshot(restored1.pastKeyValues, GenerationConfig(), pinned->ranks[1])) return false;
+        if (reinterpret_cast<float *>(restored0.pastKeyValues[0].second.cpuData)[0] != 3.0f ||
+            reinterpret_cast<float *>(restored1.pastKeyValues[0].second.cpuData)[0] != 7.0f) return false;
+        auto &restoredState = rank1.requestStates[&restored1.pastKeyValues[0].first];
+        if (restoredState.previousToken1 != 91 || restoredState.convHistory != std::vector<float>({8, 9}) ||
+            restoredState.indexerRawKeys[0].size() != (size_t)length) return false;
+        reinterpret_cast<float *>(restored1.pastKeyValues[0].second.cpuData)[0] = -1.0f;
+        if (!rank1.RestorePrefixSnapshot(again.pastKeyValues, GenerationConfig(), pinned->ranks[1]) ||
+            reinterpret_cast<float *>(again.pastKeyValues[0].second.cpuData)[0] != 7.0f) return false;
+
+        rank1.autoWarmupRunning.store(true);
+        Fill(rank1, b, length * 3, 1200);
+        if (Record(rank1, b.pastKeyValues) != 0) return false;
+        rank1.autoWarmupRunning.store(false);
+        state1.hasMultimodalInput = true;
+        if (Record(rank1, b.pastKeyValues) != 0) return false;
+        return true;
+    }
 };
 }
 
@@ -78,6 +144,8 @@ int main() {
     auto check = [&](bool condition, const char *message) {
         if (!condition) { std::cerr << message << '\n'; ++failures; }
     };
+    check(Qwen4PrefixCacheTestAccess::TestRankSnapshots(length),
+          "TP snapshot completeness, shard isolation or eviction recovery failed");
 
     Qwen4ExpModel model;
     Qwen4PrefixCacheTestAccess::Configure(model);

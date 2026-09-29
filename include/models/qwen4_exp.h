@@ -256,6 +256,9 @@ namespace fastllm {
             std::vector<int> tokens;
             std::vector<PrefixLayerSnapshot> layers;
             RequestState state;
+            // A TP hit pins the same token boundary on every rank. These
+            // references survive rank-local eviction until restore completes.
+            std::vector<std::shared_ptr<PrefixSnapshot>> ranks;
         };
 
         struct PendingPrefixRestore {
@@ -524,6 +527,12 @@ namespace fastllm {
         std::shared_ptr<PrefixSnapshot> FindPrefixSnapshotLocked(
             const std::vector<int> &tokens, int maxCachedLen,
             int exactLen = -1) const;
+        static std::shared_ptr<PrefixSnapshot> FindCommonPrefixSnapshot(
+            const std::vector<Qwen4ExpModel *> &models,
+            const std::vector<int> &tokens, int maxCachedLen);
+        bool RestoreThreadTpPrefixSnapshot(
+            ResponseContext *context,
+            const std::shared_ptr<PrefixSnapshot> &snapshot);
         bool ShouldRecordPrefixSnapshot(
             const std::vector<std::pair<Data, Data>> &pastKeyValues,
             const RequestState &state, int &cachedLen) const;
@@ -532,6 +541,10 @@ namespace fastllm {
             RequestState &state);
         bool RestorePrefixSnapshot(
             ResponseContext *context,
+            const std::shared_ptr<PrefixSnapshot> &snapshot);
+        bool RestorePrefixSnapshot(
+            std::vector<std::pair<Data, Data>> &pastKeyValues,
+            const GenerationConfig &generationConfig,
             const std::shared_ptr<PrefixSnapshot> &snapshot);
 
         void DumpTensorIfRequested(const std::string &name, const Data &data) const;

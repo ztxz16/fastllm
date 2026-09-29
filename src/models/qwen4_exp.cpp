@@ -1974,6 +1974,21 @@ namespace fastllm {
         if (threadTpRank == 0) {
             RunPLE(hyperInput, inputIds, state, output, hostInputTokens);
         } else {
+            // PLE's recurrent history belongs to rank zero, but prefix
+            // matching and speculative rollback need the tokens on every rank.
+            const int count = inputIds.Count(0);
+            if (hostInputTokens && (int)hostInputTokens->size() >= count) {
+                state.processedTokens.insert(state.processedTokens.end(),
+                    hostInputTokens->begin(), hostInputTokens->begin() + count);
+            } else {
+                Data idsCpu;
+                ToDataType(inputIds, idsCpu, DataType::FLOAT32);
+                idsCpu.ToDevice(DataDevice::CPU);
+                const auto *ids = reinterpret_cast<const float *>(idsCpu.cpuData);
+                for (int i = 0; i < count; ++i) {
+                    state.processedTokens.push_back((int)(ids[i] + 0.01f));
+                }
+            }
             output.dataType = hyperInput.dataType;
             output.UpdateUnitSize();
             output.Resize(hyperInput.dims);
@@ -1997,10 +2012,21 @@ namespace fastllm {
             const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
             std::vector<std::vector<float> *> *logits, const Data *precomputedEmbedding) {
 #ifdef USE_CUDA
-        PrepareThreadTp();
         ThreadTpState &tp = *threadTpState;
-        std::lock_guard<std::mutex> guard(tp.forwardMutex);
         const Data *key = &pastKeyValues[0].first;
+        bool hasMultimodalInput = precomputedEmbedding != nullptr;
+        {
+            // Preserve the request-wide restriction even on a later decode
+            // call (or a direct one-token ForwardMultimodal call).
+            std::lock_guard<std::mutex> lock(stateMutex);
+            const auto found = requestStates.find(key);
+            hasMultimodalInput = hasMultimodalInput ||
+                (found != requestStates.end() && found->second.hasMultimodalInput);
+        }
+        std::lock_guard<std::mutex> guard(tp.forwardMutex);
+        // Prefix lookup also takes this mutex: publish the rank vector only
+        // after its weights and workers are fully initialized.
+        PrepareThreadTp();
         auto &entry = tp.caches[key];
         bool resetRequest = false;
         if (!entry) {
@@ -2097,6 +2123,7 @@ namespace fastllm {
                 embedding.ToDevice(DataDevice::CUDA, std::vector<int>{tp.devices[r]});
             }
             Qwen4ExpModel &model = *tp.ranks[r];
+            model.autoWarmupRunning.store(autoWarmupRunning.load());
             auto &cache = r == 0 && !entry->ownsRankZero
                 ? pastKeyValues : caches[r];
             if (resetRequest) {
@@ -2139,6 +2166,9 @@ namespace fastllm {
                     }
                 }
             }
+            if (hasMultimodalInput) {
+                model.requestStates[&cache.front().first].hasMultimodalInput = true;
+            }
             // Every rank runs the same proposal/acceptance state machine.
             // Global vocabulary sampling keeps rollback and collectives aligned.
             auto tokens = Qwen4MtpDraftsPerStep() > 0 && !entry->mtpDisabled
@@ -2147,7 +2177,7 @@ namespace fastllm {
                 : model.ForwardTarget(batch, ids, mask, positions,
                     cache, generationConfig, lastTokens,
                     r == 0 ? logits : nullptr, nullptr, nullptr, nullptr, nullptr,
-                    false, true, false,
+                    true, true, false,
                     hostInputTokens.empty() ? nullptr : &hostInputTokens, false,
                     precomputedEmbedding ? &embedding : nullptr);
             if (r == 0) result = std::move(tokens);
@@ -2181,6 +2211,66 @@ namespace fastllm {
 #else
         return {};
 #endif
+    }
+
+    bool Qwen4ExpModel::RestoreThreadTpPrefixSnapshot(
+            ResponseContext *context,
+            const std::shared_ptr<PrefixSnapshot> &snapshot) {
+        ThreadTpState &tp = *threadTpState;
+        std::lock_guard<std::mutex> guard(tp.forwardMutex);
+        if (tp.ranks.empty() || snapshot->ranks.size() != tp.ranks.size() ||
+            (int)context->pastKeyValues.size() < block_cnt) return false;
+        for (const auto &shard : snapshot->ranks) {
+            if (!shard || shard->cachedLen != snapshot->cachedLen ||
+                shard->tokens != snapshot->tokens) return false;
+        }
+        const Data *key = &context->pastKeyValues.front().first;
+        if (tp.caches.count(key)) return false;
+        // A restored request needs its own mutable buffers; an idle graph's
+        // captured addresses cannot be transplanted onto a prefix snapshot.
+        tp.ReleaseCache(nullptr, tp.idleCache);
+        auto entry = std::make_unique<ThreadTpState::RequestCache>();
+        entry->ranks.resize(tp.ranks.size());
+        for (size_t rank = 1; rank < tp.ranks.size(); ++rank) {
+            entry->ranks[rank].resize(block_cnt);
+        }
+#ifdef USE_CUDA
+        Qwen4CudaDeviceGuard deviceGuard;
+#endif
+        bool restored = true;
+        try {
+            for (size_t rank = 0; rank < tp.ranks.size(); ++rank) {
+#ifdef USE_CUDA
+                FastllmCudaSetDevice(tp.devices[rank]);
+#endif
+                auto &cache = rank == 0 ? context->pastKeyValues : entry->ranks[rank];
+                restored = tp.ranks[rank]->RestorePrefixSnapshot(
+                    cache, context->generationConfig, snapshot->ranks[rank]);
+#ifdef USE_CUDA
+                // Rank workers run on different per-thread streams.
+                FastllmCudaSyncCurrentThreadStream();
+#endif
+                if (!restored) break;
+            }
+        } catch (...) {
+            tp.ReleaseCache(key, entry);
+            throw;
+        }
+        if (!restored) {
+            tp.ReleaseCache(key, entry);
+            // Retire the whole hit, including a target-only snapshot rejected
+            // after enabling MTP. Recompute once and record compatible shards.
+            for (size_t rank = 0; rank < tp.ranks.size(); ++rank) {
+                auto &model = *tp.ranks[rank];
+                std::lock_guard<std::mutex> lock(model.prefixCacheMutex);
+                auto &records = model.prefixSnapshots;
+                records.erase(std::remove(records.begin(), records.end(),
+                                          snapshot->ranks[rank]), records.end());
+            }
+            return false;
+        }
+        tp.caches.emplace(key, std::move(entry));
+        return true;
     }
 
     void Qwen4ExpModel::RemoveThreadTpRequest(const Data *key) {
@@ -7222,6 +7312,9 @@ namespace fastllm {
             ApplyDeviceMap(this->deviceMap, this->pleLayer + 1, this->block_cnt);
             RunPLE(committedPleInput, committedIds, state, unusedPle,
                    &candidateTokens);
+        } else {
+            state.processedTokens.insert(state.processedTokens.end(),
+                candidateTokens.begin(), candidateTokens.begin() + committedInputs);
         }
 
         for (int layer = 0; layer < this->block_cnt; layer++) {
@@ -9792,11 +9885,49 @@ namespace fastllm {
         return best;
     }
 
+    std::shared_ptr<Qwen4ExpModel::PrefixSnapshot>
+    Qwen4ExpModel::FindCommonPrefixSnapshot(
+            const std::vector<Qwen4ExpModel *> &models,
+            const std::vector<int> &tokens, int maxCachedLen) {
+        if (models.empty()) return nullptr;
+        std::vector<std::unique_lock<std::mutex>> locks;
+        for (auto *model : models) locks.emplace_back(model->prefixCacheMutex);
+        std::vector<std::shared_ptr<PrefixSnapshot>> shards;
+        shards.reserve(models.size());
+        // A rank can evict or decline a snapshot independently. Never shorten
+        // the prompt until all ranks have the exact same prefix; try an older
+        // common boundary if the longest candidate is incomplete.
+        while (maxCachedLen > 0) {
+            auto first = models[0]->FindPrefixSnapshotLocked(tokens, maxCachedLen);
+            if (!first) return nullptr;
+            shards.clear();
+            shards.push_back(first);
+            for (size_t rank = 1; rank < models.size(); ++rank) {
+                auto shard = models[rank]->FindPrefixSnapshotLocked(
+                    tokens, first->cachedLen, first->cachedLen);
+                if (!shard) break;
+                shards.push_back(shard);
+            }
+            if (shards.size() == models.size()) {
+                for (size_t rank = 0; rank < models.size(); ++rank) {
+                    shards[rank]->timestamp = ++models[rank]->prefixSnapshotTimestamp;
+                }
+                auto common = std::make_shared<PrefixSnapshot>();
+                common->cachedLen = first->cachedLen;
+                common->tokens = first->tokens;
+                common->ranks = std::move(shards);
+                return common;
+            }
+            maxCachedLen = first->cachedLen - 1;
+        }
+        return nullptr;
+    }
+
     bool Qwen4ExpModel::ShouldRecordPrefixSnapshot(
             const std::vector<std::pair<Data, Data>> &pastKeyValues,
             const RequestState &state, int &cachedLen) const {
         if (state.hasMultimodalInput || autoWarmupRunning.load() ||
-            threadTpRank >= 0 || !Qwen4PrefixCacheEnabled() ||
+            !Qwen4PrefixCacheEnabled() ||
             (int)pastKeyValues.size() < this->block_cnt) {
             return false;
         }
@@ -9853,7 +9984,7 @@ namespace fastllm {
         // and materialize the device-resident PLE/QSA histories once at this
         // boundary so the snapshot has a self-sufficient generic fallback
         // representation.
-        MaterializePLEHostHistory(state);
+        if (threadTpRank <= 0) MaterializePLEHostHistory(state);
         for (int layer = 0; layer < this->block_cnt; layer++) {
             if (!this->IsLinearAttentionLayer(layer)) {
                 MaterializeQsaHostHistory(layer, cachedLen, state);
@@ -9998,7 +10129,8 @@ namespace fastllm {
             (uint64_t)std::max(
                 1, Qwen4EnvInt(
                     "FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_MB", 4096)) *
-            1024ULL * 1024ULL;
+            1024ULL * 1024ULL /
+            (threadTpOwner ? threadTpOwner->devices.size() : 1);
         if (snapshotBytes > maxSnapshotBytes) {
             state.lastPrefixSnapshotLen = cachedLen;
             if (Qwen4PrefixCacheDebugEnabled()) {
@@ -10202,24 +10334,35 @@ namespace fastllm {
     bool Qwen4ExpModel::TryRestoreHistoryCache(
             std::vector<int> &inputTokens, int &cacheLen) {
         cacheLen = 0;
-        if (threadTpState) return false;
         if (!Qwen4PrefixCacheEnabled() || inputTokens.size() <= 1) {
             return false;
         }
 
-        const std::vector<int> originalTokens = inputTokens;
         std::shared_ptr<PrefixSnapshot> snapshot;
+        if (threadTpState) {
+            // Exclude worker updates and cache teardown. Lookup itself does
+            // not allocate CUDA storage or require the scheduler's forward lock.
+            std::lock_guard<std::mutex> guard(threadTpState->forwardMutex);
+            std::vector<Qwen4ExpModel *> models;
+            for (auto &rank : threadTpState->ranks) models.push_back(rank.get());
+            snapshot = FindCommonPrefixSnapshot(
+                models, inputTokens, (int)inputTokens.size() - 1);
+        }
         {
             std::lock_guard<std::mutex> guard(this->prefixCacheMutex);
-            snapshot = FindPrefixSnapshotLocked(
-                originalTokens, (int)originalTokens.size() - 1);
+            if (!threadTpState) {
+                snapshot = FindPrefixSnapshotLocked(
+                    inputTokens, (int)inputTokens.size() - 1);
+            }
             if (snapshot == nullptr) {
                 return false;
             }
-            snapshot->timestamp = ++this->prefixSnapshotTimestamp;
+            if (!threadTpState) {
+                snapshot->timestamp = ++this->prefixSnapshotTimestamp;
+            }
             PendingPrefixRestore pending;
             pending.cachedLen = snapshot->cachedLen;
-            pending.tokens = originalTokens;
+            pending.tokens = inputTokens;
             pending.snapshot = snapshot;
             this->pendingPrefixRestores.push_back(std::move(pending));
             while (this->pendingPrefixRestores.size() > 64) {
@@ -10241,17 +10384,28 @@ namespace fastllm {
             ResponseContext *context,
             const std::shared_ptr<PrefixSnapshot> &snapshot) {
         if (context == nullptr || !context->multimodalInput.empty() ||
-            snapshot == nullptr || snapshot->state.hasMultimodalInput ||
+            snapshot == nullptr || snapshot->cachedLen != context->cacheLen) {
+            return false;
+        }
+        if (threadTpState) return RestoreThreadTpPrefixSnapshot(context, snapshot);
+        return RestorePrefixSnapshot(context->pastKeyValues,
+                                     context->generationConfig, snapshot);
+    }
+
+    bool Qwen4ExpModel::RestorePrefixSnapshot(
+            std::vector<std::pair<Data, Data>> &pastKeyValues,
+            const GenerationConfig &generationConfig,
+            const std::shared_ptr<PrefixSnapshot> &snapshot) {
+        if (snapshot == nullptr || snapshot->state.hasMultimodalInput ||
             snapshot->cachedLen <= 0 ||
-            snapshot->cachedLen != context->cacheLen ||
             (int)snapshot->layers.size() < this->block_cnt ||
-            (int)context->pastKeyValues.size() < this->block_cnt ||
+            (int)pastKeyValues.size() < this->block_cnt ||
             (int)snapshot->state.processedTokens.size() !=
                 snapshot->cachedLen) {
             return false;
         }
         if (snapshot->state.mtpState == nullptr &&
-            MtpSupportsGenerationConfig(context->generationConfig)) {
+            MtpSupportsGenerationConfig(generationConfig)) {
             // A snapshot recorded while MTP was disabled cannot reconstruct
             // the missing draft KV state. Retire it and recompute once; the
             // current MTP request will then record an MTP-capable snapshot.
@@ -10363,13 +10517,13 @@ namespace fastllm {
             const PrefixLayerSnapshot &layerSnapshot = snapshot->layers[layer];
             if (!restoreTensor(
                     layerSnapshot.first,
-                    context->pastKeyValues[layer].first,
+                    pastKeyValues[layer].first,
                     layerSnapshot.linear,
                     layerSnapshot.firstDevice,
                     layerSnapshot.firstDeviceIds) ||
                 !restoreTensor(
                     layerSnapshot.second,
-                    context->pastKeyValues[layer].second,
+                    pastKeyValues[layer].second,
                     layerSnapshot.linear,
                     layerSnapshot.secondDevice,
                     layerSnapshot.secondDeviceIds)) {
@@ -10437,7 +10591,7 @@ namespace fastllm {
         restored.lastPrefixSnapshotLen = snapshot->cachedLen;
         {
             std::lock_guard<std::mutex> guard(this->stateMutex);
-            this->requestStates[&context->pastKeyValues[0].first] =
+            this->requestStates[&pastKeyValues[0].first] =
                 std::move(restored);
         }
         return true;
@@ -10707,14 +10861,17 @@ namespace fastllm {
 
         auto prefixSnapshotDue = [&]() {
             int cachedLen = 0;
-            if (!ShouldRecordPrefixSnapshot(
-                    pastKeyValues, *requestState, cachedLen)) {
-                return false;
+            bool due = ShouldRecordPrefixSnapshot(
+                pastKeyValues, *requestState, cachedLen);
+            if (due) {
+                std::lock_guard<std::mutex> guard(this->prefixCacheMutex);
+                due = FindPrefixSnapshotLocked(
+                    requestState->processedTokens, cachedLen, cachedLen) == nullptr;
             }
-            std::lock_guard<std::mutex> guard(this->prefixCacheMutex);
-            return FindPrefixSnapshotLocked(
-                requestState->processedTokens,
-                cachedLen, cachedLen) == nullptr;
+            // Splitting the MTP prompt at a snapshot boundary changes its
+            // collective sequence. Independent rank eviction must never let
+            // only some ranks enter this branch.
+            return ThreadTpAllTrue(due);
         };
 
         auto generateProposalChain = [&](const Data &targetHidden,

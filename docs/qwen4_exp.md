@@ -53,10 +53,23 @@ eight. Qwen3.8-Flash-Next MTP currently requires simple greedy decoding, a CUDA
 target device map, and CUDA or NUMA MoE placement. Unsupported configurations
 automatically fall back to ordinary target decoding.
 
-For Qwen3.8-Flash-Next, MTP state is not persisted in cross-request prefix
-snapshots, so a request restored from such a snapshot falls back to ordinary
-target decoding. This limitation does not apply to Qwen3.8 checkpoints that
-use the Qwen3.5 architecture.
+Qwen3.8-Flash-Next prefix snapshots preserve target and available MTP state.
+Enabling MTP after recording a target-only snapshot causes one recomputation
+to replace it with an MTP-compatible snapshot; later hits can continue MTP.
+
+## Prefix caching with hybrid TP
+
+`--tp 2 --moe_device numa --prefix_cache true` supports cross-request prefix
+reuse. Every rank must hold a complete snapshot of the same token prefix.
+Restore recovers each rank's KV, linear-attention and QSA state, plus rank
+zero's PLE history. Missing or incompatible shards cause recomputation.
+Image and video requests do not use token-only cross-request snapshots.
+
+`FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_MB` limits the whole TP snapshot store
+(4096 MiB by default), divided equally among ranks. The default recording
+interval is 16 pages, or 2048 tokens with the default 128-token pages, so
+short requests may not produce a snapshot. At least one token remains
+uncached on a hit; identical prompts can reuse an earlier chunk snapshot.
 
 ## Build and smoke tests
 

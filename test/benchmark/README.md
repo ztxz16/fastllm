@@ -196,4 +196,8 @@ PYTHONPATH=build-proto/tools python test/benchmark/qwen4_prefix_cache.py \
 
 默认使用 CUDA 计算、NUMA 专家、FP16 激活和 CUDA Graph；模型及专家主机快照需要足够的系统内存。可通过 `--cache-gib`、`--moe-device`、`--threads`、`--graph` 调整运行配置。输出目录须没有同模式的既有结果。
 
+提示词预填充助手的代码块，减少选择输出格式带来的歧义，输出仍严格逐 token 比较。自适应专家调度可能改变 CPU/GPU 计算路径；若出现差异，应使用未修改版本对照。主机内存充足时可用 `--cache-gib 0` 固定专家放置。
+
+双卡混合推理可增加 `--tp 2 --ngram-device disk`，自动覆盖首次并发请求、Graph 恢复、默认 2048 token 快照间隔，以及从普通解码切换到 MTP。需要缩短边界用例时，可设置 `--families 511:512,512:512,513:512,1025:512`。测试内部固定边界用例的快照间隔为 1 页，默认间隔用例单独设为 16 页，无须额外设置环境变量。
+
 测试先关闭前缀缓存生成参考，再开启缓存，检查重复请求、真实前缀恢复、不同续写及共享快照复用；覆盖 4095/4096/4097 token 和 8193 token 的分块 prefill。它比较完整生成 token，并要求日志中出现预期长度的 `restore`，防止把未崩溃或仅查找到缓存误判为恢复成功。`mtp*.log` 保留原始日志，`mtp*.json` 保存各请求输出与首 token 耗时，`summary.json` 仅在所有检查通过后生成。
