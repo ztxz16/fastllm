@@ -7763,7 +7763,9 @@ namespace fastllm {
                     // NUMA shard begins and ends at a complete 32-value
                     // SwiGLU group (64 interleaved gate/up columns).
                     const bool canFuseGroup32 =
-                        downInputDataType == DataType::INF_INT8_GROUP32 &&
+                        (downInputDataType == DataType::INF_INT8_GROUP32 ||
+                         downInputDataType == static_cast<DataType>(
+                             DataType::DATA_GGUF_FORMAT + GGML_TYPE_Q8_0)) &&
                         interDim % 32 == 0 && kPer % 64 == 0;
                     const bool canFuseDstConvert =
                         downInputDataType == DataType::FLOAT32 ||

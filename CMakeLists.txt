@@ -695,6 +695,10 @@ if (UNIT_TEST)
         add_executable(cpu_gguf_iq4_nl_test test/basic/test_cpu_gguf_iq4_nl.cpp)
         target_link_libraries(cpu_gguf_iq4_nl_test PRIVATE fastllm)
         fastllm_add_checked_test(cpu_gguf_iq4_nl cpu_gguf_iq4_nl_test "PASS: IQ4_NL multi-row CPU" 60)
+
+        add_executable(cpu_swiglu_q8_0_test test/basic/test_cpu_swiglu_q8_0.cpp)
+        target_link_libraries(cpu_swiglu_q8_0_test PRIVATE fastllm)
+        fastllm_add_checked_test(cpu_swiglu_q8_0 cpu_swiglu_q8_0_test "PASS: fused Q8_0 SwiGLU" 60)
     endif()
 
     add_executable(device_operator_lifetime_test test/basic/test_device_operator_lifetime.cpp)
