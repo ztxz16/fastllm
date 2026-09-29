@@ -1904,6 +1904,75 @@ static void mul_mat_q6_k_r4_q8_k(int n, const void * vx, size_t bx, const DataIn
     }
 }
 
+// Keep the ordinary IQ4_NL layout: neighboring output rows share the Q8_0
+// loads without allocating another weight representation for CPU decode.
+template <int rows>
+static void mul_mat_iq4_nl_q8_0_rows(int blocks, const char *vx, size_t bx,
+                                    const block_q8_0 *y, const DataInfo &info,
+                                    int ix, int iy) {
+    const __m128i values = _mm_setr_epi8(
+        -127, -104, -83, -65, -49, -35, -22, -10,
+        1, 13, 25, 38, 53, 69, 89, 113);
+    const __m128i mask = _mm_set1_epi8(15);
+    const __m256i ones = _mm256_set1_epi16(1);
+    const block_iq4_nl *x[rows];
+    __m256 even[rows], odd[rows];
+    for (int r = 0; r < rows; ++r) {
+        x[r] = reinterpret_cast<const block_iq4_nl *>(vx + r * bx);
+        even[r] = odd[r] = _mm256_setzero_ps();
+    }
+    auto accumulate = [&](int block, __m256 *acc) {
+        const __m256i qy = _mm256_loadu_si256((const __m256i *)y[block].qs);
+        const __m256i ay = _mm256_abs_epi8(qy);
+        const float dy = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(y[block].d)));
+        for (int r = 0; r < rows; ++r) {
+            const __m128i bits = _mm_loadu_si128((const __m128i *)x[r][block].qs);
+            const __m256i qx = MM256_SET_M128I(
+                _mm_shuffle_epi8(values, _mm_and_si128(_mm_srli_epi16(bits, 4), mask)),
+                _mm_shuffle_epi8(values, _mm_and_si128(bits, mask)));
+            // IQ4_NL never contains -128. Applying the Q8 sign to IQ4
+            // therefore also handles Q8=-128, without signed-byte overflow.
+            const __m256i products = _mm256_maddubs_epi16(ay, _mm256_sign_epi8(qx, qy));
+            const __m256i sum = _mm256_madd_epi16(products, ones);
+            const float dx = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(x[r][block].d)));
+            acc[r] = _mm256_fmadd_ps(_mm256_set1_ps(dx * dy), _mm256_cvtepi32_ps(sum), acc[r]);
+        }
+    };
+    int block = 0;
+    for (; block + 1 < blocks; block += 2) {
+        accumulate(block, even);
+        accumulate(block + 1, odd);
+    }
+    if (block < blocks) accumulate(block, even);
+    for (int r = 0; r < rows; ++r) {
+        const __m256 acc = _mm256_add_ps(even[r], odd[r]);
+        __m128 sum = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+        sum = _mm_add_ps(sum, _mm_movehl_ps(sum, sum));
+        sum = _mm_add_ss(sum, _mm_movehdup_ps(sum));
+        info.store(ix + r, iy, _mm_cvtss_f32(sum));
+    }
+}
+
+template <int nrc_y>
+static void mul_mat_iq4_nl_q8_0(int n, const void *vx, size_t bx,
+                               const DataInfo &info, int nrc_x) {
+    assert(n % QK4_NL == 0);
+    for (int iy = 0; iy < nrc_y; ++iy) {
+        const auto *y = reinterpret_cast<const block_q8_0 *>(info.src1_row(iy));
+        int ix = 0;
+        for (; ix + 3 < nrc_x; ix += 4) {
+            mul_mat_iq4_nl_q8_0_rows<4>(n / QK4_NL, (const char *)vx + ix * bx, bx, y, info, ix, iy);
+        }
+        if (ix + 1 < nrc_x) {
+            mul_mat_iq4_nl_q8_0_rows<2>(n / QK4_NL, (const char *)vx + ix * bx, bx, y, info, ix, iy);
+            ix += 2;
+        }
+        if (ix < nrc_x) {
+            mul_mat_iq4_nl_q8_0_rows<1>(n / QK4_NL, (const char *)vx + ix * bx, bx, y, info, ix, iy);
+        }
+    }
+}
+
 #if defined(__AVX512VNNI__) && defined(__AVX512VL__)
 static inline float q8_0_scale(const block_q8_0 &block) {
     return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int)block.d)));
@@ -1976,7 +2045,9 @@ static void mul_mat_empty(int n, const void * vx, size_t bx, const DataInfo& inf
     return nullptr;
 
 mul_mat_t GetMulMatFunction(ggml_type type, int nrc_y) {
-    if (type == GGML_TYPE_Q8_0) {
+    if (type == GGML_TYPE_IQ4_NL) {
+        RETURN_MATMUL_FUNCTION(mul_mat_iq4_nl_q8_0, nrc_y)
+    } else if (type == GGML_TYPE_Q8_0) {
         RETURN_MATMUL_FUNCTION(mul_mat_q8_0_q8_0_fast, nrc_y)
     } else if (type == GGML_TYPE_IQ2_XXS_R4) {
         RETURN_MATMUL_FUNCTION(mul_mat_iq2_xxs_r4_q8_k, nrc_y)

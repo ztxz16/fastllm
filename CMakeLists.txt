@@ -691,6 +691,10 @@ if (UNIT_TEST)
         add_executable(cpu_isa_compat_test test/basic/test_cpu_isa_compat.cpp)
         target_link_libraries(cpu_isa_compat_test PRIVATE fastllm)
         add_test(NAME cpu_isa_compat COMMAND cpu_isa_compat_test)
+
+        add_executable(cpu_gguf_iq4_nl_test test/basic/test_cpu_gguf_iq4_nl.cpp)
+        target_link_libraries(cpu_gguf_iq4_nl_test PRIVATE fastllm)
+        fastllm_add_checked_test(cpu_gguf_iq4_nl cpu_gguf_iq4_nl_test "PASS: IQ4_NL multi-row CPU" 60)
     endif()
 
     add_executable(device_operator_lifetime_test test/basic/test_device_operator_lifetime.cpp)
