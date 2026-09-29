@@ -3156,6 +3156,12 @@ namespace fastllm {
             }
         }
         this->mtpWeightsStatus.store(hasMtpWeights ? 1 : 0, std::memory_order_release);
+        // Direct API callers can skip AutoWarmup. Register all NUMA experts
+        // before requests (and before TP borrows their storage), even without
+        // a CUDA expert cache. Lazy per-route registration frees source heaps
+        // piecemeal while allocating NUMA shards; unreclaimed source pages can
+        // otherwise nearly double host RSS. Warmup also trims those pages.
+        WarmupNumaMoeWeights();
         this->preparedWeights = true;
     }
 

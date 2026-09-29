@@ -9,6 +9,45 @@ namespace fastllm {
 // Supply small, valid CPU KV/QSA state to exercise the actual snapshot store
 // without loading model weights or running the visual encoder.
 struct Qwen4PrefixCacheTestAccess {
+    static bool TestNumaWeightsPrepared() {
+#ifdef USE_NUMAS
+        Qwen4ExpModel model;
+        model.block_cnt = 1;
+        model.num_experts = 2;
+        model.linearLayers = {true};
+        model.pleLayer = -1;
+        model.deviceMap = {{"cpu", 1}};
+        model.moeDeviceMap = {{"numa", 1}};
+        std::vector<Data *> experts;
+        for (int e = 0; e < model.num_experts; ++e) {
+            const std::string prefix = model.languagePrefix +
+                "layers.0.mlp.experts." + std::to_string(e) + ".";
+            for (const auto &part : {std::make_pair("gateup_proj.weight", "linearSwiglu"),
+                                     std::make_pair("down_proj.weight", "linearColumn")}) {
+                const std::string name = prefix + part.first;
+                Data &weight = model.weight[name];
+                weight.CopyFrom(Data(FLOAT32, {64, 16}, std::vector<float>(1024, 1.0f)));
+                model.moeLinears.insert(name);
+                model.AddSpecialWeight(name, part.second, 0);
+                experts.push_back(&weight);
+            }
+        }
+        // No Forward/AutoWarmup or GPU expert cache: source buffers must
+        // already be released before a request can visit individual experts.
+        model.PrepareWeights();
+        for (Data *weight : experts) {
+            if (weight->cpuData != nullptr || weight->numasData.empty()) return false;
+            for (const uint8_t *shard : weight->numasData)
+                if (!shard || reinterpret_cast<const float *>(shard)[0] != 1.0f) return false;
+        }
+        const auto shards = experts[0]->numasData;
+        model.PrepareWeights();
+        return experts[0]->numasData == shards;
+#else
+        return true;
+#endif
+    }
+
     static void Configure(Qwen4ExpModel &model) {
         model.block_cnt = model.embed_dim = 1;
         model.deviceMap = {{"cpu", 1}};
@@ -138,6 +177,8 @@ int main() {
     SetEnv("FASTLLM_PREFIX_CACHE", "1");
     SetEnv("FASTLLM_PREFIX_CACHE_SNAPSHOT_INTERVAL_PAGES", "1");
     SetEnv("FASTLLM_QWEN4_ENABLE_MTP", "0");
+    SetEnv("FT_NUMAS", "1");
+    SetMoeCudaCacheBytes(0);
     SetDeviceMap({{"cpu", 1}});
     const int length = std::max(2, GetPageLen() * 2);
     int failures = 0;
@@ -146,6 +187,8 @@ int main() {
     };
     check(Qwen4PrefixCacheTestAccess::TestRankSnapshots(length),
           "TP snapshot completeness, shard isolation or eviction recovery failed");
+    check(Qwen4PrefixCacheTestAccess::TestNumaWeightsPrepared(),
+          "NUMA expert source storage survived preparation without a GPU cache");
 
     Qwen4ExpModel model;
     Qwen4PrefixCacheTestAccess::Configure(model);
