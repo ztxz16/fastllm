@@ -121,8 +121,9 @@ static float FP8(float x) {
     }
     return std::copysign(best, x);
 }
-static void TestIndexer(bool zeroWeights, bool fp8) {
-    const int queries = 3, heads = 4, dim = 128, keys = 2060, topK = 2048, past = keys - queries;
+static void TestIndexer(bool zeroWeights, bool fp8, int queries = 3, int keys = 2060,
+                        int topK = 2048) {
+    const int heads = 4, dim = 128, past = keys - queries;
     const int stride = 2 * 192 + dim;
     auto q = Values(queries * heads * dim, 43), k = Values(keys * stride, 79);
     auto w = Values(queries * heads, 97);
@@ -133,6 +134,20 @@ static void TestIndexer(bool zeroWeights, bool fp8) {
     Upload(wd, {1, queries, heads}, w);
     FastllmCudaNaiveIndexer(qd, wd, kd, heads, dim, past, topK, fp8, indices);
     indices.ToDevice(DataDevice::CPU);
+    if (queries > 32) {
+        // Compare every index, including tie order and -1 padding, against
+        // a single active worker using exactly the same CUDA scores.
+        std::vector<int> parallel((int *)indices.cpuData,
+                                  (int *)indices.cpuData + queries * topK);
+        auto *pool = GetAlivePool();
+        auto active = pool->curActivateThreadInterval;
+        pool->curActivateThreadInterval = {active.first, active.first + 1};
+        FastllmCudaNaiveIndexer(qd, wd, kd, heads, dim, past, topK, fp8, indices);
+        pool->curActivateThreadInterval = active;
+        indices.ToDevice(DataDevice::CPU);
+        Require(std::equal(parallel.begin(), parallel.end(), (int *)indices.cpuData),
+                "parallel indexer differs from serial indexer");
+    }
     auto roundRow = [&](float *x) {
         if (!fp8) return;
         float scale = 1e-4f;
@@ -153,6 +168,10 @@ static void TestIndexer(bool zeroWeights, bool fp8) {
         std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return scores[a] > scores[b]; });
         for (int i = 0; i < topK; i++) {
             int actual = ((int *)indices.cpuData)[row * topK + i];
+            if (i > past + row) {
+                Require(actual == -1, "indexer did not pad unavailable causal keys");
+                continue;
+            }
             Require(actual >= 0 && actual <= past + row, "indexer selected a future key");
             Require(zeroWeights ? actual == i : std::abs(scores[actual] - scores[order[i]]) < 2e-5,
                     "FP8 indexer or stable TopK mismatch");
@@ -163,6 +182,7 @@ int main() {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
     try {
+        SetThreads(4);
         TestRope();
         TestAttention(15, 0, false, false, 7, false);
         TestAttention(1023, 1024, false, false, 7, false);
@@ -177,6 +197,13 @@ int main() {
         TestIndexer(true, true);
         TestIndexer(false, true);
         TestIndexer(false, false);
+        auto *pool = GetAlivePool();
+        auto active = pool->curActivateThreadInterval;
+        pool->curActivateThreadInterval = {1, 4};
+        TestIndexer(true, true, 65, 129, 256);
+        TestIndexer(false, false, 65, 257, 128);
+        TestIndexer(false, true, 65, 257, 128);
+        pool->curActivateThreadInterval = active;
         std::puts("Naive-N0.5 CUDA regression passed");
     } catch (const std::exception &error) {
         std::fprintf(stderr, "%s\n", error.what()); return 1;

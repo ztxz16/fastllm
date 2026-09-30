@@ -18,6 +18,10 @@ FT_NUMAS=1 numactl -C 0-31 -m 0 \
 长 prefill 默认自动分配 CPU/GPU 专家；如需关闭 GPU 专家 prefill，在启动前设置
 `FT_GPU_PREFILL=0`。此开关在进程初始化时读取。
 
+本机 24 GiB 单卡、长请求可追加 `--chunked_prefill_size 8192`。同一实际
+7557-token 输入的安装版预热首 token 时间由约 25.77 秒降至 20.81–21.49 秒，详细配置、
+连续输出验证与显存实测见文末的分块调优记录。默认分块仍为 2048。
+
 ## 实现范围
 
 - CUDA 执行稠密层、路由、注意力及输出投影；专家权重保存在 NUMA。decode 专家由 CPU 执行，长 prefill 按路由负载分给 CPU 与 GPU 并行执行。
@@ -27,7 +31,7 @@ FT_NUMAS=1 numactl -C 0-31 -m 0 \
 - NUMA 专家使用动态 W8A8：每 128 个激活使用独立 FP32 缩放系数，在 GEMM 中应用激活和权重的缩放，并对齐原始实现的 BF16 舍入顺序。参考 FP8 内核使用的 FP32 → FP16 向零截断 → FP8 舍入也在 NUMA 路径中保留。
 - 默认以 2048 token 分块 prefill，可用 `--chunked_prefill_size` 覆盖；每次 Forward 处理一条序列。跨请求前缀复用使用模型专用的 CPU KV 归档，HTTP 请求由现有调度器处理。
 
-当前稀疏索引在 GPU 计算分数、在 CPU 做稳定 top-k。超长上下文的索引开销还可以优化。本文的完整模型验证覆盖到 2057 token，不代表已经验证配置中的 1M 上下文。
+当前稀疏索引在 GPU 计算分数、在 CPU 并行做稳定 top-k。完整模型验证覆盖到 7557-token 输入及 7588-token 缓存复用，尚未验证配置中的 1M 上下文。
 
 ## 工具调用与跨请求前缀缓存
 
@@ -672,9 +676,9 @@ python tools/naive_n05_export_nvfp4.py \
   --model ~/hfmodels/Naive-N0.5-Flash-FP8 \
   --output ~/hfmodels/Naive-N0.5-Flash-MoE-NVFP4
 
-FT_NUMAS=2 FT_THREADS=40 numactl -C 0-63 -m 0,1 \
+FT_NUMAS=2 numactl -C 0-63 -m 0,1 \
   ftllm server ~/hfmodels/Naive-N0.5-Flash-MoE-NVFP4 \
-  --device cuda --moe_device numa
+  --device cuda --moe_device numa --threads 40
 ```
 
 运行时自动识别 safetensors 中的 NVFP4 格式，使用与 Qwen4 相同的紧凑 E4M3 NUMA
@@ -757,3 +761,183 @@ token/s；以上表格排除了这段权重准备过程，加载模型的时间�
 来自 2026-09-29 的独立进程测量。完整输入、两轮逐 token 时间、接受率、二进制
 校验及对比数据见 [FP8 当前速度测量](benchmarks/naive_n05_fp8_current.json)，
 原始文件位于 `/tmp/naive-fp8-current`。
+
+## 优化前的单 NUMA、7557-token 实际 Codex 输入 prefill 波形（2026-09-30）
+
+使用已安装的 FP8 模型和 Draft，单 NUMA、内存节点 0、CPU 0–31、28 个工作线程、
+RTX 4090（CUDA ordinal 0，PCI `0000:41:00.0`）。输入为实际 Codex Responses 请求
+经过相同 chat template 得到的 7557 个 token，分块为 2048/2048/2048/1413。每次请求
+只生成一个目标 token，用于测量 prefill 到首 token，不包含持续推测解码。模型加载和
+工厂内单 token warm-up 在测量之外。每次请求前清空历史，三组均重新计算全部 KV，
+`cached_input_tokens=0`、`missed_input_tokens=7557`。
+
+| 状态 | 无 profiler 首 token | Nsight 首 token |
+| --- | ---: | ---: |
+| 进程内首次异步请求，记录历史 | 46.811 秒 | 47.158 秒 |
+| 进程内预热后，记录历史 | 38.390 秒 | 38.398 秒 |
+| 进程内预热后，不记录历史 | 37.660 秒 | 38.152 秒 |
+
+每个条件各测一次；全部六次首 token 一致。关闭历史记录的差值为 0.25–0.73 秒，
+当前测量不支持把历史记录视为主要耗时。首次请求在进入第一个 `RunTarget` 分块前
+另有 7.15 秒启动段，尚未细分，不能直接归因为权重转换。
+
+![完整 prefill 波形](benchmarks/naive_n05_flash_prefill_7557.png)
+
+预热且记录历史的 Nsight 时间线中，CUDA kernel、memcpy、memset 的活动区间取
+并集为 **18.659 秒，占请求时间 48.6%**；单独 kernel 并集为 **7.408 秒**。这里
+统计的是设备有活动的时间比例，不是 SM 占用率。设备行按 25 ms 时间桶显示活动
+比例；主机函数范围与设备执行存在重叠，不能逐行相加。
+
+优化优先级如下：
+
+1. **索引 Top-K 的 CPU 串行选择**：后面三个分块的 9 个全局注意力层，共 27 次
+   `FastllmCudaNaiveIndexer`，主机函数累计 13.787 秒。分数 D2H API 返回到索引
+   H2D API 开始之间累计 **13.340 秒**，其中 GPU 活动仅 0.016 秒。测量时实现位于
+   `src/devices/cuda/models/naive-n05-kernels.cu`，逐 query 行串行执行 `iota` 和
+   `partial_sort`。优先使用线程池按行并行，每个工作线程独立排序缓冲，保留分数
+   相同优先较早 key 的规则和最终索引顺序；之后可评估精确 GPU Top-K，消除分数
+   回传与索引上传。此处的 13.34 秒是当前串行段耗时，不是已验证的加速收益。
+2. **GPU 专家权重重复搬运和串行提交**：188 次 GPU 专家辅助调用共处理 9751 个
+   专家任务，每个任务的 gate/up 和 down 权重重新 H2D。累计权重 **253.060 GB**
+   （十进制），设备拷贝 **9.455 秒**；全部 H2D 为 259.477 GB、9.754 秒。
+   `src/devices/cuda/models/naive-n05-experts.cu` 的 `Gemm` 每次调用都搬权重，
+   当前同一 stream 内依次拷贝、解包和 GEMM。值得评估 pinned staging、双缓冲
+   与拷贝/计算重叠、受显存上限约束的热点专家缓存，并在索引优化后比较更大的
+   prefill 分块。GPU 专家主机函数累计 19.480 秒，期间 CUDA 活动并集 14.320 秒；
+   差值还包含主机提交、输出散射等，未使用 CPU 采样进一步归因。
+3. **注意力融合**：注意力 GPU kernel 累计 **2.812 秒**，其中长/稀疏路径的
+   `AttentionScores` 为 1.114 秒、`AttentionValues` 为 0.866 秒。2048-query、
+   64-head、top-K 2048 的 FP32 scores 中间张量约 1 GiB。融合 scores、softmax、
+   values 可减少中间张量和访存；需保持 sink、causal mask 与 BF16 舍入语义。
+
+![索引选择局部波形](benchmarks/naive_n05_flash_prefill_7557_zoom.png)
+
+局部图为预热请求第二分块的第 5 层，2048 queries、4096 keys：主机选择阶段
+**431.4 ms**，期间 GPU 空闲。紧随其后的 `MergeMOE` 主机范围包含此前排队的
+注意力完成、输入回传以及并发 CPU/GPU 专家工作。整次请求 `MergeMOE` 主机范围
+累计 22.663 秒，其中 GPU 专家 worker 启动前 2.435 秒、worker 范围 19.480 秒、
+worker 结束后 0.747 秒；因此不能把 22.663 秒全部归为 CPU 专家计算，或再与
+注意力、GPU 专家时间相加。
+
+采集使用临时 `LD_PRELOAD` NVTX 标记已有函数，不增加算子间 CUDA 同步；设备
+操作通过 CUDA runtime correlation ID 关联到发起它的主机范围。环境中
+`perf_event_open` 不可用，本次未采 CPU 指令栈或内存带宽。完整输入和 token IDs
+未写入文档数据。可分享的测量数据及矢量图见
+[测量 JSON](benchmarks/naive_n05_flash_prefill_7557.json)、
+[完整 SVG](benchmarks/naive_n05_flash_prefill_7557.svg)、
+[局部 SVG](benchmarks/naive_n05_flash_prefill_7557_zoom.svg)。原始 Nsight 报告位于
+`build-fastllm/prefill-profile-20260930/prefill.nsys-rep`，可用 Nsight Systems GUI 打开。
+
+## CPU Top-K 并行优化实测（2026-09-30）
+
+`FastllmCudaNaiveIndexer` 的主机 Top-K 阶段已按 query 行并行，复用现有线程池，
+每个工作线程独立排序缓冲。采用步进分配行以平衡不同因果长度的工作量，并遵守
+线程池当前激活区间。原来的比较器和 `partial_sort` 保留，分数相同仍优先较早
+key；32 行以内的小批量和 decode 在调用线程计算，不启动并行任务。
+
+同一实际 7557-token 输入、单 NUMA/28 线程/RTX 4090、全部重新计算 KV，
+无 profiler 的对照如下。优化后测量两次独立加载的进程，第二次使用最终重新
+编译、安装并核对库哈希的版本：
+
+| 状态 | 优化前 | 优化后第一进程 | 最终安装版本 | 最终版本耗时减少 |
+| --- | ---: | ---: | ---: | ---: |
+| 首次异步请求，记录历史 | 46.811 秒 | 33.817 秒 | 33.886 秒 | 27.6% |
+| 预热后，记录历史 | 38.390 秒 | 25.490 秒 | 25.687 秒 | 33.1% |
+| 预热后，不记录历史 | 37.660 秒 | 24.701 秒 | 24.872 秒 | 34.0% |
+
+每个进程每种条件各一次，模型加载不计入首 token 时间。预热且记录历史的
+输入吞吐由约 197 提高到约 294 token/s。全部请求
+`cached_input_tokens=0`、`missed_input_tokens=7557`，首 token 与旧版一致。
+
+![Top-K 优化前后波形](benchmarks/naive_n05_flash_prefill_topk_parallel.png)
+
+Nsight 中 27 次主机选择段累计由 **13.340 秒降到 0.495 秒**，约为原来的
+1/27；完整预热请求由 38.402 秒降到 25.582 秒。CUDA 活动并集仍为约 18.65 秒，
+活动时间占请求的比例从 48.6% 提高到 72.9%。这些比例不代表 SM 占用率。
+
+正确性验证包含 FP8/non-FP8 分数、并列分数、因果 key 范围、`-1` 补位、
+串行与并行逐项对照，以及线程池激活区间从非零线程开始的情况。另用优化前
+共享库与最终共享库检查 2048×4096、2048×6144、1413×7557 和 1×7557 的索引
+选择，每种尺寸分别使用普通分数和全部并列分数，**22,568,960 个索引逐项一致**。
+`naive_n05_attention`、`numas_fp8_eager_moe_hybrid` 最终回归通过。
+
+优化后的波形进一步标记了 CPU 专家阶段：188 次 CPU 专家范围累计 19.560 秒，
+GPU 专家辅助范围累计 19.548 秒，两者并发、完成时间接近。GPU 辅助函数结束
+晚于 CPU 专家结束的正差累计只有 0.375 秒。其主机回填范围约 3.314 秒，大部分
+与 CPU 专家计算重叠。若保持当前 CPU 工作量和专家分工，单独缩短 GPU 搬运或
+回填的收益会受 CPU 限制；进一步优化需同时考虑 CPU 专家计算与分工比例。
+本次最终生产改动为 Top-K 并行化。
+
+详细数据、最终安装库哈希和索引对照哈希见
+[优化测量 JSON](benchmarks/naive_n05_flash_prefill_topk_parallel.json)，
+矢量波形见 [对照 SVG](benchmarks/naive_n05_flash_prefill_topk_parallel.svg)。优化后
+原始 Nsight 报告保存在 `build-fastllm/prefill-opt-20260930/prefill.nsys-rep`。
+
+## Prefill 分块与 CPU 任务粒度调优（2026-09-30）
+
+保持同一实际 7557-token 输入、单 NUMA、28 工作线程、RTX 4090、BF16 激活，
+并加载 7-token DSpark Draft。每次完整请求清空历史，再开启历史记录，全部
+`cached_input_tokens=0`。扩大分块减少不同块重复搬运专家权重的次数，并让更多
+CPU 专家达到按多行复用权重的 GEMM 路径。
+
+| 配置 | 预热首 token 时间 | 输入吞吐 |
+| --- | ---: | ---: |
+| 2048 分块、64 列 CPU 任务 | 25.13–25.60 秒 | 295–301 token/s |
+| 4096 分块、64 列 CPU 任务 | 22.51–23.22 秒 | 325–336 token/s |
+| 8192 分块、64 列 CPU 任务，尺寸已预热 | 20.37–20.47 秒 | 369–371 token/s |
+| 8192 分块、128 列 CPU 任务 | 20.43–20.45 秒 | 370 token/s |
+
+表中第一、第二行包含一次无插桩进程与同一加载进程中的对照；后两行暂为 CPU
+函数计时插桩进程的对照。首次扩大到 8192 时为 22.62 秒，包含更大工作区的
+分配，后续才降到约 20.4 秒。模型加载不计入以上时间。8192 时观察到 GPU
+显存占用约 21465 MiB，本次整模型输入长度为 7557。
+
+CPU FP8 eager prefill 的 gate/up 与 down 任务已从每个任务 64 列增至 128 列，
+仅在输入至少 256 行时启用；复用每个任务的激活解码，减少调度任务数。2048
+分块的同进程对照约节省 0.4–0.9 秒；8192 时 CPU 专家已经更早结束，完整
+请求收益很小。256 列没有带来稳定的额外收益，因此保留 128 列。
+
+原来的 2048 分块、8192 分块、以及 8192 加 128 列任务三组连续生成的
+32 个贪心 token 全部一致。新增 255、256、257 行 CPU 回归覆盖任务粒度切换
+边界，原生 CPU、AVX2 回退、CPU/GPU 混合、attention、历史缓存五项测试通过。
+
+本机启动命令可用：
+
+```bash
+FT_NUMAS=1 numactl -C 0-31 -m 0 \
+  ftllm server /home/tf/hfmodels/Naive-N0.5-Flash-FP8 \
+  --device cuda:0 --moe_device numa --threads 28 \
+  --draft /home/tf/hfmodels/Naive-N0.5-Flash-FP8-Draft --draft_tokens 7 \
+  --cache_history true --max_context_length 32768 \
+  --chunked_prefill_size 8192
+```
+
+测量数据见 [分块调优 JSON](benchmarks/naive_n05_flash_prefill_chunk_tuning.json)。
+本轮未保留宽 SIMD tile、激活行填充或长 attention 融合实验；长 attention
+融合在 157,401,088 字节输出逐位一致的情况下，在实际大尺寸中反而慢约 13%。
+
+### 最终安装版验证
+
+重新编译、安装并核对共享库哈希后，另起一个正常 `ftllm` 进程，不带实验 shim
+或计时插桩；默认分块仍是 2048，通过启动参数或模型接口选择更大的分块。
+
+| 最终安装版条件 | 首 token 时间 | 输入吞吐 |
+| --- | ---: | ---: |
+| 8192 分块，首次请求 | 31.823 秒 | 237 token/s |
+| 8192 分块，预热后，输出 1 token | 21.495 秒 | 352 token/s |
+| 4096 分块，预热后，输出 1 token | 22.852 秒 | 331 token/s |
+| 2048 分块，预热后，输出 1 token | 25.770 秒 | 293 token/s |
+| 8192 分块，继续预热后，输出 32 token | 20.808 秒 | 363 token/s |
+
+以上完整请求都重新计算 7557 个 token。相对同进程 2048 配置，8192 使预热
+首 token 时间减少约 17–19%。首次请求仍需 31.82 秒；分块调优没有消除首次
+大批量计算时的初始化成本。CPU 任务粒度的改动没有在默认 2048 的安装版
+完整请求上观察到稳定收益，因此主要加速来自显式选择 8192 分块。
+
+![分块与 CPU 专家时间对照](benchmarks/naive_n05_flash_prefill_chunk_tuning.png)
+
+安装版的 32-token 贪心输出与原版 2048 配置逐 token 一致。紧接着追加请求，
+复用 7588 个 token，只计算 2 个输入 token，首 token 为 **0.241 秒**。
+首次扩大分块、尺寸预热和缓存命中是不同条件，以上分别列出。
+最终共享库 SHA-256 与完整原始测量数值记录在调优 JSON 中；矢量图见
+[分块对照 SVG](benchmarks/naive_n05_flash_prefill_chunk_tuning.svg)。

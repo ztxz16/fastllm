@@ -6365,7 +6365,10 @@ namespace fastllm {
         auto *numaConfig = GetNumaConfig();
 
         int offset = 0;
-        int stride = 64;
+        // Wider prefill tasks reuse decoded FP8 activations across more
+        // output columns. Small batches retain their existing granularity.
+        const int fp8PrefillStride = fp8EagerMode && bs >= 256 ? 128 : 64;
+        int stride = fp8PrefillStride;
 
         const int gateCols = interDim * 2;
         const int gateColsPerNuma = gateCols / numaConfig->numaCnt;
@@ -6663,7 +6666,7 @@ namespace fastllm {
 
         // 5. down
         offset = 0;
-        stride = useDeepSeekV4GroupedDecodeFast ? 128 : 64;
+        stride = useDeepSeekV4GroupedDecodeFast ? 128 : fp8PrefillStride;
         if (useDeepSeekV4GroupedDecodeFast) {
             const int groups = std::max(
                 1, (int)groupedGemmExperts.size());

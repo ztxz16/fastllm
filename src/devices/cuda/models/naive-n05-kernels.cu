@@ -28,6 +28,55 @@ void CheckLaunch() {
         std::string("Naive-N0.5 CUDA: ") + cudaGetErrorString(status));
 }
 
+struct IndexerTopKOp : fastllm::MultiThreadBaseOp {
+    const float *scores;
+    int *indices;
+    int queries, keys, topK, queryStart, first, step;
+
+    void Run() override {
+        std::vector<int> order(keys);
+        // Each worker owns its scratch and writes disjoint query rows. Keep
+        // the original comparator and partial_sort so ties and index order
+        // remain identical to the serial path.
+        for (int row = first; row < queries; row += step) {
+            int end = queryStart + row + 1;
+            std::iota(order.begin(), order.begin() + end, 0);
+            const float *values = scores + (size_t)row * keys;
+            auto before = [&](int a, int b) {
+                return values[a] > values[b] || (values[a] == values[b] && a < b);
+            };
+            int valid = std::min(topK, end);
+            std::partial_sort(order.begin(), order.begin() + valid, order.begin() + end, before);
+            int *target = indices + (size_t)row * topK;
+            std::copy_n(order.data(), valid, target);
+            std::fill(target + valid, target + topK, -1);
+        }
+    }
+};
+
+void IndexerTopK(const float *scores, int *indices, int queries, int keys,
+                int queryStart, int topK) {
+    // Decode and small verification batches stay on the caller thread.
+    // Longer prefill reuses the existing pool, respecting its active range.
+    auto *pool = queries > 32 ? fastllm::GetAlivePool() : nullptr;
+    int first = pool ? pool->curActivateThreadInterval.first : 0;
+    int available = pool ? pool->curActivateThreadInterval.second - first : 1;
+    int threads = std::min(std::max(1, available), (queries + 31) / 32);
+    std::vector<IndexerTopKOp> tasks(threads);
+    for (int t = 0; t < threads; ++t) {
+        auto &task = tasks[t];
+        task.scores = scores; task.indices = indices;
+        task.queries = queries; task.keys = keys; task.topK = topK;
+        task.queryStart = queryStart; task.first = t; task.step = threads;
+    }
+    if (threads == 1) {
+        tasks[0].Run();
+    } else {
+        for (int t = 0; t < threads; ++t) pool->PushOp(first + t, &tasks[t]);
+        for (int t = 0; t < threads; ++t) pool->Wait(first + t);
+    }
+}
+
 __global__ void Rope(BF16 *data, const float *positions, int heads, int dim,
                      int rotaryDim, float theta) {
     int row = blockIdx.x, d = threadIdx.x;
@@ -244,20 +293,8 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
     indices.dataType = DataType::INT32;
     indices.Resize({queries, topK});
     indices.Allocate();
-    std::vector<int> order(keys);
-    for (int row = 0; row < queries; row++) {
-        std::iota(order.begin(), order.end(), 0);
-        const float *values = (float *)scores.cpuData + (size_t)row * keys;
-        auto before = [&](int a, int b) {
-            return values[a] > values[b] || (values[a] == values[b] && a < b);
-        };
-        int valid = std::min(topK, queryStart + row + 1);
-        std::partial_sort(order.begin(), order.begin() + valid,
-                          order.begin() + queryStart + row + 1, before);
-        int *target = (int *)indices.cpuData + (size_t)row * topK;
-        std::copy_n(order.data(), valid, target);
-        std::fill(target + valid, target + topK, -1);
-    }
+    IndexerTopK((const float *)scores.cpuData, (int *)indices.cpuData,
+                queries, keys, queryStart, topK);
     indices.ToDevice(DataDevice::CUDA, query.dataDeviceIds);
 }
 

@@ -1,0 +1,279 @@
+{
+  "date": "2026-09-30T13:10:27.268272+00:00",
+  "change": "Parallel CPU Top-K query rows using the existing active thread pool; original comparator and partial_sort retained.",
+  "configuration": {
+    "model": "Naive-N0.5-Flash-FP8",
+    "draft": "Naive-N0.5-Flash-FP8-Draft",
+    "draft_tokens": 7,
+    "input_tokens": 7557,
+    "output_tokens": 1,
+    "chunk_tokens": [
+      2048,
+      2048,
+      2048,
+      1413
+    ],
+    "numa_nodes": 1,
+    "memory_node": 0,
+    "cpu_affinity": "0-31",
+    "workers": 28,
+    "gpu": "RTX 4090",
+    "cuda_device": 0,
+    "max_context_length": 32768,
+    "default_command_uses_installed_package": true
+  },
+  "method": [
+    "Exact real Codex chat-template input; prompt and input IDs omitted.",
+    "Model loading and factory warm-up excluded; history cleared before each request.",
+    "Greedy single target output token isolates prefill, without sustained draft decoding.",
+    "Original baseline measured once per condition; optimized source measured in two independent processes.",
+    "Final build/package hashes match; final installed build repeats the complete input benchmark.",
+    "Nsight host selection gap bounds are score-download API return and index-upload API entry.",
+    "CUDA runtime correlation IDs attribute asynchronous GPU activity; interval unions avoid double counting.",
+    "No extra CUDA synchronization; CPU instruction sampling unavailable.",
+    "Only Top-K parallelization is retained in the final production change."
+  ],
+  "before_plain": [
+    {
+      "name": "cold_archive",
+      "ttft_seconds": 46.81094391900115,
+      "token": 271,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 1
+      }
+    },
+    {
+      "name": "warm_archive",
+      "ttft_seconds": 38.389712465999764,
+      "token": 271,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 1
+      }
+    },
+    {
+      "name": "warm_no_archive",
+      "ttft_seconds": 37.659589529001096,
+      "token": 271,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 1
+      }
+    }
+  ],
+  "after_plain_round1": [
+    {
+      "name": "cold_archive",
+      "ttft_seconds": 33.81679198200436,
+      "token": 271,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 1
+      }
+    },
+    {
+      "name": "warm_archive",
+      "ttft_seconds": 25.490146327996626,
+      "token": 271,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 1
+      }
+    },
+    {
+      "name": "warm_no_archive",
+      "ttft_seconds": 24.70107527000073,
+      "token": 271,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 1
+      }
+    }
+  ],
+  "after_plain_final": [
+    {
+      "name": "cold_archive",
+      "ttft_seconds": 33.886006654000084,
+      "token": 271,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 1
+      }
+    },
+    {
+      "name": "warm_archive",
+      "ttft_seconds": 25.68703248300153,
+      "token": 271,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 1
+      }
+    },
+    {
+      "name": "warm_no_archive",
+      "ttft_seconds": 24.871913710994704,
+      "token": 271,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 1
+      }
+    }
+  ],
+  "after_profile": [
+    {
+      "name": "cold_archive",
+      "ttft_seconds": 34.24475378700299,
+      "token": 271,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 1
+      }
+    },
+    {
+      "name": "warm_archive",
+      "ttft_seconds": 25.57712957500189,
+      "token": 271,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 1
+      }
+    },
+    {
+      "name": "warm_no_archive",
+      "ttft_seconds": 25.180997332994593,
+      "token": 271,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 1
+      }
+    }
+  ],
+  "installed_library_sha256": "d2d7900f5809107665aa1b79c4482c0aee4ffeb83043f3d94af9cc4c89749d38",
+  "profile_library_sha256": "16f9d548fe1036c8252cfa132c7fe8170d40f7447aed108c5590d103a179b5ea",
+  "correctness": {
+    "reference_library": "pre-optimization shared library",
+    "index_cases": [
+      {
+        "case": "1-7557-ties",
+        "indices": 2048,
+        "sha256": "cc76b029564c7257d6c27e130546ac40603f1e3ae5efc1106b2656294f599ec5",
+        "exact": true
+      },
+      {
+        "case": "1-7557-values",
+        "indices": 2048,
+        "sha256": "66512f87510cf922646b1e4e8095ecd06f0d96d5e0c50ef49444d36674fdaf54",
+        "exact": true
+      },
+      {
+        "case": "1413-7557-ties",
+        "indices": 2893824,
+        "sha256": "1a70525d9632d7fda8c0bcf67078f2ce4f481a6fe49df8aeb03ec246bf996788",
+        "exact": true
+      },
+      {
+        "case": "1413-7557-values",
+        "indices": 2893824,
+        "sha256": "c8aa83419509cd8fd7e2acc340bc2cf9129688b41726cbd1e75ed3aa8731c32b",
+        "exact": true
+      },
+      {
+        "case": "2048-4096-ties",
+        "indices": 4194304,
+        "sha256": "ced8387f2ccd8503fa4113ef299430a857c9a1df3ed8f4368a87a81f7c808a9e",
+        "exact": true
+      },
+      {
+        "case": "2048-4096-values",
+        "indices": 4194304,
+        "sha256": "94be1cd4ccd6591b5ee8a4677404ee1ce6f271083dce42ab9c062cb2a76cd1e7",
+        "exact": true
+      },
+      {
+        "case": "2048-6144-ties",
+        "indices": 4194304,
+        "sha256": "ced8387f2ccd8503fa4113ef299430a857c9a1df3ed8f4368a87a81f7c808a9e",
+        "exact": true
+      },
+      {
+        "case": "2048-6144-values",
+        "indices": 4194304,
+        "sha256": "ea33db4b53bf2056c02bf647c01c57b9940d591d494ff49d8771f8fc15ac501b",
+        "exact": true
+      }
+    ],
+    "total_indices_compared": 22568960,
+    "all_exact": true,
+    "final_library_indices_rechecked": true,
+    "first_output_token_equal_all_runs": true,
+    "ctest_passed": [
+      "naive_n05_attention",
+      "numas_fp8_eager_moe_hybrid"
+    ],
+    "coverage": [
+      "FP8 / non-FP8 scores",
+      "tied scores",
+      "causal key bounds and -1 padding",
+      "parallel vs single worker",
+      "nonzero active pool start",
+      "actual 2048/1413/1-query shapes vs old library"
+    ]
+  },
+  "warm_profile_comparison": {
+    "before_duration_seconds": 38.401688204,
+    "after_duration_seconds": 25.581923744,
+    "before_index_selection_seconds": 13.339530098,
+    "after_index_selection_seconds": 0.495261943,
+    "before_gpu_active_seconds": 18.659147252,
+    "after_gpu_active_seconds": 18.649434003,
+    "cpu_expert_inclusive_seconds": 19.560345608,
+    "gpu_expert_inclusive_seconds": 19.547751382,
+    "gpu_positive_tail_after_cpu_seconds": 0.3748034920000001,
+    "gpu_expert_scatter_host_seconds": 3.3142244860000023,
+    "note": "CPU/GPU experts run concurrently; inclusive durations cannot be added. Scatter mostly overlaps CPU work."
+  },
+  "final_plain_improvements": [
+    {
+      "name": "cold_archive",
+      "before_ttft_seconds": 46.81094391900115,
+      "after_ttft_seconds": 33.886006654000084,
+      "seconds_saved": 12.924937265001063,
+      "time_reduction_percent": 27.61093065622774,
+      "input_tokens_per_second_before": 161.43660792391157,
+      "input_tokens_per_second_after": 223.0124097289561
+    },
+    {
+      "name": "warm_archive",
+      "before_ttft_seconds": 38.389712465999764,
+      "after_ttft_seconds": 25.68703248300153,
+      "seconds_saved": 12.702679982998234,
+      "time_reduction_percent": 33.0887604179075,
+      "input_tokens_per_second_before": 196.8496119030048,
+      "input_tokens_per_second_after": 294.19513542488284
+    },
+    {
+      "name": "warm_no_archive",
+      "before_ttft_seconds": 37.659589529001096,
+      "after_ttft_seconds": 24.871913710994704,
+      "seconds_saved": 12.787675818006392,
+      "time_reduction_percent": 33.95596175619171,
+      "input_tokens_per_second_before": 200.66602144403262,
+      "input_tokens_per_second_after": 303.8366925766313
+    }
+  ],
+  "waveform": "naive_n05_flash_prefill_topk_parallel.svg",
+  "raw_report": "../../build-fastllm/prefill-opt-20260930/prefill.nsys-rep"
+}

@@ -193,7 +193,7 @@ int main(int argc, char **argv) {
         }
         Data x(BFLOAT16), ids(INT32), scores(FLOAT32), output(BFLOAT16), w1, w2, w3, ti, to;
         const std::vector<int> rowCases = hybrid ? std::vector<int>{256, 257, 65, 2} :
-                                                  std::vector<int>{1, 3, 65, 2};
+                                                  std::vector<int>{1, 3, 65, 2, 255, 256, 257};
         for (int rows : rowCases) {
             x.Resize({rows, hidden}); x.Allocate();
             ids.Resize({rows, topk}); ids.Allocate();
