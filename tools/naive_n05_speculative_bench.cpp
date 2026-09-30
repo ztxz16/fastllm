@@ -45,7 +45,12 @@ public:
             {"equal", fresh.first == first.first && first.first == cached.first}};
     }
     static Json CompareLogits(NaiveN05FlashModel &model, const std::vector<int> &prompt,
-                              const std::vector<int> &continuation) {
+                              const std::vector<int> &continuation, const std::string &outputPath) {
+        std::ofstream rawLogits;
+        if (!outputPath.empty()) {
+            rawLogits.open(outputPath, std::ios::binary | std::ios::trunc);
+            AssertInFastLLM(rawLogits.good(), "Cannot open logits output.");
+        }
         std::vector<std::pair<Data, Data>> sequential(model.block_cnt), batched(model.block_cnt);
         auto forward = [&](const std::vector<int> &tokens, int start,
                            std::vector<std::pair<Data, Data>> &kv, TargetCapture *capture) {
@@ -71,6 +76,10 @@ public:
             single.ToDevice(DataDevice::CPU);
             const float *a = (float *)single.cpuData;
             const float *b = (float *)batch.cpuData + (size_t)row * vocab;
+            if (!outputPath.empty()) {
+                rawLogits.write((const char *)a, vocab * sizeof(float));
+                AssertInFastLLM(rawLogits.good(), "Cannot write logits output.");
+            }
             int topA = std::max_element(a, a + vocab) - a, topB = std::max_element(b, b + vocab) - b;
             topMatches += topA == topB;
             double sumA = 0, sumB = 0, abs = 0;
@@ -89,7 +98,8 @@ public:
             metrics.push_back(Json::object{{"kl", kl}, {"max_abs", abs}, {"top1_sequential", topA}, {"top1_batched", topB}});
         }
         return Json::object{{"input_tokens", (int)prompt.size()}, {"verify_tokens", (int)continuation.size()},
-            {"max_kl", maxKL}, {"max_abs", maxAbs}, {"top1_matches", topMatches}, {"positions", metrics}};
+            {"max_kl", maxKL}, {"max_abs", maxAbs}, {"top1_matches", topMatches}, {"positions", metrics},
+            {"vocab_size", vocab}, {"logits_output", outputPath}};
     }
     static Json Run(NaiveN05FlashModel &model, const std::vector<int> &prompt,
                     const GenerationConfig &config, int candidates, float confidence) {
@@ -186,7 +196,8 @@ int main(int argc, char **argv) {
             std::vector<int> tokens;
             for (auto &token : test["verify_ids"].array_items()) tokens.push_back(token.int_value());
             AssertInFastLLM(!tokens.empty(), "Benchmark verification tokens must not be empty.");
-            record(NaiveBenchmarkAccess::CompareLogits(*model, prompt, tokens).object_items(), test, "LOGITS_RESULT");
+            record(NaiveBenchmarkAccess::CompareLogits(*model, prompt, tokens,
+                test["logits_output"].string_value()).object_items(), test, "LOGITS_RESULT");
             continue;
         }
         GenerationConfig config;

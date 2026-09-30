@@ -140,6 +140,10 @@ void NaiveN05FlashModel::InitParams() {
 std::map<std::string, std::vector<std::pair<std::string, DataType>>>
 NaiveN05FlashModel::GetTensorMap(const std::vector<std::string> &names) {
     auto result = basellm::GetTensorMap(names);
+    const bool compactNvfp4 = std::any_of(names.begin(), names.end(), [](const std::string &name) {
+        return name.find(".mlp.experts.") != std::string::npos &&
+               (StringEndWith(name, ".weight_scale") || StringEndWith(name, ".weight_scale_2"));
+    });
     for (auto &name : names) {
         if (draftEnabled && (name.rfind("layers.", 0) == 0 ||
                 name.rfind("markov_head.", 0) == 0 || name.rfind("confidence_head.", 0) == 0 ||
@@ -148,6 +152,10 @@ NaiveN05FlashModel::GetTensorMap(const std::vector<std::string> &names) {
             auto type = (name.find("norm.weight") != std::string::npos ||
                          name.rfind("confidence_head.", 0) == 0) ? DataType::FLOAT32 : DataType::BFLOAT16;
             result[name] = {{"dspark." + name, type}};
+        } else if (compactNvfp4 && moeLinears.count(name)) {
+            // Preserve the E4M3 scale bytes for NUMA's compact grouped kernel.
+            // The loader checks the source dtype before using this layout.
+            result[name] = {{name, DataType::NVFP4_BLOCK_16_E4M3}};
         } else if (name.find(".mlp.gate.") != std::string::npos) {
             result[name] = {{name, DataType::FLOAT32}};
         } else if (name.find(".mlp.experts.") == std::string::npos &&
