@@ -1,6 +1,6 @@
 # FastLLM
 
-[English](README_EN.md) · [快速开始](#快速开始) · [模型部署指南](#模型部署指南) · [Benchmark](docs/benchmark.md) · [常用参数](#常用参数) · [版本日志](docs/version.md)
+[English](README_EN.md) · [快速开始](#快速开始) · [模型部署指南](#模型部署指南) · [Flash-Next 用户手册](docs/qwen3.8-flash-next/README.md) · [Benchmark](docs/benchmark.md) · [常用参数](#常用参数) · [版本日志](docs/version.md)
 
 FastLLM 是一个面向本地运行和服务部署的高性能大模型推理引擎。核心运行时使用 C++ 实现，不依赖 PyTorch，支持稠密模型与 MoE 模型，并提供 CUDA、ROCm、CPU、NUMA、磁盘混合推理以及多卡张量并行能力。
 
@@ -153,7 +153,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 | 模型 | 部署指南 | 推荐配置入口 | Benchmark |
 | --- | --- | --- | --- |
-| Qwen4-Exp / Qwen3.8-Flash-Next | [Qwen4-Exp 指南](docs/qwen4.md) | PLE、QSA、CUDA/NUMA、`--ngram_device disk` | [Qwen4 Benchmark](docs/benchmarks/qwen4_exp.md) |
+| Qwen4-Exp / Qwen3.8-Flash-Next | [用户手册](docs/qwen3.8-flash-next/README.md) | 双卡串行 / TP2、专家缓存、固定 GPU 专家层、MTP | [本机实测性能](docs/qwen3.8-flash-next/README.md#performance) |
 | Qwen3.5 / Qwen3.6 / Qwen3.8 | [Qwen 当前模型指南](docs/qwen3.md) | 单卡、TP、混合 MoE、MTP、DFlash2 | [Qwen3 Benchmark](docs/benchmarks/qwen3.md) |
 | DeepSeek-V4 / V4-Flash | [DeepSeek-V4 指南](docs/deepseek.md) | CUDA + NUMA、磁盘专家、TP、内置 DSpark | [DeepSeek-V4 Benchmark](docs/benchmarks/deepseek_v4.md) |
 | Kimi-K3 | [Kimi-K3 指南](docs/kimi_k3.md) | KDA/MLA、混合专家、磁盘专家、外部 DSpark | [Kimi-K3 Benchmark](docs/benchmarks/kimi_k3.md) |
@@ -250,7 +250,7 @@ ftllm server /data/models/qwen4-exp \
   --ngram_device disk
 ~~~
 
-磁盘模式会降低常驻内存，但增加随机 I/O，建议使用高速 SSD。更多限制见 [Qwen4-Exp 文档](docs/qwen4_exp.md)。
+磁盘模式会降低常驻内存，但增加随机 I/O，建议使用高速 SSD。更多限制见 [Flash-Next 用户手册](docs/qwen3.8-flash-next/README.md)。
 
 ## 常用参数
 
@@ -433,7 +433,7 @@ bash install.sh
 | 主题 | 文档 |
 | --- | --- |
 | 发布说明 | [稳定版日志](docs/version.md) · [Nightly 使用](docs/nightly.md) · [Nightly 日志](docs/nightly_changelog.md) |
-| 模型部署 | [Qwen4-Exp](docs/qwen4.md) · [Qwen3.5/3.6/3.8](docs/qwen3.md) · [DeepSeek-V4](docs/deepseek.md) · [Kimi-K3](docs/kimi_k3.md) · [Dots3-Note](docs/dots3_note.md) · [GLM-5](docs/glm5.md) · [Laguna](docs/laguna.md) |
+| 模型部署 | [Qwen3.8-Flash-Next](docs/qwen3.8-flash-next/README.md) · [Qwen3.5/3.6/3.8](docs/qwen3.md) · [DeepSeek-V4](docs/deepseek.md) · [Kimi-K3](docs/kimi_k3.md) · [Dots3-Note](docs/dots3_note.md) · [GLM-5](docs/glm5.md) · [Laguna](docs/laguna.md) |
 | 混合推理 | [GPU、NUMA 与磁盘混合部署](docs/mixforward.md) |
 | 性能与验证 | [按模型查看 Benchmark](docs/benchmark.md) |
 | 量化 | [动态量化配置](docs/dtype_config.md) |

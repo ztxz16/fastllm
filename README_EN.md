@@ -1,6 +1,6 @@
 # FastLLM
 
-[中文](README.md) · [Quick start](#quick-start) · [Model deployment guides](#model-deployment-guides) · [Benchmarks](docs/benchmark_en.md) · [Common options](#common-options) · [Changelog](docs/version_en.md)
+[中文](README.md) · [Quick start](#quick-start) · [Model deployment guides](#model-deployment-guides) · [Flash-Next user guide](docs/qwen3.8-flash-next/README_EN.md) · [Benchmarks](docs/benchmark_en.md) · [Common options](#common-options) · [Changelog](docs/version_en.md)
 
 FastLLM is a high-performance inference engine for running and serving large language models. Its core runtime is implemented in C++ and does not depend on PyTorch. It supports dense and MoE models across CUDA, ROCm, CPU, NUMA, disk-assisted hybrid inference, and multi-GPU tensor parallelism.
 
@@ -157,7 +157,7 @@ Attention architecture, MoE placement, speculative decoding, and quantization di
 
 | Model | Deployment guide | Recommended configuration topics | Benchmark |
 | --- | --- | --- | --- |
-| Qwen4-Exp / Qwen3.8-Flash-Next | [Qwen4-Exp guide](docs/qwen4_exp.md) | PLE, QSA, CUDA/NUMA, and `--ngram_device disk` | [Qwen4 benchmark](docs/benchmarks/qwen4_exp_en.md) |
+| Qwen4-Exp / Qwen3.8-Flash-Next | [Flash-Next user guide](docs/qwen3.8-flash-next/README_EN.md) | Dual-GPU serial / TP2, expert cache, resident GPU expert layers, MTP | [Measured performance](docs/qwen3.8-flash-next/README_EN.md#performance) |
 | Qwen3.5 / Qwen3.6 / Qwen3.8 | [Current Qwen guide](docs/qwen3_en.md) | Single GPU, TP, hybrid MoE, MTP, and DFlash2 | [Qwen3 benchmarks](docs/benchmarks/qwen3_en.md) |
 | DeepSeek-V4 / V4-Flash | [DeepSeek-V4 guide](docs/deepseek_en.md) | CUDA + NUMA, disk experts, TP, and embedded DSpark | [DeepSeek-V4 benchmark](docs/benchmarks/deepseek_v4_en.md) |
 | Kimi-K3 | [Kimi-K3 guide](docs/kimi_k3_en.md) | KDA/MLA, hybrid and disk experts, external DSpark | [Kimi-K3 benchmark](docs/benchmarks/kimi_k3_en.md) |
@@ -254,7 +254,7 @@ ftllm server /data/models/qwen4-exp \
   --ngram_device disk
 ~~~
 
-Disk mode reduces resident memory at the cost of random I/O; a fast SSD is recommended. See the [Qwen4-Exp guide](docs/qwen4_exp.md) for details.
+Disk mode reduces resident memory at the cost of random I/O; a fast SSD is recommended. See the [Flash-Next user guide](docs/qwen3.8-flash-next/README_EN.md) for details.
 
 ## Common options
 
@@ -432,7 +432,7 @@ Additional platform documentation:
 | Topic | Documents |
 | --- | --- |
 | Releases | [Stable changelog](docs/version_en.md) · [Nightly usage](docs/nightly.md) · [Nightly changelog](docs/nightly_changelog.md) |
-| Model deployment | [Qwen4-Exp](docs/qwen4_exp.md) · [Qwen3.5/3.6/3.8](docs/qwen3_en.md) · [DeepSeek-V4](docs/deepseek_en.md) · [Kimi-K3](docs/kimi_k3_en.md) · [Dots3-Note](docs/dots3_note_en.md) · [GLM-5](docs/glm5_en.md) · [Laguna](docs/laguna_en.md) |
+| Model deployment | [Qwen3.8-Flash-Next](docs/qwen3.8-flash-next/README_EN.md) · [Qwen3.5/3.6/3.8](docs/qwen3_en.md) · [DeepSeek-V4](docs/deepseek_en.md) · [Kimi-K3](docs/kimi_k3_en.md) · [Dots3-Note](docs/dots3_note_en.md) · [GLM-5](docs/glm5_en.md) · [Laguna](docs/laguna_en.md) |
 | Hybrid inference | [GPU, NUMA, and disk deployment](docs/mixforward.md) |
 | Performance and validation | [Benchmarks by model](docs/benchmark_en.md) |
 | Quantization | [Dynamic quantization configuration](docs/dtype_config.md) |
