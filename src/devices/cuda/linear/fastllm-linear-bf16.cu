@@ -25,10 +25,9 @@ template <int THREAD_PER_BLOCK, int PART>
 __global__ void FastllmGemvBf16Bf16Kernel2MultiRow(__nv_bfloat16 *A, __nv_bfloat16 *B, __nv_bfloat16 *C, __nv_bfloat16 *bias, int m, int k) {
     __shared__ float sdata[PART][THREAD_PER_BLOCK];
     unsigned int tid = threadIdx.x;
-    // Keep exact small batches on the very same PART=1 kernel as ordinary
-    // decode.  blockIdx.y only selects an independent input/output row, so
-    // each row retains the same instructions and reduction order as a
-    // separate one-row launch on every CUDA architecture.
+    // Large exact batches use grid.y for independent rows. Small batches
+    // share each weight load across PART rows with the same per-row sums
+    // and reduction tree as one-row decode.
     if constexpr (PART == 1) {
         const size_t gridRow = (size_t)blockIdx.y;
         A += gridRow * m;
@@ -47,10 +46,10 @@ __global__ void FastllmGemvBf16Bf16Kernel2MultiRow(__nv_bfloat16 *A, __nv_bfloat
     if (m % 8 == 0) {
 #pragma unroll
         for (int i = tid * 8; i < m; i += THREAD_PER_BLOCK * 8) {
+            regB.in = *reinterpret_cast<const uint4 *>(baseB + i);
 #pragma unroll
             for (int x = 0; x < PART; x++) {
                 regA.in = *reinterpret_cast<const uint4 *>(A + x * m + i);
-                regB.in = *reinterpret_cast<const uint4 *>(baseB + i);
                 float sum = 0.0f;
                 if (i < m)
                     sum += __bfloat162float(regA.out2[0].x) * __bfloat162float(regB.out2[0].x);
@@ -612,23 +611,8 @@ void LaunchFastllmGemmFp16Bf16(half *input, __nv_bfloat16 *weight, half *output,
 }
 
 void LaunchFastllmGemmBf16Bf16(__nv_bfloat16 *input, __nv_bfloat16 *weight, __nv_bfloat16 *output, __nv_bfloat16 *bias, int n, int m, int k) {
-    if (n > 1 &&
-        n < fastllm::FastllmCudaGetLinearExactBatchThreshold()) {
-        // CUDA guarantees at least 65,535 blocks in grid.y. Preserve the
-        // previous launch-per-row fallback if an external caller requests a
-        // larger exact batch instead of relying on a device-specific limit.
-        if (n <= 65535) {
-            FastllmGemvBf16Bf16Kernel2MultiRow<256, 1>
-                <<<dim3(k, n), 256>>>(
-                    input, weight, output, bias, m, k);
-        } else {
-            for (int i = 0; i < n; ++i) {
-                FastllmGemvBf16Bf16Kernel2MultiRow<256, 1>
-                    <<<k, 256>>>(input + (size_t)i * m, weight,
-                                 output + (size_t)i * k, bias, m, k);
-            }
-        }
-    } else if (n == 1) {
+    // PART=2..8 reuses the weights without changing the per-row reduction.
+    if (n == 1) {
         FastllmGemvBf16Bf16Kernel2MultiRow<256, 1> <<<k, 256>>>(input, weight, output, bias, m, k);
     } else if (n == 2) {
         FastllmGemvBf16Bf16Kernel2MultiRow<256, 2> <<<k, 256>>>(input, weight, output, bias, m, k);
@@ -644,9 +628,16 @@ void LaunchFastllmGemmBf16Bf16(__nv_bfloat16 *input, __nv_bfloat16 *weight, __nv
         FastllmGemvBf16Bf16Kernel2MultiRow<256, 7> <<<k, 256>>>(input, weight, output, bias, m, k);
     } else if (n == 8) {
         FastllmGemvBf16Bf16Kernel2MultiRow<256, 8> <<<k, 256>>>(input, weight, output, bias, m, k);
+    } else if (n > 8 && n <= 65535 &&
+               n < fastllm::FastllmCudaGetLinearExactBatchThreshold()) {
+        // Larger exact batches use independent rows, within grid.y's limit.
+        FastllmGemvBf16Bf16Kernel2MultiRow<256, 1>
+            <<<dim3(k, n), 256>>>(input, weight, output, bias, m, k);
     } else {
         for (int i = 0; i < n; i++) {
-            FastllmGemvBf16Bf16Kernel2MultiRow<256, 1> <<<k, 256>>>(input + i * m, weight, output + i * k, bias, m, k);
+            FastllmGemvBf16Bf16Kernel2MultiRow<256, 1>
+                <<<k, 256>>>(input + (size_t)i * m, weight,
+                             output + (size_t)i * k, bias, m, k);
         }
     }
 }

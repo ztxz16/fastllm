@@ -11359,14 +11359,22 @@ namespace {
 
         auto runBf16Case = [&](int inputDim, int outputDim,
                                bool withBias) {
-            const std::vector<float> allInputs = makeValues(
-                (size_t)5 * inputDim,
+            auto variedValues = [&](size_t count, uint32_t seed, float scale) {
+                auto values = makeValues(count, seed, scale);
+                // Mixed exponents exercise rounding and cancellation, which
+                // small fixed-point dot products can leave entirely exact.
+                for (size_t i = 0; i < count; ++i)
+                    values[i] = std::ldexp(values[i], (int)(i % 13) - 6);
+                return values;
+            };
+            const std::vector<float> allInputs = variedValues(
+                (size_t)9 * inputDim,
                 0x51f2a9d3u + inputDim, 1.0f / 64.0f);
             fastllm::Data weight = MakeCudaTensor(
                 fastllm::DataType::BFLOAT16,
                 {outputDim, inputDim},
-                makeValues((size_t)outputDim * inputDim,
-                           0xa73c19e5u + outputDim, 1.0f / 256.0f));
+                variedValues((size_t)outputDim * inputDim,
+                             0xa73c19e5u + outputDim, 1.0f / 256.0f));
             fastllm::Data bias = withBias ? MakeCudaTensor(
                 fastllm::DataType::FLOAT32, {outputDim},
                 makeValues(outputDim, 0x138bd24fu, 1.0f / 128.0f)) :
@@ -11379,7 +11387,7 @@ namespace {
                 return FastllmCudaBFloat16MatMulBFloat16(
                     input, caseWeight, caseBias, output, n, m, k);
             };
-            for (int rows = 2; rows <= 5; rows++) {
+            for (int rows = 2; rows <= 9; rows++) {
                 verifyRows(
                     "BF16xBF16 m=" + std::to_string(inputDim) +
                         " k=" + std::to_string(outputDim) +
@@ -11533,6 +11541,10 @@ namespace {
         for (bool withBias : {false, true}) {
             runBf16Case(256, 257, withBias);
             runBf16Case(259, 193, withBias);
+            // Exercise multiple accumulation iterations in the shared-weight
+            // kernel, including its unaligned path and the row-9 fallback.
+            runBf16Case(4096, 257, withBias);
+            runBf16Case(4103, 193, withBias);
             runFp32Case(
                 fastllm::DataType::BFLOAT16,
                 256, 257, withBias);
