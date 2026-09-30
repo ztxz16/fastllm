@@ -11,6 +11,7 @@ import copy
 import importlib.util
 import json
 from pathlib import Path
+import sys
 
 
 def main():
@@ -31,6 +32,7 @@ def main():
     destination.mkdir(parents=True, exist_ok=True)
     module_spec = importlib.util.spec_from_file_location("naive_original_dflash", root / "dflash.py")
     module = importlib.util.module_from_spec(module_spec)
+    sys.modules[module_spec.name] = module
     module_spec.loader.exec_module(module)
     config_data = json.loads((root / "config.json").read_text())
     config = Qwen3Config(**config_data)
