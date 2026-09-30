@@ -40,7 +40,7 @@ public:
         std::lock_guard<std::mutex> guard(forwardLocker);
         return Create(tokens);
     }
-    void Feed(ResponseContext *context, int past, int count) {
+    void Feed(ResponseContext *context, int past, int count, size_t accountedBytes = 0) {
         auto chunk = BeginHistoryChunk(context->pastKeyValues, past, count);
         Require(chunk && chunk->length == count, "History recording was unavailable");
         for (int layer = 0; layer < block_cnt; ++layer) {
@@ -53,12 +53,18 @@ public:
                 CopyHistoryTensor(input, part ? chunk->layers[layer].second : chunk->layers[layer].first, count);
             }
         }
+        // Exercise budget eviction without allocating GiB-sized test tensors.
+        if (accountedBytes) chunk->bytes = accountedBytes;
         FinishHistoryChunk(context->pastKeyValues, chunk);
     }
     void CheckBound(ResponseContext *context) {
         auto chunk = BeginHistoryChunk(context->pastKeyValues, 0, 100000000);
-        Require(chunk && chunk->length < 100000000 && chunk->bytes <= (1ULL << 30),
+        Require(chunk && chunk->length < 100000000 && chunk->bytes <= (8ULL << 30),
                 "Archive capacity did not limit an oversized request");
+    }
+    void CheckFull(ResponseContext *context, int past) {
+        Require(!BeginHistoryChunk(context->pastKeyValues, past, 1),
+                "Full history archive exceeded its byte limit");
     }
     void CheckRestored(ResponseContext *context, int expected) {
         Require(context->cacheLen == expected, "Incorrect cached prefix length");
@@ -155,6 +161,21 @@ int main() {
         model.TryRecordResponseContext(last);
         Require(model.Create({1003, 20, 30})->cacheLen == 0, "Recording a covered prefix did not refresh LRU");
         model.CheckRestored(model.Create({1002, 20, 30}), 2);
+
+        // A short title request must not evict a main record at the per-record
+        // byte limit. Their token prefixes are independent, as in Codex.
+        model.SetSaveHistoryChat(false);
+        model.SetSaveHistoryChat(true);
+        auto *mainRequest = model.Create({2000, 20});
+        model.Feed(mainRequest, 0, 2, 8ULL << 30);
+        model.CheckFull(mainRequest, 2);
+        model.TryRecordResponseContext(mainRequest);
+        auto *titleRequest = model.Create({3000, 20});
+        model.Feed(titleRequest, 0, 2, 1ULL << 30);
+        model.TryRecordResponseContext(titleRequest);
+        model.CheckRestored(model.Create({2000, 20, 30}), 2);
+        model.CheckRestored(model.Create({3000, 20, 30}), 2);
+
         std::cout << "Naive history prefix, fork, sliding, index, isolation and LRU: PASS\n";
     } catch (const std::exception &e) {
         std::cerr << e.what() << '\n';

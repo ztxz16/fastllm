@@ -26,7 +26,7 @@ std::shared_ptr<NaiveN05FlashModel::HistoryChunk> NaiveN05FlashModel::BeginHisto
     if (!saveHistoryChat || it == activeHistory.end() ||
         it->second.length != past || historyBytesPerToken == 0) return nullptr;
     auto &state = it->second;
-    int rows = std::min<size_t>(length, (historyByteLimit - state.bytes) / historyBytesPerToken);
+    int rows = std::min<size_t>(length, (historyRecordByteLimit - state.bytes) / historyBytesPerToken);
     if (rows <= 0) return nullptr;
     auto chunk = std::make_shared<HistoryChunk>();
     chunk->length = rows;
@@ -230,10 +230,9 @@ void NaiveN05FlashModel::TryRecordResponseContext(ResponseContext *context) {
             std::equal(entry->tokens.begin(), entry->tokens.end(), memory->tokens.begin());
     }), history.end());
     history.push_back(std::move(memory));
-    size_t bytes = 0;
-    for (const auto &entry : history) bytes += entry->bytes;
-    while (history.size() > historyRecordLimit || bytes > historyByteLimit) {
-        bytes -= history.front()->bytes;
+    // BeginHistoryChunk bounds each record; limiting the count also bounds
+    // the completed archives to historyRecordLimit * historyRecordByteLimit.
+    while (history.size() > historyRecordLimit) {
         history.erase(history.begin());
     }
 }

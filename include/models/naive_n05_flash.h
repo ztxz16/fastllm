@@ -100,9 +100,11 @@ namespace fastllm {
             size_t bytes = 0;
         };
         // Archives use host memory, never a second persistent GPU KV copy.
-        // An active request may build one additional archive of this size.
-        static constexpr size_t historyByteLimit = 1ULL << 30;
+        // Bound each record independently so a small auxiliary request does
+        // not evict the main conversation's nearly-full archive.
         static constexpr size_t historyRecordLimit = 5;
+        // Enough for the usual 32K local-agent context, including draft state.
+        static constexpr size_t historyRecordByteLimit = 8ULL << 30;
         size_t historyBytesPerToken = 0;
         std::mutex historyMutex;
         // Oldest first; completed records and their chunks are immutable.
