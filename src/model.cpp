@@ -294,18 +294,22 @@ namespace fastllm {
         }
         std::vector<FastllmCudaMoeCacheLayer> layers;
         layers.reserve(layerWeights.size());
-        for (const auto &weights : layerWeights) {
+        bool allNuma = true;
+        for (int layer = 0; layer < static_cast<int>(layerWeights.size()); ++layer) {
+            const std::string device = SelectMoeDeviceForLayer(layer);
+            // GPU-resident layers keep their own expert layout. Register only
+            // host tables, including when the first layer resides on CUDA.
+            const bool numa = device == "numa" || device.compare(0, 5, "numa:") == 0;
+            if (device != "cpu" && !numa) continue;
+            allNuma = allNuma && numa;
+            const auto &weights = layerWeights[layer];
             layers.push_back({
                 weights.data(),
                 static_cast<int>(weights.size())});
         }
+        if (layers.empty()) return false;
         std::function<void()> registerNumaWeights;
 #ifdef USE_NUMAS
-        bool allNuma = true;
-        for (int layer = 0; layer < static_cast<int>(layers.size()); ++layer) {
-            const std::string device = SelectMoeDeviceForLayer(layer);
-            allNuma = allNuma && (device == "numa" || device.compare(0, 5, "numa:") == 0);
-        }
         if (allNuma) {
             registerNumaWeights = [this] { WarmupNumaMoeWeights(); };
         }
@@ -360,7 +364,6 @@ namespace fastllm {
             if (!weights.empty()) {
                 FastllmCudaReleaseMoeCache(
                     weights.data(), static_cast<int>(weights.size()));
-                return;
             }
         }
 #else

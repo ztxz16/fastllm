@@ -165,6 +165,68 @@ class FastLLmModelContextMetadataTest(unittest.TestCase):
         self.assertEqual(model["default_reasoning_effort"], "xhigh")
         self.assertEqual(model["defaultReasoningEffort"], "xhigh")
 
+    def test_native_vision_model_advertises_image_input_without_mmproj(self):
+        for architecture, model_type in [
+            ("Qwen3_5ForConditionalGeneration", "qwen3_5"),
+            ("Qwen3_5MoeForConditionalGeneration", "qwen3_5_moe"),
+            ("CogVLMForCausalLM", "cogvlm"),
+            ("Gemma4ForConditionalGeneration", "gemma4"),
+            ("Step3p7ForConditionalGeneration", "step3p5"),
+            ("DeepseekV41ForCausalLM", "deepseek_v41"),
+            ("Qwen3_8FlashNextForConditionalGeneration", "qwen4_exp"),
+        ]:
+            with self.subTest(architecture=architecture):
+                native_model = _FakeModel(65536, 100000, model_type=model_type)
+                native_model.config = {
+                    "architectures": [architecture],
+                    "vision_config": {"hidden_size": 1152},
+                }
+                model = FastLLmModel("custom-alias", native_model).response["data"][0]
+                self.assertEqual(model["input_modalities"], ["text", "image"])
+                self.assertEqual(model["inputModalities"], ["text", "image"])
+
+    def test_deepseek_v41_model_type_and_flat_vision_config(self):
+        for model_type in ("deepseek_v41", "deepseek_v41_text"):
+            for vision in ({"vision_config": {"num_hidden_layers": 2}},
+                           {"vision_n_layers": 2}):
+                with self.subTest(model_type=model_type, vision=vision):
+                    native_model = _FakeModel(65536, 100000)
+                    native_model.config = {"architectures": ["NativeCheckpoint"],
+                                           "model_type": model_type, **vision}
+                    model = FastLLmModel("alias", native_model).response["data"][0]
+                    self.assertEqual(model["input_modalities"], ["text", "image"])
+
+    def test_new_vision_architectures_keep_text_only_checkpoints_text_only(self):
+        for architecture in ("DeepseekV41ForCausalLM",
+                             "Qwen3_8FlashNextForConditionalGeneration"):
+            for vision in ({}, {"vision_config": {}}, {"vision_config": "invalid"},
+                           {"vision_n_layers": 0},
+                           {"vision_config": {"hidden_size": 1152}, "language_model_only": True}):
+                with self.subTest(architecture=architecture, vision=vision):
+                    native_model = _FakeModel(65536, 100000)
+                    native_model.config = {"architectures": [architecture], **vision}
+                    model = FastLLmModel("vision-alias", native_model).response["data"][0]
+                    self.assertEqual(model["input_modalities"], ["text"])
+
+    def test_text_only_and_unknown_vision_models_do_not_advertise_images(self):
+        for config in [
+            {},
+            {"architectures": ["Qwen3_5ForConditionalGeneration"]},
+            {"architectures": ["Qwen3_5ForConditionalGeneration"], "vision_config": {}},
+            {"architectures": ["Qwen3_5ForConditionalGeneration"],
+             "vision_config": {"hidden_size": 1152}, "language_model_only": True},
+            {"architectures": ["Qwen3_5ForConditionalGeneration"], "vision_config": "invalid"},
+            {"architectures": ["UnknownForConditionalGeneration"],
+             "vision_config": {"hidden_size": 1152}},
+            {"architectures": ["Qwen4ExpForConditionalGeneration"],
+             "model_type": "qwen4_exp", "vision_config": {"hidden_size": 1152}},
+        ]:
+            with self.subTest(config=config):
+                native_model = _FakeModel(65536, 100000)
+                native_model.config = config
+                model = FastLLmModel("qwen-vision-alias", native_model).response["data"][0]
+                self.assertEqual(model["input_modalities"], ["text"])
+
     def test_mmproj_model_advertises_image_input(self):
         native_model = _FakeModel(262144, 262144, model_type = "qwen3_5")
         native_model.mmproj_path = "/models/mmproj.gguf"

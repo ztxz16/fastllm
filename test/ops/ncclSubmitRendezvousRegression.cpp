@@ -24,8 +24,8 @@ static void RunRanks(int ranks, const std::function<void(int)> &fn) {
     for (auto &worker : workers) worker.join();
 }
 
-static void CheckOrdering(int ranks) {
-    constexpr int rounds = 128;
+static void CheckOrdering(int ranks, bool delayed = true) {
+    const int rounds = delayed ? 128 : 4096;
     NcclSubmitRendezvous group(ranks, 5s);
     std::vector<std::atomic<int>> prepared(rounds), submitted(rounds);
     for (int i = 0; i < rounds; ++i) {
@@ -37,12 +37,12 @@ static void CheckOrdering(int ranks) {
             // Rotate the slow rank on each side of the collective. No rank
             // may enter NCCL before all previous host work has finished, or
             // enter the next GEMM before all NCCL host calls have returned.
-            if (rank == i % ranks) std::this_thread::sleep_for(50us);
+            if (delayed && rank == i % ranks) std::this_thread::sleep_for(50us);
             ++prepared[i];
             Require(group.Wait(rank, NcclSubmitRendezvous::Before,
                                100 + i, i % 3), "before boundary failed");
             Require(prepared[i] == ranks, "entered submission before peers were ready");
-            if (rank == (i + 1) % ranks) std::this_thread::sleep_for(50us);
+            if (delayed && rank == (i + 1) % ranks) std::this_thread::sleep_for(50us);
             ++submitted[i];
             Require(group.Wait(rank, NcclSubmitRendezvous::After,
                                100 + i, i % 3), "after boundary failed");
@@ -105,7 +105,10 @@ static void CheckFailures() {
 }
 
 int main() {
-    for (int ranks : {3, 5, 7}) CheckOrdering(ranks);
+    for (int ranks : {2, 3, 4, 5, 7}) {
+        CheckOrdering(ranks);
+        CheckOrdering(ranks, false);
+    }
     CheckFailures();
-    std::cout << "PASS: odd-rank host ordering, independent groups, failure wakeup\n";
+    std::cout << "PASS: even/odd-rank host ordering, fast reuse, independent groups, failure wakeup\n";
 }

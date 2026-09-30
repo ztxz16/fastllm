@@ -24,6 +24,7 @@ namespace fastllm {
         ~Qwen4ExpModel() override;
 
         void InitParams() override;
+        bool RetainCudaWorkspace() const override;
 
         std::map<std::string, std::vector<std::pair<std::string, DataType>>>
         GetTensorMap(const std::vector<std::string> &tensorNames) override;
@@ -73,11 +74,13 @@ namespace fastllm {
         bool UseGenericHistoryCache() const override { return false; }
 
     private:
+        friend struct Qwen4PrefixCacheTestAccess;
         struct PrefixSnapshot;
         struct DecodeCudaGraphState;
         struct PleStagingState;
         struct MtpDraftCudaGraphState;
         struct QsaHostMirrorTransfer;
+        struct ServingCache;
         struct MtpRuntimeState;
         struct ThreadTpState;
         std::unique_ptr<ThreadTpState> threadTpState;
@@ -98,6 +101,8 @@ namespace fastllm {
                 const Data *precomputedEmbedding = nullptr);
 
         struct RequestState {
+            // Exclusive request lease on the model's startup allocation.
+            std::shared_ptr<ServingCache> servingCache;
             std::shared_ptr<PleStagingState> pleStaging;
             int previousToken1 = -1;
             int previousToken2 = -1;
@@ -129,6 +134,9 @@ namespace fastllm {
             // TP dense graphs retain the legacy attention padding width even
             // when physical KV storage is reserved or reused across requests.
             int denseGraphWidth = 0;
+            // Token IDs cannot identify image/video embeddings or M-RoPE state.
+            // Keep this flag through decode, including direct C++ forwards.
+            bool hasMultimodalInput = false;
             std::vector<int> processedTokens;
             int prefixRequestId = 0;
             int lastPrefixSnapshotLen = 0;
@@ -143,6 +151,19 @@ namespace fastllm {
             std::shared_ptr<MtpRuntimeState> mtpState;
             bool mtpDisabled = false;
         };
+
+        struct ServingCache {
+            std::vector<std::pair<Data, Data>> layers;
+            std::pair<Data, Data> mtp;
+            std::map<int, std::shared_ptr<QsaHostMirrorTransfer>> hostMirrors;
+        };
+        std::shared_ptr<ServingCache> servingCache;
+        void ClearWarmupCache(std::vector<std::pair<Data, Data>> &cache);
+        void ReserveServingCache(std::vector<std::pair<Data, Data>> &warmupCache);
+        void AcquireServingCache(std::vector<std::pair<Data, Data>> &cache,
+                                 RequestState &state);
+        std::shared_ptr<QsaHostMirrorTransfer> &GetQsaHostMirror(
+                RequestState &state, int layer);
 
         struct RequestRuntimeCheckpoint {
             int previousToken1 = -1;
@@ -410,12 +431,14 @@ namespace fastllm {
                                 Data *alphaCapture = nullptr,
                                 Data *betaCapture = nullptr,
                                 Data *recurrentStateOutput = nullptr);
-        void RunMoE(int layer, const Data &input, Data &output);
+        void RunMoE(int layer, const Data &input, Data &output,
+                    bool reduceOutput = true);
         void RunMoEWithPrefix(int deviceLayer,
                               const std::string &mlpPrefix,
                               std::vector<Data *> &moeWeights,
                               std::vector<Data *> &moeBiass,
-                              const Data &input, Data &output);
+                              const Data &input, Data &output,
+                              bool reduceOutput = true);
 
         bool HasMtpWeights() const;
         bool MtpSupportsGenerationConfig(

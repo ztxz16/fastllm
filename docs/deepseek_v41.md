@@ -481,34 +481,35 @@ FT_MOE_ASSIST_DEVICES=0,1 ftllm server ... --device cuda --moe_device numa
 把额外的 CUDA 设备加进专家流。默认为空，行为不变。每张卡拿到一份输入激活的副本、一组不相交的
 专家，各自算出一份 partial，最后在 root 卡（产出这一层激活的那张）上相加。
 
-### 与之配套的重叠开关
+### 输入搬运与归约重叠
 
 只把第二张卡加进来是不够的：每层会多出两段**只在主线程上串行**的搬运，正好把算子级省下来的时间
 还回去。
 
-输入搬运与 partial 归约的重叠现在默认开启，无需设置环境变量；可用
-`FT_MOE_ASSIST_OVERLAP=0` 恢复原来的串行搬运。下面另外两项调度策略仍默认关闭。
+输入搬运与 partial 归约始终使用重叠路径，无需设置环境变量。
+没有 peer 通路时自动使用 pinned host 中转。下面两项调度策略仍默认关闭。
 
 | 变量 | 作用 |
 | --- | --- |
-| `FT_MOE_ASSIST_OVERLAP=0` | 关闭默认启用的输入 staging 与 partial 归约重叠 |
 | `FT_MOE_ASSIST_BALANCE=1` | 按各卡实测的「每专家毫秒」分配 GPU 专家，而不是按 route 数均分 |
 | `FT_EXPERT_LIMIT_AUTO=1` | 用真实层反馈出的 CPU / GPU 速度算 expertLimit，取代单专家合成 benchmark |
 
-`FT_MOE_ASSIST_OVERLAP` 具体改了两处：
+重叠路径包括两处：
 
 - **输入 staging**：原来是「`waitForCpuInput()` 等输入的 D2H 落到 pinned host」+「一次阻塞的 H2D
   把整块激活推上第二张卡」，两步都压在主线程上，既不与 root 卡的专家计算重叠、也不与 CPU 专家重叠。
   现在主线程只准备副本缓冲，搬运挪进该卡的 worker 线程、排在它自己的 per-thread stream 上：
   优先 `cudaMemcpyPeerAsync` 直接从产出激活的那张卡拉（这台机器上两张 3090 Ti 之间是 NVLink），
   拉不动再退回「等 `inputCopyStream` 上的 D2H 完成事件 + pinned H2D」。后续 compute 走同一条 stream，
-  顺序天然成立，主机侧一次都不用同步。
+  顺序天然成立，主线程不必等待这次搬运。
 - **partial 归约**：原来是所有 worker join 之后才开始跨卡搬运，每搬一块 `AddTo` 一次、再
   `cudaStreamSynchronize` 一次。现在跨卡搬运同样放进 worker 线程，落到每卡独立的 root 侧缓冲，
   与 root 卡剩余的专家、以及主线程的 CPU 专家重叠；主线程只在 root stream 上等事件、做 `AddTo`，
   中间的逐块同步全部去掉，末尾统一同步一次再释放 partial。
 
 事件、归约缓冲、pinned 中转缓冲都按设备缓存在每层的 MoE manager 上，跨层复用。
+设置 `FASTLLM_PROFILE_NUMAS_MOE=1 FASTLLM_PROFILE_DETAIL=1` 可统一查看每层的
+CPU/GPU 专家划分、各卡 route 数，以及 stage / limit / prep / cpu / join / reduce 耗时。
 
 ### expertLimit 的选择
 
@@ -525,7 +526,8 @@ FT_MOE_ASSIST_DEVICES=0,1 ftllm server ... --device cuda --moe_device numa
 - CPU 的「每 route 毫秒」= CPU 专家段墙钟 ÷ 落在 CPU 上的 route 数（EMA）。
 
 然后枚举阈值 t，用与实际分配一致的贪心把 GPU 专家摊到各卡上，取 `max(cpuMs, gpuMs)` 最小的 t。
-样本不足（前几层）时退回原来的合成估计。`FT_EXPERT_LIMIT=<n>` 的显式覆盖优先级最高，
+样本不足（前几层）时先将 route 最少的两个专家分给 CPU，其余交给 GPU，以收集两侧耗时。
+`FT_EXPERT_LIMIT=<n>` 的显式覆盖优先级最高，
 两种自动估计都不会执行。
 
 动态 prefill 分配可能改变专家归约和舍入路径。数值比较应使用相同输入及生成历史，结合 logits
@@ -544,7 +546,7 @@ e2e 取 3 次的中位数。
 | --- | --- | --- | --- | --- | --- | --- |
 | 单卡（现状） | 0.01 | 0.78 | 44.88 | 8.64 | **55.00** | 5.76 s |
 | + `FT_MOE_ASSIST_DEVICES=0,1` | 1.75 | 5.44 | 35.09 | 6.89 | **49.95** | 5.42 s |
-| + `FT_MOE_ASSIST_OVERLAP=1` | 0.02 | 1.60 | 36.14 | 1.95 | **40.49** | 5.36 s |
+| + 搬运重叠（现为固定路径） | 0.02 | 1.60 | 36.14 | 1.95 | **40.49** | 5.36 s |
 | + `FT_EXPERT_LIMIT_AUTO=1` | 0.01 | 0.33 | 10.58 | 25.72 | **37.18** | 3.06 s |
 
 三步合计 **55.00 -> 37.18 ms/层（1.48x）**，端到端 **5.76 -> 3.06 s（1.88x）**。
@@ -1148,9 +1150,8 @@ eager / Graph 切换和共享专家重叠，以及 DSpark 的 1～6 token 图重
 | `FASTLLM_TRACE_OPS` | 逐算子打印"算子名 / 落在哪个设备 / 权重名"（排查 TP 落点用） |
 | `FASTLLM_DSV41_DISABLE_PREFIX_CACHE` 等 | 前缀缓存相关，见"多请求与前缀缓存" |
 | `FASTLLM_DSPARK_*` | DSpark 投机解码相关，见"DSpark 投机解码" |
-| `FT_MOE_ASSIST_DEVICES` / `FT_MOE_ASSIST_OVERLAP` / `FT_MOE_ASSIST_BALANCE` / `FT_EXPERT_LIMIT_AUTO` | NUMA MoE 的多卡专家流，见"prefill 的多卡专家流" |
-| `FASTLLM_NUMAS_MOE_ASSIST_PROFILE` | 按层打印 NUMA MoE prefill 的分阶段耗时（stage / limit / prep / cpu / join / reduce） |
-| `FASTLLM_NUMAS_MOE_GPU_TRACE` | 打印每层的 CPU / GPU 专家划分与各卡拿到的专家数 |
+| `FT_MOE_ASSIST_DEVICES` / `FT_MOE_ASSIST_BALANCE` / `FT_EXPERT_LIMIT_AUTO` | NUMA MoE 的多卡专家流，见"prefill 的多卡专家流" |
+| `FASTLLM_PROFILE_NUMAS_MOE=1 FASTLLM_PROFILE_DETAIL=1` | NUMA MoE 分阶段耗时、CPU/GPU 专家划分及各卡 route 数 |
 
 ## DSpark 与专家缓存验证
 

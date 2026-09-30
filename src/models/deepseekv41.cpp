@@ -3367,9 +3367,32 @@ namespace fastllm {
                 }
             }
         }
-        // Multi-token graph workspaces also retain asynchronous TP operands.
-        // Eager prefill keeps synchronous dispatch and may release temporaries.
-        ScopedTpDispatch tpDecodeDispatch(tp && single && (seqlen == 1 || graphActive), tpDevices);
+        bool tpVerifyWorkspaceActive = false;
+        if (!graphActive && tp && dsparkVerify && seqlen > 1 && seqlen <= 8 &&
+            segments[0].spec->deferWindow && segments[0].startPos > 0 &&
+            inputEmbeds == nullptr && !hasImageTokens &&
+            std::getenv("FASTLLM_DSV41_DUMP_DIR") == nullptr &&
+            !GetFastllmEnv().cudaSync && !GetFastllmEnv().printProfile &&
+            !V41ReferenceMathEnabled() &&
+            !V41EnvFlag("FASTLLM_DSV41_DISABLE_TP_VERIFY_ASYNC")) {
+            if (!graphLock.owns_lock()) {
+                graphLock = std::unique_lock<std::mutex>(v41CudaGraphMutex, std::try_to_lock);
+            }
+            if (graphLock.owns_lock()) {
+                if (!v41TpVerifyWorkspace || v41TpVerifyDevices != tpDevices) {
+                    v41TpVerifyWorkspace = std::make_shared<DeepSeekV41DecodeWorkspace>();
+                    v41TpVerifyDevices = tpDevices;
+                }
+                ws = v41TpVerifyWorkspace.get();
+                tpVerifyWorkspaceActive = true;
+            }
+        }
+        // Eager verification retains per-weight quantization buffers just as
+        // graph execution does. Event-ordered dispatch can then avoid a device
+        // synchronization after every operator. Drain the ranks before releasing
+        // the workspace lock; long prefill still uses synchronous dispatch.
+        ScopedTpDispatch tpDecodeDispatch(
+            tp && single && (seqlen == 1 || graphActive || tpVerifyWorkspaceActive), tpDevices);
         bool graphPoolOpen = false;
         auto graphGiveUp = [&](const char *stage) {
             if (!graphState) {

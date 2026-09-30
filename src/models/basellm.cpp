@@ -4,6 +4,7 @@
 
 #include "basellm.h"
 #include "utils.h"
+#include "utils/cuda_cache_budget.h"
 #include <sstream>
 #include <cstring>
 #include <cstdlib>
@@ -512,7 +513,9 @@ namespace fastllm {
     }
 
     void basellm::TryRecordResponseContext(ResponseContext *context) {
-        if (context == nullptr) {
+        // These caches are keyed only by token IDs. Media placeholders do not
+        // identify their pixels, embeddings, or multimodal position state.
+        if (context == nullptr || !context->multimodalInput.empty()) {
             return;
         }
         this->TryRecordHistoryCache(context->allTokens);
@@ -595,6 +598,9 @@ namespace fastllm {
     }
 
     void ResponseContext::TryRecordPagedCache(basellm *model) {
+        if (!this->multimodalInput.empty()) {
+            return;
+        }
         bool hasLinearAttentionCache = false;
         bool hasBoundedAttentionCache = false;
         for (int i = 0; i < (int)this->pastKeyValues.size(); i++) {
@@ -1901,7 +1907,7 @@ namespace fastllm {
                     }
 
                     if (isPrompt) {
-                        if (ctx->cacheLen == 0 &&
+                        if (!isMultimodal && ctx->cacheLen == 0 &&
                             ctx->intParams.find("paged_prefix_restore_disabled") ==
                                 ctx->intParams.end()) {
                             PagedCacheManager *probeManager = nullptr;
@@ -3026,7 +3032,11 @@ namespace fastllm {
                             dictLocker.unlock();
                             forwardLocker.lock();
 #ifdef USE_CUDA
-                            FastllmCudaClearBigBuffer();
+                            if (model->RetainCudaWorkspace()) {
+                                FastllmCudaTrimBigBuffer();
+                            } else {
+                                FastllmCudaClearBigBuffer();
+                            }
 #endif
                             Data inputIds = Data(DataType::FLOAT32, {1, (int) ids.size()}, ids);
                             std::vector<int> ret;
@@ -3213,9 +3223,15 @@ namespace fastllm {
         context->multimodalInput = multimodalInput;
         context->tokens = LastTokensUnit(generationConfig.last_n);
 
-        bool restoredNativeHistory = this->TryRestoreHistoryCache(context->currentTokens, context->cacheLen);
+        // A restored text prefix can bypass the multimodal prefill path, while
+        // a restored media prefix may belong to different images with the same
+        // placeholder tokens. Keep request-local KV reuse, but do not restore
+        // cross-request token-only caches for multimodal prompts.
+        bool allowHistoryCache = context->multimodalInput.empty();
+        bool restoredNativeHistory = allowHistoryCache &&
+            this->TryRestoreHistoryCache(context->currentTokens, context->cacheLen);
 
-        auto cache = restoredNativeHistory || !this->UseGenericHistoryCache() ?
+        auto cache = !allowHistoryCache || restoredNativeHistory || !this->UseGenericHistoryCache() ?
                      std::make_pair((PastKVCacheMemory*)nullptr, 0) :
                      pastKVCacheManager.Get(inputTokens);
         if (cache.first != nullptr && cache.second > 0) {
@@ -4730,17 +4746,8 @@ namespace fastllm {
             auto freeSizes = FastllmCudaGetFreeSizes();
             auto totalSizes = FastllmCudaGetTotalSizes();
             auto getCudaRuntimeHeadroom = [&](int id, long long avail) -> long long {
-                if (avail <= 0) {
-                    return 0;
-                }
-
-                long long headroom = 512LL * 1024LL * 1024LL;
-                if (id >= 0 && id < (int)totalSizes.size()) {
-                    headroom = std::max(headroom, totalSizes[id] / 100);
-                }
-                headroom = std::min(headroom, 2LL * 1024LL * 1024LL * 1024LL);
-                headroom = std::min(headroom, avail / 4);
-                return std::max(0LL, headroom);
+                return CudaCacheRuntimeHeadroom(
+                    id >= 0 && id < (int)totalSizes.size() ? totalSizes[id] : 0, avail);
             };
             auto fitPagesWithLinearReserve = [&](int id, long long avail, long long kvBytesPerPage) -> int {
                 if (avail <= 0 || kvBytesPerPage <= 0) {

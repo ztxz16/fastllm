@@ -1,3 +1,4 @@
+import copy
 import os
 import sys
 import unittest
@@ -5,7 +6,9 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "tools")))
 
-from fastllm_pytools.qwen35_multimodal_native import build_qwen35_prompt
+from fastllm_pytools.qwen35_multimodal_native import (
+    build_qwen35_prompt, normalize_qwen35_conversation,
+)
 
 
 class FakeTokenizer:
@@ -13,11 +16,43 @@ class FakeTokenizer:
         self.kwargs = None
 
     def apply_chat_template(self, conversation, **kwargs):
+        self.conversation = conversation
         self.kwargs = kwargs
         return "<|im_start|>assistant\n"
 
 
 class Qwen35MultimodalPromptTest(unittest.TestCase):
+    def test_multimodal_tool_history_survives_normalization_and_rendering(self):
+        conversation = [
+            {"role": "user", "content": [
+                {"type": "image", "image": "private image payload"},
+                {"type": "text", "text": "Inspect both images."},
+            ]},
+            {"role": "assistant", "content": None,
+             "reasoning_content": "Inspect the second image.", "tool_calls": [{
+                 "id": "call_image", "type": "function", "function": {
+                     "name": "read_image", "arguments": {"path": "second.png"},
+                 },
+             }]},
+            {"role": "tool", "tool_call_id": "call_image", "name": "read_image",
+             "content": [{"type": "text", "text": "Second image:"},
+                         {"type": "image", "image": "second image payload"}]},
+        ]
+        original = copy.deepcopy(conversation)
+        normalized = normalize_qwen35_conversation(conversation, image_count=2, video_count=0)
+        tokenizer = FakeTokenizer()
+        build_qwen35_prompt(
+            tokenizer=tokenizer, conversation=normalized, image_grid_thw=None,
+            video_grid_thw=None, video_timestamps=None, merge_size=2,
+            add_generation_prompt=True, enable_thinking=False,
+        )
+        self.assertEqual(tokenizer.conversation[1], original[1])
+        self.assertEqual(tokenizer.conversation[2]["tool_call_id"], "call_image")
+        self.assertEqual(tokenizer.conversation[2]["name"], "read_image")
+        self.assertEqual(tokenizer.conversation[0]["content"][0], {"type": "image"})
+        self.assertEqual(tokenizer.conversation[2]["content"][1], {"type": "image"})
+        self.assertEqual(conversation, original)
+
     def prompt(self, tokenizer, **kwargs):
         return build_qwen35_prompt(
             tokenizer=tokenizer,

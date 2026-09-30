@@ -1,3 +1,6 @@
+#include <climits>
+#include "devices/cuda/fastllm-fp8-small-t.cuh"
+#include "devices/cuda/fastllm-fp8-sm70.cuh"
 //
 // Created by huangyuyang on 2/6/26.
 //
@@ -193,11 +196,59 @@ __device__ __forceinline__ float FastllmQuantizedNVFP4E2M1Value(
     return (value & 8) != 0 ? -magnitude : magnitude;
 }
 
-template <typename T>
+struct FastllmInt4NVFP4QuantParams {
+    const float2 *values = nullptr; // Scale and minimum/zero point per channel/group.
+    int groups = 1, groupSize = 0;
+    bool perTensor = false, useZeroPoint = false;
+};
+
+static bool FastllmPrepareInt4NVFP4QuantParams(
+        const fastllm::Data &input, FastllmInt4NVFP4QuantParams &params,
+        std::vector<float2> &values) {
+    if (input.perChannelAxis != -1 && input.perChannelAxis != 0) return false;
+    const bool grouped = input.dataType == fastllm::DataType::INT4_GROUP;
+    if (grouped && input.perChannelAxis != 0) return false;
+    params.perTensor = input.perChannelAxis == -1;
+    params.groupSize = grouped ? input.groupCnt : input.dims[1];
+    if (params.groupSize <= 0) return false;
+    params.groups = (input.dims[1] - 1) / params.groupSize + 1;
+    if (grouped && input.group != params.groups) return false;
+    const size_t count = (params.perTensor ? 1 : size_t(input.dims[0])) * params.groups;
+    const bool legacy = input.dataType == fastllm::DataType::INT4;
+    params.useZeroPoint = legacy || (grouped && !input.zeros.empty());
+    const bool configZeros = legacy && input.perChannelsConfigs.size() == count;
+    if (input.scales.size() != count ||
+        (params.useZeroPoint ? (!configZeros && input.zeros.size() != count)
+                             : input.mins.size() != count)) return false;
+    values.resize(count);
+    for (size_t i = 0; i < count; ++i) {
+        float scale = input.scales[i];
+        float offset = params.useZeroPoint
+            ? float(configZeros ? input.perChannelsConfigs[i].zeroPoint : input.zeros[i])
+            : input.mins[i];
+        if (!std::isfinite(scale) || scale < 0 || !std::isfinite(offset) ||
+            (params.useZeroPoint && (offset < 0 || offset > 15))) return false;
+        // Match the existing INT4 -> FP16 CUDA dequantization paths, including
+        // the half-precision scale/min metadata used by INT4_GROUP.
+        if (grouped) {
+            scale = __half2float(__float2half_rn(scale));
+            offset = __half2float(__float2half_rn(offset));
+        }
+        const float low = params.useZeroPoint ? scale * -offset : offset;
+        const float high = params.useZeroPoint ? scale * (15 - offset) : std::fma(scale, 15.0f, offset);
+        if (!std::isfinite(low) || !std::isfinite(high) ||
+            std::max(std::fabs(low), std::fabs(high)) > 65504.0f) return false;
+        values[i] = make_float2(scale, offset);
+    }
+    return true;
+}
+
+template <typename T, bool int4Input = false>
 __global__ void FastllmQuantizeLinearWeightNVFP4Block16Kernel(
         const T *input, uint8_t *output, unsigned int *maximumScaleBits,
         int columns, int packedRowBytes, int blocksPerRow,
-        int totalBlocks) {
+        int totalBlocks, const float *rowScales = nullptr, const int *rowIds = nullptr,
+        FastllmInt4NVFP4QuantParams int4 = {}) {
     constexpr int warpsPerBlock = 8;
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
@@ -206,12 +257,28 @@ __global__ void FastllmQuantizeLinearWeightNVFP4Block16Kernel(
 
     for (; tile < totalBlocks; tile += tileStride) {
         const int row = tile / blocksPerRow;
+        const int sourceRow = rowIds ? rowIds[row] : row;
         const int columnBlock = tile - row * blocksPerRow;
         const int column = columnBlock * 16 + lane;
-        float value = lane < 16
-            ? FastllmFp8QuantLoad(
-                  input, (size_t)row * columns + column)
-            : 0.0f;
+        float value = 0.0f;
+        if (lane < 16) {
+            if constexpr (int4Input) {
+                const uint8_t packed = input[((size_t)sourceRow * columns + column) / 2];
+                const float q = (column & 1) ? (packed & 15) : (packed >> 4);
+                const size_t group = (int4.perTensor ? 0 : size_t(sourceRow)) * int4.groups +
+                                     column / int4.groupSize;
+                const float2 params = int4.values[group];
+                const float decoded = int4.useZeroPoint
+                    ? params.x * (q - params.y) : params.x * q + params.y;
+                value = __half2float(__float2half_rn(decoded));
+            } else if constexpr (__is_same(T, uint8_t)) {
+                __nv_fp8_e4m3 code;
+                code.__x = input[(size_t)sourceRow * columns + column];
+                value = float(code) * rowScales[sourceRow];
+            } else {
+                value = FastllmFp8QuantLoad(input, (size_t)sourceRow * columns + column);
+            }
+        }
         float localMaximum = lane < 16 ? fabsf(value) : 0.0f;
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
@@ -268,12 +335,13 @@ __global__ void FastllmQuantizeLinearWeightNVFP4Block16Kernel(
         scale = __shfl_sync(0xffffffff, scale, 0);
 
         uint8_t *packedBlock =
-            output + (size_t)row * packedRowBytes +
-            (size_t)columnBlock * (8 + sizeof(float));
+            output ? output + (size_t)row * packedRowBytes +
+            (size_t)columnBlock * (8 + sizeof(float)) : nullptr;
         if (lane == 0) {
-            *reinterpret_cast<float *>(packedBlock + 8) = scale;
+            if (packedBlock) *reinterpret_cast<float *>(packedBlock + 8) = scale;
             atomicMax(maximumScaleBits, __float_as_uint(scale));
         }
+        if (!output) continue; // Scale-only pass keeps selected rows numerically unchanged.
         const uint8_t quantized = lane < 16
             ? FastllmQuantizeNVFP4E2M1(value / scale) : 0;
         const uint8_t low = (uint8_t)__shfl_sync(
@@ -286,22 +354,57 @@ __global__ void FastllmQuantizeLinearWeightNVFP4Block16Kernel(
     }
 }
 
-bool FastllmCudaQuantizeLinearWeightNVFP4Block16(
-        const fastllm::Data &input, fastllm::Data &output) {
+bool FastllmCudaQuantizeLinearWeightNVFP4Block16Rows(
+        const fastllm::Data &input, fastllm::Data &output,
+        const std::vector<int> &selectedRows) {
+    const bool int4Input = input.dataType == fastllm::DataType::INT4 ||
+        input.dataType == fastllm::DataType::INT4_NOZERO ||
+        input.dataType == fastllm::DataType::INT4_GROUP;
     if (input.dataDevice != fastllm::DataDevice::CUDA ||
         input.cudaData == nullptr || input.dims.size() != 2 ||
         input.dims[0] <= 0 || input.dims[1] <= 0 ||
         input.dims[1] % 16 != 0 ||
-        (input.dataType != fastllm::DataType::FLOAT16 &&
-         input.dataType != fastllm::DataType::BFLOAT16) ||
-        input.dataDeviceIds.empty()) {
+        input.strides.size() != 2 || input.strides[1] != 1 ||
+        input.strides[0] != (uint64_t)input.dims[1] ||
+        input.IsRepacked || input.multiDeviceData ||
+        (!int4Input && input.dataType != fastllm::DataType::FLOAT16 &&
+         input.dataType != fastllm::DataType::BFLOAT16 &&
+         !(input.dataType == fastllm::DataType::FP8_E4M3 &&
+           input.blockK == 1 && input.blockM >= input.dims[1] &&
+           input.scales.size() == size_t(input.dims[0]))) ||
+        input.dataDeviceIds.size() != 1) {
         return false;
     }
 
+    if (selectedRows.size() > size_t(input.dims[0])) return false;
+    for (int row : selectedRows) {
+        if (row < 0 || row >= input.dims[0]) return false;
+    }
+    const int rows = selectedRows.empty() ? input.dims[0] : int(selectedRows.size());
+    if (input.dims[0] > INT_MAX / (input.dims[1] / 16)) return false;
     const int device = input.dataDeviceIds[0];
     if (cudaSetDevice(device) != cudaSuccess) {
         cudaGetLastError();
         return false;
+    }
+    cudaStreamCaptureStatus capture;
+    if (cudaStreamIsCapturing(cudaStreamPerThread, &capture) != cudaSuccess ||
+        capture != cudaStreamCaptureStatusNone || &input == &output) return false;
+    FastllmInt4NVFP4QuantParams int4Params;
+    std::vector<float2> int4Values;
+    if (int4Input && !FastllmPrepareInt4NVFP4QuantParams(input, int4Params, int4Values)) return false;
+    struct Int4ParamsAllocation {
+        float2 *ptr = nullptr;
+        ~Int4ParamsAllocation() { if (ptr) cudaFree(ptr); }
+    } int4Allocation;
+    if (int4Input) {
+        const size_t bytes = int4Values.size() * sizeof(float2);
+        if (cudaMalloc(reinterpret_cast<void **>(&int4Allocation.ptr), bytes) != cudaSuccess ||
+            cudaMemcpy(int4Allocation.ptr, int4Values.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        int4Params.values = int4Allocation.ptr;
     }
     output.FreeSpace();
     output.dataType = fastllm::DataType::NVFP4_BLOCK_16;
@@ -310,12 +413,36 @@ bool FastllmCudaQuantizeLinearWeightNVFP4Block16(
     output.UpdateUnitSize();
     output.dataDevice = fastllm::DataDevice::CUDA;
     output.dataDeviceIds = {device};
-    output.Resize(input.dims);
+    output.Resize({rows, input.dims[1]});
     output.Allocate(false);
     if (output.cudaData == nullptr) {
         return false;
     }
 
+    // Select directly while quantizing: no full-vocabulary temporary or gather buffer.
+    struct RowIdsAllocation {
+        int *ptr = nullptr;
+        ~RowIdsAllocation() { if (ptr) cudaFree(ptr); }
+    } rowIds;
+    if (!selectedRows.empty() &&
+        (cudaMalloc(reinterpret_cast<void **>(&rowIds.ptr), selectedRows.size() * sizeof(int)) != cudaSuccess ||
+         cudaMemcpy(rowIds.ptr, selectedRows.data(), selectedRows.size() * sizeof(int),
+                    cudaMemcpyHostToDevice) != cudaSuccess)) {
+        output.FreeSpace();
+        cudaGetLastError();
+        return false;
+    }
+    float *rowScales = nullptr;
+    if (input.dataType == fastllm::DataType::FP8_E4M3) {
+        if (cudaMalloc(reinterpret_cast<void **>(&rowScales), input.scales.size() * sizeof(float)) != cudaSuccess ||
+            cudaMemcpy(rowScales, input.scales.data(), input.scales.size() * sizeof(float),
+                       cudaMemcpyHostToDevice) != cudaSuccess) {
+            if (rowScales) cudaFree(rowScales);
+            output.FreeSpace();
+            cudaGetLastError();
+            return false;
+        }
+    }
     unsigned int *deviceMaximumScaleBits = nullptr;
     cudaError_t state = cudaMalloc(
         reinterpret_cast<void **>(&deviceMaximumScaleBits),
@@ -328,12 +455,12 @@ bool FastllmCudaQuantizeLinearWeightNVFP4Block16(
         if (deviceMaximumScaleBits != nullptr) {
             cudaFree(deviceMaximumScaleBits);
         }
+        if (rowScales) cudaFree(rowScales);
         output.FreeSpace();
         cudaGetLastError();
         return false;
     }
 
-    const int rows = input.dims[0];
     const int columns = input.dims[1];
     const int blocksPerRow = columns / 16;
     const int packedRowBytes =
@@ -342,21 +469,36 @@ bool FastllmCudaQuantizeLinearWeightNVFP4Block16(
     cudaDeviceProp properties;
     state = cudaGetDeviceProperties(&properties, device);
     if (state == cudaSuccess) {
-        const int grid = std::max(
-            1, std::min(totalBlocks,
-                        properties.multiProcessorCount * 8));
-        if (input.dataType == fastllm::DataType::FLOAT16) {
-            FastllmQuantizeLinearWeightNVFP4Block16Kernel<<<grid, 256>>>(
-                (const half *)input.cudaData,
-                (uint8_t *)output.cudaData, deviceMaximumScaleBits,
-                columns, packedRowBytes, blocksPerRow, totalBlocks);
-        } else {
-            FastllmQuantizeLinearWeightNVFP4Block16Kernel<<<grid, 256>>>(
-                (const __nv_bfloat16 *)input.cudaData,
-                (uint8_t *)output.cudaData, deviceMaximumScaleBits,
-                columns, packedRowBytes, blocksPerRow, totalBlocks);
+        auto launchQuantization = [&](int count, uint8_t *destination, const int *indices) {
+            const int grid = std::max(1, std::min(count, properties.multiProcessorCount * 8));
+            if (int4Input) {
+                FastllmQuantizeLinearWeightNVFP4Block16Kernel<uint8_t, true><<<grid, 256>>>(
+                    (const uint8_t *)input.cudaData, destination, deviceMaximumScaleBits,
+                    columns, packedRowBytes, blocksPerRow, count, nullptr, indices, int4Params);
+            } else if (input.dataType == fastllm::DataType::FP8_E4M3) {
+                FastllmQuantizeLinearWeightNVFP4Block16Kernel<<<grid, 256>>>(
+                    (const uint8_t *)input.cudaData, destination, deviceMaximumScaleBits,
+                    columns, packedRowBytes, blocksPerRow, count, rowScales, indices);
+            } else if (input.dataType == fastllm::DataType::FLOAT16) {
+                FastllmQuantizeLinearWeightNVFP4Block16Kernel<<<grid, 256>>>(
+                    (const half *)input.cudaData, destination, deviceMaximumScaleBits,
+                    columns, packedRowBytes, blocksPerRow, count, nullptr, indices);
+            } else {
+                FastllmQuantizeLinearWeightNVFP4Block16Kernel<<<grid, 256>>>(
+                    (const __nv_bfloat16 *)input.cudaData, destination, deviceMaximumScaleBits,
+                    columns, packedRowBytes, blocksPerRow, count, nullptr, indices);
+            }
+            return cudaGetLastError();
+        };
+        if (!selectedRows.empty()) {
+            // Repacking rounds block scales to FP8 relative to this tensor scale.
+            // Compute it over the original matrix, so selecting rows cannot alter
+            // their effective weights. No full-size quantized temporary is needed.
+            state = launchQuantization(input.dims[0] * blocksPerRow, nullptr, nullptr);
         }
-        state = cudaGetLastError();
+        if (state == cudaSuccess) {
+            state = launchQuantization(totalBlocks, (uint8_t *)output.cudaData, rowIds.ptr);
+        }
     }
 
     unsigned int maximumScaleBits = 0;
@@ -366,6 +508,7 @@ bool FastllmCudaQuantizeLinearWeightNVFP4Block16(
             sizeof(unsigned int), cudaMemcpyDeviceToHost);
     }
     cudaFree(deviceMaximumScaleBits);
+    if (rowScales) cudaFree(rowScales);
     if (state != cudaSuccess) {
         printf("Error: NVFP4 block16 weight quantization failed on "
                "cuda:%d (%s).\n", device, cudaGetErrorString(state));
@@ -386,6 +529,12 @@ bool FastllmCudaQuantizeLinearWeightNVFP4Block16(
     output.IsRepacked = false;
     return true;
 }
+
+bool FastllmCudaQuantizeLinearWeightNVFP4Block16(
+        const fastllm::Data &input, fastllm::Data &output) {
+    return FastllmCudaQuantizeLinearWeightNVFP4Block16Rows(input, output, {});
+}
+
 
 __global__ void FastllmCudaFP8E4M3BLOCK1282HalfKernel(uint8_t* a, half *b) {
     unsigned int tid = threadIdx.x;
@@ -842,7 +991,12 @@ static bool CanRunFastllmRowFP8(const T *input, const uint8_t *weight, const T *
     const char *flag = std::getenv("FASTLLM_CUDA_FP8_ROW_GEMV");
     if (flag && (!std::strcmp(flag, "0") || !std::strcmp(flag, "false")))
         return false;
-    if (batch != 1 || K < 512 || K > 32768 || N < 4096 || blockM < K || blockK != 1 || !input ||
+    // The eight-row MMA path also amortizes weight loads across wide
+    // vocabulary projections.
+    if (batch != 1 && (batch < 2 || batch > 8 || K % 256 ||
+        (N > 65536 && batch != 8)))
+        return false;
+    if (K < 512 || K > 32768 || N < (batch == 1 ? 4096 : 512) || blockM < K || blockK != 1 || !input ||
         !weight || !output || !scales || reinterpret_cast<uintptr_t>(input) % 4 ||
         reinterpret_cast<uintptr_t>(weight) % 16 || reinterpret_cast<uintptr_t>(output) % 2 ||
         reinterpret_cast<uintptr_t>(scales) % 4 || (bias && reinterpret_cast<uintptr_t>(bias) % 2))
@@ -854,14 +1008,16 @@ static bool CanRunFastllmRowFP8(const T *input, const uint8_t *weight, const T *
         uintptr_t x = reinterpret_cast<uintptr_t>(a), y = reinterpret_cast<uintptr_t>(b);
         return x < y + bs && y < x + as;
     };
-    if (overlaps(output, size_t(N) * 2, input, size_t(K) * 2) ||
-        overlaps(output, size_t(N) * 2, weight, size_t(N) * K) ||
-        overlaps(output, size_t(N) * 2, scales, size_t(N) * 4) ||
-        (bias && overlaps(output, size_t(N) * 2, bias, size_t(N) * 2)))
+    if (overlaps(output, size_t(batch) * N * 2, input, size_t(batch) * K * 2) ||
+        overlaps(output, size_t(batch) * N * 2, weight, size_t(N) * K) ||
+        overlaps(output, size_t(batch) * N * 2, scales, size_t(N) * 4) ||
+        (bias && overlaps(output, size_t(batch) * N * 2, bias, size_t(N) * 2)))
         return false;
     int device = 0;
     if (cudaGetDevice(&device) != cudaSuccess)
         return false;
+    if (batch > 1)
+        return fastllm::fp8small::CanRun<T>(device, K, N, batch);
     static thread_local std::map<int, bool> available;
     auto it = available.find(device);
     if (it == available.end()) {
@@ -879,6 +1035,12 @@ static bool CanRunFastllmRowFP8(const T *input, const uint8_t *weight, const T *
 template <class T>
 static bool TryFastllmRowFP8(T *input, uint8_t *weight, T *output, T *bias, float *scales, int batch, int K,
                              int N, int blockM, int blockK) {
+    if (batch > 1) {
+        if (!CanRunFastllmRowFP8<T, 8>(input, weight, output, bias, scales, batch, K, N, blockM, blockK))
+            return false;
+        fastllm::fp8small::Dispatch<T>(input, weight, scales, bias, output, K, N, batch, cudaStreamPerThread);
+        return true;
+    }
     if (K % 256) {
         if (!CanRunFastllmRowFP8<T, 16>(input, weight, output, bias, scales, batch, K, N, blockM, blockK))
             return false;
@@ -900,6 +1062,10 @@ static bool TryFastllmRowFP8(T *input, uint8_t *weight, T *output, T *bias, floa
 }
 
 void LaunchFastllmGemmFp16FP8E4M3(half *input, uint8_t *weight, half *output, half *bias, float *scales, int n, int m, int k, int blockM, int blockK) {
+    if (fastllm::fp8sm70::Try(input, weight, scales, bias, output,
+                            m, k, n, blockM, blockK, cudaStreamPerThread)) {
+        return;
+    }
     if (TryFastllmRowFP8(input, weight, output, bias, scales, n, m, k, blockM, blockK)) {
         return;
     }
@@ -1884,7 +2050,8 @@ __global__ void FastllmCudaFP8E4M32BF16Kernel(uint8_t* a, float *scales, __nv_bf
     }
 }
 
-template <int THREAD_PER_BLOCK, int PART, bool USE_WARP_REDUCE = false>
+template <int THREAD_PER_BLOCK, int PART, bool USE_WARP_REDUCE = false,
+          bool POWER_OF_TWO_BLOCKS = false>
 __global__ void FastllmGemvBF16FP8E4M3Kernel1MultiRow(__nv_bfloat16 *A, uint8_t *B, __nv_bfloat16 *C,
                                                     __nv_bfloat16 *bias, float *scales,
                                                     int m, int k, int blockM, int blockK) {
@@ -1902,9 +2069,12 @@ __global__ void FastllmGemvBF16FP8E4M3Kernel1MultiRow(__nv_bfloat16 *A, uint8_t 
     int st = blockIdx.x;
 #pragma unroll
     for (int x = 0; x < PART; x++) sdata[x][tid] = 0;
-    int ms = (m - 1) / blockM + 1;
+    const int shiftM = POWER_OF_TWO_BLOCKS ? __ffs(blockM) - 1 : 0;
+    const int shiftK = POWER_OF_TWO_BLOCKS ? __ffs(blockK) - 1 : 0;
+    int ms = POWER_OF_TWO_BLOCKS ? ((m - 1) >> shiftM) + 1
+                               : (m - 1) / blockM + 1;
     const float magicScaleConstant = exp2f(120.0f);
-    scales += (st / blockK) * ms;
+    scales += (POWER_OF_TWO_BLOCKS ? st >> shiftK : st / blockK) * ms;
 
     const uint8_t *baseB = (uint8_t*)B + st * m;
     // Preserve a safe BF16 fallback for uneven TP widths as well.
@@ -1916,12 +2086,12 @@ __global__ void FastllmGemvBF16FP8E4M3Kernel1MultiRow(__nv_bfloat16 *A, uint8_t 
             const float value = __bfloat162float(*reinterpret_cast<const __nv_bfloat16 *>(&bits));
 #pragma unroll
             for (int x = 0; x < PART; ++x)
-                sdata[x][tid] += float(A[size_t(x) * m + i]) * value * scales[i / blockM];
+                sdata[x][tid] += float(A[size_t(x) * m + i]) * value * scales[POWER_OF_TWO_BLOCKS ? i >> shiftM : i / blockM];
         }
     } else {
         union_bf16_4_fp8 regA;
         for (int i = tid * 4; i < m; i += THREAD_PER_BLOCK * 4) {
-            float curScale = scales[i / blockM];
+            float curScale = scales[POWER_OF_TWO_BLOCKS ? i >> shiftM : i / blockM];
             uint32_t bb = ((uint32_t*)(baseB + i))[0];
             uint16_t b0_bits = (((bb >> 0) & 0x80) << 8) | (((bb >> 0) & 0x7F) << 4);
             uint16_t b1_bits = (((bb >> 8) & 0x80) << 8) | (((bb >> 8) & 0x7F) << 4);
@@ -2110,11 +2280,138 @@ __global__ void FastllmGemvBF16FP8E4M3KernelWarpRows(
     }
 }
 
+// Group output channels without serializing their two 32-thread partials.
+// The input traversal, FMA order and compensated 64-thread reduction match
+// Kernel1MultiRow. Callers guarantee four-element input/weight alignment.
+template <int ROWS, int PART, bool POWER_OF_TWO_BLOCKS>
+__global__ void FastllmGemvBF16FP8E4M3KernelRegisterRows(
+        const __nv_bfloat16 *__restrict__ A, const uint8_t *__restrict__ B,
+        __nv_bfloat16 *__restrict__ C, const __nv_bfloat16 *__restrict__ bias,
+        const float *__restrict__ scales, int m, int k, int blockM, int blockK) {
+    const int tid = threadIdx.x % 64;
+    const int lane = tid % 32;
+    const int row = threadIdx.x / 64;
+    const int outputRow = blockIdx.x * ROWS + row;
+    // Inactive tail rows still participate in the block-wide barrier.
+    const int st = min(outputRow, k - 1);
+    const int shiftM = POWER_OF_TWO_BLOCKS ? __ffs(blockM) - 1 : 0;
+    const int shiftK = POWER_OF_TWO_BLOCKS ? __ffs(blockK) - 1 : 0;
+    const int ms = POWER_OF_TWO_BLOCKS ? ((m - 1) >> shiftM) + 1
+                                     : (m - 1) / blockM + 1;
+    const float *rowScales = scales + (POWER_OF_TWO_BLOCKS ? st >> shiftK : st / blockK) * ms;
+    const uint8_t *baseB = B + (size_t)st * m;
+    float partial[PART];
+#pragma unroll
+    for (int x = 0; x < PART; x++) partial[x] = 0.0f;
+    union_bf16_4_fp8 regA;
+    for (int i = tid * 4; i < m; i += 256) {
+        const float curScale = rowScales[POWER_OF_TWO_BLOCKS ? i >> shiftM : i / blockM];
+        const uint32_t bb = *(const uint32_t*)(baseB + i);
+        const uint16_t b0Bits =
+            (((bb >> 0) & 0x80) << 8) | (((bb >> 0) & 0x7F) << 4);
+        const uint16_t b1Bits =
+            (((bb >> 8) & 0x80) << 8) | (((bb >> 8) & 0x7F) << 4);
+        const uint16_t b2Bits =
+            (((bb >> 16) & 0x80) << 8) | (((bb >> 16) & 0x7F) << 4);
+        const uint16_t b3Bits =
+            (((bb >> 24) & 0x80) << 8) | (((bb >> 24) & 0x7F) << 4);
+        const float bf0 = __bfloat162float(
+            *reinterpret_cast<const __nv_bfloat16*>(&b0Bits));
+        const float bf1 = __bfloat162float(
+            *reinterpret_cast<const __nv_bfloat16*>(&b1Bits));
+        const float bf2 = __bfloat162float(
+            *reinterpret_cast<const __nv_bfloat16*>(&b2Bits));
+        const float bf3 = __bfloat162float(
+            *reinterpret_cast<const __nv_bfloat16*>(&b3Bits));
+#pragma unroll
+        for (int x = 0; x < PART; x++) {
+            regA.in = *reinterpret_cast<const uint2*>(
+                A + (size_t)x * m + i);
+            partial[x] +=
+                (__bfloat162float(regA.out[0]) * bf0 +
+                 __bfloat162float(regA.out[1]) * bf1 +
+                 __bfloat162float(regA.out[2]) * bf2 +
+                 __bfloat162float(regA.out[3]) * bf3) * curScale;
+        }
+    }
+    // Keep accumulation in registers. Only the upper half of the original
+    // 64-thread reduction crosses warps; the compensated tree is unchanged.
+    __shared__ float high[ROWS][PART][32];
+    if (tid >= 32) {
+#pragma unroll
+        for (int x = 0; x < PART; x++) high[row][x][lane] = partial[x];
+    }
+    __syncthreads();
+    if (tid >= 32) return;
+    const float magicScaleConstant = exp2f(120.0f);
+#pragma unroll
+    for (int x = 0; x < PART; x++) {
+        float sum = partial[x];
+        float other = high[row][x][lane];
+        float tmp = sum + other;
+        float diff = (tmp - sum) - other;
+        sum = tmp;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            const float source = __shfl_down_sync(0xffffffffu, sum, offset);
+            if (lane < offset) {
+                other = source - diff;
+                tmp = sum + other;
+                diff = (tmp - sum) - other;
+                sum = tmp;
+            }
+        }
+        if (lane == 0 && outputRow < k) {
+            float result = sum * magicScaleConstant;
+            if (bias != nullptr) result += __bfloat162float(bias[st]);
+            C[st + (size_t)k * x] = __float2bfloat16_rn(result);
+        }
+    }
+}
+
 template <int PART>
 static void LaunchFastllmGemmBF16FP8E4M3SmallBatch(
         __nv_bfloat16 *input, uint8_t *weight, __nv_bfloat16 *output,
         __nv_bfloat16 *bias, float *scales, int m, int k,
         int blockM, int blockK) {
+    // Power-of-two quantization blocks need only shifts for scale indexing.
+    // Other layouts and unaligned TP slices retain the established fallback.
+    const bool alignedPowerOfTwoBlocks = m > 0 && k > 0 &&
+        blockM > 0 && (blockM & (blockM - 1)) == 0 &&
+        blockK > 0 && (blockK & (blockK - 1)) == 0 &&
+        m % 4 == 0 && blockM % 4 == 0 &&
+        reinterpret_cast<uintptr_t>(input) % alignof(uint2) == 0 &&
+        reinterpret_cast<uintptr_t>(weight) % 4 == 0;
+    if (alignedPowerOfTwoBlocks) {
+        if constexpr (PART == 2 || PART == 3) {
+            // Short batches benefit from parallel input traversal with the
+            // existing per-channel block layout.
+            FastllmGemvBF16FP8E4M3Kernel1MultiRow<64, PART, PART == 3, true>
+                <<<k, 64>>>(input, weight, output, bias, scales,
+                            m, k, blockM, blockK);
+            return;
+        }
+        if constexpr (PART == 5) {
+            // Five-row eager/draft calls are sensitive to weight-cache misses.
+            // Retain the original block layout and accumulation; simplify
+            // scale indexing only on wide output projections.
+            if (m <= k / 2) {
+                FastllmGemvBF16FP8E4M3Kernel1MultiRow<64, PART, true, true>
+                    <<<k, 64>>>(input, weight, output, bias, scales,
+                                m, k, blockM, blockK);
+                return;
+            }
+        }
+        // Six-row wide expansions already have a competitive warp-row path.
+        if (PART != 5 && !(PART == 6 && k >= 2048 && m <= k / 2)) {
+            constexpr int rowsPerBlock = 2;
+            // At seven rows, integer-division code schedules better than the
+            // shift variant on the measured register-accumulation path.
+            FastllmGemvBF16FP8E4M3KernelRegisterRows<rowsPerBlock, PART, PART != 7>
+                <<<(k + rowsPerBlock - 1) / rowsPerBlock, rowsPerBlock * 64>>>(
+                    input, weight, output, bias, scales, m, k, blockM, blockK);
+            return;
+        }
+    }
     if constexpr (PART == 6) {
         // Halving the resident warps wins when there is ample output-level
         // parallelism and each warp's two virtual halves stay short.  Keep

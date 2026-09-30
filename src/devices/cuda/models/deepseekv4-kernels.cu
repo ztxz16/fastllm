@@ -5911,8 +5911,12 @@ bool DeepSeekV4LaunchWoAByWeight(const fastllm::Data &o, const fastllm::Data &wo
             if (tokenTile != nullptr) {
                 tokensPerBlock = std::atoi(tokenTile);
             }
+            // Small decode/verification batches benefit from four output rows
+            // per CTA: this reduces the token tile shared-memory footprint and
+            // register pressure. Keep the wider tile for larger prefill batches.
+            const bool smallTokenBatch = totalTokens >= 2 && totalTokens <= 8;
             int rowsPerBlock =
-                (oRank % 8 == 0 && woA.blockK % 8 == 0) ? 8 : 4;
+                (!smallTokenBatch && oRank % 8 == 0 && woA.blockK % 8 == 0) ? 8 : 4;
             const char *rowTile =
                 std::getenv("FASTLLM_DSV4_CUDA_WOA_ROWS_PER_BLOCK");
             if (rowTile != nullptr) {

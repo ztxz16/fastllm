@@ -18,6 +18,7 @@ struct Access : DeepSeekV41Model {
     using DeepSeekV41Model::v41IsDsparkTarget;
     using DeepSeekV41Model::v41DsparkTpDevices;
     using DeepSeekV41Model::v41CudaGraphSlots;
+    using DeepSeekV41Model::v41TpVerifyWorkspace;
 };
 
 static void AppendTensor(std::vector<float> &result, const Data &input) {
@@ -44,7 +45,7 @@ static void AppendTensor(std::vector<float> &result, const Data &input) {
 
 // Exercise every candidate count, fresh request state, ring wrap and rejected
 // suffixes. Compare actual target features and committed KV, not only argmax.
-static std::vector<float> RunDsparkRequests(DeepSeekV41Model &model) {
+static std::vector<float> RunDsparkRequests(DeepSeekV41Model &model, int candidates = 8) {
     model.*(&Access::v41DsparkEnabled) = true;
     model.*(&Access::v41DsparkTpDevices) = {0, 1};
     // Real requests enter DsparkAdvance after prefill before verifying drafts.
@@ -62,13 +63,13 @@ static std::vector<float> RunDsparkRequests(DeepSeekV41Model &model) {
         std::vector<Data> dummy(model.block_cnt * 2);
         std::vector<std::pair<Data *, Data *>> past;
         for (size_t i = 0; i < dummy.size(); i += 2) past.emplace_back(&dummy[i], &dummy[i + 1]);
-        for (int step = 0; step <= 36; ++step) {
+        for (int step = 0; step <= candidates * 6; ++step) {
             DeepSeekV41SpecScratch scratch;
             scratch.captureMain = true;
             DeepSeekV41Segment seg;
             seg.state = state;
             seg.startPos = state->totalLen;
-            seg.seqlen = step == 0 ? length : 1 + (step - 1) % 6;
+            seg.seqlen = step == 0 ? length : 1 + (step - 1) % candidates;
             seg.spec = &scratch;
             if (step > 0 && seg.seqlen > 1) {
                 scratch.wantAllTokens = scratch.deferWindow = true;
@@ -89,7 +90,7 @@ static std::vector<float> RunDsparkRequests(DeepSeekV41Model &model) {
             result.insert(result.end(), scratch.tokens.begin(), scratch.tokens.end());
             for (const Data &hidden : scratch.mainHidden) AppendTensor(result, hidden);
             if (scratch.deferWindow) {
-                const int committed = 1 + ((step - 1) / 6) % seg.seqlen;
+                const int committed = 1 + ((step - 1) / candidates) % seg.seqlen;
                 (model.*(&Access::DsparkCommitPrefix))(*state, scratch, seg.startPos, committed, seg.seqlen);
             }
             result.push_back(state->totalLen);
@@ -130,10 +131,10 @@ static std::vector<float> RunRequests(DeepSeekV41Model &model, const std::vector
 }
 
 static void Compare(const std::vector<float> &expected, const std::vector<float> &actual) {
-    if (actual.size() != expected.size()) throw std::runtime_error("missing request logits");
+    if (actual.size() != expected.size()) throw std::runtime_error("request result size mismatch");
     for (size_t i = 0; i < actual.size(); ++i) {
         if (!std::isfinite(actual[i]) || std::fabs(actual[i] - expected[i]) > 1e-5f) {
-            std::cerr << "logit " << i << ": " << expected[i] << " vs " << actual[i] << '\n';
+            std::cerr << "result value " << i << ": " << expected[i] << " vs " << actual[i] << '\n';
             throw std::runtime_error("TP decode differs from eager after warmup");
         }
     }
@@ -143,9 +144,16 @@ int main(int argc, char **argv) {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < 2) return 77;
     try {
-        const bool expertCache = argc == 3 && std::string(argv[2]) == "--expert-cache";
-        if (argc != 2 && !expertCache)
-            throw std::runtime_error("usage: deepseekV41TpGraphRegression FIXTURE_DIR [--expert-cache]");
+        bool expertCache = false, fp8Dense = false, eagerOnly = false;
+        if (argc < 2)
+            throw std::runtime_error("usage: deepseekV41TpGraphRegression FIXTURE_DIR [--expert-cache] [--fp8-dense] [--eager-only]");
+        for (int i = 2; i < argc; ++i) {
+            const std::string option = argv[i];
+            if (option == "--expert-cache") expertCache = true;
+            else if (option == "--fp8-dense") fp8Dense = true;
+            else if (option == "--eager-only") eagerOnly = true;
+            else throw std::runtime_error("unknown option: " + option);
+        }
         setenv("FASTLLM_DSV41_DISABLE_SHARED_OVERLAP", "1", 1);
         SetCudaGraph(false);
         SetThreads(2);
@@ -158,31 +166,43 @@ int main(int argc, char **argv) {
             setenv("FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS", "2", 1);
             setenv("FASTLLM_DSV41_MOE_CACHE_PREFETCH", "0", 1);
         }
-        auto base = CreateLLMModelFromHF(argv[1], DataType::FLOAT16);
+        auto base = CreateLLMModelFromHF(argv[1], fp8Dense ? DataType::DATA_AUTO_SOURCE : DataType::FLOAT16);
         auto &model = dynamic_cast<DeepSeekV41Model &>(*base);
         // Initialize weight shards and kernel plans before comparing dispatch.
         RunRequests(model, {7});
         const auto expected = RunRequests(model, {7, 17, 33, 7});
         unsetenv("FASTLLM_DSV41_DISABLE_SHARED_OVERLAP");
         Compare(expected, RunRequests(model, {7, 17, 33, 7}));
-        SetCudaGraph(true);
-        Compare(expected, RunRequests(model, {7, 17, 33, 7}));
+        if (!eagerOnly) {
+            SetCudaGraph(true);
+            Compare(expected, RunRequests(model, {7, 17, 33, 7}));
+            SetCudaGraph(false);
+            Compare(expected, RunRequests(model, {7, 17, 33, 7}));
+            SetCudaGraph(true);
+            Compare(expected, RunRequests(model, {7, 17, 33, 7}));
+            std::cout << "PASS: eager/graph switching and shared overlap match across 4 requests, 52 steps each\n";
+        }
         SetCudaGraph(false);
-        Compare(expected, RunRequests(model, {7, 17, 33, 7}));
+        setenv("FASTLLM_DSV41_DISABLE_TP_VERIFY_ASYNC", "1", 1);
+        const auto verifyEight = RunDsparkRequests(model, 8);
+        unsetenv("FASTLLM_DSV41_DISABLE_TP_VERIFY_ASYNC");
+        Compare(verifyEight, RunDsparkRequests(model, 8));
+        auto *workspace = (model.*(&Access::v41TpVerifyWorkspace)).get();
+        if (!workspace) throw std::runtime_error("asynchronous verifier was not exercised");
+        Compare(verifyEight, RunDsparkRequests(model, 8));
+        if ((model.*(&Access::v41TpVerifyWorkspace)).get() != workspace)
+            throw std::runtime_error("verifier workspace was not reused");
+        std::cout << "PASS: synchronous/asynchronous TP verification 1..8, features and rollback match across requests\n";
+        if (eagerOnly) return 0;
         SetCudaGraph(true);
-        Compare(expected, RunRequests(model, {7, 17, 33, 7}));
-        std::cout << "PASS: eager/graph switching and shared overlap match across 4 requests, 52 steps each\n";
-        SetCudaGraph(false);
-        const auto speculative = RunDsparkRequests(model);
-        SetCudaGraph(true);
-        Compare(speculative, RunDsparkRequests(model));
-        if ((model.*(&Access::v41CudaGraphSlots)).size() != 6)
+        Compare(verifyEight, RunDsparkRequests(model));
+        if ((model.*(&Access::v41CudaGraphSlots)).size() != 8)
             throw std::runtime_error("missing DSpark graph shapes");
         SetCudaGraph(false);
-        Compare(speculative, RunDsparkRequests(model));
+        Compare(verifyEight, RunDsparkRequests(model));
         SetCudaGraph(true);
-        Compare(speculative, RunDsparkRequests(model));
-        std::cout << "PASS: DSpark graph shapes 1..6, main features and rollback match across requests\n";
+        Compare(verifyEight, RunDsparkRequests(model));
+        std::cout << "PASS: DSpark graph shapes 1..8, main features and rollback match across requests\n";
     } catch (const std::exception &e) {
         std::cerr << "FAIL: " << e.what() << '\n';
         return 1;

@@ -61,12 +61,13 @@ template <class T> void Run(DataType type, int D, int M, bool inplace) {
             if (std::strstr(name, "normdecode"))
                 specialized = true;
 #else
-            if (D == 5120 && M == 1 && p.gridDim.x == 1 && p.blockDim.x == 512)
+            if (type == FLOAT16 && D == 5120 && M >= 1 && M <= 8 && p.gridDim.x == unsigned(M) && p.blockDim.x == 512)
                 specialized = true;
 #endif
         }
     }
-    Require(specialized == (expectSpecialized && D == 5120 && M == 1), "specialization/fallback selection incorrect");
+    // BF16 already has a dedicated 5120-wide dispatch before normdecode.
+    Require(specialized == (expectSpecialized && type == FLOAT16 && D == 5120 && M >= 1 && M <= 8), "specialization/fallback selection incorrect");
     Check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
     for (int step = 0; step < 5; ++step) {
         std::vector<T> hx(M * D);
@@ -80,6 +81,9 @@ template <class T> void Run(DataType type, int D, int M, bool inplace) {
         Check(cudaGraphLaunch(exec, cudaStreamPerThread));
         Check(cudaDeviceSynchronize());
         auto a = Read<T>(out), b = Read<T>(ref);
+        if (type == FLOAT16 && D == 5120 && M <= 8)
+            Require(memcmp(a.data(), b.data(), a.size() * sizeof(T)) == 0,
+                    "decode RMSNorm differs bitwise from the generic reduction");
         double sq = 0, den = 0, ce = 0, cd = 0;
         for (int row = 0; row < M; ++row) {
             double ss = 0;
@@ -123,11 +127,19 @@ int main() {
         ex.SetFirstDevice("cuda:0");
         Run<half>(FLOAT16, 5120, 1, false);
         Run<half>(FLOAT16, 5120, 1, true);
-        Run<half>(FLOAT16, 5120, 2, false);
+        for (int rows = 2; rows <= 8; ++rows) {
+            Run<half>(FLOAT16, 5120, rows, false);
+            Run<half>(FLOAT16, 5120, rows, true);
+        }
+        Run<half>(FLOAT16, 5120, 9, false);
         Run<half>(FLOAT16, 4096, 1, false);
         Run<__nv_bfloat16>(BFLOAT16, 5120, 1, false);
         Run<__nv_bfloat16>(BFLOAT16, 5120, 1, true);
-        Run<__nv_bfloat16>(BFLOAT16, 5120, 2, false);
+        for (int rows = 2; rows <= 8; ++rows) {
+            Run<__nv_bfloat16>(BFLOAT16, 5120, rows, false);
+            Run<__nv_bfloat16>(BFLOAT16, 5120, rows, true);
+        }
+        Run<__nv_bfloat16>(BFLOAT16, 5120, 9, false);
         Run<__nv_bfloat16>(BFLOAT16, 4096, 1, false);
         puts("PASS");
         return 0;

@@ -662,6 +662,26 @@ if (UNIT_TEST)
     add_executable(moe_expert_partition_test test/basic/test_moe_expert_partition.cpp)
     target_include_directories(moe_expert_partition_test PRIVATE src)
     add_test(NAME moe_expert_partition COMMAND moe_expert_partition_test)
+    function(fastllm_add_checked_test name target pass_regex timeout)
+        add_test(NAME ${name} COMMAND "${CMAKE_COMMAND}"
+            "-DTEST_EXECUTABLE=$<TARGET_FILE:${target}>"
+            "-DTEST_PASS_REGEX=${pass_regex}" "-DTEST_TIMEOUT=${timeout}"
+            "-DTEST_ARGUMENTS=${ARGN}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/test/basic/run_checked_test.cmake")
+        math(EXPR outer_timeout "${timeout} + 10")
+        set_tests_properties(${name} PROPERTIES TIMEOUT ${outer_timeout}
+            SKIP_REGULAR_EXPRESSION "FASTLLM_TEST_SKIP_NO_DEVICE")
+    endfunction()
+    add_executable(qwen35_mtp_shortlist_test test/basic/test_qwen35_mtp_shortlist.cpp)
+    target_include_directories(qwen35_mtp_shortlist_test PRIVATE include)
+    set_target_properties(qwen35_mtp_shortlist_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    fastllm_add_checked_test(qwen35_mtp_shortlist qwen35_mtp_shortlist_test "PASS" 60)
+    if (USE_CUDA AND NOT USE_ROCM)
+        add_executable(qwen35_dflash_shortlist_test test/basic/test_qwen35_dflash_shortlist.cpp)
+        target_link_libraries(qwen35_dflash_shortlist_test PRIVATE fastllm)
+        fastllm_add_checked_test(qwen35_dflash_shortlist qwen35_dflash_shortlist_test "PASS: padded rows excluded" 180)
+        set_tests_properties(qwen35_dflash_shortlist PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+    endif()
     if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|i[3-6]86)$")
         add_executable(cpu_isa_compat_test test/basic/test_cpu_isa_compat.cpp)
         target_link_libraries(cpu_isa_compat_test PRIVATE fastllm)
@@ -705,6 +725,14 @@ if (UNIT_TEST)
 
     add_executable(qwen35_paged_cache_test test/basic/test_qwen35_paged_cache.cpp)
     add_test(NAME qwen35_paged_cache COMMAND qwen35_paged_cache_test)
+
+    add_executable(multimodal_history_cache_test test/basic/test_multimodal_history_cache.cpp)
+    target_link_libraries(multimodal_history_cache_test PRIVATE fastllm)
+    add_test(NAME multimodal_history_cache COMMAND multimodal_history_cache_test)
+
+    add_executable(qwen4_multimodal_cache_test test/basic/test_qwen4_multimodal_cache.cpp)
+    target_link_libraries(qwen4_multimodal_cache_test PRIVATE fastllm)
+    add_test(NAME qwen4_multimodal_cache COMMAND qwen4_multimodal_cache_test)
 
     add_executable(nvfp4_planar_test test/basic/test_nvfp4_planar.cpp)
     target_link_libraries(nvfp4_planar_test PRIVATE fastllm)
@@ -799,12 +827,23 @@ if (UNIT_TEST)
         set_tests_properties(qwen35_mtp_tp qwen35_mtp_tp_wide
                              PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
                              PASS_REGULAR_EXPRESSION "TOTAL [0-9]+ PASS")
+        add_executable(qwen35_dflash_batch_snapshots_test test/basic/test_qwen35_dflash_batch_snapshots.cpp)
+        target_link_libraries(qwen35_dflash_batch_snapshots_test PRIVATE fastllm)
+        add_test(NAME qwen35_dflash_batch_snapshots COMMAND qwen35_dflash_batch_snapshots_test)
+        set_tests_properties(qwen35_dflash_batch_snapshots PROPERTIES
+                             LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
         add_executable(cuda_mtp_gumbel_test test/basic/test_cuda_mtp_gumbel.cpp)
         target_link_libraries(cuda_mtp_gumbel_test PRIVATE fastllm)
         target_include_directories(cuda_mtp_gumbel_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         add_test(NAME cuda_mtp_gumbel COMMAND cuda_mtp_gumbel_test)
         set_tests_properties(cuda_mtp_gumbel PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
                              PASS_REGULAR_EXPRESSION "MTP Gumbel/rejection: PASS")
+        add_executable(cuda_fp8_marlin_prepare_test test/basic/test_cuda_fp8_marlin_prepare.cu)
+        target_link_libraries(cuda_fp8_marlin_prepare_test PRIVATE fastllm cublas)
+        target_include_directories(cuda_fp8_marlin_prepare_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME cuda_fp8_marlin_prepare COMMAND cuda_fp8_marlin_prepare_test)
+        set_tests_properties(cuda_fp8_marlin_prepare PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
+                             PASS_REGULAR_EXPRESSION "FP8 explicit Marlin preparation: PASS")
         add_executable(cuda_mtp_rejection_test test/basic/test_cuda_mtp_rejection.cpp)
         target_link_libraries(cuda_mtp_rejection_test PRIVATE fastllm)
         target_include_directories(cuda_mtp_rejection_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
@@ -940,6 +979,20 @@ if (UNIT_TEST)
         add_test(NAME cuda_qwen4_attention_fusion COMMAND cuda_qwen4_attention_fusion_test)
         set_tests_properties(cuda_qwen4_attention_fusion PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
 
+        add_executable(cuda_qwen4_shared_expert_test test/basic/test_cuda_qwen4_shared_expert.cpp)
+        target_link_libraries(cuda_qwen4_shared_expert_test PRIVATE fastllm)
+        target_include_directories(cuda_qwen4_shared_expert_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME cuda_qwen4_shared_expert COMMAND cuda_qwen4_shared_expert_test)
+        set_tests_properties(cuda_qwen4_shared_expert PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+
+        if (USE_NUMAS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            add_executable(numas_cuda_affinity_test test/basic/test_numas_cuda_affinity.cpp)
+            target_link_libraries(numas_cuda_affinity_test PRIVATE fastllm)
+            add_test(NAME numas_cuda_affinity COMMAND numas_cuda_affinity_test)
+            set_tests_properties(numas_cuda_affinity PROPERTIES LABELS cuda
+                ENVIRONMENT "FT_NUMAS=2;FT_THREADS=6" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 60)
+        endif()
+
         add_executable(cuda_bf16_bias_multigpu_test test/basic/test_cuda_bf16_bias_multigpu.cpp)
         target_link_libraries(cuda_bf16_bias_multigpu_test PRIVATE fastllm)
         target_include_directories(cuda_bf16_bias_multigpu_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
@@ -1068,10 +1121,65 @@ if (UNIT_TEST)
         set_tests_properties(cuda_rmsnorm_decode PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
 
         add_executable(cuda_nvfp4_fused_test test/basic/test_cuda_nvfp4_fused.cu)
+        # Baseline/candidate numerical comparison uses separate processes:
+        # cuda_nvfp4_sm75_decode_test GPU write|check REFERENCE_DIR [quick]
+        add_executable(cuda_nvfp4_sm75_decode_test test/basic/test_cuda_nvfp4_sm75_decode.cu)
+        target_link_libraries(cuda_nvfp4_sm75_decode_test PRIVATE fastllm)
+        set_target_properties(cuda_nvfp4_sm75_decode_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_executable(cuda_greedy_typed_test test/basic/test_cuda_greedy_typed.cu)
+        target_link_libraries(cuda_greedy_typed_test PRIVATE fastllm)
+        set_target_properties(cuda_greedy_typed_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        fastllm_add_checked_test(cuda_greedy_typed cuda_greedy_typed_test "PASS device=" 600)
+        set_tests_properties(cuda_greedy_typed PROPERTIES LABELS cuda RUN_SERIAL TRUE
+            ENVIRONMENT "SKIP_GREEDY_GRAPH=1;FASTLLM_CUDA_GRAPH=0")
+        add_executable(cuda_dflash_sm75_test test/basic/test_cuda_dflash_sm75.cu)
+        target_link_libraries(cuda_dflash_sm75_test PRIVATE fastllm)
+        set_target_properties(cuda_dflash_sm75_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        fastllm_add_checked_test(cuda_dflash_sm75 cuda_dflash_sm75_test "PASS DFlash SM75 attention" 600)
+        set_tests_properties(cuda_dflash_sm75 PROPERTIES LABELS cuda RUN_SERIAL TRUE
+            ENVIRONMENT "FASTLLM_CUDA_GRAPH=0")
+
+        foreach(dflash_test IN ITEMS attention rope)
+            add_executable(cuda_dflash_${dflash_test}_test test/basic/test_cuda_dflash_${dflash_test}.cu)
+            target_link_libraries(cuda_dflash_${dflash_test}_test PRIVATE fastllm)
+            set_target_properties(cuda_dflash_${dflash_test}_test PROPERTIES
+                CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        endforeach()
+        fastllm_add_checked_test(cuda_dflash_attention cuda_dflash_attention_test "PASS DFlash attention" 600)
+        fastllm_add_checked_test(cuda_dflash_rope cuda_dflash_rope_test "ALL_PASS cases=" 600)
+        set_tests_properties(cuda_dflash_attention cuda_dflash_rope PROPERTIES
+            LABELS cuda RUN_SERIAL TRUE)
+        set_tests_properties(cuda_dflash_attention PROPERTIES ENVIRONMENT "DFLASH_ATTN_NO_BENCH=1")
+
+        if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            add_executable(cuda_dflash_graph_test test/basic/test_cuda_dflash_graph.cu)
+            # fastllm is an OBJECT library. ELF link wrapping lets this test
+            # observe real CUDA graph calls without production instrumentation.
+            target_link_libraries(cuda_dflash_graph_test PRIVATE fastllm
+                "-Wl,--wrap=cudaGraphInstantiate"
+                "-Wl,--wrap=cudaGraphLaunch"
+                "-Wl,--wrap=cudaGraphExecDestroy")
+            set_target_properties(cuda_dflash_graph_test PROPERTIES
+                CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+            fastllm_add_checked_test(cuda_dflash_graph cuda_dflash_graph_test "ALL_PASS full draft graph lifecycle" 600)
+            set_tests_properties(cuda_dflash_graph PROPERTIES LABELS cuda RUN_SERIAL TRUE
+                ENVIRONMENT "FASTLLM_CUDA_DFLASH_FUSED_CONV=1;FASTLLM_CUDA_DFLASH_FUSED_QKV_PREPARE=1;FASTLLM_CUDA_DFLASH_FUSED_GATEUP_PREPARE=1")
+        else()
+            message(STATUS "DFlash graph execution-observation test requires Linux ELF link wrapping")
+        endif()
+
         target_link_libraries(cuda_nvfp4_fused_test PRIVATE fastllm)
         set_target_properties(cuda_nvfp4_fused_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
-        add_test(NAME cuda_nvfp4_fused COMMAND cuda_nvfp4_fused_test)
-        set_tests_properties(cuda_nvfp4_fused PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        fastllm_add_checked_test(cuda_nvfp4_fused cuda_nvfp4_fused_test "PASS" 600)
+        set_tests_properties(cuda_nvfp4_fused PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+        fastllm_add_checked_test(cuda_nvfp4_swiglu_sm75 cuda_nvfp4_fused_test "PASS" 600)
+        set_tests_properties(cuda_nvfp4_swiglu_sm75 PROPERTIES
+            LABELS cuda RUN_SERIAL TRUE
+            ENVIRONMENT "SM75_SWIGLU_ONLY=1;FASTLLM_CUDA_GRAPH=0;FASTLLM_CUDA_NVFP4_SWIGLU_MULTIROW=1")
+        fastllm_add_checked_test(cuda_nvfp4_sm120_tiles cuda_nvfp4_fused_test "PASS SM120 NVFP4 tiles" 600 sm120-tiles)
+        fastllm_add_checked_test(cuda_nvfp4_swiglu_sm120 cuda_nvfp4_fused_test "PASS SM120 SwiGLU" 600 sm120-swiglu)
+        set_tests_properties(cuda_nvfp4_sm120_tiles cuda_nvfp4_swiglu_sm120 PROPERTIES
+            LABELS cuda RUN_SERIAL TRUE)
 
         add_executable(cuda_fp8_linear_add_test test/basic/test_cuda_fp8_linear_add.cu)
         target_link_libraries(cuda_fp8_linear_add_test PRIVATE fastllm)
@@ -1111,6 +1219,9 @@ if (UNIT_TEST)
         add_executable(cudaGraphPoolMissRegression test/ops/cudaGraphPoolMissRegression.cpp)
         target_link_libraries(cudaGraphPoolMissRegression fastllm)
         target_include_directories(cudaGraphPoolMissRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME cudaGraphPoolMiss COMMAND cudaGraphPoolMissRegression)
+        set_tests_properties(cudaGraphPoolMiss PROPERTIES LABELS cuda
+            SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
 
         add_executable(marlinGraphScratchRegression test/ops/marlinGraphScratchRegression.cpp)
         target_link_libraries(marlinGraphScratchRegression fastllm)

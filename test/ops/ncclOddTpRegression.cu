@@ -108,13 +108,14 @@ static void RunGroup(const std::vector<int> &devices) {
 
 int main() {
     int count = 0;
-    if (cudaGetDeviceCount(&count) != cudaSuccess || count < 3) {
-        std::cout << "SKIP: requires at least three CUDA GPUs\n";
+    if (cudaGetDeviceCount(&count) != cudaSuccess || count < 2) {
+        std::cout << "SKIP: requires at least two CUDA GPUs\n";
         return 77;
     }
-    RunGroup({0, 1, 2});
+    if (count >= 3) RunGroup({0, 1, 2});
     RunGroup({0, 1});
     if (count >= 4) RunGroup({0, 1, 2, 3});
-    // Rebuild a same-size odd group with different membership/rank order.
-    RunGroup(count >= 4 ? std::vector<int>{3, 1, 2} : std::vector<int>{2, 0, 1});
+    // Rebuild a same-size group with different membership/rank order.
+    RunGroup(count >= 4 ? std::vector<int>{3, 1, 2} :
+             count == 3 ? std::vector<int>{2, 0, 1} : std::vector<int>{1, 0});
 }

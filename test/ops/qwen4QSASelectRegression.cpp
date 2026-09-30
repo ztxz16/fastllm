@@ -28,6 +28,105 @@ static uint32_t Ordered(float value) {
     return bits & 0x80000000u ? ~bits : bits | 0x80000000u;
 }
 
+// Compare incremental compression against the public unfused operators.
+// Check every physical cache slot, including untouched history, while one
+// captured graph advances and shrinks its logical sequence length.
+static int CheckCompression() {
+    constexpr int dim = 128, ratio = 4, capacity = 13;
+    int checks = 0;
+    std::mt19937 generator(29);
+    std::uniform_real_distribution<float> random(-2.0f, 2.0f);
+    for (int sequence : {1, 2, 3, 4}) {
+        std::vector<float> raw(sequence * dim), oldTail(ratio * dim);
+        std::vector<float> oldCache(capacity * dim), weights(dim);
+        for (auto *values : {&raw, &oldTail, &oldCache, &weights})
+            for (float &v : *values) v = random(generator);
+        Data input(FLOAT32, {sequence, dim}, raw);
+        Data norm(FLOAT32, {dim}, weights);
+        Data positions(FLOAT32, {sequence});
+        Data tail(FLOAT32, {ratio, dim}), tailPositions(FLOAT32, {ratio});
+        Data cache(FLOAT32, {capacity, dim}), meta(INT32, {1});
+        for (Data *d : {&input, &norm, &positions, &tail, &tailPositions, &cache, &meta}) ToGpu(*d);
+        auto graphLaunch = [&] {
+            if (!FastllmCudaQwen4QSAAppendCompress4Graph(input, positions, norm,
+                    1000000.0f, (const int32_t *)meta.cudaData,
+                    tail, tailPositions, cache, 1e-6f))
+                throw std::runtime_error("incremental QSA graph append rejected");
+        };
+        cudaGraph_t graph;
+        cudaGraphExec_t executable;
+        CheckCuda(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+        graphLaunch();
+        CheckCuda(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+        CheckCuda(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+        for (int previous : {0, 1, 2, 3, 48, 49, 50, 51, 4, 5, 6, 7}) {
+            const int oldCount = previous % ratio;
+            if (previous + sequence > capacity * ratio) continue;
+            for (int positionBase : {0, 100003}) {
+                std::vector<float> pos(sequence), oldPos(ratio);
+                for (int i = 0; i < sequence; ++i) pos[i] = positionBase + (previous + i) * 3;
+                for (int i = 0; i < ratio; ++i) oldPos[i] = positionBase + (previous - oldCount + i) * 3;
+                auto wantedCache = oldCache, wantedTail = oldTail, wantedPos = oldPos;
+                if (oldCount + sequence >= ratio) {
+                    std::vector<float> complete(ratio * dim);
+                    std::copy_n(oldTail.begin(), oldCount * dim, complete.begin());
+                    std::copy_n(raw.begin(), (ratio - oldCount) * dim, complete.begin() + oldCount * dim);
+                    Data keys(FLOAT32, {ratio, dim}, complete), pooled, member, averaged, normalized;
+                    ToGpu(keys);
+                    Split(keys, 0, 0, 1, pooled);
+                    for (int i = 1; i < ratio; ++i) {
+                        Split(keys, 0, i, i + 1, member);
+                        AddTo(pooled, member);
+                    }
+                    Mul(pooled, 0.25f, averaged);
+                    RMSNorm(averaged, norm, 1e-6f, normalized);
+                    normalized.Reshape({1, 1, 1, dim});
+                    Data first(FLOAT32, {1, 1},
+                        std::vector<float>{oldCount > 0 ? oldPos[0] : pos[0]});
+                    ToGpu(first);
+                    RopeEncoding(normalized, first, 64, 1000000.0f, 1.0f, true);
+                    CheckCuda(cudaMemcpy(wantedCache.data() + (previous / ratio) * dim,
+                        normalized.cudaData, dim * sizeof(float), cudaMemcpyDeviceToHost));
+                }
+                for (int i = 0; i < sequence; ++i) {
+                    const int slot = (oldCount + i) % ratio;
+                    std::copy_n(raw.begin() + i * dim, dim, wantedTail.begin() + slot * dim);
+                    wantedPos[slot] = pos[i];
+                }
+                for (bool replay : {false, true}) {
+                    auto upload = [&](Data &d, const std::vector<float> &values) {
+                        CheckCuda(cudaMemcpy(d.cudaData, values.data(), values.size() * sizeof(float), cudaMemcpyHostToDevice));
+                    };
+                    upload(tail, oldTail); upload(tailPositions, oldPos);
+                    upload(cache, oldCache); upload(positions, pos);
+                    if (replay) {
+                        CheckCuda(cudaMemcpyAsync(meta.cudaData, &previous, sizeof(previous), cudaMemcpyHostToDevice, cudaStreamPerThread));
+                        CheckCuda(cudaGraphLaunch(executable, cudaStreamPerThread));
+                    } else if (!FastllmCudaQwen4QSAAppendCompress4(input, positions, norm,
+                            1000000.0f, previous, tail, tailPositions, cache, 1e-6f)) {
+                        throw std::runtime_error("incremental QSA eager append rejected");
+                    }
+                    CheckCuda(cudaStreamSynchronize(cudaStreamPerThread));
+                    auto compare = [&](Data &d, const std::vector<float> &wanted) {
+                        std::vector<float> actual(wanted.size());
+                        CheckCuda(cudaMemcpy(actual.data(), d.cudaData, actual.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                        if (std::memcmp(actual.data(), wanted.data(), actual.size() * sizeof(float)))
+                            throw std::runtime_error("incremental QSA cache differs from unfused operators");
+                    };
+                    compare(cache, wantedCache); compare(tail, wantedTail); compare(tailPositions, wantedPos);
+                    ++checks;
+                }
+            }
+        }
+        if (FastllmCudaQwen4QSAAppendCompress4(input, positions, norm, 1000000.0f,
+                capacity * ratio + ratio - sequence, tail, tailPositions, cache, 1e-6f))
+            throw std::runtime_error("QSA append accepted insufficient compressed capacity");
+        CheckCuda(cudaGraphExecDestroy(executable));
+        CheckCuda(cudaGraphDestroy(graph));
+    }
+    return checks;
+}
+
 static int CheckPrefill() {
     // The metadata-driven path deliberately retains the generic scoring
     // kernel. Compare full indices with it, including ties, causal tails,
@@ -179,7 +278,10 @@ int main() {
         return 77;
     }
     try {
+        SetThreads(2);
         FastllmCudaSetDevice(0);
+        const int compressionChecks = CheckCompression();
+        std::cout << "PASS: " << compressionChecks << " incremental compression caches exactly match unfused operators\n";
         const int gatherChecks = CheckDenseVerifierGather();
         std::cout << "PASS: " << gatherChecks << " dense verifier rows preserve causal KV and padding across replays\n";
         constexpr int heads = 4, dim = 128, budget = 2048, ratio = 4;
@@ -187,9 +289,11 @@ int main() {
         std::mt19937 generator(42);
         std::uniform_real_distribution<float> random(-1.0f, 1.0f);
         int checks = 0;
-        for (int capacity : {512, 1281, 2048, 2049, 4096, 4097, 8192, 8193,
-                             16384, 16385, 32768, 32769, 36864, 36865,
-                             65536, 65537, 69632, 69633}) {
+        for (int capacity : {512, 1281, 2048, 2049, 4096, 4097, 6144, 6145,
+                             8192, 8193, 10240, 10241, 16384, 16385,
+                             20480, 20481, 24576, 24577, 32768, 32769,
+                             36864, 36865, 40960, 40961, 65536, 65537,
+                             69632, 69633, 73728, 73729}) {
             for (int rows : {1, 4}) {
                 for (int pattern = 0; pattern < 3; pattern++) {
                     std::vector<float> queries(rows * heads * dim);

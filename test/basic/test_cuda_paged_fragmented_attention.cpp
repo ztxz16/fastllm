@@ -16,7 +16,8 @@
 
 using namespace fastllm;
 namespace {
-constexpr int heads = 12, kvHeads = 2, dim = 256, pageLen = 128, group = 6;
+constexpr int dim = 256, pageLen = 128, group = 6;
+bool benchmark = false;
 void Check(cudaError_t e) {
     if (e != cudaSuccess)
         throw std::runtime_error(cudaGetErrorString(e));
@@ -50,7 +51,7 @@ void Ints(Data &a, const std::vector<int> &v) {
 }
 struct CacheView : Data {
     CacheView(PagedCacheManager &pool, int length, const std::vector<int> &pages) : Data(FLOAT16) {
-        Resize({kvHeads, length, dim});
+        Resize({pool.dims[2], length, dim});
         isPagedKVCache = true;
         pagedKVCacheData = &pool;
         pageLen = ::pageLen;
@@ -60,16 +61,19 @@ struct CacheView : Data {
     ~CacheView() { isPagedKVCache = false; } // Synthetic pages have no allocator refs.
 };
 
-void Run(int length, int rows, int layout, bool tail) {
+void Run(int kvHeads, int length, int rows, int layout, bool tail) {
+    const int heads = group * kvHeads;
     int pages = (length + pageLen - 1) / pageLen;
     std::vector<int> ids(pages);
     std::iota(ids.begin(), ids.end(), 0);
     if (layout == 1)
         std::reverse(ids.begin(), ids.end());
-    if (layout == 2)
+    if (layout == 2 || layout >= 5) {
+        const int gaps = layout == 2 ? 9 : layout == 5 ? 10 : layout == 6 ? 11 : 17;
         for (int i = 0; i < pages; ++i)
-            ids[i] += i * 9 / pages;
-    if (layout >= 3) {
+            ids[i] += i * gaps / pages;
+    }
+    if (layout == 3 || layout == 4) {
         // Logical fragmentation can still coalesce physically (layout 3).
         // Isolated physical pages (layout 4) must retain the gather fallback.
         if (layout == 4)
@@ -132,6 +136,24 @@ void Run(int length, int rows, int layout, bool tail) {
     Require(FastllmCudaHalfPagedAttentionBatchFastllmFallback(q, k, v, qs, ps, pi, ls, out, group, 1.f / 16),
             "attention failed");
     Check(cudaDeviceSynchronize());
+    if (benchmark) {
+        cudaEvent_t start, end;
+        Check(cudaEventCreate(&start));
+        Check(cudaEventCreate(&end));
+        Check(cudaEventRecord(start, cudaStreamPerThread));
+        for (int i = 0; i < 20; ++i) {
+            Require(FastllmCudaHalfPagedAttentionBatchFastllmFallback(
+                q, k, v, qs, ps, pi, ls, out, group, 1.f / 16), "attention failed");
+        }
+        Check(cudaEventRecord(end, cudaStreamPerThread));
+        Check(cudaEventSynchronize(end));
+        float ms = 0;
+        Check(cudaEventElapsedTime(&ms, start, end));
+        std::printf("BENCH kv_heads=%d len=%d rows=%d layout=%d us=%.3f\n",
+                    kvHeads, length, rows, layout, ms * 1000 / 20);
+        Check(cudaEventDestroy(start));
+        Check(cudaEventDestroy(end));
+    }
     std::vector<uint16_t> actual(out.Count(0));
     Check(cudaMemcpy(actual.data(), out.cudaData, out.GetBytes(), cudaMemcpyDeviceToHost));
     double maxError = 0;
@@ -173,13 +195,14 @@ void Run(int length, int rows, int layout, bool tail) {
                 if (!std::isfinite(value) || error > .0015 + .003 * std::abs(expected)) {
                     std::fprintf(
                         stderr,
-                        "FAIL len=%d rows=%d layout=%d tail=%d r=%d h=%d d=%d actual=%.9g expected=%.9g\n",
-                        length, rows, layout, tail, r, h, d, value, expected);
+                        "FAIL kv_heads=%d len=%d rows=%d layout=%d tail=%d r=%d h=%d d=%d actual=%.9g expected=%.9g\n",
+                        kvHeads, length, rows, layout, tail, r, h, d, value, expected);
                     throw std::runtime_error("paged attention differs from independent reference");
                 }
             }
         }
-    std::printf("PASS len=%d rows=%d layout=%d tail=%d max_abs=%.9g\n", length, rows, layout, tail, maxError);
+    std::printf("PASS kv_heads=%d len=%d rows=%d layout=%d tail=%d max_abs=%.9g\n",
+                kvHeads, length, rows, layout, tail, maxError);
     std::fflush(stdout);
 }
 } // namespace
@@ -188,15 +211,25 @@ int main(int argc, char **argv) {
     if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0)
         return 77;
     Check(cudaSetDevice(0));
-    // Exercise SM70's direct-KV path even when the test GPU is newer.
-    setenv("FASTLLM_PAGED_CUBLAS_LINEAR_KV", "1", 1);
+    // The existing two-head direct-KV path can also be tested on newer GPUs.
+    // The new four-head path remains SM70-only, including with this override.
+    // An explicit zero allows benchmarking the gather fallback in the same binary.
+    if (!std::getenv("FASTLLM_PAGED_CUBLAS_LINEAR_KV"))
+        setenv("FASTLLM_PAGED_CUBLAS_LINEAR_KV", "1", 1);
+    // Keep short test cases on the direct-KV/gather dispatch as well.
+    setenv("FASTLLM_PAGED_SM70_SMALL_T", "0", 1);
     try {
-        bool longTest = argc > 1 && std::string(argv[1]) == "--long";
-        for (int length : longTest ? std::vector<int>{179908, 179969, 208897} : std::vector<int>{129, 4099})
-            for (int rows : {2, 4, 8})
-                for (int layout = 0; layout < 5; ++layout)
-                    for (bool tail : {false, true})
-                        Run(length, rows, layout, tail);
+        std::string mode = argc > 1 ? argv[1] : "";
+        bool longTest = mode == "--long";
+        benchmark = mode == "--bench";
+        for (int kvHeads : benchmark ? std::vector<int>{4} : std::vector<int>{2, 4})
+            for (int length : benchmark ? std::vector<int>{4099, 8192, 65536, 131072} :
+                              longTest ? std::vector<int>{65536, 65541, 179908, 179969, 208897} :
+                                         std::vector<int>{129, 4099, 8191, 8192, 8193})
+                for (int rows : benchmark ? std::vector<int>{2, 6} : std::vector<int>{2, 4, 6, 8})
+                    for (int layout = 0; layout < 8; ++layout)
+                        for (bool tail : benchmark ? std::vector<bool>{false} : std::vector<bool>{false, true})
+                            Run(kvHeads, length, rows, layout, tail);
         return 0;
     } catch (const std::exception &error) {
         std::fprintf(stderr, "%s\n", error.what());

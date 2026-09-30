@@ -98,6 +98,14 @@ constexpr uint32_t get_num_mma_q(const uint32_t cta_tile_q) {
 // VO-split was originally reserved for head dimensions above 256. D256 with
 // CTA16 also needs it on 64 KiB-smem GPUs: time-sharing the K/V tile is what
 // makes this short-query shape launchable on SM75.
+// A custom small-query policy can request explicit output-stage ordering.
+// Existing attention policies keep their original generated code.
+template <typename Variant, typename = void>
+struct NeedsDFlashOutputSync : std::false_type {};
+template <typename Variant>
+struct NeedsDFlashOutputSync<Variant, std::void_t<decltype(Variant::dflash_sync_output)>>
+    : std::bool_constant<Variant::dflash_sync_output> {};
+
 constexpr bool use_vo_split_shape(const uint32_t num_warps_kv,
                                   const uint32_t cta_tile_q,
                                   const uint32_t head_dim_vo) {
@@ -1971,6 +1979,11 @@ __device__ __forceinline__ void threadblock_sync_mdo_states(
         }
       }
     }
+    if constexpr (NeedsDFlashOutputSync<typename KTraits::AttentionVariant>::value) {
+      // The reduction arrays alias the FP16 output staging area. Every warp
+      // must finish reading the reduction before any Q warp reuses it.
+      __syncthreads();
+    }
   }
 }
 
@@ -2033,6 +2046,11 @@ __device__ __forceinline__ void write_o_reg_gmem(
         }
       }
 
+      if constexpr (NeedsDFlashOutputSync<typename KTraits::AttentionVariant>::value) {
+        // Lanes read each other's staged FP16 values below. SM75 independent
+        // thread scheduling requires a warp memory barrier between phases.
+        __syncwarp();
+      }
       uint32_t o_smem_offset_w = o_smem->template get_permuted_offset<UPCAST_STRIDE_O>(
           warp_idx_x * KTraits::NUM_MMA_Q * 16 + lane_idx / 8, lane_idx % 8);
 

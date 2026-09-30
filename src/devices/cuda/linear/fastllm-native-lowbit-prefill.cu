@@ -320,7 +320,10 @@ __device__ inline int MarlinScaleIndex(int n) {
 }
 static __global__ void RepackFp4(const uint32_t *weight, const uint8_t *scales, uint8_t *out, uint8_t *sout,
                                  int N, int packedN, int K) {
-    __shared__ __align__(16) uint8_t tile[64 * 128];
+    // Pad shared rows to reduce bank conflicts while keeping every row
+    // 16-byte aligned. The global weight and scale layouts stay unchanged.
+    constexpr int sharedPitch = 144;
+    __shared__ __align__(16) uint8_t tile[64 * sharedPitch];
     int word = threadIdx.x & 127;
     int localN = (word & 3) * 16 + (word >> 4), row = blockIdx.x * 64 + localN;
     int startK = blockIdx.y * 256;
@@ -328,10 +331,10 @@ static __global__ void RepackFp4(const uint32_t *weight, const uint8_t *scales, 
         int localGroup = t * 2 + (threadIdx.x >> 7), group = startK / 16 + localGroup;
         uint32_t q = group < K / 16 ? weight[(size_t(group) * (packedN / 64) + row / 64) * 128 + word] : 0;
         int pair = localGroup * 8 + ((word >> 2) & 3);
-        tile[localN * 128 + pair] = (q & 15) | (((q >> 16) & 15) << 4);
-        tile[localN * 128 + pair + 4] = ((q >> 4) & 15) | (((q >> 20) & 15) << 4);
-        tile[(localN + 8) * 128 + pair] = ((q >> 8) & 15) | (((q >> 24) & 15) << 4);
-        tile[(localN + 8) * 128 + pair + 4] = ((q >> 12) & 15) | (((q >> 28) & 15) << 4);
+        tile[localN * sharedPitch + pair] = (q & 15) | (((q >> 16) & 15) << 4);
+        tile[localN * sharedPitch + pair + 4] = ((q >> 4) & 15) | (((q >> 20) & 15) << 4);
+        tile[(localN + 8) * sharedPitch + pair] = ((q >> 8) & 15) | (((q >> 24) & 15) << 4);
+        tile[(localN + 8) * sharedPitch + pair + 4] = ((q >> 12) & 15) | (((q >> 28) & 15) << 4);
         if (((word >> 2) & 3) == 0 && group < K / 16) {
             if (row < N) {
                 float f = __half2float(__ushort_as_half(
@@ -352,7 +355,7 @@ static __global__ void RepackFp4(const uint32_t *weight, const uint8_t *scales, 
         int row = blockIdx.x * 64 + i / 8, k = startK / 2 + (i % 8) * 16;
         if (row < N && k < K / 2)
             reinterpret_cast<uint4 *>(out)[size_t(row) * (K / 32) + k / 16] =
-                reinterpret_cast<const uint4 *>(tile)[i];
+                reinterpret_cast<const uint4 *>(tile)[(i / 8) * (sharedPitch / 16) + i % 8];
     }
 }
 template <bool TmaScale = false>

@@ -71,6 +71,14 @@ class HarnessRuntime(ManagedAgentRuntime):
     @staticmethod
     def _patch(service, bind_host, *, experimental_recovery=False):
         context = service.get("contextWindowTokens") or 8192
+        # Reasoning and tool arguments share the output budget. An 8K ceiling
+        # can exhaust a coding turn in thinking before any tool call is made.
+        # Keep half the advertised context for input; Pi applies its own
+        # per-request context clamp as the conversation grows.
+        output_budget = max(1, min(32768, context // 2))
+        metadata = service.get("modelMetadata") or {}
+        modalities = metadata.get("input_modalities", metadata.get("inputModalities", []))
+        image_input = isinstance(modalities, list) and "image" in modalities
         efforts, default = reasoning_options(service)
         # Harness names the disabled level "off"; FastLLM expects "none" on
         # the wire so it overrides a service with thinking enabled by default.
@@ -92,9 +100,10 @@ class HarnessRuntime(ManagedAgentRuntime):
                 "apiKeyEnv": "FTLLM_HARNESS_API_KEY",
                 **({"reasoning": default} if default else {}),
                 "models": [{"id": service["modelName"], "name": service["modelName"],
+                            "input": ["text", "image"] if image_input else ["text"],
                             "reasoningEfforts": {"off" if effort == "none" else effort: effort
                                                  for effort in efforts} if efforts else False,
-                            "contextWindow": context, "maxTokens": min(8192, context // 2)}],
+                            "contextWindow": context, "maxTokens": output_budget}],
                 "compat": {"supportsStore": False, "supportsReasoningEffort": True,
                            "thinkingFormat": "openai", "maxTokensField": "max_tokens",
                            "supportsDeveloperRole": False},

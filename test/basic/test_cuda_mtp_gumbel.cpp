@@ -73,7 +73,7 @@ std::vector<double> TargetOracle(const std::vector<float> &values, float tempera
     return probs;
 }
 void ChainCase(const char *label, const std::vector<float> &p, const std::vector<float> &q,
-        float temperature = 1, int topK = 32, float topP = 1) {
+        float temperature = 1, int topK = 32, float topP = 1, bool indirect = false) {
     const int batch = 16384, drafts = 3, vocab = 32;
     const std::vector<float> bonus{.1f, .2f, .7f};
     const auto expected = TargetOracle(p, temperature, topK, topP);
@@ -95,8 +95,16 @@ void ChainCase(const char *label, const std::vector<float> &p, const std::vector
     Require(FastllmCudaMtpSampleDraftLogits(qlogits.p, saved.p, lse.p, ids.p, nullptr,
         qt.data(), batch * drafts, vocab), "chain draft failed");
     auto cache = saved.Read();
-    Require(FastllmCudaMtpRejectionSamplingLogits(target.p, saved.p, lse.p, ids.p,
-        pt.data(), pk.data(), pp.data(), output.data(), accepted.data(), batch, drafts, vocab), "chain verify failed");
+    if (indirect) {
+        std::vector<FastllmMtpProposalView> views(batch);
+        for (int b = 0; b < batch; ++b)
+            views[b] = {saved.p + (size_t)b * drafts * vocab, lse.p + b * drafts, ids.p + b * drafts};
+        Require(FastllmCudaMtpRejectionSamplingLogitsBatch(target.p, views.data(),
+            pt.data(), pk.data(), pp.data(), output.data(), accepted.data(), batch, drafts, vocab), "indirect chain verify failed");
+    } else {
+        Require(FastllmCudaMtpRejectionSamplingLogits(target.p, saved.p, lse.p, ids.p,
+            pt.data(), pk.data(), pp.data(), output.data(), accepted.data(), batch, drafts, vocab), "chain verify failed");
+    }
     Require(cache == saved.Read(), "verifier mutated q");
     auto proposals = ids.Read();
     int counts[3] = {}, bonuses[3] = {}, prefix[3] = {}, allAccepted = 0;
@@ -160,6 +168,69 @@ void LargeVocabAndGraphCase() {
     std::printf("vocab=%d graph sample/cache/lse %.3f us, fresh replay RNG: PASS\n", vocab, ms);
     cudaEventDestroy(start); cudaEventDestroy(end); cudaGraphExecDestroy(exec); cudaGraphDestroy(graph);
 }
+
+void IndirectBatchCase(int batch, int drafts) {
+    const int vocab = 257, guard = 11, pitch = drafts + guard;
+    Buffer<float> cache(std::vector<float>((size_t)batch * pitch * vocab, 123)),
+                  lse(std::vector<float>(batch * pitch, 123)),
+                  floatTokens(std::vector<float>(batch * pitch, 123));
+    Buffer<int> tokens(std::vector<int>(batch * pitch, -7));
+    std::vector<float> ts(batch), logits((size_t)batch * vocab, -INFINITY);
+    std::vector<int> hostTokens(batch);
+    auto id = [&](int b, int d) { return (b * 17 + d * 13 + 1) % vocab; };
+    // Reverse the request-to-cache mapping and pad slots: contiguous indexing
+    // or cross-lane aliasing must fail, even when every row has one-hot logits.
+    for (int d = 0; d < drafts; ++d) {
+        std::fill(logits.begin(), logits.end(), -INFINITY);
+        std::vector<FastllmMtpDraftOutput> outputs(batch);
+        for (int b = 0; b < batch; ++b) {
+            ts[b] = d % 2 ? 1.0f : (b % 2 ? .7f : 1.3f);
+            logits[(size_t)b * vocab + id(b,d)] = .5f;
+            size_t slot = (batch - 1 - b) * pitch + d;
+            outputs[b] = {cache.p + slot * vocab, lse.p + slot, tokens.p + slot,
+                          b % 2 ? nullptr : floatTokens.p + slot};
+        }
+        Buffer<float> input(logits);
+        Require(FastllmCudaMtpSampleDraftLogitsBatch(input.p, outputs.data(), ts.data(),
+            d % 2 ? nullptr : hostTokens.data(), batch, vocab), "indirect draft failed");
+        auto observed = tokens.Read();
+        auto floats = floatTokens.Read(), normalizers = lse.Read(), saved = cache.Read();
+        for (int b = 0; b < batch; ++b) {
+            size_t slot = (batch - 1 - b) * pitch + d;
+            Require(observed[slot] == id(b,d), "indirect token mapping failed");
+            if (d % 2 == 0) Require(hostTokens[b] == id(b,d), "batched host tokens mismatch");
+            if (b % 2 == 0) Require(floats[slot] == id(b,d), "indirect float token mapping failed");
+            Require(std::fabs(normalizers[slot] - .5f/ts[b]) < 1e-6, "indirect normalizer mismatch");
+            Require(std::fabs(saved[slot*vocab+id(b,d)] - .5f/ts[b]) < 1e-6, "indirect logits mismatch");
+        }
+    }
+    auto observed = tokens.Read();
+    for (int b = 0; b < batch; ++b)
+        for (int d = drafts; d < pitch; ++d) Require(observed[b*pitch+d] == -7, "proposal guard overwritten");
+    std::vector<float> target((size_t)batch*(drafts+1)*vocab,-INFINITY), pt(batch*(drafts+1),1), pp(pt.size(),.95f);
+    std::vector<int> pk(pt.size(),1), output(pt.size()), accepted(batch), expected(batch);
+    std::vector<FastllmMtpProposalView> views(batch);
+    for (int b = 0; b < batch; ++b) {
+        int off = (batch - 1 - b) * pitch;
+        views[b] = {cache.p + (size_t)off*vocab, lse.p+off, tokens.p+off};
+        expected[b] = b % (drafts+1);
+        for (int d = 0; d <= drafts; ++d) {
+            int token = d < expected[b] ? id(b,d) : (id(b,d)+1)%vocab;
+            target[((size_t)b*(drafts+1)+d)*vocab+token] = 0;
+        }
+    }
+    Buffer<float> p(target);
+    Require(FastllmCudaMtpRejectionSamplingLogitsBatch(p.p,views.data(),pt.data(),pk.data(),pp.data(),
+        output.data(),accepted.data(),batch,drafts,vocab), "indirect verification failed");
+    for (int b = 0; b < batch; ++b) {
+        Require(accepted[b] == expected[b], "mixed accept lengths mismatch");
+        for (int d = 0; d <= drafts; ++d) {
+            int expectedToken = d < expected[b] ? id(b,d) : d == expected[b] ? (id(b,d)+1)%vocab : -1;
+            Require(output[b*(drafts+1)+d] == expectedToken, "indirect verified token mismatch");
+        }
+    }
+    std::printf("indirect B=%d drafts=%d, reordered/padded caches, mixed acceptance: PASS\n",batch,drafts);
+}
 }
 int main() {
     int devices = 0;
@@ -173,6 +244,15 @@ int main() {
         ChainCase("target top-k/top-p", {.6f,.3f,.1f}, {.2f,.3f,.5f}, 1, 2, .7f);
         ChainCase("target temperature", {.6f,.3f,.1f}, {.2f,.3f,.5f}, 1.5f, 2, .95f);
         ChainCase("target top-k ties", {.4f,.4f,.2f}, {.6f,.3f,.1f}, .7f, 1, 1);
+        ChainCase("batch indirect p=q", {.6f,.3f,.1f}, {.6f,.3f,.1f}, 1, 32, 1, true);
+        ChainCase("batch indirect residual", {.1f,.2f,.7f}, {.6f,.3f,.1f}, 1, 32, 1, true);
+        ChainCase("batch indirect constraints", {.6f,.3f,.1f}, {.2f,.3f,.5f}, 1.5f, 2, .95f, true);
+        for (int device = 0; device < devices; ++device) {
+            Check(cudaSetDevice(device));
+            for (int batch : {1,2,4,8,10,16,24,32})
+                for (int drafts : {1,3,7}) IndirectBatchCase(batch,drafts);
+        }
+        Check(cudaSetDevice(0));
         LargeVocabAndGraphCase(); std::puts("MTP Gumbel/rejection: PASS"); return 0;
     } catch (const std::exception &e) { std::fprintf(stderr, "%s\n", e.what()); return 1; }
 }

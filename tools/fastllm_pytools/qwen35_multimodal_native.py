@@ -239,7 +239,9 @@ def _calculate_timestamps(
 def sanitize_qwen35_conversation(conversation: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     sanitized = []
     for message in conversation:
-        item = {"role": message["role"]}
+        # Strip image/video payloads from content, but keep tool-call history
+        # and reasoning fields needed by the tokenizer's chat template.
+        item = dict(message)
         content = message.get("content", "")
         if isinstance(content, list):
             new_content = []

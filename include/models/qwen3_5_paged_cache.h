@@ -1,6 +1,7 @@
 #ifndef FASTLLM_QWEN3_5_PAGED_CACHE_H
 #define FASTLLM_QWEN3_5_PAGED_CACHE_H
 
+#include <algorithm>
 #include <cstddef>
 #include <unordered_set>
 #include <vector>
@@ -19,6 +20,14 @@ namespace fastllm {
         }
         if (prefix == current.size()) {
             return {};
+        }
+        // Copy-on-write normally replaces only the final partial page.
+        // Searching once avoids building a hash table for the entire prefix;
+        // search all retained entries to preserve duplicate/reordered IDs.
+        if (current.size() - prefix == 1) {
+            const int page = current.back();
+            return std::find(retained.begin(), retained.end(), page) == retained.end()
+                ? std::vector<int>{page} : std::vector<int>{};
         }
         std::unordered_set<int> keep(retained.begin(), retained.end());
         std::vector<int> released;

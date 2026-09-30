@@ -1513,7 +1513,9 @@ def make_normal_llm_model(args, startup_progress = None):
                 args.moe_device = multicuda_spec
         else:
             if (not user_set_device):
-                args.device = tp_device
+                # Qwen's NUMA prefill workers discover GPUs from the main
+                # device map, so include every requested TP device by default.
+                args.device = (cuda_spec or tp_device) if is_qwen38_flash_next_model else tp_device
             if (not user_set_moe_device):
                 args.moe_device = (_thread_tp_cuda_device_spec(args.tp) or args.device) if is_thread_tp_moe_model else args.device
     if ((is_multicuda_tp_model or is_laguna_hybrid_tp_model) and

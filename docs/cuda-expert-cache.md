@@ -58,12 +58,64 @@ NVIDIA CUDA adapter. A model must prepare its expert tables and call the cache
 dispatch/release interfaces to use the adapter; the CLI flag alone does not
 add integration to other model implementations.
 
+Qwen4-Exp / Qwen3.8-Flash-Next also supports the cache with thread-level TP:
+
+```sh
+ftllm server /path/to/Qwen3.8-Flash-Next --tp 2 \
+  --moe_device numa --moe_cuda_cache 4g
+```
+
+For supported FP32 NUMA decode and verifier batches of up to nine rows,
+individual experts are assigned across the TP ranks by expert ID modulo rank
+count. Rank 0 supplies one
+authoritative routing decision. Each GPU computes its resident expert subset
+of the same layer; rank 0 computes the remaining routes once on NUMA. The
+existing TP reduction combines these partial results and the shared-expert
+slices. Shared experts launch after routing copies so their GPU work can
+overlap the NUMA subset. Recurring cold routes are admitted at most one per
+GPU per layer call, subject to measured copy cost; cold routes still execute
+on NUMA for the current call. A device with no usable cache leaves its routes
+on NUMA without disabling the other devices. A verifier snapshots cache
+residency for all rows before admitting cold experts, so every occurrence of
+an expert has the same owner. Supported NVFP4 NUMA subsets group rows by expert
+to reuse weight reads; other CPU configurations retain row-wise computation.
+GPU rows use the existing expert kernels, with admissions deferred until all
+resident rows have completed. Rank contributions use fused FP32 multiply-adds
+for weighted accumulation, including when all routes execute on NUMA.
+
+The byte budget applies to each device. Ordinary TP decode retains its dense
+CUDA Graph segments while expert dispatch runs outside capture. Cache warmup
+precedes startup KV budgeting. Larger prefill batches and unsupported EP shapes retain
+the rank-zero host-expert path and its existing cache eligibility.
+`--moe_device_layers` can keep some expert layers on CUDA; those resident
+layers are excluded from host-cache preparation. Disabling the cache preserves
+the original rank-zero host-expert execution.
+
+Measure throughput with the cache both enabled and disabled: refill and host
+routing overhead can outweigh the saved CPU work. Qwen's existing NVFP4 hybrid
+path uses FP32 CUDA activations and BF16 NUMA activations. Changing the measured
+CPU/GPU split can therefore change logits and greedy tokens, including between
+repeated requests; cache enablement does not promise bitwise CPU equivalence.
+NUMA prefill also selects CPU/GPU experts by timing when the cache is disabled.
+For numerical comparisons, set the existing `FT_EXPERT_LIMIT=0` in both runs
+to hold prefill on CPU; this is a diagnostic setting, not a recommended
+throughput setting.
+
+To distinguish backend precision from implementation errors, compare expert
+operators with identical inputs and routes before comparing whole-model logits.
+Check the fused gate/SiLU and down projections against independently dequantized
+weights, then check weighted rank contributions and the TP sum separately.
+Small activation differences can cross a top-k routing boundary and replace an
+expert, amplifying the difference in later layers.
+
 Qwen4-Exp MTP verifier batches of up to nine tokens can use the cache and become
 eligible for CUDA Graph when the remaining graph requirements are satisfied.
 Larger batches retain the configured MoE backend. MTP draft expert tables are
 not registered with this cache and retain their separately configured placement.
+TP with host experts keeps its existing MTP graph fallback; enabling the cache
+does not enable a whole-backbone MTP graph.
 
-For supported compact NVFP4 experts assigned entirely to NUMA, preparation
+For supported compact NVFP4 host tables assigned entirely to NUMA, preparation
 copies only original E4M3/global scales, invokes the model's NUMA registration
 callback, then borrows its pinned block-16 shards. Refill restores compact GPU
 records without rounding. With the cache enabled, complete 32-row tiles place
@@ -134,6 +186,13 @@ Results for every verify row use CPU staging and replica upload without requirin
 peer access. Cache work stays outside graph capture and preserves captured tensor
 addresses. Unsupported inputs or unprofitable splits fall back before launching
 shared work, so the shared expert runs exactly once on either path.
+
+Eager TP DSpark verification with 2–8 rows reuses one workspace across candidate
+counts and requests. Per-weight activation quantization buffers stay alive
+through event-ordered device dispatch, and both devices finish before the
+workspace lock is released. Long prefill keeps synchronous dispatch. Set
+`FASTLLM_DSV41_DISABLE_TP_VERIFY_ASYNC=1` to compare with the synchronous eager
+verification path without changing CUDA Graph or expert-cache settings.
 
 Expert math preserves V4.1 block-32 FP8 activation quantization, SwiGLU clipping,
 route weighting before down-input quantization and per-expert BF16 rounding.
@@ -332,6 +391,19 @@ aligned and odd widths; FP8 covers its supported layouts. Random FP8 tests
 compare gate and output bytes against the original all-resident GPU backend
 for FP16/BF16, including two layer tables, repeated expert IDs, changing inputs
 and scores, eviction and both eager execution and graph replay.
+Layered model checks exclude CUDA-resident tables, initialize per-device caches,
+and verify release/reprepare when the first registered host table is not layer 0.
+On two GPUs, expert-parallel tests compare summed rank outputs against independent
+CPU/GPU expert references, including duplicate routes, zero/negative scores,
+asymmetric cache budgets, reversed device order and collective fallback.
+An all-CPU routing case checks fused accumulation against a scalar reference.
+Verifier checks include transitions between one, four and nine rows and
+compare grouped NUMA values with independent single-row expert outputs.
+
+`test/benchmark/qwen4_tp_short_requests.py` exercises a real Qwen checkpoint
+with 512/2040-token inputs, 1/2/8-token outputs and repeated cache/MTP switches.
+It checks the TP/NUMA prefill handoff without per-operator synchronization,
+which would mask premature cross-thread reuse of CUDA temporary buffers.
 
 Shared-NUMA NVFP4 cases compare gate/output bytes with a full snapshot across
 NUMA shard counts, verifier sizes, eviction and eager/graph replay, including a

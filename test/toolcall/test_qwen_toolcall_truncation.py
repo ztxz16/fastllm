@@ -112,7 +112,7 @@ class QwenToolCallTruncationTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_complete_function_recovers_at_stop_or_length(self):
         for stream in (False, True):
-            for max_tokens in (24, 128):
+            for max_tokens in (24, 128, -1):
                 for chunk_size in (1, 7, 1024):
                     with self.subTest(stream=stream, max_tokens=max_tokens,
                                       chunk_size=chunk_size):
@@ -143,10 +143,12 @@ class QwenToolCallTruncationTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_incomplete_arguments_without_length_remain_errors(self):
         for stream in (False, True):
-            result = await self._response(
-                _FUNCTION[:-1], stream=stream, max_tokens=128)
-            self.assertTrue(result["errors"])
-            self.assertEqual(result["calls"], [])
+            for max_tokens in (128, -1):
+                with self.subTest(stream=stream, max_tokens=max_tokens):
+                    result = await self._response(
+                        _FUNCTION[:-1], stream=stream, max_tokens=max_tokens)
+                    self.assertTrue(result["errors"])
+                    self.assertEqual(result["calls"], [])
 
     async def test_recovery_does_not_bypass_validation_at_length(self):
         for stream in (False, True):

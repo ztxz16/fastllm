@@ -153,10 +153,26 @@ class Qwen35ReasoningTest(unittest.IsolatedAsyncioTestCase):
         })
         self.assertEqual(template_kwargs["reasoning_effort"], "medium")
 
-    def test_unsupported_effort_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "low, medium, xhigh"):
-            completion()._resolve_qwen3_5_reasoning_effort(
-                request(reasoning_effort="high"))
+    def test_unsupported_effort_uses_native_default(self):
+        for effort in ("minimal", "high", "max", 75):
+            with self.subTest(effort=effort):
+                self.assertEqual(
+                    completion()._resolve_qwen3_5_reasoning_effort(
+                        request(reasoning_effort=effort)), "xhigh")
+
+    def test_template_effort_fallback_preserves_other_kwargs(self):
+        instance = completion()
+        for key in ("reasoning_effort", "thinking_effort"):
+            for effort in ("high", "unknown", "", 75):
+                with self.subTest(key=key, effort=effort):
+                    template_kwargs = {key: effort, "custom": "kept"}
+                    chat_request = request(chat_template_kwargs=template_kwargs)
+                    resolved = instance._resolve_chat_template_kwargs(
+                        chat_request,
+                        instance._resolve_qwen3_5_reasoning_effort(chat_request))
+                    self.assertEqual(resolved["reasoning_effort"], "xhigh")
+                    self.assertEqual(resolved["custom"], "kept")
+                    self.assertEqual(template_kwargs[key], effort)
 
     def test_reasoning_response_requires_native_template_and_thinking(self):
         instance = completion()
@@ -226,15 +242,16 @@ class Qwen35ReasoningTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(template_kwargs, {"custom": "kept"})
 
     async def test_explicit_effort_enables_thinking_unless_template_explicitly_disables_it(self):
-        for override, expected in ((None, True), ({"enable_thinking": False}, False)):
-            with self.subTest(override=override):
-                instance = completion()
-                instance.enable_thinking = False
-                response = await instance.create_chat_completion(
-                    request(reasoning_effort="xhigh", chat_template_kwargs=override), RawRequest())
-                self.assertIsInstance(response, ChatCompletionResponse)
-                self.assertEqual(instance.model.input_kwargs["enable_thinking"], expected)
-                self.assertEqual(instance.model.launch_kwargs["enable_thinking"], expected)
+        for effort in ("xhigh", "high"):
+            for override, expected in ((None, True), ({"enable_thinking": False}, False)):
+                with self.subTest(effort=effort, override=override):
+                    instance = completion()
+                    instance.enable_thinking = False
+                    response = await instance.create_chat_completion(
+                        request(reasoning_effort=effort, chat_template_kwargs=override), RawRequest())
+                    self.assertIsInstance(response, ChatCompletionResponse)
+                    self.assertEqual(instance.model.input_kwargs["enable_thinking"], expected)
+                    self.assertEqual(instance.model.launch_kwargs["enable_thinking"], expected)
 
     async def test_unspecified_effort_preserves_service_thinking_default(self):
         instance = completion()

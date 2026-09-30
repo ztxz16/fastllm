@@ -41,6 +41,7 @@
 #include <vector>
 
 namespace fastllm {
+    struct DeepSeekV41DecodeWorkspace;
     // 单层的推理缓存
     struct DeepSeekV41LayerCache {
         int totalLen = 0;             // 已经进入本层的 token 数
@@ -325,6 +326,10 @@ namespace fastllm {
         // 捕获和回放共用互斥量，抢不到锁的前向退回逐算子。
         std::mutex v41CudaGraphMutex;
         std::map<int, std::shared_ptr<void>> v41CudaGraphSlots;
+        // One bounded eager verifier workspace, protected by v41CudaGraphMutex.
+        // No graph captures these buffers, so candidate counts can share them.
+        std::shared_ptr<DeepSeekV41DecodeWorkspace> v41TpVerifyWorkspace;
+        std::vector<int> v41TpVerifyDevices;
 
         // Retain tensor storage until this scope drains all TP ranks.
         class ScopedTpDispatch {

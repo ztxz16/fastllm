@@ -4,6 +4,7 @@
 #include "fastllm-cuda-shared-weight.cuh"
 #include "devices/cpu/cpudevice.h"
 #include "devices/cuda/cudadevice.h"
+#include "models/qwen4_exp.h"
 #ifdef USE_NUMAS
 #include "devices/numas/numasdevice.h"
 #include "devices/numas/numas.h"
@@ -19,6 +20,7 @@ namespace fastllm { NumaConfig *GetNumaConfig(); }
 #include <memory>
 #include <random>
 #include <stdexcept>
+#include <thread>
 #include <type_traits>
 #include <vector>
 
@@ -46,6 +48,36 @@ static size_t ExpertRecordBytes(const fastllm::Data &gate, const fastllm::Data &
     const size_t scaleBytes = gate.dataType == fastllm::DataType::FP8_E4M3_BLOCK_128 ? 0 :
         (gate.scales.size() + down.scales.size()) * sizeof(float);
     return (scalesOffset + scaleBytes + 127) / 128 * 128;
+}
+
+static void CheckLayeredModelCache(std::vector<fastllm::Data *> &hostWeights) {
+    fastllm::Qwen4ExpModel model;
+    model.block_cnt = 2;
+    model.deviceMap = model.moeDeviceMap = {{"cuda:0", 1}};
+    model.layeredMoeDeviceMap = {{"cpu", 1}};
+    model.moeDeviceLayers = 1;
+    // The first table represents a GPU layer that must never be snapshotted.
+    std::vector<std::vector<fastllm::Data *>> layers{
+        std::vector<fastllm::Data *>(hostWeights.size(), nullptr), hostWeights};
+    int devices = 0;
+    Check(cudaGetDeviceCount(&devices));
+    devices = std::min(devices, 2);
+    for (int pass = 0; pass < 2; ++pass) {
+        Require(model.PrepareMoeCudaCache(layers), "host layer after CUDA layer not registered");
+        for (int device = 0; device < devices; ++device) {
+            Check(cudaSetDevice(device));
+            Require(model.MoeCudaCacheAvailable(layers[1]), "per-device cache unavailable");
+            Require(!model.MoeCudaCacheAvailable(layers[0]), "CUDA layer was registered");
+        }
+        model.ReleaseMoeCudaCache(layers);
+        for (int device = 0; device < devices; ++device) {
+            Check(cudaSetDevice(device));
+            Require(!model.MoeCudaCacheAvailable(layers[1]), "later host layer cache leaked");
+        }
+        Check(cudaSetDevice(0));
+    }
+    model.moeDeviceLayers = 0;
+    Require(!model.PrepareMoeCudaCache(layers), "all-CUDA placement prepared host cache");
 }
 
 template<class T>
@@ -182,6 +214,9 @@ static void Run(fastllm::DataType dtype, int hidden, int inter,
     FastllmCudaReleaseMoeCache(weights.data(), weights.size());
     Require(!supported(), "released table still registered");
     FastllmCudaReleaseMoeCache(weights.data(), weights.size());
+    if (dtype == fastllm::DataType::FLOAT32 && hidden == 128 && batch == 1) {
+        CheckLayeredModelCache(weights);
+    }
     fastllm::SetMoeCudaCacheBytes(0);
     std::printf("PASS adapter weight=%d dtype=%d hidden=%d inter=%d batch=%d, graph/eviction/release/validation\n",
                 int(weightType), int(dtype), hidden, inter, batch);
@@ -312,6 +347,166 @@ static void CompareFP8(fastllm::DataType dtype, fastllm::DataType weightType,
     std::printf("PASS FP8 resident-reference weight=%d dtype=%d batch=%d: 50 steps, two tables, duplicates, eviction, eager/graph, bitwise gate/output\n",
                 int(weightType), int(dtype), batch);
 }
+
+#ifdef USE_NUMAS
+static void CheckExpertParallel(std::vector<fastllm::Data *> &reference,
+                                std::vector<fastllm::Data *> &weights,
+                                bool disableSecondDevice, bool reverseDevices = false,
+                                int maxRows = 1) {
+    using namespace fastllm;
+    int devices = 0;
+    Check(cudaGetDeviceCount(&devices));
+    if (devices < 2) return;
+    const char *overrideName = "FASTLLM_MOE_CUDA_CACHE_BYTES_1";
+    const char *previous = std::getenv(overrideName);
+    const bool hadOverride = previous != nullptr;
+    const std::string previousValue = previous ? previous : "";
+    if (disableSecondDevice) setenv(overrideName, "0", 1);
+    auto context = FastllmCudaCreateMoeExpertParallel(2);
+    const int hidden = weights[2]->dims[1], topk = 7;
+    Data inputs[2]{{FLOAT32, {maxRows, hidden}}, {FLOAT32, {maxRows, hidden}}};
+    Data ids(INT32, {maxRows, topk}), scores(FLOAT32, {maxRows, topk}), results[2];
+    Data refIds(INT32, {maxRows, topk}), refScores(FLOAT32, {maxRows, topk}), refInput(FLOAT32, {maxRows, hidden});
+    Data refGate, refOutput;
+    for (int r = 0; r < 2; ++r) {
+        Check(cudaSetDevice(reverseDevices ? 1 - r : r));
+        inputs[r].ToDevice(DataDevice::CUDA, std::vector<int>{reverseDevices ? 1 - r : r});
+        inputs[r].Allocate(false);
+    }
+    Check(cudaSetDevice(reverseDevices ? 1 : 0));
+    ids.ToDevice(DataDevice::CUDA, std::vector<int>{reverseDevices ? 1 : 0}); ids.Allocate(false);
+    scores.ToDevice(DataDevice::CUDA, std::vector<int>{reverseDevices ? 1 : 0}); scores.Allocate(false);
+    Check(cudaSetDevice(0));
+    AllocateGpu(refIds); AllocateGpu(refScores); AllocateGpu(refInput);
+    std::vector<float> activation(maxRows * hidden), routeScores(maxRows * topk),
+        cpu(maxRows * topk * hidden), gpu(maxRows * hidden), grouped(cpu.size());
+    std::vector<int32_t> indices(maxRows * topk), mask(maxRows * topk, -1);
+    std::array<std::vector<float>, 2> actual{std::vector<float>(maxRows * hidden), std::vector<float>(maxRows * hidden)};
+    std::mt19937 rng(912);
+    const uint64_t budget = GetMoeCudaCacheBytes();
+    for (int step = 0; step < 20; ++step) {
+        const int rows = step % 3 == 0 ? 1 : maxRows;
+        const int routes = rows * topk;
+        for (auto &input : inputs) input.Resize({rows, hidden});
+        ids.Resize({rows, topk}); scores.Resize({rows, topk});
+        refIds.Resize({rows, topk}); refScores.Resize({rows, topk}); refInput.Resize({rows, hidden});
+        for (auto &v : activation) v = float(int(rng() % 31) - 15) / 64;
+        for (int r = 0; r < routes; ++r) {
+            const int k = r % topk;
+            indices[r] = ((k == 6 ? 1 : k) + (r / topk) % 3) + (step >= 8 ? 12 : 0);
+            // Keep the other cache usable but send every route to the rank
+            // whose device is disabled, forcing EP's all-CPU reduction.
+            if (disableSecondDevice && step == 12)
+                indices[r] = 2 * ((k == 6 ? 1 : k) + (r / topk) % 3) +
+                    (reverseDevices ? 0 : 1);
+            routeScores[r] = k == 3 ? 0 : k == 5 ? -.125f : float(k + 1) / 32;
+        }
+        for (int r = 0; r < 2; ++r) {
+            Check(cudaSetDevice(reverseDevices ? 1 - r : r));
+            Check(cudaMemcpy(inputs[r].cudaData, activation.data(), rows * hidden * sizeof(float), cudaMemcpyHostToDevice));
+        }
+        Check(cudaSetDevice(reverseDevices ? 1 : 0));
+        Check(cudaMemcpy(ids.cudaData, indices.data(), routes * sizeof(int32_t), cudaMemcpyHostToDevice));
+        Check(cudaMemcpy(scores.cudaData, routeScores.data(), routes * sizeof(float), cudaMemcpyHostToDevice));
+        Check(cudaSetDevice(0));
+        Check(cudaMemcpy(refInput.cudaData, activation.data(), rows * hidden * sizeof(float), cudaMemcpyHostToDevice));
+        Check(cudaMemcpy(refIds.cudaData, indices.data(), routes * sizeof(int32_t), cudaMemcpyHostToDevice));
+        // Independent existing backends bound every route's CPU/GPU arithmetic.
+        for (int row = 0; row < rows; ++row)
+            NumasMoeDecodeExperts(activation.data() + row * hidden, cpu.data() + row * topk * hidden,
+                weights.data(), indices.data() + row * topk, mask.data(), topk, 0);
+        NumasMoeDecodeExpertsBatch(activation.data(), grouped.data(), rows, weights.data(), weights.size(),
+            indices.data(), mask.data(), routeScores.data(), topk, 0);
+        for (int i = 0; i < routes * hidden; ++i)
+            Require(std::abs(grouped[i] - cpu[i]) <= 3e-5f * (1 + std::abs(cpu[i])),
+                    "EP grouped NUMA differs from single-row expert reference");
+        std::vector<float> lower(rows * hidden, 0), upper(rows * hidden, 0);
+        for (int r = 0; r < topk; ++r) {
+            std::vector<float> one(routes, 0);
+            for (int row = 0; row < rows; ++row) one[row * topk + r] = 1;
+            Check(cudaMemcpy(refScores.cudaData, one.data(), routes * sizeof(float), cudaMemcpyHostToDevice));
+            Require(FastllmCudaMergeMOECache(refInput, refGate, refOutput,
+                reference.data(), reference.size(), static_cast<int32_t *>(refIds.cudaData),
+                static_cast<float *>(refScores.cudaData), topk), "EP GPU reference rejected");
+            Check(cudaMemcpy(gpu.data(), refOutput.cudaData, rows * hidden * sizeof(float), cudaMemcpyDeviceToHost));
+            for (int c = 0; c < rows * hidden; ++c) {
+                const int route = (c / hidden) * topk + r;
+                const float a = cpu[route * hidden + c % hidden] * routeScores[route], b = gpu[c] * routeScores[route];
+                lower[c] += std::min(a, b); upper[c] += std::max(a, b);
+            }
+        }
+        const bool reject = step >= 16;
+        if (step == 16) inputs[1].dataType = FLOAT16;
+        if (step == 17) SetMoeCudaCacheBytes(0);
+        if (step == 18) inputs[1].Resize({rows == 1 ? 2 : 1, hidden});
+        if (step == 19) {
+            Check(cudaSetDevice(reverseDevices ? 1 : 0));
+            const int32_t invalid = weights.size() / 2;
+            Check(cudaMemcpy(ids.cudaData, &invalid, sizeof(invalid), cudaMemcpyHostToDevice));
+        }
+        bool accepted[2]{}; int callbacks[2]{}; std::exception_ptr errors[2];
+        const auto before = FastllmCudaGetMoeExpertParallelStats(*context);
+        auto run = [&](int rank) {
+            try {
+                Check(cudaSetDevice(reverseDevices ? 1 - rank : rank));
+                Data empty;
+                accepted[rank] = FastllmCudaMergeMOEExpertParallel(*context, rank, inputs[rank],
+                    rank == 0 ? ids : empty, rank == 0 ? scores : empty, results[rank],
+                    weights.data(), weights.size(), 0, [&] { ++callbacks[rank]; });
+                if (accepted[rank]) Check(cudaMemcpy(actual[rank].data(), results[rank].cudaData,
+                    rows * hidden * sizeof(float), cudaMemcpyDeviceToHost));
+            } catch (...) { errors[rank] = std::current_exception(); }
+        };
+        std::thread first(run, 0), second(run, 1);
+        first.join(); second.join();
+        inputs[1].dataType = FLOAT32;
+        SetMoeCudaCacheBytes(budget);
+        for (int rank = 0; rank < 2; ++rank) {
+            if (errors[rank]) std::rethrow_exception(errors[rank]);
+            Require(accepted[rank] == !reject, "EP rejection was not collective");
+            Require(callbacks[rank] == int(!reject), "EP shared expert callback count changed");
+        }
+        if (reject) continue;
+        const auto after = FastllmCudaGetMoeExpertParallelStats(*context);
+        Require(after.cpuRoutes - before.cpuRoutes +
+            after.gpuRoutes[0] - before.gpuRoutes[0] + after.gpuRoutes[1] - before.gpuRoutes[1] == routes,
+            "EP route ownership is not exclusive and complete");
+        if (disableSecondDevice && step == 12) {
+            Require(after.cpuRoutes - before.cpuRoutes == routes,
+                    "EP all-CPU reduction case used GPU experts");
+            for (int c = 0; c < rows * hidden; ++c) {
+                float expected = 0;
+                for (int r = 0; r < topk; ++r) {
+                    const int route = (c / hidden) * topk + r;
+                    expected = std::fma(cpu[route * hidden + c % hidden],
+                                        routeScores[route], expected);
+                }
+                Require(actual[0][c] == expected && actual[1][c] == 0,
+                        "EP all-CPU reduction changed fused accumulation");
+            }
+        }
+        for (int c = 0; c < rows * hidden; ++c) {
+            const float result = actual[0][c] + actual[1][c];
+            const float tolerance = 3e-5f * (1 + std::max(std::abs(lower[c]), std::abs(upper[c])));
+            Require(std::isfinite(result) && result >= lower[c] - tolerance && result <= upper[c] + tolerance,
+                    "EP duplicated or lost an expert contribution");
+        }
+    }
+    const auto stats = FastllmCudaGetMoeExpertParallelStats(*context);
+    if (disableSecondDevice) {
+        Require(stats.gpuRoutes[reverseDevices ? 0 : 1] == 0, "disabled EP device executed experts");
+        Require(stats.gpuRoutes[reverseDevices ? 1 : 0] > 0, "EP disabled both devices");
+    } else {
+        Require(stats.gpuRoutes[0] && stats.gpuRoutes[1] && stats.multiGpuSteps,
+                "EP never computed one layer on both GPUs");
+    }
+    context.reset();
+    if (hadOverride) setenv(overrideName, previousValue.c_str(), 1); else unsetenv(overrideName);
+    Check(cudaSetDevice(0));
+    std::printf("PASS expert parallel: asymmetric=%d reverse=%d rows=1/%d, two GPU subsets + one NUMA subset, duplicates/zero/negative scores, rejection\n",
+                disableSecondDevice, reverseDevices, maxRows);
+}
+#endif
 
 template<class T>
 static void CompareNumaCache(fastllm::DataType dtype, int nodes, int batch,
@@ -575,6 +770,15 @@ static void CompareNumaCache(fastllm::DataType dtype, int nodes, int batch,
         }
 #endif
     }
+#ifdef USE_NUMAS
+    if (hybrid) {
+        CheckExpertParallel(weights[0][0], weights[1][0], planar);
+        CheckExpertParallel(weights[0][0], weights[1][0], planar, false, 4);
+        CheckExpertParallel(weights[0][0], weights[1][0], planar, false, FASTLLM_CUDA_MOE_CACHE_MAX_BATCH);
+        if (planar) CheckExpertParallel(weights[0][0], weights[1][0], true, true);
+        if (planar) CheckExpertParallel(weights[0][0], weights[1][0], true, true, 4);
+    }
+#endif
     for (int backend = 0; backend < 2; ++backend) {
         for (int table = 0; table < tables; ++table) {
             Check(cudaGraphExecDestroy(exec[backend][table]));

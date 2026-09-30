@@ -31,6 +31,10 @@
 #include <set>
 #include <numeric>
 #include <fstream>
+#ifdef __linux__
+#include <pthread.h>
+#include <sched.h>
+#endif
 
 #ifdef __aarch64__
 #include <arm_neon.h>
@@ -304,27 +308,22 @@ namespace fastllm {
         bool pinnedWeight;
     };
 
-    // 多卡专家流默认开启搬运重叠，其他调度策略默认关闭。
-    //   FT_MOE_ASSIST_OVERLAP=0  关闭 assist 卡输入 staging 与输出归约的
-    //                            事件依赖重叠，恢复主线程串行搬运。
+    // 多卡专家流始终重叠搬运；以下可选调度策略默认关闭。
     //   FT_MOE_ASSIST_BALANCE=1  按各卡实测的每专家耗时分配 GPU 专家，而不是
     //                            固定按 route 数均分。
     //   FT_EXPERT_LIMIT_AUTO=1   用真实层反馈出的 CPU/GPU 速度算 expertLimit，
     //                            取代单专家合成 benchmark 的估计。
-    //   FASTLLM_NUMAS_MOE_ASSIST_PROFILE=1  打印 prefill 各阶段耗时。
     struct NumasMoeAssistConfig {
-        bool overlap = true;
         bool balance = false;
-        bool profile = false;
         bool autoExpertLimit = false;
     };
 
     static const NumasMoeAssistConfig &GetNumasMoeAssistConfig() {
         static const NumasMoeAssistConfig config = []() {
-            auto readBool = [](const char *name, bool defaultValue = false) {
+            auto readBool = [](const char *name) {
                 const char *value = std::getenv(name);
                 if (value == nullptr || value[0] == '\0') {
-                    return defaultValue;
+                    return false;
                 }
                 std::string lowered(value);
                 std::transform(
@@ -334,15 +333,10 @@ namespace fastllm {
                        lowered != "off" && lowered != "no";
             };
             NumasMoeAssistConfig parsed;
-            parsed.overlap = readBool("FT_MOE_ASSIST_OVERLAP", parsed.overlap);
             parsed.balance = readBool("FT_MOE_ASSIST_BALANCE");
-            parsed.profile = readBool("FASTLLM_NUMAS_MOE_ASSIST_PROFILE");
             parsed.autoExpertLimit = readBool("FT_EXPERT_LIMIT_AUTO");
             if (parsed.autoExpertLimit) {
                 printf("Activate NUMA MoE measured expertLimit\n");
-            }
-            if (parsed.overlap) {
-                printf("Activate NUMA MoE assist overlap\n");
             }
             if (parsed.balance) {
                 printf("Activate NUMA MoE assist bandwidth balance\n");
@@ -416,11 +410,6 @@ namespace fastllm {
             cpuMsPerRoute = cpuMsPerRoute <= 0.0 ? sample :
                 cpuMsPerRoute * 0.7 + sample * 0.3;
             cpuSamples++;
-        }
-
-        double GetCpuMsPerRoute() {
-            std::lock_guard<std::mutex> guard(locker);
-            return cpuMsPerRoute;
         }
 
         // 用真实层反馈出来的两个系数直接算 makespan 最优的 expertLimit。
@@ -545,6 +534,85 @@ namespace fastllm {
         numaConfigLocker.unlock();
         
         return fastllmNumaConfig;
+    }
+
+    std::vector<std::vector<int>> GetNumasCudaWorkerCpuSets(
+            const std::vector<int> &devices) {
+        std::vector<std::vector<int>> result(devices.size());
+        if (devices.empty()) return result;
+#if defined(USE_CUDA) && defined(__linux__)
+        cpu_set_t allowed;
+        if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) return result;
+        auto coreOf = [](int cpu, std::pair<int, int> &core) {
+            const auto base = "/sys/devices/system/cpu/cpu" +
+                std::to_string(cpu) + "/topology/";
+            std::ifstream package(base + "physical_package_id");
+            std::ifstream id(base + "core_id");
+            return bool(package >> core.first) && bool(id >> core.second);
+        };
+        std::set<std::pair<int, int>> occupied;
+        auto *pool = GetAlivePool();
+        for (const auto &node : GetNumaConfig()->numaToCpuDict) {
+            for (const auto &worker : node) {
+                cpu_set_t workerCpus;
+                if (worker.first < 0 || worker.first >= (int)pool->threads.size() ||
+                    pthread_getaffinity_np(pool->threads[worker.first]->native_handle(),
+                        sizeof(workerCpus), &workerCpus) != 0) return result;
+                // A restricted container can reject the preferred expert pin.
+                // Use the actual mask, including a NUMA-wide fallback, instead
+                // of assuming that its requested single-core binding worked.
+                for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+                    if (!CPU_ISSET(cpu, &workerCpus)) continue;
+                    std::pair<int, int> core;
+                    if (!coreOf(cpu, core)) return result;
+                    occupied.insert(core);
+                }
+            }
+        }
+        std::map<int, std::vector<int>> available;
+        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+            if (!CPU_ISSET(cpu, &allowed)) continue;
+            std::pair<int, int> core;
+            if (!coreOf(cpu, core)) return result;
+            // Keep one logical CPU per unused physical core. SMT siblings of
+            // an expert worker must not compete with its vector kernels.
+            if (occupied.insert(core).second) {
+                const int node = numa_node_of_cpu(cpu);
+                if (node >= 0) available[node].push_back(cpu);
+            }
+        }
+        std::vector<int> nodes;
+        std::map<int, int> ranksPerNode;
+        for (int device : devices) {
+            int node = FastllmCudaGetHostNumaNode(device);
+            nodes.push_back(node);
+            ++ranksPerNode[node];
+        }
+        for (size_t rank = 0; rank < devices.size(); ++rank) {
+            const int node = nodes[rank];
+            if (node >= 0 && available[node].size() >= (size_t)ranksPerNode[node]) {
+                result[rank] = available[node];
+            }
+        }
+#endif
+        return result;
+    }
+
+    bool BindNumasWorkerCpuSet(const std::vector<int> &cpus) {
+#ifdef __linux__
+        cpu_set_t allowed, selected;
+        if (cpus.empty() || sched_getaffinity(0, sizeof(allowed), &allowed) != 0) return false;
+        CPU_ZERO(&selected);
+        for (int cpu : cpus) {
+            if (cpu >= 0 && cpu < CPU_SETSIZE && CPU_ISSET(cpu, &allowed)) {
+                CPU_SET(cpu, &selected);
+            }
+        }
+        return CPU_COUNT(&selected) > 0 &&
+            sched_setaffinity(0, sizeof(selected), &selected) == 0;
+#else
+        return false;
+#endif
     }
 
     NumasDevice::NumasDevice() {
@@ -1898,7 +1966,70 @@ namespace fastllm {
         }
     };
 
+    // Reuse one descriptor per pool worker. Routing and activation pointers
+    // are rebound for each row; workers construct their small GEMM views on
+    // their own stacks instead of building vectors on the submitting thread.
+    struct NumasMoeDecodeContext {
+        Data **weights = nullptr;
+        const std::vector<std::pair<int, float>> *experts = nullptr;
+        uint8_t *input = nullptr, *sharedInput = nullptr, *downInput = nullptr;
+        float *gateUp = nullptr, *swiglu = nullptr, *downOutput = nullptr;
+        DataType inputType = FLOAT32, downType = FLOAT32;
+        int inputDim = 0, interDim = 0, outputDim = 0, numaCnt = 0;
+        int gateUnitRows = 4;
+        size_t downRowBytes = 0;
+        bool gate = true, fuseConvert = false;
+    };
+
+    struct NumasMoeDecodeWorker : MultiThreadBaseOp {
+        NumasMoeDecodeContext *context = nullptr;
+        int node = 0, worker = 0, workers = 1;
+
+        void Run() override {
+            auto &c = *context;
+            const int columns = c.gate ? c.interDim * 2 : c.outputDim;
+            const int perNode = columns / c.numaCnt;
+            const int base = perNode * node;
+            const int unit = c.gate ? c.gateUnitRows : 4;
+            const int units = perNode * (int)c.experts->size() / unit;
+            const int first = unit * (worker * (units / workers) +
+                                      std::min(worker, units % workers));
+            const int last = first + unit * (units / workers +
+                                             (worker < units % workers));
+            for (int row = first; row < last;) {
+                const int slot = row / perNode;
+                const int start = row % perNode;
+                const int end = std::min(perNode, start + last - row);
+                const int expert = (*c.experts)[slot].first;
+                Data &weight = *c.weights[expert * 2 + (c.gate ? 0 : 1)];
+                if (c.gate) {
+                    MultiThreadGemmAndCrossSwigluOp task(
+                        expert == 0 && c.sharedInput ? c.sharedInput : c.input,
+                        c.inputType, weight.numasData[node], weight.GetDataType(),
+                        reinterpret_cast<uint8_t*>(c.gateUp +
+                            (size_t)slot * columns + base), FLOAT32,
+                        c.swiglu + (size_t)slot * c.interDim,
+                        1, c.inputDim, columns, start, end, base,
+                        c.fuseConvert ? c.downInput + slot * c.downRowBytes : nullptr,
+                        c.downType);
+                    task.Run();
+                } else {
+                    MultiThreadGemmOp task(
+                        c.downInput + slot * c.downRowBytes, c.downType,
+                        weight.numasData[node], weight.GetDataType(),
+                        reinterpret_cast<uint8_t*>(c.downOutput +
+                            (size_t)slot * columns + base), FLOAT32,
+                        1, c.interDim, columns, start, end);
+                    task.Run();
+                }
+                row += end - start;
+            }
+        }
+    };
+
     struct FastllmMoeDataManagerNumas {
+            NumasMoeDecodeContext decodeContext;
+            std::vector<NumasMoeDecodeWorker> rowWorkers;
             std::vector<NumasMoeTaskList> decodeWorkers;
             std::vector<std::vector<MultiThreadDeepSeekV41NumasDecodeOp>> fusedDecodeTasks;
             std::vector <float, alignedAllocator<float, 64> > gateUpOutput, swigluOutput, downOutput, reduceOutput;
@@ -2372,7 +2503,7 @@ namespace fastllm {
             inputBytes + indexBytes + scoreBytes);
         void *inputCopyStream = workspace.EnsureInputCopyStream(device);
         void *routeCopyStream = workspace.EnsureRouteCopyStream(device);
-        void *sourceReadyEvent = FastllmCudaEventCreate();
+        void *sourceReadyEvent = workspace.EnsureInputSourceEvent(device);
         FastllmCudaEventRecordCurrentThread(sourceReadyEvent);
         FastllmCudaStreamWaitEvent(inputCopyStream, sourceReadyEvent);
         FastllmCudaStreamWaitEvent(routeCopyStream, sourceReadyEvent);
@@ -2387,7 +2518,6 @@ namespace fastllm {
                 indexHost, index.cudaData, indexBytes, routeCopyStream) &&
             FastllmCudaCopyFromDeviceToPinnedHostAsync(
                 scoreHost, score.cudaData, scoreBytes, routeCopyStream);
-        FastllmCudaEventDestroy(sourceReadyEvent);
         if (!copied) {
             FastllmCudaStreamSynchronize(routeCopyStream);
             FastllmCudaStreamSynchronize(inputCopyStream);
@@ -5635,7 +5765,6 @@ namespace fastllm {
                                   weightsBatch, sharedScale, adaptiveN, m)) {
                     return defaultExpertLimit;
                 }
-                // printf("MoE dynamic expertLimit benchmark initialized: N=%d, bs=%d, topk=%d\n", profile.maxN, input.dims[0], topk);
             }
             std::vector<detail::MoeExpertCost> expertCosts;
             expertCosts.reserve(expertTasks.size());
@@ -5864,7 +5993,6 @@ namespace fastllm {
                 }
             }
 
-            // printf("MoE benchmark: cpu samples=%d, gpu samples=%d\n", (int)profile.cpuTimeUs.size(), (int)profile.gpuTimeUs.size());
             profile.initialized = true;
             return true;
         }
@@ -6577,53 +6705,6 @@ namespace fastllm {
             }
         }
 
-        // debug: 输出指定token关联的所有专家计算结果（通过环境变量 FASTLLM_DEBUG_TOKEN_ID 指定token id，逗号分隔）
-        /* {
-            static std::set<int> debugTokenIds;
-            static bool debugTokenIdInited = false;
-            if (!debugTokenIdInited) {
-                const char *env = getenv("FASTLLM_DEBUG_TOKEN_ID");
-                if (env) {
-                    std::string s(env);
-                    size_t pos = 0;
-                    while (pos < s.size()) {
-                        size_t next = s.find(',', pos);
-                        if (next == std::string::npos) next = s.size();
-                        debugTokenIds.insert(atoi(s.substr(pos, next - pos).c_str()));
-                        pos = next + 1;
-                    }
-                }
-                debugTokenIdInited = true;
-            }
-            if (!debugTokenIds.empty()) {
-                int debugOffset = 0;
-                for (int e = 0; e < (int)expertTasks.size(); e++) {
-                    if (weights[e * 2] != nullptr && expertTasks[e].size() > 0 && cpuExperts.count(e)) {
-                        float* debugDownOutput = downOutput.data() + debugOffset * dim;
-                        for (int i = 0; i < (int)expertTasks[e].size(); i++) {
-                            int rowIdx = expertTasks[e][i].first;
-                            if (debugTokenIds.count(rowIdx)) {
-                                float score = expertTasks[e][i].second;
-                                float sumAbs = 0.0f;
-                                for (int d = 0; d < dim; d++) {
-                                    sumAbs += std::abs(debugDownOutput[i * dim + d]);
-                                }
-                                printf("[DEBUG origToken=%d] expert=%d, score=%.6f, output_l1norm=%.6f, first5=[%.6f, %.6f, %.6f, %.6f, %.6f]\n",
-                                       rowIdx, e, score, sumAbs,
-                                       debugDownOutput[i * dim + 0],
-                                       debugDownOutput[i * dim + 1],
-                                       debugDownOutput[i * dim + 2],
-                                       debugDownOutput[i * dim + 3],
-                                       debugDownOutput[i * dim + 4]);
-                            }
-                        }
-                        debugOffset += expertTasks[e].size();
-                    }
-                }
-                fflush(stdout);
-            }
-        } */
-
         if (perRouteOutput != nullptr) {
             // expertTasks was built in row/route order. Consume each group's
             // rows in that same order, including duplicate ids with different
@@ -6818,6 +6899,34 @@ namespace fastllm {
                 }
             }
         }
+    }
+
+    void NumasMoeDecodeExpertsBatch(const float *input, float *output, int rows,
+        Data **weights, int weightsBatch, const int32_t *indices,
+        const int32_t *gpuIndices, const float *scores, int topk, int layer) {
+        const int hidden = weights[2]->dims[1];
+        // Reuse the existing grouped NVFP4 arithmetic where supported. Other
+        // formats/CPUs retain their exact single-row activation conversion.
+        if (!CanUseNumasMoeExactSmallBatch(rows) ||
+            !IsNumasGroupedNVFP4Weight(weights[2]) ||
+            !IsNumasGroupedNVFP4Weight(weights[3])) {
+            for (int row = 0; row < rows; ++row)
+                NumasMoeDecodeExperts(input + size_t(row) * hidden,
+                    output + size_t(row) * topk * hidden, weights,
+                    indices + row * topk, gpuIndices + row * topk, topk, layer);
+            return;
+        }
+        std::unordered_set<int> cpuExperts;
+        for (int r = 0; r < rows * topk; ++r)
+            if (gpuIndices[r] < 0) cpuExperts.insert(indices[r] + 1);
+        if (cpuExperts.empty()) return;
+        Data x(FLOAT32, {rows, hidden}, DataDevice::CPU, (void *)input);
+        Data ids(INT32, {rows, topk}, DataDevice::CPU, (void *)indices);
+        Data routes(FLOAT32, {rows, topk}, DataDevice::CPU, (void *)scores);
+        Data result(FLOAT32, {rows, hidden}, DataDevice::CPU, output);
+        DoNumasMergeMOEOnCPU(x, result, ids, routes, weights, nullptr, 1.0f,
+            weightsBatch, topk, cpuExperts, GetNumasMoeRuntimeCache()[layer % 2],
+            nullptr, 0.0f, false, 128, false, output);
     }
 
     void NumasMoeVerifyExperts(const uint16_t *input, void *output, int rows,
@@ -7109,9 +7218,7 @@ namespace fastllm {
         FastllmMoeDataManagerNumas &fastllmMoeDataManagerNumas =
             GetNumasMoeRuntimeCache()[layer % 2];
         const NumasMoeAssistConfig &assistConfig = GetNumasMoeAssistConfig();
-#ifdef USE_CUDA
-        const bool assistOverlap = assistConfig.overlap;
-#endif
+        const bool trackExpertSpeed = assistConfig.balance || assistConfig.autoExpertLimit;
 
         Data cpuIndex, cpuScore;
         Data cpuInput;
@@ -7199,10 +7306,9 @@ namespace fastllm {
                 scoreHost = indexHost + indexBytes;
                 // 事件按设备缓存复用：assist worker 线程要在主线程离开这段
                 // 之后才等待它，不能就地销毁。
-                void *sourceReadyEvent = assistOverlap ?
+                void *sourceReadyEvent =
                     fastllmMoeDataManagerNumas.EnsureInputSourceEvent(
-                        cudaDeviceId) :
-                    FastllmCudaEventCreate();
+                        cudaDeviceId);
                 FastllmCudaEventRecordCurrentThread(sourceReadyEvent);
                 FastllmCudaStreamWaitEvent(inputCopyStream, sourceReadyEvent);
                 FastllmCudaStreamWaitEvent(routeCopyStream, sourceReadyEvent);
@@ -7212,14 +7318,12 @@ namespace fastllm {
                             inputHost, rawInput.cudaData, inputBytes,
                             inputCopyStream),
                         "NUMA MergeMOE failed to enqueue the input D2H copy.");
-                    if (assistOverlap) {
-                        assistSourceEvent = sourceReadyEvent;
-                        assistHostReadyEvent = fastllmMoeDataManagerNumas.
-                            EnsureInputHostReadyEvent(cudaDeviceId);
-                        FastllmCudaEventRecord(
-                            assistHostReadyEvent, inputCopyStream);
-                        assistPinnedInputHost = inputHost;
-                    }
+                    assistSourceEvent = sourceReadyEvent;
+                    assistHostReadyEvent = fastllmMoeDataManagerNumas.
+                        EnsureInputHostReadyEvent(cudaDeviceId);
+                    FastllmCudaEventRecord(
+                        assistHostReadyEvent, inputCopyStream);
+                    assistPinnedInputHost = inputHost;
                 }
                 if (indexOnCuda) {
                     AssertInFastLLM(
@@ -7234,9 +7338,6 @@ namespace fastllm {
                             scoreHost, rawScore.cudaData, scoreBytes,
                             routeCopyStream),
                         "NUMA MergeMOE failed to enqueue the score D2H copy.");
-                }
-                if (!assistOverlap) {
-                    FastllmCudaEventDestroy(sourceReadyEvent);
                 }
             }
             if (inputOnCuda) {
@@ -7328,7 +7429,6 @@ namespace fastllm {
         output.dataType = input.dataType;
         output.expansionDims.clear();
         output.Resize(input.dims);
-// printf("allocate spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
         int32_t *indexData = (int32_t*)index.cpuData;
         float *scoreData = (float*)score.cpuData;
 
@@ -7392,7 +7492,7 @@ namespace fastllm {
             }
         }
 #ifdef USE_CUDA
-        if (std::getenv("FASTLLM_NUMAS_MOE_GPU_TRACE") != nullptr) {
+        if (profileDetail) {
             std::vector<NumasMoeCudaInputReplica> traceReplicas =
                 GetNumasMoeCudaInputReplicas(rawInput);
             printf(
@@ -7452,7 +7552,7 @@ namespace fastllm {
             return;
         }
 
-        if (input.dims[0] < 32) {
+        if (input.dims[0] < kNumasMoeGpuPrefillMinRows) {
             waitForCpuInput();
             Data *cpuOutput = &output;
 #ifdef USE_CUDA
@@ -7481,7 +7581,6 @@ namespace fastllm {
                     swigluLimit, deepSeekV4Mode, activationQuantBlock,
                     quantizeSharedExpert);
             } else {
-// auto st = std::chrono::system_clock::now();
             int32_t *indexData = (int32_t*)index.cpuData;
             float *scoreData = (float*)score.cpuData;
             {
@@ -7595,7 +7694,6 @@ namespace fastllm {
                     }
                     profileLap(profileResizeMs);
 
-// printf("malloc spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                     // 0. input -> realInput（若 input 非 FLOAT32 则先转为 float32）
                     if (input.dataType == startDataType && input.dataType != DataType::FLOAT32) {
                         size_t bytes = GetDataBytes(startDataType, 1, inputDim);
@@ -7625,7 +7723,6 @@ namespace fastllm {
                         return expert == 0 && !originalSharedInput.empty() ? originalSharedInput.data() : realInput.data();
                     };
                     profileLap(profileInputMs);
-// printf("RunMultiThreadConvertFromFloat32 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
 
                     // 1. gateUp + swiglu
                     auto *numaConfig = GetNumaConfig();
@@ -7673,6 +7770,47 @@ namespace fastllm {
                         downInputDataType == DataType::FLOAT16 ||
                         downInputDataType == DataType::BFLOAT16 ||
                         canFuseGroup32;
+                    auto &decodeContext = fastllmMoeDataManagerNumas.decodeContext;
+                    auto &rowWorkers = fastllmMoeDataManagerNumas.rowWorkers;
+                    if (!useDeepSeekV4MoeFast) {
+                        decodeContext.weights = weights;
+                        decodeContext.experts = &v;
+                        decodeContext.input = realInput.data();
+                        decodeContext.sharedInput = originalSharedInput.empty()
+                            ? nullptr : originalSharedInput.data();
+                        decodeContext.downInput = downInput.data();
+                        decodeContext.gateUp = gateUpOutput.data();
+                        decodeContext.swiglu = swigluOutput.data();
+                        decodeContext.downOutput = downOutput.data();
+                        decodeContext.inputType = startDataType;
+                        decodeContext.downType = downInputDataType;
+                        decodeContext.inputDim = inputDim;
+                        decodeContext.interDim = interDim;
+                        decodeContext.outputDim = outputDim;
+                        decodeContext.numaCnt = numaConfig->numaCnt;
+                        decodeContext.gateUnitRows = canFuseGroup32 ? 64 : 4;
+                        decodeContext.downRowBytes = GetDataBytes(downInputDataType, 1, interDim);
+                        decodeContext.fuseConvert = canFuseDstConvert && !deepSeekV4Mode;
+                        rowWorkers.resize(numaConfig->threads);
+                        for (int nid = 0; nid < numaConfig->numaCnt; ++nid) {
+                            auto &nodeWorkers = numaConfig->numaToCpuDict[nid];
+                            for (int t = 0; t < (int)nodeWorkers.size(); ++t) {
+                                auto &worker = rowWorkers[nodeWorkers[t].first];
+                                worker.context = &decodeContext;
+                                worker.node = nid;
+                                worker.worker = t;
+                                worker.workers = nodeWorkers.size();
+                            }
+                            for (const auto &expert : v) {
+                                for (int phase = 0; phase < 2; ++phase) {
+                                    Data *weight = weights[expert.first * 2 + phase];
+                                    AssertInFastLLM((int)weight->numasData.size() > nid &&
+                                                    weight->numasData[nid] != nullptr,
+                                                    "NUMA decode weight is missing a shard.\n");
+                                }
+                            }
+                        }
+                    }
                     if (useDeepSeekV4MoeFast) {
                         std::vector<int> localExpertOrder;
                         auto &expertOrder = reuseMoeTaskStorage ?
@@ -7811,99 +7949,12 @@ namespace fastllm {
                                 gateTasks, false);
                         }
                     } else {
-                        auto &workers = fastllmMoeDataManagerNumas.decodeWorkers;
-                        auto &taskStorage = fastllmMoeDataManagerNumas.gateSwigluTaskStorage;
-                        workers.resize(numaConfig->threads);
-                        taskStorage.resize(numaConfig->threads);
-                        for (int i = 0; i < numaConfig->threads; i++) {
-                            workers[i].tasks.clear();
-                            taskStorage[i].clear();
-                            taskStorage[i].reserve(totalExperts);
-                        }
-                        for (int nid = 0;
-                             nid < numaConfig->numaCnt; nid++) {
-                            int base = kPer * nid;
-                            int threadNum =
-                                numaConfig->numaToCpuDict[nid].size();
-                            int totalRows = kPer * totalExperts;
-                            // A fused group-32 destination must never be
-                            // split between workers because its scale and sum
-                            // are shared by all 32 activation values.
-                            int unitRows = canFuseGroup32 ? 64 : 4;
-                            int rowsPerThread =
-                                (totalRows / unitRows) / threadNum;
-                            int remainingRows =
-                                (totalRows / unitRows) % threadNum;
-                            int currentRow = 0;
-
-                            for (int tid = 0; tid < threadNum; tid++) {
-                                int threadRows =
-                                    (rowsPerThread +
-                                     (tid < remainingRows ? 1 : 0)) *
-                                    unitRows;
-                                int endRow = currentRow + threadRows;
-                                int rowStart = currentRow;
-                                while (rowStart < endRow) {
-                                    int expertIdx = rowStart / kPer;
-                                    if (expertIdx >= totalExperts) {
-                                        break;
-                                    }
-                                    int e = v[expertIdx].first;
-                                    int expertStartRow =
-                                        rowStart % kPer;
-                                    int expertEndRow = std::min(
-                                        kPer,
-                                        expertStartRow +
-                                            (endRow - rowStart));
-                                    size_t outputOffset =
-                                        GetDataBytes(
-                                            DataType::FLOAT32,
-                                            expertIdx, k) +
-                                        GetDataBytes(
-                                            DataType::FLOAT32, 1,
-                                            base);
-                                    uint8_t *dstPtr =
-                                        canFuseDstConvert &&
-                                                !deepSeekV4Mode ?
-                                            (uint8_t*)downInput.data() +
-                                                expertIdx *
-                                                    GetDataBytes(
-                                                        downInputDataType,
-                                                        1, interDim) :
-                                            nullptr;
-                                    if ((int)weights[e * 2]->numasData.size() <= nid ||
-                                            weights[e * 2]->numasData[nid] == nullptr) {
-                                        ErrorInFastLLM("NumasMergeMOE small batch gate weight missing NUMA shard: " +
-                                                       weights[e * 2]->name + "\n");
-                                    }
-                                    taskStorage[numaConfig->numaToCpuDict[nid][tid].first].emplace_back(
-                                        (uint8_t*)expertInput(e), startDataType,
-                                        weights[e * 2]->numasData[nid], weights[e * 2]->GetDataType(),
-                                        (uint8_t*)gateUpOutput.data() + outputOffset, DataType::FLOAT32,
-                                        swigluOutput.data() + expertIdx * interDim,
-                                        1, inputDim, k, expertStartRow, expertEndRow, base,
-                                        dstPtr, downInputDataType);
-                                    rowStart +=
-                                        expertEndRow -
-                                        expertStartRow;
-                                    if (expertEndRow == kPer) {
-                                        rowStart =
-                                            (expertIdx + 1) * kPer;
-                                    }
-                                }
-                                currentRow = endRow;
-                            }
-                        }
-                        for (int i = 0; i < numaConfig->threads; i++) {
-                            for (auto &task : taskStorage[i]) {
-                                workers[i].tasks.push_back(&task);
-                            }
-                        }
+                        decodeContext.gate = true;
                         profileLap(profileGatePrepMs);
-                        for (int i = 0; i < numaConfig->threads; i++) {
-                            pool->PushOp(i, &workers[i]);
+                        for (int i = 0; i < numaConfig->threads; ++i) {
+                            pool->PushOp(i, &rowWorkers[i]);
                         }
-                        for (int i = 0; i < numaConfig->threads; i++) {
+                        for (int i = 0; i < numaConfig->threads; ++i) {
                             pool->Wait(i);
                         }
                     }
@@ -8167,83 +8218,12 @@ namespace fastllm {
                                 downTasks, false);
                         }
                     } else {
-                        auto &workers = fastllmMoeDataManagerNumas.decodeWorkers;
-                        auto &taskStorage = fastllmMoeDataManagerNumas.gemmTaskStorage;
-                        workers.resize(numaConfig->threads);
-                        taskStorage.resize(numaConfig->threads);
-                        for (int i = 0; i < numaConfig->threads; i++) {
-                            workers[i].tasks.clear();
-                            taskStorage[i].clear();
-                            taskStorage[i].reserve(totalExperts);
-                        }
-                        for (int nid = 0;
-                             nid < numaConfig->numaCnt; nid++) {
-                            int base = kPer * nid;
-                            int threadNum =
-                                numaConfig->numaToCpuDict[nid].size();
-                            int totalRows = kPer * totalExperts;
-                            int unitRows = 4;
-                            int rowsPerThread =
-                                (totalRows / unitRows) / threadNum;
-                            int extraRows =
-                                (totalRows / unitRows) % threadNum;
-                            int currentRow = 0;
-                            for (int tid = 0;
-                                 tid < threadNum; tid++) {
-                                int threadRows =
-                                    (rowsPerThread +
-                                     (tid < extraRows ? 1 : 0)) *
-                                    unitRows;
-                                int endRow =
-                                    currentRow + threadRows;
-                                for (int row = currentRow;
-                                     row < endRow;) {
-                                    int expertIdx = row / kPer;
-                                    int rowInExpert = row % kPer;
-                                    int rowsToProcess = std::min(
-                                        kPer - rowInExpert,
-                                        endRow - row);
-                                    if (expertIdx < totalExperts) {
-                                        int e = v[expertIdx].first;
-                                        size_t inputOffset =
-                                            expertIdx *
-                                            GetDataBytes(
-                                                downInputDataType,
-                                                1, interDim);
-                                        size_t outputOffset =
-                                            GetDataBytes(
-                                                DataType::FLOAT32,
-                                                expertIdx, k) +
-                                            GetDataBytes(
-                                                DataType::FLOAT32,
-                                                1, base);
-                                        if ((int)weights[e * 2 + 1]->numasData.size() <= nid ||
-                                                weights[e * 2 + 1]->numasData[nid] == nullptr) {
-                                            ErrorInFastLLM("NumasMergeMOE small batch down weight missing NUMA shard: " +
-                                                           weights[e * 2 + 1]->name + "\n");
-                                        }
-                                        taskStorage[numaConfig->numaToCpuDict[nid][tid].first].emplace_back(
-                                            downInput.data() + inputOffset, downInputDataType,
-                                            weights[e * 2 + 1]->numasData[nid],
-                                            weights[e * 2 + 1]->GetDataType(),
-                                            (uint8_t*)downOutput.data() + outputOffset, DataType::FLOAT32,
-                                            1, interDim, k, rowInExpert, rowInExpert + rowsToProcess);
-                                    }
-                                    row += rowsToProcess;
-                                }
-                                currentRow = endRow;
-                            }
-                        }
-                        for (int i = 0; i < numaConfig->threads; i++) {
-                            for (auto &task : taskStorage[i]) {
-                                workers[i].tasks.push_back(&task);
-                            }
-                        }
+                        decodeContext.gate = false;
                         profileLap(profileDownPrepMs);
-                        for (int i = 0; i < numaConfig->threads; i++) {
-                            pool->PushOp(i, &workers[i]);
+                        for (int i = 0; i < numaConfig->threads; ++i) {
+                            pool->PushOp(i, &rowWorkers[i]);
                         }
-                        for (int i = 0; i < numaConfig->threads; i++) {
+                        for (int i = 0; i < numaConfig->threads; ++i) {
                             pool->Wait(i);
                         }
                     }
@@ -8256,7 +8236,6 @@ namespace fastllm {
                         }
                     }
 
-// printf("down spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                     float *fLastOutput = reduceOutput.data();
                     if (cpuOutput->dataType == DataType::FLOAT32) {
                         fLastOutput =
@@ -8318,7 +8297,6 @@ namespace fastllm {
                     }
                     profileLap(profileReduceMs);
 
-// printf("reduce spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                     // 7. reduceOutput -> last Output
                     if (cpuOutput->dataType != DataType::FLOAT32) {
                         if (cpuOutput->dataType == DataType::FLOAT16) {
@@ -8343,7 +8321,6 @@ namespace fastllm {
                         }
                     }
                     profileLap(profileOutputMs);
-// printf("last spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                 }
                 if (profileDetail) {
                     double total = profileRegisterMs + profileResizeMs + profileInputMs + profileGatePrepMs +
@@ -8375,16 +8352,14 @@ namespace fastllm {
             }
 #endif
         } else {
-            Data gate, attenPart, moePart;
             int bs = input.dims[0];
             int m = weightsBatch / 2 - 1; // num experts
             // prefill 分阶段计时：定位 assist 卡带来的额外串行开销。
-            const bool assistProfile = assistConfig.profile;
             auto phaseClock = std::chrono::steady_clock::now();
             double phaseStageMs = 0.0, phaseLimitMs = 0.0, phasePrepMs = 0.0;
             double phaseCpuMs = 0.0, phaseJoinMs = 0.0, phaseReduceMs = 0.0;
             auto phaseLap = [&](double &bucket) {
-                if (!assistProfile) {
+                if (!profileDetail) {
                     return;
                 }
                 auto now = std::chrono::steady_clock::now();
@@ -8429,10 +8404,10 @@ namespace fastllm {
                     }
                     // 关键路径优化：默认路径在这里 waitForCpuInput() 之后做一次
                     // 同步 H2D，等于把「等 D2H 落地」+「42 MB 上卡」串在每层
-                    // 主线程上。开启 FT_MOE_ASSIST_OVERLAP 后只分配副本缓冲，
+                    // 主线程上。异步路径只分配副本缓冲，
                     // 真正的搬运由该卡的 worker 线程在自己的 per-thread stream
                     // 上异步发起，与 root 卡的专家计算和 CPU 专家并行。
-                    if (assistOverlap && assistStagingReady) {
+                    if (assistStagingReady) {
                         Data *staged = fastllmMoeDataManagerNumas.
                             EnsureGpuInputReplica(input, device);
                         cudaInputReplicas.push_back(
@@ -8465,7 +8440,7 @@ namespace fastllm {
             }
             phaseLap(phaseStageMs);
 
-            if (std::getenv("FASTLLM_NUMAS_MOE_GPU_TRACE") != nullptr) {
+            if (profileDetail) {
                 printf(
                     "[Fastllm] NUMA MoE decision layer=%d gpu_prefill=%d "
                     "replicas=%zu\n",
@@ -8494,7 +8469,6 @@ namespace fastllm {
                     expertTasks[expertIdx + 1].push_back(std::make_pair(b, value));
                 }
             }
-// printf("prepare 0 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
             // Respect an explicit FT_EXPERT_LIMIT override and skip the dynamic
             // CPU/GPU expert split benchmark in that case.
             if (gpuPrefill && !hasExpertLimitOverride) {
@@ -8520,7 +8494,7 @@ namespace fastllm {
                         measuredLimit = ComputeNumasMoeProbeExpertLimit(
                             expertTasks, weights, weightsBatch, 2);
                     }
-                    if (assistConfig.profile) {
+                    if (profileDetail) {
                         printf(
                             "[fastllm-profile-numas-moe-assist] layer=%d "
                             "measured_limit=%d predict_cpu=%.2fms "
@@ -8553,7 +8527,6 @@ namespace fastllm {
 #endif
             }
             phaseLap(phaseLimitMs);
-// printf("get expertLimit spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
             // 根据 expertLimit 阈值生成 cpuExperts / gpuExperts 集合
             std::unordered_set<int> cpuExperts, gpuExperts;
             for (int e = 0; e < (int)expertTasks.size(); e++) {
@@ -8566,8 +8539,6 @@ namespace fastllm {
                     gpuExperts.insert(e);
                 }
             }
-// printf("MoE expertLimit=%d, cpuExperts=%d, gpuExperts=%d\n", expertLimit, (int)cpuExperts.size(), (int)gpuExperts.size());
-// printf("prepare 1 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
             uint8_t *cpuOutputPinned = nullptr;
 #ifdef USE_CUDA
             int gpuId = -1;
@@ -8686,7 +8657,7 @@ namespace fastllm {
                 // 归约落地缓冲与完成事件都提前在主线程准备好（分配走 CUDA
                 // 内存池，跨层复用），worker 线程里只发拷贝、不做分配；
                 // assistResources 的表项也在这里建好，worker 只做查找。
-                if (assistOverlap && gpuWorkerCount > 1) {
+                if (gpuWorkerCount > 1) {
                     for (int i = 1; i < gpuWorkerCount; i++) {
                         const int assistDevice =
                             cudaInputReplicas[i].deviceId;
@@ -8699,7 +8670,7 @@ namespace fastllm {
                     FastllmCudaSetDevice(gpuId);
                 }
 
-                if (std::getenv("FASTLLM_NUMAS_MOE_GPU_TRACE") != nullptr) {
+                if (profileDetail) {
                     size_t cpuRoutes = 0;
                     for (int expert : cpuExperts) {
                         cpuRoutes += expertTasks[expert].size();
@@ -8763,8 +8734,9 @@ namespace fastllm {
                             // （否则 assist 卡会被误判成慢卡而越分越少）。
                             FastllmCudaSyncCurrentThreadStream();
                         }
-                        auto workerStart =
-                            std::chrono::steady_clock::now();
+                        const auto workerStart = trackExpertSpeed
+                            ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::time_point{};
                         // RegisterNumas converts source FP8/NVFP4 weights in
                         // place, including the interleaved gate/up layout
                         // required by V4.1's activation kernel. Normalize CUDA
@@ -8800,11 +8772,13 @@ namespace fastllm {
                             index, score, w1, w2, w3, weights, biass,
                             sharedScale, true, gpuExpertSets[i], true,
                             MoeGateSwiglu, deepSeekV4Mode, swigluLimit, activationQuantBlock, quantizeSharedExpert);
-                        NumasMoeDeviceSpeedTracker::GetInstance().RecordGpu(
-                            workerDevice, (int)gpuExpertSets[i].size(),
-                            std::chrono::duration<double, std::milli>(
-                                std::chrono::steady_clock::now() -
-                                workerStart).count());
+                        if (trackExpertSpeed) {
+                            NumasMoeDeviceSpeedTracker::GetInstance().RecordGpu(
+                                workerDevice, (int)gpuExpertSets[i].size(),
+                                std::chrono::duration<double, std::milli>(
+                                    std::chrono::steady_clock::now() -
+                                    workerStart).count());
+                        }
                         // 归约的跨卡传输也在 worker 线程里发起：DoCuda... 返回
                         // 时本卡的 partial 已经算完，这一步与 root 卡的剩余
                         // 专家、以及主线程的 CPU 专家重叠。主线程只需要在
@@ -8850,7 +8824,6 @@ namespace fastllm {
                 }
             }
             phaseLap(phasePrepMs);
-// printf("gpu prepare spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
 #endif
             waitForCpuInput();
             if (!gpuPrefill || gpuExperts.empty()) {
@@ -8862,13 +8835,15 @@ namespace fastllm {
                     cpuOutputPinned = fastllmMoeDataManagerNumas.EnsurePinnedOutput(output.GetBytes());
                 }
 #endif
-                auto cpuExpertStart = std::chrono::steady_clock::now();
+                const auto cpuExpertStart = trackExpertSpeed
+                    ? std::chrono::steady_clock::now()
+                    : std::chrono::steady_clock::time_point{};
                 DoNumasMergeMOEOnCPU(
                     input, output, index, score, weights, biass,
                     sharedScale, weightsBatch, topk, cpuExperts, fastllmMoeDataManagerNumas,
                     cpuOutputPinned, swigluLimit, deepSeekV4Mode, activationQuantBlock, quantizeSharedExpert
                 );
-                {
+                if (trackExpertSpeed) {
                     size_t cpuRoutes = 0;
                     for (int expert : cpuExperts) {
                         cpuRoutes += expertTasks[expert].size();
@@ -8893,7 +8868,6 @@ namespace fastllm {
 #endif
             }
             phaseLap(phaseCpuMs);
-// printf("cpu spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
 #ifdef USE_CUDA
             if (gpuPrefill && !gpuExperts.empty()) {
                 for (std::thread &gpuThread : gpuThreads) {
@@ -8908,60 +8882,26 @@ namespace fastllm {
                     FastllmCudaStreamSynchronize(cpuOutputCopyStream);
                     Data cpuOutputAlias(output.dataType, output.dims, DataDevice::CUDA, cpuOutputStaging);
                     FastllmCudaAddTo(gpuOutputAlias, cpuOutputAlias, 1.0f);
-                    // 开启重叠时这次同步没有意义：后续 AddTo 与消费方都在同一条
-                    // per-thread stream 上，末尾统一同步一次即可。
-                    if (!assistOverlap) {
-                        FastllmCudaSyncCurrentThreadStream();
-                    }
                 }
                 if (gpuOutputPartials.size() > 1) {
-                    size_t outputBytes = output.GetBytes();
-                    if (assistOverlap && !assistReduceTargets.empty()) {
-                        // worker 线程已经把 partial 送到 root 卡上的独立缓冲，
-                        // 这里只剩 AddTo。每个 partial 有自己的落地缓冲，所以
-                        // 多张 assist 卡的传输之间不需要串行。
-                        for (int i = 1;
-                             i < (int)gpuOutputPartials.size(); i++) {
-                            if (assistReduceTargets[i] == nullptr) {
-                                continue;
-                            }
-                            if (assistPartialEvents[i] != nullptr) {
-                                FastllmCudaCurrentThreadStreamWaitEvent(
-                                    assistPartialEvents[i]);
-                            }
-                            Data reduceAlias(
-                                output.dataType, output.dims,
-                                DataDevice::CUDA, assistReduceTargets[i]);
-                            FastllmCudaAddTo(
-                                gpuOutputAlias, reduceAlias, 1.0f);
+                    // Workers have copied each partial into its own root-device
+                    // buffer. Join their streams before reducing those buffers.
+                    for (int i = 1; i < (int)gpuOutputPartials.size(); i++) {
+                        if (assistReduceTargets[i] == nullptr) continue;
+                        if (assistPartialEvents[i] != nullptr) {
+                            FastllmCudaCurrentThreadStreamWaitEvent(
+                                assistPartialEvents[i]);
                         }
-                    } else {
-                        void *reduceStaging =
-                            fastllmMoeDataManagerNumas.EnsureGpuOutputStaging(
-                                outputBytes, gpuId);
                         Data reduceAlias(
                             output.dataType, output.dims,
-                            DataDevice::CUDA, reduceStaging);
-                        for (int i = 1;
-                             i < (int)gpuOutputPartials.size(); i++) {
-                            int sourceDevice =
-                                cudaInputReplicas[i].deviceId;
-                            FastllmCudaMemcpyBetweenDevices(
-                                gpuId, reduceStaging, sourceDevice,
-                                gpuOutputPartials[i]->cudaData,
-                                outputBytes);
-                            FastllmCudaSetDevice(gpuId);
-                            FastllmCudaAddTo(
-                                gpuOutputAlias, reduceAlias, 1.0f);
-                            FastllmCudaSyncCurrentThreadStream();
-                        }
+                            DataDevice::CUDA, assistReduceTargets[i]);
+                        FastllmCudaAddTo(gpuOutputAlias, reduceAlias, 1.0f);
                     }
                 }
                 // 重叠路径把中间的每一次同步都省掉了，这里统一同步一次：
                 // partial 与各 staging 缓冲要等归约真正读完才能释放/复用。
-                if (assistOverlap &&
-                    (cpuOutputStaging != nullptr ||
-                     gpuOutputPartials.size() > 1)) {
+                if (cpuOutputStaging != nullptr ||
+                    gpuOutputPartials.size() > 1) {
                     FastllmCudaSyncCurrentThreadStream();
                 }
                 output.dataDevice = DataDevice::CUDA;
@@ -8976,7 +8916,7 @@ namespace fastllm {
             }
 #endif
             phaseLap(phaseReduceMs);
-            if (assistProfile) {
+            if (profileDetail) {
                 printf(
                     "[fastllm-profile-numas-moe-assist] layer=%d tokens=%d "
                     "stage=%.3f limit=%.3f prep=%.3f cpu=%.3f join=%.3f "
