@@ -604,3 +604,103 @@ GPU 活动时间是 kernel 与 memcpy 时间区间的并集，不是 SM 利用�
 
 这是关闭 profiler、排除加载和短/长输入预热后各一次测量。逐 token 时间、库校验值及
 数值一致性记录见上述 JSON 的 `cleanup_verification`。
+
+## 仅量化 MoE 专家的 NVFP4 导出
+
+`tools/naive_n05_export_nvfp4.py` 将原始 FP8 专家反量化后，导出为 E2M1 权重、
+每 16 列一个 E4M3 缩放值和每矩阵一个 FP32 缩放值。采用就近舍入，平局取偶数；
+这是权重量化实验，未做激活校准或量化感知训练。推理使用 BF16 激活。
+注意力、路由、首层稠密 MLP、词嵌入及输出头原样复制。
+
+导出需要有 CUDA 的 PyTorch 和 safetensors，输出目录必须不存在：
+
+```bash
+python tools/naive_n05_export_nvfp4.py \
+  --model ~/hfmodels/Naive-N0.5-Flash-FP8 \
+  --output ~/hfmodels/Naive-N0.5-Flash-MoE-NVFP4
+
+FT_NUMAS=2 FT_THREADS=40 numactl -C 0-63 -m 0,1 \
+  ftllm server ~/hfmodels/Naive-N0.5-Flash-MoE-NVFP4 \
+  --device cuda --moe_device numa
+```
+
+运行时自动识别 safetensors 中的 NVFP4 格式，使用与 Qwen4 相同的紧凑 E4M3 NUMA
+布局；无需设置新的环境变量。`nvfp4_export.json` 记录量化方法、采样权重误差和全部
+非专家张量的 SHA256。此次导出含 36,096 个专家矩阵；472 个非专家张量的字节校验
+全部通过。权重分片从 293.465 GiB 缩至 170.025 GiB，减少 42.1%。
+
+导出器的小规模回归无需加载完整模型，覆盖舍入、全零专家、分块缩放和非专家
+字节一致性。使用已安装 PyTorch 和 safetensors 的 Python 运行：
+
+```bash
+python -m unittest discover -s test -p test_naive_n05_export_nvfp4.py -v
+```
+
+### NVFP4 实测（投影优化前）
+
+本节保留量化导出时的对比；投影优化后的 NVFP4 速度见
+[投影优化实测](naive_n05_nvfp4_profile.md#投影优化实测)。
+
+双 NUMA、共 40 个工作线程、CPU 0–63、RTX 4090，并发 1。与此前 FP8 双 NUMA
+测量使用同一组输入，普通和推测路径分别预热后交替运行两轮，下表采用第二轮。
+推测候选上限为 7，置信度阈值为 0.5；decode 吞吐不包含首 token。
+
+| 编程任务 | FP8 普通 | NVFP4 普通 | FP8 推测 | NVFP4 推测 |
+| --- | ---: | ---: | ---: | ---: |
+| 区间合并 | 19.85 | 27.42 | 32.25 | 36.19 |
+| 二分查找 | 20.24 | 29.15 | 39.44 | 42.93 |
+| 拓扑排序 | 20.45 | 28.91 | 31.03 | 33.42 |
+
+单位：token/s。普通解码提高 38.2–44.0%，推测解码提高 7.7–12.2%。三组贪心
+答案在 FP8/NVFP4、普通/推测及两轮之间全部一致；18 份贪心与采样代码通过全部
+48,948 项执行检查。首次冷请求 TTFT 为 44.574 秒，decode 为 8.46 token/s，未计入稳态。
+
+**长输入 prefill 变慢**：2057-token 重复输入，普通模式由 8.530 秒增加到
+12.075 秒，推测模式由 8.542 秒增加到 12.101 秒，约 170 输入 token/s，吞吐下降
+29.4%。当前紧凑 NVFP4 + BF16 激活的 GPU 专家 prefill 不支持，专家由 CPU 执行；
+FP8 双 NUMA 基线的专家 prefill 也使用 CPU。短编程提示 TTFT 为 0.82–0.91 秒。
+
+精度检查使用同一固定续写前缀、全部 152576 维 logits，与当前 FastLLM FP8 版本
+比较，而非另行运行原始 Transformers 参考。87/127/2057-token 三组输入共 24 个
+位置，平均 KL(FP8‖NVFP4) 为 0.04912，最大 0.21582；平均 RMSE 为 0.42205，
+最大绝对差为 4.625；top-1 相同 23/24。该结果是有限输入的量化误差测量。
+
+另做 NVFP4 整块验证与逐 token 推理比较：87/127-token 前缀的 16 个位置逐位一致；
+2057-token 前缀的 8 个位置最大绝对差为 1.125、最大 KL 为 0.01504，top-1 均一致。
+因此此版本的长上下文推测验证不能宣称与逐 token 推理严格数值等价。
+
+完整输入、逐 token 时间、接受率、量化误差和代码检查见
+[NVFP4 测量数据](benchmarks/naive_n05_nvfp4.json)。原始 FP32 logits 与日志保存在
+`/tmp/naive-nvfp4-numa2-40`。基准工具的验证 case 可设置 `logits_output`，导出逐 token
+目标 logits 的行优先 FP32 文件，形状由结果中的 `verify_tokens` 和 `vocab_size` 给出。
+
+普通解码与推测验证的 Nsight 波形、相同 8-token 前缀的逐算子对比和优化优先级见
+[NVFP4 推测验证分析](naive_n05_nvfp4_profile.md)。
+
+## 投影优化后的 FP8 速度（2026-09-30）
+
+使用当前已安装版本及原始 `Naive-N0.5-Flash-FP8`，双 NUMA 共 40 个工作线程、
+CPU 0–63、内存节点 0/1、RTX 4090、并发 1。普通与推测路径分别预热后交替
+运行两轮，推测候选上限 7、置信度阈值 0.5，关闭 profiler 和跨请求前缀缓存。
+下面为第二轮 decode 吞吐，不含首 token：
+
+| 编程任务 | FP8 普通 token/s | FP8 推测 token/s | 投影优化前 FP8 推测 token/s |
+| --- | ---: | ---: | ---: |
+| 区间合并 | 19.88 | 43.48 | 32.25 |
+| 二分查找 | 20.07 | 53.93 | 39.44 |
+| 拓扑排序 | 20.73 | 41.68 | 31.03 |
+
+推测解码比此前测量提高 34.3–36.7%。第一轮推测分别为 43.45、53.89、41.67
+token/s，与第二轮接近；普通解码两轮为 19.77–20.73 token/s。三组任务两轮的
+生成 token、接受数、候选数和轮数与优化前相同。接受率分别为 83/104（79.81%）、
+91/95（95.79%）、133/177（75.14%）。
+
+2057-token 重复输入在预热后重新计算全部 KV，首 token 为 **8.530 秒**，
+按输入长度除以首 token 时间约 **241 输入 token/s**。首次长输入为 17.930 秒，
+未计入稳态。进程的首次冷请求首 token 为 221.054 秒，随后冷解码为 2.10
+token/s；以上表格排除了这段权重准备过程，加载模型的时间也不在 TTFT 内。
+
+同配置、相同输入的当前 NVFP4 推测参考为 49.83、60.22、45.98 token/s，
+来自 2026-09-29 的独立进程测量。完整输入、两轮逐 token 时间、接受率、二进制
+校验及对比数据见 [FP8 当前速度测量](benchmarks/naive_n05_fp8_current.json)，
+原始文件位于 `/tmp/naive-fp8-current`。
