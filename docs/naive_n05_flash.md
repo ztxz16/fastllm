@@ -53,6 +53,56 @@ MoE 启动默认启用 `--cache_history true`；可用 `--cache_history false` �
 该模型的归档始终使用 CPU 内存，不受 `--cache_fast` 影响，不额外常驻 GPU KV 副本。
 API 的 `usage.prompt_tokens_details.cached_tokens` 表示本次命中的输入 token 数。
 
+### 本地 Codex CLI
+
+`/v1/models` 的 Naive 模型目录提供 `none`（关闭思考）和 `low`（开启思考），默认 `none`。
+Naive 的 `low` 是思考开关，没有较短的思考 token 预算；Codex 自动生成会话标题时也会
+继承此设置。交互速度优先时保留 `none`。首次长提示仍需完整 prefill，后续请求通过
+历史缓存复用前缀。
+
+Codex 的自动标题请求有 30 秒超时，长 prefill 时排队生成可能超时并在下一轮重试。
+以下命令通过 `X-FastLLM-Codex-Title-Mode: local` 显式启用本地标题：服务端仅匹配
+Codex 的标题提示和对应 JSON schema，从用户请求提取不超过 36 字的标题，直接返回，
+不进入模型队列。标题是请求文本的摘要标签；普通对话、工具调用和其他结构化输出仍由
+模型生成。不带此请求头时保留模型生成标题的行为。
+
+获取当前服务的模型目录并启动客户端：
+
+```bash
+curl --noproxy '*' -fsS http://127.0.0.1:8080/v1/models -o /tmp/naive-n05-models.json &&
+NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
+codex --no-daemon -m naive-n05 \
+  -c model_provider=fastllm \
+  -c model_catalog_json=/tmp/naive-n05-models.json \
+  -c model_reasoning_effort=none \
+  -c cli_auth_credentials_store=ephemeral \
+  -c features.plugins=false -c features.remote_plugin=false -c features.apps=false \
+  -c web_search=disabled -c check_for_update_on_startup=false \
+  -c analytics.enabled=false \
+  -c model_providers.fastllm.name=FastLLM \
+  -c model_providers.fastllm.base_url=http://127.0.0.1:8080/v1 \
+  -c model_providers.fastllm.wire_api=responses \
+  -c model_providers.fastllm.requires_openai_auth=false \
+  -c 'model_providers.fastllm.http_headers={"X-FastLLM-Codex-Title-Mode"="local"}' \
+  -c model_providers.fastllm.supports_websockets=false \
+  -c model_providers.fastllm.request_max_retries=0 \
+  -c model_providers.fastllm.stream_max_retries=0
+```
+
+仅关闭 `remote_plugin` 不会关闭插件目录的其他远程查询；此命令关闭整个插件功能。
+`cli_auth_credentials_store=ephemeral` 让这个本地客户端不读取持久化 ChatGPT 登录凭据，
+避免发送前等待远程用户设置查询超时；不会删除已有登录、技能或会话记录。
+`NO_PROXY` 与 `no_proxy` 保证本地 API 直连。代码或配置更新后应重启服务和 Codex，
+并重新获取模型目录；旧进程与旧目录文件不会自动加载修改。
+
+2026-09-30 使用 Codex 0.159.2、`workspace-write` 和 `on-request` 实测：原服务参数、
+已安装的 Python 包、不设置额外缓存容量环境变量时，发送到服务端为 0.11–0.16 秒。
+冷启动自动标题请求在 0.45 秒完成，首条消息提交后 0.70 秒已保存到客户端数据库；
+7557-token 主请求首次 prefill 仍约 47 秒。后续短回复为 0.71–1.31 秒，实际执行
+`printf fastllm_ok` 并返回工具结果为 5.04–6.28 秒；连续四轮只有一次标题请求。
+44 项 API 回归及原生历史缓存测试通过，逐次数据见
+[Codex 交互验证](benchmarks/naive_n05_codex.json)。
+
 `tools/naive_n05_flash_bench.py` 默认关闭历史缓存来测量完整 prefill；增加
 `--cache_history true` 可测试复用，并在结果中查看 `cached_input_tokens`。
 

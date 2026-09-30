@@ -16,7 +16,14 @@ class FastLLmModel:
         is_glm5_next = self._is_glm5_next(model)
         is_qwen_reasoning = (
             self._is_qwen3_5(model) or self._is_qwen4_exp(model))
-        if is_kimi_k3 or is_glm5_next:
+        is_naive_n05 = self._is_naive_n05(model)
+        if is_naive_n05:
+            # Naive exposes a thinking switch; "low" enables thinking without
+            # imposing a smaller token budget. Keep local interactive use off
+            # by default, including Codex's auxiliary title generation turns.
+            reasoning_efforts = ["none", "low"]
+            default_reasoning_effort = "none"
+        elif is_kimi_k3 or is_glm5_next:
             reasoning_efforts = ["none", "low", "high", "max"]
             default_reasoning_effort = "max"
         elif is_qwen_reasoning:
@@ -52,7 +59,13 @@ class FastLLmModel:
                 "app_ids": [],
                 "hidden": False,
                 "default_reasoning_level": default_reasoning_effort or "low",
-                "supported_reasoning_levels": reasoning_efforts,
+                "supported_reasoning_levels": [
+                    {"effort": effort, "description": (
+                        "Disable thinking for faster responses." if effort == "none"
+                        else "Enable thinking." if is_naive_n05
+                        else f"Use {effort} reasoning effort.")}
+                    for effort in reasoning_efforts
+                ],
                 "supported_reasoning_efforts": reasoning_efforts,
                 "supportedReasoningEfforts": reasoning_efforts,
                 "default_reasoning_effort": default_reasoning_effort,
@@ -221,6 +234,18 @@ class FastLLmModel:
             "CogVLMForCausalLM", "Gemma4ForConditionalGeneration",
             "Step3p7ForConditionalGeneration", "Qwen3_8FlashNextForConditionalGeneration",
         }
+
+    @staticmethod
+    def _is_naive_n05(model):
+        get_type = getattr(model, "get_type", None)
+        if callable(get_type):
+            try:
+                if get_type() == "naive_n05_flash":
+                    return True
+            except Exception:
+                pass
+        config = getattr(model, "config", None)
+        return isinstance(config, dict) and config.get("model_type") == "naive_n05_flash"
 
     @staticmethod
     def _is_kimi_k3(model):

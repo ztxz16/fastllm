@@ -1,0 +1,272 @@
+{
+  "date": "2026-09-30",
+  "codex_version": "0.159.2",
+  "configuration": {
+    "mode": "workspace-write",
+    "approval_policy": "on-request",
+    "reasoning_effort": "none",
+    "request_compression_override": false,
+    "cli_auth_credentials_store": "ephemeral",
+    "local_title_header": "X-FastLLM-Codex-Title-Mode: local",
+    "numa_node": 0,
+    "cpu_affinity": "0-31",
+    "threads": 28,
+    "device": "cuda:0",
+    "moe_device": "numa",
+    "draft_tokens": 7,
+    "context_limit": 32768,
+    "history_record_byte_limit": 8589934592,
+    "history_total_byte_limit": 42949672960,
+    "history_byte_limit_environment_override": false,
+    "pythonpath_override": false
+  },
+  "checks": {
+    "api_tests_passed": 44,
+    "native_history_test": "passed",
+    "installed_library_matches_build": true
+  },
+  "installed_server_cold_run": {
+    "turns": [
+      {
+        "prompt": "你好",
+        "send_to_server_seconds": 0.157,
+        "turn_seconds": 50.264,
+        "responses": [
+          {
+            "input_tokens": 7557,
+            "cached_tokens": 0,
+            "output_tokens": 55,
+            "http_seconds": 50.107,
+            "status": "response.completed",
+            "output": [
+              {
+                "type": "message",
+                "id": "msg_sgy3iRe9Weu6TULhwfvPfW",
+                "status": "completed",
+                "role": "assistant",
+                "content": [
+                  {
+                    "type": "output_text",
+                    "text": "\n\n你好！我是 Naive N0.5，由 NaiveAI 开发的 AI 模型。NaiveAI 是一家人工智能公司，专注于 AI 研究并自主研发自己的 AI 模型。很高兴见到你，有什么我可以帮忙的吗？",
+                    "annotations": []
+                  }
+                ]
+              }
+            ],
+            "first_text_delta_seconds": 46.953
+          }
+        ]
+      },
+      {
+        "prompt": "请运行 printf fastllm_ok，并只回复命令的实际输出",
+        "send_to_server_seconds": 0.133,
+        "turn_seconds": 6.28,
+        "responses": [
+          {
+            "input_tokens": 7635,
+            "cached_tokens": 7612,
+            "output_tokens": 69,
+            "http_seconds": 3.543,
+            "status": "response.completed",
+            "output": [
+              {
+                "type": "function_call",
+                "id": "fc_eWJx6T6R9CwdyPEReqFHdy",
+                "call_id": "call_640640c4ec484ca3829e672c",
+                "name": "exec_command",
+                "arguments": "{\"cmd\": \"printf fastllm_ok\", \"workdir\": \"/home/tf/agentTest\", \"yield_time_ms\": 10000, \"max_output_tokens\": 1000}",
+                "status": "completed"
+              }
+            ]
+          },
+          {
+            "input_tokens": 7758,
+            "cached_tokens": 7635,
+            "output_tokens": 5,
+            "http_seconds": 2.51,
+            "status": "response.completed",
+            "output": [
+              {
+                "type": "message",
+                "id": "msg_4zceH9DFmViNNSFcqUWPLC",
+                "status": "completed",
+                "role": "assistant",
+                "content": [
+                  {
+                    "type": "output_text",
+                    "text": "\n\nfastllm_ok",
+                    "annotations": []
+                  }
+                ]
+              }
+            ],
+            "first_text_delta_seconds": 2.263
+          }
+        ]
+      }
+    ],
+    "title_requests": [
+      {
+        "http_seconds": 0.448,
+        "title": "开始对话",
+        "status": "response.completed"
+      }
+    ],
+    "title_saved_seconds_after_first_submit": 0.698,
+    "title_saved_before_main_first_token": true,
+    "title_persisted_in_client_database": "开始对话"
+  },
+  "warm_four_turn_run": {
+    "turns": [
+      {
+        "prompt": "你好",
+        "send_to_server_seconds": 0.156,
+        "turn_seconds": 3.748,
+        "responses": [
+          {
+            "input_tokens": 7557,
+            "cached_tokens": 7556,
+            "output_tokens": 55,
+            "http_seconds": 3.592,
+            "status": "response.completed",
+            "output": [
+              {
+                "type": "message",
+                "id": "msg_6yzkMQpD2YNGpz5MwvDezV",
+                "status": "completed",
+                "role": "assistant",
+                "content": [
+                  {
+                    "type": "output_text",
+                    "text": "\n\n你好！我是 Naive N0.5，由 NaiveAI 开发的 AI 模型。NaiveAI 是一家人工智能公司，专注于 AI 研究并自主研发自己的 AI 模型。很高兴见到你，有什么我可以帮忙的吗？",
+                    "annotations": []
+                  }
+                ]
+              }
+            ],
+            "first_text_delta_seconds": 0.481
+          }
+        ]
+      },
+      {
+        "prompt": "请只回复：收到",
+        "send_to_server_seconds": 0.127,
+        "turn_seconds": 0.708,
+        "responses": [
+          {
+            "input_tokens": 7627,
+            "cached_tokens": 7626,
+            "output_tokens": 2,
+            "http_seconds": 0.581,
+            "status": "response.completed",
+            "output": [
+              {
+                "type": "message",
+                "id": "msg_qoBidStYQPswxTA7qzLucQ",
+                "status": "completed",
+                "role": "assistant",
+                "content": [
+                  {
+                    "type": "output_text",
+                    "text": "\n\n收到",
+                    "annotations": []
+                  }
+                ]
+              }
+            ],
+            "first_text_delta_seconds": 0.382
+          }
+        ]
+      },
+      {
+        "prompt": "请运行 printf fastllm_ok，并只回复命令的实际输出",
+        "send_to_server_seconds": 0.116,
+        "turn_seconds": 5.038,
+        "responses": [
+          {
+            "input_tokens": 7652,
+            "cached_tokens": 7651,
+            "output_tokens": 69,
+            "http_seconds": 3.157,
+            "status": "response.completed",
+            "output": [
+              {
+                "type": "function_call",
+                "id": "fc_6cCKfRg3fXEReozsXxamXY",
+                "call_id": "call_24cd952373e84dd482a536c6",
+                "name": "exec_command",
+                "arguments": "{\"cmd\": \"printf fastllm_ok\", \"workdir\": \"/home/tf/agentTest\", \"yield_time_ms\": 10000, \"max_output_tokens\": 1000}",
+                "status": "completed"
+              }
+            ]
+          },
+          {
+            "input_tokens": 7775,
+            "cached_tokens": 7729,
+            "output_tokens": 5,
+            "http_seconds": 1.696,
+            "status": "response.completed",
+            "output": [
+              {
+                "type": "message",
+                "id": "msg_hKMFyg8VeuZtoYLMkMQ46A",
+                "status": "completed",
+                "role": "assistant",
+                "content": [
+                  {
+                    "type": "output_text",
+                    "text": "\n\nfastllm_ok",
+                    "annotations": []
+                  }
+                ]
+              }
+            ],
+            "first_text_delta_seconds": 1.334
+          }
+        ]
+      },
+      {
+        "prompt": "请只回复：测试完成",
+        "send_to_server_seconds": 0.112,
+        "turn_seconds": 1.307,
+        "responses": [
+          {
+            "input_tokens": 7796,
+            "cached_tokens": 7780,
+            "output_tokens": 3,
+            "http_seconds": 1.195,
+            "status": "response.completed",
+            "output": [
+              {
+                "type": "message",
+                "id": "msg_zX2tUqpJYgXTiPUUtEjGR8",
+                "status": "completed",
+                "role": "assistant",
+                "content": [
+                  {
+                    "type": "output_text",
+                    "text": "\n\n测试完成",
+                    "annotations": []
+                  }
+                ]
+              }
+            ],
+            "first_text_delta_seconds": 0.834
+          }
+        ]
+      }
+    ],
+    "title_requests": [
+      {
+        "http_seconds": 0.486,
+        "title": "开始对话",
+        "status": "response.completed"
+      }
+    ]
+  },
+  "limits": [
+    "The first cold main request still prefills 7557 tokens; title generation does not accelerate model prefill.",
+    "Local titles are extracted labels from the user request, not model-generated summaries.",
+    "These are single-machine measurements of short messages and one real command, not a long-task benchmark."
+  ]
+}

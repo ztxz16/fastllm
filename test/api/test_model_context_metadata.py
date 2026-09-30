@@ -119,6 +119,22 @@ class FastLLmModelContextMetadataTest(unittest.TestCase):
         self.assertEqual(model["default_reasoning_effort"], "max")
         self.assertEqual(model["defaultReasoningEffort"], "max")
 
+    def test_naive_reasoning_switch_defaults_to_none_for_custom_alias(self):
+        for native_model in (
+            _FakeModel(32768, 32768, model_type="naive_n05_flash"),
+            SimpleNamespace(config={"model_type": "naive_n05_flash"}),
+        ):
+            metadata = FastLLmModel("custom-alias", native_model).response
+            for model in (metadata["data"][0], metadata["models"][0]):
+                self.assertEqual(model["supported_reasoning_efforts"], ["none", "low"])
+                self.assertEqual(model["default_reasoning_level"], "none")
+                self.assertEqual(model["default_reasoning_effort"], "none")
+                self.assertEqual(model["defaultReasoningEffort"], "none")
+                self.assertEqual(
+                    [preset["effort"] for preset in model["supported_reasoning_levels"]],
+                    ["none", "low"],
+                )
+
     def test_qwen3_5_reasoning_efforts_are_discoverable(self):
         metadata = FastLLmModel(
             "qwen3.5",

@@ -2672,6 +2672,29 @@ class FastLLmCompletion:
           traceback.print_exc()
           return self.create_error_response(str(e))
 
+      if getattr(raw_request, "headers", {}).get("x-fastllm-codex-title-mode") == "local":
+          from .codex_title import local_codex_title
+          title = local_codex_title(request, chat_request.messages)
+          if title is not None:
+              error = await self._check_model(request)
+              if error is not None:
+                  return error
+              content = json.dumps({"title": title}, ensure_ascii=False)
+              response_id = f"resp_{shortuuid.random()}"
+              created_at = int(time.time())
+              if request.stream:
+                  async def title_stream():
+                      yield "data: " + json.dumps({
+                          "id": response_id, "created": created_at,
+                          "choices": [{"delta": {"content": content}, "finish_reason": "stop"}],
+                          "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                      }, ensure_ascii=False) + "\n\n"
+                  return self.responses_stream_generator(request, title_stream()), None
+              return self._responses_response_object(
+                  request, response_id, created_at, "completed",
+                  [self._responses_message_item(f"msg_{shortuuid.random()}", content)],
+                  ResponsesUsageInfo(), output_text=content)
+
       generator = await self.create_chat_completion(chat_request, raw_request)
       if isinstance(generator, ErrorResponse):
           return generator
