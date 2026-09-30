@@ -212,9 +212,11 @@ int main() {
         if (properties.major * 10 + properties.minor < 75)
             return 77;
         setenv("FASTLLM_CUDA_GDN_INPUT_CONV", "1", 1);
-        for (auto shape : {std::vector<int>{5120,16384,10240}, {5120,8192,5120},
-                           {5120,6144,3840}, {5120,5120,3200}, {5120,4096,2560},
-                           {3072,4111,2567}}) {
+        const std::vector<int> shapes[] = {
+            {5120,16384,10240}, {5120,8192,5120}, {5120,6144,3840},
+            {5120,5120,3200}, {5120,4096,2560}, {3072,4111,2567}
+        };
+        for (const auto &shape : shapes) {
             Run<half>(DataType::FLOAT16, shape[0], shape[1], shape[2]);
             Run<__nv_bfloat16>(DataType::BFLOAT16, shape[0], shape[1], shape[2]);
         }

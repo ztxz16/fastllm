@@ -141,7 +141,8 @@ int RunSuite(cudaStream_t stream) {
     }
     // Dynamic dimensions and offsets exercise the scalar fallback, including
     // vectors' alignment requirements rather than only CUDA allocation bases.
-    for (auto offsets : {std::pair<int, int>{1, 0}, {0, 1}, {1, 1}}) {
+    const std::pair<int, int> offsetCases[] = {{1, 0}, {0, 1}, {1, 1}};
+    for (const auto &offsets : offsetCases) {
         for (int cols : {1023, 1024, 1025, 1040}) {
             RunCase<T>(3, cols, 0, offsets.first, offsets.second, true, stream);
             ++cases;
