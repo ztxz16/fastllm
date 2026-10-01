@@ -1026,3 +1026,47 @@ ctest --test-dir build-fastllm --output-on-failure -R '^naive_n05_(decode|attent
 
 完整配置、库哈希、重复范围及验证记录见
 [CUDA decode 测量数据](benchmarks/naive_n05_cuda_decode.json)。
+
+
+## 单行 RMSNorm 与专家选择优化
+
+普通解码自动按形状选择以下 CUDA 路径，无需环境变量：
+
+- 单行、4096 通道的 BF16 RMSNorm 将输入和 FP32 权重保留在寄存器中，展开固定
+  次数的循环，保持原有逐线程累加顺序，以及乘权重前后的两次 BF16 舍入。
+- 单行、256 专家选 8 使用 warp Top-K，复用 512 专家选 10 的固定形状实现。
+  并列分数重建原 64 线程归并顺序；非有限值、归一化及路由缩放沿用原处理。
+- 多行 prefill 和其他维度保留原调度；通用选择核的 `MAXK=50` 布局保留。
+  5120 维通用 RMSNorm 的 `FASTLLM_CUDA_RMSNORM_DECODE` 属于另一条仍在使用的路径。
+
+整理后的代码统一维度常量，去掉多余的候选结构转换，保留原向量加载布局。CUDA 13.1 重建后，
+4096 维 RMSNorm、256/top8 选择，以及 512/top10 的普通和融合 softmax 两个核的
+SASS 指令及控制编码与整理前一致。实际库接口各 672 组 RMSNorm/路由对照通过，
+包含回退形状；有限结果、路由索引和权重逐 bit 相等，RMSNorm NaN 按分类核验。
+memcheck、racecheck、synccheck 各抽查两项各 112 组，均无错误或 hazard。
+
+### 整模型性能
+
+以下为整理前优化实现的实测，基线 `b0a7ede3` 已包含上一节的长上下文修复。
+完整 Naive checkpoint、8 张 RTX 5090 按层分配、CUDA 13.1、`--max_batch 1 --mtp 0`，
+16 线程、prefill 分块 512、tokens/context 65536，历史及前缀缓存关闭。
+
+| 场景 | 基线 decode | 优化后 decode | 提升 |
+| --- | ---: | ---: | ---: |
+| 短中文（56 输入） | 55.54 token/s | 58.81 token/s | 5.89% |
+| 短代码（80 输入） | 54.18 token/s | 57.21 token/s | 5.58% |
+| 7,565 输入代码 | 46.44 token/s | 48.55 token/s | 4.53% |
+| 32,727 输入代码 | 45.13 token/s | 47.15 token/s | 4.48% |
+
+前三项为无 profiler 的 ABBA 四独立进程，每个 case/进程预热一次、正式三次；每版
+六个正式样本。32K 是补充 A/B，每版一次预热、一次正式样本，不与 ABBA 样本量混算。
+首 token 时间基本不变。生成文本跨版一致，代码输出均为 69 token，并通过 980 项检查；
+这属于固定任务性能与回归测试，不代表全面质量评估。
+
+32K Nsight Systems 的 14 个内部解码步中，每 token 的 97 次 RMSNorm 从合计
+0.861 ms 降至 0.140 ms，47 次专家选择从 0.521 ms 降至 0.163 ms，共省约
+1.079 ms。前后仍为 1141 个核/token，无 CUDA malloc/free。基线波形来自此前对
+同一基线库的采集；吞吐采用上述无 profiler 测量，不使用含停采集/导出开销的请求速度。
+
+完整库哈希、重复范围及验证记录见
+[单行小算子测量数据](benchmarks/naive_n05_small_kernels.json)。

@@ -1,0 +1,252 @@
+{
+  "date": "2026-10-01",
+  "model": "Naive-N0.5-Flash-MoE-NVFP4 (full checkpoint)",
+  "base_commit": "b0a7ede3b64ae907ce90b61282b4a0ecd2adccfb",
+  "configuration": {
+    "max_batch": 1,
+    "mtp": 0,
+    "threads": 16,
+    "chunked_prefill_size": 512,
+    "max_context_length": 65536,
+    "tokens": 65536,
+    "cache_history": false,
+    "prefix_cache": false,
+    "gpu": "8 x RTX 5090, sequential layer placement",
+    "cuda": "13.1",
+    "arch": "sm_120f"
+  },
+  "measurement_note": "Full-model throughput and NSYS measurements precede source cleanup. The four affected kernel SASS instruction/control encodings are unchanged after cleanup; linked-library numerical/sanitizer checks were rerun.",
+  "library_sha256": {
+    "baseline": "d1bd9c4a105068b9563c82f1370652cf7327268b1d8979b6ffc321416475246c",
+    "measured_optimized": "0a7e38445085d22663aed5f79aee5b884b10144fb7d9fbe78d5fe57723b85e39",
+    "cleaned_optimized": "aee58a1a042858c48bf04f01b53004f298ae99094d39e00493d4fa5fdaa4bb4b"
+  },
+  "abba_order": [
+    "A2",
+    "B1",
+    "B2",
+    "A3"
+  ],
+  "abba_method": "Four independent processes, one warmup and three measured requests/case/process; six measured samples/version. A1 exploratory short cases excluded because compilation overlapped.",
+  "abba": [
+    {
+      "case": "explanation",
+      "input_tokens": 56,
+      "output_tokens": 74,
+      "versions": {
+        "baseline": {
+          "samples": 6,
+          "median_decode_tok_s": 55.54181805544822,
+          "range_decode_tok_s": [
+            55.51714985566404,
+            55.57060783096298
+          ],
+          "median_ttft_seconds": 0.2797727999568451,
+          "process_medians": [
+            55.542653090348956,
+            55.54098302054748
+          ]
+        },
+        "fixed": {
+          "samples": 6,
+          "median_decode_tok_s": 58.811711268916525,
+          "range_decode_tok_s": [
+            58.78318548238278,
+            58.82772746493654
+          ],
+          "median_ttft_seconds": 0.2794568800018169,
+          "process_medians": [
+            58.827617479262244,
+            58.792782824712035
+          ]
+        }
+      },
+      "decode_gain_percent": 5.887263557350475,
+      "output_sha256": "b0ae45950ccb218480d7183225650e71085a79524118818f97cec3b20e99bece",
+      "greedy_identical": true,
+      "code_check": null
+    },
+    {
+      "case": "context-short",
+      "input_tokens": 80,
+      "output_tokens": 69,
+      "versions": {
+        "baseline": {
+          "samples": 6,
+          "median_decode_tok_s": 54.18373501525214,
+          "range_decode_tok_s": [
+            54.15185281649363,
+            54.19533759394714
+          ],
+          "median_ttft_seconds": 0.39681509998627007,
+          "process_medians": [
+            54.16027018099715,
+            54.18962460579133
+          ]
+        },
+        "fixed": {
+          "samples": 6,
+          "median_decode_tok_s": 57.20672869600232,
+          "range_decode_tok_s": [
+            57.18417968008027,
+            57.213663619106065
+          ],
+          "median_ttft_seconds": 0.3966634399839677,
+          "process_medians": [
+            57.20674217183721,
+            57.20671522016743
+          ]
+        }
+      },
+      "decode_gain_percent": 5.579153374899759,
+      "output_sha256": "625647b8667c3c81662fd1a28ece2a83d34ca6ef80c407b16b1832bfd0010951",
+      "greedy_identical": true,
+      "code_check": {
+        "passed": true,
+        "checks": 980
+      }
+    },
+    {
+      "case": "context-7k5",
+      "input_tokens": 7565,
+      "output_tokens": 69,
+      "versions": {
+        "baseline": {
+          "samples": 6,
+          "median_decode_tok_s": 46.44365889752166,
+          "range_decode_tok_s": [
+            46.402747129324574,
+            46.49742297565503
+          ],
+          "median_ttft_seconds": 18.716467220016057,
+          "process_medians": [
+            46.464093422757145,
+            46.43978156316188
+          ]
+        },
+        "fixed": {
+          "samples": 6,
+          "median_decode_tok_s": 48.54661001077912,
+          "range_decode_tok_s": [
+            48.489840949362026,
+            48.56140965891201
+          ],
+          "median_ttft_seconds": 18.781339379987912,
+          "process_medians": [
+            48.53885345445301,
+            48.554366567105234
+          ]
+        }
+      },
+      "decode_gain_percent": 4.527961756625687,
+      "output_sha256": "625647b8667c3c81662fd1a28ece2a83d34ca6ef80c407b16b1832bfd0010951",
+      "greedy_identical": true,
+      "code_check": {
+        "passed": true,
+        "checks": 980
+      }
+    }
+  ],
+  "context_32k": {
+    "case": "context-32k",
+    "input_tokens": 32727,
+    "output_tokens": 69,
+    "versions": {
+      "baseline": {
+        "samples": 1,
+        "median_decode_tok_s": 45.12621124420209,
+        "median_ttft_seconds": 94.70218128000852
+      },
+      "fixed": {
+        "samples": 1,
+        "median_decode_tok_s": 47.14739276238856,
+        "median_ttft_seconds": 94.84506051999051
+      }
+    },
+    "decode_gain_percent": 4.478952392543611,
+    "output_sha256": "625647b8667c3c81662fd1a28ece2a83d34ca6ef80c407b16b1832bfd0010951",
+    "greedy_identical": true,
+    "code_check": {
+      "passed": true,
+      "checks": 980
+    },
+    "note": "Supplementary A/B: one warmup + one measured request/version, not ABBA. A1 overlaps build in early cases, but its measured 32K request starts after compilation."
+  },
+  "nsys": {
+    "comparison": [
+      {
+        "family": "RMSNorm",
+        "calls_per_token": 97.0,
+        "baseline_ms_per_token": 0.8612249999999975,
+        "fixed_ms_per_token": 0.14022157142857058,
+        "baseline_us_per_call": 8.878608247422653,
+        "fixed_us_per_call": 1.4455832106038207,
+        "duration_reduction_percent": 83.7183579867548
+      },
+      {
+        "family": "Expert selection",
+        "calls_per_token": 47.0,
+        "baseline_ms_per_token": 0.520502142857143,
+        "fixed_ms_per_token": 0.16257364285714226,
+        "baseline_us_per_call": 11.074513677811552,
+        "fixed_us_per_call": 3.4590136778115377,
+        "duration_reduction_percent": 68.76599931659413
+      }
+    ],
+    "saved_gpu_ms_per_token": 1.0789319285714276,
+    "notes": [
+      "Baseline waveform is the previous operator-profile run of the exact same d1bd9c4a library. Candidate waveform captures 14 interior decode steps (52..65), 1141 kernels/token.",
+      "Use unprofiled ABBA for throughput; NSYS kernel durations include profiler effects.",
+      "Microbenchmark uses repeated CUDA Graph launches with hot cache; do not equate it with real-model kernel durations."
+    ]
+  },
+  "validation": {
+    "standalone_rms_cases": 600,
+    "standalone_rms_inplace_cases": 600,
+    "standalone_expert_cases": 1200,
+    "library_rms_cases": 672,
+    "library_expert_cases": 672,
+    "correctness": "Finite results, routing indices and weights bit exact; RMS NaNs matched by classification. Includes unaffected shapes.",
+    "sanitizer": "memcheck, racecheck, synccheck all zero errors/hazards for standalone and actual APIs",
+    "greedy_identical": true,
+    "code_checks": 980,
+    "quality_limit": "Targeted probes and fixed prompts, not broad model quality evaluation.",
+    "post_cleanup_api_rms_cases": 672,
+    "post_cleanup_api_expert_cases": 672,
+    "post_cleanup_sanitizer": "memcheck/racecheck/synccheck: 112 RMS + 112 expert cases each; zero errors/hazards",
+    "post_cleanup_sass_unchanged": {
+      "KimiK3RMSNorm4096KernelEPK13__nv_bfloat16PKfPS0_f": {
+        "identical": true,
+        "before_sha256": "36d364786cef4b92e3f91e647e0a7d3120a2950a592a666c613ddef015517826",
+        "after_sha256": "36d364786cef4b92e3f91e647e0a7d3120a2950a592a666c613ddef015517826",
+        "before_sass_lines": 544,
+        "after_sass_lines": 544
+      },
+      "_Z34FastllmSelectExpertFixedTopKKernelILb0ELi512ELi10EEvPKfS1_PiPfiif": {
+        "identical": true,
+        "before_sha256": "ee3a1787e32609b94d53f20d13c002c85f090f38e13de64564f5a1d5d37a0cf0",
+        "after_sha256": "ee3a1787e32609b94d53f20d13c002c85f090f38e13de64564f5a1d5d37a0cf0",
+        "before_sass_lines": 16288,
+        "after_sass_lines": 16288
+      },
+      "_Z34FastllmSelectExpertFixedTopKKernelILb0ELi256ELi8EEvPKfS1_PiPfiif": {
+        "identical": true,
+        "before_sha256": "a66ab9d15fdb74531235eaecee0ad8ff9799343bbe9336dce30cdf6e4af6c6ef",
+        "after_sha256": "a66ab9d15fdb74531235eaecee0ad8ff9799343bbe9336dce30cdf6e4af6c6ef",
+        "before_sass_lines": 6032,
+        "after_sass_lines": 6032
+      },
+      "_Z34FastllmSelectExpertFixedTopKKernelILb1ELi512ELi10EEvPKfS1_PiPfiif": {
+        "identical": true,
+        "before_sha256": "bfc30c98a330049b3aa48e35dc70d9d025e00c83fdcde2907bd1786e84af10e0",
+        "after_sha256": "bfc30c98a330049b3aa48e35dc70d9d025e00c83fdcde2907bd1786e84af10e0",
+        "before_sass_lines": 17280,
+        "after_sass_lines": 17280
+      }
+    }
+  },
+  "changes": [
+    "4096-channel single-row Kimi RMSNorm retains sixteen input values and weights in registers, preserves original reduction and intermediate BF16 rounding.",
+    "Reuse fixed-shape warp TopK for single-row 256/top-8; exact ties retain legacy merge order; original generic MAXK=50 and prefill dispatch retained."
+  ]
+}
