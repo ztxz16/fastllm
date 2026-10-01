@@ -1070,3 +1070,45 @@ memcheck、racecheck、synccheck 各抽查两项各 112 组，均无错误或 ha
 
 完整库哈希、重复范围及验证记录见
 [单行小算子测量数据](benchmarks/naive_n05_small_kernels.json)。
+
+## 单 query 滑窗 Attention 优化
+
+因果滑窗为 128、Q/K 维度为 192、V 维度为 128 时，单 query 自动选择专用 CUDA 核。
+要求连续 K/V、没有稀疏 indices、保留键数为 1–128 且 `pastLength == keys - 1`。
+输出按四个 32 维片分工，模型中的线程块数从 64 增至 256；Q 保存在寄存器，V 由线程
+协作预取到共享内存。保持原 QK 点积顺序、256-lane softmax 归约树、BF16 舍入及按
+slot 顺序的 FP32 FMA；块同步从 21 次减至 6 次。多 query prefill 和其他形状保留原路径。
+
+窗口、维度、线程及输出片宽使用内核与调度共享的编译期常量，无新增环境开关。
+CUDA 13.1 / `sm_120f` 重建后，该源文件全部 17 个 CUDA 函数（含回退与 CUB）
+的 SASS 指令及控制编码与整理前一致。实际库 368 组逐 bit 对照、2 组 CUDA Graph、
+含 24 种单 query 窗口边界组合的 CPU 参考单测通过；memcheck、racecheck、synccheck
+各 44 组 API 对照及 2 组 Graph 检查均为零错误、零 hazard。
+
+### 整模型性能
+
+以下为整理前 SWA 优化实现的实测，基线 `c3de61cd` 已含前面的 RMSNorm/专家选择优化。
+完整 Naive-N0.5-Flash-MoE-NVFP4、8 张 RTX 5090 按层执行、CUDA 13.1、
+`--max_batch 1 --mtp 0`，16 线程、prefill 分块 512、tokens/context 65536，关闭缓存。
+
+| 场景 | 基线 decode | 优化后 decode | 提升 |
+| --- | ---: | ---: | ---: |
+| 短中文（56 输入） | 58.85 token/s | 61.01 token/s | 3.67% |
+| 短代码（80 输入） | 57.23 token/s | 59.71 token/s | 4.34% |
+| 7,565 输入代码 | 48.57 token/s | 50.59 token/s | 4.15% |
+| 32,727 输入代码 | 47.15 token/s | 49.05 token/s | 4.04% |
+
+无 profiler 的 A1旧→B1新→B2新→A2旧四独立进程；每个进程、每个场景先预热一次。
+每版短输入和 7.5K 各 6 个正式样本，32K 各 2 个；测速时无并发编译、GPU 探针或
+NVML 轮询。60 次请求中，同场景的新旧输出全部相同，代码检查 980 项通过。
+本轮整理后只重做机器码与正确性验证，没有重跑整模型吞吐；这是固定任务的性能与
+回归测试，不代表全面质量评估。
+
+32K Nsight Systems 取 14 个内部解码步：每 token 的 39 次 SWA 从 1.180 ms 降至
+0.419 ms，单次 30.25→10.74 μs（耗时减少 64.5%），合计节省 0.761 ms/token。
+GPU 核总时间 17.531→16.761 ms，仍为 1141 个 kernel/token，无 CUDA malloc/free。
+基线波形来自此前同一基线库；原生吞吐仅取上表，不能用 profiler 请求速度代替。
+热缓存 Graph 的 17.08→6.60 μs 微基准独立保存，不当作真实模型算子时间。
+
+配置、逐次范围、库哈希和整理后机器码核验见
+[SWA 解码测量数据](benchmarks/naive_n05_swa_decode.json)。

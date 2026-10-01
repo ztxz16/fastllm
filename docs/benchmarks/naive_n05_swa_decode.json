@@ -1,0 +1,354 @@
+{
+  "date": "2026-10-01",
+  "model": "Naive-N0.5-Flash-MoE-NVFP4 (full checkpoint)",
+  "base_commit": "c3de61cd06901921a5b01b938644173529780cec",
+  "configuration": {
+    "max_batch": 1,
+    "mtp": 0,
+    "threads": 16,
+    "chunked_prefill_size": 512,
+    "max_context_length": 65536,
+    "tokens": 65536,
+    "cache_history": false,
+    "prefix_cache": false,
+    "gpu": "8 x RTX 5090, sequential layer placement",
+    "cuda": "13.1",
+    "arch": "sm_120f"
+  },
+  "measurement_note": "Full-model ABBA and NSYS precede source cleanup. All 17 CUDA functions in naive-n05-kernels.cu, including SWA and fallback paths, have identical SASS instruction/control encodings after cleanup. Library API, CPU-reference and sanitizer checks were rerun; full-model throughput was not rerun after cleanup.",
+  "library_sha256": {
+    "baseline": "aee58a1a042858c48bf04f01b53004f298ae99094d39e00493d4fa5fdaa4bb4b",
+    "measured_optimized": "f8791e9bf6592e18c7c53fcc3055ac7f444c2729f525cb8c9df8e11d5d5b992f",
+    "cleaned_optimized": "95723b93af94b7bdc7a8630e915af32d4859f73e896d99c23a4f77b01f9076da"
+  },
+  "abba_order": [
+    "A1",
+    "B1",
+    "B2",
+    "A2"
+  ],
+  "abba_method": "Each version has two independent processes. Per process: warmup+3 formal requests for short/7.5K; warmup+1 formal request at 32K.",
+  "abba": [
+    {
+      "case": "explanation",
+      "input_tokens": 56,
+      "output_tokens": 74,
+      "versions": {
+        "baseline": {
+          "samples": 6,
+          "median_decode_tok_s": 58.84833612483709,
+          "range_decode_tok_s": [
+            58.83933305742164,
+            58.88098890517413
+          ],
+          "median_ttft_seconds": 0.2794630799908191,
+          "process_medians": [
+            58.86329083119174,
+            58.842019365313796
+          ]
+        },
+        "fixed": {
+          "samples": 6,
+          "median_decode_tok_s": 61.00816855974642,
+          "range_decode_tok_s": [
+            61.000123937169974,
+            61.019244732667914
+          ],
+          "median_ttft_seconds": 0.27937504000146873,
+          "process_medians": [
+            61.00989801452305,
+            61.005417417171515
+          ]
+        }
+      },
+      "decode_gain_percent": 3.6701673779316435,
+      "output_sha256": "b0ae45950ccb218480d7183225650e71085a79524118818f97cec3b20e99bece",
+      "greedy_identical": true,
+      "code_check": null
+    },
+    {
+      "case": "context-short",
+      "input_tokens": 80,
+      "output_tokens": 69,
+      "versions": {
+        "baseline": {
+          "samples": 6,
+          "median_decode_tok_s": 57.23271246336674,
+          "range_decode_tok_s": [
+            57.20022849219088,
+            57.25128819550045
+          ],
+          "median_ttft_seconds": 0.39669302001129836,
+          "process_medians": [
+            57.20484412034522,
+            57.24909607113237
+          ]
+        },
+        "fixed": {
+          "samples": 6,
+          "median_decode_tok_s": 59.714634068382274,
+          "range_decode_tok_s": [
+            59.69075344344784,
+            59.7221703567773
+          ],
+          "median_ttft_seconds": 0.3963860600197222,
+          "process_medians": [
+            59.71729691072648,
+            59.70136883670178
+          ]
+        }
+      },
+      "decode_gain_percent": 4.336543732055609,
+      "output_sha256": "625647b8667c3c81662fd1a28ece2a83d34ca6ef80c407b16b1832bfd0010951",
+      "greedy_identical": true,
+      "code_check": {
+        "passed": true,
+        "checks": 980
+      }
+    },
+    {
+      "case": "context-7k5",
+      "input_tokens": 7565,
+      "output_tokens": 69,
+      "versions": {
+        "baseline": {
+          "samples": 6,
+          "median_decode_tok_s": 48.56863523920676,
+          "range_decode_tok_s": [
+            48.560655043181924,
+            48.60579008849968
+          ],
+          "median_ttft_seconds": 18.71434975997545,
+          "process_medians": [
+            48.5669451483625,
+            48.571879596631895
+          ]
+        },
+        "fixed": {
+          "samples": 6,
+          "median_decode_tok_s": 50.585585154655476,
+          "range_decode_tok_s": [
+            50.55147195495849,
+            50.611189657056094
+          ],
+          "median_ttft_seconds": 18.786757600028068,
+          "process_medians": [
+            50.59048620310126,
+            50.55647361835141
+          ]
+        }
+      },
+      "decode_gain_percent": 4.152782769198637,
+      "output_sha256": "625647b8667c3c81662fd1a28ece2a83d34ca6ef80c407b16b1832bfd0010951",
+      "greedy_identical": true,
+      "code_check": {
+        "passed": true,
+        "checks": 980
+      }
+    },
+    {
+      "case": "context-32k",
+      "input_tokens": 32727,
+      "output_tokens": 69,
+      "versions": {
+        "baseline": {
+          "samples": 2,
+          "median_decode_tok_s": 47.14540493732318,
+          "range_decode_tok_s": [
+            47.13030764926036,
+            47.160502225386004
+          ],
+          "median_ttft_seconds": 94.73772008001106,
+          "process_medians": [
+            47.160502225386004,
+            47.13030764926036
+          ]
+        },
+        "fixed": {
+          "samples": 2,
+          "median_decode_tok_s": 49.05001525227199,
+          "range_decode_tok_s": [
+            49.034305408437895,
+            49.065725096106085
+          ],
+          "median_ttft_seconds": 94.99771091996809,
+          "process_medians": [
+            49.065725096106085,
+            49.034305408437895
+          ]
+        }
+      },
+      "decode_gain_percent": 4.039864155331507,
+      "output_sha256": "625647b8667c3c81662fd1a28ece2a83d34ca6ef80c407b16b1832bfd0010951",
+      "greedy_identical": true,
+      "code_check": {
+        "passed": true,
+        "checks": 980
+      }
+    }
+  ],
+  "nsys": {
+    "comparison": [
+      {
+        "family": "SWA attention",
+        "calls_per_token": 39.0,
+        "baseline_ms_per_token": 1.179673714285715,
+        "fixed_ms_per_token": 0.41871685714285706,
+        "baseline_us_per_call": 30.248043956043976,
+        "fixed_us_per_call": 10.736329670329669,
+        "duration_reduction_percent": 64.50570593612086
+      }
+    ],
+    "saved_gpu_ms_per_token": 0.760956857142858,
+    "total_gpu_kernel_ms_per_token": {
+      "baseline": 17.530560857142856,
+      "fixed": 16.761044214285715
+    },
+    "notes": [
+      "Baseline waveform is the previous operator-profile run of the exact same aee58a1a library. Candidate waveform captures 14 interior decode steps (52..65), 1141 kernels/token.",
+      "Use unprofiled ABBA for throughput; NSYS kernel durations include profiler effects.",
+      "Microbenchmark uses repeated CUDA Graph launches with hot cache; do not equate it with real-model kernel durations."
+    ]
+  },
+  "validation": {
+    "standalone_cases_per_variant": 176,
+    "standalone_variants": 8,
+    "library_bit_exact_cases": 368,
+    "graph_cases": 2,
+    "cpu_reference_unit": "passed; includes 24 single-query SWA boundary cases",
+    "sanitizer": "memcheck, racecheck, synccheck each 44 actual API cases; zero errors/hazards",
+    "greedy_identical": true,
+    "code_checks": 980,
+    "quality_limit": "Targeted probes and fixed prompts, not broad model quality evaluation.",
+    "post_cleanup_library_bit_exact_cases": 368,
+    "post_cleanup_graph_cases": 2,
+    "post_cleanup_cpu_reference": "passed; includes 24 single-query SWA boundary cases",
+    "post_cleanup_sanitizer": "memcheck/racecheck/synccheck: 44 API cases and 2 graph cases each; zero errors/hazards",
+    "post_cleanup_sass_unchanged": {
+      "(anonymous namespace)::AttentionValuesTiled(float const*, __nv_bfloat16 const*, int const*, __nv_bfloat16*, int, int, int, int, int, int, int, bool)": {
+        "identical": true,
+        "before_sass_lines": 1088,
+        "after_sass_lines": 1088,
+        "before_sha256": "7a53926a854b31ecad23b388c23602983b9afc6728d0f5b188e588ce855cb243",
+        "after_sha256": "7a53926a854b31ecad23b388c23602983b9afc6728d0f5b188e588ce855cb243"
+      },
+      "(anonymous namespace)::AttentionValues(float const*, __nv_bfloat16 const*, int const*, __nv_bfloat16*, int, int, int, int, int, int, int, bool)": {
+        "identical": true,
+        "before_sass_lines": 1136,
+        "after_sass_lines": 1136,
+        "before_sha256": "2efb3c380a113d669e72d8a80d862b0eaee620f256b252368ac6d21312d4ffdb",
+        "after_sha256": "2efb3c380a113d669e72d8a80d862b0eaee620f256b252368ac6d21312d4ffdb"
+      },
+      "(anonymous namespace)::AttentionSwaDecode(__nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16 const*, float const*, __nv_bfloat16*, int, int, int)": {
+        "identical": true,
+        "before_sass_lines": 1808,
+        "after_sass_lines": 1808,
+        "before_sha256": "ce746007b38a047b9e56c41d98206ad153df7fa4c8122648026f251871725e8c",
+        "after_sha256": "ce746007b38a047b9e56c41d98206ad153df7fa4c8122648026f251871725e8c"
+      },
+      "(anonymous namespace)::AttentionShort(__nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16 const*, int const*, float const*, __nv_bfloat16*, int, int, int, int, int, int, int, int, int, bool)": {
+        "identical": true,
+        "before_sass_lines": 3696,
+        "after_sass_lines": 3696,
+        "before_sha256": "9f8e45b352b71c807bc5c332b0830de895f9ed7c5af5ac4f88b729dd651cdf03",
+        "after_sha256": "9f8e45b352b71c807bc5c332b0830de895f9ed7c5af5ac4f88b729dd651cdf03"
+      },
+      "(anonymous namespace)::AttentionSoftmax(float*, float const*, int, int)": {
+        "identical": true,
+        "before_sass_lines": 1376,
+        "after_sass_lines": 1376,
+        "before_sha256": "22b57b1e49f9f6593d2da1f07e4311fb51c3e0e256ee81cb0d829075dd52326c",
+        "after_sha256": "22b57b1e49f9f6593d2da1f07e4311fb51c3e0e256ee81cb0d829075dd52326c"
+      },
+      "(anonymous namespace)::AttentionScores(__nv_bfloat16 const*, __nv_bfloat16 const*, int const*, float*, int, int, int, int, int, int, int, int, bool)": {
+        "identical": true,
+        "before_sass_lines": 1744,
+        "after_sass_lines": 1744,
+        "before_sha256": "8fe2d55caca98e0919406c777872b2b66f1a8091cc0fea7e6fea661cc46ee439",
+        "after_sha256": "8fe2d55caca98e0919406c777872b2b66f1a8091cc0fea7e6fea661cc46ee439"
+      },
+      "(anonymous namespace)::IndexScores(float const*, float const*, __nv_bfloat16 const*, float*, int, int, int)": {
+        "identical": true,
+        "before_sass_lines": 176,
+        "after_sass_lines": 176,
+        "before_sha256": "43a263a986065b2ed083a8f0dd5a8f6de4dc45e0bdbdaf92433e4bac71a2d9bc",
+        "after_sha256": "43a263a986065b2ed083a8f0dd5a8f6de4dc45e0bdbdaf92433e4bac71a2d9bc"
+      },
+      "(anonymous namespace)::RoundIndexer(__nv_bfloat16 const*, float*, int, int, bool)": {
+        "identical": true,
+        "before_sass_lines": 464,
+        "after_sass_lines": 464,
+        "before_sha256": "3ca013301a8b9921b1a4722f7ff10a14d5ed76c79380916004a5ebc15b8f5d11",
+        "after_sha256": "3ca013301a8b9921b1a4722f7ff10a14d5ed76c79380916004a5ebc15b8f5d11"
+      },
+      "(anonymous namespace)::Rope(__nv_bfloat16*, float const*, int, int, int, float)": {
+        "identical": true,
+        "before_sass_lines": 944,
+        "after_sass_lines": 944,
+        "before_sha256": "5e5c0ede868e2ef2fa0b2042f65bbb9bde944a27e7378bf700cda28e7321a70c",
+        "after_sha256": "5e5c0ede868e2ef2fa0b2042f65bbb9bde944a27e7378bf700cda28e7321a70c"
+      },
+      "(anonymous namespace)::DecodeTopK(unsigned long long const*, int*, int, int)": {
+        "identical": true,
+        "before_sass_lines": 64,
+        "after_sass_lines": 64,
+        "before_sha256": "bb36eba50e1bfda6d40fd4b08bcd871f7518843ea1236684cc74f5ca59448fff",
+        "after_sha256": "bb36eba50e1bfda6d40fd4b08bcd871f7518843ea1236684cc74f5ca59448fff"
+      },
+      "(anonymous namespace)::EncodeTopK(float const*, unsigned long long*, int)": {
+        "identical": true,
+        "before_sass_lines": 64,
+        "after_sass_lines": 64,
+        "before_sha256": "faaf9776accaf7631bb3dabc41b0f5b5b3f48ce53ff73b5b2a94d6928112ed5d",
+        "after_sha256": "faaf9776accaf7631bb3dabc41b0f5b5b3f48ce53ff73b5b2a94d6928112ed5d"
+      },
+      "(anonymous namespace)::TrimCachePair(uint4*, uint4*, int, int, int, int)": {
+        "identical": true,
+        "before_sass_lines": 512,
+        "after_sass_lines": 512,
+        "before_sha256": "c38bdc2c5d8f017c1f0662900bc846040a5d04ec49d5b7c9abd1a3478f5d9cf6",
+        "after_sha256": "c38bdc2c5d8f017c1f0662900bc846040a5d04ec49d5b7c9abd1a3478f5d9cf6"
+      },
+      "void cub::CUB_300102_SM_1200::detail::radix_sort::DeviceRadixSortOnesweepKernel<cub::CUB_300102_SM_1200::detail::radix::policy_hub<unsigned long long, cub::CUB_300102_SM_1200::NullType, unsigned int>::Policy1000, (cub::CUB_300102_SM_1200::SortOrder)1, unsigned long long, cub::CUB_300102_SM_1200::NullType, unsigned int, int, int, cub::CUB_300102_SM_1200::detail::identity_decomposer_t>(int*, int*, unsigned int*, unsigned int const*, unsigned long long*, unsigned long long const*, cub::CUB_300102_SM_1200::NullType*, cub::CUB_300102_SM_1200::NullType const*, int, int, int, cub::CUB_300102_SM_1200::detail::identity_decomposer_t)": {
+        "identical": true,
+        "before_sass_lines": 3584,
+        "after_sass_lines": 3584,
+        "before_sha256": "ddf5274069529a0b0a550607c9f3cc52accbf57c82512c259998bbce99345443",
+        "after_sha256": "ddf5274069529a0b0a550607c9f3cc52accbf57c82512c259998bbce99345443"
+      },
+      "void cub::CUB_300102_SM_1200::detail::radix_sort::DeviceRadixSortExclusiveSumKernel<cub::CUB_300102_SM_1200::detail::radix::policy_hub<unsigned long long, cub::CUB_300102_SM_1200::NullType, unsigned int>::Policy1000, unsigned int>(unsigned int*)": {
+        "identical": true,
+        "before_sass_lines": 224,
+        "after_sass_lines": 224,
+        "before_sha256": "10dbe63d9b74c5b6539044fec6244e938aaacfb4ece9e690a5f7869f1fdde0a3",
+        "after_sha256": "10dbe63d9b74c5b6539044fec6244e938aaacfb4ece9e690a5f7869f1fdde0a3"
+      },
+      "void cub::CUB_300102_SM_1200::detail::radix_sort::DeviceRadixSortHistogramKernel<cub::CUB_300102_SM_1200::detail::radix::policy_hub<unsigned long long, cub::CUB_300102_SM_1200::NullType, unsigned int>::Policy1000, (cub::CUB_300102_SM_1200::SortOrder)1, unsigned long long, unsigned int, cub::CUB_300102_SM_1200::detail::identity_decomposer_t>(unsigned int*, unsigned long long const*, unsigned int, int, int, cub::CUB_300102_SM_1200::detail::identity_decomposer_t)": {
+        "identical": true,
+        "before_sass_lines": 1536,
+        "after_sass_lines": 1536,
+        "before_sha256": "67936aa3649d38efb3c356d4832f3fc23db89b332bfc092770c0358145c1ade3",
+        "after_sha256": "67936aa3649d38efb3c356d4832f3fc23db89b332bfc092770c0358145c1ade3"
+      },
+      "void cub::CUB_300102_SM_1200::detail::radix_sort::DeviceRadixSortSingleTileKernel<cub::CUB_300102_SM_1200::detail::radix::policy_hub<unsigned long long, cub::CUB_300102_SM_1200::NullType, unsigned int>::Policy1000, (cub::CUB_300102_SM_1200::SortOrder)1, unsigned long long, cub::CUB_300102_SM_1200::NullType, unsigned int, cub::CUB_300102_SM_1200::detail::identity_decomposer_t>(unsigned long long const*, unsigned long long*, cub::CUB_300102_SM_1200::NullType const*, cub::CUB_300102_SM_1200::NullType*, unsigned int, int, int, cub::CUB_300102_SM_1200::detail::identity_decomposer_t)": {
+        "identical": true,
+        "before_sass_lines": 992,
+        "after_sass_lines": 992,
+        "before_sha256": "48b16404948071732656bc211b34f67bdb0195d1be11039f722434fac125e46b",
+        "after_sha256": "48b16404948071732656bc211b34f67bdb0195d1be11039f722434fac125e46b"
+      },
+      "void cub::CUB_300102_SM_1200::detail::EmptyKernel<void>()": {
+        "identical": true,
+        "before_sass_lines": 32,
+        "after_sass_lines": 32,
+        "before_sha256": "d2ab0a9d52119821ea13bc6b01be6bd595fd9223e41aacbedf83532e2d322f1f",
+        "after_sha256": "d2ab0a9d52119821ea13bc6b01be6bd595fd9223e41aacbedf83532e2d322f1f"
+      }
+    }
+  },
+  "changes": [
+    "Shared fixed shape constants between dispatch and kernel; no new runtime environment switches.",
+    "Single-query causal sliding attention: four output slices and cooperative shared-memory V staging, with original score/softmax rounding, reduction tree and ordered FP32 FMA.",
+    "Keep short/full/sparse attention fallback paths and their independent correctness checks."
+  ]
+}
