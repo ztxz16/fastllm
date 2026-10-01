@@ -190,6 +190,7 @@ int main() {
         TestAttention(127, 128, false, true);
         TestAttention(7, 0, false, false);
         TestAttention(2057, 0, true, false);
+        TestAttention(2057, 0, true, false, 1);
         TestAttention(127, 128, false, true, 1);
         TestAttention(255, 0, false, false, 1);
         TestAttention(256, 0, false, true, 1);
@@ -197,6 +198,9 @@ int main() {
         TestIndexer(true, true);
         TestIndexer(false, true);
         TestIndexer(false, false);
+        TestIndexer(true, true, 1);
+        TestIndexer(false, true, 1);
+        TestIndexer(false, false, 1);
         auto *pool = GetAlivePool();
         auto active = pool->curActivateThreadInterval;
         pool->curActivateThreadInterval = {1, 4};

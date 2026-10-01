@@ -308,8 +308,7 @@ Data NaiveN05FlashModel::RunTarget(
                                   cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
                                   localPast, slidingLayers[layer] ? window : 0, attn);
         if (slidingLayers[layer] && (!capture || !capture->verifying)) {
-            TrimCache(pastKey, window - 1);
-            TrimCache(pastValue, window - 1);
+            FastllmCudaNaiveTrimCache(pastKey, pastValue, window - 1);
         }
         Linear(attn, weight[ap + "o_proj.weight"], Data(), projected);
         AddTo(hidden, projected);

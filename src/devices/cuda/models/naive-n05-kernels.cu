@@ -3,6 +3,7 @@
 #include "utils.h"
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include <cub/device/device_radix_sort.cuh>
 #include <algorithm>
 #include <cmath>
 #include <numeric>
@@ -26,6 +27,35 @@ void CheckLaunch() {
     auto status = cudaGetLastError();
     fastllm::AssertInFastLLM(status == cudaSuccess,
         std::string("Naive-N0.5 CUDA: ") + cudaGetErrorString(status));
+}
+
+// Each thread owns a disjoint 16-byte column. Moving rows in increasing order
+// is overlap-safe even when dropping just one row; no other thread touches
+// that column. K and V share a launch and retain their reserved capacity.
+__global__ void TrimCachePair(uint4 *key, uint4 *value, int keyColumns,
+                              int valueColumns, int drop, int keep) {
+    int column = blockIdx.x * blockDim.x + threadIdx.x;
+    uint4 *data = column < keyColumns ? key : value;
+    int columns = column < keyColumns ? keyColumns : valueColumns;
+    if (column >= keyColumns) column -= keyColumns;
+    if (column >= columns) return;
+    for (int row = 0; row < keep; ++row)
+        data[(size_t)row * columns + column] = data[(size_t)(row + drop) * columns + column];
+}
+
+__global__ void EncodeTopK(const float *scores, unsigned long long *order, int count) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    float score = scores[i];
+    // The CPU comparator treats -0 and +0 as tied.
+    unsigned bits = score == 0.0f ? 0u : __float_as_uint(score);
+    unsigned ordered = (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
+    order[i] = ((unsigned long long)ordered << 32) | (0xffffffffu - (unsigned)i);
+}
+__global__ void DecodeTopK(const unsigned long long *order, int *indices,
+                           int count, int topK) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < topK) indices[i] = i < count ? (int)(0xffffffffu - (unsigned)order[i]) : -1;
 }
 
 struct IndexerTopKOp : fastllm::MultiThreadBaseOp {
@@ -138,7 +168,10 @@ __global__ void AttentionScores(const BF16 *q, const BF16 *k, const int *indices
     int query = blockIdx.y, h = blockIdx.x;
     int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     int kvHead = h / (heads / kvHeads);
-    for (int slot = warp; slot < count; slot += 8) {
+    // Decode spreads key tiles over SMs while preserving each dot's reduction.
+    int first = gridDim.z > 1 ? blockIdx.z * 64 : 0;
+    int end = gridDim.z > 1 ? min(count, first + 64) : count;
+    for (int slot = first + warp; slot < end; slot += 8) {
         int key = KeyIndex(indices, query, slot, count, past, window);
         float dot = 0;
         bool valid = key >= 0 && key < keys && (!causal || key <= past + query);
@@ -256,6 +289,89 @@ __global__ void AttentionValues(const float *prob, const BF16 *v, const int *ind
     }
     out[((size_t)query * heads + h) * dim + d] = __float2bfloat16(sum);
 }
+
+// Cooperatively stage a tile of V instead of issuing one dependent global
+// load for each of 2048 slots. Output dimensions form separate CTAs; each
+// output keeps exactly the original slot order and FP32 FMA accumulation.
+__global__ void AttentionValuesTiled(const float *prob, const BF16 *v,
+        const int *indices, BF16 *out, int heads, int kvHeads, int dim,
+        int keys, int count, int past, int window, bool causal) {
+    __shared__ BF16 values[64][32];
+    __shared__ float probabilities[64];
+    __shared__ int selected[64];
+    int h = blockIdx.x, query = blockIdx.y, t = threadIdx.x;
+    int d = blockIdx.z * 32 + t, kvHead = h / (heads / kvHeads);
+    float sum = 0;
+    const float *p = prob + ((size_t)query * heads + h) * count;
+    for (int first = 0; first < count; first += 64) {
+        if (t < 64) {
+            int slot = first + t;
+            int key = slot < count ? KeyIndex(indices, query, slot, count, past, window) : -1;
+            bool valid = key >= 0 && key < keys && (!causal || key <= past + query);
+            selected[t] = valid ? key : -1;
+            probabilities[t] = slot < count ? p[slot] : 0;
+        }
+        __syncthreads();
+        for (int i = t; i < 64 * 32; i += 256) {
+            int row = i / 32, col = blockIdx.z * 32 + i % 32;
+            int key = selected[row];
+            values[row][i % 32] = key >= 0 && col < dim
+                ? v[((size_t)key * kvHeads + kvHead) * dim + col] : __float2bfloat16(0);
+        }
+        __syncthreads();
+        if (t < 32 && d < dim) {
+            for (int row = 0; row < min(64, count - first); ++row)
+                if (selected[row] >= 0) sum += probabilities[row] * (float)values[row][t];
+        }
+        __syncthreads();
+    }
+    if (t < 32 && d < dim) out[((size_t)query * heads + h) * dim + d] = __float2bfloat16(sum);
+}
+}
+
+void FastllmCudaNaiveTrimCache(fastllm::Data &key, fastllm::Data &value, int keep) {
+    using namespace fastllm;
+    AssertInFastLLM(keep >= 0 && key.dims.size() == 3 && value.dims.size() == 3 &&
+        key.dims[0] == 1 && value.dims[0] == 1 && key.dims[1] == value.dims[1] &&
+        key.dataType == BFLOAT16 && value.dataType == BFLOAT16 &&
+        key.dataDevice == DataDevice::CUDA && value.dataDevice == DataDevice::CUDA &&
+        key.dataDeviceIds == value.dataDeviceIds && key.dims[2] % 8 == 0 && value.dims[2] % 8 == 0,
+        "Invalid Naive-N0.5 sliding cache layout.");
+    if (key.dims[1] <= keep) return;
+    int kc = key.dims[2] / 8, vc = value.dims[2] / 8;
+    TrimCachePair<<<(kc + vc + 255) / 256, 256>>>((uint4 *)key.cudaData,
+        (uint4 *)value.cudaData, kc, vc, key.dims[1] - keep, keep);
+    CheckLaunch();
+    key.Resize({1, keep, key.dims[2]});
+    value.Resize({1, keep, value.dims[2]});
+}
+
+void FastllmCudaNaiveTopK(const fastllm::Data &scores, int queryStart, int topK,
+                         fastllm::Data &indices) {
+    using namespace fastllm;
+    AssertInFastLLM(scores.dataDevice == DataDevice::CUDA && scores.dataType == FLOAT32 &&
+        scores.dims.size() == 2 && scores.dims[0] == 1 && queryStart >= 0 &&
+        queryStart < scores.dims[1] && topK > 0, "Invalid Naive-N0.5 decode TopK.");
+    int count = queryStart + 1;
+    Data encoded, sorted, workspace;
+    Output(encoded, INT32, {count, 2});
+    Output(sorted, INT32, {count, 2});
+    Output(indices, INT32, {1, topK});
+    auto *input = (unsigned long long *)encoded.cudaData;
+    auto *output = (unsigned long long *)sorted.cudaData;
+    size_t bytes = 0;
+    // Match FastLLM's per-thread default stream explicitly: CCCL's launcher
+    // may use the driver API, where a null stream denotes the legacy stream.
+    auto status = cub::DeviceRadixSort::SortKeysDescending(nullptr, bytes, input, output,
+        count, 0, 64, cudaStreamPerThread);
+    AssertInFastLLM(status == cudaSuccess, "Naive-N0.5 TopK workspace query failed.");
+    Output(workspace, INT32, {(int)((bytes + 3) / 4)});
+    EncodeTopK<<<(count + 255) / 256, 256>>>((const float *)scores.cudaData, input, count);
+    status = cub::DeviceRadixSort::SortKeysDescending(workspace.cudaData, bytes, input, output,
+        count, 0, 64, cudaStreamPerThread);
+    AssertInFastLLM(status == cudaSuccess, "Naive-N0.5 GPU TopK failed.");
+    DecodeTopK<<<(topK + 255) / 256, 256>>>(output, (int *)indices.cudaData, count, topK);
+    CheckLaunch();
 }
 
 void FastllmCudaNaiveRope(fastllm::Data &input, const fastllm::Data &positions,
@@ -287,6 +403,10 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
         (float *)scores.cudaData, heads, keys, queryStart);
     CheckLaunch();
     // The stable tie rule in the released model selects the earliest key.
+    if (queries == 1) {
+        FastllmCudaNaiveTopK(scores, queryStart, topK, indices);
+        return;
+    }
     // Keep selection bounded to one prefill chunk, and transfer only scores.
     scores.ToDevice(DataDevice::CPU);
     indices.ToDevice(DataDevice::CPU);
@@ -318,13 +438,19 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
     }
     Data scores;
     Output(scores, DataType::FLOAT32, {queries, heads, count});
-    AttentionScores<<<dim3(heads, queries), 256>>>((const BF16 *)query.cudaData,
+    AttentionScores<<<dim3(heads, queries, queries == 1 ? (count + 63) / 64 : 1), 256>>>((const BF16 *)query.cudaData,
         (const BF16 *)key.cudaData, selected, (float *)scores.cudaData,
         heads, kvHeads, dim, key.dims[2], keys, count, pastLength, window, causal);
     AttentionSoftmax<<<queries * heads, 256>>>((float *)scores.cudaData,
         sink.dims.empty() ? nullptr : (const float *)sink.cudaData, heads, count);
-    AttentionValues<<<dim3(heads, queries), 256>>>((const float *)scores.cudaData,
-        (const BF16 *)value.cudaData, selected, (BF16 *)output.cudaData,
-        heads, kvHeads, valueDim, keys, count, pastLength, window, causal);
+    if (queries == 1) {
+        AttentionValuesTiled<<<dim3(heads, queries, (valueDim + 31) / 32), 256>>>((const float *)scores.cudaData,
+            (const BF16 *)value.cudaData, selected, (BF16 *)output.cudaData,
+            heads, kvHeads, valueDim, keys, count, pastLength, window, causal);
+    } else {
+        AttentionValues<<<dim3(heads, queries), 256>>>((const float *)scores.cudaData,
+            (const BF16 *)value.cudaData, selected, (BF16 *)output.cudaData,
+            heads, kvHeads, valueDim, keys, count, pastLength, window, causal);
+    }
     CheckLaunch();
 }
