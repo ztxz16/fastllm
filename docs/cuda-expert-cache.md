@@ -37,10 +37,118 @@ or BF16 activations. The V4.1 adapter has a separate BF16 contract:
 
 | Expert weights | Host/cache record | Compute requirements |
 | --- | --- | --- |
+| GGUF `Q*`, `IQ*`, F32/F16/BF16 | Original ordinary GGUF blocks, including their embedded scales | Each projection width must contain complete quantization blocks; mixed gate/down types and different layer widths are supported |
 | `NVFP4_BLOCK_16_E4M3` | Packed E2M1 weights, planar E4M3 block scales, global scales | Existing compact NVFP4 adapter |
 | `FP8_E4M3` | Original E4M3 bytes and FP32 block-scale arrays for gate/up and down | Hidden/intermediate widths and column scale blocks divisible by 4 |
 | `FP8_E4M3_BLOCK_128` | Original interleaved 128-byte weight blocks and FP32 scales | Hidden/intermediate widths divisible by 128 |
 | DeepSeek V4.1 `NVFP4_BLOCK_32_E8M0` | 16 packed E2M1 bytes and one UE8M0 scale per 32 weights | BF16 decode and 2–8-row verification; NUMA weights and widths divisible by 32 |
+
+The generic GGUF adapter accepts Q2_0, Q4_0/Q4_1, Q5_0/Q5_1,
+Q8_0/Q8_1, Q2_K–Q6_K, IQ1_S/IQ1_M, IQ2_XXS/IQ2_XS/IQ2_S,
+IQ3_XXS/IQ3_S, IQ4_NL/IQ4_XS, and F32/F16/BF16. Gate/up and down
+may have different types; layers share an LRU pool with the largest record
+stride, while each layer retains its own shapes, types and down offset.
+Experts within a layer must have matching projection layouts. Gate/up rows
+use ordinary concatenated `[gate, up]` order. CPU R4/interleaved layouts are
+not admitted as ordinary GGUF blocks.
+
+The GGUF fast path quantizes input and SwiGLU activations to Q8_1 and uses
+DP4A integer dots for Q2_0, IQ1_M, IQ2_XXS, IQ2_XS and IQ2_S projections.
+Each warp computes one output row; a block shares the activation and codebook.
+Both projection types must be supported, widths must contain complete blocks,
+and widths above 24,576 use the floating-point fallback. A per-device workspace
+is allocated before graph capture and reused across layers and batch rows.
+For hidden size 2,560 and intermediate size 640 it uses 353,600 bytes, separate
+from the expert-record budget. Other formats retain the register-dequantized
+floating-point kernels. Selection depends on projection types, dimensions and
+available workspace, without an environment override. Q8_1 activation
+quantization changes numerical results and can change generated tokens.
+
+Both paths accumulate in FP32 and round projection/SwiGLU results to the
+activation type. With registered NUMA weights, GGUF also uses the existing
+hybrid decode scheduler: resident experts run on CUDA and CPU workers compute
+cache misses concurrently. Tensor parallel decode assigns expert ownership
+across its GPUs and reduces unweighted per-expert results once. Each GPU has
+its own cache budget; for example, `--moe_cuda_cache 2g` with two GPUs allows
+approximately 4 GiB of expert records in total.
+The low-level cache hit/miss counters describe CUDA cache lookups/refills;
+hybrid CPU-only routes do not all reach those lookups. Use the expert-parallel
+CPU/GPU route counters to measure the fraction of all routes served by GPUs.
+
+Eager expert-parallel planning reads a mapped host residency mirror updated
+by the GPU LRU kernel, including during graph replay. Each rank drains its
+stream before reading the mirror, so prefill and ordinary cache calls may
+safely change residency between decode calls. Devices without a host mapping
+retain the device-lookup fallback. This removes the per-layer lookup kernel
+and residency readback without changing slot ownership or eviction policy.
+For single-row decode, NUMA gate/up jobs run while the caller submits CUDA
+expert work; down-projection jobs retain their gate/up completion dependency.
+The independent shared branch is submitted before cache admissions, so a
+future-token refill does not hold up that branch. Multi-row CPU subsets keep
+their existing grouped/row-wise scheduling.
+
+The CPU adapter accepts its existing Q8_0, Q8_1, Q8_K and Q8_K32 activation
+formats. Q8_0 SwiGLU quantization is fused into complete 32-value blocks;
+other formats use the ordinary whole-row quantizer. CPU shard boundaries and
+GEMM task boundaries must meet the corresponding block/row alignment rules.
+FP32 hybrid decode and small batches reuse the FP8/NVFP4 scheduling paths;
+unsupported CPU layouts or input types retain the existing fallback.
+
+The immutable mapped host snapshot is made before destructive NUMA repacking.
+It adds host RAM usage, approximately the number of experts times the largest
+record stride, in addition to CPU expert storage. Pure GPU expert execution
+with on-demand refills remains available through the cache operator without
+NUMA registration. Decode and verification batches of up to nine rows use
+the cache; larger prefill batches retain the configured CPU/NUMA backend.
+
+## GPU-resident GGUF experts
+
+SwiGLU decode and small batches use these fused kernels when every routed
+expert in a layer is already on the same GPU. This path is enabled automatically
+for ordinary GGUF tensors with matching layouts within each layer and FP32,
+FP16 or BF16 activations. It does not need an expert-cache budget. Larger batches
+use grouped MMQ where supported. Shared experts inside the same operator,
+repacked layouts and incompatible placements retain the existing operator paths.
+
+A layer uploads only its gate/up and down pointers: 8 KiB for 512 experts.
+The kernels read route IDs and scores directly on CUDA, without copying route
+IDs back to the CPU or duplicating the weights. Q8-supported formats use the
+same five-kernel DP4A sequence as the cache; other supported formats use the
+floating-point fused kernels. Scratch storage belongs to the invocation, and
+pointer tables are invalidated when any participating tensor moves, frees its
+storage or is destroyed. Warm the layer before CUDA Graph capture so its
+pointer table already exists.
+
+Cached, resident and streamed experts select their supported kernels
+automatically. Different reduction orders can change generated tokens;
+the optimized and fallback paths are not guaranteed to be bitwise identical.
+
+For a Qwen4-Exp target GGUF without embedded MTP weights, attach a
+`qwen4exp-mtp` GGUF using `--draft /path/to/mtp.gguf --mtp 3`.
+The auxiliary file uses HF `mtp.*` tensor names, raw HF norm weights, and
+packed `gate_up_proj` / `down_proj` expert tensors. Loading splits the expert
+axis while retaining ordinary quantized blocks and applies the norm offset
+once. Target and draft host expert tables share the same GGUF LRU pool and
+expert-record budget; draft dense weights and verifier state use additional
+memory. The existing Qwen4 MTP generation constraints still apply.
+
+After warmup, read or reset counters outside timed inference:
+
+```python
+from ftllm import llm
+before = llm.get_moe_cuda_cache_stats(device=0, reset=True)
+# Run the measured requests here.
+after = llm.get_moe_cuda_cache_stats(device=0)
+print(after["hit_rate"], after["payload_bytes"], after["slots"])
+```
+
+The query synchronizes the selected CUDA device and aggregates prepared
+cache groups. Reset clears hits/misses while preserving cached weights and
+LRU ages. Report actual `payload_bytes`, since free-memory reservation can
+reduce the requested capacity. Route counters follow the shared LRU's
+convention: each unique missing expert in a row counts one refill miss;
+additional duplicate routes count as hits. Invalid expert IDs are excluded.
+The API raises an error on builds without GPU cache statistics.
 
 Records remain quantized; FP8 is not expanded to BF16 in the cache. FP8 slot
 pointer tables share one allocation before capture: two weight tables for
@@ -98,8 +206,9 @@ CPU/GPU split can therefore change logits and greedy tokens, including between
 repeated requests; cache enablement does not promise bitwise CPU equivalence.
 NUMA prefill also selects CPU/GPU experts by timing when the cache is disabled.
 For numerical comparisons, set the existing `FT_EXPERT_LIMIT=0` in both runs
-to hold prefill on CPU; this is a diagnostic setting, not a recommended
-throughput setting.
+to assign prefill experts to GPU whenever GPU assistance is supported. Use
+`FT_GPU_PREFILL=0` to hold these experts on CPU. These are diagnostic settings,
+not recommended throughput settings.
 
 To distinguish backend precision from implementation errors, compare expert
 operators with identical inputs and routes before comparing whole-model logits.
@@ -417,9 +526,99 @@ packing and CPU outputs with and without AVX512-BF16 across row-tile boundaries.
 Architecture compilation and execution are distinct checks: compiling these
 tests for another SM does not establish its runtime correctness or performance.
 
+GPU-resident GGUF experts also accept 1–32 input rows with CUDA routing tensors.
+The batched gate/up, down and reduction kernels retain each row's single-token
+expert order and rounding. Q8 activations and partial results use caller-owned
+scratch sized for the actual row and route counts; weights remain packed.
+`cuda_gguf_moe_cache_test` checks all 24 admitted GGUF formats against a CPU
+oracle and compares batched results bitwise with individual rows, including
+four-row MTP verification, invalid/duplicate routes and graph replay.
+With `USE_NUMAS`, its `--hybrid` mode checks CPU subsets against serial
+GEMM/quantization and bounds the combined CPU/GPU result using independent
+per-expert outputs. It covers mixed formats and widths across layers,
+single-device and two-device execution, and duplicate/zero/negative routes.
+For larger resident prefill batches, NVIDIA SM75+ can group routes on the GPU
+and reuse packed expert tiles with MMQ. Gate/up supports Q2_0 and IQ2_XXS/XS/S;
+IQ1_M gate/up retains its Q8 dot fallback. Down supports Q2_0 and IQ2_XXS/XS/S.
+The path accepts up to 4096 rows subject to route and workspace limits, without
+a persistent dequantized weight copy or host route synchronization. Q2_0 K
+tails, including 320-column TP shards, are masked before loading weights.
+Other types/shapes retain the ordinary prefill fallback. Large-batch MMQ is
+checked against independent CPU gate/up and down oracles: changed accumulation
+order can cross a later Q8 rounding boundary. It does not promise bitwise equality
+to single-row inference; the 1–32-row decode/verifier path remains unchanged.
+Set `--chunked_prefill_size` above 32 to use this path (for example, 512 or
+1024, subject to available activation/workspace memory).
+`cuda_gguf_moe_grouped` covers uneven groups, all routes selecting one expert,
+empty groups, graph replay, three activation types and actual TP shards.
+`cuda_data_device_test` requires two GPUs and checks source-device CPU reads
+and CUDA clones while the caller is on the other GPU. These checks protect
+CPU embedding handoffs and MTP checkpoints without per-operator synchronization.
+
+Qwen4-Exp GGUF checkpoints support resident tensor parallel experts with
+`--tp 2 --moe_device cuda:0,1 --moe_cuda_cache 0`. Gate/up rows and down columns
+use the same intermediate slice, aligned to the down weight's GGUF block and
+the 32-value Q8 activation block. A 640-wide Q2_0 expert therefore splits into
+320 columns on each rank without dequantizing or requantizing its weights.
+Packed GGUF output heads split by vocabulary row. CPU token embeddings share
+one immutable host table across ranks; `--low_gpu_mem` keeps that policy explicit
+when CUDA Graph is enabled. CUDA embedding operators honor `lockInCPU`.
+
+Resident eager TP2 reductions use peer access for aligned FP32/FP16/BF16
+tensors up to 288 KiB. Each thread reads its packed inputs before either rank
+overwrites them, so the reduction supports in-place storage and changing
+temporary addresses. Captured execution, larger messages and unsupported peer
+topologies retain NCCL. Topology, tensor size, alignment and capture state
+determine eligibility automatically.
+`cuda_gguf_tp_shards_test` checks packed byte conservation and independent CPU
+expert results on both ranks, including 320/320 splitting and four-row MTP.
+`cuda_tp2_reduce_test` queues changing shapes, alternating buffers, in-place
+and separate outputs, and delayed rank streams without intermediate host
+synchronization. It also checks collective rejection and recovery for an
+unaligned destination, and dtype-rounded residual additions with changing
+inputs and delayed peer streams.
+
 The V4.1 `cuda_dsv41_moe_cache_test --dual` integration test uses an independent
 FP8/BF16 dense oracle for CPU subsets, hybrid/pure decode and 2–8-row verify.
 It covers all 4096 FP4 code/scale combinations, repeated and zero-weight routes,
 cold admission, eviction, CPU/GPU prefill, unregistered NVFP4 cold startup,
 asymmetric budgets and GPU 0/1/0 output
 movement. `--dual --verify-only` limits it to multirow verification.
+
+## Measured GPU-resident GGUF configuration
+
+The [Qwen3.8-Flash-Next benchmark](qwen3.8-flash-next/README_EN.md#gguf-resident-performance)
+records the 2026-10-01 cleanup build on two 22 GiB RTX 2080 Ti cards:
+70.87 token/s decode (512 input / 512 output, chunk 32) and 1205.13 token/s
+for 4096-token prefill (chunk 1024), each the median of three measured runs
+after warmup. MTP is off and CUDA Graph is on. Expert weights remain on GPU
+with zero expert-cache budget; embedding remains on CPU and PLE uses disk.
+Per-GPU logical weights are 19.36 GiB, used memory after loading is about
+20.21 GiB, and sampled peaks are 21.06 / 20.84 GiB.
+[Machine-readable results](benchmarks/qwen38_flash_next_iq2xs_2080ti_20261001.json)
+include configuration, timing definitions, per-run data and validation limits.
+
+## GGUF NUMA GPU-assisted prefill
+
+NUMA prefill retains its CPU/GPU expert scheduler. For supported 33–4096-row
+batches, each GPU worker uploads its selected expert subset into reusable
+scratch and calls the grouped packed-weight MMQ kernels. CPU-selected experts
+continue to run on NUMA. The GPU restores IQ2_XXS/XS/S R4 and cross-SwiGLU row
+layouts without modifying host weights or retaining a second model snapshot.
+Q2_0 gate/up weights are also supported; down weights use Q2_0 or
+IQ2_XXS/XS/S. IQ1_M retains per-expert GEMM for host prefill: the current
+grouped IQ1_M gate kernel uses per-route DP4A and loses batch weight reuse.
+FP32, FP16 and BF16 activations are accepted on NVIDIA SM75 or newer.
+
+Scratch includes the current worker's uploaded and restored packed weights,
+route metadata, grouped MMQ products and activations. It is reused across
+layers on the same device, separately from the expert-cache payload budget.
+Admission checks the entire selected subset, workspace size and available
+memory before uploading weights. Shared experts inside the operator,
+incompatible shapes/types, small decode batches, CUDA Graph capture and
+insufficient memory retain the existing per-expert implementation.
+Q8 activation quantization can change logits and generated tokens.
+
+`cuda_gguf_moe_host` checks the CPU R4 repacker against an independent decoded
+weight oracle, cross/non-cross gate/up layouts, selected subset changes,
+NUMA row shards, both GPUs, three activation types and immutable host storage.

@@ -184,3 +184,42 @@ WebUI 连接已经启动的 API 服务。需要工具调用时，可在服务启
 | TP2，固定 12 层专家 | 1321.08 | 22.57 | 37.82 |
 
 这组数据中，TP2 + 每卡 8 GiB 专家缓存的解码较快，TP2 固定 12 层专家的长输入处理较快。实际速度随输入、输出内容和硬件而变化。
+
+<a id="gguf-resident-performance"></a>
+
+### GGUF IQ2_XS：双卡专家常驻 GPU（2026-10-01）
+
+使用清理后的 GGUF 实现，在同一台双 22 GiB RTX 2080 Ti / EPYC 7452 机器复测 `Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS`。主干和专家使用 TP2，FP16 激活，CUDA Graph 开启，MTP 关闭且不加载外部 MTP 权重。专家缓存预算为 0；所有专家权重以原生 GGUF 格式驻留 GPU。embedding 仍在 CPU（`--low_gpu_mem`），PLE 使用磁盘，因此这里的纯 GPU 指 Dense/MoE 计算和专家驻留。
+
+核心启动参数如下。两个 GGUF 分片需放在同一目录，模型路径指向第一分片；每组测试按表格调整 `--chunked_prefill_size`。
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 FASTLLM_CUDA_GRAPH=1 FT_NUMAS=1 \
+ftllm server /data/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf \
+  --tp 2 --device cuda:0,1 --moe_device cuda:0,1 \
+  --atype float16 --low_gpu_mem --ngram_device disk --threads 28 \
+  --moe_cuda_cache 0 --mtp 0 --max_batch 1 --tokens 8192 \
+  --kv_cache_limit 1g --gpu_mem_ratio 0.95 --chunked_prefill_size 1024 \
+  --prefix_cache false --cache_history false --enable_thinking false \
+  --temperature 0 --top_k 1 --repeat_penalty 1
+```
+
+测速直接调用原生生成接口，无 HTTP 开销或 profiler；greedy、batch=1，每组先预热，再正式测三轮并取中位数。解码为 512 输入、512 输出，速度按 `511 / (末 token 时间 - 首 token 时间)` 计算；prefill 为 4096 输入、1 输出，速度按 `4096 / TTFT` 计算，包含首 token 延迟。
+
+| 测试 | Chunk | 三轮速度（token/s） | 中位数（token/s） | TTFT 中位数（秒） |
+| --- | ---: | --- | ---: | ---: |
+| 解码 | 32 | 71.11 / 70.87 / 70.61 | **70.87** | 1.23 |
+| 解码 | 512 | 69.99 / 69.77 / 69.56 | **69.77** | 0.49 |
+| 4096 prefill | 1024 | 1206.47 / 1205.13 / 1200.43 | **1205.13** | 3.40 |
+
+同一 chunk 的三轮输出一致；不同 chunk 的输出从第 200 个 token 开始不同，不能将约 1.6% 的解码差异单独归因于 chunk。这组模型、放置和 Graph 配置也不同于上方 NVFP4 混推记录，不构成量化格式之间的受控对比。
+
+| 显存（GiB） | GPU0 | GPU1 |
+| --- | ---: | ---: |
+| 逻辑权重 | 19.3554 | 19.3554 |
+| 加载及初始化预热完成后已用 | 20.2088 | 20.2049 |
+| 全程采样峰值 | 21.0586 | 20.8379 |
+
+逻辑权重来自 TP 初始化清单，加载后显存来自 `cudaMemGetInfo`，峰值由 `nvidia-smi` 每 2 秒采样，可能遗漏短暂峰值。CPU embedding 为 2.368 GiB；主机进程 HWM 为 41.905 GiB，swap 为 0。每卡 49,152 个专家 gate/up、down 张量均为 GPU 原生 GGUF；所有请求的 CPU/混合 MoE 路径计数、专家缓存 hits/misses/payload 及 MTP verifier 调用均为 0。算术和 JSON 校验通过，chunk=1024 的 4096 prefill 全部完成，无 OOM。
+
+[完整三轮数据、配置及校验信息](../benchmarks/qwen38_flash_next_iq2xs_2080ti_20261001.json)。此次测速使用带诊断计数的隔离构建，原生库 SHA256 为 `0e9aa1b66b2d502e150395a40bfca36f2b43c0ea937329f43f89d60861add82b`；没有覆盖已安装版本。

@@ -184,3 +184,42 @@ These NVFP4 measurements were recorded on 2026-09-29 with the two 22 GiB RTX 208
 | TP2, 12 fixed expert layers | 1321.08 | 22.57 | 37.82 |
 
 In this measurement, TP2 with an 8 GiB cache per GPU had the highest decode rate, while TP2 with 12 fixed expert layers had the highest prefill rate. Actual speed varies with the workload and hardware.
+
+<a id="gguf-resident-performance"></a>
+
+### GGUF IQ2_XS: experts resident on two GPUs (2026-10-01)
+
+The cleaned-up GGUF implementation was measured on the same two 22 GiB RTX 2080 Ti cards and EPYC 7452, using `Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS`. Dense layers and experts use TP2 with FP16 activations and CUDA Graph enabled. MTP is disabled and no external MTP weights are loaded. The expert-cache budget is zero; all expert weights remain in their native GGUF format on the GPUs. Embedding stays on CPU (`--low_gpu_mem`) and PLE uses disk, so “GPU-only” here refers to Dense/MoE computation and expert residency.
+
+Keep both GGUF shards in the same directory and pass the first shard as the model. The main startup parameters are below; change `--chunked_prefill_size` for each group in the table.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 FASTLLM_CUDA_GRAPH=1 FT_NUMAS=1 \
+ftllm server /data/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf \
+  --tp 2 --device cuda:0,1 --moe_device cuda:0,1 \
+  --atype float16 --low_gpu_mem --ngram_device disk --threads 28 \
+  --moe_cuda_cache 0 --mtp 0 --max_batch 1 --tokens 8192 \
+  --kv_cache_limit 1g --gpu_mem_ratio 0.95 --chunked_prefill_size 1024 \
+  --prefix_cache false --cache_history false --enable_thinking false \
+  --temperature 0 --top_k 1 --repeat_penalty 1
+```
+
+Timing uses the native generation API without HTTP overhead or a profiler, with greedy sampling and batch size 1. Each group has one warmup followed by three measured requests; the table reports medians. Decode uses 512 input and 512 output tokens, calculated as `511 / (last token arrival - first token arrival)`. Prefill uses 4096 input tokens and one output token, calculated as `4096 / TTFT`, including first-token latency.
+
+| Test | Chunk | Three runs (token/s) | Median (token/s) | Median TTFT (s) |
+| --- | ---: | --- | ---: | ---: |
+| Decode | 32 | 71.11 / 70.87 / 70.61 | **70.87** | 1.23 |
+| Decode | 512 | 69.99 / 69.77 / 69.56 | **69.77** | 0.49 |
+| 4096-token prefill | 1024 | 1206.47 / 1205.13 / 1200.43 | **1205.13** | 3.40 |
+
+Outputs match across the three runs within each chunk group. The two chunk groups diverge at output token 200, so the roughly 1.6% decode-rate difference cannot be attributed solely to chunk size. Model, placement and Graph settings also differ from the NVFP4 hybrid results above; these are not a controlled comparison of quantization formats.
+
+| GPU memory (GiB) | GPU0 | GPU1 |
+| --- | ---: | ---: |
+| Logical weights | 19.3554 | 19.3554 |
+| Used after loading and initialization warmup | 20.2088 | 20.2049 |
+| Sampled peak over the run | 21.0586 | 20.8379 |
+
+Logical weights come from the TP preparation manifest, loaded memory from `cudaMemGetInfo`, and peaks from `nvidia-smi` sampled every two seconds, which may miss short transients. CPU embedding occupies 2.368 GiB; process host-memory HWM was 41.905 GiB with zero swap. Each GPU holds 49,152 native GGUF expert gate/up and down tensors. CPU/hybrid MoE path counters, expert-cache hits/misses/payload and MTP verifier calls remain zero for all requests. Arithmetic and JSON checks pass, and every 4096-token prefill at chunk=1024 completes without OOM.
+
+[Full per-run data, configuration and validation](../benchmarks/qwen38_flash_next_iq2xs_2080ti_20261001.json). This measurement used an isolated build with diagnostic counters, native library SHA256 `0e9aa1b66b2d502e150395a40bfca36f2b43c0ea937329f43f89d60861add82b`; the installed package was unchanged.

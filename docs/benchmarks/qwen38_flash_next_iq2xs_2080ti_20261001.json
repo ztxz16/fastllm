@@ -1,0 +1,237 @@
+{
+  "native_sha256": "0e9aa1b66b2d502e150395a40bfca36f2b43c0ea937329f43f89d60861add82b",
+  "decode": {
+    "32": {
+      "input_tokens": 512,
+      "output_tokens": 512,
+      "runs_tps": [
+        71.10544357393174,
+        70.87415243633049,
+        70.60770585047842
+      ],
+      "median_tps": 70.87415243633049,
+      "ttft_s": [
+        1.2223566039465368,
+        1.2314065319951624,
+        1.238787628011778
+      ],
+      "identical_outputs": true,
+      "output_sha256": [
+        "e49164772cf9b0d049c8e8617e084ac168d6d8e72baf687420951747bdf47237",
+        "e49164772cf9b0d049c8e8617e084ac168d6d8e72baf687420951747bdf47237",
+        "e49164772cf9b0d049c8e8617e084ac168d6d8e72baf687420951747bdf47237"
+      ]
+    },
+    "512": {
+      "input_tokens": 512,
+      "output_tokens": 512,
+      "runs_tps": [
+        69.98787596285301,
+        69.76754839695596,
+        69.55628685884417
+      ],
+      "median_tps": 69.76754839695596,
+      "ttft_s": [
+        0.48066371213644743,
+        0.4854749199002981,
+        0.48517070105299354
+      ],
+      "identical_outputs": true,
+      "output_sha256": [
+        "6eb80484b0c9089b3fc386521251712b73b3aa254fdb2b3b7985387263791f68",
+        "6eb80484b0c9089b3fc386521251712b73b3aa254fdb2b3b7985387263791f68",
+        "6eb80484b0c9089b3fc386521251712b73b3aa254fdb2b3b7985387263791f68"
+      ]
+    }
+  },
+  "prefill": {
+    "input_tokens": 4096,
+    "chunk": 1024,
+    "runs_tps": [
+      1206.4705275513204,
+      1205.125914094797,
+      1200.4251652177522
+    ],
+    "median_tps": 1205.125914094797,
+    "ttft_s": [
+      3.395026986952871,
+      3.398814972024411,
+      3.412124402821064
+    ],
+    "median_ttft_s": 3.398814972024411,
+    "identical_outputs": true
+  },
+  "sanity": {
+    "arithmetic": "1073",
+    "json-task": "{\"items\": [1, 2, 5, 9], \"sum\": 17, \"count\": 4}"
+  },
+  "memory": {
+    "logical_weight_gib_per_gpu": [
+      19.355388402938843,
+      19.355388402938843
+    ],
+    "loaded_cuda_used_gib_per_gpu": [
+      20.20880126953125,
+      20.20489501953125
+    ],
+    "expert_tensors_per_rank": [
+      49152,
+      49152
+    ],
+    "embedding_cpu_gib": 2.3681640625,
+    "cpu_tensor_names": [
+      "model.language_model.embed_tokens.weight"
+    ],
+    "sampled_peak_gib_per_gpu": [
+      21.05859375,
+      20.837890625
+    ],
+    "sampled_phase_peak_mib": {
+      "init": [
+        1.0,
+        1.0
+      ],
+      "loading": [
+        20694.0,
+        20690.0
+      ],
+      "decode-chunk32-warmup": [
+        20722.0,
+        20720.0
+      ],
+      "decode-chunk32-1": [
+        20734.0,
+        20730.0
+      ],
+      "decode-chunk32-2": [
+        20734.0,
+        20730.0
+      ],
+      "decode-chunk32-3": [
+        20734.0,
+        20730.0
+      ],
+      "decode-chunk512-warmup": [
+        20964.0,
+        20902.0
+      ],
+      "decode-chunk512-1": [
+        20964.0,
+        20902.0
+      ],
+      "decode-chunk512-2": [
+        20964.0,
+        20902.0
+      ],
+      "decode-chunk512-3": [
+        20964.0,
+        20902.0
+      ],
+      "prefill-warmup": [
+        21564.0,
+        21338.0
+      ],
+      "prefill-1": [
+        21548.0,
+        21330.0
+      ],
+      "prefill-2": [
+        21540.0,
+        21330.0
+      ],
+      "prefill-3": [
+        21532.0,
+        21330.0
+      ],
+      "complete": [
+        21006.0,
+        21006.0
+      ]
+    },
+    "max_host_rss_gib": 41.9053955078125,
+    "max_swap_kib": 0
+  },
+  "checks": {
+    "no_host_or_hybrid_moe": true,
+    "no_expert_cache": true,
+    "all_experts_gpu_native_gguf": true,
+    "sanity_passed": true
+  },
+  "date": "2026-10-01",
+  "hardware": {
+    "gpu": "2 x NVIDIA GeForce RTX 2080 Ti 22 GiB (SM75)",
+    "cpu": "AMD EPYC 7452",
+    "host_memory_gib_approx": 126
+  },
+  "model": "Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf",
+  "source": {
+    "base_commit": "22d9c42f980689d4f38faa2595afaa0ee02acfbd",
+    "working_tree": "uncommitted GGUF implementation and cleanup",
+    "native_kind": "isolated benchmark build with diagnostic counters; installed package unchanged"
+  },
+  "configuration": {
+    "tensor_parallel": 2,
+    "activation_dtype": "float16",
+    "main_device": "cuda:0,1",
+    "moe_device": "cuda:0,1",
+    "moe_cache_bytes_per_gpu": 0,
+    "embedding": "cpu (--low_gpu_mem)",
+    "ngram_device": "disk",
+    "threads": 28,
+    "max_batch": 1,
+    "tokens": 8192,
+    "kv_cache_limit": "1g",
+    "gpu_mem_ratio": 0.95,
+    "mtp": 0,
+    "external_mtp_loaded": false,
+    "cuda_graph": 1,
+    "prefix_cache": false,
+    "cache_history": false,
+    "enable_thinking": false,
+    "sampling": "greedy"
+  },
+  "methodology": {
+    "formal_runs_per_group": 3,
+    "warmup_requests_per_group": 1,
+    "order": [
+      "decode chunk32",
+      "decode chunk512",
+      "prefill chunk1024",
+      "sanity"
+    ],
+    "decode_tps": "511 / (last token arrival - first token arrival)",
+    "prefill_tps": "4096 / TTFT, including first-token latency",
+    "memory_peak": "nvidia-smi sampled every 2 seconds; short transients may be missed",
+    "resident_manifest": "TP preparation snapshot",
+    "profiler": false,
+    "caveats": [
+      "Different chunks produce different output sequences starting at output token 200 (1-based). The decode-rate difference cannot be attributed solely to chunk size.",
+      "Only this two-GPU SM75 configuration was exercised in this run.",
+      "Embedding remains on CPU and PLE uses disk; pure GPU refers to Dense/MoE compute and resident expert weights."
+    ]
+  },
+  "load_seconds": 125.58894389495254,
+  "artifacts_relative_to_workspace": "benchmark-results/fastllm-gguf-tp2-20261001/resident-cleanup-retest",
+  "artifact_sha256": {
+    "bench.py": "199ce340295aa945b4a336742a3df6e0c5af17b79dc5b77df5cd226c020eb1c9",
+    "run.py": "61a3a93cf6c802767861e58c1170f4287b5e75a8d18756586d6c0f428654d8cb",
+    "fastllm-candidate/results.json": "7c74cb2550f7778913d143494da7d3b90e41d419826aa0d5882507a499aa1061",
+    "fastllm-candidate/loaded-residency.json.gz": "5cd4dd8ea85127be80f811b6760961c492d3ce63f060720436615831d1bd728d"
+  },
+  "closeout": {
+    "exit_code": 0,
+    "error": null,
+    "protected_unchanged": true,
+    "gpu_processes": ""
+  },
+  "input_sha256": {
+    "decode": "3793ac4d1a75963bab4ca8788ffd5de16eb073642aa696c49574e149381270df",
+    "prefill": "f9e45ebc9176d19c1c37e3019f16d9ecf8bddf83f1b71423ce990bcdd006811a"
+  },
+  "post_measurement_change": {
+    "file": "src/devices/cuda/cudadevice.cpp",
+    "change": "Guard CUDA-only GGUF host prefill workspace and dispatch with #ifndef USE_ROCM",
+    "cuda_preprocessed_source_identical": true,
+    "rocm_validation": "Preprocessing removes the undeclared CUDA-only call; no ROCm toolchain/runtime test performed."
+  }
+}
