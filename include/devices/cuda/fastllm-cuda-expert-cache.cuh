@@ -19,6 +19,9 @@ struct ExpertCacheView {
     unsigned long long *hitCount;
     unsigned long long *missCount;
     int slots;
+    // Optional mapped host mirror. Read on the CPU only after synchronizing
+    // the stream that updates this view; graph replay updates it as well.
+    int32_t *hostKeyToSlot = nullptr;
 };
 
 namespace expert_cache_detail {
@@ -156,10 +159,14 @@ __global__ void LruEnsureKernel(
     for (int m = tid; m < misses; m += Threads) {
         int slot = victims[m];
         int oldKey = cache.slotKeys[slot];
-        if (oldKey >= 0) cache.keyToSlot[oldKey] = -1;
+        if (oldKey >= 0) {
+            cache.keyToSlot[oldKey] = -1;
+            if (cache.hostKeyToSlot) cache.hostKeyToSlot[oldKey] = -1;
+        }
         int key = incoming[m];
         cache.slotKeys[slot] = key;
         cache.keyToSlot[key] = slot;
+        if (cache.hostKeyToSlot) cache.hostKeyToSlot[key] = slot;
         cache.lastUsed[slot] = tick;
         missingExperts[m] = key - keyBase;
         missingSlots[m] = slot;

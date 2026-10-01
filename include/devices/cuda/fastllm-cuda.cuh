@@ -2,6 +2,7 @@
 #define FASTLLM_CUDA_CUH
 
 #include "fastllm.h"
+#include <unordered_set>
 
 // Device-resident request/chunk offsets shared by the ragged GDN frontend,
 // recurrent kernels, and output layout conversion.  The backing storage is
@@ -1699,7 +1700,7 @@ bool FastllmCudaMergeMOENVFP4E4M3MarlinIndexed(
         int batch, int topk);
 #ifndef USE_ROCM
 // Model-facing interface for the opt-in GPU expert cache. Preparation validates
-// compact NVFP4 or FP8 SwiGLU weights behind this format-independent interface.
+// compact GGUF, NVFP4 or FP8 SwiGLU weights behind this format-independent interface.
 struct FastllmCudaMoeCacheLayer {
     fastllm::Data *const *weights = nullptr;
     int weightsBatch = 0;
@@ -1724,6 +1725,56 @@ bool FastllmCudaPrepareMoeCache(
         const std::function<void()> &registerNumaWeights = {});
 bool FastllmCudaCanRunMoeCache(
         fastllm::Data **weights, int weightsBatch);
+
+struct FastllmCudaMoeGGUFCacheView {
+    const uint8_t *records;
+    const int32_t *routeSlots;
+    size_t recordStride, downOffset;
+    int gateType, downType, hidden, inter;
+    void *workspace = nullptr;
+    size_t workspaceBytes = 0;
+};
+bool FastllmCudaMoeGGUFCacheSupported(int type, int columns);
+// Q8_1 input/mid activations and per-expert down results, reused on one stream.
+size_t FastllmCudaMoeGGUFCacheWorkspaceBytes(int hidden, int inter);
+bool FastllmCudaMoeGGUFCacheQ8Supported(int gateType, int downType, int hidden, int inter);
+bool FastllmCudaMoeGGUFCacheCompute(
+        const fastllm::Data &input, fastllm::Data &gateOutput,
+        fastllm::Data &output, const FastllmCudaMoeGGUFCacheView &view,
+        const float *scores, int topk, float *perExpert = nullptr);
+// perExpert, when provided, receives unweighted FP32 [rows, topk, hidden]
+// results; missing route slots write zero. The caller owns the final reduction.
+// Use the same fused kernels with immutable GPU weight pointers. Routing stays
+// on CUDA; only a pointer table is uploaded, without copying/repacking weights.
+// Accepts 1..32 rows with the decode kernels; larger batches use grouped MMQ
+// when supported. Indices/scores are contiguous [rows, topk]. Decode rows
+// retain the single-token expert order and rounding. Scratch is caller-owned.
+bool FastllmCudaMergeMOEGGUFResidentIndexed(
+        const fastllm::Data &input, fastllm::Data &gateOutput,
+        fastllm::Data &workspace, fastllm::Data &output,
+        fastllm::Data **weights, int weightsBatch,
+        const int32_t *indices, const float *scores, int topk);
+// Invalidate pointer tables before any participating weight changes storage.
+void FastllmCudaReleaseMoeGGUFResident(const fastllm::Data *weight);
+
+// GPU route grouping and packed expert MMQ for prefill. Workspace sizing also
+// checks type, shape and device support; zero leaves the ordinary path intact.
+size_t FastllmCudaMoeGGUFGroupedWorkspaceBytes(
+    int gateType, int downType, int rows, int hidden, int inter,
+    int experts, int topk);
+bool FastllmCudaMoeGGUFGrouped(
+    const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &output,
+    const void *weightPointers, const int32_t *indices, const float *scores,
+    void *workspace, int gateType, int downType, int hidden, int inter,
+    int experts, int topk);
+// NUMA GPU-assisted prefill: temporarily upload only this worker's experts,
+// restore their packed/interleaved layout, and reuse grouped MMQ. No weight
+// storage is mutated. Caller serializes and retains scratch on this GPU.
+bool FastllmCudaMergeMOEGGUFHost(const fastllm::Data &input,
+    fastllm::Data &gate, fastllm::Data &workspace, fastllm::Data &output,
+    fastllm::Data **weights, int expertCount, const int32_t *indices,
+    const float *scores, int topk, const std::unordered_set<int> &experts,
+    bool crossSwiglu);
 // Eager single-token decode: generic FP32 or explicitly registered V4.1
 // BF16 math. Adapters execute disjoint CPU/CUDA subsets with shared scheduling.
 bool FastllmCudaCanRunMoeHybrid(fastllm::Data **weights, int weightsBatch);
@@ -2287,5 +2338,10 @@ bool FastllmCudaQwen4SharedExpert(
     fastllm::Data &downWeight, fastllm::Data &gateWeight,
     fastllm::Data &gateUp, fastllm::Data &hidden,
     fastllm::Data &gate, fastllm::Data &output);
+
+
+// Snapshot completed GPU cache counters. values: hits, misses, payload bytes,
+// slots, host records. Synchronizes the device; call outside timed inference.
+extern "C" bool fastllm_moe_cuda_cache_stats(int device, uint64_t *values, bool reset);
 
 #endif // FASTLLM_CUDA_CUH

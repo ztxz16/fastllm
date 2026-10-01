@@ -3288,24 +3288,38 @@ namespace fastllm {
         if (!weights || weightsBatch < 4 || weightsBatch % 2 || weights[0] || weights[1]) return false;
         auto *config = GetNumaConfig();
         for (int i = 2; i < weightsBatch; ++i) {
-            const auto *w = weights[i];
+            auto *w = weights[i];
             if (!IsNumasLinearWeightRegistered(w) ||
                 w->dims[0] % (config->numaCnt * 4) != 0) return false;
             const auto act = GetNumasLinearActDataType(weights[i], 1);
-            // Other activation encodings need their quantization-group row
-            // alignment/conversion adapter before entering the fused tasks.
-            if (act != DataType::FLOAT32 && act != DataType::FLOAT16 && act != DataType::BFLOAT16)
+            const bool ggufAct = act >= DataType::DATA_GGUF_FORMAT &&
+                                 act < DataType::DATA_GGUF_FORMAT_END;
+            if (ggufAct) {
+                const auto type = static_cast<ggml_type>(int(act) - int(DataType::DATA_GGUF_FORMAT));
+                // ConvertFromFloat32 uses iqk_quantize_row_q8_K, whose
+                // supported formats are not all in GGML's reference table.
+                if ((type != GGML_TYPE_Q8_0 && type != GGML_TYPE_Q8_1 &&
+                     type != GGML_TYPE_Q8_K && type != GGML_TYPE_Q8_K32) ||
+                    w->dims[1] % ggml_blck_size(type)) return false;
+                // The fused Q8_0 down-input writer owns complete blocks of
+                // 32 SwiGLU values, including at each NUMA shard boundary.
+                if (i % 2 && type == GGML_TYPE_Q8_0 &&
+                    w->dims[1] % (config->numaCnt * 32)) return false;
+            } else if (act != DataType::FLOAT32 && act != DataType::FLOAT16 && act != DataType::BFLOAT16) {
                 return false;
+            }
             if (i > 3 && (w->dataType != weights[2 + i % 2]->dataType ||
+                          w->GetDataType() != weights[2 + i % 2]->GetDataType() ||
                           w->dims != weights[2 + i % 2]->dims)) return false;
         }
         return weights[2]->dims[0] == weights[3]->dims[1] * 2 &&
                weights[2]->dims[1] == weights[3]->dims[0];
     }
 
-    void NumasMoeDecodeExperts(const float *input, float *output,
+    static void NumasMoeDecodeExpertsImpl(const float *input, float *output,
             Data **weights, const int32_t *indices, const int32_t *gpuIndices,
-            int topk, int layer, const float *routeScores, float swigluLimit) {
+            int topk, int layer, const float *routeScores, float swigluLimit,
+            const std::function<void()> &submitGpu) {
         const bool deepSeekV41 = routeScores != nullptr;
         auto &work = GetNumasMoeRuntimeCache()[layer % 2];
         auto *config = GetNumaConfig();
@@ -3314,7 +3328,10 @@ namespace fastllm {
         routes.clear();
         for (int r = 0; r < topk; ++r)
             if (gpuIndices[r] < 0) routes.push_back(r);
-        if (routes.empty()) return;
+        if (routes.empty()) {
+            if (submitGpu) submitGpu();
+            return;
+        }
         const int hidden = weights[2]->dims[1];
         const int inter = weights[2]->dims[0] / 2;
         const int count = routes.size();
@@ -3322,6 +3339,10 @@ namespace fastllm {
                         "V4.1 decode requires complete block-32 NUMA shards.\n");
         const DataType gateAct = GetNumasLinearActDataType(weights[2], 1);
         const DataType downAct = GetNumasLinearActDataType(weights[3], 1);
+        const bool q8Down = downAct == static_cast<DataType>(
+            int(DataType::DATA_GGUF_FORMAT) + GGML_TYPE_Q8_0);
+        const bool quantizeDownRows = downAct >= DataType::DATA_GGUF_FORMAT &&
+            downAct < DataType::DATA_GGUF_FORMAT_END && !q8Down;
         const size_t downBytes = GetDataBytes(downAct, 1, inter);
         work.realInput.resize(GetDataBytes(gateAct, 1, hidden));
         work.gateUpOutput.resize(count * inter * 2);
@@ -3337,7 +3358,7 @@ namespace fastllm {
         for (int phase = 0; phase < 2; ++phase) {
             const int columns = phase == 0 ? inter * 2 : hidden;
             const int perNode = columns / config->numaCnt;
-            const int granularity = deepSeekV41 && phase == 0 ? 64 : 4;
+            const int granularity = (deepSeekV41 || q8Down) && phase == 0 ? 64 : 4;
             for (auto &worker : work.decodeWorkers) worker.tasks.clear();
             for (int node = 0; node < config->numaCnt; ++node) {
                 const int threads = config->numaToCpuDict[node].size();
@@ -3366,20 +3387,20 @@ namespace fastllm {
                         Data &weight = *weights[expert * 2 + phase];
                         if (phase == 0 && deepSeekV41) {
                             downTasks.emplace_back(work.realInput.data(), gateAct,
-                                weight.numasData[node], weight.dataType,
+                                weight.numasData[node], weight.GetDataType(),
                                 reinterpret_cast<uint8_t *>(work.gateUpOutput.data() + item * columns + node * perNode),
                                 DataType::FLOAT32, 1, hidden, columns, row, row + rows);
                         } else if (phase == 0) {
                             gateTasks.emplace_back(work.realInput.data(), gateAct,
-                                weight.numasData[node], weight.dataType,
+                                weight.numasData[node], weight.GetDataType(),
                                 reinterpret_cast<uint8_t *>(work.gateUpOutput.data() +
                                     item * columns + node * perNode), DataType::FLOAT32,
                                 work.swigluOutput.data() + item * inter,
                                 1, hidden, columns, row, row + rows, node * perNode,
-                                work.downInput.data() + item * downBytes, downAct);
+                                quantizeDownRows ? nullptr : work.downInput.data() + item * downBytes, downAct);
                         } else {
                             downTasks.emplace_back(work.downInput.data() + item * downBytes, downAct,
-                                weight.numasData[node], weight.dataType,
+                                weight.numasData[node], weight.GetDataType(),
                                 reinterpret_cast<uint8_t *>(output + route * hidden + node * perNode),
                                 DataType::FLOAT32, 1, inter, columns, row, row + rows);
                         }
@@ -3407,8 +3428,37 @@ namespace fastllm {
                 }
             }
             for (int t = 0; t < config->threads; ++t) pool->PushOp(t, &work.decodeWorkers[t]);
+            if (phase == 0 && submitGpu) {
+                try {
+                    submitGpu();
+                } catch (...) {
+                    // Jobs borrow the reusable layer workspace. A callback
+                    // failure must not leave workers accessing it on unwind.
+                    for (int t = 0; t < config->threads; ++t) pool->Wait(t);
+                    throw;
+                }
+            }
             for (int t = 0; t < config->threads; ++t) pool->Wait(t);
+            // Q8_K/Q8_1 and other GGUF activation formats retain the normal
+            // whole-row quantizer after all gate/up tasks have completed.
+            if (phase == 0 && quantizeDownRows)
+                RunMultiThreadConvertFromFloat32(work.downInput.data(), downAct,
+                    work.swigluOutput.data(), count, inter, pool);
         }
+    }
+
+    void NumasMoeDecodeExperts(const float *input, float *output,
+            Data **weights, const int32_t *indices, const int32_t *gpuIndices,
+            int topk, int layer, const float *routeScores, float swigluLimit) {
+        NumasMoeDecodeExpertsImpl(input, output, weights, indices, gpuIndices,
+                                 topk, layer, routeScores, swigluLimit, {});
+    }
+
+    void NumasMoeDecodeExpertsWithOverlap(const float *input, float *output,
+            Data **weights, const int32_t *indices, const int32_t *gpuIndices,
+            int topk, int layer, const std::function<void()> &submitGpu) {
+        NumasMoeDecodeExpertsImpl(input, output, weights, indices, gpuIndices,
+                                 topk, layer, nullptr, 0.0f, submitGpu);
     }
 
     bool IsNumasLinearWeightSupported(const Data *weight) {

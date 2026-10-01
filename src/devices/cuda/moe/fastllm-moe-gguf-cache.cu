@@ -1,0 +1,510 @@
+// Ordinary GGUF expert records: decode in registers, keeping cache entries packed.
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+#define GGML_COMMON_DECL_CUDA
+#define GGML_COMMON_IMPL_CUDA
+#include "gguf.h"
+#include "fastllm-gguf-gemv.cuh"
+#include "fastllm-cuda.cuh"
+#include "fastllm-moe-gguf-common.cuh"
+#include "fastllm-moe-gguf-q8.cuh"
+#include <algorithm>
+#include <atomic>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
+
+namespace {
+// Keep dispatch and admission on the same list. Repacked CPU layouts are never
+// admitted: the host snapshot is taken before NUMA registration/repacking.
+#define GGUF_CACHE_TYPES(M) \
+    M(Q2_0) M(Q4_0) M(Q4_1) M(Q5_0) M(Q5_1) M(Q8_0) M(Q8_1) \
+    M(Q2_K) M(Q3_K) M(Q4_K) M(Q5_K) M(Q6_K) \
+    M(IQ1_S) M(IQ1_M) M(IQ2_XXS) M(IQ2_XS) M(IQ2_S) \
+    M(IQ3_XXS) M(IQ3_S) M(IQ4_NL) M(IQ4_XS) M(F32) M(F16) M(BF16)
+
+#define GGUF_CACHE_Q8_TYPES(M) M(Q2_0) M(IQ1_M) M(IQ2_XXS) M(IQ2_XS) M(IQ2_S)
+
+size_t Align16(size_t bytes) { return (bytes + 15) & ~size_t(15); }
+size_t Q8Bytes(int rows, int columns) {
+    return Align16(size_t(rows) * (columns / 32) * sizeof(block_q8_1));
+}
+
+size_t Q8WorkspaceBytes(int rows, int hidden, int inter, int topk) {
+    const int routes = rows * topk;
+    return Q8Bytes(rows, hidden) + Q8Bytes(routes, inter) +
+        size_t(routes) * hidden * sizeof(float);
+}
+
+// The weight accessor is the only difference between cached records and
+// resident tensors. Both views use identical projection and reduction kernels.
+struct ResidentView {
+    const uint8_t *const *weights;
+    const int32_t *indices;
+    int experts, gateType, downType, hidden, inter;
+    void *workspace;
+    size_t workspaceBytes;
+};
+
+template<bool IsGate>
+__device__ __forceinline__ const uint8_t *ExpertWeight(
+        const FastllmCudaMoeGGUFCacheView &view, int route) {
+    const int slot = view.routeSlots[route];
+    return slot < 0 ? nullptr : view.records + size_t(slot)*view.recordStride +
+        (IsGate ? 0 : view.downOffset);
+}
+template<bool IsGate>
+__device__ __forceinline__ const uint8_t *ExpertWeight(
+        const ResidentView &view, int route) {
+    const int expert = view.indices[route];
+    return expert < 0 || expert >= view.experts ? nullptr :
+        view.weights[2*expert + (IsGate ? 0 : 1)];
+}
+
+template<typename T>
+__global__ void QuantizeQ8(const T *input, block_q8_1 *output, int columns) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    // A complete warp owns a Q8_1 block. columns is divisible by 32.
+    if (c >= columns) return;
+    const float x = float(input[size_t(blockIdx.y)*columns + c]);
+    float maximum = fabsf(x), sum = x;
+#pragma unroll
+    for (int mask = 16; mask; mask >>= 1) {
+        maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, mask));
+        sum += __shfl_xor_sync(0xffffffff, sum, mask);
+    }
+    const float scale = maximum / 127.0f;
+    auto &q = output[size_t(blockIdx.y)*(columns/32) + c/32];
+    q.qs[c%32] = maximum == 0 ? 0 : int8_t(roundf(x / scale));
+    if (c%32 == 0) q.ds = __floats2half2_rn(scale, sum);
+}
+
+template<ggml_type Type, typename T, bool IsGate, typename View, int ThreadsPerRow = 32>
+__global__ void Q8Projection(const block_q8_1 *input, T *gate, float *partial,
+                            View view, int topk, size_t rowBytes) {
+    using F = gguf_cache_q8::Format<Type>;
+    __shared__ uint64_t grid[F::gridSize ? F::gridSize : 1];
+    extern __shared__ uint32_t activation[];
+    const int route = blockIdx.y;
+    const int columns = IsGate ? view.hidden : view.inter;
+    const auto *x = input + size_t(IsGate ? route/topk : route)*(columns/32);
+    gguf_cache_q8::StageGrid<Type>(grid);
+    for (int i = threadIdx.x; i < columns/32*int(sizeof(block_q8_1))/4; i += blockDim.x)
+        activation[i] = reinterpret_cast<const uint32_t *>(x)[i];
+    __syncthreads();
+    const int row = blockIdx.x*(256/ThreadsPerRow) + threadIdx.x/ThreadsPerRow;
+    if (row >= (IsGate ? view.inter : view.hidden)) return;
+    const uint8_t *record = ExpertWeight<IsGate>(view, route);
+    float value = 0;
+    if (record != nullptr) {
+        const auto *sharedX = reinterpret_cast<const block_q8_1 *>(activation);
+        const uint8_t *weight = record + size_t(row)*rowBytes;
+        value = gguf_cache_q8::RowDot<Type, ThreadsPerRow>(weight, sharedX, columns, grid);
+        if constexpr (IsGate) {
+            const float up = float(DequantizeCast<T>::cast(gguf_cache_q8::RowDot<Type>(
+                weight + size_t(view.inter)*rowBytes, sharedX, columns, grid)));
+            value = float(DequantizeCast<T>::cast(value));
+            value = value / (1.0f + expf(-value)) * up;
+        }
+    }
+    if (threadIdx.x%ThreadsPerRow == 0) {
+        if constexpr (IsGate) gate[size_t(route)*view.inter + row] = DequantizeCast<T>::cast(value);
+        else partial[size_t(route)*view.hidden + row] = float(DequantizeCast<T>::cast(value));
+    }
+}
+
+template<ggml_type Type, typename T, typename View>
+void LaunchQ8Down(const block_q8_1 *input, T *gate, float *partial,
+                  const View &view, int topk, int routes, size_t rowBytes) {
+    if constexpr (Type == GGML_TYPE_Q2_0) {
+        // Eight lanes reproduce the original 32-lane sum for up to sixteen
+        // Q8 blocks, and let one CTA cover 32 rather than eight output rows.
+        // Select the smaller subgroup for prefill batches. Keep the existing
+        // launch for decode/verifier batches, whose end-to-end gain is unstable.
+        if (view.inter <= 512 && routes > 8*topk) {
+            Q8Projection<Type, T, false, View, 8><<<dim3((view.hidden+31)/32, routes), 256,
+                view.inter/32*sizeof(block_q8_1), cudaStreamPerThread>>>(
+                    input, gate, partial, view, topk, rowBytes);
+            return;
+        }
+    }
+    Q8Projection<Type, T, false><<<dim3((view.hidden+7)/8, routes), 256,
+        view.inter/32*sizeof(block_q8_1), cudaStreamPerThread>>>(
+            input, gate, partial, view, topk, rowBytes);
+}
+
+template<typename T>
+__global__ void Q8Reduce(const float *partial, T *output, const float *scores,
+                         int hidden, int topk) {
+    const int row = blockIdx.x*blockDim.x + threadIdx.x;
+    if (row >= hidden) return;
+    float sum = 0;
+    // Keep the same expert order and activation/output rounding as fallback.
+    const int firstRoute = blockIdx.y * topk;
+    for (int route = firstRoute; route < firstRoute + topk; ++route)
+        sum += partial[size_t(route)*hidden + row]*scores[route];
+    output[size_t(blockIdx.y)*hidden + row] = DequantizeCast<T>::cast(sum);
+}
+
+template<typename T, typename View>
+bool ComputeQ8(const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &output,
+               const View &view, const float *scores, int topk, float *perExpert) {
+    const int rows = input.dims[0], routes = rows * topk;
+    auto *qInput = static_cast<block_q8_1 *>(view.workspace);
+    auto *qGate = reinterpret_cast<block_q8_1 *>(static_cast<uint8_t *>(view.workspace) + Q8Bytes(rows, view.hidden));
+    auto *partial = reinterpret_cast<float *>(reinterpret_cast<uint8_t *>(qGate) + Q8Bytes(routes, view.inter));
+    if (perExpert) partial = perExpert;
+    const auto gateType = static_cast<ggml_type>(view.gateType);
+    const auto downType = static_cast<ggml_type>(view.downType);
+    QuantizeQ8<<<dim3((view.hidden+255)/256, rows), 256, 0, cudaStreamPerThread>>>(
+        static_cast<const T *>(input.cudaData), qInput, view.hidden);
+    switch (gateType) {
+#define Q8_GATE(name) case GGML_TYPE_##name: \
+        Q8Projection<GGML_TYPE_##name, T, true><<<dim3((view.inter+7)/8, routes), 256, \
+            view.hidden/32*sizeof(block_q8_1), cudaStreamPerThread>>>(qInput, \
+            static_cast<T *>(gate.cudaData), partial, view, topk, ggml_row_size(gateType, view.hidden)); break;
+        GGUF_CACHE_Q8_TYPES(Q8_GATE)
+#undef Q8_GATE
+        default: return false;
+    }
+    QuantizeQ8<<<dim3((view.inter+255)/256, routes), 256, 0, cudaStreamPerThread>>>(
+        static_cast<const T *>(gate.cudaData), qGate, view.inter);
+    switch (downType) {
+#define Q8_DOWN(name) case GGML_TYPE_##name: \
+        LaunchQ8Down<GGML_TYPE_##name>(qGate, static_cast<T *>(gate.cudaData), \
+            partial, view, topk, routes, ggml_row_size(downType, view.inter)); break;
+        GGUF_CACHE_Q8_TYPES(Q8_DOWN)
+#undef Q8_DOWN
+        default: return false;
+    }
+    if (!perExpert)
+        Q8Reduce<<<dim3((view.hidden+255)/256, rows), 256, 0, cudaStreamPerThread>>>(
+            partial, static_cast<T *>(output.cudaData), scores, view.hidden, topk);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+template<ggml_type type, typename T>
+__device__ __forceinline__ float Dot(const void *weight, const T *input,
+                                      int columns, int warp, int warps) {
+    const int lane = threadIdx.x % 32;
+    float sum = 0;
+    if constexpr (type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16) {
+        for (int c = warp * 32 + lane; c < columns; c += warps * 32) {
+            float w;
+            if constexpr (type == GGML_TYPE_F32) w = static_cast<const float *>(weight)[c];
+            else if constexpr (type == GGML_TYPE_F16) w = __half2float(static_cast<const half *>(weight)[c]);
+            else w = __bfloat162float(static_cast<const __nv_bfloat16 *>(weight)[c]);
+            sum = fmaf(float(DequantizeCast<T>::cast(w)), float(input[c]), sum);
+        }
+    } else if constexpr (type == GGML_TYPE_Q5_0 || type == GGML_TYPE_Q5_1 || type == GGML_TYPE_Q8_1) {
+        for (int b = warp; b < columns / 32; b += warps) {
+            float w;
+            if constexpr (type == GGML_TYPE_Q8_1) {
+                const auto &q = static_cast<const block_q8_1 *>(weight)[b];
+                w = __low2float(q.ds) * q.qs[lane];
+            } else {
+                using Block = std::conditional_t<type == GGML_TYPE_Q5_0, block_q5_0, block_q5_1>;
+                const auto &q = static_cast<const Block *>(weight)[b];
+                const int low = (q.qs[lane % 16] >> (4 * (lane / 16))) & 15;
+                const int high = (q.qh[lane / 8] >> (lane % 8)) & 1;
+                if constexpr (type == GGML_TYPE_Q5_0) w = __half2float(q.d) * (low + 16 * high - 16);
+                else w = __low2float(q.dm) * (low + 16 * high) + __high2float(q.dm);
+            }
+            sum = fmaf(float(DequantizeCast<T>::cast(w)), float(input[b * 32 + lane]), sum);
+        }
+    } else {
+        FastllmGgufGemvDotOutput<T> dot{input, &sum, 0};
+        for (int b = warp; b < (columns + 255) / 256; b += warps)
+            FastllmGgufGemvBlock<type>(weight, dot, b, lane, columns);
+    }
+    for (int mask = 16; mask; mask >>= 1) sum += __shfl_down_sync(0xffffffff, sum, mask);
+    return sum;
+}
+
+template<ggml_type type, typename T, typename View>
+__global__ void Gate(const T *input, T *gateOutput, View view,
+                     int topk, size_t rowBytes) {
+    const int row = blockIdx.x, route = blockIdx.y;
+    const uint8_t *record = ExpertWeight<true>(view, route);
+    if (record == nullptr) {
+        if (threadIdx.x == 0) gateOutput[route * view.inter + row] = DequantizeCast<T>::cast(0);
+        return;
+    }
+    input += size_t(route/topk)*view.hidden;
+    const int warp = threadIdx.x / 32;
+    float gate = Dot<type>(record + size_t(row) * rowBytes, input, view.hidden, warp, 4);
+    float up = Dot<type>(record + size_t(row + view.inter) * rowBytes, input, view.hidden, warp, 4);
+    __shared__ float gates[4], ups[4];
+    if (threadIdx.x % 32 == 0) { gates[warp] = gate; ups[warp] = up; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        gate = up = 0;
+        for (int w = 0; w < 4; ++w) { gate += gates[w]; up += ups[w]; }
+        gate = float(DequantizeCast<T>::cast(gate));
+        up = float(DequantizeCast<T>::cast(up));
+        gateOutput[route * view.inter + row] = DequantizeCast<T>::cast(gate / (1.0f + expf(-gate)) * up);
+    }
+}
+
+template<ggml_type type, typename T, typename View>
+__global__ void Down(const T *gateOutput, T *output, View view,
+                     const float *scores, int topk, size_t rowBytes, float *perExpert) {
+    const int row = blockIdx.x, localRoute = threadIdx.x / 32;
+    const int route = blockIdx.y*topk + localRoute;
+    const uint8_t *record = ExpertWeight<false>(view, route);
+    float value = 0;
+    if (record != nullptr) {
+        const uint8_t *weight = record + size_t(row) * rowBytes;
+        value = Dot<type>(weight, gateOutput + route * view.inter, view.inter, 0, 1);
+    }
+    if (perExpert) {
+        if (threadIdx.x % 32 == 0)
+            perExpert[size_t(route)*view.hidden + row] = float(DequantizeCast<T>::cast(value));
+        return;
+    }
+    extern __shared__ float partial[];
+    if (threadIdx.x % 32 == 0) partial[localRoute] = float(DequantizeCast<T>::cast(value)) * scores[route];
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float result = 0;
+        for (int e = 0; e < topk; ++e) result += partial[e];
+        output[size_t(blockIdx.y)*view.hidden + row] = DequantizeCast<T>::cast(result);
+    }
+}
+
+template<typename T, typename View>
+bool Compute(const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &output,
+             const View &view, const float *scores, int topk, float *perExpert = nullptr) {
+    const int rows = input.dims[0], routes = rows * topk;
+    const size_t requiredBytes = Q8WorkspaceBytes(rows, view.hidden, view.inter, topk);
+    if (view.workspace &&
+        FastllmCudaMoeGGUFCacheQ8Supported(view.gateType, view.downType, view.hidden, view.inter) &&
+        view.workspaceBytes >= requiredBytes)
+        return ComputeQ8<T>(input, gate, output, view, scores, topk, perExpert);
+    const auto gateType = static_cast<ggml_type>(view.gateType);
+    const auto downType = static_cast<ggml_type>(view.downType);
+    switch (gateType) {
+#define LAUNCH_GATE(name) case GGML_TYPE_##name: \
+        Gate<GGML_TYPE_##name><<<dim3(view.inter, routes), 128, 0, cudaStreamPerThread>>>( \
+            static_cast<const T *>(input.cudaData), static_cast<T *>(gate.cudaData), \
+            view, topk, ggml_row_size(gateType, view.hidden)); break;
+        GGUF_CACHE_TYPES(LAUNCH_GATE)
+#undef LAUNCH_GATE
+        default: return false;
+    }
+    switch (downType) {
+#define LAUNCH_DOWN(name) case GGML_TYPE_##name: \
+        Down<GGML_TYPE_##name><<<dim3(view.hidden, rows), topk * 32, topk * sizeof(float), cudaStreamPerThread>>>( \
+            static_cast<const T *>(gate.cudaData), static_cast<T *>(output.cudaData), view, \
+            scores, topk, ggml_row_size(downType, view.inter), perExpert); break;
+        GGUF_CACHE_TYPES(LAUNCH_DOWN)
+#undef LAUNCH_DOWN
+        default: return false;
+    }
+    return cudaGetLastError() == cudaSuccess;
+}
+
+struct ResidentLayer {
+    int device = -1, experts = 0, gateType = -1, downType = -1, hidden = 0, inter = 0;
+    void *table = nullptr;
+    std::vector<const fastllm::Data *> sources;
+    std::atomic<bool> retired{false};
+    ~ResidentLayer() {
+        if (!table) return;
+        int previous = -1;
+        if (cudaGetDevice(&previous) == cudaSuccess && cudaSetDevice(device) == cudaSuccess) {
+            cudaFree(table);
+            if (previous != device) cudaSetDevice(previous);
+        }
+    }
+};
+struct ResidentRegistry {
+    std::mutex mutex;
+    std::map<const fastllm::Data *, std::shared_ptr<ResidentLayer>> layers;
+    std::unordered_map<const fastllm::Data *, const fastllm::Data *> owners;
+};
+ResidentRegistry &ResidentLayers() {
+    // Data destructors retire every live entry, including during static teardown.
+    static auto *registry = new ResidentRegistry;
+    return *registry;
+}
+thread_local std::unordered_map<const fastllm::Data *, std::weak_ptr<ResidentLayer>> residentFront;
+
+std::shared_ptr<ResidentLayer> GetResidentLayer(fastllm::Data **weights, int count, int device) {
+    const auto *key = weights[2];
+    auto front = residentFront.find(key);
+    if (front != residentFront.end()) {
+        auto layer = front->second.lock();
+        if (layer && !layer->retired.load(std::memory_order_acquire) &&
+            layer->device == device && (layer->experts + 1)*2 == count) return layer;
+        residentFront.erase(front);
+    }
+    auto &registry = ResidentLayers();
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    auto found = registry.layers.find(key);
+    if (found != registry.layers.end()) {
+        auto layer = found->second;
+        if (layer->device != device || (layer->experts + 1)*2 != count) return {};
+        residentFront[key] = layer;
+        return layer;
+    }
+    cudaStreamCaptureStatus capture;
+    if (cudaStreamIsCapturing(cudaStreamPerThread, &capture) != cudaSuccess ||
+        capture != cudaStreamCaptureStatusNone) return {};
+    auto layer = std::make_shared<ResidentLayer>();
+    layer->device = device;
+    layer->experts = count/2 - 1;
+    layer->hidden = weights[2]->dims[1];
+    layer->inter = weights[2]->dims[0]/2;
+    layer->gateType = weights[2]->ggmlType;
+    layer->downType = weights[3]->ggmlType;
+    if (layer->inter <= 0 || !FastllmCudaMoeGGUFCacheSupported(layer->gateType, layer->hidden) ||
+        !FastllmCudaMoeGGUFCacheSupported(layer->downType, layer->inter)) return {};
+    std::vector<const uint8_t *> pointers(2*layer->experts, nullptr);
+    for (int e = 0; e < layer->experts; ++e) {
+        auto *gate = weights[2*(e+1)], *down = weights[2*(e+1)+1];
+        if (!gate && !down) continue;
+        if (!gate || !down) return {};
+        for (int part = 0; part < 2; ++part) {
+            auto *weight = part ? down : gate;
+            const int rows = part ? layer->hidden : 2*layer->inter;
+            const int cols = part ? layer->inter : layer->hidden;
+            const int type = part ? layer->downType : layer->gateType;
+            if (weight->dataType != fastllm::DATA_GGUF_FORMAT ||
+                weight->dataDevice != fastllm::CUDA || !weight->cudaData ||
+                weight->dataDeviceIds != std::vector<int>{device} ||
+                weight->ggmlType != type || weight->dims != std::vector<int>({rows, cols})) return {};
+            auto owner = registry.owners.find(weight);
+            if (owner != registry.owners.end() && owner->second != key) return {};
+            pointers[2*e+part] = static_cast<const uint8_t *>(weight->cudaData);
+            layer->sources.push_back(weight);
+        }
+    }
+    const size_t bytes = pointers.size()*sizeof(pointers[0]);
+    if (cudaMalloc(&layer->table, bytes) != cudaSuccess) { cudaGetLastError(); return {}; }
+    // Complete the one-time upload before publishing it to another stream.
+    if (cudaMemcpy(layer->table, pointers.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess) return {};
+    for (const auto *source : layer->sources) registry.owners[source] = key;
+    registry.layers[key] = layer;
+    if (residentFront.size() > 256) residentFront.clear();
+    residentFront[key] = layer;
+    return layer;
+}
+
+}
+
+size_t FastllmCudaMoeGGUFCacheWorkspaceBytes(int hidden, int inter) {
+    // Bound shared Q8 input + the largest (IQ1_M) codebook below 48 KiB.
+    if (hidden <= 0 || inter <= 0 || hidden > 24576 || inter > 24576 || hidden%32 || inter%32) return 0;
+    return Q8WorkspaceBytes(1, hidden, inter, 32);
+}
+
+bool FastllmCudaMoeGGUFCacheQ8Supported(int gateType, int downType, int hidden, int inter) {
+    auto supported = [](int type) {
+        switch (static_cast<ggml_type>(type)) {
+#define Q8_SUPPORTED(name) case GGML_TYPE_##name:
+            GGUF_CACHE_Q8_TYPES(Q8_SUPPORTED)
+#undef Q8_SUPPORTED
+                return true;
+            default: return false;
+        }
+    };
+    return supported(gateType) && supported(downType) &&
+        FastllmCudaMoeGGUFCacheWorkspaceBytes(hidden, inter) &&
+        FastllmCudaMoeGGUFCacheSupported(gateType, hidden) &&
+        FastllmCudaMoeGGUFCacheSupported(downType, inter);
+}
+
+bool FastllmCudaMoeGGUFCacheSupported(int type, int columns) {
+    if (columns <= 0) return false;
+    switch (static_cast<ggml_type>(type)) {
+#define GGUF_SUPPORTED(name) case GGML_TYPE_##name:
+        GGUF_CACHE_TYPES(GGUF_SUPPORTED)
+#undef GGUF_SUPPORTED
+#undef GGUF_CACHE_TYPES
+            return columns % ggml_blck_size(static_cast<ggml_type>(type)) == 0;
+        default: return false;
+    }
+}
+
+bool FastllmCudaMoeGGUFCacheCompute(const fastllm::Data &input, fastllm::Data &gate,
+        fastllm::Data &output, const FastllmCudaMoeGGUFCacheView &view,
+        const float *scores, int topk, float *perExpert) {
+    if (topk <= 0 || topk > 32 || !scores || !view.records || !view.routeSlots ||
+        !FastllmCudaMoeGGUFCacheSupported(view.gateType, view.hidden) ||
+        !FastllmCudaMoeGGUFCacheSupported(view.downType, view.inter)) return false;
+    switch (input.dataType) {
+        case fastllm::FLOAT32: return Compute<float>(input, gate, output, view, scores, topk, perExpert);
+        case fastllm::FLOAT16: return Compute<half>(input, gate, output, view, scores, topk, perExpert);
+        case fastllm::BFLOAT16: return Compute<__nv_bfloat16>(input, gate, output, view, scores, topk, perExpert);
+        default: return false;
+    }
+}
+
+
+void FastllmCudaReleaseMoeGGUFResident(const fastllm::Data *weight) {
+    if (!weight) return;
+    auto &registry = ResidentLayers();
+    std::shared_ptr<ResidentLayer> retired;
+    {
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        auto owner = registry.owners.find(weight);
+        if (owner == registry.owners.end()) return;
+        auto layer = registry.layers.find(owner->second);
+        if (layer == registry.layers.end()) return;
+        retired = std::move(layer->second);
+        retired->retired.store(true, std::memory_order_release);
+        registry.layers.erase(layer);
+        for (const auto *source : retired->sources) registry.owners.erase(source);
+    }
+    // cudaFree runs outside the registry lock, on the allocation's own GPU.
+}
+
+bool FastllmCudaMergeMOEGGUFResidentIndexed(
+        const fastllm::Data &input, fastllm::Data &gate,
+        fastllm::Data &workspace, fastllm::Data &output,
+        fastllm::Data **weights, int weightsBatch,
+        const int32_t *indices, const float *scores, int topk) {
+    using fastllm_gguf_moe::AllocateTensor;
+    if (topk <= 0 || topk > 32 || !indices || !scores ||
+        input.dataDevice != fastllm::CUDA || !input.cudaData || input.dims.size() != 2 || input.dims[0] <= 0 || input.dims[0] > 4096 ||
+        !fastllm_gguf_moe::IsActivationType(input.dataType) ||
+        !weights || weightsBatch < 4 || weightsBatch%2 || !weights[2] || !weights[3] ||
+        weights[2]->dataType != fastllm::DATA_GGUF_FORMAT || weights[2]->dims.size() != 2 ||
+        weights[2]->dataDevice != fastllm::CUDA || weights[3]->dataDevice != fastllm::CUDA) return false;
+    const int device = FastllmCudaGetDevice();
+    if (input.dataDeviceIds != std::vector<int>{device} || input.dims[1] != weights[2]->dims[1]) return false;
+    auto layer = GetResidentLayer(weights, weightsBatch, device);
+    if (!layer) return false;
+    const int rows = input.dims[0];
+    if (rows > 32) {
+        const size_t bytes = FastllmCudaMoeGGUFGroupedWorkspaceBytes(
+            layer->gateType, layer->downType, rows, layer->hidden,
+            layer->inter, layer->experts, topk);
+        if (!bytes || bytes > size_t(INT32_MAX)) return false;
+        AllocateTensor(gate, input.dataType, {rows*topk, layer->inter}, device);
+        AllocateTensor(output, input.dataType, {rows, layer->hidden}, device);
+        AllocateTensor(workspace, fastllm::INT8, {int(bytes)}, device);
+        return FastllmCudaMoeGGUFGrouped(input, gate, output, layer->table,
+            indices, scores, workspace.cudaData, layer->gateType,
+            layer->downType, layer->hidden, layer->inter, layer->experts, topk);
+    }
+    const int routes = rows * topk;
+    AllocateTensor(gate, input.dataType, {routes, layer->inter}, device);
+    AllocateTensor(output, input.dataType, {rows, layer->hidden}, device);
+    const size_t bytes = FastllmCudaMoeGGUFCacheQ8Supported(
+        layer->gateType, layer->downType, layer->hidden, layer->inter)
+        ? Q8WorkspaceBytes(rows, layer->hidden, layer->inter, topk) : 0;
+    if (bytes) AllocateTensor(workspace, fastllm::INT8, {int(bytes)}, device);
+    const ResidentView view{static_cast<const uint8_t *const *>(layer->table), indices,
+        layer->experts, layer->gateType, layer->downType, layer->hidden, layer->inter,
+        bytes ? workspace.cudaData : nullptr, bytes};
+    switch (input.dataType) {
+        case fastllm::FLOAT32: return Compute<float>(input, gate, output, view, scores, topk);
+        case fastllm::FLOAT16: return Compute<half>(input, gate, output, view, scores, topk);
+        case fastllm::BFLOAT16: return Compute<__nv_bfloat16>(input, gate, output, view, scores, topk);
+        default: return false;
+    }
+}

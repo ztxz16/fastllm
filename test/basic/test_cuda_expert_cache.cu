@@ -24,6 +24,15 @@ template<class T> struct Buffer {
     std::vector<T> get() { std::vector<T> v(count); Check(cudaMemcpy(v.data(), data, count*sizeof(T), cudaMemcpyDeviceToHost)); return v; }
 };
 struct Request { int base; std::vector<int> ids; };
+struct Mirror {
+    int *host=nullptr, *device=nullptr;
+    explicit Mirror(size_t count) {
+        Check(cudaHostAlloc(&host,count*sizeof(int),cudaHostAllocMapped));
+        Check(cudaHostGetDevicePointer(&device,host,0));
+        std::fill_n(host,count,-1);
+    }
+    ~Mirror() { cudaFreeHost(host); }
+};
 struct Reference {
     std::vector<int> owner, mapping;
     std::vector<unsigned long long> ages;
@@ -66,7 +75,8 @@ static void Run(const std::vector<Request> &requests, int experts, int records,
     const unsigned long long initial=(1ULL<<32)-20;
     tick.put({initial});
     std::vector<int> flat; for(auto &r:requests) flat.insert(flat.end(),r.ids.begin(),r.ids.end()); input.put(flat);
-    fastllm::cuda::ExpertCacheView view{map.data,owner.data,ages.data,tick.data,hits.data,misses.data,slots};
+    Mirror mirror(records);
+    fastllm::cuda::ExpertCacheView view{map.data,owner.data,ages.data,tick.data,hits.data,misses.data,slots,mirror.device};
     cudaStream_t stream; Check(cudaStreamCreate(&stream));
     auto launch=[&] {
         for(size_t i=0;i<n;++i) {
@@ -88,6 +98,10 @@ static void Run(const std::vector<Request> &requests, int experts, int records,
         if(graph) Check(cudaGraphLaunch(exec,stream)); else launch();
         Check(cudaEventRecord(end,stream));
         Check(cudaStreamSynchronize(stream));
+        // Snapshot before any D2H read could add another synchronization.
+        // Both eager insertion/eviction and repeated graph replay must make
+        // the host view coherent at the stream completion boundary.
+        std::vector<int> hostMap(mirror.host,mirror.host+records);
         float elapsed=0;Check(cudaEventElapsedTime(&elapsed,begin,end));
         std::printf("TIME slots=%d threads=%d graph=%d us/call=%.6f\n",slots,threads,graph,elapsed*1000/n);
         auto actualRoutes=routes.get(), actualIds=ids.get(), actualDest=dest.get(), actualMissing=missing.get();
@@ -102,7 +116,7 @@ static void Run(const std::vector<Request> &requests, int experts, int records,
                 throw std::runtime_error("LRU request mismatch");
             }
         }
-        if(map.get()!=ref.mapping || owner.get()!=ref.owner || ages.get()!=ref.ages ||
+        if(hostMap!=ref.mapping || map.get()!=ref.mapping || owner.get()!=ref.owner || ages.get()!=ref.ages ||
            tick.get()[0]!=ref.tick || hits.get()[0]!=ref.hits || misses.get()[0]!=ref.misses)
             throw std::runtime_error("LRU state mismatch");
     }

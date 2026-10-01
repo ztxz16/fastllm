@@ -363,6 +363,7 @@ if (USE_CUDA)
         src/devices/cuda/fastllm-triton-cuda.cu
         src/devices/cuda/fastllm-ggml-cuda.cu
         src/devices/cuda/gguf_mmq/fastllm-gguf-mmq.cu
+        src/devices/cuda/gguf_mmq/fastllm-gguf-moe-stream.cu
         src/devices/cuda/attention/fastllm-attention.cu
         src/devices/cuda/attention/paged/fastllm-paged-attention-native.cu
         src/devices/cuda/linear/fastllm-linear-fp32.cu
@@ -383,6 +384,7 @@ if (USE_CUDA)
         src/devices/cuda/linear/fastllm-linear-fp8-cutlass-sm89.cu
         src/devices/cuda/moe/fastllm-moe-fp8.cu
         src/devices/cuda/moe/fastllm-moe-cache.cu
+        src/devices/cuda/moe/fastllm-moe-gguf-cache.cu
         src/devices/cuda/moe/fastllm-moe-vllm-marlin.cu
         src/devices/cuda/linear/fastllm-linear-int8.cu
         src/devices/cuda/linear/fastllm-linear-int4.cu
@@ -684,6 +686,19 @@ if (UNIT_TEST)
         fastllm_add_checked_test(cuda_gguf_iq_r4 cuda_gguf_iq_r4_test "PASS: IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS R4 CUDA" 60)
         set_tests_properties(cuda_gguf_iq_r4 PROPERTIES LABELS cuda RUN_SERIAL TRUE)
 
+        add_executable(cuda_gguf_moe_cache_test test/basic/test_cuda_gguf_moe_cache.cu)
+        target_include_directories(cuda_gguf_moe_cache_test PRIVATE include/devices/cuda third_party/gguf ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        target_link_libraries(cuda_gguf_moe_cache_test PRIVATE fastllm)
+        fastllm_add_checked_test(cuda_gguf_moe_cache cuda_gguf_moe_cache_test "PASS: generic GGUF CUDA expert cache" 300)
+        set_tests_properties(cuda_gguf_moe_cache PROPERTIES LABELS "cuda;gguf;moe" RUN_SERIAL TRUE)
+        fastllm_add_checked_test(cuda_gguf_moe_grouped cuda_gguf_moe_cache_test "PASS: grouped GGUF expert prefill" 600 --grouped)
+        set_tests_properties(cuda_gguf_moe_grouped PROPERTIES LABELS "cuda;gguf;moe" RUN_SERIAL TRUE)
+        fastllm_add_checked_test(cuda_gguf_moe_host cuda_gguf_moe_cache_test "PASS: streamed GGUF prefill" 600 --host)
+        set_tests_properties(cuda_gguf_moe_host PROPERTIES LABELS "cuda;gguf;moe" RUN_SERIAL TRUE)
+        if (USE_NUMAS)
+            fastllm_add_checked_test(cuda_gguf_moe_hybrid cuda_gguf_moe_cache_test "PASS: GGUF CPU/GPU hybrid expert decode" 300 --hybrid)
+            set_tests_properties(cuda_gguf_moe_hybrid PROPERTIES LABELS "cuda;gguf;moe;numa" RUN_SERIAL TRUE)
+        endif()
         add_executable(cuda_gguf_q2_0_test test/basic/test_cuda_gguf_q2_0.cu)
         target_link_libraries(cuda_gguf_q2_0_test PRIVATE fastllm)
         target_include_directories(cuda_gguf_q2_0_test PRIVATE src/devices/cuda ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

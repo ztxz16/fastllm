@@ -458,6 +458,9 @@ fastllm_lib.set_layered_moe_device_map.argtypes = [ctypes.c_int, ctypes.c_void_p
 fastllm_lib.set_moe_device_layers.argtypes = [ctypes.c_int]
 fastllm_lib.set_ngram_device.argtypes = [ctypes.c_char_p]
 fastllm_lib.set_moe_cuda_cache.argtypes = [ctypes.c_uint64]
+if hasattr(fastllm_lib, "fastllm_moe_cuda_cache_stats"):
+    fastllm_lib.fastllm_moe_cuda_cache_stats.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_uint64), ctypes.c_bool]
+    fastllm_lib.fastllm_moe_cuda_cache_stats.restype = ctypes.c_bool
 fastllm_lib.set_moe_cpu_cache.argtypes = [ctypes.c_uint64]
 fastllm_lib.get_disk_moe_cache_stats.argtypes = [ctypes.POINTER(ctypes.c_uint64)]
 
@@ -625,6 +628,23 @@ def set_moe_cuda_cache(bytes_: int):
     if bytes_ < 0 or bytes_ > (1 << 64) - 1:
         raise ValueError("MoE CUDA cache size must fit in uint64")
     fastllm_lib.set_moe_cuda_cache(ctypes.c_uint64(bytes_));
+
+def get_moe_cuda_cache_stats(device: int = 0, reset: bool = False):
+    """Synchronize a CUDA device and read expert-cache counters outside inference timing.
+
+    Reset clears route counters only; cached weights and LRU residency are retained.
+    Byte and slot counts cover all prepared expert tables on the selected device.
+    """
+    query = getattr(fastllm_lib, "fastllm_moe_cuda_cache_stats", None)
+    if query is None:
+        raise RuntimeError("GPU expert-cache statistics require an updated CUDA build")
+    values = (ctypes.c_uint64 * 5)()
+    if not query(int(device), values, bool(reset)):
+        raise RuntimeError("Could not read GPU expert-cache statistics")
+    result = dict(zip(("hits", "misses", "payload_bytes", "slots", "records"), values))
+    routes = result["hits"] + result["misses"]
+    result["hit_rate"] = result["hits"] / routes if routes else None
+    return result
 
 def set_moe_cpu_cache(bytes_: int):
     bytes_ = int(bytes_)

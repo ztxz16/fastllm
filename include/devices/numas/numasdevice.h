@@ -7,6 +7,7 @@
 
 #include "device.h"
 #include "devices/cpu/cpudevice.h"
+#include <functional>
 
 namespace fastllm {
     // Plan local CPU sets for CUDA submission, excluding expert-worker cores
@@ -68,6 +69,13 @@ namespace fastllm {
         Data **weights, const int32_t *indices, const int32_t *gpuIndices,
         int topk, int layer, const float *routeScores = nullptr,
         float swigluLimit = 0.0f);
+
+    // Submit independent GPU work while the single-row gate/up CPU jobs run.
+    // The callback must not reuse this layer's MoE workspace or submit work
+    // to the shared CPU pool. All expert workers finish before return/throw.
+    void NumasMoeDecodeExpertsWithOverlap(const float *input, float *output,
+        Data **weights, const int32_t *indices, const int32_t *gpuIndices,
+        int topk, int layer, const std::function<void()> &submitGpu);
 
     // FP32 verifier subset, returning unweighted [row, route, hidden] values.
     // An expert must have the same CPU/GPU ownership in every input row.

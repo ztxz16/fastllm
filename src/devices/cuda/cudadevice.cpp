@@ -8815,6 +8815,10 @@ namespace fastllm {
 
     struct CudaMergeMoeFromCpuWorkspace {
         std::mutex mutex;
+#ifndef USE_ROCM
+        Data ggufGate;
+        Data ggufWorkspace;
+#endif
         Data tempInput;
         Data tempMiddle;
         Data tempSwiglu;
@@ -8902,6 +8906,17 @@ namespace fastllm {
             }
         }
         int m = maxExpert + 1; // 专家数量
+
+#ifndef USE_ROCM
+        if (setZero && !deepSeekV4Mode && gateType == MoeGateSwiglu &&
+            output.dataType == input.dataType && output.dims == input.dims &&
+            FastllmCudaMergeMOEGGUFHost(input, workspace.ggufGate,
+                workspace.ggufWorkspace, output, weights, m, indexData,
+                scoreData, topk, experts, isCrossSwiglu)) {
+            input.FreeCudaTemporary({}, false);
+            return;
+        }
+#endif
         
         std::vector <std::vector <std::pair <int, float> > > expertTasks; // expertTasks[i]代表专家i的task, expertTasks[i][j] = (第j个任务对应的行数， 权重)
         expertTasks.resize(m + 1);
@@ -9716,6 +9731,26 @@ namespace fastllm {
             "Prepared CUDA expert cache failed during decode.");
         return true;
     }
+
+    static bool TryCudaMergeMOEGGUFResidentIndexed(
+            const Data &input, Data &output, const Data &index,
+            const Data &score, Data &gateOutput, Data &workspace,
+            Data **weights, int weightsBatch, float sharedScale,
+            MoeGateType gateType) {
+        if (gateType != MoeGateSwiglu || !IsCudaMergeMoeGGUFInputType(input.dataType) ||
+            input.dataDevice != DataDevice::CUDA || input.dims.size() != 2 || input.dims[0] <= 0 ||
+            index.dataDevice != DataDevice::CUDA || index.dataType != DataType::INT32 ||
+            index.dims.size() != 2 || index.dims[0] != input.dims[0] ||
+            score.dataDevice != DataDevice::CUDA || score.dataType != DataType::FLOAT32 ||
+            score.dims != index.dims || weights == nullptr || weightsBatch < 4 ||
+            (weights[0] != nullptr && sharedScale != 0.0f)) {
+            return false;
+        }
+        return FastllmCudaMergeMOEGGUFResidentIndexed(
+            input, gateOutput, workspace, output, weights, weightsBatch,
+            reinterpret_cast<const int32_t *>(index.cudaData),
+            reinterpret_cast<const float *>(score.cudaData), index.dims[1]);
+    }
 #endif
 
     static bool TryCudaMergeMOEBatch1Fp8(
@@ -10180,6 +10215,11 @@ namespace fastllm {
             if (TryCudaMergeMOECache(
                     input, output, index, score,
                     w1, weights, weightsBatch, gateType)) {
+                return;
+            }
+            if (TryCudaMergeMOEGGUFResidentIndexed(
+                    input, output, index, score, w1, w2,
+                    weights, weightsBatch, sharedScale, gateType)) {
                 return;
             }
 #endif

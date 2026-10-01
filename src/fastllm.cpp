@@ -2222,6 +2222,11 @@ namespace fastllm {
     void Data::FreeSpace() {
         if (isFake)
             return;
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        if (this->dataType == DataType::DATA_GGUF_FORMAT) {
+            FastllmCudaReleaseMoeGGUFResident(this);
+        }
+#endif
         if (this->cudaNativeNvfp4Layout) { this->cudaNativeNvfp4Layout = false; this->IsRepacked = false; }
         this->expansionSize = 0;
         this->expansionBytes = 0;
@@ -2394,6 +2399,11 @@ namespace fastllm {
             ReleaseDiskMoeCache(this);
         }
 #ifdef USE_CUDA
+#ifndef USE_ROCM
+        if (this->dataType == DataType::DATA_GGUF_FORMAT) {
+            FastllmCudaReleaseMoeGGUFResident(this);
+        }
+#endif
         // Hash-route tables keep per-device CUDA replicas while the owning
         // Data is alive. Retire them before either this object or its CPU
         // allocation can be reused by a subsequently loaded model.
@@ -2787,6 +2797,11 @@ namespace fastllm {
         if (alreadyOnTarget) {
             return;
         }
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        if (this->dataType == DataType::DATA_GGUF_FORMAT) {
+            FastllmCudaReleaseMoeGGUFResident(this);
+        }
+#endif
 
         if (this->expansionBytes != 0) {
 #ifdef USE_CUDA

@@ -935,11 +935,16 @@ template <ggml_type type, typename OutputType>
 static void launch_mmq_type(
         ggml_backend_cuda_context &context, const mmq_args &args,
         OutputType *output, cudaStream_t stream) {
-    // The verifier always supplies exactly eight rows.  The imported chooser
-    // would select mmq_x=8 here; using the prefill-oriented 128-row tile makes
-    // the tensor-core kernel calculate 120 masked rows for every output tile.
+    // Match the token tile to small verifier and prefill batches. A fixed
+    // 128-row tile also computes the rows masked out during write-back.
     if (args.ne11 <= 8) {
         launch_mul_mat_q_to_output<type, 8, OutputType>(
+            context, args, output, stream);
+    } else if (args.ne11 <= 32) {
+        launch_mul_mat_q_to_output<type, 32, OutputType>(
+            context, args, output, stream);
+    } else if (args.ne11 <= 64) {
+        launch_mul_mat_q_to_output<type, 64, OutputType>(
             context, args, output, stream);
     } else {
         launch_mul_mat_q_to_output<type, 128, OutputType>(
@@ -1083,6 +1088,8 @@ static bool matmul(
     return true;
 }
 
+#include "fastllm-gguf-moe-grouped.cuh"
+
 } // namespace fastllm_gguf_mmq
 
 bool FastllmCudaHalfMatMulGGUFMMQ(
@@ -1139,4 +1146,37 @@ bool FastllmCudaHalfGgufGateUpSiluMulMMVQ(
         static_cast<const half *>(input), gate_weight, up_weight,
         static_cast<half *>(output), static_cast<ggml_type>(weight_type),
         n, m, k, reinterpret_cast<cudaStream_t>(stream));
+}
+
+size_t FastllmCudaMoeGGUFGroupedWorkspaceBytes(int gateType, int downType,
+        int rows, int hidden, int inter, int experts, int topk) {
+    using namespace fastllm_gguf_mmq;
+    if (rows <= 32 || rows > 4096 || experts <= 0 || experts > 1024 || topk <= 0 || topk > 32 ||
+        rows*topk+experts*(grouped_moe::kTile-1)+grouped_moe::kTile-1 > 65535 ||
+        hidden <= 0 || hidden > 24576 || inter <= 0 || inter > 24576 ||
+        !(grouped_moe::MatrixType(gateType, hidden) ||
+          (gateType == GGML_TYPE_IQ1_M && hidden%256 == 0)) ||
+        !grouped_moe::MatrixType(downType, inter)) return 0;
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (!int8_mma_available(cc)) return 0;
+    return grouped_moe::Workspace(nullptr, rows, hidden, inter, experts, topk).bytes;
+}
+
+bool FastllmCudaMoeGGUFGrouped(const fastllm::Data &input, fastllm::Data &gate,
+        fastllm::Data &output, const void *weightPointers, const int32_t *indices,
+        const float *scores, void *workspace, int gateType, int downType,
+        int hidden, int inter, int experts, int topk) {
+    using namespace fastllm_gguf_mmq;
+    const auto *weights = static_cast<const uint8_t *const *>(weightPointers);
+    switch (input.dataType) {
+#define GROUPED_RUN(DType, T) case fastllm::DType: return grouped_moe::Run( \
+            static_cast<const T *>(input.cudaData), static_cast<T *>(gate.cudaData), \
+            static_cast<T *>(output.cudaData), weights, indices, scores, workspace, \
+            gateType, downType, input.dims[0], hidden, inter, experts, topk);
+        GROUPED_RUN(FLOAT32, float)
+        GROUPED_RUN(FLOAT16, half)
+        GROUPED_RUN(BFLOAT16, __nv_bfloat16)
+#undef GROUPED_RUN
+        default: return false;
+    }
 }
