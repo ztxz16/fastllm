@@ -220,7 +220,62 @@ struct Qwen4GGUFTestAccess {
         Check(m.IsLinearAttentionLayer(0) && !m.IsLinearAttentionLayer(1) && m.indexerCompressRatio == 2, "attention layout metadata");
     }
     static void Prepare(Qwen4ExpModel &m) { m.PrepareWeights(); }
+    static bool HasMtp(const Qwen4ExpModel &m) { return m.HasMtpWeights(); }
 };
+}
+static void TestMtpImport(Fixture &fixture) {
+    std::vector<Tensor> tensors;
+    auto add = [&](const std::string &name, std::vector<int> dims, ggml_type type) {
+        size_t n = 1; for (int d : dims) n *= d;
+        tensors.push_back(FloatTensor(name, dims, type, std::vector<float>(n, 0)));
+    };
+    for (const std::string &name : {"pre_fc_norm_embedding", "pre_fc_norm_hidden"})
+        add("mtp." + name + ".weight", {name == "pre_fc_norm_hidden" ? 512 : 256}, GGML_TYPE_F32);
+    add("mtp.fc_embedding.weight", {256, 256}, GGML_TYPE_BF16);
+    add("mtp.fc_hidden.weight", {256, 256}, GGML_TYPE_BF16);
+    for (const std::string &prefix : {"mtp.hyper_connection_mixer.", "mtp.layers.0.attn_hyper_connection.", "mtp.layers.0.mlp_hyper_connection."}) {
+        add(prefix + "hc_norm.weight", {512}, GGML_TYPE_F32);
+        add(prefix + "input_mix_weight_down.weight", {4, 512}, GGML_TYPE_BF16);
+        add(prefix + "input_mix_weight_up.weight", {512, 4}, GGML_TYPE_BF16);
+        if (prefix != "mtp.hyper_connection_mixer.") add(prefix + "block_inject_weight.weight", {2, 512}, GGML_TYPE_BF16);
+    }
+    const std::string attn = "mtp.layers.0.self_attn.";
+    add(attn + "q_proj.weight", {16, 256}, GGML_TYPE_BF16);
+    add(attn + "k_proj.weight", {4, 256}, GGML_TYPE_BF16);
+    add(attn + "v_proj.weight", {4, 256}, GGML_TYPE_BF16);
+    add(attn + "o_proj.weight", {256, 8}, GGML_TYPE_BF16);
+    for (const std::string &name : {"q_norm", "k_norm", "indexer.q_layernorm", "indexer.k_layernorm"})
+        add(attn + name + ".weight", {4}, GGML_TYPE_F32);
+    add(attn + "indexer.index_qk_proj.weight", {8, 256}, GGML_TYPE_BF16);
+    const std::string mlp = "mtp.layers.0.mlp.";
+    add(mlp + "gate.weight", {2, 256}, GGML_TYPE_BF16);
+    add(mlp + "shared_expert_gate.weight", {1, 256}, GGML_TYPE_BF16);
+    for (const std::string &name : {"gate", "up"}) add(mlp + "shared_expert." + name + "_proj.weight", {32, 256}, GGML_TYPE_BF16);
+    add(mlp + "shared_expert.down_proj.weight", {256, 32}, GGML_TYPE_BF16);
+    add(mlp + "experts.gate_up_proj", {2, 64, 256}, GGML_TYPE_Q8_0);
+    add(mlp + "experts.down_proj", {2, 256, 32}, GGML_TYPE_Q8_0);
+    const std::string path = fixture.directory + "/mtp.gguf";
+    Write(path, {{"general.architecture", "qwen4exp-mtp"}}, tensors);
+    fixture.files.push_back(path);
+    setenv("FASTLLM_QWEN4_ENABLE_MTP", "3", 1);
+    auto loaded = CreateLLMModelFromGGUFFile(fixture.files[0], "", path);
+    auto *model = dynamic_cast<Qwen4ExpModel *>(loaded.get());
+    Check(model && Qwen4GGUFTestAccess::HasMtp(*model), "external MTP GGUF was silently disabled");
+    for (int e = 0; e < 2; ++e) {
+        const auto &gate = model->weight[mlp + "experts." + std::to_string(e) + ".gateup_proj.weight"];
+        const auto &down = model->weight[mlp + "experts." + std::to_string(e) + ".down_proj.weight"];
+        Check(gate.dims == std::vector<int>({64, 256}) && down.dims == std::vector<int>({256, 32}), "MTP packed expert split shape");
+        Check(gate.dataType == DATA_GGUF_FORMAT && down.dataType == DATA_GGUF_FORMAT && gate.ggmlType == GGML_TYPE_Q8_0, "MTP packed experts were expanded");
+    }
+    Check(model->weight["mtp.pre_fc_norm_hidden.weight"].dataType == FLOAT32, "MTP norm must remain FP32");
+    Check(model->weight["mtp.fc_hidden.weight"].dataType == FLOAT16, "MTP dense must use FP16");
+    Qwen4GGUFTestAccess::Prepare(*model);
+    Check(Qwen4GGUFTestAccess::HasMtp(*model), "MTP weights lost during prepare");
+    Check(At(model->weight["mtp.pre_fc_norm_hidden.weight"], 0) == 1.0f, "raw HF MTP norm offset missing");
+    Qwen4GGUFTestAccess::Prepare(*model);
+    Check(At(model->weight["mtp.layers.0.self_attn.indexer.k_layernorm.weight"], 0) == 1.0f, "MTP norm offset applied twice");
+    setenv("FASTLLM_QWEN4_ENABLE_MTP", "0", 1);
+    std::cout << "PASS: external Qwen4 MTP GGUF, packed expert split, dense/norm dtype and preparation\n";
 }
 int main() {
     try {
@@ -228,6 +283,7 @@ int main() {
         SetMoeCudaCacheBytes(0); setenv("FASTLLM_QWEN4_ENABLE_MTP", "0", 1);
         Fixture fixture;
         TestFloatImport(fixture.directory);
+        TestMtpImport(fixture);
         for (bool disk : {true, false}) {
             SetNgramDevice(disk ? "disk" : "cpu");
             auto base = CreateLLMModelFromGGUFFile(fixture.files[0], "");

@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import struct
 import sys
 import tempfile
 import types
@@ -178,6 +179,32 @@ class SpeculativeDraftCliAliasesTest(unittest.TestCase):
             ])
             with self.assertRaisesRegex(ValueError, "different MTP draft counts"):
                 make_normal_llm_model(args)
+
+    def test_qwen4_mtp_gguf_without_adjacent_config(self):
+        def string(value):
+            data = value.encode()
+            return struct.pack("<Q", len(data)) + data
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "mtp.gguf")
+            def write(architecture, name):
+                with open(path, "wb") as file:
+                    file.write(b"GGUF" + struct.pack("<IQQ", 3, 1, 1))
+                    file.write(string("general.architecture") + struct.pack("<I", 8) + string(architecture))
+                    file.write(string(name) + struct.pack("<IQQIQ", 2, 256, 256, 1, 0))
+            write("qwen4exp-mtp", "mtp.fc_hidden.weight")
+            with patch.dict(os.environ, {}, clear=True):
+                args = self.configure_without_target(["--draft", path, "--mtp", "3"])
+                self.assertEqual(args.speculative_algorithm, "mtp")
+                self.assertEqual(args.mtp, 3)
+                self.assertEqual(args.speculative_draft_model_path, path)
+            for architecture, name, message in [
+                ("qwen4exp", "mtp.fc_hidden.weight", "qwen4exp-mtp architecture"),
+                ("qwen4exp-mtp", "output.weight", "only mtp"),
+            ]:
+                write(architecture, name)
+                args = make_normal_parser("test").parse_args(["--draft", path, "--mtp", "3"])
+                with self.assertRaisesRegex(ValueError, message):
+                    make_normal_llm_model(args)
 
     def test_external_mtp_requires_qwen35_config(self):
         with tempfile.TemporaryDirectory() as draft_path:

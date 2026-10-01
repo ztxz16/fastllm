@@ -3863,7 +3863,27 @@ namespace fastllm {
         }
 
         json11::Json externalMtpTextConfig;
-        if (!externalMtpPath.empty()) {
+        const bool externalMtpGGUF = !externalMtpPath.empty() &&
+            StringEndWith(externalMtpPath, ".gguf");
+        if (externalMtpGGUF) {
+            AssertInFastLLM(model->model_struct == "qwen4_exp",
+                "External MTP GGUF requires a Qwen4-Exp target.");
+            json11::Json mtpMetadata;
+            ReadGGUFMetaData(externalMtpPath, mtpMetadata);
+            AssertInFastLLM(mtpMetadata["params"]["general.architecture"].string_value() == "qwen4exp-mtp",
+                "External Qwen4 MTP GGUF has an incompatible architecture.");
+            // These files are auxiliary weights, not another target shard.
+            // Validate names before appending so they cannot replace target weights.
+            std::vector<ReadGGUFTask> mtpTasks;
+            AppendGGUFTasks(model->model_struct, externalMtpPath, mtpTasks);
+            AssertInFastLLM(!mtpTasks.empty(), "External MTP GGUF has no tensors.");
+            for (const auto &task : mtpTasks) {
+                AssertInFastLLM(task.name.compare(0, 4, "mtp.") == 0,
+                    "External MTP GGUF contains a non-MTP tensor: " + task.name);
+            }
+            ggufFileNames.push_back(externalMtpPath);
+            printf("[Fastllm] GGUF target: loading Qwen4 MTP GGUF from %s\n", externalMtpPath.c_str());
+        } else if (!externalMtpPath.empty()) {
             AssertInFastLLM(
                 model->model_struct == "qwen3_5" ||
                     ConvertGGUFTypeToFastllmType(arch) == "qwen3_5",
@@ -4471,6 +4491,17 @@ namespace fastllm {
         }
         loadGGUFWeights(parallelTensors);
         model->OnWeightLoadGroupFinished();
+        if (externalMtpGGUF) {
+            // qwen4exp-mtp stores raw HF norm weights, unlike target GGUF's
+            // effective gamma. Let Qwen4 PrepareWeights apply the HF +1 once.
+            for (auto &item : model->weight.weight) {
+                if (StartWith(item.first, "mtp.") &&
+                    item.first.find("norm") != std::string::npos &&
+                    item.second.dataType == DataType::FLOAT32) {
+                    item.second.isGGUFData = false;
+                }
+            }
+        }
         if (forceSafeGgufDequant) {
             for (auto &item : model->weight.weight) {
                 if (item.second.isGGUFData ||

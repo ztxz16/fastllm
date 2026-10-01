@@ -8,9 +8,9 @@ import math
 from decimal import Decimal, InvalidOperation, localcontext
 
 try:
-    from .gguf_metadata import get_gguf_model_config
+    from .gguf_metadata import get_gguf_model_config, read_gguf_metadata, read_gguf_tensor_names
 except ImportError:
-    from gguf_metadata import get_gguf_model_config
+    from gguf_metadata import get_gguf_model_config, read_gguf_metadata, read_gguf_tensor_names
 
 def _positive_int(value: str) -> int:
     try:
@@ -909,7 +909,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument("--speculative_draft_model_path", "--speculative-draft-model-path",
                         "--draft", "--draft_model_path", "--dspark_model",
                         dest = "speculative_draft_model_path", type = str, default = "",
-                        help = "MTP/DSpark/DFlash draft 模型目录；MTP 也可直接指定 mtp.safetensors")
+                        help = "MTP/DSpark/DFlash draft 模型目录；MTP 也可指定 mtp.safetensors 或 Qwen4 MTP GGUF")
     parser.add_argument("--draft_tokens", type = _positive_int, default = -1,
                         help = "每轮最多使用的 draft token 数；未指定时读取 draft 配置")
     parser.add_argument("--speculative_num_draft_tokens", "--speculative-num-draft-tokens",
@@ -1012,38 +1012,52 @@ def make_normal_llm_model(args, startup_progress = None):
     draft_architectures = []
     draft_text_config = {}
     draft_has_mtp_weights = False
+    draft_is_mtp_gguf = False
     if speculative_draft_path:
         speculative_draft_path = os.path.abspath(
             os.path.expanduser(speculative_draft_path))
         draft_is_file = os.path.isfile(speculative_draft_path)
-        draft_config_dir = (os.path.dirname(speculative_draft_path)
-                            if draft_is_file else speculative_draft_path)
-        draft_config_path = os.path.join(draft_config_dir, "config.json")
-        if not os.path.isfile(draft_config_path):
-            raise ValueError(
-                "speculative draft model has no adjacent config.json: %s" %
-                speculative_draft_path)
-        with open(draft_config_path, "r", encoding = "utf-8") as file:
-            draft_config = json.load(file)
-        draft_architectures = draft_config.get("architectures", [])
-        draft_text_config = draft_config.get("text_config", draft_config)
-        if not isinstance(draft_text_config, dict):
-            draft_text_config = {}
-        draft_has_mtp_weights = (
-            (draft_is_file and
-             speculative_draft_path.lower().endswith(".safetensors")) or
-            os.path.isfile(os.path.join(draft_config_dir, "mtp.safetensors")))
-        if not draft_has_mtp_weights:
-            draft_index_path = os.path.join(
-                draft_config_dir, "model.safetensors.index.json")
-            if os.path.isfile(draft_index_path):
-                with open(draft_index_path, "r", encoding = "utf-8") as file:
-                    draft_index = json.load(file)
-                draft_weight_map = draft_index.get("weight_map", {})
-                draft_has_mtp_weights = isinstance(
-                    draft_weight_map, dict) and any(
-                        str(name).startswith("mtp.")
-                        for name in draft_weight_map)
+        draft_is_mtp_gguf = draft_is_file and speculative_draft_path.lower().endswith(".gguf")
+        if draft_is_mtp_gguf:
+            metadata = read_gguf_metadata(speculative_draft_path, {"general.architecture"})
+            if metadata.get("general.architecture") != "qwen4exp-mtp":
+                raise ValueError("external MTP GGUF must have qwen4exp-mtp architecture")
+            names = read_gguf_tensor_names(speculative_draft_path)
+            if not names or any(not name.startswith("mtp.") for name in names):
+                raise ValueError("external MTP GGUF must contain only mtp.* tensors")
+            draft_has_mtp_weights = True
+            draft_text_config = {"model_type": "qwen4_exp", "mtp_num_hidden_layers": 1}
+            if speculative_algorithm and speculative_algorithm != "mtp":
+                raise ValueError("Qwen4 MTP GGUF requires the mtp speculative algorithm")
+        else:
+            draft_config_dir = (os.path.dirname(speculative_draft_path)
+                                if draft_is_file else speculative_draft_path)
+            draft_config_path = os.path.join(draft_config_dir, "config.json")
+            if not os.path.isfile(draft_config_path):
+                raise ValueError(
+                    "speculative draft model has no adjacent config.json: %s" %
+                    speculative_draft_path)
+            with open(draft_config_path, "r", encoding = "utf-8") as file:
+                draft_config = json.load(file)
+            draft_architectures = draft_config.get("architectures", [])
+            draft_text_config = draft_config.get("text_config", draft_config)
+            if not isinstance(draft_text_config, dict):
+                draft_text_config = {}
+            draft_has_mtp_weights = (
+                (draft_is_file and
+                 speculative_draft_path.lower().endswith(".safetensors")) or
+                os.path.isfile(os.path.join(draft_config_dir, "mtp.safetensors")))
+            if not draft_has_mtp_weights:
+                draft_index_path = os.path.join(
+                    draft_config_dir, "model.safetensors.index.json")
+                if os.path.isfile(draft_index_path):
+                    with open(draft_index_path, "r", encoding = "utf-8") as file:
+                        draft_index = json.load(file)
+                    draft_weight_map = draft_index.get("weight_map", {})
+                    draft_has_mtp_weights = isinstance(
+                        draft_weight_map, dict) and any(
+                            str(name).startswith("mtp.")
+                            for name in draft_weight_map)
         if not speculative_algorithm:
             if "DFlash2DraftModel" in draft_architectures:
                 speculative_algorithm = "dflash"
@@ -1136,7 +1150,7 @@ def make_normal_llm_model(args, startup_progress = None):
                     speculative_draft_path)
             draft_model_type = str(
                 draft_text_config.get("model_type", "") or "")
-            if draft_model_type not in ("qwen3_5", "qwen3_5_text"):
+            if not draft_is_mtp_gguf and draft_model_type not in ("qwen3_5", "qwen3_5_text"):
                 raise ValueError(
                     "external MTP checkpoint must be Qwen3.5, got model_type=%s" %
                     draft_model_type)

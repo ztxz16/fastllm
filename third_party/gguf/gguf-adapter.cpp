@@ -51,6 +51,14 @@ namespace fastllm {
         add(R"(blk\.(\d+)\.ple_(key|value)\.weight)", layer + "ple.$2_proj.weight");
         add(R"(blk\.(\d+)\.ple_norm_(key|query|conv)\.weight)", layer + "ple.norm_$2.weight", Rule::GGUFWeightReplaceForceFP32);
         add(R"(blk\.(\d+)\.ple_conv1d\.weight)", layer + "ple.conv1d.weight", Rule::GGUFWeightReplaceForceFP32);
+        // External Qwen4 MTP GGUFs retain the HF tensor names. Split packed
+        // routed experts before NUMA registration, preserving ordinary blocks.
+        rules.emplace_back(std::regex(R"(^mtp\.layers\.0\.mlp\.experts\.gate_up_proj$)"),
+            std::vector<std::string>{"mtp.layers.0.mlp.experts.", ".gateup_proj.weight"}, Rule::GGUFWeightReplacePacked);
+        rules.emplace_back(std::regex(R"(^mtp\.layers\.0\.mlp\.experts\.down_proj$)"),
+            std::vector<std::string>{"mtp.layers.0.mlp.experts.", ".down_proj.weight"}, Rule::GGUFWeightReplacePacked);
+        add(R"((mtp\..*norm.*\.weight))", "$1", Rule::GGUFWeightReplaceForceFP32);
+        add(R"((mtp\.(?!.*norm).*\.weight))", "$1");
         return rules;
     }
 

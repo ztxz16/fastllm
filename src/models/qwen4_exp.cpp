@@ -3121,7 +3121,8 @@ namespace fastllm {
             return false;
         }
         const std::string mainLayerPrefix = languagePrefix + "layers.";
-        return Qwen4StartsWith(weightName, mainLayerPrefix) &&
+        return (Qwen4StartsWith(weightName, mainLayerPrefix) ||
+                Qwen4StartsWith(weightName, kMtpExpertPrefix)) &&
                weightName.find(".mlp.experts.") != std::string::npos &&
                (Qwen4EndsWith(weightName, ".gateup_proj.weight") ||
                 Qwen4EndsWith(weightName, ".down_proj.weight"));
@@ -3249,15 +3250,6 @@ namespace fastllm {
                 Qwen4AddOne(this->weight[ple + "norm_conv.weight"]);
             }
         }
-        if (MoeCudaCacheRequested()) {
-            if (!PrepareMoeCudaCache(this->weights)) {
-                std::fprintf(
-                    stderr,
-                    "[Fastllm] Qwen4 CUDA expert cache was "
-                    "requested but could not be prepared; using the "
-                    "configured MoE device.\n");
-            }
-        }
         Qwen4AddOne(this->weight[languagePrefix +
             "hyper_connection_mixer.hc_norm.weight"]);
         this->mtpMoeWeights.clear();
@@ -3305,6 +3297,31 @@ namespace fastllm {
             }
         }
         this->mtpWeightsStatus.store(hasMtpWeights ? 1 : 0, std::memory_order_release);
+        if (MoeCudaCacheRequested()) {
+            bool cachePrepared = false;
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+            if (hasMtpWeights && !weights.empty() && weights[0].size() > 2 &&
+                weights[0][2]->isGGUFData && mtpMoeWeights[2]->isGGUFData) {
+                // Original table addresses must be retained as cache keys.
+                // Main and draft experts share one budget and LRU pool.
+                std::vector<FastllmCudaMoeCacheLayer> cacheLayers;
+                for (int layer = 0; layer <= block_cnt; ++layer) {
+                    const std::string device = SelectMoeDeviceForLayer(std::min(layer, block_cnt - 1));
+                    if (device != "cpu" && device != "numa" && device.compare(0, 5, "numa:") != 0) continue;
+                    const auto &table = layer == block_cnt ? mtpMoeWeights : weights[layer];
+                    cacheLayers.push_back({table.data(), static_cast<int>(table.size())});
+                }
+                cachePrepared = !cacheLayers.empty() && FastllmCudaPrepareMoeCache(
+                    cacheLayers.data(), static_cast<int>(cacheLayers.size()));
+            } else
+#endif
+            {
+                cachePrepared = PrepareMoeCudaCache(this->weights);
+            }
+            if (!cachePrepared) {
+                std::fprintf(stderr, "[Fastllm] Qwen4 CUDA expert cache unavailable; using the configured MoE device.\n");
+            }
+        }
         // Direct API callers can skip AutoWarmup. Register all NUMA experts
         // before requests (and before TP borrows their storage), even without
         // a CUDA expert cache. Lazy per-route registration frees source heaps
