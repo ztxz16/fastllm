@@ -693,6 +693,44 @@ FT_NUMAS=2 numactl -C 0-63 -m 0,1 \
 python -m unittest discover -s test -p test_naive_n05_export_nvfp4.py -v
 ```
 
+### 八卡 CUDA 专家推理
+
+CUDA 专家使用现有的紧凑 `NVFP4_BLOCK_16_E4M3_PACKED` 行布局：每行保存
+4 字节原始 FP32 全局缩放，每 16 个权重保存 8 字节 FP4 数据和 1 字节原始 E4M3
+分块缩放，行末对齐到 4 字节。保留一份 GPU 专家权重，模型文件无需重新导出。
+CPU/NUMA 专家继续使用原始紧凑布局。
+
+Gate 和 Up 各行保留自己的全局缩放，避免归一化到同一最小值造成溢出。
+CUDA MoE 支持默认 BF16 和 FP16 激活，沿用原生 FP32 分块缩放路径的点积顺序、
+归约、SwiGLU 和路由舍入。内核按需解码 FP8 并乘行全局缩放，不缓存展开的 FP32
+分块缩放。测试用两种布局的同一权重检查输出逐 bit 一致。
+8 张 32 GiB RTX 5090 可以使用普通设备映射把 48 层分配到八卡：
+
+```bash
+ftllm server ~/hfmodels/Naive-N0.5-Flash-MoE-NVFP4 \
+  --device '["cuda:0","cuda:1","cuda:2","cuda:3","cuda:4","cuda:5","cuda:6","cuda:7"]' \
+  --moe_device '["cuda:0","cuda:1","cuda:2","cuda:3","cuda:4","cuda:5","cuda:6","cuda:7"]' \
+  --max_batch 1 --mtp 0 --tokens 8192 --chunked_prefill_size 512 \
+  --cuda_slab 288 --cache_history false
+```
+
+这是按层分配，不是张量并行。对该 checkpoint 的 3028 亿个专家参数，紧凑专家数据
+连同行全局缩放约占 158.992 GiB；相比每块保存 FP32 缩放的 12 字节布局，
+减少约 52.508 GiB。
+实际进程显存还包含稠密权重、KV cache、工作区和分配器开销。
+
+`cuda_nvfp4_compact_moe_test` 用独立 FP64 参考检查原始 FP4/FP8 解码、不同 Gate/Up
+全局缩放、零与最大分块缩放，以及 BF16/FP16 的多种路由批次，并与 FP32 分块
+缩放布局逐 bit 对比。开启 `UNIT_TEST`
+后可编译并运行：
+
+```bash
+cmake --build build-fastllm --target cuda_nvfp4_compact_moe_test -j16
+ctest --test-dir build-fastllm --output-on-failure -R '^cuda_nvfp4_compact_moe$'
+```
+
+八卡整模型短请求实测显存约 19.7–23.9 GiB/卡，中文解释和代码生成普通解码约 51.4–55.4 token/s。生成的二分查找函数通过 980 项独立检查，2977-token 输入跨越滑窗边界后仍正确回答。与已验证 FP32 分块缩放版本比较，9 个位置的全部 152576 维 logits 均有限，top-1 全部一致，最大 KL 为 0.012838。这些是有限输入的数值与短请求验证，不代表完整质量评估或长上下文吞吐。
+
 ### NVFP4 实测（投影优化前）
 
 本节保留量化导出时的对比；投影优化后的 NVFP4 速度见
@@ -714,7 +752,7 @@ python -m unittest discover -s test -p test_naive_n05_export_nvfp4.py -v
 
 **长输入 prefill 变慢**：2057-token 重复输入，普通模式由 8.530 秒增加到
 12.075 秒，推测模式由 8.542 秒增加到 12.101 秒，约 170 输入 token/s，吞吐下降
-29.4%。当前紧凑 NVFP4 + BF16 激活的 GPU 专家 prefill 不支持，专家由 CPU 执行；
+29.4%。该次测试使用的版本不支持紧凑 NVFP4 + BF16 的 GPU 专家 prefill，专家由 CPU 执行；
 FP8 双 NUMA 基线的专家 prefill 也使用 CPU。短编程提示 TTFT 为 0.82–0.91 秒。
 
 精度检查使用同一固定续写前缀、全部 152576 维 logits，与当前 FastLLM FP8 版本
@@ -941,3 +979,50 @@ FT_NUMAS=1 numactl -C 0-31 -m 0 \
 首次扩大分块、尺寸预热和缓存命中是不同条件，以上分别列出。
 最终共享库 SHA-256 与完整原始测量数值记录在调优 JSON 中；矢量图见
 [分块对照 SVG](benchmarks/naive_n05_flash_prefill_chunk_tuning.svg)。
+
+
+## 普通 decode 的长上下文优化
+
+普通解码（`--max_batch 1 --mtp 0`）会自动使用以下路径，无需额外环境变量：
+
+- 滑窗层在原分配上一次搬移 K/V 后缀，保留容量，避免每 token 重复申请、释放显存。
+  容量可能保留到最近一次 prefill 分块的大小。草稿验证期间仍保留回退所需的完整缓存。
+- 单 query Indexer 在 GPU 上执行稳定 Top-K：分数降序、同分时位置升序，正负零视为
+  同分，只选择因果范围内的位置，不足部分填 `-1`。多 query 的 prefill 继续使用 CPU 路径。
+- 超过 256 个位置的单 query attention 按 key 和输出维度分块，提高 GPU 并行度，
+  保持原来的逐项累加顺序及 BF16 舍入。短 attention 和多 query 路径保持原行为。
+
+常规 `naive_n05_decode_test` 覆盖 60 组稳定 Top-K 和 240 组连续滑窗追加/裁剪，
+检查缓存内容、显存指针及容量。attention 测试包含独立标量参考，history 测试检查
+前缀恢复、分支隔离和滑窗行为。`--quick` 提供 24 组 decode 抽样用于 sanitizer。
+
+```bash
+cmake --build build-fastllm --target naive_n05_decode_test naive_n05_attention_test naive_n05_history_test -j16
+ctest --test-dir build-fastllm --output-on-failure -R '^naive_n05_(decode|attention|history)$'
+```
+
+### 整模型性能记录（2026-10-01）
+
+完整 Naive-N0.5-Flash-MoE-NVFP4 checkpoint，8 张 RTX 5090 按层分配，BF16 激活/KV、
+紧凑 NVFP4 专家，16 线程，prefill 分块 512，关闭历史及前缀缓存。
+以下为代码整理前已验证实现的实测，基线不含本节 decode 优化：
+
+| 输入 token | 基线 decode | 优化后 decode | 提升 | 优化后首 token |
+| --- | ---: | ---: | ---: | ---: |
+| 7,565 | 31.72 token/s | 46.51 token/s | 46.6% | 18.79 秒 |
+| 16,351 | 30.48 token/s | 45.80 token/s | 50.3% | 42.98 秒 |
+| 32,727 | 29.15 token/s | 45.14 token/s | 54.9% | 94.05 秒 |
+
+每版独立进程按 A→B 顺序测试，各长度预热一次、正式三次取中位数；无 profiler。
+输入通过扩充同一代码任务的技术背景获得，输出均为相同的 69 token，代码通过 980
+项检查，缓存命中为零且无截断。这是长上下文性能测试，不是理解质量评估。
+32K 时最高单卡显存采样峰值约 24.70 GiB（500 ms 采样，非分配器精确高水位）。
+
+此前 7.5K ABBA 复测得到 31.73 → 46.42 token/s。对应 Nsight 稳态采样中，每 token
+全局 attention GPU 时间从 4.473 降至 1.309 ms，CPU 索引选择/准备区间从 4.412 ms
+降为零，156 次 malloc 和 156 次 free 均消除。GPU Top-K 自身增加了工作量，原地
+滑窗仍需搬移数据；没有按单项消融分配整体收益。追踪有可能丢事件的警告，区间
+关键计数稳定；吞吐来自独立的无 profiler 请求。
+
+完整配置、库哈希、重复范围及验证记录见
+[CUDA decode 测量数据](benchmarks/naive_n05_cuda_decode.json)。
