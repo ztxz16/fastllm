@@ -9516,7 +9516,8 @@ namespace fastllm {
     static bool IsCudaMergeMoeNVFP4WeightType(DataType dataType) {
         return dataType == DataType::NVFP4 ||
                dataType == DataType::NVFP4_BLOCK_16 ||
-               dataType == DataType::NVFP4_BLOCK_16_E8M0;
+               dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+               dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED;
     }
 
     static bool TryCudaMergeMOEBatch1Int8Indexed(

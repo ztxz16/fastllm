@@ -144,6 +144,19 @@ NaiveN05FlashModel::GetTensorMap(const std::vector<std::string> &names) {
         return name.find(".mlp.experts.") != std::string::npos &&
                (StringEndWith(name, ".weight_scale") || StringEndWith(name, ".weight_scale_2"));
     });
+    auto usesCuda = [](const std::map<std::string, int> &devices) {
+        return std::any_of(devices.begin(), devices.end(), [](const auto &device) {
+            return device.first.rfind("cuda", 0) == 0 ||
+                   device.first.rfind("multicuda", 0) == 0;
+        });
+    };
+    // Keep packed original E4M3 scales on CUDA. Native kernels decode them
+    // on demand, preserving independent gate/up globals and BF16 rounding.
+    // CPU/NUMA keeps the original compact checkpoint layout.
+    const bool cudaExperts = usesCuda(moeDeviceMap.empty() ? deviceMap : moeDeviceMap) ||
+                            (moeDeviceLayers >= 0 && usesCuda(layeredMoeDeviceMap));
+    const DataType nvfp4Type = cudaExperts ? DataType::NVFP4_BLOCK_16_E4M3_PACKED :
+                                          DataType::NVFP4_BLOCK_16_E4M3;
     for (auto &name : names) {
         if (draftEnabled && (name.rfind("layers.", 0) == 0 ||
                 name.rfind("markov_head.", 0) == 0 || name.rfind("confidence_head.", 0) == 0 ||
@@ -153,9 +166,7 @@ NaiveN05FlashModel::GetTensorMap(const std::vector<std::string> &names) {
                          name.rfind("confidence_head.", 0) == 0) ? DataType::FLOAT32 : DataType::BFLOAT16;
             result[name] = {{"dspark." + name, type}};
         } else if (compactNvfp4 && moeLinears.count(name)) {
-            // Preserve the E4M3 scale bytes for NUMA's compact grouped kernel.
-            // The loader checks the source dtype before using this layout.
-            result[name] = {{name, DataType::NVFP4_BLOCK_16_E4M3}};
+            result[name] = {{name, nvfp4Type}};
         } else if (name.find(".mlp.gate.") != std::string::npos) {
             result[name] = {{name, DataType::FLOAT32}};
         } else if (name.find(".mlp.experts.") == std::string::npos &&
