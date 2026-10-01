@@ -274,6 +274,90 @@ __global__ void AttentionShort(const BF16 *q, const BF16 *k, const BF16 *v,
     }
 }
 
+constexpr int kSwaWindow = 128;
+constexpr int kSwaQkDim = 192;
+constexpr int kSwaValueDim = 128;
+constexpr int kSwaOutputTile = 32;
+constexpr int kSwaThreads = 256;
+
+// Single-query sliding window with head dimensions 192/128. Four
+// output slices spread the work across SMs; cooperative V loads avoid the
+// reference kernel's dependent global load for every output/slot pair.
+// The softmax tree, BF16 rounding and slot-ordered FP32 FMAs are unchanged.
+__global__ void AttentionSwaDecode(const BF16 *q, const BF16 *k, const BF16 *v,
+        const float *sink, BF16 *out, int heads, int kvHeads, int keys) {
+    __shared__ float scores[kSwaWindow], scratch[kSwaThreads], maximum, denominator;
+    __shared__ BF16 values[kSwaWindow][kSwaOutputTile];
+    int h = blockIdx.x, t = threadIdx.x, lane = t % 32, warp = t / 32;
+    int kvHead = h / (heads / kvHeads), firstDim = blockIdx.z * kSwaOutputTile;
+    for (int i = t; i < keys * kSwaOutputTile; i += kSwaThreads) {
+        int row = i / kSwaOutputTile, col = i % kSwaOutputTile;
+        values[row][col] = v[((size_t)row * kvHeads + kvHead) * kSwaValueDim + firstDim + col];
+    }
+    float query[kSwaQkDim / 32];
+    #pragma unroll
+    for (int i = 0; i < kSwaQkDim / 32; ++i) query[i] = (float)q[(size_t)h * kSwaQkDim + lane + i * 32];
+    for (int slot = warp; slot < keys; slot += 8) {
+        float dot = 0;
+        #pragma unroll
+        for (int i = 0; i < kSwaQkDim / 32; ++i)
+            dot += query[i] * (float)k[((size_t)slot * kvHeads + kvHead) * kSwaQkDim + lane + i * 32];
+        dot = WarpSum(dot);
+        if (lane == 0) scores[slot] = RoundBF16(RoundBF16(dot) * rsqrtf((float)kSwaQkDim));
+    }
+    __syncthreads();
+    float bias = sink ? sink[h] : -INFINITY;
+    scratch[t] = t < keys ? fmaxf(bias, scores[t]) : bias;
+    __syncthreads();
+    // Fold the first three stages of the original 256-lane tree into
+    // warp-local work; separate scalars keep scratch reuse race-free.
+    if (t < 32) {
+        float a = fmaxf(scratch[t], scratch[t + 128]);
+        float b = fmaxf(scratch[t + 64], scratch[t + 192]);
+        float c = fmaxf(scratch[t + 32], scratch[t + 160]);
+        float d = fmaxf(scratch[t + 96], scratch[t + 224]);
+        float m = fmaxf(fmaxf(a, b), fmaxf(c, d));
+        #pragma unroll
+        for (int offset = 16; offset; offset >>= 1)
+            m = fmaxf(m, __shfl_down_sync(0xffffffffu, m, offset));
+        if (t == 0) maximum = m;
+    }
+    __syncthreads();
+    float probability = t < keys ? expf(scores[t] - maximum) : 0;
+    float sum = probability;
+    if (t == 0 && sink) sum += expf(bias - maximum);
+    scratch[t] = sum;
+    __syncthreads();
+    if (t < 32) {
+        float a = scratch[t] + scratch[t + 128];
+        float b = scratch[t + 64] + scratch[t + 192];
+        float c = scratch[t + 32] + scratch[t + 160];
+        float d = scratch[t + 96] + scratch[t + 224];
+        float total = WarpSum((a + b) + (c + d));
+        if (t == 0) denominator = total;
+    }
+    __syncthreads();
+    if (t < keys) scores[t] = denominator > 0 ? RoundBF16(probability / denominator) : 0;
+    __syncthreads();
+    if (t < kSwaOutputTile) {
+        float result = 0;
+        for (int first = 0; first < keys; first += 8) {
+            float p[8], value[8];
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                if (first + i < keys) {
+                    p[i] = scores[first + i];
+                    value[i] = (float)values[first + i][t];
+                }
+            }
+            #pragma unroll
+            for (int i = 0; i < 8; ++i)
+                if (first + i < keys) result += p[i] * value[i];
+        }
+        out[(size_t)h * kSwaValueDim + firstDim + t] = __float2bfloat16(result);
+    }
+}
+
 __global__ void AttentionValues(const float *prob, const BF16 *v, const int *indices,
                                 BF16 *out, int heads, int kvHeads, int dim,
                                 int keys, int count, int past, int window, bool causal) {
@@ -428,6 +512,17 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
     int count = indices.dims.empty() ? (window ? std::min(window + (causal ? 0 : queries - 1), keys) : keys) : indices.dims[1];
     const int *selected = indices.dims.empty() ? nullptr : (const int *)indices.cudaData;
     Output(output, DataType::BFLOAT16, {1, queries, heads * valueDim});
+    if (queries == 1 && window == kSwaWindow && causal && !selected &&
+        keys > 0 && keys <= kSwaWindow && pastLength == keys - 1 &&
+        dim == kSwaQkDim && valueDim == kSwaValueDim && key.dims[2] == kvHeads * dim) {
+        AttentionSwaDecode<<<dim3(heads, 1, kSwaValueDim / kSwaOutputTile), kSwaThreads>>>(
+            (const BF16 *)query.cudaData,
+            (const BF16 *)key.cudaData, (const BF16 *)value.cudaData,
+            sink.dims.empty() ? nullptr : (const float *)sink.cudaData,
+            (BF16 *)output.cudaData, heads, kvHeads, keys);
+        CheckLaunch();
+        return;
+    }
     if (count <= 256) {
         AttentionShort<<<dim3(heads, queries), 256>>>((const BF16 *)query.cudaData,
             (const BF16 *)key.cudaData, (const BF16 *)value.cudaData, selected,

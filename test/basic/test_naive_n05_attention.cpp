@@ -191,7 +191,13 @@ int main() {
         TestAttention(7, 0, false, false);
         TestAttention(2057, 0, true, false);
         TestAttention(2057, 0, true, false, 1);
-        TestAttention(127, 128, false, true, 1);
+        // Exercise the single-query SWA path at warp and window boundaries,
+        // with and without an attention sink. Prefill and sparse paths below
+        // retain their independent reference checks.
+        for (int past : {0, 1, 6, 30, 31, 32, 62, 63, 64, 79, 126, 127}) {
+            TestAttention(past, 128, false, false, 1);
+            TestAttention(past, 128, false, true, 1);
+        }
         TestAttention(255, 0, false, false, 1);
         TestAttention(256, 0, false, true, 1);
         TestAttention(0, 128, false, true, 54);
