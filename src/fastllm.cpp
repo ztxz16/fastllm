@@ -1123,10 +1123,33 @@ namespace fastllm {
     }
 
     void Data::CopyFrom(const Data &ori) {
+        if (this == &ori) return;
 #ifdef USE_CUDA
         if (this->cudaNativeNvfp4Layout) FastllmCudaRestoreNativeNvfp4(*this);
-#endif
+        // A clone belongs to the source device. The executor may currently
+        // point at another pipeline stage while saving an MTP checkpoint.
+        const int callerDevice = FastllmCudaGetDevice();
+        struct RestoreCopyDevice {
+            int device;
+            ~RestoreCopyDevice() { FastllmCudaSetDevice(device); }
+        } restoreDevice{callerDevice};
+        if (ori.dataDevice == DataDevice::CUDA) {
+            int sourceDevice = ori.dataDeviceIds.empty() ? callerDevice : ori.dataDeviceIds[0];
+            if (ori.cudaData != nullptr && !FastllmCudaGraphIsCapturingFast()) {
+                const int actualDevice = GetPointerDeviceId(ori.cudaData);
+                if (actualDevice >= 0) sourceDevice = actualDevice;
+            }
+            FastllmCudaSetDevice(sourceDevice);
+            this->ToDevice(DataDevice::CUDA, {sourceDevice}, false);
+            this->dataDeviceIds = {sourceDevice};
+        } else {
+            this->ToDevice(ori.dataDevice);
+            this->dataDeviceIds = ori.dataDeviceIds;
+        }
+#else
         this->ToDevice(ori.dataDevice);
+        this->dataDeviceIds = ori.dataDeviceIds;
+#endif
         this->name = ori.name;
         this->isKVCache = ori.isKVCache;
         this->isLinearAttention = ori.isLinearAttention;
@@ -2890,6 +2913,13 @@ namespace fastllm {
                 }
             } else if (this->dataDevice == DataDevice::CUDA) {
                 if (device == DataDevice::CPU) {
+                    const int callerDevice = FastllmCudaGetDevice();
+                    int sourceDevice = this->dataDeviceIds.empty() ? callerDevice : this->dataDeviceIds[0];
+                    if (this->cudaData != nullptr && !FastllmCudaGraphIsCapturingFast()) {
+                        const int actualDevice = GetPointerDeviceId(this->cudaData);
+                        if (actualDevice >= 0) sourceDevice = actualDevice;
+                    }
+                    FastllmCudaSetDevice(sourceDevice);
                     if (this->cudaNativeNvfp4Layout) FastllmCudaRestoreNativeNvfp4(*this);
                     if (this->cpuData == nullptr) {
                         this->cpuData = new uint8_t[expansionBytes];
@@ -2903,6 +2933,7 @@ namespace fastllm {
                         this->cudaData = nullptr;
                         this->cudaDataBorrowed = false;
                     }
+                    FastllmCudaSetDevice(callerDevice);
                 } else if (device == DataDevice::CUDA) {
                     int sourceDevice = this->dataDeviceIds.size() == 0 ? 0 : this->dataDeviceIds[0];
                     if (this->cudaData != nullptr) {

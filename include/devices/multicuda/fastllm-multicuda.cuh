@@ -78,6 +78,9 @@ bool FastllmCanUseTP2P2PAllReduceAdd(int count, int dataType, int deviceId);
 // addition into the communication kernel. Returns false without modifying the
 // tensors when the topology, data type or runtime state is not suitable.
 bool FastllmTryTP2P2PAllReduceAdd(void* data, void* dest, int count, int dataType, int deviceId);
+// Eager TP=2 small-tensor sum, including in-place reduction. Both ranks must
+// submit matching tensors. Unsupported configurations leave the tensors alone.
+bool FastllmTryTP2P2PAllReduce(void* data, void* dest, int count, int dataType, int deviceId);
 void FastllmNcclReduce(void* data, void* dest, int count, int dataType, int root, int deviceId);
 void FastllmCudaPackMoeEpPacket(void *packet, const void *hidden, size_t hiddenBytes,
                                const int32_t *indices, const float *scores, int topk);

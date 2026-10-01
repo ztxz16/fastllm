@@ -42,6 +42,14 @@ struct Tensor { std::string name; std::vector<int> dims; ggml_type type; Bytes b
 Tensor FloatTensor(const std::string &name, const std::vector<int> &dims, ggml_type type,
                    const std::vector<float> &values) {
     Tensor t{name, dims, type, {}};
+    if (type == GGML_TYPE_Q8_0) {
+        Check(values.size() % 32 == 0, "Q8 fixture block alignment");
+        for (size_t b = 0; b < values.size(); b += 32) {
+            Put<uint16_t>(t.bytes, float_to_half(0.125f));
+            for (int c = 0; c < 32; ++c) Put<int8_t>(t.bytes, int8_t(values[b + c] * 8));
+        }
+        return t;
+    }
     for (float value : values) {
         if (type == GGML_TYPE_F32) Put(t.bytes, value);
         else if (type == GGML_TYPE_F16) Put<uint16_t>(t.bytes, float_to_half(value));
@@ -106,8 +114,8 @@ struct Fixture {
             tensors.push_back(FloatTensor(name, columns == 1 ? std::vector<int>{count} :
                 std::vector<int>{count, columns}, type, values));
         };
-        rows("blk.0.attn_qkv.weight", 16, 4, 256, GGML_TYPE_F16);
-        rows("blk.0.attn_gate.weight", 0, 4, 256, GGML_TYPE_F32);
+        rows("blk.0.attn_qkv.weight", 16, 4, 256, GGML_TYPE_Q8_0);
+        rows("blk.0.attn_gate.weight", 0, 4, 256, GGML_TYPE_Q8_0);
         rows("blk.0.ssm_alpha.weight", 0, 1, 256, GGML_TYPE_F32);
         rows("blk.0.ssm_beta.weight", 0, 1, 256, GGML_TYPE_F32);
         rows("blk.0.ssm_conv1d.weight", 16, 4, 4, GGML_TYPE_F32);
@@ -151,6 +159,13 @@ struct Fixture {
 float At(Data &data, size_t i) {
     Check(data.cpuData && data.dataDevice == DataDevice::CPU, "expected CPU weight");
     if (data.dataType == FLOAT32) return reinterpret_cast<float *>(data.cpuData)[i];
+    if (data.dataType == DATA_GGUF_FORMAT) {
+        std::vector<float> row(data.dims.back());
+        const size_t columns = data.dims.back();
+        ggml_type_to_float(static_cast<ggml_type>(data.ggmlType))(
+            data.cpuData + i / columns * ggml_row_size(static_cast<ggml_type>(data.ggmlType), columns), row.data(), columns);
+        return row[i % columns];
+    }
     Check(data.dataType == FLOAT16, "unexpected dense dtype");
     return half_to_float(reinterpret_cast<uint16_t *>(data.cpuData)[i]);
 }
@@ -219,11 +234,16 @@ int main() {
             auto *m = dynamic_cast<Qwen4ExpModel *>(base.get()); Check(m != nullptr, "architecture dispatch");
             Qwen4GGUFTestAccess::CheckMetadata(*m);
             const std::string p = "model.language_model.layers.0.linear_attn.";
+            for (const char *name : {"in_proj_qkv.weight", "in_proj_z.weight"}) {
+                Data &w = m->weight[p + name];
+                Check(w.dataType == DATA_GGUF_FORMAT && w.ggmlType == GGML_TYPE_Q8_0 && !w.IsRepacked,
+                      "quantized GDN projection was expanded or repacked before row restoration");
+            }
             for (const auto &suffix : {"in_proj_qkv.weight", "in_proj_z.weight", "in_proj_a.weight", "in_proj_b.weight", "conv1d.weight", "dt_bias"}) {
                 Data &w = m->weight[p + suffix];
                 const bool prefix = suffix == std::string("in_proj_qkv.weight") || suffix == std::string("conv1d.weight");
                 const int offset = prefix ? 16 : 0, hd = w.dims[0] == 6 ? 1 : 4;
-                const int cols = w.Count(0) / w.dims[0];
+                const int cols = w.dims.size() == 2 ? w.dims[1] : 1;
                 for (int r = 0; r < w.dims[0]; ++r) for (int c = 0; c < cols; ++c)
                     Check(At(w, r * cols + c) == (r < offset ? -1 : (r - offset) / hd + 1), "GDN row permutation");
             }

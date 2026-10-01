@@ -11,11 +11,10 @@ namespace fastllm {
                        Rule::GGUFWeightReplaceType type = Rule::GGUFWeightReplaceForceFP16) {
             rules.emplace_back(std::regex("^" + pattern + "$"), name, type);
         };
-        // Keep the large expert and PLE tensors packed. Dense projections are
-        // imported as FP16 so GDN column permutations and TP splitting do not
-        // requantize independently quantized GGUF blocks.
+        // Keep large attention/output projections packed. Shared gate/up and
+        // auxiliary merges retain FP16; GDN output needs a column permutation.
         add(R"(token_embd\.weight)", base + "embed_tokens.weight", Rule::GGUFWeightReplaceForceFP32);
-        add(R"(output\.weight)", "lm_head.weight");
+        add(R"(output\.weight)", "lm_head.weight", Rule::GGUFWeightReplaceDirect);
         add(R"(per_layer_token_embd\.weight)", base + "ple_embedding.weight", Rule::GGUFWeightReplaceDirect);
         add(R"(output_hc_norm\.weight)", base + "hyper_connection_mixer.hc_norm.weight", Rule::GGUFWeightReplaceForceFP32);
         for (const auto &kind : {"down", "up"}) {
@@ -30,16 +29,16 @@ namespace fastllm {
             add(source + R"(_(down|up)\.weight)", target + "input_mix_weight_$2.weight");
             add(source + R"(_inject\.weight)", target + "block_inject_weight.weight");
         }
-        add(R"(blk\.(\d+)\.attn_(q|k|v)\.weight)", layer + "self_attn.$2_proj.weight");
-        add(R"(blk\.(\d+)\.attn_output\.weight)", layer + "self_attn.o_proj.weight");
+        add(R"(blk\.(\d+)\.attn_(q|k|v)\.weight)", layer + "self_attn.$2_proj.weight", Rule::GGUFWeightReplaceDirect);
+        add(R"(blk\.(\d+)\.attn_output\.weight)", layer + "self_attn.o_proj.weight", Rule::GGUFWeightReplaceDirect);
         add(R"(blk\.(\d+)\.attn_(q|k)_norm\.weight)", layer + "self_attn.$2_norm.weight", Rule::GGUFWeightReplaceForceFP32);
         add(R"(blk\.(\d+)\.indexer\.(q|k)_proj\.weight)", layer + "self_attn.indexer.index_$2_proj.weight");
         add(R"(blk\.(\d+)\.indexer\.(q|k)_norm\.weight)", layer + "self_attn.indexer.$2_layernorm.weight", Rule::GGUFWeightReplaceForceFP32);
-        add(R"(blk\.(\d+)\.attn_qkv\.weight)", layer + "linear_attn.in_proj_qkv.weight");
-        add(R"(blk\.(\d+)\.attn_gate\.weight)", layer + "linear_attn.in_proj_z.weight");
+        add(R"(blk\.(\d+)\.attn_qkv\.weight)", layer + "linear_attn.in_proj_qkv.weight", Rule::GGUFWeightReplaceDirect);
+        add(R"(blk\.(\d+)\.attn_gate\.weight)", layer + "linear_attn.in_proj_z.weight", Rule::GGUFWeightReplaceDirect);
         add(R"(blk\.(\d+)\.ssm_beta\.weight)", layer + "linear_attn.in_proj_b.weight");
         add(R"(blk\.(\d+)\.ssm_alpha\.weight)", layer + "linear_attn.in_proj_a.weight");
-        add(R"(blk\.(\d+)\.ssm_out\.weight)", layer + "linear_attn.out_proj.weight");
+        add(R"(blk\.(\d+)\.ssm_out\.weight)", layer + "linear_attn.out_proj.weight", Rule::GGUFWeightReplaceForceFP16);
         add(R"(blk\.(\d+)\.ssm_conv1d\.weight)", layer + "linear_attn.conv1d.weight", Rule::GGUFWeightReplaceForceFP32);
         add(R"(blk\.(\d+)\.ssm_a)", layer + "linear_attn.A_log", Rule::GGUFWeightReplaceForceFP32);
         add(R"(blk\.(\d+)\.ssm_dt\.bias)", layer + "linear_attn.dt_bias", Rule::GGUFWeightReplaceForceFP32);

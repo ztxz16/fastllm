@@ -6082,7 +6082,7 @@ namespace fastllm {
     }
 
     bool CudaEmbedding::CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
-        if (GetLowMemMode() || !GetCudaEmbedding()) {
+        if (GetLowMemMode() || !GetCudaEmbedding() || datas.at("weight")->lockInCPU) {
             return false;
         }
         Data &input = *(datas.find("input")->second);
@@ -6103,7 +6103,7 @@ namespace fastllm {
     }
 
     bool CudaEmbeddingDirect::CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
-        if (GetLowMemMode() || (!GetCudaEmbedding())) {
+        if (GetLowMemMode() || !GetCudaEmbedding() || datas.at("weight")->lockInCPU) {
             return false;
         }
         Data &input = *(datas.find("input")->second);

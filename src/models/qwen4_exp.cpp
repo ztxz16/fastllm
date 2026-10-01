@@ -1703,8 +1703,14 @@ namespace fastllm {
                 // Keep the original host layout and NUMA weight registrations.
                 continue;
             }
-            // The PLE lookup table remains shared and read-only on the host.
-            if (name.find(".ple.ple_embedding.ngram_embedding.") != std::string::npos) {
+            // Host lookup weights are immutable and can be shared by ranks.
+            // Respect the embedding policy before allocating any GPU copies:
+            // moving them back during the first forward is too late to avoid
+            // exhausting memory while preparing large resident checkpoints.
+            const bool hostEmbedding = name == languagePrefix + "embed_tokens.weight" &&
+                (GetLowMemMode() || !GetCudaEmbeddingRequested());
+            if (hostEmbedding) source.ToDevice(DataDevice::CPU);
+            if (hostEmbedding || name.find(".ple.ple_embedding.ngram_embedding.") != std::string::npos) {
                 for (auto &model : tp.ranks) {
                     Data &local = model->weight[name];
                     local = source;
@@ -1719,10 +1725,12 @@ namespace fastllm {
             const bool full = name.find(".self_attn.") != std::string::npos &&
                               name.find(".indexer.") == std::string::npos;
             if (name == "lm_head.weight" && source.dims.size() == 2 &&
-                source.dataType == DataType::FLOAT16 &&
+                (source.dataType == DataType::FLOAT16 ||
+                 (source.dataType == DataType::DATA_GGUF_FORMAT &&
+                  source.ggmlType >= 0 && !source.IsRepacked)) &&
                 source.dims[0] / 256 >= count && source.dims[0] <= (1 << 24)) {
-                // Row sharding preserves each logit's native FP32/FP16 GEMV
-                // arithmetic. Other weight formats retain the replicated head.
+                // Row sharding preserves each logit's native GEMV arithmetic,
+                // including packed GGUF rows, without replicating the head.
                 axis = 0;
                 tp.vocabSize = source.dims[0];
                 tp.topCandidates.resize(count);
@@ -1772,13 +1780,26 @@ namespace fastllm {
                     // routed slice. Rotate these slices per layer while keeping
                     // each gate/down pair on the same intermediate range.
                     const int width = axis == 0 ? source.dims[0] / 2 : source.dims[1];
-                    AssertInFastLLM(width > 0 && width % 128 == 0,
-                                    "Qwen4 TP expert width cannot satisfy 128-column alignment.");
+                    int splitUnit = 128;
+                    if (source.dataType == DataType::DATA_GGUF_FORMAT) {
+                        const std::string pairName = axis == 1 ? name :
+                            name.substr(0, name.size() - std::string("gateup_proj.weight").size()) + "down_proj.weight";
+                        const Data &down = weight.weight.at(pairName);
+                        AssertInFastLLM(down.dataType == DataType::DATA_GGUF_FORMAT && down.ggmlType >= 0,
+                                        "Qwen4 TP GGUF expert requires a packed down projection.");
+                        // GGUF blocks are powers of two. Align columns to the
+                        // packed down blocks and the 32-value Q8 activations,
+                        // rather than imposing NVFP4's 128-column tiles. Q2_0
+                        // then splits a 640-wide expert evenly into 320/320.
+                        splitUnit = std::max(32, int(ggml_blck_size((ggml_type)down.ggmlType)));
+                    }
+                    AssertInFastLLM(width > 0 && width % splitUnit == 0,
+                                    "Qwen4 TP expert width cannot satisfy its packed-column alignment.");
                     int offset = 0;
                     for (int r = 0; r < count; ++r) {
-                        const int blocks = width / 128 / count +
-                            ((r + expertLayer) % count < (width / 128) % count ? 1 : 0);
-                        const int end = offset + blocks * 128;
+                        const int blocks = width / splitUnit / count +
+                            ((r + expertLayer) % count < (width / splitUnit) % count ? 1 : 0);
+                        const int end = offset + blocks * splitUnit;
                         scheme[devices[r]] = {{offset, end}};
                         if (axis == 0) scheme[devices[r]].push_back({width + offset, width + end});
                         offset = end;
@@ -1853,11 +1874,17 @@ namespace fastllm {
                         data.Count(0) <= std::numeric_limits<int>::max(),
                         "Qwen4 TP reduction has invalid storage.");
         const int device = threadTpOwner->devices[threadTpRank];
+        if (!threadTpOwner->hostMoe &&
+            FastllmTryTP2P2PAllReduce(data.cudaData, data.cudaData,
+                                    data.Count(0), data.dataType, device)) {
+            return;
+        }
         // The NCCL wrapper owns both host submission boundaries and bypasses
         // them during capture. Repeating those waits here adds another rank
         // wakeup without extending the protected submission interval.
-        // Use the same reduction tree for eager and captured execution; custom
-        // all-reduce registration depends on temporary-pointer reuse across requests.
+        // Captured execution and unsupported topologies retain NCCL. The
+        // eager peer path exchanges current pointers instead of caching pooled
+        // temporary addresses across requests.
         FastllmNcclAllReduceNoCustom(data.cudaData, data.cudaData,
                                    data.Count(0), data.dataType, device);
 #endif
