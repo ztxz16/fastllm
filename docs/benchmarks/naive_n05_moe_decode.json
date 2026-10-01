@@ -1,0 +1,342 @@
+{
+  "date": "2026-10-01",
+  "model": "Full Naive-N0.5-Flash-MoE-NVFP4",
+  "base_commit": "707c591ee09741200e0213bd3308db30dc7676f6",
+  "configuration": {
+    "cuda": "13.1",
+    "arch": "sm_120f",
+    "max_batch": 1,
+    "mtp": 0,
+    "threads": 16,
+    "chunked_prefill_size": 512,
+    "max_context_length": 65536,
+    "cache_history": false,
+    "prefix_cache": false,
+    "gpu": "8 x RTX 5090, sequential layer placement (not tensor parallel)"
+  },
+  "measurement_note": "Full-model ABBA, NSYS and NCU precede this source cleanup. All142CUDAfunctions in fastllm-moe-fp8.cu retain identical SASS instruction/control encodings, including both new kernels. Actual-library bitwise/Graph, FP64/native-layout oracle and memcheck were rerun after cleanup; full-model throughput, racecheck and synccheck were not rerun.",
+  "library_sha256": {
+    "baseline": "95723b93af94b7bdc7a8630e915af32d4859f73e896d99c23a4f77b01f9076da",
+    "measured_optimized": "637b0c81d372b706874a22ee463748e1cf7a866997d9cbaa305915ab0a9bb33d",
+    "cleaned_optimized": "441391788d1c10e30df3d577cf647ae6265d77fb0f239e4f65e8d2140aa563ba"
+  },
+  "abba_order": [
+    "A1",
+    "B1",
+    "B2",
+    "A2"
+  ],
+  "abba_method": "Two independent processes/version; per process warmup+3 formal requests for short/7.5K, warmup+1 at 32K. 60 total requests,40 formal. No concurrent compilation, GPU probes, profiler or NVML polling.",
+  "abba": [
+    {
+      "case": "explanation",
+      "input_tokens": 56,
+      "output_tokens": 74,
+      "versions": {
+        "baseline": {
+          "samples": 6,
+          "median_decode_tok_s": 61.05005911382894,
+          "range_decode_tok_s": [
+            60.95371488853251,
+            61.059162682390614
+          ],
+          "median_ttft_seconds": 0.27934947999892756,
+          "process_medians": [
+            61.057399744489494,
+            60.99214468185246
+          ]
+        },
+        "fixed": {
+          "samples": 6,
+          "median_decode_tok_s": 67.95038799068811,
+          "range_decode_tok_s": [
+            67.91142415283507,
+            67.99939266267175
+          ],
+          "median_ttft_seconds": 0.27939201999106444,
+          "process_medians": [
+            67.98135783419727,
+            67.9315812467119
+          ]
+        }
+      },
+      "decode_gain_percent": 11.302739058767152,
+      "output_sha256": "b0ae45950ccb218480d7183225650e71085a79524118818f97cec3b20e99bece",
+      "greedy_identical": true,
+      "code_check": null
+    },
+    {
+      "case": "context-short",
+      "input_tokens": 80,
+      "output_tokens": 69,
+      "versions": {
+        "baseline": {
+          "samples": 6,
+          "median_decode_tok_s": 59.70443807126095,
+          "range_decode_tok_s": [
+            59.67346958262291,
+            59.73993379435267
+          ],
+          "median_ttft_seconds": 0.3963424399844371,
+          "process_medians": [
+            59.73682275242639,
+            59.67624094519711
+          ]
+        },
+        "fixed": {
+          "samples": 6,
+          "median_decode_tok_s": 66.35727243688561,
+          "range_decode_tok_s": [
+            66.31371387531078,
+            66.42831925185412
+          ],
+          "median_ttft_seconds": 0.39657440001610667,
+          "process_medians": [
+            66.39954520553137,
+            66.31979334273952
+          ]
+        }
+      },
+      "decode_gain_percent": 11.14294779507694,
+      "output_sha256": "625647b8667c3c81662fd1a28ece2a83d34ca6ef80c407b16b1832bfd0010951",
+      "greedy_identical": true,
+      "code_check": {
+        "passed": true,
+        "checks": 980
+      }
+    },
+    {
+      "case": "context-7k5",
+      "input_tokens": 7565,
+      "output_tokens": 69,
+      "versions": {
+        "baseline": {
+          "samples": 6,
+          "median_decode_tok_s": 50.588036074461115,
+          "range_decode_tok_s": [
+            50.580444821100386,
+            50.619181268972426
+          ],
+          "median_ttft_seconds": 18.71997774002375,
+          "process_medians": [
+            50.58790284757811,
+            50.58816930134412
+          ]
+        },
+        "fixed": {
+          "samples": 6,
+          "median_decode_tok_s": 55.341025230049624,
+          "range_decode_tok_s": [
+            55.33040060681657,
+            55.36931020601623
+          ],
+          "median_ttft_seconds": 18.846887740015518,
+          "process_medians": [
+            55.36705606069839,
+            55.333449620130125
+          ]
+        }
+      },
+      "decode_gain_percent": 9.39548067964633,
+      "output_sha256": "625647b8667c3c81662fd1a28ece2a83d34ca6ef80c407b16b1832bfd0010951",
+      "greedy_identical": true,
+      "code_check": {
+        "passed": true,
+        "checks": 980
+      }
+    },
+    {
+      "case": "context-32k",
+      "input_tokens": 32727,
+      "output_tokens": 69,
+      "versions": {
+        "baseline": {
+          "samples": 2,
+          "median_decode_tok_s": 49.071553961383415,
+          "range_decode_tok_s": [
+            49.07036199358484,
+            49.072745929182
+          ],
+          "median_ttft_seconds": 94.69467399999849,
+          "process_medians": [
+            49.072745929182,
+            49.07036199358484
+          ]
+        },
+        "fixed": {
+          "samples": 2,
+          "median_decode_tok_s": 53.46218521582601,
+          "range_decode_tok_s": [
+            53.46057705454953,
+            53.46379337710249
+          ],
+          "median_ttft_seconds": 95.1566612799943,
+          "process_medians": [
+            53.46379337710249,
+            53.46057705454953
+          ]
+        }
+      },
+      "decode_gain_percent": 8.947406185460881,
+      "output_sha256": "625647b8667c3c81662fd1a28ece2a83d34ca6ef80c407b16b1832bfd0010951",
+      "greedy_identical": true,
+      "code_check": {
+        "passed": true,
+        "checks": 980
+      }
+    }
+  ],
+  "nsys": {
+    "comparison": [
+      {
+        "family": "MoE gate/up + SwiGLU",
+        "calls_per_token": 47,
+        "baseline_ms_per_token": 3.700840500000002,
+        "fixed_ms_per_token": 2.5308728571428563,
+        "baseline_us_per_call": 78.7412872340426,
+        "fixed_us_per_call": 53.84835866261397,
+        "duration_reduction_percent": 31.613565698309486,
+        "baseline_counters": {
+          "samples": 11,
+          "time_us_range": [
+            78.016,
+            89.888
+          ],
+          "dram_GB_s_range": [
+            893.4207976146105,
+            1031.9857040743389
+          ],
+          "dram_pct_range": [
+            50.64,
+            58.5
+          ]
+        },
+        "fixed_counters": {
+          "samples": 11,
+          "time_us_range": [
+            55.424,
+            68.0
+          ],
+          "dram_GB_s_range": [
+            1258.7985270910046,
+            1438.9037187977585
+          ],
+          "dram_pct_range": [
+            71.38,
+            81.61
+          ]
+        }
+      },
+      {
+        "family": "MoE down + reduce",
+        "calls_per_token": 47,
+        "baseline_ms_per_token": 1.9856973571428576,
+        "fixed_ms_per_token": 1.4377705000000023,
+        "baseline_us_per_call": 42.248879939209736,
+        "fixed_us_per_call": 30.59086170212771,
+        "duration_reduction_percent": 27.593674089955268,
+        "baseline_counters": {
+          "samples": 11,
+          "time_us_range": [
+            41.696,
+            47.52
+          ],
+          "dram_GB_s_range": [
+            805.8936026936027,
+            918.808902532617
+          ],
+          "dram_pct_range": [
+            45.68,
+            52.09
+          ]
+        },
+        "fixed_counters": {
+          "samples": 11,
+          "time_us_range": [
+            28.128,
+            33.92
+          ],
+          "dram_GB_s_range": [
+            1124.5962264150944,
+            1370.4180327868853
+          ],
+          "dram_pct_range": [
+            63.73,
+            77.67
+          ]
+        }
+      }
+    ],
+    "moe_ms_per_token": {
+      "baseline": 5.686537857142859,
+      "fixed": 3.9686433571428585
+    },
+    "total_gpu_kernel_ms_per_token": {
+      "baseline": 16.76242607142857,
+      "fixed": 15.0645355
+    },
+    "captured_steps": [
+      51,
+      66
+    ],
+    "analyzed_steps": [
+      52,
+      65
+    ],
+    "kernels_per_token": 1141,
+    "malloc_free_per_token": 0,
+    "baseline_note": "Previous 32K capture of the same95723b93library; native baseline remeasured in this ABBA."
+  },
+  "ncu": {
+    "gpu_devices": [
+      0,
+      7
+    ],
+    "decode_step": 51,
+    "calls": 22,
+    "calls_per_kernel": 11,
+    "passes_per_call": 1,
+    "cache_control": "none",
+    "clock_control": "none",
+    "note": "Actual-model representative ranges, bandwidth calculated using counter elapsed time; not logical matrix traffic divided by NSYS time."
+  },
+  "validation_before_cleanup": {
+    "actual_api_bit_exact_cases": 140,
+    "actual_api_graph_cases": 5,
+    "oracle_cases": 20,
+    "sanitizer": "memcheck, racecheck, synccheck each13cases/5graphs, zero errors/hazards",
+    "unchanged_fallback_sass_functions": 140,
+    "micro_variants": 6,
+    "micro_cases_per_variant": 100,
+    "micro_working_set_bytes": 454033408,
+    "ncu_calls": 22,
+    "ncu_single_pass": true,
+    "ncu_counts_match_nsys": true,
+    "greedy_outputs_identical": true,
+    "generated_code_checks": 980
+  },
+  "validation_after_cleanup": {
+    "api_bit_exact_cases": 140,
+    "graph_cases": 5,
+    "fp64_native_oracle_cases": 20,
+    "memcheck_cases": 13,
+    "memcheck_graph_cases": 5,
+    "memcheck_errors": 0,
+    "sass_functions": 142,
+    "sass_all_identical": true,
+    "sass_comparison_sha256": "9b0689a6f16089ba5e8906cc7a96df335712401cbfcae87a5266311086cd7469"
+  },
+  "changes": [
+    "Shared shape/layout/launch constants; no new or redundant runtime environment variables.",
+    "Hoist row scales, reuse four input values in gate/up, retain pseudo-BF16 dot order and BF16 rounding.",
+    "Two-warp ordered reduction replaces repeated block barriers; gate/up7to1,down8to2.",
+    "All fallback kernels and existing direct tests retained; new top8 tested against indexed FP32-scale path and independent FP64."
+  ],
+  "limitations": [
+    "Fixed-shape single-token BF16 optimization; prefill and other formats/shapes continue to use previous kernels.",
+    "NSYS/NCU durations are profiled measurements; throughput claims use only native ABBA. Baseline traces/counters come from the prior run of the same 95723b93 library.",
+    "Counter ranges sample 11 calls per MoE kernel on GPUs0/7 at decode51 with no cache flush or clock adjustment; bandwidth uses counter elapsed time.",
+    "The new top-8 test exposed a pre-existing direct-vs-indexed rounding difference, reproduced with the unchanged baseline library. Existing direct tests remain; new top-8 indexed correctness uses FP32-scale indexed and FP64 references.",
+    "Targeted correctness and fixed greedy prompts, not a broad model quality evaluation."
+  ]
+}

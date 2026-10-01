@@ -1112,3 +1112,57 @@ GPU 核总时间 17.531→16.761 ms，仍为 1141 个 kernel/token，无 CUDA ma
 
 配置、逐次范围、库哈希和整理后机器码核验见
 [SWA 解码测量数据](benchmarks/naive_n05_swa_decode.json)。
+
+## 单 token packed NVFP4 MoE 解码优化
+
+BF16 激活、packed E4M3 块缩放、hidden 4096/intermediate 2048、top-8 时，
+索引式单 token MoE 自动使用专用 gate/up + SwiGLU 与 down + reduce 核。
+每行 FP32 缩放只加载一次，gate/up 复用四个输入值，省去固定尺寸不需要的尾部处理。
+保留伪 BF16 权重转换、原点积与 64 线程归约加法顺序、BF16 舍入位置，以及逐专家
+FP32 权重乘法舍入和按 slot 累加顺序。归约改用一次共享内存配对加 warp shuffle，
+gate/up 整块同步从 7 次降至 1 次，down 从 8 次降至 2 次。
+
+整理后，形状、packed 行布局与线程参数由内核和调度共享编译期常量，无新增环境开关。
+多 token、其他形状和数据格式保留原路径；这些路径仍被使用，不作为冗余删除。
+CUDA 13.1 / `sm_120f` 重建后，该 MoE 源文件全部 142 个 CUDA 函数（含两个新核）
+的 SASS 指令及控制编码与整理前完全一致。
+
+整理后重跑实际库 140 组逐 bit 对照、5 组 CUDA Graph、20 组 FP64/native-layout
+参考回归，以及 memcheck 的 13 组/5 Graph 检查，全部通过。整理前已通过三种
+sanitizer，各 13 组/5 Graph、零错误与 hazard；本次未重复 racecheck/synccheck。
+新增 top-8 用例暴露的 direct/indexed 舍入差异在原基线也能复现：direct 路径可以
+融合专家权重乘加，indexed 路径先舍入乘积。原有 direct 测试保留，新增 top-8
+对比 indexed FP32-scale 路径与独立 FP64 参考，本轮不改 direct 路径。
+
+### 整模型性能
+
+以下为整理前优化实现的实测，基线 `707c591e` 已包含前面的 SWA、RMSNorm 和专家选择优化。
+完整 Naive-N0.5-Flash-MoE-NVFP4，8 张 RTX 5090 按层执行（非张量并行），
+CUDA 13.1，`--max_batch 1 --mtp 0`，16 线程、prefill 分块 512、context/tokens 65536，
+关闭历史与前缀缓存。
+
+| 场景 | 基线 decode | 优化后 decode | 提升 |
+| --- | ---: | ---: | ---: |
+| 短中文（56 输入） | 61.05 token/s | 67.95 token/s | 11.30% |
+| 短代码（80 输入） | 59.70 token/s | 66.36 token/s | 11.14% |
+| 7,565 输入代码 | 50.59 token/s | 55.34 token/s | 9.40% |
+| 32,727 输入代码 | 49.07 token/s | 53.46 token/s | 8.95% |
+
+无 profiler 的 A1旧→B1新→B2新→A2旧四独立进程，每个场景先预热一次。
+每版短输入/7.5K 各 6 个正式样本，32K 各 2 个，共 60 次请求、40 个正式样本；
+测速期间无编译、GPU 探针、profiler 或 NVML 轮询。输出跨版本一致，代码检查
+980 项通过。整理后未重跑整模型吞吐；这是固定任务性能与回归测试，不代表全面质量评估。
+
+32K NSYS 分析第 52–65 共 14 个内部解码步，每 token 的 gate/up 与 down 各 47 次：
+gate/up 从 78.74 降至 53.85 μs，down 从 42.25 降至 30.59 μs；合计从 5.687 降至
+3.969 ms/token，耗时减少 30.21%，节省 1.718 ms。GPU 核总时间 16.762→15.065 ms，
+其他算子合计变化约 0.020 ms；仍为 1141 个 kernel/token，无 CUDA malloc/free。
+
+NCU 在 GPU 0/7 第 51 步采样 22 次 MoE 调用，全部单 pass，不清空缓存、不调整时钟，
+调用计数与 NSYS 匹配。实际 DRAM 带宽 gate/up 从 893–1032 提高到 1259–1439 GB/s，
+down 从 806–919 提高到 1125–1370 GB/s；峰值利用率分别为 71.38–81.61% 和
+63.73–77.67%。这些是代表调用区间，带宽使用 NCU 自身的计数时间计算。
+旧波形/计数来自此前同一基线库；原生速度仅取 ABBA，不使用 profiler 请求吞吐。
+
+配置、逐次范围、库哈希与整理后验证记录见
+[MoE 解码测量数据](benchmarks/naive_n05_moe_decode.json)。
