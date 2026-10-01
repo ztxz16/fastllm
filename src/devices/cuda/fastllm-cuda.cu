@@ -8511,6 +8511,41 @@ namespace {
         }
     }
 
+#ifndef USE_ROCM
+    // Cache one decode row while preserving the generic kernel's accumulation
+    // order and the BF16 rounding before and after applying the FP32 weight.
+    __global__ void KimiK3RMSNorm4096Kernel(
+            const __nv_bfloat16 *input, const float *weight,
+            __nv_bfloat16 *output, float eps) {
+        constexpr int CHANNELS = 4096;
+        constexpr int VALUES_PER_THREAD = CHANNELS / KIMI_K3_CUDA_THREADS;
+        __shared__ float warpSums[KIMI_K3_CUDA_THREADS / 32];
+        float values[VALUES_PER_THREAD];
+        float weights[VALUES_PER_THREAD];
+#pragma unroll
+        for (int part = 0; part < VALUES_PER_THREAD; ++part) {
+            int channel = threadIdx.x + part * KIMI_K3_CUDA_THREADS;
+            values[part] = __bfloat162float(input[channel]);
+            weights[part] = weight[channel];
+        }
+        float partial = 0.0f;
+#pragma unroll
+        for (int part = 0; part < VALUES_PER_THREAD; ++part) {
+            partial += values[part] * values[part];
+        }
+        float squareSum =
+            KimiK3BlockReduceSum<KIMI_K3_CUDA_THREADS>(partial, warpSums);
+        float scale = rsqrtf(squareSum / CHANNELS + eps);
+#pragma unroll
+        for (int part = 0; part < VALUES_PER_THREAD; ++part) {
+            float normalized = __bfloat162float(
+                __float2bfloat16_rn(values[part] * scale));
+            output[threadIdx.x + part * KIMI_K3_CUDA_THREADS] =
+                __float2bfloat16_rn(normalized * weights[part]);
+        }
+    }
+#endif
+
     __global__ void KimiK3L2NormKernel(
             const __nv_bfloat16 *input, __nv_bfloat16 *output,
             int rows, int channels, float eps) {
@@ -8929,10 +8964,19 @@ bool FastllmCudaKimiK3RMSNorm(
     }
     int channels = input.dims.back();
     int rows = (int)(input.Count(0) / channels);
-    KimiK3RMSNormKernel<<<rows, KIMI_K3_CUDA_THREADS>>>(
-        (const __nv_bfloat16*)input.cudaData,
-        (const float*)weight.cudaData,
-        (__nv_bfloat16*)output.cudaData, rows, channels, eps);
+#ifndef USE_ROCM
+    if (rows == 1 && channels == 4096) {
+        KimiK3RMSNorm4096Kernel<<<1, KIMI_K3_CUDA_THREADS>>>(
+            (const __nv_bfloat16 *)input.cudaData, (const float *)weight.cudaData,
+            (__nv_bfloat16 *)output.cudaData, eps);
+    } else
+#endif
+    {
+        KimiK3RMSNormKernel<<<rows, KIMI_K3_CUDA_THREADS>>>(
+            (const __nv_bfloat16*)input.cudaData,
+            (const float*)weight.cudaData,
+            (__nv_bfloat16*)output.cudaData, rows, channels, eps);
+    }
     return KimiK3CudaLastError("KimiK3RMSNorm CUDA kernel failed.");
 }
 
