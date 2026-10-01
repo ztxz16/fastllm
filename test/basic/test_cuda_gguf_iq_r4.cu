@@ -72,7 +72,9 @@ int main() {
         if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
         if (!get_repack_info(GGML_TYPE_IQ2_XS)) return 77;
         Cuda(cudaSetDevice(0));
-        for (const auto types : {std::make_pair(GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XS_R4),
+        for (const auto types : {std::make_pair(GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XXS_R4),
+                                  std::make_pair(GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_S_R4),
+                                  std::make_pair(GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XS_R4),
                                   std::make_pair(GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_XXS_R4)}) {
             for (int columns : {256, 2560}) {
                 TestType<float>(types.first, types.second, 12, columns, ggml_get_to_fp32_cuda(types.second));
@@ -80,7 +82,7 @@ int main() {
                 TestType<__nv_bfloat16>(types.first, types.second, 12, columns, ggml_get_to_bf16_cuda(types.second));
             }
         }
-        std::cout << "PASS: IQ2_XS/IQ3_XXS R4 CUDA FP32/FP16/BF16 match CPU, including chunk boundaries\n";
+        std::cout << "PASS: IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS R4 CUDA FP32/FP16/BF16 match CPU, including chunk boundaries\n";
         return 0;
     } catch (const std::exception &e) { std::cerr << e.what() << '\n'; return 1; }
 }

@@ -43,6 +43,23 @@ static inline __device__ void get_scale_min_k4(int j, const uint8_t * q, uint8_t
 }
 
 template<typename dst_t, typename Output>
+static __device__ __forceinline__ void dequantize_block_q2_0_impl(
+        const void *__restrict__ vx, Output output, int64_t blockCount,
+        int64_t group, int lane) {
+    const int64_t block = 4 * group + lane / 8;
+    if (block >= blockCount) return;
+    const auto &x = static_cast<const block_q2_0 *>(vx)[block];
+    const int offset = 8 * (lane % 8);
+    const float d = __half2float(x.d);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int column = offset + j;
+        const int code = (x.qs[column / 4] >> (2 * (column % 4))) & 3;
+        output[block * QK2_0 + column] = DequantizeCast<dst_t>::cast(d * (code - 1));
+    }
+}
+
+template<typename dst_t, typename Output>
 static __device__ __forceinline__ void dequantize_block_q4_0_impl(const void * __restrict__ vx,
                                               Output yy,
                                               int64_t blockCount, int64_t blockIndex, int threadIndex) {
@@ -506,7 +523,10 @@ template<ggml_type type, typename T>
 static __device__ __forceinline__ void FastllmGgufGemvBlock(
         const void *weight, FastllmGgufGemvDotOutput<T> output,
         int block, int lane, int columns) {
-    if constexpr (type == GGML_TYPE_Q4_0) {
+    if constexpr (type == GGML_TYPE_Q2_0) {
+        dequantize_block_q2_0_impl<T>(weight, output, columns / QK2_0, block, lane);
+    }
+    else if constexpr (type == GGML_TYPE_Q4_0) {
         dequantize_block_q4_0_impl<T>(weight, output, columns / QK4_0, block, lane);
     }
     else if constexpr (type == GGML_TYPE_Q4_1) {
@@ -612,6 +632,7 @@ static bool FastllmGgufDirectGemv(
             FastllmGgufDirectGemvKernel<GGML_TYPE_##name><<<rows, 128, 0, stream>>>( \
                 input, static_cast<const char *>(weight), output, columns, rowBytes); \
             return true;
+        FASTLLM_GGUF_DIRECT_GEMV_CASE(Q2_0)
         FASTLLM_GGUF_DIRECT_GEMV_CASE(Q4_0)
         FASTLLM_GGUF_DIRECT_GEMV_CASE(Q4_1)
         FASTLLM_GGUF_DIRECT_GEMV_CASE(IQ2_XXS)

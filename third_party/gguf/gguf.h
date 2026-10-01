@@ -1300,6 +1300,14 @@ typedef uint32_t ggml_half2;
 #define QK_K 256
 #define K_SCALE_SIZE 12
 
+// llama.cpp Q2_0: four consecutive 2-bit codes per byte, {-1, 0, 1, 2} * d.
+#define QK2_0 64
+typedef struct {
+    ggml_half d;
+    uint8_t qs[QK2_0 / 4];
+} block_q2_0;
+static_assert(sizeof(block_q2_0) == 18, "wrong q2_0 block size/padding");
+
 #define QK4_0 32
 typedef struct {
     ggml_half d;           // delta
@@ -1791,6 +1799,7 @@ enum ggml_type {
         // So we are able to consume MS BitNet I2_S quants
         //
         GGML_TYPE_I2_S    = 36,
+        GGML_TYPE_Q2_0    = 42,
         //
         GGML_TYPE_Q8_0_X4 = 97,
         GGML_TYPE_Q8_1_X4 = 98,
@@ -1957,6 +1966,8 @@ GGML_API void quantize_row_iq3_s_ref  (const float * GGML_RESTRICT x, block_iq3_
 GGML_API void quantize_row_iq2_s_ref  (const float * GGML_RESTRICT x, block_iq2_s   * GGML_RESTRICT y, int64_t k);
 
 // Dequantization
+GGML_API void dequantize_row_q2_0(const block_q2_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 GGML_API void dequantize_row_q4_0(const block_q4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_q4_1(const block_q4_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_q5_0(const block_q5_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);

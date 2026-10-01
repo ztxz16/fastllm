@@ -8120,3 +8120,60 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * restrict s, size_t bs, const void * r
 }
 
 #endif // #ifdef __aarch64__ else ...
+
+// Format and scalar reference follow llama.cpp 3cf03257f219 (Q2_0, type 42).
+void dequantize_row_q2_0(const block_q2_0 * GGML_RESTRICT x,
+                         float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK2_0 == 0);
+    for (int64_t b = 0; b < k / QK2_0; ++b) {
+        const float d = GGML_FP16_TO_FP32(x[b].d);
+        for (int j = 0; j < QK2_0; ++j) {
+            y[b * QK2_0 + j] = d * (int((x[b].qs[j / 4] >> (2 * (j % 4))) & 3) - 1);
+        }
+    }
+}
+
+void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy,
+        size_t by, int nrc) {
+    assert(n % QK2_0 == 0 && nrc == 1);
+    (void)bs; (void)bx; (void)by; (void)nrc;
+    const auto *x = static_cast<const block_q2_0 *>(vx);
+    const auto *y = static_cast<const block_q8_0 *>(vy);
+    float sum = 0.0f;
+    for (int b = 0; b < n / QK2_0; ++b) {
+        const float d = GGML_FP16_TO_FP32(x[b].d);
+        for (int half = 0; half < 2; ++half) {
+            const auto &yb = y[2 * b + half];
+            int dot = 0;
+#if defined(__AVX2__)
+            const __m128i packed = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(x[b].qs + 8 * half));
+            const __m128i mask = _mm_set1_epi8(3);
+            const __m128i q0 = _mm_and_si128(packed, mask);
+            const __m128i q1 = _mm_and_si128(_mm_srli_epi16(packed, 2), mask);
+            const __m128i q2 = _mm_and_si128(_mm_srli_epi16(packed, 4), mask);
+            const __m128i q3 = _mm_and_si128(_mm_srli_epi16(packed, 6), mask);
+            const __m128i lo = _mm_unpacklo_epi8(q0, q1);
+            const __m128i hi = _mm_unpacklo_epi8(q2, q3);
+            const __m128i codes[2] = {_mm_unpacklo_epi16(lo, hi), _mm_unpackhi_epi16(lo, hi)};
+            __m128i acc = _mm_setzero_si128();
+            for (int p = 0; p < 2; ++p) {
+                const __m128i activation = _mm_loadu_si128(reinterpret_cast<const __m128i *>(yb.qs + 16 * p));
+                const __m128i pairs = _mm_sub_epi16(_mm_maddubs_epi16(codes[p], activation),
+                                                   _mm_maddubs_epi16(_mm_set1_epi8(1), activation));
+                acc = _mm_add_epi32(acc, _mm_madd_epi16(pairs, _mm_set1_epi16(1)));
+            }
+            acc = _mm_hadd_epi32(acc, acc);
+            acc = _mm_hadd_epi32(acc, acc);
+            dot = _mm_cvtsi128_si32(acc);
+#else
+            for (int j = 0; j < QK8_0; ++j) {
+                const int q = (x[b].qs[8 * half + j / 4] >> (2 * (j % 4))) & 3;
+                dot += (q - 1) * yb.qs[j];
+            }
+#endif
+            sum += d * GGML_FP16_TO_FP32(yb.d) * dot;
+        }
+    }
+    *s = sum;
+}

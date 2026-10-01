@@ -77,6 +77,12 @@ static void QuantizeWeights(ggml_type type, const std::vector<float> &x,
     // These formats have dequantizers but no reference quantizer in this repo.
     // Generate valid packed values, including arbitrary high bits and signs.
     for (auto &byte : packed) byte = random();
+    if (type == GGML_TYPE_Q2_0) {
+        for (int b = 0; b < count / QK2_0; ++b)
+            reinterpret_cast<block_q2_0 *>(packed.data())[b].d =
+                fastllm::float_to_half((b % 5 + 1) * 0.125f);
+        return;
+    }
     for (int b = 0; b < count / 32; ++b) {
         const uint16_t scale = fastllm::float_to_half((b % 5 + 1) * 0.125f);
         if (type == GGML_TYPE_Q5_0)
@@ -94,7 +100,7 @@ static void QuantizeWeights(ggml_type type, const std::vector<float> &x,
 
 static void TestQuantizedDots() {
     std::mt19937 random(20260920);
-    for (ggml_type type : {GGML_TYPE_IQ4_NL, GGML_TYPE_Q5_0,
+    for (ggml_type type : {GGML_TYPE_Q2_0, GGML_TYPE_IQ4_NL, GGML_TYPE_Q5_0,
                           GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K,
                           GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
                           GGML_TYPE_Q6_K}) {
