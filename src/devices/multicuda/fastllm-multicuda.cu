@@ -1707,6 +1707,48 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
             }
         }
 
+    } else if (weight.dataType == fastllm::DataType::INT8_PERCHANNEL_S8 ||
+               weight.dataType == fastllm::DataType::INT8_PERCHANNEL_S8_W8A16) {
+        // Signed symmetric int8: one scale per output channel.  Row splits take
+        // the matching scale slice; column splits keep every scale (the channel
+        // set is unchanged).
+        fastllm::AssertInFastLLM(
+            weight.scales.size() == static_cast<size_t>(k),
+            "INT8_PERCHANNEL_S8 tensor parallel scale shape mismatch.\n");
+        for (int i = 0; i < multiCudaCurrentDevices.size(); i++) {
+            int deviceId = multiCudaCurrentDevices[i], mallocType = 0;
+            std::string specialId = "";
+            SwitchDeviceAndGetInfos(deviceId, specialId, mallocType);
+            auto &div = divisionScheme[deviceId];
+            int len = 0;
+            for (auto &it : div) {
+                len += it.second - it.first;
+            }
+            auto curDevice = weight.multiDeviceDatas[deviceId];
+            if (curDevice == nullptr) {
+                continue;
+            }
+            if (len == 0) {
+                curDevice->scales.clear();
+                continue;
+            }
+            curDevice->perChannelAxis = 0;
+            if (splitAxis == 0) {
+                curDevice->scales.resize(len);
+                int curLen = 0;
+                for (auto &it : div) {
+                    if (it.second > it.first) {
+                        memcpy(curDevice->scales.data() + curLen,
+                               weight.scales.data() + it.first,
+                               static_cast<size_t>(it.second - it.first) *
+                                   sizeof(float));
+                    }
+                    curLen += it.second - it.first;
+                }
+            } else {
+                curDevice->scales = weight.scales;
+            }
+        }
     } else {
         // 1. mins, scales
         if (weight.mins.size() > 0) {
