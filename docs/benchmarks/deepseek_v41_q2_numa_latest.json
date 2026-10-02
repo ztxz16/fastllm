@@ -1,0 +1,437 @@
+{
+  "date": "2026-10-02",
+  "sync": {
+    "date_utc": "2026-10-02T00:45:47.481488+00:00",
+    "head_before": "2faae1d993f2df589a246dce8d2e3e5fda4f9e82",
+    "library_before_sha256": "b141c7fdc951aa1c02d80071b80bbf6b60437992f59e5a963c17a40f960c2a98",
+    "head_after": "2a3c71c8ef447f372102e3cf2ab50f5485e0854e",
+    "remote_commits_added": 8,
+    "sync_workflow": "fetch; stash --include-untracked; rebase origin/master; stash pop (automatic merge, no conflicts)",
+    "library_after_sha256": "80616ce1f0f89da05ac76c3037bd1b8beff9a053a58df6d23c24467aabadc67e",
+    "build_fix": "src/devices/cuda/moe/fastllm-moe-gguf-cache.cu: use ../fastllm-gguf-gemv.cuh for parent-directory header",
+    "ctest_passed": [
+      "cpu_gguf_repack",
+      "numas_v41_q2_moe",
+      "disk_v41_q2_moe",
+      "disk_v41_q2_moe_cuda_prefill"
+    ]
+  },
+  "model": "/home/tf/hfmodels/DeepSeek-V4.1-Flash-Q2_K-Mixed",
+  "hardware": {
+    "cpu": "AMD EPYC 9374F, NUMA 0, physical CPUs 0-31",
+    "gpu": "RTX 4090 24 GiB, CUDA ordinal 0 / physical index 1"
+  },
+  "config": {
+    "threads": 28,
+    "device": "cuda:0",
+    "moe_device": "numa",
+    "ngram_device": "cpu",
+    "dtype": "float16",
+    "kv_cache_dtype": "bfloat16",
+    "chunked_prefill_size": 4096,
+    "max_batch": 1,
+    "dspark": 5,
+    "mtp": 0,
+    "fast_prefill": true,
+    "moe_cuda_cache": 0,
+    "moe_cpu_cache": 0
+  },
+  "history_prefix_cache": false,
+  "sampling": "greedy",
+  "short_input_tokens": 33,
+  "short_output_tokens": 128,
+  "long_input_tokens": 8600,
+  "measurement_order": [
+    "warmup_short",
+    "warmup_dspark",
+    "arithmetic",
+    "coding",
+    "warmup_long",
+    "fast_long_0",
+    "fast_long_1",
+    "fast_long_2",
+    "fast_long_ordinary_decode",
+    "ordinary_short_0",
+    "fast_short_0",
+    "fast_short_1",
+    "ordinary_short_1",
+    "ordinary_short_2",
+    "fast_short_2",
+    "fast_medium"
+  ],
+  "before": {
+    "ordinary_short": {
+      "requests": 3,
+      "repeated_output_tokens_identical": true,
+      "ttft_seconds_median": 0.5478110649855807,
+      "ttft_seconds_runs": [
+        0.5512929710093886,
+        0.5458157859975472,
+        0.5478110649855807
+      ],
+      "decode_tps_median": 25.128839602055955,
+      "decode_tps_runs": [
+        25.128839602055955,
+        25.151605769679207,
+        24.990564620486825
+      ],
+      "output_tokens": [
+        128,
+        128,
+        128
+      ],
+      "rss_gib_median": 408.9350776672363,
+      "peak_rss_gib": 408.9350776672363,
+      "verify_rounds": [
+        0,
+        0,
+        0
+      ],
+      "proposed_drafts": [
+        0,
+        0,
+        0
+      ],
+      "accepted_drafts": [
+        0,
+        0,
+        0
+      ],
+      "draft_acceptance_rate": null
+    },
+    "dspark_short": {
+      "requests": 3,
+      "repeated_output_tokens_identical": true,
+      "ttft_seconds_median": 0.5562476110062562,
+      "ttft_seconds_runs": [
+        0.5517782679817174,
+        0.5600205139780883,
+        0.5562476110062562
+      ],
+      "decode_tps_median": 24.02741589462193,
+      "decode_tps_runs": [
+        24.061277802598557,
+        24.007658384043612,
+        24.02741589462193
+      ],
+      "output_tokens": [
+        128,
+        128,
+        128
+      ],
+      "rss_gib_median": 408.9350776672363,
+      "peak_rss_gib": 408.9350776672363,
+      "verify_rounds": [
+        48,
+        48,
+        48
+      ],
+      "proposed_drafts": [
+        122,
+        122,
+        122
+      ],
+      "accepted_drafts": [
+        61,
+        61,
+        61
+      ],
+      "draft_acceptance_rate": 0.5
+    },
+    "dspark_long": {
+      "requests": 3,
+      "repeated_output_tokens_identical": true,
+      "ttft_seconds_median": 13.92840446298942,
+      "ttft_seconds_runs": [
+        13.92840446298942,
+        13.843470530002378,
+        13.949153837020276
+      ],
+      "decode_tps_median": 41.679673001219186,
+      "decode_tps_runs": [
+        41.27328570278324,
+        41.68930755517072,
+        41.679673001219186
+      ],
+      "output_tokens": [
+        30,
+        30,
+        30
+      ],
+      "rss_gib_median": 408.9381103515625,
+      "peak_rss_gib": 409.0165557861328,
+      "verify_rounds": [
+        5,
+        5,
+        5
+      ],
+      "proposed_drafts": [
+        25,
+        25,
+        25
+      ],
+      "accepted_drafts": [
+        24,
+        24,
+        24
+      ],
+      "draft_acceptance_rate": 0.96
+    },
+    "model_load_seconds": 397.4504131009744,
+    "steady_rss_gib": 408.9360542297363,
+    "global_peak_rss_gib": 424.92833709716797,
+    "global_peak_gpu_gib_physical_indices": [
+      1.2393798828125,
+      19.9053955078125
+    ],
+    "numa_mapped_pages_after_bench": {
+      "N0": 107171992,
+      "N1": 32996
+    },
+    "dspark_short_speed_ratio_vs_ordinary": 0.9561689387621422,
+    "ordinary_long": {
+      "output_tokens": 30,
+      "ttft_seconds": 13.994920443015872,
+      "decode_tokens_per_second": 24.200378035642217
+    }
+  },
+  "after": {
+    "ordinary_short": {
+      "requests": 3,
+      "repeated_output_tokens_identical": true,
+      "ttft_seconds_median": 0.5518195350014139,
+      "ttft_seconds_runs": [
+        0.5469044090132229,
+        0.5518195350014139,
+        0.5677755500073545
+      ],
+      "decode_tps_median": 24.991479838719854,
+      "decode_tps_runs": [
+        25.01657869845791,
+        24.991479838719854,
+        24.976550200412174
+      ],
+      "output_tokens": [
+        128,
+        128,
+        128
+      ],
+      "rss_gib_median": 408.92794036865234,
+      "peak_rss_gib": 408.92794036865234,
+      "verify_rounds": [
+        0,
+        0,
+        0
+      ],
+      "proposed_drafts": [
+        0,
+        0,
+        0
+      ],
+      "accepted_drafts": [
+        0,
+        0,
+        0
+      ],
+      "draft_acceptance_rate": null
+    },
+    "dspark_short": {
+      "requests": 3,
+      "repeated_output_tokens_identical": true,
+      "ttft_seconds_median": 0.5682890710013453,
+      "ttft_seconds_runs": [
+        0.5686353540222626,
+        0.5682890710013453,
+        0.562402988987742
+      ],
+      "decode_tps_median": 26.12504958278473,
+      "decode_tps_runs": [
+        26.12504958278473,
+        26.176769829230935,
+        26.112121091921328
+      ],
+      "output_tokens": [
+        128,
+        128,
+        128
+      ],
+      "rss_gib_median": 408.92794036865234,
+      "peak_rss_gib": 408.92794036865234,
+      "verify_rounds": [
+        46,
+        46,
+        46
+      ],
+      "proposed_drafts": [
+        107,
+        107,
+        107
+      ],
+      "accepted_drafts": [
+        62,
+        62,
+        62
+      ],
+      "draft_acceptance_rate": 0.5794392523364486
+    },
+    "dspark_long": {
+      "requests": 3,
+      "repeated_output_tokens_identical": true,
+      "ttft_seconds_median": 14.06671178797842,
+      "ttft_seconds_runs": [
+        14.06671178797842,
+        13.979782775015337,
+        14.1556464570167
+      ],
+      "decode_tps_median": 41.62114246644384,
+      "decode_tps_runs": [
+        41.33131653749106,
+        41.873243441541554,
+        41.62114246644384
+      ],
+      "output_tokens": [
+        30,
+        30,
+        30
+      ],
+      "rss_gib_median": 408.9293098449707,
+      "peak_rss_gib": 409.0081672668457,
+      "verify_rounds": [
+        5,
+        5,
+        5
+      ],
+      "proposed_drafts": [
+        25,
+        25,
+        25
+      ],
+      "accepted_drafts": [
+        24,
+        24,
+        24
+      ],
+      "draft_acceptance_rate": 0.96
+    },
+    "model_load_seconds": 284.3144669329922,
+    "steady_rss_gib": 408.92891693115234,
+    "global_peak_rss_gib": 424.89767837524414,
+    "global_peak_gpu_gib_physical_indices": [
+      1.2393798828125,
+      19.9073486328125
+    ],
+    "numa_mapped_pages_after_bench": {
+      "N0": 107169734,
+      "N1": 33076
+    },
+    "dspark_short_speed_ratio_vs_ordinary": 1.0453582481461787,
+    "ordinary_long": {
+      "output_tokens": 30,
+      "ttft_seconds": 14.086765187996207,
+      "decode_tokens_per_second": 23.988995013901157
+    }
+  },
+  "ratios_after_vs_before": {
+    "ordinary_short": {
+      "ttft_seconds_median": 1.0073172490883124,
+      "decode_tps_median": 0.9945337800904718
+    },
+    "dspark_short": {
+      "ttft_seconds_median": 1.0216476615033114,
+      "decode_tps_median": 1.0873016764417147
+    },
+    "dspark_long": {
+      "ttft_seconds_median": 1.0099298756980033,
+      "decode_tps_median": 0.9985957055187638
+    }
+  },
+  "validation": {
+    "before_functional_checks": {
+      "arithmetic_888": true,
+      "all_five_long_retrieval_requests_exact": true,
+      "generated_prime_function_17_cases": true
+    },
+    "after_functional_checks": {
+      "arithmetic_888": true,
+      "all_five_long_retrieval_requests_exact": true,
+      "generated_prime_function_17_cases": true
+    },
+    "per_request_output_tokens_identical": {
+      "warmup_short": false,
+      "warmup_dspark": false,
+      "arithmetic": true,
+      "coding": true,
+      "warmup_long": true,
+      "fast_long_0": true,
+      "fast_long_1": true,
+      "fast_long_2": true,
+      "fast_long_ordinary_decode": true,
+      "ordinary_short_0": false,
+      "fast_short_0": false,
+      "fast_short_1": false,
+      "ordinary_short_1": false,
+      "ordinary_short_2": false,
+      "fast_short_2": false,
+      "fast_medium": false
+    },
+    "per_request_draft_counts_identical": {
+      "warmup_short": true,
+      "warmup_dspark": false,
+      "arithmetic": true,
+      "coding": true,
+      "warmup_long": true,
+      "fast_long_0": true,
+      "fast_long_1": true,
+      "fast_long_2": true,
+      "fast_long_ordinary_decode": true,
+      "ordinary_short_0": true,
+      "fast_short_0": false,
+      "fast_short_1": false,
+      "ordinary_short_1": true,
+      "ordinary_short_2": true,
+      "fast_short_2": false,
+      "fast_medium": false
+    },
+    "all_output_tokens_identical": false,
+    "all_draft_counts_identical": false,
+    "first_changed_output_token_index_zero_based": {
+      "warmup_short": 13,
+      "warmup_dspark": 0,
+      "ordinary_short_0": 10,
+      "fast_short_0": 21,
+      "fast_short_1": 21,
+      "ordinary_short_1": 10,
+      "ordinary_short_2": 10,
+      "fast_short_2": 21,
+      "fast_medium": 0
+    },
+    "no_history_prefix_tokens_reused": true,
+    "ctest_passed": [
+      "cpu_gguf_repack",
+      "numas_v41_q2_moe",
+      "disk_v41_q2_moe",
+      "disk_v41_q2_moe_cuda_prefill"
+    ]
+  },
+  "notes": [
+    "Before is the installed pre-fetch library, including existing local optimizations. After is origin/master 2a3c71c8 plus the restored local changes and one CUDA relative-header fix.",
+    "Target and draft weights stay loaded in ordinary and DSpark controls. output_token_least=1 disables speculation for ordinary requests; zero enables DSpark 5.",
+    "Identical model/config/prompts before and after. Two short warmups, arithmetic/code, long warmup, three long DSpark measurements, long ordinary, then three alternating short requests per mode, and a medium prompt.",
+    "Model loading and warmups are excluded from measured request medians. SSD/page cache was not flushed, so load times should not be interpreted as a code-only comparison.",
+    "The new library compiled on NUMA 1 while the old benchmark ran on NUMA 0; no competing inference or GPU tests ran during measured requests.",
+    "No GPU expert cache; experts and Engram are resident in RAM. Historical disk + 64 GiB expert-cache results are a different deployment configuration.",
+    "Short prompts enumerate integers; long prompts retrieve three codes as JSON. These cases do not establish full model accuracy or general task performance.",
+    "Short and medium natural-language outputs changed across versions, including ordinary decoding. Short DSpark acceptance changed from 50.0% to 57.9%; its throughput gain cannot be attributed entirely to faster kernels because routing and verification work also changed. Arithmetic, generated code, and all long retrieval outputs are identical across versions."
+  ],
+  "artifacts": {
+    "root": "/home/tf/github/fastllm/build-fastllm/dsv41-q2-numa-latest-20261002",
+    "before": "/home/tf/github/fastllm/build-fastllm/dsv41-q2-numa-latest-20261002/before",
+    "after": "/home/tf/github/fastllm/build-fastllm/dsv41-q2-numa-latest-20261002/after"
+  },
+  "historical_q2_export_measurement": {
+    "native_library_sha256": "0e4cbd7ceebfd76a148878229652372514326cf97f181eb0ea2553ddafec8854",
+    "short_decode_tokens_per_second_median": 25.75225280808921,
+    "long_ttft_seconds_median": 14.124704181987909,
+    "rss_after_load_gib": 407.6352844238281
+  }
+}

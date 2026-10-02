@@ -1,0 +1,1259 @@
+{
+  "configuration": "Single NUMA 0, 28 CPU threads, CUDA 0/1 serial layer map, per-device 8 GiB expert cache, fast prefill, 8600 input tokens, chunk 4096, one output token, speculation and prefix history disabled.",
+  "timing_note": "Plain requests retain native per-layer wall timing without synchronizing every operator. Separate profile requests synchronize at operator boundaries; do not subtract their totals from plain TTFT. CPU phase includes input readiness and CPU output-copy enqueue. Join is only the remaining GPU wait after concurrent CPU work.",
+  "q2": {
+    "model_path": "/home/tf/hfmodels/DeepSeek-V4.1-Flash-Q2_K-Mixed",
+    "library_sha256": "97597346648fece59018d1fd2ef99fcdc6687c7357f08188ea1d50f22123377f",
+    "plain_ttft_seconds_median": 13.652673415985191,
+    "plain_assist_phase_seconds_mean": {
+      "stage": 0.001587333333333332,
+      "limit": 0.028029333333333337,
+      "prep": 0.016692333333333333,
+      "cpu": 9.441901000000001,
+      "join": 1.6283679999999998,
+      "reduce": 0.08168500000000009,
+      "total": 11.198254666666665
+    },
+    "plain_routes_mean": {
+      "cpu_routes": 56238,
+      "gpu0_routes": 535516,
+      "gpu1_routes": 535622
+    },
+    "profile_operator_group_seconds_mean": {
+      "AttentionWoA": 0.0928341835,
+      "DenseLinear": 0.3572839040000001,
+      "Engram": 0.024905837,
+      "GPUActivationQuant": 0.043741616,
+      "HC": 0.159445321,
+      "Indexer": 0.011358597,
+      "MergeMOE": 11.219888309,
+      "Other": 0.14083098649999998,
+      "SparseAttention": 0.3464550425
+    },
+    "runs": [
+      {
+        "name": "plain_long_0",
+        "request_id": 3,
+        "ttft_seconds": 13.652673415985191,
+        "moe_calls": 120,
+        "assist_phase_seconds": {
+          "stage": 0.001594999999999999,
+          "limit": 0.027954999999999994,
+          "prep": 0.01650799999999999,
+          "cpu": 9.481818,
+          "join": 1.6605899999999998,
+          "reduce": 0.08208100000000007,
+          "total": 11.270555000000003
+        },
+        "routes": {
+          "cpu_routes": 56238,
+          "gpu0_routes": 535516,
+          "gpu1_routes": 535622
+        },
+        "by_batch_rows": {
+          "128": {
+            "calls": 57,
+            "phase_seconds": {
+              "stage": 0.0006590000000000004,
+              "limit": 0.003887000000000001,
+              "prep": 0.006779000000000001,
+              "cpu": 0.671766,
+              "join": 1.374421,
+              "reduce": 0.0014660000000000003,
+              "total": 2.058980999999999
+            },
+            "routes": {
+              "cpu_routes": 10506,
+              "gpu0_routes": 16629,
+              "gpu1_routes": 16641
+            }
+          },
+          "408": {
+            "calls": 21,
+            "phase_seconds": {
+              "stage": 0.00027000000000000006,
+              "limit": 0.003008,
+              "prep": 0.0027949999999999997,
+              "cpu": 0.929875,
+              "join": 0.286096,
+              "reduce": 0.001563,
+              "total": 1.223613
+            },
+            "routes": {
+              "cpu_routes": 7722,
+              "gpu0_routes": 21827,
+              "gpu1_routes": 21859
+            }
+          },
+          "4096": {
+            "calls": 42,
+            "phase_seconds": {
+              "stage": 0.0006660000000000005,
+              "limit": 0.021060000000000006,
+              "prep": 0.006933999999999998,
+              "cpu": 7.880177000000001,
+              "join": 7.300000000000005e-05,
+              "reduce": 0.07905200000000001,
+              "total": 7.987961000000002
+            },
+            "routes": {
+              "cpu_routes": 38010,
+              "gpu0_routes": 497060,
+              "gpu1_routes": 497122
+            }
+          }
+        }
+      },
+      {
+        "name": "plain_long_1",
+        "request_id": 4,
+        "ttft_seconds": 13.448289527004818,
+        "moe_calls": 120,
+        "assist_phase_seconds": {
+          "stage": 0.0015729999999999989,
+          "limit": 0.027923999999999997,
+          "prep": 0.016643999999999996,
+          "cpu": 9.317973000000002,
+          "join": 1.6215529999999994,
+          "reduce": 0.08122400000000009,
+          "total": 11.066876999999993
+        },
+        "routes": {
+          "cpu_routes": 56238,
+          "gpu0_routes": 535516,
+          "gpu1_routes": 535622
+        },
+        "by_batch_rows": {
+          "128": {
+            "calls": 57,
+            "phase_seconds": {
+              "stage": 0.0006430000000000003,
+              "limit": 0.0038110000000000006,
+              "prep": 0.006547000000000001,
+              "cpu": 0.714078,
+              "join": 1.3379349999999999,
+              "reduce": 0.0014559999999999998,
+              "total": 2.0644669999999996
+            },
+            "routes": {
+              "cpu_routes": 10506,
+              "gpu0_routes": 16629,
+              "gpu1_routes": 16641
+            }
+          },
+          "408": {
+            "calls": 21,
+            "phase_seconds": {
+              "stage": 0.00026500000000000004,
+              "limit": 0.003017999999999999,
+              "prep": 0.0028150000000000002,
+              "cpu": 0.8833849999999999,
+              "join": 0.28354199999999996,
+              "reduce": 0.0008760000000000003,
+              "total": 1.173905
+            },
+            "routes": {
+              "cpu_routes": 7722,
+              "gpu0_routes": 21827,
+              "gpu1_routes": 21859
+            }
+          },
+          "4096": {
+            "calls": 42,
+            "phase_seconds": {
+              "stage": 0.0006650000000000004,
+              "limit": 0.021095000000000003,
+              "prep": 0.007282000000000001,
+              "cpu": 7.720510000000001,
+              "join": 7.600000000000006e-05,
+              "reduce": 0.078892,
+              "total": 7.828504999999999
+            },
+            "routes": {
+              "cpu_routes": 38010,
+              "gpu0_routes": 497060,
+              "gpu1_routes": 497122
+            }
+          }
+        }
+      },
+      {
+        "name": "plain_long_2",
+        "request_id": 5,
+        "ttft_seconds": 13.654346096998779,
+        "moe_calls": 120,
+        "assist_phase_seconds": {
+          "stage": 0.0015939999999999986,
+          "limit": 0.02820900000000002,
+          "prep": 0.01692500000000001,
+          "cpu": 9.525912000000003,
+          "join": 1.6029610000000003,
+          "reduce": 0.0817500000000001,
+          "total": 11.257332
+        },
+        "routes": {
+          "cpu_routes": 56238,
+          "gpu0_routes": 535516,
+          "gpu1_routes": 535622
+        },
+        "by_batch_rows": {
+          "128": {
+            "calls": 57,
+            "phase_seconds": {
+              "stage": 0.0006620000000000004,
+              "limit": 0.0040869999999999995,
+              "prep": 0.006908,
+              "cpu": 0.681965,
+              "join": 1.360719,
+              "reduce": 0.0014750000000000002,
+              "total": 2.0558109999999994
+            },
+            "routes": {
+              "cpu_routes": 10506,
+              "gpu0_routes": 16629,
+              "gpu1_routes": 16641
+            }
+          },
+          "408": {
+            "calls": 21,
+            "phase_seconds": {
+              "stage": 0.00027000000000000006,
+              "limit": 0.003065,
+              "prep": 0.0026889999999999996,
+              "cpu": 1.003336,
+              "join": 0.242164,
+              "reduce": 0.0013800000000000004,
+              "total": 1.2529030000000003
+            },
+            "routes": {
+              "cpu_routes": 7722,
+              "gpu0_routes": 21827,
+              "gpu1_routes": 21859
+            }
+          },
+          "4096": {
+            "calls": 42,
+            "phase_seconds": {
+              "stage": 0.0006620000000000005,
+              "limit": 0.021056999999999992,
+              "prep": 0.007327999999999998,
+              "cpu": 7.840611000000003,
+              "join": 7.800000000000005e-05,
+              "reduce": 0.07889500000000002,
+              "total": 7.948617999999999
+            },
+            "routes": {
+              "cpu_routes": 38010,
+              "gpu0_routes": 497060,
+              "gpu1_routes": 497122
+            }
+          }
+        }
+      },
+      {
+        "name": "profile_long_0",
+        "request_id": 6,
+        "ttft_seconds": 13.65977704100078,
+        "moe_calls": 120,
+        "assist_phase_seconds": {
+          "stage": 0.0015689999999999986,
+          "limit": 0.027906000000000004,
+          "prep": 0.016503999999999998,
+          "cpu": 9.441880000000001,
+          "join": 1.5950660000000003,
+          "reduce": 0.08125200000000013,
+          "total": 11.164158000000002
+        },
+        "routes": {
+          "cpu_routes": 56238,
+          "gpu0_routes": 535516,
+          "gpu1_routes": 535622
+        },
+        "by_batch_rows": {
+          "128": {
+            "calls": 57,
+            "phase_seconds": {
+              "stage": 0.0006690000000000003,
+              "limit": 0.0037890000000000003,
+              "prep": 0.006636000000000002,
+              "cpu": 0.7260420000000003,
+              "join": 1.326064,
+              "reduce": 0.001523999999999999,
+              "total": 2.064717
+            },
+            "routes": {
+              "cpu_routes": 10506,
+              "gpu0_routes": 16629,
+              "gpu1_routes": 16641
+            }
+          },
+          "408": {
+            "calls": 21,
+            "phase_seconds": {
+              "stage": 0.0002780000000000001,
+              "limit": 0.003125,
+              "prep": 0.00296,
+              "cpu": 0.9268290000000001,
+              "join": 0.268926,
+              "reduce": 0.0008040000000000004,
+              "total": 1.202925
+            },
+            "routes": {
+              "cpu_routes": 7722,
+              "gpu0_routes": 21827,
+              "gpu1_routes": 21859
+            }
+          },
+          "4096": {
+            "calls": 42,
+            "phase_seconds": {
+              "stage": 0.0006220000000000004,
+              "limit": 0.020991999999999997,
+              "prep": 0.006907999999999998,
+              "cpu": 7.789009,
+              "join": 7.600000000000006e-05,
+              "reduce": 0.07892400000000001,
+              "total": 7.896516
+            },
+            "routes": {
+              "cpu_routes": 38010,
+              "gpu0_routes": 497060,
+              "gpu1_routes": 497122
+            }
+          }
+        },
+        "operator_seconds": {
+          "MergeMOE": 11.216670156,
+          "DeepSeekV41SparseAttention": 0.346503841,
+          "Linear/attn.wq_b.weight": 0.096175912,
+          "DeepSeekV4WoA": 0.092833122,
+          "DeepSeekV41HcMix": 0.091523407,
+          "Embedding": 0.08207592,
+          "Linear/attn.wo_b.weight": 0.076212628,
+          "DeepSeekV41HcPost": 0.047082295,
+          "Linear/type=7;shape=4608x5120": 0.045988863000000005,
+          "DeepSeekV41QuantizeActivation": 0.043617071,
+          "Linear/type=10;shape=25600x6144": 0.036701094,
+          "Linear/type=0;shape=384x5120": 0.030009412,
+          "Linear/w2": 0.025042989,
+          "EngramGatherRows": 0.022305861,
+          "ToBFloat16": 0.020698819,
+          "DeepSeekV41HcPreNorm": 0.020026885,
+          "Linear/attn.wq_a.weight": 0.01982769,
+          "DeepSeekV41RotaryQuant": 0.012297293,
+          "Linear/attn.wkv.weight": 0.010115836000000001,
+          "DeepSeekV41IndexerScore": 0.008865199,
+          "AddTo": 0.007936476999999999,
+          "ConvertToFloat32": 0.00677446,
+          "Linear/attn.compressor.wkv.weight": 0.005183983,
+          "Linear/type=7;shape=129280x5120": 0.004305394,
+          "RMSNorm": 0.0042646360000000005,
+          "Linear/attn.compressor.wgate.weight": 0.003682857,
+          "CatDirect": 0.002598313,
+          "DeepSeekV41EngramApply": 0.002577082,
+          "Linear/attn.indexer.wq_b.weight": 0.002442458,
+          "DeepSeekV41IndexerTopK": 0.002288532,
+          "DeepSeekV41WindowStore": 0.0016781819999999999,
+          "Repeat": 0.001238059,
+          "Linear/attn.indexer.weights_proj.weight": 0.001223893,
+          "DeepSeekV41HcApplyPre": 0.001076887,
+          "Split": 0.00035334900000000004,
+          "Mul": 0.000346837,
+          "DeepSeekV41Compress": 0.000341439,
+          "Linear/attn.indexer.wk.weight": 0.000288647,
+          "ToFloat32": 0.000222953,
+          "DeepSeekV41CandidateBlocks": 0.00021378600000000002,
+          "TopK": 6.4612e-05
+        },
+        "operator_group_seconds": {
+          "MergeMOE": 11.216670156,
+          "DenseLinear": 0.3572016560000001,
+          "SparseAttention": 0.346503841,
+          "HC": 0.15970947400000002,
+          "Other": 0.14089134899999997,
+          "AttentionWoA": 0.092833122,
+          "GPUActivationQuant": 0.043617071,
+          "Engram": 0.024882943,
+          "Indexer": 0.011367517
+        },
+        "frame_seconds": 13.625309489,
+        "frames": [
+          {
+            "kind": "prefill",
+            "rows": 4096,
+            "start_pos": 0
+          },
+          {
+            "kind": "verify",
+            "rows": 4096,
+            "start_pos": 4096
+          },
+          {
+            "kind": "verify",
+            "rows": 408,
+            "start_pos": 8192
+          }
+        ]
+      },
+      {
+        "name": "profile_long_1",
+        "request_id": 7,
+        "ttft_seconds": 13.64582398897619,
+        "moe_calls": 120,
+        "assist_phase_seconds": {
+          "stage": 0.0015659999999999984,
+          "limit": 0.027904999999999992,
+          "prep": 0.016479000000000008,
+          "cpu": 9.461136000000002,
+          "join": 1.5858980000000007,
+          "reduce": 0.08154600000000016,
+          "total": 11.174525000000006
+        },
+        "routes": {
+          "cpu_routes": 56238,
+          "gpu0_routes": 535516,
+          "gpu1_routes": 535622
+        },
+        "by_batch_rows": {
+          "128": {
+            "calls": 57,
+            "phase_seconds": {
+              "stage": 0.0006820000000000004,
+              "limit": 0.0040360000000000005,
+              "prep": 0.006805000000000001,
+              "cpu": 0.70422,
+              "join": 1.342586,
+              "reduce": 0.001517,
+              "total": 2.0598539999999996
+            },
+            "routes": {
+              "cpu_routes": 10506,
+              "gpu0_routes": 16629,
+              "gpu1_routes": 16641
+            }
+          },
+          "408": {
+            "calls": 21,
+            "phase_seconds": {
+              "stage": 0.00027200000000000005,
+              "limit": 0.002986,
+              "prep": 0.0026880000000000007,
+              "cpu": 0.9276750000000001,
+              "join": 0.243234,
+              "reduce": 0.0010950000000000003,
+              "total": 1.177945
+            },
+            "routes": {
+              "cpu_routes": 7722,
+              "gpu0_routes": 21827,
+              "gpu1_routes": 21859
+            }
+          },
+          "4096": {
+            "calls": 42,
+            "phase_seconds": {
+              "stage": 0.0006120000000000005,
+              "limit": 0.020882999999999995,
+              "prep": 0.006985999999999999,
+              "cpu": 7.829240999999999,
+              "join": 7.800000000000005e-05,
+              "reduce": 0.07893400000000003,
+              "total": 7.936726000000002
+            },
+            "routes": {
+              "cpu_routes": 38010,
+              "gpu0_routes": 497060,
+              "gpu1_routes": 497122
+            }
+          }
+        },
+        "operator_seconds": {
+          "MergeMOE": 11.223106462,
+          "DeepSeekV41SparseAttention": 0.346406244,
+          "Linear/attn.wq_b.weight": 0.096158884,
+          "DeepSeekV4WoA": 0.092835245,
+          "DeepSeekV41HcMix": 0.091284649,
+          "Embedding": 0.081989038,
+          "Linear/attn.wo_b.weight": 0.07612626099999999,
+          "DeepSeekV41HcPost": 0.046829933000000004,
+          "Linear/type=7;shape=4608x5120": 0.046013726,
+          "DeepSeekV41QuantizeActivation": 0.043866161,
+          "Linear/type=10;shape=25600x6144": 0.036696394,
+          "Linear/type=0;shape=384x5120": 0.029904081,
+          "Linear/w2": 0.025152378000000003,
+          "EngramGatherRows": 0.02236048,
+          "ToBFloat16": 0.020627735,
+          "Linear/attn.wq_a.weight": 0.020098067,
+          "DeepSeekV41HcPreNorm": 0.020013789,
+          "DeepSeekV41RotaryQuant": 0.012268958,
+          "Linear/attn.wkv.weight": 0.010102601,
+          "DeepSeekV41IndexerScore": 0.008852976,
+          "AddTo": 0.007939356,
+          "ConvertToFloat32": 0.006746862,
+          "Linear/attn.compressor.wkv.weight": 0.005203306,
+          "Linear/type=7;shape=129280x5120": 0.004302523999999999,
+          "RMSNorm": 0.004245037,
+          "Linear/attn.compressor.wgate.weight": 0.003651486,
+          "CatDirect": 0.00295121,
+          "DeepSeekV41EngramApply": 0.002568251,
+          "Linear/attn.indexer.wq_b.weight": 0.002433736,
+          "DeepSeekV41IndexerTopK": 0.002281785,
+          "DeepSeekV41WindowStore": 0.001640592,
+          "Linear/attn.indexer.weights_proj.weight": 0.0012307210000000002,
+          "Repeat": 0.0010559039999999999,
+          "DeepSeekV41HcApplyPre": 0.001052797,
+          "Split": 0.00035883899999999996,
+          "DeepSeekV41Compress": 0.000335997,
+          "Mul": 0.0003345,
+          "Linear/attn.indexer.wk.weight": 0.000291987,
+          "ToFloat32": 0.00021647500000000002,
+          "DeepSeekV41CandidateBlocks": 0.00021491599999999997,
+          "TopK": 6.0121e-05
+        },
+        "operator_group_seconds": {
+          "MergeMOE": 11.223106462,
+          "DenseLinear": 0.35736615200000005,
+          "SparseAttention": 0.346406244,
+          "HC": 0.15918116799999998,
+          "Other": 0.14077062399999996,
+          "AttentionWoA": 0.092835245,
+          "GPUActivationQuant": 0.043866161,
+          "Engram": 0.024928731,
+          "Indexer": 0.011349676999999999
+        },
+        "frame_seconds": 13.621483382,
+        "frames": [
+          {
+            "kind": "prefill",
+            "rows": 4096,
+            "start_pos": 0
+          },
+          {
+            "kind": "verify",
+            "rows": 4096,
+            "start_pos": 4096
+          },
+          {
+            "kind": "verify",
+            "rows": 408,
+            "start_pos": 8192
+          }
+        ]
+      }
+    ],
+    "output_token_ids": [
+      [
+        24313
+      ],
+      [
+        24313
+      ],
+      [
+        24313
+      ],
+      [
+        24313
+      ],
+      [
+        24313
+      ]
+    ],
+    "cuda_cache_lookup_deltas": [
+      {
+        "0": {
+          "hits": 0,
+          "misses": 0
+        },
+        "1": {
+          "hits": 0,
+          "misses": 0
+        }
+      },
+      {
+        "0": {
+          "hits": 0,
+          "misses": 0
+        },
+        "1": {
+          "hits": 0,
+          "misses": 0
+        }
+      },
+      {
+        "0": {
+          "hits": 0,
+          "misses": 0
+        },
+        "1": {
+          "hits": 0,
+          "misses": 0
+        }
+      },
+      {
+        "0": {
+          "hits": 0,
+          "misses": 0
+        },
+        "1": {
+          "hits": 0,
+          "misses": 0
+        }
+      },
+      {
+        "0": {
+          "hits": 0,
+          "misses": 0
+        },
+        "1": {
+          "hits": 0,
+          "misses": 0
+        }
+      }
+    ],
+    "model_load_seconds": 386.59689911297755,
+    "gpu_expert_cache_payload_after_release_bytes": {
+      "0": 0,
+      "1": 0
+    }
+  },
+  "nvfp4": {
+    "model_path": "/home/tf/hfmodels/DeepSeek-V4.1-Flash",
+    "library_sha256": "97597346648fece59018d1fd2ef99fcdc6687c7357f08188ea1d50f22123377f",
+    "plain_ttft_seconds_median": 5.9298744419938885,
+    "plain_assist_phase_seconds_mean": {
+      "stage": 0.00219033333333333,
+      "limit": 0.030796,
+      "prep": 0.025905666666666667,
+      "cpu": 2.7451086666666664,
+      "join": 0.674053,
+      "reduce": 0.026134999999999995,
+      "total": 3.5041836666666653
+    },
+    "plain_routes_mean": {
+      "cpu_routes": 44935,
+      "gpu0_routes": 541206,
+      "gpu1_routes": 541235
+    },
+    "profile_operator_group_seconds_mean": {
+      "AttentionWoA": 0.093274834,
+      "DenseLinear": 0.370384474,
+      "Engram": 0.027030720499999997,
+      "GPUActivationQuant": 0.046451209,
+      "HC": 0.15770358750000002,
+      "Indexer": 0.011049606,
+      "MergeMOE": 3.5505031479999998,
+      "Other": 0.13834404599999997,
+      "SparseAttention": 0.333986605
+    },
+    "runs": [
+      {
+        "name": "plain_long_0",
+        "request_id": 3,
+        "ttft_seconds": 5.9298744419938885,
+        "moe_calls": 120,
+        "assist_phase_seconds": {
+          "stage": 0.0021789999999999965,
+          "limit": 0.030424,
+          "prep": 0.029022000000000006,
+          "cpu": 2.7433929999999993,
+          "join": 0.6845949999999997,
+          "reduce": 0.024755999999999997,
+          "total": 3.5143639999999987
+        },
+        "routes": {
+          "cpu_routes": 44935,
+          "gpu0_routes": 541206,
+          "gpu1_routes": 541235
+        },
+        "by_batch_rows": {
+          "128": {
+            "calls": 57,
+            "phase_seconds": {
+              "stage": 0.0007110000000000005,
+              "limit": 0.004627000000000002,
+              "prep": 0.010879999999999997,
+              "cpu": 0.638772,
+              "join": 0.29295400000000005,
+              "reduce": 0.003306,
+              "total": 0.9512409999999999
+            },
+            "routes": {
+              "cpu_routes": 10715,
+              "gpu0_routes": 16513,
+              "gpu1_routes": 16548
+            }
+          },
+          "408": {
+            "calls": 21,
+            "phase_seconds": {
+              "stage": 0.0003160000000000001,
+              "limit": 0.004394,
+              "prep": 0.004567,
+              "cpu": 0.40348,
+              "join": 0.18149199999999996,
+              "reduce": 0.0014010000000000006,
+              "total": 0.5956480000000001
+            },
+            "routes": {
+              "cpu_routes": 7092,
+              "gpu0_routes": 22161,
+              "gpu1_routes": 22155
+            }
+          },
+          "4096": {
+            "calls": 42,
+            "phase_seconds": {
+              "stage": 0.0011519999999999998,
+              "limit": 0.021403,
+              "prep": 0.013575,
+              "cpu": 1.7011409999999996,
+              "join": 0.21014899999999995,
+              "reduce": 0.020048999999999997,
+              "total": 1.9674749999999996
+            },
+            "routes": {
+              "cpu_routes": 27128,
+              "gpu0_routes": 502532,
+              "gpu1_routes": 502532
+            }
+          }
+        }
+      },
+      {
+        "name": "plain_long_1",
+        "request_id": 4,
+        "ttft_seconds": 5.902942020999035,
+        "moe_calls": 120,
+        "assist_phase_seconds": {
+          "stage": 0.0021669999999999966,
+          "limit": 0.030663999999999993,
+          "prep": 0.024438999999999995,
+          "cpu": 2.7471099999999997,
+          "join": 0.6490380000000001,
+          "reduce": 0.026487999999999987,
+          "total": 3.479897999999998
+        },
+        "routes": {
+          "cpu_routes": 44935,
+          "gpu0_routes": 541206,
+          "gpu1_routes": 541235
+        },
+        "by_batch_rows": {
+          "128": {
+            "calls": 57,
+            "phase_seconds": {
+              "stage": 0.0007180000000000005,
+              "limit": 0.004753000000000001,
+              "prep": 0.011515999999999997,
+              "cpu": 0.640494,
+              "join": 0.3003910000000001,
+              "reduce": 0.003396,
+              "total": 0.9612650000000001
+            },
+            "routes": {
+              "cpu_routes": 10715,
+              "gpu0_routes": 16513,
+              "gpu1_routes": 16548
+            }
+          },
+          "408": {
+            "calls": 21,
+            "phase_seconds": {
+              "stage": 0.00033400000000000015,
+              "limit": 0.004601000000000001,
+              "prep": 0.004597,
+              "cpu": 0.40552600000000005,
+              "join": 0.162165,
+              "reduce": 0.001452,
+              "total": 0.5786650000000001
+            },
+            "routes": {
+              "cpu_routes": 7092,
+              "gpu0_routes": 22161,
+              "gpu1_routes": 22155
+            }
+          },
+          "4096": {
+            "calls": 42,
+            "phase_seconds": {
+              "stage": 0.0011149999999999999,
+              "limit": 0.021310000000000003,
+              "prep": 0.008325999999999998,
+              "cpu": 1.7010899999999998,
+              "join": 0.186482,
+              "reduce": 0.021639999999999996,
+              "total": 1.9399679999999997
+            },
+            "routes": {
+              "cpu_routes": 27128,
+              "gpu0_routes": 502532,
+              "gpu1_routes": 502532
+            }
+          }
+        }
+      },
+      {
+        "name": "plain_long_2",
+        "request_id": 5,
+        "ttft_seconds": 5.966855346021475,
+        "moe_calls": 120,
+        "assist_phase_seconds": {
+          "stage": 0.0022249999999999974,
+          "limit": 0.03130000000000001,
+          "prep": 0.024255999999999996,
+          "cpu": 2.744823,
+          "join": 0.6885260000000002,
+          "reduce": 0.027161,
+          "total": 3.518288999999999
+        },
+        "routes": {
+          "cpu_routes": 44935,
+          "gpu0_routes": 541206,
+          "gpu1_routes": 541235
+        },
+        "by_batch_rows": {
+          "128": {
+            "calls": 57,
+            "phase_seconds": {
+              "stage": 0.0007360000000000005,
+              "limit": 0.004565,
+              "prep": 0.011028,
+              "cpu": 0.6403519999999998,
+              "join": 0.33020799999999995,
+              "reduce": 0.0035050000000000003,
+              "total": 0.9903900000000001
+            },
+            "routes": {
+              "cpu_routes": 10715,
+              "gpu0_routes": 16513,
+              "gpu1_routes": 16548
+            }
+          },
+          "408": {
+            "calls": 21,
+            "phase_seconds": {
+              "stage": 0.0003310000000000002,
+              "limit": 0.004808,
+              "prep": 0.004813,
+              "cpu": 0.404662,
+              "join": 0.150097,
+              "reduce": 0.0016330000000000003,
+              "total": 0.566342
+            },
+            "routes": {
+              "cpu_routes": 7092,
+              "gpu0_routes": 22161,
+              "gpu1_routes": 22155
+            }
+          },
+          "4096": {
+            "calls": 42,
+            "phase_seconds": {
+              "stage": 0.0011580000000000002,
+              "limit": 0.021927000000000002,
+              "prep": 0.008415,
+              "cpu": 1.6998089999999995,
+              "join": 0.20822100000000004,
+              "reduce": 0.022022999999999997,
+              "total": 1.9615569999999993
+            },
+            "routes": {
+              "cpu_routes": 27128,
+              "gpu0_routes": 502532,
+              "gpu1_routes": 502532
+            }
+          }
+        }
+      },
+      {
+        "name": "profile_long_0",
+        "request_id": 6,
+        "ttft_seconds": 6.056610923988046,
+        "moe_calls": 120,
+        "assist_phase_seconds": {
+          "stage": 0.0021849999999999964,
+          "limit": 0.030463,
+          "prep": 0.02380599999999999,
+          "cpu": 2.775151,
+          "join": 0.6442489999999998,
+          "reduce": 0.031696999999999996,
+          "total": 3.5075489999999996
+        },
+        "routes": {
+          "cpu_routes": 44935,
+          "gpu0_routes": 541206,
+          "gpu1_routes": 541235
+        },
+        "by_batch_rows": {
+          "128": {
+            "calls": 57,
+            "phase_seconds": {
+              "stage": 0.0007580000000000005,
+              "limit": 0.004848,
+              "prep": 0.011244,
+              "cpu": 0.6390110000000001,
+              "join": 0.28396899999999997,
+              "reduce": 0.0037180000000000004,
+              "total": 0.943542
+            },
+            "routes": {
+              "cpu_routes": 10715,
+              "gpu0_routes": 16513,
+              "gpu1_routes": 16548
+            }
+          },
+          "408": {
+            "calls": 21,
+            "phase_seconds": {
+              "stage": 0.0003080000000000001,
+              "limit": 0.003853999999999999,
+              "prep": 0.004332000000000001,
+              "cpu": 0.403229,
+              "join": 0.14973099999999998,
+              "reduce": 0.0014370000000000003,
+              "total": 0.562894
+            },
+            "routes": {
+              "cpu_routes": 7092,
+              "gpu0_routes": 22161,
+              "gpu1_routes": 22155
+            }
+          },
+          "4096": {
+            "calls": 42,
+            "phase_seconds": {
+              "stage": 0.0011190000000000002,
+              "limit": 0.021761000000000006,
+              "prep": 0.008230000000000003,
+              "cpu": 1.7329110000000003,
+              "join": 0.21054899999999993,
+              "reduce": 0.02654199999999999,
+              "total": 2.001113
+            },
+            "routes": {
+              "cpu_routes": 27128,
+              "gpu0_routes": 502532,
+              "gpu1_routes": 502532
+            }
+          }
+        },
+        "operator_seconds": {
+          "MergeMOE": 3.553812367,
+          "DeepSeekV41SparseAttention": 0.333835866,
+          "Linear/attn.wq_b.weight": 0.095399158,
+          "DeepSeekV4WoA": 0.093331306,
+          "DeepSeekV41HcMix": 0.089585327,
+          "Linear/attn.wo_b.weight": 0.084525977,
+          "Embedding": 0.075071933,
+          "Linear/type=7;shape=4608x5120": 0.047721536999999994,
+          "DeepSeekV41HcPost": 0.046485349,
+          "DeepSeekV41QuantizeActivation": 0.046345311,
+          "Linear/type=10;shape=25600x6144": 0.035452911999999996,
+          "Linear/type=0;shape=384x5120": 0.029839439000000002,
+          "Linear/w2": 0.026843806999999997,
+          "EngramGatherRows": 0.026310754,
+          "Linear/attn.wq_a.weight": 0.022278017,
+          "ToBFloat16": 0.020536204,
+          "DeepSeekV41HcPreNorm": 0.020290948,
+          "DeepSeekV41RotaryQuant": 0.012418160000000001,
+          "Linear/attn.wkv.weight": 0.010383379,
+          "DeepSeekV41IndexerScore": 0.008464105,
+          "AddTo": 0.00799195,
+          "ConvertToFloat32": 0.006949396,
+          "Linear/attn.compressor.wkv.weight": 0.005202336,
+          "RMSNorm": 0.004387586,
+          "Linear/type=7;shape=129280x5120": 0.004244912,
+          "Linear/attn.compressor.wgate.weight": 0.003956876,
+          "DeepSeekV41EngramApply": 0.002541241,
+          "CatDirect": 0.00248507,
+          "Linear/attn.indexer.wq_b.weight": 0.002392862,
+          "DeepSeekV41IndexerTopK": 0.002216843,
+          "DeepSeekV41WindowStore": 0.001918882,
+          "Linear/attn.indexer.weights_proj.weight": 0.001690958,
+          "DeepSeekV41HcApplyPre": 0.001162621,
+          "Repeat": 0.0010378639999999999,
+          "Mul": 0.000404943,
+          "Split": 0.000374397,
+          "DeepSeekV41Compress": 0.000367988,
+          "Linear/attn.indexer.wk.weight": 0.000333107,
+          "ToFloat32": 0.000262166,
+          "DeepSeekV41CandidateBlocks": 0.000215544,
+          "TopK": 6.352199999999999e-05
+        },
+        "operator_group_seconds": {
+          "MergeMOE": 3.553812367,
+          "DenseLinear": 0.370265277,
+          "SparseAttention": 0.333835866,
+          "HC": 0.157524245,
+          "Other": 0.134270061,
+          "AttentionWoA": 0.093331306,
+          "GPUActivationQuant": 0.046345311,
+          "Engram": 0.028851995,
+          "Indexer": 0.010896492
+        },
+        "frame_seconds": 6.019652626,
+        "frames": [
+          {
+            "kind": "prefill",
+            "rows": 4096,
+            "start_pos": 0
+          },
+          {
+            "kind": "verify",
+            "rows": 4096,
+            "start_pos": 4096
+          },
+          {
+            "kind": "verify",
+            "rows": 408,
+            "start_pos": 8192
+          }
+        ]
+      },
+      {
+        "name": "profile_long_1",
+        "request_id": 7,
+        "ttft_seconds": 6.028829902003054,
+        "moe_calls": 120,
+        "assist_phase_seconds": {
+          "stage": 0.0023459999999999965,
+          "limit": 0.030122000000000003,
+          "prep": 0.023735999999999993,
+          "cpu": 2.7468380000000026,
+          "join": 0.6717330000000001,
+          "reduce": 0.025863,
+          "total": 3.500633999999998
+        },
+        "routes": {
+          "cpu_routes": 44935,
+          "gpu0_routes": 541206,
+          "gpu1_routes": 541235
+        },
+        "by_batch_rows": {
+          "128": {
+            "calls": 57,
+            "phase_seconds": {
+              "stage": 0.0008670000000000006,
+              "limit": 0.004467000000000001,
+              "prep": 0.011022000000000004,
+              "cpu": 0.636737,
+              "join": 0.31192300000000006,
+              "reduce": 0.0036899999999999997,
+              "total": 0.9687010000000001
+            },
+            "routes": {
+              "cpu_routes": 10715,
+              "gpu0_routes": 16513,
+              "gpu1_routes": 16548
+            }
+          },
+          "408": {
+            "calls": 21,
+            "phase_seconds": {
+              "stage": 0.0003390000000000001,
+              "limit": 0.004403000000000001,
+              "prep": 0.0047989999999999994,
+              "cpu": 0.403595,
+              "join": 0.14847800000000003,
+              "reduce": 0.00163,
+              "total": 0.5632460000000001
+            },
+            "routes": {
+              "cpu_routes": 7092,
+              "gpu0_routes": 22161,
+              "gpu1_routes": 22155
+            }
+          },
+          "4096": {
+            "calls": 42,
+            "phase_seconds": {
+              "stage": 0.0011400000000000002,
+              "limit": 0.021252,
+              "prep": 0.007914999999999998,
+              "cpu": 1.706506,
+              "join": 0.211332,
+              "reduce": 0.020542999999999995,
+              "total": 1.9686869999999999
+            },
+            "routes": {
+              "cpu_routes": 27128,
+              "gpu0_routes": 502532,
+              "gpu1_routes": 502532
+            }
+          }
+        },
+        "operator_seconds": {
+          "MergeMOE": 3.5471939289999996,
+          "DeepSeekV41SparseAttention": 0.334137344,
+          "Linear/attn.wq_b.weight": 0.095488593,
+          "DeepSeekV4WoA": 0.093218362,
+          "DeepSeekV41HcMix": 0.090149663,
+          "Linear/attn.wo_b.weight": 0.084416177,
+          "Embedding": 0.081267733,
+          "Linear/type=7;shape=4608x5120": 0.048424434999999995,
+          "DeepSeekV41QuantizeActivation": 0.046557107,
+          "DeepSeekV41HcPost": 0.046504646,
+          "Linear/type=10;shape=25600x6144": 0.03537372,
+          "Linear/type=0;shape=384x5120": 0.029972869000000003,
+          "Linear/w2": 0.026301168,
+          "EngramGatherRows": 0.022666503999999997,
+          "Linear/attn.wq_a.weight": 0.022356558,
+          "ToBFloat16": 0.022190473,
+          "DeepSeekV41HcPreNorm": 0.020167907,
+          "DeepSeekV41RotaryQuant": 0.01252806,
+          "Linear/attn.wkv.weight": 0.010302710999999999,
+          "DeepSeekV41IndexerScore": 0.008486836,
+          "AddTo": 0.008020814000000001,
+          "ConvertToFloat32": 0.006941042999999999,
+          "Linear/attn.compressor.wkv.weight": 0.005215045,
+          "RMSNorm": 0.004508005,
+          "Linear/type=7;shape=129280x5120": 0.004292603,
+          "Linear/attn.compressor.wgate.weight": 0.003956515,
+          "CatDirect": 0.002619514,
+          "DeepSeekV41EngramApply": 0.0025429420000000003,
+          "DeepSeekV41IndexerTopK": 0.0025066689999999996,
+          "Linear/attn.indexer.wq_b.weight": 0.002414267,
+          "DeepSeekV41WindowStore": 0.0018089710000000001,
+          "Linear/attn.indexer.weights_proj.weight": 0.0016546489999999998,
+          "DeepSeekV41HcApplyPre": 0.001060714,
+          "Repeat": 0.001031365,
+          "Mul": 0.00041764000000000005,
+          "Split": 0.00038307900000000004,
+          "DeepSeekV41Compress": 0.00036873700000000006,
+          "Linear/attn.indexer.wk.weight": 0.000334361,
+          "ToFloat32": 0.000270437,
+          "DeepSeekV41CandidateBlocks": 0.000209215,
+          "TopK": 6.216e-05
+        },
+        "operator_group_seconds": {
+          "MergeMOE": 3.5471939289999996,
+          "DenseLinear": 0.37050367100000003,
+          "SparseAttention": 0.334137344,
+          "HC": 0.15788293000000003,
+          "Other": 0.14241803099999994,
+          "AttentionWoA": 0.093218362,
+          "GPUActivationQuant": 0.046557107,
+          "Engram": 0.025209445999999996,
+          "Indexer": 0.011202720000000001
+        },
+        "frame_seconds": 6.001420962,
+        "frames": [
+          {
+            "kind": "prefill",
+            "rows": 4096,
+            "start_pos": 0
+          },
+          {
+            "kind": "verify",
+            "rows": 4096,
+            "start_pos": 4096
+          },
+          {
+            "kind": "verify",
+            "rows": 408,
+            "start_pos": 8192
+          }
+        ]
+      }
+    ],
+    "output_token_ids": [
+      [
+        24313
+      ],
+      [
+        24313
+      ],
+      [
+        24313
+      ],
+      [
+        24313
+      ],
+      [
+        24313
+      ]
+    ],
+    "cuda_cache_lookup_deltas": [
+      {
+        "0": {
+          "hits": 0,
+          "misses": 0
+        },
+        "1": {
+          "hits": 0,
+          "misses": 0
+        }
+      },
+      {
+        "0": {
+          "hits": 0,
+          "misses": 0
+        },
+        "1": {
+          "hits": 0,
+          "misses": 0
+        }
+      },
+      {
+        "0": {
+          "hits": 0,
+          "misses": 0
+        },
+        "1": {
+          "hits": 0,
+          "misses": 0
+        }
+      },
+      {
+        "0": {
+          "hits": 0,
+          "misses": 0
+        },
+        "1": {
+          "hits": 0,
+          "misses": 0
+        }
+      },
+      {
+        "0": {
+          "hits": 0,
+          "misses": 0
+        },
+        "1": {
+          "hits": 0,
+          "misses": 0
+        }
+      }
+    ],
+    "model_load_seconds": 428.48272522201296,
+    "gpu_expert_cache_payload_after_release_bytes": {
+      "0": 0,
+      "1": 0
+    }
+  },
+  "observations": {
+    "routed_moe_prefill_uses_cpu_and_both_gpus": true,
+    "ordinary_prefill_cuda_expert_cache_lookups": 0,
+    "cpu_input_preparation": "Q2 CPU experts prepare every batch input row. BF16 -> FP32 -> Q8_K is performed before a second BF16 -> newly allocated FP32 -> serial block-32 FP8 -> Q8_K pass overwrites it. Only CPU-routed rows are then expanded for expert GEMM.",
+    "cpu_fast_path": "useDeepSeekV4LargeFast requires downInputDataType < DATA_GGUF_FORMAT, so GGUF experts bypass parallel down-input preparation, rounding and output storage, plus redundant cross-SwiGLU removal.",
+    "gpu_small_batch_path": "Q2_K_R4 and Q4_K_R4 are absent from GGUF MMQ/MMVQ admission. For expert batches greater than one row, CUDA GGUF linear falls back to BF16 dequantization plus cuBLAS GEMM. NVFP4 can use its direct quantized GEMV path for up to 31 rows.",
+    "split_calibration": "Default synthetic split calibration calls the generic CPU/GPU MoE helpers without V4.1 deepSeekV4Mode, swigluLimit or activationQuantBlock parameters. This omits model-specific CPU preparation costs; its contribution has not been isolated with a split-policy A/B run."
+  },
+  "source_locations": {
+    "numa_cpu_input_preparation": "src/devices/numas/numasdevice.cpp:6374",
+    "numa_gguf_activation_quantization": "src/devices/numas/numasdevice.cpp:738",
+    "numa_cpu_fast_admission": "src/devices/numas/numasdevice.cpp:6480",
+    "numa_prefill_route_split": "src/devices/numas/numasdevice.cpp:8840",
+    "cuda_gguf_dispatch": "src/devices/cuda/fastllm-ggml-cuda.cu:3125",
+    "cuda_gguf_mmq_admission": "src/devices/cuda/gguf_mmq/fastllm-gguf-mmq.cu:932",
+    "split_calibration": "src/devices/numas/numasdevice.cpp:6039",
+    "expert_cache_prefill_guard": "src/models/deepseekv41.cpp:4575"
+  },
+  "limitations": [
+    "Split policies and routed experts differ across quantized formats; the matched comparison does not fix route IDs.",
+    "TTFT includes prefill and producing one token, and excludes model load/tokenization/HTTP.",
+    "The CPU phase has not been separated into allocation, activation preparation, GEMM and reduction on the full model. Attribution within the phase is based on source inspection.",
+    "The two synchronized operator profiles are separate from the three ordinary requests; their timings should not be added to ordinary TTFT.",
+    "Only one output token was requested; this analysis does not evaluate model accuracy or decode throughput."
+  ]
+}

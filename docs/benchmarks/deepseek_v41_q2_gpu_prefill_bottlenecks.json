@@ -1,0 +1,549 @@
+{
+  "date": "2026-10-02",
+  "full_model_configuration": "Single NUMA 0, 28 CPU threads, CUDA 0/1 serial layer map, per-device 8 GiB expert cache, fast prefill, 8600 input tokens, chunk 4096, one output token, request-level speculation and prefix/history reuse disabled.",
+  "full_model_sources": [
+    "docs/benchmarks/deepseek_v41_q2_grouped_prefill.json:after",
+    "docs/benchmarks/deepseek_v41_q2_nvfp4_prefill_analysis.json:nvfp4"
+  ],
+  "full_model": {
+    "q2": {
+      "model_path": "/home/tf/hfmodels/DeepSeek-V4.1-Flash-Q2_K-Mixed",
+      "library_sha256": "077aea4b679dd65c4279cedd8135e34fb3ab088e0407c828688a10ef32f02b57",
+      "plain_ttft_seconds_median": 9.316440477996366,
+      "plain_assist_phase_seconds_mean": {
+        "stage": 0.0022873333333333313,
+        "limit": 0.03446833333333333,
+        "prep": 0.02580866666666667,
+        "cpu": 2.728950666666666,
+        "join": 3.9938510000000003,
+        "reduce": 0.020424333333333336,
+        "total": 6.805794666666666
+      },
+      "plain_routes_mean": {
+        "cpu_routes": 56973,
+        "gpu0_routes": 535200,
+        "gpu1_routes": 535203
+      },
+      "profile_operator_group_seconds_mean": {
+        "AttentionWoA": 0.09361404250000001,
+        "DenseLinear": 0.3769149915000001,
+        "Engram": 0.025131159,
+        "GPUActivationQuant": 0.047141659,
+        "HC": 0.160144477,
+        "Indexer": 0.0111359335,
+        "MergeMOE": 6.875944436999999,
+        "Other": 0.150307195,
+        "SparseAttention": 0.33471536
+      },
+      "input_tokens_per_ttft_second": 923.0993339475028,
+      "by_rows_phase_seconds_mean": {
+        "128": {
+          "stage": 0.0010530000000000006,
+          "limit": 0.007344000000000001,
+          "prep": 0.012081,
+          "cpu": 0.684798,
+          "join": 0.6150019999999999,
+          "reduce": 0.004251666666666667,
+          "total": 1.3245303333333331
+        },
+        "408": {
+          "stage": 0.00038933333333333344,
+          "limit": 0.005323,
+          "prep": 0.004438333333333333,
+          "cpu": 0.36649666666666664,
+          "join": 0.46862,
+          "reduce": 0.0018933333333333335,
+          "total": 0.8471636666666666
+        },
+        "4096": {
+          "stage": 0.0008450000000000004,
+          "limit": 0.02180133333333334,
+          "prep": 0.009289333333333333,
+          "cpu": 1.6776559999999998,
+          "join": 2.9102290000000006,
+          "reduce": 0.014279333333333335,
+          "total": 4.634100666666666
+        }
+      }
+    },
+    "nvfp4": {
+      "model_path": "/home/tf/hfmodels/DeepSeek-V4.1-Flash",
+      "library_sha256": "97597346648fece59018d1fd2ef99fcdc6687c7357f08188ea1d50f22123377f",
+      "plain_ttft_seconds_median": 5.9298744419938885,
+      "plain_assist_phase_seconds_mean": {
+        "stage": 0.00219033333333333,
+        "limit": 0.030796,
+        "prep": 0.025905666666666667,
+        "cpu": 2.7451086666666664,
+        "join": 0.674053,
+        "reduce": 0.026134999999999995,
+        "total": 3.5041836666666653
+      },
+      "plain_routes_mean": {
+        "cpu_routes": 44935,
+        "gpu0_routes": 541206,
+        "gpu1_routes": 541235
+      },
+      "profile_operator_group_seconds_mean": {
+        "AttentionWoA": 0.093274834,
+        "DenseLinear": 0.370384474,
+        "Engram": 0.027030720499999997,
+        "GPUActivationQuant": 0.046451209,
+        "HC": 0.15770358750000002,
+        "Indexer": 0.011049606,
+        "MergeMOE": 3.5505031479999998,
+        "Other": 0.13834404599999997,
+        "SparseAttention": 0.333986605
+      },
+      "input_tokens_per_ttft_second": 1450.2836584695538,
+      "by_rows_phase_seconds_mean": {
+        "128": {
+          "stage": 0.0007216666666666672,
+          "limit": 0.004648333333333334,
+          "prep": 0.011141333333333331,
+          "cpu": 0.6398726666666666,
+          "join": 0.30785100000000004,
+          "reduce": 0.0034023333333333336,
+          "total": 0.967632
+        },
+        "408": {
+          "stage": 0.00032700000000000014,
+          "limit": 0.004601,
+          "prep": 0.004659,
+          "cpu": 0.404556,
+          "join": 0.16458466666666666,
+          "reduce": 0.0014953333333333335,
+          "total": 0.5802183333333334
+        },
+        "4096": {
+          "stage": 0.0011416666666666667,
+          "limit": 0.02154666666666667,
+          "prep": 0.010105333333333332,
+          "cpu": 1.7006799999999995,
+          "join": 0.20161733333333334,
+          "reduce": 0.02123733333333333,
+          "total": 1.9563333333333328
+        }
+      }
+    }
+  },
+  "full_model_comparison": {
+    "q2_to_nvfp4_ttft_ratio": 1.5711024860863265,
+    "ttft_extra_seconds": 3.3865660360024776,
+    "moe_extra_seconds": 3.301611000000001,
+    "moe_fraction_of_ttft_gap": 0.974914106177372,
+    "rows4096_fraction_of_moe_gap": 0.8110487072321155
+  },
+  "microbenchmark_configuration": {
+    "library_sha256": "077aea4b679dd65c4279cedd8135e34fb3ab088e0407c828688a10ef32f02b57",
+    "entrypoint": "fastllm::DoCudaMergeMOEFromCPU",
+    "input_type": "BF16",
+    "hidden": 5120,
+    "intermediate": 2304,
+    "experts": 384,
+    "topk": 6,
+    "selected_experts": {
+      "rows4096": 44,
+      "rows128": 22
+    },
+    "cuda_devices": {
+      "0": "RTX 4090",
+      "1": "RTX 4090 D"
+    },
+    "numa_node": 0,
+    "cpu_affinity": "0-31",
+    "source_weights": "Pinned host NUMA shards; Q2_K_R4 gate/up and Q4_K_R4 down versus NVFP4 block32 E8M0.",
+    "routing": "Identical fixed uniform routing and scores, about half the routes handled by the selected worker subset.",
+    "values": "Deterministic synthetic weights and activations; finite output checked. Not real model route replay or a cross-format accuracy check.",
+    "warmup_calls": 3,
+    "measured_calls": 5,
+    "profiler": "Nsight Systems 2024.6.2, CUDA trace only, cudaProfilerApi capture around five measured calls."
+  },
+  "microbenchmarks": {
+    "nvfp4-128-gpu0": {
+      "format": "nvfp4",
+      "device": 0,
+      "rows": 128,
+      "experts": 22,
+      "weight_bytes": 413614080,
+      "wall_ms_samples": [
+        16.163642,
+        16.001649,
+        15.994018,
+        15.986757,
+        15.991029
+      ],
+      "wall_ms_median": 15.994018,
+      "profile": {
+        "capture_calls": 5,
+        "h2d_bytes_per_call": 413624832.0,
+        "h2d_ms_per_call": 15.4726106,
+        "kernel_ms_per_call": 5.559121,
+        "h2d_kernel_overlap_ms_per_call": 5.3280532,
+        "kernel_groups_ms_per_call": {
+          "other": 0.1549198,
+          "nvfp4_gemv": 5.4042012
+        },
+        "kernels": {
+          "FastllmPickInputKernelVec16(const uint4 *, uint4 *, int, int, int *)": {
+            "instances": 110,
+            "total_ns": 127009,
+            "mean_ms_per_call": 0.0254018
+          },
+          "void <unnamed>::V41QuantizeActivationKernel<__nv_bfloat16>(const T1 *, T1 *, unsigned long)": {
+            "instances": 110,
+            "total_ns": 143937,
+            "mean_ms_per_call": 0.0287874
+          },
+          "void FastllmGemvNVFP4Block16Kernel1MultiRow<(int)64, (int)16, (bool)1, (bool)1, (bool)0, (bool)0, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16>(T7 *, unsigned char *, T8 *, T9 *, int, int, int)": {
+            "instances": 220,
+            "total_ns": 21471379,
+            "mean_ms_per_call": 4.294275799999999
+          },
+          "void FastllmGemvNVFP4Block16Kernel1MultiRow<(int)64, (int)1, (bool)1, (bool)1, (bool)0, (bool)0, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16>(T7 *, unsigned char *, T8 *, T9 *, int, int, int)": {
+            "instances": 410,
+            "total_ns": 5549627,
+            "mean_ms_per_call": 1.1099253999999998
+          },
+          "void <unnamed>::DeepSeekV4PrepareMoeDownInputKernel<(int)32>(const __nv_bfloat16 *, __nv_bfloat16 *, const float *, int, float, bool)": {
+            "instances": 110,
+            "total_ns": 225857,
+            "mean_ms_per_call": 0.0451714
+          },
+          "FastllmCudaBF162FloatKernel(unsigned short *, float *, int)": {
+            "instances": 110,
+            "total_ns": 122723,
+            "mean_ms_per_call": 0.0245446
+          },
+          "FastllmPickOutputKernel(float *, float *, int, int, int *, float *)": {
+            "instances": 110,
+            "total_ns": 142241,
+            "mean_ms_per_call": 0.0284482
+          },
+          "FastllmCudaFloat2Bf16Kernel(float *, __nv_bfloat16 *, int)": {
+            "instances": 5,
+            "total_ns": 12832,
+            "mean_ms_per_call": 0.0025664
+          }
+        }
+      }
+    },
+    "nvfp4-4096-gpu0-plain": {
+      "format": "nvfp4",
+      "device": 0,
+      "rows": 4096,
+      "experts": 44,
+      "weight_bytes": 827228160,
+      "wall_ms_samples": [
+        32.516911,
+        32.484488,
+        32.468289,
+        32.452089,
+        32.461888
+      ],
+      "wall_ms_median": 32.468289
+    },
+    "nvfp4-4096-gpu0": {
+      "format": "nvfp4",
+      "device": 0,
+      "rows": 4096,
+      "experts": 44,
+      "weight_bytes": 827228160,
+      "wall_ms_samples": [
+        32.94023,
+        32.765695,
+        32.696973,
+        32.754095,
+        32.658362
+      ],
+      "wall_ms_median": 32.754095,
+      "profile": {
+        "capture_calls": 5,
+        "h2d_bytes_per_call": 827572224.0,
+        "h2d_ms_per_call": 30.9823638,
+        "kernel_ms_per_call": 15.8828548,
+        "h2d_kernel_overlap_ms_per_call": 15.043684800000001,
+        "kernel_groups_ms_per_call": {
+          "other": 2.365353,
+          "nvfp4_to_bf16": 6.1797614,
+          "bf16_gemm": 7.3377404
+        },
+        "kernels": {
+          "FastllmPickInputKernelVec16(const uint4 *, uint4 *, int, int, int *)": {
+            "instances": 220,
+            "total_ns": 1109962,
+            "mean_ms_per_call": 0.2219924
+          },
+          "void <unnamed>::V41QuantizeActivationKernel<__nv_bfloat16>(const T1 *, T1 *, unsigned long)": {
+            "instances": 220,
+            "total_ns": 1290796,
+            "mean_ms_per_call": 0.25815920000000003
+          },
+          "FastllmCudaNVFP4Block16E8M02BFloat16Kernel(unsigned char *, __nv_bfloat16 *, int, int, bool)": {
+            "instances": 440,
+            "total_ns": 30898807,
+            "mean_ms_per_call": 6.1797614
+          },
+          "void cutlass::Kernel2<cutlass_80_tensorop_s16816gemm_bf16_64x64_32x6_tn_align8>(T1::Params)": {
+            "instances": 440,
+            "total_ns": 36688702,
+            "mean_ms_per_call": 7.3377404
+          },
+          "FastllmCudaFloat2Bf16Kernel(float *, __nv_bfloat16 *, int)": {
+            "instances": 445,
+            "total_ns": 2451610,
+            "mean_ms_per_call": 0.490322
+          },
+          "void <unnamed>::DeepSeekV4PrepareMoeDownInputKernel<(int)32>(const __nv_bfloat16 *, __nv_bfloat16 *, const float *, int, float, bool)": {
+            "instances": 220,
+            "total_ns": 2520566,
+            "mean_ms_per_call": 0.5041132
+          },
+          "FastllmCudaBF162FloatKernel(unsigned short *, float *, int)": {
+            "instances": 220,
+            "total_ns": 909607,
+            "mean_ms_per_call": 0.18192139999999998
+          },
+          "FastllmPickOutputKernel(float *, float *, int, int, int *, float *)": {
+            "instances": 220,
+            "total_ns": 3544224,
+            "mean_ms_per_call": 0.7088448
+          }
+        }
+      }
+    },
+    "nvfp4-4096-gpu1-plain": {
+      "format": "nvfp4",
+      "device": 1,
+      "rows": 4096,
+      "experts": 44,
+      "weight_bytes": 827228160,
+      "wall_ms_samples": [
+        32.53882,
+        32.52276,
+        32.503699,
+        32.502909,
+        32.498139
+      ],
+      "wall_ms_median": 32.503699
+    },
+    "q2-128-gpu0": {
+      "format": "q2",
+      "device": 0,
+      "rows": 128,
+      "experts": 22,
+      "weight_bytes": 316293120,
+      "wall_ms_samples": [
+        24.634564,
+        24.516451,
+        24.516331,
+        24.50329,
+        24.538562
+      ],
+      "wall_ms_median": 24.516451,
+      "profile": {
+        "capture_calls": 5,
+        "h2d_bytes_per_call": 316306816.0,
+        "h2d_ms_per_call": 11.853045,
+        "kernel_ms_per_call": 12.086782,
+        "h2d_kernel_overlap_ms_per_call": 0.0,
+        "kernel_groups_ms_per_call": {
+          "restore": 7.566807799999999,
+          "other": 0.0764744,
+          "gate_up_mmq": 3.0183207999999997,
+          "down_mmq": 1.425179
+        },
+        "kernels": {
+          "fastllm_gguf_stream::Restore(const fastllm_gguf_stream::WeightCopy *)": {
+            "instances": 220,
+            "total_ns": 37834039,
+            "mean_ms_per_call": 7.566807799999999
+          },
+          "fastllm_gguf_mmq::grouped_moe::Count(const int *, const unsigned char *const *, int *, int, int)": {
+            "instances": 5,
+            "total_ns": 5792,
+            "mean_ms_per_call": 0.0011584000000000002
+          },
+          "fastllm_gguf_mmq::grouped_moe::Prefix(const int *, int *, int *, int)": {
+            "instances": 5,
+            "total_ns": 8928,
+            "mean_ms_per_call": 0.0017855999999999998
+          },
+          "fastllm_gguf_mmq::grouped_moe::Scatter(const int *, const unsigned char *const *, const int *, int *, int *, int *, int, int)": {
+            "instances": 5,
+            "total_ns": 6848,
+            "mean_ms_per_call": 0.0013696
+          },
+          "fastllm_gguf_mmq::grouped_moe::QuantizeV41(const __nv_bfloat16 *, block_q8_K *, int)": {
+            "instances": 10,
+            "total_ns": 100481,
+            "mean_ms_per_call": 0.0200962
+          },
+          "fastllm_gguf_mmq::grouped_moe::GatherV41(const block_q8_K *, fastllm_gguf_mmq::block_q8_1_mmq *, const int *, const int *, int, int, int)": {
+            "instances": 10,
+            "total_ns": 134498,
+            "mean_ms_per_call": 0.0268996
+          },
+          "void fastllm_gguf_mmq::grouped_moe::Matmul<(ggml_type)10>(const unsigned char *const *, int, const fastllm_gguf_mmq::block_q8_1_mmq *, float *, const int *, const int *, const int *, int, int, int, int, int)": {
+            "instances": 5,
+            "total_ns": 15091604,
+            "mean_ms_per_call": 3.0183207999999997
+          },
+          "fastllm_gguf_mmq::grouped_moe::ActivateV41(const float *, __nv_bfloat16 *, const int *, const float *, int, int, float)": {
+            "instances": 5,
+            "total_ns": 57185,
+            "mean_ms_per_call": 0.011437
+          },
+          "void fastllm_gguf_mmq::grouped_moe::Matmul<(ggml_type)12>(const unsigned char *const *, int, const fastllm_gguf_mmq::block_q8_1_mmq *, float *, const int *, const int *, const int *, int, int, int, int, int)": {
+            "instances": 5,
+            "total_ns": 7125895,
+            "mean_ms_per_call": 1.425179
+          },
+          "fastllm_gguf_mmq::grouped_moe::ReduceV41(const float *, __nv_bfloat16 *, const int *, const int *, int, int, int)": {
+            "instances": 5,
+            "total_ns": 68640,
+            "mean_ms_per_call": 0.013728
+          }
+        }
+      }
+    },
+    "q2-4096-gpu0-plain": {
+      "format": "q2",
+      "device": 0,
+      "rows": 4096,
+      "experts": 44,
+      "weight_bytes": 632586240,
+      "wall_ms_samples": [
+        97.822348,
+        97.755525,
+        97.853588,
+        97.818798,
+        97.792586
+      ],
+      "wall_ms_median": 97.818798
+    },
+    "q2-4096-gpu0": {
+      "format": "q2",
+      "device": 0,
+      "rows": 4096,
+      "experts": 44,
+      "weight_bytes": 632586240,
+      "wall_ms_samples": [
+        98.120165,
+        98.049993,
+        98.028403,
+        98.007273,
+        98.029402
+      ],
+      "wall_ms_median": 98.029402,
+      "profile": {
+        "capture_calls": 5,
+        "h2d_bytes_per_call": 632791808.0,
+        "h2d_ms_per_call": 23.7150532,
+        "kernel_ms_per_call": 73.12254440000001,
+        "h2d_kernel_overlap_ms_per_call": 0.0,
+        "kernel_groups_ms_per_call": {
+          "restore": 14.590896,
+          "other": 1.6818723999999998,
+          "gate_up_mmq": 38.033082799999995,
+          "down_mmq": 18.8166932
+        },
+        "kernels": {
+          "fastllm_gguf_stream::Restore(const fastllm_gguf_stream::WeightCopy *)": {
+            "instances": 440,
+            "total_ns": 72954480,
+            "mean_ms_per_call": 14.590896
+          },
+          "fastllm_gguf_mmq::grouped_moe::Count(const int *, const unsigned char *const *, int *, int, int)": {
+            "instances": 5,
+            "total_ns": 10112,
+            "mean_ms_per_call": 0.0020224
+          },
+          "fastllm_gguf_mmq::grouped_moe::Prefix(const int *, int *, int *, int)": {
+            "instances": 5,
+            "total_ns": 8801,
+            "mean_ms_per_call": 0.0017602
+          },
+          "fastllm_gguf_mmq::grouped_moe::Scatter(const int *, const unsigned char *const *, const int *, int *, int *, int *, int, int)": {
+            "instances": 5,
+            "total_ns": 12512,
+            "mean_ms_per_call": 0.0025024
+          },
+          "fastllm_gguf_mmq::grouped_moe::QuantizeV41(const __nv_bfloat16 *, block_q8_K *, int)": {
+            "instances": 10,
+            "total_ns": 2679450,
+            "mean_ms_per_call": 0.53589
+          },
+          "fastllm_gguf_mmq::grouped_moe::GatherV41(const block_q8_K *, fastllm_gguf_mmq::block_q8_1_mmq *, const int *, const int *, int, int, int)": {
+            "instances": 10,
+            "total_ns": 1624911,
+            "mean_ms_per_call": 0.3249822
+          },
+          "void fastllm_gguf_mmq::grouped_moe::Matmul<(ggml_type)10>(const unsigned char *const *, int, const fastllm_gguf_mmq::block_q8_1_mmq *, float *, const int *, const int *, const int *, int, int, int, int, int)": {
+            "instances": 5,
+            "total_ns": 190165414,
+            "mean_ms_per_call": 38.033082799999995
+          },
+          "fastllm_gguf_mmq::grouped_moe::ActivateV41(const float *, __nv_bfloat16 *, const int *, const float *, int, int, float)": {
+            "instances": 5,
+            "total_ns": 2180502,
+            "mean_ms_per_call": 0.4361004
+          },
+          "void fastllm_gguf_mmq::grouped_moe::Matmul<(ggml_type)12>(const unsigned char *const *, int, const fastllm_gguf_mmq::block_q8_1_mmq *, float *, const int *, const int *, const int *, int, int, int, int, int)": {
+            "instances": 5,
+            "total_ns": 94083466,
+            "mean_ms_per_call": 18.8166932
+          },
+          "fastllm_gguf_mmq::grouped_moe::ReduceV41(const float *, __nv_bfloat16 *, const int *, const int *, int, int, int)": {
+            "instances": 5,
+            "total_ns": 1893074,
+            "mean_ms_per_call": 0.3786148
+          }
+        }
+      }
+    },
+    "q2-4096-gpu1-plain": {
+      "format": "q2",
+      "device": 1,
+      "rows": 4096,
+      "experts": 44,
+      "weight_bytes": 632586240,
+      "wall_ms_samples": [
+        102.632542,
+        102.677765,
+        102.650852,
+        102.645492,
+        102.845108
+      ],
+      "wall_ms_median": 102.650852
+    }
+  },
+  "observations": [
+    "Whole-model CPU phase is now approximately equal. About 97.5% of the TTFT gap is in routed MoE; about 81.1% of that MoE gap comes from the 4096-row chunks.",
+    "The current Q2 GPU host path runs on one stream: upload, restore R4/cross layout, then grouped MMQ after every selected expert has been uploaded. Trace shows zero H2D/kernel overlap.",
+    "The NVFP4 path prefetches the next expert on a separate stream. At 4096 rows, about 15 ms of its 15.9 ms kernel time overlaps H2D per call.",
+    "Q2 transmits 23.53% fewer expert weight bytes; both formats achieve approximately 26.7 GB/s during active H2D. Its slower wall time is not explained by larger packed transfers or slower PCIe bandwidth.",
+    "Q2 large-batch gate/up and down MMQ total about 56.85 ms; NVFP4 dequantization plus BF16 GEMM total about 13.52 ms. Nsight traces confirm BF16 GEMM for NVFP4 here, not a native FP4 GEMM.",
+    "The V4.1 MMQ adapter preserves FP32 scales and computes min corrections using additional integer MMA operations. It uses a fixed 16-token tile. Their individual contributions to the measured GEMM cost are source-level hypotheses, not separately measured stalls.",
+    "R4 restoration costs about 14.59 ms at 4096 rows and 7.57 ms at 128 rows. At 128 rows, Q2 MMQ itself is faster than NVFP4 GEMV in this fixture, but restore and missing transfer overlap make the complete operation slower.",
+    "The formal long prefill uses temporary selected-expert uploads rather than resident expert-cache lookups. Raising the existing cache budget alone does not remove these costs."
+  ],
+  "next_experiments": [
+    "Compare larger MMQ tiles with a precision-checked large-batch Q2 dequantize/BF16 GEMM path; choose by per-expert batch size.",
+    "Eliminate separate R4 restoration through a compatible direct reader or fuse it into dequantization; tune restore grid/vectorization if retaining it.",
+    "Pipeline expert-group upload and compute with double buffering and explicit events; retain bounded scratch because the full model is already close to 24 GiB per GPU."
+  ],
+  "limitations": [
+    "Whole-model timings reuse matched-configuration runs from the prior stages; the NVFP4 whole-model baseline has the earlier library hash. Both formats in the new GPU microbenchmark use the identical current library.",
+    "Whole-model quantization changes routing and CPU/GPU route allocation. Microbenchmarks fix routing but omit concurrent CPU expert work, full-model memory pressure, and other model operators.",
+    "Kernel and copy durations are means over five calls; wall time is their median and includes CPU scheduling. Overlapped durations must not be added as if sequential.",
+    "Input tokens divided by TTFT is an effective prefill measure including first-token overhead, not a dedicated kernel-only prefill counter.",
+    "No production inference implementation changed during this analysis."
+  ],
+  "artifact_directory": "build-fastllm/dsv41-q2-vs-nvfp4-gpu-20261002",
+  "reproduce": {
+    "source": "build-fastllm/dsv41-q2-vs-nvfp4-gpu-20261002/gpu.cpp",
+    "plain": "FT_NUMAS=1 OPENBLAS_NUM_THREADS=1 numactl -C 0-31 -m 0 <artifact_directory>/gpu {q2|nvfp4} {4096|128} {0|1}",
+    "profile": "FT_NUMAS=1 OPENBLAS_NUM_THREADS=1 numactl -C 0-31 -m 0 nsys profile --trace=cuda --sample=none --cpuctxsw=none --capture-range=cudaProfilerApi --capture-range-end=stop --force-overwrite=true --output=<report> <artifact_directory>/gpu <format> <rows> <device>"
+  }
+}

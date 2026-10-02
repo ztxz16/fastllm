@@ -1,0 +1,625 @@
+{
+  "date": "2026-10-02",
+  "model": "/home/tf/hfmodels/DeepSeek-V4.1-Flash-Q2_K-Mixed",
+  "model_format": "Q2_K/Q4_K mixed export; GPU records borrow the existing NUMA R4 layout",
+  "git_head": "2a3c71c8ef447f372102e3cf2ab50f5485e0854e",
+  "native_library_sha256": "97597346648fece59018d1fd2ef99fcdc6687c7357f08188ea1d50f22123377f",
+  "hardware": {
+    "cpu": "AMD EPYC 9374F, NUMA 0, physical CPUs 0-31",
+    "gpu": "RTX 4090 24 GiB, CUDA ordinal 0 / physical index 1"
+  },
+  "config": {
+    "threads": 28,
+    "device": "cuda:0",
+    "moe_device": "numa",
+    "ngram_device": "cpu",
+    "dtype": "float16",
+    "kv_cache_dtype": "bfloat16",
+    "chunked_prefill_size": 4096,
+    "max_batch": 1,
+    "dspark": 5,
+    "mtp": 0,
+    "fast_prefill": true,
+    "moe_cuda_cache": 3221225472,
+    "moe_cpu_cache": 0,
+    "speculative_dspark_confidence_threshold": 0.5
+  },
+  "measurement_order": [
+    "warmup_nocache_ordinary",
+    "warmup_nocache_dspark",
+    "warmup_cache_ordinary",
+    "warmup_cache_dspark",
+    "nocache_ordinary_short_0",
+    "nocache_dspark_short_0",
+    "cache_ordinary_short_0",
+    "cache_dspark_short_0",
+    "cache_dspark_short_1",
+    "cache_ordinary_short_1",
+    "nocache_dspark_short_1",
+    "nocache_ordinary_short_1",
+    "nocache_ordinary_short_2",
+    "nocache_dspark_short_2",
+    "cache_ordinary_short_2",
+    "cache_dspark_short_2",
+    "nocache_arithmetic",
+    "nocache_coding",
+    "cache_arithmetic",
+    "cache_coding",
+    "warmup_nocache_long",
+    "warmup_cache_long",
+    "nocache_dspark_long_0",
+    "cache_dspark_long_0",
+    "cache_dspark_long_1",
+    "nocache_dspark_long_1",
+    "nocache_dspark_long_2",
+    "cache_dspark_long_2",
+    "nocache_ordinary_long",
+    "cache_ordinary_long"
+  ],
+  "nocache": {
+    "ordinary_short": {
+      "requests": 3,
+      "input_tokens": [
+        33,
+        33,
+        33
+      ],
+      "output_tokens": [
+        128,
+        128,
+        128
+      ],
+      "decode_tps_median": 24.919532773266656,
+      "decode_tps_runs": [
+        24.919532773266656,
+        24.996143375502196,
+        24.902632320464363
+      ],
+      "ttft_seconds_median": 0.5361276800103951,
+      "ttft_seconds_runs": [
+        0.5361276800103951,
+        0.5360537709784694,
+        0.5557655290176626
+      ],
+      "verify_rounds": [
+        0,
+        0,
+        0
+      ],
+      "proposed_drafts": [
+        0,
+        0,
+        0
+      ],
+      "accepted_drafts": [
+        0,
+        0,
+        0
+      ],
+      "draft_acceptance_rate": null,
+      "average_drafts_per_verify": null,
+      "average_accepted_per_verify": null,
+      "cuda_cache_lookup_deltas": [
+        {
+          "hits": 0,
+          "misses": 0
+        },
+        {
+          "hits": 0,
+          "misses": 0
+        },
+        {
+          "hits": 0,
+          "misses": 0
+        }
+      ],
+      "rss_gib_median": 408.1520652770996,
+      "gpu_peak_gib_physical_indices": [
+        1.2393798828125,
+        20.5772705078125
+      ],
+      "repeat_output_tokens_identical": true
+    },
+    "dspark_short": {
+      "requests": 3,
+      "input_tokens": [
+        33,
+        33,
+        33
+      ],
+      "output_tokens": [
+        128,
+        128,
+        128
+      ],
+      "decode_tps_median": 23.586596284308307,
+      "decode_tps_runs": [
+        23.61761951080608,
+        23.422248393180045,
+        23.586596284308307
+      ],
+      "ttft_seconds_median": 0.558365828008391,
+      "ttft_seconds_runs": [
+        0.5766756089869887,
+        0.5518572810105979,
+        0.558365828008391
+      ],
+      "verify_rounds": [
+        48,
+        48,
+        48
+      ],
+      "proposed_drafts": [
+        133,
+        133,
+        133
+      ],
+      "accepted_drafts": [
+        63,
+        63,
+        63
+      ],
+      "draft_acceptance_rate": 0.47368421052631576,
+      "average_drafts_per_verify": 2.7708333333333335,
+      "average_accepted_per_verify": 1.3125,
+      "cuda_cache_lookup_deltas": [
+        {
+          "hits": 0,
+          "misses": 0
+        },
+        {
+          "hits": 0,
+          "misses": 0
+        },
+        {
+          "hits": 0,
+          "misses": 0
+        }
+      ],
+      "rss_gib_median": 408.1510887145996,
+      "gpu_peak_gib_physical_indices": [
+        1.2393798828125,
+        20.5772705078125
+      ],
+      "repeat_output_tokens_identical": true
+    },
+    "dspark_long": {
+      "requests": 3,
+      "input_tokens": [
+        8600,
+        8600,
+        8600
+      ],
+      "output_tokens": [
+        30,
+        30,
+        30
+      ],
+      "decode_tps_median": 41.43446269982649,
+      "decode_tps_runs": [
+        41.43446269982649,
+        41.49449111836328,
+        40.21817779078839
+      ],
+      "ttft_seconds_median": 14.066187254997203,
+      "ttft_seconds_runs": [
+        14.06693929102039,
+        14.066187254997203,
+        14.028182517999085
+      ],
+      "verify_rounds": [
+        5,
+        5,
+        5
+      ],
+      "proposed_drafts": [
+        25,
+        25,
+        25
+      ],
+      "accepted_drafts": [
+        24,
+        24,
+        24
+      ],
+      "draft_acceptance_rate": 0.96,
+      "average_drafts_per_verify": 5.0,
+      "average_accepted_per_verify": 4.8,
+      "cuda_cache_lookup_deltas": [
+        {
+          "hits": 0,
+          "misses": 0
+        },
+        {
+          "hits": 0,
+          "misses": 0
+        },
+        {
+          "hits": 0,
+          "misses": 0
+        }
+      ],
+      "rss_gib_median": 408.97139739990234,
+      "gpu_peak_gib_physical_indices": [
+        1.2413330078125,
+        22.9171142578125
+      ],
+      "repeat_output_tokens_identical": true
+    },
+    "ordinary_long": {
+      "ttft_seconds": 14.074979803990573,
+      "decode_tokens_per_second": 23.927739553009097,
+      "output_tokens": 30
+    },
+    "short_dspark_vs_ordinary_speed_ratio": 0.946510373967031,
+    "long_dspark_vs_ordinary_speed_ratio": 1.7316496866757223
+  },
+  "cache": {
+    "ordinary_short": {
+      "requests": 3,
+      "input_tokens": [
+        33,
+        33,
+        33
+      ],
+      "output_tokens": [
+        128,
+        128,
+        128
+      ],
+      "decode_tps_median": 22.950160500949,
+      "decode_tps_runs": [
+        22.8672949772332,
+        22.950160500949,
+        22.99871284180391
+      ],
+      "ttft_seconds_median": 0.5434522829891648,
+      "ttft_seconds_runs": [
+        0.5481859639985487,
+        0.5434522829891648,
+        0.5396468649851158
+      ],
+      "verify_rounds": [
+        0,
+        0,
+        0
+      ],
+      "proposed_drafts": [
+        0,
+        0,
+        0
+      ],
+      "accepted_drafts": [
+        0,
+        0,
+        0
+      ],
+      "draft_acceptance_rate": null,
+      "average_drafts_per_verify": null,
+      "average_accepted_per_verify": null,
+      "cuda_cache_lookup_deltas": [
+        {
+          "hits": 11597,
+          "misses": 264
+        },
+        {
+          "hits": 11375,
+          "misses": 340
+        },
+        {
+          "hits": 11824,
+          "misses": 165
+        }
+      ],
+      "rss_gib_median": 408.1510887145996,
+      "gpu_peak_gib_physical_indices": [
+        1.2393798828125,
+        20.5772705078125
+      ],
+      "repeat_output_tokens_identical": false
+    },
+    "dspark_short": {
+      "requests": 3,
+      "input_tokens": [
+        33,
+        33,
+        33
+      ],
+      "output_tokens": [
+        128,
+        128,
+        128
+      ],
+      "decode_tps_median": 26.23638389972807,
+      "decode_tps_runs": [
+        26.23638389972807,
+        23.838207129953535,
+        28.569642695758688
+      ],
+      "ttft_seconds_median": 0.549254181998549,
+      "ttft_seconds_runs": [
+        0.549254181998549,
+        0.5586753639800008,
+        0.5414128900156356
+      ],
+      "verify_rounds": [
+        45,
+        46,
+        47
+      ],
+      "proposed_drafts": [
+        127,
+        128,
+        109
+      ],
+      "accepted_drafts": [
+        63,
+        52,
+        66
+      ],
+      "draft_acceptance_rate": 0.49725274725274726,
+      "average_drafts_per_verify": 2.63768115942029,
+      "average_accepted_per_verify": 1.3115942028985508,
+      "cuda_cache_lookup_deltas": [
+        {
+          "hits": 5028,
+          "misses": 897
+        },
+        {
+          "hits": 5381,
+          "misses": 1038
+        },
+        {
+          "hits": 3721,
+          "misses": 768
+        }
+      ],
+      "rss_gib_median": 408.1510887145996,
+      "gpu_peak_gib_physical_indices": [
+        1.2393798828125,
+        20.5772705078125
+      ],
+      "repeat_output_tokens_identical": false
+    },
+    "dspark_long": {
+      "requests": 3,
+      "input_tokens": [
+        8600,
+        8600,
+        8600
+      ],
+      "output_tokens": [
+        30,
+        30,
+        30
+      ],
+      "decode_tps_median": 43.48818876100393,
+      "decode_tps_runs": [
+        43.48818876100393,
+        43.42509566160249,
+        43.639746971549734
+      ],
+      "ttft_seconds_median": 14.09224538700073,
+      "ttft_seconds_runs": [
+        14.068072569003562,
+        14.09224538700073,
+        14.101281640992966
+      ],
+      "verify_rounds": [
+        5,
+        5,
+        5
+      ],
+      "proposed_drafts": [
+        25,
+        25,
+        25
+      ],
+      "accepted_drafts": [
+        24,
+        24,
+        24
+      ],
+      "draft_acceptance_rate": 0.96,
+      "average_drafts_per_verify": 5.0,
+      "average_accepted_per_verify": 4.8,
+      "cuda_cache_lookup_deltas": [
+        {
+          "hits": 646,
+          "misses": 193
+        },
+        {
+          "hits": 675,
+          "misses": 191
+        },
+        {
+          "hits": 653,
+          "misses": 185
+        }
+      ],
+      "rss_gib_median": 408.9713478088379,
+      "gpu_peak_gib_physical_indices": [
+        1.2413330078125,
+        22.9171142578125
+      ],
+      "repeat_output_tokens_identical": true
+    },
+    "ordinary_long": {
+      "ttft_seconds": 14.140386414015666,
+      "decode_tokens_per_second": 20.598623838299638,
+      "output_tokens": 30
+    },
+    "short_dspark_vs_ordinary_speed_ratio": 1.1431895606413378,
+    "long_dspark_vs_ordinary_speed_ratio": 2.1112181620669745
+  },
+  "cache_vs_nocache_ratios": {
+    "ordinary_short": {
+      "decode_tps_median": 0.9209707384871046,
+      "ttft_seconds_median": 1.0136620496420323
+    },
+    "dspark_short": {
+      "decode_tps_median": 1.1123429418759592,
+      "ttft_seconds_median": 0.983681583734553
+    },
+    "dspark_long": {
+      "decode_tps_median": 1.0495656496394254,
+      "ttft_seconds_median": 1.001852536976164
+    }
+  },
+  "cache_final": {
+    "hits": 60958,
+    "misses": 6262,
+    "payload_bytes": 3220439040,
+    "slots": 224,
+    "records": 15360,
+    "hit_rate": 0.9068432014281463
+  },
+  "cache_after_release": {
+    "hits": 0,
+    "misses": 0,
+    "payload_bytes": 0,
+    "slots": 0,
+    "records": 0,
+    "hit_rate": null
+  },
+  "cache_routing_trace": [
+    "[Fastllm] V4.1 expert cache: 1 layers, 0 CPU routes, 6 GPU routes, 0 resident GPU routes, 224 slots; current GPU split 6/6; device 0; 0 all resident routes; 0 prefetched experts, 0.000 us/prefetch.",
+    "[Fastllm] V4.1 expert cache: 93 layers, 247 CPU routes, 311 GPU routes, 26 resident GPU routes, 224 slots; current GPU split 1/6; device 0; 26 all resident routes; 1 prefetched experts, 0.000 us/prefetch.",
+    "[Fastllm] V4.1 expert cache: 1024 layers, 5333 CPU routes, 811 GPU routes, 521 resident GPU routes, 224 slots; current GPU split 1/6; device 0; 521 all resident routes; 30 prefetched experts, 551.159 us/prefetch.",
+    "[Fastllm] V4.1 expert cache: 2048 layers, 10407 CPU routes, 1881 GPU routes, 1590 resident GPU routes, 224 slots; current GPU split 1/6; device 0; 1594 all resident routes; 62 prefetched experts, 550.269 us/prefetch.",
+    "[Fastllm] V4.1 verify cache: device 0, 1 calls, 12 routes, 5 resident routes, 5 GPU routes, 5 GPU groups, 0 admissions, 0 fallbacks; CPU 70.000 us/unit, GPU 80.000 us/route, refill 750.000 us.",
+    "[Fastllm] V4.1 expert cache: 3072 layers, 14852 CPU routes, 3580 GPU routes, 3288 resident GPU routes, 224 slots; current GPU split 1/6; device 0; 3308 all resident routes; 95 prefetched experts, 549.508 us/prefetch.",
+    "[Fastllm] V4.1 expert cache: 4096 layers, 18583 CPU routes, 5993 GPU routes, 5701 resident GPU routes, 224 slots; current GPU split 0/6; device 0; 5747 all resident routes; 128 prefetched experts, 549.745 us/prefetch.",
+    "[Fastllm] V4.1 expert cache: 5120 layers, 22335 CPU routes, 8385 GPU routes, 8093 resident GPU routes, 224 slots; current GPU split 4/6; device 0; 8159 all resident routes; 160 prefetched experts, 549.659 us/prefetch.",
+    "[Fastllm] V4.1 expert cache: 6144 layers, 26173 CPU routes, 10691 GPU routes, 10399 resident GPU routes, 224 slots; current GPU split 3/6; device 0; 10489 all resident routes; 193 prefetched experts, 549.198 us/prefetch.",
+    "[Fastllm] V4.1 expert cache: 7168 layers, 30109 CPU routes, 12899 GPU routes, 12549 resident GPU routes, 224 slots; current GPU split 1/6; device 0; 12650 all resident routes; 225 prefetched experts, 549.326 us/prefetch.",
+    "[Fastllm] V4.1 expert cache: 8192 layers, 34112 CPU routes, 15040 GPU routes, 14645 resident GPU routes, 224 slots; current GPU split 3/6; device 0; 14758 all resident routes; 257 prefetched experts, 549.290 us/prefetch.",
+    "[Fastllm] V4.1 verify cache: device 0, 1024 calls, 23520 routes, 7714 resident routes, 7620 GPU routes, 3447 GPU groups, 436 admissions, 0 fallbacks; CPU 88.212 us/unit, GPU 65.482 us/route, refill 552.119 us.",
+    "[Fastllm] V4.1 verify cache: device 0, 2048 calls, 47088 routes, 16117 resident routes, 15901 GPU routes, 7169 GPU groups, 872 admissions, 0 fallbacks; CPU 83.141 us/unit, GPU 65.523 us/route, refill 552.166 us.",
+    "[Fastllm] V4.1 expert cache: 9216 layers, 37934 CPU routes, 17362 GPU routes, 16906 resident GPU routes, 224 slots; current GPU split 2/6; device 0; 17029 all resident routes; 290 prefetched experts, 549.033 us/prefetch.",
+    "[Fastllm] V4.1 verify cache: device 0, 3072 calls, 68448 routes, 23156 resident routes, 22785 GPU routes, 10582 GPU groups, 1334 admissions, 0 fallbacks; CPU 88.799 us/unit, GPU 69.131 us/route, refill 552.812 us.",
+    "[Fastllm] V4.1 verify cache: device 0, 4096 calls, 91776 routes, 29787 resident routes, 29284 GPU routes, 13849 GPU groups, 1875 admissions, 0 fallbacks; CPU 87.593 us/unit, GPU 72.895 us/route, refill 550.150 us.",
+    "[Fastllm] V4.1 expert cache: 10240 layers, 41757 CPU routes, 19683 GPU routes, 19178 resident GPU routes, 224 slots; current GPU split 1/6; device 0; 19322 all resident routes; 322 prefetched experts, 549.368 us/prefetch.",
+    "[Fastllm] V4.1 expert cache: 11264 layers, 45614 CPU routes, 21970 GPU routes, 21420 resident GPU routes, 224 slots; current GPU split 3/6; device 0; 21576 all resident routes; 355 prefetched experts, 549.455 us/prefetch.",
+    "[Fastllm] V4.1 expert cache: 12288 layers, 49436 CPU routes, 24292 GPU routes, 23705 resident GPU routes, 224 slots; current GPU split 1/6; device 0; 23879 all resident routes; 388 prefetched experts, 548.994 us/prefetch.",
+    "[Fastllm] V4.1 expert cache: 13312 layers, 53282 CPU routes, 26590 GPU routes, 25967 resident GPU routes, 224 slots; current GPU split 4/6; device 0; 26156 all resident routes; 420 prefetched experts, 549.084 us/prefetch.",
+    "[Fastllm] V4.1 expert cache: 14336 layers, 57216 CPU routes, 28800 GPU routes, 28117 resident GPU routes, 224 slots; current GPU split 2/6; device 0; 28318 all resident routes; 453 prefetched experts, 549.159 us/prefetch.",
+    "[Fastllm] V4.1 expert cache: 15360 layers, 61235 CPU routes, 30925 GPU routes, 30239 resident GPU routes, 224 slots; current GPU split 1/6; device 0; 30461 all resident routes; 486 prefetched experts, 549.305 us/prefetch.",
+    "[Fastllm] V4.1 expert cache: 16384 layers, 65064 CPU routes, 33240 GPU routes, 32552 resident GPU routes, 224 slots; current GPU split 2/6; device 0; 32793 all resident routes; 519 prefetched experts, 550.031 us/prefetch.",
+    "[Fastllm] V4.1 expert cache: 17408 layers, 68737 CPU routes, 35711 GPU routes, 35022 resident GPU routes, 224 slots; current GPU split 0/6; device 0; 35300 all resident routes; 552 prefetched experts, 549.461 us/prefetch.",
+    "[Fastllm] V4.1 expert cache: 18432 layers, 72567 CPU routes, 38025 GPU routes, 37336 resident GPU routes, 224 slots; current GPU split 2/6; device 0; 37631 all resident routes; 585 prefetched experts, 549.377 us/prefetch.",
+    "[Fastllm] V4.1 expert cache: 19456 layers, 76346 CPU routes, 40390 GPU routes, 39701 resident GPU routes, 224 slots; current GPU split 1/6; device 0; 40024 all resident routes; 618 prefetched experts, 549.325 us/prefetch.",
+    "[Fastllm] V4.1 expert cache: 20480 layers, 80351 CPU routes, 42529 GPU routes, 41840 resident GPU routes, 224 slots; current GPU split 0/6; device 0; 42193 all resident routes; 650 prefetched experts, 549.373 us/prefetch.",
+    "[Fastllm] V4.1 verify cache: device 0, 5120 calls, 114480 routes, 36911 resident routes, 36228 GPU routes, 17185 GPU groups, 2347 admissions, 0 fallbacks; CPU 94.243 us/unit, GPU 78.106 us/route, refill 552.150 us.",
+    "[Fastllm] V4.1 verify cache: device 0, 6144 calls, 133824 routes, 43130 resident routes, 42348 GPU routes, 20355 GPU groups, 2731 admissions, 0 fallbacks; CPU 83.884 us/unit, GPU 69.206 us/route, refill 553.160 us.",
+    "[Fastllm] V4.1 verify cache: device 0, 7168 calls, 164112 routes, 49461 resident routes, 48604 GPU routes, 23202 GPU groups, 3519 admissions, 0 fallbacks; CPU 81.997 us/unit, GPU 86.427 us/route, refill 551.085 us.",
+    "[Fastllm] V4.1 expert cache: 21504 layers, 84599 CPU routes, 44425 GPU routes, 43730 resident GPU routes, 224 slots; current GPU split 1/6; device 0; 44097 all resident routes; 681 prefetched experts, 549.640 us/prefetch.",
+    "[Fastllm] V4.1 verify cache: device 0, 8192 calls, 197712 routes, 55561 resident routes, 54641 GPU routes, 26149 GPU groups, 4422 admissions, 0 fallbacks; CPU 82.987 us/unit, GPU 69.742 us/route, refill 551.766 us.",
+    "[Fastllm] V4.1 expert cache: 22528 layers, 89399 CPU routes, 45769 GPU routes, 45071 resident GPU routes, 224 slots; current GPU split 2/6; device 0; 45438 all resident routes; 714 prefetched experts, 549.914 us/prefetch."
+  ],
+  "validation": {
+    "nocache_functional_checks": {
+      "arithmetic_888": true,
+      "all_five_long_retrieval_requests_exact": true,
+      "prime_function_17_cases": true
+    },
+    "cache_functional_checks": {
+      "arithmetic_888": true,
+      "all_five_long_retrieval_requests_exact": true,
+      "prime_function_17_cases": true
+    },
+    "cache_vs_nocache_request_pairs": {
+      "ordinary_short_0": {
+        "output_tokens_identical": false,
+        "draft_counts_identical": true
+      },
+      "dspark_short_0": {
+        "output_tokens_identical": false,
+        "draft_counts_identical": false
+      },
+      "dspark_short_1": {
+        "output_tokens_identical": false,
+        "draft_counts_identical": false
+      },
+      "ordinary_short_1": {
+        "output_tokens_identical": false,
+        "draft_counts_identical": true
+      },
+      "ordinary_short_2": {
+        "output_tokens_identical": false,
+        "draft_counts_identical": true
+      },
+      "dspark_short_2": {
+        "output_tokens_identical": false,
+        "draft_counts_identical": false
+      },
+      "arithmetic": {
+        "output_tokens_identical": true,
+        "draft_counts_identical": true
+      },
+      "coding": {
+        "output_tokens_identical": true,
+        "draft_counts_identical": false
+      },
+      "dspark_long_0": {
+        "output_tokens_identical": true,
+        "draft_counts_identical": true
+      },
+      "dspark_long_1": {
+        "output_tokens_identical": true,
+        "draft_counts_identical": true
+      },
+      "dspark_long_2": {
+        "output_tokens_identical": true,
+        "draft_counts_identical": true
+      },
+      "ordinary_long": {
+        "output_tokens_identical": true,
+        "draft_counts_identical": true
+      }
+    },
+    "no_history_prefix_cache": true,
+    "cache_disabled_requests_lookup_deltas_zero": true,
+    "operator_tests": {
+      "native_sha256": "97597346648fece59018d1fd2ef99fcdc6687c7357f08188ea1d50f22123377f",
+      "ctest_passed": 7,
+      "shared_library_cache_top6": "ALL_PASS",
+      "scalar_relative_rms_limit": 0.01,
+      "cpu_gpu_relative_rms_limit": 0.005,
+      "source": "build-fastllm/dsv41-q2-cuda-cache-20261002/shared-cache-test-top6.log",
+      "cache_top6_cpu_gpu_relative_rms_max": 0.000272,
+      "ctest_log": "/home/tf/github/fastllm/build-fastllm/dsv41-q2-cuda-cache-20261002/ctest.log"
+    }
+  },
+  "model_load_seconds": 382.62655176999397,
+  "steady_rss_gib": 408.97485733032227,
+  "global_peak_rss_gib": 425.03613662719727,
+  "global_peak_gpu_gib_physical_indices": [
+    1.2413330078125,
+    22.9171142578125
+  ],
+  "numa_mapped_pages_after_bench": {
+    "N0": 107190666,
+    "N1": 24278
+  },
+  "notes": [
+    "The V4.1 cache now accepts registered Q2_K/Q4_K R4 experts. GPU kernels preserve the block-32 FP8 activation boundary followed by GGML Q8_K encoding, route weighting before down-input quantization, clipping, BF16 projection boundaries, and ordered per-expert reduction. It borrows existing pinned NUMA weights with zero host weight snapshot.",
+    "One model load prepares a 3 GiB expert-record cache. Controls set_moe_cuda_cache(0) before each request to disable all cache dispatch. Existing cache records remain allocated; both controls use the same resident target and draft weights.",
+    "Two warmups per cache mode, then three short requests per cache/speculation mode with reversed ordering in the middle repeat. Arithmetic/code checks, long warmups, three alternating long DSpark requests per cache mode and one long ordinary control per cache mode follow.",
+    "Cache counters synchronize CUDA outside request timing. The V4.1 route trace is enabled at its built-in reporting intervals. Lookup counters do not represent all NUMA routes; route traces report actual CPU/GPU splits.",
+    "CUDA cache retains live residency and adaptive scheduling across requests. Numerical differences can change generated text, draft acceptance and route selection; compare paired outputs and acceptance before attributing throughput changes solely to compute acceleration.",
+    "Timing is native launch to first token and then first-to-last token throughput; excludes loading, tokenization and HTTP. Prefix/history caching is disabled. Fast prefill is enabled.",
+    "The long retrieval task only generates about 30 tokens. Functional fixtures and these timing results do not establish complete model accuracy or general conversation performance."
+  ],
+  "artifacts": {
+    "root": "/home/tf/github/fastllm/build-fastllm/dsv41-q2-cuda-cache-20261002",
+    "results": "/home/tf/github/fastllm/build-fastllm/dsv41-q2-cuda-cache-20261002/results.json",
+    "log": "/home/tf/github/fastllm/build-fastllm/dsv41-q2-cuda-cache-20261002/bench.log"
+  },
+  "cache_routing_last_report": {
+    "decode_gpu_route_fraction": 0.33860825047348486,
+    "verify_gpu_route_fraction": 0.2763666342963502,
+    "verify_resident_route_fraction": 0.2810198672817027,
+    "note": "Cumulative enabled-cache routes at the last built-in reporting interval, including warmups and all benchmark tasks; not the full final totals."
+  }
+}

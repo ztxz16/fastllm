@@ -1756,6 +1756,13 @@ struct FastllmCudaMoeGGUFCacheView {
     const uint64_t *slotOffsets = nullptr;
 };
 bool FastllmCudaMoeGGUFCacheSupported(int type, int columns);
+// V4.1 cache records borrow NUMA's cross-interleaved Q2_K/Q4_K R4 blocks.
+// Input already has the model's block-32 FP8 boundary. Scores precede
+// down-input quantization, and per-expert outputs are rounded to BF16.
+bool FastllmCudaMoeV41GGUFCacheCompute(
+        const fastllm::Data &input, fastllm::Data &activation,
+        const FastllmCudaMoeGGUFCacheView &view,
+        const float *scores, int topk, float swigluLimit, float *perExpert);
 // Q8_1 input/mid activations and per-expert down results, reused on one stream.
 size_t FastllmCudaMoeGGUFCacheWorkspaceBytes(int hidden, int inter);
 // True when both stages support Q8 for single-token decode. Each supported
@@ -1785,12 +1792,12 @@ void FastllmCudaReleaseMoeGGUFResident(const fastllm::Data *weight);
 // checks type, shape and device support; zero leaves the ordinary path intact.
 size_t FastllmCudaMoeGGUFGroupedWorkspaceBytes(
     int gateType, int downType, int rows, int hidden, int inter,
-    int experts, int topk);
+    int experts, int topk, bool deepSeekV41 = false);
 bool FastllmCudaMoeGGUFGrouped(
     const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &output,
     const void *weightPointers, const int32_t *indices, const float *scores,
     void *workspace, int gateType, int downType, int hidden, int inter,
-    int experts, int topk);
+    int experts, int topk, bool deepSeekV41 = false, float swigluLimit = 0.0f);
 // NUMA GPU-assisted prefill: temporarily upload only this worker's experts,
 // restore their packed/interleaved layout, and reuse grouped MMQ. No weight
 // storage is mutated. Caller serializes and retains scratch on this GPU.
@@ -1798,7 +1805,8 @@ bool FastllmCudaMergeMOEGGUFHost(const fastllm::Data &input,
     fastllm::Data &gate, fastllm::Data &workspace, fastllm::Data &output,
     fastllm::Data **weights, int expertCount, const int32_t *indices,
     const float *scores, int topk, const std::unordered_set<int> &experts,
-    bool crossSwiglu);
+    bool crossSwiglu, bool deepSeekV4Mode = false, float swigluLimit = 0.0f,
+    int activationQuantBlock = 128);
 // Eager single-token decode: generic FP32 or explicitly registered V4.1
 // BF16 math. Adapters execute disjoint CPU/CUDA subsets with shared scheduling.
 bool FastllmCudaCanRunMoeHybrid(fastllm::Data **weights, int weightsBatch);

@@ -733,7 +733,57 @@ namespace fastllm {
         }
     }
 
-    static void QuantizeNumasV41Input(uint8_t *input, DataType type, int rows, int columns) {
+    static void QuantizeNumasV41Input(uint8_t *input, DataType type, int rows, int columns,
+                                     const uint8_t *source = nullptr, DataType sourceType = DataType::FLOAT32) {
+        if (type >= DataType::DATA_GGUF_FORMAT && type < DataType::DATA_GGUF_FORMAT_END) {
+            // Q2/Q4 experts consume GGML's encoded activations. Apply the
+            // original block-32 FP8 boundary before encoding those activations.
+            AssertInFastLLM(source != nullptr, "V4.1 GGML activation requires its floating point source.\n");
+            AssertInFastLLM(sourceType == DataType::BFLOAT16 || sourceType == DataType::FLOAT16 ||
+                            sourceType == DataType::FLOAT32, "V4.1 GGML activation requires a floating point source type.\n");
+            // Fuse source conversion, FP8 and GGML encoding per row on the
+            // existing workers. Retain row scratch instead of allocating and
+            // zero-filling a full FP32 batch on every MoE layer.
+            struct QuantizeGgufOp : MultiThreadBaseOp {
+                const uint8_t *source;
+                uint8_t *output;
+                DataType sourceType, type;
+                int start, end, columns;
+                size_t stride;
+                std::vector<float> values;
+                std::vector<uint16_t> bfloat;
+                void Run() override {
+                    values.resize(columns);
+                    if (sourceType == DataType::BFLOAT16) bfloat.resize(columns);
+                    for (int r = start; r < end; ++r) {
+                        if (sourceType == DataType::BFLOAT16) {
+                            memcpy(bfloat.data(), source + size_t(r)*columns*2, columns*2);
+                            QuantizeDeepSeekV4FP8ActivationBFloat16(bfloat.data(), columns, 32);
+                            BFloat16ToFloat32(bfloat.data(), values.data(), columns);
+                        } else {
+                            if (sourceType == DataType::FLOAT16)
+                                Float16ToFloat32((uint16_t*)source + size_t(r)*columns, values.data(), columns);
+                            else memcpy(values.data(), source + size_t(r)*columns*4, columns*4);
+                            QuantizeDeepSeekV4FP8Activation(values.data(), columns, 32);
+                        }
+                        ConvertFromFloat32(output + r*stride, type, values.data(), 1, columns);
+                    }
+                }
+            };
+            const int threads = std::max(1, std::min(rows, GetNumaConfig()->threads));
+            static thread_local std::vector<QuantizeGgufOp> ops;
+            ops.resize(threads);
+            auto *pool = GetAlivePool();
+            for (int t = 0; t < threads; ++t) {
+                auto &op = ops[t];
+                op.source = source; op.output = input; op.sourceType = sourceType; op.type = type;
+                op.start = rows*t/threads; op.end = rows*(t+1)/threads; op.columns = columns;
+                op.stride = GetDataBytes(type, 1, columns);
+                if (threads == 1) op.Run(); else pool->PushOp(t, &op);
+            }
+            if (threads > 1) for (int t = 0; t < threads; ++t) pool->Wait(t);
+            return;
+        }
         AssertInFastLLM(type == DataType::BFLOAT16 || type == DataType::FLOAT32 || type == DataType::FLOAT16,
                         "V4.1 NUMA activation quantization requires floating point input.\n");
         if (type == DataType::BFLOAT16 && rows > 1 && columns >= 1024 &&
@@ -800,7 +850,8 @@ namespace fastllm {
             float h = (gate / (1.0f + std::exp(-gate))) * up;
             swiglu[i] = RoundFloat32ToBFloat16RNE(routeWeight * h);
         }
-        if (IsDeepSeekV4QuantizedWeight(downWeight) || (!routed && quantizeSharedExpert)) {
+        if (IsDeepSeekV4QuantizedWeight(downWeight) || (!routed && quantizeSharedExpert) ||
+            (routed && activationQuantBlock == 32)) {
             QuantizeDeepSeekV4FP8Activation(swiglu, interDim, activationQuantBlock);
         }
 
@@ -813,6 +864,9 @@ namespace fastllm {
             memcpy(downInput, swiglu, (size_t)interDim * sizeof(float));
         } else if (downInputType == DataType::FLOAT16) {
             Float32ToFloat16(swiglu, (uint16_t*)downInput, interDim);
+        } else if (downInputType >= DataType::DATA_GGUF_FORMAT &&
+                   downInputType < DataType::DATA_GGUF_FORMAT_END) {
+            RunMultiThreadConvertFromFloat32(downInput, downInputType, swiglu, 1, interDim, GetAlivePool());
         } else {
             ErrorInFastLLM("DeepSeek-V4 NUMA MoE requires a floating-point down activation type.\n");
         }
@@ -3310,6 +3364,14 @@ namespace fastllm {
         // selected weights are registered. Mirror RegisterNumas' native
         // quantized-weight conversions so the pre-registration and registered
         // forms select the same activation buffer format.
+        if (weight != nullptr && weight->dataType == DataType::DATA_GGUF_FORMAT &&
+            !weight->IsRepacked && !weight->disableGGUFRepack &&
+            !(GetEnableAMX() && GetCPUInstructInfo()->hasAMX)) {
+            auto repack = get_repack_info((ggml_type)weight->ggmlType);
+            if (repack != nullptr) {
+                return (DataType)(DataType::DATA_GGUF_FORMAT + ggml_type_vec_dot_type(repack->new_type));
+            }
+        }
         if (weight != nullptr &&
             (weight->dataType == DataType::INT8 ||
              weight->dataType == DataType::INT4_NOZERO)) {
@@ -3379,6 +3441,22 @@ namespace fastllm {
             int topk, int layer, const float *routeScores, float swigluLimit,
             const std::function<void()> &submitGpu) {
         const bool deepSeekV41 = routeScores != nullptr;
+        if (deepSeekV41 && weights[2]->dataType == DataType::DATA_GGUF_FORMAT) {
+            // The FP4 fused decode writer only handles floating activations.
+            // Reuse the exact GGML V4.1 row preparation for a cached Q2 layer,
+            // including block-32 FP8 followed by GGML's Q8 activation encoding.
+            const int hidden = weights[2]->dims[1];
+            static thread_local std::vector<uint16_t> bits;
+            bits.resize(hidden);
+            for (int c = 0; c < hidden; ++c)
+                bits[c] = Float32ToBFloat16RNEBits(input[c]);
+            const int weightsBatch = 2 * (*std::max_element(indices, indices + topk) + 2);
+            if (submitGpu) submitGpu();
+            NumasMoeVerifyExperts(bits.data(), output, 1, weights,
+                weightsBatch, indices,
+                gpuIndices, routeScores, topk, layer, swigluLimit, true);
+            return;
+        }
         auto &work = GetNumasMoeRuntimeCache()[layer % 2];
         auto *config = GetNumaConfig();
         auto *pool = GetAlivePool();
@@ -6415,8 +6493,15 @@ namespace fastllm {
             reduceOutput.resize(reduceOutputSize);
         }
 
-        // 0. input -> realInput（若 input 非 FLOAT32 则先转为 float32）
-        if (fp8EagerMode) {
+        // Routed V4.1 GGUF needs only the FP8 -> Q8 encoding. Preserve the
+        // unquantized copy only when an unquantized shared expert uses it.
+        const bool directV41GgufInput = deepSeekV4Mode && activationQuantBlock == 32 &&
+            startDataType >= DataType::DATA_GGUF_FORMAT && startDataType < DataType::DATA_GGUF_FORMAT_END &&
+            !(weights[0] && !quantizeSharedExpert);
+        if (directV41GgufInput) {
+            QuantizeNumasV41Input(realInput.data(), startDataType, bs, inputDim,
+                                 (uint8_t*)input.cpuData, input.dataType);
+        } else if (fp8EagerMode) {
             BFloat16ToFloat32((uint16_t *)input.cpuData, inputFloat32.data(), bs * inputDim);
             PrepareEagerFP8(inputFloat32.data(), realInput.data(), bs, inputDim);
         } else if (input.dataType == startDataType && input.dataType != DataType::FLOAT32) {
@@ -6441,9 +6526,10 @@ namespace fastllm {
         }
 
         std::vector<uint8_t, alignedAllocator<uint8_t, 64>> originalSharedInput;
-        if (deepSeekV4Mode && activationQuantBlock == 32) {
+        if (deepSeekV4Mode && activationQuantBlock == 32 && !directV41GgufInput) {
             if (weights[0] && !quantizeSharedExpert) originalSharedInput.assign(realInput.begin(), realInput.end());
-            QuantizeNumasV41Input(realInput.data(), startDataType, bs, inputDim);
+            QuantizeNumasV41Input(realInput.data(), startDataType, bs, inputDim,
+                                 (uint8_t*)input.cpuData, input.dataType);
         }
 
         // 1. realInput -> expandInput
@@ -6522,6 +6608,7 @@ namespace fastllm {
             canFuseGroup32);
         const bool useDeepSeekV4LargeFast =
             deepSeekV4Mode &&
+            downInputDataType < DataType::DATA_GGUF_FORMAT &&
             NumasDeepSeekV4FastPathAvailable() &&
             std::getenv(
                 "FASTLLM_DSV4_DISABLE_NUMAS_MOE_LARGE_FAST") == nullptr;
@@ -8095,7 +8182,9 @@ namespace fastllm {
                     std::vector<uint8_t, alignedAllocator<uint8_t, 64>> originalSharedInput;
                     if (deepSeekV4Mode && activationQuantBlock == 32) {
                         if (weights[0] && !quantizeSharedExpert) originalSharedInput.assign(realInput.begin(), realInput.end());
-                        QuantizeNumasV41Input(realInput.data(), startDataType, 1, inputDim);
+                        QuantizeNumasV41Input(realInput.data(), startDataType, 1, inputDim,
+                            (uint8_t*)input.cpuData + (size_t)o * GetDataBytes(input.dataType, 1, inputDim),
+                            input.dataType);
                     }
                     auto expertInput = [&](int expert) {
                         return expert == 0 && !originalSharedInput.empty() ? originalSharedInput.data() : realInput.data();
@@ -8107,6 +8196,7 @@ namespace fastllm {
 
                     bool useDeepSeekV4MoeFast =
                         deepSeekV4Mode &&
+                        downInputDataType < DataType::DATA_GGUF_FORMAT &&
                         NumasDeepSeekV4FastPathAvailable() &&
                         std::getenv(
                             "FASTLLM_DSV4_DISABLE_NUMAS_MOE_FAST") == nullptr;

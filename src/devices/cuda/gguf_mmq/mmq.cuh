@@ -3865,7 +3865,9 @@ struct mmq_type_traits<mmq_x, mmq_y, nwarps, need_check, GGML_TYPE_IQ5_KS_R4> {
     static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_q8_1_dp4a<mmq_x, mmq_y, nwarps>;
 };
 
-template <ggml_type type, int mmq_x, int nwarps, bool need_check, bool fixup>
+template <ggml_type type, int mmq_x, int nwarps, bool need_check, bool fixup,
+          template<int, int, int, bool, ggml_type> class TileTraits = mmq_type_traits,
+          bool check_y = false>
 static __device__ void mul_mat_q_process_tile(
     const char * __restrict__ x, const char * __restrict__ yc, float * __restrict__ dst, float * __restrict__ tmp_fixup,
     const int & ne00, const int & ne01, const int & stride01, const int & ne10, const int & ne11, const int & stride11, const int & ne0,
@@ -3873,17 +3875,17 @@ static __device__ void mul_mat_q_process_tile(
 
     constexpr int              qk         = ggml_cuda_type_traits<type>::qk;
     constexpr int              mmq_y      = get_mmq_y_device();
-    constexpr load_tiles_mmq_t load_tiles = mmq_type_traits<mmq_x, mmq_y, nwarps, need_check, type>::load_tiles;
+    constexpr load_tiles_mmq_t load_tiles = TileTraits<mmq_x, mmq_y, nwarps, need_check, type>::load_tiles;
 
     extern __shared__ char data_mul_mat_q[];
     int * tile_y = (int *) data_mul_mat_q;
     int * tile_x = tile_y + GGML_PAD(mmq_x*(WARP_SIZE + WARP_SIZE/QI8_1), nwarps*WARP_SIZE);
 
 #ifdef INT8_MMA_AVAILABLE
-    constexpr vec_dot_mmq_t    vec_dot    = mmq_type_traits<mmq_x, mmq_y, nwarps, need_check, type>::vec_dot_mma;
+    constexpr vec_dot_mmq_t    vec_dot    = TileTraits<mmq_x, mmq_y, nwarps, need_check, type>::vec_dot_mma;
     constexpr mmq_write_back_t write_back = mmq_write_back_mma<mmq_x, mmq_y, nwarps, need_check>;
 #else
-    constexpr vec_dot_mmq_t    vec_dot    = mmq_type_traits<mmq_x, mmq_y, nwarps, need_check, type>::vec_dot_dp4a;
+    constexpr vec_dot_mmq_t    vec_dot    = TileTraits<mmq_x, mmq_y, nwarps, need_check, type>::vec_dot_dp4a;
     constexpr mmq_write_back_t write_back = mmq_write_back_dp4a<mmq_x, mmq_y, nwarps, need_check>;
 #endif // INT8_MMA_AVAILABLE
 
@@ -3905,7 +3907,11 @@ static __device__ void mul_mat_q_process_tile(
             for (int l0 = 0; l0 < mmq_x*MMQ_TILE_Y_K; l0 += nwarps*WARP_SIZE) {
                 int l = l0 + threadIdx.y*WARP_SIZE + threadIdx.x;
 
-                tile_y[l] = by0[l];
+                // Grouped experts can retain their compact row padding when
+                // using a wider compute tile. Clamp the last tile's reads;
+                // write_back already discards those extra output columns.
+                const int src = check_y ? min(l/MMQ_TILE_Y_K, tile_y_max_j)*MMQ_TILE_Y_K + l%MMQ_TILE_Y_K : l;
+                tile_y[l] = by0[src];
             }
         }
 
@@ -3921,7 +3927,8 @@ static __device__ void mul_mat_q_process_tile(
             for (int l0 = 0; l0 < mmq_x*MMQ_TILE_Y_K; l0 += nwarps*WARP_SIZE) {
                 int l = l0 + threadIdx.y*WARP_SIZE + threadIdx.x;
 
-                tile_y[l] = by0[l];
+                const int src = check_y ? min(l/MMQ_TILE_Y_K, tile_y_max_j)*MMQ_TILE_Y_K + l%MMQ_TILE_Y_K : l;
+                tile_y[l] = by0[src];
             }
         }
 

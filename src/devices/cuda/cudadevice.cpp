@@ -8916,11 +8916,14 @@ namespace fastllm {
         int m = maxExpert + 1; // 专家数量
 
 #ifndef USE_ROCM
-        if (setZero && !deepSeekV4Mode && gateType == MoeGateSwiglu &&
+        // The host adapter checks the quantized formats, activation layout and
+        // model math together before allocating or launching grouped MMQ.
+        if (setZero && gateType == MoeGateSwiglu &&
             output.dataType == input.dataType && output.dims == input.dims &&
             FastllmCudaMergeMOEGGUFHost(input, workspace.ggufGate,
                 workspace.ggufWorkspace, output, weights, m, indexData,
-                scoreData, topk, experts, isCrossSwiglu)) {
+                scoreData, topk, experts, isCrossSwiglu, deepSeekV4Mode,
+                swigluLimit, activationQuantBlock)) {
             input.FreeCudaTemporary({}, false);
             return;
         }
@@ -9199,7 +9202,8 @@ namespace fastllm {
                             tempMiddle, tempSwiglu,
                             cudaScales + startIdx[i], swigluLimit,
                             IsDeepSeekV4CudaQuantizedWeight(*weights[i * 2 + 1]) ||
-                                (i == 0 && quantizeSharedExpert), activationQuantBlock),
+                                (i == 0 && quantizeSharedExpert) ||
+                                (i != 0 && deepSeekV41Mode), activationQuantBlock),
                         "DeepSeek-V4 failed to prepare its CUDA MoE down input.");
                 } else {
                     ApplyCudaMoeGate(

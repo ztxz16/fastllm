@@ -42,6 +42,7 @@ or BF16 activations. The V4.1 adapter has a separate BF16 contract:
 | `FP8_E4M3` | Original E4M3 bytes and FP32 block-scale arrays for gate/up and down | Hidden/intermediate widths and column scale blocks divisible by 4 |
 | `FP8_E4M3_BLOCK_128` | Original interleaved 128-byte weight blocks and FP32 scales | Hidden/intermediate widths divisible by 128 |
 | DeepSeek V4.1 `NVFP4_BLOCK_32_E8M0` | 16 packed E2M1 bytes and one UE8M0 scale per 32 weights | BF16 decode and 2–8-row verification; NUMA weights and widths divisible by 32 |
+| DeepSeek V4.1 Q2_K gate/up + Q4_K down | Registered NUMA Q2_K_R4/Q4_K_R4 blocks, retaining cross-interleaved gate/up rows | BF16 decode and 2–8-row verification; widths divisible by 256 |
 
 The generic GGUF adapter accepts Q2_0, Q4_0/Q4_1, Q5_0/Q5_1,
 Q8_0/Q8_1, Q2_K–Q6_K, IQ1_S/IQ1_M, IQ2_XXS/IQ2_XS/IQ2_S,
@@ -254,8 +255,9 @@ addition to storage used by the fallback backend.
 
 ## DeepSeek V4.1
 
-Use CUDA for the main model and shared experts, and NUMA for the NVFP4 routed
-experts. A dual-GPU configuration with 8 GiB of cache on each device is:
+Use CUDA for the main model and shared experts, and NUMA for the routed experts.
+Both original NVFP4 and the Q2_K/Q4_K mixed export support this cache. A dual-GPU
+configuration with 8 GiB of cache on each device is:
 
 ```sh
 FT_NUMAS=1 numactl -C 0-31 -m 0 \
@@ -264,8 +266,8 @@ FT_NUMAS=1 numactl -C 0-31 -m 0 \
   --moe_cuda_cache 8g
 ```
 
-The cache borrows registered, pinned NUMA block-32 weights, without a separate
-host snapshot. The shared scheduler measures CPU/GPU compute and refill costs
+The cache borrows registered, pinned NUMA block-32 or Q2_K_R4/Q4_K_R4 weights,
+without a separate host weight snapshot. The shared scheduler measures CPU/GPU compute and refill costs
 to choose disjoint expert subsets, preferring resident experts. Resident experts
 can remain on CPU when that gives a better split. A cache is not a guaranteed
 speedup: route reuse, capacity and PCIe transfers matter.
@@ -307,6 +309,12 @@ Expert math preserves V4.1 block-32 FP8 activation quantization, SwiGLU clipping
 route weighting before down-input quantization and per-expert BF16 rounding.
 Results accumulate in ascending expert-ID order in FP32 before final BF16
 rounding. CPU/GPU reduction can still introduce floating-point differences.
+For Q2_K/Q4_K, the GPU reads the existing R4 packing directly and encodes FP8-rounded
+activations as GGML Q8_K using the signed maximum. Gate/up rows retain their NUMA
+interleaving, and route scores are applied before the intermediate FP8/Q8 boundary.
+The single-row CPU subset reuses the grouped GGML V4.1 preparation used by verification.
+The `cuda_v41_q2_moe_cache` test covers top-6 routes, eviction, CPU/GPU splits,
+zero inputs and scores, and SwiGLU clipping against NUMA and a scalar reference.
 The block-32 GPU prefill GEMM also accumulates into FP32 before its BF16 cast,
 preventing reduced-precision cuBLAS partial reductions. Source NVFP4 experts
 are registered before their first GPU prefill use, including when startup
@@ -610,8 +618,37 @@ IQ2_XXS/XS/S. IQ1_M retains per-expert GEMM for host prefill: the current
 grouped IQ1_M gate kernel uses per-route DP4A and loses batch weight reuse.
 FP32, FP16 and BF16 activations are accepted on NVIDIA SM75 or newer.
 
-Scratch includes the current worker's uploaded and restored packed weights,
-route metadata, grouped MMQ products and activations. It is reused across
+DeepSeek-V4.1's BF16 Q2_K gate/up + Q4_K down pair also uses this streamed
+path, including Q2_K_R4/Q4_K_R4 NUMA weights. Admission checks the model's
+block-32 activation contract, formats, shapes and workspace capacity instead
+of excluding every V4 model. The adapter retains BF16 projection rounding,
+SwiGLU clipping, route scores before the down-input BF16/FP8 boundary, and
+ascending expert-ID reduction. Both projections use signed-max GGML Q8_K
+quants with FP32 scales. The shared MMQ tile loop uses V4.1 loaders and MMA
+fragments that form integer activation sums instead of rounding scale/sum
+metadata to half precision. Matrix accumulation can still change rounding
+relative to the NUMA scalar oracle; bitwise CPU/GPU equality is not promised.
+V4 block-128, shared experts inside this operator,
+and other format/activation combinations retain the per-expert fallback.
+The V4.1 GGUF fallback also applies the required down-input FP8 boundary.
+
+V4.1 CPU input preparation fuses source conversion, FP8 quantization and
+GGML encoding across the existing worker pool with reusable per-row scratch.
+It skips the redundant pre-FP8 Q8 encoding when no unquantized shared expert
+needs it. This preserves CPU/GPU expert scheduling and adds no environment
+switch. `cuda_v41_q2_moe_prefill` checks both GPUs at 33, 65, 128, 408, 1023,
+1024, 1041 and 4096 rows against NUMA and independent scalar references, including zeros,
+negative/zero route scores, clipping, selected subsets, canonical/R4 weights,
+NUMA shards, immutable inputs and rejection of unsupported math/shapes.
+The `_small` and `_model_shape` tests cover cancellation-sensitive 256-wide
+inputs and the model's 5120 × 2304 expert dimensions, respectively.
+
+Scratch includes the current worker's restored packed weights, projection upload
+staging, route metadata, grouped MMQ products and activations. V4.1 uses two staging
+buffers so a high-priority stream can upload/restore down weights during gate/up
+MMQ; an event gates the down projection. Other formats use one staging buffer.
+V4.1 batches of at least 1024 rows use 64-row compute tiles while retaining
+16-row route padding, with guarded reads for each expert's last tile. Scratch is reused across
 layers on the same device, separately from the expert-cache payload budget.
 Admission checks the entire selected subset, workspace size and available
 memory before uploading weights. Shared experts inside the operator,

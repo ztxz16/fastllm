@@ -904,6 +904,32 @@ if (UNIT_TEST)
     set_tests_properties(reduce_batch PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
 
     if (USE_NUMAS)
+        add_executable(numas_v41_q2_moe_test test/basic/test_numas_v41_q2_moe.cpp)
+        target_link_libraries(numas_v41_q2_moe_test PRIVATE fastllm)
+        add_test(NAME numas_v41_q2_moe COMMAND numas_v41_q2_moe_test)
+        add_test(NAME disk_v41_q2_moe COMMAND numas_v41_q2_moe_test disk)
+        if (USE_CUDA)
+            add_test(NAME cuda_v41_q2_moe_cache COMMAND numas_v41_q2_moe_test cache 512)
+            set_tests_properties(cuda_v41_q2_moe_cache PROPERTIES LABELS "cuda;gguf;moe" RUN_SERIAL TRUE)
+            add_test(NAME cuda_v41_q2_moe_prefill COMMAND numas_v41_q2_moe_test host 768)
+            add_test(NAME cuda_v41_q2_moe_prefill_small COMMAND numas_v41_q2_moe_test host 256)
+            add_test(NAME cuda_v41_q2_moe_prefill_model_shape COMMAND numas_v41_q2_moe_test host 5120 2304 33)
+            set_tests_properties(cuda_v41_q2_moe_prefill cuda_v41_q2_moe_prefill_small cuda_v41_q2_moe_prefill_model_shape PROPERTIES
+                ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4;FT_GPU_PREFILL=0"
+                LABELS "cuda;gguf;moe" RUN_SERIAL TRUE TIMEOUT 300)
+        endif()
+        set_tests_properties(disk_v41_q2_moe PROPERTIES
+            ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4;FT_GPU_PREFILL=0"
+            RUN_SERIAL TRUE TIMEOUT 180)
+        if (USE_CUDA)
+            add_test(NAME disk_v41_q2_moe_cuda_prefill COMMAND numas_v41_q2_moe_test disk 512 cuda)
+            set_tests_properties(disk_v41_q2_moe_cuda_prefill PROPERTIES
+                ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4;FT_GPU_PREFILL=1"
+                RUN_SERIAL TRUE TIMEOUT 180 LABELS cuda)
+        endif()
+        set_tests_properties(numas_v41_q2_moe PROPERTIES
+            ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4;FT_GPU_PREFILL=0"
+            RUN_SERIAL TRUE TIMEOUT 120)
         add_executable(numas_fp8_moe_bench tools/numas_fp8_moe_bench.cpp)
         target_link_libraries(numas_fp8_moe_bench PRIVATE fastllm)
         add_executable(numas_fp8_eager_moe_test test/basic/test_numas_fp8_eager_moe.cpp)

@@ -333,6 +333,25 @@ bool BindSharedV41(const OffloadLayout &l, const fastllm::Data &w, int,
     return true;
 }
 
+bool PlanSharedV41GGUF(const OffloadLayout &l, fastllm::cuda::SharedExpertLayout &) {
+    return l.deepSeekV41 && l.gateGgmlType == GGML_TYPE_Q2_K_R4 &&
+        l.downGgmlType == GGML_TYPE_Q4_K_R4 && !(l.hidden % 256) && !(l.inter % 256);
+}
+void SnapshotV41GGUF(const OffloadLayout &, const fastllm::Data &, const fastllm::Data &, uint8_t *) {}
+bool BindSharedV41GGUF(const OffloadLayout &l, const fastllm::Data &w, int part,
+                       fastllm::cuda::SharedWeightView &view) {
+    if (w.dataType != fastllm::DATA_GGUF_FORMAT || w.numasData.empty() ||
+        w.ggmlType != (part ? l.downGgmlType : l.gateGgmlType) ||
+        w.dims[0] % (4 * w.numasData.size())) return false;
+    // Copy R4 bytes as a contiguous blob. Row-group restoration would corrupt
+    // its four-row packing; the V4.1 GPU kernel reads the cross-interleaved rows.
+    view.rowGroups = 1;
+    view.rowBytes = fastllm::GetDataBytes(static_cast<fastllm::DataType>(
+        int(fastllm::DATA_GGUF_FORMAT) + w.ggmlType), 1, w.dims[1]);
+    view.tileStride = view.rowStride = view.blockBytes = view.blockStride = view.rowBytes;
+    return true;
+}
+
 bool PlanSharedFP8(const OffloadLayout &l, fastllm::cuda::SharedExpertLayout &plan) {
     if (l.weightType == fastllm::DataType::FP8_E4M3) {
         if ((l.gateBlockM != 128 && l.gateBlockM != l.hidden) ||
@@ -448,6 +467,32 @@ int GGUFCacheType(const fastllm::Data *weight) {
         case fastllm::DataType::BFLOAT16: return GGML_TYPE_BF16;
         default: return -1;
     }
+}
+
+bool ValidateV41GGUFPair(fastllm::Data *gate, fastllm::Data *down,
+                         const OffloadLayout *expected, OffloadLayout &observed) {
+    if (!gate || !down || gate->dataType != fastllm::DATA_GGUF_FORMAT ||
+        down->dataType != fastllm::DATA_GGUF_FORMAT ||
+        gate->ggmlType != GGML_TYPE_Q2_K_R4 || down->ggmlType != GGML_TYPE_Q4_K_R4 ||
+        !gate->IsRepacked || !down->IsRepacked || gate->numasData.empty() || down->numasData.empty() ||
+        gate->dataDevice != fastllm::DataDevice::CPU || down->dataDevice != fastllm::DataDevice::CPU ||
+        gate->dims.size() != 2 || down->dims.size() != 2 ||
+        down->dims[0] <= 0 || down->dims[1] <= 0 || down->dims[1] > INT_MAX / 2 ||
+        gate->dims[0] != 2 * down->dims[1] || gate->dims[1] != down->dims[0] ||
+        gate->dims[1] % 256 || down->dims[1] % 256) return false;
+    observed.weightType = fastllm::DATA_GGUF_FORMAT;
+    observed.deepSeekV41 = true;
+    observed.gateGgmlType = gate->ggmlType;
+    observed.downGgmlType = down->ggmlType;
+    observed.hidden = gate->dims[1]; observed.inter = down->dims[1];
+    observed.gateBytes = gate->GetBytes(); observed.downBytes = down->GetBytes();
+    observed.downOffset = AlignUp(observed.gateBytes, 16);
+    observed.scalesOffset = AlignUp(observed.downOffset + observed.downBytes, 16);
+    observed.recordStride = AlignUp(observed.scalesOffset, 128);
+    return !expected || (expected->weightType == observed.weightType && expected->deepSeekV41 &&
+        expected->gateGgmlType == observed.gateGgmlType && expected->downGgmlType == observed.downGgmlType &&
+        expected->hidden == observed.hidden && expected->inter == observed.inter &&
+        expected->gateBytes == observed.gateBytes && expected->downBytes == observed.downBytes);
 }
 
 bool ValidateWeightPair(fastllm::Data *gate, fastllm::Data *down,
@@ -1401,7 +1446,9 @@ bool FastllmCudaPrepareMoeCache(
         for (int expert = 0; expert < experts; ++expert) {
             const int position = (expert + 1) * 2;
             OffloadLayout observed;
-            if (!ValidateWeightPair(
+            const bool v41GGUF = layers[0].deepSeekV41 && layers[layer].weights[position] &&
+                layers[layer].weights[position]->dataType == fastllm::DATA_GGUF_FORMAT;
+            if (!(v41GGUF ? ValidateV41GGUFPair : ValidateWeightPair)(
                     layers[layer].weights[position],
                     layers[layer].weights[position + 1],
                     expert == 0 ? nullptr : &layerLayout, observed)) {
@@ -1419,7 +1466,7 @@ bool FastllmCudaPrepareMoeCache(
                 return false;
             }
             if (layers[0].deepSeekV41 !=
-                (observed.weightType == fastllm::DataType::NVFP4_BLOCK_32_E8M0)) return false;
+                (observed.weightType == fastllm::DataType::NVFP4_BLOCK_32_E8M0 || v41GGUF)) return false;
             if (expert == 0) {
                 layerLayout = observed;
                 layerLayout.experts = experts;
@@ -1432,12 +1479,12 @@ bool FastllmCudaPrepareMoeCache(
                 observed.swigluLimit = layers[0].swigluLimit;
                 layout = observed;
                 first = false;
-            } else if (observed.weightType == fastllm::DataType::DATA_GGUF_FORMAT) {
+            } else if (observed.weightType == fastllm::DataType::DATA_GGUF_FORMAT && !layers[0].deepSeekV41) {
                 if (layout.weightType != observed.weightType) return false;
                 layout.recordStride = std::max(layout.recordStride, observed.recordStride);
             } else {
                 OffloadLayout checked;
-                if (!ValidateWeightPair(layers[layer].weights[position],
+                if (!(v41GGUF ? ValidateV41GGUFPair : ValidateWeightPair)(layers[layer].weights[position],
                                         layers[layer].weights[position + 1], &layout, checked)) return false;
             }
         }
@@ -1476,7 +1523,7 @@ bool FastllmCudaPrepareMoeCache(
     // Snapshot canonical GGUF before NUMA interleaves gate/up rows and repacks
     // CPU kernels. GPU slot records remain immutable ordinary GGUF payloads.
     const bool shareNuma = bool(registerNumaWeights) &&
-                          layout.weightType != fastllm::DataType::DATA_GGUF_FORMAT;
+                          (layout.weightType != fastllm::DataType::DATA_GGUF_FORMAT || layout.deepSeekV41);
     if (shareNuma && (!storage || layout.recordStride > UINT32_MAX / kMaxTopK ||
                       !storage->plan(layout, group->sharedLayout))) return false;
     const size_t hostStride = shareNuma ? group->sharedLayout.auxiliaryBytes : layout.recordStride;
@@ -1724,6 +1771,10 @@ bool ComputeV41Cache(const fastllm::Data &input, fastllm::Data &activation,
 
 bool FP8HybridShape(const OffloadLayout &) { return true; }
 bool GGUFHybridShape(const OffloadLayout &layout) {
+    if (layout.deepSeekV41) {
+        fastllm::cuda::SharedExpertLayout plan;
+        return PlanSharedV41GGUF(layout, plan);
+    }
     return FastllmCudaMoeGGUFCacheSupported(layout.gateGgmlType, layout.hidden) &&
            FastllmCudaMoeGGUFCacheSupported(layout.downGgmlType, layout.inter);
 }
@@ -1735,6 +1786,9 @@ bool ComputeGGUFCache(const fastllm::Data &input, fastllm::Data &gateOutput,
         cache.records, cache.routeSlots, layout.recordStride, layout.downOffset,
         layout.gateGgmlType, layout.downGgmlType, layout.hidden, layout.inter,
         cache.ggufWorkspace, cache.ggufWorkspaceBytes, cache.slotOffsets};
+    if (layout.deepSeekV41)
+        return FastllmCudaMoeV41GGUFCacheCompute(input, gateOutput, view,
+            scores, topk, layout.swigluLimit, perExpert);
     return FastllmCudaMoeGGUFCacheCompute(input, gateOutput, output, view, scores, topk, perExpert);
 }
 
@@ -1742,8 +1796,9 @@ const ExpertCacheBackend *FindExpertCacheBackend(fastllm::DataType type) {
     static const SharedCacheStorage nvfp4{PlanSharedNVFP4, SnapshotNVFP4Metadata, BindSharedNVFP4};
     static const SharedCacheStorage v41{PlanSharedV41, SnapshotV41, BindSharedV41};
     static const SharedCacheStorage fp8{PlanSharedFP8, SnapshotFP8Metadata, BindSharedFP8};
+    static const SharedCacheStorage v41GGUF{PlanSharedV41GGUF, SnapshotV41GGUF, BindSharedV41GGUF};
     static const ExpertCacheBackend backends[] = {
-        {fastllm::DataType::DATA_GGUF_FORMAT, GGUFHybridShape, nullptr, ComputeGGUFCache},
+        {fastllm::DataType::DATA_GGUF_FORMAT, GGUFHybridShape, &v41GGUF, ComputeGGUFCache},
         {fastllm::DataType::NVFP4_BLOCK_32_E8M0, FP8HybridShape, &v41, ComputeV41Cache},
         {fastllm::DataType::NVFP4_BLOCK_16_E4M3, SupportsNVFP4WideDecode, &nvfp4, ComputeNVFP4Cache},
         {fastllm::DataType::FP8_E4M3, FP8HybridShape, &fp8, ComputeFP8Cache},
@@ -2542,13 +2597,22 @@ bool TryV41VerifyHybrid(const fastllm::Data &input, const fastllm::Data &index, 
         w.activation.Allocate(false);
         checkCudaErrors("Verify GPU start", cudaEventRecord(w.start, cudaStreamPerThread));
         using namespace fastllm::cuda::dsv41_cache;
-        Gate<true><<<dim3(layout.inter / 32, routes), 512, 0, cudaStreamPerThread>>>(
-            (const __nv_bfloat16 *)w.quantizedInput.cudaData, dSlots, cache->records, (const float *)score.cudaData,
-            (__nv_bfloat16 *)w.activation.cudaData, hidden, layout.inter, layout.recordStride, layout.swigluLimit,
-            topk);
-        Down<<<dim3(hidden / 8, routes), 128, 0, cudaStreamPerThread>>>(
-            (const __nv_bfloat16 *)w.activation.cudaData, dSlots, cache->records, dGpu, hidden, layout.inter,
-            layout.recordStride, layout.downOffset);
+        if (layout.weightType == fastllm::DATA_GGUF_FORMAT) {
+            const FastllmCudaMoeGGUFCacheView view{cache->records, dSlots, layout.recordStride, layout.downOffset,
+                layout.gateGgmlType, layout.downGgmlType, hidden, layout.inter,
+                cache->ggufWorkspace, cache->ggufWorkspaceBytes};
+            fastllm::AssertInFastLLM(FastllmCudaMoeV41GGUFCacheCompute(w.quantizedInput, w.activation,
+                view, (const float *)score.cudaData, topk, layout.swigluLimit, dGpu),
+                "Verify Q2 CUDA experts failed.\n");
+        } else {
+            Gate<true><<<dim3(layout.inter / 32, routes), 512, 0, cudaStreamPerThread>>>(
+                (const __nv_bfloat16 *)w.quantizedInput.cudaData, dSlots, cache->records, (const float *)score.cudaData,
+                (__nv_bfloat16 *)w.activation.cudaData, hidden, layout.inter, layout.recordStride, layout.swigluLimit,
+                topk);
+            Down<<<dim3(hidden / 8, routes), 128, 0, cudaStreamPerThread>>>(
+                (const __nv_bfloat16 *)w.activation.cudaData, dSlots, cache->records, dGpu, hidden, layout.inter,
+                layout.recordStride, layout.downOffset);
+        }
         checkCudaErrors("Verify CUDA experts", cudaGetLastError());
         checkCudaErrors("Verify GPU finish", cudaEventRecord(w.computed, cudaStreamPerThread));
         w.previousGpuRoutes = gpuRoutes;

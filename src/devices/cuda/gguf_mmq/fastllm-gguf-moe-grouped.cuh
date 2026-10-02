@@ -2,6 +2,8 @@
 // Packed MoE prefill on the existing MMQ tile machinery. Included inside
 // fastllm_gguf_mmq after mmq_io, the Q8 helpers and imported MMQ definitions.
 
+#include "fastllm-gguf-moe-v41-mmq.cuh"
+
 namespace grouped_moe {
 constexpr int kTile = 16;
 
@@ -62,12 +64,12 @@ static bool MatrixType(int type, int columns) {
 }
 static size_t Align(size_t x) { return (x+255)&~size_t(255); }
 struct Workspace {
-    int capacity;
+    int capacity, inputRows;
     int *counts, *offsets, *cursors, *tileExperts, *groupRoutes, *routeGroups;
     block_q8_1_mmq *quantized;
     float *products;
     size_t bytes;
-    Workspace(void *base, int rows, int hidden, int inter, int experts, int topk) {
+    Workspace(void *base, int rows, int hidden, int inter, int experts, int topk) : inputRows(rows) {
         const int routes = rows*topk;
         capacity = ((routes+experts*(kTile-1)+kTile-1)/kTile)*kTile;
         size_t used = 0;
@@ -153,16 +155,26 @@ __global__ void Quantize(const T *input, block_q8_1_mmq *output,
     if (col%32 == 0) q.d4[(col%128)/32] = __half2float(__float2half_rn(scale));
 }
 
-template<ggml_type Type>
+template<ggml_type Type, int Tile = kTile>
 __global__ void Matmul(const uint8_t *const *weights, int part,
                        const block_q8_1_mmq *input, float *output,
                        const int *counts, const int *offsets, const int *tileExperts,
                        int experts, int columns, int width, int capacity, int stride) {
     if (blockIdx.y*kTile >= offsets[experts]) return;
     const int e = tileExperts[blockIdx.y], begin = offsets[e];
-    const int localTile = blockIdx.y-begin/kTile;
+    const int packedTile = blockIdx.y-begin/kTile;
+    // Keep the 16-row routing/workspace layout. Only the first CTA of each
+    // wider tile computes; this avoids padding every expert to 64 rows.
+    if (packedTile%(Tile/kTile)) return;
+    const int localTile = packedTile/(Tile/kTile);
     const int padded = ((columns+255)/256)*256;
-    mul_mat_q_process_tile<Type, kTile, MMQ_NWARPS, true, false>(
+    if constexpr (Type == GGML_TYPE_Q2_K || Type == GGML_TYPE_Q4_K) {
+        mul_mat_q_process_tile<Type, Tile, MMQ_NWARPS, true, false, v41_mmq_type_traits, (Tile > kTile)>(
+            reinterpret_cast<const char *>(weights[2*e+part]),
+            reinterpret_cast<const char *>(input+begin), output+size_t(begin)*width,
+            nullptr, padded, width, stride, padded, counts[e], capacity, width,
+            blockIdx.x, localTile, 0, padded/256);
+    } else mul_mat_q_process_tile<Type, kTile, MMQ_NWARPS, true, false>(
         reinterpret_cast<const char *>(weights[2*e+part]),
         reinterpret_cast<const char *>(input+begin), output+size_t(begin)*width,
         nullptr, padded, width, stride, padded, counts[e], capacity, width,
@@ -247,18 +259,19 @@ __global__ void IQ1Gate(const block_q8_1 *input, T *gate,
     if (threadIdx.x%32 == 0) gate[size_t(route)*inter+row] = mmq_io<T>::from_float(value);
 }
 
-template<ggml_type Type>
+template<ggml_type Type, int Tile = kTile>
 static void LaunchMatrix(const uint8_t *const *weights, int part, Workspace &w,
                           int experts, int columns, int width, cudaStream_t stream) {
     const int device = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[device].cc;
-    constexpr ggml_type SharedType = Type == GGML_TYPE_Q2_0 ? GGML_TYPE_Q8_0 : Type;
-    const int shared = mmq_get_shmem<SharedType>(kTile, get_mmq_y_host(cc), cc);
+    constexpr ggml_type SharedType = Type == GGML_TYPE_Q2_0 ? GGML_TYPE_Q8_0 :
+        Type == GGML_TYPE_Q4_K ? GGML_TYPE_Q2_K : Type;
+    const int shared = mmq_get_shmem<SharedType>(Tile, get_mmq_y_host(cc), cc);
     static std::once_flag initialized[GGML_CUDA_MAX_DEVICES];
     std::call_once(initialized[device], [shared]() {
-        CUDA_CHECK(cudaFuncSetAttribute(Matmul<Type>, cudaFuncAttributeMaxDynamicSharedMemorySize, shared));
+        CUDA_CHECK(cudaFuncSetAttribute(Matmul<Type, Tile>, cudaFuncAttributeMaxDynamicSharedMemorySize, shared));
     });
-    Matmul<Type><<<dim3((width+get_mmq_y_host(cc)-1)/get_mmq_y_host(cc), w.capacity/kTile),
+    Matmul<Type, Tile><<<dim3((width+get_mmq_y_host(cc)-1)/get_mmq_y_host(cc), w.capacity/kTile),
         dim3(32, MMQ_NWARPS), shared, stream>>>(weights, part, w.quantized, w.products,
             w.counts, w.offsets, w.tileExperts, experts, columns, width, w.capacity,
             int(ggml_row_size(Type, columns)));
@@ -270,12 +283,20 @@ static void Matrix(int type, const uint8_t *const *weights, int part, Workspace 
         GROUPED_CASE(Q2_0) GROUPED_CASE(IQ2_XXS) GROUPED_CASE(IQ2_XS) GROUPED_CASE(IQ2_S)
         GROUPED_CASE(IQ3_XXS) GROUPED_CASE(IQ3_S) GROUPED_CASE(IQ4_NL) GROUPED_CASE(IQ4_XS)
 #undef GROUPED_CASE
+#define V41_CASE(T) case GGML_TYPE_##T: \
+        if (w.inputRows >= 1024) LaunchMatrix<GGML_TYPE_##T, 64>(weights, part, w, experts, columns, width, stream); \
+        else LaunchMatrix<GGML_TYPE_##T>(weights, part, w, experts, columns, width, stream); \
+        break;
+        V41_CASE(Q2_K) V41_CASE(Q4_K)
+#undef V41_CASE
     }
 }
+#include "fastllm-gguf-moe-v41.cuh"
 template<class T>
 static bool Run(const T *input, T *gate, T *output, const uint8_t *const *weights,
                  const int *indices, const float *scores, void *workspace,
-                 int gt, int dt, int rows, int hidden, int inter, int experts, int topk) {
+                 int gt, int dt, int rows, int hidden, int inter, int experts, int topk,
+                 bool deepSeekV41, float swigluLimit, cudaEvent_t downWeightsReady) {
     const auto stream = cudaStreamPerThread;
     Workspace w(workspace, rows, hidden, inter, experts, topk);
     const int routes = rows*topk;
@@ -288,6 +309,13 @@ static bool Run(const T *input, T *gate, T *output, const uint8_t *const *weight
     Prefix<<<1, threads, 0, stream>>>(w.counts, w.offsets, w.tileExperts, experts);
     Scatter<<<(routes+255)/256, 256, 0, stream>>>(indices, weights, w.offsets, w.cursors,
         w.groupRoutes, w.routeGroups, routes, experts);
+    if constexpr (std::is_same<T, __nv_bfloat16>::value) {
+        if (deepSeekV41) {
+            RunV41(input, gate, output, weights, indices, scores, w,
+                rows, hidden, inter, experts, topk, swigluLimit, downWeightsReady);
+            return cudaGetLastError() == cudaSuccess;
+        }
+    }
     // Gate input uses the same Q8 quantizer as Dense MMVQ. Matrix is the
     // first consumer of products, so this scratch reuse adds no allocation.
     auto *q = reinterpret_cast<block_q8_1 *>(w.products);
