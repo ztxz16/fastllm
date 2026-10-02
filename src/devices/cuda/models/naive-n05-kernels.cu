@@ -853,31 +853,56 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
     int queries = query.dims[1], keys = packedKeys.dims[1];
     int stride = packedKeys.dims[2];
     Data q, k, scores;
-    Output(q, DataType::FLOAT32, {queries, heads, dim});
-    Output(k, DataType::FLOAT32, {keys, dim});
     Output(scores, DataType::FLOAT32, {queries, keys});
-    RoundIndexer<<<queries * heads, 128>>>((const BF16 *)query.cudaData,
-        (float *)q.cudaData, dim, 0, fp8);
-    RoundIndexer<<<keys, 128>>>((const BF16 *)packedKeys.cudaData,
-        (float *)k.cudaData, stride, stride - dim, fp8);
-    if (queries > 1 && heads == 16) {
-        // A larger tile amortizes operand loads once there are enough tiles
-        // to fill the GPU. Keep the smaller tile for short/underfilled work.
-        if ((int64_t)queries * keys >= 128 * 1024) {
-            constexpr int keysPerBlock = kIndexerKeysPerWarp * kIndexerWarps;
-            IndexScoresPrefillTiled<<<dim3((keys + keysPerBlock - 1) / keysPerBlock,
-                (queries + kIndexerQueryTile - 1) / kIndexerQueryTile), kIndexerWarps * 32>>>(
-                (const float *)q.cudaData, (const float *)k.cudaData,
-                (const BF16 *)weights.cudaData, (float *)scores.cudaData, queries, keys, queryStart);
+#ifdef FASTLLM_NAIVE_DSA_MMA
+    // Keep the E4M3 values exact in BF16 and apply their FP32 scales after MMA.
+    // Small prefill blocks and decode retain the original FP32 reduction path.
+    if (fp8 && heads == 16 && queries >= 32 &&
+        (int64_t)queries * keys >= 1024 * 1024 &&
+        FastllmCudaFlashInferDataTypeSupported(DataType::BFLOAT16)) {
+        Data qScale, kScale;
+        Output(q, DataType::BFLOAT16, {queries, heads, dim});
+        Output(k, DataType::BFLOAT16, {keys, dim});
+        Output(qScale, DataType::FLOAT32, {queries, heads});
+        Output(kScale, DataType::FLOAT32, {keys});
+        naive_dsa_mma::QuantizeIndexer<<<queries * heads, 128>>>(
+            (const BF16 *)query.cudaData, (BF16 *)q.cudaData,
+            (float *)qScale.cudaData, dim, 0);
+        naive_dsa_mma::QuantizeIndexer<<<keys, 128>>>(
+            (const BF16 *)packedKeys.cudaData, (BF16 *)k.cudaData,
+            (float *)kScale.cudaData, stride, stride - dim);
+        naive_dsa_mma::IndexerScores<<<dim3((keys + 63) / 64, (queries + 63) / 64), 256>>>(
+            (const BF16 *)q.cudaData, (const BF16 *)k.cudaData,
+            (const float *)qScale.cudaData, (const float *)kScale.cudaData,
+            (const BF16 *)weights.cudaData, (float *)scores.cudaData, queries, keys, queryStart);
+    } else
+#endif
+    {
+        Output(q, DataType::FLOAT32, {queries, heads, dim});
+        Output(k, DataType::FLOAT32, {keys, dim});
+        RoundIndexer<<<queries * heads, 128>>>((const BF16 *)query.cudaData,
+            (float *)q.cudaData, dim, 0, fp8);
+        RoundIndexer<<<keys, 128>>>((const BF16 *)packedKeys.cudaData,
+            (float *)k.cudaData, stride, stride - dim, fp8);
+        if (queries > 1 && heads == 16) {
+            // A larger tile amortizes operand loads once there are enough tiles
+            // to fill the GPU. Keep the smaller tile for short/underfilled work.
+            if ((int64_t)queries * keys >= 128 * 1024) {
+                constexpr int keysPerBlock = kIndexerKeysPerWarp * kIndexerWarps;
+                IndexScoresPrefillTiled<<<dim3((keys + keysPerBlock - 1) / keysPerBlock,
+                    (queries + kIndexerQueryTile - 1) / kIndexerQueryTile), kIndexerWarps * 32>>>(
+                    (const float *)q.cudaData, (const float *)k.cudaData,
+                    (const BF16 *)weights.cudaData, (float *)scores.cudaData, queries, keys, queryStart);
+            } else {
+                IndexScoresPrefill<<<dim3((keys + 7) / 8, queries), 256>>>((const float *)q.cudaData,
+                    (const float *)k.cudaData, (const BF16 *)weights.cudaData,
+                    (float *)scores.cudaData, keys, queryStart);
+            }
         } else {
-            IndexScoresPrefill<<<dim3((keys + 7) / 8, queries), 256>>>((const float *)q.cudaData,
+            IndexScores<<<dim3((keys + 7) / 8, queries), 256>>>((const float *)q.cudaData,
                 (const float *)k.cudaData, (const BF16 *)weights.cudaData,
-                (float *)scores.cudaData, keys, queryStart);
+                (float *)scores.cudaData, heads, keys, queryStart);
         }
-    } else {
-        IndexScores<<<dim3((keys + 7) / 8, queries), 256>>>((const float *)q.cudaData,
-            (const float *)k.cudaData, (const BF16 *)weights.cudaData,
-            (float *)scores.cudaData, heads, keys, queryStart);
     }
     CheckLaunch();
     // Stable GPU selection for decode and every row of a prefill chunk.

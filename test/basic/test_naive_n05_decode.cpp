@@ -575,6 +575,112 @@ static void TestAttentionSwa() {
     }
 }
 
+// Independent CPU E4M3 nearest-even quantizer; use dequantized FP32 operands
+// and FP64 score accumulation to check both the old and MMA dispatch paths.
+static float IndexerE4M3(float x) {
+    float a = std::min(448.f, std::abs(x)), best = 0.f;
+    float distance = a;
+    for (int bits = 1; bits <= 126; ++bits) {
+        int exponent = bits >> 3, mantissa = bits & 7;
+        float value = exponent ? std::ldexp(float(8 + mantissa), exponent - 10)
+                               : std::ldexp(float(mantissa), -9);
+        float delta = std::abs(value - a);
+        if (delta < distance || (delta == distance && !(bits & 1))) {
+            best = value; distance = delta;
+        }
+    }
+    return std::copysign(best, x);
+}
+static std::vector<float> IndexerOperands(const std::vector<uint16_t> &input,
+                                         int rows, int stride, int offset, bool fp8) {
+    std::vector<float> out((size_t)rows * 128);
+    for (int row = 0; row < rows; ++row) {
+        float maximum = 0.f;
+        for (int d = 0; d < 128; ++d)
+            maximum = std::max(maximum, std::abs(FromBits(input[(size_t)row * stride + offset + d])));
+        float scale = std::max(maximum, 1e-4f) / 448.f;
+        for (int d = 0; d < 128; ++d) {
+            float x = FromBits(input[(size_t)row * stride + offset + d]);
+            out[(size_t)row * 128 + d] = fp8 ? IndexerE4M3(x / scale) * scale : x;
+        }
+    }
+    return out;
+}
+static void TestIndexer() {
+    struct Shape { int rows, keys, heads, stride; bool fp8; };
+    const Shape shapes[] = {
+        {1,257,16,896,true}, {31,4099,16,897,true},
+        {32,32767,16,896,true}, {32,32768,16,896,true},
+        {33,32769,16,897,true}, {64,16384,16,896,true},
+        {65,16387,16,896,true}, {512,2051,16,896,true},
+        {64,16384,8,896,true}, {64,16384,16,896,false}};
+    for (const auto &s : shapes) for (int mode = 0; mode < 5; ++mode) {
+        if (quick && s.rows != 33 && s.rows != 1) continue;
+        Data q(BFLOAT16), k(BFLOAT16), w(BFLOAT16), out;
+        Upload(q, {1,s.rows,s.heads*128}, 123);
+        Upload(k, {1,s.keys,s.stride}, 287);
+        Upload(w, {1,s.rows,s.heads}, 555);
+        auto qb = Read<uint16_t>(q), kb = Read<uint16_t>(k), wb = Read<uint16_t>(w);
+        for (auto &v : wb) if (mode != 1) v &= 0x7fff;
+        if (mode == 2) std::fill(qb.begin(),qb.end(),0);
+        if (mode == 3) std::fill(kb.begin(),kb.end(),Float32ToBFloat16RNEBits(.125f));
+        if (mode == 4) {
+            for (auto &v : qb) v = Float32ToBFloat16RNEBits(FromBits(v) * 16.f);
+            for (auto &v : kb) v = Float32ToBFloat16RNEBits(FromBits(v) / 256.f);
+        }
+        Require(cudaMemcpy(q.cudaData,qb.data(),qb.size()*2,cudaMemcpyHostToDevice)==cudaSuccess,"Indexer Q upload");
+        Require(cudaMemcpy(k.cudaData,kb.data(),kb.size()*2,cudaMemcpyHostToDevice)==cudaSuccess,"Indexer K upload");
+        Require(cudaMemcpy(w.cudaData,wb.data(),wb.size()*2,cudaMemcpyHostToDevice)==cudaSuccess,"Indexer W upload");
+        // Include causal future keys and output padding in the small case.
+        int past = s.rows == 1 ? 63 : s.keys-s.rows;
+        int top = s.rows == 1 ? 80 : 2048;
+        FastllmCudaNaiveIndexer(q,w,k,s.heads,128,past,top,s.fp8,out);
+        auto got = Read<int>(out);
+        auto qv = IndexerOperands(qb,s.rows*s.heads,128,0,s.fp8);
+        auto kv = IndexerOperands(kb,s.keys,s.stride,s.stride-128,s.fp8);
+        std::vector<int> rows={0,s.rows/2,s.rows-1};
+        std::sort(rows.begin(), rows.end());
+        rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+        for (int row : rows) {
+            int valid = past+row+1, keep = std::min(top,valid);
+            std::vector<double> scores(valid);
+            double magnitude = 0;
+            for (int key=0; key<valid; ++key) {
+                double score=0;
+                for (int head=0; head<s.heads; ++head) {
+                    double dot=0;
+                    for (int d=0; d<128; ++d)
+                        dot+=double(qv[((size_t)row*s.heads+head)*128+d])*kv[(size_t)key*128+d];
+                    score+=std::max(dot,0.)*FromBits(wb[row*s.heads+head]);
+                }
+                scores[key] = score;
+                magnitude = std::max(magnitude, std::abs(score));
+            }
+            std::vector<int> order(valid);
+            std::iota(order.begin(), order.end(), 0);
+            std::partial_sort(order.begin(),order.begin()+keep,order.end(),[&](int a,int b){
+                return scores[a]>scores[b] || (scores[a]==scores[b] && a<b);
+            });
+            double tolerance=std::max(1e-6,magnitude*3e-6);
+            std::vector<bool> seen(valid,false);
+            for (int i=0;i<top;++i) {
+                int key=got[(size_t)row*top+i];
+                if (i >= keep) {
+                    Require(key == -1, "Indexer invalid output padding");
+                    continue;
+                }
+                Require(key>=0&&key<valid,"Indexer selected a future/out-of-range key");
+                Require(!seen[key], "Indexer selected a duplicate key");
+                seen[key] = true;
+                Require(std::abs(scores[key]-scores[order[i]])<=tolerance,
+                        "Indexer ranking differs from independent FP64 reference");
+                if (mode==2||mode==3) Require(key==i,"Indexer equal-score tie order changed");
+            }
+        }
+        ++checks;
+    }
+}
+
 int main(int argc,char **argv) {
     int devices=0;if(cudaGetDeviceCount(&devices)!=cudaSuccess || !devices) return 77;
     if (argc == 2 && std::strcmp(argv[1], "--invalid-indexer") == 0) {
@@ -587,7 +693,7 @@ int main(int argc,char **argv) {
                 "usage: naive_n05_decode_test [--quick]");
         quick = argc == 2;
         SetThreads(4);
-        TestTopK(); TestBatchedTopK(); TestCache(); TestCacheReservation(); TestRopeWidths(); TestAttentionWidths(); TestAttentionSelectedValues(); TestAttentionGroupedScores(); TestAttentionGlobalMma(); TestAttentionSwa();
+        TestTopK(); TestBatchedTopK(); TestIndexer(); TestCache(); TestCacheReservation(); TestRopeWidths(); TestAttentionWidths(); TestAttentionSelectedValues(); TestAttentionGroupedScores(); TestAttentionGlobalMma(); TestAttentionSwa();
         Require(cudaDeviceSynchronize()==cudaSuccess,"CUDA final synchronization failed");
         std::printf("Naive decode regression passed: %d cases\n",checks);
     }catch(const std::exception&e){std::fprintf(stderr,"%s\n",e.what());return 1;}
