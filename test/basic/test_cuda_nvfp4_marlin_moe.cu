@@ -1,5 +1,5 @@
 // Standalone regression for BF16 row-packed NVFP4 grouped Marlin.
-// Exercises independent gate/up globals, sparse routing, both tile sizes,
+// Exercises independent gate/up globals, sparse routing, all three tile sizes,
 // CUDA Graph replay, rejected layouts and cache retirement/address reuse.
 #include "fastllm.h"
 #include "devices/cuda/fastllm-cuda.cuh"
@@ -24,7 +24,8 @@ struct Fixture {
     std::vector<Data *> weights;
     std::vector<std::vector<float>> decoded;
     Fixture(int seed, bool invalid = false, bool planar = false,
-            int hidden = 256, int intermediate = 128, int experts = 16)
+            int hidden = 256, int intermediate = 128, int experts = 16,
+            bool variedScales = false)
         : hidden(hidden), intermediate(intermediate), experts(experts), weights(2 + experts * 2, nullptr) {
         const int H=hidden,I=intermediate,E=experts;
         for (int e = 0; e < E; ++e) for (int matrix = 0; matrix < 2; ++matrix) {
@@ -41,13 +42,18 @@ struct Fixture {
                     if (r == 0 || (!matrix && r == I)) d->scales.push_back(global);
                 } else std::memcpy(bytes + r * stride, &global, 4);
                 for (int g = 0; g < k / 16; ++g) {
-                    bytes[planar ? n * k / 2 + r * (k / 16) + g : r * stride + 12 + g * 9] = (invalid && r == 0 && g == 0) ? 1 : 56; // E4M3 1
+                    const int scaleExponent = variedScales
+                        ? int(Mix(r * (k / 16) + g + e * 719 + seed) % 5) - 2 : 0;
+                    const unsigned char scaleCode = (7 + scaleExponent) * 8;
+                    const float scale = std::ldexp(1.f, scaleExponent);
+                    bytes[planar ? n * k / 2 + r * (k / 16) + g : r * stride + 12 + g * 9] =
+                        (invalid && r == 0 && g == 0) ? 1 : scaleCode;
                     for (int j = 0; j < 8; ++j) {
                         int c0 = Mix(r * k + g * 16 + j * 2 + e * n * k + seed * 719) % 16;
                         int c1 = Mix(r * k + g * 16 + j * 2 + 1 + e * n * k + seed * 719) % 16;
                         bytes[planar ? r * (k / 2) + g * 8 + j : r * stride + 4 + g * 9 + j] = c0 | (c1 << 4);
-                        full[r * k + g * 16 + j * 2] = global * Code(c0);
-                        full[r * k + g * 16 + j * 2 + 1] = global * Code(c1);
+                        full[r * k + g * 16 + j * 2] = global * scale * Code(c0);
+                        full[r * k + g * 16 + j * 2 + 1] = global * scale * Code(c1);
                     }
                 }
             }
@@ -55,7 +61,7 @@ struct Fixture {
         }
     }
 };
-static void Run(Fixture &f, int m, int topk) {
+static void Run(Fixture &f, int m, int topk, bool spreadRoutes = false) {
     const int H=f.hidden,I=f.intermediate,E=f.experts;
     bool bf16 = f.weights[2]->dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED;
     DataType dtype = bf16 ? DataType::BFLOAT16 : DataType::FLOAT16;
@@ -70,7 +76,9 @@ static void Run(Fixture &f, int m, int topk) {
         else ((half *)x.cpuData)[i] = __float2half_rn(xf[i]);
     }
     for (int i = 0; i < m * topk; ++i) {
-        ix[i] = (i / topk % 5 + (i % topk) * 3) % E; // include unused experts
+        ix[i] = spreadRoutes
+            ? (Mix(i / topk + 319) % E + (i % topk) * 31) % E
+            : (i / topk % 5 + (i % topk) * 3) % E; // include unused experts
         sf[i] = 1.f / topk + (i % topk) * .013f;
         ((int *)ids.cpuData)[i] = ix[i]; ((float *)scores.cpuData)[i] = sf[i];
     }
@@ -105,8 +113,27 @@ static void Run(Fixture &f, int m, int topk) {
     cudaGraph_t graph; cudaGraphExec_t exec;
     Cuda(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal)); call();
     Cuda(cudaStreamEndCapture(cudaStreamPerThread,&graph)); Cuda(cudaGraphInstantiate(&exec,graph,nullptr,nullptr,0));
-    for (int i=0;i<3;++i) { Cuda(cudaGraphLaunch(exec,cudaStreamPerThread)); Cuda(cudaStreamSynchronize(cudaStreamPerThread));
-        Cuda(cudaMemcpy(replay.data(),y.cudaData,replay.size()*2,cudaMemcpyDeviceToHost)); Check(std::memcmp(actual.data(),replay.data(),actual.size()*2)==0,"graph result changed"); }
+    std::vector<__nv_bfloat16> changedInput(spreadRoutes ? m * H : 0);
+    for (int i = 0; i < 3; ++i) {
+        if (spreadRoutes) {
+            // Replay captured metadata/GEMMs with new routes, scores and input.
+            for (auto &expert : ix) expert = (expert + 3) % E;
+            for (auto &score : sf) score *= .875f;
+            for (int j = 0; j < m * H; ++j) {
+                xf[j] = Round(-xf[j] * .9375f);
+                changedInput[j] = __float2bfloat16_rn(xf[j]);
+            }
+            Cuda(cudaMemcpyAsync(x.cudaData,changedInput.data(),m*H*2,cudaMemcpyHostToDevice,cudaStreamPerThread));
+            Cuda(cudaMemcpyAsync(ids.cudaData,ix.data(),ix.size()*4,cudaMemcpyHostToDevice,cudaStreamPerThread));
+            Cuda(cudaMemcpyAsync(scores.cudaData,sf.data(),sf.size()*4,cudaMemcpyHostToDevice,cudaStreamPerThread));
+            call(); Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+            Cuda(cudaMemcpy(actual.data(),y.cudaData,actual.size()*2,cudaMemcpyDeviceToHost));
+        }
+        Cuda(cudaGraphLaunch(exec,cudaStreamPerThread));
+        Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+        Cuda(cudaMemcpy(replay.data(),y.cudaData,replay.size()*2,cudaMemcpyDeviceToHost));
+        Check(std::memcmp(actual.data(),replay.data(),actual.size()*2)==0,"graph result changed");
+    }
     Cuda(cudaGraphExecDestroy(exec)); Cuda(cudaGraphDestroy(graph));
     std::printf("dtype=%s m=%d topk=%d FP64_nrmse=%.8g graph=bitwise_equal\n",bf16 ? "bf16" : "fp16",m,topk,nrmse);
 }
@@ -116,6 +143,11 @@ int main(int argc, char **argv) { try {
         cudaGetDeviceProperties(&prop,0) != cudaSuccess || prop.major < 8 ||
         prop.sharedMemPerBlockOptin < 71680) return 77;
     FastllmCudaSetDevice(0); SetThreads(4);
+    if (argc == 2 && std::strcmp(argv[1], "--narrow-prefill") == 0) {
+        Fixture narrow(19,false,false,256,256,16,true);
+        for (int m : {9,32,33,32}) Run(narrow,m,8,true);
+        std::puts("Narrow prefill boundary PASS"); return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--route-capacity") == 0) {
         Fixture legacy(9,false,true); Run(legacy,9,16);
         std::puts("Route capacity boundary PASS"); return 0;
@@ -125,5 +157,11 @@ int main(int argc, char **argv) { try {
     for(int pass=0;pass<2;++pass) { Fixture f(3+pass); for(int m:{1,8,9,10,32,33,129}) Run(f,m,2); Run(f,1,8); }
     { Fixture legacy(9,false,true); Run(legacy,1,2); Run(legacy,129,2); Run(legacy,9,16); }
     { Fixture alternate(11,false,false,512,256,7); Run(alternate,1,1); Run(alternate,9,7); Run(alternate,65,3); }
+    { Fixture narrow(19,false,false,256,256,256,true);
+      for (int m : {128,129,255,256,511,512,513,1024}) Run(narrow,m,8,true); }
+    // Gate/up halves of 128 columns must retain the old 128-column tile.
+    { Fixture unaligned(29,false,false,256,128,16,true); Run(unaligned,32,8,true); }
+    { Fixture uneven(23,false,false,512,256,7,true);
+      for (int m : {9,10,37,38,10}) Run(uneven,m,3,true); }
     Cuda(cudaDeviceSynchronize()); std::puts("PASS"); return 0;
 } catch(const std::exception &e) { std::fprintf(stderr,"FAIL: %s\n",e.what()); return 1; } }
