@@ -688,6 +688,51 @@ __global__ void AttentionValues(const float *prob, const BF16 *v, const int *ind
     }
 }
 
+constexpr int kDecodePVKeys = 2048;
+constexpr int kDecodePVValueDim = 128;
+constexpr int kDecodePVParts = 32;
+
+// Decode has just one query. Split its 2048 selected keys across CTAs so
+// every thread accumulates one value column, then combine FP32 partial sums.
+// Inputs/probability rounding and BF16 output are unchanged; the FP32 sum order
+// differs from the serial fallback. Prefill and other shapes keep their paths.
+__global__ void AttentionValuesDecodePartial(const float *prob, const BF16 *v,
+        const int *indices, float *partial, int heads, int kvHeads,
+        int keys, int past, bool causal) {
+    constexpr int count = kDecodePVKeys, dim = kDecodePVValueDim;
+    constexpr int parts = kDecodePVParts, slots = count / parts;
+    int h = blockIdx.x, part = blockIdx.y, d = threadIdx.x;
+    int kvHead = h / (heads / kvHeads);
+    float sum = 0;
+    for (int base = part * slots; base < (part + 1) * slots; base += 8) {
+        float probabilities[8], values[8];
+        bool valid[8];
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            int slot = base + i, key = indices ? indices[slot] : slot;
+            valid[i] = key >= 0 && key < keys && (!causal || key <= past);
+            probabilities[i] = prob[h * count + slot];
+            values[i] = valid[i] ? (float)v[((size_t)key * kvHeads + kvHead) * dim + d] : 0;
+        }
+        #pragma unroll
+        for (int i = 0; i < 8; ++i)
+            if (valid[i]) sum = fmaf(probabilities[i], values[i], sum);
+    }
+    partial[(h * parts + part) * dim + d] = sum;
+}
+
+__global__ void AttentionValuesDecodeReduce(const float *partial, BF16 *out, int heads) {
+    constexpr int dim = kDecodePVValueDim, parts = kDecodePVParts;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= heads * dim) return;
+    int h = i / dim, d = i % dim;
+    float sum = 0;
+    #pragma unroll
+    for (int part = 0; part < parts; ++part)
+        sum += partial[(h * parts + part) * dim + d];
+    out[i] = __float2bfloat16(sum);
+}
+
 // Cooperatively stage a tile of V instead of issuing one dependent global
 // load for each of 2048 slots. Output dimensions form separate CTAs; each
 // output keeps exactly the original slot order and FP32 FMA accumulation.
@@ -1000,7 +1045,16 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
             heads, kvHeads, keys, count, pastLength, causal);
     } else
 #endif
-    if (queries == 1) {
+    if (queries == 1 && window == 0 && count == kDecodePVKeys &&
+        valueDim == kDecodePVValueDim && heads >= 32) {
+        Data partial;
+        Output(partial, FLOAT32, {heads, kDecodePVParts, kDecodePVValueDim});
+        AttentionValuesDecodePartial<<<dim3(heads, kDecodePVParts), kDecodePVValueDim>>>((const float *)scores.cudaData,
+            (const BF16 *)value.cudaData, selected, (float *)partial.cudaData,
+            heads, kvHeads, keys, pastLength, causal);
+        AttentionValuesDecodeReduce<<<(heads * kDecodePVValueDim + 255) / 256, 256>>>(
+            (const float *)partial.cudaData, (BF16 *)output.cudaData, heads);
+    } else if (queries == 1) {
         AttentionValuesTiled<<<dim3(heads, queries, (valueDim + 31) / 32), 256>>>((const float *)scores.cudaData,
             (const BF16 *)value.cudaData, selected, (BF16 *)output.cudaData,
             heads, kvHeads, valueDim, keys, count, pastLength, window, causal);

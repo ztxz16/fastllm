@@ -438,10 +438,15 @@ static void TestAttentionGlobalMma() {
     struct Shape { int rows, keys, count, heads, kvHeads, padding; bool selected; };
     for (auto s : {Shape{32,512,512,64,4,0,false}, Shape{33,515,513,64,4,128,true},
                    Shape{32,2048,2051,64,4,0,true}, Shape{64,2048,2048,32,1,8,true},
-                   Shape{32,515,257,128,4,128,true}, Shape{32,4096,2048,64,4,128,true}})
+                   Shape{32,515,257,128,4,128,true}, Shape{32,4096,2048,64,4,128,true},
+                   // Decode split-PV dispatch and adjacent serial fallbacks.
+                   Shape{1,2048,2048,64,4,128,false}, Shape{1,32768,2048,64,4,128,true},
+                   Shape{1,4099,2048,32,1,0,true}, Shape{1,4099,2048,31,1,0,true},
+                   Shape{1,4099,2047,64,4,128,true}, Shape{1,4099,2049,64,4,128,true}})
     for (bool causal : {false,true}) for (int mode=0;mode<5;++mode) {
         constexpr int dim=192,valueDim=128;
-        int past=s.keys-s.rows,stride=s.kvHeads*dim+s.padding;
+        int past = s.rows == 1 && s.padding == 0 ? s.keys - 67 : s.keys - s.rows;
+        int stride = s.kvHeads * dim + s.padding;
         Data q(BFLOAT16),k(BFLOAT16),v(BFLOAT16),indices(INT32),sink(FLOAT32),out;
         Upload(q,{1,s.rows,s.heads*dim},53); Upload(k,{1,s.keys,stride},71);
         Upload(v,{1,s.keys,s.kvHeads*valueDim},113);
@@ -462,7 +467,7 @@ static void TestAttentionGlobalMma() {
             indices.Resize({s.rows,s.count});indices.Allocate();
             for (int r=0;r<s.rows;++r) for (int slot=0;slot<s.count;++slot) {
                 int key=(slot*137+r*13)%s.keys;
-                if (slot%97==0 || r==0 || mode==4) key=-1;
+                if (slot%97==0 || (r==0 && s.rows>1) || mode==4) key=-1;
                 else if (slot%193==1) key=s.keys+7;
                 selected[r*s.count+slot]=key;
             }
@@ -681,6 +686,62 @@ static void TestIndexer() {
     }
 }
 
+// Replays change Q/K/V, routing scores, and historical key contents. Cached
+// workspaces must not turn these launches into stale-input computations.
+static void TestDecodeGraphs() {
+    auto Put = [](const Data &data, const auto &values) {
+        Require(cudaMemcpyAsync(data.cudaData, values.data(), values.size() * sizeof(values[0]),
+            cudaMemcpyHostToDevice, cudaStreamPerThread) == cudaSuccess, "decode graph input update");
+    };
+    auto Capture = [](auto call) {
+        cudaGraph_t graph;
+        cudaGraphExec_t exec;
+        Require(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal) == cudaSuccess,
+                "decode graph begin");
+        call();
+        Require(cudaStreamEndCapture(cudaStreamPerThread, &graph) == cudaSuccess, "decode graph end");
+        Require(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0) == cudaSuccess, "decode graph instantiate");
+        cudaGraphDestroy(graph);
+        return exec;
+    };
+    auto Replay = [](cudaGraphExec_t exec) {
+        Require(cudaGraphLaunch(exec, cudaStreamPerThread) == cudaSuccess, "decode graph launch");
+        Require(cudaStreamSynchronize(cudaStreamPerThread) == cudaSuccess, "decode graph sync");
+    };
+    {
+        constexpr int keys = 4099, heads = 64, kvHeads = 4, dim = 192, valueDim = 128, count = 2048;
+        Data q(BFLOAT16), k(BFLOAT16), v(BFLOAT16), indices(INT32), sink(FLOAT32), actual, expected;
+        Upload(q, {1, 1, heads * dim}, 711);
+        Upload(k, {1, keys, kvHeads * dim + 128}, 713);
+        Upload(v, {1, keys, kvHeads * valueDim}, 715);
+        Upload(sink, {heads}, 717);
+        indices.Resize({1, count});
+        indices.Allocate();
+        for (int i = 0; i < count; ++i) ((int *)indices.cpuData)[i] = (i * 137) % keys;
+        indices.ToDevice(DataDevice::CUDA, {0}, true);
+        auto call = [&](Data &out) {
+            FastllmCudaNaiveAttention(q, k, v, indices, sink, heads, kvHeads, dim, valueDim, keys - 65, 0, out);
+        };
+        call(actual);
+        Require(cudaDeviceSynchronize() == cudaSuccess, "PV graph warmup");
+        auto graph = Capture([&]() { call(actual); });
+        auto qb = Read<uint16_t>(q), vb = Read<uint16_t>(v);
+        auto ids = Read<int>(indices);
+        for (int seed = 1; seed <= 3; ++seed) {
+            for (auto &x : qb) x ^= 0x8000;
+            for (size_t i = seed; i < vb.size(); i += 17) vb[i] ^= 0x8000;
+            for (int i = 0; i < count; ++i) ids[i] = i % 97 == 0 ? -1 : (i * 137 + seed * 43) % keys;
+            Put(q, qb); Put(v, vb); Put(indices, ids);
+            call(expected);
+            auto reference = Read<uint16_t>(expected);
+            Replay(graph);
+            Require(Read<uint16_t>(actual) == reference, "PV graph differs from eager after input update");
+            ++checks;
+        }
+        cudaGraphExecDestroy(graph);
+    }
+}
+
 int main(int argc,char **argv) {
     int devices=0;if(cudaGetDeviceCount(&devices)!=cudaSuccess || !devices) return 77;
     if (argc == 2 && std::strcmp(argv[1], "--invalid-indexer") == 0) {
@@ -689,11 +750,18 @@ int main(int argc,char **argv) {
         std::fprintf(stderr,"Invalid Indexer width was accepted\n"); return 1;
     }
     try {
-        Require(argc == 1 || (argc == 2 && std::strcmp(argv[1], "--quick") == 0),
-                "usage: naive_n05_decode_test [--quick]");
-        quick = argc == 2;
+        bool graphsOnly = argc == 2 && std::strcmp(argv[1], "--decode-graphs") == 0;
+        quick = argc == 2 && std::strcmp(argv[1], "--quick") == 0;
+        Require(argc == 1 || quick || graphsOnly,
+                "usage: naive_n05_decode_test [--quick|--decode-graphs]");
         SetThreads(4);
-        TestTopK(); TestBatchedTopK(); TestIndexer(); TestCache(); TestCacheReservation(); TestRopeWidths(); TestAttentionWidths(); TestAttentionSelectedValues(); TestAttentionGroupedScores(); TestAttentionGlobalMma(); TestAttentionSwa();
+        if (!graphsOnly) {
+            TestTopK(); TestBatchedTopK(); TestIndexer();
+            TestCache(); TestCacheReservation(); TestRopeWidths();
+            TestAttentionWidths(); TestAttentionSelectedValues(); TestAttentionGroupedScores();
+            TestAttentionGlobalMma(); TestAttentionSwa();
+        }
+        TestDecodeGraphs();
         Require(cudaDeviceSynchronize()==cudaSuccess,"CUDA final synchronization failed");
         std::printf("Naive decode regression passed: %d cases\n",checks);
     }catch(const std::exception&e){std::fprintf(stderr,"%s\n",e.what());return 1;}
