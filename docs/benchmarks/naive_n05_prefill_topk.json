@@ -1,0 +1,811 @@
+{
+  "libraries": {
+    "baseline": "0f838d0343c879aa3cd354543ef13d321c8610fb2459b019daa931a4a7b670cb",
+    "fixed": "db57da6ae7d5fc9ae31d2104c164d98d8daba04ed9fe7bd3c5b677c1f9f99b10"
+  },
+  "order": [
+    "A1",
+    "B1",
+    "B2",
+    "A2"
+  ],
+  "cases": [
+    {
+      "case": "explanation",
+      "input_tokens": 56,
+      "baseline": {
+        "samples": 4,
+        "ttft_seconds": 0.07789821998449042,
+        "ttft_range": [
+          0.07739136001328006,
+          0.07810400001471862
+        ],
+        "decode_tok_s": 66.86376623767755,
+        "decode_range": [
+          66.85751806096054,
+          66.88188577434597
+        ],
+        "output_sha256": [
+          "df953f35789e40435c23416e2689d828374ec010795fd1ba65de8cb25ce19c00"
+        ],
+        "output_tokens": [
+          60
+        ],
+        "code_check": null
+      },
+      "fixed": {
+        "samples": 4,
+        "ttft_seconds": 0.07774971998878755,
+        "ttft_range": [
+          0.07753215997945517,
+          0.07782735995715484
+        ],
+        "decode_tok_s": 66.89717564967712,
+        "decode_range": [
+          66.87131556115114,
+          66.93807066621928
+        ],
+        "output_sha256": [
+          "df953f35789e40435c23416e2689d828374ec010795fd1ba65de8cb25ce19c00"
+        ],
+        "output_tokens": [
+          60
+        ],
+        "code_check": null
+      },
+      "ttft_speedup": 1.0019099746690314,
+      "ttft_reduction_pct": 0.1906333620106393,
+      "decode_change_pct": 0.0499663926809113
+    },
+    {
+      "case": "context-short",
+      "input_tokens": 80,
+      "baseline": {
+        "samples": 4,
+        "ttft_seconds": 0.09381545998621732,
+        "ttft_range": [
+          0.0934887999901548,
+          0.09396168001694605
+        ],
+        "decode_tok_s": 65.1011574653007,
+        "decode_range": [
+          65.08498912679688,
+          65.13636316584297
+        ],
+        "output_sha256": [
+          "625647b8667c3c81662fd1a28ece2a83d34ca6ef80c407b16b1832bfd0010951"
+        ],
+        "output_tokens": [
+          69
+        ],
+        "code_check": {
+          "passed": true,
+          "checks": 980
+        }
+      },
+      "fixed": {
+        "samples": 4,
+        "ttft_seconds": 0.0938253200147301,
+        "ttft_range": [
+          0.0935332000372,
+          0.09397955995518714
+        ],
+        "decode_tok_s": 65.15003347324605,
+        "decode_range": [
+          65.12557091476845,
+          65.16380282958723
+        ],
+        "output_sha256": [
+          "625647b8667c3c81662fd1a28ece2a83d34ca6ef80c407b16b1832bfd0010951"
+        ],
+        "output_tokens": [
+          69
+        ],
+        "code_check": {
+          "passed": true,
+          "checks": 980
+        }
+      },
+      "ttft_speedup": 0.9998949107926173,
+      "ttft_reduction_pct": -0.01051002522849398,
+      "decode_change_pct": 0.07507701836393377
+    },
+    {
+      "case": "context-7k5",
+      "input_tokens": 7565,
+      "baseline": {
+        "samples": 4,
+        "ttft_seconds": 6.6387083400040865,
+        "ttft_range": [
+          6.6321964399539866,
+          6.640195999993011
+        ],
+        "decode_tok_s": 54.42121034279894,
+        "decode_range": [
+          54.394518773948846,
+          54.4603577595281
+        ],
+        "output_sha256": [
+          "625647b8667c3c81662fd1a28ece2a83d34ca6ef80c407b16b1832bfd0010951"
+        ],
+        "output_tokens": [
+          69
+        ],
+        "code_check": {
+          "passed": true,
+          "checks": 980
+        }
+      },
+      "fixed": {
+        "samples": 4,
+        "ttft_seconds": 5.277504899975611,
+        "ttft_range": [
+          5.276020560006145,
+          5.279446200001985
+        ],
+        "decode_tok_s": 53.85532746128753,
+        "decode_range": [
+          53.850093187499766,
+          53.882707044034575
+        ],
+        "output_sha256": [
+          "625647b8667c3c81662fd1a28ece2a83d34ca6ef80c407b16b1832bfd0010951"
+        ],
+        "output_tokens": [
+          69
+        ],
+        "code_check": {
+          "passed": true,
+          "checks": 980
+        }
+      },
+      "ttft_speedup": 1.2579255663097093,
+      "ttft_reduction_pct": 20.50404039933523,
+      "decode_change_pct": -1.0398204632842911
+    },
+    {
+      "case": "context-32k",
+      "input_tokens": 32727,
+      "baseline": {
+        "samples": 2,
+        "ttft_seconds": 47.07172104000347,
+        "ttft_range": [
+          47.06421176000731,
+          47.079230319999624
+        ],
+        "decode_tok_s": 52.655628229648,
+        "decode_range": [
+          52.65052172565808,
+          52.66073473363793
+        ],
+        "output_sha256": [
+          "2d9ed45554582128b9cef42ae3e47b0d347c26b91059a97676ace58aeae6d533"
+        ],
+        "output_tokens": [
+          69
+        ],
+        "code_check": {
+          "passed": true,
+          "checks": 980
+        }
+      },
+      "fixed": {
+        "samples": 2,
+        "ttft_seconds": 27.567033799976343,
+        "ttft_range": [
+          27.564333239977714,
+          27.569734359974973
+        ],
+        "decode_tok_s": 50.96250295992202,
+        "decode_range": [
+          50.941317640043316,
+          50.98368827980073
+        ],
+        "output_sha256": [
+          "2d9ed45554582128b9cef42ae3e47b0d347c26b91059a97676ace58aeae6d533"
+        ],
+        "output_tokens": [
+          69
+        ],
+        "code_check": {
+          "passed": true,
+          "checks": 980
+        }
+      },
+      "ttft_speedup": 1.707536667947346,
+      "ttft_reduction_pct": 41.43610390504151,
+      "decode_change_pct": -3.2154687478833655
+    }
+  ],
+  "indexer_differential": [
+    {
+      "kind": "differential",
+      "rows": 1,
+      "keys": 32768,
+      "fp8": 0,
+      "bitwise_equal": true
+    },
+    {
+      "kind": "differential",
+      "rows": 1,
+      "keys": 32768,
+      "fp8": 1,
+      "bitwise_equal": true
+    },
+    {
+      "kind": "differential",
+      "rows": 2,
+      "keys": 7,
+      "fp8": 0,
+      "bitwise_equal": true
+    },
+    {
+      "kind": "differential",
+      "rows": 2,
+      "keys": 7,
+      "fp8": 1,
+      "bitwise_equal": true
+    },
+    {
+      "kind": "differential",
+      "rows": 33,
+      "keys": 2049,
+      "fp8": 0,
+      "bitwise_equal": true
+    },
+    {
+      "kind": "differential",
+      "rows": 33,
+      "keys": 2049,
+      "fp8": 1,
+      "bitwise_equal": true
+    },
+    {
+      "kind": "differential",
+      "rows": 512,
+      "keys": 8192,
+      "fp8": 0,
+      "bitwise_equal": true
+    },
+    {
+      "kind": "differential",
+      "rows": 512,
+      "keys": 8192,
+      "fp8": 1,
+      "bitwise_equal": true
+    },
+    {
+      "kind": "differential",
+      "rows": 512,
+      "keys": 32768,
+      "fp8": 0,
+      "bitwise_equal": true
+    },
+    {
+      "kind": "differential",
+      "rows": 512,
+      "keys": 32768,
+      "fp8": 1,
+      "bitwise_equal": true
+    }
+  ],
+  "indexer_microbenchmark": [
+    {
+      "keys": 8192,
+      "queries": 512,
+      "baseline": {
+        "samples": 10,
+        "wall_ms_median": 24.1321,
+        "event_ms_median": 24.12555
+      },
+      "fixed": {
+        "samples": 10,
+        "wall_ms_median": 6.0074000000000005,
+        "event_ms_median": 6.000640000000001
+      },
+      "wall_speedup": 4.017062289842527
+    },
+    {
+      "keys": 16384,
+      "queries": 512,
+      "baseline": {
+        "samples": 10,
+        "wall_ms_median": 46.3573,
+        "event_ms_median": 46.3483
+      },
+      "fixed": {
+        "samples": 10,
+        "wall_ms_median": 9.8698,
+        "event_ms_median": 9.862974999999999
+      },
+      "wall_speedup": 4.6968834221564775
+    },
+    {
+      "keys": 32768,
+      "queries": 512,
+      "baseline": {
+        "samples": 10,
+        "wall_ms_median": 79.81475,
+        "event_ms_median": 79.79984999999999
+      },
+      "fixed": {
+        "samples": 10,
+        "wall_ms_median": 19.589599999999997,
+        "event_ms_median": 19.5785
+      },
+      "wall_speedup": 4.07434301874464
+    }
+  ],
+  "memory_snapshots": [
+    {
+      "run": "A1",
+      "version": "baseline",
+      "ready_MiB_by_device": [
+        19586,
+        22480,
+        22480,
+        22482,
+        22482,
+        22482,
+        22482,
+        23676
+      ],
+      "after_requests_MiB_by_device": [
+        19928,
+        22804,
+        22804,
+        22806,
+        22806,
+        22806,
+        22806,
+        24000
+      ],
+      "note": "nvidia-smi snapshot with allocator pool retained; not an exact peak"
+    },
+    {
+      "run": "B1",
+      "version": "fixed",
+      "ready_MiB_by_device": [
+        19586,
+        22480,
+        22482,
+        22482,
+        22482,
+        22482,
+        22482,
+        23674
+      ],
+      "after_requests_MiB_by_device": [
+        19980,
+        22856,
+        22858,
+        22858,
+        22858,
+        22858,
+        22858,
+        24050
+      ],
+      "note": "nvidia-smi snapshot with allocator pool retained; not an exact peak"
+    },
+    {
+      "run": "B2",
+      "version": "fixed",
+      "ready_MiB_by_device": [
+        19586,
+        22480,
+        22482,
+        22482,
+        22482,
+        22482,
+        22482,
+        23672
+      ],
+      "after_requests_MiB_by_device": [
+        19980,
+        22856,
+        22858,
+        22858,
+        22858,
+        22858,
+        22858,
+        24048
+      ],
+      "note": "nvidia-smi snapshot with allocator pool retained; not an exact peak"
+    },
+    {
+      "run": "A2",
+      "version": "baseline",
+      "ready_MiB_by_device": [
+        19586,
+        22480,
+        22482,
+        22482,
+        22478,
+        22478,
+        22482,
+        23674
+      ],
+      "after_requests_MiB_by_device": [
+        19928,
+        22804,
+        22806,
+        22806,
+        22802,
+        22802,
+        22806,
+        23998
+      ],
+      "note": "nvidia-smi snapshot with allocator pool retained; not an exact peak"
+    }
+  ],
+  "profile": [
+    {
+      "context_end": 1024,
+      "baseline_scope_ms": 301.08148,
+      "fixed_scope_ms": 298.1346,
+      "baseline_score_gpu_ms": 0,
+      "fixed_score_gpu_ms": 0,
+      "fixed_topk_gpu_ms": 0,
+      "baseline_score_D2H_ms": 0.0,
+      "baseline_host_gpu_idle_ms": 0.0,
+      "fixed_indexer_host_ranges": 0,
+      "fixed_indexer_CPU_transfer_bytes": 0,
+      "baseline_moe_ms": 110.35194100000001,
+      "fixed_moe_ms": 110.39064899999998
+    },
+    {
+      "context_end": 16384,
+      "baseline_scope_ms": 792.78648,
+      "fixed_scope_ms": 440.76792,
+      "baseline_score_gpu_ms": 80.31636499999999,
+      "fixed_score_gpu_ms": 80.27648199999999,
+      "fixed_topk_gpu_ms": 6.950897000000002,
+      "baseline_score_D2H_ms": 117.336584,
+      "baseline_host_gpu_idle_ms": 198.95339699999997,
+      "fixed_indexer_host_ranges": 0,
+      "fixed_indexer_CPU_transfer_bytes": 0,
+      "baseline_moe_ms": 103.89014500000003,
+      "fixed_moe_ms": 104.08379899999998
+    },
+    {
+      "context_end": 32256,
+      "baseline_scope_ms": 1095.0722,
+      "fixed_scope_ms": 532.166,
+      "baseline_score_gpu_ms": 147.68496700000003,
+      "fixed_score_gpu_ms": 148.05846400000001,
+      "fixed_topk_gpu_ms": 24.748677999999998,
+      "baseline_score_D2H_ms": 255.843686,
+      "baseline_host_gpu_idle_ms": 251.41955200000007,
+      "fixed_indexer_host_ranges": 0,
+      "fixed_indexer_CPU_transfer_bytes": 0,
+      "baseline_moe_ms": 108.99853599999992,
+      "fixed_moe_ms": 109.30631500000001
+    }
+  ],
+  "decode_profile": {
+    "families": [
+      {
+        "family": "BF16 GEMV",
+        "calls_per_token": 223.0,
+        "baseline_gpu_ms_per_token": 6.740208428571423,
+        "fixed_gpu_ms_per_token": 6.737738214285709
+      },
+      {
+        "family": "MoE Marlin gate/up GEMM",
+        "calls_per_token": 47.0,
+        "baseline_gpu_ms_per_token": 2.414760214285715,
+        "fixed_gpu_ms_per_token": 2.4151382142857156
+      },
+      {
+        "family": "MoE Marlin down GEMM",
+        "calls_per_token": 47.0,
+        "baseline_gpu_ms_per_token": 1.3325286428571423,
+        "fixed_gpu_ms_per_token": 1.3330069285714283
+      },
+      {
+        "family": "Full attention values",
+        "calls_per_token": 9.0,
+        "baseline_gpu_ms_per_token": 1.0882117857142861,
+        "fixed_gpu_ms_per_token": 1.0872025
+      },
+      {
+        "family": "KV trim",
+        "calls_per_token": 39.0,
+        "baseline_gpu_ms_per_token": 0.7823479285714274,
+        "fixed_gpu_ms_per_token": 0.7820578571428556
+      },
+      {
+        "family": "SWA attention",
+        "calls_per_token": 39.0,
+        "baseline_gpu_ms_per_token": 0.4234959285714286,
+        "fixed_gpu_ms_per_token": 0.42392357142857195
+      },
+      {
+        "family": "Indexer Top-K",
+        "calls_per_token": 108.0,
+        "baseline_gpu_ms_per_token": 0.40086507142857214,
+        "fixed_gpu_ms_per_token": 0.3996580714285718
+      },
+      {
+        "family": "Indexer scores",
+        "calls_per_token": 9.0,
+        "baseline_gpu_ms_per_token": 0.3495116428571429,
+        "fixed_gpu_ms_per_token": 0.3513913571428572
+      },
+      {
+        "family": "Router FP32 GEMV",
+        "calls_per_token": 47.0,
+        "baseline_gpu_ms_per_token": 0.20549878571428634,
+        "fixed_gpu_ms_per_token": 0.2067330000000005
+      },
+      {
+        "family": "Full attention scores",
+        "calls_per_token": 9.0,
+        "baseline_gpu_ms_per_token": 0.20353778571428569,
+        "fixed_gpu_ms_per_token": 0.20359028571428558
+      },
+      {
+        "family": "Expert selection",
+        "calls_per_token": 47.0,
+        "baseline_gpu_ms_per_token": 0.16945321428571375,
+        "fixed_gpu_ms_per_token": 0.16928385714285668
+      },
+      {
+        "family": "Indexer quantization",
+        "calls_per_token": 18.0,
+        "baseline_gpu_ms_per_token": 0.16864400000000004,
+        "fixed_gpu_ms_per_token": 0.1687335
+      },
+      {
+        "family": "RoPE",
+        "calls_per_token": 114.0,
+        "baseline_gpu_ms_per_token": 0.15553321428571415,
+        "fixed_gpu_ms_per_token": 0.1555059999999999
+      },
+      {
+        "family": "RMSNorm",
+        "calls_per_token": 97.0,
+        "baseline_gpu_ms_per_token": 0.14196978571428445,
+        "fixed_gpu_ms_per_token": 0.14195157142857
+      },
+      {
+        "family": "Residual add",
+        "calls_per_token": 96.0,
+        "baseline_gpu_ms_per_token": 0.09743071428571455,
+        "fixed_gpu_ms_per_token": 0.09748771428571443
+      },
+      {
+        "family": "MoE weighted reduce",
+        "calls_per_token": 47.0,
+        "baseline_gpu_ms_per_token": 0.05911985714285737,
+        "fixed_gpu_ms_per_token": 0.05914735714285734
+      },
+      {
+        "family": "Type conversion",
+        "calls_per_token": 67.0,
+        "baseline_gpu_ms_per_token": 0.05207085714285712,
+        "fixed_gpu_ms_per_token": 0.051775999999999954
+      },
+      {
+        "family": "Router sigmoid",
+        "calls_per_token": 47.0,
+        "baseline_gpu_ms_per_token": 0.05185114285714283,
+        "fixed_gpu_ms_per_token": 0.051817071428571414
+      },
+      {
+        "family": "Final sampling/normalization",
+        "calls_per_token": 10.0,
+        "baseline_gpu_ms_per_token": 0.04904914285714286,
+        "fixed_gpu_ms_per_token": 0.04922271428571427
+      },
+      {
+        "family": "MoE SwiGLU",
+        "calls_per_token": 47.0,
+        "baseline_gpu_ms_per_token": 0.04262857142857129,
+        "fixed_gpu_ms_per_token": 0.042594142857142823
+      },
+      {
+        "family": "Elementwise multiply",
+        "calls_per_token": 58.0,
+        "baseline_gpu_ms_per_token": 0.041846499999999745,
+        "fixed_gpu_ms_per_token": 0.04174149999999972
+      },
+      {
+        "family": "MoE route/scratch",
+        "calls_per_token": 47.0,
+        "baseline_gpu_ms_per_token": 0.036596428571428204,
+        "fixed_gpu_ms_per_token": 0.03657821428571388
+      },
+      {
+        "family": "Full attention softmax",
+        "calls_per_token": 9.0,
+        "baseline_gpu_ms_per_token": 0.018843428571428584,
+        "fixed_gpu_ms_per_token": 0.018784071428571435
+      },
+      {
+        "family": "Dense FFN SiLU",
+        "calls_per_token": 1.0,
+        "baseline_gpu_ms_per_token": 0.0008960000000000003,
+        "fixed_gpu_ms_per_token": 0.0009051428571428575
+      }
+    ],
+    "scalar_stats": {
+      "baseline": {
+        "wall_ms": {
+          "mean": 30.007845714285715,
+          "median": 29.914099999999998,
+          "min": 29.79944,
+          "max": 30.38708
+        },
+        "gpu_active_union_ms": {
+          "mean": 15.3235225,
+          "median": 15.321466000000001,
+          "min": 15.309179,
+          "max": 15.342552
+        },
+        "gpu_kernel_sum_ms": {
+          "mean": 15.026899071428572,
+          "median": 15.0251305,
+          "min": 15.014491,
+          "max": 15.045241
+        },
+        "gpu_copy_sum_ms": {
+          "mean": 0.2513664285714286,
+          "median": 0.251007,
+          "min": 0.249888,
+          "max": 0.256704
+        },
+        "gpu_idle_ms": {
+          "mean": 14.684323214285714,
+          "median": 14.59133,
+          "min": 14.477077000000001,
+          "max": 15.059445
+        },
+        "host_select_alloc_ms": {
+          "mean": 0.0,
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0
+        },
+        "host_select_gpu_overlap_ms": {
+          "mean": 0.0,
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0
+        },
+        "other_gap_ms": {
+          "mean": 14.684323214285714,
+          "median": 14.59133,
+          "min": 14.477077000000001,
+          "max": 15.059445
+        },
+        "kernels": {
+          "mean": 1282,
+          "median": 1282.0,
+          "min": 1282,
+          "max": 1282
+        },
+        "copies": {
+          "mean": 242,
+          "median": 242.0,
+          "min": 242,
+          "max": 242
+        },
+        "indexer_host_ranges": {
+          "mean": 0,
+          "median": 0.0,
+          "min": 0,
+          "max": 0
+        },
+        "indexer_wall_ms": {
+          "mean": 1.7092114285714286,
+          "median": 1.69892,
+          "min": 1.63536,
+          "max": 1.78776
+        }
+      },
+      "fixed": {
+        "wall_ms": {
+          "mean": 33.69892,
+          "median": 33.596900000000005,
+          "min": 33.29376,
+          "max": 34.37116
+        },
+        "gpu_active_union_ms": {
+          "mean": 15.323506785714287,
+          "median": 15.322962,
+          "min": 15.31456,
+          "max": 15.332708
+        },
+        "gpu_kernel_sum_ms": {
+          "mean": 15.025968857142857,
+          "median": 15.026399,
+          "min": 15.018401,
+          "max": 15.036516
+        },
+        "gpu_copy_sum_ms": {
+          "mean": 0.25224885714285716,
+          "median": 0.251023,
+          "min": 0.249824,
+          "max": 0.259104
+        },
+        "gpu_idle_ms": {
+          "mean": 18.375413214285715,
+          "median": 18.2694915,
+          "min": 17.978341,
+          "max": 19.054332000000002
+        },
+        "host_select_alloc_ms": {
+          "mean": 0.0,
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0
+        },
+        "host_select_gpu_overlap_ms": {
+          "mean": 0.0,
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0
+        },
+        "other_gap_ms": {
+          "mean": 18.375413214285715,
+          "median": 18.2694915,
+          "min": 17.978341,
+          "max": 19.054332000000002
+        },
+        "kernels": {
+          "mean": 1282,
+          "median": 1282.0,
+          "min": 1282,
+          "max": 1282
+        },
+        "copies": {
+          "mean": 242,
+          "median": 242.0,
+          "min": 242,
+          "max": 242
+        },
+        "indexer_host_ranges": {
+          "mean": 0,
+          "median": 0.0,
+          "min": 0,
+          "max": 0
+        },
+        "indexer_wall_ms": {
+          "mean": 1.811762857142857,
+          "median": 1.8117,
+          "min": 1.77356,
+          "max": 1.84708
+        }
+      }
+    },
+    "cuda_api_ms_per_token": {
+      "baseline": {
+        "cuKernelGetName": 0.4259657142857147,
+        "cudaLaunchKernel_ptsz_v7000": 10.147705714285712,
+        "cudaMemcpy2D_ptds_v7000": 1.3134114285714285,
+        "cudaMemcpyPeer_v4000": 0.8771514285714286,
+        "cudaMemcpy_ptds_v7000": 1.2664057142857141,
+        "cudaMemsetAsync_ptsz_v7000": 0.4386085714285714
+      },
+      "fixed": {
+        "cuKernelGetName": 0.5101171428571423,
+        "cudaLaunchKernel_ptsz_v7000": 11.510174285714282,
+        "cudaMemcpy2D_ptds_v7000": 1.5258085714285714,
+        "cudaMemcpyPeer_v4000": 0.8680714285714286,
+        "cudaMemcpy_ptds_v7000": 1.2944457142857142,
+        "cudaMemsetAsync_ptsz_v7000": 0.45193714285714287
+      }
+    },
+    "interpretation": "GPU kernel time and counts are essentially unchanged. Profile host gaps and API submission time increase, but historical instrumented captures are not a controlled attribution of the 1.04–3.22% unprofiled decode regression; the precise CPU-side cause remains unisolated."
+  },
+  "request_count": 48,
+  "formal_request_count": 28,
+  "notes": [
+    "Full-model benchmark has no profiler or concurrent compilation/GPU polling; warmup requests excluded.",
+    "Baseline is Marlin V2, not the earlier SIMT implementation. Both versions were remeasured in A/B/B/A order.",
+    "Profile baseline is the preceding same-host/same-input capture; candidate capture is new. Profile wall time includes instrumentation overhead.",
+    "Microbenchmarks use synthetic BF16 Indexer inputs with identical index outputs against independently compiled prior code; whole-model speed comes from the server benchmark.",
+    "This change preserves score computation and stable selected-index order, and all benchmark text matches. This is not a new broad quality evaluation."
+  ]
+}

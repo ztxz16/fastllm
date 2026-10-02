@@ -1166,3 +1166,168 @@ down 从 806–919 提高到 1125–1370 GB/s；峰值利用率分别为 71.38�
 
 配置、逐次范围、库哈希与整理后验证记录见
 [MoE 解码测量数据](benchmarks/naive_n05_moe_decode.json)。
+
+## BF16 NVFP4 grouped Marlin（2026-10-01）
+
+CUDA 的 packed E4M3 NVFP4 专家现在优先使用仓库内 grouped Marlin W4A16，
+覆盖 prefill 和普通 decode，无新增 vLLM/PyTorch 依赖或环境开关。
+仅标准无 bias SwiGLU、支持的形状及可无损编码的 scale 使用此路径。
+权重首次准备时检查每个 gate/up/down 的 global 在全部行保持一致，保留原 FP4 和
+E4M3 block scale。gate/up 在输出首次 BF16 舍入前各自应用原始 global，
+down 使用原始 global，并在归约时用 FP32 路由分数加权。
+BF16 Marlin 的 global 指数补偿为 `2^119`。Tensor Core 累加与中间舍入和原生
+SIMT 路径不同，不承诺逐 bit 等价。
+
+源权重独立分配，成功重排后释放；prefill/decode 共用一份 canonical 布局。
+显存不足以并存一层两种布局时使用 CPU staging。模型析构时清理 Marlin cache，
+准备失败且源权重仍在时保留原生回退；源布局释放后不允许静默回退。
+
+完整 Naive NVFP4、8×RTX 5090 按层执行、CUDA13.1/sm120f，
+`--max_batch 1 --mtp 0`、chunk512、16线程、context65536，关闭历史和前缀缓存。
+原生A1/A2先测，修订后的Marlin C1/C2随后测（同一会话，非交错）；
+每版两个进程，短/7.5K各4次正式请求、32K各2次，
+另有各场景预热。模型加载和预热不计入下表。
+
+| 输入 token | 原生 TTFT/s | Marlin TTFT/s | TTFT 加速 | 原生 decode tok/s | Marlin decode tok/s | decode 变化 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 56 | 0.2793 | 0.0778 | 3.59× | 67.96 | 66.89 | -1.56% |
+| 80 | 0.3966 | 0.0937 | 4.23× | 66.39 | 65.14 | -1.87% |
+| 7565 | 18.7200 | 6.6319 | 2.82× | 55.41 | 54.43 | -1.76% |
+| 32727 | 94.7551 | 47.0238 | 2.02× | 53.48 | 52.65 | -1.55% |
+
+12组真实层回放包含GPU路由、两个GEMM、激活与归约；prefill中位数
+13.8238→1.9685 ms，
+配对倍率中位数6.867×。算子native对照为此前同库同输入测量，
+上表为本轮原生完整模型测量。解码变化也保留在表中，不由微基准外推。
+18组BF16/FP16与FP64参考、18个Graph、12组真实层Graph、memcheck/synccheck及
+显存受限重排通过。固定代码生成通过980项检查；10个teacher-forced位置的完整词表
+logits有9/10个top-1相同，最大KL为0.19025634。
+Top-1分歧在开头换行token；中文生成措辞可能不同，代码功能检查通过。
+这些检查不构成广泛的模型质量评估。
+
+测量与接入元数据见 [JSON](benchmarks/naive_n05_marlin.json)。
+
+
+## 2026-10-01 Prefill GPU Top-K
+
+完整 Naive NVFP4 / 8×RTX 5090 按层，CUDA 13.1、BF16 激活与 KV、chunk 512、max_batch 1、MTP 0、16 CPU 线程、禁用 history/prefix cache。基线为已接入 Marlin 的版本，A/B/B/A 四进程，共 48 请求、28 正式采样。
+
+| 输入 tokens | 原 TTFT (s) | GPU Top-K TTFT (s) | 首 token 加速 | 原 / 新 decode (tok/s) |
+|---:|---:|---:|---:|---:|
+| 56 | 0.0779 | 0.0777 | 1.002× | 66.864 / 66.897 |
+| 80 | 0.0938 | 0.0938 | 1.000× | 65.101 / 65.150 |
+| 7565 | 6.6387 | 5.2775 | 1.258× | 54.421 / 53.855 |
+| 32727 | 47.0717 | 27.5670 | 1.708× | 52.656 / 50.963 |
+
+批量 Top-K 使用 CUDA 自带 CUB segmented radix sort，64 位 score/index 编码保留同分时 index 升序，±0 视作同分；每行独立因果结束位置排除未来 key，结果不足 topK 填 −1。删除 prefill 的 scores D2H、CPU partial_sort 和索引 CPU 往返；保持原 scores 运算与单 query decode 路径。无额外依赖或环境开关。512×32768 两个编码缓冲共 256 MiB，另有 CUB workspace；请求结束后的内存池保留量仅是快照，不等同于峰值。
+
+330 回归通过；10 组新旧完整 Indexer 索引逐 bit 相同；memcheck/racecheck/synccheck 各 45 用例零错误。完整模型测试文本全部与 Marlin 基线一致，代码场景各 980 检查通过。有效位置 NaN 不在旧 CPU 比较器的可靠语义内。长上下文解码小幅回退，不能宣称 decode 加速。
+
+三个 512-token prefill 波形窗口中的 Indexer CPU 选择和 CPU/GPU 往返已消失；decode 内部 14 步仍每 token 1282 kernels。数据见 [naive_n05_prefill_topk.json](benchmarks/naive_n05_prefill_topk.json)；完整脚本/波形/原始计时位于 `results/wan2-naive-prefill-topk-20261001/`（远端 `/mnt/disk_sdb/naive-prefill-topk-20261001/`）。
+
+
+## 2026-10-01 Prefill IndexScores
+
+在 Marlin + GPU 批量 Top-K 版本上继续优化。完整 Naive NVFP4，8×5090 按层、CUDA 13.1、BF16 激活/KV、chunk 512、max_batch 1、MTP 0、16 CPU 线程、禁用 history/prefix cache。A/B/B/A 四进程，48 请求、28 正式采样。
+
+| 输入 tokens | 原 TTFT (s) | 新 TTFT (s) | 加速 | 原 / 新 decode (tok/s) |
+|---:|---:|---:|---:|---:|
+| 56 | 0.0777 | 0.0778 | 0.999× | 66.890 / 66.877 |
+| 80 | 0.0936 | 0.0936 | 1.000× | 65.134 / 65.119 |
+| 7565 | 5.2794 | 5.0770 | 1.040× | 53.853 / 53.849 |
+| 32727 | 27.5625 | 25.1915 | 1.094× | 50.984 / 50.976 |
+
+新 IndexScoresPrefill 仅用于多 query、16 heads、dim 128。两个 16-lane 子组并行计算相邻 head；每线程保留原 lane 与 lane+16 的四项乘加，再重建原 warp 归约树，head 加权仍按原顺序。key 片段跨 head 复用。单 query 与其他 head 数保留原核；没有新依赖、环境开关、临时显存分配或额外 launch。
+
+原 330 回归通过；生产 CUDA 源码直接编译的 21 分数矩阵 +6 Graph 重放逐 bit 一致；独立编译上版完整 Indexer 的 18 组索引及 12 Graph 重放一致，包含 FP8 开关、不同 head 数、64K keys。三种 sanitizer 各 87 快速用例零错误。所有整模型测试文本相同，代码场景各 980 检查通过；整模型正式输入最长32727，64K仅算子验证。
+
+结果详见 [naive_n05_indexscores.json](benchmarks/naive_n05_indexscores.json)。生产 kernel 回归探针 `scores-plugin.cu`、完整 Indexer 对照 `differential-plugin.cu`、复现/波形/原始计时位于 `results/wan2-naive-indexscores-opt-20261001/`（远端 `/mnt/disk_sdb/naive-indexscores-opt-20261001/`）。
+
+
+## 2026-10-01 按请求预留 KV 容量
+
+参考 ChatGLM 的输入加输出预留方式，以及 Qwen4 对物理容量和逻辑长度的区分，
+Naive 的全局层现在按 `input_token_length + output_token_limit - 1` 预留。
+分块 prefill 使用 GenerationConfig 中完整请求的输入长度；最后一个输出 token 不再前向，故减一。
+预留提示受模型 max_positions、正值 tokensLimit 和 GetMaxTokens 限制，再按 128 token 对齐。
+这只是物理容量提示，不改变实际上下文限制，也不会截断已经存在的逻辑 KV。
+输出无上限时先预留完整输入；缺少输入长度元数据的直接调用/预热仍使用原有增量扩容。
+超出预留范围时仍可按原方式扩容。已有前缀容量不足时扩容一次并保留内容。
+
+SWA 只预留 `min(请求预留量, window - 1 + 本次块长)`，chunk512/window128 时为639，
+对齐后640；不会给39个滑窗层各分配整段长上下文。逻辑长度仍由实际追加和裁剪决定。
+普通前向和 MTP 的 target 前向均传递预留量；本轮完整模型验证固定 MTP0。
+无新依赖、环境变量或 CUDA kernel 改动。
+
+完整 Naive NVFP4/48层/8×RTX5090 按层、CUDA13.1、BF16激活/KV、chunk512、
+max_batch1、MTP0、context65536、16线程、禁用history/prefix cache。
+基线是上一轮 IndexScores 版本，ABBA四进程48请求、28正式采样，无并发编译、profiling或GPU轮询。
+
+| 输入 tokens | 旧 TTFT (s) | 预留后 TTFT (s) | 加速 | 旧 / 新 decode (tok/s) |
+|---:|---:|---:|---:|---:|
+| 56 | 0.0779 | 0.0778 | 1.000× | 66.908 / 66.862 |
+| 80 | 0.0937 | 0.0935 | 1.002× | 65.133 / 65.162 |
+| 7565 | 5.0694 | 4.9826 | 1.017× | 53.861 / 53.868 |
+| 32727 | 25.1898 | 24.7851 | 1.016× | 50.982 / 51.219 |
+
+336项回归通过，其中6项新增预留测试覆盖32K/64K边界、指针稳定、逻辑长度、完整内容、
+已有前缀和SWA裁剪；memcheck/racecheck/synccheck各51快速用例零错误。
+所有完整模型A/B输出及reasoning（含预热）一致，代码请求各980项检查通过。
+完整模型正式输入最长32727，64K仅KV回归；未扩大到其他生成设置或MTP端到端验证。
+
+32727输入/最多256输出的完整profile请求中，96份K/V都仅在第一块分配一次：
+9全局层各K/V33024容量，39滑窗层各K/V640容量。后续三个prefill采样窗口中
+KV Expansion均为0；其他工作区的分配计数单独保留在结果中。
+decode1..66覆盖32768边界也无KV扩容。
+旧版32K采样块有18对分配/释放。带工具host时间不作为原生性能数据。
+容量日志见 `nsys/control.allocations`，内存池快照不是峰值显存。
+
+结果见 [naive_n05_kv_reserve.json](benchmarks/naive_n05_kv_reserve.json)。
+复现脚本、增量/完整补丁、原始请求、回归日志和4段NSYS位于
+`results/wan2-naive-kv-reserve-20261001/`（远端 `/mnt/disk_sdb/naive-kv-reserve-20261001/`）。
+
+
+## 2026-10-02 代码整理与尺寸兼容性
+
+目标前向现在统一根据 GenerationConfig 计算请求 KV 预留，普通和 DSpark 调用只传原配置；
+移除重复计算和未使用的默认容量参数。单行及批量 Top-K 共用编码/解码 kernel，
+保留各自的 CUB radix/segmented radix 排序策略、同分索引顺序和因果范围，移除无用头文件。
+
+CUDA cache trim 保留16字节对齐的向量路径，为其他正值BF16行宽添加标量回退，
+沿列递增搬移保持原地重叠安全。RoPE和prefill AttentionValues按实际维度循环，
+不再把线程块大小误当成输出维度上限；覆盖384维。Indexer仍按128元素块执行量化，
+增加布局/类型/设备检查，非128块宽明确报错；16-head特化和其他head数量的原实现均保留。
+这不是对任意量化布局或所有GPU架构的支持声明。
+
+NVFP4 grouped Marlin的小批路由既可能按expert分组填充，也可能每条route占一个填充块。
+缓存容量现在覆盖两种布局以及之后更大请求的复用，不依赖Naive的256专家/top-k8。
+旧FP16 planar路径在16专家、batch9、top-k16下可写出原路由缓冲区；旧库memcheck复现19错误，
+新版相同边界和其他形状均零错误。本模型256专家配置下，每MoE层小批路由缓存额外约26.25KiB。
+
+相关路径没有遗留的实验环境开关，本轮没有新增或删除环境变量。
+FASTLLM_DSPARK_MODEL_PATH、FASTLLM_DSPARK_TOKENS和FASTLLM_DSPARK_CONFIDENCE_THRESHOLD
+仍由正式CLI选项设置，并由加载器/DSpark读取，
+属于有效配置接口，保留以免破坏现有选项。没有加入按模型名或固定设备编号选择优化的分支。
+
+验证：423项Naive回归；memcheck/racecheck/synccheck各62快速项零错误；
+22组Marlin与FP64参考（BF16/FP16、7/16专家、H/I为256/128及512/256、top-k1/2/3/7/8/16），
+各3次Graph重放逐bit相等，并通过完整memcheck。18组新旧Indexer索引及12次变化输入Graph逐bit一致，
+包含heads1/7/16/17、FP8开关、64Kkeys。RoPE64/192/384维、Attention value128/384维、
+cache7/13等非对齐宽度均覆盖；不支持的Indexer块宽验证会明确拒绝。
+
+完整Naive NVFP4/48层/8×RTX5090按层，CUDA13.1、BF16激活/KV、chunk512、context65536、
+max_batch1、MTP0、16线程、禁history/prefix cache；旧KV预留版与整理后版本ABBA，48请求28正式采样。
+无并发编译、profiling或GPU轮询。正式请求中位数：
+
+| 输入 tokens | 整理前 TTFT (s) | 整理后 TTFT (s) | 前 / 后 decode (tok/s) |
+|---:|---:|---:|---:|
+| 56 | 0.0778 | 0.0779 | 66.880 / 67.093 |
+| 80 | 0.0936 | 0.0939 | 65.162 / 65.366 |
+| 7565 | 4.9822 | 5.0159 | 53.872 / 54.045 |
+| 32727 | 24.7845 | 24.8515 | 51.205 / 51.384 |
+
+所有同场景output/reasoning含预热跨版本一致，代码请求各980项检查通过。硬件验证为RTX5090；
+完整模型测试固定MTP0，未扩展到MTP端到端或其他GPU架构。显存快照为请求后池保留量，不是峰值。
+详见 [naive_n05_cleanup.json](benchmarks/naive_n05_cleanup.json)。
+复现脚本/补丁/原始请求/回归及旧版越界日志在 `results/wan2-naive-code-cleanup-20261002/`
+（远端 `/mnt/disk_sdb/naive-code-cleanup-20261002/`）。

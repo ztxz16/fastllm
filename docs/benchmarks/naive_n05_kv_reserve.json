@@ -1,0 +1,1832 @@
+{
+  "libraries": {
+    "baseline": "84b9c32722aa13bcd601e89e451b0f572157c5b17ea54b1e2bea0774de2e5c46",
+    "fixed": "71959072b749da92c82a2c132f32a1ce4efbaded5e834fc45e3102efb0b0506b"
+  },
+  "order": [
+    "A1",
+    "B1",
+    "B2",
+    "A2"
+  ],
+  "cases": [
+    {
+      "case": "explanation",
+      "input_tokens": 56,
+      "baseline": {
+        "samples": 4,
+        "ttft_seconds": 0.07787751997238956,
+        "ttft_range": [
+          0.07768632000079378,
+          0.07804819999728352
+        ],
+        "decode_tok_s": 66.90809035319847,
+        "decode_range": [
+          66.87358638987992,
+          66.94065286916768
+        ],
+        "output_sha256": [
+          "df953f35789e40435c23416e2689d828374ec010795fd1ba65de8cb25ce19c00"
+        ],
+        "output_tokens": [
+          60
+        ],
+        "code_check": null
+      },
+      "fixed": {
+        "samples": 4,
+        "ttft_seconds": 0.07784852001350373,
+        "ttft_range": [
+          0.07765864004613832,
+          0.07803044002503157
+        ],
+        "decode_tok_s": 66.86152027267546,
+        "decode_range": [
+          66.85022454430127,
+          66.87589072557313
+        ],
+        "output_sha256": [
+          "df953f35789e40435c23416e2689d828374ec010795fd1ba65de8cb25ce19c00"
+        ],
+        "output_tokens": [
+          60
+        ],
+        "code_check": null
+      },
+      "ttft_speedup": 1.0003725177932836,
+      "ttft_reduction_pct": 0.03723790754522893,
+      "decode_change_pct": -0.06960306336225575
+    },
+    {
+      "case": "context-short",
+      "input_tokens": 80,
+      "baseline": {
+        "samples": 4,
+        "ttft_seconds": 0.09373235999373719,
+        "ttft_range": [
+          0.09353200002806261,
+          0.09394016000442207
+        ],
+        "decode_tok_s": 65.13330200699718,
+        "decode_range": [
+          65.07087864597437,
+          65.15691701970098
+        ],
+        "output_sha256": [
+          "625647b8667c3c81662fd1a28ece2a83d34ca6ef80c407b16b1832bfd0010951"
+        ],
+        "output_tokens": [
+          69
+        ],
+        "code_check": {
+          "passed": true,
+          "checks": 980
+        }
+      },
+      "fixed": {
+        "samples": 4,
+        "ttft_seconds": 0.0935290599882137,
+        "ttft_range": [
+          0.09348156000487506,
+          0.09376855997834355
+        ],
+        "decode_tok_s": 65.1624173192568,
+        "decode_range": [
+          65.1444553389192,
+          65.18256947560258
+        ],
+        "output_sha256": [
+          "625647b8667c3c81662fd1a28ece2a83d34ca6ef80c407b16b1832bfd0010951"
+        ],
+        "output_tokens": [
+          69
+        ],
+        "code_check": {
+          "passed": true,
+          "checks": 980
+        }
+      },
+      "ttft_speedup": 1.0021736560332062,
+      "ttft_reduction_pct": 0.21689415004281232,
+      "decode_change_pct": 0.04470111504017993
+    },
+    {
+      "case": "context-7k5",
+      "input_tokens": 7565,
+      "baseline": {
+        "samples": 4,
+        "ttft_seconds": 5.069428080023499,
+        "ttft_range": [
+          5.062464599963278,
+          5.076508840022143
+        ],
+        "decode_tok_s": 53.86071408795171,
+        "decode_range": [
+          53.829174758877414,
+          53.88307935939439
+        ],
+        "output_sha256": [
+          "625647b8667c3c81662fd1a28ece2a83d34ca6ef80c407b16b1832bfd0010951"
+        ],
+        "output_tokens": [
+          69
+        ],
+        "code_check": {
+          "passed": true,
+          "checks": 980
+        }
+      },
+      "fixed": {
+        "samples": 4,
+        "ttft_seconds": 4.982627799996408,
+        "ttft_range": [
+          4.981322080013342,
+          4.983870439988095
+        ],
+        "decode_tok_s": 53.86779908748189,
+        "decode_range": [
+          53.84753633881488,
+          53.878687064722136
+        ],
+        "output_sha256": [
+          "625647b8667c3c81662fd1a28ece2a83d34ca6ef80c407b16b1832bfd0010951"
+        ],
+        "output_tokens": [
+          69
+        ],
+        "code_check": {
+          "passed": true,
+          "checks": 980
+        }
+      },
+      "ttft_speedup": 1.0174205827750478,
+      "ttft_reduction_pct": 1.7122302290693336,
+      "decode_change_pct": 0.013154299288742344
+    },
+    {
+      "case": "context-32k",
+      "input_tokens": 32727,
+      "baseline": {
+        "samples": 2,
+        "ttft_seconds": 25.189828159986064,
+        "ttft_range": [
+          25.18030483997427,
+          25.19935147999786
+        ],
+        "decode_tok_s": 50.9818266328311,
+        "decode_range": [
+          50.96675234762691,
+          50.996900918035294
+        ],
+        "output_sha256": [
+          "2d9ed45554582128b9cef42ae3e47b0d347c26b91059a97676ace58aeae6d533"
+        ],
+        "output_tokens": [
+          69
+        ],
+        "code_check": {
+          "passed": true,
+          "checks": 980
+        }
+      },
+      "fixed": {
+        "samples": 2,
+        "ttft_seconds": 24.785080800007563,
+        "ttft_range": [
+          24.77867932000663,
+          24.791482280008495
+        ],
+        "decode_tok_s": 51.218724288008445,
+        "decode_range": [
+          51.214426610672774,
+          51.22302196534411
+        ],
+        "output_sha256": [
+          "2d9ed45554582128b9cef42ae3e47b0d347c26b91059a97676ace58aeae6d533"
+        ],
+        "output_tokens": [
+          69
+        ],
+        "code_check": {
+          "passed": true,
+          "checks": 980
+        }
+      },
+      "ttft_speedup": 1.0163302820452527,
+      "ttft_reduction_pct": 1.6067888887842496,
+      "decode_change_pct": 0.4646707872659528
+    }
+  ],
+  "request_count": 48,
+  "formal_request_count": 28,
+  "all_outputs_and_reasoning_identical_including_warmups": true,
+  "memory_snapshots": [
+    {
+      "run": "A1",
+      "version": "baseline",
+      "ready_MiB_by_device": [
+        19586,
+        22480,
+        22480,
+        22482,
+        22480,
+        22480,
+        22482,
+        23674
+      ],
+      "after_requests_MiB_by_device": [
+        19980,
+        22856,
+        22856,
+        22858,
+        22856,
+        22856,
+        22858,
+        24050
+      ],
+      "note": "nvidia-smi snapshot with allocator pool retained; not an exact peak"
+    },
+    {
+      "run": "B1",
+      "version": "fixed",
+      "ready_MiB_by_device": [
+        19586,
+        22482,
+        22482,
+        22482,
+        22482,
+        22482,
+        22482,
+        23674
+      ],
+      "after_requests_MiB_by_device": [
+        19980,
+        22858,
+        22858,
+        22858,
+        22858,
+        22858,
+        22858,
+        24052
+      ],
+      "note": "nvidia-smi snapshot with allocator pool retained; not an exact peak"
+    },
+    {
+      "run": "B2",
+      "version": "fixed",
+      "ready_MiB_by_device": [
+        19586,
+        22480,
+        22480,
+        22482,
+        22482,
+        22478,
+        22482,
+        23672
+      ],
+      "after_requests_MiB_by_device": [
+        19980,
+        22856,
+        22856,
+        22858,
+        22858,
+        22854,
+        22858,
+        24050
+      ],
+      "note": "nvidia-smi snapshot with allocator pool retained; not an exact peak"
+    },
+    {
+      "run": "A2",
+      "version": "baseline",
+      "ready_MiB_by_device": [
+        19586,
+        22482,
+        22480,
+        22480,
+        22478,
+        22482,
+        22482,
+        23672
+      ],
+      "after_requests_MiB_by_device": [
+        19980,
+        22858,
+        22856,
+        22856,
+        22854,
+        22858,
+        22858,
+        24048
+      ],
+      "note": "nvidia-smi snapshot with allocator pool retained; not an exact peak"
+    }
+  ],
+  "profile_windows": [
+    {
+      "phase": "prefill_1024",
+      "baseline_host_ms": 296.46708,
+      "fixed_host_ms": 272.7494,
+      "baseline_expansions": 96,
+      "fixed_expansions": 0,
+      "baseline_cudaMalloc": 104,
+      "fixed_cudaMalloc": 8,
+      "baseline_cudaFree": 96,
+      "fixed_cudaFree": 0,
+      "baseline_gpu_active_ms": 215.194762,
+      "fixed_gpu_active_ms": 215.351198
+    },
+    {
+      "phase": "prefill_16384",
+      "baseline_host_ms": 401.52792,
+      "fixed_host_ms": 393.93168,
+      "baseline_expansions": 18,
+      "fixed_expansions": 0,
+      "baseline_cudaMalloc": 18,
+      "fixed_cudaMalloc": 0,
+      "baseline_cudaFree": 18,
+      "fixed_cudaFree": 0,
+      "baseline_gpu_active_ms": 336.909328,
+      "fixed_gpu_active_ms": 336.850896
+    },
+    {
+      "phase": "prefill_32256",
+      "baseline_host_ms": 467.80916,
+      "fixed_host_ms": 459.33964,
+      "baseline_expansions": 18,
+      "fixed_expansions": 0,
+      "baseline_cudaMalloc": 18,
+      "fixed_cudaMalloc": 0,
+      "baseline_cudaFree": 18,
+      "fixed_cudaFree": 0,
+      "baseline_gpu_active_ms": 402.92198,
+      "fixed_gpu_active_ms": 402.259362
+    }
+  ],
+  "allocation_records": [
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 0,
+      "width": 896,
+      "before": 0,
+      "after": 33024,
+      "logical": 512,
+      "reserve": 32982
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 0,
+      "width": 512,
+      "before": 0,
+      "after": 33024,
+      "logical": 512,
+      "reserve": 32982
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 1,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 1,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 2,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 2,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 3,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 3,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 4,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 4,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 5,
+      "width": 896,
+      "before": 0,
+      "after": 33024,
+      "logical": 512,
+      "reserve": 32982
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 5,
+      "width": 512,
+      "before": 0,
+      "after": 33024,
+      "logical": 512,
+      "reserve": 32982
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 6,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 6,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 7,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 7,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 8,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 8,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 9,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 9,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 10,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 10,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 11,
+      "width": 896,
+      "before": 0,
+      "after": 33024,
+      "logical": 512,
+      "reserve": 32982
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 11,
+      "width": 512,
+      "before": 0,
+      "after": 33024,
+      "logical": 512,
+      "reserve": 32982
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 12,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 12,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 13,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 13,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 14,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 14,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 15,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 15,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 16,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 16,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 17,
+      "width": 896,
+      "before": 0,
+      "after": 33024,
+      "logical": 512,
+      "reserve": 32982
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 17,
+      "width": 512,
+      "before": 0,
+      "after": 33024,
+      "logical": 512,
+      "reserve": 32982
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 18,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 18,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 19,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 19,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 20,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 20,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 21,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 21,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 22,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 22,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 23,
+      "width": 896,
+      "before": 0,
+      "after": 33024,
+      "logical": 512,
+      "reserve": 32982
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 23,
+      "width": 512,
+      "before": 0,
+      "after": 33024,
+      "logical": 512,
+      "reserve": 32982
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 24,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 24,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 25,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 25,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 26,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 26,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 27,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 27,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 28,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 28,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 29,
+      "width": 896,
+      "before": 0,
+      "after": 33024,
+      "logical": 512,
+      "reserve": 32982
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 29,
+      "width": 512,
+      "before": 0,
+      "after": 33024,
+      "logical": 512,
+      "reserve": 32982
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 30,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 30,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 31,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 31,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 32,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 32,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 33,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 33,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 34,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 34,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 35,
+      "width": 896,
+      "before": 0,
+      "after": 33024,
+      "logical": 512,
+      "reserve": 32982
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 35,
+      "width": 512,
+      "before": 0,
+      "after": 33024,
+      "logical": 512,
+      "reserve": 32982
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 36,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 36,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 37,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 37,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 38,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 38,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 39,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 39,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 40,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 40,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 41,
+      "width": 896,
+      "before": 0,
+      "after": 33024,
+      "logical": 512,
+      "reserve": 32982
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 41,
+      "width": 512,
+      "before": 0,
+      "after": 33024,
+      "logical": 512,
+      "reserve": 32982
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 42,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 42,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 43,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 43,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 44,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 44,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 45,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 45,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 46,
+      "width": 1536,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 46,
+      "width": 1024,
+      "before": 0,
+      "after": 640,
+      "logical": 512,
+      "reserve": 639
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 47,
+      "width": 896,
+      "before": 0,
+      "after": 33024,
+      "logical": 512,
+      "reserve": 32982
+    },
+    {
+      "past": 0,
+      "tokens": 512,
+      "layer": 47,
+      "width": 512,
+      "before": 0,
+      "after": 33024,
+      "logical": 512,
+      "reserve": 32982
+    }
+  ],
+  "global_KV_reserved_MiB": 798.1875,
+  "sliding_KV_reserved_MiB": 121.875,
+  "global_KV_capacity_extra_over_baseline_final_MiB": 3.09375,
+  "baseline_global_prefill_copy_read_GiB_theoretical": 24.36328125,
+  "decode_profile": {
+    "captured_steps": 66,
+    "analyzed_steps": 64,
+    "allocation_audit": {
+      "captured_steps": [
+        1,
+        66
+      ],
+      "interior_steps": [
+        2,
+        65
+      ],
+      "cache_expansion_count": 0,
+      "captured_allocator_calls": 39,
+      "interior_allocator_calls": 20,
+      "allocator_api_inclusive_ms": 0.7602799999999997,
+      "by_step": {
+        "1": 19,
+        "2": 6,
+        "10": 7,
+        "42": 7
+      },
+      "records": [
+        {
+          "step": 1,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=5.keys=32728",
+          "api_inclusive_ms": 0.03572
+        },
+        {
+          "step": 1,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=11.keys=32728",
+          "api_inclusive_ms": 0.01892
+        },
+        {
+          "step": 1,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=11.keys=32728",
+          "api_inclusive_ms": 0.00992
+        },
+        {
+          "step": 1,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=11.keys=32728",
+          "api_inclusive_ms": 0.01364
+        },
+        {
+          "step": 1,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=17.keys=32728",
+          "api_inclusive_ms": 0.01756
+        },
+        {
+          "step": 1,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=17.keys=32728",
+          "api_inclusive_ms": 0.01204
+        },
+        {
+          "step": 1,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=17.keys=32728",
+          "api_inclusive_ms": 0.01348
+        },
+        {
+          "step": 1,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=23.keys=32728",
+          "api_inclusive_ms": 0.01816
+        },
+        {
+          "step": 1,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=23.keys=32728",
+          "api_inclusive_ms": 0.00876
+        },
+        {
+          "step": 1,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=23.keys=32728",
+          "api_inclusive_ms": 0.01004
+        },
+        {
+          "step": 1,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=29.keys=32728",
+          "api_inclusive_ms": 0.01624
+        },
+        {
+          "step": 1,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=29.keys=32728",
+          "api_inclusive_ms": 0.01052
+        },
+        {
+          "step": 1,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=29.keys=32728",
+          "api_inclusive_ms": 0.01132
+        },
+        {
+          "step": 1,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=35.keys=32728",
+          "api_inclusive_ms": 0.01816
+        },
+        {
+          "step": 1,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=35.keys=32728",
+          "api_inclusive_ms": 0.00812
+        },
+        {
+          "step": 1,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=35.keys=32728",
+          "api_inclusive_ms": 0.0112
+        },
+        {
+          "step": 1,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=41.keys=32728",
+          "api_inclusive_ms": 0.01776
+        },
+        {
+          "step": 1,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=41.keys=32728",
+          "api_inclusive_ms": 0.00848
+        },
+        {
+          "step": 1,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=41.keys=32728",
+          "api_inclusive_ms": 0.01016
+        },
+        {
+          "step": 2,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=11.keys=32729",
+          "api_inclusive_ms": 0.01808
+        },
+        {
+          "step": 2,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=17.keys=32729",
+          "api_inclusive_ms": 0.01708
+        },
+        {
+          "step": 2,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=23.keys=32729",
+          "api_inclusive_ms": 0.01784
+        },
+        {
+          "step": 2,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=29.keys=32729",
+          "api_inclusive_ms": 0.0178
+        },
+        {
+          "step": 2,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=35.keys=32729",
+          "api_inclusive_ms": 0.01836
+        },
+        {
+          "step": 2,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=41.keys=32729",
+          "api_inclusive_ms": 0.0172
+        },
+        {
+          "step": 10,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=5.keys=32737",
+          "api_inclusive_ms": 0.0372
+        },
+        {
+          "step": 10,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=11.keys=32737",
+          "api_inclusive_ms": 0.02264
+        },
+        {
+          "step": 10,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=17.keys=32737",
+          "api_inclusive_ms": 0.02464
+        },
+        {
+          "step": 10,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=23.keys=32737",
+          "api_inclusive_ms": 0.02396
+        },
+        {
+          "step": 10,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=29.keys=32737",
+          "api_inclusive_ms": 0.02372
+        },
+        {
+          "step": 10,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=35.keys=32737",
+          "api_inclusive_ms": 0.02248
+        },
+        {
+          "step": 10,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=41.keys=32737",
+          "api_inclusive_ms": 0.0204
+        },
+        {
+          "step": 42,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=5.keys=32769",
+          "api_inclusive_ms": 0.03192
+        },
+        {
+          "step": 42,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=11.keys=32769",
+          "api_inclusive_ms": 0.04364
+        },
+        {
+          "step": 42,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=17.keys=32769",
+          "api_inclusive_ms": 0.0304
+        },
+        {
+          "step": 42,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=23.keys=32769",
+          "api_inclusive_ms": 0.02144
+        },
+        {
+          "step": 42,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=29.keys=32769",
+          "api_inclusive_ms": 0.0222
+        },
+        {
+          "step": 42,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=35.keys=32769",
+          "api_inclusive_ms": 0.02948
+        },
+        {
+          "step": 42,
+          "api": "cudaMalloc_v3020",
+          "operation": "indexer.layer=41.keys=32769",
+          "api_inclusive_ms": 0.0296
+        }
+      ],
+      "note": "All remaining captured allocations are inside Indexer workspace scopes; no KV Expansion and no cudaFree. API inclusive time is instrumented and is not a native performance saving."
+    },
+    "scalar_stats": {
+      "wall_ms": {
+        "mean": 32.254975625,
+        "median": 32.27696,
+        "min": 31.56872,
+        "max": 33.08036
+      },
+      "gpu_active_union_ms": {
+        "mean": 15.319352921875,
+        "median": 15.317834999999999,
+        "min": 15.301974,
+        "max": 15.343255
+      },
+      "gpu_kernel_sum_ms": {
+        "mean": 15.02264159375,
+        "median": 15.02243,
+        "min": 15.006678,
+        "max": 15.043486
+      },
+      "gpu_copy_sum_ms": {
+        "mean": 0.2515319375,
+        "median": 0.250144,
+        "min": 0.249022,
+        "max": 0.260863
+      },
+      "gpu_idle_ms": {
+        "mean": 16.935622703125,
+        "median": 16.9623645,
+        "min": 16.239188,
+        "max": 17.751858
+      },
+      "host_select_alloc_ms": {
+        "mean": 0.0,
+        "median": 0.0,
+        "min": 0.0,
+        "max": 0.0
+      },
+      "host_select_gpu_overlap_ms": {
+        "mean": 0.0,
+        "median": 0.0,
+        "min": 0.0,
+        "max": 0.0
+      },
+      "other_gap_ms": {
+        "mean": 16.935622703125,
+        "median": 16.9623645,
+        "min": 16.239188,
+        "max": 17.751858
+      },
+      "kernels": {
+        "mean": 1282,
+        "median": 1282.0,
+        "min": 1282,
+        "max": 1282
+      },
+      "copies": {
+        "mean": 242,
+        "median": 242.0,
+        "min": 242,
+        "max": 242
+      },
+      "indexer_host_ranges": {
+        "mean": 0,
+        "median": 0.0,
+        "min": 0,
+        "max": 0
+      },
+      "indexer_wall_ms": {
+        "mean": 1.8548381250000001,
+        "median": 1.8458,
+        "min": 1.74664,
+        "max": 2.09444
+      }
+    },
+    "families": [
+      {
+        "family": "BF16 GEMV",
+        "gpu_ms_per_token": 6.739236078124998,
+        "calls_per_token": 223.0,
+        "share_gpu_kernel_percent": 44.86052626675717
+      },
+      {
+        "family": "MoE Marlin gate/up GEMM",
+        "gpu_ms_per_token": 2.4156541562499974,
+        "calls_per_token": 47.0,
+        "share_gpu_kernel_percent": 16.080089118647457
+      },
+      {
+        "family": "MoE Marlin down GEMM",
+        "gpu_ms_per_token": 1.3319261874999977,
+        "calls_per_token": 47.0,
+        "share_gpu_kernel_percent": 8.86612503658566
+      },
+      {
+        "family": "Full attention values",
+        "gpu_ms_per_token": 1.0870406249999998,
+        "calls_per_token": 9.0,
+        "share_gpu_kernel_percent": 7.236015172273379
+      },
+      {
+        "family": "KV trim",
+        "gpu_ms_per_token": 0.7822074062499987,
+        "calls_per_token": 39.0,
+        "share_gpu_kernel_percent": 5.2068566062005255
+      },
+      {
+        "family": "SWA attention",
+        "gpu_ms_per_token": 0.4239235000000028,
+        "calls_per_token": 39.0,
+        "share_gpu_kernel_percent": 2.8218971833580317
+      },
+      {
+        "family": "Indexer Top-K",
+        "gpu_ms_per_token": 0.3959529999999994,
+        "calls_per_token": 108.0,
+        "share_gpu_kernel_percent": 2.6357082243427263
+      },
+      {
+        "family": "Indexer scores",
+        "gpu_ms_per_token": 0.351644109375,
+        "calls_per_token": 9.0,
+        "share_gpu_kernel_percent": 2.3407608254549457
+      },
+      {
+        "family": "Router FP32 GEMV",
+        "gpu_ms_per_token": 0.20612599999999726,
+        "calls_per_token": 47.0,
+        "share_gpu_kernel_percent": 1.3721022279181174
+      },
+      {
+        "family": "Full attention scores",
+        "gpu_ms_per_token": 0.20348896874999992,
+        "calls_per_token": 9.0,
+        "share_gpu_kernel_percent": 1.354548515852628
+      },
+      {
+        "family": "Expert selection",
+        "gpu_ms_per_token": 0.16876409375000076,
+        "calls_per_token": 47.0,
+        "share_gpu_kernel_percent": 1.1233982565370753
+      },
+      {
+        "family": "Indexer quantization",
+        "gpu_ms_per_token": 0.16864406249999997,
+        "calls_per_token": 18.0,
+        "share_gpu_kernel_percent": 1.1225992542494168
+      },
+      {
+        "family": "RoPE",
+        "gpu_ms_per_token": 0.15600809375000113,
+        "calls_per_token": 114.0,
+        "share_gpu_kernel_percent": 1.0384864258154622
+      },
+      {
+        "family": "RMSNorm",
+        "gpu_ms_per_token": 0.14233873437499955,
+        "calls_per_token": 97.0,
+        "share_gpu_kernel_percent": 0.9474947098133405
+      },
+      {
+        "family": "Residual add",
+        "gpu_ms_per_token": 0.09689487499999769,
+        "calls_per_token": 96.0,
+        "share_gpu_kernel_percent": 0.6449922564904287
+      },
+      {
+        "family": "MoE weighted reduce",
+        "gpu_ms_per_token": 0.059361390625001655,
+        "calls_per_token": 47.0,
+        "share_gpu_kernel_percent": 0.3951461549192412
+      },
+      {
+        "family": "Type conversion",
+        "gpu_ms_per_token": 0.052070390625000344,
+        "calls_per_token": 67.0,
+        "share_gpu_kernel_percent": 0.34661274650034724
+      },
+      {
+        "family": "Router sigmoid",
+        "gpu_ms_per_token": 0.051872343750000716,
+        "calls_per_token": 47.0,
+        "share_gpu_kernel_percent": 0.3452944239286231
+      },
+      {
+        "family": "Final sampling/normalization",
+        "gpu_ms_per_token": 0.04909793750000009,
+        "calls_per_token": 10.0,
+        "share_gpu_kernel_percent": 0.3268262588413665
+      },
+      {
+        "family": "MoE SwiGLU",
+        "gpu_ms_per_token": 0.042627375000000946,
+        "calls_per_token": 47.0,
+        "share_gpu_kernel_percent": 0.2837541901933921
+      },
+      {
+        "family": "Elementwise multiply",
+        "gpu_ms_per_token": 0.04152140625000092,
+        "calls_per_token": 58.0,
+        "share_gpu_kernel_percent": 0.2763921777064527
+      },
+      {
+        "family": "MoE route/scratch",
+        "gpu_ms_per_token": 0.036546921875000776,
+        "calls_per_token": 47.0,
+        "share_gpu_kernel_percent": 0.24327893098511888
+      },
+      {
+        "family": "Full attention softmax",
+        "gpu_ms_per_token": 0.018792437500000026,
+        "calls_per_token": 9.0,
+        "share_gpu_kernel_percent": 0.12509409468850294
+      },
+      {
+        "family": "Dense FFN SiLU",
+        "gpu_ms_per_token": 0.0009015000000000002,
+        "calls_per_token": 1.0,
+        "share_gpu_kernel_percent": 0.006000941940697436
+      }
+    ]
+  },
+  "validation": {
+    "regression_cases": 336,
+    "new_reservation_cases": 6,
+    "sanitizer_quick_cases_per_tool": 51,
+    "sanitizers": [
+      "memcheck",
+      "racecheck",
+      "synccheck"
+    ]
+  },
+  "notes": [
+    "Native benchmarks use the complete 48-layer Naive NVFP4 model on 8 GPUs with layer placement, max_batch 1, MTP 0, BF16 activations/KV, chunk 512, context 65536 and history/prefix cache disabled.",
+    "Baseline is the preceding IndexScores version and is remeasured in this ABBA run. No profiling, compilation or GPU polling during native timed requests.",
+    "NSYS comparison baseline is the preceding same-host capture; candidate windows are newly captured. Profile host times include instrumentation and are not native latency.",
+    "Allocation hook observes the complete request, including the initial prefill chunk; all 96 target-layer K/V caches allocate once, with no further growth. Three sampled prefill windows and decode 1..66 are recorded by NSYS.",
+    "Physical reserve is request input length plus bounded output minus one, capped by model and configured token limits then aligned to 128. Actual logical length remains independent; unknown metadata uses the old growth path.",
+    "GPU snapshots are retained allocator pool usage after requests, not peak memory. Reserved KV sizes are computed from observed capacities. Avoided 24.36 GiB of old-cache reads is a source-derived theoretical whole-prefill estimate; writes are additional.",
+    "Full-model timed inputs reach 32727 tokens. The 65536-token cache boundary is covered by the regression test, not a full-model timed request. MTP remains disabled in full-model tests."
+  ]
+}
