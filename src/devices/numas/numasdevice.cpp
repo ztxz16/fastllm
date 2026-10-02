@@ -877,6 +877,11 @@ namespace fastllm {
                type == static_cast<DataType>(DataType::DATA_GGUF_FORMAT + GGML_TYPE_Q8_K32);
     }
 
+    static bool CanPrepareDeepSeekV4Q8K(DataType type, int columns, int activationQuantBlock) {
+        return IsQ8KActivationType(type) && columns % QK_K == 0 &&
+               (activationQuantBlock == 32 || activationQuantBlock == 128);
+    }
+
     struct MultiThreadDeepSeekV4NumasDownPrepareOp : MultiThreadBaseOp {
         const float *gateUpData;
         float *swigluData;
@@ -6609,12 +6614,18 @@ namespace fastllm {
             downInputDataType == DataType::FLOAT16 ||
             downInputDataType == DataType::BFLOAT16 ||
             canFuseGroup32);
-        const bool useDeepSeekV4LargeFast =
+        const bool enableDeepSeekV4LargeFast =
             deepSeekV4Mode &&
+            std::getenv("FASTLLM_DSV4_DISABLE_NUMAS_MOE_LARGE_FAST") == nullptr;
+        const bool useDeepSeekV4LargeFast =
+            enableDeepSeekV4LargeFast &&
             downInputDataType < DataType::DATA_GGUF_FORMAT &&
-            NumasDeepSeekV4FastPathAvailable() &&
-            std::getenv(
-                "FASTLLM_DSV4_DISABLE_NUMAS_MOE_LARGE_FAST") == nullptr;
+            NumasDeepSeekV4FastPathAvailable();
+        // Cached Q2/Q4 experts use this grouped path even for one row.
+        // Their GEMM workers stay unchanged; prepare whole Q8_K blocks and
+        // round/store the result with the existing parallel workers.
+        const bool useQ8KPrepare = enableDeepSeekV4LargeFast &&
+            CanPrepareDeepSeekV4Q8K(downInputDataType, interDim, activationQuantBlock);
         const bool useDeepSeekV4GroupedDecodeFast =
             useDeepSeekV4LargeFast && bs > 1 && bs <= 8 &&
             std::getenv(
@@ -6632,15 +6643,13 @@ namespace fastllm {
             // gained by grouping repeated experts.
             stride = 208;
         }
-        const bool skipRedundantCrossSwiglu =
-            useDeepSeekV4LargeFast || fp8EagerMode;
+        const bool useDeepSeekV4PostOps = useDeepSeekV4LargeFast || useQ8KPrepare;
+        const bool skipRedundantCrossSwiglu = useDeepSeekV4PostOps || fp8EagerMode;
         const bool useParallelDeepSeekV4Prepare =
-            useDeepSeekV4LargeFast &&
-            interDim % (128 * numaConfig->numaCnt) == 0;
-        const bool useParallelDeepSeekV4Round =
-            useDeepSeekV4LargeFast;
+            useQ8KPrepare || (useDeepSeekV4LargeFast &&
+                             interDim % (128 * numaConfig->numaCnt) == 0);
         const bool useParallelDeepSeekV4Store =
-            useDeepSeekV4LargeFast || (fp8EagerMode && bs >= 8);
+            useDeepSeekV4PostOps || (fp8EagerMode && bs >= 8);
 
         auto &gateTaskStorage =
             fastllmMoeDataManagerNumas.gateSwigluTaskStorage;
@@ -6807,38 +6816,40 @@ namespace fastllm {
             offset = 0;
             const size_t downRowBytes =
                 GetDataBytes(downInputDataType, 1, interDim);
-            const int interDimPerNuma =
-                interDim / numaConfig->numaCnt;
+            const int prepareColumns = useQ8KPrepare ? QK_K : interDim / numaConfig->numaCnt;
             auto &prepareTaskStorage =
                 fastllmMoeDataManagerNumas.prepareTaskStorage;
             auto &prepareTasks =
                 fastllmMoeDataManagerNumas.taskPointers;
             prepareTaskStorage.resize(numaConfig->numaCnt);
             prepareTasks.resize(numaConfig->numaCnt);
-            size_t tasksPerNode = (size_t)totalLines;
+            const size_t tasksPerNode =
+                ((size_t)totalLines * (interDim / prepareColumns) + numaConfig->numaCnt - 1) /
+                numaConfig->numaCnt;
             for (int nid = 0; nid < numaConfig->numaCnt; nid++) {
                 prepareTaskStorage[nid].clear();
                 prepareTasks[nid].clear();
                 prepareTaskStorage[nid].reserve(tasksPerNode);
                 prepareTasks[nid].reserve(tasksPerNode);
             }
+            size_t prepareTaskIndex = 0;
             for (int e = 0; e < (int)expertTasks.size(); e++) {
                 if (weights[e * 2] == nullptr ||
                     expertTasks[e].empty() || !cpuExperts.count(e)) {
                     continue;
                 }
                 int lines = expertTasks[e].size();
-                bool quantize = (e == 0 && quantizeSharedExpert) || IsDeepSeekV4QuantizedWeight(
-                    *weights[e * 2 + 1]);
+                const bool quantize = (e == 0 && quantizeSharedExpert) ||
+                    (e != 0 && activationQuantBlock == 32) ||
+                    IsDeepSeekV4QuantizedWeight(*weights[e * 2 + 1]);
                 for (int line = 0; line < lines; line++) {
                     size_t row = (size_t)offset + line;
                     bool routed = e != 0;
                     float routeWeight = routed ?
                         expertTasks[e][line].second : 1.0f;
-                    for (int nid = 0; nid < numaConfig->numaCnt;
-                         nid++) {
-                        int st = nid * interDimPerNuma;
-                        int end = st + interDimPerNuma;
+                    for (int st = 0; st < interDim; st += prepareColumns) {
+                        const int nid = prepareTaskIndex++ % numaConfig->numaCnt;
+                        const int end = st + prepareColumns;
                         prepareTaskStorage[nid].emplace_back(
                             gateUpOutput.data() + row * interDim * 2,
                             swigluOutput.data() + row * interDim,
@@ -7028,7 +7039,7 @@ namespace fastllm {
                 else pool->PushOp(i, &task);
             }
             if (threads > 1) for (int i = 0; i < threads; ++i) pool->Wait(i);
-        } else if (deepSeekV4Mode && useParallelDeepSeekV4Round) {
+        } else if (useDeepSeekV4PostOps) {
             auto &roundOps = fastllmMoeDataManagerNumas.roundOps;
             roundOps.clear();
             size_t count = (size_t)totalLines * dim;
@@ -8229,9 +8240,7 @@ namespace fastllm {
                     // GGUF retains its existing GEMM workers. Only activation
                     // preparation and reduction share the floating-point path.
                     const bool useQ8KPrepare = enableDeepSeekV4MoeFast &&
-                        IsQ8KActivationType(downInputDataType) &&
-                        interDim % QK_K == 0 &&
-                        (activationQuantBlock == 32 || activationQuantBlock == 128);
+                        CanPrepareDeepSeekV4Q8K(downInputDataType, interDim, activationQuantBlock);
                     const bool useParallelPrepare = useDeepSeekV4MoeFast || useQ8KPrepare;
                     bool reuseMoeTaskStorage =
                         useParallelPrepare &&

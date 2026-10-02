@@ -72,12 +72,27 @@ struct DiskFixtureFile {
     ~DiskFixtureFile() { unlink(path.c_str()); }
 };
 
+struct RestoreEnv {
+    const char *key;
+    bool present;
+    std::string value;
+    explicit RestoreEnv(const char *key) : key(key) {
+        const char *saved = std::getenv(key);
+        present = saved != nullptr;
+        if (saved) value = saved;
+    }
+    ~RestoreEnv() {
+        if (present) setenv(key, value.c_str(), 1);
+        else unsetenv(key);
+    }
+};
+
 int main(int argc, char **argv) {
     try {
-        const bool disk = argc > 1 && std::string(argv[1]) == "disk";
-        const bool cache = argc > 1 && std::string(argv[1]) == "cache";
-        const bool host = argc > 1 && std::string(argv[1]) == "host";
-        const bool decode = argc > 1 && std::string(argv[1]) == "decode";
+        const std::string mode = argc > 1 ? argv[1] : "";
+        const bool disk = mode == "disk", cache = mode == "cache", host = mode == "host";
+        const bool decode = mode == "decode", verify = mode == "verify";
+        const bool decodeOrVerify = decode || verify;
         // Exercise the row-wise decode path even for adversarial multi-row
         // fixtures; otherwise 2..8 rows take a separate grouped implementation.
         if (decode) setenv("FASTLLM_DSV4_DISABLE_NUMAS_MOE_GROUPED_DECODE", "1", 1);
@@ -95,10 +110,10 @@ int main(int argc, char **argv) {
         ((Executor*)GetExecutor())->SetFirstDevice(disk ? "disk" : "numa");
         if (disk) { SetMoeCpuCacheBytes(4 * 1024 * 1024); SetMoeCudaCacheBytes(0); }
         const int hidden = argc > 2 ? std::stoi(argv[2]) : 256;
-        const int inter = (host || decode) && argc > 3 ? std::stoi(argv[3]) : 256;
-        const int experts = cache ? 24 : decode ? 6 : 3, topk = (cache || decode) ? 6 : 2;
+        const int inter = (host || decodeOrVerify) && argc > 3 ? std::stoi(argv[3]) : 256;
+        const int experts = cache ? 24 : decodeOrVerify ? 6 : 3, topk = (cache || decodeOrVerify) ? 6 : 2;
         // Q4_K_R4 consumes Q8_K32, while Q2_K_R4 consumes Q8_K.
-        const bool q2Down = decode && argc > 4 && std::string(argv[4]) == "q2";
+        const bool q2Down = decodeOrVerify && argc > 4 && std::string(argv[4]) == "q2";
         std::vector<std::unique_ptr<Data>> owned;
         std::vector<Data*> weights(2 * (experts + 1), nullptr), biases(weights);
         std::vector<std::vector<float>> decoded(weights.size());
@@ -175,9 +190,10 @@ int main(int argc, char **argv) {
             // neither 16- nor 64-row aligned.
             host ? std::vector<int>{33, 65, 128, 408, 1023, 1024, 1041, 4096} :
             decode ? std::vector<int>{1, 3} :
+            verify ? std::vector<int>{1, 2, 3, 6, 8} :
             std::vector<int>{1, 7, 32, 64, 260, 2, 3, 6, 8};
         for (bool quantizeShared : {false, true}) for (int rows : batches) {
-            if ((cache || host || decode) && quantizeShared) continue;
+            if ((cache || host || decodeOrVerify) && quantizeShared) continue;
             std::vector<float> source(rows * hidden);
             std::vector<uint16_t> inputBits(source.size());
             for (size_t i = 0; i < source.size(); ++i) {
@@ -186,8 +202,8 @@ int main(int argc, char **argv) {
                 if (cache && rows == 6) source[i] = Bf16(source[i] * 32.f);
                 if (host && i / hidden == 1) source[i] = 0;
                 if (host && rows == 128) source[i] = Bf16(source[i] * 32.f);
-                if (decode && i / hidden == 1) source[i] = 0;
-                if (decode && i / hidden == 2) source[i] = Bf16(source[i] * 32.f);
+                if (decodeOrVerify && i / hidden == 1) source[i] = 0;
+                if (decodeOrVerify && i / hidden == 2) source[i] = Bf16(source[i] * 32.f);
                 if (host && rows == 65 && i/hidden%7 == 3 && i%256 < 2)
                     source[i] = i%256 == 0 ? 32.f : -32.f; // signed-maximum tie
                 uint32_t bits; memcpy(&bits, &source[i], sizeof(bits)); inputBits[i] = bits >> 16;
@@ -200,7 +216,7 @@ int main(int argc, char **argv) {
                 if (cache && rows == 3 && r == 1) scores[r * topk + k] = 0;
                 if (host && r%7 == 0) scores[r * topk + k] = 0;
                 if (host && r%7 == 2) scores[r * topk + k] *= -1;
-                if (decode && r == 2 && k % 2) scores[r * topk + k] *= -1;
+                if (decodeOrVerify && r == 2 && k % 2) scores[r * topk + k] *= -1;
             }
             Data input(BFLOAT16, {rows, hidden}, DataDevice::CPU, inputBits.data());
 #ifdef USE_CUDA
@@ -215,22 +231,58 @@ int main(int argc, char **argv) {
             Data score(FLOAT32, {rows, topk}, DataDevice::CPU, scores.data());
             MergeMOE(input, index, score, weights, biases, w1, w2, w3, currentInput, currentOutput,
                      0.7f, output, 0, MoeGateSwiglu, false, 10.f, true, nullptr, 32, quantizeShared);
+            if (verify) {
+                // The cache verifier uses the grouped path even for one row.
+                // Compare its scalar fallback exactly, including untouched GPU
+                // route slots, signed routing and non-BF16 clamp thresholds.
+                RestoreEnv fast("FASTLLM_DSV4_DISABLE_NUMAS_MOE_LARGE_FAST");
+                for (bool perRoute : {false, true}) for (bool subset : {false, true}) {
+                    if (subset && !perRoute) continue;
+                    std::vector<int32_t> gpuIds(ids.size(), -1);
+                    if (subset) for (size_t i = 0; i < ids.size(); ++i)
+                        if (ids[i] % 2) gpuIds[i] = ids[i];
+                    const size_t bytes = size_t(rows) * hidden *
+                        (perRoute ? topk * sizeof(float) : sizeof(uint16_t));
+                    std::vector<uint8_t> reference(bytes), actual(bytes);
+                    for (float limit : {0.f, 1.234567f, 10.f}) {
+                        auto run = [&](std::vector<uint8_t> &buffer) {
+                            std::fill(buffer.begin(), buffer.end(), 0x5a);
+                            NumasMoeVerifyExperts(inputBits.data(), buffer.data(), rows,
+                                weights.data(), weights.size(), ids.data(), gpuIds.data(),
+                                scores.data(), topk, 0, limit, perRoute);
+                        };
+                        setenv(fast.key, "1", 1); run(reference);
+                        unsetenv(fast.key); run(actual);
+                        if (reference != actual)
+                            throw std::runtime_error("Q2 cache verifier differs from scalar fallback");
+                    }
+                }
+                // The same preparation capability also admits V4 block-128
+                // activations. Exercise that public MergeMOE path separately
+                // from the V4.1 cache verifier's fixed block-32 boundary.
+                for (DataType type : {BFLOAT16, FLOAT32}) {
+                    Data check(type);
+                    auto merge = [&] {
+                        MergeMOE(input, index, score, weights, biases, w1, w2, w3,
+                                 currentInput, currentOutput, .7f, check, 0, MoeGateSwiglu,
+                                 false, 1.234567f, true, nullptr, 128, false);
+                    };
+                    setenv(fast.key, "1", 1); merge();
+                    std::vector<uint8_t> reference(check.cpuData, check.cpuData + check.GetBytes());
+                    unsetenv(fast.key); merge();
+                    if (memcmp(reference.data(), check.cpuData, reference.size()))
+                        throw std::runtime_error("Q2 grouped block-128 differs from scalar fallback");
+                }
+                printf("Q2 verifier exact: rows=%d hidden=%d inter=%d down=%s\n",
+                       rows, hidden, inter, q2Down ? "Q2" : "Q4");
+                continue;
+            }
             if (decode) {
                 // Compare the complete optimized operator byte-for-byte with
                 // its scalar fallback, including non-BF16 clamp thresholds,
                 // zero inputs, signed routes and both FP8 block sizes.
-                struct RestoreEnv {
-                    const char *key;
-                    bool present;
-                    std::string value;
-                    explicit RestoreEnv(const char *key) : key(key), present(std::getenv(key) != nullptr),
-                        value(present ? std::getenv(key) : "") {}
-                    ~RestoreEnv() {
-                        if (present) setenv(key, value.c_str(), 1);
-                        else unsetenv(key);
-                    }
-                } fast("FASTLLM_DSV4_DISABLE_NUMAS_MOE_FAST"),
-                  taskCache("FASTLLM_DSV4_DISABLE_NUMAS_MOE_TASK_CACHE");
+                RestoreEnv fast("FASTLLM_DSV4_DISABLE_NUMAS_MOE_FAST"),
+                           taskCache("FASTLLM_DSV4_DISABLE_NUMAS_MOE_TASK_CACHE");
                 for (int block : {32, 128}) for (float limit : {0.f, 1.234567f, 10.f}) {
                     for (DataType outputType : {BFLOAT16, FLOAT32}) {
                         Data check(outputType);
