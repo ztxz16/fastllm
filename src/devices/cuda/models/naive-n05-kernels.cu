@@ -14,6 +14,8 @@
 #if !defined(FASTLLM_CUDA_LEGACY_ONLY) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
 #define FASTLLM_NAIVE_SWA_FLASHINFER
 #include "naive-n05-swa-flashinfer.cuh"
+#define FASTLLM_NAIVE_DSA_MMA
+#include "naive-n05-dsa-mma.cuh"
 #endif
 
 namespace {
@@ -933,6 +935,22 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
     }
     Data scores;
     Output(scores, DataType::FLOAT32, {queries, heads, count});
+#ifdef FASTLLM_NAIVE_DSA_MMA
+    // Sixteen Q heads share each gathered K/V tile. Preserve materialized
+    // BF16-rounded logits/probabilities; MMA changes FP32 reduction order.
+    const bool useMma = queries >= 32 && (size_t)queries * heads >= 2048 && window == 0 &&
+        heads % kvHeads == 0 && (heads / kvHeads) % naive_dsa_mma::kHeads == 0 &&
+        dim == naive_dsa_mma::kQkDim && valueDim == naive_dsa_mma::kValueDim &&
+        key.dims[2] % 8 == 0 && (size_t)query.cudaData % 16 == 0 &&
+        (size_t)key.cudaData % 16 == 0 && (size_t)value.cudaData % 16 == 0 &&
+        FastllmCudaFlashInferDataTypeSupported(DataType::BFLOAT16);
+    if (useMma) {
+        naive_dsa_mma::Scores<<<dim3(queries, heads / naive_dsa_mma::kHeads,
+            (count + naive_dsa_mma::kKeys - 1) / naive_dsa_mma::kKeys), naive_dsa_mma::kThreads>>>(
+            (const BF16 *)query.cudaData, (const BF16 *)key.cudaData, selected, (float *)scores.cudaData,
+            heads, kvHeads, key.dims[2], keys, count, pastLength, causal);
+    } else
+#endif
     // Small query blocks need the original per-head CTA count for occupancy.
     if (queries >= 32 && dim <= 192 && heads / kvHeads >= 2) {
         AttentionScoresPrefillGrouped<<<dim3(kvHeads, queries, (heads / kvHeads + 1) / 2), 128>>>(
@@ -950,6 +968,13 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
     }
     AttentionSoftmax<<<queries * heads, 256>>>((float *)scores.cudaData,
         sink.dims.empty() ? nullptr : (const float *)sink.cudaData, heads, count);
+#ifdef FASTLLM_NAIVE_DSA_MMA
+    if (useMma) {
+        naive_dsa_mma::Values<<<dim3(queries, heads / naive_dsa_mma::kHeads), naive_dsa_mma::kThreads>>>(
+            (const float *)scores.cudaData, (const BF16 *)value.cudaData, selected, (BF16 *)output.cudaData,
+            heads, kvHeads, keys, count, pastLength, causal);
+    } else
+#endif
     if (queries == 1) {
         AttentionValuesTiled<<<dim3(heads, queries, (valueDim + 31) / 32), 256>>>((const float *)scores.cudaData,
             (const BF16 *)value.cudaData, selected, (BF16 *)output.cudaData,

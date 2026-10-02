@@ -432,6 +432,88 @@ static void TestAttentionGroupedScores() {
     }
 }
 
+// Independent FP64 reference for the global GQA path. Reproduce the model's
+// two logits roundings and probability rounding, but not either GPU reduction.
+static void TestAttentionGlobalMma() {
+    struct Shape { int rows, keys, count, heads, kvHeads, padding; bool selected; };
+    for (auto s : {Shape{32,512,512,64,4,0,false}, Shape{33,515,513,64,4,128,true},
+                   Shape{32,2048,2051,64,4,0,true}, Shape{64,2048,2048,32,1,8,true},
+                   Shape{32,515,257,128,4,128,true}, Shape{32,4096,2048,64,4,128,true}})
+    for (bool causal : {false,true}) for (int mode=0;mode<5;++mode) {
+        constexpr int dim=192,valueDim=128;
+        int past=s.keys-s.rows,stride=s.kvHeads*dim+s.padding;
+        Data q(BFLOAT16),k(BFLOAT16),v(BFLOAT16),indices(INT32),sink(FLOAT32),out;
+        Upload(q,{1,s.rows,s.heads*dim},53); Upload(k,{1,s.keys,stride},71);
+        Upload(v,{1,s.keys,s.kvHeads*valueDim},113);
+        auto qb=Read<uint16_t>(q),kb=Read<uint16_t>(k),vb=Read<uint16_t>(v);
+        if (mode==1 || mode==3) {
+            for (auto &x:qb) x=Float32ToBFloat16RNEBits(mode==3?0:4*FromBits(x));
+            for (auto &x:kb) x=Float32ToBFloat16RNEBits(mode==3?0:4*FromBits(x));
+            if (mode==3) {
+                for (auto &x:vb) x=Float32ToBFloat16RNEBits(.375f);
+                Require(cudaMemcpy(v.cudaData,vb.data(),vb.size()*2,cudaMemcpyHostToDevice)==cudaSuccess,"global V upload");
+            }
+            Require(cudaMemcpy(q.cudaData,qb.data(),qb.size()*2,cudaMemcpyHostToDevice)==cudaSuccess,"global Q upload");
+            Require(cudaMemcpy(k.cudaData,kb.data(),kb.size()*2,cudaMemcpyHostToDevice)==cudaSuccess,"global K upload");
+        }
+        std::vector<int> selected;
+        if (s.selected) {
+            selected.resize(s.rows*s.count);
+            indices.Resize({s.rows,s.count});indices.Allocate();
+            for (int r=0;r<s.rows;++r) for (int slot=0;slot<s.count;++slot) {
+                int key=(slot*137+r*13)%s.keys;
+                if (slot%97==0 || r==0 || mode==4) key=-1;
+                else if (slot%193==1) key=s.keys+7;
+                selected[r*s.count+slot]=key;
+            }
+            std::memcpy(indices.cpuData,selected.data(),selected.size()*sizeof(int));
+            indices.ToDevice(DataDevice::CUDA,{0},true);
+        }
+        bool withSink=mode!=0;
+        std::vector<float> sinks;
+        if (withSink) {
+            sinks.resize(s.heads);
+            sink.Resize({s.heads});sink.Allocate();
+            for(int h=0;h<s.heads;++h) sinks[h]=(h%3-1)*(mode==2?80.f:1.3f);
+            std::memcpy(sink.cpuData,sinks.data(),sinks.size()*sizeof(float));
+            sink.ToDevice(DataDevice::CUDA,{0},true);
+        }
+        FastllmCudaNaiveAttention(q,k,v,indices,sink,s.heads,s.kvHeads,dim,valueDim,past,0,out,causal);
+        auto actual=Read<uint16_t>(out);
+        for (auto x:actual) Require(std::isfinite(FromBits(x)),"global nonfinite output");
+        double error=0,norm=0;
+        for (int r:{0,s.rows/2,s.rows-1}) for (int h:{0,s.heads/2,s.heads-1}) {
+            std::vector<double> probs(s.count);std::vector<int> valid(s.count,-1);
+            double maximum=withSink?sinks[h]:-INFINITY;
+            for (int slot=0;slot<s.count;++slot) {
+                int key=s.selected?selected[r*s.count+slot]:slot;
+                double score=-INFINITY;
+                if (key>=0 && key<s.keys && (!causal || key<=past+r)) {
+                    valid[slot]=key; double dot=0;
+                    for(int d=0;d<dim;++d) dot+=double(FromBits(qb[((size_t)r*s.heads+h)*dim+d]))*
+                        FromBits(kb[(size_t)key*stride+(h/(s.heads/s.kvHeads))*dim+d]);
+                    score=Rounded(Rounded(float(dot))/std::sqrt(float(dim)));
+                }
+                probs[slot]=score;maximum=std::max(maximum,score);
+            }
+            double denominator=withSink?std::exp(sinks[h]-maximum):0;
+            for(auto &p:probs){p=std::isfinite(maximum)?std::exp(p-maximum):0;denominator+=p;}
+            for(auto &p:probs)p=denominator>0?Rounded(float(p/denominator)):0;
+            for(int d:{0,31,64,127}) {
+                double expected=0;
+                for(int slot=0;slot<s.count;++slot) if(valid[slot]>=0)
+                    expected+=probs[slot]*FromBits(vb[((size_t)valid[slot]*s.kvHeads+h/(s.heads/s.kvHeads))*valueDim+d]);
+                expected=Rounded(float(expected));
+                double got=FromBits(actual[((size_t)r*s.heads+h)*valueDim+d]);
+                Require(std::abs(got-expected)<=.012,"global attention differs from independent reference");
+                error+=(got-expected)*(got-expected);norm+=expected*expected;
+            }
+        }
+        Require(std::sqrt(error/std::max(norm,1e-30))<=.01,"global relative error exceeds 1 percent");
+        ++checks;
+    }
+}
+
 // Standard causal SWA, including the learned zero-value sink, evaluated with
 // independent double-precision dots/softmax on sampled rows and output columns.
 // FlashInfer changes the reduction/rounding order, so compare numerically.
@@ -505,7 +587,7 @@ int main(int argc,char **argv) {
                 "usage: naive_n05_decode_test [--quick]");
         quick = argc == 2;
         SetThreads(4);
-        TestTopK(); TestBatchedTopK(); TestCache(); TestCacheReservation(); TestRopeWidths(); TestAttentionWidths(); TestAttentionSelectedValues(); TestAttentionGroupedScores(); TestAttentionSwa();
+        TestTopK(); TestBatchedTopK(); TestCache(); TestCacheReservation(); TestRopeWidths(); TestAttentionWidths(); TestAttentionSelectedValues(); TestAttentionGroupedScores(); TestAttentionGlobalMma(); TestAttentionSwa();
         Require(cudaDeviceSynchronize()==cudaSuccess,"CUDA final synchronization failed");
         std::printf("Naive decode regression passed: %d cases\n",checks);
     }catch(const std::exception&e){std::fprintf(stderr,"%s\n",e.what());return 1;}
