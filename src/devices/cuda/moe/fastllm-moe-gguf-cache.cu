@@ -52,7 +52,8 @@ template<bool IsGate>
 __device__ __forceinline__ const uint8_t *ExpertWeight(
         const FastllmCudaMoeGGUFCacheView &view, int route) {
     const int slot = view.routeSlots[route];
-    return slot < 0 ? nullptr : view.records + size_t(slot)*view.recordStride +
+    return slot < 0 ? nullptr : view.records +
+        (view.slotOffsets ? view.slotOffsets[slot] : size_t(slot)*view.recordStride) +
         (IsGate ? 0 : view.downOffset);
 }
 template<bool IsGate>

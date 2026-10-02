@@ -22,6 +22,8 @@ struct ExpertCacheView {
     // Optional mapped host mirror. Read on the CPU only after synchronizing
     // the stream that updates this view; graph replay updates it as well.
     int32_t *hostKeyToSlot = nullptr;
+    // Zero count selects the entire cache (legacy callers).
+    int slotBegin = 0, slotCount = 0;
 };
 
 namespace expert_cache_detail {
@@ -78,6 +80,7 @@ __global__ void LruEnsureKernel(
     __shared__ unsigned long long tick;
     __shared__ Candidate warps[Threads / 32];
     const int tid = threadIdx.x;
+    const int end = cache.slotBegin + (cache.slotCount ? cache.slotCount : cache.slots);
     if (tid == 0) {
         tick = *cache.step + 1;
         *cache.step = tick;
@@ -87,7 +90,7 @@ __global__ void LruEnsureKernel(
         int key = expert >= 0 && expert < numExperts ? keyBase + expert : -1;
         keys[q] = key;
         int slot = key >= 0 ? cache.keyToSlot[key] : -1;
-        resident[q] = slot >= 0 && slot < cache.slots && cache.slotKeys[slot] == key
+        resident[q] = slot >= cache.slotBegin && slot < end && cache.slotKeys[slot] == key
             ? slot : -1;
     }
     __syncthreads();
@@ -125,8 +128,8 @@ __global__ void LruEnsureKernel(
     if constexpr (CachedItems > 0) {
         #pragma unroll
         for (int i = 0; i < CachedItems; ++i) {
-            int slot = tid + i * Threads;
-            unsigned long long age = slot < cache.slots ? cache.lastUsed[slot] : ULLONG_MAX;
+            int slot = cache.slotBegin + tid + i * Threads;
+            unsigned long long age = slot < end ? cache.lastUsed[slot] : ULLONG_MAX;
             ages[i] = age == tick ? ULLONG_MAX : age;
         }
     }
@@ -135,11 +138,11 @@ __global__ void LruEnsureKernel(
         if constexpr (CachedItems > 0) {
             #pragma unroll
             for (int i = 0; i < CachedItems; ++i) {
-                int slot = tid + i * Threads;
-                if (slot < cache.slots) best = Earlier(best, Candidate{ages[i], slot});
+                int slot = cache.slotBegin + tid + i * Threads;
+                if (slot < end) best = Earlier(best, Candidate{ages[i], slot});
             }
         } else {
-            for (int slot = tid; slot < cache.slots; slot += Threads) {
+            for (int slot = cache.slotBegin + tid; slot < end; slot += Threads) {
                 unsigned long long age = cache.lastUsed[slot];
                 best = Earlier(best, Candidate{age == tick ? ULLONG_MAX : age, slot});
             }
@@ -152,7 +155,7 @@ __global__ void LruEnsureKernel(
         if constexpr (CachedItems > 0) {
             #pragma unroll
             for (int i = 0; i < CachedItems; ++i)
-                if (tid + i * Threads == best.slot) ages[i] = ULLONG_MAX;
+                if (cache.slotBegin + tid + i * Threads == best.slot) ages[i] = ULLONG_MAX;
         }
         __syncthreads();
     }
@@ -182,7 +185,7 @@ inline void Launch(ExpertCacheView cache, const int32_t *indices,
                    int keyBase, int numExperts, int queries,
                    int32_t *routes, int32_t *experts, int32_t *slots,
                    int32_t *missing, cudaStream_t stream) {
-    if (cache.slots <= Threads * 16)
+    if ((cache.slotCount ? cache.slotCount : cache.slots) <= Threads * 16)
         LruEnsureKernel<Threads, 16, MaxQueries><<<1, Threads, 0, stream>>>(
             cache, indices, keyBase, numExperts, queries, routes, experts, slots, missing);
     else
@@ -208,7 +211,9 @@ inline bool EnsureExpertCache(ExpertCacheView cache, const int32_t *indices,
                               int keyBase, int numExperts, int queries,
                               int32_t *routes, int32_t *experts, int32_t *slots,
                               int32_t *missing, int threads, cudaStream_t stream) {
-    if (queries < 1 || queries > MaxQueries || cache.slots < queries ||
+    const int count = cache.slotCount ? cache.slotCount : cache.slots;
+    if (cache.slotBegin < 0 || count < queries || cache.slotBegin > cache.slots - count ||
+        queries < 1 || queries > MaxQueries || cache.slots < queries ||
         keyBase < 0 || numExperts < 1 || numExperts > INT_MAX - keyBase) return false;
     #define FASTLLM_LRU_LAUNCH(T) \
         expert_cache_detail::Launch<T, MaxQueries>(cache, indices, keyBase, numExperts, \

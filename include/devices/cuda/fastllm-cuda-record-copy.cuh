@@ -17,6 +17,8 @@ struct RecordCopyView {
     size_t sourcePitch;
     size_t destinationPitch;
     size_t bytesPerRecord;
+    // Optional device byte offsets; each must have the same alignment as the pitch.
+    const uint64_t *destinationOffsets = nullptr;
 };
 
 struct RecordCopyLaunch { int blocks; int threads; };
@@ -58,7 +60,8 @@ __global__ void CopyKernel(RecordCopyView view, const int32_t *sourceIds,
             size_t(sourceIds[record]) * view.sourcePitch);
         Unit *destination = reinterpret_cast<Unit *>(
             static_cast<uint8_t *>(view.destination) +
-            size_t(destinationIds[record]) * view.destinationPitch);
+            (view.destinationOffsets ? view.destinationOffsets[destinationIds[record]] :
+             size_t(destinationIds[record]) * view.destinationPitch));
         destination[unit] = source[unit];
     }
 }

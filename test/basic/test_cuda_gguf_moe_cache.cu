@@ -173,7 +173,7 @@ template<class T> static void CheckReference(ggml_type type, fastllm::DataType d
         }
 }
 
-template<class T> static void Run(ggml_type type, fastllm::DataType dtype, int batch = 1) {
+template<class T> static void Run(ggml_type type, fastllm::DataType dtype, int batch = 1, bool compact = false) {
     const int hidden = 256, inter = 256, experts = 24, topk = 10;
     std::vector<std::unique_ptr<fastllm::Data>> owned;
     std::vector<fastllm::Data *> tables[2];
@@ -193,7 +193,7 @@ template<class T> static void Run(ggml_type type, fastllm::DataType dtype, int b
         stride = std::max(stride, ((gate + 15) / 16 * 16 + down + 127) / 128 * 128);
         layers[layer] = {tables[layer].data(), int(tables[layer].size())};
     }
-    fastllm::SetMoeCudaCacheBytes(16 * stride);
+    fastllm::SetMoeCudaCacheBytes((compact ? 32 : 16) * stride);
     bool called = false;
     if (type == GGML_TYPE_F32) {
         tables[0][2]->isGGUFData = false;
@@ -249,7 +249,9 @@ template<class T> static void Run(ggml_type type, fastllm::DataType dtype, int b
         if (pass < 2 && batch == 1) {
             Require(fastllm_moe_cuda_cache_stats(0, stats, false), "stats snapshot failed");
             Require(stats[0] == uint64_t(pass * topk) && stats[1] == topk, "cold/hot counter mismatch");
-            Require(stats[2] == stride * 16 && stats[3] == 16 && stats[4] == 48, "cache allocation counters mismatch");
+            if (compact) Require(stats[2] <= stride * 32 && stats[3] > 32 && stats[4] == 48,
+                "compact cache failed to hold more experts in the budget");
+            else Require(stats[2] == stride * 16 && stats[3] == 16 && stats[4] == 48, "cache allocation counters mismatch");
         }
         const int intermediate = layer == 0 ? inter : inter * 2;
         const bool useQ8 = FastllmCudaMoeGGUFCacheQ8Supported(tables[layer][2]->ggmlType,
@@ -798,6 +800,11 @@ int main(int argc, char **argv) {
             if (count >= 2) RunHost<float>(GGML_TYPE_IQ2_XXS, fastllm::FLOAT32, 1);
             std::puts("PASS: streamed GGUF prefill, NUMA shards, selected subsets, immutable weights");
             return 0;
+        }
+        if (argc > 1 && std::strcmp(argv[1], "--compact") == 0) {
+            Run<float>(GGML_TYPE_IQ3_S, fastllm::FLOAT32, 1, true);
+            Run<half>(GGML_TYPE_IQ4_XS, fastllm::FLOAT16, 4, true);
+            std::puts("PASS: compact heterogeneous GGUF cache and graph replay"); return 0;
         }
         bool tpOnly = argc > 1 && std::strcmp(argv[1], "--tp-shards") == 0;
         if (argc > 1 && std::strcmp(argv[1], "--mmq") == 0) {

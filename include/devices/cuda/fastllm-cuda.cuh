@@ -1753,6 +1753,7 @@ struct FastllmCudaMoeGGUFCacheView {
     int gateType, downType, hidden, inter;
     void *workspace = nullptr;
     size_t workspaceBytes = 0;
+    const uint64_t *slotOffsets = nullptr;
 };
 bool FastllmCudaMoeGGUFCacheSupported(int type, int columns);
 // Q8_1 input/mid activations and per-expert down results, reused on one stream.

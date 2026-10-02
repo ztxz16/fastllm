@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <stdexcept>
 #include <vector>
 
 namespace fastllm {
@@ -53,14 +54,22 @@ public:
 };
 
 // Observe every routed expert, including CPU work, in a payload-free LRU with
-// the real cache capacity. This estimates reuse without copying cold weights
+// the real capacity and record-size partitions. This estimates reuse without copying cold weights
 // into a small cache just to find out that they will be evicted immediately.
 class MoeDecodePolicy {
 public:
     enum class Mode { Hybrid, FillGpu, MeasureGpu, Gpu };
 
     MoeDecodePolicy(int records, int capacity)
-        : links(records), capacity(std::min(records, capacity)) {}
+        : links(records), partitions(1) { partitions[0].capacity = std::max(0, std::min(records, capacity)); }
+
+    MoeDecodePolicy(const std::vector<int> &partitionForKey, const std::vector<int> &capacities)
+        : links(partitionForKey.size()), keyPartitions(partitionForKey), partitions(capacities.size()) {
+        for (int id : keyPartitions)
+            if (id < 0 || id >= int(partitions.size())) throw std::invalid_argument("invalid cache partition");
+        for (size_t i = 0; i < capacities.size(); ++i)
+            partitions[i].capacity = std::max(0, capacities[i]);
+    }
 
     bool UseGpu() const { return mode != Mode::Hybrid; }
     Mode GetMode() const { return mode; }
@@ -72,27 +81,29 @@ public:
     void ObserveRoutes(int base, const int *experts, int count) {
         for (int i = 0; i < count; ++i) {
             const int key = base + experts[i];
-            if (experts[i] < 0 || key < 0 || key >= int(links.size()) || capacity <= 0) {
+            if (experts[i] < 0 || key < 0 || key >= int(links.size())) {
                 continue;
             }
+            auto &part = partitions[keyPartitions.empty() ? 0 : keyPartitions[key]];
             ++routes;
+            if (part.capacity <= 0) { ++misses; continue; }
             auto &entry = links[key];
             if (entry.present) {
-                Unlink(key);
+                Unlink(key, part);
             } else {
                 ++misses;
-                if (used == capacity) {
-                    const int victim = tail;
-                    Unlink(victim);
+                if (part.used == part.capacity) {
+                    const int victim = part.tail;
+                    Unlink(victim, part);
                     links[victim].present = false;
-                } else ++used;
+                } else ++part.used;
                 entry.present = true;
             }
             entry.previous = -1;
-            entry.next = head;
-            if (head >= 0) links[head].previous = key;
-            else tail = key;
-            head = key;
+            entry.next = part.head;
+            if (part.head >= 0) links[part.head].previous = key;
+            else part.tail = key;
+            part.head = key;
         }
     }
 
@@ -155,25 +166,27 @@ public:
 private:
     struct Link { int previous = -1, next = -1; bool present = false; };
     std::vector<Link> links;
-    int capacity, used = 0, head = -1, tail = -1;
+    struct Partition { int capacity = 0, used = 0, head = -1, tail = -1; };
+    std::vector<int> keyPartitions;
+    std::vector<Partition> partitions;
     Mode mode = Mode::Hybrid;
     MoeDecodeScheduler::Estimate hybrid, gpu;
     int steps = 0, cooldown = 0;
     uint64_t routes = 0, misses = 0;
     double missRate = 1.0;
 
-    void Unlink(int key) {
+    void Unlink(int key, Partition &part) {
         const auto &entry = links[key];
         if (entry.previous >= 0) links[entry.previous].next = entry.next;
-        else head = entry.next;
+        else part.head = entry.next;
         if (entry.next >= 0) links[entry.next].previous = entry.previous;
-        else tail = entry.previous;
+        else part.tail = entry.previous;
     }
     void ReturnToHybrid(int delay) {
         mode = Mode::Hybrid;
         cooldown = delay;
-        steps = used = 0;
-        head = tail = -1;
+        steps = 0;
+        for (auto &part : partitions) { part.used = 0; part.head = part.tail = -1; }
         routes = misses = 0;
         std::fill(links.begin(), links.end(), Link{});
     }

@@ -23,7 +23,7 @@ template<class T> struct Buffer {
     void put(const std::vector<T> &v) { Check(cudaMemcpy(data, v.data(), v.size()*sizeof(T), cudaMemcpyHostToDevice)); }
     std::vector<T> get() { std::vector<T> v(count); Check(cudaMemcpy(v.data(), data, count*sizeof(T), cudaMemcpyDeviceToHost)); return v; }
 };
-struct Request { int base; std::vector<int> ids; };
+struct Request { int base; std::vector<int> ids; int slotBegin = 0, slotCount = 0; };
 struct Mirror {
     int *host=nullptr, *device=nullptr;
     explicit Mirror(size_t count) {
@@ -55,7 +55,11 @@ struct Reference {
             else need.push_back(key);
         }
         for (int key:need) {
-            auto victim=*order.begin();
+            auto it = order.begin();
+            const int end = r.slotBegin + (r.slotCount ? r.slotCount : int(owner.size()));
+            while (it != order.end() && (it->second < r.slotBegin || it->second >= end)) ++it;
+            if (it == order.end()) throw std::runtime_error("empty partition");
+            auto victim=*it;
             if (victim.first==tick) throw std::runtime_error("no evictable slot");
             int s=victim.second;
             if(owner[s]>=0) mapping[owner[s]]=-1;
@@ -80,6 +84,7 @@ static void Run(const std::vector<Request> &requests, int experts, int records,
     cudaStream_t stream; Check(cudaStreamCreate(&stream));
     auto launch=[&] {
         for(size_t i=0;i<n;++i) {
+            view.slotBegin = requests[i].slotBegin; view.slotCount = requests[i].slotCount;
             bool ok = k<=16 ? fastllm::cuda::EnsureExpertCache<16>(view,input.data+i*k,requests[i].base,experts,k,
                     routes.data+i*k,ids.data+i*k,dest.data+i*k,missing.data+i,threads,stream)
                 : fastllm::cuda::EnsureExpertCache<128>(view,input.data+i*k,requests[i].base,experts,k,
@@ -161,6 +166,12 @@ int main(int argc,char **argv) {
             }
             std::vector<Request> small{{0,{0,1,1,-1}},{17,{2,3,4,5}},{0,{0,4,5,6}}};
             for(int threads:{32,64,128,256}) Run(small,17,34,17,threads,false);
+            std::vector<Request> partitioned{
+                {0,{0,1,1,-1},3,5}, {17,{2,3,4,5},11,5},
+                {0,{2,3,4,5},3,5}, {17,{2,3,4,5},11,5},
+                {0,{0,1,5,6},3,5}, {17,{0,1,6,7},11,5}};
+            for (int threads : {32,128,256}) for (bool graph : {false,true})
+                Run(partitioned,17,34,19,threads,graph,3);
             fastllm::cuda::ExpertCacheView empty{};
             if(fastllm::cuda::EnsureExpertCache(empty,nullptr,0,1,0,nullptr,nullptr,nullptr,nullptr,128,nullptr))
                 throw std::runtime_error("invalid query count accepted");

@@ -10,6 +10,7 @@
 
 #include "fastllm-cuda.cuh"
 #include "fastllm-cuda-expert-cache.cuh"
+#include "fastllm-cuda-cache-layout.h"
 #include "fastllm-cuda-record-copy.cuh"
 #include "fastllm-cuda-shared-weight.cuh"
 #include "fastllm.h"
@@ -136,8 +137,20 @@ struct DecodePolicyState {
     fastllm::MoeDecodePolicy policy;
     int layers, topk;
     double startUs = 0;
-    DecodePolicyState(int records, int slots, int layers, int topk)
-        : policy(records, slots), layers(layers), topk(topk) {}
+    DecodePolicyState(int records, int slots, int layers, int topk,
+                      const std::vector<fastllm::cuda::CacheSlotSpan> &spans)
+        : policy(records, slots), layers(layers), topk(topk) {
+        if (spans.empty()) return;
+        std::unordered_map<int, int> ids;
+        std::vector<int> keys(records), capacities;
+        const int experts = records / layers;
+        for (int layer = 0; layer < layers; ++layer) {
+            auto inserted = ids.emplace(spans[layer].begin, capacities.size());
+            if (inserted.second) capacities.push_back(spans[layer].count);
+            std::fill_n(keys.begin() + layer * experts, experts, inserted.first->second);
+        }
+        policy = fastllm::MoeDecodePolicy(keys, capacities);
+    }
 };
 
 // Independent buffers/estimates: verify has more routes and must not teach
@@ -182,6 +195,9 @@ struct DeviceCache {
     fastllm::cuda::RecordCopyLaunch copyLaunch{0, 0};
     int ensureThreads = 0;
     uint8_t *records = nullptr;
+    size_t recordBytes = 0;
+    uint64_t *slotOffsets = nullptr;
+    std::vector<fastllm::cuda::CacheSlotSpan> layerSlots;
     int32_t *keyToSlot = nullptr;
     int32_t *hostKeyToSlot = nullptr, *mappedKeyToSlot = nullptr;
     int32_t *slotKeys = nullptr;
@@ -207,9 +223,10 @@ struct DeviceCache {
 
 struct OffloadGroup {
     OffloadLayout layout;
-    // GGUF layers may use different gate/down encodings. Slot allocation and
-    // LRU metadata use the largest record; each layer keeps its byte layout.
+    // GGUF layers keep their actual record size in host storage and share
+    // GPU slot partitions with other layers of the same size.
     std::vector<OffloadLayout> layerLayouts;
+    std::vector<size_t> layerHostOffsets;
     size_t totalRecords = 0;
     uint8_t *hostRecords = nullptr;
     uint8_t *deviceHostRecords = nullptr;
@@ -599,6 +616,7 @@ void ReleaseDeviceCache(DeviceCache &cache) {
     cache.batchHybrid.reset();
     cache.decode.reset();
     cudaFree(cache.records);
+    cudaFree(cache.slotOffsets);
     cudaFree(cache.keyToSlot);
     cudaFreeHost(cache.hostKeyToSlot);
     cudaFree(cache.slotKeys);
@@ -709,8 +727,7 @@ DeviceCache *GetDeviceCache(OffloadGroup &group) {
     const size_t reserveBytes = std::min(
         freeBytes, DeviceMemoryReserveBytes(totalBytes));
     if (group.layout.weightType == fastllm::DataType::DATA_GGUF_FORMAT) {
-        // Allocate before capture; heterogeneous layers share the largest
-        // workspace, just as they share the record stride and route metadata.
+        // Allocate before capture; heterogeneous layers share the largest workspace.
         for (const auto &layout : group.layerLayouts) {
             cache.ggufWorkspaceBytes = std::max(cache.ggufWorkspaceBytes,
                 FastllmCudaMoeGGUFCacheWorkspaceBytes(layout.hidden, layout.inter));
@@ -719,14 +736,26 @@ DeviceCache *GetDeviceCache(OffloadGroup &group) {
     const size_t metadataBytes =
         group.totalRecords * sizeof(int32_t) +
         group.numaPointers.size() * sizeof(void *) +
-        slots * (sizeof(int32_t) + sizeof(unsigned long long) +
+        group.totalRecords * (sizeof(int32_t) + sizeof(unsigned long long) + sizeof(uint64_t) +
             Fp8PointerTableCount(group.layout.weightType) * sizeof(void *)) + 4096 +
         cache.ggufWorkspaceBytes;
     size_t usableBytes = freeBytes > reserveBytes
         ? freeBytes - reserveBytes : 0;
     usableBytes = usableBytes > metadataBytes
         ? usableBytes - metadataBytes : 0;
-    slots = std::min(slots, usableBytes / group.layout.recordStride);
+    fastllm::cuda::CacheSlotPlan slotPlan;
+    if (!group.layerLayouts.empty()) {
+        std::vector<size_t> strides;
+        for (const auto &layout : group.layerLayouts) strides.push_back(layout.recordStride);
+        slotPlan = fastllm::cuda::PlanCacheSlots(strides, group.layout.experts,
+            std::min(uint64_t(usableBytes), budgetBytes), kMaxTopK);
+        slots = slotPlan.offsets.size();
+        cache.recordBytes = slotPlan.bytes;
+        cache.layerSlots = slotPlan.layers;
+    } else {
+        slots = std::min(slots, usableBytes / group.layout.recordStride);
+        cache.recordBytes = slots * group.layout.recordStride;
+    }
     if (slots < kMaxTopK) {
         std::fprintf(stderr,
             "[Fastllm] CUDA expert cache has insufficient free GPU "
@@ -750,7 +779,7 @@ DeviceCache *GetDeviceCache(OffloadGroup &group) {
         (cache.ggufWorkspaceBytes == 0 ||
             AllocateOne(&cache.ggufWorkspace, cache.ggufWorkspaceBytes)) &&
         AllocateOne(reinterpret_cast<void **>(&cache.records),
-                    slots * group.layout.recordStride) &&
+                    cache.recordBytes) &&
         AllocateOne(reinterpret_cast<void **>(&cache.keyToSlot),
                     group.totalRecords * sizeof(int32_t)) &&
         AllocateOne(reinterpret_cast<void **>(&cache.slotKeys),
@@ -784,6 +813,11 @@ DeviceCache *GetDeviceCache(OffloadGroup &group) {
         cudaMemsetAsync(cache.totalMissCount, 0,
             sizeof(unsigned long long), cudaStreamPerThread) == cudaSuccess &&
         PrepareFp8SlotPointers(cache, group.layout);
+    if (initialized && !slotPlan.offsets.empty()) {
+        const size_t bytes = slots * sizeof(uint64_t);
+        initialized = AllocateOne(reinterpret_cast<void **>(&cache.slotOffsets), bytes) &&
+            cudaMemcpy(cache.slotOffsets, slotPlan.offsets.data(), bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+    }
     if (initialized && !group.numaPointers.empty()) {
         std::vector<void *> pointers(group.numaPointers.size());
         for (size_t i = 0; initialized && i < pointers.size(); ++i) {
@@ -825,7 +859,7 @@ DeviceCache *GetDeviceCache(OffloadGroup &group) {
         "[Fastllm] %s GPU expert cache: %d slots, %.3f GiB, "
         "%zu records in mapped host storage; refill grid %d x %d.\n",
         FormatName(group.layout.weightType), cache.slots,
-        static_cast<double>(slots * group.layout.recordStride) /
+        static_cast<double>(cache.recordBytes) /
             (1024.0 * 1024.0 * 1024.0),
         group.totalRecords, cache.copyLaunch.blocks, cache.copyLaunch.threads);
     return &cache;
@@ -1409,7 +1443,6 @@ bool FastllmCudaPrepareMoeCache(
     group->layout = layout;
     if (layout.weightType == fastllm::DataType::DATA_GGUF_FORMAT) {
         group->layerLayouts = std::move(layerLayouts);
-        for (auto &layer : group->layerLayouts) layer.recordStride = layout.recordStride;
     }
     if (static_cast<size_t>(layerCount) >
             static_cast<size_t>(INT_MAX) /
@@ -1442,7 +1475,11 @@ bool FastllmCudaPrepareMoeCache(
     if (shareNuma && (!storage || layout.recordStride > UINT32_MAX / kMaxTopK ||
                       !storage->plan(layout, group->sharedLayout))) return false;
     const size_t hostStride = shareNuma ? group->sharedLayout.auxiliaryBytes : layout.recordStride;
-    const size_t hostBytes = group->totalRecords * hostStride;
+    size_t hostBytes = 0;
+    for (int layer = 0; layer < layerCount; ++layer) {
+        group->layerHostOffsets.push_back(hostBytes);
+        hostBytes += size_t(experts) * (shareNuma ? hostStride : group->LayerLayout(layer).recordStride);
+    }
     void *host = nullptr;
     std::unique_ptr<void, decltype(&cudaFreeHost)> hostOwner(nullptr, cudaFreeHost);
     if (hostBytes) {
@@ -1474,13 +1511,14 @@ bool FastllmCudaPrepareMoeCache(
             fastllm::Data *gate = layers[layer].weights[position];
             fastllm::Data *down = layers[layer].weights[position + 1];
             uint8_t *record = hostBytes ? group->hostRecords +
-                (size_t(layer) * experts + expert) * hostStride : nullptr;
+                group->layerHostOffsets[layer] + size_t(expert) *
+                    (shareNuma ? hostStride : recordLayout.recordStride) : nullptr;
             if (shareNuma) {
                 expertWeights.push_back(gate);
                 expertWeights.push_back(down);
                 storage->snapshot(layout, *gate, *down, record);
             } else {
-                if (!group->layerLayouts.empty()) memset(record, 0, layout.recordStride);
+                if (!group->layerLayouts.empty()) memset(record, 0, recordLayout.recordStride);
                 memcpy(record, gate->cpuData, recordLayout.gateBytes);
                 memcpy(record + recordLayout.downOffset, down->cpuData, recordLayout.downBytes);
                 if (layout.gateScaleBytes) {
@@ -1691,7 +1729,7 @@ bool ComputeGGUFCache(const fastllm::Data &input, fastllm::Data &gateOutput,
     const FastllmCudaMoeGGUFCacheView view{
         cache.records, cache.routeSlots, layout.recordStride, layout.downOffset,
         layout.gateGgmlType, layout.downGgmlType, layout.hidden, layout.inter,
-        cache.ggufWorkspace, cache.ggufWorkspaceBytes};
+        cache.ggufWorkspace, cache.ggufWorkspaceBytes, cache.slotOffsets};
     return FastllmCudaMoeGGUFCacheCompute(input, gateOutput, output, view, scores, topk, perExpert);
 }
 
@@ -1713,9 +1751,12 @@ const ExpertCacheBackend *FindExpertCacheBackend(fastllm::DataType type) {
 bool EnsureCachedExperts(OffloadGroup *group, DeviceCache *cache, int tableId,
                          const int32_t *indices, int topk) {
     const auto &layout = group->layout;
+    const auto span = cache->layerSlots.empty() ? fastllm::cuda::CacheSlotSpan{0, cache->slots} :
+        cache->layerSlots[tableId];
     const fastllm::cuda::ExpertCacheView metadata{
         cache->keyToSlot, cache->slotKeys, cache->lastUsed, cache->step,
-        cache->hitCount, cache->totalMissCount, cache->slots, cache->mappedKeyToSlot};
+        cache->hitCount, cache->totalMissCount, cache->slots, cache->mappedKeyToSlot,
+        span.begin, span.count};
     if (!fastllm::cuda::EnsureExpertCache<kMaxTopK>(
             metadata, indices, tableId * layout.experts, layout.experts, topk,
             cache->routeSlots, cache->missExperts, cache->missSlots, cache->missCount,
@@ -1730,11 +1771,11 @@ bool EnsureCachedExperts(OffloadGroup *group, DeviceCache *cache, int tableId,
             cache->records, cache->missExperts, cache->missSlots, cache->missCount,
             topk, cache->copyLaunch, cudaStreamPerThread);
     }
-    const uint8_t *sourceTable = group->deviceHostRecords +
-        size_t(tableId) * layout.experts * layout.recordStride;
+    const auto &recordLayout = group->LayerLayout(tableId);
+    const uint8_t *sourceTable = group->deviceHostRecords + group->layerHostOffsets[tableId];
     if (!fastllm::cuda::CopyRecords(
-            {sourceTable, cache->records, layout.recordStride,
-             layout.recordStride, layout.recordStride},
+            {sourceTable, cache->records, recordLayout.recordStride,
+             layout.recordStride, recordLayout.recordStride, cache->slotOffsets},
             cache->missExperts, cache->missSlots, cache->missCount, topk,
             cache->copyLaunch, cudaStreamPerThread)) return false;
     return cudaGetLastError() == cudaSuccess;
@@ -2169,7 +2210,7 @@ void *FastllmCudaBeginMoeDecode(fastllm::Data **weights, int weightsBatch, int t
     if (!cache) return nullptr;
     if (!cache->decode) {
         cache->decode = std::make_unique<DecodePolicyState>(
-            group->totalRecords, cache->slots, group->tableKeys.size(), topk);
+            group->totalRecords, cache->slots, group->tableKeys.size(), topk, cache->layerSlots);
     }
     cache->decode->startUs = HybridNowUs();
     return cache;
@@ -2878,7 +2919,7 @@ extern "C" bool fastllm_moe_cuda_cache_stats(int device, uint64_t *values, bool 
         ok &= cudaMemcpy(counts, cache.hitCount, sizeof(counts[0]), cudaMemcpyDeviceToHost) == cudaSuccess;
         ok &= cudaMemcpy(counts + 1, cache.totalMissCount, sizeof(counts[1]), cudaMemcpyDeviceToHost) == cudaSuccess;
         values[0] += counts[0]; values[1] += counts[1];
-        values[2] += size_t(cache.slots) * group->layout.recordStride;
+        values[2] += cache.recordBytes;
         values[3] += cache.slots; values[4] += group->totalRecords;
         if (reset) {
             ok &= cudaMemset(cache.hitCount, 0, sizeof(counts[0])) == cudaSuccess;
