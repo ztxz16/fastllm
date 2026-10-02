@@ -421,6 +421,46 @@ __global__ void AttentionScoresPrefill(const BF16 *q, const BF16 *k, const int *
     }
 }
 
+// Reuse each K load across two Q heads in the same KV group. One key per
+// warp keeps the register tile small; each dot retains the original lane
+// accumulation, warp reduction and BF16 rounding order.
+__global__ void AttentionScoresPrefillGrouped(const BF16 *q, const BF16 *k, const int *indices,
+                                             float *scores, int heads, int kvHeads, int dim,
+                                             int keyStride, int keys, int count, int past,
+                                             int window, bool causal) {
+    constexpr int headTile = 2, warps = 4, maxDim = 192;
+    int query = blockIdx.y, kvHead = blockIdx.x, headsPerKv = heads / kvHeads;
+    int firstHead = kvHead * headsPerKv + blockIdx.z * headTile;
+    int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    float queryValues[headTile][maxDim / 32];
+    #pragma unroll
+    for (int h = 0; h < headTile; ++h) {
+        #pragma unroll
+        for (int j = 0; j < maxDim / 32; ++j)
+            queryValues[h][j] = firstHead + h < (kvHead + 1) * headsPerKv && lane + j * 32 < dim
+                ? (float)q[((size_t)query * heads + firstHead + h) * dim + lane + j * 32] : 0;
+    }
+    for (int slot = warp; slot < count; slot += warps) {
+        int key = KeyIndex(indices, query, slot, count, past, window);
+        bool valid = key >= 0 && key < keys && (!causal || key <= past + query);
+        float dot[headTile] = {};
+        #pragma unroll
+        for (int j = 0; j < maxDim / 32; ++j) if (lane + j * 32 < dim && valid) {
+            float keyValue = (float)k[(size_t)key * keyStride + kvHead * dim + lane + j * 32];
+            #pragma unroll
+            for (int h = 0; h < headTile; ++h)
+                dot[h] += queryValues[h][j] * keyValue;
+        }
+        #pragma unroll
+        for (int h = 0; h < headTile; ++h) {
+            dot[h] = WarpSum(dot[h]);
+            if (lane == 0 && firstHead + h < (kvHead + 1) * headsPerKv)
+                scores[((size_t)query * heads + firstHead + h) * count + slot] =
+                    valid ? RoundBF16(RoundBF16(dot[h]) * rsqrtf((float)dim)) : -INFINITY;
+        }
+    }
+}
+
 // Four output columns per lane amortize index/probability reads and permit
 // aligned 64-bit V loads. Each column keeps its original slot-ordered FP32
 // accumulation. Four independent heads per CTA avoid one-warp block limits.
@@ -868,7 +908,12 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
     }
     Data scores;
     Output(scores, DataType::FLOAT32, {queries, heads, count});
-    if (queries > 1 && dim <= 256) {
+    // Small query blocks need the original per-head CTA count for occupancy.
+    if (queries >= 32 && dim <= 192 && heads / kvHeads >= 2) {
+        AttentionScoresPrefillGrouped<<<dim3(kvHeads, queries, (heads / kvHeads + 1) / 2), 128>>>(
+            (const BF16 *)query.cudaData, (const BF16 *)key.cudaData, selected, (float *)scores.cudaData,
+            heads, kvHeads, dim, key.dims[2], keys, count, pastLength, window, causal);
+    } else if (queries > 1 && dim <= 256) {
         auto kernel = dim <= 192 ? AttentionScoresPrefill<192> : AttentionScoresPrefill<256>;
         kernel<<<dim3(heads, queries), 128>>>((const BF16 *)query.cudaData,
             (const BF16 *)key.cudaData, selected, (float *)scores.cudaData,

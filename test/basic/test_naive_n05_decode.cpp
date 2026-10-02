@@ -375,6 +375,63 @@ static void TestAttentionSelectedValues() {
     }
 }
 
+// Compare grouped QK with independent one-head calls, which use the original
+// QK path. Nonzero Q/K make this sensitive to dot/reduction/rounding changes.
+static void TestAttentionGroupedScores() {
+    struct Shape { int queries, heads, kvHeads, dim, valueDim, keys, selected; };
+    for (auto s : {Shape{32,4,2,64,8,513,511}, Shape{33,14,2,192,128,1027,2051},
+                   Shape{32,8,2,129,132,513,0}, Shape{31,8,2,192,128,513,512}})
+    for (bool causal : {false, true}) for (bool withSink : {false, true}) {
+        Data query(BFLOAT16),key(BFLOAT16),value(BFLOAT16),sink(FLOAT32),indices(INT32),output;
+        int keyStride = s.kvHeads * s.dim + 128, past = s.keys - s.queries;
+        Upload(query,{1,s.queries,s.heads*s.dim},53);
+        Upload(key,{1,s.keys,keyStride},71);
+        Upload(value,{1,s.keys,s.kvHeads*s.valueDim},113);
+        if (withSink) Upload(sink,{s.heads},171);
+        if (s.selected) {
+            indices.Resize({s.queries,s.selected}); indices.Allocate();
+            auto *p = (int *)indices.cpuData;
+            for (int q=0;q<s.queries;++q) for (int slot=0;slot<s.selected;++slot) {
+                int k = (slot*137+q*13)%s.keys;
+                if (slot%97==0 || q==0) k=-1;
+                else if (slot%193==1) k=s.keys+3;
+                p[q*s.selected+slot]=k;
+            }
+            indices.ToDevice(DataDevice::CUDA,{0},true);
+        }
+        FastllmCudaNaiveAttention(query,key,value,indices,sink,s.heads,s.kvHeads,s.dim,
+                                  s.valueDim,past,0,output,causal);
+        auto actual=Read<uint16_t>(output),qbits=Read<uint16_t>(query),
+             kbits=Read<uint16_t>(key),vbits=Read<uint16_t>(value);
+        auto copyHead = [](Data &dst, const std::vector<uint16_t> &src,
+                           int rows, int stride, int offset, int width) {
+            dst.Resize({1,rows,width}); dst.Allocate();
+            for (int r=0;r<rows;++r)
+                std::memcpy((uint16_t *)dst.cpuData+r*width,src.data()+r*stride+offset,width*sizeof(uint16_t));
+            dst.ToDevice(DataDevice::CUDA,{0},true);
+        };
+        for (int h=0;h<s.heads;++h) {
+            Data q(BFLOAT16),k(BFLOAT16),v(BFLOAT16),headSink(FLOAT32),reference;
+            int kvHead=h/(s.heads/s.kvHeads);
+            copyHead(q,qbits,s.queries,s.heads*s.dim,h*s.dim,s.dim);
+            copyHead(k,kbits,s.keys,keyStride,kvHead*s.dim,s.dim);
+            copyHead(v,vbits,s.keys,s.kvHeads*s.valueDim,kvHead*s.valueDim,s.valueDim);
+            if (withSink) {
+                headSink.Resize({1}); headSink.Allocate();
+                Require(cudaMemcpy(headSink.cpuData,(float *)sink.cudaData+h,sizeof(float),cudaMemcpyDeviceToHost)==cudaSuccess,
+                        "copy head sink failed");
+                headSink.ToDevice(DataDevice::CUDA,{0},true);
+            }
+            FastllmCudaNaiveAttention(q,k,v,indices,headSink,1,1,s.dim,s.valueDim,past,0,reference,causal);
+            auto expected=Read<uint16_t>(reference);
+            for (int r=0;r<s.queries;++r) for (int d=0;d<s.valueDim;++d)
+                Require(actual[(r*s.heads+h)*s.valueDim+d]==expected[r*s.valueDim+d],
+                        "Grouped Attention differs from isolated head");
+        }
+        ++checks;
+    }
+}
+
 int main(int argc,char **argv) {
     int devices=0;if(cudaGetDeviceCount(&devices)!=cudaSuccess || !devices) return 77;
     if (argc == 2 && std::strcmp(argv[1], "--invalid-indexer") == 0) {
@@ -387,7 +444,7 @@ int main(int argc,char **argv) {
                 "usage: naive_n05_decode_test [--quick]");
         quick = argc == 2;
         SetThreads(4);
-        TestTopK(); TestBatchedTopK(); TestCache(); TestCacheReservation(); TestRopeWidths(); TestAttentionWidths(); TestAttentionSelectedValues();
+        TestTopK(); TestBatchedTopK(); TestCache(); TestCacheReservation(); TestRopeWidths(); TestAttentionWidths(); TestAttentionSelectedValues(); TestAttentionGroupedScores();
         Require(cudaDeviceSynchronize()==cudaSuccess,"CUDA final synchronization failed");
         std::printf("Naive decode regression passed: %d cases\n",checks);
     }catch(const std::exception&e){std::fprintf(stderr,"%s\n",e.what());return 1;}
