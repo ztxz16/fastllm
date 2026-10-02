@@ -4,6 +4,8 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cub/device/device_radix_sort.cuh>
+#include <cub/device/device_segmented_radix_sort.cuh>
+#include <climits>
 #include <algorithm>
 #include <cmath>
 #include <numeric>
@@ -58,53 +60,30 @@ __global__ void DecodeTopK(const unsigned long long *order, int *indices,
     if (i < topK) indices[i] = i < count ? (int)(0xffffffffu - (unsigned)order[i]) : -1;
 }
 
-struct IndexerTopKOp : fastllm::MultiThreadBaseOp {
-    const float *scores;
-    int *indices;
-    int queries, keys, topK, queryStart, first, step;
-
-    void Run() override {
-        std::vector<int> order(keys);
-        // Each worker owns its scratch and writes disjoint query rows. Keep
-        // the original comparator and partial_sort so ties and index order
-        // remain identical to the serial path.
-        for (int row = first; row < queries; row += step) {
-            int end = queryStart + row + 1;
-            std::iota(order.begin(), order.begin() + end, 0);
-            const float *values = scores + (size_t)row * keys;
-            auto before = [&](int a, int b) {
-                return values[a] > values[b] || (values[a] == values[b] && a < b);
-            };
-            int valid = std::min(topK, end);
-            std::partial_sort(order.begin(), order.begin() + valid, order.begin() + end, before);
-            int *target = indices + (size_t)row * topK;
-            std::copy_n(order.data(), valid, target);
-            std::fill(target + valid, target + topK, -1);
-        }
+// Sorting the original score bits plus the inverse position preserves the CPU
+// comparator, including +/-0 ties. Separate causal segment ends exclude future
+// keys even when a valid score is -infinity; no score matrix leaves the GPU.
+__global__ void EncodeBatchedTopK(const float *scores, unsigned long long *order,
+                                 int *offsets, int queries, int keys, int queryStart) {
+    int row = blockIdx.y, col = blockIdx.x * blockDim.x + threadIdx.x;
+    int count = queryStart + row + 1;
+    if (col == 0) {
+        offsets[row] = row * keys;
+        offsets[queries + row] = row * keys + count;
     }
-};
-
-void IndexerTopK(const float *scores, int *indices, int queries, int keys,
-                int queryStart, int topK) {
-    // Decode and small verification batches stay on the caller thread.
-    // Longer prefill reuses the existing pool, respecting its active range.
-    auto *pool = queries > 32 ? fastllm::GetAlivePool() : nullptr;
-    int first = pool ? pool->curActivateThreadInterval.first : 0;
-    int available = pool ? pool->curActivateThreadInterval.second - first : 1;
-    int threads = std::min(std::max(1, available), (queries + 31) / 32);
-    std::vector<IndexerTopKOp> tasks(threads);
-    for (int t = 0; t < threads; ++t) {
-        auto &task = tasks[t];
-        task.scores = scores; task.indices = indices;
-        task.queries = queries; task.keys = keys; task.topK = topK;
-        task.queryStart = queryStart; task.first = t; task.step = threads;
-    }
-    if (threads == 1) {
-        tasks[0].Run();
-    } else {
-        for (int t = 0; t < threads; ++t) pool->PushOp(first + t, &tasks[t]);
-        for (int t = 0; t < threads; ++t) pool->Wait(first + t);
-    }
+    if (col >= count) return;
+    float score = scores[(size_t)row * keys + col];
+    unsigned bits = score == 0.0f ? 0u : __float_as_uint(score);
+    unsigned ordered = (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
+    order[(size_t)row * keys + col] =
+        ((unsigned long long)ordered << 32) | (0xffffffffu - (unsigned)col);
+}
+__global__ void DecodeBatchedTopK(const unsigned long long *order, int *indices,
+                                 int keys, int queryStart, int topK) {
+    int row = blockIdx.y, col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= topK) return;
+    indices[(size_t)row * topK + col] = col <= queryStart + row
+        ? (int)(0xffffffffu - (unsigned)order[(size_t)row * keys + col]) : -1;
 }
 
 __global__ void Rope(BF16 *data, const float *positions, int heads, int dim,
@@ -434,8 +413,41 @@ void FastllmCudaNaiveTopK(const fastllm::Data &scores, int queryStart, int topK,
                          fastllm::Data &indices) {
     using namespace fastllm;
     AssertInFastLLM(scores.dataDevice == DataDevice::CUDA && scores.dataType == FLOAT32 &&
-        scores.dims.size() == 2 && scores.dims[0] == 1 && queryStart >= 0 &&
-        queryStart < scores.dims[1] && topK > 0, "Invalid Naive-N0.5 decode TopK.");
+        scores.dims.size() == 2 && scores.dims[0] > 0 && queryStart >= 0 &&
+        (int64_t)queryStart + scores.dims[0] <= scores.dims[1] && topK > 0,
+        "Invalid Naive-N0.5 TopK.");
+    int queries = scores.dims[0], keys = scores.dims[1];
+    if (queries > 1) {
+        int64_t total = (int64_t)queries * keys;
+        AssertInFastLLM(total <= INT_MAX && (int64_t)queries * topK <= INT_MAX,
+            "Naive-N0.5 batched TopK is too large.");
+        Data encoded, sorted, offsets, workspace;
+        Output(encoded, INT32, {queries, keys, 2});
+        Output(sorted, INT32, {queries, keys, 2});
+        Output(offsets, INT32, {2, queries});
+        Output(indices, INT32, {queries, topK});
+        auto *input = (unsigned long long *)encoded.cudaData;
+        auto *output = (unsigned long long *)sorted.cudaData;
+        auto *begin = (int *)offsets.cudaData;
+        size_t bytes = 0;
+        int items = (queries - 1) * keys + queryStart + queries;
+        auto status = cub::DeviceSegmentedRadixSort::SortKeysDescending(
+            nullptr, bytes, input, output, items, queries, begin, begin + queries,
+            0, 64, cudaStreamPerThread);
+        AssertInFastLLM(status == cudaSuccess && (bytes + 3) / 4 <= INT_MAX,
+            "Naive-N0.5 batched TopK workspace query failed.");
+        Output(workspace, INT32, {(int)((bytes + 3) / 4)});
+        EncodeBatchedTopK<<<dim3((keys + 255) / 256, queries), 256>>>(
+            (const float *)scores.cudaData, input, begin, queries, keys, queryStart);
+        status = cub::DeviceSegmentedRadixSort::SortKeysDescending(
+            workspace.cudaData, bytes, input, output, items, queries, begin, begin + queries,
+            0, 64, cudaStreamPerThread);
+        AssertInFastLLM(status == cudaSuccess, "Naive-N0.5 batched GPU TopK failed.");
+        DecodeBatchedTopK<<<dim3((topK + 255) / 256, queries), 256>>>(
+            output, (int *)indices.cudaData, keys, queryStart, topK);
+        CheckLaunch();
+        return;
+    }
     int count = queryStart + 1;
     Data encoded, sorted, workspace;
     Output(encoded, INT32, {count, 2});
@@ -486,20 +498,8 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
         (const float *)k.cudaData, (const BF16 *)weights.cudaData,
         (float *)scores.cudaData, heads, keys, queryStart);
     CheckLaunch();
-    // The stable tie rule in the released model selects the earliest key.
-    if (queries == 1) {
-        FastllmCudaNaiveTopK(scores, queryStart, topK, indices);
-        return;
-    }
-    // Keep selection bounded to one prefill chunk, and transfer only scores.
-    scores.ToDevice(DataDevice::CPU);
-    indices.ToDevice(DataDevice::CPU);
-    indices.dataType = DataType::INT32;
-    indices.Resize({queries, topK});
-    indices.Allocate();
-    IndexerTopK((const float *)scores.cpuData, (int *)indices.cpuData,
-                queries, keys, queryStart, topK);
-    indices.ToDevice(DataDevice::CUDA, query.dataDeviceIds);
+    // Stable GPU selection for decode and every row of a prefill chunk.
+    FastllmCudaNaiveTopK(scores, queryStart, topK, indices);
 }
 
 void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &key,

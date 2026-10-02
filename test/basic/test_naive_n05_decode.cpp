@@ -63,6 +63,84 @@ static void TestTopK() {
         ++checks;
     }
 }
+static std::vector<int> BatchedReference(const std::vector<float> &scores, int rows,
+                                        int keys, int past, int top) {
+    std::vector<int> result((size_t)rows * top, -1), order(keys);
+    for (int row = 0; row < rows; ++row) {
+        int valid = past + row + 1, keep = std::min(valid, top);
+        std::iota(order.begin(), order.begin() + valid, 0);
+        const float *p = scores.data() + (size_t)row * keys;
+        std::partial_sort(order.begin(), order.begin() + keep, order.begin() + valid,
+            [p](int a, int b) { return p[a] > p[b] || (p[a] == p[b] && a < b); });
+        std::copy_n(order.data(), keep, result.data() + (size_t)row * top);
+    }
+    return result;
+}
+static std::vector<float> BatchedScores(int rows, int keys, int past, int mode, unsigned seed) {
+    std::vector<float> values((size_t)rows * keys);
+    for (int row = 0; row < rows; ++row) for (int col = 0; col < keys; ++col) {
+        seed = seed * 1664525u + 1013904223u;
+        float v = mode == 0 ? (col & 1 ? -0.0f : 0.0f) : mode == 1
+            ? float(int(seed % 19) - 9) : float(int(seed >> 8) - (1 << 23)) / 8192.0f;
+        if (mode == 1 && col < 3) v = col == 2 ? -std::numeric_limits<float>::infinity()
+                                                            : std::numeric_limits<float>::infinity();
+        // Future positions must never win, even with +infinity or NaN there.
+        if (col > past + row) v = col & 1 ? std::numeric_limits<float>::infinity()
+                                         : std::numeric_limits<float>::quiet_NaN();
+        values[(size_t)row * keys + col] = v;
+    }
+    return values;
+}
+static void TestBatchedTopK() {
+    Data result;
+    struct Shape { int rows, keys, past, top; };
+    const Shape shapes[] = {{2,2,0,7}, {3,127,0,129}, {33,2049,17,2048},
+        {31,8192,8000,1}, {32,8192,8160,17}, {129,8193,8064,2048},
+        {512,32768,32256,2048}, {512,65536,65024,2048}};
+    for (const auto &s : shapes) for (int mode = 0; mode < 3; ++mode) {
+        if (quick && s.rows > 33) continue;
+        auto values = BatchedScores(s.rows, s.keys, s.past, mode, 713 + mode);
+        auto expected = BatchedReference(values, s.rows, s.keys, s.past, s.top);
+        Data scores(FLOAT32); scores.Resize({s.rows,s.keys}); scores.Allocate();
+        std::memcpy(scores.cpuData, values.data(), values.size()*sizeof(float));
+        scores.ToDevice(DataDevice::CUDA,{0},true);
+        FastllmCudaNaiveTopK(scores,s.past,s.top,result);
+        Require(result.dataDevice==DataDevice::CUDA && result.dims==std::vector<int>({s.rows,s.top}),
+                "batched TopK changed output shape/device");
+        auto actual=Read<int>(result);
+        if (actual!=expected) {
+            for(size_t i=0;i<actual.size();++i) if(actual[i]!=expected[i]) {
+                std::fprintf(stderr,"BatchedTopK rows=%d keys=%d mode=%d i=%zu got=%d expected=%d\n",
+                    s.rows,s.keys,mode,i,actual[i],expected[i]);break;
+            }
+        }
+        Require(actual==expected,"Batched TopK differs from independent CPU comparator");
+        ++checks;
+    }
+    // Change score contents between graph replays to catch stale host selection.
+    for (const auto &s : {Shape{3,2049,1000,2048}, Shape{33,8192,8159,2048}}) {
+        Data scores(FLOAT32), output; auto values=BatchedScores(s.rows,s.keys,s.past,2,19);
+        scores.Resize({s.rows,s.keys});scores.Allocate();
+        std::memcpy(scores.cpuData,values.data(),values.size()*sizeof(float));scores.ToDevice(DataDevice::CUDA,{0},true);
+        FastllmCudaNaiveTopK(scores,s.past,s.top,output);
+        Require(cudaDeviceSynchronize()==cudaSuccess,"TopK warmup failed");
+        cudaGraph_t graph;cudaGraphExec_t exec;
+        Require(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal)==cudaSuccess,"capture begin");
+        FastllmCudaNaiveTopK(scores,s.past,s.top,output);
+        Require(cudaStreamEndCapture(cudaStreamPerThread,&graph)==cudaSuccess,"capture end");
+        Require(cudaGraphInstantiate(&exec,graph,nullptr,nullptr,0)==cudaSuccess,"graph instantiate");
+        for(int seed=41;seed<44;++seed) {
+            values=BatchedScores(s.rows,s.keys,s.past,seed%3,seed);
+            auto expected=BatchedReference(values,s.rows,s.keys,s.past,s.top);
+            Require(cudaMemcpyAsync(scores.cudaData,values.data(),values.size()*sizeof(float),cudaMemcpyHostToDevice,cudaStreamPerThread)==cudaSuccess,"graph upload");
+            Require(cudaGraphLaunch(exec,cudaStreamPerThread)==cudaSuccess,"graph launch");
+            Require(cudaStreamSynchronize(cudaStreamPerThread)==cudaSuccess,"graph sync");
+            Require(Read<int>(output)==expected,"graph TopK differs after score update");++checks;
+        }
+        cudaGraphExecDestroy(exec);cudaGraphDestroy(graph);
+    }
+}
+
 struct CacheOps : NaiveN05FlashModel { using NaiveN05FlashModel::AppendCache; };
 static void TestCache() {
     for (auto dims : {std::pair<int,int>{1536,1024}, {8,16}, {200,56}}) {
@@ -97,7 +175,7 @@ int main(int argc,char **argv) {
                 "usage: naive_n05_decode_test [--quick]");
         quick = argc == 2;
         SetThreads(4);
-        TestTopK(); TestCache();
+        TestTopK(); TestBatchedTopK(); TestCache();
         Require(cudaDeviceSynchronize()==cudaSuccess,"CUDA final synchronization failed");
         std::printf("Naive decode regression passed: %d cases\n",checks);
     }catch(const std::exception&e){std::fprintf(stderr,"%s\n",e.what());return 1;}

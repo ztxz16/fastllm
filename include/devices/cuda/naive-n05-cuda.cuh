@@ -7,7 +7,8 @@ void FastllmCudaNaiveRope(fastllm::Data &input, const fastllm::Data &positions,
                          int heads, int dim, int rotaryDim, float theta);
 // Keep the allocation and logical row order when retaining a sliding suffix.
 void FastllmCudaNaiveTrimCache(fastllm::Data &key, fastllm::Data &value, int keep);
-// Exact descending score / ascending position order for a single query.
+// Exact descending score / ascending position order for each query row.
+// Row r considers only keys [0, queryStart + r]; missing slots are -1.
 void FastllmCudaNaiveTopK(const fastllm::Data &scores, int queryStart, int topK,
                          fastllm::Data &indices);
 void FastllmCudaNaiveIndexer(const fastllm::Data &query,
