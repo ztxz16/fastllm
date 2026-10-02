@@ -53,6 +53,48 @@ __global__ void TrimCachePair(T *key, T *value, int keyColumns,
         data[(size_t)row * columns + column] = data[(size_t)(row + drop) * columns + column];
 }
 
+constexpr int kTrimTileBytes = 64;
+constexpr int kTrimMaxRows = 128;
+
+// A CTA owns a disjoint 64-byte column tile and stages all retained rows
+// before writing. The barrier makes overlapping suffix moves safe while rows
+// are copied in parallel; other CTAs never read or write these columns.
+template <typename T>
+__global__ void TrimCachePairTiled(T *key, T *value, int keyColumns,
+                                 int valueColumns, int drop, int keep) {
+    constexpr int columns = kTrimTileBytes / sizeof(T);
+    __shared__ T rows[kTrimMaxRows * columns];
+    int keyBlocks = (keyColumns + columns - 1) / columns;
+    bool isKey = blockIdx.x < keyBlocks;
+    T *data = isKey ? key : value;
+    int stride = isKey ? keyColumns : valueColumns;
+    int firstColumn = (isKey ? blockIdx.x : blockIdx.x - keyBlocks) * columns;
+    for (int i = threadIdx.x; i < keep * columns; i += blockDim.x) {
+        int row = i / columns, col = firstColumn + i % columns;
+        if (col < stride) rows[i] = data[(size_t)(row + drop) * stride + col];
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < keep * columns; i += blockDim.x) {
+        int row = i / columns, col = firstColumn + i % columns;
+        if (col < stride) data[(size_t)row * stride + col] = rows[i];
+    }
+}
+
+
+template <typename T>
+void LaunchTrimCachePair(T *key, T *value, int keyColumns,
+                        int valueColumns, int drop, int keep) {
+    if (keep <= kTrimMaxRows) {
+        constexpr int columns = kTrimTileBytes / sizeof(T);
+        int blocks = (keyColumns + columns - 1) / columns +
+                     (valueColumns + columns - 1) / columns;
+        TrimCachePairTiled<<<blocks, 256>>>(key, value, keyColumns, valueColumns, drop, keep);
+    } else {
+        TrimCachePair<<<(keyColumns + valueColumns + 255) / 256, 256>>>(
+            key, value, keyColumns, valueColumns, drop, keep);
+    }
+}
+
 __device__ unsigned OrderedScoreBits(float score) {
     unsigned bits = score == 0.0f ? 0u : __float_as_uint(score);
     return (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
@@ -781,16 +823,15 @@ void FastllmCudaNaiveTrimCache(fastllm::Data &key, fastllm::Data &value, int kee
         key.dataDeviceIds == value.dataDeviceIds && key.dims[2] > 0 && value.dims[2] > 0,
         "Invalid Naive-N0.5 sliding cache layout.");
     if (key.dims[1] <= keep) return;
+    int drop = key.dims[1] - keep;
     if (key.dims[2] % 8 == 0 && value.dims[2] % 8 == 0) {
-        int kc = key.dims[2] / 8, vc = value.dims[2] / 8;
-        TrimCachePair<<<(kc + vc + 255) / 256, 256>>>((uint4 *)key.cudaData,
-            (uint4 *)value.cudaData, kc, vc, key.dims[1] - keep, keep);
+        LaunchTrimCachePair((uint4 *)key.cudaData, (uint4 *)value.cudaData,
+            key.dims[2] / 8, value.dims[2] / 8, drop, keep);
     } else {
         // The vector path requires 16-byte row alignment. Other BF16 layouts
         // use the same overlap-safe column ownership at scalar granularity.
-        int kc = key.dims[2], vc = value.dims[2];
-        TrimCachePair<<<(kc + vc + 255) / 256, 256>>>((uint16_t *)key.cudaData,
-            (uint16_t *)value.cudaData, kc, vc, key.dims[1] - keep, keep);
+        LaunchTrimCachePair((uint16_t *)key.cudaData, (uint16_t *)value.cudaData,
+            key.dims[2], value.dims[2], drop, keep);
     }
     CheckLaunch();
     key.Resize({1, keep, key.dims[2]});

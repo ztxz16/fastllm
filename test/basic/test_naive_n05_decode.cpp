@@ -177,6 +177,27 @@ static void TestCache() {
     }
 }
 
+// Cover overlapping moves, the tiled/serial boundary, and non-vector rows.
+static void TestCacheEdges() {
+    for (auto dims : {std::pair<int, int>{1536, 1024}, {7, 13}, {8, 16}, {200, 56}})
+    for (int keep : {0, 1, 127, 128, 129, 511}) for (int drop : {1, 7, 128, 513}) {
+        if (quick && (keep < 127 || keep > 129 || drop != 1)) continue;
+        Data key(BFLOAT16), value(BFLOAT16);
+        Upload(key, {1, keep + drop, dims.first}, 817);
+        Upload(value, {1, keep + drop, dims.second}, 819);
+        auto k = Read<uint16_t>(key), v = Read<uint16_t>(value);
+        k.erase(k.begin(), k.begin() + (size_t)drop * dims.first);
+        v.erase(v.begin(), v.begin() + (size_t)drop * dims.second);
+        auto kp = key.cudaData, vp = value.cudaData;
+        FastllmCudaNaiveTrimCache(key, value, keep);
+        Require(key.cudaData == kp && value.cudaData == vp,
+                "sliding trim changed allocation");
+        Require(Read<uint16_t>(key) == k && Read<uint16_t>(value) == v,
+                "sliding suffix differs at trim boundary");
+        ++checks;
+    }
+}
+
 static void TestCacheReservation() {
     CacheOps model;
     model.max_positions = 65536;
@@ -740,6 +761,25 @@ static void TestDecodeGraphs() {
         }
         cudaGraphExecDestroy(graph);
     }
+    for (auto dims : {std::pair<int, int>{1536, 1024}, {7, 13}}) {
+        constexpr int keep = 127, drop = 1;
+        Data k(BFLOAT16), v(BFLOAT16);
+        Upload(k, {1, keep + drop, dims.first}, 733);
+        Upload(v, {1, keep + drop, dims.second}, 739);
+        auto kb = Read<uint16_t>(k), vb = Read<uint16_t>(v);
+        auto graph = Capture([&]() { FastllmCudaNaiveTrimCache(k, v, keep); });
+        for (int seed = 1; seed <= 3; ++seed) {
+            for (auto &x : kb) x ^= 0x8000;
+            for (auto &x : vb) x ^= 0x8000;
+            Put(k, kb); Put(v, vb);
+            Replay(graph);
+            std::vector<uint16_t> kr(kb.begin() + drop * dims.first, kb.end());
+            std::vector<uint16_t> vr(vb.begin() + drop * dims.second, vb.end());
+            Require(Read<uint16_t>(k) == kr && Read<uint16_t>(v) == vr, "trim graph differs from CPU suffix");
+            ++checks;
+        }
+        cudaGraphExecDestroy(graph);
+    }
 }
 
 int main(int argc,char **argv) {
@@ -757,7 +797,7 @@ int main(int argc,char **argv) {
         SetThreads(4);
         if (!graphsOnly) {
             TestTopK(); TestBatchedTopK(); TestIndexer();
-            TestCache(); TestCacheReservation(); TestRopeWidths();
+            TestCache(); TestCacheEdges(); TestCacheReservation(); TestRopeWidths();
             TestAttentionWidths(); TestAttentionSelectedValues(); TestAttentionGroupedScores();
             TestAttentionGlobalMma(); TestAttentionSwa();
         }
