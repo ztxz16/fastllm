@@ -1116,6 +1116,7 @@ static __device__ __forceinline__ half FastllmGgufHalfSiluMulValue(
 
 #if !defined(USE_ROCM)
 #include "fastllm-gguf-iq3-gemv.cuh"
+#include "fastllm-gguf-q3-k-gemv.cuh"
 #include "fastllm-gguf-small-mmvq.cuh"
 #endif
 
@@ -1126,6 +1127,14 @@ static void mul_mat_vec_q_cuda(
     const int ne2, const uint64_t nb02, const uint64_t nb12, const uint64_t nb2, const int64_t ids_nb0,
     cudaStream_t stream) {
 #if !defined(USE_ROCM)
+    if constexpr (type == GGML_TYPE_Q3_K) {
+        if (ncols_y == 1 && ne2 == 1 && ids_data == nullptr && nrows_dst >= nrows_x &&
+            fastllm_gguf_q3_k::Supports(vy, ncols_x, nrows_x)) {
+            fastllm_gguf_q3_k::Launch(vx, static_cast<const block_q8_1 *>(vy), dst,
+                                      ncols_x, nrows_x, stream);
+            return;
+        }
+    }
     if constexpr (type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ3_XXS) {
         if (ncols_y == 1 && ne2 == 1 && ids_data == nullptr &&
             fastllm_gguf_iq3::Supports(vy, ncols_x, nrows_x)) {
