@@ -200,13 +200,133 @@ static __device__ __forceinline__ float DotQ2(const void *weight,
     return __half2float(q.d) * __low2float(x[part].ds) * sum;
 }
 
+static __device__ __forceinline__ float DotIQ3XXS(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs, const uint32_t *grid) {
+
+    const block_iq3_xxs * bq3 = (const block_iq3_xxs *) vbq + kbx;
+
+    const int2 q3_packed = make_int2(get_int_b2(bq3->qs, iqs), get_int_b2(bq3->qs, iqs+1));
+    const uint8_t * q3 = (const uint8_t *) &q3_packed;
+    const uint32_t aux32 = get_int_b2(bq3->qs, QK_K/16 + iqs/2);
+
+    int sumi = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int2 grid_pos = make_int2(grid[q3[l0 + 0]], grid[q3[l0 + 1]]);
+
+        const uint32_t s7 = (aux32 >> (7*l0/2)) & 0x7F;
+        const uint32_t s8 = (s7 | ((__popc(s7) & 1) << 7)) * 0x01010101u;
+        const uint32_t signs[2] = {__vcmpne4(s8 & 0x08040201, 0), __vcmpne4(s8 & 0x80402010, 0)};
+
+        const int grid_l = ((grid_pos.x ^ signs[0]) + (signs[0] & 0x01010101u));
+        const int grid_h = ((grid_pos.y ^ signs[1]) + (signs[1] & 0x01010101u));
+
+        const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+        const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+
+        sumi = ggml_cuda_dp4a(grid_l, u0, sumi);
+        sumi = ggml_cuda_dp4a(grid_h, u1, sumi);
+    }
+
+    const int ls = aux32 >> 28;
+    const float scaled = (ls + 0.5f) * 0.5f * sumi;
+    const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs/2].ds);
+    return d * scaled;
+}
+
+static __device__ __forceinline__ float DotIQ3S(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs, const uint32_t *grid) {
+
+    const block_iq3_s * bq3 = (const block_iq3_s *) vbq + kbx;
+
+    const int2      qs_packed = make_int2(get_int_b2(bq3->qs, iqs + 0), get_int_b2(bq3->qs, iqs + 1));
+    const uint8_t * qs        = (const uint8_t *) &qs_packed;
+
+    const int qh = bq3->qh[iqs/2];
+
+    const int       signs_packed_32 = get_int_b2(bq3->signs, iqs/2);
+    const uint8_t * signs_packed_8  = (const uint8_t *) &signs_packed_32;
+
+    int sumi = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int2 grid_pos = make_int2(
+            grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
+            grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
+
+        const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
+        const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
+
+        const int grid_l = ((grid_pos.x ^ signs0) + (signs0 & 0x01010101u));
+        const int grid_h = ((grid_pos.y ^ signs1) + (signs1 & 0x01010101u));
+
+        const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+        const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+
+        sumi = ggml_cuda_dp4a(grid_l, u0, sumi);
+        sumi = ggml_cuda_dp4a(grid_h, u1, sumi);
+    }
+
+    sumi *= 1 + 2*((bq3->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);
+
+    const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs/2].ds);
+    return d * sumi;
+}
+
+// Expand the low/high nibbles through the shared 16-entry IQ4 codebook.
+static __device__ __forceinline__ int2 UnpackIQ4(int q4) {
+    uint32_t v1, v2, v3, v4, mask;
+    const uint32_t * values32 = (const uint32_t *)kvalues_iq4nl;
+
+    mask = (0x32103210 | ((q4 & 0x88888888) >> 1));
+    v1 = __byte_perm(values32[0], values32[1], q4);
+    v2 = __byte_perm(values32[2], values32[3], q4);
+    // Select between the low and high results based on the MSB of each index nibble.
+    v3 = __byte_perm(v1, v2, mask);
+    v1 = __byte_perm(values32[0], values32[1], q4 >> 16);
+    v2 = __byte_perm(values32[2], values32[3], q4 >> 16);
+    v4 = __byte_perm(v1, v2, mask >> 16);
+
+    return make_int2(__byte_perm(v3, v4, 0x6420), __byte_perm(v3, v4, 0x7531));
+}
+
+// One lane consumes a complete 32-value IQ4 sub-block. IQ4_XS stores eight
+// such sub-blocks plus signed six-bit scales in each 256-value weight block.
+template<ggml_type Type>
+static __device__ __forceinline__ float DotIQ4(const void *weight,
+        const block_q8_1 *x, int block, int part) {
+    const uint8_t *qs;
+    float scale;
+    if constexpr (Type == GGML_TYPE_IQ4_NL) {
+        const auto &q = static_cast<const block_iq4_nl *>(weight)[block];
+        qs = q.qs;
+        scale = __half2float(q.d);
+    } else {
+        const auto &q = static_cast<const block_iq4_xs *>(weight)[block];
+        qs = q.qs + 16*part;
+        const int low = (q.scales_l[part/2] >> (4*(part%2))) & 15;
+        const int high = (q.scales_h >> (2*part)) & 3;
+        scale = __half2float(q.d) * ((low | (high << 4)) - 32);
+    }
+    int sum = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int2 values = UnpackIQ4(get_int_b2(qs, j));
+        sum = ggml_cuda_dp4a(values.x, get_int_b4(x[part].qs, j), sum);
+        sum = ggml_cuda_dp4a(values.y, get_int_b4(x[part].qs, j+4), sum);
+    }
+    return scale * __low2float(x[part].ds) * sum;
+}
+
 template<ggml_type Type> struct Format {
-    static constexpr int block = Type == GGML_TYPE_Q2_0 ? 64 : 256;
+    static constexpr int block = Type == GGML_TYPE_IQ4_NL ? 32 : Type == GGML_TYPE_Q2_0 ? 64 : 256;
     static constexpr int parts = block/32;
-    static constexpr int step = Type == GGML_TYPE_IQ1_M || Type == GGML_TYPE_Q2_0 ? 1 : 2;
+    static constexpr int step = Type == GGML_TYPE_IQ1_M || Type == GGML_TYPE_Q2_0 ||
+        Type == GGML_TYPE_IQ4_NL || Type == GGML_TYPE_IQ4_XS ? 1 : 2;
     static constexpr int gridSize = Type == GGML_TYPE_IQ1_M ? 2048 :
         Type == GGML_TYPE_IQ2_S ? 1024 : Type == GGML_TYPE_IQ2_XS ? 512 :
-        Type == GGML_TYPE_IQ2_XXS ? 256 : 0;
+        Type == GGML_TYPE_IQ2_XXS ? 256 :
+        Type == GGML_TYPE_IQ3_S ? 256 : Type == GGML_TYPE_IQ3_XXS ? 128 : 0;
 };
 
 template<ggml_type Type, int ThreadsPerRow = 32>
@@ -222,6 +342,12 @@ __device__ __forceinline__ float RowDot(const void *weight, const block_q8_1 *x,
         else if constexpr (Type == GGML_TYPE_IQ2_XS) sum += DotXS(weight, xb, b, part, grid);
         else if constexpr (Type == GGML_TYPE_IQ2_XXS) sum += DotXXS(weight, xb, b, part, grid);
         else if constexpr (Type == GGML_TYPE_IQ1_M) sum += DotIQ1M(weight, xb, b, part, grid);
+        else if constexpr (Type == GGML_TYPE_IQ3_XXS)
+            sum += DotIQ3XXS(weight, xb, b, part, reinterpret_cast<const uint32_t *>(grid));
+        else if constexpr (Type == GGML_TYPE_IQ3_S)
+            sum += DotIQ3S(weight, xb, b, part, reinterpret_cast<const uint32_t *>(grid));
+        else if constexpr (Type == GGML_TYPE_IQ4_NL || Type == GGML_TYPE_IQ4_XS)
+            sum += DotIQ4<Type>(weight, xb, b, part);
         else if constexpr (ThreadsPerRow == 8) {
             // With at most sixteen Q8 blocks this combines k and k+8,
             // exactly the first nonzero stage of the full-warp reduction.
@@ -240,7 +366,12 @@ __device__ __forceinline__ float RowDot(const void *weight, const block_q8_1 *x,
 
 template<ggml_type Type>
 __device__ __forceinline__ void StageGrid(uint64_t *grid) {
-    if constexpr (Format<Type>::gridSize) {
+    if constexpr (Type == GGML_TYPE_IQ3_XXS || Type == GGML_TYPE_IQ3_S) {
+        const uint32_t *source = Type == GGML_TYPE_IQ3_S ? iq3s_grid : iq3xxs_grid;
+        auto *destination = reinterpret_cast<uint32_t *>(grid);
+        for (int i = threadIdx.x; i < 2*Format<Type>::gridSize; i += blockDim.x)
+            destination[i] = source[i];
+    } else if constexpr (Format<Type>::gridSize) {
         const uint64_t *source = Type == GGML_TYPE_IQ1_M ? iq1s_grid :
             Type == GGML_TYPE_IQ2_S ? iq2s_grid : Type == GGML_TYPE_IQ2_XS ? iq2xs_grid : iq2xxs_grid;
         for (int i = threadIdx.x; i < Format<Type>::gridSize; i += blockDim.x) grid[i] = source[i];

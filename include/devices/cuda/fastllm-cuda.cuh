@@ -1758,6 +1758,9 @@ struct FastllmCudaMoeGGUFCacheView {
 bool FastllmCudaMoeGGUFCacheSupported(int type, int columns);
 // Q8_1 input/mid activations and per-expert down results, reused on one stream.
 size_t FastllmCudaMoeGGUFCacheWorkspaceBytes(int hidden, int inter);
+// True when both stages support Q8 for single-token decode. Each supported
+// stage can run independently for decode/verifier rows. Large prefill batches
+// retain their existing grouped MMQ or legacy dispatch.
 bool FastllmCudaMoeGGUFCacheQ8Supported(int gateType, int downType, int hidden, int inter);
 bool FastllmCudaMoeGGUFCacheCompute(
         const fastllm::Data &input, fastllm::Data &gateOutput,
