@@ -5,6 +5,7 @@
 #include <cuda_runtime_api.h>
 #include <algorithm>
 #include <cstdio>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <numeric>
@@ -146,7 +147,7 @@ struct CacheOps : NaiveN05FlashModel {
     using NaiveN05FlashModel::CacheReserveCapacity;
 };
 static void TestCache() {
-    for (auto dims : {std::pair<int,int>{1536,1024}, {8,16}, {200,56}}) {
+    for (auto dims : {std::pair<int,int>{1536,1024}, {8,16}, {200,56}, {7,13}}) {
         Data key(BFLOAT16), value(BFLOAT16);
         std::vector<uint16_t> refK, refV;
         for (int step = 0; step < (quick ? 4 : 80); ++step) {
@@ -255,14 +256,87 @@ static void TestCacheReservation() {
     }
 }
 
+static float FromBits(uint16_t bits) {
+    uint32_t raw = uint32_t(bits) << 16;
+    float value; std::memcpy(&value, &raw, sizeof(value)); return value;
+}
+static float Rounded(float value) { return FromBits(Float32ToBFloat16RNEBits(value)); }
+static void Zeros(Data &data, const std::vector<int> &shape) {
+    data.Resize(shape); data.Allocate();
+    std::memset(data.cpuData, 0, data.GetBytes());
+    data.ToDevice(DataDevice::CUDA, {0}, true);
+}
+static void TestRopeWidths() {
+    for (int dim : {64, 192, 384}) {
+        const int heads = 3, rows = 3, rotary = dim == 192 ? 64 : dim;
+        const float theta = 10000.0f;
+        Data input(BFLOAT16), positions(FLOAT32, {1,rows}, {0.0f,7.0f,1973.0f});
+        Upload(input, {1,rows,heads*dim}, 817 + dim);
+        auto before=Read<uint16_t>(input);
+        positions.ToDevice(DataDevice::CUDA,{0},true);
+        FastllmCudaNaiveRope(input,positions,heads,dim,rotary,theta);
+        auto actual=Read<uint16_t>(input);
+        const float pos[] = {0,7,1973};
+        for (int r=0;r<rows;++r) for(int h=0;h<heads;++h) {
+            size_t base=(r*heads+h)*dim;
+            for(int d=0;d<rotary/2;++d) {
+                float angle=pos[r]*std::pow(theta,-2.0f*d/rotary);
+                float c=Rounded(std::cos(angle)), sn=Rounded(std::sin(angle));
+                float x=FromBits(before[base+d]), y=FromBits(before[base+d+rotary/2]);
+                float lo=Rounded(Rounded(x*c)-Rounded(y*sn));
+                float hi=Rounded(Rounded(y*c)+Rounded(x*sn));
+                // CPU/GPU transcendental implementations can round differently.
+                Require(std::abs(FromBits(actual[base+d])-lo)<=0.012f &&
+                        std::abs(FromBits(actual[base+d+rotary/2])-hi)<=0.012f,
+                        "RoPE width differs from CPU reference");
+            }
+            for(int d=rotary;d<dim;++d)
+                Require(actual[base+d]==before[base+d],"RoPE changed nonrotary coordinates");
+        }
+        ++checks;
+    }
+}
+static void TestAttentionWidths() {
+    struct Shape { int queries, keys, valueDim; };
+    for(auto shape : {Shape{2,300,384},Shape{1,300,384},Shape{2,127,384},Shape{2,300,128}}) {
+        const int heads=4,kvHeads=2,dim=96,past=shape.keys-shape.queries;
+        Data query(BFLOAT16),key(BFLOAT16),value(BFLOAT16),sink(FLOAT32),indices,output;
+        Zeros(query,{1,shape.queries,heads*dim});
+        Zeros(key,{1,shape.keys,kvHeads*dim+128});
+        Zeros(sink,{heads});
+        Upload(value,{1,shape.keys,kvHeads*shape.valueDim},135);
+        auto values=Read<uint16_t>(value);
+        FastllmCudaNaiveAttention(query,key,value,indices,sink,heads,kvHeads,dim,
+                                  shape.valueDim,past,0,output);
+        auto actual=Read<uint16_t>(output);
+        for(int q=0;q<shape.queries;++q) for(int h=0;h<heads;++h) for(int d=0;d<shape.valueDim;++d) {
+            int valid=past+q+1;
+            // All QK logits and the sink are zero: uniform probabilities have
+            // an independent, exact denominator, including one sink position.
+            float probability=Rounded(1.0f/(valid+1));
+            float sum=0;
+            for(int k=0;k<valid;++k)
+                sum=std::fma(probability,FromBits(values[(k*kvHeads+h/(heads/kvHeads))*shape.valueDim+d]),sum);
+            Require(actual[(q*heads+h)*shape.valueDim+d]==Float32ToBFloat16RNEBits(sum),
+                    "Attention width differs from independent uniform-softmax reference");
+        }
+        ++checks;
+    }
+}
+
 int main(int argc,char **argv) {
     int devices=0;if(cudaGetDeviceCount(&devices)!=cudaSuccess || !devices) return 77;
+    if (argc == 2 && std::strcmp(argv[1], "--invalid-indexer") == 0) {
+        Data query, weights, key, indices;
+        FastllmCudaNaiveIndexer(query,weights,key,1,64,0,1,false,indices);
+        std::fprintf(stderr,"Invalid Indexer width was accepted\n"); return 1;
+    }
     try {
         Require(argc == 1 || (argc == 2 && std::strcmp(argv[1], "--quick") == 0),
                 "usage: naive_n05_decode_test [--quick]");
         quick = argc == 2;
         SetThreads(4);
-        TestTopK(); TestBatchedTopK(); TestCache(); TestCacheReservation();
+        TestTopK(); TestBatchedTopK(); TestCache(); TestCacheReservation(); TestRopeWidths(); TestAttentionWidths();
         Require(cudaDeviceSynchronize()==cudaSuccess,"CUDA final synchronization failed");
         std::printf("Naive decode regression passed: %d cases\n",checks);
     }catch(const std::exception&e){std::fprintf(stderr,"%s\n",e.what());return 1;}

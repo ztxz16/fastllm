@@ -8,7 +8,6 @@
 #include <climits>
 #include <algorithm>
 #include <cmath>
-#include <numeric>
 #include <vector>
 
 namespace {
@@ -31,13 +30,14 @@ void CheckLaunch() {
         std::string("Naive-N0.5 CUDA: ") + cudaGetErrorString(status));
 }
 
-// Each thread owns a disjoint 16-byte column. Moving rows in increasing order
+// Each thread owns a disjoint vector/scalar column. Moving rows in increasing order
 // is overlap-safe even when dropping just one row; no other thread touches
 // that column. K and V share a launch and retain their reserved capacity.
-__global__ void TrimCachePair(uint4 *key, uint4 *value, int keyColumns,
+template <typename T>
+__global__ void TrimCachePair(T *key, T *value, int keyColumns,
                               int valueColumns, int drop, int keep) {
     int column = blockIdx.x * blockDim.x + threadIdx.x;
-    uint4 *data = column < keyColumns ? key : value;
+    T *data = column < keyColumns ? key : value;
     int columns = column < keyColumns ? keyColumns : valueColumns;
     if (column >= keyColumns) column -= keyColumns;
     if (column >= columns) return;
@@ -45,29 +45,14 @@ __global__ void TrimCachePair(uint4 *key, uint4 *value, int keyColumns,
         data[(size_t)row * columns + column] = data[(size_t)(row + drop) * columns + column];
 }
 
-__global__ void EncodeTopK(const float *scores, unsigned long long *order, int count) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= count) return;
-    float score = scores[i];
-    // The CPU comparator treats -0 and +0 as tied.
-    unsigned bits = score == 0.0f ? 0u : __float_as_uint(score);
-    unsigned ordered = (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
-    order[i] = ((unsigned long long)ordered << 32) | (0xffffffffu - (unsigned)i);
-}
-__global__ void DecodeTopK(const unsigned long long *order, int *indices,
-                           int count, int topK) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < topK) indices[i] = i < count ? (int)(0xffffffffu - (unsigned)order[i]) : -1;
-}
-
 // Sorting the original score bits plus the inverse position preserves the CPU
 // comparator, including +/-0 ties. Separate causal segment ends exclude future
 // keys even when a valid score is -infinity; no score matrix leaves the GPU.
-__global__ void EncodeBatchedTopK(const float *scores, unsigned long long *order,
-                                 int *offsets, int queries, int keys, int queryStart) {
+__global__ void EncodeTopK(const float *scores, unsigned long long *order,
+                           int *offsets, int queries, int keys, int queryStart) {
     int row = blockIdx.y, col = blockIdx.x * blockDim.x + threadIdx.x;
     int count = queryStart + row + 1;
-    if (col == 0) {
+    if (offsets && col == 0) {
         offsets[row] = row * keys;
         offsets[queries + row] = row * keys + count;
     }
@@ -78,8 +63,8 @@ __global__ void EncodeBatchedTopK(const float *scores, unsigned long long *order
     order[(size_t)row * keys + col] =
         ((unsigned long long)ordered << 32) | (0xffffffffu - (unsigned)col);
 }
-__global__ void DecodeBatchedTopK(const unsigned long long *order, int *indices,
-                                 int keys, int queryStart, int topK) {
+__global__ void DecodeTopK(const unsigned long long *order, int *indices,
+                           int keys, int queryStart, int topK) {
     int row = blockIdx.y, col = blockIdx.x * blockDim.x + threadIdx.x;
     if (col >= topK) return;
     indices[(size_t)row * topK + col] = col <= queryStart + row
@@ -88,15 +73,16 @@ __global__ void DecodeBatchedTopK(const unsigned long long *order, int *indices,
 
 __global__ void Rope(BF16 *data, const float *positions, int heads, int dim,
                      int rotaryDim, float theta) {
-    int row = blockIdx.x, d = threadIdx.x;
-    if (d >= rotaryDim / 2) return;
-    float angle = positions[row / heads] * powf(theta, -2.0f * d / rotaryDim);
-    float c = RoundBF16(cosf(angle)), s = RoundBF16(sinf(angle));
+    int row = blockIdx.x;
     BF16 *x = data + (size_t)row * dim;
-    float a = (float)x[d], b = (float)x[d + rotaryDim / 2];
-    // Match eager GPT-NeoX RoPE, including each BF16 multiplication.
-    x[d] = __float2bfloat16(RoundBF16(a * c) - RoundBF16(b * s));
-    x[d + rotaryDim / 2] = __float2bfloat16(RoundBF16(b * c) + RoundBF16(a * s));
+    for (int d = threadIdx.x; d < rotaryDim / 2; d += blockDim.x) {
+        float angle = positions[row / heads] * powf(theta, -2.0f * d / rotaryDim);
+        float c = RoundBF16(cosf(angle)), s = RoundBF16(sinf(angle));
+        float a = (float)x[d], b = (float)x[d + rotaryDim / 2];
+        // Match eager GPT-NeoX RoPE, including each BF16 multiplication.
+        x[d] = __float2bfloat16(RoundBF16(a * c) - RoundBF16(b * s));
+        x[d + rotaryDim / 2] = __float2bfloat16(RoundBF16(b * c) + RoundBF16(a * s));
+    }
 }
 
 __global__ void RoundIndexer(const BF16 *input, float *output, int stride,
@@ -382,17 +368,18 @@ __global__ void AttentionSwaDecode(const BF16 *q, const BF16 *k, const BF16 *v,
 __global__ void AttentionValues(const float *prob, const BF16 *v, const int *indices,
                                 BF16 *out, int heads, int kvHeads, int dim,
                                 int keys, int count, int past, int window, bool causal) {
-    int query = blockIdx.y, h = blockIdx.x, d = threadIdx.x;
-    if (d >= dim) return;
+    int query = blockIdx.y, h = blockIdx.x;
     int kvHead = h / (heads / kvHeads);
-    float sum = 0;
     const float *p = prob + ((size_t)query * heads + h) * count;
-    for (int slot = 0; slot < count; slot++) {
-        int key = KeyIndex(indices, query, slot, count, past, window);
-        if (key >= 0 && key < keys && (!causal || key <= past + query))
-            sum += p[slot] * (float)v[((size_t)key * kvHeads + kvHead) * dim + d];
+    for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+        float sum = 0;
+        for (int slot = 0; slot < count; slot++) {
+            int key = KeyIndex(indices, query, slot, count, past, window);
+            if (key >= 0 && key < keys && (!causal || key <= past + query))
+                sum += p[slot] * (float)v[((size_t)key * kvHeads + kvHead) * dim + d];
+        }
+        out[((size_t)query * heads + h) * dim + d] = __float2bfloat16(sum);
     }
-    out[((size_t)query * heads + h) * dim + d] = __float2bfloat16(sum);
 }
 
 // Cooperatively stage a tile of V instead of issuing one dependent global
@@ -440,12 +427,20 @@ void FastllmCudaNaiveTrimCache(fastllm::Data &key, fastllm::Data &value, int kee
         key.dims[0] == 1 && value.dims[0] == 1 && key.dims[1] == value.dims[1] &&
         key.dataType == BFLOAT16 && value.dataType == BFLOAT16 &&
         key.dataDevice == DataDevice::CUDA && value.dataDevice == DataDevice::CUDA &&
-        key.dataDeviceIds == value.dataDeviceIds && key.dims[2] % 8 == 0 && value.dims[2] % 8 == 0,
+        key.dataDeviceIds == value.dataDeviceIds && key.dims[2] > 0 && value.dims[2] > 0,
         "Invalid Naive-N0.5 sliding cache layout.");
     if (key.dims[1] <= keep) return;
-    int kc = key.dims[2] / 8, vc = value.dims[2] / 8;
-    TrimCachePair<<<(kc + vc + 255) / 256, 256>>>((uint4 *)key.cudaData,
-        (uint4 *)value.cudaData, kc, vc, key.dims[1] - keep, keep);
+    if (key.dims[2] % 8 == 0 && value.dims[2] % 8 == 0) {
+        int kc = key.dims[2] / 8, vc = value.dims[2] / 8;
+        TrimCachePair<<<(kc + vc + 255) / 256, 256>>>((uint4 *)key.cudaData,
+            (uint4 *)value.cudaData, kc, vc, key.dims[1] - keep, keep);
+    } else {
+        // The vector path requires 16-byte row alignment. Other BF16 layouts
+        // use the same overlap-safe column ownership at scalar granularity.
+        int kc = key.dims[2], vc = value.dims[2];
+        TrimCachePair<<<(kc + vc + 255) / 256, 256>>>((uint16_t *)key.cudaData,
+            (uint16_t *)value.cudaData, kc, vc, key.dims[1] - keep, keep);
+    }
     CheckLaunch();
     key.Resize({1, keep, key.dims[2]});
     value.Resize({1, keep, value.dims[2]});
@@ -479,13 +474,13 @@ void FastllmCudaNaiveTopK(const fastllm::Data &scores, int queryStart, int topK,
         AssertInFastLLM(status == cudaSuccess && (bytes + 3) / 4 <= INT_MAX,
             "Naive-N0.5 batched TopK workspace query failed.");
         Output(workspace, INT32, {(int)((bytes + 3) / 4)});
-        EncodeBatchedTopK<<<dim3((keys + 255) / 256, queries), 256>>>(
+        EncodeTopK<<<dim3((keys + 255) / 256, queries), 256>>>(
             (const float *)scores.cudaData, input, begin, queries, keys, queryStart);
         status = cub::DeviceSegmentedRadixSort::SortKeysDescending(
             workspace.cudaData, bytes, input, output, items, queries, begin, begin + queries,
             0, 64, cudaStreamPerThread);
         AssertInFastLLM(status == cudaSuccess, "Naive-N0.5 batched GPU TopK failed.");
-        DecodeBatchedTopK<<<dim3((topK + 255) / 256, queries), 256>>>(
+        DecodeTopK<<<dim3((topK + 255) / 256, queries), 256>>>(
             output, (int *)indices.cudaData, keys, queryStart, topK);
         CheckLaunch();
         return;
@@ -502,13 +497,16 @@ void FastllmCudaNaiveTopK(const fastllm::Data &scores, int queryStart, int topK,
     // may use the driver API, where a null stream denotes the legacy stream.
     auto status = cub::DeviceRadixSort::SortKeysDescending(nullptr, bytes, input, output,
         count, 0, 64, cudaStreamPerThread);
-    AssertInFastLLM(status == cudaSuccess, "Naive-N0.5 TopK workspace query failed.");
+    AssertInFastLLM(status == cudaSuccess && (bytes + 3) / 4 <= INT_MAX,
+        "Naive-N0.5 TopK workspace query failed.");
     Output(workspace, INT32, {(int)((bytes + 3) / 4)});
-    EncodeTopK<<<(count + 255) / 256, 256>>>((const float *)scores.cudaData, input, count);
+    EncodeTopK<<<(count + 255) / 256, 256>>>(
+        (const float *)scores.cudaData, input, nullptr, 1, count, queryStart);
     status = cub::DeviceRadixSort::SortKeysDescending(workspace.cudaData, bytes, input, output,
         count, 0, 64, cudaStreamPerThread);
     AssertInFastLLM(status == cudaSuccess, "Naive-N0.5 GPU TopK failed.");
-    DecodeTopK<<<(topK + 255) / 256, 256>>>(output, (int *)indices.cudaData, count, topK);
+    DecodeTopK<<<(topK + 255) / 256, 256>>>(
+        output, (int *)indices.cudaData, count, queryStart, topK);
     CheckLaunch();
 }
 
@@ -526,6 +524,18 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
                             const fastllm::Data &packedKeys, int heads, int dim,
                             int queryStart, int topK, bool fp8, fastllm::Data &indices) {
     using namespace fastllm;
+    // Indexer quantization is defined on 128-element blocks. The score kernel
+    // has a general head-count path, but a different block width is unsupported.
+    AssertInFastLLM(dim == 128 && heads > 0 && query.dims.size() == 3 &&
+        query.dims[0] == 1 && query.dims[1] > 0 && query.dims[2] == (int64_t)heads * dim &&
+        packedKeys.dims.size() == 3 && packedKeys.dims[0] == 1 && packedKeys.dims[2] >= dim &&
+        queryStart >= 0 && (int64_t)queryStart + query.dims[1] <= packedKeys.dims[1] && topK > 0 &&
+        query.dataType == BFLOAT16 && packedKeys.dataType == BFLOAT16 && weights.dataType == BFLOAT16 &&
+        query.dataDevice == DataDevice::CUDA && packedKeys.dataDevice == DataDevice::CUDA &&
+        weights.dataDevice == DataDevice::CUDA && query.dataDeviceIds == packedKeys.dataDeviceIds &&
+        query.dataDeviceIds == weights.dataDeviceIds && query.cudaData && packedKeys.cudaData &&
+        weights.cudaData && weights.Count(0) == (uint64_t)query.dims[1] * heads,
+        "Invalid Naive-N0.5 Indexer layout (requires 128-element BF16 blocks).");
     int queries = query.dims[1], keys = packedKeys.dims[1];
     int stride = packedKeys.dims[2];
     Data q, k, scores;
