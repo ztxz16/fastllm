@@ -777,6 +777,10 @@ if (UNIT_TEST)
         target_link_libraries(cpu_isa_compat_test PRIVATE fastllm)
         add_test(NAME cpu_isa_compat COMMAND cpu_isa_compat_test)
 
+        add_executable(cpu_gguf_iq_native_test test/basic/test_cpu_gguf_iq_native.cpp)
+        target_link_libraries(cpu_gguf_iq_native_test PRIVATE fastllm)
+        fastllm_add_checked_test(cpu_gguf_iq_native cpu_gguf_iq_native_test "PASS: IQ3_S/IQ4_XS CPU" 60)
+
         add_executable(cpu_gguf_iq4_nl_test test/basic/test_cpu_gguf_iq4_nl.cpp)
         target_link_libraries(cpu_gguf_iq4_nl_test PRIVATE fastllm)
         fastllm_add_checked_test(cpu_gguf_iq4_nl cpu_gguf_iq4_nl_test "PASS: IQ4_NL multi-row CPU" 60)
