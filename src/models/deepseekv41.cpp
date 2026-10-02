@@ -1465,13 +1465,33 @@ namespace fastllm {
         // FASTLLM_DSV41_ENGRAM_WKV_FP8=0 可退回解量化。
         static const bool wkvFp8 = V41EnvFlagOn("FASTLLM_DSV41_ENGRAM_WKV_FP8") && !V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH");
         std::set<std::string> tensorNameSet(tensorNames.begin(), tensorNames.end());
+        auto markQuantizedLinear = [&](const std::string &name) {
+            quantizedLinearNames.insert(name);
+            if (V41EndsWith(name, ".w1.weight")) {
+                quantizedLinearNames.insert(name.substr(0, name.size() - strlen("w1.weight")) + "gateup.weight");
+            }
+        };
+        // FastLLM exports keep scales inside each quantized weight. Preserve
+        // the source activation boundaries even when the separate .scale
+        // tensors are absent, or weights were requantized to Q2/Q4.
+        auto activationNames = this->weight.dicts.find("fastllm_activation_quantized_linears");
+        if (activationNames != this->weight.dicts.end()) {
+            std::string error;
+            auto names = json11::Json::parse(activationNames->second, error);
+            AssertInFastLLM(error.empty() && names.is_array(),
+                            "DeepSeekV41: invalid exported activation quantization metadata.");
+            for (const auto &name : names.array_items()) {
+                AssertInFastLLM(name.is_string(),
+                                "DeepSeekV41: exported activation quantization names must be strings.");
+                if (tensorNameSet.count(name.string_value())) {
+                    markQuantizedLinear(name.string_value());
+                }
+            }
+        }
         for (const std::string &name : tensorNames) {
             if (V41EndsWith(name, ".weight") &&
                 tensorNameSet.count(name.substr(0, name.size() - strlen("weight")) + "scale")) {
-                quantizedLinearNames.insert(name);
-                if (V41EndsWith(name, ".w1.weight")) {
-                    quantizedLinearNames.insert(name.substr(0, name.size() - strlen("w1.weight")) + "gateup.weight");
-                }
+                markQuantizedLinear(name);
             }
         }
         for (const std::string &name : tensorNames) {

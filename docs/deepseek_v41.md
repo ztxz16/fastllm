@@ -117,6 +117,44 @@ ftllm server /path/to/DeepSeek-V4.1-Flash \
 - 首次启动会生成 `engram_meta.json`（约 1 分钟）并读入两张 Engram 表。
 
 CPU / NUMA 专家使用 FastLLM 自有线程池，由 `--threads` 控制；CLI 会自动设置 `FT_THREADS`，无需重复指定。
+
+### 导出 Q2_K/Q4_K 混合量化
+
+`tools/deepseek_v41_export_q2.py` 按分片导出可独立加载的 FastLLM 模型目录，配置见
+`example/quant/deepseekv41/Q2_K_MIXED.json`：主干路由专家的 `w1/w3` 使用 Q2_K，`w2` 使用 Q4_K；
+其它线性权重使用 FP16，模型映射保护的权重保留指定精度。Engram 表和 DSpark 草稿权重逐字节复制。
+混合分片会先分离这些原样保留的张量，导出不依赖 `FASTLLM_DSPARK_TOKENS` 设置。
+原始 Flash checkpoint 的路由专家已经是 FP4，因此这里是从 FP4 再量化，未使用校准集或 importance matrix。
+
+```bash
+FT_NUMAS=1 numactl -C 0-31 -m 0 \
+  python tools/deepseek_v41_export_q2.py \
+  --model /path/to/DeepSeek-V4.1-Flash \
+  --output /path/to/DeepSeek-V4.1-Flash-Q2_K-Mixed \
+  --threads 28
+```
+
+中断后使用相同命令并增加 `--resume`；脚本检查源配置、量化配置和分片信息，跳过已经完成的分片。
+输出是 FastLLM 的扩展 safetensors 格式，需使用支持导出激活元数据和 V4.1 GGML NUMA 激活转换的 FastLLM：
+独立 scale 会内嵌到转换后的权重，`config.json` 中的 `fastllm_activation_quantized_linears` 保留原模型的激活量化边界。
+
+单 NUMA 混推启动示例（CPU 核号应按机器的 NUMA 拓扑调整）：
+
+```bash
+FT_NUMAS=1 numactl -C 0-31 -m 0 \
+  ftllm server /path/to/DeepSeek-V4.1-Flash-Q2_K-Mixed \
+  --device cuda:0 --moe_device numa --ngram_device cpu \
+  --threads 28 --dtype float16 --kv_cache_dtype bfloat16 \
+  --chunked_prefill_size 4096 --max_batch 1 --dspark 5 \
+  --fast_prefill --cache_history true --host 0.0.0.0 --port 8080
+```
+
+2026-10-01 在单 NUMA、28 线程、RTX 4090、chunk 4096、DSpark 5、fastprefill 开启的配置下验证：
+导出权重为 419.45 GiB（源权重 475.25 GiB，缩小 11.74%），整模型可加载和生成。
+8,600-token prefill 预热后 3 次 TTFT 中位数为 14.12 秒，短输入解码为 25.75 token/s；
+同配置原 FP4 分别为 7.37 秒和 27.56 token/s，因此当前方案节省空间但没有加速。
+5 次长上下文取值 JSON 全部正确，算术和生成代码的 17 个用例通过；这些功能用例不能替代完整精度评测。
+
 常规推理不调用 OpenMP / MKL，`OMP_NUM_THREADS`、`MKL_NUM_THREADS`、`OMP_WAIT_POLICY`、`KMP_BLOCKTIME`
 可从上述命令中省略。Tokenizer 的 Python 依赖可能加载带 OpenMP / MKL 的 PyTorch，但不承担模型前向。
 NumPy 会加载 OpenBLAS，建议保留 `OPENBLAS_NUM_THREADS=1` 以免建立额外的大线程池。

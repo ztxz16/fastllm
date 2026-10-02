@@ -5,6 +5,7 @@
 #include "utils.h"
 #include "devices/cpu/computeutils.h"
 #include "devices/cpu/deepseekv41-reference-math.h"
+#include "models/deepseekv41.h"
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
 #endif
@@ -24,6 +25,33 @@ static void Check(bool ok, const char *message) {
     if (!ok)
         throw std::runtime_error(message);
     checks++;
+}
+static void ExportedActivationMetadata() {
+    class Probe : public DeepSeekV41Model {
+    public:
+        bool Quantized(const std::string &name) const {
+            return quantizedLinearNames.count(name) != 0;
+        }
+    };
+    const std::string query = "layers.0.attn.wq_a.weight";
+    const std::string expert = "layers.0.ffn.experts.0.w1.weight";
+    Probe original;
+    original.GetTensorMap({query, expert});
+    Check(!original.Quantized(query) && !original.Quantized(expert),
+          "unquantized source acquired activation quantization");
+    Probe exported;
+    exported.weight.AddDict("fastllm_activation_quantized_linears",
+                           "[\"" + query + "\",\"" + expert + "\"]");
+    exported.GetTensorMap({query, expert, "layers.0.attn.wq_b.weight"});
+    Check(exported.Quantized(query) && exported.Quantized(expert),
+          "export lost source activation quantization without scale tensors");
+    Check(exported.Quantized("layers.0.ffn.experts.0.gateup.weight"),
+          "export lost fused expert activation quantization");
+    Check(!exported.Quantized("layers.0.attn.wq_b.weight"),
+          "export metadata quantized an unrelated linear");
+    exported.GetTensorMap({"layers.0.attn.wq_b.weight", "layers.0.attn.wq_b.scale"});
+    Check(exported.Quantized("layers.0.attn.wq_b.weight"),
+          "export metadata prevented source scale detection");
 }
 static float Bf(float x) { return RoundFloat32ToBFloat16RNE(x); }
 static std::vector<float> Read(Data &data) {
@@ -686,6 +714,7 @@ static void SharedSwigluBoundary() {
 int main(int argc, char **argv) {
     try {
         SetThreads(30);
+        ExportedActivationMetadata();
         Activation(false);
         RotaryBoundary(false);
         AttentionBoundary(false);
