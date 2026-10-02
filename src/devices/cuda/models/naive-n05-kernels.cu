@@ -127,6 +127,21 @@ __global__ void DecodeTopK(const unsigned long long *order, int *indices,
         ? (int)(0xffffffffu - (unsigned)order[(size_t)row * keys + col]) : -1;
 }
 
+// CUB radix sort is stable: ascending input positions resolve equal score
+// bits without sorting an additional 32-bit position suffix.
+__global__ void EncodeTopKPairs(const float *scores, unsigned *bits, int *positions, int count) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) {
+        bits[i] = OrderedScoreBits(scores[i]);
+        positions[i] = i;
+    }
+}
+
+__global__ void DecodeTopKPairs(const int *positions, int *indices, int count, int topK) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < topK) indices[i] = i < count ? positions[i] : -1;
+}
+
 // Select a bounded superset of the top K before sorting it. A radix prefix can
 // stop as soon as at most capacity entries remain; no possible winner is lost.
 // If equal scores straddle a full candidate buffer, retain the lowest indices.
@@ -276,6 +291,36 @@ __global__ void IndexScores(const float *q, const float *k, const BF16 *weights,
     }
     if (lane == 0)
         scores[(size_t)query * keys + key] = key <= queryStart + query ? score : -INFINITY;
+}
+
+// Decode consumes each packed K row once. Keep its original E4M3-rounded
+// FP32 operands in registers across the 16 heads, avoiding a full temporary K.
+__global__ void IndexScoresDecode(const float *q, const BF16 *packedKeys,
+        const BF16 *weights, float *scores, int stride, int keys, int queryStart) {
+    int key = blockIdx.x * 8 + threadIdx.x / 32, lane = threadIdx.x % 32;
+    if (key >= keys) return;
+    float k[4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i)
+        k[i] = (float)packedKeys[(size_t)key * stride + stride - 128 + lane + i * 32];
+    float maximum = fmaxf(fmaxf(fabsf(k[0]), fabsf(k[2])),
+                         fmaxf(fabsf(k[1]), fabsf(k[3])));
+    for (int offset = 16; offset; offset >>= 1)
+        maximum = fmaxf(maximum, __shfl_down_sync(0xffffffff, maximum, offset));
+    float scale = fmaxf(__shfl_sync(0xffffffff, maximum, 0), 1e-4f) / 448.0f;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i)
+        k[i] = (float)__nv_fp8_e4m3(fmaxf(-448.0f, fminf(448.0f, k[i] / scale))) * scale;
+    float score = 0;
+    for (int h = 0; h < 16; ++h) {
+        float dot = 0;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i)
+            dot += q[h * 128 + lane + i * 32] * k[i];
+        dot = WarpSum(dot);
+        score += fmaxf(dot, 0.0f) * (float)weights[h];
+    }
+    if (lane == 0) scores[key] = key <= queryStart ? score : -INFINITY;
 }
 
 // Two 16-lane subgroups evaluate adjacent heads in parallel. Each lane owns
@@ -890,23 +935,25 @@ void FastllmCudaNaiveTopK(const fastllm::Data &scores, int queryStart, int topK,
     Output(encoded, INT32, {count, 2});
     Output(sorted, INT32, {count, 2});
     Output(indices, INT32, {1, topK});
-    auto *input = (unsigned long long *)encoded.cudaData;
-    auto *output = (unsigned long long *)sorted.cudaData;
+    auto *input = (unsigned *)encoded.cudaData;
+    auto *output = (unsigned *)sorted.cudaData;
+    auto *inputPositions = (int *)encoded.cudaData + count;
+    auto *outputPositions = (int *)sorted.cudaData + count;
     size_t bytes = 0;
-    // Match FastLLM's per-thread default stream explicitly: CCCL's launcher
-    // may use the driver API, where a null stream denotes the legacy stream.
-    auto status = cub::DeviceRadixSort::SortKeysDescending(nullptr, bytes, input, output,
-        count, 0, 64, cudaStreamPerThread);
+    // Stability retains ascending position order for equal score bits. This
+    // gives the same total order as the batched 64-bit key with half the bits.
+    // CCCL's driver launcher needs the per-thread stream explicitly.
+    auto status = cub::DeviceRadixSort::SortPairsDescending(nullptr, bytes,
+        input, output, inputPositions, outputPositions, count, 0, 32, cudaStreamPerThread);
     AssertInFastLLM(status == cudaSuccess && (bytes + 3) / 4 <= INT_MAX,
         "Naive-N0.5 TopK workspace query failed.");
     Output(workspace, INT32, {(int)((bytes + 3) / 4)});
-    EncodeTopK<<<(count + 255) / 256, 256>>>(
-        (const float *)scores.cudaData, input, nullptr, 1, count, queryStart);
-    status = cub::DeviceRadixSort::SortKeysDescending(workspace.cudaData, bytes, input, output,
-        count, 0, 64, cudaStreamPerThread);
+    EncodeTopKPairs<<<(count + 255) / 256, 256>>>(
+        (const float *)scores.cudaData, input, inputPositions, count);
+    status = cub::DeviceRadixSort::SortPairsDescending(workspace.cudaData, bytes,
+        input, output, inputPositions, outputPositions, count, 0, 32, cudaStreamPerThread);
     AssertInFastLLM(status == cudaSuccess, "Naive-N0.5 GPU TopK failed.");
-    DecodeTopK<<<(topK + 255) / 256, 256>>>(
-        output, (int *)indices.cudaData, count, queryStart, topK);
+    DecodeTopKPairs<<<(topK + 255) / 256, 256>>>(outputPositions, (int *)indices.cudaData, count, topK);
     CheckLaunch();
 }
 
@@ -965,29 +1012,35 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
 #endif
     {
         Output(q, DataType::FLOAT32, {queries, heads, dim});
-        Output(k, DataType::FLOAT32, {keys, dim});
         RoundIndexer<<<queries * heads, 128>>>((const BF16 *)query.cudaData,
             (float *)q.cudaData, dim, 0, fp8);
-        RoundIndexer<<<keys, 128>>>((const BF16 *)packedKeys.cudaData,
-            (float *)k.cudaData, stride, stride - dim, fp8);
-        if (queries > 1 && heads == 16) {
-            // A larger tile amortizes operand loads once there are enough tiles
-            // to fill the GPU. Keep the smaller tile for short/underfilled work.
-            if ((int64_t)queries * keys >= 128 * 1024) {
-                constexpr int keysPerBlock = kIndexerKeysPerWarp * kIndexerWarps;
-                IndexScoresPrefillTiled<<<dim3((keys + keysPerBlock - 1) / keysPerBlock,
-                    (queries + kIndexerQueryTile - 1) / kIndexerQueryTile), kIndexerWarps * 32>>>(
-                    (const float *)q.cudaData, (const float *)k.cudaData,
-                    (const BF16 *)weights.cudaData, (float *)scores.cudaData, queries, keys, queryStart);
-            } else {
-                IndexScoresPrefill<<<dim3((keys + 7) / 8, queries), 256>>>((const float *)q.cudaData,
-                    (const float *)k.cudaData, (const BF16 *)weights.cudaData,
-                    (float *)scores.cudaData, keys, queryStart);
-            }
+        if (queries == 1 && heads == 16 && fp8) {
+            IndexScoresDecode<<<(keys + 7) / 8, 256>>>((const float *)q.cudaData,
+                (const BF16 *)packedKeys.cudaData, (const BF16 *)weights.cudaData,
+                (float *)scores.cudaData, stride, keys, queryStart);
         } else {
-            IndexScores<<<dim3((keys + 7) / 8, queries), 256>>>((const float *)q.cudaData,
-                (const float *)k.cudaData, (const BF16 *)weights.cudaData,
-                (float *)scores.cudaData, heads, keys, queryStart);
+            Output(k, DataType::FLOAT32, {keys, dim});
+            RoundIndexer<<<keys, 128>>>((const BF16 *)packedKeys.cudaData,
+                (float *)k.cudaData, stride, stride - dim, fp8);
+            if (queries > 1 && heads == 16) {
+                // A larger tile amortizes operand loads once there are enough tiles
+                // to fill the GPU. Keep the smaller tile for short/underfilled work.
+                if ((int64_t)queries * keys >= 128 * 1024) {
+                    constexpr int keysPerBlock = kIndexerKeysPerWarp * kIndexerWarps;
+                    IndexScoresPrefillTiled<<<dim3((keys + keysPerBlock - 1) / keysPerBlock,
+                        (queries + kIndexerQueryTile - 1) / kIndexerQueryTile), kIndexerWarps * 32>>>(
+                        (const float *)q.cudaData, (const float *)k.cudaData,
+                        (const BF16 *)weights.cudaData, (float *)scores.cudaData, queries, keys, queryStart);
+                } else {
+                    IndexScoresPrefill<<<dim3((keys + 7) / 8, queries), 256>>>((const float *)q.cudaData,
+                        (const float *)k.cudaData, (const BF16 *)weights.cudaData,
+                        (float *)scores.cudaData, keys, queryStart);
+                }
+            } else {
+                IndexScores<<<dim3((keys + 7) / 8, queries), 256>>>((const float *)q.cudaData,
+                    (const float *)k.cudaData, (const BF16 *)weights.cudaData,
+                    (float *)scores.cudaData, heads, keys, queryStart);
+            }
         }
     }
     CheckLaunch();

@@ -639,7 +639,9 @@ static void TestIndexer() {
         {32,32767,16,896,true}, {32,32768,16,896,true},
         {33,32769,16,897,true}, {64,16384,16,896,true},
         {65,16387,16,896,true}, {512,2051,16,896,true},
-        {64,16384,8,896,true}, {64,16384,16,896,false}};
+        {64,16384,8,896,true}, {64,16384,16,896,false},
+        {1,4099,16,897,true}, {1,32768,16,896,true}, {1,131073,16,897,true},
+        {1,4099,8,896,true}, {1,4099,16,896,false}};
     for (const auto &s : shapes) for (int mode = 0; mode < 5; ++mode) {
         if (quick && s.rows != 33 && s.rows != 1) continue;
         Data q(BFLOAT16), k(BFLOAT16), w(BFLOAT16), out;
@@ -658,8 +660,9 @@ static void TestIndexer() {
         Require(cudaMemcpy(k.cudaData,kb.data(),kb.size()*2,cudaMemcpyHostToDevice)==cudaSuccess,"Indexer K upload");
         Require(cudaMemcpy(w.cudaData,wb.data(),wb.size()*2,cudaMemcpyHostToDevice)==cudaSuccess,"Indexer W upload");
         // Include causal future keys and output padding in the small case.
-        int past = s.rows == 1 ? 63 : s.keys-s.rows;
-        int top = s.rows == 1 ? 80 : 2048;
+        bool smallDecode = s.rows == 1 && s.keys == 257;
+        int past = smallDecode ? 63 : (s.rows == 1 && s.stride == 897 ? s.keys - 65 : s.keys - s.rows);
+        int top = smallDecode ? 80 : 2048;
         FastllmCudaNaiveIndexer(q,w,k,s.heads,128,past,top,s.fp8,out);
         auto got = Read<int>(out);
         auto qv = IndexerOperands(qb,s.rows*s.heads,128,0,s.fp8);
@@ -776,6 +779,33 @@ static void TestDecodeGraphs() {
             std::vector<uint16_t> kr(kb.begin() + drop * dims.first, kb.end());
             std::vector<uint16_t> vr(vb.begin() + drop * dims.second, vb.end());
             Require(Read<uint16_t>(k) == kr && Read<uint16_t>(v) == vr, "trim graph differs from CPU suffix");
+            ++checks;
+        }
+        cudaGraphExecDestroy(graph);
+    }
+    for (int keys : {4099, 32768}) {
+        constexpr int heads = 16, stride = 897;
+        Data q(BFLOAT16), k(BFLOAT16), w(BFLOAT16), actual, expected;
+        Upload(q, {1, 1, heads * 128}, 751);
+        Upload(k, {1, keys, stride}, 757);
+        Upload(w, {1, 1, heads}, 761);
+        auto call = [&](Data &out) {
+            FastllmCudaNaiveIndexer(q, w, k, heads, 128, keys - 65, 2048, true, out);
+        };
+        call(actual);
+        Require(cudaDeviceSynchronize() == cudaSuccess, "Indexer graph warmup");
+        auto graph = Capture([&]() { call(actual); });
+        auto qb = Read<uint16_t>(q), kb = Read<uint16_t>(k), wb = Read<uint16_t>(w);
+        for (int seed = 1; seed <= 3; ++seed) {
+            for (auto &x : qb) x ^= 0x8000;
+            for (auto &x : wb) x ^= 0x8000;
+            for (int row = seed; row < keys; row += 37) for (int d = 0; d < 128; ++d)
+                kb[(size_t)row * stride + stride - 128 + d] ^= 0x8000;
+            Put(q, qb); Put(k, kb); Put(w, wb);
+            call(expected);
+            auto reference = Read<int>(expected);
+            Replay(graph);
+            Require(Read<int>(actual) == reference, "Indexer graph differs after historical-key update");
             ++checks;
         }
         cudaGraphExecDestroy(graph);
