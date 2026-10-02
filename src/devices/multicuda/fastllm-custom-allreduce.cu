@@ -34,6 +34,14 @@ constexpr int kCustomArMaxRanks = 8;
 constexpr int kCustomArMaxBlocks = 36;
 constexpr int kCustomArThreads = 512;
 constexpr int kCustomArPushMaxBlocks = 256;
+// Cap for the pointer-tuple registration cache. Speculative decode produces
+// fresh activation addresses every step, so without a cap the device pointer
+// tables would accumulate without bound (each small allocation best-fits into
+// a larger activation-pool block), showing up as the GPU small-buffer pool
+// busy count growing steadily with decoding. Evicting the oldest entry and
+// reusing its device block keeps the zero-copy path for hot pointer tuples
+// while bounding device memory usage.
+constexpr size_t kCustomArMaxRegistrations = 64;
 constexpr size_t kCustomArPushMaxBytes = 1ULL * 1024ULL * 1024ULL;
 constexpr size_t kCustomArAutoSmallBytes = 16ULL * 1024ULL;
 constexpr size_t kCustomArAutoLargeBytes = 1ULL * 1024ULL * 1024ULL;
@@ -1230,7 +1238,47 @@ bool FindOrRegisterCustomArPointers(CustomArState &state, int rank,
             ok = BuildCustomArRegistration(state, inputs, rankDatas);
             lock.lock();
             if (ok) {
+                // Bound the pointer-tuple cache.  Speculative decode allocates
+                // fresh activations every step, so every registration key is a
+                // miss and old device pointer tables would otherwise stay
+                // resident for the whole serving session.  Make room *before*
+                // inserting: std::map iterates by key, so after insertion the
+                // victim would be whichever tuple sorts lowest and could be the
+                // entry we just built, freeing the table this call is about to
+                // launch against.  BuildCustomArRegistration synchronized every
+                // participating device above, so kernels that referenced the
+                // evicted tables have already completed.
+                std::vector<CustomArAllocation> evicted;
+                while (state.registrations.size() >= kCustomArMaxRegistrations) {
+                    auto victim = state.registrations.begin();
+                    for (int evictRank = 0;
+                         evictRank < (int)victim->second.size(); ++evictRank) {
+                        if (victim->second[evictRank] != nullptr &&
+                            evictRank < (int)state.devices.size()) {
+                            evicted.push_back(
+                                {state.devices[evictRank],
+                                 victim->second[evictRank]});
+                        }
+                    }
+                    state.registrations.erase(victim);
+                }
                 state.registrations[key] = rankDatas;
+                if (!evicted.empty()) {
+                    lock.unlock();
+                    int originalDevice = FastllmCudaGetDevice();
+                    for (const CustomArAllocation &allocation : evicted) {
+                        if (allocation.device < 0 ||
+                            allocation.pointer == nullptr) {
+                            continue;
+                        }
+                        FastllmCudaSetDevice(allocation.device);
+                        FastllmCudaFree(allocation.pointer);
+                    }
+                    if (originalDevice >= 0) {
+                        FastllmCudaSetDevice(originalDevice);
+                    }
+                    lock.lock();
+                }
             }
         }
         state.lastRegistrationMissDuringCapture =
