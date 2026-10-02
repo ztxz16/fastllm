@@ -100,8 +100,13 @@ bool FastllmCudaMergeMOEGGUFHost(const fastllm::Data &input,
     CUDA_CHECK(cudaStreamIsCapturing(cudaStreamPerThread, &capture));
     if (capture != cudaStreamCaptureStatusNone) return false;
     int gt = -1, dt = -1, inter = 0, maxBlocks = 0;
-    size_t packedBytes = 0;
-    struct Source { const fastllm::Data *weight; size_t offset; int slot; };
+    size_t packedBytes = 0, restoreBytes = 0;
+    struct Source {
+        const fastllm::Data *weight;
+        size_t offset, uploadOffset;
+        int slot;
+        bool restore;
+    };
     std::vector<Source> sources;
     // Validate the entire subset before allocating, copying, or changing output.
     // The selected expert IDs use NUMA's +1 convention (slot 0 is shared).
@@ -122,8 +127,11 @@ bool FastllmCudaMergeMOEGGUFHost(const fastllm::Data &input,
                  w->dims[0]%w->numasData.size() ||
                  std::any_of(w->numasData.begin(), w->numasData.end(),
                     [](const uint8_t *p) { return p == nullptr; })))) return false;
-            sources.push_back({w, packedBytes, 2*(e-1)+part});
-            packedBytes += Align(w->GetBytes());
+            const bool restore = (crossSwiglu && part == 0) || Ordinary(w->ggmlType) != w->ggmlType;
+            const size_t weightBytes = Align(w->GetBytes());
+            sources.push_back({w, packedBytes, restoreBytes, 2*(e-1)+part, restore});
+            packedBytes += weightBytes;
+            if (restore) restoreBytes += weightBytes;
             maxBlocks = std::max(maxBlocks, w->dims[0] *
                 (w->dims[1]/(w->ggmlType == GGML_TYPE_Q2_0 ? 64 : 256)));
         }
@@ -136,12 +144,16 @@ bool FastllmCudaMergeMOEGGUFHost(const fastllm::Data &input,
     const size_t mmqBytes = FastllmCudaMoeGGUFGroupedWorkspaceBytes(
         gt, dt, rows, hidden, inter, expertCount, topk);
     if (!mmqBytes) return false;
-    const size_t tableOffset = 2*packedBytes;
+    // Final weights and routing metadata stay live through both projections.
+    // Only weights that need restoring use upload scratch. Restore and MMQ
+    // run on the same stream, so MMQ can overwrite that scratch afterwards
+    // without another copy, allocation, or synchronization.
+    const size_t tableOffset = packedBytes;
     const size_t descOffset = tableOffset+Align(2*expertCount*sizeof(void *));
     const size_t indexOffset = descOffset+Align(sources.size()*sizeof(WeightCopy));
     const size_t scoreOffset = indexOffset+Align(size_t(rows)*topk*sizeof(int32_t));
     const size_t mmqOffset = scoreOffset+Align(size_t(rows)*topk*sizeof(float));
-    const size_t bytes = mmqOffset+mmqBytes;
+    const size_t bytes = mmqOffset+std::max(restoreBytes, mmqBytes);
     if (bytes > size_t(INT32_MAX)) return false;
     const size_t gateBytes = size_t(rows)*topk*inter*(input.dataType == fastllm::FLOAT32 ? 4 : 2);
     size_t freeBytes = 0, totalBytes = 0;
@@ -159,18 +171,18 @@ bool FastllmCudaMergeMOEGGUFHost(const fastllm::Data &input,
     for (const auto &src : sources) {
         const auto &w = *src.weight;
         auto *target = base+src.offset;
+        auto *upload = src.restore ? base+mmqOffset+src.uploadOffset : target;
         if (w.cpuData) {
-            CUDA_CHECK(cudaMemcpyAsync(target, w.cpuData, w.GetBytes(), cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(upload, w.cpuData, w.GetBytes(), cudaMemcpyHostToDevice, stream));
         } else {
             const size_t shardBytes = w.GetBytes()/w.numasData.size();
             for (size_t node = 0; node < w.numasData.size(); ++node)
-                CUDA_CHECK(cudaMemcpyAsync(target+node*shardBytes, w.numasData[node],
+                CUDA_CHECK(cudaMemcpyAsync(upload+node*shardBytes, w.numasData[node],
                     shardBytes, cudaMemcpyHostToDevice, stream));
         }
         const bool cross = crossSwiglu && src.slot%2 == 0;
-        const bool restore = cross || Ordinary(w.ggmlType) != w.ggmlType;
-        table[src.slot] = restore ? target+packedBytes : target;
-        if (restore) copies.push_back({target, target+packedBytes, w.ggmlType,
+        table[src.slot] = target;
+        if (src.restore) copies.push_back({upload, target, w.ggmlType,
             w.dims[0], w.dims[1], int(cross)});
     }
     CUDA_CHECK(cudaMemcpyAsync(base+tableOffset, table.data(), table.size()*sizeof(void *), cudaMemcpyHostToDevice, stream));

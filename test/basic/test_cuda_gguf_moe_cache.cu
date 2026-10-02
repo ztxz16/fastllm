@@ -518,9 +518,9 @@ template<class T> static void RunTPShards(ggml_type type, fastllm::DataType dtyp
 // NUMA row shards against independently decoded ordinary GGUF weights.
 template<class T> static void RunHost(ggml_type type, fastllm::DataType dtype,
         int device, int batch = 65, int inter = 256, bool cross = true,
-        ggml_type downType = GGML_TYPE_Q2_0) {
+        ggml_type downType = GGML_TYPE_Q2_0, int experts = 4) {
     Cuda(cudaSetDevice(device));
-    const int hidden = 256, experts = 4, topk = 3;
+    const int hidden = 256, topk = 3;
     std::vector<std::unique_ptr<fastllm::Data>> owned;
     std::vector<fastllm::Data *> table(2*(experts+1), nullptr);
     std::vector<std::vector<float>> decoded;
@@ -579,6 +579,7 @@ template<class T> static void RunHost(ggml_type type, fastllm::DataType dtype,
     for (int pass = 0; pass < 3; ++pass) {
         selected = pass == 0 ? std::unordered_set<int>{1,3} :
             pass == 1 ? std::unordered_set<int>{2,4} : std::unordered_set<int>{1,2,3,4};
+        if (pass == 2) for (int e = 1; e <= experts; ++e) selected.insert(e);
         // Alias two immutable NUMA shards; restore ownership before assertions.
         std::vector<uint8_t *> originals;
         for (auto &w : owned) {
@@ -797,6 +798,10 @@ int main(int argc, char **argv) {
             RunHost<__nv_bfloat16>(GGML_TYPE_IQ2_S, fastllm::BFLOAT16, 0);
             RunHost<float>(GGML_TYPE_IQ2_XS, fastllm::FLOAT32, 0, 33, 256, false);
             RunHost<float>(GGML_TYPE_IQ2_S, fastllm::FLOAT32, 0, 33, 256, true, GGML_TYPE_IQ2_XS);
+            // Exercise direct uploads with no restore, and a weight-heavy
+            // batch whose upload scratch is larger than the MMQ workspace.
+            RunHost<half>(GGML_TYPE_Q2_0, fastllm::FLOAT16, 0, 33, 256, false, GGML_TYPE_Q2_0, 32);
+            RunHost<half>(GGML_TYPE_IQ2_S, fastllm::FLOAT16, 0, 33, 256, true, GGML_TYPE_IQ2_XS, 32);
             if (count >= 2) RunHost<float>(GGML_TYPE_IQ2_XXS, fastllm::FLOAT32, 1);
             std::puts("PASS: streamed GGUF prefill, NUMA shards, selected subsets, immutable weights");
             return 0;
