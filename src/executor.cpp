@@ -33,6 +33,33 @@
 #endif
 
 namespace fastllm {
+    static bool TensorNeedsDeviceCopy(
+            const std::string &opType, const std::string &name,
+            BaseDevice *device, const DataDict &datas) {
+        if (name == "output" ||
+            (opType == "SelectExpert" && (name == "index" || name == "score"))) {
+            return false;
+        }
+#ifdef USE_CUDA
+        if (opType == "MergeMOE" && device->deviceType == "cuda" &&
+            (name == "w1" || name == "w2" || name == "w3")) {
+            // CUDA MoE overwrites these workspaces before reading them (or
+            // leaves them unused). Moving between layer devices must allocate
+            // on the destination without transferring the previous layer's data.
+            // Keep input semantics if a caller also binds this Data as an input.
+            const Data *workspace = datas.at(name);
+            for (const char *input : {"input", "index", "score"}) {
+                auto it = datas.find(input);
+                if (it != datas.end() && it->second == workspace) {
+                    return true;
+                }
+            }
+            return false;
+        }
+#endif
+        return true;
+    }
+
 #ifdef USE_CUDA
     static bool KeepKimiK3NumaTensorOnSource(
             const std::string &opType, const std::string &name,
@@ -355,12 +382,7 @@ namespace fastllm {
                         }
                     } else {
                         if (it.second) {
-                            bool copyData = true;
-                            if (it.first == "output") {
-                                copyData = false;
-                            } else if (opType == "SelectExpert" && (it.first == "index" || it.first == "score")) {
-                                copyData = false;
-                            }
+                            const bool copyData = TensorNeedsDeviceCopy(opType, it.first, device, datas);
 #ifdef USE_CUDA
                             if (!KeepKimiK3NumaTensorOnSource(
                                     opType, it.first, device, it.second) &&
@@ -448,12 +470,7 @@ namespace fastllm {
                     }
                 } else {
                     if (it.second) {
-                        bool copyData = true;
-                        if (it.first == "output") {
-                            copyData = false;
-                        } else if (opType == "SelectExpert" && (it.first == "index" || it.first == "score")) {
-                            copyData = false;
-                        }
+                        const bool copyData = TensorNeedsDeviceCopy(opType, it.first, device, datas);
 #ifdef USE_CUDA
                         if (!KeepKimiK3NumaTensorOnSource(
                                 opType, it.first, device, it.second) &&
