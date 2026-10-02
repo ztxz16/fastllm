@@ -7276,7 +7276,7 @@ namespace fastllm {
 
     static bool TryNaiveFP8HybridPrefill(Data &input, Data &output,
         Data &index, Data &score, Data **weights, Data **biass, int weightsBatch,
-        int topk, FastllmMoeDataManagerNumas &workspace) {
+        int topk, FastllmMoeDataManagerNumas &workspace, int layer, bool profileDetail) {
         int n = input.dims[0], hidden = input.dims[1];
         if (!MoeEnvConfig::GetInstance().GetGpuPrefill() || n < 256 ||
             GetNumaConfig()->numaCnt != 1 || input.dataType != BFLOAT16 ||
@@ -7292,20 +7292,30 @@ namespace fastllm {
         std::sort(order.begin(), order.end(), [&](int a, int b) {
             return routes[a].size() != routes[b].size() ? routes[a].size() > routes[b].size() : a < b;
         });
-        // Estimate both workers' completion time. Transfer cost is per expert;
+        // Use the same TP, serial-layer and extra-assist device discovery as
+        // ordinary NUMA MoE. Keep this model's W8A8/BF16 expert arithmetic.
+        const int currentDevice = FastllmCudaGetDevice();
+        std::vector<int> devices = GetNumasMoeCudaAssistDevices();
+        if (std::find(devices.begin(), devices.end(), currentDevice) == devices.end())
+            devices.push_back(currentDevice);
+        // Estimate the CPU and each GPU's completion time. Transfer cost is per expert;
         // CPU compute cost is per routed row, so offload the busiest experts.
-        double cpu = n * topk * .013, gpu = 0, best = cpu;
+        double cpu = n * topk * .013, best = cpu;
+        std::vector<double> gpuLoads(devices.size(), 0.0);
+        std::vector<int> assignments;
         int count = 0;
-        for (int i = 0; i < (int)order.size() && i < 96; ++i) {
+        for (int i = 0; i < (int)order.size() && i < 96 * (int)devices.size(); ++i) {
             int rows = routes[order[i]].size();
             if (rows < 32) break;
-            cpu -= rows * .013; gpu += 1.2 + rows * .003;
-            double cost = std::max(cpu, gpu);
+            int worker = (int)(std::min_element(gpuLoads.begin(), gpuLoads.end()) - gpuLoads.begin());
+            assignments.push_back(worker);
+            cpu -= rows * .013; gpuLoads[worker] += 1.2 + rows * .003;
+            double cost = std::max(cpu, *std::max_element(gpuLoads.begin(), gpuLoads.end()));
             if (cost < best) { best = cost; count = i + 1; }
         }
         if (count == 0) return false;
         std::unordered_set<int> cpuExperts(order.begin(), order.end());
-        std::vector<FastllmNaiveFP8ExpertTask> gpuTasks;
+        std::vector<std::vector<FastllmNaiveFP8ExpertTask>> gpuTasks(devices.size());
         for (int i = 0; i < count; ++i) {
             int e = order[i];
             for (int part = 0; part < 2; ++part) {
@@ -7314,7 +7324,7 @@ namespace fastllm {
                 if (w->numasData.empty()) RegisterNumas(w, part ? "linear" : "linearSwiglu");
                 if (w->dataType != FP8_E4M3_BLOCK_128 || !w->numasData[0]) return false;
             }
-            gpuTasks.push_back({weights[e * 2]->numasData[0], weights[e * 2 + 1]->numasData[0], routes[e]});
+            gpuTasks[assignments[i]].push_back({weights[e * 2]->numasData[0], weights[e * 2 + 1]->numasData[0], routes[e]});
             cpuExperts.erase(e);
         }
         // One transient route buffer per inference thread, not per model layer.
@@ -7322,23 +7332,41 @@ namespace fastllm {
         perRoute.resize((size_t)n * topk * hidden);
         float *results = perRoute.data();
         const float *silu = GetDeepSeekV4BFloat16SiluLookup().data();
-        int device = FastllmCudaGetDevice();
-        bool gpuOk = false;
-        std::thread worker([&]() {
-            try {
-                gpuOk = FastllmCudaNaiveExpertPrefill(device, (uint16_t *)input.cpuData,
-                    scores, n, topk, hidden, inter, gpuTasks, silu, results);
-            } catch (...) { gpuOk = false; }
-        });
+        // vector<bool> would pack independently written worker flags together.
+        std::vector<int> gpuOk(devices.size(), 1);
+        std::vector<std::thread> workers;
+        workers.reserve(devices.size());
+        auto joinWorkers = [&]() {
+            for (auto &worker : workers) if (worker.joinable()) worker.join();
+        };
         // Disjoint route slots are written concurrently; the final reduction
         // retains ascending expert-id order and performs only one BF16 cast.
         try {
+            for (size_t i = 0; i < devices.size(); ++i) {
+                if (gpuTasks[i].empty()) continue;
+                workers.emplace_back([&, i]() {
+                    try {
+                        gpuOk[i] = FastllmCudaNaiveExpertPrefill(devices[i], (uint16_t *)input.cpuData,
+                            scores, n, topk, hidden, inter, gpuTasks[i], silu, results);
+                    } catch (...) { gpuOk[i] = 0; }
+                });
+            }
             if (!cpuExperts.empty()) DoNumasMergeMOEOnCPU(input, output, index, score,
                 weights, biass, 0, weightsBatch, topk, cpuExperts, workspace,
                 nullptr, 0, false, 128, false, results, true);
-        } catch (...) { worker.join(); throw; }
-        worker.join();
-        if (!gpuOk) return false;
+        } catch (...) { joinWorkers(); throw; }
+        joinWorkers();
+        if (std::find(gpuOk.begin(), gpuOk.end(), 0) != gpuOk.end()) return false;
+        if (profileDetail) {
+            printf("[Fastllm] NUMA MoE prefill layer=%d naive_fp8=1 cpu_experts=%zu", layer, cpuExperts.size());
+            for (size_t i = 0; i < devices.size(); ++i) {
+                size_t gpuRoutes = 0;
+                for (const auto &task : gpuTasks[i]) gpuRoutes += task.routes.size();
+                printf(" gpu%d_experts=%zu gpu%d_routes=%zu", devices[i], gpuTasks[i].size(), devices[i], gpuRoutes);
+            }
+            printf("\n");
+            fflush(stdout);
+        }
         std::vector<int> reduceOrder(n * topk);
         for (int row = 0; row < n; ++row) {
             auto first = reduceOrder.begin() + row * topk;
@@ -7974,7 +8002,7 @@ namespace fastllm {
             ensureCpuOutput();
 #ifdef USE_CUDA
             if (fp8EagerMode && TryNaiveFP8HybridPrefill(input, output, index, score,
-                    weights, biass, weightsBatch, topk, fastllmMoeDataManagerNumas)) return;
+                    weights, biass, weightsBatch, topk, fastllmMoeDataManagerNumas, layer, profileDetail)) return;
 #endif
             DoNumasMergeMOEOnCPU(
                 input, output, index, score, weights, biass,

@@ -942,7 +942,8 @@ if (UNIT_TEST)
         if (USE_CUDA)
             target_include_directories(numas_fp8_eager_moe_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
             add_test(NAME numas_fp8_eager_moe_hybrid COMMAND numas_fp8_eager_moe_test --hybrid)
-            set_tests_properties(numas_fp8_eager_moe_hybrid PROPERTIES
+            add_test(NAME numas_fp8_eager_moe_hybrid_multicuda COMMAND numas_fp8_eager_moe_test --hybrid-dual)
+            set_tests_properties(numas_fp8_eager_moe_hybrid numas_fp8_eager_moe_hybrid_multicuda PROPERTIES
                 ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4;FT_GPU_PREFILL=1;FASTLLM_ACTIVATE_NUMA=ON"
                 LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
         endif()

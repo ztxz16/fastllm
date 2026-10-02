@@ -1,0 +1,407 @@
+{
+  "date_utc": "2026-09-30T17:06:39.070991+00:00",
+  "input_tokens": 7557,
+  "raw_device": "cudapp=2",
+  "library_sha256": "0dd499db3534a58cbd5b38af520acc2ce936e2fddd0f7153ed10b98953bfea32",
+  "cpu_affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31
+  ],
+  "runs": [
+    {
+      "name": "cold_8192",
+      "chunk_size": 8192,
+      "input_tokens": 7557,
+      "output_tokens": 1,
+      "ttft_seconds": 25.0523345670008,
+      "total_seconds": 25.057532937003998,
+      "last_token_seconds": 25.0523345670008,
+      "decode_tokens_per_second": null,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 1
+      },
+      "output_hash": "da8c326d8b17883e05109f856f3fd093a3a9fde6473d42082d1f2c58be30e909",
+      "gpu_peak_mib_physical_indices": [
+        17193.125,
+        16069.125
+      ],
+      "gpu_mean_utilization_physical_indices": [
+        31.201612903225808,
+        33.53629032258065
+      ],
+      "gpu_sample_count": 248
+    },
+    {
+      "name": "warm_8192_a",
+      "chunk_size": 8192,
+      "input_tokens": 7557,
+      "output_tokens": 1,
+      "ttft_seconds": 22.037046800003736,
+      "total_seconds": 22.042311764998885,
+      "last_token_seconds": 22.037046800003736,
+      "decode_tokens_per_second": null,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 1
+      },
+      "output_hash": "da8c326d8b17883e05109f856f3fd093a3a9fde6473d42082d1f2c58be30e909",
+      "gpu_peak_mib_physical_indices": [
+        17195.125,
+        16069.125
+      ],
+      "gpu_mean_utilization_physical_indices": [
+        30.570776255707763,
+        29.95433789954338
+      ],
+      "gpu_sample_count": 219
+    },
+    {
+      "name": "warm_8192_b",
+      "chunk_size": 8192,
+      "input_tokens": 7557,
+      "output_tokens": 1,
+      "ttft_seconds": 22.110378862002108,
+      "total_seconds": 22.115635735004616,
+      "last_token_seconds": 22.110378862002108,
+      "decode_tokens_per_second": null,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 1
+      },
+      "output_hash": "da8c326d8b17883e05109f856f3fd093a3a9fde6473d42082d1f2c58be30e909",
+      "gpu_peak_mib_physical_indices": [
+        17195.125,
+        16069.125
+      ],
+      "gpu_mean_utilization_physical_indices": [
+        38.70909090909091,
+        30.39090909090909
+      ],
+      "gpu_sample_count": 220
+    },
+    {
+      "name": "warm_8192_c",
+      "chunk_size": 8192,
+      "input_tokens": 7557,
+      "output_tokens": 1,
+      "ttft_seconds": 22.135981914994773,
+      "total_seconds": 22.14116235399706,
+      "last_token_seconds": 22.135981914994773,
+      "decode_tokens_per_second": null,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 1
+      },
+      "output_hash": "da8c326d8b17883e05109f856f3fd093a3a9fde6473d42082d1f2c58be30e909",
+      "gpu_peak_mib_physical_indices": [
+        20661.125,
+        16069.125
+      ],
+      "gpu_mean_utilization_physical_indices": [
+        41.963800904977376,
+        45.65610859728507
+      ],
+      "gpu_sample_count": 221
+    },
+    {
+      "name": "warm_4096_a",
+      "chunk_size": 4096,
+      "input_tokens": 7557,
+      "output_tokens": 1,
+      "ttft_seconds": 23.758500567993906,
+      "total_seconds": 23.76389976399514,
+      "last_token_seconds": 23.758500567993906,
+      "decode_tokens_per_second": null,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 1
+      },
+      "output_hash": "da8c326d8b17883e05109f856f3fd093a3a9fde6473d42082d1f2c58be30e909",
+      "gpu_peak_mib_physical_indices": [
+        16573.125,
+        13117.125
+      ],
+      "gpu_mean_utilization_physical_indices": [
+        34.573839662447256,
+        31.679324894514767
+      ],
+      "gpu_sample_count": 237
+    },
+    {
+      "name": "warm_4096_b",
+      "chunk_size": 4096,
+      "input_tokens": 7557,
+      "output_tokens": 1,
+      "ttft_seconds": 24.013985155994305,
+      "total_seconds": 24.01922429700062,
+      "last_token_seconds": 24.013985155994305,
+      "decode_tokens_per_second": null,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 1
+      },
+      "output_hash": "da8c326d8b17883e05109f856f3fd093a3a9fde6473d42082d1f2c58be30e909",
+      "gpu_peak_mib_physical_indices": [
+        16517.125,
+        13029.125
+      ],
+      "gpu_mean_utilization_physical_indices": [
+        31.204166666666666,
+        30.458333333333332
+      ],
+      "gpu_sample_count": 240
+    },
+    {
+      "name": "warm_2048_a",
+      "chunk_size": 2048,
+      "input_tokens": 7557,
+      "output_tokens": 1,
+      "ttft_seconds": 27.471920247000526,
+      "total_seconds": 27.477198134998616,
+      "last_token_seconds": 27.471920247000526,
+      "decode_tokens_per_second": null,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 1
+      },
+      "output_hash": "da8c326d8b17883e05109f856f3fd093a3a9fde6473d42082d1f2c58be30e909",
+      "gpu_peak_mib_physical_indices": [
+        14021.125,
+        11449.125
+      ],
+      "gpu_mean_utilization_physical_indices": [
+        36.722627737226276,
+        33.82846715328467
+      ],
+      "gpu_sample_count": 274
+    },
+    {
+      "name": "warm_2048_b",
+      "chunk_size": 2048,
+      "input_tokens": 7557,
+      "output_tokens": 1,
+      "ttft_seconds": 28.17057002499496,
+      "total_seconds": 28.175649067998165,
+      "last_token_seconds": 28.17057002499496,
+      "decode_tokens_per_second": null,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 1
+      },
+      "output_hash": "da8c326d8b17883e05109f856f3fd093a3a9fde6473d42082d1f2c58be30e909",
+      "gpu_peak_mib_physical_indices": [
+        13999.125,
+        11417.125
+      ],
+      "gpu_mean_utilization_physical_indices": [
+        32.0,
+        34.34163701067616
+      ],
+      "gpu_sample_count": 281
+    },
+    {
+      "name": "quality_8192",
+      "chunk_size": 8192,
+      "input_tokens": 7557,
+      "output_tokens": 32,
+      "ttft_seconds": 21.928761520997796,
+      "total_seconds": 23.67648313400423,
+      "last_token_seconds": 23.67120282399992,
+      "decode_tokens_per_second": 17.79113014974382,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 32
+      },
+      "output_hash": "6e006305163e7792af2f0ae60d2bf511782e0d84300f0173d4661b6b3f88e81d",
+      "gpu_peak_mib_physical_indices": [
+        20633.125,
+        16225.125
+      ],
+      "gpu_mean_utilization_physical_indices": [
+        41.81434599156118,
+        27.734177215189874
+      ],
+      "gpu_sample_count": 237,
+      "output_equals_original_2048": true
+    },
+    {
+      "name": "cached_followup_8192",
+      "chunk_size": 8192,
+      "input_tokens": 7590,
+      "output_tokens": 1,
+      "ttft_seconds": 0.25869501100532943,
+      "total_seconds": 0.2636758380031097,
+      "last_token_seconds": 0.25869501100532943,
+      "decode_tokens_per_second": null,
+      "statistics": {
+        "cached_input_tokens": 7588,
+        "missed_input_tokens": 2,
+        "output_tokens": 1
+      },
+      "output_hash": "303b3ae9f1ffbc7af3cfb274895ffbf9070964ef72694c51ea3fdb354ade79b0",
+      "gpu_peak_mib_physical_indices": [
+        11875.125,
+        10043.125
+      ],
+      "gpu_mean_utilization_physical_indices": [
+        12.0,
+        9.0
+      ],
+      "gpu_sample_count": 2
+    }
+  ],
+  "gpu_names_physical_indices": [
+    "NVIDIA GeForce RTX 4090 D",
+    "NVIDIA GeForce RTX 4090"
+  ],
+  "model_load_seconds": 484.3083981009986,
+  "args": {
+    "path": "/home/tf/hfmodels/Naive-N0.5-Flash-FP8",
+    "device": "{'cuda:0': 1, 'cuda:1': 1}",
+    "moe_device": "numa",
+    "threads": 28,
+    "dtype": "fp8_e4m3",
+    "atype": "auto",
+    "speculative_draft_model_path": "/home/tf/hfmodels/Naive-N0.5-Flash-FP8-Draft",
+    "draft_tokens": 7,
+    "cache_history": "true",
+    "chunked_prefill_size": 8192,
+    "max_context_length": 32768,
+    "max_batch": 1
+  },
+  "cudapp_serial_environment": "1",
+  "hardware": {
+    "cpu": "AMD EPYC 9374F",
+    "numa_nodes_used": 1,
+    "worker_threads": 28,
+    "cuda_ordinal_0": {
+      "physical_index": 1,
+      "name": "RTX 4090",
+      "pci_bus_id": "0000:41:00.0"
+    },
+    "cuda_ordinal_1": {
+      "physical_index": 0,
+      "name": "RTX 4090 D",
+      "pci_bus_id": "0000:01:00.0"
+    },
+    "gpu_interconnect_topology": "NODE"
+  },
+  "placement": {
+    "target_layers_0_to_23": "cuda:0",
+    "target_layers_24_to_47": "cuda:1",
+    "draft": "cuda:1",
+    "routed_experts": "numa"
+  },
+  "method": [
+    "Installed production library restored to commit 2faae1d9; no native source changes.",
+    "Existing --device cudapp=2 enables serial layer placement, not tensor parallel execution.",
+    "Same private 7557-token input, one NUMA node, 28 threads and 7-token Draft as the earlier single-GPU measurements.",
+    "Reset history before each full request; each reports zero cached input tokens.",
+    "Exclude model loading and the first full request from warm summaries.",
+    "Measure GPUs through NVML every 100 ms; physical NVIDIA indices differ from CUDA ordinals.",
+    "Compare with earlier single-GPU cache-disabled results; configurations ran in separate processes at different times.",
+    "Earlier single-GPU process used the experimental library with its expert cache disabled; the production source has since been restored.",
+    "GPU peaks depend on workspace and allocator history; do not treat independent-process peaks as an exact allocation comparison.",
+    "32-token decode throughput is a short greedy sample after prefill, not a long-generation benchmark.",
+    "Raw input and output token bodies are excluded."
+  ],
+  "previous_single_gpu_source": "naive_n05_flash_prefill_expert_cache.json",
+  "previous_single_gpu_library_sha256": "7c2a555e645a70ecb82cc0c72478b19528e422b40633b253a9b75f27b43c91d5",
+  "summaries": [
+    {
+      "chunk_size": 2048,
+      "samples": 2,
+      "dual_serial_ttft_median_seconds": 27.821245135997742,
+      "dual_serial_ttft_min_seconds": 27.471920247000526,
+      "dual_serial_ttft_max_seconds": 28.17057002499496,
+      "effective_input_tokens_per_second": 271.6269513840717,
+      "previous_single_gpu_ttft_median_seconds": 24.744041819503764,
+      "ttft_increase_percent": 12.43613852151051,
+      "gpu_peak_mib_physical_indices": [
+        14021.125,
+        11449.125
+      ]
+    },
+    {
+      "chunk_size": 4096,
+      "samples": 2,
+      "dual_serial_ttft_median_seconds": 23.886242861994106,
+      "dual_serial_ttft_min_seconds": 23.758500567993906,
+      "dual_serial_ttft_max_seconds": 24.013985155994305,
+      "effective_input_tokens_per_second": 316.3745777710441,
+      "previous_single_gpu_ttft_median_seconds": null,
+      "ttft_increase_percent": null,
+      "gpu_peak_mib_physical_indices": [
+        16573.125,
+        13117.125
+      ]
+    },
+    {
+      "chunk_size": 8192,
+      "samples": 3,
+      "dual_serial_ttft_median_seconds": 22.110378862002108,
+      "dual_serial_ttft_min_seconds": 22.037046800003736,
+      "dual_serial_ttft_max_seconds": 22.135981914994773,
+      "effective_input_tokens_per_second": 341.7851881763599,
+      "previous_single_gpu_ttft_median_seconds": 20.655708648500877,
+      "ttft_increase_percent": 7.042460940243789,
+      "gpu_peak_mib_physical_indices": [
+        20661.125,
+        16069.125
+      ]
+    }
+  ],
+  "comparison": {
+    "dual_serial_32_token_decode_tokens_per_second": 17.79113014974382,
+    "previous_single_gpu_32_token_decode_tokens_per_second_approximate": 20.991924217170503,
+    "single_gpu_decode_estimator": "31 / (total_seconds - ttft_seconds), including final handle completion overhead",
+    "dual_serial_decode_estimator": "31 / (last_token_seconds - ttft_seconds)",
+    "greedy_32_tokens_match_original": true,
+    "cached_followup_ttft_seconds": 0.25869501100532943,
+    "cached_followup_statistics": {
+      "cached_input_tokens": 7588,
+      "missed_input_tokens": 2,
+      "output_tokens": 1
+    }
+  }
+}

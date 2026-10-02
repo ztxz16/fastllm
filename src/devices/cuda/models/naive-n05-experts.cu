@@ -87,6 +87,7 @@ struct Buffer {
     template<class T> T *As() { return (T *)ptr; }
 };
 struct Workspace {
+    std::mutex mutex;
     cudaStream_t stream = nullptr;
     cublasHandle_t handle = nullptr;
     Buffer input, scores, routes, lookup, packed, weight, weightScales;
@@ -106,9 +107,9 @@ struct Workspace {
     }
 };
 std::mutex &Mutex() { static std::mutex mutex; return mutex; }
-std::map<int, std::unique_ptr<Workspace>> &Workspaces() {
+std::map<int, std::shared_ptr<Workspace>> &Workspaces() {
     // Explicitly released while CUDA is alive, like the NUMA runtime cache.
-    static auto *workspaces = new std::map<int, std::unique_ptr<Workspace>>;
+    static auto *workspaces = new std::map<int, std::shared_ptr<Workspace>>;
     return *workspaces;
 }
 
@@ -134,11 +135,18 @@ bool FastllmCudaNaiveExpertPrefill(int device, const uint16_t *input,
         const std::vector<FastllmNaiveFP8ExpertTask> &tasks,
         const float *siluLookup, float *perRouteOutput) {
     if (tasks.empty() || hidden % 128 || intermediate % 128) return false;
-    std::lock_guard<std::mutex> guard(Mutex());
+    // Protect the registry briefly; GPU work on different devices must overlap.
+    // A shared owner keeps the workspace alive if the registry is cleared.
+    std::shared_ptr<Workspace> workspace;
+    {
+        std::lock_guard<std::mutex> guard(Mutex());
+        auto &entry = Workspaces()[device];
+        if (!entry) entry = std::make_shared<Workspace>(device);
+        workspace = entry;
+    }
+    std::lock_guard<std::mutex> guard(workspace->mutex);
     if (cudaSetDevice(device) != cudaSuccess) return false;
-    auto &entry = Workspaces()[device];
-    if (!entry) entry.reset(new Workspace(device));
-    auto &w = *entry;
+    auto &w = *workspace;
     if (!w.Init()) return false;
     // On every failure, finish already submitted copies before the caller
     // retries on CPU or releases its input and routing buffers.
@@ -201,9 +209,17 @@ bool FastllmCudaNaiveExpertPrefill(int device, const uint16_t *input,
 }
 
 void FastllmCudaNaiveClearExpertPrefill() {
-    std::lock_guard<std::mutex> guard(Mutex());
-    if (Workspaces().empty()) return;
+    std::map<int, std::shared_ptr<Workspace>> retired;
+    {
+        std::lock_guard<std::mutex> guard(Mutex());
+        retired.swap(Workspaces());
+    }
+    if (retired.empty()) return;
+    // Drain users of the old workspaces without blocking the registry.
+    for (auto &entry : retired) {
+        std::lock_guard<std::mutex> guard(entry.second->mutex);
+    }
     int previous = 0; cudaGetDevice(&previous);
-    Workspaces().clear();
+    retired.clear();
     cudaSetDevice(previous);
 }

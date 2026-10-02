@@ -9,6 +9,8 @@
 #include <cstring>
 #include <cstdio>
 #include <memory>
+#include <future>
+#include <thread>
 #include <stdexcept>
 #include <vector>
 #ifdef USE_CUDA
@@ -157,11 +159,13 @@ static void TestTiledGemm() {
 
 int main(int argc, char **argv) {
     try {
-        const bool hybrid = argc == 2 && std::strcmp(argv[1], "--hybrid") == 0;
+        const bool dual = argc == 2 && std::strcmp(argv[1], "--hybrid-dual") == 0;
+        const bool hybrid = dual || (argc == 2 && std::strcmp(argv[1], "--hybrid") == 0);
         if (hybrid) {
 #ifdef USE_CUDA
             int devices = 0;
-            if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
+            if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < (dual ? 2 : 1)) return 77;
+            if (dual) SetDeviceMap({{"cuda:0", 1}, {"cuda:1", 1}});
 #else
             return 77;
 #endif
@@ -213,6 +217,11 @@ int main(int argc, char **argv) {
                 }
                 RoundActivation(inputs[row], &inputScales[row]);
             }
+#ifdef USE_CUDA
+            const int currentDevice = dual && rows == 256 ? 1 : 0;
+            if (hybrid && cudaSetDevice(currentDevice) != cudaSuccess)
+                throw std::runtime_error("Cannot select the CUDA prefill device");
+#endif
             executor.Run("MergeMOE", {
                 {"input", &x}, {"index", &ids}, {"score", &scores},
                 {"weights", (Data *)weights.data()}, {"biass", (Data *)biases.data()},
@@ -220,6 +229,13 @@ int main(int argc, char **argv) {
             }, {{"sharedScale", 0}}, {{"weights___batch", (int)weights.size()},
                 {"biass___batch", (int)biases.size()}, {"fp8EagerMode", 1}});
             output.ToDevice(DataDevice::CPU);
+#ifdef USE_CUDA
+            if (hybrid) {
+                int after = -1;
+                if (cudaGetDevice(&after) != cudaSuccess || after != currentDevice)
+                    throw std::runtime_error("Hybrid prefill changed the caller's CUDA device");
+            }
+#endif
             std::vector<float> gpuRoutes;
 #ifdef USE_CUDA
             if (hybrid && rows >= 256) {
@@ -243,6 +259,36 @@ int main(int argc, char **argv) {
                     (float *)scores.cpuData, rows, topk, hidden, inter, tasks,
                     silu.data(), gpuRoutes.data()))
                     throw std::runtime_error("CUDA FP8 expert path unavailable");
+                if (dual) {
+                    // Warm both devices, then write disjoint route slots
+                    // concurrently. Also exercise two callers on one device
+                    // and recreation of workspaces after explicit release.
+                    std::vector<float> second(gpuRoutes.size());
+                    if (!FastllmCudaNaiveExpertPrefill(1, (uint16_t *)x.cpuData,
+                        (float *)scores.cpuData, rows, topk, hidden, inter, tasks,
+                        silu.data(), second.data()) || second != gpuRoutes)
+                        throw std::runtime_error("Second CUDA device differs from the FP8 oracle");
+                    std::vector<FastllmNaiveFP8ExpertTask> splitTasks[2];
+                    for (size_t i = 0; i < tasks.size(); ++i) splitTasks[i % 2].push_back(tasks[i]);
+                    for (int attempt = 0; attempt < 3; ++attempt) {
+                        if (attempt == 2) FastllmCudaNaiveClearExpertPrefill();
+                        std::vector<float> parallel(gpuRoutes.size(), 12345.0f);
+                        int ok[2] = {0, 0};
+                        std::promise<void> start;
+                        auto ready = start.get_future().share();
+                        std::thread workers[2];
+                        for (int i = 0; i < 2; ++i) workers[i] = std::thread([&, i]() {
+                            ready.wait();
+                            ok[i] = FastllmCudaNaiveExpertPrefill(attempt == 1 ? 0 : i,
+                                (uint16_t *)x.cpuData, (float *)scores.cpuData, rows, topk,
+                                hidden, inter, splitTasks[i], silu.data(), parallel.data());
+                        });
+                        start.set_value();
+                        for (auto &worker : workers) worker.join();
+                        if (!ok[0] || !ok[1] || parallel != gpuRoutes)
+                            throw std::runtime_error("Concurrent FP8 expert workspaces changed routed outputs");
+                    }
+                }
             }
 #endif
             for (int row = 0; row < rows; row++) {

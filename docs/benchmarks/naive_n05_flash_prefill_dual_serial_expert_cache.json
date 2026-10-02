@@ -1,0 +1,1309 @@
+{
+  "date_utc": "2026-09-30T17:32:36.001940+00:00",
+  "input_tokens": 7557,
+  "raw_device": "cudapp=2",
+  "library_sha256": "7c2a555e645a70ecb82cc0c72478b19528e422b40633b253a9b75f27b43c91d5",
+  "cpu_affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31
+  ],
+  "runs": [
+    {
+      "name": "cold_8192_disabled",
+      "chunk_size": 8192,
+      "input_tokens": 7557,
+      "cache_budget_bytes_per_cuda_device": 0,
+      "output_tokens": 1,
+      "ttft_seconds": 24.65923876699526,
+      "total_seconds": 24.664208946000144,
+      "last_token_seconds": 24.65923876699526,
+      "decode_tokens_per_second": null,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 1
+      },
+      "output_hash": "da8c326d8b17883e05109f856f3fd093a3a9fde6473d42082d1f2c58be30e909",
+      "gpu_peak_mib_physical_indices": [
+        17193.125,
+        16069.125
+      ],
+      "gpu_mean_utilization_physical_indices": [
+        25.591836734693878,
+        31.571428571428573
+      ],
+      "gpu_sample_count": 245,
+      "cache_stats_cuda_ordinals": [
+        {
+          "resident_bytes": 0,
+          "hits": 0,
+          "misses": 4304,
+          "copied_weight_bytes": 55849254912
+        },
+        {
+          "resident_bytes": 0,
+          "hits": 0,
+          "misses": 3954,
+          "copied_weight_bytes": 51307610112
+        }
+      ],
+      "cache_delta_cuda_ordinals": [
+        {
+          "hits": 0,
+          "misses": 4304,
+          "copied_weight_bytes": 55849254912
+        },
+        {
+          "hits": 0,
+          "misses": 3954,
+          "copied_weight_bytes": 51307610112
+        }
+      ],
+      "weight_h2d_bytes_total": 107156865024
+    },
+    {
+      "name": "warm_8192_disabled_a",
+      "chunk_size": 8192,
+      "input_tokens": 7557,
+      "cache_budget_bytes_per_cuda_device": 0,
+      "output_tokens": 1,
+      "ttft_seconds": 21.53110762200231,
+      "total_seconds": 21.536480718998064,
+      "last_token_seconds": 21.53110762200231,
+      "decode_tokens_per_second": null,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 1
+      },
+      "output_hash": "da8c326d8b17883e05109f856f3fd093a3a9fde6473d42082d1f2c58be30e909",
+      "gpu_peak_mib_physical_indices": [
+        20751.125,
+        16069.125
+      ],
+      "gpu_mean_utilization_physical_indices": [
+        28.906976744186046,
+        38.604651162790695
+      ],
+      "gpu_sample_count": 215,
+      "cache_stats_cuda_ordinals": [
+        {
+          "resident_bytes": 0,
+          "hits": 0,
+          "misses": 8608,
+          "copied_weight_bytes": 111698509824
+        },
+        {
+          "resident_bytes": 0,
+          "hits": 0,
+          "misses": 7908,
+          "copied_weight_bytes": 102615220224
+        }
+      ],
+      "cache_delta_cuda_ordinals": [
+        {
+          "hits": 0,
+          "misses": 4304,
+          "copied_weight_bytes": 55849254912
+        },
+        {
+          "hits": 0,
+          "misses": 3954,
+          "copied_weight_bytes": 51307610112
+        }
+      ],
+      "weight_h2d_bytes_total": 107156865024
+    },
+    {
+      "name": "warm_8192_disabled_b",
+      "chunk_size": 8192,
+      "input_tokens": 7557,
+      "cache_budget_bytes_per_cuda_device": 0,
+      "output_tokens": 1,
+      "ttft_seconds": 21.6748110970002,
+      "total_seconds": 21.679731512005674,
+      "last_token_seconds": 21.6748110970002,
+      "decode_tokens_per_second": null,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 1
+      },
+      "output_hash": "da8c326d8b17883e05109f856f3fd093a3a9fde6473d42082d1f2c58be30e909",
+      "gpu_peak_mib_physical_indices": [
+        20183.125,
+        16069.125
+      ],
+      "gpu_mean_utilization_physical_indices": [
+        31.416666666666668,
+        25.60185185185185
+      ],
+      "gpu_sample_count": 216,
+      "cache_stats_cuda_ordinals": [
+        {
+          "resident_bytes": 0,
+          "hits": 0,
+          "misses": 12912,
+          "copied_weight_bytes": 167547764736
+        },
+        {
+          "resident_bytes": 0,
+          "hits": 0,
+          "misses": 11862,
+          "copied_weight_bytes": 153922830336
+        }
+      ],
+      "cache_delta_cuda_ordinals": [
+        {
+          "hits": 0,
+          "misses": 4304,
+          "copied_weight_bytes": 55849254912
+        },
+        {
+          "hits": 0,
+          "misses": 3954,
+          "copied_weight_bytes": 51307610112
+        }
+      ],
+      "weight_h2d_bytes_total": 107156865024
+    },
+    {
+      "name": "fill_8192_2g",
+      "chunk_size": 8192,
+      "input_tokens": 7557,
+      "cache_budget_bytes_per_cuda_device": 2147483648,
+      "output_tokens": 1,
+      "ttft_seconds": 21.645985595998354,
+      "total_seconds": 21.65097072199569,
+      "last_token_seconds": 21.645985595998354,
+      "decode_tokens_per_second": null,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 1
+      },
+      "output_hash": "da8c326d8b17883e05109f856f3fd093a3a9fde6473d42082d1f2c58be30e909",
+      "gpu_peak_mib_physical_indices": [
+        23013.125,
+        18383.125
+      ],
+      "gpu_mean_utilization_physical_indices": [
+        39.97695852534562,
+        32.35023041474654
+      ],
+      "gpu_sample_count": 217,
+      "cache_stats_cuda_ordinals": [
+        {
+          "resident_bytes": 2145386496,
+          "hits": 0,
+          "misses": 17216,
+          "copied_weight_bytes": 223397019648
+        },
+        {
+          "resident_bytes": 2145386496,
+          "hits": 0,
+          "misses": 15816,
+          "copied_weight_bytes": 205230440448
+        }
+      ],
+      "cache_delta_cuda_ordinals": [
+        {
+          "hits": 0,
+          "misses": 4304,
+          "copied_weight_bytes": 55849254912
+        },
+        {
+          "hits": 0,
+          "misses": 3954,
+          "copied_weight_bytes": 51307610112
+        }
+      ],
+      "weight_h2d_bytes_total": 107156865024
+    },
+    {
+      "name": "warm_8192_2g_a",
+      "chunk_size": 8192,
+      "input_tokens": 7557,
+      "cache_budget_bytes_per_cuda_device": 2147483648,
+      "output_tokens": 1,
+      "ttft_seconds": 21.713561599994136,
+      "total_seconds": 21.718602132998058,
+      "last_token_seconds": 21.713561599994136,
+      "decode_tokens_per_second": null,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 1
+      },
+      "output_hash": "da8c326d8b17883e05109f856f3fd093a3a9fde6473d42082d1f2c58be30e909",
+      "gpu_peak_mib_physical_indices": [
+        19509.125,
+        18383.125
+      ],
+      "gpu_mean_utilization_physical_indices": [
+        34.94444444444444,
+        27.22222222222222
+      ],
+      "gpu_sample_count": 216,
+      "cache_stats_cuda_ordinals": [
+        {
+          "resident_bytes": 2145386496,
+          "hits": 165,
+          "misses": 21359,
+          "copied_weight_bytes": 277152792576
+        },
+        {
+          "resident_bytes": 2145386496,
+          "hits": 165,
+          "misses": 19633,
+          "copied_weight_bytes": 254755995648
+        }
+      ],
+      "cache_delta_cuda_ordinals": [
+        {
+          "hits": 165,
+          "misses": 4143,
+          "copied_weight_bytes": 53755772928
+        },
+        {
+          "hits": 165,
+          "misses": 3817,
+          "copied_weight_bytes": 49525555200
+        }
+      ],
+      "weight_h2d_bytes_total": 103281328128
+    },
+    {
+      "name": "warm_8192_2g_b",
+      "chunk_size": 8192,
+      "input_tokens": 7557,
+      "cache_budget_bytes_per_cuda_device": 2147483648,
+      "output_tokens": 1,
+      "ttft_seconds": 21.645450938005524,
+      "total_seconds": 21.650481138000032,
+      "last_token_seconds": 21.645450938005524,
+      "decode_tokens_per_second": null,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 1
+      },
+      "output_hash": "da8c326d8b17883e05109f856f3fd093a3a9fde6473d42082d1f2c58be30e909",
+      "gpu_peak_mib_physical_indices": [
+        22975.125,
+        18383.125
+      ],
+      "gpu_mean_utilization_physical_indices": [
+        29.412037037037038,
+        36.80555555555556
+      ],
+      "gpu_sample_count": 216,
+      "cache_stats_cuda_ordinals": [
+        {
+          "resident_bytes": 2145386496,
+          "hits": 330,
+          "misses": 25502,
+          "copied_weight_bytes": 330908565504
+        },
+        {
+          "resident_bytes": 2145386496,
+          "hits": 330,
+          "misses": 23450,
+          "copied_weight_bytes": 304281550848
+        }
+      ],
+      "cache_delta_cuda_ordinals": [
+        {
+          "hits": 165,
+          "misses": 4143,
+          "copied_weight_bytes": 53755772928
+        },
+        {
+          "hits": 165,
+          "misses": 3817,
+          "copied_weight_bytes": 49525555200
+        }
+      ],
+      "weight_h2d_bytes_total": 103281328128
+    },
+    {
+      "name": "quality_8192_2g",
+      "chunk_size": 8192,
+      "input_tokens": 7557,
+      "cache_budget_bytes_per_cuda_device": 2147483648,
+      "output_tokens": 32,
+      "ttft_seconds": 21.715672580998216,
+      "total_seconds": 23.182928825001,
+      "last_token_seconds": 23.17786842899659,
+      "decode_tokens_per_second": 21.200990306761213,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 32
+      },
+      "output_hash": "6e006305163e7792af2f0ae60d2bf511782e0d84300f0173d4661b6b3f88e81d",
+      "gpu_peak_mib_physical_indices": [
+        22975.125,
+        18383.125
+      ],
+      "gpu_mean_utilization_physical_indices": [
+        37.09051724137931,
+        24.560344827586206
+      ],
+      "gpu_sample_count": 232,
+      "cache_stats_cuda_ordinals": [
+        {
+          "resident_bytes": 2145386496,
+          "hits": 495,
+          "misses": 29645,
+          "copied_weight_bytes": 384664338432
+        },
+        {
+          "resident_bytes": 2145386496,
+          "hits": 495,
+          "misses": 27267,
+          "copied_weight_bytes": 353807106048
+        }
+      ],
+      "cache_delta_cuda_ordinals": [
+        {
+          "hits": 165,
+          "misses": 4143,
+          "copied_weight_bytes": 53755772928
+        },
+        {
+          "hits": 165,
+          "misses": 3817,
+          "copied_weight_bytes": 49525555200
+        }
+      ],
+      "weight_h2d_bytes_total": 103281328128,
+      "output_equals_original_2048": true
+    },
+    {
+      "name": "warm_8192_disabled_c",
+      "chunk_size": 8192,
+      "input_tokens": 7557,
+      "cache_budget_bytes_per_cuda_device": 0,
+      "output_tokens": 1,
+      "ttft_seconds": 21.769514608000463,
+      "total_seconds": 21.774521688996174,
+      "last_token_seconds": 21.769514608000463,
+      "decode_tokens_per_second": null,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 1
+      },
+      "output_hash": "da8c326d8b17883e05109f856f3fd093a3a9fde6473d42082d1f2c58be30e909",
+      "gpu_peak_mib_physical_indices": [
+        17275.125,
+        17241.125
+      ],
+      "gpu_mean_utilization_physical_indices": [
+        36.46082949308756,
+        32.58064516129032
+      ],
+      "gpu_sample_count": 217,
+      "cache_stats_cuda_ordinals": [
+        {
+          "resident_bytes": 0,
+          "hits": 495,
+          "misses": 33949,
+          "copied_weight_bytes": 440513593344
+        },
+        {
+          "resident_bytes": 0,
+          "hits": 495,
+          "misses": 31221,
+          "copied_weight_bytes": 405114716160
+        }
+      ],
+      "cache_delta_cuda_ordinals": [
+        {
+          "hits": 0,
+          "misses": 4304,
+          "copied_weight_bytes": 55849254912
+        },
+        {
+          "hits": 0,
+          "misses": 3954,
+          "copied_weight_bytes": 51307610112
+        }
+      ],
+      "weight_h2d_bytes_total": 107156865024
+    },
+    {
+      "name": "fill_8192_4g",
+      "chunk_size": 8192,
+      "input_tokens": 7557,
+      "cache_budget_bytes_per_cuda_device": 4294967296,
+      "output_tokens": 1,
+      "ttft_seconds": 21.913612393997028,
+      "total_seconds": 21.918656701993314,
+      "last_token_seconds": 21.913612393997028,
+      "decode_tokens_per_second": null,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 1
+      },
+      "output_hash": "da8c326d8b17883e05109f856f3fd093a3a9fde6473d42082d1f2c58be30e909",
+      "gpu_peak_mib_physical_indices": [
+        24107.125,
+        20701.125
+      ],
+      "gpu_mean_utilization_physical_indices": [
+        27.59360730593607,
+        37.76255707762557
+      ],
+      "gpu_sample_count": 219,
+      "cache_stats_cuda_ordinals": [
+        {
+          "resident_bytes": 4290772992,
+          "hits": 495,
+          "misses": 38253,
+          "copied_weight_bytes": 496362848256
+        },
+        {
+          "resident_bytes": 4290772992,
+          "hits": 495,
+          "misses": 35175,
+          "copied_weight_bytes": 456422326272
+        }
+      ],
+      "cache_delta_cuda_ordinals": [
+        {
+          "hits": 0,
+          "misses": 4304,
+          "copied_weight_bytes": 55849254912
+        },
+        {
+          "hits": 0,
+          "misses": 3954,
+          "copied_weight_bytes": 51307610112
+        }
+      ],
+      "weight_h2d_bytes_total": 107156865024
+    },
+    {
+      "name": "warm_8192_4g_a",
+      "chunk_size": 8192,
+      "input_tokens": 7557,
+      "cache_budget_bytes_per_cuda_device": 4294967296,
+      "output_tokens": 1,
+      "ttft_seconds": 21.833713391002675,
+      "total_seconds": 21.83876301500277,
+      "last_token_seconds": 21.833713391002675,
+      "decode_tokens_per_second": null,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 1
+      },
+      "output_hash": "da8c326d8b17883e05109f856f3fd093a3a9fde6473d42082d1f2c58be30e909",
+      "gpu_peak_mib_physical_indices": [
+        21981.125,
+        20701.125
+      ],
+      "gpu_mean_utilization_physical_indices": [
+        24.660550458715598,
+        41.42201834862385
+      ],
+      "gpu_sample_count": 218,
+      "cache_stats_cuda_ordinals": [
+        {
+          "resident_bytes": 4290772992,
+          "hits": 826,
+          "misses": 42230,
+          "copied_weight_bytes": 547973234688
+        },
+        {
+          "resident_bytes": 4290772992,
+          "hits": 826,
+          "misses": 38860,
+          "copied_weight_bytes": 504243683328
+        }
+      ],
+      "cache_delta_cuda_ordinals": [
+        {
+          "hits": 331,
+          "misses": 3977,
+          "copied_weight_bytes": 51610386432
+        },
+        {
+          "hits": 331,
+          "misses": 3685,
+          "copied_weight_bytes": 47821357056
+        }
+      ],
+      "weight_h2d_bytes_total": 99431743488
+    },
+    {
+      "name": "warm_8192_4g_b",
+      "chunk_size": 8192,
+      "input_tokens": 7557,
+      "cache_budget_bytes_per_cuda_device": 4294967296,
+      "output_tokens": 1,
+      "ttft_seconds": 21.639974653997342,
+      "total_seconds": 21.645072177998372,
+      "last_token_seconds": 21.639974653997342,
+      "decode_tokens_per_second": null,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 1
+      },
+      "output_hash": "da8c326d8b17883e05109f856f3fd093a3a9fde6473d42082d1f2c58be30e909",
+      "gpu_peak_mib_physical_indices": [
+        21981.125,
+        20701.125
+      ],
+      "gpu_mean_utilization_physical_indices": [
+        36.879629629629626,
+        30.416666666666668
+      ],
+      "gpu_sample_count": 216,
+      "cache_stats_cuda_ordinals": [
+        {
+          "resident_bytes": 4290772992,
+          "hits": 1157,
+          "misses": 46207,
+          "copied_weight_bytes": 599583621120
+        },
+        {
+          "resident_bytes": 4290772992,
+          "hits": 1157,
+          "misses": 42545,
+          "copied_weight_bytes": 552065040384
+        }
+      ],
+      "cache_delta_cuda_ordinals": [
+        {
+          "hits": 331,
+          "misses": 3977,
+          "copied_weight_bytes": 51610386432
+        },
+        {
+          "hits": 331,
+          "misses": 3685,
+          "copied_weight_bytes": 47821357056
+        }
+      ],
+      "weight_h2d_bytes_total": 99431743488
+    },
+    {
+      "name": "quality_8192_4g",
+      "chunk_size": 8192,
+      "input_tokens": 7557,
+      "cache_budget_bytes_per_cuda_device": 4294967296,
+      "output_tokens": 32,
+      "ttft_seconds": 21.47674671599816,
+      "total_seconds": 22.878221496997867,
+      "last_token_seconds": 22.873361979000038,
+      "decode_tokens_per_second": 22.196520989874315,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 32
+      },
+      "output_hash": "6e006305163e7792af2f0ae60d2bf511782e0d84300f0173d4661b6b3f88e81d",
+      "gpu_peak_mib_physical_indices": [
+        21983.125,
+        20701.125
+      ],
+      "gpu_mean_utilization_physical_indices": [
+        24.846491228070175,
+        28.486842105263158
+      ],
+      "gpu_sample_count": 228,
+      "cache_stats_cuda_ordinals": [
+        {
+          "resident_bytes": 4290772992,
+          "hits": 1488,
+          "misses": 50184,
+          "copied_weight_bytes": 651194007552
+        },
+        {
+          "resident_bytes": 4290772992,
+          "hits": 1488,
+          "misses": 46230,
+          "copied_weight_bytes": 599886397440
+        }
+      ],
+      "cache_delta_cuda_ordinals": [
+        {
+          "hits": 331,
+          "misses": 3977,
+          "copied_weight_bytes": 51610386432
+        },
+        {
+          "hits": 331,
+          "misses": 3685,
+          "copied_weight_bytes": 47821357056
+        }
+      ],
+      "weight_h2d_bytes_total": 99431743488,
+      "output_equals_original_2048": true
+    },
+    {
+      "name": "warm_8192_disabled_d",
+      "chunk_size": 8192,
+      "input_tokens": 7557,
+      "cache_budget_bytes_per_cuda_device": 0,
+      "output_tokens": 1,
+      "ttft_seconds": 22.10363815099845,
+      "total_seconds": 22.10849902699556,
+      "last_token_seconds": 22.10363815099845,
+      "decode_tokens_per_second": null,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 1
+      },
+      "output_hash": "da8c326d8b17883e05109f856f3fd093a3a9fde6473d42082d1f2c58be30e909",
+      "gpu_peak_mib_physical_indices": [
+        17361.125,
+        19557.125
+      ],
+      "gpu_mean_utilization_physical_indices": [
+        21.54090909090909,
+        27.98181818181818
+      ],
+      "gpu_sample_count": 220,
+      "cache_stats_cuda_ordinals": [
+        {
+          "resident_bytes": 0,
+          "hits": 1488,
+          "misses": 54488,
+          "copied_weight_bytes": 707043262464
+        },
+        {
+          "resident_bytes": 0,
+          "hits": 1488,
+          "misses": 50184,
+          "copied_weight_bytes": 651194007552
+        }
+      ],
+      "cache_delta_cuda_ordinals": [
+        {
+          "hits": 0,
+          "misses": 4304,
+          "copied_weight_bytes": 55849254912
+        },
+        {
+          "hits": 0,
+          "misses": 3954,
+          "copied_weight_bytes": 51307610112
+        }
+      ],
+      "weight_h2d_bytes_total": 107156865024
+    },
+    {
+      "name": "fill_8192_6g",
+      "chunk_size": 8192,
+      "input_tokens": 7557,
+      "cache_budget_bytes_per_cuda_device": 6442450944,
+      "output_tokens": 1,
+      "ttft_seconds": 21.78102719699382,
+      "total_seconds": 21.786245245995815,
+      "last_token_seconds": 21.78102719699382,
+      "decode_tokens_per_second": null,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 1
+      },
+      "output_hash": "da8c326d8b17883e05109f856f3fd093a3a9fde6473d42082d1f2c58be30e909",
+      "gpu_peak_mib_physical_indices": [
+        24275.125,
+        23015.125
+      ],
+      "gpu_mean_utilization_physical_indices": [
+        29.908256880733944,
+        30.922018348623855
+      ],
+      "gpu_sample_count": 218,
+      "cache_stats_cuda_ordinals": [
+        {
+          "resident_bytes": 6436159488,
+          "hits": 1488,
+          "misses": 58792,
+          "copied_weight_bytes": 762892517376
+        },
+        {
+          "resident_bytes": 6436159488,
+          "hits": 1488,
+          "misses": 54138,
+          "copied_weight_bytes": 702501617664
+        }
+      ],
+      "cache_delta_cuda_ordinals": [
+        {
+          "hits": 0,
+          "misses": 4304,
+          "copied_weight_bytes": 55849254912
+        },
+        {
+          "hits": 0,
+          "misses": 3954,
+          "copied_weight_bytes": 51307610112
+        }
+      ],
+      "weight_h2d_bytes_total": 107156865024
+    },
+    {
+      "name": "warm_8192_6g_a",
+      "chunk_size": 8192,
+      "input_tokens": 7557,
+      "cache_budget_bytes_per_cuda_device": 6442450944,
+      "output_tokens": 1,
+      "ttft_seconds": 21.70981585700065,
+      "total_seconds": 21.714815983003064,
+      "last_token_seconds": 21.70981585700065,
+      "decode_tokens_per_second": null,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 1
+      },
+      "output_hash": "da8c326d8b17883e05109f856f3fd093a3a9fde6473d42082d1f2c58be30e909",
+      "gpu_peak_mib_physical_indices": [
+        24297.125,
+        23015.125
+      ],
+      "gpu_mean_utilization_physical_indices": [
+        28.337962962962962,
+        30.0
+      ],
+      "gpu_sample_count": 216,
+      "cache_stats_cuda_ordinals": [
+        {
+          "resident_bytes": 6436159488,
+          "hits": 1984,
+          "misses": 62604,
+          "copied_weight_bytes": 812357517312
+        },
+        {
+          "resident_bytes": 6436159488,
+          "hits": 1984,
+          "misses": 57698,
+          "copied_weight_bytes": 748696633344
+        }
+      ],
+      "cache_delta_cuda_ordinals": [
+        {
+          "hits": 496,
+          "misses": 3812,
+          "copied_weight_bytes": 49464999936
+        },
+        {
+          "hits": 496,
+          "misses": 3560,
+          "copied_weight_bytes": 46195015680
+        }
+      ],
+      "weight_h2d_bytes_total": 95660015616
+    },
+    {
+      "name": "warm_8192_6g_b",
+      "chunk_size": 8192,
+      "input_tokens": 7557,
+      "cache_budget_bytes_per_cuda_device": 6442450944,
+      "output_tokens": 1,
+      "ttft_seconds": 21.339900073995523,
+      "total_seconds": 21.3450255439966,
+      "last_token_seconds": 21.339900073995523,
+      "decode_tokens_per_second": null,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 1
+      },
+      "output_hash": "da8c326d8b17883e05109f856f3fd093a3a9fde6473d42082d1f2c58be30e909",
+      "gpu_peak_mib_physical_indices": [
+        24297.125,
+        23015.125
+      ],
+      "gpu_mean_utilization_physical_indices": [
+        41.29577464788732,
+        34.13145539906103
+      ],
+      "gpu_sample_count": 213,
+      "cache_stats_cuda_ordinals": [
+        {
+          "resident_bytes": 6436159488,
+          "hits": 2480,
+          "misses": 66416,
+          "copied_weight_bytes": 861822517248
+        },
+        {
+          "resident_bytes": 6436159488,
+          "hits": 2480,
+          "misses": 61258,
+          "copied_weight_bytes": 794891649024
+        }
+      ],
+      "cache_delta_cuda_ordinals": [
+        {
+          "hits": 496,
+          "misses": 3812,
+          "copied_weight_bytes": 49464999936
+        },
+        {
+          "hits": 496,
+          "misses": 3560,
+          "copied_weight_bytes": 46195015680
+        }
+      ],
+      "weight_h2d_bytes_total": 95660015616
+    },
+    {
+      "name": "quality_8192_6g",
+      "chunk_size": 8192,
+      "input_tokens": 7557,
+      "cache_budget_bytes_per_cuda_device": 6442450944,
+      "output_tokens": 32,
+      "ttft_seconds": 21.733194351996644,
+      "total_seconds": 23.161865697002213,
+      "last_token_seconds": 23.15667952899821,
+      "decode_tokens_per_second": 21.777536219448727,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 32
+      },
+      "output_hash": "6e006305163e7792af2f0ae60d2bf511782e0d84300f0173d4661b6b3f88e81d",
+      "gpu_peak_mib_physical_indices": [
+        24297.125,
+        23015.125
+      ],
+      "gpu_mean_utilization_physical_indices": [
+        21.415584415584416,
+        31.432900432900432
+      ],
+      "gpu_sample_count": 231,
+      "cache_stats_cuda_ordinals": [
+        {
+          "resident_bytes": 6436159488,
+          "hits": 2976,
+          "misses": 70228,
+          "copied_weight_bytes": 911287517184
+        },
+        {
+          "resident_bytes": 6436159488,
+          "hits": 2976,
+          "misses": 64818,
+          "copied_weight_bytes": 841086664704
+        }
+      ],
+      "cache_delta_cuda_ordinals": [
+        {
+          "hits": 496,
+          "misses": 3812,
+          "copied_weight_bytes": 49464999936
+        },
+        {
+          "hits": 496,
+          "misses": 3560,
+          "copied_weight_bytes": 46195015680
+        }
+      ],
+      "weight_h2d_bytes_total": 95660015616,
+      "output_equals_original_2048": true
+    },
+    {
+      "name": "cached_followup_8192_6g",
+      "chunk_size": 8192,
+      "input_tokens": 7590,
+      "cache_budget_bytes_per_cuda_device": 6442450944,
+      "output_tokens": 1,
+      "ttft_seconds": 0.24804911400133278,
+      "total_seconds": 0.25284312500298256,
+      "last_token_seconds": 0.24804911400133278,
+      "decode_tokens_per_second": null,
+      "statistics": {
+        "cached_input_tokens": 7588,
+        "missed_input_tokens": 2,
+        "output_tokens": 1
+      },
+      "output_hash": "303b3ae9f1ffbc7af3cfb274895ffbf9070964ef72694c51ea3fdb354ade79b0",
+      "gpu_peak_mib_physical_indices": [
+        18897.125,
+        16951.125
+      ],
+      "gpu_mean_utilization_physical_indices": [
+        17.0,
+        11.0
+      ],
+      "gpu_sample_count": 3,
+      "cache_stats_cuda_ordinals": [
+        {
+          "resident_bytes": 6436159488,
+          "hits": 2976,
+          "misses": 70228,
+          "copied_weight_bytes": 911287517184
+        },
+        {
+          "resident_bytes": 6436159488,
+          "hits": 2976,
+          "misses": 64818,
+          "copied_weight_bytes": 841086664704
+        }
+      ],
+      "cache_delta_cuda_ordinals": [
+        {
+          "hits": 0,
+          "misses": 0,
+          "copied_weight_bytes": 0
+        },
+        {
+          "hits": 0,
+          "misses": 0,
+          "copied_weight_bytes": 0
+        }
+      ],
+      "weight_h2d_bytes_total": 0
+    },
+    {
+      "name": "warm_8192_disabled_e",
+      "chunk_size": 8192,
+      "input_tokens": 7557,
+      "cache_budget_bytes_per_cuda_device": 0,
+      "output_tokens": 1,
+      "ttft_seconds": 22.073830445995554,
+      "total_seconds": 22.078840914000466,
+      "last_token_seconds": 22.073830445995554,
+      "decode_tokens_per_second": null,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 1
+      },
+      "output_hash": "da8c326d8b17883e05109f856f3fd093a3a9fde6473d42082d1f2c58be30e909",
+      "gpu_peak_mib_physical_indices": [
+        19275.125,
+        21871.125
+      ],
+      "gpu_mean_utilization_physical_indices": [
+        39.92272727272727,
+        42.027272727272724
+      ],
+      "gpu_sample_count": 220,
+      "cache_stats_cuda_ordinals": [
+        {
+          "resident_bytes": 0,
+          "hits": 2976,
+          "misses": 74532,
+          "copied_weight_bytes": 967136772096
+        },
+        {
+          "resident_bytes": 0,
+          "hits": 2976,
+          "misses": 68772,
+          "copied_weight_bytes": 892394274816
+        }
+      ],
+      "cache_delta_cuda_ordinals": [
+        {
+          "hits": 0,
+          "misses": 4304,
+          "copied_weight_bytes": 55849254912
+        },
+        {
+          "hits": 0,
+          "misses": 3954,
+          "copied_weight_bytes": 51307610112
+        }
+      ],
+      "weight_h2d_bytes_total": 107156865024
+    },
+    {
+      "name": "quality_8192_disabled",
+      "chunk_size": 8192,
+      "input_tokens": 7557,
+      "cache_budget_bytes_per_cuda_device": 0,
+      "output_tokens": 32,
+      "ttft_seconds": 21.09457923300215,
+      "total_seconds": 22.679913834996114,
+      "last_token_seconds": 22.675131768999563,
+      "decode_tokens_per_second": 19.613394236489174,
+      "statistics": {
+        "cached_input_tokens": 0,
+        "missed_input_tokens": 7557,
+        "output_tokens": 32
+      },
+      "output_hash": "6e006305163e7792af2f0ae60d2bf511782e0d84300f0173d4661b6b3f88e81d",
+      "gpu_peak_mib_physical_indices": [
+        20895.125,
+        16071.125
+      ],
+      "gpu_mean_utilization_physical_indices": [
+        25.150442477876105,
+        30.800884955752213
+      ],
+      "gpu_sample_count": 226,
+      "cache_stats_cuda_ordinals": [
+        {
+          "resident_bytes": 0,
+          "hits": 2976,
+          "misses": 78836,
+          "copied_weight_bytes": 1022986027008
+        },
+        {
+          "resident_bytes": 0,
+          "hits": 2976,
+          "misses": 72726,
+          "copied_weight_bytes": 943701884928
+        }
+      ],
+      "cache_delta_cuda_ordinals": [
+        {
+          "hits": 0,
+          "misses": 4304,
+          "copied_weight_bytes": 55849254912
+        },
+        {
+          "hits": 0,
+          "misses": 3954,
+          "copied_weight_bytes": 51307610112
+        }
+      ],
+      "weight_h2d_bytes_total": 107156865024,
+      "output_equals_original_2048": true
+    }
+  ],
+  "gpu_names_physical_indices": [
+    "NVIDIA GeForce RTX 4090 D",
+    "NVIDIA GeForce RTX 4090"
+  ],
+  "model_load_seconds": 542.0946590660024,
+  "args": {
+    "path": "/home/tf/hfmodels/Naive-N0.5-Flash-FP8",
+    "device": "{'cuda:0': 1, 'cuda:1': 1}",
+    "moe_device": "numa",
+    "threads": 28,
+    "dtype": "fp8_e4m3",
+    "atype": "auto",
+    "speculative_draft_model_path": "/home/tf/hfmodels/Naive-N0.5-Flash-FP8-Draft",
+    "draft_tokens": 7,
+    "cache_history": "true",
+    "chunked_prefill_size": 8192,
+    "max_context_length": 32768,
+    "max_batch": 1
+  },
+  "cudapp_serial_environment": "1",
+  "hardware": {
+    "cpu": "AMD EPYC 9374F",
+    "numa_nodes_used": 1,
+    "worker_threads": 28,
+    "cuda_ordinal_0": {
+      "physical_index": 1,
+      "name": "RTX 4090",
+      "pci_bus_id": "0000:41:00.0"
+    },
+    "cuda_ordinal_1": {
+      "physical_index": 0,
+      "name": "RTX 4090 D",
+      "pci_bus_id": "0000:01:00.0"
+    },
+    "gpu_interconnect_topology": "NODE"
+  },
+  "method": [
+    "Private package copy with the preserved expert-cache experimental shared library; installed production package untouched.",
+    "Existing --device cudapp=2 splits target layers equally across two GPUs and executes them serially.",
+    "Same 7557-token input, CPU 0-31, single NUMA node, 28 threads, BF16 activations and 7-token Draft.",
+    "Use 8192-token chunk size; reset history before each full request.",
+    "In one model process, alternate cache-disabled measurements with per-device cache budgets of 2, 4 and 6 GiB.",
+    "Exclude model loading, cold initialization, first cache-fill requests and quality requests from warm medians.",
+    "Cache original packed FP8 expert matrices; preserve first admitted weights across model-layer sweeps.",
+    "Actual per-device residency may be smaller than the budget because admission reserves free CUDA memory.",
+    "The existing cache-aware CPU/GPU prefill assignment discounts H2D cost for resident gate/down pairs.",
+    "This prototype caches GPU-assisted prefill experts; decode experts continue to run on CPU.",
+    "Weight H2D counters include packed expert matrix uploads, not activation copies or other model weights.",
+    "NVML memory sampled every 100 ms; physical NVIDIA indices differ from CUDA ordinals.",
+    "32-token greedy output checks use the original single-GPU reference; this is a short decode sample.",
+    "Raw input and output token bodies are excluded."
+  ],
+  "summaries": [
+    {
+      "chunk_size": 8192,
+      "cache_budget_bytes_per_device": 0,
+      "samples": 5,
+      "ttft_seconds_median": 21.769514608000463,
+      "ttft_seconds_min": 21.53110762200231,
+      "ttft_seconds_max": 22.10363815099845,
+      "ttft_reduction_percent_vs_disabled": 0.0,
+      "input_tokens_per_second": 347.1368166023667,
+      "resident_bytes_median_cuda_ordinals": [
+        0,
+        0
+      ],
+      "matrix_hits_median_cuda_ordinals": [
+        0,
+        0
+      ],
+      "weight_h2d_bytes_median": 107156865024,
+      "gpu_peak_mib_physical_indices": [
+        20751.125,
+        21871.125
+      ]
+    },
+    {
+      "chunk_size": 8192,
+      "cache_budget_bytes_per_device": 2147483648,
+      "samples": 2,
+      "ttft_seconds_median": 21.67950626899983,
+      "ttft_seconds_min": 21.645450938005524,
+      "ttft_seconds_max": 21.713561599994136,
+      "ttft_reduction_percent_vs_disabled": 0.4134604772839223,
+      "input_tokens_per_second": 348.57804906774925,
+      "resident_bytes_median_cuda_ordinals": [
+        2145386496.0,
+        2145386496.0
+      ],
+      "matrix_hits_median_cuda_ordinals": [
+        165.0,
+        165.0
+      ],
+      "weight_h2d_bytes_median": 103281328128.0,
+      "gpu_peak_mib_physical_indices": [
+        22975.125,
+        18383.125
+      ]
+    },
+    {
+      "chunk_size": 8192,
+      "cache_budget_bytes_per_device": 4294967296,
+      "samples": 2,
+      "ttft_seconds_median": 21.73684402250001,
+      "ttft_seconds_min": 21.639974653997342,
+      "ttft_seconds_max": 21.833713391002675,
+      "ttft_reduction_percent_vs_disabled": 0.15007493776847403,
+      "input_tokens_per_second": 347.65856497740333,
+      "resident_bytes_median_cuda_ordinals": [
+        4290772992.0,
+        4290772992.0
+      ],
+      "matrix_hits_median_cuda_ordinals": [
+        331.0,
+        331.0
+      ],
+      "weight_h2d_bytes_median": 99431743488.0,
+      "gpu_peak_mib_physical_indices": [
+        21981.125,
+        20701.125
+      ]
+    },
+    {
+      "chunk_size": 8192,
+      "cache_budget_bytes_per_device": 6442450944,
+      "samples": 2,
+      "ttft_seconds_median": 21.524857965498086,
+      "ttft_seconds_min": 21.339900073995523,
+      "ttft_seconds_max": 21.70981585700065,
+      "ttft_reduction_percent_vs_disabled": 1.1238497821741245,
+      "input_tokens_per_second": 351.0824560195945,
+      "resident_bytes_median_cuda_ordinals": [
+        6436159488.0,
+        6436159488.0
+      ],
+      "matrix_hits_median_cuda_ordinals": [
+        496.0,
+        496.0
+      ],
+      "weight_h2d_bytes_median": 95660015616.0,
+      "gpu_peak_mib_physical_indices": [
+        24297.125,
+        23015.125
+      ]
+    }
+  ],
+  "quality": {
+    "all_32_token_outputs_match_original": true,
+    "runs": [
+      {
+        "name": "quality_8192_2g",
+        "ttft_seconds": 21.715672580998216,
+        "decode_tokens_per_second": 21.200990306761213,
+        "output_tokens": 32,
+        "output_hash": "6e006305163e7792af2f0ae60d2bf511782e0d84300f0173d4661b6b3f88e81d",
+        "output_equals_original_2048": true
+      },
+      {
+        "name": "quality_8192_4g",
+        "ttft_seconds": 21.47674671599816,
+        "decode_tokens_per_second": 22.196520989874315,
+        "output_tokens": 32,
+        "output_hash": "6e006305163e7792af2f0ae60d2bf511782e0d84300f0173d4661b6b3f88e81d",
+        "output_equals_original_2048": true
+      },
+      {
+        "name": "quality_8192_6g",
+        "ttft_seconds": 21.733194351996644,
+        "decode_tokens_per_second": 21.777536219448727,
+        "output_tokens": 32,
+        "output_hash": "6e006305163e7792af2f0ae60d2bf511782e0d84300f0173d4661b6b3f88e81d",
+        "output_equals_original_2048": true
+      },
+      {
+        "name": "quality_8192_disabled",
+        "ttft_seconds": 21.09457923300215,
+        "decode_tokens_per_second": 19.613394236489174,
+        "output_tokens": 32,
+        "output_hash": "6e006305163e7792af2f0ae60d2bf511782e0d84300f0173d4661b6b3f88e81d",
+        "output_equals_original_2048": true
+      }
+    ],
+    "cached_followup_ttft_seconds": 0.24804911400133278,
+    "cached_followup_statistics": {
+      "cached_input_tokens": 7588,
+      "missed_input_tokens": 2,
+      "output_tokens": 1
+    }
+  },
+  "validation": {
+    "native_hybrid_and_dual_gpu_cache_isolation": "passed",
+    "native_cpu": "passed",
+    "native_avx2_fallback": "passed"
+  },
+  "production_library_sha256_after_experiment": "0dd499db3534a58cbd5b38af520acc2ce936e2fddd0f7153ed10b98953bfea32",
+  "experiment_package": "build-fastllm/prefill-cudapp-cache-20261001/ftllm",
+  "outcome": {
+    "retained_in_production": false,
+    "reason": "Warm TTFT reduction below 1.2%, comparable to run variation, with nearly full GPU memory at 6 GiB per device.",
+    "production_sources_changed": false,
+    "production_package_changed": false,
+    "server_running_after_experiment": false
+  }
+}
