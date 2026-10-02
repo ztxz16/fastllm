@@ -548,25 +548,35 @@ __device__ float Dot(const uint8_t *weight, const block_q8_K *input, int row, in
             const auto &w = reinterpret_cast<const block_q2_k_r4 *>(weight)[size_t(row / 4) * blocks + b];
             scale = __half2float(reinterpret_cast<const half *>(w.d)[r]);
             minimum = __half2float(reinterpret_cast<const half *>(w.d)[r + 4]);
-            for (int c = lane; c < 256; c += 32) {
+            // Four adjacent activations share a scale. R4 stores their
+            // packed weights in one aligned word; keep the integer sum
+            // exact with DP4A before the original per-block FP32 FMAs.
+            #pragma unroll
+            for (int c = lane * 4; c < 256; c += 128) {
                 const int pos = c % 32;
-                const int q = (w.qs[32 * (c / 32) + 4 * r + pos % 4 + 16 * (pos / 16)] >> (2 * ((pos % 16) / 4))) & 3;
-                const int s = w.scales[4 * (c / 16) + r], x = input[b].qs[c];
-                dot += (s & 15) * q * x;
-                bias += (s >> 4) * x;
+                const uint32_t packed = *reinterpret_cast<const uint32_t *>(
+                    w.qs + 32 * (c / 32) + 4 * r + 16 * (pos / 16));
+                const int q = (packed >> (2 * ((pos % 16) / 4))) & 0x03030303;
+                const int s = w.scales[4 * (c / 16) + r];
+                const int x = *reinterpret_cast<const int *>(input[b].qs + c);
+                dot += (s & 15) * __dp4a(q, x, 0);
+                bias += (s >> 4) * __dp4a(0x01010101, x, 0);
             }
         } else {
             const auto &w = reinterpret_cast<const block_q4_k_r4 *>(weight)[size_t(row / 4) * blocks + b];
             scale = __half2float(reinterpret_cast<const half *>(w.d)[r]);
             minimum = __half2float(reinterpret_cast<const half *>(w.d)[r + 4]);
-            for (int c = lane; c < 256; c += 32) {
+            #pragma unroll
+            for (int c = lane * 4; c < 256; c += 128) {
                 const int pos = c % 32, index = 4 * (c / 32) + r;
                 const int high = (w.scales_h[index % 16] >> (4 * (index / 16))) & 15;
                 const int low = w.scales_l[index];
-                const int q = (w.qs[64 * (c / 32) + 4 * r + pos % 4 + 32 * ((pos % 8) / 4) + 16 * (pos / 16)] >> (4 * ((pos % 16) / 8))) & 15;
-                const int x = input[b].qs[c];
-                dot += ((low & 15) + 16 * (high & 3)) * q * x;
-                bias += ((low >> 4) + 16 * (high >> 2)) * x;
+                const uint32_t packed = *reinterpret_cast<const uint32_t *>(
+                    w.qs + 64 * (c / 32) + 4 * r + 32 * ((pos % 8) / 4) + 16 * (pos / 16));
+                const int q = (packed >> (4 * ((pos % 16) / 8))) & 0x0f0f0f0f;
+                const int x = *reinterpret_cast<const int *>(input[b].qs + c);
+                dot += ((low & 15) + 16 * (high & 3)) * __dp4a(q, x, 0);
+                bias += ((low >> 4) + 16 * (high >> 2)) * __dp4a(0x01010101, x, 0);
             }
         }
         for (int mask = 16; mask; mask >>= 1) {
