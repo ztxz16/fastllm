@@ -135,6 +135,48 @@ __global__ void IndexScores(const float *q, const float *k, const BF16 *weights,
         scores[(size_t)query * keys + key] = key <= queryStart + query ? score : -INFINITY;
 }
 
+// Two 16-lane subgroups evaluate adjacent heads in parallel. Each lane owns
+// the original lane and lane+16 partial sums, so the first add reproduces the
+// old shuffle-by-16 stage. The remaining shuffle tree and head accumulation
+// order are unchanged. Key fragments stay in registers across all 16 heads.
+__global__ void IndexScoresPrefill(const float *__restrict__ q, const float *__restrict__ k,
+                                   const BF16 *__restrict__ weights, float *__restrict__ scores,
+                                   int keys, int queryStart) {
+    int query = blockIdx.y, key = blockIdx.x * 8 + threadIdx.x / 32;
+    int lane = threadIdx.x % 32, column = lane % 16, headOffset = lane / 16;
+    if (key >= keys) return;
+    if (key > queryStart + query) {
+        if (lane == 0) scores[(size_t)query * keys + key] = -INFINITY;
+        return;
+    }
+    float keyLow[4], keyHigh[4];
+    #pragma unroll
+    for (int d = 0; d < 4; ++d) {
+        keyLow[d] = k[(size_t)key * 128 + column + d * 32];
+        keyHigh[d] = k[(size_t)key * 128 + column + 16 + d * 32];
+    }
+    float score = 0;
+    #pragma unroll
+    for (int head = 0; head < 16; head += 2) {
+        const float *row = q + ((size_t)query * 16 + head + headOffset) * 128;
+        float low = 0, high = 0;
+        #pragma unroll
+        for (int d = 0; d < 4; ++d) {
+            low += row[column + d * 32] * keyLow[d];
+            high += row[column + 16 + d * 32] * keyHigh[d];
+        }
+        float dot = low + high;
+        #pragma unroll
+        for (int offset = 8; offset; offset >>= 1)
+            dot += __shfl_down_sync(0xffffffff, dot, offset, 16);
+        float first = __shfl_sync(0xffffffff, dot, 0);
+        float second = __shfl_sync(0xffffffff, dot, 16);
+        score += fmaxf(first, 0.0f) * (float)weights[query * 16 + head];
+        score += fmaxf(second, 0.0f) * (float)weights[query * 16 + head + 1];
+    }
+    if (lane == 0) scores[(size_t)query * keys + key] = score;
+}
+
 __device__ int KeyIndex(const int *indices, int query, int slot, int count,
                         int past, int window) {
     if (indices) return indices[(size_t)query * count + slot];
@@ -494,9 +536,15 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
         (float *)q.cudaData, dim, 0, fp8);
     RoundIndexer<<<keys, 128>>>((const BF16 *)packedKeys.cudaData,
         (float *)k.cudaData, stride, stride - dim, fp8);
-    IndexScores<<<dim3((keys + 7) / 8, queries), 256>>>((const float *)q.cudaData,
-        (const float *)k.cudaData, (const BF16 *)weights.cudaData,
-        (float *)scores.cudaData, heads, keys, queryStart);
+    if (queries > 1 && heads == 16 && dim == 128) {
+        IndexScoresPrefill<<<dim3((keys + 7) / 8, queries), 256>>>((const float *)q.cudaData,
+            (const float *)k.cudaData, (const BF16 *)weights.cudaData,
+            (float *)scores.cudaData, keys, queryStart);
+    } else {
+        IndexScores<<<dim3((keys + 7) / 8, queries), 256>>>((const float *)q.cudaData,
+            (const float *)k.cudaData, (const BF16 *)weights.cudaData,
+            (float *)scores.cudaData, heads, keys, queryStart);
+    }
     CheckLaunch();
     // Stable GPU selection for decode and every row of a prefill chunk.
     FastllmCudaNaiveTopK(scores, queryStart, topK, indices);
