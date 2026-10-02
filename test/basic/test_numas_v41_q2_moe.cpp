@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
@@ -76,6 +77,10 @@ int main(int argc, char **argv) {
         const bool disk = argc > 1 && std::string(argv[1]) == "disk";
         const bool cache = argc > 1 && std::string(argv[1]) == "cache";
         const bool host = argc > 1 && std::string(argv[1]) == "host";
+        const bool decode = argc > 1 && std::string(argv[1]) == "decode";
+        // Exercise the row-wise decode path even for adversarial multi-row
+        // fixtures; otherwise 2..8 rows take a separate grouped implementation.
+        if (decode) setenv("FASTLLM_DSV4_DISABLE_NUMAS_MOE_GROUPED_DECODE", "1", 1);
         const bool cuda = argc > 3 && std::string(argv[3]) == "cuda";
         DiskFixtureFile fixture;
         if (disk) {
@@ -90,15 +95,17 @@ int main(int argc, char **argv) {
         ((Executor*)GetExecutor())->SetFirstDevice(disk ? "disk" : "numa");
         if (disk) { SetMoeCpuCacheBytes(4 * 1024 * 1024); SetMoeCudaCacheBytes(0); }
         const int hidden = argc > 2 ? std::stoi(argv[2]) : 256;
-        const int inter = host && argc > 3 ? std::stoi(argv[3]) : 256;
-        const int experts = cache ? 24 : 3, topk = cache ? 6 : 2;
+        const int inter = (host || decode) && argc > 3 ? std::stoi(argv[3]) : 256;
+        const int experts = cache ? 24 : decode ? 6 : 3, topk = (cache || decode) ? 6 : 2;
+        // Q4_K_R4 consumes Q8_K32, while Q2_K_R4 consumes Q8_K.
+        const bool q2Down = decode && argc > 4 && std::string(argv[4]) == "q2";
         std::vector<std::unique_ptr<Data>> owned;
         std::vector<Data*> weights(2 * (experts + 1), nullptr), biases(weights);
         std::vector<std::vector<float>> decoded(weights.size());
         std::vector<std::vector<uint8_t>> canonical(weights.size());
         for (int e = disk ? 0 : 1; e <= experts; ++e) for (int part = 0; part < 2; ++part) {
             int rows = part ? hidden : 2 * inter, cols = part ? inter : hidden;
-            auto type = part ? GGML_TYPE_Q4_K : GGML_TYPE_Q2_K;
+            auto type = part && !q2Down ? GGML_TYPE_Q4_K : GGML_TYPE_Q2_K;
             auto weight = e == 0 ? std::make_unique<Data>(FLOAT16, std::vector<int>{rows, cols}) :
                 std::make_unique<Data>(DATA_GGUF_FORMAT, type, std::vector<int>{rows, cols});
             std::vector<float> original(rows * cols);
@@ -167,9 +174,10 @@ int main(int argc, char **argv) {
             // Straddle wide-MMQ admission and exercise expert tails that are
             // neither 16- nor 64-row aligned.
             host ? std::vector<int>{33, 65, 128, 408, 1023, 1024, 1041, 4096} :
+            decode ? std::vector<int>{1, 3} :
             std::vector<int>{1, 7, 32, 64, 260, 2, 3, 6, 8};
         for (bool quantizeShared : {false, true}) for (int rows : batches) {
-            if ((cache || host) && quantizeShared) continue;
+            if ((cache || host || decode) && quantizeShared) continue;
             std::vector<float> source(rows * hidden);
             std::vector<uint16_t> inputBits(source.size());
             for (size_t i = 0; i < source.size(); ++i) {
@@ -178,6 +186,8 @@ int main(int argc, char **argv) {
                 if (cache && rows == 6) source[i] = Bf16(source[i] * 32.f);
                 if (host && i / hidden == 1) source[i] = 0;
                 if (host && rows == 128) source[i] = Bf16(source[i] * 32.f);
+                if (decode && i / hidden == 1) source[i] = 0;
+                if (decode && i / hidden == 2) source[i] = Bf16(source[i] * 32.f);
                 if (host && rows == 65 && i/hidden%7 == 3 && i%256 < 2)
                     source[i] = i%256 == 0 ? 32.f : -32.f; // signed-maximum tie
                 uint32_t bits; memcpy(&bits, &source[i], sizeof(bits)); inputBits[i] = bits >> 16;
@@ -190,6 +200,7 @@ int main(int argc, char **argv) {
                 if (cache && rows == 3 && r == 1) scores[r * topk + k] = 0;
                 if (host && r%7 == 0) scores[r * topk + k] = 0;
                 if (host && r%7 == 2) scores[r * topk + k] *= -1;
+                if (decode && r == 2 && k % 2) scores[r * topk + k] *= -1;
             }
             Data input(BFLOAT16, {rows, hidden}, DataDevice::CPU, inputBits.data());
 #ifdef USE_CUDA
@@ -204,6 +215,48 @@ int main(int argc, char **argv) {
             Data score(FLOAT32, {rows, topk}, DataDevice::CPU, scores.data());
             MergeMOE(input, index, score, weights, biases, w1, w2, w3, currentInput, currentOutput,
                      0.7f, output, 0, MoeGateSwiglu, false, 10.f, true, nullptr, 32, quantizeShared);
+            if (decode) {
+                // Compare the complete optimized operator byte-for-byte with
+                // its scalar fallback, including non-BF16 clamp thresholds,
+                // zero inputs, signed routes and both FP8 block sizes.
+                struct RestoreEnv {
+                    const char *key;
+                    bool present;
+                    std::string value;
+                    explicit RestoreEnv(const char *key) : key(key), present(std::getenv(key) != nullptr),
+                        value(present ? std::getenv(key) : "") {}
+                    ~RestoreEnv() {
+                        if (present) setenv(key, value.c_str(), 1);
+                        else unsetenv(key);
+                    }
+                } fast("FASTLLM_DSV4_DISABLE_NUMAS_MOE_FAST"),
+                  taskCache("FASTLLM_DSV4_DISABLE_NUMAS_MOE_TASK_CACHE");
+                for (int block : {32, 128}) for (float limit : {0.f, 1.234567f, 10.f}) {
+                    for (DataType outputType : {BFLOAT16, FLOAT32}) {
+                        Data check(outputType);
+                        auto merge = [&] {
+                            MergeMOE(input, index, score, weights, biases, w1, w2, w3,
+                                     currentInput, currentOutput, .7f, check, 0, MoeGateSwiglu,
+                                     false, limit, true, nullptr, block, quantizeShared);
+                        };
+                        setenv(fast.key, "1", 1);
+                        merge();
+                        const std::vector<uint8_t> reference(check.cpuData, check.cpuData + check.GetBytes());
+                        unsetenv(fast.key);
+                        for (bool cached : {true, false}) {
+                            if (cached) unsetenv(taskCache.key);
+                            else setenv(taskCache.key, "1", 1);
+                            merge();
+                            if (memcmp(reference.data(), check.cpuData, reference.size()))
+                                throw std::runtime_error("Q2 decode fast/scalar outputs differ: block=" +
+                                    std::to_string(block) + " limit=" + std::to_string(limit) +
+                                    " output=" + GetDataTypeName(outputType) +
+                                    " task_cache=" + std::to_string(cached));
+                        }
+                    }
+                }
+                printf("Q2 decode fast/scalar bitwise PASS rows=%d inter=%d\n", rows, inter);
+            }
 #ifdef USE_CUDA
             if (host) {
                 const std::vector<uint8_t> reference(output.cpuData, output.cpuData + output.GetBytes());

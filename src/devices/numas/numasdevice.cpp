@@ -872,14 +872,18 @@ namespace fastllm {
         }
     }
 
+    static bool IsQ8KActivationType(DataType type) {
+        return type == static_cast<DataType>(DataType::DATA_GGUF_FORMAT + GGML_TYPE_Q8_K) ||
+               type == static_cast<DataType>(DataType::DATA_GGUF_FORMAT + GGML_TYPE_Q8_K32);
+    }
+
     struct MultiThreadDeepSeekV4NumasDownPrepareOp : MultiThreadBaseOp {
         const float *gateUpData;
         float *swigluData;
         uint8_t *downInputData;
         DataType downInputType;
         int st, end;
-        bool routed, quantize, useBFloat16SiluLookup;
-        bool useDirectBFloat16Prepare;
+        bool routed, quantize;
         float routeWeight, swigluLimit;
         int activationQuantBlock;
 
@@ -888,24 +892,29 @@ namespace fastllm {
             uint8_t *downInputData, DataType downInputType,
             int st, int end, bool routed, float routeWeight,
             float swigluLimit, bool quantize,
-            bool useBFloat16SiluLookup, bool useDirectBFloat16Prepare,
             int activationQuantBlock = 128
         ) : gateUpData(gateUpData), swigluData(swigluData),
             downInputData(downInputData), downInputType(downInputType),
             st(st), end(end), routed(routed), quantize(quantize),
-            useBFloat16SiluLookup(useBFloat16SiluLookup),
-            useDirectBFloat16Prepare(useDirectBFloat16Prepare),
             routeWeight(routeWeight), swigluLimit(swigluLimit),
             activationQuantBlock(activationQuantBlock) {}
 
         void Run() override {
-            const std::array<float, 65536> *siluLookup =
-                useBFloat16SiluLookup ?
-                    &GetDeepSeekV4BFloat16SiluLookup() : nullptr;
-            uint16_t *directBFloat16Output =
-                useDirectBFloat16Prepare &&
-                        downInputType == DataType::BFLOAT16 ?
-                    (uint16_t*)downInputData : nullptr;
+            const auto &siluLookup = GetDeepSeekV4BFloat16SiluLookup();
+            const bool prepareQ8K = IsQ8KActivationType(downInputType);
+            // One complete Q8_K block per task, containing whole FP8 blocks.
+            // Keep the model's BF16 boundary in bounded worker-local scratch.
+            std::array<uint16_t, QK_K> q8Input;
+            if (prepareQ8K) {
+                AssertInFastLLM(st % QK_K == 0 && end - st == QK_K,
+                               "DeepSeek-V4 Q8_K preparation requires complete blocks.");
+            }
+            uint16_t *directBFloat16Output = nullptr;
+            if (prepareQ8K) {
+                directBFloat16Output = q8Input.data();
+            } else if (downInputType == DataType::BFLOAT16) {
+                directBFloat16Output = (uint16_t*)downInputData + st;
+            }
             for (int i = st; i < end; i++) {
                 uint16_t gateBits =
                     Float32ToBFloat16RNEBits(gateUpData[i * 2]);
@@ -923,14 +932,13 @@ namespace fastllm {
                     up = std::max(
                         -swigluLimit, std::min(up, swigluLimit));
                 }
-                float silu = siluLookup != nullptr && gateIsBFloat16 ?
-                    (*siluLookup)[gateBits] :
+                float silu = gateIsBFloat16 ? siluLookup[gateBits] :
                     gate / (1.0f + std::exp(-gate));
                 float h = silu * up;
                 uint16_t outputBits =
                     Float32ToBFloat16RNEBits(routeWeight * h);
                 if (directBFloat16Output != nullptr) {
-                    directBFloat16Output[i] = outputBits;
+                    directBFloat16Output[i - st] = outputBits;
                 } else {
                     swigluData[i] =
                         BFloat16BitsToFloat32(outputBits);
@@ -939,7 +947,12 @@ namespace fastllm {
             if (directBFloat16Output != nullptr) {
                 if (quantize) {
                     QuantizeDeepSeekV4FP8ActivationBFloat16(
-                        directBFloat16Output + st, end - st, activationQuantBlock);
+                        directBFloat16Output, end - st, activationQuantBlock);
+                }
+                if (prepareQ8K) {
+                    ConvertFromBFloat16(
+                        downInputData + GetDataBytes(downInputType, 1, st),
+                        downInputType, directBFloat16Output, 1, end - st);
                 }
                 return;
             }
@@ -950,11 +963,7 @@ namespace fastllm {
                     swigluData + st, end - st, activationQuantBlock);
             }
 
-            if (downInputType == DataType::BFLOAT16) {
-                Float32ToBFloat16(
-                    swigluData + st,
-                    (uint16_t*)downInputData + st, end - st);
-            } else if (downInputType == DataType::FLOAT32) {
+            if (downInputType == DataType::FLOAT32) {
                 memcpy(
                     (float*)downInputData + st, swigluData + st,
                     (size_t)(end - st) * sizeof(float));
@@ -964,8 +973,7 @@ namespace fastllm {
                     (uint16_t*)downInputData + st, end - st);
             } else {
                 ErrorInFastLLM(
-                    "DeepSeek-V4 NUMA MoE requires a floating-point "
-                    "down activation type.\n");
+                    "Unsupported DeepSeek-V4 NUMA MoE down activation type.\n");
             }
         }
     };
@@ -2011,7 +2019,7 @@ namespace fastllm {
                 MultiThreadDeepSeekV4NumasDownPrepareOp prepare(gateUp, swiglu,
                     downInput, downType, (globalOffset + st) / 2,
                     (globalOffset + end) / 2, true, score, limit,
-                    true, true, true, 32);
+                    true, 32);
                 prepare.Run();
             } else {
                 auto *values = reinterpret_cast<float *>(outputData);
@@ -2033,7 +2041,7 @@ namespace fastllm {
         int inputDim = 0, interDim = 0, outputDim = 0, numaCnt = 0;
         int gateUnitRows = 4;
         size_t downRowBytes = 0;
-        bool gate = true, fuseConvert = false;
+        bool gate = true, fuseConvert = false, skipCrossSwiglu = false;
     };
 
     struct NumasMoeDecodeWorker : MultiThreadBaseOp {
@@ -2066,7 +2074,7 @@ namespace fastllm {
                         c.swiglu + (size_t)slot * c.interDim,
                         1, c.inputDim, columns, start, end, base,
                         c.fuseConvert ? c.downInput + slot * c.downRowBytes : nullptr,
-                        c.downType);
+                        c.downType, c.skipCrossSwiglu);
                     task.Run();
                 } else {
                     MultiThreadGemmOp task(
@@ -4516,15 +4524,10 @@ namespace fastllm {
 
         bool IsDirectBFloat16Q8KType(DataType dataType) {
 #ifdef __AVX2__
-            if (dataType >= DataType::DATA_GGUF_FORMAT &&
-                dataType < DataType::DATA_GGUF_FORMAT_END) {
-                const ggml_type type = (ggml_type)(
-                    (int)dataType - (int)DataType::DATA_GGUF_FORMAT);
-                return type == GGML_TYPE_Q8_K ||
-                       type == GGML_TYPE_Q8_K32;
-            }
-#endif
+            return IsQ8KActivationType(dataType);
+#else
             return false;
+#endif
         }
 
         inline float KimiK3MulAddPreserveOrder(
@@ -6638,10 +6641,6 @@ namespace fastllm {
             useDeepSeekV4LargeFast;
         const bool useParallelDeepSeekV4Store =
             useDeepSeekV4LargeFast || (fp8EagerMode && bs >= 8);
-        const bool useBFloat16SiluLookup =
-            useParallelDeepSeekV4Prepare;
-        const bool useDirectBFloat16Prepare =
-            useParallelDeepSeekV4Prepare;
 
         auto &gateTaskStorage =
             fastllmMoeDataManagerNumas.gateSwigluTaskStorage;
@@ -6846,8 +6845,7 @@ namespace fastllm {
                             downInput.data() + row * downRowBytes,
                             downInputDataType, st, end,
                             routed, routeWeight, swigluLimit,
-                            quantize, useBFloat16SiluLookup,
-                            useDirectBFloat16Prepare, activationQuantBlock);
+                            quantize, activationQuantBlock);
                     }
                 }
                 offset += lines;
@@ -8222,14 +8220,21 @@ namespace fastllm {
                     // 1. gateUp + swiglu
                     auto *numaConfig = GetNumaConfig();
 
-                    bool useDeepSeekV4MoeFast =
-                        deepSeekV4Mode &&
+                    const bool enableDeepSeekV4MoeFast = deepSeekV4Mode &&
+                        std::getenv("FASTLLM_DSV4_DISABLE_NUMAS_MOE_FAST") == nullptr;
+                    const bool useDeepSeekV4MoeFast =
+                        enableDeepSeekV4MoeFast &&
                         downInputDataType < DataType::DATA_GGUF_FORMAT &&
-                        NumasDeepSeekV4FastPathAvailable() &&
-                        std::getenv(
-                            "FASTLLM_DSV4_DISABLE_NUMAS_MOE_FAST") == nullptr;
+                        NumasDeepSeekV4FastPathAvailable();
+                    // GGUF retains its existing GEMM workers. Only activation
+                    // preparation and reduction share the floating-point path.
+                    const bool useQ8KPrepare = enableDeepSeekV4MoeFast &&
+                        IsQ8KActivationType(downInputDataType) &&
+                        interDim % QK_K == 0 &&
+                        (activationQuantBlock == 32 || activationQuantBlock == 128);
+                    const bool useParallelPrepare = useDeepSeekV4MoeFast || useQ8KPrepare;
                     bool reuseMoeTaskStorage =
-                        useDeepSeekV4MoeFast &&
+                        useParallelPrepare &&
                         std::getenv(
                             "FASTLLM_DSV4_DISABLE_NUMAS_MOE_TASK_CACHE") ==
                             nullptr;
@@ -8238,17 +8243,13 @@ namespace fastllm {
                         std::getenv(
                             "FASTLLM_DSV4_DISABLE_NUMAS_MOE_DIRECT_GEMM") ==
                             nullptr;
-                    bool useBFloat16SiluLookup =
-                        useDeepSeekV4MoeFast;
-                    bool useDirectBFloat16Prepare =
-                        useDeepSeekV4MoeFast;
                     // The direct queue adjusts these preferred widths using
                     // the actual expert count and workers on each NUMA node.
                     int gateRowsPerTask = 208;
                     int downRowsPerTask = 128;
-                    // Keep each activation task on one gate-output NUMA
-                    // shard, with at least one FP8 quantization block.
-                    int swigluRowsPerTask = std::max(
+                    // Q8_K tasks own complete 256-value blocks; floating-point
+                    // tasks follow gate-output NUMA shards and FP8 blocks.
+                    int swigluRowsPerTask = useQ8KPrepare ? QK_K : std::max(
                         128,
                         interDim / std::max(1, numaConfig->numaCnt));
 
@@ -8289,6 +8290,9 @@ namespace fastllm {
                         decodeContext.gateUnitRows = canFuseGroup32 ? 64 : 4;
                         decodeContext.downRowBytes = GetDataBytes(downInputDataType, 1, interDim);
                         decodeContext.fuseConvert = canFuseDstConvert && !deepSeekV4Mode;
+                        // The model-specific preparation below computes SwiGLU
+                        // after BF16 rounding, clamping and route weighting.
+                        decodeContext.skipCrossSwiglu = deepSeekV4Mode;
                         rowWorkers.resize(numaConfig->threads);
                         for (int nid = 0; nid < numaConfig->numaCnt; ++nid) {
                             auto &nodeWorkers = numaConfig->numaToCpuDict[nid];
@@ -8459,7 +8463,7 @@ namespace fastllm {
                     profileLap(profileGateMs);
 
                     // 4. swigluOutput -> downInput
-                    if (useDeepSeekV4MoeFast) {
+                    if (useParallelPrepare) {
                         const size_t downRowBytes =
                             GetDataBytes(
                                 downInputDataType, 1, interDim);
@@ -8500,6 +8504,7 @@ namespace fastllm {
                             float routeWeight =
                                 routed ? v[expertIdx].second : 1.0f;
                             bool quantize = (e == 0 && quantizeSharedExpert) ||
+                                (routed && activationQuantBlock == 32) ||
                                 IsDeepSeekV4QuantizedWeight(
                                     *weights[e * 2 + 1]);
                             for (int row = 0; row < interDim;
@@ -8521,8 +8526,7 @@ namespace fastllm {
                                             downRowBytes,
                                     downInputDataType, row, end,
                                     routed, routeWeight, swigluLimit,
-                                    quantize, useBFloat16SiluLookup,
-                                    useDirectBFloat16Prepare, activationQuantBlock);
+                                    quantize, activationQuantBlock);
                             }
                         }
                         for (int nid = 0;
@@ -8728,7 +8732,7 @@ namespace fastllm {
                     profileLap(profileDownMs);
 
                     if (deepSeekV4Mode &&
-                        !useDeepSeekV4MoeFast) {
+                        !useParallelPrepare) {
                         for (size_t i = 0; i < (size_t)totalExperts * outputDim; i++) {
                             downOutput[i] = RoundFloat32ToBFloat16RNE(downOutput[i]);
                         }
@@ -8741,7 +8745,7 @@ namespace fastllm {
                     }
 
                     // 6. reduce
-                    if (useDeepSeekV4MoeFast) {
+                    if (useParallelPrepare) {
                         int reduceThreads = std::min(
                             {(int)pool->threads.size(),
                              16, outputDim});
