@@ -97,7 +97,10 @@ static void TestBatchedTopK() {
     struct Shape { int rows, keys, past, top; };
     const Shape shapes[] = {{2,2,0,7}, {3,127,0,129}, {33,2049,17,2048},
         {31,8192,8000,1}, {32,8192,8160,17}, {129,8193,8064,2048},
-        {512,32768,32256,2048}, {512,65536,65024,2048}};
+        {512,32768,32256,2048}, {512,65536,65024,2048},
+        // Compact-selection dispatch boundary, partial causal rows, and odd K.
+        {2,8191,8189,2048}, {2,8192,8190,2048}, {2,8193,8191,2048},
+        {17,32769,0,7}, {3,65537,4095,2049}};
     for (const auto &s : shapes) for (int mode = 0; mode < 3; ++mode) {
         if (quick && s.rows > 33) continue;
         auto values = BatchedScores(s.rows, s.keys, s.past, mode, 713 + mode);
@@ -119,7 +122,8 @@ static void TestBatchedTopK() {
         ++checks;
     }
     // Change score contents between graph replays to catch stale host selection.
-    for (const auto &s : {Shape{3,2049,1000,2048}, Shape{33,8192,8159,2048}}) {
+    for (const auto &s : {Shape{3,2049,1000,2048}, Shape{33,8192,8159,2048},
+                          Shape{17,32769,32752,2048}}) {
         Data scores(FLOAT32), output; auto values=BatchedScores(s.rows,s.keys,s.past,2,19);
         scores.Resize({s.rows,s.keys});scores.Allocate();
         std::memcpy(scores.cpuData,values.data(),values.size()*sizeof(float));scores.ToDevice(DataDevice::CUDA,{0},true);

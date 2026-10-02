@@ -3,6 +3,7 @@
 #include "utils.h"
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include <cub/block/block_scan.cuh>
 #include <cub/device/device_radix_sort.cuh>
 #include <cub/device/device_segmented_radix_sort.cuh>
 #include <climits>
@@ -45,6 +46,15 @@ __global__ void TrimCachePair(T *key, T *value, int keyColumns,
         data[(size_t)row * columns + column] = data[(size_t)(row + drop) * columns + column];
 }
 
+__device__ unsigned OrderedScoreBits(float score) {
+    unsigned bits = score == 0.0f ? 0u : __float_as_uint(score);
+    return (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
+}
+
+__device__ unsigned long long TopKOrder(unsigned scoreBits, int index) {
+    return ((unsigned long long)scoreBits << 32) | (0xffffffffu - (unsigned)index);
+}
+
 // Sorting the original score bits plus the inverse position preserves the CPU
 // comparator, including +/-0 ties. Separate causal segment ends exclude future
 // keys even when a valid score is -infinity; no score matrix leaves the GPU.
@@ -57,11 +67,8 @@ __global__ void EncodeTopK(const float *scores, unsigned long long *order,
         offsets[queries + row] = row * keys + count;
     }
     if (col >= count) return;
-    float score = scores[(size_t)row * keys + col];
-    unsigned bits = score == 0.0f ? 0u : __float_as_uint(score);
-    unsigned ordered = (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
     order[(size_t)row * keys + col] =
-        ((unsigned long long)ordered << 32) | (0xffffffffu - (unsigned)col);
+        TopKOrder(OrderedScoreBits(scores[(size_t)row * keys + col]), col);
 }
 __global__ void DecodeTopK(const unsigned long long *order, int *indices,
                            int keys, int queryStart, int topK) {
@@ -69,6 +76,107 @@ __global__ void DecodeTopK(const unsigned long long *order, int *indices,
     if (col >= topK) return;
     indices[(size_t)row * topK + col] = col <= queryStart + row
         ? (int)(0xffffffffu - (unsigned)order[(size_t)row * keys + col]) : -1;
+}
+
+// Select a bounded superset of the top K before sorting it. A radix prefix can
+// stop as soon as at most capacity entries remain; no possible winner is lost.
+// If equal scores straddle a full candidate buffer, retain the lowest indices.
+__global__ void SelectTopKCompact(const float *scores, unsigned long long *selected, int *offsets,
+                                  int queries, int keys, int queryStart, int topK, int capacity) {
+    constexpr int threads = 256, warps = threads / 32;
+    using Scan = cub::BlockScan<int, threads>;
+    __shared__ typename Scan::TempStorage scan;
+    __shared__ int histogram[warps][256];
+    __shared__ unsigned prefix;
+    __shared__ int rank, candidateCount, selectedCount, tiesSeen;
+    int row = blockIdx.x, t = threadIdx.x, lane = t % 32, warp = t / 32;
+    int count = queryStart + row + 1, keep = min(count, topK);
+    const float *input = scores + (size_t)row * keys;
+    unsigned long long *output = selected + (size_t)row * capacity;
+    if (t == 0) {
+        offsets[row] = row * capacity;
+        prefix = 0; rank = keep; selectedCount = 0; tiesSeen = 0;
+    }
+    __syncthreads();
+    if (count <= capacity) {
+        if (t == 0) offsets[queries + row] = row * capacity + count;
+        for (int col = t; col < count; col += threads)
+            output[col] = TopKOrder(OrderedScoreBits(input[col]), col);
+        return;
+    }
+    unsigned mask = 0;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        unsigned wanted = prefix;
+        int target = rank;
+        for (int i = t; i < warps * 256; i += threads) ((int *)histogram)[i] = 0;
+        __syncthreads();
+        for (int base = 0; base < count; base += threads) {
+            int col = base + t;
+            unsigned bits = col < count ? OrderedScoreBits(input[col]) : 0;
+            int bucket = col < count && (bits & mask) == wanted ? int((bits >> shift) & 255) : 256;
+            // Aggregate identical buckets within each warp before its histogram
+            // update, including the common case where all score exponents match.
+            #if __CUDA_ARCH__ >= 700
+            unsigned peers = __match_any_sync(0xffffffff, bucket);
+            if (bucket < 256 && lane == __ffs(peers) - 1)
+                atomicAdd(&histogram[warp][bucket], __popc(peers));
+            #else
+            if (bucket < 256) atomicAdd(&histogram[warp][bucket], 1);
+            #endif
+        }
+        __syncthreads();
+        int bucket = 255 - t, n = 0;
+        #pragma unroll
+        for (int w = 0; w < warps; ++w) n += histogram[w][bucket];
+        int before;
+        Scan(scan).ExclusiveSum(n, before);
+        if (before < target && before + n >= target) {
+            prefix = wanted | ((unsigned)bucket << shift);
+            rank = target - before;
+            candidateCount = keep - rank + n;
+        }
+        __syncthreads();
+        mask |= 255u << shift;
+        if (candidateCount <= capacity) break;
+    }
+    unsigned threshold = prefix;
+    int tiesWanted = rank;
+    if (candidateCount <= capacity) {
+        if (t == 0) offsets[queries + row] = row * capacity + candidateCount;
+        for (int base = 0; base < count; base += threads) {
+            int col = base + t;
+            unsigned bits = col < count ? OrderedScoreBits(input[col]) : 0;
+            bool take = col < count && bits >= threshold;
+            unsigned ballot = __ballot_sync(0xffffffff, take);
+            if (ballot) {
+                int outputBase = 0, leader = __ffs(ballot) - 1;
+                if (lane == leader) outputBase = atomicAdd(&selectedCount, __popc(ballot));
+                outputBase = __shfl_sync(0xffffffff, outputBase, leader);
+                if (take)
+                    output[outputBase + __popc(ballot & ((1u << lane) - 1))] =
+                        TopKOrder(bits, col);
+            }
+        }
+    } else {
+        if (t == 0) offsets[queries + row] = row * capacity + keep;
+        for (int base = 0; base < count; base += threads) {
+            int col = base + t;
+            unsigned bits = col < count ? OrderedScoreBits(input[col]) : 0;
+            int equal = col < count && bits == threshold, equalBefore, equalTotal;
+            Scan(scan).ExclusiveSum(equal, equalBefore, equalTotal);
+            __syncthreads();
+            int take = col < count &&
+                (bits > threshold || (equal && tiesSeen + equalBefore < tiesWanted));
+            int before, total;
+            Scan(scan).ExclusiveSum(take, before, total);
+            __syncthreads();
+            if (take)
+                output[selectedCount + before] = TopKOrder(bits, col);
+            __syncthreads();
+            if (t == 0) { selectedCount += total; tiesSeen += equalTotal; }
+            __syncthreads();
+        }
+    }
 }
 
 __global__ void Rope(BF16 *data, const float *positions, int heads, int dim,
@@ -533,30 +641,38 @@ void FastllmCudaNaiveTopK(const fastllm::Data &scores, int queryStart, int topK,
         int64_t total = (int64_t)queries * keys;
         AssertInFastLLM(total <= INT_MAX && (int64_t)queries * topK <= INT_MAX,
             "Naive-N0.5 batched TopK is too large.");
+        // Full sorting remains cheaper for short rows or large requested K.
+        bool compact = (int64_t)keys >= (int64_t)topK * 4;
+        int sortStride = compact ? topK * 2 : keys;
         Data encoded, sorted, offsets, workspace;
-        Output(encoded, INT32, {queries, keys, 2});
-        Output(sorted, INT32, {queries, keys, 2});
+        Output(encoded, INT32, {queries, sortStride, 2});
+        Output(sorted, INT32, {queries, sortStride, 2});
         Output(offsets, INT32, {2, queries});
         Output(indices, INT32, {queries, topK});
         auto *input = (unsigned long long *)encoded.cudaData;
         auto *output = (unsigned long long *)sorted.cudaData;
         auto *begin = (int *)offsets.cudaData;
         size_t bytes = 0;
-        int items = (queries - 1) * keys + queryStart + queries;
+        int items = compact ? queries * sortStride : (queries - 1) * keys + queryStart + queries;
         auto status = cub::DeviceSegmentedRadixSort::SortKeysDescending(
             nullptr, bytes, input, output, items, queries, begin, begin + queries,
             0, 64, cudaStreamPerThread);
         AssertInFastLLM(status == cudaSuccess && (bytes + 3) / 4 <= INT_MAX,
             "Naive-N0.5 batched TopK workspace query failed.");
         Output(workspace, INT32, {(int)((bytes + 3) / 4)});
-        EncodeTopK<<<dim3((keys + 255) / 256, queries), 256>>>(
-            (const float *)scores.cudaData, input, begin, queries, keys, queryStart);
+        if (compact) {
+            SelectTopKCompact<<<queries, 256>>>((const float *)scores.cudaData,
+                input, begin, queries, keys, queryStart, topK, sortStride);
+        } else {
+            EncodeTopK<<<dim3((keys + 255) / 256, queries), 256>>>(
+                (const float *)scores.cudaData, input, begin, queries, keys, queryStart);
+        }
         status = cub::DeviceSegmentedRadixSort::SortKeysDescending(
             workspace.cudaData, bytes, input, output, items, queries, begin, begin + queries,
             0, 64, cudaStreamPerThread);
         AssertInFastLLM(status == cudaSuccess, "Naive-N0.5 batched GPU TopK failed.");
         DecodeTopK<<<dim3((topK + 255) / 256, queries), 256>>>(
-            output, (int *)indices.cudaData, keys, queryStart, topK);
+            output, (int *)indices.cudaData, sortStride, queryStart, topK);
         CheckLaunch();
         return;
     }
