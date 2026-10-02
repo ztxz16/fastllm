@@ -6,10 +6,12 @@
 #include "fastllm-gguf-dequant.cuh"
 #include "fastllm-gguf-gemv.cuh"
 #include "moe/fastllm-moe-gguf-q8.cuh"
+#include "fastllm-cuda.cuh"
 #include <cmath>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
+#include <type_traits>
 #include <vector>
 
 static void Check(bool ok, const char *message) { if (!ok) throw std::runtime_error(message); }
@@ -130,12 +132,105 @@ static void TestGroupedQ8Dot(int rows, int columns) {
     Cuda(cudaFree(weights));Cuda(cudaFree(activation));Cuda(cudaFree(original));Cuda(cudaFree(grouped));
 }
 
+template<typename T> static void TestMmvq(int batch, int columns) {
+    const int rows = 13; // Exercise a partial eight-row CUDA block.
+    Fixture f(rows, columns);
+    std::vector<T> values(batch*columns), actual(batch*rows);
+    std::vector<float> quantized(batch*columns);
+    for (int i = 0; i < batch*columns; ++i)
+        values[i] = Cast<T>(i%columns < 32 ? 0 :
+            .47f*std::sin(i*.713f)+.031f*std::cos(i*1.37f));
+    for (int b = 0; b < batch*columns; b += 32) {
+        float maximum = 0;
+        for (int i = 0; i < 32; ++i) maximum = std::max(maximum, std::fabs(float(values[b+i])));
+        const float scale = maximum/127.0f;
+        const float stored = __half2float(__float2half_rn(scale));
+        for (int i = 0; i < 32; ++i)
+            quantized[b+i] = maximum == 0 ? 0 : std::round(float(values[b+i])/scale)*stored;
+    }
+    void *weight = nullptr; T *input = nullptr, *output = nullptr;
+    Cuda(cudaMalloc(&weight, f.weight.size()*sizeof(block_q2_0)));
+    Cuda(cudaMalloc(reinterpret_cast<void **>(&input), values.size()*sizeof(T)));
+    Cuda(cudaMalloc(reinterpret_cast<void **>(&output), actual.size()*sizeof(T)));
+    Cuda(cudaMemcpy(weight, f.weight.data(), f.weight.size()*sizeof(block_q2_0), cudaMemcpyHostToDevice));
+    Cuda(cudaMemcpy(input, values.data(), values.size()*sizeof(T), cudaMemcpyHostToDevice));
+    auto launch = [&](int n, int m) {
+        if constexpr (std::is_same<T, float>::value)
+            return FastllmCudaFloatMatMulGGUFMMVQ(input,weight,output,GGML_TYPE_Q2_0,n,m,rows,cudaStreamPerThread);
+        else if constexpr (std::is_same<T, half>::value)
+            return FastllmCudaHalfMatMulGGUFMMVQ(input,weight,output,GGML_TYPE_Q2_0,n,m,rows,cudaStreamPerThread);
+        else
+            return FastllmCudaBFloat16MatMulGGUFMMVQ(input,weight,output,GGML_TYPE_Q2_0,n,m,rows,cudaStreamPerThread);
+    };
+    Check(!launch(9, columns) && !launch(batch, 96) && !launch(batch, 32768),
+          "Q2 MMVQ admitted unsupported shape");
+    Check(launch(batch, columns), "Q2 MMVQ rejected supported shape");
+    Cuda(cudaDeviceSynchronize());
+    if (batch == 3 && columns == 320) {
+        cudaGraph_t graph;
+        cudaGraphExec_t executable;
+        Cuda(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+        Check(launch(batch, columns), "Q2 MMVQ graph capture rejected");
+        Cuda(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+        Cuda(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+        Cuda(cudaMemset(output, 0xff, actual.size()*sizeof(T)));
+        Cuda(cudaGraphLaunch(executable, cudaStreamPerThread));
+        Cuda(cudaDeviceSynchronize());
+        Cuda(cudaGraphExecDestroy(executable));
+        Cuda(cudaGraphDestroy(graph));
+    }
+    Cuda(cudaMemcpy(actual.data(), output, actual.size()*sizeof(T), cudaMemcpyDeviceToHost));
+    for (int b = 0; b < batch; ++b) for (int r = 0; r < rows; ++r) {
+        double reference = 0, magnitude = 0;
+        for (int c = 0; c < columns; ++c) {
+            const double term = double(f.reference[r*columns+c])*quantized[b*columns+c];
+            reference += term; magnitude += std::fabs(term);
+        }
+        const float expected = float(Cast<T>(float(reference)));
+        const float rounding = std::is_same<T, float>::value ? 0.0f :
+            std::is_same<T, half>::value ? .001f : .008f;
+        Check(std::isfinite(float(actual[b*rows+r])) &&
+              std::fabs(float(actual[b*rows+r])-expected) <=
+                  1e-5*std::max(1.0, magnitude)+rounding*std::max(1.0f, std::fabs(expected)),
+              "Q2 MMVQ disagrees with independent CPU Q8 reference");
+    }
+    Cuda(cudaFree(weight)); Cuda(cudaFree(input)); Cuda(cudaFree(output));
+}
+
+static void TestMmvqAdmission() {
+    // Invalid calls must reject before reading any device buffer. IQ formats
+    // require 256-column weight blocks even though Q8 input uses blocks of 32.
+    for (auto type : {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
+                      GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M}) {
+        for (int columns : {32, 64, 192, 288}) {
+            Check(!FastllmCudaFloatMatMulGGUFMMVQ(nullptr, nullptr, nullptr,
+                      type, 1, columns, 128, cudaStreamPerThread) &&
+                  !FastllmCudaHalfMatMulGGUFMMVQ(nullptr, nullptr, nullptr,
+                      type, 1, columns, 128, cudaStreamPerThread) &&
+                  !FastllmCudaBFloat16MatMulGGUFMMVQ(nullptr, nullptr, nullptr,
+                      type, 1, columns, 128, cudaStreamPerThread),
+                  "MMVQ accepted a partial weight block");
+            Check(!FastllmCudaHalfGgufGateUpSiluMulMMVQ(nullptr, nullptr, nullptr,
+                      nullptr, type, 1, columns, 128, cudaStreamPerThread),
+                  "Fused gate/up accepted a partial or unsupported weight block");
+        }
+    }
+    for (auto type : {GGML_TYPE_Q2_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1,
+                      GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M}) {
+        Check(!FastllmCudaHalfGgufGateUpSiluMulMMVQ(nullptr, nullptr, nullptr,
+                  nullptr, type, 1, 256, 128, cudaStreamPerThread),
+              "Fused gate/up accepted a format without an implementation");
+    }
+    Cuda(cudaGetLastError());
+}
+
 int main() {
     try {
         for (int columns : {64, 128, 192, 640, 2560}) TestCpu(columns);
         int devices = 0;
         if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) return 77;
         Cuda(cudaSetDevice(0));
+        TestMmvqAdmission();
         for (int columns : {64,128,192,256,320,448,512})
             for (int rows : {7,33}) TestGroupedQ8Dot(rows,columns);
         for (int columns : {64, 128, 192, 640, 2560}) {
@@ -143,7 +238,12 @@ int main() {
             TestGpu<half>(7, columns, ggml_get_to_fp16_cuda(GGML_TYPE_Q2_0));
             TestGpu<__nv_bfloat16>(7, columns, ggml_get_to_bf16_cuda(GGML_TYPE_Q2_0));
         }
-        std::cout << "PASS: Q2_0 CPU decoding/dot and CUDA FP32/FP16/BF16 dequantization/GEMV\n";
+        for (int columns : {64, 320, 2560}) for (int batch : {1, 3, 8}) {
+            TestMmvq<float>(batch, columns);
+            TestMmvq<half>(batch, columns);
+            TestMmvq<__nv_bfloat16>(batch, columns);
+        }
+        std::cout << "PASS: Q2_0 CPU decoding/dot and CUDA FP32/FP16/BF16 dequantization/GEMV/MMVQ\n";
         return 0;
     } catch (const std::exception &e) { std::cerr << e.what() << '\n'; return 1; }
 }

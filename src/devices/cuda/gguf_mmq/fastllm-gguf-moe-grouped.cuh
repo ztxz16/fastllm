@@ -1,7 +1,6 @@
 #pragma once
 // Packed MoE prefill on the existing MMQ tile machinery. Included inside
-// fastllm_gguf_mmq after mmq_io and the imported MMQ definitions.
-#include "../moe/fastllm-moe-gguf-q8.cuh"
+// fastllm_gguf_mmq after mmq_io, the Q8 helpers and imported MMQ definitions.
 
 namespace grouped_moe {
 constexpr int kTile = 16;
@@ -19,19 +18,17 @@ __device__ void LoadQ2(const char *x, int *tile, const int &kb0,
         const int row = row0 + threadIdx.y;
         const int srcRow = Check ? min(row, imax) : row;
         const auto *weight = reinterpret_cast<const block_q2_0 *>(x + srcRow*stride);
-#pragma unroll
-        for (int half = 0; half < 2; ++half) {
-            const int word = threadIdx.x + half*32;
-            const int block = kb0 + word/16;
-            uint32_t packed = 0;
-            if (block < stride/int(sizeof(block_q2_0))) {
-                const unsigned codes = weight[block].qs[word%16];
-#pragma unroll
-                for (int v = 0; v < 4; ++v)
-                    packed |= uint32_t(uint8_t(int((codes>>(2*v))&3)-1)) << (8*v);
-            }
-            tile[row*Pitch + word] = int(packed);
+        // One aligned 16-bit load supplies eight values. Decode both byte
+        // vectors in registers instead of issuing two dependent byte loads.
+        const int block = kb0 + threadIdx.x/8;
+        int2 values = make_int2(0, 0);
+        if (block < stride/int(sizeof(block_q2_0))) {
+            const uint16_t codes = reinterpret_cast<const uint16_t *>(
+                weight[block].qs)[threadIdx.x%8];
+            values = gguf_cache_q8::UnpackQ2(codes);
         }
+        tile[row*Pitch + 2*threadIdx.x] = values.x;
+        tile[row*Pitch + 2*threadIdx.x+1] = values.y;
         if (threadIdx.x < 8) {
             const int block = kb0 + threadIdx.x/2;
             scales[row*Pitch + threadIdx.x] = block < stride/int(sizeof(block_q2_0))
@@ -134,15 +131,16 @@ __global__ void Scatter(const int *indices, const uint8_t *const *weights,
 
 // Use the same 32-value activation quantizer as the small-batch path. D4
 // stores its FP16-rounded scale in float; this avoids changing the Q8 oracle.
-template<class T, bool GateInput>
+template<class T>
 __global__ void Quantize(const T *input, block_q8_1_mmq *output,
-                         const int *groupRoutes, int columns, int capacity, int topk) {
+                         const int *groupRoutes, const int *activeRows,
+                         int columns, int capacity) {
+    if (blockIdx.y >= *activeRows) return;
     const int col = blockIdx.x*blockDim.x+threadIdx.x;
     const int padded = ((columns+255)/256)*256;
     if (col >= padded) return;
     const int row = blockIdx.y, route = groupRoutes[row];
-    const int source = GateInput ? route/topk : route;
-    const float x = route >= 0 && col < columns ? mmq_io<T>::to_float(input[size_t(source)*columns+col]) : 0.0f;
+    const float x = route >= 0 && col < columns ? mmq_io<T>::to_float(input[size_t(route)*columns+col]) : 0.0f;
     float maximum = fabsf(x);
 #pragma unroll
     for (int m = 16; m; m >>= 1) maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, m));
@@ -196,20 +194,25 @@ __global__ void Reduce(const float *products, T *output, const int *routeGroups,
     output[i] = mmq_io<T>::from_float(sum);
 }
 
-template<class T>
-__global__ void QuantizeRows(const T *input, block_q8_1 *out, int columns) {
-    const int col = blockIdx.x*blockDim.x+threadIdx.x;
-    if (col >= columns) return;
-    const float x = mmq_io<T>::to_float(input[size_t(blockIdx.y)*columns+col]);
-    float maximum = fabsf(x), sum = x;
-#pragma unroll
-    for (int m = 16; m; m >>= 1) {
-        maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, m));
-        sum += __shfl_xor_sync(0xffffffff, sum, m);
+// Quantize each token once, then gather its packed Q8 values for each expert.
+// A warp copies one 128-value D4 block; padded expert rows are explicitly zero.
+__global__ void GatherQuantized(const block_q8_1 *input, block_q8_1_mmq *output,
+                                const int *groupRoutes, const int *activeRows,
+                                int columns, int capacity, int topk) {
+    const int row = blockIdx.x*(blockDim.x/32)+threadIdx.x/32;
+    if (row >= *activeRows) return;
+    const int route = groupRoutes[row], firstBlock = blockIdx.y*4;
+    auto *destination = reinterpret_cast<uint32_t *>(output+size_t(blockIdx.y)*capacity+row);
+    for (int word = threadIdx.x%32; word < sizeof(block_q8_1_mmq)/sizeof(uint32_t); word += 32) {
+        const int block = firstBlock+(word < 4 ? word : (word-4)/8);
+        uint32_t value = 0;
+        if (route >= 0 && block < columns/32) {
+            const auto &q = input[size_t(route/topk)*(columns/32)+block];
+            value = word < 4 ? __float_as_uint(__low2float(q.ds))
+                            : reinterpret_cast<const uint32_t *>(q.qs)[(word-4)%8];
+        }
+        destination[word] = value;
     }
-    auto &q = out[size_t(blockIdx.y)*(columns/32)+col/32];
-    q.qs[col%32] = maximum == 0 ? 0 : int8_t(roundf(x/(maximum/127.0f)));
-    if (col%32 == 0) q.ds = __floats2half2_rn(maximum/127.0f, sum);
 }
 // IQ1_M retains its existing Q8 dot arithmetic until an MMQ tile loader is
 // available. This is only the gate/up fallback; its down still uses MMQ.
@@ -281,20 +284,22 @@ static bool Run(const T *input, T *gate, T *output, const uint8_t *const *weight
     Prefix<<<1, threads, 0, stream>>>(w.counts, w.offsets, w.tileExperts, experts);
     Scatter<<<(routes+255)/256, 256, 0, stream>>>(indices, weights, w.offsets, w.cursors,
         w.groupRoutes, w.routeGroups, routes, experts);
+    // Gate input uses the same Q8 quantizer as Dense MMVQ. Matrix is the
+    // first consumer of products, so this scratch reuse adds no allocation.
+    auto *q = reinterpret_cast<block_q8_1 *>(w.products);
+    quantize_mmvq_q8_1<<<dim3((hidden+255)/256, rows), 256, 0, stream>>>(input, q, hidden);
     if (gt == GGML_TYPE_IQ1_M) {
-        auto *q = reinterpret_cast<block_q8_1 *>(w.quantized);
-        QuantizeRows<<<dim3((hidden+255)/256, rows), 256, 0, stream>>>(input, q, hidden);
         IQ1Gate<<<dim3((inter+7)/8, routes), 256, hidden/32*sizeof(block_q8_1), stream>>>(
             q, gate, weights, indices, experts, hidden, inter, topk,
             int(ggml_row_size(GGML_TYPE_IQ1_M, hidden)));
     } else {
-        Quantize<T, true><<<dim3((hidden+255)/256, w.capacity), 256, 0, stream>>>(
-            input, w.quantized, w.groupRoutes, hidden, w.capacity, topk);
+        GatherQuantized<<<dim3((w.capacity+7)/8, ((hidden+255)/256)*2), 256, 0, stream>>>(
+            q, w.quantized, w.groupRoutes, w.offsets+experts, hidden, w.capacity, topk);
         Matrix(gt, weights, 0, w, experts, hidden, 2*inter, stream);
         Activate<<<(routes*inter+255)/256, 256, 0, stream>>>(w.products, gate, w.routeGroups, routes, inter);
     }
-    Quantize<T, false><<<dim3((inter+255)/256, w.capacity), 256, 0, stream>>>(
-        gate, w.quantized, w.groupRoutes, inter, w.capacity, topk);
+    Quantize<<<dim3((inter+255)/256, w.capacity), 256, 0, stream>>>(
+        gate, w.quantized, w.groupRoutes, w.offsets+experts, inter, w.capacity);
     Matrix(dt, weights, 1, w, experts, inter, hidden, stream);
     Reduce<<<(rows*hidden+255)/256, 256, 0, stream>>>(w.products, output,
         w.routeGroups, scores, rows, hidden, topk);

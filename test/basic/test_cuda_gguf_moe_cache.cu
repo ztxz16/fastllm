@@ -746,6 +746,10 @@ int main(int argc, char **argv) {
                 RunResident<half>(type, fastllm::FLOAT16, 0, 256, 256, 65);
             }
             RunResident<__nv_bfloat16>(GGML_TYPE_IQ2_S, fastllm::BFLOAT16, 0, 256, 320, 129);
+            // Q2 supports non-256-aligned gate input as well as down input.
+            // Exercise both tails in the quantize-once/gather path.
+            RunResident<__nv_bfloat16>(GGML_TYPE_Q2_0, fastllm::BFLOAT16, 0, 320, 192, 65);
+            RunResident<float>(GGML_TYPE_Q2_0, fastllm::FLOAT32, 0, 64, 64, 33);
             for (auto type : {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S})
                 RunResident<float>(GGML_TYPE_Q2_0, fastllm::FLOAT32, 0, 256, 256, 33, type);
             if (count >= 2) {
@@ -808,5 +812,6 @@ int main(int argc, char **argv) {
             RunResident<__nv_bfloat16>(GGML_TYPE_Q2_0, fastllm::BFLOAT16, 0, 256, 256, batch);
         }
         std::puts("PASS: generic GGUF CUDA expert cache and resident fused kernels");
+        return 0;
     } catch (const std::exception &e) { std::fprintf(stderr, "FAIL: %s\n", e.what()); return 1; }
 }

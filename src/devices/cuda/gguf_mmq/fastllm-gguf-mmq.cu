@@ -9,6 +9,7 @@ namespace fastllm_gguf_mmq {
 #include "mmq.cuh"
 #include "fastllm-gguf-iq2-gemv.cuh"
 #include "../fastllm-gguf-small-mmvq.cuh"
+#include "../moe/fastllm-moe-gguf-q8.cuh"
 
 constexpr int kQuantizeBlockSize = 128;
 constexpr int kBlackwellDirectTileThreshold = 1000;
@@ -98,6 +99,13 @@ static bool is_extended_mmvq_type(ggml_type type) {
         default:
             return false;
     }
+}
+
+// Check the actual weight block size, not only the Q8 activation block.
+// The caller must first establish that the type has an implemented kernel.
+static bool supports_mmvq_shape(ggml_type type, int rows, int columns, int output_rows) {
+    return rows > 0 && rows <= 8 && columns > 0 &&
+           columns % ggml_blck_size(type) == 0 && output_rows > 0;
 }
 
 template <ggml_type type>
@@ -511,14 +519,37 @@ static void dispatch_extended_gate_up(
 #undef FASTLLM_DISPATCH_EXTENDED_GATE_UP
 }
 
+// Ordinary Q2_0 rows can use the same Q8/DP4A arithmetic as resident experts.
+// A warp computes one output row; the block shares its quantized activation.
+template<typename OutputType>
+static __global__ void q2_mmvq(
+        const block_q2_0 *weight, const block_q8_1 *input,
+        OutputType *output, int columns, int output_rows) {
+    extern __shared__ uint32_t activation[];
+    const int input_blocks = columns/QK8_1;
+    const auto *source = reinterpret_cast<const uint32_t *>(
+        input + size_t(blockIdx.y)*input_blocks);
+    for (int i = threadIdx.x; i < input_blocks*int(sizeof(block_q8_1))/4;
+         i += blockDim.x) activation[i] = source[i];
+    __syncthreads();
+    const int row = blockIdx.x*8+threadIdx.x/32;
+    if (row >= output_rows) return;
+    const float value = gguf_cache_q8::RowDot<GGML_TYPE_Q2_0>(
+        weight + size_t(row)*(columns/QK2_0),
+        reinterpret_cast<const block_q8_1 *>(activation), columns, nullptr);
+    if (threadIdx.x%32 == 0)
+        output[size_t(blockIdx.y)*output_rows+row] = mmq_io<OutputType>::from_float(value);
+}
+
 template <typename InputType, typename OutputType>
 static bool matmul_mmvq(
         const InputType *input, const void *weight, OutputType *output,
         ggml_type type, int rows, int input_columns, int output_rows,
         cudaStream_t stream) {
-    if (!is_extended_mmvq_type(type) || rows <= 0 || rows > 8 ||
-        input_columns <= 0 || input_columns % QK8_1 != 0 ||
-        output_rows <= 0) {
+    const bool q2 = type == GGML_TYPE_Q2_0;
+    if ((!q2 && !is_extended_mmvq_type(type)) ||
+        !supports_mmvq_shape(type, rows, input_columns, output_rows) ||
+        (q2 && size_t(input_columns/QK8_1)*sizeof(block_q8_1) > 32*1024)) {
         return false;
     }
     if (type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M) {
@@ -539,9 +570,16 @@ static bool matmul_mmvq(
     quantize_mmvq_q8_1<<<blocks, threads, 0, stream>>>(
         input, quantized, input_columns);
 
-    dispatch_extended_mmvq(
-        type, weight, quantized, output, rows, input_columns, output_rows,
-        stream);
+    if (q2) {
+        q2_mmvq<<<dim3((output_rows+7)/8, rows), 256,
+            size_t(input_columns/QK8_1)*sizeof(block_q8_1), stream>>>(
+                static_cast<const block_q2_0 *>(weight), quantized, output,
+                input_columns, output_rows);
+    } else {
+        dispatch_extended_mmvq(
+            type, weight, quantized, output, rows, input_columns, output_rows,
+            stream);
+    }
     FastllmCudaFree(quantized);
     return true;
 }
@@ -550,13 +588,12 @@ static bool gate_up_mmvq(
         const half *input, const void *gate_weight, const void *up_weight,
         half *output, ggml_type type, int rows, int input_columns,
         int output_rows, cudaStream_t stream) {
-    if (!is_extended_mmvq_type(type) || rows <= 0 || rows > 8 ||
-        input_columns <= 0 || input_columns % QK8_1 != 0 ||
-        output_rows <= 0) {
+    // dispatch_extended_gate_up implements only the IQ2 family. Reject other
+    // formats before allocating/quantizing so callers can use their fallback.
+    if ((type != GGML_TYPE_IQ2_XXS && type != GGML_TYPE_IQ2_XS &&
+         type != GGML_TYPE_IQ2_S) ||
+        !supports_mmvq_shape(type, rows, input_columns, output_rows)) {
         return false;
-    }
-    if (type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M) {
-        ensure_iq1s_grid(stream);
     }
 
     const size_t block_count =

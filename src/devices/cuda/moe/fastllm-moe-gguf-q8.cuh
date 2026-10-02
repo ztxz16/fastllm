@@ -176,6 +176,15 @@ static __device__ __forceinline__ float DotIQ1M(const void *weight,
         ((sums[0] + offsets[0])*s0 + (sums[1] + offsets[1])*s1);
 }
 
+// Expand eight consecutive Q2_0 codes into two DP4A byte vectors. Both
+// expert GEMV and grouped MMQ use this packing without changing the weights.
+static __device__ __forceinline__ int2 UnpackQ2(uint16_t codes) {
+    const int even = __byte_perm(0x020100ff, 0x020100ff, codes);
+    const int odd = __byte_perm(0x020100ff, 0x020100ff, codes >> 2);
+    return make_int2(__byte_perm(even, odd, 0x5140),
+                     __byte_perm(even, odd, 0x7362));
+}
+
 // Q2_0's 64-value block uses {-1, 0, 1, 2}; each lane dots 32 values.
 static __device__ __forceinline__ float DotQ2(const void *weight,
         const block_q8_1 *x, int block, int part) {
@@ -184,12 +193,9 @@ static __device__ __forceinline__ float DotQ2(const void *weight,
     int sum = 0;
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-        const int even = __byte_perm(0x020100ff, 0x020100ff, bits[j]);
-        const int odd = __byte_perm(0x020100ff, 0x020100ff, bits[j] >> 2);
-        const int low = __byte_perm(even, odd, 0x5140);
-        const int high = __byte_perm(even, odd, 0x7362);
-        sum = ggml_cuda_dp4a(low, get_int_b4(x[part].qs, 2*j), sum);
-        sum = ggml_cuda_dp4a(high, get_int_b4(x[part].qs, 2*j+1), sum);
+        const int2 values = UnpackQ2(bits[j]);
+        sum = ggml_cuda_dp4a(values.x, get_int_b4(x[part].qs, 2*j), sum);
+        sum = ggml_cuda_dp4a(values.y, get_int_b4(x[part].qs, 2*j+1), sum);
     }
     return __half2float(q.d) * __low2float(x[part].ds) * sum;
 }
