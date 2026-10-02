@@ -1698,6 +1698,14 @@ bool FastllmCudaMergeMOENVFP4E4M3MarlinIndexed(
         fastllm::Data **weights, int weightsBatch,
         const int32_t *indices, const float *scores,
         int batch, int topk);
+bool FastllmCudaMergeMOENVFP4E4M3MarlinIndexedClamped(
+        const fastllm::Data &input, fastllm::Data &gateOutput,
+        fastllm::Data &activation, fastllm::Data &output,
+        fastllm::Data **weights, int weightsBatch,
+        const int32_t *indices, const float *scores,
+        int batch, int topk, float swigluLimit);
+bool FastllmCudaSwigluClamped(
+        const fastllm::Data &input, float limit, fastllm::Data &output);
 #ifndef USE_ROCM
 // Model-facing interface for the opt-in GPU expert cache. Preparation validates
 // compact GGUF, NVFP4 or FP8 SwiGLU weights behind this format-independent interface.

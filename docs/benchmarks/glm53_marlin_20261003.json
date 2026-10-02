@@ -1,0 +1,281 @@
+{
+  "model": "GLM-5.3-Flash-NVFP4",
+  "hardware": "8 x RTX 5090 32GB",
+  "placement": "cudapp=8 serial layers",
+  "upstream_marlin_commit": "35cec24c8d46c2c5935edab88f39ff413de6a361",
+  "library_sha256": "238ad1b775bc7dc2775559b726cf5ba18153f49a5a2371772afb47739aec7bae",
+  "config": {
+    "activation": "bfloat16",
+    "context_budget": 32768,
+    "chunked_prefill_size": 1024,
+    "max_batch": 1,
+    "mtp": 0,
+    "cpu_threads": 8,
+    "prefix_cache": false,
+    "history_cache": false,
+    "swiglu_limit": 10
+  },
+  "speedup_16k": 1.5537936444506717,
+  "ttft_reduction_fraction": 0.3564138947462744,
+  "decode_marlin": {
+    "engine": "fastllm-serial",
+    "single": {
+      "512": {
+        "trials": 3,
+        "actual_input_tokens": [
+          512,
+          512,
+          512
+        ],
+        "output_tokens": 256,
+        "median_ttft_s": 0.43533279898110777,
+        "median_decode_tokens_s": 49.53110958460828,
+        "median_end_to_end_tokens_s": 45.83884898815256
+      },
+      "2048": {
+        "trials": 3,
+        "actual_input_tokens": [
+          2048,
+          2048,
+          2048
+        ],
+        "output_tokens": 256,
+        "median_ttft_s": 1.603392958000768,
+        "median_decode_tokens_s": 49.49215455844109,
+        "median_end_to_end_tokens_s": 37.88676027119341
+      }
+    }
+  },
+  "quality": {
+    "method": "Both engines prefill each identical teacher-forced prefix independently, no cache hits.",
+    "positions": 16,
+    "top1_equal": 14,
+    "max_kl": 0.1621460750339647,
+    "mean_kl": 0.031735329730397235,
+    "rows": [
+      {
+        "length": 512,
+        "position": 0,
+        "top1_equal": true,
+        "top1_native": 16,
+        "top1_marlin": 16,
+        "kl": 0.026380887251269997,
+        "nrmse": 0.11157700185823785,
+        "max_abs": 1.48046875
+      },
+      {
+        "length": 512,
+        "position": 1,
+        "top1_equal": true,
+        "top1_native": 13,
+        "top1_marlin": 13,
+        "kl": 0.0036317748681953424,
+        "nrmse": 0.14440203704647414,
+        "max_abs": 1.361328125
+      },
+      {
+        "length": 512,
+        "position": 2,
+        "top1_equal": true,
+        "top1_native": 362,
+        "top1_marlin": 362,
+        "kl": 0.026843645438924413,
+        "nrmse": 0.07696493796092742,
+        "max_abs": 1.40625
+      },
+      {
+        "length": 512,
+        "position": 3,
+        "top1_equal": true,
+        "top1_native": 220,
+        "top1_marlin": 220,
+        "kl": 0.031140898950707114,
+        "nrmse": 0.07748871034331394,
+        "max_abs": 1.177734375
+      },
+      {
+        "length": 512,
+        "position": 4,
+        "top1_equal": true,
+        "top1_native": 22,
+        "top1_marlin": 22,
+        "kl": 0.013969061763587873,
+        "nrmse": 0.08172743708934675,
+        "max_abs": 1.0542945861816406
+      },
+      {
+        "length": 512,
+        "position": 5,
+        "top1_equal": true,
+        "top1_native": 33,
+        "top1_marlin": 33,
+        "kl": 0.0003063528714452776,
+        "nrmse": 0.05306471596115551,
+        "max_abs": 0.73828125
+      },
+      {
+        "length": 512,
+        "position": 6,
+        "top1_equal": true,
+        "top1_native": 1614,
+        "top1_marlin": 1614,
+        "kl": 0.013607283622498216,
+        "nrmse": 0.06834860945611927,
+        "max_abs": 1.296875
+      },
+      {
+        "length": 512,
+        "position": 7,
+        "top1_equal": false,
+        "top1_native": 389,
+        "top1_marlin": 23100,
+        "kl": 0.027231144165169325,
+        "nrmse": 0.047816991969929744,
+        "max_abs": 0.890625
+      },
+      {
+        "length": 2048,
+        "position": 0,
+        "top1_equal": false,
+        "top1_native": 12,
+        "top1_marlin": 16,
+        "kl": 0.1621460750339647,
+        "nrmse": 0.2029830054838573,
+        "max_abs": 2.71875
+      },
+      {
+        "length": 2048,
+        "position": 1,
+        "top1_equal": true,
+        "top1_native": 13374,
+        "top1_marlin": 13374,
+        "kl": 0.10490639294834353,
+        "nrmse": 0.1077033963510392,
+        "max_abs": 1.59375
+      },
+      {
+        "length": 2048,
+        "position": 2,
+        "top1_equal": true,
+        "top1_native": 220,
+        "top1_marlin": 220,
+        "kl": 0.007972380179424499,
+        "nrmse": 0.16263018507052224,
+        "max_abs": 1.7265625
+      },
+      {
+        "length": 2048,
+        "position": 3,
+        "top1_equal": true,
+        "top1_native": 16,
+        "top1_marlin": 16,
+        "kl": 0.0024677917232271717,
+        "nrmse": 0.15441681352238318,
+        "max_abs": 1.498046875
+      },
+      {
+        "length": 2048,
+        "position": 4,
+        "top1_equal": true,
+        "top1_native": 25,
+        "top1_marlin": 25,
+        "kl": 0.0017992186467810551,
+        "nrmse": 0.16947996156874212,
+        "max_abs": 1.79296875
+      },
+      {
+        "length": 2048,
+        "position": 5,
+        "top1_equal": true,
+        "top1_native": 362,
+        "top1_marlin": 362,
+        "kl": 0.041462958113867056,
+        "nrmse": 0.09804224836895428,
+        "max_abs": 1.53125
+      },
+      {
+        "length": 2048,
+        "position": 6,
+        "top1_equal": true,
+        "top1_native": 22611,
+        "top1_marlin": 22611,
+        "kl": 0.04040879780564522,
+        "nrmse": 0.09085237444383622,
+        "max_abs": 1.3125
+      },
+      {
+        "length": 2048,
+        "position": 7,
+        "top1_equal": true,
+        "top1_native": 51097,
+        "top1_marlin": 51097,
+        "kl": 0.003490612303304948,
+        "nrmse": 0.11343735921452451,
+        "max_abs": 2.2421875
+      }
+    ]
+  },
+  "tests": {
+    "ctest_passed": 3,
+    "ctest_failed": 0,
+    "memcheck_errors": 0,
+    "clamped_fp64_nrmse_glm_shape": 0.0023422552,
+    "clamped_fp64_nrmse_1024": 0.0026829843,
+    "memcheck_log": "memcheck.log"
+  },
+  "limitations": [
+    "Marlin and native have different accumulation and BF16 rounding; not bitwise equivalent.",
+    "Full-model quality checks cover 16 teacher-forced positions and benchmark text, not a broad evaluation.",
+    "Cold weight repack cost is excluded by full-length warmup.",
+    "8 GPUs execute layers serially; this change does not introduce tensor parallelism."
+  ],
+  "prefill": {
+    "prefill_native_clamped": {
+      "engine": "native",
+      "input_tokens": 16384,
+      "output_tokens": 8,
+      "trials": 3,
+      "metric": "Request sent to first nonempty streamed token, including HTTP/scheduling/prefill/first-token overhead",
+      "median_ttft_s": 21.932981839985587,
+      "median_effective_prefill_tokens_s": 747.0028525775119,
+      "min_ttft_s": 21.844739128020592,
+      "max_ttft_s": 21.952315406000707,
+      "context_limit": 32768,
+      "chunked_prefill_size": 1024,
+      "prefix_cache": false
+    },
+    "prefill_marlin_clamped": {
+      "engine": "marlin",
+      "input_tokens": 16384,
+      "output_tokens": 8,
+      "trials": 3,
+      "metric": "Request sent to first nonempty streamed token, including HTTP/scheduling/prefill/first-token overhead",
+      "median_ttft_s": 14.115762358997017,
+      "median_effective_prefill_tokens_s": 1160.6882847214601,
+      "min_ttft_s": 14.103314239997417,
+      "max_ttft_s": 14.123206363990903,
+      "context_limit": 32768,
+      "chunked_prefill_size": 1024,
+      "prefix_cache": false
+    }
+  },
+  "profile": {
+    "input_tokens": 16384,
+    "chunks": 16,
+    "chunk_size": 1024,
+    "output_tokens": 1,
+    "decode_forward": false,
+    "total_kernel_calls": 38800,
+    "total_kernel_gpu_seconds": 13.713157414000001,
+    "kernel_union_seconds": 13.713157414,
+    "marlin_expert_projection_calls": 1344,
+    "marlin_expert_projection_seconds": 2.164806938,
+    "previous_native_expert_projection_seconds": 9.249279107,
+    "expert_projection_speedup": 4.272565347349233,
+    "kda_recurrent_seconds": 6.539910649,
+    "mla_attention_seconds": 1.830930858,
+    "previous_kernel_calls": 708075,
+    "trace_caveat": "Nsight warns that not all CUDA events might have been collected. All observed kernels correlate with runtime APIs; 1344 expert projections, 544 KDA and 176 MLA calls match the expected 16 full chunks. Times describe observed trace.",
+    "kernels_correlated_with_runtime_api": 38800
+  }
+}
