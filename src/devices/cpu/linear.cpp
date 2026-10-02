@@ -2643,20 +2643,23 @@ namespace fastllm {
             if (q8kInputs.size() < n * rowCount) {
                 q8kInputs.resize(n * rowCount);
             }
-            if (n > 1) {
+            // Tiny expert batches cost less to quantize on the caller than to
+            // dispatch a second wave of worker tasks. Keep the matmul parallel.
+            if (n > 1 && (n > 3 || (int64_t)n * m > 16384)) {
                 std::vector<fastllm::MultiThreadFloat32ToQ8KOp*> ops;
-                int per = n / threadNum;
+                const int quantThreads = std::min(n, threadNum);
+                int per = n / quantThreads;
                 int cur = 0;
-                for (int i = 0; i < threadNum; i++) {
-                    int end = cur + per + (cur + per * (threadNum - i) < n);
+                for (int i = 0; i < quantThreads; i++) {
+                    int end = cur + per + (cur + per * (quantThreads - i) < n);
                     ops.push_back(new MultiThreadFloat32ToQ8KOp(
                         inputData + cur * m, (uint8_t*)(q8kInputs.data() + cur * rowCount), (end - cur) * m, tensor->type));
                     cur = end;
                 }
-                for (int i = 0; i < threadNum; i++) {
+                for (int i = 0; i < quantThreads; i++) {
                     pool->PushOp(startTid + i, ops[i]);
                 }
-                for (int i = 0; i < threadNum; i++) {
+                for (int i = 0; i < quantThreads; i++) {
                     pool->Wait(startTid + i);
                     delete ops[i];
                 }

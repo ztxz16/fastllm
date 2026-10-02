@@ -1,0 +1,189 @@
+{
+  "date": "2026-10-01",
+  "hardware": {
+    "cpu": "AMD EPYC 9374F, NUMA 0",
+    "cuda_ordinal_0": "NVIDIA GeForce RTX 4090 24 GiB (physical index 1)"
+  },
+  "model": "/home/tf/hfmodels/DeepSeek-V4.1-Flash-Q2_K-Mixed",
+  "config": {
+    "cpu_affinity": "0-31",
+    "numa_memory_node": 0,
+    "threads": 28,
+    "moe_device": "disk",
+    "moe_cpu_cache_gib": 64,
+    "ngram_device": "disk",
+    "device": "cuda:0",
+    "dtype": "float16",
+    "kv_cache_dtype": "bfloat16",
+    "fast_prefill": true,
+    "chunked_prefill_size": 4096,
+    "max_batch": 1,
+    "dspark_block_size": 5,
+    "prefix_cache": false,
+    "sampling": "greedy"
+  },
+  "changes": [
+    "AVX2 Q2_K/Q4_K R4 bit rearrangement without scalar expansion; packed layout byte-exact.",
+    "Prepare CPU-only V4.1 GGML experts in the existing one-expert SSD prefetch worker, in-place.",
+    "Quantize tiny GGML input batches on the caller and cap larger quantization waves at the number of rows."
+  ],
+  "before_library_sha256": "631b1fcad69cbee69611c8080d5f587505f879cf5eeb22e3ab1f9454cf3bb326",
+  "after_library_sha256": "ded28b9d41d77b97d23d17accd5469987216cc884a18ecebf677fe5d3a69d9a9",
+  "prompt": "写一个 Python 模块，包含 is_prime(n) 和 first_primes(count) 两个函数，再给出五条 assert 测试。只输出代码，不要解释。",
+  "input_tokens": 41,
+  "output_tokens": 192,
+  "decode_comparison": {
+    "dspark_off": {
+      "before_decode_tps": 2.2515279933786845,
+      "after_decode_tps": 3.6718240076171154,
+      "speed_ratio": 1.6308142818633617,
+      "before_ttft_seconds": 29.687916583490733,
+      "after_ttft_seconds": 15.502065068001684,
+      "before_total_seconds": 114.52391774299758,
+      "after_total_seconds": 67.5504938410013,
+      "before_decode_tps_runs": [
+        2.2360992418500945,
+        2.2669567449072745
+      ],
+      "after_decode_tps_runs": [
+        3.7598371613254975,
+        3.583810853908733
+      ],
+      "after_accept_rate": null
+    },
+    "dspark_on": {
+      "before_decode_tps": 1.5967658659784503,
+      "after_decode_tps": 2.7761561812121767,
+      "speed_ratio": 1.7386119282497507,
+      "before_ttft_seconds": 29.300878022993857,
+      "after_ttft_seconds": 15.42818810800236,
+      "before_total_seconds": 148.9559550559934,
+      "after_total_seconds": 84.22959536100097,
+      "before_decode_tps_runs": [
+        1.6250923370563994,
+        1.5684393949005009
+      ],
+      "after_decode_tps_runs": [
+        2.7686578715370547,
+        2.7836544908872987
+      ],
+      "after_accept_rate": 0.6181818181818182
+    }
+  },
+  "microbench": {
+    "matrix_bank": 32,
+    "threads": 28,
+    "q2_gate_shape": [
+      4608,
+      5120
+    ],
+    "q4_down_shape": [
+      5120,
+      2304
+    ],
+    "before_repack_ms": {
+      "0": 5.632821,
+      "1": 2.381244
+    },
+    "after_repack_ms": {
+      "0": 0.590595,
+      "1": 0.659023
+    },
+    "repack_speed_ratios": [
+      9.537535874838087,
+      3.613294224936004
+    ]
+  },
+  "profiled_merge_moe": {
+    "operator": "MergeMOE",
+    "before_plain_ms": 424.3679350052356,
+    "after_plain_ms": 254.46800861256546,
+    "plain_speed_ratio": 1.6676671355233006,
+    "before_verify_ms": 2185.7101620588237,
+    "after_verify_ms": 1235.445671,
+    "verify_speed_ratio": 1.769167364753204
+  },
+  "profiled_cpu_linear_before_after_note": "The old CpuLinear timing includes cold repack; the new timing excludes preparation done by the prefetch worker. Use full MergeMOE and end-to-end timings for net gains.",
+  "profiled_repack": {
+    "profile_code_off/plain": {
+      "calls": {
+        "q2": 4469,
+        "q4": 4469
+      },
+      "ms_per_call": {
+        "q2": 0.6275922745580668,
+        "q4": 0.6971252993958379
+      },
+      "sum_ms_per_output_token": 30.995616952879583
+    },
+    "profile_code_on/plain": {
+      "calls": {
+        "q2": 221,
+        "q4": 221
+      },
+      "ms_per_call": {
+        "q2": 0.6403753484162895,
+        "q4": 0.7152890859728507
+      },
+      "sum_ms_per_output_token": 1.5685960209424084
+    },
+    "profile_code_on/verify": {
+      "calls": {
+        "q2": 6446,
+        "q4": 6446
+      },
+      "ms_per_call": {
+        "q2": 0.6441855738442445,
+        "q4": 0.7250626886441204
+      },
+      "sum_ms_per_output_token": 46.21033664921466
+    }
+  },
+  "ssd_reads_identical_per_profile_phase": true,
+  "profile_accept_rate": 0.6181818181818182,
+  "mean_verify_input_rows": 5.313725490196078,
+  "mean_verify_committed_rows": 3.6666666666666665,
+  "normal_peak_rss_gib": 75.69379425048828,
+  "normal_steady_rss_gib": [
+    70.77946853637695,
+    70.76567459106445,
+    70.7499771118164,
+    70.82996368408203
+  ],
+  "validation": {
+    "complete": true,
+    "args_match_before": true,
+    "prefix_cache_disabled_all_runs": true,
+    "same_192_token_output_before_after_off_on": true,
+    "after_library_matches_installed": true,
+    "expert_cache_budget_respected": true,
+    "cache_released": true,
+    "no_speculation_in_off_runs": true,
+    "dspark_verified_in_on_runs": true
+  },
+  "ctest_passed": [
+    "cpu_gguf_repack",
+    "cpu_gguf_iq4_nl",
+    "numas_v41_q2_moe",
+    "disk_v41_q2_moe",
+    "disk_v41_q2_moe_cuda_prefill",
+    "disk_moe_cache",
+    "disk_moe_cache_cuda",
+    "disk_moe_cache_cuda_prefill"
+  ],
+  "notes": [
+    "Unprofiled results are medians of two measured requests per mode; after runs include one warm-up per mode and alternate off/on order.",
+    "Unprofiled before values are from the previous same-task session, which also ran short-prompt benchmarks before the code task.",
+    "Normal and profiled outputs match the old 192-token outputs exactly; this is a fixed-length performance/correctness regression, not a full-model accuracy evaluation.",
+    "Operator comparison uses CUDA synchronization at each boundary and disables CUDA Graph, separately from normal throughput.",
+    "Operator timing covers all 40 target MoE layers. pread times can overlap computation; repack times include the prefetch thread and are not additive wall times.",
+    "DSpark remains slower than plain decode with this disk/cache configuration; keep --dspark 0 for deployment."
+  ],
+  "artifacts": {
+    "normal": "build-fastllm/dsv41-q2-dspark-opt-20261001/results.json",
+    "operators": "build-fastllm/dsv41-q2-dspark-opt-20261001/profile/operators.csv",
+    "profile_comparison": "build-fastllm/dsv41-q2-dspark-opt-20261001/profile/validation.json",
+    "ctest": "build-fastllm/dsv41-q2-dspark-opt-20261001/ctest-final.log"
+  },
+  "avx2_only_build_passed": true
+}

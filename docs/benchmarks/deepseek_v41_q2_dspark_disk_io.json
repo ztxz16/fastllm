@@ -1,0 +1,246 @@
+{
+  "date": "2026-10-01",
+  "model": "/home/tf/hfmodels/DeepSeek-V4.1-Flash-Q2_K-Mixed",
+  "hardware": {
+    "cpu": "AMD EPYC 9374F, NUMA 0",
+    "gpu": "RTX 4090 24 GiB, CUDA ordinal 0 / physical index 1"
+  },
+  "library_sha256": "68985b373f0b3421f9f1c3e2dd5b1f04876f6ac475e1d90a70902edb06b92f05",
+  "config": {
+    "threads": 28,
+    "device": "cuda:0",
+    "moe_device": "disk",
+    "moe_cpu_cache": 68719476736,
+    "ngram_device": "disk",
+    "dtype": "float16",
+    "kv_cache_dtype": "bfloat16",
+    "fast_prefill": true,
+    "chunked_prefill_size": 4096,
+    "max_batch": 1,
+    "dspark": 5,
+    "mtp": 0,
+    "speculative_dspark_confidence_threshold": 0.5
+  },
+  "cpu_affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31
+  ],
+  "numa_memory_node": 0,
+  "history_prefix_cache": false,
+  "sampling": "greedy",
+  "prompt": "写一个 Python 模块，包含 is_prime(n) 和 first_primes(count) 两个函数，再给出五条 assert 测试。只输出代码，不要解释。",
+  "input_tokens": 41,
+  "output_tokens": 192,
+  "warmup_requests": 2,
+  "measurement_order": [
+    "code_0_off",
+    "code_0_on",
+    "code_1_on",
+    "code_1_off",
+    "code_2_off",
+    "code_2_on"
+  ],
+  "ordinary_with_draft_weights_loaded": {
+    "requests": 3,
+    "decode_tps_median": 4.802704848730135,
+    "decode_tps_runs": [
+      4.802704848730135,
+      4.797883270601953,
+      5.018410236982337
+    ],
+    "ttft_seconds_median": 12.29652662499575,
+    "ttft_seconds_runs": [
+      12.157390976994066,
+      12.29652662499575,
+      12.514117330996669
+    ],
+    "total_seconds_median": 51.92743106499256,
+    "rss_gib_median": 70.71598815917969,
+    "peak_rss_gib": 70.80263900756836,
+    "peak_gpu_gib_physical_indices": [
+      0.8214111328125,
+      14.1182861328125
+    ],
+    "max_cpu_cache_gib": 63.99877458997071,
+    "physical_ssd_reads_gib": [
+      86.02121353149414,
+      86.54385375976562,
+      82.7111587524414
+    ],
+    "cpu_cache_hit_rates": [
+      0.8504156403940887,
+      0.8488300492610837,
+      0.8552032019704433
+    ],
+    "verify_rounds": 0,
+    "proposed_drafts": 0,
+    "accepted_drafts": 0,
+    "draft_accept_rate": null,
+    "tokens_per_verify_round": null
+  },
+  "dspark_5": {
+    "requests": 3,
+    "decode_tps_median": 3.6718464876015235,
+    "decode_tps_runs": [
+      3.6930023859230476,
+      3.62552755097501,
+      3.6718464876015235
+    ],
+    "ttft_seconds_median": 12.386215428996366,
+    "ttft_seconds_runs": [
+      12.44314463599585,
+      12.199979780009016,
+      12.386215428996366
+    ],
+    "total_seconds_median": 64.4043672849948,
+    "rss_gib_median": 70.66014862060547,
+    "peak_rss_gib": 70.87103652954102,
+    "peak_gpu_gib_physical_indices": [
+      0.8214111328125,
+      14.1182861328125
+    ],
+    "max_cpu_cache_gib": 63.99122168496251,
+    "physical_ssd_reads_gib": [
+      117.89623641967773,
+      121.94303894042969,
+      117.97664260864258
+    ],
+    "cpu_cache_hit_rates": [
+      0.8605534632389061,
+      0.8560122264068555,
+      0.8603569674144425
+    ],
+    "verify_rounds": 153,
+    "proposed_drafts": 660,
+    "accepted_drafts": 408,
+    "draft_accept_rate": 0.6181818181818182,
+    "tokens_per_verify_round": 3.6666666666666665
+  },
+  "fully_disabled_reference": {
+    "requests": 3,
+    "decode_tps_median": 4.901086247837075,
+    "decode_tps_runs": [
+      4.901086247837075,
+      4.8209606973869,
+      4.970349760518544
+    ],
+    "ttft_seconds_median": 12.349820994000765,
+    "ttft_seconds_runs": [
+      11.602634112001397,
+      12.382398347996059,
+      12.349820994000765
+    ],
+    "total_seconds_median": 50.77836104000744,
+    "rss_gib_median": 70.72391891479492,
+    "peak_rss_gib": 70.86141586303711,
+    "peak_gpu_gib_physical_indices": [
+      0.8214111328125,
+      12.8897705078125
+    ],
+    "max_cpu_cache_gib": 63.99877458997071,
+    "physical_ssd_reads_gib": [
+      80.23196792602539,
+      83.08638763427734,
+      82.65755462646484
+    ],
+    "cpu_cache_hit_rates": [
+      0.86251539408867,
+      0.8550646551724138,
+      0.8552647783251232
+    ],
+    "verify_rounds": 0,
+    "proposed_drafts": 0,
+    "accepted_drafts": 0,
+    "draft_accept_rate": null,
+    "tokens_per_verify_round": null
+  },
+  "previous_dspark_5_before_disk_io_optimization": {
+    "requests": 2,
+    "decode_tps_median": 2.7761561812121767,
+    "decode_tps_runs": [
+      2.7686578715370547,
+      2.7836544908872987
+    ],
+    "ttft_seconds_median": 15.42818810800236,
+    "ttft_seconds_runs": [
+      15.681894865992945,
+      15.174481350011774
+    ],
+    "total_seconds_median": 84.22959536100097,
+    "rss_gib_median": 70.75782585144043,
+    "peak_rss_gib": 70.94486618041992,
+    "peak_gpu_gib_physical_indices": [
+      0.8214111328125,
+      14.1182861328125
+    ],
+    "max_cpu_cache_gib": 63.99604797363281,
+    "physical_ssd_reads_gib": [
+      117.31999206542969,
+      121.60801315307617
+    ],
+    "cpu_cache_hit_rates": [
+      0.8610883685388352,
+      0.8562960537088586
+    ],
+    "verify_rounds": 102,
+    "proposed_drafts": 440,
+    "accepted_drafts": 272,
+    "draft_accept_rate": 0.6181818181818182,
+    "tokens_per_verify_round": 3.6666666666666665
+  },
+  "validation": {
+    "all_eight_requests_match_fully_disabled_192_token_reference": true,
+    "ordinary_requests_verify_rounds": 0,
+    "all_dspark_requests_executed_verification": true,
+    "cached_history_input_tokens": 0,
+    "max_cpu_cache_bytes": 68718160962,
+    "cache_fully_released": true
+  },
+  "artifacts": {
+    "current": "/home/tf/github/fastllm/build-fastllm/dsv41-q2-dspark-io-opt-20261001",
+    "fully_disabled_reference": "/home/tf/github/fastllm/build-fastllm/dsv41-q2-disk-opt2-20261001/aligned-v2",
+    "previous_dspark": "/home/tf/github/fastllm/build-fastllm/dsv41-q2-dspark-opt-20261001"
+  },
+  "notes": [
+    "No source or native-library changes in this retest; installed library includes the aligned expert-read and persistent prefetch-worker optimization.",
+    "DSpark 5, confidence threshold 0.5. Draft and target disk experts share the same 64 GiB CPU cache.",
+    "Main comparison uses the same loaded model and alternating ordinary/DSpark requests. output_token_least=1 suppresses speculation for ordinary controls; output_token_least=0 enables DSpark requests.",
+    "Two warmups followed by off/on, on/off, off/on measurements; median of three requests per mode. Each request has a fresh KV cache and disabled history/prefix cache.",
+    "Fully disabled reference was measured in the preceding turn with the same native library, --dspark 0 --mtp 0, no draft weights loaded, median of three repeats.",
+    "Previous DSpark 5 reference uses the older native library before disk-read optimization, median of two measurements.",
+    "This 41-token code prompt and output-token regression do not establish long-context speed or full model accuracy."
+  ],
+  "dspark_speed_ratio_vs_same_process_ordinary": 0.7645371937799555,
+  "dspark_speed_ratio_vs_fully_disabled": 0.7491903431044427,
+  "dspark_speed_ratio_vs_before_disk_io_optimization": 1.3226368575554182
+}

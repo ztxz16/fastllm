@@ -1,0 +1,382 @@
+{
+  "date": "2026-10-01",
+  "model": "/home/tf/hfmodels/DeepSeek-V4.1-Flash-Q2_K-Mixed",
+  "hardware": {
+    "cpu": "AMD EPYC 9374F, NUMA 0",
+    "gpu": "RTX 4090 24 GiB, CUDA ordinal 0 / physical index 1"
+  },
+  "library_sha256": "08b23f3ea06868f314bfba35f9f5f1848bf856a857deff641b63d55ac08a2cb3",
+  "before_library_sha256": "68985b373f0b3421f9f1c3e2dd5b1f04876f6ac475e1d90a70902edb06b92f05",
+  "config": {
+    "threads": 28,
+    "device": "cuda:0",
+    "moe_device": "disk",
+    "moe_cpu_cache": 68719476736,
+    "ngram_device": "disk",
+    "dtype": "float16",
+    "kv_cache_dtype": "bfloat16",
+    "fast_prefill": true,
+    "chunked_prefill_size": 4096,
+    "max_batch": 1,
+    "dspark": 5,
+    "mtp": 0,
+    "speculative_dspark_confidence_threshold": 0.5
+  },
+  "cpu_affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31
+  ],
+  "numa_memory_node": 0,
+  "history_prefix_cache": false,
+  "sampling": "greedy",
+  "prompt": "写一个 Python 模块，包含 is_prime(n) 和 first_primes(count) 两个函数，再给出五条 assert 测试。只输出代码，不要解释。",
+  "input_tokens": 41,
+  "output_tokens": 192,
+  "warmup_requests": 2,
+  "measurement_order": [
+    "code_0_off",
+    "code_0_on",
+    "code_1_on",
+    "code_1_off",
+    "code_2_off",
+    "code_2_on"
+  ],
+  "ordinary_with_draft_weights_loaded": {
+    "requests": 3,
+    "decode_tps_median": 5.707184950022387,
+    "decode_tps_runs": [
+      5.707184950022387,
+      5.667522744196929,
+      5.88900368031456
+    ],
+    "ttft_seconds_median": 11.049796882987721,
+    "ttft_seconds_runs": [
+      11.049796882987721,
+      11.429090107005322,
+      10.96213642298244
+    ],
+    "total_seconds_median": 44.51711154100485,
+    "rss_gib_median": 70.75082015991211,
+    "peak_rss_gib": 70.77391052246094,
+    "peak_gpu_gib_physical_indices": [
+      0.8214111328125,
+      14.1182861328125
+    ],
+    "max_cpu_cache_gib": 63.99877458997071,
+    "expert_disk_reads_gib": [
+      85.94776153564453,
+      86.46995544433594,
+      82.64053344726562
+    ],
+    "physical_ssd_reads_gib": [
+      86.02121353149414,
+      86.54385375976562,
+      82.7111587524414
+    ],
+    "verify_rounds": 0,
+    "proposed_drafts": 0,
+    "accepted_drafts": 0,
+    "draft_accept_rate": null
+  },
+  "dspark_5": {
+    "requests": 3,
+    "decode_tps_median": 4.242323462587389,
+    "decode_tps_runs": [
+      4.243829148253379,
+      4.161109186364914,
+      4.242323462587389
+    ],
+    "ttft_seconds_median": 10.972953354998026,
+    "ttft_seconds_runs": [
+      10.911500591988442,
+      11.259821416984778,
+      10.972953354998026
+    ],
+    "total_seconds_median": 55.9961516209878,
+    "rss_gib_median": 70.75883483886719,
+    "peak_rss_gib": 70.91880416870117,
+    "peak_gpu_gib_physical_indices": [
+      0.8214111328125,
+      14.1182861328125
+    ],
+    "max_cpu_cache_gib": 63.99122168496251,
+    "expert_disk_reads_gib": [
+      117.79438018798828,
+      121.8380355834961,
+      117.87471771240234
+    ],
+    "physical_ssd_reads_gib": [
+      117.89623641967773,
+      121.94303894042969,
+      117.97664260864258
+    ],
+    "verify_rounds": 153,
+    "proposed_drafts": 660,
+    "accepted_drafts": 408,
+    "draft_accept_rate": 0.6181818181818182
+  },
+  "before_ordinary_with_draft_weights_loaded": {
+    "requests": 3,
+    "decode_tps_median": 4.802704848730135,
+    "decode_tps_runs": [
+      4.802704848730135,
+      4.797883270601953,
+      5.018410236982337
+    ],
+    "ttft_seconds_median": 12.29652662499575,
+    "ttft_seconds_runs": [
+      12.157390976994066,
+      12.29652662499575,
+      12.514117330996669
+    ],
+    "total_seconds_median": 51.92743106499256,
+    "rss_gib_median": 70.71598815917969,
+    "peak_rss_gib": 70.80263900756836,
+    "peak_gpu_gib_physical_indices": [
+      0.8214111328125,
+      14.1182861328125
+    ],
+    "max_cpu_cache_gib": 63.99877458997071,
+    "expert_disk_reads_gib": [
+      85.94776153564453,
+      86.46995544433594,
+      82.64053344726562
+    ],
+    "physical_ssd_reads_gib": [
+      86.02121353149414,
+      86.54385375976562,
+      82.7111587524414
+    ],
+    "verify_rounds": 0,
+    "proposed_drafts": 0,
+    "accepted_drafts": 0,
+    "draft_accept_rate": null
+  },
+  "before_dspark_5": {
+    "requests": 3,
+    "decode_tps_median": 3.6718464876015235,
+    "decode_tps_runs": [
+      3.6930023859230476,
+      3.62552755097501,
+      3.6718464876015235
+    ],
+    "ttft_seconds_median": 12.386215428996366,
+    "ttft_seconds_runs": [
+      12.44314463599585,
+      12.199979780009016,
+      12.386215428996366
+    ],
+    "total_seconds_median": 64.4043672849948,
+    "rss_gib_median": 70.66014862060547,
+    "peak_rss_gib": 70.87103652954102,
+    "peak_gpu_gib_physical_indices": [
+      0.8214111328125,
+      14.1182861328125
+    ],
+    "max_cpu_cache_gib": 63.99122168496251,
+    "expert_disk_reads_gib": [
+      117.79438018798828,
+      121.8380355834961,
+      117.87471771240234
+    ],
+    "physical_ssd_reads_gib": [
+      117.89623641967773,
+      121.94303894042969,
+      117.97664260864258
+    ],
+    "verify_rounds": 153,
+    "proposed_drafts": 660,
+    "accepted_drafts": 408,
+    "draft_accept_rate": 0.6181818181818182
+  },
+  "changes": [
+    "CPU resident expert min-heap ordered by the original heat and last-use keys; rebuild once every 4096 touches when heat aging changes keys. GPU eviction selection remains unchanged.",
+    "Reuse exact-size aligned expert read allocations. At most four buffers, 16 MiB each, 32 MiB total. Retained buffers are workspace beyond the live expert cache budget; contents are overwritten and repacked on every read.",
+    "Track only actually freed allocations toward malloc_trim; release retained buffers when CPU cache is disabled or the last disk cache entry is unloaded."
+  ],
+  "validation": {
+    "all_eight_requests_match_previous_192_token_ids": true,
+    "all_eight_requests_have_identical_cache_hits_misses_evictions_and_read_bytes": true,
+    "all_eight_requests_have_identical_resident_cache_bytes": true,
+    "all_dspark_requests_have_identical_rounds_and_accepts": true,
+    "ordinary_requests_verify_rounds": 0,
+    "cached_history_input_tokens": 0,
+    "max_cpu_cache_bytes": 68718160962,
+    "pool_workspace_limit_bytes": 33554432,
+    "cache_fully_released": true,
+    "rss_gib_after_release": 1.6964263916015625,
+    "ctest_passed": [
+      "disk_moe_cache",
+      "disk_moe_cache_cuda",
+      "disk_moe_cache_cuda_prefill",
+      "numas_v41_q2_moe",
+      "disk_v41_q2_moe",
+      "disk_v41_q2_moe_cuda_prefill"
+    ]
+  },
+  "artifacts": {
+    "current": "/home/tf/github/fastllm/build-fastllm/dsv41-q2-dspark-cache-opt-20261001",
+    "before": "/home/tf/github/fastllm/build-fastllm/dsv41-q2-dspark-io-opt-20261001",
+    "operator": "/home/tf/github/fastllm/build-fastllm/dsv41-q2-dspark-cache-opt-20261001/operator"
+  },
+  "notes": [
+    "Uninstrumented throughput: same process, same model/draft weights, two warmups, alternating off/on, on/off, off/on measurements. Medians of three requests per mode.",
+    "output_token_least=1 suppresses speculation for ordinary controls; output_token_least=0 enables DSpark 5. Draft and target experts share the same 64 GiB live CPU cache.",
+    "Operator sampling separately synchronizes CUDA at operator boundaries and disables CUDA Graph; its throughput must not replace uninstrumented measurements.",
+    "This single 41-token prompt and 192-token equality check do not establish long-context speed or full-model accuracy. First-token time includes draft setup when enabled; no prefix/history reuse."
+  ],
+  "ordinary_speed_ratio_vs_before": 1.1883272301297885,
+  "dspark_speed_ratio_vs_before": 1.1553651485464211,
+  "dspark_speed_ratio_vs_same_process_ordinary": 0.7433302932596828,
+  "profile_validation": {
+    "plain_forward_frames": 382,
+    "verify_forward_frames": 102,
+    "all_target_frames_have_40_moe_calls": true,
+    "all_six_192_token_requests_match_ordinary_reference": true,
+    "verify_candidate_counts_match_trace_rows": true,
+    "accepted_counts_match_commit_rows": true,
+    "cache_within_64_gib": true,
+    "cache_released": true,
+    "expert_routes_and_io_counts_identical_to_before": true
+  },
+  "profile_comparison": {
+    "CacheMakeRoom": {
+      "plain": {
+        "before_ms_per_forward": 13.179976217277488,
+        "after_ms_per_forward": 0.1307425602094241
+      },
+      "verify": {
+        "before_ms_per_forward": 70.62787725490196,
+        "after_ms_per_forward": 0.6517394019607843
+      }
+    },
+    "MallocTrim": {
+      "plain": {
+        "before_ms_per_forward": 10.710099259162304,
+        "after_ms_per_forward": 0.19735991361256544
+      },
+      "verify": {
+        "before_ms_per_forward": 50.90500075490196,
+        "after_ms_per_forward": 1.2897105294117648
+      }
+    },
+    "before": {
+      "plain_moe_ms_per_target_forward": 199.14832862041885,
+      "verify_moe_ms_per_target_forward": 926.9960008333334,
+      "routed_expert_reuse": {
+        "off": {
+          "routed_gate_projections_per_target_forward": 240.0,
+          "routed_rows_per_selected_expert": 1.0,
+          "routed_rows": 91680,
+          "routed_gate_projections": 91680
+        },
+        "verify": {
+          "routed_gate_projections_per_target_forward": 855.3333333333334,
+          "routed_rows_per_selected_expert": 1.4909907844665535,
+          "routed_rows": 130080,
+          "routed_gate_projections": 87244
+        }
+      },
+      "io_repack_detail": {
+        "plain": {
+          "frames": 382,
+          "pread_ms_per_forward": 92.41827778272251,
+          "pread_mib_per_forward": 321.9915413581888,
+          "pread_calls_per_forward": 166.39005235602093,
+          "large_copy_ms_per_forward": 3.434336154450262,
+          "large_copy_mib_per_forward": 119.16312172774869,
+          "q2_repack_ms_per_forward": 12.891733316753928,
+          "q4_repack_ms_per_forward": 17.716601431937175,
+          "q2_repack_calls_per_forward": 23.463350785340314,
+          "q4_repack_calls_per_forward": 23.463350785340314
+        },
+        "verify": {
+          "frames": 102,
+          "pread_ms_per_forward": 472.4818358333333,
+          "pread_mib_per_forward": 1779.299364276961,
+          "pread_calls_per_forward": 890.9313725490196,
+          "large_copy_ms_per_forward": 19.72466119607843,
+          "large_copy_mib_per_forward": 665.5491727941177,
+          "q2_repack_ms_per_forward": 75.50417992156864,
+          "q4_repack_ms_per_forward": 102.37036159803921,
+          "q2_repack_calls_per_forward": 129.65686274509804,
+          "q4_repack_calls_per_forward": 129.65686274509804
+        }
+      }
+    },
+    "after": {
+      "plain_moe_ms_per_target_forward": 161.78693667801048,
+      "verify_moe_ms_per_target_forward": 790.887206882353,
+      "routed_expert_reuse": {
+        "off": {
+          "routed_gate_projections_per_target_forward": 240.0,
+          "routed_rows_per_selected_expert": 1.0,
+          "routed_rows": 91680,
+          "routed_gate_projections": 91680
+        },
+        "verify": {
+          "routed_gate_projections_per_target_forward": 855.3333333333334,
+          "routed_rows_per_selected_expert": 1.4909907844665535,
+          "routed_rows": 130080,
+          "routed_gate_projections": 87244
+        }
+      },
+      "io_repack_detail": {
+        "plain": {
+          "frames": 382,
+          "pread_ms_per_forward": 71.28509270157068,
+          "pread_mib_per_forward": 321.9915413581888,
+          "pread_calls_per_forward": 166.39005235602093,
+          "large_copy_ms_per_forward": 3.6078878193717276,
+          "large_copy_mib_per_forward": 119.16312172774869,
+          "q2_repack_ms_per_forward": 13.449286740837698,
+          "q4_repack_ms_per_forward": 18.371378659685867,
+          "q2_repack_calls_per_forward": 23.463350785340314,
+          "q4_repack_calls_per_forward": 23.463350785340314
+        },
+        "verify": {
+          "frames": 102,
+          "pread_ms_per_forward": 394.52372910784317,
+          "pread_mib_per_forward": 1779.299364276961,
+          "pread_calls_per_forward": 890.9313725490196,
+          "large_copy_ms_per_forward": 20.367881088235293,
+          "large_copy_mib_per_forward": 665.5491727941177,
+          "q2_repack_ms_per_forward": 78.43198770588235,
+          "q4_repack_ms_per_forward": 106.53799029411765,
+          "q2_repack_calls_per_forward": 129.65686274509804,
+          "q4_repack_calls_per_forward": 129.65686274509804
+        }
+      }
+    }
+  }
+}

@@ -507,6 +507,88 @@ mul_mat_t GetMulMatFunction(ggml_type type, int nrc_y) {
 
 // #define HAVE_FANCY_SIMD
 
+// Interleave four rows without expanding their packed quants to 256 bytes.
+// Each 128-bit lane contains a four-byte group for one half of the block.
+static inline void store_r4_groups(uint8_t * dst, const __m256i * rows, int half_stride) {
+    const auto a = _mm256_unpacklo_epi32(rows[0], rows[1]);
+    const auto b = _mm256_unpacklo_epi32(rows[2], rows[3]);
+    const auto packed = _mm256_unpacklo_epi64(a, b);
+    _mm_storeu_si128((__m128i *)dst, _mm256_castsi256_si128(packed));
+    _mm_storeu_si128((__m128i *)(dst + half_stride), _mm256_extracti128_si256(packed, 1));
+}
+
+static inline void repack_q2_k_block(const block_q2_K * const * x, int ibl, block_q2_k_r4 & y) {
+    __m128i scales[4];
+    for (int k = 0; k < 4; ++k) {
+        y.d[k] = x[k][ibl].d;
+        y.d[k + 4] = x[k][ibl].dmin;
+        scales[k] = _mm_loadu_si128((const __m128i *)x[k][ibl].scales);
+    }
+    const auto lo01 = _mm_unpacklo_epi8(scales[0], scales[1]);
+    const auto lo23 = _mm_unpacklo_epi8(scales[2], scales[3]);
+    const auto hi01 = _mm_unpackhi_epi8(scales[0], scales[1]);
+    const auto hi23 = _mm_unpackhi_epi8(scales[2], scales[3]);
+    _mm_storeu_si128((__m128i *)(y.scales +  0), _mm_unpacklo_epi16(lo01, lo23));
+    _mm_storeu_si128((__m128i *)(y.scales + 16), _mm_unpackhi_epi16(lo01, lo23));
+    _mm_storeu_si128((__m128i *)(y.scales + 32), _mm_unpacklo_epi16(hi01, hi23));
+    _mm_storeu_si128((__m128i *)(y.scales + 48), _mm_unpackhi_epi16(hi01, hi23));
+
+    const auto transpose = _mm256_setr_epi8(
+        0,4,8,12, 1,5,9,13, 2,6,10,14, 3,7,11,15,
+        0,4,8,12, 1,5,9,13, 2,6,10,14, 3,7,11,15);
+    const auto gather = _mm256_setr_epi8(
+        0,4,8,12, -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1,
+        0,4,8,12, -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1);
+    const auto mask = _mm256_set1_epi8(3);
+    const auto powers = _mm256_set1_epi32(0x40100401);
+    const auto ones = _mm256_set1_epi16(1);
+    for (int half = 0; half < 2; ++half) {
+        __m256i source[4];
+        for (int k = 0; k < 4; ++k)
+            source[k] = _mm256_shuffle_epi8(_mm256_loadu_si256(
+                (const __m256i *)(x[k][ibl].qs + 32 * half)), transpose);
+        for (int plane = 0; plane < 4; ++plane) {
+            __m256i rows[4];
+            for (int k = 0; k < 4; ++k) {
+                const auto values = _mm256_and_si256(_mm256_srl_epi16(
+                    source[k], _mm_cvtsi32_si128(2 * plane)), mask);
+                rows[k] = _mm256_shuffle_epi8(_mm256_madd_epi16(
+                    _mm256_maddubs_epi16(values, powers), ones), gather);
+            }
+            store_r4_groups(y.qs + 32 * (4 * half + plane), rows, 16);
+        }
+    }
+}
+
+static inline void repack_q4_k_quants(const block_q4_K * const * x, int ibl, block_q4_k_r4 & y) {
+    const auto pairs = _mm256_setr_epi8(
+        0,8,1,9,2,10,3,11, 4,12,5,13,6,14,7,15,
+        0,8,1,9,2,10,3,11, 4,12,5,13,6,14,7,15);
+    const auto gather = _mm256_setr_epi8(
+        0,2,4,6,8,10,12,14, -1,-1,-1,-1,-1,-1,-1,-1,
+        0,2,4,6,8,10,12,14, -1,-1,-1,-1,-1,-1,-1,-1);
+    const auto mask = _mm256_set1_epi8(15);
+    const auto powers = _mm256_set1_epi16(0x1001);
+    for (int block = 0; block < 4; ++block) {
+        __m256i source[4];
+        for (int k = 0; k < 4; ++k)
+            source[k] = _mm256_shuffle_epi8(_mm256_loadu_si256(
+                (const __m256i *)(x[k][ibl].qs + 32 * block)), pairs);
+        for (int plane = 0; plane < 2; ++plane) {
+            __m256i rows[4];
+            for (int k = 0; k < 4; ++k) {
+                const auto values = _mm256_and_si256(_mm256_srl_epi16(
+                    source[k], _mm_cvtsi32_si128(4 * plane)), mask);
+                rows[k] = _mm256_shuffle_epi8(_mm256_maddubs_epi16(values, powers), gather);
+            }
+            uint8_t * dst = y.qs + 64 * (2 * block + plane);
+            store_r4_groups(dst, rows, 16);
+            for (auto & row : rows) row = _mm256_srli_si256(row, 4);
+            store_r4_groups(dst + 32, rows, 16);
+        }
+    }
+}
+
 inline uint8_t scrambled_sign(uint8_t s) {
     static const uint8_t k_table[128] = {
         0x00, 0x7f, 0x7e, 0x01, 0x7c, 0x03, 0x02, 0x7d, 0x78, 0x07, 0x06, 0x79, 0x04, 0x7b, 0x7a, 0x05,
@@ -638,46 +720,15 @@ static void repack_iq3_xxs(int nrows, int n_per_row, const block_iq3_xxs * x, bl
     }
 }
 
-inline void convert_q2_k(const block_q2_K& x, uint8_t * L) {
-    const uint8_t * qs = x.qs;
-    for (int n = 0; n < QK_K; n += 128) {
-        for (int j = 0; j < 32; ++j) {
-            L[n + j +  0] = (qs[j] >> 0) & 0x3;
-            L[n + j + 32] = (qs[j] >> 2) & 0x3;
-            L[n + j + 64] = (qs[j] >> 4) & 0x3;
-            L[n + j + 96] = (qs[j] >> 6) & 0x3;
-        }
-        qs += 32;
-    }
-}
-
 static void repack_q2_k(int nrows, int n_per_row, const block_q2_K * x, block_q2_k_r4 * y, [[maybe_unused]] bool online) {
-    // printf("into repack_q2_k %d %d\n", nrows, n_per_row);
-    // while (1);
     assert(nrows % 4 == 0);
     assert(n_per_row % QK_K == 0);
-    int nblock = n_per_row/QK_K;
-    const block_q2_K * x4[4];
-    uint8_t L[QK_K];
+    const int nblock = n_per_row / QK_K;
     for (int row = 0; row < nrows; row += 4) {
-        for (int k = 0; k < 4; ++k) x4[k] = x + nblock*k;
-        for (int ibl = 0; ibl < nblock; ++ibl) {
-            for (int k = 0; k < 4; ++k) {
-                y[ibl].d[k+0] = x4[k][ibl].d;
-                y[ibl].d[k+4] = x4[k][ibl].dmin;
-                for (int ib = 0; ib < QK_K/16; ++ib) {
-                    y[ibl].scales[4*ib+k] = x4[k][ibl].scales[ib];
-                }
-                convert_q2_k(x4[k][ibl], L);
-                for (int ib = 0; ib < QK_K/32; ++ib) {
-                    for (int i = 0; i < 4; ++i) {
-                        y[ibl].qs[32*ib+4*k+i+ 0] = ((L[32*ib+i+ 0] & 0x3) << 0) | ((L[32*ib+i+ 4] & 0x3) << 2) | ((L[32*ib+i+ 8] & 0x3) << 4) | ((L[32*ib+i+12] & 0x3) << 6);
-                        y[ibl].qs[32*ib+4*k+i+16] = ((L[32*ib+i+16] & 0x3) << 0) | ((L[32*ib+i+20] & 0x3) << 2) | ((L[32*ib+i+24] & 0x3) << 4) | ((L[32*ib+i+28] & 0x3) << 6);
-                    }
-                }
-            }
-        }
-        x += 4*nblock;
+        const block_q2_K * x4[4];
+        for (int k = 0; k < 4; ++k) x4[k] = x + nblock * k;
+        for (int ibl = 0; ibl < nblock; ++ibl) repack_q2_k_block(x4, ibl, y[ibl]);
+        x += 4 * nblock;
         y += nblock;
     }
 }
@@ -753,46 +804,29 @@ inline void get_scale_min_k4(int j, const uint8_t * q, uint8_t& d, uint8_t& m) {
         m = (q[j+4] >>  4) | ((q[j-0] >> 6) << 4);
     }
 }
-inline void convert_q4_k(const block_q4_K& x, uint8_t * L, uint8_t * Ld, uint8_t * Lm) {
-    for (int ib64 = 0; ib64 < QK_K/64; ++ib64) {
-        get_scale_min_k4(2*ib64+0, x.scales, Ld[2*ib64+0], Lm[2*ib64+0]);
-        get_scale_min_k4(2*ib64+1, x.scales, Ld[2*ib64+1], Lm[2*ib64+1]);
-        for (int j = 0; j < 32; ++j) {
-            L[64*ib64+j+ 0] = x.qs[32*ib64+j] & 0xf;
-            L[64*ib64+j+32] = x.qs[32*ib64+j] >>  4;
-        }
-    }
-}
-
 static void repack_q4_k(int nrows, int n_per_row, const block_q4_K * x, block_q4_k_r4 * y, [[maybe_unused]] bool online) {
-    assert(nrows%4 == 0);
-    assert(n_per_row%QK_K == 0);
-    int nblock = n_per_row/QK_K;
-    const block_q4_K * x4[4];
-    uint8_t L[QK_K], Ld[QK_K/32], Lm[QK_K/32];
+    assert(nrows % 4 == 0);
+    assert(n_per_row % QK_K == 0);
+    const int nblock = n_per_row / QK_K;
     for (int row = 0; row < nrows; row += 4) {
-        for (int k = 0; k < 4; ++k) x4[k] = x + nblock*k;
+        const block_q4_K * x4[4];
+        for (int k = 0; k < 4; ++k) x4[k] = x + nblock * k;
         for (int ibl = 0; ibl < nblock; ++ibl) {
-            std::memset(y[ibl].scales_l, 0, QK_K/8);
-            std::memset(y[ibl].scales_h, 0, QK_K/16);
+            std::memset(y[ibl].scales_h, 0, QK_K / 16);
             for (int k = 0; k < 4; ++k) {
-                y[ibl].d[k+0] = x4[k][ibl].d;
-                y[ibl].d[k+4] = x4[k][ibl].dmin;
-                convert_q4_k(x4[k][ibl], L, Ld, Lm);
-                for (int ib = 0; ib < QK_K/32; ++ib) {
-                    y[ibl].scales_l[4*ib+k] = (Ld[ib] & 0xf) | ((Lm[ib] & 0xf) << 4);
-                    uint8_t h = (Ld[ib] >> 4) | ((Lm[ib] >> 4) << 2);
-                    y[ibl].scales_h[(4*ib+k)%16] |= (h << 4*((4*ib+k)/16));
-                    for (int i = 0; i < 4; ++i) {
-                        y[ibl].qs[64*ib+4*k+i+ 0] = L[32*ib+i+ 0] | (L[32*ib+i+ 8] << 4);
-                        y[ibl].qs[64*ib+4*k+i+16] = L[32*ib+i+16] | (L[32*ib+i+24] << 4);
-                        y[ibl].qs[64*ib+4*k+i+32] = L[32*ib+i+ 4] | (L[32*ib+i+12] << 4);
-                        y[ibl].qs[64*ib+4*k+i+48] = L[32*ib+i+20] | (L[32*ib+i+28] << 4);
-                    }
+                y[ibl].d[k] = x4[k][ibl].d;
+                y[ibl].d[k + 4] = x4[k][ibl].dmin;
+                for (int ib = 0; ib < QK_K / 32; ++ib) {
+                    uint8_t d, m;
+                    get_scale_min_k4(ib, x4[k][ibl].scales, d, m);
+                    y[ibl].scales_l[4 * ib + k] = (d & 15) | ((m & 15) << 4);
+                    const uint8_t h = (d >> 4) | ((m >> 4) << 2);
+                    y[ibl].scales_h[(4 * ib + k) % 16] |= h << (4 * ((4 * ib + k) / 16));
                 }
             }
+            repack_q4_k_quants(x4, ibl, y[ibl]);
         }
-        x += 4*nblock;
+        x += 4 * nblock;
         y += nblock;
     }
 }
