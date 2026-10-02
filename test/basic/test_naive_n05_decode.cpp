@@ -141,7 +141,10 @@ static void TestBatchedTopK() {
     }
 }
 
-struct CacheOps : NaiveN05FlashModel { using NaiveN05FlashModel::AppendCache; };
+struct CacheOps : NaiveN05FlashModel {
+    using NaiveN05FlashModel::AppendCache;
+    using NaiveN05FlashModel::CacheReserveCapacity;
+};
 static void TestCache() {
     for (auto dims : {std::pair<int,int>{1536,1024}, {8,16}, {200,56}}) {
         Data key(BFLOAT16), value(BFLOAT16);
@@ -168,6 +171,90 @@ static void TestCache() {
         }
     }
 }
+
+static void TestCacheReservation() {
+    CacheOps model;
+    model.max_positions = 65536;
+    const int oldMaxTokens = GetMaxTokens();
+    struct RestoreLimit { int value; ~RestoreLimit() { SetMaxTokens(value); } } restore{oldMaxTokens};
+    SetMaxTokens(65536);
+    GenerationConfig config;
+    config.input_token_length = 32727;
+    config.output_token_limit = 256;
+    Require(model.CacheReserveCapacity(config) == 32982, "full request reservation lost chunked prompt length");
+    model.tokensLimit = 8192;
+    Require(model.CacheReserveCapacity(config) == 8192, "model token budget not respected");
+    model.tokensLimit = -1;
+    SetMaxTokens(16384);
+    Require(model.CacheReserveCapacity(config) == 16384, "configured token budget not respected");
+    SetMaxTokens(65536);
+    config.input_token_length = config.output_token_limit = std::numeric_limits<int>::max();
+    Require(model.CacheReserveCapacity(config) == 65536, "large generation limit overflowed reservation");
+    config.input_token_length = 512; config.output_token_limit = -1;
+    Require(model.CacheReserveCapacity(config) == 512, "unbounded output should still reserve known prompt");
+    config.input_token_length = 0;
+    Require(model.CacheReserveCapacity(config) == 0, "warmup without request metadata changed reservation");
+    ++checks;
+
+    // Cross the old 32768-token expansion boundary while preserving every
+    // logical row. A large physical capacity must not become logical length.
+    for (int width : {896, 512, 8}) {
+        const int prompt = quick ? 1405 : width == 8 ? 65519 : 32727;
+        const int decode = quick ? 12 : width == 8 ? 17 : 68;
+        config.input_token_length = prompt; config.output_token_limit = 256;
+        const int reserve = model.CacheReserveCapacity(config);
+        Data cache(BFLOAT16); std::vector<uint16_t> reference;
+        void *address = nullptr; int done = 0, seed = 300;
+        while (done < prompt + decode) {
+            const int rows = done < prompt ? std::min(512, prompt - done) : 1;
+            Data current(BFLOAT16); Upload(current, {1, rows, width}, seed++);
+            auto values = Read<uint16_t>(current);reference.insert(reference.end(), values.begin(), values.end());
+            CacheOps::AppendCache(cache, current, reserve);
+            if (address) Require(cache.cudaData == address, "reserved global cache grew inside request horizon");
+            address = cache.cudaData;done += rows;
+            Require(cache.dims == std::vector<int>({1,done,width}), "physical reservation changed logical KV length");
+            Require(cache.expansionDims[1] >= reserve && cache.isKVCache, "global cache capacity/flag incorrect");
+        }
+        Require(Read<uint16_t>(cache) == reference, "reserved global cache content differs");
+        ++checks;
+    }
+    // A restored prefix may already own a smaller allocation. Growing it once
+    // must preserve the prefix, and a later smaller hint must never truncate it.
+    {
+        Data cache(BFLOAT16), prefix(BFLOAT16), input(BFLOAT16);
+        Upload(prefix,{1,129,16},701);Upload(input,{1,257,16},702);
+        auto reference=Read<uint16_t>(prefix), tail=Read<uint16_t>(input);
+        reference.insert(reference.end(),tail.begin(),tail.end());
+        CacheOps::AppendCache(cache,prefix);
+        CacheOps::AppendCache(cache,input,1024);
+        auto address=cache.cudaData;
+        CacheOps::AppendCache(cache,input,0);
+        reference.insert(reference.end(),tail.begin(),tail.end());
+        Require(cache.cudaData==address && cache.dims[1]==643 && Read<uint16_t>(cache)==reference,
+                "restored-prefix reservation lost cache contents or shrank capacity");
+        ++checks;
+    }
+    // Sliding caches reserve only window-1 + a prefill chunk. Reuse the same
+    // pointers through mixed prefill/decode and verify the retained suffix.
+    {
+        Data key(BFLOAT16),value(BFLOAT16);std::vector<uint16_t> refK,refV;
+        void *kp=nullptr,*vp=nullptr;
+        for (int step=0;step<(quick?5:70);++step) {
+            int rows=step<3?512:step==3?471:1;
+            Data k(BFLOAT16),v(BFLOAT16);Upload(k,{1,rows,1536},900+step);Upload(v,{1,rows,1024},1000+step);
+            auto kr=Read<uint16_t>(k),vr=Read<uint16_t>(v);refK.insert(refK.end(),kr.begin(),kr.end());refV.insert(refV.end(),vr.begin(),vr.end());
+            CacheOps::AppendCache(key,k,127+rows);CacheOps::AppendCache(value,v,127+rows);
+            if(kp)Require(key.cudaData==kp && value.cudaData==vp,"sliding reservation reallocated between chunks");
+            kp=key.cudaData;vp=value.cudaData;
+            Require(key.expansionDims[1]==640 && value.expansionDims[1]==640,"sliding reservation grew to full context");
+            FastllmCudaNaiveTrimCache(key,value,127);
+            refK.erase(refK.begin(),refK.end()-127*1536);refV.erase(refV.begin(),refV.end()-127*1024);
+            Require(Read<uint16_t>(key)==refK && Read<uint16_t>(value)==refV,"reserved sliding suffix differs");
+        }
+        ++checks;
+    }
+}
+
 int main(int argc,char **argv) {
     int devices=0;if(cudaGetDeviceCount(&devices)!=cudaSuccess || !devices) return 77;
     try {
@@ -175,7 +262,7 @@ int main(int argc,char **argv) {
                 "usage: naive_n05_decode_test [--quick]");
         quick = argc == 2;
         SetThreads(4);
-        TestTopK(); TestBatchedTopK(); TestCache();
+        TestTopK(); TestBatchedTopK(); TestCache(); TestCacheReservation();
         Require(cudaDeviceSynchronize()==cudaSuccess,"CUDA final synchronization failed");
         std::printf("Naive decode regression passed: %d cases\n",checks);
     }catch(const std::exception&e){std::fprintf(stderr,"%s\n",e.what());return 1;}

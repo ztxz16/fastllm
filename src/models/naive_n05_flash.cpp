@@ -4,6 +4,7 @@
 #include "json11.hpp"
 #include "utils.h"
 #include <cmath>
+#include <climits>
 #ifdef USE_CUDA
 #include "devices/cuda/naive-n05-cuda.cuh"
 #include "devices/cuda/fastllm-cuda.cuh"
@@ -29,14 +30,30 @@ namespace {
     }
 }
 
-void NaiveN05FlashModel::AppendCache(Data &cache, Data &input) {
+int NaiveN05FlashModel::CacheReserveCapacity(const GenerationConfig &config) const {
+    // Like ChatGLM, reserve the request's prompt and bounded output in one
+    // allocation. Chunked prefill must use the full prompt length supplied by
+    // GenerationConfig, not the current chunk. Warmup/direct calls without
+    // this metadata keep the existing incremental allocation path.
+    if (config.input_token_length <= 0) return 0;
+    int64_t capacity = config.input_token_length;
+    if (config.output_token_limit > 0) capacity += (int64_t)config.output_token_limit - 1;
+    int limit = max_positions;
+    if (tokensLimit > 0) limit = std::min(limit, tokensLimit);
+    if (GetMaxTokens() > 0) limit = std::min(limit, GetMaxTokens());
+    return (int)std::min<int64_t>(capacity, limit);
+}
+
+void NaiveN05FlashModel::AppendCache(Data &cache, Data &input, int reserveCapacity) {
     int oldLength = cache.dims.empty() ? 0 : cache.dims[1];
     int length = oldLength + input.dims[1];
     cache.dataType = input.dataType;
     cache.UpdateUnitSize();
     cache.ToDevice(input.dataDevice, input.dataDeviceIds);
-    if (cache.expansionDims.empty() || cache.expansionDims[1] < length) {
-        cache.Expansion({1, ((length + 127) / 128) * 128, input.dims[2]});
+    const int64_t wanted = std::max(length, reserveCapacity);
+    if (cache.expansionDims.empty() || cache.expansionDims[1] < wanted) {
+        const int capacity = (int)std::min<int64_t>(INT_MAX, (wanted + 127) / 128 * 128);
+        cache.Expansion({1, capacity, input.dims[2]});
     }
     CatDirect(cache, input, 1);
     cache.isKVCache = true;
@@ -190,14 +207,15 @@ int NaiveN05FlashModel::Forward(
         std::vector<float> *retLogits) {
     if (draftEnabled)
         return ForwardDraft(inputIds, positionIds, pastKeyValues, generationConfig, lastTokens, retLogits);
-    Data logits = RunTarget(inputIds, positionIds, pastKeyValues, nullptr);
+    Data logits = RunTarget(inputIds, positionIds, pastKeyValues, generationConfig, nullptr);
     if (isIntermediateChunkedPrefill) return 0;
     return SampleTarget(logits, pastKeyValues, generationConfig, lastTokens, retLogits);
 }
 
 Data NaiveN05FlashModel::RunTarget(
         const Data &inputIds, const Data &positionIds,
-        std::vector<std::pair<Data, Data>> &pastKeyValues, TargetCapture *capture) {
+        std::vector<std::pair<Data, Data>> &pastKeyValues, const GenerationConfig &config,
+        TargetCapture *capture) {
 #ifndef USE_CUDA
     ErrorInFastLLM("Naive-N0.5 currently requires the CUDA backend for attention.");
     return Data();
@@ -208,6 +226,7 @@ Data NaiveN05FlashModel::RunTarget(
                     (int)pastKeyValues.size() == block_cnt,
                     "Naive-N0.5 expects one unpadded sequence and a complete KV cache.");
     int length = inputIds.dims[1];
+    const int reserveCapacity = CacheReserveCapacity(config);
     const int previousExactThreshold = FastllmCudaGetLinearExactBatchThreshold();
     struct RestoreExactThreshold {
         int value;
@@ -286,8 +305,13 @@ Data NaiveN05FlashModel::RunTarget(
         auto &pastKey = pastKeyValues[layer].first;
         auto &pastValue = pastKeyValues[layer].second;
         int localPast = pastKey.dims.empty() ? 0 : pastKey.dims[1];
-        AppendCache(pastKey, packed);
-        AppendCache(pastValue, v);
+        // Sliding layers retain only window-1 rows between chunks. Keep their
+        // reservation bounded even when the full request is very long.
+        const int layerCapacity = slidingLayers[layer]
+            ? (int)std::min<int64_t>(reserveCapacity, (int64_t)window - 1 + length)
+            : reserveCapacity;
+        AppendCache(pastKey, packed, layerCapacity);
+        AppendCache(pastValue, v, layerCapacity);
         Data noIndices;
         Data *selected = &noIndices;
         if (!slidingLayers[layer] && pastKey.dims[1] > indexTopK) {
