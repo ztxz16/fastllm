@@ -11,6 +11,11 @@
 #include <cmath>
 #include <vector>
 
+#if !defined(FASTLLM_CUDA_LEGACY_ONLY) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
+#define FASTLLM_NAIVE_SWA_FLASHINFER
+#include "naive-n05-swa-flashinfer.cuh"
+#endif
+
 namespace {
 using BF16 = __nv_bfloat16;
 __device__ float RoundBF16(float x) { return __bfloat162float(__float2bfloat16(x)); }
@@ -898,6 +903,24 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
         CheckLaunch();
         return;
     }
+#ifdef FASTLLM_NAIVE_SWA_FLASHINFER
+    // Match FlashInfer's bottom-right causal alignment. Tiny prefill blocks
+    // retain the original path; BF16 MMA requires aligned input rows.
+    if (queries >= 32 && (size_t)queries * heads >= 2048 &&
+        window == kSwaWindow && causal && !selected && pastLength == keys - queries &&
+        dim == kSwaQkDim && valueDim == kSwaValueDim && key.dims[2] % 8 == 0 &&
+        (size_t)query.cudaData % 16 == 0 && (size_t)key.cudaData % 16 == 0 &&
+        (size_t)value.cudaData % 16 == 0 && FastllmCudaFlashInferDataTypeSupported(DataType::BFLOAT16)) {
+        auto status = naive_swa_flashinfer::Run((const BF16 *)query.cudaData,
+            (const BF16 *)key.cudaData, (const BF16 *)value.cudaData,
+            sink.dims.empty() ? nullptr : (const float *)sink.cudaData,
+            (BF16 *)output.cudaData, queries, keys, heads, kvHeads, key.dims[2]);
+        AssertInFastLLM(status == cudaSuccess,
+            std::string("Naive SWA FlashInfer: ") + cudaGetErrorString(status));
+        CheckLaunch();
+        return;
+    }
+#endif
     if (count <= 256) {
         AttentionShort<<<dim3(heads, queries), 256>>>((const BF16 *)query.cudaData,
             (const BF16 *)key.cudaData, (const BF16 *)value.cudaData, selected,

@@ -432,6 +432,64 @@ static void TestAttentionGroupedScores() {
     }
 }
 
+// Standard causal SWA, including the learned zero-value sink, evaluated with
+// independent double-precision dots/softmax on sampled rows and output columns.
+// FlashInfer changes the reduction/rounding order, so compare numerically.
+static void TestAttentionSwa() {
+    struct Shape { int queries, past, padding, mode; float amplitude; };
+    for (auto s : {Shape{31,127,0,1,1}, Shape{32,0,0,0,1}, Shape{56,0,128,1,1},
+                   Shape{80,0,0,3,1}, Shape{33,127,0,2,1}, Shape{33,127,0,1,4},
+                   Shape{512,0,0,1,1}, Shape{512,127,0,1,1}, Shape{471,127,0,1,1}}) {
+        constexpr int heads=64, kvHeads=8, dim=192, valueDim=128;
+        int keys=s.past+s.queries, stride=kvHeads*dim+s.padding;
+        Data q(BFLOAT16),k(BFLOAT16),v(BFLOAT16),sink(FLOAT32),indices,out;
+        Upload(q,{1,s.queries,heads*dim},53); Upload(k,{1,keys,stride},71);
+        Upload(v,{1,keys,kvHeads*valueDim},113);
+        auto qb=Read<uint16_t>(q),kb=Read<uint16_t>(k),vb=Read<uint16_t>(v);
+        for (auto &x:qb) x=Float32ToBFloat16RNEBits(s.mode==3 ? 0 : FromBits(x)*s.amplitude);
+        for (auto &x:kb) x=Float32ToBFloat16RNEBits(s.mode==3 ? 0 : FromBits(x)*s.amplitude);
+        if (s.mode==3) for (auto &x:vb) x=Float32ToBFloat16RNEBits(.375f);
+        Require(cudaMemcpy(q.cudaData,qb.data(),qb.size()*2,cudaMemcpyHostToDevice)==cudaSuccess,"SWA query upload");
+        Require(cudaMemcpy(k.cudaData,kb.data(),kb.size()*2,cudaMemcpyHostToDevice)==cudaSuccess,"SWA key upload");
+        Require(cudaMemcpy(v.cudaData,vb.data(),vb.size()*2,cudaMemcpyHostToDevice)==cudaSuccess,"SWA value upload");
+        std::vector<float>bias(heads);
+        if (s.mode) {
+            sink.Resize({heads});sink.Allocate();
+            for (int h=0;h<heads;++h) bias[h]=s.mode==2 ? (h%3-1)*80.f : (h%5-2)*1.3f;
+            std::memcpy(sink.cpuData,bias.data(),heads*sizeof(float));sink.ToDevice(DataDevice::CUDA,{0},true);
+        }
+        FastllmCudaNaiveAttention(q,k,v,indices,sink,heads,kvHeads,dim,valueDim,s.past,128,out,true);
+        auto actual=Read<uint16_t>(out);
+        for (auto x:actual) Require(std::isfinite(FromBits(x)),"SWA nonfinite output");
+        double error=0,norm=0;
+        std::vector<int> rows = {0, s.queries / 2, s.queries - 1};
+        rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+        for (int row:rows) for (int h:{0,17,63}) {
+            int end=s.past+row+1,start=std::max(0,end-128);
+            std::vector<double>scores(end-start);double maximum=s.mode ? bias[h] : -INFINITY;
+            for (int z=start;z<end;++z) {
+                double dot=0;
+                for (int d=0;d<dim;++d)
+                    dot+=double(FromBits(qb[((size_t)row*heads+h)*dim+d]))*FromBits(kb[(size_t)z*stride+h/(heads/kvHeads)*dim+d]);
+                scores[z-start]=dot/std::sqrt(double(dim));maximum=std::max(maximum,scores[z-start]);
+            }
+            double denominator=s.mode ? std::exp(bias[h]-maximum) : 0;
+            for (auto &x:scores) { x=std::exp(x-maximum);denominator+=x; }
+            for (int d:{0,31,64,127}) {
+                double expected=0;
+                for (int z=start;z<end;++z)
+                    expected+=scores[z-start]*FromBits(vb[((size_t)z*kvHeads+h/(heads/kvHeads))*valueDim+d]);
+                expected/=denominator;
+                double got=FromBits(actual[((size_t)row*heads+h)*valueDim+d]);
+                Require(std::abs(got-expected)<=.012,"SWA differs from independent reference");
+                error+=(got-expected)*(got-expected);norm+=expected*expected;
+            }
+        }
+        Require(std::sqrt(error/std::max(norm,1e-30))<=.01,"SWA relative error exceeds 1 percent");
+        ++checks;
+    }
+}
+
 int main(int argc,char **argv) {
     int devices=0;if(cudaGetDeviceCount(&devices)!=cudaSuccess || !devices) return 77;
     if (argc == 2 && std::strcmp(argv[1], "--invalid-indexer") == 0) {
@@ -444,7 +502,7 @@ int main(int argc,char **argv) {
                 "usage: naive_n05_decode_test [--quick]");
         quick = argc == 2;
         SetThreads(4);
-        TestTopK(); TestBatchedTopK(); TestCache(); TestCacheReservation(); TestRopeWidths(); TestAttentionWidths(); TestAttentionSelectedValues(); TestAttentionGroupedScores();
+        TestTopK(); TestBatchedTopK(); TestCache(); TestCacheReservation(); TestRopeWidths(); TestAttentionWidths(); TestAttentionSelectedValues(); TestAttentionGroupedScores(); TestAttentionSwa();
         Require(cudaDeviceSynchronize()==cudaSuccess,"CUDA final synchronization failed");
         std::printf("Naive decode regression passed: %d cases\n",checks);
     }catch(const std::exception&e){std::fprintf(stderr,"%s\n",e.what());return 1;}
