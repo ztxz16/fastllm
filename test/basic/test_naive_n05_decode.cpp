@@ -439,7 +439,10 @@ static void TestAttentionSwa() {
     struct Shape { int queries, past, padding, mode; float amplitude; };
     for (auto s : {Shape{31,127,0,1,1}, Shape{32,0,0,0,1}, Shape{56,0,128,1,1},
                    Shape{80,0,0,3,1}, Shape{33,127,0,2,1}, Shape{33,127,0,1,4},
-                   Shape{512,0,0,1,1}, Shape{512,127,0,1,1}, Shape{471,127,0,1,1}}) {
+                   Shape{512,0,0,1,1}, Shape{512,127,0,1,1}, Shape{471,127,0,1,1},
+                   Shape{1,0,0,0,1}, Shape{1,31,0,1,1}, Shape{1,63,0,1,1},
+                   Shape{1,126,0,1,1}, Shape{1,127,0,0,1}, Shape{1,127,0,1,1},
+                   Shape{1,127,0,2,1}, Shape{1,127,0,3,1}, Shape{1,127,0,1,4}}) {
         constexpr int heads=64, kvHeads=8, dim=192, valueDim=128;
         int keys=s.past+s.queries, stride=kvHeads*dim+s.padding;
         Data q(BFLOAT16),k(BFLOAT16),v(BFLOAT16),sink(FLOAT32),indices,out;

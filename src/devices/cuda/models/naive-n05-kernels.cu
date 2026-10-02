@@ -892,21 +892,12 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
     int count = indices.dims.empty() ? (window ? std::min(window + (causal ? 0 : queries - 1), keys) : keys) : indices.dims[1];
     const int *selected = indices.dims.empty() ? nullptr : (const int *)indices.cudaData;
     Output(output, DataType::BFLOAT16, {1, queries, heads * valueDim});
-    if (queries == 1 && window == kSwaWindow && causal && !selected &&
-        keys > 0 && keys <= kSwaWindow && pastLength == keys - 1 &&
-        dim == kSwaQkDim && valueDim == kSwaValueDim && key.dims[2] == kvHeads * dim) {
-        AttentionSwaDecode<<<dim3(heads, 1, kSwaValueDim / kSwaOutputTile), kSwaThreads>>>(
-            (const BF16 *)query.cudaData,
-            (const BF16 *)key.cudaData, (const BF16 *)value.cudaData,
-            sink.dims.empty() ? nullptr : (const float *)sink.cudaData,
-            (BF16 *)output.cudaData, heads, kvHeads, keys);
-        CheckLaunch();
-        return;
-    }
 #ifdef FASTLLM_NAIVE_SWA_FLASHINFER
-    // Match FlashInfer's bottom-right causal alignment. Tiny prefill blocks
-    // retain the original path; BF16 MMA requires aligned input rows.
-    if (queries >= 32 && (size_t)queries * heads >= 2048 &&
+    // Match FlashInfer's bottom-right causal alignment. Full-window decode
+    // benefits with at least 64 Q heads and GQA 8; shorter windows stay on
+    // the dedicated decode kernel. BF16 MMA requires aligned input rows.
+    if (((queries >= 32 && (size_t)queries * heads >= 2048) ||
+         (queries == 1 && keys == kSwaWindow && heads >= 64 && heads / kvHeads == 8)) &&
         window == kSwaWindow && causal && !selected && pastLength == keys - queries &&
         dim == kSwaQkDim && valueDim == kSwaValueDim && key.dims[2] % 8 == 0 &&
         (size_t)query.cudaData % 16 == 0 && (size_t)key.cudaData % 16 == 0 &&
@@ -921,6 +912,17 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
         return;
     }
 #endif
+    if (queries == 1 && window == kSwaWindow && causal && !selected &&
+        keys > 0 && keys <= kSwaWindow && pastLength == keys - 1 &&
+        dim == kSwaQkDim && valueDim == kSwaValueDim && key.dims[2] == kvHeads * dim) {
+        AttentionSwaDecode<<<dim3(heads, 1, kSwaValueDim / kSwaOutputTile), kSwaThreads>>>(
+            (const BF16 *)query.cudaData,
+            (const BF16 *)key.cudaData, (const BF16 *)value.cudaData,
+            sink.dims.empty() ? nullptr : (const float *)sink.cudaData,
+            (BF16 *)output.cudaData, heads, kvHeads, keys);
+        CheckLaunch();
+        return;
+    }
     if (count <= 256) {
         AttentionShort<<<dim3(heads, queries), 256>>>((const BF16 *)query.cudaData,
             (const BF16 *)key.cudaData, (const BF16 *)value.cudaData, selected,
