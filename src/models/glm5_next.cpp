@@ -659,6 +659,8 @@ namespace fastllm {
         std::map<std::string,
                  std::vector<std::pair<std::string, DataType>>> result;
         const std::string layersPrefix = languagePrefix + "layers.";
+        const std::set<std::string> tensorNameSet(
+            tensorNames.begin(), tensorNames.end());
 
         for (const std::string &name : tensorNames) {
             if (name == languagePrefix + "embed_tokens.weight") {
@@ -744,8 +746,24 @@ namespace fastllm {
                  Glm5NextEndsWith(suffix, ".weight")) ||
                 (suffix.rfind("mlp.experts.", 0) == 0 &&
                  Glm5NextEndsWith(suffix, ".weight"))) {
-                result[name].emplace_back(
-                    name, DataType::DATA_AUTO_LINEAR);
+                DataType type = DataType::DATA_AUTO_LINEAR;
+                if (suffix.rfind("mlp.experts.", 0) == 0) {
+                    const std::string base = name.substr(
+                        0, name.size() - std::strlen(".weight"));
+                    const std::string device = SelectMoeDeviceForLayer(
+                        std::min(layer, block_cnt - 1));
+                    // Preserve ModelOpt's E4M3 block scales and separate
+                    // gate/up globals on resident CUDA experts. The loader
+                    // validates the source dtype before accepting this marker.
+                    // CPU/NUMA and tensor-parallel layouts retain their policy.
+                    // Scalar weight_scale_2 is absent from tensorNames;
+                    // the generic loader reads it from the safetensors index.
+                    if (device.rfind("cuda", 0) == 0 &&
+                        tensorNameSet.count(base + ".weight_scale")) {
+                        type = DataType::NVFP4_BLOCK_16_E4M3_PACKED;
+                    }
+                }
+                result[name].emplace_back(name, type);
                 continue;
             }
 

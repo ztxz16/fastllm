@@ -3406,7 +3406,7 @@ __global__ void FastllmGemvNVFP4Block16Kernel1MultiRow(InputT *A, uint8_t *B, Ou
         int blockEnd = min(blockStart + blockSize, m);
         const uint8_t *blockData = rowData + block * (PLANAR ? 8 : blockBytes);
         float scaleMagic = COMPACT ?
-            (FastllmCudaNVFP4E4M3ScaleToFloat(blockData[8]) * globalScale) * FastllmCudaNVFP4MagicScale() : SCALE_E8M0 ? FastllmCudaNVFP4E8M0ToMagicScale(blockData[scaleOffset])
+            (__fmul_rn(FastllmCudaNVFP4E4M3ScaleToFloat(blockData[8]), globalScale)) * FastllmCudaNVFP4MagicScale() : SCALE_E8M0 ? FastllmCudaNVFP4E8M0ToMagicScale(blockData[scaleOffset])
                                       : (PLANAR ? rowScales[block] : *(float*)(blockData + 8)) * FastllmCudaNVFP4MagicScale();
         int local = i - blockStart;
         int remaining = min(4, blockEnd - i);
@@ -3466,7 +3466,7 @@ __global__ void FastllmGemvNVFP4Block16Kernel1MultiRow(InputT *A, uint8_t *B, Ou
 // them load one consecutive uint32 each and exchange the words within the 4-lane
 // group. This turns three strided warp loads into one fully coalesced 12-byte/block
 // load and keeps the dot accumulator in a register until reduction.
-template <int THREAD_PER_BLOCK, bool PLANAR, typename InputT, typename OutputT, typename BiasT>
+template <int THREAD_PER_BLOCK, bool PLANAR, bool COMPACT, typename InputT, typename OutputT, typename BiasT>
 __global__ void FastllmGemvNVFP4Block16Kernel1Coalesced(
         const InputT * __restrict__ A, const uint8_t * __restrict__ B,
         OutputT * __restrict__ C, const BiasT * __restrict__ bias,
@@ -3484,21 +3484,36 @@ __global__ void FastllmGemvNVFP4Block16Kernel1Coalesced(
     const int blocks = (m + 15) / 16;
     const uint8_t *rowData = B + (PLANAR ? fastllm::NVFP4PlanarWeightOffset(row, blocks) : (size_t)row * perRow);
     const float *rowScales = PLANAR ? (const float *)(B + fastllm::NVFP4PlanarScaleOffset(row, blocks)) : nullptr;
+    const float globalScale = COMPACT ? *(const float *)rowData : 1.0f;
+    if (COMPACT) rowData += sizeof(float);
     float acc = 0.0f;
 
     for (int i = tid * 4; i < m; i += THREAD_PER_BLOCK * 4) {
-        const uint8_t *blockData = rowData + (size_t)(i >> 4) * (PLANAR ? 8 : 12);
-        const uint32_t loaded = PLANAR && laneInGroup == 2
-                ? __float_as_uint(rowScales[i >> 4])
-                : (laneInGroup < (PLANAR ? 2 : 3)
-                    ? *(const uint32_t *)(blockData + laneInGroup * 4) : 0u);
-        const unsigned int mask = __activemask();
-        const uint32_t weightWord0 = __shfl_sync(mask, loaded, groupBaseLane);
-        const uint32_t weightWord1 = __shfl_sync(mask, loaded, groupBaseLane + 1);
-        const uint32_t scaleWord = __shfl_sync(mask, loaded, groupBaseLane + 2);
-        const uint16_t packed4 = laneInGroup < 2
-                ? (uint16_t)(weightWord0 >> (laneInGroup * 16))
-                : (uint16_t)(weightWord1 >> ((laneInGroup - 2) * 16));
+        const uint8_t *blockData = rowData +
+            (size_t)(i >> 4) * (COMPACT ? 9 : (PLANAR ? 8 : 12));
+        uint16_t packed4;
+        float blockScale;
+        if constexpr (COMPACT) {
+            // Nine-byte blocks can be unaligned. Preserve the expanded
+            // kernel's dot products, thread count, and reduction order.
+            packed4 = uint16_t(blockData[laneInGroup * 2]) |
+                      (uint16_t(blockData[laneInGroup * 2 + 1]) << 8);
+            blockScale = __fmul_rn(
+                FastllmCudaNVFP4E4M3ScaleToFloat(blockData[8]), globalScale);
+        } else {
+            const uint32_t loaded = PLANAR && laneInGroup == 2
+                    ? __float_as_uint(rowScales[i >> 4])
+                    : (laneInGroup < (PLANAR ? 2 : 3)
+                        ? *(const uint32_t *)(blockData + laneInGroup * 4) : 0u);
+            const unsigned int mask = __activemask();
+            const uint32_t weightWord0 = __shfl_sync(mask, loaded, groupBaseLane);
+            const uint32_t weightWord1 = __shfl_sync(mask, loaded, groupBaseLane + 1);
+            const uint32_t scaleWord = __shfl_sync(mask, loaded, groupBaseLane + 2);
+            packed4 = laneInGroup < 2
+                    ? (uint16_t)(weightWord0 >> (laneInGroup * 16))
+                    : (uint16_t)(weightWord1 >> ((laneInGroup - 2) * 16));
+            blockScale = __uint_as_float(scaleWord);
+        }
 
         const uint8_t packed01 = packed4 & 0xFF;
         const uint8_t packed23 = packed4 >> 8;
@@ -3507,7 +3522,7 @@ __global__ void FastllmGemvNVFP4Block16Kernel1Coalesced(
         const float w2 = FastllmCudaNVFP4PseudoBFloat16ToFloat(packed23 & 0xF);
         const float w3 = FastllmCudaNVFP4PseudoBFloat16ToFloat(packed23 >> 4);
         const float blockSum = FastllmCudaNVFP4Dot4(A, i, w0, w1, w2, w3);
-        acc += blockSum * (__uint_as_float(scaleWord) * FastllmCudaNVFP4MagicScale());
+        acc += blockSum * (blockScale * FastllmCudaNVFP4MagicScale());
     }
 
 #pragma unroll
@@ -3595,12 +3610,12 @@ static void LaunchFastllmGemmNVFP4Block16(InputT *input, uint8_t *weight, Output
                                           BiasT *bias, int n, int m, int k, int perRow) {
     if (n == 1) {
         const int threads = FastllmCudaNVFP4Block16ThreadsPerRow(m);
-        if (!SCALE_E8M0 && !COMPACT && (m & 15) == 0) {
+        if (!SCALE_E8M0 && (m & 15) == 0) {
             if (threads == 128) {
-                FastllmGemvNVFP4Block16Kernel1Coalesced<128, PLANAR> <<< k, 128 >>>(
+                FastllmGemvNVFP4Block16Kernel1Coalesced<128, PLANAR, COMPACT> <<< k, 128 >>>(
                         input, weight, output, bias, m, k, perRow);
             } else {
-                FastllmGemvNVFP4Block16Kernel1Coalesced<64, PLANAR> <<< k, 64 >>>(
+                FastllmGemvNVFP4Block16Kernel1Coalesced<64, PLANAR, COMPACT> <<< k, 64 >>>(
                         input, weight, output, bias, m, k, perRow);
             }
             return;
@@ -3944,7 +3959,7 @@ __global__ void FastllmCudaNVFP4Block162HalfKernel(uint8_t *a, half *b, int m, i
         int block = i >> 4;
         int offset = i & 15;
         uint8_t *blockData = rowData + block * (compactScales ? 9 : (planar ? 8 : (8 + sizeof(float))));
-        float scale = compactScales ? FastllmCudaNVFP4E4M3ScaleToFloat(blockData[8]) * globalScale : planar ? rowScales[block] : *(float*)(blockData + 8);
+        float scale = compactScales ? __fmul_rn(FastllmCudaNVFP4E4M3ScaleToFloat(blockData[8]), globalScale) : planar ? rowScales[block] : *(float*)(blockData + 8);
         uint8_t packed = blockData[offset >> 1];
         uint8_t fp4 = (offset & 1) ? (packed >> 4) : (packed & 0xF);
         rowOut[i] = __float2half_rn(FastllmCudaNVFP4E2M1ToFloat(fp4) * scale);
@@ -3966,7 +3981,7 @@ __global__ void FastllmCudaNVFP4Block162BFloat16Kernel(uint8_t *a, __nv_bfloat16
         int block = i >> 4;
         int offset = i & 15;
         uint8_t *blockData = rowData + block * (compactScales ? 9 : (planar ? 8 : (8 + sizeof(float))));
-        float scale = compactScales ? FastllmCudaNVFP4E4M3ScaleToFloat(blockData[8]) * globalScale : planar ? rowScales[block] : *(float*)(blockData + 8);
+        float scale = compactScales ? __fmul_rn(FastllmCudaNVFP4E4M3ScaleToFloat(blockData[8]), globalScale) : planar ? rowScales[block] : *(float*)(blockData + 8);
         uint8_t packed = blockData[offset >> 1];
         uint8_t fp4 = (offset & 1) ? (packed >> 4) : (packed & 0xF);
         rowOut[i] = __float2bfloat16_rn(FastllmCudaNVFP4E2M1ToFloat(fp4) * scale);
