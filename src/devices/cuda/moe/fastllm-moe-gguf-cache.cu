@@ -4,7 +4,7 @@
 #define GGML_COMMON_DECL_CUDA
 #define GGML_COMMON_IMPL_CUDA
 #include "gguf.h"
-#include "fastllm-gguf-gemv.cuh"
+#include "../fastllm-gguf-gemv.cuh"
 #include "fastllm-cuda.cuh"
 #include "fastllm-moe-gguf-common.cuh"
 #include "fastllm-moe-gguf-q8.cuh"
