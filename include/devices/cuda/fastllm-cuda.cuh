@@ -1919,6 +1919,9 @@ bool FastllmCudaHalfMatMulFloatNVFP4(const fastllm::Data &input, fastllm::Data &
 bool FastllmCudaHalfMatMulFloatNVFP4Block16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaHalfMatMulFloatNVFP4Block16E8M0(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
+bool FastllmCudaFloatMatMulGGUFMMQ(const void *input, const void *weight,
+                                void *output, int weight_type,
+                                int n, int m, int k, void *stream);
 bool FastllmCudaHalfMatMulGGUFMMQ(const void *input, const void *weight,
                                  void *output, int ggmlType,
                                  int n, int m, int k, void *stream);

@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 #include <thread>
@@ -39,6 +40,10 @@ static std::unique_ptr<fastllm::Data> Weight(ggml_type type, int rows, int cols,
     for (size_t b = 0; b < d->GetBytes() / size; ++b) {
         uint8_t *p = d->cpuData + b * size;
         uint16_t scale = __half_as_ushort(__float2half_rn(0.00390625f * (1 + seed % 3)));
+        // IQ4_XS adds a signed 6-bit subscale. Keep random gate/down fixtures
+        // within FP16 range even when both stages use its extreme codes.
+        if (type == GGML_TYPE_IQ4_XS)
+            scale = __half_as_ushort(__float2half_rn(0.00390625f * (1 + seed % 3) / 32));
         if (type == GGML_TYPE_F32) { float f = float(int(state % 17) - 8) / 128; std::memcpy(p, &f, 4); }
         else if (type == GGML_TYPE_BF16) { uint16_t bf = 0x3b80; std::memcpy(p, &bf, 2); }
         else if (type == GGML_TYPE_IQ1_M) {
@@ -116,11 +121,13 @@ template<class T> static void CheckReference(ggml_type type, fastllm::DataType d
             if (useQ8) inputQ8 = Q8Reference(x.data() + r*hidden, hidden);
             std::vector<T> activated(inter);
             for (int i = 0; i < inter; ++i) {
-                double g = 0, u = 0;
+                double g = 0, u = 0, gMagnitude = 0, uMagnitude = 0;
                 for (int c = 0; c < hidden; ++c) {
                     const double value = useQ8 ? inputQ8[c] : float(x[r*hidden+c]);
-                    g += (useQ8 ? gu[i*hidden+c] : float(Cast<T>(gu[i*hidden+c]))) * value;
-                    u += (useQ8 ? gu[(i+inter)*hidden+c] : float(Cast<T>(gu[(i+inter)*hidden+c]))) * value;
+                    const double gt = (useQ8 ? gu[i*hidden+c] : float(Cast<T>(gu[i*hidden+c]))) * value;
+                    const double ut = (useQ8 ? gu[(i+inter)*hidden+c] : float(Cast<T>(gu[(i+inter)*hidden+c]))) * value;
+                    g += gt; u += ut;
+                    gMagnitude += std::fabs(gt); uMagnitude += std::fabs(ut);
                 }
                 const float gf = float(Cast<T>(float(g))), uf = float(Cast<T>(float(u)));
                 activated[i] = Cast<T>(gf / (1 + std::exp(-gf)) * uf);
@@ -128,9 +135,18 @@ template<class T> static void CheckReference(ggml_type type, fastllm::DataType d
                     const T observed = actualGate[(r*topk+k)*inter+i];
                     const float tolerance = dtype == fastllm::FLOAT32 ? 0.0001f :
                         dtype == fastllm::FLOAT16 ? 0.002f : 0.02f;
+                    // A nearly cancelled dot can be amplified by the other
+                    // SwiGLU factor. Bound FP32 reduction error in the two
+                    // dots before comparing their nonlinear product.
+                    const double allowed = tolerance*std::max(1.0f, std::fabs(float(activated[i]))) +
+                        8*std::numeric_limits<float>::epsilon() *
+                        (std::fabs(uf)*gMagnitude + std::fabs(gf)*uMagnitude);
+                    if (!std::isfinite(float(observed)) ||
+                        std::fabs(float(observed)-float(activated[i])) > allowed)
+                        std::fprintf(stderr, "gate type=%d dtype=%d pass=%d row=%d route=%d col=%d g=%g u=%g expected=%g actual=%g\n",
+                            type, dtype, pass, r, k, i, gf, uf, float(activated[i]), float(observed));
                     Require(std::isfinite(float(observed)) &&
-                        std::fabs(float(observed)-float(activated[i])) <=
-                        tolerance*std::max(1.0f, std::fabs(float(activated[i]))),
+                        std::fabs(float(observed)-float(activated[i])) <= allowed,
                         "GGUF grouped gate/up disagrees with CPU decoded reference");
                     activated[i] = observed;
                 }
@@ -247,6 +263,55 @@ template<class T> static void Run(ggml_type type, fastllm::DataType dtype, int b
     Require(fastllm_moe_cuda_cache_stats(0, stats, false) && stats[2] == 0, "released GPU allocation counted");
     std::printf("PASS GGUF cache type=%d dtype=%d batch=%d: mixed layers, snapshot, cold/hot, eviction, duplicate/invalid routes, graph, release\n", type, dtype, batch);
 }
+// Validate the FP32 prefill entry against CPU-decoded weights and an
+// independent Q8 activation oracle. These formats all use MMQ's D4 layout.
+static void RunFloatMmq(ggml_type type, int batch, int columns, int width) {
+    auto weight = Weight(type, width, columns, 5, true);
+    const auto decoded = Decode(*weight);
+    weight->ToDevice(fastllm::CUDA, {0}, true);
+    fastllm::Data input(fastllm::FLOAT32, {batch, columns});
+    fastllm::Data output(fastllm::FLOAT32, {batch, width});
+    Gpu(input); Gpu(output);
+    std::vector<float> values(batch*columns), quantized(batch*columns);
+    for (int i = 0; i < batch*columns; ++i)
+        values[i] = i%columns < 32 ? 0 : .37f*std::sin(i*.173f)+.013f*std::cos(i*.71f);
+    for (int i = 0; i < batch*columns; i += 32) {
+        float maximum = 0;
+        for (int c = 0; c < 32; ++c) maximum = std::max(maximum, std::fabs(values[i+c]));
+        const float scale = maximum/127;
+        for (int c = 0; c < 32; ++c)
+            quantized[i+c] = maximum == 0 ? 0 : std::round(values[i+c]/scale)*scale;
+    }
+    Cuda(cudaMemcpy(input.cudaData, values.data(), values.size()*sizeof(float), cudaMemcpyHostToDevice));
+    Require(!FastllmCudaFloatMatMulGGUFMMQ(input.cudaData, weight->cudaData, output.cudaData,
+        type, 1, columns, width, cudaStreamPerThread), "MMQ stole single-token decode");
+    Require(!FastllmCudaFloatMatMulGGUFMMQ(input.cudaData, weight->cudaData, output.cudaData,
+        type, batch, columns-1, width, cudaStreamPerThread), "MMQ accepted a partial weight block");
+    Require(FastllmCudaFloatMatMulGGUFMMQ(input.cudaData, weight->cudaData, output.cudaData,
+        type, batch, columns, width, cudaStreamPerThread), "FP32 MMQ rejected valid prefill");
+    Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+    std::vector<float> actual(batch*width);
+    Cuda(cudaMemcpy(actual.data(), output.cudaData, actual.size()*sizeof(float), cudaMemcpyDeviceToHost));
+    for (int row = 0; row < batch; ++row) for (int col = 0; col < width; ++col) {
+        double reference = 0, magnitude = 0;
+        for (int c = 0; c < columns; ++c) {
+            const double term = double(decoded[col*columns+c])*quantized[row*columns+c];
+            reference += term; magnitude += std::fabs(term);
+        }
+        Require(std::isfinite(actual[row*width+col]) &&
+            std::fabs(actual[row*width+col]-reference) <= 2e-5*std::max(1.0, magnitude),
+            "FP32 MMQ disagrees with CPU decoded Q8 dot");
+    }
+    Require(FastllmCudaMatMulFloatGGUF(input, *weight, fastllm::Data(), output,
+        batch, columns, width), "FP32 GGUF Linear rejected prefill");
+    Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+    std::vector<float> dispatched(actual.size());
+    Cuda(cudaMemcpy(dispatched.data(), output.cudaData, dispatched.size()*sizeof(float), cudaMemcpyDeviceToHost));
+    for (size_t i = 0; i < actual.size(); ++i)
+        Require(std::fabs(actual[i]-dispatched[i]) <= 1e-6f*std::max(1.0f,std::fabs(actual[i])),
+                "FP32 GGUF Linear bypassed MMQ");
+}
+
 template<class T> static void RunResident(ggml_type type, fastllm::DataType dtype,
                                         int device, int hidden = 256, int inter = 256, int batch = 1,
                                         ggml_type downType = GGML_TYPE_Q2_0) {
@@ -293,7 +358,8 @@ template<class T> static void RunResident(ggml_type type, fastllm::DataType dtyp
     Require(!launch(), "resident metadata initialized during graph capture");
     Cuda(cudaStreamEndCapture(cudaStreamPerThread, &cold));
     Cuda(cudaGraphDestroy(cold));
-    const bool useQ8 = FastllmCudaMoeGGUFCacheQ8Supported(type, downType, hidden, inter);
+    const bool useQ8 = batch > 32 ||
+        FastllmCudaMoeGGUFCacheQ8Supported(type, downType, hidden, inter);
     cudaGraph_t graph{}; cudaGraphExec_t exec{};
     std::vector<int32_t> routes(batch*topk);
     for (int pass = 0; pass < 5; ++pass) {
@@ -734,6 +800,21 @@ int main(int argc, char **argv) {
             return 0;
         }
         bool tpOnly = argc > 1 && std::strcmp(argv[1], "--tp-shards") == 0;
+        if (argc > 1 && std::strcmp(argv[1], "--mmq") == 0) {
+            cudaDeviceProp properties{}; Cuda(cudaGetDeviceProperties(&properties, 0));
+            if (properties.major*10+properties.minor < 75) {
+                std::puts("FASTLLM_TEST_SKIP_NO_DEVICE: MMQ requires SM75+"); return 0;
+            }
+            for (auto type : {GGML_TYPE_Q2_0, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
+                              GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS}) {
+                RunFloatMmq(type, 9, 256, 47);
+                RunFloatMmq(type, 33, 256, 129);
+            }
+            RunFloatMmq(GGML_TYPE_IQ3_XXS, 65, 2560, 65);
+            RunFloatMmq(GGML_TYPE_IQ4_NL, 129, 320, 47);
+            RunFloatMmq(GGML_TYPE_Q2_0, 129, 320, 47);
+            std::puts("PASS: FP32 GGUF MMQ and Linear dispatch"); return 0;
+        }
         if (argc > 1 && std::strcmp(argv[1], "--grouped") == 0) {
             cudaDeviceProp properties{}; Cuda(cudaGetDeviceProperties(&properties, 0));
             if (properties.major*10+properties.minor < 75) {
@@ -750,6 +831,12 @@ int main(int argc, char **argv) {
             // Exercise both tails in the quantize-once/gather path.
             RunResident<__nv_bfloat16>(GGML_TYPE_Q2_0, fastllm::BFLOAT16, 0, 320, 192, 65);
             RunResident<float>(GGML_TYPE_Q2_0, fastllm::FLOAT32, 0, 64, 64, 33);
+            for (auto type : {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS}) {
+                RunResident<float>(type, fastllm::FLOAT32, 0, 256, 320, 33, GGML_TYPE_IQ4_NL);
+                RunResident<half>(type, fastllm::FLOAT16, 0, 256, 256, 65, type);
+            }
+            RunResident<__nv_bfloat16>(GGML_TYPE_IQ3_S, fastllm::BFLOAT16, 0, 256, 320, 33, GGML_TYPE_IQ4_NL);
+            RunResident<float>(GGML_TYPE_IQ4_NL, fastllm::FLOAT32, 0, 96, 32, 33, GGML_TYPE_IQ4_NL);
             for (auto type : {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S})
                 RunResident<float>(GGML_TYPE_Q2_0, fastllm::FLOAT32, 0, 256, 256, 33, type);
             if (count >= 2) {

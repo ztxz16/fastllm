@@ -54,8 +54,11 @@ namespace grouped_moe {
 static bool MatrixType(int type, int columns) {
     if (columns <= 0) return false;
     if (type == GGML_TYPE_Q2_0) return columns%64 == 0;
+    if (type == GGML_TYPE_IQ4_NL) return columns%32 == 0;
     return columns%256 == 0 && (type == GGML_TYPE_IQ2_XXS ||
-        type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_S);
+        type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_S ||
+        type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S ||
+        type == GGML_TYPE_IQ4_XS);
 }
 static size_t Align(size_t x) { return (x+255)&~size_t(255); }
 struct Workspace {
@@ -265,6 +268,7 @@ static void Matrix(int type, const uint8_t *const *weights, int part, Workspace 
     switch (type) {
 #define GROUPED_CASE(T) case GGML_TYPE_##T: LaunchMatrix<GGML_TYPE_##T>(weights, part, w, experts, columns, width, stream); break;
         GROUPED_CASE(Q2_0) GROUPED_CASE(IQ2_XXS) GROUPED_CASE(IQ2_XS) GROUPED_CASE(IQ2_S)
+        GROUPED_CASE(IQ3_XXS) GROUPED_CASE(IQ3_S) GROUPED_CASE(IQ4_NL) GROUPED_CASE(IQ4_XS)
 #undef GROUPED_CASE
     }
 }

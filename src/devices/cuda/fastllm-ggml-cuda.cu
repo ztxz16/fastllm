@@ -2501,17 +2501,21 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
     auto dequantFp16 = ggml_get_to_fp16_cuda(ggufType);
     auto has_vec_dot = get_has_vec_dot_q_cuda((ggml_type)weight.ggmlType);
     cudaStream_t stream = cudaStreamPerThread;
+    const bool usedMmq = !forceFp32Dequant && !allowSmallMmvq &&
+        FastllmCudaFloatMatMulGGUFMMQ(
+            cudaInput, weight.cudaData, cudaOutput, weight.ggmlType,
+            n, m, k, stream);
     // has_vec_dot covers only the legacy dispatcher. Try extended MMVQ
     // before the direct fallback so IQ2/IQ1 and Q4_0/Q4_1 are not shadowed.
-    const bool usedExtendedMmvq = (!forceFp32Dequant || allowSmallMmvq) &&
+    const bool usedExtendedMmvq = !usedMmq && (!forceFp32Dequant || allowSmallMmvq) &&
         FastllmCudaFloatMatMulGGUFMMVQ(
             cudaInput, weight.cudaData, cudaOutput, weight.ggmlType,
             n, m, k, stream);
-    const bool usedDirectGemv = n == 1 && !usedExtendedMmvq && !has_vec_dot &&
+    const bool usedDirectGemv = n == 1 && !usedMmq && !usedExtendedMmvq && !has_vec_dot &&
         FastllmGgufDirectGemv(cudaInput, weight.cudaData, cudaOutput,
                              ggufType, m, k, stream);
 
-    if (!usedDirectGemv && !usedExtendedMmvq &&
+    if (!usedDirectGemv && !usedMmq && !usedExtendedMmvq &&
         (forceFp32Dequant || n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) &&
         dequantFp32 != nullptr) {
         auto fastllmCublasHandle = getFastllmCublasHandle();
@@ -2546,7 +2550,7 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
                 throw("cublas error");
             }
         }
-    } else if (!usedDirectGemv && !usedExtendedMmvq &&
+    } else if (!usedDirectGemv && !usedMmq && !usedExtendedMmvq &&
                (n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) &&
                dequantFp16 != nullptr) {
         auto fastllmCublasHandle = getFastllmCublasHandle();
@@ -2590,7 +2594,7 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
                 throw("cublas error");
             }
         }
-    } else if (!usedDirectGemv && !usedExtendedMmvq) {
+    } else if (!usedDirectGemv && !usedMmq && !usedExtendedMmvq) {
         q8Input = (block_q8_1*)FastllmCudaMalloc(n * m * sizeof(half));
         quantize_row_q8_1_cuda (
             cudaInput, q8Input, m, n, 1, m, GGML_TYPE_Q8_1, stream

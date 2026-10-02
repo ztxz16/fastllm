@@ -934,9 +934,10 @@ static void launch_mul_mat_q_to_output(
 }
 
 static bool is_supported_type(ggml_type type) {
-    return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ||
+    return type == GGML_TYPE_Q2_0 || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ||
            type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q3_K ||
            type == GGML_TYPE_Q6_K || type == GGML_TYPE_IQ3_S ||
+           type == GGML_TYPE_IQ3_XXS ||
            type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q4_0 ||
            type == GGML_TYPE_Q4_1 || type == GGML_TYPE_Q8_0 ||
            type == GGML_TYPE_IQ2_XXS ||
@@ -948,8 +949,8 @@ template <typename InputType>
 static void launch_quantize(
         ggml_type type, const InputType *input,
         block_q8_1_mmq *quantized,
-        int rows, int cols, cudaStream_t stream) {
-    const dim3 blocks((cols + 4 * kQuantizeBlockSize - 1) /
+        int rows, int cols, int padded_cols, cudaStream_t stream) {
+    const dim3 blocks((padded_cols + 4 * kQuantizeBlockSize - 1) /
                           (4 * kQuantizeBlockSize),
                       rows, 1);
     const dim3 threads(kQuantizeBlockSize, 1, 1);
@@ -957,17 +958,17 @@ static void launch_quantize(
         case MMQ_Q8_1_DS_LAYOUT_D4:
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, InputType>
                 <<<blocks, threads, 0, stream>>>(
-                    input, quantized, cols, rows, cols);
+                    input, quantized, cols, rows, padded_cols);
             break;
         case MMQ_Q8_1_DS_LAYOUT_DS4:
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, InputType>
                 <<<blocks, threads, 0, stream>>>(
-                    input, quantized, cols, rows, cols);
+                    input, quantized, cols, rows, padded_cols);
             break;
         case MMQ_Q8_1_DS_LAYOUT_D2S6:
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6, InputType>
                 <<<blocks, threads, 0, stream>>>(
-                    input, quantized, cols, rows, cols);
+                    input, quantized, cols, rows, padded_cols);
             break;
     }
 }
@@ -998,6 +999,10 @@ static void launch_mmq(
         ggml_type type, ggml_backend_cuda_context &context,
         const mmq_args &args, OutputType *output, cudaStream_t stream) {
     switch (type) {
+        case GGML_TYPE_Q2_0:
+            launch_mmq_type<GGML_TYPE_Q2_0, OutputType>(
+                context, args, output, stream);
+            break;
         case GGML_TYPE_Q4_K:
             launch_mmq_type<GGML_TYPE_Q4_K, OutputType>(
                 context, args, output, stream);
@@ -1016,6 +1021,10 @@ static void launch_mmq(
             break;
         case GGML_TYPE_Q6_K:
             launch_mmq_type<GGML_TYPE_Q6_K, OutputType>(
+                context, args, output, stream);
+            break;
+        case GGML_TYPE_IQ3_XXS:
+            launch_mmq_type<GGML_TYPE_IQ3_XXS, OutputType>(
                 context, args, output, stream);
             break;
         case GGML_TYPE_IQ3_S:
@@ -1065,9 +1074,14 @@ static bool matmul(
         ggml_type type,
         int rows, int cols, int output_cols, cudaStream_t stream) {
     if (!is_supported_type(type) || rows <= 0 || cols <= 0 ||
-        cols % (4 * QK8_1) != 0 || output_cols <= 0) {
+        cols % ggml_blck_size(type) != 0 || output_cols <= 0) {
         return false;
     }
+    // Only these tile loaders guard a partial K tile. The quantized activation
+    // allocation must include its zero padding as well as the row-tile guard.
+    if (cols % MMQ_ITER_K != 0 &&
+        type != GGML_TYPE_Q2_0 && type != GGML_TYPE_IQ4_NL) return false;
+    const int padded_cols = ((cols + MMQ_ITER_K - 1) / MMQ_ITER_K) * MMQ_ITER_K;
 
     if (type == GGML_TYPE_IQ1_S) {
         ensure_iq1s_grid(stream);
@@ -1088,7 +1102,7 @@ static bool matmul(
     // guard region for the same reason. Its values need not be initialized:
     // they belong only to output rows masked by the checked write-back path.
     const size_t quantized_payload_count =
-        static_cast<size_t>(rows) * cols / (4 * QK8_1);
+        static_cast<size_t>(rows) * padded_cols / (4 * QK8_1);
     const size_t quantized_count = quantized_payload_count +
         static_cast<size_t>(get_mmq_x_max_host(
             ggml_cuda_info().devices[device].cc));
@@ -1107,16 +1121,16 @@ static bool matmul(
         return false;
     }
 
-    launch_quantize(type, input, quantized, rows, cols, stream);
+    launch_quantize(type, input, quantized, rows, cols, padded_cols, stream);
 
     mmq_args args{};
     args.x = static_cast<const char *>(weight);
     args.y = reinterpret_cast<const char *>(quantized);
     args.dst = float_output;
-    args.ne00 = cols;
+    args.ne00 = padded_cols;
     args.ne01 = output_cols;
     args.stride01 = ggml_row_size(type, cols);
-    args.ne10 = cols;
+    args.ne10 = padded_cols;
     args.ne11 = rows;
     args.stride11 = rows;
     args.ne0 = output_cols;
@@ -1132,6 +1146,15 @@ static bool matmul(
 #include "fastllm-gguf-moe-grouped.cuh"
 
 } // namespace fastllm_gguf_mmq
+
+bool FastllmCudaFloatMatMulGGUFMMQ(
+        const void *input, const void *weight, void *output, int weight_type,
+        int n, int m, int k, void *stream) {
+    return fastllm_gguf_mmq::matmul(
+        static_cast<const float *>(input), weight, static_cast<float *>(output),
+        static_cast<ggml_type>(weight_type), n, m, k,
+        reinterpret_cast<cudaStream_t>(stream));
+}
 
 bool FastllmCudaHalfMatMulGGUFMMQ(
         const void *input, const void *weight, void *output, int weight_type,

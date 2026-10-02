@@ -63,6 +63,7 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
             return MMQ_Q8_1_DS_LAYOUT_DS4;
         case GGML_TYPE_Q6_0:
             return MMQ_Q8_1_DS_LAYOUT_D4;
+        case GGML_TYPE_Q2_0:
         case GGML_TYPE_Q8_0:
             return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_Q2_K:
@@ -194,6 +195,7 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
         case GGML_TYPE_Q5_0    : return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_Q5_1    : return MMQ_DP4A_TXS_Q8_1;
         case GGML_TYPE_Q6_0    : return MMQ_DP4A_TXS_Q8_0;
+        case GGML_TYPE_Q2_0    : return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_Q8_0    : return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_Q2_K    : return MMQ_DP4A_TXS_Q2_K;
         case GGML_TYPE_Q3_K    : return MMQ_DP4A_TXS_Q3_K;
@@ -254,6 +256,7 @@ static constexpr __host__ __device__ int mmq_get_mma_tile_x_k(ggml_type type) {
         case GGML_TYPE_Q5_0    : return MMQ_MMA_TILE_X_K_Q8_0;
         case GGML_TYPE_Q5_1    : return MMQ_MMA_TILE_X_K_Q8_1;
         case GGML_TYPE_Q6_0    : return MMQ_MMA_TILE_X_K_Q8_0;
+        case GGML_TYPE_Q2_0    : return MMQ_MMA_TILE_X_K_Q8_0;
         case GGML_TYPE_Q8_0    : return MMQ_MMA_TILE_X_K_Q8_0;
         case GGML_TYPE_Q2_K    : return MMQ_MMA_TILE_X_K_Q2_K;
         case GGML_TYPE_Q3_K    : return MMQ_MMA_TILE_X_K_Q3_K;
@@ -2052,8 +2055,11 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
 
         const block_iq4_nl * bxi = (const block_iq4_nl *)(x + i*stride) + kbx0 + kbx;
 
-        const int aux_q4 = get_int_b2(bxi->qs, kqsx);
-        const int2 v = get_int_from_table_16(aux_q4);
+        // Grouped expert shards can end partway through the 256-value tile.
+        // Do not read the next row (or past the allocation) for padded K.
+        const bool valid_block = kbx0 + kbx < stride / int(sizeof(block_iq4_nl));
+        const int2 v = valid_block ? get_int_from_table_16(get_int_b2(bxi->qs, kqsx))
+                                  : make_int2(0, 0);
         const int k0 = 8 * (threadIdx.x / 4) + threadIdx.x % 4;
 #ifdef INT8_MMA_AVAILABLE
         x_qs[i*MMQ_MMA_TILE_X_K_Q8_0 + k0 + 0] = v.x;
@@ -2078,9 +2084,11 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
         const block_iq4_nl * bxi = (const block_iq4_nl *)(x + i*stride) + kbx0 + kbxd;
 
 #ifdef INT8_MMA_AVAILABLE
-        x_df[i*MMQ_MMA_TILE_X_K_Q8_0 + kbxd] = __half2float(bxi->d);
+        x_df[i*MMQ_MMA_TILE_X_K_Q8_0 + kbxd] =
+            kbx0 + kbxd < stride / int(sizeof(block_iq4_nl)) ? __half2float(bxi->d) : 0.0f;
 #else
-        x_df[i*(WARP_SIZE/4) + i/4   + kbxd] = __half2float(bxi->d);
+        x_df[i*(WARP_SIZE/4) + i/4   + kbxd] =
+            kbx0 + kbxd < stride / int(sizeof(block_iq4_nl)) ? __half2float(bxi->d) : 0.0f;
 #endif // INT8_MMA_AVAILABLE
     }
 }
