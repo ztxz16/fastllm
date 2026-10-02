@@ -377,6 +377,82 @@ __global__ void AttentionScores(const BF16 *q, const BF16 *k, const int *indices
     }
 }
 
+// Keep each warp's original lane-strided dot product and reduction order,
+// but retain Q in registers and interleave four independent selected keys.
+// The bounded query register tile leaves larger head dimensions on the
+// general kernel; this path is only used for multiple-query prefill.
+template <int MaxDim>
+__global__ void AttentionScoresPrefill(const BF16 *q, const BF16 *k, const int *indices,
+                                      float *scores, int heads, int kvHeads, int dim,
+                                      int keyStride, int keys, int count, int past,
+                                      int window, bool causal) {
+    constexpr int keysPerWarp = 4, warps = 4;
+    int query = blockIdx.y, h = blockIdx.x;
+    int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    int kvHead = h / (heads / kvHeads);
+    float queryValues[MaxDim / 32];
+    #pragma unroll
+    for (int j = 0; j < MaxDim / 32; ++j)
+        if (lane + j * 32 < dim)
+            queryValues[j] = (float)q[((size_t)query * heads + h) * dim + lane + j * 32];
+    for (int first = warp * keysPerWarp; first < count; first += warps * keysPerWarp) {
+        int key[keysPerWarp];
+        bool valid[keysPerWarp];
+        float dot[keysPerWarp];
+        #pragma unroll
+        for (int i = 0; i < keysPerWarp; ++i) {
+            key[i] = first + i < count ? KeyIndex(indices, query, first + i, count, past, window) : -1;
+            valid[i] = key[i] >= 0 && key[i] < keys && (!causal || key[i] <= past + query);
+            dot[i] = 0;
+        }
+        #pragma unroll
+        for (int j = 0; j < MaxDim / 32; ++j) if (lane + j * 32 < dim) {
+            #pragma unroll
+            for (int i = 0; i < keysPerWarp; ++i) if (valid[i])
+                dot[i] += queryValues[j] * (float)k[(size_t)key[i] * keyStride + kvHead * dim + lane + j * 32];
+        }
+        #pragma unroll
+        for (int i = 0; i < keysPerWarp; ++i) {
+            dot[i] = WarpSum(dot[i]);
+            if (lane == 0 && first + i < count)
+                scores[((size_t)query * heads + h) * count + first + i] =
+                    valid[i] ? RoundBF16(RoundBF16(dot[i]) * rsqrtf((float)dim)) : -INFINITY;
+        }
+    }
+}
+
+// Four output columns per lane amortize index/probability reads and permit
+// aligned 64-bit V loads. Each column keeps its original slot-ordered FP32
+// accumulation. Four independent heads per CTA avoid one-warp block limits.
+__global__ void AttentionValuesPrefill(const float *prob, const BF16 *v, const int *indices,
+                                      BF16 *out, int heads, int kvHeads, int dim,
+                                      int keys, int count, int past, int window, bool causal) {
+    constexpr int columns = 4, headGroup = 4;
+    int query = blockIdx.y, lane = threadIdx.x % 32;
+    int h = blockIdx.x * headGroup + threadIdx.x / 32;
+    if (h >= heads) return;
+    int kvHead = h / (heads / kvHeads);
+    const float *p = prob + ((size_t)query * heads + h) * count;
+    for (int d = lane * columns; d < dim; d += 32 * columns) {
+        float sum[columns] = {};
+        for (int slot = 0; slot < count; ++slot) {
+            int key = KeyIndex(indices, query, slot, count, past, window);
+            if (key >= 0 && key < keys && (!causal || key <= past + query)) {
+                uint2 bits = *reinterpret_cast<const uint2*>(v + ((size_t)key * kvHeads + kvHead) * dim + d);
+                unsigned words[2] = {bits.x, bits.y};
+                float weight = p[slot];
+                #pragma unroll
+                for (int j = 0; j < columns; ++j)
+                    sum[j] += weight * __bfloat162float(__ushort_as_bfloat16(
+                        (unsigned short)(words[j / 2] >> (16 * (j % 2)))));
+            }
+        }
+        #pragma unroll
+        for (int j = 0; j < columns; ++j)
+            out[((size_t)query * heads + h) * dim + d + j] = __float2bfloat16(sum[j]);
+    }
+}
+
 __global__ void AttentionSoftmax(float *scores, const float *sink, int heads, int count) {
     __shared__ float scratch[256];
     int row = blockIdx.x, t = threadIdx.x;
@@ -792,13 +868,24 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
     }
     Data scores;
     Output(scores, DataType::FLOAT32, {queries, heads, count});
-    AttentionScores<<<dim3(heads, queries, queries == 1 ? (count + 63) / 64 : 1), 256>>>((const BF16 *)query.cudaData,
-        (const BF16 *)key.cudaData, selected, (float *)scores.cudaData,
-        heads, kvHeads, dim, key.dims[2], keys, count, pastLength, window, causal);
+    if (queries > 1 && dim <= 256) {
+        auto kernel = dim <= 192 ? AttentionScoresPrefill<192> : AttentionScoresPrefill<256>;
+        kernel<<<dim3(heads, queries), 128>>>((const BF16 *)query.cudaData,
+            (const BF16 *)key.cudaData, selected, (float *)scores.cudaData,
+            heads, kvHeads, dim, key.dims[2], keys, count, pastLength, window, causal);
+    } else {
+        AttentionScores<<<dim3(heads, queries, queries == 1 ? (count + 63) / 64 : 1), 256>>>((const BF16 *)query.cudaData,
+            (const BF16 *)key.cudaData, selected, (float *)scores.cudaData,
+            heads, kvHeads, dim, key.dims[2], keys, count, pastLength, window, causal);
+    }
     AttentionSoftmax<<<queries * heads, 256>>>((float *)scores.cudaData,
         sink.dims.empty() ? nullptr : (const float *)sink.cudaData, heads, count);
     if (queries == 1) {
         AttentionValuesTiled<<<dim3(heads, queries, (valueDim + 31) / 32), 256>>>((const float *)scores.cudaData,
+            (const BF16 *)value.cudaData, selected, (BF16 *)output.cudaData,
+            heads, kvHeads, valueDim, keys, count, pastLength, window, causal);
+    } else if (valueDim % 4 == 0 && (size_t)value.cudaData % alignof(uint2) == 0) {
+        AttentionValuesPrefill<<<dim3((heads + 3) / 4, queries), 128>>>((const float *)scores.cudaData,
             (const BF16 *)value.cudaData, selected, (BF16 *)output.cudaData,
             heads, kvHeads, valueDim, keys, count, pastLength, window, causal);
     } else {

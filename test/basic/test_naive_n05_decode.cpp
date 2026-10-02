@@ -328,6 +328,53 @@ static void TestAttentionWidths() {
     }
 }
 
+static void TestAttentionSelectedValues() {
+    struct Shape { int queries, heads, kvHeads, dim, valueDim, keys, selected; };
+    for (auto s : {Shape{2,1,1,64,4,257,257}, Shape{5,3,1,129,132,513,511},
+                   Shape{7,8,2,192,128,1027,2051}, Shape{3,4,2,256,384,300,301},
+                   Shape{2,7,1,384,127,259,259}, Shape{2,4,2,193,8,257,257}})
+    for (bool causal : {false, true}) for (bool withSink : {false, true}) {
+        int past = s.keys - s.queries;
+        Data query(BFLOAT16),key(BFLOAT16),value(BFLOAT16),sink(FLOAT32),indices(INT32),output;
+        Zeros(query,{1,s.queries,s.heads*s.dim});
+        Zeros(key,{1,s.keys,s.kvHeads*s.dim+128});
+        Upload(value,{1,s.keys,s.kvHeads*s.valueDim},157);
+        if (withSink) Zeros(sink,{s.heads});
+        indices.Resize({s.queries,s.selected}); indices.Allocate();
+        std::vector<int> selected(s.queries*s.selected);
+        for (int q=0;q<s.queries;++q) for (int slot=0;slot<s.selected;++slot) {
+            int k=(slot*137+q*13)%s.keys;
+            if (slot%17==0) k=-1;
+            if (slot%31==1) k=s.keys+3;
+            // The first row also covers the all-masked case.
+            if (q==0) k=-1;
+            selected[q*s.selected+slot]=k;
+        }
+        std::memcpy(indices.cpuData,selected.data(),selected.size()*sizeof(int));
+        indices.ToDevice(DataDevice::CUDA,{0},true);
+        auto values=Read<uint16_t>(value);
+        FastllmCudaNaiveAttention(query,key,value,indices,sink,s.heads,s.kvHeads,s.dim,
+                                  s.valueDim,past,0,output,causal);
+        auto actual=Read<uint16_t>(output);
+        for (int q=0;q<s.queries;++q) {
+            std::vector<int> validKeys;
+            for (int slot=0;slot<s.selected;++slot) {
+                int k=selected[q*s.selected+slot];
+                if (k>=0 && k<s.keys && (!causal || k<=past+q)) validKeys.push_back(k);
+            }
+            float probability=validKeys.empty() ? 0 : Rounded(1.0f/(validKeys.size()+int(withSink)));
+            for (int h=0;h<s.heads;++h) for (int d=0;d<s.valueDim;++d) {
+                float sum=0;
+                for (int k : validKeys)
+                    sum=std::fma(probability,FromBits(values[(k*s.kvHeads+h/(s.heads/s.kvHeads))*s.valueDim+d]),sum);
+                Require(actual[(q*s.heads+h)*s.valueDim+d]==Float32ToBFloat16RNEBits(sum),
+                        "Selected Attention differs from independent uniform-softmax reference");
+            }
+        }
+        ++checks;
+    }
+}
+
 int main(int argc,char **argv) {
     int devices=0;if(cudaGetDeviceCount(&devices)!=cudaSuccess || !devices) return 77;
     if (argc == 2 && std::strcmp(argv[1], "--invalid-indexer") == 0) {
@@ -340,7 +387,7 @@ int main(int argc,char **argv) {
                 "usage: naive_n05_decode_test [--quick]");
         quick = argc == 2;
         SetThreads(4);
-        TestTopK(); TestBatchedTopK(); TestCache(); TestCacheReservation(); TestRopeWidths(); TestAttentionWidths();
+        TestTopK(); TestBatchedTopK(); TestCache(); TestCacheReservation(); TestRopeWidths(); TestAttentionWidths(); TestAttentionSelectedValues();
         Require(cudaDeviceSynchronize()==cudaSuccess,"CUDA final synchronization failed");
         std::printf("Naive decode regression passed: %d cases\n",checks);
     }catch(const std::exception&e){std::fprintf(stderr,"%s\n",e.what());return 1;}
