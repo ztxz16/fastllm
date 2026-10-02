@@ -1,0 +1,1327 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-02",
+  "model": "Qwen3.8-Flash-Next-GSQ-RCO-Q2_0",
+  "hardware": {
+    "gpu": "2 x NVIDIA RTX 2080 Ti 22 GiB, SM75, NVLink",
+    "cpu": "AMD EPYC 7452",
+    "ram_gib": 126
+  },
+  "baseline_commit": "0321c9c59",
+  "baseline_description": "Previous Q2 expert/Dense optimization, freshly rerun in this experiment",
+  "configuration": {
+    "tp": 2,
+    "devices": [
+      0,
+      1
+    ],
+    "moe_devices": [
+      0,
+      1
+    ],
+    "activation": "float16",
+    "cuda_graph": true,
+    "mtp": 0,
+    "expert_cache_bytes": 0,
+    "expert_residency": "all GPU native GGUF",
+    "embedding": "CPU FP32",
+    "ple": "disk",
+    "threads": 28,
+    "max_batch": 1,
+    "context_tokens": 8192,
+    "kv_cache_limit": "1g",
+    "gpu_mem_ratio": 0.95,
+    "prefix_cache": false,
+    "cache_history": false,
+    "thinking": false,
+    "sampling": "greedy",
+    "warmup": "one 512-token decode run per chunk, one prefill run; three formal runs per group",
+    "clock_control": "none"
+  },
+  "timing": {
+    "decode": "511 / (last token arrival - first token arrival)",
+    "prefill": "4096 / TTFT, includes first output token",
+    "statistic": "median of three formal requests",
+    "memory_peak": "nvidia-smi every two seconds; short peaks may be missed"
+  },
+  "results": {
+    "baseline": {
+      "native_sha256": "cdacb884eef2ec3ce0b70386a69f4ec6211c6cd4e42de091e15af9eab8ec38ee",
+      "measurements": {
+        "decode-chunk32": {
+          "chunk": 32,
+          "input_tokens": 512,
+          "output_tokens": 512,
+          "runs_tps": [
+            70.81677099934062,
+            70.68923639056868,
+            70.5806656764456
+          ],
+          "median_tps": 70.68923639056868,
+          "median_ttft_s": 1.0684288130141795,
+          "output_sha256": "0c48c0288384eefcfdaff25b9d9ab6540643814f20b6cecf0e1af1ac4ebca53a"
+        },
+        "decode-chunk512": {
+          "chunk": 512,
+          "input_tokens": 512,
+          "output_tokens": 512,
+          "runs_tps": [
+            69.65204882132524,
+            69.51324725379227,
+            69.33004139531272
+          ],
+          "median_tps": 69.51324725379227,
+          "median_ttft_s": 0.43900311295874417,
+          "output_sha256": "058c9cee2cbb34e13b6c9636aad60fe95f2adf38abc9e89f4248dcece1bbd85e"
+        },
+        "prefill": {
+          "chunk": 1024,
+          "input_tokens": 4096,
+          "output_tokens": 1,
+          "runs_tps": [
+            1356.3288640749397,
+            1355.214268699227,
+            1352.9181173920729
+          ],
+          "median_tps": 1355.214268699227,
+          "median_ttft_s": 3.0224002909380943,
+          "output_sha256": "543266b735ecac89bf4c2a6ee49c6cbf5827e4686b59aa8495ff1fa8b48bce7d"
+        }
+      },
+      "logical_gpu_weight_gib": [
+        18.663426160812378,
+        18.663426160812378
+      ],
+      "loaded_used_gpu_gib": [
+        19.84356689453125,
+        19.84161376953125
+      ],
+      "sampled_peak_gpu_gib": [
+        20.685546875,
+        20.46484375
+      ],
+      "host_hwm_gib": 40.72364044189453,
+      "host_swap_kib": 0,
+      "sanity": {
+        "arithmetic": "1073",
+        "json-task": "{\"items\": [1, 2, 5, 9], \"sum\": 17, \"count\": 4}"
+      },
+      "closeout": {
+        "exit_code": 0,
+        "error": null,
+        "protected_unchanged": true,
+        "gpu_processes": "",
+        "elapsed_s": 213.46536254882812
+      }
+    },
+    "v2": {
+      "native_sha256": "8c3c12485b0031d127aa2353b4e3cb40d0f99d97a0cd7a05f5900af8a67d74db",
+      "measurements": {
+        "decode-chunk32": {
+          "chunk": 32,
+          "input_tokens": 512,
+          "output_tokens": 512,
+          "runs_tps": [
+            71.86018285310897,
+            71.6101855692594,
+            71.38660812812478
+          ],
+          "median_tps": 71.6101855692594,
+          "median_ttft_s": 1.0621870937757194,
+          "output_sha256": "0c48c0288384eefcfdaff25b9d9ab6540643814f20b6cecf0e1af1ac4ebca53a"
+        },
+        "decode-chunk512": {
+          "chunk": 512,
+          "input_tokens": 512,
+          "output_tokens": 512,
+          "runs_tps": [
+            70.80476116194284,
+            70.63264412118453,
+            70.51140629596668
+          ],
+          "median_tps": 70.63264412118453,
+          "median_ttft_s": 0.4372947020456195,
+          "output_sha256": "058c9cee2cbb34e13b6c9636aad60fe95f2adf38abc9e89f4248dcece1bbd85e"
+        },
+        "prefill": {
+          "chunk": 1024,
+          "input_tokens": 4096,
+          "output_tokens": 1,
+          "runs_tps": [
+            1360.546000529437,
+            1357.4089728774309,
+            1358.0202273210575
+          ],
+          "median_tps": 1358.0202273210575,
+          "median_ttft_s": 3.0161553691141307,
+          "output_sha256": "543266b735ecac89bf4c2a6ee49c6cbf5827e4686b59aa8495ff1fa8b48bce7d"
+        }
+      },
+      "logical_gpu_weight_gib": [
+        18.663426160812378,
+        18.663426160812378
+      ],
+      "loaded_used_gpu_gib": [
+        19.84356689453125,
+        19.84161376953125
+      ],
+      "sampled_peak_gpu_gib": [
+        20.685546875,
+        20.46484375
+      ],
+      "host_hwm_gib": 40.721717834472656,
+      "host_swap_kib": 0,
+      "sanity": {
+        "arithmetic": "1073",
+        "json-task": "{\"items\": [1, 2, 5, 9], \"sum\": 17, \"count\": 4}"
+      },
+      "closeout": {
+        "exit_code": 0,
+        "error": null,
+        "protected_unchanged": true,
+        "gpu_processes": "",
+        "elapsed_s": 207.23176169395447
+      }
+    }
+  },
+  "improvement_percent": {
+    "decode-chunk32": 1.3028138733913286,
+    "decode-chunk512": 1.6103360317859305,
+    "prefill": 0.2070490760493371
+  },
+  "output_comparison": {
+    "decode-chunk32-warmup": {
+      "equal": true,
+      "output_tokens": 512,
+      "sha256": "0c48c0288384eefcfdaff25b9d9ab6540643814f20b6cecf0e1af1ac4ebca53a"
+    },
+    "decode-chunk32-1": {
+      "equal": true,
+      "output_tokens": 512,
+      "sha256": "0c48c0288384eefcfdaff25b9d9ab6540643814f20b6cecf0e1af1ac4ebca53a"
+    },
+    "decode-chunk32-2": {
+      "equal": true,
+      "output_tokens": 512,
+      "sha256": "0c48c0288384eefcfdaff25b9d9ab6540643814f20b6cecf0e1af1ac4ebca53a"
+    },
+    "decode-chunk32-3": {
+      "equal": true,
+      "output_tokens": 512,
+      "sha256": "0c48c0288384eefcfdaff25b9d9ab6540643814f20b6cecf0e1af1ac4ebca53a"
+    },
+    "decode-chunk512-warmup": {
+      "equal": true,
+      "output_tokens": 512,
+      "sha256": "058c9cee2cbb34e13b6c9636aad60fe95f2adf38abc9e89f4248dcece1bbd85e"
+    },
+    "decode-chunk512-1": {
+      "equal": true,
+      "output_tokens": 512,
+      "sha256": "058c9cee2cbb34e13b6c9636aad60fe95f2adf38abc9e89f4248dcece1bbd85e"
+    },
+    "decode-chunk512-2": {
+      "equal": true,
+      "output_tokens": 512,
+      "sha256": "058c9cee2cbb34e13b6c9636aad60fe95f2adf38abc9e89f4248dcece1bbd85e"
+    },
+    "decode-chunk512-3": {
+      "equal": true,
+      "output_tokens": 512,
+      "sha256": "058c9cee2cbb34e13b6c9636aad60fe95f2adf38abc9e89f4248dcece1bbd85e"
+    },
+    "prefill-warmup": {
+      "equal": true,
+      "output_tokens": 1,
+      "sha256": "543266b735ecac89bf4c2a6ee49c6cbf5827e4686b59aa8495ff1fa8b48bce7d"
+    },
+    "prefill-1": {
+      "equal": true,
+      "output_tokens": 1,
+      "sha256": "543266b735ecac89bf4c2a6ee49c6cbf5827e4686b59aa8495ff1fa8b48bce7d"
+    },
+    "prefill-2": {
+      "equal": true,
+      "output_tokens": 1,
+      "sha256": "543266b735ecac89bf4c2a6ee49c6cbf5827e4686b59aa8495ff1fa8b48bce7d"
+    },
+    "prefill-3": {
+      "equal": true,
+      "output_tokens": 1,
+      "sha256": "543266b735ecac89bf4c2a6ee49c6cbf5827e4686b59aa8495ff1fa8b48bce7d"
+    },
+    "arithmetic": {
+      "equal": true,
+      "output_tokens": 4,
+      "sha256": "9f6c3b6296b056a2d0617cd32bc8fe056b768c80f7fa93509d4ef7fcdd323b9a"
+    },
+    "json-task": {
+      "equal": true,
+      "output_tokens": 28,
+      "sha256": "3686ffbab987beed5999cf44776b14c9e2e6620acf239b2c96c171b1b4dbea98"
+    }
+  },
+  "changes": [
+    "Q3_K byte-permute sub-scale decoding and packed sign extension, preserving the four-group dot order",
+    "Eight output rows per CUDA block for at least 1024 rows and K <= 8192; shared Q8 input",
+    "Optimized decoding with the legacy four-warps-per-row schedule for smaller projections and long K",
+    "Single input row only; guarded dimensions/alignment and existing fallback; no environment variable or persistent workspace"
+  ],
+  "production_source_sha256": {
+    "src/devices/cuda/fastllm-ggml-cuda.cu": "cb5cef461dd172a660dfd3c967e14364be637295a1f344c3447640d7dc3b5222",
+    "src/devices/cuda/fastllm-gguf-q3-k-gemv.cuh": "d170730fb1b0868788c7729ce003562ae12e3ec9428ae7bde6f8b7ef2a32296f"
+  },
+  "test_source_sha256": {
+    "test/basic/test_cuda_gguf_q3_k.cu": "2a27fd6065aed7bf37dae06bcccb94e22c34cc7f2c96753c149a559f42f7c7a4",
+    "CMakeLists.txt": "28a175e6691d49eaaa13551b4858a1f7574732e4346ac6a4ab788a7d25b0d8da"
+  },
+  "tests": {
+    "passed": true,
+    "cases": [
+      {
+        "name": "q3",
+        "command": [
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/decode-kernel-opt/v2/q3-test"
+        ],
+        "exit_code": 0,
+        "seconds": 1.0157427787780762
+      },
+      {
+        "name": "memcheck",
+        "command": [
+          "/usr/local/cuda/bin/compute-sanitizer",
+          "--tool",
+          "memcheck",
+          "--error-exitcode",
+          "88",
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/expert-prefill/grouped-loader",
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/decode-kernel-opt/v2/q3-test.so"
+        ],
+        "exit_code": 0,
+        "seconds": 1.2161436080932617
+      },
+      {
+        "name": "synccheck",
+        "command": [
+          "/usr/local/cuda/bin/compute-sanitizer",
+          "--tool",
+          "synccheck",
+          "--error-exitcode",
+          "88",
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/expert-prefill/grouped-loader",
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/decode-kernel-opt/v2/q3-test.so"
+        ],
+        "exit_code": 0,
+        "seconds": 1.1158792972564697
+      },
+      {
+        "name": "q2-regression",
+        "command": [
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/expert-prefill/grouped-loader",
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/q2-kernel-opt/v2/q2-test.so"
+        ],
+        "exit_code": 0,
+        "seconds": 0.7653658390045166
+      },
+      {
+        "name": "dense",
+        "command": [
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/decode-kernel-opt/dense_replay",
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/q2-iq2-wave",
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/decode-kernel-opt/v2-dense"
+        ],
+        "exit_code": 0,
+        "seconds": 3.4719862937927246
+      }
+    ]
+  },
+  "dense_replay": {
+    "validation": {
+      "count": 72,
+      "all_exact": true
+    },
+    "median_us": {
+      "baseline": {
+        "K256-M127-B1-T7": 4.28064,
+        "K256-M128-B1-T7": 4.23104,
+        "K256-M129-B1-T7": 4.08192,
+        "K768-M127-B1-T7": 4.58784,
+        "K768-M128-B1-T7": 4.3408,
+        "K768-M129-B1-T7": 4.34176,
+        "K2560-M127-B1-T7": 4.74336,
+        "K2560-M128-B1-T7": 4.70016,
+        "K2560-M129-B1-T7": 4.50496,
+        "K2560-M320-B1-T7": 5.12768,
+        "K2560-M3072-B1-T7": 16.3795,
+        "K2560-M5120-B1-T7": 25.3053,
+        "K2560-M6144-B1-T7": 29.873,
+        "K4352-M127-B1-T7": 5.20608,
+        "K4352-M128-B1-T7": 4.62496,
+        "K4352-M129-B1-T7": 4.62624,
+        "K18432-M127-B1-T7": 7.70208,
+        "K18432-M128-B1-T7": 7.76896,
+        "K18432-M129-B1-T7": 7.7408,
+        "K18688-M127-B1-T7": 7.90208,
+        "K18688-M128-B1-T7": 7.93152,
+        "K18688-M129-B1-T7": 7.92736
+      },
+      "v2": {
+        "K256-M127-B1-T7": 4.28032,
+        "K256-M128-B1-T7": 4.096,
+        "K256-M129-B1-T7": 4.11456,
+        "K768-M127-B1-T7": 4.77952,
+        "K768-M128-B1-T7": 4.44416,
+        "K768-M129-B1-T7": 4.44416,
+        "K2560-M127-B1-T7": 5.06592,
+        "K2560-M128-B1-T7": 4.7968,
+        "K2560-M129-B1-T7": 4.62688,
+        "K2560-M320-B1-T7": 5.12224,
+        "K2560-M3072-B1-T7": 14.6022,
+        "K2560-M5120-B1-T7": 22.1014,
+        "K2560-M6144-B1-T7": 25.5894,
+        "K4352-M127-B1-T7": 4.48352,
+        "K4352-M128-B1-T7": 4.23392,
+        "K4352-M129-B1-T7": 4.24352,
+        "K18432-M127-B1-T7": 7.5536,
+        "K18432-M128-B1-T7": 7.09056,
+        "K18432-M129-B1-T7": 7.08608,
+        "K18688-M127-B1-T7": 7.72544,
+        "K18688-M128-B1-T7": 7.76192,
+        "K18688-M129-B1-T7": 7.75456
+      }
+    },
+    "method": "Public Linear with real Q3_K packed blocks repeated/cropped to each shape and synthetic nonzero input explicitly copied to CUDA; FP32/FP16/BF16, partial rows, 1/3/8 input rows, admission boundaries. CUDA events over graph replays; clocks uncontrolled."
+  },
+  "nsys": {
+    "baseline": {
+      "span_ms_per_step": 15.458939052083332,
+      "devices": {
+        "0": {
+          "q3_kernel_ms_per_step": 0.9581869375,
+          "q3_calls_per_step": 53,
+          "q3_shapes": [
+            {
+              "deviceId": 0,
+              "name": "void mul_mat_vec_q<(ggml_type)11, (int)1, (int)4, __half>(const void *, const void *, T4 *, const char *, int, int, int, int, unsigned long, unsigned long, unsigned long, long)",
+              "family": "Dense GEMV",
+              "gridX": 5120,
+              "gridY": 1,
+              "gridZ": 1,
+              "blockX": 32,
+              "blockY": 4,
+              "blockZ": 1,
+              "dynamicSharedMemory": 0,
+              "staticSharedMemory": 384,
+              "count": 1728,
+              "bytes": 0,
+              "ms": 39.414347,
+              "mean_us": 22.809228587962963,
+              "median_us": 22.818
+            },
+            {
+              "deviceId": 0,
+              "name": "void mul_mat_vec_q<(ggml_type)11, (int)1, (int)4, __half>(const void *, const void *, T4 *, const char *, int, int, int, int, unsigned long, unsigned long, unsigned long, long)",
+              "family": "Dense GEMV",
+              "gridX": 3072,
+              "gridY": 1,
+              "gridZ": 1,
+              "blockX": 32,
+              "blockY": 4,
+              "blockZ": 1,
+              "dynamicSharedMemory": 0,
+              "staticSharedMemory": 384,
+              "count": 2400,
+              "bytes": 0,
+              "ms": 35.623432,
+              "mean_us": 14.843096666666668,
+              "median_us": 14.849
+            },
+            {
+              "deviceId": 0,
+              "name": "void mul_mat_vec_q<(ggml_type)11, (int)1, (int)4, __half>(const void *, const void *, T4 *, const char *, int, int, int, int, unsigned long, unsigned long, unsigned long, long)",
+              "family": "Dense GEMV",
+              "gridX": 6144,
+              "gridY": 1,
+              "gridZ": 1,
+              "blockX": 32,
+              "blockY": 4,
+              "blockZ": 1,
+              "dynamicSharedMemory": 0,
+              "staticSharedMemory": 384,
+              "count": 576,
+              "bytes": 0,
+              "ms": 15.572044,
+              "mean_us": 27.03479861111111,
+              "median_us": 27.074
+            },
+            {
+              "deviceId": 0,
+              "name": "void mul_mat_vec_q<(ggml_type)11, (int)1, (int)4, __half>(const void *, const void *, T4 *, const char *, int, int, int, int, unsigned long, unsigned long, unsigned long, long)",
+              "family": "Dense GEMV",
+              "gridX": 256,
+              "gridY": 1,
+              "gridZ": 1,
+              "blockX": 32,
+              "blockY": 4,
+              "blockZ": 1,
+              "dynamicSharedMemory": 0,
+              "staticSharedMemory": 384,
+              "count": 384,
+              "bytes": 0,
+              "ms": 1.376123,
+              "mean_us": 3.5836536458333335,
+              "median_us": 3.616
+            }
+          ],
+          "dense_gemv_ms_per_step": 6.4483594479166655,
+          "largest_kernels": [
+            {
+              "name": "void FastllmGemvFp32Fp16HyperProjectKernel<(int)256, (int)1, (int)10240>(const float *, const __half *, const __half *, float *, float *, const float *, const float *, int, int, int, int)",
+              "ms_per_step": 1.5506621770833335,
+              "calls_per_step": 96.0
+            },
+            {
+              "name": "void FastllmGemvFp16Fp16Kernel2MultiRow<(int)256, (int)1, (bool)0, (bool)0>(__half *, __half *, __half *, __half *, int, int, bool, __half *, __half *, bool)",
+              "ms_per_step": 1.5163890729166667,
+              "calls_per_step": 120.0
+            },
+            {
+              "name": "FastllmQwen4HyperMixDecodeKernel(const float *, const float *, const __half *, float *)",
+              "ms_per_step": 1.3765954270833334,
+              "calls_per_step": 97.0
+            },
+            {
+              "name": "void mul_mat_vec_q<(ggml_type)11, (int)1, (int)4, __half>(const void *, const void *, T4 *, const char *, int, int, int, int, unsigned long, unsigned long, unsigned long, long)",
+              "ms_per_step": 0.9581869375,
+              "calls_per_step": 53.0
+            },
+            {
+              "name": "void <unnamed>::Q8Projection<(ggml_type)42, float, (bool)0, <unnamed>::ResidentView, (int)32>(const block_q8_1 *, T2 *, float *, T4, int, unsigned long)",
+              "ms_per_step": 0.9056580833333333,
+              "calls_per_step": 48.0
+            },
+            {
+              "name": "void <unnamed>::Q8Projection<(ggml_type)42, float, (bool)1, <unnamed>::ResidentView, (int)32>(const block_q8_1 *, T2 *, float *, T4, int, unsigned long)",
+              "ms_per_step": 0.654838125,
+              "calls_per_step": 48.0
+            },
+            {
+              "name": "ncclDevKernel_AllReduce_Sum_f32_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)",
+              "ms_per_step": 0.503160375,
+              "calls_per_step": 48.0
+            },
+            {
+              "name": "ncclDevKernel_AllReduce_Sum_f16_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)",
+              "ms_per_step": 0.47087906249999995,
+              "calls_per_step": 48.0
+            },
+            {
+              "name": "void FastllmGemvFp32Fp16Kernel2MultiRow<(int)256, (int)1, (int)2560, (bool)1, (bool)0>(float *, __half *, float *, float *, int, int, const __half *, float *, const float *)",
+              "ms_per_step": 0.4526554479166667,
+              "calls_per_step": 48.0
+            },
+            {
+              "name": "void mul_mat_vec_q<(ggml_type)13, (int)1, (int)4, float>(const void *, const void *, T4 *, const char *, int, int, int, int, unsigned long, unsigned long, unsigned long, long)",
+              "ms_per_step": 0.4454708541666667,
+              "calls_per_step": 1.0
+            }
+          ]
+        },
+        "1": {
+          "q3_kernel_ms_per_step": 0.9636074270833334,
+          "q3_calls_per_step": 53,
+          "q3_shapes": [
+            {
+              "deviceId": 1,
+              "name": "void mul_mat_vec_q<(ggml_type)11, (int)1, (int)4, __half>(const void *, const void *, T4 *, const char *, int, int, int, int, unsigned long, unsigned long, unsigned long, long)",
+              "family": "Dense GEMV",
+              "gridX": 5120,
+              "gridY": 1,
+              "gridZ": 1,
+              "blockX": 32,
+              "blockY": 4,
+              "blockZ": 1,
+              "dynamicSharedMemory": 0,
+              "staticSharedMemory": 384,
+              "count": 1728,
+              "bytes": 0,
+              "ms": 39.818592,
+              "mean_us": 23.043166666666668,
+              "median_us": 23.073
+            },
+            {
+              "deviceId": 1,
+              "name": "void mul_mat_vec_q<(ggml_type)11, (int)1, (int)4, __half>(const void *, const void *, T4 *, const char *, int, int, int, int, unsigned long, unsigned long, unsigned long, long)",
+              "family": "Dense GEMV",
+              "gridX": 3072,
+              "gridY": 1,
+              "gridZ": 1,
+              "blockX": 32,
+              "blockY": 4,
+              "blockZ": 1,
+              "dynamicSharedMemory": 0,
+              "staticSharedMemory": 384,
+              "count": 2400,
+              "bytes": 0,
+              "ms": 35.675664,
+              "mean_us": 14.864859999999998,
+              "median_us": 14.881
+            },
+            {
+              "deviceId": 1,
+              "name": "void mul_mat_vec_q<(ggml_type)11, (int)1, (int)4, __half>(const void *, const void *, T4 *, const char *, int, int, int, int, unsigned long, unsigned long, unsigned long, long)",
+              "family": "Dense GEMV",
+              "gridX": 6144,
+              "gridY": 1,
+              "gridZ": 1,
+              "blockX": 32,
+              "blockY": 4,
+              "blockZ": 1,
+              "dynamicSharedMemory": 0,
+              "staticSharedMemory": 384,
+              "count": 576,
+              "bytes": 0,
+              "ms": 15.629226,
+              "mean_us": 27.134072916666664,
+              "median_us": 27.169
+            },
+            {
+              "deviceId": 1,
+              "name": "void mul_mat_vec_q<(ggml_type)11, (int)1, (int)4, __half>(const void *, const void *, T4 *, const char *, int, int, int, int, unsigned long, unsigned long, unsigned long, long)",
+              "family": "Dense GEMV",
+              "gridX": 256,
+              "gridY": 1,
+              "gridZ": 1,
+              "blockX": 32,
+              "blockY": 4,
+              "blockZ": 1,
+              "dynamicSharedMemory": 0,
+              "staticSharedMemory": 384,
+              "count": 384,
+              "bytes": 0,
+              "ms": 1.382831,
+              "mean_us": 3.601122395833333,
+              "median_us": 3.616
+            }
+          ],
+          "dense_gemv_ms_per_step": 6.311800989583335,
+          "largest_kernels": [
+            {
+              "name": "void FastllmGemvFp32Fp16HyperProjectKernel<(int)256, (int)1, (int)10240>(const float *, const __half *, const __half *, float *, float *, const float *, const float *, int, int, int, int)",
+              "ms_per_step": 1.542834375,
+              "calls_per_step": 96.0
+            },
+            {
+              "name": "void FastllmGemvFp16Fp16Kernel2MultiRow<(int)256, (int)1, (bool)0, (bool)0>(__half *, __half *, __half *, __half *, int, int, bool, __half *, __half *, bool)",
+              "ms_per_step": 1.5120302916666668,
+              "calls_per_step": 120.0
+            },
+            {
+              "name": "FastllmQwen4HyperMixDecodeKernel(const float *, const float *, const __half *, float *)",
+              "ms_per_step": 1.376443625,
+              "calls_per_step": 97.0
+            },
+            {
+              "name": "void mul_mat_vec_q<(ggml_type)11, (int)1, (int)4, __half>(const void *, const void *, T4 *, const char *, int, int, int, int, unsigned long, unsigned long, unsigned long, long)",
+              "ms_per_step": 0.9636074270833334,
+              "calls_per_step": 53.0
+            },
+            {
+              "name": "void <unnamed>::Q8Projection<(ggml_type)42, float, (bool)0, <unnamed>::ResidentView, (int)32>(const block_q8_1 *, T2 *, float *, T4, int, unsigned long)",
+              "ms_per_step": 0.9071796249999999,
+              "calls_per_step": 48.0
+            },
+            {
+              "name": "void <unnamed>::Q8Projection<(ggml_type)42, float, (bool)1, <unnamed>::ResidentView, (int)32>(const block_q8_1 *, T2 *, float *, T4, int, unsigned long)",
+              "ms_per_step": 0.6538836458333334,
+              "calls_per_step": 48.0
+            },
+            {
+              "name": "ncclDevKernel_AllReduce_Sum_f32_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)",
+              "ms_per_step": 0.48266204166666665,
+              "calls_per_step": 48.0
+            },
+            {
+              "name": "void FastllmGemvFp32Fp16Kernel2MultiRow<(int)256, (int)1, (int)2560, (bool)1, (bool)0>(float *, __half *, float *, float *, int, int, const __half *, float *, const float *)",
+              "ms_per_step": 0.44812578124999997,
+              "calls_per_step": 48.0
+            },
+            {
+              "name": "void mul_mat_vec_q<(ggml_type)13, (int)1, (int)4, float>(const void *, const void *, T4 *, const char *, int, int, int, int, unsigned long, unsigned long, unsigned long, long)",
+              "ms_per_step": 0.4446004479166667,
+              "calls_per_step": 1.0
+            },
+            {
+              "name": "ncclDevKernel_AllReduce_Sum_f16_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)",
+              "ms_per_step": 0.4114484375,
+              "calls_per_step": 48.0
+            }
+          ]
+        }
+      },
+      "diagnostics": [
+        {
+          "timestamp": -134151299670,
+          "timestampType": 1,
+          "source": 2,
+          "severity": 1,
+          "text": "Process was launched by the profiler, see /home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/q2-kernel-opt/tmp/nvidia/nsight_systems/quadd_session_103104237/streams/pid_3104254_stdout.log and stderr.log for program output",
+          "globalPid": 333555716587520
+        },
+        {
+          "timestamp": -134120294023,
+          "timestampType": 1,
+          "source": 1,
+          "severity": 1,
+          "text": "Common injection library initialized successfully.",
+          "globalPid": 333555716587520
+        },
+        {
+          "timestamp": -133774992279,
+          "timestampType": 1,
+          "source": 1,
+          "severity": 1,
+          "text": "Buffers holding CUDA trace data will be flushed on CudaProfilerStop() call. See --flush-on-cudaprofilerstop to control this behavior.",
+          "globalPid": 333555716587520
+        },
+        {
+          "timestamp": -133756570886,
+          "timestampType": 1,
+          "source": 1,
+          "severity": 1,
+          "text": "Loaded CUPTI library: /usr/local/cuda-13.1/nsight-systems-2025.5.2/target-linux-x64/libcupti.so.13.1",
+          "globalPid": 333555716587520
+        },
+        {
+          "timestamp": -133756565115,
+          "timestampType": 1,
+          "source": 1,
+          "severity": 2,
+          "text": "Installed CUDA driver version (13.2) is not supported by this build of Nsight Systems. CUDA trace will be collected using libraries for driver version 13.1",
+          "globalPid": 333555716587520
+        },
+        {
+          "timestamp": -133456387162,
+          "timestampType": 1,
+          "source": 1,
+          "severity": 1,
+          "text": "CUDA injection initialized successfully.",
+          "globalPid": 333555716587520
+        },
+        {
+          "timestamp": -18056620181,
+          "timestampType": 1,
+          "source": 1,
+          "severity": 1,
+          "text": "NVTX injection initialized successfully.",
+          "globalPid": 333555716587520
+        },
+        {
+          "timestamp": -540570205,
+          "timestampType": 1,
+          "source": 1,
+          "severity": 1,
+          "text": "Starting the profiling session using NVTX trigger.",
+          "globalPid": 333555716587520
+        },
+        {
+          "timestamp": 0,
+          "timestampType": 1,
+          "source": 3,
+          "severity": 1,
+          "text": "Profiling has started.",
+          "globalPid": -144115188075855872
+        },
+        {
+          "timestamp": 2737230079,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "Not all NVTX events might have been collected.",
+          "globalPid": 333555716587520
+        },
+        {
+          "timestamp": 2737235849,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "No NVTX events collected. Does the process use NVTX?",
+          "globalPid": 333555716587520
+        },
+        {
+          "timestamp": 2737238084,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "Not all CUDA events might have been collected.",
+          "globalPid": 333555716587520
+        },
+        {
+          "timestamp": 2737241560,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 1,
+          "text": "Number of CUDA events collected: \t1535691.",
+          "globalPid": 333555716587520
+        },
+        {
+          "timestamp": 2737244806,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "cuBLAS profiling might have not been started correctly.",
+          "globalPid": 333555716587520
+        },
+        {
+          "timestamp": 2737245558,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "No cuBLAS events collected. Does the process use cuBLAS?",
+          "globalPid": 333555716587520
+        },
+        {
+          "timestamp": 9484637918,
+          "timestampType": 1,
+          "source": 1,
+          "severity": 1,
+          "text": "Stopping the profiling session using NVTX trigger.",
+          "globalPid": 333555716587520
+        },
+        {
+          "timestamp": 9485234934,
+          "timestampType": 1,
+          "source": 3,
+          "severity": 1,
+          "text": "Profiling has stopped.",
+          "globalPid": -144115188075855872
+        },
+        {
+          "timestamp": 9565723266,
+          "timestampType": 1,
+          "source": 1,
+          "severity": 1,
+          "text": "Number of CUPTI events produced: \t1632170, CUPTI buffers: 50.",
+          "globalPid": 333555716587520
+        }
+      ],
+      "token_markers": 129
+    },
+    "v2": {
+      "span_ms_per_step": 15.199436760416667,
+      "devices": {
+        "0": {
+          "q3_kernel_ms_per_step": 0.7866913854166665,
+          "q3_calls_per_step": 53,
+          "q3_shapes": [
+            {
+              "deviceId": 0,
+              "name": "void fastllm_gguf_q3_k::Gemv<__half>(const block_q3_K *, const block_q8_1 *, T1 *, int, int)",
+              "family": "Dense GEMV",
+              "gridX": 640,
+              "gridY": 1,
+              "gridZ": 1,
+              "blockX": 256,
+              "blockY": 1,
+              "blockZ": 1,
+              "dynamicSharedMemory": 2880,
+              "staticSharedMemory": 0,
+              "count": 1728,
+              "bytes": 0,
+              "ms": 31.398352,
+              "mean_us": 18.170342592592593,
+              "median_us": 18.145
+            },
+            {
+              "deviceId": 0,
+              "name": "void fastllm_gguf_q3_k::Gemv<__half>(const block_q3_K *, const block_q8_1 *, T1 *, int, int)",
+              "family": "Dense GEMV",
+              "gridX": 384,
+              "gridY": 1,
+              "gridZ": 1,
+              "blockX": 256,
+              "blockY": 1,
+              "blockZ": 1,
+              "dynamicSharedMemory": 2880,
+              "staticSharedMemory": 0,
+              "count": 2400,
+              "bytes": 0,
+              "ms": 30.625045,
+              "mean_us": 12.760435416666667,
+              "median_us": 12.833
+            },
+            {
+              "deviceId": 0,
+              "name": "void fastllm_gguf_q3_k::Gemv<__half>(const block_q3_K *, const block_q8_1 *, T1 *, int, int)",
+              "family": "Dense GEMV",
+              "gridX": 768,
+              "gridY": 1,
+              "gridZ": 1,
+              "blockX": 256,
+              "blockY": 1,
+              "blockZ": 1,
+              "dynamicSharedMemory": 2880,
+              "staticSharedMemory": 0,
+              "count": 576,
+              "bytes": 0,
+              "ms": 12.20726,
+              "mean_us": 21.193159722222223,
+              "median_us": 21.185
+            },
+            {
+              "deviceId": 0,
+              "name": "void fastllm_gguf_q3_k::GemvFourWarps<__half>(const block_q3_K *, const block_q8_1 *, T1 *, int)",
+              "family": "Dense GEMV",
+              "gridX": 256,
+              "gridY": 1,
+              "gridZ": 1,
+              "blockX": 32,
+              "blockY": 4,
+              "blockZ": 1,
+              "dynamicSharedMemory": 0,
+              "staticSharedMemory": 384,
+              "count": 384,
+              "bytes": 0,
+              "ms": 1.291716,
+              "mean_us": 3.3638437500000005,
+              "median_us": 3.36
+            }
+          ],
+          "dense_gemv_ms_per_step": 6.28365178125,
+          "largest_kernels": [
+            {
+              "name": "void FastllmGemvFp32Fp16HyperProjectKernel<(int)256, (int)1, (int)10240>(const float *, const __half *, const __half *, float *, float *, const float *, const float *, int, int, int, int)",
+              "ms_per_step": 1.5514449791666667,
+              "calls_per_step": 96.0
+            },
+            {
+              "name": "void FastllmGemvFp16Fp16Kernel2MultiRow<(int)256, (int)1, (bool)0, (bool)0>(__half *, __half *, __half *, __half *, int, int, bool, __half *, __half *, bool)",
+              "ms_per_step": 1.5179949479166668,
+              "calls_per_step": 120.0
+            },
+            {
+              "name": "FastllmQwen4HyperMixDecodeKernel(const float *, const float *, const __half *, float *)",
+              "ms_per_step": 1.3777671041666668,
+              "calls_per_step": 97.0
+            },
+            {
+              "name": "void <unnamed>::Q8Projection<(ggml_type)42, float, (bool)0, <unnamed>::ResidentView, (int)32>(const block_q8_1 *, T2 *, float *, T4, int, unsigned long)",
+              "ms_per_step": 0.9095159062499999,
+              "calls_per_step": 48.0
+            },
+            {
+              "name": "void fastllm_gguf_q3_k::Gemv<__half>(const block_q3_K *, const block_q8_1 *, T1 *, int, int)",
+              "ms_per_step": 0.7732360104166666,
+              "calls_per_step": 49.0
+            },
+            {
+              "name": "void <unnamed>::Q8Projection<(ggml_type)42, float, (bool)1, <unnamed>::ResidentView, (int)32>(const block_q8_1 *, T2 *, float *, T4, int, unsigned long)",
+              "ms_per_step": 0.6571431145833333,
+              "calls_per_step": 48.0
+            },
+            {
+              "name": "ncclDevKernel_AllReduce_Sum_f32_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)",
+              "ms_per_step": 0.48535817708333334,
+              "calls_per_step": 48.0
+            },
+            {
+              "name": "void FastllmGemvFp32Fp16Kernel2MultiRow<(int)256, (int)1, (int)2560, (bool)1, (bool)0>(float *, __half *, float *, float *, int, int, const __half *, float *, const float *)",
+              "ms_per_step": 0.45349709375,
+              "calls_per_step": 48.0
+            },
+            {
+              "name": "void mul_mat_vec_q<(ggml_type)13, (int)1, (int)4, float>(const void *, const void *, T4 *, const char *, int, int, int, int, unsigned long, unsigned long, unsigned long, long)",
+              "ms_per_step": 0.44607246875,
+              "calls_per_step": 1.0
+            },
+            {
+              "name": "ncclDevKernel_AllReduce_Sum_f16_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)",
+              "ms_per_step": 0.4291956041666667,
+              "calls_per_step": 48.0
+            }
+          ]
+        },
+        "1": {
+          "q3_kernel_ms_per_step": 0.78221234375,
+          "q3_calls_per_step": 53,
+          "q3_shapes": [
+            {
+              "deviceId": 1,
+              "name": "void fastllm_gguf_q3_k::Gemv<__half>(const block_q3_K *, const block_q8_1 *, T1 *, int, int)",
+              "family": "Dense GEMV",
+              "gridX": 640,
+              "gridY": 1,
+              "gridZ": 1,
+              "blockX": 256,
+              "blockY": 1,
+              "blockZ": 1,
+              "dynamicSharedMemory": 2880,
+              "staticSharedMemory": 0,
+              "count": 1728,
+              "bytes": 0,
+              "ms": 31.182734,
+              "mean_us": 18.045563657407406,
+              "median_us": 18.048
+            },
+            {
+              "deviceId": 1,
+              "name": "void fastllm_gguf_q3_k::Gemv<__half>(const block_q3_K *, const block_q8_1 *, T1 *, int, int)",
+              "family": "Dense GEMV",
+              "gridX": 384,
+              "gridY": 1,
+              "gridZ": 1,
+              "blockX": 256,
+              "blockY": 1,
+              "blockZ": 1,
+              "dynamicSharedMemory": 2880,
+              "staticSharedMemory": 0,
+              "count": 2400,
+              "bytes": 0,
+              "ms": 30.485853,
+              "mean_us": 12.702438749999999,
+              "median_us": 12.769
+            },
+            {
+              "deviceId": 1,
+              "name": "void fastllm_gguf_q3_k::Gemv<__half>(const block_q3_K *, const block_q8_1 *, T1 *, int, int)",
+              "family": "Dense GEMV",
+              "gridX": 768,
+              "gridY": 1,
+              "gridZ": 1,
+              "blockX": 256,
+              "blockY": 1,
+              "blockZ": 1,
+              "dynamicSharedMemory": 2880,
+              "staticSharedMemory": 0,
+              "count": 576,
+              "bytes": 0,
+              "ms": 12.129165,
+              "mean_us": 21.057578125000003,
+              "median_us": 21.057
+            },
+            {
+              "deviceId": 1,
+              "name": "void fastllm_gguf_q3_k::GemvFourWarps<__half>(const block_q3_K *, const block_q8_1 *, T1 *, int)",
+              "family": "Dense GEMV",
+              "gridX": 256,
+              "gridY": 1,
+              "gridZ": 1,
+              "blockX": 32,
+              "blockY": 4,
+              "blockZ": 1,
+              "dynamicSharedMemory": 0,
+              "staticSharedMemory": 384,
+              "count": 384,
+              "bytes": 0,
+              "ms": 1.294633,
+              "mean_us": 3.371440104166666,
+              "median_us": 3.36
+            }
+          ],
+          "dense_gemv_ms_per_step": 6.128312145833331,
+          "largest_kernels": [
+            {
+              "name": "void FastllmGemvFp32Fp16HyperProjectKernel<(int)256, (int)1, (int)10240>(const float *, const __half *, const __half *, float *, float *, const float *, const float *, int, int, int, int)",
+              "ms_per_step": 1.5426442708333334,
+              "calls_per_step": 96.0
+            },
+            {
+              "name": "void FastllmGemvFp16Fp16Kernel2MultiRow<(int)256, (int)1, (bool)0, (bool)0>(__half *, __half *, __half *, __half *, int, int, bool, __half *, __half *, bool)",
+              "ms_per_step": 1.5127984895833333,
+              "calls_per_step": 120.0
+            },
+            {
+              "name": "FastllmQwen4HyperMixDecodeKernel(const float *, const float *, const __half *, float *)",
+              "ms_per_step": 1.3761295520833334,
+              "calls_per_step": 97.0
+            },
+            {
+              "name": "void <unnamed>::Q8Projection<(ggml_type)42, float, (bool)0, <unnamed>::ResidentView, (int)32>(const block_q8_1 *, T2 *, float *, T4, int, unsigned long)",
+              "ms_per_step": 0.9040072708333334,
+              "calls_per_step": 48.0
+            },
+            {
+              "name": "void fastllm_gguf_q3_k::Gemv<__half>(const block_q3_K *, const block_q8_1 *, T1 *, int, int)",
+              "ms_per_step": 0.7687265833333333,
+              "calls_per_step": 49.0
+            },
+            {
+              "name": "void <unnamed>::Q8Projection<(ggml_type)42, float, (bool)1, <unnamed>::ResidentView, (int)32>(const block_q8_1 *, T2 *, float *, T4, int, unsigned long)",
+              "ms_per_step": 0.6528766145833333,
+              "calls_per_step": 48.0
+            },
+            {
+              "name": "ncclDevKernel_AllReduce_Sum_f32_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)",
+              "ms_per_step": 0.49887340625,
+              "calls_per_step": 48.0
+            },
+            {
+              "name": "void FastllmGemvFp32Fp16Kernel2MultiRow<(int)256, (int)1, (int)2560, (bool)1, (bool)0>(float *, __half *, float *, float *, int, int, const __half *, float *, const float *)",
+              "ms_per_step": 0.44789215625,
+              "calls_per_step": 48.0
+            },
+            {
+              "name": "void mul_mat_vec_q<(ggml_type)13, (int)1, (int)4, float>(const void *, const void *, T4 *, const char *, int, int, int, int, unsigned long, unsigned long, unsigned long, long)",
+              "ms_per_step": 0.44437858333333335,
+              "calls_per_step": 1.0
+            },
+            {
+              "name": "ncclDevKernel_AllReduce_Sum_f16_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)",
+              "ms_per_step": 0.42946963541666666,
+              "calls_per_step": 48.0
+            }
+          ]
+        }
+      },
+      "diagnostics": [
+        {
+          "timestamp": -132108845727,
+          "timestampType": 1,
+          "source": 2,
+          "severity": 1,
+          "text": "Process was launched by the profiler, see /home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/decode-kernel-opt/tmp/nvidia/nsight_systems/quadd_session_103113714/streams/pid_3113731_stdout.log and stderr.log for program output",
+          "globalPid": 333714714263552
+        },
+        {
+          "timestamp": -132087242187,
+          "timestampType": 1,
+          "source": 1,
+          "severity": 1,
+          "text": "Common injection library initialized successfully.",
+          "globalPid": 333714714263552
+        },
+        {
+          "timestamp": -131736599521,
+          "timestampType": 1,
+          "source": 1,
+          "severity": 1,
+          "text": "Buffers holding CUDA trace data will be flushed on CudaProfilerStop() call. See --flush-on-cudaprofilerstop to control this behavior.",
+          "globalPid": 333714714263552
+        },
+        {
+          "timestamp": -131719098776,
+          "timestampType": 1,
+          "source": 1,
+          "severity": 1,
+          "text": "Loaded CUPTI library: /usr/local/cuda-13.1/nsight-systems-2025.5.2/target-linux-x64/libcupti.so.13.1",
+          "globalPid": 333714714263552
+        },
+        {
+          "timestamp": -131719093377,
+          "timestampType": 1,
+          "source": 1,
+          "severity": 2,
+          "text": "Installed CUDA driver version (13.2) is not supported by this build of Nsight Systems. CUDA trace will be collected using libraries for driver version 13.1",
+          "globalPid": 333714714263552
+        },
+        {
+          "timestamp": -131412527756,
+          "timestampType": 1,
+          "source": 1,
+          "severity": 1,
+          "text": "CUDA injection initialized successfully.",
+          "globalPid": 333714714263552
+        },
+        {
+          "timestamp": -18070207134,
+          "timestampType": 1,
+          "source": 1,
+          "severity": 1,
+          "text": "NVTX injection initialized successfully.",
+          "globalPid": 333714714263552
+        },
+        {
+          "timestamp": -536865031,
+          "timestampType": 1,
+          "source": 1,
+          "severity": 1,
+          "text": "Starting the profiling session using NVTX trigger.",
+          "globalPid": 333714714263552
+        },
+        {
+          "timestamp": 0,
+          "timestampType": 1,
+          "source": 3,
+          "severity": 1,
+          "text": "Profiling has started.",
+          "globalPid": -144115188075855872
+        },
+        {
+          "timestamp": 2656926659,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "Not all NVTX events might have been collected.",
+          "globalPid": 333714714263552
+        },
+        {
+          "timestamp": 2656934023,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "No NVTX events collected. Does the process use NVTX?",
+          "globalPid": 333714714263552
+        },
+        {
+          "timestamp": 2656938151,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "Not all CUDA events might have been collected.",
+          "globalPid": 333714714263552
+        },
+        {
+          "timestamp": 2656942889,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 1,
+          "text": "Number of CUDA events collected: \t1535691.",
+          "globalPid": 333714714263552
+        },
+        {
+          "timestamp": 2656947648,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "cuBLAS profiling might have not been started correctly.",
+          "globalPid": 333714714263552
+        },
+        {
+          "timestamp": 2656949131,
+          "timestampType": 2,
+          "source": 3,
+          "severity": 2,
+          "text": "No cuBLAS events collected. Does the process use cuBLAS?",
+          "globalPid": 333714714263552
+        },
+        {
+          "timestamp": 9430955747,
+          "timestampType": 1,
+          "source": 1,
+          "severity": 1,
+          "text": "Stopping the profiling session using NVTX trigger.",
+          "globalPid": 333714714263552
+        },
+        {
+          "timestamp": 9431527233,
+          "timestampType": 1,
+          "source": 3,
+          "severity": 1,
+          "text": "Profiling has stopped.",
+          "globalPid": -144115188075855872
+        },
+        {
+          "timestamp": 9504260358,
+          "timestampType": 1,
+          "source": 1,
+          "severity": 1,
+          "text": "Number of CUPTI events produced: \t1633135, CUPTI buffers: 50.",
+          "globalPid": 333714714263552
+        }
+      ],
+      "token_markers": 129
+    }
+  },
+  "ncu": {
+    "records": {
+      "baseline": [
+        {
+          "kernel": "void quantize_q8_1<__half>(const T1 *, void *, long, long)",
+          "metrics": {
+            "gpu__time_duration.sum": 2688.0,
+            "dram__bytes.sum": 10624.0,
+            "dram__bytes.sum.per_second": 3952380952.38,
+            "dram__throughput.avg.pct_of_peak_sustained_elapsed": 0.62,
+            "sm__throughput.avg.pct_of_peak_sustained_elapsed": 0.96,
+            "sm__pipe_alu_cycles_active.avg.pct_of_peak_sustained_elapsed": 0.39,
+            "sm__pipe_fma_cycles_active.avg.pct_of_peak_sustained_elapsed": 0.61,
+            "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed": 0.0,
+            "sm__warps_active.avg.pct_of_peak_sustained_active": 21.71,
+            "sm__cycles_elapsed.avg.per_second": 1366848301.82,
+            "smsp__warp_issue_stalled_math_pipe_throttle_per_warp_active.pct": 0.37,
+            "smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct": 23.81,
+            "launch__registers_per_thread": 22.0
+          }
+        },
+        {
+          "kernel": "void mul_mat_vec_q<11, 1, 4, __half>(const void *, const void *, T4 *, const char *, int, int, int, int, unsigned long, unsigned long, unsigned long, long)",
+          "metrics": {
+            "gpu__time_duration.sum": 23136.0,
+            "dram__bytes.sum": 7086112.0,
+            "dram__bytes.sum.per_second": 306280774550.48,
+            "dram__throughput.avg.pct_of_peak_sustained_elapsed": 48.73,
+            "sm__throughput.avg.pct_of_peak_sustained_elapsed": 63.53,
+            "sm__pipe_alu_cycles_active.avg.pct_of_peak_sustained_elapsed": 63.53,
+            "sm__pipe_fma_cycles_active.avg.pct_of_peak_sustained_elapsed": 30.41,
+            "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed": 0.13,
+            "sm__warps_active.avg.pct_of_peak_sustained_active": 74.02,
+            "sm__cycles_elapsed.avg.per_second": 1739031608.49,
+            "smsp__warp_issue_stalled_math_pipe_throttle_per_warp_active.pct": 8.95,
+            "smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct": 14.39,
+            "launch__registers_per_thread": 66.0
+          }
+        }
+      ],
+      "v2": [
+        {
+          "kernel": "void quantize_q8_1<__half>(const T1 *, void *, long, long)",
+          "metrics": {
+            "gpu__time_duration.sum": 2688.0,
+            "dram__bytes.sum": 10752.0,
+            "dram__bytes.sum.per_second": 4000000000.0,
+            "dram__throughput.avg.pct_of_peak_sustained_elapsed": 0.63,
+            "sm__throughput.avg.pct_of_peak_sustained_elapsed": 0.96,
+            "sm__pipe_alu_cycles_active.avg.pct_of_peak_sustained_elapsed": 0.39,
+            "sm__pipe_fma_cycles_active.avg.pct_of_peak_sustained_elapsed": 0.6,
+            "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed": 0.0,
+            "sm__warps_active.avg.pct_of_peak_sustained_active": 21.71,
+            "sm__cycles_elapsed.avg.per_second": 1370371586.13,
+            "smsp__warp_issue_stalled_math_pipe_throttle_per_warp_active.pct": 0.36,
+            "smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct": 23.64,
+            "launch__registers_per_thread": 22.0
+          }
+        },
+        {
+          "kernel": "void fastllm_gguf_q3_k::Gemv<__half>(const block_q3_K *, const block_q8_1 *, T1 *, int, int)",
+          "metrics": {
+            "gpu__time_duration.sum": 19744.0,
+            "dram__bytes.sum": 6998784.0,
+            "dram__bytes.sum.per_second": 354476499189.63,
+            "dram__throughput.avg.pct_of_peak_sustained_elapsed": 56.99,
+            "sm__throughput.avg.pct_of_peak_sustained_elapsed": 49.52,
+            "sm__pipe_alu_cycles_active.avg.pct_of_peak_sustained_elapsed": 35.36,
+            "sm__pipe_fma_cycles_active.avg.pct_of_peak_sustained_elapsed": 22.95,
+            "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed": 0.11,
+            "sm__warps_active.avg.pct_of_peak_sustained_active": 83.87,
+            "sm__cycles_elapsed.avg.per_second": 1659631518.73,
+            "smsp__warp_issue_stalled_math_pipe_throttle_per_warp_active.pct": 2.88,
+            "smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct": 47.57,
+            "launch__registers_per_thread": 45.0
+          }
+        }
+      ]
+    },
+    "method": "Actual Q3_K 5120 x 2560 projection and synthetic nonzero FP16 activation; GPU0, cold cache, kernel replay, clocks uncontrolled; hardware traffic is not merely weight bytes divided by duration"
+  },
+  "final_remote_verification": {
+    "protected_after": {
+      "/home/nono/fastllm/lib/python3.12/site-packages/ftllm/libfastllm_tools.so": "032a90cacd3845835039aa6282c93517fc654f3205df04aa466eeae10bd59474",
+      "/home/nono/fastllm/lib/python3.12/site-packages/ftllm/llm.py": "9f16c5c96776a0760eb24dee439bb007d17305590fee51b10f955624b1c153d6",
+      "/home/nono/fastllm/lib/python3.12/site-packages/ftllm/util.py": "8d7d9a00bffd7dfbbc46dd165d423c1a724ce5c524c0d6142bc26fc77affbbbe",
+      "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/native-mixed/libfastllm_tools.so": "6ce666188f12237519947dcf5c329115040efe7ed59676d376e8ea6824b90202"
+    },
+    "protected_unchanged": true,
+    "native_sha256": "8c3c12485b0031d127aa2353b4e3cb40d0f99d97a0cd7a05f5900af8a67d74db",
+    "reused_objects_verified": true,
+    "source_manifest_verified": true,
+    "gpu_processes": "",
+    "gpu_state": "0, 1 MiB, 45\n1, 1 MiB, 50"
+  },
+  "limitations": [
+    "Performance and sanitizer tests use SM75; no cross-architecture speed guarantee.",
+    "Clock frequencies were not locked; tiny operator differences and the small prefill difference are not established gains.",
+    "Profiling has overhead; end-to-end throughput comes from unprofiled runs.",
+    "Identical outputs are demonstrated for these test cases, not all possible model prompts."
+  ],
+  "artifact_root": "benchmark-results/fastllm-gguf-tp2-20261001/decode-kernel-opt"
+}

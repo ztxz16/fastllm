@@ -619,6 +619,22 @@ incompatible shapes/types, small decode batches, CUDA Graph capture and
 insufficient memory retain the existing per-expert implementation.
 Q8 activation quantization can change logits and generated tokens.
 
+The grouped path quantizes each gate/up input token once and gathers packed Q8
+blocks into the expert route layout. Its compact input reuses the product
+buffer before matrix multiplication, so the persistent workspace size does
+not grow. Gather and down-input quantization skip rows beyond the device-side
+active route count while explicitly zeroing padding within active expert
+tiles. Q2_0 tiles use aligned 16-bit loads and register byte permutations;
+their MMA accumulation order and Q8 scale rounding remain unchanged.
+
+The ordinary Q2_0 Dense path also accepts 1–8-row Q8/DP4A MMVQ for
+FP32/FP16/BF16. It requires 64-column alignment and at most 32 KiB of staged
+Q8 activation per block; other shapes retain the existing fallback. This
+Dense change adds activation quantization and can change generated tokens.
+The [Q2_0 TP2 benchmark](qwen3.8-flash-next/README_EN.md#gguf-q2_0-expert-mmq-and-dense-decode-optimization-2026-10-01)
+records 1354.38 token/s for 4096-token prefill (+19.83%) and 70.74 token/s
+decode (+0.85%) on two 22 GiB RTX 2080 Ti cards, with MTP off and Graph on.
+
 `cuda_gguf_moe_host` checks the CPU R4 repacker against an independent decoded
 weight oracle, cross/non-cross gate/up layouts, selected subset changes,
 NUMA row shards, both GPUs, three activation types and immutable host storage.

@@ -223,3 +223,55 @@ Outputs match across the three runs within each chunk group. The two chunk group
 Logical weights come from the TP preparation manifest, loaded memory from `cudaMemGetInfo`, and peaks from `nvidia-smi` sampled every two seconds, which may miss short transients. CPU embedding occupies 2.368 GiB; process host-memory HWM was 41.905 GiB with zero swap. Each GPU holds 49,152 native GGUF expert gate/up and down tensors. CPU/hybrid MoE path counters, expert-cache hits/misses/payload and MTP verifier calls remain zero for all requests. Arithmetic and JSON checks pass, and every 4096-token prefill at chunk=1024 completes without OOM.
 
 [Full per-run data, configuration and validation](../benchmarks/qwen38_flash_next_iq2xs_2080ti_20261001.json). This measurement used an isolated build with diagnostic counters, native library SHA256 `0e9aa1b66b2d502e150395a40bfca36f2b43c0ea937329f43f89d60861add82b`; the installed package was unchanged.
+
+### GGUF Q2_0: expert MMQ and Dense decode optimization (2026-10-01)
+
+The same machine and TP2/Graph/MTP=0 configuration were used to compare `Qwen3.8-Flash-Next-GSQ-RCO-Q2_0` before and after optimization. Both builds used identical input tokens, output lengths, warmup and three-run median timing. Changes include 16-bit Q2 expert MMQ loads with vector unpacking, quantizing each input token once before gathering expert routes, and Q8/DP4A dot products for 1–8-row Q2 Dense operations. Dispatch depends on format and tensor dimensions, with no model-name checks or new environment variables.
+
+| Measurement | Chunk | Before token/s | Three runs after, token/s | Median after, token/s | Change |
+| --- | ---: | ---: | --- | ---: | ---: |
+| Decode, 512 input / 512 output | 32 | 70.14 | 71.12 / 70.74 / 70.44 | **70.74** | +0.85% |
+| Decode, 512 input / 512 output | 512 | 68.91 | 69.76 / 69.58 / 69.49 | **69.58** | +0.97% |
+| 4096-token prefill, 1 output | 1024 | 1130.22 | 1357.01 / 1354.38 / 1352.08 | **1354.38** | **+19.83%** |
+
+Across two Nsight Systems prefill captures, GPU0 expert gate/up kernel time falls from 1041.96 to 706.54 ms, down from 638.04 to 496.87 ms, and routing/quantization/reduction from 232.44 to 124.61 ms. Key expert counts also pass the GPU1 audit. Decode has only seven Q2 Dense projections per step; total Dense GEMV time falls from 6.131 to 6.003 ms, with other quantization formats and the output head still accounting for substantial time.
+
+GPU0 cold-cache NCU replay shows the two Q2 Dense projections increasing DRAM bandwidth utilization from 16.01% / 17.57% to 56.92% / 61.73%, with an additional 2.08 μs input quantization per operation. Q2 expert gate/up MMQ falls from 4.431 to 3.005 ms while DRAM utilization rises from 3.32% to 4.90%. Expert input quantization changes from 676.86 μs to 38.24 μs for token quantization plus 116.13 μs for gathering. MMQ still does not saturate DRAM bandwidth. These counters use real expert snapshots, real Dense weights and synthetic nonzero Dense inputs with uncontrolled clocks; they are isolated-operator measurements, not full-request bandwidth.
+
+Expert input quantization reuses the product buffer, preserving weight storage and persistent workspace size. Logical weights remain 18.6634 GiB per GPU. Used memory after loading and initialization is unchanged at 19.8436 / 19.8416 GiB on GPU0/GPU1; sampled peaks in both complete runs are 20.6855 / 20.4648 GiB. CPU embedding, disk PLE, GPU-resident experts and zero expert-cache budget match the preceding section.
+
+All 16 gate/output tensors from real expert snapshots are bitwise identical to the original implementation. Tests cover grouped experts, 320-column and shorter K tails, TP shards, GPU-assisted prefill of CPU experts, the generic cache and CUDA Graph. An independent CPU Q8 reference validates the new Dense path for FP32/FP16/BF16, 1/3/8 rows and partial output blocks. Dense activation quantization changes numerical results and generated tokens: three runs with the same chunk agree, but the before/after outputs first differ at token 17 / 250 for chunk 32 / 512. The approximately 1% decode difference therefore includes changed routing; use isolated replay to assess individual kernel gains. The 4096-token prefill first token, arithmetic answer and JSON result are unchanged. These checks do not replace a full model quality evaluation.
+
+[Per-run comparison, numerical validation and profiler results](../benchmarks/qwen38_flash_next_q2_0_2080ti_20261001.json). The optimized isolated native library has SHA256 `cdacb884eef2ec3ce0b70386a69f4ec6211c6cd4e42de091e15af9eab8ec38ee`.
+
+### GGUF Q2_0: Q3_K Dense decode optimization (2026-10-02)
+
+The Q2_0 model also uses Q3_K and other formats for Dense weights. This change reduces repeated sub-scale loads and unpacking instructions in Q3_K. Large single-token projections process eight output rows per CUDA block with shared Q8 activations. Smaller projections and long K retain four warps per row to avoid regressions found during shape sweeps. Dispatch uses format, dimensions and alignment, without model-specific checks, additional environment variables, weight conversions or persistent workspace. Floating-point accumulation order is preserved.
+
+The preceding optimized build was rerun as the baseline on the same two 22 GiB RTX 2080 Ti GPUs, with TP2, CUDA Graph enabled, MTP disabled and all experts resident on GPU. Each group has a warmup and three formal runs; values below are medians:
+
+| Test | Chunk | Previous token/s | Current token/s | Change |
+| --- | ---: | ---: | ---: | ---: |
+| Decode, 512 input / 512 output | 32 | 70.69 | **71.61** | +1.30% |
+| Decode, 512 input / 512 output | 512 | 69.51 | **70.63** | +1.61% |
+| 4096 prefill, 1 output | 1024 | 1355.21 | **1358.02** | +0.21% |
+
+All output tokens matched the baseline across 14 requests, including warmups, formal decode/prefill runs, arithmetic and JSON checks. The small prefill difference is treated as measurement variation.
+
+In Nsight Systems, GPU0's 53 Q3_K Dense calls per decode step decreased from 0.958 to 0.787 ms in total. Cold-cache NCU replay of a 5120×2560 Q3_K projection decreased from 23.136 to 19.744 μs; DRAM utilization increased from 48.73% to 56.99%, ALU activity decreased from 63.53% to 35.36%, and registers per thread fell from 66 to 45. Replay uses actual weights and synthetic nonzero input, with unlocked clocks. End-to-end throughput is measured separately without profiling. Other Dense operations, HC projections and cross-GPU reduction still account for much of decode time, limiting the end-to-end gain to roughly 1%–2%.
+
+FP32/FP16/BF16 CPU-reference checks, bitwise comparisons against the original four-warp kernel, partial output rows, dimension boundaries and CUDA Graph replay passed. All 72 public Linear cases matched bitwise. Q2 regression tests and Compute Sanitizer memcheck/synccheck passed, with zero sanitizer errors. Memory use was unchanged: 18.6634 GiB of logical GPU weights per rank, 19.8436 / 19.8416 GiB used after loading and warmup, and sampled peaks of 20.6855 / 20.4648 GiB on GPU0/GPU1.
+
+[Full measurements and validation](../benchmarks/qwen38_flash_next_q3_decode_2080ti_20261002.json). Isolated native build SHA256: `8c3c12485b0031d127aa2353b4e3cb40d0f99d97a0cd7a05f5900af8a67d74db`; installed libraries were preserved. Performance and sanitizer coverage currently target SM75.
+
+### GGUF Q2/Q3 cleanup and regression checks (2026-10-02)
+
+The cleanup shares Q8 input quantization between Dense and grouped experts, Q2 eight-value unpacking, and the Q3 K-accumulation code used by both launch geometries. It retains the measured shape dispatch and fallbacks, removes a duplicate include and unreachable IQ1 initialization in fused gate/up, and preserves weight layouts, arithmetic precision and persistent workspace sizes.
+
+Admission now checks columns against the weight format's block size. Fused gate/up accepts only its implemented IQ2_XXS / IQ2_XS / IQ2_S formats. Unsupported formats and partial weight blocks return false before allocation or device-buffer access, allowing the caller to select its fallback. Boundary regression checks pass, and all 36 supported IQ2 fused-call outputs match the preceding build bitwise.
+
+An audit of 17 GGUF source files found no remaining runtime experiment switches, benchmark hooks or hardcoded model paths. Cache budgets, MTP, TP and Graph controls remain valid configuration options; no switch was added. The cache test entry also now returns explicitly on success, supporting dynamic-loading tests that rename main.
+
+All 12 operator/cache/TP-shard/Graph/memory/synchronization checks pass. All 16 captured expert intermediates, 72 Dense outputs and generated tokens across 14 model requests match the preceding build. Under the same configuration, three-run medians are **71.61 → 71.59 token/s** for chunk-32 decode, **70.63 → 70.67 token/s** for chunk-512 decode, and **1358.02 → 1359.00 token/s** for 4096 prefill. Clocks were unlocked; small differences are not claimed as new optimization gains. Memory use after loading and warmup is unchanged.
+
+[Cleanup record and full regression results](../benchmarks/qwen38_flash_next_gguf_cleanup_2080ti_20261002.json). Isolated build SHA256: `2c60b9f0661321f32447f8d3bd1de75998e6fd9029eda3a95a79aad210241f91`. Runtime validation targets SM75; installed libraries were preserved.

@@ -1,0 +1,527 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-02",
+  "model": "Qwen3.8-Flash-Next-GSQ-RCO-Q2_0",
+  "hardware": {
+    "gpu": "2 x NVIDIA RTX 2080 Ti 22 GiB, SM75, NVLink",
+    "cpu": "AMD EPYC 7452",
+    "ram_gib": 126
+  },
+  "configuration": {
+    "tp": 2,
+    "devices": [
+      0,
+      1
+    ],
+    "moe_devices": [
+      0,
+      1
+    ],
+    "activation": "float16",
+    "cuda_graph": true,
+    "mtp": 0,
+    "expert_cache_bytes": 0,
+    "expert_residency": "all GPU native GGUF",
+    "embedding": "CPU FP32",
+    "ple": "disk",
+    "threads": 28,
+    "max_batch": 1,
+    "context_tokens": 8192,
+    "kv_cache_limit": "1g",
+    "gpu_mem_ratio": 0.95,
+    "prefix_cache": false,
+    "cache_history": false,
+    "thinking": false,
+    "sampling": "greedy",
+    "warmup": "one 512-token decode run per chunk, one prefill run; three formal runs per group",
+    "clock_control": "none"
+  },
+  "timing": {
+    "decode": "511 / (last token arrival - first token arrival)",
+    "prefill": "4096 / TTFT, includes first output token",
+    "statistic": "median of three formal requests",
+    "memory_peak": "nvidia-smi every two seconds; short peaks may be missed"
+  },
+  "changes": [
+    "Reuse the Dense Q8 quantizer for grouped experts, including IQ1_M, with existing scratch buffers",
+    "Share Q2_0 eight-value unpacking between expert GEMV and grouped MMQ",
+    "Share Q3_K partial dot and warp reduction; retain the measured launch geometry and admission policy",
+    "Remove duplicate include and unreachable IQ1 initialization in fused gate/up",
+    "Restrict fused gate/up admission to implemented IQ2 types; validate each weight format block size before allocation"
+  ],
+  "source_sha256": {
+    "src/devices/cuda/fastllm-gguf-q3-k-gemv.cuh": {
+      "before": "d170730fb1b0868788c7729ce003562ae12e3ec9428ae7bde6f8b7ef2a32296f",
+      "after": "ec2b5c4d921c607b03128d352f7919bb61a8058531fa17e32d04c7d9e243f370"
+    },
+    "src/devices/cuda/gguf_mmq/fastllm-gguf-mmq.cu": {
+      "before": "38884d35b1e08f7ffdee8d2dedbd8206b35495584b9014d93cda84aa6a37921a",
+      "after": "71fd270d35c92171b92c1110e9bafb235fd79db7e31d941fc00d934152383886"
+    },
+    "src/devices/cuda/gguf_mmq/fastllm-gguf-moe-grouped.cuh": {
+      "before": "7b4bf6c11a3eb28424d0dc2b76688ef5f7d7cb9b948191a3546be5ea2e92eb5c",
+      "after": "eda026807ca9a4ba9f10bfe00e93036fd1c1ca1baa06cda7e9e3f079f7f4f588"
+    },
+    "src/devices/cuda/moe/fastllm-moe-gguf-q8.cuh": {
+      "before": "e729cab2ada64c7b5bdb92b6dc36ac4560eb9380bb2042ea0fee823b6a99ea21",
+      "after": "92ba0983c9951bf8efebeb5afbd152ecc14c19e736e3558808d6f60a9a301055"
+    },
+    "test/basic/test_cuda_gguf_q2_0.cu": {
+      "before": "7723162dfc99195244dd0d697b9edbb4172d8077fac0c4963e89bd498d10fdc9",
+      "after": "04488f8b97a117c0e5c4923fa4f44bda4e3177e34efd9bf04d950faa83ca9e21"
+    },
+    "test/basic/test_cuda_gguf_moe_cache.cu": {
+      "before": "5307c642f637493072f4917ad4a830e5e2b9a3fdfbadfe724469b826b52226f7",
+      "after": "1424c8c36d1de3b3cf349bd25289e9911160ae2dc1547e98cf3ab71bff159980"
+    }
+  },
+  "final_test_source_sha256": {
+    "test/basic/test_cuda_gguf_moe_cache.cu": "1424c8c36d1de3b3cf349bd25289e9911160ae2dc1547e98cf3ab71bff159980"
+  },
+  "environment_audit": {
+    "scanned_files": [
+      "src/devices/cuda/fastllm-gguf-iq3-gemv.cuh",
+      "src/devices/cuda/fastllm-gguf-q3-k-gemv.cuh",
+      "src/devices/cuda/fastllm-gguf-gemv.cuh",
+      "src/devices/cuda/fastllm-gguf-dequant.cuh",
+      "src/devices/cuda/fastllm-gguf-small-mmvq.cuh",
+      "src/devices/cuda/gguf_mmq/fastllm-gguf-moe-grouped.cuh",
+      "src/devices/cuda/gguf_mmq/fastllm-gguf-iq2-gemv.cuh",
+      "src/devices/cuda/gguf_mmq/fastllm-gguf-mmq.cu",
+      "src/devices/cuda/gguf_mmq/fastllm-gguf-mmq-common.cuh",
+      "src/devices/cuda/gguf_mmq/vecdotq.cuh",
+      "src/devices/cuda/gguf_mmq/mmq.cuh",
+      "src/devices/cuda/gguf_mmq/mma.cuh",
+      "src/devices/cuda/gguf_mmq/fastllm-gguf-moe-stream.cu",
+      "src/devices/cuda/moe/fastllm-moe-gguf-q8.cuh",
+      "src/devices/cuda/moe/fastllm-moe-gguf-common.cuh",
+      "src/devices/cuda/moe/fastllm-moe-gguf-cache.cu",
+      "src/devices/cuda/fastllm-ggml-cuda.cu"
+    ],
+    "gguf_runtime_environment_variables": [],
+    "benchmark_hooks_in_production": false,
+    "hardcoded_model_or_ssd_paths": false,
+    "preserved_runtime_options": [
+      "FASTLLM_MOE_CUDA_CACHE_BYTES_<device>: per-device memory budget",
+      "FASTLLM_QWEN4_ENABLE_MTP / --mtp: speculation mode",
+      "FASTLLM_TP / --tp: device distribution",
+      "CUDA Graph, prefix-cache and diagnostic options outside the GGUF kernels"
+    ],
+    "conclusion": "No redundant GGUF runtime environment switches remain; no active configuration option was removed."
+  },
+  "results": {
+    "baseline": {
+      "native_sha256": "8c3c12485b0031d127aa2353b4e3cb40d0f99d97a0cd7a05f5900af8a67d74db",
+      "groups": {
+        "decode-chunk32": {
+          "chunk": 32,
+          "input_tokens": 512,
+          "output_tokens": 512,
+          "runs_tps": [
+            71.86018285310897,
+            71.6101855692594,
+            71.38660812812478
+          ],
+          "median_tps": 71.6101855692594,
+          "median_ttft_s": 1.0621870937757194,
+          "sha256": "0c48c0288384eefcfdaff25b9d9ab6540643814f20b6cecf0e1af1ac4ebca53a"
+        },
+        "decode-chunk512": {
+          "chunk": 512,
+          "input_tokens": 512,
+          "output_tokens": 512,
+          "runs_tps": [
+            70.80476116194284,
+            70.63264412118453,
+            70.51140629596668
+          ],
+          "median_tps": 70.63264412118453,
+          "median_ttft_s": 0.4372947020456195,
+          "sha256": "058c9cee2cbb34e13b6c9636aad60fe95f2adf38abc9e89f4248dcece1bbd85e"
+        },
+        "prefill": {
+          "chunk": 1024,
+          "input_tokens": 4096,
+          "output_tokens": 1,
+          "runs_tps": [
+            1360.546000529437,
+            1357.4089728774309,
+            1358.0202273210575
+          ],
+          "median_tps": 1358.0202273210575,
+          "median_ttft_s": 3.0161553691141307,
+          "sha256": "543266b735ecac89bf4c2a6ee49c6cbf5827e4686b59aa8495ff1fa8b48bce7d"
+        }
+      },
+      "logical_weight_gib": [
+        18.663426160812378,
+        18.663426160812378
+      ],
+      "loaded_gpu_gib": [
+        19.84356689453125,
+        19.84161376953125
+      ],
+      "sampled_peak_gpu_gib": [
+        20.685546875,
+        20.46484375
+      ],
+      "sanity": {
+        "arithmetic": "1073",
+        "json-task": "{\"items\": [1, 2, 5, 9], \"sum\": 17, \"count\": 4}"
+      },
+      "closeout": {
+        "exit_code": 0,
+        "error": null,
+        "protected_unchanged": true,
+        "gpu_processes": "",
+        "elapsed_s": 207.23176169395447
+      }
+    },
+    "candidate": {
+      "native_sha256": "2c60b9f0661321f32447f8d3bd1de75998e6fd9029eda3a95a79aad210241f91",
+      "groups": {
+        "decode-chunk32": {
+          "chunk": 32,
+          "input_tokens": 512,
+          "output_tokens": 512,
+          "runs_tps": [
+            71.91707372243668,
+            71.58818243387816,
+            71.45761407393924
+          ],
+          "median_tps": 71.58818243387816,
+          "median_ttft_s": 1.064150305930525,
+          "sha256": "0c48c0288384eefcfdaff25b9d9ab6540643814f20b6cecf0e1af1ac4ebca53a"
+        },
+        "decode-chunk512": {
+          "chunk": 512,
+          "input_tokens": 512,
+          "output_tokens": 512,
+          "runs_tps": [
+            70.81970993891542,
+            70.66618579767567,
+            70.53917249449776
+          ],
+          "median_tps": 70.66618579767567,
+          "median_ttft_s": 0.4371596649289131,
+          "sha256": "058c9cee2cbb34e13b6c9636aad60fe95f2adf38abc9e89f4248dcece1bbd85e"
+        },
+        "prefill": {
+          "chunk": 1024,
+          "input_tokens": 4096,
+          "output_tokens": 1,
+          "runs_tps": [
+            1359.7849331315524,
+            1359.0024597627223,
+            1357.724136756502
+          ],
+          "median_tps": 1359.0024597627223,
+          "median_ttft_s": 3.0139754130505025,
+          "sha256": "543266b735ecac89bf4c2a6ee49c6cbf5827e4686b59aa8495ff1fa8b48bce7d"
+        }
+      },
+      "logical_weight_gib": [
+        18.663426160812378,
+        18.663426160812378
+      ],
+      "loaded_gpu_gib": [
+        19.84356689453125,
+        19.84161376953125
+      ],
+      "sampled_peak_gpu_gib": [
+        20.685546875,
+        20.46484375
+      ],
+      "sanity": {
+        "arithmetic": "1073",
+        "json-task": "{\"items\": [1, 2, 5, 9], \"sum\": 17, \"count\": 4}"
+      },
+      "closeout": {
+        "exit_code": 0,
+        "error": null,
+        "protected_unchanged": true,
+        "gpu_processes": "",
+        "elapsed_s": 207.25158500671387
+      }
+    }
+  },
+  "output_comparison": {
+    "decode-chunk32-warmup": {
+      "equal": true,
+      "tokens": 512,
+      "sha256": "0c48c0288384eefcfdaff25b9d9ab6540643814f20b6cecf0e1af1ac4ebca53a"
+    },
+    "decode-chunk32-1": {
+      "equal": true,
+      "tokens": 512,
+      "sha256": "0c48c0288384eefcfdaff25b9d9ab6540643814f20b6cecf0e1af1ac4ebca53a"
+    },
+    "decode-chunk32-2": {
+      "equal": true,
+      "tokens": 512,
+      "sha256": "0c48c0288384eefcfdaff25b9d9ab6540643814f20b6cecf0e1af1ac4ebca53a"
+    },
+    "decode-chunk32-3": {
+      "equal": true,
+      "tokens": 512,
+      "sha256": "0c48c0288384eefcfdaff25b9d9ab6540643814f20b6cecf0e1af1ac4ebca53a"
+    },
+    "decode-chunk512-warmup": {
+      "equal": true,
+      "tokens": 512,
+      "sha256": "058c9cee2cbb34e13b6c9636aad60fe95f2adf38abc9e89f4248dcece1bbd85e"
+    },
+    "decode-chunk512-1": {
+      "equal": true,
+      "tokens": 512,
+      "sha256": "058c9cee2cbb34e13b6c9636aad60fe95f2adf38abc9e89f4248dcece1bbd85e"
+    },
+    "decode-chunk512-2": {
+      "equal": true,
+      "tokens": 512,
+      "sha256": "058c9cee2cbb34e13b6c9636aad60fe95f2adf38abc9e89f4248dcece1bbd85e"
+    },
+    "decode-chunk512-3": {
+      "equal": true,
+      "tokens": 512,
+      "sha256": "058c9cee2cbb34e13b6c9636aad60fe95f2adf38abc9e89f4248dcece1bbd85e"
+    },
+    "prefill-warmup": {
+      "equal": true,
+      "tokens": 1,
+      "sha256": "543266b735ecac89bf4c2a6ee49c6cbf5827e4686b59aa8495ff1fa8b48bce7d"
+    },
+    "prefill-1": {
+      "equal": true,
+      "tokens": 1,
+      "sha256": "543266b735ecac89bf4c2a6ee49c6cbf5827e4686b59aa8495ff1fa8b48bce7d"
+    },
+    "prefill-2": {
+      "equal": true,
+      "tokens": 1,
+      "sha256": "543266b735ecac89bf4c2a6ee49c6cbf5827e4686b59aa8495ff1fa8b48bce7d"
+    },
+    "prefill-3": {
+      "equal": true,
+      "tokens": 1,
+      "sha256": "543266b735ecac89bf4c2a6ee49c6cbf5827e4686b59aa8495ff1fa8b48bce7d"
+    },
+    "arithmetic": {
+      "equal": true,
+      "tokens": 4,
+      "sha256": "9f6c3b6296b056a2d0617cd32bc8fe056b768c80f7fa93509d4ef7fcdd323b9a"
+    },
+    "json-task": {
+      "equal": true,
+      "tokens": 28,
+      "sha256": "3686ffbab987beed5999cf44776b14c9e2e6620acf239b2c96c171b1b4dbea98"
+    }
+  },
+  "throughput_change_percent": {
+    "decode-chunk32": -0.030726264994751507,
+    "decode-chunk512": 0.04748749945364672,
+    "prefill": 0.07232826300402895
+  },
+  "tests": {
+    "passed": true,
+    "cases": [
+      {
+        "name": "q2",
+        "command": [
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/q2-q3-cleanup/candidate/q2-test"
+        ],
+        "exit_code": 0,
+        "seconds": 0.9161133766174316
+      },
+      {
+        "name": "memcheck-q2",
+        "command": [
+          "/usr/local/cuda/bin/compute-sanitizer",
+          "--tool",
+          "memcheck",
+          "--error-exitcode",
+          "88",
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/expert-prefill/grouped-loader",
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/q2-q3-cleanup/candidate/q2-test.so"
+        ],
+        "exit_code": 0,
+        "seconds": 1.4168727397918701
+      },
+      {
+        "name": "q3",
+        "command": [
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/q2-q3-cleanup/candidate/q3-test"
+        ],
+        "exit_code": 0,
+        "seconds": 1.016026496887207
+      },
+      {
+        "name": "memcheck-q3",
+        "command": [
+          "/usr/local/cuda/bin/compute-sanitizer",
+          "--tool",
+          "memcheck",
+          "--error-exitcode",
+          "88",
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/expert-prefill/grouped-loader",
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/q2-q3-cleanup/candidate/q3-test.so"
+        ],
+        "exit_code": 0,
+        "seconds": 1.266444206237793
+      },
+      {
+        "name": "synccheck-q3",
+        "command": [
+          "/usr/local/cuda/bin/compute-sanitizer",
+          "--tool",
+          "synccheck",
+          "--error-exitcode",
+          "88",
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/expert-prefill/grouped-loader",
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/q2-q3-cleanup/candidate/q3-test.so"
+        ],
+        "exit_code": 0,
+        "seconds": 1.2161731719970703
+      },
+      {
+        "name": "grouped",
+        "command": [
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/expert-prefill/grouped-loader",
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/q2-kernel-opt/v2/cache-test.so",
+          "--grouped"
+        ],
+        "exit_code": 0,
+        "seconds": 9.028768062591553
+      },
+      {
+        "name": "host",
+        "command": [
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/expert-prefill/grouped-loader",
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/q2-kernel-opt/v2/cache-test.so",
+          "--host"
+        ],
+        "exit_code": 0,
+        "seconds": 1.517021656036377
+      },
+      {
+        "name": "tp-shards",
+        "command": [
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/expert-prefill/grouped-loader",
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/q2-kernel-opt/v2/cache-test.so",
+          "--tp-shards"
+        ],
+        "exit_code": 0,
+        "seconds": 4.9216883182525635
+      },
+      {
+        "name": "cache",
+        "command": [
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/expert-prefill/grouped-loader",
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/q2-q3-cleanup/candidate/cache-test.so"
+        ],
+        "exit_code": 0,
+        "seconds": 77.08685564994812
+      },
+      {
+        "name": "memcheck-grouped",
+        "command": [
+          "/usr/local/cuda/bin/compute-sanitizer",
+          "--tool",
+          "memcheck",
+          "--report-api-errors",
+          "no",
+          "--error-exitcode",
+          "88",
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/expert-prefill/grouped-loader",
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/q2-q3-cleanup/candidate/cache-test.so",
+          "--grouped"
+        ],
+        "exit_code": 0,
+        "seconds": 11.131805419921875
+      },
+      {
+        "name": "real-expert-replay",
+        "command": [
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/q2-kernel-opt/replay",
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/q2-iq2-wave"
+        ],
+        "exit_code": 0,
+        "seconds": 11.186249732971191
+      },
+      {
+        "name": "dense-replay",
+        "command": [
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/decode-kernel-opt/dense_replay",
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/q2-iq2-wave",
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/q2-q3-cleanup/candidate-dense"
+        ],
+        "exit_code": 0,
+        "seconds": 3.4693288803100586
+      }
+    ],
+    "failed_harness_attempts": [
+      {
+        "name": "cache",
+        "command": [
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/expert-prefill/grouped-loader",
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/q2-kernel-opt/v2/cache-test.so"
+        ],
+        "exit_code": -11,
+        "seconds": 78.18997430801392
+      }
+    ],
+    "harness_fix": "Explicit return 0 in the cache test entry; renamed main in dlopen builds lacks the special implicit return of main."
+  },
+  "dense_replay": {
+    "count": 72,
+    "all_exact": true
+  },
+  "supported_gate_up": {
+    "cases": 36,
+    "runs": [
+      {
+        "variant": "baseline",
+        "exit_code": 0,
+        "command": [
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/q2-q3-cleanup/gate_probe",
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/q2-q3-cleanup/gate-baseline"
+        ],
+        "seconds": 0.7156057357788086
+      },
+      {
+        "variant": "candidate",
+        "exit_code": 0,
+        "command": [
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/q2-q3-cleanup/gate_probe",
+          "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/q2-q3-cleanup/gate-candidate"
+        ],
+        "seconds": 0.6149537563323975
+      }
+    ],
+    "all_exact": true
+  },
+  "real_expert_tensors_bitwise_equal": 16,
+  "final_remote_verification": {
+    "native_sha256": "2c60b9f0661321f32447f8d3bd1de75998e6fd9029eda3a95a79aad210241f91",
+    "protected_after": {
+      "/home/nono/fastllm/lib/python3.12/site-packages/ftllm/libfastllm_tools.so": "032a90cacd3845835039aa6282c93517fc654f3205df04aa466eeae10bd59474",
+      "/home/nono/fastllm/lib/python3.12/site-packages/ftllm/llm.py": "9f16c5c96776a0760eb24dee439bb007d17305590fee51b10f955624b1c153d6",
+      "/home/nono/fastllm/lib/python3.12/site-packages/ftllm/util.py": "8d7d9a00bffd7dfbbc46dd165d423c1a724ce5c524c0d6142bc26fc77affbbbe",
+      "/home/nono/fastllm_new/compare-20260922/fastllm-gguf-tp2-20261001/native-mixed/libfastllm_tools.so": "6ce666188f12237519947dcf5c329115040efe7ed59676d376e8ea6824b90202"
+    },
+    "protected_unchanged": true,
+    "reused_objects_verified": 155,
+    "build_source_files_verified": 158,
+    "final_test_source_sha256": {
+      "test/basic/test_cuda_gguf_moe_cache.cu": "1424c8c36d1de3b3cf349bd25289e9911160ae2dc1547e98cf3ab71bff159980"
+    },
+    "gpu_processes": "",
+    "gpu_state": "0, NVIDIA GeForce RTX 2080 Ti, 1, 0\n1, NVIDIA GeForce RTX 2080 Ti, 1, 0"
+  },
+  "limitations": [
+    "GPU compilation and runtime validation target SM75.",
+    "No clocks were locked; small throughput differences are measurement variation.",
+    "Baseline measurements reuse the immediately preceding Q3 optimization run under identical configuration."
+  ],
+  "artifact_root": "benchmark-results/fastllm-gguf-tp2-20261001/q2-q3-cleanup"
+}
