@@ -163,6 +163,81 @@ __global__ void IndexScoresPrefill(const float *__restrict__ q, const float *__r
     if (lane == 0) scores[(size_t)query * keys + key] = score;
 }
 
+constexpr int kIndexerKeysPerWarp = 16;
+constexpr int kIndexerQueryTile = 2;
+constexpr int kIndexerWarps = 4;
+
+// Reuse each key fragment across two query rows, and each query-head fragment
+// across 16 keys. Keep the original per-lane sums, shuffle tree and head order.
+__global__ void IndexScoresPrefillTiled(const float *__restrict__ q, const float *__restrict__ k,
+                                        const BF16 *__restrict__ weights, float *__restrict__ scores,
+                                        int queries, int keys, int queryStart) {
+    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    int column = lane % 16, headOffset = lane / 16;
+    int firstKey = (blockIdx.x * kIndexerWarps + warp) * kIndexerKeysPerWarp;
+    if (firstKey >= keys) return;
+    float keyLow[kIndexerKeysPerWarp][4], keyHigh[kIndexerKeysPerWarp][4];
+    #pragma unroll
+    for (int j = 0; j < kIndexerKeysPerWarp; ++j) {
+        int key = firstKey + j;
+        #pragma unroll
+        for (int d = 0; d < 4; ++d) {
+            keyLow[j][d] = key < keys ? k[(size_t)key * 128 + column + d * 32] : 0;
+            keyHigh[j][d] = key < keys ? k[(size_t)key * 128 + column + 16 + d * 32] : 0;
+        }
+    }
+    #pragma unroll
+    for (int qi = 0; qi < kIndexerQueryTile; ++qi) {
+        int query = blockIdx.y * kIndexerQueryTile + qi;
+        if (query >= queries) break;
+        if (firstKey > queryStart + query) {
+            if (lane == 0) {
+                #pragma unroll
+                for (int j = 0; j < kIndexerKeysPerWarp; ++j)
+                    if (firstKey + j < keys) scores[(size_t)query * keys + firstKey + j] = -INFINITY;
+            }
+            continue;
+        }
+        float sums[kIndexerKeysPerWarp] = {};
+        #pragma unroll
+        for (int head = 0; head < 16; head += 2) {
+            const float *row = q + ((size_t)query * 16 + head + headOffset) * 128;
+            float queryLow[4], queryHigh[4];
+            #pragma unroll
+            for (int d = 0; d < 4; ++d) {
+                queryLow[d] = row[column + d * 32];
+                queryHigh[d] = row[column + 16 + d * 32];
+            }
+            float firstWeight = (float)weights[query * 16 + head];
+            float secondWeight = (float)weights[query * 16 + head + 1];
+            #pragma unroll
+            for (int j = 0; j < kIndexerKeysPerWarp; ++j) {
+                float low = 0, high = 0;
+                #pragma unroll
+                for (int d = 0; d < 4; ++d) {
+                    low += queryLow[d] * keyLow[j][d];
+                    high += queryHigh[d] * keyHigh[j][d];
+                }
+                float dot = low + high;
+                #pragma unroll
+                for (int offset = 8; offset; offset >>= 1)
+                    dot += __shfl_down_sync(0xffffffff, dot, offset, 16);
+                float first = __shfl_sync(0xffffffff, dot, 0);
+                float second = __shfl_sync(0xffffffff, dot, 16);
+                sums[j] += fmaxf(first, 0.0f) * firstWeight;
+                sums[j] += fmaxf(second, 0.0f) * secondWeight;
+            }
+        }
+        if (lane == 0) {
+            #pragma unroll
+            for (int j = 0; j < kIndexerKeysPerWarp; ++j)
+                if (firstKey + j < keys)
+                    scores[(size_t)query * keys + firstKey + j] =
+                        firstKey + j <= queryStart + query ? sums[j] : -INFINITY;
+        }
+    }
+}
+
 __device__ int KeyIndex(const int *indices, int query, int slot, int count,
                         int past, int window) {
     if (indices) return indices[(size_t)query * count + slot];
@@ -546,10 +621,20 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
         (float *)q.cudaData, dim, 0, fp8);
     RoundIndexer<<<keys, 128>>>((const BF16 *)packedKeys.cudaData,
         (float *)k.cudaData, stride, stride - dim, fp8);
-    if (queries > 1 && heads == 16 && dim == 128) {
-        IndexScoresPrefill<<<dim3((keys + 7) / 8, queries), 256>>>((const float *)q.cudaData,
-            (const float *)k.cudaData, (const BF16 *)weights.cudaData,
-            (float *)scores.cudaData, keys, queryStart);
+    if (queries > 1 && heads == 16) {
+        // A larger tile amortizes operand loads once there are enough tiles
+        // to fill the GPU. Keep the smaller tile for short/underfilled work.
+        if ((int64_t)queries * keys >= 128 * 1024) {
+            constexpr int keysPerBlock = kIndexerKeysPerWarp * kIndexerWarps;
+            IndexScoresPrefillTiled<<<dim3((keys + keysPerBlock - 1) / keysPerBlock,
+                (queries + kIndexerQueryTile - 1) / kIndexerQueryTile), kIndexerWarps * 32>>>(
+                (const float *)q.cudaData, (const float *)k.cudaData,
+                (const BF16 *)weights.cudaData, (float *)scores.cudaData, queries, keys, queryStart);
+        } else {
+            IndexScoresPrefill<<<dim3((keys + 7) / 8, queries), 256>>>((const float *)q.cudaData,
+                (const float *)k.cudaData, (const BF16 *)weights.cudaData,
+                (float *)scores.cudaData, keys, queryStart);
+        }
     } else {
         IndexScores<<<dim3((keys + 7) / 8, queries), 256>>>((const float *)q.cudaData,
             (const float *)k.cudaData, (const BF16 *)weights.cudaData,
