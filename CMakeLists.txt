@@ -801,6 +801,17 @@ if (UNIT_TEST)
     target_include_directories(cpu_moe_cache_layout_test PRIVATE include)
     fastllm_add_checked_test(cpu_moe_cache_layout cpu_moe_cache_layout_test "PASS: cache size classes" 60)
 
+    add_executable(cpu_cuda_embedding_policy_test test/basic/test_cpu_cuda_embedding_policy.cpp)
+    target_link_libraries(cpu_cuda_embedding_policy_test PRIVATE fastllm)
+    foreach(graph_default 0 1)
+        add_test(NAME cpu_cuda_embedding_policy_${graph_default}
+                 COMMAND cpu_cuda_embedding_policy_test ${graph_default})
+        set_tests_properties(cpu_cuda_embedding_policy_${graph_default} PROPERTIES
+            ENVIRONMENT "FASTLLM_CUDA_GRAPH=${graph_default}"
+            PASS_REGULAR_EXPRESSION "PASS: explicit CUDA embedding policy"
+            TIMEOUT 60)
+    endforeach()
+
     add_executable(device_operator_lifetime_test test/basic/test_device_operator_lifetime.cpp)
     target_link_libraries(device_operator_lifetime_test PRIVATE fastllm)
     add_test(NAME device_operator_lifetime COMMAND device_operator_lifetime_test)

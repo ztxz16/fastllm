@@ -896,7 +896,8 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         dest = "prefix_cache_snapshot_max_records", type = int, default = -1,
                         help = "全局最多保留的前缀缓存快照数，对应 FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_RECORDS")
     parser.add_argument("--gpu_mem_ratio", type = float, default = 0.9, help = "GPU显存使用比例，如0.9表示使用90%%的显存")
-    parser.add_argument("--cuda_slab", type = int, default = 0, help = "CUDA模型权重slab大小（MB），0表示关闭")
+    parser.add_argument("--cuda_slab", type = int, default = None,
+                        help = "CUDA模型权重slab大小（MiB）；默认按模型选择，0表示关闭")
     parser.add_argument("--mtp", type = int, default = 0, help = "支持MTP的模型每步生成的draft token数，0表示关闭（默认），当前最大8")
     parser.add_argument("--mtp_fp8_draft_head", "--mtp-fp8-draft-head",
                         type = int, choices = [0, 1], default = None,
@@ -986,6 +987,10 @@ def make_normal_llm_model(args, startup_progress = None):
 
     user_set_device = bool(args.device and args.device != "")
     user_set_moe_device = bool(args.moe_device and args.moe_device != "")
+    # Resolve this after loading a saved JSON configuration. An explicit zero
+    # must remain an opt-out, including when another model previously used slabs.
+    cuda_slab_auto = getattr(args, "cuda_slab", None) is None
+    args.cuda_slab = 0 if cuda_slab_auto else max(0, int(args.cuda_slab))
     if str(getattr(args, "speculative_algorithm", "") or "").strip().lower() == "off":
         # Explicitly disabling speculation takes precedence over saved draft settings.
         args.mtp = args.dspark = 0
@@ -1537,7 +1542,7 @@ def make_normal_llm_model(args, startup_progress = None):
         # Large MoE checkpoints have tens of thousands of routed-expert tensors.
         # Pack their TP shards into slabs to avoid exhausting the CUDA driver's
         # allocation-count limit before device memory is full.
-        if args.cuda_slab <= 0:
+        if cuda_slab_auto:
             # Laguna TP=4 owns 64 experts/rank.  Its merged gate-up and down
             # sources are 6 MiB and 3 MiB, and one layer is exactly 576 MiB per
             # rank.  A 96 MiB slab packs both shapes and the whole layer without
@@ -1546,7 +1551,7 @@ def make_normal_llm_model(args, startup_progress = None):
             args.cuda_slab = (96 if is_laguna_hybrid_tp_model and
                               _thread_tp_cuda_device_count(args.tp) == 4
                               else 256)
-    if (is_qwen38_flash_next_model and args.cuda_slab <= 0 and
+    if (is_qwen38_flash_next_model and cuda_slab_auto and
             _uses_cuda_device(args.device) and
             (args.moe_device_layers >= 0 or
              _uses_cuda_device(args.moe_device))):
@@ -1556,6 +1561,15 @@ def make_normal_llm_model(args, startup_progress = None):
         # avoids CUDA page/allocation overhead from tens of thousands of tiny
         # expert tensors.
         args.cuda_slab = 225
+    elif (is_qwen38_flash_next_model and cuda_slab_auto and
+            gguf_config is not None and _uses_cuda_device(args.device) and
+            args.moe_device_layers < 0 and
+            str(args.moe_device).strip().lower() in ("cpu", "numa", "disk")):
+        # Host-offloaded experts have their own cache arena. Pack the persistent
+        # dense GPU weights instead: their many 6.25 MiB and smaller allocations
+        # otherwise waste hundreds of MiB at the CUDA allocation granularity.
+        # A 64 MiB slab retains 256-byte alignment and the existing compute paths.
+        args.cuda_slab = 64
     if ((args.device and args.device.find("numa") != -1) or args.moe_device.find("numa") != -1 or
         (args.device and args.device.find("tfacc") != -1) or args.moe_device.find("tfacc") != -1):
         os.environ["FASTLLM_ACTIVATE_NUMA"] = "ON"

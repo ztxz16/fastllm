@@ -292,6 +292,7 @@ namespace fastllm {
     static bool kvCacheInCPU = false;
     static bool historyCacheInCPU = false;
     static bool cudaEmbedding = false;
+    static bool cudaEmbeddingConfigured = false;
     static bool cudaSharedExpert = false;
     static int cudaSlabMB = 0;
     static std::atomic<uint64_t> moeCudaCacheBytes{0};
@@ -416,10 +417,13 @@ namespace fastllm {
 
     void SetCudaEmbedding(bool v) {
         cudaEmbedding = v;
+        cudaEmbeddingConfigured = true;
     }
 
     bool GetCudaEmbedding() {
-        return cudaEmbedding || GetFastllmEnv().cudaGraph;
+        // Graph mode supplies a default, but must not override an explicit
+        // opt-out (for example --low_gpu_mem on a CPU-offloaded MoE model).
+        return cudaEmbeddingConfigured ? cudaEmbedding : GetFastllmEnv().cudaGraph;
     }
 
     bool GetCudaEmbeddingRequested() {
