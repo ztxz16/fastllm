@@ -150,8 +150,9 @@ NaiveN05FlashModel::GetTensorMap(const std::vector<std::string> &names) {
                    device.first.rfind("multicuda", 0) == 0;
         });
     };
-    // Keep packed original E4M3 scales on CUDA. Native kernels decode them
-    // on demand, preserving independent gate/up globals and BF16 rounding.
+    // Keep original E4M3 scales in the packed CUDA source layout. Grouped
+    // Marlin validates and replaces it once during warmup; unsupported
+    // layouts retain the native kernels and independent gate/up globals.
     // CPU/NUMA keeps the original compact checkpoint layout.
     const bool cudaExperts = usesCuda(moeDeviceMap.empty() ? deviceMap : moeDeviceMap) ||
                             (moeDeviceLayers >= 0 && usesCuda(layeredMoeDeviceMap));

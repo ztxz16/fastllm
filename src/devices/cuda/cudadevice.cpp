@@ -9654,7 +9654,8 @@ namespace fastllm {
         for (int slot = 2; slot < weightsBatch; ++slot) {
             Data *weight = weights[slot];
             if (weight != nullptr &&
-                weight->dataType == DataType::NVFP4_BLOCK_16_E4M3 &&
+                (weight->dataType == DataType::NVFP4_BLOCK_16_E4M3 ||
+                 weight->dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED) &&
                 weight->cudaData == nullptr) {
                 return true;
             }
@@ -9680,10 +9681,12 @@ namespace fastllm {
         bool hasCandidate =
             weights != nullptr && weightsBatch >= 4 &&
             weights[2] != nullptr &&
-            weights[2]->dataType == DataType::NVFP4_BLOCK_16_E4M3;
+            (weights[2]->dataType == DataType::NVFP4_BLOCK_16_E4M3 ||
+             weights[2]->dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED);
         if (gateType != MoeGateSwiglu ||
             (input.dataType != DataType::FLOAT16 &&
-             input.dataType != DataType::FLOAT32) ||
+             input.dataType != DataType::FLOAT32 &&
+             input.dataType != DataType::BFLOAT16) ||
             input.dataDevice != DataDevice::CUDA ||
             input.dims.size() != 2 || input.dims[0] != batch ||
             batch <= 0 || topk <= 0 || topk > 16 ||

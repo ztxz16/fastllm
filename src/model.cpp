@@ -848,7 +848,8 @@ namespace fastllm {
         if (deviceIds.size() > 1) {
             deviceIds = {deviceIds[0]};
         }
-        if (data.dataType == DataType::NVFP4_BLOCK_16_E4M3) {
+        if (data.dataType == DataType::NVFP4_BLOCK_16_E4M3 ||
+            data.dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED) {
             // Marlin replaces this source allocation with its consolidated
             // layout during warmup, so it must be independently releasable.
             data.directMemory = true;

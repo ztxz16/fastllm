@@ -48,7 +48,8 @@ template <const fastllm_marlin_moe_types::ScalarTypeId a_type_id,
           const int threads, const int thread_m_blocks,
           const int thread_n_blocks, const int thread_k_blocks,
           const bool m_block_size_8, const int stages,
-          const int group_blocks, const bool is_zp_float>
+          const int group_blocks, const bool is_zp_float,
+          const bool nvfp4_gate_up = false>
 __global__ void Marlin(
     const int4 *__restrict__ A, const int4 *__restrict__ B,
     int4 *__restrict__ C, int4 *__restrict__ C_tmp,
@@ -239,7 +240,8 @@ template <const fastllm_marlin_moe_types::ScalarTypeId a_type_id,  // A ScalarTy
                              // fetch pipeline
           const int group_blocks,  // number of consecutive 16x16 blocks
                                    // with a separate quantization scale
-          const bool is_zp_float   // is zero point of float16 type?
+          const bool is_zp_float,  // is zero point of float16 type?
+          const bool nvfp4_gate_up = false  // independent gate/up global scales
           >
 __global__ void Marlin(
     const int4* __restrict__ A,  // fp16 input matrix of shape mxk
@@ -542,7 +544,7 @@ __global__ void Marlin(
     expert_id = expert_ids_ptr[block_id];
 
     if constexpr (b_type == fastllm_marlin_moe_types::kFE2M1f && s_type == fastllm_marlin_moe_types::kFE4M3fn) {
-      global_scale_f32 = global_scale_ptr[expert_id];
+      global_scale_f32 = global_scale_ptr[expert_id * (nvfp4_gate_up ? 2 : 1)];
     }
 
     B_expert_off = expert_id * prob_n * prob_k / (pack_factor * 4);
@@ -1789,13 +1791,22 @@ __global__ void Marlin(
     int c_sh_rd = c_sh_stride * (threadIdx.x / (2 * thread_n_blocks)) +
                   (threadIdx.x % (2 * thread_n_blocks));
 
+    // Each output tile stays within one gate/up half (both are N-tile aligned).
+    // Apply the checkpoint global before the first BF16 rounding, rather than
+    // moving an up/gate ratio through the already-rounded activation.
+    float output_global_scale = global_scale_f32;
+    if constexpr (nvfp4_gate_up) {
+      output_global_scale = global_scale_ptr[expert_id * 2 +
+          (slice_col * 16 * thread_n_blocks >= prob_n / 2 ? 1 : 0)];
+    }
+
     // We first reorder in shared memory to guarantee the most efficient final
     // global write patterns
     auto write = [&](int idx, float c0, float c1, FragS& s, FragS& b_bias) {
       if constexpr (b_type == fastllm_marlin_moe_types::kFE2M1f && s_type == fastllm_marlin_moe_types::kFE4M3fn) {
         if (!mul_topk_weights) {
-          c0 *= global_scale_f32;
-          c1 *= global_scale_f32;
+          c0 *= output_global_scale;
+          c1 *= output_global_scale;
         }
       }
 

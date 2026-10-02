@@ -2445,8 +2445,9 @@ namespace fastllm {
 #ifdef FASTLLM_ENABLE_DSV4_MOE_DEEPGEMM_SM120
             FastllmCudaReleaseMergeMOEDeepGemmSm120Cache(this);
 #endif
-        } else if (this->dataType == DataType::INT4_GROUP &&
-                   this->isModelWeight) {
+        } else if ((this->dataType == DataType::INT4_GROUP && this->isModelWeight) ||
+                   this->dataType == DataType::NVFP4_BLOCK_16_E4M3 ||
+                   this->dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED) {
             FastllmCudaReleaseMergeMOEVllmMarlinCache(this);
         }
 #endif

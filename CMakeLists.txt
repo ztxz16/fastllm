@@ -1187,6 +1187,13 @@ if (UNIT_TEST)
             set_tests_properties(cuda_${cache_test} PROPERTIES LABELS cuda)
         endforeach()
 
+        add_executable(cuda_nvfp4_marlin_moe_test test/basic/test_cuda_nvfp4_marlin_moe.cu)
+        target_link_libraries(cuda_nvfp4_marlin_moe_test PRIVATE fastllm)
+        set_target_properties(cuda_nvfp4_marlin_moe_test PROPERTIES
+            CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME cuda_nvfp4_marlin_moe COMMAND cuda_nvfp4_marlin_moe_test)
+        set_tests_properties(cuda_nvfp4_marlin_moe PROPERTIES LABELS cuda RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+
         add_executable(cuda_nvfp4_compact_moe_test test/basic/test_cuda_nvfp4_compact_moe.cu)
         target_link_libraries(cuda_nvfp4_compact_moe_test PRIVATE fastllm)
         set_target_properties(cuda_nvfp4_compact_moe_test PROPERTIES
