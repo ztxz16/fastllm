@@ -1743,7 +1743,12 @@ namespace fastllm {
                     name.find("conv1d.weight") != std::string::npos) {
                     scheme = qkvScheme; axis = 0;
                 } else if (name.find("out_proj.weight") != std::string::npos) {
-                    scheme = equalScheme(vd); axis = 1;
+                    // Packed GGUF columns retain tiled [value, key] heads.
+                    // Each rank takes its key-head interval from every value group.
+                    scheme = ggufWeightsRestored && source.dataType == DataType::DATA_GGUF_FORMAT && source.isGGUFData
+                        ? equalScheme(num_k_heads * head_v_dim, num_v_heads / num_k_heads)
+                        : equalScheme(vd);
+                    axis = 1;
                 } else if (name.find("in_proj_z.weight") != std::string::npos) {
                     scheme = equalScheme(vd); axis = 0;
                 } else if (name.find("in_proj_a.weight") != std::string::npos ||
@@ -2971,12 +2976,90 @@ namespace fastllm {
         this->weight.weight.erase(kMtpPackedDownName);
     }
 
+    void Qwen4ExpModel::RestoreGdnOutputWeight(Data &out, int tpSize) {
+        AssertInFastLLM(out.dataDevice == DataDevice::CPU && out.cpuData &&
+                        out.dims.size() == 2 && out.dims[1] == num_v_heads * head_v_dim &&
+                        tpSize > 0 && num_k_heads % tpSize == 0,
+                        "Qwen4 GGUF GDN output projection has an invalid layout.");
+        if (out.dataType == DataType::DATA_GGUF_FORMAT && out.ggmlType >= 0 &&
+            !out.IsRepacked && ggml_is_quantized((ggml_type)out.ggmlType) &&
+            (num_k_heads / tpSize * head_v_dim) %
+                std::max(32, (int)ggml_blck_size((ggml_type)out.ggmlType)) == 0) {
+            // Preserve complete quantization blocks, including their scales.
+            // TP selects an aligned interval within each tiled value group.
+            return;
+        }
+        if (out.dataType != DataType::FLOAT16) {
+            std::vector<float> values((size_t)out.dims[0] * out.dims[1]);
+            if (out.dataType == DataType::FLOAT32) {
+                std::memcpy(values.data(), out.cpuData, values.size() * sizeof(float));
+            } else {
+                AssertInFastLLM(out.dataType == DataType::DATA_GGUF_FORMAT &&
+                                out.ggmlType >= 0 && !out.IsRepacked,
+                                "Qwen4 GGUF GDN output type cannot be restored.");
+                const auto toFloat = ggml_type_to_float((ggml_type)out.ggmlType);
+                AssertInFastLLM(toFloat != nullptr, "Qwen4 GGUF GDN output type cannot be decoded.");
+                toFloat(out.cpuData, values.data(), values.size());
+            }
+            Data dense(DataType::FLOAT16, out.dims);
+            dense.Allocate();
+            // Match GGUF's FP16 import conversion for unaligned TP layouts.
+            extern void Float32ToFloat16(float *, uint16_t *, int);
+            Float32ToFloat16(values.data(), (uint16_t *)dense.cpuData, values.size());
+            dense.name = out.name;
+            dense.isGGUFData = true;
+            out.CopyFrom(dense);
+        }
+        const int perKey = num_v_heads / num_k_heads;
+        const size_t rowBytes = out.dims[1] * sizeof(uint16_t);
+        const size_t headBytes = head_v_dim * sizeof(uint16_t);
+        std::vector<uint8_t> row(rowBytes);
+        for (int r = 0; r < out.dims[0]; r++) {
+            uint8_t *source = out.cpuData + r * rowBytes;
+            for (int head = 0; head < num_v_heads; head++) {
+                const int tiled = (head % perKey) * num_k_heads + head / perKey;
+                std::memcpy(row.data() + head * headBytes, source + tiled * headBytes, headBytes);
+            }
+            std::memcpy(source, row.data(), rowBytes);
+        }
+    }
+
+    void Qwen4ExpModel::RunGdnOutputProjection(Data &input, Data &projection, Data &output) {
+        const auto architecture = weight.dicts.find("gguf_architecture");
+        if (architecture != weight.dicts.end() && architecture->second == "qwen4exp" &&
+            projection.isGGUFData && projection.dataType == DataType::DATA_GGUF_FORMAT) {
+            const std::vector<int> dims = input.dims;
+            Data grouped, tiled;
+            grouped.FakeFrom(input, 0);
+            grouped.Resize(input.dims);
+            grouped.Reshape({-1, num_k_heads, num_v_heads / num_k_heads, head_v_dim});
+#ifdef USE_CUDA
+            if (input.dataDevice == DataDevice::CUDA) {
+                Qwen4CudaDeviceGuard deviceGuard(input.dataDeviceIds);
+                const int device = input.dataDeviceIds.empty()
+                    ? FastllmCudaGetDevice() : input.dataDeviceIds[0];
+                AssertInFastLLM(Qwen4PrepareDecodeGraphWorkspace(tiled, input.dataType,
+                        {grouped.dims[0], grouped.dims[2], grouped.dims[1], grouped.dims[3]}, device) &&
+                    FastllmCudaPermuteTo(grouped, tiled, {0, 2, 1, 3}),
+                    "Qwen4 GGUF GDN activation permutation failed.");
+            } else
+#endif
+            {
+                Permute(grouped, {0, 2, 1, 3}, tiled);
+            }
+            tiled.Reshape(dims);
+            Linear(tiled, projection, Data(), output);
+        } else {
+            Linear(input, projection, Data(), output);
+        }
+    }
+
     void Qwen4ExpModel::RestoreGgufWeights() {
         if (ggufWeightsRestored || weight.dicts["gguf_architecture"] != "qwen4exp") return;
         // GGUF's GDN value heads are tiled [value-within-group, key-head],
-        // while FastLLM uses the HF grouped order. Dense weights were imported
-        // as floating point; restore both row and column permutations once,
-        // before any TP split or CUDA upload of these projections.
+        // while FastLLM uses the HF grouped order. Restore rows once before
+        // TP splitting or CUDA upload. Packed output columns stay tiled;
+        // RunGdnOutputProjection permutes the much smaller activation.
         const int perKey = num_v_heads / num_k_heads;
         auto restoreRows = [&](Data &data, int offset, int headDim) {
             AssertInFastLLM(data.dataDevice == DataDevice::CPU && data.cpuData &&
@@ -3026,21 +3109,11 @@ namespace fastllm {
                                 "Qwen4 GGUF ssm_a contains an invalid decay.");
                 values[i] = std::log(-values[i]);
             }
-            Data &out = get("out_proj.weight");
-            AssertInFastLLM(out.dataType == DataType::FLOAT16 && out.cpuData &&
-                            out.dims.size() == 2 && out.dims[1] == num_v_heads * head_v_dim,
-                            "Qwen4 GGUF GDN output projection has an invalid layout.");
-            const size_t rowBytes = out.dims[1] * sizeof(uint16_t);
-            const size_t headBytes = head_v_dim * sizeof(uint16_t);
-            std::vector<uint8_t> row(rowBytes);
-            for (int r = 0; r < out.dims[0]; r++) {
-                uint8_t *source = out.cpuData + r * rowBytes;
-                for (int head = 0; head < num_v_heads; head++) {
-                    const int tiled = (head % perKey) * num_k_heads + head / perKey;
-                    std::memcpy(row.data() + head * headBytes, source + tiled * headBytes, headBytes);
-                }
-                std::memcpy(source, row.data(), rowBytes);
-            }
+            int tpSize = 1;
+#ifdef USE_CUDA
+            if (threadTpState) tpSize = threadTpState->devices.size();
+#endif
+            RestoreGdnOutputWeight(get("out_proj.weight"), tpSize);
         }
         ggufWeightsRestored = true;
     }
@@ -6218,9 +6291,8 @@ namespace fastllm {
             }
             outputCore->Reshape({batch, sequence,
                                  this->num_v_heads * this->head_v_dim});
-            Linear(*outputCore,
-                   this->weight[linear + "out_proj.weight"],
-                   Data(), output);
+            RunGdnOutputProjection(*outputCore,
+                   this->weight[linear + "out_proj.weight"], output);
             ThreadTpAllReduce(output);
             return;
         }
@@ -6412,7 +6484,7 @@ namespace fastllm {
         // gate; Qwen3-Next's default SiLU here would noticeably change logits.
         SigmoidMulTo(allCore, z);
         allCore.Reshape({batch, sequence, valueDimension});
-        Linear(allCore, this->weight[linear + "out_proj.weight"], Data(), output);
+        RunGdnOutputProjection(allCore, this->weight[linear + "out_proj.weight"], output);
         ThreadTpAllReduce(output);
     }
 

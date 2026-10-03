@@ -12,7 +12,7 @@ namespace fastllm {
             rules.emplace_back(std::regex("^" + pattern + "$"), name, type);
         };
         // Keep large attention/output projections packed. Shared gate/up and
-        // auxiliary merges retain FP16; GDN output needs a column permutation.
+        // auxiliary merges retain FP16. GDN reorders activations at projection.
         add(R"(token_embd\.weight)", base + "embed_tokens.weight", Rule::GGUFWeightReplaceForceFP32);
         add(R"(output\.weight)", "lm_head.weight", Rule::GGUFWeightReplaceDirect);
         add(R"(per_layer_token_embd\.weight)", base + "ple_embedding.weight", Rule::GGUFWeightReplaceDirect);
@@ -38,7 +38,7 @@ namespace fastllm {
         add(R"(blk\.(\d+)\.attn_gate\.weight)", layer + "linear_attn.in_proj_z.weight", Rule::GGUFWeightReplaceDirect);
         add(R"(blk\.(\d+)\.ssm_beta\.weight)", layer + "linear_attn.in_proj_b.weight");
         add(R"(blk\.(\d+)\.ssm_alpha\.weight)", layer + "linear_attn.in_proj_a.weight");
-        add(R"(blk\.(\d+)\.ssm_out\.weight)", layer + "linear_attn.out_proj.weight", Rule::GGUFWeightReplaceForceFP16);
+        add(R"(blk\.(\d+)\.ssm_out\.weight)", layer + "linear_attn.out_proj.weight", Rule::GGUFWeightReplaceDirect);
         add(R"(blk\.(\d+)\.ssm_conv1d\.weight)", layer + "linear_attn.conv1d.weight", Rule::GGUFWeightReplaceForceFP32);
         add(R"(blk\.(\d+)\.ssm_a)", layer + "linear_attn.A_log", Rule::GGUFWeightReplaceForceFP32);
         add(R"(blk\.(\d+)\.ssm_dt\.bias)", layer + "linear_attn.dt_bias", Rule::GGUFWeightReplaceForceFP32);

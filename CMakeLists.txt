@@ -1181,6 +1181,12 @@ if (UNIT_TEST)
         add_test(NAME naive_n05_decode COMMAND naive_n05_decode_test)
         set_tests_properties(naive_n05_decode PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
 
+        add_executable(cuda_qwen4_gdn_output_test test/basic/test_cuda_qwen4_gdn_output.cpp)
+        target_link_libraries(cuda_qwen4_gdn_output_test PRIVATE fastllm)
+        target_include_directories(cuda_qwen4_gdn_output_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        fastllm_add_checked_test(cuda_qwen4_gdn_output cuda_qwen4_gdn_output_test "ALL_PASS" 180)
+        set_tests_properties(cuda_qwen4_gdn_output PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+
         add_executable(cuda_qwen4_shared_expert_test test/basic/test_cuda_qwen4_shared_expert.cpp)
         target_link_libraries(cuda_qwen4_shared_expert_test PRIVATE fastllm)
         target_include_directories(cuda_qwen4_shared_expert_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

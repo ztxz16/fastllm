@@ -313,6 +313,8 @@ namespace fastllm {
         bool preparedWeights = false;
         bool ggufWeightsRestored = false;
         void RestoreGgufWeights();
+        void RestoreGdnOutputWeight(Data &weight, int tpSize);
+        void RunGdnOutputProjection(Data &input, Data &weight, Data &output);
         std::atomic<int> mtpWeightsStatus{-1};
         std::mutex prepareMutex;
         mutable std::mutex stateMutex;
