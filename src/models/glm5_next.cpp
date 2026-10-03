@@ -807,12 +807,14 @@ namespace fastllm {
                     const std::string device = SelectMoeDeviceForLayer(
                         std::min(layer, block_cnt - 1));
                     // Preserve ModelOpt's E4M3 block scales and separate
-                    // gate/up globals on resident CUDA experts. The loader
+                    // gate/up globals on CUDA and NUMA experts. The loader
                     // validates the source dtype before accepting this marker.
-                    // CPU/NUMA and tensor-parallel layouts retain their policy.
+                    // NUMA consumes the packed scales directly, including
+                    // the CUDA hybrid-prefill path.
                     // Scalar weight_scale_2 is absent from tensorNames;
                     // the generic loader reads it from the safetensors index.
-                    if (device.rfind("cuda", 0) == 0 &&
+                    if ((device.rfind("cuda", 0) == 0 ||
+                         device == "numa" || device.rfind("numa:", 0) == 0) &&
                         tensorNameSet.count(base + ".weight_scale")) {
                         type = DataType::NVFP4_BLOCK_16_E4M3_PACKED;
                     }

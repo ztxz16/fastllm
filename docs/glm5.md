@@ -12,9 +12,11 @@ ftllm server /data/models/glm5 \
   --host 0.0.0.0 --port 8080
 ~~~
 
-## GLM-5.3-Flash NVFP4 显存
+## GLM-5.3-Flash NVFP4 紧凑存储
 
-GLM-5.3-Flash 的 ModelOpt NVFP4 路由专家在单设备 CUDA 后端（包括 `cudapp` 按层串行）默认使用紧凑存储。每 16 个权重保留 8 字节 FP4 数据和 1 字节 E4M3 块缩放，每行另存 4 字节全局缩放。合并 gate/up 权重时保留各自的全局缩放；这是存储布局转换，不重新量化权重。
+GLM-5.3-Flash 的 ModelOpt NVFP4 路由专家在单设备 CUDA 后端（包括 `cudapp` 按层串行）及 NUMA 后端默认使用紧凑存储。`--moe_device numa` 的 CPU 专家计算和 CUDA 混合 prefill 共用该紧凑布局。
+
+每 16 个权重保留 8 字节 FP4 数据和 1 字节 E4M3 块缩放，每行另存 4 字节全局缩放。合并 gate/up 权重时保留各自的全局缩放；这是存储布局转换，不重新量化权重。
 
 ## GLM-5.3-Flash NVFP4 grouped Marlin
 
