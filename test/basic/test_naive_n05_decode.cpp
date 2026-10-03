@@ -133,7 +133,7 @@ static void TestBatchedTopK() {
         Require(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal)==cudaSuccess,"capture begin");
         FastllmCudaNaiveTopK(scores,s.past,s.top,output);
         Require(cudaStreamEndCapture(cudaStreamPerThread,&graph)==cudaSuccess,"capture end");
-        Require(cudaGraphInstantiate(&exec,graph,nullptr,nullptr,0)==cudaSuccess,"graph instantiate");
+        Require(cudaGraphInstantiateWithFlags(&exec,graph,0)==cudaSuccess,"graph instantiate");
         for(int seed=41;seed<44;++seed) {
             values=BatchedScores(s.rows,s.keys,s.past,seed%3,seed);
             auto expected=BatchedReference(values,s.rows,s.keys,s.past,s.top);
@@ -729,7 +729,7 @@ static void TestDecodeGraphs() {
                 "decode graph begin");
         call();
         Require(cudaStreamEndCapture(cudaStreamPerThread, &graph) == cudaSuccess, "decode graph end");
-        Require(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0) == cudaSuccess, "decode graph instantiate");
+        Require(cudaGraphInstantiateWithFlags(&exec, graph, 0) == cudaSuccess, "decode graph instantiate");
         cudaGraphDestroy(graph);
         return exec;
     };

@@ -920,7 +920,15 @@
       "file": "test/basic/test_naive_n05_decode.cpp",
       "modified_by_this_diff": false,
       "error": "Five-argument cudaGraphInstantiate call fails to compile with CUDA 12.9 (three-argument API).",
-      "scope": "Excluded from five passing CTest targets; not repaired in this cleanup."
+      "scope": "Excluded from five passing CTest targets; not repaired in this cleanup.",
+      "resolution": {
+        "api": "cudaGraphInstantiateWithFlags",
+        "cuda": "12.9",
+        "build": "Test translation unit rebuilt and relinked with the validated CMake core objects.",
+        "ctest": "naive_n05_decode",
+        "cases_passed": 830,
+        "elapsed_seconds": 29.58
+      }
     },
     "performance_rebenchmarked": false,
     "model_quality_evaluation": false

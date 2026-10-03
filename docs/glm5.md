@@ -163,7 +163,7 @@ ctest --test-dir build-fastllm -R '^glm5_next_(flashinfer.*|dsa|mla_prefill)$' -
 新增测试包含 CPU E4M3 打包逐位对照、独立 double softmax 参考、全屏蔽行、单 key、2051→2112 补齐、非 64 倍数 query、16K/32K 历史、碎片化分页缓存，短 query、类型/布局和 CUDA Graph capture 的回退，以及强制 BF16 时与直接 BF16 kernel 的逐位对照。
 
 
-本次清理统一了后端开关和重复缓存清理代码。`auto` / `bf16` 在上述四种长度、各 5 步共 40 步的完整 logits 与各自清理前版本逐位一致，历史恢复同样一致；三种后端在 15/2047/2048/2049/4099-token 输入上各生成 5 token 均通过。3 项 GLM 与 2 项 Naive 回归通过，memcheck 为 0 errors。另有未修改的 `naive_n05_decode` 测试使用旧版 `cudaGraphInstantiate` 调用，在 CUDA 12.9 下编译失败，未计入通过项。性能表仍对应上次构建，本次未重新测量吞吐，也未补做模型质量评测。
+本次清理统一了后端开关和重复缓存清理代码。`auto` / `bf16` 在上述四种长度、各 5 步共 40 步的完整 logits 与各自清理前版本逐位一致，历史恢复同样一致；三种后端在 15/2047/2048/2049/4099-token 输入上各生成 5 token 均通过。3 项 GLM 与 2 项 Naive 回归通过，memcheck 为 0 errors。`naive_n05_decode` 测试的两处 Graph 实例化已改用 `cudaGraphInstantiateWithFlags`，CUDA 12.9 编译、链接及完整 830 个回归用例均通过。性能表仍对应上次构建，本次未重新测量吞吐，也未补做模型质量评测。
 
 ## GPU + NUMA 混合 MoE
 
