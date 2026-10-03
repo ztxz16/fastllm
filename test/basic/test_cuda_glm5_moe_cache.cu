@@ -3,6 +3,7 @@
 #include "utils.h"
 #include "fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-moe-policy.h"
+#include "devices/cuda/fastllm-cuda-moe-cache-stats.h"
 #include "devices/numas/numasdevice.h"
 #include "devices/numas/numas.h"
 #include "../../src/devices/cuda/moe/fastllm-moe-glm5-cache.cuh"
@@ -306,7 +307,10 @@ int main(int argc, char **argv) {
                 Check(cudaMemcpy(input.cudaData, bx.data(), hidden * 2, cudaMemcpyHostToDevice));
                 Check(cudaMemcpy(index.cudaData, ids.data(), topk * 4, cudaMemcpyHostToDevice));
                 Check(cudaMemcpy(scores.cudaData, route.data(), topk * 4, cudaMemcpyHostToDevice));
+                int splitStep = 0;
                 for (int split : {0, 1, 3, 6, 6, 0}) {
+                    uint64_t before[8] = {}, after[8] = {}, again[8] = {};
+                    Require(fastllm_moe_cuda_cache_route_stats(device, before), "route snapshot failed");
                     const auto value = std::to_string(split);
                     setenv("FASTLLM_GLM5_MOE_CACHE_GPU_EXPERTS", value.c_str(), 1);
                     int callbacks = 0;
@@ -319,6 +323,22 @@ int main(int argc, char **argv) {
                     int current;
                     Check(cudaGetDevice(&current));
                     Require(current == device, "callback changed output device");
+                    Require(fastllm_moe_cuda_cache_route_stats(device, after), "route snapshot failed");
+                    Require(fastllm_moe_cuda_cache_route_stats(device, again), "repeated snapshot failed");
+                    for (int i = 0; i < 8; ++i) {
+                        Require(after[i] == again[i] && after[i] >= before[i], "snapshot changed counters");
+                        after[i] -= before[i];
+                    }
+                    Require(after[0] == 1 && after[1] == topk, "missing full-route calls");
+                    Require(after[2] + after[3] == topk, "residency route total mismatch");
+                    Require(after[4] == split && after[5] == topk - split, "CPU/GPU route total mismatch");
+                    Require(after[6] == std::min<uint64_t>(split, after[2]), "resident GPU route mismatch");
+                    // The previous all-GPU call loaded every selected expert.
+                    // Cached routes must still count when all execution is CPU.
+                    if (splitStep >= 4) Require(after[2] == topk && after[3] == 0, "warm CPU/GPU residency lost");
+                    if (splitStep == 5) Require(after[4] == 0 && after[6] == 0 && after[2] == topk,
+                                               "CPU-resident routes excluded from hit rate");
+                    ++splitStep;
                     Check(cudaMemcpy(actual.data(), output.cudaData, hidden * 2, cudaMemcpyDeviceToHost));
                     std::vector<float> values(hidden);
                     for (int c = 0; c < hidden; ++c) values[c] = __bfloat162float(actual[c]);

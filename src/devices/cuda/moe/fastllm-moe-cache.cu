@@ -9,6 +9,7 @@
 //
 
 #include "fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-moe-cache-stats.h"
 #include "fastllm-cuda-expert-cache.cuh"
 #include "fastllm-cuda-cache-layout.h"
 #include "fastllm-cuda-record-copy.cuh"
@@ -3136,6 +3137,33 @@ bool FastllmCudaMergeMOECache(
         }
     }
     return true;
+}
+
+extern "C" bool fastllm_moe_cuda_cache_route_stats(int device, uint64_t *values) {
+    if (!values || device < 0) return false;
+    std::fill_n(values, 8, uint64_t(0));
+    int previous = 0;
+    if (cudaGetDevice(&previous) != cudaSuccess || cudaSetDevice(device) != cudaSuccess) return false;
+    bool ok = cudaDeviceSynchronize() == cudaSuccess;
+    std::lock_guard<std::mutex> guard(RegistryMutex());
+    for (const auto &group : Groups()) {
+        std::lock_guard<std::mutex> lock(group->mutex);
+        auto it = group->deviceCaches.find(device);
+        if (it == group->deviceCaches.end() || !it->second || !it->second->ready ||
+            !it->second->hybrid) continue;
+        const auto &work = *it->second->hybrid;
+        const uint64_t routes = work.cpuRoutes + work.gpuRoutes;
+        values[0] += work.scheduler.calls;
+        values[1] += routes;
+        values[2] += work.allResidentRoutes;
+        values[3] += routes - work.allResidentRoutes;
+        values[4] += work.gpuRoutes;
+        values[5] += work.cpuRoutes;
+        values[6] += work.residentRoutes;
+        values[7] += work.prefetchedExperts;
+    }
+    ok &= cudaSetDevice(previous) == cudaSuccess;
+    return ok;
 }
 
 extern "C" bool fastllm_moe_cuda_cache_stats(int device, uint64_t *values, bool reset) {

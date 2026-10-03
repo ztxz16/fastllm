@@ -630,9 +630,11 @@ def set_moe_cuda_cache(bytes_: int):
     fastllm_lib.set_moe_cuda_cache(ctypes.c_uint64(bytes_));
 
 def get_moe_cuda_cache_stats(device: int = 0, reset: bool = False):
-    """Synchronize a CUDA device and read expert-cache counters outside inference timing.
+    """Synchronize a CUDA device and read expert-cache query counters outside inference timing.
 
-    Reset clears route counters only; cached weights and LRU residency are retained.
+    Hits/misses include GPU-assigned queries and prefetch, excluding CPU-only
+    routes. Use get_moe_cuda_cache_route_stats for full hybrid route residency.
+    Reset clears these query counters only; cached weights and LRU residency are retained.
     Byte and slot counts cover all prepared expert tables on the selected device.
     """
     query = getattr(fastllm_lib, "fastllm_moe_cuda_cache_stats", None)
@@ -644,6 +646,29 @@ def get_moe_cuda_cache_stats(device: int = 0, reset: bool = False):
     result = dict(zip(("hits", "misses", "payload_bytes", "slots", "records"), values))
     routes = result["hits"] + result["misses"]
     result["hit_rate"] = result["hits"] / routes if routes else None
+    return result
+
+def get_moe_cuda_cache_route_stats(device: int = 0):
+    """Read cumulative single-token hybrid decode counters between requests.
+
+    Residency is measured across all routed experts before CPU/GPU dispatch,
+    excluding prefetch lookups. Prefill, batched verify and pure-GPU mode are
+    not counted. Host inference must be idle; this also synchronizes the GPU.
+    Subtract snapshots for per-request counts; cache and scheduler are retained.
+    """
+    query = getattr(fastllm_lib, "fastllm_moe_cuda_cache_route_stats", None)
+    if query is None:
+        raise RuntimeError("Full-route expert-cache statistics require an updated CUDA build")
+    query.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_uint64)]
+    query.restype = ctypes.c_bool
+    values = (ctypes.c_uint64 * 8)()
+    if not query(int(device), values):
+        raise RuntimeError("Could not read full-route expert-cache statistics")
+    result = dict(zip(("calls", "routes", "resident_routes", "nonresident_routes",
+                       "gpu_routes", "cpu_routes", "resident_gpu_routes", "prefetched_experts"), values))
+    routes = result["routes"]
+    result["hit_rate"] = result["resident_routes"] / routes if routes else None
+    result["gpu_fraction"] = result["gpu_routes"] / routes if routes else None
     return result
 
 def set_moe_cpu_cache(bytes_: int):
