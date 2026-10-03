@@ -1,5 +1,6 @@
 #include "fastllm.h"
 #include "fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-moe-policy.h"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #include "gguf.h"
 #include <cuda_fp16.h>
@@ -649,11 +650,13 @@ static void CpuExpertReference(const float *input, float *output,
             1, inter, hidden, 0, hidden / nodes).Run();
 }
 
-static void RunHybrid(ggml_type format, int rows, bool single = false) {
+static void RunHybrid(ggml_type format, int rows, bool single = false, bool frequency = false) {
     using namespace fastllm;
     constexpr int experts = 24, topk = 7;
     int hidden = 256;
     const int ranks = single ? 1 : 2;
+    uint64_t frequencyHits = 0, frequencyMisses = 0;
+    bool sawFrequencyAdmission = false;
     std::vector<std::unique_ptr<Data>> owned;
     std::vector<Data *> tables[2];
     FastllmCudaMoeCacheLayer layers[2];
@@ -753,12 +756,55 @@ static void RunHybrid(ggml_type format, int rows, bool single = false) {
                 lower[c] += std::min(a,b); upper[c] += std::max(a,b);
             }
         }
+        if (frequency) {
+            // Model a prefill changing the real cache between decode requests.
+            // Fill with other experts, forcing the partial partition to miss.
+            std::vector<int32_t> cold;
+            for (int e = 0; e < experts; ++e)
+                if (std::find(route.begin(), route.end(), e) == route.end()) cold.push_back(e);
+            for (int start = 0; start < int(cold.size()); start += topk) {
+                std::vector<int32_t> refill(topk);
+                for (int k = 0; k < topk; ++k) refill[k] = cold[(start+k)%cold.size()];
+                Cuda(cudaMemcpy(ids.cudaData,refill.data(),topk*4,cudaMemcpyHostToDevice));
+                Require(FastllmCudaMergeMOECache(input[0],gpuGate,gpuOutput,table.data(),table.size(),
+                    static_cast<int32_t *>(ids.cudaData),static_cast<float *>(scores.cudaData),topk),
+                    "frequency prefill refill failed");
+            }
+            Cuda(cudaMemcpy(ids.cudaData,route.data(),route.size()*4,cudaMemcpyHostToDevice));
+        }
         Cuda(cudaMemcpy(scores.cudaData, score.data(), score.size()*4, cudaMemcpyHostToDevice));
         std::exception_ptr errors[2]; bool accepted[2]{};
         auto run = [&](int rank) {
             try {
                 Cuda(cudaSetDevice(rank)); Data empty;
-                if (single) accepted[rank] = FastllmCudaMergeMOEHybrid(input[rank], ids, scores, output[rank],
+                if (frequency) {
+                    uint64_t previousHits = 0;
+                    for (int repeat = 0; repeat < 3; ++repeat) {
+                        uint64_t before[5]{}, after[5]{};
+                        Require(fastllm_moe_cuda_cache_stats(rank, before, false), "cache statistics unavailable");
+                        void *state = FastllmCudaBeginMoeDecode(table.data(),table.size(),topk);
+                        Require(state != nullptr, "frequency decode policy unavailable");
+                        accepted[rank] = FastllmCudaMergeMOEHybrid(input[rank],ids,scores,output[rank],
+                            table.data(),table.size(),layer,[] {});
+                        Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+                        FastllmCudaEndMoeDecode(state);
+                        Require(accepted[rank], "frequency hybrid rejected");
+                        Require(fastllm_moe_cuda_cache_stats(rank, after, false), "cache statistics unavailable");
+                        const uint64_t hits = after[0] - before[0], misses = after[1] - before[1];
+                        Require(hits + misses == topk, "frequency cache lost or duplicated a route");
+                        frequencyHits += hits;
+                        frequencyMisses += misses;
+                        sawFrequencyAdmission |= repeat > 0 && hits > previousHits;
+                        previousHits = hits;
+                        Cuda(cudaMemcpy(actual[rank].data(), output[rank].cudaData,
+                            actual[rank].size()*4, cudaMemcpyDeviceToHost));
+                        for (size_t c = 0; c < lower.size(); ++c) {
+                            const float tol = 3e-5f * (1 + std::max(std::abs(lower[c]), std::abs(upper[c])));
+                            Require(std::isfinite(actual[rank][c]) && actual[rank][c] >= lower[c]-tol &&
+                                actual[rank][c] <= upper[c]+tol, "frequency admission corrupted a route");
+                        }
+                    }
+                } else if (single) accepted[rank] = FastllmCudaMergeMOEHybrid(input[rank], ids, scores, output[rank],
                     table.data(), table.size(), layer, [] {});
                 else accepted[rank] = FastllmCudaMergeMOEExpertParallel(*context, rank, input[rank],
                     rank == 0 ? ids : empty, rank == 0 ? scores : empty, output[rank],
@@ -779,6 +825,12 @@ static void RunHybrid(ggml_type format, int rows, bool single = false) {
             Require(std::isfinite(v) && v >= lower[c]-tol && v <= upper[c]+tol, "GGUF EP lost or duplicated a route");
         }
     }
+    if (frequency) {
+        Require(frequencyHits && frequencyMisses && sawFrequencyAdmission,
+                "frequency policy did not exercise CPU, GPU and admission");
+        std::printf("FREQUENCY gpu=%llu cpu=%llu\n",
+            (unsigned long long)frequencyHits, (unsigned long long)frequencyMisses);
+    }
     if (!single) {
         const auto stats = FastllmCudaGetMoeExpertParallelStats(*context);
         Require(stats.cpuRoutes && stats.gpuRoutes[0] && stats.gpuRoutes[1] && stats.multiGpuSteps,
@@ -796,6 +848,11 @@ int main(int argc, char **argv) {
         int count = 0; Cuda(cudaGetDeviceCount(&count)); if (!count) { std::puts("SKIP: no CUDA device"); return 0; }
         Cuda(cudaSetDevice(0));
 #ifdef USE_NUMAS
+        if (argc > 1 && std::strcmp(argv[1], "--frequency") == 0) {
+            RunHybrid(GGML_TYPE_IQ3_XXS,1,true,true);
+            RunHybrid(GGML_TYPE_IQ4_XS,1,true,true);
+            std::puts("PASS: frequency admission, CPU misses, mixed partitions, prefill reconciliation"); return 0;
+        }
         if (argc > 1 && std::strcmp(argv[1], "--hybrid-single") == 0) {
             for (auto type : {GGML_TYPE_Q2_0, GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS,
                               GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_Q4_K,
