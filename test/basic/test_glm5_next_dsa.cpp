@@ -20,7 +20,9 @@ uint16_t Bf(float x) {
 float F(uint16_t x) { uint32_t u = uint32_t(x) << 16; float f; std::memcpy(&f, &u, 4); return f; }
 void Upload(Data &x, const std::vector<int> &dims, const std::vector<float> &v, DataType type = BFLOAT16) {
     x.dataType = type; x.UpdateUnitSize(); x.Resize(dims);
-    x.ToDevice(DataDevice::CUDA, {0}, false); x.Allocate();
+    int device = 0;
+    Check(cudaGetDevice(&device) == cudaSuccess, "upload device");
+    x.ToDevice(DataDevice::CUDA, {device}, false); x.Allocate();
     Check(x.Count(0) == v.size(), "upload shape");
     if (type == BFLOAT16) {
         std::vector<uint16_t> b(v.size());
@@ -209,6 +211,70 @@ void Attention(int past,int rows,bool fragmented) {
     std::printf("PASS sparse latent attention past=%d rows=%d fragmented=%d max_error=%.8g\n",past,rows,fragmented,error);
     Check(error<.003,"attention independent reference");
 }
+void MlaPlanCache(int device, int heads, int rank, DataType type) {
+    FastllmCudaSetDevice(device);
+    static_cast<Executor*>(GetExecutor())->SetFirstDevice("cuda:" + std::to_string(device));
+    constexpr int pageLen = 16, pages = 8, tokens = pageLen * pages;
+    std::vector<int> pageIds(pages), indices(tokens);
+    std::vector<float> kv(2 * tokens * rank), pe(2 * tokens * 64), query(heads * rank), queryPe(heads * 64);
+    for (int p = 0; p < pages; ++p) pageIds[p] = 2 * (pages - 1 - p);
+    for (int i = 0; i < (int)kv.size(); ++i) kv[i] = Pattern(i / rank, i % rank) / 8;
+    for (int i = 0; i < (int)pe.size(); ++i) pe[i] = Pattern(i / 64, i % 64) / 16;
+    for (int i = 0; i < (int)query.size(); ++i) query[i] = Pattern(i / rank, i % rank) / 8;
+    for (int i = 0; i < (int)queryPe.size(); ++i) queryPe[i] = Pattern(i / 64, i % 64) / 16;
+    PagedCacheManager kvPool, pePool;
+    Data q, qp, output, reference, physical(INT32);
+    Upload(kvPool, {2 * pages, pageLen, 1, rank}, kv);
+    Upload(pePool, {2 * pages, pageLen, 1, 64}, pe);
+    Upload(q, {heads, 1, rank}, query);
+    Upload(qp, {1, 1, heads, 64}, queryPe);
+    Upload(output, {heads, 1, rank}, std::vector<float>(heads * rank));
+    Upload(reference, {heads, 1, rank}, std::vector<float>(heads * rank));
+    if (type == FLOAT16) {
+        for (Data *x : {static_cast<Data*>(&kvPool), static_cast<Data*>(&pePool), &q, &qp, &output, &reference})
+            ToDataType(*x, FLOAT16);
+    }
+    BorrowedCache cache, peCache;
+    for (BorrowedCache *x : {&cache, &peCache}) {
+        x->dataType = type;
+        x->Resize({1, tokens, x == &cache ? rank : 64});
+        x->isPagedKVCache = true; x->pageLen = pageLen; x->lastPageLen = pageLen;
+        x->pagedKVCacheData = x == &cache ? &kvPool : &pePool;
+    }
+    physical.Resize({tokens}); physical.ToDevice(DataDevice::CUDA, {device}, false); physical.Allocate(false);
+    auto readBits = [&](Data &x) {
+        std::vector<uint16_t> bits(heads * rank);
+        Check(cudaMemcpy(bits.data(), x.cudaData, bits.size() * 2, cudaMemcpyDeviceToHost) == cudaSuccess, "MLA bits");
+        return bits;
+    };
+    auto run = [&](int length, bool sparse, Data &out) {
+        Check(FastllmCudaMLAPaged(q, qp, peCache, cache, out, 1.f / 16, length,
+                                sparse ? &physical : nullptr), "MLA cache dispatch");
+        return readBits(out);
+    };
+    for (int mapping = 0; mapping < 2; ++mapping) {
+        if (mapping) std::reverse(pageIds.begin(), pageIds.end());
+        cache.pageIndex = peCache.pageIndex = pageIds;
+        for (int i = 0; i < tokens; ++i) indices[i] = pageIds[i / pageLen] * pageLen + i % pageLen;
+        FastllmCudaCopyFromHostToDevice(physical.cudaData, indices.data(), indices.size() * 4);
+        std::vector<std::vector<uint16_t>> expected;
+        for (int tail = 0; tail < 4; ++tail) {
+            auto first = run(64 + tail, true, output);
+            // The non-sparse path overwrites shared integer staging and gives
+            // an uncached reference over exactly the same physical tokens.
+            Check(first == run(64 + tail, false, reference), "MLA cached vs uncached bits");
+            run(17, false, reference);
+            Check(first == run(64 + tail, true, output), "MLA plan survived workspace reuse");
+            expected.push_back(std::move(first));
+        }
+        // Exceed the bounded cache, then revisit all four decode tail shapes.
+        for (int length = 1; length <= 20; ++length) run(length, true, output);
+        for (int tail = 0; tail < 4; ++tail)
+            Check(expected[tail] == run(64 + tail, true, output), "MLA plan eviction/rebuild bits");
+    }
+    std::printf("PASS MLA plan cache device=%d heads=%d rank=%d dtype=%d: tails, changed indices, workspace reuse, eviction exact\n",
+                device, heads, rank, int(type));
+}
 void DecodeRouter() {
     for (int mode=0; mode<4; ++mode) for (bool norm:{false,true}) {
         std::vector<float> x(288),bias(288);
@@ -327,6 +393,12 @@ int main(int argc, char **argv) {
         Attention(2045, 9, true);
         Attention(4098, 1, false);
         for (int tail = 0; tail < 4; ++tail) Attention(32768 + tail, 1, true);
+        MlaPlanCache(0, 64, 512, BFLOAT16);
+        MlaPlanCache(0, 32, 512, BFLOAT16);
+        MlaPlanCache(0, 64, 128, BFLOAT16);
+        MlaPlanCache(0, 64, 128, FLOAT16);
+        if (devices > 1) MlaPlanCache(1, 64, 512, BFLOAT16);
+        MlaPlanCache(0, 64, 512, BFLOAT16);
         Check(cudaDeviceSynchronize() == cudaSuccess, "CUDA async error");
         std::puts("PASS GLM DSA");
         return 0;
