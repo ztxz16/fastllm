@@ -1,5 +1,7 @@
 #include "devices/cuda/fastllm-cuda-rmsnorm-small-linear.h"
 #include "devices/cuda/fastllm-rmsnorm-small-linear.cuh"
+#include "devices/cuda/fastllm-rmsnorm-small-linear-mixed.cuh"
+#include "gguf.h"
 #include "fastllm-cuda.cuh"
 #include "utils.h"
 #include <map>
@@ -20,6 +22,32 @@ bool Dense(const Data &x, int dev, size_t align) {
         stride *= x.dims[i];
     }
     return true;
+}
+bool MixedWeight(const Data &x, const Data &w) {
+    return x.dataType == FLOAT16 && (w.dataType == BFLOAT16 ||
+        (w.dataType == DATA_GGUF_FORMAT && w.ggmlType == GGML_TYPE_BF16));
+}
+bool DenseMixedWeight(const Data &w, int dev) {
+    if (w.dataType == BFLOAT16) return Dense(w, dev, 16);
+    if (w.dataDevice != DataDevice::CUDA || !w.cudaData || w.multiDeviceData ||
+        reinterpret_cast<uintptr_t>(w.cudaData)%16 ||
+        (!w.dataDeviceIds.empty() && (w.dataDeviceIds.size() != 1 || w.dataDeviceIds[0] != dev))) return false;
+    const auto *t = static_cast<const ggml_tensor *>(w.ggmlTensor);
+    return t && t->type == GGML_TYPE_BF16 && t->ne[0] == w.dims[1] && t->ne[1] == w.dims[0] &&
+        t->nb[0] == 2 && t->nb[1] == size_t(w.dims[1])*2;
+}
+bool MixedAvailable() {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return false;
+    static thread_local std::map<int, bool> cache;
+    auto it = cache.find(dev);
+    if (it == cache.end()) {
+        cudaFuncAttributes a{};
+        const auto status = cudaFuncGetAttributes(&a, rmssmall::Mixed5120<false>);
+        if (status != cudaSuccess) cudaGetLastError();
+        it = cache.emplace(dev, status == cudaSuccess && a.maxThreadsPerBlock >= 512).first;
+    }
+    return it->second;
 }
 template <class T, int D> bool Available() {
     int dev = 0;
@@ -68,15 +96,18 @@ bool FastllmCudaRMSNormSmallLinearCanRun(const Data &x, const Data &g, const Dat
     const char *flag = std::getenv("FASTLLM_CUDA_RMSNORM_SMALL_LINEAR");
     if (flag && (!std::strcmp(flag, "0") || !std::strcmp(flag, "false")))
         return false;
-    if ((x.dataType != FLOAT16 && x.dataType != BFLOAT16) || w.dataType != x.dataType ||
+    const bool mixed = MixedWeight(x, w);
+    if ((x.dataType != FLOAT16 && x.dataType != BFLOAT16) || (!mixed && w.dataType != x.dataType) ||
         g.dataType != FLOAT32 || w.IsRepacked || w.dims.size() != 2 || x.dims.empty())
         return false;
     int D = w.dims[1], N = w.dims[0];
+    if (mixed && (D != 5120 || !b.dims.empty())) return false;
     if (D < 1024 || D > 8192 || D % 1024 || N < 1 || N > 256 || x.dims.back() != D || x.Count(0) % D ||
         x.Count(0) / D < 1 || x.Count(0) / D > 8 || g.dims != std::vector<int>{D})
         return false;
     int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess || !Dense(x, dev, 4) || !Dense(g, dev, 8) || !Dense(w, dev, 4) ||
+    if (cudaGetDevice(&dev) != cudaSuccess || !Dense(x, dev, mixed ? 16 : 4) || !Dense(g, dev, mixed ? 16 : 8) ||
+        !(mixed ? DenseMixedWeight(w, dev) : Dense(w, dev, 4)) ||
         (!b.dims.empty() && (b.dataType != FLOAT32 || b.dims != std::vector<int>{N} || !Dense(b, dev, 4))))
         return false;
     // Reject aliases before Reshape/Allocate can change any caller-owned tensor.
@@ -102,11 +133,18 @@ bool FastllmCudaRMSNormSmallLinearCanRun(const Data &x, const Data &g, const Dat
         if (a < c + o.GetBytes() && c < a + y.GetBytes())
             return false;
     }
-    return x.dataType == FLOAT16 ? Available<half>(D) : Available<__nv_bfloat16>(D);
+    return mixed ? MixedAvailable() : (x.dataType == FLOAT16 ? Available<half>(D) : Available<__nv_bfloat16>(D));
 }
 void FastllmCudaRMSNormSmallLinear(const Data &x, const Data &g, const Data &w, const Data &b, Data &y,
                                    Data &o, float eps) {
-    if (x.dataType == FLOAT16)
+    if (MixedWeight(x, w)) {
+        const bool bf16Dot = x.Count(0)/5120 == 8 && FastllmCudaGetLinearExactBatchThreshold() <= 8;
+        auto kernel = bf16Dot ? rmssmall::Mixed5120<true> : rmssmall::Mixed5120<false>;
+        kernel<<<dim3((w.dims[0]+1)/2, x.Count(0)/5120), 512, 0, cudaStreamPerThread>>>(
+            static_cast<const half *>(x.cudaData), static_cast<const float *>(g.cudaData),
+            static_cast<const __nv_bfloat16 *>(w.cudaData), static_cast<half *>(y.cudaData),
+            static_cast<half *>(o.cudaData), w.dims[0], eps);
+    } else if (x.dataType == FLOAT16)
         Launch<half>(x, g, w, b, y, o, eps);
     else
         Launch<__nv_bfloat16>(x, g, w, b, y, o, eps);

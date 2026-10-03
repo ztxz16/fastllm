@@ -139,7 +139,7 @@ static __device__ __forceinline__ float DotS(
     return d * sumi;
 }
 
-template <ggml_type Type, int Rows, bool Fused, typename Output>
+template <ggml_type Type, int Rows, bool Fused, typename Output, int StoreMode = 0>
 __global__ void IQ2SharedGemvKernel(
         const void *__restrict__ weights, const void *__restrict__ upWeights,
         const block_q8_1 *__restrict__ input, Output *__restrict__ output,
@@ -203,7 +203,7 @@ __global__ void IQ2SharedGemvKernel(
             const half activated = __hdiv(gate, __hadd(__float2half(1.0f), hexp(-gate)));
             output[row] = __hmul(activated, up);
         } else {
-            output[row] = static_cast<Output>(sum);
+            FastllmGgufStore<StoreMode>(output + row, sum);
         }
     }
 }
@@ -215,22 +215,22 @@ static bool Supports(const void *input, int columns, int rows) {
            (reinterpret_cast<uintptr_t>(input) & 15) == 0;
 }
 
-template <ggml_type Type, int Rows, bool Fused, typename Output>
+template <ggml_type Type, int Rows, bool Fused, typename Output, int StoreMode = 0>
 static void LaunchRows(const void *weights, const void *upWeights, const block_q8_1 *input,
                        Output *output, int columns, int rows, cudaStream_t stream) {
     const size_t sharedBytes = columns / QK8_1 * sizeof(block_q8_1);
-    IQ2SharedGemvKernel<Type, Rows, Fused, Output><<<
+    IQ2SharedGemvKernel<Type, Rows, Fused, Output, StoreMode><<<
         (rows + Rows - 1) / Rows, Rows * WARP_SIZE, sharedBytes, stream>>>(
             weights, upWeights, input, output, columns, rows);
 }
 
-template <ggml_type Type, bool Fused, typename Output>
+template <ggml_type Type, bool Fused, typename Output, int StoreMode = 0>
 static void Launch(const void *weights, const void *upWeights, const block_q8_1 *input,
                    Output *output, int columns, int rows, cudaStream_t stream) {
     // Sixteen rows amortize input/codebook staging. Fused XS keeps eight
     // rows to balance its larger register footprint against resident blocks.
     constexpr int rowsPerBlock = Fused && Type == GGML_TYPE_IQ2_XS ? 8 : 16;
-    LaunchRows<Type, rowsPerBlock, Fused>(weights, upWeights, input, output,
+    LaunchRows<Type, rowsPerBlock, Fused, Output, StoreMode>(weights, upWeights, input, output,
                                         columns, rows, stream);
 }
 

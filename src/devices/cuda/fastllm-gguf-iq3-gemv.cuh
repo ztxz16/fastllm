@@ -84,7 +84,7 @@ static __device__ __forceinline__ float DotS(
 }
 
 
-template <ggml_type Type, int Rows, bool Fused, typename Output>
+template <ggml_type Type, int Rows, bool Fused, typename Output, int StoreMode = 0>
 __global__ void SharedGemvKernel(
         const void *__restrict__ weights, const void *__restrict__ upWeights,
         const block_q8_1 *__restrict__ input, Output *__restrict__ output,
@@ -127,7 +127,7 @@ __global__ void SharedGemvKernel(
         if constexpr (Fused) {
             output[row] = FastllmGgufHalfSiluMulValue((half)sum, (half)upSum);
         } else {
-            output[row] = (Output)sum;
+            FastllmGgufStore<StoreMode>(output + row, sum);
         }
     }
 }
@@ -140,12 +140,12 @@ static bool Supports(const void *input, int columns, int rows) {
            (reinterpret_cast<uintptr_t>(input) & 15) == 0;
 }
 
-template <ggml_type Type, bool Fused, typename Output>
+template <ggml_type Type, bool Fused, typename Output, int StoreMode = 0>
 static void Launch(const void *weights, const void *upWeights, const block_q8_1 *input,
                    Output *output, int columns, int rows, cudaStream_t stream) {
     constexpr int rowsPerBlock = Fused ? 16 : 8;
     const size_t sharedBytes = columns / QK8_1 * sizeof(block_q8_1);
-    SharedGemvKernel<Type, rowsPerBlock, Fused, Output><<<
+    SharedGemvKernel<Type, rowsPerBlock, Fused, Output, StoreMode><<<
         (rows + rowsPerBlock - 1) / rowsPerBlock, rowsPerBlock * WARP_SIZE, sharedBytes, stream>>>(
             weights, upWeights, input, output, columns, rows);
 }

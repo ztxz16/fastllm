@@ -1,3 +1,4 @@
+#include "devices/cuda/fastllm-cuda-gguf-linear-add.h"
 #include "devices/cuda/fastllm-cuda-gdn.h"
 #include "devices/cuda/fastllm-cuda-rmsnorm-small-linear.h"
 #include "devices/cuda/fastllm-cuda-fp8-linear-add.h"
@@ -6403,6 +6404,7 @@ namespace fastllm {
     }
 
     bool DoCudaLinearAdd(Data &input, Data &weight, const Data &bias, Data &output) {
+        if (FastllmCudaGGUFLinearAdd(input, weight, bias, output)) return true;
         if (FastllmCudaFP8LinearAddCanRun(input, weight, bias, output)) {
             FastllmCudaFP8LinearAdd(input, weight, bias, output);
             return true;

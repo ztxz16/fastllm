@@ -43,6 +43,7 @@
 #include "devices/cuda/fastllm-cuda-gdn.h"
 #include "devices/cuda/fastllm-cuda-gdn-prepare.h"
 #include "devices/cuda/fastllm-cuda-rmsnorm-small-linear.h"
+#include "devices/cuda/fastllm-cuda-gguf-projections.h"
 #include "devices/cuda/cudaworkspace.h"
 #include "devices/cuda/fastllm-cuda-vision.h"
 #include "devices/cuda/fastllm-cuda-fp8.h"
@@ -5561,6 +5562,40 @@ namespace fastllm {
                        FloatDict{{"alpha", alpha}}, IntDict());
         }
 
+        static void Qwen35CudaLinearGroup(
+                Qwen3CudaDirectRunner &runner, Data &input,
+                std::initializer_list<Data *> weights,
+                std::initializer_list<const Data *> biases,
+                std::initializer_list<Data *> outputs) {
+            using namespace qwen3cuda;
+            std::vector<Data *> w(weights), o(outputs);
+            std::vector<const Data *> b(biases);
+            AssertInFastLLM(w.size() == o.size() && w.size() == b.size(),
+                            "Qwen3.5 projection group size mismatch.\n");
+            bool shared = input.dataType == DataType::FLOAT16 && !input.dims.empty() &&
+                input.dims.back() > 0 && input.Count(0)/input.dims.back() <= 8;
+            for (size_t i = 0; i < w.size(); ++i) {
+                shared = shared && w[i]->dataType == DataType::DATA_GGUF_FORMAT &&
+                    w[i]->dims.size() == 2 && w[i]->dims[1] == input.dims.back() &&
+                    b[i]->dims.empty();
+            }
+            if (shared) {
+                FastllmCudaSetDevice(runner.DeviceId());
+                for (size_t i = 0; i < w.size(); ++i) {
+                    Qwen3CudaPrepareLocalOutput(*o[i], runner.DeviceId());
+                    o[i]->dataType = input.dataType;
+                    o[i]->UpdateUnitSize();
+                    auto shape = input.dims;
+                    shape.back() = w[i]->dims[0];
+                    o[i]->Resize(shape);
+                    o[i]->Allocate(false);
+                }
+                if (FastllmCudaGGUFLinearShared(input, w.data(), o.data(), int(w.size()))) return;
+            }
+            for (size_t i = 0; i < w.size(); ++i)
+                Qwen3CudaLinear(runner, input, *w[i], *b[i], *o[i]);
+        }
+
         static bool Qwen35CudaTryGgufGateUpSiluMul(
                 Qwen3CudaDirectRunner &runner,
                 Data &input,
@@ -7018,12 +7053,9 @@ namespace fastllm {
                     // heterogeneous Q/K/V rows to FP16.  Reuse the persistent
                     // attention buffers so CUDA graph capture does not retain
                     // pointers owned by temporary Data objects.
-                    Qwen3CudaLinear(
-                        runner, *attenInput, *qWeight, *qBias, *qgate);
-                    Qwen3CudaLinear(
-                        runner, *attenInput, *kWeight, *kBias, *k);
-                    Qwen3CudaLinear(
-                        runner, *attenInput, *vWeight, *vBias, *v);
+                    Qwen35CudaLinearGroup(runner, *attenInput,
+                        {qWeight, kWeight, vWeight}, {qBias, kBias, vBias},
+                        {qgate, k, v});
                     Qwen3CudaCat(runner, *qgate, *k, -1, *gate);
                     Qwen3CudaCat(runner, *gate, *v, -1, *merged);
                 }
@@ -8318,6 +8350,22 @@ namespace fastllm {
         qwen3cuda::Qwen3CudaPermuteSelf(runner, input, {0, 2, 1, 3});
         input.Reshape(originalShape);
     }
+
+    static void Qwen35CudaGdnOutputResidual(
+            Qwen3CudaDirectRunner &runner, Data &input, Data &weight,
+            Data &bias, Data &middle, Data &hidden,
+            int keyHeads, int valueHeads, int headDim,
+            bool tensorParallel, bool firstRank, int gpuId) {
+        using namespace qwen3cuda;
+        if (!tensorParallel && weight.isGGUFData &&
+            FastllmCudaGGUFLinearAddPermuted(input, weight, bias, hidden,
+                keyHeads, valueHeads, headDim)) return;
+        Qwen35CudaPermuteGroupedGdnOutputForGguf(
+            runner, input, weight, keyHeads, valueHeads, headDim);
+        Qwen3CudaLinearResidualReduce(runner, input, weight, bias, middle,
+            hidden, tensorParallel, firstRank, gpuId, true);
+    }
+
 #endif
 
     static void Add1(Data &input) {
@@ -11841,20 +11889,12 @@ namespace fastllm {
                                                       qkvzWeightName + ".tp_bias"),
                                         buf.gdnMerged);
                     } else if (!projectedConvBlock && !fusedInputProjection) {
-                        Qwen3CudaLinear(
-                            cudaRunner, buf.attenInput,
-                            *requireLocal(weight[qkvWeightName], qkvWeightName),
-                            *requireLocal(GetThreadTensorParallelBias(
-                                              qkvWeightName + ".tp_bias"),
-                                          qkvWeightName + ".tp_bias"),
-                            buf.gdnQkvProjection);
-                        Qwen3CudaLinear(
-                            cudaRunner, buf.attenInput,
-                            *requireLocal(weight[zWeightName], zWeightName),
-                            *requireLocal(GetThreadTensorParallelBias(
-                                              zWeightName + ".tp_bias"),
-                                          zWeightName + ".tp_bias"),
-                            buf.gdnZProjection);
+                        Qwen35CudaLinearGroup(cudaRunner, buf.attenInput,
+                            {requireLocal(weight[qkvWeightName], qkvWeightName),
+                             requireLocal(weight[zWeightName], zWeightName)},
+                            {requireLocal(GetThreadTensorParallelBias(qkvWeightName + ".tp_bias"), qkvWeightName + ".tp_bias"),
+                             requireLocal(GetThreadTensorParallelBias(zWeightName + ".tp_bias"), zWeightName + ".tp_bias")},
+                            {&buf.gdnQkvProjection, &buf.gdnZProjection});
                     }
                     // Preserve the batch-1 zero-copy path without replacing the
                     // owning max-batch workspace tensors with borrowed views.
@@ -12075,16 +12115,11 @@ namespace fastllm {
                     buf.coreAttnOut.Reshape({zShape[0], zShape[1], localVd});
                     Data &outProjWeight = *requireLocal(
                         weight[outProjWeightName], outProjWeightName);
-                    Qwen35CudaPermuteGroupedGdnOutputForGguf(
-                        cudaRunner, buf.coreAttnOut, outProjWeight,
-                        localKeyHeads, localValueHeads, head_v_dim);
-                    Qwen3CudaLinearResidualReduce(
-                        cudaRunner, buf.coreAttnOut,
-                        outProjWeight,
-                        *requireLocal(GetThreadTensorParallelBias(outProjWeightName + ".tp_bias"),
+                    Qwen35CudaGdnOutputResidual(cudaRunner, buf.coreAttnOut,
+                        outProjWeight, *requireLocal(GetThreadTensorParallelBias(outProjWeightName + ".tp_bias"),
                                       outProjWeightName + ".tp_bias"),
-                        buf.attenLastOutput, buf.hiddenStates,
-                        tensorParallel, firstTensorParallelRank, gpuId, true);
+                        buf.attenLastOutput, buf.hiddenStates, localKeyHeads, localValueHeads, head_v_dim,
+                        tensorParallel, firstTensorParallelRank, gpuId);
                 }
 
                 bool hasMergedDenseMlp =
@@ -13721,20 +13756,12 @@ namespace fastllm {
                                                   qkvzWeightName + ".tp_bias"),
                                     gdnMerged);
                 } else if (!projectedConvBlock && !fusedInputProjection) {
-                    Qwen3CudaLinear(
-                        cudaRunner, attenInput,
-                        *requireLocal(weight[qkvWeightName], qkvWeightName),
-                        *requireLocal(GetThreadTensorParallelBias(
-                                          qkvWeightName + ".tp_bias"),
-                                      qkvWeightName + ".tp_bias"),
-                        qkvConvInput);
-                    Qwen3CudaLinear(
-                        cudaRunner, attenInput,
-                        *requireLocal(weight[zWeightName], zWeightName),
-                        *requireLocal(GetThreadTensorParallelBias(
-                                          zWeightName + ".tp_bias"),
-                                      zWeightName + ".tp_bias"),
-                        z);
+                    Qwen35CudaLinearGroup(cudaRunner, attenInput,
+                        {requireLocal(weight[qkvWeightName], qkvWeightName),
+                         requireLocal(weight[zWeightName], zWeightName)},
+                        {requireLocal(GetThreadTensorParallelBias(qkvWeightName + ".tp_bias"), qkvWeightName + ".tp_bias"),
+                         requireLocal(GetThreadTensorParallelBias(zWeightName + ".tp_bias"), zWeightName + ".tp_bias")},
+                        {&qkvConvInput, &z});
                 }
                 bool projectedQkvSplitReady = projectedConvBlock || hasSeparateQkvZGdnInLinear;
                 auto ensureProjectedQkvSplit = [&]() {
@@ -15434,16 +15461,11 @@ namespace fastllm {
                     }
                     postLinearAttnOutput->Reshape(
                         {zShape[0], zShape[1], localVd});
-                    Qwen35CudaPermuteGroupedGdnOutputForGguf(
-                        cudaRunner, *postLinearAttnOutput, outProjWeight,
-                        localKeyHeads, localValueHeads, head_v_dim);
-                    Qwen3CudaLinearResidualReduce(
-                        cudaRunner, *postLinearAttnOutput,
-                        outProjWeight,
-                        *requireLocal(GetThreadTensorParallelBias(outProjWeightName + ".tp_bias"),
+                    Qwen35CudaGdnOutputResidual(cudaRunner, *postLinearAttnOutput,
+                        outProjWeight, *requireLocal(GetThreadTensorParallelBias(outProjWeightName + ".tp_bias"),
                                       outProjWeightName + ".tp_bias"),
-                        attenLastOutput, hiddenStates,
-                        tensorParallel, firstTensorParallelRank, gpuId, true);
+                        attenLastOutput, hiddenStates, localKeyHeads, localValueHeads, head_v_dim,
+                        tensorParallel, firstTensorParallelRank, gpuId);
                 }
             }
             bool hasMergedDenseMlp =

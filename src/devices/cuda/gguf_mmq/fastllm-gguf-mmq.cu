@@ -1,3 +1,6 @@
+#include "fastllm-cuda-gguf-projections.h"
+#include "fastllm-cuda-gguf-linear-add.h"
+#include "../fastllm-gguf-store.cuh"
 #include "fastllm-gguf-mmq-common.cuh"
 
 #include <cuda_bf16.h>
@@ -166,7 +169,7 @@ static __global__ void quantize_mmvq_q8_1(
     }
 }
 
-template <ggml_type type, int input_rows, int nwarps, typename OutputType>
+template <ggml_type type, int input_rows, int nwarps, typename OutputType, int StoreMode = 0>
 __launch_bounds__(nwarps * WARP_SIZE, 1)
 static __global__ void mul_mat_vec_extended(
         const void *__restrict__ weight,
@@ -244,10 +247,8 @@ static __global__ void mul_mat_vec_extended(
 
         if (threadIdx.x < rows_per_block &&
             output_row0 + threadIdx.x < output_rows) {
-            output[static_cast<size_t>(input_row) * output_rows +
-                   output_row0 + threadIdx.x] =
-                mmq_io<OutputType>::from_float(
-                    sums[input_row][threadIdx.x]);
+            FastllmGgufStore<StoreMode>(output + static_cast<size_t>(input_row) * output_rows +
+                   output_row0 + threadIdx.x, sums[input_row][threadIdx.x]);
         }
     }
 }
@@ -359,7 +360,7 @@ static __global__ void mul_mat_vec_gate_up_extended(
     }
 }
 
-template <ggml_type type, int nwarps, typename OutputType>
+template <ggml_type type, int nwarps, typename OutputType, int StoreMode = 0>
 static void launch_extended_mmvq_rows(
         const void *weight, const block_q8_1 *input, OutputType *output,
         int rows, int input_columns, int output_rows,
@@ -370,7 +371,7 @@ static void launch_extended_mmvq_rows(
         (output_rows + rows_per_block - 1) / rows_per_block, 1, 1);
     const dim3 threads(threads_x, nwarps, 1);
 #define FASTLLM_LAUNCH_MMVQ_ROWS(row_count)                              \
-    mul_mat_vec_extended<type, row_count, nwarps, OutputType>            \
+    mul_mat_vec_extended<type, row_count, nwarps, OutputType, StoreMode>            \
         <<<blocks, threads, 0, stream>>>(                                 \
             weight, input, output, input_columns, output_rows)
     switch (rows) {
@@ -415,7 +416,7 @@ static void launch_extended_gate_up_rows(
 #undef FASTLLM_LAUNCH_GATE_UP_ROWS
 }
 
-template <ggml_type type, typename OutputType>
+template <ggml_type type, typename OutputType, int StoreMode = 0>
 static void launch_extended_mmvq_type(
         const void *weight, const block_q8_1 *input, OutputType *output,
         int rows, int input_columns, int output_rows,
@@ -424,25 +425,25 @@ static void launch_extended_mmvq_type(
                   type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_S) {
         if (rows >= 2 && rows <= 8 && fastllm_gguf_small_mmvq::Supports(
                 input, input_columns, output_rows, input_columns, output_rows)) {
-            fastllm_gguf_small_mmvq::LaunchBatch<type>(weight, input, output,
+            fastllm_gguf_small_mmvq::LaunchBatch<type, OutputType, StoreMode>(weight, input, output,
                 input_columns, output_rows, rows, input_columns, output_rows, stream);
             return;
         }
     }
     if constexpr (type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_S) {
         if (rows == 1 && iq2_decode::Supports(input, input_columns, output_rows)) {
-            iq2_decode::Launch<type, false>(weight, nullptr, input, output,
+            iq2_decode::Launch<type, false, OutputType, StoreMode>(weight, nullptr, input, output,
                                           input_columns, output_rows, stream);
             return;
         }
     }
     const int nwarps = rows <= 4 ? 4 : 1;
     if (nwarps == 4) {
-        launch_extended_mmvq_rows<type, 4>(
+        launch_extended_mmvq_rows<type, 4, OutputType, StoreMode>(
             weight, input, output, rows, input_columns, output_rows,
             stream);
     } else {
-        launch_extended_mmvq_rows<type, 1>(
+        launch_extended_mmvq_rows<type, 1, OutputType, StoreMode>(
             weight, input, output, rows, input_columns, output_rows,
             stream);
     }
@@ -472,14 +473,14 @@ static void launch_extended_gate_up_type(
     }
 }
 
-template <typename OutputType>
+template <typename OutputType, int StoreMode = 0>
 static void dispatch_extended_mmvq(
         ggml_type type, const void *weight, const block_q8_1 *input,
         OutputType *output, int rows, int input_columns, int output_rows,
         cudaStream_t stream) {
 #define FASTLLM_DISPATCH_EXTENDED_MMVQ(type_name)                        \
     case type_name:                                                       \
-        launch_extended_mmvq_type<type_name>(                             \
+        launch_extended_mmvq_type<type_name, OutputType, StoreMode>(                             \
             weight, input, output, rows, input_columns, output_rows,      \
             stream);                                                      \
         break
@@ -541,12 +542,15 @@ static __global__ void q2_mmvq(
         output[size_t(blockIdx.y)*output_rows+row] = mmq_io<OutputType>::from_float(value);
 }
 
-template <typename InputType, typename OutputType>
+template <typename InputType, typename OutputType, int StoreMode = 0>
 static bool matmul_mmvq(
         const InputType *input, const void *weight, OutputType *output,
         ggml_type type, int rows, int input_columns, int output_rows,
         cudaStream_t stream) {
     const bool q2 = type == GGML_TYPE_Q2_0;
+    if constexpr (StoreMode == 1) {
+        if (type != GGML_TYPE_IQ2_S && type != GGML_TYPE_IQ2_XS) return false;
+    }
     if ((!q2 && !is_extended_mmvq_type(type)) ||
         !supports_mmvq_shape(type, rows, input_columns, output_rows) ||
         (q2 && size_t(input_columns/QK8_1)*sizeof(block_q8_1) > 32*1024)) {
@@ -576,7 +580,7 @@ static bool matmul_mmvq(
                 static_cast<const block_q2_0 *>(weight), quantized, output,
                 input_columns, output_rows);
     } else {
-        dispatch_extended_mmvq(
+        dispatch_extended_mmvq<OutputType, StoreMode>(
             type, weight, quantized, output, rows, input_columns, output_rows,
             stream);
     }
@@ -1154,6 +1158,33 @@ bool FastllmCudaHalfMatMulGGUFMMVQ(
     return fastllm_gguf_mmq::matmul_mmvq(
         static_cast<const half *>(input), weight, static_cast<half *>(output),
         static_cast<ggml_type>(weight_type), n, m, k,
+        reinterpret_cast<cudaStream_t>(stream));
+}
+
+bool FastllmCudaGGUFExtendedFromQ8(const void *input, const void *weight,
+        void *output, int weightType, int rows, int columns, int outputRows,
+        int storeMode, void *stream) {
+    using namespace fastllm_gguf_mmq;
+    const auto type = static_cast<ggml_type>(weightType);
+    if ((type != GGML_TYPE_IQ2_XXS && type != GGML_TYPE_IQ2_XS && type != GGML_TYPE_IQ2_S && type != GGML_TYPE_IQ1_M) ||
+        !supports_mmvq_shape(type, rows, columns, outputRows) || storeMode < 0 || storeMode > 2)
+        return false;
+    if (type == GGML_TYPE_IQ1_M) ensure_iq1s_grid(reinterpret_cast<cudaStream_t>(stream));
+#define SHARED_CASE(MODE) \
+    case MODE: dispatch_extended_mmvq<half, MODE>(type, weight, \
+        static_cast<const block_q8_1 *>(input), static_cast<half *>(output), \
+        rows, columns, outputRows, reinterpret_cast<cudaStream_t>(stream)); break
+    switch (storeMode) { SHARED_CASE(0); SHARED_CASE(1); SHARED_CASE(2); }
+#undef SHARED_CASE
+    return true;
+}
+
+bool FastllmCudaHalfMatMulGGUFMMVQAddTo(
+        const void *input, const void *weight, void *output, int weightType,
+        int rows, int columns, int outputRows, void *stream) {
+    return fastllm_gguf_mmq::matmul_mmvq<half, half, true>(
+        static_cast<const half *>(input), weight, static_cast<half *>(output),
+        static_cast<ggml_type>(weightType), rows, columns, outputRows,
         reinterpret_cast<cudaStream_t>(stream));
 }
 

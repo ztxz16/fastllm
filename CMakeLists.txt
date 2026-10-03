@@ -1365,6 +1365,18 @@ if (UNIT_TEST)
         set_tests_properties(cuda_nvfp4_sm120_tiles cuda_nvfp4_swiglu_sm120 PROPERTIES
             LABELS cuda RUN_SERIAL TRUE)
 
+        add_executable(cuda_gguf_decode_fusions_test test/basic/test_cuda_gguf_decode_fusions.cu)
+        target_link_libraries(cuda_gguf_decode_fusions_test PRIVATE fastllm)
+        set_target_properties(cuda_gguf_decode_fusions_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        fastllm_add_checked_test(cuda_gguf_decode_fusions cuda_gguf_decode_fusions_test "PASS GGUF decode fusions" 600)
+        set_tests_properties(cuda_gguf_decode_fusions PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+
+        add_executable(cuda_gguf_linear_add_test test/basic/test_cuda_gguf_linear_add.cu)
+        target_link_libraries(cuda_gguf_linear_add_test PRIVATE fastllm)
+        set_target_properties(cuda_gguf_linear_add_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        fastllm_add_checked_test(cuda_gguf_linear_add cuda_gguf_linear_add_test "PASS GGUF LinearAdd" 600)
+        set_tests_properties(cuda_gguf_linear_add PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+
         add_executable(cuda_fp8_linear_add_test test/basic/test_cuda_fp8_linear_add.cu)
         target_link_libraries(cuda_fp8_linear_add_test PRIVATE fastllm)
         set_target_properties(cuda_fp8_linear_add_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)

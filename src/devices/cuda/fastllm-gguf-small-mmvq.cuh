@@ -204,7 +204,7 @@ template <ggml_type Type, int Warps> static __device__ __forceinline__ void Load
 
 // One lane owns an entire Q8_1 group. Cache the exact integer input sum
 // once per tile, so Q4_K's minimum correction needs no repeated DP4A sum.
-template <int Tokens, int Rows, int Tile, typename Output>
+template <int Tokens, int Rows, int Tile, typename Output, int StoreMode = 0>
 __global__ void Q4KBatchSharedGemvKernel(const void *__restrict__ weights,
                                          const block_q8_1 *__restrict__ input, Output *__restrict__ output,
                                          int columns, int outputRows, int inputStride, int outputStride) {
@@ -259,14 +259,14 @@ __global__ void Q4KBatchSharedGemvKernel(const void *__restrict__ weights,
 #pragma unroll
     for (int token = 0; token < Tokens; ++token) {
         const float sum = warp_reduce_sum(sums[token]);
-        if (lane == 0 && row < outputRows) output[token * outputStride + row] = (Output)sum;
+        if (lane == 0 && row < outputRows) FastllmGgufStore<StoreMode>(output + token * outputStride + row, sum);
     }
 }
 
 // Q2_K has two independent scale/min pairs per 32-value Q8_1 group.
 // Cache the exact sums of the two quantized 16-value halves; ds.y is the
 // rounded sum before input quantization and cannot be used here.
-template <int Tokens, int Rows, int Tile, typename Output>
+template <int Tokens, int Rows, int Tile, typename Output, int StoreMode = 0>
 __global__ void Q2KBatchSharedGemvKernel(const void *__restrict__ weights,
                                          const block_q8_1 *__restrict__ input, Output *__restrict__ output,
                                          int columns, int outputRows, int inputStride, int outputStride) {
@@ -325,11 +325,11 @@ __global__ void Q2KBatchSharedGemvKernel(const void *__restrict__ weights,
 #pragma unroll
     for (int token = 0; token < Tokens; ++token) {
         const float sum = warp_reduce_sum(sums[token]);
-        if (lane == 0 && row < outputRows) output[token * outputStride + row] = (Output)sum;
+        if (lane == 0 && row < outputRows) FastllmGgufStore<StoreMode>(output + token * outputStride + row, sum);
     }
 }
 
-template <ggml_type Type, int Tokens, int Rows, int Tile, typename Output>
+template <ggml_type Type, int Tokens, int Rows, int Tile, typename Output, int StoreMode = 0>
 __global__ void BatchSharedGemvKernel(const void *__restrict__ weights, const block_q8_1 *__restrict__ input,
                                       Output *__restrict__ output, int columns, int outputRows,
                                       int inputStride, int outputStride) {
@@ -390,13 +390,13 @@ __global__ void BatchSharedGemvKernel(const void *__restrict__ weights, const bl
 #pragma unroll
     for (int token = 0; token < Tokens; ++token) {
         const float sum = warp_reduce_sum(sums[token]);
-        if (lane == 0 && row < outputRows) output[token * outputStride + row] = (Output)sum;
+        if (lane == 0 && row < outputRows) FastllmGgufStore<StoreMode>(output + token * outputStride + row, sum);
     }
 }
 
 // Each warp computes two output rows, sharing every Q8 input load across
 // both dot products. Preserve the original per-row K accumulation order.
-template <ggml_type Type, int Tokens, int Warps, int Tile, typename Output>
+template <ggml_type Type, int Tokens, int Warps, int Tile, typename Output, int StoreMode = 0>
 __global__ __launch_bounds__(Warps * WARP_SIZE, Warps <= 8 ? 4 : 2) void IQ3PairSharedGemvKernel(
     const void *__restrict__ weights, const block_q8_1 *__restrict__ input, Output *__restrict__ output,
     int columns, int outputRows, int inputStride, int outputStride) {
@@ -449,8 +449,8 @@ __global__ __launch_bounds__(Warps * WARP_SIZE, Warps <= 8 ? 4 : 2) void IQ3Pair
     for (int t = 0; t < Tokens; ++t) {
         const float sum0 = warp_reduce_sum(sums0[t]), sum1 = warp_reduce_sum(sums1[t]);
         if (lane == 0) {
-            if (row0 < outputRows) output[t * outputStride + row0] = (Output)sum0;
-            if (row0 + Warps < outputRows) output[t * outputStride + row0 + Warps] = (Output)sum1;
+            if (row0 < outputRows) FastllmGgufStore<StoreMode>(output + t * outputStride + row0, sum0);
+            if (row0 + Warps < outputRows) FastllmGgufStore<StoreMode>(output + t * outputStride + row0 + Warps, sum1);
         }
     }
 }
@@ -462,24 +462,24 @@ static bool Supports(const void *input, int columns, int rows, int inputStride, 
            inputStride % QK_K == 0 && outputStride >= rows && (reinterpret_cast<uintptr_t>(input) & 15) == 0;
 }
 
-template <ggml_type Type, int Tokens, int Rows, typename Output>
+template <ggml_type Type, int Tokens, int Rows, typename Output, int StoreMode = 0>
 static void LaunchRows(const void *weights, const block_q8_1 *input, Output *output, int columns, int rows,
                        int inputStride, int outputStride, cudaStream_t stream) {
     constexpr int tile = 1024;
     const int blocks = (rows + Rows - 1) / Rows;
     if constexpr (Type == GGML_TYPE_Q2_K) {
-        Q2KBatchSharedGemvKernel<Tokens, Rows, tile, Output><<<blocks, Rows * WARP_SIZE, 0, stream>>>(
+        Q2KBatchSharedGemvKernel<Tokens, Rows, tile, Output, StoreMode><<<blocks, Rows * WARP_SIZE, 0, stream>>>(
             weights, input, output, columns, rows, inputStride / QK8_1, outputStride);
     } else if constexpr (Type == GGML_TYPE_Q4_K) {
-        Q4KBatchSharedGemvKernel<Tokens, Rows, tile, Output><<<blocks, Rows * WARP_SIZE, 0, stream>>>(
+        Q4KBatchSharedGemvKernel<Tokens, Rows, tile, Output, StoreMode><<<blocks, Rows * WARP_SIZE, 0, stream>>>(
             weights, input, output, columns, rows, inputStride / QK8_1, outputStride);
     } else {
-        BatchSharedGemvKernel<Type, Tokens, Rows, tile, Output><<<blocks, Rows * WARP_SIZE, 0, stream>>>(
+        BatchSharedGemvKernel<Type, Tokens, Rows, tile, Output, StoreMode><<<blocks, Rows * WARP_SIZE, 0, stream>>>(
             weights, input, output, columns, rows, inputStride / QK8_1, outputStride);
     }
 }
 
-template <ggml_type Type, int Tokens, typename Output>
+template <ggml_type Type, int Tokens, typename Output, int StoreMode = 0>
 static void LaunchBatchTokens(const void *weights, const block_q8_1 *input, Output *output, int columns,
                               int rows, int inputStride, int outputStride, cudaStream_t stream) {
     // Larger batches amortize input copies across more output rows; smaller
@@ -487,7 +487,7 @@ static void LaunchBatchTokens(const void *weights, const block_q8_1 *input, Outp
     if constexpr (Type == GGML_TYPE_IQ3_S || Type == GGML_TYPE_IQ3_XXS) {
         if (rows >= 4096) {
             constexpr int warps = 8, outputRows = 2 * warps;
-            IQ3PairSharedGemvKernel<Type, Tokens, warps, 1024, Output>
+            IQ3PairSharedGemvKernel<Type, Tokens, warps, 1024, Output, StoreMode>
                 <<<(rows + outputRows - 1) / outputRows, warps * WARP_SIZE, 0, stream>>>(
                     weights, input, output, columns, rows, inputStride / QK8_1, outputStride);
             return;
@@ -495,20 +495,20 @@ static void LaunchBatchTokens(const void *weights, const block_q8_1 *input, Outp
     } else {
         constexpr int largeBatch = Type == GGML_TYPE_Q4_K ? 4 : 5;
         if (Tokens >= largeBatch && rows >= 4096) {
-            LaunchRows<Type, Tokens, 16>(weights, input, output, columns, rows, inputStride, outputStride,
+            LaunchRows<Type, Tokens, 16, Output, StoreMode>(weights, input, output, columns, rows, inputStride, outputStride,
                                          stream);
             return;
         }
     }
-    LaunchRows<Type, Tokens, 8>(weights, input, output, columns, rows, inputStride, outputStride, stream);
+    LaunchRows<Type, Tokens, 8, Output, StoreMode>(weights, input, output, columns, rows, inputStride, outputStride, stream);
 }
 
-template <ggml_type Type, typename Output>
+template <ggml_type Type, typename Output, int StoreMode = 0>
 static void LaunchBatch(const void *weights, const block_q8_1 *input, Output *output, int columns, int rows,
                         int tokens, int inputStride, int outputStride, cudaStream_t stream) {
 #define FASTLLM_SMALL_MMVQ_CASE(N)                                                                           \
     case N:                                                                                                  \
-        LaunchBatchTokens<Type, N>(weights, input, output, columns, rows, inputStride, outputStride,         \
+        LaunchBatchTokens<Type, N, Output, StoreMode>(weights, input, output, columns, rows, inputStride, outputStride,         \
                                    stream);                                                                  \
         break
     switch (tokens) {

@@ -1,3 +1,6 @@
+#include "fastllm-cuda-gguf-projections.h"
+#include "fastllm-cuda-gguf-linear-add.h"
+#include "fastllm-gguf-store.cuh"
 //
 // Created by huangyuyang on 8/6/25.
 //
@@ -44,8 +47,8 @@ static __device__ __forceinline__ float warp_reduce_sum(float x) {
 
 #define CUDA_QUANTIZE_BLOCK_SIZE     256
 
-template <typename T>
-static __global__ void quantize_q8_1(const T * __restrict__ x, void * __restrict__ vy, const int64_t kx, const int64_t kx0_padded) {
+template <typename T, bool Permuted = false>
+static __global__ void quantize_q8_1(const T * __restrict__ x, void * __restrict__ vy, const int64_t kx, const int64_t kx0_padded, int keyHeads = 0, int groups = 0, int headDim = 0) {
     const int64_t ix0 = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
 
     if (ix0 >= kx0_padded) {
@@ -61,7 +64,12 @@ static __global__ void quantize_q8_1(const T * __restrict__ x, void * __restrict
     const int64_t ib = i_padded / QK8_1; // block index
     const int64_t iqs = i_padded % QK8_1; // quant index
 
-    const float xi = ix0 < kx ? (float)x[ix1*kx + ix0] : 0.0f;
+    int64_t source = ix0;
+    if constexpr (Permuted) {
+        const int head = ix0 / headDim;
+        source = ((head % keyHeads) * groups + head / keyHeads) * headDim + ix0 % headDim;
+    }
+    const float xi = ix0 < kx ? (float)x[ix1*kx + source] : 0.0f;
     float amax = fabsf(xi);
     float sum = xi;
 
@@ -939,7 +947,7 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q8_0> {
     static constexpr int qi = QI8_0;
 };
 
-template <ggml_type type, int ncols_y, int nwarps, typename OType>
+template <ggml_type type, int ncols_y, int nwarps, typename OType, int StoreMode = 0>
 static __device__ void mul_mat_vec_q(
     const void * __restrict__ vx, const void * __restrict__ vy, OType * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
@@ -1019,12 +1027,12 @@ static __device__ void mul_mat_vec_q(
         }
 
         if (threadIdx.x < rows_per_cuda_block && (rows_per_cuda_block == 1 || row0 + threadIdx.x < nrows_dst)) {
-            dst[j*nrows_dst + row0 + threadIdx.x] = (OType)tmp[j][threadIdx.x];
+            FastllmGgufStore<StoreMode>(dst + j*nrows_dst + row0 + threadIdx.x, tmp[j][threadIdx.x]);
         }
     }
 }
 
-template <ggml_type type, int ncols_y, int nwarps, typename OType>
+template <ggml_type type, int ncols_y, int nwarps, typename OType, int StoreMode = 0>
 #if !defined(USE_ROCM)
 __launch_bounds__(nwarps * WARP_SIZE, 1)
 #endif
@@ -1055,10 +1063,10 @@ static __global__ void mul_mat_vec_q(
     }
     const char * cx = (const char *)vx + i02*nb02;
     const char * cy = (const char *)vy + i2*nb12;
-    mul_mat_vec_q<type, ncols_y, nwarps, OType>(cx, cy, (OType *)cdst, ncols_x, nrows_x, nrows_y, nrows_dst);
+    mul_mat_vec_q<type, ncols_y, nwarps, OType, StoreMode>(cx, cy, (OType *)cdst, ncols_x, nrows_x, nrows_y, nrows_dst);
 }
 
-template <ggml_type type, int nwarps, typename OType>
+template <ggml_type type, int nwarps, typename OType, int StoreMode = 0>
 static void mul_mat_vec_q_cuda_T(
     const void * vx, const void * vy, OType * dst, const char * ids_data,
     const int ncols_x, const int nrows_x, const int nrows_y, const int ncols_y, const int nrows_dst,
@@ -1074,28 +1082,28 @@ static void mul_mat_vec_q_cuda_T(
 
     switch (ncols_y) {
         case 1:
-            mul_mat_vec_q<type, 1, nwarps, OType><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
+            mul_mat_vec_q<type, 1, nwarps, OType, StoreMode><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
             break;
         case 2:
-            mul_mat_vec_q<type, 2, nwarps, OType><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
+            mul_mat_vec_q<type, 2, nwarps, OType, StoreMode><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
             break;
         case 3:
-            mul_mat_vec_q<type, 3, nwarps, OType><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
+            mul_mat_vec_q<type, 3, nwarps, OType, StoreMode><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
             break;
         case 4:
-            mul_mat_vec_q<type, 4, nwarps, OType><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
+            mul_mat_vec_q<type, 4, nwarps, OType, StoreMode><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
             break;
         case 5:
-            mul_mat_vec_q<type, 5, nwarps, OType><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
+            mul_mat_vec_q<type, 5, nwarps, OType, StoreMode><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
             break;
         case 6:
-            mul_mat_vec_q<type, 6, nwarps, OType><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
+            mul_mat_vec_q<type, 6, nwarps, OType, StoreMode><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
             break;
         case 7:
-            mul_mat_vec_q<type, 7, nwarps, OType><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
+            mul_mat_vec_q<type, 7, nwarps, OType, StoreMode><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
             break;
         case 8:
-            mul_mat_vec_q<type, 8, nwarps, OType><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
+            mul_mat_vec_q<type, 8, nwarps, OType, StoreMode><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
             break;
         default:
             printf("fatal error: ncols_y = %d exceeds MMVQ_MAX_BATCH_SIZE\n", ncols_y);
@@ -1120,7 +1128,7 @@ static __device__ __forceinline__ half FastllmGgufHalfSiluMulValue(
 #include "fastllm-gguf-small-mmvq.cuh"
 #endif
 
-template <ggml_type type, typename OType>
+template <ggml_type type, typename OType, int StoreMode = 0>
 static void mul_mat_vec_q_cuda(
     const void * vx, const void * vy, OType * dst, const char * ids_data,
     const int ncols_x, const int nrows_x, const int nrows_y, const int ncols_y, const int nrows_dst,
@@ -1138,7 +1146,7 @@ static void mul_mat_vec_q_cuda(
     if constexpr (type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ3_XXS) {
         if (ncols_y == 1 && ne2 == 1 && ids_data == nullptr &&
             fastllm_gguf_iq3::Supports(vy, ncols_x, nrows_x)) {
-            fastllm_gguf_iq3::Launch<type, false>(
+            fastllm_gguf_iq3::Launch<type, false, OType, StoreMode>(
                 vx, nullptr, (const block_q8_1 *)vy, dst, ncols_x, nrows_x, stream);
             return;
         }
@@ -1147,7 +1155,7 @@ static void mul_mat_vec_q_cuda(
                   type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q2_K) {
         if (ncols_y >= 2 && ncols_y <= 8 && ne2 == 1 && ids_data == nullptr &&
             fastllm_gguf_small_mmvq::Supports(vy, ncols_x, nrows_x, nrows_y, nrows_dst)) {
-            fastllm_gguf_small_mmvq::LaunchBatch<type>(
+            fastllm_gguf_small_mmvq::LaunchBatch<type, OType, StoreMode>(
                 vx, (const block_q8_1 *)vy, dst, ncols_x, nrows_x,
                 ncols_y, nrows_y, nrows_dst, stream);
             return;
@@ -1159,11 +1167,11 @@ static void mul_mat_vec_q_cuda(
     // block, so a single warp preserves occupancy. Batched expert slices
     // also use one warp to avoid multiplying register pressure by ne2.
     if (ne2 < 2 && ncols_y <= 4) {
-        mul_mat_vec_q_cuda_T<type, 4, OType>(
+        mul_mat_vec_q_cuda_T<type, 4, OType, StoreMode>(
             vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, ncols_y,
             nrows_dst, ne2, nb02, nb12, nb2, ids_nb0, stream);
     } else {
-        mul_mat_vec_q_cuda_T<type, 1, OType>(
+        mul_mat_vec_q_cuda_T<type, 1, OType, StoreMode>(
             vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, ncols_y,
             nrows_dst, ne2, nb02, nb12, nb2, ids_nb0, stream);
     }
@@ -2633,6 +2641,124 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
     return true;
 }
 
+namespace {
+static bool GgufDenseLocal(const fastllm::Data &data) {
+    using namespace fastllm;
+    const int device = FastllmCudaGetDevice();
+    if (data.dataDevice != DataDevice::CUDA || !data.cudaData || data.multiDeviceData ||
+        data.dims.empty() || data.strides.size() != data.dims.size() ||
+        (!data.dataDeviceIds.empty() &&
+         (data.dataDeviceIds.size() != 1 || data.dataDeviceIds[0] != device))) return false;
+    uint64_t stride = 1;
+    for (int i = int(data.dims.size())-1; i >= 0; --i) {
+        if (data.dims[i] <= 0 || data.strides[i] != stride) return false;
+        stride *= data.dims[i];
+    }
+    return true;
+}
+static bool GgufOverlap(const fastllm::Data &a, const fastllm::Data &b) {
+    const auto x = reinterpret_cast<uintptr_t>(a.cudaData);
+    const auto y = reinterpret_cast<uintptr_t>(b.cudaData);
+    return x < y+b.GetBytes() && y < x+a.GetBytes();
+}
+static bool GgufSharedProjectionCanRun(const fastllm::Data &input,
+        const fastllm::Data &weight, const fastllm::Data &output) {
+    using namespace fastllm;
+    if (input.dataType != FLOAT16 || output.dataType != FLOAT16 ||
+        weight.dataType != DATA_GGUF_FORMAT || weight.dims.size() != 2 ||
+        !GgufDenseLocal(input) || !GgufDenseLocal(output) ||
+        weight.dataDevice != DataDevice::CUDA || !weight.cudaData || weight.multiDeviceData ||
+        (!weight.dataDeviceIds.empty() && (weight.dataDeviceIds.size() != 1 ||
+            weight.dataDeviceIds[0] != FastllmCudaGetDevice()))) return false;
+    const int columns = input.dims.back(), rows = input.Count(0)/columns, outputs = weight.dims[0];
+    if (columns % 256 || rows < 1 || rows > 8 || outputs < 1 || weight.dims[1] != columns ||
+        output.dims.back() != outputs || output.Count(0) != size_t(rows)*outputs ||
+        GgufOverlap(input, output) || GgufOverlap(weight, output)) return false;
+    const auto type = static_cast<ggml_type>(weight.ggmlType);
+    switch (type) {
+        case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_Q4_K: case GGML_TYPE_Q2_K:
+        case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ1_M: break;
+        default: return false;
+    }
+    const auto *tensor = static_cast<const ggml_tensor *>(weight.ggmlTensor);
+    if (!tensor || tensor->type != type || tensor->ne[0] != columns || tensor->ne[1] != outputs ||
+        tensor->nb[0] != ggml_type_size(type) || tensor->nb[1] != ggml_row_size(type, columns)) return false;
+    if (rows == 8 && !weight.forceGGUFFp32Dequant) {
+        int major = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, FastllmCudaGetDevice()) != cudaSuccess ||
+            major >= 10) return false;
+    }
+    return true;
+}
+
+} // namespace
+
+static bool FastllmGGUFLinearAddImpl(const fastllm::Data &input, fastllm::Data &weight,
+        const fastllm::Data &bias, fastllm::Data &output, int keyHeads, int valueHeads, int headDim) {
+    using namespace fastllm;
+    if (!bias.dims.empty() || !GgufSharedProjectionCanRun(input, weight, output)) return false;
+    const int m = input.dims.back(), k = weight.dims[0], n = input.Count(0) / m;
+    const bool permuted = keyHeads != 0;
+    if (permuted && (keyHeads < 1 || valueHeads < keyHeads || valueHeads % keyHeads ||
+        headDim < 32 || headDim % 32 || int64_t(valueHeads) * headDim != m)) return false;
+    const ggml_type type = static_cast<ggml_type>(weight.ggmlType);
+    switch (type) {
+        case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_Q4_K: case GGML_TYPE_Q2_K:
+        case GGML_TYPE_IQ2_S: case GGML_TYPE_IQ2_XS: break;
+        default: return false;
+    }
+    cudaStream_t stream = cudaStreamPerThread;
+    if (!permuted && (type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ2_XS)) {
+        return FastllmCudaHalfMatMulGGUFMMVQAddTo(input.cudaData, weight.cudaData,
+            output.cudaData, weight.ggmlType, n, m, k, stream);
+    }
+    block_q8_1 *quantized = nullptr;
+    if (FastllmCudaTryMalloc(reinterpret_cast<void **>(&quantized),
+                            size_t(n)*(m/QK8_1)*sizeof(block_q8_1)) !=
+        FASTLLM_CUDA_TRY_MALLOC_SUCCESS) return false;
+    if (permuted) {
+        quantize_q8_1<half, true><<<dim3((m+255)/256, n), 256, 0, stream>>>(
+            static_cast<const half *>(input.cudaData), quantized, m, m,
+            keyHeads, valueHeads/keyHeads, headDim);
+    } else {
+        quantize_row_q8_1_cuda(static_cast<const half *>(input.cudaData), quantized,
+                              m, n, 1, m, GGML_TYPE_Q8_1, stream);
+    }
+#define FASTLLM_GGUF_ADD_CASE(TYPE) \
+    case TYPE: mul_mat_vec_q_cuda<TYPE, half, true>(weight.cudaData, quantized, \
+        static_cast<half *>(output.cudaData), nullptr, m, k, m, n, k, \
+        1, 0, 0, 0, 0, stream); break
+    switch (type) {
+        FASTLLM_GGUF_ADD_CASE(GGML_TYPE_IQ3_S);
+        FASTLLM_GGUF_ADD_CASE(GGML_TYPE_IQ3_XXS);
+        FASTLLM_GGUF_ADD_CASE(GGML_TYPE_IQ4_XS);
+        FASTLLM_GGUF_ADD_CASE(GGML_TYPE_Q4_K);
+        FASTLLM_GGUF_ADD_CASE(GGML_TYPE_Q2_K);
+        case GGML_TYPE_IQ2_S: case GGML_TYPE_IQ2_XS:
+            FastllmCudaGGUFExtendedFromQ8(quantized, weight.cudaData, output.cudaData,
+                type, n, m, k, 1, stream); break;
+        default: break; // checked before allocating or writing
+    }
+#undef FASTLLM_GGUF_ADD_CASE
+    FastllmCudaFree(quantized);
+    return true;
+}
+
+bool FastllmCudaGGUFLinearAdd(const fastllm::Data &input, fastllm::Data &weight,
+        const fastllm::Data &bias, fastllm::Data &output) {
+    return FastllmGGUFLinearAddImpl(input, weight, bias, output, 0, 0, 0);
+}
+
+bool FastllmCudaGGUFLinearAddPermuted(const fastllm::Data &input,
+        fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output,
+        int keyHeads, int valueHeads, int headDim) {
+    if (keyHeads <= 0) return false;
+    return FastllmGGUFLinearAddImpl(input, weight, bias, output, keyHeads, valueHeads, headDim);
+}
+
 bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
     if ((ggml_type)weight.ggmlType == GGML_TYPE_BF16) {
         return FastllmCudaHalfMatMulBFloat16(
@@ -2912,6 +3038,70 @@ static bool FastllmDispatchGgufFusedGateUpMmvq(
     }
 }
 
+namespace {
+template<int StoreMode>
+static void GgufProjectFromQ8(const block_q8_1 *input, const fastllm::Data &weight,
+        half *output, int rows, int columns, cudaStream_t stream) {
+    const int outputs = weight.dims[0];
+#define PROJECT_CASE(TYPE) \
+    case TYPE: mul_mat_vec_q_cuda<TYPE, half, StoreMode>(weight.cudaData, input, \
+        output, nullptr, columns, outputs, columns, rows, outputs, \
+        1, 0, 0, 0, 0, stream); break
+    switch (static_cast<ggml_type>(weight.ggmlType)) {
+        PROJECT_CASE(GGML_TYPE_IQ3_S); PROJECT_CASE(GGML_TYPE_IQ3_XXS);
+        PROJECT_CASE(GGML_TYPE_IQ4_XS); PROJECT_CASE(GGML_TYPE_Q4_K); PROJECT_CASE(GGML_TYPE_Q2_K);
+        case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S: case GGML_TYPE_IQ1_M:
+            FastllmCudaGGUFExtendedFromQ8(input, weight.cudaData, output,
+                weight.ggmlType, rows, columns, outputs, StoreMode, stream); break;
+        default: break; // validated before allocating or launching
+    }
+#undef PROJECT_CASE
+}
+}
+
+bool FastllmCudaGGUFLinearShared(const fastllm::Data &input,
+        fastllm::Data *const *weights, fastllm::Data *const *outputs, int count) {
+    if (count < 2 || count > 3 || !weights || !outputs) return false;
+    for (int i = 0; i < count; ++i) {
+        if (!weights[i] || !outputs[i] || !GgufSharedProjectionCanRun(input, *weights[i], *outputs[i])) return false;
+        for (int j = 0; j < count; ++j) {
+            if (!weights[j] || GgufOverlap(*weights[j], *outputs[i])) return false;
+            if (j < i && GgufOverlap(*outputs[i], *outputs[j])) return false;
+        }
+    }
+    const int columns = input.dims.back(), rows = input.Count(0)/columns;
+    block_q8_1 *q8 = nullptr;
+    if (FastllmCudaTryMalloc(reinterpret_cast<void **>(&q8),
+            size_t(rows)*(columns/QK8_1)*sizeof(block_q8_1)) != FASTLLM_CUDA_TRY_MALLOC_SUCCESS) return false;
+    const auto stream = cudaStreamPerThread;
+    quantize_row_q8_1_cuda(static_cast<const half *>(input.cudaData), q8,
+        columns, rows, 1, columns, GGML_TYPE_Q8_1, stream);
+    for (int i = 0; i < count; ++i)
+        GgufProjectFromQ8<0>(q8, *weights[i], static_cast<half *>(outputs[i]->cudaData), rows, columns, stream);
+    FastllmCudaFree(q8);
+    return true;
+}
+
+bool FastllmCudaGGUFMixedGateUp(const fastllm::Data &input,
+        fastllm::Data &gate, fastllm::Data &up, fastllm::Data &output) {
+    if (gate.dims != up.dims ||
+        !GgufSharedProjectionCanRun(input, gate, output) ||
+        !GgufSharedProjectionCanRun(input, up, output)) return false;
+    const int columns = input.dims.back(), rows = input.Count(0)/columns;
+    block_q8_1 *q8 = nullptr;
+    if (FastllmCudaTryMalloc(reinterpret_cast<void **>(&q8),
+            size_t(rows)*(columns/QK8_1)*sizeof(block_q8_1)) != FASTLLM_CUDA_TRY_MALLOC_SUCCESS) return false;
+    const auto stream = cudaStreamPerThread;
+    quantize_row_q8_1_cuda(static_cast<const half *>(input.cudaData), q8,
+        columns, rows, 1, columns, GGML_TYPE_Q8_1, stream);
+    GgufProjectFromQ8<0>(q8, gate, static_cast<half *>(output.cudaData), rows, columns, stream);
+    // The up projection reads the rounded FP16 gate already stored here.
+    // Its epilogue preserves both the SiLU and projection rounding boundaries.
+    GgufProjectFromQ8<2>(q8, up, static_cast<half *>(output.cudaData), rows, columns, stream);
+    FastllmCudaFree(q8);
+    return true;
+}
+
 bool FastllmCudaHalfGgufGateUpSiluMul(
         const fastllm::Data &input,
         fastllm::Data &gateWeight,
@@ -2962,6 +3152,13 @@ bool FastllmCudaHalfGgufGateUpSiluMul(
             }
             FastllmCudaFree(upOutput);
         }
+    }
+
+    if (gateWeight.ggmlType != upWeight.ggmlType &&
+        FastllmCudaGGUFMixedGateUp(input, gateWeight, upWeight, output)) {
+        FastllmCudaFinishInput(input, cudaInput);
+        FastllmCudaFinishOutput(output, cudaOutput);
+        return true;
     }
 
     if (gateWeight.ggmlType == upWeight.ggmlType &&
