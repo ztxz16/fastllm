@@ -123,7 +123,13 @@ static void TestBatchedTopK() {
     }
     // Change score contents between graph replays to catch stale host selection.
     for (const auto &s : {Shape{3,2049,1000,2048}, Shape{33,8192,8159,2048},
-                          Shape{17,32769,32752,2048}}) {
+                          Shape{17,32769,32752,2048},
+                          // Single-query selection: padding, truncation,
+                          // partial causal ranges, and changed scores on replay.
+                          Shape{1,2049,1023,2048}, Shape{1,2049,2048,2048},
+                          Shape{1,32769,32704,2048}, Shape{1,131073,131008,2048},
+                          Shape{1,8193,8190,2048}, Shape{1,8193,8191,2048},
+                          Shape{1,262144,262143,2048}, Shape{1,262145,262144,2048}}) {
         Data scores(FLOAT32), output; auto values=BatchedScores(s.rows,s.keys,s.past,2,19);
         scores.Resize({s.rows,s.keys});scores.Allocate();
         std::memcpy(scores.cpuData,values.data(),values.size()*sizeof(float));scores.ToDevice(DataDevice::CUDA,{0},true);
@@ -646,7 +652,8 @@ static void TestIndexer() {
         {65,16387,16,896,true}, {512,2051,16,896,true},
         {64,16384,8,896,true}, {64,16384,16,896,false},
         {1,4099,16,897,true}, {1,32768,16,896,true}, {1,131073,16,897,true},
-        {1,4099,8,896,true}, {1,4099,16,896,false}};
+        {1,4099,8,896,true}, {1,4099,16,896,false},
+        {1,32768,16,897,false}};
     for (const auto &s : shapes) for (int mode = 0; mode < 5; ++mode) {
         if (quick && s.rows != 33 && s.rows != 1) continue;
         Data q(BFLOAT16), k(BFLOAT16), w(BFLOAT16), out;
@@ -788,14 +795,15 @@ static void TestDecodeGraphs() {
         }
         cudaGraphExecDestroy(graph);
     }
-    for (int keys : {4099, 32768}) {
+    // Both scoring backends must preserve ordering across changed-input replays.
+    for (int keys : {4099, 32768, 131073}) for (bool fp8Query : {false, true}) {
         constexpr int heads = 16, stride = 897;
         Data q(BFLOAT16), k(BFLOAT16), w(BFLOAT16), actual, expected;
         Upload(q, {1, 1, heads * 128}, 751);
         Upload(k, {1, keys, stride}, 757);
         Upload(w, {1, 1, heads}, 761);
         auto call = [&](Data &out) {
-            FastllmCudaNaiveIndexer(q, w, k, heads, 128, keys - 65, 2048, true, out);
+            FastllmCudaNaiveIndexer(q, w, k, heads, 128, keys - 65, 2048, fp8Query, out);
         };
         call(actual);
         Require(cudaDeviceSynchronize() == cudaSuccess, "Indexer graph warmup");

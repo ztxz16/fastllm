@@ -1,6 +1,7 @@
 #include "devices/cuda/naive-n05-cuda.cuh"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "utils.h"
+#include "naive-n05-topk.cuh"
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cub/block/block_scan.cuh>
@@ -95,10 +96,18 @@ void LaunchTrimCachePair(T *key, T *value, int keyColumns,
     }
 }
 
-__device__ unsigned OrderedScoreBits(float score) {
-    unsigned bits = score == 0.0f ? 0u : __float_as_uint(score);
-    return (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
-}
+using naive_topk::OrderedScoreBits;
+
+// Emit ordered scores during decode scoring. Only the CUB fallback needs
+// an explicit position array; cooperative selection derives positions itself.
+struct IndexerTopKOutput {
+    unsigned *scoreBits;
+    int *positions;
+    __device__ void Store(int index, float score) const {
+        scoreBits[index] = OrderedScoreBits(score);
+        if (positions) positions[index] = index;
+    }
+};
 
 __device__ unsigned long long TopKOrder(unsigned scoreBits, int index) {
     return ((unsigned long long)scoreBits << 32) | (0xffffffffu - (unsigned)index);
@@ -140,6 +149,85 @@ __global__ void EncodeTopKPairs(const float *scores, unsigned *bits, int *positi
 __global__ void DecodeTopKPairs(const int *positions, int *indices, int count, int topK) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < topK) indices[i] = i < count ? positions[i] : -1;
+}
+
+// Cache device capability once per worker/device, before repeated Graph captures.
+// Small rows retain CUB's single-block path; the selector specializes K=2048.
+bool UseCooperativeTopK(int count, int topK) {
+#ifdef FASTLLM_NAIVE_COOPERATIVE_TOPK
+    using namespace naive_topk;
+    if (topK != kTopK || count < kMinKeys || count > kMaxKeys) return false;
+    int device = FastllmCudaGetDevice();
+    static thread_local std::vector<int> supported;
+    if (device >= (int)supported.size()) supported.resize(device + 1, -1);
+    if (supported[device] < 0) {
+        cudaDeviceProp prop;
+        auto status = cudaGetDeviceProperties(&prop, device);
+        fastllm::AssertInFastLLM(status == cudaSuccess, "Naive TopK device query failed.");
+        supported[device] = 0;
+        if (prop.cooperativeLaunch && prop.major >= 8) {
+            int floatBlocks, bitBlocks;
+            status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&floatBlocks,
+                Select<float>, kThreads, 0);
+            fastllm::AssertInFastLLM(status == cudaSuccess, "Naive TopK occupancy query failed.");
+            status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bitBlocks,
+                Select<unsigned>, kThreads, 0);
+            fastllm::AssertInFastLLM(status == cudaSuccess, "Naive TopK occupancy query failed.");
+            supported[device] = std::min(floatBlocks, bitBlocks) * prop.multiProcessorCount >= kBlocks;
+        }
+    }
+    return supported[device] != 0;
+#else
+    return false;
+#endif
+}
+
+#ifdef FASTLLM_NAIVE_COOPERATIVE_TOPK
+template <typename Score>
+void CooperativeTopK(const Score *scores, int count, fastllm::Data &indices) {
+    using namespace fastllm;
+    using namespace naive_topk;
+    // Each invocation owns its scratch through the existing graph-aware allocator.
+    Data workspace;
+    Output(workspace, INT32, {(int)(sizeof(Workspace) / sizeof(int))});
+    Output(indices, INT32, {1, kTopK});
+    auto *scratch = (Workspace *)workspace.cudaData;
+    auto *candidates = scratch->candidates;
+    auto *histograms = scratch->partials;
+    auto *ties = scratch->ties;
+    auto *state = &scratch->state;
+    void *args[] = {&scores, &count, &histograms, &ties, &state, &candidates};
+    auto status = cudaLaunchCooperativeKernel((void *)naive_topk::Select<Score>,
+        kBlocks, kThreads, args, 0, cudaStreamPerThread);
+    AssertInFastLLM(status == cudaSuccess, "Naive cooperative TopK selection failed.");
+    naive_topk::Sort<<<1, kThreads, 0, cudaStreamPerThread>>>(candidates, state, (int *)indices.cudaData);
+    CheckLaunch();
+}
+#endif
+
+// The output allocation holds all sorted positions; only its first topK
+// entries are exposed to attention. This avoids a separate gather/copy kernel.
+void SortTopKPairs(const unsigned *input, const int *positions, int count,
+                   int topK, fastllm::Data &indices) {
+    using namespace fastllm;
+    Data sorted, workspace;
+    Output(sorted, INT32, {count});
+    Output(indices, INT32, {1, std::max(count, topK)});
+    auto *output = (unsigned *)sorted.cudaData;
+    auto *outputPositions = (int *)indices.cudaData;
+    size_t bytes = 0;
+    // Stable sorting resolves equal score bits by ascending input position.
+    auto status = cub::DeviceRadixSort::SortPairsDescending(nullptr, bytes,
+        input, output, positions, outputPositions, count, 0, 32, cudaStreamPerThread);
+    AssertInFastLLM(status == cudaSuccess && (bytes + 3) / 4 <= INT_MAX,
+        "Naive-N0.5 TopK workspace query failed.");
+    Output(workspace, INT32, {(int)((bytes + 3) / 4)});
+    status = cub::DeviceRadixSort::SortPairsDescending(workspace.cudaData, bytes,
+        input, output, positions, outputPositions, count, 0, 32, cudaStreamPerThread);
+    AssertInFastLLM(status == cudaSuccess, "Naive-N0.5 GPU TopK failed.");
+    if (count < topK)
+        DecodeTopKPairs<<<(topK + 255) / 256, 256>>>(outputPositions, outputPositions, count, topK);
+    indices.Resize({1, topK});
 }
 
 // Select a bounded superset of the top K before sorting it. A radix prefix can
@@ -316,10 +404,11 @@ __global__ void IndexScores(const float *q, const float *k, const BF16 *weights,
         scores[(size_t)query * keys + key] = key <= queryStart + query ? score : -INFINITY;
 }
 
-// Decode consumes each packed K row once. Keep its original E4M3-rounded
-// FP32 operands in registers across the 16 heads, avoiding a full temporary K.
+// Decode consumes each packed BF16 K row once. Keep its FP32 values in
+// registers across the 16 heads, avoiding a full temporary K.
+template <typename ScoreOutput>
 __global__ void IndexScoresDecode(const float *q, const BF16 *packedKeys,
-        const BF16 *weights, float *scores, int stride, int keys, int queryStart) {
+        const BF16 *weights, ScoreOutput scores, int stride, int keys, int queryStart) {
     int key = blockIdx.x * 8 + threadIdx.x / 32, lane = threadIdx.x % 32;
     if (key >= keys) return;
     float k[4];
@@ -335,7 +424,7 @@ __global__ void IndexScoresDecode(const float *q, const BF16 *packedKeys,
         dot = WarpSum(dot);
         score += fmaxf(dot, 0.0f) * (float)weights[h];
     }
-    if (lane == 0) scores[key] = key <= queryStart ? score : -INFINITY;
+    if (lane == 0) scores.Store(key, key <= queryStart ? score : -INFINITY);
 }
 
 // Two 16-lane subgroups evaluate adjacent heads in parallel. Each lane owns
@@ -946,29 +1035,19 @@ void FastllmCudaNaiveTopK(const fastllm::Data &scores, int queryStart, int topK,
         return;
     }
     int count = queryStart + 1;
-    Data encoded, sorted, workspace;
+#ifdef FASTLLM_NAIVE_COOPERATIVE_TOPK
+    if (UseCooperativeTopK(count, topK)) {
+        CooperativeTopK((const float *)scores.cudaData, count, indices);
+        return;
+    }
+#endif
+    Data encoded;
     Output(encoded, INT32, {count, 2});
-    Output(sorted, INT32, {count, 2});
-    Output(indices, INT32, {1, topK});
     auto *input = (unsigned *)encoded.cudaData;
-    auto *output = (unsigned *)sorted.cudaData;
     auto *inputPositions = (int *)encoded.cudaData + count;
-    auto *outputPositions = (int *)sorted.cudaData + count;
-    size_t bytes = 0;
-    // Stability retains ascending position order for equal score bits. This
-    // gives the same total order as the batched 64-bit key with half the bits.
-    // CCCL's driver launcher needs the per-thread stream explicitly.
-    auto status = cub::DeviceRadixSort::SortPairsDescending(nullptr, bytes,
-        input, output, inputPositions, outputPositions, count, 0, 32, cudaStreamPerThread);
-    AssertInFastLLM(status == cudaSuccess && (bytes + 3) / 4 <= INT_MAX,
-        "Naive-N0.5 TopK workspace query failed.");
-    Output(workspace, INT32, {(int)((bytes + 3) / 4)});
     EncodeTopKPairs<<<(count + 255) / 256, 256>>>(
         (const float *)scores.cudaData, input, inputPositions, count);
-    status = cub::DeviceRadixSort::SortPairsDescending(workspace.cudaData, bytes,
-        input, output, inputPositions, outputPositions, count, 0, 32, cudaStreamPerThread);
-    AssertInFastLLM(status == cudaSuccess, "Naive-N0.5 GPU TopK failed.");
-    DecodeTopKPairs<<<(topK + 255) / 256, 256>>>(outputPositions, (int *)indices.cudaData, count, topK);
+    SortTopKPairs(input, inputPositions, count, topK, indices);
     CheckLaunch();
 }
 
@@ -1028,8 +1107,12 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
         "Invalid Naive-N0.5 Indexer layout (requires 128-element BF16 blocks).");
     int queries = query.dims[1], keys = packedKeys.dims[1];
     int stride = packedKeys.dims[2];
-    Data q, k, scores;
-    Output(scores, DataType::FLOAT32, {queries, keys});
+    bool decodeTopK = queries == 1 && heads == 16;
+    bool selectTopK = decodeTopK && UseCooperativeTopK(queryStart + 1, topK);
+    Data q, k, scores, positions;
+    Output(scores, decodeTopK ? INT32 : FLOAT32, {queries, keys});
+    if (decodeTopK && !selectTopK) Output(positions, INT32, {keys});
+    IndexerTopKOutput topKOutput{(unsigned *)scores.cudaData, (int *)positions.cudaData};
 #ifdef FASTLLM_NAIVE_DSA_MMA
     using naive_dsa_mma::kKeys;
     using naive_dsa_mma::kThreads;
@@ -1048,7 +1131,7 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
             naive_dsa_mma::IndexerDecodeScores<<<(keys + kKeys - 1) / kKeys, kThreads>>>(
                 (const BF16 *)q.cudaData, (const BF16 *)packedKeys.cudaData,
                 (const float *)qScale.cudaData, (const BF16 *)weights.cudaData,
-                (float *)scores.cudaData, stride, keys, queryStart);
+                topKOutput, stride, keys, queryStart);
         } else {
             naive_dsa_mma::IndexerScores<<<dim3((keys + kKeys - 1) / kKeys,
                 (queries + kKeys - 1) / kKeys), kThreads>>>(
@@ -1062,10 +1145,10 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
         Output(q, DataType::FLOAT32, {queries, heads, dim});
         RoundIndexer<<<queries * heads, 128>>>((const BF16 *)query.cudaData,
             (float *)q.cudaData, dim, 0, fp8Query);
-        if (queries == 1 && heads == 16) {
+        if (decodeTopK) {
             IndexScoresDecode<<<(keys + 7) / 8, 256>>>((const float *)q.cudaData,
                 (const BF16 *)packedKeys.cudaData, (const BF16 *)weights.cudaData,
-                (float *)scores.cudaData, stride, keys, queryStart);
+                topKOutput, stride, keys, queryStart);
         } else {
             Output(k, DataType::FLOAT32, {keys, dim});
             RoundIndexer<<<keys, 128>>>((const BF16 *)packedKeys.cudaData,
@@ -1092,8 +1175,20 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
         }
     }
     CheckLaunch();
-    // Stable GPU selection for decode and every row of a prefill chunk.
-    FastllmCudaNaiveTopK(scores, queryStart, topK, indices);
+    // The selector derives positions directly; CUB's fallback uses emitted positions.
+#ifdef FASTLLM_NAIVE_COOPERATIVE_TOPK
+    if (selectTopK) {
+        CooperativeTopK((const unsigned *)scores.cudaData, queryStart + 1, indices);
+        return;
+    }
+#endif
+    if (decodeTopK) {
+        SortTopKPairs((const unsigned *)scores.cudaData, (const int *)positions.cudaData,
+            queryStart + 1, topK, indices);
+        CheckLaunch();
+    } else {
+        FastllmCudaNaiveTopK(scores, queryStart, topK, indices);
+    }
 }
 
 void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &key,
