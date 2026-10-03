@@ -9256,11 +9256,17 @@ namespace fastllm {
                         // (and output) of an identical prefill.  Do this in
                         // the existing GPU worker so its one-time packing is
                         // overlapped with the disjoint CPU expert work.
+                        // Packed block-16 NVFP4 (including GLM) still stores
+                        // gate/up in separate halves before NUMA registration.
+                        // The CUDA worker consumes interleaved rows even on
+                        // the first request; quantized packing alone does not
+                        // establish that gate/up layout.
                         for (int e : gpuExpertSets[i]) {
                             Data *gateUpWeight = weights[e * 2];
                             Data *downWeight = weights[e * 2 + 1];
                             if (gateUpWeight != nullptr &&
                                 (gateUpWeight->dataType == DataType::FP8_E4M3 ||
+                                 IsNumasGroupedNVFP4Weight(gateUpWeight) ||
                                  (deepSeekV4Mode && activationQuantBlock == 32 &&
                                   gateUpWeight->dataType == DataType::NVFP4)) &&
                                 gateUpWeight->numasData.empty() &&
@@ -9270,6 +9276,7 @@ namespace fastllm {
                             }
                             if (downWeight != nullptr &&
                                 (downWeight->dataType == DataType::FP8_E4M3 ||
+                                 IsNumasGroupedNVFP4Weight(downWeight) ||
                                  (deepSeekV4Mode && activationQuantBlock == 32 &&
                                   downWeight->dataType == DataType::NVFP4)) &&
                                 downWeight->numasData.empty() &&

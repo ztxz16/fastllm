@@ -968,6 +968,15 @@ if (UNIT_TEST)
         set_tests_properties(numas_nvfp4_moe numas_nvfp4_moe_avx2 PROPERTIES
             ENVIRONMENT "FT_NUMAS=2;FT_THREADS=6;FT_GPU_PREFILL=0"
             SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+        if (USE_CUDA)
+            add_executable(numas_nvfp4_hybrid_cold_test test/basic/test_numas_nvfp4_hybrid_cold.cpp)
+            target_link_libraries(numas_nvfp4_hybrid_cold_test PRIVATE fastllm)
+            target_include_directories(numas_nvfp4_hybrid_cold_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            add_test(NAME numas_nvfp4_hybrid_cold COMMAND numas_nvfp4_hybrid_cold_test)
+            set_tests_properties(numas_nvfp4_hybrid_cold PROPERTIES
+                ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4;FT_GPU_PREFILL=1;FT_EXPERT_LIMIT=0"
+                LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+        endif()
     endif()
 
     add_executable(regressionOps test/ops/regressionOps.cpp)
