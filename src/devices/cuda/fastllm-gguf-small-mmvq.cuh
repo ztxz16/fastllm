@@ -1,5 +1,8 @@
 #pragma once
 
+#include <algorithm>
+#include <cstdlib>
+
 // Quantized dot arithmetic adapted from ggml / Iwan Kawrakow (MIT).
 // Copyright (C) 2023-2024 The ggml authors
 // Copyright (C) 2024 Iwan Kawrakow
@@ -24,7 +27,14 @@ static __device__ __forceinline__ int2 LookupIQ4(uint32_t q) {
 // Decode one lane's 32 weights once, then reuse the packed int8 values for
 // every input token. Keep the format-specific integer scaling in the dot
 // product: in particular IQ3_XXS rounds before applying the floating scale.
-template <ggml_type Type>
+// Codebook magnitudes are nonzero, so per-byte two's-complement increments
+// cannot carry into a neighboring byte. bits contains four sign bits.
+static __device__ __forceinline__ uint32_t PackedSigns(uint32_t value, uint32_t bits) {
+    const uint32_t ones = ((bits & 15u) * 0x00204081u) & 0x01010101u;
+    return (value ^ (ones * 255u)) + ones;
+}
+
+template <ggml_type Type, bool CompactSigns = false>
 static __device__ __forceinline__ void DecodeBatchWeights(const void *weights, int block, int iqs,
                                                           const void *codebook, int (&values)[8], float &d,
                                                           int &scale) {
@@ -99,11 +109,16 @@ static __device__ __forceinline__ void DecodeBatchWeights(const void *weights, i
                 signs = s7 | ((__popc(s7) & 1) << 7);
             }
             const uint64_t q = iq2Grid[index];
-            const uint32_t repeated = signs * 0x01010101u;
-            const uint32_t s0 = __vcmpne4(repeated & 0x08040201, 0);
-            const uint32_t s1 = __vcmpne4(repeated & 0x80402010, 0);
-            values[2 * j] = (uint32_t(q) ^ s0) + (s0 & 0x01010101u);
-            values[2 * j + 1] = (uint32_t(q >> 32) ^ s1) + (s1 & 0x01010101u);
+            if constexpr (CompactSigns) {
+                values[2 * j] = PackedSigns(uint32_t(q), signs);
+                values[2 * j + 1] = PackedSigns(uint32_t(q >> 32), signs >> 4);
+            } else {
+                const uint32_t repeated = signs * 0x01010101u;
+                const uint32_t s0 = __vcmpne4(repeated & 0x08040201, 0);
+                const uint32_t s1 = __vcmpne4(repeated & 0x80402010, 0);
+                values[2 * j] = (uint32_t(q) ^ s0) + (s0 & 0x01010101u);
+                values[2 * j + 1] = (uint32_t(q >> 32) ^ s1) + (s1 & 0x01010101u);
+            }
         }
     } else if constexpr (Type == GGML_TYPE_IQ3_S) {
         const auto *w = static_cast<const block_iq3_s *>(weights) + block;
@@ -116,10 +131,15 @@ static __device__ __forceinline__ void DecodeBatchWeights(const void *weights, i
         for (int j = 0; j < 8; j += 2) {
             const uint32_t lo = grid[qs[j] | ((qh << (8 - j)) & 0x100)];
             const uint32_t hi = grid[qs[j + 1] | ((qh << (7 - j)) & 0x100)];
-            const uint32_t s0 = __vcmpne4(((signs[j / 2] & 0x03) << 7) | ((signs[j / 2] & 0x0c) << 21), 0);
-            const uint32_t s1 = __vcmpne4(((signs[j / 2] & 0x30) << 3) | ((signs[j / 2] & 0xc0) << 17), 0);
-            values[j] = (lo ^ s0) + (s0 & 0x01010101u);
-            values[j + 1] = (hi ^ s1) + (s1 & 0x01010101u);
+            if constexpr (CompactSigns) {
+                values[j] = PackedSigns(lo, signs[j / 2]);
+                values[j + 1] = PackedSigns(hi, signs[j / 2] >> 4);
+            } else {
+                const uint32_t s0 = __vcmpne4(((signs[j / 2] & 0x03) << 7) | ((signs[j / 2] & 0x0c) << 21), 0);
+                const uint32_t s1 = __vcmpne4(((signs[j / 2] & 0x30) << 3) | ((signs[j / 2] & 0xc0) << 17), 0);
+                values[j] = (lo ^ s0) + (s0 & 0x01010101u);
+                values[j + 1] = (hi ^ s1) + (s1 & 0x01010101u);
+            }
         }
         d = __half2float(w->d);
         scale = 1 + 2 * ((w->scales[iqs / 4] >> ((iqs << 1) & 4)) & 15);
@@ -131,11 +151,17 @@ static __device__ __forceinline__ void DecodeBatchWeights(const void *weights, i
 #pragma unroll
         for (int j = 0; j < 8; j += 2) {
             const uint32_t s7 = (aux >> (7 * j / 2)) & 127;
-            const uint32_t s8 = (s7 | ((__popc(s7) & 1) << 7)) * 0x01010101u;
-            const uint32_t s0 = __vcmpne4(s8 & 0x08040201, 0);
-            const uint32_t s1 = __vcmpne4(s8 & 0x80402010, 0);
-            values[j] = (grid[qs[j]] ^ s0) + (s0 & 0x01010101u);
-            values[j + 1] = (grid[qs[j + 1]] ^ s1) + (s1 & 0x01010101u);
+            const uint32_t signs = s7 | ((__popc(s7) & 1) << 7);
+            if constexpr (CompactSigns) {
+                values[j] = PackedSigns(grid[qs[j]], signs);
+                values[j + 1] = PackedSigns(grid[qs[j + 1]], signs >> 4);
+            } else {
+                const uint32_t s8 = signs * 0x01010101u;
+                const uint32_t s0 = __vcmpne4(s8 & 0x08040201, 0);
+                const uint32_t s1 = __vcmpne4(s8 & 0x80402010, 0);
+                values[j] = (grid[qs[j]] ^ s0) + (s0 & 0x01010101u);
+                values[j + 1] = (grid[qs[j + 1]] ^ s1) + (s1 & 0x01010101u);
+            }
         }
         d = __half2float(w->d);
         scale = aux >> 28;
@@ -479,9 +505,154 @@ static void LaunchRows(const void *weights, const block_q8_1 *input, Output *out
     }
 }
 
+// T=8 IQ4_XS/Q4_K: one warp owns two output rows and keeps its Q8
+// activation slices in registers. There are no block-wide barriers. The
+// static K loop preserves each lane's original accumulation order.
+// Q4_K deliberately uses the exact sum of quantized input bytes, not
+// q8_1.ds.y (the rounded sum before quantization).
+template <ggml_type Type, int K, typename Output, int StoreMode = 0>
+__global__ __launch_bounds__(128) void RegisterT8GemvKernel(
+    const void *__restrict__ weights, const block_q8_1 *__restrict__ input,
+    Output *__restrict__ output, int outputRows, int inputStride, int outputStride) {
+    static_assert(Type == GGML_TYPE_IQ4_XS || Type == GGML_TYPE_Q4_K);
+    static_assert(K % 1024 == 0);
+    constexpr int tokens = 8, warps = 4;
+    const int lane = threadIdx.x % WARP_SIZE, warp = threadIdx.x / WARP_SIZE;
+    for (int row0 = (blockIdx.x * warps + warp) * 2; row0 < outputRows;
+         row0 += gridDim.x * warps * 2) {
+        float sums[2][tokens] = {};
+#pragma unroll
+        for (int it = 0; it < K / 1024; ++it) {
+            const int slice = it * WARP_SIZE + lane;
+            int activation[tokens][8], inputSum[tokens];
+            float dx[tokens];
+#pragma unroll
+            for (int t = 0; t < tokens; ++t) {
+                const auto &x = input[t * inputStride + slice];
+                dx[t] = __low2float(x.ds);
+                int sum = 0;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    activation[t][j] = get_int_b4(x.qs, j);
+                    if constexpr (Type == GGML_TYPE_Q4_K)
+                        sum = ggml_cuda_dp4a(0x01010101, activation[t][j], sum);
+                }
+                inputSum[t] = sum;
+            }
+#pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                const int row = min(row0 + r, outputRows - 1);
+                const int block = row * (K / QK_K) + slice / 8, group = lane % 8;
+                int values[8], scale, minimum = 0;
+                float d, dmin = 0;
+                if constexpr (Type == GGML_TYPE_IQ4_XS) {
+                    DecodeBatchWeights<Type>(weights, block, 2 * group, nullptr, values, d, scale);
+                } else {
+                    const auto *w = static_cast<const block_q4_K *>(weights) + block;
+#pragma unroll
+                    for (int j = 0; j < 8; ++j)
+                        values[j] = (get_int_b4(w->qs, (group / 2) * 8 + j) >> (4 * (group % 2))) & 0x0f0f0f0f;
+                    scale = group < 4 ? (w->scales[group] & 63)
+                        : ((w->scales[group + 4] & 15) | ((w->scales[group - 4] >> 6) << 4));
+                    minimum = group < 4 ? (w->scales[group + 4] & 63)
+                        : ((w->scales[group + 4] >> 4) | ((w->scales[group] >> 6) << 4));
+                    const float2 dm = __half22float2(w->dm);
+                    d = dm.x; dmin = dm.y;
+                }
+#pragma unroll
+                for (int t = 0; t < tokens; ++t) {
+                    int dot = 0;
+#pragma unroll
+                    for (int j = 0; j < 8; ++j)
+                        dot = ggml_cuda_dp4a(values[j], activation[t][j], dot);
+                    if constexpr (Type == GGML_TYPE_IQ4_XS)
+                        sums[r][t] += (d * dx[t]) * (dot * scale);
+                    else
+                        sums[r][t] += d * (dx[t] * (dot * scale)) -
+                                      dmin * (dx[t] * (inputSum[t] * minimum));
+                }
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+#pragma unroll
+            for (int t = 0; t < tokens; ++t) {
+                const float sum = warp_reduce_sum(sums[r][t]);
+                if (lane == 0 && row0 + r < outputRows)
+                    FastllmGgufStore<StoreMode>(output + t * outputStride + row0 + r, sum);
+            }
+        }
+    }
+}
+
+template <ggml_type Type, int K, typename Output, int StoreMode>
+static void LaunchRegisterT8(const void *weights, const block_q8_1 *input, Output *output,
+                             int rows, int inputStride, int outputStride, cudaStream_t stream) {
+    // Per-thread/per-device cache: no cross-thread mutation and no assumption
+    // that all CUDA devices have the same SM count or register capacity.
+    static thread_local int cachedDevice = -1, cachedLimit = 0;
+    int device = -1;
+    const int groups = (rows + 7) / 8;
+    int blocks = groups;
+    if (cudaGetDevice(&device) == cudaSuccess) {
+        if (device != cachedDevice) {
+            int resident = 0, sms = 0;
+            if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &resident, RegisterT8GemvKernel<Type, K, Output, StoreMode>, 128, 0) == cudaSuccess &&
+                cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) == cudaSuccess &&
+                resident > 0 && sms > 0) {
+                cachedLimit = resident * sms;
+                cachedDevice = device;
+            }
+        }
+        if (device == cachedDevice) blocks = std::min(groups, cachedLimit);
+    }
+    RegisterT8GemvKernel<Type, K, Output, StoreMode><<<blocks, 128, 0, stream>>>(
+        weights, input, output, rows, inputStride / QK8_1, outputStride);
+}
+
+#include "fastllm-gguf-t8-extended.cuh"
+#include "fastllm-gguf-t8-tiled.cuh"
+
 template <ggml_type Type, int Tokens, typename Output, int StoreMode = 0>
 static void LaunchBatchTokens(const void *weights, const block_q8_1 *input, Output *output, int columns,
                               int rows, int inputStride, int outputStride, cudaStream_t stream) {
+    if constexpr (Tokens == 8 && (Type == GGML_TYPE_IQ4_XS || Type == GGML_TYPE_IQ3_XXS)) {
+        constexpr int outputKind = std::is_same<Output, half>::value ? 1
+            : std::is_same<Output, __nv_bfloat16>::value ? 2 : 0;
+        if (rows >= 4096 && DispatchTiledT8(
+                Type, outputKind, StoreMode, weights, input, output, columns, rows,
+                inputStride, outputStride, stream)) return;
+    }
+    if constexpr (Tokens == 8 && ExtendedT8Type<Type>) {
+        constexpr int outputKind = std::is_same<Output, half>::value ? 1
+            : std::is_same<Output, __nv_bfloat16>::value ? 2 : 0;
+        if (rows >= 4096 && DispatchExtendedT8(
+                Type, outputKind, StoreMode, weights, input, output, columns, rows,
+                inputStride, outputStride, stream)) return;
+    }
+    if constexpr (Tokens == 8 && (Type == GGML_TYPE_IQ4_XS || Type == GGML_TYPE_Q4_K)) {
+        if (rows >= 4096) {
+#define FASTLLM_REGISTER_T8_K(K) \
+            case K: LaunchRegisterT8<Type, K, Output, StoreMode>( \
+                weights, input, output, rows, inputStride, outputStride, stream); return
+            switch (columns) {
+                FASTLLM_REGISTER_T8_K(5120);
+                FASTLLM_REGISTER_T8_K(6144);
+                FASTLLM_REGISTER_T8_K(10240);
+                case 17408:
+                    // IQ4_XS uses the tiled route above for this width.
+                    // Only Q4_K uses the register kernel here.
+                    if constexpr (Type == GGML_TYPE_Q4_K) {
+                        LaunchRegisterT8<Type, 17408, Output, StoreMode>(
+                            weights, input, output, rows, inputStride, outputStride, stream);
+                        return;
+                    }
+                    break;
+            }
+#undef FASTLLM_REGISTER_T8_K
+        }
+    }
     // Larger batches amortize input copies across more output rows; smaller
     // matrices retain more CTAs. These are scheduling choices, not SM guards.
     if constexpr (Type == GGML_TYPE_IQ3_S || Type == GGML_TYPE_IQ3_XXS) {

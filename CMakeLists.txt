@@ -362,6 +362,8 @@ if (USE_CUDA)
         src/devices/cuda/fastllm-cuda-mtp.cu
         src/devices/cuda/fastllm-triton-cuda.cu
         src/devices/cuda/fastllm-ggml-cuda.cu
+        src/devices/cuda/fastllm-gguf-t8-extended.cu
+        src/devices/cuda/fastllm-gguf-t8-tiled.cu
         src/devices/cuda/gguf_mmq/fastllm-gguf-mmq.cu
         src/devices/cuda/gguf_mmq/fastllm-gguf-moe-stream.cu
         src/devices/cuda/attention/fastllm-attention.cu
@@ -1364,6 +1366,23 @@ if (UNIT_TEST)
         fastllm_add_checked_test(cuda_nvfp4_swiglu_sm120 cuda_nvfp4_fused_test "PASS SM120 SwiGLU" 600 sm120-swiglu)
         set_tests_properties(cuda_nvfp4_sm120_tiles cuda_nvfp4_swiglu_sm120 PROPERTIES
             LABELS cuda RUN_SERIAL TRUE)
+
+        add_executable(cuda_gguf_t8_extended_test test/basic/test_cuda_gguf_t8_extended.cu)
+        target_link_libraries(cuda_gguf_t8_extended_test PRIVATE fastllm)
+        set_target_properties(cuda_gguf_t8_extended_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        fastllm_add_checked_test(cuda_gguf_t8_extended cuda_gguf_t8_extended_test "PASS T8 extended projections" 600)
+        set_tests_properties(cuda_gguf_t8_extended PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+        add_executable(cuda_gguf_t8_tiled_test test/basic/test_cuda_gguf_t8_tiled.cu)
+        target_link_libraries(cuda_gguf_t8_tiled_test PRIVATE fastllm)
+        set_target_properties(cuda_gguf_t8_tiled_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        fastllm_add_checked_test(cuda_gguf_t8_tiled cuda_gguf_t8_tiled_test "PASS T8 tiled projections" 600)
+        set_tests_properties(cuda_gguf_t8_tiled PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+
+        add_executable(cuda_gguf_t8_register_test test/basic/test_cuda_gguf_t8_register.cu)
+        target_link_libraries(cuda_gguf_t8_register_test PRIVATE fastllm)
+        set_target_properties(cuda_gguf_t8_register_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        fastllm_add_checked_test(cuda_gguf_t8_register cuda_gguf_t8_register_test "PASS T8 register projections" 600)
+        set_tests_properties(cuda_gguf_t8_register PROPERTIES LABELS cuda RUN_SERIAL TRUE)
 
         add_executable(cuda_gguf_decode_fusions_test test/basic/test_cuda_gguf_decode_fusions.cu)
         target_link_libraries(cuda_gguf_decode_fusions_test PRIVATE fastllm)
