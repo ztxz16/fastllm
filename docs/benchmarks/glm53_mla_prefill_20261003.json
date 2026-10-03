@@ -1,0 +1,327 @@
+{
+  "date": "2026-10-03",
+  "model": "GLM-5.3-Flash-NVFP4",
+  "hardware": "8 x NVIDIA RTX 5090 32 GiB, ARM64, CUDA 12.9, SM120",
+  "base_commit": "5e590933d8ace0ceb7392c37da5c89e3fba12379",
+  "implementation": "Bounded head-group KV expansion with existing BF16 GEMM and paged prefill attention; compressed persistent cache and absorbed MLA decode",
+  "configuration": {
+    "device": "cudapp=8",
+    "moe_device": "cudapp=8",
+    "chunked_prefill_size": 1024,
+    "tokens": 32768,
+    "max_batch": 1,
+    "gpu_mem_ratio": 0.9,
+    "prefix_cache": false,
+    "cache_history": false,
+    "cuda_slab": 288,
+    "moe_atype": "bfloat16",
+    "mtp": 0,
+    "threads": 8
+  },
+  "prompt_token_sha256": "4d8b3c6d7ab88e3b7da89bd9ce8081a863b4827554295c21bac627b16ddc5509",
+  "measurement": "Independent processes, two warmups, three timed 16K first-token requests per build; loading and weight repacking excluded. Performance numbers below describe the pre-cleanup implementation.",
+  "baseline": {
+    "library_sha256": "d9335f796c563a7d735799a05a93ec6b8322b348eb1b019b2123aa15d0be67b3",
+    "ttft_median_s": 7.609796882024966,
+    "prefill_tokens_per_second": 2153.0141019532994,
+    "ttft_samples_s": [
+      7.608737185015343,
+      7.609796882024966,
+      7.611113304970786
+    ]
+  },
+  "integrated_before_cleanup": {
+    "library_sha256": "b893bc4b824a10fa5bc9b712140eb9833373fd04247de8ebd5407905cb5d56fb",
+    "ttft_median_s": 6.6501548499800265,
+    "prefill_tokens_per_second": 2463.7020294420977,
+    "ttft_samples_s": [
+      6.6501548499800265,
+      6.634756842977367,
+      6.6514581050141715
+    ]
+  },
+  "speedup": 1.14430371227338,
+  "ttft_reduction": 0.12610612962767787,
+  "quality": {
+    "greedy_tokens_equal": 37,
+    "greedy_tokens_total": 56,
+    "same_prefix_rows": 40,
+    "same_prefix_max_abs": 4.125,
+    "same_prefix_max_rmse": 0.5237971530800934,
+    "same_prefix_min_cosine": 0.9745620952284423,
+    "same_prefix_max_probability_tv": 0.2245895914716376,
+    "logits_bitwise_equal": false,
+    "finite": true,
+    "cases": [
+      {
+        "case": "quality-0-512",
+        "greedy_tokens_equal": 8,
+        "total_steps": 8,
+        "same_prefix_steps": 8
+      },
+      {
+        "case": "quality-1-512",
+        "greedy_tokens_equal": 8,
+        "total_steps": 8,
+        "same_prefix_steps": 8
+      },
+      {
+        "case": "quality-16k",
+        "greedy_tokens_equal": 8,
+        "total_steps": 8,
+        "same_prefix_steps": 8
+      },
+      {
+        "case": "quality-2-512",
+        "greedy_tokens_equal": 0,
+        "total_steps": 8,
+        "same_prefix_steps": 1
+      },
+      {
+        "case": "quality-3-2048",
+        "greedy_tokens_equal": 5,
+        "total_steps": 8,
+        "same_prefix_steps": 6
+      },
+      {
+        "case": "quality-4-2048",
+        "greedy_tokens_equal": 0,
+        "total_steps": 8,
+        "same_prefix_steps": 1
+      },
+      {
+        "case": "quality-5-2048",
+        "greedy_tokens_equal": 8,
+        "total_steps": 8,
+        "same_prefix_steps": 8
+      }
+    ],
+    "note": "Logit error metrics only use matching input/generated prefixes. Later positions after token divergence are excluded."
+  },
+  "profile": {
+    "library_sha256": "b893bc4b824a10fa5bc9b712140eb9833373fd04247de8ebd5407905cb5d56fb",
+    "baseline_source": "Existing same-input convolution optimization capture, not the fresh unprofiled timing run",
+    "baseline_ttft_s": 7.627506160992198,
+    "integrated_ttft_s": 6.7068759219837375,
+    "integrated_kernel_calls": 40400,
+    "integrated_kernel_total_ms": 6213.376090000001,
+    "families": {
+      "Compressed MLA attention": {
+        "before_ms": 1823.080261,
+        "after_ms": 0.0,
+        "before_calls": 176,
+        "after_calls": 0
+      },
+      "MoE Marlin": {
+        "before_ms": 2131.870117,
+        "after_ms": 2129.8138860000013,
+        "before_calls": 1344,
+        "after_calls": 1344
+      },
+      "KDA recurrence": {
+        "before_ms": 864.022379,
+        "after_ms": 863.6628359999996,
+        "before_calls": 544,
+        "after_calls": 544
+      },
+      "Dense GEMM/GEMV": {
+        "before_ms": 1411.517775,
+        "after_ms": 1610.6428080000012,
+        "before_calls": 9520,
+        "after_calls": 10136
+      },
+      "Other kernels": {
+        "before_ms": 984.0088869999997,
+        "after_ms": 976.35149,
+        "before_calls": 27760,
+        "after_calls": 27892
+      },
+      "Expanded MHA attention": {
+        "before_ms": 0.0,
+        "after_ms": 632.9050700000005,
+        "before_calls": 0,
+        "after_calls": 484
+      }
+    },
+    "trace": "Nsight Systems 2026.3.2 CUDA software trace; one warmed 16K request",
+    "caveat": "Nsight warns not all CUDA events might have been collected; GPU timings summarize collected events. Main end-to-end timing uses fresh unprofiled A/B runs."
+  },
+  "memory": {
+    "active_expanded_kv_budget_mib": 256,
+    "excludes": "Latent/output/attention workspace and allocator caches",
+    "baseline": [
+      11161,
+      26559,
+      22387,
+      26555,
+      26623,
+      22359,
+      26559,
+      27787
+    ],
+    "integrated": [
+      12191,
+      27653,
+      23439,
+      27649,
+      27701,
+      23453,
+      27653,
+      28839
+    ],
+    "delta": [
+      1030,
+      1094,
+      1052,
+      1094,
+      1078,
+      1094,
+      1094,
+      1052
+    ]
+  },
+  "verification": {
+    "independent_attention_reference": "passed; max_abs=0.0015147, max_rmse=0.0001538",
+    "memcheck_errors": 0
+  },
+  "limitations": [
+    "BF16 reassociation changes logits and can change greedy tokens; enabled by default with this numerical tradeoff documented.",
+    "The original dense attention semantics are retained; DSA indexing is not implemented.",
+    "Runtime verification is on RTX 5090 only; this is not a broad quality evaluation."
+  ],
+  "cleanup_verification": {
+    "before_library_sha256": "b893bc4b824a10fa5bc9b712140eb9833373fd04247de8ebd5407905cb5d56fb",
+    "library_sha256": "b6f4b8679227f00a5f47f84bc19f5e64587a84bdc7e37e4cbcffa1c7e4975c65",
+    "changes": [
+      "Reuse HND query layout and remove two inverse fallback transposes",
+      "Remove redundant prefill query view",
+      "Check persistent cache content immutability and skip explicitly disabled FlashInfer tests"
+    ],
+    "total_cases": 11,
+    "total_steps": 88,
+    "logits_bitwise_equal_to_before_cleanup": true,
+    "greedy_tokens_equal_to_before_cleanup": true,
+    "max_abs": 0.0,
+    "ttft_samples_s": [
+      6.644724034995306,
+      6.6345680429949425,
+      6.650199547002558
+    ],
+    "ttft_median_s": 6.644724034995306,
+    "prefill_tokens_per_second": 2465.71564352583,
+    "unit_test": "passed",
+    "memcheck_errors": 0,
+    "cases": [
+      {
+        "case": "quality-0-512",
+        "input_tokens": 512,
+        "steps": 8,
+        "logits_bitwise_equal": true,
+        "tokens_equal": true,
+        "finite": true,
+        "max_abs": 0.0,
+        "logits_sha256": "94f811aa6b748110bf643a8244a94e681bd696e93c7ef2e70dc2027bffd92b9d"
+      },
+      {
+        "case": "quality-1-512",
+        "input_tokens": 512,
+        "steps": 8,
+        "logits_bitwise_equal": true,
+        "tokens_equal": true,
+        "finite": true,
+        "max_abs": 0.0,
+        "logits_sha256": "7283a8871b7394a9d2ac841eb73d206ca2575dbf9e688831bfa034c077375f1e"
+      },
+      {
+        "case": "quality-16k",
+        "input_tokens": 16384,
+        "steps": 8,
+        "logits_bitwise_equal": true,
+        "tokens_equal": true,
+        "finite": true,
+        "max_abs": 0.0,
+        "logits_sha256": "d3c37432e84f656ba937c397dd26a28c1a4ef9345e804dc62de687c8296490b7"
+      },
+      {
+        "case": "quality-2-512",
+        "input_tokens": 512,
+        "steps": 8,
+        "logits_bitwise_equal": true,
+        "tokens_equal": true,
+        "finite": true,
+        "max_abs": 0.0,
+        "logits_sha256": "84315451f14f96769059f44eb391a50843145e4620b8f65d794737aa4996d476"
+      },
+      {
+        "case": "quality-3-2048",
+        "input_tokens": 2048,
+        "steps": 8,
+        "logits_bitwise_equal": true,
+        "tokens_equal": true,
+        "finite": true,
+        "max_abs": 0.0,
+        "logits_sha256": "5f25bdc5a3bb659ad7f0ff55ca528561e3457d128ef2a9dafa092417d83c0294"
+      },
+      {
+        "case": "quality-4-2048",
+        "input_tokens": 2048,
+        "steps": 8,
+        "logits_bitwise_equal": true,
+        "tokens_equal": true,
+        "finite": true,
+        "max_abs": 0.0,
+        "logits_sha256": "db9833458e6e03449093d18cd16acd48bd50bd3080ec217db7c0260418f143b6"
+      },
+      {
+        "case": "quality-5-2048",
+        "input_tokens": 2048,
+        "steps": 8,
+        "logits_bitwise_equal": true,
+        "tokens_equal": true,
+        "finite": true,
+        "max_abs": 0.0,
+        "logits_sha256": "00f234578d3b4557f7d4afa6ba51cf7e824ce51f0c18355a74dbb53536aef0d1"
+      },
+      {
+        "case": "edge-1",
+        "input_tokens": 1,
+        "steps": 8,
+        "logits_bitwise_equal": true,
+        "tokens_equal": true,
+        "finite": true,
+        "max_abs": 0.0,
+        "logits_sha256": "425d310d2e7329405a47e7c3b06b5d85b895b5a6a48825b893c41bf5706d3ef2"
+      },
+      {
+        "case": "edge-33",
+        "input_tokens": 33,
+        "steps": 8,
+        "logits_bitwise_equal": true,
+        "tokens_equal": true,
+        "finite": true,
+        "max_abs": 0.0,
+        "logits_sha256": "3bf1d98036415cb39cfece34910d23b2cf000c03a99615f5a6bc9d3c9039cb98"
+      },
+      {
+        "case": "edge-63",
+        "input_tokens": 63,
+        "steps": 8,
+        "logits_bitwise_equal": true,
+        "tokens_equal": true,
+        "finite": true,
+        "max_abs": 0.0,
+        "logits_sha256": "9c947731a3751a6e4fbcbc66759a9ddc930b39356f713b2ef010815e05210a84"
+      },
+      {
+        "case": "edge-64",
+        "input_tokens": 64,
+        "steps": 8,
+        "logits_bitwise_equal": true,
+        "tokens_equal": true,
+        "finite": true,
+        "max_abs": 0.0,
+        "logits_sha256": "624a8e37ccaaec977ad70a41f3b9297cc4fe319f8e118ec1028c7ac4795d657b"
+      }
+    ]
+  }
+}

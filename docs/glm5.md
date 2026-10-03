@@ -70,6 +70,28 @@ CUDA causal convolution 沿 token 维度增加 block 并行，在 1024 token、8
 
 两次 nsys 均采用 CUDA software trace，排除加载、权重重排和两次预热；53 类 kernel 的 39344 次调用数量全部一致。Nsight 提示可能未收集全部事件，因此耗时表示已采集区间的统计。[配置、库 SHA256 和结果](benchmarks/glm53_conv_20261003.json)。
 
+## GLM-5.3-Flash MLA prefill
+
+CUDA BF16 prefill 在 query 长度至少 64、QK/V 维度为 256、压缩 KV rank 为 512 时，默认按 attention head 分组临时展开完整历史 K/V，复用现有 `MatMulTransB` 和 FlashInfer `AttentionPaged`。长期缓存仍保存压缩 KV，decode 使用原来的 absorbed MLA。无新增 kernel、环境开关或预加载库；不改变原有 dense attention 语义，也未引入 DSA indexer。
+
+每组展开 K/V 的活动空间上限为 256 MiB，另需 latent、输出和 attention workspace。该上限不包含分配器缓存：下述配置预热后，GPU 驻留显存增加 1030–1094 MiB/卡。短 query、已有精确小 batch 模式、CUDA Graph capture、不支持的类型或布局，以及展开工作区容量不足时保留原路径。
+
+2026-10-03 同机对照（8 × RTX 5090，`cudapp=8`，BF16，chunk=1024，单请求；两版均含 grouped Marlin、寄存器 KDA 和并行 causal convolution）：
+
+| 指标 | 压缩 MLA prefill | 分组展开 prefill |
+| --- | ---: | ---: |
+| 16384-token TTFT（三次中位数，不带 profiler） | 7.610 s | 6.650 s |
+| 16384 / TTFT | 2153.0 token/s | 2463.7 token/s |
+| 16K attention kernel 总耗时（nsys） | 1823.080 ms | 632.905 ms |
+
+端到端吞吐提升 14.43%，TTFT 降低 12.61%。展开 K/V 使全模型 dense GEMM/GEMV 总耗时增加约 199 ms，GPU kernel 总耗时仍减少约 1 秒。Nsight 提示可能未收集全部事件，GPU 时间表示已采集区间的统计。性能表对应清理前的已验证构建；具体库 SHA256、计时样本与清理回归分别记录于[结果 JSON](benchmarks/glm53_mla_prefill_20261003.json)。
+
+展开 K/V 改变 BF16 舍入顺序，不保证与 absorbed MLA 的 logits 或 greedy 文本逐位一致。7 组 512/2048/16384-token 输入各生成 8 token，其中 3 个短输入样本分叉，37/56 个 token 位置相同；16K 样本的 8 个 token 相同。仅比较相同前缀的 40 个位置时，logits 最大绝对差为 4.125、最大 RMSE 为 0.5238，概率分布最大 TV 为 0.2246。该抽样不替代完整模型质量评测。
+
+启用 `UNIT_TEST` 后运行 `ctest --test-dir build-fastllm -R '^glm5_next_mla_prefill$' --output-on-failure`。测试以独立 CPU 双精度计算为参考，覆盖不同 head 分组、碎片化页、尾页、带历史的 causal mask、压缩缓存内容不变及回退；CUDA memcheck 为 0 errors。当前实测硬件为 RTX 5090。
+
+删除多余 query 转置和视图后，原 7 组样本加上 1/33/63/64-token 边界输入，共 11 组、88 个生成步骤的 logits 和 token 与清理前快速版本逐位一致（最大绝对差为 0）；清理后 16K TTFT 中位数为 6.645 秒。此结论仅针对代码清理，不表示快速 prefill 与原 absorbed MLA 逐位一致。
+
 ## GPU + NUMA 混合 MoE
 
 ~~~bash
