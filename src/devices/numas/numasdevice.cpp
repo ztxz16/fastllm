@@ -2009,14 +2009,15 @@ namespace fastllm {
         DataType downType;
         int globalOffset;
         float score, limit;
+        int activationQuantBlock;
 
         MultiThreadDeepSeekV41NumasDecodeOp(const MultiThreadGemmOp &gemm,
                 float *gateUp, float *swiglu, uint8_t *downInput,
                 DataType downType, int globalOffset,
-                float score, float limit)
+                float score, float limit, int activationQuantBlock = 32)
             : MultiThreadGemmOp(gemm), gateUp(gateUp), swiglu(swiglu),
               downInput(downInput), downType(downType), globalOffset(globalOffset),
-              score(score), limit(limit) {}
+              score(score), limit(limit), activationQuantBlock(activationQuantBlock) {}
 
         void Run() override {
             MultiThreadGemmOp::Run();
@@ -2024,7 +2025,7 @@ namespace fastllm {
                 MultiThreadDeepSeekV4NumasDownPrepareOp prepare(gateUp, swiglu,
                     downInput, downType, (globalOffset + st) / 2,
                     (globalOffset + end) / 2, true, score, limit,
-                    true, 32);
+                    true, activationQuantBlock);
                 prepare.Run();
             } else {
                 auto *values = reinterpret_cast<float *>(outputData);
@@ -3452,7 +3453,7 @@ namespace fastllm {
     static void NumasMoeDecodeExpertsImpl(const float *input, float *output,
             Data **weights, const int32_t *indices, const int32_t *gpuIndices,
             int topk, int layer, const float *routeScores, float swigluLimit,
-            const std::function<void()> &submitGpu) {
+            const std::function<void()> &submitGpu, int activationQuantBlock = 32) {
         const bool deepSeekV41 = routeScores != nullptr;
         if (deepSeekV41 && weights[2]->dataType == DataType::DATA_GGUF_FORMAT) {
             // The FP4 fused decode writer only handles floating activations.
@@ -3484,8 +3485,10 @@ namespace fastllm {
         const int hidden = weights[2]->dims[1];
         const int inter = weights[2]->dims[0] / 2;
         const int count = routes.size();
-        AssertInFastLLM(!deepSeekV41 || inter % (config->numaCnt * 32) == 0,
-                        "V4.1 decode requires complete block-32 NUMA shards.\n");
+        AssertInFastLLM(!deepSeekV41 ||
+                        ((activationQuantBlock == 32 || activationQuantBlock == 128) &&
+                         inter % (config->numaCnt * activationQuantBlock) == 0),
+                        "Scored MoE decode requires complete activation blocks in each NUMA shard.\n");
         const DataType gateAct = GetNumasLinearActDataType(weights[2], 1);
         const DataType downAct = GetNumasLinearActDataType(weights[3], 1);
         const bool q8Down = downAct == static_cast<DataType>(
@@ -3499,7 +3502,7 @@ namespace fastllm {
         work.downInput.resize(count * downBytes);
         RunMultiThreadConvertFromFloat32(work.realInput.data(), gateAct,
                                         input, 1, hidden, pool);
-        if (deepSeekV41) QuantizeNumasV41Input(work.realInput.data(), gateAct, 1, hidden);
+        if (deepSeekV41 && activationQuantBlock == 32) QuantizeNumasV41Input(work.realInput.data(), gateAct, 1, hidden);
         auto runWorkers = [&](auto &workers, bool overlap) {
             for (int t = 0; t < config->threads; ++t) pool->PushOp(t, &workers[t]);
             try {
@@ -3550,7 +3553,8 @@ namespace fastllm {
         for (int phase = 0; phase < 2; ++phase) {
             const int columns = phase == 0 ? inter * 2 : hidden;
             const int perNode = columns / config->numaCnt;
-            const int granularity = (deepSeekV41 || q8Down) && phase == 0 ? 64 : 4;
+            const int granularity = phase == 0 ?
+                (deepSeekV41 ? 2 * activationQuantBlock : q8Down ? 64 : 4) : 4;
             for (auto &worker : work.decodeWorkers) worker.tasks.clear();
             for (int node = 0; node < config->numaCnt; ++node) {
                 const int threads = config->numaToCpuDict[node].size();
@@ -3609,7 +3613,8 @@ namespace fastllm {
                                 phase == 0 ? work.swigluOutput.data() + item * inter : nullptr,
                                 phase == 0 ? work.downInput.data() + item * downBytes : nullptr,
                                 downAct, node * perNode,
-                                phase == 0 ? routeScores[routes[item]] : 0, swigluLimit);
+                                phase == 0 ? routeScores[routes[item]] : 0,
+                                swigluLimit, activationQuantBlock);
                         }
                         for (auto &task : storage) tasks.push_back(&task);
                     } else if (phase == 0) {
@@ -3630,9 +3635,10 @@ namespace fastllm {
 
     void NumasMoeDecodeExperts(const float *input, float *output,
             Data **weights, const int32_t *indices, const int32_t *gpuIndices,
-            int topk, int layer, const float *routeScores, float swigluLimit) {
+            int topk, int layer, const float *routeScores, float swigluLimit,
+            int activationQuantBlock) {
         NumasMoeDecodeExpertsImpl(input, output, weights, indices, gpuIndices,
-                                 topk, layer, routeScores, swigluLimit, {});
+                                 topk, layer, routeScores, swigluLimit, {}, activationQuantBlock);
     }
 
     void NumasMoeDecodeExpertsWithOverlap(const float *input, float *output,

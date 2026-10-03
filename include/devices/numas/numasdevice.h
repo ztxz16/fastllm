@@ -68,7 +68,7 @@ namespace fastllm {
     void NumasMoeDecodeExperts(const float *input, float *output,
         Data **weights, const int32_t *indices, const int32_t *gpuIndices,
         int topk, int layer, const float *routeScores = nullptr,
-        float swigluLimit = 0.0f);
+        float swigluLimit = 0.0f, int activationQuantBlock = 32);
 
     // Submit independent GPU work while the single-row gate/up CPU jobs run.
     // The callback must not reuse this layer's MoE workspace or submit work

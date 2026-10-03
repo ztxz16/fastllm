@@ -1728,6 +1728,9 @@ struct FastllmCudaMoeCacheLayer {
     // quantization and requires BF16 rounding at both projections.
     bool deepSeekV41 = false;
     float swigluLimit = 0.0f;
+    // GLM: BF16 projections, scores before block-128 FP8 down activation,
+    // without V4.1's block-32 quantization of the incoming activation.
+    bool glm5 = false;
 };
 // One anchor plus up to eight speculative tokens. Larger prefill batches
 // keep using the configured MoE backend.

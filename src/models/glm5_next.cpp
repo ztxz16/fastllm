@@ -439,6 +439,7 @@ namespace fastllm {
 
     Glm5NextModel::~Glm5NextModel() {
         ShutdownRuntime();
+        ReleaseMoeCudaCache(expertWeights);
         {
             std::lock_guard<std::mutex> guard(historyCacheMutex);
             pendingHistoryCache.reset();
@@ -993,6 +994,25 @@ namespace fastllm {
                 "GLM-5.3 MTP eh_proj has an invalid shape.");
             mtpWeightsReady = true;
         }
+#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
+        if (FastllmCudaMoeCacheRequested()) {
+            std::vector<FastllmCudaMoeCacheLayer> layers;
+            for (int layer = 0; layer < block_cnt; ++layer) {
+                const std::string device = SelectMoeDeviceForLayer(layer);
+                const auto &experts = expertWeights[layer];
+                if ((device == "numa" || device.rfind("numa:", 0) == 0) &&
+                    experts.size() >= 4 && experts[2] &&
+                    experts[2]->dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED) {
+                    layers.push_back({experts.data(), (int)experts.size(),
+                                      false, swigluLimit, true});
+                }
+            }
+            if (!layers.empty()) {
+                FastllmCudaPrepareMoeCache(layers.data(), (int)layers.size(),
+                    [this] { WarmupNumaMoeWeights(); });
+            }
+        }
+#endif
     }
 
     int Glm5NextModel::GetHistoryCacheSequenceLength(
@@ -2197,9 +2217,33 @@ namespace fastllm {
             routed_scaling_factor,
             &weight[mlp + "gate.e_score_correction_bias"]);
 
+        auto runShared = [&] {
+            if (GetCudaSharedExpert()) {
+                ApplyDeviceMap(deviceMap, deviceLayer + 1, block_cnt);
+            } else {
+                ApplyMoeDeviceMapForLayer(deviceLayer);
+            }
+            RunClampedMlp(input,
+                weight[mlp + "shared_experts.gateup_proj.weight"],
+                weight[mlp + "shared_experts.down_proj.weight"], output);
+        };
+        Data routedOutput;
 #if defined(USE_CUDA) && defined(USE_NUMAS)
         const std::string routedDevice =
             SelectMoeDeviceForLayer(deviceLayer);
+#ifndef USE_ROCM
+        if (sequence == 1 && input.dataType == DataType::BFLOAT16 &&
+            moeAtype == DataType::BFLOAT16 &&
+            (routedDevice == "numa" || routedDevice.rfind("numa:", 0) == 0) &&
+            FastllmCudaMergeMOEHybrid(input, expertIndex, expertScore, routedOutput,
+                weights.data(), (int)weights.size(), deviceLayer, runShared)) {
+            ApplyDeviceMap(deviceMap, deviceLayer + 1, block_cnt);
+            AddTo(output, routedOutput);
+            input.Reshape(outputDims);
+            output.Reshape(outputDims);
+            return;
+        }
+#endif
         const bool prefetchNumasSmallBatch =
             sequence >= 1 &&
             sequence <= kNumasMoePrefetchMaxRows &&
@@ -2214,19 +2258,10 @@ namespace fastllm {
         }
 #endif
 
-        if (GetCudaSharedExpert()) {
-            ApplyDeviceMap(deviceMap, deviceLayer + 1, block_cnt);
-        } else {
-            ApplyMoeDeviceMapForLayer(deviceLayer);
-        }
-        RunClampedMlp(
-            input,
-            weight[mlp + "shared_experts.gateup_proj.weight"],
-            weight[mlp + "shared_experts.down_proj.weight"],
-            output);
+        runShared();
 
         Data w1, w2, w3, tempInput, tempOutput;
-        Data moeInputTemp, moeOutputTemp, routedOutput;
+        Data moeInputTemp, moeOutputTemp;
         ApplyMoeDeviceMapForLayer(deviceLayer);
         MergeMOEBlock(
             &input, &expertIndex, &expertScore,
