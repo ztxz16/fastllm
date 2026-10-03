@@ -209,6 +209,28 @@ void Attention(int past,int rows,bool fragmented) {
     std::printf("PASS sparse latent attention past=%d rows=%d fragmented=%d max_error=%.8g\n",past,rows,fragmented,error);
     Check(error<.003,"attention independent reference");
 }
+void DecodeRouter() {
+    for (int mode=0; mode<4; ++mode) for (bool norm:{false,true}) {
+        std::vector<float> x(288),bias(288);
+        for(int i=0;i<288;++i){
+            x[i]=mode==0?float((i*73)%293)/293: mode==1?.5f:float(i%7)/8;
+            bias[i]=mode==2?float(i%3)/16:0;
+        }
+        if(mode==3) for(int i=0;i<288;i+=17) x[i]=std::numeric_limits<float>::quiet_NaN();
+        Data logits,twice,b,id,score,refId,refScore;
+        Upload(logits,{1,288},x,FLOAT32);
+        auto xx=x;xx.insert(xx.end(),x.begin(),x.end());Upload(twice,{2,288},xx,FLOAT32);
+        Upload(b,{288},bias,FLOAT32);Upload(id,{1,8},std::vector<float>(8),INT32);
+        Upload(score,{1,8},std::vector<float>(8),FLOAT32);
+        Upload(refId,{2,8},std::vector<float>(16),INT32);Upload(refScore,{2,8},std::vector<float>(16),FLOAT32);
+        Check(FastllmCudaSelectExpert(logits,&b,id,score,8,norm,1.75f),"decode router");
+        Check(FastllmCudaSelectExpert(twice,&b,refId,refScore,8,norm,1.75f),"reference router");
+        auto ids=Integers(id),refs=Integers(refId);auto weights=Download(score),expected=Download(refScore);
+        Check(std::equal(ids.begin(),ids.end(),refs.begin()),"router ties/indices differ");
+        Check(std::equal(weights.begin(),weights.end(),expected.begin()),"router scores differ");
+    }
+    std::puts("PASS 288-expert decode router: generic equality, ties, bias, NaN, normalization");
+}
 void DecodeHc() {
     constexpr int dim=4096,flat=4*dim,mix=24;
     std::vector<float> x(flat),fn(mix*flat),scale={.8f,.6f,.7f},base(mix),norm(dim);
@@ -230,6 +252,22 @@ void DecodeHc() {
         for(size_t i=0;i<a.size();++i)Check(std::abs(a[i]-b[i])<2e-5,"HC mixing differs");
     }
     std::puts("PASS HC fusion preserves GLM RMSNorm rounding exactly");
+}
+void DecodeSmallGemv() {
+    for(int width:{8,64,128,256}){
+        constexpr int rows=8192;
+        std::vector<float> x(width),w(rows*width),bias(rows);
+        for(int i=0;i<width;++i)x[i]=Pattern(i,3)/4;
+        for(int i=0;i<rows*width;++i)w[i]=Pattern(i/width,i%width)/4;
+        for(int i=0;i<rows;++i)bias[i]=Pattern(i,7)/16;
+        Data input,weight,b,output,refInput,reference;
+        Upload(input,{1,width},x);Upload(weight,{rows,width},w);Upload(b,{rows},bias,FLOAT32);
+        auto xx=x;xx.insert(xx.end(),x.begin(),x.end());Upload(refInput,{2,width},xx);
+        Linear(input,weight,b,output);Linear(refInput,weight,b,reference);
+        auto got=Download(output),expected=Download(reference);
+        Check(std::equal(got.begin(),got.end(),expected.begin()),"short GEMV changed reduction");
+    }
+    std::puts("PASS short BF16 GEMV exact against original 256-thread multirow path");
 }
 void Fixture(const std::string &dir) {
     auto load = [&](const std::string &name, Data &out, DataType type) {
@@ -276,7 +314,9 @@ int main(int argc, char **argv) {
     static_cast<Executor*>(GetExecutor())->SetFirstDevice("cuda:0");
     try {
         if (argc == 2) { Fixture(argv[1]); return 0; }
+        DecodeRouter();
         DecodeHc();
+        DecodeSmallGemv();
         NormAndQuantization();
         KpoolChunks();
         Selection(0, 9);

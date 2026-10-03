@@ -612,7 +612,12 @@ void LaunchFastllmGemmFp16Bf16(half *input, __nv_bfloat16 *weight, half *output,
 
 void LaunchFastllmGemmBf16Bf16(__nv_bfloat16 *input, __nv_bfloat16 *weight, __nv_bfloat16 *output, __nv_bfloat16 *bias, int n, int m, int k) {
     // PART=2..8 reuses the weights without changing the per-row reduction.
-    if (n == 1) {
+    if (n == 1 && m > 0 && m <= 256 && m % 8 == 0) {
+        // At most 32 lanes load data; the original extra zero reductions do
+        // not contribute to these short, aligned projections.
+        FastllmGemvBf16Bf16Kernel2MultiRow<32, 1>
+            <<<k, 32>>>(input, weight, output, bias, m, k);
+    } else if (n == 1) {
         FastllmGemvBf16Bf16Kernel2MultiRow<256, 1> <<<k, 256>>>(input, weight, output, bias, m, k);
     } else if (n == 2) {
         FastllmGemvBf16Bf16Kernel2MultiRow<256, 2> <<<k, 256>>>(input, weight, output, bias, m, k);

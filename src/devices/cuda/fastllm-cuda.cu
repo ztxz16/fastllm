@@ -10996,7 +10996,8 @@ __global__ void FastllmSelectExpertFixedTopKKernel(
     __shared__ __align__(16) float softmaxProbabilities[EXPERTS];
 
     static_assert((EXPERTS == 256 && TOPK == 8) ||
-                  (EXPERTS == 512 && TOPK == 10));
+                  (EXPERTS == 512 && TOPK == 10) ||
+                  (!APPLY_SOFTMAX && EXPERTS == 288 && TOPK == 8));
     int token = blockIdx.x;
     const float *tokenLogits = logits + (size_t)token * EXPERTS;
     index += (size_t)token * TOPK;
@@ -11032,19 +11033,18 @@ __global__ void FastllmSelectExpertFixedTopKKernel(
     int lane = tid;
     int firstExpert = lane * VALUES_PER_LANE;
     float choiceKeys[VALUES_PER_LANE];
-    float firstProbabilities[8];
-    float secondProbabilities[8];
-    FastllmRouterLoad8(
-        probabilityLogits + firstExpert, firstProbabilities);
-    if constexpr (VALUES_PER_LANE > 8) {
-        FastllmRouterLoad8(
-            probabilityLogits + firstExpert + 8, secondProbabilities);
+    float firstProbabilities[8], secondProbabilities[8];
+    if constexpr (EXPERTS != 288) {
+        FastllmRouterLoad8(probabilityLogits + firstExpert, firstProbabilities);
+        if constexpr (VALUES_PER_LANE > 8)
+            FastllmRouterLoad8(probabilityLogits + firstExpert + 8, secondProbabilities);
     }
 #pragma unroll
     for (int part = 0; part < VALUES_PER_LANE; ++part) {
         int expert = firstExpert + part;
-        float probability = part < 8 ? firstProbabilities[part]
-                                    : secondProbabilities[part - 8];
+        float probability;
+        if constexpr (EXPERTS == 288) probability = probabilityLogits[expert];
+        else probability = part < 8 ? firstProbabilities[part] : secondProbabilities[part - 8];
         float key = probability + (hasBias ? bias[expert] : 0.0f);
         choiceKeys[part] = isfinite(key) ? key : NEG_INF;
     }
@@ -11143,7 +11143,7 @@ __global__ void FastllmSelectExpertFixedTopKKernel(
             legacyIds[virtualTid][rank] = -1.0f;
         }
 #pragma unroll
-        for (int part = 0; part < EXPERTS / LEGACY_THREADS; ++part) {
+        for (int part = 0; part < (EXPERTS + LEGACY_THREADS - 1) / LEGACY_THREADS; ++part) {
             int expert = virtualTid + part * LEGACY_THREADS;
             int owner = expert / VALUES_PER_LANE;
             int ownerPart = expert % VALUES_PER_LANE;
@@ -11159,7 +11159,7 @@ __global__ void FastllmSelectExpertFixedTopKKernel(
             }
 #pragma unroll
             for (int rank = 0; rank < TOPK; ++rank) {
-                if (key > legacyKeys[virtualTid][rank]) {
+                if (expert < EXPERTS && key > legacyKeys[virtualTid][rank]) {
 #pragma unroll
                     for (int shift = TOPK - 1; shift > rank; --shift) {
                         legacyKeys[virtualTid][shift] =
@@ -12403,6 +12403,10 @@ bool FastllmCudaSelectExpert(const fastllm::Data &logits, const fastllm::Data *g
 #else
     if (n == 1 && numExperts == 256 && topk == 8) {
         FastllmSelectExpertFixedTopKKernel<false, 256, 8><<<1, 32>>>(
+            cudaLogits, cudaBias, cudaIndex, cudaScore,
+            hasBias, needNorm, routeScale);
+    } else if (n == 1 && numExperts == 288 && topk == 8) {
+        FastllmSelectExpertFixedTopKKernel<false, 288, 8><<<1, 32>>>(
             cudaLogits, cudaBias, cudaIndex, cudaScore,
             hasBias, needNorm, routeScale);
     } else if (n <= 9 && numExperts == 512 && topk == 10) {
