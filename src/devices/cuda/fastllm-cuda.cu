@@ -13,6 +13,7 @@
 #ifndef USE_ROCM
 #include "fastllm-cuda-ordered-reduce.cuh"
 #include "fastllm-rmsnorm-decode.cuh"
+#include "attention/fastllm-kda-prefill.cuh"
 #endif
 #include "fastllm.h"
 #include "utils/utils.h"
@@ -9124,6 +9125,32 @@ bool FastllmCudaKimiK3RecurrentKDA(
     if (initializeState) {
         FastllmCudaMemset0(state.cudaData, state.GetBytes());
     }
+#ifndef USE_ROCM
+    // Keep decode, auxiliary/state replay and graph capture on the existing
+    // allocation-free path. Prefill uses the shared CUDA scratch manager.
+    if (dimension == KIMI_K3_KDA_DIMENSION && batch > 0 && heads > 0 &&
+        sequence >= 64 && !stateOnly && !outputAux &&
+        normalizeQKInFp32 && roundBetaToBfloat16 &&
+        aLog.Count(0) == (uint64_t)heads && !FastllmCudaGraphIsCapturing()) {
+        size_t rows = (size_t)batch * sequence * heads;
+        if (rows <= (size_t)std::numeric_limits<int>::max() - 3) {
+            size_t scratchBytes = rows * (3 * dimension + 1) * sizeof(float);
+            size_t borrowedBytes = 0;
+            bool own = false;
+            void *scratch = FastllmBorrowCudaTempBuffer(scratchBytes, &borrowedBytes, &own);
+            if (scratch != nullptr && borrowedBytes >= scratchBytes) {
+                KimiK3LaunchKdaPrefill(q.cudaData, k.cudaData, v.cudaData, rawGate.cudaData,
+                    (const float*)rawBeta.cudaData, (const float*)aLog.cudaData,
+                    (const float*)dtBias.cudaData, (float*)state.cudaData, output.cudaData,
+                    (float*)scratch, batch, sequence, heads, dimension, lowerBound);
+                bool success = KimiK3CudaLastError("KimiK3 KDA prefill CUDA kernel failed.");
+                FastllmReleaseCudaTempBuffer(scratch, own);
+                return success;
+            }
+            FastllmReleaseCudaTempBuffer(scratch, own);
+        }
+    }
+#endif
     // Vector reductions retain one owner per state column, while all threads
     // cooperate on the row-major decay and rank-one update passes.
     int threads = KIMI_K3_CUDA_THREADS;
