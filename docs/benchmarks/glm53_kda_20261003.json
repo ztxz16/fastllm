@@ -1,0 +1,166 @@
+{
+  "date": "2026-10-03",
+  "model": "GLM-5.3-Flash-NVFP4",
+  "hardware": "8 x NVIDIA RTX 5090 32 GiB, ARM64, CUDA 12.9, SM120",
+  "configuration": {
+    "device": "cudapp=8",
+    "moe_device": "cudapp=8",
+    "chunked_prefill_size": 1024,
+    "tokens": 32768,
+    "max_batch": 1,
+    "gpu_mem_ratio": 0.9,
+    "prefix_cache": false,
+    "cache_history": false,
+    "cuda_slab": 288,
+    "moe_atype": "bfloat16",
+    "mtp": 0,
+    "threads": 8
+  },
+  "library_sha256": {
+    "baseline": "ab5a99cc1a823fbd45baf6dd7f8eaafae80441183311b93dcc9847d4fe0875fb",
+    "integrated": "168f8ed82298fc7569c2770b85aaea5048cf512350c2219d4cd25e1d05fd0b7f"
+  },
+  "prefill": {
+    "input_tokens": 16384,
+    "output_tokens": 1,
+    "prompt_token_sha256": "4d8b3c6d7ab88e3b7da89bd9ce8081a863b4827554295c21bac627b16ddc5509",
+    "warmup_runs": 2,
+    "timed_runs": 3,
+    "baseline": {
+      "ttft_samples_s": [
+        14.027947835042141,
+        14.030731085978914,
+        14.035360246954951
+      ],
+      "ttft_median_s": 14.030731085978914,
+      "prefill_tokens_per_second": 1167.7224728776064
+    },
+    "integrated": {
+      "ttft_samples_s": [
+        8.424995886045508,
+        8.426786513999104,
+        8.428512270969804
+      ],
+      "ttft_median_s": 8.426786513999104,
+      "prefill_tokens_per_second": 1944.2761452164327
+    },
+    "speedup": 1.6650156097665685,
+    "ttft_reduction": 0.3994050301184877
+  },
+  "operator_benchmark": {
+    "tokens": 1024,
+    "heads": 64,
+    "dimension": 128,
+    "batch": 1,
+    "workspace_bytes": 100925440,
+    "warmup_runs": 3,
+    "timed_runs": 30,
+    "timing": "CUDA events, median",
+    "baseline": {
+      "median_ms": 11.7329922,
+      "min_ms": 11.6892157,
+      "max_ms": 11.7381124
+    },
+    "integrated": [
+      {
+        "fixture": "t1024-h64",
+        "median_ms": 1.66782403,
+        "min_ms": 1.66297603,
+        "max_ms": 1.68464005,
+        "output_bitwise_equal": true,
+        "state_bitwise_equal": true
+      },
+      {
+        "fixture": "real-kda-0",
+        "median_ms": 1.66809595,
+        "min_ms": 1.66294396,
+        "max_ms": 1.67321599,
+        "output_bitwise_equal": true,
+        "state_bitwise_equal": true
+      },
+      {
+        "fixture": "real-kda-33",
+        "median_ms": 1.66655993,
+        "min_ms": 1.66300797,
+        "max_ms": 1.67321599,
+        "output_bitwise_equal": true,
+        "state_bitwise_equal": true
+      },
+      {
+        "fixture": "real-kda-34",
+        "median_ms": 1.66911995,
+        "min_ms": 1.66294396,
+        "max_ms": 1.67529595,
+        "output_bitwise_equal": true,
+        "state_bitwise_equal": true
+      },
+      {
+        "fixture": "real-kda-67",
+        "median_ms": 1.66911995,
+        "min_ms": 1.66297603,
+        "max_ms": 1.67561603,
+        "output_bitwise_equal": true,
+        "state_bitwise_equal": true
+      }
+    ],
+    "speedup": 7.034910151762234
+  },
+  "quality": {
+    "steps_per_case": 8,
+    "total_steps": 56,
+    "logits_bitwise_equal": true,
+    "greedy_tokens_equal": true,
+    "finite": true,
+    "max_abs": 0.0,
+    "max_nrmse": 0.0,
+    "cases": [
+      {
+        "case": "quality-0-512",
+        "input_tokens": 512,
+        "common_logits_sha256": "a14c37af5e4414901dd49d5f6bfd3e043e5a35ead400166fc75d6e0117c2a9f3"
+      },
+      {
+        "case": "quality-1-512",
+        "input_tokens": 512,
+        "common_logits_sha256": "d0ffbb721b9d8595a016713af792bea89e353a5b7248d73baa5a25eb0c6e95cc"
+      },
+      {
+        "case": "quality-16k",
+        "input_tokens": 16384,
+        "common_logits_sha256": "fa2c58b75e5dd5cfa53f74cf8462b046683db6057b6d88577b0ea75c35c535e2"
+      },
+      {
+        "case": "quality-2-512",
+        "input_tokens": 512,
+        "common_logits_sha256": "f4ba1ffe07ef7544741c5c4aedf81708c1630786af52729ba97c3fbb66bf5e2a"
+      },
+      {
+        "case": "quality-3-2048",
+        "input_tokens": 2048,
+        "common_logits_sha256": "743c0b034934b5f340c3f1fa3cbd0e05ddd04dee6f7a63acb60867c213e7782b"
+      },
+      {
+        "case": "quality-4-2048",
+        "input_tokens": 2048,
+        "common_logits_sha256": "0fa4ace316590a60d1e321d66a72aa361db4997775e20885cf84fb6348342817"
+      },
+      {
+        "case": "quality-5-2048",
+        "input_tokens": 2048,
+        "common_logits_sha256": "885bdf540e78b05cb34ced4b119b0257b71c46ef280a3f37f9d68f15495bcd40"
+      }
+    ]
+  },
+  "validation": {
+    "ctest": "cuda_kda_prefill: passed",
+    "memcheck_errors": 0,
+    "racecheck_errors": 0,
+    "racecheck_warnings": 0
+  },
+  "notes": [
+    "Both model builds use the same grouped Marlin NVFP4 MoE path; this comparison isolates the KDA change.",
+    "Model timing is single-request TTFT with one generated token; 16384 / TTFT includes scheduling and first-token overhead.",
+    "Both builds run in separate processes; warmup and initial weight repacking are excluded from the three timed runs.",
+    "Bitwise equality is verified on the listed hardware, build and inputs; this is not a broad model quality benchmark."
+  ]
+}

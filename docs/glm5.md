@@ -30,6 +30,30 @@ ctest --test-dir build-fastllm -R 'cuda_nvfp4_(marlin|compact)' --output-on-fail
 ~~~
 回归覆盖零限幅行为、BF16/FP16/FP32 激活边界、带限幅的 CUDA 调度、1024-token 路由、4096/2048 top-8、CUDA Graph 重放，以及不支持形状和内存分配方式的回退。
 
+## GLM-5.3-Flash KDA prefill
+
+BF16 KDA prefill 在 head dimension=128、序列长度至少 64、FP32 QK 归一化、beta 舍入为 BF16、每 head 一个 `a_log` 时自动使用 CUDA 寄存器递推核。预处理并行计算 QK 归一化和 gate；每个 warp 负责 16 个 value 列，将 FP32 状态列保存在寄存器中，减少逐 token 的全局显存读写和同步。
+
+实现保持原递推的累加顺序、独立的 decay 舍入及 gate 倒数后乘法，不使用三角分块求解重排。正常编译即可启用，无额外环境开关或 `LD_PRELOAD`。decode、辅助输出、state-only 续算、不匹配的形状或参数，以及 CUDA Graph capture 保留原 CUDA 路径。
+
+临时空间通过现有 CUDA workspace 管理器复用，需求为 `batch × sequence × heads × (3 × 128 + 1) × 4` 字节；batch=1、sequence=1024、heads=64 时为 96.25 MiB。该空间在设备上复用，不按层重复常驻分配。
+
+启用 `UNIT_TEST` 后运行：
+~~~bash
+ctest --test-dir build-fastllm -R '^cuda_kda_prefill$' --output-on-failure
+~~~
+回归逐位比较原递推与新路径的 BF16 输出和 FP32 最终状态，覆盖边界长度、多 batch、长记忆 gate、零值与极小值 QK、初始状态、混合长度续算和 CUDA Graph 重放。
+
+同日同机 KDA 专项对照（8 × RTX 5090，cudapp=8，chunk=1024，单请求，MTP=0，两版均启用 grouped Marlin）：
+
+| 指标 | 原 KDA 递推 | 寄存器 KDA 递推 |
+| --- | ---: | ---: |
+| KDA 算子（1024 token，64 heads，D=128） | 11.733 ms | 1.668 ms |
+| 16384-token TTFT | 14.031 s | 8.427 s |
+| 16384 / TTFT | 1167.7 token/s | 1944.3 token/s |
+
+算子为 3 次预热、30 次 CUDA event 计时的中位数；整模排除加载和首次权重重排，预热后测 3 次取中位数。整模有效 prefill 提升 66.50%，TTFT 降低 39.94%。512/2048/16384-token 的 7 组输入各生成 8 token，共 56 步完整 logits 和 token 均与本次 KDA 修改前的 Marlin 基线逐位一致（最大绝对差、NRMSE 均为 0）。算子回归、4 组真实层输入、CUDA memcheck 和 racecheck 均通过。[参数、动态库 SHA256 与结果](benchmarks/glm53_kda_20261003.json)。
+
 ## GPU + NUMA 混合 MoE
 
 ~~~bash
