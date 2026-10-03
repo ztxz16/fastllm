@@ -282,9 +282,8 @@ Data NaiveN05FlashModel::RunTarget(
         AssertInFastLLM(q.dataDevice == DataDevice::CUDA,
                         "Naive-N0.5 attention requires --device cuda.");
         positions.ToDevice(q.dataDevice, q.dataDeviceIds);
-        FastllmCudaNaiveRope(q, positions, cfg.heads, cfg.headDim, rotaryDim, cfg.theta);
-        FastllmCudaNaiveRope(k, positions, cfg.kvHeads, cfg.headDim, rotaryDim, cfg.theta);
-        Mul(v, valueScale, v);
+        FastllmCudaNaiveRopeQKScaleV(q, k, v, positions, cfg.heads, cfg.kvHeads,
+            cfg.headDim, cfg.valueDim, rotaryDim, cfg.theta, valueScale);
         if (!slidingLayers[layer]) {
             std::string ip = ap + "indexer.";
             Linear(normed, weight[ip + "wk.weight"], Data(), indexKey);

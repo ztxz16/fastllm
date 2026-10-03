@@ -243,17 +243,38 @@ __global__ void SelectTopKCompact(const float *scores, unsigned long long *selec
     }
 }
 
-__global__ void Rope(BF16 *data, const float *positions, int heads, int dim,
-                     int rotaryDim, float theta) {
-    int row = blockIdx.x;
-    BF16 *x = data + (size_t)row * dim;
+__device__ void RopeHead(BF16 *x, float position, int rotaryDim, float theta) {
     for (int d = threadIdx.x; d < rotaryDim / 2; d += blockDim.x) {
-        float angle = positions[row / heads] * powf(theta, -2.0f * d / rotaryDim);
+        float angle = position * powf(theta, -2.0f * d / rotaryDim);
         float c = RoundBF16(cosf(angle)), s = RoundBF16(sinf(angle));
         float a = (float)x[d], b = (float)x[d + rotaryDim / 2];
         // Match eager GPT-NeoX RoPE, including each BF16 multiplication.
         x[d] = __float2bfloat16(RoundBF16(a * c) - RoundBF16(b * s));
         x[d + rotaryDim / 2] = __float2bfloat16(RoundBF16(b * c) + RoundBF16(a * s));
+    }
+}
+
+__global__ void Rope(BF16 *data, const float *positions, int heads, int dim,
+                     int rotaryDim, float theta) {
+    int row = blockIdx.x;
+    RopeHead(data + (size_t)row * dim, positions[row / heads], rotaryDim, theta);
+}
+
+// Q/K rotate in place; V keeps the eager Mul's BF16 coefficient rounding.
+// Each CTA owns one head, so all three outputs are independent.
+__global__ void RopeQKScaleV(BF16 *q, BF16 *k, BF16 *v, const float *positions,
+                            int heads, int kvHeads, int dim, int valueDim,
+                            int rotaryDim, float theta, BF16 valueScale) {
+    int totalHeads = heads + 2 * kvHeads;
+    int token = blockIdx.x / totalHeads, head = blockIdx.x % totalHeads;
+    if (head < heads + kvHeads) {
+        BF16 *x = head < heads ? q + ((size_t)token * heads + head) * dim
+            : k + ((size_t)token * kvHeads + head - heads) * dim;
+        RopeHead(x, positions[token], rotaryDim, theta);
+    } else {
+        BF16 *x = v + ((size_t)token * kvHeads + head - heads - kvHeads) * valueDim;
+        for (int d = threadIdx.x; d < valueDim; d += blockDim.x)
+            x[d] = __float2bfloat16_rn((float)x[d] * (float)valueScale);
     }
 }
 
@@ -958,6 +979,34 @@ void FastllmCudaNaiveRope(fastllm::Data &input, const fastllm::Data &positions,
                             "Invalid Naive-N0.5 RoPE input.");
     Rope<<<input.Count(0) / dim, 128>>>((BF16 *)input.cudaData,
         (const float *)positions.cudaData, heads, dim, rotaryDim, theta);
+    CheckLaunch();
+}
+
+void FastllmCudaNaiveRopeQKScaleV(fastllm::Data &q, fastllm::Data &k,
+        fastllm::Data &v, const fastllm::Data &positions,
+        int heads, int kvHeads, int dim, int valueDim,
+        int rotaryDim, float theta, float valueScale) {
+    using namespace fastllm;
+    AssertInFastLLM(heads > 0 && kvHeads > 0 && dim > 0 && valueDim > 0 &&
+        rotaryDim > 0 && rotaryDim % 2 == 0 && rotaryDim <= dim &&
+        q.dims.size() == 3 && q.dims[0] == 1 && q.dims[1] > 0 &&
+        q.dims[2] == (int64_t)heads * dim &&
+        k.dims.size() == 3 && k.dims[0] == 1 && k.dims[1] == q.dims[1] &&
+        k.dims[2] == (int64_t)kvHeads * dim &&
+        v.dims.size() == 3 && v.dims[0] == 1 && v.dims[1] == q.dims[1] &&
+        v.dims[2] == (int64_t)kvHeads * valueDim &&
+        q.dataType == BFLOAT16 && k.dataType == BFLOAT16 && v.dataType == BFLOAT16 &&
+        positions.dataType == FLOAT32 && positions.Count(0) >= (uint64_t)q.dims[1] &&
+        q.dataDevice == DataDevice::CUDA && k.dataDevice == DataDevice::CUDA &&
+        v.dataDevice == DataDevice::CUDA && positions.dataDevice == DataDevice::CUDA &&
+        q.dataDeviceIds == k.dataDeviceIds && q.dataDeviceIds == v.dataDeviceIds &&
+        q.dataDeviceIds == positions.dataDeviceIds &&
+        q.cudaData && k.cudaData && v.cudaData && positions.cudaData,
+        "Invalid Naive-N0.5 fused Q/K RoPE and V scale input.");
+    RopeQKScaleV<<<(uint64_t)q.dims[1] * (heads + 2 * kvHeads), 128>>>(
+        (BF16 *)q.cudaData, (BF16 *)k.cudaData, (BF16 *)v.cudaData,
+        (const float *)positions.cudaData, heads, kvHeads, dim, valueDim,
+        rotaryDim, theta, __float2bfloat16_rn(valueScale));
     CheckLaunch();
 }
 
