@@ -232,6 +232,50 @@ class SpeculativeDraftCliAliasesTest(unittest.TestCase):
                                         "must be Qwen3.5"):
                 make_normal_llm_model(args)
 
+    def test_glm53_embedded_mtp_reaches_model_loader(self):
+        with tempfile.TemporaryDirectory() as model_path:
+            self.write_draft_config(model_path, {
+                "architectures": ["Glm5NextForConditionalGeneration"],
+                "model_type": "glm5_next",
+                "text_config": {"model_type": "glm5_next_text", "num_nextn_predict_layers": 1},
+            })
+            for options, expected in [
+                (["--mtp", "3"], 3),
+                (["--speculative_algorithm", "mtp", "--draft_tokens", "5"], 5),
+                (["--speculative_algorithm", "off", "--mtp", "3"], 0),
+            ]:
+                with self.subTest(options=options):
+                    args = make_normal_parser("test").parse_args([
+                        model_path, "--device", "cuda", "--moe_device", "numa", *options,
+                    ])
+                    fake_model = MagicMock()
+                    fake_model.get_max_input_len.return_value = 4096
+                    fake_model.get_max_batch.return_value = 1
+                    fake_ftllm = types.ModuleType("ftllm")
+                    fake_ftllm.llm = MagicMock()
+                    fake_ftllm.llm.model.return_value = fake_model
+                    with patch.dict(os.environ, {}, clear=True), \
+                            patch.dict(sys.modules, {"ftllm": fake_ftllm}), \
+                            redirect_stdout(io.StringIO()):
+                        self.assertIs(make_normal_llm_model(args), fake_model)
+                        self.assertEqual(os.environ["FASTLLM_GLM5_NEXT_ENABLE_MTP"], str(expected))
+                        self.assertEqual(args.mtp, expected)
+                        self.assertEqual(fake_ftllm.llm.model.call_args.kwargs["external_mtp_path"], "")
+
+    def test_glm53_mtp_rejects_external_draft(self):
+        with tempfile.TemporaryDirectory() as model_path, tempfile.TemporaryDirectory() as draft_path:
+            self.write_draft_config(model_path, {
+                "architectures": ["Glm5NextForConditionalGeneration"],
+                "model_type": "glm5_next",
+            })
+            self.write_mtp_checkpoint(draft_path)
+            args = make_normal_parser("test").parse_args([
+                model_path, "--mtp", "3", "--draft", draft_path,
+            ])
+            with patch.dict(os.environ, {}, clear=True), \
+                    self.assertRaisesRegex(ValueError, "GLM-5.3 MTP uses the checkpoint's embedded"):
+                make_normal_llm_model(args)
+
     def test_deepseek_v4_mtp_uses_embedded_dspark(self):
         with tempfile.TemporaryDirectory() as model_path:
             self.write_draft_config(model_path, {

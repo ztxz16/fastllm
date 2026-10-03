@@ -1278,6 +1278,7 @@ def make_normal_llm_model(args, startup_progress = None):
     is_laguna_model = False
     is_qwen35_model = False
     is_qwen38_flash_next_model = False
+    is_glm5_next_model = False
     is_deepseek_v4_model = False
     is_dots3_note_model = False
     if (os.path.exists(config_path) or gguf_config is not None):
@@ -1311,6 +1312,11 @@ def make_normal_llm_model(args, startup_progress = None):
                                  "Qwen4ExpForConditionalGeneration") or
                 model_type in ("qwen3_8_flash_next", "qwen4_exp") or
                 text_model_type in ("qwen3_8_flash_next_text", "qwen4_exp_text")
+            )
+            is_glm5_next_model = (
+                architecture == "Glm5NextForConditionalGeneration" or
+                model_type == "glm5_next" or
+                text_model_type == "glm5_next_text"
             )
             is_deepseek_v4_model = (
                 architecture in ("DeepseekV4ForCausalLM",
@@ -1410,9 +1416,14 @@ def make_normal_llm_model(args, startup_progress = None):
                         "embedded DSpark draft weights.",
                         flush=True,
                     )
+                elif is_glm5_next_model:
+                    if speculative_draft_path:
+                        raise ValueError(
+                            "GLM-5.3 MTP uses the checkpoint's embedded "
+                            "next-token prediction layer and does not accept an external draft")
                 elif not (is_qwen35_model or is_qwen38_flash_next_model):
                     raise ValueError(
-                        "MTP currently requires a Qwen3.5 or Qwen3.8-Flash-Next target, got "
+                        "MTP currently requires a Qwen3.5, Qwen3.8-Flash-Next or GLM-5.3 target, got "
                         "architecture=%s model_type=%s" %
                         (architecture, model_type))
                 if (not is_deepseek_v4_model and speculative_draft_path and not (
