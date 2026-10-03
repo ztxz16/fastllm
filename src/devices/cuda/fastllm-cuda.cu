@@ -9175,10 +9175,10 @@ bool FastllmCudaKimiK3RecurrentKDA(
         FastllmCudaMemset0(state.cudaData, state.GetBytes());
     }
 #ifndef USE_ROCM
-    // Keep decode, auxiliary/state replay and graph capture on the existing
-    // allocation-free path. Prefill uses the shared CUDA scratch manager.
+    // Ordinary decode and prefill reuse register scan with shared CUDA scratch.
+    // Auxiliary/state replay and graph capture keep the allocation-free path.
     if (dimension == KIMI_K3_KDA_DIMENSION && batch > 0 && heads > 0 &&
-        sequence >= 64 && !stateOnly && !outputAux &&
+        (sequence == 1 || sequence >= 64) && !stateOnly && !outputAux &&
         normalizeQKInFp32 && roundBetaToBfloat16 &&
         aLog.Count(0) == (uint64_t)heads && !FastllmCudaGraphIsCapturing()) {
         size_t rows = (size_t)batch * sequence * heads;

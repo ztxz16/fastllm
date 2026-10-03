@@ -1,3 +1,4 @@
+#include "devices/cuda/glm5-next-cuda.cuh"
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
 
@@ -3617,7 +3618,7 @@ __global__ void DeepSeekV4HcPreFinishNorm4x4096Kernel(
         const __nv_bfloat16 *x, const float *dots, const float *scale,
         const float *base, const float *normWeight, __nv_bfloat16 *normOutput,
         float *post, float *comb, int tokens, int sinkhornIters,
-        float eps, float normEps, int dotsStride, int dotParts) {
+        float eps, float normEps, int dotsStride, int dotParts, bool roundBeforeWeight = false) {
     constexpr int hcMult = 4;
     constexpr int dim = 4096;
     constexpr int flatDim = hcMult * dim;
@@ -3808,6 +3809,48 @@ __global__ void DeepSeekV4HcPreFinishNorm4x4096Kernel(
         }
     }
 
+    if (roundBeforeWeight) {
+        // GLM/Kimi RMSNorm rounds the normalized activation to BF16 before
+        // applying FP32 weights. Preserve its 256-thread strided FP32 sum as
+        // well as the rounded HcPre output, while sharing the fused Sinkhorn.
+        auto *mixed = reinterpret_cast<__nv_bfloat16*>(yShared);
+        for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+            float value = 0.0f;
+#pragma unroll
+            for (int h = 0; h < hcMult; ++h)
+                value += pre[h] * Dsv4ToFloat(xrow[h * dim + d]);
+            mixed[d] = __float2bfloat16_rn(value);
+        }
+        __syncthreads();
+        float sum = 0.0f;
+        if (threadIdx.x < 256) {
+#pragma unroll
+            for (int d = threadIdx.x; d < dim; d += 256) {
+                float value = __bfloat162float(mixed[d]);
+                sum = __fmaf_rn(value, value, sum);
+            }
+        }
+        const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_down_sync(0xffffffff, sum, offset);
+        if (lane == 0) warpSums[warp] = sum;
+        __syncthreads();
+        if (warp == 0) {
+            float total = lane < 8 ? warpSums[lane] : 0.0f;
+            for (int offset = 16; offset > 0; offset >>= 1)
+                total += __shfl_down_sync(0xffffffff, total, offset);
+            if (lane == 0) normScale = rsqrtf(total / dim + normEps);
+        }
+        __syncthreads();
+        for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+            float normalized = __bfloat162float(__float2bfloat16_rn(
+                __bfloat162float(mixed[d]) * normScale));
+            normOutput[(uint64_t)token * dim + d] =
+                __float2bfloat16_rn(normalized * normWeight[d]);
+        }
+        return;
+    }
+
     if constexpr (optimizedSm120) {
         static_assert(finishThreads == 1024,
                       "optimized HcPre finish preserves the 32-warp reduction tree");
@@ -3939,7 +3982,7 @@ void DeepSeekV4LaunchHcPreFinishNorm4x4096(
         const float *base, const float *normWeight,
         __nv_bfloat16 *normOutput, float *post, float *comb,
         int tokens, int sinkhornIters, float eps, float normEps,
-        int dotsStride, int dotParts) {
+        int dotsStride, int dotParts, bool roundBeforeWeight = false) {
     bool useSm120 = FastllmCudaRuntimeArch() >= 120 &&
         std::getenv("FASTLLM_DSV4_REFERENCE_HC_PRE_FINISH") == nullptr;
     if (!useSm120) {
@@ -3947,7 +3990,7 @@ void DeepSeekV4LaunchHcPreFinishNorm4x4096(
         DeepSeekV4HcPreFinishNorm4x4096Kernel<finishThreads, false>
             <<<tokens, finishThreads>>>(
                 x, dots, scale, base, normWeight, normOutput, post, comb,
-                tokens, sinkhornIters, eps, normEps, dotsStride, dotParts);
+                tokens, sinkhornIters, eps, normEps, dotsStride, dotParts, roundBeforeWeight);
         return;
     }
 
@@ -3955,7 +3998,7 @@ void DeepSeekV4LaunchHcPreFinishNorm4x4096(
     DeepSeekV4HcPreFinishNorm4x4096Kernel<finishThreads, true>
         <<<tokens, finishThreads>>>(
             x, dots, scale, base, normWeight, normOutput, post, comb,
-            tokens, sinkhornIters, eps, normEps, dotsStride, dotParts);
+            tokens, sinkhornIters, eps, normEps, dotsStride, dotParts, roundBeforeWeight);
 }
 
 template <typename XT>
@@ -7454,7 +7497,7 @@ extern "C" bool FastllmCudaDeepSeekV4HcPre(const fastllm::Data &x, fastllm::Data
     return ok;
 }
 
-extern "C" bool FastllmCudaDeepSeekV4HcPreNorm(const fastllm::Data &x,
+static bool DeepSeekV4HcPreNormImpl(const fastllm::Data &x,
                                                 fastllm::Data &hcFn,
                                                 fastllm::Data &hcScale,
                                                 fastllm::Data &hcBase,
@@ -7463,7 +7506,7 @@ extern "C" bool FastllmCudaDeepSeekV4HcPreNorm(const fastllm::Data &x,
                                                 float eps, float normEps,
                                                 fastllm::Data &normOutput,
                                                 fastllm::Data &post,
-                                                fastllm::Data &comb) {
+                                                fastllm::Data &comb, bool roundBeforeWeight) {
     // Cover ordinary one-token decode and DSpark-7's eight-row target
     // verification.  Other multi-token execution retains the established
     // graph-safe generic HcPre + RMSNorm path.
@@ -7476,7 +7519,8 @@ extern "C" bool FastllmCudaDeepSeekV4HcPreNorm(const fastllm::Data &x,
         hcBase.dataDevice != fastllm::DataDevice::CUDA ||
         normWeight.dataDevice != fastllm::DataDevice::CUDA ||
         x.dataType != fastllm::DataType::BFLOAT16 ||
-        hcFn.dataType != fastllm::DataType::FLOAT32 ||
+        (hcFn.dataType != fastllm::DataType::FLOAT32 &&
+         hcFn.dataType != fastllm::DataType::BFLOAT16) ||
         hcScale.dataType != fastllm::DataType::FLOAT32 ||
         hcBase.dataType != fastllm::DataType::FLOAT32 ||
         normWeight.dataType != fastllm::DataType::FLOAT32 ||
@@ -7514,11 +7558,16 @@ extern "C" bool FastllmCudaDeepSeekV4HcPreNorm(const fastllm::Data &x,
     }
     int dotThreads = 256;
     int dotBlocks = tokens * dotsStride * dotParts;
-    DeepSeekV4HcPreDotsBlockKernel<<<dotBlocks, dotThreads,
-                                     dotThreads * sizeof(float)>>>(
-        (const __nv_bfloat16 *)x.cudaData,
-        (const float *)hcFn.cudaData, dots, tokens, flatDim,
-        mixHc, dotsStride, dotParts);
+    auto launchDots = [&](const auto *fn) {
+        DeepSeekV4HcPreDotsBlockKernel<<<dotBlocks, dotThreads,
+                                         dotThreads * sizeof(float)>>>(
+            (const __nv_bfloat16 *)x.cudaData, fn, dots, tokens, flatDim,
+            mixHc, dotsStride, dotParts);
+    };
+    if (hcFn.dataType == fastllm::DataType::BFLOAT16)
+        launchDots((const __nv_bfloat16*)hcFn.cudaData);
+    else
+        launchDots((const float*)hcFn.cudaData);
 
     DeepSeekV4LaunchHcPreFinishNorm4x4096(
         (const __nv_bfloat16 *)x.cudaData, dots,
@@ -7526,10 +7575,29 @@ extern "C" bool FastllmCudaDeepSeekV4HcPreNorm(const fastllm::Data &x,
         (const float *)normWeight.cudaData,
         (__nv_bfloat16 *)normOutput.cudaData,
         (float *)post.cudaData, (float *)comb.cudaData,
-        tokens, sinkhornIters, eps, normEps, dotsStride, dotParts);
+        tokens, sinkhornIters, eps, normEps, dotsStride, dotParts, roundBeforeWeight);
     DeviceSync();
     FastllmCudaFree(dots);
     return true;
+}
+
+extern "C" bool FastllmCudaDeepSeekV4HcPreNorm(
+        const fastllm::Data &x, fastllm::Data &fn, fastllm::Data &scale,
+        fastllm::Data &base, fastllm::Data &norm, int hcMult, int iters,
+        float eps, float normEps, fastllm::Data &output,
+        fastllm::Data &post, fastllm::Data &comb) {
+    if (fn.dataType != fastllm::DataType::FLOAT32) return false;
+    return DeepSeekV4HcPreNormImpl(x, fn, scale, base, norm, hcMult, iters,
+        eps, normEps, output, post, comb, false);
+}
+
+bool FastllmCudaGlm5NextHcPreNorm(
+        const fastllm::Data &x, fastllm::Data &fn, fastllm::Data &scale,
+        fastllm::Data &base, fastllm::Data &norm, int hcMult, int iters,
+        float eps, float normEps, fastllm::Data &output,
+        fastllm::Data &post, fastllm::Data &comb) {
+    return DeepSeekV4HcPreNormImpl(x, fn, scale, base, norm, hcMult, iters,
+        eps, normEps, output, post, comb, true);
 }
 
 extern "C" bool FastllmCudaDeepSeekV4HcPostPreNorm(

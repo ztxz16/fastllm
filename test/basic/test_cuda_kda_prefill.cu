@@ -160,6 +160,7 @@ int main(int argc, char **argv) {
         CheckColdGraph(); // Must precede allocation of the prefill scratch buffer.
         bool quick = argc == 2 && std::string(argv[1]) == "--sanitizer";
         for (int t : {1,63,64,65}) RunCase(1,t,3);
+        RunCase(1,1,64); RunCase(1,1,64,128,-40,true);
         CheckNormalizationEdges();
         RunCase(2,65,3); RunCase(1,65,1,128,-40,true);
         RunCase(1,65,8,64); RunCase(1,65,8,128,-2,false,false);

@@ -209,6 +209,28 @@ void Attention(int past,int rows,bool fragmented) {
     std::printf("PASS sparse latent attention past=%d rows=%d fragmented=%d max_error=%.8g\n",past,rows,fragmented,error);
     Check(error<.003,"attention independent reference");
 }
+void DecodeHc() {
+    constexpr int dim=4096,flat=4*dim,mix=24;
+    std::vector<float> x(flat),fn(mix*flat),scale={.8f,.6f,.7f},base(mix),norm(dim);
+    for(int i=0;i<flat;++i)x[i]=Pattern(i/128,i%128);
+    for(int i=0;i<mix*flat;++i)fn[i]=Pattern(i/flat,i%flat)/256;
+    for(int i=0;i<mix;++i)base[i]=Pattern(i,3)/16;
+    for(int i=0;i<dim;++i)norm[i]=1+Pattern(i,4)/16;
+    Data input,w,sc,ba,n,mixed,post,comb,reference,out,fastPost,fastComb;
+    Upload(input,{1,1,4,dim},x);Upload(w,{mix,flat},fn);Upload(sc,{3},scale,FLOAT32);
+    Upload(ba,{mix},base,FLOAT32);Upload(n,{dim},norm,FLOAT32);
+    Check(FastllmCudaDeepSeekV4HcPre(input,w,sc,ba,4,20,1e-6f,1e-6f,mixed,post,comb),"HC reference");
+    KimiK3RMSNorm(mixed,n,1e-6f,reference);
+    Check(FastllmCudaGlm5NextHcPreNorm(input,w,sc,ba,n,4,20,1e-6f,1e-6f,out,fastPost,fastComb),"HC fusion");
+    auto a=Download(reference),b=Download(out);
+    for(float value:b) Check(std::isfinite(value),"HC nonfinite");
+    Check(a==b,"HC fused RMSNorm reference must preserve GLM rounding");
+    for(auto pair:{std::make_pair(&post,&fastPost),std::make_pair(&comb,&fastComb)}){
+        auto a=Download(*pair.first),b=Download(*pair.second);
+        for(size_t i=0;i<a.size();++i)Check(std::abs(a[i]-b[i])<2e-5,"HC mixing differs");
+    }
+    std::puts("PASS HC fusion preserves GLM RMSNorm rounding exactly");
+}
 void Fixture(const std::string &dir) {
     auto load = [&](const std::string &name, Data &out, DataType type) {
         std::ifstream f(dir+"/"+name+".bin", std::ios::binary);
@@ -254,6 +276,7 @@ int main(int argc, char **argv) {
     static_cast<Executor*>(GetExecutor())->SetFirstDevice("cuda:0");
     try {
         if (argc == 2) { Fixture(argv[1]); return 0; }
+        DecodeHc();
         NormAndQuantization();
         KpoolChunks();
         Selection(0, 9);

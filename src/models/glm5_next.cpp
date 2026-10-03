@@ -4,6 +4,7 @@
 
 #include "blocks/baseblock.h"
 #include "gguf.h"
+#include "executor.h"
 #include "utils.h"
 
 #ifdef USE_CUDA
@@ -177,6 +178,27 @@ namespace fastllm {
                 Glm5NextWriteFloat(data, index, value);
             }
             data.ToDevice(originalDevice, originalDeviceIds);
+        }
+
+        void Glm5NextHcPreNorm(Data &input, Data &fn, Data &scale,
+                Data &base, Data &norm, int hcMult, int sinkhornIters,
+                float eps, float normEps, Data &output, Data &post, Data &comb) {
+#ifdef USE_CUDA
+            auto *executor = static_cast<Executor*>(GetExecutor());
+            if (input.dims == std::vector<int>({1, 1, 4, 4096}) &&
+                executor->GetFirstDeviceType() == "cuda") {
+                const auto devices = executor->GetDeviceIds("cuda");
+                for (Data *x : {&input, &fn, &scale, &base, &norm})
+                    x->ToDevice(DataDevice::CUDA, devices);
+                FastllmCudaSetDevice(GetPointerDeviceId(input.cudaData));
+                if (FastllmCudaGlm5NextHcPreNorm(input, fn, scale, base, norm,
+                        hcMult, sinkhornIters, eps, normEps, output, post, comb)) return;
+            }
+#endif
+            Data mixed;
+            DeepSeekV4HcPre(input, fn, scale, base, hcMult, sinkhornIters,
+                eps, normEps, mixed, post, comb);
+            KimiK3RMSNorm(mixed, norm, normEps, output);
         }
 
         void Glm5NextHcMean(const Data &input, Data &output) {
@@ -3122,18 +3144,14 @@ namespace fastllm {
             const std::string prefix = languagePrefix + "layers." +
                 std::to_string(layer) + ".";
 
-            Data attentionInput, attentionPost, attentionComb;
-            DeepSeekV4HcPre(
+            Data normalizedAttention, attentionPost, attentionComb;
+            Glm5NextHcPreNorm(
                 *current, weight[prefix + "hc_attn_fn"],
                 weight[prefix + "hc_attn_scale"],
-                weight[prefix + "hc_attn_base"], hcMult,
+                weight[prefix + "hc_attn_base"],
+                weight[prefix + "input_layernorm.weight"], hcMult,
                 hcSinkhornIters, hcEps, rms_norm_eps,
-                attentionInput, attentionPost, attentionComb);
-            Data normalizedAttention;
-            KimiK3RMSNorm(
-                attentionInput,
-                weight[prefix + "input_layernorm.weight"],
-                rms_norm_eps, normalizedAttention);
+                normalizedAttention, attentionPost, attentionComb);
             Data attentionOutput;
             if (kdaLayers[layer]) {
                 RunKdaAttention(
@@ -3151,18 +3169,14 @@ namespace fastllm {
                 attentionPost, attentionComb, *next);
             std::swap(current, next);
 
-            Data ffnInput, ffnPost, ffnComb;
-            DeepSeekV4HcPre(
+            Data normalizedFfn, ffnPost, ffnComb;
+            Glm5NextHcPreNorm(
                 *current, weight[prefix + "hc_ffn_fn"],
                 weight[prefix + "hc_ffn_scale"],
-                weight[prefix + "hc_ffn_base"], hcMult,
+                weight[prefix + "hc_ffn_base"],
+                weight[prefix + "post_attention_layernorm.weight"], hcMult,
                 hcSinkhornIters, hcEps, rms_norm_eps,
-                ffnInput, ffnPost, ffnComb);
-            Data normalizedFfn;
-            KimiK3RMSNorm(
-                ffnInput,
-                weight[prefix + "post_attention_layernorm.weight"],
-                rms_norm_eps, normalizedFfn);
+                normalizedFfn, ffnPost, ffnComb);
             Data ffnOutput;
             if (denseMlpLayers[layer]) {
                 RunClampedMlp(
