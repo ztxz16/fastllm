@@ -2028,9 +2028,67 @@ namespace fastllm {
         }
     };
 
+    // Small GGUF decode batches need finer slices than the fused Q8 writer's
+    // 64 columns. Workers claim slices within their NUMA shard; the submitting
+    // thread quantizes the completed intermediate rows once between phases.
+    struct NumasMoeHybridDecodeQueue {
+        std::atomic<int> next {0};
+        Data **weights = nullptr;
+        const std::vector<int> *routes = nullptr;
+        const int32_t *indices = nullptr;
+        uint8_t *input = nullptr, *downInput = nullptr;
+        float *gateUp = nullptr, *swiglu = nullptr, *output = nullptr;
+        DataType inputType = FLOAT32, downType = FLOAT32;
+        size_t downBytes = 0;
+        int hidden = 0, inter = 0, node = 0, nodes = 1;
+        int phase = 0, units = 0, tasks = 0;
+
+        void Run(int task) const {
+            const int columns = phase == 0 ? inter * 2 : hidden;
+            const int perNode = columns / nodes, base = node * perNode;
+            // Four columns also preserve the row groups of repacked IQ data.
+            int start = 4 * (int)((int64_t)units * task / tasks);
+            const int end = 4 * (int)((int64_t)units * (task + 1) / tasks);
+            while (start < end) {
+                const int item = start / perNode, row = start % perNode;
+                const int rows = std::min(perNode - row, end - start);
+                const int route = (*routes)[item];
+                Data &weight = *weights[2 * (indices[route] + 1) + phase];
+                if (phase == 0) {
+                    MultiThreadGemmAndCrossSwigluOp op(input, inputType,
+                        weight.numasData[node], weight.GetDataType(),
+                        reinterpret_cast<uint8_t *>(gateUp + (size_t)item * columns + base),
+                        FLOAT32, swiglu + (size_t)item * inter,
+                        1, hidden, columns, row, row + rows, base);
+                    op.Run();
+                } else {
+                    MultiThreadGemmOp op(downInput + item * downBytes, downType,
+                        weight.numasData[node], weight.GetDataType(),
+                        reinterpret_cast<uint8_t *>(output + (size_t)route * hidden + base),
+                        FLOAT32, 1, inter, columns, row, row + rows);
+                    op.Run();
+                }
+                start += rows;
+            }
+        }
+    };
+
+    struct NumasMoeHybridDecodeWorker : MultiThreadBaseOp {
+        NumasMoeHybridDecodeQueue *queue = nullptr;
+        void Run() override {
+            for (int task = queue->next.fetch_add(1, std::memory_order_relaxed);
+                 task < queue->tasks;
+                 task = queue->next.fetch_add(1, std::memory_order_relaxed)) {
+                queue->Run(task);
+            }
+        }
+    };
+
     struct FastllmMoeDataManagerNumas {
             NumasMoeDecodeContext decodeContext;
             std::vector<NumasMoeDecodeWorker> rowWorkers;
+            std::vector<std::unique_ptr<NumasMoeHybridDecodeQueue>> hybridDecodeQueues;
+            std::vector<NumasMoeHybridDecodeWorker> hybridDecodeWorkers;
             std::vector<NumasMoeTaskList> decodeWorkers;
             std::vector<std::vector<MultiThreadDeepSeekV41NumasDecodeOp>> fusedDecodeTasks;
             std::vector <float, alignedAllocator<float, 64> > gateUpOutput, swigluOutput, downOutput, reduceOutput;
@@ -3351,6 +3409,49 @@ namespace fastllm {
         RunMultiThreadConvertFromFloat32(work.realInput.data(), gateAct,
                                         input, 1, hidden, pool);
         if (deepSeekV41) QuantizeNumasV41Input(work.realInput.data(), gateAct, 1, hidden);
+        auto runWorkers = [&](auto &workers, bool overlap) {
+            for (int t = 0; t < config->threads; ++t) pool->PushOp(t, &workers[t]);
+            try {
+                if (overlap && submitGpu) submitGpu();
+            } catch (...) {
+                // Jobs borrow the layer workspace; drain them before unwinding.
+                for (int t = 0; t < config->threads; ++t) pool->Wait(t);
+                throw;
+            }
+            for (int t = 0; t < config->threads; ++t) pool->Wait(t);
+        };
+        if (!deepSeekV41 && q8Down && gateAct >= DataType::DATA_GGUF_FORMAT &&
+                gateAct < DataType::DATA_GGUF_FORMAT_END) {
+            work.hybridDecodeQueues.resize(config->numaCnt);
+            work.hybridDecodeWorkers.resize(config->threads);
+            for (int node = 0; node < config->numaCnt; ++node) {
+                auto &owned = work.hybridDecodeQueues[node];
+                if (!owned) owned = std::make_unique<NumasMoeHybridDecodeQueue>();
+                auto &q = *owned;
+                q.weights = weights; q.routes = &routes; q.indices = indices;
+                q.input = work.realInput.data(); q.inputType = gateAct;
+                q.downInput = work.downInput.data(); q.downType = downAct;
+                q.gateUp = work.gateUpOutput.data(); q.swiglu = work.swigluOutput.data();
+                q.output = output; q.downBytes = downBytes;
+                q.hidden = hidden; q.inter = inter; q.node = node; q.nodes = config->numaCnt;
+                for (const auto &worker : config->numaToCpuDict[node])
+                    work.hybridDecodeWorkers[worker.first].queue = &q;
+            }
+            for (int stage = 0; stage < 2; ++stage) {
+                for (int node = 0; node < config->numaCnt; ++node) {
+                    auto &q = *work.hybridDecodeQueues[node];
+                    q.phase = stage;
+                    q.units = count * (stage == 0 ? inter * 2 : hidden) / config->numaCnt / 4;
+                    q.tasks = std::min(q.units, 3 * (int)config->numaToCpuDict[node].size());
+                    q.next.store(0, std::memory_order_relaxed);
+                }
+                runWorkers(work.hybridDecodeWorkers, stage == 0);
+                if (stage == 0)
+                    ConvertFromFloat32(work.downInput.data(), downAct,
+                        work.swigluOutput.data(), count, inter);
+            }
+            return;
+        }
         work.decodeWorkers.resize(config->threads);
         work.gateSwigluTaskStorage.resize(config->threads);
         work.gemmTaskStorage.resize(config->threads);
@@ -3427,18 +3528,7 @@ namespace fastllm {
                     }
                 }
             }
-            for (int t = 0; t < config->threads; ++t) pool->PushOp(t, &work.decodeWorkers[t]);
-            if (phase == 0 && submitGpu) {
-                try {
-                    submitGpu();
-                } catch (...) {
-                    // Jobs borrow the reusable layer workspace. A callback
-                    // failure must not leave workers accessing it on unwind.
-                    for (int t = 0; t < config->threads; ++t) pool->Wait(t);
-                    throw;
-                }
-            }
-            for (int t = 0; t < config->threads; ++t) pool->Wait(t);
+            runWorkers(work.decodeWorkers, phase == 0);
             // Q8_K/Q8_1 and other GGUF activation formats retain the normal
             // whole-row quantizer after all gate/up tasks have completed.
             if (phase == 0 && quantizeDownRows)
