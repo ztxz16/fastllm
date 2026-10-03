@@ -8595,7 +8595,9 @@ namespace {
         int batchIndex = item / channels;
         int channel = item % channels;
         int history = kernelSize - 1;
-        for (int token = 0; token < sequence; token++) {
+        // Each output reads only the input and the initial history. Split tokens
+        // across blocks while preserving the original tap accumulation order.
+        for (int token = blockIdx.y; token < sequence; token += gridDim.y) {
             float value = 0.0f;
             for (int kernel = 0; kernel < kernelSize; kernel++) {
                 int sourceToken = token - history + kernel;
@@ -9020,7 +9022,10 @@ bool FastllmCudaKimiK3CausalConv1D(
     int items = batch * channels;
     int blocks = (items + KIMI_K3_CUDA_THREADS - 1) /
                  KIMI_K3_CUDA_THREADS;
-    KimiK3CausalConv1DKernel<<<blocks, KIMI_K3_CUDA_THREADS>>>(
+    // About eight tokens per block amortizes weight loads without serializing
+    // the entire prefill. Keep grid.y valid even for unusually long sequences.
+    int tokenBlocks = std::min(65535, std::max(1, sequence / 8 + (sequence % 8 != 0)));
+    KimiK3CausalConv1DKernel<<<dim3(blocks, tokenBlocks), KIMI_K3_CUDA_THREADS>>>(
         (const __nv_bfloat16*)input.cudaData,
         (const float*)weight.cudaData,
         cache == nullptr ? nullptr :
