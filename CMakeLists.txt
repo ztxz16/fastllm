@@ -1036,6 +1036,12 @@ if (UNIT_TEST)
         add_test(NAME cuda_single_query_attention COMMAND cuda_single_query_attention_test)
         set_tests_properties(cuda_single_query_attention PROPERTIES LABELS cuda SKIP_RETURN_CODE 77)
 
+        add_executable(glm5_next_mla_prefill_test test/basic/test_glm5_next_mla_prefill.cpp)
+        target_link_libraries(glm5_next_mla_prefill_test PRIVATE fastllm)
+        target_include_directories(glm5_next_mla_prefill_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME glm5_next_mla_prefill COMMAND glm5_next_mla_prefill_test)
+        set_tests_properties(glm5_next_mla_prefill PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+
         if (NOT WIN32)
             add_executable(cuda_paged_fragmented_attention_test test/basic/test_cuda_paged_fragmented_attention.cpp)
             target_link_libraries(cuda_paged_fragmented_attention_test PRIVATE fastllm)

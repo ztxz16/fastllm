@@ -1,4 +1,5 @@
 #include "glm5_next.h"
+#include "glm5_next_mla_prefill.h"
 
 #include "blocks/baseblock.h"
 #include "gguf.h"
@@ -1807,16 +1808,30 @@ namespace fastllm {
                 num_attention_heads, valueHeadDim, kvLoraRank}),
             "GLM-5.3 compressed MLA split weights have invalid shapes.");
 
-        PermuteSelf(query, {0, 2, 1, 3});
+        // Both attention paths consume the same contiguous HND query.
+        query.Reshape({num_attention_heads, sequence, qkNopeHeadDim});
+#ifdef USE_CUDA
+        if (sequence >= 64 &&
+            FastllmCudaGetLinearExactBatchThreshold() < sequence) {
+            Data prefillOutput;
+            if (glm5_next_detail::TryMhaPrefill(
+                    query, latentKvCache, keyWeight, valueWeight,
+                    prefillOutput, 1.0f / std::sqrt((float)qkHeadDim))) {
+                query.FreeSpace();
+                PermuteSelf(prefillOutput, {1, 0, 2});
+                prefillOutput.Reshape({1, sequence, num_attention_heads * valueHeadDim});
+                Linear(prefillOutput, weight[prefix + "o_proj.weight"], Data(), output);
+                return;
+            }
+        }
+#endif
+
         Data queryPe(DataType::BFLOAT16);
         queryPe.dataDevice = query.dataDevice;
         queryPe.dataDeviceIds = query.dataDeviceIds;
         queryPe.Resize({
             1, sequence, num_attention_heads, mlaPaddedPeHeadDim});
         queryPe.Allocate(0.0f);
-        PermuteSelf(query, {2, 0, 1, 3});
-        query.Reshape({
-            num_attention_heads, sequence, qkNopeHeadDim});
 
         Data absorbedQuery;
         bool exactSmallBatchMatmul = false;
