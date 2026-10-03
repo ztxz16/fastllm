@@ -5652,7 +5652,7 @@ namespace fastllm {
             const int m = input.dims.back();
             const int n = input.Count(0) / m;
             const int k = weight.dims[0] / 2;
-            if (n != 1) {
+            if (n != 1 && n != 8) {
                 return false;
             }
 

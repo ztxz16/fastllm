@@ -1,4 +1,5 @@
 #include "fastllm-cuda-gguf-projections.h"
+#include "fastllm-cuda-gguf-planar-t8.h"
 #include "fastllm-cuda-gguf-linear-add.h"
 #include "fastllm-gguf-store.cuh"
 //
@@ -3082,12 +3083,38 @@ bool FastllmCudaGGUFLinearShared(const fastllm::Data &input,
     return true;
 }
 
+// Only the verifier gate/up boundary uses planar activations. Producers write
+// the final layout directly; legacy consumers continue receiving block_q8_1.
+static bool GgufTryPlanarGateUp(const void *input, const void *gate, const void *up,
+        void *output, int gateType, int upType, int rows, int columns, int outputs) {
+    if (rows != 8 || columns != 5120 || outputs < 4096 ||
+        !FastllmGgufPlanarT8Supported(gateType) || !FastllmGgufPlanarT8Supported(upType)) return false;
+    void *workspace = nullptr;
+    if (FastllmCudaTryMalloc(&workspace, FASTLLM_GGUF_PLANAR_T8_BYTES) !=
+        FASTLLM_CUDA_TRY_MALLOC_SUCCESS) return false;
+    const auto stream = cudaStreamPerThread;
+    FastllmGgufQuantizePlanarT8(input, workspace, stream);
+    if (gateType == upType) {
+        FastllmGgufProjectPlanarT8(gateType, 3, gate, up, workspace,
+            output, outputs, outputs, stream);
+    } else {
+        FastllmGgufProjectPlanarT8(gateType, 0, gate, nullptr, workspace,
+            output, outputs, outputs, stream);
+        FastllmGgufProjectPlanarT8(upType, 2, up, nullptr, workspace,
+            output, outputs, outputs, stream);
+    }
+    FastllmCudaFree(workspace);
+    return true;
+}
+
 bool FastllmCudaGGUFMixedGateUp(const fastllm::Data &input,
         fastllm::Data &gate, fastllm::Data &up, fastllm::Data &output) {
     if (gate.dims != up.dims ||
         !GgufSharedProjectionCanRun(input, gate, output) ||
         !GgufSharedProjectionCanRun(input, up, output)) return false;
     const int columns = input.dims.back(), rows = input.Count(0)/columns;
+    if (GgufTryPlanarGateUp(input.cudaData, gate.cudaData, up.cudaData,
+            output.cudaData, gate.ggmlType, up.ggmlType, rows, columns, gate.dims[0])) return true;
     block_q8_1 *q8 = nullptr;
     if (FastllmCudaTryMalloc(reinterpret_cast<void **>(&q8),
             size_t(rows)*(columns/QK8_1)*sizeof(block_q8_1)) != FASTLLM_CUDA_TRY_MALLOC_SUCCESS) return false;
@@ -3237,6 +3264,29 @@ bool FastllmCudaHalfGgufMergedGateUpSiluMul(
         fastllm::Data &output,
         int n, int m, int k) {
     const ggml_type type = (ggml_type)weight.ggmlType;
+    if (n == 8 && m == 5120 && k >= 4096 &&
+        input.dataType == fastllm::FLOAT16 && output.dataType == fastllm::FLOAT16 &&
+        weight.dataType == fastllm::DATA_GGUF_FORMAT &&
+        GgufDenseLocal(input) && GgufDenseLocal(output) &&
+        input.dims.back() == m && input.Count(0) == size_t(n)*m &&
+        output.dims.back() == k && output.Count(0) == size_t(n)*k &&
+        weight.dims == std::vector<int>({2*k,m}) &&
+        weight.dataDevice == fastllm::DataDevice::CUDA && weight.cudaData && !weight.multiDeviceData &&
+        (weight.dataDeviceIds.empty() || (weight.dataDeviceIds.size() == 1 &&
+            weight.dataDeviceIds[0] == FastllmCudaGetDevice())) &&
+        !GgufOverlap(input,output) && !GgufOverlap(weight,output)) {
+        const auto *tensor = static_cast<const ggml_tensor *>(weight.ggmlTensor);
+        int major = 0;
+        if (FastllmGgufPlanarT8Supported(type) && tensor && tensor->type == type &&
+            tensor->ne[0] == m && tensor->ne[1] == 2*k &&
+            tensor->nb[0] == ggml_type_size(type) && tensor->nb[1] == ggml_row_size(type,m) &&
+            (weight.forceGGUFFp32Dequant ||
+                (cudaDeviceGetAttribute(&major,cudaDevAttrComputeCapabilityMajor,FastllmCudaGetDevice()) == cudaSuccess && major < 10))) {
+            const char *up = static_cast<const char *>(weight.cudaData)+size_t(k)*ggml_row_size(type,m);
+            if (GgufTryPlanarGateUp(input.cudaData,weight.cudaData,up,output.cudaData,
+                    type,type,n,m,k)) return true;
+        }
+    }
     if (n != 1 || m <= 0 || k <= 0 || m % QK8_1 != 0 ||
         input.dataType != fastllm::DataType::FLOAT16 ||
         weight.dataType != fastllm::DataType::DATA_GGUF_FORMAT ||
