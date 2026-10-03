@@ -67,10 +67,19 @@ template<class Block> inline float dot(int n, const Block *x, const block_q8_K *
             // Weight values never equal -128; applying Q8's sign to the
             // weight also handles the valid signed Q8 endpoint -128.
             const __m256i pair = _mm256_maddubs_epi16(_mm256_abs_epi8(qy), _mm256_sign_epi8(qx, qy));
-            const __m256i sum = _mm256_madd_epi16(pair, _mm256_set1_epi16(1));
-            total = _mm256_add_epi32(total, _mm256_mullo_epi32(sum, _mm256_set1_epi32(scale(x[b], g))));
+            // The group scale fits in int16. Apply it in the widening
+            // multiply-add instead of a second int32 vector multiply.
+            total = _mm256_add_epi32(total,
+                _mm256_madd_epi16(pair, _mm256_set1_epi16(scale(x[b], g))));
         }
+#if defined(__F16C__)
+        // Avoid spilling the accumulators around an external converter for
+        // every block. Keep the table converter on CPUs without F16C.
+        const float dx = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(x[b].d)));
+        const __m256 d = _mm256_set1_ps(dx * y[b].d);
+#else
         const __m256 d = _mm256_set1_ps(GGML_FP16_TO_FP32(x[b].d) * y[b].d);
+#endif
         acc = _mm256_add_ps(acc, _mm256_mul_ps(d, _mm256_cvtepi32_ps(total)));
     }
     __m128 sum = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));

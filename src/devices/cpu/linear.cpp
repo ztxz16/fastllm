@@ -554,13 +554,17 @@ namespace fastllm {
                 st = end;
             }
         } else if (vec_dot != nullptr) {
+            // These strides are constant for the whole operation. Resolving
+            // GGUF type metadata for every output row is costly for small dots.
+            const size_t weightRowBytes = ggml_row_size(weightType, m);
+            const size_t inputRowBytes = ggml_row_size(vec_dot_type, m);
             for (int i = 0; i < n; i++) {
+                const uint8_t *inputRow = q8kInputData + size_t(i) * inputRowBytes;
                 for (int j = st; j < end; j++) {
-                    float now = 0.0f;
                     vec_dot (
-                        m, &outputData[i * k + j], 0, 
-                        weightData + j * ggml_row_size(weightType, m), 0, 
-                        q8kInputData + i * ggml_row_size(vec_dot_type, m), 0, 
+                        m, &outputData[i * k + j], 0,
+                        weightData + size_t(j) * weightRowBytes, 0,
+                        inputRow, 0,
                         1
                     );
                     outputData[i * k + j] += (biasData ? biasData[j] : 0.0f);

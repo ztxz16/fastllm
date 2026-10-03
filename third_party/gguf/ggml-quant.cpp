@@ -8140,42 +8140,65 @@ void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
     (void)bs; (void)bx; (void)by; (void)nrc;
     const auto *x = static_cast<const block_q2_0 *>(vx);
     const auto *y = static_cast<const block_q8_0 *>(vy);
+#if defined(__AVX2__)
+    const __m128i mask = _mm_set1_epi8(3);
+    const __m256i ones8 = _mm256_set1_epi8(1);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+    for (int b = 0; b < n / QK2_0; ++b) {
+        // Unpack the whole 64-value block once, in the original value order.
+        const __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i *>(x[b].qs));
+        const __m128i q0 = _mm_and_si128(packed, mask);
+        const __m128i q1 = _mm_and_si128(_mm_srli_epi16(packed, 2), mask);
+        const __m128i q2 = _mm_and_si128(_mm_srli_epi16(packed, 4), mask);
+        const __m128i q3 = _mm_and_si128(_mm_srli_epi16(packed, 6), mask);
+        const __m128i lo0 = _mm_unpacklo_epi8(q0, q1), lo1 = _mm_unpacklo_epi8(q2, q3);
+        const __m128i hi0 = _mm_unpackhi_epi8(q0, q1), hi1 = _mm_unpackhi_epi8(q2, q3);
+        const __m256i codes0 = MM256_SET_M128I(_mm_unpackhi_epi16(lo0, lo1), _mm_unpacklo_epi16(lo0, lo1));
+        const __m256i codes1 = MM256_SET_M128I(_mm_unpackhi_epi16(hi0, hi1), _mm_unpacklo_epi16(hi0, hi1));
+        const __m256i a0 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(y[2 * b].qs));
+        const __m256i a1 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(y[2 * b + 1].qs));
+        // Subtract the code offset in int16, preserving the full int8 range
+        // (including -128) without signed-byte negation or saturation.
+        const __m256i p0 = _mm256_sub_epi16(_mm256_maddubs_epi16(codes0, a0), _mm256_maddubs_epi16(ones8, a0));
+        const __m256i p1 = _mm256_sub_epi16(_mm256_maddubs_epi16(codes1, a1), _mm256_maddubs_epi16(ones8, a1));
+#if defined(__F16C__)
+        // Convert all three scales inline. Calls to the externally visible
+        // table converter would spill the live AVX accumulators every block.
+        const __m128 scales = _mm_cvtph_ps(_mm_set_epi32(0, 0, int(y[2 * b + 1].d),
+            int(uint32_t(x[b].d) | (uint32_t(y[2 * b].d) << 16))));
+        const __m128 products = _mm_mul_ps(scales, _mm_shuffle_ps(scales, scales, 0));
+        const __m256 scale0 = _mm256_broadcastss_ps(_mm_shuffle_ps(products, products, 0x55));
+        const __m256 scale1 = _mm256_broadcastss_ps(_mm_shuffle_ps(products, products, 0xaa));
+#else
+        const float d = GGML_FP16_TO_FP32(x[b].d);
+        const __m256 scale0 = _mm256_set1_ps(d * GGML_FP16_TO_FP32(y[2 * b].d));
+        const __m256 scale1 = _mm256_set1_ps(d * GGML_FP16_TO_FP32(y[2 * b + 1].d));
+#endif
+        acc0 = _mm256_add_ps(acc0, _mm256_mul_ps(scale0, _mm256_cvtepi32_ps(_mm256_madd_epi16(p0, ones16))));
+        acc1 = _mm256_add_ps(acc1, _mm256_mul_ps(scale1, _mm256_cvtepi32_ps(_mm256_madd_epi16(p1, ones16))));
+    }
+    // Keep independent vector accumulators across blocks; reduce only once.
+    const __m256 acc = _mm256_add_ps(acc0, acc1);
+    __m128 sum = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+    sum = _mm_add_ps(sum, _mm_movehl_ps(sum, sum));
+    *s = _mm_cvtss_f32(_mm_add_ss(sum, _mm_movehdup_ps(sum)));
+#else
     float sum = 0.0f;
     for (int b = 0; b < n / QK2_0; ++b) {
         const float d = GGML_FP16_TO_FP32(x[b].d);
         for (int half = 0; half < 2; ++half) {
             const auto &yb = y[2 * b + half];
             int dot = 0;
-#if defined(__AVX2__)
-            const __m128i packed = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(x[b].qs + 8 * half));
-            const __m128i mask = _mm_set1_epi8(3);
-            const __m128i q0 = _mm_and_si128(packed, mask);
-            const __m128i q1 = _mm_and_si128(_mm_srli_epi16(packed, 2), mask);
-            const __m128i q2 = _mm_and_si128(_mm_srli_epi16(packed, 4), mask);
-            const __m128i q3 = _mm_and_si128(_mm_srli_epi16(packed, 6), mask);
-            const __m128i lo = _mm_unpacklo_epi8(q0, q1);
-            const __m128i hi = _mm_unpacklo_epi8(q2, q3);
-            const __m128i codes[2] = {_mm_unpacklo_epi16(lo, hi), _mm_unpackhi_epi16(lo, hi)};
-            __m128i acc = _mm_setzero_si128();
-            for (int p = 0; p < 2; ++p) {
-                const __m128i activation = _mm_loadu_si128(reinterpret_cast<const __m128i *>(yb.qs + 16 * p));
-                const __m128i pairs = _mm_sub_epi16(_mm_maddubs_epi16(codes[p], activation),
-                                                   _mm_maddubs_epi16(_mm_set1_epi8(1), activation));
-                acc = _mm_add_epi32(acc, _mm_madd_epi16(pairs, _mm_set1_epi16(1)));
-            }
-            acc = _mm_hadd_epi32(acc, acc);
-            acc = _mm_hadd_epi32(acc, acc);
-            dot = _mm_cvtsi128_si32(acc);
-#else
             for (int j = 0; j < QK8_0; ++j) {
                 const int q = (x[b].qs[8 * half + j / 4] >> (2 * (j % 4))) & 3;
                 dot += (q - 1) * yb.qs[j];
             }
-#endif
             sum += d * GGML_FP16_TO_FP32(yb.d) * dot;
         }
     }
     *s = sum;
+#endif
 }
 
 #include "ggml-iq-native.h"
