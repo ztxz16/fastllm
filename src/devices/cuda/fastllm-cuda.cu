@@ -8512,6 +8512,41 @@ namespace {
         }
     }
 
+#ifndef USE_ROCM
+    // Cache one decode row while preserving the generic kernel's accumulation
+    // order and the BF16 rounding before and after applying the FP32 weight.
+    __global__ void KimiK3RMSNorm4096Kernel(
+            const __nv_bfloat16 *input, const float *weight,
+            __nv_bfloat16 *output, float eps) {
+        constexpr int CHANNELS = 4096;
+        constexpr int VALUES_PER_THREAD = CHANNELS / KIMI_K3_CUDA_THREADS;
+        __shared__ float warpSums[KIMI_K3_CUDA_THREADS / 32];
+        float values[VALUES_PER_THREAD];
+        float weights[VALUES_PER_THREAD];
+#pragma unroll
+        for (int part = 0; part < VALUES_PER_THREAD; ++part) {
+            int channel = threadIdx.x + part * KIMI_K3_CUDA_THREADS;
+            values[part] = __bfloat162float(input[channel]);
+            weights[part] = weight[channel];
+        }
+        float partial = 0.0f;
+#pragma unroll
+        for (int part = 0; part < VALUES_PER_THREAD; ++part) {
+            partial += values[part] * values[part];
+        }
+        float squareSum =
+            KimiK3BlockReduceSum<KIMI_K3_CUDA_THREADS>(partial, warpSums);
+        float scale = rsqrtf(squareSum / CHANNELS + eps);
+#pragma unroll
+        for (int part = 0; part < VALUES_PER_THREAD; ++part) {
+            float normalized = __bfloat162float(
+                __float2bfloat16_rn(values[part] * scale));
+            output[threadIdx.x + part * KIMI_K3_CUDA_THREADS] =
+                __float2bfloat16_rn(normalized * weights[part]);
+        }
+    }
+#endif
+
     __global__ void KimiK3L2NormKernel(
             const __nv_bfloat16 *input, __nv_bfloat16 *output,
             int rows, int channels, float eps) {
@@ -8932,10 +8967,19 @@ bool FastllmCudaKimiK3RMSNorm(
     }
     int channels = input.dims.back();
     int rows = (int)(input.Count(0) / channels);
-    KimiK3RMSNormKernel<<<rows, KIMI_K3_CUDA_THREADS>>>(
-        (const __nv_bfloat16*)input.cudaData,
-        (const float*)weight.cudaData,
-        (__nv_bfloat16*)output.cudaData, rows, channels, eps);
+#ifndef USE_ROCM
+    if (rows == 1 && channels == 4096) {
+        KimiK3RMSNorm4096Kernel<<<1, KIMI_K3_CUDA_THREADS>>>(
+            (const __nv_bfloat16 *)input.cudaData, (const float *)weight.cudaData,
+            (__nv_bfloat16 *)output.cudaData, eps);
+    } else
+#endif
+    {
+        KimiK3RMSNormKernel<<<rows, KIMI_K3_CUDA_THREADS>>>(
+            (const __nv_bfloat16*)input.cudaData,
+            (const float*)weight.cudaData,
+            (__nv_bfloat16*)output.cudaData, rows, channels, eps);
+    }
     return KimiK3CudaLastError("KimiK3RMSNorm CUDA kernel failed.");
 }
 
@@ -10912,17 +10956,16 @@ __global__ void FastllmFusedSigmoidSelectExpert256Top10Kernel(
     }
 }
 
-// Shape specialization for 512 experts and top-10, independent of model name.
+// Fixed-shape selection for 512/top-10 and single-row 256/top-8 decode.
 // APPLY_SOFTMAX joins the established 256-thread FP32 softmax with
 // selection while reproducing its max/sum/division order exactly. One warp
 // then performs TopK; exact ties rebuild the original 64-thread lists and
 // merge tree so both instantiations remain compatible with the legacy path.
-template <bool APPLY_SOFTMAX>
-__global__ void FastllmSelectExpert512Top10Kernel(
+template <bool APPLY_SOFTMAX, int EXPERTS, int TOPK>
+__global__ void FastllmSelectExpertFixedTopKKernel(
         const float *logits, const float *bias, int32_t *index, float *score,
         int hasBias, int needNorm, float routeScale) {
-    constexpr int TOPK = 10;
-    constexpr int VALUES_PER_LANE = 16;
+    constexpr int VALUES_PER_LANE = EXPERTS / 32;
     constexpr int LEGACY_THREADS = 64;
     constexpr float NEG_INF = -FLT_MAX;
     constexpr unsigned int FULL_WARP_MASK = 0xffffffffu;
@@ -10933,24 +10976,26 @@ __global__ void FastllmSelectExpert512Top10Kernel(
     __shared__ float legacyKeys[LEGACY_THREADS][TOPK];
     __shared__ float legacyIds[LEGACY_THREADS][TOPK];
     __shared__ float softmaxReduce[257];
-    __shared__ __align__(16) float softmaxProbabilities[512];
+    __shared__ __align__(16) float softmaxProbabilities[EXPERTS];
 
+    static_assert((EXPERTS == 256 && TOPK == 8) ||
+                  (EXPERTS == 512 && TOPK == 10));
     int token = blockIdx.x;
-    const float *tokenLogits = logits + (size_t)token * 512;
+    const float *tokenLogits = logits + (size_t)token * EXPERTS;
     index += (size_t)token * TOPK;
     score += (size_t)token * TOPK;
     int tid = threadIdx.x;
     const float *probabilityLogits = tokenLogits;
     if constexpr (APPLY_SOFTMAX) {
         float maxValue = -1e100;
-        for (int expert = tid; expert < 512; expert += blockDim.x) {
+        for (int expert = tid; expert < EXPERTS; expert += blockDim.x) {
             maxValue = max(maxValue, tokenLogits[expert]);
         }
         float softmaxMaximum = fastllm::cuda::OrderedBlockReduce<256>(
             maxValue, softmaxReduce, fastllm::cuda::OrderedMax{});
 
         float sum = 0.0f;
-        for (int expert = tid; expert < 512; expert += blockDim.x) {
+        for (int expert = tid; expert < EXPERTS; expert += blockDim.x) {
             softmaxProbabilities[expert] =
                 exp(tokenLogits[expert] - softmaxMaximum);
             sum += softmaxProbabilities[expert];
@@ -10958,7 +11003,7 @@ __global__ void FastllmSelectExpert512Top10Kernel(
         float denominator = fastllm::cuda::OrderedBlockReduce<256>(
             sum, softmaxReduce, fastllm::cuda::OrderedSum{});
         if (fabs(denominator) < 1e-6) denominator = 0.0001f;
-        for (int expert = tid; expert < 512; expert += blockDim.x) {
+        for (int expert = tid; expert < EXPERTS; expert += blockDim.x) {
             softmaxProbabilities[expert] /= denominator;
         }
         __syncthreads();
@@ -10974,8 +11019,10 @@ __global__ void FastllmSelectExpert512Top10Kernel(
     float secondProbabilities[8];
     FastllmRouterLoad8(
         probabilityLogits + firstExpert, firstProbabilities);
-    FastllmRouterLoad8(
-        probabilityLogits + firstExpert + 8, secondProbabilities);
+    if constexpr (VALUES_PER_LANE > 8) {
+        FastllmRouterLoad8(
+            probabilityLogits + firstExpert + 8, secondProbabilities);
+    }
 #pragma unroll
     for (int part = 0; part < VALUES_PER_LANE; ++part) {
         int expert = firstExpert + part;
@@ -10987,17 +11034,16 @@ __global__ void FastllmSelectExpert512Top10Kernel(
 
 #pragma unroll
     for (int rank = 0; rank < TOPK; ++rank) {
-        auto winner = fastllm::cuda::WarpArgMax(choiceKeys, firstExpert, 512);
-        FastllmRouterCandidate best{winner.value, winner.index};
+        auto winner = fastllm::cuda::WarpArgMax(choiceKeys, firstExpert, EXPERTS);
 
-        int owner = best.id / VALUES_PER_LANE;
-        int ownerPart = best.id % VALUES_PER_LANE;
+        int owner = winner.index / VALUES_PER_LANE;
+        int ownerPart = winner.index % VALUES_PER_LANE;
         // The selected row is already available in shared/global storage.
         // A dynamic index into a per-thread array forces a local-memory stack.
-        float probability = probabilityLogits[best.id];
+        float probability = probabilityLogits[winner.index];
         if (lane == 0) {
-            selectedKeys[rank] = best.key;
-            selectedIds[rank] = best.id;
+            selectedKeys[rank] = winner.value;
+            selectedIds[rank] = winner.index;
             selectedProbabilities[rank] =
                 isfinite(probability) ? probability : 0.0f;
         }
@@ -11080,7 +11126,7 @@ __global__ void FastllmSelectExpert512Top10Kernel(
             legacyIds[virtualTid][rank] = -1.0f;
         }
 #pragma unroll
-        for (int part = 0; part < 8; ++part) {
+        for (int part = 0; part < EXPERTS / LEGACY_THREADS; ++part) {
             int expert = virtualTid + part * LEGACY_THREADS;
             int owner = expert / VALUES_PER_LANE;
             int ownerPart = expert % VALUES_PER_LANE;
@@ -12130,7 +12176,7 @@ bool FastllmCudaFusedSoftmaxSelectExpert(
             return false;
         }
         const int tokens = (int)(logits.Count(0) / 512);
-        FastllmSelectExpert512Top10Kernel<true><<<tokens, 256>>>(
+        FastllmSelectExpertFixedTopKKernel<true, 512, 10><<<tokens, 256>>>(
             cudaLogits, cudaBias, cudaIndex, cudaScore,
             hasBias ? 1 : 0, needNorm ? 1 : 0, routeScale);
         const cudaError_t state = cudaGetLastError();
@@ -12330,16 +12376,20 @@ bool FastllmCudaSelectExpert(const fastllm::Data &logits, const fastllm::Data *g
         return false;
     }
 
-    // The NVIDIA-only single-row specialization covers Qwen4 decode. Preserve
-    // the generic kernel's original MAXK=50 instantiation exactly: changing
+    // Keep decode specializations narrow and preserve the generic kernel's
+    // original MAXK=50 instantiation exactly: changing
     // its shared-memory row stride changes legacy merge behavior for prefill.
 #ifdef USE_ROCM
     FastllmSelectExpertKernel<64, 50><<<n, 64>>>(
         cudaLogits, cudaBias, cudaIndex, cudaScore, n, numExperts,
         topk, hasBias, needNorm, routeScale);
 #else
-    if (n <= 9 && numExperts == 512 && topk == 10) {
-        FastllmSelectExpert512Top10Kernel<false><<<n, 32>>>(
+    if (n == 1 && numExperts == 256 && topk == 8) {
+        FastllmSelectExpertFixedTopKKernel<false, 256, 8><<<1, 32>>>(
+            cudaLogits, cudaBias, cudaIndex, cudaScore,
+            hasBias, needNorm, routeScale);
+    } else if (n <= 9 && numExperts == 512 && topk == 10) {
+        FastllmSelectExpertFixedTopKKernel<false, 512, 10><<<n, 32>>>(
             cudaLogits, cudaBias, cudaIndex, cudaScore,
             hasBias, needNorm, routeScale);
     } else {

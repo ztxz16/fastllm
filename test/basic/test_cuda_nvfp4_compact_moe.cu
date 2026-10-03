@@ -72,8 +72,9 @@ static bool RunNative(const fastllm::Data &input, fastllm::Data &gate,
         rows.data(),routeScales.data(),positions.data(),starts.data(),counts.data(),
         batch,topk,total,maximum,hidden,inter);
 }
-static void RunShape(int hidden, int inter, const std::vector<int>& batches) {
-    constexpr int experts = 8, topk = 3;
+static void RunShape(int hidden, int inter, const std::vector<int>& batches, int topk = 3,
+                     bool checkDirect = true) {
+    constexpr int experts = 8;
     using fastllm::Data; using fastllm::DataType; using fastllm::DataDevice;
     std::mt19937 rng(941);
     auto& owned=retainedWeights;
@@ -166,7 +167,7 @@ static void RunShape(int hidden, int inter, const std::vector<int>& batches) {
             Require(output.GetBytes()==referenceOutput.GetBytes() &&
                 memcmp(output.cpuData,referenceOutput.cpuData,output.GetBytes())==0,
                 "compact output differs bitwise from native FP32-scale layout");
-            if (batch == 1) {
+            if (batch == 1 && checkDirect) {
                 auto runDirect = type == DataType::BFLOAT16 ? FastllmCudaBFloat16MergeMOENVFP4Batch1
                                                            : FastllmCudaHalfMergeMOENVFP4Batch1;
                 for (auto *table : {&weights, &referenceWeights}) {
@@ -233,7 +234,14 @@ int main(int argc,char**argv) {
         if(properties.major<8)return 77; // BF16 support is required.
         FastllmCudaSetDevice(0);
         RunShape(128,128,argc>1 ? std::vector<int>{1,65} : std::vector<int>{1,9,32,65,200});
-        if(argc==1) {RunShape(256,256,{1,17,96});RunShape(4096,2048,{1});}
+        if(argc==1) {
+            RunShape(256,256,{1,17,96});
+            RunShape(4096,2048,{1});
+            // The direct kernel can fuse score multiplication with accumulation;
+            // indexed kernels round the product first. Keep the existing direct
+            // checks and verify top-8 against indexed FP32 scales and FP64 instead.
+            RunShape(4096,2048,{1},8,false);
+        }
         puts("compact NVFP4 native bitwise and FP64-oracle regression passed");return 0;
     } catch(const std::exception& e) {fprintf(stderr,"FAILED: %s\n",e.what());return 1;}
 }

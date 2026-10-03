@@ -1,0 +1,335 @@
+{
+  "date": "2026-10-01",
+  "model": "Naive-N0.5-Flash-MoE-NVFP4",
+  "measurement_note": "Measurements precede the cleanup commits; preserved here as evidence for the same decode algorithms.",
+  "base_commit": "2faae1d993f2df589a246dce8d2e3e5fda4f9e82",
+  "library_sha256": {
+    "baseline": "2b1683e3df4baebf8a6c8345fe447d333b51b3ceeed5d94f7a0d788332c49411",
+    "optimized": "e1040a12a1427a6b65bfde43027a874ad310fcc877325d7703f5ca8bc5706f3a"
+  },
+  "configuration": {
+    "gpu": "8 RTX 5090, layers distributed across GPUs",
+    "max_batch": 1,
+    "mtp": 0,
+    "chunked_prefill_size": 512,
+    "threads": 16,
+    "cache_history": false,
+    "prefix_cache": false,
+    "activation_kv": "BF16",
+    "expert_weights": "compact NVFP4",
+    "temperature": 0,
+    "cuda": "13.1",
+    "kernel_build_arch": "sm_120f"
+  },
+  "long_context": {
+    "configuration": {
+      "tokens": 65536,
+      "max_context_length": 65536,
+      "max_output_tokens": 256
+    },
+    "method": "A/B, one process per version, 1 warmup + 3 measured requests per input length",
+    "cases": [
+      {
+        "name": "context-7k5",
+        "input_tokens": 7565,
+        "output_tokens": {
+          "baseline": 69,
+          "fixed": 69
+        },
+        "decode_tok_s": {
+          "baseline": 31.724622513064073,
+          "fixed": 46.50917074687582
+        },
+        "decode_improvement_percent": 46.60275540780201,
+        "ttft_seconds": {
+          "baseline": 19.05963656003587,
+          "fixed": 18.790500040049665
+        },
+        "decode_ranges": {
+          "baseline": [
+            31.646350175680972,
+            31.803100346285675
+          ],
+          "fixed": [
+            46.494559125375595,
+            46.51533004258535
+          ]
+        },
+        "outputs_identical": true,
+        "output_sha256": {
+          "baseline": "625647b8667c3c81662fd1a28ece2a83d34ca6ef80c407b16b1832bfd0010951",
+          "fixed": "625647b8667c3c81662fd1a28ece2a83d34ca6ef80c407b16b1832bfd0010951"
+        },
+        "code_checks": {
+          "baseline": {
+            "passed": true,
+            "checks": 980
+          },
+          "fixed": {
+            "passed": true,
+            "checks": 980
+          }
+        },
+        "gpu_memory": {
+          "baseline": {
+            "sample_interval_ms": 500,
+            "sampled_peak_per_gpu_mib": [
+              20846,
+              23926,
+              23932,
+              23920,
+              23920,
+              23920,
+              23920,
+              25114
+            ],
+            "sampled_peak_total_mib": 189480
+          },
+          "fixed": {
+            "sample_interval_ms": 500,
+            "sampled_peak_per_gpu_mib": [
+              20852,
+              23942,
+              23934,
+              23934,
+              23934,
+              23946,
+              23946,
+              25132
+            ],
+            "sampled_peak_total_mib": 189598
+          }
+        }
+      },
+      {
+        "name": "context-16k",
+        "input_tokens": 16351,
+        "output_tokens": {
+          "baseline": 69,
+          "fixed": 69
+        },
+        "decode_tok_s": {
+          "baseline": 30.479375494489297,
+          "fixed": 45.799738328064855
+        },
+        "decode_improvement_percent": 50.2646874649564,
+        "ttft_seconds": {
+          "baseline": 43.70740067999577,
+          "fixed": 42.9767957199947
+        },
+        "decode_ranges": {
+          "baseline": [
+            30.456723834945468,
+            30.529950006644828
+          ],
+          "fixed": [
+            45.78828573987915,
+            45.801372057494646
+          ]
+        },
+        "outputs_identical": true,
+        "output_sha256": {
+          "baseline": "625647b8667c3c81662fd1a28ece2a83d34ca6ef80c407b16b1832bfd0010951",
+          "fixed": "625647b8667c3c81662fd1a28ece2a83d34ca6ef80c407b16b1832bfd0010951"
+        },
+        "code_checks": {
+          "baseline": {
+            "passed": true,
+            "checks": 980
+          },
+          "fixed": {
+            "passed": true,
+            "checks": 980
+          }
+        },
+        "gpu_memory": {
+          "baseline": {
+            "sample_interval_ms": 500,
+            "sampled_peak_per_gpu_mib": [
+              20912,
+              23940,
+              23956,
+              23970,
+              23952,
+              23958,
+              23944,
+              25134
+            ],
+            "sampled_peak_total_mib": 189692
+          },
+          "fixed": {
+            "sample_interval_ms": 500,
+            "sampled_peak_per_gpu_mib": [
+              20896,
+              23966,
+              23968,
+              23976,
+              23984,
+              23958,
+              23978,
+              25182
+            ],
+            "sampled_peak_total_mib": 189814
+          }
+        }
+      },
+      {
+        "name": "context-32k",
+        "input_tokens": 32727,
+        "output_tokens": {
+          "baseline": 69,
+          "fixed": 69
+        },
+        "decode_tok_s": {
+          "baseline": 29.149316965003035,
+          "fixed": 45.14306194880523
+        },
+        "decode_improvement_percent": 54.86833534728945,
+        "ttft_seconds": {
+          "baseline": 96.24912027997198,
+          "fixed": 94.05440576002002
+        },
+        "decode_ranges": {
+          "baseline": [
+            29.10516794586358,
+            29.225605185425636
+          ],
+          "fixed": [
+            45.12078076615925,
+            45.14989233210356
+          ]
+        },
+        "outputs_identical": true,
+        "output_sha256": {
+          "baseline": "625647b8667c3c81662fd1a28ece2a83d34ca6ef80c407b16b1832bfd0010951",
+          "fixed": "625647b8667c3c81662fd1a28ece2a83d34ca6ef80c407b16b1832bfd0010951"
+        },
+        "code_checks": {
+          "baseline": {
+            "passed": true,
+            "checks": 980
+          },
+          "fixed": {
+            "passed": true,
+            "checks": 980
+          }
+        },
+        "gpu_memory": {
+          "baseline": {
+            "sample_interval_ms": 500,
+            "sampled_peak_per_gpu_mib": [
+              21056,
+              24072,
+              24082,
+              24064,
+              24054,
+              24056,
+              24038,
+              25228
+            ],
+            "sampled_peak_total_mib": 190438
+          },
+          "fixed": {
+            "sample_interval_ms": 500,
+            "sampled_peak_per_gpu_mib": [
+              21052,
+              24054,
+              24044,
+              24080,
+              24090,
+              24072,
+              24062,
+              25296
+            ],
+            "sampled_peak_total_mib": 190560
+          }
+        }
+      }
+    ]
+  },
+  "abba": {
+    "configuration": {
+      "tokens": 8192,
+      "max_context_length_argument": "not set (server default)",
+      "max_output_tokens_by_case": {
+        "explanation": 128,
+        "coding": 256,
+        "long-coding": 256
+      }
+    },
+    "method": "A/B/B/A, 1 warmup + 3 measured requests per process/case; 6 formal samples per version",
+    "cases": [
+      {
+        "name": "explanation",
+        "input_tokens": 56,
+        "output_tokens": 74,
+        "output_sha256": "b0ae45950ccb218480d7183225650e71085a79524118818f97cec3b20e99bece",
+        "decode_tok_s": {
+          "baseline": 55.38082553656068,
+          "latest": 55.52645828703011
+        },
+        "decode_improvement_percent": 0.26296601587003643,
+        "ttft_seconds": {
+          "baseline": 0.2792013399885036,
+          "latest": 0.27944938000291586
+        },
+        "all_outputs_identical": true
+      },
+      {
+        "name": "coding",
+        "input_tokens": 80,
+        "output_tokens": 69,
+        "output_sha256": "625647b8667c3c81662fd1a28ece2a83d34ca6ef80c407b16b1832bfd0010951",
+        "decode_tok_s": {
+          "baseline": 50.974437686542174,
+          "latest": 54.174781474045204
+        },
+        "decode_improvement_percent": 6.2783307335000815,
+        "ttft_seconds": {
+          "baseline": 0.396721860015532,
+          "latest": 0.3966086999862455
+        },
+        "all_outputs_identical": true
+      },
+      {
+        "name": "long-coding",
+        "input_tokens": 7565,
+        "output_tokens": 69,
+        "output_sha256": "625647b8667c3c81662fd1a28ece2a83d34ca6ef80c407b16b1832bfd0010951",
+        "decode_tok_s": {
+          "baseline": 31.727600957775252,
+          "latest": 46.4246238096167
+        },
+        "decode_improvement_percent": 46.32251543821737,
+        "ttft_seconds": {
+          "baseline": 18.72134656002163,
+          "latest": 18.709854820015607
+        },
+        "all_outputs_identical": true
+      }
+    ]
+  },
+  "historical_validation": {
+    "attention_regression": "passed including independent scalar reference for decode",
+    "history_regression": "passed",
+    "decode_regression_cases": 336,
+    "stable_topk_cases": 60,
+    "cache_sequence_cases": 240,
+    "attention_bit_exact_cases": 24,
+    "indexer_exact_order_cases": 12,
+    "sanitizer_cases_per_tool": 30,
+    "sanitizer_tools": [
+      "memcheck",
+      "racecheck",
+      "synccheck"
+    ],
+    "sanitizer_errors": 0,
+    "lower_bound_checks_per_unique_output": 980,
+    "all_greedy_outputs_identical": true
+  },
+  "notes": [
+    "Historical 336-case validation included 36 comparisons against separately compiled prior kernels. The committed normal decode test has 300 independent Top-K/cache cases; legacy comparison harnesses remain with external measurement artifacts.",
+    "History and attention also have independent regressions. Peak VRAM was sampled every 500 ms.",
+    "No profiler was active during the reported throughput measurements."
+  ]
+}

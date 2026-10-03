@@ -1,0 +1,415 @@
+{
+  "base_commit": "bfa91d653b00333d46259b8f0926aad518e0243e",
+  "model": "Naive-N0.5-Flash-MoE-NVFP4",
+  "hardware": "8 x RTX 5090, layer placement",
+  "config": {
+    "cuda": "13.1",
+    "arch": "sm_120f",
+    "max_batch": 1,
+    "mtp": 0,
+    "threads": 16,
+    "chunked_prefill_size": 512,
+    "context_length": 65536,
+    "history_cache": false,
+    "prefix_cache": false
+  },
+  "libraries": {
+    "baseline": "441391788d1c10e30df3d577cf647ae6265d77fb0f239e4f65e8d2140aa563ba",
+    "fixed": "0f838d0343c879aa3cd354543ef13d321c8610fb2459b019daa931a4a7b670cb"
+  },
+  "final_library": {
+    "measured": "0f838d0343c879aa3cd354543ef13d321c8610fb2459b019daa931a4a7b670cb",
+    "final": "0f838d0343c879aa3cd354543ef13d321c8610fb2459b019daa931a4a7b670cb"
+  },
+  "full_model": {
+    "libraries": {
+      "baseline": "441391788d1c10e30df3d577cf647ae6265d77fb0f239e4f65e8d2140aa563ba",
+      "fixed": "0f838d0343c879aa3cd354543ef13d321c8610fb2459b019daa931a4a7b670cb"
+    },
+    "order": [
+      "A1",
+      "A2",
+      "C1",
+      "C2"
+    ],
+    "order_note": "Baseline A1/A2 preceded revised candidate C1/C2 in the same session; prototype B1/B2 are excluded from final results.",
+    "cases": [
+      {
+        "case": "explanation",
+        "baseline": {
+          "prompt_tokens": 56,
+          "formal_requests": 4,
+          "ttft_seconds": 0.27932240001973696,
+          "decode_tok_s": 67.9559480824002,
+          "ttft_range": [
+            0.27915955998469144,
+            0.27959891996579245
+          ],
+          "decode_range": [
+            67.92837260217297,
+            67.9975152748602
+          ],
+          "output_hashes": [
+            "b0ae45950ccb218480d7183225650e71085a79524118818f97cec3b20e99bece"
+          ],
+          "output_lengths": [
+            74
+          ],
+          "code_checks": null
+        },
+        "marlin": {
+          "prompt_tokens": 56,
+          "formal_requests": 4,
+          "ttft_seconds": 0.0778417999681551,
+          "decode_tok_s": 66.89281423730041,
+          "ttft_range": [
+            0.07766727998387069,
+            0.07791608001571149
+          ],
+          "decode_range": [
+            66.82104215138354,
+            66.96511770869552
+          ],
+          "output_hashes": [
+            "df953f35789e40435c23416e2689d828374ec010795fd1ba65de8cb25ce19c00"
+          ],
+          "output_lengths": [
+            60
+          ],
+          "code_checks": null
+        },
+        "ttft_speedup": 3.588334289983108,
+        "decode_change_pct": -1.5644456079263014,
+        "same_greedy_text": false
+      },
+      {
+        "case": "context-short",
+        "baseline": {
+          "prompt_tokens": 80,
+          "formal_requests": 4,
+          "ttft_seconds": 0.3965877000009641,
+          "decode_tok_s": 66.38636981168293,
+          "ttft_range": [
+            0.3960090799955651,
+            0.39719431998673826
+          ],
+          "decode_range": [
+            66.36024627752774,
+            66.43762101443014
+          ],
+          "output_hashes": [
+            "625647b8667c3c81662fd1a28ece2a83d34ca6ef80c407b16b1832bfd0010951"
+          ],
+          "output_lengths": [
+            69
+          ],
+          "code_checks": {
+            "passed": true,
+            "checks": 980
+          }
+        },
+        "marlin": {
+          "prompt_tokens": 80,
+          "formal_requests": 4,
+          "ttft_seconds": 0.09372948002419434,
+          "decode_tok_s": 65.14366224530927,
+          "ttft_range": [
+            0.09352176001993939,
+            0.09385732002556324
+          ],
+          "decode_range": [
+            65.06989980718323,
+            65.20927266627888
+          ],
+          "output_hashes": [
+            "625647b8667c3c81662fd1a28ece2a83d34ca6ef80c407b16b1832bfd0010951"
+          ],
+          "output_lengths": [
+            69
+          ],
+          "code_checks": {
+            "passed": true,
+            "checks": 980
+          }
+        },
+        "ttft_speedup": 4.231194922863043,
+        "decode_change_pct": -1.8719317984984274,
+        "same_greedy_text": true
+      },
+      {
+        "case": "context-7k5",
+        "baseline": {
+          "prompt_tokens": 7565,
+          "formal_requests": 4,
+          "ttft_seconds": 18.720000379980775,
+          "decode_tok_s": 55.40586063009596,
+          "ttft_range": [
+            18.695698640018236,
+            18.727552519994788
+          ],
+          "decode_range": [
+            55.35803951760557,
+            55.435553887561035
+          ],
+          "output_hashes": [
+            "625647b8667c3c81662fd1a28ece2a83d34ca6ef80c407b16b1832bfd0010951"
+          ],
+          "output_lengths": [
+            69
+          ],
+          "code_checks": {
+            "passed": true,
+            "checks": 980
+          }
+        },
+        "marlin": {
+          "prompt_tokens": 7565,
+          "formal_requests": 4,
+          "ttft_seconds": 6.631946599984076,
+          "decode_tok_s": 54.43125521771066,
+          "ttft_range": [
+            6.630051080021076,
+            6.63501443999121
+          ],
+          "decode_range": [
+            54.407505622588886,
+            54.4837829807325
+          ],
+          "output_hashes": [
+            "625647b8667c3c81662fd1a28ece2a83d34ca6ef80c407b16b1832bfd0010951"
+          ],
+          "output_lengths": [
+            69
+          ],
+          "code_checks": {
+            "passed": true,
+            "checks": 980
+          }
+        },
+        "ttft_speedup": 2.8227007105313127,
+        "decode_change_pct": -1.7590294624101666,
+        "same_greedy_text": true
+      },
+      {
+        "case": "context-32k",
+        "baseline": {
+          "prompt_tokens": 32727,
+          "formal_requests": 2,
+          "ttft_seconds": 94.7550603999698,
+          "decode_tok_s": 53.48057095390706,
+          "ttft_range": [
+            94.7400591999758,
+            94.77006159996381
+          ],
+          "decode_range": [
+            53.446084029751745,
+            53.51505787806238
+          ],
+          "output_hashes": [
+            "625647b8667c3c81662fd1a28ece2a83d34ca6ef80c407b16b1832bfd0010951"
+          ],
+          "output_lengths": [
+            69
+          ],
+          "code_checks": {
+            "passed": true,
+            "checks": 980
+          }
+        },
+        "marlin": {
+          "prompt_tokens": 32727,
+          "formal_requests": 2,
+          "ttft_seconds": 47.0237671599898,
+          "decode_tok_s": 52.65024273086688,
+          "ttft_range": [
+            47.01563916000305,
+            47.03189515997656
+          ],
+          "decode_range": [
+            52.61964748351277,
+            52.68083797822098
+          ],
+          "output_hashes": [
+            "2d9ed45554582128b9cef42ae3e47b0d347c26b91059a97676ace58aeae6d533"
+          ],
+          "output_lengths": [
+            69
+          ],
+          "code_checks": {
+            "passed": true,
+            "checks": 980
+          }
+        },
+        "ttft_speedup": 2.015046137787791,
+        "decode_change_pct": -1.552579204428861,
+        "same_greedy_text": false
+      }
+    ],
+    "logits": [
+      {
+        "case": "arithmetic",
+        "position": 0,
+        "input_tokens": 53,
+        "top1_equal": false,
+        "baseline_top1": 271,
+        "marlin_top1": 198,
+        "nrmse": 0.13262003800381095,
+        "max_abs": 3.4375,
+        "kl_baseline_marlin": 0.19025633643767276
+      },
+      {
+        "case": "arithmetic",
+        "position": 1,
+        "input_tokens": 54,
+        "top1_equal": true,
+        "baseline_top1": 19,
+        "marlin_top1": 19,
+        "nrmse": 0.1481858373692006,
+        "max_abs": 2.03125,
+        "kl_baseline_marlin": 0.0002781707211624649
+      },
+      {
+        "case": "arithmetic",
+        "position": 2,
+        "input_tokens": 55,
+        "top1_equal": true,
+        "baseline_top1": 17,
+        "marlin_top1": 17,
+        "nrmse": 0.046231619718711,
+        "max_abs": 0.9375,
+        "kl_baseline_marlin": 6.996562982239586e-06
+      },
+      {
+        "case": "chinese",
+        "position": 0,
+        "input_tokens": 56,
+        "top1_equal": true,
+        "baseline_top1": 198,
+        "marlin_top1": 198,
+        "nrmse": 0.07018451257092576,
+        "max_abs": 1.125,
+        "kl_baseline_marlin": 0.007618990667020971
+      },
+      {
+        "case": "chinese",
+        "position": 1,
+        "input_tokens": 57,
+        "top1_equal": true,
+        "baseline_top1": 106772,
+        "marlin_top1": 106772,
+        "nrmse": 0.09175590077839164,
+        "max_abs": 1.21875,
+        "kl_baseline_marlin": 0.049235671673914
+      },
+      {
+        "case": "chinese",
+        "position": 2,
+        "input_tokens": 58,
+        "top1_equal": true,
+        "baseline_top1": 101916,
+        "marlin_top1": 101916,
+        "nrmse": 0.06259670264935334,
+        "max_abs": 0.875,
+        "kl_baseline_marlin": 0.0014173402647979355
+      },
+      {
+        "case": "coding",
+        "position": 0,
+        "input_tokens": 80,
+        "top1_equal": true,
+        "baseline_top1": 271,
+        "marlin_top1": 271,
+        "nrmse": 0.11654893969679485,
+        "max_abs": 2.5,
+        "kl_baseline_marlin": 7.237402045322641e-06
+      },
+      {
+        "case": "coding",
+        "position": 1,
+        "input_tokens": 81,
+        "top1_equal": true,
+        "baseline_top1": 73594,
+        "marlin_top1": 73594,
+        "nrmse": 0.09040671020691023,
+        "max_abs": 1.125,
+        "kl_baseline_marlin": 0.011210700876227676
+      },
+      {
+        "case": "context-7k5",
+        "position": 0,
+        "input_tokens": 7565,
+        "top1_equal": true,
+        "baseline_top1": 271,
+        "marlin_top1": 271,
+        "nrmse": 0.06638098484257611,
+        "max_abs": 1.40625,
+        "kl_baseline_marlin": 1.5503451340405253e-05
+      },
+      {
+        "case": "long",
+        "position": 0,
+        "input_tokens": 2971,
+        "top1_equal": true,
+        "baseline_top1": 271,
+        "marlin_top1": 271,
+        "nrmse": 0.07335255327280488,
+        "max_abs": 2.1875,
+        "kl_baseline_marlin": 2.6152587454424226e-06
+      }
+    ],
+    "logits_summary": {
+      "positions": 10,
+      "top1_equal": 9,
+      "max_kl": 0.19025633643767276,
+      "max_nrmse": 0.1481858373692006
+    },
+    "request_count": 48,
+    "formal_request_count": 28
+  },
+  "real_layer_prefill": {
+    "median_ms": 1.96854,
+    "median_graph_ms": 1.95507,
+    "native_median_ms": 13.8238,
+    "speedup": 6.866935103067558,
+    "max_fp32_nrmse": 0.003382706047231228
+  },
+  "real_layer_decode": {
+    "median_ms": 0.0768,
+    "median_graph_ms": 0.067712,
+    "native_median_ms": 0.079936,
+    "speedup": 1.0408333333333333,
+    "max_fp32_nrmse": 0.0031279455683318803
+  },
+  "validation": {
+    "small_shape_cases": 18,
+    "small_shape_cuda_graphs": 18,
+    "real_layer_cases": 12,
+    "real_layer_cuda_graphs": 12,
+    "memcheck_errors": 0,
+    "synccheck_errors": 0,
+    "host_staging_repack": "passed",
+    "code_checks": 980,
+    "source_layout_released": true
+  },
+  "integration": {
+    "dependency": "Existing in-tree Marlin CUDA; no new vLLM, Torch or Python package dependency",
+    "dtype": "BF16 input/output, NVFP4 row-packed source, standard bias-free SwiGLU",
+    "scales": "Preserve independent gGate/gUp/gDown; gate/up select globals by output tile before BF16 rounding; down applies its global before BF16 rounding, then reduction uses FP32 routing scores; exponent compensation 2^119",
+    "layout": "One canonical Marlin weight layout for prefill and decode; originals released after successful preparation",
+    "fallback": "Unsupported shape/dtype, varying per-row globals, nonfinite/nonpositive globals, or scales outside zero/[1/64,448] retain native layout; incompatible invocation after retirement fails explicitly",
+    "environment_variables_added": []
+  },
+  "limits": [
+    "Tensor Core arithmetic and BF16 rounding differ from the native SIMT path; not bitwise equivalent to native.",
+    "Quality checks cover fixed prompts and ten teacher-forced positions, not broad model evaluation.",
+    "Single-layer comparisons reuse the previous native measurements; whole-model BAAB measures both exact libraries in this run.",
+    "Final candidate C1/C2 were measured after baseline A1/A2 in the same session; this final comparison is not interleaved. Prototype B1/B2 are archived separately."
+  ],
+  "disposition": {
+    "branch": "naive-marlin-integration-20261001",
+    "source": "/mnt/disk_sdb/naive-marlin-integration-20261001/source",
+    "committed": false,
+    "pushed": false,
+    "installed": false
+  }
+}

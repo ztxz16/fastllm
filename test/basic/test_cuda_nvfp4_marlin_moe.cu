@@ -1,5 +1,5 @@
 // Standalone regression for BF16 row-packed NVFP4 grouped Marlin.
-// Exercises independent gate/up globals, sparse routing, both tile sizes,
+// Exercises independent gate/up globals, sparse routing, all three tile sizes,
 // CUDA Graph replay, rejected layouts and cache retirement/address reuse.
 #include "fastllm.h"
 #include "devices/cpu/cpudevice.h"
@@ -61,7 +61,7 @@ struct Fixture {
     }
 };
 static void Run(Fixture &f, int m, int topk, float limit = 0.0f,
-                float amplitude = .15f, bool expectMarlin = true) {
+                float amplitude = .15f, bool expectMarlin = true, bool spreadRoutes = false) {
     const int H=f.hidden,I=f.intermediate,E=f.experts;
     bool bf16 = f.weights[2]->dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED;
     DataType dtype = bf16 ? DataType::BFLOAT16 : DataType::FLOAT16;
@@ -76,7 +76,9 @@ static void Run(Fixture &f, int m, int topk, float limit = 0.0f,
         else ((half *)x.cpuData)[i] = __float2half_rn(xf[i]);
     }
     for (int i = 0; i < m * topk; ++i) {
-        ix[i] = (i / topk % 5 + (i % topk) * 3) % E; // include unused experts
+        ix[i] = spreadRoutes
+            ? (Mix(i / topk + 319) % E + (i % topk) * 31) % E
+            : (i / topk % 5 + (i % topk) * 3) % E; // include unused experts
         sf[i] = 1.f / topk + (i % topk) * .013f;
         ((int *)ids.cpuData)[i] = ix[i]; ((float *)scores.cpuData)[i] = sf[i];
     }
@@ -138,8 +140,27 @@ static void Run(Fixture &f, int m, int topk, float limit = 0.0f,
     cudaGraph_t graph; cudaGraphExec_t exec;
     Cuda(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal)); call();
     Cuda(cudaStreamEndCapture(cudaStreamPerThread,&graph)); Cuda(cudaGraphInstantiate(&exec,graph,nullptr,nullptr,0));
-    for (int i=0;i<3;++i) { Cuda(cudaGraphLaunch(exec,cudaStreamPerThread)); Cuda(cudaStreamSynchronize(cudaStreamPerThread));
-        Cuda(cudaMemcpy(replay.data(),y.cudaData,replay.size()*2,cudaMemcpyDeviceToHost)); Check(std::memcmp(actual.data(),replay.data(),actual.size()*2)==0,"graph result changed"); }
+    std::vector<__nv_bfloat16> changedInput(spreadRoutes ? m * H : 0);
+    for (int i = 0; i < 3; ++i) {
+        if (spreadRoutes) {
+            // Replay captured metadata/GEMMs with new routes, scores and input.
+            for (auto &expert : ix) expert = (expert + 3) % E;
+            for (auto &score : sf) score *= .875f;
+            for (int j = 0; j < m * H; ++j) {
+                xf[j] = Round(-xf[j] * .9375f);
+                changedInput[j] = __float2bfloat16_rn(xf[j]);
+            }
+            Cuda(cudaMemcpyAsync(x.cudaData,changedInput.data(),m*H*2,cudaMemcpyHostToDevice,cudaStreamPerThread));
+            Cuda(cudaMemcpyAsync(ids.cudaData,ix.data(),ix.size()*4,cudaMemcpyHostToDevice,cudaStreamPerThread));
+            Cuda(cudaMemcpyAsync(scores.cudaData,sf.data(),sf.size()*4,cudaMemcpyHostToDevice,cudaStreamPerThread));
+            call(); Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+            Cuda(cudaMemcpy(actual.data(),y.cudaData,actual.size()*2,cudaMemcpyDeviceToHost));
+        }
+        Cuda(cudaGraphLaunch(exec,cudaStreamPerThread));
+        Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+        Cuda(cudaMemcpy(replay.data(),y.cudaData,replay.size()*2,cudaMemcpyDeviceToHost));
+        Check(std::memcmp(actual.data(),replay.data(),actual.size()*2)==0,"graph result changed");
+    }
     Cuda(cudaGraphExecDestroy(exec)); Cuda(cudaGraphDestroy(graph));
     std::printf("dtype=%s m=%d topk=%d FP64_nrmse=%.8g graph=bitwise_equal\n",bf16 ? "bf16" : "fp16",m,topk,nrmse);
 }
@@ -186,6 +207,11 @@ int main(int argc, char **argv) { try {
         prop.sharedMemPerBlockOptin < 71680) return 77;
     FastllmCudaSetDevice(0); SetThreads(4);
     CheckActivation();
+    if (argc == 2 && std::strcmp(argv[1], "--narrow-prefill") == 0) {
+        Fixture narrow(19,false,false,256,256,16,true);
+        for (int m : {9,32,33,32}) Run(narrow,m,8,0.0f,.15f,true,true);
+        std::puts("Narrow prefill boundary PASS"); return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--clamped-small") == 0) {
         Fixture f(17); Run(f,33,8,10.0f,15.0f);
         std::puts("Clamped small PASS"); return 0;
@@ -210,5 +236,14 @@ int main(int argc, char **argv) { try {
     { Fixture clampedHalf(17,false,true); Run(clampedHalf,33,8,10.0f,15.0f); }
     { Fixture glm(19,false,false,4096,2048,8); Run(glm,1,8,10.0f,15.0f); }
     { Fixture fallback(23,false,false,128,64,8); Run(fallback,33,8,10.0f,30.0f,false); }
+    { Fixture narrow(19,false,false,256,256,256,true);
+      for (int m : {128,129,255,256,511,512,513,1024}) Run(narrow,m,8,0.0f,.15f,true,true); }
+    // Gate/up halves of 128 columns must retain the old 128-column tile.
+    { Fixture unaligned(29,false,false,256,128,16,true); Run(unaligned,32,8,0.0f,.15f,true,true); }
+    { Fixture uneven(23,false,false,512,256,7,true);
+      for (int m : {9,10,37,38,10}) Run(uneven,m,3,0.0f,.15f,true,true); }
+    // Cover the merge boundary: narrow-prefill routing with upstream clipping.
+    { Fixture narrowClamped(31,false,false,256,256,16,true);
+      Run(narrowClamped,32,8,10.0f,15.0f,true,true); }
     Cuda(cudaDeviceSynchronize()); std::puts("PASS"); return 0;
 } catch(const std::exception &e) { std::fprintf(stderr,"FAIL: %s\n",e.what()); return 1; } }

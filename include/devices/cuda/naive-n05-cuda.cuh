@@ -5,11 +5,23 @@
 // as [1, tokens, heads * dim (+ indexDim for DSA keys)].
 void FastllmCudaNaiveRope(fastllm::Data &input, const fastllm::Data &positions,
                          int heads, int dim, int rotaryDim, float theta);
+// In-place Q/K RoPE and V scaling, preserving eager BF16 rounding.
+void FastllmCudaNaiveRopeQKScaleV(fastllm::Data &q, fastllm::Data &k,
+    fastllm::Data &v, const fastllm::Data &positions,
+    int heads, int kvHeads, int dim, int valueDim,
+    int rotaryDim, float theta, float valueScale);
+// Keep the allocation and logical row order when retaining a sliding suffix.
+void FastllmCudaNaiveTrimCache(fastllm::Data &key, fastllm::Data &value, int keep);
+// Exact descending score / ascending position order for each query row.
+// Row r considers only keys [0, queryStart + r]; missing slots are -1.
+void FastllmCudaNaiveTopK(const fastllm::Data &scores, int queryStart, int topK,
+                         fastllm::Data &indices);
+// Only Q is optionally E4M3-rounded; Indexer K always retains its BF16 input.
 void FastllmCudaNaiveIndexer(const fastllm::Data &query,
                             const fastllm::Data &weights,
                             const fastllm::Data &packedKeys,
                             int heads, int dim, int queryStart, int topK,
-                            bool fp8, fastllm::Data &indices);
+                            bool fp8Query, fastllm::Data &indices);
 void FastllmCudaNaiveAttention(const fastllm::Data &query,
                               const fastllm::Data &key,
                               const fastllm::Data &value,

@@ -693,6 +693,44 @@ FT_NUMAS=2 numactl -C 0-63 -m 0,1 \
 python -m unittest discover -s test -p test_naive_n05_export_nvfp4.py -v
 ```
 
+### 八卡 CUDA 专家推理
+
+CUDA 专家使用现有的紧凑 `NVFP4_BLOCK_16_E4M3_PACKED` 行布局：每行保存
+4 字节原始 FP32 全局缩放，每 16 个权重保存 8 字节 FP4 数据和 1 字节原始 E4M3
+分块缩放，行末对齐到 4 字节。保留一份 GPU 专家权重，模型文件无需重新导出。
+CPU/NUMA 专家继续使用原始紧凑布局。
+
+Gate 和 Up 各行保留自己的全局缩放，避免归一化到同一最小值造成溢出。
+CUDA MoE 支持默认 BF16 和 FP16 激活，沿用原生 FP32 分块缩放路径的点积顺序、
+归约、SwiGLU 和路由舍入。内核按需解码 FP8 并乘行全局缩放，不缓存展开的 FP32
+分块缩放。测试用两种布局的同一权重检查输出逐 bit 一致。
+8 张 32 GiB RTX 5090 可以使用普通设备映射把 48 层分配到八卡：
+
+```bash
+ftllm server ~/hfmodels/Naive-N0.5-Flash-MoE-NVFP4 \
+  --device '["cuda:0","cuda:1","cuda:2","cuda:3","cuda:4","cuda:5","cuda:6","cuda:7"]' \
+  --moe_device '["cuda:0","cuda:1","cuda:2","cuda:3","cuda:4","cuda:5","cuda:6","cuda:7"]' \
+  --max_batch 1 --mtp 0 --tokens 8192 --chunked_prefill_size 512 \
+  --cuda_slab 288 --cache_history false
+```
+
+这是按层分配，不是张量并行。对该 checkpoint 的 3028 亿个专家参数，紧凑专家数据
+连同行全局缩放约占 158.992 GiB；相比每块保存 FP32 缩放的 12 字节布局，
+减少约 52.508 GiB。
+实际进程显存还包含稠密权重、KV cache、工作区和分配器开销。
+
+`cuda_nvfp4_compact_moe_test` 用独立 FP64 参考检查原始 FP4/FP8 解码、不同 Gate/Up
+全局缩放、零与最大分块缩放，以及 BF16/FP16 的多种路由批次，并与 FP32 分块
+缩放布局逐 bit 对比。开启 `UNIT_TEST`
+后可编译并运行：
+
+```bash
+cmake --build build-fastllm --target cuda_nvfp4_compact_moe_test -j16
+ctest --test-dir build-fastllm --output-on-failure -R '^cuda_nvfp4_compact_moe$'
+```
+
+八卡整模型短请求实测显存约 19.7–23.9 GiB/卡，中文解释和代码生成普通解码约 51.4–55.4 token/s。生成的二分查找函数通过 980 项独立检查，2977-token 输入跨越滑窗边界后仍正确回答。与已验证 FP32 分块缩放版本比较，9 个位置的全部 152576 维 logits 均有限，top-1 全部一致，最大 KL 为 0.012838。这些是有限输入的数值与短请求验证，不代表完整质量评估或长上下文吞吐。
+
 ### NVFP4 实测（投影优化前）
 
 本节保留量化导出时的对比；投影优化后的 NVFP4 速度见
@@ -714,7 +752,7 @@ python -m unittest discover -s test -p test_naive_n05_export_nvfp4.py -v
 
 **长输入 prefill 变慢**：2057-token 重复输入，普通模式由 8.530 秒增加到
 12.075 秒，推测模式由 8.542 秒增加到 12.101 秒，约 170 输入 token/s，吞吐下降
-29.4%。当前紧凑 NVFP4 + BF16 激活的 GPU 专家 prefill 不支持，专家由 CPU 执行；
+29.4%。该次测试使用的版本不支持紧凑 NVFP4 + BF16 的 GPU 专家 prefill，专家由 CPU 执行；
 FP8 双 NUMA 基线的专家 prefill 也使用 CPU。短编程提示 TTFT 为 0.82–0.91 秒。
 
 精度检查使用同一固定续写前缀、全部 152576 维 logits，与当前 FastLLM FP8 版本
@@ -941,3 +979,355 @@ FT_NUMAS=1 numactl -C 0-31 -m 0 \
 首次扩大分块、尺寸预热和缓存命中是不同条件，以上分别列出。
 最终共享库 SHA-256 与完整原始测量数值记录在调优 JSON 中；矢量图见
 [分块对照 SVG](benchmarks/naive_n05_flash_prefill_chunk_tuning.svg)。
+
+
+## 普通 decode 的长上下文优化
+
+普通解码（`--max_batch 1 --mtp 0`）会自动使用以下路径，无需额外环境变量：
+
+- 滑窗层在原分配上一次搬移 K/V 后缀，保留容量，避免每 token 重复申请、释放显存。
+  容量可能保留到最近一次 prefill 分块的大小。草稿验证期间仍保留回退所需的完整缓存。
+- 单 query Indexer 在 GPU 上执行稳定 Top-K：分数降序、同分时位置升序，正负零视为
+  同分，只选择因果范围内的位置，不足部分填 `-1`。多 query 的 prefill 继续使用 CPU 路径。
+- 超过 256 个位置的单 query attention 按 key 和输出维度分块，提高 GPU 并行度，
+  保持原来的逐项累加顺序及 BF16 舍入。短 attention 和多 query 路径保持原行为。
+
+常规 `naive_n05_decode_test` 覆盖 60 组稳定 Top-K 和 240 组连续滑窗追加/裁剪，
+检查缓存内容、显存指针及容量。attention 测试包含独立标量参考，history 测试检查
+前缀恢复、分支隔离和滑窗行为。`--quick` 提供 24 组 decode 抽样用于 sanitizer。
+
+```bash
+cmake --build build-fastllm --target naive_n05_decode_test naive_n05_attention_test naive_n05_history_test -j16
+ctest --test-dir build-fastllm --output-on-failure -R '^naive_n05_(decode|attention|history)$'
+```
+
+### 整模型性能记录（2026-10-01）
+
+完整 Naive-N0.5-Flash-MoE-NVFP4 checkpoint，8 张 RTX 5090 按层分配，BF16 激活/KV、
+紧凑 NVFP4 专家，16 线程，prefill 分块 512，关闭历史及前缀缓存。
+以下为代码整理前已验证实现的实测，基线不含本节 decode 优化：
+
+| 输入 token | 基线 decode | 优化后 decode | 提升 | 优化后首 token |
+| --- | ---: | ---: | ---: | ---: |
+| 7,565 | 31.72 token/s | 46.51 token/s | 46.6% | 18.79 秒 |
+| 16,351 | 30.48 token/s | 45.80 token/s | 50.3% | 42.98 秒 |
+| 32,727 | 29.15 token/s | 45.14 token/s | 54.9% | 94.05 秒 |
+
+每版独立进程按 A→B 顺序测试，各长度预热一次、正式三次取中位数；无 profiler。
+输入通过扩充同一代码任务的技术背景获得，输出均为相同的 69 token，代码通过 980
+项检查，缓存命中为零且无截断。这是长上下文性能测试，不是理解质量评估。
+32K 时最高单卡显存采样峰值约 24.70 GiB（500 ms 采样，非分配器精确高水位）。
+
+此前 7.5K ABBA 复测得到 31.73 → 46.42 token/s。对应 Nsight 稳态采样中，每 token
+全局 attention GPU 时间从 4.473 降至 1.309 ms，CPU 索引选择/准备区间从 4.412 ms
+降为零，156 次 malloc 和 156 次 free 均消除。GPU Top-K 自身增加了工作量，原地
+滑窗仍需搬移数据；没有按单项消融分配整体收益。追踪有可能丢事件的警告，区间
+关键计数稳定；吞吐来自独立的无 profiler 请求。
+
+完整配置、库哈希、重复范围及验证记录见
+[CUDA decode 测量数据](benchmarks/naive_n05_cuda_decode.json)。
+
+
+## 单行 RMSNorm 与专家选择优化
+
+普通解码自动按形状选择以下 CUDA 路径，无需环境变量：
+
+- 单行、4096 通道的 BF16 RMSNorm 将输入和 FP32 权重保留在寄存器中，展开固定
+  次数的循环，保持原有逐线程累加顺序，以及乘权重前后的两次 BF16 舍入。
+- 单行、256 专家选 8 使用 warp Top-K，复用 512 专家选 10 的固定形状实现。
+  并列分数重建原 64 线程归并顺序；非有限值、归一化及路由缩放沿用原处理。
+- 多行 prefill 和其他维度保留原调度；通用选择核的 `MAXK=50` 布局保留。
+  5120 维通用 RMSNorm 的 `FASTLLM_CUDA_RMSNORM_DECODE` 属于另一条仍在使用的路径。
+
+整理后的代码统一维度常量，去掉多余的候选结构转换，保留原向量加载布局。CUDA 13.1 重建后，
+4096 维 RMSNorm、256/top8 选择，以及 512/top10 的普通和融合 softmax 两个核的
+SASS 指令及控制编码与整理前一致。实际库接口各 672 组 RMSNorm/路由对照通过，
+包含回退形状；有限结果、路由索引和权重逐 bit 相等，RMSNorm NaN 按分类核验。
+memcheck、racecheck、synccheck 各抽查两项各 112 组，均无错误或 hazard。
+
+### 整模型性能
+
+以下为整理前优化实现的实测，基线 `b0a7ede3` 已包含上一节的长上下文修复。
+完整 Naive checkpoint、8 张 RTX 5090 按层分配、CUDA 13.1、`--max_batch 1 --mtp 0`，
+16 线程、prefill 分块 512、tokens/context 65536，历史及前缀缓存关闭。
+
+| 场景 | 基线 decode | 优化后 decode | 提升 |
+| --- | ---: | ---: | ---: |
+| 短中文（56 输入） | 55.54 token/s | 58.81 token/s | 5.89% |
+| 短代码（80 输入） | 54.18 token/s | 57.21 token/s | 5.58% |
+| 7,565 输入代码 | 46.44 token/s | 48.55 token/s | 4.53% |
+| 32,727 输入代码 | 45.13 token/s | 47.15 token/s | 4.48% |
+
+前三项为无 profiler 的 ABBA 四独立进程，每个 case/进程预热一次、正式三次；每版
+六个正式样本。32K 是补充 A/B，每版一次预热、一次正式样本，不与 ABBA 样本量混算。
+首 token 时间基本不变。生成文本跨版一致，代码输出均为 69 token，并通过 980 项检查；
+这属于固定任务性能与回归测试，不代表全面质量评估。
+
+32K Nsight Systems 的 14 个内部解码步中，每 token 的 97 次 RMSNorm 从合计
+0.861 ms 降至 0.140 ms，47 次专家选择从 0.521 ms 降至 0.163 ms，共省约
+1.079 ms。前后仍为 1141 个核/token，无 CUDA malloc/free。基线波形来自此前对
+同一基线库的采集；吞吐采用上述无 profiler 测量，不使用含停采集/导出开销的请求速度。
+
+完整库哈希、重复范围及验证记录见
+[单行小算子测量数据](benchmarks/naive_n05_small_kernels.json)。
+
+## 单 query 滑窗 Attention 优化
+
+因果滑窗为 128、Q/K 维度为 192、V 维度为 128 时，单 query 自动选择专用 CUDA 核。
+要求连续 K/V、没有稀疏 indices、保留键数为 1–128 且 `pastLength == keys - 1`。
+输出按四个 32 维片分工，模型中的线程块数从 64 增至 256；Q 保存在寄存器，V 由线程
+协作预取到共享内存。保持原 QK 点积顺序、256-lane softmax 归约树、BF16 舍入及按
+slot 顺序的 FP32 FMA；块同步从 21 次减至 6 次。多 query prefill 和其他形状保留原路径。
+
+窗口、维度、线程及输出片宽使用内核与调度共享的编译期常量，无新增环境开关。
+CUDA 13.1 / `sm_120f` 重建后，该源文件全部 17 个 CUDA 函数（含回退与 CUB）
+的 SASS 指令及控制编码与整理前一致。实际库 368 组逐 bit 对照、2 组 CUDA Graph、
+含 24 种单 query 窗口边界组合的 CPU 参考单测通过；memcheck、racecheck、synccheck
+各 44 组 API 对照及 2 组 Graph 检查均为零错误、零 hazard。
+
+### 整模型性能
+
+以下为整理前 SWA 优化实现的实测，基线 `c3de61cd` 已含前面的 RMSNorm/专家选择优化。
+完整 Naive-N0.5-Flash-MoE-NVFP4、8 张 RTX 5090 按层执行、CUDA 13.1、
+`--max_batch 1 --mtp 0`，16 线程、prefill 分块 512、tokens/context 65536，关闭缓存。
+
+| 场景 | 基线 decode | 优化后 decode | 提升 |
+| --- | ---: | ---: | ---: |
+| 短中文（56 输入） | 58.85 token/s | 61.01 token/s | 3.67% |
+| 短代码（80 输入） | 57.23 token/s | 59.71 token/s | 4.34% |
+| 7,565 输入代码 | 48.57 token/s | 50.59 token/s | 4.15% |
+| 32,727 输入代码 | 47.15 token/s | 49.05 token/s | 4.04% |
+
+无 profiler 的 A1旧→B1新→B2新→A2旧四独立进程；每个进程、每个场景先预热一次。
+每版短输入和 7.5K 各 6 个正式样本，32K 各 2 个；测速时无并发编译、GPU 探针或
+NVML 轮询。60 次请求中，同场景的新旧输出全部相同，代码检查 980 项通过。
+本轮整理后只重做机器码与正确性验证，没有重跑整模型吞吐；这是固定任务的性能与
+回归测试，不代表全面质量评估。
+
+32K Nsight Systems 取 14 个内部解码步：每 token 的 39 次 SWA 从 1.180 ms 降至
+0.419 ms，单次 30.25→10.74 μs（耗时减少 64.5%），合计节省 0.761 ms/token。
+GPU 核总时间 17.531→16.761 ms，仍为 1141 个 kernel/token，无 CUDA malloc/free。
+基线波形来自此前同一基线库；原生吞吐仅取上表，不能用 profiler 请求速度代替。
+热缓存 Graph 的 17.08→6.60 μs 微基准独立保存，不当作真实模型算子时间。
+
+配置、逐次范围、库哈希和整理后机器码核验见
+[SWA 解码测量数据](benchmarks/naive_n05_swa_decode.json)。
+
+## 单 token packed NVFP4 MoE 解码优化
+
+BF16 激活、packed E4M3 块缩放、hidden 4096/intermediate 2048、top-8 时，
+索引式单 token MoE 自动使用专用 gate/up + SwiGLU 与 down + reduce 核。
+每行 FP32 缩放只加载一次，gate/up 复用四个输入值，省去固定尺寸不需要的尾部处理。
+保留伪 BF16 权重转换、原点积与 64 线程归约加法顺序、BF16 舍入位置，以及逐专家
+FP32 权重乘法舍入和按 slot 累加顺序。归约改用一次共享内存配对加 warp shuffle，
+gate/up 整块同步从 7 次降至 1 次，down 从 8 次降至 2 次。
+
+整理后，形状、packed 行布局与线程参数由内核和调度共享编译期常量，无新增环境开关。
+多 token、其他形状和数据格式保留原路径；这些路径仍被使用，不作为冗余删除。
+CUDA 13.1 / `sm_120f` 重建后，该 MoE 源文件全部 142 个 CUDA 函数（含两个新核）
+的 SASS 指令及控制编码与整理前完全一致。
+
+整理后重跑实际库 140 组逐 bit 对照、5 组 CUDA Graph、20 组 FP64/native-layout
+参考回归，以及 memcheck 的 13 组/5 Graph 检查，全部通过。整理前已通过三种
+sanitizer，各 13 组/5 Graph、零错误与 hazard；本次未重复 racecheck/synccheck。
+新增 top-8 用例暴露的 direct/indexed 舍入差异在原基线也能复现：direct 路径可以
+融合专家权重乘加，indexed 路径先舍入乘积。原有 direct 测试保留，新增 top-8
+对比 indexed FP32-scale 路径与独立 FP64 参考，本轮不改 direct 路径。
+
+### 整模型性能
+
+以下为整理前优化实现的实测，基线 `707c591e` 已包含前面的 SWA、RMSNorm 和专家选择优化。
+完整 Naive-N0.5-Flash-MoE-NVFP4，8 张 RTX 5090 按层执行（非张量并行），
+CUDA 13.1，`--max_batch 1 --mtp 0`，16 线程、prefill 分块 512、context/tokens 65536，
+关闭历史与前缀缓存。
+
+| 场景 | 基线 decode | 优化后 decode | 提升 |
+| --- | ---: | ---: | ---: |
+| 短中文（56 输入） | 61.05 token/s | 67.95 token/s | 11.30% |
+| 短代码（80 输入） | 59.70 token/s | 66.36 token/s | 11.14% |
+| 7,565 输入代码 | 50.59 token/s | 55.34 token/s | 9.40% |
+| 32,727 输入代码 | 49.07 token/s | 53.46 token/s | 8.95% |
+
+无 profiler 的 A1旧→B1新→B2新→A2旧四独立进程，每个场景先预热一次。
+每版短输入/7.5K 各 6 个正式样本，32K 各 2 个，共 60 次请求、40 个正式样本；
+测速期间无编译、GPU 探针、profiler 或 NVML 轮询。输出跨版本一致，代码检查
+980 项通过。整理后未重跑整模型吞吐；这是固定任务性能与回归测试，不代表全面质量评估。
+
+32K NSYS 分析第 52–65 共 14 个内部解码步，每 token 的 gate/up 与 down 各 47 次：
+gate/up 从 78.74 降至 53.85 μs，down 从 42.25 降至 30.59 μs；合计从 5.687 降至
+3.969 ms/token，耗时减少 30.21%，节省 1.718 ms。GPU 核总时间 16.762→15.065 ms，
+其他算子合计变化约 0.020 ms；仍为 1141 个 kernel/token，无 CUDA malloc/free。
+
+NCU 在 GPU 0/7 第 51 步采样 22 次 MoE 调用，全部单 pass，不清空缓存、不调整时钟，
+调用计数与 NSYS 匹配。实际 DRAM 带宽 gate/up 从 893–1032 提高到 1259–1439 GB/s，
+down 从 806–919 提高到 1125–1370 GB/s；峰值利用率分别为 71.38–81.61% 和
+63.73–77.67%。这些是代表调用区间，带宽使用 NCU 自身的计数时间计算。
+旧波形/计数来自此前同一基线库；原生速度仅取 ABBA，不使用 profiler 请求吞吐。
+
+配置、逐次范围、库哈希与整理后验证记录见
+[MoE 解码测量数据](benchmarks/naive_n05_moe_decode.json)。
+
+## BF16 NVFP4 grouped Marlin（2026-10-01）
+
+CUDA 的 packed E4M3 NVFP4 专家现在优先使用仓库内 grouped Marlin W4A16，
+覆盖 prefill 和普通 decode，无新增 vLLM/PyTorch 依赖或环境开关。
+仅标准无 bias SwiGLU、支持的形状及可无损编码的 scale 使用此路径。
+权重首次准备时检查每个 gate/up/down 的 global 在全部行保持一致，保留原 FP4 和
+E4M3 block scale。gate/up 在输出首次 BF16 舍入前各自应用原始 global，
+down 使用原始 global，并在归约时用 FP32 路由分数加权。
+BF16 Marlin 的 global 指数补偿为 `2^119`。Tensor Core 累加与中间舍入和原生
+SIMT 路径不同，不承诺逐 bit 等价。
+
+源权重独立分配，成功重排后释放；prefill/decode 共用一份 canonical 布局。
+显存不足以并存一层两种布局时使用 CPU staging。模型析构时清理 Marlin cache，
+准备失败且源权重仍在时保留原生回退；源布局释放后不允许静默回退。
+
+完整 Naive NVFP4、8×RTX 5090 按层执行、CUDA13.1/sm120f，
+`--max_batch 1 --mtp 0`、chunk512、16线程、context65536，关闭历史和前缀缓存。
+原生A1/A2先测，修订后的Marlin C1/C2随后测（同一会话，非交错）；
+每版两个进程，短/7.5K各4次正式请求、32K各2次，
+另有各场景预热。模型加载和预热不计入下表。
+
+| 输入 token | 原生 TTFT/s | Marlin TTFT/s | TTFT 加速 | 原生 decode tok/s | Marlin decode tok/s | decode 变化 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 56 | 0.2793 | 0.0778 | 3.59× | 67.96 | 66.89 | -1.56% |
+| 80 | 0.3966 | 0.0937 | 4.23× | 66.39 | 65.14 | -1.87% |
+| 7565 | 18.7200 | 6.6319 | 2.82× | 55.41 | 54.43 | -1.76% |
+| 32727 | 94.7551 | 47.0238 | 2.02× | 53.48 | 52.65 | -1.55% |
+
+12组真实层回放包含GPU路由、两个GEMM、激活与归约；prefill中位数
+13.8238→1.9685 ms，
+配对倍率中位数6.867×。算子native对照为此前同库同输入测量，
+上表为本轮原生完整模型测量。解码变化也保留在表中，不由微基准外推。
+18组BF16/FP16与FP64参考、18个Graph、12组真实层Graph、memcheck/synccheck及
+显存受限重排通过。固定代码生成通过980项检查；10个teacher-forced位置的完整词表
+logits有9/10个top-1相同，最大KL为0.19025634。
+Top-1分歧在开头换行token；中文生成措辞可能不同，代码功能检查通过。
+这些检查不构成广泛的模型质量评估。
+
+测量与接入元数据见 [JSON](benchmarks/naive_n05_marlin.json)。
+
+
+## 2026-10-01 Prefill GPU Top-K
+
+完整 Naive NVFP4 / 8×RTX 5090 按层，CUDA 13.1、BF16 激活与 KV、chunk 512、max_batch 1、MTP 0、16 CPU 线程、禁用 history/prefix cache。基线为已接入 Marlin 的版本，A/B/B/A 四进程，共 48 请求、28 正式采样。
+
+| 输入 tokens | 原 TTFT (s) | GPU Top-K TTFT (s) | 首 token 加速 | 原 / 新 decode (tok/s) |
+|---:|---:|---:|---:|---:|
+| 56 | 0.0779 | 0.0777 | 1.002× | 66.864 / 66.897 |
+| 80 | 0.0938 | 0.0938 | 1.000× | 65.101 / 65.150 |
+| 7565 | 6.6387 | 5.2775 | 1.258× | 54.421 / 53.855 |
+| 32727 | 47.0717 | 27.5670 | 1.708× | 52.656 / 50.963 |
+
+批量 Top-K 使用 CUDA 自带 CUB segmented radix sort，64 位 score/index 编码保留同分时 index 升序，±0 视作同分；每行独立因果结束位置排除未来 key，结果不足 topK 填 −1。删除 prefill 的 scores D2H、CPU partial_sort 和索引 CPU 往返；保持原 scores 运算与单 query decode 路径。无额外依赖或环境开关。512×32768 两个编码缓冲共 256 MiB，另有 CUB workspace；请求结束后的内存池保留量仅是快照，不等同于峰值。
+
+330 回归通过；10 组新旧完整 Indexer 索引逐 bit 相同；memcheck/racecheck/synccheck 各 45 用例零错误。完整模型测试文本全部与 Marlin 基线一致，代码场景各 980 检查通过。有效位置 NaN 不在旧 CPU 比较器的可靠语义内。长上下文解码小幅回退，不能宣称 decode 加速。
+
+三个 512-token prefill 波形窗口中的 Indexer CPU 选择和 CPU/GPU 往返已消失；decode 内部 14 步仍每 token 1282 kernels。数据见 [naive_n05_prefill_topk.json](benchmarks/naive_n05_prefill_topk.json)；完整脚本/波形/原始计时位于 `results/wan2-naive-prefill-topk-20261001/`（远端 `/mnt/disk_sdb/naive-prefill-topk-20261001/`）。
+
+
+## 2026-10-01 Prefill IndexScores
+
+在 Marlin + GPU 批量 Top-K 版本上继续优化。完整 Naive NVFP4，8×5090 按层、CUDA 13.1、BF16 激活/KV、chunk 512、max_batch 1、MTP 0、16 CPU 线程、禁用 history/prefix cache。A/B/B/A 四进程，48 请求、28 正式采样。
+
+| 输入 tokens | 原 TTFT (s) | 新 TTFT (s) | 加速 | 原 / 新 decode (tok/s) |
+|---:|---:|---:|---:|---:|
+| 56 | 0.0777 | 0.0778 | 0.999× | 66.890 / 66.877 |
+| 80 | 0.0936 | 0.0936 | 1.000× | 65.134 / 65.119 |
+| 7565 | 5.2794 | 5.0770 | 1.040× | 53.853 / 53.849 |
+| 32727 | 27.5625 | 25.1915 | 1.094× | 50.984 / 50.976 |
+
+新 IndexScoresPrefill 仅用于多 query、16 heads、dim 128。两个 16-lane 子组并行计算相邻 head；每线程保留原 lane 与 lane+16 的四项乘加，再重建原 warp 归约树，head 加权仍按原顺序。key 片段跨 head 复用。单 query 与其他 head 数保留原核；没有新依赖、环境开关、临时显存分配或额外 launch。
+
+原 330 回归通过；生产 CUDA 源码直接编译的 21 分数矩阵 +6 Graph 重放逐 bit 一致；独立编译上版完整 Indexer 的 18 组索引及 12 Graph 重放一致，包含 FP8 开关、不同 head 数、64K keys。三种 sanitizer 各 87 快速用例零错误。所有整模型测试文本相同，代码场景各 980 检查通过；整模型正式输入最长32727，64K仅算子验证。
+
+结果详见 [naive_n05_indexscores.json](benchmarks/naive_n05_indexscores.json)。生产 kernel 回归探针 `scores-plugin.cu`、完整 Indexer 对照 `differential-plugin.cu`、复现/波形/原始计时位于 `results/wan2-naive-indexscores-opt-20261001/`（远端 `/mnt/disk_sdb/naive-indexscores-opt-20261001/`）。
+
+
+## 2026-10-01 按请求预留 KV 容量
+
+参考 ChatGLM 的输入加输出预留方式，以及 Qwen4 对物理容量和逻辑长度的区分，
+Naive 的全局层现在按 `input_token_length + output_token_limit - 1` 预留。
+分块 prefill 使用 GenerationConfig 中完整请求的输入长度；最后一个输出 token 不再前向，故减一。
+预留提示受模型 max_positions、正值 tokensLimit 和 GetMaxTokens 限制，再按 128 token 对齐。
+这只是物理容量提示，不改变实际上下文限制，也不会截断已经存在的逻辑 KV。
+输出无上限时先预留完整输入；缺少输入长度元数据的直接调用/预热仍使用原有增量扩容。
+超出预留范围时仍可按原方式扩容。已有前缀容量不足时扩容一次并保留内容。
+
+SWA 只预留 `min(请求预留量, window - 1 + 本次块长)`，chunk512/window128 时为639，
+对齐后640；不会给39个滑窗层各分配整段长上下文。逻辑长度仍由实际追加和裁剪决定。
+普通前向和 MTP 的 target 前向均传递预留量；本轮完整模型验证固定 MTP0。
+无新依赖、环境变量或 CUDA kernel 改动。
+
+完整 Naive NVFP4/48层/8×RTX5090 按层、CUDA13.1、BF16激活/KV、chunk512、
+max_batch1、MTP0、context65536、16线程、禁用history/prefix cache。
+基线是上一轮 IndexScores 版本，ABBA四进程48请求、28正式采样，无并发编译、profiling或GPU轮询。
+
+| 输入 tokens | 旧 TTFT (s) | 预留后 TTFT (s) | 加速 | 旧 / 新 decode (tok/s) |
+|---:|---:|---:|---:|---:|
+| 56 | 0.0779 | 0.0778 | 1.000× | 66.908 / 66.862 |
+| 80 | 0.0937 | 0.0935 | 1.002× | 65.133 / 65.162 |
+| 7565 | 5.0694 | 4.9826 | 1.017× | 53.861 / 53.868 |
+| 32727 | 25.1898 | 24.7851 | 1.016× | 50.982 / 51.219 |
+
+336项回归通过，其中6项新增预留测试覆盖32K/64K边界、指针稳定、逻辑长度、完整内容、
+已有前缀和SWA裁剪；memcheck/racecheck/synccheck各51快速用例零错误。
+所有完整模型A/B输出及reasoning（含预热）一致，代码请求各980项检查通过。
+完整模型正式输入最长32727，64K仅KV回归；未扩大到其他生成设置或MTP端到端验证。
+
+32727输入/最多256输出的完整profile请求中，96份K/V都仅在第一块分配一次：
+9全局层各K/V33024容量，39滑窗层各K/V640容量。后续三个prefill采样窗口中
+KV Expansion均为0；其他工作区的分配计数单独保留在结果中。
+decode1..66覆盖32768边界也无KV扩容。
+旧版32K采样块有18对分配/释放。带工具host时间不作为原生性能数据。
+容量日志见 `nsys/control.allocations`，内存池快照不是峰值显存。
+
+结果见 [naive_n05_kv_reserve.json](benchmarks/naive_n05_kv_reserve.json)。
+复现脚本、增量/完整补丁、原始请求、回归日志和4段NSYS位于
+`results/wan2-naive-kv-reserve-20261001/`（远端 `/mnt/disk_sdb/naive-kv-reserve-20261001/`）。
+
+
+## 2026-10-02 代码整理与尺寸兼容性
+
+目标前向现在统一根据 GenerationConfig 计算请求 KV 预留，普通和 DSpark 调用只传原配置；
+移除重复计算和未使用的默认容量参数。单行及批量 Top-K 共用编码/解码 kernel，
+保留各自的 CUB radix/segmented radix 排序策略、同分索引顺序和因果范围，移除无用头文件。
+
+CUDA cache trim 保留16字节对齐的向量路径，为其他正值BF16行宽添加标量回退，
+沿列递增搬移保持原地重叠安全。RoPE和prefill AttentionValues按实际维度循环，
+不再把线程块大小误当成输出维度上限；覆盖384维。Indexer仍按128元素块执行量化，
+增加布局/类型/设备检查，非128块宽明确报错；16-head特化和其他head数量的原实现均保留。
+这不是对任意量化布局或所有GPU架构的支持声明。
+
+NVFP4 grouped Marlin的小批路由既可能按expert分组填充，也可能每条route占一个填充块。
+缓存容量现在覆盖两种布局以及之后更大请求的复用，不依赖Naive的256专家/top-k8。
+旧FP16 planar路径在16专家、batch9、top-k16下可写出原路由缓冲区；旧库memcheck复现19错误，
+新版相同边界和其他形状均零错误。本模型256专家配置下，每MoE层小批路由缓存额外约26.25KiB。
+
+相关路径没有遗留的实验环境开关，本轮没有新增或删除环境变量。
+FASTLLM_DSPARK_MODEL_PATH、FASTLLM_DSPARK_TOKENS和FASTLLM_DSPARK_CONFIDENCE_THRESHOLD
+仍由正式CLI选项设置，并由加载器/DSpark读取，
+属于有效配置接口，保留以免破坏现有选项。没有加入按模型名或固定设备编号选择优化的分支。
+
+验证：423项Naive回归；memcheck/racecheck/synccheck各62快速项零错误；
+22组Marlin与FP64参考（BF16/FP16、7/16专家、H/I为256/128及512/256、top-k1/2/3/7/8/16），
+各3次Graph重放逐bit相等，并通过完整memcheck。18组新旧Indexer索引及12次变化输入Graph逐bit一致，
+包含heads1/7/16/17、FP8开关、64Kkeys。RoPE64/192/384维、Attention value128/384维、
+cache7/13等非对齐宽度均覆盖；不支持的Indexer块宽验证会明确拒绝。
+
+完整Naive NVFP4/48层/8×RTX5090按层，CUDA13.1、BF16激活/KV、chunk512、context65536、
+max_batch1、MTP0、16线程、禁history/prefix cache；旧KV预留版与整理后版本ABBA，48请求28正式采样。
+无并发编译、profiling或GPU轮询。正式请求中位数：
+
+| 输入 tokens | 整理前 TTFT (s) | 整理后 TTFT (s) | 前 / 后 decode (tok/s) |
+|---:|---:|---:|---:|
+| 56 | 0.0778 | 0.0779 | 66.880 / 67.093 |
+| 80 | 0.0936 | 0.0939 | 65.162 / 65.366 |
+| 7565 | 4.9822 | 5.0159 | 53.872 / 54.045 |
+| 32727 | 24.7845 | 24.8515 | 51.205 / 51.384 |
+
+所有同场景output/reasoning含预热跨版本一致，代码请求各980项检查通过。硬件验证为RTX5090；
+完整模型测试固定MTP0，未扩展到MTP端到端或其他GPU架构。显存快照为请求后池保留量，不是峰值。
+详见 [naive_n05_cleanup.json](benchmarks/naive_n05_cleanup.json)。
+复现脚本/补丁/原始请求/回归及旧版越界日志在 `results/wan2-naive-code-cleanup-20261002/`
+（远端 `/mnt/disk_sdb/naive-code-cleanup-20261002/`）。

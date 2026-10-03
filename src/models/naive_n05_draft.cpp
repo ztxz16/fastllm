@@ -236,7 +236,7 @@ int NaiveN05FlashModel::ForwardDraft(
         limit = std::min(limit, config.output_token_limit - (oldLength - config.input_token_length) - 1);
     if (context.kv.empty() || inputIds.dims[1] != 1 || config.output_logits || constrained || limit <= 0) {
         TargetCapture capture;
-        Data logits = RunTarget(inputIds, positions, kv, &capture);
+        Data logits = RunTarget(inputIds, positions, kv, config, &capture);
         CommitDraftContext(capture, inputIds.dims[1], context, kv);
         if (isIntermediateChunkedPrefill) return 0;
         return SampleTarget(logits, kv, config, lastTokens, retLogits);
@@ -299,7 +299,7 @@ int NaiveN05FlashModel::ForwardDraft(
     Data verifyPos(FLOAT32, {1, (int)verifyIds.size()}, verifyPositions);
     TargetCapture capture;
     capture.verifying = true;
-    Data logits = RunTarget(verifyInput, verifyPos, kv, &capture);
+    Data logits = RunTarget(verifyInput, verifyPos, kv, config, &capture);
     samplingTokens = lastTokens.units.empty() ? LastTokensUnit(config.last_n) : lastTokens.units[0];
     int accepted = 0, next = -1;
     if (greedy) {

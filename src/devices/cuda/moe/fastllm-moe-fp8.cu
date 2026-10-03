@@ -2210,6 +2210,132 @@ __global__ void FastllmGemvTypedNVFP4Block16TopKDownReduceKernel(T *A, uint8_t *
     }
 }
 
+// Single-token BF16 packed NVFP4 path for Naive's 4096/2048, top-8 MoE.
+// Preserve the pseudo-BF16 dot order: ordinary FP4 products differ on underflow.
+// Share the specialization contract between launch dispatch and both kernels.
+struct FastllmMoeNVFP4PackedDecodeConfig {
+    static constexpr int hidden = 4096;
+    static constexpr int inter = 2048;
+    static constexpr int topk = 8;
+    static constexpr int groupThreads = 64;
+    static constexpr int warpThreads = 32;
+    static constexpr int valuesPerThread = 4;
+    static constexpr int inputStride = groupThreads * valuesPerThread;
+    static constexpr int downThreads = topk * groupThreads;
+    static constexpr int blockValues = 16;
+    static constexpr int blockBytes = 9;
+    static constexpr int headerBytes = sizeof(float);
+    static constexpr int gateRowBytes = headerBytes + hidden / blockValues * blockBytes;
+    static constexpr int downRowBytes = headerBytes + inter / blockValues * blockBytes;
+    static_assert(groupThreads == 2 * warpThreads, "Packed decode reduction requires two warps");
+};
+
+struct FastllmMoeNVFP4PackedFour {
+    unsigned bits;
+    float scale;
+};
+
+__device__ __forceinline__ FastllmMoeNVFP4PackedFour FastllmMoeNVFP4LoadPackedFour(
+        const uint8_t *row, int i, float header) {
+    using Config = FastllmMoeNVFP4PackedDecodeConfig;
+    const uint8_t *block = row + Config::headerBytes + (i >> 4) * Config::blockBytes;
+    int offset = (i & 15) >> 1;
+    __nv_fp8_e4m3 scale;
+    scale.__x = block[8];
+    return {unsigned(block[offset]) | (unsigned(block[offset + 1]) << 8),
+            __fmul_rn(float(scale), header)};
+}
+
+__device__ __forceinline__ void FastllmMoeNVFP4AccumulatePackedFour(
+        float a0, float a1, float a2, float a3, FastllmMoeNVFP4PackedFour w, float &sum) {
+    float partial = 0;
+    partial += a0 * FastllmMoeNVFP4PseudoBFloat16ToFloat(w.bits & 15);
+    partial += a1 * FastllmMoeNVFP4PseudoBFloat16ToFloat((w.bits >> 4) & 15);
+    partial += a2 * FastllmMoeNVFP4PseudoBFloat16ToFloat((w.bits >> 8) & 15);
+    partial += a3 * FastllmMoeNVFP4PseudoBFloat16ToFloat((w.bits >> 12) & 15);
+    sum += (partial * FastllmMoeNVFP4MagicScale()) * w.scale;
+}
+
+__device__ __forceinline__ float FastllmMoeNVFP4OrderedWarpReduce(float value) {
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value += __shfl_down_sync(0xffffffffu, value, offset);
+    }
+    return value;
+}
+
+__global__ void FastllmGemvBFloat16NVFP4PackedTopKSwigluIndexedKernel(
+        __nv_bfloat16 *input, const int32_t *indices, uint8_t **weights,
+        __nv_bfloat16 *output, int m, int k, int perRow) {
+    using Config = FastllmMoeNVFP4PackedDecodeConfig;
+    __shared__ float gatePartial[Config::groupThreads], upPartial[Config::groupThreads];
+    int tid = threadIdx.x, row = blockIdx.x, slot = blockIdx.y;
+    const uint8_t *gateRow = weights[indices[slot]] + (size_t)row * perRow;
+    const uint8_t *upRow = gateRow + (size_t)k * perRow;
+    // Hoist the row headers and share the four input values between gate/up.
+    float gateHeader = *(const float *)gateRow, upHeader = *(const float *)upRow;
+    float gateSum = 0, upSum = 0;
+    for (int base = 0; base < m / Config::inputStride; ++base) {
+        int i = tid * Config::valuesPerThread + base * Config::inputStride;
+        auto gateWeight = FastllmMoeNVFP4LoadPackedFour(gateRow, i, gateHeader);
+        auto upWeight = FastllmMoeNVFP4LoadPackedFour(upRow, i, upHeader);
+        float a0 = __bfloat162float(input[i]), a1 = __bfloat162float(input[i + 1]);
+        float a2 = __bfloat162float(input[i + 2]), a3 = __bfloat162float(input[i + 3]);
+        FastllmMoeNVFP4AccumulatePackedFour(a0, a1, a2, a3, gateWeight, gateSum);
+        FastllmMoeNVFP4AccumulatePackedFour(a0, a1, a2, a3, upWeight, upSum);
+    }
+    // Pair lanes 0..31 with 32..63 before the warp tree, matching the original
+    // 64-lane shared-memory reduction bit for bit.
+    gatePartial[tid] = gateSum;
+    upPartial[tid] = upSum;
+    __syncthreads();
+    if (tid < Config::warpThreads) {
+        gateSum = FastllmMoeNVFP4OrderedWarpReduce(gatePartial[tid] + gatePartial[tid + Config::warpThreads]);
+        upSum = FastllmMoeNVFP4OrderedWarpReduce(upPartial[tid] + upPartial[tid + Config::warpThreads]);
+        if (tid == 0) {
+            float gate = FastllmMoeFp8Round<__nv_bfloat16>(gateSum);
+            float up = FastllmMoeFp8Round<__nv_bfloat16>(upSum);
+            output[(size_t)slot * k + row] = __float2bfloat16_rn((gate / (1.f + expf(-gate))) * up);
+        }
+    }
+}
+
+__global__ void FastllmGemvBFloat16NVFP4PackedTopKDownReduceIndexedKernel(
+        __nv_bfloat16 *input, const int32_t *indices, uint8_t **weights,
+        __nv_bfloat16 *output, const float *scores, int topk, int m, int perRow) {
+    using Config = FastllmMoeNVFP4PackedDecodeConfig;
+    __shared__ float partials[Config::downThreads], expertOutput[Config::topk];
+    int tid = threadIdx.x, slot = tid / Config::groupThreads, lane = tid % Config::groupThreads, row = blockIdx.x;
+    const uint8_t *weightRow = weights[indices[slot]] + (size_t)row * perRow;
+    const __nv_bfloat16 *expertInput = input + (size_t)slot * m;
+    float header = *(const float *)weightRow, sum = 0;
+    for (int base = 0; base < m / Config::inputStride; ++base) {
+        int i = lane * Config::valuesPerThread + base * Config::inputStride;
+        auto weight = FastllmMoeNVFP4LoadPackedFour(weightRow, i, header);
+        float a0 = __bfloat162float(expertInput[i]), a1 = __bfloat162float(expertInput[i + 1]);
+        float a2 = __bfloat162float(expertInput[i + 2]), a3 = __bfloat162float(expertInput[i + 3]);
+        FastllmMoeNVFP4AccumulatePackedFour(a0, a1, a2, a3, weight, sum);
+    }
+    partials[tid] = sum;
+    __syncthreads();
+    if (lane < Config::warpThreads) {
+        sum = FastllmMoeNVFP4OrderedWarpReduce(partials[tid] + partials[tid + Config::warpThreads]);
+        if (lane == 0) {
+            expertOutput[slot] = FastllmMoeFp8Round<__nv_bfloat16>(sum) * scores[slot];
+        }
+    }
+    // Store rounded, weighted expert values before the ordered slot sum;
+    // combining the multiply with that sum would change FP32 rounding.
+    __syncthreads();
+    if (tid == 0) {
+        float result = 0;
+        for (int i = 0; i < topk; ++i) {
+            result += expertOutput[i];
+        }
+        output[row] = __float2bfloat16_rn(result);
+    }
+}
+
 template <fastllm::DataType SCALE_FORMAT, typename T, int THREAD_PER_BLOCK>
 __global__ void FastllmGemvTypedNVFP4Block16TopKSwigluIndexedKernel(T *A, const int32_t *indices,
                                                                     uint8_t **weights, T *C,
@@ -4092,6 +4218,16 @@ static void LaunchFastllmGemmTypedNVFP4TopKSwigluIndexed(T *input, const int32_t
                                                          uint8_t **weights, T *output,
                                                          int topk, int m, int k, int perRow) {
     dim3 grid(k, topk);
+    if constexpr (SCALE_FORMAT == fastllm::DataType::NVFP4_BLOCK_16_E4M3_PACKED &&
+                  std::is_same_v<T, __nv_bfloat16>) {
+        using Config = FastllmMoeNVFP4PackedDecodeConfig;
+        if (topk == Config::topk && m == Config::hidden && k == Config::inter &&
+            perRow == Config::gateRowBytes) {
+            FastllmGemvBFloat16NVFP4PackedTopKSwigluIndexedKernel<<<grid, Config::groupThreads>>>(
+                input, indices, weights, output, m, k, perRow);
+            return;
+        }
+    }
     FastllmGemvTypedNVFP4Block16TopKSwigluIndexedKernel<SCALE_FORMAT, T, 64> <<< grid, 64 >>>(
         input, indices, weights, output, topk, m, k, perRow);
 }
@@ -4101,6 +4237,16 @@ static void LaunchFastllmGemmTypedNVFP4TopKDownReduceIndexed(T *input, const int
                                                              uint8_t **weights, T *output,
                                                              const float *scores, int topk, int m, int k,
                                                              int perRow) {
+    if constexpr (SCALE_FORMAT == fastllm::DataType::NVFP4_BLOCK_16_E4M3_PACKED &&
+                  std::is_same_v<T, __nv_bfloat16>) {
+        using Config = FastllmMoeNVFP4PackedDecodeConfig;
+        if (topk == Config::topk && m == Config::inter && k == Config::hidden &&
+            perRow == Config::downRowBytes) {
+            FastllmGemvBFloat16NVFP4PackedTopKDownReduceIndexedKernel<<<k, Config::downThreads>>>(
+                input, indices, weights, output, scores, topk, m, perRow);
+            return;
+        }
+    }
     if (topk > 0 && topk <= 16) {
         constexpr int groupThreads = 64;
         FastllmGemvTypedNVFP4Block16TopKDownReduceIndexedParallelKernel<

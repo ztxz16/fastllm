@@ -4,6 +4,7 @@
 #include "json11.hpp"
 #include "utils.h"
 #include <cmath>
+#include <climits>
 #ifdef USE_CUDA
 #include "devices/cuda/naive-n05-cuda.cuh"
 #include "devices/cuda/fastllm-cuda.cuh"
@@ -29,14 +30,30 @@ namespace {
     }
 }
 
-void NaiveN05FlashModel::AppendCache(Data &cache, Data &input) {
+int NaiveN05FlashModel::CacheReserveCapacity(const GenerationConfig &config) const {
+    // Like ChatGLM, reserve the request's prompt and bounded output in one
+    // allocation. Chunked prefill must use the full prompt length supplied by
+    // GenerationConfig, not the current chunk. Warmup/direct calls without
+    // this metadata keep the existing incremental allocation path.
+    if (config.input_token_length <= 0) return 0;
+    int64_t capacity = config.input_token_length;
+    if (config.output_token_limit > 0) capacity += (int64_t)config.output_token_limit - 1;
+    int limit = max_positions;
+    if (tokensLimit > 0) limit = std::min(limit, tokensLimit);
+    if (GetMaxTokens() > 0) limit = std::min(limit, GetMaxTokens());
+    return (int)std::min<int64_t>(capacity, limit);
+}
+
+void NaiveN05FlashModel::AppendCache(Data &cache, Data &input, int reserveCapacity) {
     int oldLength = cache.dims.empty() ? 0 : cache.dims[1];
     int length = oldLength + input.dims[1];
     cache.dataType = input.dataType;
     cache.UpdateUnitSize();
     cache.ToDevice(input.dataDevice, input.dataDeviceIds);
-    if (cache.expansionDims.empty() || cache.expansionDims[1] < length) {
-        cache.Expansion({1, ((length + 127) / 128) * 128, input.dims[2]});
+    const int64_t wanted = std::max(length, reserveCapacity);
+    if (cache.expansionDims.empty() || cache.expansionDims[1] < wanted) {
+        const int capacity = (int)std::min<int64_t>(INT_MAX, (wanted + 127) / 128 * 128);
+        cache.Expansion({1, capacity, input.dims[2]});
     }
     CatDirect(cache, input, 1);
     cache.isKVCache = true;
@@ -144,6 +161,20 @@ NaiveN05FlashModel::GetTensorMap(const std::vector<std::string> &names) {
         return name.find(".mlp.experts.") != std::string::npos &&
                (StringEndWith(name, ".weight_scale") || StringEndWith(name, ".weight_scale_2"));
     });
+    auto usesCuda = [](const std::map<std::string, int> &devices) {
+        return std::any_of(devices.begin(), devices.end(), [](const auto &device) {
+            return device.first.rfind("cuda", 0) == 0 ||
+                   device.first.rfind("multicuda", 0) == 0;
+        });
+    };
+    // Keep original E4M3 scales in the packed CUDA source layout. Grouped
+    // Marlin validates and replaces it once during warmup; unsupported
+    // layouts retain the native kernels and independent gate/up globals.
+    // CPU/NUMA keeps the original compact checkpoint layout.
+    const bool cudaExperts = usesCuda(moeDeviceMap.empty() ? deviceMap : moeDeviceMap) ||
+                            (moeDeviceLayers >= 0 && usesCuda(layeredMoeDeviceMap));
+    const DataType nvfp4Type = cudaExperts ? DataType::NVFP4_BLOCK_16_E4M3_PACKED :
+                                          DataType::NVFP4_BLOCK_16_E4M3;
     for (auto &name : names) {
         if (draftEnabled && (name.rfind("layers.", 0) == 0 ||
                 name.rfind("markov_head.", 0) == 0 || name.rfind("confidence_head.", 0) == 0 ||
@@ -153,9 +184,7 @@ NaiveN05FlashModel::GetTensorMap(const std::vector<std::string> &names) {
                          name.rfind("confidence_head.", 0) == 0) ? DataType::FLOAT32 : DataType::BFLOAT16;
             result[name] = {{"dspark." + name, type}};
         } else if (compactNvfp4 && moeLinears.count(name)) {
-            // Preserve the E4M3 scale bytes for NUMA's compact grouped kernel.
-            // The loader checks the source dtype before using this layout.
-            result[name] = {{name, DataType::NVFP4_BLOCK_16_E4M3}};
+            result[name] = {{name, nvfp4Type}};
         } else if (name.find(".mlp.gate.") != std::string::npos) {
             result[name] = {{name, DataType::FLOAT32}};
         } else if (name.find(".mlp.experts.") == std::string::npos &&
@@ -178,14 +207,15 @@ int NaiveN05FlashModel::Forward(
         std::vector<float> *retLogits) {
     if (draftEnabled)
         return ForwardDraft(inputIds, positionIds, pastKeyValues, generationConfig, lastTokens, retLogits);
-    Data logits = RunTarget(inputIds, positionIds, pastKeyValues, nullptr);
+    Data logits = RunTarget(inputIds, positionIds, pastKeyValues, generationConfig, nullptr);
     if (isIntermediateChunkedPrefill) return 0;
     return SampleTarget(logits, pastKeyValues, generationConfig, lastTokens, retLogits);
 }
 
 Data NaiveN05FlashModel::RunTarget(
         const Data &inputIds, const Data &positionIds,
-        std::vector<std::pair<Data, Data>> &pastKeyValues, TargetCapture *capture) {
+        std::vector<std::pair<Data, Data>> &pastKeyValues, const GenerationConfig &config,
+        TargetCapture *capture) {
 #ifndef USE_CUDA
     ErrorInFastLLM("Naive-N0.5 currently requires the CUDA backend for attention.");
     return Data();
@@ -196,6 +226,7 @@ Data NaiveN05FlashModel::RunTarget(
                     (int)pastKeyValues.size() == block_cnt,
                     "Naive-N0.5 expects one unpadded sequence and a complete KV cache.");
     int length = inputIds.dims[1];
+    const int reserveCapacity = CacheReserveCapacity(config);
     const int previousExactThreshold = FastllmCudaGetLinearExactBatchThreshold();
     struct RestoreExactThreshold {
         int value;
@@ -251,9 +282,8 @@ Data NaiveN05FlashModel::RunTarget(
         AssertInFastLLM(q.dataDevice == DataDevice::CUDA,
                         "Naive-N0.5 attention requires --device cuda.");
         positions.ToDevice(q.dataDevice, q.dataDeviceIds);
-        FastllmCudaNaiveRope(q, positions, cfg.heads, cfg.headDim, rotaryDim, cfg.theta);
-        FastllmCudaNaiveRope(k, positions, cfg.kvHeads, cfg.headDim, rotaryDim, cfg.theta);
-        Mul(v, valueScale, v);
+        FastllmCudaNaiveRopeQKScaleV(q, k, v, positions, cfg.heads, cfg.kvHeads,
+            cfg.headDim, cfg.valueDim, rotaryDim, cfg.theta, valueScale);
         if (!slidingLayers[layer]) {
             std::string ip = ap + "indexer.";
             Linear(normed, weight[ip + "wk.weight"], Data(), indexKey);
@@ -274,8 +304,13 @@ Data NaiveN05FlashModel::RunTarget(
         auto &pastKey = pastKeyValues[layer].first;
         auto &pastValue = pastKeyValues[layer].second;
         int localPast = pastKey.dims.empty() ? 0 : pastKey.dims[1];
-        AppendCache(pastKey, packed);
-        AppendCache(pastValue, v);
+        // Sliding layers retain only window-1 rows between chunks. Keep their
+        // reservation bounded even when the full request is very long.
+        const int layerCapacity = slidingLayers[layer]
+            ? (int)std::min<int64_t>(reserveCapacity, (int64_t)window - 1 + length)
+            : reserveCapacity;
+        AppendCache(pastKey, packed, layerCapacity);
+        AppendCache(pastValue, v, layerCapacity);
         Data noIndices;
         Data *selected = &noIndices;
         if (!slidingLayers[layer] && pastKey.dims[1] > indexTopK) {
@@ -297,8 +332,7 @@ Data NaiveN05FlashModel::RunTarget(
                                   cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
                                   localPast, slidingLayers[layer] ? window : 0, attn);
         if (slidingLayers[layer] && (!capture || !capture->verifying)) {
-            TrimCache(pastKey, window - 1);
-            TrimCache(pastValue, window - 1);
+            FastllmCudaNaiveTrimCache(pastKey, pastValue, window - 1);
         }
         Linear(attn, weight[ap + "o_proj.weight"], Data(), projected);
         AddTo(hidden, projected);

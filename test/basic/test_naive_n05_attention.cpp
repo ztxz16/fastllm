@@ -121,7 +121,7 @@ static float FP8(float x) {
     }
     return std::copysign(best, x);
 }
-static void TestIndexer(bool zeroWeights, bool fp8, int queries = 3, int keys = 2060,
+static void TestIndexer(bool zeroWeights, bool fp8Query, int queries = 3, int keys = 2060,
                         int topK = 2048) {
     const int heads = 4, dim = 128, past = keys - queries;
     const int stride = 2 * 192 + dim;
@@ -132,7 +132,7 @@ static void TestIndexer(bool zeroWeights, bool fp8, int queries = 3, int keys = 
     Upload(qd, {1, queries, heads * dim}, q);
     Upload(kd, {1, keys, stride}, k);
     Upload(wd, {1, queries, heads}, w);
-    FastllmCudaNaiveIndexer(qd, wd, kd, heads, dim, past, topK, fp8, indices);
+    FastllmCudaNaiveIndexer(qd, wd, kd, heads, dim, past, topK, fp8Query, indices);
     indices.ToDevice(DataDevice::CPU);
     if (queries > 32) {
         // Compare every index, including tie order and -1 padding, against
@@ -142,21 +142,20 @@ static void TestIndexer(bool zeroWeights, bool fp8, int queries = 3, int keys = 
         auto *pool = GetAlivePool();
         auto active = pool->curActivateThreadInterval;
         pool->curActivateThreadInterval = {active.first, active.first + 1};
-        FastllmCudaNaiveIndexer(qd, wd, kd, heads, dim, past, topK, fp8, indices);
+        FastllmCudaNaiveIndexer(qd, wd, kd, heads, dim, past, topK, fp8Query, indices);
         pool->curActivateThreadInterval = active;
         indices.ToDevice(DataDevice::CPU);
         Require(std::equal(parallel.begin(), parallel.end(), (int *)indices.cpuData),
                 "parallel indexer differs from serial indexer");
     }
     auto roundRow = [&](float *x) {
-        if (!fp8) return;
+        if (!fp8Query) return;
         float scale = 1e-4f;
         for (int d = 0; d < dim; d++) scale = std::max(scale, std::abs(x[d]));
         scale /= 448;
         for (int d = 0; d < dim; d++) x[d] = FP8(x[d] / scale) * scale;
     };
     for (int row = 0; row < queries * heads; row++) roundRow(q.data() + row * dim);
-    for (int t = 0; t < keys; t++) roundRow(k.data() + t * stride + stride - dim);
     for (int row = 0; row < queries; row++) {
         std::vector<double> scores(past + row + 1);
         for (int t = 0; t <= past + row; t++) for (int h = 0; h < heads; h++) {
@@ -190,13 +189,23 @@ int main() {
         TestAttention(127, 128, false, true);
         TestAttention(7, 0, false, false);
         TestAttention(2057, 0, true, false);
-        TestAttention(127, 128, false, true, 1);
+        TestAttention(2057, 0, true, false, 1);
+        // Exercise the single-query SWA path at warp and window boundaries,
+        // with and without an attention sink. Prefill and sparse paths below
+        // retain their independent reference checks.
+        for (int past : {0, 1, 6, 30, 31, 32, 62, 63, 64, 79, 126, 127}) {
+            TestAttention(past, 128, false, false, 1);
+            TestAttention(past, 128, false, true, 1);
+        }
         TestAttention(255, 0, false, false, 1);
         TestAttention(256, 0, false, true, 1);
         TestAttention(0, 128, false, true, 54);
         TestIndexer(true, true);
         TestIndexer(false, true);
         TestIndexer(false, false);
+        TestIndexer(true, true, 1);
+        TestIndexer(false, true, 1);
+        TestIndexer(false, false, 1);
         auto *pool = GetAlivePool();
         auto active = pool->curActivateThreadInterval;
         pool->curActivateThreadInterval = {1, 4};

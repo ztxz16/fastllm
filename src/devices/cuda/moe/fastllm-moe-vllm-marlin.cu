@@ -124,15 +124,21 @@ static MarlinMoeKernelFn GetNvfp4E4M3MarlinMoeKernelImpl(
 }
 
 template <bool Gate>
-static MarlinMoeKernelFn GetBf16Nvfp4MarlinMoeKernel(bool smallBatch, int &threads) {
+static MarlinMoeKernelFn GetBf16Nvfp4MarlinMoeKernel(
+        bool smallBatch, bool narrowPrefill, int &threads) {
+    threads = (smallBatch || narrowPrefill) ? 256 : 128;
     if (smallBatch) {
-        threads = 256;
         return marlin_kernel::Marlin<
             marlin_types::kBFloat16.id(), marlin_types::kFE2M1f.id(),
             marlin_types::kBFloat16.id(), marlin_types::kFE4M3fn.id(),
             256, 1, 8, 8, true, 4, 1, false, Gate>;
     }
-    threads = 128;
+    if (narrowPrefill) {
+        return marlin_kernel::Marlin<
+            marlin_types::kBFloat16.id(), marlin_types::kFE2M1f.id(),
+            marlin_types::kBFloat16.id(), marlin_types::kFE4M3fn.id(),
+            256, 1, 16, 4, false, 4, 1, false, Gate>;
+    }
     return marlin_kernel::Marlin<
         marlin_types::kBFloat16.id(), marlin_types::kFE2M1f.id(),
         marlin_types::kBFloat16.id(), marlin_types::kFE4M3fn.id(),
@@ -147,17 +153,22 @@ static bool Nvfp4MarlinIsSm75(int device) {
 }
 
 static MarlinMoeKernelFn GetNvfp4E4M3MarlinMoeKernel(
-        bool gate, bool smallBatch, int &threads, bool bf16 = false) {
-    if (bf16) return gate ? GetBf16Nvfp4MarlinMoeKernel<true>(smallBatch, threads)
-                          : GetBf16Nvfp4MarlinMoeKernel<false>(smallBatch, threads);
+        bool gate, bool smallBatch, int &threads, bool bf16 = false,
+        bool narrowPrefill = false) {
+    if (bf16) {
+        return gate
+            ? GetBf16Nvfp4MarlinMoeKernel<true>(smallBatch, narrowPrefill, threads)
+            : GetBf16Nvfp4MarlinMoeKernel<false>(smallBatch, narrowPrefill, threads);
+    }
     return Nvfp4MarlinIsSm75(FastllmCudaGetDevice())
         ? GetNvfp4E4M3MarlinMoeKernelImpl<2>(gate, smallBatch, threads)
         : GetNvfp4E4M3MarlinMoeKernelImpl<4>(gate, smallBatch, threads);
 }
 
 static int GetNvfp4E4M3MarlinMoeSharedMemorySize(
-        bool gate, bool smallBatch, bool bf16 = false) {
-    if (bf16) return smallBatch ? 45184 : 35328;
+        bool gate, bool smallBatch, bool bf16 = false,
+        bool narrowPrefill = false) {
+    if (bf16) return smallBatch ? 45184 : (narrowPrefill ? 45312 : 35328);
     if (Nvfp4MarlinIsSm75(FastllmCudaGetDevice())) {
         return smallBatch ? 22656 : (gate ? 53248 : 18432);
     }
@@ -270,13 +281,15 @@ static bool PrepareNvfp4E4M3MarlinMoeKernels(int device, bool bf16 = false) {
         maxSharedMemory <= 0) {
         return false;
     }
-    for (bool smallBatch : {false, true}) {
+    for (int configuration = 0; configuration < (bf16 ? 3 : 2); ++configuration) {
+        const bool smallBatch = configuration == 0;
+        const bool narrowPrefill = configuration == 2;
         for (bool gate : {true, false}) {
             int threads = 0;
-            MarlinMoeKernelFn kernel =
-                GetNvfp4E4M3MarlinMoeKernel(gate, smallBatch, threads, bf16);
-            int sharedMemory =
-                GetNvfp4E4M3MarlinMoeSharedMemorySize(gate, smallBatch, bf16);
+            MarlinMoeKernelFn kernel = GetNvfp4E4M3MarlinMoeKernel(
+                gate, smallBatch, threads, bf16, narrowPrefill);
+            int sharedMemory = GetNvfp4E4M3MarlinMoeSharedMemorySize(
+                gate, smallBatch, bf16, narrowPrefill);
             if (kernel == nullptr || sharedMemory > maxSharedMemory ||
                 cudaFuncSetAttribute(
                     kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -365,10 +378,11 @@ static bool LaunchNvfp4E4M3MarlinMoe(
         const int32_t *sortedTokenIds, const int32_t *expertIds,
         const int32_t *numTokensPadded, const float *topkWeights,
         int topk, bool multiplyTopkWeights, int rows, int outputColumns,
-        int inputColumns, int *workspace, cudaStream_t stream, int sms, bool bf16) {
+        int inputColumns, int *workspace, cudaStream_t stream, int sms,
+        bool bf16, bool narrowPrefill) {
     int threads = 0;
-    MarlinMoeKernelFn kernel =
-        GetNvfp4E4M3MarlinMoeKernel(gate, smallBatch, threads, bf16);
+    MarlinMoeKernelFn kernel = GetNvfp4E4M3MarlinMoeKernel(
+        gate, smallBatch, threads, bf16, narrowPrefill);
     if (kernel == nullptr || activation == nullptr || weight == nullptr ||
         output == nullptr || temporaryOutput == nullptr || scales == nullptr ||
         globalScale == nullptr || sortedTokenIds == nullptr ||
@@ -379,9 +393,10 @@ static bool LaunchNvfp4E4M3MarlinMoe(
         return false;
     }
 
-    const int blocksPerSm = gate ? 1 : 2;
+    const int blocksPerSm = narrowPrefill ? 2 : (gate ? 1 : 2);
     kernel<<<sms * blocksPerSm, threads,
-             GetNvfp4E4M3MarlinMoeSharedMemorySize(gate, smallBatch, bf16),
+             GetNvfp4E4M3MarlinMoeSharedMemorySize(
+                 gate, smallBatch, bf16, narrowPrefill),
              stream>>>(
         reinterpret_cast<const int4 *>(activation),
         reinterpret_cast<const int4 *>(weight),
@@ -3428,8 +3443,16 @@ static bool RunNvfp4E4M3MarlinMoe(
 
     const int routes = batch * topk;
     const bool smallBatch = routes <= cache->experts * (bf16 ? 4 : 16);
-    const int gateBlock = smallBatch ? 8 : (bf16 ? 32 : 64);
-    const int downBlock = smallBatch ? 8 : 32;
+    // Sparse prefill routing wastes rows in the 32-row tile. The 16x256x64
+    // tile reduces padding and reuses each activation across more columns.
+    // Each gate/up half must be 256-column aligned because it has its own
+    // global scale; the down projection needs the same output alignment.
+    // Keep the small-batch layout unchanged.
+    const bool narrowPrefill = bf16 && !smallBatch &&
+        routes <= cache->experts * 16 && cache->hidden % 256 == 0 &&
+        cache->intermediate % 256 == 0;
+    const int downBlock = smallBatch ? 8 : (narrowPrefill ? 16 : 32);
+    const int gateBlock = bf16 ? downBlock : (smallBatch ? 8 : 64);
     AwqMarlinRouteStorage *routeStorage =
         EnsureNvfp4E4M3RuntimeCapacity(
             *cache, routes, smallBatch, gateBlock, downBlock);
@@ -3506,7 +3529,7 @@ static bool RunNvfp4E4M3MarlinMoe(
             routeStorage->sortedTokenIds, routeStorage->gateExpertIds,
             routeStorage->numTokensPadded, scores, topk, false,
             batch, cache->intermediate * 2, cache->hidden,
-            cache->workspace, stream, cache->sms, bf16)) {
+            cache->workspace, stream, cache->sms, bf16, narrowPrefill)) {
         FailNvfp4E4M3MarlinAfterRepack(
             "gate/up Marlin launch", cache.get());
     }
@@ -3532,7 +3555,7 @@ static bool RunNvfp4E4M3MarlinMoe(
             routeStorage->sortedTokenIds, routeStorage->downExpertIds,
             routeStorage->numTokensPadded, scores, 1, !bf16,
             routes, cache->hidden, cache->intermediate,
-            cache->workspace, stream, cache->sms, bf16)) {
+            cache->workspace, stream, cache->sms, bf16, narrowPrefill)) {
         FailNvfp4E4M3MarlinAfterRepack(
             "down Marlin launch", cache.get());
     }

@@ -1,0 +1,420 @@
+{
+  "libraries": {
+    "baseline": "71959072b749da92c82a2c132f32a1ce4efbaded5e834fc45e3102efb0b0506b",
+    "fixed": "a471a1b9d08f7b42eb4f39715a98a5696080ff29f7165031468ac85c036f2555"
+  },
+  "order": [
+    "A1",
+    "B1",
+    "B2",
+    "A2"
+  ],
+  "cases": [
+    {
+      "case": "explanation",
+      "input_tokens": 56,
+      "baseline": {
+        "samples": 4,
+        "ttft_seconds": 0.07780137995723635,
+        "ttft_range": [
+          0.07762351998826489,
+          0.0781435199896805
+        ],
+        "decode_tok_s": 66.87971605518322,
+        "decode_range": [
+          66.86584680003537,
+          66.89992895324853
+        ],
+        "output_sha256": [
+          "df953f35789e40435c23416e2689d828374ec010795fd1ba65de8cb25ce19c00"
+        ],
+        "output_tokens": [
+          60
+        ],
+        "code_check": null
+      },
+      "fixed": {
+        "samples": 4,
+        "ttft_seconds": 0.07794752001063898,
+        "ttft_range": [
+          0.0778447599732317,
+          0.07835851999698207
+        ],
+        "decode_tok_s": 67.09315901670942,
+        "decode_range": [
+          67.0544032607307,
+          67.11420695117332
+        ],
+        "output_sha256": [
+          "df953f35789e40435c23416e2689d828374ec010795fd1ba65de8cb25ce19c00"
+        ],
+        "output_tokens": [
+          60
+        ],
+        "code_check": null
+      },
+      "ttft_speedup": 0.9981251481332224,
+      "ttft_reduction_pct": -0.18783735389136247,
+      "decode_change_pct": 0.31914453905588225
+    },
+    {
+      "case": "context-short",
+      "input_tokens": 80,
+      "baseline": {
+        "samples": 4,
+        "ttft_seconds": 0.09362987999338657,
+        "ttft_range": [
+          0.09349191997898743,
+          0.09371027996530756
+        ],
+        "decode_tok_s": 65.16195605105983,
+        "decode_range": [
+          65.13533743961479,
+          65.20634374877265
+        ],
+        "output_sha256": [
+          "625647b8667c3c81662fd1a28ece2a83d34ca6ef80c407b16b1832bfd0010951"
+        ],
+        "output_tokens": [
+          69
+        ],
+        "code_check": {
+          "passed": true,
+          "checks": 980
+        }
+      },
+      "fixed": {
+        "samples": 4,
+        "ttft_seconds": 0.09390472000814043,
+        "ttft_range": [
+          0.09365000005345792,
+          0.09401532000629231
+        ],
+        "decode_tok_s": 65.36649306246707,
+        "decode_range": [
+          65.33753717657915,
+          65.38583005320224
+        ],
+        "output_sha256": [
+          "625647b8667c3c81662fd1a28ece2a83d34ca6ef80c407b16b1832bfd0010951"
+        ],
+        "output_tokens": [
+          69
+        ],
+        "code_check": {
+          "passed": true,
+          "checks": 980
+        }
+      },
+      "ttft_speedup": 0.9970732034052171,
+      "ttft_reduction_pct": -0.2935387878028717,
+      "decode_change_pct": 0.31389022644896514
+    },
+    {
+      "case": "context-7k5",
+      "input_tokens": 7565,
+      "baseline": {
+        "samples": 4,
+        "ttft_seconds": 4.982221240003128,
+        "ttft_range": [
+          4.981012959964573,
+          4.984313760010991
+        ],
+        "decode_tok_s": 53.87187664370875,
+        "decode_range": [
+          53.835205812221886,
+          53.89380694472936
+        ],
+        "output_sha256": [
+          "625647b8667c3c81662fd1a28ece2a83d34ca6ef80c407b16b1832bfd0010951"
+        ],
+        "output_tokens": [
+          69
+        ],
+        "code_check": {
+          "passed": true,
+          "checks": 980
+        }
+      },
+      "fixed": {
+        "samples": 4,
+        "ttft_seconds": 5.01587108001695,
+        "ttft_range": [
+          5.014220119977836,
+          5.016398079984356
+        ],
+        "decode_tok_s": 54.04519257236612,
+        "decode_range": [
+          54.0206213881915,
+          54.08658339209435
+        ],
+        "output_sha256": [
+          "625647b8667c3c81662fd1a28ece2a83d34ca6ef80c407b16b1832bfd0010951"
+        ],
+        "output_tokens": [
+          69
+        ],
+        "code_check": {
+          "passed": true,
+          "checks": 980
+        }
+      },
+      "ttft_speedup": 0.9932913267751473,
+      "ttft_reduction_pct": -0.6753983493073656,
+      "decode_change_pct": 0.32171875096096425
+    },
+    {
+      "case": "context-32k",
+      "input_tokens": 32727,
+      "baseline": {
+        "samples": 2,
+        "ttft_seconds": 24.78449397996883,
+        "ttft_range": [
+          24.78066275996389,
+          24.78832519997377
+        ],
+        "decode_tok_s": 51.204678479678826,
+        "decode_range": [
+          51.2006013963318,
+          51.20875556302585
+        ],
+        "output_sha256": [
+          "2d9ed45554582128b9cef42ae3e47b0d347c26b91059a97676ace58aeae6d533"
+        ],
+        "output_tokens": [
+          69
+        ],
+        "code_check": {
+          "passed": true,
+          "checks": 980
+        }
+      },
+      "fixed": {
+        "samples": 2,
+        "ttft_seconds": 24.851477500022156,
+        "ttft_range": [
+          24.85055936005665,
+          24.852395639987662
+        ],
+        "decode_tok_s": 51.3840040031456,
+        "decode_range": [
+          51.38261861440515,
+          51.385389391886044
+        ],
+        "output_sha256": [
+          "2d9ed45554582128b9cef42ae3e47b0d347c26b91059a97676ace58aeae6d533"
+        ],
+        "output_tokens": [
+          69
+        ],
+        "code_check": {
+          "passed": true,
+          "checks": 980
+        }
+      },
+      "ttft_speedup": 0.9973046463714977,
+      "ttft_reduction_pct": -0.27026381941654964,
+      "decode_change_pct": 0.3502131617483695
+    }
+  ],
+  "memory_snapshots": [
+    {
+      "run": "A1",
+      "version": "baseline",
+      "ready_MiB_by_device": [
+        19586,
+        22480,
+        22480,
+        22482,
+        22482,
+        22482,
+        22480,
+        23674
+      ],
+      "after_requests_MiB_by_device": [
+        19980,
+        22856,
+        22856,
+        22858,
+        22858,
+        22858,
+        22856,
+        24052
+      ],
+      "note": "nvidia-smi snapshot with allocator pool retained; not an exact peak"
+    },
+    {
+      "run": "B1",
+      "version": "fixed",
+      "ready_MiB_by_device": [
+        19586,
+        22480,
+        22480,
+        22480,
+        22482,
+        22480,
+        22482,
+        23674
+      ],
+      "after_requests_MiB_by_device": [
+        19978,
+        22860,
+        22860,
+        22860,
+        22862,
+        22860,
+        22862,
+        24052
+      ],
+      "note": "nvidia-smi snapshot with allocator pool retained; not an exact peak"
+    },
+    {
+      "run": "B2",
+      "version": "fixed",
+      "ready_MiB_by_device": [
+        19586,
+        22482,
+        22480,
+        22480,
+        22482,
+        22482,
+        22482,
+        23672
+      ],
+      "after_requests_MiB_by_device": [
+        19978,
+        22862,
+        22860,
+        22860,
+        22862,
+        22862,
+        22862,
+        24050
+      ],
+      "note": "nvidia-smi snapshot with allocator pool retained; not an exact peak"
+    },
+    {
+      "run": "A2",
+      "version": "baseline",
+      "ready_MiB_by_device": [
+        19586,
+        22480,
+        22482,
+        22482,
+        22482,
+        22480,
+        22482,
+        23674
+      ],
+      "after_requests_MiB_by_device": [
+        19980,
+        22856,
+        22858,
+        22858,
+        22858,
+        22856,
+        22858,
+        24052
+      ],
+      "note": "nvidia-smi snapshot with allocator pool retained; not an exact peak"
+    }
+  ],
+  "request_count": 48,
+  "formal_request_count": 28,
+  "all_outputs_and_reasoning_identical_including_warmups": true,
+  "validation": {
+    "naive_cases": 423,
+    "naive_sanitizer_cases_each": 62,
+    "marlin_cases": 22,
+    "marlin_graph_replays": 66,
+    "marlin_memcheck_cases": 22,
+    "indexer_bitwise_comparisons": 18,
+    "indexer_graph_replays": 12,
+    "baseline_route_buffer_bug_reproduced": true,
+    "unsupported_indexer_width_rejected": true
+  },
+  "scope": [
+    "Unified target KV reservation entry; removed its redundant optional argument and repeated caller-side calculation.",
+    "Merged single-row/batched Top-K encoding and decoding kernels while retaining their distinct CUB sorting algorithms and deterministic tie order; removed unused numeric header.",
+    "Vector cache trim retained for aligned layouts; scalar fallback added for other positive BF16 widths. RoPE and prefill AttentionValues iterate over all coordinates instead of stopping at launch block size.",
+    "Indexer keeps the optimized 16-head path and arbitrary-head fallback; validates its documented 128-element quantization block layout instead of silently misinterpreting another width.",
+    "Grouped NVFP4 Marlin small-batch routing reserves for both grouped and one-padded-block-per-route layouts, including reuse after earlier smaller requests. No model-name, expert-count or hidden-size special case added."
+  ],
+  "environment_audit": {
+    "redundant_tuning_variables_found": 0,
+    "new_variables": 0,
+    "removed_variables": 0,
+    "retained_existing_configuration_bridges": [
+      "FASTLLM_DSPARK_MODEL_PATH",
+      "FASTLLM_DSPARK_TOKENS",
+      "FASTLLM_DSPARK_CONFIDENCE_THRESHOLD"
+    ],
+    "reason": "These are active CLI-to-DSpark configuration interfaces in tools/fastllm_pytools/util.py, src/model.cpp and src/models/naive_n05_draft.cpp; removing them would break supported options."
+  },
+  "generality": {
+    "cache_width_pairs": [
+      [
+        1536,
+        1024
+      ],
+      [
+        8,
+        16
+      ],
+      [
+        200,
+        56
+      ],
+      [
+        7,
+        13
+      ]
+    ],
+    "rope_dimensions": [
+      64,
+      192,
+      384
+    ],
+    "attention_value_dimensions": [
+      128,
+      384
+    ],
+    "marlin_expert_counts": [
+      7,
+      16
+    ],
+    "marlin_hidden_intermediate_pairs": [
+      [
+        256,
+        128
+      ],
+      [
+        512,
+        256
+      ]
+    ],
+    "marlin_topk": [
+      1,
+      2,
+      3,
+      7,
+      8,
+      16
+    ],
+    "indexer_heads": [
+      1,
+      7,
+      16,
+      17
+    ],
+    "hardware_tested": "RTX 5090 / CUDA 13.1 / sm_120f"
+  },
+  "notes": [
+    "Baseline is the previous KV reservation version; both versions remeasured in ABBA order with complete 48-layer Naive NVFP4 model, 8 GPUs in layer placement, max_batch1/MTP0, BF16 activation/KV, chunk512/context65536, 16 threads and no history/prefix cache.",
+    "No concurrent profiling, compilation or GPU polling during native timed requests. All outputs and reasoning, including warmups, agree across versions; each code-generation case passes 980 checks.",
+    "The legacy FP16 planar NVFP4 route-capacity failure is reproduced under memcheck at 16 experts, batch9, topk16. Candidate passes the same case plus alternative shapes and CUDA Graph replay.",
+    "Aligned KV trim, specialized SWA and 16-head IndexScores fast paths are retained. Unsupported Indexer block widths are rejected explicitly; this does not claim support for arbitrary quantization formats.",
+    "Memory snapshots are retained allocator pools after requests, not peak usage. Conservative small-batch route storage adds about 26.25 KiB per 256-expert layer in this configuration.",
+    "End-to-end benchmark covers ordinary decoding with MTP disabled. Other GPU architectures were not tested; no broad performance claim outside measured configurations."
+  ]
+}

@@ -65,8 +65,10 @@ namespace fastllm {
             double Uniform() { return std::generate_canonical<double, 53>(random); }
         };
         Data RunTarget(const Data &inputIds, const Data &positions,
-                       std::vector<std::pair<Data, Data>> &kv, TargetCapture *capture);
-        static void AppendCache(Data &cache, Data &input);
+                       std::vector<std::pair<Data, Data>> &kv, const GenerationConfig &config,
+                       TargetCapture *capture);
+        int CacheReserveCapacity(const GenerationConfig &config) const;
+        static void AppendCache(Data &cache, Data &input, int reserveCapacity = 0);
         static void TrimCache(Data &cache, int length);
         int SampleTarget(Data &logits, std::vector<std::pair<Data, Data>> &kv,
                          const GenerationConfig &config, const LastTokensManager &lastTokens,
