@@ -1,0 +1,928 @@
+{
+  "timing": [
+    {
+      "tokens": 16384,
+      "baseline_seconds": 6.688872280996293,
+      "flashinfer_seconds": 6.105630703968927,
+      "baseline_samples": [
+        6.688735803996678,
+        6.688872280996293,
+        6.703811637009494
+      ],
+      "flashinfer_samples": [
+        6.100095273985062,
+        6.105630703968927,
+        6.118511121021584
+      ],
+      "ttft_reduction_percent": 8.71958011045313,
+      "baseline_tokens_per_second": 2449.4412976830886,
+      "flashinfer_tokens_per_second": 2683.4246606742336,
+      "throughput_gain_percent": 9.552519720005881
+    },
+    {
+      "tokens": 32768,
+      "baseline_seconds": 13.655998233996797,
+      "flashinfer_seconds": 12.402489857980981,
+      "baseline_samples": [
+        13.665353015006986,
+        13.655998233996797,
+        13.621068790031131
+      ],
+      "flashinfer_samples": [
+        12.41160964698065,
+        12.402489857980981,
+        12.367478952044621
+      ],
+      "ttft_reduction_percent": 9.179177929997017,
+      "baseline_tokens_per_second": 2399.531651843921,
+      "flashinfer_tokens_per_second": 2642.0501347085437,
+      "throughput_gain_percent": 10.106909099459461
+    }
+  ],
+  "logits": [
+    {
+      "tokens": 2049,
+      "baseline_output": [
+        13,
+        362,
+        22611,
+        51097,
+        1657
+      ],
+      "flashinfer_output": [
+        13,
+        362,
+        22611,
+        51097,
+        1657
+      ],
+      "sequence_equal": true,
+      "steps": [
+        {
+          "step": 1,
+          "bitwise_equal": true,
+          "rmse": 0.0,
+          "relative_l2": 0.0,
+          "max_abs_error": 0.0,
+          "cosine": 1.0,
+          "top1_equal": true,
+          "baseline_top1": 13,
+          "flashinfer_top1": 13,
+          "baseline_top1_probability": 0.9982284803336161,
+          "flashinfer_top1_probability": 0.9982284803336161,
+          "top20_overlap": 20,
+          "kl_base_to_trial": 0.0,
+          "total_variation": 0.0
+        },
+        {
+          "step": 2,
+          "bitwise_equal": true,
+          "rmse": 0.0,
+          "relative_l2": 0.0,
+          "max_abs_error": 0.0,
+          "cosine": 1.0,
+          "top1_equal": true,
+          "baseline_top1": 362,
+          "flashinfer_top1": 362,
+          "baseline_top1_probability": 0.9989573545886041,
+          "flashinfer_top1_probability": 0.9989573545886041,
+          "top20_overlap": 20,
+          "kl_base_to_trial": 0.0,
+          "total_variation": 0.0
+        },
+        {
+          "step": 3,
+          "bitwise_equal": true,
+          "rmse": 0.0,
+          "relative_l2": 0.0,
+          "max_abs_error": 0.0,
+          "cosine": 0.9999999999999999,
+          "top1_equal": true,
+          "baseline_top1": 22611,
+          "flashinfer_top1": 22611,
+          "baseline_top1_probability": 0.9999844356928728,
+          "flashinfer_top1_probability": 0.9999844356928728,
+          "top20_overlap": 20,
+          "kl_base_to_trial": 0.0,
+          "total_variation": 0.0
+        },
+        {
+          "step": 4,
+          "bitwise_equal": true,
+          "rmse": 0.0,
+          "relative_l2": 0.0,
+          "max_abs_error": 0.0,
+          "cosine": 0.9999999999999998,
+          "top1_equal": true,
+          "baseline_top1": 51097,
+          "flashinfer_top1": 51097,
+          "baseline_top1_probability": 0.999942276457468,
+          "flashinfer_top1_probability": 0.999942276457468,
+          "top20_overlap": 20,
+          "kl_base_to_trial": 0.0,
+          "total_variation": 0.0
+        },
+        {
+          "step": 5,
+          "bitwise_equal": true,
+          "rmse": 0.0,
+          "relative_l2": 0.0,
+          "max_abs_error": 0.0,
+          "cosine": 1.0000000000000002,
+          "top1_equal": true,
+          "baseline_top1": 1657,
+          "flashinfer_top1": 1657,
+          "baseline_top1_probability": 0.999936216624215,
+          "flashinfer_top1_probability": 0.999936216624215,
+          "top20_overlap": 20,
+          "kl_base_to_trial": 0.0,
+          "total_variation": 0.0
+        }
+      ]
+    },
+    {
+      "tokens": 4099,
+      "baseline_output": [
+        4938,
+        30491,
+        13,
+        88269,
+        44120
+      ],
+      "flashinfer_output": [
+        4938,
+        30491,
+        13,
+        88269,
+        44120
+      ],
+      "sequence_equal": true,
+      "steps": [
+        {
+          "step": 1,
+          "bitwise_equal": false,
+          "rmse": 0.6854881743423981,
+          "relative_l2": 0.19763436214040403,
+          "max_abs_error": 5.6875,
+          "cosine": 0.9820915390113575,
+          "top1_equal": true,
+          "baseline_top1": 4938,
+          "flashinfer_top1": 4938,
+          "baseline_top1_probability": 0.9999352946519803,
+          "flashinfer_top1_probability": 0.9999805942915782,
+          "top20_overlap": 17,
+          "kl_base_to_trial": 6.221943359199537e-05,
+          "total_variation": 4.5957079828542764e-05
+        },
+        {
+          "step": 2,
+          "bitwise_equal": false,
+          "rmse": 0.4708202651465077,
+          "relative_l2": 0.1341971101545831,
+          "max_abs_error": 3.125,
+          "cosine": 0.9910370720356146,
+          "top1_equal": true,
+          "baseline_top1": 30491,
+          "flashinfer_top1": 30491,
+          "baseline_top1_probability": 0.9999844387035767,
+          "flashinfer_top1_probability": 0.999971364447109,
+          "top20_overlap": 16,
+          "kl_base_to_trial": 3.715047028957922e-06,
+          "total_variation": 1.315036295412094e-05
+        },
+        {
+          "step": 3,
+          "bitwise_equal": false,
+          "rmse": 0.36638576215643587,
+          "relative_l2": 0.15118145231347413,
+          "max_abs_error": 2.078125,
+          "cosine": 0.9887461709955573,
+          "top1_equal": true,
+          "baseline_top1": 13,
+          "flashinfer_top1": 13,
+          "baseline_top1_probability": 0.9999711225947251,
+          "flashinfer_top1_probability": 0.9999895755760684,
+          "top20_overlap": 18,
+          "kl_base_to_trial": 1.5314038445398486e-05,
+          "total_variation": 1.8453217554692388e-05
+        },
+        {
+          "step": 4,
+          "bitwise_equal": false,
+          "rmse": 0.3493264436214621,
+          "relative_l2": 0.10537002871177638,
+          "max_abs_error": 2.140625,
+          "cosine": 0.9945816835182224,
+          "top1_equal": true,
+          "baseline_top1": 88269,
+          "flashinfer_top1": 88269,
+          "baseline_top1_probability": 0.9999605343246666,
+          "flashinfer_top1_probability": 0.9999830796962023,
+          "top20_overlap": 17,
+          "kl_base_to_trial": 1.4959363339631555e-05,
+          "total_variation": 2.3599868598767157e-05
+        },
+        {
+          "step": 5,
+          "bitwise_equal": false,
+          "rmse": 0.37066003140545645,
+          "relative_l2": 0.12057046280139742,
+          "max_abs_error": 1.9375,
+          "cosine": 0.9930463445625377,
+          "top1_equal": true,
+          "baseline_top1": 44120,
+          "flashinfer_top1": 44120,
+          "baseline_top1_probability": 0.9999993981968891,
+          "flashinfer_top1_probability": 0.9999995807634886,
+          "top20_overlap": 17,
+          "kl_base_to_trial": 1.0301107134856413e-07,
+          "total_variation": 2.0405181542807623e-07
+        }
+      ]
+    },
+    {
+      "tokens": 16384,
+      "baseline_output": [
+        785,
+        1196,
+        374,
+        10156,
+        264
+      ],
+      "flashinfer_output": [
+        785,
+        1196,
+        374,
+        10156,
+        264
+      ],
+      "sequence_equal": true,
+      "steps": [
+        {
+          "step": 1,
+          "bitwise_equal": false,
+          "rmse": 0.3545638258648725,
+          "relative_l2": 0.18856919925581006,
+          "max_abs_error": 1.875,
+          "cosine": 0.9822112099738209,
+          "top1_equal": true,
+          "baseline_top1": 785,
+          "flashinfer_top1": 785,
+          "baseline_top1_probability": 0.9885283381857606,
+          "flashinfer_top1_probability": 0.9880925622158677,
+          "top20_overlap": 19,
+          "kl_base_to_trial": 0.0003896742902113306,
+          "total_variation": 0.0009949260866339374
+        },
+        {
+          "step": 2,
+          "bitwise_equal": false,
+          "rmse": 0.22269360993839274,
+          "relative_l2": 0.08766263660371197,
+          "max_abs_error": 1.4375,
+          "cosine": 0.9964682849461287,
+          "top1_equal": true,
+          "baseline_top1": 1196,
+          "flashinfer_top1": 1196,
+          "baseline_top1_probability": 0.9992305390466901,
+          "flashinfer_top1_probability": 0.9994071262769071,
+          "top20_overlap": 18,
+          "kl_base_to_trial": 4.231492435320678e-05,
+          "total_variation": 0.0001885746261656729
+        },
+        {
+          "step": 3,
+          "bitwise_equal": false,
+          "rmse": 0.1509565915073335,
+          "relative_l2": 0.050243179788252476,
+          "max_abs_error": 1.0625,
+          "cosine": 0.9987421812489363,
+          "top1_equal": true,
+          "baseline_top1": 374,
+          "flashinfer_top1": 374,
+          "baseline_top1_probability": 0.6014174377711642,
+          "flashinfer_top1_probability": 0.6363188948610992,
+          "top20_overlap": 20,
+          "kl_base_to_trial": 0.009904425459848269,
+          "total_variation": 0.055192780411099505
+        },
+        {
+          "step": 4,
+          "bitwise_equal": false,
+          "rmse": 0.1488797432334045,
+          "relative_l2": 0.05139678467640559,
+          "max_abs_error": 1.078125,
+          "cosine": 0.9987321325065512,
+          "top1_equal": true,
+          "baseline_top1": 10156,
+          "flashinfer_top1": 10156,
+          "baseline_top1_probability": 0.9957599505599012,
+          "flashinfer_top1_probability": 0.9967981875271422,
+          "top20_overlap": 19,
+          "kl_base_to_trial": 0.00022742952002027401,
+          "total_variation": 0.00105669789369233
+        },
+        {
+          "step": 5,
+          "bitwise_equal": false,
+          "rmse": 0.1451185339107757,
+          "relative_l2": 0.0477869115471929,
+          "max_abs_error": 0.80859375,
+          "cosine": 0.9989516290922017,
+          "top1_equal": true,
+          "baseline_top1": 264,
+          "flashinfer_top1": 264,
+          "baseline_top1_probability": 0.8225285262438246,
+          "flashinfer_top1_probability": 0.8237433934723184,
+          "top20_overlap": 19,
+          "kl_base_to_trial": 0.001395967266830628,
+          "total_variation": 0.011651762443346368
+        }
+      ]
+    },
+    {
+      "tokens": 32768,
+      "baseline_output": [
+        785,
+        1196,
+        374,
+        10156,
+        264
+      ],
+      "flashinfer_output": [
+        785,
+        1196,
+        374,
+        10156,
+        264
+      ],
+      "sequence_equal": true,
+      "steps": [
+        {
+          "step": 1,
+          "bitwise_equal": false,
+          "rmse": 0.45645281501170715,
+          "relative_l2": 0.2455263090276237,
+          "max_abs_error": 2.80078125,
+          "cosine": 0.9706560576179414,
+          "top1_equal": true,
+          "baseline_top1": 785,
+          "flashinfer_top1": 785,
+          "baseline_top1_probability": 0.9952894544223576,
+          "flashinfer_top1_probability": 0.9966172464803105,
+          "top20_overlap": 18,
+          "kl_base_to_trial": 0.0014078400533759957,
+          "total_variation": 0.0021360876024889928
+        },
+        {
+          "step": 2,
+          "bitwise_equal": false,
+          "rmse": 0.2513993093171857,
+          "relative_l2": 0.0901676697915293,
+          "max_abs_error": 1.234375,
+          "cosine": 0.9960197708622156,
+          "top1_equal": true,
+          "baseline_top1": 1196,
+          "flashinfer_top1": 1196,
+          "baseline_top1_probability": 0.9997645875260506,
+          "flashinfer_top1_probability": 0.9998147856701954,
+          "top20_overlap": 18,
+          "kl_base_to_trial": 2.8226353975231688e-05,
+          "total_variation": 7.227455413461148e-05
+        },
+        {
+          "step": 3,
+          "bitwise_equal": false,
+          "rmse": 0.16717571290374378,
+          "relative_l2": 0.053139285836896796,
+          "max_abs_error": 1.09375,
+          "cosine": 0.9985877389159162,
+          "top1_equal": true,
+          "baseline_top1": 374,
+          "flashinfer_top1": 374,
+          "baseline_top1_probability": 0.8114088699403217,
+          "flashinfer_top1_probability": 0.8348849325993746,
+          "top20_overlap": 20,
+          "kl_base_to_trial": 0.003068798785696509,
+          "total_variation": 0.023476970903494643
+        },
+        {
+          "step": 4,
+          "bitwise_equal": false,
+          "rmse": 0.15352117818747557,
+          "relative_l2": 0.04978338883708408,
+          "max_abs_error": 0.8125,
+          "cosine": 0.9987945695155735,
+          "top1_equal": true,
+          "baseline_top1": 10156,
+          "flashinfer_top1": 10156,
+          "baseline_top1_probability": 0.9997844329437371,
+          "flashinfer_top1_probability": 0.999774675134938,
+          "top20_overlap": 20,
+          "kl_base_to_trial": 1.1703164544707666e-05,
+          "total_variation": 3.254927522664682e-05
+        },
+        {
+          "step": 5,
+          "bitwise_equal": false,
+          "rmse": 0.14498095273216965,
+          "relative_l2": 0.04577342803936799,
+          "max_abs_error": 0.6973190307617188,
+          "cosine": 0.9990356021571482,
+          "top1_equal": true,
+          "baseline_top1": 264,
+          "flashinfer_top1": 264,
+          "baseline_top1_probability": 0.7965001796531008,
+          "flashinfer_top1_probability": 0.8048965431313378,
+          "top20_overlap": 19,
+          "kl_base_to_trial": 0.0013317746434701706,
+          "total_variation": 0.01005024822485451
+        }
+      ]
+    }
+  ],
+  "history": [
+    {
+      "label": "history-cold",
+      "input_tokens": 4099,
+      "output_tokens": [
+        4938,
+        30491,
+        13,
+        88269,
+        44120
+      ],
+      "profiled": false,
+      "ttft_s": 1.5940169200184755,
+      "elapsed_s": 1.6877368160057813,
+      "token_sha256": "34817b895956e836627a93cfc251d20ff5140f43e43ce884f8ab158153e212db",
+      "logits_sha256": [
+        "4609245cfb669a7366365d60bdb0a12b86b8e702033b43e727b97006ad0152c8",
+        "0315132dc2109969ceb8d9c4fadeb780af306e69e14cd53ee44450ada0bfa80e",
+        "041d3869e7c10816ae73e5b8db7f6c66f44d06cd96983c26bc1de44d4054a222",
+        "20010f04155a5779dedb80b8c865fae18f0d4016376a95fb138e9c35dedd869e",
+        "edb495dcbb4fefe735e2445f0e356debaf2ca8a506bc2bc8ad83d085063598d1"
+      ]
+    },
+    {
+      "label": "history-restored",
+      "input_tokens": 4099,
+      "output_tokens": [
+        4938,
+        30491,
+        13,
+        88269,
+        44120
+      ],
+      "profiled": false,
+      "ttft_s": 0.03703600895823911,
+      "elapsed_s": 0.12528583797393367,
+      "token_sha256": "34817b895956e836627a93cfc251d20ff5140f43e43ce884f8ab158153e212db",
+      "logits_sha256": [
+        "4609245cfb669a7366365d60bdb0a12b86b8e702033b43e727b97006ad0152c8",
+        "0315132dc2109969ceb8d9c4fadeb780af306e69e14cd53ee44450ada0bfa80e",
+        "041d3869e7c10816ae73e5b8db7f6c66f44d06cd96983c26bc1de44d4054a222",
+        "20010f04155a5779dedb80b8c865fae18f0d4016376a95fb138e9c35dedd869e",
+        "edb495dcbb4fefe735e2445f0e356debaf2ca8a506bc2bc8ad83d085063598d1"
+      ]
+    },
+    {
+      "label": "history-extend",
+      "input_tokens": 6151,
+      "output_tokens": [
+        304,
+        15267,
+        13,
+        20245,
+        4128
+      ],
+      "profiled": false,
+      "ttft_s": 0.8265928940381855,
+      "elapsed_s": 0.9164533430011943,
+      "token_sha256": "5c07f2b841c474667953515b37dc09bfee9d064de0f38d33219427dc3248c1a8",
+      "logits_sha256": [
+        "4db5f4a2efeb9e59b437c67b566bdd930ffd78ace2a74203f55e20712af6fe99",
+        "714244be9a77813fc7dea57dca9d6c5ec74510c5231abcd282f927ef7d0c6a99",
+        "7cc5c8dc4494235c9455e7f672365d10c13e7c7892e530d5dbc2dde153e943df",
+        "4030a7376fb9606c0e587b07af78bcd60a1cac529c0bf2fe43e84d48edb50a79",
+        "092833db91c0624b921f53611dcbd2db750a4ac7373d9ef738115ee9284f90c2"
+      ]
+    }
+  ],
+  "caveats": [
+    "TTFT is warmed, includes one output token; median of 3 runs per length.",
+    "Numerical inputs are synthetic length-scaling prompts, not a quality benchmark.",
+    "Later-step logits are compared only while preceding generated tokens match.",
+    "Trial uses FP8 KV, Q and attention probabilities; this changes more than BF16 rounding.",
+    "Trial requantizes gathered BF16 history on every sparse prefill chunk."
+  ],
+  "microbenchmark": [
+    {
+      "rows": 9,
+      "cap": 16384,
+      "qstd": 0.25,
+      "baseline_ms": 0.211037,
+      "flashinfer_ms": 0.180026,
+      "max_error": 0.000586509705,
+      "rmse": 0.00014662268,
+      "relative_l2": 0.0261094005,
+      "cosine": 0.999659143,
+      "dequant_max_error": 0.000183105469,
+      "dequant_relative_l2": 0.00591713315
+    },
+    {
+      "adapter_rows": 64,
+      "cap": 16384,
+      "bitwise_equal": true,
+      "adapter_ms": 0.233402
+    },
+    {
+      "rows": 64,
+      "cap": 16384,
+      "qstd": 0.25,
+      "baseline_ms": 0.40345,
+      "flashinfer_ms": 0.181037,
+      "max_error": 0.000728607178,
+      "rmse": 0.000147722276,
+      "relative_l2": 0.0260765564,
+      "cosine": 0.999660035,
+      "dequant_max_error": 0.000244140625,
+      "dequant_relative_l2": 0.0058844717
+    },
+    {
+      "adapter_rows": 1024,
+      "cap": 16384,
+      "bitwise_equal": true,
+      "adapter_ms": 1.33831
+    },
+    {
+      "rows": 1024,
+      "cap": 16384,
+      "qstd": 0.25,
+      "baseline_ms": 4.98257,
+      "flashinfer_ms": 1.286416,
+      "max_error": 0.000793457031,
+      "rmse": 0.000147308112,
+      "relative_l2": 0.0262736922,
+      "cosine": 0.999654818,
+      "dequant_max_error": 0.000244140625,
+      "dequant_relative_l2": 0.00593549903
+    },
+    {
+      "rows": 9,
+      "cap": 32768,
+      "qstd": 0.25,
+      "baseline_ms": 0.210973,
+      "flashinfer_ms": 0.180448,
+      "max_error": 0.00065612793,
+      "rmse": 0.000147936334,
+      "relative_l2": 0.0265942703,
+      "cosine": 0.999646612,
+      "dequant_max_error": 0.000183105469,
+      "dequant_relative_l2": 0.00597165865
+    },
+    {
+      "adapter_rows": 64,
+      "cap": 32768,
+      "bitwise_equal": true,
+      "adapter_ms": 0.280758
+    },
+    {
+      "rows": 64,
+      "cap": 32768,
+      "qstd": 0.25,
+      "baseline_ms": 0.403226,
+      "flashinfer_ms": 0.181389,
+      "max_error": 0.000682830811,
+      "rmse": 0.00014759543,
+      "relative_l2": 0.0264318634,
+      "cosine": 0.999650652,
+      "dequant_max_error": 0.000244140625,
+      "dequant_relative_l2": 0.00595675462
+    },
+    {
+      "adapter_rows": 1024,
+      "cap": 32768,
+      "bitwise_equal": true,
+      "adapter_ms": 1.394522
+    },
+    {
+      "rows": 1024,
+      "cap": 32768,
+      "qstd": 0.25,
+      "baseline_ms": 5.056893,
+      "flashinfer_ms": 1.286531,
+      "max_error": 0.000762939453,
+      "rmse": 0.000146487158,
+      "relative_l2": 0.026019146,
+      "cosine": 0.999661474,
+      "dequant_max_error": 0.000244140625,
+      "dequant_relative_l2": 0.00591069655
+    },
+    {
+      "adapter_rows": 1024,
+      "cap": 32768,
+      "bitwise_equal": true,
+      "adapter_ms": 1.397971
+    },
+    {
+      "rows": 1024,
+      "cap": 32768,
+      "qstd": 1.0,
+      "baseline_ms": 5.080534,
+      "flashinfer_ms": 1.290378,
+      "max_error": 0.00115966797,
+      "rmse": 0.000197585417,
+      "relative_l2": 0.0280019639,
+      "cosine": 0.999607868,
+      "dequant_max_error": 0.000854492188,
+      "dequant_relative_l2": 0.0164076421
+    }
+  ],
+  "microbenchmark_note": "Operator measurements are from the preceding prototype; model results above are from the formal CMake build.",
+  "validation": {
+    "history_restoration_bitwise_equal": true,
+    "greedy_sequences_equal": true,
+    "integration_memcheck": {
+      "errors": 0,
+      "gpu_pack_matches_cpu": true,
+      "double_reference_max_abs_error": 0.00083705783
+    },
+    "gpu_pack_matches_cpu_pack": true,
+    "ctest": {
+      "passed": 4,
+      "failed": 0,
+      "tests": [
+        "glm5_next_dsa",
+        "glm5_next_flashinfer",
+        "glm5_next_flashinfer_disabled",
+        "glm5_next_mla_prefill"
+      ],
+      "phase": "Before cleanup; forced-BF16 coverage now belongs to glm5_next_flashinfer."
+    },
+    "trial_equivalence": {
+      "baseline": [
+        {
+          "input_tokens": 2049,
+          "tokens_equal": true,
+          "logits_bitwise_equal": true
+        },
+        {
+          "input_tokens": 4099,
+          "tokens_equal": true,
+          "logits_bitwise_equal": true
+        },
+        {
+          "input_tokens": 16384,
+          "tokens_equal": true,
+          "logits_bitwise_equal": true
+        },
+        {
+          "input_tokens": 32768,
+          "tokens_equal": true,
+          "logits_bitwise_equal": true
+        }
+      ],
+      "flashinfer": [
+        {
+          "input_tokens": 2049,
+          "tokens_equal": true,
+          "logits_bitwise_equal": true
+        },
+        {
+          "input_tokens": 4099,
+          "tokens_equal": true,
+          "logits_bitwise_equal": true
+        },
+        {
+          "input_tokens": 16384,
+          "tokens_equal": true,
+          "logits_bitwise_equal": true
+        },
+        {
+          "input_tokens": 32768,
+          "tokens_equal": true,
+          "logits_bitwise_equal": true
+        }
+      ]
+    },
+    "compatibility_compile_checks": {
+      "CPU": "GLM model translation unit",
+      "SM80": "generic adapter stub without FlashInfer feature definition",
+      "SM80+SM120": "dedicated FlashInfer object compiled solely for sm_120a",
+      "other_GPU_runtime": "not tested"
+    },
+    "private_include_isolation": true
+  },
+  "implementation": {
+    "status": "Integrated into repository CMake build; enabled by default in the supported configuration.",
+    "flashinfer_commit": "7eb86aa0fdc1248fab43c89801de4ed450e35e77",
+    "flashinfer_kernel": "sparse_mla_prefill_swapab_kernel<ModelType::GLM53_NOPE,64>",
+    "quantizer": "existing Dots3 QuantizeKKernel<__nv_bfloat16>, four 128-element groups per token",
+    "device_kernel_changes": "none; pinned upstream implementation reused",
+    "host_adapter": "BF16 latent -> existing FP8 quantizer -> cudaMemcpy2DAsync 528-byte packing; 2051 indices padded with -1 to 2112",
+    "query_and_output_dtype": "BF16",
+    "internal_query_probability_and_kv_dtype": "FP8 E4M3",
+    "short_query_behavior": "fewer than 64 queries retains current BF16 attention",
+    "sm_scale": 0.0625,
+    "compile_target": "compute_120a -> sm_120a; CUDA 12.9",
+    "dependencies": "Pinned minimal FlashInfer source closure, with project-compatible fastdiv headers",
+    "fallback_environment": "FASTLLM_GLM5_NEXT_DSA_BACKEND=bf16",
+    "runtime_device_guard": "exact compute capability 12.0; unsupported shape/type/layout or graph capture uses BF16 DSA",
+    "build_artifact": "/root/github/fastllm/build-fastllm/tools/ftllm/libfastllm_tools.so",
+    "installation": "Repository build output tested; site-packages installation was not replaced."
+  },
+  "scaling": {
+    "baseline_32k_over_16k": 2.041599489467717,
+    "flashinfer_32k_over_16k": 2.0313200157878564
+  },
+  "build": {
+    "repo_commit": "42bfc71ccf6afd5c559b1a4ec5712df02b858ec5",
+    "library": "/root/github/fastllm/build-fastllm/tools/ftllm/libfastllm_tools.so",
+    "library_sha256": "9f1988e01cae1892083d21f0f9f92c99e564ef9e9d135eea2125fa8372477df7",
+    "cuda": "12.9.86",
+    "cmake": "4.4.3",
+    "gpu": {
+      "count": 8,
+      "name": "NVIDIA GeForce RTX 5090",
+      "driver": "595.71.05"
+    },
+    "dynamic_dependencies_unchanged": true,
+    "dynamic_dependencies": [
+      "libcublasLt.so.12",
+      "libcublas.so.12",
+      "libnccl.so.2",
+      "libcuda.so.1",
+      "libnuma.so.1",
+      "libstdc++.so.6",
+      "libm.so.6",
+      "libgcc_s.so.1",
+      "libc.so.6",
+      "ld-linux-aarch64.so.1"
+    ],
+    "dedicated_object_compile_options": [
+      "-std=c++20",
+      "--default-stream=per-thread",
+      "--expt-relaxed-constexpr",
+      "--expt-extended-lambda",
+      "--generate-code=arch=compute_120a,code=sm_120a"
+    ]
+  },
+  "same_library_ab": true,
+  "source_sha256": {
+    "CMakeLists.txt": "1c099ffe121b93c43b3a41d350d3c45e3baa207788c6c74aab7d15f4aafc25da",
+    "docs/glm5.md": "86f777459f476e84412c14aaaf6e297dd384ae251c81bc17685add48fa97dbae",
+    "include/devices/cuda/glm5-next-cuda.cuh": "9ef25fa669fb12f94abd92f654d2f3f4c6a2e363e9fdde2fd74d833fc64a8a68",
+    "src/devices/cuda/models/dots3-note-kernels.cu": "9c135120025904a28b28a63cd8acf2021f8400d926f6862946b0d9034eb8915c",
+    "src/devices/cuda/models/glm5-next-dsa-sm120.cu": "181ffff2418cb8ac5b2268ba62ae65187d1cf9d6a77470ca68d47ad42a8047ae",
+    "src/devices/cuda/models/glm5-next-dsa.cpp": "61f8b005e4ea6e98ee9c801837fb540a4409b6378422d3f6886ab40cd1cc800e",
+    "src/devices/cuda/models/glm5-next-dsa.cuh": "3f16a5199d3e9ef289c4602d4fd474de365cb84042f0808cec5695c512de46ad",
+    "src/models/glm5_next_dsa.h": "8f0f4b687e1baab0e9c615ccb0adfa82e419a47b55e870c24582ca60c762f29c",
+    "test/basic/test_glm5_next_flashinfer.cpp": "32dd64afa93ea0eb89bd3a3181c8d8869881b12b756df38d036152c0e13d60b4"
+  },
+  "benchmark_metadata": {
+    "shared": {
+      "commit": "42bfc71ccf6afd5c559b1a4ec5712df02b858ec5",
+      "worktree_dirty": true,
+      "library": "/root/github/fastllm/build-fastllm/tools/ftllm/libfastllm_tools.so",
+      "library_sha256": "9f1988e01cae1892083d21f0f9f92c99e564ef9e9d135eea2125fa8372477df7",
+      "prompt_sha256": {
+        "16384": "bfaa9cdfa45fedb5e33d37e2a4c425b9ff9b167037f748262f62c2e579ce4417",
+        "32768": "30142b7fa44cf1746262936cb516db8f42c7b633664eb91428cc026d5c742bc8"
+      },
+      "prompt_note": "32K is two exact copies of the 16K token sequence; first 16K is identical. Synthetic length-scaling input, not a quality benchmark.",
+      "profiler_preloads": "",
+      "custom_kernel_preload": false,
+      "disable_dsa": "",
+      "arguments": {
+        "model": "/root/hfmodels/GLM-5.3-Flash-NVFP4",
+        "path": "",
+        "threads": 8,
+        "low": false,
+        "low_gpu_mem": false,
+        "dtype": "auto",
+        "moe_dtype": "",
+        "moe_atype": "bfloat16",
+        "atype": "auto",
+        "kv_cache_dtype": "auto",
+        "cuda_embedding": false,
+        "kv_cache_limit": "auto",
+        "max_batch": 1,
+        "chunked_prefill_size": 1024,
+        "fast_prefill": false,
+        "device": "cudapp=8",
+        "vision_device": null,
+        "multimodal": false,
+        "tp": "",
+        "moe_device": "cudapp=8",
+        "moe_device_layers": -1,
+        "moe_cuda_cache": 0,
+        "moe_cpu_cache": 0,
+        "image_embedding_cache": null,
+        "ngram_device": "cpu",
+        "moe_experts": -1,
+        "cache_history": "false",
+        "cache_fast": "",
+        "enable_thinking": "",
+        "cuda_shared_expert": "true",
+        "enable_amx": "false",
+        "max_context_length": -1,
+        "rope_scaling": "",
+        "tokens": 65536,
+        "page_size": -1,
+        "prefix_cache": "false",
+        "prefix_cache_snapshot_interval_pages": -1,
+        "prefix_cache_snapshot_max_per_request": -1,
+        "prefix_cache_snapshot_max_records": -1,
+        "gpu_mem_ratio": 0.9,
+        "cuda_slab": 288,
+        "mtp": 0,
+        "mtp_fp8_draft_head": null,
+        "dspark": 0,
+        "speculative_algorithm": "",
+        "speculative_draft_model_path": "",
+        "draft_tokens": -1,
+        "speculative_num_draft_tokens": -1,
+        "speculative_dspark_block_size": -1,
+        "speculative_dspark_confidence_threshold": 0.5,
+        "triton": false,
+        "custom": "",
+        "lora": "",
+        "cache_dir": "",
+        "dtype_config": "",
+        "ori": "",
+        "mmproj": "",
+        "tool_call_parser": "auto",
+        "chat_template": "",
+        "capture_kind": "bench",
+        "capture_length": 32768,
+        "check_logits_after": true
+      }
+    },
+    "modes": {
+      "bf16": {
+        "disable_flashinfer": "1",
+        "arguments": {
+          "capture_output": "/root/glm53-flashinfer-integration/results-baseline",
+          "check_history_after": false
+        }
+      },
+      "auto": {
+        "disable_flashinfer": "",
+        "arguments": {
+          "capture_output": "/root/glm53-flashinfer-integration/results-flashinfer",
+          "check_history_after": true
+        }
+      }
+    },
+    "environment_note": "These measurements predate cleanup. Recorded disable_dsa / disable_flashinfer values are historical; current equivalents are FASTLLM_GLM5_NEXT_DSA_BACKEND=bf16 or auto."
+  },
+  "vendor_sha256_manifest": "../../third_party/flashinfer_glm53/sha256.json",
+  "source_sha256_note": "These hashes identify the measured pre-cleanup build. See cleanup_verification for the rebuilt library and cleanup regression results.",
+  "cleanup_verification": {
+    "library_sha256": "ab94412c7f593f92f0c7036fa2841bb8e46e322f0b59e3e68fd7c44a0d9afffe",
+    "environment": "FASTLLM_GLM5_NEXT_DSA_BACKEND=auto|bf16|dense; default auto",
+    "compared_with": "Pre-cleanup formal build recorded above; each backend compared with its own previous output.",
+    "input_lengths": [
+      2049,
+      4099,
+      16384,
+      32768
+    ],
+    "generated_steps_per_length_per_backend": 5,
+    "auto_and_bf16_full_logits_bitwise_equal": true,
+    "auto_and_bf16_history_restore_bitwise_equal": true,
+    "all_three_modes_boundary_smoke_lengths": [
+      15,
+      2047,
+      2048,
+      2049,
+      4099
+    ],
+    "boundary_smoke_steps_per_length": 5,
+    "ctest": {
+      "passed": 5,
+      "failed": 0,
+      "tests": [
+        "glm5_next_dsa",
+        "glm5_next_flashinfer",
+        "glm5_next_mla_prefill",
+        "naive_n05_history",
+        "naive_n05_attention"
+      ]
+    },
+    "compute_sanitizer_errors": 0,
+    "compile_checks": [
+      "CPU GLM model",
+      "SM80 generic adapter"
+    ],
+    "existing_test_issue": {
+      "file": "test/basic/test_naive_n05_decode.cpp",
+      "modified_by_this_diff": false,
+      "error": "Five-argument cudaGraphInstantiate call fails to compile with CUDA 12.9 (three-argument API).",
+      "scope": "Excluded from five passing CTest targets; not repaired in this cleanup."
+    },
+    "performance_rebenchmarked": false,
+    "model_quality_evaluation": false
+  }
+}

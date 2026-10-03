@@ -4,6 +4,7 @@
 #include "models/glm5_next.h"
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/cuda/glm5-next-cuda.cuh"
 #include "devices/cuda/naive-n05-cuda.cuh"
 #include <cmath>
 #include <limits>
@@ -154,7 +155,7 @@ inline void BuildDsaIndices(Data &input, Data &qNormalized,
 }
 
 inline void SparseLatentAttention(Data &query, const Data &cache,
-        Data &indices, float scale, Data &output) {
+        Data &indices, float scale, Data &output, bool useFlashInfer = true) {
     const int heads = query.dims[0], sequence = query.dims[1];
     const int tokens = cache.dims[1], rank = query.dims[2];
     const auto *pool = cache.pagedKVCacheData;
@@ -180,14 +181,17 @@ inline void SparseLatentAttention(Data &query, const Data &cache,
     PermuteSelf(query, {1, 0, 2});
     query.Reshape({1, sequence, heads, rank});
     indices.Reshape({1, sequence, indices.dims.back()});
-    Data sink(DataType::FLOAT32);
-    sink.Resize({heads});
-    sink.ToDevice(query.dataDevice, query.dataDeviceIds, false);
-    sink.Allocate(-std::numeric_limits<float>::infinity());
-    // Candidate construction already enforces causal positions.
-    AssertInFastLLM(FastllmCudaDeepSeekV41SparseAttention(
-        query, latent, nullptr, &latent, &indices, sink, 0, 0, scale, output),
-        "GLM DSA sparse MLA failed.");
+    if (!useFlashInfer ||
+        !FastllmCudaGlm5NextDsaPrefill(query, latent, indices, scale, output)) {
+        Data sink(DataType::FLOAT32);
+        sink.Resize({heads});
+        sink.ToDevice(query.dataDevice, query.dataDeviceIds, false);
+        sink.Allocate(-std::numeric_limits<float>::infinity());
+        // Candidate construction already enforces causal positions.
+        AssertInFastLLM(FastllmCudaDeepSeekV41SparseAttention(
+            query, latent, nullptr, &latent, &indices, sink, 0, 0, scale, output),
+            "GLM DSA sparse MLA failed.");
+    }
     output.Reshape({sequence, heads, rank});
     PermuteSelf(output, {1, 0, 2});
 }

@@ -1,5 +1,6 @@
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "fastllm.h"
+#include "glm5-next-dsa.cuh"
 
 #include <algorithm>
 #include <cfloat>
@@ -2397,4 +2398,14 @@ bool FastllmCudaDots3NoteSlidingAttentionPrefill(
     DeviceSync();
     FastllmCudaFree(scores);
     return ok && launchState == cudaSuccess;
+}
+
+// Reuse the existing per-128 E4M3 kernel for the GLM latent cache adapter.
+cudaError_t FastllmCudaGlm5NextQuantizeLatentRaw(const void *input,
+        void *bytes, float *scales, int rows, cudaStream_t stream) {
+    if (!input || !bytes || !scales || rows <= 0) return cudaErrorInvalidValue;
+    QuantizeKKernel<<<rows, kIndexerDim, 0, stream>>>(
+        static_cast<const __nv_bfloat16 *>(input), static_cast<uint8_t *>(bytes),
+        scales, rows);
+    return cudaGetLastError();
 }

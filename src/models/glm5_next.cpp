@@ -1980,7 +1980,8 @@ namespace fastllm {
 #ifdef USE_CUDA
         if (!dsaIndices.dims.empty()) {
             glm5_next_detail::SparseLatentAttention(absorbedQuery, latentKvCache,
-                dsaIndices, 1.0f / std::sqrt((float)qkHeadDim), latentAttention);
+                dsaIndices, 1.0f / std::sqrt((float)qkHeadDim), latentAttention,
+                dsaBackend == DsaBackend::Auto);
         } else
 #endif
         {

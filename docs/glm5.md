@@ -102,7 +102,7 @@ CUDA BF16 的 11 个 DSA 层现在加载 checkpoint 中的 Indexer 权重，执�
 
 启用 `UNIT_TEST` 后可运行 `ctest --test-dir build-fastllm -R '^glm5_next_dsa$' --output-on-failure`。回归包含独立 LayerNorm、Hadamard/FP8、KPool 参考计算，非 4 倍数分块与尾组，2048 和 32K 附近的因果 Top-K，以及连续/碎片化分页 latent attention。
 
-以下为 BF16 DSA 基线。同机对照（8 × RTX 5090，`cudapp=8`，chunk=1024，MTP=0；prefix/history 在性能测试期间关闭；预热后各 3 次取中位数）：
+以下为 FlashInfer 接入前的 BF16 DSA 基线。同机对照（8 × RTX 5090，`cudapp=8`，chunk=1024，MTP=0；prefix/history 在性能测试期间关闭；预热后各 3 次取中位数）：
 
 | 输入长度 | 原 dense TTFT | DSA TTFT | 原 dense token/s | DSA token/s | 吞吐变化 |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -119,7 +119,51 @@ nsys 记录的稀疏注意力 GPU 总耗时为 809.3 / 1734.9 ms（16K / 32K）�
 
 参数、计时样本、构建 SHA256 与验证记录见[结果 JSON](benchmarks/glm53_dsa_20261003.json)。
 
-后端由 `FASTLLM_GLM5_NEXT_DSA_BACKEND` 在模型初始化时选择：`auto`（默认）和 `bf16` 使用 BF16 learned DSA，`dense` 使用原 dense 路径。空值等同 `auto`，无效值会报错。
+## GLM-5.3-Flash FlashInfer sparse prefill
+
+显式 `CUDA_ARCH` 列表包含 SM120（例如 `-DCUDA_ARCH=120` 或 `'-DCUDA_ARCH=80;120'`），且 CUDA 编译器版本至少为 12.9、未设置 `CUDA_NO_TENSOR_CORE` 时，默认编译 FlashInfer `GLM53_NOPE` sparse prefill。运行时只在 SM120、单 batch、BF16、64 attention heads、latent rank=512、query 至少 64 token、连续输入且不在 CUDA Graph capture 内时使用。其他情况使用现有 BF16 DSA attention。DSA 的前 2048 token 仍使用 dense 全选路径。
+
+该路径直接复用固定版本的 FlashInfer `swapAB` kernel，并用现有 Dots3 `QuantizeKKernel` 将临时收集的 BF16 latent KV 转成每 128 维一组的 E4M3 + FP32 scale。每个 token 为 528 字节；2051 宽的选择结果用 `-1` 补齐到 2112，保留完整因果尾组。softmax scale 继续使用模型的 `1/16`。Q/输出接口为 BF16，kernel 内部 Q、KV 和概率使用 FP8 运算。分页缓存和历史快照仍保存 BF16，每个 chunk 重新量化临时历史，不新增持久化 FP8 状态。
+
+只需现有 CUDA/C++ 构建环境。`third_party/flashinfer_glm53` 固定上游 `7eb86aa0fdc1248fab43c89801de4ed450e35e77` 的最小头文件集合，保留逐文件 BSD-3-Clause 和项目 Apache-2.0 许可。两个 fast-div 兼容头复用现有 vendored 实现，以兼容 CUDA 12.9。新头文件只对专用 object target 可见，kernel 单独生成 `sm_120a` cubin。无需安装 FlashInfer Python 包、PyTorch、Triton 或 SGLang。
+
+需要保留 BF16 DSA attention 时，在进程启动前设置：
+
+~~~bash
+FASTLLM_GLM5_NEXT_DSA_BACKEND=bf16 ftllm server /data/models/glm5.3-flash --mtp 0
+~~~
+
+后端统一由 `FASTLLM_GLM5_NEXT_DSA_BACKEND` 控制，在模型初始化时读取：
+
+| 值 | 行为 |
+| --- | --- |
+| `auto`（默认） | learned DSA；满足条件时使用 FlashInfer，否则回退 BF16 |
+| `bf16` | learned DSA，始终使用 BF16 sparse attention |
+| `dense` | 原 dense 路径，用于对照及原有 MTP / expanded 模式 |
+
+未设置或空值等同 `auto`，其他值会报错。开发期间的 `DISABLE_DSA` / `DISABLE_FLASHINFER` 两个开关已移除。FP8 差异大于 BF16 舍入差异，生成 token 不保证与 BF16 后端一致，少量样本的一致结果不能替代模型质量评测。
+
+正式 CMake 构建复测：8 × RTX 5090，`cudapp=8`、BF16、chunk=1024、单请求、MTP=0，上下文预算 65536。性能阶段关闭 prefix/history cache，排除模型加载与首次权重重排；同一动态库切换 BF16 / FlashInfer 做 A/B（历史记录中的开关现对应 `bf16` / `auto`），各长度预热后 3 次取中位数。TTFT 包含调度和首 token，token/s 按输入长度 / TTFT 计算。
+
+| 输入长度 | BF16 DSA TTFT | FlashInfer TTFT | BF16 token/s | FlashInfer token/s | 吞吐提升 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 16384 | 6.689 s | 6.106 s | 2449.4 | 2683.4 | +9.55% |
+| 32768 | 13.656 s | 12.402 s | 2399.5 | 2642.1 | +10.11% |
+
+正式版与此前 FlashInfer 试验版在 2049/4099/16384/32768-token 输入各生成 5 token，完整 logits 全部逐位一致；BF16 后端同样与接入前基线逐位一致。FlashInfer 内部历史恢复的 5 步 logits 也逐位一致。接入时四项 CTest 全部通过（清理后将开关测试合入主测试），完整适配路径的 compute-sanitizer memcheck 为 0 errors；CPU GLM 源码、SM80 回退入口、SM80+SM120 混合配置中的专用 kernel 分别通过编译检查，其他 GPU 未做运行时验证。
+
+FP8 与 BF16 的 greedy token 在这些样本上相同，但 16K/32K 首步 logits 的相对 L2 差异为 18.9%/24.6%，余弦相似度为 0.9822/0.9707。32K 输入仍为同一 16K 序列重复两次，这是性能与回归样本，不是模型质量评测。GPU 打包与独立 CPU E4M3 打包逐位一致；端到端数值差异来自计算路径变化，不应理解为只改变 BF16 舍入。[参数、构建哈希与全部验证结果](benchmarks/glm53_flashinfer_20261003.json)。
+
+启用 `UNIT_TEST` 后运行：
+
+~~~bash
+ctest --test-dir build-fastllm -R '^glm5_next_(flashinfer.*|dsa|mla_prefill)$' --output-on-failure
+~~~
+
+新增测试包含 CPU E4M3 打包逐位对照、独立 double softmax 参考、全屏蔽行、单 key、2051→2112 补齐、非 64 倍数 query、16K/32K 历史、碎片化分页缓存，短 query、类型/布局和 CUDA Graph capture 的回退，以及强制 BF16 时与直接 BF16 kernel 的逐位对照。
+
+
+本次清理统一了后端开关和重复缓存清理代码。`auto` / `bf16` 在上述四种长度、各 5 步共 40 步的完整 logits 与各自清理前版本逐位一致，历史恢复同样一致；三种后端在 15/2047/2048/2049/4099-token 输入上各生成 5 token 均通过。3 项 GLM 与 2 项 Naive 回归通过，memcheck 为 0 errors。另有未修改的 `naive_n05_decode` 测试使用旧版 `cudaGraphInstantiate` 调用，在 CUDA 12.9 下编译失败，未计入通过项。性能表仍对应上次构建，本次未重新测量吞吐，也未补做模型质量评测。
 
 ## GPU + NUMA 混合 MoE
 

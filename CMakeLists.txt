@@ -391,6 +391,7 @@ if (USE_CUDA)
         src/devices/cuda/linear/fastllm-linear-int4group.cu
         src/devices/cuda/linear/fastllm-marlin.cu
         src/devices/cuda/linear/fastllm-linear-int4nozero.cu
+        src/devices/cuda/models/glm5-next-dsa.cpp
         src/devices/cuda/models/dots3-note-kernels.cu
         src/devices/cuda/models/naive-n05-kernels.cu
         src/devices/cuda/models/naive-n05-experts.cu
@@ -444,6 +445,21 @@ if (USE_CUDA)
         message(STATUS "DeepSeek-V4 SM120 sparse MLA kernel: OFF")
         message(STATUS "DeepSeek-V4 SM120 DeepGEMM MoE kernel: OFF")
         message(STATUS "DeepSeek-V4 SM120 DeepGEMM WoA kernel: OFF")
+    endif()
+
+    set_property(SOURCE src/devices/cuda/models/glm5-next-dsa.cpp
+        APPEND PROPERTY INCLUDE_DIRECTORIES "${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}")
+
+    # GLM53 prefill uses architecture-specific register and matrix-load
+    # instructions. Keep its newer FlashInfer headers private to this target.
+    if (FASTLLM_CUTLASS_FP8_SM120_ENABLED AND NOT CUDA_NO_TENSOR_CORE AND
+        CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9)
+        set(FASTLLM_GLM53_FLASHINFER_SM120_ENABLED ON)
+        set_property(SOURCE src/devices/cuda/models/glm5-next-dsa.cpp
+            APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_GLM53_FLASHINFER_SM120)
+        message(STATUS "GLM53 FlashInfer sparse prefill: ON (sm_120a)")
+    else()
+        message(STATUS "GLM53 FlashInfer sparse prefill: OFF (BF16 DSA fallback)")
     endif()
 
     # Marlin 内核需要 sm_75+，但通过 __CUDA_ARCH__ 宏保护可在低算力（如 sm_70）下编译为占位实现，
@@ -619,6 +635,20 @@ if (FASTLLM_CUDA_SM120_SOURCES)
     set(FASTLLM_CUDA_SM120_OBJECTS $<TARGET_OBJECTS:fastllm_cuda_sm120>)
 endif()
 
+if (FASTLLM_GLM53_FLASHINFER_SM120_ENABLED)
+    add_library(fastllm_glm53_flashinfer_sm120 OBJECT
+        src/devices/cuda/models/glm5-next-dsa-sm120.cu)
+    # nvcc's -arch shorthand also emits generic compute_120 PTX, which cannot
+    # represent these instructions. Emit only the architecture-specific cubin.
+    set_target_properties(fastllm_glm53_flashinfer_sm120 PROPERTIES
+        CUDA_ARCHITECTURES OFF POSITION_INDEPENDENT_CODE ON)
+    target_compile_options(fastllm_glm53_flashinfer_sm120 PRIVATE
+        "--generate-code=arch=compute_120a,code=sm_120a")
+    target_include_directories(fastllm_glm53_flashinfer_sm120 BEFORE PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/flashinfer_glm53/include")
+    set(FASTLLM_GLM53_FLASHINFER_OBJECTS $<TARGET_OBJECTS:fastllm_glm53_flashinfer_sm120>)
+endif()
+
 if (PY_API)
     if(POLICY CMP0148)
         cmake_policy(SET CMP0148 NEW)
@@ -632,7 +662,7 @@ if (PY_API)
 
     include_directories(third_party/pybind11/include)
     file(GLOB FASTLLM_CXX_HEADERS include/**/*.h)
-    add_library(pyfastllm MODULE src/pybinding.cpp ${FASTLLM_CXX_SOURCES} ${FASTLLM_CXX_HEADERS} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_CUDA_SM120_OBJECTS} ${FASTLLM_CUDA_SM90_OBJECTS} ${FASTLLM_TFACC_SOURCES} ${FASTLLM_TOPS_SOURCES})
+    add_library(pyfastllm MODULE src/pybinding.cpp ${FASTLLM_CXX_SOURCES} ${FASTLLM_CXX_HEADERS} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_CUDA_SM120_OBJECTS} ${FASTLLM_CUDA_SM90_OBJECTS} ${FASTLLM_GLM53_FLASHINFER_OBJECTS} ${FASTLLM_TFACC_SOURCES} ${FASTLLM_TOPS_SOURCES})
     target_link_libraries(pyfastllm PUBLIC pybind11::module ${FASTLLM_LINKED_LIBS})
     pybind11_extension(pyfastllm)
 else()
@@ -652,6 +682,10 @@ if (FASTLLM_CUDA_SM120_SOURCES)
     # fastllm consumer gets the implementations referenced by the core code.
     target_link_libraries(
         fastllm INTERFACE $<TARGET_OBJECTS:fastllm_cuda_sm120>)
+endif()
+
+if (FASTLLM_GLM53_FLASHINFER_SM120_ENABLED)
+    target_link_libraries(fastllm INTERFACE ${FASTLLM_GLM53_FLASHINFER_OBJECTS})
 endif()
 
 add_executable(main main.cpp)
@@ -1041,6 +1075,16 @@ if (UNIT_TEST)
         target_include_directories(glm5_next_dsa_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         add_test(NAME glm5_next_dsa COMMAND glm5_next_dsa_test)
         set_tests_properties(glm5_next_dsa PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+
+        add_executable(glm5_next_flashinfer_test test/basic/test_glm5_next_flashinfer.cpp)
+        target_link_libraries(glm5_next_flashinfer_test PRIVATE fastllm)
+        target_include_directories(glm5_next_flashinfer_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        if (FASTLLM_GLM53_FLASHINFER_SM120_ENABLED)
+            target_compile_definitions(glm5_next_flashinfer_test PRIVATE FASTLLM_ENABLE_GLM53_FLASHINFER_SM120)
+        endif()
+        add_test(NAME glm5_next_flashinfer COMMAND glm5_next_flashinfer_test)
+        set_tests_properties(glm5_next_flashinfer PROPERTIES
+            LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
 
         add_executable(glm5_next_mla_prefill_test test/basic/test_glm5_next_mla_prefill.cpp)
         target_link_libraries(glm5_next_mla_prefill_test PRIVATE fastllm)
@@ -1488,7 +1532,7 @@ if (BUILD_CLI)
     target_link_libraries(FastllmStudio_cli fastllm)
 endif()
 
-add_library(fastllm_tools SHARED ${FASTLLM_CXX_SOURCES} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_CUDA_SM120_OBJECTS} ${FASTLLM_CUDA_SM90_OBJECTS} ${FASTLLM_TFACC_SOURCES} ${FASTLLM_TOPS_SOURCES} tools/src/pytools.cpp)
+add_library(fastllm_tools SHARED ${FASTLLM_CXX_SOURCES} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_CUDA_SM120_OBJECTS} ${FASTLLM_CUDA_SM90_OBJECTS} ${FASTLLM_GLM53_FLASHINFER_OBJECTS} ${FASTLLM_TFACC_SOURCES} ${FASTLLM_TOPS_SOURCES} tools/src/pytools.cpp)
 target_link_libraries(fastllm_tools PUBLIC ${FASTLLM_LINKED_LIBS})
 
 set(BUILD_INFO_USE_CUDA "false")
