@@ -12,6 +12,12 @@
 #include <vector>
 
 namespace fastllm {
+    struct Glm5NextIndexerCache {
+        Data keys, tailKeys, tailGates;
+        Data hadamard; // immutable workspace, not part of prefix snapshots
+        int tokens = 0;
+    };
+
     class Glm5NextModel : public basellm {
     public:
         Glm5NextModel();
@@ -97,6 +103,7 @@ namespace fastllm {
         struct HistoryCacheMemory {
             std::vector<int> tokens;
             std::vector<std::pair<Data, Data>> pastKeyValues;
+            std::vector<Glm5NextIndexerCache> indexer;
             int sequenceLength = 0;
             uint64_t bytes = 0;
             bool recurrentStateOnCpu = false;
@@ -246,8 +253,14 @@ namespace fastllm {
         float hcEps = 1e-6f;
 
         int indexTopK = 0;
+        enum class DsaBackend { Auto, BFloat16, Dense };
+        DsaBackend dsaBackend = DsaBackend::Auto;
+        bool UsesDsa() const { return dsaBackend != DsaBackend::Dense; }
+        std::map<const std::vector<std::pair<Data, Data>> *,
+                 std::vector<Glm5NextIndexerCache>> indexerCaches;
+        std::mutex indexerCachesMutex;
         // DSA history is retained by page reference rather than copied.  This
-        // limit therefore applies only to the fixed-size KDA recurrent state;
+        // limit covers KDA recurrent state and the pooled Indexer cache;
         // larger state snapshots are tiered to host memory.
         uint64_t historyCacheGpuStateLimitBytes =
             1024ULL * 1024ULL * 1024ULL;

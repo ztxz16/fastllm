@@ -16,6 +16,10 @@ void FastllmCudaNaiveTrimCache(fastllm::Data &key, fastllm::Data &value, int kee
 // Row r considers only keys [0, queryStart + r]; missing slots are -1.
 void FastllmCudaNaiveTopK(const fastllm::Data &scores, int queryStart, int topK,
                          fastllm::Data &indices);
+// Reuse the row quantizer for Indexer Q/K. Values are exact E4M3 numbers in
+// BF16 storage, with a separate FP32 scale. roundScale selects UE8M0 scales.
+bool FastllmCudaNaiveQuantizeIndexer(const fastllm::Data &input,
+    fastllm::Data &values, fastllm::Data &scales, bool roundScale);
 // Only Q is optionally E4M3-rounded; Indexer K always retains its BF16 input.
 void FastllmCudaNaiveIndexer(const fastllm::Data &query,
                             const fastllm::Data &weights,

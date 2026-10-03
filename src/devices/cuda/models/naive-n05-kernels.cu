@@ -1010,6 +1010,28 @@ void FastllmCudaNaiveRopeQKScaleV(fastllm::Data &q, fastllm::Data &k,
     CheckLaunch();
 }
 
+bool FastllmCudaNaiveQuantizeIndexer(const fastllm::Data &input,
+        fastllm::Data &values, fastllm::Data &scales, bool roundScale) {
+#ifdef FASTLLM_NAIVE_DSA_MMA
+    using namespace fastllm;
+    if (input.dataDevice != DataDevice::CUDA || input.dataType != BFLOAT16 ||
+        input.cudaData == nullptr || input.dims.empty() || input.dims.back() != 128 ||
+        input.Count(0) == 0 || input.Count(0) / 128 > INT_MAX ||
+        input.strides.back() != 1) return false;
+    const int rows = input.Count(0) / 128;
+    Output(values, BFLOAT16, input.dims);
+    auto dims = input.dims; dims.pop_back();
+    if (dims.empty()) dims.push_back(1);
+    Output(scales, FLOAT32, dims);
+    naive_dsa_mma::QuantizeIndexer<<<rows, 128>>>(
+        (const BF16 *)input.cudaData, (BF16 *)values.cudaData,
+        (float *)scales.cudaData, 128, 0, roundScale);
+    return cudaGetLastError() == cudaSuccess;
+#else
+    return false;
+#endif
+}
+
 void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &weights,
                             const fastllm::Data &packedKeys, int heads, int dim,
                             int queryStart, int topK, bool fp8Query, fastllm::Data &indices) {

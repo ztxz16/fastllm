@@ -4059,7 +4059,7 @@ __global__ __launch_bounds__(256) void FastllmRMSNormBFloat16Hidden3072ExactKern
 #endif
 
 template <int THREAD_PER_BLOCK>
-__global__ void FastllmLayerNormKernelInner1(float *input, float *gamma, float *beta, float *output, int outer, int channels) {
+__global__ void FastllmLayerNormKernelInner1(float *input, float *gamma, float *beta, float *output, int outer, int channels, double epsilon = 1e-10) {
     int o = blockIdx.x;
     input = input + o * channels;
     output = output + o * channels;
@@ -4094,7 +4094,7 @@ __global__ void FastllmLayerNormKernelInner1(float *input, float *gamma, float *
     if (tid == 0) {
         mean = sdata[0] / channels;
         var = sdata2[0] + mean * mean * channels - 2 * mean * channels * mean;
-        var = sqrt(var / channels + 1e-10);
+        var = sqrt(var / channels + epsilon);
     }
     __syncthreads();
 
@@ -10424,6 +10424,23 @@ bool FastllmCudaRMSNormPartApply(const fastllm::Data &input, fastllm::Data &weig
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
     return true;
+}
+
+bool FastllmCudaLayerNormWithEpsilon(const fastllm::Data &input,
+        const fastllm::Data &gamma, const fastllm::Data &beta,
+        fastllm::Data &output, float epsilon) {
+    using namespace fastllm;
+    if (input.dataType != FLOAT32 || gamma.dataType != FLOAT32 ||
+        beta.dataType != FLOAT32 || output.dataType != FLOAT32 ||
+        input.dataDevice != DataDevice::CUDA || gamma.dataDevice != DataDevice::CUDA ||
+        beta.dataDevice != DataDevice::CUDA || output.dataDevice != DataDevice::CUDA ||
+        input.dims.empty() || input.dims.back() != 128 || output.dims != input.dims ||
+        gamma.Count(0) != 128 || beta.Count(0) != 128 || epsilon <= 0 ||
+        !input.cudaData || !gamma.cudaData || !beta.cudaData || !output.cudaData) return false;
+    FastllmLayerNormKernelInner1<64><<<input.Count(0) / 128, 64>>>(
+        (float *)input.cudaData, (float *)gamma.cudaData, (float *)beta.cudaData,
+        (float *)output.cudaData, input.Count(0) / 128, 128, epsilon);
+    return cudaGetLastError() == cudaSuccess;
 }
 
 bool FastllmCudaLayerNorm(const fastllm::Data &input, fastllm::Data &gamma, fastllm::Data &beta, fastllm::Data &output, int axis) {

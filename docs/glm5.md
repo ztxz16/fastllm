@@ -92,6 +92,35 @@ CUDA BF16 prefill 在 query 长度至少 64、QK/V 维度为 256、压缩 KV ran
 
 删除多余 query 转置和视图后，原 7 组样本加上 1/33/63/64-token 边界输入，共 11 组、88 个生成步骤的 logits 和 token 与清理前快速版本逐位一致（最大绝对差为 0）；清理后 16K TTFT 中位数为 6.645 秒。此结论仅针对代码清理，不表示快速 prefill 与原 absorbed MLA 逐位一致。
 
+## GLM-5.3-Flash learned DSA
+
+CUDA BF16 的 11 个 DSA 层现在加载 checkpoint 中的 Indexer 权重，执行 32-head、128-dim 的学习式索引。KPool-4 使用逐维 gate + APE 的 softmax 汇聚，经过 BF16、归一化 Hadamard 和 UE8M0 scale 的 E4M3 舍入后，对可见完整组评分，选择最多 512 组，展开成 2048 个 token，再附加当前未完整组的 0–3 个 token。2048 token 以内仍全选，但同时维护索引缓存。
+
+接入复用 DeepSeek-V4 的压缩汇聚、DeepSeek-V4.1 的评分/Top-K/512 维稀疏注意力、Qwen4 的组索引展开和 Naive 的 FP8 量化。没有新增 CUDA kernel；仅为现有 LayerNorm 和量化器增加参数，并补充 host 接口。为复用 BF16 Tensor Core 评分，FP8 舍入后的值按 2 的幂反量化后保存在 BF16 中。分页 latent KV 保持原格式，稀疏注意力临时收集连续历史；KPool 缓存和尾组随 chunk、decode 和历史快照保持同步。
+
+当前支持 `--mtp 0` 的 compressed MLA 路径。MTP 的索引共享/回滚及 expanded attention 尚未接入。`FASTLLM_GLM5_NEXT_DSA_BACKEND=dense` 可恢复原 dense 路径用于对照。稀疏选择会改变长输入的注意力语义，不保证与旧 dense 路径生成相同 token，也不承诺与 SGLang 的不同 GEMM 后端逐位相同。
+
+启用 `UNIT_TEST` 后可运行 `ctest --test-dir build-fastllm -R '^glm5_next_dsa$' --output-on-failure`。回归包含独立 LayerNorm、Hadamard/FP8、KPool 参考计算，非 4 倍数分块与尾组，2048 和 32K 附近的因果 Top-K，以及连续/碎片化分页 latent attention。
+
+以下为 BF16 DSA 基线。同机对照（8 × RTX 5090，`cudapp=8`，chunk=1024，MTP=0；prefix/history 在性能测试期间关闭；预热后各 3 次取中位数）：
+
+| 输入长度 | 原 dense TTFT | DSA TTFT | 原 dense token/s | DSA token/s | 吞吐变化 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 16384 | 6.651 s | 6.693 s | 2463.3 | 2448.0 | -0.62% |
+| 32768 | 15.237 s | 13.665 s | 2150.5 | 2397.9 | +11.50% |
+
+同一动态库切换 dense / BF16 DSA 做 A/B（记录中的旧开关现已统一为 `FASTLLM_GLM5_NEXT_DSA_BACKEND`），排除加载与首次重排。32K 输入为 16K token 序列重复两次；这是长度扩展测试，不能用于评判回答质量。32K/16K 的 TTFT 倍率从 2.291 降到 2.042；16K 尚无性能收益。
+
+nsys 记录的稀疏注意力 GPU 总耗时为 809.3 / 1734.9 ms（16K / 32K），Indexer 打分为 19.3 / 70.3 ms，Top-K 为 5.9 / 18.2 ms。优先继续优化稀疏注意力，Top-K 的端到端占比已经很小。实际稀疏调用为 154 / 330 次，前两个 1024-token chunk 保留 dense 全选路径。
+
+独立 PyTorch 对照使用真实第 3 层权重、随机 BF16 hidden states，并关闭 BF16 GEMM 的降精度归约以对齐 FP32 累加。在 4099-token、chunk=1024 的测试中，量化 KPool key 有 99.9626% 逐值相同，选中 token 集合的平均重合率超过 99.99%。这是 Indexer 中间量验证，不是完整 SGLang 模型的质量或逐位等价测试。CUDA memcheck 为 0 errors，Naive 原有 CUDA 回归通过；CPU/GPU 历史快照恢复 4096 token 后的 5 步完整 logits 均逐位相同。
+
+补充 pooled Indexer 的上下文显存预算后，最终构建再次各测 3 次，16K / 32K 中位 TTFT 为 6.693 / 13.667 秒。
+
+参数、计时样本、构建 SHA256 与验证记录见[结果 JSON](benchmarks/glm53_dsa_20261003.json)。
+
+后端由 `FASTLLM_GLM5_NEXT_DSA_BACKEND` 在模型初始化时选择：`auto`（默认）和 `bf16` 使用 BF16 learned DSA，`dense` 使用原 dense 路径。空值等同 `auto`，无效值会报错。
+
 ## GPU + NUMA 混合 MoE
 
 ~~~bash

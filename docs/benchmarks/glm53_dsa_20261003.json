@@ -1,0 +1,380 @@
+{
+  "base_commit": "42bfc71ccf6afd5c559b1a4ec5712df02b858ec5",
+  "hardware": "8 x RTX 5090",
+  "mode": "cudapp=8, BF16, chunk=1024, MTP=0, prefix/history disabled during timings",
+  "measure": "Three interleaved 16K/32K requests per mode after warmup, one generated token, no profiler. 32K repeats the 16K input twice.",
+  "model_quality_evaluation": false,
+  "new_cuda_kernels": false,
+  "library_sha256": "62d905f2f68f1c6a08e8be8729ed3c38b95263ad785112e7cbbffc578457453a",
+  "timings": [
+    {
+      "tokens": 16384,
+      "samples_s": {
+        "dense": [
+          6.646796843037009,
+          6.6512699000304565,
+          6.669067317037843
+        ],
+        "dsa": [
+          6.688639294006862,
+          6.692870822036639,
+          6.708568636036944
+        ]
+      },
+      "median_ttft_s": {
+        "dense": 6.6512699000304565,
+        "dsa": 6.692870822036639
+      },
+      "throughput_token_s": {
+        "dense": 2463.2890028902566,
+        "dsa": 2447.977920932643
+      },
+      "throughput_change_pct": -0.6215706699314927,
+      "latency_reduction_pct": -0.6254583354975862
+    },
+    {
+      "tokens": 32768,
+      "samples_s": {
+        "dense": [
+          15.243154600029811,
+          15.237268047989346,
+          15.202400505950209
+        ],
+        "dsa": [
+          13.670254632015713,
+          13.665475804999005,
+          13.629793388012331
+        ]
+      },
+      "median_ttft_s": {
+        "dense": 15.237268047989346,
+        "dsa": 13.665475804999005
+      },
+      "throughput_token_s": {
+        "dense": 2150.5167394048663,
+        "dsa": 2397.8674776924377
+      },
+      "throughput_change_pct": 11.501921085070155,
+      "latency_reduction_pct": 10.315446561942899
+    }
+  ],
+  "validation": {
+    "unit": "PASS",
+    "naive_regression": "PASS",
+    "cuda_memcheck": "0 errors",
+    "indexer": {
+      "reference": "Independent PyTorch implementation of pinned SGLang operation order; real layer 3 weights, random BF16 hidden states; not a full SGLang model comparison.",
+      "key_exact_fraction": 0.9996261596679688,
+      "key_rmse": 0.0015229395357891917,
+      "key_max_abs": 0.25,
+      "chunks": [
+        {
+          "start": 2048,
+          "rows": 1024,
+          "mean_token_set_overlap": 0.9999675983322318,
+          "min_token_set_overlap": 0.998046875,
+          "future_rows": 0
+        },
+        {
+          "start": 3072,
+          "rows": 1024,
+          "mean_token_set_overlap": 0.9999409224220375,
+          "min_token_set_overlap": 0.998046875,
+          "future_rows": 0
+        },
+        {
+          "start": 4096,
+          "rows": 3,
+          "mean_token_set_overlap": 1.0,
+          "min_token_set_overlap": 1.0,
+          "future_rows": 0
+        }
+      ],
+      "reference_accumulation": "FP32 accumulation; PyTorch allow_bf16_reduced_precision_reduction=False, allow_tf32=False."
+    },
+    "cpu_history": {
+      "restored_prefix_tokens": 4096,
+      "generated_steps": 5,
+      "full_logits_bitwise_equal": true,
+      "cold": {
+        "label": "history-cold",
+        "input_tokens": 4099,
+        "output_tokens": [
+          4938,
+          30491,
+          13,
+          88269,
+          44120
+        ],
+        "profiled": false,
+        "ttft_s": 1.786952496971935,
+        "elapsed_s": 1.9344456339604221,
+        "token_sha256": "34817b895956e836627a93cfc251d20ff5140f43e43ce884f8ab158153e212db",
+        "logits_sha256": [
+          "8b2eab9005889c98dc6b6c133663bace9472f9b1e74e99a9a38ce8c745195130",
+          "e54f738a31745912e95a492fc345126b1d8030f1a7b49a4feea96aa0c7a92cf8",
+          "7da7d378ce0e8a3a0ba3287c73a45040b45b30695ece505d923f1074a835702d",
+          "af54a398b2eea917bd7754ffa06767ce12497c4fbc1c9d9594597dbae549bd5a",
+          "0b4ce8cd261dd5f7c15913575bcdce62c27927f0e8f6537808a0b40c0c4f6d6d"
+        ]
+      },
+      "restored": {
+        "label": "history-restored",
+        "input_tokens": 4099,
+        "output_tokens": [
+          4938,
+          30491,
+          13,
+          88269,
+          44120
+        ],
+        "profiled": false,
+        "ttft_s": 0.06473101704614237,
+        "elapsed_s": 0.17466593300923705,
+        "token_sha256": "34817b895956e836627a93cfc251d20ff5140f43e43ce884f8ab158153e212db",
+        "logits_sha256": [
+          "8b2eab9005889c98dc6b6c133663bace9472f9b1e74e99a9a38ce8c745195130",
+          "e54f738a31745912e95a492fc345126b1d8030f1a7b49a4feea96aa0c7a92cf8",
+          "7da7d378ce0e8a3a0ba3287c73a45040b45b30695ece505d923f1074a835702d",
+          "af54a398b2eea917bd7754ffa06767ce12497c4fbc1c9d9594597dbae549bd5a",
+          "0b4ce8cd261dd5f7c15913575bcdce62c27927f0e8f6537808a0b40c0c4f6d6d"
+        ]
+      }
+    },
+    "gpu_history": {
+      "restored_prefix_tokens": 4096,
+      "generated_steps": 5,
+      "full_logits_bitwise_equal": true,
+      "cold": {
+        "label": "history-cold",
+        "input_tokens": 4099,
+        "output_tokens": [
+          4938,
+          30491,
+          13,
+          88269,
+          44120
+        ],
+        "profiled": false,
+        "ttft_s": 1.7064095109817572,
+        "elapsed_s": 1.8181805899948813,
+        "token_sha256": "34817b895956e836627a93cfc251d20ff5140f43e43ce884f8ab158153e212db",
+        "logits_sha256": [
+          "8b2eab9005889c98dc6b6c133663bace9472f9b1e74e99a9a38ce8c745195130",
+          "e54f738a31745912e95a492fc345126b1d8030f1a7b49a4feea96aa0c7a92cf8",
+          "7da7d378ce0e8a3a0ba3287c73a45040b45b30695ece505d923f1074a835702d",
+          "af54a398b2eea917bd7754ffa06767ce12497c4fbc1c9d9594597dbae549bd5a",
+          "0b4ce8cd261dd5f7c15913575bcdce62c27927f0e8f6537808a0b40c0c4f6d6d"
+        ]
+      },
+      "restored": {
+        "label": "history-restored",
+        "input_tokens": 4099,
+        "output_tokens": [
+          4938,
+          30491,
+          13,
+          88269,
+          44120
+        ],
+        "profiled": false,
+        "ttft_s": 0.03766018198803067,
+        "elapsed_s": 0.12782648502616212,
+        "token_sha256": "34817b895956e836627a93cfc251d20ff5140f43e43ce884f8ab158153e212db",
+        "logits_sha256": [
+          "8b2eab9005889c98dc6b6c133663bace9472f9b1e74e99a9a38ce8c745195130",
+          "e54f738a31745912e95a492fc345126b1d8030f1a7b49a4feea96aa0c7a92cf8",
+          "7da7d378ce0e8a3a0ba3287c73a45040b45b30695ece505d923f1074a835702d",
+          "af54a398b2eea917bd7754ffa06767ce12497c4fbc1c9d9594597dbae549bd5a",
+          "0b4ce8cd261dd5f7c15913575bcdce62c27927f0e8f6537808a0b40c0c4f6d6d"
+        ]
+      }
+    }
+  },
+  "scaling_32k_over_16k": {
+    "dense": 2.2908810312929226,
+    "dsa": 2.041795840434375
+  },
+  "profile": {
+    "16384": {
+      "sparse_attention": {
+        "gpu_ms": 809.297202,
+        "calls": 154
+      },
+      "indexer_score": {
+        "gpu_ms": 19.306644,
+        "calls": 154
+      },
+      "top_k": {
+        "gpu_ms": 5.928791,
+        "calls": 154
+      },
+      "fp8_quantization": {
+        "gpu_ms": 2.913983,
+        "calls": 330
+      },
+      "kpool": {
+        "gpu_ms": 0.385828,
+        "calls": 176
+      },
+      "expand_indices": {
+        "gpu_ms": 1.035082,
+        "calls": 154
+      }
+    },
+    "32768": {
+      "sparse_attention": {
+        "gpu_ms": 1734.857589,
+        "calls": 330
+      },
+      "indexer_score": {
+        "gpu_ms": 70.310926,
+        "calls": 330
+      },
+      "top_k": {
+        "gpu_ms": 18.230876,
+        "calls": 330
+      },
+      "fp8_quantization": {
+        "gpu_ms": 6.205842,
+        "calls": 682
+      },
+      "kpool": {
+        "gpu_ms": 0.770596,
+        "calls": 352
+      },
+      "expand_indices": {
+        "gpu_ms": 2.219188,
+        "calls": 330
+      }
+    }
+  },
+  "profile_note": "CUDA software trace; includes kernel sums across all eight GPUs, excludes loading and warmup; no dropped-event warning was emitted.",
+  "final_verification": {
+    "library_sha256": "b9ea3890da07e31240d197882d298140b0f4ddde3424c2da915bbed0075a84d6",
+    "change_since_ab": "Include pooled Indexer memory in context budgeting. No kernel or arithmetic change.",
+    "samples": [
+      {
+        "label": "warmup-16k",
+        "input_tokens": 16384,
+        "output_tokens": [
+          785
+        ],
+        "profiled": false,
+        "ttft_s": 78.67016266495921,
+        "elapsed_s": 78.67332269699546,
+        "token_sha256": "bfaa9cdfa45fedb5e33d37e2a4c425b9ff9b167037f748262f62c2e579ce4417"
+      },
+      {
+        "label": "warmup-32k",
+        "input_tokens": 32768,
+        "output_tokens": [
+          785
+        ],
+        "profiled": false,
+        "ttft_s": 13.624290278996341,
+        "elapsed_s": 13.628077783971094,
+        "token_sha256": "30142b7fa44cf1746262936cb516db8f42c7b633664eb91428cc026d5c742bc8"
+      },
+      {
+        "label": "timed-0",
+        "input_tokens": 16384,
+        "output_tokens": [
+          785
+        ],
+        "profiled": false,
+        "ttft_s": 6.689945379039273,
+        "elapsed_s": 6.692724419001024,
+        "token_sha256": "bfaa9cdfa45fedb5e33d37e2a4c425b9ff9b167037f748262f62c2e579ce4417"
+      },
+      {
+        "label": "timed-0",
+        "input_tokens": 32768,
+        "output_tokens": [
+          785
+        ],
+        "profiled": false,
+        "ttft_s": 13.672266331966966,
+        "elapsed_s": 13.676309116999619,
+        "token_sha256": "30142b7fa44cf1746262936cb516db8f42c7b633664eb91428cc026d5c742bc8"
+      },
+      {
+        "label": "timed-1",
+        "input_tokens": 16384,
+        "output_tokens": [
+          785
+        ],
+        "profiled": false,
+        "ttft_s": 6.693265220033936,
+        "elapsed_s": 6.696106582006905,
+        "token_sha256": "bfaa9cdfa45fedb5e33d37e2a4c425b9ff9b167037f748262f62c2e579ce4417"
+      },
+      {
+        "label": "timed-1",
+        "input_tokens": 32768,
+        "output_tokens": [
+          785
+        ],
+        "profiled": false,
+        "ttft_s": 13.666566555970348,
+        "elapsed_s": 13.670433825987857,
+        "token_sha256": "30142b7fa44cf1746262936cb516db8f42c7b633664eb91428cc026d5c742bc8"
+      },
+      {
+        "label": "timed-2",
+        "input_tokens": 16384,
+        "output_tokens": [
+          785
+        ],
+        "profiled": false,
+        "ttft_s": 6.71166891901521,
+        "elapsed_s": 6.7145013230037875,
+        "token_sha256": "bfaa9cdfa45fedb5e33d37e2a4c425b9ff9b167037f748262f62c2e579ce4417"
+      },
+      {
+        "label": "timed-2",
+        "input_tokens": 32768,
+        "output_tokens": [
+          785
+        ],
+        "profiled": false,
+        "ttft_s": 13.63301584101282,
+        "elapsed_s": 13.63675875600893,
+        "token_sha256": "30142b7fa44cf1746262936cb516db8f42c7b633664eb91428cc026d5c742bc8"
+      },
+      {
+        "label": "history-extend",
+        "input_tokens": 6151,
+        "output_tokens": [
+          304,
+          15267,
+          13,
+          20245,
+          4128
+        ],
+        "profiled": false,
+        "ttft_s": 0.9218459470430389,
+        "elapsed_s": 1.0144335040240549,
+        "token_sha256": "5c07f2b841c474667953515b37dc09bfee9d064de0f38d33219427dc3248c1a8",
+        "logits_sha256": [
+          "f8ac7e052fbfb3d39784246e2f705ae22db65bac08e86e6d332124e363edddb0",
+          "b5ec11a0b3ff388e5d0fec9fabe711bcce66188865c31c5a303a9909eb513863",
+          "d4123b94cfce7ab461b3e8941015e033ae44df838d75887b26020f3df4bc0f20",
+          "da7a660b9902897315311f78331670b33589d737b3338293f50bacad7fd8a483",
+          "3d44c6e49b0992d2ebf526b3e0e81532e6da686bf6d8d49bd75f2cfa1b5c19a1"
+        ]
+      }
+    ],
+    "median_ttft_s": {
+      "16384": 6.693265220033936,
+      "32768": 13.666566555970348
+    },
+    "history_reference": "validation.gpu_history contains the cold/restored samples from this same build."
+  },
+  "sglang_reference_revision": "00bcc25f6c857dc7cfb9e624ee38269d4c3735f6",
+  "limits": [
+    "CUDA BF16, compressed MLA, MTP=0. MTP rollback/index sharing not integrated.",
+    "No full model quality evaluation or bitwise SGLang equivalence claim.",
+    "Original installed ftllm library was preserved; benchmarks used isolated Python package and rebuilt shared library."
+  ]
+}

@@ -146,7 +146,7 @@ __global__ __launch_bounds__(kThreads) void Values(const float *prob, const BF16
 // Store the original E4M3 quantization result exactly in BF16, with its FP32
 // block scale kept separately. Do not round dequantized FP32 values to BF16.
 __global__ void QuantizeIndexer(const BF16 *input, BF16 *values, float *scales,
-                                int stride, int offset) {
+                                int stride, int offset, bool roundScale = false) {
     __shared__ float maximum[128];
     const int d = threadIdx.x, row = blockIdx.x;
     float x = (float)input[(size_t)row * stride + offset + d];
@@ -157,6 +157,7 @@ __global__ void QuantizeIndexer(const BF16 *input, BF16 *values, float *scales,
         __syncthreads();
     }
     float scale = fmaxf(maximum[0], 1e-4f) / 448.0f;
+    if (roundScale) scale = exp2f(ceilf(log2f(scale)));
     float value = (float)__nv_fp8_e4m3(fmaxf(-448.0f, fminf(448.0f, x / scale)));
     values[(size_t)row * 128 + d] = __float2bfloat16(value);
     if (d == 0) scales[row] = scale;

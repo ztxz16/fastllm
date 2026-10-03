@@ -1082,6 +1082,14 @@ bool FastllmCudaDeepSeekV4BuildIndexerTopKGraph(
                                                       int betaSlow,
                                                       fastllm::Data &indices,
                                                       fastllm::Data &lengths);
+
+// Host adapters for existing kernels, shared by GLM's KPool indexer.
+bool FastllmCudaLayerNormWithEpsilon(const fastllm::Data &input,
+    const fastllm::Data &gamma, const fastllm::Data &beta,
+    fastllm::Data &output, float epsilon);
+bool FastllmCudaQwen4ExpandSelectedBlocks(const fastllm::Data &selected,
+    int keyLength, int queryStart, int compressRatio, fastllm::Data &indices);
+
 // Dots3-Note DSA indexer. Q RoPE/NoPE halves are FP32 after leading-RoPE,
 // K is BF16 after LayerNorm + leading-RoPE, and weights are the 64 projected
 // coefficients. Quantized Q/K tensors use INT8 storage for raw E4M3 bytes;

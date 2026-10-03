@@ -3244,6 +3244,27 @@ static bool FastllmCudaQwen4QSASelectLaunch(
     return cudaGetLastError() == cudaSuccess;
 }
 
+bool FastllmCudaQwen4ExpandSelectedBlocks(const fastllm::Data &selected,
+        int keyLength, int queryStart, int compressRatio, fastllm::Data &indices) {
+    using namespace fastllm;
+    if (selected.dataDevice != DataDevice::CUDA || selected.dataType != INT32 ||
+        !selected.cudaData || selected.dims.size() != 2 || selected.dims[0] <= 0 ||
+        selected.dims[1] <= 0 || compressRatio <= 0 || queryStart < 0 ||
+        (int64_t)queryStart + selected.dims[0] > keyLength) return false;
+    const int rows = selected.dims[0], count = selected.dims[1];
+    const int width = count * compressRatio + compressRatio - 1;
+    indices.dataType = INT32;
+    indices.Resize({rows, width});
+    indices.ToDevice(DataDevice::CUDA, selected.dataDeviceIds, false);
+    indices.Allocate(false);
+    const int blocks = std::min<uint64_t>(1024, ((uint64_t)rows * width + 255) / 256);
+    Qwen4QSAExpandIndicesKernel<<<blocks, 256, 0, cudaStreamPerThread>>>(
+        (const int32_t *)selected.cudaData, (int32_t *)indices.cudaData,
+        rows, count, compressRatio, keyLength / compressRatio,
+        keyLength, width, queryStart, nullptr);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 bool FastllmCudaQwen4QSASelect(
         const fastllm::Data &query,
         const fastllm::Data &compressedKeys,
