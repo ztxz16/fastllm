@@ -622,8 +622,10 @@ static std::vector<float> IndexerOperands(const std::vector<uint16_t> &input,
     std::vector<float> out((size_t)rows * 128);
     for (int row = 0; row < rows; ++row) {
         float maximum = 0.f;
-        for (int d = 0; d < 128; ++d)
-            maximum = std::max(maximum, std::abs(FromBits(input[(size_t)row * stride + offset + d])));
+        if (fp8) {
+            for (int d = 0; d < 128; ++d)
+                maximum = std::max(maximum, std::abs(FromBits(input[(size_t)row * stride + offset + d])));
+        }
         float scale = std::max(maximum, 1e-4f) / 448.f;
         for (int d = 0; d < 128; ++d) {
             float x = FromBits(input[(size_t)row * stride + offset + d]);
@@ -633,8 +635,11 @@ static std::vector<float> IndexerOperands(const std::vector<uint16_t> &input,
     return out;
 }
 static void TestIndexer() {
-    struct Shape { int rows, keys, heads, stride; bool fp8; };
+    struct Shape { int rows, keys, heads, stride; bool fp8Query; };
     const Shape shapes[] = {
+        // Decode MMA uses 64-key tiles; cover partial tiles and scalar K loads.
+        {1,63,16,896,true}, {1,64,16,896,true}, {1,65,16,897,true},
+        {1,127,16,896,true}, {1,129,16,897,true},
         {1,257,16,896,true}, {31,4099,16,897,true},
         {32,32767,16,896,true}, {32,32768,16,896,true},
         {33,32769,16,897,true}, {64,16384,16,896,true},
@@ -663,10 +668,10 @@ static void TestIndexer() {
         bool smallDecode = s.rows == 1 && s.keys == 257;
         int past = smallDecode ? 63 : (s.rows == 1 && s.stride == 897 ? s.keys - 65 : s.keys - s.rows);
         int top = smallDecode ? 80 : 2048;
-        FastllmCudaNaiveIndexer(q,w,k,s.heads,128,past,top,s.fp8,out);
+        FastllmCudaNaiveIndexer(q,w,k,s.heads,128,past,top,s.fp8Query,out);
         auto got = Read<int>(out);
-        auto qv = IndexerOperands(qb,s.rows*s.heads,128,0,s.fp8);
-        auto kv = IndexerOperands(kb,s.keys,s.stride,s.stride-128,s.fp8);
+        auto qv = IndexerOperands(qb,s.rows*s.heads,128,0,s.fp8Query);
+        auto kv = IndexerOperands(kb,s.keys,s.stride,s.stride-128,false);
         std::vector<int> rows={0,s.rows/2,s.rows-1};
         std::sort(rows.begin(), rows.end());
         rows.erase(std::unique(rows.begin(), rows.end()), rows.end());

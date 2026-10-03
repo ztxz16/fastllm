@@ -11,11 +11,12 @@ void FastllmCudaNaiveTrimCache(fastllm::Data &key, fastllm::Data &value, int kee
 // Row r considers only keys [0, queryStart + r]; missing slots are -1.
 void FastllmCudaNaiveTopK(const fastllm::Data &scores, int queryStart, int topK,
                          fastllm::Data &indices);
+// Only Q is optionally E4M3-rounded; Indexer K always retains its BF16 input.
 void FastllmCudaNaiveIndexer(const fastllm::Data &query,
                             const fastllm::Data &weights,
                             const fastllm::Data &packedKeys,
                             int heads, int dim, int queryStart, int topK,
-                            bool fp8, fastllm::Data &indices);
+                            bool fp8Query, fastllm::Data &indices);
 void FastllmCudaNaiveAttention(const fastllm::Data &query,
                               const fastllm::Data &key,
                               const fastllm::Data &value,

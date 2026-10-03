@@ -262,16 +262,18 @@ __global__ void RoundIndexer(const BF16 *input, float *output, int stride,
     __shared__ float maximum[128];
     int d = threadIdx.x, row = blockIdx.x;
     float x = (float)input[(size_t)row * stride + offset + d];
+    if (!fp8) {
+        output[(size_t)row * 128 + d] = x;
+        return;
+    }
     maximum[d] = fabsf(x);
     __syncthreads();
     for (int step = 64; step; step >>= 1) {
         if (d < step) maximum[d] = fmaxf(maximum[d], maximum[d + step]);
         __syncthreads();
     }
-    if (fp8) {
-        float scale = fmaxf(maximum[0], 1e-4f) / 448.0f;
-        x = (float)__nv_fp8_e4m3(fmaxf(-448.0f, fminf(448.0f, x / scale))) * scale;
-    }
+    float scale = fmaxf(maximum[0], 1e-4f) / 448.0f;
+    x = (float)__nv_fp8_e4m3(fmaxf(-448.0f, fminf(448.0f, x / scale))) * scale;
     output[(size_t)row * 128 + d] = x;
 }
 
@@ -303,14 +305,6 @@ __global__ void IndexScoresDecode(const float *q, const BF16 *packedKeys,
     #pragma unroll
     for (int i = 0; i < 4; ++i)
         k[i] = (float)packedKeys[(size_t)key * stride + stride - 128 + lane + i * 32];
-    float maximum = fmaxf(fmaxf(fabsf(k[0]), fabsf(k[2])),
-                         fmaxf(fabsf(k[1]), fabsf(k[3])));
-    for (int offset = 16; offset; offset >>= 1)
-        maximum = fmaxf(maximum, __shfl_down_sync(0xffffffff, maximum, offset));
-    float scale = fmaxf(__shfl_sync(0xffffffff, maximum, 0), 1e-4f) / 448.0f;
-    #pragma unroll
-    for (int i = 0; i < 4; ++i)
-        k[i] = (float)__nv_fp8_e4m3(fmaxf(-448.0f, fminf(448.0f, k[i] / scale))) * scale;
     float score = 0;
     for (int h = 0; h < 16; ++h) {
         float dot = 0;
@@ -969,7 +963,7 @@ void FastllmCudaNaiveRope(fastllm::Data &input, const fastllm::Data &positions,
 
 void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &weights,
                             const fastllm::Data &packedKeys, int heads, int dim,
-                            int queryStart, int topK, bool fp8, fastllm::Data &indices) {
+                            int queryStart, int topK, bool fp8Query, fastllm::Data &indices) {
     using namespace fastllm;
     // Indexer quantization is defined on 128-element blocks. The score kernel
     // has a general head-count path, but a different block width is unsupported.
@@ -988,40 +982,45 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
     Data q, k, scores;
     Output(scores, DataType::FLOAT32, {queries, keys});
 #ifdef FASTLLM_NAIVE_DSA_MMA
-    // Keep the E4M3 values exact in BF16 and apply their FP32 scales after MMA.
-    // Small prefill blocks and decode retain the original FP32 reduction path.
-    if (fp8 && heads == 16 && queries >= 32 &&
-        (int64_t)queries * keys >= 1024 * 1024 &&
+    using naive_dsa_mma::kKeys;
+    using naive_dsa_mma::kThreads;
+    // Q keeps its E4M3 values and FP32 scales; K retains the input BF16 values.
+    // Decode tiles over keys; larger prefill chunks also share K across queries.
+    if (fp8Query && heads == 16 && (queries == 1 ||
+        (queries >= 32 && (int64_t)queries * keys >= 1024 * 1024)) &&
         FastllmCudaFlashInferDataTypeSupported(DataType::BFLOAT16)) {
-        Data qScale, kScale;
+        Data qScale;
         Output(q, DataType::BFLOAT16, {queries, heads, dim});
-        Output(k, DataType::BFLOAT16, {keys, dim});
         Output(qScale, DataType::FLOAT32, {queries, heads});
-        Output(kScale, DataType::FLOAT32, {keys});
         naive_dsa_mma::QuantizeIndexer<<<queries * heads, 128>>>(
             (const BF16 *)query.cudaData, (BF16 *)q.cudaData,
             (float *)qScale.cudaData, dim, 0);
-        naive_dsa_mma::QuantizeIndexer<<<keys, 128>>>(
-            (const BF16 *)packedKeys.cudaData, (BF16 *)k.cudaData,
-            (float *)kScale.cudaData, stride, stride - dim);
-        naive_dsa_mma::IndexerScores<<<dim3((keys + 63) / 64, (queries + 63) / 64), 256>>>(
-            (const BF16 *)q.cudaData, (const BF16 *)k.cudaData,
-            (const float *)qScale.cudaData, (const float *)kScale.cudaData,
-            (const BF16 *)weights.cudaData, (float *)scores.cudaData, queries, keys, queryStart);
+        if (queries == 1) {
+            naive_dsa_mma::IndexerDecodeScores<<<(keys + kKeys - 1) / kKeys, kThreads>>>(
+                (const BF16 *)q.cudaData, (const BF16 *)packedKeys.cudaData,
+                (const float *)qScale.cudaData, (const BF16 *)weights.cudaData,
+                (float *)scores.cudaData, stride, keys, queryStart);
+        } else {
+            naive_dsa_mma::IndexerScores<<<dim3((keys + kKeys - 1) / kKeys,
+                (queries + kKeys - 1) / kKeys), kThreads>>>(
+                (const BF16 *)q.cudaData, (const BF16 *)packedKeys.cudaData,
+                (const float *)qScale.cudaData, (const BF16 *)weights.cudaData,
+                (float *)scores.cudaData, queries, keys, queryStart, stride);
+        }
     } else
 #endif
     {
         Output(q, DataType::FLOAT32, {queries, heads, dim});
         RoundIndexer<<<queries * heads, 128>>>((const BF16 *)query.cudaData,
-            (float *)q.cudaData, dim, 0, fp8);
-        if (queries == 1 && heads == 16 && fp8) {
+            (float *)q.cudaData, dim, 0, fp8Query);
+        if (queries == 1 && heads == 16) {
             IndexScoresDecode<<<(keys + 7) / 8, 256>>>((const float *)q.cudaData,
                 (const BF16 *)packedKeys.cudaData, (const BF16 *)weights.cudaData,
                 (float *)scores.cudaData, stride, keys, queryStart);
         } else {
             Output(k, DataType::FLOAT32, {keys, dim});
             RoundIndexer<<<keys, 128>>>((const BF16 *)packedKeys.cudaData,
-                (float *)k.cudaData, stride, stride - dim, fp8);
+                (float *)k.cudaData, stride, stride - dim, false);
             if (queries > 1 && heads == 16) {
                 // A larger tile amortizes operand loads once there are enough tiles
                 // to fill the GPU. Keep the smaller tile for short/underfilled work.
