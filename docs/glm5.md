@@ -54,6 +54,22 @@ ctest --test-dir build-fastllm -R '^cuda_kda_prefill$' --output-on-failure
 
 算子为 3 次预热、30 次 CUDA event 计时的中位数；整模排除加载和首次权重重排，预热后测 3 次取中位数。整模有效 prefill 提升 66.50%，TTFT 降低 39.94%。512/2048/16384-token 的 7 组输入各生成 8 token，共 56 步完整 logits 和 token 均与本次 KDA 修改前的 Marlin 基线逐位一致（最大绝对差、NRMSE 均为 0）。算子回归、4 组真实层输入、CUDA memcheck 和 racecheck 均通过。[参数、动态库 SHA256 与结果](benchmarks/glm53_kda_20261003.json)。
 
+## GLM-5.3-Flash KDA causal convolution
+
+CUDA causal convolution 沿 token 维度增加 block 并行，在 1024 token、8192 channels 时由 32 个 block 增加到 4096 个 block。每个线程仍按原顺序累加卷积 tap，历史缓存由后续同一 stream 的更新核处理。该改动适用于共用此算子的模型，无新增环境开关、临时显存或预加载库；单 token decode 仍使用原来的 block 数。
+
+2026-10-03 同机对照（8 × RTX 5090，cudapp=8，chunk=1024；两版均含 grouped Marlin 和寄存器 KDA 递推）：
+
+| 指标 | 串行 token 卷积 | 并行 token 卷积 |
+| --- | ---: | ---: |
+| 16K 中 1632 次卷积的 GPU 总耗时（nsys） | 899.726 ms | 62.878 ms |
+| 16384-token TTFT（三次中位数，不带 profiler） | 8.433 s | 7.596 s |
+| 16384 / TTFT | 1942.7 token/s | 2156.9 token/s |
+
+整模有效 prefill 提升 11.02%，TTFT 降低 9.93%。7 组 512/2048/16384-token 输入各生成 8 token，共 56 步完整 logits 和 greedy token 与修改前逐位一致。卷积输出及缓存回归、分块续接、CUDA Graph、原 KDA 回归、memcheck 和 racecheck 均通过。启用 `UNIT_TEST` 后可运行 `ctest --test-dir build-fastllm -R '^cuda_kda_(conv|prefill)$' --output-on-failure`。
+
+两次 nsys 均采用 CUDA software trace，排除加载、权重重排和两次预热；53 类 kernel 的 39344 次调用数量全部一致。Nsight 提示可能未收集全部事件，因此耗时表示已采集区间的统计。[配置、库 SHA256 和结果](benchmarks/glm53_conv_20261003.json)。
+
 ## GPU + NUMA 混合 MoE
 
 ~~~bash

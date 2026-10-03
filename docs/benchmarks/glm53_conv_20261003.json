@@ -1,0 +1,133 @@
+{
+  "date": "2026-10-03",
+  "model": "GLM-5.3-Flash-NVFP4",
+  "hardware": "8 x NVIDIA RTX 5090 32 GiB, ARM64, CUDA 12.9, SM120",
+  "implementation": "CUDA causal convolution with token-axis grid parallelism and unchanged FP32 tap order",
+  "base_commit": "00d099b7deb04a676a74d20bde1a54d2c4479ade",
+  "configuration": {
+    "device": "cudapp=8",
+    "moe_device": "cudapp=8",
+    "chunked_prefill_size": 1024,
+    "tokens": 32768,
+    "max_batch": 1,
+    "gpu_mem_ratio": 0.9,
+    "prefix_cache": false,
+    "cache_history": false,
+    "cuda_slab": 288,
+    "moe_atype": "bfloat16",
+    "mtp": 0,
+    "threads": 8
+  },
+  "prompt_token_sha256": "4d8b3c6d7ab88e3b7da89bd9ce8081a863b4827554295c21bac627b16ddc5509",
+  "measurement": "Independent processes; loading and two warmups excluded; three timed 16K first-token requests per build.",
+  "baseline": {
+    "library_sha256": "168f8ed82298fc7569c2770b85aaea5048cf512350c2219d4cd25e1d05fd0b7f",
+    "ttft_samples_s": [
+      8.43178248096956,
+      8.433478267979808,
+      8.434915375022683
+    ],
+    "ttft_median_s": 8.433478267979808,
+    "prefill_tokens_per_second": 1942.7334107454449
+  },
+  "integrated": {
+    "library_sha256": "d9335f796c563a7d735799a05a93ec6b8322b348eb1b019b2123aa15d0be67b3",
+    "ttft_samples_s": [
+      7.594308910018299,
+      7.596136775042396,
+      7.597121111000888
+    ],
+    "ttft_median_s": 7.596136775042396,
+    "prefill_tokens_per_second": 2156.8858599058804
+  },
+  "speedup": 1.1102325455340079,
+  "ttft_reduction": 0.09928779873858529,
+  "quality": {
+    "steps_per_case": 8,
+    "total_steps": 56,
+    "logits_bitwise_equal": true,
+    "greedy_tokens_equal": true,
+    "finite": true,
+    "max_abs": 0.0,
+    "max_nrmse": 0.0,
+    "cases": [
+      {
+        "case": "quality-0-512",
+        "input_tokens": 512,
+        "common_logits_sha256": "a14c37af5e4414901dd49d5f6bfd3e043e5a35ead400166fc75d6e0117c2a9f3"
+      },
+      {
+        "case": "quality-1-512",
+        "input_tokens": 512,
+        "common_logits_sha256": "d0ffbb721b9d8595a016713af792bea89e353a5b7248d73baa5a25eb0c6e95cc"
+      },
+      {
+        "case": "quality-16k",
+        "input_tokens": 16384,
+        "common_logits_sha256": "fa2c58b75e5dd5cfa53f74cf8462b046683db6057b6d88577b0ea75c35c535e2"
+      },
+      {
+        "case": "quality-2-512",
+        "input_tokens": 512,
+        "common_logits_sha256": "f4ba1ffe07ef7544741c5c4aedf81708c1630786af52729ba97c3fbb66bf5e2a"
+      },
+      {
+        "case": "quality-3-2048",
+        "input_tokens": 2048,
+        "common_logits_sha256": "743c0b034934b5f340c3f1fa3cbd0e05ddd04dee6f7a63acb60867c213e7782b"
+      },
+      {
+        "case": "quality-4-2048",
+        "input_tokens": 2048,
+        "common_logits_sha256": "0fa4ace316590a60d1e321d66a72aa361db4997775e20885cf84fb6348342817"
+      },
+      {
+        "case": "quality-5-2048",
+        "input_tokens": 2048,
+        "common_logits_sha256": "885bdf540e78b05cb34ced4b119b0257b71c46ef280a3f37f9d68f15495bcd40"
+      }
+    ]
+  },
+  "convolution_profile": {
+    "calls": 1632,
+    "before_ms": 899.72568,
+    "after_ms": 62.877983,
+    "speedup": 14.309073495566803,
+    "saved_ms": 836.847697,
+    "before_grid": [
+      32,
+      1,
+      1
+    ],
+    "after_grid": [
+      32,
+      128,
+      1
+    ],
+    "block": [
+      256,
+      1,
+      1
+    ],
+    "trace": "Nsight Systems 2026.3.2, CUDA software trace; one warmed 16K first-token request.",
+    "caveat": "Nsight warns some events might not have been collected; all individual kernel call counts match the previous capture.",
+    "kernel_calls": 39344,
+    "unique_kernels": 53,
+    "all_kernel_call_counts_equal": true
+  },
+  "verification": {
+    "cuda_kda_conv": "passed",
+    "cuda_kda_prefill": "passed",
+    "memcheck_errors": 0,
+    "racecheck_errors": 0,
+    "racecheck_warnings": 0,
+    "coverage": [
+      "BF16 output and history cache bitwise equality",
+      "one-token decode, short sequences, odd channels, multiple batches, kernel sizes 1/2/4/8",
+      "null/initialized/nonzero cache; input and weight immutability",
+      "1+2+7+65+962 chunk continuation",
+      "FastLLM CUDA Graph capture and three replays for T=1/65",
+      "T=1024,C=8192 and grid.y limit at T=524289"
+    ]
+  }
+}
