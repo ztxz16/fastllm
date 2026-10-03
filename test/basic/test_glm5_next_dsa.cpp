@@ -126,6 +126,11 @@ void Selection(int past,int rows) {
     for(int r=0;r<rows;++r)for(int j=0;j<m;++j)s[r*m+j]=(j*37+r*13)%101-50;
     Upload(scores,{1,rows,m},s,FLOAT32);
     Check(FastllmCudaDeepSeekV41IndexerTopK(scores,nullptr,512,4,past,1,groups),"TopK launch");
+    if (rows == 1) {
+        Data fast;
+        Check(FastllmCudaQwen4SelectBlocks(scores,512,past,4,fast),"decode radix selection");
+        Check(Integers(fast)==Integers(groups),"decode radix selection order/ties");
+    }
     groups.Reshape({rows,groups.dims.back()});
     Check(FastllmCudaQwen4ExpandSelectedBlocks(groups,past+rows,past,4,indices),"expand launch");
     auto got=Integers(indices);const int width=indices.dims.back();
@@ -172,6 +177,35 @@ void Attention(int past,int rows,bool fragmented) {
         for(int i=0;i<width;++i){int t=ids[r*width+i];if(t<0)continue;double dot=0;for(int d=0;d<rank;++d)dot+=q[(h*rows+r)*rank+d]*kv[(pagesIds[t/pageLen]*pageLen+t%pageLen)*rank+d];den+=(p[i]=std::exp(dot/16));}
         for(int d=0;d<rank;d+=17){double num=0;for(int i=0;i<width;++i){int t=ids[r*width+i];if(t>=0)num+=p[i]*kv[(pagesIds[t/pageLen]*pageLen+t%pageLen)*rank+d];}error=std::max(error,std::abs(got[(h*rows+r)*rank+d]-num/den));}
     }
+    if (rows == 1) {
+        Data table(INT32), physical, pagedQuery, pagedOutput;
+        table.Resize({pages}); table.ToDevice(DataDevice::CUDA,{0},false); table.Allocate(false);
+        FastllmCudaCopyFromHostToDevice(table.cudaData,pagesIds.data(),pages*4);
+        Check(FastllmCudaQwen4ExpandSelectedBlocks(groups,tokens,past,4,physical,&table,pageLen),"paged expand");
+        auto mapped=Integers(physical);
+        for(size_t i=0;i<ids.size();++i)
+            Check(mapped[i]==(ids[i]<0?-1:pagesIds[ids[i]/pageLen]*pageLen+ids[i]%pageLen),"physical page mapping");
+        PagedCacheManager pePool;
+        Upload(pePool,{int(kv.size()/pageLen/rank),pageLen,1,64},std::vector<float>(kv.size()/rank*64));
+        BorrowedCache peCache;peCache.dataType=BFLOAT16;peCache.Resize({1,tokens,64});
+        peCache.isPagedKVCache=true;peCache.pageLen=pageLen;peCache.lastPageLen=cache.lastPageLen;
+        peCache.pageIndex=pagesIds;peCache.pagedKVCacheData=&pePool;
+        Upload(pagedQuery,{heads,rows,rank},q);
+        SparseLatentAttention(pagedQuery,cache,physical,1.f/16,pagedOutput,false,&peCache);
+        Check(Download(pagedOutput)==got,"paged BF16 fallback differs");
+        Upload(pagedQuery,{heads,rows,rank},q);
+        Data qPe,direct;
+        Upload(qPe,{1,1,heads,64},std::vector<float>(heads*64));
+        Upload(direct,{heads,1,rank},std::vector<float>(heads*rank));
+        Check(FastllmCudaMLAPaged(pagedQuery,qPe,peCache,cache,direct,
+            1.f/16,2048+tokens%4,&physical),"FlashInfer physical-page dispatch");
+        SparseLatentAttention(pagedQuery,cache,physical,1.f/16,pagedOutput,true,&peCache);
+        auto flash=Download(pagedOutput); double diff=0,sq=0;
+        Check(flash==Download(direct),"physical-page wrapper did not use MLA");
+        for(size_t i=0;i<got.size();++i){diff=std::max(diff,double(std::abs(flash[i]-got[i])));sq+=(flash[i]-got[i])*(flash[i]-got[i]);}
+        Check(diff<.004 && std::sqrt(sq/got.size())<.001,"paged MLA differs");
+        std::printf("PASS physical-page MLA max_diff=%.8g rmse=%.8g\n",diff,std::sqrt(sq/got.size()));
+    }
     std::printf("PASS sparse latent attention past=%d rows=%d fragmented=%d max_error=%.8g\n",past,rows,fragmented,error);
     Check(error<.003,"attention independent reference");
 }
@@ -213,9 +247,28 @@ void Fixture(const std::string &dir) {
     dump("pooled-keys",cache.keys);std::puts("PASS real checkpoint fixture execution");
 }
 }
-int main(int argc,char **argv){
-    int devices=0;if(cudaGetDeviceCount(&devices)!=cudaSuccess||devices==0)return 77;
-    FastllmCudaSetDevice(0);static_cast<Executor*>(GetExecutor())->SetFirstDevice("cuda:0");
-    try{if(argc==2){Fixture(argv[1]);return 0;}NormAndQuantization();KpoolChunks();Selection(0,9);Selection(2045,15);Selection(32760,8);Scoring();Attention(2045,9,true);Attention(4098,1,false);Check(cudaDeviceSynchronize()==cudaSuccess,"CUDA async error");std::puts("PASS GLM DSA");return 0;}
-    catch(const std::exception &e){std::fprintf(stderr,"FAIL: %s\n",e.what());return 1;}
+int main(int argc, char **argv) {
+    int devices = 0;
+    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
+    FastllmCudaSetDevice(0);
+    static_cast<Executor*>(GetExecutor())->SetFirstDevice("cuda:0");
+    try {
+        if (argc == 2) { Fixture(argv[1]); return 0; }
+        NormAndQuantization();
+        KpoolChunks();
+        Selection(0, 9);
+        Selection(2045, 15);
+        Selection(32760, 8);
+        for (int past : {16384, 32768, 65535}) Selection(past, 1);
+        Scoring();
+        Attention(2045, 9, true);
+        Attention(4098, 1, false);
+        for (int tail = 0; tail < 4; ++tail) Attention(32768 + tail, 1, true);
+        Check(cudaDeviceSynchronize() == cudaSuccess, "CUDA async error");
+        std::puts("PASS GLM DSA");
+        return 0;
+    } catch (const std::exception &e) {
+        std::fprintf(stderr, "FAIL: %s\n", e.what());
+        return 1;
+    }
 }

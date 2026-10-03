@@ -2030,7 +2030,8 @@ namespace {
             const int32_t *selectedBlocks, int32_t *indices,
             int rows, int selectedK, int compressRatio,
             int completeBlocks, int keyLength, int outputWidth,
-            int queryStart, const int32_t *decodeMeta) {
+            int queryStart, const int32_t *decodeMeta,
+            const int32_t *pageTable = nullptr, int pageLen = 0) {
         const int dynamicQueryStart =
             queryStart == -2 && decodeMeta != nullptr
                 ? decodeMeta[0] : queryStart;
@@ -2061,6 +2062,10 @@ namespace {
                                       rowBlocks * compressRatio;
                 indices[item] = tail < remainder
                     ? rowBlocks * compressRatio + tail : -1;
+            }
+            if (pageTable != nullptr && indices[item] >= 0) {
+                const int token = indices[item];
+                indices[item] = pageTable[token / pageLen] * pageLen + token % pageLen;
             }
         }
     }
@@ -3108,6 +3113,64 @@ bool FastllmCudaQwen4HyperCombineRMSNorm(
     return cudaGetLastError() == cudaSuccess;
 }
 
+static bool Qwen4SelectBlocksRaw(const float *scores, int32_t *selectedBlocks,
+        int rows, int scoreCapacity, int selectedK, int queryStart,
+        int compressRatio, const int32_t *decodeMeta) {
+    // Bound the per-thread row cache as capacity grows. Wider blocks spread
+    // long decode rows across more warps; batched prefill keeps one small
+    // block per row. Dispatch uses physical capacity so graph replay can
+    // advance the logical length without overrunning a cached specialization.
+    auto selectKernel = Qwen4QSARadixSelectKernel<0>;
+    int selectThreads = 256;
+    if (rows == 1) {
+        static const struct {
+            int threads;
+            int items;
+            decltype(selectKernel) kernel;
+        } kernels[] = {
+            {256, 8, Qwen4QSARadixSelectKernel<8>},
+            {256, 16, Qwen4QSARadixSelectKernel<16>},
+            {256, 24, Qwen4QSARadixSelectKernel<24>},
+            {256, 32, Qwen4QSARadixSelectKernel<32>},
+            {256, 40, Qwen4QSARadixSelectKernel<40>},
+            {512, 32, Qwen4QSARadixSelectKernel<32, 512>},
+            {512, 40, Qwen4QSARadixSelectKernel<40, 512>},
+            {1024, 24, Qwen4QSARadixSelectKernel<24, 1024>},
+            {1024, 32, Qwen4QSARadixSelectKernel<32, 1024>},
+            {1024, 36, Qwen4QSARadixSelectKernel<36, 1024>},
+            {1024, 40, Qwen4QSARadixSelectKernel<40, 1024>},
+            {1024, 64, Qwen4QSARadixSelectKernel<64, 1024>},
+            {1024, 72, Qwen4QSARadixSelectKernel<72, 1024>}
+        };
+        selectKernel = Qwen4QSARadixSelectKernel<0, 1024>;
+        selectThreads = 1024;
+        for (const auto &entry : kernels) {
+            if (scoreCapacity <= entry.threads * entry.items) {
+                selectKernel = entry.kernel;
+                selectThreads = entry.threads;
+                break;
+            }
+        }
+    }
+    selectKernel<<<rows, selectThreads, 0, cudaStreamPerThread>>>(
+        scores, selectedBlocks, rows, scoreCapacity, selectedK,
+        queryStart, compressRatio, decodeMeta);
+    const cudaError_t selectError = cudaGetLastError();
+    if (selectError != cudaSuccess) {
+        // Configuration/resource errors enqueue no work. Preserve a small
+        // generic fallback on devices that cannot launch the wider variant.
+        if (selectError != cudaErrorInvalidConfiguration &&
+            selectError != cudaErrorLaunchOutOfResources) {
+            return false;
+        }
+        Qwen4QSARadixSelectKernel<0><<<rows, 256, 0, cudaStreamPerThread>>>(
+            scores, selectedBlocks, rows, scoreCapacity, selectedK,
+            queryStart, compressRatio, decodeMeta);
+        if (cudaGetLastError() != cudaSuccess) return false;
+    }
+    return true;
+}
+
 static bool FastllmCudaQwen4QSASelectLaunch(
         const fastllm::Data &query,
         const fastllm::Data &compressedKeys,
@@ -3180,58 +3243,8 @@ static bool FastllmCudaQwen4QSASelectLaunch(
             ? launchScore((const half*)query.cudaData)
             : launchScore((const __nv_bfloat16*)query.cudaData);
     if (!scored) return false;
-    // Bound the per-thread row cache as capacity grows. Wider blocks spread
-    // long decode rows across more warps; batched prefill keeps one small
-    // block per row. Dispatch uses physical capacity so graph replay can
-    // advance the logical length without overrunning a cached specialization.
-    auto selectKernel = Qwen4QSARadixSelectKernel<0>;
-    int selectThreads = threads;
-    if (rows == 1) {
-        static const struct {
-            int threads;
-            int items;
-            decltype(selectKernel) kernel;
-        } kernels[] = {
-            {256, 8, Qwen4QSARadixSelectKernel<8>},
-            {256, 16, Qwen4QSARadixSelectKernel<16>},
-            {256, 24, Qwen4QSARadixSelectKernel<24>},
-            {256, 32, Qwen4QSARadixSelectKernel<32>},
-            {256, 40, Qwen4QSARadixSelectKernel<40>},
-            {512, 32, Qwen4QSARadixSelectKernel<32, 512>},
-            {512, 40, Qwen4QSARadixSelectKernel<40, 512>},
-            {1024, 24, Qwen4QSARadixSelectKernel<24, 1024>},
-            {1024, 32, Qwen4QSARadixSelectKernel<32, 1024>},
-            {1024, 36, Qwen4QSARadixSelectKernel<36, 1024>},
-            {1024, 40, Qwen4QSARadixSelectKernel<40, 1024>},
-            {1024, 64, Qwen4QSARadixSelectKernel<64, 1024>},
-            {1024, 72, Qwen4QSARadixSelectKernel<72, 1024>}
-        };
-        selectKernel = Qwen4QSARadixSelectKernel<0, 1024>;
-        selectThreads = 1024;
-        for (const auto &entry : kernels) {
-            if (scoreCapacity <= entry.threads * entry.items) {
-                selectKernel = entry.kernel;
-                selectThreads = entry.threads;
-                break;
-            }
-        }
-    }
-    selectKernel<<<rows, selectThreads, 0, cudaStreamPerThread>>>(
-        scores, selectedBlocks, rows, scoreCapacity, selectedK,
-        queryStart, compressRatio, decodeMeta);
-    const cudaError_t selectError = cudaGetLastError();
-    if (selectError != cudaSuccess) {
-        // Configuration/resource errors enqueue no work. Preserve a small
-        // generic fallback on devices that cannot launch the wider variant.
-        if (selectError != cudaErrorInvalidConfiguration &&
-            selectError != cudaErrorLaunchOutOfResources) {
-            return false;
-        }
-        Qwen4QSARadixSelectKernel<0><<<rows, threads, 0, cudaStreamPerThread>>>(
-            scores, selectedBlocks, rows, scoreCapacity, selectedK,
-            queryStart, compressRatio, decodeMeta);
-        if (cudaGetLastError() != cudaSuccess) return false;
-    }
+    if (!Qwen4SelectBlocksRaw(scores, selectedBlocks, rows, scoreCapacity,
+            selectedK, queryStart, compressRatio, decodeMeta)) return false;
     const int expandBlocks = std::min<uint64_t>(
         1024,
         ((uint64_t)rows * outputWidth + threads - 1) / threads);
@@ -3244,13 +3257,36 @@ static bool FastllmCudaQwen4QSASelectLaunch(
     return cudaGetLastError() == cudaSuccess;
 }
 
+bool FastllmCudaQwen4SelectBlocks(const fastllm::Data &scores,
+        int selectedK, int queryStart, int compressRatio, fastllm::Data &selected) {
+    using namespace fastllm;
+    if (scores.dataDevice != DataDevice::CUDA || scores.dataType != FLOAT32 ||
+        !scores.cudaData || scores.dims.size() != 3 || scores.dims[0] != 1 ||
+        scores.dims[1] != 1 || scores.dims[2] <= 0 || selectedK <= 0 ||
+        compressRatio <= 0 || queryStart < 0 ||
+        (queryStart + 1) / compressRatio > scores.dims[2]) return false;
+    selected.dataType = INT32;
+    selected.UpdateUnitSize();
+    selected.Resize({1, selectedK});
+    selected.ToDevice(DataDevice::CUDA, scores.dataDeviceIds, false);
+    selected.Allocate(false);
+    return Qwen4SelectBlocksRaw((const float*)scores.cudaData,
+        (int32_t*)selected.cudaData, 1, scores.dims[2], selectedK,
+        queryStart, compressRatio, nullptr);
+}
+
 bool FastllmCudaQwen4ExpandSelectedBlocks(const fastllm::Data &selected,
-        int keyLength, int queryStart, int compressRatio, fastllm::Data &indices) {
+        int keyLength, int queryStart, int compressRatio, fastllm::Data &indices,
+        const fastllm::Data *pageTable, int pageLen) {
     using namespace fastllm;
     if (selected.dataDevice != DataDevice::CUDA || selected.dataType != INT32 ||
         !selected.cudaData || selected.dims.size() != 2 || selected.dims[0] <= 0 ||
         selected.dims[1] <= 0 || compressRatio <= 0 || queryStart < 0 ||
         (int64_t)queryStart + selected.dims[0] > keyLength) return false;
+    if (pageTable != nullptr && (pageLen <= 0 ||
+        pageTable->dataDevice != DataDevice::CUDA || pageTable->dataType != INT32 ||
+        !pageTable->cudaData || pageTable->Count(0) < (uint64_t)(keyLength + pageLen - 1) / pageLen ||
+        pageTable->dataDeviceIds != selected.dataDeviceIds)) return false;
     const int rows = selected.dims[0], count = selected.dims[1];
     const int width = count * compressRatio + compressRatio - 1;
     indices.dataType = INT32;
@@ -3261,7 +3297,8 @@ bool FastllmCudaQwen4ExpandSelectedBlocks(const fastllm::Data &selected,
     Qwen4QSAExpandIndicesKernel<<<blocks, 256, 0, cudaStreamPerThread>>>(
         (const int32_t *)selected.cudaData, (int32_t *)indices.cudaData,
         rows, count, compressRatio, keyLength / compressRatio,
-        keyLength, width, queryStart, nullptr);
+        keyLength, width, queryStart, nullptr,
+        pageTable == nullptr ? nullptr : (const int32_t*)pageTable->cudaData, pageLen);
     return cudaGetLastError() == cudaSuccess;
 }
 

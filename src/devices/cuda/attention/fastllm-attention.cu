@@ -4836,7 +4836,8 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
 }
 
 bool FastllmCudaMLAPaged(const fastllm::Data &qNope, const fastllm::Data &qPe, const fastllm::Data &kvCachePaged, const fastllm::Data &peCachePaged,
-                         fastllm::Data &output, float softmaxScale, int requestedKvLen) {
+                         fastllm::Data &output, float softmaxScale, int requestedKvLen,
+                         const fastllm::Data *physicalTokenIndices) {
 #ifndef FASTLLM_ENABLE_FLASHINFER
     // FlashInfer 不可用（sm_70 以下），分页 MLA 暂无原生实现。
     return false;
@@ -4859,6 +4860,18 @@ bool FastllmCudaMLAPaged(const fastllm::Data &qNope, const fastllm::Data &qPe, c
     int kvLen = requestedKvLen > 0 ? requestedKvLen : fullKvLen;
     int qoLen = b * s;
     if (kvLen <= 0 || kvLen > fullKvLen || kvLen < s) return false;
+    if (physicalTokenIndices != nullptr) {
+        // A selected physical token is a page of length one in the same KV
+        // pool. Keep the GPU indices on device and reuse FlashInfer's split-K
+        // paged MLA scheduler, without copying or quantizing any cached KV.
+        if (b != 1 || s != 1 ||
+            physicalTokenIndices->dataDevice != fastllm::DataDevice::CUDA ||
+            physicalTokenIndices->dataType != fastllm::DataType::INT32 ||
+            !physicalTokenIndices->cudaData ||
+            physicalTokenIndices->Count(0) < (uint64_t)kvLen ||
+            physicalTokenIndices->dataDeviceIds != qNope.dataDeviceIds) return false;
+        pageLen = 1;
+    }
     numPages = (kvLen + pageLen - 1) / pageLen;
 
     std::vector<int32_t> q_indptr_h = {0, qoLen};
@@ -4876,8 +4889,11 @@ bool FastllmCudaMLAPaged(const fastllm::Data &qNope, const fastllm::Data &qPe, c
         batch_size, (uint32_t)h, (uint32_t)head_dim_ckv, causal, 0);
     if (plan_status != cudaSuccess || numPages <= 0) return false;
 
-    int32_t *d_kv_indices = (int32_t*)FastllmCudaMalloc(numPages * sizeof(int32_t));
-    cudaMemcpy(d_kv_indices, kvCachePaged.pageIndex.data(), numPages * sizeof(int32_t), cudaMemcpyHostToDevice);
+    int32_t *d_kv_indices = physicalTokenIndices != nullptr
+        ? (int32_t*)physicalTokenIndices->cudaData
+        : (int32_t*)FastllmCudaMalloc(numPages * sizeof(int32_t));
+    if (physicalTokenIndices == nullptr)
+        cudaMemcpy(d_kv_indices, kvCachePaged.pageIndex.data(), numPages * sizeof(int32_t), cudaMemcpyHostToDevice);
 
     uint_fastdiv num_heads_div((uint32_t)h);
     uint_fastdiv block_size_div((uint32_t)pageLen);
@@ -4940,7 +4956,7 @@ bool FastllmCudaMLAPaged(const fastllm::Data &qNope, const fastllm::Data &qPe, c
     cudaError_t status = qNope.dataType == fastllm::DataType::BFLOAT16 ?
         runAttention(__nv_bfloat16()) : runAttention(half());
 
-    FastllmCudaFree(d_kv_indices);
+    if (physicalTokenIndices == nullptr) FastllmCudaFree(d_kv_indices);
 
     if (status != cudaSuccess) return false;
     DeviceSync();

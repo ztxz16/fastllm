@@ -15,6 +15,8 @@ namespace fastllm {
     struct Glm5NextIndexerCache {
         Data keys, tailKeys, tailGates;
         Data hadamard; // immutable workspace, not part of prefix snapshots
+        Data pageTable; // derived GPU page map; rebuild after page/history changes
+        std::vector<int> pageTableIds;
         int tokens = 0;
     };
 
@@ -44,6 +46,8 @@ namespace fastllm {
         // Keep it atomically aligned with every DSA K/V layer in the
         // model-specific snapshots below.
         bool UseGenericHistoryCache() const override { return false; }
+
+        bool RetainCudaWorkspace() const override { return true; }
 
         int Forward(
                 const Data &inputIds,

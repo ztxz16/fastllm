@@ -1789,22 +1789,6 @@ namespace fastllm {
             rms_norm_eps, qNormalized);
         Linear(qNormalized, weight[prefix + "q_b_proj.weight"],
                Data(), query);
-        Data dsaIndices;
-#ifdef USE_CUDA
-        if (UsesDsa()) {
-            std::lock_guard<std::mutex> guard(indexerCachesMutex);
-            auto &caches = indexerCaches[&pastKeyValues];
-            if (caches.empty()) caches.resize(block_cnt);
-            const int past = pastKeyValues[layerIndex].second.dims.empty() ? 0 :
-                pastKeyValues[layerIndex].second.dims[1];
-            glm5_next_detail::BuildDsaIndices(input, qNormalized, weight,
-                prefix + "indexer.", past, indexTopK, caches[layerIndex], dsaIndices);
-        }
-#else
-        AssertInFastLLM(!UsesDsa(), "GLM DSA requires a CUDA build.");
-#endif
-        qResidual.FreeSpace();
-        qNormalized.FreeSpace();
         ToDataType(query, DataType::BFLOAT16);
         query.Reshape(
             {1, sequence, num_attention_heads, qkNopeHeadDim});
@@ -1871,6 +1855,23 @@ namespace fastllm {
             keyPeCache.lastPageLen == latentKvCache.lastPageLen &&
             keyPeCache.pageIndex == latentKvCache.pageIndex,
             "GLM-5.3 compressed MLA caches are out of sync.");
+
+        Data dsaIndices;
+#ifdef USE_CUDA
+        if (UsesDsa()) {
+            std::lock_guard<std::mutex> guard(indexerCachesMutex);
+            auto &caches = indexerCaches[&pastKeyValues];
+            if (caches.empty()) caches.resize(block_cnt);
+            const int past = latentKvCache.dims[1] - sequence;
+            glm5_next_detail::BuildDsaIndices(input, qNormalized, weight,
+                prefix + "indexer.", past, indexTopK, caches[layerIndex], dsaIndices,
+                sequence == 1 ? &latentKvCache : nullptr);
+        }
+#else
+        AssertInFastLLM(!UsesDsa(), "GLM DSA requires a CUDA build.");
+#endif
+        qResidual.FreeSpace();
+        qNormalized.FreeSpace();
 
         const std::string kvWeightName = prefix + "kv_b_proj.weight";
         const std::string keyWeightName = kvWeightName + "__mla_key";
@@ -1981,7 +1982,7 @@ namespace fastllm {
         if (!dsaIndices.dims.empty()) {
             glm5_next_detail::SparseLatentAttention(absorbedQuery, latentKvCache,
                 dsaIndices, 1.0f / std::sqrt((float)qkHeadDim), latentAttention,
-                dsaBackend == DsaBackend::Auto);
+                dsaBackend == DsaBackend::Auto, sequence == 1 ? &keyPeCache : nullptr);
         } else
 #endif
         {

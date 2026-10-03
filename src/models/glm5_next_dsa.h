@@ -101,7 +101,8 @@ inline void AppendIndexerKeys(Glm5NextIndexerCache &cache,
 
 inline void BuildDsaIndices(Data &input, Data &qNormalized,
         WeightMap &weight, const std::string &prefix, int past, int topK,
-        Glm5NextIndexerCache &cache, Data &indices) {
+        Glm5NextIndexerCache &cache, Data &indices,
+        const Data *pagedCache = nullptr) {
     AssertInFastLLM(input.dataDevice == DataDevice::CUDA &&
         input.dataType == DataType::BFLOAT16 && topK == 2048,
         "GLM DSA currently requires CUDA BF16 and Top-2048.");
@@ -145,43 +146,90 @@ inline void BuildDsaIndices(Data &input, Data &qNormalized,
     AssertInFastLLM(FastllmCudaDeepSeekV41IndexerScore(
         quantized, headWeights, cache.keys, 4, past, scores),
         "GLM DSA Indexer scoring failed.");
-    AssertInFastLLM(FastllmCudaDeepSeekV41IndexerTopK(
+    const bool selected = sequence == 1 && FastllmCudaQwen4SelectBlocks(
+        scores, topK / 4, past, 4, groups);
+    AssertInFastLLM(selected || FastllmCudaDeepSeekV41IndexerTopK(
         scores, nullptr, topK / 4, 4, past, 1, groups),
         "GLM DSA group selection failed.");
     groups.Reshape({sequence, groups.dims.back()});
+    const Data *pageTable = nullptr;
+    if (pagedCache != nullptr) {
+        AssertInFastLLM(sequence == 1 && pagedCache->isPagedKVCache &&
+            pagedCache->dims[1] == past + sequence && pagedCache->pageLen > 0,
+            "GLM DSA decode page table is out of sync.");
+        if (cache.pageTableIds != pagedCache->pageIndex ||
+            cache.pageTable.dataDeviceIds != input.dataDeviceIds ||
+            cache.pageTable.cudaData == nullptr) {
+            cache.pageTable.dataType = DataType::INT32;
+            cache.pageTable.UpdateUnitSize();
+            cache.pageTable.Resize({int(pagedCache->pageIndex.size())});
+            cache.pageTable.ToDevice(input.dataDevice, input.dataDeviceIds, false);
+            cache.pageTable.Allocate(false);
+            FastllmCudaCopyFromHostToDevice(
+                cache.pageTable.cudaData, (void*)pagedCache->pageIndex.data(),
+                pagedCache->pageIndex.size() * sizeof(int32_t));
+            cache.pageTableIds = pagedCache->pageIndex;
+        }
+        pageTable = &cache.pageTable;
+    }
     AssertInFastLLM(FastllmCudaQwen4ExpandSelectedBlocks(
-        groups, past + sequence, past, 4, indices),
+        groups, past + sequence, past, 4, indices,
+        pageTable, pagedCache == nullptr ? 0 : pagedCache->pageLen),
         "GLM DSA group expansion failed.");
 }
 
 inline void SparseLatentAttention(Data &query, const Data &cache,
-        Data &indices, float scale, Data &output, bool useFlashInfer = true) {
+        Data &indices, float scale, Data &output, bool useFlashInfer = true,
+        const Data *keyPeCache = nullptr) {
     const int heads = query.dims[0], sequence = query.dims[1];
     const int tokens = cache.dims[1], rank = query.dims[2];
     const auto *pool = cache.pagedKVCacheData;
     AssertInFastLLM(pool && rank == 512 && pool->dims[2] == 1 &&
         pool->dims[3] == rank, "GLM DSA latent cache layout mismatch.");
     Data latent(DataType::BFLOAT16);
-    latent.Resize({1, tokens, rank});
-    latent.ToDevice(query.dataDevice, query.dataDeviceIds, false);
-    latent.Allocate(false);
-    for (size_t first = 0; first < cache.pageIndex.size();) {
-        size_t end = first + 1;
-        while (end < cache.pageIndex.size() &&
-            cache.pageIndex[end] == cache.pageIndex[end - 1] + 1) ++end;
-        const size_t begin = first * cache.pageLen;
-        const size_t count = std::min(end * cache.pageLen, size_t(tokens)) - begin;
-        AssertInFastLLM(FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
-            static_cast<uint8_t *>(latent.cudaData) + begin * rank * 2,
-            static_cast<uint8_t *>(pool->cudaData) +
-                size_t(cache.pageIndex[first]) * cache.pageLen * rank * 2,
-            count * rank * 2), "GLM DSA latent gather failed.");
-        first = end;
+    if (keyPeCache != nullptr) {
+        // A paged decode cache means indices already address physical tokens.
+        AssertInFastLLM(sequence == 1, "GLM DSA physical indices require decode.");
+        if (useFlashInfer) {
+            Data queryPe(DataType::BFLOAT16);
+            queryPe.Resize({1, 1, heads, 64});
+            queryPe.ToDevice(query.dataDevice, query.dataDeviceIds, false);
+            queryPe.Allocate(0.0f);
+            output.dataType = DataType::BFLOAT16;
+            output.UpdateUnitSize();
+            output.Resize(query.dims);
+            output.ToDevice(query.dataDevice, query.dataDeviceIds, false);
+            output.Allocate(false);
+            const int selectedTokens = std::min(tokens / 4, 512) * 4 + tokens % 4;
+            if (FastllmCudaMLAPaged(query, queryPe, *keyPeCache, cache, output,
+                    scale, selectedTokens, &indices)) return;
+        }
+        // The BF16 fallback reads the same pool without gathering logical KV.
+        latent.FakeFrom(*pool, 0);
+        latent.dataDeviceIds = pool->dataDeviceIds;
+        latent.Resize({1, int(pool->Count(0) / rank), rank});
+    } else {
+        latent.Resize({1, tokens, rank});
+        latent.ToDevice(query.dataDevice, query.dataDeviceIds, false);
+        latent.Allocate(false);
+        for (size_t first = 0; first < cache.pageIndex.size();) {
+            size_t end = first + 1;
+            while (end < cache.pageIndex.size() &&
+                cache.pageIndex[end] == cache.pageIndex[end - 1] + 1) ++end;
+            const size_t begin = first * cache.pageLen;
+            const size_t count = std::min(end * cache.pageLen, size_t(tokens)) - begin;
+            AssertInFastLLM(FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
+                static_cast<uint8_t *>(latent.cudaData) + begin * rank * 2,
+                static_cast<uint8_t *>(pool->cudaData) +
+                    size_t(cache.pageIndex[first]) * cache.pageLen * rank * 2,
+                count * rank * 2), "GLM DSA latent gather failed.");
+            first = end;
+        }
     }
     PermuteSelf(query, {1, 0, 2});
     query.Reshape({1, sequence, heads, rank});
     indices.Reshape({1, sequence, indices.dims.back()});
-    if (!useFlashInfer ||
+    if (keyPeCache != nullptr || !useFlashInfer ||
         !FastllmCudaGlm5NextDsaPrefill(query, latent, indices, scale, output)) {
         Data sink(DataType::FLOAT32);
         sink.Resize({heads});

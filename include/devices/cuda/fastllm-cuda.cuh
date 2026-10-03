@@ -474,7 +474,8 @@ bool FastllmCudaMLA(const fastllm::Data &qNope, const fastllm::Data &qPe, const 
                     fastllm::Data &score, fastllm::Data &output, float softmaxScale);
 
 bool FastllmCudaMLAPaged(const fastllm::Data &qNope, const fastllm::Data &qPe, const fastllm::Data &kvCachePaged, const fastllm::Data &peCachePaged,
-                         fastllm::Data &output, float softmaxScale, int kvLen = -1);
+                         fastllm::Data &output, float softmaxScale, int kvLen = -1,
+                         const fastllm::Data *physicalTokenIndices = nullptr);
 
 bool FastllmCudaEmbedding(const fastllm::Data &input, const fastllm::Data &weight, fastllm::Data &output);
 bool FastllmCudaEmbeddingDirect(const fastllm::Data &input, const fastllm::Data &weight, fastllm::Data &output);
@@ -1088,7 +1089,10 @@ bool FastllmCudaLayerNormWithEpsilon(const fastllm::Data &input,
     const fastllm::Data &gamma, const fastllm::Data &beta,
     fastllm::Data &output, float epsilon);
 bool FastllmCudaQwen4ExpandSelectedBlocks(const fastllm::Data &selected,
-    int keyLength, int queryStart, int compressRatio, fastllm::Data &indices);
+        int keyLength, int queryStart, int compressRatio, fastllm::Data &indices,
+        const fastllm::Data *pageTable = nullptr, int pageLen = 0);
+bool FastllmCudaQwen4SelectBlocks(const fastllm::Data &scores,
+        int selectedK, int queryStart, int compressRatio, fastllm::Data &selected);
 
 // Dots3-Note DSA indexer. Q RoPE/NoPE halves are FP32 after leading-RoPE,
 // K is BF16 after LayerNorm + leading-RoPE, and weights are the 64 projected
