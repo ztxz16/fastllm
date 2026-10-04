@@ -187,10 +187,11 @@ __device__ __forceinline__ void LoadIndexerKeys(
 // One query: a warp scores eight BF16 keys against all sixteen E4M3 Q heads.
 // Keep FP32 MMA accumulation and ascending weighted-head order. Applying the
 // unchanged Q scales after MMA can change FP32 rounding relative to SIMT.
-template <typename ScoreOutput>
+template <typename ScoreOutput, typename Length = int>
 __global__ void IndexerDecodeScores(const BF16 *q, const BF16 *packedKeys,
         const float *qscale, const BF16 *weights, ScoreOutput scores,
-        int stride, int keys, int past) {
+        int stride, Length liveKeys, int past) {
+    int keys = liveKeys;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     __shared__ __align__(16) BF16 qs[kHeads][kIndexerDim + 8], ks[kKeys][kIndexerDim + 8];
     __shared__ float scale[kHeads], weight[kHeads];

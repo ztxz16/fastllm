@@ -209,7 +209,7 @@ set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/context
         src/devices/disk/diskdevice.cpp
         src/models/graphllm.cpp src/models/chatglm.cpp src/models/moss.cpp src/models/llama.cpp src/models/qwen.cpp src/models/basellm.cpp src/kvmem.cpp src/models/basellmkvmem.cpp
         src/models/glm.cpp src/models/minicpm.cpp src/models/minicpm3.cpp src/models/internlm2.cpp src/models/bert.cpp src/models/moe.cpp src/models/deepseekv2.cpp src/models/deepseekv4.cpp src/models/deepseekv41.cpp src/models/deepseekv41_vision.cpp src/models/deepseekv41_dspark.cpp src/models/dots3_note.cpp
-        src/models/phi3.cpp src/models/xlmroberta.cpp src/models/cogvlm.cpp src/models/qwen3.cpp src/models/qwen3_moe.cpp src/models/hy_v3.cpp src/models/qwen3_next.cpp src/models/qwen4_exp.cpp src/models/kimi_k3.cpp src/models/naive_n05_flash.cpp src/models/naive_n05_history.cpp src/models/naive_n05_draft.cpp
+        src/models/phi3.cpp src/models/xlmroberta.cpp src/models/cogvlm.cpp src/models/qwen3.cpp src/models/qwen3_moe.cpp src/models/hy_v3.cpp src/models/qwen3_next.cpp src/models/qwen4_exp.cpp src/models/kimi_k3.cpp src/models/naive_n05_flash.cpp src/models/naive_n05_tp.cpp src/models/naive_n05_history.cpp src/models/naive_n05_draft.cpp
         src/models/minimax.cpp src/models/hunyuan.cpp
         src/models/ernie4_5.cpp src/models/pangu_moe.cpp src/models/glm4_moe.cpp src/models/glm5_moe_dsa.cpp src/models/glm5_next.cpp src/models/gpt_oss.cpp
         src/models/minimax_m2.cpp src/models/qwen2.cpp src/models/qwen3_5.cpp src/models/gemma4.cpp src/models/step3p5.cpp src/models/laguna.cpp
@@ -1350,6 +1350,33 @@ if (UNIT_TEST)
         add_test(NAME naive_n05_attention COMMAND naive_n05_attention_test)
         set_tests_properties(naive_n05_attention PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
 
+        add_executable(naive_n05_tp_model_test test/basic/test_naive_n05_tp_model.cpp)
+        target_link_libraries(naive_n05_tp_model_test PRIVATE fastllm)
+        target_include_directories(naive_n05_tp_model_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME naive_n05_tp_model COMMAND naive_n05_tp_model_test)
+        add_test(NAME naive_n05_tp_model_2 COMMAND naive_n05_tp_model_test 2)
+        add_test(NAME naive_n05_tp_model_4 COMMAND naive_n05_tp_model_test 4)
+        set_tests_properties(naive_n05_tp_model naive_n05_tp_model_2 naive_n05_tp_model_4
+            PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
+            PASS_REGULAR_EXPRESSION "MODEL SMOKE PASS")
+
+        # Failure injection interposes the shared library's graph entry points.
+        if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            add_executable(naive_n05_tp_graph_test test/basic/test_naive_n05_tp_graph.cpp)
+            find_library(NAIVE_TP_GRAPH_CUDART cudart HINTS ${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
+            target_link_libraries(naive_n05_tp_graph_test PRIVATE
+                fastllm_tools ${NAIVE_TP_GRAPH_CUDART} ${CMAKE_DL_LIBS})
+            set_target_properties(naive_n05_tp_graph_test PROPERTIES
+                ENABLE_EXPORTS ON LINKER_LANGUAGE CUDA)
+            target_include_directories(naive_n05_tp_graph_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            add_test(NAME naive_n05_tp_graph COMMAND "${CMAKE_COMMAND}"
+                "-DTEST_EXECUTABLE=$<TARGET_FILE:naive_n05_tp_graph_test>"
+                "-DTEST_DIRECTORY=${CMAKE_CURRENT_BINARY_DIR}/naive-tp-graph"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/test/basic/run_naive_tp_graph_test.cmake")
+            set_tests_properties(naive_n05_tp_graph PROPERTIES LABELS cuda RUN_SERIAL TRUE TIMEOUT 730
+                SKIP_REGULAR_EXPRESSION "FASTLLM_TEST_SKIP_NO_DEVICE")
+        endif()
+
         add_executable(naive_n05_tp_test test/basic/test_naive_n05_tp.cpp)
         target_link_libraries(naive_n05_tp_test PRIVATE fastllm)
         target_include_directories(naive_n05_tp_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
@@ -1374,6 +1401,13 @@ if (UNIT_TEST)
         target_include_directories(cuda_qwen4_gdn_output_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         fastllm_add_checked_test(cuda_qwen4_gdn_output cuda_qwen4_gdn_output_test "ALL_PASS" 180)
         set_tests_properties(cuda_qwen4_gdn_output PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+
+        add_executable(naive_n05_decode_graph_test test/basic/test_naive_n05_decode_graph.cpp)
+        target_link_libraries(naive_n05_decode_graph_test PRIVATE fastllm)
+        target_include_directories(naive_n05_decode_graph_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME naive_n05_decode_graph COMMAND naive_n05_decode_graph_test)
+        set_tests_properties(naive_n05_decode_graph PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
+            PASS_REGULAR_EXPRESSION "DECODE GRAPH PASS")
 
         add_executable(cuda_qwen4_shared_expert_test test/basic/test_cuda_qwen4_shared_expert.cpp)
         target_link_libraries(cuda_qwen4_shared_expert_test PRIVATE fastllm)

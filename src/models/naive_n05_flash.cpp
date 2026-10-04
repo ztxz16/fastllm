@@ -1,4 +1,5 @@
 #include "naive_n05_flash.h"
+#include "naive_n05_tp.h"
 #include "blocks/baseblock.h"
 #include "executor.h"
 #include "json11.hpp"
@@ -8,6 +9,7 @@
 #ifdef USE_CUDA
 #include "devices/cuda/naive-n05-cuda.cuh"
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/multicuda/fastllm-multicuda.cuh"
 #endif
 
 namespace fastllm {
@@ -89,6 +91,8 @@ NaiveN05FlashModel::NaiveN05FlashModel() {
 
 NaiveN05FlashModel::~NaiveN05FlashModel() {
     ShutdownRuntime();
+    tpWorkers.Stop();
+    tpDecodeState.reset();
 }
 
 void NaiveN05FlashModel::InitParams() {
@@ -125,6 +129,7 @@ void NaiveN05FlashModel::InitParams() {
     max_positions = number("max_position_embeddings", 1048576);
     indexFp8 = weight.dicts["indexer_activation_dtype"] != "bf16";
     InitDraft();
+    InitTensorParallel();
     historyBytesPerToken = draftEnabled ? embed_dim * sizeof(uint16_t) : 0;
     for (int layer = 0; layer < block_cnt; ++layer) {
         const auto &cfg = slidingLayers[layer] ? sliding : full;
@@ -207,7 +212,9 @@ int NaiveN05FlashModel::Forward(
         std::vector<float> *retLogits) {
     if (draftEnabled)
         return ForwardDraft(inputIds, positionIds, pastKeyValues, generationConfig, lastTokens, retLogits);
-    Data logits = RunTarget(inputIds, positionIds, pastKeyValues, generationConfig, nullptr);
+    Data logits = tpDevices.size() > 1
+        ? ForwardTensorParallel(inputIds, positionIds, pastKeyValues, generationConfig)
+        : RunTarget(inputIds, positionIds, pastKeyValues, generationConfig, nullptr);
     if (isIntermediateChunkedPrefill) return 0;
     return SampleTarget(logits, pastKeyValues, generationConfig, lastTokens, retLogits);
 }
@@ -215,7 +222,7 @@ int NaiveN05FlashModel::Forward(
 Data NaiveN05FlashModel::RunTarget(
         const Data &inputIds, const Data &positionIds,
         std::vector<std::pair<Data, Data>> &pastKeyValues, const GenerationConfig &config,
-        TargetCapture *capture) {
+        TargetCapture *capture, int tpRank, const Data *embedding, TargetWorkspace *workspace) {
 #ifndef USE_CUDA
     ErrorInFastLLM("Naive-N0.5 currently requires the CUDA backend for attention.");
     return Data();
@@ -225,6 +232,32 @@ Data NaiveN05FlashModel::RunTarget(
     AssertInFastLLM(inputIds.dims.size() == 2 && inputIds.dims[0] == 1 &&
                     (int)pastKeyValues.size() == block_cnt,
                     "Naive-N0.5 expects one unpadded sequence and a complete KV cache.");
+    const bool tensorParallel = tpRank >= 0;
+    const int gpu = tensorParallel ? tpDevices.at(tpRank) : -1;
+    Data emptyWeight;
+    auto localWeight = [&](const std::string &name) -> Data & {
+        if (!tensorParallel) return weight[name];
+        auto it = weight.weight.find(name);
+        if (it == weight.weight.end() || it->second.dims.empty()) return emptyWeight;
+        return *it->second.multiDeviceDatas.at(gpu);
+    };
+    auto &moeWeights = tensorParallel ? tpMoeWeights.at(tpRank) : this->moeWeights;
+    auto &moeBiases = tensorParallel ? tpMoeBiases.at(tpRank) : this->moeBiases;
+    size_t communication = 0;
+    auto reduce = [&](Data &data) {
+        if (workspace) {
+            auto &state = *tpDecodeState;
+            auto &rank = *state.ranks.at(tpRank);
+            if (state.mode == TPDecodeState::Warm)
+                rank.communicationPointers.push_back(data.cudaData);
+            else if (communication >= rank.communicationPointers.size() ||
+                     rank.communicationPointers[communication] != data.cudaData)
+                rank.ok = false;
+            ++communication;
+        }
+        if (tensorParallel)
+            FastllmNcclAllReduce(data.cudaData, data.cudaData, data.Count(0), data.dataType, gpu);
+    };
     int length = inputIds.dims[1];
     const int reserveCapacity = CacheReserveCapacity(config);
     const int previousExactThreshold = FastllmCudaGetLinearExactBatchThreshold();
@@ -238,7 +271,7 @@ Data NaiveN05FlashModel::RunTarget(
     if (capture && capture->verifying)
         FastllmCudaSetLinearExactBatchThreshold(std::max(previousExactThreshold, length + 1));
     int pastLength = pastKeyValues[0].first.dims.empty() ? 0 : pastKeyValues[0].first.dims[1];
-    auto historyChunk = BeginHistoryChunk(pastKeyValues, pastLength, length);
+    auto historyChunk = tensorParallel ? nullptr : BeginHistoryChunk(pastKeyValues, pastLength, length);
     if (capture) capture->history = historyChunk;
     AssertInFastLLM(!slidingLayers[0] && pastLength + length <= max_positions,
                     "Naive-N0.5 requires a DSA first layer and input within the context window.");
@@ -252,33 +285,79 @@ Data NaiveN05FlashModel::RunTarget(
             for (int expert = 0; expert < num_experts; expert++) {
                 std::string base = "model.layers." + std::to_string(layer) +
                                    ".mlp.experts." + std::to_string(expert) + ".";
-                moeWeights[layer].push_back(&weight[base + "gateup_proj.weight"]);
-                moeWeights[layer].push_back(&weight[base + "down_proj.weight"]);
+                moeWeights[layer].push_back(&localWeight(base + "gateup_proj.weight"));
+                moeWeights[layer].push_back(&localWeight(base + "down_proj.weight"));
             }
             moeBiases[layer].resize(moeWeights[layer].size(), nullptr);
         }
     }
-    ApplyDeviceMap(deviceMap, 1, block_cnt);
-    Data hidden, normed, q, k, v, packed, attn, projected;
-    Data routerInput, router, expertIndex, expertScore;
-    Data w1, w2, w3, tempInput, tempOutput, moeOutput, moeInputTemp, moeOutputTemp;
-    Data indexQ, indexKey, indexWeights, indices, positions;
-    positions.CopyFrom(positionIds);
-    ToDataType(positions, DataType::FLOAT32);
-    Embedding(inputIds, weight["model.embed_tokens.weight"], hidden);
+    if (!tensorParallel) ApplyDeviceMap(deviceMap, 1, block_cnt);
+    TargetWorkspace temporary;
+    TargetWorkspace &buf = workspace ? *workspace : temporary;
+    Data &hidden = buf.hidden;
+    Data &normed = buf.normed;
+    Data &q = buf.q;
+    Data &k = buf.k;
+    Data &v = buf.v;
+    Data &packed = buf.packed;
+    Data &attn = buf.attn;
+    Data &projected = buf.projected;
+    Data &routerInput = buf.routerInput;
+    Data &router = buf.router;
+    Data &expertIndex = buf.expertIndex;
+    Data &expertScore = buf.expertScore;
+    Data &w1 = buf.w1;
+    Data &w2 = buf.w2;
+    Data &w3 = buf.w3;
+    Data &tempInput = buf.tempInput;
+    Data &tempOutput = buf.tempOutput;
+    Data &moeOutput = buf.moeOutput;
+    Data &moeInputTemp = buf.moeInputTemp;
+    Data &moeOutputTemp = buf.moeOutputTemp;
+    Data &indexQ = buf.indexQ;
+    Data &indexKey = buf.indexKey;
+    Data &indexWeights = buf.indexWeights;
+    Data &indices = buf.indices;
+    Data &positions = buf.positions;
+    if (!workspace) {
+        positions.CopyFrom(positionIds);
+        ToDataType(positions, DataType::FLOAT32);
+    }
+    if (embedding) hidden.CopyFrom(*embedding);
+    else if (workspace) EmbeddingDirect(inputIds, localWeight("model.embed_tokens.weight"), hidden);
+    else Embedding(inputIds, localWeight("model.embed_tokens.weight"), hidden);
     ToDataType(hidden, DataType::BFLOAT16);
+    auto norm = [&](Data &input, Data &weight, Data &output) {
+        if (!workspace) {
+            KimiK3RMSNorm(input, weight, rms_norm_eps, output);
+            return;
+        }
+        output.dataType = DataType::BFLOAT16;
+        output.Resize(input.dims);
+        output.ToDevice(DataDevice::CUDA, {gpu}, false);
+        output.Allocate(false);
+        if (!FastllmCudaKimiK3RMSNorm(input, weight, output, rms_norm_eps)) {
+            if (FastllmCudaGraphIsCapturingFast()) FastllmCudaSetThreadError();
+            else AssertInFastLLM(false, "Naive TP RMSNorm launch failed.");
+        }
+    };
     for (int layer = 0; layer < block_cnt; layer++) {
-        ApplyDeviceMap(deviceMap, layer + 1, block_cnt);
+        if (!tensorParallel) ApplyDeviceMap(deviceMap, layer + 1, block_cnt);
         std::string prefix = "model.layers." + std::to_string(layer);
         std::string ap = prefix + ".self_attn.";
-        auto &cfg = slidingLayers[layer] ? sliding : full;
+        auto cfg = slidingLayers[layer] ? sliding : full;
+        if (tensorParallel) {
+            cfg.heads /= tpDevices.size();
+            cfg.kvHeads = std::max(1, cfg.kvHeads / (int)tpDevices.size());
+        }
         int rotaryDim = (int)(cfg.headDim * partialRotary);
         // This RMSNorm rounds the normalized activation before multiplying
         // the affine weight, matching the checkpoint's LlamaRMSNorm.
-        KimiK3RMSNorm(hidden, weight[prefix + ".input_layernorm.weight"], rms_norm_eps, normed);
-        Linear(normed, weight[ap + "q_proj.weight"], weight[ap + "q_proj.bias"], q);
-        Linear(normed, weight[ap + "k_proj.weight"], weight[ap + "k_proj.bias"], k);
-        Linear(normed, weight[ap + "v_proj.weight"], weight[ap + "v_proj.bias"], v);
+        if (!workspace || layer == 0)
+            norm(hidden, localWeight(prefix + ".input_layernorm.weight"), normed);
+        Linear(normed, localWeight(ap + "q_proj.weight"), localWeight(ap + "q_proj.bias"), q);
+        Linear(normed, localWeight(ap + "k_proj.weight"), localWeight(ap + "k_proj.bias"), k);
+        Linear(normed, localWeight(ap + "v_proj.weight"), localWeight(ap + "v_proj.bias"), v);
         AssertInFastLLM(q.dataDevice == DataDevice::CUDA,
                         "Naive-N0.5 attention requires --device cuda.");
         positions.ToDevice(q.dataDevice, q.dataDeviceIds);
@@ -286,12 +365,19 @@ Data NaiveN05FlashModel::RunTarget(
             cfg.headDim, cfg.valueDim, rotaryDim, cfg.theta, valueScale);
         if (!slidingLayers[layer]) {
             std::string ip = ap + "indexer.";
-            Linear(normed, weight[ip + "wk.weight"], Data(), indexKey);
+            Linear(normed, localWeight(ip + "wk.weight"), Data(), indexKey);
             // LayerNorm accumulates in FP32; the generic CUDA operation does
             // not accept BF16 storage, so round only its final result.
-            ToDataType(indexKey, DataType::FLOAT32);
-            LayerNorm(indexKey, weight[ip + "k_norm.weight"], weight[ip + "k_norm.bias"], -1, indexKey);
-            ToDataType(indexKey, DataType::BFLOAT16);
+            if (workspace) {
+                ToDataType(indexKey, buf.indexKeyFloat, DataType::FLOAT32);
+                LayerNorm(buf.indexKeyFloat, localWeight(ip + "k_norm.weight"),
+                          localWeight(ip + "k_norm.bias"), -1, buf.indexKeyFloat);
+                ToDataType(buf.indexKeyFloat, indexKey, DataType::BFLOAT16);
+            } else {
+                ToDataType(indexKey, DataType::FLOAT32);
+                LayerNorm(indexKey, localWeight(ip + "k_norm.weight"), localWeight(ip + "k_norm.bias"), -1, indexKey);
+                ToDataType(indexKey, DataType::BFLOAT16);
+            }
             FastllmCudaNaiveRope(indexKey, positions, 1, indexDim, rotaryDim, cfg.theta);
             Cat(k, indexKey, 2, packed);
         } else {
@@ -301,58 +387,94 @@ Data NaiveN05FlashModel::RunTarget(
             CopyHistoryTensor(packed, historyChunk->layers[layer].first, historyChunk->length);
             CopyHistoryTensor(v, historyChunk->layers[layer].second, historyChunk->length);
         }
-        auto &pastKey = pastKeyValues[layer].first;
-        auto &pastValue = pastKeyValues[layer].second;
+        auto &pastKey = tensorParallel ? *pastKeyValues[layer].first.multiDeviceDatas.at(gpu) : pastKeyValues[layer].first;
+        auto &pastValue = tensorParallel ? *pastKeyValues[layer].second.multiDeviceDatas.at(gpu) : pastKeyValues[layer].second;
         int localPast = pastKey.dims.empty() ? 0 : pastKey.dims[1];
         // Sliding layers retain only window-1 rows between chunks. Keep their
         // reservation bounded even when the full request is very long.
         const int layerCapacity = slidingLayers[layer]
             ? (int)std::min<int64_t>(reserveCapacity, (int64_t)window - 1 + length)
             : reserveCapacity;
-        AppendCache(pastKey, packed, layerCapacity);
-        AppendCache(pastValue, v, layerCapacity);
+        if (workspace) {
+            FastllmCudaNaiveAppendDecodeCache(pastKey, pastValue, packed, v,
+                buf.liveKeys, slidingLayers[layer] ? window : 0);
+        } else {
+            AppendCache(pastKey, packed, layerCapacity);
+            AppendCache(pastValue, v, layerCapacity);
+        }
         Data noIndices;
         Data *selected = &noIndices;
-        if (!slidingLayers[layer] && pastKey.dims[1] > indexTopK) {
+        if (!slidingLayers[layer] && (workspace ? buf.capacity : pastKey.dims[1]) > indexTopK) {
             std::string ip = ap + "indexer.";
-            Linear(normed, weight[ip + "wq.weight"], Data(), indexQ);
+            Linear(normed, localWeight(ip + "wq.weight"), Data(), indexQ);
             FastllmCudaNaiveRope(indexQ, positions, indexHeads, indexDim, rotaryDim, cfg.theta);
-            Linear(normed, weight[ip + "weights_proj.weight"], Data(), indexWeights);
+            Linear(normed, localWeight(ip + "weights_proj.weight"), Data(), indexWeights);
             Mul(indexWeights, 1.0f / std::sqrt((float)indexHeads), indexWeights);
-            FastllmCudaNaiveIndexer(indexQ, indexWeights, pastKey, indexHeads, indexDim,
-                                    localPast, indexTopK, indexFp8, indices);
+            if (workspace) {
+                FastllmCudaNaiveDecodeIndexer(indexQ, indexWeights, pastKey,
+                    buf.liveKeys, buf.capacity, indexFp8, buf.decode, indices);
+            } else {
+                FastllmCudaNaiveIndexer(indexQ, indexWeights, pastKey, indexHeads, indexDim,
+                                        localPast, indexTopK, indexFp8, indices);
+            }
             selected = &indices;
         }
-        Data &sink = weight[ap + "attention_sink_bias"];
+        Data &sink = localWeight(ap + "attention_sink_bias");
         if (!sink.dims.empty()) {
             ToDataType(sink, DataType::FLOAT32);
             sink.ToDevice(q.dataDevice, q.dataDeviceIds);
         }
-        FastllmCudaNaiveAttention(q, pastKey, pastValue, *selected, sink,
-                                  cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
-                                  localPast, slidingLayers[layer] ? window : 0, attn);
-        if (slidingLayers[layer] && (!capture || !capture->verifying)) {
-            FastllmCudaNaiveTrimCache(pastKey, pastValue, window - 1);
+        if (workspace) {
+            FastllmCudaNaiveDecodeAttention(q, pastKey, pastValue, *selected, sink,
+                buf.liveKeys, buf.capacity, cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
+                slidingLayers[layer] ? window : 0, buf.decode, attn);
+            if (slidingLayers[layer])
+                FastllmCudaNaiveTrimDecodeCache(pastKey, pastValue, buf.liveKeys, window);
+        } else {
+            FastllmCudaNaiveAttention(q, pastKey, pastValue, *selected, sink,
+                                      cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
+                                      localPast, slidingLayers[layer] ? window : 0, attn);
+            if (slidingLayers[layer] && (!capture || !capture->verifying))
+                FastllmCudaNaiveTrimCache(pastKey, pastValue, window - 1);
         }
-        Linear(attn, weight[ap + "o_proj.weight"], Data(), projected);
-        AddTo(hidden, projected);
-        KimiK3RMSNorm(hidden, weight[prefix + ".post_attention_layernorm.weight"], rms_norm_eps, normed);
+        Linear(attn, localWeight(ap + "o_proj.weight"), Data(), projected);
+        reduce(projected);
+        if (workspace) {
+            FastllmCudaNaiveAddDecodeRMSNorm(hidden, projected,
+                localWeight(prefix + ".post_attention_layernorm.weight"), rms_norm_eps, normed);
+        } else {
+            AddTo(hidden, projected);
+            norm(hidden, localWeight(prefix + ".post_attention_layernorm.weight"), normed);
+        }
+        auto addMlpResidual = [&](Data &branch) {
+            if (!workspace) { AddTo(hidden, branch); return; }
+            const bool lastLayer = layer + 1 == block_cnt;
+            const std::string name = lastLayer ? "model.norm.weight" :
+                "model.layers." + std::to_string(layer + 1) + ".input_layernorm.weight";
+            FastllmCudaNaiveAddDecodeRMSNorm(hidden, branch, localWeight(name),
+                rms_norm_eps, lastLayer ? buf.last : normed);
+        };
         if (!moeLayers[layer]) {
-            Linear(normed, weight[prefix + ".mlp.gate_proj.weight"], Data(), w1);
-            Linear(normed, weight[prefix + ".mlp.up_proj.weight"], Data(), w3);
+            // Dense and routed-expert scratch have independent lifetimes.
+            Data &w1 = workspace ? buf.denseGate : buf.w1;
+            Data &w2 = workspace ? buf.denseDown : buf.w2;
+            Data &w3 = workspace ? buf.denseUp : buf.w3;
+            Linear(normed, localWeight(prefix + ".mlp.gate_proj.weight"), Data(), w1);
+            Linear(normed, localWeight(prefix + ".mlp.up_proj.weight"), Data(), w3);
             Silu(w1, w1);
             MulTo(w1, w3);
-            Linear(w1, weight[prefix + ".mlp.down_proj.weight"], Data(), w2);
-            AddTo(hidden, w2);
+            Linear(w1, localWeight(prefix + ".mlp.down_proj.weight"), Data(), w2);
+            reduce(w2);
+            addMlpResidual(w2);
         } else {
             ToDataType(normed, routerInput, DataType::FLOAT32);
-            Linear(routerInput, weight[prefix + ".mlp.gate.weight"], Data(), router);
+            Linear(routerInput, localWeight(prefix + ".mlp.gate.weight"), Data(), router);
             Sigmoid(router, router);
             SelectExpert(router, expertIndex, expertScore, num_experts_per_tok,
                          norm_topk_prob, routed_scaling_factor,
-                         &weight[prefix + ".mlp.gate.e_score_correction_bias"]);
+                         &localWeight(prefix + ".mlp.gate.e_score_correction_bias"));
             normed.Reshape({length, embed_dim});
-            ApplyMoeDeviceMapForLayer(layer);
+            if (!tensorParallel) ApplyMoeDeviceMapForLayer(layer);
             auto &executor = *(Executor *)GetExecutor();
             if (executor.firstDevice.find("numa") == 0 &&
                 (moeWeights[layer][2]->dataType == DataType::FP8_E4M3 ||
@@ -377,22 +499,32 @@ Data NaiveN05FlashModel::RunTarget(
                               0.0f, &moeOutput, layer, DataType::BFLOAT16, moeAtype,
                               &moeInputTemp, &moeOutputTemp);
             }
-            ApplyDeviceMap(deviceMap, layer + 1, block_cnt);
+            if (!tensorParallel) ApplyDeviceMap(deviceMap, layer + 1, block_cnt);
             moeOutput.Reshape(hidden.dims);
-            AddTo(hidden, moeOutput);
+            reduce(moeOutput);
+            addMlpResidual(moeOutput);
         }
         if (capture && std::find(draftTargetLayers.begin(), draftTargetLayers.end(), layer) != draftTargetLayers.end())
             Copy(hidden, capture->hidden[layer]);
     }
-    if (!capture) FinishHistoryChunk(pastKeyValues, historyChunk);
+    if (!tensorParallel && !capture) FinishHistoryChunk(pastKeyValues, historyChunk);
     if (isIntermediateChunkedPrefill) return Data();
-    Data last, logits;
-    if (capture && capture->verifying) Copy(hidden, last);
-    else Split(hidden, 1, length - 1, length, last);
-    KimiK3RMSNorm(last, weight["model.norm.weight"], rms_norm_eps, last);
-    Linear(last, weight["lm_head.weight"], Data(), logits);
+    Data localLogits;
+    Data &last = buf.last, &logits = workspace ? buf.logits : localLogits;
+    if (!workspace) {
+        if (capture && capture->verifying) Copy(hidden, last);
+        else Split(hidden, 1, length - 1, length, last);
+        norm(last, localWeight("model.norm.weight"), last);
+    }
+    if (workspace) {
+        // Conversions must not free addresses retained by the graph.
+        Linear(last, localWeight("lm_head.weight"), Data(), buf.logitsBf16);
+        ToDataType(buf.logitsBf16, logits, DataType::FLOAT32);
+        return Data();
+    }
+    Linear(last, localWeight("lm_head.weight"), Data(), logits);
     ToDataType(logits, DataType::FLOAT32);
-    return logits;
+    return localLogits;
 #endif
 }
 
@@ -430,8 +562,16 @@ void NaiveN05FlashModel::WarmUp() {
     }
     elementsInKVCachePerToken = 0;
     for (int layer = 0; layer < block_cnt; layer++) {
-        if (!slidingLayers[layer])
+        if (slidingLayers[layer]) continue;
+        if (tpDevices.size() > 1) {
+            // Count physical storage, including replicated KV heads and the
+            // replicated Indexer key, for the scheduler's token budget.
+            for (int device : tpDevices)
+                elementsInKVCachePerToken += cache[layer].first.multiDeviceDatas.at(device)->dims[2] +
+                                            cache[layer].second.multiDeviceDatas.at(device)->dims[2];
+        } else {
             elementsInKVCachePerToken += cache[layer].first.dims[2] + cache[layer].second.dims[2];
+        }
     }
 }
 }

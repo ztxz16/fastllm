@@ -467,6 +467,7 @@ namespace fastllm {
              model->model_type != "step3p5" &&
              model->model_type != "laguna" &&
              model->model_type != "minimax_m2" &&
+             model->model_type != "naive_n05_flash" &&
              model->model_type != "deepseek_v4" &&
              model->model_type != "deepseek_v41" &&
              model->model_struct != "qwen3_5") ||

@@ -35,6 +35,34 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query,
                               int pastLength, int window,
                               fastllm::Data &output, bool causal = true);
 
+// Whole-step decode graphs own these buffers until the executable is destroyed.
+// liveKeys is an INT32 device scalar (past length + 1), updated before replay.
+struct FastllmNaiveDecodeScratch {
+    fastllm::Data indexQuery, indexScale, indexScores, topk;
+    fastllm::Data attentionScores, attentionPartial;
+};
+bool FastllmCudaNaiveDecodeGraphSupported();
+// One BF16 decode row; update the residual and preserve RMSNorm rounding.
+void FastllmCudaNaiveAddDecodeRMSNorm(fastllm::Data &hidden,
+    const fastllm::Data &branch, const fastllm::Data &weight,
+    float eps, fastllm::Data &output);
+
+void FastllmCudaNaiveAppendDecodeCache(fastllm::Data &key, fastllm::Data &value,
+    const fastllm::Data &newKey, const fastllm::Data &newValue,
+    const fastllm::Data &liveKeys, int window);
+void FastllmCudaNaiveTrimDecodeCache(fastllm::Data &key, fastllm::Data &value,
+    const fastllm::Data &liveKeys, int window);
+void FastllmCudaNaiveDecodeIndexer(const fastllm::Data &query,
+    const fastllm::Data &weights, const fastllm::Data &packedKeys,
+    const fastllm::Data &liveKeys, int capacity, bool fp8Query,
+    FastllmNaiveDecodeScratch &scratch, fastllm::Data &indices);
+void FastllmCudaNaiveDecodeAttention(const fastllm::Data &query,
+    const fastllm::Data &key, const fastllm::Data &value,
+    const fastllm::Data &indices, const fastllm::Data &sink,
+    const fastllm::Data &liveKeys, int capacity, int heads, int kvHeads,
+    int dim, int valueDim, int window,
+    FastllmNaiveDecodeScratch &scratch, fastllm::Data &output);
+
 // NUMA FP8 weights are row-packed [128 E4M3 bytes, FP32 scale]. Gate/up
 // output rows are interleaved. Route ids index the original [token, top-k].
 struct FastllmNaiveFP8ExpertTask {

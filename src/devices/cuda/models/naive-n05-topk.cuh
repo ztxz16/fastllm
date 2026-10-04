@@ -39,9 +39,10 @@ __device__ inline unsigned OrderedScoreBits(unsigned bits) {
 }
 // Fixed K/capacity specialization. Equal scores retain input order.
 // A cooperative launch is required: all CTAs must be simultaneously resident.
-template <typename Score>
-__global__ void Select(const Score *scores, int n, int *partials, int *ties, State *state,
+template <typename Score, typename Count = int>
+__global__ void Select(const Score *scores, Count liveCount, int *partials, int *ties, State *state,
                        Candidates *out) {
+    int n = liveCount;
     constexpr int T = kThreads;
     using Scan = cub::BlockScan<int, T>;
     __shared__ int hist[kBuckets];

@@ -442,7 +442,8 @@ static void TestAttentionGroupedScores() {
                    // Single-query GQA reuse and adjacent dimension/group fallbacks.
                    Shape{1,32,8,64,8,4099,2048}, Shape{1,64,4,192,8,4099,2048},
                    Shape{1,48,4,129,132,4099,2048}, Shape{1,32,4,193,8,4099,2048},
-                   Shape{1,31,1,192,8,4099,2048}})
+                   Shape{1,31,1,192,8,4099,2048},
+                   Shape{1,8,1,192,8,4099,2048}, Shape{1,4,1,129,132,4099,2048}})
     for (bool causal : {false, true}) for (bool withSink : {false, true}) {
         Data query(BFLOAT16),key(BFLOAT16),value(BFLOAT16),sink(FLOAT32),indices(INT32),output;
         int keyStride = s.kvHeads * s.dim + 128, past = s.keys - s.queries - (s.queries == 1 ? 64 : 0);
@@ -506,7 +507,10 @@ static void TestAttentionGlobalMma() {
                    Shape{1,4099,2048,32,1,0,true}, Shape{1,4099,2048,31,1,0,true},
                    Shape{1,4099,2047,64,4,128,true}, Shape{1,4099,2049,64,4,128,true},
                    // Unaligned K stride uses grouped QK; aligned GQA16 uses shared K/V.
-                   Shape{1,4099,2048,64,4,1,true}, Shape{1,4099,2048,32,2,128,true}})
+                   Shape{1,4099,2048,64,4,1,true}, Shape{1,4099,2048,32,2,128,true},
+                   // TP shards: GQA4/8/16 and the adjacent head-count fallback.
+                   Shape{1,4099,2048,4,1,128,true}, Shape{1,4099,2048,8,1,128,true},
+                   Shape{1,4099,2048,16,1,128,true}, Shape{1,4099,2048,3,1,128,true}})
     for (bool causal : {false,true}) for (int mode=0;mode<5;++mode) {
         constexpr int dim=192,valueDim=128;
         int past = s.rows == 1 && s.padding == 0 ? s.keys - 67 : s.keys - s.rows;

@@ -1325,6 +1325,7 @@ def make_normal_llm_model(args, startup_progress = None):
     is_deepseek_v41_model = False
     is_laguna_hybrid_tp_model = False
     is_laguna_model = False
+    is_naive_n05_model = False
     is_qwen35_model = False
     is_qwen38_flash_next_model = False
     is_glm5_next_model = False
@@ -1340,6 +1341,9 @@ def make_normal_llm_model(args, startup_progress = None):
             architectures = config.get("architectures", [])
             architecture = architectures[0] if architectures else ""
             model_type = config.get("model_type", "")
+            is_naive_n05_model = model_type == "naive_n05_flash"
+            if is_naive_n05_model:
+                is_thread_tp_moe_model = True
             is_laguna_model = (architecture == 'LagunaForCausalLM' or
                                 model_type == 'laguna')
             is_dots3_note_model = (
@@ -1610,6 +1614,11 @@ def make_normal_llm_model(args, startup_progress = None):
                 args.device = (cuda_spec or tp_device) if is_qwen38_flash_next_model else tp_device
             if (not user_set_moe_device):
                 args.moe_device = (_thread_tp_cuda_device_spec(args.tp) or args.device) if is_thread_tp_moe_model else args.device
+    if (is_naive_n05_model and _uses_thread_tp(getattr(args, "tp", "")) and
+            _thread_tp_cuda_device_count(args.tp) > 1 and cuda_slab_auto):
+        # TP produces thousands of small expert shards per GPU. Keep compact
+        # NVFP4 sources in slabs that Marlin can release one layer at a time.
+        args.cuda_slab = 16
     if ((is_multicuda_tp_model or is_laguna_hybrid_tp_model) and
             _uses_multicuda_device(args.moe_device)):
         # Large MoE checkpoints have tens of thousands of routed-expert tensors.
@@ -1721,7 +1730,7 @@ def make_normal_llm_model(args, startup_progress = None):
             if (atype_was_auto and not is_deepseek_v41_model):
                 # DeepSeek-V4.1 的 SetDataType 只接受 float32（推理精度由模型内部
                 # 自己按 BF16 走），--tp 不能像其它模型那样把 atype 改成 float16。
-                args.atype = "bfloat16" if is_laguna_model else "float16"
+                args.atype = "bfloat16" if (is_laguna_model or is_naive_n05_model) else "float16"
             if (not(args.device and args.device != "")):
                 args.device = _first_thread_tp_cuda_device(tp_arg)
     if (args.moe_atype == "" and is_moe_model and args.dtype == "fp8_e4m3"):
