@@ -514,8 +514,21 @@ namespace fastllm {
 
         auto vec_dot_type = ggml_type_vec_dot_type(weightType);
         auto vec_dot = ggml_type_vec_dot(weightType);
-        if (GetMulMatFunction(weightType, 1) != nullptr) {
-            int part = (n == 1 ? (end - st) : 64);
+        if (auto single = GetMulMatFunction(weightType, 1)) {
+            // Decode needs only the one-row kernel. Avoid allocating a table
+            // and resolving all eight batch sizes for every worker slice.
+            if (n == 1) {
+                const size_t weightRowBytes = ggml_row_size(weightType, m);
+                const size_t inputRowBytes = ggml_row_size(vec_dot_type, m);
+                DataInfo info{outputData + st, (const char *)q8kInputData,
+                    (size_t)k, inputRowBytes, 0, 1, nullptr, 0};
+                single(m, weightData + size_t(st) * weightRowBytes,
+                       weightRowBytes, info, end - st);
+                if (biasData)
+                    for (int j = st; j < end; ++j) outputData[j] += biasData[j];
+                return true;
+            }
+            const int part = 64;
             int oldSt = st, oldEnd = end;
 
             int maxRows = 8;

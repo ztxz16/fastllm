@@ -1,6 +1,7 @@
 #pragma once
 #include "gguf.h"
 #include <cassert>
+#include <cstring>
 
 extern float GGML_FP16_TO_FP32(ggml_half f);
 
@@ -21,16 +22,24 @@ template<> inline int scale(const block_iq4_xs &x, int g) {
 
 #if defined(__AVX2__)
 inline __m256i unpack(const block_iq3_s &x, int g) {
-    const uint8_t *q = x.qs + 8 * g;
-    const int hi = x.qh[g];
+    // Construct all eight 9-bit codebook indices together. Scalar shifts
+    // for each index and 64-bit sign broadcasts dominate small CPU dots.
+    const __m256i lo = _mm256_cvtepu8_epi32(
+        _mm_loadl_epi64((const __m128i *)(x.qs + 8 * g)));
+    const __m256i hi = _mm256_and_si256(
+        _mm256_sllv_epi32(_mm256_set1_epi32(x.qh[g]),
+                         _mm256_setr_epi32(8, 7, 6, 5, 4, 3, 2, 1)),
+        _mm256_set1_epi32(256));
+    alignas(32) uint32_t index[8];
+    _mm256_store_si256((__m256i *)index, _mm256_or_si256(lo, hi));
+    // Scalar table loads avoid the expensive gather on older AVX2 CPUs.
     const __m256i values = _mm256_setr_epi32(
-        iq3s_grid[q[0] | ((hi << 8) & 256)], iq3s_grid[q[1] | ((hi << 7) & 256)],
-        iq3s_grid[q[2] | ((hi << 6) & 256)], iq3s_grid[q[3] | ((hi << 5) & 256)],
-        iq3s_grid[q[4] | ((hi << 4) & 256)], iq3s_grid[q[5] | ((hi << 3) & 256)],
-        iq3s_grid[q[6] | ((hi << 2) & 256)], iq3s_grid[q[7] | ((hi << 1) & 256)]);
-    const uint8_t *s = x.signs + 4 * g;
-    const uint64_t repeat = 0x0101010101010101ULL;
-    const __m256i signs = _mm256_setr_epi64x(s[0] * repeat, s[1] * repeat, s[2] * repeat, s[3] * repeat);
+        iq3s_grid[index[0]], iq3s_grid[index[1]], iq3s_grid[index[2]], iq3s_grid[index[3]],
+        iq3s_grid[index[4]], iq3s_grid[index[5]], iq3s_grid[index[6]], iq3s_grid[index[7]]);
+    uint32_t bits;
+    std::memcpy(&bits, x.signs + 4 * g, sizeof(bits));
+    const __m256i signs = _mm256_shuffle_epi8(_mm256_set1_epi32(bits),
+        _mm256_setr_epi64x(0, 0x0101010101010101LL, 0x0202020202020202LL, 0x0303030303030303LL));
     const __m256i mask = _mm256_set1_epi64x(0x8040201008040201ULL);
     const __m256i neg = _mm256_cmpeq_epi8(_mm256_and_si256(signs, mask), mask);
     return _mm256_sign_epi8(values, _mm256_or_si256(neg, _mm256_set1_epi8(1)));

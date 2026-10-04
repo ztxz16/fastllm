@@ -2,6 +2,7 @@
 #include "devices/cpu/computeutils.h"
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <stdexcept>
 #include <vector>
@@ -9,6 +10,42 @@
 static void Check(bool value, const char *message) {
     if (!value) throw std::runtime_error(message);
 }
+
+// Cover every codebook index in every packed position, including the high
+// index bit and sign broadcasts across 128-bit lanes. Unit scales make the
+// decoded reference an exact integer, including Q8's -128 endpoint.
+static void RunIQ3SCodebook() {
+    const auto decode = ggml_type_to_float(GGML_TYPE_IQ3_S);
+    const auto dot = ggml_type_vec_dot(GGML_TYPE_IQ3_S);
+    const int8_t endpoints[] = {-128, -127, -1, 0, 1, 126, 127};
+    for (int code = 0; code < 512; ++code)
+    for (int signs : {0x00, 0xff, 0x55, 0xaa})
+    for (int pattern = 0; pattern < 3; ++pattern) {
+        block_iq3_s x {};
+        block_q8_K y {};
+        x.d = 0x3c00;
+        y.d = 1.0f;
+        std::memset(x.scales, 0xff, sizeof(x.scales));
+        for (int g = 0; g < 8; ++g) {
+            for (int i = 0; i < 8; ++i) {
+                const int index = (code + g * 73 + i * 19) % 512;
+                x.qs[8 * g + i] = index & 255;
+                x.qh[g] |= (index >> 8) << i;
+            }
+            for (int i = 0; i < 4; ++i) x.signs[4 * g + i] = signs ^ (g * 37 + i * 19);
+        }
+        for (int i = 0; i < QK_K; ++i)
+            y.qs[i] = pattern == 0 ? -128 : pattern == 1 ? 127 : endpoints[i % 7];
+        float decoded[QK_K], actual;
+        decode(&x, decoded, QK_K);
+        double expected = 0;
+        for (int i = 0; i < QK_K; ++i) expected += double(decoded[i]) * y.qs[i];
+        dot(QK_K, &actual, 0, &x, 0, &y, 0, 1);
+        Check(actual == expected, "IQ3_S codebook/sign endpoint differs from decoded reference");
+        Check(iq_native::dot(QK_K, &x, &y) == expected, "IQ3_S inline codebook/sign endpoint differs");
+    }
+}
+
 template<class Block> static void Run(ggml_type type) {
     Check(ggml_type_vec_dot_type(type) == GGML_TYPE_Q8_K, "wrong activation type");
     const auto dot = ggml_type_vec_dot(type);
@@ -58,6 +95,59 @@ template<class Block> static void Run(ggml_type type) {
                 near(iq_native::dot(columns, x.data() + col * blocks, y.data() + row * blocks), expected);
                 if (col >= 2 && col < outputs - 2) near(result[row * outputs + col], expected + bias[col]);
                 else Check(result[row * outputs + col] == -123456, "linear wrote outside requested columns");
+            }
+        }
+    }
+}
+
+static void RunR4(ggml_type type) {
+    const auto *pack = get_repack_info(type);
+    if (!pack) return; // This build has no architecture-specific R4 kernels.
+    const auto decode = ggml_type_to_float(type);
+    std::mt19937 random(62851 + type);
+    constexpr int outputs = 24, first = 4, last = 20;
+    const uint16_t scales[] = {0, 0x2800, 0xb000, 0x2c80, 1, 0x8155};
+    for (int columns : {256, 512, 2560}) for (int inputs : {1, 2, 8, 9}) {
+        const size_t stride = ggml_row_size(type, columns);
+        const size_t block = ggml_type_size(type);
+        std::vector<uint8_t> raw(outputs * stride), packed(raw.size());
+        for (auto &v : raw) v = random();
+        for (size_t off = 0; off < raw.size(); off += block)
+            std::memcpy(raw.data() + off, &scales[(off / block) % 6], sizeof(uint16_t));
+        pack->repack(outputs, columns, (const char *)raw.data(), (char *)packed.data(), false);
+        std::vector<block_q8_K> activation(inputs * columns / QK_K);
+        for (auto &b : activation) {
+            b.d = (int(random() % 15) - 7) / 128.0f;
+            // The Q8_K row quantizer used by these R4 kernels emits [-127,127].
+            for (int i = 0; i < QK_K; ++i)
+                b.qs[i] = i % 3 == 0 ? -127 : i % 3 == 1 ? 127 : int(random() % 255) - 127;
+        }
+        std::vector<float> result(inputs * outputs, -123456), bias(outputs), row(columns);
+        for (int col = 0; col < outputs; ++col) bias[col] = (col - 10) * .125f;
+        const auto at = fastllm::DataType(int(fastllm::DATA_GGUF_FORMAT) + GGML_TYPE_Q8_K);
+        const auto wt = fastllm::DataType(int(fastllm::DATA_GGUF_FORMAT) + pack->new_type);
+        for (bool withBias : {false, true}) {
+            std::fill(result.begin(), result.end(), -123456);
+            Check(fastllm::LinearQ8K_GGUF_Kernel((uint8_t *)activation.data(), packed.data(),
+                withBias ? bias.data() : nullptr, result.data(), inputs, columns, outputs,
+                first, last, at, wt), "R4 linear dispatch failed");
+            for (int col = 0; col < outputs; ++col) {
+                decode(raw.data() + col * stride, row.data(), columns);
+                for (int input = 0; input < inputs; ++input) {
+                    if (col < first || col >= last) {
+                        Check(result[input * outputs + col] == -123456, "R4 wrote outside requested slice");
+                        continue;
+                    }
+                    double expected = withBias ? bias[col] : 0, magnitude = 0;
+                    for (int c = 0; c < columns; ++c) {
+                        const auto &b = activation[(input * columns + c) / QK_K];
+                        const double term = double(row[c]) * b.d * b.qs[c % QK_K];
+                        expected += term; magnitude += std::abs(term);
+                    }
+                    const float actual = result[input * outputs + col];
+                    Check(std::isfinite(actual) && std::abs(actual - expected) <= 1e-5 + magnitude * 3e-6,
+                          "IQ R4 decode/batch differs from decoded FP64 reference");
+                }
             }
         }
     }
@@ -119,9 +209,12 @@ static void RunQ2() {
 int main() {
     try {
         RunQ2();
+        RunIQ3SCodebook();
         Run<block_iq3_s>(GGML_TYPE_IQ3_S);
         Run<block_iq4_xs>(GGML_TYPE_IQ4_XS);
-        std::puts("PASS: IQ3_S/IQ4_XS CPU and Q2_0 dot, signed endpoints, scales and linear dispatch");
+        RunR4(GGML_TYPE_IQ2_S);
+        RunR4(GGML_TYPE_IQ3_XXS);
+        std::puts("PASS: IQ3_S/IQ4_XS CPU, IQ2_S/IQ3_XXS R4 and Q2_0 dot, codebooks, signed endpoints, scales and linear dispatch");
         return 0;
     } catch (const std::exception &e) { std::fprintf(stderr, "FAIL: %s\n", e.what()); return 1; }
 }
