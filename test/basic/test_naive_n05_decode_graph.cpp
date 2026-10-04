@@ -62,7 +62,7 @@ struct Graph {
     }
 };
 static void TestAttention(int heads, int dim, int vd, int window, int capacity,
-                          const std::vector<int> &lengths, bool fp8) {
+                          const std::vector<int> &lengths, bool fp8, bool withSink = true) {
     Data q(BFLOAT16), iq(BFLOAT16), iw(BFLOAT16), key(BFLOAT16), value(BFLOAT16), sink(FLOAT32), live(INT32);
     Upload(q, {1, 1, heads * dim}, 1);
     Upload(iq, {1, 1, 16 * 128}, 2);
@@ -70,7 +70,8 @@ static void TestAttention(int heads, int dim, int vd, int window, int capacity,
     int storage = window ? window : capacity, stride = dim + (window ? 0 : 128);
     Upload(key, {1, storage, stride}, 4);
     Upload(value, {1, storage, vd}, 5);
-    Upload(sink, {heads}, 6);
+    if (withSink)
+        Upload(sink, {heads}, 6);
     live.Resize({1});
     live.Allocate();
     ((int *)live.cpuData)[0] = lengths[0];
@@ -96,6 +97,16 @@ static void TestAttention(int heads, int dim, int vd, int window, int capacity,
         Data referenceIndices;
         if (sparse)
             FastllmCudaNaiveIndexer(iq, iw, key, 16, 128, n - 1, 2048, fp8, referenceIndices);
+        else if (!window && capacity <= 256) {
+            // Explicit identity indices retain the independent generic kernel
+            // while the captured path uses the tiled short-decode kernel.
+            referenceIndices.dataType = INT32;
+            referenceIndices.Resize({1, n});
+            referenceIndices.Allocate();
+            for (int i = 0; i < n; ++i)
+                ((int *)referenceIndices.cpuData)[i] = i;
+            referenceIndices.ToDevice(DataDevice::CUDA, {0}, true);
+        }
         FastllmCudaNaiveAttention(q, key, value, referenceIndices, sink, heads, 1, dim, vd, n - 1, window,
                                   expected);
         auto ref = Read<uint16_t>(expected);
@@ -191,7 +202,8 @@ int main() {
         for (int w : {0, 8, 128})
             TestCache(w);
         for (int heads : {2, 4, 8, 16}) {
-            TestAttention(heads, 192, 128, 0, 256, {2, 127, 128, 129, 255, 256, 3}, true);
+            for (bool sink : {false, true})
+                TestAttention(heads, 192, 128, 0, 256, {1, 2, 127, 128, 129, 255, 256, 3}, true, sink);
             TestAttention(heads, 192, 128, 0, 2047, {257, 511, 512, 1023, 2047, 258}, true);
             TestAttention(heads, 192, 128, 128, 256, {2, 127, 128, 129, 256, 3}, true);
             TestAttention(heads, 32, 16, 8, 256, {2, 7, 8, 9, 256, 3}, false);

@@ -970,16 +970,16 @@ constexpr int kSwaValueDim = 128;
 constexpr int kSwaOutputTile = 32;
 constexpr int kSwaThreads = 256;
 
-// Single-query sliding window with head dimensions 192/128. Four
+// Single-query attention with head dimensions 192/128 and up to 256 keys. Four
 // output slices spread the work across SMs; cooperative V loads avoid the
 // reference kernel's dependent global load for every output/slot pair.
 // The softmax tree, BF16 rounding and slot-ordered FP32 FMAs are unchanged.
-template <typename Length = int>
-__global__ void AttentionSwaDecode(const BF16 *q, const BF16 *k, const BF16 *v,
-        const float *sink, BF16 *out, int heads, int kvHeads, Length liveKeys) {
+template <int MaxKeys, typename Length = int>
+__global__ void AttentionShortDecode(const BF16 *q, const BF16 *k, const BF16 *v,
+        const float *sink, BF16 *out, int heads, int kvHeads, int keyStride, Length liveKeys) {
     int keys = liveKeys;
-    __shared__ float scores[kSwaWindow], scratch[kSwaThreads], maximum, denominator;
-    __shared__ BF16 values[kSwaWindow][kSwaOutputTile];
+    __shared__ float scores[MaxKeys], scratch[kSwaThreads], maximum, denominator;
+    __shared__ BF16 values[MaxKeys][kSwaOutputTile];
     int h = blockIdx.x, t = threadIdx.x, lane = t % 32, warp = t / 32;
     int kvHead = h / (heads / kvHeads), firstDim = blockIdx.z * kSwaOutputTile;
     for (int i = t; i < keys * kSwaOutputTile; i += kSwaThreads) {
@@ -993,7 +993,7 @@ __global__ void AttentionSwaDecode(const BF16 *q, const BF16 *k, const BF16 *v,
         float dot = 0;
         #pragma unroll
         for (int i = 0; i < kSwaQkDim / 32; ++i)
-            dot += query[i] * (float)k[((size_t)slot * kvHeads + kvHead) * kSwaQkDim + lane + i * 32];
+            dot += query[i] * (float)k[(size_t)slot * keyStride + kvHead * kSwaQkDim + lane + i * 32];
         dot = WarpSum(dot);
         if (lane == 0) scores[slot] = RoundBF16(RoundBF16(dot) * rsqrtf((float)kSwaQkDim));
     }
@@ -1534,11 +1534,22 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
     if (queries == 1 && window == kSwaWindow && causal && !selected &&
         keys > 0 && keys <= kSwaWindow && pastLength == keys - 1 &&
         dim == kSwaQkDim && valueDim == kSwaValueDim && key.dims[2] == kvHeads * dim) {
-        AttentionSwaDecode<<<dim3(heads, 1, kSwaValueDim / kSwaOutputTile), kSwaThreads>>>(
+        AttentionShortDecode<kSwaWindow><<<dim3(heads, 1, kSwaValueDim / kSwaOutputTile), kSwaThreads>>>(
             (const BF16 *)query.cudaData,
             (const BF16 *)key.cudaData, (const BF16 *)value.cudaData,
             sink.dims.empty() ? nullptr : (const float *)sink.cudaData,
-            (BF16 *)output.cudaData, heads, kvHeads, keys);
+            (BF16 *)output.cudaData, heads, kvHeads, key.dims[2], keys);
+        CheckLaunch();
+        return;
+    }
+    if (queries == 1 && window == 0 && causal && !selected &&
+        keys > 0 && keys <= 256 && pastLength == keys - 1 &&
+        dim == kSwaQkDim && valueDim == kSwaValueDim) {
+        AttentionShortDecode<256><<<dim3(heads, 1, kSwaValueDim / kSwaOutputTile), kSwaThreads>>>(
+            (const BF16 *)query.cudaData,
+            (const BF16 *)key.cudaData, (const BF16 *)value.cudaData,
+            sink.dims.empty() ? nullptr : (const float *)sink.cudaData,
+            (BF16 *)output.cudaData, heads, kvHeads, key.dims[2], keys);
         CheckLaunch();
         return;
     }
@@ -1829,8 +1840,14 @@ void FastllmCudaNaiveDecodeAttention(const fastllm::Data &query,
     Output(output, BFLOAT16, {1, 1, heads * valueDim});
     auto *out = (BF16 *)output.cudaData;
     if (window == kSwaWindow && dim == kSwaQkDim && valueDim == kSwaValueDim) {
-        AttentionSwaDecode<<<dim3(heads, 1, kSwaValueDim / kSwaOutputTile), kSwaThreads>>>(
-            q, k, v, bias, out, heads, kvHeads, keys);
+        AttentionShortDecode<kSwaWindow><<<dim3(heads, 1, kSwaValueDim / kSwaOutputTile), kSwaThreads>>>(
+            q, k, v, bias, out, heads, kvHeads, key.dims[2], keys);
+    } else if (!window && !selected && capacity > 0 && capacity <= 256 &&
+               dim == kSwaQkDim && valueDim == kSwaValueDim) {
+        // Bound the live length to the capacity captured for this graph.
+        DecodeKeys shortKeys{(const int *)liveKeys.cudaData, capacity};
+        AttentionShortDecode<256><<<dim3(heads, 1, kSwaValueDim / kSwaOutputTile), kSwaThreads>>>(
+            q, k, v, bias, out, heads, kvHeads, key.dims[2], shortKeys);
     } else if (window || capacity <= 256) {
         int count = window ? window : capacity;
         AttentionShort<<<heads, 256>>>(q, k, v, selected, bias, out, heads, kvHeads,

@@ -386,6 +386,40 @@ static void TestAttentionWidths() {
     }
 }
 
+// Identity indices force the original generic short-attention path. Compare
+// nonzero Q/K against it so that dot, softmax and PV rounding all matter.
+static void TestAttentionShortDecode() {
+    struct Shape { int heads, kvHeads, keys, padding; };
+    for (auto s : {Shape{1,1,1,0}, Shape{3,1,31,1}, Shape{8,1,32,128},
+                   Shape{8,1,80,0}, Shape{8,1,127,128}, Shape{8,1,128,128},
+                   Shape{8,1,129,128}, Shape{8,1,255,128}, Shape{8,1,256,128},
+                   Shape{4,2,129,1}, Shape{16,2,256,0}, Shape{32,4,129,128},
+                   Shape{64,4,129,128}, Shape{64,4,256,128}})
+    for (int mode = 0; mode < 3; ++mode) {
+        Data q(BFLOAT16), k(BFLOAT16), v(BFLOAT16), sink(FLOAT32);
+        Data indices(INT32), empty, actual, expected;
+        Upload(q, {1,1,s.heads*192}, 71 + mode);
+        Upload(k, {1,s.keys,s.kvHeads*192+s.padding}, 113 + mode);
+        Upload(v, {1,s.keys,s.kvHeads*128}, 157 + mode);
+        if (mode) {
+            sink.Resize({s.heads}); sink.Allocate();
+            for (int h = 0; h < s.heads; ++h)
+                ((float *)sink.cpuData)[h] = (h % 3 - 1) * (mode == 2 ? 80.f : 1.3f);
+            sink.ToDevice(DataDevice::CUDA, {0}, true);
+        }
+        indices.Resize({1,s.keys}); indices.Allocate();
+        std::iota((int *)indices.cpuData, (int *)indices.cpuData + s.keys, 0);
+        indices.ToDevice(DataDevice::CUDA, {0}, true);
+        FastllmCudaNaiveAttention(q, k, v, empty, sink, s.heads, s.kvHeads,
+                                 192, 128, s.keys - 1, 0, actual);
+        FastllmCudaNaiveAttention(q, k, v, indices, sink, s.heads, s.kvHeads,
+                                 192, 128, s.keys - 1, 0, expected);
+        Require(Read<uint16_t>(actual) == Read<uint16_t>(expected),
+                "Short decode differs bitwise from generic attention");
+        ++checks;
+    }
+}
+
 static void TestAttentionSelectedValues() {
     struct Shape { int queries, heads, kvHeads, dim, valueDim, keys, selected; };
     for (auto s : {Shape{2,1,1,64,4,257,257}, Shape{5,3,1,129,132,513,511},
@@ -510,7 +544,10 @@ static void TestAttentionGlobalMma() {
                    Shape{1,4099,2048,64,4,1,true}, Shape{1,4099,2048,32,2,128,true},
                    // TP shards: GQA4/8/16 and the adjacent head-count fallback.
                    Shape{1,4099,2048,4,1,128,true}, Shape{1,4099,2048,8,1,128,true},
-                   Shape{1,4099,2048,16,1,128,true}, Shape{1,4099,2048,3,1,128,true}})
+                   Shape{1,4099,2048,16,1,128,true}, Shape{1,4099,2048,3,1,128,true},
+                   // Short decode and the neighboring long-attention dispatch.
+                   Shape{1,1,1,8,1,128,false}, Shape{1,129,129,8,1,128,false},
+                   Shape{1,256,256,8,1,128,false}, Shape{1,257,257,8,1,128,false}})
     for (bool causal : {false,true}) for (int mode=0;mode<5;++mode) {
         constexpr int dim=192,valueDim=128;
         int past = s.rows == 1 && s.padding == 0 ? s.keys - 67 : s.keys - s.rows;
@@ -882,7 +919,8 @@ int main(int argc,char **argv) {
         if (!graphsOnly) {
             TestTopK(); TestTopKSpecialValues(); TestBatchedTopK(); TestIndexer();
             TestCache(); TestCacheEdges(); TestCacheReservation(); TestRopeWidths();
-            TestAttentionWidths(); TestAttentionSelectedValues(); TestAttentionGroupedScores();
+            TestAttentionWidths(); TestAttentionShortDecode();
+            TestAttentionSelectedValues(); TestAttentionGroupedScores();
             TestAttentionGlobalMma(); TestAttentionSwa();
         }
         TestDecodeGraphs();
