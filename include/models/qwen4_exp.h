@@ -66,6 +66,9 @@ namespace fastllm {
                 std::vector<std::vector<float> *> *logits = nullptr) override;
 
         void WarmUp() override;
+        PagedCacheManager *GetPagedKVCacheManager(int layerIndex, bool isKey) const override;
+        std::vector<std::pair<int, PagedCacheManager *>> GetPagedKVCacheManagers(
+                int layerIndex, bool isKey) const override;
 
         bool TryRestoreHistoryCache(std::vector<int> &inputTokens,
                                     int &cacheLen) override;
@@ -102,7 +105,7 @@ namespace fastllm {
                 const Data *precomputedEmbedding = nullptr);
 
         struct RequestState {
-            // Exclusive request lease on the model's startup allocation.
+            // Keep the model's preallocated pools alive while this request uses them.
             std::shared_ptr<ServingCache> servingCache;
             std::shared_ptr<PleStagingState> pleStaging;
             int previousToken1 = -1;
@@ -141,9 +144,9 @@ namespace fastllm {
             std::vector<int> processedTokens;
             int prefixRequestId = 0;
             int lastPrefixSnapshotLen = 0;
-            // Keeps GPU-resident snapshot storage alive while restored cache
-            // tensors borrow it. The next Forward detaches mutable tensors
-            // with a device-to-device copy and releases this reference.
+            // Keeps snapshot storage alive while restoring fixed linear slots
+            // and request-local QSA state. Nonlinear KV retains page references
+            // and detaches only a shared partial page before append.
             std::shared_ptr<PrefixSnapshot> borrowedPrefixSnapshot;
             // The one-layer MTP cache is request-local. Prefix snapshots keep
             // a compact, independently owned copy only when it is aligned at
@@ -154,15 +157,16 @@ namespace fastllm {
         };
 
         struct ServingCache {
-            std::vector<std::pair<Data, Data>> layers;
-            std::pair<Data, Data> mtp;
-            std::map<int, std::shared_ptr<QsaHostMirrorTransfer>> hostMirrors;
+            using Pools = std::pair<std::shared_ptr<PagedCacheManager>,
+                                    std::shared_ptr<PagedCacheManager>>;
+            std::vector<Pools> layers;
+            Pools mtp;
         };
         std::shared_ptr<ServingCache> servingCache;
         void ClearWarmupCache(std::vector<std::pair<Data, Data>> &cache);
         void ReserveServingCache(std::vector<std::pair<Data, Data>> &warmupCache);
         void AcquireServingCache(std::vector<std::pair<Data, Data>> &cache,
-                                 RequestState &state);
+                                 RequestState &state, int appendTokens = 1);
         std::shared_ptr<QsaHostMirrorTransfer> &GetQsaHostMirror(
                 RequestState &state, int layer);
 
@@ -210,9 +214,10 @@ namespace fastllm {
         };
 
         struct MtpRuntimeState {
+            // Pool ownership must outlive destruction of the KV page references.
+            RequestState attentionState;
             Data key;
             Data value;
-            RequestState attentionState;
             // Keep sampling outputs resident on CUDA across verifier cycles;
             // the host reads only the compact token-id prefix.
             Data sampledTokenIds;
@@ -255,8 +260,9 @@ namespace fastllm {
             uint64_t tensorBytes = 0;
             uint64_t stateBytes = 0;
             std::vector<int> tokens;
-            std::vector<PrefixLayerSnapshot> layers;
+            // Destroy page references before releasing their pool owner.
             RequestState state;
+            std::vector<PrefixLayerSnapshot> layers;
             // A TP hit pins the same token boundary on every rank. These
             // references survive rank-local eviction until restore completes.
             std::vector<std::shared_ptr<PrefixSnapshot>> ranks;

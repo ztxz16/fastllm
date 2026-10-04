@@ -10,6 +10,7 @@
 
 #include "qwen4_exp.h"
 #include "qwen4_tp_sampling.h"
+#include "models/qwen4_paged_cache.h"
 
 #include "devices/cpu/alivethreadpool.h"
 #include "executor.h"
@@ -45,6 +46,7 @@
 #include <fstream>
 #include <functional>
 #include <limits>
+#include <numeric>
 #include <set>
 #include <sstream>
 #include <utility>
@@ -299,13 +301,6 @@ namespace fastllm {
 #ifdef USE_CUDA
         ~QsaHostMirrorTransfer() {
             Release();
-        }
-
-        size_t Reserve(int rows, int rowWidth, int deviceId) {
-            device = deviceId;
-            FastllmCudaSetDevice(device);
-            EnsureCapacity(rows, rowWidth);
-            return (size_t)rowCapacity * (rowWidth + 1) * sizeof(float);
         }
 
         void Prepare(const std::vector<float> &rawKeys,
@@ -636,6 +631,10 @@ namespace fastllm {
                                 axis < (int)cache.dims.size(),
                                 "Qwen4-Exp cache append rank mismatch.\n");
             }
+            if (Qwen4IsPagedKV(cache)) {
+                Qwen4ReservePagedAppend(cache, cache.dims[1] + append.dims[1]);
+                return;
+            }
             const int logical = cache.dims.empty() ? 0 : cache.dims[axis];
             const int64_t required64 =
                 (int64_t)logical + append.dims[axis] + reserveTokens;
@@ -665,39 +664,18 @@ namespace fastllm {
         }
 
 #ifdef USE_CUDA
-        class Qwen4CudaDeviceGuard {
-        public:
-            Qwen4CudaDeviceGuard()
-                : previousDevice(FastllmCudaGetDevice()), changed(true) {}
-
-            explicit Qwen4CudaDeviceGuard(
-                    const std::vector<int> &deviceIds)
-                : previousDevice(FastllmCudaGetDevice()), changed(false) {
-                if (!deviceIds.empty() &&
-                    deviceIds[0] != this->previousDevice) {
-                    FastllmCudaSetDevice(deviceIds[0]);
-                    this->changed = true;
-                }
-            }
-
-            ~Qwen4CudaDeviceGuard() {
-                if (this->changed) {
-                    FastllmCudaSetDevice(this->previousDevice);
-                }
-            }
-
-        private:
-            int previousDevice;
-            bool changed;
-        };
-
         bool Qwen4BorrowCudaTensor(const Data &source, Data &destination,
-                                   bool linear) {
+                                   bool linear, bool sharePages = true) {
+            if (sharePages && source.isPagedKVCache) {
+                Qwen4SharePagedCache(source, destination);
+                return true;
+            }
             if (source.dataDevice != DataDevice::CUDA ||
                 source.cudaData == nullptr || source.multiDeviceData) {
                 return false;
             }
             const long long cacheUid = destination.cacheUid;
+            Qwen4ReleasePagedReference(destination);
             destination.FreeSpace();
             destination.isFake = false;
             destination.dataType = source.dataType;
@@ -714,6 +692,12 @@ namespace fastllm {
             if (destination.expansionDims.size() !=
                 destination.dims.size()) {
                 destination.expansionDims = destination.dims;
+            }
+            if (!sharePages && Qwen4IsPagedKV(source)) {
+                // The TP root is a scheduler-only view. Count the rank's used
+                // pages without taking references that would force a needless
+                // COW on every decode append. Workers own the actual page tables.
+                destination.expansionDims[1] = (int)source.pageIndex.size() * source.pageLen;
             }
             destination.dataDevice = DataDevice::CUDA;
             destination.dataDeviceIds = source.dataDeviceIds;
@@ -737,7 +721,7 @@ namespace fastllm {
         void Qwen4DetachBorrowedCudaTensor(
                 Data &data, bool growFullAttentionCache = true) {
             if (data.dataDevice != DataDevice::CUDA ||
-                !data.cudaDataBorrowed || data.cudaData == nullptr) {
+                !data.cudaDataBorrowed || data.cudaData == nullptr || data.isPagedKVCache) {
                 return;
             }
             Qwen4CudaDeviceGuard deviceGuard(data.dataDeviceIds);
@@ -1197,6 +1181,7 @@ namespace fastllm {
                 cache.multiDeviceDatas.clear();
                 cache.multiDeviceData = false;
             }
+            Qwen4ReleasePagedReference(cache);
             cache.FreeSpace();
             cache = Data(dataType);
             cache.cacheUid = cacheUid;
@@ -2221,9 +2206,7 @@ namespace fastllm {
                         if (model.IsLinearAttentionLayer(layer)) {
                             tensor->Allocate(0.0f);
                         } else if (!tensor->dims.empty()) {
-                            auto dims = tensor->dims;
-                            dims[1] = 0;
-                            tensor->Resize(dims);
+                            Qwen4ResizeKVCache(*tensor, 0);
                         }
                     }
                 }
@@ -2255,9 +2238,9 @@ namespace fastllm {
             for (int layer = 0; layer < block_cnt; ++layer) {
                 const bool linear = IsLinearAttentionLayer(layer);
                 Qwen4BorrowCudaTensor(caches[0][layer].first,
-                                     pastKeyValues[layer].first, linear);
+                                     pastKeyValues[layer].first, linear, false);
                 Qwen4BorrowCudaTensor(caches[0][layer].second,
-                                     pastKeyValues[layer].second, linear);
+                                     pastKeyValues[layer].second, linear, false);
             }
         }
         entry->startupReserved = true;
@@ -4775,15 +4758,6 @@ namespace fastllm {
     std::shared_ptr<Qwen4ExpModel::QsaHostMirrorTransfer> &
     Qwen4ExpModel::GetQsaHostMirror(RequestState &state, int layer) {
         auto &mirror = state.indexerHostMirrorTransfers[layer];
-#ifdef USE_CUDA
-        if (!mirror && state.servingCache) {
-            const auto reserved = state.servingCache->hostMirrors.find(layer);
-            if (reserved != state.servingCache->hostMirrors.end()) {
-                mirror = reserved->second;
-                mirror->Rollback(0);
-            }
-        }
-#endif
         if (!mirror) mirror = std::make_shared<QsaHostMirrorTransfer>();
         return mirror;
     }
@@ -6074,13 +6048,12 @@ namespace fastllm {
 #endif
         }
         if (appendedWithStridedCudaCache) {
-            pastKey.Resize(
-                {keyCacheDesc.dims[0], previousLength + sequence,
-                 this->head_dim});
-            pastValue.Resize(
-                {keyCacheDesc.dims[0], previousLength + sequence,
-                 this->head_dim});
+            if (pastKey.dims.empty()) pastKey.Resize({keyCacheDesc.dims[0], 0, this->head_dim});
+            if (pastValue.dims.empty()) pastValue.Resize({keyCacheDesc.dims[0], 0, this->head_dim});
+            Qwen4ResizeKVCache(pastKey, previousLength + sequence);
+            Qwen4ResizeKVCache(pastValue, previousLength + sequence);
         } else {
+            AssertInFastLLM(!Qwen4IsPagedKV(pastKey), "Qwen4 paged KV append failed.\n");
             CatDirect(pastKey, key, 1);
             CatDirect(pastValue, value, 1);
         }
@@ -6096,6 +6069,34 @@ namespace fastllm {
             Qwen4SparseAttention(query, pastKey, pastValue,
                                  qsaIndices, attentionGroup,
                                  attentionScale, context);
+        } else if (Qwen4IsPagedKV(pastKey)) {
+            if (qsaDeviceCompatibleMask && qsaMask.dims.empty() &&
+                pastKey.pageIndex == pastValue.pageIndex && query.dataType == FLOAT16) {
+                Data qs, ps, pages, last;
+                GeneratePagedBatchParams(query, {&pastKey}, 1, qs, ps, pages, last, {sequence});
+                AttentionPagedBatch(query, pastKey, pastValue, qs, ps, pages, last,
+                                    context, attentionGroup, attentionScale, 1);
+                // Paged attention returns [tokens, heads, dim]; Qwen4's output
+                // fusion consumes the same head-major layout as dense attention.
+                PermuteSelf(context, {1, 0, 2});
+            } else {
+#ifdef USE_CUDA
+                // Arbitrary masks and short masked QSA use the original dense
+                // operation. Materialize logical rows, never the reserved capacity.
+                Data indices(INT32, {1, pastKey.dims[1]});
+                indices.Allocate();
+                std::iota((int*)indices.cpuData, (int*)indices.cpuData + pastKey.dims[1], 0);
+                indices.ToDevice(DataDevice::CUDA, pastKey.dataDeviceIds);
+                Data denseKey(pastKey.dataType, pastKey.dims), denseValue(pastValue.dataType, pastValue.dims);
+                denseKey.ToDevice(DataDevice::CUDA, pastKey.dataDeviceIds, false);
+                denseValue.ToDevice(DataDevice::CUDA, pastValue.dataDeviceIds, false);
+                denseKey.Allocate();
+                denseValue.Allocate();
+                AssertInFastLLM(FastllmCudaQwen4GatherKV(pastKey, pastValue, indices, denseKey, denseValue),
+                                "Qwen4 masked paged attention gather failed.\n");
+                Attention(query, denseKey, denseValue, qsaMask, context, attentionGroup, attentionScale, 1);
+#endif
+            }
         } else {
             Attention(query, pastKey, pastValue, qsaMask, context,
                       attentionGroup, attentionScale, 1);
@@ -6839,6 +6840,10 @@ namespace fastllm {
                 destination = Data();
                 return allowEmpty;
             }
+            if (Qwen4IsPagedKV(source)) {
+                Qwen4SharePagedCache(source, destination);
+                return true;
+            }
             if (source.multiDeviceData ||
                 (source.dataDevice == DataDevice::CUDA &&
                  source.cudaData == nullptr) ||
@@ -6984,6 +6989,7 @@ namespace fastllm {
 
         const RequestState &sourceAttention = source.attentionState;
         RequestState &clonedAttention = cloned->attentionState;
+        clonedAttention.servingCache = sourceAttention.servingCache;
         clonedAttention.indexerRawKeys = sourceAttention.indexerRawKeys;
         clonedAttention.indexerPositions = sourceAttention.indexerPositions;
         clonedAttention.indexerBlockKeys = sourceAttention.indexerBlockKeys;
@@ -7322,7 +7328,7 @@ namespace fastllm {
                 continue;
             }
 #endif
-            destination.CopyFrom(source);
+            Qwen4CopyLinearState(source, destination);
         }
 #ifdef USE_CUDA
         for (const auto &copy : copies) {
@@ -7367,13 +7373,8 @@ namespace fastllm {
                     second.dims[1] >= checkpoint.valueLengths[layer] +
                         committedInputs,
                     "Qwen4-Exp MTP full-attention cache is incomplete.");
-                std::vector<int> keyDims = first.dims;
-                std::vector<int> valueDims = second.dims;
-                keyDims[1] = checkpoint.keyLengths[layer] + committedInputs;
-                valueDims[1] =
-                    checkpoint.valueLengths[layer] + committedInputs;
-                first.Resize(keyDims);
-                second.Resize(valueDims);
+                Qwen4ResizeKVCache(first, checkpoint.keyLengths[layer] + committedInputs);
+                Qwen4ResizeKVCache(second, checkpoint.valueLengths[layer] + committedInputs);
                 continue;
             }
 
@@ -7516,12 +7517,10 @@ namespace fastllm {
              replayIndex < (int)linearReplayLayers.size(); replayIndex++) {
                 const int layer = linearReplayLayers[replayIndex];
                 ApplyDeviceMap(this->deviceMap, layer + 1, this->block_cnt);
-                pastKeyValues[layer].first.CopyFrom(
-                    checkpoint.linearFirst[layer]);
+                Qwen4CopyLinearState(checkpoint.linearFirst[layer], pastKeyValues[layer].first);
                 if (linearStateCheckpoints[layer] !=
                     &pastKeyValues[layer].second) {
-                    pastKeyValues[layer].second.CopyFrom(
-                        *linearStateCheckpoints[layer]);
+                    Qwen4CopyLinearState(*linearStateCheckpoints[layer], pastKeyValues[layer].second);
                 }
                 Data convInput, alpha, beta;
                 Split(capture.linearConvInputs[layer], 1, 0,
@@ -8949,6 +8948,10 @@ namespace fastllm {
                 appendSignature(
                     pastValue.cudaData, Qwen4AxisCapacity(pastValue, 1),
                     pastValue.strides[0]);
+                if (Qwen4IsPagedKV(pastKey)) {
+                    appendSignature(pastKey.pagedKVCacheData->cudaData, pastKey.pageLen, 0);
+                    appendSignature(pastValue.pagedKVCacheData->cudaData, pastValue.pageLen, 0);
+                }
                 appendSignature(
                     tailKeys->cudaData,
                     Qwen4AxisCapacity(*tailKeys, 0),
@@ -10041,12 +10044,8 @@ namespace fastllm {
                 }
                 Data &pastKey = pastKeyValues[layer].first;
                 Data &pastValue = pastKeyValues[layer].second;
-                pastKey.Resize(
-                    {pastKey.dims[0], keyLength,
-                     pastKey.dims[2]});
-                pastValue.Resize(
-                    {pastValue.dims[0], keyLength,
-                     pastValue.dims[2]});
+                Qwen4ResizeKVCache(pastKey, keyLength);
+                Qwen4ResizeKVCache(pastValue, keyLength);
                 requestState.geometricCacheGrowthReadyLayers.insert(
                     layer);
 
@@ -10454,7 +10453,6 @@ namespace fastllm {
         snapshot->stateBytes = stateBytes;
         snapshot->tokens = state.processedTokens;
         snapshot->state = state;
-        snapshot->state.servingCache.reset();
         snapshot->state.mtpState = mtpSnapshotState;
         snapshot->state.mtpDisabled = mtpSnapshotState == nullptr;
         snapshot->state.borrowedPrefixSnapshot.reset();
@@ -11150,9 +11148,7 @@ namespace fastllm {
             if (cache.dims.size() < 2) {
                 return;
             }
-            std::vector<int> dims = cache.dims;
-            dims[1] = length;
-            cache.Resize(dims);
+            Qwen4ResizeKVCache(cache, length);
         };
 
         auto prefixSnapshotDue = [&]() {
@@ -11682,14 +11678,11 @@ namespace fastllm {
 
         const bool restoredPrefixSnapshot =
             requestState->borrowedPrefixSnapshot != nullptr;
-        if (!restoredPrefixSnapshot) {
-            AcquireServingCache(pastKeyValues, *requestState);
-        }
         if (restoredPrefixSnapshot) {
 #ifdef USE_CUDA
-            // Restored CUDA caches initially alias immutable snapshot storage.
-            // Detach all mutable layer states before any attention/GDN update;
-            // other requests keep sharing the original snapshot safely.
+            // Detach the compact linear/QSA snapshot tensors before updating
+            // them. Paged KV keeps its shared prefix and performs tail-page COW
+            // when the next append is reserved.
             for (int layer = 0; layer < this->block_cnt; layer++) {
                 Qwen4DetachBorrowedCudaTensor(
                     pastKeyValues[layer].first);
@@ -11720,6 +11713,7 @@ namespace fastllm {
 #endif
             requestState->borrowedPrefixSnapshot.reset();
         }
+        AcquireServingCache(pastKeyValues, *requestState, inputIds.dims[1]);
 
         Data embedding, hiddenBuffers[2];
         Data *hiddenStates = &hiddenBuffers[0];
@@ -12513,9 +12507,10 @@ namespace fastllm {
             return layers.size() > (size_t)block_cnt;
         });
         const int lookahead = hasMtp ? Qwen4MtpDraftsPerStep() : 0;
+        const int linearSlots = std::max(1, maxBatch);
         long long totalBytesPerToken = 0, totalFixedBytes = 0;
         for (auto &item : budgets) {
-            item.second.fixed += lookahead * item.second.kv;
+            item.second.fixed = (item.second.fixed + lookahead * item.second.kv) * linearSlots;
             totalBytesPerToken += item.second.kv;
             totalFixedBytes += item.second.fixed;
         }
@@ -12574,7 +12569,8 @@ namespace fastllm {
         if (capacity <= 0) {
             throw std::runtime_error("Qwen4-Exp has insufficient memory for startup KV reservation.");
         }
-        size_t pinnedBytes = 0;
+        size_t allocatedBytes = 0;
+        const int reservedCapacity = (int)capacity + lookahead * linearSlots;
         std::vector<std::shared_ptr<ServingCache>> reservations;
         for (size_t rank = 0; rank < targets.size(); ++rank) {
             auto reserved = std::make_shared<ServingCache>();
@@ -12585,32 +12581,33 @@ namespace fastllm {
                 auto &destination = layer < block_cnt ? reserved->layers[layer] : reserved->mtp;
                 for (int component = 0; component < 2; ++component) {
                     const Shape &shape = component == 0 ? source.first : source.second;
-                    Data &tensor = component == 0 ? destination.first : destination.second;
+                    auto &manager = component == 0 ? destination.first : destination.second;
+                    manager = std::make_shared<PagedCacheManager>();
+                    Data &tensor = *manager;
                     tensor.dataType = shape.type;
                     tensor.UpdateUnitSize();
                     tensor.dataDevice = DataDevice::CUDA;
                     tensor.dataDeviceIds = {shape.device};
                     tensor.directMemory = true;
-                    tensor.isKVCache = true;
                     tensor.isLinearAttention = linear;
                     tensor.isLinearAttentionTransposed = shape.transposed;
                     FastllmCudaSetDevice(shape.device);
+                    const int pageLen = linear ? 1 : std::max(1, GetPageLen());
+                    const int pages = linear ? linearSlots : (reservedCapacity + pageLen - 1) / pageLen;
+                    std::vector<int> dimensions;
                     if (linear) {
-                        tensor.Resize(shape.dims);
-                        tensor.Allocate(true);
+                        dimensions = shape.dims;
+                        dimensions.insert(dimensions.begin(), linearSlots);
                     } else {
-                        auto dimensions = shape.dims;
-                        dimensions[1] = (int)capacity + lookahead;
-                        tensor.Expansion(dimensions);
-                        dimensions[1] = 0;
-                        tensor.Resize(dimensions);
+                        dimensions = {pages, pageLen, shape.dims[0], shape.dims[2]};
                     }
-                }
-                if (!linear) {
-                    auto mirror = std::make_shared<QsaHostMirrorTransfer>();
-                    pinnedBytes += mirror->Reserve((int)capacity + lookahead, indexerHeadDim,
-                                                   source.first.device);
-                    reserved->hostMirrors[layer] = std::move(mirror);
+                    manager->type = linear ? PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_MLP_CACHE
+                                           : PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE;
+                    manager->pageLen = pageLen;
+                    tensor.Resize(dimensions);
+                    tensor.Allocate();
+                    manager->SetMaxPages(pages);
+                    allocatedBytes += tensor.GetBytes();
                 }
             }
             reservations.push_back(std::move(reserved));
@@ -12619,59 +12616,101 @@ namespace fastllm {
             targets[rank].first->servingCache = std::move(reservations[rank]);
         }
         tokensLimit = (int)capacity;
-        std::printf("[Fastllm] Qwen4-Exp startup KV capacity: %d tokens, %.2f MiB CUDA storage, %.2f MiB pinned QSA storage.\n",
-            tokensLimit, (totalFixedBytes + capacity * totalBytesPerToken) / 1048576.0,
-            pinnedBytes / 1048576.0);
+        maxBatch = linearSlots;
+        std::printf("[Fastllm] Qwen4-Exp startup KV capacity: %d tokens, %d fixed linear slots, page size %d, %.2f MiB CUDA storage.\n",
+            tokensLimit, linearSlots, GetPageLen(), allocatedBytes / 1048576.0);
         std::fflush(stdout);
 #endif
     }
 
+    PagedCacheManager *Qwen4ExpModel::GetPagedKVCacheManager(int layer, bool isKey) const {
+        if (threadTpState && !threadTpState->ranks.empty()) {
+            return threadTpState->ranks[0]->GetPagedKVCacheManager(layer, isKey);
+        }
+        if (!servingCache || layer < 0 || layer >= block_cnt || IsLinearAttentionLayer(layer)) return nullptr;
+        const auto &pools = servingCache->layers[layer];
+        return (isKey ? pools.first : pools.second).get();
+    }
+
+    std::vector<std::pair<int, PagedCacheManager *>> Qwen4ExpModel::GetPagedKVCacheManagers(
+            int layer, bool isKey) const {
+        std::vector<std::pair<int, PagedCacheManager *>> result;
+        if (threadTpState) {
+            for (const auto &rank : threadTpState->ranks) {
+                auto local = rank->GetPagedKVCacheManagers(layer, isKey);
+                result.insert(result.end(), local.begin(), local.end());
+            }
+        } else if (auto *pool = GetPagedKVCacheManager(layer, isKey)) {
+            result.emplace_back(pool->dataDeviceIds.front(), pool);
+        }
+        return result;
+    }
+
     void Qwen4ExpModel::AcquireServingCache(
-            std::vector<std::pair<Data, Data>> &cache, RequestState &state) {
+            std::vector<std::pair<Data, Data>> &cache, RequestState &state, int appendTokens) {
 #ifdef USE_CUDA
-        if (state.servingCache || !servingCache || GetKVCacheInCPU()) return;
+        if (!servingCache || GetKVCacheInCPU()) return;
         std::lock_guard<std::mutex> guard(stateMutex);
-        if (servingCache.use_count() != 1 ||
-            cache.size() != servingCache->layers.size()) return;
-        for (int layer = 0; layer < block_cnt; ++layer) {
-            if (IsLinearAttentionLayer(layer)) continue;
-            for (const Data *tensor : {&cache[layer].first, &cache[layer].second}) {
-                if (!tensor->dims.empty() &&
-                    (tensor->dims.size() != 3 || tensor->dims[1] != 0)) return;
+        AssertInFastLLM(cache.size() == servingCache->layers.size(), "Qwen4 cache layer count mismatch.\n");
+        // Prefix pages are references into the same bounded pool. Evict old
+        // snapshots before admission/append needs their pages, rather than
+        // growing the pool or duplicating the whole prefix on restore.
+        auto cacheNeedsPages = [&](const ServingCache::Pools &pools, const Data &key,
+                                   const Data &value, int append) {
+            for (int component = 0; component < 2; ++component) {
+                const auto &pool = component == 0 ? pools.first : pools.second;
+                if (!pool) continue;
+                const Data &tensor = component == 0 ? key : value;
+                const int length = tensor.dims.empty() ? 0 : tensor.dims[1];
+                const int pages = (length + append + pool->pageLen - 1) / pool->pageLen;
+                const int held = Qwen4IsPagedKV(tensor) ? (int)tensor.pageIndex.size() : 0;
+                int needed = std::max(0, pages - held);
+                std::lock_guard<std::mutex> lock(pool->pageIndexLocker);
+                if (held > 0 && length % pool->pageLen &&
+                    pool->pageRefCount[tensor.pageIndex[(length - 1) / pool->pageLen]] > 1) ++needed;
+                if (pool->FreePageCount() < needed) return true;
+            }
+            return false;
+        };
+        auto shortOfPages = [&]() {
+            for (int layer = 0; layer < block_cnt; ++layer) {
+                if (!IsLinearAttentionLayer(layer) &&
+                    cacheNeedsPages(servingCache->layers[layer], cache[layer].first,
+                                    cache[layer].second, appendTokens)) return true;
+            }
+            return state.mtpState && cacheNeedsPages(servingCache->mtp,
+                state.mtpState->key, state.mtpState->value, appendTokens + Qwen4MtpDraftsPerStep());
+        };
+        {
+            std::lock_guard<std::mutex> lock(prefixCacheMutex);
+            while (!prefixSnapshots.empty() && shortOfPages()) {
+                const auto oldest = std::min_element(prefixSnapshots.begin(), prefixSnapshots.end(),
+                    [](const auto &a, const auto &b) { return a->timestamp < b->timestamp; });
+                prefixSnapshots.erase(oldest);
             }
         }
         Qwen4CudaDeviceGuard deviceGuard;
-        std::set<int> synchronized;
-        for (int layer = 0; layer < block_cnt; ++layer) {
-            const bool linear = IsLinearAttentionLayer(layer);
-            auto &source = servingCache->layers[layer];
-            const int device = source.first.dataDeviceIds.front();
-            FastllmCudaSetDevice(device);
-            if (synchronized.insert(device).second) ForceDeviceSync();
-            if (linear) {
-                source.first.Allocate(0.0f);
-                source.second.Allocate(0.0f);
+        auto attach = [&](ServingCache::Pools &pools, Data &key, Data &value, bool linear) {
+            for (int component = 0; component < 2; ++component) {
+                auto &pool = component == 0 ? pools.first : pools.second;
+                Data &tensor = component == 0 ? key : value;
+                if (!pool) continue;
+                FastllmCudaSetDevice(pool->dataDeviceIds.front());
+                if (linear) {
+                    const std::vector<int> dims(pool->dims.begin() + 1, pool->dims.end());
+                    Qwen4AttachLinearSlot(*pool, tensor, dims, pool->isLinearAttentionTransposed);
+                } else if (tensor.dims.empty() || tensor.dims[1] == 0) {
+                    Qwen4AttachPagedCache(*pool, tensor);
+                }
             }
-            Qwen4BorrowCudaTensor(source.first, cache[layer].first, linear);
-            Qwen4BorrowCudaTensor(source.second, cache[layer].second, linear);
+        };
+        for (int layer = 0; layer < block_cnt; ++layer) {
+            attach(servingCache->layers[layer], cache[layer].first, cache[layer].second,
+                   IsLinearAttentionLayer(layer));
         }
-        if (servingCache->mtp.first.cudaData != nullptr) {
-            const int device = servingCache->mtp.first.dataDeviceIds.front();
-            FastllmCudaSetDevice(device);
-            if (synchronized.insert(device).second) ForceDeviceSync();
-        }
-        for (auto &mirror : servingCache->hostMirrors) {
-            mirror.second->MarkDeviceSynchronized();
-            mirror.second->Rollback(0);
-        }
-        state.indexerHostMirrorTransfers = servingCache->hostMirrors;
-        state.indexerHostMirrorTransfers.erase(block_cnt);
-        if (state.mtpState && servingCache->mtp.first.cudaData != nullptr) {
-            Qwen4BorrowCudaTensor(servingCache->mtp.first, state.mtpState->key, false);
-            Qwen4BorrowCudaTensor(servingCache->mtp.second, state.mtpState->value, false);
+        if (state.mtpState && servingCache->mtp.first) {
+            attach(servingCache->mtp, state.mtpState->key, state.mtpState->value, false);
             state.mtpState->attentionState.servingCache = servingCache;
-            state.mtpState->attentionState.indexerHostMirrorTransfers[block_cnt] =
-                servingCache->hostMirrors.at(block_cnt);
         }
         state.servingCache = servingCache;
 #endif
