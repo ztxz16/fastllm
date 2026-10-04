@@ -195,7 +195,10 @@ __global__ void Select(const Score *scores, Count liveCount, int *partials, int 
         offset += total;
     }
 }
-__global__ void Sort(const Candidates *in, const State *state, int *out) {
+__global__ void Sort(const Candidates *in, const State *state, int *out, int workspaceStride = 0) {
+    in = (const Candidates *)((const char *)in + (size_t)blockIdx.x * workspaceStride);
+    state = (const State *)((const char *)state + (size_t)blockIdx.x * workspaceStride);
+    out += (size_t)blockIdx.x * kTopK;
     if (state->uniform) {
         for (int i = threadIdx.x; i < kTopK; i += blockDim.x)
             out[i] = i;

@@ -438,9 +438,16 @@ __global__ void IndexScores(const float *q, const float *k, const BF16 *weights,
 
 // Decode consumes each packed BF16 K row once. Keep its FP32 values in
 // registers across the 16 heads, avoiding a full temporary K.
-template <typename ScoreOutput, typename Length = int>
+template <typename ScoreOutput, typename Length = int, bool Verify = false>
 __global__ void IndexScoresDecode(const float *q, const BF16 *packedKeys,
         const BF16 *weights, ScoreOutput scores, int stride, Length liveKeys, int queryStart) {
+    if constexpr (Verify) {
+        const int row = blockIdx.y;
+        q += (size_t)row * 16 * 128;
+        weights += row * 16;
+        liveKeys.length += row;
+        scores.scoreBits += (size_t)row * (queryStart + 1);
+    }
     int keys = liveKeys;
     int key = blockIdx.x * 8 + threadIdx.x / 32, lane = threadIdx.x % 32;
     if (key >= keys) return;
@@ -622,10 +629,18 @@ constexpr int kDecodeQkKeyTile = 8;
 constexpr int kDecodeValueTile = 64;
 
 // Preserve each head's arithmetic order while sharing gathered K loads.
-template<int HeadTile, int MaxDim, int KeyTile = 32, typename Length = int>
+template<int HeadTile, int MaxDim, int KeyTile = 32, typename Length = int, bool Verify = false>
 __global__ void AttentionScoresDecodeGrouped(const BF16 *q, const BF16 *k,
         const int *indices, float *scores, int heads, int kvHeads, int dim,
         int keyStride, Length liveKeys, int count, int past, bool causal) {
+    if constexpr (Verify) {
+        const int row = blockIdx.z;
+        liveKeys.length += row;
+        q += (size_t)row * heads * dim;
+        indices += (size_t)row * count;
+        scores += (size_t)row * heads * count;
+        past = (int)liveKeys - 1;
+    }
     int keys = liveKeys;
     constexpr int warps = 4;
     int firstHead = blockIdx.x * HeadTile;
@@ -1131,13 +1146,21 @@ __global__ void AttentionValuesDecodePartial(const float *prob, const BF16 *v,
     partial[(h * parts + part) * dim + d] = sum;
 }
 
-template<int HeadTile, typename Length = int>
+template<int HeadTile, typename Length = int, bool Verify = false>
 __global__ void AttentionValuesDecodeGrouped(const float *prob, const BF16 *v,
         const int *indices, float *partial, int heads, int kvHeads,
         Length liveKeys, int past, bool causal) {
-    int keys = liveKeys;
     constexpr int count = kDecodePVKeys, dim = kDecodePVValueDim;
     constexpr int parts = kDecodePVParts, slots = count / parts;
+    if constexpr (Verify) {
+        const int row = blockIdx.z;
+        liveKeys.length += row;
+        prob += (size_t)row * heads * count;
+        indices += (size_t)row * count;
+        partial += (size_t)row * heads * parts * dim;
+        past = (int)liveKeys - 1;
+    }
+    int keys = liveKeys;
     int firstHead = blockIdx.x * HeadTile, part = blockIdx.y, d = threadIdx.x;
     int kvHead = firstHead / (heads / kvHeads);
     float sum[HeadTile] = {};
@@ -1235,6 +1258,8 @@ __global__ void AttentionValuesDecodeShared(const float *prob, const BF16 *v,
 
 __global__ void AttentionValuesDecodeReduce(const float *partial, BF16 *out, int heads) {
     constexpr int dim = kDecodePVValueDim, parts = kDecodePVParts;
+    partial += (size_t)blockIdx.y * heads * parts * dim;
+    out += (size_t)blockIdx.y * heads * dim;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= heads * dim) return;
     int h = i / dim, d = i % dim;
@@ -2111,16 +2136,62 @@ void FastllmCudaNaiveGraphVerifyIndexer(const fastllm::Data &query,
         FastllmNaiveDecodeScratch &scratch, fastllm::Data &indices) {
     using namespace fastllm;
     const int rows = query.dims[1];
-    Output(indices, INT32, {rows, 2048});
-    for (int row = 0; row < rows; ++row) {
-        Data q(BFLOAT16, {1, 1, 2048}), w(BFLOAT16, {1, 1, 16});
-        Data live(INT32, {1}), out(INT32, {1, 2048});
-        q.FakeFrom(query, (size_t)row * 2048 * sizeof(BF16));
-        w.FakeFrom(weights, (size_t)row * 16 * sizeof(BF16));
-        live.FakeFrom(liveKeys, row * sizeof(int));
-        out.FakeFrom(indices, (size_t)row * 2048 * sizeof(int));
-        FastllmCudaNaiveDecodeIndexer(q, w, packedKeys, live, capacity, fp8Query, scratch, out);
+    if (rows == 1) {
+        FastllmCudaNaiveDecodeIndexer(query, weights, packedKeys, liveKeys,
+            capacity, fp8Query, scratch, indices);
+        return;
     }
+    // Score every causal row together, retaining each row's exact decode MMA
+    // and head accumulation. Cooperative selection stays within its original
+    // resident grid; independent workspaces let the final sorts run together.
+    Output(indices, INT32, {rows, naive_topk::kTopK});
+    Output(scratch.indexScores, INT32, {rows, capacity});
+    Output(scratch.topk, INT32, {rows, (int)(sizeof(naive_topk::Workspace) / sizeof(int))});
+    DecodeKeys keys{(const int *)liveKeys.cudaData, 0};
+    const int stride = packedKeys.dims[2];
+    IndexerTopKOutput scoreOutput{(unsigned *)scratch.indexScores.cudaData, nullptr};
+#ifdef FASTLLM_NAIVE_DSA_MMA
+    if (fp8Query && FastllmCudaFlashInferDataTypeSupported(BFLOAT16)) {
+        Output(scratch.indexQuery, BFLOAT16, {rows * 16, 128});
+        Output(scratch.indexScale, FLOAT32, {rows * 16});
+        naive_dsa_mma::QuantizeIndexer<<<rows * 16, 128>>>((const BF16 *)query.cudaData,
+            (BF16 *)scratch.indexQuery.cudaData, (float *)scratch.indexScale.cudaData, 128, 0);
+        naive_dsa_mma::IndexerDecodeScores<IndexerTopKOutput, DecodeKeys, true>
+            <<<dim3((capacity + naive_dsa_mma::kKeys - 1) / naive_dsa_mma::kKeys, rows), naive_dsa_mma::kThreads>>>(
+                (const BF16 *)scratch.indexQuery.cudaData, (const BF16 *)packedKeys.cudaData,
+                (const float *)scratch.indexScale.cudaData, (const BF16 *)weights.cudaData,
+                scoreOutput, stride, keys, capacity - 1);
+    } else
+#endif
+    {
+        Output(scratch.indexQuery, FLOAT32, {rows * 16, 128});
+        RoundIndexer<<<rows * 16, 128>>>((const BF16 *)query.cudaData,
+            (float *)scratch.indexQuery.cudaData, 128, 0, fp8Query);
+        IndexScoresDecode<IndexerTopKOutput, DecodeKeys, true><<<dim3((capacity + 7) / 8, rows), 256>>>(
+            (const float *)scratch.indexQuery.cudaData, (const BF16 *)packedKeys.cudaData,
+            (const BF16 *)weights.cudaData, scoreOutput, stride, keys, capacity - 1);
+    }
+    auto *workspaces = (naive_topk::Workspace *)scratch.topk.cudaData;
+    for (int row = 0; row < rows; ++row) {
+        auto *workspace = workspaces + row;
+        auto *scores = (const unsigned *)scratch.indexScores.cudaData + (size_t)row * capacity;
+        DecodeKeys count{(const int *)liveKeys.cudaData + row, 0};
+        auto *histograms = workspace->partials;
+        auto *ties = workspace->ties;
+        auto *state = &workspace->state;
+        auto *candidates = &workspace->candidates;
+        void *args[] = {&scores, &count, &histograms, &ties, &state, &candidates};
+        auto status = cudaLaunchCooperativeKernel((void *)naive_topk::Select<unsigned, DecodeKeys>,
+            DecodeTopKBlocks(), naive_topk::kThreads, args, 0, cudaStreamPerThread);
+        if (status != cudaSuccess) {
+            FastllmCudaSetThreadError();
+            if (!FastllmCudaGraphIsCapturingFast())
+                AssertInFastLLM(false, "Naive verify TopK launch failed.");
+        }
+    }
+    naive_topk::Sort<<<rows, naive_topk::kThreads>>>(&workspaces->candidates, &workspaces->state,
+        (int *)indices.cudaData, sizeof(naive_topk::Workspace));
+    CheckLaunch();
 }
 
 void FastllmCudaNaiveGraphVerifyAttention(const fastllm::Data &query,
@@ -2147,6 +2218,33 @@ void FastllmCudaNaiveGraphVerifyAttention(const fastllm::Data &query,
         else
             AttentionShortDecode<256, DecodeKeys, true><<<grid, kSwaThreads>>>(
                 q, k, v, bias, out, heads, kvHeads, key.dims[2], keys);
+        CheckLaunch();
+        return;
+    }
+    const bool grouped = heads % kvHeads == 0 && (heads / kvHeads) % 4 == 0;
+    const bool shared = grouped && (heads / kvHeads) % kDecodeSharedHeads == 0;
+    if (rows > 1 && !window && !indices.dims.empty() && grouped && !shared &&
+        dim <= kDecodeQkDim && valueDim == kDecodePVValueDim) {
+        // The grouped decode kernels keep their per-row arithmetic and causal
+        // lengths, with independent score/partial slices indexed by grid.z.
+        constexpr int count = kDecodePVKeys;
+        Output(scratch.attentionScores, FLOAT32, {rows, heads, count});
+        Output(scratch.attentionPartial, FLOAT32, {rows, heads, kDecodePVParts, valueDim});
+        auto *scores = (float *)scratch.attentionScores.cudaData;
+        auto *partial = (float *)scratch.attentionPartial.cudaData;
+        auto *selected = (const int *)indices.cudaData;
+        auto *bias = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
+        DecodeKeys keys{(const int *)liveKeys.cudaData, 0};
+        AttentionScoresDecodeGrouped<4, kDecodeQkDim, 32, DecodeKeys, true>
+            <<<dim3(heads / 4, count / 32, rows), 128>>>((const BF16 *)query.cudaData,
+                (const BF16 *)key.cudaData, selected, scores, heads, kvHeads, dim,
+                key.dims[2], keys, count, capacity - 1, true);
+        AttentionSoftmax<<<rows * heads, 256>>>(scores, bias, heads, count);
+        AttentionValuesDecodeGrouped<4, DecodeKeys, true>
+            <<<dim3(heads / 4, kDecodePVParts, rows), kDecodePVValueDim>>>(scores,
+                (const BF16 *)value.cudaData, selected, partial, heads, kvHeads, keys, capacity - 1, true);
+        AttentionValuesDecodeReduce<<<dim3((heads * valueDim + 255) / 256, rows), 256>>>(
+            partial, (BF16 *)output.cudaData, heads);
         CheckLaunch();
         return;
     }

@@ -194,8 +194,8 @@ static void TestResidualNorm(int channels, int rows = 1) {
         ++checks;
     }
 }
-static void TestVerifyGraph(int window, int capacity, const std::vector<int> &prefixes, bool fp8) {
-    const int rows = 8, heads = 8, dim = 192, vd = 128;
+static void TestVerifyGraph(int window, int capacity, const std::vector<int> &prefixes, bool fp8, int rows = 8, int heads = 8) {
+    const int dim = 192, vd = 128;
     const int kc = dim + (window ? 0 : 128), storage = (window ? window + rows : capacity) + 1;
     Data q(BFLOAT16), iq(BFLOAT16), iw(BFLOAT16), key(BFLOAT16), value(BFLOAT16);
     Data nk(BFLOAT16), nv(BFLOAT16), sink(FLOAT32), live(INT32), indices, actual;
@@ -226,10 +226,10 @@ static void TestVerifyGraph(int window, int capacity, const std::vector<int> &pr
     Graph graph;
     graph.Capture(body);
     for (int past : prefixes) {
-        int lengths[rows];
+        std::vector<int> lengths(rows);
         for (int row = 0; row < rows; ++row)
             lengths[row] = past + row + 1;
-        Cuda(cudaMemcpy(live.cudaData, lengths, sizeof(lengths), cudaMemcpyHostToDevice));
+        Cuda(cudaMemcpy(live.cudaData, lengths.data(), rows * sizeof(int), cudaMemcpyHostToDevice));
         Cuda(cudaMemcpy(key.cudaData, originalK.data(), key.GetBytes(), cudaMemcpyHostToDevice));
         Cuda(
             cudaMemcpy(value.cudaData, originalV.data(), value.GetBytes(), cudaMemcpyHostToDevice));
@@ -387,6 +387,11 @@ int main() {
         for (int rows : {1, 7, 8})
             for (int past : {2048, 4090, 8183})
                 for (bool fp8 : {false, true}) TestVerifyIndexerView(rows, past, fp8);
+        for (int rows = 1; rows <= 8; ++rows)
+            for (bool fp8 : {false, true})
+                TestVerifyGraph(0, 32776, {2048, 32768, 2049}, fp8, rows);
+        for (int heads : {4, 12, 16})
+            TestVerifyGraph(0, 4096, {2048, 4088, 2049}, true, 8, heads);
         for (int dim : {32, 128, 256}) for (int rows : {2, 7, 8})
             for (bool shortAttention : {false, true})
                 TestDraftAttention(dim, rows, 1024, shortAttention);
