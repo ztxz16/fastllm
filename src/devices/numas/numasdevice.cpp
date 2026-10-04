@@ -3467,8 +3467,9 @@ namespace fastllm {
         const bool deepSeekV41 = routeScores != nullptr;
         if (deepSeekV41 && weights[2]->dataType == DataType::DATA_GGUF_FORMAT) {
             // The FP4 fused decode writer only handles floating activations.
-            // Reuse the exact GGML V4.1 row preparation for a cached Q2 layer,
-            // including block-32 FP8 followed by GGML's Q8 activation encoding.
+            // Reuse GGML row preparation with the caller's model semantics:
+            // V4.1 has block-32 FP8 boundaries; GLM uses block 128 and retains
+            // ordinary GGUF BF16/Q8 activation preparation.
             const int hidden = weights[2]->dims[1];
             static thread_local std::vector<uint16_t> bits;
             bits.resize(hidden);
@@ -3478,7 +3479,7 @@ namespace fastllm {
             if (submitGpu) submitGpu();
             NumasMoeVerifyExperts(bits.data(), output, 1, weights,
                 weightsBatch, indices,
-                gpuIndices, routeScores, topk, layer, swigluLimit, true);
+                gpuIndices, routeScores, topk, layer, swigluLimit, true, activationQuantBlock);
             return;
         }
         auto &work = GetNumasMoeRuntimeCache()[layer % 2];
@@ -7445,6 +7446,16 @@ namespace fastllm {
         Data **weights, int weightsBatch, const int32_t *indices,
         const int32_t *gpuIndices, const float *scores, int topk, int layer,
         float swigluLimit, bool perRoute) {
+        NumasMoeVerifyExperts(input, output, rows, weights, weightsBatch,
+            indices, gpuIndices, scores, topk, layer, swigluLimit, perRoute, 32);
+    }
+
+    void NumasMoeVerifyExperts(const uint16_t *input, void *output, int rows,
+        Data **weights, int weightsBatch, const int32_t *indices,
+        const int32_t *gpuIndices, const float *scores, int topk, int layer,
+        float swigluLimit, bool perRoute, int activationQuantBlock) {
+        AssertInFastLLM(activationQuantBlock == 32 || activationQuantBlock == 128,
+                        "Scored NUMA MoE requires activation block 32 or 128.\n");
         const int hidden = weights[2]->dims[1];
         Data x(DataType::BFLOAT16, {rows, hidden}, DataDevice::CPU, (void*)input);
         Data ids(DataType::INT32, {rows, topk}, DataDevice::CPU, (void*)indices);
@@ -7457,7 +7468,7 @@ namespace fastllm {
         if (cpuExperts.empty()) return;
         DoNumasMergeMOEOnCPU(x, result, ids, routes, weights, nullptr, 1.0f,
             weightsBatch, topk, cpuExperts, GetNumasMoeRuntimeCache()[layer % 2],
-            nullptr, swigluLimit, true, 32, false,
+            nullptr, swigluLimit, true, activationQuantBlock, false,
             perRoute ? (float*)output : nullptr);
     }
 

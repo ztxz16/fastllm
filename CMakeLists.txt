@@ -1430,6 +1430,13 @@ if (UNIT_TEST)
             add_test(NAME cuda_glm5_moe_cache COMMAND cuda_glm5_moe_cache_test)
             set_tests_properties(cuda_glm5_moe_cache PROPERTIES LABELS cuda RUN_SERIAL TRUE)
 
+            add_executable(cuda_glm5_gguf_cache_test test/basic/test_cuda_glm5_gguf_cache.cpp)
+            target_link_libraries(cuda_glm5_gguf_cache_test PRIVATE fastllm)
+            target_include_directories(cuda_glm5_gguf_cache_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            fastllm_add_checked_test(cuda_glm5_gguf_cache cuda_glm5_gguf_cache_test "PASS: GLM GGUF cache" 120)
+            set_tests_properties(cuda_glm5_gguf_cache PROPERTIES LABELS "cuda;gguf" RUN_SERIAL TRUE
+                ENVIRONMENT "FT_NUMAS=1;FT_THREADS=8")
+
         endif()
 
 

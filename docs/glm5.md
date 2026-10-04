@@ -35,7 +35,11 @@ FT_NUMAS=1 numactl --cpunodebind=0 --membind=0 \
   --moe_cuda_cache 0 --moe_cpu_cache 0 --mtp 0
 ~~~
 
-测速时先用同长度输入完成预热，并关闭 prefix/history cache。启用 `UNIT_TEST` 后可运行 `glm5_next_gguf`、`numas_gguf_fallback` 和 `cuda_gguf_mmq_alignment` 回归，分别覆盖分片映射与布局恢复、混合量化专家回退、窄投影的 CUDA 数值与边界。
+GGUF 的单 token BF16 混合推理可通过 `--moe_cuda_cache 12G` 为每张显卡设置 12 GiB 专家缓存，支持 IQ2_XXS/IQ2_S gate/up 与 IQ3_XXS/IQ4_XS down。GPU 保留压缩权重，并遵循 GGUF 的 Q8_K/BF16 激活、限幅和路由权重顺序；多行输入保留原 NUMA 路径。当前缓存还会在主机保存一份 NUMA 重排前的 GGUF 专家快照，混合格式按最大专家大小对齐，因此会增加主机内存占用。
+
+真实命中率应使用 `get_moe_cuda_cache_route_stats()` 在请求前后的差值计算 `resident_routes / routes`，覆盖分给 CPU 的专家，并排除预取查询；`get_moe_cuda_cache_stats()` 的 hits/misses 是查询计数，口径不同。
+
+测速时先用同长度输入完成预热，并关闭 prefix/history cache。启用 `UNIT_TEST` 后可运行 `glm5_next_gguf`、`numas_gguf_fallback`、`cuda_gguf_mmq_alignment` 和 `cuda_glm5_gguf_cache` 回归，分别覆盖分片映射与布局恢复、混合量化专家回退、窄投影的 CUDA 数值与边界、缓存的 CPU/GPU 分配与数值。
 
 ## GLM-5.3-Flash NVFP4 grouped Marlin
 

@@ -1759,6 +1759,13 @@ struct FastllmCudaMoeGGUFCacheView {
     const uint64_t *slotOffsets = nullptr;
 };
 bool FastllmCudaMoeGGUFCacheSupported(int type, int columns);
+bool FastllmCudaMoeGlm5GGUFCacheSupported(int gateType, int downType, int hidden, int inter);
+// Ordinary IQ2 gate/up + IQ3/IQ4 down records. Match GLM GGUF's Q8_K
+// activations, asymmetric clamp, score placement and BF16 boundaries.
+bool FastllmCudaMoeGlm5GGUFCacheCompute(
+        const fastllm::Data &input, fastllm::Data &activation,
+        const FastllmCudaMoeGGUFCacheView &view,
+        const float *scores, int topk, float swigluLimit, float *perExpert);
 // V4.1 cache records borrow NUMA's cross-interleaved Q2_K/Q4_K R4 blocks.
 // Input already has the model's block-32 FP8 boundary. Scores precede
 // down-input quantization, and per-expert outputs are rounded to BF16.

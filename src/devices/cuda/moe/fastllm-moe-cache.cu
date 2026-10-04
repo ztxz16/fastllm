@@ -1442,10 +1442,14 @@ bool FastllmCudaPrepareMoeCache(
         return true;
     }
 
-    // V4.1 has no separate host snapshot: its compact representation is
-    // produced by NUMA registration and remains owned by the model.
-    if (layers[0].deepSeekV41 || layers[0].glm5) {
-        if (!registerNumaWeights) return false;
+    // Shared compact layouts come from NUMA registration. Ordinary GLM GGUF
+    // must instead be snapshotted before NUMA repacks the original blocks.
+    const bool canonicalGlmGGUF = layers[0].glm5 && layers[0].weights[2] &&
+        layers[0].weights[2]->dataType == fastllm::DataType::DATA_GGUF_FORMAT;
+    if ((layers[0].deepSeekV41 || layers[0].glm5) && !registerNumaWeights) return false;
+    const bool registerBeforeSnapshot = layers[0].deepSeekV41 ||
+        (layers[0].glm5 && !canonicalGlmGGUF);
+    if (registerBeforeSnapshot) {
         registerNumaWeights();
     }
     OffloadLayout layout;
@@ -1486,8 +1490,12 @@ bool FastllmCudaPrepareMoeCache(
             }
             if (layers[0].deepSeekV41 !=
                 (observed.weightType == fastllm::DataType::NVFP4_BLOCK_32_E8M0 || v41GGUF)) return false;
+            const bool glmGGUF = layers[0].glm5 &&
+                observed.weightType == fastllm::DataType::DATA_GGUF_FORMAT;
             if (layers[0].glm5 !=
-                (observed.weightType == fastllm::DataType::NVFP4_BLOCK_16_E4M3_PACKED)) return false;
+                (observed.weightType == fastllm::DataType::NVFP4_BLOCK_16_E4M3_PACKED || glmGGUF)) return false;
+            if (glmGGUF && !FastllmCudaMoeGlm5GGUFCacheSupported(
+                    observed.gateGgmlType, observed.downGgmlType, observed.hidden, observed.inter)) return false;
             if (expert == 0) {
                 layerLayout = observed;
                 layerLayout.experts = experts;
@@ -1605,7 +1613,7 @@ bool FastllmCudaPrepareMoeCache(
         }
     }
     if (shareNuma) {
-        registerNumaWeights();
+        if (!registerBeforeSnapshot) registerNumaWeights();
         if (!BindNumaWeights(*group, expertWeights, *storage)) {
             std::fprintf(stderr, "[Fastllm] CUDA expert cache requires matching pinned NUMA "
                          "shards after registration; using the configured MoE backend.\n");
@@ -1811,6 +1819,9 @@ bool ComputeV41Cache(const fastllm::Data &input, fastllm::Data &activation,
 
 bool FP8HybridShape(const OffloadLayout &) { return true; }
 bool GGUFHybridShape(const OffloadLayout &layout) {
+    if (layout.glm5)
+        return FastllmCudaMoeGlm5GGUFCacheSupported(
+            layout.gateGgmlType, layout.downGgmlType, layout.hidden, layout.inter);
     if (layout.deepSeekV41) {
         fastllm::cuda::SharedExpertLayout plan;
         return PlanSharedV41GGUF(layout, plan);
@@ -1828,6 +1839,9 @@ bool ComputeGGUFCache(const fastllm::Data &input, fastllm::Data &gateOutput,
         cache.ggufWorkspace, cache.ggufWorkspaceBytes, cache.slotOffsets};
     if (layout.deepSeekV41)
         return FastllmCudaMoeV41GGUFCacheCompute(input, gateOutput, view,
+            scores, topk, layout.swigluLimit, perExpert);
+    if (layout.glm5)
+        return FastllmCudaMoeGlm5GGUFCacheCompute(input, gateOutput, view,
             scores, topk, layout.swigluLimit, perExpert);
     return FastllmCudaMoeGGUFCacheCompute(input, gateOutput, output, view, scores, topk, perExpert);
 }

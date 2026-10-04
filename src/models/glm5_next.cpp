@@ -1009,7 +1009,8 @@ namespace fastllm {
                 const auto &experts = expertWeights[layer];
                 if ((device == "numa" || device.rfind("numa:", 0) == 0) &&
                     experts.size() >= 4 && experts[2] &&
-                    experts[2]->dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED) {
+                    (experts[2]->dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED ||
+                     experts[2]->dataType == DataType::DATA_GGUF_FORMAT)) {
                     layers.push_back({experts.data(), (int)experts.size(),
                                       false, swigluLimit, true});
                 }

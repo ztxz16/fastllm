@@ -90,6 +90,12 @@ namespace fastllm {
         Data **weights, int weightsBatch, const int32_t *indices,
         const int32_t *gpuIndices, const float *scores, int topk, int layer,
         float swigluLimit, bool perRoute);
+    // GLM uses block 128 semantics: GGUF activations retain BF16/Q8 rounding
+    // without the V4.1 block-32 FP8 boundary. Keep the original ABI above.
+    void NumasMoeVerifyExperts(const uint16_t *input, void *output, int rows,
+        Data **weights, int weightsBatch, const int32_t *indices,
+        const int32_t *gpuIndices, const float *scores, int topk, int layer,
+        float swigluLimit, bool perRoute, int activationQuantBlock);
 
     // NUMA MoE keeps reusable host/CUDA staging buffers outside the model.
     // Release them explicitly while the CUDA allocator is still alive.
