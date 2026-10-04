@@ -11088,7 +11088,7 @@ __global__ void FastllmFusedSigmoidSelectExpert256Top10Kernel(
 // selection while reproducing its max/sum/division order exactly. One warp
 // then performs TopK; exact ties rebuild the original 64-thread lists and
 // merge tree so both instantiations remain compatible with the legacy path.
-template <bool APPLY_SOFTMAX, int EXPERTS, int TOPK>
+template <bool APPLY_SOFTMAX, int EXPERTS, int TOPK, bool APPLY_SIGMOID = false>
 __global__ void FastllmSelectExpertFixedTopKKernel(
         const float *logits, const float *bias, int32_t *index, float *score,
         int hasBias, int needNorm, float routeScale) {
@@ -11135,6 +11135,15 @@ __global__ void FastllmSelectExpertFixedTopKKernel(
             softmaxProbabilities[expert] /= denominator;
         }
         __syncthreads();
+        probabilityLogits = softmaxProbabilities;
+    }
+    if constexpr (APPLY_SIGMOID) {
+        // Match the standalone FP32 sigmoid, including its double division.
+        for (int expert = tid; expert < EXPERTS; expert += 32) {
+            float x = tokenLogits[expert];
+            softmaxProbabilities[expert] = 1.0 / (1.0 + expf(-x));
+        }
+        __syncwarp();
         probabilityLogits = softmaxProbabilities;
     }
     if (tid >= 32) {
@@ -12188,7 +12197,11 @@ static bool FastllmCudaFusedSelectExpert256(
     int biasType = !hasBias || gateBias->dataType == fastllm::DataType::FLOAT32 ? 0 :
                    (gateBias->dataType == fastllm::DataType::FLOAT16 ? 1 : 2);
 #ifndef USE_ROCM
-    if constexpr (ROUTER_SIGMOID) {
+    if constexpr (ROUTER_SIGMOID && ROUTER_TOPK == 8) {
+        FastllmSelectExpertFixedTopKKernel<false, 256, 8, true><<<tokens, 32>>>(
+            (const float *)cudaLogits, (const float *)cudaBias, cudaIndex, cudaScore,
+            hasBias ? 1 : 0, needNorm ? 1 : 0, routeScale);
+    } else if constexpr (ROUTER_SIGMOID) {
         if (logits.dataType == fastllm::DataType::FLOAT16) {
             FastllmFusedSigmoidSelectExpert256Top10Kernel<half><<<tokens, 32>>>(
                 (const half*)cudaLogits, cudaBias, cudaIndex, cudaScore,
@@ -12342,6 +12355,16 @@ bool FastllmCudaFusedSigmoidSelectExpert(
         const fastllm::Data &logits, const fastllm::Data *gateBias,
         fastllm::Data &index, fastllm::Data &score,
         int topk, bool needNorm, float routeScale) {
+#ifndef USE_ROCM
+    if (topk == 8 && !logits.dims.empty() && logits.dims.back() == 256 &&
+        logits.Count(0) > 0 && logits.dataType == fastllm::DataType::FLOAT32) {
+        if (gateBias && !gateBias->dims.empty() &&
+            (gateBias->Count(0) != 256 || gateBias->dataType != fastllm::DataType::FLOAT32))
+            return false;
+        return FastllmCudaFusedSelectExpert256<8, true>(
+            logits, gateBias, index, score, needNorm, routeScale);
+    }
+#endif
     if (topk != 10 || logits.dims.empty() || logits.dims.back() != 256 || logits.Count(0) == 0 ||
         (logits.dataType != fastllm::DataType::FLOAT16 &&
          logits.dataType != fastllm::DataType::BFLOAT16 &&

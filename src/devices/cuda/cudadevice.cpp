@@ -8202,9 +8202,15 @@ namespace fastllm {
             logits.dataType == DataType::FLOAT16 ||
             logits.dataType == DataType::BFLOAT16 ||
             logits.dataType == DataType::FLOAT32;
+#ifdef USE_ROCM
+        const bool sigmoidTop8 = false;
+#else
+        const bool sigmoidTop8 = sigmoid && topk == 8 &&
+            logits.dataType == DataType::FLOAT32;
+#endif
         const bool supported256 =
             !logits.dims.empty() && logits.dims.back() == 256 &&
-            topk == (sigmoid ? 10 : 8) && validType;
+            (topk == (sigmoid ? 10 : 8) || sigmoidTop8) && validType;
         const bool supportedQwen4 =
             !sigmoid && !logits.dims.empty() &&
             logits.dims.back() == 512 && topk == 10 &&
@@ -8217,7 +8223,7 @@ namespace fastllm {
         auto biasIt = datas.find("gateBias");
         if (biasIt != datas.end() && biasIt->second != nullptr && !biasIt->second->dims.empty()) {
             const Data &bias = *biasIt->second;
-            const bool validBiasType = supportedQwen4
+            const bool validBiasType = (supportedQwen4 || sigmoidTop8)
                 ? bias.dataType == DataType::FLOAT32
                 : (bias.dataType == DataType::FLOAT32 ||
                    bias.dataType == DataType::FLOAT16 ||

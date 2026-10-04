@@ -82,7 +82,7 @@ __global__ void FastllmGemvBf16Bf16Kernel2MultiRow(__nv_bfloat16 *A, __nv_bfloat
     float diff[PART];
 #pragma unroll
     for (int x = 0; x < PART; x++) diff[x] = 0.0f;
-    for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
+    for (unsigned int s = THREAD_PER_BLOCK / 2; s >= (PART > 1 ? 32 : 1); s >>= 1) {
         if (tid < s) {
 #pragma unroll
             for (int x = 0; x < PART; x++) {
@@ -93,6 +93,29 @@ __global__ void FastllmGemvBf16Bf16Kernel2MultiRow(__nv_bfloat16 *A, __nv_bfloat
             }
         }
         __syncthreads();
+    }
+
+    if constexpr (PART > 1) {
+        // Complete the same compensated binary tree within warp zero. The
+        // 128/64/32 stages above preserve both each lane's sum and correction;
+        // shuffles replace only the remaining shared-memory exchanges.
+        if (tid < 32) {
+            #pragma unroll
+            for (int x = 0; x < PART; ++x) {
+                float value = sdata[x][tid], correction = diff[x];
+                #pragma unroll
+                for (int step = 16; step; step >>= 1) {
+                    float peer = __shfl_down_sync(0xffffffffu, value, step);
+                    if (tid < step) {
+                        float other = peer - correction;
+                        float sum = value + other;
+                        correction = (sum - value) - other;
+                        value = sum;
+                    }
+                }
+                if (tid == 0) sdata[x][0] = value;
+            }
+        }
     }
 
     if (tid == 0) {

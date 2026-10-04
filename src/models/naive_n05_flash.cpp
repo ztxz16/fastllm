@@ -499,13 +499,28 @@ Data NaiveN05FlashModel::RunTarget(
         } else {
             ToDataType(normed, routerInput, DataType::FLOAT32);
             Linear(routerInput, localWeight(prefix + ".mlp.gate.weight"), Data(), router);
-            Sigmoid(router, router);
-            SelectExpert(router, expertIndex, expertScore, num_experts_per_tok,
-                         norm_topk_prob, routed_scaling_factor,
-                         &localWeight(prefix + ".mlp.gate.e_score_correction_bias"));
+            Data &routerBias = localWeight(prefix + ".mlp.gate.e_score_correction_bias");
+            auto &executor = *(Executor *)GetExecutor();
+            bool fusedRouter = false;
+            // The warp-fused sigmoid amortizes selection for multiple rows;
+            // one row is faster with the existing wide sigmoid and selector.
+            if (length > 1 && router.dataDevice == DataDevice::CUDA) {
+                DataDict routerData = {{"logits", &router}, {"index", &expertIndex},
+                                       {"score", &expertScore}, {"gateBias", &routerBias}};
+                FloatDict routerFloats = {{"routeScale", routed_scaling_factor}};
+                IntDict routerInts = {{"topk", num_experts_per_tok}, {"needNorm", norm_topk_prob ? 1 : 0}};
+                fusedRouter = executor.CanRunOnFirstDevice(
+                    "FusedSigmoidSelectExpert", routerData, routerFloats, routerInts);
+                if (fusedRouter)
+                    executor.Run("FusedSigmoidSelectExpert", routerData, routerFloats, routerInts);
+            }
+            if (!fusedRouter) {
+                Sigmoid(router, router);
+                SelectExpert(router, expertIndex, expertScore, num_experts_per_tok,
+                             norm_topk_prob, routed_scaling_factor, &routerBias);
+            }
             normed.Reshape({length, embed_dim});
             if (!tensorParallel) ApplyMoeDeviceMapForLayer(layer);
-            auto &executor = *(Executor *)GetExecutor();
             if (executor.firstDevice.find("numa") == 0 &&
                 (moeWeights[layer][2]->dataType == DataType::FP8_E4M3 ||
                  moeWeights[layer][2]->dataType == DataType::FP8_E4M3_BLOCK_128)) {
