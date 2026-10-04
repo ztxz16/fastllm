@@ -210,6 +210,8 @@ struct ggml_cuda_type_traits;
         static constexpr int qi = qi_value;                               \
     }
 
+FASTLLM_GGUF_MMQ_TRAITS(GGML_TYPE_Q5_0, QK5_0, QR5_0, QI5_0);
+FASTLLM_GGUF_MMQ_TRAITS(GGML_TYPE_Q5_1, QK5_1, QR5_1, QI5_1);
 FASTLLM_GGUF_MMQ_TRAITS(GGML_TYPE_Q4_K, QK_K, QR4_K, QI4_K);
 FASTLLM_GGUF_MMQ_TRAITS(GGML_TYPE_Q2_K, QK_K, QR2_K, QI2_K);
 FASTLLM_GGUF_MMQ_TRAITS(GGML_TYPE_Q5_K, QK_K, QR5_K, QI5_K);

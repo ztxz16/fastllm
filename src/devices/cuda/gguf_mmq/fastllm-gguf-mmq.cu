@@ -943,7 +943,10 @@ static bool is_supported_type(ggml_type type) {
            type == GGML_TYPE_Q6_K || type == GGML_TYPE_IQ3_S ||
            type == GGML_TYPE_IQ3_XXS ||
            type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q4_0 ||
-           type == GGML_TYPE_Q4_1 || type == GGML_TYPE_Q8_0 ||
+           type == GGML_TYPE_Q4_1 || type == GGML_TYPE_Q5_0 ||
+           type == GGML_TYPE_Q5_1 || type == GGML_TYPE_Q8_0 ||
+           type == GGML_TYPE_Q2_K ||
+           type == GGML_TYPE_IQ1_M ||
            type == GGML_TYPE_IQ2_XXS ||
            type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_S ||
            type == GGML_TYPE_IQ1_S;
@@ -1005,6 +1008,22 @@ static void launch_mmq(
     switch (type) {
         case GGML_TYPE_Q2_0:
             launch_mmq_type<GGML_TYPE_Q2_0, OutputType>(
+                context, args, output, stream);
+            break;
+        case GGML_TYPE_Q5_0:
+            launch_mmq_type<GGML_TYPE_Q5_0, OutputType>(
+                context, args, output, stream);
+            break;
+        case GGML_TYPE_Q5_1:
+            launch_mmq_type<GGML_TYPE_Q5_1, OutputType>(
+                context, args, output, stream);
+            break;
+        case GGML_TYPE_Q2_K:
+            launch_mmq_type<GGML_TYPE_Q2_K, OutputType>(
+                context, args, output, stream);
+            break;
+        case GGML_TYPE_IQ1_M:
+            launch_mmq_type<GGML_TYPE_IQ1_M, OutputType>(
                 context, args, output, stream);
             break;
         case GGML_TYPE_Q4_K:
