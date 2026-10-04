@@ -4548,7 +4548,7 @@ static size_t FastllmCudaAlignBytes(size_t size, size_t align) {
     return ((size + align - 1) / align) * align;
 }
 
-static std::string FastllmCudaWeightSlabGroup(const std::string &name) {
+static std::string FastllmCudaWeightSlabGroup(const std::string &name, bool transientExpert) {
     // Expert-parallel source tensors are consolidated and released one layer
     // at a time during the first ForwardGPU call.  Do not mix different layers
     // in the same slab, otherwise one live tensor from a later layer pins all
@@ -4560,10 +4560,18 @@ static std::string FastllmCudaWeightSlabGroup(const std::string &name) {
             return name.substr(0, pos + std::strlen(marker));
         }
     }
+    if (transientExpert) {
+        size_t pos = name.find(".mlp.experts.");
+        if (pos != std::string::npos) return name.substr(0, pos + std::strlen(".mlp.experts."));
+    }
     return "";
 }
 
 void *FastllmCudaMallocModelWeight(size_t size, const std::string &name) {
+    return FastllmCudaMallocModelWeightGrouped(size, name, false);
+}
+
+void *FastllmCudaMallocModelWeightGrouped(size_t size, const std::string &name, bool transientExpert) {
     size_t slabBytes = FastllmCudaGetWeightSlabBytes();
     if (slabBytes == 0 || size == 0 || size > slabBytes / 2) {
         return FastllmCudaMalloc(size);
@@ -4575,7 +4583,7 @@ void *FastllmCudaMallocModelWeight(size_t size, const std::string &name) {
 
     const size_t align = 256;
     size_t aligned = FastllmCudaAlignBytes(size, align);
-    std::string group = FastllmCudaWeightSlabGroup(name);
+    std::string group = FastllmCudaWeightSlabGroup(name, transientExpert);
     std::lock_guard<std::mutex> lock(fastllmCudaWeightSlabMutex);
 
     auto &slabs = fastllmCudaWeightSlabs[id];
@@ -4625,6 +4633,12 @@ void *FastllmCudaMallocModelWeight(size_t size, const std::string &name) {
     fastllmCudaWeightSlabPtrs[ret] = {id, slab.base};
     fastllmCudaWeightSlabPtrCount.fetch_add(1, std::memory_order_relaxed);
     return ret;
+}
+
+bool FastllmCudaIsWeightSlabPointer(const void *pointer) {
+    if (!pointer || fastllmCudaWeightSlabPtrCount.load(std::memory_order_relaxed) == 0) return false;
+    std::lock_guard<std::mutex> lock(fastllmCudaWeightSlabMutex);
+    return fastllmCudaWeightSlabPtrs.count(const_cast<void *>(pointer)) != 0;
 }
 
 static bool FastllmCudaTryFreeWeightSlabPtr(void *ret) {

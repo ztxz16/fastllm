@@ -1324,6 +1324,7 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                     curLen += copyLen;
                 }
             } else if (weight.dataType == fastllm::DataType::NVFP4_BLOCK_16 ||
+                       weight.dataType == fastllm::DataType::NVFP4_BLOCK_16_E4M3_PACKED ||
                        weight.dataType == fastllm::DataType::NVFP4_BLOCK_16_E8M0 ||
                        weight.dataType == fastllm::DataType::NVFP4_BLOCK_32_E8M0) {
                 size_t rowBytes = fastllm::GetDataBytes(weight.dataType, 1, m);
@@ -1516,6 +1517,7 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                     curLen += copyLen;
                 }
             } else if (weight.dataType == fastllm::DataType::NVFP4_BLOCK_16 ||
+                       weight.dataType == fastllm::DataType::NVFP4_BLOCK_16_E4M3_PACKED ||
                        weight.dataType == fastllm::DataType::NVFP4_BLOCK_16_E8M0 ||
                        weight.dataType == fastllm::DataType::NVFP4_BLOCK_32_E8M0) {
                 const size_t packedBlock = weight.dataType ==
@@ -1525,7 +1527,15 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                     8 + sizeof(float) : packedBlock / 2 + sizeof(uint8_t);
                 size_t srcRowBytes = fastllm::GetDataBytes(weight.dataType, 1, m);
                 size_t dstRowBytes = fastllm::GetDataBytes(weight.dataType, 1, len);
+                const size_t header = weight.dataType ==
+                    fastllm::DataType::NVFP4_BLOCK_16_E4M3_PACKED ? sizeof(float) : 0;
+                if (header) {
+                    state = FastllmCudaMemcpy2D(deviceWeightData, dstRowBytes,
+                        sourceWeightData, srcRowBytes, header, kSize,
+                        GetCudaMemcpyType(mallocType, sourceWeightType), deviceId, rootDevice);
+                }
                 for (auto &it : div) {
+                    if (state != cudaSuccess) break;
                     int copyLen = it.second - it.first;
                     fastllm::AssertInFastLLM(
                         it.first % packedBlock == 0 &&
@@ -1536,9 +1546,9 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                         cudaSetDevice(rootDevice);
                     }
                     size_t dstOffsetBytes =
-                        static_cast<size_t>(curLen / packedBlock) * blockBytes;
+                        header + static_cast<size_t>(curLen / packedBlock) * blockBytes;
                     size_t srcOffsetBytes =
-                        static_cast<size_t>(it.first / packedBlock) * blockBytes;
+                        header + static_cast<size_t>(it.first / packedBlock) * blockBytes;
                     size_t copyBytes =
                         static_cast<size_t>(copyLen / packedBlock) * blockBytes;
                     state = FastllmCudaMemcpy2D((uint8_t*)deviceWeightData + dstOffsetBytes,

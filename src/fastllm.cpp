@@ -115,7 +115,10 @@ namespace fastllm {
 #ifdef USE_CUDA
         static void *CudaMallocForData(const Data &data, uint64_t bytes) {
             if (data.isModelWeight && !data.directMemory) {
-                return FastllmCudaMallocModelWeight(bytes, data.name);
+                // TP NVFP4 sources are retired after each layer is repacked.
+                bool transientExpert = data.dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED &&
+                    (data.tpLinearType == TP_LINEAR_ROW || data.tpLinearType == TP_LINEAR_COLUMN);
+                return FastllmCudaMallocModelWeightGrouped(bytes, data.name, transientExpert);
             }
             return data.directMemory ? FastllmCudaDirectMalloc(bytes) : FastllmCudaMalloc(bytes);
         }

@@ -29,13 +29,18 @@ struct Fixture {
     std::vector<std::vector<float>> decoded;
     Fixture(int seed, bool invalid = false, bool planar = false,
             int hidden = 256, int intermediate = 128, int experts = 16,
-            bool directMemory = true, bool variedScales = false)
+            bool directMemory = true, bool variedScales = false, bool slab = false)
         : hidden(hidden), intermediate(intermediate), experts(experts), weights(2 + experts * 2, nullptr) {
         const int H=hidden,I=intermediate,E=experts;
         for (int e = 0; e < E; ++e) for (int matrix = 0; matrix < 2; ++matrix) {
             int n = matrix ? H : 2 * I, k = matrix ? I : H, stride = 4 + k / 16 * 9;
             auto d = std::make_unique<Data>(planar ? DataType::NVFP4_BLOCK_16_E4M3 : DataType::NVFP4_BLOCK_16_E4M3_PACKED);
             d->blockK = 1; d->blockM = 16; d->directMemory = directMemory;
+            if (slab) {
+                d->isModelWeight = true;
+                d->tpLinearType = matrix ? TP_LINEAR_COLUMN : TP_LINEAR_ROW;
+                d->name = "test.mlp.experts." + std::to_string(e);
+            }
             d->Resize({n, k}); d->Allocate(false);
             auto *bytes = reinterpret_cast<unsigned char *>(d->cpuData);
             std::vector<float> full(n * k);
@@ -225,6 +230,14 @@ int main(int argc, char **argv) { try {
         }
         FastllmCudaSetLinearExactBatchThreshold(0);
         std::puts("Grouped decode PASS"); return 0;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--tp-slab") == 0) {
+        FastllmCudaSetWeightSlabBytes(16ULL << 20);
+        Fixture f(47, false, false, 4096, 256, 8, false, true, true);
+        for (auto &w : f.owned) Check(FastllmCudaIsWeightSlabPointer(w->cudaData), "expected slab source");
+        for (int m : {1, 9, 512}) Run(f, m, 8, 0.0f, .15f, true, true);
+        for (auto &w : f.owned) Check(w->cudaData == nullptr, "slab source was not released");
+        std::puts("TP slab source PASS"); return 0;
     }
     if (argc == 2 && std::strcmp(argv[1], "--decode-tiles") == 0) {
         // Keep the single-token reduction checks small enough for Sanitizer.

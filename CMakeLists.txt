@@ -1350,6 +1350,13 @@ if (UNIT_TEST)
         add_test(NAME naive_n05_attention COMMAND naive_n05_attention_test)
         set_tests_properties(naive_n05_attention PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
 
+        add_executable(naive_n05_tp_test test/basic/test_naive_n05_tp.cpp)
+        target_link_libraries(naive_n05_tp_test PRIVATE fastllm)
+        target_include_directories(naive_n05_tp_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME naive_n05_tp COMMAND naive_n05_tp_test)
+        set_tests_properties(naive_n05_tp PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
+            PASS_REGULAR_EXPRESSION "PASS: packed CPU/GPU")
+
         add_executable(naive_n05_decode_test test/basic/test_naive_n05_decode.cpp)
         target_link_libraries(naive_n05_decode_test PRIVATE fastllm)
         target_include_directories(naive_n05_decode_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

@@ -2907,7 +2907,8 @@ static bool ValidateNvfp4E4M3Weight(
            (weight->dataType == fastllm::DataType::NVFP4_BLOCK_16_E4M3_PACKED ||
             weight->scales.size() == (size_t)globalScales) &&
            weight->GetBytes() >= packedBytes + scaleBytes &&
-           weight->cudaData != nullptr && weight->directMemory &&
+           weight->cudaData != nullptr && !weight->isFake &&
+           (weight->directMemory || FastllmCudaIsWeightSlabPointer(weight->cudaData)) &&
            !weight->cudaDataBorrowed;
 }
 
