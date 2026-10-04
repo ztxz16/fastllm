@@ -610,29 +610,36 @@ void LaunchFastllmGemmFp16Bf16(half *input, __nv_bfloat16 *weight, half *output,
     }
 }
 
-void LaunchFastllmGemmBf16Bf16(__nv_bfloat16 *input, __nv_bfloat16 *weight, __nv_bfloat16 *output, __nv_bfloat16 *bias, int n, int m, int k) {
+template <int THREADS>
+static void LaunchFastllmGemmBf16Bf16SmallBatch(__nv_bfloat16 *input, __nv_bfloat16 *weight, __nv_bfloat16 *output, __nv_bfloat16 *bias, int n, int m, int k) {
     // PART=2..8 reuses the weights without changing the per-row reduction.
-    if (n == 1 && m > 0 && m <= 256 && m % 8 == 0) {
-        // At most 32 lanes load data; the original extra zero reductions do
-        // not contribute to these short, aligned projections.
-        FastllmGemvBf16Bf16Kernel2MultiRow<32, 1>
-            <<<k, 32>>>(input, weight, output, bias, m, k);
-    } else if (n == 1) {
-        FastllmGemvBf16Bf16Kernel2MultiRow<256, 1> <<<k, 256>>>(input, weight, output, bias, m, k);
+    if (n == 1) {
+        FastllmGemvBf16Bf16Kernel2MultiRow<THREADS, 1> <<<k, THREADS>>>(input, weight, output, bias, m, k);
     } else if (n == 2) {
-        FastllmGemvBf16Bf16Kernel2MultiRow<256, 2> <<<k, 256>>>(input, weight, output, bias, m, k);
+        FastllmGemvBf16Bf16Kernel2MultiRow<THREADS, 2> <<<k, THREADS>>>(input, weight, output, bias, m, k);
     } else if (n == 3) {
-        FastllmGemvBf16Bf16Kernel2MultiRow<256, 3> <<<k, 256>>>(input, weight, output, bias, m, k);
+        FastllmGemvBf16Bf16Kernel2MultiRow<THREADS, 3> <<<k, THREADS>>>(input, weight, output, bias, m, k);
     } else if (n == 4) {
-        FastllmGemvBf16Bf16Kernel2MultiRow<256, 4> <<<k, 256>>>(input, weight, output, bias, m, k);
+        FastllmGemvBf16Bf16Kernel2MultiRow<THREADS, 4> <<<k, THREADS>>>(input, weight, output, bias, m, k);
     } else if (n == 5) {
-        FastllmGemvBf16Bf16Kernel2MultiRow<256, 5> <<<k, 256>>>(input, weight, output, bias, m, k);
+        FastllmGemvBf16Bf16Kernel2MultiRow<THREADS, 5> <<<k, THREADS>>>(input, weight, output, bias, m, k);
     } else if (n == 6) {
-        FastllmGemvBf16Bf16Kernel2MultiRow<256, 6> <<<k, 256>>>(input, weight, output, bias, m, k);
+        FastllmGemvBf16Bf16Kernel2MultiRow<THREADS, 6> <<<k, THREADS>>>(input, weight, output, bias, m, k);
     } else if (n == 7) {
-        FastllmGemvBf16Bf16Kernel2MultiRow<256, 7> <<<k, 256>>>(input, weight, output, bias, m, k);
+        FastllmGemvBf16Bf16Kernel2MultiRow<THREADS, 7> <<<k, THREADS>>>(input, weight, output, bias, m, k);
     } else if (n == 8) {
-        FastllmGemvBf16Bf16Kernel2MultiRow<256, 8> <<<k, 256>>>(input, weight, output, bias, m, k);
+        FastllmGemvBf16Bf16Kernel2MultiRow<THREADS, 8> <<<k, THREADS>>>(input, weight, output, bias, m, k);
+    }
+}
+
+void LaunchFastllmGemmBf16Bf16(__nv_bfloat16 *input, __nv_bfloat16 *weight, __nv_bfloat16 *output, __nv_bfloat16 *bias, int n, int m, int k) {
+    if (n >= 1 && n <= 8) {
+        if (m > 0 && m <= 256 && m % 8 == 0) {
+            // Only one warp loads data in these short, aligned projections.
+            LaunchFastllmGemmBf16Bf16SmallBatch<32>(input, weight, output, bias, n, m, k);
+        } else {
+            LaunchFastllmGemmBf16Bf16SmallBatch<256>(input, weight, output, bias, n, m, k);
+        }
     } else if (n > 8 && n <= 65535 &&
                n < fastllm::FastllmCudaGetLinearExactBatchThreshold()) {
         // Larger exact batches use independent rows, within grid.y's limit.
@@ -848,7 +855,7 @@ bool FastllmCudaBFloat16MatMulBFloat16(const fastllm::Data &input, fastllm::Data
         n < fastllm::FastllmCudaGetLinearExactBatchThreshold();
     if (n < 8 || exactRows) {
         LaunchFastllmGemmBf16Bf16(cudaInput, weightPtr, cudaOutput, cudaBiasData, n, m, k);
-    } else if (n == 8 && k <= 1024) {
+    } else if (n == 8 && (k <= 1024 || (m > 0 && m <= 256 && m % 8 == 0))) {
         LaunchFastllmGemmBf16Bf16(cudaInput, weightPtr, cudaOutput, nullptr, n, m, k);
         // Match the GEMM branch: round the dot product before adding bias.
         if (bias.dims.size() > 0) {

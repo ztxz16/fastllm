@@ -17,6 +17,7 @@
 #ifdef USE_CUDA
 #include "devices/cpu/cpudevice.h"
 #include "devices/cuda/cudadevice.h"
+#include "devices/cuda/glm5-next-cuda.cuh"
 #include "devices/cuda/fastllm-awq-sm70.cuh"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/multicuda/fastllm-multicuda.cuh"
@@ -11278,6 +11279,148 @@ namespace {
         }
     }
 
+    void RunCudaSmallBatchDecodeRegression() {
+        FastllmCudaSetDevice(0);
+        const int previousThreshold = fastllm::FastllmCudaGetLinearExactBatchThreshold();
+        fastllm::FastllmCudaSetLinearExactBatchThreshold(0);
+        fastllm::Data emptyBias;
+
+        // Exercise automatic dispatch, with distinct rows and both sides of
+        // the short/aligned reduction boundary. Exact-batch mode stays off.
+        for (auto type : {fastllm::DataType::FLOAT32, fastllm::DataType::BFLOAT16}) {
+            for (int m : (type == fastllm::DataType::FLOAT32 ?
+                          std::vector<int>{4096} : std::vector<int>{128, 256, 259})) {
+                const int k = type == fastllm::DataType::FLOAT32 ? 288 : 2049;
+                const auto values = MakeRegressionValues(8 * m, 0.37f, 0.21f);
+                for (bool withBias : {false, true}) {
+                    auto weight = MakeCudaTensor(type, {k, m},
+                        MakeRegressionValues((size_t)k * m, 0.83f, 0.031f));
+                    auto bias = MakeCudaTensor(fastllm::DataType::FLOAT32, {k},
+                        MakeRegressionValues(k, 1.13f, 0.27f));
+                    const auto &caseBias = withBias ? bias : emptyBias;
+                    auto launch = [&](fastllm::Data &input, fastllm::Data &output, int n) {
+                        return type == fastllm::DataType::FLOAT32 ?
+                            FastllmCudaMatMulFloat32(input, weight, caseBias, output, n, m, k) :
+                            FastllmCudaBFloat16MatMulBFloat16(input, weight, caseBias, output, n, m, k);
+                    };
+                    std::vector<float> reference;
+                    for (int row = 0; row < 8; row++) {
+                        auto input = MakeCudaTensor(type, {1, m},
+                            std::vector<float>(values.begin() + row * m, values.begin() + (row + 1) * m));
+                        auto output = MakeCudaTensor(type, {1, k}, std::vector<float>(k));
+                        Expect(launch(input, output, 1), "small-batch linear reference failed");
+                        auto rowValues = ToFloatVector(output);
+                        reference.insert(reference.end(), rowValues.begin(), rowValues.end());
+                    }
+                    for (int n = 2; n <= 8; n++) {
+                        auto input = MakeCudaTensor(type, {n, m},
+                            std::vector<float>(values.begin(), values.begin() + n * m));
+                        auto output = MakeCudaTensor(type, {n, k}, std::vector<float>(n * k));
+                        Expect(launch(input, output, n), "automatic small-batch linear failed");
+                        // The established B8 GEMM path rounds before bias and
+                        // may also use a different reduction for unaligned m.
+                        const float tol = type == fastllm::DataType::BFLOAT16 &&
+                            n == 8 && (withBias || m == 259) ? 0.016f : 0.0f;
+                        ExpectFloatNear(std::vector<float>(reference.begin(), reference.begin() + n * k),
+                            ToFloatVector(output), tol, tol,
+                            "automatic small-batch linear n=" + std::to_string(n) + " m=" + std::to_string(m));
+                    }
+                }
+            }
+        }
+        std::cout << "Small-batch automatic linear: PASS\n";
+
+        // Nine rows select the legacy generic kernel; compare prefixes so
+        // fixed Top-K preserves scores and legacy ordering even at ties.
+        for (int experts : {256, 288}) {
+            for (bool tied : {false, true}) {
+                for (bool withBias : {false, true}) {
+                    for (bool normalize : {false, true}) {
+                        auto values = MakeRegressionValues(9 * experts, 0.43f, 0.19f);
+                        for (int row = 0; row < 9; row++) {
+                            for (int e = 0; e < experts; e++) {
+                                values[row * experts + e] = tied ? 0.1f * (row + 1) :
+                                    0.5f + values[row * experts + e];
+                            }
+                        }
+                        auto bias = MakeCudaTensor(fastllm::DataType::FLOAT32, {experts},
+                            tied ? std::vector<float>(experts, 0.01f) :
+                            MakeRegressionValues(experts, 0.71f, 0.037f));
+                        auto select = [&](int n, std::vector<int32_t> &indices, std::vector<float> &scores) {
+                            auto logits = MakeCudaTensor(fastllm::DataType::FLOAT32, {n, experts},
+                                std::vector<float>(values.begin(), values.begin() + n * experts));
+                            auto index = MakeIntTensor({n, 8}, std::vector<int32_t>(n * 8, -1));
+                            index.ToDevice(fastllm::DataDevice::CUDA);
+                            auto score = MakeCudaTensor(fastllm::DataType::FLOAT32, {n, 8}, std::vector<float>(n * 8));
+                            Expect(FastllmCudaSelectExpert(logits, withBias ? &bias : nullptr,
+                                index, score, 8, normalize, 2.5f), "small-batch Top-K failed");
+                            indices = ToIntVector(index);
+                            scores = ToFloatVector(score);
+                        };
+                        std::vector<int32_t> referenceIndex;
+                        std::vector<float> referenceScore;
+                        select(9, referenceIndex, referenceScore);
+                        for (int n = 1; n <= 8; n++) {
+                            std::vector<int32_t> index;
+                            std::vector<float> score;
+                            select(n, index, score);
+                            ExpectIntEqual(std::vector<int32_t>(referenceIndex.begin(), referenceIndex.begin() + n * 8),
+                                index, "small-batch legacy Top-K indices");
+                            ExpectFloatNear(std::vector<float>(referenceScore.begin(), referenceScore.begin() + n * 8),
+                                score, 0.0f, 0.0f, "small-batch legacy Top-K scores");
+                        }
+                    }
+                }
+            }
+        }
+        std::cout << "Small-batch expert Top-K: PASS\n";
+
+        constexpr int hidden = 4096, flat = 4 * hidden;
+        const auto values = MakeRegressionValues(8 * flat, 0.23f, 0.06f);
+        auto scale = MakeCudaTensor(fastllm::DataType::FLOAT32, {3}, {0.71f, 0.83f, 0.57f});
+        auto base = MakeCudaTensor(fastllm::DataType::FLOAT32, {24}, MakeRegressionValues(24, 1.11f, 0.12f));
+        auto norm = MakeCudaTensor(fastllm::DataType::FLOAT32, {hidden},
+            MakeRegressionValues(hidden, 0.79f, 0.31f));
+        for (auto fnType : {fastllm::DataType::FLOAT32, fastllm::DataType::BFLOAT16}) {
+            auto fn = MakeCudaTensor(fnType, {24, flat}, MakeRegressionValues(24 * flat, 0.67f, 0.008f));
+            for (bool glmRounding : {false, true}) {
+                // The DeepSeek entry point requires FP32 HC weights.
+                if (!glmRounding && fnType != fastllm::DataType::FLOAT32) continue;
+                auto launch = [&](fastllm::Data &input, fastllm::Data &output, fastllm::Data &post, fastllm::Data &comb) {
+                    auto kernel = glmRounding ? FastllmCudaGlm5NextHcPreNorm : FastllmCudaDeepSeekV4HcPreNorm;
+                    return kernel(input, fn, scale, base, norm, 4, 20, 1e-6f, 1e-5f, output, post, comb);
+                };
+                std::vector<float> reference[3];
+                for (int row = 0; row < 8; row++) {
+                    auto input = MakeCudaTensor(fastllm::DataType::BFLOAT16, {1, 1, 4, hidden},
+                        std::vector<float>(values.begin() + row * flat, values.begin() + (row + 1) * flat));
+                    fastllm::Data outputs[3];
+                    Expect(launch(input, outputs[0], outputs[1], outputs[2]), "single-row HC reference failed");
+                    for (int i = 0; i < 3; i++) {
+                        auto rowValues = ToFloatVector(outputs[i]);
+                        reference[i].insert(reference[i].end(), rowValues.begin(), rowValues.end());
+                    }
+                }
+                for (int n = 8; n >= 1; n--) {
+                    auto input = MakeCudaTensor(fastllm::DataType::BFLOAT16, {1, n, 4, hidden},
+                        std::vector<float>(values.begin(), values.begin() + n * flat));
+                    fastllm::Data outputs[3];
+                    Expect(launch(input, outputs[0], outputs[1], outputs[2]), "small-batch fused HC failed");
+                    for (int i = 0; i < 3; i++) {
+                        ExpectFloatNear(std::vector<float>(reference[i].begin(), reference[i].begin() + reference[i].size() / 8 * n),
+                            ToFloatVector(outputs[i]), 0.0f, 0.0f, "small-batch fused HC row independence");
+                    }
+                }
+                auto unsupported = MakeCudaTensor(fastllm::DataType::BFLOAT16,
+                    {1, 9, 4, hidden}, std::vector<float>(9 * flat));
+                fastllm::Data outputs[3];
+                Expect(!launch(unsupported, outputs[0], outputs[1], outputs[2]), "HC prefill fallback boundary changed");
+            }
+        }
+        fastllm::FastllmCudaSetLinearExactBatchThreshold(previousThreshold);
+        std::cout << "Small-batch fused HC: PASS\n";
+    }
+
     void RunCudaExactSmallBatchLinearRegression() {
         FastllmCudaSetDevice(0);
         fastllm::Data emptyBias;
@@ -14794,6 +14937,12 @@ int main(int argc, char **argv) {
             RunCudaNVFP4Sm70TurboMindRegression();
             return 0;
         }
+        if (argc == 2 && std::string(argv[1]) == "--cuda-small-batch-decode") {
+            Expect(FastllmCudaGetDeviceCount() > 0, "small-batch decode regression requires CUDA.");
+            RunCudaSmallBatchDecodeRegression();
+            std::cout << "CUDA small-batch decode regressions: PASS\n";
+            return 0;
+        }
         if (argc == 2 &&
             std::string(argv[1]) == "--cuda-exact-small-batch-linear") {
             Expect(FastllmCudaGetDeviceCount() > 0,
@@ -15149,6 +15298,7 @@ int main(int argc, char **argv) {
             RunCudaInt4GroupHalfWeightRoundingRegression();
             RunCudaFp8LinearAddRegression();
             RunCudaExactSmallBatchLinearRegression();
+            RunCudaSmallBatchDecodeRegression();
             RunCudaFp16WarpRowsGemvRegression();
             RunCudaFusedRouterSelectionRegression();
             RunCudaQwen35RouterSharedGateFusionRegression();

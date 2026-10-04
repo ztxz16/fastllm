@@ -12401,12 +12401,12 @@ bool FastllmCudaSelectExpert(const fastllm::Data &logits, const fastllm::Data *g
         cudaLogits, cudaBias, cudaIndex, cudaScore, n, numExperts,
         topk, hasBias, needNorm, routeScale);
 #else
-    if (n == 1 && numExperts == 256 && topk == 8) {
-        FastllmSelectExpertFixedTopKKernel<false, 256, 8><<<1, 32>>>(
+    if (n <= 8 && numExperts == 256 && topk == 8) {
+        FastllmSelectExpertFixedTopKKernel<false, 256, 8><<<n, 32>>>(
             cudaLogits, cudaBias, cudaIndex, cudaScore,
             hasBias, needNorm, routeScale);
-    } else if (n == 1 && numExperts == 288 && topk == 8) {
-        FastllmSelectExpertFixedTopKKernel<false, 288, 8><<<1, 32>>>(
+    } else if (n <= 8 && numExperts == 288 && topk == 8) {
+        FastllmSelectExpertFixedTopKKernel<false, 288, 8><<<n, 32>>>(
             cudaLogits, cudaBias, cudaIndex, cudaScore,
             hasBias, needNorm, routeScale);
     } else if (n <= 9 && numExperts == 512 && topk == 10) {

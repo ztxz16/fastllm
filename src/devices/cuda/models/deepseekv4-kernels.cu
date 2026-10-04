@@ -7507,12 +7507,11 @@ static bool DeepSeekV4HcPreNormImpl(const fastllm::Data &x,
                                                 fastllm::Data &normOutput,
                                                 fastllm::Data &post,
                                                 fastllm::Data &comb, bool roundBeforeWeight) {
-    // Cover ordinary one-token decode and DSpark-7's eight-row target
-    // verification.  Other multi-token execution retains the established
-    // graph-safe generic HcPre + RMSNorm path.
+    // The fused finish processes each row independently. Cover small decode
+    // batches, including shrinking batches, and eight-row target verification.
     const bool supportedRows =
         x.dims.size() == 4 && x.dims[0] == 1 &&
-        (x.dims[1] == 1 || x.dims[1] == 8);
+        x.dims[1] >= 1 && x.dims[1] <= 8;
     if (x.dataDevice != fastllm::DataDevice::CUDA ||
         hcFn.dataDevice != fastllm::DataDevice::CUDA ||
         hcScale.dataDevice != fastllm::DataDevice::CUDA ||
