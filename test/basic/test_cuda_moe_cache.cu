@@ -17,6 +17,7 @@ namespace fastllm { NumaConfig *GetNumaConfig(); }
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <random>
 #include <stdexcept>
@@ -421,7 +422,7 @@ static void CheckExpertParallel(std::vector<fastllm::Data *> &reference,
         for (int i = 0; i < routes * hidden; ++i)
             Require(std::abs(grouped[i] - cpu[i]) <= 3e-5f * (1 + std::abs(cpu[i])),
                     "EP grouped NUMA differs from single-row expert reference");
-        std::vector<float> lower(rows * hidden, 0), upper(rows * hidden, 0);
+        std::vector<float> lower(rows * hidden, 0), upper(rows * hidden, 0), magnitude(rows * hidden, 0);
         for (int r = 0; r < topk; ++r) {
             std::vector<float> one(routes, 0);
             for (int row = 0; row < rows; ++row) one[row * topk + r] = 1;
@@ -434,10 +435,13 @@ static void CheckExpertParallel(std::vector<fastllm::Data *> &reference,
                 const int route = (c / hidden) * topk + r;
                 const float a = cpu[route * hidden + c % hidden] * routeScores[route], b = gpu[c] * routeScores[route];
                 lower[c] += std::min(a, b); upper[c] += std::max(a, b);
+                magnitude[c] += std::max(std::abs(a), std::abs(b));
             }
         }
         const bool reject = step >= 16;
-        if (step == 16) inputs[ranks - 1].dataType = FLOAT16;
+        // FP16/BF16 are supported EP inputs; use an unsupported type to
+        // verify that one rank's rejection makes every rank fall back.
+        if (step == 16) inputs[ranks - 1].dataType = INT8;
         if (step == 17) SetMoeCudaCacheBytes(0);
         if (step == 18) inputs[ranks - 1].Resize({rows == 1 ? 2 : 1, hidden});
         if (step == 19) {
@@ -496,7 +500,15 @@ static void CheckExpertParallel(std::vector<fastllm::Data *> &reference,
         }
         for (int c = 0; c < rows * hidden; ++c) {
             const float result = actual[0][c] + (singleDeviceHybrid ? 0 : actual[1][c]);
-            const float tolerance = 3e-5f * (1 + std::max(std::abs(lower[c]), std::abs(upper[c])));
+            // Rank-local sums round before the cross-rank addition. Bound
+            // that error by the terms' magnitudes, even when they cancel.
+            const float tolerance = 3e-5f * (1 + std::max(std::abs(lower[c]), std::abs(upper[c]))) +
+                (topk + 2) * std::numeric_limits<float>::epsilon() * magnitude[c];
+            if (!std::isfinite(result) || result < lower[c] - tolerance || result > upper[c] + tolerance)
+                std::fprintf(stderr, "EP mismatch: step=%d rows=%d column=%d asymmetric=%d reverse=%d "
+                    "rank0=%g rank1=%g bounds=[%g,%g] tolerance=%g\n",
+                    step, rows, c, disableSecondDevice, reverseDevices,
+                    actual[0][c], singleDeviceHybrid ? 0.f : actual[1][c], lower[c], upper[c], tolerance);
             Require(std::isfinite(result) && result >= lower[c] - tolerance && result <= upper[c] + tolerance,
                     "EP duplicated or lost an expert contribution");
         }
