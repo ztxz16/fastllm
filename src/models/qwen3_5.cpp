@@ -39,6 +39,7 @@
 #include "json11.hpp"
 
 #ifdef USE_CUDA
+#include "gguf.h"
 #include "models/qwen3_cuda_common.h"
 #include "devices/cuda/fastllm-cuda-gdn.h"
 #include "devices/cuda/fastllm-cuda-gdn-prepare.h"
@@ -28864,11 +28865,67 @@ namespace fastllm {
         }
         return true;
     }
+
+    // Preserve the original GGUF encoding: shortlist selection changes only
+    // the available draft tokens, never the target head or quantization error.
+    static bool Qwen35GatherGgufDraftRows(const Data &source, Data &output,
+                                        const std::vector<int> &rows, int device) {
+        if (source.dataType != DataType::DATA_GGUF_FORMAT || source.IsRepacked ||
+            source.ggmlType < 0 || source.ggmlType >= GGML_TYPE_COUNT ||
+            source.ggmlTensor == nullptr ||
+            source.multiDeviceData || source.dataDevice != DataDevice::CUDA ||
+            source.cudaData == nullptr || source.dataDeviceIds != std::vector<int>{device} ||
+            source.dims.size() != 2 || source.dims[0] <= 0 || source.dims[1] <= 0 ||
+            rows.empty() || rows.size() > (size_t)source.dims[0]) return false;
+        for (int row : rows) if (row < 0 || row >= source.dims[0]) return false;
+        const auto *tensor = static_cast<const ggml_tensor*>(source.ggmlTensor);
+        // GGUF loaders may leave Data::strides as {1}; packed row layout is
+        // described by ggml's byte strides, not the logical Data strides.
+        if (tensor->type != source.ggmlType || tensor->ne[0] != source.dims[1] ||
+            tensor->ne[1] != source.dims[0] || tensor->ne[2] != 1 || tensor->ne[3] != 1)
+            return false;
+        const int64_t blockSize = ggml_blck_size(tensor->type);
+        const size_t typeSize = ggml_type_size(tensor->type);
+        if (blockSize <= 0 || typeSize == 0 || tensor->nb[0] != typeSize ||
+            source.dims[1] % blockSize != 0) return false;
+        const size_t rowBytes = ggml_row_size(tensor->type, source.dims[1]);
+        if (tensor->nb[1] != rowBytes || source.GetBytes() != rowBytes * source.dims[0])
+            return false;
+        output.dataType = source.dataType;
+        output.ggmlType = source.ggmlType;
+        output.isGGUFData = true;
+        output.disableGGUFRepack = source.disableGGUFRepack;
+        output.forceGGUFFp32Dequant = source.forceGGUFFp32Dequant;
+        output.Resize({(int)rows.size(), source.dims[1]});
+        output.ToDevice(DataDevice::CUDA, std::vector<int>{device});
+        output.Allocate(false);
+        if (output.cudaData == nullptr || output.GetBytes() != rows.size() * rowBytes)
+            return false;
+        std::vector<void*> destinations;
+        std::vector<const void*> sources;
+        std::vector<size_t> sizes;
+        // Adjacent selected rows form one copy span. The existing bounded
+        // batched-copy kernel also handles non-contiguous IDs and padding.
+        for (size_t begin = 0; begin < rows.size();) {
+            size_t end = begin + 1;
+            while (end < rows.size() && rows[end] == rows[begin] + (int)(end - begin)) ++end;
+            destinations.push_back((uint8_t*)output.cudaData + begin * rowBytes);
+            sources.push_back((const uint8_t*)source.cudaData + (size_t)rows[begin] * rowBytes);
+            sizes.push_back((end - begin) * rowBytes);
+            begin = end;
+        }
+        const bool copied = FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
+            destinations.data(), sources.data(), sizes.data(), (int)sizes.size());
+        // Preparation runs once. Complete all copies before publishing the
+        // new head, including the failure path that releases its allocation.
+        FastllmCudaSyncCurrentThreadStream();
+        return copied && !FastllmCudaGetThreadError();
+    }
 #endif
 
     bool Qwen3_5Model::PrepareDFlashDraftShortlist(const std::vector<int> &devices) {
 #ifdef USE_CUDA
-        if (!dflashDraftTokenIds.empty()) dflashNvfp4TpLmHeads.clear();
+        if (!dflashDraftTokenIds.empty()) dflashDraftLmHeads.clear();
         dflashDraftTokenIds.clear();
         const char *path = std::getenv("FASTLLM_DFLASH_DRAFT_TOKEN_IDS");
         if (!path || !*path || std::string(path) == "0") return false;
@@ -28882,33 +28939,34 @@ namespace fastllm {
             std::vector<int> ids;
             mtp_shortlist::Shard plan;
             const auto bias = weight.weight.find("lm_head.bias");
+            const bool gguf = head.dataType == DataType::DATA_GGUF_FORMAT;
             bool valid = head.dims.size() == 2 && dflashSelectorTopK > 0 &&
                 (bias == weight.weight.end() || bias->second.dims.empty()) &&
                 mtp_shortlist::Read(path, head.dims[0], ids) &&
                 mtp_shortlist::Project(ids, {{0, head.dims[0]}},
                     head.dims[0], head.dims[0], plan) &&
                 plan.logicalSize >= dflashSelectorTopK &&
-                FastllmCudaMarlinNVFP4Supported((int)plan.rows.size(), head.dims[1]);
+                (gguf || FastllmCudaMarlinNVFP4Supported((int)plan.rows.size(), head.dims[1]));
             const int device = devices.front();
             std::unordered_map<int, Data> pending;
             if (valid) {
                 FastllmCudaSetDevice(device);
-                valid = FastllmCudaQuantizeLinearWeightNVFP4Block16Rows(
-                    head, pending[device], plan.rows);
+                valid = gguf ? Qwen35GatherGgufDraftRows(head, pending[device], plan.rows, device) :
+                    FastllmCudaQuantizeLinearWeightNVFP4Block16Rows(head, pending[device], plan.rows);
             }
             if (!valid) {
                 printf("[Qwen3.5 DFlash2 shortlist] invalid or unsupported single-GPU shortlist; using full vocabulary.\n");
                 return false;
             }
             Data &q = pending.at(device);
-            q.name = "dflash.draft_lm_head_nvfp4_shortlist.cuda:" + std::to_string(device);
+            q.name = "dflash.draft_lm_head_shortlist.cuda:" + std::to_string(device);
             q.weightType = WeightType::LINEAR;
             q.isModelWeight = true;
-            Qwen35PrepareDraftNvfp4Layout(q, device);
+            if (!gguf) Qwen35PrepareDraftNvfp4Layout(q, device);
             const uint64_t bytes = q.GetBytes();
             const size_t paddedRows = plan.rows.size();
             plan.tokenIds.resize(plan.logicalSize);
-            dflashNvfp4TpLmHeads.swap(pending);
+            dflashDraftLmHeads.swap(pending);
             dflashDraftTokenIds[device] = std::move(plan.tokenIds);
             printf("[Qwen3.5 DFlash2 shortlist] GPU %d: selected=%d padded=%zu source=%d.\n",
                 device, plan.logicalSize, paddedRows, head.dims[0]);
@@ -28959,7 +29017,7 @@ namespace fastllm {
             printf("[Qwen3.5 DFlash2 shortlist] invalid or unsupported TP shortlist; using full vocabulary.\n");
             return false;
         }
-        dflashNvfp4TpLmHeads.swap(pending);
+        dflashDraftLmHeads.swap(pending);
         size_t bytes = 0;
         for (int device : devices) {
             auto &plan = plans.at(device);
@@ -28967,7 +29025,7 @@ namespace fastllm {
                 device, plan.logicalSize, plan.rows.size(), head.multiDeviceDatas.at(device)->dims[0]);
             plan.tokenIds.resize(plan.logicalSize);
             dflashDraftTokenIds[device] = std::move(plan.tokenIds);
-            bytes += dflashNvfp4TpLmHeads.at(device).GetBytes();
+            bytes += dflashDraftLmHeads.at(device).GetBytes();
         }
         printf("[Qwen3.5 DFlash2 shortlist] ready: %zu/%d tokens, %.3f GB extra; greedy only, target head retained.\n",
             ids.size(), head.dims[0], bytes / 1.0e9);
@@ -29008,7 +29066,7 @@ namespace fastllm {
             return;
         }
         if (!dflashDraftTokenIds.empty()) {
-            dflashNvfp4TpLmHeads.clear();
+            dflashDraftLmHeads.clear();
             dflashDraftTokenIds.clear();
         }
         std::set<std::string> deferredTpLinearWeights;
@@ -29248,9 +29306,9 @@ namespace fastllm {
                     if (local == head.multiDeviceDatas.end() || !local->second) continue;
                     FastllmCudaSetDevice(tpDevice);
                     if (!supported(*local->second)) continue;
-                    Data &q = dflashNvfp4TpLmHeads[tpDevice];
+                    Data &q = dflashDraftLmHeads[tpDevice];
                     if (q.dims.empty() && !FastllmCudaQuantizeLinearWeightNVFP4Block16(*local->second, q)) {
-                        dflashNvfp4TpLmHeads.erase(tpDevice);
+                        dflashDraftLmHeads.erase(tpDevice);
                         continue;
                     }
                     q.name = "dflash.draft_lm_head_nvfp4.cuda:" + std::to_string(tpDevice);
@@ -29260,13 +29318,14 @@ namespace fastllm {
                 }
                 FastllmCudaSetDevice(device);
                 printf("[Qwen3.5 DFlash2 NVFP4] %zu/%zu draft head shards; target head retained.\n",
-                       dflashNvfp4TpLmHeads.size(), tpDevices.size());
+                       dflashDraftLmHeads.size(), tpDevices.size());
             }
             if (!dflashNvfp4DraftLmHead.dims.empty()) {
                 dflashNvfp4DraftLmHead.ToDevice(DataDevice::CUDA, {device}, true);
                 Qwen35PrepareDraftNvfp4Layout(dflashNvfp4DraftLmHead, device);
             }
-            if (dflashNvfp4DraftLmHead.dims.empty() && supported(head)) {
+            if (dflashNvfp4DraftLmHead.dims.empty() && supported(head) &&
+                (head.dataType != DataType::DATA_GGUF_FORMAT || dflashDraftTokenIds.empty())) {
                 const bool converted = FastllmCudaQuantizeLinearWeightNVFP4Block16(
                     head, dflashNvfp4DraftLmHead);
                 if (converted) {
@@ -29504,8 +29563,8 @@ namespace fastllm {
         auto selected = dflashDraftTokenIds.find(device);
         const bool compact = useShortlist && selected != dflashDraftTokenIds.end();
         Data *head = &originalHead;
-        auto local = dflashNvfp4TpLmHeads.find(device);
-        if (local != dflashNvfp4TpLmHeads.end() &&
+        auto local = dflashDraftLmHeads.find(device);
+        if (local != dflashDraftLmHeads.end() &&
             (selected == dflashDraftTokenIds.end() || compact)) {
             head = &local->second;
         } else if (!weight["lm_head.weight"].multiDeviceData && !dflashNvfp4DraftLmHead.dims.empty()) {
@@ -29519,10 +29578,11 @@ namespace fastllm {
             qwen3cuda::Qwen3CudaToDataType(runner, halfInput, DataType::FLOAT16);
             source = &halfInput;
         }
+        const bool trimPadding = compact && head->dims[0] != (int)selected->second.size();
         Data paddedOutput;
-        Data &projection = compact ? paddedOutput : output;
+        Data &projection = trimPadding ? paddedOutput : output;
         qwen3cuda::Qwen3CudaLinear(runner, *source, *head, bias, projection);
-        if (compact) {
+        if (trimPadding) {
             // Padding repeats weights for GEMM alignment. It must be removed
             // before top-k so one token cannot occupy several candidate slots.
             qwen3cuda::Qwen3CudaSplit(runner, paddedOutput, -1, 0,

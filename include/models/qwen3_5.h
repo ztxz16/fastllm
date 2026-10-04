@@ -426,7 +426,7 @@ namespace fastllm {
         bool dflashEnabled = false;
         bool dflashWeightsPrepared = false;
         Data dflashNvfp4DraftLmHead;
-        std::unordered_map<int, Data> dflashNvfp4TpLmHeads;
+        std::unordered_map<int, Data> dflashDraftLmHeads;
         // Logical IDs only: aligned duplicate rows are removed before top-k.
         std::unordered_map<int, std::vector<int>> dflashDraftTokenIds;
         std::unordered_map<std::string, Data> dflashNvfp4ViewWeights;
