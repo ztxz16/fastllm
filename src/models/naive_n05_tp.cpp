@@ -13,6 +13,88 @@
 
 namespace fastllm {
 
+bool NaiveN05FlashModel::CanReuseTensorParallelCache(const ResponseContext *context) const {
+#ifdef USE_CUDA
+    // With a single live handle, removal happens after its last forward and
+    // creation precedes its first forward. Never touch another request's KV or
+    // the worker-owned decode state from these callbacks.
+    return !isFree && tpDevices.size() > 1 && maxBatch == 1 &&
+        GetFastllmEnv().cudaGraph && !saveHistoryChat && !GetKVCacheInCPU() &&
+        kvCacheDataType == BFLOAT16 && context->multimodalInput.empty() &&
+        context->cacheLen == 0 && responseContextDict.dicts.size() == 1 &&
+        responseContextDict.dicts.begin()->second == context;
+#else
+    return false;
+#endif
+}
+
+void NaiveN05FlashModel::RestoreTensorParallelCache(ResponseContext *context) {
+    if (tpIdleCache.empty()) return;
+    // Release unused storage on every return path, before a new prefill can
+    // allocate another set. A successful swap leaves only empty descriptors.
+    std::vector<std::pair<Data, Data>> idle;
+    idle.swap(tpIdleCache);
+    if (!CanReuseTensorParallelCache(context) ||
+        (int)context->pastKeyValues.size() != block_cnt || (int)idle.size() != block_cnt) return;
+    const int reserve = CacheReserveCapacity(context->generationConfig);
+    if (reserve <= 0) return;
+    const int64_t capacity = ((int64_t)reserve + 127) / 128 * 128;
+    for (int layer = 0; layer < block_cnt; ++layer) {
+        for (Data *root : {&context->pastKeyValues[layer].first,
+                           &context->pastKeyValues[layer].second})
+            if (!root->dims.empty() || root->multiDeviceData || root->cudaData || root->cpuData)
+                return;
+        if (slidingLayers[layer]) continue;
+        for (Data *root : {&idle[layer].first, &idle[layer].second})
+            for (int device : tpDevices)
+                if (root->multiDeviceDatas.at(device)->expansionDims[1] != capacity)
+                    return;
+    }
+    context->pastKeyValues.swap(idle);
+    // The scheduler identifies a pending prompt by EMPTY root capacity.
+    // Keeping the previous root capacity would consume an active slot and
+    // could prevent this fresh request from ever being admitted.
+    for (auto &layer : context->pastKeyValues) {
+        for (Data *root : {&layer.first, &layer.second}) {
+            root->dims.clear();
+            root->strides.clear();
+            root->expansionDims.clear();
+            for (auto &item : root->multiDeviceDatas) {
+                Data &local = *item.second;
+                local.Resize({1, 0, local.dims[2]});
+            }
+        }
+    }
+}
+
+void NaiveN05FlashModel::RecycleTensorParallelCache(ResponseContext *context) {
+    if (!CanReuseTensorParallelCache(context) ||
+        (!context->isEnding && !context->isAbort) ||
+        context->error != ResponseContextErrorNone ||
+        CacheReserveCapacity(context->generationConfig) <= 0 ||
+        (int)context->pastKeyValues.size() != block_cnt) return;
+    for (const auto &layer : context->pastKeyValues) {
+        for (const Data *root : {&layer.first, &layer.second}) {
+            if (!root->multiDeviceData || root->isPagedKVCache || root->isFake ||
+                root->cudaData || root->cpuData || root->dataDeviceIds != tpDevices ||
+                root->multiDeviceDatas.size() != tpDevices.size()) return;
+            for (int device : tpDevices) {
+                auto it = root->multiDeviceDatas.find(device);
+                if (it == root->multiDeviceDatas.end() || !it->second) return;
+                const Data &local = *it->second;
+                if (local.isFake || local.cudaDataBorrowed || local.isPagedKVCache ||
+                    local.dataDevice != DataDevice::CUDA || local.dataType != BFLOAT16 ||
+                    !local.cudaData || local.dims.size() != 3 || local.dims[1] <= 0 ||
+                    local.expansionDims.size() != 3 || local.expansionDims[1] < local.dims[1]) return;
+            }
+        }
+    }
+    // Bound retention to one completed request's existing allocation set;
+    // ownership is transferred, never copied or shared with another handle.
+    tpIdleCache.clear();
+    tpIdleCache.swap(context->pastKeyValues);
+}
+
 bool NaiveN05FlashModel::InitTensorParallel() {
 #ifdef USE_CUDA
     // Use the existing --tp setting; ordinary lists of layer devices retain

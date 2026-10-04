@@ -98,6 +98,7 @@ bool NaiveN05FlashModel::TryRestoreHistoryCache(std::vector<int> &tokens, int &c
 }
 
 void NaiveN05FlashModel::OnResponseContextCreated(ResponseContext *context) {
+    RestoreTensorParallelCache(context);
     std::shared_ptr<const HistoryMemory> pending;
     {
         std::lock_guard<std::mutex> guard(historyMutex);
@@ -177,6 +178,7 @@ void NaiveN05FlashModel::OnResponseContextCreated(ResponseContext *context) {
 }
 
 void NaiveN05FlashModel::OnResponseContextRemoved(ResponseContext *context) {
+    RecycleTensorParallelCache(context);
     std::lock_guard<std::mutex> guard(historyMutex);
     activeHistory.erase(&context->pastKeyValues);
     auto draft = draftContexts.find(&context->pastKeyValues);

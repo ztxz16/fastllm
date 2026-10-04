@@ -16,6 +16,7 @@
 #include <atomic>
 #include <dlfcn.h>
 static bool failBegin = false, failInstantiate = false;
+static std::atomic<int> captures{0};
 extern "C" bool FastllmCudaGraphInstantiate(void *graph, void **exec) {
     int device = 0;
     cudaGetDevice(&device);
@@ -27,6 +28,7 @@ extern "C" bool FastllmCudaGraphInstantiate(void *graph, void **exec) {
     return fn(graph, exec);
 }
 extern "C" bool FastllmCudaGraphBeginCapture() {
+    ++captures;
     int device = 0;
     cudaGetDevice(&device);
     if (failBegin && device == 3)
@@ -67,6 +69,7 @@ class Fixture : public NaiveN05FlashModel {
                         {"max_position_embeddings", "8192"}};
         InitParams();
         SetSaveHistoryChat(false);
+        maxBatch = 1;
         unsigned seed = 7;
         auto add = [&](std::string name, std::vector<int> dims, DataType type, float scale,
                        bool norm = false) {
@@ -142,6 +145,84 @@ class Fixture : public NaiveN05FlashModel {
                     throw std::runtime_error("cache metadata mismatch");
             }
         }
+        RunRequests(out, graphs);
+    }
+    void RunRequests(std::ofstream &out, bool graphs) {
+        std::vector<void *> previous;
+        int request = 0;
+        auto run = [&](int prompt, bool cancelled, bool queued, bool reuse, bool execute = true) {
+            std::lock_guard<std::mutex> guard(dictLocker);
+            // Let the context dictionary own queued handles, including when a
+            // failed assertion unwinds this fixture and shuts down the model.
+            int pending = queued ? responseContextDict.CreateHandle() : -1;
+            int handle = responseContextDict.CreateHandle();
+            ResponseContext *context = responseContextDict.GetHandle(handle);
+            context->Init(block_cnt, dataType, kvCacheDataType);
+            context->generationConfig.input_token_length = prompt;
+            context->generationConfig.output_token_limit = 16;
+            context->generationConfig.output_logits = true;
+            OnResponseContextCreated(context);
+            auto &kv = context->pastKeyValues;
+            bool restored = kv[0].first.multiDeviceData;
+            if (restored != (graphs && reuse))
+                throw std::runtime_error("unexpected request KV allocation reuse");
+            for (auto &layer : kv)
+                for (Data *root : {&layer.first, &layer.second})
+                    if (!root->dims.empty() || !root->expansionDims.empty())
+                        throw std::runtime_error("fresh request consumes a scheduler slot");
+            if (restored) {
+                size_t i = 0;
+                for (auto &layer : kv)
+                    for (Data *root : {&layer.first, &layer.second})
+                        for (auto &item : root->multiDeviceDatas) {
+                            if (item.second->cudaData != previous.at(i++) || item.second->dims[1] != 0)
+                                throw std::runtime_error("KV ownership or logical length was not reset");
+                        }
+            }
+            const bool expectReplay = restored && !failBegin && !failInstantiate;
+            int beforeCaptures = captures.load(), past = 0;
+            for (int step = 0; execute && step < 7; ++step) {
+                int n = step ? 1 : prompt;
+                std::vector<float> ids(n), positions(n);
+                for (int i = 0; i < n; ++i) {
+                    // Change every request's tokens, including an identical
+                    // allocation shape, to catch accidental prefix reuse.
+                    ids[i] = ((past + i) * 3 + request * 11) % 256;
+                    positions[i] = past + i;
+                }
+                Data input(FLOAT32, {1, n}, ids), pos(FLOAT32, {1, n}, positions);
+                std::vector<float> logits;
+                int before = launches.load();
+                Forward(input, Data(), pos, kv, context->generationConfig, LastTokensManager(), &logits);
+                out.write((const char *)logits.data(), logits.size() * sizeof(float));
+                past += n;
+                if (step == 1 && expectReplay && launches.load() - before != 8)
+                    throw std::runtime_error("second request did not replay on first decode");
+                if (kv[0].first.dims[1] != past || kv[1].first.dims[1] != std::min(past, 7))
+                    throw std::runtime_error("reused cache metadata mismatch");
+            }
+            if (execute && expectReplay && captures.load() != beforeCaptures)
+                throw std::runtime_error("reused request unexpectedly recaptured");
+            previous.clear();
+            for (auto &layer : kv)
+                for (Data *root : {&layer.first, &layer.second})
+                    for (auto &item : root->multiDeviceDatas) previous.push_back(item.second->cudaData);
+            context->isAbort = cancelled;
+            context->isEnding = !cancelled;
+            RemoveResponseContext(handle);
+            if (queued) RemoveResponseContext(pending);
+            std::cout << "request=" << request++ << " prompt=" << prompt << " restored=" << restored
+                      << " captures=" << captures.load() - beforeCaptures << std::endl;
+        };
+        run(80, false, false, false);
+        run(80, true, false, true);   // completed GPU work, cancelled response
+        run(85, false, false, true);  // changed length in the same reservation
+        run(300, false, false, false);
+        run(300, false, false, true);
+        run(300, false, true, false); // queued handle prevents ownership transfer
+        run(300, false, false, false);
+        run(300, true, false, true, false); // abort before any forward
+        run(300, false, false, false);
     }
 };
 int main(int argc, char **argv) {

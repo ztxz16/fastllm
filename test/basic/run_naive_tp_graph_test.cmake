@@ -1,4 +1,7 @@
 file(MAKE_DIRECTORY "${TEST_DIRECTORY}")
+# Six length/boundary cases and eight executed lifecycle requests; each
+# emits seven steps of 256 FP32 logits. The pre-forward abort emits nothing.
+math(EXPR expected_bytes "(6 + 8) * 7 * 256 * 4")
 foreach(mode eager graph failbegin failinstantiate)
     set(output "${TEST_DIRECTORY}/${mode}.bin")
     file(REMOVE "${output}")
@@ -15,8 +18,8 @@ foreach(mode eager graph failbegin failinstantiate)
         message(FATAL_ERROR "Naive TP ${mode} did not write logits")
     endif()
     file(SIZE "${output}" bytes)
-    if (NOT bytes EQUAL 43008)
-        message(FATAL_ERROR "Naive TP ${mode}: expected 43008 logit bytes, got ${bytes}")
+    if (NOT bytes EQUAL expected_bytes)
+        message(FATAL_ERROR "Naive TP ${mode}: expected ${expected_bytes} logit bytes, got ${bytes}")
     endif()
     file(SHA256 "${output}" digest)
     if (mode STREQUAL "eager")

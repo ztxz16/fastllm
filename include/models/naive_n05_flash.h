@@ -99,6 +99,12 @@ namespace fastllm {
         std::map<const std::vector<std::pair<Data, Data>> *, std::shared_ptr<DraftContext>> draftContexts;
 
     private:
+        // Only request lifecycle callbacks (serialized by dictLocker) own this
+        // single idle allocation set. No token contents are reused.
+        std::vector<std::pair<Data, Data>> tpIdleCache;
+        bool CanReuseTensorParallelCache(const ResponseContext *context) const;
+        void RestoreTensorParallelCache(ResponseContext *context);
+        void RecycleTensorParallelCache(ResponseContext *context);
         bool InitTensorParallel();
         void PrepareTensorParallel();
         struct TPDecodeState;
