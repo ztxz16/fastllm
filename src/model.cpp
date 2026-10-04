@@ -3345,6 +3345,10 @@ namespace fastllm {
             const std::string sections = json11::Json(ropeSections).dump();
             AddGGUFDictIfMissing(model, "mrope_section", sections);
             AddGGUFDictIfMissing(model, "rope_parameters.mrope_section", sections);
+            // Qwen3.5's GGUF sections use the interleaved three-axis layout.
+            if (model->model_struct == "qwen3_5") {
+                AddGGUFDictIfMissing(model, "rope_parameters.mrope_interleaved", "true");
+            }
         }
 
         int rotaryDim = GetGGUFArchParam(
@@ -3801,10 +3805,73 @@ namespace fastllm {
         requireShape("mtp.layers.0.mlp.down_proj.weight", {hidden, intermediate});
     }
 
+    static void ValidateDFlashContextExtension(const basellm &model) {
+        // Draft Q/K interact only with draft K inside its local window. Their
+        // RoPE need not match the target's partial M-RoPE/YaRN. Keep the draft
+        // checkpoint frequencies; target verification uses the target plan.
+        auto require = [](bool ok, const std::string &reason) {
+            if (!ok) throw std::invalid_argument("DFlash context extension: " + reason);
+        };
+        auto read = [&](const std::string &key) {
+            auto it = model.weight.dicts.find("dflash." + key);
+            if (it == model.weight.dicts.end()) return json11::Json();
+            std::string error;
+            auto value = json11::Json::parse(it->second, error);
+            return error.empty() ? value : json11::Json(it->second);
+        };
+        auto integer = [&](const std::string &key) {
+            auto value = read(key);
+            require(value.is_number() && value.int_value() > 0 &&
+                        value.number_value() == value.int_value(),
+                    key + " must be a positive integer");
+            return value.int_value();
+        };
+        require(model.model_struct == "qwen3_5", "requires a Qwen3.5 target");
+        const int layers = integer("num_hidden_layers");
+        const int window = integer("sliding_window");
+        require(window <= integer("max_position_embeddings"),
+                "sliding_window exceeds the draft's native context");
+        auto types = read("layer_types");
+        require(types.is_array() && (int)types.array_items().size() == layers,
+                "requires an explicit sliding-attention layout for every draft layer");
+        for (const auto &type : types.array_items()) {
+            require(type.string_value() == "sliding_attention",
+                    "full-attention draft layers are not supported with target YaRN");
+        }
+        auto sliding = read("use_sliding_window");
+        require(sliding.is_null() || (sliding.is_bool() && sliding.bool_value()),
+                "sliding attention must be enabled");
+        for (const std::string &prefix : {"rope_parameters.", "rope_scaling."}) {
+            for (const std::string &key : {"rope_type", "type"}) {
+                auto value = read(prefix + key);
+                require(value.is_null() || value.string_value() == "default",
+                        "only the draft's native default RoPE is supported");
+            }
+            for (const std::string &key : {"factor", "partial_rotary_factor"}) {
+                auto value = read(prefix + key);
+                require(value.is_null() || (value.is_number() && value.number_value() == 1),
+                        "scaled or partial draft RoPE is not supported");
+            }
+            require(read(prefix + "mrope_section").is_null(),
+                    "draft M-RoPE is not supported");
+        }
+        auto partial = read("partial_rotary_factor");
+        require(partial.is_null() || (partial.is_number() && partial.number_value() == 1),
+                "partial draft RoPE is not supported");
+    }
+
     std::unique_ptr<basellm> CreateLLMModelFromGGUFFile(
             const std::string &fileName, const std::string &originalPath,
             const std::string &externalMtpPath,
             const std::string &mmprojPath) {
+        return CreateLLMModelFromGGUFFile(fileName, originalPath, externalMtpPath,
+                                          mmprojPath, {});
+    }
+
+    std::unique_ptr<basellm> CreateLLMModelFromGGUFFile(
+            const std::string &fileName, const std::string &originalPath,
+            const std::string &externalMtpPath, const std::string &mmprojPath,
+            const ContextOptions &contextOptions) {
         std::vector <ReadGGUFTask> readGGUFTasks;
         std::map <std::string, ReadGGUFTask*> readGGUFTaskDict;
         std::unique_ptr<SafeTensors> dflashSafeTensors;
@@ -3823,7 +3890,8 @@ namespace fastllm {
         json11::Json params = config["params"];
         std::string arch = params["general.architecture"].string_value();        
 
-        basellm *model = nullptr; 
+        std::unique_ptr<basellm> modelOwner;
+        basellm *model = nullptr;
         std::string path = originalPath;
         std::vector <std::string> tensors;
         if (path != "") {
@@ -3844,6 +3912,7 @@ namespace fastllm {
             }
             arch = modelType;
             model = CreateModelWithType(modelType);
+            modelOwner.reset(model);
             AddDictRecursion(model, "", config);
             // 设置eos_token_id
             if (config["eos_token_id"].is_null()) {
@@ -3895,6 +3964,7 @@ namespace fastllm {
             printf("general.architecture = %s\n", arch.c_str());
             printf("general.name = %s\n", params["general.name"].string_value().c_str());
             model = CreateLLMModelFromGGUFMetadata(params, arch);
+            modelOwner.reset(model);
             if (!mmprojPath.empty() && model->model_struct == "qwen3_5") {
                 const size_t slash = fileName.find_last_of("/\\");
                 const std::string ggufDir =
@@ -4051,8 +4121,30 @@ namespace fastllm {
         int ggufMtpLayerCount = GetGGUFArchParam(
             params, arch, "nextn_predict_layers").int_value();
 
+        // Preserve the legacy GGUF path unless context options were requested.
+        if (contextOptions.maxLength > 0 || !contextOptions.ropeScaling.empty()) {
+            if (originalPath.empty()) {
+                for (const auto &alias : std::vector<std::pair<std::string, std::string>>{
+                         {"rope_parameters.rope_type", "rope.scaling.type"},
+                         {"rope_parameters.factor", "rope.scaling.factor"},
+                         {"rope_parameters.original_max_position_embeddings", "rope.scaling.original_context_length"}}) {
+                    auto value = GetGGUFArchParam(params, arch, alias.second);
+                    if (!value.is_null()) {
+                        model->weight.AddDict(alias.first, GGUFJsonToDictValue(value));
+                    }
+                }
+            }
+            model->ConfigureContext(contextOptions);
+            if (model->YarnConfig() && !dflashPath.empty()) {
+                ValidateDFlashContextExtension(*model);
+            }
+        }
+
         // 3.0 更新模型信息
         model->InitParams();
+        if (model->contextPlan.configured) {
+            model->max_positions = model->contextPlan.effectiveLength;
+        }
         if (externalMtpSafeTensors != nullptr) {
             ValidateExternalMtpCheckpoint(
                 model, externalMtpTextConfig, *externalMtpSafeTensors);
@@ -4581,7 +4673,7 @@ namespace fastllm {
         printf("\n");
         fflush(stdout);
 
-        return std::unique_ptr<fastllm::basellm> (model);
+        return modelOwner;
     }
 
     std::unique_ptr<fastllm::basellm> CreateLLMModelFromFile(const std::string &fileName) {
@@ -4870,8 +4962,11 @@ namespace fastllm {
 
         // 4.0 更新模型信息
         model->ConfigureContext(contextOptions);
-        if (model->YarnConfig() && (!dsparkPath.empty() || !dflashPath.empty())) {
-            throw std::invalid_argument("Context extension with an external DSpark/DFlash draft is not implemented; disable the external draft.");
+        if (model->YarnConfig() && !dsparkPath.empty()) {
+            throw std::invalid_argument("Context extension with an external DSpark draft is not implemented; disable the external draft.");
+        }
+        if (model->YarnConfig() && !dflashPath.empty()) {
+            ValidateDFlashContextExtension(*model);
         }
         // 记录模型目录，供需要自行读取超大张量的模型（如 DeepSeek-V4.1 Engram 表）使用
         model->weight.AddDict("model_directory", path);

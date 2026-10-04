@@ -62,9 +62,9 @@ print(model.context_config)
 | Qwen3.5 dense/MoE，以及使用该架构的 Qwen3.8 | partial rotary、交错三轴 M-RoPE、TP、内置 MTP、融合 decode | Qwen3.5-2B、Qwen3.8-27B-FP8；不据此声明所有 MoE checkpoint 均完成实测 |
 | 其他模型 | 无新参数时沿用原路径；不开放新的 RoPE 扩展 | 需要模型适配和相应路径验证 |
 
-新 RoPE 扩展入口目前仅接入 **HF 模型目录**。GGUF、FLM、自定义 GraphLLM 的 CLI 仅设置 `--max_context_length` 时保留旧的限长路径：可以缩小，超过模型窗口时仍取原上限，warmup 后保留原窗口和用户限长的元数据。它们显式设置 `--rope_scaling` 时仍会报不支持。Python 的新构造参数要求 HF 目录；其他格式继续使用旧长度 setter。上下文扩展不会额外增加某模型对 FP4、MTP 或其他后端的支持。
+新 RoPE 扩展入口接入 **HF 模型目录和 GGUF 文件**，仍受上表的模型布局限制。GGUF 显式传入 `--rope_scaling` 时，在 `InitParams` 前应用公共配置；读取 GGUF 的窗口、theta、旋转维度、scaling 元数据和 Qwen3.5 交错 sections，原生加载路径保持不变。GGUF、FLM、自定义 GraphLLM 的 CLI 仅设置 `--max_context_length` 时保留旧的限长路径：可以缩小，超过模型窗口时仍取原上限。FLM 和自定义 GraphLLM 显式设置 `--rope_scaling` 仍会报不支持。Python 的新构造参数支持 HF 目录和 GGUF；其他格式继续使用旧长度 setter。上下文扩展不会额外增加某模型对 FP4、MTP 或其他后端的支持。
 
-本期开放 default、linear 与静态 YaRN。linear 扩大声明窗口同样需要明确原始长度。已有 dynamic NTK 在没有 RoPE 覆盖且没有扩大声明窗口时保留原路径，不开放新的动态扩展。外部 DSpark/DFlash draft 尚未验证扩展后的 RoPE 一致性，YaRN 与这些外部 draft 同时配置时拒绝启动。
+本期开放 default、linear 与静态 YaRN。linear 扩大声明窗口同样需要明确原始长度。已有 dynamic NTK 在没有 RoPE 覆盖且没有扩大声明窗口时保留原路径，不开放新的动态扩展。外部 DSpark 与 YaRN 同用仍拒绝启动。Qwen3.5 的 DFlash2 可保留独立的原生 default RoPE 与目标 YaRN 同用，但草稿必须显式声明所有层均为滑窗注意力，窗口不超过其原生长度，且不使用缩放、partial rotary 或 M-RoPE。HF/GGUF 两个加载入口执行同一项检查。该组合不承诺短上下文相同的草稿接受率；主模型与草稿分别使用自己的旋转配置。
 
 | HF 新入口的输入 | 行为 |
 | --- | --- |
@@ -86,9 +86,9 @@ print(model.context_config)
 - `RopeConfig`：归一后的 theta、factor、原始长度、旋转维度、YaRN beta 区间、幅度和三轴 sections。
 - `ContextPlan`：模型声明长度、用户目标、最终有效窗口及 RoPE 参数。模型实例持有，多个模型不共享可变配置。
 
-HF loader 在 `InitParams` **之前**调用 `ConfigureContext`，避免先按旧窗口分配资源再重建模型。模型的 `InitContextParams` 将计划应用到自身旋转参数；C API 保留旧入口，增加带 context options 的入口和已解析配置查询，错误不会跨 ctypes 直接抛出。
+HF loader 和显式配置上下文的 GGUF loader 在 `InitParams` **之前**调用 `ConfigureContext`，避免先按旧窗口分配资源再重建模型。模型的 `InitContextParams` 将计划应用到自身旋转参数；C API 保留旧入口，增加带 context options 的入口和已解析配置查询，错误不会跨 ctypes 直接抛出。
 
-HF loader 通过 RAII 管理初始化中的模型和 LoRA 资源；CLI/服务公共工厂在 warmup 或容量检查失败时释放已加载模型，避免重试启动遗留权重。直接使用 Python `llm.model` 的调用方仍负责在失败或使用结束后调用 `release_memory()`。
+HF/GGUF loader 通过 RAII 管理初始化中的模型，HF loader 还管理 LoRA 资源；CLI/服务公共工厂在 warmup 或容量检查失败时释放已加载模型，避免重试启动遗留权重。直接使用 Python `llm.model` 的调用方仍负责在失败或使用结束后调用 `release_memory()`。
 
 解析器区分顶层与 `text_config`，归一 `rope_parameters`、旧 `rope_scaling` 及 `type` 别名；不修改视觉编码器配置。新旧字段冲突必须显式覆盖消解。跨算法切换仅保留 theta 和布局等兼容字段，不继承旧算法的专属参数。当前接受裸单组配置及 `{"full_attention": {...}}` 的单组覆盖；**尚未实现多个 RoPE 组同时持有不同计划**，不能把此语法当成已支持 Laguna 的 full/sliding 多组布局。
 

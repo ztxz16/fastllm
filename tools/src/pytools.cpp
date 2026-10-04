@@ -496,6 +496,29 @@ extern "C" {
         return -1;
     }
 
+    DLL_EXPORT int create_llm_model_from_gguf_with_context(
+            char *path, char *oriPath, char *mtpPath, char *mmprojPath,
+            int maxLength, char *ropeScaling) {
+        fastllmPytoolsContextResult.clear();
+        try {
+            std::lock_guard<std::mutex> guard(models.locker);
+            auto model = fastllm::CreateLLMModelFromGGUFFile(
+                path, oriPath, mtpPath == nullptr ? "" : mtpPath,
+                mmprojPath == nullptr ? "" : mmprojPath,
+                {maxLength, ropeScaling == nullptr ? "" : ropeScaling});
+            int id = models.models.size();
+            models.models[id] = std::move(model);
+            return id;
+        } catch (const std::exception &error) {
+            fastllmPytoolsContextResult = error.what();
+        } catch (const char *error) {
+            fastllmPytoolsContextResult = error == nullptr ? "unknown model initialization error" : error;
+        } catch (...) {
+            fastllmPytoolsContextResult = "unknown model initialization error";
+        }
+        return -1;
+    }
+
     DLL_EXPORT int create_llm_model_from_gguf(char *path, char *oriPath) {
         models.locker.lock();
         int id = models.models.size();

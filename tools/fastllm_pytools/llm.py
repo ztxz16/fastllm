@@ -368,6 +368,12 @@ fastllm_lib.create_llm_model_fromhf_with_config.restype = ctypes.c_int
 fastllm_lib.create_llm_model_from_gguf.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
 fastllm_lib.create_llm_model_from_gguf.restype = ctypes.c_int
 
+if hasattr(fastllm_lib, "create_llm_model_from_gguf_with_context"):
+    fastllm_lib.create_llm_model_from_gguf_with_context.argtypes = [
+        ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
+        ctypes.c_int, ctypes.c_char_p]
+    fastllm_lib.create_llm_model_from_gguf_with_context.restype = ctypes.c_int
+
 if hasattr(fastllm_lib, "create_llm_model_from_gguf_with_mtp"):
     fastllm_lib.create_llm_model_from_gguf_with_mtp.argtypes = [
         ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
@@ -1275,9 +1281,13 @@ class model:
         if not isinstance(rope_scaling, str):
             raise ValueError("rope_scaling must be yarn or a JSON object")
         context_requested = max_context_length > 0 or bool(rope_scaling)
-        if context_requested and (id != -99999 or graph is not None or model_json or not os.path.isdir(path)):
-            raise ValueError("Context options currently require a Hugging Face model directory")
-        if context_requested and not hasattr(fastllm_lib, "create_llm_model_fromhf_with_context"):
+        is_gguf = os.path.isfile(path) and str(path).lower().endswith(".gguf")
+        if context_requested and (id != -99999 or graph is not None or model_json or
+                                  not (os.path.isdir(path) or is_gguf)):
+            raise ValueError("Context options require a Hugging Face model directory or GGUF file")
+        context_loader = ("create_llm_model_from_gguf_with_context" if is_gguf else
+                          "create_llm_model_fromhf_with_context")
+        if context_requested and not hasattr(fastllm_lib, context_loader):
             raise RuntimeError("The native FastLLM library must be rebuilt to support context options")
         self.context_config = None
         if (graph != None):
@@ -1368,7 +1378,16 @@ class model:
                 if external_mtp_path and mmproj_path:
                     raise ValueError(
                         "external MTP and mmproj cannot be used together")
-                if external_mtp_path:
+                if context_requested:
+                    self.model = fastllm_lib.create_llm_model_from_gguf_with_context(
+                        path.encode(), ori_model_path.encode(),
+                        external_mtp_path.encode(), mmproj_path.encode(),
+                        max_context_length, rope_scaling.encode())
+                    if self.model < 0:
+                        raise ValueError(fastllm_lib.get_llm_context_result().decode("utf-8", errors="replace"))
+                    if mmproj_path:
+                        self.mmproj_path = mmproj_path
+                elif external_mtp_path:
                     if not hasattr(fastllm_lib, "create_llm_model_from_gguf_with_mtp"):
                         raise RuntimeError(
                             "the loaded FastLLM library does not support "

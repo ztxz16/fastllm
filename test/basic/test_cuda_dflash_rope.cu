@@ -165,13 +165,16 @@ int main() {
         }
         FastllmCudaSetDevice(0);Executor executor;SetCurrentThreadExecutor(&executor);executor.SetFirstDevice("cuda:0");
         for(float theta:{10000.f,10000000.f}) {
-            for(int position:{0,4093,65528,65535,65536,131065,203940,262128}) {
+            for(int position:{0,4093,65528,65535,65536,131065,203940,262128,524280,999984,1000000}) {
                 for(int tokens=1;tokens<=16;++tokens) {Qkv(tokens,position,theta);Kv(tokens,position,theta);}
                 for(int dim:{64,128,256})for(DataType type:{FLOAT32,FLOAT16,BFLOAT16})for(int tokens:{1,3,8,16})Fallback(tokens,dim,position,theta,type);
             }
-            for(int tokens:{32,127,1024})for(int position:{4090,65500,203000}) {Qkv(tokens,position,theta);Kv(tokens,position,theta);}
+            for(int tokens:{32,127,1024})for(int position:{4090,65500,203000,998976}) {Qkv(tokens,position,theta);Kv(tokens,position,theta);}
         }
         for(int tokens:{1,2,7,8,16}) {Qkv(tokens,65532,10000000.f,true);Kv(tokens,65532,10000000.f,5,true);}
+        // Reuse the captured graph with million-token positions, without a
+        // position table allocation or changing the inverse-frequency pointer.
+        for(int tokens:{1,7,8,16}) {Qkv(tokens,934448,10000000.f,true);Kv(tokens,934448,10000000.f,5,true);}
         Kv(8,65535,10000000.f,1);Kv(8,203940,10000000.f,7);
         for(int tokens:{1,8,1024}) {Qkv(tokens,65535,10000000.f,false,true);Kv(tokens,65535,10000000.f,5,false,true);}
         Data invalid(FLOAT32),positions,inv;
