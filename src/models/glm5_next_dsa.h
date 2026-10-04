@@ -99,10 +99,51 @@ inline void AppendIndexerKeys(Glm5NextIndexerCache &cache,
     cache.tokens += sequence;
 }
 
+struct DsaProjections {
+    Data keys, gates, query, headWeights;
+};
+
+// Stateless projections can share weight loads across independent requests.
+// Pooling, rotation/scoring, and page tables retain their request-local cache.
+inline void ProjectDsaKeys(Data &input, WeightMap &weight,
+        const std::string &prefix, DsaProjections &projected) {
+    const int sequence = input.Count(0) / input.dims.back();
+    Data key, keyFloat;
+    Linear(input, weight[prefix + "wk.weight"], Data(), key);
+    ToDataType(key, keyFloat, DataType::FLOAT32);
+    auto &gamma = weight[prefix + "k_norm.weight"];
+    auto &beta = weight[prefix + "k_norm.bias"];
+    gamma.ToDevice(input.dataDevice, input.dataDeviceIds);
+    beta.ToDevice(input.dataDevice, input.dataDeviceIds);
+    auto &normalized = projected.keys;
+    normalized.dataType = DataType::FLOAT32;
+    normalized.Resize(keyFloat.dims);
+    normalized.ToDevice(input.dataDevice, input.dataDeviceIds, false);
+    normalized.Allocate(false);
+    AssertInFastLLM(FastllmCudaLayerNormWithEpsilon(
+        keyFloat, gamma, beta, normalized, 1e-6f), "GLM DSA LayerNorm failed.");
+    ToDataType(normalized, DataType::BFLOAT16);
+    normalized.Reshape({1, sequence, 128});
+    Linear(input, weight[prefix + "index_kpool_compress_gate"], Data(), projected.gates);
+    projected.gates.Reshape(normalized.dims);
+}
+
+inline void ProjectDsaQueries(Data &input, Data &qNormalized, WeightMap &weight,
+        const std::string &prefix, DsaProjections &projected) {
+    const int sequence = input.Count(0) / input.dims.back();
+    Linear(qNormalized, weight[prefix + "wq_b.weight"], Data(), projected.query);
+    projected.query.Reshape({1, sequence, 32, 128});
+    Data floatInput;
+    ToDataType(input, floatInput, DataType::FLOAT32);
+    Linear(floatInput, weight[prefix + "weights_proj.weight"], Data(), projected.headWeights);
+    Mul(projected.headWeights, 1.0f / std::sqrt(32.0f), projected.headWeights);
+    Mul(projected.headWeights, 1.0f / std::sqrt(128.0f), projected.headWeights);
+}
+
 inline void BuildDsaIndices(Data &input, Data &qNormalized,
         WeightMap &weight, const std::string &prefix, int past, int topK,
         Glm5NextIndexerCache &cache, Data &indices,
-        const Data *pagedCache = nullptr) {
+        const Data *pagedCache = nullptr, DsaProjections *projected = nullptr) {
     AssertInFastLLM(input.dataDevice == DataDevice::CUDA &&
         input.dataType == DataType::BFLOAT16 && topK == 2048,
         "GLM DSA currently requires CUDA BF16 and Top-2048.");
@@ -114,35 +155,20 @@ inline void BuildDsaIndices(Data &input, Data &qNormalized,
     }
     AssertInFastLLM(cache.tokens == past, "GLM DSA Indexer cache is out of sync.");
     const int sequence = input.Count(0) / input.dims.back();
-    Data key, keyFloat, normalized, gates;
-    Linear(input, weight[prefix + "wk.weight"], Data(), key);
-    ToDataType(key, keyFloat, DataType::FLOAT32);
-    auto &gamma = weight[prefix + "k_norm.weight"];
-    auto &beta = weight[prefix + "k_norm.bias"];
-    gamma.ToDevice(input.dataDevice, input.dataDeviceIds);
-    beta.ToDevice(input.dataDevice, input.dataDeviceIds);
-    normalized.dataType = DataType::FLOAT32;
-    normalized.Resize(keyFloat.dims);
-    normalized.ToDevice(input.dataDevice, input.dataDeviceIds, false);
-    normalized.Allocate(false);
-    AssertInFastLLM(FastllmCudaLayerNormWithEpsilon(
-        keyFloat, gamma, beta, normalized, 1e-6f), "GLM DSA LayerNorm failed.");
-    ToDataType(normalized, DataType::BFLOAT16);
-    normalized.Reshape({1, sequence, 128});
-    Linear(input, weight[prefix + "index_kpool_compress_gate"], Data(), gates);
-    gates.Reshape(normalized.dims);
-    AppendIndexerKeys(cache, normalized, gates,
+    DsaProjections local;
+    if (projected == nullptr) {
+        ProjectDsaKeys(input, weight, prefix, local);
+        projected = &local;
+    }
+    AppendIndexerKeys(cache, projected->keys, projected->gates,
         weight[prefix + "index_kpool_compress_ape"]);
     if (past + sequence <= topK) return;
-
-    Data query, quantized, floatInput, headWeights, scores, groups;
-    Linear(qNormalized, weight[prefix + "wq_b.weight"], Data(), query);
-    query.Reshape({1, sequence, 32, 128});
-    RotateAndQuantizeIndexer(query, cache.hadamard, quantized);
-    ToDataType(input, floatInput, DataType::FLOAT32);
-    Linear(floatInput, weight[prefix + "weights_proj.weight"], Data(), headWeights);
-    Mul(headWeights, 1.0f / std::sqrt(32.0f), headWeights);
-    Mul(headWeights, 1.0f / std::sqrt(128.0f), headWeights);
+    if (projected == &local) ProjectDsaQueries(input, qNormalized, weight, prefix, local);
+    AssertInFastLLM(!projected->query.dims.empty() && !projected->headWeights.dims.empty(),
+        "GLM DSA query projections are missing.");
+    Data quantized, scores, groups;
+    RotateAndQuantizeIndexer(projected->query, cache.hadamard, quantized);
+    auto &headWeights = projected->headWeights;
     AssertInFastLLM(FastllmCudaDeepSeekV41IndexerScore(
         quantized, headWeights, cache.keys, 4, past, scores),
         "GLM DSA Indexer scoring failed.");

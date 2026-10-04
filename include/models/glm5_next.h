@@ -60,6 +60,16 @@ namespace fastllm {
                 const LastTokensManager &lastTokens = LastTokensManager(),
                 std::vector<float> *logits = nullptr) override;
 
+        std::vector<int> ForwardBatch(
+                int batch, const Data &inputIds,
+                const std::vector<Data*> &attentionMasks,
+                const std::vector<Data*> &positionIds,
+                const std::vector<int> &seqLens,
+                std::vector<std::pair<Data*, Data*>> &pastKeyValues,
+                const std::vector<GenerationConfig> &generationConfigs,
+                const LastTokensManager &lastTokens = LastTokensManager(),
+                std::vector<std::vector<float>*> *logits = nullptr) override;
+
         bool NeedAttentionMask(int qlen, int klen) override;
 
         bool TryForwardChunkedPrefill(
@@ -150,7 +160,8 @@ namespace fastllm {
 
         void ForwardLayers(
                 Data &hiddenStates, int firstLayer, int endLayer,
-                std::vector<std::pair<Data, Data>> &pastKeyValues,
+                const std::vector<std::vector<std::pair<Data, Data>>*>
+                    &requestCaches,
                 std::vector<KdaReplayCapture> *kdaReplay = nullptr,
                 std::vector<Glm5NextIndexerCache> *indexer = nullptr);
 
@@ -218,7 +229,7 @@ namespace fastllm {
 
         void RunKdaAttention(
                 int layerIndex, Data &input, int sequence,
-                std::vector<std::pair<Data, Data>> &pastKeyValues,
+                const std::vector<std::vector<std::pair<Data, Data>>*> &requestCaches,
                 Data &output,
                 KdaReplayCapture *replayCapture = nullptr);
 
@@ -229,7 +240,7 @@ namespace fastllm {
 
         void RunCompressedMlaAttention(
                 int layerIndex, Data &input, int sequence,
-                std::vector<std::pair<Data, Data>> &pastKeyValues,
+                const std::vector<std::vector<std::pair<Data, Data>>*> &requestCaches,
                 Data &output, Glm5NextIndexerCache *indexer = nullptr);
 
         void RunExpandedSparseAttention(
@@ -252,6 +263,12 @@ namespace fastllm {
 
         int Sample(
                 Data &hiddenStates,
+                const GenerationConfig &generationConfig,
+                const LastTokensManager &lastTokens,
+                std::vector<float> *logits);
+
+        int SampleLogits(
+                Data &outputLogits,
                 const GenerationConfig &generationConfig,
                 const LastTokensManager &lastTokens,
                 std::vector<float> *logits);
