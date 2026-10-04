@@ -29,7 +29,7 @@ static void Init(Data &data, const std::vector<int> &shape,
             ((uint16_t *)data.cpuData)[i] = bits >> 16;
         }
     }
-    data.ToDevice(DataDevice::CUDA, {0}, true);
+    data.ToDevice(DataDevice::CUDA, {FastllmCudaGetDevice()}, true);
 }
 
 static std::vector<float> Read(const Data &data) {
@@ -123,6 +123,100 @@ static void Run(int batch, int keyHeads, int valueHeads, int sequence,
                 outputError, stateError);
 }
 
+static std::vector<uint16_t> ReadHalf(const Data &data) {
+    std::vector<uint16_t> values(data.Count(0));
+    Require(cudaMemcpy(values.data(), data.cudaData, values.size() * sizeof(uint16_t),
+                       cudaMemcpyDeviceToHost) == cudaSuccess, "GDN half copy failed");
+    return values;
+}
+
+static void RunFusedOutput(int batch, int keyHeads, int valueHeads,
+                           bool tiled, bool graph) {
+    const int channels = (2 * keyHeads + valueHeads) * 128;
+    std::vector<float> x(batch * channels), initial(batch * valueHeads * 128 * 128);
+    std::vector<float> a(batch * valueHeads), beta(a.size()), z(a.size() * 128);
+    std::vector<float> log(valueHeads), bias(valueHeads), norm(128);
+    for (size_t i = 0; i < x.size(); ++i) x[i] = std::sin(i * 1.37f) * .13f;
+    for (size_t i = 0; i < initial.size(); ++i) initial[i] = std::cos(i * .73f) * .02f;
+    for (size_t i = 0; i < a.size(); ++i) {
+        a[i] = (int(i % 17) - 8) / 8.f;
+        beta[i] = (int(i % 13) - 6) / 7.f;
+    }
+    for (size_t i = 0; i < z.size(); ++i) z[i] = std::sin(i * .731f) * 2.f;
+    for (int i = 0; i < valueHeads; ++i) {
+        log[i] = (i % 5 - 2) * .17f;
+        bias[i] = (i % 7 - 3) * .11f;
+    }
+    for (int i = 0; i < 128; ++i) norm[i] = 1.f + std::sin(i * .13f) * .1f;
+    Data q(FLOAT32), alpha(FLOAT16), b(FLOAT16), alog(FLOAT32), dt(FLOAT32);
+    Data st(FLOAT32), referenceState(FLOAT32), core(FLOAT32), gate(FLOAT16);
+    Data nw(FLOAT32), out(FLOAT16), reference(FLOAT16);
+    Init(q, {batch, 1, channels}, x);
+    Init(alpha, {batch, 1, valueHeads}, a); Init(b, alpha.dims, beta);
+    Init(alog, {valueHeads}, log); Init(dt, {valueHeads}, bias);
+    Init(st, {batch, valueHeads, 128, 128}, initial);
+    Init(referenceState, st.dims, initial);
+    Init(core, {batch * valueHeads, 128}, std::vector<float>(z.size()));
+    Init(gate, core.dims, z); Init(nw, {128}, norm);
+    Init(reference, core.dims, std::vector<float>(z.size()));
+    Init(out, {batch, 1, valueHeads * 128}, std::vector<float>(z.size(), -9.f));
+    auto fused = [&]() {
+        return FastllmCudaQwen4GatedDeltaRuleDecodeOutput(q, alpha, b, alog, dt,
+            nw, gate, st, out, keyHeads, valueHeads, 1e-6f, 1e-6f, tiled);
+    };
+    // Failed preconditions must leave the recurrent state available to fallback.
+    Require(!FastllmCudaQwen4GatedDeltaRuleDecodeOutput(q, alpha, b, alog, dt,
+        nw, gate, st, out, keyHeads, valueHeads, 1e-6f, 0.f, tiled),
+        "fused GDN accepted invalid epsilon");
+    Require(!FastllmCudaQwen4GatedDeltaRuleDecodeOutput(q, alpha, b, alog, dt,
+        nw, gate, st, gate, keyHeads, valueHeads, 1e-6f, 1e-6f, tiled),
+        "fused GDN accepted aliased gate/output");
+    const auto rejectedState = Read(st);
+    Require(std::memcmp(rejectedState.data(), initial.data(),
+                        initial.size() * sizeof(float)) == 0,
+            "rejected fused GDN modified state");
+    cudaGraph_t captured = nullptr;
+    cudaGraphExec_t executable = nullptr;
+    if (graph) {
+        Require(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal)
+                == cudaSuccess, "GDN graph capture start failed");
+        Require(fused(), "GDN graph fused call rejected");
+        Require(cudaStreamEndCapture(cudaStreamPerThread, &captured) == cudaSuccess,
+                "GDN graph capture end failed");
+        Require(cudaGraphInstantiateWithFlags(&executable, captured, 0)
+                == cudaSuccess, "GDN graph instantiate failed");
+    }
+    for (int token = 0; token < 32; ++token) {
+        Require(FastllmCudaQwen4GatedDeltaRuleDecode(q, alpha, b, alog, dt,
+            referenceState, core, keyHeads, valueHeads, 128, 128, 1e-6f),
+            "reference GDN rejected");
+        Require(FastllmCudaQwen4GdnOutputGateExact(core, nw, gate, reference, 1e-6f),
+                "reference GDN gate rejected");
+        if (graph) Require(cudaGraphLaunch(executable, cudaStreamPerThread) == cudaSuccess,
+                           "GDN graph launch failed");
+        else Require(fused(), "fused GDN rejected");
+        const auto grouped = ReadHalf(reference);
+        std::vector<uint16_t> expected(grouped.size());
+        const int perKey = valueHeads / keyHeads;
+        for (int item = 0; item < batch; ++item)
+            for (int head = 0; head < valueHeads; ++head) {
+                const int destination = tiled
+                    ? (head % perKey) * keyHeads + head / perKey : head;
+                std::copy_n(grouped.data() + (item * valueHeads + head) * 128, 128,
+                            expected.data() + (item * valueHeads + destination) * 128);
+            }
+        Require(ReadHalf(out) == expected, "fused GDN output/layout differs bitwise");
+        const auto actualState = Read(st), expectedState = Read(referenceState);
+        Require(std::memcmp(actualState.data(), expectedState.data(),
+                            actualState.size() * sizeof(float)) == 0,
+                "fused GDN state differs bitwise");
+    }
+    if (executable) cudaGraphExecDestroy(executable);
+    if (captured) cudaGraphDestroy(captured);
+    std::printf("FUSED_PASS device=%d batch=%d key_heads=%d value_heads=%d tiled=%d graph=%d steps=32 state_exact=1 output_exact=1\n",
+                FastllmCudaGetDevice(), batch, keyHeads, valueHeads, tiled, graph);
+}
+
 int main() {
     try {
         if (FastllmCudaGetDeviceCount() < 1) return 77;
@@ -133,6 +227,18 @@ int main() {
                     Run(sequence % 2 + 1, 4, 12, sequence, dtype, outOfPlace);
         Run(1, 16, 48, 5, FLOAT16, true);
         Run(8, 8, 32, 5, FLOAT32, false);
+        for (bool tiled : {false, true})
+            for (bool graph : {false, true}) {
+                RunFusedOutput(1, 16, 48, tiled, graph);
+                RunFusedOutput(2, 8, 24, tiled, graph);
+            }
+        if (FastllmCudaGetDeviceCount() >= 2) {
+            // Exercise the actual second device with the per-rank TP shape.
+            FastllmCudaSetDevice(1);
+            RunFusedOutput(1, 8, 24, false, false);
+            RunFusedOutput(1, 8, 24, true, true);
+            FastllmCudaSetDevice(0);
+        }
     } catch (const std::exception &e) {
         std::fprintf(stderr, "%s\n", e.what());
         return 1;

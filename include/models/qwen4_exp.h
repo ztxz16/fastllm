@@ -320,6 +320,7 @@ namespace fastllm {
         bool ggufWeightsRestored = false;
         void RestoreGgufWeights();
         void RestoreGdnOutputWeight(Data &weight, int tpSize);
+        bool GdnOutputUsesTiledLayout(const Data &projection) const;
         void RunGdnOutputProjection(Data &input, Data &weight, Data &output);
         std::atomic<int> mtpWeightsStatus{-1};
         std::mutex prepareMutex;

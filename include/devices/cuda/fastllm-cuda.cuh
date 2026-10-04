@@ -798,6 +798,16 @@ bool FastllmCudaQwen4GatedDeltaRuleDecode(
     fastllm::Data &state, fastllm::Data &output,
     int keyHeads, int valueHeads, int keyDim, int valueDim,
     float recurrentEps, fastllm::Data *stateOutput = nullptr);
+// Single-token FP16 decode with the exact output norm/gate in the same kernel.
+// tiledOutput writes the local GGUF [value-within-group, key-head] layout.
+// Unsupported inputs return false before modifying recurrent state.
+bool FastllmCudaQwen4GatedDeltaRuleDecodeOutput(
+        const fastllm::Data &qkv, const fastllm::Data &alpha,
+        const fastllm::Data &beta, const fastllm::Data &aLog,
+        const fastllm::Data &dtBias, const fastllm::Data &normWeight,
+        const fastllm::Data &gate, fastllm::Data &state,
+        fastllm::Data &output, int keyHeads, int valueHeads,
+        float recurrentEps, float normEps, bool tiledOutput);
 // Exact verifier tail for Qwen4 GDN: FP32->FP16 (round-to-zero), RMSNorm,
 // FP16 sigmoid and FP16 multiply retain the same boundaries as the four
 // standard operations while sharing one launch. Unsupported layouts return

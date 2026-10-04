@@ -3035,10 +3035,14 @@ namespace fastllm {
         }
     }
 
-    void Qwen4ExpModel::RunGdnOutputProjection(Data &input, Data &projection, Data &output) {
+    bool Qwen4ExpModel::GdnOutputUsesTiledLayout(const Data &projection) const {
         const auto architecture = weight.dicts.find("gguf_architecture");
-        if (architecture != weight.dicts.end() && architecture->second == "qwen4exp" &&
-            projection.isGGUFData && projection.dataType == DataType::DATA_GGUF_FORMAT) {
+        return architecture != weight.dicts.end() && architecture->second == "qwen4exp" &&
+               projection.isGGUFData && projection.dataType == DataType::DATA_GGUF_FORMAT;
+    }
+
+    void Qwen4ExpModel::RunGdnOutputProjection(Data &input, Data &projection, Data &output) {
+        if (GdnOutputUsesTiledLayout(projection)) {
             const std::vector<int> dims = input.dims;
             Data grouped, tiled;
             grouped.FakeFrom(input, 0);
@@ -6275,10 +6279,32 @@ namespace fastllm {
 
         // Decode is dominated by the many small Q/K normalization, head
         // repeat, recurrent-state and output-gate launches.  Keep the state in
-        // float32 as required by the checkpoint.  Fuse the state transition,
-        // then reuse the standard output RMSNorm/gate operations so their
-        // established fp16 rounding semantics remain bit-identical.
+        // float32 as required by the checkpoint. Single-token FP16 decode
+        // also fuses the output norm/gate and its optional GGUF head layout,
+        // retaining the established rounding boundaries.
         if (fusedDecode || sequentialMtpDecode) {
+#ifdef USE_CUDA
+            if (fusedDecode && this->dataType == DataType::FLOAT16 &&
+                currentConvolved.dataDevice == DataDevice::CUDA &&
+                this->head_k_dim == 128 && this->head_v_dim == 128) {
+                Qwen4CudaDeviceGuard deviceGuard(currentConvolved.dataDeviceIds);
+                Data gated;
+                Data &projection = this->weight[linear + "out_proj.weight"];
+                if (Qwen4PrepareCudaWorkspaceOnCurrentDevice(gated, DataType::FLOAT16,
+                        {batch, sequence, this->num_v_heads * this->head_v_dim},
+                        FastllmCudaGetDevice()) &&
+                    FastllmCudaQwen4GatedDeltaRuleDecodeOutput(
+                        currentConvolved, alpha, beta,
+                        this->weight[linear + "A_log"], this->weight[linear + "dt_bias"],
+                        this->weight[linear + "norm.weight"], z, pastRecurrent, gated,
+                        this->num_k_heads, this->num_v_heads, 1e-6f,
+                        this->rms_norm_eps, GdnOutputUsesTiledLayout(projection))) {
+                    Linear(gated, projection, Data(), output);
+                    ThreadTpAllReduce(output);
+                    return;
+                }
+            }
+#endif
             Data core;
             if (fusedDecode) {
                 fastllm::GatedDeltaRuleDecode(

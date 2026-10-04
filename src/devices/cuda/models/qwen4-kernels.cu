@@ -1092,13 +1092,19 @@ namespace {
         }
     }
 
-    template <typename T, bool OUT_OF_PLACE_STATE>
+    __device__ __forceinline__ void Qwen4GdnOutputGateExactDevice(
+            const float *input, const float *weight, const half *gate,
+            half *output, float eps);
+
+    template <typename T, bool OUT_OF_PLACE_STATE, bool FUSE_OUTPUT = false>
     __global__ __launch_bounds__(128) void Qwen4GatedDeltaRuleDecodeKernel(
             const float *qkv, const T *alpha, const T *beta,
             const float *aLog, const float *dtBias, float *state,
             float *stateOutput, float *output,
             int keyHeads, int valueHeads,
-            int sequence, float recurrentEps, float inverseHead) {
+            int sequence, float recurrentEps, float inverseHead,
+            const float *normWeight = nullptr, const half *outputGate = nullptr,
+            float outputNormEps = 0.0f, bool tiledOutput = false) {
         constexpr int KEY_DIM = 128;
         constexpr int VALUE_DIM = 128;
         const int item = blockIdx.x;
@@ -1115,6 +1121,7 @@ namespace {
                 (uint64_t)item * KEY_DIM * VALUE_DIM;
         }
 
+        __shared__ __align__(8) float fusedCore[FUSE_OUTPUT ? VALUE_DIM : 1];
         __shared__ float queryNorm[KEY_DIM];
         __shared__ float keyNorm[KEY_DIM];
         __shared__ float normScales[2];
@@ -1219,8 +1226,24 @@ namespace {
                 headNextState[stateIndex] = updated;
                 core += updated * queryNorm[keyChannel];
             }
-            output[(row * valueHeads + valueHead) * VALUE_DIM + tid] =
-                core;
+            if constexpr (FUSE_OUTPUT) {
+                // Keep the FP32 core on chip, then apply the same FP16
+                // rounding boundaries as the standalone output-gate kernel.
+                fusedCore[tid] = core;
+                __syncthreads();
+                if (tid < 32) {
+                    const int outputHead = tiledOutput
+                        ? (valueHead % repeat) * keyHeads + keyHead
+                        : valueHead;
+                    Qwen4GdnOutputGateExactDevice(
+                        fusedCore, normWeight,
+                        outputGate + (row * valueHeads + valueHead) * VALUE_DIM,
+                        (half*)output + (row * valueHeads + outputHead) * VALUE_DIM,
+                        outputNormEps);
+                }
+            } else {
+                output[(row * valueHeads + valueHead) * VALUE_DIM + tid] = core;
+            }
             __syncthreads();
         }
     }
@@ -1380,15 +1403,11 @@ namespace {
     //   FP32 core -> FP16(rz) -> RMSNorm(FP16, 128) -> Sigmoid(FP16) -> Mul(FP16).
     // One warp evaluates the same two legacy warp reductions independently
     // and combines them in the same order as FastllmRMSNormHalf128ExactKernel.
-    __global__ __launch_bounds__(32) void Qwen4GdnOutputGateExactKernel(
+    __device__ __forceinline__ void Qwen4GdnOutputGateExactDevice(
             const float *input, const float *weight, const half *gate,
             half *output, float eps) {
         constexpr int CHANNELS = 128;
-        const int row = blockIdx.x;
-        const int lane = threadIdx.x;
-        input += (uint64_t)row * CHANNELS;
-        gate += (uint64_t)row * CHANNELS;
-        output += (uint64_t)row * CHANNELS;
+        const int lane = threadIdx.x & 31;
 
         const float2 raw0 = *reinterpret_cast<const float2 *>(
             input + lane * 2);
@@ -1448,6 +1467,14 @@ namespace {
 #endif
             output2[index] = __halves2half2(result0, result1);
         }
+    }
+
+    __global__ __launch_bounds__(32) void Qwen4GdnOutputGateExactKernel(
+            const float *input, const float *weight, const half *gate,
+            half *output, float eps) {
+        const uint64_t offset = (uint64_t)blockIdx.x * 128;
+        Qwen4GdnOutputGateExactDevice(input + offset, weight, gate + offset,
+                                    output + offset, eps);
     }
 
     struct Qwen4LinearReplayPointers {
@@ -2654,6 +2681,46 @@ namespace {
                 (float*)output.cudaData, keyHeads, valueHeads,
                 sequence, recurrentEps, inverseHead);
         }
+    }
+
+    bool Qwen4CanRunGatedDeltaRule(
+            const fastllm::Data &qkv, const fastllm::Data &alpha,
+            const fastllm::Data &beta,
+            const fastllm::Data &aLog, const fastllm::Data &dtBias,
+            const fastllm::Data &state, const fastllm::Data &output,
+            int keyHeads, int valueHeads, int keyDim, int valueDim,
+            fastllm::DataType outputType) {
+        for (const fastllm::Data *data :
+                {&qkv, &alpha, &beta, &aLog, &dtBias, &state, &output}) {
+            if (data->dataDevice != fastllm::DataDevice::CUDA ||
+                data->cudaData == nullptr) {
+                return false;
+            }
+        }
+        const int batch = qkv.dims.empty() ? 0 : qkv.dims[0];
+        const int sequence = qkv.dims.size() == 3 ? qkv.dims[1] : 0;
+        const int qkvChannels = 2 * keyHeads * keyDim +
+                                valueHeads * valueDim;
+        if (qkv.dataType != fastllm::DataType::FLOAT32 ||
+            state.dataType != fastllm::DataType::FLOAT32 ||
+            aLog.dataType != fastllm::DataType::FLOAT32 ||
+            dtBias.dataType != fastllm::DataType::FLOAT32 ||
+            !Qwen4CudaActivationType(alpha.dataType) ||
+            beta.dataType != alpha.dataType ||
+            output.dataType != outputType || keyHeads <= 0 ||
+            valueHeads <= 0 || valueHeads % keyHeads != 0 ||
+            keyDim != 128 || valueDim != 128 || qkv.dims.size() != 3 ||
+            sequence <= 0 || qkv.dims[2] != qkvChannels ||
+            alpha.Count(0) !=
+                (uint64_t)batch * sequence * valueHeads ||
+            beta.Count(0) !=
+                (uint64_t)batch * sequence * valueHeads ||
+            aLog.Count(0) != (uint64_t)valueHeads ||
+            dtBias.Count(0) != (uint64_t)valueHeads ||
+            state.dims != std::vector<int>({batch, valueHeads, keyDim, valueDim})) {
+            return false;
+        }
+        return true;
     }
 
 }
@@ -4262,38 +4329,9 @@ bool FastllmCudaQwen4GatedDeltaRuleDecode(
         fastllm::Data &state, fastllm::Data &output,
         int keyHeads, int valueHeads, int keyDim, int valueDim,
         float recurrentEps, fastllm::Data *stateOutput) {
-    const int batch = qkv.dims.empty() ? 0 : qkv.dims[0];
-    const int sequence = qkv.dims.size() == 3 ? qkv.dims[1] : 0;
-    const int qkvChannels = 2 * keyHeads * keyDim +
-                            valueHeads * valueDim;
-    if (qkv.dataDevice != fastllm::DataDevice::CUDA ||
-        alpha.dataDevice != fastllm::DataDevice::CUDA ||
-        beta.dataDevice != fastllm::DataDevice::CUDA ||
-        aLog.dataDevice != fastllm::DataDevice::CUDA ||
-        dtBias.dataDevice != fastllm::DataDevice::CUDA ||
-        state.dataDevice != fastllm::DataDevice::CUDA ||
-        output.dataDevice != fastllm::DataDevice::CUDA ||
-        qkv.cudaData == nullptr ||
-        alpha.cudaData == nullptr || beta.cudaData == nullptr ||
-        aLog.cudaData == nullptr || dtBias.cudaData == nullptr ||
-        state.cudaData == nullptr ||
-        output.cudaData == nullptr || qkv.dataType != fastllm::DataType::FLOAT32 ||
-        state.dataType != fastllm::DataType::FLOAT32 ||
-        aLog.dataType != fastllm::DataType::FLOAT32 ||
-        dtBias.dataType != fastllm::DataType::FLOAT32 ||
-        !Qwen4CudaActivationType(alpha.dataType) ||
-        beta.dataType != alpha.dataType ||
-        output.dataType != fastllm::DataType::FLOAT32 || keyHeads <= 0 ||
-        valueHeads <= 0 || valueHeads % keyHeads != 0 ||
-        keyDim != 128 || valueDim != 128 || qkv.dims.size() != 3 ||
-        sequence <= 0 || qkv.dims[2] != qkvChannels ||
-        alpha.Count(0) !=
-            (uint64_t)batch * sequence * valueHeads ||
-        beta.Count(0) !=
-            (uint64_t)batch * sequence * valueHeads ||
-        aLog.Count(0) != (uint64_t)valueHeads ||
-        dtBias.Count(0) != (uint64_t)valueHeads ||
-        state.dims != std::vector<int>({batch, valueHeads, keyDim, valueDim}) ||
+    if (!Qwen4CanRunGatedDeltaRule(qkv, alpha, beta, aLog, dtBias, state,
+            output, keyHeads, valueHeads, keyDim, valueDim,
+            fastllm::DataType::FLOAT32) ||
         (stateOutput != nullptr &&
          (stateOutput->dataDevice != fastllm::DataDevice::CUDA ||
           stateOutput->cudaData == nullptr ||
@@ -4301,6 +4339,8 @@ bool FastllmCudaQwen4GatedDeltaRuleDecode(
           stateOutput->dims != state.dims))) {
         return false;
     }
+    const int batch = qkv.dims[0];
+    const int sequence = qkv.dims[1];
     const int blocks = batch * valueHeads;
     // RunLinearAttention constructs this value on the host and then uses it
     // as both the RMSNorm weight and the subsequent query scale.  Passing the
@@ -4347,6 +4387,58 @@ bool FastllmCudaQwen4GatedDeltaRuleDecode(
     }
     DeviceSync();
     return cudaGetLastError() == cudaSuccess;
+}
+
+bool FastllmCudaQwen4GatedDeltaRuleDecodeOutput(
+        const fastllm::Data &qkv, const fastllm::Data &alpha,
+        const fastllm::Data &beta, const fastllm::Data &aLog,
+        const fastllm::Data &dtBias, const fastllm::Data &normWeight,
+        const fastllm::Data &gate, fastllm::Data &state,
+        fastllm::Data &output, int keyHeads, int valueHeads,
+        float recurrentEps, float normEps, bool tiledOutput) {
+    if (!Qwen4CanRunGatedDeltaRule(qkv, alpha, beta, aLog, dtBias, state,
+            output, keyHeads, valueHeads, 128, 128, fastllm::DataType::FLOAT16) ||
+        qkv.dims[0] <= 0 || qkv.dims[1] != 1 ||
+        alpha.dataType != fastllm::DataType::FLOAT16 ||
+        normWeight.dataDevice != fastllm::DataDevice::CUDA ||
+        gate.dataDevice != fastllm::DataDevice::CUDA ||
+        normWeight.cudaData == nullptr || gate.cudaData == nullptr ||
+        normWeight.dataType != fastllm::DataType::FLOAT32 ||
+        gate.dataType != fastllm::DataType::FLOAT16 ||
+        normWeight.Count(0) != 128 || !(normEps > 0.0f) ||
+        gate.Count(0) != (uint64_t)qkv.dims[0] * valueHeads * 128 ||
+        output.Count(0) != gate.Count(0)) {
+        return false;
+    }
+    const int device = FastllmCudaGetDevice();
+    if (output.multiDeviceData ||
+        (!output.dataDeviceIds.empty() && output.dataDeviceIds[0] != device)) {
+        return false;
+    }
+    const fastllm::Data *inputs[] = {
+        &qkv, &alpha, &beta, &aLog, &dtBias, &normWeight, &gate, &state};
+    for (const fastllm::Data *data : inputs) {
+        if (data->multiDeviceData ||
+            (!data->dataDeviceIds.empty() && data->dataDeviceIds[0] != device) ||
+            data->cudaData == output.cudaData) {
+            return false;
+        }
+    }
+    const int blocks = qkv.dims[0] * valueHeads;
+    const float inverseHead = 1.0f / std::sqrt(128.0f);
+    Qwen4GatedDeltaRuleDecodeKernel<half, false, true><<<
+        blocks, 128, 0, cudaStreamPerThread>>>(
+            (const float*)qkv.cudaData, (const half*)alpha.cudaData,
+            (const half*)beta.cudaData, (const float*)aLog.cudaData,
+            (const float*)dtBias.cudaData, (float*)state.cudaData, nullptr,
+            (float*)output.cudaData, keyHeads, valueHeads, 1,
+            recurrentEps, inverseHead, (const float*)normWeight.cudaData,
+            (const half*)gate.cudaData, normEps, tiledOutput);
+    // A submitted state update must never be retried through the fallback.
+    fastllm::AssertInFastLLM(cudaGetLastError() == cudaSuccess,
+                           "Qwen4 fused GDN decode launch failed.");
+    DeviceSync();
+    return true;
 }
 
 bool FastllmCudaQwen4GdnOutputGateExact(
