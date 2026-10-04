@@ -1846,6 +1846,8 @@ struct FastllmCudaMoeExpertParallel;
 struct FastllmCudaMoeExpertParallelStats {
     uint64_t steps = 0, cpuRoutes = 0, multiGpuSteps = 0;
     std::vector<uint64_t> gpuRoutes, admissions;
+    // gpuRoutes includes temporary uploads; the difference is streamed work.
+    std::vector<uint64_t> residentRoutes;
 };
 std::shared_ptr<FastllmCudaMoeExpertParallel> FastllmCudaCreateMoeExpertParallel(int ranks);
 // Read only between calls, after all ranks have finished expert dispatch.

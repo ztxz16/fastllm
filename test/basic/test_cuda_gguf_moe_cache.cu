@@ -783,7 +783,7 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
                       fastllm::DataType inputType = fastllm::FLOAT32, bool noCache = false,
                       bool large = false, bool verifyDynamic = false) {
     using namespace fastllm;
-    constexpr int experts = 24, topk = 7;
+    constexpr int experts = 24, topk = 7, steps = 18;
     int hidden = 256;
     const int ranks = single ? 1 : 2;
     uint64_t frequencyHits = 0, frequencyMisses = 0;
@@ -824,6 +824,7 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
                 "zero-cache GPU reference allocation failed");
         Require(fastllm_moe_cuda_cache_stats(0, oracleStats, false), "reference statistics unavailable");
         setenv("FASTLLM_MOE_CUDA_CACHE_BYTES_0", "0", 1);
+        if (!single) setenv("FASTLLM_MOE_CUDA_CACHE_BYTES_1", "0", 1);
     }
     Require(FastllmCudaPrepareMoeCache(layers, 2, [&] {
         for (auto &table : tables) for (size_t i = 2; i < table.size(); ++i)
@@ -845,7 +846,7 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
     std::vector<float> x(rows * hidden), score(rows * topk), cpu(rows * topk * hidden),
         serial(cpu.size()), gpu(rows * hidden), actual[2]{std::vector<float>(rows * hidden), std::vector<float>(rows * hidden)};
     std::vector<int32_t> route(rows * topk), mask(rows * topk, -1);
-    for (int step = 0; step < 18; ++step) {
+    for (int step = 0; step < steps; ++step) {
         const int layer = step % 2;
         auto &table = tables[layer];
         hidden = table[2]->dims[1];
@@ -1112,7 +1113,7 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
         std::printf("FREQUENCY gpu=%llu cpu=%llu\n",
             (unsigned long long)frequencyHits, (unsigned long long)frequencyMisses);
     }
-    if (verifyDynamic) {
+    if (verifyDynamic && single) {
         uint64_t routes[8]{};
         Require(fastllm_moe_cuda_cache_route_stats(0, routes), "verify route counters unavailable");
         Require(routes[4] > routes[6] && routes[5] > 0 && (noCache || routes[6] > 0),
@@ -1131,8 +1132,19 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
     }
     if (!single) {
         const auto stats = FastllmCudaGetMoeExpertParallelStats(*context);
+        Require(stats.steps == steps &&
+                stats.cpuRoutes + stats.gpuRoutes[0] + stats.gpuRoutes[1] == uint64_t(steps * rows * topk),
+                "parallel staging lost or duplicated route ownership");
+        if (verifyDynamic) {
+            for (int rank = 0; rank < ranks; ++rank) {
+                Require(stats.gpuRoutes[rank] > stats.residentRoutes[rank],
+                        "parallel rank never uploaded a missed expert");
+                if (noCache) Require(stats.residentRoutes[rank] == 0,
+                                     "zero-cache parallel rank reported a resident expert");
+            }
+        }
         Cuda(cudaSetDevice(1));
-        const bool peerCache = FastllmCudaCanRunMoeCache(tables[0].data(), tables[0].size());
+        const bool peerCache = noCache || FastllmCudaCanRunMoeCache(tables[0].data(), tables[0].size());
         Require(stats.cpuRoutes && stats.gpuRoutes[0] &&
             (peerCache ? stats.gpuRoutes[1] && stats.multiGpuSteps :
                          stats.gpuRoutes[1] == 0 && stats.multiGpuSteps == 0),
@@ -1143,6 +1155,7 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
     if (noCache) {
         FastllmCudaReleaseMoeCache(oracleTables[0].data(), oracleTables[0].size());
         unsetenv("FASTLLM_MOE_CUDA_CACHE_BYTES_0");
+        if (!single) unsetenv("FASTLLM_MOE_CUDA_CACHE_BYTES_1");
     }
     ClearNumasMoeRuntimeCache(); Cuda(cudaSetDevice(0));
     std::printf("PASS GGUF hybrid format=%d rows=%d ranks=%d input=%d: CPU serial reference, mixed layers, CPU/GPU routes, duplicate/zero/negative routes\n", format, rows, ranks, inputType);
@@ -1188,6 +1201,15 @@ int main(int argc, char **argv) {
                 RunHybrid(GGML_TYPE_IQ3_S, rows, true, false, fastllm::FLOAT32, true, true, true);
             }
             std::puts("PASS: dynamic verify cached/staged/NUMA experts and numerical references"); return 0;
+        }
+        if (argc > 1 && std::strcmp(argv[1], "--parallel-dynamic") == 0) {
+            if (count < 2) { std::puts("FASTLLM_TEST_SKIP_NO_DEVICE: requires two GPUs"); return 0; }
+            fastllm::SetThreads(4);
+            for (int rows : {1, 2, 3, 4, 5, FASTLLM_CUDA_MOE_CACHE_MAX_BATCH}) {
+                RunHybrid(GGML_TYPE_IQ3_S, rows, false, false, fastllm::FLOAT32, false, false, true);
+                RunHybrid(GGML_TYPE_IQ3_S, rows, false, false, fastllm::FLOAT16, true, true, true);
+            }
+            std::puts("PASS: parallel dynamic resident/staged/NUMA experts and numerical references"); return 0;
         }
         if (argc > 1 && std::strcmp(argv[1], "--pipeline") == 0) {
             fastllm::SetThreads(4);

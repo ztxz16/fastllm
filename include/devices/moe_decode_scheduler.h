@@ -94,6 +94,73 @@ public:
         }
         return selected;
     }
+
+    struct RankPlan {
+        const MoeDecodeOverlapScheduler *timing = nullptr;
+        int hits = 0, misses = 0;
+        const int *routeCounts = nullptr;
+        int selected = 0;
+    };
+
+    // All ranks share one CPU worker pool. Account for its entire remaining
+    // subset while each GPU has its own resident work and measured DMA cost.
+    // A null timing leaves this rank's misses on CPU (e.g. no staging buffer).
+    static void SelectParallelMisses(std::vector<RankPlan> &plans, const Estimate &cpu) {
+        int remaining = 0;
+        bool calibrating = !cpu.initialized;
+        for (auto &p : plans) {
+            p.selected = 0;
+            for (int i = 0; i < p.misses; ++i)
+                remaining += p.routeCounts ? p.routeCounts[i] : 1;
+            calibrating |= p.timing && p.misses &&
+                (!p.timing->copiedExpert.initialized || !p.timing->stagedExpert.initialized);
+        }
+        if (!remaining) return;
+        if (calibrating) {
+            for (auto &p : plans) if (p.timing && p.misses)
+                p.selected = cpu.initialized ? std::max(1, p.misses / 2) : p.misses / 2;
+            return;
+        }
+        std::vector<int> current(plans.size(), 0);
+        std::vector<double> gpu(plans.size(), 0);
+        double gpuBound = 0;
+        for (size_t r = 0; r < plans.size(); ++r) if (plans[r].timing) {
+            gpu[r] = plans[r].hits * plans[r].timing->residentExpert.us;
+            gpuBound = std::max(gpuBound, gpu[r]);
+        }
+        double best = std::max(remaining * cpu.us, gpuBound);
+        // Sweep increasing GPU completion-time limits. At each limit, taking
+        // every affordable prefix minimizes the common CPU remainder. This
+        // avoids enumerating every combination of per-rank expert counts.
+        while (true) {
+            int next = -1;
+            double finish = 0, compute = 0;
+            for (size_t r = 0; r < plans.size(); ++r) {
+                const auto &p = plans[r];
+                if (!p.timing || current[r] == p.misses) continue;
+                const int routes = p.routeCounts ? p.routeCounts[current[r]] : 1;
+                const double cost = std::max(gpu[r], (current[r] + 1) * p.timing->copiedExpert.us) +
+                    routes * p.timing->stagedExpert.us;
+                const double end = p.timing->dispatch.us + cost;
+                if (next < 0 || end < finish) { next = r; finish = end; compute = cost; }
+            }
+            if (next < 0) break;
+            const auto &p = plans[next];
+            remaining -= p.routeCounts ? p.routeCounts[current[next]] : 1;
+            ++current[next];
+            gpu[next] = compute;
+            gpuBound = std::max(gpuBound, finish);
+            const double cost = std::max(remaining * cpu.us, gpuBound);
+            if (cost < best * .97) {
+                best = cost;
+                for (size_t r = 0; r < plans.size(); ++r) plans[r].selected = current[r];
+            }
+        }
+        for (auto &p : plans) if (p.timing && p.misses && p.timing->calls % 127 == 126) {
+            if (!p.selected) p.selected = 1;
+            else if (p.selected == p.misses) --p.selected;
+        }
+    }
 };
 
 // Observe every routed expert, including CPU work, in a payload-free LRU with

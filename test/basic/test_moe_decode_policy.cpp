@@ -149,9 +149,59 @@ static void TestDecodeOverlap() {
             "compute-bound pipeline did not wait for the preceding expert");
 }
 
+static void TestParallelOverlap() {
+    using Scheduler = fastllm::MoeDecodeOverlapScheduler;
+    Scheduler a, b;
+    Scheduler::Estimate cpu;
+    std::vector<Scheduler::RankPlan> plans{{&a, 0, 3}, {&b, 0, 3}};
+    Scheduler::SelectParallelMisses(plans, cpu);
+    Require(plans[0].selected == 1 && plans[1].selected == 1,
+            "parallel calibration did not retain a CPU subset");
+    cpu.Observe(100);
+    for (auto *p : {&a, &b}) {
+        p->cpuExpert.Observe(100);
+        p->copiedExpert.Observe(180);
+        p->stagedExpert.Observe(10);
+    }
+    Require(a.SelectMisses(3, 0) == 1 && b.SelectMisses(3, 0) == 1,
+            "independent-rank reference changed");
+    Scheduler::SelectParallelMisses(plans, cpu);
+    Require(plans[0].selected + plans[1].selected == 3,
+            "parallel split counted the shared CPU worker pool twice");
+    for (int i = 0; i < 100; ++i) b.copiedExpert.Observe(2000);
+    Scheduler::SelectParallelMisses(plans, cpu);
+    Require(plans[0].selected > 0 && plans[1].selected == 0,
+            "parallel split ignored the slower PCIe link");
+    b.calls = 126;
+    Scheduler::SelectParallelMisses(plans, cpu);
+    Require(plans[1].selected == 1, "parallel split did not reprobe an unused link");
+    b.calls = 127;
+    b.copiedExpert.Observe(1); b.stagedExpert.Observe(1);
+    plans[0].timing = nullptr;
+    Scheduler::SelectParallelMisses(plans, cpu);
+    Require(plans[0].selected == 0 && plans[1].selected == 3,
+            "CPU-only rank was omitted from the common CPU budget");
+    const int reused[] = {4, 4};
+    a.copiedExpert.Observe(250); a.stagedExpert.Observe(10);
+    plans = {{&a, 0, 2, reused}, {&b, 0, 0}};
+    Scheduler::SelectParallelMisses(plans, cpu);
+    Require(plans[0].selected == 1, "parallel verifier charged repeated DMA for a shared expert");
+    // The planner is independent of TP degree, including an empty rank.
+    plans = {{&b, 0, 3}, {&b, 0, 3}, {&b, 0, 3}, {&b, 0, 0}};
+    Scheduler::SelectParallelMisses(plans, cpu);
+    Require(plans[0].selected == 3 && plans[1].selected == 3 &&
+            plans[2].selected == 3 && plans[3].selected == 0,
+            "parallel planner assumes two ranks or assigns an empty rank");
+    cpu.Observe(.01);
+    Scheduler::SelectParallelMisses(plans, cpu);
+    Require(std::all_of(plans.begin(), plans.end(), [](const auto &p) { return p.selected == 0; }),
+            "parallel planner did not adapt to faster NUMA");
+}
+
 int main() {
     TestFrequencyAdmission();
     TestDecodeOverlap();
+    TestParallelOverlap();
     using fastllm::MoeDecodePolicy;
     // Four alternating experts fit in a global cache, but cannot borrow
     // unused slots from a different record-size partition.
