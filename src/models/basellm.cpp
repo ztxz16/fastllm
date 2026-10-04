@@ -2497,6 +2497,7 @@ namespace fastllm {
 #endif
                 Data inputIds = Data(DataType::FLOAT32, {1, (int) ids.size()}, ids);
                 std::vector<int> ret;
+                int chunkedPrefillToken = -1;
                 std::chrono::system_clock::time_point profileStartTime;
                 if (printProfile) {
                     profileStartTime = std::chrono::system_clock::now();
@@ -2513,6 +2514,14 @@ namespace fastllm {
                         tokensManager,
                         &logits
                     );
+                } else if (singleContext != nullptr && seqLens.size() == 1 &&
+                           seqLens[0] > prefillChunkSize &&
+                           model->TryForwardChunkedPrefill(
+                               inputIds, attentionMasks[0] == nullptr ? Data() : *attentionMasks[0],
+                               positionIds[0] == nullptr ? Data() : *positionIds[0],
+                               singleContext->pastKeyValues, generationConfigs[0],
+                               tokensManager, logits[0], chunkedPrefillToken)) {
+                    ret = {chunkedPrefillToken};
                 } else if (seqLens.size() == 1 && seqLens[0] > prefillChunkSize) {
                     int len = seqLens[0];
                     std::vector <std::pair <Data, Data> > *pastKeyValue1;
@@ -3066,8 +3075,11 @@ namespace fastllm {
                         }
                         if (seqLens.size() > 0) {
                             std::vector <std::pair <Data, Data> > *pastKeyValue1;
+                            bool isSingleText = false;
                             if (seqLens.size() == 1) {
-                                pastKeyValue1 = &model->responseContextDict.dicts[handles[0]]->pastKeyValues;
+                                auto context = model->responseContextDict.dicts[handles[0]];
+                                pastKeyValue1 = &context->pastKeyValues;
+                                isSingleText = context->multimodalInput.empty();
                             }
                             dictLocker.unlock();
                             forwardLocker.lock();
@@ -3108,7 +3120,15 @@ namespace fastllm {
                             } else {
                                 int first, part;
                                 first = part = model->GetChunkedPrefillSize();
-                                if (seqLens[0] > first) {
+                                int chunkedPrefillToken = -1;
+                                if (isSingleText && seqLens[0] > first &&
+                                    model->TryForwardChunkedPrefill(
+                                        inputIds, attentionMasks[0] == nullptr ? Data() : *attentionMasks[0],
+                                        positionIds[0] == nullptr ? Data() : *positionIds[0],
+                                        *pastKeyValue1, generationConfigs[0], tokensManager,
+                                        logits[0], chunkedPrefillToken)) {
+                                    ret = {chunkedPrefillToken};
+                                } else if (seqLens[0] > first) {
                                     int len = seqLens[0];
                                     for (int st = 0; st < len; ) {
                                         auto chunkStartTime = std::chrono::steady_clock::now();

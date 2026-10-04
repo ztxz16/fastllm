@@ -12,6 +12,8 @@
 #include <vector>
 
 namespace fastllm {
+    class CudaChunkedPrefillPipeline;
+
     struct Glm5NextIndexerCache {
         Data keys, tailKeys, tailGates;
         Data hadamard; // immutable workspace, not part of prefix snapshots
@@ -59,6 +61,14 @@ namespace fastllm {
                 std::vector<float> *logits = nullptr) override;
 
         bool NeedAttentionMask(int qlen, int klen) override;
+
+        bool TryForwardChunkedPrefill(
+                const Data &inputIds, const Data &attentionMask,
+                const Data &positionIds,
+                std::vector<std::pair<Data, Data>> &pastKeyValues,
+                const GenerationConfig &generationConfig,
+                const LastTokensManager &lastTokens,
+                std::vector<float> *logits, int &outputToken) override;
 
         std::string MakeInput(
                 const std::string &history,
@@ -136,6 +146,23 @@ namespace fastllm {
                 std::vector<float> *logits,
                 MtpRuntimeState &state);
 
+        void ForwardEmbedding(const Data &inputIds, Data &hiddenStates);
+
+        void ForwardLayers(
+                Data &hiddenStates, int firstLayer, int endLayer,
+                std::vector<std::pair<Data, Data>> &pastKeyValues,
+                std::vector<KdaReplayCapture> *kdaReplay = nullptr,
+                std::vector<Glm5NextIndexerCache> *indexer = nullptr);
+
+        int ForwardOutput(
+                Data &hiddenStates,
+                const GenerationConfig &generationConfig,
+                const LastTokensManager &lastTokens,
+                std::vector<float> *logits, bool sampleOutput,
+                Data *targetHiddenStates = nullptr);
+
+        std::pair<Data &, Data &> PrepareMlaWeights(int layerIndex);
+
         bool MtpSupportsGenerationConfig(
                 const GenerationConfig &generationConfig) const;
 
@@ -198,12 +225,12 @@ namespace fastllm {
         void RunSparseAttention(
                 int layerIndex, Data &input, int sequence,
                 std::vector<std::pair<Data, Data>> &pastKeyValues,
-                Data &output);
+                Data &output, Glm5NextIndexerCache *indexer = nullptr);
 
         void RunCompressedMlaAttention(
                 int layerIndex, Data &input, int sequence,
                 std::vector<std::pair<Data, Data>> &pastKeyValues,
-                Data &output);
+                Data &output, Glm5NextIndexerCache *indexer = nullptr);
 
         void RunExpandedSparseAttention(
                 int layerIndex, Data &input, int sequence,
@@ -263,6 +290,9 @@ namespace fastllm {
         std::map<const std::vector<std::pair<Data, Data>> *,
                  std::vector<Glm5NextIndexerCache>> indexerCaches;
         std::mutex indexerCachesMutex;
+#ifdef USE_CUDA
+        std::unique_ptr<CudaChunkedPrefillPipeline> prefillPipeline;
+#endif
         // DSA history is retained by page reference rather than copied.  This
         // limit covers KDA recurrent state and the pooled Indexer cache;
         // larger state snapshots are tiered to host memory.

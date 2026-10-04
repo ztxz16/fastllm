@@ -11,6 +11,7 @@
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-moe-policy.h"
+#include "utils/cuda_chunked_prefill.h"
 #endif
 #ifdef USE_NUMAS
 #include "devices/numas/numasdevice.h"
@@ -441,6 +442,9 @@ namespace fastllm {
 
     Glm5NextModel::~Glm5NextModel() {
         ShutdownRuntime();
+#ifdef USE_CUDA
+        prefillPipeline.reset();
+#endif
         ReleaseMoeCudaCache(expertWeights);
         {
             std::lock_guard<std::mutex> guard(historyCacheMutex);
@@ -1813,20 +1817,65 @@ namespace fastllm {
     void Glm5NextModel::RunSparseAttention(
             int layerIndex, Data &input, int sequence,
             std::vector<std::pair<Data, Data>> &pastKeyValues,
-            Data &output) {
+            Data &output, Glm5NextIndexerCache *indexer) {
         if (useCompressedMla) {
             RunCompressedMlaAttention(
-                layerIndex, input, sequence, pastKeyValues, output);
+                layerIndex, input, sequence, pastKeyValues, output, indexer);
         } else {
             RunExpandedSparseAttention(
                 layerIndex, input, sequence, pastKeyValues, output);
         }
     }
 
+    std::pair<Data &, Data &> Glm5NextModel::PrepareMlaWeights(int layerIndex) {
+        const std::string kvWeightName = languagePrefix + "layers." +
+            std::to_string(layerIndex) + ".self_attn.kv_b_proj.weight";
+        const std::string keyWeightName = kvWeightName + "__mla_key";
+        const std::string valueWeightName = kvWeightName + "__mla_value";
+        auto combined = weight.weight.find(kvWeightName);
+        if (combined != weight.weight.end()) {
+            // References survive insertions that rehash the weight map.
+            Data &kvWeight = combined->second;
+            Data &keyWeight = weight.weight.try_emplace(keyWeightName).first->second;
+            Data &valueWeight = weight.weight.try_emplace(valueWeightName).first->second;
+            AssertInFastLLM(
+                kvWeight.Count(0) ==
+                    (uint64_t)num_attention_heads *
+                    (qkNopeHeadDim + valueHeadDim) * kvLoraRank,
+                "GLM-5.3 KV-B projection weight has an invalid size.");
+            kvWeight.Reshape({num_attention_heads,
+                qkNopeHeadDim + valueHeadDim, kvLoraRank});
+            Split(kvWeight, 1, 0, qkNopeHeadDim, keyWeight);
+            Split(kvWeight, 1, qkNopeHeadDim,
+                  qkNopeHeadDim + valueHeadDim, valueWeight);
+            weight.weight.erase(kvWeightName);
+        }
+        auto keyWeight = weight.weight.find(keyWeightName);
+        auto valueWeight = weight.weight.find(valueWeightName);
+        AssertInFastLLM(keyWeight != weight.weight.end() &&
+            valueWeight != weight.weight.end(),
+            "GLM-5.3 compressed MLA split weights are missing.");
+        if (keyWeight->second.dims == std::vector<int>({
+                num_attention_heads, kvLoraRank, qkNopeHeadDim})) {
+            PermuteSelf(keyWeight->second, {0, 2, 1});
+        }
+        if (valueWeight->second.dims == std::vector<int>({
+                num_attention_heads, kvLoraRank, valueHeadDim})) {
+            PermuteSelf(valueWeight->second, {0, 2, 1});
+        }
+        AssertInFastLLM(
+            keyWeight->second.dims == std::vector<int>({
+                num_attention_heads, qkNopeHeadDim, kvLoraRank}) &&
+            valueWeight->second.dims == std::vector<int>({
+                num_attention_heads, valueHeadDim, kvLoraRank}),
+            "GLM-5.3 compressed MLA split weights have invalid shapes.");
+        return {keyWeight->second, valueWeight->second};
+    }
+
     void Glm5NextModel::RunCompressedMlaAttention(
             int layerIndex, Data &input, int sequence,
             std::vector<std::pair<Data, Data>> &pastKeyValues,
-            Data &output) {
+            Data &output, Glm5NextIndexerCache *indexer) {
         AssertInFastLLM(
             qkRopeHeadDim == 0 && qkHeadDim == qkNopeHeadDim &&
             kvLoraRank == 512 && mlaPaddedPeHeadDim == 64,
@@ -1912,12 +1961,18 @@ namespace fastllm {
         Data dsaIndices;
 #ifdef USE_CUDA
         if (UsesDsa()) {
-            std::lock_guard<std::mutex> guard(indexerCachesMutex);
-            auto &caches = indexerCaches[&pastKeyValues];
-            if (caches.empty()) caches.resize(block_cnt);
             const int past = latentKvCache.dims[1] - sequence;
+            // The pipeline already holds the registry lock and assigns each
+            // layer to one worker for the complete prompt.
+            std::unique_lock<std::mutex> guard(indexerCachesMutex, std::defer_lock);
+            if (indexer == nullptr) {
+                guard.lock();
+                auto &caches = indexerCaches[&pastKeyValues];
+                if (caches.empty()) caches.resize(block_cnt);
+                indexer = &caches[layerIndex];
+            }
             glm5_next_detail::BuildDsaIndices(input, qNormalized, weight,
-                prefix + "indexer.", past, indexTopK, caches[layerIndex], dsaIndices,
+                prefix + "indexer.", past, indexTopK, *indexer, dsaIndices,
                 sequence == 1 ? &latentKvCache : nullptr);
         }
 #else
@@ -1926,54 +1981,9 @@ namespace fastllm {
         qResidual.FreeSpace();
         qNormalized.FreeSpace();
 
-        const std::string kvWeightName = prefix + "kv_b_proj.weight";
-        const std::string keyWeightName = kvWeightName + "__mla_key";
-        const std::string valueWeightName = kvWeightName + "__mla_value";
-        auto combined = weight.weight.find(kvWeightName);
-        if (combined != weight.weight.end()) {
-            weight.weight.try_emplace(keyWeightName);
-            weight.weight.try_emplace(valueWeightName);
-            combined = weight.weight.find(kvWeightName);
-            auto keyWeight = weight.weight.find(keyWeightName);
-            auto valueWeight = weight.weight.find(valueWeightName);
-            AssertInFastLLM(
-                combined->second.Count(0) ==
-                    (uint64_t)num_attention_heads *
-                    (qkNopeHeadDim + valueHeadDim) * kvLoraRank,
-                "GLM-5.3 KV-B projection weight has an invalid size.");
-            combined->second.Reshape({
-                num_attention_heads,
-                qkNopeHeadDim + valueHeadDim,
-                kvLoraRank});
-            Split(combined->second, 1, 0, qkNopeHeadDim,
-                  keyWeight->second);
-            Split(combined->second, 1, qkNopeHeadDim,
-                  qkNopeHeadDim + valueHeadDim,
-                  valueWeight->second);
-            weight.weight.erase(combined);
-        }
-        auto keyWeightIt = weight.weight.find(keyWeightName);
-        auto valueWeightIt = weight.weight.find(valueWeightName);
-        AssertInFastLLM(
-            keyWeightIt != weight.weight.end() &&
-            valueWeightIt != weight.weight.end(),
-            "GLM-5.3 compressed MLA split weights are missing.");
-        Data &keyWeight = keyWeightIt->second;
-        Data &valueWeight = valueWeightIt->second;
-        if (keyWeight.dims == std::vector<int>({
-                num_attention_heads, kvLoraRank, qkNopeHeadDim})) {
-            PermuteSelf(keyWeight, {0, 2, 1});
-        }
-        if (valueWeight.dims == std::vector<int>({
-                num_attention_heads, kvLoraRank, valueHeadDim})) {
-            PermuteSelf(valueWeight, {0, 2, 1});
-        }
-        AssertInFastLLM(
-            keyWeight.dims == std::vector<int>({
-                num_attention_heads, qkNopeHeadDim, kvLoraRank}) &&
-            valueWeight.dims == std::vector<int>({
-                num_attention_heads, valueHeadDim, kvLoraRank}),
-            "GLM-5.3 compressed MLA split weights have invalid shapes.");
+        auto mlaWeights = PrepareMlaWeights(layerIndex);
+        Data &keyWeight = mlaWeights.first;
+        Data &valueWeight = mlaWeights.second;
 
         // Both attention paths consume the same contiguous HND query.
         query.Reshape({num_attention_heads, sequence, qkNopeHeadDim});
@@ -3148,6 +3158,96 @@ namespace fastllm {
             generationConfig, lastTokens, logits, true);
     }
 
+    bool Glm5NextModel::TryForwardChunkedPrefill(
+            const Data &inputIds, const Data &attentionMask,
+            const Data &positionIds,
+            std::vector<std::pair<Data, Data>> &pastKeyValues,
+            const GenerationConfig &generationConfig,
+            const LastTokensManager &lastTokens,
+            std::vector<float> *logits, int &outputToken) {
+        (void)positionIds; // This model derives causal positions from its caches.
+#ifdef USE_CUDA
+        const int chunkSize = GetChunkedPrefillSize();
+        // Skipping discarded intermediate samples must not change the random
+        // generator's consumption for sampling-based generation.
+        if (!generationConfig.IsSimpleGreedy() ||
+            mtpEnabled || saveHistoryChat || !useCompressedMla ||
+            GetKVCacheInCPU() || GetHistoryCacheInCPU() ||
+            GetLowMemMode() || MoeCudaCacheRequested() ||
+            GetFastllmEnv().printProfile || FastllmCudaGraphIsCapturingFast() ||
+            inputIds.dataDevice != DataDevice::CPU ||
+            inputIds.dataType != DataType::FLOAT32 || inputIds.cpuData == nullptr ||
+            inputIds.dims.size() != 2 || inputIds.dims[0] != 1 ||
+            chunkSize <= 0 || inputIds.dims[1] <= chunkSize ||
+            !attentionMask.dims.empty()) {
+            return false;
+        }
+        // Prefix/history restoration and continuation prefill retain their
+        // existing path. No partially populated recurrent state is admitted.
+        for (const auto &cache : pastKeyValues) {
+            if (!cache.first.dims.empty() || !cache.second.dims.empty() ||
+                !cache.first.pageIndex.empty() || !cache.second.pageIndex.empty()) {
+                return false;
+            }
+        }
+        std::vector<CudaPrefillStage> stages;
+        if (!BuildCudaPrefillStages(deviceMap, block_cnt, stages)) return false;
+        for (int layer = 0; layer < block_cnt; ++layer) {
+            if (!denseMlpLayers[layer] && SelectMoeDeviceForLayer(layer) !=
+                    SelectDeviceFromMap(deviceMap, layer + 1, block_cnt)) {
+                return false;
+            }
+        }
+
+        // All eligibility checks precede mutation. After work starts, errors
+        // propagate after draining the workers; never retry partially appended
+        // KV/KDA state through the serial fallback.
+        for (int layer = 0; layer < block_cnt; ++layer) {
+            if (!kdaLayers[layer]) {
+                ApplyDeviceMap(deviceMap, layer + 1, block_cnt);
+                PrepareMlaWeights(layer);
+            }
+        }
+        if ((int)pastKeyValues.size() < block_cnt) pastKeyValues.resize(block_cnt);
+        // Keep the registry stable while workers access distinct layer entries.
+        // This also prevents request removal from freeing an in-flight indexer.
+        std::lock_guard<std::mutex> indexerGuard(indexerCachesMutex);
+        auto &indexer = indexerCaches[&pastKeyValues];
+        if (indexer.empty()) indexer.resize(block_cnt);
+        if (!prefillPipeline) prefillPipeline.reset(new CudaChunkedPrefillPipeline());
+        std::vector<int> devices;
+        for (const auto &stage : stages) devices.push_back(stage.device);
+        const int sequence = inputIds.dims[1];
+        const int chunks = 1 + (sequence - 1) / chunkSize;
+        const float *tokens = reinterpret_cast<const float *>(inputIds.cpuData);
+        if (verbose) {
+            printf("[Prompt] Pipelined prefill: %zu CUDA stages, %d chunks (%d tokens/chunk).\n",
+                   stages.size(), chunks, chunkSize);
+            fflush(stdout);
+        }
+        prefillPipeline->Run(devices, chunks, DataType::BFLOAT16,
+            {1, chunkSize, hcMult, embed_dim},
+            [&](int rank, int chunk, Data &hiddenStates) {
+                if (rank == 0) {
+                    const int start = chunk * chunkSize;
+                    const int length = std::min(chunkSize, sequence - start);
+                    Data chunkInput(DataType::FLOAT32, {1, length},
+                        std::vector<float>(tokens + start, tokens + start + length));
+                    ForwardEmbedding(chunkInput, hiddenStates);
+                }
+                ForwardLayers(hiddenStates, stages[rank].firstLayer,
+                    stages[rank].endLayer, pastKeyValues, nullptr, &indexer);
+                if (rank + 1 == (int)stages.size() && chunk + 1 == chunks) {
+                    outputToken = ForwardOutput(hiddenStates, generationConfig,
+                                                lastTokens, logits, true);
+                }
+            });
+        return true;
+#else
+        return false;
+#endif
+    }
+
     int Glm5NextModel::ForwardImpl(
             const Data &inputIds,
             const Data &attentionMask,
@@ -3168,21 +3268,37 @@ namespace fastllm {
         if ((int)pastKeyValues.size() < block_cnt) {
             pastKeyValues.resize(block_cnt);
         }
-        const int sequence = inputIds.dims[1];
-
         if (kdaReplay != nullptr) {
             kdaReplay->clear();
             kdaReplay->resize(block_cnt);
         }
+        Data hiddenStates;
+        ForwardEmbedding(inputIds, hiddenStates);
+        ForwardLayers(hiddenStates, 0, block_cnt, pastKeyValues, kdaReplay);
+        return ForwardOutput(hiddenStates, generationConfig, lastTokens,
+                             logits, sampleOutput, targetHiddenStates);
+    }
+
+    void Glm5NextModel::ForwardEmbedding(
+            const Data &inputIds, Data &hiddenStates) {
+        const int sequence = inputIds.dims[1];
         ApplyDeviceMap(deviceMap, 0, block_cnt);
-        Data embedding, hiddenStates, hiddenStatesTemp;
+        Data embedding;
         Embedding(
             inputIds, weight[languagePrefix + "embed_tokens.weight"],
             embedding);
         ToDataType(embedding, DataType::BFLOAT16);
         embedding.Reshape({1, sequence, 1, embed_dim});
         Repeat(embedding, 2, hcMult, hiddenStates);
+    }
 
+    void Glm5NextModel::ForwardLayers(
+            Data &hiddenStates, int firstLayer, int endLayer,
+            std::vector<std::pair<Data, Data>> &pastKeyValues,
+            std::vector<KdaReplayCapture> *kdaReplay,
+            std::vector<Glm5NextIndexerCache> *indexer) {
+        const int sequence = hiddenStates.dims[1];
+        Data hiddenStatesTemp;
         Data *current = &hiddenStates;
         Data *next = &hiddenStatesTemp;
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
@@ -3197,7 +3313,7 @@ namespace fastllm {
         const bool frequencyDecode = sequence == 1 && !(mtpEnabled && mtpWeightsReady) &&
                                      kdaReplay == nullptr;
 #endif
-        for (int layer = 0; layer < block_cnt; layer++) {
+        for (int layer = firstLayer; layer < endLayer; layer++) {
             ApplyDeviceMap(deviceMap, layer + 1, block_cnt);
             const std::string prefix = languagePrefix + "layers." +
                 std::to_string(layer) + ".";
@@ -3220,7 +3336,8 @@ namespace fastllm {
             } else {
                 RunSparseAttention(
                     layer, normalizedAttention, sequence,
-                    pastKeyValues, attentionOutput);
+                    pastKeyValues, attentionOutput,
+                    indexer == nullptr ? nullptr : &(*indexer)[layer]);
             }
             DeepSeekV4HcPost(
                 attentionOutput, *current,
@@ -3264,14 +3381,23 @@ namespace fastllm {
                 ffnOutput, *current, ffnPost, ffnComb, *next);
             std::swap(current, next);
         }
+        // Each layer swaps twice, so the final residual remains in the
+        // caller-owned buffer. No tensor ownership crosses a worker boundary.
+    }
 
+    int Glm5NextModel::ForwardOutput(
+            Data &hiddenStates,
+            const GenerationConfig &generationConfig,
+            const LastTokensManager &lastTokens,
+            std::vector<float> *logits, bool sampleOutput,
+            Data *targetHiddenStates) {
         if (!sampleOutput && targetHiddenStates == nullptr) {
             return 0;
         }
 
         ApplyDeviceMap(deviceMap, block_cnt, block_cnt);
         Data collapsed, finalHidden;
-        Glm5NextHcMean(*current, collapsed);
+        Glm5NextHcMean(hiddenStates, collapsed);
         KimiK3RMSNorm(
             collapsed, weight[languagePrefix + "norm.weight"],
             rms_norm_eps, finalHidden);

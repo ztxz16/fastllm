@@ -259,6 +259,19 @@ namespace fastllm {
                 const LastTokensManager &lastTokens = LastTokensManager(),
                 std::vector <float> *logits = nullptr);
 
+        // Called before the scheduler slices a single text prompt. Returning
+        // false must leave request state untouched; true means all chunks have
+        // completed and outputToken contains the first generated token.
+        virtual bool TryForwardChunkedPrefill(
+                const Data &inputIds, const Data &attentionMask,
+                const Data &positionIds,
+                std::vector<std::pair<Data, Data>> &pastKeyValues,
+                const GenerationConfig &generationConfig,
+                const LastTokensManager &lastTokens,
+                std::vector<float> *logits, int &outputToken) {
+            return false;
+        }
+
         virtual std::vector <int> ForwardBatch(
                 int batch,
                 const Data &inputIds,
