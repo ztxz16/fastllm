@@ -67,8 +67,8 @@ quantization changes numerical results and can change generated tokens.
 
 Both paths accumulate in FP32 and round projection/SwiGLU results to the
 activation type. With registered NUMA weights, GGUF also uses the existing
-hybrid decode scheduler: resident experts run on CUDA and CPU workers compute
-cache misses concurrently. Tensor parallel decode assigns expert ownership
+hybrid decode scheduler: resident experts run on CUDA, while misses can be
+split between CPU workers and streamed CUDA execution. Tensor parallel decode assigns expert ownership
 across its GPUs and reduces unweighted per-expert results once. Each GPU has
 its own cache budget; for example, `--moe_cuda_cache 2g` with two GPUs allows
 approximately 4 GiB of expert records in total.
@@ -101,6 +101,38 @@ record stride, in addition to CPU expert storage. Pure GPU expert execution
 with on-demand refills remains available through the cache operator without
 NUMA registration. Decode and verification batches of up to nine rows use
 the cache; larger prefill batches retain the configured CPU/NUMA backend.
+
+## GGUF dynamic decode
+
+Ordinary GGUF experts registered with NUMA can overlap resident GPU work,
+PCIe copies of uncached experts, and CPU work. The scheduler uses per-layer
+measurements of CPU time, resident/staged GPU time, transfer time and host
+submission cost; occasional probes refresh a path that has stopped receiving
+work. No fixed-split environment variable is needed. A staged expert executes
+as soon as its own transfer and preceding GPU work finish. Staging uses
+separate temporary records and does not admit or evict cache entries.
+
+Single-row decode reuses the Q8 input prepared by resident GPU experts when
+computing staged experts. Qwen's independent shared expert is submitted
+while the single-row NUMA jobs and expert transfers are active.
+
+A zero per-device budget also supports this streamed path for ordinary GGUF
+with registered NUMA experts. It allocates metadata and temporary staging
+buffers, but zero resident slots and zero resident expert payload. The global
+CLI/API budget must still enable preparation; `--moe_cuda_cache 0` by itself
+retains its existing behavior of disabling the cache backend. For example:
+
+```sh
+FASTLLM_MOE_CUDA_CACHE_BYTES_0=0 \
+ftllm server /path/to/model --device cuda --moe_device numa --moe_cuda_cache 2g
+```
+
+Check `llm.get_moe_cuda_cache_stats(0)` for actual `payload_bytes` and `slots`.
+For the execution split, subtract snapshots from
+`llm.get_moe_cuda_cache_route_stats(0)` taken between requests. Those counters
+include single-token hybrid decode, including CPU routes; they exclude
+prefill, multi-token verification, multi-GPU expert parallelism and pure-GPU mode. Reading them synchronizes the device. A temporary GPU expert
+counts as GPU execution, but not as a resident cache hit.
 
 ## GPU-resident GGUF experts
 

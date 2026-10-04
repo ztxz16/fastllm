@@ -6637,6 +6637,15 @@ namespace fastllm {
             SigmoidMulTo(sharedResult, sharedGate);
         };
 #if defined(USE_CUDA) && !defined(USE_ROCM)
+        auto finishHybrid = [&] {
+            FastllmCudaGraphMarkParallelJoin(deviceLayer);
+            output.Reshape(input.dims);
+            sharedOutput.Reshape(input.dims);
+            ApplyDeviceMap(this->deviceMap, deviceLayer + 1, this->block_cnt);
+            Qwen4CastLike(sharedOutput, output);
+            AddTo(output, sharedOutput);
+            if (reduceOutput) ThreadTpAllReduce(output);
+        };
         if (hostMoe && threadTpOwner->expertParallel &&
             batch * sequence <= FASTLLM_CUDA_MOE_CACHE_MAX_BATCH &&
             MoeCudaCacheRequested()) {
@@ -6645,13 +6654,23 @@ namespace fastllm {
                     threadTpRank, flattened, expertIndex, expertScore, output,
                     moeWeights.data(), moeWeights.size(), deviceLayer,
                     [&] { runSharedExpert(sharedOutput); })) {
-                FastllmCudaGraphMarkParallelJoin(deviceLayer);
-                output.Reshape(input.dims);
-                sharedOutput.Reshape(input.dims);
-                ApplyDeviceMap(this->deviceMap, deviceLayer + 1, this->block_cnt);
-                Qwen4CastLike(sharedOutput, output);
-                AddTo(output, sharedOutput);
-                if (reduceOutput) ThreadTpAllReduce(output);
+                finishHybrid();
+                return;
+            }
+        }
+#endif
+#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
+        if (runRoutedExperts && numaMoe && batch * sequence == 1 &&
+            SelectDeviceFromMap(this->deviceMap, deviceLayer + 1, this->block_cnt).find("cuda") == 0 &&
+            FastllmCudaMoeCacheRequested()) {
+            selectExperts();
+            // The hybrid backend starts NUMA workers and expert DMA before
+            // this callback queues the independent shared expert. Keep its
+            // intermediates alive until both branches have been combined.
+            if (FastllmCudaMergeMOEHybrid(flattened, expertIndex, expertScore,
+                    output, moeWeights.data(), moeWeights.size(), deviceLayer,
+                    [&] { runSharedExpert(sharedOutput); })) {
+                finishHybrid();
                 return;
             }
         }

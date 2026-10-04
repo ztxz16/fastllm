@@ -53,6 +53,43 @@ public:
     }
 };
 
+// Resident experts stay on the GPU. Only misses are split between NUMA and
+// temporary GPU storage; this policy never admits or evicts a cache entry.
+// Keep one instance per layer: quantization, dimensions and CPU cost can vary.
+class MoeDecodeOverlapScheduler {
+public:
+    using Estimate = MoeDecodeScheduler::Estimate;
+    Estimate cpuExpert, residentExpert, copiedExpert, stagedExpert, dispatch;
+    uint64_t calls = 0;
+
+    int SelectMisses(int misses, int hits) const {
+        if (misses <= 0) return 0;
+        // Measure useful work during warmup instead of running extra experts.
+        // A single miss needs two calls to observe both CPU and transfer costs.
+        if (!cpuExpert.initialized) return misses / 2;
+        if (!copiedExpert.initialized || !stagedExpert.initialized)
+            return std::max(1, misses / 2);
+        const double resident = hits * residentExpert.us;
+        double best = std::max(misses * cpuExpert.us, resident);
+        int selected = 0;
+        double gpu = resident;
+        for (int n = 1; n <= misses; ++n) {
+            // Each expert can run as soon as its own DMA and the preceding
+            // GPU work finish, overlapping transfers of subsequent experts.
+            gpu = std::max(gpu, n * copiedExpert.us) + stagedExpert.us;
+            const double cost = dispatch.us + std::max((misses - n) * cpuExpert.us, gpu);
+            if (cost < best * .97) { best = cost; selected = n; }
+        }
+        // Refresh an unused path occasionally, so a change in CPU/PCIe speed
+        // can recover from an all-CPU or all-GPU choice without permanent bias.
+        if (calls % 127 == 126) {
+            if (!selected) return 1;
+            if (selected == misses) return selected - 1;
+        }
+        return selected;
+    }
+};
+
 // Observe every routed expert, including CPU work, in a payload-free LRU with
 // the real capacity and record-size partitions. This estimates reuse without copying cold weights
 // into a small cache just to find out that they will be evicted immediately.

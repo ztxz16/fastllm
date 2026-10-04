@@ -3655,8 +3655,16 @@ namespace fastllm {
     void NumasMoeDecodeExpertsWithOverlap(const float *input, float *output,
             Data **weights, const int32_t *indices, const int32_t *gpuIndices,
             int topk, int layer, const std::function<void()> &submitGpu) {
+        NumasMoeDecodeExpertsWithOverlap(input, output, weights, indices, gpuIndices,
+                                        topk, layer, submitGpu, nullptr, 0.0f, 32);
+    }
+
+    void NumasMoeDecodeExpertsWithOverlap(const float *input, float *output,
+            Data **weights, const int32_t *indices, const int32_t *gpuIndices,
+            int topk, int layer, const std::function<void()> &submitGpu,
+            const float *routeScores, float swigluLimit, int activationQuantBlock) {
         NumasMoeDecodeExpertsImpl(input, output, weights, indices, gpuIndices,
-                                 topk, layer, nullptr, 0.0f, submitGpu);
+                                 topk, layer, routeScores, swigluLimit, submitGpu, activationQuantBlock);
     }
 
     bool IsNumasLinearWeightSupported(const Data *weight) {

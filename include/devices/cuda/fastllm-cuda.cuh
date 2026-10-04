@@ -1757,6 +1757,10 @@ struct FastllmCudaMoeGGUFCacheView {
     void *workspace = nullptr;
     size_t workspaceBytes = 0;
     const uint64_t *slotOffsets = nullptr;
+    // Reuse the Q8_1 input prefix produced by an earlier call on this stream.
+    // Only valid for the same input/shape and workspace within one MoE call.
+    // Gate/down scratch may change; the input prefix must remain untouched.
+    bool q8InputPrepared = false;
 };
 bool FastllmCudaMoeGGUFCacheSupported(int type, int columns);
 bool FastllmCudaMoeGlm5GGUFCacheSupported(int gateType, int downType, int hidden, int inter);

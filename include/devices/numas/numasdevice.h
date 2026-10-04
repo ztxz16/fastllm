@@ -76,6 +76,11 @@ namespace fastllm {
     void NumasMoeDecodeExpertsWithOverlap(const float *input, float *output,
         Data **weights, const int32_t *indices, const int32_t *gpuIndices,
         int topk, int layer, const std::function<void()> &submitGpu);
+    // Scored BF16 models retain their clamp, route-score and activation boundaries.
+    void NumasMoeDecodeExpertsWithOverlap(const float *input, float *output,
+        Data **weights, const int32_t *indices, const int32_t *gpuIndices,
+        int topk, int layer, const std::function<void()> &submitGpu,
+        const float *routeScores, float swigluLimit, int activationQuantBlock);
 
     // FP32 verifier subset, returning unweighted [row, route, hidden] values.
     // An expert must have the same CPU/GPU ownership in every input row.

@@ -91,8 +91,56 @@ static void TestFrequencyAdmission() {
     Require(zero.Select(0,0,&resident,1).key < 0, "zero capacity admitted an expert");
 }
 
+static void TestDecodeOverlap() {
+    fastllm::MoeDecodeOverlapScheduler p;
+    Require(p.SelectMisses(0, 10) == 0, "all-hit layer requested PCIe work");
+    Require(p.SelectMisses(4, 6) == 2, "warmup did not sample CPU and PCIe together");
+    Require(p.SelectMisses(1, 9) == 0, "single-miss warmup did not measure CPU first");
+    p.cpuExpert.Observe(100);
+    Require(p.SelectMisses(1, 9) == 1, "single-miss warmup did not measure PCIe next");
+    p.residentExpert.Observe(5);
+    p.copiedExpert.Observe(75);
+    p.stagedExpert.Observe(10);
+    p.dispatch.Observe(8);
+    Require(p.SelectMisses(3, 7) == 2, "three-way overlap was treated as serialized work");
+    for (int i = 0; i < 100; ++i) p.copiedExpert.Observe(500);
+    Require(p.SelectMisses(3, 7) == 0, "PCIe slowdown did not shift work back to NUMA");
+    p.calls = 126;
+    Require(p.SelectMisses(3, 7) == 1, "CPU-only choice never reprobes PCIe");
+    p.calls = 127;
+    p.copiedExpert.Observe(10);
+    Require(p.SelectMisses(3, 7) == 3, "faster PCIe did not recover GPU offload");
+    p.calls = 253;
+    Require(p.SelectMisses(3, 7) == 2, "GPU-only choice never reprobes NUMA");
+    p.calls = 254;
+    p.cpuExpert.Observe(10);
+    Require(p.SelectMisses(3, 7) == 0, "faster NUMA did not reduce GPU offload");
+    p.cpuExpert.Observe(100);
+    p.residentExpert.Observe(1000);
+    // Use sustained samples, rather than assuming one noisy observation wins.
+    for (int i = 0; i < 100; ++i) {
+        p.cpuExpert.Observe(100);
+        p.residentExpert.Observe(1000);
+    }
+    Require(p.SelectMisses(3, 7) == 0, "busy resident GPU attracted additional experts");
+
+    fastllm::MoeDecodeOverlapScheduler pipeline;
+    pipeline.cpuExpert.Observe(100);
+    pipeline.copiedExpert.Observe(60);
+    pipeline.stagedExpert.Observe(40);
+    Require(pipeline.SelectMisses(6, 0) == 4,
+            "expert DMA and compute were treated as whole-batch serialization");
+    fastllm::MoeDecodeOverlapScheduler computeBound;
+    computeBound.cpuExpert.Observe(50);
+    computeBound.copiedExpert.Observe(20);
+    computeBound.stagedExpert.Observe(80);
+    Require(computeBound.SelectMisses(6, 0) == 2,
+            "compute-bound pipeline did not wait for the preceding expert");
+}
+
 int main() {
     TestFrequencyAdmission();
+    TestDecodeOverlap();
     using fastllm::MoeDecodePolicy;
     // Four alternating experts fit in a global cache, but cannot borrow
     // unused slots from a different record-size partition.

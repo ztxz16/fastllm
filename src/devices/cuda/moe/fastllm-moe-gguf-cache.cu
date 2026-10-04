@@ -268,7 +268,8 @@ __global__ void Down(const T *gateOutput, T *output, View view,
 
 template<typename T, typename View>
 bool Compute(const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &output,
-             const View &view, const float *scores, int topk, float *perExpert = nullptr) {
+             const View &view, const float *scores, int topk, float *perExpert = nullptr,
+             bool q8InputPrepared = false) {
     const int rows = input.dims[0], routes = rows * topk;
     const int stages = view.workspace && view.workspaceBytes >= Q8WorkspaceBytes(rows, view.hidden, view.inter, topk)
         ? Q8Stages(view.gateType, view.downType, view.hidden, view.inter, rows) : 0;
@@ -283,8 +284,9 @@ bool Compute(const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &out
     const auto gateType = static_cast<ggml_type>(view.gateType);
     const auto downType = static_cast<ggml_type>(view.downType);
     if (stages & 1) {
-        QuantizeQ8<<<dim3((view.hidden+255)/256, rows), 256, 0, cudaStreamPerThread>>>(
-            static_cast<const T *>(input.cudaData), qInput, view.hidden);
+        if (!q8InputPrepared)
+            QuantizeQ8<<<dim3((view.hidden+255)/256, rows), 256, 0, cudaStreamPerThread>>>(
+                static_cast<const T *>(input.cudaData), qInput, view.hidden);
         switch (gateType) {
 #define Q8_GATE(name) case GGML_TYPE_##name: \
             Q8Projection<GGML_TYPE_##name, T, true><<<dim3((view.inter+7)/8, routes), 256, \
@@ -453,9 +455,9 @@ bool FastllmCudaMoeGGUFCacheCompute(const fastllm::Data &input, fastllm::Data &g
         !FastllmCudaMoeGGUFCacheSupported(view.gateType, view.hidden) ||
         !FastllmCudaMoeGGUFCacheSupported(view.downType, view.inter)) return false;
     switch (input.dataType) {
-        case fastllm::FLOAT32: return Compute<float>(input, gate, output, view, scores, topk, perExpert);
-        case fastllm::FLOAT16: return Compute<half>(input, gate, output, view, scores, topk, perExpert);
-        case fastllm::BFLOAT16: return Compute<__nv_bfloat16>(input, gate, output, view, scores, topk, perExpert);
+        case fastllm::FLOAT32: return Compute<float>(input, gate, output, view, scores, topk, perExpert, view.q8InputPrepared);
+        case fastllm::FLOAT16: return Compute<half>(input, gate, output, view, scores, topk, perExpert, view.q8InputPrepared);
+        case fastllm::BFLOAT16: return Compute<__nv_bfloat16>(input, gate, output, view, scores, topk, perExpert, view.q8InputPrepared);
         default: return false;
     }
 }
