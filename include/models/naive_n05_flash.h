@@ -25,6 +25,8 @@ namespace fastllm {
                               std::vector<std::pair<Data, Data>> &kv,
                               const GenerationConfig &config, const Data *embedding = nullptr);
         bool NeedAttentionMask(int, int) override { return false; }
+        // Bound idle TP prefill workspace with the shared pressure-aware pool.
+        bool RetainCudaWorkspace() const override { return tpDevices.size() > 1; }
         // The history archive also retains keys discarded by sliding attention.
         bool UseGenericHistoryCache() const override { return false; }
         bool TryRestoreHistoryCache(std::vector<int> &tokens, int &cacheLen) override;

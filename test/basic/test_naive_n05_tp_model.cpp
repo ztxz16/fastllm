@@ -86,6 +86,8 @@ class Fixture : public NaiveN05FlashModel {
         }
     }
     std::vector<std::vector<float>> Run() {
+        if (RetainCudaWorkspace() != (ranks > 1))
+            throw std::runtime_error("unexpected serial/TP workspace policy");
         WarmUp();
         if (elementsInKVCachePerToken != std::max(4, ranks) * 48 + ranks * 128)
             throw std::runtime_error("physical KV cache accounting mismatch");
