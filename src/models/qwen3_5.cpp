@@ -26816,21 +26816,7 @@ namespace fastllm {
 
     void Qwen3_5Model::OnModelWeightsLoaded() {
         imageEmbeddingCache.reset();
-        bool forceSafeGgufDequant = false;
-        for (const auto &item : this->weight.weight) {
-            forceSafeGgufDequant |= item.second.forceGGUFFp32Dequant;
-        }
         RestoreGgufGdnWeights(0, block_cnt);
-
-        if (forceSafeGgufDequant) {
-            for (auto &item : this->weight.weight) {
-                Data &loadedWeight = item.second;
-                if (loadedWeight.isGGUFData ||
-                    loadedWeight.dataType == DataType::DATA_GGUF_FORMAT) {
-                    loadedWeight.forceGGUFFp32Dequant = true;
-                }
-            }
-        }
 
         auto finalNorm = this->weight.weight.find(
             language_prefix + "norm.weight");
