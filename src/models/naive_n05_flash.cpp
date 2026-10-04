@@ -93,6 +93,7 @@ NaiveN05FlashModel::~NaiveN05FlashModel() {
     ShutdownRuntime();
     tpWorkers.Stop();
     tpDecodeState.reset();
+    tpVerifyState.reset();
 }
 
 void NaiveN05FlashModel::InitParams() {
@@ -233,6 +234,8 @@ Data NaiveN05FlashModel::RunTarget(
                     (int)pastKeyValues.size() == block_cnt,
                     "Naive-N0.5 expects one unpadded sequence and a complete KV cache.");
     const bool tensorParallel = tpRank >= 0;
+    const bool decodeWorkspace = workspace && workspace->capacity > 0;
+    const bool graphVerify = decodeWorkspace && capture && capture->verifying;
     const int gpu = tensorParallel ? tpDevices.at(tpRank) : -1;
     Data emptyWeight;
     auto localWeight = [&](const std::string &name) -> Data & {
@@ -245,7 +248,7 @@ Data NaiveN05FlashModel::RunTarget(
     auto &moeBiases = tensorParallel ? tpMoeBiases.at(tpRank) : this->moeBiases;
     size_t communication = 0;
     auto reduce = [&](Data &data) {
-        if (workspace) {
+        if (decodeWorkspace) {
             auto &state = *tpDecodeState;
             auto &rank = *state.ranks.at(tpRank);
             if (state.mode == TPDecodeState::Warm)
@@ -255,8 +258,18 @@ Data NaiveN05FlashModel::RunTarget(
                 rank.ok = false;
             ++communication;
         }
-        if (tensorParallel)
-            FastllmNcclAllReduce(data.cudaData, data.cudaData, data.Count(0), data.dataType, gpu);
+        if (!tensorParallel) return;
+        if (capture && capture->verifying && inputIds.dims[1] > 1) {
+            if (!FastllmCudaCustomAllReduceRows(data.cudaData, data.cudaData,
+                    data.Count(0), embed_dim, data.dataType, gpu)) {
+                // An unsupported/disabled custom path must retain ordinary
+                // single-token NCCL arithmetic, including its message size.
+                for (int row = 0; row < inputIds.dims[1]; ++row) {
+                    void *ptr = (uint8_t *)data.cudaData + (size_t)row * embed_dim * data.unitSize;
+                    FastllmNcclAllReduce(ptr, ptr, embed_dim, data.dataType, gpu);
+                }
+            }
+        } else FastllmNcclAllReduce(data.cudaData, data.cudaData, data.Count(0), data.dataType, gpu);
     };
     int length = inputIds.dims[1];
     const int reserveCapacity = CacheReserveCapacity(config);
@@ -319,16 +332,19 @@ Data NaiveN05FlashModel::RunTarget(
     Data &indexWeights = buf.indexWeights;
     Data &indices = buf.indices;
     Data &positions = buf.positions;
-    if (!workspace) {
+    if (!decodeWorkspace) {
         positions.CopyFrom(positionIds);
         ToDataType(positions, DataType::FLOAT32);
     }
     if (embedding) hidden.CopyFrom(*embedding);
-    else if (workspace) EmbeddingDirect(inputIds, localWeight("model.embed_tokens.weight"), hidden);
+    // A persistent verification workspace keeps BF16 storage. Embedding's
+    // FP32 intermediate cannot reuse that allocation at the same element count.
+    else if (decodeWorkspace || (workspace && GetCudaEmbedding() && !GetLowMemMode()))
+        EmbeddingDirect(inputIds, localWeight("model.embed_tokens.weight"), hidden);
     else Embedding(inputIds, localWeight("model.embed_tokens.weight"), hidden);
     ToDataType(hidden, DataType::BFLOAT16);
     auto norm = [&](Data &input, Data &weight, Data &output) {
-        if (!workspace) {
+        if (!decodeWorkspace) {
             KimiK3RMSNorm(input, weight, rms_norm_eps, output);
             return;
         }
@@ -353,7 +369,7 @@ Data NaiveN05FlashModel::RunTarget(
         int rotaryDim = (int)(cfg.headDim * partialRotary);
         // This RMSNorm rounds the normalized activation before multiplying
         // the affine weight, matching the checkpoint's LlamaRMSNorm.
-        if (!workspace || layer == 0)
+        if (!decodeWorkspace || layer == 0)
             norm(hidden, localWeight(prefix + ".input_layernorm.weight"), normed);
         Linear(normed, localWeight(ap + "q_proj.weight"), localWeight(ap + "q_proj.bias"), q);
         Linear(normed, localWeight(ap + "k_proj.weight"), localWeight(ap + "k_proj.bias"), k);
@@ -368,7 +384,7 @@ Data NaiveN05FlashModel::RunTarget(
             Linear(normed, localWeight(ip + "wk.weight"), Data(), indexKey);
             // LayerNorm accumulates in FP32; the generic CUDA operation does
             // not accept BF16 storage, so round only its final result.
-            if (workspace) {
+            if (decodeWorkspace) {
                 ToDataType(indexKey, buf.indexKeyFloat, DataType::FLOAT32);
                 LayerNorm(buf.indexKeyFloat, localWeight(ip + "k_norm.weight"),
                           localWeight(ip + "k_norm.bias"), -1, buf.indexKeyFloat);
@@ -395,8 +411,10 @@ Data NaiveN05FlashModel::RunTarget(
         const int layerCapacity = slidingLayers[layer]
             ? (int)std::min<int64_t>(reserveCapacity, (int64_t)window - 1 + length)
             : reserveCapacity;
-        if (workspace) {
-            FastllmCudaNaiveAppendDecodeCache(pastKey, pastValue, packed, v,
+        if (decodeWorkspace) {
+            if (graphVerify) FastllmCudaNaiveAppendVerifyCache(pastKey, pastValue, packed, v,
+                buf.liveKeys, slidingLayers[layer] ? window : 0);
+            else FastllmCudaNaiveAppendDecodeCache(pastKey, pastValue, packed, v,
                 buf.liveKeys, slidingLayers[layer] ? window : 0);
         } else {
             AppendCache(pastKey, packed, layerCapacity);
@@ -404,18 +422,23 @@ Data NaiveN05FlashModel::RunTarget(
         }
         Data noIndices;
         Data *selected = &noIndices;
-        if (!slidingLayers[layer] && (workspace ? buf.capacity : pastKey.dims[1]) > indexTopK) {
+        if (!slidingLayers[layer] && (decodeWorkspace ? buf.capacity : pastKey.dims[1]) > indexTopK) {
             std::string ip = ap + "indexer.";
             Linear(normed, localWeight(ip + "wq.weight"), Data(), indexQ);
             FastllmCudaNaiveRope(indexQ, positions, indexHeads, indexDim, rotaryDim, cfg.theta);
             Linear(normed, localWeight(ip + "weights_proj.weight"), Data(), indexWeights);
             Mul(indexWeights, 1.0f / std::sqrt((float)indexHeads), indexWeights);
-            if (workspace) {
-                FastllmCudaNaiveDecodeIndexer(indexQ, indexWeights, pastKey,
+            if (decodeWorkspace) {
+                if (graphVerify) FastllmCudaNaiveGraphVerifyIndexer(indexQ, indexWeights, pastKey,
+                    buf.liveKeys, buf.capacity, indexFp8, buf.decode, indices);
+                else FastllmCudaNaiveDecodeIndexer(indexQ, indexWeights, pastKey,
                     buf.liveKeys, buf.capacity, indexFp8, buf.decode, indices);
             } else {
-                FastllmCudaNaiveIndexer(indexQ, indexWeights, pastKey, indexHeads, indexDim,
-                                        localPast, indexTopK, indexFp8, indices);
+                if (capture && capture->verifying && length <= 8)
+                    FastllmCudaNaiveVerifyIndexer(indexQ, indexWeights, pastKey, indexHeads,
+                        indexDim, localPast, indexTopK, indexFp8, indices);
+                else FastllmCudaNaiveIndexer(indexQ, indexWeights, pastKey, indexHeads, indexDim,
+                                            localPast, indexTopK, indexFp8, indices);
             }
             selected = &indices;
         }
@@ -424,22 +447,29 @@ Data NaiveN05FlashModel::RunTarget(
             ToDataType(sink, DataType::FLOAT32);
             sink.ToDevice(q.dataDevice, q.dataDeviceIds);
         }
-        if (workspace) {
-            FastllmCudaNaiveDecodeAttention(q, pastKey, pastValue, *selected, sink,
+        if (decodeWorkspace) {
+            if (graphVerify) FastllmCudaNaiveGraphVerifyAttention(q, pastKey, pastValue, *selected, sink,
                 buf.liveKeys, buf.capacity, cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
                 slidingLayers[layer] ? window : 0, buf.decode, attn);
-            if (slidingLayers[layer])
+            else FastllmCudaNaiveDecodeAttention(q, pastKey, pastValue, *selected, sink,
+                buf.liveKeys, buf.capacity, cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
+                slidingLayers[layer] ? window : 0, buf.decode, attn);
+            if (slidingLayers[layer] && !graphVerify)
                 FastllmCudaNaiveTrimDecodeCache(pastKey, pastValue, buf.liveKeys, window);
         } else {
-            FastllmCudaNaiveAttention(q, pastKey, pastValue, *selected, sink,
-                                      cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
-                                      localPast, slidingLayers[layer] ? window : 0, attn);
+            if (capture && capture->verifying && length <= 8)
+                FastllmCudaNaiveVerifyAttention(q, pastKey, pastValue, *selected, sink,
+                    cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
+                    localPast, slidingLayers[layer] ? window : 0, attn);
+            else FastllmCudaNaiveAttention(q, pastKey, pastValue, *selected, sink,
+                                           cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
+                                           localPast, slidingLayers[layer] ? window : 0, attn);
             if (slidingLayers[layer] && (!capture || !capture->verifying))
                 FastllmCudaNaiveTrimCache(pastKey, pastValue, window - 1);
         }
         Linear(attn, localWeight(ap + "o_proj.weight"), Data(), projected);
         reduce(projected);
-        if (workspace) {
+        if (decodeWorkspace) {
             FastllmCudaNaiveAddDecodeRMSNorm(hidden, projected,
                 localWeight(prefix + ".post_attention_layernorm.weight"), rms_norm_eps, normed);
         } else {
@@ -447,7 +477,7 @@ Data NaiveN05FlashModel::RunTarget(
             norm(hidden, localWeight(prefix + ".post_attention_layernorm.weight"), normed);
         }
         auto addMlpResidual = [&](Data &branch) {
-            if (!workspace) { AddTo(hidden, branch); return; }
+            if (!decodeWorkspace) { AddTo(hidden, branch); return; }
             const bool lastLayer = layer + 1 == block_cnt;
             const std::string name = lastLayer ? "model.norm.weight" :
                 "model.layers." + std::to_string(layer + 1) + ".input_layernorm.weight";
@@ -493,6 +523,51 @@ Data NaiveN05FlashModel::RunTarget(
                     {"biass___batch", (int)moeBiases[layer].size()},
                     {"layer", layer}, {"gateType", (int)MoeGateSwiglu}, {"fp8EagerMode", 1}
                 });
+            } else if (capture && capture->verifying && length > 1 &&
+                       (moeWeights[layer][2]->dataType == DataType::BFLOAT16 ||
+                        moeWeights[layer][2]->dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED) &&
+                       normed.dataDevice == DataDevice::CUDA) {
+                // Expert batching can change BF16 accumulation order, including
+                // Marlin's split-K schedule. Verify with decode arithmetic;
+                // the following TP reduction still covers the entire block.
+                moeOutput.dataType = BFLOAT16;
+                moeOutput.Resize({length, embed_dim});
+                moeOutput.ToDevice(normed.dataDevice, normed.dataDeviceIds);
+                moeOutput.Allocate(false);
+                const bool residentRows =
+                    moeWeights[layer][2]->dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED &&
+                    FastllmCudaNVFP4E4M3GroupedMoeSupported(normed.dataDeviceIds.at(0)) &&
+                    FastllmCudaPrepareNVFP4E4M3Moe(moeWeights[layer].data(), moeWeights[layer].size());
+                const bool mergedRows = residentRows &&
+                    FastllmCudaMergeMOENVFP4E4M3MarlinRows(normed, w1, w2, moeOutput,
+                        moeWeights[layer].data(), moeWeights[layer].size(),
+                        (const int32_t *)expertIndex.cudaData, (const float *)expertScore.cudaData,
+                        length, num_experts_per_tok);
+                for (int row = 0; !mergedRows && row < length; ++row) {
+                    Data rowInput(BFLOAT16, {1, embed_dim});
+                    Data rowIndex, rowScore, rowOutput;
+                    rowInput.FakeFrom(normed, (size_t)row * embed_dim * 2);
+                    if (residentRows) {
+                        rowIndex.Resize({1, expertIndex.dims[1]});
+                        rowScore.Resize({1, expertScore.dims[1]});
+                        rowOutput.Resize({1, embed_dim});
+                        rowIndex.FakeFrom(expertIndex, (size_t)row * expertIndex.GetBytes() / length);
+                        rowScore.FakeFrom(expertScore, (size_t)row * expertScore.GetBytes() / length);
+                        rowOutput.FakeFrom(moeOutput, (size_t)row * embed_dim * 2);
+                    } else {
+                        // Generic expert backends may move routing to CPU;
+                        // those need owning tensors instead of device views.
+                        Split(expertIndex, 0, row, row + 1, rowIndex);
+                        Split(expertScore, 0, row, row + 1, rowScore);
+                    }
+                    MergeMOEBlock(&rowInput, &rowIndex, &rowScore, &moeWeights[layer],
+                        &moeBiases[layer], &w1, &w2, &w3, &tempInput, &tempOutput,
+                        0.0f, &rowOutput, layer, DataType::BFLOAT16, moeAtype,
+                        &moeInputTemp, &moeOutputTemp);
+                    if (!residentRows)
+                        FastllmCudaCopyFromDeviceToDevice((uint16_t *)moeOutput.cudaData + (size_t)row * embed_dim,
+                                                         rowOutput.cudaData, (size_t)embed_dim * 2);
+                }
             } else {
                 MergeMOEBlock(&normed, &expertIndex, &expertScore, &moeWeights[layer],
                               &moeBiases[layer], &w1, &w2, &w3, &tempInput, &tempOutput,
@@ -504,19 +579,20 @@ Data NaiveN05FlashModel::RunTarget(
             reduce(moeOutput);
             addMlpResidual(moeOutput);
         }
-        if (capture && std::find(draftTargetLayers.begin(), draftTargetLayers.end(), layer) != draftTargetLayers.end())
+        if (capture && capture->collectHidden &&
+            std::find(draftTargetLayers.begin(), draftTargetLayers.end(), layer) != draftTargetLayers.end())
             Copy(hidden, capture->hidden[layer]);
     }
     if (!tensorParallel && !capture) FinishHistoryChunk(pastKeyValues, historyChunk);
     if (isIntermediateChunkedPrefill) return Data();
     Data localLogits;
-    Data &last = buf.last, &logits = workspace ? buf.logits : localLogits;
-    if (!workspace) {
+    Data &last = buf.last, &logits = decodeWorkspace ? buf.logits : localLogits;
+    if (!decodeWorkspace) {
         if (capture && capture->verifying) Copy(hidden, last);
         else Split(hidden, 1, length - 1, length, last);
         norm(last, localWeight("model.norm.weight"), last);
     }
-    if (workspace) {
+    if (decodeWorkspace) {
         // Conversions must not free addresses retained by the graph.
         Linear(last, localWeight("lm_head.weight"), Data(), buf.logitsBf16);
         ToDataType(buf.logitsBf16, logits, DataType::FLOAT32);

@@ -5,6 +5,7 @@
 #include <cmath>
 #ifdef USE_CUDA
 #include "devices/cuda/naive-n05-cuda.cuh"
+#include "devices/cuda/fastllm-cuda.cuh"
 #endif
 
 namespace fastllm {
@@ -16,6 +17,228 @@ namespace {
         if (input.Count(0) / input.dims.back() > 1) MatMulTransB(input, weight, output);
         else Linear(input, weight, Data(), output);
     }
+}
+
+#ifdef USE_CUDA
+struct NaiveN05FlashModel::DraftWorkspace {
+    struct Layer { Data normed, q, k, v, attention, output, gate, up, scores; };
+    struct Graph {
+        void *graph = nullptr, *exec = nullptr;
+        std::vector<void *> reserved;
+        void Clear() {
+            FastllmCudaGraphExecDestroy(exec);
+            FastllmCudaGraphDestroy(graph);
+            exec = graph = nullptr;
+            FastllmCudaGraphMemoryPoolRelease(reserved);
+            reserved.clear();
+        }
+    } graphs[2];
+    int device = -1;
+    bool disabled = false;
+    std::vector<void *> inputs;
+    Data id, live, positions, hidden, normalized;
+    std::vector<Layer> layers;
+    ~DraftWorkspace() {
+        int previous = FastllmCudaGetDevice();
+        if (device >= 0) FastllmCudaSetDevice(device);
+        for (auto &graph : graphs) graph.Clear();
+        // Data frees use their recorded device; restore the caller's selection.
+        FastllmCudaSetDevice(previous);
+    }
+};
+#endif
+
+std::shared_ptr<NaiveN05FlashModel::DraftContext> NaiveN05FlashModel::CreateDraftContext() {
+    // The request lifecycle and caller hold historyMutex. Reuse storage only;
+    // reset every logical prefix, proposal and sampling state for a new request.
+    auto context = std::make_shared<DraftContext>();
+    if (idleDraftContext) {
+        context->kv.swap(idleDraftContext->kv);
+        context->workspace.swap(idleDraftContext->workspace);
+        idleDraftContext.reset();
+        for (auto &pair : context->kv)
+            for (Data *cache : {&pair.first, &pair.second})
+                cache->Resize({1, 0, cache->dims[2]});
+    }
+    return context;
+}
+
+bool NaiveN05FlashModel::RunDraftGraph(int anchor, DraftContext &context, Data &output) {
+#ifdef USE_CUDA
+    if (!GetFastllmEnv().cudaGraph || !GetCudaEmbedding() || GetLowMemMode() ||
+        draftBlock < 2 || draftBlock >= 32 || draftHeadDim % 4 || draftHeadDim > 256 ||
+        context.kv.size() != (size_t)draftLayers) return false;
+    ApplyDraftDevice();
+    const int device = FastllmCudaGetDevice();
+    Data &embedding = DraftWeight("model.embed_tokens.weight");
+    Data &mask = weight["dspark.mask_embedding"];
+    if (embedding.dataType != BFLOAT16 || mask.dataType != BFLOAT16 ||
+        mask.Count(0) != embed_dim) return false;
+    embedding.ToDevice(DataDevice::CUDA, std::vector<int>{device});
+    mask.ToDevice(DataDevice::CUDA, std::vector<int>{device});
+    std::vector<void *> inputs{embedding.cudaData, mask.cudaData};
+    for (auto &pair : context.kv) for (Data *cache : {&pair.first, &pair.second}) {
+        if (cache->dataType != BFLOAT16 || cache->dataDevice != DataDevice::CUDA ||
+            cache->dataDeviceIds != std::vector<int>{device} || cache->expansionDims.empty() ||
+            cache->expansionDims[1] < draftWindow + draftBlock) return false;
+        inputs.push_back(cache->cudaData);
+    }
+    if (context.workspace && (context.workspace->device != device || context.workspace->inputs != inputs))
+        context.workspace.reset();
+    if (!context.workspace) {
+        context.workspace = std::make_shared<DraftWorkspace>();
+        context.workspace->device = device;
+        context.workspace->inputs = std::move(inputs);
+        context.workspace->layers.resize(draftLayers);
+    }
+    auto &state = *context.workspace;
+    if (state.disabled) return false;
+    auto upload = [&](Data &target, DataType type, void *value) {
+        if (target.dims.empty()) {
+            target.dataType = type;
+            target.UpdateUnitSize();
+            target.dataDevice = DataDevice::CUDA;
+            target.dataDeviceIds = {device};
+            target.Resize({1});
+            target.Allocate();
+        }
+        FastllmCudaCopyFromHostToDevice(target.cudaData, value, sizeof(int));
+    };
+    float token = anchor;
+    int live = context.committed + 1;
+    upload(state.id, FLOAT32, &token);
+    upload(state.live, INT32, &live);
+    const bool shortAttention = std::min(context.committed, draftWindow - 1) + draftBlock <= 256;
+    auto &graph = state.graphs[shortAttention ? 0 : 1];
+    auto body = [&]() {
+        FastllmCudaNaiveDraftInput(state.id, embedding, mask, state.live, draftBlock,
+                                  state.hidden, state.positions);
+        for (int i = 0; i < draftLayers; ++i) {
+            const std::string layer = "dspark.layers." + std::to_string(i) + ".";
+            auto &b = state.layers[i];
+            KimiK3RMSNorm(state.hidden, weight[layer + "input_layernorm.weight"], draftEps, b.normed);
+            DraftLinear(b.normed, weight[layer + "self_attn.q_proj.weight"], b.q);
+            DraftLinear(b.normed, weight[layer + "self_attn.k_proj.weight"], b.k);
+            DraftLinear(b.normed, weight[layer + "self_attn.v_proj.weight"], b.v);
+            b.q.Reshape({1, draftBlock * draftHeads, draftHeadDim});
+            b.k.Reshape({1, draftBlock * draftKvHeads, draftHeadDim});
+            KimiK3RMSNorm(b.q, weight[layer + "self_attn.q_norm.weight"], draftEps, b.q);
+            KimiK3RMSNorm(b.k, weight[layer + "self_attn.k_norm.weight"], draftEps, b.k);
+            b.q.Reshape({1, draftBlock, draftHeads * draftHeadDim});
+            b.k.Reshape({1, draftBlock, draftKvHeads * draftHeadDim});
+            FastllmCudaNaiveRope(b.q, state.positions, draftHeads, draftHeadDim, draftHeadDim, draftTheta);
+            FastllmCudaNaiveRope(b.k, state.positions, draftKvHeads, draftHeadDim, draftHeadDim, draftTheta);
+            auto &cache = context.kv[i];
+            FastllmCudaNaiveAppendVerifyCache(cache.first, cache.second, b.k, b.v, state.live, draftWindow);
+            FastllmCudaNaiveDraftAttention(b.q, cache.first, cache.second, state.live,
+                draftHeads, draftKvHeads, draftHeadDim, draftWindow, shortAttention, b.scores, b.attention);
+            DraftLinear(b.attention, weight[layer + "self_attn.o_proj.weight"], b.output);
+            AddTo(state.hidden, b.output);
+            KimiK3RMSNorm(state.hidden, weight[layer + "post_attention_layernorm.weight"], draftEps, b.normed);
+            DraftLinear(b.normed, weight[layer + "mlp.gate_proj.weight"], b.gate);
+            DraftLinear(b.normed, weight[layer + "mlp.up_proj.weight"], b.up);
+            Silu(b.gate, b.gate);
+            MulTo(b.gate, b.up);
+            DraftLinear(b.gate, weight[layer + "mlp.down_proj.weight"], b.output);
+            AddTo(state.hidden, b.output);
+        }
+        KimiK3RMSNorm(state.hidden, weight["dspark.norm.weight"], draftEps, state.normalized);
+    };
+    if (graph.exec) {
+        AssertInFastLLM(FastllmCudaGraphLaunch(graph.exec), "Naive draft graph launch failed.");
+    } else {
+        body();
+        // Warmup resolves weights, cuBLAS and all persistent workspaces. Capture
+        // does not commit any KV metadata or advance the proposal RNG.
+        bool pool = FastllmCudaGraphPrepareCaptureDevice() && FastllmCudaGraphMemoryPoolBegin();
+        bool ok = false;
+        if (pool) {
+            FastllmCudaClearThreadError();
+            if (FastllmCudaGraphBeginCapture()) {
+                try { body(); }
+                catch (...) {
+                    FastllmCudaGraphEndCapture(&graph.graph);
+                    FastllmCudaGraphMemoryPoolEnd(graph.reserved);
+                    graph.Clear();
+                    state.disabled = true;
+                    throw;
+                }
+                bool clean = !FastllmCudaGetThreadError();
+                ok = FastllmCudaGraphEndCapture(&graph.graph) && clean;
+            }
+            ok = FastllmCudaGraphMemoryPoolEnd(graph.reserved) && ok;
+            if (ok) ok = FastllmCudaGraphInstantiate(graph.graph, &graph.exec);
+        }
+        if (!ok) {
+            graph.Clear();
+            state.disabled = true;
+            FastllmCudaClearLastError();
+            FastllmCudaClearThreadError();
+            fprintf(stderr, "[Fastllm] Naive draft graph capture failed; using eager.\n");
+            return false;
+        }
+    }
+    Copy(state.normalized, output);
+    return true;
+#else
+    return false;
+#endif
+}
+
+void NaiveN05FlashModel::ApplyDraftDevice() {
+    if (tpDevices.empty()) ApplyDeviceMap(deviceMap, block_cnt, block_cnt);
+    else ApplyDeviceMap({{"cuda:" + std::to_string(tpDevices.front()), 1}}, 1, 1);
+}
+
+Data &NaiveN05FlashModel::DraftWeight(const std::string &name) {
+    Data &data = weight[name];
+    return tpDevices.empty() || !data.multiDeviceData ? data :
+        *data.multiDeviceDatas.at(tpDevices.front());
+}
+
+Data NaiveN05FlashModel::RunDraftTarget(const Data &inputIds, const Data &positions,
+        std::vector<std::pair<Data, Data>> &kv, const GenerationConfig &config,
+        TargetCapture &capture) {
+    return tpDevices.empty() ? RunTarget(inputIds, positions, kv, config, &capture) :
+        ForwardTensorParallel(inputIds, positions, kv, config, &capture);
+}
+
+void NaiveN05FlashModel::CommitTargetCache(std::vector<std::pair<Data, Data>> &kv,
+        int past, int count) {
+#ifdef USE_CUDA
+    auto commit = [&](int device) {
+        for (int layer = 0; layer < block_cnt; ++layer) {
+            const int length = (slidingLayers[layer] ? std::min(past, window - 1) : past) + count;
+            auto &pair = kv[layer];
+            Data &key = device < 0 ? pair.first : *pair.first.multiDeviceDatas.at(device);
+            Data &value = device < 0 ? pair.second : *pair.second.multiDeviceDatas.at(device);
+            key.Resize({1, length, key.dims[2]});
+            value.Resize({1, length, value.dims[2]});
+            if (slidingLayers[layer]) {
+                FastllmCudaSetDevice(key.dataDeviceIds.at(0));
+                FastllmCudaNaiveTrimCache(key, value, window - 1);
+            }
+        }
+    };
+    if (tpDevices.empty()) commit(-1);
+    else {
+        std::vector<std::exception_ptr> errors(tpDevices.size());
+        tpWorkers.Run(tpDevices, [&](int rank) {
+            const int device = tpDevices[rank];
+            FastllmCudaSetDevice(device);
+            commit(device);
+            ForceDeviceSync();
+        }, errors);
+        for (auto error : errors) if (error) std::rethrow_exception(error);
+        for (int layer = 0; layer < block_cnt; ++layer) {
+            auto &pair = kv[layer];
+            const int length = (slidingLayers[layer] ? std::min(past, window - 1) : past) + count;
+            int kept = slidingLayers[layer] ? std::min(length, window - 1) : length;
+            pair.first.Resize({1, kept, pair.first.dims[2]});
+            pair.second.Resize({1, kept, pair.second.dims[2]});
+        }
+    }
+#endif
 }
 
 void NaiveN05FlashModel::InitDraft() {
@@ -76,7 +299,7 @@ void NaiveN05FlashModel::InitDraft() {
 
 void NaiveN05FlashModel::AppendDraftContext(Data &hidden, int start, DraftContext &context) {
 #ifdef USE_CUDA
-    ApplyDeviceMap(deviceMap, block_cnt, block_cnt);
+    ApplyDraftDevice();
     int length = hidden.dims[1];
     // Only the last window - 1 context positions can be visible to the next block.
     int begin = std::max(0, length - draftWindow + 1);
@@ -97,10 +320,12 @@ void NaiveN05FlashModel::AppendDraftContext(Data &hidden, int start, DraftContex
         key.Reshape({1, length, draftKvHeads * draftHeadDim});
         pos.ToDevice(key.dataDevice, key.dataDeviceIds);
         FastllmCudaNaiveRope(key, pos, draftKvHeads, draftHeadDim, draftHeadDim, draftTheta);
-        AppendCache(context.kv[i].first, key);
-        AppendCache(context.kv[i].second, value);
-        TrimCache(context.kv[i].first, draftWindow - 1);
-        TrimCache(context.kv[i].second, draftWindow - 1);
+        AppendCache(context.kv[i].first, key, draftWindow + draftBlock);
+        AppendCache(context.kv[i].second, value, draftWindow + draftBlock);
+        // Retain bounded draft KV storage between proposal/commit rounds.
+        // Copying the suffix discards capacity and reallocates ten buffers
+        // on every round once the draft window is full.
+        FastllmCudaNaiveTrimCache(context.kv[i].first, context.kv[i].second, draftWindow - 1);
     }
     context.committed = start + begin + length;
 #endif
@@ -108,7 +333,7 @@ void NaiveN05FlashModel::AppendDraftContext(Data &hidden, int start, DraftContex
 
 void NaiveN05FlashModel::CommitDraftContext(TargetCapture &capture, int tokens,
         DraftContext &context, std::vector<std::pair<Data, Data>> &kv) {
-    ApplyDeviceMap(deviceMap, block_cnt, block_cnt);
+    ApplyDraftDevice();
     Data combined;
     for (int layer : draftTargetLayers) {
         Data selected, joined;
@@ -141,10 +366,11 @@ void NaiveN05FlashModel::CommitDraftContext(TargetCapture &capture, int tokens,
 
 Data NaiveN05FlashModel::RunDraft(int anchor, DraftContext &context) {
     Data normalized;
+    if (RunDraftGraph(anchor, context, normalized)) return normalized;
 #ifdef USE_CUDA
-    ApplyDeviceMap(deviceMap, block_cnt, block_cnt);
+    ApplyDraftDevice();
     Data id(FLOAT32, {1, 1}, {(float)anchor}), hidden;
-    Embedding(id, weight["model.embed_tokens.weight"], hidden);
+    Embedding(id, DraftWeight("model.embed_tokens.weight"), hidden);
     ToDataType(hidden, BFLOAT16);
     Data &mask = weight["dspark.mask_embedding"];
     AssertInFastLLM(mask.Count(0) == embed_dim, "Invalid DSpark mask embedding.");
@@ -204,7 +430,7 @@ int NaiveN05FlashModel::ForwardDraft(
     {
         std::lock_guard<std::mutex> guard(historyMutex);
         auto &entry = draftContexts[&kv];
-        if (!entry) entry = std::make_shared<DraftContext>();
+        if (!entry) entry = CreateDraftContext();
         owner = entry;
     }
     auto &context = *owner;
@@ -234,17 +460,23 @@ int NaiveN05FlashModel::ForwardDraft(
     int limit = std::min(draftTokens, max_positions - oldLength - 1);
     if (config.output_token_limit > 0)
         limit = std::min(limit, config.output_token_limit - (oldLength - config.input_token_length) - 1);
-    if (context.kv.empty() || inputIds.dims[1] != 1 || config.output_logits || constrained || limit <= 0) {
+    if (context.committed == 0 || context.kv.empty() || inputIds.dims[1] != 1 || config.output_logits || constrained || limit <= 0) {
         TargetCapture capture;
-        Data logits = RunTarget(inputIds, positions, kv, config, &capture);
-        CommitDraftContext(capture, inputIds.dims[1], context, kv);
+        // With history disabled, only the final draft window is ever used.
+        // Preserve absolute position accounting while skipping invisible
+        // prompt chunks' feature copies, projection and draft KV construction.
+        const int draftStart = std::max(0, config.input_token_length - draftWindow + 1);
+        capture.collectHidden = saveHistoryChat || oldLength + inputIds.dims[1] > draftStart;
+        Data logits = RunDraftTarget(inputIds, positions, kv, config, capture);
+        if (capture.collectHidden) CommitDraftContext(capture, inputIds.dims[1], context, kv);
+        else context.committed += inputIds.dims[1];
         if (isIntermediateChunkedPrefill) return 0;
         return SampleTarget(logits, kv, config, lastTokens, retLogits);
     }
     Data draftHidden = RunDraft(anchor, context), selected, baseLogits;
     // DSpark predicts after the anchor at slot 0, unlike DFlash's masked-slot-only head.
     Split(draftHidden, 1, 0, limit, selected);
-    DraftLinear(selected, weight["lm_head.weight"], baseLogits);
+    baseLogits = RunDraftHead(selected);
     const int vocab = baseLogits.dims.back();
     const bool greedy = config.IsSimpleGreedy() && config.output_token_least <= 0;
     LastTokensUnit samplingTokens = lastTokens.units.empty() ? LastTokensUnit(config.last_n) : lastTokens.units[0];
@@ -294,12 +526,18 @@ int NaiveN05FlashModel::ForwardDraft(
     }
     std::vector<float> verifyIds{(float)anchor}, verifyPositions;
     for (int token : proposed) verifyIds.push_back((float)token);
+    // Confidence may shorten proposals while an eight-row graph is ready.
+    // Causal padding preserves every useful logit. Acceptance/commit below
+    // remain bounded by proposed.size(), and limit already checks both the
+    // remaining context and output budget. Unsupported backends stay eager.
+    if (limit == 7 && HasVerificationGraph()) verifyIds.resize(8, (float)anchor);
     for (int i = 0; i < (int)verifyIds.size(); ++i) verifyPositions.push_back(oldLength + i);
     Data verifyInput(FLOAT32, {1, (int)verifyIds.size()}, verifyIds);
     Data verifyPos(FLOAT32, {1, (int)verifyIds.size()}, verifyPositions);
     TargetCapture capture;
     capture.verifying = true;
-    Data logits = RunTarget(verifyInput, verifyPos, kv, config, &capture);
+    Data logits = RunDraftTarget(verifyInput, verifyPos, kv, config, capture);
+    ApplyDraftDevice();
     samplingTokens = lastTokens.units.empty() ? LastTokensUnit(config.last_n) : lastTokens.units[0];
     int accepted = 0, next = -1;
     if (greedy) {
@@ -327,13 +565,7 @@ int NaiveN05FlashModel::ForwardDraft(
         }
     }
     int committed = accepted + 1;
-    for (int i = 0; i < block_cnt; ++i) {
-        int length = (slidingLayers[i] ? std::min(oldLength, window - 1) : oldLength) + committed;
-        auto &cache = kv[i];
-        cache.first.Resize({1, length, cache.first.dims[2]});
-        cache.second.Resize({1, length, cache.second.dims[2]});
-        if (slidingLayers[i]) { TrimCache(cache.first, window - 1); TrimCache(cache.second, window - 1); }
-    }
+    CommitTargetCache(kv, oldLength, committed);
     CommitDraftContext(capture, committed, context, kv);
     ++context.rounds;
     context.proposed += proposed.size();

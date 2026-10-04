@@ -19,6 +19,7 @@ struct NaiveN05FlashModel::TPDecodeState {
     enum Mode { Warm, Prepare, Capture, Replay } mode = Warm;
     struct Rank {
         TargetWorkspace buffers;
+        TargetCapture features;
         void *graph = nullptr, *exec = nullptr;
         bool ok = true;
         std::vector<void *> communicationPointers;
@@ -28,7 +29,8 @@ struct NaiveN05FlashModel::TPDecodeState {
     std::vector<void *> cachePointers, reservedPointers;
     std::vector<int> cacheCapacities;
     uint64_t ncclGeneration = 0;
-    int capacity = 0, region = 0;
+    int capacity = 0, region = 0, rows = 1;
+    bool verifying = false;
     bool warmed = false, captured = false, disabled = false, active = false;
     void ClearGraphs();
     ~TPDecodeState();

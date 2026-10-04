@@ -1,14 +1,47 @@
-#include "models/naive_n05_flash.h"
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/multicuda/fastllm-multicuda.cuh"
+#include "models/naive_n05_flash.h"
+#include "utils/utils.h"
 #include <cmath>
 #include <cuda_runtime_api.h>
 #include <iostream>
 #include <stdexcept>
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+#include <atomic>
+#include <dlfcn.h>
+static std::atomic<int> verifyGraphLaunches{0}, verifyGraphCaptures{0};
+static bool failVerifyBegin = false, failVerifyInstantiate = false, expectVerifyGraph = true;
+static int failGraphDevice = 3;
+extern "C" bool FastllmCudaGraphLaunch(void *exec) {
+    ++verifyGraphLaunches;
+    static auto fn = (bool (*)(void *))dlsym(RTLD_NEXT, "FastllmCudaGraphLaunch");
+    return fn(exec);
+}
+extern "C" bool FastllmCudaGraphBeginCapture() {
+    ++verifyGraphCaptures;
+    int device = 0;
+    cudaGetDevice(&device);
+    if (failVerifyBegin && device == failGraphDevice)
+        return false;
+    static auto fn = (bool (*)())dlsym(RTLD_NEXT, "FastllmCudaGraphBeginCapture");
+    return fn();
+}
+extern "C" bool FastllmCudaGraphInstantiate(void *graph, void **exec) {
+    int device = 0;
+    cudaGetDevice(&device);
+    if (failVerifyInstantiate && device == failGraphDevice) {
+        *exec = nullptr;
+        return false;
+    }
+    static auto fn = (bool (*)(void *, void **))dlsym(RTLD_NEXT, "FastllmCudaGraphInstantiate");
+    return fn(graph, exec);
+}
+#endif
 using namespace fastllm;
 class Fixture : public NaiveN05FlashModel {
   public:
     int ranks;
-    explicit Fixture(int ranks) : ranks(ranks) {
+    explicit Fixture(int ranks, bool packed = false, bool graph = false) : ranks(ranks) {
         setenv("FASTLLM_TP", ranks > 1 ? std::to_string(ranks).c_str() : "false", 1);
         deviceMap = {{"cuda:0", 1}};
         moeDeviceMap = deviceMap;
@@ -31,11 +64,39 @@ class Fixture : public NaiveN05FlashModel {
                         {"n_routed_experts", "8"},
                         {"num_experts_per_tok", "2"},
                         {"max_position_embeddings", "1024"}};
+        if (graph) {
+            weight.dicts["index_top_k"] = "2048";
+            weight.dicts["max_position_embeddings"] = "8192";
+        }
         InitParams();
         SetSaveHistoryChat(false);
         unsigned seed = 7;
         auto add = [&](std::string name, std::vector<int> dims, DataType type, float scale,
                        bool norm = false) {
+            if (packed && name.find(".mlp.experts.") != std::string::npos) {
+                weight.AddEmptyWeight(name, dims, NVFP4_BLOCK_16_E4M3_PACKED);
+                auto &w = weight[name];
+                w.directMemory = true;
+                w.blockK = 1;
+                w.blockM = 16;
+                w.Allocate(false);
+                size_t stride = w.GetBytes() / dims[0];
+                for (int row = 0; row < dims[0]; ++row) {
+                    uint8_t *dst = w.cpuData + row * stride;
+                    float global =
+                        name.find("gateup_proj") != std::string::npos && row >= dims[0] / 2 ? .006f
+                                                                                            : .004f;
+                    std::memcpy(dst, &global, sizeof(float));
+                    for (int group = 0; group < dims[1] / 16; ++group) {
+                        for (int j = 0; j < 8; ++j) {
+                            seed = seed * 1664525 + 1013904223;
+                            dst[4 + group * 9 + j] = seed >> 16;
+                        }
+                        dst[12 + group * 9] = 56; // E4M3 1.0
+                    }
+                }
+                return;
+            }
             weight.AddEmptyWeight(name, dims, type);
             auto &w = weight[name];
             w.Allocate();
@@ -114,18 +175,437 @@ class Fixture : public NaiveN05FlashModel {
         }
         return out;
     }
+
+    void VerifyHead() {
+        Data referenceHead(weight["lm_head.weight"]);
+        std::vector<std::pair<Data, Data>> kv(2);
+        Data ids(FLOAT32, {1, 3}, {1, 2, 3}), pos(FLOAT32, {1, 3}, {0, 1, 2});
+        GenerationConfig cfg;
+        TargetCapture capture;
+        RunDraftTarget(ids, pos, kv, cfg, capture);
+        for (int rows : {1, 2, 7, 3, 8, 7}) {
+            Data hidden(BFLOAT16, {1, rows, 256});
+            hidden.Allocate();
+            for (int i = 0; i < hidden.Count(0); ++i) {
+                float x = std::sin((i + rows) * .1f);
+                uint32_t bits;
+                std::memcpy(&bits, &x, 4);
+                ((uint16_t *)hidden.cpuData)[i] = bits >> 16;
+            }
+            hidden.ToDevice(DataDevice::CUDA, std::vector<int>{0});
+            Data actual = RunDraftHead(hidden), expected;
+            ApplyDraftDevice();
+            if (rows > 1)
+                MatMulTransB(hidden, referenceHead, expected);
+            else
+                Linear(hidden, referenceHead, Data(), expected);
+            actual.ToDevice(DataDevice::CPU);
+            expected.ToDevice(DataDevice::CPU);
+            if (actual.dataType != BFLOAT16 || expected.dataType != BFLOAT16 ||
+                actual.dims != expected.dims)
+                throw std::runtime_error("head output shape or dtype differs");
+            int differing = 0;
+            for (int i = 0; i < actual.Count(0); ++i)
+                differing += ((uint16_t *)actual.cpuData)[i] != ((uint16_t *)expected.cpuData)[i];
+            std::cout << "HEAD difference=" << differing << " / " << actual.Count(0) << std::endl;
+            bool nonzero = false;
+            for (int i = 0; i < expected.Count(0); ++i)
+                nonzero |= (((uint16_t *)expected.cpuData)[i] & 0x7fff) != 0;
+            if (!nonzero)
+                throw std::runtime_error("head regression requires nonzero logits");
+            if (differing)
+                throw std::runtime_error("head differs");
+        }
+        std::cout << "HEAD PASS checks=6" << std::endl;
+    }
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+    void VerifyGraphBlocks() {
+        draftTargetLayers = {0, 1};
+        int checks = 0;
+        for (int prompt : {3, 120, 254, 510, 2045, 2049, 4090}) {
+            std::vector<std::pair<Data, Data>> reference(2), candidate(2);
+            GenerationConfig cfg;
+            cfg.input_token_length = prompt;
+            cfg.output_token_limit = 96;
+            cfg.output_logits = true;
+            std::vector<std::vector<uint16_t>> features(2);
+            auto forward = [&](auto &kv, int start, int count, bool verifying) {
+                std::vector<float> ids(count), pos(count);
+                for (int row = 0; row < count; ++row) {
+                    ids[row] = (start + row) * 3 % 256;
+                    pos[row] = start + row;
+                }
+                Data input(FLOAT32, {1, count}, ids), positions(FLOAT32, {1, count}, pos);
+                TargetCapture capture;
+                capture.verifying = verifying;
+                Data out = RunDraftTarget(input, positions, kv, cfg, capture);
+                out.ToDevice(DataDevice::CPU);
+                if (capture.hidden.size() != 2)
+                    throw std::runtime_error("missing graph features");
+                for (int layer = 0; layer < 2; ++layer) {
+                    Data h(capture.hidden.at(layer));
+                    h.ToDevice(DataDevice::CPU);
+                    features[layer].assign((uint16_t *)h.cpuData,
+                                           (uint16_t *)h.cpuData + h.Count(0));
+                }
+                return std::vector<float>((float *)out.cpuData,
+                                          (float *)out.cpuData + out.Count(0));
+            };
+            forward(reference, 0, prompt, false);
+            forward(candidate, 0, prompt, false);
+            int past = prompt;
+            for (int keep : {1, 4, 8, 3, 7, 8}) {
+                auto block = forward(candidate, past, 8, true);
+                auto blockFeatures = features;
+                for (int row = 0; row < keep; ++row) {
+                    auto one = forward(reference, past + row, 1, false);
+                    if (!std::equal(one.begin(), one.end(), block.begin() + row * 256)) {
+                        for (int layer = 0; layer < 2; ++layer) {
+                            int differing = 0;
+                            for (int j = 0; j < 256; ++j)
+                                differing +=
+                                    features[layer][j] != blockFeatures[layer][row * 256 + j];
+                            std::cerr << "graph hidden layer=" << layer
+                                      << " differing=" << differing << std::endl;
+                        }
+                        throw std::runtime_error("graph verification differs from decode at " +
+                                                 std::to_string(past) + " row " +
+                                                 std::to_string(row));
+                    }
+                    ++checks;
+                }
+                CommitTargetCache(candidate, past, keep);
+                for (int layer = 0; layer < 2; ++layer)
+                    if (candidate[layer].first.dims != reference[layer].first.dims)
+                        throw std::runtime_error("graph rollback metadata mismatch");
+                past += keep;
+            }
+        }
+        if (expectVerifyGraph &&
+            (!verifyGraphCaptures ||
+             ((!failVerifyBegin && !failVerifyInstantiate) != (verifyGraphLaunches > 0))))
+            throw std::runtime_error("verification graph execution/fallback was not exercised");
+        std::cout << "VERIFY GRAPH PASS checks=" << checks << " captures=" << verifyGraphCaptures
+                  << " launches=" << verifyGraphLaunches << std::endl;
+    }
+
+#endif
+    void VerifyBlocks() {
+        // Compare against the same rank count: TP has its own reduction tree.
+        draftTargetLayers = {0, 1};
+        int checks = 0;
+        for (int past : {3, 7, 15, 17})
+            for (int rows : {2, 3, 4, 5, 6, 7, 8}) {
+                for (int keep : {1, rows / 2, rows}) {
+                    std::vector<std::pair<Data, Data>> reference(2), candidate(2);
+                    GenerationConfig cfg;
+                    cfg.input_token_length = past;
+                    cfg.output_token_limit = 32;
+                    cfg.output_logits = true;
+                    TargetCapture referenceCapture;
+                    auto forward = [&](auto &kv, int start, int count) {
+                        std::vector<float> ids(count), pos(count), result;
+                        for (int i = 0; i < count; ++i) {
+                            ids[i] = (start + i) * 3 % 256;
+                            pos[i] = start + i;
+                        }
+                        Data input(FLOAT32, {1, count}, ids), positions(FLOAT32, {1, count}, pos);
+                        Data logits = RunDraftTarget(input, positions, kv, cfg, referenceCapture);
+                        logits.ToDevice(DataDevice::CPU);
+                        result.assign((float *)logits.cpuData,
+                                      (float *)logits.cpuData + logits.Count(0));
+                        return result;
+                    };
+                    forward(reference, 0, past);
+                    forward(candidate, 0, past);
+                    std::vector<float> ids(rows), pos(rows);
+                    for (int i = 0; i < rows; ++i) {
+                        ids[i] = (past + i) * 3 % 256;
+                        pos[i] = past + i;
+                    }
+                    Data input(FLOAT32, {1, rows}, ids), positions(FLOAT32, {1, rows}, pos);
+                    TargetCapture capture;
+                    capture.verifying = true;
+                    Data block = RunDraftTarget(input, positions, candidate, cfg, capture);
+                    block.ToDevice(DataDevice::CPU);
+                    if (block.dims != std::vector<int>({1, rows, 256}) ||
+                        capture.hidden.size() != 2)
+                        throw std::runtime_error("missing verification logits/features");
+                    for (int row = 0; row < keep; ++row) {
+                        auto one = forward(reference, past + row, 1);
+                        const float *actual = (const float *)block.cpuData + row * 256;
+                        double maximum = 0;
+                        for (int j = 0; j < 256; ++j)
+                            maximum = std::max(maximum, (double)std::abs(actual[j] - one[j]));
+                        if (maximum != 0) {
+                            for (int layer = 0; layer < 2; ++layer) {
+                                Data blockHidden(capture.hidden.at(layer)),
+                                    refHidden(referenceCapture.hidden.at(layer));
+                                blockHidden.ToDevice(DataDevice::CPU);
+                                refHidden.ToDevice(DataDevice::CPU);
+                                int differing = 0;
+                                for (int j = 0; j < 256; ++j)
+                                    differing += ((uint16_t *)blockHidden.cpuData)[row * 256 + j] !=
+                                                 ((uint16_t *)refHidden.cpuData)[j];
+                                std::cerr << "hidden layer=" << layer << " differing=" << differing
+                                          << '\n';
+                            }
+                            std::cerr << "verify past=" << past << " rows=" << rows
+                                      << " row=" << row << " max_abs=" << maximum << '\n';
+                            throw std::runtime_error("block verification differs from decode");
+                        }
+                        ++checks;
+                    }
+                    CommitTargetCache(candidate, past, keep);
+                    for (int layer = 0; layer < 2; ++layer) {
+                        if (candidate[layer].first.dims != reference[layer].first.dims)
+                            throw std::runtime_error("rollback root length mismatch");
+                        if (ranks > 1)
+                            for (int device = 0; device < ranks; ++device)
+                                if (candidate[layer].first.multiDeviceDatas.at(device)->dims !=
+                                    reference[layer].first.multiDeviceDatas.at(device)->dims)
+                                    throw std::runtime_error("rollback rank length mismatch");
+                    }
+                    if (forward(reference, past + keep, 1) != forward(candidate, past + keep, 1))
+                        throw std::runtime_error("rejected suffix changed subsequent decode");
+                    ++checks;
+                }
+            }
+        std::cout << "VERIFY BLOCK PASS ranks=" << ranks << " checks=" << checks << std::endl;
+    }
 };
+// A 4096-wide BF16 verification block crosses the TP8 48-KiB policy
+// boundary at six rows. Compare full-block reduction against ordinary decode.
+static void VerifyRowAllReduce(int ranks) {
+    SetCudaGraph(true);
+    std::vector<int> devices(ranks);
+    for (int i = 0; i < ranks; ++i)
+        devices[i] = i;
+    if (!FastllmInitNccl(devices))
+        throw std::runtime_error("collective init");
+    PersistentWorkerGroup workers;
+    std::vector<std::exception_ptr> errors(ranks);
+    auto run = [&](const std::function<void(int)> &fn) {
+        std::fill(errors.begin(), errors.end(), nullptr);
+        workers.Run(
+            devices,
+            [&](int rank) {
+                FastllmCudaSetDevice(rank);
+                fn(rank);
+            },
+            errors);
+        for (auto e : errors)
+            if (e)
+                std::rethrow_exception(e);
+    };
+    int checks = 0;
+    for (DataType type : {BFLOAT16, FLOAT32})
+        for (int rows : {2, 5, 6, 7, 8}) {
+            constexpr int width = 4096;
+            std::vector<Data> reference(ranks), block(ranks);
+            for (int rank = 0; rank < ranks; ++rank) {
+                Data input(type, {rows, width});
+                input.Allocate();
+                unsigned seed = 37 + rank;
+                for (int i = 0; i < rows * width; ++i) {
+                    seed = seed * 1664525 + 1013904223;
+                    float value = (int(seed >> 16) - 32768) / 2048.f;
+                    if (type == FLOAT32)
+                        ((float *)input.cpuData)[i] = value;
+                    else {
+                        uint32_t bits;
+                        std::memcpy(&bits, &value, 4);
+                        ((uint16_t *)input.cpuData)[i] = bits >> 16;
+                    }
+                }
+                reference[rank].CopyFrom(input);
+                block[rank].CopyFrom(input);
+                reference[rank].ToDevice(DataDevice::CUDA, std::vector<int>{rank});
+                block[rank].ToDevice(DataDevice::CUDA, std::vector<int>{rank});
+            }
+            run([&](int rank) {
+                auto &d = reference[rank];
+                for (int row = 0; row < rows; ++row) {
+                    void *ptr = (uint8_t *)d.cudaData + (size_t)row * width * d.unitSize;
+                    FastllmNcclAllReduce(ptr, ptr, width, type, rank);
+                }
+                ForceDeviceSync();
+            });
+            run([&](int rank) {
+                auto &d = block[rank];
+                if (!FastllmCudaCustomAllReduceRows(d.cudaData, d.cudaData, d.Count(0), width, type,
+                                                    rank)) {
+                    for (int row = 0; row < rows; ++row) {
+                        void *ptr = (uint8_t *)d.cudaData + (size_t)row * width * d.unitSize;
+                        FastllmNcclAllReduce(ptr, ptr, width, type, rank);
+                    }
+                }
+                ForceDeviceSync();
+            });
+            for (int rank = 0; rank < ranks; ++rank) {
+                reference[rank].ToDevice(DataDevice::CPU);
+                block[rank].ToDevice(DataDevice::CPU);
+                if (std::memcmp(reference[rank].cpuData, block[rank].cpuData,
+                                block[rank].GetBytes()))
+                    throw std::runtime_error("block collective differs from single-row reduction");
+                ++checks;
+            }
+        }
+    std::cout << "ROW ALLREDUCE PASS checks=" << checks << std::endl;
+}
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+class DraftFixture : public NaiveN05FlashModel {
+  public:
+    DraftFixture() {
+        embed_dim = 256;
+        block_cnt = 2;
+        draftLayers = 2;
+        draftBlock = 7;
+        draftHeads = 8;
+        draftKvHeads = 2;
+        draftHeadDim = 32;
+        draftWindow = 1024;
+        deviceMap = {{"cuda:0", 1}};
+        unsigned seed = 17;
+        auto add = [&](const std::string &name, std::vector<int> dims, bool norm = false) {
+            weight.AddEmptyWeight(name, dims, norm ? FLOAT32 : BFLOAT16);
+            Data &w = weight[name];
+            w.Allocate();
+            for (int i = 0; i < w.Count(0); ++i) {
+                seed = seed * 1664525u + 1013904223u;
+                float value = norm ? 1.f : .04f * ((int)(seed >> 16) - 32768) / 32768.f;
+                if (norm)
+                    ((float *)w.cpuData)[i] = value;
+                else
+                    ((uint16_t *)w.cpuData)[i] = Float32ToBFloat16RNEBits(value);
+            }
+        };
+        add("model.embed_tokens.weight", {256, 256});
+        add("dspark.mask_embedding", {256});
+        add("dspark.norm.weight", {256}, true);
+        for (int i = 0; i < draftLayers; ++i) {
+            std::string p = "dspark.layers." + std::to_string(i) + ".";
+            add(p + "input_layernorm.weight", {256}, true);
+            add(p + "post_attention_layernorm.weight", {256}, true);
+            for (const char *n : {"q", "k", "v"})
+                add(p + "self_attn." + n + "_proj.weight", {n[0] == 'q' ? 256 : 64, 256});
+            add(p + "self_attn.o_proj.weight", {256, 256});
+            add(p + "self_attn.q_norm.weight", {32}, true);
+            add(p + "self_attn.k_norm.weight", {32}, true);
+            add(p + "mlp.gate_proj.weight", {512, 256});
+            add(p + "mlp.up_proj.weight", {512, 256});
+            add(p + "mlp.down_proj.weight", {256, 512});
+        }
+        // Match the model loader's GPU embedding placement in both paths.
+        weight["model.embed_tokens.weight"].ToDevice(DataDevice::CUDA, std::vector<int>{0});
+        weight["dspark.mask_embedding"].ToDevice(DataDevice::CUDA, std::vector<int>{0});
+    }
+    void Run() {
+        int checks = 0;
+        auto read = [](const Data &value) {
+            size_t count = 1;
+            for (int dim : value.dims)
+                count *= dim;
+            std::vector<uint16_t> bits(count);
+            if (cudaMemcpy(bits.data(), value.cudaData, count * sizeof(uint16_t),
+                           cudaMemcpyDeviceToHost) != cudaSuccess)
+                throw std::runtime_error("draft read failed");
+            return bits;
+        };
+        auto hidden = [&](int count, int seed) {
+            Data x(BFLOAT16, {1, count, embed_dim});
+            x.Allocate();
+            for (int i = 0; i < x.Count(0); ++i)
+                ((uint16_t *)x.cpuData)[i] = Float32ToBFloat16RNEBits(std::sin((i + seed) * .137f));
+            x.ToDevice(DataDevice::CUDA, std::vector<int>{0});
+            return x;
+        };
+        for (int prefix : {3, 80, 249, 250, 1023, 1024, 32768, 3}) {
+            auto candidate = CreateDraftContext();
+            auto reference = std::make_shared<DraftContext>();
+            int count = std::min(prefix, draftWindow - 1);
+            Data h = hidden(count, prefix);
+            AppendDraftContext(h, prefix - count, *candidate);
+            AppendDraftContext(h, prefix - count, *reference);
+            for (int round = 0; round < 4; ++round) {
+                SetCudaGraph(false);
+                Data expected = RunDraft(11 + round, *reference);
+                auto bits = read(expected);
+                SetCudaGraph(true);
+                Data actual = RunDraft(11 + round, *candidate);
+                if (bits != read(actual))
+                    throw std::runtime_error("draft backbone differs from eager");
+                if (candidate->committed != reference->committed)
+                    throw std::runtime_error("draft proposal changed committed length");
+                for (int layer = 0; layer < draftLayers; ++layer) {
+                    if (read(candidate->kv[layer].first) != read(reference->kv[layer].first) ||
+                        read(candidate->kv[layer].second) != read(reference->kv[layer].second))
+                        throw std::runtime_error("draft proposal changed visible KV");
+                }
+                int accepted = round + 1;
+                Data next = hidden(accepted, round + prefix);
+                AppendDraftContext(next, candidate->committed, *candidate);
+                AppendDraftContext(next, reference->committed, *reference);
+                ++checks;
+            }
+            // Exercise the same bounded storage transfer as request removal.
+            idleDraftContext = std::move(candidate);
+        }
+        if (!failVerifyBegin && !failVerifyInstantiate && verifyGraphLaunches == 0)
+            throw std::runtime_error("draft did not replay a graph");
+        if ((failVerifyBegin || failVerifyInstantiate) && verifyGraphLaunches != 0)
+            throw std::runtime_error("failed draft graph was launched");
+        std::cout << "DRAFT GRAPH PASS checks=" << checks << " captures=" << verifyGraphCaptures
+                  << " launches=" << verifyGraphLaunches << std::endl;
+    }
+};
+#endif
+
 int main(int argc, char **argv) {
     try {
         int ranks = argc > 1 ? std::stoi(argv[1]) : 8;
-        if (ranks != 2 && ranks != 4 && ranks != 8)
+        if (ranks != 1 && ranks != 2 && ranks != 4 && ranks != 8)
             return 2;
         int devices = 0;
         if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < ranks)
             return 77;
+        if (argc > 2 && std::string(argv[2]) == "reduce_rows") {
+            VerifyRowAllReduce(ranks);
+            return 0;
+        }
         SetThreads(4);
         SetDeviceMap({{"cuda:0", 1}});
         FastllmCudaSetDevice(0);
+        if (argc > 2 && std::string(argv[2]) == "head") {
+            Fixture fixture(ranks);
+            fixture.VerifyHead();
+            return 0;
+        }
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+        if (argc > 2 && std::string(argv[2]) == "draft_graph") {
+            SetCudaEmbedding(true);
+            failGraphDevice = 0;
+            failVerifyBegin = argc > 3 && std::string(argv[3]) == "failbegin";
+            failVerifyInstantiate = argc > 3 && std::string(argv[3]) == "failinstantiate";
+            DraftFixture fixture; fixture.Run();
+            return 0;
+        }
+        if (argc > 2 && std::string(argv[2]) == "verify_graph") {
+            expectVerifyGraph = argc <= 3 || std::string(argv[3]) != "eager";
+            SetCudaGraph(expectVerifyGraph);
+            SetCudaEmbedding(true);
+            failVerifyBegin = argc > 3 && std::string(argv[3]) == "failbegin";
+            failVerifyInstantiate = argc > 3 && std::string(argv[3]) == "failinstantiate";
+            Fixture fixture(ranks, true, true);
+            fixture.VerifyGraphBlocks();
+            return 0;
+        }
+#endif
+        if (argc > 2 && std::string(argv[2]) == "verify") {
+            Fixture fixture(ranks, argc > 3 && std::string(argv[3]) == "packed");
+            fixture.VerifyBlocks();
+            return 0;
+        }
         std::vector<std::vector<float>> reference;
         {
             Fixture serial(1);

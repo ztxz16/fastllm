@@ -1360,8 +1360,34 @@ if (UNIT_TEST)
             PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
             PASS_REGULAR_EXPRESSION "MODEL SMOKE PASS")
 
+        foreach(NAIVE_VERIFY_RANKS 1 2 4 8)
+            add_test(NAME naive_n05_verify_${NAIVE_VERIFY_RANKS}
+                COMMAND naive_n05_tp_model_test ${NAIVE_VERIFY_RANKS} verify)
+            set_tests_properties(naive_n05_verify_${NAIVE_VERIFY_RANKS}
+                PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
+                PASS_REGULAR_EXPRESSION "VERIFY BLOCK PASS")
+        endforeach()
+
+        foreach(NAIVE_VERIFY_RANKS 1 8)
+            add_test(NAME naive_n05_verify_packed_${NAIVE_VERIFY_RANKS}
+                COMMAND naive_n05_tp_model_test ${NAIVE_VERIFY_RANKS} verify packed)
+            set_tests_properties(naive_n05_verify_packed_${NAIVE_VERIFY_RANKS}
+                PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
+                PASS_REGULAR_EXPRESSION "VERIFY BLOCK PASS")
+        endforeach()
+        add_test(NAME naive_n05_verify_allreduce COMMAND naive_n05_tp_model_test 8 reduce_rows)
+        set_tests_properties(naive_n05_verify_allreduce
+            PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
+            PASS_REGULAR_EXPRESSION "ROW ALLREDUCE PASS")
+        add_test(NAME naive_n05_draft_head COMMAND naive_n05_tp_model_test 8 head)
+        set_tests_properties(naive_n05_draft_head
+            PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
+            PASS_REGULAR_EXPRESSION "HEAD PASS")
+
         # Failure injection interposes the shared library's graph entry points.
         if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            add_executable(naive_n05_verify_graph_test test/basic/test_naive_n05_tp_model.cpp)
+            target_compile_definitions(naive_n05_verify_graph_test PRIVATE FASTLLM_TEST_VERIFY_GRAPH_HOOKS)
             add_executable(naive_n05_tp_graph_test test/basic/test_naive_n05_tp_graph.cpp)
             find_library(NAIVE_TP_GRAPH_CUDART cudart HINTS ${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
             target_link_libraries(naive_n05_tp_graph_test PRIVATE
@@ -1369,6 +1395,24 @@ if (UNIT_TEST)
             set_target_properties(naive_n05_tp_graph_test PROPERTIES
                 ENABLE_EXPORTS ON LINKER_LANGUAGE CUDA)
             target_include_directories(naive_n05_tp_graph_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            target_link_libraries(naive_n05_verify_graph_test PRIVATE
+                fastllm_tools ${NAIVE_TP_GRAPH_CUDART} ${CMAKE_DL_LIBS})
+            set_target_properties(naive_n05_verify_graph_test PROPERTIES ENABLE_EXPORTS ON LINKER_LANGUAGE CUDA)
+            target_include_directories(naive_n05_verify_graph_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            foreach(NAIVE_VERIFY_MODE eager graph failbegin failinstantiate)
+                add_test(NAME naive_n05_verify_${NAIVE_VERIFY_MODE}
+                    COMMAND naive_n05_verify_graph_test 8 verify_graph ${NAIVE_VERIFY_MODE})
+                set_tests_properties(naive_n05_verify_${NAIVE_VERIFY_MODE}
+                    PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
+                    PASS_REGULAR_EXPRESSION "VERIFY GRAPH PASS")
+            endforeach()
+            foreach(NAIVE_DRAFT_MODE graph failbegin failinstantiate)
+                add_test(NAME naive_n05_draft_${NAIVE_DRAFT_MODE}
+                    COMMAND naive_n05_verify_graph_test 1 draft_graph ${NAIVE_DRAFT_MODE})
+                set_tests_properties(naive_n05_draft_${NAIVE_DRAFT_MODE}
+                    PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
+                    PASS_REGULAR_EXPRESSION "DRAFT GRAPH PASS")
+            endforeach()
             add_test(NAME naive_n05_tp_graph COMMAND "${CMAKE_COMMAND}"
                 "-DTEST_EXECUTABLE=$<TARGET_FILE:naive_n05_tp_graph_test>"
                 "-DTEST_DIRECTORY=${CMAKE_CURRENT_BINARY_DIR}/naive-tp-graph"

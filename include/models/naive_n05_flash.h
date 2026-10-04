@@ -9,6 +9,8 @@
 
 namespace fastllm {
     class NaiveN05FlashModel : public basellm {
+    protected:
+        struct TargetCapture;
     public:
         NaiveN05FlashModel();
         ~NaiveN05FlashModel() override;
@@ -23,7 +25,8 @@ namespace fastllm {
                     std::vector<float> *logits = nullptr) override;
         Data ForwardSingleGPU(int rank, const Data &inputIds, const Data &positions,
                               std::vector<std::pair<Data, Data>> &kv,
-                              const GenerationConfig &config, const Data *embedding = nullptr);
+                              const GenerationConfig &config, const Data *embedding = nullptr,
+                              TargetCapture *capture = nullptr);
         bool NeedAttentionMask(int, int) override { return false; }
         // Bound idle TP prefill workspace with the shared pressure-aware pool.
         bool RetainCudaWorkspace() const override { return tpDevices.size() > 1; }
@@ -58,12 +61,15 @@ namespace fastllm {
 
         struct TargetCapture {
             bool verifying = false;
+            bool collectHidden = true;
             std::map<int, Data> hidden;
             std::shared_ptr<HistoryChunk> history;
         };
+        struct DraftWorkspace;
         struct DraftContext {
             int committed = 0;
             std::vector<std::pair<Data, Data>> kv;
+            std::shared_ptr<DraftWorkspace> workspace;
             Data restoredHidden;
             std::deque<std::pair<int, int>> pending;
             std::mt19937_64 random{std::random_device{}()};
@@ -85,7 +91,16 @@ namespace fastllm {
         void AppendDraftContext(Data &hidden, int start, DraftContext &context);
         void CommitDraftContext(TargetCapture &capture, int tokens, DraftContext &context,
                                 std::vector<std::pair<Data, Data>> &kv);
+        std::shared_ptr<DraftContext> CreateDraftContext();
+        bool RunDraftGraph(int anchor, DraftContext &context, Data &output);
         Data RunDraft(int anchor, DraftContext &context);
+        void ApplyDraftDevice();
+        Data &DraftWeight(const std::string &name);
+        Data RunDraftHead(Data &hidden);
+        Data RunDraftTarget(const Data &inputIds, const Data &positions,
+                            std::vector<std::pair<Data, Data>> &kv,
+                            const GenerationConfig &config, TargetCapture &capture);
+        void CommitTargetCache(std::vector<std::pair<Data, Data>> &kv, int past, int count);
         int ForwardDraft(const Data &inputIds, const Data &positions,
                          std::vector<std::pair<Data, Data>> &kv,
                          const GenerationConfig &config, const LastTokensManager &lastTokens,
@@ -97,6 +112,7 @@ namespace fastllm {
         float draftConfidenceThreshold = 0.5f;
         std::vector<int> draftTargetLayers;
         std::map<const std::vector<std::pair<Data, Data>> *, std::shared_ptr<DraftContext>> draftContexts;
+        std::shared_ptr<DraftContext> idleDraftContext;
 
     private:
         // Only request lifecycle callbacks (serialized by dictLocker) own this
@@ -108,17 +124,21 @@ namespace fastllm {
         bool InitTensorParallel();
         void PrepareTensorParallel();
         struct TPDecodeState;
-        std::shared_ptr<TPDecodeState> tpDecodeState;
+        std::shared_ptr<TPDecodeState> tpDecodeState, tpVerifyState;
+        bool HasVerificationGraph() const;
         bool PrepareTensorParallelDecode(const Data &inputIds,
-                                        std::vector<std::pair<Data, Data>> &kv);
+                                        std::vector<std::pair<Data, Data>> &kv, bool verifying = false);
         Data ForwardTensorParallelDecode(int rank, const Data &inputIds, const Data &positions,
                                         std::vector<std::pair<Data, Data>> &kv,
-                                        const GenerationConfig &config, const Data *embedding);
+                                        const GenerationConfig &config, const Data *embedding, TargetCapture *capture);
         Data ForwardTensorParallel(const Data &inputIds, const Data &positions,
                                    std::vector<std::pair<Data, Data>> &kv,
-                                   const GenerationConfig &config);
+                                   const GenerationConfig &config, TargetCapture *capture = nullptr);
         std::vector<int> tpDevices;
         bool tpPrepared = false;
+        std::vector<std::shared_ptr<TargetWorkspace>> tpVerifyWorkspaces;
+        std::vector<Data> tpDraftHeadInputs, tpDraftHeadLogits;
+        Data tpDraftHeadOutput;
         PersistentWorkerGroup tpWorkers;
         std::vector<std::vector<std::vector<Data *>>> tpMoeWeights, tpMoeBiases;
         std::vector<std::pair<int, int>> tpVocabRanges;
