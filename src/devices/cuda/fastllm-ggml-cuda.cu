@@ -719,7 +719,12 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
 
         const int vih = ((vh >> (4*i)) << 4) & 0x30303030;
 
-        const int vi = __vsubss4((vil | vih), 0x20202020); // vi = (vil | vih) - 32
+        // Each byte is an unsigned six-bit value. Flip its sign bit and
+        // extend it into bits 6/7, preserving q - 32 without saturating
+        // packed-byte subtraction. Unsigned multiplication cannot carry
+        // between bytes: each contribution is either 0x00 or 0xc0.
+        const uint32_t centered = uint32_t(vil | vih) ^ 0x20202020u;
+        const int vi = static_cast<int>(centered | ((centered & 0x20202020u) * 6u));
 
         sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
     }
