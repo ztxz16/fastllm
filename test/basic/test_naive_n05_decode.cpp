@@ -438,10 +438,14 @@ static void TestAttentionSelectedValues() {
 static void TestAttentionGroupedScores() {
     struct Shape { int queries, heads, kvHeads, dim, valueDim, keys, selected; };
     for (auto s : {Shape{32,4,2,64,8,513,511}, Shape{33,14,2,192,128,1027,2051},
-                   Shape{32,8,2,129,132,513,0}, Shape{31,8,2,192,128,513,512}})
+                   Shape{32,8,2,129,132,513,0}, Shape{31,8,2,192,128,513,512},
+                   // Single-query GQA reuse and adjacent dimension/group fallbacks.
+                   Shape{1,32,8,64,8,4099,2048}, Shape{1,64,4,192,8,4099,2048},
+                   Shape{1,48,4,129,132,4099,2048}, Shape{1,32,4,193,8,4099,2048},
+                   Shape{1,31,1,192,8,4099,2048}})
     for (bool causal : {false, true}) for (bool withSink : {false, true}) {
         Data query(BFLOAT16),key(BFLOAT16),value(BFLOAT16),sink(FLOAT32),indices(INT32),output;
-        int keyStride = s.kvHeads * s.dim + 128, past = s.keys - s.queries;
+        int keyStride = s.kvHeads * s.dim + 128, past = s.keys - s.queries - (s.queries == 1 ? 64 : 0);
         Upload(query,{1,s.queries,s.heads*s.dim},53);
         Upload(key,{1,s.keys,keyStride},71);
         Upload(value,{1,s.keys,s.kvHeads*s.valueDim},113);
@@ -451,7 +455,7 @@ static void TestAttentionGroupedScores() {
             auto *p = (int *)indices.cpuData;
             for (int q=0;q<s.queries;++q) for (int slot=0;slot<s.selected;++slot) {
                 int k = (slot*137+q*13)%s.keys;
-                if (slot%97==0 || q==0) k=-1;
+                if (slot%97==0 || (q==0 && s.queries>1)) k=-1;
                 else if (slot%193==1) k=s.keys+3;
                 p[q*s.selected+slot]=k;
             }
@@ -500,7 +504,9 @@ static void TestAttentionGlobalMma() {
                    // Decode split-PV dispatch and adjacent serial fallbacks.
                    Shape{1,2048,2048,64,4,128,false}, Shape{1,32768,2048,64,4,128,true},
                    Shape{1,4099,2048,32,1,0,true}, Shape{1,4099,2048,31,1,0,true},
-                   Shape{1,4099,2047,64,4,128,true}, Shape{1,4099,2049,64,4,128,true}})
+                   Shape{1,4099,2047,64,4,128,true}, Shape{1,4099,2049,64,4,128,true},
+                   // Unaligned K stride uses grouped QK; aligned GQA16 uses shared K/V.
+                   Shape{1,4099,2048,64,4,1,true}, Shape{1,4099,2048,32,2,128,true}})
     for (bool causal : {false,true}) for (int mode=0;mode<5;++mode) {
         constexpr int dim=192,valueDim=128;
         int past = s.rows == 1 && s.padding == 0 ? s.keys - 67 : s.keys - s.rows;

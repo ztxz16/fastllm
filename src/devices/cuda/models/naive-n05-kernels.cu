@@ -575,6 +575,117 @@ __global__ void AttentionScores(const BF16 *q, const BF16 *k, const int *indices
     }
 }
 
+// Shared by the single-query score, softmax and split-PV paths.
+constexpr int kDecodePVKeys = 2048;
+constexpr int kDecodePVValueDim = 128;
+constexpr int kDecodePVParts = 32;
+constexpr int kDecodeQkDim = 192;
+constexpr int kDecodeSharedHeads = 16;
+constexpr int kDecodeSharedThreads = 256;
+constexpr int kDecodeQkKeyTile = 8;
+constexpr int kDecodeValueTile = 64;
+
+// Preserve each head's arithmetic order while sharing gathered K loads.
+template<int HeadTile, int MaxDim, int KeyTile = 32>
+__global__ void AttentionScoresDecodeGrouped(const BF16 *q, const BF16 *k,
+        const int *indices, float *scores, int heads, int kvHeads, int dim,
+        int keyStride, int keys, int count, int past, bool causal) {
+    constexpr int warps = 4;
+    int firstHead = blockIdx.x * HeadTile;
+    int kvHead = firstHead / (heads / kvHeads);
+    int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    float query[HeadTile][MaxDim / 32];
+    #pragma unroll
+    for (int h = 0; h < HeadTile; ++h) {
+        #pragma unroll
+        for (int j = 0; j < MaxDim / 32; ++j)
+            query[h][j] = lane + j * 32 < dim
+                ? (float)q[(size_t)(firstHead + h) * dim + lane + j * 32] : 0;
+    }
+    int first = blockIdx.y * KeyTile, end = min(count, first + KeyTile);
+    for (int slot = first + warp; slot < end; slot += warps) {
+        int key = indices ? indices[slot] : slot;
+        bool valid = key >= 0 && key < keys && (!causal || key <= past);
+        float dot[HeadTile] = {};
+        #pragma unroll
+        for (int j = 0; j < MaxDim / 32; ++j) {
+            if (valid && lane + j * 32 < dim) {
+                float value = (float)k[(size_t)key * keyStride + kvHead * dim + lane + j * 32];
+                #pragma unroll
+                for (int h = 0; h < HeadTile; ++h)
+                    dot[h] += query[h][j] * value;
+            }
+        }
+        #pragma unroll
+        for (int h = 0; h < HeadTile; ++h) {
+            dot[h] = WarpSum(dot[h]);
+            if (lane == 0)
+                scores[(size_t)(firstHead + h) * count + slot] = valid
+                    ? RoundBF16(RoundBF16(dot[h]) * rsqrtf((float)dim)) : -INFINITY;
+        }
+    }
+}
+
+// Stage eight selected K rows once for sixteen Q heads. The aligned load
+// path keeps each head's original lane sum, warp tree and BF16 rounding.
+__global__ void AttentionScoresDecodeShared(const BF16 *q, const BF16 *k,
+        const int *indices, float *scores, int heads, int kvHeads, int dim,
+        int keyStride, int keys, int count, int past, bool causal) {
+    constexpr int HeadTile = kDecodeSharedHeads, KeyTile = kDecodeQkKeyTile, HeadsPerWarp = 2;
+    constexpr int MaxDim = kDecodeQkDim, threads = kDecodeSharedThreads;
+    __shared__ __align__(16) BF16 values[KeyTile][MaxDim];
+    __shared__ int selected[KeyTile];
+    int t = threadIdx.x, lane = t % 32, warp = t / 32, firstHead = blockIdx.x * HeadTile;
+    int kvHead = firstHead / (heads / kvHeads), first = blockIdx.y * KeyTile;
+    if (t < KeyTile) {
+        int slot = first + t, key = slot < count ? (indices ? indices[slot] : slot) : -1;
+        selected[t] = key >= 0 && key < keys && (!causal || key <= past) ? key : -1;
+    }
+    __syncthreads();
+    // Dispatch guarantees 16-byte alignment for every selected K row.
+    #pragma unroll
+    for (int i = t; i < KeyTile * (MaxDim / 8); i += threads) {
+        int row = i / (MaxDim / 8), d = i % (MaxDim / 8) * 8, key = selected[row];
+        *reinterpret_cast<uint4 *>(&values[row][d]) = key >= 0
+            ? *reinterpret_cast<const uint4 *>(k + (size_t)key * keyStride + kvHead * dim + d)
+            : make_uint4(0, 0, 0, 0);
+    }
+    int head = firstHead + warp * HeadsPerWarp;
+    float query[HeadsPerWarp][MaxDim / 32];
+    #pragma unroll
+    for (int h = 0; h < HeadsPerWarp; ++h) {
+        #pragma unroll
+        for (int j = 0; j < MaxDim / 32; ++j)
+            query[h][j] = lane + j * 32 < dim ? (float)q[(head + h) * dim + lane + j * 32] : 0;
+    }
+    __syncthreads();
+    for (int slot = 0; slot < KeyTile && first + slot < count; ++slot) {
+        float dot[HeadsPerWarp] = {};
+        bool valid = selected[slot] >= 0;
+        #pragma unroll
+        for (int j = 0; j < MaxDim / 32; ++j) {
+            if (lane + j * 32 < dim && valid) {
+                float value = (float)values[slot][lane + j * 32];
+                #pragma unroll
+                for (int h = 0; h < HeadsPerWarp; ++h)
+                    dot[h] += query[h][j] * value;
+            }
+        }
+        #pragma unroll
+        for (int offset = 16; offset; offset >>= 1) {
+            #pragma unroll
+            for (int h = 0; h < HeadsPerWarp; ++h)
+                dot[h] += __shfl_down_sync(0xffffffff, dot[h], offset);
+        }
+        if (lane == 0) {
+            #pragma unroll
+            for (int h = 0; h < HeadsPerWarp; ++h)
+                scores[(head + h) * count + first + slot] = valid
+                    ? RoundBF16(RoundBF16(dot[h]) * rsqrtf((float)dim)) : -INFINITY;
+        }
+    }
+}
+
 // Keep each warp's original lane-strided dot product and reduction order,
 // but retain Q in registers and interleave four independent selected keys.
 // The bounded query register tile leaves larger head dimensions on the
@@ -723,6 +834,54 @@ __global__ void AttentionSoftmax(float *scores, const float *sink, int heads, in
     sum = scratch[0];
     for (int i = t; i < count; i += 256)
         values[i] = sum > 0 ? RoundBF16(values[i] / sum) : 0;
+}
+
+// Preserve the 256-lane softmax tree and sequential per-thread sum, while
+// retaining eight exponentials in registers and folding the tree within a warp.
+__global__ void AttentionSoftmaxDecode(float *scores, const float *sink) {
+    constexpr int threads = kDecodeSharedThreads, count = kDecodePVKeys;
+    constexpr int items = count / threads;
+    __shared__ float scratch[threads], maximum, denominator;
+    int h = blockIdx.x, t = threadIdx.x;
+    float logits[items], bias = sink ? sink[h] : -INFINITY;
+    float top = bias;
+    #pragma unroll
+    for (int i = 0; i < items; ++i) {
+        logits[i] = scores[h * count + t + i * threads];
+        top = fmaxf(top, logits[i]);
+    }
+    scratch[t] = top;
+    __syncthreads();
+    if (t < 32) {
+        float a = fmaxf(scratch[t], scratch[t + 128]), b = fmaxf(scratch[t + 64], scratch[t + 192]);
+        float c = fmaxf(scratch[t + 32], scratch[t + 160]), d = fmaxf(scratch[t + 96], scratch[t + 224]);
+        float mx = fmaxf(fmaxf(a, b), fmaxf(c, d));
+        #pragma unroll
+        for (int offset = 16; offset; offset >>= 1)
+            mx = fmaxf(mx, __shfl_down_sync(0xffffffff, mx, offset));
+        if (t == 0) maximum = mx;
+    }
+    __syncthreads();
+    float sum = 0;
+    #pragma unroll
+    for (int i = 0; i < items; ++i) {
+        logits[i] = expf(logits[i] - maximum);
+        sum += logits[i];
+    }
+    if (t == 0 && sink) sum += expf(bias - maximum);
+    scratch[t] = sum;
+    __syncthreads();
+    if (t < 32) {
+        // Fold strides 128, 64 and 32 in the original block-reduction order.
+        float a = scratch[t] + scratch[t + 128], b = scratch[t + 64] + scratch[t + 192];
+        float c = scratch[t + 32] + scratch[t + 160], d = scratch[t + 96] + scratch[t + 224];
+        float total = WarpSum((a + b) + (c + d));
+        if (t == 0) denominator = total;
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int i = 0; i < items; ++i)
+        scores[h * count + t + i * threads] = denominator > 0 ? RoundBF16(logits[i] / denominator) : 0;
 }
 
 // Short full attention and the 128-token sliding window fit in shared memory.
@@ -879,10 +1038,6 @@ __global__ void AttentionValues(const float *prob, const BF16 *v, const int *ind
     }
 }
 
-constexpr int kDecodePVKeys = 2048;
-constexpr int kDecodePVValueDim = 128;
-constexpr int kDecodePVParts = 32;
-
 // Decode has just one query. Split its 2048 selected keys across CTAs so
 // every thread accumulates one value column, then combine FP32 partial sums.
 // Inputs/probability rounding and BF16 output are unchanged; the FP32 sum order
@@ -910,6 +1065,105 @@ __global__ void AttentionValuesDecodePartial(const float *prob, const BF16 *v,
             if (valid[i]) sum = fmaf(probabilities[i], values[i], sum);
     }
     partial[(h * parts + part) * dim + d] = sum;
+}
+
+template<int HeadTile>
+__global__ void AttentionValuesDecodeGrouped(const float *prob, const BF16 *v,
+        const int *indices, float *partial, int heads, int kvHeads,
+        int keys, int past, bool causal) {
+    constexpr int count = kDecodePVKeys, dim = kDecodePVValueDim;
+    constexpr int parts = kDecodePVParts, slots = count / parts;
+    int firstHead = blockIdx.x * HeadTile, part = blockIdx.y, d = threadIdx.x;
+    int kvHead = firstHead / (heads / kvHeads);
+    float sum[HeadTile] = {};
+    for (int base = part * slots; base < (part + 1) * slots; base += 8) {
+        float values[8];
+        bool valid[8];
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            int key = indices ? indices[base + i] : base + i;
+            valid[i] = key >= 0 && key < keys && (!causal || key <= past);
+            values[i] = valid[i] ? (float)v[((size_t)key * kvHeads + kvHead) * dim + d] : 0;
+        }
+        #pragma unroll
+        for (int h = 0; h < HeadTile; ++h) {
+            float probabilities[8];
+            #pragma unroll
+            for (int i = 0; i < 8; ++i)
+                probabilities[i] = prob[(firstHead + h) * count + base + i];
+            #pragma unroll
+            for (int i = 0; i < 8; ++i)
+                if (valid[i]) sum[h] = fmaf(probabilities[i], values[i], sum[h]);
+        }
+    }
+    #pragma unroll
+    for (int h = 0; h < HeadTile; ++h)
+        partial[((firstHead + h) * parts + part) * dim + d] = sum[h];
+}
+
+// Sixteen Q heads share a 64-key by 64-column V tile. Each warp computes
+// two heads; the existing 64-key partial sums and final reduction stay ordered.
+__global__ void AttentionValuesDecodeShared(const float *prob, const BF16 *v,
+        const int *indices, float *partial, int heads, int kvHeads,
+        int keys, int past, bool causal) {
+    constexpr int HeadTile = kDecodeSharedHeads, ValueTile = kDecodeValueTile, HeadsPerWarp = 2;
+    constexpr int count = kDecodePVKeys, parts = kDecodePVParts, slots = count / parts;
+    constexpr int dim = kDecodePVValueDim, columns = ValueTile / 32, threads = kDecodeSharedThreads;
+    __shared__ __align__(16) BF16 values[slots][ValueTile];
+    __shared__ int selected[slots];
+    __shared__ float probabilities[HeadTile][slots];
+    int t = threadIdx.x, lane = t % 32, warp = t / 32;
+    int firstHead = blockIdx.x * HeadTile, part = blockIdx.y;
+    int kvHead = firstHead / (heads / kvHeads), firstColumn = blockIdx.z * ValueTile;
+    if (t < slots) {
+        int key = indices ? indices[part * slots + t] : part * slots + t;
+        selected[t] = key >= 0 && key < keys && (!causal || key <= past) ? key : -1;
+    }
+    for (int i = t; i < HeadTile * slots; i += threads)
+        probabilities[i / slots][i % slots] = prob[(firstHead + i / slots) * count + part * slots + i % slots];
+    __syncthreads();
+    #pragma unroll
+    for (int i = t; i < slots * (ValueTile / 8); i += threads) {
+        int row = i / (ValueTile / 8), d = i % (ValueTile / 8) * 8, key = selected[row];
+        *reinterpret_cast<uint4 *>(&values[row][d]) = key >= 0
+            ? *reinterpret_cast<const uint4 *>(v + ((size_t)key * kvHeads + kvHead) * dim + firstColumn + d)
+            : make_uint4(0, 0, 0, 0);
+    }
+    __syncthreads();
+    float sums[HeadsPerWarp][columns] = {};
+    for (int base = 0; base < slots; base += 8) {
+        float valueTile[8][columns], probTile[HeadsPerWarp][8];
+        bool valid[8];
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            valid[i] = selected[base + i] >= 0;
+            #pragma unroll
+            for (int d = 0; d < columns; ++d)
+                valueTile[i][d] = (float)values[base + i][lane * columns + d];
+            #pragma unroll
+            for (int h = 0; h < HeadsPerWarp; ++h) {
+                int head = warp * HeadsPerWarp + h;
+                probTile[h][i] = probabilities[head][base + i];
+            }
+        }
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            if (valid[i]) {
+                #pragma unroll
+                for (int h = 0; h < HeadsPerWarp; ++h) {
+                    #pragma unroll
+                    for (int d = 0; d < columns; ++d)
+                        sums[h][d] = fmaf(probTile[h][i], valueTile[i][d], sums[h][d]);
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (int h = 0; h < HeadsPerWarp; ++h) {
+        #pragma unroll
+        for (int d = 0; d < columns; ++d)
+            partial[((firstHead + warp * HeadsPerWarp + h) * parts + part) * dim + firstColumn + lane * columns + d] = sums[h][d];
+    }
 }
 
 __global__ void AttentionValuesDecodeReduce(const float *partial, BF16 *out, int heads) {
@@ -1259,6 +1513,9 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
         CheckLaunch();
         return;
     }
+    const bool splitDecode = queries == 1 && window == 0 && count == kDecodePVKeys && heads >= 32;
+    const bool groupedDecode = splitDecode && heads % kvHeads == 0 && (heads / kvHeads) % 4 == 0;
+    const bool sharedDecode = groupedDecode && (heads / kvHeads) % kDecodeSharedHeads == 0;
     Data scores;
     Output(scores, DataType::FLOAT32, {queries, heads, count});
 #ifdef FASTLLM_NAIVE_DSA_MMA
@@ -1277,6 +1534,19 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
             heads, kvHeads, key.dims[2], keys, count, pastLength, causal);
     } else
 #endif
+    // Each shared tile must stay within one KV head and have aligned vector loads.
+    if (sharedDecode && dim == kDecodeQkDim && key.dims[2] % 8 == 0 &&
+        (size_t)key.cudaData % 16 == 0) {
+        AttentionScoresDecodeShared<<<dim3(heads / kDecodeSharedHeads, count / kDecodeQkKeyTile), kDecodeSharedThreads>>>(
+            (const BF16 *)query.cudaData, (const BF16 *)key.cudaData, selected,
+            (float *)scores.cudaData, heads, kvHeads, dim, key.dims[2],
+            keys, count, pastLength, causal);
+    } else if (groupedDecode && dim <= kDecodeQkDim) {
+        AttentionScoresDecodeGrouped<4, kDecodeQkDim><<<dim3(heads / 4, count / 32), 128>>>(
+            (const BF16 *)query.cudaData, (const BF16 *)key.cudaData, selected,
+            (float *)scores.cudaData, heads, kvHeads, dim, key.dims[2],
+            keys, count, pastLength, causal);
+    } else
     // Small query blocks need the original per-head CTA count for occupancy.
     if (queries >= 32 && dim <= 192 && heads / kvHeads >= 2) {
         AttentionScoresPrefillGrouped<<<dim3(kvHeads, queries, (heads / kvHeads + 1) / 2), 128>>>(
@@ -1292,8 +1562,13 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
             (const BF16 *)key.cudaData, selected, (float *)scores.cudaData,
             heads, kvHeads, dim, key.dims[2], keys, count, pastLength, window, causal);
     }
-    AttentionSoftmax<<<queries * heads, 256>>>((float *)scores.cudaData,
-        sink.dims.empty() ? nullptr : (const float *)sink.cudaData, heads, count);
+    if (sharedDecode) {
+        AttentionSoftmaxDecode<<<heads, kDecodeSharedThreads>>>((float *)scores.cudaData,
+            sink.dims.empty() ? nullptr : (const float *)sink.cudaData);
+    } else {
+        AttentionSoftmax<<<queries * heads, 256>>>((float *)scores.cudaData,
+            sink.dims.empty() ? nullptr : (const float *)sink.cudaData, heads, count);
+    }
 #ifdef FASTLLM_NAIVE_DSA_MMA
     if (useMma) {
         naive_dsa_mma::Values<<<dim3(queries, heads / naive_dsa_mma::kHeads), naive_dsa_mma::kThreads>>>(
@@ -1301,13 +1576,23 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
             heads, kvHeads, keys, count, pastLength, causal);
     } else
 #endif
-    if (queries == 1 && window == 0 && count == kDecodePVKeys &&
-        valueDim == kDecodePVValueDim && heads >= 32) {
+    if (splitDecode && valueDim == kDecodePVValueDim) {
         Data partial;
         Output(partial, FLOAT32, {heads, kDecodePVParts, kDecodePVValueDim});
-        AttentionValuesDecodePartial<<<dim3(heads, kDecodePVParts), kDecodePVValueDim>>>((const float *)scores.cudaData,
-            (const BF16 *)value.cudaData, selected, (float *)partial.cudaData,
-            heads, kvHeads, keys, pastLength, causal);
+        if (sharedDecode && (size_t)value.cudaData % 16 == 0) {
+            AttentionValuesDecodeShared<<<dim3(heads / kDecodeSharedHeads, kDecodePVParts,
+                kDecodePVValueDim / kDecodeValueTile), kDecodeSharedThreads>>>(
+                (const float *)scores.cudaData, (const BF16 *)value.cudaData,
+                selected, (float *)partial.cudaData, heads, kvHeads, keys, pastLength, causal);
+        } else if (groupedDecode) {
+            AttentionValuesDecodeGrouped<4><<<dim3(heads / 4, kDecodePVParts), kDecodePVValueDim>>>(
+                (const float *)scores.cudaData, (const BF16 *)value.cudaData,
+                selected, (float *)partial.cudaData, heads, kvHeads, keys, pastLength, causal);
+        } else {
+            AttentionValuesDecodePartial<<<dim3(heads, kDecodePVParts), kDecodePVValueDim>>>(
+                (const float *)scores.cudaData, (const BF16 *)value.cudaData,
+                selected, (float *)partial.cudaData, heads, kvHeads, keys, pastLength, causal);
+        }
         AttentionValuesDecodeReduce<<<(heads * kDecodePVValueDim + 255) / 256, 256>>>(
             (const float *)partial.cudaData, (BF16 *)output.cudaData, heads);
     } else if (queries == 1) {
