@@ -62,7 +62,7 @@ print(model.context_config)
 | Qwen3.5 dense/MoE，以及使用该架构的 Qwen3.8 | partial rotary、交错三轴 M-RoPE、TP、内置 MTP、融合 decode | Qwen3.5-2B、Qwen3.8-27B-FP8；不据此声明所有 MoE checkpoint 均完成实测 |
 | 其他模型 | 无新参数时沿用原路径；不开放新的 RoPE 扩展 | 需要模型适配和相应路径验证 |
 
-新 RoPE 扩展入口接入 **HF 模型目录和 GGUF 文件**，仍受上表的模型布局限制。GGUF 显式传入 `--rope_scaling` 时，在 `InitParams` 前应用公共配置；读取 GGUF 的窗口、theta、旋转维度、scaling 元数据和 Qwen3.5 交错 sections，原生加载路径保持不变。GGUF、FLM、自定义 GraphLLM 的 CLI 仅设置 `--max_context_length` 时保留旧的限长路径：可以缩小，超过模型窗口时仍取原上限。FLM 和自定义 GraphLLM 显式设置 `--rope_scaling` 仍会报不支持。Python 的新构造参数支持 HF 目录和 GGUF；其他格式继续使用旧长度 setter。上下文扩展不会额外增加某模型对 FP4、MTP 或其他后端的支持。
+新 RoPE 扩展入口接入 **HF 模型目录和 GGUF 文件**，仍受上表的模型布局限制。GGUF 显式传入 `--rope_scaling` 时，在 `InitParams` 前应用公共配置；读取 GGUF 的窗口、theta、旋转维度、scaling 元数据和 Qwen3.5 交错 sections，原生加载路径保持不变。GGUF、FLM、自定义 GraphLLM 的 CLI 仅设置 `--max_context_length` 时保留旧的限长路径：可以缩小，超过模型窗口时仍取原上限。FLM 和自定义 GraphLLM 显式设置 `--rope_scaling` 仍会报不支持。Python 的新构造参数支持 HF 目录和 GGUF；其他格式继续使用旧长度 setter。上下文扩展不会额外增加某模型对 FP4、MTP 或其他后端的支持。结合主机 KV 备份的长上下文用法见 [KVMem](kvmem.md)。
 
 本期开放 default、linear 与静态 YaRN。linear 扩大声明窗口同样需要明确原始长度。已有 dynamic NTK 在没有 RoPE 覆盖且没有扩大声明窗口时保留原路径，不开放新的动态扩展。外部 DSpark 与 YaRN 同用仍拒绝启动。Qwen3.5 的 DFlash2 可保留独立的原生 default RoPE 与目标 YaRN 同用，但草稿必须显式声明所有层均为滑窗注意力，窗口不超过其原生长度，且不使用缩放、partial rotary 或 M-RoPE。HF/GGUF 两个加载入口执行同一项检查。该组合不承诺短上下文相同的草稿接受率；主模型与草稿分别使用自己的旋转配置。
 

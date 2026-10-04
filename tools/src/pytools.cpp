@@ -1155,6 +1155,28 @@ extern "C" {
         model->AddPromptCache(input);
     }
 
+    DLL_EXPORT const char *set_kvmem_llm_model(int modelId, bool enabled, int maxTokens,
+            int residentTokens, int sinkTokens, int recentTokens, int retrievalTokens,
+            int prefillTokens, unsigned long long hostBytes, int retrievalInterval) {
+        fastllmPytoolsContextResult.clear();
+        try {
+            fastllm::KvMemConfig config;
+            config.enabled = enabled;
+            config.maxTokens = maxTokens;
+            config.residentTokens = residentTokens;
+            config.sinkTokens = sinkTokens;
+            config.recentTokens = recentTokens;
+            config.retrievalTokens = retrievalTokens;
+            config.prefillTokens = prefillTokens;
+            config.retrievalInterval = retrievalInterval;
+            config.hostBytes = hostBytes;
+            models.GetModel(modelId)->ConfigureKvMem(config);
+        } catch (const std::exception &error) {
+            fastllmPytoolsContextResult = error.what();
+        }
+        return fastllmPytoolsContextResult.c_str();
+    }
+
     DLL_EXPORT void set_kv_cache_limit_llm_model(int modelId, long long bytes) {
         auto model = models.GetModel(modelId);
         model->kvCacheLimit = bytes;

@@ -473,6 +473,10 @@ fastllm_lib.get_disk_moe_cache_stats.argtypes = [ctypes.POINTER(ctypes.c_uint64)
 fastllm_lib.apply_chat_template.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
 fastllm_lib.apply_chat_template.restype = ctypes.c_char_p
 
+fastllm_lib.set_kvmem_llm_model.argtypes = (
+    [ctypes.c_int, ctypes.c_bool] + [ctypes.c_int] * 6 + [ctypes.c_uint64, ctypes.c_int])
+fastllm_lib.set_kvmem_llm_model.restype = ctypes.c_char_p
+
 fastllm_lib.set_kv_cache_limit_llm_model.argtypes = [ctypes.c_int, ctypes.c_int64]
 
 fastllm_lib.set_max_batch_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
@@ -2071,6 +2075,8 @@ class model:
                             tool_choice = None, chat_template_kwargs = None) -> int:
         if enable_thinking is None:
             enable_thinking = self.enable_thinking
+        if getattr(self, "kvmem_enabled", False) and (images or videos):
+            raise ValueError("KVMem currently supports text-only requests")
         multimodal_images = list(images or [])
         multimodal_videos = list(videos or [])
         if multimodal_images or multimodal_videos:
@@ -3188,16 +3194,22 @@ class model:
         fastllm_lib.release_memory(self.model)
     
     def set_save_history(self, save: bool):
+        if getattr(self, "kvmem_enabled", False) and save:
+            raise ValueError("KVMem does not support history caching")
         self.save_history = bool(save)
         fastllm_lib.set_save_history(self.model, save)
 
     def set_atype(self, atype: str):
+        if getattr(self, "kvmem_enabled", False):
+            raise ValueError("Set compute dtype before configuring KVMem")
         fastllm_lib.set_model_atype(self.model, str(atype).encode())
 
     def set_moe_atype(self, moe_atype: str):
         fastllm_lib.set_model_moe_atype(self.model, str(moe_atype).encode())
 
     def set_kv_cache_dtype(self, kv_cache_dtype: str):
+        if getattr(self, "kvmem_enabled", False):
+            raise ValueError("Set KV dtype before configuring KVMem")
         fastllm_lib.set_model_kv_cache_dtype(self.model, str(kv_cache_dtype).encode())
 
     def warmup(self):
@@ -3211,6 +3223,35 @@ class model:
     
     def set_cuda_shared_expert(self, cuda_shared_expert: bool):
         fastllm_lib.set_cuda_shared_expert(cuda_shared_expert)
+
+    def set_kvmem(self, *, enabled=True, max_tokens=32768, resident_tokens=8192,
+                  sink_tokens=128, recent_tokens=2048, retrieval_tokens=4096,
+                  prefill_tokens=512, host_mib=8192, retrieval_interval=64):
+        """Opt into sparse, host-backed KV before warmup (single-GPU Qwen3/3.5).
+
+        This changes attention once the resident budget is exceeded. Prefix
+        caching and batching are disabled; Qwen3.5 also supports DFlash/MTP.
+        Token budgets except max_tokens must align to the configured KV page.
+        retrieval_interval controls speculative score reuse in committed tokens;
+        it need not be page aligned. Use 1 to refresh every verification round.
+        """
+        values = (max_tokens, resident_tokens, sink_tokens, recent_tokens,
+                  retrieval_tokens, prefill_tokens)
+        if not isinstance(enabled, bool):
+            raise TypeError("enabled must be bool")
+        if any(type(value) is not int or not 0 <= value <= 2147483647 for value in values):
+            raise ValueError("KVMem token budgets must be nonnegative 32-bit integers")
+        if type(host_mib) is not int or not 0 < host_mib < (1 << 44):
+            raise ValueError("host_mib must be a positive integer below 2**44")
+        if type(retrieval_interval) is not int or not 1 <= retrieval_interval <= 2147483647:
+            raise ValueError("retrieval_interval must be a positive 32-bit integer")
+        error = fastllm_lib.set_kvmem_llm_model(
+            self.model, enabled, *values, host_mib << 20, retrieval_interval)
+        if error:
+            raise ValueError(error.decode("utf-8", errors="replace"))
+        self.kvmem_enabled = enabled
+        if enabled:
+            self.save_history = False
 
     def set_kv_cache_limit(self, limit: str):
         limit_bytes = 0
@@ -3230,6 +3271,8 @@ class model:
         fastllm_lib.set_kv_cache_limit_llm_model(self.model, ctypes.c_int64(limit_bytes))
     
     def set_max_batch(self, batch: int):
+        if getattr(self, "kvmem_enabled", False) and batch != 1:
+            raise ValueError("KVMem currently requires max_batch=1")
         fastllm_lib.set_max_batch_llm_model(self.model, batch)
 
     def get_max_batch(self):

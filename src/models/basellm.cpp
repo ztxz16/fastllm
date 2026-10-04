@@ -50,6 +50,9 @@ namespace fastllm {
         static void ReleasePagedCachePages(Data &cache, bool clearDims = false) {
             std::set<std::pair<PagedCacheManager*, int> > releasedPages;
             auto releaseUnique = [&](Data &pagedCache) {
+                if (ReleaseKvMemCache(pagedCache)) {
+                    return;
+                }
                 if (!pagedCache.isPagedKVCache || pagedCache.pagedKVCacheData == nullptr ||
                     pagedCache.pageIndex.empty()) {
                     return;
@@ -509,6 +512,7 @@ namespace fastllm {
     }
 
     void ResponseContext::TryRecord(basellm *model) {
+        if (model->kvMemConfig.enabled) return;
         model->TryRecordResponseContext(this);
     }
 
@@ -598,6 +602,7 @@ namespace fastllm {
     }
 
     void ResponseContext::TryRecordPagedCache(basellm *model) {
+        if (model->kvMemConfig.enabled) return;
         if (!this->multimodalInput.empty()) {
             return;
         }
@@ -1428,6 +1433,7 @@ namespace fastllm {
         auto collectDecodePageNeeds =
                 [&](const std::vector<ResponseContext*> &contexts) -> std::map<PagedCacheManager*, int> {
             std::map<PagedCacheManager*, int> needs;
+            if (model->kvMemConfig.enabled) return needs;
             bool representativeCachesKnown = true;
             for (auto *ctx : contexts) {
                 if (ctx == nullptr || model->kvCacheId < 0 ||
@@ -1551,6 +1557,7 @@ namespace fastllm {
 
         auto collectPrefillPageNeeds = [&](ResponseContext *ctx, int appendTokens) -> PageNeedState {
             PageNeedState state;
+            if (model->kvMemConfig.enabled) return state;
             if (ctx == nullptr || appendTokens <= 0) {
                 return state;
             }
@@ -1605,7 +1612,10 @@ namespace fastllm {
         };
 
         auto *pcm = model->GetPagedKVCacheManager(model->kvCacheId, true);
-        if (pcm != nullptr) {
+        if (model->kvMemConfig.enabled) {
+            maxTotalLens = model->kvMemConfig.maxTokens;
+            maxBatch = 1;
+        } else if (pcm != nullptr) {
             totalPages = pcm->maxPages;
             pageLen = pcm->pageLen;
             maxTotalLens = totalPages * pageLen;
@@ -1907,7 +1917,7 @@ namespace fastllm {
                     }
 
                     if (isPrompt) {
-                        if (!isMultimodal && ctx->cacheLen == 0 &&
+                        if (!model->kvMemConfig.enabled && !isMultimodal && ctx->cacheLen == 0 &&
                             ctx->intParams.find("paged_prefix_restore_disabled") ==
                                 ctx->intParams.end()) {
                             PagedCacheManager *probeManager = nullptr;
@@ -2514,7 +2524,8 @@ namespace fastllm {
                         tokensManager,
                         &logits
                     );
-                } else if (singleContext != nullptr && seqLens.size() == 1 &&
+                } else if (!model->kvMemConfig.enabled &&
+                           singleContext != nullptr && seqLens.size() == 1 &&
                            seqLens[0] > prefillChunkSize &&
                            model->TryForwardChunkedPrefill(
                                inputIds, attentionMasks[0] == nullptr ? Data() : *attentionMasks[0],
@@ -2522,7 +2533,8 @@ namespace fastllm {
                                singleContext->pastKeyValues, generationConfigs[0],
                                tokensManager, logits[0], chunkedPrefillToken)) {
                     ret = {chunkedPrefillToken};
-                } else if (seqLens.size() == 1 && seqLens[0] > prefillChunkSize) {
+                } else if (seqLens.size() == 1 && (seqLens[0] > prefillChunkSize ||
+                           (model->kvMemConfig.enabled && seqLens[0] > 1))) {
                     int len = seqLens[0];
                     std::vector <std::pair <Data, Data> > *pastKeyValue1;
                     dictLocker.lock();
@@ -2531,6 +2543,10 @@ namespace fastllm {
                     auto prefillStartTime = std::chrono::system_clock::now();
                     for (int st = 0; st < len; ) {
                         int curLen = std::min(prefillChunkSize, len - st);
+                        // Retrieve with the final prompt query before sampling.
+                        if (model->kvMemConfig.enabled && curLen > 1 && st + curLen == len) {
+                            --curLen;
+                        }
                         auto chunkStartTime = std::chrono::system_clock::now();
                         Data curInput, curPositionIds;
                         Split(inputIds, 1, st, st + curLen, curInput);
@@ -2724,6 +2740,9 @@ namespace fastllm {
     int basellm::LaunchResponseTokens(const std::vector<int> &inputTokens,
                                       const fastllm::GenerationConfig &generationConfig,
                                       const std::map <std::string, std::vector <Data*> > &multimodalInput) {
+        if (kvMemConfig.enabled && !multimodalInput.empty()) {
+            throw std::invalid_argument("KVMem currently supports text-only requests");
+        }
         mainLoopLocker.lock();
         if (mainLoop == nullptr) {
             if (mainLoop == nullptr) {
@@ -3658,6 +3677,7 @@ namespace fastllm {
     }
 
     int basellm::GetChunkedPrefillSize() {
+        if (kvMemConfig.enabled) return kvMemConfig.prefillTokens;
         if (this->chunkedPrefillSize >= 0) {
             return this->chunkedPrefillSize;
         }
@@ -3840,6 +3860,7 @@ namespace fastllm {
     }
 
     static int GetCacheLen(const Data &cache) {
+        if (cache.kvMemConfig) return cache.dims.size() > 1 ? cache.dims[1] : 0;
         if (cache.isPagedKVCache) {
             if (cache.pageIndex.empty()) {
                 return 0;
@@ -4136,6 +4157,10 @@ namespace fastllm {
         fflush(stdout);
         Prepare();
         WarmupNumaMoeWeights();
+        if (kvMemConfig.enabled) {
+            WarmupKvMem();
+            return;
+        }
 
         int pageLen = fastllm::GetPageLen();
         int len = this->GetChunkedPrefillSize();

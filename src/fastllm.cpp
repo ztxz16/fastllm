@@ -5,6 +5,7 @@
 #include "utils.h"
 
 #include "fastllm.h"
+#include "kvmem.h"
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda-native-prefill.h"
 #endif
@@ -1106,7 +1107,23 @@ namespace fastllm {
         CopyFrom(ori);
     }
 
+    bool ReleaseKvMemCache(Data &cache) {
+        if (!cache.kvMemConfig) {
+            return false;
+        }
+        cache.pageIndex.clear();
+        cache.pagedKVCacheData = nullptr;
+        cache.lastPageLen = 0;
+        cache.isPagedKVCache = false;
+        cache.kvMemCache.reset();
+        cache.kvMemConfig.reset();
+        return true;
+    }
+
     void Data::FakeFrom(const Data &ori, size_t offset) {
+        if (ori.kvMemConfig || kvMemConfig) {
+            throw std::runtime_error("KVMem cache views require an explicit backend implementation");
+        }
         AssertInFastLLM(!ori.cudaNativeNvfp4Layout, "Native NVFP4 weight views require restoring the source layout first.");
         this->cudaNativeNvfp4Layout = false;
         this->dataType = ori.dataType;
@@ -1128,6 +1145,9 @@ namespace fastllm {
 
     void Data::CopyFrom(const Data &ori) {
         if (this == &ori) return;
+        if (ori.kvMemConfig || kvMemConfig) {
+            throw std::runtime_error("KVMem cache snapshots require an explicit backend implementation");
+        }
 #ifdef USE_CUDA
         if (this->cudaNativeNvfp4Layout) FastllmCudaRestoreNativeNvfp4(*this);
         // A clone belongs to the source device. The executor may currently
@@ -2458,7 +2478,7 @@ namespace fastllm {
         if (isFake) {
             return;
         }
-        if (this->isPagedKVCache && !this->pageIndex.empty()) {
+        if (!this->kvMemCache && this->isPagedKVCache && !this->pageIndex.empty()) {
             this->pagedKVCacheData->ReleasePageIndices(this->pageIndex);
         }
         if (this->multiDeviceData) {

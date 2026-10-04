@@ -4899,6 +4899,7 @@ namespace fastllm {
         }
 
         static int Qwen35CacheTokenLen(const Data &cache) {
+            if (cache.kvMemConfig) return cache.dims.size() > 1 ? cache.dims[1] : 0;
             if (cache.multiDeviceData && !cache.multiDeviceDatas.empty()) {
                 for (auto &it : cache.multiDeviceDatas) {
                     if (it.second != nullptr) {
@@ -7125,12 +7126,15 @@ namespace fastllm {
                 return *qForAttentionHolder;
             };
 
+            const bool useKvMem = (bool)(*batchPastKeys)[0]->kvMemConfig;
+            Data kvMemRawQ, kvMemRawK;
+            if (useKvMem) isPrefill = true;
             if (!isPrefill && (*batchPastKeys)[0]->pagedKVCacheData == nullptr) {
                 isPrefill = true;
             }
 
             if (isPrefill) {
-                bool fusedPrefill = !ropeConfig && Qwen35CudaTryQGateKVPrefill(
+                bool fusedPrefill = !useKvMem && !ropeConfig && Qwen35CudaTryQGateKVPrefill(
                     runner, *merged, *qNormWeight, *kNormWeight,
                     *allPositionIds, *q, *gate, *k, *v,
                     numAttentionHeads, numKeyValueHeads, headDim,
@@ -7152,6 +7156,10 @@ namespace fastllm {
 
                     Qwen3CudaRMSNorm(runner, *q, *qNormWeight, rmsNormEps, *q);
                     Qwen3CudaRMSNorm(runner, *k, *kNormWeight, rmsNormEps, *k);
+                    if (useKvMem) {
+                        kvMemRawQ.CopyFrom(*q);
+                        kvMemRawK.CopyFrom(*k);
+                    }
                     Qwen35CudaApplyRotary(runner, *q, *allPositionIds,
                                           rotaryDim, mropeSections, ropeBase, ropeScale, ropeConfig);
                     Qwen35CudaApplyRotary(runner, *k, *allPositionIds,
@@ -7167,14 +7175,18 @@ namespace fastllm {
 
                 bool packedPrefillMeta = externalPrefillMeta;
                 Data *appendBaseTokenLens = externalAppendBaseTokenLens;
-                if (!packedPrefillMeta && !repeatSinglePagedCache) {
+                if (!useKvMem && !packedPrefillMeta && !repeatSinglePagedCache) {
                     packedPrefillMeta = Qwen35PreparePackedPagedAppend(
                         runner.DeviceId(), *k, *v,
                         *batchPastKeys, *batchPastValues, seqLens,
                         *qSizes, *pageSizes, *pageIndexs, *lastPageLens,
                         appendBaseTokenLens);
                 }
-                if (packedPrefillMeta) {
+                if (useKvMem) {
+                    packedPrefillMeta = false;
+                    KvMemAppend(kvMemRawQ, kvMemRawK, *k, *v,
+                                *(*batchPastKeys)[0], *(*batchPastValues)[0]);
+                } else if (packedPrefillMeta) {
                     AssertInFastLLM(
                         appendBaseTokenLens != nullptr &&
                         appendBaseTokenLens->dataDevice ==
@@ -9327,8 +9339,9 @@ namespace fastllm {
             return pool;
         }
         const int pageLen = GetPageLen();
-        const int mainPages = GetMaxTokens() > 0 ?
-            (GetMaxTokens() + pageLen - 1) / pageLen : 300;
+        const int contextTokens = kvMemConfig.enabled ? kvMemConfig.maxTokens : GetMaxTokens();
+        const int mainPages = contextTokens > 0 ?
+            (contextTokens + pageLen - 1) / pageLen : 300;
         const int batch = std::max(1, this->maxBatch > 0 ? this->maxBatch : 512);
         const int draftPages = (std::max(1, Qwen35MtpDraftsPerStep()) + pageLen - 1) / pageLen;
         const int poolPages = mainPages + batch * draftPages;
@@ -9990,6 +10003,7 @@ namespace fastllm {
     }
 
     void Qwen3_5Model::OnAutoWarmupFinished() {
+        if (kvMemConfig.enabled) return;
 #ifdef USE_CUDA
         PrepareMtpCudaServingWarmup();
         std::vector<int> fp8Devices;
@@ -10518,6 +10532,21 @@ namespace fastllm {
         dflashContexts.erase(context);
     }
 
+    bool Qwen3_5Model::KvMemLayerEligible(int layer) const {
+        return weight.weight.find(language_prefix + "layers." + std::to_string(layer) +
+                                  ".self_attn.o_proj.weight") != weight.weight.end();
+    }
+
+    void Qwen3_5Model::ValidateKvMemModel(const KvMemConfig &config) const {
+        // Target KV transactions handle both draft backends. Draft caches
+        // retain their own lifecycle (DFlash sliding window / MTP paged KV).
+        const int drafts = HasDFlashWeights() ? DFlashDraftsPerStep() :
+            (Qwen35MtpDisabledByEnv() ? 0 : Qwen35MtpDraftsPerStep());
+        if (config.enabled && drafts + 1 > config.prefillTokens) {
+            throw std::invalid_argument("KVMem: prefill_tokens must cover drafts + 1 verification tokens");
+        }
+    }
+
     bool Qwen3_5Model::UseModelSpecificScheduler() const {
 #ifndef USE_CUDA
         return false;
@@ -10525,6 +10554,7 @@ namespace fastllm {
         bool useMtpScheduler = !Qwen35MtpDisabledByEnv() &&
                                HasMtpWeights();
         bool useDFlashScheduler = HasDFlashWeights();
+        if (kvMemConfig.enabled && !useMtpScheduler && !useDFlashScheduler) return false;
         std::vector<int> handoffDevices;
         std::map<int, int> handoffRatios;
         bool useGpuTokenHandoffScheduler = Qwen35MtpDisabledByEnv() &&
@@ -11056,7 +11086,7 @@ namespace fastllm {
             return tpGraphContext->All(tpGraphRank, localEligible);
         };
         const int maxCudaGraphDecodeBatch = Qwen35MaxCudaGraphDecodeBatch(this);
-        if (!Qwen35CudaGraphEnabled() || batch <= 0 || batch > maxCudaGraphDecodeBatch ||
+        if (kvMemConfig.enabled || !Qwen35CudaGraphEnabled() || batch <= 0 || batch > maxCudaGraphDecodeBatch ||
             !all1 || isPrefill || (int)seqLens.size() < batch ||
             (int)pastKeyValues.size() < batch * block_cnt || seqLens[0] != 1 ||
             positionIds.Count(0) != (uint64_t)batch) {
@@ -13268,7 +13298,7 @@ namespace fastllm {
                             {{&attenLastOutput}, prefillResidualElements}});
                     }
                     const bool exactDFlashVerifierAttention =
-                        exactSmallDFlashVerifier &&
+                        !kvMemConfig.enabled && exactSmallDFlashVerifier &&
                         mtpVerifyGraphDeviceState == nullptr &&
                         bsz == 1 && seqlen > 1;
                     if (exactDFlashVerifierAttention) {
@@ -15935,12 +15965,14 @@ namespace fastllm {
         std::map<int, int> ratios;
         if (!CanUseGPUForward() ||
             !GetQwen35GPUForwardDevices(this->deviceMap, devices, ratios)) {
+            if (kvMemConfig.enabled) throw std::invalid_argument("KVMem requires one CUDA device");
             if (threadTpWorkerGroup.HasWorkers()) {
                 threadTpWorkerGroup.Stop();
             }
             return ForwardV2(batch, inputIds, attentionMask, positionIds, seqLens,
                              pastKeyValues, generationConfigs, lastTokens, retLogits);
         }
+        PrepareKvMemCaches(batch, (int)devices.size(), pastKeyValues);
         bool tensorParallel = devices.size() > 1;
         auto mtpTargetProfileRecord = [&](int logitRows) {
             if (!mtpTargetProfileEnabled) {
@@ -16911,7 +16943,7 @@ namespace fastllm {
             homogeneousVerifyLength &= len == seqLens[0];
         }
         bool mtpVerifyGraphEligible =
-            Qwen35CudaGraphEnabled() &&
+            !kvMemConfig.enabled && Qwen35CudaGraphEnabled() &&
             Qwen35MtpVerifyCudaGraphEnabled() &&
             (!speculativeCaptureDFlashHiddenStates ||
              (batch == 1 && computeType == DataType::FLOAT16 &&
@@ -18275,7 +18307,7 @@ namespace fastllm {
         // and recover only rejected GDN prefixes. Reuse the batched recovery
         // path for one request instead of writing a full state per draft.
         // Graph verification keeps its existing stable snapshot addresses.
-        if (useDFlash && seqLens[0] > 1 &&
+        if (!kvMemConfig.enabled && useDFlash && seqLens[0] > 1 &&
             seqLens[0] <= QWEN35_MTP_FAST_SEQ_MAX &&
             DFlashDraftsPerStep() <= QWEN35_MTP_PREFIX_SNAPSHOT_MAX &&
             !Qwen35CudaGraphEnabled() &&
@@ -19496,6 +19528,135 @@ namespace fastllm {
             acceptedTokens[0].push_back(nextToken);
             setNextInputWithDrafts(nextToken, drafts);
             mtpProfileRecord(QWEN35_MTP_PROFILE_SEED, false, 0, 0, 1);
+            return true;
+        }
+
+        if (kvMemConfig.enabled) {
+            // Attention caches own provisional tails; GDN verification runs
+            // against isolated states. No borrowed page references enter the
+            // ordinary copy-on-write/ReleasePageIndex paths below.
+            std::vector<std::pair<Data, Data>> linearScratch(block_cnt);
+            auto validationPast = pastKeyValues;
+            std::vector<int> transactions;
+            transactions.reserve(block_cnt);
+            bool committedStep = false;
+            const bool oldCapture = speculativeCaptureFirstTokenLinearState;
+            const int oldSlots = speculativeLinearStateCaptureSlots;
+            auto finishTransactions = [&](int accepted) {
+                while (!transactions.empty()) {
+                    int layer = transactions.back();
+                    auto &kv = pastKeyValues[layer];
+                    kv.first->kvMemCache->FinishTransaction(accepted, *kv.first, *kv.second);
+                    transactions.pop_back();
+                }
+            };
+            int guardToken = 0;
+            auto cleanup = [&](int*) noexcept {
+                // Failed CUDA/transfer caches are poisoned and released with
+                // the request. Never let exception cleanup throw a second time.
+                for (int layer : transactions) {
+                    auto &kv = pastKeyValues[layer];
+                    try { kv.first->kvMemCache->FinishTransaction(0, *kv.first, *kv.second); }
+                    catch (...) {}
+                }
+                speculativeCaptureFirstTokenLinearState = oldCapture;
+                speculativeLinearStateCaptureSlots = oldSlots;
+                ++speculativeLinearStateGeneration;
+                speculativeLinearStates.clear();
+                speculativeLinearCaptureMask.clear();
+                if (!committedStep) eraseDraftCache();
+            };
+            std::unique_ptr<int, decltype(cleanup)> guard(&guardToken, cleanup);
+            for (int i = 0; i < block_cnt; ++i) {
+                if (isAttentionLayerAt(i)) {
+                    auto &kv = pastKeyValues[i];
+                    if (!kv.first->kvMemCache || kv.first->kvMemCache != kv.second->kvMemCache) {
+                        throw std::runtime_error("KVMem: missing speculative target cache");
+                    }
+                    kv.first->kvMemCache->BeginTransaction(seqLen);
+                    transactions.push_back(i);
+                } else {
+                    linearScratch[i].first.CopyFrom(*pastKeyValues[i].first);
+                    linearScratch[i].second.CopyFrom(*pastKeyValues[i].second);
+                    validationPast[i] = {&linearScratch[i].first, &linearScratch[i].second};
+                }
+            }
+            speculativeCaptureFirstTokenLinearState = true;
+            speculativeLinearStateCaptureSlots = seqLen - 1;
+            ++speculativeLinearStateGeneration;
+            speculativeLinearStates.clear();
+            speculativeLinearStates.resize(block_cnt);
+            speculativeLinearCaptureMask.assign(block_cnt, {});
+            speculativeFirstTokenLinearStates.clear();
+            speculativeFirstTokenLinearStates.resize(block_cnt);
+            speculativeFirstTokenLinearCaptureMask.assign(block_cnt, 0);
+            for (int i = 0; i < block_cnt; ++i) {
+                if (!isAttentionLayerAt(i)) {
+                    speculativeLinearStates[i].resize(seqLen - 1);
+                    speculativeLinearCaptureMask[i].assign(seqLen - 1, 0);
+                }
+            }
+            mtpProfileMark(mtpProfileCachePrepUs);
+            targetRet = runTargetWithPast(inputIds, attentionMask, positionIds, seqLens, validationPast);
+            mtpProfileMark(mtpProfileTargetUs);
+            if ((int)targetRet.size() < seqLen) {
+                throw std::runtime_error("KVMem: incomplete speculative verification");
+            }
+            const int draftCount = seqLen - 1;
+            const int matched = countAcceptedDrafts(targetRet, draftCount);
+            const int commitLen = matched + 1;
+            auto committed = buildCommittedTokens(targetRet, draftCount, matched);
+            bool captured = true;
+            if (commitLen < seqLen) {
+                for (int i = 0; i < block_cnt; ++i) {
+                    if (!isAttentionLayerAt(i) &&
+                        (speculativeLinearCaptureMask[i][commitLen - 1] & 3) != 3) {
+                        captured = false;
+                        break;
+                    }
+                }
+            }
+            if (captured) {
+                for (int i = 0; i < block_cnt; ++i) {
+                    if (!isAttentionLayerAt(i)) {
+                        auto &state = commitLen == seqLen ? linearScratch[i] :
+                            speculativeLinearStates[i][commitLen - 1];
+                        copyTensorIntoExistingStorage(*pastKeyValues[i].first, state.first);
+                        copyTensorIntoExistingStorage(*pastKeyValues[i].second, state.second);
+                    }
+                }
+                finishTransactions(commitLen);
+            } else {
+                // Generic/BF16/long verifiers may not capture GDN prefixes.
+                // Restore target KV and replay only accepted input tokens.
+                finishTransactions(0);
+                Data replayInput = buildInputIdsSlice(0, commitLen);
+                Data replayPositions = BuildMtpPositionIdsSlice(allPositionIds, 0, commitLen, 0);
+                runTargetCacheOnly(replayInput, {nullptr}, {&replayPositions}, {commitLen});
+            }
+            mtpProfileMark(mtpProfileCommitUs);
+            speculativeCaptureFirstTokenLinearState = oldCapture;
+            speculativeLinearStateCaptureSlots = oldSlots;
+            Data hidden;
+            Split(speculativeHiddenStates, 1, 0, commitLen, hidden);
+            Data positions = BuildMtpPositionIdsSlice(allPositionIds, 0, commitLen, 0);
+            std::vector<int> draftInputs;
+            for (int i = 1; i < commitLen; ++i) draftInputs.push_back(tokenAt(i));
+            draftInputs.push_back(committed.back());
+            auto drafts = runSpeculativeDraftChain(hidden, draftInputs, positions,
+                commitLen - 1, commitLen - 1, committed);
+            mtpProfileMark(mtpProfileDraftUs);
+            for (int i = 0; i < draftCount && i < QWEN35_MTP_MAX_DRAFTS; ++i) {
+                mtpDraftPositionAttempts[i].fetch_add(1, std::memory_order_relaxed);
+                if (i < matched) mtpDraftPositionAccepts[i].fetch_add(1, std::memory_order_relaxed);
+            }
+            mtpValidationCount.fetch_add(1, std::memory_order_relaxed);
+            acceptedTokens[0] = committed;
+            setNextInputWithDrafts(committed.back(), drafts);
+            keptInputLens[0] = commitLen;
+            logMtpStats();
+            mtpProfileRecord(QWEN35_MTP_PROFILE_SINGLE, true, draftCount, matched, commitLen);
+            committedStep = true;
             return true;
         }
 
@@ -22619,6 +22780,9 @@ namespace fastllm {
         auto releasePagedCachePages = [](Data &cache, bool clearDims = false) {
             std::set<std::pair<PagedCacheManager*, int> > releasedPages;
             auto releaseUnique = [&](Data &pagedCache) {
+                if (ReleaseKvMemCache(pagedCache)) {
+                    return;
+                }
                 if (!pagedCache.isPagedKVCache || pagedCache.pagedKVCacheData == nullptr ||
                     pagedCache.pageIndex.empty()) {
                     return;
@@ -22681,6 +22845,10 @@ namespace fastllm {
                 return 0;
             }
             int tokens = (int)ctx->currentTokens.size();
+            if (model->kvMemConfig.enabled && ctx->preTokens > 0) {
+                int remaining = model->kvMemConfig.maxTokens - ctx->cacheLen - ctx->preTokens;
+                tokens = std::min(tokens, std::max(1, std::min(remaining, model->kvMemConfig.prefillTokens)));
+            }
             if (useMtpBatchScheduling && ctx->preTokens > 0 && tokens > 1) {
                 tokens = std::min(tokens, mtpBatchDecodeTokens);
             }
@@ -22894,6 +23062,7 @@ namespace fastllm {
 
         auto collectDecodePageNeeds = [&](ResponseContext *ctx) -> std::map<PagedCacheManager*, int> {
             std::map<PagedCacheManager*, int> needs;
+            if (model->kvMemConfig.enabled) return needs;
             int decodeTokens = ctx == nullptr ? 1 :
                 std::max(1, scheduledDecodeTokens(ctx));
             addMtpPageNeeds(ctx, decodeTokens + mtpDraftsPerStep, needs);
@@ -22988,7 +23157,7 @@ namespace fastllm {
         auto collectPrefillPageNeeds = [&](ResponseContext *ctx,
                                            int appendTokens) {
             std::map<PagedCacheManager*, int> needs;
-            if (ctx == nullptr || appendTokens <= 0) {
+            if (model->kvMemConfig.enabled || ctx == nullptr || appendTokens <= 0) {
                 return needs;
             }
             addMtpPageNeeds(ctx, appendTokens, needs);
@@ -23075,7 +23244,7 @@ namespace fastllm {
             // Restoring text-only KV here makes Qwen35ForwardMultimodal take
             // its decode branch, skipping vision encoding and chunked prefill.
             // Media-aware cache keys and position state are required first.
-            if (ctx == nullptr || !ctx->multimodalInput.empty() ||
+            if (model->kvMemConfig.enabled || ctx == nullptr || !ctx->multimodalInput.empty() ||
                 ctx->cacheLen != 0 || ctx->currentTokens.empty()) {
                 return 0;
             }
@@ -23288,7 +23457,10 @@ namespace fastllm {
         };
 
         auto *pcm = GetPagedCacheManager(model->kvCacheId * 2);
-        if (pcm != nullptr) {
+        if (model->kvMemConfig.enabled) {
+            maxTotalLens = model->kvMemConfig.maxTokens;
+            model->tokensLimit = model->promptLimit = maxTotalLens;
+        } else if (pcm != nullptr) {
             totalPages = pcm->maxPages;
             pageLen = pcm->pageLen;
             maxTotalLens = totalPages * pageLen;
@@ -23341,7 +23513,7 @@ namespace fastllm {
         bool gpuTokenHandoffHasDevices = GetQwen35GPUForwardDevices(
             model->deviceMap, gpuTokenHandoffDevices,
             gpuTokenHandoffRatios);
-        bool gpuTokenHandoffConfigured = gpuTokenHandoffRequested &&
+        bool gpuTokenHandoffConfigured = !model->kvMemConfig.enabled && gpuTokenHandoffRequested &&
             gpuTokenHandoffCudaEmbedding &&
             !gpuTokenHandoffLowMem && gpuTokenHandoffMtpDisabled &&
             gpuTokenHandoffHasDevices && !gpuTokenHandoffDevices.empty();
@@ -24199,7 +24371,8 @@ namespace fastllm {
                         keptInputLens,
                         usedMtpForward);
                 } else if (seqLens.size() == 1 && selectedIsPrompt &&
-                           seqLens[0] > longPrefillChunkSize &&
+                           (seqLens[0] > longPrefillChunkSize ||
+                            (model->kvMemConfig.enabled && seqLens[0] > 1)) &&
                            singleContext != nullptr) {
                     int len = seqLens[0];
                     std::vector<std::pair<Data, Data> > *pastKeyValue1 = nullptr;
@@ -24407,6 +24580,9 @@ namespace fastllm {
                         for (int st = 0; st < len; ) {
                             int curLen = std::min(
                                 longPrefillChunkSize, len - st);
+                            if (model->kvMemConfig.enabled && curLen > 1 && st + curLen == len) {
+                                --curLen;
+                            }
                             bool isLastChunk = st + curLen == len;
                             auto chunkStartTime = std::chrono::system_clock::now();
                             Data curInput, curPositionIds;
@@ -24897,7 +25073,8 @@ namespace fastllm {
                                 ctx->TryRecordPagedCache(model);
                             }
                             eraseMtpCache(ctx);
-                        } else if (ctx->allTokens.size() >= model->max_positions) {
+                        } else if (ctx->allTokens.size() >= model->max_positions ||
+                                   (model->kvMemConfig.enabled && ctx->allTokens.size() >= (size_t)maxTotalLens)) {
                             ctx->isEnding = true;
                             if (!skipPagedCacheRecord) {
                                 ctx->TryRecordPagedCache(model);
@@ -35049,6 +35226,7 @@ namespace fastllm {
             const GenerationConfig &generationConfig,
             const LastTokensManager &lastTokens,
             std::vector <std::vector <float>*> *retLogits) {
+        if (kvMemConfig.enabled) throw std::invalid_argument("KVMem currently supports text-only requests");
         std::vector<std::vector<int> > acceptedTokens;
         std::vector<std::vector<int> > nextInputTokens;
         std::vector<int> keptInputLens;
@@ -35609,6 +35787,12 @@ namespace fastllm {
         const std::vector <GenerationConfig> &generationConfigs,
         const LastTokensManager &lastTokens,
         std::vector <std::vector <float>*> *retLogits) {
+        if (kvMemConfig.enabled) {
+            if (!CanUseGPUForward()) throw std::invalid_argument("KVMem requires the direct CUDA forward path");
+            return ForwardGPU(batch, inputIds, attentionMask, positionIds, seqLens,
+                              pastKeyValues, generationConfigs, lastTokens, retLogits);
+        }
+
 #ifdef USE_CUDA
         if (IsThreadTensorParallelEnabled()) {
             return ForwardGPU(batch, inputIds, attentionMask, positionIds, seqLens,

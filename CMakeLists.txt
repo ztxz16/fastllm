@@ -207,7 +207,7 @@ file(GLOB BLOCK_FILES "src/blocks/*.cpp")
 file(GLOB CPU_DEVICE_FILES "src/devices/cpu/*.cpp")
 set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/contextconfig.cpp src/executor.cpp src/template.cpp src/graph.cpp src/tokenizer.cpp
         src/devices/disk/diskdevice.cpp
-        src/models/graphllm.cpp src/models/chatglm.cpp src/models/moss.cpp src/models/llama.cpp src/models/qwen.cpp src/models/basellm.cpp
+        src/models/graphllm.cpp src/models/chatglm.cpp src/models/moss.cpp src/models/llama.cpp src/models/qwen.cpp src/models/basellm.cpp src/kvmem.cpp src/models/basellmkvmem.cpp
         src/models/glm.cpp src/models/minicpm.cpp src/models/minicpm3.cpp src/models/internlm2.cpp src/models/bert.cpp src/models/moe.cpp src/models/deepseekv2.cpp src/models/deepseekv4.cpp src/models/deepseekv41.cpp src/models/deepseekv41_vision.cpp src/models/deepseekv41_dspark.cpp src/models/dots3_note.cpp
         src/models/phi3.cpp src/models/xlmroberta.cpp src/models/cogvlm.cpp src/models/qwen3.cpp src/models/qwen3_moe.cpp src/models/hy_v3.cpp src/models/qwen3_next.cpp src/models/qwen4_exp.cpp src/models/kimi_k3.cpp src/models/naive_n05_flash.cpp src/models/naive_n05_history.cpp src/models/naive_n05_draft.cpp
         src/models/minimax.cpp src/models/hunyuan.cpp
@@ -360,6 +360,7 @@ if (USE_CUDA)
         src/devices/cuda/fastllm-cuda-vision.cu
         src/devices/cuda/fastllm-cuda.cu
         src/devices/cuda/fastllm-cuda-mtp.cu
+        src/devices/cuda/fastllm-kvmem.cu
         src/devices/cuda/fastllm-triton-cuda.cu
         src/devices/cuda/fastllm-ggml-cuda.cu
         src/devices/cuda/fastllm-gguf-t8-extended.cu
@@ -714,11 +715,20 @@ if (UNIT_TEST)
         set_tests_properties(${name} PROPERTIES TIMEOUT ${outer_timeout}
             SKIP_REGULAR_EXPRESSION "FASTLLM_TEST_SKIP_NO_DEVICE")
     endfunction()
+    add_executable(kvmem_pages_test test/basic/test_kvmem_pages.cpp src/kvmem.cpp)
+    target_include_directories(kvmem_pages_test PRIVATE include)
+    set_target_properties(kvmem_pages_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    fastllm_add_checked_test(kvmem_pages kvmem_pages_test "KVMem page tests passed" 60)
     add_executable(qwen35_mtp_shortlist_test test/basic/test_qwen35_mtp_shortlist.cpp)
     target_include_directories(qwen35_mtp_shortlist_test PRIVATE include)
     set_target_properties(qwen35_mtp_shortlist_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
     fastllm_add_checked_test(qwen35_mtp_shortlist qwen35_mtp_shortlist_test "PASS" 60)
     if (USE_CUDA AND NOT USE_ROCM)
+        add_executable(cuda_kvmem_test test/basic/test_cuda_kvmem.cu)
+        target_link_libraries(cuda_kvmem_test PRIVATE fastllm)
+        set_target_properties(cuda_kvmem_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        fastllm_add_checked_test(cuda_kvmem cuda_kvmem_test "PASS KVMem all 8 cases" 180)
+        set_tests_properties(cuda_kvmem PROPERTIES LABELS cuda RUN_SERIAL TRUE)
         add_executable(cuda_gguf_iq_r4_test test/basic/test_cuda_gguf_iq_r4.cu)
         target_link_libraries(cuda_gguf_iq_r4_test PRIVATE fastllm)
         target_include_directories(cuda_gguf_iq_r4_test PRIVATE src/devices/cuda ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

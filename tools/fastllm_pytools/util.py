@@ -852,6 +852,8 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--atype', type = str, default = "auto", help = '推理类型，可使用float32或float16')
     parser.add_argument('--kv_cache_dtype', type = str, default = "auto", help = 'KV Cache类型，可使用auto、float16、bfloat16、fp8_e4m3或fp4（Qwen3.5 CUDA 与 DeepSeek-V4.1）')
     parser.add_argument('--cuda_embedding', action = 'store_true', help = '在cuda上进行embedding')
+    parser.add_argument('--kvmem', type=str, default=None,
+                        help='启用稀疏主机 KV 缓存；JSON 参数，如 {"max_tokens":32768,"retrieval_interval":64}。默认关闭；单卡单请求，Qwen3/3.5 普通解码及 Qwen3.5 DFlash/MTP')
     parser.add_argument('--kv_cache_limit', type = str, default = "auto",  help = 'kv缓存最大使用量')
     parser.add_argument('--max_batch', type = int, default = -1,  help = '每次最多同时推理的询问数量')
     parser.add_argument('--chunked_prefill_size', type = int, default = -1, help = '分块 prefill 的切片大小（首块与后续块相同），如 8192')
@@ -1834,6 +1836,15 @@ def make_normal_llm_model(args, startup_progress = None):
             model.set_kv_cache_limit(args.kv_cache_limit)
         if (args.chunked_prefill_size > 0):
             model.set_chunked_prefill_size(args.chunked_prefill_size)
+        if getattr(args, "kvmem", None) is not None:
+            kvmem_options = json.loads(args.kvmem)
+            if not isinstance(kvmem_options, dict):
+                raise ValueError("--kvmem must be a JSON object")
+            if args.kv_cache_limit not in ("", "auto"):
+                raise ValueError("Use KVMem resident_tokens instead of --kv_cache_limit")
+            if args.chunked_prefill_size > 0:
+                kvmem_options.setdefault("prefill_tokens", args.chunked_prefill_size)
+            model.set_kvmem(**kvmem_options)
         llm.report_model_load_progress("weights_finalize", 1, 1)
         llm.report_model_load_progress("warmup", 0, 1)
         model.warmup()

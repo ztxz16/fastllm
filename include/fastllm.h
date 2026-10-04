@@ -490,6 +490,8 @@ namespace fastllm {
     };
 
     class PagedCacheManager;
+    struct KvMemConfig;
+    class KvMemCache;
 
     class Data {
     public:
@@ -503,6 +505,9 @@ namespace fastllm {
         // Paged KV Cache的相关信息
         // 当isKVCache = true且isPagedKVCache = true时，下面这些信息才有意义
         bool isPagedKVCache = false; // 是否是分片的KV Cache
+        // Optional request-owned sparse KV storage; pageIndex is a borrowed view.
+        std::shared_ptr<const KvMemConfig> kvMemConfig;
+        std::shared_ptr<KvMemCache> kvMemCache;
         int pageLen = 128; // 每个page的长度（token数）
         PagedCacheManager *pagedKVCacheData = nullptr; // 存储kv cached的数据，shape为 [maxPages, pageLen, numHeads, headDim]
         std::vector <int> pageIndex; // 目前使用的Index编号
