@@ -19,6 +19,10 @@ struct RecordCopyView {
     size_t bytesPerRecord;
     // Optional device byte offsets; each must have the same alignment as the pitch.
     const uint64_t *destinationOffsets = nullptr;
+    // Optional already-staged source for one record ID. Other IDs retain the
+    // ordinary source table. Both sources must stay alive until completion.
+    const void *cachedSource = nullptr;
+    int cachedSourceId = -1;
 };
 
 struct RecordCopyLaunch { int blocks; int threads; };
@@ -56,8 +60,9 @@ __global__ void CopyKernel(RecordCopyView view, const int32_t *sourceIds,
         Index record = Index(flat) / unitsPerRecord;
         Index unit = Index(flat) - record * unitsPerRecord;
         const Unit *source = reinterpret_cast<const Unit *>(
-            static_cast<const uint8_t *>(view.source) +
-            size_t(sourceIds[record]) * view.sourcePitch);
+            view.cachedSource && sourceIds[record] == view.cachedSourceId
+                ? static_cast<const uint8_t *>(view.cachedSource)
+                : static_cast<const uint8_t *>(view.source) + size_t(sourceIds[record]) * view.sourcePitch);
         Unit *destination = reinterpret_cast<Unit *>(
             static_cast<uint8_t *>(view.destination) +
             (view.destinationOffsets ? view.destinationOffsets[destinationIds[record]] :
@@ -96,7 +101,8 @@ inline bool CopyRecords(RecordCopyView view, const int32_t *sourceIds,
         view.bytesPerRecord > std::numeric_limits<size_t>::max() / size_t(maxRecords)) return false;
     uintptr_t alignment = reinterpret_cast<uintptr_t>(view.source) |
                           reinterpret_cast<uintptr_t>(view.destination) |
-                          view.sourcePitch | view.destinationPitch | view.bytesPerRecord;
+                          view.sourcePitch | view.destinationPitch | view.bytesPerRecord |
+                          reinterpret_cast<uintptr_t>(view.cachedSource);
     if ((alignment & 15) == 0)
         record_copy_detail::Launch<uint4>(view, sourceIds, destinationIds, count, maxRecords, launch, stream);
     else

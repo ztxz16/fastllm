@@ -299,6 +299,8 @@ struct DeviceCache {
     std::vector<fastllm::cuda::CacheSlotSpan> layerSlots;
     std::vector<uint64_t> hostSlotOffsets;
     std::unique_ptr<fastllm::MoeFrequencyPolicy> frequency;
+    cudaStream_t admissionStream = nullptr;
+    cudaEvent_t admissionDone = nullptr;
     bool frequencyActive = false;
     bool frequencyResidencyDirty = true;
     int32_t *keyToSlot = nullptr;
@@ -774,6 +776,7 @@ void ReleaseDeviceCache(DeviceCache &cache) {
     if (cache.device >= 0) {
         cudaSetDevice(cache.device);
     }
+    if (cache.admissionStream) cudaStreamSynchronize(cache.admissionStream);
     cache.hybrid.reset();
     cache.verify.reset();
     cache.batchHybrid.reset();
@@ -794,6 +797,8 @@ void ReleaseDeviceCache(DeviceCache &cache) {
     cudaFree(cache.fp8Pointers);
     cudaFree(cache.numaPointers);
     cudaFree(cache.ggufWorkspace);
+    if (cache.admissionDone) cudaEventDestroy(cache.admissionDone);
+    if (cache.admissionStream) cudaStreamDestroy(cache.admissionStream);
     cache = DeviceCache();
 }
 
@@ -868,6 +873,15 @@ DeviceCache *GetDeviceCache(OffloadGroup &group) {
     }
     DeviceCache &cache = *entry;
     if (cache.ready || cache.attempted) {
+        // Cache payload and metadata become visible together. An external
+        // event dependency also makes later captured cache users wait safely.
+        if (cache.admissionDone) {
+            cudaStreamCaptureStatus capture;
+            checkCudaErrors("MoE cache update capture", cudaStreamIsCapturing(cudaStreamPerThread, &capture));
+            checkCudaErrors("MoE cache update dependency", cudaStreamWaitEvent(
+                cudaStreamPerThread, cache.admissionDone,
+                capture == cudaStreamCaptureStatusActive ? cudaEventWaitExternal : cudaEventWaitDefault));
+        }
         return cache.ready ? &cache : nullptr;
     }
     cache.attempted = true;
@@ -1000,6 +1014,13 @@ DeviceCache *GetDeviceCache(OffloadGroup &group) {
             AllocateOne(reinterpret_cast<void **>(&cache.numaPointers), bytes) &&
             cudaMemcpy(cache.numaPointers, pointers.data(), bytes,
                        cudaMemcpyHostToDevice) == cudaSuccess;
+    }
+    if (initialized && group.cpuDecodeReady) {
+        // Create the fence before any graph can capture this cache. A graph
+        // captured before the first asynchronous admission must wait on later
+        // admissions too, rather than retaining a fence-free cache path.
+        initialized = cudaEventCreateWithFlags(&cache.admissionDone, cudaEventDisableTiming) == cudaSuccess &&
+            cudaEventRecord(cache.admissionDone, cudaStreamPerThread) == cudaSuccess;
     }
     if (!initialized) {
         std::fprintf(stderr,
@@ -1978,7 +1999,8 @@ const ExpertCacheBackend *FindExpertCacheBackend(fastllm::DataType type) {
 }
 
 bool EnsureCachedExperts(OffloadGroup *group, DeviceCache *cache, int tableId,
-                         const int32_t *indices, int topk) {
+                         const int32_t *indices, int topk, cudaStream_t stream = cudaStreamPerThread,
+                         const uint8_t *stagedRecord = nullptr, int stagedExpert = -1) {
     if (cache->slots == 0) return false;
     cache->frequencyResidencyDirty = true;
     const auto &layout = group->layout;
@@ -1991,7 +2013,7 @@ bool EnsureCachedExperts(OffloadGroup *group, DeviceCache *cache, int tableId,
     if (!fastllm::cuda::EnsureExpertCache<kMaxTopK>(
             metadata, indices, tableId * layout.experts, layout.experts, topk,
             cache->routeSlots, cache->missExperts, cache->missSlots, cache->missCount,
-            cache->ensureThreads, cudaStreamPerThread)) return false;
+            cache->ensureThreads, stream)) return false;
     const auto &shared = group->sharedLayout;
     if (shared.shards > 0) {
         void *const *pointers = cache->numaPointers +
@@ -2000,15 +2022,15 @@ bool EnsureCachedExperts(OffloadGroup *group, DeviceCache *cache, int tableId,
             size_t(tableId) * layout.experts * shared.auxiliaryBytes : nullptr;
         return fastllm::cuda::CopySharedExpertRecords(shared, pointers, metadata,
             cache->records, cache->missExperts, cache->missSlots, cache->missCount,
-            topk, cache->copyLaunch, cudaStreamPerThread);
+            topk, cache->copyLaunch, stream);
     }
     const auto &recordLayout = group->LayerLayout(tableId);
     const uint8_t *sourceTable = group->deviceHostRecords + group->layerHostOffsets[tableId];
     if (!fastllm::cuda::CopyRecords(
             {sourceTable, cache->records, recordLayout.recordStride,
-             layout.recordStride, recordLayout.recordStride, cache->slotOffsets},
+             layout.recordStride, recordLayout.recordStride, cache->slotOffsets, stagedRecord, stagedExpert},
             cache->missExperts, cache->missSlots, cache->missCount, topk,
-            cache->copyLaunch, cudaStreamPerThread)) return false;
+            cache->copyLaunch, stream)) return false;
     return cudaGetLastError() == cudaSuccess;
 }
 
@@ -2169,7 +2191,10 @@ struct FastllmCudaMoeExpertParallel {
             int previous = 0;
             cudaGetDevice(&previous);
             if (cudaDevice >= 0) cudaSetDevice(cudaDevice);
-            if (pending) cudaEventSynchronize(done);
+            if (pending) {
+                cudaEventSynchronize(done);
+                if (admitted) cudaEventSynchronize(copyEnd);
+            }
             overlap.reset();
             ids.FreeSpace(); selected.FreeSpace(); scores.FreeSpace();
             owners.FreeSpace(); lookup.FreeSpace(); gate.FreeSpace(); inputFloat.FreeSpace();
@@ -2186,6 +2211,7 @@ struct FastllmCudaMoeExpertParallel {
                 checkCudaErrors("EP completion", cudaEventSynchronize(done));
                 if (overlap) overlap->Observe();
                 if (admitted) {
+                    checkCudaErrors("EP admission completion", cudaEventSynchronize(copyEnd));
                     float ms = 0;
                     checkCudaErrors("EP refill timing", cudaEventElapsedTime(&ms, copyStart, copyEnd));
                     refill.Observe(ms * 1000);
@@ -2508,6 +2534,11 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
         const size_t bytes = FastllmCudaMoeGGUFCacheBatchWorkspaceBytes(hidden, layout.inter, rows, topk);
         if (bytes) allocate(work.batchWorkspace, INT8, {int(bytes)});
     }
+    work.admitted = candidate >= 0 && work.cache->slots > 0 && cpuCount + stagedRoutes > 0;
+    if (work.admitted && !work.cache->admissionStream) {
+        checkCudaErrors("EP admission stream", cudaStreamCreateWithFlags(
+            &work.cache->admissionStream, cudaStreamNonBlocking));
+    }
     auto submitGpu = [&] {
         const double dispatchStart = HybridNowUs();
         allocate(output, FLOAT32, {rows, hidden});
@@ -2565,20 +2596,6 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
         }
         if (hits && overlap)
             checkCudaErrors("Verify resident done", cudaEventRecord(overlap->residentDone, cudaStreamPerThread));
-        // Staging a miss does not change whether it was eligible for admission.
-        work.admitted = candidate >= 0 && work.cache->slots > 0 && cpuCount + stagedRoutes > 0;
-        if (work.admitted) {
-            checkCudaErrors("EP refill start", cudaEventRecord(work.copyStart, cudaStreamPerThread));
-            BuildHybridPrefetchRoutes<<<1, 32, 0, cudaStreamPerThread>>>(
-                static_cast<int32_t *>(work.ids.cudaData) + (candidate / topk) * topk,
-                work.cache->keyToSlot, work.cache->slotKeys,
-                static_cast<int32_t *>(work.lookup.cudaData), work.table * layout.experts,
-                layout.experts, topk, candidate % topk);
-            AssertInFastLLM(EnsureCachedExperts(work.group, work.cache, work.table,
-                static_cast<int32_t *>(work.lookup.cudaData), topk), "EP cache admission failed.\n");
-            checkCudaErrors("EP refill end", cudaEventRecord(work.copyEnd, cudaStreamPerThread));
-            ++work.admissions;
-        }
         if (staged) {
             FastllmCudaMoeGGUFCacheView temporary{
                 overlap->records, nullptr, layout.recordStride, layout.downOffset,
@@ -2635,6 +2652,29 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
         static_cast<float *>(output.cudaData), hidden, topk, rank);
     checkCudaErrors("EP reduction", cudaGetLastError());
     checkCudaErrors("EP done", cudaEventRecord(work.done, cudaStreamPerThread));
+    if (work.admitted) {
+        // The decision is unchanged; execute it after this layer has finished
+        // reading its slots, beside the following layer's attention/dense work.
+        const auto stream = work.cache->admissionStream;
+        checkCudaErrors("EP admission dependency", cudaStreamWaitEvent(stream, work.done, 0));
+        checkCudaErrors("EP refill start", cudaEventRecord(work.copyStart, stream));
+        BuildHybridPrefetchRoutes<<<1, 32, 0, stream>>>(
+            static_cast<int32_t *>(work.ids.cudaData) + (candidate / topk) * topk,
+            work.cache->keyToSlot, work.cache->slotKeys,
+            static_cast<int32_t *>(work.lookup.cudaData), work.table * layout.experts,
+            layout.experts, topk, candidate % topk);
+        // A staged expert is already in VRAM. Promote those exact packed bytes
+        // rather than reading the same host record over PCIe a second time.
+        const int stagedIndex = stagedSlot[candidate];
+        const uint8_t *record = stagedIndex >= 0
+            ? overlap->records + size_t(stagedIndex) * layout.recordStride : nullptr;
+        AssertInFastLLM(EnsureCachedExperts(work.group, work.cache, work.table,
+            static_cast<int32_t *>(work.lookup.cudaData), topk, stream,
+            record, work.Indices()[candidate]), "EP cache admission failed.\n");
+        checkCudaErrors("EP refill end", cudaEventRecord(work.copyEnd, stream));
+        checkCudaErrors("EP publish admission", cudaEventRecord(work.cache->admissionDone, stream));
+        ++work.admissions;
+    }
     work.pending = true;
     work.gpuRoutes += gpuCount;
     work.residentRoutes += hits;

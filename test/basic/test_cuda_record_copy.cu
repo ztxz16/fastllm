@@ -10,7 +10,7 @@ static void Check(cudaError_t e) {
 }
 
 static void Run(size_t bytes, size_t sourcePitch, size_t destinationPitch,
-                int sourceOffset, int destinationOffset, bool mappedHost, bool wideIndex = false) {
+                int sourceOffset, int destinationOffset, bool mappedHost, bool wideIndex = false, bool cached = false) {
     constexpr int records = 19, destinations = 31, maxCopies = 17;
     size_t sourceSize = sourceOffset + records * sourcePitch + 32;
     size_t destinationSize = destinationOffset + destinations * destinationPitch + 32;
@@ -38,6 +38,15 @@ static void Run(size_t bytes, size_t sourcePitch, size_t destinationPitch,
     Check(cudaMalloc(&count, sizeof(int32_t)));
     Check(cudaMemcpy(s, sourceIds.data(), maxCopies * sizeof(int32_t), cudaMemcpyHostToDevice));
     Check(cudaMemcpy(d, destinationIds.data(), maxCopies * sizeof(int32_t), cudaMemcpyHostToDevice));
+    std::vector<uint8_t> cachedInput(bytes + sourceOffset + 1, 0x6b);
+    uint8_t *cachedSource = nullptr;
+    if (cached) {
+        Check(cudaMalloc(&cachedSource, cachedInput.size()));
+        Check(cudaMemcpy(cachedSource, cachedInput.data(), cachedInput.size(), cudaMemcpyHostToDevice));
+    }
+    fastllm::cuda::RecordCopyView view{
+        source + sourceOffset, destination + destinationOffset, sourcePitch, destinationPitch, bytes,
+        nullptr, cached ? cachedSource + sourceOffset : nullptr, sourceIds[2]};
     cudaDeviceProp props; Check(cudaGetDeviceProperties(&props, 0));
     auto launch = fastllm::cuda::RecordCopyConfiguration(bytes, maxCopies, props);
     cudaStream_t stream; Check(cudaStreamCreate(&stream));
@@ -48,10 +57,10 @@ static void Run(size_t bytes, size_t sourcePitch, size_t destinationPitch,
         // compiling the automatic dispatch for batches larger than 2^32 units.
         fastllm::cuda::record_copy_detail::CopyKernel<uint8_t, uint64_t>
             <<<launch.blocks, launch.threads, 0, stream>>>(
-                {source + sourceOffset, destination + destinationOffset, sourcePitch, destinationPitch, bytes},
+                view,
                 s, d, count, uint64_t(bytes));
     } else if (!fastllm::cuda::CopyRecords(
-            {source + sourceOffset, destination + destinationOffset, sourcePitch, destinationPitch, bytes},
+            view,
             s, d, count, maxCopies, launch, stream)) throw std::runtime_error("launch rejected");
     Check(cudaStreamEndCapture(stream, &graph));
     Check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
@@ -61,7 +70,8 @@ static void Run(size_t bytes, size_t sourcePitch, size_t destinationPitch,
         std::vector<uint8_t> expected = initial, actual(destinationSize);
         for (int i = 0; i < copies; ++i)
             std::memcpy(expected.data() + destinationOffset + destinationIds[i] * destinationPitch,
-                        input.data() + sourceOffset + sourceIds[i] * sourcePitch, bytes);
+                        cached && sourceIds[i] == sourceIds[2] ? cachedInput.data() + sourceOffset :
+                            input.data() + sourceOffset + sourceIds[i] * sourcePitch, bytes);
         Check(cudaGraphLaunch(exec, stream));
         Check(cudaGraphLaunch(exec, stream));
         Check(cudaStreamSynchronize(stream));
@@ -70,7 +80,7 @@ static void Run(size_t bytes, size_t sourcePitch, size_t destinationPitch,
     }
     cudaGraphExecDestroy(exec); cudaGraphDestroy(graph); cudaStreamDestroy(stream);
     if (mappedHost) cudaFreeHost(host); else cudaFree(source);
-    cudaFree(destination); cudaFree(s); cudaFree(d); cudaFree(count);
+    cudaFree(cachedSource); cudaFree(destination); cudaFree(s); cudaFree(d); cudaFree(count);
     std::printf("PASS bytes=%zu pitches=%zu/%zu offsets=%d/%d mapped=%d wide=%d graph and guards\n",
                 bytes, sourcePitch, destinationPitch, sourceOffset, destinationOffset, mappedHost, wideIndex);
 }
@@ -88,6 +98,9 @@ int main() {
             Run(8192, 8320, 8448, 0, 0, mapped);
             Run(2764928, 2764928, 2765056, 0, 0, mapped);
             Run(1025, 1031, 1041, 7, 3, mapped, true);
+            Run(8192, 8320, 8448, 0, 0, mapped, false, true);
+            Run(1025, 1031, 1041, 7, 3, mapped, false, true);
+            Run(1025, 1031, 1041, 7, 3, mapped, true, true);
         }
         // Invalid layouts must be rejected before any kernel is enqueued.
         if (fastllm::cuda::CopyRecords({nullptr, nullptr, 16, 8, 16}, nullptr,

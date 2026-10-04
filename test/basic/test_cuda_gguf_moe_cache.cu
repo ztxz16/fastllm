@@ -951,7 +951,7 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
             oracleInput = &referenceInput;
         }
         Cuda(cudaMemcpy(ids.cudaData, route.data(), route.size()*4, cudaMemcpyHostToDevice));
-        std::vector<float> lower(rows * hidden, 0), upper(lower.size(), 0);
+        std::vector<float> lower(rows * hidden, 0), upper(lower.size(), 0), gpuExpected(lower.size(), 0);
         // Cache GPU and CPU arithmetic may round differently: independently
         // bound each weighted route, then verify neither duplication nor loss.
         for (int k = 0; k < topk; ++k) {
@@ -966,6 +966,7 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
                 const int r = (c / hidden) * topk + k;
                 const float a = serial[r * hidden + c % hidden] * score[r], b = gpu[c] * score[r];
                 lower[c] += std::min(a,b); upper[c] += std::max(a,b);
+                gpuExpected[c] += b;
             }
         }
         if ((frequency || verifyDynamic) && !noCache) {
@@ -1023,6 +1024,17 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
                         output[rank], table.data(), table.size(), layer, [] {}),
                         "EP accepted invalid routes");
                 }
+                cudaGraph_t graph = nullptr; cudaGraphExec_t exec = nullptr;
+                if (single && verifyDynamic && !noCache && (step == 0 || step == 8)) {
+                    // Capture before admission, then replay after the verifier
+                    // publishes a new event. The graph must wait for that update.
+                    Cuda(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+                    Require(FastllmCudaMergeMOECache(*oracleInput, gpuGate, gpuOutput,
+                        table.data(), table.size(), static_cast<int32_t *>(ids.cudaData),
+                        static_cast<float *>(scores.cudaData), topk), "post-verify graph rejected");
+                    Cuda(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+                    Cuda(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+                }
                 if (frequency) {
                     uint64_t previousHits = 0;
                     for (int repeat = 0; repeat < 3; ++repeat) {
@@ -1055,6 +1067,15 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
                 else accepted[rank] = FastllmCudaMergeMOEExpertParallel(*context, rank, input[rank],
                     rank == 0 ? ids : empty, rank == 0 ? scores : empty, output[rank],
                     table.data(), table.size(), layer, [] {});
+                if (exec) {
+                    Cuda(cudaGraphLaunch(exec, cudaStreamPerThread));
+                    Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+                    Cuda(cudaMemcpy(gpu.data(), gpuOutput.cudaData, gpu.size()*4, cudaMemcpyDeviceToHost));
+                    for (size_t c = 0; c < gpu.size(); ++c)
+                        Require(std::isfinite(gpu[c]) && std::abs(gpu[c] - gpuExpected[c]) <=
+                            3e-5f * (1 + std::abs(gpuExpected[c])), "post-verify graph read stale cache contents");
+                    Cuda(cudaGraphExecDestroy(exec)); Cuda(cudaGraphDestroy(graph));
+                }
                 if (accepted[rank]) Cuda(cudaMemcpy(actual[rank].data(), output[rank].cudaData,
                     actual[rank].size()*4, cudaMemcpyDeviceToHost));
                 if (single) Require(callbacks == (frequency ? 3 : 1), "hybrid shared callback count changed");
