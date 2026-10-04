@@ -2,6 +2,52 @@
 #include "executor.h"
 
 namespace fastllm {
+    static std::vector<GGUFWeightReplaceRule> Glm5NextGGUFWeightRules() {
+        using Rule = GGUFWeightReplaceRule;
+        const std::string base = "model.language_model.";
+        const std::string layer = base + "layers.$1.";
+        std::vector<Rule> rules;
+        auto add = [&](const std::string &pattern, const std::string &name,
+                       Rule::GGUFWeightReplaceType type = Rule::GGUFWeightReplaceDirect) {
+            rules.emplace_back(std::regex("^" + pattern + "$"), name, type);
+        };
+        add(R"(token_embd\.weight)", base + "embed_tokens.weight", Rule::GGUFWeightReplaceForceFP32);
+        add(R"(output\.weight)", "lm_head.weight");
+        add(R"(output_norm\.weight)", base + "norm.weight", Rule::GGUFWeightReplaceForceFP32);
+        add(R"(blk\.(\d+)\.attn_norm\.weight)", layer + "input_layernorm.weight", Rule::GGUFWeightReplaceForceFP32);
+        add(R"(blk\.(\d+)\.ffn_norm\.weight)", layer + "post_attention_layernorm.weight", Rule::GGUFWeightReplaceForceFP32);
+        add(R"(blk\.(\d+)\.(hc_(?:attn|ffn)_(?:fn|base|scale))(?:\.weight)?)", layer + "$2", Rule::GGUFWeightReplaceForceFP32);
+        add(R"(blk\.(\d+)\.attn_(q|k|v)\.weight)", layer + "self_attn.$2_proj.weight");
+        add(R"(blk\.(\d+)\.attn_output\.weight)", layer + "self_attn.o_proj.weight");
+        add(R"(blk\.(\d+)\.attn_(q_a|q_b)\.weight)", layer + "self_attn.$2_proj.weight");
+        add(R"(blk\.(\d+)\.attn_kv_a_mqa\.weight)", layer + "self_attn.kv_a_proj_with_mqa.weight");
+        add(R"(blk\.(\d+)\.attn_(q_a|kv_a)_norm\.weight)", layer + "self_attn.$2_layernorm.weight", Rule::GGUFWeightReplaceForceFP32);
+        // GGUF transposes K per head and separates K/V. Restore the canonical
+        // combined KV-B projection once after loading, before any GPU upload.
+        add(R"(blk\.(\d+)\.attn_(k|v)_b\.weight)", layer + "self_attn.gguf_$2_b.weight", Rule::GGUFWeightReplaceForceFP32);
+        add(R"(blk\.(\d+)\.ssm_(f_a|f_b|g_a|g_b)\.weight)", layer + "self_attn.$2_proj.weight");
+        add(R"(blk\.(\d+)\.ssm_beta\.weight)", layer + "self_attn.b_proj.weight");
+        add(R"(blk\.(\d+)\.ssm_conv1d_(q|k|v)\.weight)", layer + "self_attn.$2_conv1d.weight", Rule::GGUFWeightReplaceForceFP32);
+        add(R"(blk\.(\d+)\.ssm_a)", layer + "self_attn.gguf_decay", Rule::GGUFWeightReplaceForceFP32);
+        add(R"(blk\.(\d+)\.ssm_dt\.(?:bias|weight))", layer + "self_attn.dt_bias", Rule::GGUFWeightReplaceForceFP32);
+        add(R"(blk\.(\d+)\.ssm_norm\.weight)", layer + "self_attn.o_norm.weight", Rule::GGUFWeightReplaceForceFP32);
+        add(R"(blk\.(\d+)\.indexer\.attn_q_b\.weight)", layer + "self_attn.indexer.wq_b.weight");
+        add(R"(blk\.(\d+)\.indexer\.attn_k\.weight)", layer + "self_attn.indexer.wk.weight");
+        add(R"(blk\.(\d+)\.indexer\.k_norm\.(weight|bias))", layer + "self_attn.indexer.k_norm.$2", Rule::GGUFWeightReplaceForceFP32);
+        add(R"(blk\.(\d+)\.indexer\.proj\.weight)", layer + "self_attn.indexer.weights_proj.weight", Rule::GGUFWeightReplaceForceFP32);
+        add(R"(blk\.(\d+)\.indexer_compressor_ape(?:\.weight)?)", layer + "self_attn.indexer.index_kpool_compress_ape", Rule::GGUFWeightReplaceForceFP32);
+        add(R"(blk\.(\d+)\.indexer_compressor_gate(?:\.weight)?)", layer + "self_attn.indexer.index_kpool_compress_gate");
+        add(R"(blk\.(\d+)\.ffn_(gate|up|down)\.weight)", layer + "mlp.$2_proj.weight");
+        add(R"(blk\.(\d+)\.ffn_gate_inp\.weight)", layer + "mlp.gate.weight", Rule::GGUFWeightReplaceForceFP32);
+        add(R"(blk\.(\d+)\.exp_probs_b\.bias)", layer + "mlp.gate.e_score_correction_bias", Rule::GGUFWeightReplaceForceFP32);
+        add(R"(blk\.(\d+)\.ffn_(gate|up|down)_shexp\.weight)", layer + "mlp.shared_experts.$2_proj.weight");
+        rules.emplace_back(std::regex(R"(^blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$)"),
+            std::vector<std::string>{layer + "mlp.experts.", ".$2_proj.weight"}, Rule::GGUFWeightReplacePacked);
+        // GGUF MTP is unsupported; the loader also filters the appended layer.
+        add(R"(blk\.\d+\.nextn\..*)", "ignore");
+        return rules;
+    }
+
     static std::vector<GGUFWeightReplaceRule> Qwen4GGUFWeightRules() {
         using Rule = GGUFWeightReplaceRule;
         const std::string base = "model.language_model.";
@@ -64,6 +110,7 @@ namespace fastllm {
 
     std::vector <GGUFWeightReplaceRule> GetGGUFWeightReplaceRules(const std::string &arch) {
         static std::map <std::string, std::vector <GGUFWeightReplaceRule> > originalArchRulesDict = {
+            {"glm5_next", Glm5NextGGUFWeightRules()},
             {"qwen4_exp", Qwen4GGUFWeightRules()},
             {
                 "default", 

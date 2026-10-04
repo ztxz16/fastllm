@@ -3133,6 +3133,7 @@ namespace fastllm {
             {"qwen4exp", "qwen4_exp"},
             {"glm4_moe", "glm4_moe"}, // glm4_moe
             {"glm-dsa", "glm_moe_dsa"}, {"glm_moe_dsa", "glm_moe_dsa"}, // glm_moe_dsa
+            {"glm5next", "glm5_next"},
             {"minimax_m2", "minimax_m2"}, // minimax_m2
             {"deepseek2", "deepseek_v2"}, {"deepseek_v2", "deepseek_v2"},  {"deepseek_v3", "deepseek_v2"} // deepseek_v2
         };
@@ -3279,6 +3280,52 @@ namespace fastllm {
             AddGGUFDictIfMissing(model, "num_hidden_layers",
                                  std::to_string(mainLayerCount));
             model->block_cnt = mainLayerCount;
+        }
+
+        if (model->model_struct == "glm5_next") {
+            for (const auto &alias : std::vector<std::pair<std::string, std::string>>{
+                    {"hc_mult", "hyper_connection.count"},
+                    {"hc_sinkhorn_iters", "hyper_connection.sinkhorn_iterations"},
+                    {"hc_eps", "hyper_connection.epsilon"},
+                    {"linear_attn_config.num_heads", "attention.head_count"},
+                    {"linear_attn_config.head_dim", "kda.head_dim"},
+                    {"linear_attn_config.short_conv_kernel_size", "ssm.conv_kernel"},
+                    {"linear_attn_config.gate_lower_bound", "kda.gate_lower_bound"},
+                    {"index_n_heads", "attention.indexer.head_count"},
+                    {"index_head_dim", "attention.indexer.key_length"},
+                    {"index_topk", "attention.indexer.top_k"},
+                    {"index_kpool", "attention.indexer.kpool"}}) {
+                addAlias(alias.first, alias.second);
+            }
+            AddGGUFDictIfMissing(model, "num_nextn_predict_layers", std::to_string(nextnLayers));
+            // This GGUF uses the per-layer KV-head array as its KDA/MLA mask,
+            // including an appended NextN block. It is not a scalar GQA count.
+            const auto heads = GetGGUFArchParam(params, arch, "attention.head_count_kv").array_items();
+            AssertInFastLLM(heads.size() == (size_t)blockCount,
+                "GLM-5.3 GGUF attention layer mask is incomplete.");
+            std::vector<json11::Json> kda;
+            for (int layer = 0; layer < mainLayerCount; ++layer) {
+                AssertInFastLLM(heads[layer].is_number() &&
+                    (heads[layer].int_value() == 0 || heads[layer].int_value() == 1),
+                    "GLM-5.3 GGUF attention layer mask must contain 0 or 1.");
+                if (heads[layer].int_value() == 0) kda.emplace_back(layer);
+            }
+            AddGGUFDictIfMissing(model, "linear_attn_config.kda_layers", json11::Json(kda).dump());
+            if (model->weight.dicts["num_key_value_heads"].find('[') != std::string::npos) {
+                model->weight.AddDict("num_key_value_heads", model->weight.dicts["num_attention_heads"]);
+            }
+            double clamp = -1;
+            for (const char *key : {"swiglu_clamp_exp", "swiglu_clamp_shexp"}) {
+                const auto values = GetGGUFArchParam(params, arch, key).array_items();
+                AssertInFastLLM(values.size() == (size_t)blockCount,
+                    "GLM-5.3 GGUF SwiGLU limits are incomplete.");
+                for (const auto &value : values) {
+                    if (clamp < 0) clamp = value.number_value();
+                    AssertInFastLLM(value.is_number() && clamp > 0 && value.number_value() == clamp,
+                        "GLM-5.3 GGUF requires a common positive SwiGLU limit.");
+                }
+            }
+            AddGGUFDictIfMissing(model, "swiglu_limit", json11::Json(clamp).dump());
         }
 
         const auto &tokens = params["tokenizer.ggml.tokens"].array_items();
@@ -3979,6 +4026,11 @@ namespace fastllm {
         }
 
         arch = ConvertGGUFTypeToFastllmType(arch);
+        // Preserve the source-format marker with --ori too: GLM's GGUF
+        // decay and split MLA projections still need layout restoration.
+        if (arch == "glm5_next") {
+            model->weight.AddDict("gguf_architecture", params["general.architecture"].string_value());
+        }
         const int ggufFileType = params["general.file_type"].int_value();
         // The new mixed-GGUF MMQ/MMVQ CUDA fast paths are not numerically
         // correct yet for these primary quantization families. Mark this

@@ -1,6 +1,7 @@
 #include "glm5_next.h"
 #include "glm5_next_mla_prefill.h"
 #include "glm5_next_dsa.h"
+#include "glm5_next_gguf.h"
 
 #include "blocks/baseblock.h"
 #include "gguf.h"
@@ -533,6 +534,8 @@ namespace fastllm {
         mtpDraftsPerStep = Glm5NextEnvInt(
             "FASTLLM_GLM5_NEXT_ENABLE_MTP", 0, 0, 8);
         mtpEnabled = mtpDraftsPerStep > 0;
+        AssertInFastLLM(weight.dicts["gguf_architecture"] != "glm5next" || !mtpEnabled,
+            "GLM-5.3 GGUF currently requires --mtp 0.");
         AssertInFastLLM(!UsesDsa() || (!mtpEnabled && useCompressedMla),
             "GLM DSA requires compressed MLA and --mtp 0; "
             "FASTLLM_GLM5_NEXT_DSA_BACKEND=dense restores the legacy dense path.");
@@ -853,6 +856,10 @@ namespace fastllm {
     }
 
     void Glm5NextModel::OnModelWeightsLoaded() {
+        if (weight.dicts["gguf_architecture"] == "glm5next") {
+            glm5_next_detail::RestoreGgufWeights(weight, block_cnt,
+                num_attention_heads, qkNopeHeadDim, valueHeadDim, kvLoraRank);
+        }
         auto require = [&](const std::string &name) -> Data& {
             auto it = weight.weight.find(name);
             AssertInFastLLM(

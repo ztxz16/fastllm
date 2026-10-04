@@ -157,6 +157,7 @@ _ARCHITECTURE_CONFIGS = {
     "deepseek_v3": ("deepseek_v3", "DeepseekV3ForCausalLM"),
     "glm-dsa": ("glm_moe_dsa", "GlmMoeDsaForCausalLM"),
     "glm_moe_dsa": ("glm_moe_dsa", "GlmMoeDsaForCausalLM"),
+    "glm5next": ("glm5_next", "Glm5NextForConditionalGeneration"),
     "minimax_m2": ("minimax_m2", "MiniMaxM2ForCausalLM"),
 }
 
@@ -202,6 +203,12 @@ def get_gguf_model_config(path):
 
 
 _GPT2_PRETOKENIZER_PATTERNS = {
+    "glm4": (
+        r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|"
+        r"[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}|"
+        r" ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|"
+        r"\s+(?!\S)|\s+"
+    ),
     "qwen35": (
         r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|"
         r"[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}|"

@@ -3386,6 +3386,16 @@ namespace fastllm {
                 return (DataType)(DataType::DATA_GGUF_FORMAT + ggml_type_vec_dot_type(repack->new_type));
             }
         }
+        if (weight != nullptr && weight->dataType == DataType::DATA_GGUF_FORMAT &&
+            ggml_type_vec_dot_type((ggml_type)weight->ggmlType) == GGML_TYPE_F32) {
+            // Formats without an integer dot kernel (for example IQ4_XS in
+            // mixed UD-IQ2 checkpoints) use the existing tiled BF16 GEMM
+            // fallback. GGUF_FORMAT + F32 is not a Q8 activation format and
+            // must never be passed to iqk_quantize_row_q8_K.
+            AssertInFastLLM(ggml_type_to_float((ggml_type)weight->ggmlType) != nullptr,
+                "NUMA GGUF weight has neither a dot kernel nor a dequantizer.");
+            return DataType::BFLOAT16;
+        }
         if (weight != nullptr &&
             (weight->dataType == DataType::INT8 ||
              weight->dataType == DataType::INT4_NOZERO)) {

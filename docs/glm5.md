@@ -18,6 +18,25 @@ GLM-5.3-Flash 的 ModelOpt NVFP4 路由专家在单设备 CUDA 后端（包括 `
 
 每 16 个权重保留 8 字节 FP4 数据和 1 字节 E4M3 块缩放，每行另存 4 字节全局缩放。合并 gate/up 权重时保留各自的全局缩放；这是存储布局转换，不重新量化权重。
 
+## GLM-5.3-Flash GGUF
+
+支持 `general.architecture=glm5next` 的 GLM-5.3-Flash GGUF，包括 Unsloth 的四分片 `UD-IQ2_XXS`。指定第一个分片即可加载其余分片，无需 `--ori`。当前路径支持文本推理，要求 `--mtp 0`。
+
+路由专家保留 GGUF 混合量化格式；加载时还原 KDA 衰减参数和拆分、转置的 MLA KV-B 权重。IQ4_XS 专家使用分块 BF16 回退，权重不整体展开。KDA 的 128 维 Q8 投影使用 CUDA 反量化 GEMM，避免进入要求 K 维度按 256 对齐的 MMQ 内核。
+
+双卡按层串行、单 NUMA 的启动示例（按机器调整线程数）：
+
+~~~bash
+FT_NUMAS=1 numactl --cpunodebind=0 --membind=0 \
+  ftllm chat /data/models/GLM-5.3-Flash-UD-IQ2_XXS-00001-of-00004.gguf \
+  --device cudapp=2 --moe_device numa --threads 20 \
+  --dtype bfloat16 --atype bfloat16 --moe_atype bfloat16 \
+  --kv_cache_dtype bfloat16 --chunked_prefill_size 8192 \
+  --moe_cuda_cache 0 --moe_cpu_cache 0 --mtp 0
+~~~
+
+测速时先用同长度输入完成预热，并关闭 prefix/history cache。启用 `UNIT_TEST` 后可运行 `glm5_next_gguf`、`numas_gguf_fallback` 和 `cuda_gguf_mmq_alignment` 回归，分别覆盖分片映射与布局恢复、混合量化专家回退、窄投影的 CUDA 数值与边界。
+
 ## GLM-5.3-Flash NVFP4 grouped Marlin
 
 兼容的 CUDA 紧凑 NVFP4 路由专家默认使用 grouped Marlin，支持 BF16 激活、独立 gate/up 全局缩放和 GPU 路由。prefill 与 decode 共用一次重排后的权重布局；成功准备后释放原 GPU 布局。首次执行包含重排开销，测速需先预热。
