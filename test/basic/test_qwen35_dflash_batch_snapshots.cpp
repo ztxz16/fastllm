@@ -107,6 +107,18 @@ void Run(int device, int batch, int length, int kHeads = 2,
                 keyPtrs, input, convWeight, convBias, convSequence,
                 convSnapshotPtrs, slots, 0), "reference convolution rejected");
     conv = Read(convSequence);
+    std::vector<std::vector<float>> finalConvKeys(batch);
+    for (int b = 0; b < batch; ++b) {
+        finalConvKeys[b] = Read(convKeys[b]);
+        convKeys[b].CopyFrom(initialKeys[b]);
+    }
+    Data convWithoutSnapshots;
+    Require(FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16BatchPointers(
+                keyPtrs, input, convWeight, convBias, convWithoutSnapshots,
+                {}, 0, 0), "no-snapshot convolution rejected");
+    Require(Read(convWithoutSnapshots) == conv, "no-snapshot convolution output not exact");
+    for (int b = 0; b < batch; ++b)
+        Require(Read(convKeys[b]) == finalConvKeys[b], "no-snapshot convolution cache not exact");
     std::vector<Data *> statePtrs(batch), snapshotPtrs(batch * slots);
     std::vector<std::vector<std::vector<float>>> expectedStates(batch), expectedOutputs(batch);
     auto step = [&](int b, int t, Data &state) {
@@ -171,13 +183,66 @@ void Run(int device, int batch, int length, int kHeads = 2,
         hashValues(Read(states[b]));
         for (int t = 0; t < slots; ++t) hashValues(Read(snapshots[b * slots + t]));
     }
-    for (int b = 0; b < batch; ++b) states[b].CopyFrom(initialStates[b]);
+    std::vector<std::vector<float>> finalSnapshotStates(batch);
+    for (int b = 0; b < batch; ++b) {
+        finalSnapshotStates[b] = Read(states[b]);
+        states[b].CopyFrom(initialStates[b]);
+    }
     Data withoutSnapshots;
     Require(FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnapshots(
                 convSequence, baSequence, norm, aLog, dtBias, statePtrs, withoutSnapshots,
                 {}, 0, kHeads, vHeads, kDim, vDim, 1e-6f, scale),
             "no-snapshot sequence rejected");
     Require(Read(withoutSnapshots) == actual, "no-snapshot output not exact");
+    for (int b = 0; b < batch; ++b)
+        Require(Read(states[b]) == finalSnapshotStates[b], "no-snapshot final state not exact");
+    // Keep source states immutable while writing distinct final-state buffers.
+    // Two consecutive sequences exchange storage exactly as eager verification
+    // does, and compare against the existing in-place recurrence each time.
+    std::vector<Data> liveStates(batch), scratchStates(batch), referenceStates(batch);
+    std::vector<Data*> livePtrs(batch), scratchPtrs(batch), referencePtrs(batch);
+    for (int b = 0; b < batch; ++b) {
+        liveStates[b].CopyFrom(initialStates[b]);
+        scratchStates[b].CopyFrom(initialStates[b]);
+        referenceStates[b].CopyFrom(initialStates[b]);
+        livePtrs[b] = &liveStates[b];
+        scratchPtrs[b] = &scratchStates[b];
+        referencePtrs[b] = &referenceStates[b];
+    }
+    for (int round = 0; round < 2; ++round) {
+        std::vector<std::vector<float>> original(batch);
+        for (int b = 0; b < batch; ++b) original[b] = Read(liveStates[b]);
+        Data separateOutput, referenceOutput;
+        Require(FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnapshots(
+                    convSequence, baSequence, norm, aLog, dtBias, referencePtrs, referenceOutput,
+                    {}, 0, kHeads, vHeads, kDim, vDim, 1e-6f, scale), "reference sequence rejected");
+        Require(FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnapshotsWithOutput(
+                    convSequence, baSequence, norm, aLog, dtBias, livePtrs, separateOutput,
+                    {}, 0, kHeads, vHeads, kDim, vDim, 1e-6f, scale, scratchPtrs),
+                "separate state sequence rejected");
+        Require(Read(separateOutput) == Read(referenceOutput), "separate output not exact");
+        for (int b = 0; b < batch; ++b) {
+            Require(Read(liveStates[b]) == original[b], "separate sequence modified input state");
+            Require(Read(scratchStates[b]) == Read(referenceStates[b]), "separate state not exact");
+            std::swap(liveStates[b].cudaData, scratchStates[b].cudaData);
+            std::swap(liveStates[b].expansionSize, scratchStates[b].expansionSize);
+            std::swap(liveStates[b].expansionBytes, scratchStates[b].expansionBytes);
+            std::swap(liveStates[b].expansionDims, scratchStates[b].expansionDims);
+            Require(Read(scratchStates[b]) == original[b], "exchange lost rollback state");
+        }
+        Require(!FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnapshotsWithOutput(
+                    convSequence, baSequence, norm, aLog, dtBias, livePtrs, separateOutput,
+                    {}, 0, kHeads, vHeads, kDim, vDim, 1e-6f, scale, livePtrs),
+                "aliased separate states accepted");
+        auto invalid = scratchPtrs;
+        invalid.back() = nullptr;
+        Require(!FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnapshotsWithOutput(
+                    convSequence, baSequence, norm, aLog, dtBias, livePtrs, separateOutput,
+                    {}, 0, kHeads, vHeads, kDim, vDim, 1e-6f, scale, invalid),
+                "null separate state accepted");
+        for (int b = 0; b < batch; ++b)
+            Require(Read(liveStates[b]) == Read(referenceStates[b]), "rejected call modified state");
+    }
     hashValues(Read(withoutSnapshots));
     for (int b = 0; b < batch; ++b) hashValues(Read(states[b]));
     std::cout << "gdn_digest " << device << ':' << batch << ':' << length
@@ -261,6 +326,12 @@ int main() {
         // Current TP2 heads, all verification lengths, small batches and V-tail
         // fallback. Return to smaller shapes after growth to exercise scratch reuse.
         for (int device = 0; device < devices; ++device) {
+            // Single-request GSQ geometry: exercise exact compact recovery
+            // for every accepted prefix, including full acceptance and zero.
+            for (int length = 2; length <= 8; ++length) {
+                Run(device, 1, length, 16, 48, 128);
+                ++cases;
+            }
             for (int batch : {4, 8, 16, 3}) for (int length = 2; length <= 8; ++length) {
                 Run(device, batch, length, 8, 24, 128);
                 ++cases;

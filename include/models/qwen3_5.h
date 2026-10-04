@@ -318,6 +318,10 @@ namespace fastllm {
         // prepared before TP workers run; workers never mutate the map itself.
         struct DFlashLinearReplay {
             Data input, conv, ba;
+            // Eager verification writes these owned scratch states, then swaps
+            // their buffers with the live states. Scratch retains the originals.
+            std::vector<Data*> stateOutputs;
+            bool statesExchanged = false;
             Data *norm = nullptr, *aLog = nullptr, *dtBias = nullptr;
             int keyHeads = 0, valueHeads = 0;
             bool ready = false;

@@ -21153,7 +21153,8 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
     half *snap5, half *snap6,
     half **snapshotPointers, int numSnaps,
     void **prefixLengths = nullptr, half **initialStates = nullptr,
-    const float *preparedQk = nullptr, const float *preparedBa = nullptr) {
+    const float *preparedQk = nullptr, const float *preparedBa = nullptr,
+    half **outputStates = nullptr) {
     int head_idx = blockIdx.x;
     int v_base = blockIdx.y * TILE_V;
     if (head_idx >= numVHeads || v_base >= headVDim) {
@@ -21340,9 +21341,13 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
                 core_attn_out[outBase + v_col] = __float2half_rn(sumQ);
             }
         }
+        // Verification can keep its original state intact and write the final
+        // state to a second owned buffer. No preliminary matrix copy is needed.
+        half *finalRow = outputStates != nullptr ?
+            outputStates[batchIndex] + stateHeadBase + (size_t)v_col * headKDim : state_row;
 #pragma unroll
         for (int j = 0; j < 4; j++) {
-            state_row[lane_id + j * 32] = stateValues[j];
+            finalRow[lane_id + j * 32] = stateValues[j];
         }
     }
 }
@@ -21857,14 +21862,15 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16Snapshots(
     return true;
 }
 
-bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnapshots(
+bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnapshotsWithOutput(
     fastllm::Data &convOutput, fastllm::Data &ba, fastllm::Data &normWeight,
     fastllm::Data &aLog, fastllm::Data &dtBias,
     const std::vector<fastllm::Data*> &lastRecurrentStates,
     fastllm::Data &coreAttnOut,
     const std::vector<fastllm::Data*> &tokenStates, int numTokenStates,
     int numKHeads, int numVHeads, int headKDim, int headVDim,
-    float eps, float qScale) {
+    float eps, float qScale,
+    const std::vector<fastllm::Data*> &outputStates) {
     if (lastRecurrentStates.empty() || lastRecurrentStates[0] == nullptr ||
         numTokenStates < 0 ||
         numTokenStates > FASTLLM_CUDA_MTP_PREFIX_SNAPSHOT_MAX ||
@@ -21920,8 +21926,11 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnaps
         return false;
     }
 
+    if (!outputStates.empty() && outputStates.size() != lastRecurrentStates.size()) {
+        return false;
+    }
     std::vector<void*> pointers;
-    pointers.reserve(batch * (1 + numTokenStates));
+    pointers.reserve(batch * (1 + numTokenStates) + outputStates.size());
     for (fastllm::Data *state : lastRecurrentStates) {
         if (state == nullptr || state->dims != first.dims ||
             state->dataType != first.dataType ||
@@ -21958,7 +21967,26 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnaps
             pointers.push_back(snapshot->cudaData);
         }
     }
+    // Separate destinations must already be allocated and must not alias any
+    // input, snapshot or other destination. Validate before launching work.
+    for (fastllm::Data *state : outputStates) {
+        int outputDevice = -1;
+        if (state == nullptr || state->cudaData == nullptr ||
+            state->isFake || state->cudaDataBorrowed ||
+            state->isPagedKVCache || state->multiDeviceData ||
+            state->dims != first.dims || state->dataType != first.dataType ||
+            !state->isLinearAttentionTransposed ||
+            !FastllmCudaDataHasDenseStrides(*state) ||
+            !FastllmCudaResolveDataDeviceId(*state, outputDevice) || outputDevice != device ||
+            !tensors.insert(state).second ||
+            std::find(pointers.begin(), pointers.end(), state->cudaData) != pointers.end()) {
+            return false;
+        }
+        pointers.push_back(state->cudaData);
+    }
     void **devicePointers = FastllmCudaStagePointers(pointers);
+    half **outputPointers = outputStates.empty() ? nullptr :
+        (half**)(devicePointers + batch * (1 + numTokenStates));
 
     coreAttnOut.dataType = first.dataType;
     coreAttnOut.Resize({batch, seqLen, numVHeads, headVDim});
@@ -22001,7 +22029,7 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnaps
                     seqLen, numKHeads, numVHeads, headKDim, headVDim, eps, qScale,
                     nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
                     (half**)(devicePointers + batch), numTokenStates,
-                    nullptr, nullptr, prepared, prepared + qkCount);
+                    nullptr, nullptr, prepared, prepared + qkCount, outputPointers);
             checkCudaErrors("Error: CUDA error in prepared batched GDN sequence.", cudaGetLastError());
             return true;
         }
@@ -22021,7 +22049,8 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnaps
             (half*)coreAttnOut.cudaData,
             seqLen, numKHeads, numVHeads, headKDim, headVDim, eps, qScale,
             nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-            (half**)(devicePointers + batch), numTokenStates);
+            (half**)(devicePointers + batch), numTokenStates,
+            nullptr, nullptr, nullptr, nullptr, outputPointers);
     cudaError_t launchState = cudaGetLastError();
     if (launchState != cudaSuccess) {
         checkCudaErrors(
@@ -22030,6 +22059,20 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnaps
         return false;
     }
     return true;
+}
+
+// Preserve the original CUDA entry point and its argument ABI.
+bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnapshots(
+    fastllm::Data &convOutput, fastllm::Data &ba, fastllm::Data &normWeight,
+    fastllm::Data &aLog, fastllm::Data &dtBias,
+    const std::vector<fastllm::Data*> &lastRecurrentStates,
+    fastllm::Data &coreAttnOut,
+    const std::vector<fastllm::Data*> &tokenStates, int numTokenStates,
+    int numKHeads, int numVHeads, int headKDim, int headVDim,
+    float eps, float qScale) {
+    return FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnapshotsWithOutput(convOutput, ba, normWeight, aLog, dtBias,
+        lastRecurrentStates, coreAttnOut, tokenStates, numTokenStates,
+        numKHeads, numVHeads, headKDim, headVDim, eps, qScale, {});
 }
 
 bool FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedSlots(
