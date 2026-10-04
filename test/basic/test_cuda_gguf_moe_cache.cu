@@ -650,7 +650,8 @@ static void CpuExpertReference(const float *input, float *output,
             1, inter, hidden, 0, hidden / nodes).Run();
 }
 
-static void RunHybrid(ggml_type format, int rows, bool single = false, bool frequency = false) {
+static void RunHybrid(ggml_type format, int rows, bool single = false, bool frequency = false,
+                      fastllm::DataType inputType = fastllm::FLOAT32) {
     using namespace fastllm;
     constexpr int experts = 24, topk = 7;
     int hidden = 256;
@@ -683,7 +684,7 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
         Require(CanRunNumasMoeDecodeExperts(table.data(), table.size()), "GGUF CPU subset unavailable");
     std::shared_ptr<FastllmCudaMoeExpertParallel> context;
     if (!single) context = FastllmCudaCreateMoeExpertParallel(ranks);
-    Data input[2]{{FLOAT32, {rows, hidden}}, {FLOAT32, {rows, hidden}}}, output[2];
+    Data input[2]{{inputType, {rows, hidden}}, {inputType, {rows, hidden}}}, output[2], referenceInput;
     for (int rank = 0; rank < ranks; ++rank) {
         Cuda(cudaSetDevice(rank)); input[rank].ToDevice(CUDA, std::vector<int>{rank}); input[rank].Allocate(false);
     }
@@ -700,9 +701,26 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
         x.resize(rows * hidden); cpu.resize(rows * topk * hidden); serial.resize(cpu.size());
         gpu.resize(x.size()); actual[0].resize(x.size()); actual[1].resize(x.size());
         for (int i = 0; i < int(x.size()); ++i) x[i] = float((i * 13) % 31 - 15) / 64;
+        std::vector<uint16_t> packed;
+        if (inputType != FLOAT32) {
+            packed.resize(x.size());
+            for (size_t i = 0; i < x.size(); ++i) {
+                // Include values requiring rounding; CPU and GPU references
+                // must use the value represented by the actual input dtype.
+                const float value = x[i] + .000123f;
+                if (inputType == FLOAT16) {
+                    const half v = __float2half_rn(value);
+                    packed[i] = __half_as_ushort(v); x[i] = __half2float(v);
+                } else {
+                    const __nv_bfloat16 v = __float2bfloat16_rn(value);
+                    packed[i] = __bfloat16_as_ushort(v); x[i] = __bfloat162float(v);
+                }
+            }
+        }
         for (int rank = 0; rank < ranks; ++rank) {
             Cuda(cudaSetDevice(rank)); input[rank].Resize({rows, hidden}); input[rank].Allocate(false);
-            Cuda(cudaMemcpy(input[rank].cudaData, x.data(), x.size()*4, cudaMemcpyHostToDevice));
+            Cuda(cudaMemcpy(input[rank].cudaData, inputType == FLOAT32 ? (void *)x.data() : (void *)packed.data(),
+                x.size() * (inputType == FLOAT32 ? 4 : 2), cudaMemcpyHostToDevice));
         }
         for (int r = 0; r < rows * topk; ++r) {
             const int k = r % topk;
@@ -739,6 +757,14 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
             Require(std::isfinite(cpu[i]) && std::abs(cpu[i] - serial[i]) < 3e-5f * (1 + std::abs(serial[i])),
                     "GGUF CPU decoder differs from serial GEMM/quantize reference");
         Cuda(cudaSetDevice(0));
+        const Data *oracleInput = &input[0];
+        if (inputType != FLOAT32) {
+            referenceInput.dataType = FLOAT32;
+            referenceInput.Resize({rows, hidden});
+            referenceInput.ToDevice(CUDA, std::vector<int>{0}); referenceInput.Allocate(false);
+            Cuda(cudaMemcpy(referenceInput.cudaData, x.data(), x.size()*4, cudaMemcpyHostToDevice));
+            oracleInput = &referenceInput;
+        }
         Cuda(cudaMemcpy(ids.cudaData, route.data(), route.size()*4, cudaMemcpyHostToDevice));
         std::vector<float> lower(rows * hidden, 0), upper(lower.size(), 0);
         // Cache GPU and CPU arithmetic may round differently: independently
@@ -747,7 +773,7 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
             std::vector<float> one(rows * topk, 0);
             for (int row = 0; row < rows; ++row) one[row * topk + k] = 1;
             Cuda(cudaMemcpy(scores.cudaData, one.data(), one.size()*4, cudaMemcpyHostToDevice));
-            Require(FastllmCudaMergeMOECache(input[0], gpuGate, gpuOutput, table.data(), table.size(),
+            Require(FastllmCudaMergeMOECache(*oracleInput, gpuGate, gpuOutput, table.data(), table.size(),
                 static_cast<int32_t *>(ids.cudaData), static_cast<float *>(scores.cudaData), topk), "GPU oracle rejected");
             Cuda(cudaMemcpy(gpu.data(), gpuOutput.cudaData, gpu.size()*4, cudaMemcpyDeviceToHost));
             for (int c = 0; c < rows * hidden; ++c) {
@@ -777,6 +803,15 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
         auto run = [&](int rank) {
             try {
                 Cuda(cudaSetDevice(rank)); Data empty;
+                if (!single && step == 0 && inputType != FLOAT32) {
+                    Data invalidIds;
+                    invalidIds.FakeFrom(ids, 0);
+                    invalidIds.Resize({rows, 0});
+                    Require(!FastllmCudaMergeMOEExpertParallel(*context, rank, input[rank],
+                        rank == 0 ? invalidIds : empty, rank == 0 ? scores : empty,
+                        output[rank], table.data(), table.size(), layer, [] {}),
+                        "EP accepted invalid routes");
+                }
                 if (frequency) {
                     uint64_t previousHits = 0;
                     for (int repeat = 0; repeat < 3; ++repeat) {
@@ -839,7 +874,7 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
     context.reset();
     FastllmCudaReleaseMoeCache(tables[0].data(), tables[0].size()); SetMoeCudaCacheBytes(0);
     ClearNumasMoeRuntimeCache(); Cuda(cudaSetDevice(0));
-    std::printf("PASS GGUF hybrid format=%d rows=%d ranks=%d: CPU serial reference, mixed layers, CPU/GPU routes, duplicate/zero/negative routes\n", format, rows, ranks);
+    std::printf("PASS GGUF hybrid format=%d rows=%d ranks=%d input=%d: CPU serial reference, mixed layers, CPU/GPU routes, duplicate/zero/negative routes\n", format, rows, ranks, inputType);
 }
 #endif
 
@@ -871,6 +906,12 @@ int main(int argc, char **argv) {
             }
             RunHybrid(GGML_TYPE_IQ2_S, 1, true);
             RunHybrid(GGML_TYPE_Q4_K, 4, true);
+            for (auto inputType : {fastllm::FLOAT16, fastllm::BFLOAT16}) {
+                for (auto type : {GGML_TYPE_Q2_0, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS}) {
+                    for (int rows : {1, 4, FASTLLM_CUDA_MOE_CACHE_MAX_BATCH})
+                        RunHybrid(type, rows, false, false, inputType);
+                }
+            }
             std::puts("PASS: GGUF CPU/GPU hybrid expert decode"); return 0;
         }
 #endif

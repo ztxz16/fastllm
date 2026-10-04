@@ -1897,7 +1897,7 @@ struct FastllmCudaMoeExpertParallel {
     static constexpr int maxRows = FASTLLM_CUDA_MOE_CACHE_MAX_BATCH;
     static constexpr int maxRoutes = maxRows * kMaxTopK;
     struct Rank {
-        fastllm::Data ids, selected, scores, owners, lookup, gate;
+        fastllm::Data ids, selected, scores, owners, lookup, gate, inputFloat;
         float *host = nullptr, *device = nullptr;
         int32_t *routes = nullptr;
         cudaEvent_t done = nullptr, copyStart = nullptr, copyEnd = nullptr;
@@ -1924,7 +1924,7 @@ struct FastllmCudaMoeExpertParallel {
             if (cudaDevice >= 0) cudaSetDevice(cudaDevice);
             if (pending) cudaEventSynchronize(done);
             ids.FreeSpace(); selected.FreeSpace(); scores.FreeSpace();
-            owners.FreeSpace(); lookup.FreeSpace(); gate.FreeSpace();
+            owners.FreeSpace(); lookup.FreeSpace(); gate.FreeSpace(); inputFloat.FreeSpace();
             cudaFreeHost(host); cudaFreeHost(routes); cudaFree(device);
             if (done) cudaEventDestroy(done);
             if (copyStart) cudaEventDestroy(copyStart);
@@ -2024,7 +2024,6 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
     int device = -1;
     cudaGetDevice(&device);
     work.ready = FastllmCudaMoeCacheRequested() && SupportedCacheInput(input) &&
-        input.dataType == FLOAT32 &&
         cudaStreamIsCapturing(cudaStreamPerThread, &capture) == cudaSuccess &&
         capture == cudaStreamCaptureStatusNone;
     work.group = work.ready ? FindHybridGroup(weights, weightsBatch, &work.table) : nullptr;
@@ -2035,6 +2034,19 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
         work.cudaDevice = device;
         work.rows = input.dims[0];
         work.ready = work.Prepare(input.dims[1]);
+    }
+    // CPU experts and the per-expert reduction consume FP32. Convert the
+    // small activation batch once per rank, retaining the buffer until its
+    // completion event; both CPU and GPU experts then see the same values.
+    const Data *expertInput = &input;
+    if (work.ready && input.dataType != FLOAT32) {
+        work.inputFloat.Resize(input.dims);
+        work.inputFloat.ToDevice(CUDA, std::vector<int>{device}, false);
+        work.inputFloat.Allocate(false);
+        work.ready = input.dataType == FLOAT16
+            ? FastllmHalfToFloat(input.cudaData, work.inputFloat.cudaData, input.Count(0))
+            : FastllmBF16ToFloat(input.cudaData, work.inputFloat.cudaData, input.Count(0));
+        expertInput = &work.inputFloat;
     }
     work.cache = work.ready ? GetDeviceCache(*work.group) : nullptr;
     if (rank == 0 && work.ready) {
@@ -2050,7 +2062,7 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
                 routes * sizeof(int32_t), cudaMemcpyDeviceToHost, cudaStreamPerThread));
             checkCudaErrors("EP scores", cudaMemcpyAsync(work.Scores(), score.cudaData,
                 routes * sizeof(float), cudaMemcpyDeviceToHost, cudaStreamPerThread));
-            checkCudaErrors("EP input", cudaMemcpyAsync(work.host, input.cudaData,
+            checkCudaErrors("EP input", cudaMemcpyAsync(work.host, expertInput->cudaData,
                 work.rows * work.hidden * sizeof(float), cudaMemcpyDeviceToHost, cudaStreamPerThread));
             checkCudaErrors("EP routing", cudaStreamSynchronize(cudaStreamPerThread));
             for (int r = 0; r < routes; ++r)
@@ -2074,7 +2086,14 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
     }
     // A second rendezvous protects the shared validation fields from the next
     // layer when one rank rejects before the others have inspected them.
-    if (!ready || !anyCache) { state.Barrier(); return false; }
+    if (!ready || !anyCache) {
+        // A peer or invalid route tensor can reject after this rank queued
+        // its conversion. Finish it before fallback may recycle the input.
+        if (expertInput != &input)
+            checkCudaErrors("EP rejected input", cudaStreamSynchronize(cudaStreamPerThread));
+        state.Barrier();
+        return false;
+    }
     const int topk = root.topk, hidden = root.hidden;
     const int rows = root.rows, routes = rows * topk;
     const auto &layout = root.group->LayerLayout(root.table);
@@ -2179,8 +2198,8 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
                 if (std::none_of(work.Selected() + row * topk,
                         work.Selected() + (row + 1) * topk, [](int expert) { return expert >= 0; })) continue;
                 Data inputRow, outputRow;
-                inputRow.FakeFrom(input, size_t(row) * hidden * sizeof(float));
-                inputRow.Resize({1, hidden}); inputRow.dataDeviceIds = input.dataDeviceIds;
+                inputRow.FakeFrom(*expertInput, size_t(row) * hidden * sizeof(float));
+                inputRow.Resize({1, hidden}); inputRow.dataDeviceIds = expertInput->dataDeviceIds;
                 outputRow.FakeFrom(output, size_t(row) * hidden * sizeof(float));
                 outputRow.Resize({1, hidden}); outputRow.dataDeviceIds = output.dataDeviceIds;
                 AssertInFastLLM(EnsureCachedExperts(work.group, work.cache, work.table,

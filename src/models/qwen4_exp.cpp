@@ -3406,14 +3406,24 @@ namespace fastllm {
                 // Original table addresses must be retained as cache keys.
                 // Main and draft experts share one budget and LRU pool.
                 std::vector<FastllmCudaMoeCacheLayer> cacheLayers;
+                bool allNuma = true;
                 for (int layer = 0; layer <= block_cnt; ++layer) {
                     const std::string device = SelectMoeDeviceForLayer(std::min(layer, block_cnt - 1));
                     if (device != "cpu" && device != "numa" && device.compare(0, 5, "numa:") != 0) continue;
+                    allNuma = allNuma && device != "cpu";
                     const auto &table = layer == block_cnt ? mtpMoeWeights : weights[layer];
                     cacheLayers.push_back({table.data(), static_cast<int>(table.size())});
                 }
+                std::function<void()> registerNumaWeights;
+#ifdef USE_NUMAS
+                if (allNuma) {
+                    // Hybrid eligibility is checked during cache preparation,
+                    // after the canonical GGUF records have been snapshotted.
+                    registerNumaWeights = [this] { WarmupNumaMoeWeights(); };
+                }
+#endif
                 cachePrepared = !cacheLayers.empty() && FastllmCudaPrepareMoeCache(
-                    cacheLayers.data(), static_cast<int>(cacheLayers.size()));
+                    cacheLayers.data(), static_cast<int>(cacheLayers.size()), registerNumaWeights);
             } else
 #endif
             {
@@ -6626,7 +6636,7 @@ namespace fastllm {
             SigmoidMulTo(sharedResult, sharedGate);
         };
 #if defined(USE_CUDA) && !defined(USE_ROCM)
-        if (hostMoe && &moeWeights != &this->mtpMoeWeights && threadTpOwner->expertParallel &&
+        if (hostMoe && threadTpOwner->expertParallel &&
             batch * sequence <= FASTLLM_CUDA_MOE_CACHE_MAX_BATCH &&
             MoeCudaCacheRequested()) {
             selectExperts();
