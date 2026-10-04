@@ -60,6 +60,8 @@ namespace fastllm {
     void RegisterNumasLinearWeightBatch(const std::vector<Data*> &weights);
     bool IsNumasLinearWeightSupported(const Data *weight);
     bool IsNumasLinearWeightRegistered(const Data *weight);
+    // CUDA can borrow expert shards only when NUMA registration pins them.
+    bool NumasMoeWeightsArePinned();
 
     // Single-token SwiGLU subsets using already registered NUMA shards. Each
     // selected route writes its unweighted FP32 result at route * hidden.

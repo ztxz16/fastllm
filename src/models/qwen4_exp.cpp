@@ -3400,8 +3400,8 @@ namespace fastllm {
                 std::function<void()> registerNumaWeights;
 #ifdef USE_NUMAS
                 if (allNuma) {
-                    // Hybrid eligibility is checked during cache preparation,
-                    // after the canonical GGUF records have been snapshotted.
+                    // Cache preparation registers NUMA shards before binding
+                    // shared weights, retaining a canonical snapshot only as a fallback.
                     registerNumaWeights = [this] { WarmupNumaMoeWeights(); };
                 }
 #endif

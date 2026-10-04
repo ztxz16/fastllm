@@ -6,6 +6,7 @@
 #include "gguf.h"
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include "../../src/devices/cuda/moe/fastllm-moe-gguf-restore.cuh"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -779,6 +780,100 @@ static void CpuExpertReference(const float *input, float *output,
             1, inter, hidden, 0, hidden / nodes).Run();
 }
 
+static void RunSharedGGUFRecords() {
+    using namespace fastllm_gguf_restore;
+    constexpr int experts = 3;
+    enum class Mode { FixedExpert, Batch, Promotion, Empty, Uploaded };
+    for (auto type : {GGML_TYPE_Q2_K, GGML_TYPE_Q4_K, GGML_TYPE_IQ2_XXS,
+                     GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS,
+                     GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS,
+                     GGML_TYPE_Q2_0, GGML_TYPE_Q8_0, GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (int shards : {1, 2}) {
+            Record layout;
+            layout.shards = shards;
+            uint8_t *host = nullptr, *mapped = nullptr, *output = nullptr, *promoted = nullptr, *uploaded = nullptr;
+            std::vector<uint8_t> canonical;
+            std::vector<void *> sources;
+            for (int expert = 0; expert < experts; ++expert) {
+                auto gate = Weight(type, 512, 512, 17 + expert * 7, true);
+                auto down = Weight(type, 512, 256, 21 + expert * 11, true);
+                if (expert == 0) {
+                    layout.downOffset = (gate->GetBytes() + 15) & ~size_t(15);
+                    layout.stride = (layout.downOffset + down->GetBytes() + 127) & ~size_t(127);
+                    canonical.resize(experts * layout.stride, 0);
+                    Cuda(cudaHostAlloc(&host, canonical.size(), cudaHostAllocMapped | cudaHostAllocPortable));
+                    Cuda(cudaHostGetDevicePointer(&mapped, host, 0));
+                }
+                auto *record = canonical.data() + expert * layout.stride;
+                std::memcpy(record, gate->cpuData, gate->GetBytes());
+                std::memcpy(record + layout.downOffset, down->cpuData, down->GetBytes());
+                const size_t rowBytes = gate->GetBytes() / 512;
+                for (int row = 0; row < 512; ++row)
+                    std::memcpy(gate->cpuData + row * rowBytes,
+                        record + (row / 2 + (row % 2) * 256) * rowBytes, rowBytes);
+                gate->Repack(); down->Repack();
+                for (int part = 0; part < 2; ++part) {
+                    const auto &weight = part ? *down : *gate;
+                    const size_t offset = expert * layout.stride + (part ? layout.downOffset : 0);
+                    layout.weights[part] = {weight.ggmlType, weight.dims[0], weight.dims[1],
+                        weight.GetBytes() / weight.dims[0]};
+                    Require(Ordinary(weight.ggmlType) == type, "shared GGUF test did not retain its canonical format");
+                    std::memcpy(host + offset, weight.cpuData, weight.GetBytes());
+                    for (int node = 0; node < shards; ++node)
+                        sources.push_back(mapped + offset + node * weight.GetBytes() / shards);
+                }
+            }
+            const size_t outputBytes = experts * (layout.stride + 128);
+            std::vector<uint8_t> expected(outputBytes), actual(outputBytes);
+            const uint64_t offsets[] = {0, layout.stride + 128, 2 * (layout.stride + 128)};
+            int32_t metadata[] = {2, 0, 1, 1, 2, 0, experts};
+            void **pointers = nullptr;
+            int32_t *ids = nullptr;
+            uint64_t *slotOffsets = nullptr;
+            Cuda(cudaMalloc(&pointers, sources.size() * sizeof(void *)));
+            Cuda(cudaMemcpy(pointers, sources.data(), sources.size() * sizeof(void *), cudaMemcpyHostToDevice));
+            Cuda(cudaMalloc(&ids, sizeof(metadata))); Cuda(cudaMalloc(&slotOffsets, sizeof(offsets)));
+            Cuda(cudaMemcpy(slotOffsets, offsets, sizeof(offsets), cudaMemcpyHostToDevice));
+            Cuda(cudaMalloc(&output, outputBytes)); Cuda(cudaMalloc(&promoted, layout.stride));
+            Cuda(cudaMalloc(&uploaded, layout.stride));
+            Cuda(cudaMemcpy(uploaded, host + 2 * layout.stride, layout.stride, cudaMemcpyHostToDevice));
+            Cuda(cudaMemcpy(promoted, canonical.data(), layout.stride, cudaMemcpyHostToDevice));
+            // Cover host restoration, device-selected batches, D2D promotion,
+            // empty requests, and restoration after a DMA upload.
+            for (auto mode : {Mode::FixedExpert, Mode::Batch, Mode::Promotion, Mode::Empty, Mode::Uploaded}) {
+                std::fill(expected.begin(), expected.end(), 0xa5);
+                metadata[6] = mode == Mode::Empty ? 0 : experts;
+                Cuda(cudaMemcpy(ids, metadata, sizeof(metadata), cudaMemcpyHostToDevice));
+                Cuda(cudaMemset(output, 0xa5, outputBytes));
+                if (mode == Mode::FixedExpert || mode == Mode::Uploaded) {
+                    std::memcpy(expected.data(), canonical.data() + 2 * layout.stride, layout.stride);
+                    // Uploaded records must work without a host pointer table.
+                    const bool fromUpload = mode == Mode::Uploaded;
+                    Cuda(CopyRecords(layout, fromUpload ? nullptr : pointers, output, cudaStreamPerThread,
+                        nullptr, nullptr, nullptr, nullptr, fromUpload ? 0 : 2,
+                        nullptr, -1, fromUpload ? uploaded : nullptr));
+                } else {
+                    for (int i = 0; i < metadata[6]; ++i)
+                        std::memcpy(expected.data() + offsets[metadata[experts + i]],
+                            canonical.data() + metadata[i] * layout.stride, layout.stride);
+                    Cuda(CopyRecords(layout, pointers, output, cudaStreamPerThread,
+                        ids, ids + experts, ids + 2 * experts, slotOffsets, 0,
+                        mode == Mode::Promotion ? promoted : nullptr, 0));
+                }
+                Cuda(cudaMemcpy(actual.data(), output, outputBytes, cudaMemcpyDeviceToHost));
+                if (actual != expected) {
+                    const auto at = std::mismatch(actual.begin(), actual.end(), expected.begin()).first - actual.begin();
+                    std::fprintf(stderr, "GGUF restore type=%d shards=%d mode=%d byte=%zu actual=%u expected=%u\n",
+                        type, shards, int(mode), size_t(at), unsigned(actual[at]), unsigned(expected[at]));
+                    Require(false, "shared GGUF restoration changed packed bytes");
+                }
+            }
+            Cuda(cudaFree(pointers)); Cuda(cudaFree(ids)); Cuda(cudaFree(slotOffsets));
+            Cuda(cudaFree(output)); Cuda(cudaFree(promoted)); Cuda(cudaFree(uploaded)); Cuda(cudaFreeHost(host));
+        }
+    }
+}
+
 static void RunHybrid(ggml_type format, int rows, bool single = false, bool frequency = false,
                       fastllm::DataType inputType = fastllm::FLOAT32, bool noCache = false,
                       bool large = false, bool verifyDynamic = false) {
@@ -1189,6 +1284,10 @@ int main(int argc, char **argv) {
             std::puts("PASS: GGUF input quantization reuse"); return 0;
         }
 #ifdef USE_NUMAS
+        if (argc > 1 && std::strcmp(argv[1], "--shared-weights") == 0) {
+            RunSharedGGUFRecords();
+            std::puts("PASS: shared GGUF weights preserve canonical bytes"); return 0;
+        }
         if (argc > 1 && std::strcmp(argv[1], "--no-cache") == 0) {
             fastllm::SetThreads(4);
             RunHybrid(GGML_TYPE_IQ3_S, 1, true, true, fastllm::FLOAT32, true);

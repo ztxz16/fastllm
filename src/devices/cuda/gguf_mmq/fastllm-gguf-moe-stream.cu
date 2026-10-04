@@ -1,6 +1,7 @@
 #include "fastllm-gguf-mmq-common.cuh"
 #include "fastllm-gguf-moe-stream.cuh"
 #include "../moe/fastllm-moe-gguf-common.cuh"
+#include "../moe/fastllm-moe-gguf-restore.cuh"
 
 // Host NUMA shards remain immutable; only the current worker's selected
 // experts occupy GPU scratch.
@@ -12,22 +13,15 @@ struct WeightCopy {
 };
 
 static int Ordinary(int type) {
+    type = fastllm_gguf_restore::Ordinary(type);
     switch (type) {
-        case GGML_TYPE_Q2_K_R4: return GGML_TYPE_Q2_K;
-        case GGML_TYPE_Q4_K_R4: return GGML_TYPE_Q4_K;
-        case GGML_TYPE_Q2_K: case GGML_TYPE_Q4_K: return type;
-        case GGML_TYPE_IQ2_XXS_R4: return GGML_TYPE_IQ2_XXS;
-        case GGML_TYPE_IQ2_XS_R4: return GGML_TYPE_IQ2_XS;
-        case GGML_TYPE_IQ2_S_R4: return GGML_TYPE_IQ2_S;
+        case GGML_TYPE_Q2_K: case GGML_TYPE_Q4_K:
         case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ2_S: case GGML_TYPE_IQ1_M: case GGML_TYPE_Q2_0:
             return type;
         default: return -1;
     }
 }
-
-// Inverse of the CPU R4 repacker's prefix-XOR sign permutation.
-__device__ unsigned Unsign(unsigned x) { return (x ^ (x << 1)) & 127; }
 
 __global__ void Restore(const WeightCopy *copies) {
     const WeightCopy w = copies[blockIdx.y];
@@ -38,79 +32,8 @@ __global__ void Restore(const WeightCopy *copies) {
          i < w.rows*blocks; i += gridDim.x*(blockDim.x/32)) {
         const int row = i/blocks, col = i%blocks;
         const int srcRow = w.cross ? 2*(row%(w.rows/2)) + row/(w.rows/2) : row;
-        const int rlane = srcRow%4, r4 = (srcRow/4)*blocks+col;
-        if (w.type == GGML_TYPE_Q2_K_R4) {
-            const auto &s = reinterpret_cast<const block_q2_k_r4 *>(w.source)[r4];
-            auto &d = reinterpret_cast<block_q2_K *>(w.destination)[i];
-            if (lane == 0) d.dm = make_half2(reinterpret_cast<const half *>(s.d)[rlane],
-                                            reinterpret_cast<const half *>(s.d)[rlane+4]);
-            if (lane < 16) d.scales[lane] = s.scales[4*lane+rlane];
-            for (int b = lane; b < 64; b += 32) {
-                unsigned packed = 0;
-                for (int k = 0; k < 4; ++k) {
-                    const int c = (b/32)*128 + b%32 + k*32, p = c%32;
-                    const unsigned q = s.qs[32*(c/32)+4*rlane+p%4+16*(p/16)];
-                    packed |= ((q >> (2*((p%16)/4))) & 3) << (2*k);
-                }
-                d.qs[b] = packed;
-            }
-        } else if (w.type == GGML_TYPE_Q4_K_R4) {
-            const auto &s = reinterpret_cast<const block_q4_k_r4 *>(w.source)[r4];
-            auto &d = reinterpret_cast<block_q4_K *>(w.destination)[i];
-            if (lane == 0) d.dm = make_half2(reinterpret_cast<const half *>(s.d)[rlane],
-                                            reinterpret_cast<const half *>(s.d)[rlane+4]);
-            // Each of the first four lanes owns three canonical scale bytes.
-            if (lane < 4) {
-                const int lo = 4*lane+rlane, hi = lo+16;
-                const unsigned a = s.scales_h[lo], l = s.scales_l[lo], h = s.scales_l[hi];
-                const unsigned ds0 = (l&15)+16*(a&3), ms0 = (l>>4)+16*((a>>2)&3);
-                const unsigned ds1 = (h&15)+16*((a>>4)&3), ms1 = (h>>4)+16*(a>>6);
-                d.scales[lane] = ds0 | ((ds1>>4)<<6);
-                d.scales[lane+4] = ms0 | ((ms1>>4)<<6);
-                d.scales[lane+8] = (ds1&15) | ((ms1&15)<<4);
-            }
-            for (int b = lane; b < 128; b += 32) {
-                unsigned packed = 0;
-                for (int k = 0; k < 2; ++k) {
-                    const int c = (b/32)*64+b%32+k*32, p = c%32;
-                    const unsigned q = s.qs[64*(c/32)+4*rlane+p%4+32*((p%8)/4)+16*(p/16)];
-                    packed |= ((q >> (4*((p%16)/8))) & 15) << (4*k);
-                }
-                d.qs[b] = packed;
-            }
-        } else if (w.type == GGML_TYPE_IQ2_XS_R4) {
-            const auto &s = reinterpret_cast<const block_iq2_xs_r4 *>(w.source)[r4];
-            auto &d = reinterpret_cast<block_iq2_xs *>(w.destination)[i];
-            if (lane == 0) d.d = s.d[rlane];
-            if (lane < 8) d.scales[lane] = s.scales[4*lane+rlane];
-            const unsigned q = s.qs[16*(lane/4)+4*rlane+lane%4];
-            d.qs[lane] = (q & 511) | (Unsign(q>>9)<<9);
-        } else if (w.type == GGML_TYPE_IQ2_XXS_R4) {
-            const auto &s = reinterpret_cast<const block_iq2_xxs_r4 *>(w.source)[r4];
-            auto &d = reinterpret_cast<block_iq2_xxs *>(w.destination)[i];
-            if (lane == 0) d.d = s.d[rlane];
-            reinterpret_cast<uint8_t *>(d.qs)[8*(lane/4)+lane%4] =
-                s.qs[16*(lane/4)+4*rlane+lane%4];
-            if (lane < 8) {
-                uint32_t signs = 0, scale = 0;
-                for (int j = 0; j < 4; ++j) {
-                    const unsigned q = s.sas[16*lane+4*rlane+j];
-                    signs |= Unsign(q>>1) << (7*j);
-                    scale |= (q & 1) << j;
-                }
-                signs |= scale << 28;
-                d.qs[4*lane+2] = signs; d.qs[4*lane+3] = signs>>16;
-            }
-        } else if (w.type == GGML_TYPE_IQ2_S_R4) {
-            const auto &s = reinterpret_cast<const block_iq2_s_r4 *>(w.source)[r4];
-            auto &d = reinterpret_cast<block_iq2_s *>(w.destination)[i];
-            if (lane == 0) d.d = s.d[rlane];
-            if (lane < 8) {
-                d.scales[lane] = s.scales[4*lane+rlane];
-                d.qh[lane] = s.qh[4*lane+rlane];
-            }
-            d.qs[lane] = s.qs[16*(lane/4)+4*rlane+lane%4];
-            d.qs[32+lane] = s.signs[16*(lane/4)+4*rlane+lane%4];
+        if (fastllm_gguf_restore::Ordinary(w.type) != w.type) {
+            fastllm_gguf_restore::Block(w.source, w.destination, w.type, blocks, srcRow, col, i);
         } else {
             const int bytes = w.type == GGML_TYPE_Q2_0 ? sizeof(block_q2_0) :
                 w.type == GGML_TYPE_Q2_K ? sizeof(block_q2_K) :

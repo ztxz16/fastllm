@@ -20,8 +20,8 @@
 #include <vector>
 
 namespace {
-// Keep dispatch and admission on the same list. Repacked CPU layouts are never
-// admitted: the host snapshot is taken before NUMA registration/repacking.
+// Keep dispatch and admission on the same list. Cache slots hold ordinary GGUF
+// blocks, either restored from NUMA shards or copied from a canonical snapshot.
 #define GGUF_CACHE_TYPES(M) \
     M(Q2_0) M(Q4_0) M(Q4_1) M(Q5_0) M(Q5_1) M(Q8_0) M(Q8_1) \
     M(Q2_K) M(Q3_K) M(Q4_K) M(Q5_K) M(Q6_K) \

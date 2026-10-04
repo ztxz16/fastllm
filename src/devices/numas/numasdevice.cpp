@@ -2940,6 +2940,10 @@ namespace fastllm {
         RegisterNumasImpl(data, weightType, true);
     }
 
+    bool NumasMoeWeightsArePinned() {
+        return MoeEnvConfig::GetInstance().GetPinnedWeight();
+    }
+
     namespace {
         struct NumasDeepSeekV4WoAPackOp : MultiThreadBaseOp {
             const uint8_t *input;
