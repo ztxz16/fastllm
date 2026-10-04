@@ -207,6 +207,19 @@ int main(int argc, char **argv) { try {
         prop.sharedMemPerBlockOptin < 71680) return 77;
     FastllmCudaSetDevice(0); SetThreads(4);
     CheckActivation();
+    if (argc == 2 && std::strcmp(argv[1], "--grouped-decode") == 0) {
+        Fixture f(17);
+        // CPU FP64 reference, clipping and graph replay with changing routes
+        // cover grouped batches, shrinking batches and exact verification.
+        for (int threshold : {0, 10}) {
+            FastllmCudaSetLinearExactBatchThreshold(threshold);
+            for (int m : {8, 7, 6, 5, 4, 3, 2, 1, 9, 8}) {
+                Run(f, m, 8, 10.0f, 15.0f, true, true);
+            }
+        }
+        FastllmCudaSetLinearExactBatchThreshold(0);
+        std::puts("Grouped decode PASS"); return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--narrow-prefill") == 0) {
         Fixture narrow(19,false,false,256,256,16,true);
         for (int m : {9,32,33,32}) Run(narrow,m,8,0.0f,.15f,true,true);

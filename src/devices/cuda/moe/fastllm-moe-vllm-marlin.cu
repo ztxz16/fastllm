@@ -3499,10 +3499,15 @@ static bool RunNvfp4E4M3MarlinMoe(
         }
         marlinInput = activation.cudaData;
     }
-    if (smallBatch && batch <= 9) {
-        // Give each route a dedicated padded Marlin row. Besides matching
-        // the batch-1 reduction layout, this avoids the nondeterministic
-        // atomic scatter order when several top-k routes select one expert.
+    // Reuse weights across ordinary BF16 decode rows that select an expert
+    // in common. The existing stable scatter preserves route order. Below
+    // four rows its metadata overhead often outweighs the saved GEMM work;
+    // exact verification retains the batch-1 tensor-core row layout.
+    const bool groupedDecode = bf16 && batch >= 4 && batch <= 8 &&
+        batch >= fastllm::FastllmCudaGetLinearExactBatchThreshold();
+    if (smallBatch && batch <= 9 && !groupedDecode) {
+        // Give each route a dedicated padded Marlin row, matching the
+        // batch-1 reduction layout used by exact verification.
         BuildEpMetadataRowsKernel<<<1, 64, 0, stream>>>(
             indices, routeStorage->sortedTokenIds,
             routeStorage->gateExpertIds,
