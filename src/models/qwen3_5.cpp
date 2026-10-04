@@ -13060,7 +13060,7 @@ namespace fastllm {
         Data projectionScratch, localResidualScratch;
         Data &residualScratch = mtpVerifyGraphDeviceState != nullptr ?
             mtpVerifyGraphDeviceState->residualScratch : localResidualScratch;
-        Data &merged = projectionScratch, &gdnMerged = projectionScratch;
+        Data &merged = projectionScratch;
         Data &gateupResult = projectionScratch;
         Data &attenLastOutput = residualScratch, &mlpPart = residualScratch;
         Data attenInput, qgate;
@@ -13082,8 +13082,8 @@ namespace fastllm {
         Data moeFinal, sharedGate, sharedOutput;
         Data qSizes, pageSizes, pageIndexs, lastPageLens;
         Data insertIndexs, insertPositions;
-        Data baMerged, qkvConvInput, qkvConvInputPermuted;
-        Data z, b, a, g, conv, convOutput, convOutputPermuted;
+        Data localBaMerged, localQkvConvInput, qkvConvInputPermuted;
+        Data z, b, a, g, conv, localConvOutput, convOutputPermuted;
         Data coreAttnOut, coreTemp, gatedCoreAttnOut;
         Qwen35ExactDFlashPagedMeta exactDFlashPagedMeta;
         Data convInputWithCache;
@@ -13630,6 +13630,20 @@ namespace fastllm {
                     hasMergedGdnInLinear || hasQkvzGdnInLinear ||
                         hasSeparateQkvZGdnInLinear,
                     "Qwen3.5 ForwardSingleGPU requires qkvzba, qkvz/ba, or qkv/z/ba weights.\n");
+                DFlashLinearReplay *linearReplay = speculativeCaptureLinearReplay ?
+                    dflashLinearReplay.at(i).at(gpuId).get() : nullptr;
+                // Compact rollback already owns these per-layer activations.
+                // Produce directly into that storage so later layers cannot
+                // overwrite it and no post-projection backup copy is needed.
+                // Other layouts retain the existing explicit capture fallback.
+                const bool directReplayInput = linearReplay != nullptr &&
+                    Qwen35MtpTokenMajorConvEnabled();
+                Data &gdnMerged = directReplayInput && !hasSeparateQkvZGdnInLinear ?
+                    linearReplay->input : projectionScratch;
+                Data &qkvConvInput = directReplayInput && hasSeparateQkvZGdnInLinear ?
+                    linearReplay->input : localQkvConvInput;
+                Data &baMerged = linearReplay != nullptr ? linearReplay->ba : localBaMerged;
+                Data &convOutput = linearReplay != nullptr ? linearReplay->conv : localConvOutput;
                 const char *tritonEnv = std::getenv("FASTLLM_CUDA_TRITON");
                 const bool compactGdnScratch = reusePrefillScratch &&
                     !hasSeparateQkvZGdnInLinear &&
@@ -13786,9 +13800,8 @@ namespace fastllm {
                         localQkvDim, localQkvDim + localVd, z);
                     projectedZSplitReady = true;
                 };
-                DFlashLinearReplay *linearReplay = speculativeCaptureLinearReplay ?
-                    dflashLinearReplay.at(i).at(gpuId).get() : nullptr;
                 auto saveReplayActivation = [&](Data &dst, const Data &src) {
+                    if (&dst == &src) return;
                     dst.dataType = src.dataType;
                     dst.Resize(src.dims);
                     dst.ToDevice(DataDevice::CUDA, std::vector<int>{gpuId});

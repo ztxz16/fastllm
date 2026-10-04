@@ -18705,7 +18705,12 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16BatchPointers(
         !FastllmCudaDataCanShareDevice(first, output)) {
         return false;
     }
-    if (batch == 1 && tokenMajorInput && numTokenCaches > 0 &&
+    // A short eager sequence can pass its one cache pointer as a launch
+    // argument and update the cache in the convolution kernel. Graph pointer
+    // scopes keep their refreshable device tables for the snapshot-free path.
+    const bool inlineSingleCache = numTokenCaches > 0 ||
+        (fastllmCudaGraphPointerTableScopes.empty() && !FastllmCudaGraphIsCapturingFast());
+    if (batch == 1 && tokenMajorInput && inlineSingleCache &&
         numTokens <= FASTLLM_CUDA_MTP_FAST_SEQ_MAX && pointers.size() <= 8) {
         FastllmInlineConvCachePointers inlinePointers = {};
         for (size_t i = 0; i < pointers.size(); ++i) {
@@ -21250,7 +21255,7 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
     half **snapshotPointers, int numSnaps,
     void **prefixLengths = nullptr, half **initialStates = nullptr,
     const float *preparedQk = nullptr, const float *preparedBa = nullptr,
-    half **outputStates = nullptr) {
+    half **outputStates = nullptr, half *singleOutputState = nullptr) {
     int head_idx = blockIdx.x;
     int v_base = blockIdx.y * TILE_V;
     if (head_idx >= numVHeads || v_base >= headVDim) {
@@ -21439,8 +21444,9 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
         }
         // Verification can keep its original state intact and write the final
         // state to a second owned buffer. No preliminary matrix copy is needed.
-        half *finalRow = outputStates != nullptr ?
-            outputStates[batchIndex] + stateHeadBase + (size_t)v_col * headKDim : state_row;
+        half *finalState = outputStates != nullptr ? outputStates[batchIndex] : singleOutputState;
+        half *finalRow = finalState != nullptr ?
+            finalState + stateHeadBase + (size_t)v_col * headKDim : state_row;
 #pragma unroll
         for (int j = 0; j < 4; j++) {
             finalRow[lane_id + j * 32] = stateValues[j];
@@ -22080,9 +22086,18 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnaps
         }
         pointers.push_back(state->cudaData);
     }
-    void **devicePointers = FastllmCudaStagePointers(pointers);
-    half **outputPointers = outputStates.empty() ? nullptr :
+    // Single-request compact verification needs only an input and optional
+    // output state pointer. Pass them directly instead of uploading a table
+    // every layer; graph scopes retain their dynamically refreshed tables.
+    const bool inlineSingleState = batch == 1 && numTokenStates == 0 &&
+        fastllmCudaGraphPointerTableScopes.empty() && !FastllmCudaGraphIsCapturingFast();
+    void **devicePointers = inlineSingleState ? nullptr : FastllmCudaStagePointers(pointers);
+    half **outputPointers = inlineSingleState || outputStates.empty() ? nullptr :
         (half**)(devicePointers + batch * (1 + numTokenStates));
+    half **snapshotPointers = devicePointers == nullptr ? nullptr : (half**)(devicePointers + batch);
+    half *singleInputState = inlineSingleState ? (half*)first.cudaData : nullptr;
+    half *singleOutputState = inlineSingleState && !outputStates.empty() ?
+        (half*)outputStates[0]->cudaData : nullptr;
 
     coreAttnOut.dataType = first.dataType;
     coreAttnOut.Resize({batch, seqLen, numVHeads, headVDim});
@@ -22141,12 +22156,12 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnaps
             (const float*)normWeight.cudaData,
             (const float*)aLog.cudaData,
             (const float*)dtBias.cudaData,
-            nullptr, (half**)devicePointers,
+            singleInputState, (half**)devicePointers,
             (half*)coreAttnOut.cudaData,
             seqLen, numKHeads, numVHeads, headKDim, headVDim, eps, qScale,
             nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-            (half**)(devicePointers + batch), numTokenStates,
-            nullptr, nullptr, nullptr, nullptr, outputPointers);
+            snapshotPointers, numTokenStates,
+            nullptr, nullptr, nullptr, nullptr, outputPointers, singleOutputState);
     cudaError_t launchState = cudaGetLastError();
     if (launchState != cudaSuccess) {
         checkCudaErrors(

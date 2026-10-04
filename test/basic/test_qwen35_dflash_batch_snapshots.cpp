@@ -336,8 +336,9 @@ int main() {
                 Run(device, batch, length, 8, 24, 128);
                 ++cases;
             }
-            for (int vDim : {96, 192}) {
-                Run(device, 4, 4, 2, 4, vDim);
+            // Single-request direct pointers also cover partial V tiles.
+            for (int vDim : {96, 192}) for (int batch : {1, 4}) {
+                Run(device, batch, 4, 2, 4, vDim);
                 ++cases;
             }
         }
