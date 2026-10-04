@@ -862,6 +862,10 @@ if (UNIT_TEST)
     target_link_libraries(qwen4_mtp_weights_test PRIVATE fastllm)
     add_test(NAME qwen4_mtp_weights COMMAND qwen4_mtp_weights_test)
 
+    add_executable(qwen4_mtp_confidence_test test/basic/test_qwen4_mtp_confidence.cpp)
+    target_include_directories(qwen4_mtp_confidence_test PRIVATE include)
+    add_test(NAME qwen4_mtp_confidence COMMAND qwen4_mtp_confidence_test)
+
     add_executable(qwen35_paged_cache_test test/basic/test_qwen35_paged_cache.cpp)
     add_test(NAME qwen35_paged_cache COMMAND qwen35_paged_cache_test)
 

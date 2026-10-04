@@ -464,7 +464,8 @@ namespace fastllm {
                         const Data *deviceTokenIds = nullptr,
                         Data *sampledTokenIds = nullptr,
                         Data *sampledTokenValues = nullptr,
-                        int sampledTokenOffset = 0);
+                        int sampledTokenOffset = 0,
+                        float *topProbability = nullptr);
         void CaptureRequestRuntimeCheckpoint(
             RequestState &state,
             const std::map<int, int> &qsaLengths,

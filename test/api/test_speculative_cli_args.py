@@ -6,7 +6,7 @@ import sys
 import tempfile
 import types
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stdout, redirect_stderr
 from unittest.mock import MagicMock, patch
 
 
@@ -20,6 +20,17 @@ from fastllm_pytools.util import make_normal_llm_model, make_normal_parser
 
 
 class SpeculativeDraftCliAliasesTest(unittest.TestCase):
+    def test_mtp_confidence_is_optional_and_validates_probability(self):
+        parser = make_normal_parser("test")
+        self.assertIsNone(parser.parse_args([]).mtp_min_p)
+        for flag in ("--mtp_min_p", "--mtp-min-p"):
+            for value in ("0", "0.5", "1"):
+                self.assertEqual(parser.parse_args([flag, value]).mtp_min_p, float(value))
+            for value in ("-0.1", "1.1", "nan", "inf", "invalid"):
+                with self.subTest(flag=flag, value=value), redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        parser.parse_args([flag, value])
+
     def configure_without_target(self, argv):
         args = make_normal_parser("test").parse_args(argv)
         with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as error:

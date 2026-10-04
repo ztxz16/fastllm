@@ -1002,6 +1002,26 @@ namespace fastllm {
                 8, Qwen4EnvInt("FASTLLM_QWEN4_ENABLE_MTP", 0)));
         }
 
+        float Qwen4MtpMinProbability() {
+            const char *value = std::getenv("FASTLLM_QWEN4_MTP_MIN_P");
+            if (value == nullptr || value[0] == '\0') return 0;
+            char *end = nullptr;
+            const float probability = std::strtof(value, &end);
+            AssertInFastLLM(end != value && *end == '\0' &&
+                std::isfinite(probability) && probability >= 0 && probability <= 1,
+                "FASTLLM_QWEN4_MTP_MIN_P must be in [0, 1].");
+            return probability;
+        }
+
+        float Qwen4TopProbability(Data &logits) {
+            Data probabilities, top;
+            Softmax(logits, probabilities, -1);
+            TopK(probabilities, top, 1);
+            top.ToDevice(DataDevice::CPU);
+            const float probability = reinterpret_cast<const float *>(top.cpuData)[1];
+            return std::isfinite(probability) ? probability : 0;
+        }
+
         const std::string kMtpExpertPrefix = "mtp.layers.0.mlp.experts.";
         const std::string kMtpPackedGateName = kMtpExpertPrefix + "gate_up_proj";
         const std::string kMtpPackedDownName = kMtpExpertPrefix + "down_proj";
@@ -1429,11 +1449,12 @@ namespace fastllm {
         std::vector<int> votes;
         int vocabSize = 0;
         std::vector<std::vector<std::pair<int, float>>> topCandidates;
+        std::vector<std::pair<float, float>> topProbabilities;
         std::vector<const Data *> shardLogits;
         Data gatheredLogits;
         bool TrySampleLogits(int rank, Data &logits,
                 const GenerationConfig &config, int cacheLength, int &token,
-                std::vector<int> *tokens = nullptr);
+                std::vector<int> *tokens = nullptr, float *topProbability = nullptr);
         std::vector<std::unique_ptr<Qwen4ExpModel>> ranks;
         using Cache = std::vector<std::pair<Data, Data>>;
         struct RequestCache {
@@ -1734,6 +1755,7 @@ namespace fastllm {
                 axis = 0;
                 tp.vocabSize = source.dims[0];
                 tp.topCandidates.resize(count);
+                tp.topProbabilities.resize(count);
                 tp.shardLogits.resize(count);
                 for (int r = 0; r < count; ++r) {
                     scheme[devices[r]] = {qwen4_tp::VocabRange(tp.vocabSize, count, r)};
@@ -1908,7 +1930,7 @@ namespace fastllm {
 
     bool Qwen4ExpModel::ThreadTpState::TrySampleLogits(int rank, Data &logits,
             const GenerationConfig &config, int cacheLength, int &token,
-            std::vector<int> *tokens) {
+            std::vector<int> *tokens, float *topProbability) {
 #ifdef USE_CUDA
         if (vocabSize == 0) return false;
         const auto range = qwen4_tp::VocabRange(vocabSize, devices.size(), rank);
@@ -1949,7 +1971,13 @@ namespace fastllm {
             local.resize(rows);
             for (int row = 0; row < rows; ++row)
                 local[row] = {(int)(values[row * 2] + 1e-3f) + range.first, values[row * 2 + 1]};
+            if (topProbability != nullptr) {
+                AssertInFastLLM(rows == 1, "MTP confidence requires one draft row.");
+                topProbabilities[rank] = {values[1], Qwen4TopProbability(logits)};
+            }
             Barrier();
+            if (topProbability != nullptr)
+                *topProbability = qwen4_tp::MergeTopProbability(topProbabilities);
             if (tokens) tokens->resize(rows);
             for (int row = 0; row < rows; ++row) {
                 auto best = topCandidates.front()[row];
@@ -7856,7 +7884,8 @@ namespace fastllm {
             const Data *deviceTokenIds,
             Data *sampledTokenIds,
             Data *sampledTokenValues,
-            int sampledTokenOffset) {
+            int sampledTokenOffset,
+            float *topProbability) {
         // Rejection replay can finish on an earlier pipeline device.
         ApplyDeviceMap(this->deviceMap, this->block_cnt, this->block_cnt);
         const int sequence = (int)inputTokens.size();
@@ -8403,9 +8432,11 @@ namespace fastllm {
         if (state.sampleProposal) return sampledProposalToken;
         int tpToken;
         if (threadTpOwner != nullptr && threadTpOwner->TrySampleLogits(
-                threadTpRank, logits, GenerationConfig(), 0, tpToken)) {
+                threadTpRank, logits, GenerationConfig(), 0, tpToken,
+                nullptr, topProbability)) {
             return tpToken;
         }
+        if (topProbability != nullptr) *topProbability = Qwen4TopProbability(logits);
         TopK(logits, top, 1);
         top.ToDevice(DataDevice::CPU);
         return (int)(reinterpret_cast<float *>(top.cpuData)[0] + 1e-3f);
@@ -11087,6 +11118,10 @@ namespace fastllm {
         }
         MtpRuntimeState &mtp = *requestState->mtpState;
         const int draftCount = Qwen4MtpDraftsPerStep();
+        // Confidence truncation currently applies to greedy proposals only;
+        // sampled proposals retain their complete rejection-sampling state.
+        const float minProbability = generationConfig.IsSimpleGreedy()
+            ? Qwen4MtpMinProbability() : 0;
 
         auto dataToInts = [](const Data &source) {
             Data cpu;
@@ -11150,7 +11185,7 @@ namespace fastllm {
                  !this->mtpMoeWeights.empty() &&
                  !FastllmCudaUseMoeHybrid(this->mtpMoeWeights.data(), this->mtpMoeWeights.size()));
 #endif
-            if (chainBackend && draftCount > 0 &&
+            if (minProbability == 0 && chainBackend && draftCount > 0 &&
                 targetHidden.dataDevice == DataDevice::CUDA &&
                 targetHidden.cudaData != nullptr &&
                 tokenEmbedding.dataDevice == DataDevice::CUDA &&
@@ -11168,11 +11203,20 @@ namespace fastllm {
             }
             deviceChain = ThreadTpAllTrue(deviceChain);
 #endif
+            float probability = 0;
             const int first = RunMtpDraft(
                 mtp, targetHidden, tokens, positions,
                 &hiddenStates[currentHidden], true, nullptr,
                 deviceChain ? &sampledTokenIds : nullptr,
-                deviceChain ? &sampledTokenValues : nullptr, 0);
+                deviceChain ? &sampledTokenValues : nullptr, 0,
+                minProbability > 0 ? &probability : nullptr);
+            if (minProbability > 0 && !ThreadTpAllTrue(probability >= minProbability)) {
+                // The first draft has consumed only committed input. Keep its
+                // state, but the next ordinary target step invalidates the old
+                // verifier checkpoint even though no draft was admitted.
+                mtp.targetCheckpointPrepared = false;
+                return;
+            }
             if (draftCount <= 1) {
                 if (first >= 0) {
                     mtp.proposals.push_back(first);
@@ -11212,7 +11256,9 @@ namespace fastllm {
                     const int token = RunMtpDraft(
                         mtp, hiddenStates[currentHidden],
                         {previous}, {nextPosition},
-                        &hiddenStates[nextHidden], true);
+                        &hiddenStates[nextHidden], true, nullptr, nullptr, nullptr, 0,
+                        minProbability > 0 ? &probability : nullptr);
+                    if (minProbability > 0 && !ThreadTpAllTrue(probability >= minProbability)) break;
                     mtp.proposals.push_back(token);
                     currentHidden = nextHidden;
                     previous = token;
