@@ -649,10 +649,10 @@ def get_moe_cuda_cache_stats(device: int = 0, reset: bool = False):
     return result
 
 def get_moe_cuda_cache_route_stats(device: int = 0):
-    """Read cumulative single-token hybrid decode counters between requests.
+    """Read cumulative single-GPU hybrid decode/verifier counters between requests.
 
     Residency is measured across all routed experts before CPU/GPU dispatch,
-    excluding prefetch lookups. Prefill, batched verify and pure-GPU mode are
+    excluding prefetch lookups. Prefill, multi-GPU EP and pure-GPU mode are
     not counted. Host inference must be idle; this also synchronizes the GPU.
     Subtract snapshots for per-request counts; cache and scheduler are retained.
     """

@@ -130,6 +130,17 @@ static void TestDecodeOverlap() {
     pipeline.stagedExpert.Observe(40);
     Require(pipeline.SelectMisses(6, 0) == 4,
             "expert DMA and compute were treated as whole-batch serialization");
+    const int reused[] = {4, 3, 1};
+    Require(pipeline.SelectMisses(3, 0, reused) == 2,
+            "verify split did not charge one copy and multiple computations per expert");
+    fastllm::MoeDecodeOverlapScheduler transferBound;
+    transferBound.cpuExpert.Observe(100);
+    transferBound.copiedExpert.Observe(250);
+    transferBound.stagedExpert.Observe(10);
+    const int fourRows[] = {4, 4};
+    Require(transferBound.SelectMisses(2, 0) == 0 &&
+            transferBound.SelectMisses(2, 0, fourRows) == 1,
+            "verifier reuse did not amortize expert transfer cost");
     fastllm::MoeDecodeOverlapScheduler computeBound;
     computeBound.cpuExpert.Observe(50);
     computeBound.copiedExpert.Observe(20);

@@ -709,7 +709,7 @@ static void CpuExpertReference(const float *input, float *output,
 
 static void RunHybrid(ggml_type format, int rows, bool single = false, bool frequency = false,
                       fastllm::DataType inputType = fastllm::FLOAT32, bool noCache = false,
-                      bool large = false) {
+                      bool large = false, bool verifyDynamic = false) {
     using namespace fastllm;
     constexpr int experts = 24, topk = 7;
     int hidden = 256;
@@ -803,11 +803,45 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
         }
         for (int r = 0; r < rows * topk; ++r) {
             const int k = r % topk;
-            route[r] = (k == 6 ? 1 : k) + (step >= 10 ? 12 : 0);
+            route[r] = (k == 6 ? 1 : (k + (verifyDynamic ? r / topk : 0)) % 6) + (step >= 10 ? 12 : 0);
             score[r] = k == 3 ? 0 : k == 5 ? -.125f : float(k + 1) / 32;
         }
         NumasMoeDecodeExpertsBatch(x.data(), cpu.data(), rows, table.data(), table.size(),
             route.data(), mask.data(), score.data(), topk, layer);
+        if (rows > 1 && verifyDynamic) {
+            std::vector<float> overlapped(cpu.size(), 0);
+            int submitted = 0;
+            NumasMoeDecodeExpertsBatchWithOverlap(x.data(), overlapped.data(), rows,
+                table.data(), table.size(), route.data(), mask.data(), score.data(),
+                topk, layer, [&] { ++submitted; });
+            Require(submitted == 1 && overlapped == cpu,
+                    "batch overlap changed CPU arithmetic or callback count");
+            if (step == 0) {
+                bool caught = false;
+                try {
+                    NumasMoeDecodeExpertsBatchWithOverlap(x.data(), overlapped.data(), rows,
+                        table.data(), table.size(), route.data(), mask.data(), score.data(),
+                        topk, layer, [] { throw std::runtime_error("batch callback failure"); });
+                } catch (const std::runtime_error &) { caught = true; }
+                Require(caught, "batch overlap swallowed callback exception");
+                std::vector<int32_t> gpuMask(rows * topk, 0);
+                std::fill(overlapped.begin(), overlapped.end(), 123.f);
+                submitted = 0;
+                NumasMoeDecodeExpertsBatchWithOverlap(x.data(), overlapped.data(), rows,
+                    table.data(), table.size(), route.data(), gpuMask.data(), score.data(),
+                    topk, layer, [&] { ++submitted; });
+                Require(submitted == 1 && std::all_of(overlapped.begin(), overlapped.end(),
+                    [](float x) { return x == 123.f; }), "GPU-only batch touched CPU output");
+                // The first row may be entirely cached; overlap a later CPU row.
+                std::fill(gpuMask.begin() + topk, gpuMask.end(), -1);
+                submitted = 0;
+                NumasMoeDecodeExpertsBatchWithOverlap(x.data(), overlapped.data(), rows,
+                    table.data(), table.size(), route.data(), gpuMask.data(), score.data(),
+                    topk, layer, [&] { ++submitted; });
+                Require(submitted == 1 && std::equal(overlapped.begin() + topk * hidden,
+                    overlapped.end(), cpu.begin() + topk * hidden), "later CPU row overlap differs");
+            }
+        }
         if (rows == 1) {
             std::vector<float> overlapped(cpu.size(), 0);
             int submitted = 0;
@@ -862,7 +896,7 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
                 lower[c] += std::min(a,b); upper[c] += std::max(a,b);
             }
         }
-        if (frequency && !noCache) {
+        if ((frequency || verifyDynamic) && !noCache) {
             // Model a prefill changing the real cache between decode requests.
             // Fill with other experts, forcing the partial partition to miss.
             std::vector<int32_t> cold;
@@ -878,6 +912,16 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
                 Require(FastllmCudaMergeMOECache(firstRow,gpuGate,gpuOutput,table.data(),table.size(),
                     static_cast<int32_t *>(ids.cudaData),static_cast<float *>(scores.cudaData),topk),
                     "frequency prefill refill failed");
+            }
+            if (verifyDynamic) {
+                std::vector<int32_t> resident(topk, route[0]);
+                Cuda(cudaMemcpy(ids.cudaData, resident.data(), topk * 4, cudaMemcpyHostToDevice));
+                Data firstRow;
+                firstRow.FakeFrom(input[0], 0); firstRow.Resize({1, hidden});
+                firstRow.dataDeviceIds = input[0].dataDeviceIds;
+                Require(FastllmCudaMergeMOECache(firstRow, gpuGate, gpuOutput, table.data(), table.size(),
+                    static_cast<int32_t *>(ids.cudaData), static_cast<float *>(scores.cudaData), topk),
+                    "verify mixed-residency setup failed");
             }
             Cuda(cudaMemcpy(ids.cudaData,route.data(),route.size()*4,cudaMemcpyHostToDevice));
         }
@@ -975,6 +1019,23 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
         std::printf("FREQUENCY gpu=%llu cpu=%llu\n",
             (unsigned long long)frequencyHits, (unsigned long long)frequencyMisses);
     }
+    if (verifyDynamic) {
+        uint64_t routes[8]{};
+        Require(fastllm_moe_cuda_cache_route_stats(0, routes), "verify route counters unavailable");
+        Require(routes[4] > routes[6] && routes[5] > 0 && (noCache || routes[6] > 0),
+                "verify did not exercise resident GPU, staged GPU misses and NUMA");
+        Require(routes[4] + routes[5] == routes[1] && routes[2] + routes[3] == routes[1],
+                "verify staging lost or duplicated routes");
+        if (noCache) {
+            uint64_t after[5]{};
+            Require(fastllm_moe_cuda_cache_stats(0, after, false) &&
+                after[2] == oracleStats[2] && after[3] == oracleStats[3] && routes[6] == 0,
+                "verify staging unexpectedly allocated resident cache");
+        }
+        std::printf("VERIFY rows=%d resident=%llu staged=%llu cpu=%llu\n", rows,
+            (unsigned long long)routes[6], (unsigned long long)(routes[4] - routes[6]),
+            (unsigned long long)routes[5]);
+    }
     if (!single) {
         const auto stats = FastllmCudaGetMoeExpertParallelStats(*context);
         Require(stats.cpuRoutes && stats.gpuRoutes[0] && stats.gpuRoutes[1] && stats.multiGpuSteps,
@@ -1009,6 +1070,14 @@ int main(int argc, char **argv) {
             fastllm::SetThreads(4);
             RunHybrid(GGML_TYPE_IQ3_S, 1, true, true, fastllm::FLOAT32, true);
             std::puts("PASS: zero resident slots/bytes, dynamic GPU/NUMA split and numerical references"); return 0;
+        }
+        if (argc > 1 && std::strcmp(argv[1], "--verify-dynamic") == 0) {
+            fastllm::SetThreads(4);
+            for (int rows : {4, FASTLLM_CUDA_MOE_CACHE_MAX_BATCH}) {
+                RunHybrid(GGML_TYPE_IQ3_S, rows, true, false, fastllm::FLOAT32, false, false, true);
+                RunHybrid(GGML_TYPE_IQ3_S, rows, true, false, fastllm::FLOAT32, true, true, true);
+            }
+            std::puts("PASS: dynamic verify cached/staged/NUMA experts and numerical references"); return 0;
         }
         if (argc > 1 && std::strcmp(argv[1], "--pipeline") == 0) {
             fastllm::SetThreads(4);

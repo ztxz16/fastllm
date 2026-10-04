@@ -2119,7 +2119,9 @@ struct FastllmCudaMoeExpertParallel {
         DeviceCache *cache = nullptr;
         std::vector<unsigned> heat;
         fastllm::MoeDecodeScheduler::Estimate refill;
-        uint64_t calls = 0, gpuRoutes = 0, admissions = 0;
+        uint64_t calls = 0, gpuRoutes = 0, admissions = 0, residentRoutes = 0;
+        std::unique_ptr<DecodeOverlapWorkspace> overlap;
+        int overlapAttempted = 0;
 
         float *CpuOutput() { return host + maxRows * hidden; }
         float *GpuOutput() { return device + size_t(maxRoutes) * hidden; }
@@ -2135,6 +2137,7 @@ struct FastllmCudaMoeExpertParallel {
             cudaGetDevice(&previous);
             if (cudaDevice >= 0) cudaSetDevice(cudaDevice);
             if (pending) cudaEventSynchronize(done);
+            overlap.reset();
             ids.FreeSpace(); selected.FreeSpace(); scores.FreeSpace();
             owners.FreeSpace(); lookup.FreeSpace(); gate.FreeSpace(); inputFloat.FreeSpace();
             cudaFreeHost(host); cudaFreeHost(routes); cudaFree(device);
@@ -2147,6 +2150,7 @@ struct FastllmCudaMoeExpertParallel {
         bool Prepare(int width) {
             if (pending) {
                 checkCudaErrors("EP completion", cudaEventSynchronize(done));
+                if (overlap) overlap->Observe();
                 if (admitted) {
                     float ms = 0;
                     checkCudaErrors("EP refill timing", cudaEventElapsedTime(&ms, copyStart, copyEnd));
@@ -2375,6 +2379,57 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
     } else {
         std::fill_n(work.Selected(), routes, -1);
     }
+    // Ordinary GGUF verification shares immutable, pinned expert records with
+    // streamed prefill. Keep admission separate from temporary GPU execution.
+    // One decision per unique expert gives every row the same CPU/GPU owner.
+    DecodeOverlapWorkspace *overlap = nullptr;
+    const int capacity = std::min(routes, layout.experts);
+    if (count == 1 && rows > 1 && work.cache &&
+        layout.weightType == DATA_GGUF_FORMAT && work.group->sharedLayout.shards == 0) {
+        if (work.overlapAttempted < capacity) {
+            work.overlapAttempted = capacity;
+            size_t stride = 0;
+            for (const auto &l : work.group->layerLayouts)
+                stride = std::max(stride, l.recordStride);
+            auto next = std::make_unique<DecodeOverlapWorkspace>();
+            if (next->Init(stride, work.group->tableKeys.size() *
+                    FastllmCudaMoeExpertParallel::maxRows, capacity)) {
+                if (work.overlap) next->layers = std::move(work.overlap->layers);
+                work.overlap = std::move(next);
+            } else (void)cudaGetLastError(); // Retain resident GPU + CPU fallback.
+        }
+        if (work.overlap && int(work.overlap->expertReady.size()) >= capacity)
+            overlap = work.overlap.get();
+    }
+    const int timingLayer = (rows - 1) * work.group->tableKeys.size() + work.table;
+    const int hits = std::count_if(work.Selected(), work.Selected() + routes,
+        [](int expert) { return expert >= 0; });
+    std::vector<int> missedExperts, reuse;
+    std::array<int, maxRoutes> stagedSlot;
+    stagedSlot.fill(-1);
+    int staged = 0, stagedRoutes = 0;
+    if (overlap) {
+        for (int r = 0; r < routes; ++r) {
+            if (work.Selected()[r] >= 0) continue;
+            const int expert = work.Indices()[r];
+            auto found = std::find(missedExperts.begin(), missedExperts.end(), expert);
+            if (found == missedExperts.end()) { missedExperts.push_back(expert); reuse.push_back(1); }
+            else ++reuse[found - missedExperts.begin()];
+        }
+        // Spend PCIe bytes first on experts reused by the most verifier rows.
+        for (int i = 0; i < int(reuse.size()); ++i)
+            for (int j = i + 1; j < int(reuse.size()); ++j)
+                if (reuse[j] > reuse[i]) {
+                    std::swap(reuse[i], reuse[j]);
+                    std::swap(missedExperts[i], missedExperts[j]);
+                }
+        staged = overlap->layers[timingLayer].SelectMisses(reuse.size(), hits, reuse.data());
+        for (int i = 0; i < staged; ++i) {
+            overlap->hostSlots[i] = i;
+            for (int r = 0; r < routes; ++r)
+                if (work.Indices()[r] == missedExperts[i]) { stagedSlot[r] = i; ++stagedRoutes; }
+        }
+    }
     // Submit the independent shared branch before either rank starts CPU
     // expert jobs. Callbacks may lazily prepare CPU-side state, so do not run
     // arbitrary callbacks while the shared NUMA worker pool is active.
@@ -2390,19 +2445,24 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
     }
     for (int r = 0; r < routes; ++r) {
         const int owner = work.Indices()[r] % count;
-        work.Owners()[r] = state.ranks[owner]->Selected()[r] >= 0 ? owner : -1;
+        work.Owners()[r] = state.ranks[owner]->Selected()[r] >= 0 || stagedSlot[r] >= 0 ? owner : -1;
         cpuCount += work.Owners()[r] < 0;
     }
-    const int gpuCount = std::count_if(work.Selected(), work.Selected() + routes,
-        [](int expert) { return expert >= 0; });
+    const int gpuCount = hits + stagedRoutes;
     auto submitGpu = [&] {
+        const double dispatchStart = HybridNowUs();
+        if (staged) {
+            overlap->CopyExperts(work.group->hostRecords + work.group->layerHostOffsets[work.table],
+                layout.recordStride, missedExperts.data(), staged, staged);
+        }
         allocate(output, FLOAT32, {rows, hidden});
         checkCudaErrors("EP selected upload", cudaMemcpyAsync(work.selected.cudaData, work.Selected(),
             routes * sizeof(int32_t), cudaMemcpyHostToDevice, cudaStreamPerThread));
         checkCudaErrors("EP owner upload", cudaMemcpyAsync(work.owners.cudaData, work.Owners(),
             routes * sizeof(int32_t), cudaMemcpyHostToDevice, cudaStreamPerThread));
-        if (gpuCount) {
-            allocate(work.gate, FLOAT32, {topk, layout.inter});
+        if (gpuCount) allocate(work.gate, FLOAT32, {topk, layout.inter});
+        if (hits) {
+            if (overlap) checkCudaErrors("Verify resident start", cudaEventRecord(overlap->residentStart, cudaStreamPerThread));
             // Snapshot residency for the entire verifier before any admission.
             // Repeated experts consequently keep one owner across all rows and
             // CPU rows can share weight reads in the grouped NUMA path.
@@ -2421,7 +2481,10 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
                     work.GpuOutput() + size_t(row) * topk * hidden), "EP expert compute failed.\n");
             }
         }
-        work.admitted = candidate >= 0 && cpuCount > 0;
+        if (hits && overlap)
+            checkCudaErrors("Verify resident done", cudaEventRecord(overlap->residentDone, cudaStreamPerThread));
+        // Staging a miss does not change whether it was eligible for admission.
+        work.admitted = candidate >= 0 && work.cache->slots > 0 && cpuCount + stagedRoutes > 0;
         if (work.admitted) {
             checkCudaErrors("EP refill start", cudaEventRecord(work.copyStart, cudaStreamPerThread));
             BuildHybridPrefetchRoutes<<<1, 32, 0, cudaStreamPerThread>>>(
@@ -2434,13 +2497,44 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
             checkCudaErrors("EP refill end", cudaEventRecord(work.copyEnd, cudaStreamPerThread));
             ++work.admissions;
         }
+        if (staged) {
+            FastllmCudaMoeGGUFCacheView temporary{
+                overlap->records, nullptr, layout.recordStride, layout.downOffset,
+                layout.gateGgmlType, layout.downGgmlType, layout.hidden, layout.inter,
+                work.cache->ggufWorkspace, work.cache->ggufWorkspaceBytes};
+            int previousRow = -1;
+            for (int i = 0; i < staged; ++i) {
+                checkCudaErrors("Verify wait expert", cudaStreamWaitEvent(cudaStreamPerThread, overlap->expertReady[i], 0));
+                checkCudaErrors("Verify staged start", cudaEventRecord(overlap->stagedStart[i], cudaStreamPerThread));
+                temporary.routeSlots = overlap->slots + i;
+                for (int r = 0; r < routes; ++r) {
+                    if (stagedSlot[r] != i) continue;
+                    const int row = r / topk;
+                    Data inputRow, outputRow;
+                    inputRow.FakeFrom(*expertInput, size_t(row) * hidden * sizeof(float));
+                    inputRow.Resize({1, hidden}); inputRow.dataDeviceIds = expertInput->dataDeviceIds;
+                    outputRow.FakeFrom(output, size_t(row) * hidden * sizeof(float));
+                    outputRow.Resize({1, hidden}); outputRow.dataDeviceIds = output.dataDeviceIds;
+                    // Q8 scratch is shared by rows. Reuse only for consecutive
+                    // routes of the same row, never across different inputs.
+                    temporary.q8InputPrepared = previousRow == row;
+                    AssertInFastLLM(ComputeGGUFExperts(
+                        inputRow, work.gate, outputRow, layout, temporary,
+                        static_cast<float *>(work.scores.cudaData) + r, 1,
+                        work.GpuOutput() + size_t(r) * hidden), "Verify staged expert compute failed.\n");
+                    previousRow = row;
+                }
+                checkCudaErrors("Verify staged done", cudaEventRecord(overlap->stagedDone[i], cudaStreamPerThread));
+            }
+            overlap->layers[timingLayer].dispatch.Observe(HybridNowUs() - dispatchStart);
+        }
     };
-    const bool overlapCpu = rank == 0 && rows == 1 && cpuCount > 0;
+    const bool overlapCpu = rank == 0 && cpuCount > 0 && (rows == 1 || overlap);
     double cpuStart = 0;
     if (overlapCpu) {
         cpuStart = HybridNowUs();
-        NumasMoeDecodeExpertsWithOverlap(root.host, root.CpuOutput(), weights,
-            root.Indices(), root.Owners(), topk, layer, submitGpu);
+        NumasMoeDecodeExpertsBatchWithOverlap(root.host, root.CpuOutput(), rows, weights, weightsBatch,
+            root.Indices(), root.Owners(), root.Scores(), topk, layer, submitGpu);
     } else {
         submitGpu();
     }
@@ -2450,7 +2544,9 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
             if (!overlapCpu)
                 NumasMoeDecodeExpertsBatch(root.host, root.CpuOutput(), rows, weights, weightsBatch,
                     root.Indices(), root.Owners(), root.Scores(), topk, layer);
-            state.cpuTime.Observe(HybridNowUs() - (overlapCpu ? cpuStart : start));
+            const double cpuUs = HybridNowUs() - (overlapCpu ? cpuStart : start);
+            state.cpuTime.Observe(cpuUs);
+            if (overlap) overlap->layers[timingLayer].cpuExpert.Observe(cpuUs / cpuCount);
             checkCudaErrors("EP CPU output", cudaMemcpyAsync(work.device, root.CpuOutput(),
                 size_t(routes) * hidden * sizeof(float), cudaMemcpyHostToDevice, cudaStreamPerThread));
         }
@@ -2466,6 +2562,14 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
     checkCudaErrors("EP done", cudaEventRecord(work.done, cudaStreamPerThread));
     work.pending = true;
     work.gpuRoutes += gpuCount;
+    work.residentRoutes += hits;
+    if (overlap) {
+        overlap->previousLayer = timingLayer;
+        overlap->previousHits = hits;
+        overlap->previousMisses = staged;
+        overlap->previousStagedRoutes = stagedRoutes;
+        ++overlap->layers[timingLayer].calls;
+    }
     ++work.calls;
     // Each rank has its own copy of the authoritative routes. GPU decisions
     // are overwritten only after the next call's first rendezvous, so peers
@@ -2841,9 +2945,9 @@ bool FastllmCudaMergeMOEHybrid(const fastllm::Data &input,
         if (!group || group->layout.deepSeekV41 || group->layout.glm5) return false;
         auto *cache = GetDeviceCache(*group);
         if (!cache) return false;
-        // Use the same resident-only GPU routing and grouped NUMA fallback
-        // as TP verification. Demand-refilling every row serializes cold
-        // weight copies on the verifier's critical path on a single GPU.
+        // Keep resident experts on GPU and dynamically split GGUF misses
+        // between NUMA and streamed GPU execution, deduplicating weight DMA
+        // across verifier rows. Other layouts retain the resident/NUMA path.
         if (!cache->batchHybrid)
             cache->batchHybrid = std::make_shared<FastllmCudaMoeExpertParallel>(1);
         return FastllmCudaMergeMOEExpertParallel(*cache->batchHybrid, 0,
@@ -3344,8 +3448,21 @@ extern "C" bool fastllm_moe_cuda_cache_route_stats(int device, uint64_t *values)
     for (const auto &group : Groups()) {
         std::lock_guard<std::mutex> lock(group->mutex);
         auto it = group->deviceCaches.find(device);
-        if (it == group->deviceCaches.end() || !it->second || !it->second->ready ||
-            !it->second->hybrid) continue;
+        if (it == group->deviceCaches.end() || !it->second || !it->second->ready) continue;
+        if (it->second->batchHybrid) {
+            const auto &batch = *it->second->batchHybrid;
+            const auto &rank = *batch.ranks[0];
+            const uint64_t routes = batch.cpuRoutes + rank.gpuRoutes;
+            values[0] += batch.steps;
+            values[1] += routes;
+            values[2] += rank.residentRoutes;
+            values[3] += routes - rank.residentRoutes;
+            values[4] += rank.gpuRoutes;
+            values[5] += batch.cpuRoutes;
+            values[6] += rank.residentRoutes;
+            values[7] += rank.admissions;
+        }
+        if (!it->second->hybrid) continue;
         const auto &work = *it->second->hybrid;
         const uint64_t routes = work.cpuRoutes + work.gpuRoutes;
         values[0] += work.scheduler.calls;

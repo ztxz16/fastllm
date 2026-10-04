@@ -62,7 +62,9 @@ public:
     Estimate cpuExpert, residentExpert, copiedExpert, stagedExpert, dispatch;
     uint64_t calls = 0;
 
-    int SelectMisses(int misses, int hits) const {
+    // routeCounts describes reuse of each unique missed expert in a verifier.
+    // Copies are charged once per expert; CPU/GPU arithmetic once per route.
+    int SelectMisses(int misses, int hits, const int *routeCounts = nullptr) const {
         if (misses <= 0) return 0;
         // Measure useful work during warmup instead of running extra experts.
         // A single miss needs two calls to observe both CPU and transfer costs.
@@ -70,14 +72,18 @@ public:
         if (!copiedExpert.initialized || !stagedExpert.initialized)
             return std::max(1, misses / 2);
         const double resident = hits * residentExpert.us;
-        double best = std::max(misses * cpuExpert.us, resident);
+        int remaining = 0;
+        for (int i = 0; i < misses; ++i) remaining += routeCounts ? routeCounts[i] : 1;
+        double best = std::max(remaining * cpuExpert.us, resident);
         int selected = 0;
         double gpu = resident;
         for (int n = 1; n <= misses; ++n) {
             // Each expert can run as soon as its own DMA and the preceding
             // GPU work finish, overlapping transfers of subsequent experts.
-            gpu = std::max(gpu, n * copiedExpert.us) + stagedExpert.us;
-            const double cost = dispatch.us + std::max((misses - n) * cpuExpert.us, gpu);
+            const int routes = routeCounts ? routeCounts[n - 1] : 1;
+            remaining -= routes;
+            gpu = std::max(gpu, n * copiedExpert.us) + routes * stagedExpert.us;
+            const double cost = dispatch.us + std::max(remaining * cpuExpert.us, gpu);
             if (cost < best * .97) { best = cost; selected = n; }
         }
         // Refresh an unused path occasionally, so a change in CPU/PCIe speed

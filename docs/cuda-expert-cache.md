@@ -102,7 +102,7 @@ with on-demand refills remains available through the cache operator without
 NUMA registration. Decode and verification batches of up to nine rows use
 the cache; larger prefill batches retain the configured CPU/NUMA backend.
 
-## GGUF dynamic decode
+## GGUF dynamic decode and verification
 
 Ordinary GGUF experts registered with NUMA can overlap resident GPU work,
 PCIe copies of uncached experts, and CPU work. The scheduler uses per-layer
@@ -112,8 +112,18 @@ work. No fixed-split environment variable is needed. A staged expert executes
 as soon as its own transfer and preceding GPU work finish. Staging uses
 separate temporary records and does not admit or evict cache entries.
 
+Single-GPU FP32 verification accepts two to nine rows. It groups misses by
+expert identity, gives all routes of one expert the same CPU/GPU owner, and
+copies each staged expert once even when several tokens select it. Experts
+with more reused routes are considered first. Transfer cost is charged per
+unique expert; compute cost per route. Estimates are kept separately for each
+layer and verifier row count. CPU expert arithmetic and cache admission retain
+their existing paths. Shared NUMA record layouts and multi-GPU verification
+keep their previous resident-GPU/CPU routing.
+
 Single-row decode reuses the Q8 input prepared by resident GPU experts when
-computing staged experts. Qwen's independent shared expert is submitted
+computing staged experts. Verifier rows only reuse that scratch for consecutive
+routes of the same input row. Qwen's independent shared expert is submitted
 while the single-row NUMA jobs and expert transfers are active.
 
 A zero per-device budget also supports this streamed path for ordinary GGUF
@@ -130,8 +140,9 @@ ftllm server /path/to/model --device cuda --moe_device numa --moe_cuda_cache 2g
 Check `llm.get_moe_cuda_cache_stats(0)` for actual `payload_bytes` and `slots`.
 For the execution split, subtract snapshots from
 `llm.get_moe_cuda_cache_route_stats(0)` taken between requests. Those counters
-include single-token hybrid decode, including CPU routes; they exclude
-prefill, multi-token verification, multi-GPU expert parallelism and pure-GPU mode. Reading them synchronizes the device. A temporary GPU expert
+include single-GPU hybrid decode and ordinary GGUF batched verification,
+including CPU routes; they exclude prefill, multi-GPU expert parallelism and
+pure-GPU mode. Reading them synchronizes the device. A temporary GPU expert
 counts as GPU execution, but not as a resident cache hit.
 
 ## GPU-resident GGUF experts

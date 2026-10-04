@@ -88,6 +88,13 @@ namespace fastllm {
         Data **weights, int weightsBatch, const int32_t *indices,
         const int32_t *gpuIndices, const float *scores, int topk, int layer);
 
+    // Same arithmetic and callback contract as the single-row overlap API.
+    // GGUF submits GPU work while the first CPU row's workers are active.
+    void NumasMoeDecodeExpertsBatchWithOverlap(const float *input, float *output, int rows,
+        Data **weights, int weightsBatch, const int32_t *indices,
+        const int32_t *gpuIndices, const float *scores, int topk, int layer,
+        const std::function<void()> &submitGpu);
+
     // V4.1 verifier: keep all rows for a CPU expert in one grouped GEMM.
     // perRoute returns BF16-rounded FP32 expert outputs at [row, route, hidden];
     // otherwise all routes must be on CPU and output is the usual BF16 sum.
