@@ -233,16 +233,19 @@ void CooperativeTopK(const Score *scores, int count, int blocks, fastllm::Data &
     CheckLaunch();
 }
 
-// The output allocation holds all sorted positions; only its first topK
-// entries are exposed to attention. This avoids a separate gather/copy kernel.
+// Owning outputs hold all sorted positions and expose only the first topK.
+// A borrowed row can hold only topK indices: sort into separate storage when
+// count exceeds that view, then copy its selected prefix without overrunning it.
 void SortTopKPairs(const unsigned *input, const int *positions, int count,
                    int topK, fastllm::Data &indices) {
     using namespace fastllm;
-    Data sorted, workspace;
+    Data sorted, workspace, sortedPositions;
+    const bool copyPrefix = indices.isFake && count > topK;
+    Data &positionsOutput = copyPrefix ? sortedPositions : indices;
     Output(sorted, INT32, {count});
-    Output(indices, INT32, {1, std::max(count, topK)});
+    Output(positionsOutput, INT32, {1, std::max(count, topK)});
     auto *output = (unsigned *)sorted.cudaData;
-    auto *outputPositions = (int *)indices.cudaData;
+    auto *outputPositions = (int *)positionsOutput.cudaData;
     size_t bytes = 0;
     // Stable sorting resolves equal score bits by ascending input position.
     auto status = cub::DeviceRadixSort::SortPairsDescending(nullptr, bytes,
@@ -253,8 +256,9 @@ void SortTopKPairs(const unsigned *input, const int *positions, int count,
     status = cub::DeviceRadixSort::SortPairsDescending(workspace.cudaData, bytes,
         input, output, positions, outputPositions, count, 0, 32, cudaStreamPerThread);
     AssertInFastLLM(status == cudaSuccess, "Naive-N0.5 GPU TopK failed.");
-    if (count < topK)
-        DecodeTopKPairs<<<(topK + 255) / 256, 256>>>(outputPositions, outputPositions, count, topK);
+    if (copyPrefix || count < topK)
+        DecodeTopKPairs<<<(topK + 255) / 256, 256>>>(
+            outputPositions, (int *)indices.cudaData, count, topK);
     indices.Resize({1, topK});
 }
 

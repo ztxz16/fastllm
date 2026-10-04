@@ -276,6 +276,38 @@ static void TestVerifyGraph(int window, int capacity, const std::vector<int> &pr
         }
     }
 }
+// The CUB fallback sorts more than topK positions, but a verification row
+// borrows only topK entries. Detect writes beyond the final row independently
+// of allocator padding or whichever tensor happens to follow the output.
+static void TestVerifyIndexerView(int rows, int past, bool fp8) {
+    const int topK = 2048, keys = past + rows, canary = 4096;
+    Data q(BFLOAT16), w(BFLOAT16), k(BFLOAT16), storage(INT32), indices(INT32);
+    Upload(q, {1, rows, 2048}, 71);
+    Upload(w, {1, rows, 16}, 72);
+    Upload(k, {1, keys, 320}, 73);
+    storage.Resize({rows * topK + canary});
+    storage.Allocate();
+    std::fill((int *)storage.cpuData, (int *)storage.cpuData + storage.Count(0), 0x12345678);
+    storage.ToDevice(DataDevice::CUDA, {0}, true);
+    indices.Resize({rows, topK});
+    indices.FakeFrom(storage, 0);
+    FastllmCudaNaiveVerifyIndexer(q, w, k, 16, 128, past, topK, fp8, indices);
+    auto got = Read<int>(storage);
+    Require(std::all_of(got.begin() + rows * topK, got.end(),
+                       [](int x) { return x == 0x12345678; }), "borrowed TopK output overrun");
+    for (int row = 0; row < rows; ++row) {
+        Data qr(BFLOAT16, {1, 1, 2048}), wr(BFLOAT16, {1, 1, 16});
+        Data kr(BFLOAT16, {1, past + row + 1, 320}), ref;
+        qr.FakeFrom(q, row * 2048 * 2);
+        wr.FakeFrom(w, row * 16 * 2);
+        kr.FakeFrom(k, 0);
+        FastllmCudaNaiveIndexer(qr, wr, kr, 16, 128, past + row, topK, fp8, ref);
+        auto values = Read<int>(ref);
+        Require(std::equal(values.begin(), values.end(), got.begin() + row * topK),
+                "borrowed TopK indices differ");
+        ++checks;
+    }
+}
 static void TestDraftAttention(int dim, int rows, int window, bool shortAttention) {
     const int heads = 8, kvHeads = 2, storage = window + rows;
     Data q(BFLOAT16), key(BFLOAT16), value(BFLOAT16), nk(BFLOAT16), nv(BFLOAT16);
@@ -352,6 +384,9 @@ int main() {
             TestVerifyGraph(w, 256, {3, 120, 127, 128, 32768, 7}, true);
         for (bool fp8 : {false, true})
             TestVerifyGraph(0, 131072, {2048, 4095, 32768, 131064, 2049}, fp8);
+        for (int rows : {1, 7, 8})
+            for (int past : {2048, 4090, 8183})
+                for (bool fp8 : {false, true}) TestVerifyIndexerView(rows, past, fp8);
         for (int dim : {32, 128, 256}) for (int rows : {2, 7, 8})
             for (bool shortAttention : {false, true})
                 TestDraftAttention(dim, rows, 1024, shortAttention);
