@@ -379,7 +379,7 @@ static bool LaunchNvfp4E4M3MarlinMoe(
         const int32_t *numTokensPadded, const float *topkWeights,
         int topk, bool multiplyTopkWeights, int rows, int outputColumns,
         int inputColumns, int *workspace, cudaStream_t stream, int sms,
-        bool bf16, bool narrowPrefill) {
+        bool bf16, bool narrowPrefill, bool singleToken) {
     int threads = 0;
     MarlinMoeKernelFn kernel = GetNvfp4E4M3MarlinMoeKernel(
         gate, smallBatch, threads, bf16, narrowPrefill);
@@ -394,7 +394,19 @@ static bool LaunchNvfp4E4M3MarlinMoe(
     }
 
     const int blocksPerSm = narrowPrefill ? 2 : (gate ? 1 : 2);
-    kernel<<<sms * blocksPerSm, threads,
+    int blocks = sms * blocksPerSm;
+    if (bf16 && smallBatch && singleToken) {
+        // Each route owns one padded 8-row block; the selected kernel has
+        // 128-column tiles. Give each tile its full K range when there are
+        // enough tiles to fill the device, avoiding cross-CTA FP32 reduction.
+        // Keep split-K for smaller grids and respect the workspace capacity.
+        const int64_t tiles =
+            (int64_t)(outputColumns / 128) * (gate ? topk : rows);
+        if (tiles >= sms && tiles <= (int64_t)sms * 4) {
+            blocks = (int)tiles;
+        }
+    }
+    kernel<<<blocks, threads,
              GetNvfp4E4M3MarlinMoeSharedMemorySize(
                  gate, smallBatch, bf16, narrowPrefill),
              stream>>>(
@@ -3534,7 +3546,8 @@ static bool RunNvfp4E4M3MarlinMoe(
             routeStorage->sortedTokenIds, routeStorage->gateExpertIds,
             routeStorage->numTokensPadded, scores, topk, false,
             batch, cache->intermediate * 2, cache->hidden,
-            cache->workspace, stream, cache->sms, bf16, narrowPrefill)) {
+            cache->workspace, stream, cache->sms,
+            bf16, narrowPrefill, batch == 1)) {
         FailNvfp4E4M3MarlinAfterRepack(
             "gate/up Marlin launch", cache.get());
     }
@@ -3560,7 +3573,8 @@ static bool RunNvfp4E4M3MarlinMoe(
             routeStorage->sortedTokenIds, routeStorage->downExpertIds,
             routeStorage->numTokensPadded, scores, 1, !bf16,
             routes, cache->hidden, cache->intermediate,
-            cache->workspace, stream, cache->sms, bf16, narrowPrefill)) {
+            cache->workspace, stream, cache->sms,
+            bf16, narrowPrefill, batch == 1)) {
         FailNvfp4E4M3MarlinAfterRepack(
             "down Marlin launch", cache.get());
     }

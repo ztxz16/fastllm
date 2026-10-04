@@ -263,6 +263,19 @@ int main(int argc, char **argv) { try {
     { Fixture clamped(17); for (int m : {1,8,9,10,32,33,129,1024}) Run(clamped,m,8,10.0f,15.0f); }
     { Fixture clampedHalf(17,false,true); Run(clampedHalf,33,8,10.0f,15.0f); }
     { Fixture glm(19,false,false,4096,2048,8); Run(glm,1,8,10.0f,15.0f); }
+    // Single-token tile scheduling: both projections, asymmetric widths,
+    // routing changes under Graph replay, and ordinary/clamped SwiGLU.
+    {
+        Fixture decode(37, false, false, 4096, 2048, 8, true, true);
+        for (int topk : {1, 5, 6, 8})
+            Run(decode, 1, topk, 0.0f, .15f, true, true);
+        Run(decode, 1, 8, 10.0f, 15.0f, true, true);
+    }
+    {
+        Fixture asymmetric(41, false, false, 4096, 1024, 8, true, true);
+        Run(asymmetric, 1, 8, 0.0f, .15f, true, true);
+    }
+
     { Fixture fallback(23,false,false,128,64,8); Run(fallback,33,8,10.0f,30.0f,false); }
     { Fixture narrow(19,false,false,256,256,256,true);
       for (int m : {128,129,255,256,511,512,513,1024}) Run(narrow,m,8,0.0f,.15f,true,true); }
