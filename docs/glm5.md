@@ -22,7 +22,7 @@ GLM-5.3-Flash 的 ModelOpt NVFP4 路由专家在单设备 CUDA 后端（包括 `
 
 支持 `general.architecture=glm5next` 的 GLM-5.3-Flash GGUF，包括 Unsloth 的四分片 `UD-IQ2_XXS`。指定第一个分片即可加载其余分片，无需 `--ori`。当前路径支持文本推理，要求 `--mtp 0`。
 
-路由专家保留 GGUF 混合量化格式；加载时还原 KDA 衰减参数和拆分、转置的 MLA KV-B 权重。IQ4_XS 专家使用分块 BF16 回退，权重不整体展开。KDA 的 128 维 Q8 投影使用 CUDA 反量化 GEMM，避免进入要求 K 维度按 256 对齐的 MMQ 内核。
+路由专家保留 GGUF 混合量化格式；加载时还原 KDA 衰减参数和拆分、转置的 MLA KV-B 权重。支持 AVX512 BF16 的 CPU 在 IQ4_XS 单行计算时直接读取压缩权重，在寄存器中解码并完成 BF16 点积，省去临时 FP32/BF16 权重缓冲，保留原有舍入和累加顺序；多行计算和其他 CPU 继续使用分块 BF16 回退，权重不整体展开。KDA 的 128 维 Q8 投影使用 CUDA 反量化 GEMM，避免进入要求 K 维度按 256 对齐的 MMQ 内核。
 
 双卡按层串行、单 NUMA 的启动示例（按机器调整线程数）：
 

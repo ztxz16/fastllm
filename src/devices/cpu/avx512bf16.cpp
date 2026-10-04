@@ -10,6 +10,7 @@
 
 #include "utils.h"
 #include "fastllm.h"
+#include "gguf.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -21,6 +22,72 @@
 
 namespace fastllm {
     extern void AddBiasAVX512(float *outputData, float *biasData, int n, int k, int st, int end);
+
+#ifdef __AVX512BF16__
+    template <int rows>
+    static void GemvBFloat16IQ4XSRows(const uint16_t *input, const uint8_t *weights,
+                                    size_t rowBytes, float *output, int columns) {
+        const __m128i levels = _mm_setr_epi8(
+            -127, -104, -83, -65, -49, -35, -22, -10,
+            1, 13, 25, 38, 53, 69, 89, 113);
+        const __m128i mask = _mm_set1_epi8(15);
+        const block_iq4_xs *w[rows];
+        __m512 sums[rows];
+        for (int r = 0; r < rows; ++r) {
+            w[r] = reinterpret_cast<const block_iq4_xs *>(weights + r * rowBytes);
+            sums[r] = _mm512_setzero_ps();
+        }
+        for (int b = 0; b < columns / QK_K; ++b) {
+            float scales[rows];
+            for (int r = 0; r < rows; ++r) {
+                scales[r] = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(w[r][b].d)));
+            }
+            for (int s = 0; s < 8; ++s) {
+                const auto x = (__m512bh)_mm512_loadu_si512(input + b * QK_K + s * 32);
+                for (int r = 0; r < rows; ++r) {
+                    const auto &q = w[r][b];
+                    const int scale = ((q.scales_l[s / 2] >> (4 * (s % 2))) & 15) |
+                                      (((q.scales_h >> (2 * s)) & 3) << 4);
+                    const auto d = _mm512_set1_ps(scales[r] * (scale - 32));
+                    const auto bits = _mm_loadu_si128(reinterpret_cast<const __m128i *>(q.qs + s * 16));
+                    const auto lo = _mm_shuffle_epi8(levels, _mm_and_si128(bits, mask));
+                    const auto hi = _mm_shuffle_epi8(levels, _mm_and_si128(_mm_srli_epi16(bits, 4), mask));
+                    const auto f0 = _mm512_mul_ps(d, _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(lo)));
+                    const auto f1 = _mm512_mul_ps(d, _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(hi)));
+                    // Preserve the fallback's FP32 dequant -> BF16 RNE boundary
+                    // and its sequential 32-element dot accumulation. Only the
+                    // temporary FP32/BF16 weight matrices are eliminated.
+                    const auto values = _mm512_cvtne2ps_pbh(f1, f0);
+                    sums[r] = _mm512_dpbf16_ps(sums[r], values, x);
+                }
+            }
+        }
+        for (int r = 0; r < rows; ++r) output[r] = _mm512_reduce_add_ps(sums[r]);
+    }
+#endif
+
+    bool FastllmGemmBFloat16IQ4XS_AVX512BF16(
+            const void *A, long lda, const void *B, long ldb, void *C, long ldc,
+            int n, int m, int k, int st, int end) {
+#ifdef __AVX512BF16__
+        if (n != 1 || m <= 0 || m % QK_K != 0 || st < 0 || end < st || end > k ||
+            lda < long(m * sizeof(uint16_t)) || ldc < long(k * sizeof(float)) ||
+            ldb < long(size_t(m / QK_K) * sizeof(block_iq4_xs))) return false;
+        const auto *input = static_cast<const uint16_t *>(A);
+        const auto *weights = static_cast<const uint8_t *>(B);
+        auto *output = static_cast<float *>(C);
+        int r = st;
+        for (; r + 4 <= end; r += 4) {
+            GemvBFloat16IQ4XSRows<4>(input, weights + r * ldb, ldb, output + r, m);
+        }
+        for (; r < end; ++r) {
+            GemvBFloat16IQ4XSRows<1>(input, weights + r * ldb, ldb, output + r, m);
+        }
+        return true;
+#else
+        return false;
+#endif
+    }
 
     bool Float32ToBFloat16_AVX512BF16_RNE(float *float32, uint16_t *bfloat16, int len) {
 #ifdef __AVX512BF16__

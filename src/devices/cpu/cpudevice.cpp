@@ -40,6 +40,9 @@ namespace fastllm {
     void Float32ToBFloat16(float *float32, uint16_t *bfloat16, int len);
     void BFloat16ToFloat32(uint16_t *bfloat16, float *float32, int len);
     extern bool Float32ToBFloat16_AVX512BF16_RNE(float *float32, uint16_t *bfloat16, int len);
+    extern bool FastllmGemmBFloat16IQ4XS_AVX512BF16(
+        const void *A, long lda, const void *B, long ldb, void *C, long ldc,
+        int n, int m, int k, int st, int end);
     extern bool FastllmGemmBFloat16NVFP4Block16_AVX512BF16(
         const void *A, long lda, const void *B, long ldb, void *C, long ldc,
         int n, int m, int k, int st, int end, bool planar);
@@ -2425,9 +2428,13 @@ namespace fastllm {
                         LinearBFloat16_AWQ4BIT128_Kernel((uint16_t*)A, (uint8_t*)B, nullptr, (float*)C, n, m, ldc / sizeof(float), st, end);
                     } */ 
                 } else if (BType >= DataType::DATA_GGUF_FORMAT && BType < DataType::DATA_GGUF_FORMAT_END) {
+                    const ggml_type weightType = (ggml_type)((int)BType - (int)DataType::DATA_GGUF_FORMAT);
+                    if (weightType == GGML_TYPE_IQ4_XS && cpuInstructInfo.hasAVX512BF16 &&
+                        FastllmGemmBFloat16IQ4XS_AVX512BF16(A, lda, B, ldb, C, ldc, n, m, k, st, end)) {
+                        return;
+                    }
                     std::vector <float> fp32B_temp((end - st) * m);
                     std::vector <uint16_t> bf16B_temp((end - st) * m);
-                    ggml_type weightType = (ggml_type)((int)BType - (int)DataType::DATA_GGUF_FORMAT);
 
                     auto toFloat = ggml_type_to_float(weightType);
                     AssertInFastLLM(toFloat != nullptr, "WeightImportGGUFTensor: weight (type " + std::string(ggml_type_name(weightType)) + ") can't convert to fp32.");
