@@ -64,6 +64,37 @@ static void TestTopK() {
         ++checks;
     }
 }
+// Explicit ranks specify the existing score-bit order without a float comparator
+// (NaNs have no numeric ordering). Signed zeros share a rank and retain position order.
+static void TestTopKSpecialValues() {
+    const uint32_t bits[] = {0x7fc00002u, 0x7fc00001u, 0x7f800000u, 0x3f800000u,
+        0x00000001u, 0x00000000u, 0x80000000u, 0x80000001u, 0xbf800000u,
+        0xff800000u, 0xffc00001u, 0xffffffffu};
+    const int ranks[] = {0, 1, 2, 3, 4, 5, 5, 6, 7, 8, 9, 10};
+    for (int valid : {4099, 8192, 131073}) for (bool sparse : {false, true}) {
+        Data scores(FLOAT32), result;
+        scores.Resize({1, valid + 64}); scores.Allocate();
+        // Future scores outrank all valid scores and must be excluded.
+        std::vector<uint32_t> values(valid + 64, 0x7fffffffu);
+        std::vector<int> rank(valid), expected(valid);
+        for (int i = 0; i < valid; ++i) {
+            // Sparse rows also select the lowest ordered key, which equals
+            // the candidate sort's padding key. Its real positions must win.
+            int pattern = sparse && i >= 1536 ? 11 : (i * 5 + 3) % 12;
+            values[i] = bits[pattern]; rank[i] = ranks[pattern];
+        }
+        std::iota(expected.begin(), expected.end(), 0);
+        std::stable_sort(expected.begin(), expected.end(),
+            [&](int a, int b) { return rank[a] < rank[b]; });
+        expected.resize(2048);
+        std::memcpy(scores.cpuData, values.data(), values.size() * sizeof(uint32_t));
+        scores.ToDevice(DataDevice::CUDA, {0}, true);
+        FastllmCudaNaiveTopK(scores, valid - 1, 2048, result);
+        Require(Read<int>(result) == expected, "TopK special-value order or padding differs");
+        ++checks;
+    }
+}
+
 static std::vector<int> BatchedReference(const std::vector<float> &scores, int rows,
                                         int keys, int past, int top) {
     std::vector<int> result((size_t)rows * top, -1), order(keys);
@@ -123,7 +154,13 @@ static void TestBatchedTopK() {
     }
     // Change score contents between graph replays to catch stale host selection.
     for (const auto &s : {Shape{3,2049,1000,2048}, Shape{33,8192,8159,2048},
-                          Shape{17,32769,32752,2048}}) {
+                          Shape{17,32769,32752,2048},
+                          // Single-query selection: padding, truncation,
+                          // partial causal ranges, and changed scores on replay.
+                          Shape{1,2049,1023,2048}, Shape{1,2049,2048,2048},
+                          Shape{1,32769,32704,2048}, Shape{1,131073,131008,2048},
+                          Shape{1,8193,8190,2048}, Shape{1,8193,8191,2048},
+                          Shape{1,262144,262143,2048}, Shape{1,262145,262144,2048}}) {
         Data scores(FLOAT32), output; auto values=BatchedScores(s.rows,s.keys,s.past,2,19);
         scores.Resize({s.rows,s.keys});scores.Allocate();
         std::memcpy(scores.cpuData,values.data(),values.size()*sizeof(float));scores.ToDevice(DataDevice::CUDA,{0},true);
@@ -646,7 +683,8 @@ static void TestIndexer() {
         {65,16387,16,896,true}, {512,2051,16,896,true},
         {64,16384,8,896,true}, {64,16384,16,896,false},
         {1,4099,16,897,true}, {1,32768,16,896,true}, {1,131073,16,897,true},
-        {1,4099,8,896,true}, {1,4099,16,896,false}};
+        {1,4099,8,896,true}, {1,4099,16,896,false},
+        {1,32768,16,897,false}};
     for (const auto &s : shapes) for (int mode = 0; mode < 5; ++mode) {
         if (quick && s.rows != 33 && s.rows != 1) continue;
         Data q(BFLOAT16), k(BFLOAT16), w(BFLOAT16), out;
@@ -788,14 +826,15 @@ static void TestDecodeGraphs() {
         }
         cudaGraphExecDestroy(graph);
     }
-    for (int keys : {4099, 32768}) {
+    // Both scoring backends must preserve ordering across changed-input replays.
+    for (int keys : {4099, 32768, 131073}) for (bool fp8Query : {false, true}) {
         constexpr int heads = 16, stride = 897;
         Data q(BFLOAT16), k(BFLOAT16), w(BFLOAT16), actual, expected;
         Upload(q, {1, 1, heads * 128}, 751);
         Upload(k, {1, keys, stride}, 757);
         Upload(w, {1, 1, heads}, 761);
         auto call = [&](Data &out) {
-            FastllmCudaNaiveIndexer(q, w, k, heads, 128, keys - 65, 2048, true, out);
+            FastllmCudaNaiveIndexer(q, w, k, heads, 128, keys - 65, 2048, fp8Query, out);
         };
         call(actual);
         Require(cudaDeviceSynchronize() == cudaSuccess, "Indexer graph warmup");
@@ -831,7 +870,7 @@ int main(int argc,char **argv) {
                 "usage: naive_n05_decode_test [--quick|--decode-graphs]");
         SetThreads(4);
         if (!graphsOnly) {
-            TestTopK(); TestBatchedTopK(); TestIndexer();
+            TestTopK(); TestTopKSpecialValues(); TestBatchedTopK(); TestIndexer();
             TestCache(); TestCacheEdges(); TestCacheReservation(); TestRopeWidths();
             TestAttentionWidths(); TestAttentionSelectedValues(); TestAttentionGroupedScores();
             TestAttentionGlobalMma(); TestAttentionSwa();
