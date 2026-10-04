@@ -35,14 +35,26 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query,
                               int pastLength, int window,
                               fastllm::Data &output, bool causal = true);
 
+// Small speculative blocks use the same per-position arithmetic as decode.
+// The temporary KV suffix is visible only through each row's causal prefix.
+void FastllmCudaNaiveVerifyIndexer(const fastllm::Data &query,
+    const fastllm::Data &weights, const fastllm::Data &packedKeys,
+    int heads, int dim, int queryStart, int topK, bool fp8Query,
+    fastllm::Data &indices);
+void FastllmCudaNaiveVerifyAttention(const fastllm::Data &query,
+    const fastllm::Data &key, const fastllm::Data &value,
+    const fastllm::Data &indices, const fastllm::Data &sink,
+    int heads, int kvHeads, int dim, int valueDim, int pastLength,
+    int window, fastllm::Data &output);
+
 // Whole-step decode graphs own these buffers until the executable is destroyed.
 // liveKeys is an INT32 device scalar (past length + 1), updated before replay.
 struct FastllmNaiveDecodeScratch {
     fastllm::Data indexQuery, indexScale, indexScores, topk;
-    fastllm::Data attentionScores, attentionPartial;
+    fastllm::Data attentionScores, attentionPartial, windowKey, windowValue;
 };
 bool FastllmCudaNaiveDecodeGraphSupported();
-// One BF16 decode row; update the residual and preserve RMSNorm rounding.
+// BF16 rows; update each residual and preserve RMSNorm rounding.
 void FastllmCudaNaiveAddDecodeRMSNorm(fastllm::Data &hidden,
     const fastllm::Data &branch, const fastllm::Data &weight,
     float eps, fastllm::Data &output);
@@ -62,6 +74,30 @@ void FastllmCudaNaiveDecodeAttention(const fastllm::Data &query,
     const fastllm::Data &liveKeys, int capacity, int heads, int kvHeads,
     int dim, int valueDim, int window,
     FastllmNaiveDecodeScratch &scratch, fastllm::Data &output);
+
+// Fixed-shape verification graphs keep one live prefix length per query.
+void FastllmCudaNaiveAppendVerifyCache(fastllm::Data &key, fastllm::Data &value,
+    const fastllm::Data &newKey, const fastllm::Data &newValue,
+    const fastllm::Data &liveKeys, int window);
+void FastllmCudaNaiveGraphVerifyIndexer(const fastllm::Data &query,
+    const fastllm::Data &weights, const fastllm::Data &packedKeys,
+    const fastllm::Data &liveKeys, int capacity, bool fp8Query,
+    FastllmNaiveDecodeScratch &scratch, fastllm::Data &indices);
+void FastllmCudaNaiveGraphVerifyAttention(const fastllm::Data &query,
+    const fastllm::Data &key, const fastllm::Data &value,
+    const fastllm::Data &indices, const fastllm::Data &sink,
+    const fastllm::Data &liveKeys, int capacity, int heads, int kvHeads,
+    int dim, int valueDim, int window,
+    FastllmNaiveDecodeScratch &scratch, fastllm::Data &output);
+
+// Fixed draft inputs and attention read the live absolute prefix on the GPU.
+void FastllmCudaNaiveDraftInput(const fastllm::Data &id, const fastllm::Data &embedding,
+    const fastllm::Data &mask, const fastllm::Data &liveKeys, int rows,
+    fastllm::Data &hidden, fastllm::Data &positions);
+void FastllmCudaNaiveDraftAttention(const fastllm::Data &query,
+    const fastllm::Data &key, const fastllm::Data &value,
+    const fastllm::Data &liveKeys, int heads, int kvHeads, int dim, int window,
+    bool shortAttention, fastllm::Data &scores, fastllm::Data &output);
 
 // NUMA FP8 weights are row-packed [128 E4M3 bytes, FP32 scale]. Gate/up
 // output rows are interleaved. Route ids index the original [token, top-k].

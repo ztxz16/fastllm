@@ -42,6 +42,11 @@ bool FastllmCudaCustomAllReduceInit(const std::vector<int>& devices);
 void FastllmCudaCustomAllReduceReset();
 bool FastllmCudaCustomAllReduce(void* data, void* dest, int count,
                                 int dataType, int deviceId);
+// Reduce a block with the rank-ordered FP32 arithmetic selected for one row.
+// Uses the existing single-row enable policy and registers the complete block.
+// False means the caller must reduce rows separately with its ordinary path.
+bool FastllmCudaCustomAllReduceRows(void* data, void* dest, int count,
+                                    int rowElements, int dataType, int deviceId);
 // Reduces two independent rank-local tensors, rounds each reduction to the
 // destination type, then adds the rounded values into dest.  Keeping the two
 // reduction accumulators separate preserves the result of

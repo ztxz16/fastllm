@@ -35,6 +35,19 @@ struct DecodeKeys {
 };
 __device__ int ShortCount(int, int count) { return count; }
 __device__ int ShortCount(DecodeKeys keys, int count) { return min((int)keys, count); }
+__device__ int VerifyCount(int first, int row) { return first + row; }
+__device__ int VerifyCount(DecodeKeys keys, int row) {
+    keys.length += row;
+    return keys;
+}
+
+// Draft graphs append a noncausal block to a bounded sliding prefix.
+struct DraftLength {
+    const int *length;
+    int window, extra;
+    __device__ operator int() const { return min(*length - 1, window - 1) + extra; }
+};
+__device__ int ShortCount(DraftLength keys, int count) { return min((int)keys, count); }
 
 __device__ float RoundBF16(float x) { return __bfloat162float(__float2bfloat16(x)); }
 __device__ float WarpSum(float x) {
@@ -712,11 +725,12 @@ __global__ void AttentionScoresDecodeShared(const BF16 *q, const BF16 *k,
 // but retain Q in registers and interleave four independent selected keys.
 // The bounded query register tile leaves larger head dimensions on the
 // general kernel; this path is only used for multiple-query prefill.
-template <int MaxDim>
+template <int MaxDim, typename Length = int, typename Past = int>
 __global__ void AttentionScoresPrefill(const BF16 *q, const BF16 *k, const int *indices,
                                       float *scores, int heads, int kvHeads, int dim,
-                                      int keyStride, int keys, int count, int past,
+                                      int keyStride, Length liveKeys, Length liveCount, Past livePast,
                                       int window, bool causal) {
+    int keys = liveKeys, count = liveCount, past = livePast;
     constexpr int keysPerWarp = 4, warps = 4;
     int query = blockIdx.y, h = blockIdx.x;
     int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
@@ -795,9 +809,11 @@ __global__ void AttentionScoresPrefillGrouped(const BF16 *q, const BF16 *k, cons
 // Four output columns per lane amortize index/probability reads and permit
 // aligned 64-bit V loads. Each column keeps its original slot-ordered FP32
 // accumulation. Four independent heads per CTA avoid one-warp block limits.
+template <typename Length = int, typename Past = int>
 __global__ void AttentionValuesPrefill(const float *prob, const BF16 *v, const int *indices,
                                       BF16 *out, int heads, int kvHeads, int dim,
-                                      int keys, int count, int past, int window, bool causal) {
+                                      Length liveKeys, Length liveCount, Past livePast, int window, bool causal) {
+    int keys = liveKeys, count = liveCount, past = livePast;
     constexpr int columns = 4, headGroup = 4;
     int query = blockIdx.y, lane = threadIdx.x % 32;
     int h = blockIdx.x * headGroup + threadIdx.x / 32;
@@ -911,12 +927,12 @@ __global__ void AttentionSoftmaxDecode(float *scores, const float *sink) {
 // Short full attention and the 128-token sliding window fit in shared memory.
 // Keep eager's BF16 score/probability rounding, sink and reduction order while
 // removing the score tensor round-trip and two launches per layer.
-template <typename Length = int>
+template <typename Length = int, typename Past = int>
 __global__ void AttentionShort(const BF16 *q, const BF16 *k, const BF16 *v,
                                const int *indices, const float *sink, BF16 *out,
                                int heads, int kvHeads, int dim, int valueDim,
-                               int keyStride, Length liveKeys, int count, int past, int window, bool causal) {
-    int keys = liveKeys;
+                               int keyStride, Length liveKeys, int count, Past livePast, int window, bool causal) {
+    int keys = liveKeys, past = livePast;
     count = ShortCount(liveKeys, count);
     __shared__ float scores[256], scratch[256];
     int query = blockIdx.y, h = blockIdx.x, t = threadIdx.x;
@@ -974,10 +990,23 @@ constexpr int kSwaThreads = 256;
 // output slices spread the work across SMs; cooperative V loads avoid the
 // reference kernel's dependent global load for every output/slot pair.
 // The softmax tree, BF16 rounding and slot-ordered FP32 FMAs are unchanged.
-template <int MaxKeys, typename Length = int>
+template <int MaxKeys, typename Length = int, bool Verify = false>
 __global__ void AttentionShortDecode(const BF16 *q, const BF16 *k, const BF16 *v,
         const float *sink, BF16 *out, int heads, int kvHeads, int keyStride, Length liveKeys) {
-    int keys = liveKeys;
+    if constexpr (Verify) {
+        const int row = blockIdx.y;
+        q += (size_t)row * heads * kSwaQkDim;
+        out += (size_t)row * heads * kSwaValueDim;
+        if constexpr (MaxKeys == kSwaWindow) {
+            // Verification appends all rows before attention. Read each
+            // causal window directly instead of copying it into scratch.
+            const int end = (int)liveKeys + row;
+            const int begin = max(0, end - kSwaWindow);
+            k += (size_t)begin * keyStride;
+            v += (size_t)begin * kvHeads * kSwaValueDim;
+        }
+    }
+    int keys = Verify ? min(VerifyCount(liveKeys, blockIdx.y), MaxKeys) : (int)liveKeys;
     __shared__ float scores[MaxKeys], scratch[kSwaThreads], maximum, denominator;
     __shared__ BF16 values[MaxKeys][kSwaOutputTile];
     int h = blockIdx.x, t = threadIdx.x, lane = t % 32, warp = t / 32;
@@ -1501,6 +1530,86 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
     }
 }
 
+void FastllmCudaNaiveVerifyIndexer(const fastllm::Data &query,
+        const fastllm::Data &weights, const fastllm::Data &packedKeys,
+        int heads, int dim, int queryStart, int topK, bool fp8Query,
+        fastllm::Data &indices) {
+    using namespace fastllm;
+    const int rows = query.dims[1];
+    AssertInFastLLM(rows > 0 && rows <= 8 && queryStart >= 0 &&
+        queryStart + rows <= packedKeys.dims[1], "Invalid Naive verification block.");
+    Output(indices, INT32, {rows, topK});
+    for (int row = 0; row < rows; ++row) {
+        Data q(BFLOAT16, {1, 1, heads * dim}), w(BFLOAT16, {1, 1, heads});
+        Data keys(BFLOAT16, {1, queryStart + row + 1, packedKeys.dims[2]});
+        Data out(INT32, {1, topK});
+        q.FakeFrom(query, (size_t)row * heads * dim * sizeof(BF16));
+        w.FakeFrom(weights, (size_t)row * heads * sizeof(BF16));
+        keys.FakeFrom(packedKeys, 0);
+        out.FakeFrom(indices, (size_t)row * topK * sizeof(int));
+        FastllmCudaNaiveIndexer(q, w, keys, heads, dim, queryStart + row, topK, fp8Query, out);
+    }
+}
+
+void FastllmCudaNaiveVerifyAttention(const fastllm::Data &query,
+        const fastllm::Data &key, const fastllm::Data &value,
+        const fastllm::Data &indices, const fastllm::Data &sink,
+        int heads, int kvHeads, int dim, int valueDim, int pastLength,
+        int window, fastllm::Data &output) {
+    using namespace fastllm;
+    const int rows = query.dims[1];
+    AssertInFastLLM(rows > 0 && rows <= 8 && pastLength >= 0 &&
+        pastLength + rows <= key.dims[1], "Invalid Naive verification attention block.");
+    Output(output, BFLOAT16, {1, rows, heads * valueDim});
+    // Full-window, large-head eager attention may use FlashInfer. Preserve
+    // that arithmetic; the compact decode kernel is exact for its own path.
+    const bool compactWindow = window == kSwaWindow &&
+        (heads < 64 || heads / kvHeads != 8 || pastLength + rows < kSwaWindow);
+    if (dim == kSwaQkDim && valueDim == kSwaValueDim && indices.dims.empty() &&
+        (compactWindow || (!window && pastLength + rows <= 256))) {
+        const int first = window ? std::min(pastLength + 1, window) : pastLength + 1;
+        auto *q = (const BF16 *)query.cudaData;
+        auto *k = (const BF16 *)key.cudaData;
+        auto *v = (const BF16 *)value.cudaData;
+        auto *bias = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
+        auto *out = (BF16 *)output.cudaData;
+        // An eager caller can retain more than window-1 old rows.
+        const int begin = window ? std::max(0, pastLength + 1 - window) : 0;
+        k += (size_t)begin * key.dims[2];
+        v += (size_t)begin * kvHeads * valueDim;
+        dim3 grid(heads, rows, kSwaValueDim / kSwaOutputTile);
+        if (window)
+            AttentionShortDecode<kSwaWindow, int, true><<<grid, kSwaThreads>>>(
+                q, k, v, bias, out, heads, kvHeads, key.dims[2], first);
+        else
+            AttentionShortDecode<256, int, true><<<grid, kSwaThreads>>>(
+                q, k, v, bias, out, heads, kvHeads, key.dims[2], first);
+        CheckLaunch();
+        return;
+    }
+    for (int row = 0; row < rows; ++row) {
+        const int end = pastLength + row + 1;
+        const int begin = window ? std::max(0, end - window) : 0;
+        const int length = end - begin;
+        Data q(BFLOAT16, {1, 1, heads * dim});
+        Data k(BFLOAT16, {1, length, key.dims[2]});
+        Data v(BFLOAT16, {1, length, value.dims[2]});
+        Data out(BFLOAT16, {1, 1, heads * valueDim}), selected;
+        q.FakeFrom(query, (size_t)row * heads * dim * sizeof(BF16));
+        k.FakeFrom(key, (size_t)begin * key.dims[2] * sizeof(BF16));
+        v.FakeFrom(value, (size_t)begin * value.dims[2] * sizeof(BF16));
+        out.FakeFrom(output, (size_t)row * heads * valueDim * sizeof(BF16));
+        // Crossing the dense/sparse boundary inside a block must not change
+        // the PV reduction tree of the earlier, still-dense positions.
+        if (!indices.dims.empty() && end > indices.dims[1]) {
+            selected.Resize({1, indices.dims[1]});
+            selected.FakeFrom(indices, (size_t)row * indices.dims[1] * sizeof(int));
+        }
+        FastllmCudaNaiveAttention(q, k, v, selected, sink, heads, kvHeads, dim,
+                                 valueDim, length - 1, window, out);
+    }
+}
+
 void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &key,
                               const fastllm::Data &value, const fastllm::Data &indices,
                               const fastllm::Data &sink, int heads, int kvHeads,
@@ -1668,6 +1777,9 @@ template <int Channels = 0>
 __global__ void AddDecodeRMSNorm(BF16 *hidden, const BF16 *branch,
         const float *weight, BF16 *output, int channels, float eps) {
     if constexpr (Channels) channels = Channels;
+    hidden += (size_t)blockIdx.x * channels;
+    branch += (size_t)blockIdx.x * channels;
+    output += (size_t)blockIdx.x * channels;
     __shared__ float sums[8];
     float cached[Channels ? Channels / 256 : 1];
     float affine[Channels ? Channels / 256 : 1];
@@ -1714,6 +1826,15 @@ __global__ void AddDecodeRMSNorm(BF16 *hidden, const BF16 *branch,
     }
 }
 
+__global__ void DraftInput(const float *id, const BF16 *embedding, const BF16 *mask,
+        const int *length, BF16 *hidden, float *positions, int channels) {
+    int row = blockIdx.y, column = blockIdx.x * blockDim.x + threadIdx.x;
+    if (column < channels)
+        hidden[(size_t)row * channels + column] = row ? mask[column]
+            : embedding[(size_t)(int)*id * channels + column];
+    if (column == 0) positions[row] = *length - 1 + row;
+}
+
 __global__ void AppendDecodeKV(BF16 *key, BF16 *value, const BF16 *newKey,
         const BF16 *newValue, const int *length, int keyColumns, int valueColumns,
         int window) {
@@ -1723,6 +1844,28 @@ __global__ void AppendDecodeKV(BF16 *key, BF16 *value, const BF16 *newKey,
     if (column < keyColumns) key[(size_t)row * keyColumns + column] = newKey[column];
     else if ((column -= keyColumns) < valueColumns)
         value[(size_t)row * valueColumns + column] = newValue[column];
+}
+
+__global__ void AppendVerifyKV(BF16 *key, BF16 *value, const BF16 *newKey,
+        const BF16 *newValue, const int *length, int kc, int vc, int window) {
+    int column = blockIdx.x * blockDim.x + threadIdx.x;
+    const int query = blockIdx.y;
+    const int past = window ? min(*length - 1, window - 1) : *length - 1;
+    const int row = past + query;
+    if (column < kc) key[(size_t)row * kc + column] = newKey[(size_t)query * kc + column];
+    else if ((column -= kc) < vc)
+        value[(size_t)row * vc + column] = newValue[(size_t)query * vc + column];
+}
+
+__global__ void CopyVerifyWindow(const BF16 *key, const BF16 *value,
+        BF16 *outKey, BF16 *outValue, const int *length, int query,
+        int kc, int vc, int window) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const int end = min(*length - 1, window - 1) + query + 1;
+    const int begin = max(0, end - window), rows = min(end, window);
+    if (index < rows * kc) outKey[index] = key[(size_t)begin * kc + index];
+    else if ((index -= rows * kc) < rows * vc)
+        outValue[index] = value[(size_t)begin * vc + index];
 }
 
 int DecodeTopKBlocks() {
@@ -1750,7 +1893,7 @@ void FastllmCudaNaiveAddDecodeRMSNorm(fastllm::Data &hidden,
     Output(output, fastllm::BFLOAT16, hidden.dims);
     int channels = hidden.dims.back();
     auto kernel = channels == 4096 ? AddDecodeRMSNorm<4096> : AddDecodeRMSNorm<>;
-    kernel<<<1, 256>>>((BF16 *)hidden.cudaData, (const BF16 *)branch.cudaData,
+    kernel<<<hidden.Count(0) / channels, 256>>>((BF16 *)hidden.cudaData, (const BF16 *)branch.cudaData,
         (const float *)weight.cudaData, (BF16 *)output.cudaData, channels, eps);
     CheckLaunch();
 }
@@ -1902,4 +2045,130 @@ void FastllmCudaNaiveDecodeAttention(const fastllm::Data &query,
         }
     }
     CheckLaunch();
+}
+
+void FastllmCudaNaiveAppendVerifyCache(fastllm::Data &key, fastllm::Data &value,
+        const fastllm::Data &newKey, const fastllm::Data &newValue,
+        const fastllm::Data &liveKeys, int window) {
+    const int kc = key.dims[2], vc = value.dims[2], rows = newKey.dims[1];
+    AppendVerifyKV<<<dim3((kc + vc + 255) / 256, rows), 256>>>((BF16 *)key.cudaData,
+        (BF16 *)value.cudaData, (const BF16 *)newKey.cudaData,
+        (const BF16 *)newValue.cudaData, (const int *)liveKeys.cudaData, kc, vc, window);
+    CheckLaunch();
+}
+
+void FastllmCudaNaiveDraftInput(const fastllm::Data &id, const fastllm::Data &embedding,
+        const fastllm::Data &mask, const fastllm::Data &liveKeys, int rows,
+        fastllm::Data &hidden, fastllm::Data &positions) {
+    using namespace fastllm;
+    int channels = embedding.dims.back();
+    Output(hidden, BFLOAT16, {1, rows, channels});
+    Output(positions, FLOAT32, {1, rows});
+    DraftInput<<<dim3((channels + 255) / 256, rows), 256>>>((const float *)id.cudaData,
+        (const BF16 *)embedding.cudaData, (const BF16 *)mask.cudaData,
+        (const int *)liveKeys.cudaData, (BF16 *)hidden.cudaData,
+        (float *)positions.cudaData, channels);
+    CheckLaunch();
+}
+
+void FastllmCudaNaiveDraftAttention(const fastllm::Data &query,
+        const fastllm::Data &key, const fastllm::Data &value,
+        const fastllm::Data &liveKeys, int heads, int kvHeads, int dim, int window,
+        bool shortAttention, fastllm::Data &scores, fastllm::Data &output) {
+    using namespace fastllm;
+    int rows = query.dims[1];
+    AssertInFastLLM(rows > 1 && rows < 32 && dim > 0 && dim <= 256 && dim % 4 == 0,
+                    "Unsupported Naive draft graph attention shape.");
+    Output(output, BFLOAT16, {1, rows, heads * dim});
+    DraftLength keys{(const int *)liveKeys.cudaData, window, rows};
+    DraftLength past{(const int *)liveKeys.cudaData, window, 0};
+    auto *q = (const BF16 *)query.cudaData, *k = (const BF16 *)key.cudaData;
+    auto *v = (const BF16 *)value.cudaData;
+    auto *out = (BF16 *)output.cudaData;
+    if (shortAttention) {
+        AttentionShort<<<dim3(heads, rows), 256>>>(q, k, v, nullptr, nullptr, out,
+            heads, kvHeads, dim, dim, key.dims[2], keys, 256, past, window, false);
+    } else {
+        Output(scores, FLOAT32, {rows, heads, window + rows - 1});
+        auto kernel = dim <= 192 ? AttentionScoresPrefill<192, DraftLength, DraftLength>
+                                : AttentionScoresPrefill<256, DraftLength, DraftLength>;
+        kernel<<<dim3(heads, rows), 128>>>(q, k, nullptr, (float *)scores.cudaData,
+            heads, kvHeads, dim, key.dims[2], keys, keys, past, window, false);
+        AttentionSoftmax<<<rows * heads, 256>>>((float *)scores.cudaData, nullptr, heads, keys);
+        AttentionValuesPrefill<<<dim3((heads + 3) / 4, rows), 128>>>((float *)scores.cudaData,
+            v, nullptr, out, heads, kvHeads, dim, keys, keys, past, window, false);
+    }
+    CheckLaunch();
+}
+
+void FastllmCudaNaiveGraphVerifyIndexer(const fastllm::Data &query,
+        const fastllm::Data &weights, const fastllm::Data &packedKeys,
+        const fastllm::Data &liveKeys, int capacity, bool fp8Query,
+        FastllmNaiveDecodeScratch &scratch, fastllm::Data &indices) {
+    using namespace fastllm;
+    const int rows = query.dims[1];
+    Output(indices, INT32, {rows, 2048});
+    for (int row = 0; row < rows; ++row) {
+        Data q(BFLOAT16, {1, 1, 2048}), w(BFLOAT16, {1, 1, 16});
+        Data live(INT32, {1}), out(INT32, {1, 2048});
+        q.FakeFrom(query, (size_t)row * 2048 * sizeof(BF16));
+        w.FakeFrom(weights, (size_t)row * 16 * sizeof(BF16));
+        live.FakeFrom(liveKeys, row * sizeof(int));
+        out.FakeFrom(indices, (size_t)row * 2048 * sizeof(int));
+        FastllmCudaNaiveDecodeIndexer(q, w, packedKeys, live, capacity, fp8Query, scratch, out);
+    }
+}
+
+void FastllmCudaNaiveGraphVerifyAttention(const fastllm::Data &query,
+        const fastllm::Data &key, const fastllm::Data &value,
+        const fastllm::Data &indices, const fastllm::Data &sink,
+        const fastllm::Data &liveKeys, int capacity, int heads, int kvHeads,
+        int dim, int valueDim, int window,
+        FastllmNaiveDecodeScratch &scratch, fastllm::Data &output) {
+    using namespace fastllm;
+    const int rows = query.dims[1];
+    Output(output, BFLOAT16, {1, rows, heads * valueDim});
+    if (dim == kSwaQkDim && valueDim == kSwaValueDim &&
+        (window == kSwaWindow || (!window && indices.dims.empty() && capacity > 0 && capacity <= 256))) {
+        DecodeKeys keys{(const int *)liveKeys.cudaData, window ? window : capacity};
+        auto *q = (const BF16 *)query.cudaData;
+        auto *k = (const BF16 *)key.cudaData;
+        auto *v = (const BF16 *)value.cudaData;
+        auto *bias = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
+        auto *out = (BF16 *)output.cudaData;
+        dim3 grid(heads, rows, kSwaValueDim / kSwaOutputTile);
+        if (window)
+            AttentionShortDecode<kSwaWindow, DecodeKeys, true><<<grid, kSwaThreads>>>(
+                q, k, v, bias, out, heads, kvHeads, key.dims[2], keys);
+        else
+            AttentionShortDecode<256, DecodeKeys, true><<<grid, kSwaThreads>>>(
+                q, k, v, bias, out, heads, kvHeads, key.dims[2], keys);
+        CheckLaunch();
+        return;
+    }
+    if (window) {
+        Output(scratch.windowKey, BFLOAT16, {1, window, key.dims[2]});
+        Output(scratch.windowValue, BFLOAT16, {1, window, value.dims[2]});
+    }
+    for (int row = 0; row < rows; ++row) {
+        Data q(BFLOAT16, {1, 1, heads * dim}), live(INT32, {1});
+        Data out(BFLOAT16, {1, 1, heads * valueDim}), selected;
+        q.FakeFrom(query, (size_t)row * heads * dim * sizeof(BF16));
+        live.FakeFrom(liveKeys, row * sizeof(int));
+        out.FakeFrom(output, (size_t)row * heads * valueDim * sizeof(BF16));
+        if (!indices.dims.empty()) {
+            selected.Resize({1, 2048});
+            selected.FakeFrom(indices, (size_t)row * 2048 * sizeof(int));
+        }
+        if (window) {
+            int kc = key.dims[2], vc = value.dims[2];
+            CopyVerifyWindow<<<(window * (kc + vc) + 255) / 256, 256>>>(
+                (const BF16 *)key.cudaData, (const BF16 *)value.cudaData,
+                (BF16 *)scratch.windowKey.cudaData, (BF16 *)scratch.windowValue.cudaData,
+                (const int *)liveKeys.cudaData, row, kc, vc, window);
+        }
+        FastllmCudaNaiveDecodeAttention(q, window ? scratch.windowKey : key,
+            window ? scratch.windowValue : value, selected, sink, live, capacity,
+            heads, kvHeads, dim, valueDim, window, scratch, out);
+    }
 }

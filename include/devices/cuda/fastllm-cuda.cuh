@@ -1764,6 +1764,14 @@ bool FastllmCudaMergeMOENVFP4E4M3MarlinIndexedClamped(
         fastllm::Data **weights, int weightsBatch,
         const int32_t *indices, const float *scores,
         int batch, int topk, float swigluLimit);
+// Independent BF16 rows preserve the batch-1 Marlin reduction schedule.
+// Returns false before launching when the shape cannot share bounded scratch.
+bool FastllmCudaMergeMOENVFP4E4M3MarlinRows(
+        const fastllm::Data &input, fastllm::Data &gateOutput,
+        fastllm::Data &activation, fastllm::Data &output,
+        fastllm::Data **weights, int weightsBatch,
+        const int32_t *indices, const float *scores,
+        int batch, int topk);
 bool FastllmCudaSwigluClamped(
         const fastllm::Data &input, float limit, fastllm::Data &output);
 #ifndef USE_ROCM

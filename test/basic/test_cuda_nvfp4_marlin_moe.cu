@@ -211,6 +211,100 @@ static void CheckActivation() {
     std::puts("Activation boundary/dtype PASS");
 }
 
+static void CheckIndependentRows(Fixture &f, int rows, int topk, bool foreignScratch = false) {
+    const int H = f.hidden;
+    Data x(BFLOAT16, {rows, H}), ids(INT32, {rows, topk}), scores(FLOAT32, {rows, topk});
+    x.Allocate();
+    ids.Allocate();
+    scores.Allocate();
+    for (int i = 0; i < rows * H; ++i)
+        ((__nv_bfloat16 *)x.cpuData)[i] = __float2bfloat16_rn(.3f * std::sin(i * .031f));
+    for (int i = 0; i < rows * topk; ++i) {
+        ((int *)ids.cpuData)[i] = (i / topk * 3 + i % topk * 7) % f.experts;
+        ((float *)scores.cpuData)[i] = (1.f + i % topk * .07f) / topk;
+    }
+    Move(x);
+    Move(ids);
+    Move(scores);
+    Data gate(BFLOAT16), act(BFLOAT16), actual(BFLOAT16), reference(BFLOAT16, {rows, H});
+    reference.dataDevice = DataDevice::CUDA;
+    reference.dataDeviceIds = {0};
+    reference.Allocate(false);
+    auto single = [&]() {
+        for (int r = 0; r < rows; ++r) {
+            Data in(BFLOAT16, {1, H}), out(BFLOAT16, {1, H});
+            in.FakeFrom(x, (size_t)r * H * 2);
+            out.FakeFrom(reference, (size_t)r * H * 2);
+            Check(FastllmCudaMergeMOENVFP4E4M3MarlinIndexed(
+                      in, gate, act, out, f.weights.data(), f.weights.size(),
+                      (int32_t *)ids.cudaData + r * topk, (float *)scores.cudaData + r * topk, 1,
+                      topk),
+                  "single-row path rejected");
+        }
+    };
+    auto multi = [&]() {
+        Check(FastllmCudaMergeMOENVFP4E4M3MarlinRows(x, gate, act, actual, f.weights.data(),
+                                                     f.weights.size(), (int32_t *)ids.cudaData,
+                                                     (float *)scores.cudaData, rows, topk),
+              "independent rows rejected");
+    };
+    single();
+    Cuda(cudaDeviceSynchronize());
+    if (foreignScratch) {
+        // Reproduce serial layer placement: workspace storage belongs to the
+        // previous GPU, while the next invocation's input and weights are on 0.
+        actual.Resize({rows, H});
+        for (Data *d : {&gate, &act, &actual}) {
+            d->ToDevice(DataDevice::CUDA, std::vector<int>{1}, false);
+            d->Allocate(false);
+        }
+        FastllmCudaSetDevice(0);
+    }
+    multi();
+    Cuda(cudaDeviceSynchronize());
+    for (Data *d : {&gate, &act, &actual}) {
+        cudaPointerAttributes attributes{};
+        Cuda(cudaPointerGetAttributes(&attributes, d->cudaData));
+        Check(attributes.device == 0, "independent-row workspace stayed on another GPU");
+    }
+    std::vector<uint16_t> a(rows * H), b(rows * H);
+    auto compare = [&]() {
+        Cuda(cudaMemcpy(a.data(), reference.cudaData, a.size() * sizeof(uint16_t),
+                        cudaMemcpyDeviceToHost));
+        Cuda(cudaMemcpy(b.data(), actual.cudaData, b.size() * sizeof(uint16_t),
+                        cudaMemcpyDeviceToHost));
+        Check(a == b, "independent rows changed single-token arithmetic");
+    };
+    compare();
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    Cuda(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+    multi();
+    Cuda(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+    Cuda(cudaGraphInstantiate(&exec, graph, 0));
+    std::vector<int> changedIds(rows * topk);
+    std::vector<__nv_bfloat16> changedInput(rows * H);
+    for (int iteration = 0; iteration < 4; ++iteration) {
+        // New routing and activations must be consumed by the same graph.
+        for (int i = 0; i < rows * topk; ++i)
+            changedIds[i] = (iteration * 5 + i / topk * 3 + i % topk * 7) % f.experts;
+        for (int i = 0; i < rows * H; ++i)
+            changedInput[i] = __float2bfloat16_rn(.3f * std::sin(i * .031f + iteration));
+        Cuda(cudaMemcpyAsync(ids.cudaData, changedIds.data(), ids.GetBytes(),
+                             cudaMemcpyHostToDevice, cudaStreamPerThread));
+        Cuda(cudaMemcpyAsync(x.cudaData, changedInput.data(), x.GetBytes(), cudaMemcpyHostToDevice,
+                             cudaStreamPerThread));
+        single();
+        Cuda(cudaGraphLaunch(exec, cudaStreamPerThread));
+        Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+        compare();
+    }
+    Cuda(cudaGraphExecDestroy(exec));
+    Cuda(cudaGraphDestroy(graph));
+    std::printf("exact_rows H=%d I=%d rows=%d topk=%d eager/graph=bitwise_equal\n", H,
+                f.intermediate, rows, topk);
+}
+
 int main(int argc, char **argv) { try {
     int devices = 0; cudaDeviceProp prop{};
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0 ||
@@ -231,7 +325,28 @@ int main(int argc, char **argv) { try {
         FastllmCudaSetLinearExactBatchThreshold(0);
         std::puts("Grouped decode PASS"); return 0;
     }
-    if (argc == 2 && std::strcmp(argv[1], "--tp-slab") == 0) {
+    if (argc == 2 && std::strcmp(argv[1], "--cross-device-rows") == 0) {
+            if (devices < 2)
+                return 77;
+            Fixture f(59, false, false, 4096, 2048, 16, true, true);
+            for (int rows : {2, 8})
+                for (int topk : {1, 8})
+                    CheckIndependentRows(f, rows, topk, true);
+            std::puts("Cross-device independent rows PASS");
+            return 0;
+        }
+        if (argc == 2 && std::strcmp(argv[1], "--exact-rows") == 0) {
+            for (auto shape :
+                 std::vector<std::pair<int, int>>{{256, 128}, {4096, 256}, {4096, 2048}}) {
+                Fixture f(53, false, false, shape.first, shape.second, 16, true, true);
+                for (int rows : {2, 3, 5, 7, 8})
+                    for (int topk : {1, 8, 16})
+                        CheckIndependentRows(f, rows, topk);
+            }
+            std::puts("Independent rows PASS");
+            return 0;
+        }
+        if (argc == 2 && std::strcmp(argv[1], "--tp-slab") == 0) {
         FastllmCudaSetWeightSlabBytes(16ULL << 20);
         Fixture f(47, false, false, 4096, 256, 8, false, true, true);
         for (auto &w : f.owned) Check(FastllmCudaIsWeightSlabPointer(w->cudaData), "expected slab source");

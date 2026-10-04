@@ -1533,6 +1533,16 @@ if (UNIT_TEST)
         set_tests_properties(cuda_nvfp4_marlin_moe PROPERTIES LABELS cuda RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
         add_test(NAME cuda_nvfp4_marlin_clamped_native COMMAND cuda_nvfp4_marlin_moe_test --clamped-native)
         set_tests_properties(cuda_nvfp4_marlin_clamped_native PROPERTIES LABELS cuda RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+        add_test(NAME cuda_nvfp4_marlin_exact_rows
+            COMMAND cuda_nvfp4_marlin_moe_test --exact-rows)
+        set_tests_properties(cuda_nvfp4_marlin_exact_rows PROPERTIES
+            LABELS cuda RUN_SERIAL TRUE SKIP_RETURN_CODE 77 TIMEOUT 180
+            PASS_REGULAR_EXPRESSION "Independent rows PASS")
+        add_test(NAME cuda_nvfp4_marlin_cross_device_rows
+            COMMAND cuda_nvfp4_marlin_moe_test --cross-device-rows)
+        set_tests_properties(cuda_nvfp4_marlin_cross_device_rows PROPERTIES
+            LABELS cuda RUN_SERIAL TRUE SKIP_RETURN_CODE 77 TIMEOUT 180
+            PASS_REGULAR_EXPRESSION "Cross-device independent rows PASS")
 
         add_executable(cuda_nvfp4_compact_moe_test test/basic/test_cuda_nvfp4_compact_moe.cu)
         target_link_libraries(cuda_nvfp4_compact_moe_test PRIVATE fastllm)

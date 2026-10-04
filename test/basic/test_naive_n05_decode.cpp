@@ -216,8 +216,8 @@ static void TestCache() {
 
 // Cover overlapping moves, the tiled/serial boundary, and non-vector rows.
 static void TestCacheEdges() {
-    for (auto dims : {std::pair<int, int>{1536, 1024}, {7, 13}, {8, 16}, {200, 56}})
-    for (int keep : {0, 1, 127, 128, 129, 511}) for (int drop : {1, 7, 128, 513}) {
+    for (auto dims : {std::pair<int, int>{1536, 1024}, {7, 13}, {8, 16}, {200, 56}, {512, 512}})
+    for (int keep : {0, 1, 127, 128, 129, 511, 1023}) for (int drop : {1, 7, 128, 513}) {
         if (quick && (keep < 127 || keep > 129 || drop != 1)) continue;
         Data key(BFLOAT16), value(BFLOAT16);
         Upload(key, {1, keep + drop, dims.first}, 817);
@@ -903,6 +903,57 @@ static void TestDecodeGraphs() {
     }
 }
 
+static void TestVerifyBlocks() {
+    for (int past : {3, 124, 127, 253, 2045, 2048, 4095, 32768, 131064})
+    for (int rows : {2, 4, 8}) for (int heads : {8, 64}) for (int window : {0, 128}) {
+        if (quick && past != 127 && past != 2045) continue;
+        const int kvHeads = heads == 8 ? 1 : 4;
+        const int localPast = window ? std::min(past, window - 1) : past;
+        const int keys = localPast + rows;
+        const int stride = kvHeads * 192 + (window ? 0 : 128);
+        Data q(BFLOAT16), k(BFLOAT16), v(BFLOAT16), iq(BFLOAT16), iw(BFLOAT16), sink(FLOAT32);
+        Upload(q, {1, rows, heads * 192}, 911);
+        Upload(k, {1, keys, stride}, 919);
+        Upload(v, {1, keys, kvHeads * 128}, 929);
+        Upload(iq, {1, rows, 16 * 128}, 937);
+        Upload(iw, {1, rows, 16}, 941);
+        Upload(sink, {heads}, 947);
+        Data indices, actual;
+        if (!window && keys > 2048)
+            FastllmCudaNaiveVerifyIndexer(iq, iw, k, 16, 128, past, 2048, true, indices);
+        FastllmCudaNaiveVerifyAttention(q, k, v, indices, sink, heads, kvHeads,
+                                       192, 128, localPast, window, actual);
+        auto block = Read<uint16_t>(actual);
+        std::vector<int> blockIndices;
+        if (!indices.dims.empty()) blockIndices = Read<int>(indices);
+        for (int row = 0; row < rows; ++row) {
+            // Materialize each ordinary decode input and its committed KV
+            // independently, including the already-trimmed sliding prefix.
+            const int visible = localPast + row + 1;
+            const int begin = window ? std::max(0, visible - window) : 0;
+            Data qr, kr, vr, iqr, iwr, selected, expected;
+            Split(q, 1, row, row + 1, qr);
+            Split(k, 1, begin, visible, kr);
+            Split(v, 1, begin, visible, vr);
+            if (!window && visible > 2048) {
+                Split(iq, 1, row, row + 1, iqr);
+                Split(iw, 1, row, row + 1, iwr);
+                FastllmCudaNaiveIndexer(iqr, iwr, kr, 16, 128, past + row, 2048, true, selected);
+                auto one = Read<int>(selected);
+                Require(std::equal(one.begin(), one.end(), blockIndices.begin() + row * 2048),
+                        "verification Indexer differs from sequential decode");
+                ++checks;
+            }
+            FastllmCudaNaiveAttention(qr, kr, vr, selected, sink, heads, kvHeads,
+                                      192, 128, visible - begin - 1, window, expected);
+            auto one = Read<uint16_t>(expected);
+            Require(std::equal(one.begin(), one.end(), block.begin() + (size_t)row * heads * 128),
+                    "verification attention differs from sequential decode");
+            ++checks;
+        }
+    }
+}
+
 int main(int argc,char **argv) {
     int devices=0;if(cudaGetDeviceCount(&devices)!=cudaSuccess || !devices) return 77;
     if (argc == 2 && std::strcmp(argv[1], "--invalid-indexer") == 0) {
@@ -922,6 +973,7 @@ int main(int argc,char **argv) {
             TestAttentionWidths(); TestAttentionShortDecode();
             TestAttentionSelectedValues(); TestAttentionGroupedScores();
             TestAttentionGlobalMma(); TestAttentionSwa();
+            TestVerifyBlocks();
         }
         TestDecodeGraphs();
         Require(cudaDeviceSynchronize()==cudaSuccess,"CUDA final synchronization failed");

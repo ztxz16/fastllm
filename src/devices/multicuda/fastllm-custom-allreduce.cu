@@ -1276,7 +1276,7 @@ bool FindOrRegisterCustomArPointers(CustomArState &state, int rank,
 
 template <typename T>
 bool LaunchCustomAr(CustomArState &state, CustomArRankData *rankData,
-                    T *output, int rank, int count, bool writeAfterBarrier) {
+                    T *output, int rank, int count, bool writeAfterBarrier, int threads) {
     constexpr int packedWidth = CustomArPacked<T>::size;
     int packedCount = count / packedWidth;
     const size_t bytes = (size_t)count * sizeof(T);
@@ -1290,19 +1290,19 @@ bool LaunchCustomAr(CustomArState &state, CustomArRankData *rankData,
         ? packedCount / ranks + packedCount % ranks
         : packedCount;
     int blocks = std::max(1, std::min(kCustomArMaxBlocks,
-                          (workPackedCount + kCustomArThreads - 1) /
-                              kCustomArThreads));
+                          (workPackedCount + threads - 1) /
+                              threads));
 #define CUSTOM_AR_RANK_CASE(RANKS)                                           \
     case RANKS:                                                              \
         if (useTwoStage) {                                                   \
             FastllmCustomAllReduceTwoStageKernel<T, RANKS>                   \
-                <<<blocks, kCustomArThreads, 0, cudaStreamPerThread>>>(       \
+                <<<blocks, threads, 0, cudaStreamPerThread>>>(               \
                     rankData, state.allSignals,                              \
                     state.allSignals.signals[rank], state.allScratch,        \
                     output, rank, packedCount);                              \
         } else {                                                             \
             FastllmCustomAllReduceKernel<T, RANKS>                           \
-                <<<blocks, kCustomArThreads, 0, cudaStreamPerThread>>>(       \
+                <<<blocks, threads, 0, cudaStreamPerThread>>>(               \
                     rankData, state.allSignals,                              \
                     state.allSignals.signals[rank], output, rank,            \
                     packedCount, writeAfterBarrier);                         \
@@ -1492,8 +1492,8 @@ bool LaunchCustomArPairAdd(CustomArState &state,
 
 bool RunCustomArCandidate(void *data, void *dest, int count,
                           int dataType, int deviceId,
-                          bool requireEnabledPath = false) {
-    if (count <= 0) {
+                          bool requireEnabledPath = false, int rowElements = 0) {
+    if (count <= 0 || rowElements < 0 || (rowElements && count % rowElements)) {
         return false;
     }
     // The kernels access data/dest as 16-byte aligned packets; a misaligned or
@@ -1515,7 +1515,12 @@ bool RunCustomArCandidate(void *data, void *dest, int count,
     CustomArState &state = GetCustomArState();
     int rank = -1;
     CustomArCallLease lease;
-    if (!lease.Acquire(state, bytes, dataType, deviceId,
+    // Both custom kernels sum ranks 0..N-1 in FP32 and round once.
+    // Keep that arithmetic when a verification block crosses the automatic
+    // message-size threshold; otherwise switching to NCCL changes logits.
+    const size_t policyBytes = rowElements ? (size_t)rowElements * typeBytes : bytes;
+    if (policyBytes % 16 != 0) return false;
+    if (!lease.Acquire(state, policyBytes, dataType, deviceId,
                        requireEnabledPath, rank)) {
         return false;
     }
@@ -1526,6 +1531,13 @@ bool RunCustomArCandidate(void *data, void *dest, int count,
         return false;
     }
     const bool useTwoStage = CustomArUseTwoStage(state.devices.size(), bytes);
+    // A small block of decode rows gives each rank only a few KiB of the
+    // reduce-scatter shard. More, smaller CTAs overlap peer-read latency while
+    // retaining every start/publish barrier and the rank-ordered FP32 sum.
+    // Ordinary collectives and larger blocks keep their established geometry.
+    const bool compactRows = rowElements > 0 && count > rowElements &&
+        count / rowElements <= 8 && policyBytes <= kCustomArAutoSmallBytes;
+    const int threads = useTwoStage && compactRows ? 64 : kCustomArThreads;
     const bool fusedCopyBack =
         data == dest && !useTwoStage &&
         bytes <= (size_t)kCustomArMaxBlocks * kCustomArThreads * 16 &&
@@ -1539,15 +1551,15 @@ bool RunCustomArCandidate(void *data, void *dest, int count,
     if (dataType == fastllm::DataType::FLOAT16) {
         launched = LaunchCustomAr(state, rankData,
                                   reinterpret_cast<half *>(kernelDest),
-                                  rank, count, fusedCopyBack);
+                                  rank, count, fusedCopyBack, threads);
     } else if (dataType == fastllm::DataType::BFLOAT16) {
         launched = LaunchCustomAr(
             state, rankData, reinterpret_cast<__nv_bfloat16 *>(kernelDest),
-            rank, count, fusedCopyBack);
+            rank, count, fusedCopyBack, threads);
     } else if (dataType == fastllm::DataType::FLOAT32) {
         launched = LaunchCustomAr(state, rankData,
                                   reinterpret_cast<float *>(kernelDest),
-                                  rank, count, fusedCopyBack);
+                                  rank, count, fusedCopyBack, threads);
     }
     if (!launched) {
         return false;
@@ -2585,6 +2597,12 @@ bool FastllmCudaCustomAllReduceInit(const std::vector<int> &devices) {
 bool FastllmCudaCustomAllReduce(void *data, void *dest, int count,
                                 int dataType, int deviceId) {
     return RunCustomArCandidate(data, dest, count, dataType, deviceId, true);
+}
+
+bool FastllmCudaCustomAllReduceRows(void *data, void *dest, int count,
+                                    int rowElements, int dataType, int deviceId) {
+    if (rowElements <= 0) return false;
+    return RunCustomArCandidate(data, dest, count, dataType, deviceId, true, rowElements);
 }
 
 bool FastllmCudaCustomAllReducePairAdd(void *first, void *second, void *dest,
