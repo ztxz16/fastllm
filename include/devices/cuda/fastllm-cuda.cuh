@@ -1761,6 +1761,11 @@ struct FastllmCudaMoeGGUFCacheView {
     // Only valid for the same input/shape and workspace within one MoE call.
     // Gate/down scratch may change; the input prefix must remain untouched.
     bool q8InputPrepared = false;
+    // Optional compact list of active routes into the original [rows, topk]
+    // batch. Input rows and perExpert destinations use this mapping; slots
+    // and activation scratch use compact order. Entries must be distinct.
+    const int32_t *routeMap = nullptr;
+    int routeCount = 0;
 };
 bool FastllmCudaMoeGGUFCacheSupported(int type, int columns);
 bool FastllmCudaMoeGlm5GGUFCacheSupported(int gateType, int downType, int hidden, int inter);
@@ -1779,6 +1784,7 @@ bool FastllmCudaMoeV41GGUFCacheCompute(
         const float *scores, int topk, float swigluLimit, float *perExpert);
 // Q8_1 input/mid activations and per-expert down results, reused on one stream.
 size_t FastllmCudaMoeGGUFCacheWorkspaceBytes(int hidden, int inter);
+size_t FastllmCudaMoeGGUFCacheBatchWorkspaceBytes(int hidden, int inter, int rows, int topk);
 // True when both stages support Q8 for single-token decode. Each supported
 // stage can run independently for decode/verifier rows. Large prefill batches
 // retain their existing grouped MMQ or legacy dispatch.
