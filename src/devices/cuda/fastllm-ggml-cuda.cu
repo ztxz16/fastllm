@@ -1,5 +1,5 @@
 #include "fastllm-cuda-gguf-projections.h"
-#include "fastllm-cuda-gguf-planar-t8.h"
+#include "fastllm-cuda-gguf-planar.h"
 #include "fastllm-cuda-gguf-linear-add.h"
 #include "fastllm-gguf-store.cuh"
 //
@@ -2696,6 +2696,37 @@ static bool GgufSharedProjectionCanRun(const fastllm::Data &input,
 
 } // namespace
 
+static bool GgufPlanarProjectionShape(int type, int tokens, int columns, int outputs) {
+#if defined(USE_ROCM)
+    return false;
+#else
+    // Use one arithmetic path for plain and fused projections at 1..8 rows.
+    // Larger batches keep the established MMQ selection.
+    return tokens >= 1 && tokens <= 8 &&
+        FastllmGgufPlanarSupported(type, tokens, columns, outputs);
+#endif
+}
+
+static bool GgufTryPlanarProjection(const void *input, const void *weight, void *output,
+        int type, int tokens, int columns, int outputs, int mode,
+        int keyHeads = 0, int groups = 0, int headDim = 0) {
+#if defined(USE_ROCM)
+    return false;
+#else
+    if (!GgufPlanarProjectionShape(type, tokens, columns, outputs)) return false;
+    void *workspace = nullptr;
+    if (FastllmCudaTryMalloc(&workspace, FastllmGgufPlanarBytes(tokens, columns)) !=
+            FASTLLM_CUDA_TRY_MALLOC_SUCCESS) return false;
+    const auto stream = cudaStreamPerThread;
+    const bool quantized = FastllmGgufQuantizePlanar(input, 1, workspace, tokens, columns,
+        stream, keyHeads, groups, headDim);
+    const bool projected = quantized && FastllmGgufProjectPlanar(type, mode, weight, nullptr,
+        workspace, output, tokens, columns, outputs, outputs, stream);
+    FastllmCudaFree(workspace);
+    return projected;
+#endif
+}
+
 static bool FastllmGGUFLinearAddImpl(const fastllm::Data &input, fastllm::Data &weight,
         const fastllm::Data &bias, fastllm::Data &output, int keyHeads, int valueHeads, int headDim) {
     using namespace fastllm;
@@ -2712,6 +2743,8 @@ static bool FastllmGGUFLinearAddImpl(const fastllm::Data &input, fastllm::Data &
         default: return false;
     }
     cudaStream_t stream = cudaStreamPerThread;
+    if (GgufTryPlanarProjection(input.cudaData, weight.cudaData, output.cudaData,
+            type, n, m, k, 1, keyHeads, permuted ? valueHeads/keyHeads : 0, headDim)) return true;
     if (!permuted && (type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ2_XS)) {
         return FastllmCudaHalfMatMulGGUFMMVQAddTo(input.cudaData, weight.cudaData,
             output.cudaData, weight.ggmlType, n, m, k, stream);
@@ -2804,16 +2837,19 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
         FastllmCudaHalfMatMulGGUFMMQ(
             cudaInput, weight.cudaData, cudaOutput, weight.ggmlType,
             n, m, k, stream);
-    const bool usedExtendedMmvq = (!forceDequant || allowSmallMmvq) && !usedMmq &&
+    const bool usedPlanar = (!forceDequant || allowSmallMmvq) && !usedMmq &&
+        GgufTryPlanarProjection(cudaInput, weight.cudaData, cudaOutput,
+            weight.ggmlType, n, m, k, 0);
+    const bool usedExtendedMmvq = (!forceDequant || allowSmallMmvq) && !usedMmq && !usedPlanar &&
         FastllmCudaHalfMatMulGGUFMMVQ(
             cudaInput, weight.cudaData, cudaOutput, weight.ggmlType,
             n, m, k, stream);
 
-    const bool usedDirectGemv = n == 1 && !usedMmq && !usedExtendedMmvq && !has_vec_dot &&
+    const bool usedDirectGemv = n == 1 && !usedMmq && !usedPlanar && !usedExtendedMmvq && !has_vec_dot &&
         FastllmGgufDirectGemv(cudaInput, weight.cudaData, cudaOutput,
                              ggufType, m, k, stream);
 
-    if (!usedDirectGemv && !usedMmq && !usedExtendedMmvq &&
+    if (!usedDirectGemv && !usedMmq && !usedPlanar && !usedExtendedMmvq &&
         (forceDequant || n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) &&
         dequant != nullptr) {
         auto handle = getFastllmCublasHandle();
@@ -2823,7 +2859,7 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
         FastllmGGUFDequantGemm(
                 cudaInput, weight, cudaOutput, n, m, k,
                 workspace, workspaceBytes, dequant, handle, stream);
-    } else if (!usedDirectGemv && !usedMmq && !usedExtendedMmvq) {
+    } else if (!usedDirectGemv && !usedMmq && !usedPlanar && !usedExtendedMmvq) {
         q8Input = (block_q8_1*)FastllmCudaMalloc(n * m * sizeof(half));
         quantize_row_q8_1_cuda (
             cudaInput, q8Input, m, n, 1, m, GGML_TYPE_Q8_1, stream
@@ -3071,6 +3107,24 @@ bool FastllmCudaGGUFLinearShared(const fastllm::Data &input,
         }
     }
     const int columns = input.dims.back(), rows = input.Count(0)/columns;
+#if !defined(USE_ROCM)
+    bool planar = true;
+    for (int i = 0; i < count; ++i)
+        planar = planar && GgufPlanarProjectionShape(weights[i]->ggmlType, rows, columns, weights[i]->dims[0]);
+    if (planar) {
+        void *workspace = nullptr;
+        if (FastllmCudaTryMalloc(&workspace, FastllmGgufPlanarBytes(rows, columns)) ==
+                FASTLLM_CUDA_TRY_MALLOC_SUCCESS) {
+            const auto stream = cudaStreamPerThread;
+            FastllmGgufQuantizePlanar(input.cudaData, 1, workspace, rows, columns, stream);
+            for (int i = 0; i < count; ++i)
+                FastllmGgufProjectPlanar(weights[i]->ggmlType, 0, weights[i]->cudaData, nullptr,
+                    workspace, outputs[i]->cudaData, rows, columns, weights[i]->dims[0], weights[i]->dims[0], stream);
+            FastllmCudaFree(workspace);
+            return true;
+        }
+    }
+#endif
     block_q8_1 *q8 = nullptr;
     if (FastllmCudaTryMalloc(reinterpret_cast<void **>(&q8),
             size_t(rows)*(columns/QK8_1)*sizeof(block_q8_1)) != FASTLLM_CUDA_TRY_MALLOC_SUCCESS) return false;
@@ -3083,28 +3137,24 @@ bool FastllmCudaGGUFLinearShared(const fastllm::Data &input,
     return true;
 }
 
-// Only the verifier gate/up boundary uses planar activations. Producers write
-// the final layout directly; legacy consumers continue receiving block_q8_1.
+// Share one quantization and one projection launch, including mixed formats.
 static bool GgufTryPlanarGateUp(const void *input, const void *gate, const void *up,
         void *output, int gateType, int upType, int rows, int columns, int outputs) {
-    if (rows != 8 || columns != 5120 || outputs < 4096 ||
-        !FastllmGgufPlanarT8Supported(gateType) || !FastllmGgufPlanarT8Supported(upType)) return false;
+#if defined(USE_ROCM)
+    return false;
+#else
+    if (!GgufPlanarProjectionShape(gateType, rows, columns, outputs) ||
+        !GgufPlanarProjectionShape(upType, rows, columns, outputs)) return false;
     void *workspace = nullptr;
-    if (FastllmCudaTryMalloc(&workspace, FASTLLM_GGUF_PLANAR_T8_BYTES) !=
+    if (FastllmCudaTryMalloc(&workspace, FastllmGgufPlanarBytes(rows, columns)) !=
         FASTLLM_CUDA_TRY_MALLOC_SUCCESS) return false;
     const auto stream = cudaStreamPerThread;
-    FastllmGgufQuantizePlanarT8(input, workspace, stream);
-    if (gateType == upType) {
-        FastllmGgufProjectPlanarT8(gateType, 3, gate, up, workspace,
-            output, outputs, outputs, stream);
-    } else {
-        FastllmGgufProjectPlanarT8(gateType, 0, gate, nullptr, workspace,
-            output, outputs, outputs, stream);
-        FastllmGgufProjectPlanarT8(upType, 2, up, nullptr, workspace,
-            output, outputs, outputs, stream);
-    }
+    const bool quantized = FastllmGgufQuantizePlanar(input, 1, workspace, rows, columns, stream);
+    const bool projected = quantized && FastllmGgufGateUpPlanar(gateType, upType, gate, up, workspace,
+        output, rows, columns, outputs, outputs, stream);
     FastllmCudaFree(workspace);
-    return true;
+    return projected;
+#endif
 }
 
 bool FastllmCudaGGUFMixedGateUp(const fastllm::Data &input,
@@ -3264,7 +3314,7 @@ bool FastllmCudaHalfGgufMergedGateUpSiluMul(
         fastllm::Data &output,
         int n, int m, int k) {
     const ggml_type type = (ggml_type)weight.ggmlType;
-    if (n == 8 && m == 5120 && k >= 4096 &&
+    if (GgufPlanarProjectionShape(type, n, m, k) &&
         input.dataType == fastllm::FLOAT16 && output.dataType == fastllm::FLOAT16 &&
         weight.dataType == fastllm::DATA_GGUF_FORMAT &&
         GgufDenseLocal(input) && GgufDenseLocal(output) &&
@@ -3277,10 +3327,10 @@ bool FastllmCudaHalfGgufMergedGateUpSiluMul(
         !GgufOverlap(input,output) && !GgufOverlap(weight,output)) {
         const auto *tensor = static_cast<const ggml_tensor *>(weight.ggmlTensor);
         int major = 0;
-        if (FastllmGgufPlanarT8Supported(type) && tensor && tensor->type == type &&
+        if (tensor && tensor->type == type &&
             tensor->ne[0] == m && tensor->ne[1] == 2*k &&
             tensor->nb[0] == ggml_type_size(type) && tensor->nb[1] == ggml_row_size(type,m) &&
-            (weight.forceGGUFFp32Dequant ||
+            (n != 8 || weight.forceGGUFFp32Dequant ||
                 (cudaDeviceGetAttribute(&major,cudaDevAttrComputeCapabilityMajor,FastllmCudaGetDevice()) == cudaSuccess && major < 10))) {
             const char *up = static_cast<const char *>(weight.cudaData)+size_t(k)*ggml_row_size(type,m);
             if (GgufTryPlanarGateUp(input.cudaData,weight.cudaData,up,output.cudaData,

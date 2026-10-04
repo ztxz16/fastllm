@@ -49,6 +49,31 @@ static void Permuted(ggml_type type, int t, int kh, int groups) {
             FastllmCudaAddTo(p.ref, middle, 1);
         });
 }
+static void MergedGate(ggml_type type, int t, int k, int n) {
+    context = "MergedGate type=" + std::to_string(type) + " T=" + std::to_string(t) +
+              " K=" + std::to_string(k);
+    Data x(FLOAT16, {1, t, k}), merged(DATA_GGUF_FORMAT, int(type), {2 * n, k});
+    Allocate(x);
+    Allocate(merged);
+    merged.strides = {1};
+    merged.forceGGUFFp32Dequant = true;
+    Projection p(type, t, k, n), q(type, t, k, n);
+    auto gate = Weights(type, n, k), up = gate;
+    std::rotate(up.begin(), up.begin() + ggml_row_size(type, k), up.end());
+    Upload(q.w, up);
+    gate.insert(gate.end(), up.begin(), up.end());
+    Upload(merged, gate);
+    Graph([&] {
+        Check(FastllmCudaHalfGgufMergedGateUpSiluMul(x, merged, p.y, t, k, n), "merged gate rejected");
+    }, [&] { p.Compare(); }, [&](int seed) {
+        Upload(x, Input(t, k, seed * 37));
+        p.Reference(x);
+        q.Reference(x);
+        FastllmCudaSilu(p.ref, p.ref);
+        FastllmCudaMulTo(p.ref, q.ref, 1.0f);
+    });
+}
+
 static void MixedNorm(int t, int n, bool gguf) {
     context =
         "MixedNorm T=" + std::to_string(t) + " N=" + std::to_string(n) + " GGUF=" + std::to_string(gguf);
@@ -138,6 +163,11 @@ int main() {
             for (int a = 0; a < nt; ++a)
                 Gate(types[a], types[(a + 1) % nt], t, 5120, 129);
         std::cout << "PASS mixed gate epilogue" << std::endl;
+        for (auto type : types)
+            for (int t = 1; t <= 8; ++t)
+                for (int k : {768, 4096, 5120, 6144})
+                    MergedGate(type, t, k, 129);
+        std::cout << "PASS merged gate epilogue" << std::endl;
         for (auto type : types)
             if (type != GGML_TYPE_IQ2_XXS && type != GGML_TYPE_IQ1_M)
                 for (int t = 1; t <= 8; ++t)

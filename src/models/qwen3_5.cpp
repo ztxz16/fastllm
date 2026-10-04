@@ -5631,6 +5631,9 @@ namespace fastllm {
             outputDims.back() = k;
             output.Resize(outputDims);
             output.Allocate(false);
+            if (FastllmCudaGGUFMixedGateUp(input, gateWeight, upWeight, output)) {
+                return true;
+            }
             return FastllmCudaHalfGgufGateUpSiluMul(
                 input, gateWeight, upWeight, output, n, m, k);
         }
@@ -5652,7 +5655,7 @@ namespace fastllm {
             const int m = input.dims.back();
             const int n = input.Count(0) / m;
             const int k = weight.dims[0] / 2;
-            if (n != 1 && n != 8) {
+            if (n <= 0 || n > 8) {
                 return false;
             }
 
