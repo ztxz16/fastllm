@@ -14,6 +14,11 @@
 #if !defined(FASTLLM_CUDA_LEGACY_ONLY) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
 #define FASTLLM_NAIVE_SWA_FLASHINFER
 #include "naive-n05-swa-flashinfer.cuh"
+#endif
+
+#if !defined(FASTLLM_CUDA_LEGACY_ONLY)
+// Keep host launch stubs and device definitions in every architecture pass.
+// MMA bodies and runtime dispatch already guard the SM80-only instructions.
 #define FASTLLM_NAIVE_DSA_MMA
 #include "naive-n05-dsa-mma.cuh"
 #endif
