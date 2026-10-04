@@ -29,7 +29,7 @@ struct Fixture {
     std::vector<std::vector<float>> decoded;
     Fixture(int seed, bool invalid = false, bool planar = false,
             int hidden = 256, int intermediate = 128, int experts = 16,
-            bool directMemory = true)
+            bool directMemory = true, bool variedScales = false)
         : hidden(hidden), intermediate(intermediate), experts(experts), weights(2 + experts * 2, nullptr) {
         const int H=hidden,I=intermediate,E=experts;
         for (int e = 0; e < E; ++e) for (int matrix = 0; matrix < 2; ++matrix) {
@@ -46,13 +46,19 @@ struct Fixture {
                     if (r == 0 || (!matrix && r == I)) d->scales.push_back(global);
                 } else std::memcpy(bytes + r * stride, &global, 4);
                 for (int g = 0; g < k / 16; ++g) {
-                    bytes[planar ? n * k / 2 + r * (k / 16) + g : r * stride + 12 + g * 9] = (invalid && r == 0 && g == 0) ? 1 : 56; // E4M3 1
+                    // Exercise unequal group scales as well as the uniform-scale fixtures.
+                    int exponent = variedScales
+                        ? int(Mix(r * (k / 16) + g + e * 719) % 7) - 3 : 0;
+                    float groupScale = std::ldexp(1.0f, exponent);
+                    // E4M3: biased exponent 7 and zero mantissa encode 1.0.
+                    bytes[planar ? n * k / 2 + r * (k / 16) + g : r * stride + 12 + g * 9] =
+                        (invalid && r == 0 && g == 0) ? 1 : 56 + exponent * 8;
                     for (int j = 0; j < 8; ++j) {
                         int c0 = Mix(r * k + g * 16 + j * 2 + e * n * k + seed * 719) % 16;
                         int c1 = Mix(r * k + g * 16 + j * 2 + 1 + e * n * k + seed * 719) % 16;
                         bytes[planar ? r * (k / 2) + g * 8 + j : r * stride + 4 + g * 9 + j] = c0 | (c1 << 4);
-                        full[r * k + g * 16 + j * 2] = global * Code(c0);
-                        full[r * k + g * 16 + j * 2 + 1] = global * Code(c1);
+                        full[r * k + g * 16 + j * 2] = global * groupScale * Code(c0);
+                        full[r * k + g * 16 + j * 2 + 1] = global * groupScale * Code(c1);
                     }
                 }
             }
@@ -219,6 +225,15 @@ int main(int argc, char **argv) { try {
         }
         FastllmCudaSetLinearExactBatchThreshold(0);
         std::puts("Grouped decode PASS"); return 0;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--decode-tiles") == 0) {
+        // Keep the single-token reduction checks small enough for Sanitizer.
+        Fixture f(43, false, false, 1536, 768, 16, true, true);
+        Run(f, 1, 1, 0.0f, .15f, true, true);
+        Run(f, 1, 16, 0.0f, .15f, true, true);
+        Run(f, 1, 16, 10.0f, 15.0f, true, true);
+        std::puts("Decode tile scheduling PASS");
+        return 0;
     }
     if (argc == 2 && std::strcmp(argv[1], "--narrow-prefill") == 0) {
         Fixture narrow(19,false,false,256,256,16,true);

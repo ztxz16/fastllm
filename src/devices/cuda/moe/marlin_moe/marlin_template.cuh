@@ -2067,9 +2067,8 @@ __global__ void Marlin(
 
       cp_async_wait<0>();
       if constexpr (a_type == fastllm_marlin_moe_types::kBFloat16 &&
-                    s_type == fastllm_marlin_moe_types::kFE4M3fn &&
-                    !m_block_size_8) {
-        // Grouped BF16 NVFP4 reduction can overlap the last B-fragment
+                    s_type == fastllm_marlin_moe_types::kFE4M3fn) {
+        // BF16 NVFP4 reduction can overlap the last B-fragment
         // fetch in shared memory. cp_async_wait is per-thread: wait for
         // every warp before reusing the storage for reduction.
         __syncthreads();
