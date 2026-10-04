@@ -4,6 +4,10 @@ KVMem 用固定大小的 GPU KV 池和按需分配的主机备份保存长上下
 
 当前接入 Qwen3 和 Qwen3.5 的单卡 CUDA 普通解码，以及 Qwen3.5 的 DFlash/MTP 推测解码。支持 head_dim 为 128/256 的 FP16/BF16 MHA/GQA，计算与 KV 类型须一致。启用后目标模型使用单请求 eager 路径并关闭历史/prefix 缓存；尚不支持 TP、多模态、滑窗注意力或带位置偏置的目标注意力。未传入配置时，原有缓存、CUDA Graph、融合算子和推测解码路径保持原样。
 
+## 参考来源
+
+本功能的设计参考了 GitHub 项目 [kvmem/kvmem-llama.cpp](https://github.com/kvmem/kvmem-llama.cpp)，主要借鉴其固定 GPU KV 工作集、主机分层存储，以及基于 query 和 pre-RoPE mean-K 检索历史 KV 的思路。FastLLM 结合自身的分页注意力、请求生命周期和 DFlash/MTP 提交与回滚机制进行了适配。感谢该项目的作者与贡献者。
+
 ## 使用
 
 在 `warmup()` 或第一次推理之前配置，配置后不要修改设备、计算/KV 类型或并发数：
