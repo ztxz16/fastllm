@@ -10,6 +10,7 @@
 
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-moe-policy.h"
 #endif
 #ifdef USE_NUMAS
 #include "devices/numas/numasdevice.h"
@@ -3184,6 +3185,18 @@ namespace fastllm {
 
         Data *current = &hiddenStates;
         Data *next = &hiddenStatesTemp;
+#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
+        // A layer-partitioned model owns one cache on each GPU. Advance each
+        // cache once per ordinary decode token and close it on every exit.
+        struct DecodeCaches {
+            std::map<int, void *> states;
+            ~DecodeCaches() {
+                for (const auto &state : states) FastllmCudaEndMoeDecode(state.second);
+            }
+        } decodeCaches;
+        const bool frequencyDecode = sequence == 1 && !(mtpEnabled && mtpWeightsReady) &&
+                                     kdaReplay == nullptr;
+#endif
         for (int layer = 0; layer < block_cnt; layer++) {
             ApplyDeviceMap(deviceMap, layer + 1, block_cnt);
             const std::string prefix = languagePrefix + "layers." +
@@ -3230,6 +3243,21 @@ namespace fastllm {
                     weight[prefix + "mlp.down_proj.weight"],
                     ffnOutput);
             } else {
+#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
+                auto &experts = expertWeights[layer];
+                if (frequencyDecode && normalizedFfn.dataDevice == DataDevice::CUDA &&
+                    !normalizedFfn.dataDeviceIds.empty() && experts.size() >= 4 && experts[2] &&
+                    experts[2]->dataType == DataType::DATA_GGUF_FORMAT) {
+                    const int device = normalizedFfn.dataDeviceIds[0];
+                    if (decodeCaches.states.count(device) == 0) {
+                        FastllmCudaSetDevice(device);
+                        if (void *state = FastllmCudaBeginMoeDecode(
+                                experts.data(), experts.size(), num_experts_per_tok)) {
+                            decodeCaches.states.emplace(device, state);
+                        }
+                    }
+                }
+#endif
                 RunMoe(layer, normalizedFfn, sequence, ffnOutput);
             }
             DeepSeekV4HcPost(

@@ -124,7 +124,9 @@ keep their previous resident-GPU/CPU routing.
 Single-row decode reuses the Q8 input prepared by resident GPU experts when
 computing staged experts. Verifier rows only reuse that scratch for consecutive
 routes of the same input row. Qwen's independent shared expert is submitted
-while the single-row NUMA jobs and expert transfers are active.
+while the single-row NUMA jobs and expert transfers are active. GLM GGUF
+ordinary decode starts and ends its frequency policy once per CUDA device per
+token; speculative/replay calls retain their existing routing.
 
 A zero per-device budget also supports this streamed path for ordinary GGUF
 with registered NUMA experts. It allocates metadata and temporary staging
