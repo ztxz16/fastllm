@@ -411,6 +411,7 @@ void FastllmCustomAllReduceTwoStageKernel(
     // consumer threads.  The start barrier of the next collective also keeps
     // this shared scratch from being reused before every rank finishes gather.
     for (int offset = thread; offset < largestPart; offset += stride) {
+        P values[Ranks];
 #pragma unroll
         for (int source = 0; source < Ranks; ++source) {
             const int sourceCount = source == Ranks - 1
@@ -418,7 +419,19 @@ void FastllmCustomAllReduceTwoStageKernel(
             if (offset < sourceCount) {
                 const P *sourceScratch =
                     reinterpret_cast<const P *>(allScratch.scratch[source]);
-                packedOutput[source * part + offset] = sourceScratch[offset];
+                values[source] = sourceScratch[offset];
+            }
+        }
+        // Issue peer reads before their dependent output stores, allowing
+        // remote memory latency to overlap across ranks. This compiler fence
+        // does not replace the system-scope publication barrier above.
+        asm volatile("" ::: "memory");
+#pragma unroll
+        for (int source = 0; source < Ranks; ++source) {
+            const int sourceCount = source == Ranks - 1
+                ? packedCount - source * part : part;
+            if (offset < sourceCount) {
+                packedOutput[source * part + offset] = values[source];
             }
         }
     }
