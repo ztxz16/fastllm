@@ -50,6 +50,9 @@
 #include <set>
 #include <sstream>
 #include <utility>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 namespace fastllm {
 #ifdef USE_NUMAS
@@ -1445,6 +1448,7 @@ namespace fastllm {
         std::vector<std::vector<int>> workerCpus;
         bool hostMoe = false;
         std::vector<bool> hostMoeLayers;
+        int loadingExpertLayer = -1;
 #if defined(USE_CUDA) && !defined(USE_ROCM)
         std::shared_ptr<FastllmCudaMoeExpertParallel> expertParallel;
 #endif
@@ -1525,6 +1529,110 @@ namespace fastllm {
             }
         }
     };
+
+#ifdef USE_CUDA
+    static DivisionScheme Qwen4ExpertTpDivision(const Data &source, const Data &down,
+            const std::vector<int> &devices, int axis, int layer) {
+        const int count = devices.size();
+        const int width = axis == 0 ? source.dims[0] / 2 : source.dims[1];
+        // NVFP4 uses 128-column tiles. Packed GGUF only needs its down
+        // projection's block alignment and the 32-value Q8 activation blocks.
+        int splitUnit = 128;
+        if (source.dataType == DataType::DATA_GGUF_FORMAT) {
+            AssertInFastLLM(down.dataType == DataType::DATA_GGUF_FORMAT && down.ggmlType >= 0,
+                            "Qwen4 TP GGUF expert requires a packed down projection.");
+            splitUnit = std::max(32, int(ggml_blck_size((ggml_type)down.ggmlType)));
+        }
+        AssertInFastLLM(width > 0 && width % splitUnit == 0,
+                        "Qwen4 TP expert width cannot satisfy its packed-column alignment.");
+        DivisionScheme scheme;
+        int offset = 0;
+        for (int r = 0; r < count; ++r) {
+            const int blocks = width / splitUnit / count +
+                ((r + layer) % count < (width / splitUnit) % count ? 1 : 0);
+            const int end = offset + blocks * splitUnit;
+            scheme[devices[r]] = {{offset, end}};
+            if (axis == 0) scheme[devices[r]].push_back({width + offset, width + end});
+            offset = end;
+        }
+        return scheme;
+    }
+#endif
+
+    int Qwen4ExpModel::StreamingThreadTpExpertLayer(const std::string &name) const {
+#ifdef USE_CUDA
+        const auto arch = weight.dicts.find("gguf_architecture");
+        if (!threadTpState || threadTpRank >= 0 ||
+            arch == weight.dicts.end() || arch->second != "qwen4exp") return -1;
+        const std::string prefix = languagePrefix + "layers.";
+        if (!Qwen4StartsWith(name, prefix)) return -1;
+        const char *start = name.c_str() + prefix.size();
+        char *end = nullptr;
+        const long layer = std::strtol(start, &end, 10);
+        if (end == start || layer < 0 || layer >= block_cnt ||
+            !Qwen4StartsWith(end, ".mlp.experts.") ||
+            threadTpState->hostMoeLayers[layer]) return -1;
+        return int(layer);
+#else
+        return -1;
+#endif
+    }
+
+    int Qwen4ExpModel::GetWeightLoadPriority(const std::string &tensorName,
+            const std::vector<std::pair<std::string, DataType>> &) const {
+        const int layer = StreamingThreadTpExpertLayer(tensorName);
+        return layer < 0 ? 0 : layer - block_cnt;
+    }
+
+    bool Qwen4ExpModel::ShouldLoadWeightSeriallyBeforeOthers(const std::string &tensorName,
+            const std::vector<std::pair<std::string, DataType>> &) const {
+        return StreamingThreadTpExpertLayer(tensorName) >= 0;
+    }
+
+    void Qwen4ExpModel::OnWeightLoadGroupStarted(const std::set<std::string> &names) {
+        if (!threadTpState) return;
+        int &current = threadTpState->loadingExpertLayer;
+        current = -1;
+        for (const auto &name : names) {
+            const int layer = StreamingThreadTpExpertLayer(name);
+            if (layer < 0) continue;
+            AssertInFastLLM(current < 0 || current == layer,
+                            "Qwen4 TP expert load group contains multiple layers.");
+            current = layer;
+        }
+    }
+
+    void Qwen4ExpModel::OnWeightLoadGroupFinished() {
+#ifdef USE_CUDA
+        if (!threadTpState || threadTpState->loadingExpertLayer < 0) return;
+        const int layer = std::exchange(threadTpState->loadingExpertLayer, -1);
+        auto &devices = threadTpState->devices;
+        const int previousDevice = FastllmCudaGetDevice();
+        // The loader has joined all readers and finished gate/up merging.
+        // Upload one layer before reading the next; the parent owns the shards
+        // until PrepareThreadTp transfers them to rank models. Splitting again
+        // there reuses these shards without retaining or rereading CPU payloads.
+        for (int expert = 0; expert < num_experts; ++expert) {
+            const std::string prefix = languagePrefix + "layers." + std::to_string(layer) +
+                ".mlp.experts." + std::to_string(expert) + ".";
+            Data &gate = weight.weight.at(prefix + "gateup_proj.weight");
+            Data &down = weight.weight.at(prefix + "down_proj.weight");
+            AssertInFastLLM(gate.dims.size() == 2 && down.dims.size() == 2,
+                            "Qwen4 TP streaming expert has an invalid shape.");
+            for (int axis : {0, 1}) {
+                Data &source = axis == 0 ? gate : down;
+                auto scheme = Qwen4ExpertTpDivision(source, down, devices, axis, layer);
+                Data bias;
+                AssertInFastLLM(SplitMultiCudaWeight(source, bias, devices, scheme, axis, true),
+                                "Qwen4 TP failed to stream " + source.name);
+            }
+        }
+        FastllmCudaSetDevice(previousDevice);
+#if defined(__GLIBC__)
+        malloc_trim(0);
+#endif
+#endif
+    }
 
     void Qwen4ExpModel::InitThreadTp() {
 #ifdef USE_CUDA
@@ -1803,36 +1911,10 @@ namespace fastllm {
                     axis = 1;
                 }
                 if (axis >= 0 && expertWeight) {
-                    // Grouped NVFP4 Marlin needs 128 intermediate columns. A 640
-                    // wide expert on four GPUs is 256/128/128/128. With more
-                    // ranks than aligned blocks, some ranks own an empty
-                    // routed slice. Rotate these slices per layer while keeping
-                    // each gate/down pair on the same intermediate range.
-                    const int width = axis == 0 ? source.dims[0] / 2 : source.dims[1];
-                    int splitUnit = 128;
-                    if (source.dataType == DataType::DATA_GGUF_FORMAT) {
-                        const std::string pairName = axis == 1 ? name :
-                            name.substr(0, name.size() - std::string("gateup_proj.weight").size()) + "down_proj.weight";
-                        const Data &down = weight.weight.at(pairName);
-                        AssertInFastLLM(down.dataType == DataType::DATA_GGUF_FORMAT && down.ggmlType >= 0,
-                                        "Qwen4 TP GGUF expert requires a packed down projection.");
-                        // GGUF blocks are powers of two. Align columns to the
-                        // packed down blocks and the 32-value Q8 activations,
-                        // rather than imposing NVFP4's 128-column tiles. Q2_0
-                        // then splits a 640-wide expert evenly into 320/320.
-                        splitUnit = std::max(32, int(ggml_blck_size((ggml_type)down.ggmlType)));
-                    }
-                    AssertInFastLLM(width > 0 && width % splitUnit == 0,
-                                    "Qwen4 TP expert width cannot satisfy its packed-column alignment.");
-                    int offset = 0;
-                    for (int r = 0; r < count; ++r) {
-                        const int blocks = width / splitUnit / count +
-                            ((r + expertLayer) % count < (width / splitUnit) % count ? 1 : 0);
-                        const int end = offset + blocks * splitUnit;
-                        scheme[devices[r]] = {{offset, end}};
-                        if (axis == 0) scheme[devices[r]].push_back({width + offset, width + end});
-                        offset = end;
-                    }
+                    const std::string downName = axis == 1 ? name :
+                        name.substr(0, name.size() - std::string("gateup_proj.weight").size()) + "down_proj.weight";
+                    scheme = Qwen4ExpertTpDivision(source, weight.weight.at(downName),
+                                                  devices, axis, expertLayer);
                 } else if (axis >= 0) {
                     scheme = axis == 0 ? equalScheme(source.dims[0] / 2, 2)
                                        : equalScheme(source.dims[1]);

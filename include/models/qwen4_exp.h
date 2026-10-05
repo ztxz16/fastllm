@@ -31,6 +31,12 @@ namespace fastllm {
         void OnWeightLoaded(const std::string &weightName,
                             const std::set<std::string> &finishedWeightNames) override;
         void OnModelWeightsLoaded() override;
+        int GetWeightLoadPriority(const std::string &tensorName,
+                const std::vector<std::pair<std::string, DataType>> &mappedWeights) const override;
+        bool ShouldLoadWeightSeriallyBeforeOthers(const std::string &tensorName,
+                const std::vector<std::pair<std::string, DataType>> &mappedWeights) const override;
+        void OnWeightLoadGroupStarted(const std::set<std::string> &weightNames) override;
+        void OnWeightLoadGroupFinished() override;
         bool ShouldDelaySpecialWeightNumaRegistration(
                 const std::string &weightName) const override;
         bool ShouldDelaySpecialWeightCudaMove(
@@ -91,6 +97,7 @@ namespace fastllm {
         ThreadTpState *threadTpOwner = nullptr;
         int threadTpRank = -1;
         void InitThreadTp();
+        int StreamingThreadTpExpertLayer(const std::string &weightName) const;
         void PrepareThreadTp();
         void ThreadTpAllReduce(Data &data);
         bool ThreadTpAllTrue(bool value);

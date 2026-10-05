@@ -3,6 +3,9 @@
 #include "devices/disk/diskdevice.h"
 #include "gguf.h"
 #include "json11.hpp"
+#ifdef USE_CUDA
+#include "devices/cuda/fastllm-cuda.cuh"
+#endif
 
 #include <cmath>
 #include <cstdio>
@@ -78,7 +81,8 @@ void Write(const std::string &path, const Json::object &metadata, const std::vec
 struct Fixture {
     std::string directory;
     std::vector<std::string> files;
-    Fixture() {
+    Fixture(bool tpExperts = false) {
+        const int expertWidth = tpExperts ? 64 : 32;
         char name[] = "/tmp/fastllm-qwen4-gguf-XXXXXX";
         Check(mkdtemp(name) != nullptr, "fixture directory failed"); directory = name;
         for (int i = 1; i <= 3; ++i) files.push_back(directory + "/tiny-0000" + std::to_string(i) + "-of-00003.gguf");
@@ -90,7 +94,7 @@ struct Fixture {
         meta["tokenizer.ggml.model"] = "gpt2";
         const Json::object config = {{"block_count", 2}, {"embedding_length", 256}, {"vocab_size", 32},
             {"attention.head_count", 2}, {"attention.head_count_kv", 1}, {"attention.key_length", 4},
-            {"expert_count", 2}, {"expert_used_count", 1}, {"expert_feed_forward_length", 32},
+            {"expert_count", 2}, {"expert_used_count", 1}, {"expert_feed_forward_length", expertWidth},
             {"ssm.group_count", 2}, {"ssm.time_step_rank", 6}, {"ssm.state_size", 4},
             {"ssm.inner_size", 24}, {"ssm.conv_kernel", 4},
             {"hyper_connection.count", 2}, {"hyper_connection.low_rank", 4},
@@ -138,12 +142,16 @@ struct Fixture {
                 {4}, GGML_TYPE_F32, std::vector<float>(4, 1.25f)));
         }
         tensors.push_back(FloatTensor("output_hc_norm.weight", {512}, GGML_TYPE_F32, std::vector<float>(512, 1.5f)));
+        for (int layer = 0; layer < (tpExperts ? 2 : 1); ++layer)
         for (const auto &kind : {"gate", "up", "down"}) {
             const bool down = kind == std::string("down");
             const ggml_type type = down ? GGML_TYPE_IQ4_NL : GGML_TYPE_IQ2_XS;
-            const std::vector<int> dims = down ? std::vector<int>{2, 256, 32} : std::vector<int>{2, 32, 256};
+            const std::vector<int> dims = down ? std::vector<int>{2, 256, expertWidth} : std::vector<int>{2, expertWidth, 256};
             const size_t bytes = 2 * dims[1] * ggml_row_size(type, dims[2]);
-            tensors.push_back({"blk.0.ffn_" + std::string(kind) + "_exps.weight", dims, type, Bytes(bytes, 0)});
+            Bytes payload(bytes, 0);
+            if (tpExperts) for (size_t i = 0; i < bytes; ++i)
+                payload[i] = (i / ggml_row_size(type, dims[2]) + 17 * i + layer) % 63;
+            tensors.push_back({"blk." + std::to_string(layer) + ".ffn_" + std::string(kind) + "_exps.weight", dims, type, payload});
         }
         tensors.push_back(FloatTensor("blk.1.ple_conv1d.weight", {512, 4}, GGML_TYPE_F32, std::vector<float>(512 * 4, .25f)));
         Write(files[1], {}, tensors);
@@ -277,10 +285,72 @@ static void TestMtpImport(Fixture &fixture) {
     setenv("FASTLLM_QWEN4_ENABLE_MTP", "0", 1);
     std::cout << "PASS: external Qwen4 MTP GGUF, packed expert split, dense/norm dtype and preparation\n";
 }
-int main() {
+static int TestStreamingTpImport() {
+#ifdef USE_CUDA
+    if (FastllmCudaGetDeviceCount() < 2) return 77;
+    unsetenv("FASTLLM_TP");
+    Fixture fixture(true);
+    SetNgramDevice("disk");
+    auto cpu = CreateLLMModelFromGGUFFile(fixture.files[0], "");
+    SetDeviceMap({{"cuda:0", 1}}); SetMoeDeviceMap({{"cuda:0", 1}});
+    SetLayeredMoeDeviceMap({{"cpu", 1}}); SetMoeDeviceLayers(1);
+    setenv("FASTLLM_TP", "cuda:0,1", 1);
+    auto tp = CreateLLMModelFromGGUFFile(fixture.files[0], "");
+    for (int layer = 0; layer < 2; ++layer) for (int expert = 0; expert < 2; ++expert)
+    for (const std::string kind : {"gateup", "down"}) {
+        const std::string name = "model.language_model.layers." + std::to_string(layer) +
+            ".mlp.experts." + std::to_string(expert) + "." + kind + "_proj.weight";
+        Data &reference = cpu->weight[name], &weight = tp->weight[name];
+        Check(weight.dims == reference.dims && weight.ggmlType == reference.ggmlType,
+              "streaming TP changed parent weight metadata");
+        if (layer == 1) {
+            Check(!weight.multiDeviceData && weight.cpuData != nullptr,
+                  "streaming TP uploaded a CPU expert layer");
+            Check(std::memcmp(weight.cpuData, reference.cpuData, reference.GetBytes()) == 0,
+                  "streaming TP changed a CPU expert payload");
+            continue;
+        }
+        Check(weight.cpuData == nullptr && weight.multiDeviceDatas.size() == 2,
+              "GPU expert source was retained until warmup");
+        const size_t rowBytes = ggml_row_size((ggml_type)reference.ggmlType, reference.dims[1]);
+        for (int rank = 0; rank < 2; ++rank) {
+            Data &shard = *weight.multiDeviceDatas.at(rank);
+            Check(shard.dataDevice == DataDevice::CUDA && shard.cudaData && !shard.isFake,
+                  "streamed shard must own its CUDA allocation before rank preparation");
+            Bytes actual(shard.GetBytes()), expected;
+            FastllmCudaSetDevice(rank);
+            FastllmCudaCopyFromDeviceToHost(actual.data(), shard.cudaData, actual.size());
+            if (kind == "gateup") {
+                Check(shard.dims == std::vector<int>({64, 256}), "streamed gate/up shard shape");
+                for (int half = 0; half < 2; ++half) {
+                    const uint8_t *begin = reference.cpuData + (half * 64 + rank * 32) * rowBytes;
+                    expected.insert(expected.end(), begin, begin + 32 * rowBytes);
+                }
+            } else {
+                Check(shard.dims == std::vector<int>({256, 32}), "streamed down shard shape");
+                for (int row = 0; row < 256; ++row) {
+                    const uint8_t *begin = reference.cpuData + row * rowBytes + rank * rowBytes / 2;
+                    expected.insert(expected.end(), begin, begin + rowBytes / 2);
+                }
+            }
+            Check(actual == expected, "streaming TP changed packed expert shard bytes");
+        }
+    }
+    // The loader calls this hook again after ordinary weights: it must be a no-op.
+    tp->OnWeightLoadGroupFinished();
+    unsetenv("FASTLLM_TP");
+    std::cout << "PASS: Qwen4 streaming TP expert load, released CPU sources and exact packed shards\n";
+    return 0;
+#else
+    return 77;
+#endif
+}
+
+int main(int argc, char **argv) {
     try {
         SetThreads(2); SetDeviceMap({{"cpu", 1}}); SetMoeDeviceMap({{"cpu", 1}});
         SetMoeCudaCacheBytes(0); setenv("FASTLLM_QWEN4_ENABLE_MTP", "0", 1);
+        if (argc == 2 && std::string(argv[1]) == "--tp-load") return TestStreamingTpImport();
         Fixture fixture;
         TestFloatImport(fixture.directory);
         TestMtpImport(fixture);
