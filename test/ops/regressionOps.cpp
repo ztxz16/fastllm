@@ -4895,6 +4895,80 @@ namespace {
         std::cout << "CUDA Kimi-K3 recurrent KDA regression: PASS\n";
     }
 
+    void RunCudaKdaBatchDecodeRegression() {
+        using namespace fastllm;
+        FastllmCudaSetDevice(0);
+        ScopedFirstDevice device("cuda:0");
+        constexpr int heads = 4, dim = 128, channels = heads * dim, history = 3;
+        auto make = [&](DataType type, std::vector<int> dims, float seed, float scale) {
+            int count = 1;
+            for (int n : dims) count *= n;
+            return MakeCudaTensor(type, dims, MakeRegressionValues(count, seed, scale));
+        };
+        Data qw = make(DataType::FLOAT32, {channels, 1, 4}, 1.0f, .2f);
+        Data kw = make(DataType::FLOAT32, {channels, 1, 4}, 2.0f, .2f);
+        Data vw = make(DataType::FLOAT32, {channels, 1, 4}, 3.0f, .2f);
+        Data aLog = make(DataType::FLOAT32, {heads}, 4.0f, .2f);
+        Data bias = make(DataType::FLOAT32, {channels}, 5.0f, .2f);
+        for (int capacity : {2, 8, 64}) {
+            std::vector<Data> conv(capacity), states(capacity), refConv(capacity), refStates(capacity);
+            for (int row = 0; row < capacity; ++row) {
+                conv[row].CopyFrom(make(DataType::BFLOAT16, {3, history, channels}, 1.7f + row, .3f));
+                states[row].CopyFrom(make(DataType::FLOAT32, {1, heads, dim, dim}, 2.3f + row, .1f));
+                refConv[row].CopyFrom(conv[row]);
+                refStates[row].CopyFrom(states[row]);
+            }
+            for (int step = 0; step < 4; ++step) {
+                // Shrink, reorder, then restore the original membership. Inactive
+                // requests must retain their state while others continue decoding.
+                int batch = step == 2 ? std::max(2, capacity / 2) : capacity;
+                Data q = make(DataType::BFLOAT16, {1, batch, channels}, .3f + step, .7f);
+                Data k = make(DataType::BFLOAT16, q.dims, .7f + step, .7f);
+                Data v = make(DataType::BFLOAT16, q.dims, 1.1f + step, .7f);
+                Data gate = make(DataType::BFLOAT16, q.dims, 1.3f + step, .7f);
+                Data beta = make(DataType::FLOAT32, {1, batch, heads}, 1.9f + step, .7f);
+                std::vector<Data*> convPointers, statePointers;
+                std::vector<float> reference;
+                for (int row = 0; row < batch; ++row) {
+                    int slot = step % 2 ? capacity - 1 - row : row;
+                    convPointers.push_back(&conv[slot]);
+                    statePointers.push_back(&states[slot]);
+                    Data iq, ik, iv, ig, ib, cq, ck, cv, rq, rk, rv, output;
+                    Split(q, 1, row, row + 1, iq);
+                    Split(k, 1, row, row + 1, ik);
+                    Split(v, 1, row, row + 1, iv);
+                    Split(gate, 1, row, row + 1, ig);
+                    Split(beta, 1, row, row + 1, ib);
+                    Data *views[] = {&cq, &ck, &cv};
+                    for (int stream = 0; stream < 3; ++stream) {
+                        views[stream]->FakeFrom(refConv[slot], (size_t)stream * history * channels * 2);
+                        views[stream]->Resize({1, history, channels});
+                    }
+                    KimiK3CausalConv1D(iq, qw, 4, cq, rq);
+                    KimiK3CausalConv1D(ik, kw, 4, ck, rk);
+                    KimiK3CausalConv1D(iv, vw, 4, cv, rv);
+                    for (auto *tensor : {&rq, &rk, &rv, &ig}) tensor->Reshape({1, 1, heads, dim});
+                    KimiK3RecurrentKDAOutputOnly(rq, rk, rv, ig, ib, aLog, bias,
+                        -5.0f, refStates[slot], output, true, true);
+                    auto values = ToFloatVector(output);
+                    reference.insert(reference.end(), values.begin(), values.end());
+                }
+                Data output;
+                Expect(FastllmCudaKimiK3KdaBatchDecode(q, k, v, gate, beta, qw, kw, vw,
+                    aLog, bias, convPointers, statePointers, heads, dim, 4, -5.0f, output),
+                    "KDA batch path was not accepted");
+                ExpectFloatNear(reference, ToFloatVector(output), 0, 0, "Batched KDA output");
+                for (int slot = 0; slot < capacity; ++slot) {
+                    ExpectFloatNear(ToFloatVector(refConv[slot]), ToFloatVector(conv[slot]), 0, 0,
+                        "Batched KDA convolution state");
+                    ExpectFloatNear(ToFloatVector(refStates[slot]), ToFloatVector(states[slot]), 0, 0,
+                        "Batched KDA recurrent state");
+                }
+            }
+        }
+        std::cout << "CUDA batched KDA output/state, shrink/reorder/growth: PASS\n";
+    }
+
     void RunCudaMergeMlaPagedChunkRegression() {
         FastllmCudaSetDevice(0);
         constexpr int pageLen = 4;
@@ -14935,6 +15009,11 @@ int main(int argc, char **argv) {
             Expect(FastllmCudaGetDeviceCount() > 0,
                    "SM70 NVFP4 TurboMind regression requires CUDA.");
             RunCudaNVFP4Sm70TurboMindRegression();
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--cuda-batch-attention") {
+            Expect(FastllmCudaGetDeviceCount() > 0, "Batched attention regression requires CUDA.");
+            RunCudaKdaBatchDecodeRegression();
             return 0;
         }
         if (argc == 2 && std::string(argv[1]) == "--cuda-small-batch-decode") {

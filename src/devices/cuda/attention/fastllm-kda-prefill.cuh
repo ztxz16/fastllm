@@ -74,13 +74,16 @@ namespace {
             const float *query, const float *key, const float *retention,
             const float *beta, const __nv_bfloat16 *v,
             float *state, __nv_bfloat16 *output,
-            int sequence, int heads, int runtimeDimension) {
+            int sequence, int heads, int runtimeDimension,
+            float *const *statePointers) {
         constexpr int dimension = KIMI_K3_KDA_DIMENSION;
         constexpr int valueTile = KIMI_K3_KDA_VALUE_TILE;
         constexpr int tiles = dimension / valueTile;
         int item = blockIdx.x / tiles;
         int head = item % heads;
         int batch = item / heads;
+        state = statePointers ? statePointers[batch] + (size_t)head * dimension * dimension
+                              : state + (size_t)item * dimension * dimension;
         int lane = threadIdx.x;
         int column = (blockIdx.x % tiles) * valueTile + lane;
         __shared__ float q[dimension], r[dimension];
@@ -91,7 +94,7 @@ namespace {
         #pragma unroll
         for (int channel = 0; channel < dimension; ++channel) {
             columnState[channel] = lane < valueTile ?
-                state[((size_t)item * dimension + channel) * dimension + column] : 0.0f;
+                state[channel * dimension + column] : 0.0f;
         }
         float outputScale = rsqrtf((float)runtimeDimension);
         for (int token = 0; token < sequence; ++token) {
@@ -128,7 +131,7 @@ namespace {
         if (lane < valueTile) {
             #pragma unroll
             for (int channel = 0; channel < dimension; ++channel) {
-                state[((size_t)item * dimension + channel) * dimension + column] =
+                state[channel * dimension + column] =
                     columnState[channel];
             }
         }
@@ -138,7 +141,8 @@ namespace {
             const void *q, const void *k, const void *v, const void *gate,
             const float *beta, const float *aLog, const float *dtBias,
             float *state, void *output, float *scratch,
-            int batch, int sequence, int heads, int dimension, float lowerBound) {
+            int batch, int sequence, int heads, int dimension, float lowerBound,
+            float *const *statePointers = nullptr) {
         int rows = batch * sequence * heads;
         size_t elements = (size_t)rows * dimension;
         float *query = scratch;
@@ -152,6 +156,6 @@ namespace {
         KimiK3KdaRegisterScanKernel
             <<<batch * heads * (dimension / KIMI_K3_KDA_VALUE_TILE), 32, 0, cudaStreamPerThread>>>(
                 query, key, retention, activatedBeta, (const __nv_bfloat16*)v,
-                state, (__nv_bfloat16*)output, sequence, heads, dimension);
+                state, (__nv_bfloat16*)output, sequence, heads, dimension, statePointers);
     }
 }

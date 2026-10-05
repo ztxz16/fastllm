@@ -8622,7 +8622,8 @@ namespace {
     __global__ void KimiK3CausalConv1DKernel(
             const __nv_bfloat16 *input, const float *weight,
             const __nv_bfloat16 *cache, __nv_bfloat16 *output,
-            int batch, int sequence, int channels, int kernelSize) {
+            int batch, int sequence, int channels, int kernelSize,
+            __nv_bfloat16 *const *cachePointers = nullptr) {
         int item = blockIdx.x * blockDim.x + threadIdx.x;
         if (item >= batch * channels) {
             return;
@@ -8630,6 +8631,8 @@ namespace {
         int batchIndex = item / channels;
         int channel = item % channels;
         int history = kernelSize - 1;
+        if (cachePointers) cache = cachePointers[batchIndex];
+        else if (cache) cache += (size_t)batchIndex * history * channels;
         // Each output reads only the input and the initial history. Split tokens
         // across blocks while preserving the original tap accumulation order.
         for (int token = blockIdx.y; token < sequence; token += gridDim.y) {
@@ -8645,8 +8648,7 @@ namespace {
                 } else if (cache != nullptr) {
                     int cacheToken = history + sourceToken;
                     size_t cacheIndex =
-                        ((size_t)batchIndex * history + cacheToken) *
-                        channels + channel;
+                        (size_t)cacheToken * channels + channel;
                     sourceValue = __bfloat162float(cache[cacheIndex]);
                 }
                 value += sourceValue *
@@ -8693,7 +8695,7 @@ namespace {
             const __nv_bfloat16 *q, const __nv_bfloat16 *k,
             const __nv_bfloat16 *v, __nv_bfloat16 *cache,
             int batch, int sequence, int channels, int history,
-            int tokens) {
+            int tokens, __nv_bfloat16 *const *cachePointers = nullptr) {
         int item = blockIdx.x * blockDim.x + threadIdx.x;
         if (item >= 3 * batch * channels) {
             return;
@@ -8706,6 +8708,10 @@ namespace {
             (stream == 1 ? k : v);
         size_t cacheBase =
             ((size_t)stream * batch + batchIndex) * history * channels;
+        if (cachePointers) {
+            cache = cachePointers[stream * batch + batchIndex];
+            cacheBase = 0;
+        }
         // `tokens` is positive, so any retained cache slot is read from a
         // strictly higher index.  Ascending writes are therefore safe in
         // place and need no temporary history buffer.
@@ -9120,6 +9126,96 @@ bool FastllmCudaKimiK3UpdatePackedConvCache(
             batch, sequence, channels, history, tokens);
     return KimiK3CudaLastError(
         "KimiK3UpdatePackedConvCache CUDA kernel failed.");
+}
+
+bool FastllmCudaKimiK3KdaBatchDecode(
+        const fastllm::Data &q, const fastllm::Data &k, const fastllm::Data &v,
+        const fastllm::Data &rawGate, const fastllm::Data &rawBeta,
+        const fastllm::Data &qWeight, const fastllm::Data &kWeight,
+        const fastllm::Data &vWeight, const fastllm::Data &aLog,
+        const fastllm::Data &dtBias,
+        const std::vector<fastllm::Data*> &convCaches,
+        const std::vector<fastllm::Data*> &states,
+        int heads, int dimension, int kernelSize, float lowerBound,
+        fastllm::Data &output) {
+#ifdef USE_ROCM
+    return false;
+#else
+    const int batch = (int)states.size();
+    const int channels = heads * dimension, history = kernelSize - 1;
+    if (batch <= 1 || heads <= 0 || dimension != KIMI_K3_KDA_DIMENSION ||
+        history <= 0 || convCaches.size() != states.size() ||
+        q.dims != std::vector<int>({1, batch, channels}) ||
+        k.dims != q.dims || v.dims != q.dims || rawGate.dims != q.dims ||
+        rawBeta.dims != std::vector<int>({1, batch, heads}) ||
+        aLog.Count(0) != (uint64_t)heads || dtBias.Count(0) != (uint64_t)channels ||
+        FastllmCudaGraphIsCapturing()) return false;
+    auto ready = [&](const fastllm::Data &data, fastllm::DataType type) {
+        return KimiK3CudaDataReady(data, type) && data.dataDeviceIds == q.dataDeviceIds;
+    };
+    for (const auto *data : {&q, &k, &v, &rawGate})
+        if (!ready(*data, fastllm::DataType::BFLOAT16)) return false;
+    for (const auto *data : {&rawBeta, &aLog, &dtBias})
+        if (!ready(*data, fastllm::DataType::FLOAT32)) return false;
+    for (const auto *weight : {&qWeight, &kWeight, &vWeight})
+        if (!ready(*weight, fastllm::DataType::FLOAT32) ||
+            weight->dims != std::vector<int>({channels, 1, kernelSize})) return false;
+    std::vector<void*> pointers(4 * batch);
+    for (int row = 0; row < batch; ++row) {
+        const auto *conv = convCaches[row];
+        const auto *state = states[row];
+        if (!conv || !state || conv->lockInCPU || state->lockInCPU ||
+            !ready(*conv, fastllm::DataType::BFLOAT16) ||
+            !ready(*state, fastllm::DataType::FLOAT32) ||
+            conv->dims != std::vector<int>({3, history, channels}) ||
+            state->dims != std::vector<int>({1, heads, dimension, dimension})) return false;
+        for (int stream = 0; stream < 3; ++stream)
+            pointers[stream * batch + row] = (uint8_t*)conv->cudaData +
+                (size_t)stream * history * channels * sizeof(__nv_bfloat16);
+        pointers[3 * batch + row] = state->cudaData;
+    }
+    // Only pointer metadata is gathered. Request-owned states stay in place
+    // through batch growth, shrinking, reordering and history-cache snapshots.
+    const size_t tableBytes = pointers.size() * sizeof(void*);
+    const size_t convBytes = (size_t)batch * channels * sizeof(__nv_bfloat16);
+    const size_t scanOffset = (tableBytes + 3 * convBytes + 255) & ~size_t(255);
+    const size_t scratchBytes = scanOffset +
+        (size_t)batch * heads * (3 * dimension + 1) * sizeof(float);
+    size_t borrowedBytes = 0;
+    bool own = false;
+    void *scratch = FastllmBorrowCudaTempBuffer(scratchBytes, &borrowedBytes, &own);
+    if (!scratch || borrowedBytes < scratchBytes) {
+        FastllmReleaseCudaTempBuffer(scratch, own);
+        return false;
+    }
+    output.dataType = fastllm::DataType::BFLOAT16;
+    output.Resize({1, batch, heads, dimension});
+    output.ToDevice(q.dataDevice, q.dataDeviceIds, false);
+    output.Allocate();
+    checkCudaErrors("KDA cache pointer upload", cudaMemcpyAsync(scratch, pointers.data(),
+        tableBytes, cudaMemcpyHostToDevice, cudaStreamPerThread));
+    auto cachePointers = (__nv_bfloat16**)scratch;
+    __nv_bfloat16 *convolved[3];
+    const fastllm::Data *inputs[] = {&q, &k, &v};
+    const fastllm::Data *weights[] = {&qWeight, &kWeight, &vWeight};
+    const int blocks = (batch * channels + KIMI_K3_CUDA_THREADS - 1) / KIMI_K3_CUDA_THREADS;
+    for (int stream = 0; stream < 3; ++stream) {
+        convolved[stream] = (__nv_bfloat16*)((uint8_t*)scratch + tableBytes + stream * convBytes);
+        KimiK3CausalConv1DKernel<<<blocks, KIMI_K3_CUDA_THREADS, 0, cudaStreamPerThread>>>(
+            (const __nv_bfloat16*)inputs[stream]->cudaData, (const float*)weights[stream]->cudaData,
+            nullptr, convolved[stream], batch, 1, channels, kernelSize, cachePointers + stream * batch);
+    }
+    KimiK3UpdatePackedConvCacheKernel<<<3 * blocks, KIMI_K3_CUDA_THREADS, 0, cudaStreamPerThread>>>(
+        (const __nv_bfloat16*)q.cudaData, (const __nv_bfloat16*)k.cudaData,
+        (const __nv_bfloat16*)v.cudaData, nullptr, batch, 1, channels, history, 1, cachePointers);
+    KimiK3LaunchKdaPrefill(convolved[0], convolved[1], convolved[2], rawGate.cudaData,
+        (const float*)rawBeta.cudaData, (const float*)aLog.cudaData, (const float*)dtBias.cudaData,
+        nullptr, output.cudaData, (float*)((uint8_t*)scratch + scanOffset),
+        batch, 1, heads, dimension, lowerBound, (float**)(cachePointers + 3 * batch));
+    bool success = KimiK3CudaLastError("KimiK3 batched KDA decode failed.");
+    FastllmReleaseCudaTempBuffer(scratch, own);
+    return success;
+#endif
 }
 
 bool FastllmCudaKimiK3RecurrentKDA(

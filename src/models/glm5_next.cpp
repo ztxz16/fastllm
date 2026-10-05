@@ -1799,10 +1799,25 @@ namespace fastllm {
             };
 
             Data attention;
+            bool batchedState = false;
+#ifdef USE_CUDA
+            if (batch > 1) {
+                std::vector<Data*> convCaches, states;
+                for (auto *request : requestCaches) {
+                    convCaches.push_back(&(*request)[layerIndex].first);
+                    states.push_back(&(*request)[layerIndex].second);
+                }
+                batchedState = FastllmCudaKimiK3KdaBatchDecode(
+                    qProjected, kProjected, vProjected, rawGate, rawBeta,
+                    weight[prefix + "q_conv1d.weight"], weight[prefix + "k_conv1d.weight"],
+                    weight[prefix + "v_conv1d.weight"], weight[prefix + "A_log"], weight[prefix + "dt_bias"],
+                    convCaches, states, kdaHeads, kdaHeadDim, shortConvKernel, gateLowerBound, attention);
+            }
+#endif
             if (batch == 1) {
                 runState(qProjected, kProjected, vProjected, rawGate, rawBeta,
                          (*requestCaches[0])[layerIndex], attention);
-            } else {
+            } else if (!batchedState) {
                 for (int row = 0; row < batch; ++row) {
                     Data q, k, v, gate, beta, rowAttention;
                     ViewGlm5NextRows(qProjected, row, 1, q);

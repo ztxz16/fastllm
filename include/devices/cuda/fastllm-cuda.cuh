@@ -586,6 +586,17 @@ bool FastllmCudaKimiK3UpdatePackedConvCache(
         const fastllm::Data &q, const fastllm::Data &k,
         const fastllm::Data &v, fastllm::Data &cache,
         int history, int tokens);
+// One token per request, with independently owned convolution/recurrent caches.
+bool FastllmCudaKimiK3KdaBatchDecode(
+        const fastllm::Data &q, const fastllm::Data &k, const fastllm::Data &v,
+        const fastllm::Data &rawGate, const fastllm::Data &rawBeta,
+        const fastllm::Data &qWeight, const fastllm::Data &kWeight,
+        const fastllm::Data &vWeight, const fastllm::Data &aLog,
+        const fastllm::Data &dtBias,
+        const std::vector<fastllm::Data*> &convCaches,
+        const std::vector<fastllm::Data*> &states,
+        int heads, int dimension, int kernelSize, float lowerBound,
+        fastllm::Data &output);
 bool FastllmCudaKimiK3L2Norm(const fastllm::Data &input,
                              fastllm::Data &output, float eps);
 bool FastllmCudaKimiK3RecurrentKDA(
