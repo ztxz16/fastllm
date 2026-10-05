@@ -9,7 +9,7 @@ namespace fastllm_gguf_stream {
 struct WeightCopy {
     const uint8_t *source;
     uint8_t *destination;
-    int type, rows, columns, cross;
+    int type, rows, columns, cross, blockSize, blockBytes;
 };
 
 static int Ordinary(int type) {
@@ -18,6 +18,8 @@ static int Ordinary(int type) {
         case GGML_TYPE_Q2_K: case GGML_TYPE_Q4_K:
         case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ2_S: case GGML_TYPE_IQ1_M: case GGML_TYPE_Q2_0:
+        case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_NL: case GGML_TYPE_IQ4_XS: case GGML_TYPE_Q8_0:
             return type;
         default: return -1;
     }
@@ -25,7 +27,7 @@ static int Ordinary(int type) {
 
 __global__ void Restore(const WeightCopy *copies) {
     const WeightCopy w = copies[blockIdx.y];
-    const int blocks = w.columns / (w.type == GGML_TYPE_Q2_0 ? 64 : 256);
+    const int blocks = w.columns / w.blockSize;
     const int lane = threadIdx.x%32;
     // A warp restores one quantized block with contiguous field stores.
     for (int i = blockIdx.x*(blockDim.x/32)+threadIdx.x/32;
@@ -35,12 +37,7 @@ __global__ void Restore(const WeightCopy *copies) {
         if (fastllm_gguf_restore::Ordinary(w.type) != w.type) {
             fastllm_gguf_restore::Block(w.source, w.destination, w.type, blocks, srcRow, col, i);
         } else {
-            const int bytes = w.type == GGML_TYPE_Q2_0 ? sizeof(block_q2_0) :
-                w.type == GGML_TYPE_Q2_K ? sizeof(block_q2_K) :
-                w.type == GGML_TYPE_Q4_K ? sizeof(block_q4_K) :
-                w.type == GGML_TYPE_IQ1_M ? sizeof(block_iq1_m) :
-                w.type == GGML_TYPE_IQ2_XS ? sizeof(block_iq2_xs) :
-                w.type == GGML_TYPE_IQ2_S ? sizeof(block_iq2_s) : sizeof(block_iq2_xxs);
+            const int bytes = w.blockBytes;
             for (int b = lane; b < bytes; b += 32)
                 w.destination[size_t(i)*bytes+b] = w.source[size_t(srcRow*blocks+col)*bytes+b];
         }
@@ -93,12 +90,15 @@ bool FastllmCudaMergeMOEGGUFHost(const fastllm::Data &input,
     CUDA_CHECK(cudaStreamIsCapturing(cudaStreamPerThread, &capture));
     if (capture != cudaStreamCaptureStatusNone) return false;
     int gt = -1, dt = -1, inter = 0, maxBlocks = 0;
-    size_t packedBytes = 0, restoreBytes = 0, stagingBytes = 0;
+    size_t packedBytes = 0, stagingBytes = 0;
+    FastllmCudaMoeGGUFResidents resident;
+    if (!deepSeekV4Mode) FastllmCudaGetMoeGGUFResidents(weights, expertCount, resident);
     struct Source {
         const fastllm::Data *weight;
-        size_t offset, uploadOffset;
+        size_t offset;
         int slot;
         bool restore;
+        const void *resident;
     };
     std::vector<Source> sources;
     // Validate the entire subset before allocating, copying, or changing output.
@@ -115,19 +115,23 @@ bool FastllmCudaMergeMOEGGUFHost(const fastllm::Data &input,
         for (int part = 0; part < 2; ++part) {
             const auto *w = weights[2*e+part];
             if (w->dataType != fastllm::DATA_GGUF_FORMAT || w->dims[0]%4 ||
-                w->dims[1]%(w->ggmlType == GGML_TYPE_Q2_0 ? 64 : 256) ||
+                w->dims[1]%ggml_blck_size((ggml_type)Ordinary(w->ggmlType)) ||
                 (!w->cpuData && (w->numasData.empty() ||
                  w->dims[0]%(4*w->numasData.size()) ||
                  std::any_of(w->numasData.begin(), w->numasData.end(),
                     [](const uint8_t *p) { return p == nullptr; })))) return false;
             const bool restore = (crossSwiglu && part == 0) || Ordinary(w->ggmlType) != w->ggmlType;
             const size_t weightBytes = Align(w->GetBytes());
-            sources.push_back({w, packedBytes, restoreBytes, 2*(e-1)+part, restore});
+            const int slot = 2*(e-1)+part;
+            const void *cached = resident.gateType == g && resident.downType == d &&
+                resident.hidden == hidden && resident.inter == inter &&
+                slot < int(resident.weights.size()) ? resident.weights[slot] : nullptr;
+            sources.push_back({w, packedBytes, slot, restore, cached});
+            if (cached) continue;
             packedBytes += weightBytes;
-            if (restore) restoreBytes += weightBytes;
             stagingBytes = std::max(stagingBytes, weightBytes);
             maxBlocks = std::max(maxBlocks, w->dims[0] *
-                (w->dims[1]/(w->ggmlType == GGML_TYPE_Q2_0 ? 64 : 256)));
+                (w->dims[1]/int(ggml_blck_size((ggml_type)Ordinary(w->ggmlType)))));
         }
     }
     if (sources.empty() || sources.size() != experts.size()*2) return false;
@@ -138,16 +142,15 @@ bool FastllmCudaMergeMOEGGUFHost(const fastllm::Data &input,
     const size_t mmqBytes = FastllmCudaMoeGGUFGroupedWorkspaceBytes(
         gt, dt, rows, hidden, inter, expertCount, topk, deepSeekV4Mode);
     if (!mmqBytes) return false;
-    // Final weights and routing metadata stay live through both projections.
-    // Only weights that need restoring use upload scratch. Restore and MMQ
-    // run on the same stream outside V4.1, so MMQ can overwrite that scratch afterwards
-    // without another copy, allocation, or synchronization.
-    const size_t tableOffset = packedBytes + (deepSeekV4Mode ? 2*stagingBytes : 0);
+    // Two bounded upload slots: gate and down restore on separate streams.
+    // Canonical misses and routing live through both projections; resident
+    // records are borrowed directly. Never alias in-flight DMA with MMQ scratch.
+    const size_t tableOffset = packedBytes + 2*stagingBytes;
     const size_t descOffset = tableOffset+Align(2*expertCount*sizeof(void *));
     const size_t indexOffset = descOffset+Align(sources.size()*sizeof(WeightCopy));
     const size_t scoreOffset = indexOffset+Align(size_t(rows)*topk*sizeof(int32_t));
     const size_t mmqOffset = scoreOffset+Align(size_t(rows)*topk*sizeof(float));
-    const size_t bytes = Align(mmqOffset + (deepSeekV4Mode ? mmqBytes : std::max(restoreBytes, mmqBytes)));
+    const size_t bytes = Align(mmqOffset + mmqBytes);
     if (bytes/256 > size_t(INT32_MAX)) return false;
     const size_t gateBytes = size_t(rows)*topk*inter*(input.dataType == fastllm::FLOAT32 ? 4 : 2);
     size_t freeBytes = 0, totalBytes = 0;
@@ -162,7 +165,7 @@ bool FastllmCudaMergeMOEGGUFHost(const fastllm::Data &input,
     AllocateTensor(output, input.dataType, {rows, hidden}, device);
     auto *base = static_cast<uint8_t *>(workspace.cudaData);
     const auto stream = cudaStreamPerThread;
-    DownUpload downUpload(deepSeekV4Mode);
+    DownUpload downUpload(stagingBytes != 0);
     std::vector<const void *> table(2*expertCount, nullptr);
     std::vector<WeightCopy> copies;
     std::vector<int> copyIndices(sources.size(), -1);
@@ -170,19 +173,22 @@ bool FastllmCudaMergeMOEGGUFHost(const fastllm::Data &input,
         const auto &src = sources[i];
         const auto &w = *src.weight;
         auto *target = base+src.offset;
-        table[src.slot] = target;
+        table[src.slot] = src.resident ? src.resident : target;
+        if (src.resident) continue;
         if (src.restore) {
-            auto *upload = deepSeekV4Mode ? base+packedBytes+(src.slot%2)*stagingBytes :
-                base+mmqOffset+src.uploadOffset;
+            auto *upload = base+packedBytes+(src.slot%2)*stagingBytes;
             copyIndices[i] = copies.size();
             copies.push_back({upload, target, w.ggmlType, w.dims[0], w.dims[1],
-                int(crossSwiglu && src.slot%2 == 0)});
+                int(crossSwiglu && src.slot%2 == 0),
+                int(ggml_blck_size((ggml_type)Ordinary(w.ggmlType))),
+                int(ggml_type_size((ggml_type)Ordinary(w.ggmlType)))});
         }
     }
     if (!copies.empty()) CUDA_CHECK(cudaMemcpyAsync(base+descOffset, copies.data(),
         copies.size()*sizeof(WeightCopy), cudaMemcpyHostToDevice, stream));
     auto upload = [&](size_t sourceIndex, cudaStream_t uploadStream) {
         const auto &src = sources[sourceIndex];
+        if (src.resident) return;
         const auto &w = *src.weight;
         auto *target = src.restore ? const_cast<uint8_t *>(copies[copyIndices[sourceIndex]].source) : base+src.offset;
         if (w.cpuData) {
@@ -193,7 +199,7 @@ bool FastllmCudaMergeMOEGGUFHost(const fastllm::Data &input,
                 CUDA_CHECK(cudaMemcpyAsync(target+node*shardBytes, w.numasData[node],
                     shardBytes, cudaMemcpyHostToDevice, uploadStream));
         }
-        if (src.restore && deepSeekV4Mode) {
+        if (src.restore) {
             const bool kR4 = w.ggmlType == GGML_TYPE_Q2_K_R4 || w.ggmlType == GGML_TYPE_Q4_K_R4;
             const int gridLimit = kR4 ? 16*fastllm_gguf_mmq::ggml_cuda_info().devices[device].nsm : 64;
             Restore<<<std::min(gridLimit, (maxBlocks+7)/8), 256, 0, uploadStream>>>(
@@ -201,12 +207,10 @@ bool FastllmCudaMergeMOEGGUFHost(const fastllm::Data &input,
         }
     };
     for (size_t i = 0; i < sources.size(); ++i)
-        if (!deepSeekV4Mode || sources[i].slot%2 == 0) upload(i, stream);
+        if (sources[i].slot%2 == 0) upload(i, stream);
     CUDA_CHECK(cudaMemcpyAsync(base+tableOffset, table.data(), table.size()*sizeof(void *), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(base+indexOffset, indices, size_t(rows)*topk*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(base+scoreOffset, scores, size_t(rows)*topk*sizeof(float), cudaMemcpyHostToDevice, stream));
-    if (!deepSeekV4Mode && !copies.empty()) Restore<<<dim3(std::min(64, (maxBlocks+7)/8), copies.size()), 256, 0, stream>>>(
-        reinterpret_cast<const WeightCopy *>(base+descOffset));
     if (downUpload.stream) {
         CUDA_CHECK(cudaEventRecord(downUpload.begin, stream));
         CUDA_CHECK(cudaStreamWaitEvent(downUpload.stream, downUpload.begin, 0));

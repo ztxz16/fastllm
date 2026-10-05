@@ -231,6 +231,9 @@ int main(int argc, char **argv) {
             Data score(FLOAT32, {rows, topk}, DataDevice::CPU, scores.data());
             MergeMOE(input, index, score, weights, biases, w1, w2, w3, currentInput, currentOutput,
                      0.7f, output, 0, MoeGateSwiglu, false, 10.f, true, nullptr, 32, quantizeShared);
+            // GPU-assisted prefill may return a CUDA tensor. The numerical
+            // references below always read the host representation.
+            output.ToDevice(DataDevice::CPU);
             if (verify) {
                 // The cache verifier uses the grouped path even for one row.
                 // Compare its scalar fallback exactly, including untouched GPU

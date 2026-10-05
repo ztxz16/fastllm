@@ -1894,6 +1894,46 @@ bool FastllmCudaCanRunMoeHybrid(fastllm::Data **weights, int weightsBatch) {
     return FindHybridGroup(weights, weightsBatch) != nullptr;
 }
 
+bool FastllmCudaGetMoeGGUFResidents(fastllm::Data **weights, int experts,
+                                  FastllmCudaMoeGGUFResidents &view) {
+    view = {};
+    if (!weights || experts <= 0 || !weights[2]) return false;
+    OffloadGroup *group = nullptr;
+    int table = -1;
+    {
+        std::lock_guard<std::mutex> lock(RegistryMutex());
+        auto it = TableRegistry().find(weights[2]);
+        if (it == TableRegistry().end()) return false;
+        group = it->second.group;
+        table = it->second.layer;
+    }
+    const auto &layout = group->LayerLayout(table);
+    if (layout.weightType != fastllm::DATA_GGUF_FORMAT || layout.deepSeekV41 ||
+        layout.glm5 || experts > layout.experts) return false;
+    const int device = FastllmCudaGetDevice();
+    std::lock_guard<std::mutex> lock(group->mutex);
+    const auto it = group->deviceCaches.find(device);
+    if (it == group->deviceCaches.end() || !it->second) return false;
+    const auto &cache = *it->second;
+    if (!cache.ready || !cache.slots || !cache.hostKeyToSlot) return false;
+    // Both the mapped residency mirror and its payload must be visible to
+    // the host planner. The owning model has drained its preceding kernels.
+    if (cache.admissionDone) checkCudaErrors("MoE prefill cache residency",
+        cudaEventSynchronize(cache.admissionDone));
+    view.weights.assign(2*experts, nullptr);
+    view.gateType = layout.gateGgmlType; view.downType = layout.downGgmlType;
+    view.hidden = layout.hidden; view.inter = layout.inter;
+    const auto span = cache.layerSlots[table];
+    for (int e = 0; e < experts; ++e) {
+        const int slot = cache.hostKeyToSlot[table*layout.experts+e];
+        if (slot < span.begin || slot >= span.begin+span.count) continue;
+        const auto *record = cache.records + cache.hostSlotOffsets[slot];
+        view.weights[2*e] = record;
+        view.weights[2*e+1] = record+layout.downOffset;
+    }
+    return true;
+}
+
 bool FastllmCudaUseMoeHybrid(fastllm::Data **weights, int weightsBatch) {
     auto *group = FindHybridGroup(weights, weightsBatch);
     if (!group) return false;

@@ -6587,6 +6587,9 @@ namespace fastllm {
         };
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
         const bool numaMoe = moeDevice == "numa" || moeDevice.rfind("numa:", 0) == 0;
+        const bool hostPrefill = hostMoe && numaMoe &&
+            batch * sequence >= kNumasMoeGpuPrefillMinRows;
+        NumasMoeCudaAssistScope assistScope(hostPrefill ? &threadTpOwner->devices : nullptr);
         if (runRoutedExperts && batch * sequence <= kNumasMoePrefetchMaxRows &&
             flattened.dataDevice == DataDevice::CUDA &&
             numaMoe &&
@@ -6678,7 +6681,7 @@ namespace fastllm {
         runSharedExpert(runRoutedExperts ? sharedOutput : output);
 
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
-        if (hostMoe && numaMoe && batch * sequence >= kNumasMoeGpuPrefillMinRows) {
+        if (hostPrefill) {
             selectExperts();
             // NUMA prefill launches expert workers on both TP devices. Their
             // streams share the temporary pool with the rank streams, whose
@@ -6704,6 +6707,11 @@ namespace fastllm {
             FastllmCudaGraphMarkParallelJoin(deviceLayer);
             if (runRoutedExperts) output.CopyFrom(sharedOutput);
             output.Reshape(input.dims);
+#if defined(USE_NUMAS) && !defined(USE_ROCM)
+            // The owner's prefill workers also use this GPU. Do not enqueue
+            // a waiting NCCL collective while they may allocate workspace.
+            if (hostPrefill) threadTpOwner->Barrier();
+#endif
             if (reduceOutput) ThreadTpAllReduce(output);
             return;
         }
@@ -6756,6 +6764,9 @@ namespace fastllm {
         }
         Qwen4CastLike(sharedOutput, output);
         AddTo(output, sharedOutput);
+#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
+        if (hostPrefill) threadTpOwner->Barrier();
+#endif
         if (reduceOutput) ThreadTpAllReduce(output);
     }
 

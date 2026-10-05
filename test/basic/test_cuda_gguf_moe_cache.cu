@@ -215,18 +215,14 @@ template<class T> static void Run(ggml_type type, fastllm::DataType dtype, int b
         layers[layer] = {tables[layer].data(), int(tables[layer].size())};
     }
     fastllm::SetMoeCudaCacheBytes((compact ? 32 : 16) * stride);
-    bool called = false;
     if (type == GGML_TYPE_F32) {
         tables[0][2]->isGGUFData = false;
         Require(!FastllmCudaPrepareMoeCache(layers, 2), "unmarked native floating expert admitted as GGUF");
         tables[0][2]->isGGUFData = true;
     }
-    Require(FastllmCudaPrepareMoeCache(layers, 2, [&]{ called = true; }), "GGUF prepare failed");
-#ifdef USE_NUMAS
-    Require(called, "GGUF snapshot did not register the CPU weights");
-#else
-    Require(!called, "NUMA registration called in a CUDA-only build");
-#endif
+    // This fixture exercises an independent snapshot. A registration callback
+    // now means borrowing real NUMA shards, covered by --shared-weights.
+    Require(FastllmCudaPrepareMoeCache(layers, 2), "GGUF prepare failed");
     // Original host tensors can be repacked after preparation without changing the snapshot.
     for (auto &w : owned) std::memset(w->cpuData, 0, w->GetBytes());
     fastllm::Data input(dtype, {batch, hidden}), ids(fastllm::INT32, {batch, topk});
@@ -662,6 +658,61 @@ template<class T> static void RunTPShards(ggml_type type, fastllm::DataType dtyp
         CheckReference(type,dtype,rank,batch,hidden,localInter,topk,decoded[rank],x,score,routes,actual,stages.gate,stages.down,actualGate);
     }
     std::printf("PASS GGUF TP shards type=%d dtype=%d batch=%d: packed bytes, ownership, 320/320, two-rank CPU oracle\n",type,dtype,batch);
+}
+
+// Cached rows are deliberately removed from the host snapshot after admission:
+// matching the independent oracle then proves prefill borrowed resident bytes.
+static void RunPrefillCached(int device) {
+    using namespace fastllm;
+    Cuda(cudaSetDevice(device));
+    constexpr int experts = 48, hidden = 256, inter = 320, topk = 3, rows = 65;
+    std::vector<std::unique_ptr<Data>> owned;
+    std::vector<Data *> weights(2*(experts+1), nullptr);
+    std::vector<std::vector<float>> decoded;
+    for (int e = 0; e < experts; ++e) for (int part = 0; part < 2; ++part) {
+        auto w = Weight(part ? GGML_TYPE_IQ4_NL : GGML_TYPE_IQ3_S,
+            part ? hidden : 2*inter, part ? inter : hidden, 11*e+part, true);
+        decoded.push_back(Decode(*w));
+        weights[2*(e+1)+part] = w.get(); owned.push_back(std::move(w));
+    }
+    const size_t stride = (weights[2]->GetBytes()+weights[3]->GetBytes()+127)/128*128;
+    SetMoeCudaCacheBytes(32*stride);
+    FastllmCudaMoeCacheLayer layer{weights.data(), int(weights.size())};
+    Require(FastllmCudaPrepareMoeCache(&layer, 1), "prefill cache snapshot failed");
+    Data input(FLOAT32,{rows,hidden}), ids(INT32,{1,topk}), scores(FLOAT32,{rows,topk}), gate, scratch, output;
+    Gpu(input); Gpu(ids); Gpu(scores);
+    std::vector<float> x(rows*hidden), scale(rows*topk,.25f);
+    for (int i = 0; i < int(x.size()); ++i) x[i] = .3f*std::sin(i*.713f);
+    int32_t warmIds[]{0,2,4};
+    Cuda(cudaMemcpy(input.cudaData,x.data(),x.size()*4,cudaMemcpyHostToDevice));
+    Cuda(cudaMemcpy(scores.cudaData,scale.data(),scale.size()*4,cudaMemcpyHostToDevice));
+    Cuda(cudaMemcpy(ids.cudaData,warmIds,sizeof(warmIds),cudaMemcpyHostToDevice));
+    Data row; row.FakeFrom(input,0); row.Resize({1,hidden});
+    Require(FastllmCudaMergeMOECache(row,gate,output,weights.data(),weights.size(),
+        static_cast<int32_t *>(ids.cudaData),static_cast<float *>(scores.cudaData),topk), "prefill cache seed failed");
+    Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+    FastllmCudaMoeGGUFResidents resident;
+    Require(FastllmCudaGetMoeGGUFResidents(weights.data(),experts,resident), "prefill resident snapshot failed");
+    Require(resident.weights[0] && resident.weights[4] && resident.weights[8] && !resident.weights[12],
+        "prefill resident map differs from admitted experts");
+    for (int e : warmIds) for (int part = 0; part < 2; ++part)
+        std::memset(weights[2*(e+1)+part]->cpuData,0,weights[2*(e+1)+part]->GetBytes());
+    std::vector<int32_t> routes(rows*topk);
+    for (int i = 0; i < rows*topk; ++i) routes[i] = 2*(i%4);
+    uint64_t before[5]{},after[5]{};
+    Require(fastllm_moe_cuda_cache_stats(device,before,false), "cache counters missing");
+    Require(FastllmCudaMergeMOEGGUFHost(input,gate,scratch,output,weights.data(),experts,
+        routes.data(),scale.data(),topk,{1,3,5,7},false), "cached prefill rejected");
+    std::vector<float> actual(rows*hidden),actualGate(rows*topk*inter);
+    Cuda(cudaMemcpy(actual.data(),output.cudaData,actual.size()*4,cudaMemcpyDeviceToHost));
+    Cuda(cudaMemcpy(actualGate.data(),gate.cudaData,actualGate.size()*4,cudaMemcpyDeviceToHost));
+    CheckReference(GGML_TYPE_IQ3_S,FLOAT32,device,rows,hidden,inter,topk,decoded,x,scale,routes,
+        actual,true,true,actualGate);
+    Require(fastllm_moe_cuda_cache_stats(device,after,false) && std::equal(before,before+5,after),
+        "prefill mutated decode cache statistics/policy");
+    FastllmCudaReleaseMoeCache(weights.data(),weights.size()); SetMoeCudaCacheBytes(0);
+    Require(!FastllmCudaGetMoeGGUFResidents(weights.data(),experts,resident), "released prefill pointers survived");
+    std::printf("PASS cached prefill device=%d: resident+miss, CPU oracle, unchanged policy, release\n",device);
 }
 
 // Exercise the CPU repacker, cross-SwiGLU layout, selected expert subsets and
@@ -1362,11 +1413,17 @@ int main(int argc, char **argv) {
                 std::puts("FASTLLM_TEST_SKIP_NO_DEVICE: host MMQ requires SM75+"); return 0;
             }
             for (auto type : {GGML_TYPE_Q2_0, GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS,
-                              GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S}) {
+                              GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS,
+                              GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS,
+                              GGML_TYPE_Q8_0}) {
                 RunHost<float>(type, fastllm::FLOAT32, 0);
                 RunHost<half>(type, fastllm::FLOAT16, 0, 33, 320);
             }
             RunHost<__nv_bfloat16>(GGML_TYPE_IQ2_S, fastllm::BFLOAT16, 0);
+            // Real mixed-format combinations, K tails and wide prefill tiles.
+            RunHost<float>(GGML_TYPE_IQ3_XXS, fastllm::FLOAT32, 0, 65, 640, true, GGML_TYPE_IQ4_NL);
+            RunHost<float>(GGML_TYPE_IQ2_S, fastllm::FLOAT32, 0, 1024, 640, true, GGML_TYPE_IQ4_NL);
+            RunHost<half>(GGML_TYPE_Q8_0, fastllm::FLOAT16, 0, 65, 320, true, GGML_TYPE_Q8_0);
             RunHost<float>(GGML_TYPE_IQ2_XS, fastllm::FLOAT32, 0, 33, 256, false);
             RunHost<float>(GGML_TYPE_IQ2_S, fastllm::FLOAT32, 0, 33, 256, true, GGML_TYPE_IQ2_XS);
             // Exercise direct uploads with no restore, and a weight-heavy
@@ -1374,6 +1431,8 @@ int main(int argc, char **argv) {
             RunHost<half>(GGML_TYPE_Q2_0, fastllm::FLOAT16, 0, 33, 256, false, GGML_TYPE_Q2_0, 32);
             RunHost<half>(GGML_TYPE_IQ2_S, fastllm::FLOAT16, 0, 33, 256, true, GGML_TYPE_IQ2_XS, 32);
             if (count >= 2) RunHost<float>(GGML_TYPE_IQ2_XXS, fastllm::FLOAT32, 1);
+            RunPrefillCached(0);
+            if (count >= 2) RunPrefillCached(1);
             std::puts("PASS: streamed GGUF prefill, NUMA shards, selected subsets, immutable weights");
             return 0;
         }

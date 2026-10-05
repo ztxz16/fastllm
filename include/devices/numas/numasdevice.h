@@ -10,6 +10,16 @@
 #include <functional>
 
 namespace fastllm {
+    // Thread-TP models carry their own device set, independently of the
+    // process-wide executor map. Borrow it for one synchronous MoE call.
+    class NumasMoeCudaAssistScope {
+        const std::vector<int> *previous;
+    public:
+        explicit NumasMoeCudaAssistScope(const std::vector<int> *devices);
+        ~NumasMoeCudaAssistScope();
+        NumasMoeCudaAssistScope(const NumasMoeCudaAssistScope &) = delete;
+        NumasMoeCudaAssistScope &operator=(const NumasMoeCudaAssistScope &) = delete;
+    };
     // Plan local CPU sets for CUDA submission, excluding expert-worker cores
     // and respecting the caller's affinity. Empty sets preserve OS placement.
     std::vector<std::vector<int>> GetNumasCudaWorkerCpuSets(

@@ -1749,6 +1749,16 @@ bool FastllmCudaPrepareMoeCache(
 bool FastllmCudaCanRunMoeCache(
         fastllm::Data **weights, int weightsBatch);
 
+// Read-only snapshot of existing canonical GGUF cache records on this GPU.
+// No admission/eviction or allocation is performed. The caller must finish
+// using these pointers before the next decode/cache mutation or cache release.
+struct FastllmCudaMoeGGUFResidents {
+    std::vector<const void *> weights; // gate/down pairs, zero-based expert IDs
+    int gateType = -1, downType = -1, hidden = 0, inter = 0;
+};
+bool FastllmCudaGetMoeGGUFResidents(fastllm::Data **weights, int experts,
+                                  FastllmCudaMoeGGUFResidents &view);
+
 struct FastllmCudaMoeGGUFCacheView {
     const uint8_t *records;
     const int32_t *routeSlots;

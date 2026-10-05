@@ -53,10 +53,43 @@ struct mmq_type_traits<X, Y, Warps, Check, GGML_TYPE_Q2_0> {
 };
 
 namespace grouped_moe {
+// MTP and TP shards can have a Q8_0 K dimension that ends inside a 256-value
+// MMA tile. The ordinary loader assumes complete tiles; zero the tail here.
+template<int Y, int Warps, bool Check>
+__device__ void LoadQ8(const char *x, int *tile, const int &kb0,
+                       const int &imax, const int &stride) {
+#ifdef INT8_MMA_AVAILABLE
+    constexpr int Pitch = MMQ_MMA_TILE_X_K_Q8_0;
+    auto *scales = reinterpret_cast<float *>(tile+2*WARP_SIZE);
+    const int lane = threadIdx.x, blocks = stride/int(sizeof(block_q8_0));
+    for (int row0 = 0; row0 < Y; row0 += Warps) {
+        const int row = row0+threadIdx.y;
+        const int srcRow = Check ? min(row, imax) : row;
+        const auto *weight = reinterpret_cast<const block_q8_0 *>(x+srcRow*stride);
+        for (int half = 0; half < 2; ++half) {
+            const int block = kb0+lane/8+half*4;
+            tile[row*Pitch+lane+half*32] = block < blocks
+                ? get_int_b2(weight[block].qs, lane%8) : 0;
+        }
+        if (lane < 8) scales[row*Pitch+lane] = kb0+lane < blocks
+            ? __half2float(weight[kb0+lane].d) : 0.0f;
+    }
+#else
+    NO_DEVICE_CODE;
+#endif
+}
+template<int X, int Y, int Warps, bool Check, ggml_type Type>
+struct StreamTraits : mmq_type_traits<X, Y, Warps, Check, Type> {};
+template<int X, int Y, int Warps, bool Check>
+struct StreamTraits<X, Y, Warps, Check, GGML_TYPE_Q8_0>
+        : mmq_type_traits<X, Y, Warps, Check, GGML_TYPE_Q8_0> {
+    static constexpr load_tiles_mmq_t load_tiles = LoadQ8<Y, Warps, Check>;
+};
+
 static bool MatrixType(int type, int columns) {
     if (columns <= 0) return false;
     if (type == GGML_TYPE_Q2_0) return columns%64 == 0;
-    if (type == GGML_TYPE_IQ4_NL) return columns%32 == 0;
+    if (type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q8_0) return columns%32 == 0;
     return columns%256 == 0 && (type == GGML_TYPE_IQ2_XXS ||
         type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_S ||
         type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S ||
@@ -174,7 +207,7 @@ __global__ void Matmul(const uint8_t *const *weights, int part,
             reinterpret_cast<const char *>(input+begin), output+size_t(begin)*width,
             nullptr, padded, width, stride, padded, counts[e], capacity, width,
             blockIdx.x, localTile, 0, padded/256);
-    } else mul_mat_q_process_tile<Type, kTile, MMQ_NWARPS, true, false>(
+    } else mul_mat_q_process_tile<Type, Tile, MMQ_NWARPS, true, false, StreamTraits, (Tile > kTile)>(
         reinterpret_cast<const char *>(weights[2*e+part]),
         reinterpret_cast<const char *>(input+begin), output+size_t(begin)*width,
         nullptr, padded, width, stride, padded, counts[e], capacity, width,
@@ -279,9 +312,12 @@ static void LaunchMatrix(const uint8_t *const *weights, int part, Workspace &w,
 static void Matrix(int type, const uint8_t *const *weights, int part, Workspace &w,
                     int experts, int columns, int width, cudaStream_t stream) {
     switch (type) {
-#define GROUPED_CASE(T) case GGML_TYPE_##T: LaunchMatrix<GGML_TYPE_##T>(weights, part, w, experts, columns, width, stream); break;
+#define GROUPED_CASE(T) case GGML_TYPE_##T: \
+        if (w.inputRows >= 1024) LaunchMatrix<GGML_TYPE_##T, 64>(weights, part, w, experts, columns, width, stream); \
+        else LaunchMatrix<GGML_TYPE_##T>(weights, part, w, experts, columns, width, stream); break;
         GROUPED_CASE(Q2_0) GROUPED_CASE(IQ2_XXS) GROUPED_CASE(IQ2_XS) GROUPED_CASE(IQ2_S)
         GROUPED_CASE(IQ3_XXS) GROUPED_CASE(IQ3_S) GROUPED_CASE(IQ4_NL) GROUPED_CASE(IQ4_XS)
+        GROUPED_CASE(Q8_0)
 #undef GROUPED_CASE
 #define V41_CASE(T) case GGML_TYPE_##T: \
         if (w.inputRows >= 1024) LaunchMatrix<GGML_TYPE_##T, 64>(weights, part, w, experts, columns, width, stream); \
@@ -332,6 +368,7 @@ static bool Run(const T *input, T *gate, T *output, const uint8_t *const *weight
     }
     Quantize<<<dim3((inter+255)/256, w.capacity), 256, 0, stream>>>(
         gate, w.quantized, w.groupRoutes, w.offsets+experts, inter, w.capacity);
+    if (downWeightsReady) CUDA_CHECK(cudaStreamWaitEvent(stream, downWeightsReady, 0));
     Matrix(dt, weights, 1, w, experts, inter, hidden, stream);
     Reduce<<<(rows*hidden+255)/256, 256, 0, stream>>>(w.products, output,
         w.routeGroups, scores, rows, hidden, topk);
