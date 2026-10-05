@@ -875,6 +875,14 @@ namespace fastllm {
         return enabled;
     }
 
+    static bool Qwen35DFlashBatchVerifyCudaGraphEnabled(int batch, int maxBatch) {
+        // Batched verification graphs retain extra device buffers. Limit
+        // automatic capture to two-request deployments until graph buffers
+        // are included in the serving memory budget.
+        return batch == 2 && maxBatch == 2 &&
+            Qwen35EnvDefaultEnabled("FASTLLM_CUDA_GRAPH");
+    }
+
     static bool Qwen35MtpFp8DraftHeadEnabled() {
         static bool enabled = []() {
             const char *env = std::getenv("FASTLLM_MTP_FP8_DRAFT_HEAD");
@@ -16942,11 +16950,18 @@ namespace fastllm {
         for (int len : seqLens) {
             homogeneousVerifyLength &= len == seqLens[0];
         }
+        // Capture bounded batched DFlash independently of ordinary decode.
+        // An explicit FASTLLM_CUDA_GRAPH=0 still selects the eager path.
+        const bool dflashBatchVerifyGraph =
+            speculativeCaptureDFlashHiddenStates && !tensorParallel &&
+            Qwen35DFlashBatchVerifyCudaGraphEnabled(batch, maxBatch);
         bool mtpVerifyGraphEligible =
-            !kvMemConfig.enabled && Qwen35CudaGraphEnabled() &&
+            !kvMemConfig.enabled &&
+            (Qwen35CudaGraphEnabled() || dflashBatchVerifyGraph) &&
             Qwen35MtpVerifyCudaGraphEnabled() &&
             (!speculativeCaptureDFlashHiddenStates ||
-             (batch == 1 && computeType == DataType::FLOAT16 &&
+             ((batch == 1 || dflashBatchVerifyGraph) &&
+              computeType == DataType::FLOAT16 &&
               !Qwen35DFlashExactVerifyEnabled())) &&
             speculativeCollectAllLogits &&
             speculativeCaptureFirstTokenLinearState &&
@@ -21479,10 +21494,9 @@ namespace fastllm {
                 return;
             }
             // Both MTP and DFlash restore the same rank-local conv/recurrent
-            // tensors. Preserve the rank synchronization below before draft
-            // work or the next validation can use a different PTDS.
-            if (!tensorParallel ||
-                !Qwen35MtpBatchedStateRestoreEnabled()) {
+            // tensors. On one GPU they share the caller's PTDS with the next
+            // verifier; TP workers still synchronize before the handoff.
+            if (!Qwen35MtpBatchedStateRestoreEnabled()) {
                 for (const BatchStateTensorCopy &copy : copies) {
                     copyTensor(*copy.dst, *copy.src, copy.device);
                 }
@@ -21540,10 +21554,10 @@ namespace fastllm {
                             copyDsts[i], (void*)copySrcs[i], copySizes[i]);
                     }
                 }
-                // Restored target states can be consumed on a different PTDS
-                // by the next batched verify.  One synchronization per rank
-                // replaces hundreds of synchronous tensor copies.
-                ForceDeviceSync();
+                if (tensorParallel) {
+                    // Non-root ranks can be consumed on a different PTDS.
+                    ForceDeviceSync();
+                }
             };
             if (tensorParallel) {
                 threadTpWorkerGroup.Run(devices, copyOnDevice, copyErrors);
