@@ -695,8 +695,11 @@ static void RunPrefillCached(int device) {
     Require(FastllmCudaGetMoeGGUFResidents(weights.data(),experts,resident), "prefill resident snapshot failed");
     Require(resident.weights[0] && resident.weights[4] && resident.weights[8] && !resident.weights[12],
         "prefill resident map differs from admitted experts");
-    for (int e : warmIds) for (int part = 0; part < 2; ++part)
-        std::memset(weights[2*(e+1)+part]->cpuData,0,weights[2*(e+1)+part]->GetBytes());
+    auto eraseHost = [&](int e) {
+        for (int part = 0; part < 2; ++part)
+            std::memset(weights[2*(e+1)+part]->cpuData,0,weights[2*(e+1)+part]->GetBytes());
+    };
+    for (int e : warmIds) eraseHost(e);
     std::vector<int32_t> routes(rows*topk);
     for (int i = 0; i < rows*topk; ++i) routes[i] = 2*(i%4);
     uint64_t before[5]{},after[5]{};
@@ -704,15 +707,39 @@ static void RunPrefillCached(int device) {
     Require(FastllmCudaMergeMOEGGUFHost(input,gate,scratch,output,weights.data(),experts,
         routes.data(),scale.data(),topk,{1,3,5,7},false), "cached prefill rejected");
     std::vector<float> actual(rows*hidden),actualGate(rows*topk*inter);
-    Cuda(cudaMemcpy(actual.data(),output.cudaData,actual.size()*4,cudaMemcpyDeviceToHost));
-    Cuda(cudaMemcpy(actualGate.data(),gate.cudaData,actualGate.size()*4,cudaMemcpyDeviceToHost));
-    CheckReference(GGML_TYPE_IQ3_S,FLOAT32,device,rows,hidden,inter,topk,decoded,x,scale,routes,
-        actual,true,true,actualGate);
+    auto check = [&] {
+        Cuda(cudaMemcpy(actual.data(),output.cudaData,actual.size()*4,cudaMemcpyDeviceToHost));
+        Cuda(cudaMemcpy(actualGate.data(),gate.cudaData,actualGate.size()*4,cudaMemcpyDeviceToHost));
+        CheckReference(GGML_TYPE_IQ3_S,FLOAT32,device,rows,hidden,inter,topk,decoded,x,scale,routes,
+            actual,true,true,actualGate);
+    };
+    check();
     Require(fastllm_moe_cuda_cache_stats(device,after,false) && std::equal(before,before+5,after),
-        "prefill mutated decode cache statistics/policy");
+        "prefill mutated decode cache statistics");
+    Require(FastllmCudaGetMoeGGUFResidents(weights.data(),experts,resident) && resident.weights[12],
+        "prefill miss was not retained in cache");
+    eraseHost(6);
+    Require(FastllmCudaMergeMOEGGUFHost(input,gate,scratch,output,weights.data(),experts,
+        routes.data(),scale.data(),topk,{1,3,5,7},false), "prefill cache reuse rejected");
+    check();
+    std::unordered_set<int> all;
+    for (int e = 0; e < experts; ++e) all.insert(e + 1);
+    for (int i = 0; i < rows*topk; ++i) routes[i] = i % experts;
+    Require(FastllmCudaMergeMOEGGUFHost(input,gate,scratch,output,weights.data(),experts,
+        routes.data(),scale.data(),topk,all,false), "bulk cached prefill rejected");
+    Require(FastllmCudaGetMoeGGUFResidents(weights.data(),experts,resident), "bulk cache disappeared");
+    int filled = 0;
+    for (int e = 0; e < experts; ++e) if (resident.weights[2*e]) {
+        ++filled;
+        eraseHost(e);
+    }
+    Require(filled == 32, "prefill did not fill empty slots beyond decode admission budget");
+    Require(FastllmCudaMergeMOEGGUFHost(input,gate,scratch,output,weights.data(),experts,
+        routes.data(),scale.data(),topk,all,false), "bulk cache reuse rejected");
+    check();
     FastllmCudaReleaseMoeCache(weights.data(),weights.size()); SetMoeCudaCacheBytes(0);
     Require(!FastllmCudaGetMoeGGUFResidents(weights.data(),experts,resident), "released prefill pointers survived");
-    std::printf("PASS cached prefill device=%d: resident+miss, CPU oracle, unchanged policy, release\n",device);
+    std::printf("PASS cached prefill device=%d: resident+miss, bulk fill/reuse, CPU oracle, release\n",device);
 }
 
 // Exercise the CPU repacker, cross-SwiGLU layout, selected expert subsets and
@@ -772,6 +799,7 @@ template<class T> static void RunHost(ggml_type type, fastllm::DataType dtype,
     const bool unsupported = launch(); table[2]->ggmlType = originalType;
     Require(!unsupported && !output.cudaData,"unsupported host format modified output");
     selected.insert(0); Require(!launch(),"shared expert admitted"); selected.erase(0);
+    selected.insert(experts+1); Require(!launch() && !output.cudaData,"out-of-range expert admitted"); selected.erase(experts+1);
     input.Resize({32,hidden}); Require(!launch(),"decode entered host prefill"); input.Resize({batch,hidden});
     cudaGraph_t graph{};
     Cuda(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal));
@@ -1431,6 +1459,10 @@ int main(int argc, char **argv) {
             RunHost<half>(GGML_TYPE_Q2_0, fastllm::FLOAT16, 0, 33, 256, false, GGML_TYPE_Q2_0, 32);
             RunHost<half>(GGML_TYPE_IQ2_S, fastllm::FLOAT16, 0, 33, 256, true, GGML_TYPE_IQ2_XS, 32);
             if (count >= 2) RunHost<float>(GGML_TYPE_IQ2_XXS, fastllm::FLOAT32, 1);
+            // More than three 16-expert groups exercises transfer-ring reuse
+            // and a partial final group, including negative/duplicate routes.
+            RunHost<float>(GGML_TYPE_IQ3_XXS, fastllm::FLOAT32, 0, 65, 320, true, GGML_TYPE_IQ4_NL, 67);
+            RunHost<half>(GGML_TYPE_IQ2_S, fastllm::FLOAT16, 0, 1024, 320, true, GGML_TYPE_IQ4_NL, 67);
             RunPrefillCached(0);
             if (count >= 2) RunPrefillCached(1);
             std::puts("PASS: streamed GGUF prefill, NUMA shards, selected subsets, immutable weights");

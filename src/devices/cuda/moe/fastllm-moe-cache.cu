@@ -301,6 +301,8 @@ struct DeviceCache {
     cudaEvent_t admissionDone = nullptr;
     bool frequencyActive = false;
     bool frequencyResidencyDirty = true;
+    int prefillOwnerRank = 0, prefillOwnerCount = 1;
+    fastllm::Data prefillChanges;
     int32_t *keyToSlot = nullptr;
     int32_t *hostKeyToSlot = nullptr, *mappedKeyToSlot = nullptr;
     int32_t *slotKeys = nullptr;
@@ -2236,10 +2238,11 @@ __global__ void TouchResidentRoutes(const int32_t *slots, const int32_t *routes,
         atomicMax(lastUsed + slots[r], base + routes[r] / topk + 1);
 }
 
-// Ordered after the current GPU computation and the admitted record's DMA.
-__global__ void PublishFrequencyAdmission(int32_t *keys, int32_t *slotKeys,
-        int32_t *mappedKeys, unsigned long long *lastUsed, unsigned long long *step,
-        int key, int slot) {
+// Update the device mapping and its host-visible mirror together. Call only
+// after the admitted payload and all readers of the previous record are done.
+__device__ void PublishAdmission(int32_t *keys, int32_t *slotKeys,
+        int32_t *mappedKeys, unsigned long long *lastUsed,
+        int key, int slot, unsigned long long age) {
     const int old = slotKeys[slot];
     if (old >= 0) {
         keys[old] = -1;
@@ -2247,8 +2250,23 @@ __global__ void PublishFrequencyAdmission(int32_t *keys, int32_t *slotKeys,
     }
     keys[key] = slot;
     slotKeys[slot] = key;
-    lastUsed[slot] = ++*step;
+    lastUsed[slot] = age;
     if (mappedKeys) mappedKeys[key] = slot;
+}
+
+__global__ void PublishFrequencyAdmission(int32_t *keys, int32_t *slotKeys,
+        int32_t *mappedKeys, unsigned long long *lastUsed, unsigned long long *step,
+        int key, int slot) {
+    PublishAdmission(keys, slotKeys, mappedKeys, lastUsed, key, slot, ++*step);
+}
+
+__global__ void PublishPrefillAdmissions(int32_t *keys, int32_t *slotKeys,
+        int32_t *mappedKeys, unsigned long long *lastUsed, unsigned long long *step,
+        const int32_t *changes, int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    PublishAdmission(keys, slotKeys, mappedKeys, lastUsed,
+        changes[i], changes[count + i], atomicAdd(step, 1ULL) + 1);
 }
 
 // Run after current GPU experts finish reading their slots. Protect/touch
@@ -2306,6 +2324,108 @@ double HybridNowUs() {
 }
 
 } // namespace
+
+static void PrepareFrequencyPolicy(OffloadGroup *group, DeviceCache *cache) {
+    if (!cache->frequency) {
+        std::vector<int> keys(group->totalRecords), slots(cache->slots);
+        std::unordered_map<int, int> partitions;
+        for (int layer = 0; layer < int(group->tableKeys.size()); ++layer) {
+            const auto span = cache->layerSlots[layer];
+            const int id = partitions.emplace(span.begin, partitions.size()).first->second;
+            std::fill_n(keys.begin() + layer * group->layout.experts, group->layout.experts, id);
+            std::fill_n(slots.begin() + span.begin, span.count, id);
+        }
+        cache->frequency = std::make_unique<fastllm::MoeFrequencyPolicy>(
+            std::move(keys), std::move(slots), group->tableKeys.size());
+    }
+    if (cache->frequencyResidencyDirty) {
+        std::vector<int> owners(cache->slots);
+        if (!owners.empty()) checkCudaErrors("MoE frequency residency", cudaMemcpyAsync(owners.data(), cache->slotKeys,
+            owners.size() * sizeof(int), cudaMemcpyDeviceToHost, cudaStreamPerThread));
+        checkCudaErrors("MoE frequency residency", cudaStreamSynchronize(cudaStreamPerThread));
+        cache->frequency->SetResidents(owners.data());
+        cache->frequencyResidencyDirty = false;
+    }
+}
+
+void FastllmCudaPlanMoeGGUFPrefill(fastllm::Data **weights, int experts,
+        const int32_t *indices, const float *scores, int rows, int topk,
+        const std::unordered_set<int> &selected, FastllmCudaMoeGGUFPrefillPlan &plan) {
+    plan = {};
+    if (!weights || experts <= 0 || !weights[2] || !indices || !scores || rows <= 0 || topk <= 0) return;
+    OffloadGroup *group = nullptr;
+    int table = -1;
+    {
+        std::lock_guard<std::mutex> lock(RegistryMutex());
+        const auto it = TableRegistry().find(weights[2]);
+        if (it == TableRegistry().end()) return;
+        group = it->second.group; table = it->second.layer;
+    }
+    const auto &layout = group->LayerLayout(table);
+    if (layout.weightType != fastllm::DATA_GGUF_FORMAT || layout.deepSeekV41 ||
+        layout.glm5 || experts > layout.experts) return;
+    std::lock_guard<std::mutex> lock(group->mutex);
+    const auto it = group->deviceCaches.find(FastllmCudaGetDevice());
+    if (it == group->deviceCaches.end() || !it->second) return;
+    auto *cache = it->second.get();
+    if (!cache->ready || !cache->slots || !cache->hostKeyToSlot) return;
+    PrepareFrequencyPolicy(group, cache);
+    const int base = table * layout.experts;
+    std::vector<int> counts(layout.experts, 0), active(layout.experts, 0), lastRow(layout.experts, -1);
+    for (int row = 0; row < rows; ++row) for (int k = 0; k < topk; ++k) {
+        const int r = row * topk + k, e = indices[r];
+        if (e < 0 || e >= experts) continue;
+        active[e] = 1;
+        if (scores[r] == 0 || lastRow[e] == row) continue;
+        lastRow[e] = row; ++counts[e];
+    }
+    auto &policy = *cache->frequency;
+    policy.ObservePrefill(base, counts, rows);
+    std::vector<int> candidates;
+    for (int e : selected) {
+        --e;
+        // EP decode reads each expert on its designated rank. A dynamic
+        // prefill worker may compute another rank's miss, but must not fill
+        // a cache slot that subsequent decode cannot find.
+        if (e >= 0 && e < experts && counts[e] &&
+            e % cache->prefillOwnerCount == cache->prefillOwnerRank)
+            candidates.push_back(e);
+    }
+    std::sort(candidates.begin(), candidates.end(), [&](int a, int b) {
+        const float left = policy.Score(base + a), right = policy.Score(base + b);
+        return left != right ? left > right : a < b;
+    });
+    plan.weights.assign(2 * experts, nullptr);
+    plan.cache = cache;
+    for (int e : candidates) {
+        const auto admission = policy.SelectPrefill(base + e, base, active);
+        if (admission.key < 0) continue;
+        policy.Admit(table, admission);
+        auto *record = cache->records + cache->hostSlotOffsets[admission.slot];
+        plan.weights[2 * e] = record;
+        plan.weights[2 * e + 1] = record + layout.downOffset;
+        plan.keys.push_back(admission.key); plan.slots.push_back(admission.slot);
+    }
+}
+
+void FastllmCudaPublishMoeGGUFPrefill(const FastllmCudaMoeGGUFPrefillPlan &plan) {
+    if (plan.keys.empty()) return;
+    auto &cache = *static_cast<DeviceCache *>(plan.cache);
+    auto &buffer = cache.prefillChanges;
+    const int count = plan.keys.size();
+    buffer.dataType = fastllm::INT32;
+    buffer.Resize({2, count}); buffer.ToDevice(fastllm::CUDA, {cache.device}, false); buffer.Allocate(false);
+    auto *changes = static_cast<int32_t *>(buffer.cudaData);
+    checkCudaErrors("MoE prefill admission keys", cudaMemcpyAsync(changes, plan.keys.data(),
+        count * sizeof(int), cudaMemcpyHostToDevice, cudaStreamPerThread));
+    checkCudaErrors("MoE prefill admission slots", cudaMemcpyAsync(changes + count, plan.slots.data(),
+        count * sizeof(int), cudaMemcpyHostToDevice, cudaStreamPerThread));
+    PublishPrefillAdmissions<<<(count + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+        cache.keyToSlot, cache.slotKeys, cache.mappedKeyToSlot, cache.lastUsed, cache.step, changes, count);
+    checkCudaErrors("MoE prefill admission", cudaGetLastError());
+    if (cache.admissionDone) checkCudaErrors("MoE prefill admission fence",
+        cudaEventRecord(cache.admissionDone, cudaStreamPerThread));
+}
 
 struct FastllmCudaMoeExpertParallel {
     static constexpr int maxRows = FASTLLM_CUDA_MOE_CACHE_MAX_BATCH;
@@ -2480,6 +2600,10 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
         expertInput = &work.inputFloat;
     }
     work.cache = work.ready ? GetDeviceCache(*work.group) : nullptr;
+    if (work.cache) {
+        work.cache->prefillOwnerRank = rank;
+        work.cache->prefillOwnerCount = count;
+    }
     if (rank == 0 && work.ready) {
         work.ready = PackedCacheRows(index) && PackedCacheRows(score) &&
             index.dims[0] == work.rows && index.dims == score.dims &&
@@ -2881,26 +3005,7 @@ void *FastllmCudaBeginMoeDecode(fastllm::Data **weights, int weightsBatch, int t
     if (!cache) return nullptr;
     if (group->layout.weightType == fastllm::DataType::DATA_GGUF_FORMAT &&
         cache->slots < int(group->totalRecords)) {
-        if (!cache->frequency) {
-            std::vector<int> keys(group->totalRecords), slots(cache->slots);
-            std::unordered_map<int, int> partitions;
-            for (int layer = 0; layer < int(group->tableKeys.size()); ++layer) {
-                const auto span = cache->layerSlots[layer];
-                const int id = partitions.emplace(span.begin, partitions.size()).first->second;
-                std::fill_n(keys.begin() + layer * group->layout.experts, group->layout.experts, id);
-                std::fill_n(slots.begin() + span.begin, span.count, id);
-            }
-            cache->frequency = std::make_unique<fastllm::MoeFrequencyPolicy>(
-                std::move(keys), std::move(slots), group->tableKeys.size());
-        }
-        if (cache->frequencyResidencyDirty) {
-            std::vector<int> owners(cache->slots);
-            if (!owners.empty()) checkCudaErrors("MoE frequency residency", cudaMemcpyAsync(owners.data(), cache->slotKeys,
-                owners.size() * sizeof(int), cudaMemcpyDeviceToHost, cudaStreamPerThread));
-            checkCudaErrors("MoE frequency residency", cudaStreamSynchronize(cudaStreamPerThread));
-            cache->frequency->SetResidents(owners.data());
-            cache->frequencyResidencyDirty = false;
-        }
+        PrepareFrequencyPolicy(group, cache);
         cache->frequency->BeginStep();
         cache->frequencyActive = true;
         return cache;

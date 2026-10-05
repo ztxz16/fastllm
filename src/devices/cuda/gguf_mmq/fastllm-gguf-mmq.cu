@@ -1292,3 +1292,24 @@ bool FastllmCudaMoeGGUFGrouped(const fastllm::Data &input, fastllm::Data &gate,
         scores, workspace, gateType, downType, hidden, inter, experts, topk,
         deepSeekV41, swigluLimit, nullptr);
 }
+
+size_t fastllm_gguf_mmq::StreamedMoeWorkspaceBytes(int rows, int hidden, int inter, int topk, int capacity) {
+    return grouped_moe::StreamedWorkspace(nullptr, rows, hidden, inter, topk, capacity).bytes;
+}
+
+bool fastllm_gguf_mmq::RunStreamedMoe(StreamedMoePhase phase, const fastllm::Data &input,
+        fastllm::Data &gate, fastllm::Data &output, void *workspace, int capacity,
+        int hidden, int inter, int topk, int gateType, int downType,
+        const StreamedMoeBatch &batch, const float *scores) {
+    switch (input.dataType) {
+#define STREAMED_RUN(DType, T) case fastllm::DType: return grouped_moe::RunStreamed( \
+        phase, static_cast<const T *>(input.cudaData), static_cast<T *>(gate.cudaData), \
+        static_cast<T *>(output.cudaData), workspace, capacity, input.dims[0], hidden, inter, topk, \
+        gateType, downType, batch, scores);
+        STREAMED_RUN(FLOAT32, float)
+        STREAMED_RUN(FLOAT16, half)
+        STREAMED_RUN(BFLOAT16, __nv_bfloat16)
+#undef STREAMED_RUN
+        default: return false;
+    }
+}

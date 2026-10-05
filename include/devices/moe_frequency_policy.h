@@ -10,8 +10,8 @@
 
 namespace fastllm {
 
-// Decode admission only. Execution stays on the CPU for nonresident experts,
-// including the call that admits an expert. Prefill owns its existing policy.
+// Frequency admission is independent of execution. Prefill can retain already
+// uploaded records in bulk; decode keeps its bounded per-token admission rate.
 class MoeFrequencyPolicy {
 public:
     static constexpr int halfLife = 128;
@@ -41,7 +41,7 @@ public:
             if (p < 0 || p >= count) throw std::invalid_argument("invalid MoE slot partition");
     }
 
-    // Reconcile after prefill; retained frequencies still describe decode.
+    // Reconcile external cache updates without discarding observed frequencies.
     void SetResidents(const int *owners) {
         for (auto &p : residents) p.clear();
         for (auto &key : keys) key.slot = -1;
@@ -86,6 +86,40 @@ public:
             entry.score += 1;
             if (entry.slot >= 0) part.emplace(entry.score, entry.slot);
         }
+    }
+
+    // A chunk supplies one observation per token/expert, not per duplicate
+    // route. Normalize its histogram to the decay window used by decode.
+    // Decay only this layer now: globally decaying at the first layer would
+    // let it evict the still-unobserved layers on every chunk.
+    void ObservePrefill(int base, const std::vector<int> &counts, int rows) {
+        if (rows <= 0 || base < 0 || base + int(counts.size()) > int(keys.size()))
+            throw std::invalid_argument("invalid MoE prefill histogram");
+        const float decay = std::exp2(-float(rows) / halfLife);
+        const float scale = (1 - decay) * halfLife / (std::log(2.0f) * rows);
+        for (int e = 0; e < int(counts.size()); ++e) {
+            auto &key = keys[base + e];
+            auto &part = residents[keyPartitions[base + e]];
+            if (key.slot >= 0) part.erase({key.score, key.slot});
+            key.score = key.score * decay + counts[e] * scale;
+            if (key.slot >= 0) part.emplace(key.score, key.slot);
+        }
+    }
+
+    // The caller provides hot candidates in descending frequency order.
+    // Never overwrite an active expert of this layer: its borrowed pointer
+    // may still be used by a later streamed group. Other layers are drained.
+    Admission SelectPrefill(int key, int base, const std::vector<int> &active) const {
+        if (key < 0 || key >= int(keys.size()) || keys[key].slot >= 0 || keys[key].score <= 0)
+            return {};
+        for (auto victim : residents[keyPartitions[key]]) {
+            const int old = slots[victim.second];
+            if (old >= base && old < base + int(active.size()) && active[old - base]) continue;
+            if (old >= 0 && keys[key].score <= keys[old].score * replacementFactor + replacementMargin)
+                return {};
+            return {key, victim.second};
+        }
+        return {};
     }
 
     Admission Select(int layer, int base, const int *experts, int count) const {

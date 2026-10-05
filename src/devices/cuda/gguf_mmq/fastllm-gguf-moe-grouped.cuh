@@ -177,7 +177,7 @@ __global__ void Quantize(const T *input, block_q8_1_mmq *output,
     const int col = blockIdx.x*blockDim.x+threadIdx.x;
     const int padded = ((columns+255)/256)*256;
     if (col >= padded) return;
-    const int row = blockIdx.y, route = groupRoutes[row];
+    const int row = blockIdx.y, route = groupRoutes ? groupRoutes[row] : row;
     const float x = route >= 0 && col < columns ? mmq_io<T>::to_float(input[size_t(route)*columns+col]) : 0.0f;
     float maximum = fabsf(x);
 #pragma unroll
@@ -317,14 +317,8 @@ static void Matrix(int type, const uint8_t *const *weights, int part, Workspace 
         else LaunchMatrix<GGML_TYPE_##T>(weights, part, w, experts, columns, width, stream); break;
         GROUPED_CASE(Q2_0) GROUPED_CASE(IQ2_XXS) GROUPED_CASE(IQ2_XS) GROUPED_CASE(IQ2_S)
         GROUPED_CASE(IQ3_XXS) GROUPED_CASE(IQ3_S) GROUPED_CASE(IQ4_NL) GROUPED_CASE(IQ4_XS)
-        GROUPED_CASE(Q8_0)
+        GROUPED_CASE(Q8_0) GROUPED_CASE(Q2_K) GROUPED_CASE(Q4_K)
 #undef GROUPED_CASE
-#define V41_CASE(T) case GGML_TYPE_##T: \
-        if (w.inputRows >= 1024) LaunchMatrix<GGML_TYPE_##T, 64>(weights, part, w, experts, columns, width, stream); \
-        else LaunchMatrix<GGML_TYPE_##T>(weights, part, w, experts, columns, width, stream); \
-        break;
-        V41_CASE(Q2_K) V41_CASE(Q4_K)
-#undef V41_CASE
     }
 }
 #include "fastllm-gguf-moe-v41.cuh"
@@ -372,6 +366,102 @@ static bool Run(const T *input, T *gate, T *output, const uint8_t *const *weight
     Matrix(dt, weights, 1, w, experts, inter, hidden, stream);
     Reduce<<<(rows*hidden+255)/256, 256, 0, stream>>>(w.products, output,
         w.routeGroups, scores, rows, hidden, topk);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+// A bounded compute workspace is shared by all streamed groups. Only the
+// per-route products survive between groups, so final reduction keeps the
+// original top-k order and activation rounding without atomic accumulation.
+struct StreamedWorkspace {
+    block_q8_1 *input;
+    block_q8_1_mmq *quantized;
+    float *products, *routes;
+    void *gate;
+    size_t bytes;
+    StreamedWorkspace(void *base, int rows, int hidden, int inter, int topk, int capacity) {
+        size_t used = 0;
+        auto take = [&](size_t n) -> void * {
+            void *p = base ? static_cast<char *>(base) + used : nullptr;
+            used += Align(n); return p;
+        };
+        input = static_cast<block_q8_1 *>(take(size_t(rows) * (hidden / 32) * sizeof(block_q8_1)));
+        quantized = static_cast<block_q8_1_mmq *>(take(size_t(capacity) *
+            (((std::max(hidden, inter) + 255) / 256) * 2) * sizeof(block_q8_1_mmq)));
+        products = static_cast<float *>(take(size_t(capacity) * std::max(2 * inter, hidden) * sizeof(float)));
+        gate = take(size_t(capacity) * inter * sizeof(float));
+        routes = static_cast<float *>(take(size_t(rows) * topk * hidden * sizeof(float)));
+        bytes = used;
+    }
+};
+
+template<class T>
+__global__ void ActivateStreamed(const float *products, T *packed, T *gate,
+        const int *routes, int rows, int inter) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * inter) return;
+    const int row = i / inter, col = i % inter, route = routes[row];
+    T value = mmq_io<T>::from_float(0);
+    if (route >= 0) {
+        const float g = mmq_io<T>::to_float(mmq_io<T>::from_float(products[size_t(row) * 2 * inter + col]));
+        const float u = mmq_io<T>::to_float(mmq_io<T>::from_float(products[size_t(row) * 2 * inter + inter + col]));
+        value = mmq_io<T>::from_float(g / (1 + expf(-g)) * u);
+        gate[size_t(route) * inter + col] = value;
+    }
+    packed[i] = value;
+}
+
+template<class T>
+__global__ void ScatterStreamed(const float *products, float *output,
+        const int *routes, int rows, int hidden) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * hidden) return;
+    const int route = routes[i / hidden];
+    if (route >= 0) output[size_t(route) * hidden + i % hidden] =
+        mmq_io<T>::to_float(mmq_io<T>::from_float(products[i]));
+}
+
+template<class T>
+__global__ void ReduceStreamed(const float *products, T *output,
+        const float *scores, int rows, int hidden, int topk) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * hidden) return;
+    float sum = 0;
+    for (int k = 0; k < topk; ++k) {
+        const int route = (i / hidden) * topk + k;
+        sum += products[size_t(route) * hidden + i % hidden] * scores[route];
+    }
+    output[i] = mmq_io<T>::from_float(sum);
+}
+
+template<class T>
+static bool RunStreamed(StreamedMoePhase phase, const T *input, T *gate, T *output,
+        void *workspace, int capacity, int rows, int hidden, int inter, int topk,
+        int gt, int dt, const StreamedMoeBatch &batch, const float *scores) {
+    const auto stream = cudaStreamPerThread;
+    StreamedWorkspace s(workspace, rows, hidden, inter, topk, capacity);
+    if (phase == StreamedMoePhase::Prepare) {
+        CUDA_CHECK(cudaMemsetAsync(s.routes, 0, size_t(rows) * topk * hidden * sizeof(float), stream));
+        CUDA_CHECK(cudaMemsetAsync(gate, 0, size_t(rows) * topk * inter * sizeof(T), stream));
+        quantize_mmvq_q8_1<<<dim3((hidden + 255) / 256, rows), 256, 0, stream>>>(input, s.input, hidden);
+    } else if (phase == StreamedMoePhase::Finish) {
+        ReduceStreamed<<<(rows * hidden + 255) / 256, 256, 0, stream>>>(s.routes, output, scores, rows, hidden, topk);
+    } else {
+        Workspace w(nullptr, rows, hidden, inter, batch.experts, topk);
+        w.capacity = capacity;
+        w.counts = const_cast<int *>(batch.counts); w.offsets = const_cast<int *>(batch.offsets);
+        w.tileExperts = const_cast<int *>(batch.tileExperts); w.groupRoutes = const_cast<int *>(batch.routes);
+        w.quantized = s.quantized; w.products = s.products;
+        GatherQuantized<<<dim3((batch.rows + 7) / 8, ((hidden + 255) / 256) * 2), 256, 0, stream>>>(
+            s.input, s.quantized, batch.routes, batch.offsets + batch.experts, hidden, capacity, topk);
+        Matrix(gt, batch.weights, 0, w, batch.experts, hidden, 2 * inter, stream);
+        ActivateStreamed<<<(batch.rows * inter + 255) / 256, 256, 0, stream>>>(
+            s.products, static_cast<T *>(s.gate), gate, batch.routes, batch.rows, inter);
+        Quantize<<<dim3((inter + 255) / 256, batch.rows), 256, 0, stream>>>(
+            static_cast<const T *>(s.gate), s.quantized, nullptr, batch.offsets + batch.experts, inter, capacity);
+        Matrix(dt, batch.weights, 1, w, batch.experts, inter, hidden, stream);
+        ScatterStreamed<T><<<(batch.rows * hidden + 255) / 256, 256, 0, stream>>>(
+            s.products, s.routes, batch.routes, batch.rows, hidden);
+    }
     return cudaGetLastError() == cudaSuccess;
 }
 } // namespace grouped_moe

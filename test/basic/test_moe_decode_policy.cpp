@@ -91,6 +91,39 @@ static void TestFrequencyAdmission() {
     Require(zero.Select(0,0,&resident,1).key < 0, "zero capacity admitted an expert");
 }
 
+static void TestPrefillAdmission() {
+    using fastllm::MoeFrequencyPolicy;
+    MoeFrequencyPolicy policy(std::vector<int>(24, 0), std::vector<int>(12, 0), 2);
+    int empty[12]; std::fill(empty, empty + 12, -1); policy.SetResidents(empty);
+    std::vector<int> counts(12, 32);
+    counts[0] = 64;
+    policy.ObservePrefill(0, counts, 128);
+    Require(std::abs(policy.Score(0) - 32 / std::log(2.0f)) < 1e-4f,
+        "prefill frequency is not normalized to decode window");
+    for (int e = 0; e < 12; ++e) {
+        auto a = policy.SelectPrefill(e, 0, counts);
+        Require(a.key == e && a.slot == e, "prefill bulk fill stopped at decode budget");
+        policy.Admit(0, a);
+    }
+    const float firstLayerHeat = policy.Score(0);
+    policy.ObservePrefill(12, std::vector<int>(12, 128), 128);
+    Require(policy.Score(0) == firstLayerHeat, "other layer lost heat before its observation");
+    Require(policy.SelectPrefill(12, 0, counts).key < 0, "active borrowed cache slot evicted");
+    auto a = policy.SelectPrefill(12, 12, counts);
+    Require(a.key == 12 && a.slot != 0, "prefill did not choose cold inactive victim");
+    policy.Admit(1, a);
+    Require(policy.SelectPrefill(13, 12, counts).slot != a.slot,
+        "prefill reused a newly reserved active slot");
+    policy.BeginStep();
+    int e = 1; policy.Observe(0, &e, 1);
+    Require(policy.Score(1) > 0, "decode could not continue after prefill");
+    MoeFrequencyPolicy partition({0, 1}, {1}, 1);
+    int oneEmpty = -1; partition.SetResidents(&oneEmpty);
+    partition.ObservePrefill(0, {128, 128}, 128);
+    Require(partition.SelectPrefill(0, 0, {1, 1}).key < 0,
+        "prefill crossed cache record-size partition");
+}
+
 static void TestDecodeOverlap() {
     fastllm::MoeDecodeOverlapScheduler p;
     Require(p.SelectMisses(0, 10) == 0, "all-hit layer requested PCIe work");
@@ -200,6 +233,7 @@ static void TestParallelOverlap() {
 
 int main() {
     TestFrequencyAdmission();
+    TestPrefillAdmission();
     TestDecodeOverlap();
     TestParallelOverlap();
     using fastllm::MoeDecodePolicy;

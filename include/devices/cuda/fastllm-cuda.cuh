@@ -1759,6 +1759,19 @@ struct FastllmCudaMoeGGUFResidents {
 bool FastllmCudaGetMoeGGUFResidents(fastllm::Data **weights, int experts,
                                   FastllmCudaMoeGGUFResidents &view);
 
+// Reservations exclude all currently active resident experts. Upload directly
+// into these canonical gate/down destinations, then publish on the same stream
+// after both projections are ready. The model serializes calls on each device.
+struct FastllmCudaMoeGGUFPrefillPlan {
+    std::vector<void *> weights;
+    std::vector<int> keys, slots;
+    void *cache = nullptr;
+};
+void FastllmCudaPlanMoeGGUFPrefill(fastllm::Data **weights, int experts,
+    const int32_t *indices, const float *scores, int rows, int topk,
+    const std::unordered_set<int> &selected, FastllmCudaMoeGGUFPrefillPlan &plan);
+void FastllmCudaPublishMoeGGUFPrefill(const FastllmCudaMoeGGUFPrefillPlan &plan);
+
 struct FastllmCudaMoeGGUFCacheView {
     const uint8_t *records;
     const int32_t *routeSlots;
@@ -1828,9 +1841,10 @@ bool FastllmCudaMoeGGUFGrouped(
     const void *weightPointers, const int32_t *indices, const float *scores,
     void *workspace, int gateType, int downType, int hidden, int inter,
     int experts, int topk, bool deepSeekV41 = false, float swigluLimit = 0.0f);
-// NUMA GPU-assisted prefill: temporarily upload only this worker's experts,
-// restore their packed/interleaved layout, and reuse grouped MMQ. No weight
-// storage is mutated. Caller serializes and retains scratch on this GPU.
+// NUMA GPU-assisted prefill: reuse resident experts and stream the worker's
+// misses through upload, layout restoration and grouped MMQ. Ordinary GGUF
+// can retain uploaded weights in the cache; host weights stay immutable.
+// Caller serializes and retains scratch on this GPU.
 bool FastllmCudaMergeMOEGGUFHost(const fastllm::Data &input,
     fastllm::Data &gate, fastllm::Data &workspace, fastllm::Data &output,
     fastllm::Data **weights, int expertCount, const int32_t *indices,
