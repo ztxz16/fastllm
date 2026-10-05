@@ -1,7 +1,7 @@
 #pragma once
 
-// Lossless inverse of NUMA's R4 packing. Shared by streamed prefill and the
-// expert cache; projection kernels continue to receive ordinary GGUF blocks.
+// Lossless inverse of NUMA's R4 packing for prefill, canonical cache admission
+// and temporary experts whose projection kernels cannot read NUMA layouts.
 // Include gguf.h before this header.
 namespace fastllm_gguf_restore {
 constexpr size_t kTileBytes = 16 * 1024;
@@ -233,7 +233,7 @@ __device__ void PackedRows(const Matrix &w, void *const *pointers,
 static __global__ void Records(Record layout, void *const *pointers,
         uint8_t *destination, const int32_t *experts, const int32_t *slots,
         const int32_t *count, const uint64_t *slotOffsets, int fixedExpert,
-        const uint8_t *promoted, int promotedExpert, const uint8_t *uploaded) {
+        const uint8_t *promoted, int promotedExpert, const uint8_t *uploaded, bool promotedNuma) {
     // A refill usually admits one expert. Bound the launch independently of
     // top-k so empty requests do not occupy blocks on every decode layer.
     __shared__ __align__(16) uint32_t tile[kTileBytes / sizeof(uint32_t)];
@@ -246,7 +246,8 @@ static __global__ void Records(Record layout, void *const *pointers,
         const size_t offset = part ? layout.downOffset : 0;
         const auto &w = layout.weights[part];
         auto *output = record + offset;
-        if (promoted && expert == promotedExpert) {
+        const bool promote = promoted && expert == promotedExpert;
+        if (promote && !promotedNuma) {
             // Promotion of an already streamed expert never reads host weights again.
             const size_t end = part ? layout.stride : layout.downOffset;
             for (size_t i = offset + (size_t(blockIdx.x) * blockDim.x + threadIdx.x) * 16;
@@ -254,10 +255,11 @@ static __global__ void Records(Record layout, void *const *pointers,
                 *reinterpret_cast<uint4 *>(record + i) = *reinterpret_cast<const uint4 *>(promoted + i);
             continue;
         }
-        void *deviceSource = uploaded
-            ? const_cast<uint8_t *>(uploaded + size_t(request) * layout.stride + offset) : nullptr;
-        void *const *sources = uploaded ? &deviceSource : pointers + (expert * 2 + part) * layout.shards;
-        const int shards = uploaded ? 1 : layout.shards;
+        const uint8_t *deviceRecord = promote ? promoted :
+            uploaded ? uploaded + size_t(request) * layout.stride : nullptr;
+        void *deviceSource = deviceRecord ? const_cast<uint8_t *>(deviceRecord + offset) : nullptr;
+        void *const *sources = deviceRecord ? &deviceSource : pointers + (expert * 2 + part) * layout.shards;
+        const int shards = deviceRecord ? 1 : layout.shards;
         if (Ordinary(w.type) == w.type) {
             const size_t alignment = part ? size_t(w.rows) * w.rowBytes / shards : w.rowBytes;
             if (!(alignment & 15)) Rows<uint4>(w, sources, output, shards, part == 0, tile);
@@ -288,9 +290,9 @@ inline cudaError_t CopyRecords(const Record &layout, void *const *pointers,
         const int32_t *count = nullptr, const uint64_t *slotOffsets = nullptr,
         int fixedExpert = 0,
         const uint8_t *promoted = nullptr, int promotedExpert = -1,
-        const uint8_t *uploaded = nullptr) {
+        const uint8_t *uploaded = nullptr, bool promotedNuma = false) {
     Records<<<dim3(64, 1, 2), kRestoreThreads, 0, stream>>>(layout, pointers, destination,
-        experts, slots, count, slotOffsets, fixedExpert, promoted, promotedExpert, uploaded);
+        experts, slots, count, slotOffsets, fixedExpert, promoted, promotedExpert, uploaded, promotedNuma);
     return cudaGetLastError();
 }
 } // namespace fastllm_gguf_restore

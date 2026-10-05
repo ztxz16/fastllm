@@ -53,6 +53,16 @@ Experts within a layer must have matching projection layouts. Gate/up rows
 use ordinary concatenated `[gate, up]` order. CPU R4/interleaved layouts are
 not admitted as ordinary GGUF blocks.
 
+Temporary streamed experts can instead retain NUMA's gate/up row interleave
+and IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS R4 packing. The projection kernels read these
+layouts directly, without a separate restoration kernel or a second weight
+copy in host memory. Quantized values and projection arithmetic are unchanged.
+Selection uses each projection's type, shape and batch dispatch; unsupported
+R4 formats or batches retain lossless restoration. Persistent cache entries
+remain canonical: promotion from a temporary NUMA record restores it in VRAM
+without transferring the expert over PCIe again. This applies to generic GGUF
+decode and verification; GLM/V4.1's specialized arithmetic keeps its own path.
+
 The GGUF fast path quantizes input and SwiGLU activations to Q8_1 and uses
 DP4A integer dots for Q2_0, IQ1_M, IQ2_XXS, IQ2_XS and IQ2_S projections.
 Each warp computes one output row; a block shares the activation and codebook.

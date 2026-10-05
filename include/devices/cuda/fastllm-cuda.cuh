@@ -1807,8 +1807,13 @@ struct FastllmCudaMoeGGUFCacheView {
     // and activation scratch use compact order. Entries must be distinct.
     const int32_t *routeMap = nullptr;
     int routeCount = 0;
+    // Temporary DMA records can retain NUMA's cross-interleaved gate/up and
+    // R4 packing. -1 means canonical GGUF; cache admission stays canonical.
+    int numaGateType = -1, numaDownType = -1;
 };
 bool FastllmCudaMoeGGUFCacheSupported(int type, int columns);
+bool FastllmCudaMoeGGUFCacheNumaSupported(int gateType, int downType,
+    int hidden, int inter, int rows);
 bool FastllmCudaMoeGlm5GGUFCacheSupported(int gateType, int downType, int hidden, int inter);
 // Ordinary IQ2 gate/up + IQ3/IQ4 down records. Match GLM GGUF's Q8_K
 // activations, asymmetric clamp, score placement and BF16 boundaries.

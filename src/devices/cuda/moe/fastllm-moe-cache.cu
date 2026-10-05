@@ -121,6 +121,13 @@ struct DecodeOverlapWorkspace {
     int32_t *slots = nullptr, *hostSlots = nullptr;
     std::vector<fastllm::MoeDecodeOverlapScheduler> layers;
     int previousLayer = -1, previousHits = 0, previousMisses = 0, previousStagedRoutes = 0;
+    int numaGateType = -1, numaDownType = -1;
+
+    void ConfigureLayout(const OffloadGroup &group, int table, int rows);
+    void SetLayout(FastllmCudaMoeGGUFCacheView &view) const {
+        view.numaGateType = numaGateType;
+        view.numaDownType = numaDownType;
+    }
 
     bool Init(size_t stride, int layerCount, int capacity = kMaxTopK, bool restore = false) {
         expertReady.resize(capacity); stagedStart.resize(capacity); stagedDone.resize(capacity);
@@ -357,6 +364,18 @@ struct OffloadGroup {
     }
 };
 
+void DecodeOverlapWorkspace::ConfigureLayout(const OffloadGroup &group, int table, int rows) {
+    numaGateType = numaDownType = -1;
+    const auto &layout = group.LayerLayout(table);
+    if (group.ggufSources.empty() || layout.glm5 || layout.deepSeekV41) return;
+    const auto &source = group.ggufSources[table];
+    if (FastllmCudaMoeGGUFCacheNumaSupported(source.weights[0].type,
+            source.weights[1].type, layout.hidden, layout.inter, rows)) {
+        numaGateType = source.weights[0].type;
+        numaDownType = source.weights[1].type;
+    }
+}
+
 void DecodeOverlapWorkspace::CopyExpert(const OffloadGroup &group, int table,
         int expert, int i, int count) {
     const auto &layout = group.LayerLayout(table);
@@ -368,6 +387,9 @@ void DecodeOverlapWorkspace::CopyExpert(const OffloadGroup &group, int table,
             layout.recordStride, cudaMemcpyHostToDevice, copyStream));
     } else {
         const auto &source = group.ggufSources[table];
+        // Direct kernels consume CPU packing in registers. Other formats
+        // retain the lossless restore path and its separate upload scratch.
+        auto *target = numaGateType >= 0 ? destination : upload;
         // Leave bulk PCIe traffic on the DMA engine so resident expert
         // kernels can occupy the SMs while this expert is in flight.
         const size_t base = (size_t(table) * layout.experts + expert) * 2 * source.shards;
@@ -376,11 +398,11 @@ void DecodeOverlapWorkspace::CopyExpert(const OffloadGroup &group, int table,
             const size_t bytes = weight.rows * weight.rowBytes / source.shards;
             for (int node = 0; node < source.shards; ++node)
                 checkCudaErrors("MoE NUMA expert DMA", cudaMemcpyAsync(
-                    upload + (part ? source.downOffset : 0) + node * bytes,
+                    target + (part ? source.downOffset : 0) + node * bytes,
                     group.numaPointers[base + part * source.shards + node],
                     bytes, cudaMemcpyHostToDevice, copyStream));
         }
-        checkCudaErrors("MoE restore expert", fastllm_gguf_restore::CopyRecords(
+        if (numaGateType < 0) checkCudaErrors("MoE restore expert", fastllm_gguf_restore::CopyRecords(
             source, nullptr, destination, copyStream, nullptr, nullptr, nullptr, nullptr,
             0, nullptr, -1, upload));
     }
@@ -2152,7 +2174,8 @@ const ExpertCacheBackend *FindExpertCacheBackend(fastllm::DataType type) {
 
 bool EnsureCachedExperts(OffloadGroup *group, DeviceCache *cache, int tableId,
                          const int32_t *indices, int topk, cudaStream_t stream = cudaStreamPerThread,
-                         const uint8_t *stagedRecord = nullptr, int stagedExpert = -1) {
+                         const uint8_t *stagedRecord = nullptr, int stagedExpert = -1,
+                         bool stagedNuma = false) {
     if (cache->slots == 0) return false;
     cache->frequencyResidencyDirty = true;
     const auto &layout = group->layout;
@@ -2172,7 +2195,7 @@ bool EnsureCachedExperts(OffloadGroup *group, DeviceCache *cache, int tableId,
         return fastllm_gguf_restore::CopyRecords(source,
             cache->numaPointers + size_t(tableId) * layout.experts * 2 * source.shards,
             cache->records, stream, cache->missExperts, cache->missSlots,
-            cache->missCount, cache->slotOffsets, 0, stagedRecord, stagedExpert) == cudaSuccess;
+            cache->missCount, cache->slotOffsets, 0, stagedRecord, stagedExpert, nullptr, stagedNuma) == cudaSuccess;
     }
     if (shared.shards > 0) {
         void *const *pointers = cache->numaPointers +
@@ -2754,6 +2777,7 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
             overlap = work.overlap.get();
     }
     const int timingLayer = (rows - 1) * work.group->tableKeys.size() + work.table;
+    if (overlap) overlap->ConfigureLayout(*work.group, work.table, rows);
     const int hits = std::count_if(work.Selected(), work.Selected() + routes,
         [](int expert) { return expert >= 0; });
     auto &missedExperts = work.missedExperts;
@@ -2918,6 +2942,7 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
             // All calls retain the same input-row layout and Q8 prefix, even
             // when each expert serves a different number of verifier rows.
             temporary.q8InputPrepared = hits > 0;
+            overlap->SetLayout(temporary);
             for (int i = 0; i < staged; ++i) {
                 overlap->CopyExpert(*work.group, work.table, missedExperts[i], i, staged);
                 checkCudaErrors("Verify wait expert", cudaStreamWaitEvent(cudaStreamPerThread, overlap->expertReady[i], 0));
@@ -2977,14 +3002,14 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
             work.cache->keyToSlot, work.cache->slotKeys,
             static_cast<int32_t *>(work.lookup.cudaData), work.table * layout.experts,
             layout.experts, topk, candidate % topk);
-        // A staged expert is already in VRAM. Promote those exact packed bytes
-        // rather than reading the same host record over PCIe a second time.
+        // Reuse the staged VRAM record for admission. NUMA records are restored
+        // only when admitted, so persistent cache slots retain canonical bytes.
         const int stagedIndex = stagedSlot[candidate];
         const uint8_t *record = stagedIndex >= 0
             ? overlap->records + size_t(stagedIndex) * layout.recordStride : nullptr;
         AssertInFastLLM(EnsureCachedExperts(work.group, work.cache, work.table,
             static_cast<int32_t *>(work.lookup.cudaData), topk, stream,
-            record, work.Indices()[candidate]), "EP cache admission failed.\n");
+            record, work.Indices()[candidate], record && overlap->numaGateType >= 0), "EP cache admission failed.\n");
         checkCudaErrors("EP refill end", cudaEventRecord(work.copyEnd, stream));
         checkCudaErrors("EP publish admission", cudaEventRecord(work.cache->admissionDone, stream));
         ++work.admissions;
@@ -3560,6 +3585,7 @@ bool FastllmCudaMergeMOEHybrid(const fastllm::Data &input,
         else (void)cudaGetLastError();
     }
     auto *overlap = frequency ? work.overlap.get() : nullptr;
+    if (overlap) overlap->ConfigureLayout(*group, tableId, 1);
     work.previousPrefetch = false;
     auto *hostIndices = reinterpret_cast<int32_t *>(work.host + (kMaxTopK + 1) * hidden);
     auto *resident = hostIndices + kMaxTopK;
@@ -3741,6 +3767,7 @@ bool FastllmCudaMergeMOEHybrid(const fastllm::Data &input,
             // A resident call, if present, has already prepared this input.
             // All staged calls use the same prefix and disjoint output rows.
             temporary.q8InputPrepared = hits > 0;
+            overlap->SetLayout(temporary);
             for (int i = 0; i < staged; ++i) {
                 const int route = order[hits + i];
                 checkCudaErrors("Decode wait expert", cudaStreamWaitEvent(cudaStreamPerThread, overlap->expertReady[i], 0));

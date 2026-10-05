@@ -392,21 +392,23 @@ template<class T> static void RunReusedInput(ggml_type type, fastllm::DataType d
 // Compact dispatch must preserve the original input row and output route,
 // including repeated expert slots and partial groups not divisible by topk.
 template<class T> static void RunRoutedBatch(ggml_type gateType, ggml_type downType,
-                                           fastllm::DataType dtype, int rows) {
+                                           fastllm::DataType dtype, int rows, bool numa = false) {
     using namespace fastllm;
     constexpr int hidden = 256, inter = 768, experts = 3, topk = 7;
     const int routes = rows * topk;
-    auto gu = Weight(gateType, 2 * inter, hidden, 1, true);
-    auto dw = Weight(downType, hidden, inter, 2, true);
-    const size_t offset = (gu->GetBytes() + 15) / 16 * 16;
-    const size_t stride = offset + dw->GetBytes();
+    const size_t gateBytes = 2 * inter * ggml_row_size(gateType, hidden);
+    const size_t offset = (gateBytes + 15) / 16 * 16;
+    const size_t stride = offset + hidden * ggml_row_size(downType, inter);
     const size_t bytes = FastllmCudaMoeGGUFCacheBatchWorkspaceBytes(hidden, inter, rows, topk);
     Require(bytes > 0, "routed batch workspace unavailable");
     Data records(INT8, {int(experts * stride)}), workspace(INT8, {int(bytes)});
+    Data numaRecords(INT8, {int(numa ? experts * stride : 1)});
+    int numaGateType = -1, numaDownType = -1;
     Data input(dtype, {rows, hidden}), gate(dtype, {routes, inter}), output(dtype, {rows, hidden});
     Data slots(INT32, {routes}), map(INT32, {routes}), scores(FLOAT32, {routes});
     Data partial(FLOAT32, {routes, hidden});
     for (auto *d : {&records, &workspace, &input, &gate, &output, &slots, &map, &scores, &partial}) Gpu(*d);
+    if (numa) Gpu(numaRecords);
     for (int e = 0; e < experts; ++e) {
         auto g = Weight(gateType, 2 * inter, hidden, 11 * e + 1, true);
         auto d = Weight(downType, hidden, inter, 11 * e + 2, true);
@@ -414,6 +416,21 @@ template<class T> static void RunRoutedBatch(ggml_type gateType, ggml_type downT
                         g->cpuData, g->GetBytes(), cudaMemcpyHostToDevice));
         Cuda(cudaMemcpy(static_cast<uint8_t *>(records.cudaData) + e * stride + offset,
                         d->cpuData, d->GetBytes(), cudaMemcpyHostToDevice));
+        if (numa) {
+            const size_t rowBytes = g->GetBytes() / (2 * inter);
+            std::vector<uint8_t> canonical(g->cpuData, g->cpuData + g->GetBytes());
+            for (int r = 0; r < 2 * inter; ++r)
+                std::memcpy(g->cpuData + r * rowBytes,
+                    canonical.data() + (r/2 + (r%2)*inter)*rowBytes, rowBytes);
+            g->Repack(); d->Repack();
+            numaGateType = g->ggmlType; numaDownType = d->ggmlType;
+            Require(FastllmCudaMoeGGUFCacheNumaSupported(numaGateType, numaDownType,
+                hidden, inter, rows), "NUMA fixture unsupported");
+            Cuda(cudaMemcpy(static_cast<uint8_t *>(numaRecords.cudaData) + e * stride,
+                g->cpuData, g->GetBytes(), cudaMemcpyHostToDevice));
+            Cuda(cudaMemcpy(static_cast<uint8_t *>(numaRecords.cudaData) + e * stride + offset,
+                d->cpuData, d->GetBytes(), cudaMemcpyHostToDevice));
+        }
     }
     std::vector<int32_t> original(routes), compactSlots, compactRoutes;
     for (int r = 0; r < routes; ++r) original[r] = r % 5 == 0 ? -1 : (r * 11 + r / topk) % experts;
@@ -435,6 +452,10 @@ template<class T> static void RunRoutedBatch(ggml_type gateType, ggml_type downT
         Require(FastllmCudaMoeGGUFCacheCompute(input, gate, output, view,
             static_cast<float *>(scores.cudaData), topk, static_cast<float *>(partial.cudaData)), "full batch rejected");
         Cuda(cudaMemcpy(reference.data(), partial.cudaData, reference.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        if (numa) {
+            view.records = static_cast<uint8_t *>(numaRecords.cudaData);
+            view.numaGateType = numaGateType; view.numaDownType = numaDownType;
+        }
         Cuda(cudaMemcpy(slots.cudaData, compactSlots.data(), routes * sizeof(int32_t), cudaMemcpyHostToDevice));
         Cuda(cudaMemcpy(map.cudaData, compactRoutes.data(), routes * sizeof(int32_t), cudaMemcpyHostToDevice));
         Cuda(cudaMemsetAsync(workspace.cudaData, 0xff, bytes, cudaStreamPerThread));
@@ -457,8 +478,8 @@ template<class T> static void RunRoutedBatch(ggml_type gateType, ggml_type downT
         Require(!FastllmCudaMoeGGUFCacheCompute(input, gate, output, view,
             static_cast<float *>(scores.cudaData), topk, nullptr), "compact dispatch accepted a dense reduction");
     }
-    std::printf("PASS routed GGUF rows=%d gate=%d down=%d dtype=%d: exact mapping, partial groups, input reuse\n",
-                rows, gateType, downType, dtype);
+    std::printf("PASS routed GGUF rows=%d gate=%d down=%d dtype=%d numa=%d: exact mapping, partial groups, input reuse\n",
+                rows, gateType, downType, dtype, int(numa));
 }
 
 template<class T> static void RunResident(ggml_type type, fastllm::DataType dtype,
@@ -862,7 +883,7 @@ static void CpuExpertReference(const float *input, float *output,
 static void RunSharedGGUFRecords() {
     using namespace fastllm_gguf_restore;
     constexpr int experts = 3;
-    enum class Mode { FixedExpert, Batch, Promotion, Empty, Uploaded };
+    enum class Mode { FixedExpert, Batch, Promotion, PackedPromotion, Empty, Uploaded };
     for (auto type : {GGML_TYPE_Q2_K, GGML_TYPE_Q4_K, GGML_TYPE_IQ2_XXS,
                      GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS,
                      GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS,
@@ -916,12 +937,13 @@ static void RunSharedGGUFRecords() {
             Cuda(cudaMalloc(&output, outputBytes)); Cuda(cudaMalloc(&promoted, layout.stride));
             Cuda(cudaMalloc(&uploaded, layout.stride));
             Cuda(cudaMemcpy(uploaded, host + 2 * layout.stride, layout.stride, cudaMemcpyHostToDevice));
-            Cuda(cudaMemcpy(promoted, canonical.data(), layout.stride, cudaMemcpyHostToDevice));
             // Cover host restoration, device-selected batches, D2D promotion,
             // empty requests, and restoration after a DMA upload.
-            for (auto mode : {Mode::FixedExpert, Mode::Batch, Mode::Promotion, Mode::Empty, Mode::Uploaded}) {
+            for (auto mode : {Mode::FixedExpert, Mode::Batch, Mode::Promotion, Mode::PackedPromotion, Mode::Empty, Mode::Uploaded}) {
                 std::fill(expected.begin(), expected.end(), 0xa5);
                 metadata[6] = mode == Mode::Empty ? 0 : experts;
+                Cuda(cudaMemcpy(promoted, mode == Mode::PackedPromotion ? host : canonical.data(),
+                    layout.stride, cudaMemcpyHostToDevice));
                 Cuda(cudaMemcpy(ids, metadata, sizeof(metadata), cudaMemcpyHostToDevice));
                 Cuda(cudaMemset(output, 0xa5, outputBytes));
                 if (mode == Mode::FixedExpert || mode == Mode::Uploaded) {
@@ -937,7 +959,8 @@ static void RunSharedGGUFRecords() {
                             canonical.data() + metadata[i] * layout.stride, layout.stride);
                     Cuda(CopyRecords(layout, pointers, output, cudaStreamPerThread,
                         ids, ids + experts, ids + 2 * experts, slotOffsets, 0,
-                        mode == Mode::Promotion ? promoted : nullptr, 0));
+                        mode == Mode::Promotion || mode == Mode::PackedPromotion ? promoted : nullptr, 0,
+                        nullptr, mode == Mode::PackedPromotion));
                 }
                 Cuda(cudaMemcpy(actual.data(), output, outputBytes, cudaMemcpyDeviceToHost));
                 if (actual != expected) {
@@ -1341,6 +1364,32 @@ int main(int argc, char **argv) {
     try {
         int count = 0; Cuda(cudaGetDeviceCount(&count)); if (!count) { std::puts("SKIP: no CUDA device"); return 0; }
         Cuda(cudaSetDevice(0));
+        if (argc > 1 && std::strcmp(argv[1], "--numa-layout") == 0) {
+            // R4 requires the Q8 projection for each packed part. Some mixed
+            // pairs switch to floating-point projection above 32 input rows.
+            struct Case { ggml_type gate, down; int maxRows; };
+            const Case cases[] = {
+                {GGML_TYPE_IQ3_S, GGML_TYPE_Q2_0, 64},
+                {GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_NL, 32},
+                {GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XXS, 64},
+                {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_S, 32},
+                {GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_XXS, 32},
+                {GGML_TYPE_F16, GGML_TYPE_F32, 64},
+            };
+            for (int rows : {1, 2, 3, 4, 5, 8, 17, 32, 64}) {
+                for (const auto &test : cases) {
+                    if (rows > test.maxRows) continue;
+                    RunRoutedBatch<float>(test.gate, test.down, fastllm::FLOAT32, rows, true);
+                    RunRoutedBatch<half>(test.gate, test.down, fastllm::FLOAT16, rows, true);
+                    RunRoutedBatch<__nv_bfloat16>(test.gate, test.down, fastllm::BFLOAT16, rows, true);
+                }
+            }
+            Require(!FastllmCudaMoeGGUFCacheNumaSupported(GGML_TYPE_IQ3_XXS_R4,
+                GGML_TYPE_IQ4_NL, 256, 256, 64), "large R4 batch should retain restore fallback");
+            Require(!FastllmCudaMoeGGUFCacheNumaSupported(GGML_TYPE_Q4_K_R4,
+                GGML_TYPE_IQ4_NL, 256, 256, 1), "unsupported R4 should retain restore fallback");
+            std::puts("PASS: direct NUMA GGUF layout"); return 0;
+        }
         if (argc > 1 && std::strcmp(argv[1], "--routed-batch") == 0) {
             for (int rows : {1, 2, 3, 4, 5, 8, 17, 32}) {
                 for (auto pair : {std::make_pair(GGML_TYPE_IQ3_S, GGML_TYPE_Q2_0),
