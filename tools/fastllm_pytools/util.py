@@ -30,6 +30,36 @@ def _probability(value: str) -> float:
         raise argparse.ArgumentTypeError("must be a probability in [0, 1]")
     return result
 
+def _moe_cache_int(value: str) -> int:
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("must be an integer in [0, 2147483647]")
+    if not 0 <= result <= (1 << 31) - 1:
+        raise argparse.ArgumentTypeError("must be an integer in [0, 2147483647]")
+    return result
+
+def _moe_cache_interval(value: str) -> int:
+    result = _moe_cache_int(value)
+    if result == 0:
+        raise argparse.ArgumentTypeError("MoE cache update interval must be positive")
+    return result
+
+def _moe_cache_float(value: str) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("must be a finite non-negative float32 value")
+    if not 0 <= result <= 3.4028234663852886e38:
+        raise argparse.ArgumentTypeError("must be a finite non-negative float32 value")
+    return result
+
+def _moe_cache_factor(value: str) -> float:
+    result = _moe_cache_float(value)
+    if result < 1:
+        raise argparse.ArgumentTypeError("MoE cache replacement factor must be >= 1")
+    return result
+
 def _memory_size_bytes(value) -> int:
     """Parse a non-negative binary memory size such as 3g or 512m."""
     maximum = (1 << 64) - 1
@@ -872,6 +902,23 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         dest = 'moe_cuda_cache', type = _memory_size_bytes,
                         default = 0,
                         help = '混合推理时用于缓存MoE专家的CUDA显存，如3g；0表示关闭')
+    cache_policy = parser.add_argument_group('GGUF单token混合decode缓存更新（加载模型前设置）')
+    for name, kind, default, help_text in (
+        ('half_life', _moe_cache_float, 128., 'decode热度半衰期，单位token；0不衰减，默认128'),
+        ('update_interval', _moe_cache_interval, 1, '每多少个decode步更新一次，默认1'),
+        ('max_replacements', _moe_cache_int, 96, '每次更新跨层换入专家数上限；0关闭decode换入，默认96'),
+        ('max_bytes', _memory_size_bytes, 0, '每次更新换入字节上限，如30m；0不另设字节上限'),
+        ('min_heat', _moe_cache_float, 1., '候选专家最低热度，默认1'),
+        ('margin', _moe_cache_float, 1., '候选热度必须超过驻留热度乘factor再加此值，默认1'),
+        ('factor', _moe_cache_factor, 1., '驻留热度的替换保护倍数，至少1，默认1'),
+        ('min_residence', _moe_cache_int, 0, '换入后最少驻留decode步数，默认0'),
+        ('prefill_prior', _probability, 0., 'decode继承的归一化prefill热度比例[0,1]；默认0，保留缓存内容'),
+    ):
+        option = 'moe_cache_' + name
+        cache_policy.add_argument('--' + option, '--' + option.replace('_', '-'),
+                                  dest=option, type=kind, default=default, help=help_text)
+    cache_policy.add_argument('--moe_cache_rank_by_bytes', '--moe-cache-rank-by-bytes',
+                              action='store_true', help='按热度收益/换入字节排序；默认按热度收益排序')
     parser.add_argument('--moe_cpu_cache', '--moe-cpu-cache',
                         dest = 'moe_cpu_cache', type = _memory_size_bytes,
                         default = 0,
@@ -1694,6 +1741,17 @@ def make_normal_llm_model(args, startup_progress = None):
     llm.set_moe_device_layers(-1)
     llm.set_moe_cuda_cache(
         _memory_size_bytes(getattr(args, "moe_cuda_cache", 0)))
+    llm.set_moe_cache_policy(
+        half_life=getattr(args, "moe_cache_half_life", 128.),
+        update_interval=getattr(args, "moe_cache_update_interval", 1),
+        max_replacements=getattr(args, "moe_cache_max_replacements", 96),
+        max_bytes=_memory_size_bytes(getattr(args, "moe_cache_max_bytes", 0)),
+        min_heat=getattr(args, "moe_cache_min_heat", 1.),
+        margin=getattr(args, "moe_cache_margin", 1.),
+        factor=getattr(args, "moe_cache_factor", 1.),
+        min_residence=getattr(args, "moe_cache_min_residence", 0),
+        prefill_prior=getattr(args, "moe_cache_prefill_prior", 0.),
+        rank_by_bytes=getattr(args, "moe_cache_rank_by_bytes", False))
     llm.set_moe_cpu_cache(
         _memory_size_bytes(getattr(args, "moe_cpu_cache", 0)))
     llm.set_ngram_device(args.ngram_device)

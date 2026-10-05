@@ -9,119 +9,159 @@ static void Require(bool ok, const char *message) {
 }
 
 static void TestFrequencyAdmission() {
+    using fastllm::MoeCacheConfig;
     using fastllm::MoeFrequencyPolicy;
-    MoeFrequencyPolicy policy({0,0,0,0,1,1}, {0,1}, 2);
+    MoeCacheConfig config;
+    config.halfLife = 0;
+    config.maxReplacements = 1;
+    MoeFrequencyPolicy policy({0,0,0,0,1,1}, {0,1}, 2, config);
     int owners[] = {0,4}; policy.SetResidents(owners);
-    int resident = 0, cold = 1;
-    for (int step = 0; step < 8; ++step) {
-        policy.BeginStep(); policy.Observe(0, &resident, 1);
-    }
-    policy.Observe(0, &cold, 1);
-    Require(policy.Select(0,0,&cold,1).key < 0, "single miss admitted");
-    // Hysteresis prevents replacing a resident at equal/slightly higher heat.
-    for (int i = 0; i < 10; ++i) policy.Observe(0,&cold,1);
-    Require(policy.Select(0,0,&cold,1).key < 0, "replacement hysteresis ignored");
-    policy.Observe(0,&cold,1);
-    auto admission = policy.Select(0,0,&cold,1);
-    Require(admission.key == 1 && admission.slot == 0, "hot miss did not select compatible victim");
-    policy.Admit(0,admission);
-    Require(policy.Select(0,0,&resident,1).key < 0, "layer admitted twice");
-    int duplicates[] = {1,1,-1,999};
-    policy.Observe(0,duplicates,4);
-    Require(policy.Score(1) == 13, "duplicate or invalid route inflated frequency");
-    int other = 5;
-    for (int i = 0; i < 30; ++i) policy.Observe(0,&other,1);
-    admission = policy.Select(1,0,&other,1);
-    Require(admission.slot == 1, "admission crossed a record-size partition");
-    policy.Admit(1,admission);
-    // A newly admitted expert cannot be churned out by the next hot route.
+    int early = 1, late = 5;
     policy.BeginStep();
-    for (int i = 0; i < 100; ++i) policy.Observe(0,&resident,1);
-    Require(policy.Select(0,0,&resident,1).key < 0, "minimum residence ignored");
-    const float heat = policy.Score(1);
-    for (int i = 0; i < 128; ++i) policy.BeginStep();
-    Require(std::abs(policy.Score(1) - heat * .5f) < 1e-4f, "frequency half-life incorrect");
-    admission = policy.Select(0,0,&resident,1);
-    Require(admission.key == 0, "policy did not adapt to a changed hot set");
-    // A prefill may change all slots; decode frequencies survive reconciliation.
-    const float retainedHeat = policy.Score(1);
+    for (int i = 0; i < 3; ++i) policy.Observe(0, &early, 1);
+    for (int i = 0; i < 5; ++i) policy.Observe(0, &late, 1);
+    const float heat = policy.Score(early);
+    int duplicates[] = {1,1,-1,999};
+    policy.Observe(0, duplicates, 4);
+    Require(policy.Score(early) == heat + 1, "duplicate or invalid route inflated frequency");
+    Require(policy.Slot(early) < 0 && policy.Slot(late) < 0, "admitted before the token ended");
+    auto plan = policy.EndStep();
+    Require(plan.size() == 1 && plan[0].key == late && plan[0].slot == 1,
+            "global budget did not choose the higher-benefit later layer");
+    Require(policy.EndStep().empty(), "repeated End spent the budget twice");
+    policy.BeginStep();
+    plan = policy.EndStep();
+    Require(plan.size() == 1 && plan[0].key == early && plan[0].slot == 0,
+            "previously observed hot miss was forgotten or crossed a size partition");
+    // Scores survive ordinary cache reconciliation, but invalid ownership does not.
+    const float retainedHeat = policy.Score(early);
     int changed[] = {2,5}; policy.SetResidents(changed);
-    Require(policy.Score(1) == retainedHeat, "prefill reconciliation lost decode history");
+    Require(policy.Score(early) == retainedHeat, "reconciliation lost heat");
     bool rejected = false;
     try { int invalid[] = {5,2}; policy.SetResidents(invalid); }
     catch (const std::invalid_argument &) { rejected = true; }
     Require(rejected, "invalid partition snapshot accepted");
 
-    for (const int layers : {1, 3, 8, 10, 48}) {
-        MoeFrequencyPolicy fair(std::vector<int>(2*layers,0), std::vector<int>(layers,0), layers);
-        std::vector<int> ownersFair(layers);
-        for (int i = 0; i < layers; ++i) ownersFair[i] = i;
-        fair.SetResidents(ownersFair.data());
-        for (int i = 0; i < MoeFrequencyPolicy::minimumResidence; ++i) fair.BeginStep();
-        for (int layer = 0; layer < layers; ++layer) {
-            fair.Observe(layers,&layer,1); fair.Observe(layers,&layer,1);
-        }
-        const int budget = std::min(layers, MoeFrequencyPolicy::maxReplacementsPerStep);
-        std::vector<bool> visited(layers,false);
-        for (int step = 0; step < (layers + budget - 1) / budget; ++step) {
-            fair.BeginStep(); int admitted = 0;
-            for (int layer = 0; layer < layers; ++layer) {
-                auto a = fair.Select(layer,layers,&layer,1);
-                if (a.key < 0) continue;
-                fair.Admit(layer,a); visited[layer] = true; ++admitted;
-            }
-            Require(admitted > 0 && admitted <= budget, "per-token admission budget incorrect");
-        }
-        Require(std::all_of(visited.begin(),visited.end(),[](bool v) { return v; }), "later layers starved");
+    // Both record bytes and expert count are hard per-update limits.
+    for (bool byBytes : {false, true}) for (bool uniformSlots : {false, true}) {
+        config.maxReplacements = 2; config.maxBytes = 100; config.rankByBytes = byBytes;
+        MoeFrequencyPolicy bytes(uniformSlots ? std::vector<int>{0,0,0,0} : std::vector<int>{0,0,1,1},
+            uniformSlots ? std::vector<int>{0,0} : std::vector<int>{0,1}, 2, config, {80,80,40,40});
+        int old[] = {0,2}; bytes.SetResidents(old);
+        bytes.BeginStep();
+        int a=1,b=3;
+        for(int i=0;i<4;++i) bytes.Observe(0,&a,1);
+        for(int i=0;i<3;++i) bytes.Observe(0,&b,1);
+        plan=bytes.EndStep();
+        Require(plan.size()==1 && plan[0].key==(byBytes ? b : a),
+                "byte ceiling or benefit-per-byte ranking failed");
     }
-    MoeFrequencyPolicy coldStart(std::vector<int>(10,0), std::vector<int>(8,0), 1);
-    int empty[] = {-1,-1,-1,-1,-1,-1,-1,-1}; coldStart.SetResidents(empty);
-    int routes[] = {0,1,2,3,4,5,6,7,8,9};
-    for (int i = 0; i < 2; ++i) {
-        coldStart.BeginStep(); coldStart.Observe(0,routes,10);
-        for (int j = 0; j < 4; ++j) {
-            auto a = coldStart.Select(0,0,routes,10);
-            Require(a.key == i * 4 + j, "cold cache did not fill distinct empty slots"); coldStart.Admit(0,a);
-        }
-        Require(coldStart.Select(0,0,routes,10).key < 0, "cold fill budget or residence ignored");
+    config = MoeCacheConfig(); config.halfLife=0; config.maxReplacements=3;
+    {
+        auto weightedConfig=config;weightedConfig.rankByBytes=true;weightedConfig.replacementMargin=0;
+        MoeFrequencyPolicy weighted({0,0,0},{0},1,weightedConfig,{80,80,40});
+        int old=0;weighted.SetResidents(&old);weighted.BeginStep();int big=1,small=2;
+        for(int i=0;i<4;++i)weighted.Observe(0,&big,1);
+        for(int i=0;i<3;++i)weighted.Observe(0,&small,1);
+        plan=weighted.EndStep();
+        Require(plan.size()==1 && plan[0].key==small,"batch reused a reserved slot for a differently sized candidate");
     }
-    MoeFrequencyPolicy zero({0,0}, {}, 1);
-    zero.SetResidents(nullptr); zero.BeginStep();
-    zero.Observe(0,&resident,1); zero.Observe(0,&resident,1);
-    Require(zero.Select(0,0,&resident,1).key < 0, "zero capacity admitted an expert");
+    MoeFrequencyPolicy empty(std::vector<int>(10,0), std::vector<int>(8,0), 1,config);
+    int routes[]={0,1,2,3,4,5,6,7,8,9};
+    empty.BeginStep(); empty.Observe(0,routes,10); plan=empty.EndStep();
+    Require(plan.size()==3 && plan[0].key==0 && plan[2].key==2,
+            "empty-slot fills exceeded the global budget or unstable tie ordering");
+    MoeFrequencyPolicy zero({0,0}, {}, 1, config);
+    zero.BeginStep(); zero.Observe(0,&early,1);
+    Require(zero.EndStep().empty(), "zero capacity admitted an expert");
+
+    config.minimumResidence=3;
+    MoeFrequencyPolicy residence({0,0}, {0}, 1,config);
+    residence.BeginStep(); residence.Observe(0,&early,1); plan=residence.EndStep();
+    Require(plan.size()==1,"empty slot incorrectly subject to residence protection");
+    int replacement=0;
+    for(int step=0;step<3;++step) {
+        residence.BeginStep();
+        for(int i=0;i<10;++i) residence.Observe(0,&replacement,1);
+        plan=residence.EndStep();
+        Require(plan.size()==(step==2 ? 1u : 0u),"minimum residence not enforced");
+    }
+
+    config = MoeCacheConfig();config.halfLife=4;config.updateInterval=2;config.maxReplacements=0;
+    MoeFrequencyPolicy decay({0,0},{0},1,config);
+    decay.BeginStep();decay.Observe(0,&early,1);
+    Require(decay.EndStep().empty() && decay.Score(early)==1,"decayed before the update interval");
+    for(int step=1;step<4;++step){decay.BeginStep();Require(decay.EndStep().empty(),"disabled policy admitted");}
+    Require(std::abs(decay.Score(early)-.5f)<1e-6f,"decay half-life did not account for update interval");
+    for (int bad=0;bad<7;++bad) {
+        auto invalid=MoeCacheConfig();
+        switch(bad){case 0:invalid.halfLife=NAN;break;case 1:invalid.updateInterval=0;break;
+        case 2:invalid.maxReplacements=-1;break;case 3:invalid.replacementFactor=.5;break;
+        case 4:invalid.prefillPrior=2;break;case 5:invalid.minHeat=-1;break;case 6:invalid.replacementMargin=INFINITY;break;}
+        rejected=false;
+        try{invalid.Validate();}catch(const std::invalid_argument &){rejected=true;}
+        Require(rejected,"invalid policy config accepted");
+    }
 }
 
 static void TestPrefillAdmission() {
     using fastllm::MoeFrequencyPolicy;
     MoeFrequencyPolicy policy(std::vector<int>(24, 0), std::vector<int>(12, 0), 2);
-    int empty[12]; std::fill(empty, empty + 12, -1); policy.SetResidents(empty);
-    std::vector<int> counts(12, 32);
-    counts[0] = 64;
-    policy.ObservePrefill(0, counts, 128);
-    Require(std::abs(policy.Score(0) - 32 / std::log(2.0f)) < 1e-4f,
-        "prefill frequency is not normalized to decode window");
-    for (int e = 0; e < 12; ++e) {
-        auto a = policy.SelectPrefill(e, 0, counts);
-        Require(a.key == e && a.slot == e, "prefill bulk fill stopped at decode budget");
-        policy.Admit(0, a);
-    }
-    const float firstLayerHeat = policy.Score(0);
-    policy.ObservePrefill(12, std::vector<int>(12, 128), 128);
-    Require(policy.Score(0) == firstLayerHeat, "other layer lost heat before its observation");
-    Require(policy.SelectPrefill(12, 0, counts).key < 0, "active borrowed cache slot evicted");
-    auto a = policy.SelectPrefill(12, 12, counts);
-    Require(a.key == 12 && a.slot != 0, "prefill did not choose cold inactive victim");
-    policy.Admit(1, a);
-    Require(policy.SelectPrefill(13, 12, counts).slot != a.slot,
-        "prefill reused a newly reserved active slot");
+    std::vector<int> counts(12,32);counts[0]=64;
+    policy.ObservePrefill(0,counts,128);
+    Require(std::abs(policy.Score(0)-32/std::log(2.0f))<1e-4f,"prefill scale changed");
+    for(int e=0;e<12;++e){auto a=policy.SelectPrefill(e,0,counts);
+        Require(a.key==e && a.slot==e,"prefill fill stopped at decode budget");policy.Admit(0,a);}
+    const float firstLayerHeat=policy.Score(0);
+    policy.ObservePrefill(12,std::vector<int>(12,128),128);
+    Require(policy.Score(0)==firstLayerHeat,"other layer lost heat before observation");
+    Require(policy.SelectPrefill(12,0,counts).key<0,"active borrowed cache slot evicted");
+    auto a=policy.SelectPrefill(12,12,counts);
+    Require(a.key==12 && a.slot!=0,"prefill did not select a cold inactive victim");
+    policy.Admit(1,a);
+    Require(policy.SelectPrefill(13,12,counts).slot!=a.slot,"prefill reused an active reservation");
     policy.BeginStep();
-    int e = 1; policy.Observe(0, &e, 1);
-    Require(policy.Score(1) > 0, "decode could not continue after prefill");
-    MoeFrequencyPolicy partition({0, 1}, {1}, 1);
-    int oneEmpty = -1; partition.SetResidents(&oneEmpty);
-    partition.ObservePrefill(0, {128, 128}, 128);
-    Require(partition.SelectPrefill(0, 0, {1, 1}).key < 0,
-        "prefill crossed cache record-size partition");
+    Require(policy.Score(0)==0 && policy.Score(12)==0 && policy.Slot(12)==a.slot,
+            "default decode prior did not clear heat while retaining payloads");
+    int e=1;policy.Observe(0,&e,1);policy.EndStep();
+    const float heat=policy.Score(1);
+    policy.BeginStep();Require(policy.Score(1)==heat,"decode reset heat on every step");policy.EndStep();
+
+    fastllm::MoeCacheConfig config;config.halfLife=32;config.prefillPrior=.5f;
+    MoeFrequencyPolicy prior({0,0},{0},1,config);
+    prior.ObservePrefill(0,{128,0},128);const float before=prior.Score(0);
+    prior.BeginStep();Require(std::abs(prior.Score(0)-before*.125f)<1e-4f,"prefill prior weight/scale ignored");
+    prior.EndStep();const float after=prior.Score(0);
+    prior.ObservePrefill(1,{128},128);
+    Require(std::abs(prior.Score(0)-after*4)<1e-4f,"next prefill did not restore heat scale once");
+    prior.ObservePrefill(1,{128},128);
+    Require(std::abs(prior.Score(0)-after*4)<1e-4f,"prefill rescaled unrelated layers repeatedly");
+    MoeFrequencyPolicy partition({0,1},{1},1);
+    partition.ObservePrefill(0,{128,128},128);
+    Require(partition.SelectPrefill(0,0,{1,1}).key<0,"prefill crossed a record-size partition");
+}
+
+static void TestFrequencyHotSetChange() {
+    using fastllm::MoeFrequencyPolicy;
+    for(int layers : {1,3,8,24,48,100}) {
+        MoeFrequencyPolicy policy(std::vector<int>(2*layers,0),std::vector<int>(layers,0),layers);
+        std::vector<int> owners(layers);
+        for(int layer=0;layer<layers;++layer) owners[layer]=2*layer;
+        policy.SetResidents(owners.data());
+        for(int layer=0;layer<layers;++layer) policy.ObservePrefill(2*layer,{16384,0},16384);
+        const int hot=1;
+        int lastHits=0;
+        for(int step=0;step<16;++step) {
+            policy.BeginStep();int hits=0;
+            for(int layer=0;layer<layers;++layer){hits+=policy.Slot(2*layer+hot)>=0;policy.Observe(2*layer,&hot,1);}
+            const auto plan=policy.EndStep();
+            Require(plan.size()<=96,"hot-set transition exceeded global budget");lastHits=hits;
+        }
+        Require(lastHits==layers,"long prefill prevented adaptation or late layers starved");
+        policy.BeginStep();const int cold=0;
+        for(int layer=0;layer<layers;++layer) policy.Observe(2*layer,&cold,1);
+        Require(policy.EndStep().empty(),"transient miss displaced established hot set");
+    }
 }
 
 static void TestDecodeOverlap() {
@@ -234,6 +274,7 @@ static void TestParallelOverlap() {
 int main() {
     TestFrequencyAdmission();
     TestPrefillAdmission();
+    TestFrequencyHotSetChange();
     TestDecodeOverlap();
     TestParallelOverlap();
     using fastllm::MoeDecodePolicy;

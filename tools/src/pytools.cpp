@@ -4,6 +4,7 @@
 
 #include "model.h"
 #include "devices/disk/diskdevice.h"
+#include "moe_cache_config.h"
 
 #include <cstring>
 #include <csignal>
@@ -99,6 +100,28 @@ extern "C" {
 
     DLL_EXPORT void set_moe_cuda_cache(uint64_t bytes) {
         fastllm::SetMoeCudaCacheBytes(bytes);
+    }
+
+    DLL_EXPORT bool set_moe_cache_policy(float halfLife, int updateInterval,
+            int maxReplacements, uint64_t maxBytes, float minHeat, float margin,
+            float factor, int minimumResidence, float prefillPrior, bool rankByBytes) {
+        fastllm::MoeCacheConfig config;
+        config.halfLife = halfLife;
+        config.updateInterval = updateInterval;
+        config.maxReplacements = maxReplacements;
+        config.maxBytes = maxBytes;
+        config.minHeat = minHeat;
+        config.replacementMargin = margin;
+        config.replacementFactor = factor;
+        config.minimumResidence = minimumResidence;
+        config.prefillPrior = prefillPrior;
+        config.rankByBytes = rankByBytes;
+        try {
+            fastllm::SetMoeCacheConfig(config);
+            return true;
+        } catch (const std::invalid_argument &) {
+            return false;
+        }
     }
 
     DLL_EXPORT void set_moe_cpu_cache(uint64_t bytes) {

@@ -8,7 +8,6 @@ import threading
 import asyncio
 import copy
 import json
-import math
 import importlib.util
 import importlib.metadata as importlib_metadata
 import logging
@@ -464,6 +463,12 @@ fastllm_lib.set_layered_moe_device_map.argtypes = [ctypes.c_int, ctypes.c_void_p
 fastllm_lib.set_moe_device_layers.argtypes = [ctypes.c_int]
 fastllm_lib.set_ngram_device.argtypes = [ctypes.c_char_p]
 fastllm_lib.set_moe_cuda_cache.argtypes = [ctypes.c_uint64]
+if hasattr(fastllm_lib, "set_moe_cache_policy"):
+    fastllm_lib.set_moe_cache_policy.argtypes = [
+        ctypes.c_float, ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+        ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_int,
+        ctypes.c_float, ctypes.c_bool]
+    fastllm_lib.set_moe_cache_policy.restype = ctypes.c_bool
 if hasattr(fastllm_lib, "fastllm_moe_cuda_cache_stats"):
     fastllm_lib.fastllm_moe_cuda_cache_stats.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_uint64), ctypes.c_bool]
     fastllm_lib.fastllm_moe_cuda_cache_stats.restype = ctypes.c_bool
@@ -638,6 +643,37 @@ def set_moe_cuda_cache(bytes_: int):
     if bytes_ < 0 or bytes_ > (1 << 64) - 1:
         raise ValueError("MoE CUDA cache size must fit in uint64")
     fastllm_lib.set_moe_cuda_cache(ctypes.c_uint64(bytes_));
+
+def set_moe_cache_policy(*, half_life=128., update_interval=1, max_replacements=96,
+                         max_bytes=0, min_heat=1., margin=1., factor=1.,
+                         min_residence=0, prefill_prior=0., rank_by_bytes=False):
+    """Configure GGUF single-token hybrid decode admission before model loading.
+
+    Counts and byte limits apply per update, across all layers. max_bytes=0
+    imposes no byte cap; max_replacements=0 disables decode admission.
+    half_life=0 disables decay. prefill_prior weights rescaled prompt heat and
+    does not discard resident payloads. Existing cache policies keep their config.
+    """
+    for name, value, minimum in (("update_interval", update_interval, 1),
+                                  ("max_replacements", max_replacements, 0),
+                                  ("min_residence", min_residence, 0)):
+        if not isinstance(value, int) or not minimum <= value <= (1 << 31) - 1:
+            raise ValueError(f"{name} must be an integer in [{minimum}, 2147483647]")
+    if not isinstance(max_bytes, int) or not 0 <= max_bytes <= (1 << 64) - 1:
+        raise ValueError("max_bytes must fit in uint64")
+    for name, value, minimum in (("half_life", half_life, 0), ("min_heat", min_heat, 0),
+                                  ("margin", margin, 0), ("factor", factor, 1),
+                                  ("prefill_prior", prefill_prior, 0)):
+        if not math.isfinite(value) or value < minimum:
+            raise ValueError(f"{name} must be finite and >= {minimum}")
+    if prefill_prior > 1:
+        raise ValueError("prefill_prior must be in [0, 1]")
+    native = getattr(fastllm_lib, "set_moe_cache_policy", None)
+    if native is None:
+        raise RuntimeError("MoE cache policy configuration requires an updated native library")
+    if not native(half_life, update_interval, max_replacements, max_bytes,
+                  min_heat, margin, factor, min_residence, prefill_prior, rank_by_bytes):
+        raise ValueError("Invalid MoE cache policy configuration")
 
 def get_moe_cuda_cache_stats(device: int = 0, reset: bool = False):
     """Synchronize a CUDA device and read expert-cache query counters outside inference timing.

@@ -147,6 +147,66 @@ including CPU routes; they exclude prefill, multi-GPU expert parallelism and
 pure-GPU mode. Reading them synchronizes the device. A temporary GPU expert
 counts as GPU execution, but not as a resident cache hit.
 
+### Global frequency admission for single-token GGUF decode
+
+The ordinary Qwen4/GLM GGUF single-token hybrid path observes all layers before
+selecting admissions at the end of a token. Candidates compete for a global
+budget by their heat gain over an eligible resident in the same physical slot
+partition. There is no rotating layer eligibility or one-admission-per-layer
+limit. Copies run on an admission stream after current cache readers finish;
+subsequent cache users wait for the payload and residency publication together.
+Prefill retains its bulk admission path. MTP verification, thread-TP expert
+parallelism and non-GGUF adapters keep their existing admission policies.
+
+Configure before loading a model. These options have both underscore and hyphen
+spellings, and are applied to newly created cache policies:
+
+| CLI option | Default | Meaning |
+| --- | ---: | --- |
+| `--moe_cache_half_life` | `128` | Heat half-life in decode steps; `0` disables decay |
+| `--moe_cache_update_interval` | `1` | Update every N decode steps; decay accounts for N steps |
+| `--moe_cache_max_replacements` | `96` | Maximum admissions per update across all layers, including empty-slot fills; `0` disables decode admission |
+| `--moe_cache_max_bytes` | `0` | Additional byte limit per update, such as `30m`; `0` means unlimited bytes within the expert-count limit |
+| `--moe_cache_min_heat` | `1` | Minimum candidate heat |
+| `--moe_cache_margin` | `1` | Require candidate heat > resident heat × factor + margin |
+| `--moe_cache_factor` | `1` | Resident heat multiplier, at least 1 |
+| `--moe_cache_min_residence` | `0` | Minimum decode steps before an admitted expert may be evicted |
+| `--moe_cache_prefill_prior` | `0` | Fraction of rescaled prefill heat retained at decode start, in [0,1]; resident weights remain cached |
+| `--moe_cache_rank_by_bytes` | off | Rank by heat gain divided by the candidate's actual record bytes |
+
+The byte limit applies to each update, not each token when the update interval
+exceeds one. It charges the compact record copied, including when a tiny cache
+uses oversized shared slots. Empty slots do not require a positive replacement
+gain, but still consume the count and byte budgets. A slot is replaced at most
+once per update. Limits do not apply to prefill fills or temporary GPU execution
+of uncached experts, which are separate from admission.
+
+For a hard 30 MiB update limit:
+
+```sh
+ftllm server /path/to/model.gguf --device cuda --moe_device numa \
+  --moe_cuda_cache 10g --moe_cache_max_bytes 30m --moe_cache_rank_by_bytes
+```
+
+The Python API exposes the same settings without environment variables:
+
+```python
+from ftllm import llm
+llm.set_moe_cuda_cache(10 << 30)
+llm.set_moe_cache_policy(
+    half_life=128, update_interval=1, max_replacements=96,
+    max_bytes=0, min_heat=1, margin=1, factor=1,
+    min_residence=0, prefill_prior=0, rank_by_bytes=False,
+)
+# Load the model after configuration.
+```
+
+C++ callers can include `moe_cache_config.h` and use
+`SetMoeCacheConfig(MoeCacheConfig{...})`. Existing caches retain their configuration.
+The effective policy is logged when a cache is initialized. Higher admission
+budgets can improve hit rate while increasing PCIe traffic; benchmark decode
+throughput as well as resident-route hit rate when tuning these settings.
+
 ## GPU-resident GGUF experts
 
 SwiGLU decode and small batches use these fused kernels when every routed
@@ -201,7 +261,8 @@ pointer tables share one allocation before capture: two weight tables for
 packed block128, plus two scale tables for native E4M3. The existing indexed
 gate/up/down kernels read them. Cache lookup and refill produce slot IDs on the GPU, so
 changing routes do not require a per-token host pointer upload. All dependent
-work runs on `cudaStreamPerThread`.
+computation runs on `cudaStreamPerThread`; asynchronous admission streams publish
+an event dependency before subsequent cache reads.
 
 Model integration is available in DeepSeek V4.1 (described below) and the
 Qwen4-Exp backbone used by Qwen3.8-Flash-Next. Qwen4-Exp snapshots host experts

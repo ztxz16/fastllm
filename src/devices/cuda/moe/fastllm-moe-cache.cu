@@ -297,6 +297,11 @@ struct DeviceCache {
     std::vector<fastllm::cuda::CacheSlotSpan> layerSlots;
     std::vector<uint64_t> hostSlotOffsets;
     std::unique_ptr<fastllm::MoeFrequencyPolicy> frequency;
+    OffloadGroup *frequencyGroup = nullptr;
+    fastllm::Data frequencyChanges;
+    int32_t *frequencyHostChanges = nullptr;
+    size_t frequencyChangeCapacity = 0;
+    cudaEvent_t frequencyReadersDone = nullptr;
     cudaStream_t admissionStream = nullptr;
     cudaEvent_t admissionDone = nullptr;
     bool frequencyActive = false;
@@ -891,6 +896,8 @@ void ReleaseDeviceCache(DeviceCache &cache) {
     cudaFree(cache.numaPointers);
     cudaFree(cache.ggufWorkspace);
     if (cache.admissionDone) cudaEventDestroy(cache.admissionDone);
+    if (cache.frequencyReadersDone) cudaEventDestroy(cache.frequencyReadersDone);
+    cudaFreeHost(cache.frequencyHostChanges);
     if (cache.admissionStream) cudaStreamDestroy(cache.admissionStream);
     cache = DeviceCache();
 }
@@ -2254,13 +2261,7 @@ __device__ void PublishAdmission(int32_t *keys, int32_t *slotKeys,
     if (mappedKeys) mappedKeys[key] = slot;
 }
 
-__global__ void PublishFrequencyAdmission(int32_t *keys, int32_t *slotKeys,
-        int32_t *mappedKeys, unsigned long long *lastUsed, unsigned long long *step,
-        int key, int slot) {
-    PublishAdmission(keys, slotKeys, mappedKeys, lastUsed, key, slot, ++*step);
-}
-
-__global__ void PublishPrefillAdmissions(int32_t *keys, int32_t *slotKeys,
+__global__ void PublishCacheAdmissions(int32_t *keys, int32_t *slotKeys,
         int32_t *mappedKeys, unsigned long long *lastUsed, unsigned long long *step,
         const int32_t *changes, int count) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2328,15 +2329,26 @@ double HybridNowUs() {
 static void PrepareFrequencyPolicy(OffloadGroup *group, DeviceCache *cache) {
     if (!cache->frequency) {
         std::vector<int> keys(group->totalRecords), slots(cache->slots);
+        std::vector<uint64_t> recordBytes(group->totalRecords);
         std::unordered_map<int, int> partitions;
         for (int layer = 0; layer < int(group->tableKeys.size()); ++layer) {
             const auto span = cache->layerSlots[layer];
+            const auto bytes = group->LayerLayout(layer).recordStride;
             const int id = partitions.emplace(span.begin, partitions.size()).first->second;
+            std::fill_n(recordBytes.begin() + layer * group->layout.experts, group->layout.experts, bytes);
             std::fill_n(keys.begin() + layer * group->layout.experts, group->layout.experts, id);
             std::fill_n(slots.begin() + span.begin, span.count, id);
         }
+        const auto config = fastllm::GetMoeCacheConfig();
         cache->frequency = std::make_unique<fastllm::MoeFrequencyPolicy>(
-            std::move(keys), std::move(slots), group->tableKeys.size());
+            std::move(keys), std::move(slots), group->tableKeys.size(), config, std::move(recordBytes));
+        cache->frequencyGroup = group;
+        std::fprintf(stderr, "[Fastllm] MoE global frequency cuda:%d: half-life %.3g, interval %d, "
+            "max replacements %d, max bytes %llu, min heat %.3g, margin %.3g, factor %.3g, "
+            "residence %d, prefill prior %.3g, rank by bytes %d.\n",
+            cache->device, config.halfLife, config.updateInterval, config.maxReplacements,
+            (unsigned long long)config.maxBytes, config.minHeat, config.replacementMargin,
+            config.replacementFactor, config.minimumResidence, config.prefillPrior, int(config.rankByBytes));
     }
     if (cache->frequencyResidencyDirty) {
         std::vector<int> owners(cache->slots);
@@ -2420,7 +2432,7 @@ void FastllmCudaPublishMoeGGUFPrefill(const FastllmCudaMoeGGUFPrefillPlan &plan)
         count * sizeof(int), cudaMemcpyHostToDevice, cudaStreamPerThread));
     checkCudaErrors("MoE prefill admission slots", cudaMemcpyAsync(changes + count, plan.slots.data(),
         count * sizeof(int), cudaMemcpyHostToDevice, cudaStreamPerThread));
-    PublishPrefillAdmissions<<<(count + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+    PublishCacheAdmissions<<<(count + 255) / 256, 256, 0, cudaStreamPerThread>>>(
         cache.keyToSlot, cache.slotKeys, cache.mappedKeyToSlot, cache.lastUsed, cache.step, changes, count);
     checkCudaErrors("MoE prefill admission", cudaGetLastError());
     if (cache.admissionDone) checkCudaErrors("MoE prefill admission fence",
@@ -3025,6 +3037,63 @@ void FastllmCudaEndMoeDecode(void *state) {
     auto &cache = *static_cast<DeviceCache *>(state);
     if (cache.frequency) {
         cache.frequencyActive = false;
+        const auto admissions = cache.frequency->EndStep();
+        if (admissions.empty()) return;
+        auto &group = *cache.frequencyGroup;
+        int previousDevice = -1;
+        checkCudaErrors("MoE admission device", cudaGetDevice(&previousDevice));
+        checkCudaErrors("MoE admission device", cudaSetDevice(cache.device));
+        // Reuse stable pinned metadata only after its preceding async copy has
+        // completed. Usually the current token's routing already waited for it.
+        checkCudaErrors("MoE previous admission", cudaEventSynchronize(cache.admissionDone));
+        if (!cache.admissionStream)
+            checkCudaErrors("MoE admission stream", cudaStreamCreateWithFlags(
+                &cache.admissionStream, cudaStreamNonBlocking));
+        if (!cache.frequencyReadersDone)
+            checkCudaErrors("MoE admission readers", cudaEventCreateWithFlags(
+                &cache.frequencyReadersDone, cudaEventDisableTiming));
+        const int count = admissions.size();
+        if (cache.frequencyChangeCapacity < size_t(count)) {
+            cudaFreeHost(cache.frequencyHostChanges);
+            cache.frequencyHostChanges = nullptr;
+            checkCudaErrors("MoE admission metadata", cudaHostAlloc(&cache.frequencyHostChanges,
+                2 * count * sizeof(int32_t), cudaHostAllocDefault));
+            cache.frequencyChangeCapacity = count;
+            cache.frequencyChanges.dataType = fastllm::INT32;
+            cache.frequencyChanges.Resize({2, count});
+            cache.frequencyChanges.ToDevice(fastllm::CUDA, {cache.device}, false);
+            cache.frequencyChanges.Allocate(false);
+        }
+        const auto stream = cache.admissionStream;
+        checkCudaErrors("MoE admission readers", cudaEventRecord(cache.frequencyReadersDone, cudaStreamPerThread));
+        checkCudaErrors("MoE admission readers", cudaStreamWaitEvent(stream, cache.frequencyReadersDone, 0));
+        for (int i = 0; i < count; ++i) {
+            const auto a = admissions[i];
+            const int table = a.key / group.layout.experts, expert = a.key % group.layout.experts;
+            const auto &layout = group.LayerLayout(table);
+            auto *destination = cache.records + cache.hostSlotOffsets[a.slot];
+            if (group.ggufSources.empty()) {
+                checkCudaErrors("MoE global admission", cudaMemcpyAsync(destination,
+                    group.hostRecords + group.layerHostOffsets[table] + size_t(expert) * layout.recordStride,
+                    layout.recordStride, cudaMemcpyHostToDevice, stream));
+            } else {
+                const auto &source = group.ggufSources[table];
+                checkCudaErrors("MoE global admission", fastllm_gguf_restore::CopyRecords(source,
+                    cache.numaPointers + size_t(table) * layout.experts * 2 * source.shards,
+                    destination, stream, nullptr, nullptr, nullptr, nullptr, expert));
+            }
+            cache.frequencyHostChanges[i] = a.key;
+            cache.frequencyHostChanges[count + i] = a.slot;
+        }
+        auto *changes = static_cast<int32_t *>(cache.frequencyChanges.cudaData);
+        checkCudaErrors("MoE admission metadata", cudaMemcpyAsync(changes, cache.frequencyHostChanges,
+            2 * count * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        PublishCacheAdmissions<<<(count + 255) / 256, 256, 0, stream>>>(
+            cache.keyToSlot, cache.slotKeys, cache.mappedKeyToSlot, cache.lastUsed, cache.step, changes, count);
+        checkCudaErrors("MoE global admission publish", cudaGetLastError());
+        // GetDeviceCache also installs this dependency in captured cache users.
+        checkCudaErrors("MoE global admission fence", cudaEventRecord(cache.admissionDone, stream));
+        checkCudaErrors("MoE admission restore device", cudaSetDevice(previousDevice));
         return;
     }
     auto &decode = *cache.decode;
@@ -3662,32 +3731,6 @@ bool FastllmCudaMergeMOEHybrid(const fastllm::Data &input,
             checkCudaErrors("Hybrid MoE prefetch", cudaEventRecord(work.prefetchDone, cudaStreamPerThread));
             work.previousPrefetch = true;
             ++work.prefetchedExperts;
-        }
-        if (frequency) {
-            auto &policy = *frequency;
-            while (true) {
-                const auto admission = policy.Select(tableId, tableId * layout.experts, hostIndices, topk);
-                if (admission.key < 0) break;
-                // Admission only changes future residency. This call uses its
-                // original CPU subset or independent staged expert records.
-                auto *destination = cache->records + cache->hostSlotOffsets[admission.slot];
-                const int expert = admission.key % layout.experts;
-                if (group->ggufSources.empty()) {
-                    checkCudaErrors("MoE frequency admission", cudaMemcpyAsync(destination,
-                        group->hostRecords + group->layerHostOffsets[tableId] + size_t(expert) * layout.recordStride,
-                        layout.recordStride, cudaMemcpyHostToDevice, cudaStreamPerThread));
-                } else {
-                    const auto &source = group->ggufSources[tableId];
-                    checkCudaErrors("MoE frequency admission", fastllm_gguf_restore::CopyRecords(source,
-                        cache->numaPointers + size_t(tableId) * layout.experts * 2 * source.shards,
-                        destination, cudaStreamPerThread, nullptr, nullptr, nullptr, nullptr, expert));
-                }
-                PublishFrequencyAdmission<<<1, 1, 0, cudaStreamPerThread>>>(
-                    cache->keyToSlot, cache->slotKeys, cache->mappedKeyToSlot,
-                    cache->lastUsed, cache->step, admission.key, admission.slot);
-                checkCudaErrors("MoE frequency admission", cudaGetLastError());
-                policy.Admit(tableId, admission);
-            }
         }
         if (staged) {
             const double begin = HybridNowUs();

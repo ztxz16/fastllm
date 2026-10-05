@@ -1219,7 +1219,8 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
                         Require(state != nullptr, "frequency decode policy unavailable");
                         accepted[rank] = FastllmCudaMergeMOEHybrid(input[rank],ids,scores,output[rank],
                             table.data(),table.size(),layer,parallel);
-                        Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+                        // End must fence current cache readers itself before
+                        // overwriting slots on its asynchronous admission stream.
                         FastllmCudaEndMoeDecode(state);
                         Require(accepted[rank], "frequency hybrid rejected");
                         Require(fastllm_moe_cuda_cache_stats(rank, after, false), "cache statistics unavailable");

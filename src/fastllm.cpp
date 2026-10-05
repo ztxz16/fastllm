@@ -10,6 +10,7 @@
 #include "devices/cuda/fastllm-cuda-native-prefill.h"
 #endif
 #include "contextconfig.h"
+#include "moe_cache_config.h"
 #include "devices/disk/diskdevice.h"
 
 #include "executor.h"
@@ -449,6 +450,22 @@ namespace fastllm {
 
     uint64_t GetMoeCudaCacheBytes() {
         return moeCudaCacheBytes;
+    }
+
+    namespace {
+        std::mutex moeCacheConfigMutex;
+        MoeCacheConfig moeCacheConfig;
+    }
+
+    void SetMoeCacheConfig(const MoeCacheConfig &config) {
+        config.Validate();
+        std::lock_guard<std::mutex> lock(moeCacheConfigMutex);
+        moeCacheConfig = config;
+    }
+
+    MoeCacheConfig GetMoeCacheConfig() {
+        std::lock_guard<std::mutex> lock(moeCacheConfigMutex);
+        return moeCacheConfig;
     }
 
     void SetMoeCpuCacheBytes(uint64_t bytes) {
