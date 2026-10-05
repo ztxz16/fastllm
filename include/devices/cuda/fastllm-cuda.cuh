@@ -691,6 +691,10 @@ bool FastllmCudaQwen4HyperCombineRMSNorm(
 // Merges rank-major TopK(..., 1) pairs using Qwen4's existing tie order.
 bool FastllmCudaQwen4MergeTpGreedy(const float *candidates, int *output,
                                  float *floatOutput, int vocabulary, int ranks);
+// Single-row FP32 MTP confidence; maxLogit comes from the existing greedy
+// selection. Output is one device float, without materializing a softmax row.
+bool FastllmCudaQwen4TopProbability(const float *logits, float *output,
+                                   int vocabulary, float maxLogit);
 bool FastllmCudaQwen4QSASelect(const fastllm::Data &query,
                                const fastllm::Data &compressedKeys,
                                fastllm::Data &indices, int keyLength,

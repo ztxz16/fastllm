@@ -1555,6 +1555,12 @@ if (UNIT_TEST)
         fastllm_add_checked_test(cuda_q6_mmvq cuda_q6_mmvq_test "PASS Q6 multi-row" 600)
         set_tests_properties(cuda_q6_mmvq PROPERTIES LABELS cuda RUN_SERIAL TRUE)
 
+        add_executable(cuda_qwen4_confidence_test test/basic/test_cuda_qwen4_confidence.cu)
+        target_link_libraries(cuda_qwen4_confidence_test PRIVATE fastllm)
+        set_target_properties(cuda_qwen4_confidence_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        fastllm_add_checked_test(cuda_qwen4_confidence cuda_qwen4_confidence_test "PASS MTP confidence" 600)
+        set_tests_properties(cuda_qwen4_confidence PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+
         add_executable(cuda_gguf_t8_extended_test test/basic/test_cuda_gguf_t8_extended.cu)
         target_link_libraries(cuda_gguf_t8_extended_test PRIVATE fastllm)
         set_target_properties(cuda_gguf_t8_extended_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)

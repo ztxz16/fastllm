@@ -17,6 +17,35 @@
 #include <vector>
 
 namespace {
+    __global__ void Qwen4TopProbabilityKernel(
+            const float *logits, float *output, int vocabulary, float maximum) {
+        __shared__ float partial[32];
+        float sum = 0.0f;
+        float correction = 0.0f;
+        // A large vocabulary can put hundreds of tiny terms after the
+        // maximum's exp(0). Compensate the per-thread sum so its rounding
+        // does not decide whether a draft passes the confidence threshold.
+        for (int i = threadIdx.x; i < vocabulary; i += blockDim.x) {
+            const float value = expf(logits[i] - maximum) - correction;
+            const float next = sum + value;
+            correction = (next - sum) - value;
+            sum = next;
+        }
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_down_sync(0xffffffff, sum, offset);
+        if ((threadIdx.x & 31) == 0) partial[threadIdx.x >> 5] = sum;
+        __syncthreads();
+        if (threadIdx.x < 32) {
+            sum = partial[threadIdx.x];
+            for (int offset = 16; offset > 0; offset >>= 1)
+                sum += __shfl_down_sync(0xffffffff, sum, offset);
+            if (threadIdx.x == 0) {
+                const float probability = 1.0f / sum;
+                *output = isfinite(maximum) && isfinite(probability) ? probability : 0.0f;
+            }
+        }
+    }
+
     struct Qwen4CacheAddress {
         const int32_t *keyPages = nullptr;
         const int32_t *valuePages = nullptr;
@@ -2723,6 +2752,15 @@ namespace {
         return true;
     }
 
+}
+
+bool FastllmCudaQwen4TopProbability(const float *logits, float *output,
+                                   int vocabulary, float maxLogit) {
+    if (logits == nullptr || output == nullptr || vocabulary <= 0) return false;
+    Qwen4TopProbabilityKernel<<<1, 1024, 0, cudaStreamPerThread>>>(
+        logits, output, vocabulary, maxLogit);
+    DeviceSync();
+    return cudaGetLastError() == cudaSuccess;
 }
 
 bool FastllmCudaQwen4MergeTpGreedy(const float *candidates, int *output,

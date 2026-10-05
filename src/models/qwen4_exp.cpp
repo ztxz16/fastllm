@@ -997,7 +997,24 @@ namespace fastllm {
             return probability;
         }
 
-        float Qwen4TopProbability(Data &logits) {
+        float Qwen4TopProbability(Data &logits, float maxLogit) {
+#ifdef USE_CUDA
+            if (logits.dataDevice == DataDevice::CUDA && logits.dataType == FLOAT32 &&
+                logits.cudaData != nullptr && !logits.multiDeviceData &&
+                !logits.dims.empty() && logits.dims.back() > 0 &&
+                logits.Count(0) == logits.dims.back()) {
+                Qwen4CudaDeviceGuard deviceGuard(logits.dataDeviceIds);
+                Data probability(FLOAT32, {1});
+                probability.ToDevice(DataDevice::CUDA, logits.dataDeviceIds);
+                probability.Allocate();
+                if (FastllmCudaQwen4TopProbability(
+                        (const float *)logits.cudaData, (float *)probability.cudaData,
+                        logits.dims.back(), maxLogit)) {
+                    probability.ToDevice(DataDevice::CPU);
+                    return *(const float *)probability.cpuData;
+                }
+            }
+#endif
             Data probabilities, top;
             Softmax(logits, probabilities, -1);
             TopK(probabilities, top, 1);
@@ -1958,7 +1975,7 @@ namespace fastllm {
                 local[row] = {(int)(values[row * 2] + 1e-3f) + range.first, values[row * 2 + 1]};
             if (topProbability != nullptr) {
                 AssertInFastLLM(rows == 1, "MTP confidence requires one draft row.");
-                topProbabilities[rank] = {values[1], Qwen4TopProbability(logits)};
+                topProbabilities[rank] = {values[1], Qwen4TopProbability(logits, values[1])};
             }
             Barrier();
             if (topProbability != nullptr)
@@ -8501,9 +8518,10 @@ namespace fastllm {
                 nullptr, topProbability)) {
             return tpToken;
         }
-        if (topProbability != nullptr) *topProbability = Qwen4TopProbability(logits);
         TopK(logits, top, 1);
         top.ToDevice(DataDevice::CPU);
+        if (topProbability != nullptr)
+            *topProbability = Qwen4TopProbability(logits, reinterpret_cast<float *>(top.cpuData)[1]);
         return (int)(reinterpret_cast<float *>(top.cpuData)[0] + 1e-3f);
     }
 
