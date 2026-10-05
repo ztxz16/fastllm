@@ -2,6 +2,22 @@
 
 [中文](version.md)
 
+## Unreleased
+
+- Added DeepSeek-V4.1-Flash support with text and image inputs, Engram, DSpark speculative decoding, tensor parallelism, and CPU/CUDA hybrid inference. Improved numerical accuracy, prefix caching, and tool calling.
+- Improved Qwen4-Exp / Qwen3.8-Flash-Next tensor-parallel decoding, MTP verification, and rollback, with optimized long-context QSA selection, PLE transfers, vocabulary sharding, and CUDA Graph reuse.
+- Optimized Qwen3.5/3.8 MTP with tensor-parallel draft layers, NVFP4 draft quantization, and vocabulary shortlists. Improved batched drafting and verification, and fixed sampling distributions, causal boundaries, and cache rollback.
+- Optimized DFlash2 draft attention, candidate scoring, and cache writes. Improved single- and multi-GPU graphs, workspace reuse, and memory budgeting, and fixed verification graphs and repeated prefill at capacity boundaries.
+- Optimized FP8/NVFP4 prefill and small-batch decoding across GPU architectures. Expanded GDN, Attention, RMSNorm, and projection fusion, and added native low-bit prefill paths with eligibility checks and fallbacks.
+- Optimized CPU/NUMA low-bit compute, grouped expert scheduling, and compute/transfer overlap. Improved GGUF IQ2/IQ3 decoding and small-batch compute, and fixed Qwen3.5 GGUF single-step decode crashes and x86 instruction-set compatibility issues.
+- Added multilevel caching for disk-backed experts. Expanded tensor-parallel expert caching and batched verification for Qwen4 and DeepSeek-V4.1, added per-layer expert placement, reduced peak loading memory, and improved temporary workspace reuse and reclamation.
+- Improved multimodal inference for the Qwen3.5 architecture with vision-encoder offloading and uneven tensor parallelism. Fixed multi-image feature merging, tool-result images, and tool-call history; isolated text prefix caching for image requests and improved prefill memory usage.
+- Improved reasoning-parameter compatibility, streaming tool-call parsing, and finish states in the OpenAI and Anthropic APIs. Fixed Responses history splitting, finish reasons for unlimited generation, and streaming disconnect cleanup, and improved context-limit errors.
+- Added general JSON structured output through Chat Completions `response_format` and Responses `text.format`, with prompt guidance and completion-time validation for JSON objects and JSON Schema, plus explicit format errors.
+- Integrated OpenCode, Codex, and Claude Code into Launcher with independent installation, session management, and tool approvals. Improved DeepSeek Harness and Pi runtime integration, output budgets, and completion detection.
+- Reworked Launcher into a plugin-based interface with natural-language customization, theme switching, and dark mode. Improved Markdown and isolated HTML previews, Agent runtime packaging, portable-package double-click entry points, and the offline parameter manual.
+- Added NCCL startup communication checks and timeout handling. Fixed multi-GPU reduction synchronization, cross-GPU deadlocks, Marlin out-of-bounds accesses, CUDA Graph buffer lifetimes and shard-address reuse, and small-batch RMSNorm reduction rounding differences.
+
 ## V0.1.8.2
 
 - Added a web deployment launcher and an Electron desktop launcher with model downloads, launch profile management, automatic configuration for long contexts and high concurrency, and inference speed and available context displays.
