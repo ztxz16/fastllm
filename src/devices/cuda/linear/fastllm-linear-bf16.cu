@@ -4,6 +4,7 @@
 
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
+#include "fastllm-bf16-lt.cuh"
 
 #ifdef __CUDACC__
 #include <cuda_bf16.h>
@@ -874,39 +875,35 @@ bool FastllmCudaBFloat16MatMulBFloat16(const fastllm::Data &input, fastllm::Data
     __nv_bfloat16 *cudaBiasData = bias.dims.size() == 0 ? nullptr : (__nv_bfloat16 *)weight.extraCudaData[1];
     __nv_bfloat16 *weightPtr = (__nv_bfloat16 *)weight.cudaData;
 
-    bool exactRows = n > 1 &&
-        n < fastllm::FastllmCudaGetLinearExactBatchThreshold();
-    if (n < 8 || exactRows) {
+    if (n < 8) {
         LaunchFastllmGemmBf16Bf16(cudaInput, weightPtr, cudaOutput, cudaBiasData, n, m, k);
-    } else if (n == 8 && (k <= 1024 || (m > 0 && m <= 256 && m % 8 == 0))) {
+    } else if (n == 8 && m > 0 && m <= 256 && m % 8 == 0) {
         LaunchFastllmGemmBf16Bf16(cudaInput, weightPtr, cudaOutput, nullptr, n, m, k);
         // Match the GEMM branch: round the dot product before adding bias.
         if (bias.dims.size() > 0) {
             FastllmCudaBiasKernel <<<n, 256>>>(cudaOutput, cudaBiasData, k);
         }
     } else {
+        // Warm the fallback handle before a later graph capture can miss the
+        // Lt cache. Handle/workspace creation during capture is not safe.
         auto fastllmCublasHandle = getFastllmCublasHandle();
-        cublasStatus_t status;
-        float h_alpha = 1.0f, h_beta = 0.0f;
-        cudaDataType_t AType = CUDA_R_16BF, BType = CUDA_R_16BF, CType = CUDA_R_16BF, ComputeType = CUDA_R_32F;
-
-        status = cublasGemmEx(fastllmCublasHandle,
-                              CUBLAS_OP_T, CUBLAS_OP_N,
-                              k, n, m,
-                              &h_alpha, weightPtr, AType,
-                              m, cudaInput, BType,
-                              m, &h_beta,
-                              cudaOutput, CType,
-                              k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
-
-        if (status != CUBLAS_STATUS_SUCCESS) {
-            printf("Error: cublas error (BFloat16MatMulBFloat16).\n");
-            throw("cublas error");
-            exit(0);
+        // Small batches use a cached Lt algorithm; unsupported shapes retain
+        // GemmEx. Both paths accumulate in FP32 and round to BF16 before bias.
+        if (!fastllm_bf16_lt::Matmul(cudaInput, weightPtr, cudaOutput, n, m, k)) {
+            float alpha = 1.0f, beta = 0.0f;
+            cublasStatus_t status = cublasGemmEx(fastllmCublasHandle,
+                CUBLAS_OP_T, CUBLAS_OP_N, k, n, m,
+                &alpha, weightPtr, CUDA_R_16BF, m,
+                cudaInput, CUDA_R_16BF, m, &beta,
+                cudaOutput, CUDA_R_16BF, k, CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+            if (status != CUBLAS_STATUS_SUCCESS) {
+                printf("Error: cublas error (BFloat16MatMulBFloat16).\n");
+                throw("cublas error");
+            }
         }
 
         if (bias.dims.size() > 0) {
-            FastllmCudaBiasKernel <<<n, 256>>>(cudaOutput, (__nv_bfloat16 *)weight.extraCudaData[1], k);
+            FastllmCudaBiasKernel <<<n, 256>>>(cudaOutput, cudaBiasData, k);
         }
     }
 

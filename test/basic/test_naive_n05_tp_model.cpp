@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cuda_runtime_api.h>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
 #include <atomic>
@@ -38,6 +39,59 @@ extern "C" bool FastllmCudaGraphInstantiate(void *graph, void **exec) {
 }
 #endif
 using namespace fastllm;
+// Cross-algorithm BF16 logits can differ because GEMM and single-row GEMV
+// use different FP32 reduction orders. Keep the existing model-smoke relative
+// error/cosine limits, and bound isolated outliers too. Metadata and same-path
+// rollback/replay comparisons below remain exact.
+struct LogitError {
+    double relative = 0, cosine = 1, maximum = 0, scale = 0;
+    bool acceptable = true;
+};
+static LogitError CompareLogits(const float *actual, const float *expected, size_t count) {
+    LogitError result;
+    double error = 0, aa = 0, bb = 0, ab = 0;
+    for (size_t i = 0; i < count; ++i) {
+        double a = actual[i], b = expected[i];
+        if (!std::isfinite(a) || !std::isfinite(b)) {
+            result.acceptable = false;
+            return result;
+        }
+        error += (a - b) * (a - b);
+        aa += a * a; bb += b * b; ab += a * b;
+        result.maximum = std::max(result.maximum, std::abs(a - b));
+        result.scale = std::max(result.scale, std::abs(b));
+    }
+    result.relative = std::sqrt(error / std::max(bb, 1e-30));
+    result.cosine = aa > 0 && bb > 0 ? ab / std::sqrt(aa * bb) : (aa == bb ? 1 : 0);
+    result.acceptable = count > 0 && result.relative <= .02 && result.cosine >= .999 &&
+                        result.maximum <= 1e-6 + .02 * result.scale;
+    return result;
+}
+static double largestLogitRelative = 0, largestLogitAbsolute = 0;
+static void RequireCloseLogits(const float *actual, const std::vector<float> &expected,
+                               const std::string &context) {
+    auto error = CompareLogits(actual, expected.data(), expected.size());
+    largestLogitRelative = std::max(largestLogitRelative, error.relative);
+    largestLogitAbsolute = std::max(largestLogitAbsolute, error.maximum);
+    if (!error.acceptable) {
+        std::cerr << context << " relative_rmse=" << error.relative
+                  << " cosine=" << error.cosine << " max_abs=" << error.maximum
+                  << " reference_max=" << error.scale << std::endl;
+        throw std::runtime_error(context);
+    }
+}
+static void CheckLogitComparison() {
+    const float reference[] = {1, -2, 3, -4};
+    float actual[] = {1.001f, -2.002f, 3.003f, -4.004f};
+    if (!CompareLogits(actual, reference, 4).acceptable)
+        throw std::runtime_error("small BF16 error rejected");
+    actual[0] = 2;
+    if (CompareLogits(actual, reference, 4).acceptable)
+        throw std::runtime_error("large logit error accepted");
+    actual[0] = std::numeric_limits<float>::quiet_NaN();
+    if (CompareLogits(actual, reference, 4).acceptable)
+        throw std::runtime_error("non-finite logit accepted");
+}
 class Fixture : public NaiveN05FlashModel {
   public:
     int ranks;
@@ -228,7 +282,6 @@ class Fixture : public NaiveN05FlashModel {
             cfg.input_token_length = prompt;
             cfg.output_token_limit = 96;
             cfg.output_logits = true;
-            std::vector<std::vector<uint16_t>> features(2);
             auto forward = [&](auto &kv, int start, int count, bool verifying) {
                 std::vector<float> ids(count), pos(count);
                 for (int row = 0; row < count; ++row) {
@@ -240,14 +293,12 @@ class Fixture : public NaiveN05FlashModel {
                 capture.verifying = verifying;
                 Data out = RunDraftTarget(input, positions, kv, cfg, capture);
                 out.ToDevice(DataDevice::CPU);
-                if (capture.hidden.size() != 2)
-                    throw std::runtime_error("missing graph features");
-                for (int layer = 0; layer < 2; ++layer) {
-                    Data h(capture.hidden.at(layer));
-                    h.ToDevice(DataDevice::CPU);
-                    features[layer].assign((uint16_t *)h.cpuData,
-                                           (uint16_t *)h.cpuData + h.Count(0));
-                }
+                if (out.dims != std::vector<int>({1, verifying ? count : 1, 256}) ||
+                    capture.hidden.size() != 2)
+                    throw std::runtime_error("missing graph logits/features");
+                for (int layer = 0; layer < 2; ++layer)
+                    if (capture.hidden.at(layer).Count(0) != count * 256)
+                        throw std::runtime_error("graph feature shape mismatch");
                 return std::vector<float>((float *)out.cpuData,
                                           (float *)out.cpuData + out.Count(0));
             };
@@ -256,22 +307,11 @@ class Fixture : public NaiveN05FlashModel {
             int past = prompt;
             for (int keep : {1, 4, 8, 3, 7, 8}) {
                 auto block = forward(candidate, past, 8, true);
-                auto blockFeatures = features;
                 for (int row = 0; row < keep; ++row) {
                     auto one = forward(reference, past + row, 1, false);
-                    if (!std::equal(one.begin(), one.end(), block.begin() + row * 256)) {
-                        for (int layer = 0; layer < 2; ++layer) {
-                            int differing = 0;
-                            for (int j = 0; j < 256; ++j)
-                                differing +=
-                                    features[layer][j] != blockFeatures[layer][row * 256 + j];
-                            std::cerr << "graph hidden layer=" << layer
-                                      << " differing=" << differing << std::endl;
-                        }
-                        throw std::runtime_error("graph verification differs from decode at " +
-                                                 std::to_string(past) + " row " +
-                                                 std::to_string(row));
-                    }
+                    RequireCloseLogits(block.data() + row * 256, one,
+                                       "graph verification differs from decode at " +
+                                       std::to_string(past) + " row " + std::to_string(row));
                     ++checks;
                 }
                 CommitTargetCache(candidate, past, keep);
@@ -285,11 +325,62 @@ class Fixture : public NaiveN05FlashModel {
             (!verifyGraphCaptures ||
              ((!failVerifyBegin && !failVerifyInstantiate) != (verifyGraphLaunches > 0))))
             throw std::runtime_error("verification graph execution/fallback was not exercised");
+        std::cout << "LOGIT ERROR relative_max=" << largestLogitRelative
+                  << " absolute_max=" << largestLogitAbsolute << std::endl;
         std::cout << "VERIFY GRAPH PASS checks=" << checks << " captures=" << verifyGraphCaptures
                   << " launches=" << verifyGraphLaunches << std::endl;
     }
 
 #endif
+    void VerifyRollback() {
+        draftTargetLayers = {0, 1};
+        int checks = 0;
+        for (int past : {3, 7, 15}) for (int rows : {1, 7, 8})
+            for (int keep : {0, 1, rows / 2, rows}) {
+                std::vector<std::pair<Data, Data>> clean(2), poisoned(2);
+                GenerationConfig cfg;
+                cfg.input_token_length = past;
+                cfg.output_token_limit = 32;
+                cfg.output_logits = true;
+                auto forward = [&](auto &kv, int start, int count, bool verifying, bool poison) {
+                    std::vector<float> ids(count), pos(count);
+                    for (int row = 0; row < count; ++row) {
+                        ids[row] = ((start + row) * 3 + (poison && row >= keep ? 71 : 0)) % 256;
+                        pos[row] = start + row;
+                    }
+                    Data input(FLOAT32, {1, count}, ids), positions(FLOAT32, {1, count}, pos);
+                    TargetCapture capture;
+                    capture.verifying = verifying;
+                    Data out = RunDraftTarget(input, positions, kv, cfg, capture);
+                    out.ToDevice(DataDevice::CPU);
+                    if (out.dims != std::vector<int>({1, verifying ? count : 1, 256}))
+                        throw std::runtime_error("rollback logit shape mismatch");
+                    return std::vector<float>((float *)out.cpuData,
+                                              (float *)out.cpuData + out.Count(0));
+                };
+                forward(clean, 0, past, false, false);
+                forward(poisoned, 0, past, false, false);
+                auto expected = forward(clean, past, rows, true, false);
+                auto actual = forward(poisoned, past, rows, true, true);
+                if (!std::equal(expected.begin(), expected.begin() + keep * 256, actual.begin()))
+                    throw std::runtime_error("rejected token changed earlier verify rows");
+                // Repeating the same width/input after rejecting every row must be exact.
+                CommitTargetCache(clean, past, 0);
+                if (forward(clean, past, rows, true, false) != expected)
+                    throw std::runtime_error("same-path rollback/replay differs");
+                CommitTargetCache(clean, past, keep);
+                CommitTargetCache(poisoned, past, keep);
+                for (int layer = 0; layer < 2; ++layer)
+                    if (clean[layer].first.dims != poisoned[layer].first.dims ||
+                        clean[layer].second.dims != poisoned[layer].second.dims)
+                        throw std::runtime_error("same-path rollback metadata differs");
+                if (forward(clean, past + keep, 1, false, false) !=
+                    forward(poisoned, past + keep, 1, false, false))
+                    throw std::runtime_error("rejected suffix changed same-path subsequent decode");
+                ++checks;
+            }
+        std::cout << "VERIFY ROLLBACK PASS checks=" << checks << std::endl;
+    }
     void VerifyBlocks() {
         // Compare against the same rank count: TP has its own reduction tree.
         draftTargetLayers = {0, 1};
@@ -334,26 +425,7 @@ class Fixture : public NaiveN05FlashModel {
                     for (int row = 0; row < keep; ++row) {
                         auto one = forward(reference, past + row, 1);
                         const float *actual = (const float *)block.cpuData + row * 256;
-                        double maximum = 0;
-                        for (int j = 0; j < 256; ++j)
-                            maximum = std::max(maximum, (double)std::abs(actual[j] - one[j]));
-                        if (maximum != 0) {
-                            for (int layer = 0; layer < 2; ++layer) {
-                                Data blockHidden(capture.hidden.at(layer)),
-                                    refHidden(referenceCapture.hidden.at(layer));
-                                blockHidden.ToDevice(DataDevice::CPU);
-                                refHidden.ToDevice(DataDevice::CPU);
-                                int differing = 0;
-                                for (int j = 0; j < 256; ++j)
-                                    differing += ((uint16_t *)blockHidden.cpuData)[row * 256 + j] !=
-                                                 ((uint16_t *)refHidden.cpuData)[j];
-                                std::cerr << "hidden layer=" << layer << " differing=" << differing
-                                          << '\n';
-                            }
-                            std::cerr << "verify past=" << past << " rows=" << rows
-                                      << " row=" << row << " max_abs=" << maximum << '\n';
-                            throw std::runtime_error("block verification differs from decode");
-                        }
+                        RequireCloseLogits(actual, one, "block verification differs from decode");
                         ++checks;
                     }
                     CommitTargetCache(candidate, past, keep);
@@ -366,11 +438,17 @@ class Fixture : public NaiveN05FlashModel {
                                     reference[layer].first.multiDeviceDatas.at(device)->dims)
                                     throw std::runtime_error("rollback rank length mismatch");
                     }
-                    if (forward(reference, past + keep, 1) != forward(candidate, past + keep, 1))
-                        throw std::runtime_error("rejected suffix changed subsequent decode");
+                    auto expectedNext = forward(reference, past + keep, 1);
+                    auto actualNext = forward(candidate, past + keep, 1);
+                    if (actualNext.size() != expectedNext.size())
+                        throw std::runtime_error("post-commit logit shape mismatch");
+                    RequireCloseLogits(actualNext.data(), expectedNext,
+                                       "rejected suffix changed subsequent decode");
                     ++checks;
                 }
             }
+        std::cout << "LOGIT ERROR relative_max=" << largestLogitRelative
+                  << " absolute_max=" << largestLogitAbsolute << std::endl;
         std::cout << "VERIFY BLOCK PASS ranks=" << ranks << " checks=" << checks << std::endl;
     }
 };
@@ -563,6 +641,7 @@ class DraftFixture : public NaiveN05FlashModel {
 
 int main(int argc, char **argv) {
     try {
+        CheckLogitComparison();
         int ranks = argc > 1 ? std::stoi(argv[1]) : 8;
         if (ranks != 1 && ranks != 2 && ranks != 4 && ranks != 8)
             return 2;
@@ -601,6 +680,12 @@ int main(int argc, char **argv) {
             return 0;
         }
 #endif
+        if (argc > 2 && std::string(argv[2]) == "rollback") {
+            SetCudaGraph(ranks > 1);
+            Fixture fixture(ranks, true, ranks > 1);
+            fixture.VerifyRollback();
+            return 0;
+        }
         if (argc > 2 && std::string(argv[2]) == "verify") {
             Fixture fixture(ranks, argc > 3 && std::string(argv[3]) == "packed");
             fixture.VerifyBlocks();

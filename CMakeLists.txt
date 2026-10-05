@@ -1460,6 +1460,14 @@ if (UNIT_TEST)
         set_tests_properties(cuda_verify_multirow PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120
             PASS_REGULAR_EXPRESSION "VERIFY MULTIROW PASS")
 
+        add_executable(cuda_bf16_workspace_test test/basic/test_cuda_bf16_workspace.cu)
+        target_include_directories(cuda_bf16_workspace_test PRIVATE src/devices/cuda/linear)
+        target_link_libraries(cuda_bf16_workspace_test PRIVATE cublasLt Threads::Threads)
+        set_target_properties(cuda_bf16_workspace_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME cuda_bf16_workspace COMMAND cuda_bf16_workspace_test)
+        set_tests_properties(cuda_bf16_workspace PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 150
+            PASS_REGULAR_EXPRESSION "PASS independent captures")
+
         add_executable(cuda_qwen4_shared_expert_test test/basic/test_cuda_qwen4_shared_expert.cpp)
         target_link_libraries(cuda_qwen4_shared_expert_test PRIVATE fastllm)
         target_include_directories(cuda_qwen4_shared_expert_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

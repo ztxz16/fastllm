@@ -278,9 +278,10 @@ Data NaiveN05FlashModel::RunTarget(
         int value;
         ~RestoreExactThreshold() { FastllmCudaSetLinearExactBatchThreshold(value); }
     } restoreExactThreshold{previousExactThreshold};
-    // Verification must use the decode reduction tree, including the FP32
-    // router. Different GEMM rounding can change expert selection and amplify
-    // logit differences even when every cache and attention mask is correct.
+    // Keep the decode reduction order for paths honoring this threshold,
+    // especially the FP32 router where rounding can change expert selection.
+    // BF16-to-BF16 batches of eight or more rows use cuBLAS and allow bounded
+    // floating-point differences from independent single-row decoding.
     if (capture && capture->verifying)
         FastllmCudaSetLinearExactBatchThreshold(std::max(previousExactThreshold, length + 1));
     int pastLength = pastKeyValues[0].first.dims.empty() ? 0 : pastKeyValues[0].first.dims[1];

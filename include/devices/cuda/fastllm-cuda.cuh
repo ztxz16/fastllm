@@ -1250,8 +1250,10 @@ extern "C" bool FastllmCudaDeepSeekV4WoADeepGemmSm120(
                               fastllm::Data &output);
 #endif
 namespace fastllm {
-// Verifier batches below this thread-local threshold must use a native linear
-// path whose arithmetic is equivalent to independent single-token decoding.
+// Request the single-row reduction order below this thread-local threshold
+// for paths that support it (notably the FP32 expert router). BF16-to-BF16
+// batches of eight or more rows may use FP32-accumulating cuBLAS and must be
+// compared with a numerical tolerance, not bitwise equality.
 int FastllmCudaGetLinearExactBatchThreshold();
 void FastllmCudaSetLinearExactBatchThreshold(int threshold);
 bool FastllmCudaTryTritonDeepSeekV4WoA(const Data &o, Data &woA,
