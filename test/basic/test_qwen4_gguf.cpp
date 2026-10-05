@@ -1,5 +1,6 @@
 #include "model.h"
 #include "models/qwen4_exp.h"
+#include "executor.h"
 #include "devices/disk/diskdevice.h"
 #include "gguf.h"
 #include "json11.hpp"
@@ -7,6 +8,7 @@
 #include "devices/cuda/fastllm-cuda.cuh"
 #endif
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -107,6 +109,16 @@ struct Fixture {
         for (const auto &item : config) meta["qwen4exp." + item.first] = item.second;
         Write(files[0], meta, {}); // Real distribution has a metadata-only first shard.
         std::vector<Tensor> tensors;
+        Tensor embedding{"token_embd.weight", {32, 256}, GGML_TYPE_IQ4_XS,
+                         Bytes(32 * ggml_row_size(GGML_TYPE_IQ4_XS, 256))};
+        for (int row = 0; row < 32; ++row) {
+            auto &block = reinterpret_cast<block_iq4_xs *>(embedding.bytes.data())[row];
+            block.d = float_to_half((row + 1) / 1024.0f);
+            block.scales_h = row * 1973;
+            for (int i = 0; i < 4; ++i) block.scales_l[i] = row * 13 + i * 71;
+            for (int i = 0; i < 128; ++i) block.qs[i] = row * 17 + i * 29;
+        }
+        tensors.push_back(std::move(embedding));
         auto rows = [&](const std::string &name, int prefix, int headDim, int columns, ggml_type type) {
             const int count = prefix + 6 * headDim;
             std::vector<float> values(count * columns);
@@ -216,6 +228,51 @@ void TestFloatImport(const std::string &directory) {
         }
     }
     unlink(path.c_str());
+}
+
+void TestEmbeddingImport(const Fixture &fixture) {
+    const std::string name = "model.language_model.embed_tokens.weight";
+    // Compare against the previous full-table FP32 import, including repeated
+    // indices, the last vocabulary row, and FP16 token IDs/output conversion.
+    for (bool cudaEmbedding : {true, false, true, false}) {
+        SetCudaEmbedding(cudaEmbedding);
+        std::vector<ReadGGUFTask> tasks;
+        AppendGGUFTasks("qwen4_exp", fixture.files[1], tasks);
+        auto task = std::find_if(tasks.begin(), tasks.end(), [&](const ReadGGUFTask &t) {
+            return t.name == name;
+        });
+        Check(task != tasks.end(), "missing embedding import task");
+        Check(task->replaceType == (cudaEmbedding
+              ? GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32
+              : GGUFWeightReplaceRule::GGUFWeightReplaceDirect), "embedding placement policy");
+        // Match the loader's AddEmptyWeight placeholder before direct import.
+        Data weight(FLOAT32, {1}), reference(FLOAT32, {1});
+        WeightImportGGUFTensor(&weight, &task->tensor, task->fileName, task->offset, task->replaceType);
+        WeightImportGGUFTensor(&reference, &task->tensor, task->fileName, task->offset,
+                              GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32);
+        auto *storage = weight.cpuData;
+        const size_t bytes = weight.GetBytes();
+        for (DataType type : {FLOAT32, FLOAT16}) {
+            for (const std::vector<float> &ids : {std::vector<float>{31}, {31, 0, 15, 31, 1}}) {
+                Data input(type, {1, (int)ids.size()}, ids), actual, expected;
+                auto &executor = *static_cast<Executor *>(GetExecutor());
+                DataDict packed{{"input", &input}, {"weight", &weight}, {"output", &actual}};
+                DataDict dense{{"input", &input}, {"weight", &reference}, {"output", &expected}};
+                executor.RunOnDevice("cpu", "Embedding", packed, {}, {});
+                executor.RunOnDevice("cpu", "Embedding", dense, {}, {});
+                Check(actual.dims == expected.dims && actual.dataType == expected.dataType &&
+                      actual.GetBytes() == expected.GetBytes() &&
+                      std::memcmp(actual.cpuData, expected.cpuData, actual.GetBytes()) == 0,
+                      "packed embedding changed decoded values or output dtype");
+            }
+        }
+        Check(weight.cpuData == storage && weight.GetBytes() == bytes,
+              "embedding lookup reallocated the weight");
+        if (!cudaEmbedding) Check(weight.dataType == DATA_GGUF_FORMAT &&
+            weight.ggmlType == GGML_TYPE_IQ4_XS && bytes == 32 * ggml_row_size(GGML_TYPE_IQ4_XS, 256),
+            "CPU embedding expanded the quantized table");
+    }
+    std::cout << "PASS: packed Qwen4 embedding matches FP32 import and respects CUDA policy\n";
 }
 }
 namespace fastllm {
@@ -349,10 +406,12 @@ static int TestStreamingTpImport() {
 int main(int argc, char **argv) {
     try {
         SetThreads(2); SetDeviceMap({{"cpu", 1}}); SetMoeDeviceMap({{"cpu", 1}});
+        SetCudaEmbedding(false);
         SetMoeCudaCacheBytes(0); setenv("FASTLLM_QWEN4_ENABLE_MTP", "0", 1);
         if (argc == 2 && std::string(argv[1]) == "--tp-load") return TestStreamingTpImport();
         Fixture fixture;
         TestFloatImport(fixture.directory);
+        TestEmbeddingImport(fixture);
         TestMtpImport(fixture);
         for (bool disk : {true, false}) {
             SetNgramDevice(disk ? "disk" : "cpu");

@@ -1034,6 +1034,13 @@ namespace fastllm {
                         );
                     } else if (it.type == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32 ||
                                 it.type == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP16) {
+                        // CPU Qwen4 embedding can decode individual GGUF rows.
+                        // Preserve floating-point imports and the CUDA embedding
+                        // path, which still require the original dense layout.
+                        const bool packedEmbedding = arch == "qwen4_exp" &&
+                            name == "token_embd.weight" &&
+                            (GetLowMemMode() || !GetCudaEmbedding()) &&
+                            ggml_is_quantized(tensors[i].first.type);
                         name = std::regex_replace(name, it.pattern, it.names[0]);
                         if (name == "ignore") {
                             break;
@@ -1041,7 +1048,7 @@ namespace fastllm {
                         tasks.push_back (
                             ReadGGUFTask (
                                 name, nullptr, tensors[i].first, ggufBuffer.fileName, baseOffset + tensors[i].second, 
-                                it.type
+                                packedEmbedding ? GGUFWeightReplaceRule::GGUFWeightReplaceDirect : it.type
                             )
                         );
                     } else if (it.type == GGUFWeightReplaceRule::GGUFWeightReplacePacked) {
