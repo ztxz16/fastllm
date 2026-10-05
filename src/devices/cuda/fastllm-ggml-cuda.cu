@@ -758,6 +758,46 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
     return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
 }
 
+// Decode a Q6_K weight fragment once for all input rows in a small batch.
+// Keep the integer dot products and FP32 accumulation order of the single-row
+// path: MTP verification must not acquire a different rounding path.
+struct FastllmQ6MmvqFragment {
+    int values[QR6_K];
+    int scales[QR6_K];
+    float d;
+
+    __device__ __forceinline__ FastllmQ6MmvqFragment(const block_q6_K &w, int iqs) {
+        const int scaleOffset = (QI6_K/4) * (iqs / (QI6_K/2)) +
+                                (iqs % (QI6_K/2)) / (QI6_K/8);
+        const int shift = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
+        const int vl = get_int_b2(w.ql, iqs);
+        const int vh = get_int_b2(w.qh, (QI6_K/4) * (iqs / (QI6_K/2)) +
+                                 iqs % (QI6_K/4)) >> shift;
+        d = w.d;
+#pragma unroll
+        for (int i = 0; i < QR6_K; ++i) {
+            const int lo = (vl >> (4*i)) & 0x0F0F0F0F;
+            const int hi = ((vh >> (4*i)) << 4) & 0x30303030;
+            const uint32_t centered = uint32_t(lo | hi) ^ 0x20202020u;
+            values[i] = static_cast<int>(centered | ((centered & 0x20202020u) * 6u));
+            scales[i] = w.scales[scaleOffset + 4*i];
+        }
+    }
+
+    __device__ __forceinline__ float Dot(const block_q8_1 *y, int iqs) const {
+        const int offset = 2 * QR6_K * (iqs / (QI6_K/2)) +
+                           (iqs % (QI6_K/2)) / (QI6_K/4);
+        float sum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < QR6_K; ++i) {
+            const int u = get_int_b4(y[offset + 2*i].qs, iqs % QI8_1);
+            const float d8 = __low2float(y[offset + 2*i].ds);
+            sum += d8 * (ggml_cuda_dp4a(values[i], u, 0) * scales[i]);
+        }
+        return d * sum;
+    }
+};
+
 #define VDR_Q8_0_Q8_1_MMVQ 2
 #define VDR_Q8_0_Q8_1_MMQ 8
 
@@ -969,11 +1009,9 @@ static __device__ void mul_mat_vec_q(
 #if defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__) && (defined(RDNA2) || defined(RDNA3))
     constexpr int rows_per_cuda_block = 1;
 #else
-    // Match ggml's NVIDIA MMVQ packing: multi-row inputs have enough reuse to
-    // compute two output rows per block. This halves the block count for the
-    // DFlash B4/B8 verifier without changing the quantized arithmetic order of
-    // either output row.
-    constexpr int rows_per_cuda_block = ncols_y < 4 ? 1 : 2;
+    // Q6_K reuses decoded weights across input rows. One output row per CTA
+    // avoids the register pressure of the two-output-row verifier tile.
+    constexpr int rows_per_cuda_block = (type == GGML_TYPE_Q6_K && ncols_y == 4) || ncols_y < 4 ? 1 : 2;
 #endif // defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__) && !defined(RDNA2) && !defined(RDNA3)
 
     const     int tid = WARP_SIZE*threadIdx.y + threadIdx.x;
@@ -992,14 +1030,23 @@ static __device__ void mul_mat_vec_q(
         // x block quant index when casting the quants to int
         const int kqs = vdr * (tid % (qi/vdr));
 
+        if constexpr (type == GGML_TYPE_Q6_K && ncols_y >= 2 && ncols_y <= 4) {
+            const FastllmQ6MmvqFragment fragment(
+                ((const block_q6_K *)vx)[row0 * blocks_per_row_x + kbx], kqs);
 #pragma unroll
-        for (int j = 0; j < ncols_y; ++j) {
+            for (int j = 0; j < ncols_y; ++j) {
+                tmp[j][0] += fragment.Dot(&y[j * blocks_per_col_y + kby], kqs);
+            }
+        } else {
 #pragma unroll
-            for (int i = 0; i < rows_per_cuda_block; ++i) {
-                // The final two-row tile may contain only one weight row.
-                // Mask the read as well as the output store below.
-                if (rows_per_cuda_block == 1 || row0 + i < nrows_x) {
-                    tmp[j][i] += vec_dot_q_cuda(vx, &y[j*blocks_per_col_y + kby], (row0 + i)*blocks_per_row_x + kbx, kqs);
+            for (int j = 0; j < ncols_y; ++j) {
+#pragma unroll
+                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                    // The final two-row tile may contain only one weight row.
+                    // Mask the read as well as the output store below.
+                    if (rows_per_cuda_block == 1 || row0 + i < nrows_x) {
+                        tmp[j][i] += vec_dot_q_cuda(vx, &y[j*blocks_per_col_y + kby], (row0 + i)*blocks_per_row_x + kbx, kqs);
+                    }
                 }
             }
         }
@@ -1040,7 +1087,7 @@ static __device__ void mul_mat_vec_q(
 
 template <ggml_type type, int ncols_y, int nwarps, typename OType, int StoreMode = 0>
 #if !defined(USE_ROCM)
-__launch_bounds__(nwarps * WARP_SIZE, 1)
+__launch_bounds__(nwarps * WARP_SIZE, (type == GGML_TYPE_Q6_K && ncols_y >= 2 && ncols_y <= 4 ? 4 : 1))
 #endif
 static __global__ void mul_mat_vec_q(
     const void * __restrict__ vx, const void * __restrict__ vy, OType * __restrict__ dst, const char * __restrict__ ids_data,
@@ -1081,7 +1128,7 @@ static void mul_mat_vec_q_cuda_T(
     assert(ncols_x % ggml_blck_size(type) == 0);
     assert(ncols_y <= MMVQ_MAX_BATCH_SIZE);    
 
-    const int64_t rows_per_cuda_block = ncols_y < 4 ? 1 : 2;
+    const int64_t rows_per_cuda_block = (type == GGML_TYPE_Q6_K && ncols_y == 4) || ncols_y < 4 ? 1 : 2;
     const int64_t nblocks = (nrows_x + rows_per_cuda_block - 1) / rows_per_cuda_block;
     const dim3 block_nums(nblocks, ne2, 1);
     const dim3 block_dims(WARP_SIZE, nwarps, 1);
