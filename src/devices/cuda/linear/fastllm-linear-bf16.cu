@@ -133,6 +133,39 @@ __global__ void FastllmGemvBf16Bf16Kernel2MultiRow(__nv_bfloat16 *A, __nv_bfloat
     __syncthreads();
 }
 
+// At K=256 the vectorized GEMV has only one active warp per output. Pack
+// eight outputs into a CTA while preserving its per-lane products and
+// compensated reduction tree. No vocabulary size or GPU model is assumed.
+__global__ void FastllmGemvBf16SmallK(const __nv_bfloat16 *input,
+        const __nv_bfloat16 *weight, __nv_bfloat16 *output,
+        const __nv_bfloat16 *bias, int outputs) {
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * 8 + threadIdx.x / 32;
+    if (row >= outputs) return;
+    union_bf16_8 a, b;
+    a.in = *reinterpret_cast<const uint4 *>(input + lane * 8);
+    b.in = *reinterpret_cast<const uint4 *>(weight + (size_t)row * 256 + lane * 8);
+    float value = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+        value += __bfloat162float(a.out[i]) * __bfloat162float(b.out[i]);
+    float correction = 0.0f;
+#pragma unroll
+    for (int step = 16; step; step >>= 1) {
+        float peer = __shfl_down_sync(0xffffffffu, value, step);
+        if (lane < step) {
+            float other = peer - correction;
+            float sum = value + other;
+            correction = (sum - value) - other;
+            value = sum;
+        }
+    }
+    if (lane == 0) {
+        if (bias) value += __bfloat162float(bias[row]);
+        output[row] = __float2bfloat16_rn(value);
+    }
+}
+
 // FP16 input × BF16 weight -> FP16 output (用于 FastllmCudaHalfMatMulBFloat16)
 template <int THREAD_PER_BLOCK, int PART>
 __global__ void FastllmGemvFp16Bf16Kernel2MultiRow(half *A, __nv_bfloat16 *B, half *C, half *bias, int m, int k) {
@@ -637,7 +670,9 @@ void LaunchFastllmGemmFp16Bf16(half *input, __nv_bfloat16 *weight, half *output,
 template <int THREADS>
 static void LaunchFastllmGemmBf16Bf16SmallBatch(__nv_bfloat16 *input, __nv_bfloat16 *weight, __nv_bfloat16 *output, __nv_bfloat16 *bias, int n, int m, int k) {
     // PART=2..8 reuses the weights without changing the per-row reduction.
-    if (n == 1) {
+    if (n == 1 && m == 256) {
+        FastllmGemvBf16SmallK<<<(k + 7) / 8, 256>>>(input, weight, output, bias, k);
+    } else if (n == 1) {
         FastllmGemvBf16Bf16Kernel2MultiRow<THREADS, 1> <<<k, THREADS>>>(input, weight, output, bias, m, k);
     } else if (n == 2) {
         FastllmGemvBf16Bf16Kernel2MultiRow<THREADS, 2> <<<k, THREADS>>>(input, weight, output, bias, m, k);
