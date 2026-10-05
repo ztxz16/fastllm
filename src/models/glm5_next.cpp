@@ -1987,6 +1987,7 @@ namespace fastllm {
         AssertInFastLLM(!UsesDsa(), "GLM DSA requires a CUDA build.");
 #endif
         Data absorbedQuery, latentAttention;
+        std::vector<Data> requestIndices(batch);
         for (int request = 0; request < batch; ++request) {
             auto &pastKeyValues = *requestCaches[request];
             const int rows = batch == 1 ? sequence : 1;
@@ -2023,7 +2024,7 @@ namespace fastllm {
                 keyPeCache.pageIndex == latentKvCache.pageIndex,
                 "GLM-5.3 compressed MLA caches are out of sync.");
 
-            Data dsaIndices;
+            Data &dsaIndices = requestIndices[request];
 #ifdef USE_CUDA
             if (UsesDsa()) {
                 auto *requestIndexer = indexer;
@@ -2058,20 +2059,56 @@ namespace fastllm {
                 }
             }
 #endif
-            if (absorbedQuery.dims.empty()) {
-                if (exactSmallBatchMatmul) {
-                    for (int row = 0; row < sequence; row++) {
-                        Data rowQuery, rowAbsorbed;
-                        Split(query, 1, row, row + 1, rowQuery);
-                        MatMul(rowQuery, keyWeight, rowAbsorbed);
-                        AppendGlm5NextRows(absorbedQuery, rowAbsorbed, sequence);
-                    }
-                } else {
-                    MatMul(query, keyWeight, absorbedQuery);
-                }
-                query.FreeSpace();
-                ToDataType(absorbedQuery, DataType::BFLOAT16);
+        }
+        if (exactSmallBatchMatmul) {
+            for (int row = 0; row < sequence; row++) {
+                Data rowQuery, rowAbsorbed;
+                Split(query, 1, row, row + 1, rowQuery);
+                MatMul(rowQuery, keyWeight, rowAbsorbed);
+                AppendGlm5NextRows(absorbedQuery, rowAbsorbed, sequence);
             }
+        } else {
+            MatMul(query, keyWeight, absorbedQuery);
+        }
+        query.FreeSpace();
+        ToDataType(absorbedQuery, DataType::BFLOAT16);
+        bool batchedAttention = false;
+#ifdef USE_CUDA
+        const bool hasSparse = std::any_of(requestIndices.begin(), requestIndices.end(),
+            [](const Data &indices) { return !indices.dims.empty(); });
+        if (batch > 1 && (!hasSparse || dsaBackend == DsaBackend::Auto)) {
+            std::vector<const Data*> peCaches, latentCaches, indices;
+            std::vector<int> lengths;
+            for (int request = 0; request < batch; ++request) {
+                const auto &cache = (*requestCaches[request])[layerIndex];
+                peCaches.push_back(&cache.first);
+                latentCaches.push_back(&cache.second);
+                const bool sparse = !requestIndices[request].dims.empty();
+                indices.push_back(sparse ? &requestIndices[request] : nullptr);
+                const int tokens = cache.second.dims[1];
+                lengths.push_back(sparse ? std::min(tokens / 4, 512) * 4 + tokens % 4 : tokens);
+            }
+            Data queryPe(DataType::BFLOAT16);
+            queryPe.Resize({1, batch, num_attention_heads, mlaPaddedPeHeadDim});
+            queryPe.ToDevice(absorbedQuery.dataDevice, absorbedQuery.dataDeviceIds, false);
+            queryPe.Allocate(0.0f);
+            latentAttention.dataType = absorbedQuery.dataType;
+            latentAttention.Resize(absorbedQuery.dims);
+            latentAttention.ToDevice(absorbedQuery.dataDevice, absorbedQuery.dataDeviceIds, false);
+            latentAttention.Allocate();
+            batchedAttention = FastllmCudaMLAPagedBatch(absorbedQuery, queryPe, peCaches, latentCaches,
+                lengths, indices, latentAttention, 1.0f / std::sqrt((float)qkHeadDim));
+            if (!batchedAttention) {
+                latentAttention.FreeSpace();
+                latentAttention.Resize({});
+            }
+        }
+#endif
+        for (int request = 0; !batchedAttention && request < batch; ++request) {
+            const int rows = batch == 1 ? sequence : 1;
+            auto &keyPeCache = (*requestCaches[request])[layerIndex].first;
+            auto &latentKvCache = (*requestCaches[request])[layerIndex].second;
+            auto &dsaIndices = requestIndices[request];
             Data rowQuery, rowAttention;
             Data *attentionQuery = &absorbedQuery;
             Data *attentionResult = &latentAttention;

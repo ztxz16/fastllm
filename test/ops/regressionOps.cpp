@@ -4969,6 +4969,106 @@ namespace {
         std::cout << "CUDA batched KDA output/state, shrink/reorder/growth: PASS\n";
     }
 
+    void RunCudaMlaBatchDecodeCase(fastllm::DataType type, int dimension, int batch) {
+        using namespace fastllm;
+        const int heads = batch == 64 ? 64 : 4, pageLen = 4;
+        auto make = [&](std::vector<int> dims, float seed) {
+            int count = 1;
+            for (int n : dims) count *= n;
+            return MakeCudaTensor(type, dims, MakeRegressionValues(count, seed, .17f));
+        };
+        Data q = make({heads, batch, dimension}, .7f);
+        Data qp = make({1, batch, heads, 64}, 1.1f);
+        Data peExample = make({1, 1, 64}, 0), kvExample = make({1, 1, dimension}, 0);
+        auto *peManager = AllocatePagedCacheManager(12000, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_MLP_CACHE,
+            peExample, pageLen, batch * 12);
+        auto *kvManager = AllocatePagedCacheManager(12001, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_MLP_CACHE,
+            kvExample, pageLen, batch * 12);
+        std::vector<Data> peCaches(batch), kvCaches(batch);
+        for (int row = 0; row < batch; ++row) {
+            int tokens = 7 + 5 * (row % 7);
+            Data pe = make({1, tokens, 64}, row + .1f);
+            Data kv = make({1, tokens, dimension}, row + .3f);
+            for (auto *cache : {&peCaches[row], &kvCaches[row]}) {
+                cache->dataType = type;
+                cache->UpdateUnitSize();
+                cache->ToDevice(DataDevice::CUDA, {0}, false);
+                cache->SetKVCache();
+            }
+            AppendPagedCache(*peManager, peCaches[row], pe);
+            AppendPagedCache(*kvManager, kvCaches[row], kv);
+        }
+        enum class Mode { Dense, Sparse, Mixed };
+        // Repeat sparse mode to verify reuse of the cached schedule.
+        for (Mode mode : {Mode::Dense, Mode::Sparse, Mode::Mixed, Mode::Sparse}) {
+            std::vector<Data> selected(batch);
+            std::vector<const Data*> pes, kvs, indices;
+            std::vector<int> lengths;
+            Data expected;
+            for (int row = 0; row < batch; ++row) {
+                int slot = mode == Mode::Mixed ? batch - 1 - row : row;
+                pes.push_back(&peCaches[slot]);
+                kvs.push_back(&kvCaches[slot]);
+                const int tokens = kvCaches[slot].dims[1];
+                const bool sparse = mode == Mode::Sparse || (mode == Mode::Mixed && row % 2);
+                int length = sparse ? (tokens + 1) / 2 : tokens;
+                lengths.push_back(length);
+                if (sparse) {
+                    selected[row].dataType = DataType::INT32;
+                    selected[row].Resize({length});
+                    selected[row].Allocate();
+                    auto *data = (int32_t*)selected[row].cpuData;
+                    for (int i = 0; i < length; ++i) {
+                        int token = tokens - 1 - i * 2;
+                        data[i] = kvCaches[slot].pageIndex[token / pageLen] * pageLen + token % pageLen;
+                    }
+                    selected[row].ToDevice(DataDevice::CUDA, {0}, true);
+                }
+                indices.push_back(sparse ? &selected[row] : nullptr);
+                Data rowQ, rowPe, result;
+                Split(q, 1, row, row + 1, rowQ);
+                Split(qp, 1, row, row + 1, rowPe);
+                result.dataType = type;
+                result.Resize(rowQ.dims);
+                result.ToDevice(DataDevice::CUDA, {0}, false);
+                result.Allocate();
+                Expect(FastllmCudaMLAPaged(rowQ, rowPe, *pes.back(), *kvs.back(),
+                    result, .1f, length, indices.back()), "Serial paged MLA rejected");
+                if (row == 0) {
+                    expected.CopyFrom(result);
+                    expected.Expansion({heads, batch, dimension});
+                } else CatDirect(expected, result, 1);
+            }
+            expected.expansionDims.clear();
+            Data output;
+            output.dataType = type;
+            output.Resize(q.dims);
+            output.ToDevice(DataDevice::CUDA, {0}, false);
+            output.Allocate();
+            Expect(FastllmCudaMLAPagedBatch(q, qp, pes, kvs, lengths, indices, output, .1f),
+                "Batched paged MLA rejected");
+            // Split-K scheduling may change BF16/FP16 reduction rounding.
+            ExpectFloatNear(ToFloatVector(expected), ToFloatVector(output), .002f, .015f,
+                "Batched dense/sparse/mixed MLA output");
+        }
+    }
+
+    void RunCudaMlaBatchDecodeRegression() {
+        using namespace fastllm;
+        FastllmCudaSetDevice(0);
+        ScopedFirstDevice device("cuda:0");
+        ClearAllPagedCacheManagers();
+        for (DataType type : {DataType::BFLOAT16, DataType::FLOAT16}) {
+            for (int dimension : {128, 512}) {
+                for (int batch : {2, 8, 64}) {
+                    RunCudaMlaBatchDecodeCase(type, dimension, batch);
+                    ClearAllPagedCacheManagers();
+                }
+            }
+        }
+        std::cout << "CUDA batched MLA dense/sparse/mixed, BF16/FP16, rank 128/512: PASS\n";
+    }
+
     void RunCudaMergeMlaPagedChunkRegression() {
         FastllmCudaSetDevice(0);
         constexpr int pageLen = 4;
@@ -15014,6 +15114,8 @@ int main(int argc, char **argv) {
         if (argc == 2 && std::string(argv[1]) == "--cuda-batch-attention") {
             Expect(FastllmCudaGetDeviceCount() > 0, "Batched attention regression requires CUDA.");
             RunCudaKdaBatchDecodeRegression();
+            RunCudaMlaBatchDecodeRegression();
+            RunCudaMergeMlaPagedChunkRegression();
             return 0;
         }
         if (argc == 2 && std::string(argv[1]) == "--cuda-small-batch-decode") {

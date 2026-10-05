@@ -476,6 +476,13 @@ bool FastllmCudaMLA(const fastllm::Data &qNope, const fastllm::Data &qPe, const 
 bool FastllmCudaMLAPaged(const fastllm::Data &qNope, const fastllm::Data &qPe, const fastllm::Data &kvCachePaged, const fastllm::Data &peCachePaged,
                          fastllm::Data &output, float softmaxScale, int kvLen = -1,
                          const fastllm::Data *physicalTokenIndices = nullptr);
+// HND queries/output, one query per request; descriptors share the same KV pools.
+bool FastllmCudaMLAPagedBatch(const fastllm::Data &qNope, const fastllm::Data &qPe,
+        const std::vector<const fastllm::Data*> &peCaches,
+        const std::vector<const fastllm::Data*> &latentCaches,
+        const std::vector<int> &kvLengths,
+        const std::vector<const fastllm::Data*> &physicalTokenIndices,
+        fastllm::Data &output, float softmaxScale);
 
 bool FastllmCudaEmbedding(const fastllm::Data &input, const fastllm::Data &weight, fastllm::Data &output);
 bool FastllmCudaEmbeddingDirect(const fastllm::Data &input, const fastllm::Data &weight, fastllm::Data &output);

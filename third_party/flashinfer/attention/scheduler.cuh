@@ -1580,7 +1580,7 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
                            size_t int_workspace_size_in_bytes, MLAPlanInfo& plan_info,
                            IdType* qo_indptr_h, IdType* kv_indptr_h, IdType* kv_len_arr_h,
                            uint32_t batch_size, uint32_t num_heads, uint32_t head_dim_o,
-                           bool causal, cudaStream_t stream) {
+                           bool causal, cudaStream_t stream, bool compact = false) {
   int num_sm = 0;
   int dev_id = 0;
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
@@ -1735,13 +1735,14 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
                    "Internal Error: merge_cta_counter should be less than or equal to num_sm, "
                    "please report this bug to the developers");
 
-  int max_total_num_works = 16384;  // NOTE(Zihao): adjust it later
-
   std::vector<IdType> work_indptr_vec(num_clusters + 1, 0);
   for (uint32_t i = 0; i < num_clusters; ++i) {
     work_indptr_vec[i + 1] = work_indptr_vec[i] + cluster_q_indptr[i].size();
   }
   int total_num_works = work_indptr_vec.back();
+  // Eager callers need only the populated metadata. Keep fixed capacity as
+  // the default for callers that depend on stable workspace offsets.
+  int max_total_num_works = compact ? std::max(1, total_num_works) : 16384;
   auto q_indptr_vec = flatten(cluster_q_indptr, total_num_works);
   auto kv_indptr_vec = flatten(cluster_kv_indptr, total_num_works);
   auto partial_indptr_vec = flatten(cluster_partial_indptr, total_num_works);
@@ -1779,7 +1780,7 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
   plan_info.kv_end_offset =
       int_allocator.aligned_alloc_offset(sizeof(IdType) * max_total_num_works, 16, "mla_kv_end");
   plan_info.work_indptr_offset = int_allocator.aligned_alloc_offset(
-      sizeof(IdType) * max_total_num_works, 16, "mla_work_indptr");
+      sizeof(IdType) * (compact ? num_clusters + 1 : max_total_num_works), 16, "mla_work_indptr");
 
   IdType* cluster_q_indptr_h =
       GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.q_indptr_offset);
