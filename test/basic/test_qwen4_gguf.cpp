@@ -145,6 +145,8 @@ struct Fixture {
         for (int layer = 0; layer < 2; ++layer) {
             tensors.push_back(FloatTensor("blk." + std::to_string(layer) + ".ffn_gate_inp_shexp.weight",
                 {256}, GGML_TYPE_F32, std::vector<float>(256, .5f)));
+            tensors.push_back(FloatTensor("blk." + std::to_string(layer) + ".hc_attn_down.weight",
+                {4, 512}, GGML_TYPE_BF16, std::vector<float>(4 * 512, layer + .25f)));
         }
         for (const auto &kind : {"q", "k"}) {
             const int rows = kind == std::string("q") ? 8 : 4;
@@ -154,6 +156,8 @@ struct Fixture {
                 {4}, GGML_TYPE_F32, std::vector<float>(4, 1.25f)));
         }
         tensors.push_back(FloatTensor("output_hc_norm.weight", {512}, GGML_TYPE_F32, std::vector<float>(512, 1.5f)));
+        tensors.push_back(FloatTensor("output_hc_up.weight", {512, 4}, GGML_TYPE_BF16,
+                                      std::vector<float>(512 * 4, .75f)));
         for (int layer = 0; layer < (tpExperts ? 2 : 1); ++layer)
         for (const auto &kind : {"gate", "up", "down"}) {
             const bool down = kind == std::string("down");
@@ -285,10 +289,11 @@ struct Qwen4GGUFTestAccess {
         Check(m.IsLinearAttentionLayer(0) && !m.IsLinearAttentionLayer(1) && m.indexerCompressRatio == 2, "attention layout metadata");
     }
     static void Prepare(Qwen4ExpModel &m) { m.PrepareWeights(); }
+    static void PrepareTp(Qwen4ExpModel &m) { m.PrepareThreadTp(); }
     static bool HasMtp(const Qwen4ExpModel &m) { return m.HasMtpWeights(); }
 };
 }
-static void TestMtpImport(Fixture &fixture) {
+static std::string WriteMtpFixture(Fixture &fixture, int expertWidth = 32) {
     std::vector<Tensor> tensors;
     auto add = [&](const std::string &name, std::vector<int> dims, ggml_type type) {
         size_t n = 1; for (int d : dims) n *= d;
@@ -317,11 +322,16 @@ static void TestMtpImport(Fixture &fixture) {
     add(mlp + "shared_expert_gate.weight", {1, 256}, GGML_TYPE_BF16);
     for (const std::string &name : {"gate", "up"}) add(mlp + "shared_expert." + name + "_proj.weight", {32, 256}, GGML_TYPE_BF16);
     add(mlp + "shared_expert.down_proj.weight", {256, 32}, GGML_TYPE_BF16);
-    add(mlp + "experts.gate_up_proj", {2, 64, 256}, GGML_TYPE_Q8_0);
-    add(mlp + "experts.down_proj", {2, 256, 32}, GGML_TYPE_Q8_0);
+    add(mlp + "experts.gate_up_proj", {2, 2 * expertWidth, 256}, GGML_TYPE_Q8_0);
+    add(mlp + "experts.down_proj", {2, 256, expertWidth}, GGML_TYPE_Q8_0);
     const std::string path = fixture.directory + "/mtp.gguf";
     Write(path, {{"general.architecture", "qwen4exp-mtp"}}, tensors);
     fixture.files.push_back(path);
+    return path;
+}
+static void TestMtpImport(Fixture &fixture) {
+    const std::string path = WriteMtpFixture(fixture);
+    const std::string mlp = "mtp.layers.0.mlp.";
     setenv("FASTLLM_QWEN4_ENABLE_MTP", "3", 1);
     auto loaded = CreateLLMModelFromGGUFFile(fixture.files[0], "", path);
     auto *model = dynamic_cast<Qwen4ExpModel *>(loaded.get());
@@ -347,54 +357,103 @@ static int TestStreamingTpImport() {
     if (FastllmCudaGetDeviceCount() < 2) return 77;
     unsetenv("FASTLLM_TP");
     Fixture fixture(true);
+    const std::string mtpPath = WriteMtpFixture(fixture, 64);
+    setenv("FASTLLM_QWEN4_ENABLE_MTP", "3", 1);
     SetNgramDevice("disk");
-    auto cpu = CreateLLMModelFromGGUFFile(fixture.files[0], "");
+    auto cpu = CreateLLMModelFromGGUFFile(fixture.files[0], "", mtpPath);
     SetDeviceMap({{"cuda:0", 1}}); SetMoeDeviceMap({{"cuda:0", 1}});
-    SetLayeredMoeDeviceMap({{"cpu", 1}}); SetMoeDeviceLayers(1);
+    SetLayeredMoeDeviceMap({{"cpu", 1}});
     setenv("FASTLLM_TP", "cuda:0,1", 1);
-    auto tp = CreateLLMModelFromGGUFFile(fixture.files[0], "");
-    for (int layer = 0; layer < 2; ++layer) for (int expert = 0; expert < 2; ++expert)
-    for (const std::string kind : {"gateup", "down"}) {
-        const std::string name = "model.language_model.layers." + std::to_string(layer) +
-            ".mlp.experts." + std::to_string(expert) + "." + kind + "_proj.weight";
-        Data &reference = cpu->weight[name], &weight = tp->weight[name];
-        Check(weight.dims == reference.dims && weight.ggmlType == reference.ggmlType,
-              "streaming TP changed parent weight metadata");
-        if (layer == 1) {
-            Check(!weight.multiDeviceData && weight.cpuData != nullptr,
-                  "streaming TP uploaded a CPU expert layer");
-            Check(std::memcmp(weight.cpuData, reference.cpuData, reference.GetBytes()) == 0,
-                  "streaming TP changed a CPU expert payload");
-            continue;
-        }
-        Check(weight.cpuData == nullptr && weight.multiDeviceDatas.size() == 2,
-              "GPU expert source was retained until warmup");
-        const size_t rowBytes = ggml_row_size((ggml_type)reference.ggmlType, reference.dims[1]);
-        for (int rank = 0; rank < 2; ++rank) {
-            Data &shard = *weight.multiDeviceDatas.at(rank);
-            Check(shard.dataDevice == DataDevice::CUDA && shard.cudaData && !shard.isFake,
-                  "streamed shard must own its CUDA allocation before rank preparation");
-            Bytes actual(shard.GetBytes()), expected;
-            FastllmCudaSetDevice(rank);
-            FastllmCudaCopyFromDeviceToHost(actual.data(), shard.cudaData, actual.size());
-            if (kind == "gateup") {
-                Check(shard.dims == std::vector<int>({64, 256}), "streamed gate/up shard shape");
-                for (int half = 0; half < 2; ++half) {
-                    const uint8_t *begin = reference.cpuData + (half * 64 + rank * 32) * rowBytes;
-                    expected.insert(expected.end(), begin, begin + 32 * rowBytes);
-                }
-            } else {
-                Check(shard.dims == std::vector<int>({256, 32}), "streamed down shard shape");
-                for (int row = 0; row < 256; ++row) {
-                    const uint8_t *begin = reference.cpuData + row * rowBytes + rank * rowBytes / 2;
-                    expected.insert(expected.end(), begin, begin + rowBytes / 2);
-                }
+    for (bool hostLastLayer : {true, false}) {
+        SetMoeDeviceLayers(hostLastLayer ? 1 : 0);
+        auto tp = CreateLLMModelFromGGUFFile(fixture.files[0], "", mtpPath);
+        for (int layer = 0; layer < 3; ++layer) for (int expert = 0; expert < 2; ++expert)
+        for (const std::string kind : {"gateup", "down"}) {
+            const std::string name = (layer == 2 ? "mtp.layers.0.mlp.experts." :
+                "model.language_model.layers." + std::to_string(layer) + ".mlp.experts.") +
+                std::to_string(expert) + "." + kind + "_proj.weight";
+            Data &reference = cpu->weight[name], &weight = tp->weight[name];
+            Check(weight.dims == reference.dims && weight.ggmlType == reference.ggmlType,
+                  "streaming TP changed parent weight metadata");
+            if (hostLastLayer && layer >= 1) {
+                Check(!weight.multiDeviceData && weight.cpuData != nullptr,
+                      "streaming TP uploaded a CPU expert layer");
+                Check(std::memcmp(weight.cpuData, reference.cpuData, reference.GetBytes()) == 0,
+                      "streaming TP changed a CPU expert payload");
+                continue;
             }
-            Check(actual == expected, "streaming TP changed packed expert shard bytes");
+            Check(weight.cpuData == nullptr && weight.multiDeviceDatas.size() == 2,
+                  "GPU expert source was retained until warmup");
+            const size_t rowBytes = ggml_row_size((ggml_type)reference.ggmlType, reference.dims[1]);
+            for (int rank = 0; rank < 2; ++rank) {
+                Data &shard = *weight.multiDeviceDatas.at(rank);
+                Check(shard.dataDevice == DataDevice::CUDA && shard.cudaData && !shard.isFake,
+                      "streamed shard must own its CUDA allocation before rank preparation");
+                Bytes actual(shard.GetBytes()), expected;
+                FastllmCudaSetDevice(rank);
+                FastllmCudaCopyFromDeviceToHost(actual.data(), shard.cudaData, actual.size());
+                if (kind == "gateup") {
+                    Check(shard.dims == std::vector<int>({64, 256}), "streamed gate/up shard shape");
+                    for (int half = 0; half < 2; ++half) {
+                        const uint8_t *begin = reference.cpuData + (half * 64 + rank * 32) * rowBytes;
+                        expected.insert(expected.end(), begin, begin + 32 * rowBytes);
+                    }
+                } else {
+                    Check(shard.dims == std::vector<int>({256, 32}), "streamed down shard shape");
+                    for (int row = 0; row < 256; ++row) {
+                        const uint8_t *begin = reference.cpuData + row * rowBytes + rank * rowBytes / 2;
+                        expected.insert(expected.end(), begin, begin + rowBytes / 2);
+                    }
+                }
+                Check(actual == expected, "streaming TP changed packed expert shard bytes");
+            }
         }
+        const std::vector<std::string> replicaNames = {"model.language_model.hyper_connection_mixer.input_mix_weight_up.weight",
+                "model.language_model.layers.0.attn_hyper_connection.input_mix_weight_down.weight",
+                "model.language_model.layers.1.attn_hyper_connection.input_mix_weight_down.weight",
+                "mtp.fc_hidden.weight"};
+        std::map<std::pair<std::string, int>, void *> replicaPointers;
+        for (const std::string &name : replicaNames) {
+            Data &source = tp->weight[name], &reference = cpu->weight[name];
+            Check(!source.cpuData && source.multiDeviceData && source.multiDeviceDatas.size() == 2,
+                  "replicated projection remained on CPU until warmup");
+            for (int device : {0, 1}) {
+                Data &replica = *source.multiDeviceDatas.at(device);
+                replicaPointers[{name, device}] = replica.cudaData;
+                Check(!replica.isFake && replica.cudaData && replica.dims == reference.dims &&
+                      replica.GetBytes() == reference.GetBytes(), "streamed replica ownership or shape");
+                Bytes actual(replica.GetBytes());
+                FastllmCudaSetDevice(device);
+                FastllmCudaCopyFromDeviceToHost(actual.data(), replica.cudaData, actual.size());
+                Check(std::memcmp(actual.data(), reference.cpuData, actual.size()) == 0,
+                      "streamed replica changed projection bytes");
+            }
+        }
+        // The loader calls this hook again after ordinary weights: it must be a no-op.
+        tp->OnWeightLoadGroupFinished();
+        const std::string embeddingName = "model.language_model.embed_tokens.weight";
+        auto *embeddingStorage = tp->weight[embeddingName].cpuData;
+        Check(embeddingStorage != nullptr, "missing shared CPU embedding");
+        Qwen4GGUFTestAccess::PrepareTp(*dynamic_cast<Qwen4ExpModel *>(tp.get()));
+        Qwen4GGUFTestAccess::PrepareTp(*dynamic_cast<Qwen4ExpModel *>(tp.get()));
+        for (const std::string &name : replicaNames) for (int device : {0, 1}) {
+            const Data &replica = *tp->weight[name].multiDeviceDatas.at(device);
+            Check(replica.isFake && replica.cudaData == replicaPointers.at({name, device}),
+                  "TP preparation copied or retained ownership of a streamed replica");
+        }
+        Check(tp->weight[embeddingName].cpuData == embeddingStorage &&
+              tp->weight[embeddingName].dataType == DATA_GGUF_FORMAT,
+              "TP preparation released or expanded a borrowed host embedding");
+        for (const std::string name : {"model.language_model.hyper_connection_mixer.hc_norm.weight",
+                                      "model.language_model.layers.1.ple.conv1d.weight"}) {
+            Check(tp->weight[name].cpuData == nullptr && tp->weight[name].cudaData == nullptr,
+                  "TP parent retained a replicated weight payload");
+        }
+        Check((tp->weight["model.language_model.layers.1.mlp.experts.0.down_proj.weight"].cpuData != nullptr) == hostLastLayer,
+              "TP preparation changed CPU expert placement");
+        Check((tp->weight["mtp.layers.0.mlp.experts.0.down_proj.weight"].cpuData != nullptr) == hostLastLayer,
+              "TP preparation changed MTP expert placement");
     }
-    // The loader calls this hook again after ordinary weights: it must be a no-op.
-    tp->OnWeightLoadGroupFinished();
     unsetenv("FASTLLM_TP");
     std::cout << "PASS: Qwen4 streaming TP expert load, released CPU sources and exact packed shards\n";
     return 0;

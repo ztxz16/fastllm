@@ -98,6 +98,7 @@ namespace fastllm {
         int threadTpRank = -1;
         void InitThreadTp();
         int StreamingThreadTpExpertLayer(const std::string &weightName) const;
+        int StreamingThreadTpReplicaLayer(const std::string &weightName) const;
         void PrepareThreadTp();
         void ThreadTpAllReduce(Data &data);
         bool ThreadTpAllTrue(bool value);

@@ -1449,6 +1449,7 @@ namespace fastllm {
         bool hostMoe = false;
         std::vector<bool> hostMoeLayers;
         int loadingExpertLayer = -1;
+        std::vector<std::string> loadingReplicas;
 #if defined(USE_CUDA) && !defined(USE_ROCM)
         std::shared_ptr<FastllmCudaMoeExpertParallel> expertParallel;
 #endif
@@ -1557,6 +1558,17 @@ namespace fastllm {
         }
         return scheme;
     }
+
+    static void Qwen4CopyTpReplica(const Data &source, Data &local, int device) {
+        FastllmCudaSetDevice(device);
+        local.CopyFrom(source);
+        local.isModelWeight = true;
+        local.weightType = source.weightType;
+        local.scales = source.scales;
+        local.blockK = source.blockK;
+        local.blockM = source.blockM;
+        local.ToDevice(DataDevice::CUDA, std::vector<int>{device});
+    }
 #endif
 
     int Qwen4ExpModel::StreamingThreadTpExpertLayer(const std::string &name) const {
@@ -1564,6 +1576,9 @@ namespace fastllm {
         const auto arch = weight.dicts.find("gguf_architecture");
         if (!threadTpState || threadTpRank >= 0 ||
             arch == weight.dicts.end() || arch->second != "qwen4exp") return -1;
+        if (Qwen4StartsWith(name, kMtpExpertPrefix)) {
+            return threadTpState->hostMoeLayers.back() ? -1 : block_cnt;
+        }
         const std::string prefix = languagePrefix + "layers.";
         if (!Qwen4StartsWith(name, prefix)) return -1;
         const char *start = name.c_str() + prefix.size();
@@ -1578,22 +1593,53 @@ namespace fastllm {
 #endif
     }
 
+    int Qwen4ExpModel::StreamingThreadTpReplicaLayer(const std::string &name) const {
+#ifdef USE_CUDA
+        const auto arch = weight.dicts.find("gguf_architecture");
+        if (!threadTpState || threadTpRank >= 0 ||
+            arch == weight.dicts.end() || arch->second != "qwen4exp" ||
+            (!Qwen4StartsWith(name, languagePrefix) && !Qwen4StartsWith(name, "mtp."))) return -1;
+        // These projections are replicated unchanged on every TP rank. Keep
+        // norms and lookup tables on the host for PrepareWeights and sharing.
+        if (!Qwen4EndsWith(name, ".input_mix_weight_down.weight") &&
+            !Qwen4EndsWith(name, ".input_mix_weight_up.weight") &&
+            !Qwen4EndsWith(name, ".block_inject_weight.weight") &&
+            !Qwen4EndsWith(name, ".mlp.gate.weight") &&
+            !Qwen4EndsWith(name, ".ple.key_proj.weight") &&
+            !Qwen4EndsWith(name, ".ple.value_proj.weight") &&
+            name != "mtp.fc_embedding.weight" && name != "mtp.fc_hidden.weight") return -1;
+        const std::string prefix = languagePrefix + "layers.";
+        if (!Qwen4StartsWith(name, prefix)) return block_cnt;
+        return std::atoi(name.c_str() + prefix.size());
+#else
+        return -1;
+#endif
+    }
+
     int Qwen4ExpModel::GetWeightLoadPriority(const std::string &tensorName,
             const std::vector<std::pair<std::string, DataType>> &) const {
         const int layer = StreamingThreadTpExpertLayer(tensorName);
-        return layer < 0 ? 0 : layer - block_cnt;
+        if (layer >= 0) return layer - block_cnt;
+        const int replicaLayer = StreamingThreadTpReplicaLayer(tensorName);
+        if (replicaLayer < 0) return 0;
+        return replicaLayer == block_cnt ? -block_cnt - 1 : replicaLayer - block_cnt;
     }
 
     bool Qwen4ExpModel::ShouldLoadWeightSeriallyBeforeOthers(const std::string &tensorName,
             const std::vector<std::pair<std::string, DataType>> &) const {
-        return StreamingThreadTpExpertLayer(tensorName) >= 0;
+        return StreamingThreadTpExpertLayer(tensorName) >= 0 ||
+            StreamingThreadTpReplicaLayer(tensorName) >= 0;
     }
 
     void Qwen4ExpModel::OnWeightLoadGroupStarted(const std::set<std::string> &names) {
         if (!threadTpState) return;
         int &current = threadTpState->loadingExpertLayer;
         current = -1;
+        threadTpState->loadingReplicas.clear();
         for (const auto &name : names) {
+            if (StreamingThreadTpReplicaLayer(name) >= 0) {
+                threadTpState->loadingReplicas.push_back(name);
+            }
             const int layer = StreamingThreadTpExpertLayer(name);
             if (layer < 0) continue;
             AssertInFastLLM(current < 0 || current == layer,
@@ -1604,30 +1650,49 @@ namespace fastllm {
 
     void Qwen4ExpModel::OnWeightLoadGroupFinished() {
 #ifdef USE_CUDA
-        if (!threadTpState || threadTpState->loadingExpertLayer < 0) return;
+        if (!threadTpState || (threadTpState->loadingExpertLayer < 0 &&
+                              threadTpState->loadingReplicas.empty())) return;
         const int layer = std::exchange(threadTpState->loadingExpertLayer, -1);
+        std::vector<std::string> replicas;
+        replicas.swap(threadTpState->loadingReplicas);
         auto &devices = threadTpState->devices;
-        const int previousDevice = FastllmCudaGetDevice();
+        Qwen4CudaDeviceGuard deviceGuard;
         // The loader has joined all readers and finished gate/up merging.
         // Upload one layer before reading the next; the parent owns the shards
         // until PrepareThreadTp transfers them to rank models. Splitting again
         // there reuses these shards without retaining or rereading CPU payloads.
-        for (int expert = 0; expert < num_experts; ++expert) {
-            const std::string prefix = languagePrefix + "layers." + std::to_string(layer) +
-                ".mlp.experts." + std::to_string(expert) + ".";
+        for (int expert = 0; layer >= 0 && expert < num_experts; ++expert) {
+            const std::string prefix = (layer == block_cnt ? kMtpExpertPrefix :
+                languagePrefix + "layers." + std::to_string(layer) + ".mlp.experts.") +
+                std::to_string(expert) + ".";
             Data &gate = weight.weight.at(prefix + "gateup_proj.weight");
             Data &down = weight.weight.at(prefix + "down_proj.weight");
             AssertInFastLLM(gate.dims.size() == 2 && down.dims.size() == 2,
                             "Qwen4 TP streaming expert has an invalid shape.");
             for (int axis : {0, 1}) {
                 Data &source = axis == 0 ? gate : down;
-                auto scheme = Qwen4ExpertTpDivision(source, down, devices, axis, layer);
+                auto scheme = Qwen4ExpertTpDivision(source, down, devices, axis,
+                                                    std::min(layer, block_cnt - 1));
                 Data bias;
                 AssertInFastLLM(SplitMultiCudaWeight(source, bias, devices, scheme, axis, true),
                                 "Qwen4 TP failed to stream " + source.name);
             }
         }
-        FastllmCudaSetDevice(previousDevice);
+        for (const std::string &name : replicas) {
+            Data &source = weight.weight.at(name);
+            AssertInFastLLM(source.cpuData && !source.multiDeviceData &&
+                            source.multiDeviceDatas.empty() && source.dims.size() == 2,
+                            "Qwen4 TP streaming replica has an invalid source: " + name);
+            // Own each completed replica even if a later allocation fails.
+            source.multiDeviceData = true;
+            for (int device : devices) {
+                auto local = std::make_unique<Data>();
+                Qwen4CopyTpReplica(source, *local, device);
+                source.multiDeviceDatas.emplace(device, local.get());
+                local.release();
+            }
+            source.FreeSpace();
+        }
 #if defined(__GLIBC__)
         malloc_trim(0);
 #endif
@@ -1920,21 +1985,25 @@ namespace fastllm {
                                        : equalScheme(source.dims[1]);
                 }
             }
+            const std::vector<int> originalDims = source.dims;
             if (axis >= 0) {
-                const std::vector<int> originalDims = source.dims;
                 if (source.dims.size() != 2) source.Reshape({source.dims[0], (int)source.Count(1)});
                 Data bias;
                 // Explicit head ranges must not be rotated by layer balancing.
                 bool compact = source.dataType == DataType::NVFP4_BLOCK_16_E4M3;
                 AssertInFastLLM(SplitMultiCudaWeight(source, bias, devices, scheme, axis, true, compact),
                                 "Qwen4 TP failed to split " + name);
+            }
+            if (source.multiDeviceData) {
+                // Both split weights and streamed replicas transfer their
+                // allocations to ranks without a CPU round trip.
                 for (int r = 0; r < count; ++r) {
                     Data *shard = source.multiDeviceDatas.at(devices[r]);
                     Data &local = tp.ranks[r]->weight[name];
                     local = *shard; // Transfer allocation ownership to the rank.
                     shard->isFake = true;
                     local.ClearTensorParallelLayout();
-                    if (originalDims.size() != 2) {
+                    if (axis >= 0 && originalDims.size() != 2) {
                         std::vector<int> dims = originalDims;
                         dims[0] = local.dims[0];
                         local.Reshape(dims);
@@ -1943,16 +2012,12 @@ namespace fastllm {
             } else {
                 source.ToDevice(DataDevice::CPU);
                 for (int r = 0; r < count; ++r) {
-                    FastllmCudaSetDevice(devices[r]);
-                    Data &local = tp.ranks[r]->weight[name];
-                    local.CopyFrom(source);
-                    local.isModelWeight = true;
-                    local.weightType = source.weightType;
-                    local.scales = source.scales;
-                    local.blockK = source.blockK;
-                    local.blockM = source.blockM;
-                    local.ToDevice(DataDevice::CUDA, std::vector<int>{devices[r]});
+                    Qwen4CopyTpReplica(source, tp.ranks[r]->weight[name], devices[r]);
                 }
+                // Rank-local copies own their CUDA storage. Host lookup tables
+                // shared by reference took the early continue above; no rank
+                // needs this replicated weight's parent CPU payload anymore.
+                source.FreeSpace();
             }
             if (source.dataType == DataType::NVFP4_BLOCK_16_E4M3 &&
                 expertWeight) {
@@ -1971,6 +2036,10 @@ namespace fastllm {
             }
         }
         FastllmCudaSetDevice(devices.front());
+#if defined(__GLIBC__)
+        // Return released TP source allocations before prefill warmup peaks.
+        malloc_trim(0);
+#endif
         std::printf("[Qwen4 TP] %d ranks ready (linear heads %d/%d, Q/KV heads %d/%d per rank).\n",
                     count, num_k_heads / count, num_v_heads / count,
                     num_attention_heads / count, std::max(1, num_key_value_heads / count));
@@ -12947,6 +13016,9 @@ namespace fastllm {
             throw;
         }
         ClearWarmupCache(cache);
+#if defined(__GLIBC__)
+        if (threadTpState) malloc_trim(0);
+#endif
         std::printf("finish.\n");
     }
 
