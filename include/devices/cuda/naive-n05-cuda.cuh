@@ -99,6 +99,18 @@ void FastllmCudaNaiveDraftAttention(const fastllm::Data &query,
     const fastllm::Data &liveKeys, int heads, int kvHeads, int dim, int window,
     bool shortAttention, fastllm::Data &scores, fastllm::Data &output);
 
+// Greedy Markov proposals retain token ids on the GPU between steps. The
+// argmax preserves the existing TopK(..., 1) tie order and BF16 addition.
+void FastllmCudaNaiveDraftEmbedding(const fastllm::Data &ids, int step,
+    const fastllm::Data &weight, fastllm::Data &latent);
+void FastllmCudaNaiveDraftArgmax(const fastllm::Data &base,
+    const fastllm::Data &bias, int step, fastllm::Data &partial,
+    fastllm::Data &ids);
+// Join leading rows of dense, equal-width BF16 features on the current GPU.
+// Unsupported layouts return false before modifying output.
+bool FastllmCudaNaiveDraftConcat(const std::vector<const fastllm::Data *> &inputs,
+    int rows, fastllm::Data &output);
+
 // NUMA FP8 weights are row-packed [128 E4M3 bytes, FP32 scale]. Gate/up
 // output rows are interleaved. Route ids index the original [token, top-k].
 struct FastllmNaiveFP8ExpertTask {

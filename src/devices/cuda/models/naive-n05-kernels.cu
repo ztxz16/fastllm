@@ -2086,6 +2086,128 @@ void FastllmCudaNaiveAppendVerifyCache(fastllm::Data &key, fastllm::Data &value,
     CheckLaunch();
 }
 
+namespace {
+__global__ void DraftEmbedding(const float *ids, int step, const BF16 *weight,
+                               BF16 *latent, int width) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col < width) latent[col] = weight[(size_t)(int)ids[step] * width + col];
+}
+
+// The original Top1 folds lanes at offsets 128,64,...,1, retaining its left
+// operand on equality. Thus ties prefer bit-reversed lane order, then the
+// first vocabulary entry visited by that lane (stride 256).
+__device__ bool DraftBetter(float score, int id, float best, int bestId) {
+    if (score != best) return score > best;
+    unsigned rank = __brev((unsigned)id & 255u), bestRank = __brev((unsigned)bestId & 255u);
+    return rank < bestRank || (rank == bestRank && id < bestId);
+}
+__device__ void DraftWarpMax(float &score, int &id) {
+    for (int offset = 16; offset; offset >>= 1) {
+        float other = __shfl_down_sync(0xffffffffu, score, offset);
+        int otherId = __shfl_down_sync(0xffffffffu, id, offset);
+        if ((threadIdx.x & 31) + offset < 32 && DraftBetter(other, otherId, score, id)) {
+            score = other; id = otherId;
+        }
+    }
+}
+__device__ void DraftBlockMax(float &score, int &id) {
+    __shared__ float scores[8];
+    __shared__ int ids[8];
+    DraftWarpMax(score, id);
+    int lane = threadIdx.x & 31, warp = threadIdx.x / 32;
+    if (!lane) { scores[warp] = score; ids[warp] = id; }
+    __syncthreads();
+    if (!warp) {
+        score = lane < 8 ? scores[lane] : -INFINITY;
+        id = lane < 8 ? ids[lane] : INT_MAX;
+        DraftWarpMax(score, id);
+    }
+}
+__global__ void DraftArgmaxPartial(const BF16 *base, const BF16 *bias,
+                                  float2 *partial, int vocab) {
+    float best = -INFINITY;
+    int bestId = INT_MAX;
+    for (int i = blockIdx.x * 1024 + threadIdx.x;
+         i < min((int)(blockIdx.x + 1) * 1024, vocab); i += 256) {
+        float score = RoundBF16(__bfloat162float(base[i]) + __bfloat162float(bias[i]));
+        // Like the original per-lane scan, ignore NaN and -infinity.
+        if (score > -INFINITY && DraftBetter(score, i, best, bestId)) {
+            best = score; bestId = i;
+        }
+    }
+    DraftBlockMax(best, bestId);
+    if (!threadIdx.x) partial[blockIdx.x] = make_float2((float)bestId, best);
+}
+__global__ void DraftArgmaxFinish(const float2 *partial, int count,
+                                 float *ids, int step) {
+    float best = -INFINITY;
+    int bestId = INT_MAX;
+    for (int i = threadIdx.x; i < count; i += 256) {
+        float2 item = partial[i];
+        // INT_MAX is not exactly representable as float; empty tiles use
+        // their score to avoid converting that sentinel back to int.
+        if (item.y > -INFINITY && DraftBetter(item.y, (int)item.x, best, bestId)) {
+            best = item.y; bestId = (int)item.x;
+        }
+    }
+    DraftBlockMax(best, bestId);
+    if (!threadIdx.x) ids[step + 1] = bestId == INT_MAX ? 0.0f : (float)bestId;
+}
+struct DraftHiddenInputs { const BF16 *ptr[32]; };
+__global__ void DraftConcat(DraftHiddenInputs inputs, BF16 *output,
+                            int rows, int width, int count) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = (size_t)rows * width * count;
+    if (index < total) {
+        int column = index % width;
+        int layer = (index / width) % count;
+        int row = index / ((size_t)width * count);
+        output[index] = inputs.ptr[layer][(size_t)row * width + column];
+    }
+}
+}
+
+void FastllmCudaNaiveDraftEmbedding(const fastllm::Data &ids, int step,
+    const fastllm::Data &weight, fastllm::Data &latent) {
+    const int width = weight.dims[1];
+    Output(latent, fastllm::BFLOAT16, {1, 1, width});
+    DraftEmbedding<<<(width + 255) / 256, 256>>>((const float *)ids.cudaData,
+        step, (const BF16 *)weight.cudaData, (BF16 *)latent.cudaData, width);
+    CheckLaunch();
+}
+void FastllmCudaNaiveDraftArgmax(const fastllm::Data &base,
+    const fastllm::Data &bias, int step, fastllm::Data &partial, fastllm::Data &ids) {
+    const int vocab = base.dims.back(), blocks = (vocab + 1023) / 1024;
+    Output(partial, fastllm::FLOAT32, {blocks, 2});
+    DraftArgmaxPartial<<<blocks, 256>>>((const BF16 *)base.cudaData + (size_t)step * vocab,
+        (const BF16 *)bias.cudaData, (float2 *)partial.cudaData, vocab);
+    DraftArgmaxFinish<<<1, 256>>>((const float2 *)partial.cudaData, blocks,
+        (float *)ids.cudaData, step);
+    CheckLaunch();
+}
+bool FastllmCudaNaiveDraftConcat(const std::vector<const fastllm::Data *> &inputs,
+    int rows, fastllm::Data &output) {
+    if (inputs.empty() || inputs.size() > 32 || rows <= 0) return false;
+    int width = inputs[0]->dims.empty() ? 0 : inputs[0]->dims.back();
+    if (width <= 0) return false;
+    const std::vector<int> deviceIds{FastllmCudaGetDevice()};
+    DraftHiddenInputs pointers{};
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        const auto &x = *inputs[i];
+        if (x.dataType != fastllm::BFLOAT16 || x.dims.size() != 3 || x.dims[0] != 1 ||
+            x.dims[1] < rows || x.dims[2] != width || x.dataDevice != fastllm::DataDevice::CUDA ||
+            x.dataDeviceIds != deviceIds || !x.cudaData || x.strides.size() != 3 ||
+            x.strides[1] != width || x.strides[2] != 1) return false;
+        pointers.ptr[i] = (const BF16 *)x.cudaData;
+    }
+    Output(output, fastllm::BFLOAT16, {1, rows, width * (int)inputs.size()});
+    size_t total = (size_t)rows * width * inputs.size();
+    DraftConcat<<<(total + 255) / 256, 256>>>(pointers, (BF16 *)output.cudaData,
+        rows, width, inputs.size());
+    CheckLaunch();
+    return true;
+}
+
 void FastllmCudaNaiveDraftInput(const fastllm::Data &id, const fastllm::Data &embedding,
         const fastllm::Data &mask, const fastllm::Data &liveKeys, int rows,
         fastllm::Data &hidden, fastllm::Data &positions) {

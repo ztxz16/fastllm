@@ -561,6 +561,11 @@ class DraftFixture : public NaiveN05FlashModel {
         add("model.embed_tokens.weight", {256, 256});
         add("dspark.mask_embedding", {256});
         add("dspark.norm.weight", {256}, true);
+        add("dspark.markov_head.markov_w1.weight", {513, 256});
+        add("dspark.markov_head.markov_w2.weight", {513, 256});
+        draftTargetLayers = {0, 1};
+        add("dspark.fc.weight", {256, 512});
+        add("dspark.hidden_norm.weight", {256}, true);
         for (int i = 0; i < draftLayers; ++i) {
             std::string p = "dspark.layers." + std::to_string(i) + ".";
             add(p + "input_layernorm.weight", {256}, true);
@@ -615,15 +620,55 @@ class DraftFixture : public NaiveN05FlashModel {
                     throw std::runtime_error("draft backbone differs from eager");
                 if (candidate->committed != reference->committed)
                     throw std::runtime_error("draft proposal changed committed length");
+                Data base(BFLOAT16, {1, draftBlock, 513});
+                base.Allocate();
+                for (int i = 0; i < base.Count(0); ++i)
+                    ((uint16_t *)base.cpuData)[i] = Float32ToBFloat16RNEBits(std::sin((i + round + prefix) * .019f));
+                base.ToDevice(DataDevice::CUDA, std::vector<int>{0});
+                std::vector<int> expectedIds, actualIds;
+                int previous = 11 + round;
+                for (int step = 0; step < draftBlock; ++step) {
+                    Data id(FLOAT32, {1, 1}, {(float)previous}), latent, bias, logits, top;
+                    Embedding(id, weight["dspark.markov_head.markov_w1.weight"], latent);
+                    ToDataType(latent, BFLOAT16);
+                    Linear(latent, weight["dspark.markov_head.markov_w2.weight"], Data(), bias);
+                    Split(base, 1, step, step + 1, logits);
+                    AddTo(logits, bias); ToDataType(logits, FLOAT32); TopK(logits, top, 1);
+                    top.ToDevice(DataDevice::CPU);
+                    previous = (int)((float *)top.cpuData)[0]; expectedIds.push_back(previous);
+                }
+                bool proposalGraph = RunDraftProposalGraph(11 + round, base, *candidate, actualIds);
+                if (!failVerifyBegin && !failVerifyInstantiate) {
+                    if (!proposalGraph || actualIds != expectedIds)
+                        throw std::runtime_error("GPU proposal chain differs from eager");
+                } else if (proposalGraph) throw std::runtime_error("failed proposal graph did not fall back");
+                Data tail;
+                Split(base, 1, 0, draftBlock - 1, tail);
+                if (RunDraftProposalGraph(11, tail, *candidate, actualIds))
+                    throw std::runtime_error("incomplete proposal block did not fall back");
                 for (int layer = 0; layer < draftLayers; ++layer) {
                     if (read(candidate->kv[layer].first) != read(reference->kv[layer].first) ||
                         read(candidate->kv[layer].second) != read(reference->kv[layer].second))
                         throw std::runtime_error("draft proposal changed visible KV");
                 }
-                int accepted = round + 1;
+                int accepted = round == 3 ? 8 : round + 1;
                 Data next = hidden(accepted, round + prefix);
-                AppendDraftContext(next, candidate->committed, *candidate);
-                AppendDraftContext(next, reference->committed, *reference);
+                TargetCapture capture;
+                capture.hidden.emplace(0, next);
+                capture.hidden.emplace(1, hidden(accepted, round + prefix + 17));
+                Data joined, projected, normed;
+                Cat(capture.hidden.at(0), capture.hidden.at(1), -1, joined);
+                if (accepted > 1) MatMulTransB(joined, weight["dspark.fc.weight"], projected);
+                else Linear(joined, weight["dspark.fc.weight"], Data(), projected);
+                KimiK3RMSNorm(projected, weight["dspark.hidden_norm.weight"], draftEps, normed);
+                std::vector<std::pair<Data, Data>> unused;
+                CommitDraftContext(capture, accepted, *candidate, unused);
+                AppendDraftContext(normed, reference->committed, *reference);
+                for (int layer = 0; layer < draftLayers; ++layer) {
+                    if (read(candidate->kv[layer].first) != read(reference->kv[layer].first) ||
+                        read(candidate->kv[layer].second) != read(reference->kv[layer].second))
+                        throw std::runtime_error("draft commit workspace changed KV");
+                }
                 ++checks;
             }
             // Exercise the same bounded storage transfer as request removal.

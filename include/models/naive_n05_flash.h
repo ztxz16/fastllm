@@ -93,6 +93,8 @@ namespace fastllm {
                                 std::vector<std::pair<Data, Data>> &kv);
         std::shared_ptr<DraftContext> CreateDraftContext();
         bool RunDraftGraph(int anchor, DraftContext &context, Data &output);
+        bool RunDraftProposalGraph(int anchor, const Data &baseLogits,
+                                   DraftContext &context, std::vector<int> &proposed);
         Data RunDraft(int anchor, DraftContext &context);
         void ApplyDraftDevice();
         Data &DraftWeight(const std::string &name);
