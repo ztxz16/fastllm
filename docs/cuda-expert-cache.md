@@ -155,6 +155,10 @@ budget by their heat gain over an eligible resident in the same physical slot
 partition. There is no rotating layer eligibility or one-admission-per-layer
 limit. Copies run on an admission stream after current cache readers finish;
 subsequent cache users wait for the payload and residency publication together.
+Candidate and resident ordering is maintained incrementally in indexed heaps.
+Decode does not sort all candidates or rebuild resident indices every token.
+Scores retain the same float decay and cutoff; in-place heap repairs preserve
+expert/slot tie ordering when decay rounds previously different scores together.
 Prefill retains its bulk admission path. MTP verification, thread-TP expert
 parallelism and non-GGUF adapters keep their existing admission policies.
 

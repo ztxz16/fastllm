@@ -164,6 +164,53 @@ static void TestFrequencyHotSetChange() {
     }
 }
 
+static void TestFrequencyIndexUpdates() {
+    using fastllm::MoeCacheConfig;
+    using fastllm::MoeFrequencyPolicy;
+    // Decay can collapse different float scores to the same zero. The coldest
+    // slot must then follow the original slot-ID tie break, not heap history.
+    MoeCacheConfig config;
+    config.halfLife = 1.0f / 128;
+    config.replacementMargin = 0;
+    config.maxReplacements = 1;
+    MoeFrequencyPolicy ties({0,0,0,0}, {0,0}, 1, config);
+    int owners[] = {0,1}; ties.SetResidents(owners);
+    int hot = 0, miss = 3;
+    ties.BeginStep(); ties.Observe(0, &hot, 1); ties.EndStep();
+    Require(ties.Score(0) == 0, "tiny half-life did not collapse heat");
+    ties.BeginStep(); ties.Observe(0, &miss, 1);
+    auto plan = ties.EndStep();
+    Require(plan.size() == 1 && plan[0].slot == 0,
+            "decay ties retained the previous cold-slot order");
+    // All candidate scores have also collapsed; equal new observations must
+    // recover the expert-ID ordering regardless of previous heap positions.
+    ties.BeginStep(); int equal[] = {2,0}; ties.Observe(0, equal, 2);
+    plan = ties.EndStep();
+    Require(plan.size() == 1 && plan[0].key == 0 && plan[0].slot == 0,
+            "candidate score update did not restore deterministic ties");
+
+    config.halfLife = 0;
+    MoeFrequencyPolicy prefill(std::vector<int>(9,0), std::vector<int>(6,0), 1, config);
+    int initial[] = {0,1,2,3,4,5}; prefill.SetResidents(initial);
+    // Protect several cold ancestors. Search must still find the coldest
+    // unprotected descendant, and later score changes must move it both ways.
+    prefill.ObservePrefill(0, {1,2,3,4,5,6,128,0,0}, 128);
+    auto a = prefill.SelectPrefill(6, 0, {1,1,1,0,0,0,1,0,0});
+    Require(a.key == 6 && a.slot == 3, "protected prefill heap ancestors hid a cold descendant");
+    prefill.Admit(0, a);
+    prefill.ObservePrefill(0, std::vector<int>(9,0), 4096);
+    prefill.ObservePrefill(7, {128}, 128);
+    a = prefill.SelectPrefill(7, 7, {1});
+    Require(a.key == 7 && a.slot == 0, "prefill score decrease left a stale resident order");
+    prefill.Admit(0, a);
+    // A residency refresh must repopulate candidates that were previously
+    // resident, without losing their scores or depending on heap positions.
+    prefill.SetResidents(initial);
+    prefill.ObservePrefill(8, {64}, 128);
+    a = prefill.SelectPrefill(7, 7, {1,1});
+    Require(a.key == 7 && a.slot == 0, "residency refresh lost a former resident candidate");
+}
+
 static void TestDecodeOverlap() {
     fastllm::MoeDecodeOverlapScheduler p;
     Require(p.SelectMisses(0, 10) == 0, "all-hit layer requested PCIe work");
@@ -275,6 +322,7 @@ int main() {
     TestFrequencyAdmission();
     TestPrefillAdmission();
     TestFrequencyHotSetChange();
+    TestFrequencyIndexUpdates();
     TestDecodeOverlap();
     TestParallelOverlap();
     using fastllm::MoeDecodePolicy;
