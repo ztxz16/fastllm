@@ -900,6 +900,10 @@ if (UNIT_TEST)
         add_executable(qwen4_gguf_test test/basic/test_qwen4_gguf.cpp)
         target_link_libraries(qwen4_gguf_test PRIVATE fastllm)
         fastllm_add_checked_test(qwen4_gguf qwen4_gguf_test "PASS: Qwen4 three-shard GGUF" 60)
+        add_executable(disk_embedding_reader_test test/basic/test_disk_embedding_reader.cpp)
+        target_link_libraries(disk_embedding_reader_test PRIVATE fastllm)
+        fastllm_add_checked_test(disk_embedding_reader disk_embedding_reader_test
+            "PASS disk embedding reader" 60)
         if (USE_CUDA AND NOT USE_ROCM)
             fastllm_add_checked_test(qwen4_gguf_tp_load qwen4_gguf_test
                 "PASS: Qwen4 streaming TP expert load" 60 --tp-load)

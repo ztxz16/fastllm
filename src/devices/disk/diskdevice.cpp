@@ -1196,6 +1196,166 @@ namespace fastllm {
         return nullptr;
     }
 
+    struct DiskEmbeddingRowReader::Impl {
+        struct Part {
+            DiskWeightPart metadata;
+            size_t first, count, rowBytes;
+        };
+        struct Batch {
+            std::vector<int32_t> rows;
+            std::vector<uint8_t> bytes;
+            std::vector<std::pair<size_t, size_t>> duplicates;
+            std::promise<std::vector<uint8_t>> promise;
+            size_t remaining = 0;
+            std::exception_ptr error;
+        };
+        std::vector<Part> parts;
+        DataType type;
+        size_t rowBytes, rows;
+        int columns;
+        std::vector<int32_t> tags;
+        std::vector<uint8_t> cache;
+        mutable std::mutex mutex;
+        std::condition_variable ready;
+        std::deque<std::pair<std::shared_ptr<Batch>, size_t>> queue;
+        std::vector<std::thread> workers;
+        bool stopping = false;
+        Stats stats;
+
+        Impl(const Data &weight, size_t budget, int threads)
+            : type(weight.dataType), rowBytes(DiskTypeRowBytes(type, weight.dims.at(1), weight)),
+              rows(weight.dims.at(0)), columns(weight.dims.at(1)) {
+            AssertInFastLLM(weight.isDiskWeight && weight.dims.size() == 2 &&
+                            rowBytes > 0 && threads > 0,
+                            "Disk embedding reader metadata is invalid.\n");
+            size_t first = 0;
+            for (const auto &part : weight.diskWeightParts) {
+                if (part.isScalePart) continue;
+                const size_t count = DiskPartRows(part);
+                parts.push_back({part, first, count,
+                    DiskTypeRowBytes(part.sourceDataType, columns, weight)});
+                first += count;
+            }
+            AssertInFastLLM(first == rows, "Disk embedding reader shard rows mismatch.\n");
+            const size_t slots = std::min(rows, budget / (rowBytes + sizeof(int32_t)));
+            tags.assign(slots, -1);
+            cache.resize(slots * rowBytes);
+            stats.cacheBytes = slots * (rowBytes + sizeof(int32_t));
+            try {
+                for (int i = 0; i < threads; ++i) workers.emplace_back([this] { Work(); });
+            } catch (...) {
+                Stop();
+                throw;
+            }
+        }
+        ~Impl() { Stop(); }
+        void Stop() {
+            { std::lock_guard<std::mutex> lock(mutex); stopping = true; }
+            ready.notify_all();
+            for (auto &worker : workers) if (worker.joinable()) worker.join();
+        }
+        size_t Slot(int32_t row) const {
+            return (size_t)row % tags.size();
+        }
+        void Read(int32_t row, uint8_t *dst) {
+            for (const auto &part : parts) {
+                if ((size_t)row < part.first || (size_t)row - part.first >= part.count) continue;
+                const uint64_t offset = ((size_t)row - part.first) * part.rowBytes;
+                if (part.metadata.sourceDataType == type) {
+                    ReadDiskPartRange(part.metadata, offset, part.rowBytes, dst);
+                } else {
+                    std::vector<uint8_t> source(part.rowBytes);
+                    ReadDiskPartRange(part.metadata, offset, part.rowBytes, source.data());
+                    ConvertDiskPart(dst, type, source.data(), part.metadata.sourceDataType, columns);
+                }
+                return;
+            }
+            ErrorInFastLLM("Disk embedding reader row is out of bounds.\n");
+        }
+        void Complete(Batch &batch) {
+            if (batch.error) {
+                batch.promise.set_exception(batch.error);
+            } else {
+                for (const auto &copy : batch.duplicates) {
+                    memcpy(batch.bytes.data() + copy.first * rowBytes,
+                           batch.bytes.data() + copy.second * rowBytes, rowBytes);
+                }
+                batch.promise.set_value(std::move(batch.bytes));
+            }
+        }
+        void Work() {
+            while (true) {
+                std::shared_ptr<Batch> batch;
+                size_t index;
+                {
+                    std::unique_lock<std::mutex> lock(mutex);
+                    ready.wait(lock, [&] { return stopping || !queue.empty(); });
+                    if (queue.empty()) return;
+                    batch = queue.front().first;
+                    index = queue.front().second;
+                    queue.pop_front();
+                }
+                uint8_t *dst = batch->bytes.data() + index * rowBytes;
+                std::exception_ptr error;
+                try { Read(batch->rows[index], dst); }
+                catch (...) { error = std::current_exception(); }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    ++stats.reads;
+                    if (error) {
+                        if (!batch->error) batch->error = error;
+                    } else if (!tags.empty()) {
+                        const size_t slot = Slot(batch->rows[index]);
+                        memcpy(cache.data() + slot * rowBytes, dst, rowBytes);
+                        tags[slot] = batch->rows[index];
+                    }
+                    if (--batch->remaining == 0) Complete(*batch);
+                }
+            }
+        }
+    };
+
+    DiskEmbeddingRowReader::DiskEmbeddingRowReader(const Data &weight, size_t cacheBytes, int threads)
+        : impl(new Impl(weight, cacheBytes, threads)) {}
+    DiskEmbeddingRowReader::~DiskEmbeddingRowReader() = default;
+    size_t DiskEmbeddingRowReader::RowBytes() const { return impl->rowBytes; }
+    DiskEmbeddingRowReader::Stats DiskEmbeddingRowReader::GetStats() const {
+        std::lock_guard<std::mutex> lock(impl->mutex);
+        return impl->stats;
+    }
+    DiskEmbeddingRowReader::Ticket DiskEmbeddingRowReader::ReadAsync(const std::vector<int32_t> &rows) {
+        auto batch = std::make_shared<Impl::Batch>();
+        batch->rows = rows;
+        AssertInFastLLM(rows.size() <= std::numeric_limits<size_t>::max() / impl->rowBytes,
+                        "Disk embedding reader batch is too large.\n");
+        batch->bytes.resize(rows.size() * impl->rowBytes);
+        Ticket ticket{rows, batch->promise.get_future().share()};
+        // Validate before publishing any work, including on error paths.
+        for (int32_t row : rows) AssertInFastLLM(row >= 0 && (size_t)row < impl->rows,
+                                               "Disk embedding reader invalid row.\n");
+        std::unordered_map<int32_t, size_t> previous;
+        {
+            std::lock_guard<std::mutex> lock(impl->mutex);
+            impl->stats.requests += rows.size();
+            for (size_t i = 0; i < rows.size(); ++i) {
+                auto inserted = previous.emplace(rows[i], i);
+                if (!inserted.second) {
+                    batch->duplicates.emplace_back(i, inserted.first->second);
+                } else if (!impl->tags.empty() && impl->tags[impl->Slot(rows[i])] == rows[i]) {
+                    memcpy(batch->bytes.data() + i * impl->rowBytes,
+                           impl->cache.data() + impl->Slot(rows[i]) * impl->rowBytes, impl->rowBytes);
+                    ++impl->stats.hits;
+                } else {
+                    impl->queue.emplace_back(batch, i);
+                    ++batch->remaining;
+                }
+            }
+            if (batch->remaining == 0) impl->Complete(*batch);
+        }
+        impl->ready.notify_all();
+        return ticket;
+    }
+
     void DiskEmbeddingOp::Reshape(const std::string &opType, const DataDict &datas,
                                   const FloatDict &floatParams, const IntDict &intParams) {
         Data &input = *(datas.find("input")->second);

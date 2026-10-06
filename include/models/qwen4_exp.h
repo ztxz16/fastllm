@@ -6,6 +6,7 @@
 #define FASTLLM_QWEN4_EXP_H
 
 #include "qwen3_next.h"
+#include "devices/disk/diskdevice.h"
 
 #include <atomic>
 #include <cstdint>
@@ -353,6 +354,7 @@ namespace fastllm {
         // Logical concatenation of the lazy shard metadata used by the
         // standard disk EmbeddingDirect operation.
         Data pleNgramDiskWeight;
+        std::shared_ptr<DiskEmbeddingRowReader> pleDiskReader;
         // Host QSA compression must not move the device normalization weights.
         std::map<int, std::vector<float>> qsaKeyNormValues;
         std::vector<Data *> mtpMoeWeights;
@@ -411,12 +413,15 @@ namespace fastllm {
                                  Data &normalized,
                                  Data *normalizedStorage = nullptr);
 
+        int64_t PLEHashRow(const int *shifted, int head) const;
         void RunPLE(const Data &hyperInput, const Data &inputIds,
                     RequestState &state, Data &output,
-                    const std::vector<int> *hostInputTokens = nullptr);
+                    const std::vector<int> *hostInputTokens = nullptr,
+                    const DiskEmbeddingRowReader::Ticket *prefetched = nullptr);
         void RunThreadTpPLE(const Data &hyperInput, const Data &inputIds,
                     RequestState &state, Data &output,
-                    const std::vector<int> *hostInputTokens);
+                    const std::vector<int> *hostInputTokens,
+                    const DiskEmbeddingRowReader::Ticket *prefetched = nullptr);
         void MaterializePLEHostHistory(RequestState &state);
         void BuildQSAMask(int layer, const std::string &attentionPrefix,
                           const Data &input,

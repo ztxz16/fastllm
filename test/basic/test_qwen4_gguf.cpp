@@ -291,6 +291,60 @@ struct Qwen4GGUFTestAccess {
     static void Prepare(Qwen4ExpModel &m) { m.PrepareWeights(); }
     static void PrepareTp(Qwen4ExpModel &m) { m.PrepareThreadTp(); }
     static bool HasMtp(const Qwen4ExpModel &m) { return m.HasMtpWeights(); }
+    static void CheckPlePrefetch(Qwen4ExpModel &m) {
+        static_cast<Executor *>(GetExecutor())->SetFirstDevice("cpu");
+        const std::string prefix = "model.language_model.layers.1.ple.";
+        const int channels = m.hcCount * m.embed_dim;
+        auto add = [&](const std::string &name, const std::vector<int> &dims, bool norm) {
+            m.weight.AddEmptyWeight(prefix + name, dims, FLOAT32);
+            Data &w = m.weight[prefix + name]; w.Allocate();
+            for (uint64_t i = 0; i < w.Count(0); ++i)
+                ((float*)w.cpuData)[i] = norm ? 1.0f : ((int)(i % 31) - 15) * .0005f;
+        };
+        add("key_proj.weight", {channels, m.pleEmbedDim}, false);
+        add("value_proj.weight", {m.embed_dim, m.pleEmbedDim}, false);
+        for (const char *name : {"norm_key.weight", "norm_query.weight", "norm_conv.weight"})
+            add(name, {channels}, true);
+        auto reader = m.pleDiskReader;
+        Check(reader != nullptr, "PLE reader was not initialized");
+        Qwen4ExpModel::RequestState oldState, newState;
+        for (const std::vector<int> tokens : {std::vector<int>{1, 6, 3, 4}, {5}, {6}, {2}, {9, 8, 7}}) {
+            std::vector<float> ids(tokens.begin(), tokens.end());
+            Data input(FLOAT32, {1, (int)tokens.size()}, ids);
+            std::vector<float> values(tokens.size() * channels);
+            for (size_t i = 0; i < values.size(); ++i) values[i] = ((int)(i % 19) - 9) * .01f;
+            Data hidden(FLOAT32, {1, (int)tokens.size(), channels}, values), before, after;
+            DiskEmbeddingRowReader::Ticket ticket;
+            if (tokens.size() == 1) {
+                const int shifted[] = {tokens[0], newState.previousToken1 < 0 ? m.eosToken : newState.previousToken1,
+                    newState.previousToken2 < 0 ? m.eosToken : newState.previousToken2};
+                std::vector<int32_t> rows(m.ngramHeads);
+                for (int h = 0; h < m.ngramHeads; ++h) rows[h] = m.PLEHashRow(shifted, h);
+                ticket = reader->ReadAsync(rows);
+            }
+            // The baseline uses the existing disk EmbeddingDirect operation.
+            m.pleDiskReader.reset();
+            m.RunPLE(hidden, input, oldState, before, &tokens);
+            m.pleDiskReader = reader;
+            const auto checkpoint = newState;
+            m.RunPLE(hidden, input, newState, after, &tokens, &ticket);
+            auto same = [&] {
+                Check(before.dims == after.dims && before.GetBytes() == after.GetBytes() &&
+                      !memcmp(before.cpuData, after.cpuData, before.GetBytes()), "PLE output changed");
+                Check(oldState.previousToken1 == newState.previousToken1 &&
+                      oldState.previousToken2 == newState.previousToken2 &&
+                      oldState.processedTokens == newState.processedTokens &&
+                      oldState.convHistory == newState.convHistory, "PLE history changed");
+            };
+            same();
+            // A speculative rollback must be independent of the cached rows.
+            newState = checkpoint;
+            auto stale = reader->ReadAsync({0});
+            m.RunPLE(hidden, input, newState, after, &tokens, &stale);
+            same();
+        }
+        std::cout << "PASS: PLE prefetch matches serial output/history, EOS and rollback\n";
+    }
 };
 }
 static std::string WriteMtpFixture(Fixture &fixture, int expertWidth = 32) {
@@ -514,6 +568,7 @@ int main(int argc, char **argv) {
             m->OnModelWeightsLoaded(); // Repeat notification must not permute twice.
             Check(At(m->weight[p + "out_proj.weight"], 12) == 4, "GGUF restoration is not idempotent");
             Qwen4GGUFTestAccess::Prepare(*m);
+            if (disk) Qwen4GGUFTestAccess::CheckPlePrefetch(*m);
             Check(At(m->weight["model.language_model.hyper_connection_mixer.hc_norm.weight"], 0) == 1.5f, "GGUF RMSNorm offset applied twice");
             Check(At(m->weight["model.language_model.layers.1.self_attn.indexer.k_layernorm.weight"], 0) == 1.25f, "GGUF QSA norm offset applied twice");
             if (!disk) {
