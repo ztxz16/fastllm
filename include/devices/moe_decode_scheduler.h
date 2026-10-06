@@ -156,12 +156,18 @@ public:
     // Unlike EP's fixed expert ownership, every unique miss can run on any GPU.
     // The caller orders misses by cross-row reuse and keeps one owner per expert.
     static std::vector<int> AssignSharedMisses(const std::vector<SharedRankPlan> &plans,
-            const Estimate &cpu, const std::vector<int> &reuse, uint64_t calls) {
+            const Estimate &cpu, const std::vector<int> &reuse, uint64_t calls,
+            const MoeDecodeOverlapScheduler *decodeCpu = nullptr) {
         std::vector<int> result(reuse.size(), -1), current(reuse.size(), -1);
         std::vector<int> counts(plans.size(), 0);
         std::vector<double> gpu(plans.size(), 0);
         int remaining = 0;
         for (int n : reuse) remaining += n;
+        // A decode baseline must measure the actual CPU subset, excluding
+        // GPU submission/waits. Multiple CPU experts need not cost linearly.
+        if (decodeCpu && remaining > 0 && remaining < int(decodeCpu->decodeCpu.size()) &&
+            !decodeCpu->decodeCpu[remaining].initialized) return result;
+        auto cpuCost = [&](int n) { return decodeCpu ? decodeCpu->DecodeCpuUs(n) : n * cpu.us; };
         double bound = 0;
         bool calibrating = !cpu.initialized;
         for (size_t r = 0; r < plans.size(); ++r) {
@@ -187,7 +193,7 @@ public:
             }
             return result;
         }
-        double best = std::max(remaining * cpu.us, bound);
+        double best = std::max(cpuCost(remaining), bound);
         for (size_t i = 0; i < reuse.size(); ++i) {
             int selected = -1;
             double finish = 0, compute = 0;
@@ -203,11 +209,13 @@ public:
             current[i] = selected; ++counts[selected];
             gpu[selected] = compute; bound = std::max(bound, finish);
             remaining -= reuse[i];
-            const double cost = std::max(remaining * cpu.us, bound);
+            const double cost = std::max(cpuCost(remaining), bound);
             if (cost < best * .97) { best = cost; result = current; }
         }
         // Probe an unused device occasionally after the workload/link changes.
         if (calls % 127 == 126) {
+            if (decodeCpu && std::find_if(result.begin(), result.end(), [](int r) { return r >= 0; }) != result.end())
+                return std::vector<int>(reuse.size(), -1);
             const int r = (calls / 127) % plans.size();
             if (plans[r].timing && plans[r].capacity > 0 &&
                 std::find(result.begin(), result.end(), r) == result.end()) {

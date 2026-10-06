@@ -402,6 +402,31 @@ static void TestSharedOverlap() {
     Require(Scheduler::AssignSharedMisses(plans, cpu, {}, 1).empty(), "resident-only batch generated transfers");
     Require(Scheduler::AssignSharedMisses({}, cpu, {1,2}, 126) == std::vector<int>({-1,-1}),
             "missing GPUs did not leave every expert on CPU");
+    Scheduler decode;
+    plans = {{&a, 0, 8, 0}, {&b, 0, 8, 20}};
+    const std::vector<int> eight(8, 1);
+    owners = Scheduler::AssignSharedMisses(plans, decode.cpuExpert, eight, 1, &decode);
+    Require(std::count(owners.begin(), owners.end(), -1) == 8, "decode skipped CPU baseline");
+    for (int n = 1; n <= 8; ++n) decode.ObserveDecodeCpu(n, n * 100);
+    owners = Scheduler::AssignSharedMisses(plans, decode.cpuExpert, eight, 1, &decode);
+    Require(std::count(owners.begin(), owners.end(), 0) > 0 &&
+            std::count(owners.begin(), owners.end(), 1) > 0,
+            "decode did not use both profitable links");
+    owners = Scheduler::AssignSharedMisses(plans, decode.cpuExpert, eight, 126, &decode);
+    Require(std::count(owners.begin(), owners.end(), -1) == 8,
+            "decode did not refresh its CPU baseline");
+    plans = {{&a, 0, 1, 0}, {&b, 0, 1, 20}, {&a, 0, 1, 10}};
+    owners = Scheduler::AssignSharedMisses(plans, decode.cpuExpert, eight, 1, &decode);
+    for (int device=0;device<3;++device) Require(std::count(owners.begin(), owners.end(), device)==1,
+            "shared decode assumes two devices or ignores capacity");
+    plans = {{&a, 0, 8, 0}, {&b, 0, 8, 20}};
+    // A CPU plateau cannot be extrapolated as cost proportional to routes.
+    decode = {};
+    for (int n = 1; n <= 8; ++n) decode.ObserveDecodeCpu(n, 300);
+    owners = Scheduler::AssignSharedMisses(plans, decode.cpuExpert, eight, 1, &decode);
+    Require(std::count(owners.begin(), owners.end(), -1) == 8,
+            "decode split ignored non-linear CPU cost");
+
     Scheduler coldA, coldB;
     cpu = {};
     plans = {{&coldA, 0, 1, 0}, {&coldB, 0, 1, 0}};
