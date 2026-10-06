@@ -4,8 +4,9 @@ namespace fastllm {
 class Data;
 }
 
-// Resident, bias-free FP16 projections of the same input. The Q8 workspace
-// belongs to this call and is shared only by its ordered CUDA launches.
+// Resident, bias-free FP16/BF16 projections of the same input (1..8 rows).
+// Any number of projections >= 2 may share the call-local Q8 workspace.
+// Unsupported types/layouts and MMQ batches return false before any writes.
 bool FastllmCudaGGUFLinearShared(const fastllm::Data &input, fastllm::Data *const *weights,
                                  fastllm::Data *const *outputs, int count);
 bool FastllmCudaGGUFMixedGateUp(const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &up,

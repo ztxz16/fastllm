@@ -1,4 +1,5 @@
 #include "cuda_gguf_fusion_test.cuh"
+#include <cuda_bf16.h>
 
 static void Shared(ggml_type a, ggml_type b, ggml_type c, int t, int k, int n) {
     Data x(FLOAT16, {1, t, k});
@@ -17,6 +18,51 @@ static void Shared(ggml_type a, ggml_type b, ggml_type c, int t, int k, int n) {
               q.Reference(x);
               r.Reference(x);
           });
+}
+// Mixed output widths and quantization formats must preserve ordinary BF16
+// Linear bit-for-bit, including fresh inputs on each graph replay.
+static void SharedBfloat16(int rows, int columns, int count, bool forceMmvq) {
+    context = "SharedBfloat16 rows=" + std::to_string(rows) + " count=" + std::to_string(count);
+    Data x(BFLOAT16, {1, rows, columns}), bias;
+    Allocate(x);
+    std::vector<std::unique_ptr<Data>> weights, outputs, references;
+    std::vector<Data *> w, o;
+    const ggml_type types[] = {GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K};
+    for (int i = 0; i < count; ++i) {
+        const int n = 64 + i * 13;
+        weights.emplace_back(new Data(DATA_GGUF_FORMAT, int(types[i % 3]), {n, columns}));
+        std::vector<float> values(size_t(n) * columns);
+        for (size_t j = 0; j < values.size(); ++j) values[j] = .15f * std::sin(float(j + 71 * i) * .19f);
+        weights.back()->CreateFromOriData(WeightType::LINEAR, FLOAT32,
+            reinterpret_cast<uint8_t *>(values.data()), nullptr, nullptr);
+        weights.back()->ToDevice(DataDevice::CUDA, {0}, true);
+        weights.back()->forceGGUFFp32Dequant = forceMmvq;
+        outputs.emplace_back(new Data(BFLOAT16, {1, rows, n}));
+        references.emplace_back(new Data(BFLOAT16, {1, rows, n}));
+        Allocate(*outputs.back()); Allocate(*references.back());
+        w.push_back(weights.back().get()); o.push_back(outputs.back().get());
+    }
+    Graph([&] { Check(FastllmCudaGGUFLinearShared(x, w.data(), o.data(), count), "BF16 group rejected"); },
+        [&] {
+            for (int i = 0; i < count; ++i)
+                Same(*o[i], Download(*references[i], references[i]->Count(0)), "BF16 shared projection");
+        }, [&](int seed) {
+            std::vector<__nv_bfloat16> values(size_t(rows) * columns);
+            for (size_t j = 0; j < values.size(); ++j)
+                values[j] = __float2bfloat16_rn(.8f * std::sin(float(j + seed * 71) * .11f));
+            Upload(x, values);
+            for (int i = 0; i < count; ++i)
+                Check(FastllmCudaBFloat16MatMulGGUF(x, *w[i], bias, *references[i],
+                    rows, columns, w[i]->dims[0]), "BF16 reference rejected");
+        });
+    auto before = Download(*o[0], o[0]->Count(0));
+    Data *saved = o[1]; o[1] = o[0];
+    Check(!FastllmCudaGGUFLinearShared(x, w.data(), o.data(), count), "BF16 output alias accepted");
+    o[1] = saved;
+    w.back()->dataDeviceIds = {1};
+    Check(!FastllmCudaGGUFLinearShared(x, w.data(), o.data(), count), "BF16 wrong device accepted");
+    w.back()->dataDeviceIds = {0};
+    Same(*o[0], before, "BF16 rejection modified output");
 }
 static void Permuted(ggml_type type, int t, int kh, int groups) {
     const int hd = 128, k = kh * groups * hd, n = 129;
@@ -144,6 +190,16 @@ int main() {
             return 77;
         Cuda(cudaSetDevice(0));
         Reject();
+        cudaDeviceProp properties{};
+        Cuda(cudaGetDeviceProperties(&properties, 0));
+        for (int rows = 1; rows <= 8; ++rows)
+            for (int columns : {256, 4096})
+                for (int count : {2, 6})
+                    for (bool force : {false, true}) {
+                        if (rows == 8 && !force && properties.major >= 10) continue;
+                        SharedBfloat16(rows, columns, count, force);
+                    }
+        std::cout << "PASS BF16 shared Q8, 1..8 rows, 2/6 mixed projections" << std::endl;
         const ggml_type types[] = {GGML_TYPE_IQ3_S,  GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS,
                                    GGML_TYPE_Q4_K,   GGML_TYPE_Q2_K,    GGML_TYPE_IQ2_XXS,
                                    GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,   GGML_TYPE_IQ1_M};

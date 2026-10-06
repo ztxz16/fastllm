@@ -2719,9 +2719,10 @@ static bool GgufOverlap(const fastllm::Data &a, const fastllm::Data &b) {
     return x < y+b.GetBytes() && y < x+a.GetBytes();
 }
 static bool GgufSharedProjectionCanRun(const fastllm::Data &input,
-        const fastllm::Data &weight, const fastllm::Data &output) {
+        const fastllm::Data &weight, const fastllm::Data &output, bool allowBfloat16 = false) {
     using namespace fastllm;
-    if (input.dataType != FLOAT16 || output.dataType != FLOAT16 ||
+    const bool bfloat16 = allowBfloat16 && input.dataType == BFLOAT16;
+    if ((!bfloat16 && input.dataType != FLOAT16) || output.dataType != input.dataType ||
         weight.dataType != DATA_GGUF_FORMAT || weight.dims.size() != 2 ||
         !GgufDenseLocal(input) || !GgufDenseLocal(output) ||
         weight.dataDevice != DataDevice::CUDA || !weight.cudaData || weight.multiDeviceData ||
@@ -2732,12 +2733,18 @@ static bool GgufSharedProjectionCanRun(const fastllm::Data &input,
         output.dims.back() != outputs || output.Count(0) != size_t(rows)*outputs ||
         GgufOverlap(input, output) || GgufOverlap(weight, output)) return false;
     const auto type = static_cast<ggml_type>(weight.ggmlType);
-    switch (type) {
-        case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ4_XS:
-        case GGML_TYPE_Q4_K: case GGML_TYPE_Q2_K:
-        case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S:
-        case GGML_TYPE_IQ1_M: break;
-        default: return false;
+    if (bfloat16) {
+        // Match the ordinary BF16 MMVQ dispatch, including its reduction
+        // order. Extended IQ kernels and large-batch MMQ keep their fallback.
+        if (!get_has_vec_dot_q_cuda(type)) return false;
+    } else {
+        switch (type) {
+            case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ4_XS:
+            case GGML_TYPE_Q4_K: case GGML_TYPE_Q2_K:
+            case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S:
+            case GGML_TYPE_IQ1_M: break;
+            default: return false;
+        }
     }
     const auto *tensor = static_cast<const ggml_tensor *>(weight.ggmlTensor);
     if (!tensor || tensor->type != type || tensor->ne[0] != columns || tensor->ne[1] != outputs ||
@@ -3154,9 +3161,9 @@ static void GgufProjectFromQ8(const block_q8_1 *input, const fastllm::Data &weig
 
 bool FastllmCudaGGUFLinearShared(const fastllm::Data &input,
         fastllm::Data *const *weights, fastllm::Data *const *outputs, int count) {
-    if (count < 2 || count > 3 || !weights || !outputs) return false;
+    if (count < 2 || !weights || !outputs) return false;
     for (int i = 0; i < count; ++i) {
-        if (!weights[i] || !outputs[i] || !GgufSharedProjectionCanRun(input, *weights[i], *outputs[i])) return false;
+        if (!weights[i] || !outputs[i] || !GgufSharedProjectionCanRun(input, *weights[i], *outputs[i], true)) return false;
         for (int j = 0; j < count; ++j) {
             if (!weights[j] || GgufOverlap(*weights[j], *outputs[i])) return false;
             if (j < i && GgufOverlap(*outputs[i], *outputs[j])) return false;
@@ -3164,7 +3171,7 @@ bool FastllmCudaGGUFLinearShared(const fastllm::Data &input,
     }
     const int columns = input.dims.back(), rows = input.Count(0)/columns;
 #if !defined(USE_ROCM)
-    bool planar = true;
+    bool planar = input.dataType == fastllm::FLOAT16;
     for (int i = 0; i < count; ++i)
         planar = planar && GgufPlanarProjectionShape(weights[i]->ggmlType, rows, columns, weights[i]->dims[0]);
     if (planar) {
@@ -3185,10 +3192,24 @@ bool FastllmCudaGGUFLinearShared(const fastllm::Data &input,
     if (FastllmCudaTryMalloc(reinterpret_cast<void **>(&q8),
             size_t(rows)*(columns/QK8_1)*sizeof(block_q8_1)) != FASTLLM_CUDA_TRY_MALLOC_SUCCESS) return false;
     const auto stream = cudaStreamPerThread;
-    quantize_row_q8_1_cuda(static_cast<const half *>(input.cudaData), q8,
-        columns, rows, 1, columns, GGML_TYPE_Q8_1, stream);
-    for (int i = 0; i < count; ++i)
-        GgufProjectFromQ8<0>(q8, *weights[i], static_cast<half *>(outputs[i]->cudaData), rows, columns, stream);
+    if (input.dataType == fastllm::BFLOAT16) {
+        quantize_row_q8_1_cuda(static_cast<const __nv_bfloat16 *>(input.cudaData), q8,
+            columns, rows, 1, columns, GGML_TYPE_Q8_1, stream);
+        ggml_backend_cuda_context ctx;
+        for (int i = 0; i < count; ++i) {
+            const int k = weights[i]->dims[0];
+            ggml_cuda_op_mul_mat_vec_q_impl(ctx, (ggml_type)weights[i]->ggmlType,
+                columns, k, 1, 0, 0, 0, 0,
+                (const char *)weights[i]->cudaData, (const char *)q8,
+                static_cast<__nv_bfloat16 *>(outputs[i]->cudaData), nullptr,
+                0, k, rows, columns, stream);
+        }
+    } else {
+        quantize_row_q8_1_cuda(static_cast<const half *>(input.cudaData), q8,
+            columns, rows, 1, columns, GGML_TYPE_Q8_1, stream);
+        for (int i = 0; i < count; ++i)
+            GgufProjectFromQ8<0>(q8, *weights[i], static_cast<half *>(outputs[i]->cudaData), rows, columns, stream);
+    }
     FastllmCudaFree(q8);
     return true;
 }

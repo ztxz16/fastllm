@@ -11,6 +11,7 @@
 
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-gguf-projections.h"
 #include "devices/cuda/fastllm-cuda-moe-policy.h"
 #include "utils/cuda_chunked_prefill.h"
 #endif
@@ -24,6 +25,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <iostream>
 #include <limits>
 #include <set>
@@ -35,6 +37,41 @@ namespace fastllm {
         "model.language_model.";
 
     namespace {
+        // Group independent projections without retaining quantized activations
+        // across calls. Nonresident/non-GGUF weights and larger batches use Linear.
+        void Glm5NextLinearGroup(Data &input, std::initializer_list<Data *> weights,
+                                std::initializer_list<Data *> outputs) {
+            AssertInFastLLM(weights.size() == outputs.size(),
+                "GLM projection group size mismatch.");
+#ifdef USE_CUDA
+            bool shared = input.dataDevice == DataDevice::CUDA &&
+                input.dataType == DataType::BFLOAT16 && !input.dims.empty() &&
+                input.dims.back() > 0 && input.Count(0) / input.dims.back() <= 8;
+            for (auto *w : weights) {
+                shared = shared && w->dataType == DataType::DATA_GGUF_FORMAT &&
+                    w->dataDevice == DataDevice::CUDA && w->cudaData != nullptr &&
+                    w->dims.size() == 2 && w->dims[1] == input.dims.back();
+            }
+            if (shared) {
+                auto output = outputs.begin();
+                for (auto *w : weights) {
+                    Data &o = **output++;
+                    o.dataType = input.dataType;
+                    o.UpdateUnitSize();
+                    auto dims = input.dims;
+                    dims.back() = w->dims[0];
+                    o.Resize(dims);
+                    o.ToDevice(DataDevice::CUDA, input.dataDeviceIds, false);
+                    o.Allocate(false);
+                }
+                if (FastllmCudaGGUFLinearShared(input, weights.begin(), outputs.begin(),
+                        (int)weights.size())) return;
+            }
+#endif
+            auto output = outputs.begin();
+            for (auto *w : weights) Linear(input, *w, Data(), **output++);
+        }
+
         // Activations are contiguous [1, rows, ...]; these views never own
         // request state and remain valid for their parent tensor's lifetime.
         void ViewGlm5NextRows(const Data &source, int first, int rows, Data &view) {
@@ -1783,13 +1820,13 @@ namespace fastllm {
 
         auto runChunk = [&](Data &chunkInput, int chunkSequence, Data &chunkOutput) {
             Data qProjected, kProjected, vProjected;
-            Linear(chunkInput, weight[prefix + "q_proj.weight"], Data(), qProjected);
-            Linear(chunkInput, weight[prefix + "k_proj.weight"], Data(), kProjected);
-            Linear(chunkInput, weight[prefix + "v_proj.weight"], Data(), vProjected);
-            Data gateLowRank, rawGate, rawBetaBfloat16, rawBeta;
-            Linear(chunkInput, weight[prefix + "f_a_proj.weight"], Data(), gateLowRank);
+            Data gateLowRank, rawGate, rawBetaBfloat16, rawBeta, gateLow;
+            Glm5NextLinearGroup(chunkInput,
+                {&weight[prefix + "q_proj.weight"], &weight[prefix + "k_proj.weight"],
+                 &weight[prefix + "v_proj.weight"], &weight[prefix + "f_a_proj.weight"],
+                 &weight[prefix + "b_proj.weight"], &weight[prefix + "g_a_proj.weight"]},
+                {&qProjected, &kProjected, &vProjected, &gateLowRank, &rawBetaBfloat16, &gateLow});
             Linear(gateLowRank, weight[prefix + "f_b_proj.weight"], Data(), rawGate);
-            Linear(chunkInput, weight[prefix + "b_proj.weight"], Data(), rawBetaBfloat16);
             ToDataType(rawBetaBfloat16, rawBeta, DataType::FLOAT32);
 
             auto runState = [&](Data &projectedQ, Data &projectedK, Data &projectedV,
@@ -1860,8 +1897,7 @@ namespace fastllm {
                     AppendGlm5NextRows(attention, rowAttention, batch);
                 }
             }
-            Data gateLow, gate;
-            Linear(chunkInput, weight[prefix + "g_a_proj.weight"], Data(), gateLow);
+            Data gate;
             Linear(gateLow, weight[prefix + "g_b_proj.weight"], Data(), gate);
             gate.Reshape({1, chunkSequence, kdaHeads, kdaHeadDim});
             Data gatedAttention;
@@ -1957,9 +1993,10 @@ namespace fastllm {
         const std::string prefix = languagePrefix + "layers." +
             std::to_string(layerIndex) + ".self_attn.";
 
-        Data qResidual, qNormalized, query;
-        Linear(input, weight[prefix + "q_a_proj.weight"],
-               Data(), qResidual);
+        Data qResidual, qNormalized, query, compressedKv, latentKv;
+        Glm5NextLinearGroup(input,
+            {&weight[prefix + "q_a_proj.weight"], &weight[prefix + "kv_a_proj_with_mqa.weight"]},
+            {&qResidual, &compressedKv});
         KimiK3RMSNorm(
             qResidual, weight[prefix + "q_a_layernorm.weight"],
             rms_norm_eps, qNormalized);
@@ -1970,9 +2007,6 @@ namespace fastllm {
             {1, sequence, num_attention_heads, qkNopeHeadDim});
         PermuteSelf(query, {0, 2, 1, 3});
 
-        Data compressedKv, latentKv;
-        Linear(input, weight[prefix + "kv_a_proj_with_mqa.weight"],
-               Data(), compressedKv);
         KimiK3RMSNorm(
             compressedKv, weight[prefix + "kv_a_layernorm.weight"],
             rms_norm_eps, latentKv);
