@@ -28,6 +28,8 @@
 #include <limits>
 #include <set>
 
+#include "glm5_next_tp.h"
+
 namespace fastllm {
     const std::string Glm5NextModel::languagePrefix =
         "model.language_model.";
@@ -482,10 +484,11 @@ namespace fastllm {
 
     Glm5NextModel::~Glm5NextModel() {
         ShutdownRuntime();
+        threadTpState.reset();
 #ifdef USE_CUDA
         prefillPipeline.reset();
 #endif
-        ReleaseMoeCudaCache(expertWeights);
+        if (threadTpRank < 0) ReleaseMoeCudaCache(expertWeights);
         {
             std::lock_guard<std::mutex> guard(historyCacheMutex);
             pendingHistoryCache.reset();
@@ -504,7 +507,7 @@ namespace fastllm {
             std::lock_guard<std::mutex> guard(indexerCachesMutex);
             indexerCaches.clear();
         }
-        ClearAllPagedCacheManagers();
+        if (threadTpRank < 0) ClearAllPagedCacheManagers();
     }
 
     void Glm5NextModel::SetDataType(DataType dataType) {
@@ -738,6 +741,7 @@ namespace fastllm {
             }
         }
 
+        InitThreadTp();
         std::cout
             << "[GLM-5.3] Hybrid text model: 34 KDA + 11 DSA layers, "
             << "42 MoE layers, BF16 activations.\n"
@@ -1243,6 +1247,7 @@ namespace fastllm {
         if (context == nullptr) {
             return;
         }
+        RemoveThreadTpRequest(&context->pastKeyValues);
         {
             std::lock_guard<std::mutex> guard(mtpStatesMutex);
             auto it = mtpStates.find(&context->pastKeyValues);
@@ -1266,6 +1271,7 @@ namespace fastllm {
 
     bool Glm5NextModel::TryRestoreHistoryCache(
             std::vector<int> &inputTokens, int &cacheLen) {
+        if (threadTpState) return false;
         if (mtpEnabled) {
             std::lock_guard<std::mutex> guard(historyCacheMutex);
             pendingHistoryCache.reset();
@@ -2026,11 +2032,11 @@ namespace fastllm {
             InitializeGlm5NextPagedDescriptor(keyPeCache, rowKeyPe);
             InitializeGlm5NextPagedDescriptor(latentKvCache, rowLatentKv);
             PagedCacheManager *keyPeManager = AllocatePagedCacheManager(
-                layerIndex * 2,
+                (layerIndex + std::max(0, threadTpRank) * (block_cnt + 1)) * 2,
                 PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_MLP_CACHE,
                 rowKeyPe);
             PagedCacheManager *latentKvManager = AllocatePagedCacheManager(
-                layerIndex * 2 + 1,
+                (layerIndex + std::max(0, threadTpRank) * (block_cnt + 1)) * 2 + 1,
                 PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_MLP_CACHE,
                 rowLatentKv);
             AssertInFastLLM(
@@ -2248,11 +2254,11 @@ namespace fastllm {
         InitializeGlm5NextPagedDescriptor(keyCache, key);
         InitializeGlm5NextPagedDescriptor(valueCache, value);
         PagedCacheManager *keyManager = AllocatePagedCacheManager(
-            layerIndex * 2,
+            (layerIndex + std::max(0, threadTpRank) * (block_cnt + 1)) * 2,
             PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE,
             key);
         PagedCacheManager *valueManager = AllocatePagedCacheManager(
-            layerIndex * 2 + 1,
+            (layerIndex + std::max(0, threadTpRank) * (block_cnt + 1)) * 2 + 1,
             PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE,
             value);
         AssertInFastLLM(
@@ -2324,6 +2330,36 @@ namespace fastllm {
         const std::vector<int> outputDims = input.dims;
         input.Reshape({sequence, embed_dim});
 
+        bool sharedReady = false;
+        auto runShared = [&] {
+            if (sharedReady) return;
+            if (GetCudaSharedExpert() || threadTpRank >= 0) {
+                ApplyDeviceMap(deviceMap, deviceLayer + 1, block_cnt);
+            } else {
+                ApplyMoeDeviceMapForLayer(deviceLayer);
+            }
+            RunClampedMlp(input,
+                weight[mlp + "shared_experts.gateup_proj.weight"],
+                weight[mlp + "shared_experts.down_proj.weight"], output);
+            sharedReady = true;
+        };
+#ifdef USE_CUDA
+        if (threadTpRank >= 0) {
+            runShared();
+            // Drain both rank streams before the owner uses peer GPUs for
+            // host MoE. Other ranks wait at the following reduction's host
+            // submission barrier, without a pending NCCL kernel on those GPUs.
+            FastllmCudaSyncCurrentThreadStream();
+            threadTpOwner->Barrier();
+            if (threadTpRank != 0) {
+                input.Reshape(outputDims);
+                output.Reshape(outputDims);
+                return;
+            }
+        }
+#endif
+        DiskMoeCudaDeviceScope diskDevices(threadTpRank >= 0
+            ? threadTpOwner->devices : std::vector<int>{});
         ApplyDeviceMap(deviceMap, deviceLayer + 1, block_cnt);
         Data routerInput, routerScores;
         ToDataType(input, routerInput, DataType::FLOAT32);
@@ -2337,16 +2373,6 @@ namespace fastllm {
             routed_scaling_factor,
             &weight[mlp + "gate.e_score_correction_bias"]);
 
-        auto runShared = [&] {
-            if (GetCudaSharedExpert()) {
-                ApplyDeviceMap(deviceMap, deviceLayer + 1, block_cnt);
-            } else {
-                ApplyMoeDeviceMapForLayer(deviceLayer);
-            }
-            RunClampedMlp(input,
-                weight[mlp + "shared_experts.gateup_proj.weight"],
-                weight[mlp + "shared_experts.down_proj.weight"], output);
-        };
         Data routedOutput;
 #if defined(USE_CUDA) && defined(USE_NUMAS)
         const std::string routedDevice =
@@ -3241,6 +3267,8 @@ namespace fastllm {
             const GenerationConfig &generationConfig,
             const LastTokensManager &lastTokens,
             std::vector<float> *logits) {
+        if (threadTpState) return ForwardThreadTp(inputIds, pastKeyValues,
+            generationConfig, lastTokens, logits);
         AssertInFastLLM(
             inputIds.dims.size() == 2 && inputIds.dims[0] == 1 &&
             inputIds.dims[1] > 0,
@@ -3352,7 +3380,7 @@ namespace fastllm {
             (logits == nullptr || (int)logits->size() == batch),
             "GLM-5.3 ForwardBatch received inconsistent arguments.");
         int total = 0;
-        bool decodeBatch = batch > 1 && !(mtpEnabled && mtpWeightsReady);
+        bool decodeBatch = !threadTpState && batch > 1 && !(mtpEnabled && mtpWeightsReady);
         for (int length : seqLens) {
             AssertInFastLLM(length > 0, "GLM-5.3 batch contains an empty request.");
             total += length;
@@ -3435,6 +3463,7 @@ namespace fastllm {
             const GenerationConfig &generationConfig,
             const LastTokensManager &lastTokens,
             std::vector<float> *logits, int &outputToken) {
+        if (threadTpState) return false;
         (void)positionIds; // This model derives causal positions from its caches.
 #ifdef USE_CUDA
         const int chunkSize = GetChunkedPrefillSize();
@@ -3620,6 +3649,7 @@ namespace fastllm {
                     *requestCaches[0], attentionOutput,
                     indexer == nullptr ? nullptr : &(*indexer)[layer]);
             }
+            ThreadTpAllReduce(attentionOutput);
             DeepSeekV4HcPost(
                 attentionOutput, *current,
                 attentionPost, attentionComb, *next);
@@ -3643,7 +3673,7 @@ namespace fastllm {
             } else {
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
                 auto &experts = expertWeights[layer];
-                if (frequencyDecode && normalizedFfn.dataDevice == DataDevice::CUDA &&
+                if (threadTpRank <= 0 && frequencyDecode && normalizedFfn.dataDevice == DataDevice::CUDA &&
                     !normalizedFfn.dataDeviceIds.empty() && experts.size() >= 4 && experts[2] &&
                     (experts[2]->dataType == DataType::DATA_GGUF_FORMAT ||
                      experts[2]->dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED)) {
@@ -3659,6 +3689,7 @@ namespace fastllm {
 #endif
                 RunMoe(layer, normalizedFfn, sequence, ffnOutput);
             }
+            ThreadTpAllReduce(ffnOutput);
             DeepSeekV4HcPost(
                 ffnOutput, *current, ffnPost, ffnComb, *next);
             std::swap(current, next);

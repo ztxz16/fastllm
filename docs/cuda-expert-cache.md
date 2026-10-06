@@ -947,6 +947,51 @@ CUDA-to-RAM transfers. Active call leases are not persistent cache ownership.
 The original nine-value C statistics ABI is retained; the capacity-bounded v2
 API adds the hierarchy counters and is used by the Python wrapper when present.
 
+### GLM-5.3 GGUF hybrid tensor parallelism
+
+GLM-5.3 GGUF supports `--device cuda:0 --tp 0,1 --moe_device disk`.
+The TP degree must divide the KDA and MLA head counts, and shard widths must
+respect the quantization-block alignment. Each rank owns its
+attention heads, recurrent state and KV pages. Attention output, dense-FFN
+and shared-expert down projections reduce their rank-local partial sums.
+Routing executes on the owner rank. Routed host
+experts are evaluated once, using a single process-wide RAM cache; TP does not
+load a full host expert copy per rank. MTP is currently unsupported in this
+path and must remain disabled; `--cuda_shared_expert true` is required.
+Prefix/history reuse is bypassed for TP. As with ordinary BF16 tensor
+parallelism, partitioning changes floating-point accumulation and can change
+generated tokens; it does not promise bitwise agreement with serial execution.
+
+For the native GLM GGUF disk adapter, the TP owner searches resident experts
+across all participating GPUs and launches their work before CPU misses.
+Promotions select available capacity or the coldest eligible victim across
+those GPUs, keeping the existing frequency admission policy. `--moe_cuda_cache`
+still specifies the budget **per GPU**, while `--moe_cpu_cache` specifies one
+shared RAM budget. For example, `--moe_cuda_cache 8g --moe_cpu_cache 48g` uses
+16 GiB of CUDA expert payload across two ranks and 48 GiB of host payload.
+Attention weights, KV state and workspaces are outside those budgets.
+GGUF expert records retain their original IQ layout on disk, in RAM and in
+the GPU cache; this path does not introduce R4 repacking.
+
+The ordinary GGUF disk cache maintains frequency/recency min-heaps for RAM
+and each GPU. Touches update resident keys incrementally; aging rebuilds a
+heap once per epoch. This removes a full-model victim scan from repeated
+promotions without changing admission or eviction order. GPU buffers are
+released only after all resident expert work has been collected.
+An admission can reuse an evicted GGUF record of exactly the same byte size
+on the same device, avoiding a synchronous CUDA free/allocation pair. The
+record is handed directly to its replacement; trimming and unloading still
+release storage, and there is no additional GPU buffer pool outside the budget.
+
+Native GLM GGUF CUDA expert projection accepts batches of input rows without
+changing Q8_K quantization, BF16 rounding or expert-ID accumulation order.
+Disk prefill submits all rows assigned to one temporary expert together;
+resident-cache calls use bounded 32-row tiles (a tiling choice, not a model
+batch-size limit). Both serial and TP execution use this path. The disk-cache
+test compares batched per-route output bitwise against individual-row calls
+for all four supported IQ gate/down pairs, on both GPUs, including absent
+experts and zero/negative routing scores.
+
 For GLM with `--moe_device numa`, `--moe_cuda_cache 0` disables resident
 expert payloads while retaining the measured decode split between NUMA and
 temporary GPU uploads. The same scheduler runs for serial layer placement

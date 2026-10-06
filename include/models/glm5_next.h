@@ -51,6 +51,8 @@ namespace fastllm {
 
         bool RetainCudaWorkspace() const override { return true; }
 
+        bool ShouldDelaySpecialWeightCudaMove(const std::string &) const override;
+
         int Forward(
                 const Data &inputIds,
                 const Data &attentionMask,
@@ -92,6 +94,19 @@ namespace fastllm {
                 const std::string &output) override;
 
     private:
+        struct ThreadTpState;
+        std::unique_ptr<ThreadTpState> threadTpState;
+        ThreadTpState *threadTpOwner = nullptr;
+        int threadTpRank = -1;
+        void InitThreadTp();
+        void PrepareThreadTp();
+        void ThreadTpAllReduce(Data &data);
+        void RemoveThreadTpRequest(const std::vector<std::pair<Data, Data>> *key);
+        int ForwardThreadTp(const Data &inputIds,
+                std::vector<std::pair<Data, Data>> &pastKeyValues,
+                const GenerationConfig &generationConfig,
+                const LastTokensManager &lastTokens, std::vector<float> *logits);
+
         struct KdaReplayCapture {
             Data qProjected;
             Data kProjected;
