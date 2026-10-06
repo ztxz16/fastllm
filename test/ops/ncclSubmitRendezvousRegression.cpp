@@ -24,7 +24,8 @@ static void RunRanks(int ranks, const std::function<void(int)> &fn) {
     for (auto &worker : workers) worker.join();
 }
 
-static void CheckOrdering(int ranks, bool delayed = true) {
+static void CheckOrdering(int ranks, bool delayed = true,
+                          std::chrono::microseconds spinBudget = 0us) {
     const int rounds = delayed ? 128 : 4096;
     NcclSubmitRendezvous group(ranks, 5s);
     std::vector<std::atomic<int>> prepared(rounds), submitted(rounds);
@@ -40,16 +41,47 @@ static void CheckOrdering(int ranks, bool delayed = true) {
             if (delayed && rank == i % ranks) std::this_thread::sleep_for(50us);
             ++prepared[i];
             Require(group.Wait(rank, NcclSubmitRendezvous::Before,
-                               100 + i, i % 3), "before boundary failed");
+                               100 + i, i % 3, rank % 2 ? spinBudget : 0us), "before boundary failed");
             Require(prepared[i] == ranks, "entered submission before peers were ready");
             if (delayed && rank == (i + 1) % ranks) std::this_thread::sleep_for(50us);
             ++submitted[i];
             Require(group.Wait(rank, NcclSubmitRendezvous::After,
-                               100 + i, i % 3), "after boundary failed");
+                               100 + i, i % 3, spinBudget), "after boundary failed");
             Require(submitted[i] == ranks, "next GEMM overtook peer submission");
         }
     });
     Require(group.Error().empty(), "successful group became broken");
+}
+
+static void CheckSpinWait() {
+    // Cover parking after the spin deadline and a wait budget longer than
+    // the communicator timeout. Timed spinning must not extend that timeout.
+    NcclSubmitRendezvous slow(2, 1s);
+    RunRanks(2, [&](int rank) {
+        if (rank == 1) std::this_thread::sleep_for(5ms);
+        Require(slow.Wait(rank, NcclSubmitRendezvous::Before, 4, 0, 100us),
+                "timed spin did not fall back to sleep");
+        Require(slow.Wait(rank, NcclSubmitRendezvous::After, 4, 0, 100us),
+                "timed spin fallback broke reuse");
+    });
+    NcclSubmitRendezvous missing(2, 5ms);
+    const auto start = std::chrono::steady_clock::now();
+    Require(!missing.Wait(0, NcclSubmitRendezvous::Before, 4, 0, 2s),
+            "timed spin accepted a missing rank");
+    Require(std::chrono::steady_clock::now() - start < 1s,
+            "spin budget overrode the rendezvous timeout");
+
+    NcclSubmitRendezvous aborted(2, 5s);
+    std::atomic<bool> entered{false};
+    std::thread waiter([&] {
+        entered = true;
+        Require(!aborted.Wait(0, NcclSubmitRendezvous::Before, 4, 0, 1s),
+                "timed spin ignored abort");
+    });
+    while (!entered) std::this_thread::yield();
+    aborted.Abort("abort during timed wait");
+    waiter.join();
+    Require(aborted.Error() == "abort during timed wait", "timed spin lost abort reason");
 }
 
 static void CheckFailures() {
@@ -106,9 +138,12 @@ static void CheckFailures() {
 
 int main() {
     for (int ranks : {2, 3, 4, 5, 7}) {
-        CheckOrdering(ranks);
-        CheckOrdering(ranks, false);
+        for (auto spinBudget : {0us, 1000us}) {
+            CheckOrdering(ranks, true, spinBudget);
+            CheckOrdering(ranks, false, spinBudget);
+        }
     }
+    CheckSpinWait();
     CheckFailures();
     std::cout << "PASS: even/odd-rank host ordering, fast reuse, independent groups, failure wakeup\n";
 }

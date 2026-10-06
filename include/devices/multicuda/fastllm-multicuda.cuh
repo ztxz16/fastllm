@@ -67,6 +67,9 @@ void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int d
 // Multi-rank eager calls rendezvous before and after NCCL host submission;
 // callers do not need another pair of host barriers. Capture bypasses both.
 void FastllmNcclAllReduceNoCustom(void* data, void* dest, int count, int dataType, int deviceId);
+// Bounded host spin for callers with spare submission cores (nonpositive uses the default wait).
+void FastllmNcclAllReduceNoCustomWithSpin(void* data, void* dest, int count, int dataType,
+                                       int deviceId, int hostSpinMicroseconds);
 // Requires an initialized TP communicator and matching submissions on every rank.
 bool FastllmNcclAllGather(const void* data, void* dest, int count, int dataType, int deviceId);
 // Returns whether the TP=2 peer-access fast path can be used for this tensor.

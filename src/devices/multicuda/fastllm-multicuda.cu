@@ -3422,7 +3422,7 @@ void FastllmNcclBroadcast(void* data, int count, int dataType, int root, int dev
 // 功能：将所有卡上的 data 数据进行 Sum 求和，结果保存在 dest 中 (支持 in-place，即 data == dest)
 static void FastllmNcclAllReduceImpl(void* data, void* dest, int count,
                                     int dataType, int deviceId,
-                                    bool allowCustomAllReduce) {
+                                    bool allowCustomAllReduce, int hostSpinMicroseconds = 0) {
     if (data == nullptr || dest == nullptr || count <= 0) {
         return;
     }
@@ -3499,7 +3499,8 @@ static void FastllmNcclAllReduceImpl(void* data, void* dest, int count,
         }
     }
     auto waitForRanks = [&](fastllm::NcclSubmitRendezvous::Phase phase) {
-        if (rendezvous == nullptr || rendezvous->Wait(rank, phase, count, dataType)) {
+        if (rendezvous == nullptr || rendezvous->Wait(rank, phase, count, dataType,
+                std::chrono::microseconds(hostSpinMicroseconds))) {
             return true;
         }
         printf("Error: AllReduce submission on device %d: %s\n",
@@ -3544,6 +3545,11 @@ void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int d
 void FastllmNcclAllReduceNoCustom(void* data, void* dest, int count,
                                   int dataType, int deviceId) {
     FastllmNcclAllReduceImpl(data, dest, count, dataType, deviceId, false);
+}
+
+void FastllmNcclAllReduceNoCustomWithSpin(void* data, void* dest, int count,
+                                       int dataType, int deviceId, int hostSpinMicroseconds) {
+    FastllmNcclAllReduceImpl(data, dest, count, dataType, deviceId, false, hostSpinMicroseconds);
 }
 
 bool FastllmNcclAllGather(const void* data, void* dest, int count,

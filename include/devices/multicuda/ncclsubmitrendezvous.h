@@ -1,6 +1,7 @@
 #ifndef FASTLLM_NCCL_SUBMIT_RENDEZVOUS_H
 #define FASTLLM_NCCL_SUBMIT_RENDEZVOUS_H
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -22,7 +23,8 @@ public:
             std::chrono::milliseconds timeout = std::chrono::minutes(5))
         : nextPhase(ranks, 0), timeout(timeout) {}
 
-    bool Wait(int rank, Phase phase, int count, int dataType) {
+    bool Wait(int rank, Phase phase, int count, int dataType,
+              std::chrono::microseconds spinBudget = std::chrono::microseconds::zero()) {
         std::unique_lock<std::mutex> lock(mutex);
         if (!error.empty()) {
             return false;
@@ -47,15 +49,24 @@ public:
             cv.notify_all();
             return true;
         }
-        // Nearby submissions usually finish before a sleeping thread can be
-        // rescheduled. Publish completion separately from the protected rank
-        // metadata so this bounded wait never holds the mutex needed by peers.
-        // Long prefill/host-expert work still falls back to the timed CV wait.
+        // Spin without holding the rank metadata lock. Spare-core callers can
+        // cover short CPU MoE work without a scheduler wakeup; other callers
+        // retain the fixed short spin. Both fall back to the timed CV wait.
+        using Clock = std::chrono::steady_clock;
+        const bool timedSpin = spinBudget.count() > 0;
+        const auto start = timedSpin ? Clock::now() : Clock::time_point{};
+        const auto deadline = start + timeout;
+        const auto spinDeadline = std::min(start + spinBudget, deadline);
         lock.unlock();
-        for (int spin = 0; spin < 2048; ++spin) {
+        for (unsigned spin = 0;; ++spin) {
             if (completedEpoch.load(std::memory_order_acquire) != current ||
                 aborted.load(std::memory_order_acquire)) {
                 return !aborted.load(std::memory_order_acquire);
+            }
+            if (timedSpin) {
+                if ((spin & 63) == 0 && Clock::now() >= spinDeadline) break;
+            } else if (spin == 2048) {
+                break;
             }
 #if defined(__x86_64__) || defined(__i386__)
             __builtin_ia32_pause();
@@ -66,9 +77,9 @@ public:
         lock.lock();
         // A missing/failed rank must not leave its peers in a permanent CPU
         // wait. Allow long prefills; this timeout does not bound CUDA calls.
-        if (!cv.wait_for(lock, timeout, [&] {
-                return epoch != current || !error.empty();
-            })) {
+        const auto finished = [&] { return epoch != current || !error.empty(); };
+        if (!(timedSpin ? cv.wait_until(lock, deadline, finished)
+                       : cv.wait_for(lock, timeout, finished))) {
             return FailLocked("AllReduce host submission rendezvous timed out");
         }
         return error.empty();
