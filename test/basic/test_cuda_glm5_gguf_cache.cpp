@@ -109,6 +109,7 @@ int main(int argc, char **argv) {
                 "unsupported GLM pair admitted");
         float worst=0;
         bool sawCpu=false, sawMixed=false, sawGpu=false, sawStaged=false;
+        bool sawCooperative[2]{};
         for (int step=0;step<(frequency ? 32 : 8);++step) {
             const int t=step%tables;
             std::vector<float> x(hidden),scores(topk),expected(hidden),per(topk*hidden);
@@ -246,6 +247,55 @@ int main(int argc, char **argv) {
                     worst=std::max(worst,Compare(actual,expected,"hybrid vs scalar oracle"));
                 }
             }
+            if (frequency && devices > 1) {
+                // Exercise arbitrary verifier widths as well as decode; rotate
+                // routes and alternate zero/nonzero inputs between rows to catch wrong maps.
+                for (int rows : {1, 2, 5}) {
+                    const int device = step % 2;
+                    Cuda(cudaSetDevice(device));
+                    std::vector<uint16_t> batchX(rows * hidden);
+                    std::vector<int32_t> batchIds(rows * topk);
+                    std::vector<float> batchScores(rows * topk), batchExpected(rows * hidden);
+                    for (int row=0;row<rows;++row) {
+                        // A zero activation row must produce zero regardless of its
+                        // score/route order, while other rows retain the oracle.
+                        for (int c=0;c<hidden;++c) {
+                            batchX[row*hidden+c]=row%2 ? 0 : bx[c];
+                            batchExpected[row*hidden+c]=row%2 ? 0 : expected[c];
+                        }
+                        for (int k=0;k<topk;++k) {
+                            batchIds[row*topk+k]=ids[(k+row)%topk];
+                            batchScores[row*topk+k]=scores[(k+row)%topk];
+                        }
+                    }
+                    Data input(BFLOAT16,{rows,hidden},CPU,batchX.data()), index(INT32,{rows,topk},CPU,batchIds.data()),
+                         score(FLOAT32,{rows,topk},CPU,batchScores.data()), out;
+                    input.ToDevice(CUDA,std::vector<int>{device}); index.ToDevice(CUDA,std::vector<int>{device}); score.ToDevice(CUDA,std::vector<int>{device});
+                    void *state = FastllmCudaBeginMoeDecode(weights[t].data(),weights[t].size(),topk);
+                    Require(state != nullptr, "cooperative policy unavailable");
+                    uint64_t before[2][8]{}, after[2][8]{};
+                    for (int d=0;d<2;++d) Require(fastllm_moe_cuda_cache_route_stats(d,before[d]),"cooperative before");
+                    Cuda(cudaSetDevice(device));
+                    int callbacks=0;
+                    Require(FastllmCudaMergeMOEHybridOnDevices(input,index,score,out,
+                        weights[t].data(),weights[t].size(),t,{0,1},[&]{++callbacks; Cuda(cudaSetDevice(1-device));}),
+                        "cooperative GGUF rejected");
+                    Require(callbacks==1 && FastllmCudaGetDevice()==device,"cooperative callback/device restore");
+                    FastllmCudaEndMoeDecode(state);
+                    uint64_t total=0, computed=0;
+                    for (int d=0;d<2;++d) {
+                        Require(fastllm_moe_cuda_cache_route_stats(d,after[d]),"cooperative after");
+                        total+=after[d][1]-before[d][1];
+                        computed+=after[d][4]-before[d][4]+after[d][5]-before[d][5];
+                        sawCooperative[d]|=after[d][4]>before[d][4];
+                        if(noCache) Require(after[d][2]==0 && after[d][6]==0,"cooperative unexpectedly cached weights");
+                    }
+                    Require(total==rows*topk && computed==rows*topk,"cooperative routes lost or duplicated");
+                    out.ToDevice(CPU); std::vector<float> actual(rows*hidden);
+                    for(int c=0;c<rows*hidden;++c) actual[c]=BFloat16BitsToFloat32(reinterpret_cast<uint16_t*>(out.cpuData)[c]);
+                    worst=std::max(worst,Compare(actual,batchExpected,"cooperative vs scalar oracle"));
+                }
+            }
         }
         for(int device=0;device<std::min(2,devices);++device) {
             uint64_t stats[5]={};Require(fastllm_moe_cuda_cache_stats(device,stats,false),"query counters");
@@ -255,6 +305,7 @@ int main(int argc, char **argv) {
         }
         if (frequency) Require(sawCpu && sawMixed && (noCache || sawGpu) && sawStaged,
                                "frequency did not exercise CPU, resident and staged GPU routes");
+        if (frequency && devices > 1) Require(sawCooperative[0] && sawCooperative[1], "cooperative path did not exercise both GPUs");
         FastllmCudaReleaseMoeCache(weights[0].data(),weights[0].size());
         ClearNumasMoeRuntimeCache();
         std::printf("PASS: GLM GGUF cache CPU/mixed/GPU, scalar oracle, duplicates, scores, clamp, eviction, counters; max relative L2 %.8f\n",worst);

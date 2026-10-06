@@ -354,7 +354,7 @@ struct DeviceCache {
     std::unique_ptr<DecodePolicyState> decode;
 };
 
-struct Glm5MultiGpuVerify;
+struct Glm5MultiGpuHybrid;
 struct OffloadGroup {
     OffloadLayout layout;
     // GGUF layers keep their actual record size in host storage and share
@@ -375,7 +375,7 @@ struct OffloadGroup {
     // from these borrowed CPU layouts, without a second full host snapshot.
     std::vector<fastllm_gguf_restore::Record> ggufSources;
     std::unordered_map<int, std::unique_ptr<DeviceCache> > deviceCaches;
-    std::shared_ptr<Glm5MultiGpuVerify> cooperativeVerify;
+    std::shared_ptr<Glm5MultiGpuHybrid> cooperativeHybrid;
     std::mutex mutex;
 
     const OffloadLayout &LayerLayout(int tableId) const {
@@ -2137,7 +2137,7 @@ void FastllmCudaReleaseMoeCache(
 
     int originalDevice = -1;
     cudaGetDevice(&originalDevice);
-    released->cooperativeVerify.reset();
+    released->cooperativeHybrid.reset();
     for (auto &cache : released->deviceCaches) {
         PrintDeviceCacheStats(*cache.second, released->layout.weightType);
         ReleaseDeviceCache(*cache.second);
@@ -3568,11 +3568,24 @@ bool TryV41VerifyHybrid(const fastllm::Data &input, const fastllm::Data &index, 
 #include "fastllm-moe-glm5-hybrid.cuh"
 #endif
 
-bool FastllmCudaMergeMOEHybrid(const fastllm::Data &input,
+static bool MergeMOEHybrid(const fastllm::Data &input,
         const fastllm::Data &index, const fastllm::Data &score,
         fastllm::Data &output, fastllm::Data **weights, int weightsBatch, int layer,
-        const std::function<void()> &launchParallel) {
+        const std::function<void()> &launchParallel, const std::vector<int> *devices) {
 #ifdef USE_NUMAS
+    if (devices && devices->size() > 1 && SupportedCacheInput(input) &&
+        input.dataType == fastllm::BFLOAT16) {
+        int table = -1;
+        auto *group = FindHybridGroup(weights, weightsBatch, &table);
+        cudaStreamCaptureStatus capture;
+        if (group && group->layout.glm5 &&
+            cudaStreamIsCapturing(cudaStreamPerThread, &capture) == cudaSuccess &&
+            capture == cudaStreamCaptureStatusNone) {
+            auto *origin = GetDeviceCache(*group);
+            if (origin && TryGlm5MultiGpuHybrid(*group, *origin, table, input, index, score,
+                    output, weights, weightsBatch, layer, launchParallel, devices)) return true;
+        }
+    }
     if (input.dims.size() == 2 && input.dims[0] > 1) {
         if (!SupportedCacheInput(input)) return false;
         int table = -1;
@@ -3585,7 +3598,7 @@ bool FastllmCudaMergeMOEHybrid(const fastllm::Data &input,
             input.dataType != fastllm::DataType::FLOAT32)) return false;
         auto *cache = GetDeviceCache(*group);
         if (!cache) return false;
-        if (group->layout.glm5 && TryGlm5MultiGpuVerify(*group, *cache, table,
+        if (!devices && group->layout.glm5 && TryGlm5MultiGpuHybrid(*group, *cache, table,
                 input, index, score, output, weights, weightsBatch, layer, launchParallel)) return true;
         // Keep resident experts on GPU and dynamically split quantized misses
         // between NUMA and streamed GPU execution, deduplicating weight DMA
@@ -4007,6 +4020,25 @@ bool FastllmCudaMergeMOEHybrid(const fastllm::Data &input,
 #else
     return false;
 #endif
+}
+
+bool FastllmCudaMergeMOEHybrid(const fastllm::Data &input,
+        const fastllm::Data &index, const fastllm::Data &score,
+        fastllm::Data &output, fastllm::Data **weights, int weightsBatch, int layer,
+        const std::function<void()> &launchParallel) {
+    return MergeMOEHybrid(input, index, score, output, weights, weightsBatch, layer, launchParallel, nullptr);
+}
+
+bool FastllmCudaMergeMOEHybridOnDevices(const fastllm::Data &input,
+        const fastllm::Data &index, const fastllm::Data &score, fastllm::Data &output,
+        fastllm::Data **weights, int weightsBatch, int layer,
+        const std::vector<int> &devices, const std::function<void()> &launchParallel) {
+    if (!devices.empty() &&
+        std::find(devices.begin(), devices.end(), FastllmCudaGetDevice()) == devices.end()) return false;
+    // Explicit subsets also constrain fallback: never borrow a cached GPU
+    // outside the caller's stream handoff, including the single-device case.
+    return MergeMOEHybrid(input, index, score, output, weights, weightsBatch, layer,
+        launchParallel, devices.empty() ? nullptr : &devices);
 }
 
 bool FastllmCudaMergeMOECache(

@@ -609,7 +609,8 @@ template<ggml_type Type>
 __global__ void Gate(const float *input, __nv_bfloat16 *activation,
                     FastllmCudaMoeGGUFCacheView view, const float *scores, float limit, int topk) {
     const int row = blockIdx.x, route = blockIdx.y;
-    input += size_t(route / topk) * view.hidden;
+    const int original = OriginalRoute(view, route);
+    input += size_t(original / topk) * view.hidden;
     const auto *record = ExpertWeight<true>(view, route);
     if (!record) {
         if (threadIdx.x == 0) activation[size_t(route) * view.inter + row] = __float2bfloat16_rn(0);
@@ -629,7 +630,7 @@ __global__ void Gate(const float *input, __nv_bfloat16 *activation,
         gate = __bfloat162float(__float2bfloat16_rn(gate));
         up = __bfloat162float(__float2bfloat16_rn(up));
         if (limit > 0) { gate = fminf(gate, limit); up = fmaxf(-limit, fminf(up, limit)); }
-        const float value = __fmul_rn(__fmul_rn(gate / (1.f + expf(-gate)), up), scores[route]);
+        const float value = __fmul_rn(__fmul_rn(gate / (1.f + expf(-gate)), up), scores[original]);
         activation[size_t(route) * view.inter + row] = __float2bfloat16_rn(value);
     }
 }
@@ -644,7 +645,7 @@ __global__ void Down(const T *activation, float *output, FastllmCudaMoeGGUFCache
     const float value = record ? Dot<Type>(record + size_t(row) * pitch,
         activation + size_t(route) * view.inter, view.inter, 0, 1) : 0;
     if (threadIdx.x % 32 == 0)
-        output[size_t(route) * view.hidden + row] = __bfloat162float(__float2bfloat16_rn(value));
+        output[size_t(OriginalRoute(view, route)) * view.hidden + row] = __bfloat162float(__float2bfloat16_rn(value));
 }
 } // namespace glm5_gguf_cache
 
@@ -665,13 +666,14 @@ bool FastllmCudaMoeGlm5GGUFCacheCompute(const fastllm::Data &input, fastllm::Dat
         rows > 65535 / topk ||
         !FastllmCudaMoeGlm5GGUFCacheSupported(view.gateType, view.downType, view.hidden, view.inter) ||
         !view.workspace || view.workspaceBytes < size_t(rows) * (size_t(view.hidden) + size_t(topk) * view.inter) * sizeof(float) ||
+        (view.routeMap && (view.routeCount <= 0 || view.routeCount > rows * topk)) ||
         !scores || !perExpert || (!view.records && !view.recordPointers) || !view.routeSlots) return false;
     auto *x = static_cast<float *>(view.workspace);
     auto *y = x + size_t(rows) * view.hidden;
-    const int routes = rows * topk;
+    const int routes = ActiveRoutes(view, rows * topk);
     fastllm_gguf_moe::AllocateTensor(activation, fastllm::BFLOAT16,
         {routes, view.inter}, FastllmCudaGetDevice());
-    glm5_gguf_cache::Quantize<<<dim3(view.hidden / QK_K, rows), 256, 0, cudaStreamPerThread>>>(
+    if (!view.q8InputPrepared) glm5_gguf_cache::Quantize<<<dim3(view.hidden / QK_K, rows), 256, 0, cudaStreamPerThread>>>(
         static_cast<const __nv_bfloat16 *>(input.cudaData), x, view.hidden);
     if (view.gateType == GGML_TYPE_IQ2_XXS)
         glm5_gguf_cache::Gate<GGML_TYPE_IQ2_XXS><<<dim3(view.inter, routes), 128, 0, cudaStreamPerThread>>>(

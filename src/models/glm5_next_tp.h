@@ -26,8 +26,19 @@ namespace fastllm {
         int arrived = 0;
         bool failed = false;
         PersistentWorkerGroup workers;
+        std::vector<void *> moeReady;
 
-        ~ThreadTpState() { workers.Stop(); }
+        ~ThreadTpState() {
+            workers.Stop();
+#ifdef USE_CUDA
+            const int previous = FastllmCudaGetDevice();
+            for (size_t r = 0; r < moeReady.size(); ++r) if (moeReady[r]) {
+                FastllmCudaSetDevice(devices[r]);
+                FastllmCudaEventDestroy(moeReady[r]);
+            }
+            FastllmCudaSetDevice(previous);
+#endif
+        }
 
         void Abort() {
             std::lock_guard<std::mutex> lock(barrierMutex);
@@ -118,6 +129,7 @@ namespace fastllm {
         AssertInFastLLM(FastllmInitNccl(devices), "GLM TP NCCL initialization failed.");
         for (int d : devices) {
             FastllmCudaSetDevice(d);
+            tp.moeReady.push_back(d == devices[0] ? nullptr : FastllmCudaEventCreate());
             AssertInFastLLM(FastllmCudaGraphPrepareCaptureDevice(),
                 "GLM TP CUDA device initialization failed.");
         }

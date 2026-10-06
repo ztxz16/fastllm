@@ -2381,15 +2381,24 @@ namespace fastllm {
         const std::string routedDevice = SelectMoeDeviceForLayer(deviceLayer);
         const bool routedOnNumas = routedDevice == "numa" || routedDevice.rfind("numa:", 0) == 0;
         if (threadTpRank >= 0) {
-            // Single-row NUMA decode, including its CPU fallback, uses only
-            // the owner's GPU. Launch its shared expert in the CPU overlap
-            // callback. Other ranks can submit their shared work immediately;
-            // the following AllReduce rendezvous prevents an early NCCL launch.
             const bool localNumasDecode = sequence == 1 && routedOnNumas;
             if (!localNumasDecode || threadTpRank != 0) runShared();
-            if (!localNumasDecode) {
-                // Disk experts and multi-row assistance can use peer GPUs.
-                // Finish rank-local work before handing those GPUs to the owner.
+            if (localNumasDecode) {
+                // Publish peer shared-expert completion without draining its
+                // GPU on the host. The owner borrows a separate per-thread
+                // stream; the following AllReduce waits for the owner on CPU.
+                auto &tp = *threadTpOwner;
+                if (threadTpRank != 0)
+                    FastllmCudaEventRecordCurrentThread(tp.moeReady[threadTpRank]);
+                tp.Barrier();
+                if (threadTpRank == 0) {
+                    for (size_t r = 1; r < tp.devices.size(); ++r) {
+                        FastllmCudaSetDevice(tp.devices[r]);
+                        FastllmCudaCurrentThreadStreamWaitEvent(tp.moeReady[r]);
+                    }
+                    FastllmCudaSetDevice(tp.devices[0]);
+                }
+            } else {
                 FastllmCudaSyncCurrentThreadStream();
                 threadTpOwner->Barrier();
             }
@@ -2400,8 +2409,9 @@ namespace fastllm {
             }
         }
 #endif
-        DiskMoeCudaDeviceScope diskDevices(threadTpRank >= 0
-            ? threadTpOwner->devices : std::vector<int>{});
+        const std::vector<int> noDevices;
+        const auto &moeDevices = threadTpRank >= 0 ? threadTpOwner->devices : noDevices;
+        DiskMoeCudaDeviceScope diskDevices(moeDevices);
         ApplyDeviceMap(deviceMap, deviceLayer + 1, block_cnt);
         Data routerInput, routerScores;
         ToDataType(input, routerInput, DataType::FLOAT32);
@@ -2420,8 +2430,8 @@ namespace fastllm {
 #ifndef USE_ROCM
         if (sequence <= FASTLLM_CUDA_MOE_CACHE_MAX_BATCH && input.dataType == DataType::BFLOAT16 &&
             moeAtype == DataType::BFLOAT16 && routedOnNumas &&
-            FastllmCudaMergeMOEHybrid(input, expertIndex, expertScore, routedOutput,
-                weights.data(), (int)weights.size(), deviceLayer, runShared)) {
+            FastllmCudaMergeMOEHybridOnDevices(input, expertIndex, expertScore, routedOutput,
+                weights.data(), (int)weights.size(), deviceLayer, moeDevices, runShared)) {
             ApplyDeviceMap(deviceMap, deviceLayer + 1, block_cnt);
             AddTo(output, routedOutput);
             input.Reshape(outputDims);

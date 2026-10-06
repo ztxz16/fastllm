@@ -183,7 +183,7 @@ static void CheckVerify(FastllmCudaMoeCacheLayer *layers, std::vector<Data *> *w
     }
     // Grow and shrink one live dispatcher, retaining cache contents and the
     // independent timing estimates for each row count.
-    for (int rows : {2, FASTLLM_CUDA_MOE_CACHE_MAX_BATCH, 3, 8, 5, 2}) {
+    for (int rows : {1, 2, FASTLLM_CUDA_MOE_CACHE_MAX_BATCH, 3, 8, 5, 2, 1}) {
         Data input(BFLOAT16, {rows, hidden}), index(INT32, {rows, topk}), scores(FLOAT32, {rows, topk}), output;
         FastllmCudaSetDevice(0);
         Gpu(input); Gpu(index); Gpu(scores);
@@ -256,8 +256,21 @@ static void CheckVerify(FastllmCudaMoeCacheLayer *layers, std::vector<Data *> *w
                 void *state = FastllmCudaBeginMoeDecode(weights[table].data(), weights[table].size(), topk);
                 Require(state != nullptr, "verify frequency step missing");
                 int callbacks = 0;
-                Require(FastllmCudaMergeMOEHybrid(input, index, scores, output, weights[table].data(),
-                    weights[table].size(), table, [&] {
+                if (dual && pass == 0) {
+                    Data rejected;
+                    Require(!FastllmCudaMergeMOEHybridOnDevices(input, index, scores, rejected,
+                        weights[table].data(), weights[table].size(), table, {1 - device},
+                        [&] { ++callbacks; }), "unlisted origin device accepted");
+                    Require(callbacks == 0 && rejected.cudaData == nullptr,
+                        "rejected device list changed output or ran callback");
+                }
+                // Reuse the dispatcher after preparing both GPUs, then hand
+                // off only the current device. Fallback must honor that scope.
+                const bool restricted = dual && pass % 3 == 2;
+                const auto allowed = restricted ? std::vector<int>{device} :
+                    dual ? std::vector<int>{0, 1} : std::vector<int>{};
+                Require(FastllmCudaMergeMOEHybridOnDevices(input, index, scores, output, weights[table].data(),
+                    weights[table].size(), table, allowed, [&] {
                         ++callbacks;
                         if (dual) Check(cudaSetDevice(1 - device));
                     }), "GLM verifier hybrid rejected");
@@ -266,6 +279,8 @@ static void CheckVerify(FastllmCudaMoeCacheLayer *layers, std::vector<Data *> *w
                 Check(cudaGetDevice(&current));
                 Require(current == device && callbacks == 1, "verify callback/device contract failed");
                 snapshot(after, cacheAfter, gpuAfter);
+                if (restricted) Require(gpuAfter[1 - device] == gpuBefore[1 - device],
+                    "hybrid fallback used a device outside the handoff");
                 sawBoth |= dual && gpuAfter[0] > gpuBefore[0] && gpuAfter[1] > gpuBefore[1];
                 for (int i = 0; i < 8; ++i) { Require(after[i] >= before[i], "verify counters decreased"); after[i] -= before[i]; }
                 Require(after[0] == 1 && after[1] == uint64_t(rows * topk) &&
@@ -444,7 +459,15 @@ int main(int argc, char **argv) {
                 "oversized GLM verifier accepted");
         input.dims[0] = index.dims[0] = scores.dims[0] = 1;
         if (prefill) CheckPrefill(layers, weights, tables, dual);
-        if (verify) CheckVerify(layers, weights, dense, tables, dual, noCache);
+        if (verify) {
+            CheckVerify(layers, weights, dense, tables, dual, noCache);
+            // Restricted-device verification also exercises ordinary decode.
+            // Start the next calibration test with fresh timing estimates so
+            // its cold-path coverage does not depend on the preceding splits.
+            FastllmCudaReleaseMoeCache(weights[0].data(), weights[0].size());
+            Require(FastllmCudaPrepareMoeCache(layers, tables, [] {}, noCache),
+                "decode cache preparation after verify failed");
+        }
         bool sawCpu = false, sawResident = false, sawStaged = false;
         for (int pass = 0; pass < 24; ++pass) {
             const int t = pass % tables;
