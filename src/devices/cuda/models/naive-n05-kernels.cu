@@ -56,6 +56,44 @@ __device__ float WarpSum(float x) {
         x += __shfl_down_sync(0xffffffff, x, offset);
     return x;
 }
+
+constexpr int kDraftKVLayersPerLaunch = 16;
+struct DraftKVDestinations {
+    BF16 *key[kDraftKVLayersPerLaunch], *value[kDraftKVLayersPerLaunch];
+    int length[kDraftKVLayersPerLaunch];
+};
+__global__ void DraftNormRopeWrite(const BF16 *raw, const float *norm,
+        DraftKVDestinations dst, int rows, int layers, int firstLayer,
+        int heads, int dim, int start, float eps, float theta) {
+    int head = blockIdx.x % heads, row = (blockIdx.x / heads) % rows;
+    int slot = blockIdx.x / (heads * rows), layer = firstLayer + slot;
+    int t = threadIdx.x, width = heads * dim;
+    const BF16 *key = raw + (size_t)row * layers * 2 * width + layer * 2 * width + head * dim;
+    __shared__ float sums[8];
+    __shared__ BF16 normalized[256];
+    float value = t < dim ? (float)key[t] : 0;
+    float partial = WarpSum(value * value);
+    if ((t & 31) == 0) sums[t / 32] = partial;
+    __syncthreads();
+    if (t < 32) {
+        float total = WarpSum(t < 8 ? sums[t] : 0);
+        if (t == 0) sums[0] = total;
+    }
+    __syncthreads();
+    // Match KimiK3RMSNorm: BF16 normalization, FP32 weight, then BF16.
+    if (t < dim)
+        normalized[t] = __float2bfloat16(RoundBF16(value * rsqrtf(sums[0] / dim + eps)) * norm[layer * dim + t]);
+    __syncthreads();
+    size_t offset = (size_t)(dst.length[slot] + row) * width + head * dim;
+    if (t < dim / 2) {
+        float angle = (float)(start + row) * powf(theta, -2.0f * t / dim);
+        float c = RoundBF16(cosf(angle)), s = RoundBF16(sinf(angle));
+        float a = (float)normalized[t], b = (float)normalized[t + dim / 2];
+        dst.key[slot][offset + t] = __float2bfloat16(RoundBF16(a * c) - RoundBF16(b * s));
+        dst.key[slot][offset + t + dim / 2] = __float2bfloat16(RoundBF16(b * c) + RoundBF16(a * s));
+    }
+    if (t < dim) dst.value[slot][offset + t] = key[width + t];
+}
 void Output(fastllm::Data &out, fastllm::DataType type, const std::vector<int> &dims) {
     out.dataType = type;
     out.Resize(dims);
@@ -1311,6 +1349,80 @@ __global__ void AttentionValuesTiled(const float *prob, const BF16 *v,
     }
     if (t < 32 && d < dim) out[((size_t)query * heads + h) * dim + d] = __float2bfloat16(sum);
 }
+}
+
+bool FastllmCudaNaiveDraftKV(const fastllm::Data &raw, const fastllm::Data &norm,
+        int start, std::vector<std::pair<fastllm::Data, fastllm::Data>> &kv,
+        int heads, int dim, int window, int reserve, float eps, float theta) {
+    using namespace fastllm;
+    const std::vector<int> devices{FastllmCudaGetDevice()};
+    auto resident = [&](const Data &data, DataType type) {
+        return data.dataType == type && data.dataDevice == DataDevice::CUDA &&
+            data.dataDeviceIds == devices && data.cudaData;
+    };
+    if (heads <= 0 || dim <= 0 || dim > 256 || dim % 2 || window <= 1 ||
+        reserve < 0 || start < 0 ||
+        !std::isfinite(eps) || eps < 0 || !std::isfinite(theta) || theta <= 0 ||
+        !resident(raw, BFLOAT16) || !resident(norm, FLOAT32) ||
+        norm.dims.size() != 2 || norm.dims[0] <= 0 || norm.dims[1] != dim ||
+        norm.strides.size() != 2 || norm.strides[1] != 1 || norm.strides[0] != dim ||
+        raw.dims.size() != 3 || raw.dims[0] != 1 || raw.dims[1] <= 0 ||
+        (int64_t)start + raw.dims[1] > INT_MAX) return false;
+    int layers = norm.dims[0], rows = raw.dims[1];
+    int64_t width64 = (int64_t)heads * dim;
+    if (width64 > INT_MAX / 2 / layers) return false;
+    int width = (int)width64, columns = layers * 2 * width;
+    if (raw.dims[2] != columns ||
+        raw.strides.size() != 3 || raw.strides[2] != 1 || raw.strides[1] != columns ||
+        (int64_t)std::min(layers, kDraftKVLayersPerLaunch) * rows * heads > INT_MAX ||
+        (!kv.empty() && kv.size() != (size_t)layers)) return false;
+    // Validate every layer before resizing any cache; rejected calls are safe to
+    // fall back to the separate projections and ordinary append operations.
+    for (const auto &pair : kv) {
+        if (pair.first.dims != pair.second.dims) return false;
+        for (const Data *cache : {&pair.first, &pair.second}) {
+            if (cache->dims.empty()) {
+                if (!cache->expansionDims.empty()) return false;
+                continue;
+            }
+            if (!resident(*cache, BFLOAT16) || cache->dims.size() != 3 ||
+                cache->dims[0] != 1 || cache->dims[2] != width || cache->dims[1] < 0 ||
+                (int64_t)cache->dims[1] + rows > INT_MAX ||
+                cache->strides.size() != 3 || cache->strides[2] != 1 || cache->strides[1] != width ||
+                (!cache->expansionDims.empty() && (cache->expansionDims.size() != 3 ||
+                    cache->expansionDims[0] != 1 || cache->expansionDims[2] != width))) return false;
+        }
+    }
+    kv.resize(layers);
+    // Pass a bounded pointer table by value; models with more layers use multiple
+    // launches, without a per-call host-to-device pointer upload or fixed layer cap.
+    for (int first = 0; first < layers; first += kDraftKVLayersPerLaunch) {
+        DraftKVDestinations dst{};
+        int count = std::min(kDraftKVLayersPerLaunch, layers - first);
+        for (int i = 0; i < count; ++i) {
+            auto &pair = kv[first + i];
+            int old = pair.first.dims.empty() ? 0 : pair.first.dims[1];
+            dst.length[i] = old;
+            for (Data *cache : {&pair.first, &pair.second}) {
+                cache->dataType = BFLOAT16;
+                cache->UpdateUnitSize();
+                cache->ToDevice(DataDevice::CUDA, devices);
+                int64_t wanted = std::max(old + rows, reserve);
+                if (cache->expansionDims.empty() || cache->expansionDims[1] < wanted)
+                    cache->Expansion({1, (int)std::min<int64_t>(INT_MAX, (wanted + 127) / 128 * 128), width});
+                cache->Resize({1, old + rows, width});
+                cache->isKVCache = true;
+            }
+            dst.key[i] = (BF16 *)pair.first.cudaData;
+            dst.value[i] = (BF16 *)pair.second.cudaData;
+        }
+        DraftNormRopeWrite<<<count * rows * heads, 256, 0, cudaStreamPerThread>>>(
+            (const BF16 *)raw.cudaData, (const float *)norm.cudaData, dst,
+            rows, layers, first, heads, dim, start, eps, theta);
+        CheckLaunch();
+    }
+    for (auto &pair : kv) FastllmCudaNaiveTrimCache(pair.first, pair.second, window - 1);
+    return true;
 }
 
 void FastllmCudaNaiveTrimCache(fastllm::Data &key, fastllm::Data &value, int keep) {

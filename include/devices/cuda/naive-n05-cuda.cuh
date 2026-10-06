@@ -42,6 +42,12 @@ void FastllmCudaNaiveLogitsSelect(const fastllm::Data &logits, int vocabOffset,
 
 // Model-specific CUDA operations use BF16 activations. Keys/values are packed
 // as [1, tokens, heads * dim (+ indexDim for DSA keys)].
+// raw is [1, rows, layers * 2 * heads * dim], in K0,V0,K1,V1 order.
+// Returns false on unsupported layouts without changing cache contents/metadata.
+bool FastllmCudaNaiveDraftKV(const fastllm::Data &raw, const fastllm::Data &norm,
+    int start, std::vector<std::pair<fastllm::Data, fastllm::Data>> &kv,
+    int heads, int dim, int window, int reserve, float eps, float theta);
+
 void FastllmCudaNaiveRope(fastllm::Data &input, const fastllm::Data &positions,
                          int heads, int dim, int rotaryDim, float theta);
 // In-place Q/K RoPE and V scaling, preserving eager BF16 rounding.

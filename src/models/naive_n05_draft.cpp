@@ -2,6 +2,7 @@
 #include "models/speculative_sampling.h"
 #include "json11.hpp"
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #ifdef USE_CUDA
 #include "devices/cuda/naive-n05-cuda.cuh"
@@ -20,6 +21,12 @@ namespace {
 }
 
 #ifdef USE_CUDA
+struct NaiveN05FlashModel::DraftKVProjection {
+    // Immutable source weights, in K/V/norm order for each layer.
+    std::vector<void *> sources;
+    Data weight, norm;
+};
+
 struct NaiveN05FlashModel::DraftWorkspace {
     struct Layer { Data normed, q, k, v, attention, output, gate, up, scores; };
     struct Graph {
@@ -65,10 +72,11 @@ std::shared_ptr<NaiveN05FlashModel::DraftContext> NaiveN05FlashModel::CreateDraf
     if (idleDraftContext) {
         context->kv.swap(idleDraftContext->kv);
         context->workspace.swap(idleDraftContext->workspace);
+        context->projectedKV.swap(idleDraftContext->projectedKV);
         idleDraftContext.reset();
         for (auto &pair : context->kv)
             for (Data *cache : {&pair.first, &pair.second})
-                cache->Resize({1, 0, cache->dims[2]});
+                if (cache->dims.size() == 3) cache->Resize({1, 0, cache->dims[2]});
     }
     return context;
 }
@@ -386,9 +394,92 @@ void NaiveN05FlashModel::InitDraft() {
                       "dspark.layers.*.mlp.*_proj.weight"}) weight.linearNames.insert(name);
 }
 
+bool NaiveN05FlashModel::AppendDraftContextFused(Data &hidden, int start, DraftContext &context) {
+#ifdef USE_CUDA
+    const std::vector<int> devices{FastllmCudaGetDevice()};
+    // Avoid a prefill-sized intermediate and preserve the original low-memory path.
+    if (GetLowMemMode() || draftLayers <= 0 || draftKvHeads <= 0 ||
+        draftHeadDim <= 0 || draftHeadDim > 256 || draftHeadDim % 2 ||
+        hidden.dims.size() != 3 || hidden.dims[0] != 1 || hidden.dims[1] <= 0 ||
+        (int64_t)hidden.dims[1] > (int64_t)draftBlock + 1 || hidden.dims[1] >= draftWindow ||
+        hidden.dataType != BFLOAT16 || hidden.dataDevice != DataDevice::CUDA ||
+        !hidden.cudaData || hidden.multiDeviceData ||
+        hidden.dataDeviceIds != devices ||
+        hidden.strides.size() != 3 || hidden.strides[2] != 1 ||
+        hidden.strides[1] != hidden.dims[2] ||
+        hidden.strides[0] != (uint64_t)hidden.dims[1] * hidden.dims[2]) return false;
+    const int64_t width64 = (int64_t)draftKvHeads * draftHeadDim;
+    if (width64 > INT_MAX / 2 / draftLayers || hidden.dims[2] <= 0 ||
+        (int64_t)draftWindow + draftBlock > INT_MAX) return false;
+    const int width = (int)width64;
+    const std::vector<int> matrixDims{width, hidden.dims[2]}, normDims{draftHeadDim};
+    const std::vector<int> packedDims{draftLayers * 2 * width, hidden.dims[2]};
+    const std::vector<int> packedNormDims{draftLayers, draftHeadDim};
+    std::vector<void *> sources;
+    auto dense = [&](Data &tensor, DataType type, const std::vector<int> &dims) {
+        if (tensor.dataType != type || tensor.dims != dims ||
+            tensor.dataDevice != DataDevice::CUDA || !tensor.cudaData || tensor.multiDeviceData ||
+            tensor.dataDeviceIds != devices || tensor.strides.size() != dims.size()) return false;
+        uint64_t stride = 1;
+        for (int i = (int)dims.size() - 1; i >= 0; --i) {
+            if (tensor.strides[i] != stride) return false;
+            stride *= dims[i];
+        }
+        sources.push_back(tensor.cudaData);
+        return true;
+    };
+    // Prefill materializes the original weights. Do not move CPU/offloaded or
+    // sharded weights just to enable this optional optimization.
+    for (int i = 0; i < draftLayers; ++i) {
+        const auto name = "dspark.layers." + std::to_string(i) + ".self_attn.";
+        for (const char *suffix : {"k_proj.weight", "v_proj.weight"}) {
+            Data &tensor = weight[name + suffix];
+            if (!dense(tensor, BFLOAT16, matrixDims)) return false;
+        }
+        Data &norm = weight[name + "k_norm.weight"];
+        if (!dense(norm, FLOAT32, normDims)) return false;
+    }
+    if (!draftKVProjection || draftKVProjection->weight.dataDeviceIds != devices ||
+        draftKVProjection->sources != sources ||
+        draftKVProjection->weight.dims != packedDims || draftKVProjection->norm.dims != packedNormDims) {
+        auto packed = std::make_shared<DraftKVProjection>();
+        packed->sources = std::move(sources);
+        auto allocate = [&](Data &data, DataType type, const std::vector<int> &dims) {
+            data.dataType = type;
+            data.Resize(dims);
+            data.ToDevice(DataDevice::CUDA, devices, false);
+            data.Allocate(false);
+        };
+        allocate(packed->weight, BFLOAT16, packedDims);
+        allocate(packed->norm, FLOAT32, packedNormDims);
+        const size_t bytes = (size_t)width * hidden.dims[2] * sizeof(uint16_t);
+        for (int i = 0; i < draftLayers; ++i) {
+            for (int part = 0; part < 2; ++part)
+                FastllmCudaCopyFromDeviceToDevice((char *)packed->weight.cudaData + (i * 2 + part) * bytes,
+                                                 packed->sources[i * 3 + part], bytes);
+            FastllmCudaCopyFromDeviceToDevice((float *)packed->norm.cudaData + i * draftHeadDim,
+                                             packed->sources[i * 3 + 2], draftHeadDim * sizeof(float));
+        }
+        draftKVProjection = std::move(packed);
+    }
+    if (!context.projectedKV) context.projectedKV = std::make_shared<Data>();
+    // Changing GEMM output width can change BF16 rounding; postprocessing retains
+    // the separate RMSNorm and RoPE operations' rounding and reduction order.
+    DraftLinear(hidden, draftKVProjection->weight, *context.projectedKV);
+    if (!FastllmCudaNaiveDraftKV(*context.projectedKV, draftKVProjection->norm, start,
+            context.kv, draftKvHeads, draftHeadDim, draftWindow,
+            draftWindow + draftBlock, draftEps, draftTheta)) return false;
+    context.committed = start + hidden.dims[1];
+    return true;
+#else
+    return false;
+#endif
+}
+
 void NaiveN05FlashModel::AppendDraftContext(Data &hidden, int start, DraftContext &context) {
 #ifdef USE_CUDA
     ApplyDraftDevice();
+    if (AppendDraftContextFused(hidden, start, context)) return;
     int length = hidden.dims[1];
     // Only the last window - 1 context positions can be visible to the next block.
     int begin = std::max(0, length - draftWindow + 1);

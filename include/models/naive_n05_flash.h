@@ -76,10 +76,12 @@ namespace fastllm {
             std::shared_ptr<HistoryChunk> history;
         };
         struct DraftWorkspace;
+        struct DraftKVProjection;
         struct DraftContext {
             int committed = 0;
             std::vector<std::pair<Data, Data>> kv;
             std::shared_ptr<DraftWorkspace> workspace;
+            std::shared_ptr<Data> projectedKV;
             Data restoredHidden;
             std::deque<std::pair<int, int>> pending;
             std::mt19937_64 random{std::random_device{}()};
@@ -99,6 +101,7 @@ namespace fastllm {
                          std::vector<float> *retLogits, LogitsSelection *selection = nullptr);
         void InitDraft();
         void AppendDraftContext(Data &hidden, int start, DraftContext &context);
+        bool AppendDraftContextFused(Data &hidden, int start, DraftContext &context);
         void CommitDraftContext(TargetCapture &capture, int tokens, DraftContext &context,
                                 std::vector<std::pair<Data, Data>> &kv);
         std::shared_ptr<DraftContext> CreateDraftContext();
@@ -125,6 +128,8 @@ namespace fastllm {
         std::vector<int> draftTargetLayers;
         std::map<const std::vector<std::pair<Data, Data>> *, std::shared_ptr<DraftContext>> draftContexts;
         std::shared_ptr<DraftContext> idleDraftContext;
+        // Immutable merged projections belong to the model, independently of graphs.
+        std::shared_ptr<DraftKVProjection> draftKVProjection;
 
     private:
         // Only request lifecycle callbacks (serialized by dictLocker) own this
