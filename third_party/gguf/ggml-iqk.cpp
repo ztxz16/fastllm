@@ -1,5 +1,6 @@
 #include "gguf.h"
 #include <assert.h>
+#include <vector>
 
 #ifdef __aarch64__
 // some compilers don't provide _mm256_set_m128i, e.g. gcc 7
@@ -2110,6 +2111,76 @@ static void mul_mat_iq4_nl_q8_0(int n, const void *vx, size_t bx,
     }
 }
 
+// Transpose each Q8 block once so a Q2 half-block can be unpacked with a
+// broadcast and per-dword shifts, without interleaving its bytes for every row.
+struct Q2_0InputBlock {
+    __m256i qs;
+    __m256i pair_sums;
+    float d;
+};
+
+template <int nrc_y>
+static void mul_mat_q2_0_q8_0(int n, const void *vx, size_t bx,
+                             const DataInfo &info, int nrc_x) {
+    assert(n % QK2_0 == 0);
+    if (nrc_x <= 0) return;
+    // A single output row cannot amortize the input preparation.
+    if (nrc_x == 1) {
+        for (int iy = 0; iy < nrc_y; ++iy) {
+            float result;
+            ggml_vec_dot_q2_0_q8_0(n, &result, 0, vx, 0, info.src1_row(iy), 0, 1);
+            info.store(0, iy, result);
+        }
+        return;
+    }
+    const int blocks = n / QK2_0;
+    Q2_0InputBlock local[64];
+    std::vector<Q2_0InputBlock> large;
+    if (2 * blocks > 64) large.resize(2 * blocks);
+    auto *prepared = 2 * blocks <= 64 ? local : large.data();
+    const __m256i mask = _mm256_set1_epi8(3);
+    const __m256i shifts = _mm256_setr_epi32(0, 0, 2, 2, 4, 4, 6, 6);
+    const __m256i ones8 = _mm256_set1_epi8(1);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    const __m256i transpose = _mm256_setr_epi8(
+        0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15,
+        0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15);
+    const __m256i join = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+    for (int iy = 0; iy < nrc_y; ++iy) {
+        const auto *y = reinterpret_cast<const block_q8_0 *>(info.src1_row(iy));
+        for (int b = 0; b < 2 * blocks; ++b) {
+            const auto q = _mm256_loadu_si256((const __m256i *)y[b].qs);
+            prepared[b].qs = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(q, transpose), join);
+            prepared[b].pair_sums = _mm256_maddubs_epi16(ones8, prepared[b].qs);
+            prepared[b].d = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(y[b].d)));
+        }
+        for (int ix = 0; ix < nrc_x; ++ix) {
+            const auto *x = reinterpret_cast<const block_q2_0 *>((const char *)vx + ix * bx);
+            __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+            for (int b = 0; b < blocks; ++b) {
+                const auto &y0 = prepared[2 * b];
+                const auto &y1 = prepared[2 * b + 1];
+                const auto bits0 = _mm256_broadcastq_epi64(_mm_loadl_epi64((const __m128i *)x[b].qs));
+                const auto bits1 = _mm256_broadcastq_epi64(_mm_loadl_epi64((const __m128i *)(x[b].qs + 8)));
+                const auto q0 = _mm256_and_si256(_mm256_srlv_epi32(bits0, shifts), mask);
+                const auto q1 = _mm256_and_si256(_mm256_srlv_epi32(bits1, shifts), mask);
+                // Subtract in int16 to support Q8=-128 as well as zero codes.
+                const auto p0 = _mm256_sub_epi16(_mm256_maddubs_epi16(q0, y0.qs), y0.pair_sums);
+                const auto p1 = _mm256_sub_epi16(_mm256_maddubs_epi16(q1, y1.qs), y1.pair_sums);
+                const float d = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(x[b].d)));
+                acc0 = _mm256_fmadd_ps(_mm256_set1_ps(d * y0.d),
+                    _mm256_cvtepi32_ps(_mm256_madd_epi16(p0, ones16)), acc0);
+                acc1 = _mm256_fmadd_ps(_mm256_set1_ps(d * y1.d),
+                    _mm256_cvtepi32_ps(_mm256_madd_epi16(p1, ones16)), acc1);
+            }
+            const auto acc = _mm256_add_ps(acc0, acc1);
+            auto sum = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+            sum = _mm_add_ps(sum, _mm_movehl_ps(sum, sum));
+            info.store(ix, iy, _mm_cvtss_f32(_mm_add_ss(sum, _mm_movehdup_ps(sum))));
+        }
+    }
+}
+
 #if defined(__AVX512VNNI__) && defined(__AVX512VL__)
 static inline float q8_0_scale(const block_q8_0 &block) {
     return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int)block.d)));
@@ -2186,6 +2257,8 @@ mul_mat_t GetMulMatFunction(ggml_type type, int nrc_y) {
         RETURN_MATMUL_FUNCTION(mul_mat_iq4_nl_q8_0, nrc_y)
     } else if (type == GGML_TYPE_Q8_0) {
         RETURN_MATMUL_FUNCTION(mul_mat_q8_0_q8_0_fast, nrc_y)
+    } else if (type == GGML_TYPE_Q2_0) {
+        RETURN_MATMUL_FUNCTION(mul_mat_q2_0_q8_0, nrc_y)
     } else if (type == GGML_TYPE_IQ2_XXS_R4) {
         RETURN_MATMUL_FUNCTION(mul_mat_iq2_xxs_r4_q8_k, nrc_y)
     } else if (type == GGML_TYPE_IQ2_XS_R4) {
