@@ -1,5 +1,6 @@
 #include "gguf.h"
 #include <assert.h>
+#include <array>
 #include <vector>
 
 #ifdef __aarch64__
@@ -508,6 +509,158 @@ mul_mat_t GetMulMatFunction(ggml_type type, int nrc_y) {
 
 // #define HAVE_FANCY_SIMD
 
+#if !defined(__AVX512F__)
+// Keep IQ2_S in its ordinary GGUF layout on AVX2. Four 10-bit codebook
+// indices fit in one scalar register; expanding their high bits through a
+// shared 2 KiB table avoids four separate shift/mask/OR sequences. This is
+// an index table, not an expanded or repacked copy of the model weights.
+static inline __m256i iq2_s_native_values(const uint8_t *qs, uint8_t qh) {
+    static constexpr auto high = [] {
+        std::array<uint64_t, 256> table{};
+        for (int i = 0; i < 256; ++i)
+            for (int j = 0; j < 4; ++j)
+                table[i] |= uint64_t((i >> (2 * j)) & 3) << (16 * j + 8);
+        return table;
+    }();
+    uint32_t low;
+    std::memcpy(&low, qs, sizeof(low));
+    const uint64_t indices = uint64_t(_mm_cvtsi128_si64(
+        _mm_cvtepu8_epi16(_mm_cvtsi32_si128(low)))) | high[qh];
+    // Each 16-bit lane is already bounded by 1023. Word extraction avoids
+    // repeating a 10-bit mask at every codebook load.
+    return _mm256_setr_epi64x(
+        iq2s_grid[uint16_t(indices)], iq2s_grid[uint16_t(indices >> 16)],
+        iq2s_grid[uint16_t(indices >> 32)], iq2s_grid[uint16_t(indices >> 48)]);
+}
+
+// Expand one sign bit per value, in groups of 32.
+static inline __m256i iq_s_native_signs(const uint8_t *signs) {
+    uint32_t bits;
+    std::memcpy(&bits, signs, sizeof(bits));
+    const auto mask = _mm256_set1_epi64x(0x8040201008040201ULL);
+    const auto expanded = _mm256_shuffle_epi8(_mm256_set1_epi32(bits),
+        _mm256_setr_epi64x(0, 0x0101010101010101LL,
+                          0x0202020202020202LL, 0x0303030303030303LL));
+    return _mm256_cmpeq_epi8(_mm256_and_si256(expanded, mask), mask);
+}
+
+template <int nrc_y, bool signed_extreme>
+static void mul_mat_iq2_s_native_impl(int n, const void *vx, size_t bx,
+                                    const DataInfo &info, int nrc_x) {
+    static constexpr auto scale_shuffle = [] {
+        std::array<uint16_t, 128> table{};
+        for (int g = 0; g < 8; ++g)
+            for (int j = 0; j < 16; ++j) table[16 * g + j] = 0x0100 + g * 0x0202;
+        return table;
+    }();
+    const block_q8_K *y[nrc_y];
+    for (int iy = 0; iy < nrc_y; ++iy)
+        y[iy] = reinterpret_cast<const block_q8_K *>(info.src1_row(iy));
+    const int blocks = n / QK_K;
+    for (int ix = 0; ix < nrc_x; ++ix) {
+        const auto *x = reinterpret_cast<const block_iq2_s *>(
+            static_cast<const char *>(vx) + size_t(ix) * bx);
+        __m256 acc[nrc_y] = {};
+        for (int b = 0; b < blocks; ++b) {
+            uint64_t packed_scales;
+            std::memcpy(&packed_scales, x[b].scales, sizeof(packed_scales));
+            const auto scales8 = _mm_add_epi8(_mm_slli_epi16(_mm_and_si128(
+                _mm_set_epi64x(packed_scales >> 4, packed_scales),
+                _mm_set1_epi8(15)), 1), _mm_set1_epi8(1));
+            const auto scales16 = _mm256_cvtepi8_epi16(scales8);
+            // Two independent sums help decode. With more input rows there
+            // are enough independent chains already; one sum per input
+            // avoids spilling 2*nrc_y live integer vectors on AVX2.
+            __m256i total0[nrc_y] = {}, total1[nrc_y <= 2 ? nrc_y : 1] = {};
+            for (int g = 0; g < 8; g += 2) {
+                auto q0 = iq2_s_native_values(x[b].qs + 4 * g, x[b].qh[g]);
+                auto q1 = iq2_s_native_values(x[b].qs + 4 * g + 4, x[b].qh[g + 1]);
+                const auto s0 = iq_s_native_signs(x[b].qs + QK_K / 8 + 4 * g);
+                const auto s1 = iq_s_native_signs(x[b].qs + QK_K / 8 + 4 * g + 4);
+                const auto scale0 = _mm256_shuffle_epi8(scales16,
+                    _mm256_loadu_si256((const __m256i *)(scale_shuffle.data() + 16 * g)));
+                const auto scale1 = _mm256_shuffle_epi8(scales16,
+                    _mm256_loadu_si256((const __m256i *)(scale_shuffle.data() + 16 * (g + 1))));
+                if constexpr (signed_extreme) {
+                    q0 = _mm256_sign_epi8(q0, _mm256_or_si256(s0, _mm256_set1_epi8(1)));
+                    q1 = _mm256_sign_epi8(q1, _mm256_or_si256(s1, _mm256_set1_epi8(1)));
+                }
+                for (int iy = 0; iy < nrc_y; ++iy) {
+                    const auto a0 = _mm256_loadu_si256((const __m256i *)(y[iy][b].qs + 32 * g));
+                    const auto a1 = _mm256_loadu_si256((const __m256i *)(y[iy][b].qs + 32 * g + 32));
+                    __m256i pair0, pair1;
+                    if constexpr (signed_extreme) {
+                        // A signed-byte negation cannot represent +128. IQ2
+                        // codebook values fit in int8, so apply Q8's sign to
+                        // those values and treat abs(-128) as unsigned 128.
+                        pair0 = _mm256_maddubs_epi16(_mm256_abs_epi8(a0), _mm256_sign_epi8(q0, a0));
+                        pair1 = _mm256_maddubs_epi16(_mm256_abs_epi8(a1), _mm256_sign_epi8(q1, a1));
+                    } else {
+                        pair0 = _mm256_maddubs_epi16(q0, _mm256_sub_epi8(_mm256_xor_si256(s0, a0), s0));
+                        pair1 = _mm256_maddubs_epi16(q1, _mm256_sub_epi8(_mm256_xor_si256(s1, a1), s1));
+                    }
+                    if constexpr (nrc_y <= 2) {
+                        total0[iy] = _mm256_add_epi32(total0[iy], _mm256_madd_epi16(pair0, scale0));
+                        total1[iy] = _mm256_add_epi32(total1[iy], _mm256_madd_epi16(pair1, scale1));
+                    } else {
+                        total0[iy] = _mm256_add_epi32(total0[iy], _mm256_add_epi32(
+                            _mm256_madd_epi16(pair0, scale0), _mm256_madd_epi16(pair1, scale1)));
+                    }
+                }
+            }
+            const float dx = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(x[b].d)));
+            for (int iy = 0; iy < nrc_y; ++iy) {
+                auto total = total0[iy];
+                if constexpr (nrc_y <= 2) total = _mm256_add_epi32(total, total1[iy]);
+                acc[iy] = _mm256_fmadd_ps(_mm256_set1_ps(dx * y[iy][b].d),
+                    _mm256_cvtepi32_ps(total), acc[iy]);
+            }
+        }
+        for (int iy = 0; iy < nrc_y; ++iy) {
+            auto sum = _mm_add_ps(_mm256_castps256_ps128(acc[iy]), _mm256_extractf128_ps(acc[iy], 1));
+            sum = _mm_add_ps(sum, _mm_movehl_ps(sum, sum));
+            info.store(ix, iy, 0.125f * _mm_cvtss_f32(_mm_add_ss(sum, _mm_movehdup_ps(sum))));
+        }
+    }
+}
+
+template <int nrc_y>
+static void mul_mat_iq2_s_q8_k(int n, const void *vx, size_t bx,
+                             const DataInfo &info, int nrc_x) {
+    assert(n % QK_K == 0);
+    if (nrc_x == 0) return;
+    // The normal Q8_K quantizer produces [-127, 127]. Inspect each input
+    // once per matrix call, rather than adding endpoint handling to every
+    // output row's inner loop. External Q8_K buffers may also contain -128.
+    auto extremes = _mm256_setzero_si256();
+    for (int iy = 0; iy < nrc_y; ++iy) {
+        const auto *y = reinterpret_cast<const block_q8_K *>(info.src1_row(iy));
+        for (int b = 0; b < n / QK_K; ++b)
+            for (int g = 0; g < 8; ++g)
+                extremes = _mm256_or_si256(extremes, _mm256_cmpeq_epi8(
+                    _mm256_loadu_si256((const __m256i *)(y[b].qs + 32 * g)), _mm256_set1_epi8(-128)));
+    }
+    if (_mm256_movemask_epi8(extremes))
+        mul_mat_iq2_s_native_impl<nrc_y, true>(n, vx, bx, info, nrc_x);
+    else if constexpr (nrc_y >= 5) {
+        // Four input rows fit the AVX2 register file. Finish both input
+        // groups on a small output tile while its ordinary weights are hot.
+        for (int ix = 0; ix < nrc_x; ix += 8) {
+            const int rows = std::min(8, nrc_x - ix);
+            const auto *x = static_cast<const char *>(vx) + size_t(ix) * bx;
+            auto tile = info;
+            tile.s += ix;
+            mul_mat_iq2_s_native_impl<4, false>(n, x, bx, tile, rows);
+            tile.cur_y += 4;
+            mul_mat_iq2_s_native_impl<nrc_y - 4, false>(n, x, bx, tile, rows);
+        }
+    } else {
+        mul_mat_iq2_s_native_impl<nrc_y, false>(n, vx, bx, info, nrc_x);
+    }
+}
+
+#endif
+
 // Interleave four rows without expanding their packed quants to 256 bytes.
 // Each 128-bit lane contains a four-byte group for one half of the block.
 static inline void store_r4_groups(uint8_t * dst, const __m256i * rows, int half_stride) {
@@ -939,7 +1092,9 @@ const Repack * get_repack_info(ggml_type type) {
         // { GGML_TYPE_IQ2_BN, { GGML_TYPE_IQ2_BN_R4, 4,  (Repack::repack_func)repack_iq2_bn}  },
         { GGML_TYPE_IQ2_XXS,{ GGML_TYPE_IQ2_XXS_R4,4,  (Repack::repack_func)repack_iq2_xxs} },
         { GGML_TYPE_IQ2_XS, { GGML_TYPE_IQ2_XS_R4, 4,  (Repack::repack_func)repack_iq2_xs}  },
+#if defined(__AVX512F__)
         { GGML_TYPE_IQ2_S,  { GGML_TYPE_IQ2_S_R4,  4,  (Repack::repack_func)repack_iq2_s}   },
+#endif
         { GGML_TYPE_IQ3_XXS,{ GGML_TYPE_IQ3_XXS_R4,4,  (Repack::repack_func)repack_iq3_xxs} },
         // { GGML_TYPE_IQ3_S,  { GGML_TYPE_IQ3_S_R4,  4,  (Repack::repack_func)repack_iq3_s}   },
         { GGML_TYPE_Q2_K,   { GGML_TYPE_Q2_K_R4,   4,  (Repack::repack_func)repack_q2_k}    },
@@ -2263,6 +2418,10 @@ mul_mat_t GetMulMatFunction(ggml_type type, int nrc_y) {
         RETURN_MATMUL_FUNCTION(mul_mat_iq2_xxs_r4_q8_k, nrc_y)
     } else if (type == GGML_TYPE_IQ2_XS_R4) {
         RETURN_MATMUL_FUNCTION(mul_mat_iq2_xs_r4_q8_k, nrc_y)
+#if !defined(__AVX512F__)
+    } else if (type == GGML_TYPE_IQ2_S) {
+        RETURN_MATMUL_FUNCTION(mul_mat_iq2_s_q8_k, nrc_y)
+#endif
     } else if (type == GGML_TYPE_IQ2_S_R4) {
         RETURN_MATMUL_FUNCTION(mul_mat_iq2_s_r4_q8_k, nrc_y)
     } else if (type == GGML_TYPE_IQ3_XXS_R4) {
