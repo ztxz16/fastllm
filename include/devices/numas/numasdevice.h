@@ -93,6 +93,13 @@ namespace fastllm {
         Data **weights, const int32_t *indices, const int32_t *gpuIndices,
         int topk, int layer, const std::function<void()> &submitGpu,
         const float *routeScores, float swigluLimit, int activationQuantBlock);
+    // CPU preparation and worker wall time, excluding callback-only stalls.
+    // Worker completion timestamps retain CPU time that overlaps submitGpu.
+    void NumasMoeDecodeExpertsWithOverlap(const float *input, float *output,
+        Data **weights, const int32_t *indices, const int32_t *gpuIndices,
+        int topk, int layer, const std::function<void()> &submitGpu,
+        const float *routeScores, float swigluLimit, int activationQuantBlock,
+        double *cpuElapsedUs);
 
     // FP32 verifier subset, returning unweighted [row, route, hidden] values.
     // An expert must have the same CPU/GPU ownership in every input row.

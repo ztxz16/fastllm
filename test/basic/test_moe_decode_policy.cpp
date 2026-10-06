@@ -267,6 +267,36 @@ static void TestDecodeOverlap() {
     computeBound.stagedExpert.Observe(80);
     Require(computeBound.SelectMisses(6, 0) == 2,
             "compute-bound pipeline did not wait for the preceding expert");
+
+    fastllm::MoeDecodeOverlapScheduler decode;
+    Require(decode.SelectDecodeMisses(8, 0) == 0,
+            "decode did not measure the no-upload baseline first");
+    decode.ObserveDecodeCpu(8, 600);
+    Require(decode.SelectDecodeMisses(8, 0) == 4,
+            "decode did not calibrate GPU after the CPU baseline");
+    decode.ObserveDecodeCpu(6, 600); // fixed CPU overhead; linear extrapolation is wrong
+    decode.copiedExpert.Observe(250);
+    decode.stagedExpert.Observe(20);
+    decode.dispatch.Observe(50);
+    Require(decode.DecodeCpuUs(7) == 600 && decode.SelectDecodeMisses(8, 0) == 0,
+            "decode ignored measured CPU costs and chose a slower split");
+    decode.decodeCpu[6] = {};
+    decode.ObserveDecodeCpu(6, 450);
+    decode.copiedExpert = {};
+    decode.copiedExpert.Observe(200);
+    Require(decode.SelectDecodeMisses(8, 0) == 2,
+            "decode serialized host dispatch with already running CPU workers");
+    decode.calls = 126;
+    Require(decode.SelectDecodeMisses(8, 0) == 0,
+            "decode failed to refresh the no-upload baseline");
+    decode.calls = 127;
+    decode.copiedExpert.Observe(2000);
+    for (int i = 0; i < 100; ++i) decode.copiedExpert.Observe(2000);
+    Require(decode.SelectDecodeMisses(8, 0) == 0,
+            "decode did not adapt to slower PCIe");
+    decode.calls = 253;
+    Require(decode.SelectDecodeMisses(8, 0) == 1,
+            "decode stopped probing an unused GPU path");
 }
 
 static void TestParallelOverlap() {

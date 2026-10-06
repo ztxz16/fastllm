@@ -54,6 +54,47 @@ static void Reference(const float *input, float *output, Data &gate, Data &down)
             1, inter, hidden, 0, hidden / nodes).Run();
 }
 
+static void TestScoredSmallBlocks() {
+    // Q4_0 has 32-value blocks: legal intermediate widths need not meet
+    // NVFP4's 128-value per-shard activation constraint.
+    constexpr int hidden = 256, experts = 3, topk = 4;
+    for (int inter : {64, 192}) {
+        std::vector<std::unique_ptr<Data>> owned;
+        std::vector<Data *> weights(2 * (experts + 1), nullptr);
+        for (int e = 1; e <= experts; ++e) for (int part = 0; part < 2; ++part) {
+            auto w = Weight(GGML_TYPE_Q4_0, part ? hidden : 2 * inter,
+                            part ? inter : hidden, 31 * e + part);
+            RegisterNumas(w.get(), part ? "linearColumn" : "linearSwiglu");
+            weights[2 * e + part] = w.get(); owned.push_back(std::move(w));
+        }
+        Check(CanRunNumasMoeDecodeExperts(weights.data(), weights.size()), "small-block fixture rejected");
+        std::vector<float> x(hidden), expected(topk * hidden), actual(topk * hidden);
+        std::vector<uint16_t> bits(hidden);
+        for (int c = 0; c < hidden; ++c) {
+            bits[c] = Float32ToBFloat16RNEBits(std::sin(c * .17f) * .125f);
+            x[c] = BFloat16BitsToFloat32(bits[c]);
+        }
+        const int32_t ids[topk] = {2, 0, 2, 1};
+        const float scores[topk] = {.375f, 0, -.125f, .25f};
+        for (int cpuCount = 1; cpuCount <= experts; ++cpuCount) {
+            int32_t gpu[topk];
+            for (int r = 0; r < topk; ++r) gpu[r] = ids[r] >= experts - cpuCount ? -1 : 0;
+            std::fill(expected.begin(), expected.end(), 123456.f);
+            std::fill(actual.begin(), actual.end(), 123456.f);
+            NumasMoeVerifyExperts(bits.data(), expected.data(), 1, weights.data(), weights.size(),
+                ids, gpu, scores, topk, 0, .125f, true, 128);
+            int submitted = 0;
+            double cpuUs = 0;
+            NumasMoeDecodeExpertsWithOverlap(x.data(), actual.data(), weights.data(), ids, gpu,
+                topk, 0, [&] { ++submitted; }, scores, .125f, 128, &cpuUs);
+            Check(submitted == 1 && cpuUs > 0, "small-block callback or timing missing");
+            for (size_t i = 0; i < actual.size(); ++i)
+                Check(actual[i] == expected[i], "scored small-block decode differs from verifier");
+        }
+        ClearNumasMoeRuntimeCache();
+    }
+}
+
 int main(int argc, char **argv) {
     try {
         SetThreads(argc > 1 ? std::atoi(argv[1]) : 4);
@@ -61,6 +102,7 @@ int main(int argc, char **argv) {
         cpu_set_t allowed;
         Check(sched_getaffinity(0, sizeof(allowed), &allowed) == 0, "cannot read test CPU mask");
 #endif
+        TestScoredSmallBlocks();
         constexpr int experts = 8, topk = 9;
         for (auto gateType : {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
                              GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS})

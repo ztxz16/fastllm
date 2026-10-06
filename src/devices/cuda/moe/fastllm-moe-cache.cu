@@ -3660,7 +3660,7 @@ bool FastllmCudaMergeMOEHybrid(const fastllm::Data &input,
     int next = 0;
     for (int r = 0; r < topk; ++r) if (resident[r] >= 0) order[next++] = r;
     for (int r = 0; r < topk; ++r) if (resident[r] < 0) order[next++] = r;
-    const int staged = overlap ? overlap->layers[tableId].SelectMisses(topk - hits, hits) : 0;
+    const int staged = overlap ? overlap->layers[tableId].SelectDecodeMisses(topk - hits, hits) : 0;
     int gpu = frequency ? hits + staged : work.scheduler.SelectGpuCount(topk, hits, group->tableKeys.size());
     if (scoredBfloat && !frequency) {
         // Optional calibration override; unset uses the measured scheduler.
@@ -3716,9 +3716,8 @@ bool FastllmCudaMergeMOEHybrid(const fastllm::Data &input,
     if (!frequency || staged) checkCudaErrors("Hybrid MoE", cudaMemcpyAsync(deviceGpuIndices, gpuIndices, topk * sizeof(int32_t),
                     cudaMemcpyHostToDevice, cudaStreamPerThread));
     auto submitGpu = [&]() {
-        double stagedDispatchUs = 0;
+        const double submitStart = overlap && staged ? HybridNowUs() : 0;
         if (staged) {
-            const double begin = HybridNowUs();
             // The NUMA gate/up workers are already running when this callback
             // executes. DMA starts before resident kernels and does not wait
             // for them. The packed temporary records do not alter residency.
@@ -3730,7 +3729,6 @@ bool FastllmCudaMergeMOEHybrid(const fastllm::Data &input,
             overlap->splitStages = !layout.deepSeekV41 && !layout.glm5 &&
                 (group->ggufSources.empty() || overlap->numaGateType >= 0);
             overlap->CopyExperts(*group, tableId, experts.data(), staged, topk);
-            stagedDispatchUs += HybridNowUs() - begin;
         }
         // The frequency path has already started NUMA workers and staged DMA.
         // Launch the shared expert before waiting for any staged expert.
@@ -3786,7 +3784,6 @@ bool FastllmCudaMergeMOEHybrid(const fastllm::Data &input,
             ++work.prefetchedExperts;
         }
         if (staged) {
-            const double begin = HybridNowUs();
             FastllmCudaMoeGGUFCacheView temporary{
                 overlap->records, nullptr, layout.recordStride, layout.downOffset,
                 layout.gateGgmlType, layout.downGgmlType, layout.hidden, layout.inter,
@@ -3814,16 +3811,17 @@ bool FastllmCudaMergeMOEHybrid(const fastllm::Data &input,
                 temporary.q8InputPrepared = true;
                 checkCudaErrors("Decode staged end", cudaEventRecord(overlap->stagedDone[i], cudaStreamPerThread));
             }
-            stagedDispatchUs += HybridNowUs() - begin;
-            overlap->layers[tableId].dispatch.Observe(stagedDispatchUs);
+            overlap->layers[tableId].dispatch.Observe(HybridNowUs() - submitStart);
         }
     };
     if (!frequency) submitGpu();
     const double cpuStart = HybridNowUs();
+    double cpuElapsedUs = 0;
     if (frequency) {
         fastllm::NumasMoeDecodeExpertsWithOverlap(work.host, cpuOutput, weights,
             hostIndices, gpuIndices, topk, layer, submitGpu,
-            scoredBfloat ? hostScores : nullptr, layout.swigluLimit, layout.glm5 ? 128 : 32);
+            scoredBfloat ? hostScores : nullptr, layout.swigluLimit, layout.glm5 ? 128 : 32,
+            overlap ? &cpuElapsedUs : nullptr);
     } else {
         fastllm::NumasMoeDecodeExperts(work.host, cpuOutput, weights,
             hostIndices, gpuIndices, topk, layer,
@@ -3831,7 +3829,7 @@ bool FastllmCudaMergeMOEHybrid(const fastllm::Data &input,
     }
     if (gpu < topk) {
         if (!frequency) work.scheduler.cpu[topk - gpu].Observe(HybridNowUs() - cpuStart);
-        if (overlap) overlap->layers[tableId].cpuExpert.Observe((HybridNowUs() - cpuStart) / (topk - gpu));
+        if (overlap) overlap->layers[tableId].ObserveDecodeCpu(topk - gpu, cpuElapsedUs);
         checkCudaErrors("Hybrid MoE", cudaMemcpyAsync(deviceCpuOutput, cpuOutput, topk * hidden * sizeof(float),
                         cudaMemcpyHostToDevice, cudaStreamPerThread));
     }

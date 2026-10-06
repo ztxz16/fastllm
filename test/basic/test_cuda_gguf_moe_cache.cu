@@ -19,6 +19,7 @@
 #include <stdexcept>
 #include <vector>
 #include <thread>
+#include <chrono>
 #ifdef USE_NUMAS
 #include "devices/numas/numasdevice.h"
 #include "devices/cpu/computeutils.h"
@@ -1215,6 +1216,16 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
             Require(submitted == 1 && overlapped == cpu,
                     "overlap changed CPU expert arithmetic or callback count");
             if (step == 0) {
+                double cpuUs = 0;
+                auto begin = std::chrono::steady_clock::now();
+                NumasMoeDecodeExpertsWithOverlap(x.data(), overlapped.data(), table.data(),
+                    route.data(), mask.data(), topk, layer,
+                    [] { std::this_thread::sleep_for(std::chrono::milliseconds(20)); },
+                    nullptr, 0.f, 32, &cpuUs);
+                const double wallUs = std::chrono::duration<double, std::micro>(
+                    std::chrono::steady_clock::now() - begin).count();
+                Require(cpuUs > 0 && cpuUs < wallUs * .5 && overlapped == cpu,
+                        "unscored CPU timing included callback stall or changed arithmetic");
                 bool caught = false;
                 try {
                     NumasMoeDecodeExpertsWithOverlap(x.data(), overlapped.data(), table.data(),

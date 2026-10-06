@@ -60,7 +60,51 @@ class MoeDecodeOverlapScheduler {
 public:
     using Estimate = MoeDecodeScheduler::Estimate;
     Estimate cpuExpert, residentExpert, copiedExpert, stagedExpert, dispatch;
+    std::array<Estimate, MoeDecodeScheduler::maxExperts + 1> decodeCpu;
     uint64_t calls = 0;
+
+    void ObserveDecodeCpu(int routes, double us) {
+        if (routes <= 0 || routes >= int(decodeCpu.size()) || us <= 0) return;
+        decodeCpu[routes].Observe(us);
+        cpuExpert.Observe(us / routes);
+    }
+
+    double DecodeCpuUs(int routes) const {
+        if (routes <= 0) return 0;
+        if (routes < int(decodeCpu.size()) && decodeCpu[routes].initialized)
+            return decodeCpu[routes].us;
+        int lower = 0, upper = 0;
+        for (int n = 1; n < int(decodeCpu.size()); ++n) if (decodeCpu[n].initialized) {
+            if (n < routes) lower = n;
+            else { upper = n; break; }
+        }
+        if (lower && upper)
+            return decodeCpu[lower].us + (decodeCpu[upper].us - decodeCpu[lower].us) *
+                double(routes - lower) / (upper - lower);
+        return routes * cpuExpert.us;
+    }
+
+    // Single-row CPU cost is not linear in the number of experts. Measure
+    // the no-upload path before comparing splits, and refresh it sparsely.
+    // This remains distinct from the verifier's route-reuse cost model.
+    int SelectDecodeMisses(int misses, int hits) const {
+        if (misses <= 0) return 0;
+        if (misses >= int(decodeCpu.size())) return SelectMisses(misses, hits);
+        if (!decodeCpu[misses].initialized) return 0;
+        if (!copiedExpert.initialized || !stagedExpert.initialized)
+            return std::max(1, misses / 2);
+        double gpu = hits * residentExpert.us;
+        double best = std::max(DecodeCpuUs(misses), gpu);
+        int selected = 0;
+        for (int n = 1; n <= misses; ++n) {
+            gpu = std::max(gpu, n * copiedExpert.us) + stagedExpert.us;
+            // CPU workers are already active during host GPU submission.
+            const double cost = std::max(DecodeCpuUs(misses - n), dispatch.us + gpu);
+            if (cost < best * .97) { best = cost; selected = n; }
+        }
+        if (calls % 127 == 126) return selected ? 0 : 1;
+        return selected;
+    }
 
     // routeCounts describes reuse of each unique missed expert in a verifier.
     // Copies are charged once per expert; CPU/GPU arithmetic once per route.

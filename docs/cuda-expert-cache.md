@@ -122,6 +122,17 @@ work. No fixed-split environment variable is needed. A staged expert executes
 as soon as its own transfer and preceding GPU work finish. Staging uses
 separate temporary records and does not admit or evict cache entries.
 
+Single-row decode first measures the no-upload CPU baseline, keeps observed
+CPU costs by route count, and periodically refreshes that baseline. CPU worker
+completion timestamps separate CPU preparation/compute from callback-only
+GPU submission stalls; submission cost overlaps the active CPU workers in
+the planner. Scored GGUF decode uses the ordinary NUMA row workers with an
+output-route map, preserving BF16 rounding, clamp and route-score boundaries
+without constructing the multi-row verifier's per-expert task lists. Unscored
+GGUF decode, including Qwen Flash-Next, keeps its specialized subset workers
+and uses the same corrected timing and single-row planner. Verification retains
+its separate grouped execution and cost estimates.
+
 Single-GPU FP32 verification accepts two to nine rows. It groups misses by
 expert identity, gives all routes of one expert the same CPU/GPU owner, and
 copies each staged expert once even when several tokens select it. Experts

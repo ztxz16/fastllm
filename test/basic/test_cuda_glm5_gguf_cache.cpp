@@ -10,11 +10,13 @@
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <memory>
 #include <random>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 namespace fastllm { void RegisterNumas(Data *, std::string); }
 using namespace fastllm;
@@ -146,6 +148,50 @@ int main(int argc, char **argv) {
             std::vector<float> cpu(hidden);
             for(int c=0;c<hidden;++c) cpu[c]=BFloat16BitsToFloat32(reinterpret_cast<uint16_t*>(ordinary.cpuData)[c]);
             worst=std::max(worst,Compare(cpu,expected,"ordinary NUMA vs scalar oracle"));
+            // Exercise scored CPU subsets directly, including duplicate routes
+            // with different scores and the all-GPU callback-only case.
+            std::vector<int32_t> mask(topk, -1);
+            const int subsetGpu = step % (topk + 1);
+            for (int r=0;r<subsetGpu;++r) mask[r]=ids[r];
+            std::vector<float> subset(topk*hidden, 123.f), subsetExpected(subset);
+            for (int r=subsetGpu;r<topk;++r)
+                std::copy_n(per.data()+r*hidden,hidden,subsetExpected.data()+r*hidden);
+            auto checkSubset=[&](const char *label) {
+                Require(std::all_of(subset.begin(),subset.begin()+subsetGpu*hidden,
+                    [](float v){return v==123.f;}),"GPU-owned route modified by CPU");
+                const std::vector<float> actual(subset.begin()+subsetGpu*hidden,subset.end());
+                const std::vector<float> reference(subsetExpected.begin()+subsetGpu*hidden,subsetExpected.end());
+                worst=std::max(worst,Compare(actual,reference,label));
+            };
+            double cpuUs=-1;
+            int submitted=0;
+            NumasMoeDecodeExpertsWithOverlap(x.data(),subset.data(),weights[t].data(),
+                ids.data(),mask.data(),topk,t,[&]{++submitted;},
+                scores.data(),.125f,128,&cpuUs);
+            Require(submitted==1 && (subsetGpu==topk ? cpuUs==0 : cpuUs>0),
+                    "scored subset callback or CPU timing missing");
+            checkSubset("scored CPU subset vs scalar oracle");
+            if (step==0) {
+                auto begin=std::chrono::steady_clock::now();
+                NumasMoeDecodeExpertsWithOverlap(x.data(),subset.data(),weights[t].data(),
+                    ids.data(),mask.data(),topk,t,[]{std::this_thread::sleep_for(std::chrono::milliseconds(20));},
+                    scores.data(),.125f,128,&cpuUs);
+                const double wallUs=std::chrono::duration<double,std::micro>(
+                    std::chrono::steady_clock::now()-begin).count();
+                Require(cpuUs>0 && cpuUs<wallUs*.5,
+                        "scored CPU timing included the GPU callback stall");
+                checkSubset("timed scored CPU subset");
+                bool caught=false;
+                try {
+                    NumasMoeDecodeExpertsWithOverlap(x.data(),subset.data(),weights[t].data(),
+                        ids.data(),mask.data(),topk,t,[]{throw std::runtime_error("expected submit failure");},
+                        scores.data(),.125f,128,&cpuUs);
+                } catch(const std::runtime_error &) {caught=true;}
+                Require(caught,"scored subset swallowed callback failure");
+                NumasMoeDecodeExpertsWithOverlap(x.data(),subset.data(),weights[t].data(),
+                    ids.data(),mask.data(),topk,t,[]{},scores.data(),.125f,128,&cpuUs);
+                checkSubset("scored CPU callback recovery");
+            }
             for(int device=0;device<std::min(2,devices);++device) {
                 Cuda(cudaSetDevice(device));
                 Data input(BFLOAT16,{1,hidden},CPU,bx.data()),index(INT32,{1,topk},CPU,ids.data()),
