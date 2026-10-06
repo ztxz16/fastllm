@@ -958,7 +958,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help = "CUDA模型权重slab大小（MiB）；默认按模型选择，0表示关闭")
     parser.add_argument("--mtp", type = int, default = 0, help = "支持MTP的模型每步生成的draft token数，0表示关闭（默认），当前最大8")
     parser.add_argument("--mtp_min_p", "--mtp-min-p", type = _probability, default = None,
-                        help = "Qwen4 贪心 MTP 草稿概率阈值；低于阈值时停止草稿链，0 关闭（默认），--mtp 指定最大草稿数")
+                        help = "Qwen4 / GLM-5.3 贪心 MTP 草稿概率阈值；低于阈值时停止草稿链，0 关闭（默认），--mtp 指定最大草稿数")
     parser.add_argument("--mtp_fp8_draft_head", "--mtp-fp8-draft-head",
                         type = int, choices = [0, 1], default = None,
                         help = "Qwen3.5 系列多卡 MTP 的 FP8 draft 输出头；1 开启，0 复用原输出头以节省显存；未指定时沿用 FASTLLM_MTP_FP8_DRAFT_HEAD（默认开启）")
@@ -1825,9 +1825,10 @@ def make_normal_llm_model(args, startup_progress = None):
     mtp_min_p = getattr(args, "mtp_min_p", None)
     if mtp_min_p is not None:
         mtp_min_p = _probability(mtp_min_p)
-        if mtp_min_p > 0 and (not is_qwen38_flash_next_model or mtp <= 0):
-            raise ValueError("--mtp_min_p requires Qwen4 with --mtp enabled")
-        os.environ["FASTLLM_QWEN4_MTP_MIN_P"] = str(mtp_min_p)
+        if mtp_min_p > 0 and (not (is_qwen38_flash_next_model or is_glm5_next_model) or mtp <= 0):
+            raise ValueError("--mtp_min_p requires Qwen4 or GLM-5.3 with --mtp enabled")
+        name = "FASTLLM_GLM5_NEXT_MTP_MIN_P" if is_glm5_next_model else "FASTLLM_QWEN4_MTP_MIN_P"
+        os.environ[name] = str(mtp_min_p)
     os.environ["FASTLLM_GLM5_NEXT_ENABLE_MTP"] = str(mtp)
     graph = None
     if (args.custom != ""):

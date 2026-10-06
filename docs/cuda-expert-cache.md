@@ -234,6 +234,16 @@ route counters charge GPU work to its executing device and CPU work/call count
 to the origin, so summing devices counts every route and layer exactly once.
 Single-GPU and unsupported layouts keep their previous dispatchers.
 
+For greedy GLM MTP, `--mtp_min_p` (0–1, default 0) optionally truncates a draft
+chain before admitting a candidate whose full-vocabulary probability is below
+the threshold. The existing acceptance-based depth limit still applies; the
+threshold itself stays fixed. A rejected first candidate leaves the next step
+on ordinary target decode, while later truncation restores the draft KV cache
+to its committed prefix. Zero disables the confidence reduction, and sampled
+generation keeps its existing behavior. Verbose request completion reports
+verified/accepted draft counts and confidence checks/stops; accepted counts
+include the final verified batch even if the output limit truncates its delivery.
+
 GLM NVFP4 NUMA-assisted prefill reuses the resident compact records with the
 existing multi-row projection and activation kernels. Selected admissions are
 uploaded directly into cache slots; other misses retain temporary uploads and

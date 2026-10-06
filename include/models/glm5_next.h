@@ -119,6 +119,8 @@ namespace fastllm {
             int targetTokensConsumed = 0;
             int activeDraftLimit = 0;
             int consecutiveFullAccepts = 0;
+            uint64_t verifiedDrafts = 0, acceptedDrafts = 0, verifySteps = 0;
+            uint64_t confidenceChecks = 0, confidenceStops = 0;
             bool disabled = false;
             TargetRuntimeCheckpoint targetCheckpoint;
             std::vector<KdaReplayCapture> kdaReplay;
@@ -185,13 +187,13 @@ namespace fastllm {
                 const std::vector<int> &inputTokens,
                 const std::vector<int> &positions,
                 Data *nextHiddenStates,
-                bool sampleToken);
+                bool sampleToken, float *topProbability = nullptr);
 
         void GenerateMtpProposalChain(
                 MtpRuntimeState &state,
                 const Data &targetHiddenStates,
                 const std::vector<int> &inputTokens,
-                const std::vector<int> &positions);
+                const std::vector<int> &positions, float minProbability = 0);
 
         void CaptureTargetRuntimeCheckpoint(
                 const std::vector<std::pair<Data, Data>> &pastKeyValues,
@@ -330,6 +332,7 @@ namespace fastllm {
         bool mtpEnabled = false;
         bool mtpWeightsReady = false;
         int mtpDraftsPerStep = 0;
+        float mtpMinProbability = 0;
         std::map<const std::vector<std::pair<Data, Data>> *,
                  std::shared_ptr<MtpRuntimeState>> mtpStates;
         std::mutex mtpStatesMutex;

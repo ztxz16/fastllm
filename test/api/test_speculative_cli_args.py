@@ -241,6 +241,8 @@ class SpeculativeDraftCliAliasesTest(unittest.TestCase):
             })
             for options, expected in [
                 (["--mtp", "3"], 3),
+                (["--mtp", "3", "--mtp_min_p", "0.5"], 3),
+                (["--mtp", "3", "--mtp-min-p", "0"], 3),
                 (["--speculative_algorithm", "mtp", "--draft_tokens", "5"], 5),
                 (["--speculative_algorithm", "off", "--mtp", "3"], 0),
             ]:
@@ -260,6 +262,9 @@ class SpeculativeDraftCliAliasesTest(unittest.TestCase):
                         self.assertIs(make_normal_llm_model(args), fake_model)
                         self.assertEqual(os.environ["FASTLLM_GLM5_NEXT_ENABLE_MTP"], str(expected))
                         self.assertEqual(args.mtp, expected)
+                        if args.mtp_min_p is not None:
+                            self.assertEqual(os.environ["FASTLLM_GLM5_NEXT_MTP_MIN_P"], str(args.mtp_min_p))
+                            self.assertNotIn("FASTLLM_QWEN4_MTP_MIN_P", os.environ)
                         self.assertEqual(fake_ftllm.llm.model.call_args.kwargs["external_mtp_path"], "")
 
     def test_glm53_mtp_rejects_external_draft(self):

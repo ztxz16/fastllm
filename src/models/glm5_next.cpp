@@ -578,6 +578,15 @@ namespace fastllm {
         mtpDraftsPerStep = Glm5NextEnvInt(
             "FASTLLM_GLM5_NEXT_ENABLE_MTP", 0, 0, 8);
         mtpEnabled = mtpDraftsPerStep > 0;
+        if (const char *value = std::getenv("FASTLLM_GLM5_NEXT_MTP_MIN_P")) {
+            if (*value) {
+                char *end = nullptr;
+                mtpMinProbability = std::strtof(value, &end);
+                AssertInFastLLM(end != value && *end == '\0' &&
+                    std::isfinite(mtpMinProbability) && mtpMinProbability >= 0 && mtpMinProbability <= 1,
+                    "FASTLLM_GLM5_NEXT_MTP_MIN_P must be in [0, 1].");
+            }
+        }
         AssertInFastLLM(weight.dicts["gguf_architecture"] != "glm5next" || !mtpEnabled,
             "GLM-5.3 GGUF currently requires --mtp 0.");
         AssertInFastLLM(!UsesDsa() || (!mtpEnabled && useCompressedMla),
@@ -743,6 +752,9 @@ namespace fastllm {
                 << " maximum draft token(s) per verification step, "
                 << "adaptive depth, and automatic exact-verifier "
                 << "fallback.\n";
+            if (mtpMinProbability > 0)
+                std::cout << "[GLM-5.3 MTP] Greedy draft confidence threshold: "
+                          << mtpMinProbability << ".\n";
         }
     }
 
@@ -1231,6 +1243,15 @@ namespace fastllm {
         }
         {
             std::lock_guard<std::mutex> guard(mtpStatesMutex);
+            auto it = mtpStates.find(&context->pastKeyValues);
+            if (verbose && it != mtpStates.end() && it->second) {
+                const auto &state = *it->second;
+                std::cout << "[GLM-5.3 MTP stats] verify_steps=" << state.verifySteps
+                          << " verified_drafts=" << state.verifiedDrafts
+                          << " accepted_drafts=" << state.acceptedDrafts
+                          << " confidence_checks=" << state.confidenceChecks
+                          << " confidence_stops=" << state.confidenceStops << "\n";
+            }
             mtpStates.erase(&context->pastKeyValues);
         }
         {
@@ -2644,7 +2665,7 @@ namespace fastllm {
             const std::vector<int> &inputTokens,
             const std::vector<int> &positions,
             Data *nextHiddenStates,
-            bool sampleToken) {
+            bool sampleToken, float *topProbability) {
         const int sequence = (int)inputTokens.size();
         AssertInFastLLM(
             sequence > 0 && positions.size() == inputTokens.size() &&
@@ -2766,6 +2787,36 @@ namespace fastllm {
         ToDataType(outputLogits, DataType::FLOAT32);
         TopK(outputLogits, top, 1);
         top.ToDevice(DataDevice::CPU);
+        if (topProbability != nullptr) {
+            bool computed = false;
+#ifdef USE_CUDA
+            if (outputLogits.dataDevice == DataDevice::CUDA &&
+                !outputLogits.multiDeviceData && outputLogits.cudaData != nullptr) {
+                if (!outputLogits.dataDeviceIds.empty())
+                    FastllmCudaSetDevice(outputLogits.dataDeviceIds[0]);
+                Data probability(DataType::FLOAT32, {1});
+                probability.ToDevice(DataDevice::CUDA, outputLogits.dataDeviceIds);
+                probability.Allocate();
+                // Reuse the full-vocabulary reduction already used by Qwen MTP.
+                computed = FastllmCudaQwen4TopProbability(
+                    static_cast<const float *>(outputLogits.cudaData),
+                    static_cast<float *>(probability.cudaData), outputLogits.dims.back(),
+                    reinterpret_cast<const float *>(top.cpuData)[1]);
+                if (computed) {
+                    probability.ToDevice(DataDevice::CPU);
+                    *topProbability = reinterpret_cast<const float *>(probability.cpuData)[0];
+                }
+            }
+#endif
+            if (!computed) {
+                Data probabilities, probabilityTop;
+                Softmax(outputLogits, probabilities, -1);
+                TopK(probabilities, probabilityTop, 1);
+                probabilityTop.ToDevice(DataDevice::CPU);
+                *topProbability = reinterpret_cast<const float *>(probabilityTop.cpuData)[1];
+            }
+            if (!std::isfinite(*topProbability)) *topProbability = 0;
+        }
         return (int)(reinterpret_cast<float *>(top.cpuData)[0] + 1.0e-3f);
     }
 
@@ -2773,7 +2824,7 @@ namespace fastllm {
             MtpRuntimeState &state,
             const Data &targetHiddenStates,
             const std::vector<int> &inputTokens,
-            const std::vector<int> &positions) {
+            const std::vector<int> &positions, float minProbability) {
         AssertInFastLLM(
             !inputTokens.empty() && inputTokens.size() == positions.size(),
             "GLM-5.3 MTP proposal input is empty or misaligned.");
@@ -2789,9 +2840,20 @@ namespace fastllm {
         state.activeDraftLimit = draftLimit;
         Data hiddenStates[2];
         int currentHidden = 0;
+        float probability = 0;
+        auto admit = [&] {
+            if (minProbability <= 0) return true;
+            ++state.confidenceChecks;
+            if (std::isfinite(probability) && probability >= minProbability) return true;
+            ++state.confidenceStops;
+            return false;
+        };
         int proposal = RunMtpDraft(
             state, targetHiddenStates, inputTokens, positions,
-            &hiddenStates[currentHidden], true);
+            &hiddenStates[currentHidden], true, minProbability > 0 ? &probability : nullptr);
+        // The first draft consumes committed input only. If it is rejected,
+        // retain those caches and let the next ordinary target step advance.
+        if (!admit()) return;
         state.proposals.push_back(proposal);
         if (draftLimit <= 1) {
             return;
@@ -2811,7 +2873,9 @@ namespace fastllm {
             const int nextHidden = 1 - currentHidden;
             proposal = RunMtpDraft(
                 state, hiddenStates[currentHidden], {proposal},
-                {nextPosition}, &hiddenStates[nextHidden], true);
+                {nextPosition}, &hiddenStates[nextHidden], true,
+                minProbability > 0 ? &probability : nullptr);
+            if (!admit()) break;
             state.proposals.push_back(proposal);
             currentHidden = nextHidden;
             nextPosition++;
@@ -2829,6 +2893,7 @@ namespace fastllm {
             const LastTokensManager &lastTokens,
             std::vector<float> *logits,
             MtpRuntimeState &state) {
+        const float minProbability = generationConfig.IsSimpleGreedy() ? mtpMinProbability : 0;
         if (!state.pendingOutputTokens.empty()) {
             const std::pair<int, int> pending =
                 state.pendingOutputTokens.front();
@@ -2930,7 +2995,7 @@ namespace fastllm {
                 hasPairedHidden && !mtpTokens.empty(),
                 "GLM-5.3 MTP failed to align the final prompt chunk.");
             GenerateMtpProposalChain(
-                state, pairedHidden, mtpTokens, mtpPositions);
+                state, pairedHidden, mtpTokens, mtpPositions, minProbability);
 #ifdef USE_CUDA
             // A later scheduler call can run on another host worker and CUDA
             // stream.  Publish both target and request-local draft state
@@ -3082,6 +3147,9 @@ namespace fastllm {
             acceptedDrafts < (int)targetTokens.size(),
             "GLM-5.3 MTP verification did not produce a recovery token.");
         const int committedInputs = acceptedDrafts + 1;
+        ++state.verifySteps;
+        state.verifiedDrafts += proposals.size();
+        state.acceptedDrafts += acceptedDrafts;
         std::vector<int> verifiedOutputs;
         verifiedOutputs.reserve(committedInputs);
         for (int i = 0; i < acceptedDrafts; i++) {
@@ -3093,7 +3161,11 @@ namespace fastllm {
         if (state.activeDraftLimit <= 0) {
             state.activeDraftLimit = currentDepth;
         }
-        if (acceptedDrafts == currentDepth) {
+        if (acceptedDrafts == currentDepth && currentDepth < state.activeDraftLimit) {
+            // Confidence truncation is not a rejection and does not establish
+            // that the full adaptive depth succeeded either.
+            state.consecutiveFullAccepts = 0;
+        } else if (acceptedDrafts == currentDepth) {
             state.consecutiveFullAccepts++;
             const int acceptsBeforeGrowing =
                 std::max(2, 2 * (currentDepth - 1));
@@ -3146,7 +3218,7 @@ namespace fastllm {
             state, committedTargetHidden, verifiedOutputs,
             std::vector<int>(
                 candidatePositions.begin(),
-                candidatePositions.begin() + committedInputs));
+                candidatePositions.begin() + committedInputs), minProbability);
 #ifdef USE_CUDA
         ForceDeviceSync();
 #endif
