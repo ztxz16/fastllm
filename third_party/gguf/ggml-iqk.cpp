@@ -509,8 +509,7 @@ mul_mat_t GetMulMatFunction(ggml_type type, int nrc_y) {
 
 // #define HAVE_FANCY_SIMD
 
-#if !defined(__AVX512F__)
-// Keep IQ2_S in its ordinary GGUF layout on AVX2. Four 10-bit codebook
+// Keep IQ2_S in its ordinary GGUF layout on AVX2 and AVX512 builds. Four 10-bit codebook
 // indices fit in one scalar register; expanding their high bits through a
 // shared 2 KiB table avoids four separate shift/mask/OR sequences. This is
 // an index table, not an expanded or repacked copy of the model weights.
@@ -861,7 +860,6 @@ static void mul_mat_iq4_xs_q8_k(int n, const void *vx, size_t bx,
         mul_mat_iq4_xs_native_impl<Inputs>(n, vx, bx, info, outputs);
     }
 }
-#endif
 
 // Interleave four rows without expanding their packed quants to 256 bytes.
 // Each 128-bit lane contains a four-byte group for one half of the block.
@@ -1009,32 +1007,6 @@ static void repack_iq2_xs(int nrows, int n_per_row, const block_iq2_xs * x, bloc
                         y[ibl].qs[16*ib+4*k+i] = (v & 511) | (scrambled_sign(s) << 9);
                     }
                     y[ibl].scales[4*ib+k] = x4[k][ibl].scales[ib];
-                }
-            }
-        }
-        x += 4*nblock;
-        y += nblock;
-    }
-}
-
-static void repack_iq2_s(int nrows, int n_per_row, const block_iq2_s * x, block_iq2_s_r4 * y, [[maybe_unused]] bool online) {
-    assert(nrows%4 == 0);
-    assert(n_per_row%QK_K == 0);
-    int nblock = n_per_row/QK_K;
-    const block_iq2_s * x4[4];
-    for (int row = 0; row < nrows; row += 4) {
-        for (int k = 0; k < 4; ++k) x4[k] = x + nblock*k;
-        for (int ibl = 0; ibl < nblock; ++ibl) {
-            for (int k = 0; k < 4; ++k) {
-                auto signs = x4[k][ibl].qs + QK_K/8;
-                y[ibl].d[k] = x4[k][ibl].d;
-                for (int ib = 0; ib < QK_K/32; ++ib) {
-                    y[ibl].scales[4*ib+k] = x4[k][ibl].scales[ib];
-                    for (int i = 0; i < 4; ++i) {
-                        y[ibl].qs[16*ib+4*k+i] = x4[k][ibl].qs[4*ib+i];
-                        y[ibl].signs[16*ib+4*k+i] = signs[4*ib+i];
-                    }
-                    y[ibl].qh[4*ib+k] = x4[k][ibl].qh[ib];
                 }
             }
         }
@@ -1294,9 +1266,6 @@ const Repack * get_repack_info(ggml_type type) {
         // { GGML_TYPE_IQ2_BN, { GGML_TYPE_IQ2_BN_R4, 4,  (Repack::repack_func)repack_iq2_bn}  },
         { GGML_TYPE_IQ2_XXS,{ GGML_TYPE_IQ2_XXS_R4,4,  (Repack::repack_func)repack_iq2_xxs} },
         { GGML_TYPE_IQ2_XS, { GGML_TYPE_IQ2_XS_R4, 4,  (Repack::repack_func)repack_iq2_xs}  },
-#if defined(__AVX512F__)
-        { GGML_TYPE_IQ2_S,  { GGML_TYPE_IQ2_S_R4,  4,  (Repack::repack_func)repack_iq2_s}   },
-#endif
         { GGML_TYPE_IQ3_XXS,{ GGML_TYPE_IQ3_XXS_R4,4,  (Repack::repack_func)repack_iq3_xxs} },
         // { GGML_TYPE_IQ3_S,  { GGML_TYPE_IQ3_S_R4,  4,  (Repack::repack_func)repack_iq3_s}   },
         { GGML_TYPE_Q2_K,   { GGML_TYPE_Q2_K_R4,   4,  (Repack::repack_func)repack_q2_k}    },
@@ -2411,18 +2380,12 @@ static void mul_mat_iq4_nl_q8_0_rows(int blocks, const char *vx, size_t bx,
         const float dy = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(y[block].d)));
         for (int r = 0; r < rows; ++r) {
             const __m128i bits = _mm_loadu_si128((const __m128i *)x[r][block].qs);
-#if !defined(__AVX512F__)
             // Split the two nibbles across the 128-bit lanes, then decode
             // all 32 values with one shuffle instead of two plus an insert.
             const auto packed = _mm256_broadcastsi128_si256(bits);
             const auto indices = _mm256_and_si256(_mm256_blend_epi32(
                 packed, _mm256_srli_epi16(packed, 4), 0xf0), _mm256_broadcastsi128_si256(mask));
             const auto qx = _mm256_shuffle_epi8(_mm256_broadcastsi128_si256(values), indices);
-#else
-            const __m256i qx = MM256_SET_M128I(
-                _mm_shuffle_epi8(values, _mm_and_si128(_mm_srli_epi16(bits, 4), mask)),
-                _mm_shuffle_epi8(values, _mm_and_si128(bits, mask)));
-#endif
             // IQ4_NL never contains -128. Applying the Q8 sign to IQ4
             // therefore also handles Q8=-128, without signed-byte overflow.
 #if defined(__AVX512VNNI__) && defined(__AVX512VL__)
@@ -2437,14 +2400,12 @@ static void mul_mat_iq4_nl_q8_0_rows(int blocks, const char *vx, size_t bx,
     };
     int block = 0;
     for (; block + 1 < blocks; block += 2) {
-#if !defined(__AVX512F__)
-        // Interleaved row streams can starve AVX2 decode when experts no
+        // Interleaved row streams can starve decode when experts no
         // longer fit in cache. Keep the lookahead within each weight row.
         constexpr int ahead = 8;
         if (block + ahead < blocks)
             for (int r = 0; r < rows; ++r)
                 _mm_prefetch((const char *)&x[r][block + ahead], _MM_HINT_T0);
-#endif
         accumulate(block, even);
         accumulate(block + 1, odd);
     }
@@ -2641,14 +2602,12 @@ mul_mat_t GetMulMatFunction(ggml_type type, int nrc_y) {
         RETURN_MATMUL_FUNCTION(mul_mat_iq2_xxs_r4_q8_k, nrc_y)
     } else if (type == GGML_TYPE_IQ2_XS_R4) {
         RETURN_MATMUL_FUNCTION(mul_mat_iq2_xs_r4_q8_k, nrc_y)
-#if !defined(__AVX512F__)
     } else if (type == GGML_TYPE_IQ2_S) {
         RETURN_MATMUL_FUNCTION(mul_mat_iq2_s_q8_k, nrc_y)
     } else if (type == GGML_TYPE_IQ3_S) {
         RETURN_MATMUL_FUNCTION(mul_mat_iq3_s_q8_k, nrc_y)
     } else if (type == GGML_TYPE_IQ4_XS) {
         RETURN_MATMUL_FUNCTION(mul_mat_iq4_xs_q8_k, nrc_y)
-#endif
     } else if (type == GGML_TYPE_IQ2_S_R4) {
         RETURN_MATMUL_FUNCTION(mul_mat_iq2_s_r4_q8_k, nrc_y)
     } else if (type == GGML_TYPE_IQ3_XXS_R4) {

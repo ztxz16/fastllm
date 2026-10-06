@@ -198,12 +198,12 @@ void TestCodebooks() {
 
 int main() {
     if (GetMulMatFunction(GGML_TYPE_IQ3_S, 1) == nullptr) {
-#if defined(__AVX2__) && !defined(__AVX512F__) && \
+#if defined(__AVX2__) && \
     ((defined(__FMA__) && defined(__F16C__)) || defined(_MSC_VER))
-        std::fputs("FAIL: Missing IQ3_S kernel in an AVX2 build\n", stderr);
+        std::fputs("FAIL: Missing IQ3_S kernel in a supported x86 build\n", stderr);
         return 1;
 #else
-        std::puts("IQ3_S native kernel is enabled on AVX2 builds without AVX512F");
+        std::puts("IQ3_S native kernel requires AVX2, FMA and F16C");
         return 77;
 #endif
     }

@@ -1,4 +1,5 @@
 #include "ggml-iq-native.h"
+#include "gguf_iq2_s_r4_fixture.h"
 #include "devices/cpu/computeutils.h"
 #include <cmath>
 #include <cstdio>
@@ -102,6 +103,9 @@ template<class Block> static void Run(ggml_type type) {
 
 static void RunR4(ggml_type type) {
     const auto *pack = get_repack_info(type);
+    const Repack iq2Fixture{GGML_TYPE_IQ2_S_R4, 4, PackIQ2SR4Fixture};
+    if (!pack && type == GGML_TYPE_IQ2_S && GetMulMatFunction(GGML_TYPE_IQ2_S_R4, 1))
+        pack = &iq2Fixture;
     if (!pack) return; // This build has no architecture-specific R4 kernels.
     const auto decode = ggml_type_to_float(type);
     std::mt19937 random(62851 + type);

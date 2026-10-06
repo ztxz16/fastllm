@@ -1,6 +1,7 @@
 #include <cublas_v2.h>
 #include "fastllm-gguf-dequant.cuh"
 #include "utils.h"
+#include "gguf_iq2_s_r4_fixture.h"
 #include <cmath>
 #include <cstring>
 #include <iostream>
@@ -33,9 +34,14 @@ static void TestType(ggml_type original, ggml_type packedType, int rows, int col
         std::memcpy(plain.data() + offset, &scale, sizeof(scale));
     }
     const auto *repack = get_repack_info(original);
-    Check(repack && repack->new_type == packedType, "missing CPU IQ repacker");
-    repack->repack(rows, columns, reinterpret_cast<const char *>(plain.data()),
-                   reinterpret_cast<char *>(packed.data()), false);
+    if (!repack && original == GGML_TYPE_IQ2_S && packedType == GGML_TYPE_IQ2_S_R4) {
+        PackIQ2SR4Fixture(rows, columns, reinterpret_cast<const char *>(plain.data()),
+                         reinterpret_cast<char *>(packed.data()), false);
+    } else {
+        Check(repack && repack->new_type == packedType, "missing CPU IQ repacker");
+        repack->repack(rows, columns, reinterpret_cast<const char *>(plain.data()),
+                      reinterpret_cast<char *>(packed.data()), false);
+    }
     std::vector<float> reference(rows * columns);
     ggml_type_to_float(original)(plain.data(), reference.data(), reference.size());
     void *deviceWeight = nullptr; T *deviceOutput = nullptr;
