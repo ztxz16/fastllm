@@ -8203,6 +8203,24 @@ void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
 
 #include "ggml-iq-native.h"
 
+void ggml_vec_dot_iq2_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy,
+        size_t by, int nrc) {
+    assert(nrc == 1);
+    (void)bs; (void)bx; (void)by; (void)nrc;
+    *s = iq_native::dot(n, static_cast<const block_iq2_s *>(vx),
+                       static_cast<const block_q8_K *>(vy));
+}
+
+void ggml_vec_dot_iq3_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy,
+        size_t by, int nrc) {
+    assert(nrc == 1);
+    (void)bs; (void)bx; (void)by; (void)nrc;
+    *s = iq_native::dot(n, static_cast<const block_iq3_xxs *>(vx),
+                       static_cast<const block_q8_K *>(vy));
+}
+
 void ggml_vec_dot_iq3_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs,
         const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy,
         size_t by, int nrc) {
