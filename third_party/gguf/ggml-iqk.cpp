@@ -777,6 +777,90 @@ static void mul_mat_iq3_s_q8_k(int n, const void *vx, size_t bx,
         mul_mat_iq3_s_native_impl<Inputs, false>(n, vx, bx, info, outputs);
     }
 }
+
+// Decode two adjacent IQ4_XS groups with wide shuffles and share the
+// decoded values across inputs. The weights retain their GGUF layout.
+template <int Inputs>
+static void mul_mat_iq4_xs_native_impl(int n, const void *vx, size_t bx,
+                                     const DataInfo &info, int outputs) {
+    static constexpr int8_t values[16] = {
+        -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+    const block_q8_K *y[Inputs];
+    for (int t = 0; t < Inputs; ++t) y[t] = (const block_q8_K *)info.src1_row(t);
+    const auto table = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)values));
+    const auto mask = _mm256_set1_epi8(15);
+    const int blocks = n / QK_K;
+    for (int row = 0; row < outputs; ++row) {
+        const auto *x = (const block_iq4_xs *)((const char *)vx + size_t(row) * bx);
+        __m256 accum[Inputs] = {};
+        for (int b = 0; b < blocks; ++b) {
+            // A block spans 136 bytes. Keep all prefetch addresses within
+            // this row, including the final short lookahead window.
+            constexpr int ahead = 2;
+            if (b + ahead < blocks) {
+                const auto *next = (const char *)&x[b + ahead];
+                _mm_prefetch(next, _MM_HINT_T0);
+                _mm_prefetch(next + 64, _MM_HINT_T0);
+                _mm_prefetch(next + 128, _MM_HINT_T0);
+            }
+            __m256i sum0[Inputs] = {}, sum1[Inputs] = {};
+            for (int g = 0; g < 8; g += 2) {
+                const auto bits = _mm256_loadu_si256((const __m256i *)(x[b].qs + 16 * g));
+                const auto lo = _mm256_shuffle_epi8(table, _mm256_and_si256(bits, mask));
+                const auto hi = _mm256_shuffle_epi8(table,
+                    _mm256_and_si256(_mm256_srli_epi16(bits, 4), mask));
+                const auto q0 = _mm256_permute2x128_si256(lo, hi, 0x20);
+                const auto q1 = _mm256_permute2x128_si256(lo, hi, 0x31);
+                const int sc0 = ((x[b].scales_l[g / 2] & 15) |
+                                (((x[b].scales_h >> (2 * g)) & 3) << 4)) - 32;
+                const int sc1 = ((x[b].scales_l[g / 2] >> 4) |
+                                (((x[b].scales_h >> (2 * g + 2)) & 3) << 4)) - 32;
+                const auto s0 = _mm256_set1_epi16(sc0), s1 = _mm256_set1_epi16(sc1);
+                for (int t = 0; t < Inputs; ++t) {
+                    const auto a0 = _mm256_loadu_si256((const __m256i *)(y[t][b].qs + 32 * g));
+                    const auto a1 = _mm256_loadu_si256((const __m256i *)(y[t][b].qs + 32 * (g + 1)));
+                    // IQ4_XS values never equal -128. Applying the Q8 sign
+                    // to the weights therefore also supports Q8's -128.
+                    const auto p0 = _mm256_maddubs_epi16(_mm256_abs_epi8(a0), _mm256_sign_epi8(q0, a0));
+                    const auto p1 = _mm256_maddubs_epi16(_mm256_abs_epi8(a1), _mm256_sign_epi8(q1, a1));
+                    sum0[t] = _mm256_add_epi32(sum0[t], _mm256_madd_epi16(p0, s0));
+                    sum1[t] = _mm256_add_epi32(sum1[t], _mm256_madd_epi16(p1, s1));
+                }
+            }
+            const float d = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(x[b].d)));
+            for (int t = 0; t < Inputs; ++t) {
+                accum[t] = _mm256_fmadd_ps(_mm256_set1_ps(d * y[t][b].d),
+                    _mm256_cvtepi32_ps(_mm256_add_epi32(sum0[t], sum1[t])), accum[t]);
+            }
+        }
+        for (int t = 0; t < Inputs; ++t) {
+            auto v = _mm_add_ps(_mm256_castps256_ps128(accum[t]), _mm256_extractf128_ps(accum[t], 1));
+            v = _mm_add_ps(v, _mm_movehl_ps(v, v));
+            info.store(row, t, _mm_cvtss_f32(_mm_add_ss(v, _mm_movehdup_ps(v))));
+        }
+    }
+}
+
+template <int Inputs>
+static void mul_mat_iq4_xs_q8_k(int n, const void *vx, size_t bx,
+                              const DataInfo &info, int outputs) {
+    assert(n % QK_K == 0);
+    if (!outputs) return;
+    if constexpr (Inputs >= 5) {
+        // Bound register pressure while reusing each small weight tile.
+        for (int r = 0; r < outputs; r += 8) {
+            auto tile = info;
+            tile.s += r;
+            const auto *x = (const char *)vx + size_t(r) * bx;
+            const int nr = std::min(8, outputs - r);
+            mul_mat_iq4_xs_native_impl<4>(n, x, bx, tile, nr);
+            tile.cur_y += 4;
+            mul_mat_iq4_xs_native_impl<Inputs - 4>(n, x, bx, tile, nr);
+        }
+    } else {
+        mul_mat_iq4_xs_native_impl<Inputs>(n, vx, bx, info, outputs);
+    }
+}
 #endif
 
 // Interleave four rows without expanding their packed quants to 256 bytes.
@@ -2562,6 +2646,8 @@ mul_mat_t GetMulMatFunction(ggml_type type, int nrc_y) {
         RETURN_MATMUL_FUNCTION(mul_mat_iq2_s_q8_k, nrc_y)
     } else if (type == GGML_TYPE_IQ3_S) {
         RETURN_MATMUL_FUNCTION(mul_mat_iq3_s_q8_k, nrc_y)
+    } else if (type == GGML_TYPE_IQ4_XS) {
+        RETURN_MATMUL_FUNCTION(mul_mat_iq4_xs_q8_k, nrc_y)
 #endif
     } else if (type == GGML_TYPE_IQ2_S_R4) {
         RETURN_MATMUL_FUNCTION(mul_mat_iq2_s_r4_q8_k, nrc_y)
