@@ -125,6 +125,19 @@ __device__ __forceinline__ float ProjectionDot(const uint8_t *record,
         record + size_t(row)*rowBytes, x, columns, grid);
 }
 
+template<ggml_type Type>
+__device__ __forceinline__ float2 ProjectionDotPair(const uint8_t *record,
+        int gateRow, int upRow, size_t rowBytes, int storageType,
+        const block_q8_1 *x, int columns, const uint64_t *grid) {
+    // Keep the packing branch outside the accumulation loop, as in RowDot.
+    if (storageType >= 0 && storageType != Type)
+        return gguf_cache_q8::RowDotPair<Type, true>(
+            record + size_t(gateRow/4)*4*rowBytes, record + size_t(upRow/4)*4*rowBytes,
+            x, columns, grid, gateRow%4, upRow%4);
+    return gguf_cache_q8::RowDotPair<Type>(record + size_t(gateRow)*rowBytes,
+        record + size_t(upRow)*rowBytes, x, columns, grid, 0, 0);
+}
+
 template<bool IsGate>
 __device__ __forceinline__ const uint8_t *ExpertWeight(
         const FastllmCudaMoeGGUFCacheView &view, int route) {
@@ -180,12 +193,22 @@ __global__ void Q8Projection(const block_q8_1 *input, T *gate, float *partial,
         const auto *sharedX = reinterpret_cast<const block_q8_1 *>(activation);
         const int storageType = NumaType<IsGate>(view);
         const int physicalRow = IsGate && storageType >= 0 ? 2*row : row;
-        value = ProjectionDot<Type, ThreadsPerRow>(record, physicalRow, rowBytes,
-            storageType, sharedX, columns, grid);
+        float up = 0;
+        const int upRow = storageType >= 0 ? 2*row+1 : row+view.inter;
+        if constexpr (IsGate && (Type == GGML_TYPE_IQ2_S || Type == GGML_TYPE_IQ3_XXS)) {
+            const float2 values = ProjectionDotPair<Type>(record, physicalRow, upRow,
+                rowBytes, storageType, sharedX, columns, grid);
+            value = values.x;
+            up = values.y;
+        } else {
+            value = ProjectionDot<Type, ThreadsPerRow>(record, physicalRow, rowBytes,
+                storageType, sharedX, columns, grid);
+            if constexpr (IsGate)
+                up = ProjectionDot<Type, ThreadsPerRow>(record, upRow, rowBytes,
+                    storageType, sharedX, columns, grid);
+        }
         if constexpr (IsGate) {
-            const int upRow = storageType >= 0 ? 2*row+1 : row+view.inter;
-            const float up = float(DequantizeCast<T>::cast(ProjectionDot<Type, ThreadsPerRow>(
-                record, upRow, rowBytes, storageType, sharedX, columns, grid)));
+            up = float(DequantizeCast<T>::cast(up));
             value = float(DequantizeCast<T>::cast(value));
             value = value / (1.0f + expf(-value)) * up;
         }

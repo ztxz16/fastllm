@@ -7,6 +7,15 @@
 // Apply the fractional block scale in float, without truncating integer dots.
 // This matches dequantized GGUF weights against the Q8_1 activation oracle.
 namespace gguf_cache_q8 {
+// Spread four sign bits to byte MSBs, then replicate each MSB with PRMT.
+// The four-bit input keeps the multiply's bit fields disjoint.
+static __device__ __forceinline__ unsigned SignMask4(unsigned signs) {
+    const unsigned bits = (signs & 15u) * 0x10204080u;
+    unsigned mask;
+    asm("prmt.b32 %0, %1, 0, 0xba98;" : "=r"(mask) : "r"(bits));
+    return mask;
+}
+
 static __device__ __forceinline__ int get_int_b2(const void *p, int i) {
     const auto *v = static_cast<const uint16_t *>(p);
     return int(uint32_t(v[2*i]) | (uint32_t(v[2*i+1]) << 16));
@@ -174,8 +183,8 @@ static __device__ __forceinline__ float DotS(
         const int grid_pos0 = (int)(uint32_t)grid_packed;
         const int grid_pos1 = (int)(uint32_t)(grid_packed >> 32);
 
-        const int signs0 = __vcmpne4(((signs & 0x03) << 7) | ((signs & 0x0C) << 21), 0x00000000);
-        const int signs1 = __vcmpne4(((signs & 0x30) << 3) | ((signs & 0xC0) << 17), 0x00000000);
+        const int signs0 = SignMask4(signs);
+        const int signs1 = SignMask4(signs >> 4);
 
         const int grid_l = ((grid_pos0 ^ signs0) + ((signs0) & 0x01010101u));
         const int grid_h = ((grid_pos1 ^ signs1) + ((signs1) & 0x01010101u));
@@ -261,7 +270,7 @@ static __device__ __forceinline__ float DotIQ3XXS(
         const auto &q = static_cast<const block_iq3_xxs_r4 *>(vbq)[kbx];
         q3_packed = make_int2(get_int_b4(q.qs, 8*(iqs/2) + 2*row),
                              get_int_b4(q.qs, 8*(iqs/2) + 2*row + 1));
-        aux32 = R4SignsAndScale(q.sas + 16*(iqs/2) + 4*row);
+        aux32 = get_int_b4(q.sas, 4*(iqs/2) + row);
         scale = __half2float(q.d[row]);
     } else {
         const auto &q = static_cast<const block_iq3_xxs *>(vbq)[kbx];
@@ -276,9 +285,18 @@ static __device__ __forceinline__ float DotIQ3XXS(
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int2 grid_pos = make_int2(grid[q3[l0 + 0]], grid[q3[l0 + 1]]);
 
-        const uint32_t s7 = (aux32 >> (7*l0/2)) & 0x7F;
-        const uint32_t s8 = (s7 | ((__popc(s7) & 1) << 7)) * 0x01010101u;
-        const uint32_t signs[2] = {__vcmpne4(s8 & 0x08040201, 0), __vcmpne4(s8 & 0x80402010, 0)};
+        uint32_t s8;
+        if constexpr (Packed) {
+            const uint32_t v = (aux32 >> (8*l0/2)) & 255;
+            // R4's seven stored sign bits are a prefix encoding. Undoing
+            // it also produces the eighth parity bit, without reconstruction
+            // of canonical metadata or a population count.
+            s8 = (v >> 1) ^ (v & 254);
+        } else {
+            const uint32_t s7 = (aux32 >> (7*l0/2)) & 127;
+            s8 = s7 | ((__popc(s7) & 1) << 7);
+        }
+        const uint32_t signs[2] = {SignMask4(s8), SignMask4(s8 >> 4)};
 
         const int grid_l = ((grid_pos.x ^ signs[0]) + (signs[0] & 0x01010101u));
         const int grid_h = ((grid_pos.y ^ signs[1]) + (signs[1] & 0x01010101u));
@@ -290,7 +308,8 @@ static __device__ __forceinline__ float DotIQ3XXS(
         sumi = ggml_cuda_dp4a(grid_h, u1, sumi);
     }
 
-    const int ls = aux32 >> 28;
+    const int ls = Packed ? ((aux32 & 1) | ((aux32 >> 7) & 2) |
+        ((aux32 >> 14) & 4) | ((aux32 >> 21) & 8)) : aux32 >> 28;
     const float scaled = (ls + 0.5f) * 0.5f * sumi;
     const float d = scale * __low2float(bq8_1[iqs/2].ds);
     return d * scaled;
@@ -423,6 +442,33 @@ __device__ __forceinline__ float RowDot(const void *weight, const block_q8_1 *x,
 #pragma unroll
     for (int offset = ThreadsPerRow / 2; offset; offset >>= 1)
         sum += __shfl_xor_sync(mask, sum, offset, ThreadsPerRow);
+    return sum;
+}
+
+// Interleave gate/up dots so both rows reuse the activation loads and expose
+// independent integer accumulators. Preserve each row's 32-lane sum order.
+template<ggml_type Type, bool Packed = false>
+__device__ __forceinline__ float2 RowDotPair(const void *gate, const void *up,
+        const block_q8_1 *x, int columns, const uint64_t *grid, int gateRow, int upRow) {
+    static_assert(Type == GGML_TYPE_IQ2_S || Type == GGML_TYPE_IQ3_XXS);
+    float2 sum = make_float2(0, 0);
+    for (int k = threadIdx.x % 32; k < columns/32; k += 32) {
+        const int block = k/8, part = 2*(k%8);
+        const auto *xb = x + block*8;
+        if constexpr (Type == GGML_TYPE_IQ2_S) {
+            sum.x += DotS<Packed>(gate, xb, block, part, grid, gateRow);
+            sum.y += DotS<Packed>(up, xb, block, part, grid, upRow);
+        } else {
+            const auto *grid32 = reinterpret_cast<const uint32_t *>(grid);
+            sum.x += DotIQ3XXS<Packed>(gate, xb, block, part, grid32, gateRow);
+            sum.y += DotIQ3XXS<Packed>(up, xb, block, part, grid32, upRow);
+        }
+    }
+#pragma unroll
+    for (int offset = 16; offset; offset >>= 1) {
+        sum.x += __shfl_xor_sync(0xffffffff, sum.x, offset);
+        sum.y += __shfl_xor_sync(0xffffffff, sum.y, offset);
+    }
     return sum;
 }
 
