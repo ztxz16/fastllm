@@ -8,6 +8,8 @@
 #include <cuda_bf16.h>
 #include "../../src/devices/cuda/moe/fastllm-moe-gguf-restore.cuh"
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -387,6 +389,99 @@ template<class T> static void RunReusedInput(ggml_type type, fastllm::DataType d
         previous = actual;
     }
     std::printf("PASS reused Q8 input type=%d dtype=%d: exact results, changed tokens, independent scratch\n", type, dtype);
+}
+
+// Hold the down upload on its own stream until gate computation completes.
+// Poisoned down weights catch an omitted wait; the timeout catches a gate
+// completion event incorrectly placed after that wait.
+struct DelayedDownUpload {
+    cudaStream_t stream = nullptr;
+    cudaEvent_t gateReady = nullptr, downReady = nullptr, gateDone = nullptr, downStart = nullptr;
+    uint8_t *host = nullptr;
+    std::atomic<bool> release{false}, timedOut{false};
+    explicit DelayedDownUpload(size_t bytes) {
+        Cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        for (auto *e : {&gateReady, &downReady, &gateDone, &downStart}) Cuda(cudaEventCreate(e));
+        Cuda(cudaMallocHost(&host, bytes));
+    }
+    void Hold() {
+        release = false; timedOut = false;
+        Cuda(cudaLaunchHostFunc(stream, [](void *opaque) {
+            auto &self = *static_cast<DelayedDownUpload *>(opaque);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            while (!self.release.load()) {
+                if (std::chrono::steady_clock::now() > deadline) { self.timedOut = true; break; }
+                std::this_thread::sleep_for(std::chrono::microseconds(20));
+            }
+        }, this));
+    }
+    ~DelayedDownUpload() {
+        release = true;
+        if (stream) cudaStreamSynchronize(stream);
+        for (auto e : {gateReady, downReady, gateDone, downStart}) if (e) cudaEventDestroy(e);
+        if (stream) cudaStreamDestroy(stream);
+        cudaFreeHost(host);
+    }
+};
+
+template<class T> static void RunSplitUpload(ggml_type type, fastllm::DataType dtype, bool numa) {
+    using namespace fastllm;
+    constexpr int hidden = 2560, inter = 640;
+    auto g = Weight(type, 2*inter, hidden, 1, true);
+    auto d = Weight(GGML_TYPE_Q2_0, hidden, inter, 2, true);
+    int gateType = -1, downType = -1;
+    if (numa) {
+        const size_t rowBytes = g->GetBytes()/(2*inter);
+        const std::vector<uint8_t> canonical(g->cpuData, g->cpuData + g->GetBytes());
+        for (int r = 0; r < 2*inter; ++r)
+            std::memcpy(g->cpuData + r*rowBytes, canonical.data() + (r/2 + (r%2)*inter)*rowBytes, rowBytes);
+        g->Repack(); d->Repack(); gateType = g->ggmlType; downType = d->ggmlType;
+    }
+    const size_t offset = (g->GetBytes()+15)/16*16, stride = offset+d->GetBytes();
+    const size_t bytes = FastllmCudaMoeGGUFCacheWorkspaceBytes(hidden, inter);
+    Data records(INT8, {int(stride)}), workspace(INT8, {int(bytes)});
+    Data input(dtype, {1,hidden}), gate(dtype, {1,inter}), output(dtype, {1,hidden});
+    Data slots(INT32, {1}), scores(FLOAT32, {1}), partial(FLOAT32, {1,hidden});
+    for (auto *v : {&records,&workspace,&input,&gate,&output,&slots,&scores,&partial}) Gpu(*v);
+    Cuda(cudaMemset(slots.cudaData,0,sizeof(int32_t)));
+    const float score = 1; Cuda(cudaMemcpy(scores.cudaData,&score,sizeof(score),cudaMemcpyHostToDevice));
+    DelayedDownUpload upload(stride);
+    std::memcpy(upload.host,g->cpuData,g->GetBytes());
+    std::memcpy(upload.host+offset,d->cpuData,d->GetBytes());
+    FastllmCudaMoeGGUFCacheView view{static_cast<uint8_t *>(records.cudaData),
+        static_cast<int32_t *>(slots.cudaData),stride,offset,type,GGML_TYPE_Q2_0,hidden,inter,
+        workspace.cudaData,bytes};
+    view.numaGateType = gateType; view.numaDownType = downType;
+    std::vector<T> x(hidden);
+    std::vector<float> reference(hidden),actual(hidden);
+    for (int pass = 0; pass < 3; ++pass) {
+        for (int i = 0; i < hidden; ++i) x[i] = Cast<T>(.03f*std::sin(i*.731f+pass));
+        Cuda(cudaMemcpy(input.cudaData,x.data(),x.size()*sizeof(T),cudaMemcpyHostToDevice));
+        Cuda(cudaMemcpy(records.cudaData,upload.host,stride,cudaMemcpyHostToDevice));
+        Require(FastllmCudaMoeGGUFCacheCompute(input,gate,output,view,
+            static_cast<float *>(scores.cudaData),1,static_cast<float *>(partial.cudaData)),"split reference rejected");
+        Cuda(cudaMemcpy(reference.data(),partial.cudaData,hidden*sizeof(float),cudaMemcpyDeviceToHost));
+        Cuda(cudaMemset(records.cudaData,0xff,stride));
+        Cuda(cudaDeviceSynchronize());
+        Cuda(cudaMemcpyAsync(records.cudaData,upload.host,offset,cudaMemcpyHostToDevice,upload.stream));
+        Cuda(cudaEventRecord(upload.gateReady,upload.stream));
+        upload.Hold();
+        Cuda(cudaMemcpyAsync(static_cast<uint8_t *>(records.cudaData)+offset,upload.host+offset,
+            stride-offset,cudaMemcpyHostToDevice,upload.stream));
+        Cuda(cudaEventRecord(upload.downReady,upload.stream));
+        Cuda(cudaStreamWaitEvent(cudaStreamPerThread,upload.gateReady,0));
+        Require(FastllmCudaMoeGGUFCacheComputeStaged(input,gate,output,view,
+            static_cast<float *>(scores.cudaData),1,static_cast<float *>(partial.cudaData),
+            {upload.downReady,upload.gateDone,upload.downStart}),"split upload rejected");
+        Cuda(cudaEventSynchronize(upload.gateDone));
+        const bool earlyGate = !upload.timedOut && cudaEventQuery(upload.downReady) == cudaErrorNotReady;
+        upload.release = true;
+        Cuda(cudaMemcpy(actual.data(),partial.cudaData,hidden*sizeof(float),cudaMemcpyDeviceToHost));
+        Require(earlyGate,"gate waited for down upload");
+        Require(std::memcmp(actual.data(),reference.data(),hidden*sizeof(float))==0,"split upload changed output");
+        for (float v : actual) Require(std::isfinite(v),"split upload read poisoned weights");
+    }
+    std::printf("PASS split upload type=%d dtype=%d numa=%d: early gate, delayed down, bitwise output\n",type,dtype,int(numa));
 }
 
 // Compact dispatch must preserve the original input row and output route,
@@ -1364,6 +1459,15 @@ int main(int argc, char **argv) {
     try {
         int count = 0; Cuda(cudaGetDeviceCount(&count)); if (!count) { std::puts("SKIP: no CUDA device"); return 0; }
         Cuda(cudaSetDevice(0));
+        if (argc > 1 && std::strcmp(argv[1], "--split-upload") == 0) {
+            for (auto type : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_F16})
+                for (bool numa : {false,true}) {
+                    RunSplitUpload<float>(type,fastllm::FLOAT32,numa);
+                    RunSplitUpload<half>(type,fastllm::FLOAT16,numa);
+                    RunSplitUpload<__nv_bfloat16>(type,fastllm::BFLOAT16,numa);
+                }
+            std::puts("PASS: GGUF split upload dependencies"); return 0;
+        }
         if (argc > 1 && std::strcmp(argv[1], "--numa-layout") == 0) {
             // R4 requires the Q8 projection for each packed part. Some mixed
             // pairs switch to floating-point projection above 32 input rows.

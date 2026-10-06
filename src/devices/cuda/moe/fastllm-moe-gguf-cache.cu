@@ -348,7 +348,7 @@ __global__ void Down(const T *gateOutput, T *output, View view,
 template<typename T, typename View>
 bool Compute(const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &output,
              const View &view, const float *scores, int topk, float *perExpert = nullptr,
-             bool q8InputPrepared = false) {
+             bool q8InputPrepared = false, const FastllmCudaMoeGGUFStageEvents *events = nullptr) {
     const int rows = input.dims[0], routes = ActiveRoutes(view, rows * topk);
     const int stages = view.workspace && view.workspaceBytes >= Q8WorkspaceBytes(rows, view.hidden, view.inter, topk)
         ? Q8Stages(view.gateType, view.downType, view.hidden, view.inter, rows) : 0;
@@ -387,9 +387,17 @@ bool Compute(const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &out
             default: return false;
         }
     }
-    if (stages & 2) {
+    if (stages & 2)
         QuantizeQ8<<<dim3((view.inter+255)/256, routes), 256, 0, cudaStreamPerThread>>>(
             static_cast<const T *>(gate.cudaData), qGate, view.inter);
+    // Gate/up and activation quantization do not read down weights. Run them
+    // during the remaining DMA, and keep its wait out of scheduler timings.
+    if (events) {
+        if (events->gateDone && cudaEventRecord(events->gateDone, cudaStreamPerThread) != cudaSuccess) return false;
+        if (events->downReady && cudaStreamWaitEvent(cudaStreamPerThread, events->downReady, 0) != cudaSuccess) return false;
+        if (events->downStart && cudaEventRecord(events->downStart, cudaStreamPerThread) != cudaSuccess) return false;
+    }
+    if (stages & 2) {
         switch (downType) {
 #define Q8_DOWN(name) case GGML_TYPE_##name: \
             LaunchQ8Down<GGML_TYPE_##name>(qGate, static_cast<T *>(gate.cudaData), \
@@ -547,6 +555,13 @@ bool FastllmCudaMoeGGUFCacheSupported(int type, int columns) {
 bool FastllmCudaMoeGGUFCacheCompute(const fastllm::Data &input, fastllm::Data &gate,
         fastllm::Data &output, const FastllmCudaMoeGGUFCacheView &view,
         const float *scores, int topk, float *perExpert) {
+    return FastllmCudaMoeGGUFCacheComputeStaged(input, gate, output, view, scores, topk, perExpert, {});
+}
+
+bool FastllmCudaMoeGGUFCacheComputeStaged(const fastllm::Data &input, fastllm::Data &gate,
+        fastllm::Data &output, const FastllmCudaMoeGGUFCacheView &view,
+        const float *scores, int topk, float *perExpert,
+        const FastllmCudaMoeGGUFStageEvents &events) {
     if (input.dims.size() != 2 || input.dims[0] <= 0 || input.dims[1] != view.hidden ||
         topk <= 0 || topk > 32 || input.dims[0] > INT_MAX / topk ||
         !scores || !view.records || !view.routeSlots ||
@@ -559,9 +574,9 @@ bool FastllmCudaMoeGGUFCacheCompute(const fastllm::Data &input, fastllm::Data &g
          !FastllmCudaMoeGGUFCacheNumaSupported(view.numaGateType, view.numaDownType,
              view.hidden, view.inter, input.dims[0]))) return false;
     switch (input.dataType) {
-        case fastllm::FLOAT32: return Compute<float>(input, gate, output, view, scores, topk, perExpert, view.q8InputPrepared);
-        case fastllm::FLOAT16: return Compute<half>(input, gate, output, view, scores, topk, perExpert, view.q8InputPrepared);
-        case fastllm::BFLOAT16: return Compute<__nv_bfloat16>(input, gate, output, view, scores, topk, perExpert, view.q8InputPrepared);
+        case fastllm::FLOAT32: return Compute<float>(input, gate, output, view, scores, topk, perExpert, view.q8InputPrepared, &events);
+        case fastllm::FLOAT16: return Compute<half>(input, gate, output, view, scores, topk, perExpert, view.q8InputPrepared, &events);
+        case fastllm::BFLOAT16: return Compute<__nv_bfloat16>(input, gate, output, view, scores, topk, perExpert, view.q8InputPrepared, &events);
         default: return false;
     }
 }

@@ -1853,6 +1853,16 @@ bool FastllmCudaMoeGGUFCacheCompute(
         const fastllm::Data &input, fastllm::Data &gateOutput,
         fastllm::Data &output, const FastllmCudaMoeGGUFCacheView &view,
         const float *scores, int topk, float *perExpert = nullptr);
+// Gate weights are already ready on the calling stream. Down weights may
+// still be uploading; optional timing events exclude that wait from compute.
+struct FastllmCudaMoeGGUFStageEvents {
+    cudaEvent_t downReady = nullptr, gateDone = nullptr, downStart = nullptr;
+};
+bool FastllmCudaMoeGGUFCacheComputeStaged(
+        const fastllm::Data &input, fastllm::Data &gateOutput,
+        fastllm::Data &output, const FastllmCudaMoeGGUFCacheView &view,
+        const float *scores, int topk, float *perExpert,
+        const FastllmCudaMoeGGUFStageEvents &events);
 // perExpert, when provided, receives unweighted FP32 [rows, topk, hidden]
 // results; missing route slots write zero. The caller owns the final reduction.
 // Use the same fused kernels with immutable GPU weight pointers. Routing stays
