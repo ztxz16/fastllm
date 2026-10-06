@@ -8898,7 +8898,10 @@ namespace fastllm {
             (hiddenStates.dims[1] == 1 || mtpTargetGraph) &&
             !this->weights.empty() && !this->weights[0].empty() &&
             MoeCudaCacheAvailable(this->weights[0]);
-        const bool hybridDenseGraph = tpHostMoe &&
+        const bool hybridMoe = !tpHostMoe &&
+            !this->weights.empty() && !this->weights[0].empty() &&
+            FastllmCudaUseMoeHybrid(this->weights[0].data(), this->weights[0].size());
+        const bool hybridDenseGraph = (tpHostMoe || hybridMoe) &&
             hiddenStates.dims.size() == 3 && hiddenStates.dims[1] == 1 &&
             verificationCapture == nullptr && Qwen4MtpDraftsPerStep() == 0;
         const bool moeDeviceMapGraphCompatible =
@@ -8910,9 +8913,6 @@ namespace fastllm {
             hybridDenseGraph;
         // Host decisions and NUMA execution cannot be captured in the full
         // backbone graph, including multi-row MTP verification.
-        const bool hybridMoe = !tpHostMoe &&
-            !this->weights.empty() && !this->weights[0].empty() &&
-            FastllmCudaUseMoeHybrid(this->weights[0].data(), this->weights[0].size());
         if (!GetFastllmEnv().cudaGraph ||
             (hybridMoe && !hybridDenseGraph) ||
             (hybridDenseGraph && !startBeforeAttention) ||
