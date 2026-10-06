@@ -2344,13 +2344,21 @@ namespace fastllm {
             sharedReady = true;
         };
 #ifdef USE_CUDA
+        const std::string routedDevice = SelectMoeDeviceForLayer(deviceLayer);
+        const bool routedOnNumas = routedDevice == "numa" || routedDevice.rfind("numa:", 0) == 0;
         if (threadTpRank >= 0) {
-            runShared();
-            // Drain both rank streams before the owner uses peer GPUs for
-            // host MoE. Other ranks wait at the following reduction's host
-            // submission barrier, without a pending NCCL kernel on those GPUs.
-            FastllmCudaSyncCurrentThreadStream();
-            threadTpOwner->Barrier();
+            // Single-row NUMA decode, including its CPU fallback, uses only
+            // the owner's GPU. Launch its shared expert in the CPU overlap
+            // callback. Other ranks can submit their shared work immediately;
+            // the following AllReduce rendezvous prevents an early NCCL launch.
+            const bool localNumasDecode = sequence == 1 && routedOnNumas;
+            if (!localNumasDecode || threadTpRank != 0) runShared();
+            if (!localNumasDecode) {
+                // Disk experts and multi-row assistance can use peer GPUs.
+                // Finish rank-local work before handing those GPUs to the owner.
+                FastllmCudaSyncCurrentThreadStream();
+                threadTpOwner->Barrier();
+            }
             if (threadTpRank != 0) {
                 input.Reshape(outputDims);
                 output.Reshape(outputDims);
@@ -2375,12 +2383,9 @@ namespace fastllm {
 
         Data routedOutput;
 #if defined(USE_CUDA) && defined(USE_NUMAS)
-        const std::string routedDevice =
-            SelectMoeDeviceForLayer(deviceLayer);
 #ifndef USE_ROCM
         if (sequence <= FASTLLM_CUDA_MOE_CACHE_MAX_BATCH && input.dataType == DataType::BFLOAT16 &&
-            moeAtype == DataType::BFLOAT16 &&
-            (routedDevice == "numa" || routedDevice.rfind("numa:", 0) == 0) &&
+            moeAtype == DataType::BFLOAT16 && routedOnNumas &&
             FastllmCudaMergeMOEHybrid(input, expertIndex, expertScore, routedOutput,
                 weights.data(), (int)weights.size(), deviceLayer, runShared)) {
             ApplyDeviceMap(deviceMap, deviceLayer + 1, block_cnt);
@@ -2393,9 +2398,7 @@ namespace fastllm {
         const bool prefetchNumasSmallBatch =
             sequence >= 1 &&
             sequence <= kNumasMoePrefetchMaxRows &&
-            GetCudaSharedExpert() &&
-            (routedDevice == "numa" ||
-             routedDevice.rfind("numa:", 0) == 0) &&
+            GetCudaSharedExpert() && routedOnNumas &&
             std::getenv(
                 "FASTLLM_GLM5_DISABLE_NUMAS_MOE_OVERLAP") == nullptr;
         if (prefetchNumasSmallBatch) {

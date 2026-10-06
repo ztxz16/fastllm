@@ -16,6 +16,8 @@ namespace fastllm {
     struct Glm5NextModel::ThreadTpState {
         using Cache = std::vector<std::pair<Data, Data>>;
         std::vector<int> devices;
+        std::vector<std::vector<int>> workerCpus;
+        std::vector<unsigned char> workerBoundToSpareCores;
         std::vector<std::unique_ptr<Glm5NextModel>> ranks;
         std::map<const Cache *, std::vector<Cache>> requests;
         std::mutex forwardMutex, barrierMutex;
@@ -102,6 +104,17 @@ namespace fastllm {
         if (!tp.ranks.empty()) return;
         auto &devices = tp.devices;
         const int count = devices.size();
+        tp.workerCpus.resize(count);
+        tp.workerBoundToSpareCores.resize(count, false);
+#ifdef USE_NUMAS
+        for (int layer = 0; layer < block_cnt; ++layer) if (!denseMlpLayers[layer]) {
+            const auto device = SelectMoeDeviceForLayer(layer);
+            if (device == "numa" || device.rfind("numa:", 0) == 0) {
+                tp.workerCpus = GetNumasCudaWorkerCpuSets(devices);
+                break;
+            }
+        }
+#endif
         AssertInFastLLM(FastllmInitNccl(devices), "GLM TP NCCL initialization failed.");
         for (int d : devices) {
             FastllmCudaSetDevice(d);
@@ -217,8 +230,13 @@ namespace fastllm {
         if (threadTpRank < 0) return;
         AssertInFastLLM(data.dataDevice == DataDevice::CUDA && data.cudaData &&
             data.Count(0) <= std::numeric_limits<int>::max(), "GLM TP invalid reduction tensor.");
-        FastllmNcclAllReduceNoCustom(data.cudaData, data.cudaData, data.Count(0), data.dataType,
-            threadTpOwner->devices[threadTpRank]);
+        // A sleeping peer otherwise adds a wakeup after each CPU MoE phase.
+        // Only spin through that interval for single-row decode when this
+        // rank is actually bound away from the NUMA expert workers.
+        const int hostSpinUs = data.Count(0) == (uint64_t)embed_dim &&
+            threadTpOwner->workerBoundToSpareCores[threadTpRank] ? 1000 : 0;
+        FastllmNcclAllReduceNoCustomWithSpin(data.cudaData, data.cudaData, data.Count(0), data.dataType,
+            threadTpOwner->devices[threadTpRank], hostSpinUs);
 #endif
     }
 
@@ -259,6 +277,15 @@ namespace fastllm {
         std::vector<std::exception_ptr> errors(tp.devices.size());
         int result = 0;
         tp.workers.Run(tp.devices, [&](int r) {
+#ifdef USE_NUMAS
+            // The persistent submission threads must not compete with the
+            // pinned NUMA expert workers or their SMT siblings.
+            static thread_local bool placementAttempted = false;
+            if (!placementAttempted) {
+                tp.workerBoundToSpareCores[r] = BindNumasWorkerCpuSet(tp.workerCpus[r]);
+                placementAttempted = true;
+            }
+#endif
             FastllmCudaSetDevice(tp.devices[r]);
             static thread_local Executor executor;
             struct RestoreExecutor {

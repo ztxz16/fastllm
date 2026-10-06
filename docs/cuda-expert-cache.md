@@ -962,6 +962,21 @@ Prefix/history reuse is bypassed for TP. As with ordinary BF16 tensor
 parallelism, partitioning changes floating-point accumulation and can change
 generated tokens; it does not promise bitwise agreement with serial execution.
 
+With `--moe_device numa`, single-token TP decode overlaps the owner rank's
+shared expert with CPU routed experts and streamed GPU misses. Other ranks
+submit their own shared projections and meet the owner at the FFN reduction.
+CUDA submission threads use available cores outside the pinned NUMA expert
+workers when the process CPU affinity allows it. Disk experts and multi-row
+GPU assistance retain their pre-MoE coordination because they can use peer
+GPUs; the cache policy and dynamic miss-allocation policy are unchanged.
+
+For single-row TP reductions, successfully placed submission threads spin
+for at most 1 ms before sleeping at the NCCL host rendezvous. This avoids
+scheduler wakeups after short CPU MoE work without taking cores from the
+expert workers. Both pre/post submission boundaries, error propagation and
+timeouts remain active. Multi-row work and ranks without spare cores use
+the default short spin followed by a condition-variable wait.
+
 For the native GLM GGUF disk adapter, the TP owner searches resident experts
 across all participating GPUs and launches their work before CPU misses.
 Promotions select available capacity or the coldest eligible victim across
