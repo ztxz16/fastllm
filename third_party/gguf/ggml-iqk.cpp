@@ -2209,9 +2209,18 @@ static void mul_mat_iq4_nl_q8_0_rows(int blocks, const char *vx, size_t bx,
         const float dy = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(y[block].d)));
         for (int r = 0; r < rows; ++r) {
             const __m128i bits = _mm_loadu_si128((const __m128i *)x[r][block].qs);
+#if !defined(__AVX512F__)
+            // Split the two nibbles across the 128-bit lanes, then decode
+            // all 32 values with one shuffle instead of two plus an insert.
+            const auto packed = _mm256_broadcastsi128_si256(bits);
+            const auto indices = _mm256_and_si256(_mm256_blend_epi32(
+                packed, _mm256_srli_epi16(packed, 4), 0xf0), _mm256_broadcastsi128_si256(mask));
+            const auto qx = _mm256_shuffle_epi8(_mm256_broadcastsi128_si256(values), indices);
+#else
             const __m256i qx = MM256_SET_M128I(
                 _mm_shuffle_epi8(values, _mm_and_si128(_mm_srli_epi16(bits, 4), mask)),
                 _mm_shuffle_epi8(values, _mm_and_si128(bits, mask)));
+#endif
             // IQ4_NL never contains -128. Applying the Q8 sign to IQ4
             // therefore also handles Q8=-128, without signed-byte overflow.
 #if defined(__AVX512VNNI__) && defined(__AVX512VL__)
@@ -2226,6 +2235,14 @@ static void mul_mat_iq4_nl_q8_0_rows(int blocks, const char *vx, size_t bx,
     };
     int block = 0;
     for (; block + 1 < blocks; block += 2) {
+#if !defined(__AVX512F__)
+        // Interleaved row streams can starve AVX2 decode when experts no
+        // longer fit in cache. Keep the lookahead within each weight row.
+        constexpr int ahead = 8;
+        if (block + ahead < blocks)
+            for (int r = 0; r < rows; ++r)
+                _mm_prefetch((const char *)&x[r][block + ahead], _MM_HINT_T0);
+#endif
         accumulate(block, even);
         accumulate(block + 1, odd);
     }
@@ -2247,8 +2264,12 @@ static void mul_mat_iq4_nl_q8_0(int n, const void *vx, size_t bx,
     // Two output rows reduce register pressure for short decode dots while
     // retaining the original even/odd block accumulation order.
     constexpr int rows = nrc_y == 1 ? 2 : 4;
-#else
+#elif defined(__AVX512F__)
     constexpr int rows = 4;
+#else
+    // Fewer simultaneous streams improve cold-weight access on AVX2 and
+    // leave room for the unpack temporaries and even/odd accumulators.
+    constexpr int rows = 2;
 #endif
     for (int iy = 0; iy < nrc_y; ++iy) {
         const auto *y = reinterpret_cast<const block_q8_0 *>(info.src1_row(iy));

@@ -81,7 +81,9 @@ void CheckReference(float actual, const Fixture &f, int output, int input, float
 }
 
 void TestDirect() {
-    for (int columns : {32, 64, 96, 256, 640, 768, 2560}) {
+    // Eight blocks end exactly at the prefetch lookahead; nine exercise a
+    // valid lookahead followed by an odd final block.
+    for (int columns : {32, 64, 96, 256, 288, 640, 768, 2560}) {
         for (int outputs : {1, 2, 3, 4, 5, 7, 13, 64}) {
             for (int inputs = 1; inputs <= 8; ++inputs) {
                 Fixture f(columns, outputs + 3, inputs + 1, true, true);
