@@ -20,6 +20,7 @@ struct NaiveN05FlashModel::TPDecodeState {
     struct Rank {
         TargetWorkspace buffers;
         TargetCapture features;
+        Data logitsPartial, logitsCandidates;
         void *graph = nullptr, *exec = nullptr;
         bool ok = true;
         std::vector<void *> communicationPointers;
@@ -31,6 +32,7 @@ struct NaiveN05FlashModel::TPDecodeState {
     uint64_t ncclGeneration = 0;
     int capacity = 0, region = 0, rows = 1;
     bool verifying = false;
+    LogitsSelection selection;
     bool warmed = false, captured = false, disabled = false, active = false;
     void ClearGraphs();
     ~TPDecodeState();

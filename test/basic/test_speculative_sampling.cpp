@@ -71,6 +71,26 @@ int main() {
         config.last_n = 0;
         p = SpeculativeDistribution(repeated, 3, config, history);
         Require(p[0] == 1, "Unique-token repetition policy was lost");
+        // Compact candidates are already ranked raw scores, including any
+        // mask/penalty. Their IDs can be sparse in the original vocabulary.
+        config.repeat_penalty = 1;
+        config.top_k = 3;
+        config.top_p = .7f;
+        config.temperature = 1;
+        const float candidates[] = {7, std::log(.6f), 2, std::log(.3f), 9, std::log(.1f)};
+        p = SpeculativeTopKDistribution(candidates, 3, 11, config);
+        Require(std::abs(p[7] - 2.f / 3) < 1e-6 && std::abs(p[2] - 1.f / 3) < 1e-6 && p[9] == 0,
+                "Compact candidates changed top-p normalization");
+        for (int i : {0, 1, 3, 4, 5, 6, 8, 10})
+            Require(p[i] == 0, "Compact distribution leaked outside its support");
+        config.top_p = 1;
+        config.top_k = 2;
+        config.temperature = .5f;
+        p = SpeculativeTopKDistribution(candidates, 2, 11, config);
+        Require(std::abs(p[7] - .8f) < 1e-6 && std::abs(p[2] - .2f) < 1e-6,
+                "Compact candidates changed temperature/top-k normalization");
+        p = SpeculativeTopKDistribution(candidates, 1, 11, config);
+        Require(p[7] == 1, "Single compact candidate is not a point mass");
         std::cout << "Speculative sampling: all tests passed\n";
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';

@@ -6,8 +6,8 @@
 #include "utils.h"
 #include <cmath>
 #include <climits>
-#ifdef USE_CUDA
 #include "devices/cuda/naive-n05-cuda.cuh"
+#ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #endif
@@ -213,11 +213,12 @@ int NaiveN05FlashModel::Forward(
         std::vector<float> *retLogits) {
     if (draftEnabled)
         return ForwardDraft(inputIds, positionIds, pastKeyValues, generationConfig, lastTokens, retLogits);
+    auto selection = SelectLogits(generationConfig);
     Data logits = tpDevices.size() > 1
-        ? ForwardTensorParallel(inputIds, positionIds, pastKeyValues, generationConfig)
+        ? ForwardTensorParallel(inputIds, positionIds, pastKeyValues, generationConfig, nullptr, &selection)
         : RunTarget(inputIds, positionIds, pastKeyValues, generationConfig, nullptr);
     if (isIntermediateChunkedPrefill) return 0;
-    return SampleTarget(logits, pastKeyValues, generationConfig, lastTokens, retLogits);
+    return SampleTarget(logits, pastKeyValues, generationConfig, lastTokens, retLogits, &selection);
 }
 
 Data NaiveN05FlashModel::RunTarget(
@@ -620,10 +621,35 @@ Data NaiveN05FlashModel::RunTarget(
 #endif
 }
 
+NaiveN05FlashModel::LogitsSelection NaiveN05FlashModel::SelectLogits(
+        const GenerationConfig &config, bool speculative) const {
+    LogitsSelection selection;
+    // These transforms must happen before selection. Keep the established
+    // full-logits path until their branch-local GPU equivalents are available.
+    if (config.output_logits || config.output_token_least > 0 ||
+        std::abs(config.repeat_penalty - 1.0f) > 1e-8f ||
+        !config.tool_call_allowed_token_ids.empty()) return selection;
+    selection.greedy = config.IsSimpleGreedy();
+    if (selection.greedy) selection.count = 1;
+    else if (config.top_k > 1 && config.top_k <= kNaiveLogitsMaxTopK &&
+             std::isfinite(config.temperature) && config.temperature > 0 &&
+             std::isfinite(1.0f / config.temperature)) {
+        selection.count = config.top_k;
+        // Ordinary LLMSampling ranks scaled scores; DSpark ranks raw scores
+        // and applies temperature after subtracting the largest score.
+        selection.invTemperature = speculative ? 1.0f : 1.0f / config.temperature;
+    }
+    return selection;
+}
+
 int NaiveN05FlashModel::SampleTarget(
         Data &logits, std::vector<std::pair<Data, Data>> &pastKeyValues,
         const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
-        std::vector<float> *retLogits) {
+        std::vector<float> *retLogits, LogitsSelection *selection) {
+    if (selection && !selection->candidates.dims.empty()) {
+        if (selection->greedy) return (int)((float *)selection->candidates.cpuData)[0];
+        return LLMSamplingOnly(selection->candidates, 0, generationConfig);
+    }
     Data top;
     if (generationConfig.output_logits && retLogits) {
         logits.ToDevice(DataDevice::CPU);

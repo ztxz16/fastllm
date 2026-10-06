@@ -8,13 +8,47 @@
 
 namespace fastllm {
 
+// Candidates are the globally sorted raw-score TopK after all masks/penalties.
+// Keep the dense probability vector for the existing rejection/residual logic.
+template <class Token, class Score>
+inline std::vector<float> SpeculativeTopKDistribution(
+        int count, int vocab, const GenerationConfig &config, Token token, Score score) {
+    std::vector<float> probabilities(vocab, 0.0f);
+    if (count == 1) {
+        probabilities[token(0)] = 1;
+        return probabilities;
+    }
+    double sum = 0;
+    for (int i = 0; i < count; ++i) {
+        float p = std::exp((score(i) - score(0)) / config.temperature);
+        probabilities[token(i)] = p;
+        sum += p;
+    }
+    double kept = 0;
+    int retained = 0;
+    for (; retained < count; ++retained) {
+        kept += probabilities[token(retained)];
+        if (kept / sum > config.top_p) { ++retained; break; }
+    }
+    for (int i = 0; i < retained; ++i) probabilities[token(i)] /= kept;
+    for (int i = retained; i < count; ++i) probabilities[token(i)] = 0;
+    return probabilities;
+}
+
+inline std::vector<float> SpeculativeTopKDistribution(
+        const float *candidates, int count, int vocab, const GenerationConfig &config) {
+    return SpeculativeTopKDistribution(count, vocab, config,
+        [&](int i) { return (int)candidates[i * 2]; },
+        [&](int i) { return candidates[i * 2 + 1]; });
+}
+
 // The same temperature, repetition, top-k and top-p order as LLMSampling.
 // Keep the complete, normalized proposal distribution: rejection sampling
 // needs q for every token, including tokens the draft did not select.
 inline std::vector<float> SpeculativeDistribution(
         const float *logits, int vocab, const GenerationConfig &config,
         const LastTokensUnit &tokens) {
-    std::vector<float> values(logits, logits + vocab), probabilities(vocab, 0.0f);
+    std::vector<float> values(logits, logits + vocab);
     if (std::abs(config.repeat_penalty - 1.0f) > 1e-6f) {
         int previous = -1;
         for (int token : tokens.tokenSet) {
@@ -38,25 +72,8 @@ inline std::vector<float> SpeculativeDistribution(
     std::partial_sort(order.begin(), order.begin() + count, order.end(), [&](int a, int b) {
         return values[a] > values[b] || (values[a] == values[b] && a < b);
     });
-    if (count == 1) {
-        probabilities[order[0]] = 1;
-        return probabilities;
-    }
-    double sum = 0;
-    for (int i = 0; i < count; ++i) {
-        float p = std::exp((values[order[i]] - values[order[0]]) / config.temperature);
-        probabilities[order[i]] = p;
-        sum += p;
-    }
-    double kept = 0;
-    int retained = 0;
-    for (; retained < count; ++retained) {
-        kept += probabilities[order[retained]];
-        if (kept / sum > config.top_p) { ++retained; break; }
-    }
-    for (int i = 0; i < retained; ++i) probabilities[order[i]] /= kept;
-    for (int i = retained; i < count; ++i) probabilities[order[i]] = 0;
-    return probabilities;
+    return SpeculativeTopKDistribution(count, vocab, config,
+        [&](int i) { return order[i]; }, [&](int i) { return values[order[i]]; });
 }
 
 inline int SampleSpeculativeDistribution(const std::vector<float> &probabilities, double uniform) {

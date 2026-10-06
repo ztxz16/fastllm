@@ -1349,6 +1349,11 @@ if (UNIT_TEST)
         target_include_directories(naive_n05_draft_ops_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         add_test(NAME naive_n05_draft_ops COMMAND naive_n05_draft_ops_test)
         set_tests_properties(naive_n05_draft_ops PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 150)
+        add_executable(naive_n05_logits_test test/basic/test_naive_n05_logits.cpp)
+        target_link_libraries(naive_n05_logits_test PRIVATE fastllm)
+        target_include_directories(naive_n05_logits_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME naive_n05_logits COMMAND naive_n05_logits_test)
+        set_tests_properties(naive_n05_logits PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 150)
         add_executable(naive_n05_attention_test test/basic/test_naive_n05_attention.cpp)
         target_link_libraries(naive_n05_attention_test PRIVATE fastllm)
         target_include_directories(naive_n05_attention_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
@@ -1384,6 +1389,13 @@ if (UNIT_TEST)
         set_tests_properties(naive_n05_verify_allreduce
             PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
             PASS_REGULAR_EXPRESSION "ROW ALLREDUCE PASS")
+        foreach(NAIVE_SELECTION_RANKS 2 4 8)
+            add_test(NAME naive_n05_verify_selection_${NAIVE_SELECTION_RANKS}
+                COMMAND naive_n05_tp_model_test ${NAIVE_SELECTION_RANKS} selection)
+            set_tests_properties(naive_n05_verify_selection_${NAIVE_SELECTION_RANKS}
+                PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
+                PASS_REGULAR_EXPRESSION "VERIFY SELECTION PASS")
+        endforeach()
         add_test(NAME naive_n05_draft_head COMMAND naive_n05_tp_model_test 8 head)
         set_tests_properties(naive_n05_draft_head
             PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
@@ -1404,6 +1416,10 @@ if (UNIT_TEST)
                 fastllm_tools ${NAIVE_TP_GRAPH_CUDART} ${CMAKE_DL_LIBS})
             set_target_properties(naive_n05_verify_graph_test PROPERTIES ENABLE_EXPORTS ON LINKER_LANGUAGE CUDA)
             target_include_directories(naive_n05_verify_graph_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            add_test(NAME naive_n05_verify_selection_graph COMMAND naive_n05_verify_graph_test 8 selection)
+            set_tests_properties(naive_n05_verify_selection_graph
+                PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
+                PASS_REGULAR_EXPRESSION "VERIFY SELECTION PASS")
             foreach(NAIVE_VERIFY_MODE eager graph failbegin failinstantiate)
                 add_test(NAME naive_n05_verify_${NAIVE_VERIFY_MODE}
                     COMMAND naive_n05_verify_graph_test 8 verify_graph ${NAIVE_VERIFY_MODE})

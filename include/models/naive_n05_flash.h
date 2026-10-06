@@ -11,6 +11,7 @@ namespace fastllm {
     class NaiveN05FlashModel : public basellm {
     protected:
         struct TargetCapture;
+        struct LogitsSelection;
     public:
         NaiveN05FlashModel();
         ~NaiveN05FlashModel() override;
@@ -26,7 +27,8 @@ namespace fastllm {
         Data ForwardSingleGPU(int rank, const Data &inputIds, const Data &positions,
                               std::vector<std::pair<Data, Data>> &kv,
                               const GenerationConfig &config, const Data *embedding = nullptr,
-                              TargetCapture *capture = nullptr);
+                              TargetCapture *capture = nullptr, float *candidateResult = nullptr,
+                              const LogitsSelection *selection = nullptr);
         bool NeedAttentionMask(int, int) override { return false; }
         // Bound idle TP prefill workspace with the shared pressure-aware pool.
         bool RetainCudaWorkspace() const override { return tpDevices.size() > 1; }
@@ -59,7 +61,15 @@ namespace fastllm {
         void FinishHistoryChunk(const std::vector<std::pair<Data, Data>> &kv,
                                 const std::shared_ptr<HistoryChunk> &chunk);
 
+        struct LogitsSelection {
+            int count = 0;
+            bool greedy = false;
+            float invTemperature = 1.0f;
+            Data candidates; // CPU [rows, count * 2], (global token ID, score).
+        };
+        LogitsSelection SelectLogits(const GenerationConfig &config, bool speculative = false) const;
         struct TargetCapture {
+            LogitsSelection *selection = nullptr;
             bool verifying = false;
             bool collectHidden = true;
             std::map<int, Data> hidden;
@@ -86,7 +96,7 @@ namespace fastllm {
         static void TrimCache(Data &cache, int length);
         int SampleTarget(Data &logits, std::vector<std::pair<Data, Data>> &kv,
                          const GenerationConfig &config, const LastTokensManager &lastTokens,
-                         std::vector<float> *retLogits);
+                         std::vector<float> *retLogits, LogitsSelection *selection = nullptr);
         void InitDraft();
         void AppendDraftContext(Data &hidden, int start, DraftContext &context);
         void CommitDraftContext(TargetCapture &capture, int tokens, DraftContext &context,
@@ -129,13 +139,16 @@ namespace fastllm {
         std::shared_ptr<TPDecodeState> tpDecodeState, tpVerifyState;
         bool HasVerificationGraph() const;
         bool PrepareTensorParallelDecode(const Data &inputIds,
-                                        std::vector<std::pair<Data, Data>> &kv, bool verifying = false);
+                                        std::vector<std::pair<Data, Data>> &kv, bool verifying,
+                                        const LogitsSelection &selection);
         Data ForwardTensorParallelDecode(int rank, const Data &inputIds, const Data &positions,
                                         std::vector<std::pair<Data, Data>> &kv,
-                                        const GenerationConfig &config, const Data *embedding, TargetCapture *capture);
+                                        const GenerationConfig &config, const Data *embedding, TargetCapture *capture,
+                                        float *candidateResult);
         Data ForwardTensorParallel(const Data &inputIds, const Data &positions,
                                    std::vector<std::pair<Data, Data>> &kv,
-                                   const GenerationConfig &config, TargetCapture *capture = nullptr);
+                                   const GenerationConfig &config, TargetCapture *capture = nullptr,
+                                   LogitsSelection *selection = nullptr);
         std::vector<int> tpDevices;
         bool tpPrepared = false;
         std::vector<std::shared_ptr<TargetWorkspace>> tpVerifyWorkspaces;

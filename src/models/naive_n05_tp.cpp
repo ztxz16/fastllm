@@ -256,7 +256,7 @@ void NaiveN05FlashModel::TPDecodeState::ClearGraphs() {
 NaiveN05FlashModel::TPDecodeState::~TPDecodeState() { ClearGraphs(); }
 
 bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
-        std::vector<std::pair<Data, Data>> &kv, bool verifying) {
+        std::vector<std::pair<Data, Data>> &kv, bool verifying, const LogitsSelection &selection) {
     // Prefill has its own scratch. Keep decode and registered communication
     // buffers alive across requests, but only replay after validating all KV
     // addresses/capacities and the collective generation below.
@@ -309,6 +309,9 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
     if (tpDecodeState && tpDecodeState->cachePointers == pointers &&
         tpDecodeState->cacheCapacities == capacities && tpDecodeState->region == region &&
         tpDecodeState->rows == rows && tpDecodeState->verifying == verifying &&
+        tpDecodeState->selection.greedy == selection.greedy &&
+        tpDecodeState->selection.count == selection.count &&
+        tpDecodeState->selection.invTemperature == selection.invTemperature &&
         tpDecodeState->capacity >= nextLength && tpDecodeState->ncclGeneration == generation)
         return tpDecodeState->active = !tpDecodeState->disabled;
     auto state = tpDecodeState ? tpDecodeState : std::make_shared<TPDecodeState>();
@@ -318,6 +321,9 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
     state->region = region;
     state->rows = rows;
     state->verifying = verifying;
+    state->selection.greedy = selection.greedy;
+    state->selection.count = selection.count;
+    state->selection.invTemperature = selection.invTemperature;
     state->capacity = capacity;
     state->cachePointers = std::move(pointers);
     state->cacheCapacities = std::move(capacities);
@@ -353,7 +359,8 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
 
 Data NaiveN05FlashModel::ForwardTensorParallelDecode(int rank, const Data &inputIds,
         const Data &positions, std::vector<std::pair<Data, Data>> &kv,
-        const GenerationConfig &config, const Data *embedding, TargetCapture *capture) {
+        const GenerationConfig &config, const Data *embedding, TargetCapture *capture,
+        float *candidateResult) {
     auto &state = *tpDecodeState;
     auto &r = *state.ranks.at(rank);
     auto &buf = r.buffers;
@@ -395,6 +402,10 @@ Data NaiveN05FlashModel::ForwardTensorParallelDecode(int rank, const Data &input
         if (state.mode == TPDecodeState::Warm) r.communicationPointers.clear();
         RunTarget(buf.inputIds, buf.positions, kv, config,
                   state.verifying ? &r.features : nullptr, rank, embedding, &buf);
+        if (state.selection.count)
+            FastllmCudaNaiveLogitsSelect(buf.logits, tpVocabRanges[rank].first,
+                state.selection.count, state.selection.greedy, state.selection.invTemperature,
+                r.logitsPartial, r.logitsCandidates);
         if (state.mode == TPDecodeState::Capture) {
             bool clean = !FastllmCudaGetThreadError();
             r.ok = FastllmCudaGraphEndCapture(&r.graph) && clean && r.ok;
@@ -405,6 +416,11 @@ Data NaiveN05FlashModel::ForwardTensorParallelDecode(int rank, const Data &input
     }
     if (capture && capture->collectHidden)
         for (auto &feature : r.features.hidden) Copy(feature.second, capture->hidden[feature.first]);
+    if (state.selection.count) {
+        AssertInFastLLM(candidateResult != nullptr, "Naive TP candidate output is missing.");
+        FastllmCudaCopyFromDeviceToHost(candidateResult, r.logitsCandidates.cudaData, r.logitsCandidates.GetBytes());
+        return Data();
+    }
     // ToDevice(CPU) would release the graph's persistent output allocation.
     Data output(FLOAT32, buf.logits.dims);
     output.Allocate();
@@ -415,7 +431,7 @@ Data NaiveN05FlashModel::ForwardTensorParallelDecode(int rank, const Data &input
 
 Data NaiveN05FlashModel::ForwardSingleGPU(int rank, const Data &inputIds, const Data &positions,
         std::vector<std::pair<Data, Data>> &kv, const GenerationConfig &config, const Data *embedding,
-        TargetCapture *capture) {
+        TargetCapture *capture, float *candidateResult, const LogitsSelection *selection) {
 #ifdef USE_CUDA
     int device = tpDevices.at(rank);
     FastllmCudaSetDevice(device);
@@ -428,12 +444,20 @@ Data NaiveN05FlashModel::ForwardSingleGPU(int rank, const Data &inputIds, const 
     } restore{GetExecutor()};
     SetCurrentThreadExecutor(executor.get());
     if (tpDecodeState && tpDecodeState->active && !tpDecodeState->disabled)
-        return ForwardTensorParallelDecode(rank, inputIds, positions, kv, config, embedding, capture);
+        return ForwardTensorParallelDecode(rank, inputIds, positions, kv, config, embedding, capture, candidateResult);
     // Generic operators can move their inputs. Give every worker its own IDs.
     Data localIds(inputIds), localPositions(positions);
     TargetWorkspace *workspace = capture && capture->verifying
         ? tpVerifyWorkspaces.at(rank).get() : nullptr;
     Data logits = RunTarget(localIds, localPositions, kv, config, capture, rank, embedding, workspace);
+    if (candidateResult && !isIntermediateChunkedPrefill) {
+        Data partial, top;
+        FastllmCudaNaiveLogitsSelect(logits, tpVocabRanges[rank].first,
+            selection->count, selection->greedy, selection->invTemperature, partial, top);
+        FastllmCudaCopyFromDeviceToHost(candidateResult, top.cudaData, top.GetBytes());
+        ForceDeviceSync();
+        return Data();
+    }
     if (!isIntermediateChunkedPrefill) logits.ToDevice(DataDevice::CPU);
     ForceDeviceSync();
     return logits;
@@ -444,11 +468,22 @@ Data NaiveN05FlashModel::ForwardSingleGPU(int rank, const Data &inputIds, const 
 }
 
 Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data &positions,
-        std::vector<std::pair<Data, Data>> &kv, const GenerationConfig &config, TargetCapture *capture) {
+        std::vector<std::pair<Data, Data>> &kv, const GenerationConfig &config, TargetCapture *capture,
+        LogitsSelection *selection) {
 #ifdef USE_CUDA
+    PrepareTensorParallel();
+    const int vocab = weight["lm_head.weight"].dims[0];
+    const bool compact = selection && selection->count > 0 && !isIntermediateChunkedPrefill &&
+        std::all_of(tpVocabRanges.begin(), tpVocabRanges.end(), [&](const auto &range) {
+            return FastllmNaiveCanSelectLogits(range.second - range.first, range.first,
+                                              selection->count, selection->greedy);
+        });
+    if (compact) selection->count = std::min(selection->count, vocab);
+    const int count = compact ? selection->count : 0;
+    LogitsSelection fullLogits;
+    const int rows = capture && capture->verifying ? inputIds.dims[1] : 1;
     AssertInFastLLM(!saveHistoryChat, "Naive TP currently requires --cache_history false.");
     AssertInFastLLM((int)kv.size() == block_cnt, "Naive TP: incomplete KV cache.");
-    PrepareTensorParallel();
     for (auto &layer : kv) {
         for (Data *cache : {&layer.first, &layer.second}) {
             if (cache->multiDeviceData) continue;
@@ -481,7 +516,7 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
     } restore{tpDecodeState, tpVerifyState, verify};
     if (verify) tpDecodeState.swap(tpVerifyState);
     if (capture && tpDecodeState) tpDecodeState->active = false;
-    bool graphDecode = (!capture || verify) && PrepareTensorParallelDecode(inputIds, kv, verify);
+    bool graphDecode = (!capture || verify) && PrepareTensorParallelDecode(inputIds, kv, verify, compact ? *selection : fullLogits);
     // Retain each rank's verification scratch and communication addresses.
     // The existing collective registration still validates the complete tuple.
     if (capture && capture->verifying && tpVerifyWorkspaces.empty()) {
@@ -495,7 +530,8 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
             captures[rank].collectHidden = capture->collectHidden && rank == 0;
         }
     }
-    std::vector<Data> logits(tpDevices.size());
+    std::vector<Data> logits(compact ? 0 : tpDevices.size());
+    std::vector<float> candidates(compact ? tpDevices.size() * rows * count * 2 : 0);
     std::vector<std::exception_ptr> errors(tpDevices.size());
     auto runRanks = [&](const std::function<void(int)> &task) {
         std::fill(errors.begin(), errors.end(), nullptr);
@@ -506,8 +542,10 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
         runRanks([&](int rank) {
             Data local = ForwardSingleGPU(rank, inputIds, positions, kv, config,
                                           embedding.dims.empty() ? nullptr : &embedding,
-                                          capture ? &captures[rank] : nullptr);
-            logits[rank].CopyFrom(local);
+                                          capture ? &captures[rank] : nullptr,
+                                          compact ? candidates.data() + (size_t)rank * rows * count * 2 : nullptr,
+                                          compact ? selection : nullptr);
+            if (!compact) logits[rank].CopyFrom(local);
         });
     };
     if (graphDecode && tpDecodeState->warmed && !tpDecodeState->captured) {
@@ -601,8 +639,34 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
     }
     if (capture) capture->hidden = std::move(captures[0].hidden);
     if (isIntermediateChunkedPrefill) return Data();
-    const int rows = capture && capture->verifying ? inputIds.dims[1] : 1;
-    const int vocab = weight["lm_head.weight"].dims[0];
+    if (compact) {
+        auto &output = selection->candidates;
+        output.dataType = FLOAT32;
+        output.Resize({rows, count * 2});
+        output.Allocate();
+        std::vector<std::pair<float, int>> choices;
+        choices.reserve(tpDevices.size() * count);
+        for (int row = 0; row < rows; ++row) {
+            choices.clear();
+            for (size_t rank = 0; rank < tpDevices.size(); ++rank) {
+                const float *local = candidates.data() + (rank * rows + row) * count * 2;
+                for (int k = 0; k < count; ++k)
+                    if (local[k * 2] >= 0) choices.emplace_back(local[k * 2 + 1], (int)local[k * 2]);
+            }
+            auto better = [&](const auto &a, const auto &b) {
+                return selection->greedy ? FastllmNaiveTop1Better(a.first, a.second, b.first, b.second) :
+                    (a.first > b.first || (a.first == b.first && a.second < b.second));
+            };
+            int kept = std::min<int>(count, choices.size());
+            std::partial_sort(choices.begin(), choices.begin() + kept, choices.end(), better);
+            float *dst = (float *)output.cpuData + (size_t)row * count * 2;
+            for (int k = 0; k < count; ++k) {
+                dst[k * 2] = k < kept ? choices[k].second : 0;
+                dst[k * 2 + 1] = k < kept ? choices[k].first : -INFINITY;
+            }
+        }
+        return Data();
+    }
     Data output(FLOAT32, {1, rows, vocab});
     output.Allocate();
     for (int r = 0; r < (int)tpDevices.size(); ++r) {

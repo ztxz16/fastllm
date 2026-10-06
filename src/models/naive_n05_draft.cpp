@@ -289,7 +289,7 @@ Data NaiveN05FlashModel::RunDraftTarget(const Data &inputIds, const Data &positi
         std::vector<std::pair<Data, Data>> &kv, const GenerationConfig &config,
         TargetCapture &capture) {
     return tpDevices.empty() ? RunTarget(inputIds, positions, kv, config, &capture) :
-        ForwardTensorParallel(inputIds, positions, kv, config, &capture);
+        ForwardTensorParallel(inputIds, positions, kv, config, &capture, capture.selection);
 }
 
 void NaiveN05FlashModel::CommitTargetCache(std::vector<std::pair<Data, Data>> &kv,
@@ -578,11 +578,13 @@ int NaiveN05FlashModel::ForwardDraft(
         // prompt chunks' feature copies, projection and draft KV construction.
         const int draftStart = std::max(0, config.input_token_length - draftWindow + 1);
         capture.collectHidden = saveHistoryChat || oldLength + inputIds.dims[1] > draftStart;
+        auto selection = SelectLogits(config);
+        capture.selection = &selection;
         Data logits = RunDraftTarget(inputIds, positions, kv, config, capture);
         if (capture.collectHidden) CommitDraftContext(capture, inputIds.dims[1], context, kv);
         else context.committed += inputIds.dims[1];
         if (isIntermediateChunkedPrefill) return 0;
-        return SampleTarget(logits, kv, config, lastTokens, retLogits);
+        return SampleTarget(logits, kv, config, lastTokens, retLogits, &selection);
     }
     Data draftHidden = RunDraft(anchor, context), selected, baseLogits;
     // DSpark predicts after the anchor at slot 0, unlike DFlash's masked-slot-only head.
@@ -601,6 +603,9 @@ int NaiveN05FlashModel::ForwardDraft(
         }
         return SpeculativeDistribution(values, vocab, config, history);
     };
+    auto selection = SelectLogits(config, true);
+    Data proposalPartial, proposalTop;
+    std::vector<float> proposalCandidates(selection.count * 2);
     std::vector<int> proposed;
     std::vector<std::vector<float>> q;
     int previous = anchor;
@@ -631,7 +636,16 @@ int NaiveN05FlashModel::ForwardDraft(
             top.ToDevice(DataDevice::CPU);
             previous = (int)((float *)top.cpuData)[0];
         } else {
-            q.push_back(distribution(logits, 0, oldLength + step + 1, samplingTokens));
+#ifdef USE_CUDA
+            if (logits.dataDevice == DataDevice::CUDA &&
+                FastllmNaiveCanSelectLogits(vocab, 0, selection.count, false)) {
+                int count = std::min(selection.count, vocab);
+                FastllmCudaNaiveLogitsSelect(logits, 0, count, false, 1.0f, proposalPartial, proposalTop);
+                FastllmCudaCopyFromDeviceToHost(proposalCandidates.data(), proposalTop.cudaData, proposalTop.GetBytes());
+                q.push_back(SpeculativeTopKDistribution(proposalCandidates.data(), count, vocab, config));
+            } else
+#endif
+                q.push_back(distribution(logits, 0, oldLength + step + 1, samplingTokens));
             previous = SampleSpeculativeDistribution(q.back(), context.Uniform());
         }
         proposed.push_back(previous);
@@ -649,6 +663,7 @@ int NaiveN05FlashModel::ForwardDraft(
     Data verifyPos(FLOAT32, {1, (int)verifyIds.size()}, verifyPositions);
     TargetCapture capture;
     capture.verifying = true;
+    capture.selection = &selection;
     Data logits = RunDraftTarget(verifyInput, verifyPos, kv, config, capture);
     ApplyDraftDevice();
     samplingTokens = lastTokens.units.empty() ? LastTokensUnit(config.last_n) : lastTokens.units[0];
@@ -657,15 +672,25 @@ int NaiveN05FlashModel::ForwardDraft(
         // For point-mass p and q, standard rejection sampling reduces exactly
         // to matching argmax tokens and emitting the target argmax on rejection.
         Data top;
-        TopK(logits, top, 1);
-        top.ToDevice(DataDevice::CPU);
-        const float *values = (float *)top.cpuData;
+        const float *values;
+        if (!selection.candidates.dims.empty()) values = (float *)selection.candidates.cpuData;
+        else {
+            TopK(logits, top, 1);
+            top.ToDevice(DataDevice::CPU);
+            values = (float *)top.cpuData;
+        }
         while (accepted < (int)proposed.size() && proposed[accepted] == (int)values[accepted * 2])
             ++accepted;
         next = (int)values[accepted * 2];
     } else {
+        auto targetDistribution = [&](int row) {
+            if (!selection.candidates.dims.empty())
+                return SpeculativeTopKDistribution((float *)selection.candidates.cpuData +
+                    (size_t)row * selection.count * 2, selection.count, vocab, config);
+            return distribution(logits, row, oldLength + row + 1, samplingTokens);
+        };
         while (accepted < (int)proposed.size()) {
-            auto p = distribution(logits, accepted, oldLength + accepted + 1, samplingTokens);
+            auto p = targetDistribution(accepted);
             if (!AcceptSpeculativeToken(proposed[accepted], p, q[accepted], context.Uniform())) {
                 next = SampleSpeculativeResidual(p, q[accepted], context.Uniform());
                 break;
@@ -673,7 +698,7 @@ int NaiveN05FlashModel::ForwardDraft(
             samplingTokens.Push(proposed[accepted++]);
         }
         if (next < 0) {
-            auto p = distribution(logits, accepted, oldLength + accepted + 1, samplingTokens);
+            auto p = targetDistribution(accepted);
             next = SampleSpeculativeDistribution(p, context.Uniform());
         }
     }

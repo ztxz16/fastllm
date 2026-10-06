@@ -17,6 +17,12 @@
 #include <dlfcn.h>
 static bool failBegin = false, failInstantiate = false;
 static std::atomic<int> captures{0};
+static std::atomic<size_t> downloadBytes{0};
+extern "C" void FastllmCudaCopyFromDeviceToHost(void *dst, void *src, size_t bytes) {
+    downloadBytes += bytes;
+    static auto fn = (void (*)(void *, void *, size_t))dlsym(RTLD_NEXT, "FastllmCudaCopyFromDeviceToHost");
+    fn(dst, src, bytes);
+}
 extern "C" bool FastllmCudaGraphInstantiate(void *graph, void **exec) {
     int device = 0;
     cudaGetDevice(&device);
@@ -146,6 +152,56 @@ class Fixture : public NaiveN05FlashModel {
             }
         }
         RunRequests(out, graphs);
+        RunSelections(out);
+    }
+    void RunSelections(std::ofstream &out) {
+        eos_token_id = 17; eos_token_ids = {17, 23};
+        const std::vector<int> modes{0,0,0,0,1,1,1,0,0,0,2,2,2,3,3,3,4,4,4,5,5,5,
+                                     6,6,6,2,2,2,7,7,7,0,0,0};
+        for (int prompt : {3, 254, 2046}) {
+            std::vector<int> expected;
+            for (bool reference : {true, false}) {
+                std::vector<std::pair<Data, Data>> kv;
+                for (int i = 0; i < 2; ++i) kv.emplace_back(Data(BFLOAT16), Data(BFLOAT16));
+                int past = 0;
+                for (int step = 0; step < (int)modes.size(); ++step) {
+                    int n = step ? 1 : prompt;
+                    std::vector<float> ids(n), positions(n);
+                    for (int i = 0; i < n; ++i) { ids[i] = (past + i) * 3 % 256; positions[i] = past + i; }
+                    Data input(FLOAT32, {1, n}, ids), pos(FLOAT32, {1, n}, positions);
+                    GenerationConfig cfg;
+                    cfg.input_token_length = prompt;
+                    cfg.output_logits = reference || modes[step] == 1;
+                    if (modes[step] == 2) { cfg.top_k = 4; cfg.top_p = .8f; cfg.temperature = .7f; }
+                    if (modes[step] == 3) { cfg.output_token_least = 100; cfg.stop_token_ids = {27}; }
+                    if (modes[step] == 4) cfg.tool_call_allowed_token_ids = {17, 23};
+                    if (modes[step] == 5) cfg.repeat_penalty = 1.2f;
+                    if (modes[step] == 6) { cfg.top_k = 65; cfg.top_p = .9f; cfg.temperature = .7f; }
+                    if (modes[step] == 7) { cfg.top_k = 4; cfg.top_p = .8f; cfg.temperature = .9f; }
+                    LastTokensManager history(1, 64); history.units[0].Push(17); history.units[0].Push(17); history.units[0].Push(23);
+                    std::vector<float> logits;
+                    int before = launches.load(); downloadBytes = 0;
+                    srand(2026 + step);
+                    int token = Forward(input, Data(), pos, kv, cfg, history, &logits);
+                    if (reference) expected.push_back(token);
+                    else {
+                        if (token != expected[step]) throw std::runtime_error("greedy/sampling fallback token mismatch");
+                        if (cfg.output_logits != !logits.empty()) throw std::runtime_error("output_logits contract changed");
+                        if (modes[step] == 0 && launches.load() - before == 8 && downloadBytes.load() != 64)
+                            throw std::runtime_error("greedy graph still downloads full vocabulary");
+                        if ((modes[step] == 2 || modes[step] == 7) && launches.load() - before == 8 && downloadBytes.load() != 256)
+                            throw std::runtime_error("sampling graph still downloads full vocabulary");
+                        if (modes[step] != 0 && modes[step] != 2 && modes[step] != 7 && downloadBytes.load() < 256 * sizeof(float))
+                            throw std::runtime_error("sampler did not retain full logits");
+                        out.write((const char *)&token, sizeof(token));
+                    }
+                    past += n;
+                    if (kv[0].first.dims[1] != past || kv[1].first.dims[1] != std::min(past, 7))
+                        throw std::runtime_error("greedy KV metadata mismatch");
+                }
+            }
+        }
+        std::cout << "TP GREEDY AND SAMPLING PASS 102 token comparisons" << std::endl;
     }
     void RunRequests(std::ofstream &out, bool graphs) {
         std::vector<void *> previous;

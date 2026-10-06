@@ -1500,3 +1500,30 @@ decode 专家仍在 CPU，本轮优化针对长 prefill。
 模型测速覆盖的是 `cudapp=2` 配置。
 逐次数据、分层分配计数与校验结果见
 [多卡专家并行实测 JSON](benchmarks/naive_n05_flash_prefill_multigpu.json)。
+
+## TP 候选输出与小批 MoE
+
+普通 TP 解码和 DSpark verify 会自动在每卡选择局部候选，在 CPU 合并全局候选，
+减少完整词表的回传。Greedy 保留原 CUDA Top1 的并列分数顺序；有限 Top-k 采样按
+分数降序、token ID 升序。普通采样在选择前缩放温度，DSpark 使用原始分数选择，
+随后沿用原概率构造、接受/拒绝采样及 KV 提交规则。
+
+紧凑采样支持 K=2..64、每卡词表不超过 262144、全局词表不超过 2^24；这些是算子
+工作区和 FP32 token ID 格式的边界，不依赖 RTX 5090、TP8 或固定模型词表。
+Greedy 不受上述每卡词表大小限制。要求完整 logits、重复惩罚、最短输出长度、
+词表约束或超出紧凑算子边界时，保留原完整 logits 路径。普通串行推理沿用原实现。
+Graph 复用同时校验候选模式、K、温度缩放以及已有的缓存地址/容量和通信 generation。
+
+BF16/NVFP4 小批 MoE 对 2..8 行、top-k<=16 按专家稳定分组，保留原 route ID 和
+每个 token 的加权累加顺序。每个输出 tile 在一个 CTA 内完成 K 归约，避免后续行
+的路由选择改变已有前缀结果。与逐行计算比较使用既有数值容差；相同路径的 eager、
+Graph replay 和后缀路由变化下的前缀比较仍要求逐 bit 一致。其他数据类型和尺寸
+继续走已有调度，跨设备 scratch 迁移也保留。
+
+这些路径没有额外环境开关。`FASTLLM_TP`、`FASTLLM_DSPARK_TOKENS` 和
+`FASTLLM_DSPARK_CONFIDENCE_THRESHOLD` 是现有 CLI 的有效配置接口，继续保留。
+
+启用 `UNIT_TEST` 和 `USE_CUDA` 后，相关 CTest 为 `naive_n05_logits`、
+`naive_n05_verify_selection_{2,4,8}`、`naive_n05_verify_selection_graph`（Linux）、
+`naive_n05_tp_graph`（Linux）、`cuda_nvfp4_marlin_grouped_rows` 和
+`cuda_nvfp4_marlin_cross_device_rows`。`speculative_sampling` 还覆盖 CPU 概率与残差采样。

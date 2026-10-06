@@ -5,6 +5,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cub/block/block_scan.cuh>
+#include <cub/block/block_radix_sort.cuh>
 #include <cub/device/device_radix_sort.cuh>
 #include <cub/device/device_segmented_radix_sort.cuh>
 #include <climits>
@@ -2093,34 +2094,26 @@ __global__ void DraftEmbedding(const float *ids, int step, const BF16 *weight,
     if (col < width) latent[col] = weight[(size_t)(int)ids[step] * width + col];
 }
 
-// The original Top1 folds lanes at offsets 128,64,...,1, retaining its left
-// operand on equality. Thus ties prefer bit-reversed lane order, then the
-// first vocabulary entry visited by that lane (stride 256).
-__device__ bool DraftBetter(float score, int id, float best, int bestId) {
-    if (score != best) return score > best;
-    unsigned rank = __brev((unsigned)id & 255u), bestRank = __brev((unsigned)bestId & 255u);
-    return rank < bestRank || (rank == bestRank && id < bestId);
-}
-__device__ void DraftWarpMax(float &score, int &id) {
+__device__ void Top1WarpMax(float &score, int &id) {
     for (int offset = 16; offset; offset >>= 1) {
         float other = __shfl_down_sync(0xffffffffu, score, offset);
         int otherId = __shfl_down_sync(0xffffffffu, id, offset);
-        if ((threadIdx.x & 31) + offset < 32 && DraftBetter(other, otherId, score, id)) {
+        if ((threadIdx.x & 31) + offset < 32 && FastllmNaiveTop1Better(other, otherId, score, id)) {
             score = other; id = otherId;
         }
     }
 }
-__device__ void DraftBlockMax(float &score, int &id) {
+__device__ void Top1BlockMax(float &score, int &id) {
     __shared__ float scores[8];
     __shared__ int ids[8];
-    DraftWarpMax(score, id);
+    Top1WarpMax(score, id);
     int lane = threadIdx.x & 31, warp = threadIdx.x / 32;
     if (!lane) { scores[warp] = score; ids[warp] = id; }
     __syncthreads();
     if (!warp) {
         score = lane < 8 ? scores[lane] : -INFINITY;
         id = lane < 8 ? ids[lane] : INT_MAX;
-        DraftWarpMax(score, id);
+        Top1WarpMax(score, id);
     }
 }
 __global__ void DraftArgmaxPartial(const BF16 *base, const BF16 *bias,
@@ -2131,11 +2124,11 @@ __global__ void DraftArgmaxPartial(const BF16 *base, const BF16 *bias,
          i < min((int)(blockIdx.x + 1) * 1024, vocab); i += 256) {
         float score = RoundBF16(__bfloat162float(base[i]) + __bfloat162float(bias[i]));
         // Like the original per-lane scan, ignore NaN and -infinity.
-        if (score > -INFINITY && DraftBetter(score, i, best, bestId)) {
+        if (score > -INFINITY && FastllmNaiveTop1Better(score, i, best, bestId)) {
             best = score; bestId = i;
         }
     }
-    DraftBlockMax(best, bestId);
+    Top1BlockMax(best, bestId);
     if (!threadIdx.x) partial[blockIdx.x] = make_float2((float)bestId, best);
 }
 __global__ void DraftArgmaxFinish(const float2 *partial, int count,
@@ -2146,12 +2139,114 @@ __global__ void DraftArgmaxFinish(const float2 *partial, int count,
         float2 item = partial[i];
         // INT_MAX is not exactly representable as float; empty tiles use
         // their score to avoid converting that sentinel back to int.
-        if (item.y > -INFINITY && DraftBetter(item.y, (int)item.x, best, bestId)) {
+        if (item.y > -INFINITY && FastllmNaiveTop1Better(item.y, (int)item.x, best, bestId)) {
             best = item.y; bestId = (int)item.x;
         }
     }
-    DraftBlockMax(best, bestId);
+    Top1BlockMax(best, bestId);
     if (!threadIdx.x) ids[step + 1] = bestId == INT_MAX ? 0.0f : (float)bestId;
+}
+
+__global__ void LogitsTop1Partial(const float *logits, float2 *partial, int vocab, int offset) {
+    float best = -INFINITY;
+    int bestId = INT_MAX;
+    for (int i = blockIdx.x * 1024 + threadIdx.x;
+         i < min((int)(blockIdx.x + 1) * 1024, vocab); i += 256) {
+        float score = logits[(size_t)blockIdx.y * vocab + i];
+        int id = offset + i;
+        if (score > -INFINITY && FastllmNaiveTop1Better(score, id, best, bestId)) {
+            best = score; bestId = id;
+        }
+    }
+    Top1BlockMax(best, bestId);
+    if (!threadIdx.x)
+        partial[(size_t)blockIdx.y * gridDim.x + blockIdx.x] =
+            make_float2(bestId == INT_MAX ? -1.0f : (float)bestId, best);
+}
+__global__ void LogitsTop1Finish(const float2 *partial, float2 *output, int count) {
+    float best = -INFINITY;
+    int bestId = INT_MAX;
+    for (int i = threadIdx.x; i < count; i += 256) {
+        float2 item = partial[(size_t)blockIdx.x * count + i];
+        if (item.y > -INFINITY && FastllmNaiveTop1Better(item.y, (int)item.x, best, bestId)) {
+            best = item.y; bestId = (int)item.x;
+        }
+    }
+    Top1BlockMax(best, bestId);
+    if (!threadIdx.x)
+        output[blockIdx.x] = make_float2(bestId == INT_MAX ? -1.0f : (float)bestId, best);
+}
+// A tile sorts 1024 scores, retaining only its first K. The second stage
+// merges sorted tile heads; no vocabulary-sized host transfer or allocation.
+__global__ void LogitsTopKPartial(const float *logits, float2 *partial,
+                                  int vocab, int offset, int count, float scale) {
+    using Sort = cub::BlockRadixSort<unsigned long long, 256, 4>;
+    __shared__ typename Sort::TempStorage storage;
+    unsigned long long keys[4];
+    for (int j = 0; j < 4; ++j) {
+        int column = blockIdx.x * 1024 + threadIdx.x * 4 + j;
+        keys[j] = 0;
+        if (column < vocab) {
+            float value = logits[(size_t)blockIdx.y * vocab + column] * scale;
+            // Canonicalize signed zero for the CPU sampler's equality rule.
+            unsigned bits = __float_as_uint(value == 0 ? 0.0f : value);
+            unsigned ordered = (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
+            if (!isnan(value))
+                keys[j] = ((unsigned long long)ordered << 32) | (0xffffffffu - (offset + column));
+        }
+    }
+    Sort(storage).SortDescending(keys);
+    for (int j = 0; j < 4; ++j) {
+        int index = threadIdx.x * 4 + j;
+        if (index < count) {
+            auto key = keys[j];
+            unsigned ordered = key >> 32;
+            unsigned bits = (ordered & 0x80000000u) ? (ordered ^ 0x80000000u) : ~ordered;
+            partial[((size_t)blockIdx.y * gridDim.x + blockIdx.x) * count + index] =
+                key ? make_float2((float)(0xffffffffu - (unsigned)key), __uint_as_float(bits)) :
+                      make_float2(-1.0f, -INFINITY);
+        }
+    }
+}
+__device__ bool SamplingBetter(float score, int id, float best, int bestId) {
+    return score > best || (score == best && id < bestId);
+}
+__global__ void LogitsTopKFinish(const float2 *partial, float2 *output, int blocks, int count) {
+    // Each lane owns one sorted tile. 256 tiles cover vocabularies up to 262144.
+    __shared__ float scores[8];
+    __shared__ int ids[8];
+    __shared__ int winner;
+    int head = 0, lane = threadIdx.x & 31, warp = threadIdx.x / 32;
+    const float2 *tile = partial + ((size_t)blockIdx.x * blocks + threadIdx.x) * count;
+    for (int k = 0; k < count; ++k) {
+        float2 value = threadIdx.x < blocks && head < count ? tile[head] : make_float2(-1, -INFINITY);
+        float score = value.y;
+        int id = value.x >= 0 ? (int)value.x : INT_MAX;
+        for (int delta = 16; delta; delta >>= 1) {
+            float other = __shfl_down_sync(0xffffffffu, score, delta);
+            int otherId = __shfl_down_sync(0xffffffffu, id, delta);
+            if (lane + delta < 32 && SamplingBetter(other, otherId, score, id)) { score = other; id = otherId; }
+        }
+        if (!lane) { scores[warp] = score; ids[warp] = id; }
+        __syncthreads();
+        if (!warp) {
+            score = lane < 8 ? scores[lane] : -INFINITY;
+            id = lane < 8 ? ids[lane] : INT_MAX;
+            for (int delta = 16; delta; delta >>= 1) {
+                float other = __shfl_down_sync(0xffffffffu, score, delta);
+                int otherId = __shfl_down_sync(0xffffffffu, id, delta);
+                if (lane + delta < 32 && SamplingBetter(other, otherId, score, id)) { score = other; id = otherId; }
+            }
+            if (!lane) {
+                winner = id;
+                output[(size_t)blockIdx.x * count + k] = make_float2(id == INT_MAX ? -1.0f : (float)id, score);
+            }
+        }
+        __syncthreads();
+        if (value.x >= 0 && (int)value.x == winner) ++head;
+        // No lane may overwrite winner before every lane consumes it.
+        __syncthreads();
+    }
 }
 struct DraftHiddenInputs { const BF16 *ptr[32]; };
 __global__ void DraftConcat(DraftHiddenInputs inputs, BF16 *output,
@@ -2165,6 +2260,33 @@ __global__ void DraftConcat(DraftHiddenInputs inputs, BF16 *output,
         output[index] = inputs.ptr[layer][(size_t)row * width + column];
     }
 }
+}
+
+void FastllmCudaNaiveLogitsSelect(const fastllm::Data &logits, int vocabOffset,
+    int count, bool greedy, float invTemperature,
+    fastllm::Data &partial, fastllm::Data &output) {
+    using namespace fastllm;
+    AssertInFastLLM(logits.dataDevice == DataDevice::CUDA && logits.dataType == FLOAT32 &&
+        !logits.dims.empty() && logits.cudaData &&
+        FastllmNaiveCanSelectLogits(logits.dims.back(), vocabOffset, count, greedy) &&
+        (greedy || (std::isfinite(invTemperature) && invTemperature > 0)),
+        "Invalid Naive vocabulary shard for logits selection.");
+    const int vocab = logits.dims.back(), rows = logits.Count(0) / vocab;
+    const int blocks = (vocab + 1023) / 1024;
+    Output(partial, FLOAT32, {rows, blocks, count, 2});
+    Output(output, FLOAT32, {rows, count * 2});
+    if (greedy) {
+        LogitsTop1Partial<<<dim3(blocks, rows), 256>>>((const float *)logits.cudaData,
+            (float2 *)partial.cudaData, vocab, vocabOffset);
+        LogitsTop1Finish<<<rows, 256>>>((const float2 *)partial.cudaData,
+            (float2 *)output.cudaData, blocks);
+    } else {
+        LogitsTopKPartial<<<dim3(blocks, rows), 256>>>((const float *)logits.cudaData,
+            (float2 *)partial.cudaData, vocab, vocabOffset, count, invTemperature);
+        LogitsTopKFinish<<<rows, 256>>>((const float2 *)partial.cudaData,
+            (float2 *)output.cudaData, blocks, count);
+    }
+    CheckLaunch();
 }
 
 void FastllmCudaNaiveDraftEmbedding(const fastllm::Data &ids, int step,

@@ -1,6 +1,7 @@
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #include "models/naive_n05_flash.h"
+#include "models/speculative_sampling.h"
 #include "utils/utils.h"
 #include <cmath>
 #include <cuda_runtime_api.h>
@@ -228,6 +229,72 @@ class Fixture : public NaiveN05FlashModel {
                 throw std::runtime_error("cache metadata mismatch");
         }
         return out;
+    }
+
+    void VerifySelections(int ranks) {
+        draftTargetLayers = {0, 1};
+        int checks = 0;
+        for (int topk : {1, 4, 50}) {
+            GenerationConfig cfg; cfg.top_k = topk; cfg.temperature = .7f; cfg.top_p = .8f;
+            std::vector<std::vector<float>> expectedLogits;
+            std::vector<std::map<int, std::vector<char>>> expectedHidden;
+            for (bool reference : {true, false}) {
+                std::vector<std::pair<Data, Data>> kv(2);
+                int past = 0, step = 0;
+                for (int rows : {3, 8, 8, 8, 1, 3, 8, 8}) {
+                    std::vector<float> ids(rows), pos(rows);
+                    for (int row = 0; row < rows; ++row) { ids[row] = (past + row) * 3 % 256; pos[row] = past + row; }
+                    Data input(FLOAT32, {1, rows}, ids), positions(FLOAT32, {1, rows}, pos);
+                    TargetCapture capture; capture.verifying = past > 0;
+                    auto selection = SelectLogits(cfg, true);
+                    if (!reference) capture.selection = &selection;
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+                    int launches = verifyGraphLaunches;
+#endif
+                    Data logits = RunDraftTarget(input, positions, kv, cfg, capture);
+                    if (reference) {
+                        logits.ToDevice(DataDevice::CPU);
+                        expectedLogits.emplace_back((float *)logits.cpuData, (float *)logits.cpuData + logits.Count(0));
+                        expectedHidden.emplace_back();
+                    } else {
+                        if (selection.candidates.dims.empty() || !logits.dims.empty())
+                            throw std::runtime_error("verify compact output missing");
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+                        if (step == 3 && verifyGraphLaunches - launches != ranks)
+                            throw std::runtime_error("compact verify did not replay its graph");
+#endif
+                        int outputRows = past ? rows : 1;
+                        if (topk == 1) {
+                            Data full(FLOAT32, {1, outputRows, 256}, expectedLogits[step]);
+                            ApplyDraftDevice(); Data top; TopK(full, top, 1); top.ToDevice(DataDevice::CPU);
+                            for (int row = 0; row < outputRows; ++row)
+                                if (((float *)top.cpuData)[row * 2] != ((float *)selection.candidates.cpuData)[row * 2])
+                                    throw std::runtime_error("compact greedy verify token mismatch");
+                        } else {
+                            for (int row = 0; row < outputRows; ++row) {
+                                auto p = SpeculativeDistribution(expectedLogits[step].data() + row * 256, 256, cfg, LastTokensUnit());
+                                auto q = SpeculativeTopKDistribution((float *)selection.candidates.cpuData + row * topk * 2, topk, 256, cfg);
+                                if (p != q) throw std::runtime_error("compact verify probabilities mismatch");
+                            }
+                        }
+                        if (capture.hidden.size() != expectedHidden[step].size())
+                            throw std::runtime_error("compact verify features missing");
+                    }
+                    for (auto &feature : capture.hidden) {
+                        feature.second.ToDevice(DataDevice::CPU);
+                        auto *data = (char *)feature.second.cpuData;
+                        std::vector<char> bytes(data, data + feature.second.GetBytes());
+                        if (reference) expectedHidden.back()[feature.first] = bytes;
+                        else if (expectedHidden[step].at(feature.first) != bytes)
+                            throw std::runtime_error("compact verify hidden state mismatch");
+                    }
+                    int keep = past && rows > 1 ? rows - 1 : rows;
+                    CommitTargetCache(kv, past, keep); past += keep; ++step;
+                    if (!reference) ++checks;
+                }
+            }
+        }
+        std::cout << "VERIFY SELECTION PASS checks=" << checks << std::endl;
     }
 
     void VerifyHead() {
@@ -700,6 +767,11 @@ int main(int argc, char **argv) {
         SetThreads(4);
         SetDeviceMap({{"cuda:0", 1}});
         FastllmCudaSetDevice(0);
+        if (argc > 2 && std::string(argv[2]) == "selection") {
+            SetCudaEmbedding(true); SetCudaGraph(true);
+            Fixture fixture(ranks, true, true); fixture.VerifySelections(ranks);
+            return 0;
+        }
         if (argc > 2 && std::string(argv[2]) == "head") {
             Fixture fixture(ranks);
             fixture.VerifyHead();

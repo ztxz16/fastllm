@@ -1,6 +1,45 @@
 #pragma once
 #include "fastllm.h"
 
+// Match the full-vocabulary CUDA Top1's 256-lane reduction order on ties.
+// Global IDs are essential: shards need not start at a multiple of 256.
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+inline bool FastllmNaiveTop1Better(float score, int id, float best, int bestId) {
+    if (score != best) return score > best;
+#ifdef __CUDA_ARCH__
+    unsigned rank = __brev((unsigned)id & 255u), bestRank = __brev((unsigned)bestId & 255u);
+#else
+    auto reverseLane = [](unsigned x) {
+        x = ((x & 0x55u) << 1) | ((x >> 1) & 0x55u);
+        x = ((x & 0x33u) << 2) | ((x >> 2) & 0x33u);
+        return ((x & 0x0fu) << 4) | ((x >> 4) & 0x0fu);
+    };
+    unsigned rank = reverseLane((unsigned)id & 255u), bestRank = reverseLane((unsigned)bestId & 255u);
+#endif
+    return rank < bestRank || (rank == bestRank && id < bestId);
+}
+
+// These limits come from the selection workspace and FP32 token-ID format,
+// independent of the GPU architecture, model vocabulary or TP rank count.
+constexpr int kNaiveLogitsMaxTopK = 64;
+constexpr int kNaiveLogitsMaxShard = 256 * 1024;
+constexpr int kNaiveLogitsMaxVocab = 1 << 24;
+inline bool FastllmNaiveCanSelectLogits(int vocab, int offset, int count, bool greedy) {
+    return vocab > 0 && offset >= 0 && (int64_t)offset + vocab <= kNaiveLogitsMaxVocab &&
+        (greedy ? count == 1 : count > 0 && count <= kNaiveLogitsMaxTopK &&
+                               vocab <= kNaiveLogitsMaxShard);
+}
+
+// Contiguous FP32 vocabulary shards. Output [rows, count * 2] holds global
+// ID/score pairs. Missing candidates use ID -1; greedy ignores NaN/-infinity.
+// Greedy retains the legacy Top1 tie order. Sampling returns score-descending,
+// ID-ascending candidates, with scaling applied before ranking.
+void FastllmCudaNaiveLogitsSelect(const fastllm::Data &logits, int vocabOffset,
+    int count, bool greedy, float invTemperature,
+    fastllm::Data &partial, fastllm::Data &output);
+
 // Model-specific CUDA operations use BF16 activations. Keys/values are packed
 // as [1, tokens, heads * dim (+ indexDim for DSA keys)].
 void FastllmCudaNaiveRope(fastllm::Data &input, const fastllm::Data &positions,
