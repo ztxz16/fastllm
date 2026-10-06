@@ -533,7 +533,7 @@ static inline __m256i iq2_s_native_values(const uint8_t *qs, uint8_t qh) {
         iq2s_grid[uint16_t(indices >> 32)], iq2s_grid[uint16_t(indices >> 48)]);
 }
 
-// Expand one sign bit per value, in groups of 32.
+// IQ2_S and IQ3_S both store one sign bit per value, in groups of 32.
 static inline __m256i iq_s_native_signs(const uint8_t *signs) {
     uint32_t bits;
     std::memcpy(&bits, signs, sizeof(bits));
@@ -659,6 +659,124 @@ static void mul_mat_iq2_s_q8_k(int n, const void *vx, size_t bx,
     }
 }
 
+// IQ3_S stays in its original GGUF layout. Expand the eight 9-bit
+// codebook indices into two scalar registers. The 128-byte high-bit table
+// describes the format; no model weights are expanded or repacked.
+static inline __m256i iq3_s_native_values(const uint8_t *qs, uint8_t qh) {
+    static constexpr auto high = [] {
+        std::array<uint64_t, 16> table{};
+        for (int i = 0; i < 16; ++i)
+            for (int j = 0; j < 4; ++j)
+                table[i] |= uint64_t((i >> j) & 1) << (16 * j + 8);
+        return table;
+    }();
+    const auto low = _mm_cvtepu8_epi16(_mm_loadl_epi64((const __m128i *)qs));
+    const uint64_t lo = uint64_t(_mm_cvtsi128_si64(low)) | high[qh & 15];
+    const uint64_t hi = uint64_t(_mm_extract_epi64(low, 1)) | high[qh >> 4];
+    return _mm256_setr_epi32(
+        iq3s_grid[uint16_t(lo)], iq3s_grid[uint16_t(lo >> 16)],
+        iq3s_grid[uint16_t(lo >> 32)], iq3s_grid[uint16_t(lo >> 48)],
+        iq3s_grid[uint16_t(hi)], iq3s_grid[uint16_t(hi >> 16)],
+        iq3s_grid[uint16_t(hi >> 32)], iq3s_grid[uint16_t(hi >> 48)]);
+}
+
+template <int Inputs, bool Extreme>
+static void mul_mat_iq3_s_native_impl(int n, const void *vx, size_t bx,
+                                    const DataInfo &info, int outputs) {
+    const block_q8_K *y[Inputs];
+    for (int t = 0; t < Inputs; ++t) y[t] = (const block_q8_K *)info.src1_row(t);
+    for (int row = 0; row < outputs; ++row) {
+        const auto *x = (const block_iq3_s *)((const char *)vx + size_t(row) * bx);
+        __m256 accum[Inputs] = {};
+        for (int b = 0; b < n / QK_K; ++b) {
+            __m256i sum0[Inputs] = {}, sum1[Inputs <= 2 ? Inputs : 1] = {};
+            // Unroll the four fixed group pairs in a 256-value IQ3_S block.
+            // Independent lookup chains hide some scalar table-load latency.
+#if defined(__clang__)
+#pragma clang loop unroll(full)
+#elif defined(__GNUC__)
+#pragma GCC unroll 4
+#endif
+            for (int g = 0; g < 8; g += 2) {
+                auto q0 = iq3_s_native_values(x[b].qs + 8 * g, x[b].qh[g]);
+                auto q1 = iq3_s_native_values(x[b].qs + 8 * (g + 1), x[b].qh[g + 1]);
+                const auto s0 = iq_s_native_signs(x[b].signs + 4 * g);
+                const auto s1 = iq_s_native_signs(x[b].signs + 4 * (g + 1));
+                const auto scale0 = _mm256_set1_epi16(2 * (x[b].scales[g / 2] & 15) + 1);
+                const auto scale1 = _mm256_set1_epi16(2 * (x[b].scales[g / 2] >> 4) + 1);
+                if constexpr (Extreme) {
+                    q0 = _mm256_sub_epi8(_mm256_xor_si256(q0, s0), s0);
+                    q1 = _mm256_sub_epi8(_mm256_xor_si256(q1, s1), s1);
+                }
+                for (int t = 0; t < Inputs; ++t) {
+                    const auto a0 = _mm256_loadu_si256((const __m256i *)(y[t][b].qs + 32 * g));
+                    const auto a1 = _mm256_loadu_si256((const __m256i *)(y[t][b].qs + 32 * (g + 1)));
+                    __m256i p0, p1;
+                    if constexpr (Extreme) {
+                        // Negating Q8's -128 would overflow a signed byte.
+                        // IQ3_S values fit in int8, so negate weights instead.
+                        p0 = _mm256_maddubs_epi16(_mm256_abs_epi8(a0), _mm256_sign_epi8(q0, a0));
+                        p1 = _mm256_maddubs_epi16(_mm256_abs_epi8(a1), _mm256_sign_epi8(q1, a1));
+                    } else {
+                        p0 = _mm256_maddubs_epi16(q0, _mm256_sub_epi8(_mm256_xor_si256(a0, s0), s0));
+                        p1 = _mm256_maddubs_epi16(q1, _mm256_sub_epi8(_mm256_xor_si256(a1, s1), s1));
+                    }
+                    const auto v0 = _mm256_madd_epi16(p0, scale0), v1 = _mm256_madd_epi16(p1, scale1);
+                    if constexpr (Inputs <= 2) {
+                        sum0[t] = _mm256_add_epi32(sum0[t], v0);
+                        sum1[t] = _mm256_add_epi32(sum1[t], v1);
+                    } else {
+                        sum0[t] = _mm256_add_epi32(sum0[t], _mm256_add_epi32(v0, v1));
+                    }
+                }
+            }
+            const float dx = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(x[b].d)));
+            for (int t = 0; t < Inputs; ++t) {
+                auto sum = sum0[t];
+                if constexpr (Inputs <= 2) sum = _mm256_add_epi32(sum, sum1[t]);
+                accum[t] = _mm256_fmadd_ps(_mm256_set1_ps(dx * y[t][b].d), _mm256_cvtepi32_ps(sum), accum[t]);
+            }
+        }
+        for (int t = 0; t < Inputs; ++t) {
+            auto v = _mm_add_ps(_mm256_castps256_ps128(accum[t]), _mm256_extractf128_ps(accum[t], 1));
+            v = _mm_add_ps(v, _mm_movehl_ps(v, v));
+            info.store(row, t, _mm_cvtss_f32(_mm_add_ss(v, _mm_movehdup_ps(v))));
+        }
+    }
+}
+
+template <int Inputs>
+static void mul_mat_iq3_s_q8_k(int n, const void *vx, size_t bx,
+                             const DataInfo &info, int outputs) {
+    assert(n % QK_K == 0);
+    if (!outputs) return;
+    // The built-in Q8_K quantizer emits [-127, 127]. Scan once per call
+    // to retain support for external Q8_K buffers containing -128.
+    auto extreme = _mm256_setzero_si256();
+    for (int t = 0; t < Inputs; ++t) {
+        const auto *y = (const block_q8_K *)info.src1_row(t);
+        for (int b = 0; b < n / QK_K; ++b) for (int g = 0; g < 8; ++g)
+            extreme = _mm256_or_si256(extreme, _mm256_cmpeq_epi8(
+                _mm256_loadu_si256((const __m256i *)(y[b].qs + 32 * g)), _mm256_set1_epi8(-128)));
+    }
+    if (_mm256_movemask_epi8(extreme)) {
+        mul_mat_iq3_s_native_impl<Inputs, true>(n, vx, bx, info, outputs);
+    } else if constexpr (Inputs >= 5) {
+        // Limit live accumulators to four inputs on AVX2. Both input groups
+        // reuse a small tile of ordinary weights while it remains cached.
+        for (int r = 0; r < outputs; r += 8) {
+            auto tile = info;
+            tile.s += r;
+            const auto *x = (const char *)vx + size_t(r) * bx;
+            const int nr = std::min(8, outputs - r);
+            mul_mat_iq3_s_native_impl<4, false>(n, x, bx, tile, nr);
+            tile.cur_y += 4;
+            mul_mat_iq3_s_native_impl<Inputs - 4, false>(n, x, bx, tile, nr);
+        }
+    } else {
+        mul_mat_iq3_s_native_impl<Inputs, false>(n, vx, bx, info, outputs);
+    }
+}
 #endif
 
 // Interleave four rows without expanding their packed quants to 256 bytes.
@@ -2442,6 +2560,8 @@ mul_mat_t GetMulMatFunction(ggml_type type, int nrc_y) {
 #if !defined(__AVX512F__)
     } else if (type == GGML_TYPE_IQ2_S) {
         RETURN_MATMUL_FUNCTION(mul_mat_iq2_s_q8_k, nrc_y)
+    } else if (type == GGML_TYPE_IQ3_S) {
+        RETURN_MATMUL_FUNCTION(mul_mat_iq3_s_q8_k, nrc_y)
 #endif
     } else if (type == GGML_TYPE_IQ2_S_R4) {
         RETURN_MATMUL_FUNCTION(mul_mat_iq2_s_r4_q8_k, nrc_y)
