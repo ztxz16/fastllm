@@ -83,7 +83,7 @@ void Write(const std::string &path, const Json::object &metadata, const std::vec
 struct Fixture {
     std::string directory;
     std::vector<std::string> files;
-    Fixture(bool tpExperts = false) {
+    Fixture(bool tpExperts = false, int expertCount = 2) {
         const int expertWidth = tpExperts ? 64 : 32;
         char name[] = "/tmp/fastllm-qwen4-gguf-XXXXXX";
         Check(mkdtemp(name) != nullptr, "fixture directory failed"); directory = name;
@@ -96,7 +96,7 @@ struct Fixture {
         meta["tokenizer.ggml.model"] = "gpt2";
         const Json::object config = {{"block_count", 2}, {"embedding_length", 256}, {"vocab_size", 32},
             {"attention.head_count", 2}, {"attention.head_count_kv", 1}, {"attention.key_length", 4},
-            {"expert_count", 2}, {"expert_used_count", 1}, {"expert_feed_forward_length", expertWidth},
+            {"expert_count", expertCount}, {"expert_used_count", 1}, {"expert_feed_forward_length", expertWidth},
             {"ssm.group_count", 2}, {"ssm.time_step_rank", 6}, {"ssm.state_size", 4},
             {"ssm.inner_size", 24}, {"ssm.conv_kernel", 4},
             {"hyper_connection.count", 2}, {"hyper_connection.low_rank", 4},
@@ -162,8 +162,8 @@ struct Fixture {
         for (const auto &kind : {"gate", "up", "down"}) {
             const bool down = kind == std::string("down");
             const ggml_type type = down ? GGML_TYPE_IQ4_NL : GGML_TYPE_IQ2_XS;
-            const std::vector<int> dims = down ? std::vector<int>{2, 256, expertWidth} : std::vector<int>{2, expertWidth, 256};
-            const size_t bytes = 2 * dims[1] * ggml_row_size(type, dims[2]);
+            const std::vector<int> dims = down ? std::vector<int>{expertCount, 256, expertWidth} : std::vector<int>{expertCount, expertWidth, 256};
+            const size_t bytes = expertCount * dims[1] * ggml_row_size(type, dims[2]);
             Bytes payload(bytes, 0);
             if (tpExperts) for (size_t i = 0; i < bytes; ++i)
                 payload[i] = (i / ggml_row_size(type, dims[2]) + 17 * i + layer) % 63;
@@ -516,12 +516,39 @@ static int TestStreamingTpImport() {
 #endif
 }
 
+static void TestConcurrentExpertMerges() {
+    // Many independent gate/up merges used to insert/erase map nodes without
+    // the loader mutex. Verify untouched down projections as well as outputs.
+    SetThreads(16);
+    SetNgramDevice("cpu");
+    constexpr int experts = 128;
+    Fixture fixture(false, experts);
+    for (int repeat = 0; repeat < 8; ++repeat) {
+        auto model = CreateLLMModelFromGGUFFile(fixture.files[0], "");
+        for (int e = 0; e < experts; ++e) {
+            const auto prefix = "model.language_model.layers.0.mlp.experts." + std::to_string(e) + ".";
+            for (const auto &item : {std::make_pair("gateup_proj.weight", std::vector<int>{64, 256}),
+                                     std::make_pair("down_proj.weight", std::vector<int>{256, 32})}) {
+                auto it = model->weight.weight.find(prefix + item.first);
+                Check(it != model->weight.weight.end() && it->second.dims == item.second,
+                      "parallel GGUF merge lost an expert projection");
+                Check(it->second.cpuData != nullptr, "parallel GGUF merge lost weight storage");
+            }
+            Check(!model->weight.weight.count(prefix + "gate_proj.weight") &&
+                  !model->weight.weight.count(prefix + "up_proj.weight"),
+                  "parallel GGUF merge retained source projections");
+        }
+    }
+    SetThreads(2);
+}
+
 int main(int argc, char **argv) {
     try {
         SetThreads(2); SetDeviceMap({{"cpu", 1}}); SetMoeDeviceMap({{"cpu", 1}});
         SetCudaEmbedding(false);
         SetMoeCudaCacheBytes(0); setenv("FASTLLM_QWEN4_ENABLE_MTP", "0", 1);
         if (argc == 2 && std::string(argv[1]) == "--tp-load") return TestStreamingTpImport();
+        TestConcurrentExpertMerges();
         Fixture fixture;
         TestFloatImport(fixture.directory);
         TestEmbeddingImport(fixture);

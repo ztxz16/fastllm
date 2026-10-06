@@ -4314,6 +4314,11 @@ namespace fastllm {
             if (loadTensors.empty()) {
                 return;
             }
+            // Resolve stable element addresses before workers mutate the map
+            // through weight merging. Importing distinct tensors stays parallel.
+            std::vector<Data *> loadWeights;
+            loadWeights.reserve(loadTensors.size());
+            for (const auto &name : loadTensors) loadWeights.push_back(&model->weight.weight.at(name));
             const int workers = std::min(threadNum, (int)loadTensors.size());
             std::vector<std::thread> threads;
             for (int worker = 0; worker < workers; worker++) {
@@ -4348,13 +4353,13 @@ namespace fastllm {
                             } else {
                                 tensor->CreateBuffer(task.sourceDataType);
                             }
-                            model->weight[weightName].CreateFromOriData(
+                            loadWeights[i]->CreateFromOriData(
                                 WeightType::AUTO, task.sourceDataType,
                                 tensor->buffer,
                                 tensor->minsBuffer, tensor->scalesBuffer,
                                 -1, tensor->blockK, tensor->blockM);
                             if (task.linear) {
-                                model->weight[weightName].CalcWeightSum();
+                                loadWeights[i]->CalcWeightSum();
                             }
                             tensor->ClearBuffer();
                             if (task.scale != nullptr) {
@@ -4367,14 +4372,17 @@ namespace fastllm {
                             DataType dataType = task.second;
                             tensorBytes = tensor->bytes;
                             tensor->CreateBuffer(dataType);
-                            model->weight[weightName].CreateFromOriData(
+                            loadWeights[i]->CreateFromOriData(
                                 WeightType::AUTO, dataType, tensor->buffer,
                                 nullptr, nullptr, -1, -1, -1);
                             tensor->ClearBuffer();
                         }
                         {
-                            // try merge                                
-                            locker.lock();
+                            // Merging inserts/erases unordered_map nodes. Keep
+                            // lookups, callbacks and registration in this same
+                            // critical section; unlocking around merge corrupts
+                            // the map when multiple expert pairs finish together.
+                            std::lock_guard<std::mutex> weightGuard(locker);
                             allFinishNames.insert(weightName);
                             // 检查是否需要合并权重
                             bool needMerge = false;
@@ -4424,7 +4432,6 @@ namespace fastllm {
                                     continue;
                                 }
 
-                                locker.unlock();
                                 for (auto &it : rule.rules) {
                                     if (allWeightNames.find(it.inputs[0]) == allWeightNames.end()) {
                                         continue;
@@ -4516,10 +4523,8 @@ namespace fastllm {
 #ifdef USE_TFACC
                                         try {
                                             if (model->ShouldRegisterSpecialWeightForDeviceType(mergeName, "tfacc")) {
-                                                locker.lock();
                                                 mergeData.weightSum.resize(1);
                                                 RegisterFastllmData(&mergeData, it.type);
-                                                locker.unlock();
                                             }
                                         } catch (...) {
                                         }
@@ -4536,26 +4541,20 @@ namespace fastllm {
                                         model->MoveSpecialWeightToCudaIfNeeded(mergeName, mergeData);
                                     }
 
-                                    locker.lock();
                                     allFinishNames.insert(mergedWeightName);
                                     model->OnWeightLoaded(mergedWeightName, allFinishNames);
-                                    locker.unlock();
                                     for (auto input : it.inputs) {
                                         model->weight.weight.erase(input);
                                     }
                                 }
-                                locker.lock();
                             }
-                            locker.unlock();
 #ifdef USE_TFACC
                             try {
                                 if (!needMerge && model->ShouldRegisterSpecialWeightForDeviceType(weightName, "tfacc")) {
                                     auto weightIt = model->weight.weight.find(weightName);
                                     if (weightIt != model->weight.weight.end()) {
-                                        locker.lock();
                                         weightIt->second.weightSum.resize(1);
                                         RegisterFastllmData(&weightIt->second, model->specialWeights[weightName]);
-                                        locker.unlock();
                                     }
                                 }
                             } catch (...) {
