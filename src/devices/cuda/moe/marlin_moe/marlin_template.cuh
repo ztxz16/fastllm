@@ -50,7 +50,7 @@ template <const fastllm_marlin_moe_types::ScalarTypeId a_type_id,
           const bool m_block_size_8, const int stages,
           const int group_blocks, const bool is_zp_float,
           const bool nvfp4_gate_up = false,
-          const bool independent_rows = false>
+          const bool full_k = false>
 __global__ void Marlin(
     const int4 *__restrict__ A, const int4 *__restrict__ B,
     int4 *__restrict__ C, int4 *__restrict__ C_tmp,
@@ -243,7 +243,7 @@ template <const fastllm_marlin_moe_types::ScalarTypeId a_type_id,  // A ScalarTy
                                    // with a separate quantization scale
           const bool is_zp_float,  // is zero point of float16 type?
           const bool nvfp4_gate_up = false,  // independent gate/up global scales
-          const bool independent_rows = false
+          const bool full_k = false
           >
 __global__ void Marlin(
     const int4* __restrict__ A,  // fp16 input matrix of shape mxk
@@ -307,30 +307,6 @@ __global__ void Marlin(
     return;
   #endif
 
-  if constexpr (independent_rows) {
-    static_assert(a_type_id == fastllm_marlin_moe_types::kBFloat16.id() &&
-                  c_type_id == fastllm_marlin_moe_types::kBFloat16.id() &&
-                  m_block_size_8 && thread_m_blocks == 1 && thread_n_blocks == 8);
-    // Every grid.y partition has precisely the batch-1 grid.x scheduling,
-    // padded route layout and split-K reduction. Only independent tokens run
-    // together; no route is moved to another MMA tile row.
-    const size_t row = blockIdx.y;
-    const int routes = prob_m * top_k;
-    A += row * prob_m * prob_k / 8;
-    C += row * routes * prob_n / 8;
-    sorted_token_ids_ptr += row * routes * 8;
-    expert_ids_ptr += row * routes;
-    num_tokens_past_padded_ptr += row;
-    topk_weights_ptr += row * routes;
-    const int tiles = routes * (prob_n / 128);
-    if (tiles < gridDim.x) {
-      // This specialization is admitted only for tiles <= 4*SMs. For
-      // tiles >= SMs the launcher uses exactly one CTA per full-K tile,
-      // which needs neither locks nor reduction scratch.
-      locks += row * tiles;
-      C_tmp += row * tiles * (16 * 128 * sizeof(float) / sizeof(int4));
-    }
-  }
   int num_tokens_past_padded = num_tokens_past_padded_ptr[0];
   constexpr int moe_block_size = m_block_size_8 ? 8 : (16 * thread_m_blocks);
 
@@ -428,6 +404,14 @@ __global__ void Marlin(
     part2_mn_tiles = global_mn_tiles % gridDim.x;
     if (part2_mn_tiles * 3 <= gridDim.x) part2_mn_tiles += gridDim.x;
     part1_mn_iters = (global_mn_tiles - part2_mn_tiles) / gridDim.x;
+  }
+
+  if constexpr (full_k) {
+    // Keep each output tile's entire K reduction in one CTA. Its arithmetic
+    // must not depend on later tokens' expert choices during verification.
+    if (blockIdx.x >= global_mn_tiles) return;
+    part1_mn_iters = div_ceil(global_mn_tiles - blockIdx.x, gridDim.x);
+    part2_mn_tiles = 0;
   }
 
   int iters = div_ceil(k_tiles * part2_mn_tiles, gridDim.x);
@@ -671,6 +655,11 @@ __global__ void Marlin(
   };
 
   auto init_slice = [&]() {
+    if constexpr (full_k) {
+      if (part1_mn_iters) init_part1_slice();
+      else slice_iters = 0;
+      return;
+    }
     if (!in_part2 && !part1_mn_iters) {
       in_part2 = true;
       slice_col_par = (iters * blockIdx.x) / k_tiles;

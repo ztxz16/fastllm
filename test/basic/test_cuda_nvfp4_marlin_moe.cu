@@ -211,7 +211,7 @@ static void CheckActivation() {
     std::puts("Activation boundary/dtype PASS");
 }
 
-static void CheckIndependentRows(Fixture &f, int rows, int topk, bool foreignScratch = false) {
+static void CheckGroupedRows(Fixture &f, int rows, int topk, bool foreignScratch = false, bool duplicateRoutes = false) {
     const int H = f.hidden;
     Data x(BFLOAT16, {rows, H}), ids(INT32, {rows, topk}), scores(FLOAT32, {rows, topk});
     x.Allocate();
@@ -220,7 +220,7 @@ static void CheckIndependentRows(Fixture &f, int rows, int topk, bool foreignScr
     for (int i = 0; i < rows * H; ++i)
         ((__nv_bfloat16 *)x.cpuData)[i] = __float2bfloat16_rn(.3f * std::sin(i * .031f));
     for (int i = 0; i < rows * topk; ++i) {
-        ((int *)ids.cpuData)[i] = (i / topk * 3 + i % topk * 7) % f.experts;
+        ((int *)ids.cpuData)[i] = duplicateRoutes ? 0 : (i / topk * 3 + i % topk * 7) % f.experts;
         ((float *)scores.cpuData)[i] = (1.f + i % topk * .07f) / topk;
     }
     Move(x);
@@ -246,7 +246,7 @@ static void CheckIndependentRows(Fixture &f, int rows, int topk, bool foreignScr
         Check(FastllmCudaMergeMOENVFP4E4M3MarlinRows(x, gate, act, actual, f.weights.data(),
                                                      f.weights.size(), (int32_t *)ids.cudaData,
                                                      (float *)scores.cudaData, rows, topk),
-              "independent rows rejected");
+              "grouped rows rejected");
     };
     single();
     Cuda(cudaDeviceSynchronize());
@@ -265,15 +265,34 @@ static void CheckIndependentRows(Fixture &f, int rows, int topk, bool foreignScr
     for (Data *d : {&gate, &act, &actual}) {
         cudaPointerAttributes attributes{};
         Cuda(cudaPointerGetAttributes(&attributes, d->cudaData));
-        Check(attributes.device == 0, "independent-row workspace stayed on another GPU");
+        Check(attributes.device == 0, "grouped-row workspace stayed on another GPU");
     }
     std::vector<uint16_t> a(rows * H), b(rows * H);
+    double largestRelative = 0;
     auto compare = [&]() {
         Cuda(cudaMemcpy(a.data(), reference.cudaData, a.size() * sizeof(uint16_t),
                         cudaMemcpyDeviceToHost));
         Cuda(cudaMemcpy(b.data(), actual.cudaData, b.size() * sizeof(uint16_t),
                         cudaMemcpyDeviceToHost));
-        Check(a == b, "independent rows changed single-token arithmetic");
+        // Grouping changes the reduction layout versus single-token GEMM.
+        // Keep the existing MoE FP64 reference's 1% relative error bound and
+        // additionally reject nonfinite values and large isolated errors.
+        double error = 0, norm = 0, maximum = 0, scale = 0;
+        for (size_t i = 0; i < a.size(); ++i) {
+            double expected = __bfloat162float(
+                *reinterpret_cast<const __nv_bfloat16 *>(&a[i]));
+            double value = __bfloat162float(
+                *reinterpret_cast<const __nv_bfloat16 *>(&b[i]));
+            Check(std::isfinite(expected) && std::isfinite(value), "nonfinite grouped output");
+            error += (expected - value) * (expected - value);
+            norm += expected * expected;
+            maximum = std::max(maximum, std::abs(expected - value));
+            scale = std::max(scale, std::abs(expected));
+        }
+        double relative = std::sqrt(error / std::max(norm, 1e-30));
+        largestRelative = std::max(largestRelative, relative);
+        Check(relative <= .01 && maximum <= 1e-6 + .02 * scale,
+              "grouped rows numerical error");
     };
     compare();
     cudaGraph_t graph;
@@ -287,7 +306,7 @@ static void CheckIndependentRows(Fixture &f, int rows, int topk, bool foreignScr
     for (int iteration = 0; iteration < 4; ++iteration) {
         // New routing and activations must be consumed by the same graph.
         for (int i = 0; i < rows * topk; ++i)
-            changedIds[i] = (iteration * 5 + i / topk * 3 + i % topk * 7) % f.experts;
+            changedIds[i] = duplicateRoutes ? iteration : (iteration * 5 + i / topk * 3 + i % topk * 7) % f.experts;
         for (int i = 0; i < rows * H; ++i)
             changedInput[i] = __float2bfloat16_rn(.3f * std::sin(i * .031f + iteration));
         Cuda(cudaMemcpyAsync(ids.cudaData, changedIds.data(), ids.GetBytes(),
@@ -295,14 +314,43 @@ static void CheckIndependentRows(Fixture &f, int rows, int topk, bool foreignScr
         Cuda(cudaMemcpyAsync(x.cudaData, changedInput.data(), x.GetBytes(), cudaMemcpyHostToDevice,
                              cudaStreamPerThread));
         single();
+        multi();
+        Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+        std::vector<uint16_t> eager(rows * H);
+        Cuda(cudaMemcpy(eager.data(), actual.cudaData, eager.size() * sizeof(uint16_t),
+                        cudaMemcpyDeviceToHost));
         Cuda(cudaGraphLaunch(exec, cudaStreamPerThread));
         Cuda(cudaStreamSynchronize(cudaStreamPerThread));
         compare();
+        Check(eager == b, "grouped eager and graph differ");
+    }
+    // Later routes cannot affect any retained prefix. Check all prefix
+    // lengths, including routes that merge with earlier experts' tiles.
+    const auto prior = b;
+    const auto originalIds = changedIds;
+    for (int keep = 1; keep < rows; ++keep) {
+        changedIds = originalIds;
+        for (int i = keep * topk; i < rows * topk; ++i)
+            changedIds[i] = (changedIds[i] + 3) % f.experts;
+        Cuda(cudaMemcpyAsync(ids.cudaData, changedIds.data(), ids.GetBytes(),
+                             cudaMemcpyHostToDevice, cudaStreamPerThread));
+        Cuda(cudaGraphLaunch(exec, cudaStreamPerThread));
+        Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+        Cuda(cudaMemcpy(b.data(), actual.cudaData, b.size() * sizeof(uint16_t),
+                        cudaMemcpyDeviceToHost));
+        Check(std::equal(prior.begin(), prior.begin() + keep * H, b.begin()),
+              "suffix routes changed prefix");
+        auto replay = b;
+        Cuda(cudaGraphLaunch(exec, cudaStreamPerThread));
+        Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+        Cuda(cudaMemcpy(b.data(), actual.cudaData, b.size() * sizeof(uint16_t),
+                        cudaMemcpyDeviceToHost));
+        Check(replay == b, "grouped graph replay differs");
     }
     Cuda(cudaGraphExecDestroy(exec));
     Cuda(cudaGraphDestroy(graph));
-    std::printf("exact_rows H=%d I=%d rows=%d topk=%d eager/graph=bitwise_equal\n", H,
-                f.intermediate, rows, topk);
+    std::printf("grouped_rows H=%d I=%d rows=%d topk=%d relative_max=%g eager/graph/prefix/replay=bitwise_equal\n", H,
+                f.intermediate, rows, topk, largestRelative);
 }
 
 int main(int argc, char **argv) { try {
@@ -331,19 +379,23 @@ int main(int argc, char **argv) { try {
             Fixture f(59, false, false, 4096, 2048, 16, true, true);
             for (int rows : {2, 8})
                 for (int topk : {1, 8})
-                    CheckIndependentRows(f, rows, topk, true);
-            std::puts("Cross-device independent rows PASS");
+                    CheckGroupedRows(f, rows, topk, true);
+            std::puts("Cross-device grouped rows PASS");
             return 0;
         }
-        if (argc == 2 && std::strcmp(argv[1], "--exact-rows") == 0) {
+        if (argc == 2 && std::strcmp(argv[1], "--grouped-rows") == 0) {
             for (auto shape :
                  std::vector<std::pair<int, int>>{{256, 128}, {4096, 256}, {4096, 2048}}) {
                 Fixture f(53, false, false, shape.first, shape.second, 16, true, true);
-                for (int rows : {2, 3, 5, 7, 8})
+                for (int rows : {2, 3, 4, 5, 6, 7, 8})
                     for (int topk : {1, 8, 16})
-                        CheckIndependentRows(f, rows, topk);
+                        CheckGroupedRows(f, rows, topk);
             }
-            std::puts("Independent rows PASS");
+            {
+                Fixture f(61, false, false, 4096, 256, 16, true, true);
+                CheckGroupedRows(f, 8, 16, false, true);
+            }
+            std::puts("Grouped rows PASS");
             return 0;
         }
         if (argc == 2 && std::strcmp(argv[1], "--tp-slab") == 0) {
