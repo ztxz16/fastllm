@@ -81,6 +81,31 @@ public:
             if (keys[key].slot < 0) InsertCandidate(key);
     }
 
+    // Transport availability is independent of heat and current residency.
+    // Hierarchical caches can observe every route but only admit records that
+    // are already accessible, without reading storage just to fill a cache.
+    void SetCandidateEligible(int key, bool eligible) {
+        if (key < 0 || key >= int(keys.size())) throw std::invalid_argument("invalid MoE candidate");
+        auto &entry = keys[key];
+        if (entry.eligible == eligible) return;
+        entry.eligible = eligible;
+        if (entry.slot < 0) {
+            if (eligible) InsertCandidate(key);
+            else RemoveCandidate(key);
+        }
+    }
+
+    // Release a payload slot while retaining the expert's observed heat.
+    int Evict(int key) {
+        if (key < 0 || key >= int(keys.size())) throw std::invalid_argument("invalid MoE eviction");
+        const int slot = keys[key].slot;
+        if (slot < 0) return -1;
+        RemoveResident(slot);
+        slots[slot] = -1; keys[key].slot = -1;
+        InsertResident(slot); InsertCandidate(key);
+        return slot;
+    }
+
     void BeginStep() {
         ++steps;
         if (prefill) {
@@ -197,7 +222,8 @@ public:
     }
 
     Admission SelectPrefill(int key, int base, const std::vector<int> &active) const {
-        if (key < 0 || key >= int(keys.size()) || keys[key].slot >= 0 || keys[key].score <= 0)
+        if (key < 0 || key >= int(keys.size()) || !keys[key].eligible ||
+            keys[key].slot >= 0 || keys[key].score <= 0)
             return {};
         const int slot = FindPrefillVictim(residents[keyPartitions[key]], 0, -1, base, active);
         if (slot < 0) return {};
@@ -276,7 +302,7 @@ private:
         return sa != sb ? sa < sb : a < b;
     }
     void InsertCandidate(int key) {
-        if (config.maxReplacements == 0 || slots.empty()) return;
+        if (config.maxReplacements == 0 || slots.empty() || !keys[key].eligible) return;
         candidates[keyGroups[key]].Insert(key, candidatePositions,
             [this](int a, int b) { return CandidateBefore(a, b); });
     }
@@ -345,7 +371,7 @@ private:
             [this](int a, int b) { return ResidentBefore(a, b); });
     }
 
-    struct Key { float score = 0; uint64_t admitted = 0; int slot = -1; };
+    struct Key { float score = 0; uint64_t admitted = 0; int slot = -1; bool eligible = true; };
     MoeCacheConfig config;
     uint64_t steps = 0, decodeSteps = 0;
     bool prefill = false, active = false;

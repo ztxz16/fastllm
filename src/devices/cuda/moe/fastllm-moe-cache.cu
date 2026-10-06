@@ -1726,6 +1726,33 @@ bool FastllmCudaMoeCacheRequested() {
     return fastllm::GetMoeCudaCacheBytes() > 0;
 }
 
+bool FastllmCudaGlm5DiskExpert(const fastllm::Data &input, const fastllm::Data &scores,
+        const fastllm::Data &gate, const fastllm::Data &down, fastllm::Data &activation,
+        fastllm::Data &output, float limit) {
+    using namespace fastllm;
+    if (input.dataType != BFLOAT16 || input.dims.size() != 2 || input.dims[0] <= 0 ||
+        gate.dataType != NVFP4_BLOCK_16_E4M3_PACKED || down.dataType != gate.dataType ||
+        gate.dims.size() != 2 || down.dims.size() != 2 ||
+        !input.cudaData || !scores.cudaData || !gate.cudaData || !down.cudaData) return false;
+    const int rows = input.dims[0], hidden = input.dims[1], inter = down.dims[1];
+    if (hidden % 128 || inter % 128 || gate.dims != std::vector<int>({2 * inter, hidden}) ||
+        down.dims[0] != hidden || scores.dataType != FLOAT32 || scores.Count(0) != rows) return false;
+    activation.dataType = BFLOAT16;
+    activation.Resize({rows, inter});
+    activation.ToDevice(CUDA, input.dataDeviceIds, false); activation.Allocate(false);
+    output.dataType = FLOAT32;
+    output.Resize({rows, hidden});
+    output.ToDevice(CUDA, input.dataDeviceIds, false); output.Allocate(false);
+    cuda::glm5_cache::Gate<<<dim3(inter / 128, rows), 1024, 0, cudaStreamPerThread>>>(
+        (const __nv_bfloat16*)input.cudaData, nullptr, (const uint8_t*)gate.cudaData,
+        (const float*)scores.cudaData, (__nv_bfloat16*)activation.cudaData, hidden, inter, 0, limit, 1);
+    cuda::glm5_cache::Down<<<dim3(hidden / 16, rows), 128, 0, cudaStreamPerThread>>>(
+        (const __nv_bfloat16*)activation.cudaData, nullptr, (const uint8_t*)down.cudaData,
+        (float*)output.cudaData, hidden, inter, 0, 0);
+    checkCudaErrors("Disk compact GLM experts", cudaGetLastError());
+    return true;
+}
+
 bool FastllmCudaPrepareMoeCache(
         const FastllmCudaMoeCacheLayer *layers, int layerCount,
         const std::function<void()> &registerNumaWeights, bool allowStreaming) {

@@ -10,6 +10,7 @@
 #include <functional>
 
 namespace fastllm {
+    int GetNumasMoeShardCount();
     // Thread-TP models carry their own device set, independently of the
     // process-wide executor map. Borrow it for one synchronous MoE call.
     class NumasMoeCudaAssistScope {

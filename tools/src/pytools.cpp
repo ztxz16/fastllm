@@ -135,6 +135,16 @@ extern "C" {
         std::copy(result, result + 9, values);
     }
 
+    DLL_EXPORT int get_disk_moe_cache_stats_v2(uint64_t *values, int capacity) {
+        auto s = fastllm::GetDiskMoeCacheStats();
+        const uint64_t result[] = {s.cpuBytes, s.cudaBytes, s.cpuHits, s.cudaHits, s.misses,
+            s.diskBytes, s.uploads, s.cpuEvictions, s.cudaEvictions,
+            s.cpuCudaOverlapBytes, s.cudaDemotions, s.cudaDemotionBytes};
+        const int count = sizeof(result) / sizeof(result[0]);
+        if (values && capacity > 0) std::copy_n(result, std::min(capacity, count), values);
+        return count;
+    }
+
     DLL_EXPORT void disable_cuda_malloc() {
 #ifdef USE_CUDA
         DisableCudaMalloc();

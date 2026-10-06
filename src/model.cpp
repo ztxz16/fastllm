@@ -2301,6 +2301,7 @@ namespace fastllm {
                dataType == DataType::FLOAT16 ||
                dataType == DataType::BFLOAT16 ||
                dataType == DataType::FP8_E4M3 ||
+               dataType == DataType::NVFP4_BLOCK_16_E4M3 ||
                dataType == DataType::NVFP4;
     }
 
@@ -2365,10 +2366,12 @@ namespace fastllm {
     static void SetDiskWeightMeta(Data &weight, const SafeTensorItem &tensor,
                                   DataType targetDataType,
                                   SafeTensorItem *scaleTensor = nullptr,
-                                  WeightType weightType = WeightType::LINEAR) {
+                                  WeightType weightType = WeightType::LINEAR,
+                                  float globalScale = 1.0f) {
         DataType sourceDataType;
-        if (IsPackedFP4StorageDType(tensor.dtype) && targetDataType == DataType::NVFP4) {
-            sourceDataType = DataType::NVFP4;
+        const bool compactE4M3 = targetDataType == DataType::NVFP4_BLOCK_16_E4M3;
+        if (IsPackedFP4StorageDType(tensor.dtype) && (targetDataType == DataType::NVFP4 || compactE4M3)) {
+            sourceDataType = targetDataType;
         } else if (!GetSafeTensorSourceDataType(
                        tensor.dtype, sourceDataType)) {
             ErrorInFastLLM("Disk MoE only supports F32/F16/BF16/FP8/NVFP4 safetensors: " + weight.name + "\n");
@@ -2378,7 +2381,7 @@ namespace fastllm {
         }
         if (scaleTensor != nullptr &&
             !((sourceDataType == DataType::FP8_E4M3 && targetDataType == DataType::FP8_E4M3) ||
-              (sourceDataType == DataType::NVFP4 && targetDataType == DataType::NVFP4))) {
+              (sourceDataType == DataType::NVFP4 && targetDataType == DataType::NVFP4) || compactE4M3)) {
             ErrorInFastLLM("Disk MoE only supports scaled weights for FP8/NVFP4 expert tensors: " + weight.name + "\n");
         }
         ResetDiskWeightMeta(weight, targetDataType, weightType);
@@ -2410,7 +2413,7 @@ namespace fastllm {
                             "Disk MoE scaled tensor shape is too large: " + weight.name + "\n");
             int n = (int)n64;
             int m = (int)tensor.shape.back();
-            if (targetDataType == DataType::NVFP4) {
+            if (targetDataType == DataType::NVFP4 || compactE4M3) {
                 m *= 2;
             }
             int ns, ms, blockK, blockM;
@@ -2433,9 +2436,10 @@ namespace fastllm {
             }
             weight.blockK = blockK;
             weight.blockM = blockM;
-            if ((targetDataType == DataType::NVFP4 ||
-                 (targetDataType == DataType::FP8_E4M3 && weightType == WeightType::EMBEDDING)) &&
-                (scaleTensor->dtype == "F8_E8M0" || scaleTensor->dtype == "U8")) {
+            if (((targetDataType == DataType::NVFP4 ||
+                  (targetDataType == DataType::FP8_E4M3 && weightType == WeightType::EMBEDDING)) &&
+                 (scaleTensor->dtype == "F8_E8M0" || scaleTensor->dtype == "U8")) ||
+                (compactE4M3 && scaleTensor->dtype == "F8_E4M3")) {
                 if (isScalarScale) {
                     ErrorInFastLLM("Disk compact weights do not support scalar scale: " + weight.name + "\n");
                 }
@@ -2452,6 +2456,7 @@ namespace fastllm {
                 scalePart.isScalePart = true;
                 weight.diskWeightParts.push_back(scalePart);
                 weight.scales.clear();
+                if (compactE4M3) weight.scales.push_back(globalScale);
             } else {
                 AssertInFastLLM(scaleTensor->buffer != nullptr,
                                 "Disk MoE scaled tensor scale buffer is empty: " + weight.name + "\n");
@@ -5369,7 +5374,8 @@ namespace fastllm {
                                         if (tensor.dtype == "F8_E4M3") {
                                             diskDataType = DataType::FP8_E4M3;
                                         } else if (TryGetPackedFP4DataType(safeTensors, tensorName, packedFp4DataType)) {
-                                            diskDataType = packedFp4DataType;
+                                            diskDataType = packedFp4DataType == DataType::NVFP4_BLOCK_16 ?
+                                                DataType::NVFP4_BLOCK_16_E4M3 : packedFp4DataType;
                                         } else {
                                             ErrorInFastLLM("Disk MoE only supports scaled safetensors for FP8/NVFP4 expert weight: " + weightName + "\n");
                                         }
@@ -5388,8 +5394,23 @@ namespace fastllm {
                                             scaleTensor->CreateBuffer(DataType::FLOAT32);
                                         }
                                     }
+                                    float globalScale = 1.0f;
+                                    if (diskDataType == DataType::NVFP4_BLOCK_16_E4M3) {
+                                        const std::string name = FindSafeTensorScale2TensorName(safeTensors, tensorName);
+                                        if (!name.empty()) {
+                                            auto &scale2 = safeTensors.itmeDict.at(name);
+                                            scale2.CreateBuffer(DataType::FLOAT32);
+                                            AssertInFastLLM(scale2.len == 1, "Disk NVFP4 global scale must be scalar.");
+                                            globalScale = ((float*)scale2.buffer)[0];
+                                            if (StringEndWith(scale2.tensorName, ".weight_global_scale")) {
+                                                AssertInFastLLM(globalScale != 0, "Disk NVFP4 inverse scale is zero.");
+                                                globalScale = 1.0f / globalScale;
+                                            }
+                                            scale2.ClearBuffer();
+                                        }
+                                    }
                                     SetDiskWeightMeta(model->weight[weightName], tensor, diskDataType,
-                                                      scaleTensor, diskLazyWeightType);
+                                                      scaleTensor, diskLazyWeightType, globalScale);
                                     if (scaleTensor != nullptr) {
                                         scaleTensor->ClearBuffer();
                                     }

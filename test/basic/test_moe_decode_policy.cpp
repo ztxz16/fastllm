@@ -211,6 +211,31 @@ static void TestFrequencyIndexUpdates() {
     Require(a.key == 7 && a.slot == 0, "residency refresh lost a former resident candidate");
 }
 
+static void TestFrequencyAvailability() {
+    fastllm::MoeCacheConfig config;
+    config.halfLife = 0; config.replacementMargin = 0;
+    fastllm::MoeFrequencyPolicy p({0,0,0}, {0}, 1, config);
+    int hot=0, warm=1;
+    p.SetCandidateEligible(hot, false);
+    p.BeginStep();
+    for (int i=0;i<8;++i) p.Observe(0,&hot,1);
+    p.Observe(0,&warm,1);
+    auto plan=p.EndStep();
+    Require(plan.size()==1 && plan[0].key==warm,"unavailable hot expert blocked available admission");
+    Require(p.Score(hot)==8,"unavailable expert lost heat");
+    p.SetCandidateEligible(hot,true);p.BeginStep();plan=p.EndStep();
+    Require(plan.size()==1 && plan[0].key==hot,"returning payload did not recover its heat");
+    p.SetCandidateEligible(hot,false);
+    Require(p.Slot(hot)==0,"candidate availability evicted a live resident");
+    Require(p.Evict(hot)==0 && p.Evict(hot)==-1 && p.Score(hot)==8,"migration lost heat or evicted twice");
+    p.BeginStep();plan=p.EndStep();
+    Require(plan.size()==1 && plan[0].key==warm,"excluded former resident reentered the candidate heap");
+    int owner=2;p.SetResidents(&owner);p.BeginStep();plan=p.EndStep();
+    Require(plan.size()==1 && plan[0].key==warm,"reconciliation forgot candidate eligibility");
+    p.ObservePrefill(0,{128,1,1},128);
+    Require(p.SelectPrefill(hot,0,{}).key<0,"prefill ignored candidate eligibility");
+}
+
 static void TestDecodeOverlap() {
     fastllm::MoeDecodeOverlapScheduler p;
     Require(p.SelectMisses(0, 10) == 0, "all-hit layer requested PCIe work");
@@ -393,6 +418,7 @@ int main() {
     TestPrefillAdmission();
     TestFrequencyHotSetChange();
     TestFrequencyIndexUpdates();
+    TestFrequencyAvailability();
     TestDecodeOverlap();
     TestParallelOverlap();
     TestSharedOverlap();

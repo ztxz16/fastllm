@@ -3868,6 +3868,8 @@ namespace fastllm {
         return true;
     }
 
+    int GetNumasMoeShardCount() { return GetNumaConfig()->numaCnt; }
+
     namespace {
         struct NumasLinearGemmOp : MultiThreadBaseOp {
             const uint8_t *inputData;

@@ -474,6 +474,9 @@ if hasattr(fastllm_lib, "fastllm_moe_cuda_cache_stats"):
     fastllm_lib.fastllm_moe_cuda_cache_stats.restype = ctypes.c_bool
 fastllm_lib.set_moe_cpu_cache.argtypes = [ctypes.c_uint64]
 fastllm_lib.get_disk_moe_cache_stats.argtypes = [ctypes.POINTER(ctypes.c_uint64)]
+if hasattr(fastllm_lib, "get_disk_moe_cache_stats_v2"):
+    fastllm_lib.get_disk_moe_cache_stats_v2.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.c_int]
+    fastllm_lib.get_disk_moe_cache_stats_v2.restype = ctypes.c_int
 
 fastllm_lib.apply_chat_template.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
 fastllm_lib.apply_chat_template.restype = ctypes.c_char_p
@@ -725,10 +728,16 @@ def set_moe_cpu_cache(bytes_: int):
 
 def get_disk_moe_cache_stats():
     """Process-wide cumulative route counts and resident expert payload bytes."""
+    names = ("cpu_bytes", "cuda_bytes", "cpu_hits", "cuda_hits", "misses",
+             "disk_bytes", "uploads", "cpu_evictions", "cuda_evictions",
+             "cpu_cuda_overlap_bytes", "cuda_demotions", "cuda_demotion_bytes")
+    if hasattr(fastllm_lib, "get_disk_moe_cache_stats_v2"):
+        values = (ctypes.c_uint64 * len(names))()
+        count = fastllm_lib.get_disk_moe_cache_stats_v2(values, len(names))
+        return dict(zip(names[:count], values))
     values = (ctypes.c_uint64 * 9)()
     fastllm_lib.get_disk_moe_cache_stats(values)
-    return dict(zip(("cpu_bytes", "cuda_bytes", "cpu_hits", "cuda_hits", "misses",
-                     "disk_bytes", "uploads", "cpu_evictions", "cuda_evictions"), values))
+    return dict(zip(names[:9], values))
 
 def disable_cuda_malloc():
     fastllm_lib.disable_cuda_malloc();

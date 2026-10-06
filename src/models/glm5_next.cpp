@@ -7,6 +7,7 @@
 #include "gguf.h"
 #include "executor.h"
 #include "utils.h"
+#include "devices/disk/diskdevice.h"
 
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
@@ -1057,6 +1058,7 @@ namespace fastllm {
                 "GLM-5.3 MTP eh_proj has an invalid shape.");
             mtpWeightsReady = true;
         }
+        PrepareDiskMoeCache(expertWeights);
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
         {
             std::vector<FastllmCudaMoeCacheLayer> layers;

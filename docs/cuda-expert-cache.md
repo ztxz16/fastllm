@@ -579,6 +579,16 @@ entries. On glibc, retired buffers are periodically returned to the OS.
 
 CUDA residency supports compact NVFP4 with block-32 UE8M0 scales, block-128
 FP8 (native or packed), FP32, FP16 and BF16. Other formats use CPU execution.
+GLM GGUF also supports canonical IQ2_XXS/IQ2_S gate/up with IQ3_XXS/IQ4_XS
+down projections and BF16 activations. Disk and RAM retain the original IQ
+blocks; CPU execution does not copy or R4-repack them. IQ2/IQ3 use native
+Q8_K dots, while IQ4_XS preserves the model's BF16 down-input arithmetic.
+This path prefetches up to two missing experts. For batches whose per-route
+FP32 output fits in 64 MiB, resident GPU experts are submitted together,
+overlap CPU computation, and return their results in one transfer. Reduction
+keeps expert-ID order and duplicate routes. Larger batches retain bounded
+streaming execution. GPU replacement waits until borrowed records finish;
+the frequency policy and per-layer admission limit remain unchanged.
 `KimiK3RoutedExperts` does not use this cache. V4.1 retains its quantization,
 route-weight placement and ordered reduction; CPU/CUDA matrix products can
 have floating-point rounding differences.
@@ -883,6 +893,59 @@ decode (+0.85%) on two 22 GiB RTX 2080 Ti cards, with MTP off and Graph on.
 `cuda_gguf_moe_host` checks the CPU R4 repacker against an independent decoded
 weight oracle, cross/non-cross gate/up layouts, selected subset changes,
 NUMA row shards, both GPUs, three activation types and immutable host storage.
+
+### GLM compact NVFP4 disk hierarchy
+
+With `--moe_device disk`, a GLM compact E4M3 NVFP4 checkpoint retains only
+file offsets, raw scale locations and tensor multipliers during loading.
+Routed experts are read with the disk backend's bounded direct-I/O buffers;
+only requested experts are packed into the native compact NUMA/CUDA layout.
+No full-model NUMA registration or expert warmup snapshot is created.
+This path requires the NUMA backend and BF16 activations. Existing disk
+fallbacks remain available for other weight formats.
+
+`--moe_cpu_cache` bounds resident compact RAM payload **including the small
+staging cache**, while `--moe_cuda_cache` remains a per-GPU payload budget.
+Active CPU/GPU work, two read-ahead experts, non-MoE weights, activations and
+runtime allocations are additional. These are not process RSS limits; leave
+headroom and measure loading, prefill and decode high-water marks together.
+For a 64 GiB process target, start with a 40 GiB RAM payload budget and validate
+the complete workload before increasing it. CUDA allocations are independently
+releasable on eviction. The input checkpoint is never modified.
+
+Both tiers use `MoeFrequencyPolicy` and the existing `--moe_cache_*` controls
+(half-life, update interval, replacement count/bytes, heat threshold, margin,
+factor, minimum residence, prefill prior and byte ranking). Both tiers observe
+all routes, preserving an expert's heat while it moves between RAM and CUDA.
+Persistent host and CUDA payloads are exclusive: promotion removes the host
+copy, and RAM candidates exclude CUDA residents. Decode admissions occur after
+all registered MoE layers have been observed. CUDA plans first; evicted CUDA
+records are copied back only if selected by the RAM frequency policy. Prefill
+uses the same ownership rule with histogram admission and bounded lookahead.
+Payloads are leased until arithmetic and transfers finish; changing a budget
+invalidates the old tier state before it is rebuilt.
+
+The bounded host staging area retains hot already-read candidates across
+layers. When the RAM budget holds at least one expert, decode updates admit
+only available RAM/staging records or selected CUDA victims, without initiating
+disk reads merely to populate a cache. Candidate availability does not discard
+frequency history, and updating it does not rebuild the policy's heaps. A RAM
+budget smaller than one expert retains bounded disk-read fallback for CUDA
+admission so that disabling RAM caching still allows the CUDA hot set to adapt.
+
+A CUDA hit needs no disk or RAM payload. On a CUDA miss, RAM hits and demand
+reads supply compact weights to NUMA or temporary CUDA execution selected by
+the measured overlap scheduler. Resident CUDA work is submitted before disk
+reads. The disk path currently uses the calling layer's GPU; it does not use
+the separate multi-GPU verifier dispatcher. `get_disk_moe_cache_stats()` reports
+RAM/CUDA hits, two-tier misses, source bytes read, uploads, evictions and retained
+payload bytes. `disk_bytes` includes admission reads as well as demand reads;
+use process I/O counters to measure physical reads and alignment overhead.
+For the compact hierarchy, `cpu_cuda_overlap_bytes` measures retained duplicate
+host/CUDA payloads; `cuda_demotions` and `cuda_demotion_bytes` count selected
+CUDA-to-RAM transfers. Active call leases are not persistent cache ownership.
+The original nine-value C statistics ABI is retained; the capacity-bounded v2
+API adds the hierarchy counters and is used by the Python wrapper when present.
 
 For GLM with `--moe_device numa`, `--moe_cuda_cache 0` disables resident
 expert payloads while retaining the measured decode split between NUMA and

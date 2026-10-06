@@ -1828,6 +1828,9 @@ struct FastllmCudaMoeGGUFCacheView {
     // Temporary DMA records can retain NUMA's cross-interleaved gate/up and
     // R4 packing. -1 means canonical GGUF; cache admission stays canonical.
     int numaGateType = -1, numaDownType = -1;
+    // Optional device table of separately allocated canonical records. Disk
+    // caches can batch resident experts without copying them into one arena.
+    const uint8_t *const *recordPointers = nullptr;
 };
 bool FastllmCudaMoeGGUFCacheSupported(int type, int columns);
 bool FastllmCudaMoeGGUFCacheNumaSupported(int gateType, int downType,
@@ -2486,5 +2489,11 @@ bool FastllmCudaQwen4SharedExpert(
 // Snapshot completed GPU cache counters. values: hits, misses, payload bytes,
 // slots, host records. Synchronizes the device; call outside timed inference.
 extern "C" bool fastllm_moe_cuda_cache_stats(int device, uint64_t *values, bool reset);
+
+// One compact expert, arbitrary routed rows; FP32 per-route output retains
+// GLM's BF16 boundaries and score placement. Enqueues on the calling stream.
+bool FastllmCudaGlm5DiskExpert(const fastllm::Data &input, const fastllm::Data &scores,
+    const fastllm::Data &gate, const fastllm::Data &down, fastllm::Data &activation,
+    fastllm::Data &output, float limit);
 
 #endif // FASTLLM_CUDA_CUH
