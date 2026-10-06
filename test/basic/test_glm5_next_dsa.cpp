@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <fstream>
@@ -318,6 +319,34 @@ void DecodeHc() {
         for(size_t i=0;i<a.size();++i)Check(std::abs(a[i]-b[i])<2e-5,"HC mixing differs");
     }
     std::puts("PASS HC fusion preserves GLM RMSNorm rounding exactly");
+    const char *flag = "FASTLLM_DSV4_REFERENCE_HC_PRE_FINISH";
+    const char *previous = std::getenv(flag);
+    const bool hadPrevious = previous != nullptr;
+    const std::string previousValue = previous ? previous : "";
+    for (int rows = 1; rows <= 8; ++rows) for (auto fnType : {FLOAT32, BFLOAT16}) {
+        std::vector<float> values(rows * flat);
+        for (int i = 0; i < rows * flat; ++i) values[i] = Pattern(i / 128, i % 128);
+        Data caseInput, caseWeight;
+        Upload(caseInput, {1, rows, 4, dim}, values);
+        Upload(caseWeight, {mix, flat}, fn, fnType);
+        for (int iterations : {1, 7, 20}) {
+            Data slow[3], fast[3];
+            setenv(flag, "1", 1);
+            Check(FastllmCudaGlm5NextHcPreNorm(caseInput,caseWeight,sc,ba,n,4,iterations,1e-6f,1e-6f,
+                slow[0],slow[1],slow[2]), "HC reference finish");
+            unsetenv(flag);
+            Check(FastllmCudaGlm5NextHcPreNorm(caseInput,caseWeight,sc,ba,n,4,iterations,1e-6f,1e-6f,
+                fast[0],fast[1],fast[2]), "HC shuffle finish");
+            for (int i = 0; i < 3; ++i) {
+                const auto reference = Download(slow[i]), actual = Download(fast[i]);
+                Check(reference.size() == actual.size() &&
+                    std::memcmp(reference.data(), actual.data(), reference.size() * sizeof(float)) == 0,
+                    "HC shuffle changed rounding");
+            }
+        }
+    }
+    if (hadPrevious) setenv(flag, previousValue.c_str(), 1); else unsetenv(flag);
+    std::puts("PASS HC shuffle exact: 1..8 rows, FP32/BF16 weights, 1/7/20 Sinkhorn iterations");
 }
 void DecodeSmallGemv() {
     for(int width:{8,64,128,256}){

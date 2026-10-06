@@ -3613,7 +3613,7 @@ DeepSeekV4HcPreRoundedPair4x4096(
 // their rounded square sums in one pass.  It still launches 1024 threads so
 // the 32-warps reduction tree and the latency-hiding behavior stay identical
 // to the generic path.
-template <int finishThreads, bool optimizedSm120>
+template <int finishThreads, bool optimized>
 __global__ void DeepSeekV4HcPreFinishNorm4x4096Kernel(
         const __nv_bfloat16 *x, const float *dots, const float *scale,
         const float *base, const float *normWeight, __nv_bfloat16 *normOutput,
@@ -3671,11 +3671,11 @@ __global__ void DeepSeekV4HcPreFinishNorm4x4096Kernel(
     __syncthreads();
 
     // Match the established HcPre kernel's summation order exactly.  The
-    // SM120 path keeps one matrix value in each of lanes 0..15 and fetches
+    // optimized path keeps one matrix value in each of lanes 0..15 and fetches
     // the other row/column members with ordered shuffles.  This removes the
     // shared-memory round trips and roughly 80 warp barriers without changing
     // the scalar association used by greedy decode.
-    if constexpr (optimizedSm120) {
+    if constexpr (optimized) {
         if (threadIdx.x < hcSq) {
             constexpr unsigned activeMask = 0x0000ffffu;
             int lane = threadIdx.x;
@@ -3851,7 +3851,7 @@ __global__ void DeepSeekV4HcPreFinishNorm4x4096Kernel(
         return;
     }
 
-    if constexpr (optimizedSm120) {
+    if constexpr (optimized) {
         static_assert(finishThreads == 1024,
                       "optimized HcPre finish preserves the 32-warp reduction tree");
         int warp = threadIdx.x >> 5;
@@ -3983,10 +3983,14 @@ void DeepSeekV4LaunchHcPreFinishNorm4x4096(
         __nv_bfloat16 *normOutput, float *post, float *comb,
         int tokens, int sinkhornIters, float eps, float normEps,
         int dotsStride, int dotParts, bool roundBeforeWeight = false) {
-    bool useSm120 = FastllmCudaRuntimeArch() >= 120 &&
+    // GLM uses the same norm reduction in both variants; only Sinkhorn
+    // changes to ordered warp shuffles, which also work on SM80+. Keep the
+    // separate vectorized DeepSeek norm restricted to its tuned architecture.
+    const int arch = FastllmCudaRuntimeArch();
+    const bool useOptimized = (arch >= 120 || (roundBeforeWeight && arch >= 80)) &&
         std::getenv("FASTLLM_DSV4_REFERENCE_HC_PRE_FINISH") == nullptr;
-    if (!useSm120) {
-        constexpr int finishThreads = 1024;
+    constexpr int finishThreads = 1024;
+    if (!useOptimized) {
         DeepSeekV4HcPreFinishNorm4x4096Kernel<finishThreads, false>
             <<<tokens, finishThreads>>>(
                 x, dots, scale, base, normWeight, normOutput, post, comb,
@@ -3994,7 +3998,6 @@ void DeepSeekV4LaunchHcPreFinishNorm4x4096(
         return;
     }
 
-    constexpr int finishThreads = 1024;
     DeepSeekV4HcPreFinishNorm4x4096Kernel<finishThreads, true>
         <<<tokens, finishThreads>>>(
             x, dots, scale, base, normWeight, normOutput, post, comb,
