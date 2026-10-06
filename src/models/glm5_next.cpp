@@ -1046,11 +1046,12 @@ namespace fastllm {
             mtpWeightsReady = true;
         }
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
-        if (FastllmCudaMoeCacheRequested()) {
+        {
             std::vector<FastllmCudaMoeCacheLayer> layers;
-            for (int layer = 0; layer < block_cnt; ++layer) {
-                const std::string device = SelectMoeDeviceForLayer(layer);
-                const auto &experts = expertWeights[layer];
+            const int cacheLayers = block_cnt + (mtpEnabled && mtpWeightsReady ? 1 : 0);
+            for (int layer = 0; layer < cacheLayers; ++layer) {
+                const std::string device = SelectMoeDeviceForLayer(std::min(layer, block_cnt - 1));
+                const auto &experts = layer == block_cnt ? mtpExpertWeights : expertWeights[layer];
                 if ((device == "numa" || device.rfind("numa:", 0) == 0) &&
                     experts.size() >= 4 && experts[2] &&
                     (experts[2]->dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED ||
@@ -1061,7 +1062,7 @@ namespace fastllm {
             }
             if (!layers.empty()) {
                 FastllmCudaPrepareMoeCache(layers.data(), (int)layers.size(),
-                    [this] { WarmupNumaMoeWeights(); });
+                    [this] { WarmupNumaMoeWeights(); }, true);
             }
         }
 #endif
@@ -2328,7 +2329,7 @@ namespace fastllm {
         const std::string routedDevice =
             SelectMoeDeviceForLayer(deviceLayer);
 #ifndef USE_ROCM
-        if (sequence == 1 && input.dataType == DataType::BFLOAT16 &&
+        if (sequence <= FASTLLM_CUDA_MOE_CACHE_MAX_BATCH && input.dataType == DataType::BFLOAT16 &&
             moeAtype == DataType::BFLOAT16 &&
             (routedDevice == "numa" || routedDevice.rfind("numa:", 0) == 0) &&
             FastllmCudaMergeMOEHybrid(input, expertIndex, expertScore, routedOutput,
@@ -2721,6 +2722,22 @@ namespace fastllm {
             hiddenStates,
             weight[prefix + "post_attention_layernorm.weight"],
             rms_norm_eps, normalizedFfn);
+#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
+        // Draft layers run outside ForwardLayers. Give their experts the same
+        // frequency policy and measured miss split, closing the step after
+        // readers finish even if the forward throws.
+        struct DraftCache {
+            void *state = nullptr;
+            ~DraftCache() { FastllmCudaEndMoeDecode(state); }
+        };
+        DraftCache draftCache;
+        if (sequence <= FASTLLM_CUDA_MOE_CACHE_MAX_BATCH &&
+            normalizedFfn.dataDevice == DataDevice::CUDA && !normalizedFfn.dataDeviceIds.empty()) {
+            FastllmCudaSetDevice(normalizedFfn.dataDeviceIds[0]);
+            draftCache.state = FastllmCudaBeginMoeDecode(
+                mtpExpertWeights.data(), mtpExpertWeights.size(), num_experts_per_tok);
+        }
+#endif
         RunMoeWithPrefix(
             block_cnt - 1, prefix + "mlp.",
             mtpExpertWeights, mtpExpertBiases,
@@ -3486,15 +3503,14 @@ namespace fastllm {
         Data *next = &hiddenStatesTemp;
 #if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
         // A layer-partitioned model owns one cache on each GPU. Advance each
-        // cache once per ordinary decode token and close it on every exit.
+        // cache once per decode/verify batch and close it on every exit.
         struct DecodeCaches {
             std::map<int, void *> states;
             ~DecodeCaches() {
                 for (const auto &state : states) FastllmCudaEndMoeDecode(state.second);
             }
         } decodeCaches;
-        const bool frequencyDecode = sequence == 1 && !(mtpEnabled && mtpWeightsReady) &&
-                                     kdaReplay == nullptr;
+        const bool frequencyDecode = sequence <= FASTLLM_CUDA_MOE_CACHE_MAX_BATCH;
 #endif
         for (int layer = firstLayer; layer < endLayer; layer++) {
             ApplyDeviceMap(deviceMap, layer + 1, block_cnt);
@@ -3555,7 +3571,8 @@ namespace fastllm {
                 auto &experts = expertWeights[layer];
                 if (frequencyDecode && normalizedFfn.dataDevice == DataDevice::CUDA &&
                     !normalizedFfn.dataDeviceIds.empty() && experts.size() >= 4 && experts[2] &&
-                    experts[2]->dataType == DataType::DATA_GGUF_FORMAT) {
+                    (experts[2]->dataType == DataType::DATA_GGUF_FORMAT ||
+                     experts[2]->dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED)) {
                     const int device = normalizedFfn.dataDeviceIds[0];
                     if (decodeCaches.states.count(device) == 0) {
                         FastllmCudaSetDevice(device);

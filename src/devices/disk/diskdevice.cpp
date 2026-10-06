@@ -46,7 +46,8 @@ namespace fastllm {
                                       bool isCrossSwiglu, MoeGateType gateType,
                                       bool deepSeekV4Mode = false,
                                       float swigluLimit = 0.0f,
-                                      int activationQuantBlock = 128, bool quantizeSharedExpert = false);
+                                      int activationQuantBlock = 128, bool quantizeSharedExpert = false,
+                                      bool cacheAdmission = true);
 #endif
 
     DiskDevice::DiskDevice() {

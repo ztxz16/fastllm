@@ -128,6 +128,15 @@ namespace fastllm {
         const int32_t *gpuIndices, const float *scores, int topk, int layer,
         float swigluLimit, bool perRoute, int activationQuantBlock);
 
+    // Keep grouped CPU weight reuse while submitting GPU/DMA work during
+    // gate/up execution. The callback has the same worker-pool restrictions
+    // as NumasMoeDecodeExpertsWithOverlap.
+    void NumasMoeVerifyExpertsWithOverlap(const uint16_t *input, void *output, int rows,
+        Data **weights, int weightsBatch, const int32_t *indices,
+        const int32_t *gpuIndices, const float *scores, int topk, int layer,
+        float swigluLimit, bool perRoute, int activationQuantBlock,
+        const std::function<void()> &submitGpu);
+
     // NUMA MoE keeps reusable host/CUDA staging buffers outside the model.
     // Release them explicitly while the CUDA allocator is still alive.
     void ClearNumasMoeRuntimeCache();

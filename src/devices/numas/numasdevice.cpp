@@ -321,7 +321,8 @@ namespace fastllm {
         bool pinnedWeight;
     };
 
-    // 普通 GGUF prefill 默认使用实测反馈；以下开关为其他格式启用相同策略。
+    // 普通 GGUF 和 GLM 紧凑 NVFP4 prefill 默认使用实测反馈。
+    // 以下开关为其他格式启用相同策略。
     //   FT_MOE_ASSIST_BALANCE=1  按各卡实测的每专家耗时分配 GPU 专家，而不是
     //                            固定按 route 数均分。
     //   FT_EXPERT_LIMIT_AUTO=1   用真实层反馈出的 CPU/GPU 速度算 expertLimit，
@@ -1544,7 +1545,8 @@ namespace fastllm {
     };
 
     static void ScheduleNumasMoeGemmQueue(
-        std::vector<NumasMoeGemmQueueContext> &contexts
+        std::vector<NumasMoeGemmQueueContext> &contexts,
+        const std::function<void()> *submitGpu = nullptr
     ) {
         auto *pool = GetAlivePool();
         auto *numaConfig = GetNumaConfig();
@@ -1587,6 +1589,12 @@ namespace fastllm {
 
         for (int i = 0; i < (int)workers.size(); i++) {
             pool->PushOp(workerThreadIds[i], &workers[i]);
+        }
+        try {
+            if (submitGpu) (*submitGpu)();
+        } catch (...) {
+            for (int id : workerThreadIds) pool->Wait(id);
+            throw;
         }
         for (int i = 0; i < (int)workers.size(); i++) {
             pool->Wait(workerThreadIds[i]);
@@ -6049,7 +6057,8 @@ namespace fastllm {
         Data **weights, Data **biass, float sharedScale, bool setZero, const std::unordered_set<int> &experts,
         bool isCrossSwiglu, MoeGateType gateType = MoeGateSwiglu,
         bool deepSeekV4Mode = false, float swigluLimit = 0.0f,
-        int activationQuantBlock = 128, bool quantizeSharedExpert = false);
+        int activationQuantBlock = 128, bool quantizeSharedExpert = false,
+        bool cacheAdmission = true);
     extern void ReduceSumFromCPU(Data &output);
     void DoNumasMergeMOEOnCPU(
         Data &input, Data &output,
@@ -6062,7 +6071,8 @@ namespace fastllm {
         uint8_t *cpuOutputBuffer,
         float swigluLimit = 0.0f,
         bool deepSeekV4Mode = false, int activationQuantBlock = 128, bool quantizeSharedExpert = false,
-        float *perRouteOutput = nullptr, bool fp8EagerMode = false
+        float *perRouteOutput = nullptr, bool fp8EagerMode = false,
+        const std::function<void()> *submitGpu = nullptr
     );
 
     struct MoeBenchmarkShapeKey {
@@ -6495,7 +6505,8 @@ namespace fastllm {
         uint8_t *cpuOutputBuffer,
         float swigluLimit,
         bool deepSeekV4Mode, int activationQuantBlock, bool quantizeSharedExpert,
-        float *perRouteOutput, bool fp8EagerMode
+        float *perRouteOutput, bool fp8EagerMode,
+        const std::function<void()> *submitGpu
     ) {
         int bs = input.dims[0];
         int m = weightsBatch / 2 - 1; // num experts
@@ -6559,6 +6570,7 @@ namespace fastllm {
             expertTypeGroups[std::make_pair((int)gateActType, (int)downActType)].insert(e);
         }
         if (expertTypeGroups.empty()) {
+            if (submitGpu) (*submitGpu)();
             uint8_t *emptyOutput = cpuOutputBuffer != nullptr ? cpuOutputBuffer : output.cpuData;
             AssertInFastLLM(emptyOutput != nullptr,
                             "NumasMergeMOE has no writable CPU output.\n");
@@ -6566,6 +6578,7 @@ namespace fastllm {
             return;
         }
         if (expertTypeGroups.size() > 1) {
+            if (submitGpu) (*submitGpu)();
             bool firstGroup = true;
             for (auto &group : expertTypeGroups) {
                 if (firstGroup) {
@@ -6962,8 +6975,9 @@ namespace fastllm {
                     contexts.back().downInputType = downInputDataType;
                 }
             }
-            ScheduleNumasMoeGemmQueue(contexts);
+            ScheduleNumasMoeGemmQueue(contexts, submitGpu);
         } else if (useGroupedScratch) {
+            if (submitGpu) (*submitGpu)();
             for (int nid = 0; nid < numaConfig->numaCnt; nid++) {
                 gateTasks[nid].reserve(gateTaskStorage[nid].size());
                 for (auto &task : gateTaskStorage[nid]) {
@@ -6972,6 +6986,7 @@ namespace fastllm {
             }
             DynamicScheduleTasks(gateTasks, false);
         } else {
+            if (submitGpu) (*submitGpu)();
             DynamicScheduleTasks(ops);
         }
 
@@ -7633,6 +7648,15 @@ namespace fastllm {
         Data **weights, int weightsBatch, const int32_t *indices,
         const int32_t *gpuIndices, const float *scores, int topk, int layer,
         float swigluLimit, bool perRoute, int activationQuantBlock) {
+        NumasMoeVerifyExpertsWithOverlap(input, output, rows, weights, weightsBatch,
+            indices, gpuIndices, scores, topk, layer, swigluLimit, perRoute, activationQuantBlock, {});
+    }
+
+    void NumasMoeVerifyExpertsWithOverlap(const uint16_t *input, void *output, int rows,
+        Data **weights, int weightsBatch, const int32_t *indices,
+        const int32_t *gpuIndices, const float *scores, int topk, int layer,
+        float swigluLimit, bool perRoute, int activationQuantBlock,
+        const std::function<void()> &submitGpu) {
         AssertInFastLLM(activationQuantBlock == 32 || activationQuantBlock == 128,
                         "Scored NUMA MoE requires activation block 32 or 128.\n");
         const int hidden = weights[2]->dims[1];
@@ -7644,11 +7668,14 @@ namespace fastllm {
         std::unordered_set<int> cpuExperts;
         for (int r = 0; r < rows * topk; ++r)
             if (gpuIndices[r] < 0) cpuExperts.insert(indices[r] + 1);
-        if (cpuExperts.empty()) return;
+        if (cpuExperts.empty()) {
+            if (submitGpu) submitGpu();
+            return;
+        }
         DoNumasMergeMOEOnCPU(x, result, ids, routes, weights, nullptr, 1.0f,
             weightsBatch, topk, cpuExperts, GetNumasMoeRuntimeCache()[layer % 2],
             nullptr, swigluLimit, true, activationQuantBlock, false,
-            perRoute ? (float*)output : nullptr);
+            perRoute ? (float*)output : nullptr, false, submitGpu ? &submitGpu : nullptr);
     }
 
     struct NumasFusedMoeLayerWeights {
@@ -9197,10 +9224,14 @@ namespace fastllm {
             if (gpuPrefill) {
                 for (size_t i = 0; i < cudaInputReplicas.size(); ++i) {
                     FastllmCudaSetDevice(cudaInputReplicas[i].deviceId);
-                    FastllmCudaMoeGGUFResidents view;
-                    if (!FastllmCudaGetMoeGGUFResidents(weights, m, view)) continue;
-                    if (!FastllmCudaMoeGGUFGroupedWorkspaceBytes(view.gateType, view.downType,
-                            bs, view.hidden, view.inter, m, topk)) continue;
+                    FastllmCudaMoePrefillResidents view;
+                    const bool nativeGlm = deepSeekV4Mode && activationQuantBlock == 128 &&
+                        input.dataType == BFLOAT16 && weights[2] &&
+                        weights[2]->dataType == NVFP4_BLOCK_16_E4M3_PACKED;
+                    if (!FastllmCudaGetMoePrefillResidents(weights, m, view, nativeGlm && i == 0)) continue;
+                    if (view.weightType == DATA_GGUF_FORMAT ?
+                        !FastllmCudaMoeGGUFGroupedWorkspaceBytes(view.gateType, view.downType,
+                            bs, view.hidden, view.inter, m, topk) : !nativeGlm) continue;
                     for (int e = 1; e <= m; ++e) {
                         const bool resident = view.weights[2*(e-1)] != nullptr;
                         residentByDevice[i][e] = resident;
@@ -9214,7 +9245,10 @@ namespace fastllm {
             // and CPU geometry. Mixed GGUF layers must not share a synthetic
             // single-expert curve simply because their matrix sizes match.
             const bool measuredPrefill = weights[2] && weights[3] &&
-                weights[2]->dataType == DATA_GGUF_FORMAT && !deepSeekV4Mode;
+                ((weights[2]->dataType == DATA_GGUF_FORMAT && !deepSeekV4Mode) ||
+                 (deepSeekV4Mode && activationQuantBlock == 128 &&
+                  weights[2]->dataType == NVFP4_BLOCK_16_E4M3_PACKED &&
+                  weights[3]->dataType == NVFP4_BLOCK_16_E4M3_PACKED));
             const bool autoExpertLimit = assistConfig.autoExpertLimit || measuredPrefill;
             const bool balanceGpu = assistConfig.balance || measuredPrefill;
             NumasMoeDeviceSpeedTracker *speedTracker = nullptr;
@@ -9524,7 +9558,8 @@ namespace fastllm {
                             *gpuInputAliases[i], *gpuOutputPartials[i],
                             index, score, w1, w2, w3, weights, biass,
                             sharedScale, true, gpuExpertSets[i], true,
-                            MoeGateSwiglu, deepSeekV4Mode, swigluLimit, activationQuantBlock, quantizeSharedExpert);
+                            MoeGateSwiglu, deepSeekV4Mode, swigluLimit, activationQuantBlock, quantizeSharedExpert,
+                            workerDevice == cudaDeviceId);
                         if (speedTracker) {
                             speedTracker->RecordGpu(
                                 workerDevice, (int)gpuExpertSets[i].size(),

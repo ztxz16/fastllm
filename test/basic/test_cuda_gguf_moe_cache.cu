@@ -808,8 +808,8 @@ static void RunPrefillCached(int device) {
     Require(FastllmCudaMergeMOECache(row,gate,output,weights.data(),weights.size(),
         static_cast<int32_t *>(ids.cudaData),static_cast<float *>(scores.cudaData),topk), "prefill cache seed failed");
     Cuda(cudaStreamSynchronize(cudaStreamPerThread));
-    FastllmCudaMoeGGUFResidents resident;
-    Require(FastllmCudaGetMoeGGUFResidents(weights.data(),experts,resident), "prefill resident snapshot failed");
+    FastllmCudaMoePrefillResidents resident;
+    Require(FastllmCudaGetMoePrefillResidents(weights.data(),experts,resident), "prefill resident snapshot failed");
     Require(resident.weights[0] && resident.weights[4] && resident.weights[8] && !resident.weights[12],
         "prefill resident map differs from admitted experts");
     auto eraseHost = [&](int e) {
@@ -833,7 +833,7 @@ static void RunPrefillCached(int device) {
     check();
     Require(fastllm_moe_cuda_cache_stats(device,after,false) && std::equal(before,before+5,after),
         "prefill mutated decode cache statistics");
-    Require(FastllmCudaGetMoeGGUFResidents(weights.data(),experts,resident) && resident.weights[12],
+    Require(FastllmCudaGetMoePrefillResidents(weights.data(),experts,resident) && resident.weights[12],
         "prefill miss was not retained in cache");
     eraseHost(6);
     Require(FastllmCudaMergeMOEGGUFHost(input,gate,scratch,output,weights.data(),experts,
@@ -844,7 +844,7 @@ static void RunPrefillCached(int device) {
     for (int i = 0; i < rows*topk; ++i) routes[i] = i % experts;
     Require(FastllmCudaMergeMOEGGUFHost(input,gate,scratch,output,weights.data(),experts,
         routes.data(),scale.data(),topk,all,false), "bulk cached prefill rejected");
-    Require(FastllmCudaGetMoeGGUFResidents(weights.data(),experts,resident), "bulk cache disappeared");
+    Require(FastllmCudaGetMoePrefillResidents(weights.data(),experts,resident), "bulk cache disappeared");
     int filled = 0;
     for (int e = 0; e < experts; ++e) if (resident.weights[2*e]) {
         ++filled;
@@ -855,7 +855,7 @@ static void RunPrefillCached(int device) {
         routes.data(),scale.data(),topk,all,false), "bulk cache reuse rejected");
     check();
     FastllmCudaReleaseMoeCache(weights.data(),weights.size()); SetMoeCudaCacheBytes(0);
-    Require(!FastllmCudaGetMoeGGUFResidents(weights.data(),experts,resident), "released prefill pointers survived");
+    Require(!FastllmCudaGetMoePrefillResidents(weights.data(),experts,resident), "released prefill pointers survived");
     std::printf("PASS cached prefill device=%d: resident+miss, bulk fill/reuse, CPU oracle, release\n",device);
 }
 

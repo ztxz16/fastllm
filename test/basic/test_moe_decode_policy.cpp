@@ -348,6 +348,46 @@ static void TestParallelOverlap() {
             "parallel planner did not adapt to faster NUMA");
 }
 
+static void TestSharedOverlap() {
+    using Scheduler = fastllm::MoeDecodeOverlapScheduler;
+    Scheduler a, b;
+    Scheduler::Estimate cpu;
+    cpu.Observe(100);
+    for (auto *p : {&a, &b}) {
+        p->residentExpert.Observe(10); p->copiedExpert.Observe(180); p->stagedExpert.Observe(10);
+    }
+    std::vector<Scheduler::SharedRankPlan> plans{{&a, 0, 6, 0}, {&b, 0, 6, 20}};
+    auto owners = Scheduler::AssignSharedMisses(plans, cpu, {1,1,1,1,1,1}, 1);
+    Require(std::find(owners.begin(), owners.end(), 0) != owners.end() &&
+            std::find(owners.begin(), owners.end(), 1) != owners.end() &&
+            std::find(owners.begin(), owners.end(), -1) != owners.end(), "shared planner did not use three compute paths");
+    plans[1].handoffUs = 2000;
+    owners = Scheduler::AssignSharedMisses(plans, cpu, {1,1,1,1,1,1}, 1);
+    Require(std::find(owners.begin(), owners.end(), 1) == owners.end(), "shared planner ignored host-staged result cost");
+    plans[0].capacity = 0;
+    owners = Scheduler::AssignSharedMisses(plans, cpu, {1,1,1}, 1);
+    Require(std::all_of(owners.begin(), owners.end(), [](int r) { return r == -1; }), "unprofitable GPU received work");
+    plans = {{&a, 0, 1, 0}, {&b, 0, 1, 0}, {nullptr, 0, 0, 0}};
+    owners = Scheduler::AssignSharedMisses(plans, cpu, {4,4,4,4}, 1);
+    Require(std::count(owners.begin(), owners.end(), 0) <= 1 && std::count(owners.begin(), owners.end(), 1) <= 1 &&
+            std::find(owners.begin(), owners.end(), 2) == owners.end(), "shared planner exceeded scratch capacity");
+    cpu = {}; cpu.Observe(.01);
+    owners = Scheduler::AssignSharedMisses(plans, cpu, {4,4,4,4}, 1);
+    Require(std::all_of(owners.begin(), owners.end(), [](int r) { return r == -1; }), "shared planner ignored faster NUMA");
+    Require(Scheduler::AssignSharedMisses(plans, cpu, {}, 1).empty(), "resident-only batch generated transfers");
+    Require(Scheduler::AssignSharedMisses({}, cpu, {1,2}, 126) == std::vector<int>({-1,-1}),
+            "missing GPUs did not leave every expert on CPU");
+    Scheduler coldA, coldB;
+    cpu = {};
+    plans = {{&coldA, 0, 1, 0}, {&coldB, 0, 1, 0}};
+    bool probed[3]{};
+    for (int call = 0; call < 8; ++call) {
+        owners = Scheduler::AssignSharedMisses(plans, cpu, {1}, call);
+        probed[owners[0] + 1] = true;
+    }
+    Require(probed[0] && probed[1] && probed[2], "single-expert calibration starved a GPU or CPU");
+}
+
 int main() {
     TestFrequencyAdmission();
     TestPrefillAdmission();
@@ -355,6 +395,7 @@ int main() {
     TestFrequencyIndexUpdates();
     TestDecodeOverlap();
     TestParallelOverlap();
+    TestSharedOverlap();
     using fastllm::MoeDecodePolicy;
     // Four alternating experts fit in a global cache, but cannot borrow
     // unused slots from a different record-size partition.

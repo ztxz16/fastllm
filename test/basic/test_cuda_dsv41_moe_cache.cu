@@ -20,7 +20,7 @@
 namespace fastllm {
 NumaConfig *GetNumaConfig();
 void DoCudaMergeMOEFromCPU(Data &, Data &, Data &, Data &, Data &, Data &, Data &, Data **, Data **, float, bool,
-                           const std::unordered_set<int> &, bool, MoeGateType, bool, float, int, bool);
+                           const std::unordered_set<int> &, bool, MoeGateType, bool, float, int, bool, bool = true);
 }
 using namespace fastllm;
 static void Require(bool value, const char *message) {

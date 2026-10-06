@@ -1775,34 +1775,38 @@ bool FastllmCudaMoeCacheRequested();
 // leave no published cache; the configured MoE backend remains usable.
 // Borrowed shards must remain alive and unchanged until cache release.
 // Without a callback, snapshot the host weights for the ordinary CUDA cache.
+// allowStreaming permits a zero resident-cache budget when a registered NUMA
+// backend can execute misses with temporary GPU uploads. It requires a callback.
 bool FastllmCudaPrepareMoeCache(
         const FastllmCudaMoeCacheLayer *layers, int layerCount,
-        const std::function<void()> &registerNumaWeights = {});
+        const std::function<void()> &registerNumaWeights = {}, bool allowStreaming = false);
 bool FastllmCudaCanRunMoeCache(
         fastllm::Data **weights, int weightsBatch);
 
-// Read-only snapshot of existing canonical GGUF cache records on this GPU.
-// No admission/eviction or allocation is performed. The caller must finish
+// Snapshot of canonical GGUF or native compact GLM NVFP4 records on this GPU.
+// create permits lazy allocation of a prepared cache; no admission/eviction
+// is performed. The caller must finish
 // using these pointers before the next decode/cache mutation or cache release.
-struct FastllmCudaMoeGGUFResidents {
+struct FastllmCudaMoePrefillResidents {
     std::vector<const void *> weights; // gate/down pairs, zero-based expert IDs
+    int weightType = -1;
     int gateType = -1, downType = -1, hidden = 0, inter = 0;
 };
-bool FastllmCudaGetMoeGGUFResidents(fastllm::Data **weights, int experts,
-                                  FastllmCudaMoeGGUFResidents &view);
+bool FastllmCudaGetMoePrefillResidents(fastllm::Data **weights, int experts,
+                                  FastllmCudaMoePrefillResidents &view, bool create = false);
 
 // Reservations exclude all currently active resident experts. Upload directly
-// into these canonical gate/down destinations, then publish on the same stream
+// into these format-preserving gate/down destinations, then publish on the same stream
 // after both projections are ready. The model serializes calls on each device.
-struct FastllmCudaMoeGGUFPrefillPlan {
+struct FastllmCudaMoePrefillPlan {
     std::vector<void *> weights;
     std::vector<int> keys, slots;
     void *cache = nullptr;
 };
-void FastllmCudaPlanMoeGGUFPrefill(fastllm::Data **weights, int experts,
+void FastllmCudaPlanMoePrefill(fastllm::Data **weights, int experts,
     const int32_t *indices, const float *scores, int rows, int topk,
-    const std::unordered_set<int> &selected, FastllmCudaMoeGGUFPrefillPlan &plan);
-void FastllmCudaPublishMoeGGUFPrefill(const FastllmCudaMoeGGUFPrefillPlan &plan);
+    const std::unordered_set<int> &selected, FastllmCudaMoePrefillPlan &plan);
+void FastllmCudaPublishMoePrefill(const FastllmCudaMoePrefillPlan &plan);
 
 struct FastllmCudaMoeGGUFCacheView {
     const uint8_t *records;

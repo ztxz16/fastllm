@@ -46,14 +46,18 @@ __device__ inline float Dot(const __nv_bfloat16 *input,
 // as GLM's NUMA path; the incoming activation is not quantized to FP8.
 static __global__ void Gate(const __nv_bfloat16 *input, const int32_t *slots,
         const uint8_t *records, const float *scores, __nv_bfloat16 *activation,
-        int hidden, int inter, size_t stride, float limit) {
-    const int route = blockIdx.y, slot = slots[route];
+        int hidden, int inter, size_t stride, float limit,
+        int topk = 0, const int32_t *routeMap = nullptr) {
+    const int selected = blockIdx.y, slot = slots ? slots[selected] : 0;
     if (slot < 0) return;
+    const int route = routeMap ? routeMap[selected] : selected;
+    if (topk) input += size_t(route / topk) * hidden;
     const int column = blockIdx.x * 128 + threadIdx.x / 8;
     const size_t pitch = 4 + (hidden / 16) * 9;
     const uint8_t *record = records + size_t(slot) * stride;
-    float gate = BFloat(Dot(input, record + column * pitch, hidden));
-    float up = BFloat(Dot(input, record + (column + inter) * pitch, hidden));
+    // Resident and streamed records retain NUMA's adjacent gate/up rows.
+    float gate = BFloat(Dot(input, record + (2 * column) * pitch, hidden));
+    float up = BFloat(Dot(input, record + (2 * column + 1) * pitch, hidden));
     __shared__ float values[128], maxima[4];
     if ((threadIdx.x & 7) == 0) {
         if (limit > 0) {
@@ -84,9 +88,10 @@ static __global__ void Gate(const __nv_bfloat16 *input, const int32_t *slots,
 
 static __global__ void Down(const __nv_bfloat16 *activation, const int32_t *slots,
         const uint8_t *records, float *output, int hidden, int inter,
-        size_t stride, size_t downOffset) {
-    const int route = blockIdx.y, slot = slots[route];
+        size_t stride, size_t downOffset, const int32_t *routeMap = nullptr) {
+    const int selected = blockIdx.y, slot = slots ? slots[selected] : 0;
     if (slot < 0) return;
+    const int route = routeMap ? routeMap[selected] : selected;
     const int column = blockIdx.x * 16 + threadIdx.x / 8;
     const uint8_t *weight = records + size_t(slot) * stride + downOffset +
         size_t(column) * (4 + (inter / 16) * 9);

@@ -146,6 +146,78 @@ public:
         int selected = 0;
     };
 
+    struct SharedRankPlan {
+        const MoeDecodeOverlapScheduler *timing = nullptr;
+        int hits = 0, capacity = 0;
+        // Activation distribution and result gathering, including host staging.
+        double handoffUs = 0;
+    };
+
+    // Unlike EP's fixed expert ownership, every unique miss can run on any GPU.
+    // The caller orders misses by cross-row reuse and keeps one owner per expert.
+    static std::vector<int> AssignSharedMisses(const std::vector<SharedRankPlan> &plans,
+            const Estimate &cpu, const std::vector<int> &reuse, uint64_t calls) {
+        std::vector<int> result(reuse.size(), -1), current(reuse.size(), -1);
+        std::vector<int> counts(plans.size(), 0);
+        std::vector<double> gpu(plans.size(), 0);
+        int remaining = 0;
+        for (int n : reuse) remaining += n;
+        double bound = 0;
+        bool calibrating = !cpu.initialized;
+        for (size_t r = 0; r < plans.size(); ++r) {
+            const auto &p = plans[r];
+            if (!p.timing) continue;
+            gpu[r] = p.hits * p.timing->residentExpert.us;
+            if (p.hits) bound = std::max(bound, gpu[r] + p.handoffUs);
+            calibrating |= p.capacity > 0 &&
+                (!p.timing->copiedExpert.initialized || !p.timing->stagedExpert.initialized);
+        }
+        if (reuse.empty() || plans.empty()) return result;
+        if (calibrating) {
+            // Keep some real CPU work, and rotate the probes when a batch has
+            // fewer unique misses than devices. Never synthesize extra experts.
+            const int probes = reuse.size() == 1 ? int(calls % 2) : std::max(1, int(reuse.size()) / 2);
+            for (int i = 0; i < probes; ++i) {
+                for (size_t offset = 0; offset < plans.size(); ++offset) {
+                    const int r = (i + (reuse.size() == 1 ? calls / 2 : calls) + offset) % plans.size();
+                    if (plans[r].timing && counts[r] < plans[r].capacity) {
+                        result[i] = r; ++counts[r]; break;
+                    }
+                }
+            }
+            return result;
+        }
+        double best = std::max(remaining * cpu.us, bound);
+        for (size_t i = 0; i < reuse.size(); ++i) {
+            int selected = -1;
+            double finish = 0, compute = 0;
+            for (size_t r = 0; r < plans.size(); ++r) {
+                const auto &p = plans[r];
+                if (!p.timing || counts[r] >= p.capacity) continue;
+                const double next = std::max(gpu[r], (counts[r] + 1) * p.timing->copiedExpert.us) +
+                    reuse[i] * p.timing->stagedExpert.us;
+                const double end = next + p.timing->dispatch.us + p.handoffUs;
+                if (selected < 0 || end < finish) { selected = r; finish = end; compute = next; }
+            }
+            if (selected < 0) break;
+            current[i] = selected; ++counts[selected];
+            gpu[selected] = compute; bound = std::max(bound, finish);
+            remaining -= reuse[i];
+            const double cost = std::max(remaining * cpu.us, bound);
+            if (cost < best * .97) { best = cost; result = current; }
+        }
+        // Probe an unused device occasionally after the workload/link changes.
+        if (calls % 127 == 126) {
+            const int r = (calls / 127) % plans.size();
+            if (plans[r].timing && plans[r].capacity > 0 &&
+                std::find(result.begin(), result.end(), r) == result.end()) {
+                auto miss = std::find(result.begin(), result.end(), -1);
+                if (miss != result.end()) *miss = r;
+            }
+        }
+        return result;
+    }
+
     // All ranks share one CPU worker pool. Account for its entire remaining
     // subset while each GPU has its own resident work and measured DMA cost.
     // A null timing leaves this rank's misses on CPU (e.g. no staging buffer).

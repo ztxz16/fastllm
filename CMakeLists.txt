@@ -1482,13 +1482,22 @@ if (UNIT_TEST)
             set_target_properties(cuda_glm5_moe_cache_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
             add_test(NAME cuda_glm5_moe_cache COMMAND cuda_glm5_moe_cache_test)
             set_tests_properties(cuda_glm5_moe_cache PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+            fastllm_add_checked_test(cuda_glm5_moe_frequency cuda_glm5_moe_cache_test "GLM compact NVFP4 cache:" 120 --frequency)
+            fastllm_add_checked_test(cuda_glm5_moe_no_cache cuda_glm5_moe_cache_test "GLM compact NVFP4 cache:" 120 --no-cache)
+            fastllm_add_checked_test(cuda_glm5_moe_prefill cuda_glm5_moe_cache_test "GLM compact NVFP4 cache:" 120 --prefill)
+            fastllm_add_checked_test(cuda_glm5_moe_verify cuda_glm5_moe_cache_test "GLM verify:" 120 --verify)
+            fastllm_add_checked_test(cuda_glm5_moe_verify_no_cache cuda_glm5_moe_cache_test "GLM verify:" 120 --verify --no-cache)
+            set_tests_properties(cuda_glm5_moe_frequency cuda_glm5_moe_no_cache cuda_glm5_moe_prefill
+                cuda_glm5_moe_verify cuda_glm5_moe_verify_no_cache PROPERTIES
+                LABELS "cuda;moe;numa" RUN_SERIAL TRUE ENVIRONMENT "FT_NUMAS=1;FT_THREADS=8")
 
             add_executable(cuda_glm5_gguf_cache_test test/basic/test_cuda_glm5_gguf_cache.cpp)
             target_link_libraries(cuda_glm5_gguf_cache_test PRIVATE fastllm)
             target_include_directories(cuda_glm5_gguf_cache_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
             fastllm_add_checked_test(cuda_glm5_gguf_cache cuda_glm5_gguf_cache_test "PASS: GLM GGUF cache" 120)
             fastllm_add_checked_test(cuda_glm5_gguf_frequency cuda_glm5_gguf_cache_test "PASS: GLM GGUF cache" 120 --frequency)
-            set_tests_properties(cuda_glm5_gguf_cache cuda_glm5_gguf_frequency PROPERTIES LABELS "cuda;gguf" RUN_SERIAL TRUE
+            fastllm_add_checked_test(cuda_glm5_gguf_no_cache cuda_glm5_gguf_cache_test "PASS: GLM GGUF cache" 120 --no-cache)
+            set_tests_properties(cuda_glm5_gguf_cache cuda_glm5_gguf_frequency cuda_glm5_gguf_no_cache PROPERTIES LABELS "cuda;gguf" RUN_SERIAL TRUE
                 ENVIRONMENT "FT_NUMAS=1;FT_THREADS=8")
 
         endif()

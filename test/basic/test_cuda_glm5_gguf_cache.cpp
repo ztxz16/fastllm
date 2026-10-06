@@ -56,7 +56,8 @@ static void OrdinaryNumas(Data &x, Data &ids, Data &scores, Data &out,
 }
 int main(int argc, char **argv) {
     try {
-        const bool frequency = argc > 1 && std::string(argv[1]) == "--frequency";
+        const bool noCache = argc > 1 && std::string(argv[1]) == "--no-cache";
+        const bool frequency = noCache || (argc > 1 && std::string(argv[1]) == "--frequency");
         int devices = 0;
         if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) {
             std::puts("FASTLLM_TEST_SKIP_NO_DEVICE: CUDA unavailable"); return 0;
@@ -93,11 +94,15 @@ int main(int argc, char **argv) {
             layers[t]={weights[t].data(),int(weights[t].size()),false,.125f,true};
         }
         stride=(stride+127)/128*128;
-        SetMoeCudaCacheBytes(stride*(frequency ? 64 : 16));
+        unsetenv("FASTLLM_MOE_CUDA_CACHE_BYTES_0");
+        unsetenv("FASTLLM_MOE_CUDA_CACHE_BYTES_1");
+        SetMoeCudaCacheBytes(noCache ? 0 : stride*(frequency ? 64 : 16));
+        if (noCache) Require(!FastllmCudaPrepareMoeCache(layers,tables,[] {}),
+            "zero-cache streaming must be explicitly prepared");
         Require(FastllmCudaPrepareMoeCache(layers,tables,[&] {
             for (auto &table:weights) for (size_t i=2;i<table.size();++i)
                 RegisterNumas(table[i],i%2 ? "linearColumn" : "linearSwiglu");
-        }),"GLM GGUF registration rejected");
+        },noCache),"GLM GGUF registration rejected");
         Require(FastllmCudaCanRunMoeHybrid(weights[0].data(),weights[0].size()),"hybrid unavailable");
         Require(!FastllmCudaCanRunMoeCache(weights[0].data(),weights[0].size()),"generic unscored math admitted");
         Require(!FastllmCudaMoeGlm5GGUFCacheSupported(GGML_TYPE_Q4_K,GGML_TYPE_IQ4_XS,hidden,inter),
@@ -200,7 +205,8 @@ int main(int argc, char **argv) {
                 index.ToDevice(CUDA,std::vector<int>{device});score.ToDevice(CUDA,std::vector<int>{device});
                 // Refill outside Begin/End, then resume frequency admission.
                 // This also verifies that End restores ordinary routing.
-                for(int split : frequency ? std::vector<int>{-1,-1,-1,6,-1,0} :
+                for(int split : noCache ? std::vector<int>{-1,-1,-1} :
+                                frequency ? std::vector<int>{-1,-1,-1,6,-1,0} :
                                             std::vector<int>{0,2,6,6,0}) {
                     setenv("FASTLLM_GLM5_MOE_CACHE_GPU_EXPERTS",std::to_string(split).c_str(),1);
                     void *state=nullptr;
@@ -221,6 +227,8 @@ int main(int argc, char **argv) {
                     Require(fastllm_moe_cuda_cache_route_stats(device,after),"after counters");
                     Require(after[0]-before[0]==1 && after[1]-before[1]==topk,"missing routes");
                     const auto gpu=after[4]-before[4];
+                    if (noCache) Require(after[2]==0 && after[6]==0 && after[7]==0,
+                        "zero-cache dispatch retained or prefetched experts");
                     if (split < 0) {
                         const auto resident=after[2]-before[2];
                         Require(gpu>=resident && after[6]-before[6]==resident &&
@@ -241,10 +249,11 @@ int main(int argc, char **argv) {
         }
         for(int device=0;device<std::min(2,devices);++device) {
             uint64_t stats[5]={};Require(fastllm_moe_cuda_cache_stats(device,stats,false),"query counters");
-            Require(stats[0] && stats[1] && (frequency ? stats[3]>=64 && stats[3]<tables*experts : stats[3]==16),
+            Require(noCache ? stats[0]==0 && stats[1]>0 && stats[2]==0 && stats[3]==0 :
+                stats[0] && stats[1] && (frequency ? stats[3]>=64 && stats[3]<tables*experts : stats[3]==16),
                     "cache cold/hot/eviction or compact slots missing");
         }
-        if (frequency) Require(sawCpu && sawMixed && sawGpu && sawStaged,
+        if (frequency) Require(sawCpu && sawMixed && (noCache || sawGpu) && sawStaged,
                                "frequency did not exercise CPU, resident and staged GPU routes");
         FastllmCudaReleaseMoeCache(weights[0].data(),weights[0].size());
         ClearNumasMoeRuntimeCache();

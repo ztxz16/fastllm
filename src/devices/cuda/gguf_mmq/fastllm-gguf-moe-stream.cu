@@ -111,8 +111,8 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
     const int device = FastllmCudaGetDevice(), rows = input.dims[0], hidden = input.dims[1];
     auto &pipeline = GetPipeline(device);
     std::lock_guard<std::mutex> lock(pipeline.mutex);
-    FastllmCudaMoeGGUFResidents resident;
-    FastllmCudaGetMoeGGUFResidents(weights, expertCount, resident);
+    FastllmCudaMoePrefillResidents resident;
+    FastllmCudaGetMoePrefillResidents(weights, expertCount, resident);
     std::vector<std::vector<int>> routes(expertCount);
     for (int r = 0; r < rows * topk; ++r) {
         const int e = indices[r];
@@ -179,8 +179,8 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
     AllocateTensor(gate, input.dataType, {rows * topk, inter}, device);
     AllocateTensor(output, input.dataType, {rows, hidden}, device);
     auto *base = static_cast<uint8_t *>(workspace.cudaData);
-    FastllmCudaMoeGGUFPrefillPlan admission;
-    FastllmCudaPlanMoeGGUFPrefill(weights, expertCount, indices, scores, rows, topk, experts, admission);
+    FastllmCudaMoePrefillPlan admission;
+    FastllmCudaPlanMoePrefill(weights, expertCount, indices, scores, rows, topk, experts, admission);
     struct Upload { const fastllm::Data *weight; uint8_t *target; };
     std::vector<std::vector<Upload>> uploads(batches.size());
     std::vector<WeightCopy> copies;
@@ -251,7 +251,7 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
         CUDA_CHECK(cudaEventRecord(pipeline.released[slot], stream));
     }
     run(StreamedMoePhase::Finish, {});
-    FastllmCudaPublishMoeGGUFPrefill(admission);
+    FastllmCudaPublishMoePrefill(admission);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     return true;
 }
