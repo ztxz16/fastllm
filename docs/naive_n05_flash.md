@@ -1529,9 +1529,43 @@ Graph replay 和后缀路由变化下的前缀比较仍要求逐 bit 一致。�
 `cuda_nvfp4_marlin_cross_device_rows`。`speculative_sampling` 还覆盖 CPU 概率与残差采样。
 
 
-## 草稿投影融合
+## 草稿投影融合与独立 TP
 
 草稿 Q/K/V 与 Gate/Up 在模型加载阶段分别合并，沿用 WeightMergeRule 的所有权规则，
 合并成功后删除原条目。上下文 K/V 从合并 QKV 建立只读行视图，不另存合并权重缓存。
 BF16 草稿支持 Q/K RMSNorm、RoPE 和 KV 写入融合；SwiGLU 保留先将 SiLU 舍入为
 BF16 再相乘的数值语义。布局不满足融合条件时保留原算子路径，Graph 和 eager 均可运行。
+
+草稿并行只使用一个配置项 `FASTLLM_DSPARK_TP`：
+
+| 值 | 执行方式 |
+|---|---|
+| 不设置或 `1` | 单卡草稿，兼容原默认行为 |
+| `2`、`4` 等整数 N | QKV/Attention/O 与 MLP 均按 N 卡切分 |
+| `mlp:2`、`mlp:4` 等 `mlp:N` | 每卡计算完整 Attention 并持有完整 KV，只有 MLP 切分 |
+
+配置在草稿第一次使用多卡时固定，不支持加载后切换。Target 已配置 TP 时，草稿采用其
+设备列表的前 N 张卡；否则从草稿当前设备开始，按可见 CUDA 设备编号补齐。不会把
+target/head 的并行度改成 N。上下文 FC 和 Markov proposal 继续在草稿首卡运行。
+仅 MLP TP 会产生计算所需的 Attention 副本；分片与副本都释放父投影的原始存储，
+不额外保留未分片大矩阵。
+
+并行实现按实际设备数量处理，不限定为双卡或四卡。N 不能超过可用设备数或 target TP
+设备数，MLP 中间维度必须能被 N 整除；完整 TP 还要求 Q/KV 头数能被 N 整除。
+仅 MLP TP 支持单 KV 头。当前路径要求 CUDA embedding、BF16 稠密投影、peer access，
+不支持 low-memory 模式；head_dim 为 4 的倍数且不超过 256，草稿 block 在 2..31 范围。
+不符合要求时明确报错，不在已分片权重上静默退回单卡。
+
+多卡上下文投影使用逐层 K/V 行视图和 batched GEMM；工作区只保留激活与小指针表，
+不缓存权重副本。草稿拥有独立通信组、持久工作线程和 Executor，不替换 target 的通信组。
+所有从卡提交完成后首卡才允许复用输入存储。Graph 捕获失败时统一释放各卡 graph 并回退
+到相同 TP 策略的 eager 路径。未为上下文更新新增 CUDA Graph。
+
+Linux CUDA CTest 中，`naive_n05_draft_fusion` 与 `naive_n05_draft_kv` 覆盖融合数值、
+布局拒绝、请求复用及跨窗口更新；`naive_n05_draft_tp_*`、`naive_n05_draft_mlp_tp_*`
+覆盖完整/仅 MLP TP、MQA、2/4/8 卡、Graph/eager、捕获失败回退和非零首卡。
+TP 改变 GEMM 与跨卡归约顺序，跨策略使用既有数值容差；同一策略 Graph/eager 要求逐位一致。
+
+并行度需要按实际硬件和请求评估。历史短请求中，优化完整 TP2 相对单卡有端到端收益；
+仅 MLP TP2 的一次对照整轮略快于完整 TP2，但收益主要体现在 Verify 时间变化，稳定性
+尚未确认；TP4 在该场景没有净收益。因此不自动提高草稿并行度，也不承诺线性加速。

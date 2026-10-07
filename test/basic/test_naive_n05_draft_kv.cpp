@@ -104,6 +104,64 @@ static double Relative(const Data &a, const Data &b) {
 }
 // Exercise row views, changing row counts, multiple pointer-table groups,
 // reuse with different weights, and graph replay against separate GEMMs.
+int ProjectTests(int layers, int inner, int columns) {
+    std::vector<Data> owners(layers), views(layers);
+    std::vector<const Data *> weights;
+    for (int i = 0; i < layers; ++i) {
+        Data source = BF({columns + 16, inner}, i * 71 + 3);
+        owners[i].CopyFrom(source);
+        views[i].FakeFrom(owners[i], (size_t)16 * inner * sizeof(uint16_t));
+        views[i].Resize({columns, inner});
+        weights.push_back(&views[i]);
+    }
+    Data output, pointers;
+    int checks = 0;
+    for (int rows : {1, 2, 3, 4, 5, 6, 7, 8, 2, 1}) {
+        Data input = BF({1, rows, inner}, rows * 101);
+        std::reverse(weights.begin(), weights.end());
+        Check(FastllmCudaNaiveDraftKVProject(input, weights, output, pointers), "batched projection rejected");
+        Check(output.dims == std::vector<int>({layers, rows, columns}), "batched output shape");
+        for (int i = 0; i < layers; ++i) {
+            Data actual, expected;
+            actual.FakeFrom(output, (size_t)i * rows * columns * sizeof(uint16_t));
+            actual.Resize({1, rows, columns});
+            MatMulTransB(input, *const_cast<Data *>(weights[i]), expected);
+            Check(Relative(actual, expected) < .01, "batched projection error");
+            ++checks;
+        }
+        auto before = Bits(output);
+        auto last = weights.back();
+        weights.back() = nullptr;
+        Check(!FastllmCudaNaiveDraftKVProject(input, weights, output, pointers), "null weight accepted");
+        weights.back() = last;
+        views.back().strides[0]++;
+        Check(!FastllmCudaNaiveDraftKVProject(input, weights, output, pointers), "padded weight accepted");
+        views.back().strides[0]--;
+        Check(!FastllmCudaNaiveDraftKVProject(input, weights, input, pointers), "input/output alias accepted");
+        Check(!FastllmCudaNaiveDraftKVProject(input, weights, output, output), "scratch/output alias accepted");
+        Check(Bits(output) == before, "rejected projection changed output");
+        if (rows == 7) {
+            Check(cudaStreamSynchronize(cudaStreamPerThread) == cudaSuccess, "projection sync");
+            cudaGraph_t graph = nullptr; cudaGraphExec_t exec = nullptr;
+            Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal) == cudaSuccess,
+                  "projection capture begin");
+            bool captured = FastllmCudaNaiveDraftKVProject(input, weights, output, pointers);
+            Check(cudaStreamEndCapture(cudaStreamPerThread, &graph) == cudaSuccess && captured,
+                  "projection capture end");
+            Check(cudaGraphInstantiateWithFlags(&exec, graph, 0) == cudaSuccess, "projection instantiate");
+            for (int repeat = 0; repeat < 3; ++repeat) {
+                Check(cudaMemsetAsync(output.cudaData, 0, output.Count(0) * sizeof(uint16_t), cudaStreamPerThread) == cudaSuccess,
+                      "projection clear");
+                Check(cudaGraphLaunch(exec, cudaStreamPerThread) == cudaSuccess, "projection replay");
+                Check(Bits(output) == before, "projection graph bits differ");
+            }
+            cudaGraphExecDestroy(exec); cudaGraphDestroy(graph);
+            checks += 3;
+        }
+        checks += 6;
+    }
+    return checks;
+}
 int main() {
     try {
         int devices = 0;
@@ -210,6 +268,11 @@ int main() {
                     Check(kv[0].first.dims == dims && Bits(kv[0].first) == before, "rejection changed cache");
                     checks += 6;
                 }
+            checks += ProjectTests(3, 256, 128);
+            checks += ProjectTests(17, 64, 32);
+            checks += ProjectTests(5, 4096, 512);
+            checks += ProjectTests(5, 4096, 256);
+            if (device == 0) checks += ProjectTests(5, 4096, 1024);
             for (int seed : {17, 99}) {
                 ProjectionFixture model(seed);
                 auto actual = std::make_shared<ProjectionFixture::DraftContext>();

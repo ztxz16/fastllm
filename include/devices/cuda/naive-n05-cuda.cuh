@@ -50,6 +50,14 @@ bool FastllmCudaNaiveDraftKV(const std::vector<const fastllm::Data *> &raw,
     std::vector<std::pair<fastllm::Data, fastllm::Data>> &kv,
     int heads, int dim, int window, int reserve, float eps, float theta);
 
+// Project a shared BF16 input [1, rows, inner] through per-layer K/V row
+// views [columns, inner]. Output [layers, rows, columns] and pointer scratch
+// belong to the request; weight matrices are neither copied nor retained.
+// Unsupported layouts return false so the caller can use separate GEMMs.
+bool FastllmCudaNaiveDraftKVProject(const fastllm::Data &input,
+    const std::vector<const fastllm::Data *> &weights,
+    fastllm::Data &output, fastllm::Data &pointers);
+
 // Packed [Q,K,V] projection: head RMSNorm, RoPE, contiguous Q and direct K/V
 // cache writes. Preserve separate BF16 rounding; do not change cache metadata.
 // liveKeys is the graph's committed length + 1, or empty for host cache length.
@@ -203,3 +211,8 @@ bool FastllmCudaNaiveRouterSigmoid(const fastllm::Data &input,
 // Small multi-row FP32 router with BF16 inputs, preserving exact GEMV arithmetic.
 bool FastllmCudaNaiveRouterVerify(const fastllm::Data &input,
     const fastllm::Data &weight, fastllm::Data &output);
+
+// Independent draft subgroup; never replaces the target TP communicators.
+void *FastllmCudaNaiveDraftTPCreate(const std::vector<int> &devices);
+void FastllmCudaNaiveDraftTPDestroy(void *group);
+void FastllmCudaNaiveDraftTPReduce(void *group, int rank, fastllm::Data &data);

@@ -75,6 +75,8 @@ namespace fastllm {
             std::map<int, Data> hidden;
             std::shared_ptr<HistoryChunk> history;
         };
+        struct DraftTPState;
+        std::shared_ptr<DraftTPState> draftTP;
         struct DraftWorkspace;
         struct DraftContext {
             int committed = 0;
@@ -103,6 +105,9 @@ namespace fastllm {
         void CommitDraftContext(TargetCapture &capture, int tokens, DraftContext &context,
                                 std::vector<std::pair<Data, Data>> &kv);
         std::shared_ptr<DraftContext> CreateDraftContext();
+        bool PrepareDraftTP();
+        bool AppendDraftContextTP(Data &hidden, int start, DraftContext &context);
+        bool RunDraftTP(int anchor, DraftContext &context, Data &output);
         bool RunDraftGraph(int anchor, DraftContext &context, Data &output);
         bool RunDraftProposalGraph(int anchor, const Data &baseLogits,
                                    DraftContext &context, std::vector<int> &proposed);

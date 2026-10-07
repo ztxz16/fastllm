@@ -3,6 +3,7 @@
 #include "utils.h"
 #include "naive-n05-topk.cuh"
 #include <cuda_bf16.h>
+#include <nccl.h>
 #include <cuda_fp8.h>
 #include <cub/block/block_scan.cuh>
 #include <cub/block/block_radix_sort.cuh>
@@ -133,6 +134,17 @@ __global__ void VerifyRouter4096(const BF16 *input, const float *weight,
 }
 
 constexpr int kDraftKVLayersPerLaunch = 16;
+struct DraftKVWeights { const void *data[kDraftKVLayersPerLaunch]; };
+__global__ void DraftKVPointerTable(DraftKVWeights weights, const void *input,
+        BF16 *output, void **pointers, int first, int count, int layers, size_t stride) {
+    int i = threadIdx.x;
+    if (i < count) {
+        const int layer = first + i;
+        pointers[layer] = const_cast<void *>(weights.data[i]);
+        pointers[layers + layer] = const_cast<void *>(input);
+        pointers[2 * layers + layer] = output + (size_t)layer * stride;
+    }
+}
 struct DraftKVDestinations {
     const BF16 *raw[kDraftKVLayersPerLaunch];
     const float *norm[kDraftKVLayersPerLaunch];
@@ -1594,6 +1606,49 @@ bool DraftDense(const fastllm::Data &x, fastllm::DataType type) {
 }
 }
 
+bool FastllmCudaNaiveDraftKVProject(const fastllm::Data &input,
+        const std::vector<const fastllm::Data *> &weights,
+        fastllm::Data &output, fastllm::Data &pointers) {
+    using namespace fastllm;
+    if (!DraftDense(input, BFLOAT16) || input.dims.size() != 3 || input.dims[0] != 1 ||
+        weights.empty() || weights.size() > INT_MAX / (3 * sizeof(void *) / sizeof(int)) ||
+        &output == &pointers || output.isFake || pointers.isFake ||
+        output.multiDeviceData || pointers.multiDeviceData ||
+        (output.cudaData && output.cudaData == pointers.cudaData)) return false;
+    auto aliases = [&](const Data &x) {
+        return &x == &output || &x == &pointers || (x.cudaData &&
+            (x.cudaData == output.cudaData || x.cudaData == pointers.cudaData));
+    };
+    if (aliases(input)) return false;
+    const int rows = input.dims[1], inner = input.dims[2], layers = weights.size();
+    int columns = 0;
+    for (const Data *weight : weights) {
+        if (!weight || !DraftDense(*weight, BFLOAT16) || aliases(*weight) ||
+            weight->dims.size() != 2 || weight->dims[1] != inner ||
+            (columns && weight->dims[0] != columns)) return false;
+        columns = weight->dims[0];
+    }
+    Output(output, BFLOAT16, {layers, rows, columns});
+    Output(pointers, INT32, {layers * 3 * (int)(sizeof(void *) / sizeof(int))});
+    auto table = (void **)pointers.cudaData;
+    // Tiny pointer tables are constructed on the current stream. No pageable
+    // H2D copy, global pointer cache, or weight-lifetime assumption is needed.
+    for (int first = 0; first < layers; first += kDraftKVLayersPerLaunch) {
+        DraftKVWeights addresses{};
+        int count = std::min(kDraftKVLayersPerLaunch, layers - first);
+        for (int i = 0; i < count; ++i) addresses.data[i] = weights[first + i]->cudaData;
+        DraftKVPointerTable<<<1, 32, 0, cudaStreamPerThread>>>(addresses, input.cudaData,
+            (BF16 *)output.cudaData, table, first, count, layers, (size_t)rows * columns);
+    }
+    CheckLaunch();
+    const float alpha = 1, beta = 0;
+    return cublasGemmBatchedEx(getFastllmCublasHandle(), CUBLAS_OP_T, CUBLAS_OP_N,
+        columns, rows, inner, &alpha, (const void *const *)table, CUDA_R_16BF, inner,
+        (const void *const *)(table + layers), CUDA_R_16BF, inner, &beta,
+        (void *const *)(table + 2 * layers), CUDA_R_16BF, columns, layers,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS;
+}
+
 bool FastllmCudaNaiveDraftQKV(const fastllm::Data &raw,
         const fastllm::Data &qNorm, const fastllm::Data &kNorm,
         const fastllm::Data &positions, const fastllm::Data &liveKeys,
@@ -3024,4 +3079,42 @@ void FastllmCudaNaiveGraphVerifyAttention(const fastllm::Data &query,
             window ? scratch.windowValue : value, selected, sink, live, capacity,
             heads, kvHeads, dim, valueDim, window, scratch, out);
     }
+}
+
+namespace {
+struct DraftTPGroup { std::vector<int> devices; std::vector<ncclComm_t> comms; };
+}
+void *FastllmCudaNaiveDraftTPCreate(const std::vector<int> &devices) {
+    if (devices.size() < 2 || devices.size() > (size_t)FastllmCudaGetDeviceCount()) return nullptr;
+    for (size_t i = 0; i < devices.size(); ++i)
+        if (devices[i] < 0 || std::find(devices.begin(), devices.begin() + i, devices[i]) != devices.begin() + i)
+            return nullptr;
+    auto *group = new DraftTPGroup{devices, std::vector<ncclComm_t>(devices.size())};
+    int previous = FastllmCudaGetDevice();
+    if (ncclCommInitAll(group->comms.data(), devices.size(), devices.data()) != ncclSuccess) {
+        for (auto comm : group->comms) if (comm) ncclCommAbort(comm);
+        delete group; group = nullptr;
+    }
+    FastllmCudaSetDevice(previous);
+    return group;
+}
+void FastllmCudaNaiveDraftTPDestroy(void *opaque) {
+    if (!opaque) return;
+    auto *group = (DraftTPGroup *)opaque;
+    int previous = FastllmCudaGetDevice();
+    for (size_t i = 0; i < group->comms.size(); ++i) {
+        FastllmCudaSetDevice(group->devices[i]);
+        cudaDeviceSynchronize();
+        ncclCommDestroy(group->comms[i]);
+    }
+    FastllmCudaSetDevice(previous);
+    delete group;
+}
+void FastllmCudaNaiveDraftTPReduce(void *opaque, int rank, fastllm::Data &data) {
+    auto *group = (DraftTPGroup *)opaque;
+    fastllm::AssertInFastLLM(group && rank >= 0 && rank < (int)group->devices.size() &&
+        data.dataType == fastllm::BFLOAT16 && data.dataDeviceIds == std::vector<int>{group->devices[rank]},
+        "Invalid draft TP reduction.");
+    fastllm::AssertInFastLLM(ncclAllReduce(data.cudaData, data.cudaData, data.Count(0), ncclBfloat16,
+        ncclSum, group->comms[rank], cudaStreamPerThread) == ncclSuccess, "Draft TP reduction failed.");
 }

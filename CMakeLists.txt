@@ -1449,6 +1449,28 @@ if (UNIT_TEST)
                     PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
                     PASS_REGULAR_EXPRESSION "DRAFT GRAPH PASS")
             endforeach()
+            foreach(NAIVE_DRAFT_RANKS 2 4 8)
+                foreach(NAIVE_DRAFT_STRATEGY draft_tp draft_mlp_tp draft_mlp_tp_mqa)
+                    add_test(NAME naive_n05_${NAIVE_DRAFT_STRATEGY}_${NAIVE_DRAFT_RANKS}
+                        COMMAND naive_n05_verify_graph_test ${NAIVE_DRAFT_RANKS} ${NAIVE_DRAFT_STRATEGY})
+                    set_tests_properties(naive_n05_${NAIVE_DRAFT_STRATEGY}_${NAIVE_DRAFT_RANKS}
+                        PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
+                        PASS_REGULAR_EXPRESSION "DRAFT (MLP )?TP[0-9]+ PASS")
+                endforeach()
+            endforeach()
+            foreach(NAIVE_DRAFT_STRATEGY draft_tp draft_mlp_tp)
+                foreach(NAIVE_DRAFT_FAILURE failbegin failinstantiate)
+                    add_test(NAME naive_n05_${NAIVE_DRAFT_STRATEGY}_${NAIVE_DRAFT_FAILURE}
+                        COMMAND naive_n05_verify_graph_test 2 ${NAIVE_DRAFT_STRATEGY} ${NAIVE_DRAFT_FAILURE})
+                    set_tests_properties(naive_n05_${NAIVE_DRAFT_STRATEGY}_${NAIVE_DRAFT_FAILURE}
+                        PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
+                        PASS_REGULAR_EXPRESSION "DRAFT (MLP )?TP2 PASS")
+                endforeach()
+            endforeach()
+            add_test(NAME naive_n05_draft_mlp_tp_offset COMMAND naive_n05_verify_graph_test 2 draft_mlp_tp_offset)
+            set_tests_properties(naive_n05_draft_mlp_tp_offset PROPERTIES
+                LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
+                PASS_REGULAR_EXPRESSION "DRAFT MLP TP2 PASS")
             add_test(NAME naive_n05_tp_graph COMMAND "${CMAKE_COMMAND}"
                 "-DTEST_EXECUTABLE=$<TARGET_FILE:naive_n05_tp_graph_test>"
                 "-DTEST_DIRECTORY=${CMAKE_CURRENT_BINARY_DIR}/naive-tp-graph"

@@ -1,12 +1,15 @@
 #include "models/naive_n05_flash.h"
 #include "models/speculative_sampling.h"
 #include "json11.hpp"
+#include "executor.h"
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #ifdef USE_CUDA
 #include "devices/cuda/naive-n05-cuda.cuh"
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/multicuda/fastllm-multicuda.cuh"
 #endif
 
 namespace fastllm {
@@ -46,18 +49,332 @@ struct NaiveN05FlashModel::DraftWorkspace {
     bool disabled = false;
     std::vector<void *> inputs;
     Data id, live, positions, hidden, normalized;
-    Data combined, projected, committedHidden, contextSelected;
+    Data combined, projected, committedHidden, contextSelected, contextRaw, contextPointers;
     std::vector<Layer> layers;
     std::vector<ContextLayer> contextLayers;
+    std::vector<std::shared_ptr<DraftWorkspace>> tpRanks;
+    std::vector<std::pair<Data, Data>> tpKV;
+    void *ready = nullptr, *done = nullptr;
     ~DraftWorkspace() {
         int previous = FastllmCudaGetDevice();
         if (device >= 0) FastllmCudaSetDevice(device);
         for (auto &graph : graphs) graph.Clear();
         proposal.graph.Clear();
+        if (ready) FastllmCudaEventDestroy(ready);
+        if (done) FastllmCudaEventDestroy(done);
         // Data frees use their recorded device; restore the caller's selection.
         FastllmCudaSetDevice(previous);
     }
 };
+// Draft subgroup state is independent of the target's TP communicator.
+struct NaiveN05FlashModel::DraftTPState {
+    std::vector<int> devices;
+    int attentionDivisor = 1;
+    void *group = nullptr;
+    PersistentWorkerGroup workers;
+    std::vector<std::unique_ptr<Executor>> executors;
+    ~DraftTPState() { workers.Stop(); FastllmCudaNaiveDraftTPDestroy(group); }
+    void Run(const std::function<void(int)> &body) {
+        std::vector<std::exception_ptr> errors(devices.size());
+        workers.RunWithCaller(devices, [&](int rank) {
+            FastllmCudaSetDevice(devices[rank]);
+            // Each rank retains its dispatcher along with its worker. Building
+            // every backend's operator registry on each launch hides TP savings.
+            auto &executor = executors[rank];
+            if (!executor) {
+                executor = std::make_unique<Executor>();
+                executor->SetFirstDevice("cuda:" + std::to_string(devices[rank]));
+            }
+            struct Restore { void *old; ~Restore() { SetCurrentThreadExecutor(old); } } restore{GetExecutor()};
+            SetCurrentThreadExecutor(executor.get());
+            body(rank);
+        }, errors);
+        FastllmCudaSetDevice(devices.front());
+        for (auto error : errors) if (error) std::rethrow_exception(error);
+    }
+};
+
+bool NaiveN05FlashModel::PrepareDraftTP() {
+    if (draftTP) return true;
+    const char *option = std::getenv("FASTLLM_DSPARK_TP");
+    if (!option || !*option || std::string(option) == "1") return false;
+    const std::string setting(option);
+    const bool mlpOnly = setting.compare(0, 4, "mlp:") == 0;
+    const std::string count = mlpOnly ? setting.substr(4) : setting;
+    const int available = FastllmCudaGetDeviceCount();
+    AssertInFastLLM(!count.empty() && count.size() <= 9 &&
+        std::all_of(count.begin(), count.end(), [](char c) { return c >= '0' && c <= '9'; }),
+        "FASTLLM_DSPARK_TP must be a rank count or mlp:<rank count>.");
+    const int ranks = std::stoi(count);
+    AssertInFastLLM(ranks >= 2 && ranks <= available, "Draft TP needs at least two available CUDA devices.");
+    AssertInFastLLM(GetCudaEmbedding() && !GetLowMemMode() && draftHeads > 0 &&
+        draftKvHeads > 0 && draftHeads % draftKvHeads == 0 && draftHeadDim > 0 &&
+        draftHeadDim <= 256 && draftHeadDim % 4 == 0 && draftBlock > 1 && draftBlock < 32 &&
+        draftLayers > 0 && embed_dim > 0 && draftWindow > 1 &&
+        (int64_t)draftWindow + draftBlock <= INT_MAX &&
+        (draftHeads + 2LL * draftKvHeads) * draftHeadDim <= INT_MAX &&
+        (mlpOnly || (draftHeads % ranks == 0 && draftKvHeads % ranks == 0)),
+        "Draft TP requires dense BF16 weights, supported Q/KV heads and CUDA embedding.");
+    auto state = std::make_shared<DraftTPState>();
+    state->attentionDivisor = mlpOnly ? 1 : ranks;
+    AssertInFastLLM(tpDevices.empty() || tpDevices.size() >= (size_t)ranks,
+                    "Draft TP needs enough target devices.");
+    if (!tpDevices.empty()) {
+        state->devices.assign(tpDevices.begin(), tpDevices.begin() + ranks);
+    } else {
+        ApplyDraftDevice();
+        state->devices.push_back(FastllmCudaGetDevice());
+        for (int device = 0; device < available && (int)state->devices.size() < ranks; ++device)
+            if (device != state->devices.front()) state->devices.push_back(device);
+    }
+    state->executors.resize(ranks);
+    // Reject unsupported projections before transferring ownership of any weight.
+    auto projection = [&](const std::string &name, const std::vector<int> &dims) {
+        auto it = weight.weight.find(name);
+        AssertInFastLLM(it != weight.weight.end() && it->second.dataType == BFLOAT16 &&
+            !it->second.multiDeviceData && it->second.dims == dims,
+            "Draft TP needs a dense BF16 projection with matching shape: " + name);
+    };
+    for (int i = 0; i < draftLayers; ++i) {
+        const std::string p = "dspark.layers." + std::to_string(i) + ".";
+        auto down = weight.weight.find(p + "mlp.down_proj.weight");
+        AssertInFastLLM(down != weight.weight.end() && down->second.dims.size() == 2 &&
+            down->second.dims[1] > 0 && down->second.dims[1] <= INT_MAX / 2 &&
+            down->second.dims[1] % ranks == 0, "Draft MLP width must be divisible by its TP size.");
+        const int mid = down->second.dims[1];
+        projection(p + "self_attn.mergeqkv.weight",
+                   {(draftHeads + 2 * draftKvHeads) * draftHeadDim, embed_dim});
+        projection(p + "self_attn.o_proj.weight", {embed_dim, draftHeads * draftHeadDim});
+        projection(p + "mlp.gateup_proj.weight", {2 * mid, embed_dim});
+        projection(p + "mlp.down_proj.weight", {embed_dim, mid});
+    }
+    AssertInFastLLM(FastllmCudaPeerAccessInit(state->devices), "Draft TP requires peer access.");
+    auto split = [&](const std::string &name, int axis, const std::vector<int> &widths, bool replicated = false) {
+        Data &w = weight[name], bias;
+        AssertInFastLLM(w.dataType == BFLOAT16 && w.dims.size() == 2 && !w.multiDeviceData,
+                        "Draft TP needs unsharded BF16 projection " + name);
+        DivisionScheme scheme;
+        int offset = 0;
+        for (int width : widths) {
+            AssertInFastLLM(width > 0 && (replicated || width % ranks == 0), "Draft TP projection cannot be split.");
+            for (int rank = 0; rank < ranks; ++rank)
+                scheme[state->devices[rank]].push_back(replicated ? std::make_pair(offset, offset + width) :
+                    std::make_pair(offset + rank * width / ranks, offset + (rank + 1) * width / ranks));
+            offset += width;
+        }
+        AssertInFastLLM(offset == w.dims[axis], "Draft TP projection shape mismatch.");
+        w.tpLinearType = replicated ? TP_LINEAR_NONE : axis == 0 ? TP_LINEAR_ROW : TP_LINEAR_COLUMN;
+        AssertInFastLLM(SplitMultiCudaWeight(w, bias, state->devices, scheme, axis, true), "Draft TP split failed.");
+        AssertInFastLLM(!w.cudaData && !w.cpuData, "Draft TP retained an unsplit weight copy.");
+        if (replicated) {
+            w.tpLayout = TP_LAYOUT_REPLICATED;
+            w.tpAxis = -1;
+            w.tpRanges.clear();
+        }
+    };
+    auto replicate = [&](const std::string &name) {
+        Data &w = weight[name];
+        if (w.multiDeviceData) {
+            AssertInFastLLM(w.IsTensorParallelReplicated(), "Draft input must be replicated: " + name);
+            for (int device : state->devices) AssertInFastLLM(w.multiDeviceDatas.count(device), "Missing replicated draft input.");
+        } else PrepareMultiCudaReplicatedData(w, state->devices, true);
+    };
+    for (int i = 0; i < draftLayers; ++i) {
+        const std::string p = "dspark.layers." + std::to_string(i) + ".";
+        // MLP-only TP replicates attention using the same ownership transfer
+        // as shards; neither strategy retains a second source weight payload.
+        split(p + "self_attn.mergeqkv.weight", 0,
+              {draftHeads * draftHeadDim, draftKvHeads * draftHeadDim, draftKvHeads * draftHeadDim}, mlpOnly);
+        split(p + "self_attn.o_proj.weight", mlpOnly ? 0 : 1,
+              {mlpOnly ? embed_dim : draftHeads * draftHeadDim}, mlpOnly);
+        const int mid = weight[p + "mlp.down_proj.weight"].dims.at(1);
+        split(p + "mlp.gateup_proj.weight", 0, {mid, mid});
+        split(p + "mlp.down_proj.weight", 1, {mid});
+        for (const char *name : {"input_layernorm.weight", "post_attention_layernorm.weight", "self_attn.q_norm.weight", "self_attn.k_norm.weight"}) replicate(p + name);
+    }
+    replicate("dspark.norm.weight");
+    replicate("dspark.mask_embedding");
+    replicate("model.embed_tokens.weight");
+    state->group = FastllmCudaNaiveDraftTPCreate(state->devices);
+    AssertInFastLLM(state->group, "Draft TP communicator creation failed.");
+    draftTP = std::move(state);
+    ApplyDraftDevice();
+    return true;
+}
+
+bool NaiveN05FlashModel::AppendDraftContextTP(Data &hidden, int start, DraftContext &context) {
+    if (!PrepareDraftTP()) return false;
+    auto &tp = *draftTP;
+    ApplyDraftDevice();
+    if (!context.workspace) {
+        context.workspace = std::make_shared<DraftWorkspace>();
+        context.workspace->device = tp.devices.front();
+        for (int device : tp.devices) {
+            auto rank = std::make_shared<DraftWorkspace>();
+            rank->device = device;
+            rank->layers.resize(draftLayers);
+            rank->contextLayers.resize(draftLayers);
+            if (device != tp.devices.front()) rank->tpKV.resize(draftLayers);
+            FastllmCudaSetDevice(device);
+            rank->done = FastllmCudaEventCreate();
+            context.workspace->tpRanks.push_back(std::move(rank));
+        }
+        ApplyDraftDevice();
+        FastllmCudaSetDevice(tp.devices.front());
+        context.workspace->ready = FastllmCudaEventCreate();
+    }
+    auto &ws = *context.workspace;
+    context.kv.resize(draftLayers);
+    const int begin = std::max(0, hidden.dims[1] - draftWindow + 1);
+    // The usual commit input is already dense on rank 0. Its stream waits
+    // for all other ranks below before the caller can overwrite/reuse this storage.
+    Data *selected = &hidden;
+    if (begin || hidden.dataDevice != DataDevice::CUDA ||
+        hidden.dataDeviceIds != std::vector<int>{tp.devices.front()} || hidden.multiDeviceData ||
+        hidden.strides != std::vector<uint64_t>{(uint64_t)hidden.dims[1] * hidden.dims[2], (uint64_t)hidden.dims[2], 1}) {
+        Split(hidden, 1, begin, hidden.dims[1], ws.contextSelected);
+        ws.contextSelected.ToDevice(DataDevice::CUDA, std::vector<int>{tp.devices.front()});
+        selected = &ws.contextSelected;
+    }
+    const int heads = draftHeads / tp.attentionDivisor, kvHeads = draftKvHeads / tp.attentionDivisor;
+    const int rows = selected->dims[1], width = kvHeads * draftHeadDim;
+    FastllmCudaEventRecordCurrentThread(ws.ready);
+    tp.Run([&](int rank) {
+        auto &r = *ws.tpRanks[rank];
+        Data *input = selected;
+        if (rank) {
+            r.contextSelected.dataType = BFLOAT16;
+            r.contextSelected.UpdateUnitSize();
+            r.contextSelected.Resize(selected->dims);
+            r.contextSelected.ToDevice(DataDevice::CUDA, std::vector<int>{r.device}, false);
+            r.contextSelected.Allocate(false);
+            FastllmCudaCurrentThreadStreamWaitEvent(ws.ready);
+            AssertInFastLLM(FastllmCudaMemcpyPeerAsyncCurrentThread(r.device, r.contextSelected.cudaData,
+                tp.devices.front(), selected->cudaData, selected->GetBytes()), "Draft TP context transfer failed.");
+            input = &r.contextSelected;
+        }
+        std::vector<Data> views(draftLayers), parts(draftLayers);
+        std::vector<const Data *> raw, norms, weights;
+        for (int i = 0; i < draftLayers; ++i) {
+            const std::string p = "dspark.layers." + std::to_string(i) + ".self_attn.";
+            Data &qkv = *weight[p + "mergeqkv.weight"].multiDeviceDatas.at(r.device);
+            views[i].FakeFrom(qkv, (size_t)heads * draftHeadDim * embed_dim * sizeof(uint16_t));
+            views[i].Resize({2 * width, embed_dim});
+            weights.push_back(&views[i]);
+            norms.push_back(weight[p + "k_norm.weight"].multiDeviceDatas.at(r.device));
+        }
+        // Batch the K/V row views without packing or copying the weights.
+        bool batched = FastllmCudaNaiveDraftKVProject(*input, weights, r.contextRaw, r.contextPointers);
+        for (int i = 0; i < draftLayers; ++i) {
+            if (batched) {
+                parts[i].FakeFrom(r.contextRaw, (size_t)i * rows * 2 * width * sizeof(uint16_t));
+                parts[i].Resize({1, rows, 2 * width});
+                raw.push_back(&parts[i]);
+            } else {
+                DraftLinear(*input, views[i], r.contextLayers[i].raw);
+                raw.push_back(&r.contextLayers[i].raw);
+            }
+        }
+        auto &kv = rank ? r.tpKV : context.kv;
+        AssertInFastLLM(FastllmCudaNaiveDraftKV(raw, norms, start + begin, kv, kvHeads,
+            draftHeadDim, draftWindow, draftWindow + draftBlock, draftEps, draftTheta), "Draft TP KV append failed.");
+        FastllmCudaEventRecordCurrentThread(r.done);
+    });
+    for (size_t rank = 1; rank < tp.devices.size(); ++rank)
+        FastllmCudaCurrentThreadStreamWaitEvent(ws.tpRanks[rank]->done);
+    context.committed = start + hidden.dims[1];
+    return true;
+}
+
+bool NaiveN05FlashModel::RunDraftTP(int anchor, DraftContext &context, Data &output) {
+    if (!draftTP) return false;
+    auto &tp = *draftTP;
+    auto &ws = *context.workspace;
+    const int ranks = tp.devices.size();
+    const int heads = draftHeads / tp.attentionDivisor, kvHeads = draftKvHeads / tp.attentionDivisor;
+    const bool shortAttention = std::min(context.committed, draftWindow - 1) + draftBlock <= 256;
+    const int slot = shortAttention ? 0 : 1;
+    auto local = [&](const std::string &name, int device) -> Data & { return *weight[name].multiDeviceDatas.at(device); };
+    auto uploadInputs = [&](int rank) {
+        auto &r = *ws.tpRanks[rank];
+        auto upload = [&](Data &x, DataType type, void *value) {
+            if (x.dims.empty()) {
+                x.dataType = type; x.UpdateUnitSize(); x.Resize({1});
+                x.ToDevice(DataDevice::CUDA, std::vector<int>{r.device}, false); x.Allocate(false);
+            }
+            FastllmCudaCopyFromHostToDevice(x.cudaData, value, sizeof(int));
+        };
+        float token = anchor; int live = context.committed + 1;
+        upload(r.id, FLOAT32, &token); upload(r.live, INT32, &live);
+    };
+    auto body = [&](int rank) {
+        auto &r = *ws.tpRanks[rank];
+        auto &kv = rank ? r.tpKV : context.kv;
+        auto w = [&](const std::string &name) -> Data & { return local(name, r.device); };
+        FastllmCudaNaiveDraftInput(r.id, w("model.embed_tokens.weight"), w("dspark.mask_embedding"), r.live,
+                                  draftBlock, r.hidden, r.positions);
+        for (int i = 0; i < draftLayers; ++i) {
+            const std::string p = "dspark.layers." + std::to_string(i) + ".";
+            auto &b = r.layers[i];
+            KimiK3RMSNorm(r.hidden, w(p + "input_layernorm.weight"), draftEps, b.normed);
+            DraftLinear(b.normed, w(p + "self_attn.mergeqkv.weight"), b.qkv);
+            AssertInFastLLM(FastllmCudaNaiveDraftQKV(b.qkv, w(p + "self_attn.q_norm.weight"), w(p + "self_attn.k_norm.weight"),
+                r.positions, r.live, kv[i].first, kv[i].second, b.q, heads, kvHeads, draftHeadDim, draftWindow, draftEps, draftTheta), "Draft TP QKV failed.");
+            FastllmCudaNaiveDraftAttention(b.q, kv[i].first, kv[i].second, r.live, heads, kvHeads, draftHeadDim,
+                draftWindow, shortAttention, b.scores, b.attention);
+            DraftLinear(b.attention, w(p + "self_attn.o_proj.weight"), b.output);
+            if (tp.attentionDivisor > 1) FastllmCudaNaiveDraftTPReduce(tp.group, rank, b.output);
+            AddTo(r.hidden, b.output);
+            KimiK3RMSNorm(r.hidden, w(p + "post_attention_layernorm.weight"), draftEps, b.normed);
+            DraftLinear(b.normed, w(p + "mlp.gateup_proj.weight"), b.gateUp);
+            FastllmCudaNaiveDraftSwiGLU(b.gateUp, b.gate);
+            DraftLinear(b.gate, w(p + "mlp.down_proj.weight"), b.output);
+            FastllmCudaNaiveDraftTPReduce(tp.group, rank, b.output);
+            AddTo(r.hidden, b.output);
+        }
+        KimiK3RMSNorm(r.hidden, w("dspark.norm.weight"), draftEps, r.normalized);
+    };
+    bool useGraph = GetFastllmEnv().cudaGraph && !ws.disabled;
+    if (useGraph && !ws.tpRanks[0]->graphs[slot].exec) {
+        tp.Run(uploadInputs);
+        tp.Run([&](int rank) { body(rank); ForceDeviceSync(); });
+        std::vector<int> ready(ranks);
+        auto allReady = [&]() { return std::all_of(ready.begin(), ready.end(), [](int value) { return value != 0; }); };
+        tp.Run([&](int rank) { ready[rank] = FastllmCudaGraphPrepareCaptureDevice(); });
+        bool pool = allReady() && FastllmCudaGraphMemoryPoolBegin();
+        bool ok = pool;
+        if (pool) {
+            tp.Run([&](int rank) { FastllmCudaClearThreadError(); ready[rank] = FastllmCudaGraphBeginCapture(); });
+            ok = allReady();
+            tp.Run([&](int rank) {
+                if (!ready[rank]) return;
+                if (ok) body(rank);
+                ready[rank] = FastllmCudaGraphEndCapture(&ws.tpRanks[rank]->graphs[slot].graph) && !FastllmCudaGetThreadError();
+            });
+            ok = FastllmCudaGraphMemoryPoolEnd(ws.graphs[slot].reserved) && ok && allReady();
+            if (ok) {
+                tp.Run([&](int rank) { auto &g = ws.tpRanks[rank]->graphs[slot]; ready[rank] = FastllmCudaGraphInstantiate(g.graph, &g.exec); });
+                ok = allReady();
+            }
+        }
+        if (!ok) {
+            tp.Run([&](int rank) { ws.tpRanks[rank]->graphs[slot].Clear(); FastllmCudaClearLastError(); FastllmCudaClearThreadError(); });
+            ws.graphs[slot].Clear(); ws.disabled = true; useGraph = false;
+        }
+    }
+    tp.Run([&](int rank) {
+        uploadInputs(rank);
+        auto &r = *ws.tpRanks[rank];
+        if (useGraph) AssertInFastLLM(FastllmCudaGraphLaunch(r.graphs[slot].exec), "Draft TP graph launch failed.");
+        else body(rank);
+        FastllmCudaEventRecordCurrentThread(r.done);
+    });
+    for (size_t rank = 1; rank < tp.devices.size(); ++rank)
+        FastllmCudaCurrentThreadStreamWaitEvent(ws.tpRanks[rank]->done);
+    Copy(ws.tpRanks[0]->normalized, output);
+    return true;
+}
+
 #endif
 
 std::shared_ptr<NaiveN05FlashModel::DraftContext> NaiveN05FlashModel::CreateDraftContext() {
@@ -67,6 +384,11 @@ std::shared_ptr<NaiveN05FlashModel::DraftContext> NaiveN05FlashModel::CreateDraf
     if (idleDraftContext) {
         context->kv.swap(idleDraftContext->kv);
         context->workspace.swap(idleDraftContext->workspace);
+#ifdef USE_CUDA
+        if (context->workspace) for (auto &rank : context->workspace->tpRanks)
+            for (auto &pair : rank->tpKV) for (Data *cache : {&pair.first, &pair.second})
+                if (cache->dims.size() == 3) cache->Resize({1, 0, cache->dims[2]});
+#endif
         idleDraftContext.reset();
         for (auto &pair : context->kv)
             for (Data *cache : {&pair.first, &pair.second})
@@ -480,6 +802,7 @@ bool NaiveN05FlashModel::AppendDraftContextFused(Data &hidden, int start, DraftC
 void NaiveN05FlashModel::AppendDraftContext(Data &hidden, int start, DraftContext &context) {
 #ifdef USE_CUDA
     ApplyDraftDevice();
+    if (AppendDraftContextTP(hidden, start, context)) return;
     if (AppendDraftContextFused(hidden, start, context)) return;
     int length = hidden.dims[1];
     // Only the last window - 1 context positions can be visible to the next block.
@@ -583,6 +906,9 @@ void NaiveN05FlashModel::CommitDraftContext(TargetCapture &capture, int tokens,
 
 Data NaiveN05FlashModel::RunDraft(int anchor, DraftContext &context) {
     Data normalized;
+#ifdef USE_CUDA
+    if (RunDraftTP(anchor, context, normalized)) return normalized;
+#endif
     if (RunDraftGraph(anchor, context, normalized)) return normalized;
 #ifdef USE_CUDA
     ApplyDraftDevice();
