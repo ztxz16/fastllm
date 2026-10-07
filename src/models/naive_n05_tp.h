@@ -25,6 +25,8 @@ struct NaiveN05FlashModel::TPDecodeState {
         TargetWorkspace buffers;
         TargetCapture features;
         Data logitsPartial, logitsCandidates;
+        // Bounded staging for one decode/verify block.
+        Data historyDevice{BFLOAT16}, historyHost{BFLOAT16};
         void *graph = nullptr, *exec = nullptr;
         bool ok = true;
         std::vector<void *> communicationPointers;
@@ -36,7 +38,7 @@ struct NaiveN05FlashModel::TPDecodeState {
     std::vector<int> sequenceRegions, sequenceCapacities;
     uint64_t ncclGeneration = 0;
     int capacity = 0, region = 0, rows = 1;
-    bool verifying = false;
+    bool verifying = false, collectHidden = false;
     LogitsSelection selection;
     bool warmed = false, captured = false, disabled = false, active = false;
     void ClearGraphs();

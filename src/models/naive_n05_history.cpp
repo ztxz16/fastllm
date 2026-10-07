@@ -21,8 +21,13 @@ bool NaiveN05FlashModel::SetSaveHistoryChat(bool save) {
 
 std::shared_ptr<NaiveN05FlashModel::HistoryChunk> NaiveN05FlashModel::BeginHistoryChunk(
         const std::vector<std::pair<Data, Data>> &kv, int past, int length) {
+    return BeginHistoryChunk(kv.front().first, past, length);
+}
+
+std::shared_ptr<NaiveN05FlashModel::HistoryChunk> NaiveN05FlashModel::BeginHistoryChunk(
+        const Data &key, int past, int length) {
     std::lock_guard<std::mutex> guard(historyMutex);
-    auto it = activeHistory.find(&kv);
+    auto it = activeHistory.find(&key);
     if (!saveHistoryChat || it == activeHistory.end() ||
         it->second.length != past || historyBytesPerToken == 0) return nullptr;
     auto &state = it->second;
@@ -32,6 +37,22 @@ std::shared_ptr<NaiveN05FlashModel::HistoryChunk> NaiveN05FlashModel::BeginHisto
     chunk->length = rows;
     chunk->bytes = rows * historyBytesPerToken;
     chunk->layers.resize(block_cnt);
+    if (!tpDevices.empty()) {
+        // Ranks write disjoint KV-head columns into one canonical host archive.
+        // Replicated KV heads and index keys are stored only once.
+        for (int layer = 0; layer < block_cnt; ++layer) {
+            const auto &cfg = slidingLayers[layer] ? sliding : full;
+            for (int part = 0; part < 2; ++part) {
+                Data &dst = part ? chunk->layers[layer].second : chunk->layers[layer].first;
+                int width = part ? cfg.kvHeads * cfg.valueDim :
+                    cfg.kvHeads * cfg.headDim + (slidingLayers[layer] ? 0 : indexDim);
+                dst.dataType = BFLOAT16;
+                dst.Resize({1, rows, width});
+                dst.Allocate(false);
+                dst.lockInCPU = true;
+            }
+        }
+    }
     return chunk;
 }
 
@@ -59,12 +80,76 @@ void NaiveN05FlashModel::CopyHistoryTensor(const Data &source, Data &target, int
     }
 }
 
+void NaiveN05FlashModel::CopyTensorParallelHistory(const Data &source, Data &target,
+        int length, int layer, int rank, bool value) {
+    const auto &cfg = slidingLayers[layer] ? sliding : full;
+    const int ranks = tpDevices.size();
+    if (ranks > cfg.kvHeads && rank % (ranks / cfg.kvHeads)) return;
+    const int headDim = value ? cfg.valueDim : cfg.headDim;
+    const int width = std::max(1, cfg.kvHeads / ranks) * headDim;
+    const int begin = rank * cfg.kvHeads / ranks * headDim;
+    const int index = !value && !slidingLayers[layer] ? indexDim : 0;
+    AssertInFastLLM(target.dims == std::vector<int>({1, length, cfg.kvHeads * headDim + index}),
+                    "Naive TP: invalid host history layout.");
+    Data host;
+    if (source.dataDevice != DataDevice::CPU) CopyHistoryTensor(source, host, length);
+    const auto *data = source.dataDevice == DataDevice::CPU ? source.cpuData : host.cpuData;
+    for (int row = 0; row < length; ++row) {
+        const uint16_t *src = (const uint16_t *)data + (size_t)row * (width + index);
+        uint16_t *dst = (uint16_t *)target.cpuData + (size_t)row * target.dims[2];
+        std::memcpy(dst + begin, src, width * sizeof(uint16_t));
+        if (index && rank == 0)
+            std::memcpy(dst + cfg.kvHeads * headDim, src + width, index * sizeof(uint16_t));
+    }
+}
+
+void NaiveN05FlashModel::RestoreTensorParallelHistoryRank(Data &cache, int layer,
+        bool value, int capacity, int rank) {
+#ifdef USE_CUDA
+    AssertInFastLLM(cache.dims.size() == 3, "Naive TP: invalid restored cache dimensions.");
+    const auto &cfg = slidingLayers[layer] ? sliding : full;
+    const int ranks = tpDevices.size(), length = cache.dims[1];
+    const int headDim = value ? cfg.valueDim : cfg.headDim;
+    const int width = std::max(1, cfg.kvHeads / ranks) * headDim;
+    const int index = !value && !slidingLayers[layer] ? indexDim : 0;
+    AssertInFastLLM(cache.dataDevice == DataDevice::CPU && cache.dataType == BFLOAT16 &&
+                    cache.dims == std::vector<int>({1, length, cfg.kvHeads * headDim + index}) &&
+                    cache.cpuData && !cache.isFake && !cache.isPagedKVCache,
+                    "Naive TP: invalid restored host history cache.");
+    const int device = tpDevices[rank], begin = rank * cfg.kvHeads / ranks * headDim;
+    FastllmCudaSetDevice(device);
+    Data host(BFLOAT16, {1, length, width + index});
+    host.Allocate(false);
+    for (int row = 0; row < length; ++row) {
+        const uint16_t *src = (const uint16_t *)cache.cpuData + (size_t)row * cache.dims[2];
+        uint16_t *dst = (uint16_t *)host.cpuData + (size_t)row * (width + index);
+        std::memcpy(dst, src + begin, width * sizeof(uint16_t));
+        if (index) std::memcpy(dst + width, src + cfg.kvHeads * headDim, index * sizeof(uint16_t));
+    }
+    auto *local = cache.multiDeviceDatas.at(device);
+    const int required = (std::max(length, capacity) + 127) / 128 * 128;
+    // Expansion reallocates even when its requested capacity is unchanged.
+    // Preserve adopted allocations and graph addresses when they already fit.
+    if (local->expansionDims.size() != 3 || local->expansionDims[1] < required) {
+        if (!local->dims.empty()) local->Resize({1, 0, width + index});
+        local->Expansion({1, required, width + index});
+    }
+    local->Resize(host.dims);
+    FastllmCudaCopyFromHostToDevice(local->cudaData, host.cpuData, host.GetBytes());
+#endif
+}
+
 void NaiveN05FlashModel::FinishHistoryChunk(
         const std::vector<std::pair<Data, Data>> &kv,
         const std::shared_ptr<HistoryChunk> &chunk) {
+    FinishHistoryChunk(kv.front().first, chunk);
+}
+
+void NaiveN05FlashModel::FinishHistoryChunk(const Data &key,
+        const std::shared_ptr<HistoryChunk> &chunk) {
     if (!chunk) return;
     std::lock_guard<std::mutex> guard(historyMutex);
-    auto it = activeHistory.find(&kv);
+    auto it = activeHistory.find(&key);
     if (it == activeHistory.end()) return;
     auto &state = it->second;
     state.spans.push_back({chunk, chunk->length});
@@ -98,12 +183,14 @@ bool NaiveN05FlashModel::TryRestoreHistoryCache(std::vector<int> &tokens, int &c
 }
 
 void NaiveN05FlashModel::OnResponseContextCreated(ResponseContext *context) {
-    RestoreTensorParallelCache(context);
     std::shared_ptr<const HistoryMemory> pending;
     {
         std::lock_guard<std::mutex> guard(historyMutex);
         pending.swap(pendingHistory);
-        if (!saveHistoryChat || !context->multimodalInput.empty()) return;
+        if (!saveHistoryChat || !context->multimodalInput.empty()) {
+            RestoreTensorParallelCache(context);
+            return;
+        }
     }
     HistoryMemory state;
     if (pending) {
@@ -120,7 +207,11 @@ void NaiveN05FlashModel::OnResponseContextCreated(ResponseContext *context) {
         }
         AssertInFastLLM(remaining == 0, "Incomplete Naive history archive.");
         if (draftEnabled) {
-            auto draft = std::make_shared<DraftContext>();
+            std::shared_ptr<DraftContext> draft;
+            {
+                std::lock_guard<std::mutex> guard(historyMutex);
+                draft = CreateDraftContext();
+            }
             draft->committed = state.length;
             int first = std::max(0, state.length - draftWindow + 1);
             draft->restoredHidden = Data(BFLOAT16, {1, state.length - first, embed_dim});
@@ -173,14 +264,16 @@ void NaiveN05FlashModel::OnResponseContextCreated(ResponseContext *context) {
         context->intParams["promptLen"] = context->inputTokens;
         context->intParams["index"] = -1;
     }
+    RestoreTensorParallelCache(context);
     std::lock_guard<std::mutex> guard(historyMutex);
-    activeHistory[&context->pastKeyValues] = std::move(state);
+    activeHistory[&context->pastKeyValues.front().first] = std::move(state);
 }
 
 void NaiveN05FlashModel::OnResponseContextRemoved(ResponseContext *context) {
+    const Data *key = context->pastKeyValues.empty() ? nullptr : &context->pastKeyValues.front().first;
     RecycleTensorParallelCache(context);
     std::lock_guard<std::mutex> guard(historyMutex);
-    activeHistory.erase(&context->pastKeyValues);
+    activeHistory.erase(key);
     auto draft = draftContexts.find(&context->pastKeyValues);
     if (draft != draftContexts.end()) {
         const auto &s = *draft->second;
@@ -188,7 +281,7 @@ void NaiveN05FlashModel::OnResponseContextRemoved(ResponseContext *context) {
             std::cout << "[Naive DSpark] rounds=" << s.rounds << " proposed=" << s.proposed
                       << " accepted=" << s.accepted << " acceptance=" << (double)s.accepted / s.proposed
                       << " tokens_per_round=" << 1.0 + (double)s.accepted / s.rounds << std::endl;
-        if (!saveHistoryChat && (s.workspace || !s.kv.empty()))
+        if (s.workspace || !s.kv.empty())
             idleDraftContext = std::move(draft->second);
         draftContexts.erase(draft);
     }
@@ -197,7 +290,7 @@ void NaiveN05FlashModel::OnResponseContextRemoved(ResponseContext *context) {
 void NaiveN05FlashModel::TryRecordResponseContext(ResponseContext *context) {
     std::lock_guard<std::mutex> guard(historyMutex);
     if (!saveHistoryChat || !context || !context->multimodalInput.empty()) return;
-    auto active = activeHistory.find(&context->pastKeyValues);
+    auto active = activeHistory.find(&context->pastKeyValues.front().first);
     if (active == activeHistory.end() || active->second.length <= 0) return;
     // A speculative block may have committed KV ahead of the scheduler when
     // a request stops or is cancelled. Publish only the emitted prefix.

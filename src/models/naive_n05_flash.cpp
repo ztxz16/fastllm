@@ -372,7 +372,8 @@ Data NaiveN05FlashModel::RunTarget(
         FastllmCudaSetLinearExactBatchThreshold(std::max(previousExactThreshold, length + 1));
     Data &firstKey = batch ? batch->Key(0, 0) : pastKeyValues[0].first;
     int pastLength = firstKey.dims.empty() ? 0 : firstKey.dims[1];
-    auto historyChunk = tensorParallel ? nullptr : BeginHistoryChunk(pastKeyValues, pastLength, length);
+    auto historyChunk = tensorParallel ? (capture ? capture->history : nullptr) :
+        BeginHistoryChunk(pastKeyValues, pastLength, length);
     if (capture) capture->history = historyChunk;
     AssertInFastLLM(!slidingLayers[0] && (batch || pastLength + length <= max_positions),
                     "Naive-N0.5 requires a DSA first layer and input within the context window.");
@@ -479,7 +480,7 @@ Data NaiveN05FlashModel::RunTarget(
         positions.ToDevice(q.dataDevice, q.dataDeviceIds);
         auto attend = [&](Data &normed, Data &q, Data &k, Data &v, Data &qkv,
                           Data &positions, Data &pastKey, Data &pastValue,
-                          TargetWorkspace &buf, int length, int reserveCapacity, Data &attn) {
+                          TargetWorkspace &buf, int length, int reserveCapacity, Data &attn, HistoryChunk *historyChunk) {
             Data &packed = buf.packed, &indexKey = buf.indexKey, &indexQ = buf.indexQ;
             Data &indexWeights = buf.indexWeights, &indices = buf.indices;
             int localPast = pastKey.dims.empty() ? 0 : pastKey.dims[1];
@@ -525,8 +526,15 @@ Data NaiveN05FlashModel::RunTarget(
                     packed.CopyFrom(k);
                 }
                 if (historyChunk) {
-                    CopyHistoryTensor(packed, historyChunk->layers[layer].first, historyChunk->length);
-                    CopyHistoryTensor(v, historyChunk->layers[layer].second, historyChunk->length);
+                    if (tensorParallel) {
+                        CopyTensorParallelHistory(packed, historyChunk->layers[layer].first,
+                                                  historyChunk->length, layer, tpRank, false);
+                        CopyTensorParallelHistory(v, historyChunk->layers[layer].second,
+                                                  historyChunk->length, layer, tpRank, true);
+                    } else {
+                        CopyHistoryTensor(packed, historyChunk->layers[layer].first, historyChunk->length);
+                        CopyHistoryTensor(v, historyChunk->layers[layer].second, historyChunk->length);
+                    }
                 }
                 if (decodeWorkspace) {
                     if (graphVerify) FastllmCudaNaiveAppendVerifyCache(pastKey, pastValue, packed, v,
@@ -617,13 +625,14 @@ Data NaiveN05FlashModel::RunTarget(
                 attend(rowNorm, rowQ, rowK, rowV, rowQkv, rowPositions,
                        *batch->Key(sequence, layer).multiDeviceDatas.at(gpu),
                        *batch->Value(sequence, layer).multiDeviceDatas.at(gpu), part, count,
-                       CacheReserveCapacity(batch->configs[sequence]), rowAttention);
+                       CacheReserveCapacity(batch->configs[sequence]), rowAttention,
+                       capture && !capture->batchHistory.empty() ? capture->batchHistory[sequence].get() : nullptr);
                 offset += count;
             }
         } else {
             auto &pastKey = tensorParallel ? *pastKeyValues[layer].first.multiDeviceDatas.at(gpu) : pastKeyValues[layer].first;
             auto &pastValue = tensorParallel ? *pastKeyValues[layer].second.multiDeviceDatas.at(gpu) : pastKeyValues[layer].second;
-            attend(normed, q, k, v, qkv, positions, pastKey, pastValue, buf, length, reserveCapacity, attn);
+            attend(normed, q, k, v, qkv, positions, pastKey, pastValue, buf, length, reserveCapacity, attn, historyChunk.get());
         }
         Linear(attn, localWeight(ap + "o_proj.weight"), Data(), projected);
         reduce(projected);

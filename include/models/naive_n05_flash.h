@@ -80,6 +80,11 @@ namespace fastllm {
         };
         std::shared_ptr<HistoryChunk> BeginHistoryChunk(
             const std::vector<std::pair<Data, Data>> &kv, int past, int length);
+        std::shared_ptr<HistoryChunk> BeginHistoryChunk(const Data &key, int past, int length);
+        void FinishHistoryChunk(const Data &key, const std::shared_ptr<HistoryChunk> &chunk);
+        void CopyTensorParallelHistory(const Data &source, Data &target, int length,
+                                       int layer, int rank, bool value);
+        void RestoreTensorParallelHistoryRank(Data &cache, int layer, bool value, int capacity, int rank);
         static void CopyHistoryTensor(const Data &source, Data &target, int length);
         void FinishHistoryChunk(const std::vector<std::pair<Data, Data>> &kv,
                                 const std::shared_ptr<HistoryChunk> &chunk);
@@ -97,6 +102,7 @@ namespace fastllm {
             bool collectHidden = true;
             std::map<int, Data> hidden;
             std::shared_ptr<HistoryChunk> history;
+            std::vector<std::shared_ptr<HistoryChunk>> batchHistory;
         };
         struct DraftTPState;
         std::shared_ptr<DraftTPState> draftTP;
@@ -169,7 +175,8 @@ namespace fastllm {
         bool HasVerificationGraph() const;
         bool PrepareTensorParallelDecode(const Data &inputIds,
                                         std::vector<std::pair<Data, Data>> &kv, bool verifying,
-                                        const LogitsSelection &selection, const TargetBatch *batch = nullptr);
+                                        const LogitsSelection &selection, const TargetBatch *batch = nullptr,
+                                        bool collectHidden = false);
         Data ForwardTensorParallelDecode(int rank, const Data &inputIds, const Data &positions,
                                         std::vector<std::pair<Data, Data>> &kv,
                                         const GenerationConfig &config, const Data *embedding, TargetCapture *capture,
@@ -209,8 +216,9 @@ namespace fastllm {
         std::vector<std::shared_ptr<const HistoryMemory>> history;
         // LaunchResponseTokens holds dictLocker across lookup and creation.
         std::shared_ptr<const HistoryMemory> pendingHistory;
-        std::map<const std::vector<std::pair<Data, Data>> *,
-                 HistoryMemory> activeHistory;
+        // The first key also identifies requests passed through ForwardBatch's
+        // pointer interface; no second request-to-cache lookup is needed.
+        std::map<const Data *, HistoryMemory> activeHistory;
 
         struct AttentionConfig {
             int heads, kvHeads, headDim, valueDim;
