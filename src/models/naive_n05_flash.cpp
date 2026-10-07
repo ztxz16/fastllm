@@ -537,13 +537,19 @@ Data NaiveN05FlashModel::RunTarget(
             reduce(w2);
             addMlpResidual(w2);
         } else {
-            ToDataType(normed, routerInput, DataType::FLOAT32);
-            Linear(routerInput, localWeight(prefix + ".mlp.gate.weight"), Data(), router);
+            Data &routerWeight = localWeight(prefix + ".mlp.gate.weight");
+            bool hasRouterProbabilities = length == 1 &&
+                FastllmCudaNaiveRouterSigmoid(normed, routerWeight, router);
+            if (!hasRouterProbabilities &&
+                !FastllmCudaNaiveRouterVerify(normed, routerWeight, router)) {
+                ToDataType(normed, routerInput, DataType::FLOAT32);
+                Linear(routerInput, routerWeight, Data(), router);
+            }
             Data &routerBias = localWeight(prefix + ".mlp.gate.e_score_correction_bias");
             auto &executor = *(Executor *)GetExecutor();
             bool fusedRouter = false;
             // The warp-fused sigmoid amortizes selection for multiple rows;
-            // one row is faster with the existing wide sigmoid and selector.
+            // a single row already has sigmoid fused into its router projection.
             if (length > 1 && router.dataDevice == DataDevice::CUDA) {
                 DataDict routerData = {{"logits", &router}, {"index", &expertIndex},
                                        {"score", &expertScore}, {"gateBias", &routerBias}};
@@ -555,7 +561,7 @@ Data NaiveN05FlashModel::RunTarget(
                     executor.Run("FusedSigmoidSelectExpert", routerData, routerFloats, routerInts);
             }
             if (!fusedRouter) {
-                Sigmoid(router, router);
+                if (!hasRouterProbabilities) Sigmoid(router, router);
                 SelectExpert(router, expertIndex, expertScore, num_experts_per_tok,
                              norm_topk_prob, routed_scaling_factor, &routerBias);
             }

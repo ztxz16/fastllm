@@ -24,16 +24,29 @@ __device__ __forceinline__ WarpArgMaxResult WarpArgMax(
     #pragma unroll
     for (int i = 0; i < Items; ++i)
         if (firstIndex + i < size) best = fmaxf(best, keys[i]);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(USE_ROCM)
+    // Ordered integer keys let the hardware warp reduction compare finite
+    // FP32 values without changing their bits, including signed zero.
+    unsigned bits = __float_as_uint(best);
+    unsigned ordered = bits ^ ((bits & 0x80000000u) ? 0xffffffffu : 0x80000000u);
+    ordered = __reduce_max_sync(0xffffffffu, ordered);
+    best = __uint_as_float(ordered ^ ((ordered & 0x80000000u) ? 0x80000000u : 0xffffffffu));
+#else
     #pragma unroll
     for (int delta = 16; delta; delta >>= 1)
         best = fmaxf(best, __shfl_xor_sync(0xffffffffu, best, delta));
+#endif
     int index = 0x7fffffff;
     #pragma unroll
     for (int i = 0; i < Items; ++i)
         if (firstIndex + i < size && keys[i] == best) index = min(index, firstIndex + i);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(USE_ROCM)
+    index = __reduce_min_sync(0xffffffffu, index);
+#else
     #pragma unroll
     for (int delta = 16; delta; delta >>= 1)
         index = min(index, __shfl_xor_sync(0xffffffffu, index, delta));
+#endif
     return {best, index};
 }
 

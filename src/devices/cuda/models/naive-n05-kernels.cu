@@ -57,6 +57,81 @@ __device__ float WarpSum(float x) {
     return x;
 }
 
+// Preserve the 256-thread FP32 GEMV accumulation and ascending reduction
+// tree. Loading all 16 terms before arithmetic hides their memory latency.
+__global__ void RouterSigmoid4096(const BF16 *input, const float *weight,
+                                  float *output) {
+    int t = threadIdx.x, expert = blockIdx.x;
+    __shared__ float sums[8];
+    float values[16], weights[16], partial = 0;
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        values[i] = (float)input[t + i * 256];
+        weights[i] = weight[(size_t)expert * 4096 + t + i * 256];
+    }
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) partial += values[i] * weights[i];
+    #pragma unroll
+    for (int stride = 1; stride < 32; stride *= 2)
+        partial += __shfl_down_sync(0xffffffffu, partial, stride);
+    if (t % 32 == 0) sums[t / 32] = partial;
+    __syncthreads();
+    if (t < 32) {
+        partial = t < 8 ? sums[t] : 0;
+        #pragma unroll
+        for (int stride = 1; stride < 8; stride *= 2)
+            partial += __shfl_down_sync(0xffffffffu, partial, stride);
+        if (t == 0) {
+            float logit = partial + 0.0f;
+            // Match standalone FP32 sigmoid's double-precision division.
+            output[expert] = 1.0 / (1.0 + expf(-logit));
+        }
+    }
+}
+
+// Reuse each expert's weights across a few verify rows while preserving the
+// exact GEMV accumulation order. Sigmoid is fused with multi-row selection.
+template <int Rows>
+__global__ void VerifyRouter4096(const BF16 *input, const float *weight,
+        float *output, int rows, int experts) {
+    const int t = threadIdx.x, first = blockIdx.y * Rows, expert = blockIdx.x;
+    __shared__ float sums[Rows][8];
+    float weights[16], values[Rows][16], partial[Rows]{};
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        weights[i] = weight[(size_t)expert * 4096 + t + i * 256];
+        #pragma unroll
+        for (int row = 0; row < Rows; ++row)
+            values[row][i] = first + row < rows
+                ? (float)input[(size_t)(first + row) * 4096 + t + i * 256] : 0;
+    }
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        #pragma unroll
+        for (int row = 0; row < Rows; ++row) partial[row] += values[row][i] * weights[i];
+    }
+    #pragma unroll
+    for (int row = 0; row < Rows; ++row) {
+        #pragma unroll
+        for (int stride = 1; stride < 32; stride *= 2)
+            partial[row] += __shfl_down_sync(0xffffffffu, partial[row], stride);
+        if (t % 32 == 0) sums[row][t / 32] = partial[row];
+    }
+    __syncthreads();
+    if (t < 32) {
+        #pragma unroll
+        for (int row = 0; row < Rows; ++row) {
+            float value = t < 8 ? sums[row][t] : 0;
+            #pragma unroll
+            for (int stride = 1; stride < 8; stride *= 2)
+                value += __shfl_down_sync(0xffffffffu, value, stride);
+            // Keep the reference GEMV's zero-bias addition, including signed zero.
+            if (t == 0 && first + row < rows)
+                output[(size_t)(first + row) * experts + expert] = value + 0.0f;
+        }
+    }
+}
+
 constexpr int kDraftKVLayersPerLaunch = 16;
 struct DraftKVDestinations {
     BF16 *key[kDraftKVLayersPerLaunch], *value[kDraftKVLayersPerLaunch];
@@ -100,6 +175,31 @@ void Output(fastllm::Data &out, fastllm::DataType type, const std::vector<int> &
     out.ToDevice(fastllm::DataDevice::CUDA, {FastllmCudaGetDevice()}, false);
     out.Allocate(false);
 }
+// Return zero without touching output when the router fast path is unsupported.
+int RouterRows(const fastllm::Data &input, const fastllm::Data &weight,
+               const fastllm::Data &output) {
+    using namespace fastllm;
+    const int device = FastllmCudaGetDevice();
+    auto onDevice = [&](const Data &x) {
+        return x.dataDevice == DataDevice::CUDA && x.dataDeviceIds.size() == 1 &&
+            x.dataDeviceIds[0] == device && x.cudaData;
+    };
+    if (&input == &output || &weight == &output ||
+        (output.cudaData && (output.cudaData == input.cudaData || output.cudaData == weight.cudaData)) ||
+        !onDevice(input) || !onDevice(weight) || input.dataType != BFLOAT16 ||
+        weight.dataType != FLOAT32 || input.dims.empty() || input.dims.back() != 4096 ||
+        weight.dims.size() != 2 || weight.dims[1] != 4096 || weight.dims[0] <= 0 ||
+        weight.strides.size() != 2 || weight.strides[0] != 4096 || weight.strides[1] != 1 ||
+        input.strides.size() != input.dims.size()) return 0;
+    int64_t count = 1;
+    for (int axis = (int)input.dims.size() - 1; axis >= 0; --axis) {
+        if (input.strides[axis] != count || input.dims[axis] <= 0) return 0;
+        count *= input.dims[axis];
+        if (count > 8 * 4096) return 0;
+    }
+    return count / 4096;
+}
+
 void CheckLaunch() {
     auto status = cudaGetLastError();
     if (status != cudaSuccess && FastllmCudaGraphIsCapturingFast()) {
@@ -152,7 +252,6 @@ __global__ void TrimCachePairTiled(T *key, T *value, int keyColumns,
         if (col < stride) data[(size_t)row * stride + col] = rows[i];
     }
 }
-
 
 template <typename T>
 void LaunchTrimCachePair(T *key, T *value, int keyColumns,
@@ -1099,7 +1198,7 @@ constexpr int kSwaThreads = 256;
 // output slices spread the work across SMs; cooperative V loads avoid the
 // reference kernel's dependent global load for every output/slot pair.
 // The softmax tree, BF16 rounding and slot-ordered FP32 FMAs are unchanged.
-template <int MaxKeys, typename Length = int, bool Verify = false>
+template <int MaxKeys, typename Length = int, bool Verify = false, int Threads = kSwaThreads, int OutputTile = kSwaOutputTile>
 __global__ void AttentionShortDecode(const BF16 *q, const BF16 *k, const BF16 *v,
         const float *sink, BF16 *out, int heads, int kvHeads, int keyStride, Length liveKeys) {
     if constexpr (Verify) {
@@ -1117,17 +1216,17 @@ __global__ void AttentionShortDecode(const BF16 *q, const BF16 *k, const BF16 *v
     }
     int keys = Verify ? min(VerifyCount(liveKeys, blockIdx.y), MaxKeys) : (int)liveKeys;
     __shared__ float scores[MaxKeys], scratch[kSwaThreads], maximum, denominator;
-    __shared__ BF16 values[MaxKeys][kSwaOutputTile];
+    __shared__ BF16 values[MaxKeys][OutputTile];
     int h = blockIdx.x, t = threadIdx.x, lane = t % 32, warp = t / 32;
-    int kvHead = h / (heads / kvHeads), firstDim = blockIdx.z * kSwaOutputTile;
-    for (int i = t; i < keys * kSwaOutputTile; i += kSwaThreads) {
-        int row = i / kSwaOutputTile, col = i % kSwaOutputTile;
+    int kvHead = h / (heads / kvHeads), firstDim = blockIdx.z * OutputTile;
+    for (int i = t; i < keys * OutputTile; i += Threads) {
+        int row = i / OutputTile, col = i % OutputTile;
         values[row][col] = v[((size_t)row * kvHeads + kvHead) * kSwaValueDim + firstDim + col];
     }
     float query[kSwaQkDim / 32];
     #pragma unroll
     for (int i = 0; i < kSwaQkDim / 32; ++i) query[i] = (float)q[(size_t)h * kSwaQkDim + lane + i * 32];
-    for (int slot = warp; slot < keys; slot += 8) {
+    for (int slot = warp; slot < keys; slot += Threads / 32) {
         float dot = 0;
         #pragma unroll
         for (int i = 0; i < kSwaQkDim / 32; ++i)
@@ -1137,7 +1236,7 @@ __global__ void AttentionShortDecode(const BF16 *q, const BF16 *k, const BF16 *v
     }
     __syncthreads();
     float bias = sink ? sink[h] : -INFINITY;
-    scratch[t] = t < keys ? fmaxf(bias, scores[t]) : bias;
+    if (t < kSwaThreads) scratch[t] = t < keys ? fmaxf(bias, scores[t]) : bias;
     __syncthreads();
     // Fold the first three stages of the original 256-lane tree into
     // warp-local work; separate scalars keep scratch reuse race-free.
@@ -1156,7 +1255,7 @@ __global__ void AttentionShortDecode(const BF16 *q, const BF16 *k, const BF16 *v
     float probability = t < keys ? expf(scores[t] - maximum) : 0;
     float sum = probability;
     if (t == 0 && sink) sum += expf(bias - maximum);
-    scratch[t] = sum;
+    if (t < kSwaThreads) scratch[t] = sum;
     __syncthreads();
     if (t < 32) {
         float a = scratch[t] + scratch[t + 128];
@@ -1169,7 +1268,7 @@ __global__ void AttentionShortDecode(const BF16 *q, const BF16 *k, const BF16 *v
     __syncthreads();
     if (t < keys) scores[t] = denominator > 0 ? RoundBF16(probability / denominator) : 0;
     __syncthreads();
-    if (t < kSwaOutputTile) {
+    if (t < OutputTile) {
         float result = 0;
         for (int first = 0; first < keys; first += 8) {
             float p[8], value[8];
@@ -1186,6 +1285,39 @@ __global__ void AttentionShortDecode(const BF16 *q, const BF16 *k, const BF16 *v
         }
         out[(size_t)h * kSwaValueDim + firstDim + t] = __float2bfloat16(result);
     }
+}
+
+// Dispatch by workload shape, independent of TP rank count. All variants retain
+// the same QK/softmax/PV arithmetic; only the work assigned to each CTA changes.
+template <bool Verify>
+void LaunchShortAttention(const BF16 *q, const BF16 *k, const BF16 *v,
+        const float *bias, BF16 *out, int rows, int heads, int kvHeads,
+        int keyStride, DecodeKeys keys, bool sliding) {
+    int threads = kSwaThreads, tile = kSwaOutputTile;
+    auto kernel = sliding ? AttentionShortDecode<kSwaWindow, DecodeKeys, Verify>
+                          : AttentionShortDecode<256, DecodeKeys, Verify>;
+    if (heads == 8 || heads == 16) {
+        if constexpr (Verify) {
+            if (rows == 8) {
+                tile = 64;
+                if (heads == 8) {
+                    threads = 1024;
+                    kernel = sliding ? AttentionShortDecode<kSwaWindow, DecodeKeys, true, 1024, 64>
+                                     : AttentionShortDecode<256, DecodeKeys, true, 1024, 64>;
+                } else {
+                    threads = 512;
+                    kernel = sliding ? AttentionShortDecode<kSwaWindow, DecodeKeys, true, 512, 64>
+                                     : AttentionShortDecode<256, DecodeKeys, true, 512, 64>;
+                }
+            }
+        } else {
+            threads = 1024;
+            kernel = sliding ? AttentionShortDecode<kSwaWindow, DecodeKeys, false, 1024>
+                             : AttentionShortDecode<256, DecodeKeys, false, 1024>;
+        }
+    }
+    kernel<<<dim3(heads, rows, kSwaValueDim / tile), threads>>>(
+        q, k, v, bias, out, heads, kvHeads, keyStride, keys);
 }
 
 __global__ void AttentionValues(const float *prob, const BF16 *v, const int *indices,
@@ -2147,6 +2279,40 @@ int DecodeTopKBlocks() {
 }
 }
 
+bool FastllmCudaNaiveRouterSigmoid(const fastllm::Data &input,
+        const fastllm::Data &weight, fastllm::Data &output) {
+    using namespace fastllm;
+    if (RouterRows(input, weight, output) != 1) return false;
+    auto dims = input.dims;
+    dims.back() = weight.dims[0];
+    Output(output, FLOAT32, dims);
+    RouterSigmoid4096<<<weight.dims[0], 256>>>((const BF16 *)input.cudaData,
+        (const float *)weight.cudaData, (float *)output.cudaData);
+    CheckLaunch();
+    return true;
+}
+
+bool FastllmCudaNaiveRouterVerify(const fastllm::Data &input,
+        const fastllm::Data &weight, fastllm::Data &output) {
+    using namespace fastllm;
+    const int rows = RouterRows(input, weight, output);
+    if (rows < 2 || rows >= FastllmCudaGetLinearExactBatchThreshold()) return false;
+    auto dims = input.dims;
+    dims.back() = weight.dims[0];
+    Output(output, FLOAT32, dims);
+    const int experts = weight.dims[0];
+    if (rows >= 4)
+        VerifyRouter4096<4><<<dim3(experts, (rows + 3) / 4), 256>>>(
+            (const BF16 *)input.cudaData, (const float *)weight.cudaData,
+            (float *)output.cudaData, rows, experts);
+    else
+        VerifyRouter4096<2><<<dim3(experts, (rows + 1) / 2), 256>>>(
+            (const BF16 *)input.cudaData, (const float *)weight.cudaData,
+            (float *)output.cudaData, rows, experts);
+    CheckLaunch();
+    return true;
+}
+
 bool FastllmCudaNaiveDecodeGraphSupported() { return DecodeTopKBlocks() > 0; }
 
 void FastllmCudaNaiveAddDecodeRMSNorm(fastllm::Data &hidden,
@@ -2244,15 +2410,12 @@ void FastllmCudaNaiveDecodeAttention(const fastllm::Data &query,
     auto *bias = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
     Output(output, BFLOAT16, {1, 1, heads * valueDim});
     auto *out = (BF16 *)output.cudaData;
-    if (window == kSwaWindow && dim == kSwaQkDim && valueDim == kSwaValueDim) {
-        AttentionShortDecode<kSwaWindow><<<dim3(heads, 1, kSwaValueDim / kSwaOutputTile), kSwaThreads>>>(
-            q, k, v, bias, out, heads, kvHeads, key.dims[2], keys);
-    } else if (!window && !selected && capacity > 0 && capacity <= 256 &&
-               dim == kSwaQkDim && valueDim == kSwaValueDim) {
+    if (dim == kSwaQkDim && valueDim == kSwaValueDim &&
+        (window == kSwaWindow || (!window && !selected && capacity > 0 && capacity <= 256))) {
         // Bound the live length to the capacity captured for this graph.
-        DecodeKeys shortKeys{(const int *)liveKeys.cudaData, capacity};
-        AttentionShortDecode<256><<<dim3(heads, 1, kSwaValueDim / kSwaOutputTile), kSwaThreads>>>(
-            q, k, v, bias, out, heads, kvHeads, key.dims[2], shortKeys);
+        DecodeKeys shortKeys{(const int *)liveKeys.cudaData, window ? window : capacity};
+        LaunchShortAttention<false>(q, k, v, bias, out, 1, heads, kvHeads,
+            key.dims[2], shortKeys, window != 0);
     } else if (window || capacity <= 256) {
         int count = window ? window : capacity;
         AttentionShort<<<heads, 256>>>(q, k, v, selected, bias, out, heads, kvHeads,
@@ -2687,13 +2850,8 @@ void FastllmCudaNaiveGraphVerifyAttention(const fastllm::Data &query,
         auto *v = (const BF16 *)value.cudaData;
         auto *bias = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
         auto *out = (BF16 *)output.cudaData;
-        dim3 grid(heads, rows, kSwaValueDim / kSwaOutputTile);
-        if (window)
-            AttentionShortDecode<kSwaWindow, DecodeKeys, true><<<grid, kSwaThreads>>>(
-                q, k, v, bias, out, heads, kvHeads, key.dims[2], keys);
-        else
-            AttentionShortDecode<256, DecodeKeys, true><<<grid, kSwaThreads>>>(
-                q, k, v, bias, out, heads, kvHeads, key.dims[2], keys);
+        LaunchShortAttention<true>(q, k, v, bias, out, rows, heads, kvHeads,
+            key.dims[2], keys, window != 0);
         CheckLaunch();
         return;
     }

@@ -180,3 +180,12 @@ bool FastllmCudaNaiveExpertPrefill(int device, const uint16_t *input,
     const std::vector<FastllmNaiveFP8ExpertTask> &tasks,
     const float *siluLookup, float *perRouteOutput);
 void FastllmCudaNaiveClearExpertPrefill();
+
+// Single-row BF16 input, FP32 4096-column router, including sigmoid.
+// Returns false without changing output when the layout is unsupported.
+bool FastllmCudaNaiveRouterSigmoid(const fastllm::Data &input,
+    const fastllm::Data &weight, fastllm::Data &output);
+
+// Small multi-row FP32 router with BF16 inputs, preserving exact GEMV arithmetic.
+bool FastllmCudaNaiveRouterVerify(const fastllm::Data &input,
+    const fastllm::Data &weight, fastllm::Data &output);
