@@ -1487,6 +1487,20 @@ if (UNIT_TEST)
                     PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
                     PASS_REGULAR_EXPRESSION "VERIFY GRAPH PASS")
             endforeach()
+            foreach(NAIVE_HISTORY_RANKS 2 4 8)
+                add_test(NAME naive_n05_tp_features_${NAIVE_HISTORY_RANKS}
+                    COMMAND naive_n05_verify_graph_test ${NAIVE_HISTORY_RANKS} feature_graph)
+                set_tests_properties(naive_n05_tp_features_${NAIVE_HISTORY_RANKS}
+                    PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
+                    PASS_REGULAR_EXPRESSION "FEATURE GRAPH PASS")
+                foreach(NAIVE_HISTORY_MODE eager graph)
+                    add_test(NAME naive_n05_tp_history_${NAIVE_HISTORY_RANKS}_${NAIVE_HISTORY_MODE}
+                        COMMAND naive_n05_verify_graph_test ${NAIVE_HISTORY_RANKS} history ${NAIVE_HISTORY_MODE})
+                    set_tests_properties(naive_n05_tp_history_${NAIVE_HISTORY_RANKS}_${NAIVE_HISTORY_MODE}
+                        PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
+                        PASS_REGULAR_EXPRESSION "TP HISTORY PASS")
+                endforeach()
+            endforeach()
             foreach(NAIVE_BATCH_RANKS 2 8)
                 foreach(NAIVE_BATCH_MODE eager graph)
                     add_test(NAME naive_n05_batch_${NAIVE_BATCH_RANKS}_${NAIVE_BATCH_MODE}

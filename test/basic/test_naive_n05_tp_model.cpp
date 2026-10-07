@@ -201,6 +201,276 @@ class Fixture : public NaiveN05FlashModel {
             }
         }
     }
+    bool UseModelSpecificScheduler() const override { return true; }
+    void RunModelSpecificScheduler() override {}
+    void HistoryChecks(bool graph) {
+        auto require = [](bool ok, const char *message) {
+            if (!ok) throw std::runtime_error(message);
+        };
+        auto create = [&](const std::vector<int> &tokens) {
+            GenerationConfig cfg;
+            cfg.top_k = 1;
+            cfg.output_token_limit = 64;
+            cfg.output_logits = true;
+            cfg.input_token_length = tokens.size();
+            // Request creation/restoration must not acquire the forward lock.
+            std::lock_guard<std::mutex> lock(forwardLocker);
+            return responseContextDict.GetHandle(LaunchResponseTokens(tokens, cfg));
+        };
+        auto feed = [&](ResponseContext *ctx, int start, int count) {
+            std::vector<float> ids(count), positions(count), logits;
+            for (int i = 0; i < count; ++i) {
+                ids[i] = ctx->allTokens[start + i];
+                positions[i] = start + i;
+            }
+            Data input(FLOAT32, {1, count}, ids), pos(FLOAT32, {1, count}, positions);
+            Forward(input, Data(), pos, ctx->pastKeyValues, ctx->generationConfig, LastTokensManager(), &logits);
+            return logits;
+        };
+        using Snapshot = std::vector<std::vector<uint16_t>>;
+        auto snapshot = [&](ResponseContext *ctx) {
+            Snapshot result;
+            for (int layer = 0; layer < 2; ++layer)
+                for (int part = 0; part < 2; ++part)
+                    for (int rank = 0; rank < ranks; ++rank) {
+                        Data &root = part ? ctx->pastKeyValues[layer].second : ctx->pastKeyValues[layer].first;
+                        Data local(*root.multiDeviceDatas.at(rank));
+                        local.ToDevice(DataDevice::CPU);
+                        auto *ptr = (uint16_t *)local.cpuData;
+                        result.emplace_back(ptr, ptr + (size_t)local.dims[1] * local.dims[2]);
+                    }
+            return result;
+        };
+        // Restore without a suffix forward so the archive itself can be
+        // compared bitwise with the original per-rank GPU state.
+        auto restoreRanks = [&](Data &cache, int layer, bool value) {
+            const int previous = FastllmCudaGetDevice();
+            struct RestoreDevice {
+                int device;
+                ~RestoreDevice() { FastllmCudaSetDevice(device); }
+            } restore{previous};
+            cache.multiDeviceData = true;
+            cache.dataDeviceIds.clear();
+            for (int rank = 0; rank < ranks; ++rank) {
+                auto *local = new Data(BFLOAT16);
+                cache.multiDeviceDatas[rank] = local;
+                local->dataDevice = DataDevice::CUDA;
+                local->dataDeviceIds = {rank};
+                local->isKVCache = true;
+                cache.dataDeviceIds.push_back(rank);
+                RestoreTensorParallelHistoryRank(cache, layer, value, 128, rank);
+            }
+            cache.FreeSpace();
+            cache.dataDevice = DataDevice::CUDA;
+        };
+        auto checkHost = [&](ResponseContext *ctx, int length, const Snapshot &expected) {
+            require(ctx->cacheLen == length && ctx->preTokens == length, "history hit length mismatch");
+            int item = 0;
+            for (int layer = 0; layer < 2; ++layer)
+                for (int part = 0; part < 2; ++part) {
+                    const Data &root = part ? ctx->pastKeyValues[layer].second : ctx->pastKeyValues[layer].first;
+                    const int heads = layer ? 8 : 4, dim = part ? 16 : 32, index = !part && !layer ? 128 : 0;
+                    const int rows = layer ? std::min(length, 7) : length;
+                    require(root.dataDevice == DataDevice::CPU && !root.multiDeviceData &&
+                                root.dims == std::vector<int>({1, rows, heads * dim + index}),
+                            "host history layout mismatch");
+                    for (int rank = 0; rank < ranks; ++rank, ++item) {
+                        int width = std::max(1, heads / ranks) * dim, begin = rank * heads / ranks * dim;
+                        require(expected[item].size() == (size_t)rows * (width + index), "snapshot dimensions mismatch");
+                        for (int row = 0; row < rows; ++row) {
+                            auto *actual = (const uint16_t *)root.cpuData + (size_t)row * root.dims[2];
+                            auto *ref = expected[item].data() + (size_t)row * (width + index);
+                            require(!std::memcmp(actual + begin, ref, width * 2), "archived KV differs from live rank KV");
+                            if (index)
+                                require(!std::memcmp(actual + heads * dim, ref + width, index * 2),
+                                        "archived index differs");
+                        }
+                    }
+                }
+        };
+        std::vector<int> tokens(36);
+        for (int i = 0; i < 36; ++i) tokens[i] = i * 3 % 251;
+        std::map<int, Snapshot> gold;
+        std::map<int, std::vector<float>> logits;
+        SetCudaGraph(graph);
+        SetSaveHistoryChat(false);
+        auto *base = create(tokens);
+        for (int end = 12; end <= 36; ++end) {
+            logits[end] = feed(base, end == 12 ? 0 : end - 1, end == 12 ? 12 : 1);
+            gold[end] = snapshot(base);
+        }
+        SetSaveHistoryChat(true);
+        auto *seed = create(tokens);
+        for (int end = 12; end <= 36; ++end) {
+            auto out = feed(seed, end == 12 ? 0 : end - 1, end == 12 ? 12 : 1);
+            require(out == logits[end], "history recording changed ordinary logits");
+            require(snapshot(seed) == gold[end], "history recording changed live KV");
+        }
+        TryRecordResponseContext(seed);
+        // Fork far behind the live SWA tail, repeat, shorten and extend.
+        for (int cut : {12, 13, 16, 31, 35, 36}) {
+            std::vector<int> branch(tokens.begin(), tokens.begin() + cut);
+            branch.push_back(249);
+            auto *ctx = create(branch);
+            checkHost(ctx, cut, gold[cut]);
+            // A restored rank cache must match the exact saved GPU state
+            // before computing any suffix, including replicated KV groups.
+            for (int layer = 0; layer < 2; ++layer)
+                for (int part = 0; part < 2; ++part) {
+                    Data &root = part ? ctx->pastKeyValues[layer].second : ctx->pastKeyValues[layer].first;
+                    restoreRanks(root, layer, part != 0);
+                }
+            require(snapshot(ctx) == gold[cut], "restoring host history changed rank KV");
+            feed(ctx, cut, 1);
+            TryRecordResponseContext(ctx);
+            branch.push_back(248);
+            auto *child = create(branch);
+            checkHost(child, cut + 1, snapshot(ctx));
+        }
+        // Re-seed the original archive after deliberate LRU pressure above.
+        TryRecordResponseContext(seed);
+        auto *repeat = create(tokens);
+        checkHost(repeat, 35, gold[35]);
+        feed(repeat, 35, 1); // Exercise automatic CPU->TP conversion in Forward.
+        require(snapshot(repeat) == gold[36], "exact repeated suffix changed KV");
+        auto shorter = std::vector<int>(tokens.begin(), tokens.begin() + 17);
+        checkHost(create(shorter), 16, gold[16]);
+        // Two distinct live request owners share immutable host chunks, then
+        // decode together with different histories and request order.
+        std::vector<int> a(tokens.begin(), tokens.begin() + 20), b(tokens.begin(), tokens.begin() + 31);
+        a.push_back(240);
+        b.push_back(241);
+        ResponseContext *contexts[2] = {create(a), create(b)};
+        feed(contexts[0], 20, 1);
+        feed(contexts[1], 31, 1);
+        for (int step = 0; step < 5; ++step) {
+            std::vector<float> ids;
+            std::vector<Data> positions(2);
+            std::vector<Data *> pos;
+            std::vector<std::pair<Data *, Data *>> kv;
+            std::vector<GenerationConfig> configs;
+            for (int j = 0; j < 2; ++j) {
+                int i = step % 2 ? 1 - j : j;
+                auto *ctx = contexts[i];
+                int past = ctx->pastKeyValues[0].first.dims[1], token = 200 + i + step;
+                ctx->allTokens.push_back(token);
+                ids.push_back(token);
+                Data position(FLOAT32, {1, 1}, {float(past)});
+                positions[j].CopyFrom(position);
+                pos.push_back(&positions[j]);
+                for (auto &layer : ctx->pastKeyValues) kv.emplace_back(&layer.first, &layer.second);
+                configs.push_back(ctx->generationConfig);
+            }
+            Data input(FLOAT32, {1, 2}, ids);
+            ForwardBatch(2, input, {}, pos, {1, 1}, kv, configs, LastTokensManager());
+        }
+        for (auto *ctx : contexts) {
+            TryRecordResponseContext(ctx);
+            auto branch = ctx->allTokens;
+            branch.push_back(250);
+            checkHost(create(branch), ctx->allTokens.size(), snapshot(ctx));
+        }
+        // End every live owner, then exercise the production idle-allocation
+        // transfer on a prefix hit. CPU archive ownership remains independent.
+        {
+            std::lock_guard<std::mutex> lock(dictLocker);
+            std::vector<int> handles;
+            for (const auto &entry : responseContextDict.dicts) handles.push_back(entry.first);
+            for (int handle : handles) {
+                responseContextDict.GetHandle(handle)->isEnding = true;
+                RemoveResponseContext(handle);
+            }
+        }
+        SetSaveHistoryChat(false);
+        SetSaveHistoryChat(true);
+        auto *sole = create(tokens);
+        feed(sole, 0, 12);
+        for (int i = 12; i < 36; ++i) feed(sole, i, 1);
+        auto expectedSole = snapshot(sole);
+        std::vector<void *> pointers;
+        for (auto &layer : sole->pastKeyValues)
+            for (Data *root : {&layer.first, &layer.second})
+                for (auto &rank : root->multiDeviceDatas) pointers.push_back(rank.second->cudaData);
+        TryRecordResponseContext(sole);
+        {
+            std::lock_guard<std::mutex> lock(dictLocker);
+            sole->isEnding = true;
+            RemoveResponseContext(responseContextDict.dicts.begin()->first);
+        }
+        auto *hot = create(tokens);
+        require(hot->cacheLen == 35, "idle allocation lost history hit");
+        if (graph) {
+            size_t i = 0;
+            for (auto &layer : hot->pastKeyValues)
+                for (Data *root : {&layer.first, &layer.second}) {
+                    require(root->dataDevice == DataDevice::CPU && root->cpuData && root->multiDeviceData,
+                            "history hit did not retain private host rows and idle GPU allocation");
+                    for (auto &rank : root->multiDeviceDatas)
+                        require(rank.second->cudaData == pointers.at(i++), "idle GPU allocation was replaced");
+                }
+        }
+        feed(hot, 35, 1);
+        if (graph) {
+            size_t i = 0;
+            for (auto &layer : hot->pastKeyValues)
+                for (Data *root : {&layer.first, &layer.second})
+                    for (auto &rank : root->multiDeviceDatas)
+                        require(rank.second->cudaData == pointers.at(i++), "history upload reallocated idle GPU storage");
+        }
+        require(snapshot(hot) == expectedSole, "idle allocation history restore changed KV");
+        SetSaveHistoryChat(false);
+        require(create(tokens)->cacheLen == 0, "disabled history still hit");
+        std::cout << "TP HISTORY PASS ranks=" << ranks << " graph=" << graph << std::endl;
+    }
+    void FeatureGraphChecks() {
+        draftTargetLayers = {0, 1};
+        std::vector<std::vector<float>> expectedLogits;
+        std::vector<std::map<int, std::vector<char>>> expectedHidden;
+        for (bool graph : {false, true}) {
+            SetCudaGraph(graph);
+            std::vector<std::pair<Data, Data>> kv(2);
+            GenerationConfig cfg;
+            cfg.input_token_length = 12;
+            cfg.output_token_limit = 64;
+            int past = 0;
+            for (int step = 0; step < 7; ++step) {
+                int rows = step ? 1 : 12;
+                std::vector<float> ids(rows), positions(rows);
+                for (int i = 0; i < rows; ++i) {
+                    ids[i] = (past + i) * 3 % 251;
+                    positions[i] = past + i;
+                }
+                Data input(FLOAT32, {1, rows}, ids), pos(FLOAT32, {1, rows}, positions);
+                TargetCapture capture;
+    #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+                int before = verifyGraphLaunches;
+    #endif
+                Data logits = RunDraftTarget(input, pos, kv, cfg, capture);
+                const float *values = (const float *)logits.cpuData;
+                std::map<int, std::vector<char>> hidden;
+                for (auto &item : capture.hidden) {
+                    item.second.ToDevice(DataDevice::CPU);
+                    auto *data = (char *)item.second.cpuData;
+                    hidden[item.first] = std::vector<char>(data, data + item.second.GetBytes());
+                }
+                if (capture.hidden.size() != 2) throw std::runtime_error("single-token draft features missing");
+                if (!graph) {
+                    expectedLogits.emplace_back(values, values + logits.Count(0));
+                    expectedHidden.push_back(std::move(hidden));
+                } else {
+                    RequireCloseLogits(values, expectedLogits[step], "single-token feature graph logits");
+                    if (hidden != expectedHidden[step])
+                        throw std::runtime_error("single-token feature graph changed hidden states");
+    #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+                    if (step >= 3 && verifyGraphLaunches - before != ranks)
+                        throw std::runtime_error("single-token feature graph did not replay");
+    #endif
+                }
+                past += rows;
+            }
+        }
+        std::cout << "FEATURE GRAPH PASS ranks=" << ranks << std::endl;
+    }
     void BatchChecks(bool graph, bool merged) {
         if (!canDoBatchForward) throw std::runtime_error("ordinary TP did not advertise batching");
         if (merged) for (int layer = 0; layer < 2; ++layer) {
@@ -1052,6 +1322,20 @@ int main(int argc, char **argv) {
         SetThreads(4);
         SetDeviceMap({{"cuda:0", 1}});
         FastllmCudaSetDevice(0);
+        if (argc > 2 && std::string(argv[2]) == "feature_graph") {
+            SetCudaEmbedding(true);
+            Fixture fixture(ranks, true, true);
+            fixture.FeatureGraphChecks();
+            return 0;
+        }
+        if (argc > 2 && std::string(argv[2]) == "history") {
+            bool graph = argc <= 3 || std::string(argv[3]) != "eager";
+            SetCudaEmbedding(true);
+            SetCudaGraph(graph);
+            Fixture fixture(ranks, true, true);
+            fixture.HistoryChecks(graph);
+            return 0;
+        }
         if (argc > 2 && std::string(argv[2]) == "selection") {
             SetCudaEmbedding(true); SetCudaGraph(true);
             Fixture fixture(ranks, true, true); fixture.VerifySelections(ranks);
