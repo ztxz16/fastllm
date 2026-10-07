@@ -1573,9 +1573,7 @@ namespace fastllm {
 
     int Qwen4ExpModel::StreamingThreadTpExpertLayer(const std::string &name) const {
 #ifdef USE_CUDA
-        const auto arch = weight.dicts.find("gguf_architecture");
-        if (!threadTpState || threadTpRank >= 0 ||
-            arch == weight.dicts.end() || arch->second != "qwen4exp") return -1;
+        if (!threadTpState || threadTpRank >= 0) return -1;
         if (Qwen4StartsWith(name, kMtpExpertPrefix)) {
             return threadTpState->hostMoeLayers.back() ? -1 : block_cnt;
         }
@@ -1595,9 +1593,7 @@ namespace fastllm {
 
     int Qwen4ExpModel::StreamingThreadTpReplicaLayer(const std::string &name) const {
 #ifdef USE_CUDA
-        const auto arch = weight.dicts.find("gguf_architecture");
         if (!threadTpState || threadTpRank >= 0 ||
-            arch == weight.dicts.end() || arch->second != "qwen4exp" ||
             (!Qwen4StartsWith(name, languagePrefix) && !Qwen4StartsWith(name, "mtp."))) return -1;
         // These projections are replicated unchanged on every TP rank. Keep
         // norms and lookup tables on the host for PrepareWeights and sharing.

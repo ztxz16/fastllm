@@ -126,6 +126,93 @@ static void TestGpuExpertLoadPeak() {
     }
 }
 
+static void TestNativeTpStreaming() {
+    setenv("FASTLLM_TP", "0,1", 1);
+    const auto oldDevices = GetDeviceMap(), oldMoe = GetMoeDeviceMap(), oldLayered = GetLayeredMoeDeviceMap();
+    const int oldLayers = GetMoeDeviceLayers();
+    SetDeviceMap({{"cuda", 1}}); SetMoeDeviceMap({{"cuda", 1}});
+    SetLayeredMoeDeviceMap({{"numa", 1}}); SetMoeDeviceLayers(1);
+    Qwen4ExpModel model;
+    model.weight.dicts = {{"num_hidden_layers", "2"}, {"num_experts", "2"},
+                         {"max_position_embeddings", "16"}, {"ngram_vocab_size_base", "17"}};
+    model.InitParams();
+    SetDeviceMap(oldDevices); SetMoeDeviceMap(oldMoe);
+    SetLayeredMoeDeviceMap(oldLayered); SetMoeDeviceLayers(oldLayers);
+    const int previousDevice = FastllmCudaGetDevice();
+    for (int layer = 0; layer < 2; ++layer) {
+        std::set<std::string> names;
+        std::map<std::string, std::vector<uint8_t>> originals;
+        const std::string prefix = "model.language_model.layers." + std::to_string(layer) + ".";
+        for (int expert = 0; expert < 2; ++expert) for (int part = 0; part < 2; ++part) {
+            const std::string name = prefix + "mlp.experts." + std::to_string(expert) +
+                (part ? ".down_proj.weight" : ".gateup_proj.weight");
+            model.weight.AddEmptyWeight(name, {part ? 256 : 512, 256}, NVFP4_BLOCK_16_E4M3);
+            Data &weight = model.weight[name];
+            weight.blockK = 1; weight.blockM = 16;
+            weight.scales = part ? std::vector<float>{0.25f} : std::vector<float>{0.125f, 0.75f};
+            weight.Allocate();
+            auto &bytes = originals[name]; bytes.resize(weight.GetBytes());
+            for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = (i * 37 + i / 11) % 256;
+            std::memcpy(weight.cpuData, bytes.data(), bytes.size());
+            Check(model.ShouldLoadWeightSeriallyBeforeOthers(name, {}) == (layer == 0),
+                  "native TP streaming did not respect expert placement");
+            names.insert(name);
+        }
+        const std::string replicaName = prefix + "mlp.gate.weight";
+        model.weight.AddEmptyWeight(replicaName, {32, 64}, FP8_E4M3);
+        Data &replica = model.weight[replicaName];
+        replica.blockK = 1; replica.blockM = 128; replica.scales.assign(32, 0.125f);
+        replica.Allocate();
+        originals[replicaName].assign(replica.GetBytes(), uint8_t(0x38));
+        std::memcpy(replica.cpuData, originals[replicaName].data(), replica.GetBytes());
+        names.insert(replicaName);
+        Check(model.ShouldLoadWeightSeriallyBeforeOthers(replicaName, {}),
+              "native TP replica was not scheduled during loading");
+        model.OnWeightLoadGroupStarted(names);
+        model.OnWeightLoadGroupFinished();
+        model.OnWeightLoadGroupFinished(); // The completed group is consumed once.
+        Check(FastllmCudaGetDevice() == previousDevice, "TP streaming changed CUDA device");
+        for (const auto &entry : originals) {
+            Data &source = model.weight[entry.first];
+            const bool isReplica = entry.first == replicaName;
+            if (layer == 1 && !isReplica) {
+                Check(source.cpuData && source.multiDeviceDatas.empty() &&
+                      std::memcmp(source.cpuData, entry.second.data(), entry.second.size()) == 0,
+                      "native TP streaming moved or changed a NUMA expert");
+                continue;
+            }
+            Check(!source.cpuData && source.multiDeviceDatas.size() == 2,
+                  "native TP streaming retained its CPU source");
+            for (int rank = 0; rank < 2; ++rank) {
+                const Data &shard = *source.multiDeviceDatas.at(rank);
+                Check(shard.scales == source.scales && shard.blockK == source.blockK &&
+                      shard.blockM == source.blockM, "native TP streaming changed quantization metadata");
+                std::vector<uint8_t> actual(shard.GetBytes());
+                FastllmCudaSetDevice(rank);
+                FastllmCudaCopyFromDeviceToHost(actual.data(), shard.cudaData, actual.size());
+                if (isReplica) {
+                    Check(actual == entry.second, "native FP8 replica payload changed");
+                    continue;
+                }
+                const bool down = entry.first.find(".down_proj.") != std::string::npos;
+                const int rows = down ? 256 : 512, nr = 256, nc = down ? 128 : 256;
+                Check(shard.dims == std::vector<int>({nr, nc}), "native TP expert shard shape changed");
+                for (int row = 0; row < nr; ++row) for (int column = 0; column < nc; column += 16) {
+                    const int sr = down ? row : row / 128 * 256 + rank * 128 + row % 128;
+                    const int sc = column + (down ? rank * 128 : 0);
+                    Check(std::memcmp(actual.data() + (row * nc + column) / 2,
+                            entry.second.data() + (sr * 256 + sc) / 2, 8) == 0 &&
+                          actual[nr * nc / 2 + (row * nc + column) / 16] ==
+                            entry.second[rows * 256 / 2 + (sr * 256 + sc) / 16],
+                          "native TP expert nibbles or planar scales changed");
+                }
+            }
+            FastllmCudaSetDevice(previousDevice);
+        }
+    }
+    unsetenv("FASTLLM_TP");
+}
+
 int main() {
     try {
         if (FastllmCudaGetDeviceCount() == 0) {
@@ -192,6 +279,7 @@ int main() {
             CheckWeight(model, "mtp.fc_hidden.weight", 0);
         }
         if (FastllmCudaGetDeviceCount() > 1) {
+            TestNativeTpStreaming();
             Qwen4ExpModel model;
             model.block_cnt = 2;
             model.deviceMap = {{"cuda:0", 1}, {"cuda:1", 1}};
