@@ -15146,7 +15146,7 @@ bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
     uint64_t seed = rng();
 
     cudaError_t samplingState =
-        flashinfer::sampling::TopKTopPSamplingFromProb<float, int>(
+        flashinfer::sampling::TopKTopPSamplingFromProb<float, int, 0>(
         cudaProbs, cudaTopKArr, cudaTopPArr, cudaOutput,
         cudaSamplingValid,
         (int *)nullptr,
@@ -16036,7 +16036,8 @@ bool FastllmCudaDFlashTopK(
     cudaError_t state = cudaMemsetAsync(
         scratch.cudaData, 0, scratchBytes, cudaStreamPerThread);
     if (state == cudaSuccess) {
-        state = flashinfer::sampling::TopKDispatch<float, int>(
+        // This entry accepts topk <= 50, deterministic results, and no tie-break mode.
+        state = flashinfer::sampling::TopKDispatch<float, int, 1, true, 128>(
             (float*)logits.cudaData, candidateIds, candidateScores,
             (uint32_t)rows, (uint32_t)topk, (uint32_t)channels,
             rowStates, true, true,
@@ -16317,7 +16318,7 @@ bool FastllmCudaDFlashRejectionSampling(
     if (state == cudaSuccess) {
         static thread_local std::mt19937 rng(std::random_device{}());
         uint64_t seed = ((uint64_t)rng() << 32) | rng();
-        state = flashinfer::sampling::ChainSpeculativeSampling<float, int>(
+        state = flashinfer::sampling::ChainSpeculativeSampling<float, int, 1>(
             draftProbs, cudaDraftTokens, targetProbs, cudaOutput,
             cudaAccepted, cudaEmitted, (uint32_t)batch,
             (uint32_t)draftTokens, (uint32_t)vocabSize,
@@ -16396,7 +16397,7 @@ bool FastllmCudaTopKTopPSamplingToDevice(
     static thread_local std::mt19937 rng(std::random_device{}());
     uint64_t seed = rng();
     cudaError_t samplingState =
-        flashinfer::sampling::TopKTopPSamplingFromProb<float, int>(
+        flashinfer::sampling::TopKTopPSamplingFromProb<float, int, 0>(
         probs, topKArr, topPArr, output,
         (bool *)floatOutput,
         (int *)nullptr,
@@ -16532,7 +16533,7 @@ bool FastllmCudaMtpSampleDraft(float *logits, float *proposalProbs,
     cudaError_t state = cudaMemcpyAsync(proposalProbs, ws.a,
         (size_t)batch * vocabSize * sizeof(float), cudaMemcpyDeviceToDevice, stream);
     if (state == cudaSuccess) {
-        state = flashinfer::sampling::SamplingFromProb<float, int>(
+        state = flashinfer::sampling::SamplingFromProb<float, int, 1>(
             proposalProbs, ws.output, ws.valid, nullptr, batch, vocabSize, true,
             nullptr, FastllmMtpSamplingSeed(), nullptr, 0, stream);
     }
@@ -16563,7 +16564,7 @@ bool FastllmCudaMtpRejectionSampling(float *logits, float *proposalProbs,
     if (state == cudaSuccess)
         state = cudaMemsetAsync(ws.emitted, 0, batch * sizeof(int), stream);
     if (state == cudaSuccess) {
-        state = flashinfer::sampling::ChainSpeculativeSampling<float, int>(
+        state = flashinfer::sampling::ChainSpeculativeSampling<float, int, 1>(
             proposalProbs, ws.draftIds, ws.a, ws.output, ws.accepted, ws.emitted,
             batch, draftTokens, vocabSize, true, nullptr, FastllmMtpSamplingSeed(),
             nullptr, 0, stream);

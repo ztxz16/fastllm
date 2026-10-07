@@ -324,6 +324,17 @@
     }                                                                      \
   }
 
+// A 16-byte load of T can never select a wider vector, on any architecture.
+// Keep the generic dispatcher for callers with a different alignment contract.
+#define DISPATCH_16B_VEC_SIZE(dtype, vec_size, VEC_SIZE, ...) \
+  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {             \
+    if constexpr (VEC_SIZE <= 16 / sizeof(dtype)) {           \
+      __VA_ARGS__                                            \
+    } else {                                                 \
+      return cudaErrorInvalidValue;                          \
+    }                                                        \
+  })
+
 #define DISPATCH_COMPUTE_CAP_DECODE_NUM_STAGES_SMEM(compute_capacity, NUM_STAGES_SMEM, ...) \
   if (compute_capacity.first >= 8) {                                                        \
     constexpr uint32_t NUM_STAGES_SMEM = 2;                                                 \
@@ -334,6 +345,20 @@
   }
 
 namespace flashinfer {
+
+// -1 preserves runtime dispatch; 0/1 instantiate only the caller's fixed policy.
+// Reject mismatched arguments rather than silently changing sampling semantics.
+template <int POLICY = -1, typename Launch>
+cudaError_t DispatchSamplingBool(bool value, Launch launch) {
+  static_assert(POLICY >= -1 && POLICY <= 1, "Invalid sampling boolean policy");
+  if constexpr (POLICY == -1) {
+    if (value) return launch(std::true_type{});
+    return launch(std::false_type{});
+  } else {
+    if (value != bool(POLICY)) return cudaErrorInvalidValue;
+    return launch(std::bool_constant<bool(POLICY)>{});
+  }
+}
 
 template <typename T1, typename T2>
 __forceinline__ __device__ __host__ constexpr T1 ceil_div(const T1 x, const T2 y) noexcept {

@@ -160,6 +160,7 @@ int main() {
         FilterCase();
         ChainCase("identical", {.6f,.3f,.1f}, {.6f,.3f,.1f}, 3, 32);
         ChainCase("different", {.6f,.3f,.1f}, {.3f,.5f,.2f}, 3, 17);
+        ChainCase("two-wide", {.6f,.3f,.1f}, {.3f,.5f,.2f}, 3, 18);
         ChainCase("loop exit", {.6f,.3f,.1f}, {.95f,.04f,.01f}, 1, 32);
         ChainCase("disjoint", {0,1,0}, {1,0,0}, 3, 32);
         std::puts("MTP rejection sampling: PASS");
