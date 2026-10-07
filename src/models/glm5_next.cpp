@@ -2380,7 +2380,10 @@ namespace fastllm {
 #ifdef USE_CUDA
         const std::string routedDevice = SelectMoeDeviceForLayer(deviceLayer);
         const bool routedOnNumas = routedDevice == "numa" || routedDevice.rfind("numa:", 0) == 0;
-        if (threadTpRank >= 0) {
+        const bool shardedRouted = threadTpRank >= 0 && threadTpOwner->shardedMoeLayers[deviceLayer];
+        // Resident TP ranks compute their own intermediate-channel slice.
+        // The caller's FFN AllReduce combines routed and shared partials.
+        if (threadTpRank >= 0 && !shardedRouted) {
             const bool localNumasDecode = sequence == 1 && routedOnNumas;
             if (!localNumasDecode || threadTpRank != 0) runShared();
             if (localNumasDecode) {
@@ -2426,6 +2429,42 @@ namespace fastllm {
             &weight[mlp + "gate.e_score_correction_bias"]);
 
         Data routedOutput;
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        if ((routedDevice == "cuda" || routedDevice.rfind("cuda:", 0) == 0) &&
+            weights.size() >= 4 && weights[2] && weights[2]->dataType == DataType::DATA_GGUF_FORMAT) {
+            runShared();
+            const int previous = FastllmCudaGetDevice();
+            struct RestoreDevice { int device; ~RestoreDevice() { FastllmCudaSetDevice(device); } } restore{previous};
+            const auto &owner = weights[2]->dataDeviceIds;
+            AssertInFastLLM(weights[2]->dataDevice == DataDevice::CUDA && owner.size() == 1,
+                "GLM GGUF resident experts must be loaded on one CUDA device.");
+            // Copy only activations when the MoE owner differs from the dense
+            // rank; the original TP input remains on its rank's device.
+            Data localInput, activation, workspace;
+            Data *routedInput = &input;
+            if (input.dataDevice != DataDevice::CUDA || input.dataDeviceIds != owner) {
+                localInput.CopyFrom(input);
+                localInput.ToDevice(DataDevice::CUDA, owner);
+                routedInput = &localInput;
+            }
+            expertIndex.ToDevice(DataDevice::CUDA, owner);
+            expertScore.ToDevice(DataDevice::CUDA, owner);
+            FastllmCudaSetDevice(owner[0]);
+            AssertInFastLLM(moeAtype == DataType::BFLOAT16 &&
+                FastllmCudaMergeMOEGlm5GGUFResident(*routedInput, activation, workspace,
+                    routedOutput, weights.data(), (int)weights.size(),
+                    static_cast<const int32_t *>(expertIndex.cudaData),
+                    static_cast<const float *>(expertScore.cudaData), num_experts_per_tok, swigluLimit),
+                "Unsupported GLM GGUF resident MoE dtype, quantization or shape.");
+            routedOutput.ToDevice(DataDevice::CUDA, output.dataDeviceIds);
+            FastllmCudaSetDevice(previous);
+            ApplyDeviceMap(deviceMap, deviceLayer + 1, block_cnt);
+            AddTo(output, routedOutput);
+            input.Reshape(outputDims);
+            output.Reshape(outputDims);
+            return;
+        }
+#endif
 #if defined(USE_CUDA) && defined(USE_NUMAS)
 #ifndef USE_ROCM
         if (sequence <= FASTLLM_CUDA_MOE_CACHE_MAX_BATCH && input.dataType == DataType::BFLOAT16 &&
@@ -2455,6 +2494,10 @@ namespace fastllm {
 
         Data w1, w2, w3, tempInput, tempOutput;
         Data moeInputTemp, moeOutputTemp;
+#ifdef USE_CUDA
+        if (shardedRouted) ApplyDeviceMap(deviceMap, deviceLayer + 1, block_cnt);
+        else
+#endif
         ApplyMoeDeviceMapForLayer(deviceLayer);
         MergeMOEBlock(
             &input, &expertIndex, &expertScore,

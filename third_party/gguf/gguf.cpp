@@ -1036,10 +1036,11 @@ namespace fastllm {
                         );
                     } else if (it.type == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32 ||
                                 it.type == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP16) {
-                        // CPU Qwen4 embedding can decode individual GGUF rows.
+                        // CPU embedding can decode individual GGUF rows for
+                        // models that keep the imported lookup table unchanged.
                         // Preserve floating-point imports and the CUDA embedding
                         // path, which still require the original dense layout.
-                        const bool packedEmbedding = arch == "qwen4_exp" &&
+                        const bool packedEmbedding = (arch == "qwen4_exp" || arch == "glm5_next") &&
                             name == "token_embd.weight" &&
                             (GetLowMemMode() || !GetCudaEmbedding()) &&
                             ggml_is_quantized(tensors[i].first.type);

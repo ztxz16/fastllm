@@ -1,4 +1,9 @@
 #include "gguf.h"
+#include "executor.h"
+#include "models/glm5_next.h"
+#ifdef USE_CUDA
+#include "devices/cuda/fastllm-cuda.cuh"
+#endif
 #include "../../src/models/glm5_next_gguf.h"
 #include <algorithm>
 #include <cmath>
@@ -8,6 +13,27 @@
 #include <stdexcept>
 #include <unistd.h>
 using namespace fastllm;
+namespace fastllm {
+struct Glm5NextGGUFTestAccess {
+    static void InitTp(Glm5NextModel &model, bool resident = false, bool sharded = false) {
+        model.block_cnt = 4;
+        model.kdaHeads = model.num_attention_heads = 4;
+        model.qkNopeHeadDim = model.valueHeadDim = 8;
+        model.kvLoraRank = 16;
+        model.denseMlpLayers.assign(4, false);
+        model.deviceMap = {{"cuda:0", 1}};
+        model.moeDeviceMap = resident ? std::map<std::string, int>{{"cuda:0",1},{"cuda:1",1},{"numa",2}} :
+            std::map<std::string, int>{{"cpu",1}};
+        if (sharded) {
+            model.moeDeviceMap = {{"cuda:0,1",1}};
+            model.layeredMoeDeviceMap = {{"numa",1}};
+            model.moeDeviceLayers = 2;
+        }
+        model.weight.dicts["gguf_architecture"] = "glm5next";
+        model.InitThreadTp();
+    }
+};
+}
 namespace {
 void Check(bool ok, const char *message) { if (!ok) throw std::runtime_error(message); }
 using Bytes = std::vector<uint8_t>;
@@ -54,6 +80,189 @@ void Write(const std::string &path, const std::map<std::string, std::string> &me
     file.write(reinterpret_cast<const char *>(header.data()), header.size());
     file.write(reinterpret_cast<const char *>(payload.data()), payload.size());
     Check(file.good(), "fixture write failed");
+}
+
+void TestEmbedding(const std::string &directory) {
+    const std::string path = directory + "/embedding.gguf";
+    std::vector<float> values(7 * 256);
+    for (size_t i = 0; i < values.size(); ++i) values[i] = std::sin(float(i) * .017f);
+    Tensor tensor{"token_embd.weight", {7, 256}, GGML_TYPE_Q4_K,
+                  Bytes(7 * ggml_row_size(GGML_TYPE_Q4_K, 256))};
+    ggml_type_from_float_ref(GGML_TYPE_Q4_K)(values.data(), tensor.bytes.data(), values.size());
+    Write(path, {}, {tensor});
+    const bool previousCuda = GetCudaEmbedding(), previousLowMem = GetLowMemMode();
+    for (bool lowMem : {false, true}) for (bool cuda : {false, true}) {
+        SetLowMemMode(lowMem); SetCudaEmbedding(cuda);
+        std::vector<ReadGGUFTask> tasks;
+        AppendGGUFTasks("glm5_next", path, tasks);
+        Check(tasks.size() == 1, "GLM embedding task count");
+        auto &task = tasks[0];
+        const bool packed = lowMem || !cuda;
+        Check(task.replaceType == (packed ? GGUFWeightReplaceRule::GGUFWeightReplaceDirect :
+              GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32), "GLM embedding placement policy");
+        Data actualWeight(FLOAT32, {1}), reference(FLOAT32, {1});
+        WeightImportGGUFTensor(&actualWeight, &task.tensor, task.fileName, task.offset, task.replaceType);
+        WeightImportGGUFTensor(&reference, &task.tensor, task.fileName, task.offset,
+                              GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32);
+        auto *storage = actualWeight.cpuData;
+        if (packed) Check(actualWeight.dataType == DATA_GGUF_FORMAT &&
+                          actualWeight.GetBytes() == tensor.bytes.size(), "GLM embedding expanded");
+        auto &executor = *static_cast<Executor *>(GetExecutor());
+        for (DataType type : {FLOAT32, FLOAT16}) {
+            Data ids(type, {1, 5}, {6, 0, 3, 6, 1}), actual, expected;
+            DataDict a{{"input", &ids}, {"weight", &actualWeight}, {"output", &actual}};
+            DataDict b{{"input", &ids}, {"weight", &reference}, {"output", &expected}};
+            executor.RunOnDevice("cpu", "Embedding", a, {}, {});
+            executor.RunOnDevice("cpu", "Embedding", b, {}, {});
+            Check(actual.GetBytes() == expected.GetBytes() &&
+                  std::memcmp(actual.cpuData, expected.cpuData, actual.GetBytes()) == 0,
+                  "GLM packed embedding changed lookup values");
+            ToDataTypeForceCPU(actual, BFLOAT16); ToDataTypeForceCPU(expected, BFLOAT16);
+            Check(actual.dims == expected.dims && actual.GetBytes() == expected.GetBytes() &&
+                  std::memcmp(actual.cpuData, expected.cpuData, actual.GetBytes()) == 0,
+                  "GLM packed embedding changed BF16 activations");
+        }
+        Check(storage == actualWeight.cpuData, "GLM embedding lookup replaced packed storage");
+    }
+    SetLowMemMode(previousLowMem); SetCudaEmbedding(previousCuda);
+    unlink(path.c_str());
+}
+
+int TestStreamingTp() {
+#ifdef USE_CUDA
+    if (FastllmCudaGetDeviceCount() < 2) return 77;
+    setenv("FASTLLM_TP", "0,1", 1);
+    SetCudaSharedExpert(true);
+    Glm5NextModel model;
+    Glm5NextGGUFTestAccess::InitTp(model);
+    const std::string base = "model.language_model.layers.0.";
+    std::map<std::string, std::vector<int>> shapes = {
+        {"self_attn.q_proj.weight", {16, 32}}, {"self_attn.o_proj.weight", {32, 16}},
+        {"self_attn.q_conv1d.weight", {16, 1, 4}}, {"self_attn.A_log", {4}},
+        {"mlp.shared_experts.gateup_proj.weight", {32, 32}},
+        {"mlp.shared_experts.down_proj.weight", {32, 16}},
+        {"mlp.gate.weight", {8, 32}}, {"hc_attn_fn", {4, 32}}};
+    std::map<std::string, std::vector<float>> expected;
+    std::set<std::string> names;
+    for (const auto &item : shapes) {
+        const std::string name = base + item.first;
+        Data &w = model.weight[name]; w = Data(FLOAT32, item.second); w.Allocate();
+        auto &values = expected[name]; values.resize(w.Count(0));
+        for (size_t i = 0; i < values.size(); ++i) values[i] = i * .125f;
+        std::memcpy(w.cpuData, values.data(), w.GetBytes());
+        w.name = name; w.isModelWeight = true; names.insert(name);
+        Check(model.ShouldLoadWeightSeriallyBeforeOthers(name, {}), "TP dense group missing");
+    }
+    for (const std::string name : {base + "mlp.experts.0.down_proj.weight",
+                                  std::string("model.language_model.embed_tokens.weight")}) {
+        Check(!model.ShouldLoadWeightSeriallyBeforeOthers(name, {}), "TP streamed host weight");
+    }
+    FastllmCudaSetDevice(1);
+    model.OnWeightLoadGroupStarted(names);
+    model.OnWeightLoadGroupFinished();
+    Check(FastllmCudaGetDevice() == 1, "streaming TP changed caller CUDA device");
+    model.OnWeightLoadGroupFinished();
+    for (const auto &item : shapes) {
+        const std::string name = base + item.first;
+        auto &source = model.weight[name];
+        Check(!source.cpuData && source.multiDeviceData && source.multiDeviceDatas.size() == 2 &&
+              source.dims == item.second, "streamed source retained CPU memory or changed shape");
+        const bool row = item.first == "self_attn.q_proj.weight" ||
+            item.first == "self_attn.q_conv1d.weight" || item.first == "self_attn.A_log";
+        const bool column = item.first.find("o_proj") != std::string::npos ||
+            item.first.find("down_proj") != std::string::npos;
+        const bool gate = item.first.find("gateup_proj") != std::string::npos;
+        const int rows = item.second[0], cols = expected[name].size() / rows;
+        for (int rank : {0, 1}) {
+            auto &shard = *source.multiDeviceDatas.at(rank);
+            Check(shard.cudaData && !shard.isFake, "streamed shard has no owner");
+            std::vector<float> actual(shard.Count(0)), reference;
+            FastllmCudaSetDevice(rank);
+            FastllmCudaCopyFromDeviceToHost(actual.data(), shard.cudaData, shard.GetBytes());
+            for (int r = 0; r < rows; ++r) for (int c = 0; c < cols; ++c) {
+                if (row && r / (rows / 2) != rank) continue;
+                if (column && c / (cols / 2) != rank) continue;
+                if (gate && (r % (rows / 2)) / (rows / 4) != rank) continue;
+                reference.push_back(expected[name][r * cols + c]);
+            }
+            Check(actual == reference, "streamed TP weight differs from reference shard");
+        }
+    }
+    {
+        Glm5NextModel mixed;
+        Glm5NextGGUFTestAccess::InitTp(mixed, true);
+        for (int layer=0; layer<4; ++layer) {
+            const std::string name = "model.language_model.layers." + std::to_string(layer) + ".mlp.experts.0.down_proj.weight";
+            mixed.specialWeights[name] = "linearColumn";
+            mixed.specialWeightLayerIds[name] = layer;
+            Data &w = mixed.weight[name];
+            w = Data(DATA_GGUF_FORMAT, GGML_TYPE_IQ3_XXS, {256,256});
+            w.isModelWeight = true; w.Allocate();
+            std::memset(w.cpuData, 0, w.GetBytes());
+            Check(!mixed.ShouldDelaySpecialWeightCudaMove(name), "resident upload delayed until warmup");
+            const bool moved = mixed.MoveSpecialWeightToCudaIfNeeded(name, w);
+            Check(moved == (layer<2), "mixed layer placement");
+            if (layer<2) Check(w.cudaData && !w.cpuData && w.numasData.empty() &&
+                w.dataDeviceIds == std::vector<int>{layer}, "resident weight retained host source or wrong GPU");
+            else Check(w.cpuData && w.dataDevice == CPU, "NUMA layer moved to CUDA");
+        }
+    }
+    {
+        Glm5NextModel sharded;
+        Glm5NextGGUFTestAccess::InitTp(sharded, false, true);
+        for (int layer=0; layer<4; ++layer) {
+            std::set<std::string> group;
+            std::map<std::string, Bytes> originals;
+            for (int part=0; part<2; ++part) {
+                const std::string name = "model.language_model.layers." + std::to_string(layer) +
+                    ".mlp.experts.0." + (part ? "down_proj.weight" : "gateup_proj.weight");
+                sharded.specialWeights[name] = part ? "linearColumn" : "linearSwiglu";
+                sharded.specialWeightLayerIds[name] = layer;
+                Data &w = sharded.weight[name];
+                w = Data(DATA_GGUF_FORMAT, part ? GGML_TYPE_IQ3_XXS : GGML_TYPE_IQ2_XXS,
+                    part ? std::vector<int>{256,512} : std::vector<int>{1024,256});
+                w.name=name; w.isGGUFData=w.isModelWeight=true; w.Allocate();
+                for (size_t i=0; i<w.GetBytes(); ++i) w.cpuData[i]=uint8_t(i*17+i/37);
+                originals[name]=Bytes(w.cpuData,w.cpuData+w.GetBytes());
+                Check(sharded.ShouldDelaySpecialWeightCudaMove(name)==(layer<2), "TP expert upload policy");
+                Check(sharded.ShouldLoadWeightSeriallyBeforeOthers(name,{})==(layer<2), "TP expert streaming group");
+                Check(!sharded.MoveSpecialWeightToCudaIfNeeded(name,w), "TP expert uploaded before split");
+                group.insert(name);
+            }
+            sharded.OnWeightLoadGroupStarted(group);
+            sharded.OnWeightLoadGroupFinished();
+            for (const auto &name:group) {
+                auto &w=sharded.weight[name];
+                if (layer>=2) { Check(w.cpuData && !w.multiDeviceData,"NUMA expert was split"); continue; }
+                Check(!w.cpuData && w.numasData.empty() && w.multiDeviceDatas.size()==2,
+                    "TP expert retained host source");
+                const bool down=name.find("down_proj")!=std::string::npos;
+                const size_t rowBytes=ggml_row_size(ggml_type(w.ggmlType),w.dims[1]);
+                for (int r=0;r<2;++r) {
+                    const auto &local=*w.multiDeviceDatas.at(r);
+                    Check(local.dataDeviceIds==std::vector<int>{r} && local.cudaData && !local.cpuData,
+                        "TP expert shard ownership");
+                    Bytes actual(local.GetBytes()), expected;
+                    FastllmCudaSetDevice(r);
+                    FastllmCudaCopyFromDeviceToHost(actual.data(),local.cudaData,actual.size());
+                    const auto &bytes=originals.at(name);
+                    for (int row=0;row<w.dims[0];++row) {
+                        if (!down && (row%512)/256!=r) continue;
+                        const size_t first=row*rowBytes+(down ? r*rowBytes/2 : 0);
+                        const size_t count=down ? rowBytes/2 : rowBytes;
+                        expected.insert(expected.end(),bytes.begin()+first,bytes.begin()+first+count);
+                    }
+                    Check(actual==expected,"TP expert shard changed packed quantization blocks");
+                }
+            }
+        }
+    }
+    unsetenv("FASTLLM_TP");
+    std::cout << "PASS: GLM-5.3 GGUF streaming TP weights and released CPU sources\n";
+    return 0;
+#else
+    return 77;
+#endif
 }
 
 void Run(const std::string &directory) {
@@ -117,11 +326,12 @@ void Run(const std::string &directory) {
     unlink(first.c_str());unlink(second.c_str());
 }
 }
-int main() {
+int main(int argc, char **argv) {
     char directory[]="/tmp/fastllm-glm53-gguf-XXXXXX";
     try {
+        if (argc == 2 && std::string(argv[1]) == "--tp-load") return TestStreamingTp();
         Check(mkdtemp(directory)!=nullptr,"temporary directory");
-        Run(directory);rmdir(directory);
+        Run(directory);TestEmbedding(directory);rmdir(directory);
         std::cout << "PASS: GLM-5.3 GGUF shard mapping, packed IQ experts, KDA decay and MLA layout\n";
         return 0;
     } catch (const std::exception &e) { std::cerr << e.what() << "\n"; return 1; }

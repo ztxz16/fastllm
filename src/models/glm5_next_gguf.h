@@ -12,8 +12,8 @@ namespace glm5_next_detail {
 // tensors with K transposed per head. Consume the source names so restoration
 // is idempotent and ordinary HF checkpoints never enter these conversions.
 inline void RestoreGgufWeights(WeightMap &weights, int layers, int heads,
-                              int keyDim, int valueDim, int latentDim) {
-    for (int layer = 0; layer < layers; ++layer) {
+                              int keyDim, int valueDim, int latentDim, int firstLayer = 0) {
+    for (int layer = firstLayer; layer < layers; ++layer) {
         const std::string prefix = "model.language_model.layers." + std::to_string(layer) + ".";
         const std::string attn = prefix + "self_attn.";
         auto decay = weights.weight.find(attn + "gguf_decay");

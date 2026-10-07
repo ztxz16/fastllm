@@ -1367,6 +1367,8 @@ def make_normal_llm_model(args, startup_progress = None):
                 model_type == "glm5_next" or
                 text_model_type == "glm5_next_text"
             )
+            if is_glm5_next_model:
+                is_thread_tp_moe_model = True
             is_deepseek_v4_model = (
                 architecture in ("DeepseekV4ForCausalLM",
                                  "DeepSeekV4ForCausalLM") or
@@ -1640,6 +1642,13 @@ def make_normal_llm_model(args, startup_progress = None):
         # dense GPU weights instead: their many 6.25 MiB and smaller allocations
         # otherwise waste hundreds of MiB at the CUDA allocation granularity.
         # A 64 MiB slab retains 256-byte alignment and the existing compute paths.
+        args.cuda_slab = 64
+    if (is_glm5_next_model and gguf_config is not None and cuda_slab_auto and
+            _uses_thread_tp(getattr(args, "tp", "")) and
+            (args.moe_device_layers >= 0 or _uses_cuda_device(args.moe_device))):
+        # Resident expert TP doubles the number of small packed allocations.
+        # Pack them into the existing weight slabs instead of paying CUDA's
+        # allocation granularity for each shard. Explicit --cuda_slab wins.
         args.cuda_slab = 64
     if ((args.device and args.device.find("numa") != -1) or args.moe_device.find("numa") != -1 or
         (args.device and args.device.find("tfacc") != -1) or args.moe_device.find("tfacc") != -1):

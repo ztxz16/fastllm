@@ -93,6 +93,18 @@ class CudaWeightSlabDefaultsTest(unittest.TestCase):
         self.load(extra=("--moe_device_layers", "2"))
         self.llm.set_cuda_slab.assert_called_with(225)
 
+    def test_glm_gguf_resident_tp_packs_weights_and_respects_explicit_override(self):
+        glm = self.root / "glm.gguf"
+        write_gguf(glm, "glm5next")
+        tp = ("--tp", "0,1", "--moe_device_layers", "30")
+        self.load(glm, extra=tp)
+        self.llm.set_cuda_slab.assert_called_with(64)
+        for size in (0, 128):
+            self.load(glm, extra=tp+("--cuda_slab", str(size)))
+            self.llm.set_cuda_slab.assert_called_with(size)
+        self.load(glm, extra=("--tp", "0,1"))
+        self.llm.set_cuda_slab.assert_called_with(0)
+
     def test_existing_multicuda_defaults_and_explicit_zero(self):
         for model_type, devices, expected in [
                 ("deepseek_v4", "0,1", 256),

@@ -885,6 +885,11 @@ if (UNIT_TEST)
         add_executable(glm5_next_gguf_test test/basic/test_glm5_next_gguf.cpp)
         target_link_libraries(glm5_next_gguf_test PRIVATE fastllm)
         fastllm_add_checked_test(glm5_next_gguf glm5_next_gguf_test "PASS: GLM-5.3 GGUF" 60)
+        if (USE_CUDA)
+            fastllm_add_checked_test(glm5_next_gguf_tp_load glm5_next_gguf_test
+                "PASS: GLM-5.3 GGUF streaming TP" 60 "--tp-load")
+            set_tests_properties(glm5_next_gguf_tp_load PROPERTIES LABELS "cuda;gguf;tp" RUN_SERIAL TRUE)
+        endif()
 
         add_executable(cpu_gguf_iq4_xs_test test/basic/test_cpu_gguf_iq4_xs.cpp)
         target_link_libraries(cpu_gguf_iq4_xs_test PRIVATE fastllm)

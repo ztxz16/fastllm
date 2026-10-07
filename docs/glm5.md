@@ -24,6 +24,8 @@ GLM-5.3-Flash 的 ModelOpt NVFP4 路由专家在单设备 CUDA 后端（包括 `
 
 路由专家保留 GGUF 混合量化格式；加载时还原 KDA 衰减参数和拆分、转置的 MLA KV-B 权重。支持 AVX512 BF16 的 CPU 在 IQ4_XS 单行计算时直接读取压缩权重，在寄存器中解码并完成 BF16 点积，省去临时 FP32/BF16 权重缓冲，保留原有舍入和累加顺序；多行计算和其他 CPU 继续使用分块 BF16 回退，权重不整体展开。KDA 的 128 维 Q8 投影使用 CUDA 反量化 GEMM，避免进入要求 K 维度按 256 对齐的 MMQ 内核。
 
+CPU 词嵌入保留 GGUF 量化表，按 token 解码所需行，避免将完整词表展开为 FP32；显式 CUDA 词嵌入仍使用浮点导入。混合 TP 模式按层加载、恢复并上传非专家权重，随后释放 CPU 源数据，初始化 rank 时直接接管已上传的分片。NUMA 专家仍由各 rank 共享。这些优化自动启用，无需额外环境变量；分组上传目前针对 GGUF TP 路径。
+
 双卡按层串行、单 NUMA 的启动示例（按机器调整线程数）：
 
 ~~~bash
@@ -36,6 +38,23 @@ FT_NUMAS=1 numactl --cpunodebind=0 --membind=0 \
 ~~~
 
 GGUF 的单 token BF16 混合推理可通过 `--moe_cuda_cache 12G` 为每张显卡设置 12 GiB 专家缓存，支持 IQ2_XXS/IQ2_S gate/up 与 IQ3_XXS/IQ4_XS down。GPU 保留压缩权重，并遵循 GGUF 的 Q8_K/BF16 激活、限幅和路由权重顺序；多行输入保留原 NUMA 路径。当前缓存还会在主机保存一份 NUMA 重排前的 GGUF 专家快照，混合格式按最大专家大小对齐，因此会增加主机内存占用。
+
+需要降低主存占用时，可将部分 MoE 层固定放到 CUDA，其余层使用 NUMA 动态分流。例如 45 层、前三层为 dense 的 GLM-5.3-Flash：
+
+~~~bash
+FT_NUMAS=1 numactl -C 0-31 -m 0 \
+  ftllm chat /data/models/GLM-5.3-Flash-UD-IQ2_XXS-00001-of-00004.gguf \
+  --device cuda:0 --tp 0,1 \
+  --moe_device '{"cuda:0":7,"cuda:1":4,"numa":34}' --threads 20 \
+  --dtype bfloat16 --atype bfloat16 --moe_atype bfloat16 \
+  --moe_cuda_cache 0 --moe_cpu_cache 0 --mtp 0
+~~~
+
+该映射将第 3–6 层的全部路由专家放到 GPU 0，第 7–10 层放到 GPU 1（层号从 0 开始），其余 34 个 MoE 层保留在 NUMA。GPU 层在加载时上传并释放 CPU 权重，不占用动态专家缓存，不再参与 CPU/GPU 分流。TP 的注意力与共享专家仍由两卡协同计算；每个驻留 MoE 层由映射指定的一张卡计算路由专家。设备映射的数值按全部模型层分配，因此 GPU 0 的 7 层包含前三个 dense 层。
+
+进一步降低主存可使用 `--moe_device '{"cuda:0":9,"cuda:1":6,"numa":30}'`，将第 3–8 层放到 GPU 0、第 9–14 层放到 GPU 1，每卡驻留 6 个 MoE 层。上述 UD-IQ2_XXS 权重比每卡 4 层配置多移出约 9.04 GiB 主机权重。双 24 GiB 显卡、512-token 输入和 640-token 输出的短测可运行，但显存峰值已达约 23.48 / 23.22 GiB；更长上下文需重新预留 KV 与工作区空间。新增层包含 IQ4_XS down，prefill 会使用下面说明的 GEMV 路径，增加驻留层数不保证 prefill 提速。
+
+要让纯 GPU MoE 层也参与张量并行，使用 `--tp 0,1 --moe_device numa --moe_device_layers 30`。`moe_device_layers` 指最后 30 个模型层使用 NUMA；前 15 层中包含 3 个 dense 层和 12 个 MoE 层。每个 GPU MoE 层按中间维度等分 gate/up 的行与 down 的列，各卡独立计算路由和专家分片，随后复用 FFN AllReduce 合并路由专家与共享专家的部分结果。其余 NUMA 层保持原有多卡动态分流。GGUF 分片按层加载并直接上传，保留压缩格式，不保存完整 CPU 副本；GLM GGUF 的 GPU 专家 TP 默认启用 64 MiB 权重 slab，减少大量小分配的显存浪费，可用已有的 `--cuda_slab` 参数覆盖。
 
 驻留 GGUF 路径支持 BF16 激活、IQ2_XXS/IQ2_S gate/up 与 IQ3_XXS/IQ4_XS down，复用 GLM 缓存路径的限幅、score-before-down、量化边界和有序归约。支持 INT8 MMA 的 NVIDIA GPU（SM75+）上，超过 32 行且 down 为 IQ3_XXS 时自动按专家聚合 token，使用 grouped MMQ；保留每 256 个值一组的正 FP32 Q8_K scale 和最近偶数舍入，不引入 V4.1 的 FP8 量化边界。长输入按最多 1024 行分块，限制临时显存，无需额外开关。decode/小批量、IQ4_XS down 和不支持 MMQ 的设备保留原来的驻留 GEMV 路径；IQ4_XS 的 BF16 down 不会被改为 Q8。可运行 `cuda_glm5_gguf_resident` 验证两卡上的量化组合、32/33 行分派边界、1025 行分块尾部及 CPU 权重释放。
 

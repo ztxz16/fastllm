@@ -34,6 +34,12 @@ namespace fastllm {
         GetTensorMap(const std::vector<std::string> &tensorNames) override;
 
         void OnModelWeightsLoaded() override;
+        int GetWeightLoadPriority(const std::string &tensorName,
+                const std::vector<std::pair<std::string, DataType>> &mappedWeights) const override;
+        bool ShouldLoadWeightSeriallyBeforeOthers(const std::string &tensorName,
+                const std::vector<std::pair<std::string, DataType>> &mappedWeights) const override;
+        void OnWeightLoadGroupStarted(const std::set<std::string> &weightNames) override;
+        void OnWeightLoadGroupFinished() override;
 
         void SetDataType(DataType dataType) override;
 
@@ -94,11 +100,15 @@ namespace fastllm {
                 const std::string &output) override;
 
     private:
+        friend struct Glm5NextGGUFTestAccess;
         struct ThreadTpState;
         std::unique_ptr<ThreadTpState> threadTpState;
         ThreadTpState *threadTpOwner = nullptr;
         int threadTpRank = -1;
         void InitThreadTp();
+        int ThreadTpExpertLayer(const std::string &name) const;
+        int StreamingThreadTpLayer(const std::string &name) const;
+        void StageThreadTpWeight(const std::string &name);
         void PrepareThreadTp();
         void ThreadTpAllReduce(Data &data);
         void RemoveThreadTpRequest(const std::vector<std::pair<Data, Data>> *key);
