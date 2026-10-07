@@ -393,9 +393,9 @@ bool Compute(const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &out
     // Gate/up and activation quantization do not read down weights. Run them
     // during the remaining DMA, and keep its wait out of scheduler timings.
     if (events) {
-        if (events->gateDone && cudaEventRecord(events->gateDone, cudaStreamPerThread) != cudaSuccess) return false;
-        if (events->downReady && cudaStreamWaitEvent(cudaStreamPerThread, events->downReady, 0) != cudaSuccess) return false;
-        if (events->downStart && cudaEventRecord(events->downStart, cudaStreamPerThread) != cudaSuccess) return false;
+        if (events->gateDone && cudaEventRecord(static_cast<cudaEvent_t>(events->gateDone), cudaStreamPerThread) != cudaSuccess) return false;
+        if (events->downReady && cudaStreamWaitEvent(cudaStreamPerThread, static_cast<cudaEvent_t>(events->downReady), 0) != cudaSuccess) return false;
+        if (events->downStart && cudaEventRecord(static_cast<cudaEvent_t>(events->downStart), cudaStreamPerThread) != cudaSuccess) return false;
     }
     if (stages & 2) {
         switch (downType) {

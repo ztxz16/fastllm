@@ -1856,7 +1856,8 @@ bool FastllmCudaMoeGGUFCacheCompute(
 // Gate weights are already ready on the calling stream. Down weights may
 // still be uploading; optional timing events exclude that wait from compute.
 struct FastllmCudaMoeGGUFStageEvents {
-    cudaEvent_t downReady = nullptr, gateDone = nullptr, downStart = nullptr;
+    // Keep this host-facing header independent of CUDA runtime types.
+    void *downReady = nullptr, *gateDone = nullptr, *downStart = nullptr;
 };
 bool FastllmCudaMoeGGUFCacheComputeStaged(
         const fastllm::Data &input, fastllm::Data &gateOutput,
