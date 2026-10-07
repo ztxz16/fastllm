@@ -18,6 +18,8 @@ struct NaiveN05FlashModel::TargetWorkspace {
 struct NaiveN05FlashModel::TPDecodeState {
     enum Mode { Warm, Prepare, Capture, Replay } mode = Warm;
     struct Rank {
+        // Own the allocation longer than its input/position/length views.
+        Data inputStorage;
         TargetWorkspace buffers;
         TargetCapture features;
         Data logitsPartial, logitsCandidates;

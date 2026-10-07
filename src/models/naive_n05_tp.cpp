@@ -13,6 +13,22 @@
 
 namespace fastllm {
 
+namespace {
+// Expanded BF16 KV caches keep physical strides/capacity when logical length
+// changes. Other layouts retain Data::Resize and its layout invalidation rules.
+void ResizeKVLength(Data &cache, int length, int width) {
+    if (length >= 0 && cache.dataType == BFLOAT16 && !cache.cudaNativeNvfp4Layout &&
+        cache.tpLayout == TP_LAYOUT_NONE && cache.unitSize == 2 && cache.unitSizeDiv == 1 &&
+        cache.dims.size() == 3 && cache.dims[0] == 1 && cache.dims[2] == width &&
+        cache.expansionDims.size() == 3 && cache.expansionDims[0] == 1 &&
+        cache.expansionDims[1] >= length && cache.expansionDims[2] == width) {
+        cache.dims[1] = length;
+    } else {
+        cache.Resize({1, length, width});
+    }
+}
+}
+
 bool NaiveN05FlashModel::CanReuseTensorParallelCache(const ResponseContext *context) const {
 #ifdef USE_CUDA
     // With a single live handle, removal happens after its last forward and
@@ -379,35 +395,67 @@ Data NaiveN05FlashModel::ForwardTensorParallelDecode(int rank, const Data &input
     auto &r = *state.ranks.at(rank);
     auto &buf = r.buffers;
     if (state.mode != TPDecodeState::Capture) {
-        // Keep these allocations and their CUDA addresses across all replays.
-        auto copyInput = [&](Data &dst, const Data &src) {
-            if (dst.dims.empty()) {
-                dst.dataType = src.dataType;
-                dst.UpdateUnitSize();
-                dst.dataDevice = DataDevice::CUDA;
-                dst.dataDeviceIds = {tpDevices[rank]};
-                dst.Resize(src.dims);
-                dst.Allocate();
-            }
-            if (src.dataDevice == DataDevice::CUDA)
-                FastllmCudaCopyFromDeviceToDevice(dst.cudaData, src.cudaData, src.GetBytes());
-            else FastllmCudaCopyFromHostToDevice(dst.cudaData, src.cpuData, src.GetBytes());
-        };
-        copyInput(buf.inputIds, inputIds);
-        Data localPositions(positions);
-        ToDataType(localPositions, FLOAT32);
-        copyInput(buf.positions, localPositions);
-        int lengths[8];
-        for (int row = 0; row < state.rows; ++row) lengths[row] = kv[0].first.dims[1] + row + 1;
-        if (buf.liveKeys.dims.empty()) {
+        const size_t rowBytes = state.rows * sizeof(float);
+        const bool hostInputs = inputIds.dataDevice == DataDevice::CPU &&
+            positions.dataDevice == DataDevice::CPU && inputIds.dataType == FLOAT32 &&
+            positions.dataType == FLOAT32 &&
+            inputIds.GetBytes() == rowBytes && positions.GetBytes() == rowBytes;
+        if (r.inputStorage.dims.empty() && buf.inputIds.dims.empty() && hostInputs) {
+            r.inputStorage.dataType = FLOAT32;
+            r.inputStorage.dataDevice = DataDevice::CUDA;
+            r.inputStorage.dataDeviceIds = {tpDevices[rank]};
+            r.inputStorage.Resize({3, state.rows});
+            r.inputStorage.Allocate();
+            buf.inputIds.FakeFrom(r.inputStorage, 0);
+            buf.inputIds.Resize(inputIds.dims);
+            buf.positions.FakeFrom(r.inputStorage, rowBytes);
+            buf.positions.Resize(positions.dims);
+            buf.liveKeys.FakeFrom(r.inputStorage, 2 * rowBytes);
             buf.liveKeys.dataType = INT32;
-            buf.liveKeys.UpdateUnitSize();
-            buf.liveKeys.dataDevice = DataDevice::CUDA;
-            buf.liveKeys.dataDeviceIds = {tpDevices[rank]};
             buf.liveKeys.Resize({state.rows});
-            buf.liveKeys.Allocate();
         }
-        FastllmCudaCopyFromHostToDevice(buf.liveKeys.cudaData, lengths, state.rows * sizeof(int));
+        if (hostInputs && !r.inputStorage.dims.empty()) {
+            // Graph rows are bounded to one decode token or eight verify rows.
+            // Copy integer lengths as bytes, preserving their representation.
+            alignas(16) unsigned char input[3 * 8 * sizeof(float)];
+            std::memcpy(input, inputIds.cpuData, rowBytes);
+            std::memcpy(input + rowBytes, positions.cpuData, rowBytes);
+            for (int row = 0; row < state.rows; ++row) {
+                int length = kv[0].first.dims[1] + row + 1;
+                std::memcpy(input + 2 * rowBytes + row * sizeof(int), &length, sizeof(int));
+            }
+            FastllmCudaCopyFromHostToDevice(r.inputStorage.cudaData, input, 3 * rowBytes);
+        } else {
+            // Keep these allocations and their CUDA addresses across all replays.
+            auto copyInput = [&](Data &dst, const Data &src) {
+                if (dst.dims.empty()) {
+                    dst.dataType = src.dataType;
+                    dst.UpdateUnitSize();
+                    dst.dataDevice = DataDevice::CUDA;
+                    dst.dataDeviceIds = {tpDevices[rank]};
+                    dst.Resize(src.dims);
+                    dst.Allocate();
+                }
+                if (src.dataDevice == DataDevice::CUDA)
+                    FastllmCudaCopyFromDeviceToDevice(dst.cudaData, src.cudaData, src.GetBytes());
+                else FastllmCudaCopyFromHostToDevice(dst.cudaData, src.cpuData, src.GetBytes());
+            };
+            copyInput(buf.inputIds, inputIds);
+            Data localPositions(positions);
+            ToDataType(localPositions, FLOAT32);
+            copyInput(buf.positions, localPositions);
+            int lengths[8];
+            for (int row = 0; row < state.rows; ++row) lengths[row] = kv[0].first.dims[1] + row + 1;
+            if (buf.liveKeys.dims.empty()) {
+                buf.liveKeys.dataType = INT32;
+                buf.liveKeys.UpdateUnitSize();
+                buf.liveKeys.dataDevice = DataDevice::CUDA;
+                buf.liveKeys.dataDeviceIds = {tpDevices[rank]};
+                buf.liveKeys.Resize({state.rows});
+                buf.liveKeys.Allocate();
+            }
+            FastllmCudaCopyFromHostToDevice(buf.liveKeys.cudaData, lengths, state.rows * sizeof(int));
+        }
         if (state.mode == TPDecodeState::Prepare) return Data();
     }
     if (state.mode == TPDecodeState::Replay) {
@@ -637,7 +685,7 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
             for (int device : tpDevices)
                 for (Data *root : {&kv[layer].first, &kv[layer].second}) {
                     Data &local = *root->multiDeviceDatas.at(device);
-                    local.Resize({1, length, local.dims[2]});
+                    ResizeKVLength(local, length, local.dims[2]);
                 }
         }
     }
@@ -645,8 +693,12 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
         const auto &cfg = slidingLayers[layer] ? sliding : full;
         auto syncMeta = [&](Data &root, int width) {
             const Data &local = *root.multiDeviceDatas.at(tpDevices[0]);
-            root.Resize({1, local.dims[1], width});
-            root.expansionDims = {1, local.expansionDims[1], width};
+            ResizeKVLength(root, local.dims[1], width);
+            if (root.expansionDims.size() == 3) {
+                root.expansionDims[0] = 1;
+                root.expansionDims[1] = local.expansionDims[1];
+                root.expansionDims[2] = width;
+            } else root.expansionDims = {1, local.expansionDims[1], width};
         };
         syncMeta(kv[layer].first, cfg.kvHeads * cfg.headDim + (slidingLayers[layer] ? 0 : indexDim));
         syncMeta(kv[layer].second, cfg.kvHeads * cfg.valueDim);
