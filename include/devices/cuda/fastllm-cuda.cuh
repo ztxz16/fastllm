@@ -1790,7 +1790,7 @@ bool FastllmCudaPrepareMoeCache(
 bool FastllmCudaCanRunMoeCache(
         fastllm::Data **weights, int weightsBatch);
 
-// Snapshot of canonical GGUF or native compact GLM NVFP4 records on this GPU.
+// Snapshot of canonical GGUF or native compact GLM records on this GPU.
 // create permits lazy allocation of a prepared cache; no admission/eviction
 // is performed. The caller must finish
 // using these pointers before the next decode/cache mutation or cache release.
@@ -1798,6 +1798,8 @@ struct FastllmCudaMoePrefillResidents {
     std::vector<const void *> weights; // gate/down pairs, zero-based expert IDs
     int weightType = -1;
     int gateType = -1, downType = -1, hidden = 0, inter = 0;
+    int ownerRank = 0, ownerCount = 1;
+    bool nativeGlm = false;
 };
 bool FastllmCudaGetMoePrefillResidents(fastllm::Data **weights, int experts,
                                   FastllmCudaMoePrefillResidents &view, bool create = false);
@@ -1832,8 +1834,8 @@ struct FastllmCudaMoeGGUFCacheView {
     // and activation scratch use compact order. Entries must be distinct.
     const int32_t *routeMap = nullptr;
     int routeCount = 0;
-    // Temporary DMA records can retain NUMA's cross-interleaved gate/up and
-    // R4 packing. -1 means canonical GGUF; cache admission stays canonical.
+    // Temporary DMA and whole-expert GLM cache records can retain NUMA's
+    // cross-interleaved gate/up and R4 packing. -1 means canonical GGUF.
     int numaGateType = -1, numaDownType = -1;
     // Optional device table of separately allocated canonical records. Disk
     // caches can batch resident experts without copying them into one arena.
@@ -1850,14 +1852,6 @@ bool FastllmCudaMoeGlm5GGUFCacheCompute(
         const fastllm::Data &input, fastllm::Data &activation,
         const FastllmCudaMoeGGUFCacheView &view,
         const float *scores, int topk, float swigluLimit, float *perExpert);
-// Row-sharded expert TP: each rank owns gate/up rows and down output rows.
-// Gather the BF16 gate activations before down; each dot retains its complete
-// reduction dimension, Q8_K blocks, and ordinary cache rounding order.
-bool FastllmCudaMoeGlm5GGUFCacheGate(const fastllm::Data &input,
-        fastllm::Data &activation, const FastllmCudaMoeGGUFCacheView &view,
-        const float *scores, int topk, float swigluLimit);
-bool FastllmCudaMoeGlm5GGUFCacheDown(const fastllm::Data &activation,
-        const FastllmCudaMoeGGUFCacheView &view, float *perExpert);
 // GPU-only GLM GGUF experts; shares the scored cache arithmetic and keeps
 // routing on CUDA. Long prefills are tiled with bounded scratch storage.
 bool FastllmCudaMergeMOEGlm5GGUFResident(

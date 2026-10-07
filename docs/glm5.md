@@ -39,7 +39,7 @@ FT_NUMAS=1 numactl --cpunodebind=0 --membind=0 \
 
 GGUF 的 BF16 混合推理可通过 `--moe_cuda_cache 12G` 为每张显卡设置 12 GiB 专家缓存，支持 IQ2_XXS/IQ2_S gate/up 与 IQ3_XXS/IQ4_XS down。GPU 保留压缩权重，并遵循 GGUF 的 Q8_K/BF16 激活、限幅和路由权重顺序。decode 与最多 9 行的小批验证使用缓存和动态分流，更大批次保留 NUMA 路径。支持的固定页 NUMA 布局直接复用专家权重，避免保存第二份完整主机快照；无法共享的布局保留快照回退。
 
-上述 GGUF 类型配合 `--tp 0,1 --moe_device numa --moe_cuda_cache 16G` 时，缓存专家自动按 TP 分片存储。各卡共享一份频率策略和逻辑专家索引，每次换入、换出更新全部分片；容量按各卡可用预算的最小值规划，因此两卡各存半份权重，可缓存的完整专家数量约为同容量单卡的两倍。实际分配仍为运行时工作区预留显存。gate/up 和 down 均切分输出行，中间交换 BF16 激活，保留完整点积维度和原有舍入顺序；无 GPU P2P 的设备通过固定页主机缓冲交换。未命中专家继续使用 NUMA／多卡动态分流。该缓存由 decode/verify 的路由更新，当前大批 prefill 不填充此 TP 缓存。单卡、零缓存、不满足分片对齐或不支持的格式保留原路径，不需要新增参数。
+上述 GGUF 类型配合 `--tp 0,1 --moe_device numa --moe_cuda_cache 16G` 时，默认按完整专家分卡缓存：专家 `e` 存在 `devices[e % devices.size()]`，遵循 TP 参数中的设备顺序。每卡独立维护频率策略和容量，只换入分配给本卡的专家，实际容量为运行时工作区预留显存后确定，允许各卡不同。缓存直接使用原生 NUMA/R4 权重布局，gate/up 和 down 在所属卡上完成；每条路由的 FP32 结果汇集后按原有 BF16 顺序归约。未命中专家继续使用 NUMA／多卡动态分流。prefill 在两卡上传时填充缓存，后续 chunk 和 decode 复用；decode/verify 继续更新频率和驻留专家。该模式自动启用，无需新增参数；单卡、零缓存及不支持的格式保留既有路径。
 
 需要降低主存占用时，可将部分 MoE 层固定放到 CUDA，其余层使用 NUMA 动态分流。例如 45 层、前三层为 dense 的 GLM-5.3-Flash：
 
@@ -68,7 +68,7 @@ GGUF 混推的小批量验证复用专家注册时的 NUMA 适用性检查结果
 
 真实命中率应使用 `get_moe_cuda_cache_route_stats()` 在请求前后的差值计算 `resident_routes / routes`，覆盖分给 CPU 的专家，并排除预取查询；`get_moe_cuda_cache_stats()` 的 hits/misses 是查询计数，口径不同。
 
-TP 缓存沿用 `--moe_cache_*` 参数控制共享策略，其中 `--moe_cache_max_bytes` 按全部分片的总上传字节数计费。命中路由在协调卡计数一次；不能用辅助卡的逻辑路由计数判断它是否参与缓存计算。C 接口 `fastllm_moe_cuda_cache_tp_stats()` 额外返回参与卡数、共享槽位数、已填槽位数、本卡分片字节数、本卡计算的命中路由数及累计上传字节数。`cuda_glm5_gguf_tp_cache` 回归覆盖两卡分片、单／双 NUMA 源布局、冷热替换和多种验证宽度；全命中结果与未分片 GPU 路径逐位对照。
+完整专家分卡缓存沿用 `--moe_cache_*` 参数；`--moe_cache_max_replacements` 和 `--moe_cache_max_bytes` 分别限制每卡每次更新的替换数量和上传字节数。命中路由归属实际计算卡，两卡的逻辑路由计数可以相加。C 接口 `fastllm_moe_cuda_cache_ep_stats()` 额外返回参与卡数、本卡槽位数、已填槽位数、权重字节数、计算的命中路由数及累计上传字节数。`cuda_glm5_gguf_ep_cache` 回归覆盖设备倒序、按专家编号分卡、单／双 NUMA 源布局、冷热替换和多种验证宽度，全命中结果与未分片 GPU 路径逐位对照。`cuda_glm5_gguf_ep_prefill` 和 `cuda_glm5_gguf_ep_numa_prefill` 检查缓存填充与复用、原生权重字节及 NUMA／双卡 prefill 数值。
 
 测速时先用同长度输入完成预热，并关闭 prefix/history cache。启用 `UNIT_TEST` 后可运行 `glm5_next_gguf`、`numas_gguf_fallback`、`cuda_gguf_mmq_alignment` 和 `cuda_glm5_gguf_cache` 回归，分别覆盖分片映射与布局恢复、混合量化专家回退、窄投影的 CUDA 数值与边界、缓存的 CPU/GPU 分配与数值。
 

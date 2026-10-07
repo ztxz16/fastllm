@@ -20,7 +20,12 @@
 #include <stdexcept>
 #include <thread>
 #include <vector>
-namespace fastllm { void RegisterNumas(Data *, std::string); }
+namespace fastllm {
+void RegisterNumas(Data *, std::string);
+void DoCudaMergeMOEFromCPU(Data &, Data &, Data &, Data &, Data &, Data &, Data &,
+    Data **, Data **, float, bool, const std::unordered_set<int> &, bool, MoeGateType,
+    bool, float, int, bool, bool);
+}
 using namespace fastllm;
 static void Require(bool ok, const char *why) { if (!ok) throw std::runtime_error(why); }
 static void Cuda(cudaError_t e) { Require(e == cudaSuccess, cudaGetErrorString(e)); }
@@ -179,10 +184,10 @@ static void CheckVerifyCpu(std::vector<Data *> &weights, int hidden, int layer) 
     }
 }
 
-static void CheckTensorCache(std::vector<Data *> *weights, int tables, int hidden, int inter) {
+static void CheckExpertCache(std::vector<Data *> *weights, int tables, int hidden, int inter) {
     constexpr int topk=6;
     const int experts=(weights[0].size()-2)/2;
-    const std::vector<int> devices{0,1};
+    const std::vector<int> devices{1,0};
     std::vector<std::unique_ptr<Data>> records;
     std::vector<size_t> strides, gateBytes;
     for(int t=0;t<tables;++t) {
@@ -213,7 +218,7 @@ static void CheckTensorCache(std::vector<Data *> *weights, int tables, int hidde
         }
         for(int row=0;row<rows;++row) ids[row*topk+2]=ids[row*topk+3];
         // Same packed records and complete reduction dimension as the ordinary
-        // unsharded GPU adapter. All-hit TP output must be bitwise identical.
+        // unsharded GPU adapter. All-hit EP output must be bitwise identical.
         Cuda(cudaSetDevice(0));
         Data rx(BFLOAT16,{rows,hidden},CPU,x.data()),ri(INT32,{count},CPU,ids.data()),
              rs(FLOAT32,{count},CPU,scores.data()),scratch(FLOAT32,{rows*(hidden+topk*inter)}),
@@ -234,7 +239,7 @@ static void CheckTensorCache(std::vector<Data *> *weights, int tables, int hidde
             hidden,inter,scratch.cudaData,size_t(scratch.GetBytes())};
         v.numaGateType=gate;v.numaDownType=down;
         Require(FastllmCudaMoeGlm5GGUFCacheCompute(rx,activation,v,static_cast<float *>(rs.cudaData),topk,.125f,
-            static_cast<float *>(per.cudaData)),"TP oracle rejected");
+            static_cast<float *>(per.cudaData)),"EP oracle rejected");
         per.ToDevice(CPU);std::vector<uint16_t> expected(rows*hidden);
         for(int row=0;row<rows;++row) {
             std::vector<int> order(topk);for(int k=0;k<topk;++k)order[k]=k;
@@ -251,73 +256,191 @@ static void CheckTensorCache(std::vector<Data *> *weights, int tables, int hidde
         index.ToDevice(CUDA,std::vector<int>{origin});
         score.ToDevice(CUDA,std::vector<int>{origin});
         void *state=FastllmCudaBeginMoeDecode(weights[t].data(),weights[t].size(),topk,&devices);
-        Require(state!=nullptr,"TP cache scope unavailable");
+        Require(state!=nullptr,"EP cache scope unavailable");
         uint64_t before[2][8]{},after[2][8]{},beforeCache[2][5]{};
         for(int d=0;d<2;++d) {
-            Require(fastllm_moe_cuda_cache_route_stats(d,before[d]),"TP before routes");
-            Require(fastllm_moe_cuda_cache_stats(d,beforeCache[d],false),"TP before cache counters");
+            Require(fastllm_moe_cuda_cache_route_stats(d,before[d]),"EP before routes");
+            Require(fastllm_moe_cuda_cache_stats(d,beforeCache[d],false),"EP before cache counters");
         }
         Cuda(cudaSetDevice(origin));int callbacks=0;
         Require(FastllmCudaMergeMOEHybridOnDevices(input,index,score,output,weights[t].data(),weights[t].size(),
-            t,devices,[&]{++callbacks;Cuda(cudaSetDevice(1-origin));}),"TP cache dispatch rejected");
-        Require(callbacks==1 && FastllmCudaGetDevice()==origin,"TP callback or device restoration");
+            t,devices,[&]{++callbacks;Cuda(cudaSetDevice(1-origin));}),"EP cache dispatch rejected");
+        Require(callbacks==1 && FastllmCudaGetDevice()==origin,"EP callback or device restoration");
         FastllmCudaEndMoeDecode(state);
         uint64_t routes=0,hits=0,computed=0,queries=0,queryHits=0;
         for(int d=0;d<2;++d) {
-            Require(fastllm_moe_cuda_cache_route_stats(d,after[d]),"TP after routes");
+            Require(fastllm_moe_cuda_cache_route_stats(d,after[d]),"EP after routes");
             routes+=after[d][1]-before[d][1];hits+=after[d][2]-before[d][2];
             computed+=after[d][4]-before[d][4]+after[d][5]-before[d][5];
             uint64_t cache[5]{};
-            Require(fastllm_moe_cuda_cache_stats(d,cache,false),"TP cache counters");
+            Require(fastllm_moe_cuda_cache_stats(d,cache,false),"EP cache counters");
             queryHits+=cache[0]-beforeCache[d][0];
             queries+=cache[0]-beforeCache[d][0]+cache[1]-beforeCache[d][1];
         }
-        Require(routes==count && computed==count && hits<=routes,"TP duplicated or lost logical routes");
-        Require(queries==routes && queryHits==hits,"TP cache query counters lost shared hits");
+        Require(routes==count && computed==count && hits<=routes,"EP duplicated or lost logical routes");
+        Require(queries==routes && queryHits==hits,"EP cache query counters differ from logical routes");
         output.ToDevice(CPU);
         if(hits==routes) {
             allHit=true;
-            Require(std::memcmp(output.cpuData,expected.data(),expected.size()*2)==0,"TP all-hit differs from unsharded GPU output");
+            Require(std::memcmp(output.cpuData,expected.data(),expected.size()*2)==0,"EP all-hit differs from unsharded GPU output");
         } else {
             mixed|=hits>0;
             std::vector<float> a(expected.size()),b(expected.size());
             for(size_t i=0;i<a.size();++i){a[i]=BFloat16BitsToFloat32(reinterpret_cast<uint16_t *>(output.cpuData)[i]);b[i]=BFloat16BitsToFloat32(expected[i]);}
-            Compare(a,b,"TP CPU/miss/cached mixture vs GPU oracle");
+            Compare(a,b,"EP CPU/miss/cached mixture vs GPU oracle");
         }
         uint64_t stats[2][6]{};
-        for(int d=0;d<2;++d)Require(fastllm_moe_cuda_cache_tp_stats(d,stats[d]),"TP physical counters");
+        for(int d=0;d<2;++d)Require(fastllm_moe_cuda_cache_ep_stats(d,stats[d]),"EP physical counters");
         Require(stats[0][0]==2 && stats[1][0]==2 && stats[0][1]==stats[1][1] &&
-            stats[0][2]==stats[1][2] && stats[0][3]==stats[1][3] && stats[0][4]==stats[1][4],"TP cache ranks diverged");
-        Require(stats[0][1]<uint64_t(tables*experts),"TP eviction test unexpectedly fits all experts");
+            stats[0][3]==stats[1][3],"EP cache capacities diverged");
+        for (int d=0;d<2;++d) {
+            Cuda(cudaSetDevice(d));
+            FastllmCudaMoePrefillResidents residents;
+            Require(FastllmCudaGetMoePrefillResidents(weights[t].data(),experts,residents,false) &&
+                residents.ownerCount==2 && residents.ownerRank==1-d && residents.nativeGlm,
+                "EP prefill view lost native ownership");
+            for(int e=0;e<experts;++e) if(residents.weights[e*2])
+                Require(e%2==1-d && residents.weights[e*2+1],"EP expert stored on the wrong device");
+        }
+        Require(stats[0][1]<uint64_t(tables*experts),"EP eviction test unexpectedly fits all experts");
         if(step==47) {
-            Require(stats[0][2]==stats[0][1],"TP replacement test did not fill the cache");
+            Require(stats[0][2]==stats[0][1],"EP replacement test did not fill the cache");
             previousUploads=stats[0][5];
         }
         if(step==95)evicted=stats[0][5]>previousUploads && stats[0][4]>0;
     }
-    Require(allHit && mixed && evicted,"TP test missed hits, mixed routes or replacement");
+    Require(allHit && mixed && evicted,"EP test missed hits, mixed routes or replacement");
     for(int d=0;d<2;++d) {
         uint64_t cache[5]{};
-        Require(fastllm_moe_cuda_cache_stats(d,cache,true),"TP counter reset");
+        Require(fastllm_moe_cuda_cache_stats(d,cache,true),"EP counter reset");
         Require(fastllm_moe_cuda_cache_stats(d,cache,false) && cache[0]==0 && cache[1]==0 &&
-            cache[2]>0 && cache[3]>0,"TP reset changed capacity or left stale counts");
+            cache[2]>0 && cache[3]>0,"EP reset changed capacity or left stale counts");
     }
-    std::puts("PASS: GLM GGUF TP cache, both shards, shared frequency, replacement, rows 1/2/3/4/5/7/8/9, bitwise all-hit");
+    std::puts("PASS: GLM GGUF EP cache, whole experts, modulo ownership, frequency, replacement, rows 1/2/3/4/5/7/8/9, bitwise all-hit");
+}
+
+static void CheckExpertPrefill(std::vector<Data *> *tables, int count, int hidden, bool numa=false) {
+    constexpr int topk=6;
+    const int experts=(tables[0].size()-2)/2;
+    const std::vector<int> devices{1,0};
+    for(int rows : (numa ? std::vector<int>{33,129} : std::vector<int>{2,33,129})) {
+        std::vector<std::vector<uint16_t>> expected(2*count);
+        uint64_t uploads[2]{};
+        for(int pass=0;pass<3;++pass) {
+            if(pass==1) {
+                Require(FastllmCudaPrepareMoeExpertCache(tables[0].data(),tables[0].size(),devices),
+                    "EP prefill ownership setup failed");
+            }
+            for(int t=0;t<count;++t) for(int d=0;d<2;++d) {
+                Cuda(cudaSetDevice(d));
+                Data input(BFLOAT16,{rows,hidden}),ids(INT32,{rows,topk}),scores(FLOAT32,{rows,topk});
+                input.Allocate();ids.Allocate();scores.Allocate();
+                for(int i=0;i<rows*hidden;++i)
+                    reinterpret_cast<uint16_t *>(input.cpuData)[i]=Float32ToBFloat16RNEBits(float(i%37-18)/23.f);
+                std::unordered_set<int> selected;
+                for(int row=0;row<rows;++row)for(int k=0;k<topk;++k) {
+                    const int e=(row+k)%8;
+                    reinterpret_cast<int *>(ids.cpuData)[row*topk+k]=e;
+                    reinterpret_cast<float *>(scores.cpuData)[row*topk+k]=k==0 ? 0.f : k==1 ? -.125f : .3125f;
+                    selected.insert(e+1);
+                }
+                input.ToDevice(CUDA,std::vector<int>{d});
+                if(pass==1 && t==0) {
+                    // The prefill speed estimator invokes ordinary GGUF math
+                    // on the same table. Its restored payload must not replace
+                    // native records, whether the expert is cold or resident.
+                    FastllmCudaMoePrefillResidents view;
+                    Require(FastllmCudaGetMoePrefillResidents(tables[t].data(),experts,view,true),"probe cache unavailable");
+                    uint64_t before[6]{},after[6]{};
+                    Require(fastllm_moe_cuda_cache_ep_stats(d,before),"probe before stats");
+                    Data px(BFLOAT16,{65,hidden}),pi(INT32,{65,1}),ps(FLOAT32,{65,1}),po(BFLOAT16,{65,hidden}),pa,pb,pc;
+                    px.Allocate();pi.Allocate();ps.Allocate();
+                    for(int j=0;j<65*hidden;++j)reinterpret_cast<uint16_t *>(px.cpuData)[j]=Float32ToBFloat16RNEBits(float(j%17-8)/23.f);
+                    for(int j=0;j<65;++j){reinterpret_cast<int *>(pi.cpuData)[j]=0;reinterpret_cast<float *>(ps.cpuData)[j]=1;}
+                    px.ToDevice(CUDA,std::vector<int>{d});std::vector<Data*> biases(tables[t].size());
+                    DoCudaMergeMOEFromCPU(px,po,pi,ps,pa,pb,pc,tables[t].data(),biases.data(),0,true,{1},true,
+                        MoeGateSwiglu,false,0,128,false,true);
+                    Require(fastllm_moe_cuda_cache_ep_stats(d,after) && before[5]==after[5],
+                        "generic GGUF probe polluted native expert cache");
+                }
+                Data output(BFLOAT16,{rows,hidden}),w1,w2,w3;
+                std::vector<Data *> biases(tables[t].size());
+                // An unregistered table key bypasses cache lookup for the
+                // reference while borrowing the same original NUMA weights.
+                const auto &source=*tables[t][2];
+                Data key(DATA_GGUF_FORMAT,source.ggmlType,source.dims);
+                key.isFake=true;key.IsRepacked=source.IsRepacked;
+                key.isGGUFData=source.isGGUFData;key.isModelWeight=source.isModelWeight;
+                key.forceGGUFFp32Dequant=source.forceGGUFFp32Dequant;
+                key.numasData=source.numasData;
+                auto uncached=tables[t];uncached[2]=&key;
+                if(numa) {
+                    NumasMoeCudaAssistScope assist(&devices);
+                    OrdinaryNumas(input,ids,scores,output,pass ? tables[t] : uncached,t);
+                }
+                else DoCudaMergeMOEFromCPU(input,output,ids,scores,w1,w2,w3,
+                    pass ? tables[t].data() : uncached.data(),biases.data(),
+                    0,true,selected,true,MoeGateSwiglu,true,.125f,128,false,true);
+                Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+                std::vector<uint16_t> actual(rows*hidden);
+                output.ToDevice(CPU);
+                std::memcpy(actual.data(),output.cpuData,actual.size()*2);
+                Cuda(cudaSetDevice(d));
+                for(auto value:actual) Require((value & 0x7f80)!=0x7f80,"nonfinite EP prefill output");
+                if(!pass) {expected[t*2+d]=actual;continue;}
+                if(numa) {
+                    std::vector<float> a(actual.size()),b(actual.size());
+                    for(size_t i=0;i<a.size();++i){a[i]=BFloat16BitsToFloat32(actual[i]);b[i]=BFloat16BitsToFloat32(expected[t*2+d][i]);}
+                    Compare(a,b,"EP NUMA prefill differs from streamed GPU output");
+                } else Require(actual==expected[t*2+d],"EP prefill cache changed CUDA output");
+                FastllmCudaMoePrefillResidents view;
+                Require(FastllmCudaGetMoePrefillResidents(tables[t].data(),experts,view,false) && view.nativeGlm,
+                    "EP prefill residents missing");
+                int resident=0;
+                for(int e=0;e<experts;++e)if(view.weights[e*2]) {
+                    ++resident;Require(e%2==1-d,"EP prefill admitted another GPU's expert");
+                    for(int part=0;part<2;++part) {
+                        const auto &w=*tables[t][(e+1)*2+part];
+                        std::vector<uint8_t> bytes(w.GetBytes());
+                        Cuda(cudaMemcpy(bytes.data(),view.weights[e*2+part],bytes.size(),cudaMemcpyDeviceToHost));
+                        const size_t shardBytes=bytes.size()/w.numasData.size();
+                        for(size_t n=0;n<w.numasData.size();++n)
+                            Require(!memcmp(bytes.data()+n*shardBytes,w.numasData[n],shardBytes),
+                                "EP prefill cache changed native NUMA storage");
+                    }
+                }
+                Require(resident>0,"EP prefill admitted no experts");
+            }
+            if(pass)for(int d=0;d<2;++d) {
+                uint64_t stats[6]{};Require(fastllm_moe_cuda_cache_ep_stats(d,stats),"EP prefill stats");
+                if(pass==1){uploads[d]=stats[5];Require(uploads[d]>0,"EP prefill uploaded no bytes");}
+                else Require(stats[5]==uploads[d],"EP prefill reuploaded resident weights");
+            }
+        }
+    }
+    std::puts(numa ?
+        "PASS: GLM GGUF EP prefill, NUMA/two-GPU integration, native bytes, rows 33/129" :
+        "PASS: GLM GGUF EP prefill, reversed devices, native bytes, bitwise cached output, rows 2/33/129");
 }
 
 int main(int argc, char **argv) {
     try {
-        const bool tensorCache = argc > 1 && std::string(argv[1]) == "--tp-cache";
+        const bool numaPrefill = argc > 1 && std::string(argv[1]) == "--ep-numa-prefill";
+        const bool expertPrefill = numaPrefill || (argc > 1 && std::string(argv[1]) == "--ep-prefill");
+        const bool expertCache = expertPrefill || (argc > 1 && std::string(argv[1]) == "--ep-cache");
         const bool resident = argc > 1 && std::string(argv[1]) == "--resident";
         const bool noCache = argc > 1 && std::string(argv[1]) == "--no-cache";
         const bool frequency = noCache || (argc > 1 && std::string(argv[1]) == "--frequency");
         int devices = 0;
-        if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices || (tensorCache && devices<2)) {
+        if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices || (expertCache && devices<2)) {
             std::puts("FASTLLM_TEST_SKIP_NO_DEVICE: CUDA unavailable"); return 0;
         }
         constexpr int hidden=512, experts=24, topk=6, tables=4;
         const int inter=resident ? 512 : 256;
         SetThreads(8);
+        // Exercise both prefill GPU workers without relying on timing-based
+        // decisions from the speed estimator for these small test matrices.
+        if(numaPrefill) setenv("FT_EXPERT_LIMIT","1",1);
         setenv("FASTLLM_GLM5_MOE_CACHE_PREFETCH",frequency ? "1" : "0",1);
         std::mt19937 rng(71443);
         std::vector<std::unique_ptr<Data>> owned;
@@ -335,7 +458,8 @@ int main(int argc, char **argv) {
                                       (t<2 ? GGML_TYPE_IQ2_XXS : GGML_TYPE_IQ2_S);
                 const int rows=part ? hidden : 2*inter, cols=part ? inter : hidden;
                 auto w=std::make_unique<Data>(DATA_GGUF_FORMAT,type,std::vector<int>{rows,cols});
-                w->isModelWeight=true; w->isGGUFData=true; w->Allocate(false);
+                w->isModelWeight=true; w->isGGUFData=true;
+                w->forceGGUFFp32Dequant=expertPrefill && t%2; w->Allocate(false);
                 for (size_t i=0;i<w->GetBytes();++i) w->cpuData[i]=rng()>>24;
                 const size_t block=ggml_type_size(type);
                 for (size_t off=0;off<w->GetBytes();off+=block) {
@@ -354,7 +478,7 @@ int main(int argc, char **argv) {
         stride=(stride+127)/128*128;
         unsetenv("FASTLLM_MOE_CUDA_CACHE_BYTES_0");
         unsetenv("FASTLLM_MOE_CUDA_CACHE_BYTES_1");
-        SetMoeCudaCacheBytes(noCache ? 0 : stride*(tensorCache ? 16 : frequency ? 64 : 16));
+        SetMoeCudaCacheBytes(noCache ? 0 : stride*(frequency ? 64 : 16));
         if (resident) {
             for (int t=0;t<tables;++t) for (size_t i=2;i<weights[t].size();++i) {
                 auto &w = *weights[t][i];
@@ -399,8 +523,9 @@ int main(int argc, char **argv) {
             }
             std::puts("PASS: GLM direct NUMA layout and scored CPU verify rows 1/2/3/4/7/9/17");
         }
-        if(tensorCache) {
-            CheckTensorCache(weights,tables,hidden,inter);
+        if(expertCache) {
+            if(expertPrefill) CheckExpertPrefill(weights,tables,hidden,numaPrefill);
+            else CheckExpertCache(weights,tables,hidden,inter);
             FastllmCudaReleaseMoeCache(weights[0].data(),weights[0].size());
             ClearNumasMoeRuntimeCache();return 0;
         }

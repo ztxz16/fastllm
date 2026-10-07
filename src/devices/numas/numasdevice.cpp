@@ -9340,17 +9340,23 @@ namespace fastllm {
 #ifdef USE_CUDA
             std::vector<std::vector<uint8_t>> residentByDevice(
                 cudaInputReplicas.size(), std::vector<uint8_t>(m+1, 0));
+            std::vector<int> cacheOwnerRanks(cudaInputReplicas.size(), 0);
+            std::vector<int> cacheOwnerCounts(cudaInputReplicas.size(), 1);
             if (gpuPrefill) {
                 for (size_t i = 0; i < cudaInputReplicas.size(); ++i) {
                     FastllmCudaSetDevice(cudaInputReplicas[i].deviceId);
                     FastllmCudaMoePrefillResidents view;
                     const bool nativeGlm = deepSeekV4Mode && activationQuantBlock == 128 &&
                         input.dataType == BFLOAT16 && weights[2] &&
-                        weights[2]->dataType == NVFP4_BLOCK_16_E4M3_PACKED;
-                    if (!FastllmCudaGetMoePrefillResidents(weights, m, view, nativeGlm && i == 0)) continue;
-                    if (view.weightType == DATA_GGUF_FORMAT ?
+                        (weights[2]->dataType == NVFP4_BLOCK_16_E4M3_PACKED ||
+                         weights[2]->dataType == DATA_GGUF_FORMAT);
+                    if (!FastllmCudaGetMoePrefillResidents(weights, m, view,
+                            nativeGlm && (i == 0 || weights[2]->dataType == DATA_GGUF_FORMAT))) continue;
+                    if (!view.nativeGlm && (view.weightType == DATA_GGUF_FORMAT ?
                         !FastllmCudaMoeGGUFGroupedWorkspaceBytes(view.gateType, view.downType,
-                            bs, view.hidden, view.inter, m, topk) : !nativeGlm) continue;
+                            bs, view.hidden, view.inter, m, topk) : !nativeGlm)) continue;
+                    cacheOwnerRanks[i] = view.ownerRank;
+                    cacheOwnerCounts[i] = view.ownerCount;
                     for (int e = 1; e <= m; ++e) {
                         const bool resident = view.weights[2*(e-1)] != nullptr;
                         residentByDevice[i][e] = resident;
@@ -9503,8 +9509,14 @@ namespace fastllm {
                     int worker = -1;
                     for (int i = 0; i < gpuWorkerCount; ++i) {
                         if (residentExperts[expert] && !residentByDevice[i][expert]) continue;
+                        if (!residentExperts[expert] && cacheOwnerCounts[i] > 1 &&
+                            (expert - 1) % cacheOwnerCounts[i] != cacheOwnerRanks[i]) continue;
                         if (worker < 0 || predictedMs[i] < predictedMs[worker]) worker = i;
                     }
+                    // A disabled/unavailable owner cache must not prevent a
+                    // streamed miss from running on another participating GPU.
+                    if (worker < 0 && !residentExperts[expert])
+                        worker = std::min_element(predictedMs.begin(), predictedMs.end()) - predictedMs.begin();
                     AssertInFastLLM(worker >= 0, "NUMA prefill lost resident expert owner.");
                     gpuExpertSets[worker].insert(expert);
                     gpuExpertLoads[worker] += expertTasks[expert].size();

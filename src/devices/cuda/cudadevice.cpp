@@ -8953,11 +8953,13 @@ namespace fastllm {
         if (setZero && isCrossSwiglu && gateType == MoeGateSwiglu &&
             deepSeekV4Mode && activationQuantBlock == 128 &&
             input.dataType == BFLOAT16 && output.dataType == BFLOAT16 &&
-            weights[2] && weights[2]->dataType == NVFP4_BLOCK_16_E4M3_PACKED &&
-            FastllmCudaGetMoePrefillResidents(weights, m, resident, cacheAdmission)) {
-            // A layer-partitioned model decodes on the root GPU. Assist GPUs
-            // may read their residents, but must not admit this layer's misses.
-            if (cacheAdmission) FastllmCudaPlanMoePrefill(weights, m, indexData,
+            weights[2] && (weights[2]->dataType == NVFP4_BLOCK_16_E4M3_PACKED ||
+                           weights[2]->dataType == DATA_GGUF_FORMAT) &&
+            FastllmCudaGetMoePrefillResidents(weights, m, resident, cacheAdmission) &&
+            resident.nativeGlm) {
+            // Layer-partitioned models admit only on the root GPU. With
+            // expert ownership, every GPU admits its own experts instead.
+            if (cacheAdmission || resident.ownerCount > 1) FastllmCudaPlanMoePrefill(weights, m, indexData,
                 scoreData, batch, topk, experts, admission);
             cachedWeights.assign(weights, weights + 2 * (m + 1));
             for (int e : experts) {
@@ -8968,8 +8970,20 @@ namespace fastllm {
                     if (!pointer && at < int(admission.weights.size())) pointer = admission.weights[at];
                     if (!pointer) continue;
                     const Data &source = *weights[2 * e + part];
-                    auto alias = std::make_unique<Data>(source.dataType, source.dims,
-                        DataDevice::CUDA, const_cast<void *>(pointer));
+                    auto alias = std::make_unique<Data>(source.dataType);
+                    alias->isFake = true;
+                    alias->dims = source.dims;
+                    alias->strides = source.strides;
+                    alias->ggmlType = source.ggmlType;
+                    alias->ggmlTensor = source.ggmlTensor;
+                    alias->isGGUFData = source.isGGUFData;
+                    alias->IsRepacked = source.IsRepacked;
+                    alias->disableGGUFRepack = source.disableGGUFRepack;
+                    alias->forceGGUFFp32Dequant = source.forceGGUFFp32Dequant;
+                    alias->expansionSize = source.Count(0);
+                    alias->UpdateUnitSize();
+                    alias->dataDevice = DataDevice::CUDA;
+                    alias->cudaData = const_cast<void *>(pointer);
                     alias->cudaDataBorrowed = true;
                     alias->dataDeviceIds = {curDeviceId};
                     alias->blockK = source.blockK; alias->blockM = source.blockM;

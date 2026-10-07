@@ -9,7 +9,11 @@ namespace fastllm { class Data; }
 // keep their existing meaning. Begin/End bracket a complete sampled token.
 bool FastllmCudaUseMoeHybrid(fastllm::Data **weights, int weightsBatch);
 void *FastllmCudaBeginMoeDecode(fastllm::Data **weights, int weightsBatch, int topk);
-// A supported TP group shares one frequency policy and row-sharded experts.
+// Whole experts belong to devices[expert_id % devices.size()]. Configure before
+// prefill so both prefill admission and decode use the same ownership.
+bool FastllmCudaPrepareMoeExpertCache(fastllm::Data **weights, int weightsBatch,
+                                    const std::vector<int> &devices);
+// A supported TP group distributes complete experts across its devices.
 // Other formats and zero-cache configurations retain ordinary hybrid execution.
 void *FastllmCudaBeginMoeDecode(fastllm::Data **weights, int weightsBatch, int topk,
                               const std::vector<int> *devices);

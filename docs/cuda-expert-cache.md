@@ -1025,19 +1025,33 @@ expert slots and perform no cache admission. Supported GGUF layouts borrow
 the registered NUMA weight shards; any required GPU layout restoration uses
 bounded staging storage rather than a full host snapshot.
 
-GLM GGUF NUMA hybrid inference with multiple TP devices also shards cached
-experts across those devices for IQ2_XXS/IQ2_S gate/up and IQ3_XXS/IQ4_XS down.
-One frequency policy owns the logical slots and updates every shard together.
-The smallest available per-device budget determines the common slot count;
-the aggregate payload holds distinct portions of each expert. Both projections
-split output rows, exchanging BF16 activations between them, so each dot
-product retains its full reduction dimension and the existing rounding order.
-Pinned host buffers support devices without peer access. Cache misses retain
-the NUMA/multi-GPU dynamic dispatcher. Admission covers decode and small-batch
-verify (up to 9 rows); large prefill does not populate this TP cache yet.
+GLM GGUF NUMA hybrid inference with multiple TP devices distributes complete
+cached experts across those devices by default for IQ2_XXS/IQ2_S gate/up and IQ3_XXS/IQ4_XS
+down. Expert `e` belongs to `devices[e % devices.size()]`, using the configured
+TP device order. Each GPU has its own frequency policy and cache budget, and
+admits only its assigned experts. Replacement-count and upload-byte limits
+apply per GPU. Different per-device capacities are allowed. No additional mode
+flag or environment variable is needed when `--moe_cuda_cache` is enabled.
 
-Logical route counters attribute each TP cache hit once to the coordinator.
-`fastllm_moe_cuda_cache_tp_stats(device, values)` separately reports the rank
-count, logical slots, occupied slots, this rank's payload bytes, computed hit
-routes and cumulative shard-upload bytes. The last two counters show physical
-work on every GPU; summing them across ranks is not a logical cache hit rate.
+Both projections keep the native NUMA/R4 layout. A cache hit runs entirely on
+its owner GPU, without exchanging intermediate gate/up activations between
+cards. Each route's FP32 output is gathered for the existing ordered BF16
+reduction; GPU-local partial reductions are not substituted. Cache misses
+retain the CPU/multi-GPU dynamic dispatcher and may execute on any participating
+GPU regardless of permanent cache ownership.
+
+Decode and small-batch verify (up to 9 rows) observe routes on their owner and
+update caches after the step. Large prefill uses the same ownership when
+assigning GPU experts, fills native records during upload, and reuses them in
+later chunks and decode. The GLM TP device list is also passed to the NUMA
+prefill workers, so every owner GPU participates. Prefill cache publication
+waits for the payload to be ready. Ordinary GGUF profiling calls on these same
+weights fall back from the canonical-record streaming adapter; they must not
+read native records as canonical data or overwrite native slots with restored
+payloads. Zero-cache execution keeps dynamic miss offload without persistent slots.
+
+Logical route counters count each expert invocation once.
+`fastllm_moe_cuda_cache_ep_stats(device, values)` reports device count, local
+slots, occupied local slots, local payload bytes, locally computed cache-hit
+routes and cumulative whole-expert upload bytes. Hit routes can be summed across
+GPUs; the per-device totals need not match.

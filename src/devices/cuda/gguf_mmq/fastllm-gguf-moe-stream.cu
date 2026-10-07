@@ -113,6 +113,9 @@ static bool RunPipelined(const fastllm::Data &input, fastllm::Data &gate,
     std::lock_guard<std::mutex> lock(pipeline.mutex);
     FastllmCudaMoePrefillResidents resident;
     FastllmCudaGetMoePrefillResidents(weights, expertCount, resident);
+    // Generic probes can share a GLM weight table, but this pipeline restores
+    // canonical records. Never read or publish those in a native NUMA cache.
+    if (resident.nativeGlm) return false;
     std::vector<std::vector<int>> routes(expertCount);
     for (int r = 0; r < rows * topk; ++r) {
         const int e = indices[r];

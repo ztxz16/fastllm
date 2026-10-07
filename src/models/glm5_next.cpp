@@ -2436,6 +2436,11 @@ namespace fastllm {
         const std::vector<int> noDevices;
         const auto &moeDevices = threadTpRank >= 0 ? threadTpOwner->devices : noDevices;
         DiskMoeCudaDeviceScope diskDevices(moeDevices);
+#if defined(USE_CUDA) && defined(USE_NUMAS) && !defined(USE_ROCM)
+        NumasMoeCudaAssistScope numaDevices(threadTpRank >= 0 ? &moeDevices : nullptr);
+        if (threadTpRank == 0 && routedOnNumas)
+            FastllmCudaPrepareMoeExpertCache(weights.data(), weights.size(), moeDevices);
+#endif
         ApplyDeviceMap(deviceMap, deviceLayer + 1, block_cnt);
         Data routerInput, routerScores;
         ToDataType(input, routerInput, DataType::FLOAT32);
