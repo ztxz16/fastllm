@@ -153,6 +153,23 @@ int main(int argc, char **argv) {
                     }
                 };
                 check();
+                if (pass == 3 && gateType == GGML_TYPE_IQ2_XXS && downType == GGML_TYPE_Q2_0) {
+                    for (int rows : {2,3,7,9}) {
+                        std::vector<float> bx(rows*hidden), by(rows*topk*hidden,123456.f), scores(rows*topk,1.f);
+                        std::vector<int32_t> bi(rows*topk), bg(rows*topk);
+                        for (int row=0;row<rows;++row) {
+                            std::copy(x.begin(),x.end(),bx.begin()+row*hidden);
+                            std::copy_n(ids,topk,bi.begin()+row*topk);
+                            std::copy_n(gpu,topk,bg.begin()+row*topk);
+                        }
+                        submitted=0;double elapsed=0;
+                        NumasMoeDecodeExpertsBatchWithOverlap(bx.data(),by.data(),rows,weights.data(),weights.size(),
+                            bi.data(),bg.data(),scores.data(),topk,0,[&]{++submitted;},&elapsed);
+                        Check(submitted==1 && elapsed>0,"batch CPU submission or elapsed missing");
+                        for (int row=0;row<rows;++row) for (size_t i=0;i<actual.size();++i)
+                            Check(by[row*topk*hidden+i]==actual[i],"unscored batch changed decode arithmetic");
+                    }
+                }
                 if (pass == 1) {
                     bool caught = false;
                     try {

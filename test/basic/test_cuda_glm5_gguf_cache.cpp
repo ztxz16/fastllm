@@ -126,6 +126,59 @@ struct DirectLayoutFixture {
     }
 };
 
+static void CheckVerifyCpu(std::vector<Data *> &weights, int hidden, int layer) {
+    constexpr int topk=3;
+    Require(CanRunNumasMoeDecodeExperts(weights.data(), weights.size()),
+            "registered verifier weights must support exact decode");
+    for (int rows : {1,2,3,4,7,9,17,32}) for (int mode=0;mode<3;++mode) {
+        std::vector<uint16_t> x(rows*hidden);
+        std::vector<float> fx(rows*hidden), scores(rows*topk), expected(rows*topk*hidden,123.f), actual(expected);
+        std::vector<int32_t> ids(rows*topk), owners(rows*topk);
+        for (int i=0;i<rows*hidden;++i) {fx[i]=Bf(float((i*13)%67-33)/19.f);x[i]=Float32ToBFloat16RNEBits(fx[i]);}
+        for (int r=0;r<rows*topk;++r) {
+            ids[r]=r%2; scores[r]=r%3==0 ? 0.f : r%3==1 ? -.125f : .3125f;
+            owners[r]=(mode==2 || (mode==1 && (r/topk==0 || ids[r]==0))) ? 0 : -1;
+        }
+        for (int row=0;row<rows;++row) NumasMoeDecodeExperts(fx.data()+row*hidden,
+            expected.data()+row*topk*hidden,weights.data(),ids.data()+row*topk,
+            owners.data()+row*topk,topk,layer,scores.data()+row*topk,.125f,128);
+        const auto caller = std::this_thread::get_id();
+        int submits=0;double cpuUs=-1;
+        const bool delay=rows==3 && mode==1;
+        const auto start=std::chrono::steady_clock::now();
+        NumasMoeVerifyExpertsWithOverlap(x.data(),actual.data(),rows,weights.data(),weights.size(),
+            ids.data(),owners.data(),scores.data(),topk,layer,.125f,true,128,[&] {
+                Require(std::this_thread::get_id()==caller,"GPU submission moved off the caller thread");
+                ++submits;if(delay) std::this_thread::sleep_for(std::chrono::milliseconds(40));
+            },&cpuUs);
+        const double wallUs=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-start).count();
+        const bool anyCpu=std::any_of(owners.begin(),owners.end(),[](int owner){return owner<0;});
+        Require(submits==1 && (anyCpu ? cpuUs>0 : cpuUs==0),"verify callback/timing missing");
+        Require(!delay || cpuUs<wallUs*.5,"verify CPU estimate includes callback-only stall");
+        Require(actual==expected,"multi-row scored CPU differs from sequential decode or overwrites GPU routes");
+        std::fill(actual.begin(),actual.end(),123.f);
+        submits=0;
+        NumasMoeVerifyExpertsWithOverlap(x.data(),actual.data(),rows,weights.data(),weights.size(),
+            ids.data(),owners.data(),scores.data(),topk,layer,.125f,true,128,[&] {
+                Require(std::this_thread::get_id()==caller,"prepared GPU submission moved threads");
+                ++submits;
+            },&cpuUs,true);
+        Require(submits==1 && actual==expected,"prepared verifier changes CPU arithmetic or route ownership");
+        if (rows>1 && mode==1) {
+            std::fill(actual.begin(),actual.end(),123.f);
+            bool caught=false;
+            try {
+                NumasMoeVerifyExpertsWithOverlap(x.data(),actual.data(),rows,weights.data(),weights.size(),
+                    ids.data(),owners.data(),scores.data(),topk,layer,.125f,true,128,
+                    [] {throw std::runtime_error("expected submit failure");},&cpuUs,true);
+            } catch (const std::runtime_error &error) {
+                caught=std::string(error.what())=="expected submit failure";
+            }
+            Require(caught && actual==expected,"GPU failure did not drain all CPU rows before returning");
+        }
+    }
+}
+
 int main(int argc, char **argv) {
     try {
         const bool resident = argc > 1 && std::string(argv[1]) == "--resident";
@@ -215,8 +268,9 @@ int main(int argc, char **argv) {
                     "unsupported GLM pair admitted");
             for (int t=0;t<tables;++t) {
                 directFixtures[t].Check(weights[t],hidden,inter);
+                CheckVerifyCpu(weights[t],hidden,t);
             }
-            std::puts("PASS: GLM direct NUMA layout rows 1/2/3/4/7/9/17");
+            std::puts("PASS: GLM direct NUMA layout and scored CPU verify rows 1/2/3/4/7/9/17");
         }
         float worst=0;
         bool sawCpu=false, sawMixed=false, sawGpu=false, sawStaged=false;

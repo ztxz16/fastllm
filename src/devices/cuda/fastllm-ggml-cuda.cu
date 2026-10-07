@@ -1219,7 +1219,9 @@ static void mul_mat_vec_q_cuda(
     // twice the live accumulator state after packing two output rows per
     // block, so a single warp preserves occupancy. Batched expert slices
     // also use one warp to avoid multiplying register pressure by ne2.
-    if (ne2 < 2 && ncols_y <= 4) {
+    // MTP verification retains decode's reduction order even at B5-B8.
+    const bool exactBatch = ncols_y < fastllm::FastllmCudaGetLinearExactBatchThreshold();
+    if (ne2 < 2 && (ncols_y <= 4 || exactBatch)) {
         mul_mat_vec_q_cuda_T<type, 4, OType, StoreMode>(
             vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, ncols_y,
             nrows_dst, ne2, nb02, nb12, nb2, ids_nb0, stream);
@@ -2517,6 +2519,14 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
             return nullptr;
         }
     }
+}
+
+bool FastllmCudaGGUFPrefillSupported(fastllm::DataType inputType, int weightType) {
+    const auto type = static_cast<ggml_type>(weightType);
+    if (inputType == fastllm::BFLOAT16) return ggml_get_to_bf16_cuda(type) != nullptr;
+    if (inputType == fastllm::FLOAT16 || inputType == fastllm::FLOAT32)
+        return ggml_get_to_fp16_cuda(type) != nullptr;
+    return false;
 }
 
 bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {

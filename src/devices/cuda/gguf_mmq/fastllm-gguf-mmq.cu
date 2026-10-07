@@ -442,7 +442,7 @@ static void launch_extended_mmvq_type(
             return;
         }
     }
-    const int nwarps = rows <= 4 ? 4 : 1;
+    const int nwarps = rows <= 4 || rows < fastllm::FastllmCudaGetLinearExactBatchThreshold() ? 4 : 1;
     if (nwarps == 4) {
         launch_extended_mmvq_rows<type, 4, OutputType, StoreMode>(
             weight, input, output, rows, input_columns, output_rows,
@@ -466,7 +466,7 @@ static void launch_extended_gate_up_type(
             return;
         }
     }
-    const int nwarps = rows <= 4 ? 4 : 1;
+    const int nwarps = rows <= 4 || rows < fastllm::FastllmCudaGetLinearExactBatchThreshold() ? 4 : 1;
     if (nwarps == 4) {
         launch_extended_gate_up_rows<type, 4>(
             gate_weight, up_weight, input, output, rows,

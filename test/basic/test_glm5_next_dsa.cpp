@@ -124,6 +124,37 @@ void KpoolChunks() {
     Check(different<ref.size()/500&&std::sqrt(squared/ref.size())<.002,"KPool reference");
     std::puts("PASS KPool split chunks, incomplete tail, independent reference");
 }
+// A rejected suffix must be indistinguishable from a request which never saw
+// it, including the next append across a KPool group / Top-2048 boundary.
+void VerificationRollback() {
+    constexpr int total=2080;
+    std::vector<float> k(total*128),g(k.size()),a(512);
+    for(int t=0;t<total;++t)for(int d=0;d<128;++d){k[t*128+d]=Pattern(t,d);g[t*128+d]=Pattern(t+11,d)/2;}
+    for(int i=0;i<512;++i)a[i]=Pattern(i/128,i%128)/4;
+    Data key,gate,ape;Upload(key,{1,total,128},k);Upload(gate,{1,total,128},g);Upload(ape,{4,128},a,FLOAT32);
+    auto append=[&](Glm5NextIndexerCache &c,int start,int rows){
+        if(!rows)return;
+        Data x,y;Split(key,1,start,start+rows,x);Split(gate,1,start,start+rows,y);AppendIndexerKeys(c,x,y,ape);
+    };
+    auto equal=[&](Glm5NextIndexerCache &x,Glm5NextIndexerCache &y){
+        Check(x.tokens==y.tokens,"rollback token count");
+        for(auto pair:{std::make_pair(&x.keys,&y.keys),std::make_pair(&x.tailKeys,&y.tailKeys),std::make_pair(&x.tailGates,&y.tailGates)}){
+            Check(pair.first->dims==pair.second->dims,"rollback tensor shape");
+            if(!pair.first->dims.empty())Check(Download(*pair.first)==Download(*pair.second),"rollback changed accepted prefix");
+        }
+    };
+    for(int past:{0,1,2,3,4,2045,2046,2047,2048})for(int rows:{2,4,7,9})for(int accepted=0;accepted<rows;++accepted){
+        Glm5NextIndexerCache actual,expected;
+        append(actual,0,past);append(expected,0,past+accepted);
+        Glm5NextIndexerCheckpoint snapshot;CaptureIndexerCheckpoint(actual,snapshot,true);
+        Split(key,1,past,past+rows,actual.replayKeys);Split(gate,1,past,past+rows,actual.replayGates);
+        append(actual,past,rows);
+        CommitIndexerPrefix(actual,snapshot,accepted,ape);equal(actual,expected);
+        // Replace the rejected suffix with unrelated inputs, then cross more groups.
+        append(actual,2064,11);append(expected,2064,11);equal(actual,expected);
+    }
+    std::puts("PASS DSA MTP rollback: all prefixes, 2/4/7/9 rows, KPool and Top-2048 boundaries");
+}
 void Selection(int past,int rows) {
     const int m=(past+rows)/4;Data scores,groups,indices;std::vector<float> s(rows*m);
     for(int r=0;r<rows;++r)for(int j=0;j<m;++j)s[r*m+j]=(j*37+r*13)%101-50;
@@ -172,7 +203,7 @@ void Attention(int past,int rows,bool fragmented) {
     Check(FastllmCudaDeepSeekV41IndexerTopK(scores,nullptr,512,4,past,1,groups),"attention groups");groups.Reshape({rows,groups.dims.back()});
     Check(FastllmCudaQwen4ExpandSelectedBlocks(groups,tokens,past,4,idx),"attention indices");auto ids=Integers(idx);const int width=idx.dims.back();
     PagedCacheManager pool;Upload(pool,{int(kv.size()/pageLen/rank),pageLen,1,rank},kv);
-    BorrowedCache cache;cache.dataType=BFLOAT16;cache.Resize({1,tokens,rank});cache.isPagedKVCache=true;cache.pageLen=pageLen;cache.lastPageLen=(tokens-1)%pageLen+1;cache.pageIndex=pagesIds;cache.pagedKVCacheData=&pool;
+    BorrowedCache cache;cache.dataDevice=DataDevice::CUDA;cache.dataDeviceIds={0};cache.dataType=BFLOAT16;cache.Resize({1,tokens,rank});cache.isPagedKVCache=true;cache.pageLen=pageLen;cache.lastPageLen=(tokens-1)%pageLen+1;cache.pageIndex=pagesIds;cache.pagedKVCacheData=&pool;
     Data query,out;Upload(query,{heads,rows,rank},q);SparseLatentAttention(query,cache,idx,1.f/16,out);auto got=Download(out);double error=0;
     for(float v:got)Check(std::isfinite(v),"attention nonfinite");
     for(int h:{0,17,63})for(int r=0;r<rows;++r){
@@ -190,7 +221,7 @@ void Attention(int past,int rows,bool fragmented) {
             Check(mapped[i]==(ids[i]<0?-1:pagesIds[ids[i]/pageLen]*pageLen+ids[i]%pageLen),"physical page mapping");
         PagedCacheManager pePool;
         Upload(pePool,{int(kv.size()/pageLen/rank),pageLen,1,64},std::vector<float>(kv.size()/rank*64));
-        BorrowedCache peCache;peCache.dataType=BFLOAT16;peCache.Resize({1,tokens,64});
+        BorrowedCache peCache;peCache.dataDevice=DataDevice::CUDA;peCache.dataDeviceIds={0};peCache.dataType=BFLOAT16;peCache.Resize({1,tokens,64});
         peCache.isPagedKVCache=true;peCache.pageLen=pageLen;peCache.lastPageLen=cache.lastPageLen;
         peCache.pageIndex=pagesIds;peCache.pagedKVCacheData=&pePool;
         Upload(pagedQuery,{heads,rows,rank},q);
@@ -238,6 +269,8 @@ void MlaPlanCache(int device, int heads, int rank, DataType type) {
     BorrowedCache cache, peCache;
     for (BorrowedCache *x : {&cache, &peCache}) {
         x->dataType = type;
+        x->dataDevice = DataDevice::CUDA;
+        x->dataDeviceIds = {device};
         x->Resize({1, tokens, x == &cache ? rank : 64});
         x->isPagedKVCache = true; x->pageLen = pageLen; x->lastPageLen = pageLen;
         x->pagedKVCacheData = x == &cache ? &kvPool : &pePool;
@@ -408,12 +441,22 @@ int main(int argc, char **argv) {
     FastllmCudaSetDevice(0);
     static_cast<Executor*>(GetExecutor())->SetFirstDevice("cuda:0");
     try {
+        if (argc == 2 && std::string(argv[1]) == "--rollback") {
+            for (int device = 0; device < devices; ++device) {
+                FastllmCudaSetDevice(device);
+                static_cast<Executor*>(GetExecutor())->SetFirstDevice("cuda:" + std::to_string(device));
+                VerificationRollback();
+            }
+            std::puts("PASS GLM DSA MTP rollback on all CUDA devices");
+            return 0;
+        }
         if (argc == 2) { Fixture(argv[1]); return 0; }
         DecodeRouter();
         DecodeHc();
         DecodeSmallGemv();
         NormAndQuantization();
         KpoolChunks();
+        VerificationRollback();
         Selection(0, 9);
         Selection(2045, 15);
         Selection(32760, 8);

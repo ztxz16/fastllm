@@ -1386,6 +1386,9 @@ bool FastllmCudaQuantizeLinearWeightNVFP4Block16Rows(
 
 bool FastllmCudaQuantizeLinearWeightNVFP4Block16(
     const fastllm::Data &input, fastllm::Data &output);
+// Check the concrete GGUF layout before NUMA prefill streams it to CUDA.
+bool FastllmCudaGGUFPrefillSupported(fastllm::DataType inputType, int weightType);
+
 bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaFloatMergeMOEGGUFBatch1(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &output,
                                         fastllm::Data **gateups, fastllm::Data **downs, const float *scores,
@@ -1448,6 +1451,10 @@ bool FastllmCudaBatchMatMul(const fastllm::Data &input0, const fastllm::Data &in
                                   int input0Spatial, int input1Spatial, int outputSpatial,
                                   int input0Stride, int input1Stride,
                                   int batch, int n, int m, int k, float alpha);
+// Dense [batch, rows, channels] projections with the same one-row cuBLAS
+// calls as decode. Read/write strided rows directly, without Split/Cat copies.
+bool FastllmCudaBatchMatMulSingleRows(const fastllm::Data &input,
+    const fastllm::Data &weight, fastllm::Data &output, bool transposeWeight, float alpha = 1.0f);
 bool FastllmCudaBatchMatMulTransB(const fastllm::Data &input0, const fastllm::Data &input1, fastllm::Data &output,
                               int input0Spatial, int input1Spatial, int outputSpatial,
                               int input0Stride, int input1Stride,

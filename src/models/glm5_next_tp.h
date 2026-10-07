@@ -20,6 +20,7 @@ namespace fastllm {
         std::vector<unsigned char> workerBoundToSpareCores;
         std::vector<std::unique_ptr<Glm5NextModel>> ranks;
         std::map<const Cache *, std::vector<Cache>> requests;
+        std::map<const Cache *, std::vector<std::vector<KdaReplayCapture>>> replays;
         std::mutex forwardMutex, barrierMutex;
         std::condition_variable barrierCv;
         unsigned generation = 0;
@@ -91,7 +92,6 @@ namespace fastllm {
         const int count = devices.size();
         AssertInFastLLM(kdaHeads % count == 0 && num_attention_heads % count == 0,
             "GLM TP degree must divide KDA and MLA heads.");
-        AssertInFastLLM(!mtpEnabled, "GLM TP currently requires --mtp 0.");
         AssertInFastLLM(GetCudaSharedExpert(), "GLM TP requires --cuda_shared_expert true.");
         AssertInFastLLM(!GetKVCacheInCPU(), "GLM TP requires CUDA KV caches.");
         for (const auto &item : deviceMap) if (item.second > 0)
@@ -400,15 +400,22 @@ namespace fastllm {
 #endif
     }
 
+    Data &Glm5NextModel::OutputHead() {
+        return threadTpState ? threadTpState->ranks.at(0)->weight["lm_head.weight"] : weight["lm_head.weight"];
+    }
+
     void Glm5NextModel::ThreadTpAllReduce(Data &data) {
 #ifdef USE_CUDA
         if (threadTpRank < 0) return;
         AssertInFastLLM(data.dataDevice == DataDevice::CUDA && data.cudaData &&
             data.Count(0) <= std::numeric_limits<int>::max(), "GLM TP invalid reduction tensor.");
         // A sleeping peer otherwise adds a wakeup after each CPU MoE phase.
-        // Only spin through that interval for single-row decode when this
-        // rank is actually bound away from the NUMA expert workers.
-        const int hostSpinUs = data.Count(0) == (uint64_t)embed_dim &&
+        // Decode and exact multi-row verification use the same short wait
+        // budget, only on submission cores isolated from NUMA workers.
+        const uint64_t rows = data.Count(0) / embed_dim;
+        const bool decodeOrVerify = rows == 1 ||
+            (rows > 1 && rows < (uint64_t)FastllmCudaGetLinearExactBatchThreshold());
+        const int hostSpinUs = decodeOrVerify &&
             threadTpOwner->workerBoundToSpareCores[threadTpRank] ? 1000 : 0;
         FastllmNcclAllReduceNoCustomWithSpin(data.cudaData, data.cudaData, data.Count(0), data.dataType,
             threadTpOwner->devices[threadTpRank], hostSpinUs);
@@ -423,13 +430,16 @@ namespace fastllm {
         if (it == tp.requests.end()) return;
         for (size_t r = 0; r < tp.ranks.size(); ++r)
             tp.ranks[r]->indexerCaches.erase(r == 0 ? key : &it->second[r]);
+        tp.replays.erase(key);
         tp.requests.erase(it);
     }
 
     int Glm5NextModel::ForwardThreadTp(const Data &inputIds,
             std::vector<std::pair<Data, Data>> &pastKeyValues,
             const GenerationConfig &generationConfig,
-            const LastTokensManager &lastTokens, std::vector<float> *logits) {
+            const LastTokensManager &lastTokens, std::vector<float> *logits,
+            bool sampleOutput, Data *targetHiddenStates,
+            std::vector<KdaReplayCapture> *kdaReplay) {
 #ifdef USE_CUDA
         AssertInFastLLM(inputIds.dims.size() == 2 && inputIds.dims[0] == 1 && inputIds.dims[1] > 0,
             "GLM TP requires a non-empty request.");
@@ -448,6 +458,12 @@ namespace fastllm {
             caches.resize(tp.devices.size());
             for (size_t r = 1; r < caches.size(); ++r) caches[r].resize(block_cnt);
         }
+        auto &replays = tp.replays[&pastKeyValues];
+        if (kdaReplay) {
+            replays.resize(tp.devices.size());
+            for (auto &replay : replays) { replay.clear(); replay.resize(block_cnt); }
+        }
+        const int exactThreshold = FastllmCudaGetLinearExactBatchThreshold();
         std::vector<Data> hidden(tp.devices.size());
         std::vector<std::exception_ptr> errors(tp.devices.size());
         int result = 0;
@@ -462,6 +478,11 @@ namespace fastllm {
             }
 #endif
             FastllmCudaSetDevice(tp.devices[r]);
+            struct RestoreExactThreshold {
+                int old = FastllmCudaGetLinearExactBatchThreshold();
+                ~RestoreExactThreshold() { FastllmCudaSetLinearExactBatchThreshold(old); }
+            } restoreExact;
+            FastllmCudaSetLinearExactBatchThreshold(exactThreshold);
             static thread_local Executor executor;
             struct RestoreExecutor {
                 void *old;
@@ -486,9 +507,9 @@ namespace fastllm {
                 }
                 tp.Barrier();
                 FastllmCudaSetDevice(tp.devices[r]);
-                model.ForwardLayers(hidden[r], 0, block_cnt, {&cache});
+                model.ForwardLayers(hidden[r], 0, block_cnt, {&cache}, kdaReplay ? &replays[r] : nullptr);
                 if (r == 0) result = model.ForwardOutput(hidden[r], generationConfig,
-                    lastTokens, logits, true, nullptr);
+                    lastTokens, logits, sampleOutput, targetHiddenStates);
                 FastllmCudaSyncCurrentThreadStream();
             } catch (...) { tp.Abort(); throw; }
         }, errors);

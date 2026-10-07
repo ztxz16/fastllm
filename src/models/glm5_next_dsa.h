@@ -99,6 +99,44 @@ inline void AppendIndexerKeys(Glm5NextIndexerCache &cache,
     cache.tokens += sequence;
 }
 
+inline void CaptureIndexerCheckpoint(Glm5NextIndexerCache &cache,
+        Glm5NextIndexerCheckpoint &checkpoint, bool captureReplay) {
+    checkpoint.tokens = cache.tokens;
+    for (auto pair : {std::make_pair(&checkpoint.tailKeys, &cache.tailKeys),
+                      std::make_pair(&checkpoint.tailGates, &cache.tailGates)}) {
+        if (pair.second->dims.empty()) ClearIndexerTensor(*pair.first);
+        else pair.first->CopyFrom(*pair.second);
+    }
+    cache.captureReplay = captureReplay;
+}
+
+inline void CommitIndexerPrefix(Glm5NextIndexerCache &cache,
+        const Glm5NextIndexerCheckpoint &checkpoint, int accepted, Data &ape) {
+    AssertInFastLLM(accepted >= 0 && checkpoint.tokens + accepted <= cache.tokens,
+        "GLM DSA invalid verification prefix.");
+    if (checkpoint.tokens / 4 == 0) ClearIndexerTensor(cache.keys);
+    else cache.keys.Resize({1, checkpoint.tokens / 4, 128});
+    if (checkpoint.tokens % 4) {
+        cache.tailKeys.CopyFrom(checkpoint.tailKeys);
+        cache.tailGates.CopyFrom(checkpoint.tailGates);
+    } else {
+        ClearIndexerTensor(cache.tailKeys);
+        ClearIndexerTensor(cache.tailGates);
+    }
+    cache.tokens = checkpoint.tokens;
+    cache.captureReplay = false;
+    cache.pageTableIds.clear();
+    if (accepted) {
+        AssertInFastLLM(cache.replayKeys.dims.size() == 3 &&
+            cache.replayKeys.dims[1] >= accepted && cache.replayGates.dims == cache.replayKeys.dims,
+            "GLM DSA verification projections are missing.");
+        Data keys, gates;
+        Split(cache.replayKeys, 1, 0, accepted, keys);
+        Split(cache.replayGates, 1, 0, accepted, gates);
+        AppendIndexerKeys(cache, keys, gates, ape);
+    }
+}
+
 struct DsaProjections {
     Data keys, gates, query, headWeights;
 };
@@ -159,6 +197,11 @@ inline void BuildDsaIndices(Data &input, Data &qNormalized,
     if (projected == nullptr) {
         ProjectDsaKeys(input, weight, prefix, local);
         projected = &local;
+    }
+    if (cache.captureReplay) {
+        cache.replayKeys.CopyFrom(projected->keys);
+        cache.replayGates.CopyFrom(projected->gates);
+        cache.captureReplay = false;
     }
     AppendIndexerKeys(cache, projected->keys, projected->gates,
         weight[prefix + "index_kpool_compress_ape"]);

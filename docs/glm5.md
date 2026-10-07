@@ -20,7 +20,7 @@ GLM-5.3-Flash 的 ModelOpt NVFP4 路由专家在单设备 CUDA 后端（包括 `
 
 ## GLM-5.3-Flash GGUF
 
-支持 `general.architecture=glm5next` 的 GLM-5.3-Flash GGUF，包括 Unsloth 的四分片 `UD-IQ2_XXS`。指定第一个分片即可加载其余分片，无需 `--ori`。当前路径支持文本推理，要求 `--mtp 0`。
+支持 `general.architecture=glm5next` 的 GLM-5.3-Flash GGUF，包括 Unsloth 的四分片 `UD-IQ2_XXS`。指定第一个分片即可加载其余分片，无需 `--ori`。当前路径支持文本推理及内置 NextN 草稿层的 MTP；`--mtp 0` 时不加载草稿权重。
 
 路由专家保留 GGUF 混合量化格式；加载时还原 KDA 衰减参数和拆分、转置的 MLA KV-B 权重。支持 AVX512 BF16 的 CPU 在 IQ4_XS 单行计算时直接读取压缩权重，在寄存器中解码并完成 BF16 点积，省去临时 FP32/BF16 权重缓冲，保留原有舍入和累加顺序；多行计算和其他 CPU 继续使用分块 BF16 回退，权重不整体展开。KDA 的 128 维 Q8 投影使用 CUDA 反量化 GEMM，避免进入要求 K 维度按 256 对齐的 MMQ 内核。
 
@@ -37,7 +37,7 @@ FT_NUMAS=1 numactl --cpunodebind=0 --membind=0 \
   --moe_cuda_cache 0 --moe_cpu_cache 0 --mtp 0
 ~~~
 
-GGUF 的单 token BF16 混合推理可通过 `--moe_cuda_cache 12G` 为每张显卡设置 12 GiB 专家缓存，支持 IQ2_XXS/IQ2_S gate/up 与 IQ3_XXS/IQ4_XS down。GPU 保留压缩权重，并遵循 GGUF 的 Q8_K/BF16 激活、限幅和路由权重顺序；多行输入保留原 NUMA 路径。当前缓存还会在主机保存一份 NUMA 重排前的 GGUF 专家快照，混合格式按最大专家大小对齐，因此会增加主机内存占用。
+GGUF 的 BF16 混合推理可通过 `--moe_cuda_cache 12G` 为每张显卡设置 12 GiB 专家缓存，支持 IQ2_XXS/IQ2_S gate/up 与 IQ3_XXS/IQ4_XS down。GPU 保留压缩权重，并遵循 GGUF 的 Q8_K/BF16 激活、限幅和路由权重顺序。decode 与最多 9 行的小批验证使用缓存和动态分流，更大批次保留 NUMA 路径。支持的固定页 NUMA 布局直接复用专家权重，避免保存第二份完整主机快照；无法共享的布局保留快照回退。
 
 需要降低主存占用时，可将部分 MoE 层固定放到 CUDA，其余层使用 NUMA 动态分流。例如 45 层、前三层为 dense 的 GLM-5.3-Flash：
 
@@ -55,6 +55,12 @@ FT_NUMAS=1 numactl -C 0-31 -m 0 \
 进一步降低主存可使用 `--moe_device '{"cuda:0":9,"cuda:1":6,"numa":30}'`，将第 3–8 层放到 GPU 0、第 9–14 层放到 GPU 1，每卡驻留 6 个 MoE 层。上述 UD-IQ2_XXS 权重比每卡 4 层配置多移出约 9.04 GiB 主机权重。双 24 GiB 显卡、512-token 输入和 640-token 输出的短测可运行，但显存峰值已达约 23.48 / 23.22 GiB；更长上下文需重新预留 KV 与工作区空间。新增层包含 IQ4_XS down，prefill 会使用下面说明的 GEMV 路径，增加驻留层数不保证 prefill 提速。
 
 要让纯 GPU MoE 层也参与张量并行，使用 `--tp 0,1 --moe_device numa --moe_device_layers 30`。`moe_device_layers` 指最后 30 个模型层使用 NUMA；前 15 层中包含 3 个 dense 层和 12 个 MoE 层。每个 GPU MoE 层按中间维度等分 gate/up 的行与 down 的列，各卡独立计算路由和专家分片，随后复用 FFN AllReduce 合并路由专家与共享专家的部分结果。其余 NUMA 层保持原有多卡动态分流。GGUF 分片按层加载并直接上传，保留压缩格式，不保存完整 CPU 副本；GLM GGUF 的 GPU 专家 TP 默认启用 64 MiB 权重 slab，减少大量小分配的显存浪费，可用已有的 `--cuda_slab` 参数覆盖。
+
+在上述 TP 配置中使用 `--mtp 3 --speculative_algorithm mtp` 可开启最多 3 个草稿 token 的自适应深度 MTP，`--mtp_min_p` 沿用既有置信度阈值，0 表示关闭。目标模型多行验证仍使用 TP 和 NUMA 动态分流；草稿层在协调 rank 上运行 attention/共享专家，路由专家沿用最后一个目标层的 MoE 设备设置，词表输出头复用 rank 0 的存储。GGUF 草稿权重保留自身量化格式；不支持 GLM GPU 分流的格式（如此 IQ2_XXS 文件内草稿层的 Q2_K/Q3_K）走通用 NUMA 路径，不会关闭目标层的分流。MTP 不复用 history/prefix 快照。
+
+多行验证保留单行推理的归约与舍入顺序。支持的 KDA 使用寄存器扫描处理任意正序列长度；MLA 的两个吸收投影直接读写原张量中的各行，复用单行 cuBLAS 调用，省去逐行拆分与拼接。无法使用直接行访问的布局保留原路径。TP 提交线程已绑定独立核心时，验证沿用 decode 的有限自旋等待，仍保留 NCCL 提交前后的跨 rank 同步。可用 `cuda_kda_prefill` 和 `cuda_matmul_single_rows` 回归检查递归状态及投影的逐位一致性。
+
+GGUF 混推的小批量验证复用专家注册时的 NUMA 适用性检查结果。2–32 行验证中，持久协调线程推进 CPU 的 gate/up、激活和 down 阶段，GPU 上传与计算提交保留在原调用线程，避免 CPU 后续行等待 GPU 提交完成；CPU 数学计算仍使用配置的 NUMA 工作线程。无需新增开关，单行、其他权重格式和更大批次保留各自路径。`cuda_glm5_gguf_cache` 回归覆盖多行的逐位一致性、CPU/GPU 路由归属以及 GPU 提交异常后的 CPU 任务收尾。
 
 驻留 GGUF 路径支持 BF16 激活、IQ2_XXS/IQ2_S gate/up 与 IQ3_XXS/IQ4_XS down，复用 GLM 缓存路径的限幅、score-before-down、量化边界和有序归约。支持 INT8 MMA 的 NVIDIA GPU（SM75+）上，超过 32 行且 down 为 IQ3_XXS 时自动按专家聚合 token，使用 grouped MMQ；保留每 256 个值一组的正 FP32 Q8_K scale 和最近偶数舍入，不引入 V4.1 的 FP8 量化边界。长输入按最多 1024 行分块，限制临时显存，无需额外开关。decode/小批量、IQ4_XS down 和不支持 MMQ 的设备保留原来的驻留 GEMV 路径；IQ4_XS 的 BF16 down 不会被改为 Q8。可运行 `cuda_glm5_gguf_resident` 验证两卡上的量化组合、32/33 行分派边界、1025 行分块尾部及 CPU 权重释放。
 
@@ -144,7 +150,7 @@ CUDA BF16 的 11 个 DSA 层现在加载 checkpoint 中的 Indexer 权重，执�
 
 接入复用 DeepSeek-V4 的压缩汇聚、DeepSeek-V4.1 的评分/Top-K/512 维稀疏注意力、Qwen4 的组索引展开和 Naive 的 FP8 量化。没有新增 CUDA kernel；仅为现有 LayerNorm 和量化器增加参数，并补充 host 接口。为复用 BF16 Tensor Core 评分，FP8 舍入后的值按 2 的幂反量化后保存在 BF16 中。分页 latent KV 保持原格式，稀疏注意力临时收集连续历史；KPool 缓存和尾组随 chunk、decode 和历史快照保持同步。
 
-当前支持 `--mtp 0` 的 compressed MLA 路径。MTP 的索引共享/回滚及 expanded attention 尚未接入。`FASTLLM_GLM5_NEXT_DSA_BACKEND=dense` 可恢复原 dense 路径用于对照。稀疏选择会改变长输入的注意力语义，不保证与旧 dense 路径生成相同 token，也不承诺与 SGLang 的不同 GEMM 后端逐位相同。
+当前支持 compressed MLA，包括 MTP 多行验证。目标层按 rank 保存 KDA 状态和 DSA KPool 尾部；拒绝草稿后按接受前缀恢复 KDA、截断 KV 页并重新生成受影响的 KPool 分组，草稿层也独立回滚其 KV 和索引缓存。expanded attention 尚未接入 learned DSA。`FASTLLM_GLM5_NEXT_DSA_BACKEND=dense` 可恢复原 dense 路径用于对照。稀疏选择会改变长输入的注意力语义，不保证与旧 dense 路径生成相同 token，也不承诺与 SGLang 的不同 GEMM 后端逐位相同。
 
 启用 `UNIT_TEST` 后可运行 `ctest --test-dir build-fastllm -R '^glm5_next_dsa$' --output-on-failure`。回归包含独立 LayerNorm、Hadamard/FP8、KPool 参考计算，非 4 倍数分块与尾组，2048 和 32K 附近的因果 Top-K，以及连续/碎片化分页 latent attention。
 

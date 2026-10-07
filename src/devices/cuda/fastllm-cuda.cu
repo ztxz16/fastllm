@@ -9271,10 +9271,10 @@ bool FastllmCudaKimiK3RecurrentKDA(
         FastllmCudaMemset0(state.cudaData, state.GetBytes());
     }
 #ifndef USE_ROCM
-    // Ordinary decode and prefill reuse register scan with shared CUDA scratch.
+    // Decode, multi-row verification and prefill share the exact register scan.
     // Auxiliary/state replay and graph capture keep the allocation-free path.
     if (dimension == KIMI_K3_KDA_DIMENSION && batch > 0 && heads > 0 &&
-        (sequence == 1 || sequence >= 64) && !stateOnly && !outputAux &&
+        sequence > 0 && !stateOnly && !outputAux &&
         normalizeQKInFp32 && roundBetaToBfloat16 &&
         aLog.Count(0) == (uint64_t)heads && !FastllmCudaGraphIsCapturing()) {
         size_t rows = (size_t)batch * sequence * heads;
@@ -12844,6 +12844,62 @@ bool FastllmCudaEmbeddingDirect(const fastllm::Data &input, const fastllm::Data 
     }
 
     DeviceSync();
+    return true;
+}
+
+bool FastllmCudaBatchMatMulSingleRows(const fastllm::Data &input,
+        const fastllm::Data &weight, fastllm::Data &output, bool transposeWeight, float alpha) {
+    auto denseCuda = [](const fastllm::Data &data) {
+        return data.dataDevice == fastllm::DataDevice::CUDA && data.cudaData &&
+            !data.multiDeviceData && data.dims.size() == 3 && data.strides.size() == 3 &&
+            data.dims[0] > 0 && data.dims[1] > 0 && data.dims[2] > 0 &&
+            data.strides[2] == 1 && data.strides[1] == data.dims[2] &&
+            data.strides[0] == (uint64_t)data.dims[1] * data.dims[2];
+    };
+    if (!denseCuda(input) || !denseCuda(weight) || &output == &input || &output == &weight ||
+        input.dataDeviceIds != weight.dataDeviceIds || input.dataType != weight.dataType ||
+        input.dims[0] != weight.dims[0] ||
+        input.dims[2] != weight.dims[transposeWeight ? 2 : 1] ||
+        (input.dataType != fastllm::DataType::FLOAT32 &&
+         input.dataType != fastllm::DataType::FLOAT16 &&
+         input.dataType != fastllm::DataType::BFLOAT16)) return false;
+
+    const int batch = input.dims[0], rows = input.dims[1], m = input.dims[2];
+    const int k = weight.dims[transposeWeight ? 1 : 2];
+    if (!input.dataDeviceIds.empty()) FastllmCudaSetDevice(input.dataDeviceIds[0]);
+    output.dataType = input.dataType;
+    output.ToDevice(fastllm::DataDevice::CUDA, input.dataDeviceIds, false);
+    output.Resize({batch, rows, k});
+    output.Allocate();
+    auto handle = getFastllmCublasHandle();
+    const auto operation = transposeWeight ? CUBLAS_OP_T : CUBLAS_OP_N;
+    const int weightStride = transposeWeight ? m : k;
+    const long long inputSpatial = (long long)rows * m;
+    const long long weightSpatial = (long long)m * k;
+    const long long outputSpatial = (long long)rows * k;
+    const float beta = 0;
+    for (int row = 0; row < rows; ++row) {
+        const void *x = (const char *)input.cudaData + (size_t)row * m * input.unitSize;
+        void *y = (char *)output.cudaData + (size_t)row * k * output.unitSize;
+        cublasStatus_t status;
+        if (input.dataType == fastllm::DataType::BFLOAT16) {
+            status = cublasGemmStridedBatchedEx(handle, operation, CUBLAS_OP_N,
+                k, 1, m, &alpha, weight.cudaData, CUDA_R_16BF, weightStride, weightSpatial,
+                x, CUDA_R_16BF, m, inputSpatial, &beta, y, CUDA_R_16BF, k, outputSpatial,
+                batch, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        } else if (input.dataType == fastllm::DataType::FLOAT16) {
+            const half halfAlpha = __float2half(alpha), halfBeta = __float2half(beta);
+            status = cublasHgemmStridedBatched(handle, operation, CUBLAS_OP_N,
+                k, 1, m, &halfAlpha, (const half *)weight.cudaData, weightStride, weightSpatial,
+                (const half *)x, m, inputSpatial, &halfBeta, (half *)y, k, outputSpatial, batch);
+        } else {
+            status = cublasSgemmStridedBatched(handle, operation, CUBLAS_OP_N,
+                k, 1, m, &alpha, (const float *)weight.cudaData, weightStride, weightSpatial,
+                (const float *)x, m, inputSpatial, &beta, (float *)y, k, outputSpatial, batch);
+        }
+        fastllm::AssertInFastLLM(status == CUBLAS_STATUS_SUCCESS,
+            "CUDA single-row batched MatMul failed.");
+    }
     return true;
 }
 

@@ -43,8 +43,9 @@ namespace fastllm {
         add(R"(blk\.(\d+)\.ffn_(gate|up|down)_shexp\.weight)", layer + "mlp.shared_experts.$2_proj.weight");
         rules.emplace_back(std::regex(R"(^blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$)"),
             std::vector<std::string>{layer + "mlp.experts.", ".$2_proj.weight"}, Rule::GGUFWeightReplacePacked);
-        // GGUF MTP is unsupported; the loader also filters the appended layer.
-        add(R"(blk\.\d+\.nextn\..*)", "ignore");
+        add(R"(blk\.(\d+)\.nextn\.(enorm|hnorm)\.weight)", layer + "$2.weight", Rule::GGUFWeightReplaceForceFP32);
+        add(R"(blk\.(\d+)\.nextn\.shared_head_norm\.weight)", layer + "shared_head.norm.weight", Rule::GGUFWeightReplaceForceFP32);
+        add(R"(blk\.(\d+)\.nextn\.eh_proj\.weight)", layer + "eh_proj.weight");
         return rules;
     }
 

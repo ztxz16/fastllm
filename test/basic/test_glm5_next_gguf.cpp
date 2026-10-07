@@ -128,6 +128,68 @@ void TestEmbedding(const std::string &directory) {
     unlink(path.c_str());
 }
 
+int TestExactGgufLinear() {
+#ifdef USE_CUDA
+    if (FastllmCudaGetDeviceCount() == 0) return 77;
+    constexpr int columns = 2048, outputs = 256;
+    std::vector<float> values(columns * outputs);
+    for (size_t i = 0; i < values.size(); ++i)
+        values[i] = std::sin(float(i) * .037f) * std::cos(float(i) * .009f);
+    const int previous = FastllmCudaGetLinearExactBatchThreshold();
+    for (int device = 0; device < FastllmCudaGetDeviceCount(); ++device) {
+        FastllmCudaSetDevice(device);
+        ApplyDeviceMap({{"cuda:" + std::to_string(device), 1}}, 0, 1);
+        for (auto quant : {GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_Q4_0}) {
+            Data weight(DATA_GGUF_FORMAT, quant, {outputs, columns});
+            weight.isGGUFData = weight.isModelWeight = true;
+            weight.Allocate();
+            if (quant == GGML_TYPE_Q4_0) {
+                auto *blocks = reinterpret_cast<block_q4_0 *>(weight.cpuData);
+                for (size_t i = 0; i < values.size() / QK4_0; ++i) {
+                    blocks[i].d = float_to_half(.0127f * (1 + i % 7));
+                    for (int j = 0; j < QK4_0 / 2; ++j) blocks[i].qs[j] = uint8_t(i * 37 + j * 13);
+                }
+            } else {
+                auto quantize = ggml_type_from_float_ref(quant);
+                Check(quantize != nullptr, "GGUF test quantizer unavailable");
+                quantize(values.data(), weight.cpuData, values.size());
+            }
+            weight.ToDevice(CUDA, std::vector<int>{device});
+            for (int rows : {2, 3, 4, 5, 7, 8}) {
+                std::vector<float> inputValues(rows * columns);
+                for (size_t i = 0; i < inputValues.size(); ++i)
+                    inputValues[i] = std::sin(float(i) * .029f);
+                for (auto type : {FLOAT32, BFLOAT16}) {
+                    Data input(FLOAT32, {rows, columns}, inputValues), actual;
+                    input.ToDevice(CUDA, std::vector<int>{device}); ToDataType(input, type);
+                    FastllmCudaSetLinearExactBatchThreshold(rows + 1);
+                    Linear(input, weight, Data(), actual);
+                    for (int row = 0; row < rows; ++row) {
+                        Data rowInput, expected, got;
+                        Split(input, 0, row, row + 1, rowInput);
+                        FastllmCudaSetLinearExactBatchThreshold(0);
+                        Linear(rowInput, weight, Data(), expected);
+                        Split(actual, 0, row, row + 1, got);
+                        expected.ToDevice(CPU); got.ToDevice(CPU);
+                        if (expected.GetBytes() != got.GetBytes() ||
+                            std::memcmp(expected.cpuData, got.cpuData, got.GetBytes()) != 0) {
+                            std::fprintf(stderr, "GGUF exact linear device=%d quant=%s dtype=%d rows=%d row=%d\n",
+                                device, ggml_type_name(quant), int(type), rows, row);
+                            throw std::runtime_error("GGUF verifier reduction differs from one-row decode");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    FastllmCudaSetLinearExactBatchThreshold(previous);
+    std::cout << "PASS GGUF exact verifier linear rows 2/3/4/5/7/8 on both GPUs\n";
+    return 0;
+#else
+    return 77;
+#endif
+}
+
 int TestStreamingTp() {
 #ifdef USE_CUDA
     if (FastllmCudaGetDeviceCount() < 2) return 77;
@@ -282,6 +344,9 @@ void Run(const std::string &directory) {
     tensors.push_back(FloatTensor("blk.0.hc_attn_fn.weight", {24,32}, GGML_TYPE_Q8_0, std::vector<float>(24*32,.5f)));
     tensors.push_back(FloatTensor("blk.3.indexer_compressor_ape.weight", {4,128}, GGML_TYPE_F32, std::vector<float>(512,.25f)));
     tensors.push_back(FloatTensor("blk.4.nextn.enorm.weight", {32}, GGML_TYPE_F32, std::vector<float>(32,1.f)));
+    tensors.push_back(FloatTensor("blk.4.nextn.hnorm.weight", {32}, GGML_TYPE_F32, std::vector<float>(32,2.f)));
+    tensors.push_back(FloatTensor("blk.4.nextn.shared_head_norm.weight", {32}, GGML_TYPE_F32, std::vector<float>(32,3.f)));
+    tensors.push_back(FloatTensor("blk.4.nextn.eh_proj.weight", {32,64}, GGML_TYPE_Q8_0, std::vector<float>(2048,.5f)));
     for (const auto &kind : {"gate","up","down"}) {
         const bool down=std::string(kind)=="down";
         const auto type=down ? GGML_TYPE_IQ3_XXS : GGML_TYPE_IQ2_XXS;
@@ -299,10 +364,14 @@ void Run(const std::string &directory) {
     AppendGGUFTasks("glm5_next",first,tasks);
     Check(tasks.empty(),"metadata-only first shard");
     AppendGGUFTasks("glm5_next",second,tasks);
-    Check(tasks.size()==11,"split expert task count / ignored NextN weights");
+    Check(tasks.size()==15,"split expert tasks and NextN weight mappings");
     WeightMap weights;
     for (auto &task : tasks) WeightImportGGUFTensor(&weights[task.name],&task.tensor,task.fileName,task.offset,task.replaceType);
     const std::string base="model.language_model.layers.";
+    for (const char *name : {"enorm.weight", "hnorm.weight", "shared_head.norm.weight"})
+        Check(weights[base+"4."+name].dataType==FLOAT32 && weights[base+"4."+name].dims==std::vector<int>{32}, "NextN norm mapping");
+    Check(weights[base+"4.eh_proj.weight"].dataType==DATA_GGUF_FORMAT &&
+        weights[base+"4.eh_proj.weight"].dims==std::vector<int>({32,64}), "NextN projection stays packed");
     Check(weights[base+"0.hc_attn_fn"].dataType==FLOAT32,"quantized HC import type");
     Check(reinterpret_cast<float*>(weights[base+"0.hc_attn_fn"].cpuData)[31]==.5f,"quantized HC dequantization");
     Check(weights[base+"3.self_attn.indexer.index_kpool_compress_ape"].dims==std::vector<int>({4,128}),"KPool APE mapping");
@@ -329,6 +398,18 @@ void Run(const std::string &directory) {
 int main(int argc, char **argv) {
     char directory[]="/tmp/fastllm-glm53-gguf-XXXXXX";
     try {
+#ifdef USE_CUDA
+        if (argc == 2 && std::string(argv[1]) == "--prefill-formats") {
+            for (auto type : {BFLOAT16, FLOAT16, FLOAT32}) {
+                for (int quant : {GGML_TYPE_IQ2_XXS_R4, GGML_TYPE_IQ2_S_R4, GGML_TYPE_IQ3_XXS_R4,
+                                  GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_K_R4, GGML_TYPE_Q3_K})
+                    Check(FastllmCudaGGUFPrefillSupported(type, quant), "supported GGUF CUDA prefill rejected");
+                Check(!FastllmCudaGGUFPrefillSupported(type, GGML_TYPE_Q3_K_R4), "unsupported Q3_K_R4 uploaded to CUDA");
+            }
+            std::cout<<"PASS GGUF NUMA prefill CUDA format dispatch\n";return 0;
+        }
+#endif
+        if (argc == 2 && std::string(argv[1]) == "--exact-linear") return TestExactGgufLinear();
         if (argc == 2 && std::string(argv[1]) == "--tp-load") return TestStreamingTp();
         Check(mkdtemp(directory)!=nullptr,"temporary directory");
         Run(directory);TestEmbedding(directory);rmdir(directory);

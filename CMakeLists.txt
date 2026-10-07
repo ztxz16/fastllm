@@ -889,6 +889,12 @@ if (UNIT_TEST)
             fastllm_add_checked_test(glm5_next_gguf_tp_load glm5_next_gguf_test
                 "PASS: GLM-5.3 GGUF streaming TP" 60 "--tp-load")
             set_tests_properties(glm5_next_gguf_tp_load PROPERTIES LABELS "cuda;gguf;tp" RUN_SERIAL TRUE)
+            fastllm_add_checked_test(glm5_next_gguf_prefill_formats glm5_next_gguf_test
+                "PASS GGUF NUMA prefill CUDA format dispatch" 60 "--prefill-formats")
+            set_tests_properties(glm5_next_gguf_prefill_formats PROPERTIES LABELS "cuda;gguf")
+            fastllm_add_checked_test(glm5_next_gguf_exact_linear glm5_next_gguf_test
+                "PASS GGUF exact verifier linear" 60 "--exact-linear")
+            set_tests_properties(glm5_next_gguf_exact_linear PROPERTIES LABELS "cuda;gguf;mtp" RUN_SERIAL TRUE)
         endif()
 
         add_executable(cpu_gguf_iq4_xs_test test/basic/test_cpu_gguf_iq4_xs.cpp)
@@ -1278,6 +1284,9 @@ if (UNIT_TEST)
         target_link_libraries(glm5_next_dsa_test PRIVATE fastllm)
         target_include_directories(glm5_next_dsa_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         add_test(NAME glm5_next_dsa COMMAND glm5_next_dsa_test)
+        add_test(NAME glm5_next_dsa_mtp_rollback COMMAND glm5_next_dsa_test --rollback)
+        set_tests_properties(glm5_next_dsa_mtp_rollback PROPERTIES LABELS cuda SKIP_RETURN_CODE 77
+            RUN_SERIAL TRUE TIMEOUT 180 PASS_REGULAR_EXPRESSION "PASS GLM DSA MTP rollback on all CUDA devices")
         set_tests_properties(glm5_next_dsa PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
 
         add_executable(glm5_next_flashinfer_test test/basic/test_glm5_next_flashinfer.cpp)
@@ -1295,6 +1304,12 @@ if (UNIT_TEST)
         target_include_directories(glm5_next_mla_prefill_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         add_test(NAME glm5_next_mla_prefill COMMAND glm5_next_mla_prefill_test)
         set_tests_properties(glm5_next_mla_prefill PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+
+        add_executable(cuda_matmul_single_rows_test test/basic/test_cuda_matmul_single_rows.cpp)
+        target_link_libraries(cuda_matmul_single_rows_test PRIVATE fastllm)
+        target_include_directories(cuda_matmul_single_rows_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME cuda_matmul_single_rows COMMAND cuda_matmul_single_rows_test)
+        set_tests_properties(cuda_matmul_single_rows PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
 
         if (NOT WIN32)
             add_executable(cuda_paged_fragmented_attention_test test/basic/test_cuda_paged_fragmented_attention.cpp)

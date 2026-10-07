@@ -3094,14 +3094,15 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
     };
     const bool overlapCpu = rank == 0 && cpuCount > 0 && (rows == 1 || batchExperts);
     double cpuStart = 0;
+    double cpuElapsedUs = 0;
     if (overlapCpu) {
         cpuStart = HybridNowUs();
         if (glmBatch)
             NumasMoeVerifyExpertsWithOverlap(reinterpret_cast<const uint16_t *>(root.host), root.CpuOutput(),
                 rows, weights, weightsBatch, root.Indices(), root.Owners(), root.Scores(), topk, layer,
-                layout.swigluLimit, true, 128, submitGpu);
+                layout.swigluLimit, true, 128, submitGpu, &cpuElapsedUs, work.group->cpuDecodeReady);
         else NumasMoeDecodeExpertsBatchWithOverlap(root.host, root.CpuOutput(), rows, weights, weightsBatch,
-            root.Indices(), root.Owners(), root.Scores(), topk, layer, submitGpu);
+            root.Indices(), root.Owners(), root.Scores(), topk, layer, submitGpu, &cpuElapsedUs);
     } else {
         submitGpu();
     }
@@ -3111,7 +3112,8 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
             if (!overlapCpu)
                 NumasMoeDecodeExpertsBatch(root.host, root.CpuOutput(), rows, weights, weightsBatch,
                     root.Indices(), root.Owners(), root.Scores(), topk, layer);
-            const double cpuUs = HybridNowUs() - (overlapCpu ? cpuStart : start);
+            const double cpuUs = cpuElapsedUs > 0 ? cpuElapsedUs :
+                HybridNowUs() - (overlapCpu ? cpuStart : start);
             state.cpuTime.Observe(cpuUs);
             if (batchGGUF && count > 1) state.cpuExpert[timingLayer].Observe(cpuUs / cpuCount);
             else if (overlap) overlap->layers[timingLayer].cpuExpert.Observe(cpuUs / cpuCount);

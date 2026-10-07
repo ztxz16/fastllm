@@ -114,6 +114,10 @@ namespace fastllm {
         Data **weights, int weightsBatch, const int32_t *indices,
         const int32_t *gpuIndices, const float *scores, int topk, int layer,
         const std::function<void()> &submitGpu);
+    void NumasMoeDecodeExpertsBatchWithOverlap(const float *input, float *output, int rows,
+        Data **weights, int weightsBatch, const int32_t *indices,
+        const int32_t *gpuIndices, const float *scores, int topk, int layer,
+        const std::function<void()> &submitGpu, double *cpuElapsedUs);
 
     // V4.1 verifier: keep all rows for a CPU expert in one grouped GEMM.
     // perRoute returns BF16-rounded FP32 expert outputs at [row, route, hidden];
@@ -129,14 +133,33 @@ namespace fastllm {
         const int32_t *gpuIndices, const float *scores, int topk, int layer,
         float swigluLimit, bool perRoute, int activationQuantBlock);
 
-    // Keep grouped CPU weight reuse while submitting GPU/DMA work during
-    // gate/up execution. The callback has the same worker-pool restrictions
-    // as NumasMoeDecodeExpertsWithOverlap.
+    // Decode-compatible GGUF verifier rows reuse the single-row workers;
+    // other formats retain grouped CPU weight reuse. The callback has the
+    // same worker-pool restrictions as NumasMoeDecodeExpertsWithOverlap.
     void NumasMoeVerifyExpertsWithOverlap(const uint16_t *input, void *output, int rows,
         Data **weights, int weightsBatch, const int32_t *indices,
         const int32_t *gpuIndices, const float *scores, int topk, int layer,
         float swigluLimit, bool perRoute, int activationQuantBlock,
         const std::function<void()> &submitGpu);
+
+    // Exact GGUF decode rows report CPU time without callback-only stalls.
+    // Other grouped formats return zero, leaving their existing estimator intact.
+    void NumasMoeVerifyExpertsWithOverlap(const uint16_t *input, void *output, int rows,
+        Data **weights, int weightsBatch, const int32_t *indices,
+        const int32_t *gpuIndices, const float *scores, int topk, int layer,
+        float swigluLimit, bool perRoute, int activationQuantBlock,
+        const std::function<void()> &submitGpu, double *cpuElapsedUs);
+
+    // A prepared weight owner may reuse CanRunNumasMoeDecodeExperts' result
+    // until its registered weights or NUMA layout change. Small GGUF batches
+    // drive CPU rows independently of GPU submission, which stays on the
+    // calling thread. Both branches finish before return, including on error.
+    void NumasMoeVerifyExpertsWithOverlap(const uint16_t *input, void *output, int rows,
+        Data **weights, int weightsBatch, const int32_t *indices,
+        const int32_t *gpuIndices, const float *scores, int topk, int layer,
+        float swigluLimit, bool perRoute, int activationQuantBlock,
+        const std::function<void()> &submitGpu, double *cpuElapsedUs,
+        bool decodeCompatible);
 
     // NUMA MoE keeps reusable host/CUDA staging buffers outside the model.
     // Release them explicitly while the CUDA allocator is still alive.

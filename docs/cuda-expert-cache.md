@@ -133,8 +133,14 @@ the planner. Scored GGUF decode uses the ordinary NUMA row workers with an
 output-route map, preserving BF16 rounding, clamp and route-score boundaries
 without constructing the multi-row verifier's per-expert task lists. Unscored
 GGUF decode, including Qwen Flash-Next, keeps its specialized subset workers
-and uses the same corrected timing and single-row planner. Verification retains
-its separate grouped execution and cost estimates.
+and uses the same corrected timing and single-row planner. Small scored GGUF
+verification batches with per-route output (up to 32 rows, subject to decode
+kernel support) reuse these exact workers one input row at a time. The first
+CPU row launches its workers before submitting GPU work; all-GPU batches still
+submit once. Both scored and unscored GGUF verification measure worker CPU
+time without callback-only stalls. Verification retains separate estimates
+for each layer and row count and charges uploads per unique expert. Other
+formats and larger batches retain their grouped path.
 
 Single-GPU FP32 verification accepts two to nine rows. It groups misses by
 expert identity, gives all routes of one expert the same CPU/GPU owner, and

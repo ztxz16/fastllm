@@ -4162,6 +4162,9 @@ namespace fastllm {
             }
         }
         uint64_t totalLoadBytes = 0;
+        const char *glmMtp = std::getenv("FASTLLM_GLM5_NEXT_ENABLE_MTP");
+        const int loadedLayerCount = ggufMainLayerCount +
+            (arch == "glm5_next" && glmMtp && std::atoi(glmMtp) > 0 ? ggufMtpLayerCount : 0);
         for (int i = 0; i < readGGUFTasks.size(); i++) {
             if (model->model_struct == "qwen4_exp" &&
                 readGGUFTasks[i].name == "model.language_model.ple_embedding.weight") {
@@ -4180,7 +4183,7 @@ namespace fastllm {
                 continue;
             }
             std::string &weightName = readGGUFTasks[i].name;
-            if (IsGGUFTaskBeyondMainLayers(weightName, ggufMainLayerCount)) {
+            if (IsGGUFTaskBeyondMainLayers(weightName, loadedLayerCount)) {
                 continue;
             }
             tensors.push_back(weightName);

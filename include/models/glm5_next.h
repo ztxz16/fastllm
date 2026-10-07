@@ -14,8 +14,15 @@
 namespace fastllm {
     class CudaChunkedPrefillPipeline;
 
+    struct Glm5NextIndexerCheckpoint {
+        Data tailKeys, tailGates;
+        int tokens = 0;
+    };
+
     struct Glm5NextIndexerCache {
         Data keys, tailKeys, tailGates;
+        Data replayKeys, replayGates;
+        bool captureReplay = false;
         Data hadamard; // immutable workspace, not part of prefix snapshots
         Data pageTable; // derived GPU page map; rebuild after page/history changes
         std::vector<int> pageTableIds;
@@ -112,10 +119,14 @@ namespace fastllm {
         void PrepareThreadTp();
         void ThreadTpAllReduce(Data &data);
         void RemoveThreadTpRequest(const std::vector<std::pair<Data, Data>> *key);
+        struct KdaReplayCapture;
+        Data &OutputHead();
         int ForwardThreadTp(const Data &inputIds,
                 std::vector<std::pair<Data, Data>> &pastKeyValues,
                 const GenerationConfig &generationConfig,
-                const LastTokensManager &lastTokens, std::vector<float> *logits);
+                const LastTokensManager &lastTokens, std::vector<float> *logits,
+                bool sampleOutput = true, Data *targetHiddenStates = nullptr,
+                std::vector<KdaReplayCapture> *kdaReplay = nullptr);
 
         struct KdaReplayCapture {
             Data qProjected;
@@ -131,6 +142,8 @@ namespace fastllm {
             std::vector<Data> kdaFirst;
             std::vector<Data> kdaSecond;
             std::vector<int> sparseLengths;
+            std::vector<Glm5NextIndexerCheckpoint> indexer;
+            std::vector<TargetRuntimeCheckpoint> ranks;
             bool ready = false;
         };
 

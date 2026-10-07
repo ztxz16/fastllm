@@ -349,10 +349,12 @@ bool TryGlm5MultiGpuHybrid(OffloadGroup &group, DeviceCache &origin, int table,
                 r.Indices(), r.Owners(), topk, layer, submitGpu, r.Scores(), layout.swigluLimit, 128, &elapsed);
             state.cpu[timingLayer].ObserveDecodeCpu(cpuRoutes, elapsed);
         } else {
+            double elapsed = 0;
             NumasMoeVerifyExpertsWithOverlap(reinterpret_cast<const uint16_t *>(r.host), r.CpuOutput(), rows,
                 weights, weightsBatch, r.Indices(), r.Owners(), r.Scores(), topk, layer,
-                layout.swigluLimit, true, 128, submitGpu);
-            state.cpu[timingLayer].cpuExpert.Observe((HybridNowUs() - cpuStart) / cpuRoutes);
+                layout.swigluLimit, true, 128, submitGpu, &elapsed, group.cpuDecodeReady);
+            state.cpu[timingLayer].cpuExpert.Observe(
+                (elapsed > 0 ? elapsed : HybridNowUs() - cpuStart) / cpuRoutes);
         }
         checkCudaErrors("GLM CPU results", cudaMemcpyAsync(r.device, r.CpuOutput(),
             size_t(routes) * hidden * sizeof(float), cudaMemcpyHostToDevice, cudaStreamPerThread));
