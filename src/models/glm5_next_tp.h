@@ -209,7 +209,7 @@ namespace fastllm {
     int Glm5NextModel::StreamingThreadTpLayer(const std::string &name) const {
         const auto arch = weight.dicts.find("gguf_architecture");
         if (!threadTpState || threadTpRank >= 0 || arch == weight.dicts.end() ||
-            arch->second != "glm5next") return -1;
+            (arch->second != "glm5next" && arch->second != "glm5-next")) return -1;
         if (name == "lm_head.weight" || name == languagePrefix + "norm.weight") return block_cnt;
         const std::string prefix = languagePrefix + "layers.";
         if (name.rfind(prefix, 0) != 0) return -1;

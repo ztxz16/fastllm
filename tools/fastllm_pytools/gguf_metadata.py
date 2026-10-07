@@ -158,6 +158,7 @@ _ARCHITECTURE_CONFIGS = {
     "glm-dsa": ("glm_moe_dsa", "GlmMoeDsaForCausalLM"),
     "glm_moe_dsa": ("glm_moe_dsa", "GlmMoeDsaForCausalLM"),
     "glm5next": ("glm5_next", "Glm5NextForConditionalGeneration"),
+    "glm5-next": ("glm5_next", "Glm5NextForConditionalGeneration"),
     "minimax_m2": ("minimax_m2", "MiniMaxM2ForCausalLM"),
 }
 

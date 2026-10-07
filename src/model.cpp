@@ -3139,7 +3139,7 @@ namespace fastllm {
             {"qwen4exp", "qwen4_exp"},
             {"glm4_moe", "glm4_moe"}, // glm4_moe
             {"glm-dsa", "glm_moe_dsa"}, {"glm_moe_dsa", "glm_moe_dsa"}, // glm_moe_dsa
-            {"glm5next", "glm5_next"},
+            {"glm5next", "glm5_next"}, {"glm5-next", "glm5_next"},
             {"minimax_m2", "minimax_m2"}, // minimax_m2
             {"deepseek2", "deepseek_v2"}, {"deepseek_v2", "deepseek_v2"},  {"deepseek_v3", "deepseek_v2"} // deepseek_v2
         };

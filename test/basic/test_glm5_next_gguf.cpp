@@ -213,7 +213,10 @@ int TestStreamingTp() {
         for (size_t i = 0; i < values.size(); ++i) values[i] = i * .125f;
         std::memcpy(w.cpuData, values.data(), w.GetBytes());
         w.name = name; w.isModelWeight = true; names.insert(name);
-        Check(model.ShouldLoadWeightSeriallyBeforeOthers(name, {}), "TP dense group missing");
+        for (const char *arch : {"glm5next", "glm5-next"}) {
+            model.weight.dicts["gguf_architecture"] = arch;
+            Check(model.ShouldLoadWeightSeriallyBeforeOthers(name, {}), "TP dense group missing");
+        }
     }
     for (const std::string name : {base + "mlp.experts.0.down_proj.weight",
                                   std::string("model.language_model.embed_tokens.weight")}) {
@@ -341,6 +344,12 @@ void Run(const std::string &directory) {
     tensors.push_back(FloatTensor("blk.3.attn_k_b.weight", {heads,rank,keyDim}, GGML_TYPE_F32, k));
     tensors.push_back(FloatTensor("blk.3.attn_v_b.weight", {heads,valueDim,rank}, GGML_TYPE_F32, v));
     tensors.push_back(FloatTensor("blk.0.ssm_a", {heads}, GGML_TYPE_F32, {-std::exp(.25f),-std::exp(-.75f)}));
+    for (const char *kind : {"q", "k", "v"}) {
+        const std::vector<int> shape = std::string(kind) == "k" ?
+            std::vector<int>{2, 1, 4} : std::vector<int>{1, 2, 1, 4};
+        tensors.push_back(FloatTensor("blk.0.ssm_conv1d_" + std::string(kind) + ".weight",
+            shape, GGML_TYPE_F32, {1, 2, 3, 4, 5, 6, 7, 8}));
+    }
     tensors.push_back(FloatTensor("blk.0.hc_attn_fn.weight", {24,32}, GGML_TYPE_Q8_0, std::vector<float>(24*32,.5f)));
     tensors.push_back(FloatTensor("blk.3.indexer_compressor_ape.weight", {4,128}, GGML_TYPE_F32, std::vector<float>(512,.25f)));
     tensors.push_back(FloatTensor("blk.4.nextn.enorm.weight", {32}, GGML_TYPE_F32, std::vector<float>(32,1.f)));
@@ -364,7 +373,7 @@ void Run(const std::string &directory) {
     AppendGGUFTasks("glm5_next",first,tasks);
     Check(tasks.empty(),"metadata-only first shard");
     AppendGGUFTasks("glm5_next",second,tasks);
-    Check(tasks.size()==15,"split expert tasks and NextN weight mappings");
+    Check(tasks.size()==18,"split expert tasks and NextN weight mappings");
     WeightMap weights;
     for (auto &task : tasks) WeightImportGGUFTensor(&weights[task.name],&task.tensor,task.fileName,task.offset,task.replaceType);
     const std::string base="model.language_model.layers.";
@@ -384,6 +393,14 @@ void Run(const std::string &directory) {
     }
     for (int repeat=0; repeat<2; ++repeat) {
         glm5_next_detail::RestoreGgufWeights(weights,4,heads,keyDim,valueDim,rank);
+        for (const char *kind : {"q", "k", "v"}) {
+            Data &conv = weights[base + "0.self_attn." + kind + "_conv1d.weight"];
+            Check(conv.dims == std::vector<int>({2, 1, 4}), "GGUF convolution shape normalization");
+            for (int i = 0; i < 8; ++i) {
+                Check(reinterpret_cast<float *>(conv.cpuData)[i] == float(i + 1),
+                    "GGUF convolution normalization changed weight values");
+            }
+        }
         Data &combined=weights[base+"3.self_attn.kv_b_proj.weight"];
         Check(combined.dataType==BFLOAT16 && combined.dims==std::vector<int>({heads*(keyDim+valueDim),rank}),"KV-B reconstructed shape/dtype");
         for(uint64_t i=0;i<combined.Count(0);++i)

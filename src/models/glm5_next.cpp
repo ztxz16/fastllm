@@ -952,7 +952,8 @@ namespace fastllm {
     }
 
     void Glm5NextModel::OnModelWeightsLoaded() {
-        if (weight.dicts["gguf_architecture"] == "glm5next") {
+        const auto &ggufArch = weight.dicts["gguf_architecture"];
+        if (ggufArch == "glm5next" || ggufArch == "glm5-next") {
             glm5_next_detail::RestoreGgufWeights(weight, block_cnt + (mtpEnabled ? 1 : 0),
                 num_attention_heads, qkNopeHeadDim, valueHeadDim, kvLoraRank);
         }
