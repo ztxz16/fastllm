@@ -401,6 +401,7 @@ if (USE_CUDA)
         src/devices/cuda/gguf_mmq/fastllm-gguf-moe-stream.cu
         src/devices/cuda/attention/fastllm-attention.cu
         src/devices/cuda/attention/fastllm-attention-workspace.cu
+        src/devices/cuda/attention/fastllm-attention-output.cu
         src/devices/cuda/attention/fastllm-paged-cache.cu
         src/devices/cuda/attention/fastllm-paged-attention.cu
         src/devices/cuda/attention/fastllm-paged-attention-fp16-bf16.cu

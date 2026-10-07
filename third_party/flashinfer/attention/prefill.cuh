@@ -2516,7 +2516,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void SinglePrefillWithKVCache
 
 template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, PosEncodingMode POS_ENCODING_MODE,
           bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename AttentionVariant,
-          bool ENABLE_SM75_FP16_VO_SPLIT, typename Params>
+          bool ENABLE_SM75_FP16_VO_SPLIT, typename Params, bool ENABLE_SPLIT_KV = true>
 cudaError_t SinglePrefillWithKVCacheDispatchedImpl(Params params, typename Params::DTypeO* tmp,
                                                  cudaStream_t stream) {
   using DTypeQ = typename Params::DTypeQ;
@@ -2678,7 +2678,7 @@ cudaError_t SinglePrefillWithKVCacheDispatchedImpl(Params params, typename Param
               num_chunks = 0;
             }
 
-            if (num_chunks <= 1 || tmp == nullptr) {
+            if (!ENABLE_SPLIT_KV || num_chunks <= 1 || tmp == nullptr) {
               // Enough parallelism, do not split-kv
               params.partition_kv = false;
               void* args[] = {(void*)&params};
@@ -2686,7 +2686,7 @@ cudaError_t SinglePrefillWithKVCacheDispatchedImpl(Params params, typename Param
               dim3 nthrs(32, NUM_WARPS_Q, NUM_WARPS_KV);
               FLASHINFER_CUDA_CALL(
                   cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-            } else {
+            } else if constexpr (ENABLE_SPLIT_KV) {
               // Use cooperative groups to increase occupancy
               params.partition_kv = true;
               float* tmp_lse = (float*)(tmp + num_chunks * qo_len * num_qo_heads * HEAD_DIM_VO);
@@ -2701,8 +2701,8 @@ cudaError_t SinglePrefillWithKVCacheDispatchedImpl(Params params, typename Param
               FLASHINFER_CUDA_CALL(
                   cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
               if constexpr (AttentionVariant::use_softmax) {
-                FLASHINFER_CUDA_CALL(MergeStates(tmp, tmp_lse, o, lse, num_chunks, qo_len,
-                                                 num_qo_heads, HEAD_DIM_VO, stream));
+                FLASHINFER_CUDA_CALL(MergeStatesDispatched<HEAD_DIM_VO>(tmp, tmp_lse, o, lse, num_chunks, qo_len,
+                                                 num_qo_heads, stream));
               } else {
                 FLASHINFER_CUDA_CALL(
                     AttentionSum(tmp, o, num_chunks, qo_len, num_qo_heads, HEAD_DIM_VO, stream));
@@ -2716,7 +2716,7 @@ cudaError_t SinglePrefillWithKVCacheDispatchedImpl(Params params, typename Param
 
 template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, PosEncodingMode POS_ENCODING_MODE,
           bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename AttentionVariant,
-          typename Params>
+          typename Params, bool ENABLE_SPLIT_KV = true>
 cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::DTypeO* tmp,
                                               cudaStream_t stream) {
   // Pass an explicit specialization flag to both the host planner and kernel.
@@ -2733,12 +2733,12 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
                                   (params.num_qo_heads / params.num_kv_heads);
     if (use_sm75_single_prefill_vo_split(capability.first, capability.second, packed_qo_len)) {
       return SinglePrefillWithKVCacheDispatchedImpl<HEAD_DIM_QK, HEAD_DIM_VO,
-          POS_ENCODING_MODE, USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant, true>(
+          POS_ENCODING_MODE, USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant, true, Params, ENABLE_SPLIT_KV>(
               params, tmp, stream);
     }
   }
   return SinglePrefillWithKVCacheDispatchedImpl<HEAD_DIM_QK, HEAD_DIM_VO,
-      POS_ENCODING_MODE, USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant, false>(
+      POS_ENCODING_MODE, USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant, false, Params, ENABLE_SPLIT_KV>(
           params, tmp, stream);
 }
 
@@ -4335,9 +4335,9 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
                   cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
             }
             if constexpr (AttentionVariant::use_softmax) {
-              FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
+              FLASHINFER_CUDA_CALL(VariableLengthMergeStatesDispatched<HEAD_DIM_VO>(
                   tmp_v, tmp_s, params.merge_indptr, o, lse, params.max_total_num_rows,
-                  params.total_num_rows, num_qo_heads, HEAD_DIM_VO, enable_pdl, stream));
+                  params.total_num_rows, num_qo_heads, enable_pdl, stream));
             } else {
               FLASHINFER_CUDA_CALL(VariableLengthAttentionSum(
                   tmp_v, params.merge_indptr, o, params.max_total_num_rows, params.total_num_rows,
@@ -4524,9 +4524,9 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
                   cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
             }
             if constexpr (AttentionVariant::use_softmax) {
-              FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
+              FLASHINFER_CUDA_CALL(VariableLengthMergeStatesDispatched<HEAD_DIM_VO>(
                   tmp_v, tmp_s, params.merge_indptr, o, lse, params.max_total_num_rows,
-                  params.total_num_rows, num_qo_heads, HEAD_DIM_VO, enable_pdl, stream));
+                  params.total_num_rows, num_qo_heads, enable_pdl, stream));
             } else {
               FLASHINFER_CUDA_CALL(VariableLengthAttentionSum(
                   tmp_v, params.merge_indptr, o, params.max_total_num_rows, params.total_num_rows,

@@ -35,6 +35,6 @@ inline cudaError_t Run(const BF16 *q, const BF16 *k, const BF16 *v, const float 
     p.sink = sink;
     // A null scratch pointer disables split-KV so the sink is counted once.
     return flashinfer::SinglePrefillWithKVCacheDispatched<192, 128,
-        flashinfer::PosEncodingMode::kNone, false, flashinfer::MaskMode::kCausal, Attention>(p, nullptr, stream);
+        flashinfer::PosEncodingMode::kNone, false, flashinfer::MaskMode::kCausal, Attention, Params, false>(p, nullptr, stream);
 }
 }

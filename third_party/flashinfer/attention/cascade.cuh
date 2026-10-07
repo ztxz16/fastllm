@@ -634,35 +634,45 @@ cudaError_t MergeStateInPlace(DType* v, float* s, DType* v_other, float* s_other
  * \return status Indicates whether CUDA calls are successful
  * \note s are logsumexp values with base 2.
  */
+template <uint32_t HEAD_DIM, typename DTypeIn, typename DTypeO>
+cudaError_t MergeStatesDispatched(DTypeIn* v, float* s, DTypeO* v_merged, float* s_merged,
+                        uint32_t num_index_sets, uint32_t seq_len, uint32_t num_heads,
+                        cudaStream_t stream = nullptr) {
+  uint32_t head_dim = HEAD_DIM;
+  constexpr uint32_t vec_size = std::max<size_t>(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
+  constexpr uint32_t bdx = HEAD_DIM / vec_size;
+  if (num_index_sets >= seq_len) {
+    constexpr uint32_t num_threads = 128;
+    constexpr uint32_t bdy = num_threads / bdx;
+    dim3 nblks(seq_len, num_heads);
+    dim3 nthrs(bdx, bdy);
+    constexpr uint32_t num_smem_stages = 4;
+    auto kernel =
+        MergeStatesLargeNumIndexSetsKernel<vec_size, bdx, bdy, num_smem_stages, DTypeIn, DTypeO>;
+    void* args[] = {&v, &s, &v_merged, &s_merged, &num_index_sets, &num_heads};
+    uint32_t smem_size =
+        num_smem_stages * bdy * head_dim * sizeof(DTypeIn) + num_threads * sizeof(float);
+    FLASHINFER_CUDA_CALL(
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+  } else {
+    uint32_t bdy = num_heads;
+    dim3 nblks(seq_len);
+    dim3 nthrs(bdx, bdy);
+    auto kernel = MergeStatesKernel<vec_size, DTypeIn, DTypeO>;
+    void* args[] = {&v, &s, &v_merged, &s_merged, &num_index_sets, &num_heads, &head_dim};
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
+  }
+  return cudaSuccess;
+}
+
 template <typename DTypeIn, typename DTypeO>
 cudaError_t MergeStates(DTypeIn* v, float* s, DTypeO* v_merged, float* s_merged,
                         uint32_t num_index_sets, uint32_t seq_len, uint32_t num_heads,
                         uint32_t head_dim, cudaStream_t stream = nullptr) {
   DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-    constexpr uint32_t vec_size = std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
-    constexpr uint32_t bdx = HEAD_DIM / vec_size;
-    if (num_index_sets >= seq_len) {
-      constexpr uint32_t num_threads = 128;
-      constexpr uint32_t bdy = num_threads / bdx;
-      dim3 nblks(seq_len, num_heads);
-      dim3 nthrs(bdx, bdy);
-      constexpr uint32_t num_smem_stages = 4;
-      auto kernel =
-          MergeStatesLargeNumIndexSetsKernel<vec_size, bdx, bdy, num_smem_stages, DTypeIn, DTypeO>;
-      void* args[] = {&v, &s, &v_merged, &s_merged, &num_index_sets, &num_heads};
-      uint32_t smem_size =
-          num_smem_stages * bdy * head_dim * sizeof(DTypeIn) + num_threads * sizeof(float);
-      FLASHINFER_CUDA_CALL(
-          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-    } else {
-      uint32_t bdy = num_heads;
-      dim3 nblks(seq_len);
-      dim3 nthrs(bdx, bdy);
-      auto kernel = MergeStatesKernel<vec_size, DTypeIn, DTypeO>;
-      void* args[] = {&v, &s, &v_merged, &s_merged, &num_index_sets, &num_heads, &head_dim};
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
-    }
+    return MergeStatesDispatched<HEAD_DIM>(
+        v, s, v_merged, s_merged, num_index_sets, seq_len, num_heads, stream);
   });
   return cudaSuccess;
 }
@@ -683,10 +693,10 @@ cudaError_t AttentionSum(DTypeIn* v, DTypeO* v_sum, uint32_t num_index_sets, uin
   return cudaSuccess;
 }
 
-template <typename DTypeIn, typename DTypeO, typename IdType>
-cudaError_t VariableLengthMergeStates(DTypeIn* v, float* s, IdType* indptr, DTypeO* v_merged,
+template <uint32_t HEAD_DIM, typename DTypeIn, typename DTypeO, typename IdType>
+cudaError_t VariableLengthMergeStatesDispatched(DTypeIn* v, float* s, IdType* indptr, DTypeO* v_merged,
                                       float* s_merged, uint32_t max_seq_len, uint32_t* seq_len,
-                                      uint32_t num_heads, uint32_t head_dim, bool enable_pdl,
+                                      uint32_t num_heads, bool enable_pdl,
                                       cudaStream_t stream = nullptr) {
   int dev_id = 0;
   int num_sms = 0;
@@ -694,43 +704,54 @@ cudaError_t VariableLengthMergeStates(DTypeIn* v, float* s, IdType* indptr, DTyp
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
 
+  uint32_t head_dim = HEAD_DIM;
+  constexpr uint32_t vec_size = std::max<size_t>(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
+  constexpr uint32_t bdx = HEAD_DIM / vec_size;
+  constexpr uint32_t num_threads = 128;
+  constexpr uint32_t bdy = num_threads / bdx;
+  constexpr uint32_t num_smem_stages = 4;
+  uint32_t smem_size =
+      num_smem_stages * bdy * head_dim * sizeof(DTypeIn) + num_threads * sizeof(float);
+  auto kernel = PersistentVariableLengthMergeStatesKernel<vec_size, bdx, bdy, num_smem_stages,
+                                                          DTypeIn, DTypeO, IdType>;
+  FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel,
+                                                                     num_threads, smem_size));
+  num_blocks_per_sm = min(num_blocks_per_sm, ceil_div(max_seq_len * num_heads, num_sms));
+
+  dim3 nblks(num_sms * num_blocks_per_sm);
+  dim3 nthrs(bdx, bdy);
+  void* args[] = {&v, &s, &indptr, &v_merged, &s_merged, &max_seq_len, &seq_len, &num_heads};
+  FLASHINFER_CUDA_CALL(
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+
+  // PDL launch
+  if (enable_pdl) {
+    cudaLaunchAttribute attribute[1];
+    attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attribute[0].val.programmaticStreamSerializationAllowed = 1;
+    cudaLaunchConfig_t config;
+    config.attrs = attribute;
+    config.numAttrs = 1;
+    config.gridDim = nblks;
+    config.blockDim = nthrs;
+    config.dynamicSmemBytes = smem_size;
+    config.stream = stream;
+    FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, v, s, indptr, v_merged, s_merged,
+                                            max_seq_len, seq_len, num_heads));
+  } else {
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+  }
+  return cudaSuccess;
+}
+
+template <typename DTypeIn, typename DTypeO, typename IdType>
+cudaError_t VariableLengthMergeStates(DTypeIn* v, float* s, IdType* indptr, DTypeO* v_merged,
+                                      float* s_merged, uint32_t max_seq_len, uint32_t* seq_len,
+                                      uint32_t num_heads, uint32_t head_dim, bool enable_pdl,
+                                      cudaStream_t stream = nullptr) {
   DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-    constexpr uint32_t vec_size = std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
-    constexpr uint32_t bdx = HEAD_DIM / vec_size;
-    constexpr uint32_t num_threads = 128;
-    constexpr uint32_t bdy = num_threads / bdx;
-    constexpr uint32_t num_smem_stages = 4;
-    uint32_t smem_size =
-        num_smem_stages * bdy * head_dim * sizeof(DTypeIn) + num_threads * sizeof(float);
-    auto kernel = PersistentVariableLengthMergeStatesKernel<vec_size, bdx, bdy, num_smem_stages,
-                                                            DTypeIn, DTypeO, IdType>;
-    FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel,
-                                                                       num_threads, smem_size));
-    num_blocks_per_sm = min(num_blocks_per_sm, ceil_div(max_seq_len * num_heads, num_sms));
-
-    dim3 nblks(num_sms * num_blocks_per_sm);
-    dim3 nthrs(bdx, bdy);
-    void* args[] = {&v, &s, &indptr, &v_merged, &s_merged, &max_seq_len, &seq_len, &num_heads};
-    FLASHINFER_CUDA_CALL(
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-
-    // PDL launch
-    if (enable_pdl) {
-      cudaLaunchAttribute attribute[1];
-      attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-      attribute[0].val.programmaticStreamSerializationAllowed = 1;
-      cudaLaunchConfig_t config;
-      config.attrs = attribute;
-      config.numAttrs = 1;
-      config.gridDim = nblks;
-      config.blockDim = nthrs;
-      config.dynamicSmemBytes = smem_size;
-      config.stream = stream;
-      FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, v, s, indptr, v_merged, s_merged,
-                                              max_seq_len, seq_len, num_heads));
-    } else {
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-    }
+    return VariableLengthMergeStatesDispatched<HEAD_DIM>(
+        v, s, indptr, v_merged, s_merged, max_seq_len, seq_len, num_heads, enable_pdl, stream);
   });
   return cudaSuccess;
 }

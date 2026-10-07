@@ -26,6 +26,7 @@
 #include "fastdiv.cuh"
 #include "pos_enc.cuh"
 #include "utils.cuh"
+#include "fastllm-attention-output.cuh"
 #endif
 
 #include "fastllm-cuda.cuh"

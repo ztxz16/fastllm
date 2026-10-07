@@ -1219,7 +1219,7 @@ bool FastllmCudaHalfAttention(const fastllm::Data &q, const fastllm::Data &k, co
                 break;
             }
             
-            // 分配临时缓冲区（如果需要 partition-kv）
+            // This path never splits KV; reflect that in the template dispatch below.
             half *tmp = nullptr;
             cudaError_t status = cudaSuccess;
             // Pad/Split, the FastLLM allocator, and the consumers below all
@@ -1252,11 +1252,11 @@ bool FastllmCudaHalfAttention(const fastllm::Data &q, const fastllm::Data &k, co
                 
                 // 调用 FlashInfer prefill 接口，根据 mask_mode 选择不同的 variant
                 if (mask_mode == MaskMode::kCausal) {
-                    status = SinglePrefillWithKVCacheDispatched<128, 128, PosEncodingMode::kNone, false, MaskMode::kCausal, DefaultAttention<false, false, false, false>>(
-                        params, tmp, stream);
+                    status = SinglePrefillWithKVCacheDispatched<128, 128, PosEncodingMode::kNone, false, MaskMode::kCausal, DefaultAttention<false, false, false, false>,
+                        SinglePrefillParams<half, half, half>, false>(params, tmp, stream);
                 } else {
-                    status = SinglePrefillWithKVCacheDispatched<128, 128, PosEncodingMode::kNone, false, MaskMode::kNone, DefaultAttention<false, false, false, false>>(
-                        params, tmp, stream);
+                    status = SinglePrefillWithKVCacheDispatched<128, 128, PosEncodingMode::kNone, false, MaskMode::kNone, DefaultAttention<false, false, false, false>,
+                        SinglePrefillParams<half, half, half>, false>(params, tmp, stream);
                 }
             }
             
@@ -1703,8 +1703,8 @@ inline cudaError_t Run(const half *q, const half *k, const half *v, half *out, h
     if (status != cudaSuccess)
         return status;
     if (splits > 1) {
-        status = flashinfer::MergeStates(partition, p.lse, nhd, nullptr, splits, queries, heads,
-                                         128, stream);
+        status = flashinfer::MergeStatesDispatched<128>(
+            partition, p.lse, nhd, nullptr, splits, queries, heads, stream);
         if (status != cudaSuccess)
             return status;
     }
