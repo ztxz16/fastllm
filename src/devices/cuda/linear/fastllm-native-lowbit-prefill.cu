@@ -34,7 +34,13 @@ struct Plan {
     cublasLtMatrixLayout_t a = nullptr, b = nullptr, c = nullptr;
     cublasLtMatmulAlgo_t algo{};
     bool valid = false, tuned = false;
-    std::vector<cublasLtMatmulAlgo_t> candidates;
+    // nvcc 13.0 EDG frontend ICE workaround: a struct holding
+    // std::vector<cublasLtMatmulAlgo_t> that also has a user-defined dtor
+    // crashes the compiler (lexical.c find_allocated_name_reference, rc=134);
+    // indirecting through a wrapper struct does not help. Fixed array sized
+    // to the heuristic request below (8 candidates).
+    cublasLtMatmulAlgo_t candidates[8];
+    int nCandidates = 0;
     ~Plan() {
         if (op)
             cublasLtMatmulDescDestroy(op);
@@ -146,8 +152,8 @@ inline Plan *GetPlan(State &s, int bits, int M, int N, int K) {
         return nullptr;
     for (int i = 0; i < count; i++)
         if (h[i].state == CUBLAS_STATUS_SUCCESS)
-            p->candidates.push_back(h[i].algo);
-    if (p->candidates.empty())
+            p->candidates[p->nCandidates++] = h[i].algo;
+    if (p->nCandidates == 0)
         return nullptr;
     p->algo = p->candidates[0];
     p->valid = true;
@@ -165,7 +171,8 @@ inline void Tune(State &s, Plan &p, const void *a, const void *b, float *c) {
         return;
     }
     float best = 1.e30f, alpha = 1, beta = 0;
-    for (auto &candidate : p.candidates) {
+    for (int i = 0; i < p.nCandidates; i++) {
+        auto &candidate = p.candidates[i];
         auto run = [&]() {
             return cublasLtMatmul(s.handle, p.op, &alpha, a, p.a, b, p.b, &beta, c, p.c, c, p.c, &candidate,
                                   s.workspace, State::workspaceBytes, cudaStreamPerThread);
