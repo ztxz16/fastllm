@@ -375,12 +375,28 @@ if (USE_CUDA)
         src/devices/cuda/fastllm-kvmem.cu
         src/devices/cuda/fastllm-triton-cuda.cu
         src/devices/cuda/fastllm-ggml-cuda.cu
+        src/devices/cuda/fastllm-gguf-mmvq-q.cu
+        src/devices/cuda/fastllm-gguf-mmvq-k.cu
+        src/devices/cuda/fastllm-gguf-mmvq-iq.cu
+        src/devices/cuda/fastllm-gguf-dequant.cu
         src/devices/cuda/fastllm-gguf-t8-extended.cu
+        src/devices/cuda/fastllm-gguf-t8-extended-q2_k.cu
+        src/devices/cuda/fastllm-gguf-t8-extended-iq2.cu
+        src/devices/cuda/fastllm-gguf-t8-extended-iq3.cu
         src/devices/cuda/fastllm-gguf-t8-tiled.cu
         src/devices/cuda/fastllm-gguf-planar-t8.cu
         src/devices/cuda/fastllm-gguf-planar.cu
         src/devices/cuda/fastllm-gguf-planar-mixed.cu
         src/devices/cuda/gguf_mmq/fastllm-gguf-mmq.cu
+        src/devices/cuda/gguf_mmq/fastllm-gguf-mmvq-q.cu
+        src/devices/cuda/gguf_mmq/fastllm-gguf-mmvq-iq1.cu
+        src/devices/cuda/gguf_mmq/fastllm-gguf-mmvq-iq2.cu
+        src/devices/cuda/gguf_mmq/fastllm-gguf-mmq-q.cu
+        src/devices/cuda/gguf_mmq/fastllm-gguf-mmq-k.cu
+        src/devices/cuda/gguf_mmq/fastllm-gguf-mmq-iq1.cu
+        src/devices/cuda/gguf_mmq/fastllm-gguf-mmq-iq2.cu
+        src/devices/cuda/gguf_mmq/fastllm-gguf-mmq-iq3_iq4.cu
+        src/devices/cuda/gguf_mmq/fastllm-gguf-moe-grouped.cu
         src/devices/cuda/gguf_mmq/fastllm-gguf-moe-stream.cu
         src/devices/cuda/attention/fastllm-attention.cu
         src/devices/cuda/attention/paged/fastllm-paged-attention-native.cu
@@ -550,8 +566,12 @@ if(USE_ROCM)
     hipify(CUDA_SOURCE_DIR ${PROJECT_SOURCE_DIR}/src/devices/multicuda HIP_SOURCE_DIR "${PROJECT_SOURCE_DIR}/src/devices/multihip")
     include_directories(include/devices/cuda)
     include_directories(include/devices/multicuda)
-    set(FASTLLM_CUDA_SOURCES src/devices/cuda/cudadevice.cpp src/devices/cuda/cudadevicebatch.cpp 
-        src/devices/hip/fastllm-hip.hip src/devices/hip/fastllm-ggml-hip.hip 
+    set(FASTLLM_CUDA_SOURCES src/devices/cuda/cudadevice.cpp src/devices/cuda/cudadevicebatch.cpp
+        src/devices/hip/fastllm-hip.hip src/devices/hip/fastllm-ggml-hip.hip
+        src/devices/hip/fastllm-gguf-dequant.hip
+        src/devices/hip/fastllm-gguf-mmvq-q.hip
+        src/devices/hip/fastllm-gguf-mmvq-k.hip
+        src/devices/hip/fastllm-gguf-mmvq-iq.hip
         src/devices/multicuda/multicudadevice.cpp src/devices/multihip/fastllm-multihip.hip)
     add_compile_definitions(USE_ROCM)
     add_compile_definitions(USE_CUDA)

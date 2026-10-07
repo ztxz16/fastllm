@@ -287,9 +287,10 @@ template<class T> static void Run(ggml_type type, fastllm::DataType dtype, int b
     Require(fastllm_moe_cuda_cache_stats(0, stats, false) && stats[2] == 0, "released GPU allocation counted");
     std::printf("PASS GGUF cache type=%d dtype=%d batch=%d: mixed layers, snapshot, cold/hot, eviction, duplicate/invalid routes, graph, release\n", type, dtype, batch);
 }
-// Validate the FP32 prefill entry against CPU-decoded weights and an
-// independent Q8 activation oracle. These formats all use MMQ's D4 layout.
-static void RunFloatMmq(ggml_type type, int batch, int columns, int width) {
+// Validate FP32 MMQ/MMVQ against CPU-decoded weights and an independent Q8
+// activation oracle. Exact activations also cover the FP16 metadata layouts.
+static void RunFloatGgufMatmul(ggml_type type, int batch, int columns, int width, bool exactActivation = false) {
+    const auto matmul = batch <= 8 ? FastllmCudaFloatMatMulGGUFMMVQ : FastllmCudaFloatMatMulGGUFMMQ;
     auto weight = Weight(type, width, columns, 5, true);
     const auto decoded = Decode(*weight);
     weight->ToDevice(fastllm::CUDA, {0}, true);
@@ -297,8 +298,13 @@ static void RunFloatMmq(ggml_type type, int batch, int columns, int width) {
     fastllm::Data output(fastllm::FLOAT32, {batch, width});
     Gpu(input); Gpu(output);
     std::vector<float> values(batch*columns), quantized(batch*columns);
-    for (int i = 0; i < batch*columns; ++i)
-        values[i] = i%columns < 32 ? 0 : .37f*std::sin(i*.173f)+.013f*std::cos(i*.71f);
+    for (int i = 0; i < batch*columns; ++i) {
+        // Exact Q8 values also cover formats with FP16 scale/sum metadata or
+        // 64-value scales without making the CPU oracle depend on MMQ layout.
+        values[i] = exactActivation ? (i%32 == 31 ? 127 : (i*17)%255-127)/64.0f
+                                   : .37f*std::sin(i*.173f)+.013f*std::cos(i*.71f);
+        if (i%columns < 32) values[i] = 0;
+    }
     for (int i = 0; i < batch*columns; i += 32) {
         float maximum = 0;
         for (int c = 0; c < 32; ++c) maximum = std::max(maximum, std::fabs(values[i+c]));
@@ -309,10 +315,10 @@ static void RunFloatMmq(ggml_type type, int batch, int columns, int width) {
     Cuda(cudaMemcpy(input.cudaData, values.data(), values.size()*sizeof(float), cudaMemcpyHostToDevice));
     Require(!FastllmCudaFloatMatMulGGUFMMQ(input.cudaData, weight->cudaData, output.cudaData,
         type, 1, columns, width, cudaStreamPerThread), "MMQ stole single-token decode");
-    Require(!FastllmCudaFloatMatMulGGUFMMQ(input.cudaData, weight->cudaData, output.cudaData,
-        type, batch, columns-1, width, cudaStreamPerThread), "MMQ accepted a partial weight block");
-    Require(FastllmCudaFloatMatMulGGUFMMQ(input.cudaData, weight->cudaData, output.cudaData,
-        type, batch, columns, width, cudaStreamPerThread), "FP32 MMQ rejected valid prefill");
+    Require(!matmul(input.cudaData, weight->cudaData, output.cudaData,
+        type, batch, columns-1, width, cudaStreamPerThread), "MMQ/MMVQ accepted a partial weight block");
+    Require(matmul(input.cudaData, weight->cudaData, output.cudaData,
+        type, batch, columns, width, cudaStreamPerThread), "FP32 MMQ/MMVQ rejected valid input");
     Cuda(cudaStreamSynchronize(cudaStreamPerThread));
     std::vector<float> actual(batch*width);
     Cuda(cudaMemcpy(actual.data(), output.cudaData, actual.size()*sizeof(float), cudaMemcpyDeviceToHost));
@@ -324,16 +330,16 @@ static void RunFloatMmq(ggml_type type, int batch, int columns, int width) {
         }
         Require(std::isfinite(actual[row*width+col]) &&
             std::fabs(actual[row*width+col]-reference) <= 2e-5*std::max(1.0, magnitude),
-            "FP32 MMQ disagrees with CPU decoded Q8 dot");
+            "FP32 MMQ/MMVQ disagrees with CPU decoded Q8 dot");
     }
     Require(FastllmCudaMatMulFloatGGUF(input, *weight, fastllm::Data(), output,
-        batch, columns, width), "FP32 GGUF Linear rejected prefill");
+        batch, columns, width), "FP32 GGUF Linear rejected input");
     Cuda(cudaStreamSynchronize(cudaStreamPerThread));
     std::vector<float> dispatched(actual.size());
     Cuda(cudaMemcpy(dispatched.data(), output.cudaData, dispatched.size()*sizeof(float), cudaMemcpyDeviceToHost));
     for (size_t i = 0; i < actual.size(); ++i)
         Require(std::fabs(actual[i]-dispatched[i]) <= 1e-6f*std::max(1.0f,std::fabs(actual[i])),
-                "FP32 GGUF Linear bypassed MMQ");
+                "FP32 GGUF Linear bypassed MMQ/MMVQ");
 }
 
 // Reusing Q8 input must preserve the independent-call results exactly, even
@@ -1655,14 +1661,31 @@ int main(int argc, char **argv) {
             if (properties.major*10+properties.minor < 75) {
                 std::puts("FASTLLM_TEST_SKIP_NO_DEVICE: MMQ requires SM75+"); return 0;
             }
+            // Exercise the separately compiled MMVQ kernels, especially the
+            // IQ1 table initialization, against the CPU oracle on first use.
+            for (auto type : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M})
+                for (int batch = 1; batch <= 8; ++batch)
+                    RunFloatGgufMatmul(type, batch, 256, 47, true);
+            // Cover every separately compiled MMQ family, including the IQ1
+            // device table that must be initialized beside its consuming kernels.
+            for (auto type : {GGML_TYPE_Q2_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1,
+                              GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0,
+                              GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K,
+                              GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ1_S,
+                              GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS,
+                              GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S,
+                              GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS}) {
+                RunFloatGgufMatmul(type, 9, 256, 47, true);
+                RunFloatGgufMatmul(type, 33, 256, 129, true);
+            }
             for (auto type : {GGML_TYPE_Q2_0, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
                               GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS}) {
-                RunFloatMmq(type, 9, 256, 47);
-                RunFloatMmq(type, 33, 256, 129);
+                RunFloatGgufMatmul(type, 9, 256, 47);
+                RunFloatGgufMatmul(type, 33, 256, 129);
             }
-            RunFloatMmq(GGML_TYPE_IQ3_XXS, 65, 2560, 65);
-            RunFloatMmq(GGML_TYPE_IQ4_NL, 129, 320, 47);
-            RunFloatMmq(GGML_TYPE_Q2_0, 129, 320, 47);
+            RunFloatGgufMatmul(GGML_TYPE_IQ3_XXS, 65, 2560, 65);
+            RunFloatGgufMatmul(GGML_TYPE_IQ4_NL, 129, 320, 47);
+            RunFloatGgufMatmul(GGML_TYPE_Q2_0, 129, 320, 47);
             std::puts("PASS: FP32 GGUF MMQ and Linear dispatch"); return 0;
         }
         if (argc > 1 && std::strcmp(argv[1], "--grouped") == 0) {
