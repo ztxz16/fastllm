@@ -9211,8 +9211,13 @@ namespace fastllm {
             // Feed back whole parallel calls, keyed by the actual weight formats
             // and CPU geometry. Mixed GGUF layers must not share a synthetic
             // single-expert curve simply because their matrix sizes match.
-            const bool measuredPrefill = weights[2] && weights[3] &&
-                weights[2]->dataType == DATA_GGUF_FORMAT && !deepSeekV4Mode;
+            const bool measuredNativePrefill = weights[2] && weights[3] &&
+                !deepSeekV4Mode && (IsNumasGroupedNVFP4Weight(weights[2]) ||
+                weights[2]->dataType == FP8_E4M3 ||
+                weights[2]->dataType == FP8_E4M3_BLOCK_128 ||
+                weights[2]->dataType == FP8_E4M3_PERCHANNEL);
+            const bool measuredPrefill = measuredNativePrefill || (weights[2] && weights[3] &&
+                !deepSeekV4Mode && weights[2]->dataType == DATA_GGUF_FORMAT);
             const bool autoExpertLimit = assistConfig.autoExpertLimit || measuredPrefill;
             const bool balanceGpu = assistConfig.balance || measuredPrefill;
             NumasMoeDeviceSpeedTracker *speedTracker = nullptr;
@@ -9224,14 +9229,16 @@ namespace fastllm {
                     weights[2] ? int(weights[2]->dataType) : -1,
                     weights[3] ? int(weights[3]->dataType) : -1,
                     weights[2] ? weights[2]->ggmlType : -1,
-                    weights[3] ? weights[3]->ggmlType : -1});
+                    weights[3] ? weights[3]->ggmlType : -1,
+                    measuredNativePrefill ? bs : 0});
             }
             // Respect an explicit FT_EXPERT_LIMIT override and skip the dynamic
             // CPU/GPU expert split benchmark in that case.
             if (gpuPrefill && !hasExpertLimitOverride) {
 #ifdef USE_CUDA
-                // Prefer actual parallel-call timings. Bootstrap new profiles
-                // with a bounded CPU probe rather than a synthetic benchmark.
+                // Prefer actual parallel-call timings. Native formats retain
+                // synthetic calibration until full calls provide CPU samples:
+                // their fixed output-preparation cost dominates a tiny probe.
                 int measuredLimit = 0;
                 if (autoExpertLimit) {
                     std::vector<int> gpuDevices;
@@ -9242,7 +9249,7 @@ namespace fastllm {
                     measuredLimit = speedTracker->PredictExpertLimit(
                             expertTasks, weights, weightsBatch, gpuDevices,
                             2, &predictCpuMs, &predictGpuMs, residentByDevice);
-                    if (measuredLimit <= 0) {
+                    if (measuredLimit <= 0 && !measuredNativePrefill) {
                         // Sample the two smallest nonresident experts on CPU;
                         // the remaining experts provide simultaneous GPU data.
                         measuredLimit = ComputeNumasMoeProbeExpertLimit(
