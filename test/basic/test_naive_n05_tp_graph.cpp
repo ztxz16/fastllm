@@ -151,7 +151,10 @@ class Fixture : public NaiveN05FlashModel {
                     throw std::runtime_error("cache metadata mismatch");
             }
         }
-        RunRequests(out, graphs);
+        for (int limit : {1, 2}) {
+            maxBatch = limit;
+            RunRequests(out, graphs);
+        }
         RunSelections(out);
     }
     void RunSelections(std::ofstream &out) {

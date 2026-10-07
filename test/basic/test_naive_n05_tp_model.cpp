@@ -201,6 +201,181 @@ class Fixture : public NaiveN05FlashModel {
             }
         }
     }
+    void BatchChecks(bool graph, bool merged) {
+        if (!canDoBatchForward) throw std::runtime_error("ordinary TP did not advertise batching");
+        if (merged) for (int layer = 0; layer < 2; ++layer) {
+            std::string base = "model.layers." + std::to_string(layer) + ".self_attn.";
+            int rows = 0;
+            for (auto name : {"q_proj.weight", "k_proj.weight", "v_proj.weight"})
+                rows += weight[base + name].dims[0];
+            weight.AddEmptyWeight(base + "mergeqkv.weight", {rows, 256}, BFLOAT16);
+            auto &dst = weight[base + "mergeqkv.weight"];
+            dst.Allocate(false);
+            size_t offset = 0;
+            for (auto name : {"q_proj.weight", "k_proj.weight", "v_proj.weight"}) {
+                auto &src = weight[base + name];
+                std::memcpy(dst.cpuData + offset, src.cpuData, src.GetBytes());
+                offset += src.GetBytes();
+                weight.weight.erase(base + name);
+            }
+        }
+        int checks = 0;
+        for (auto prompts : {std::pair<int,int>{3, 11}, {126, 250}, {254, 510}, {2045, 2049}, {4090, 13}}) {
+            std::vector<std::vector<int>> schedule(12, {0, 1});
+            schedule[4] = {1, 0}; schedule[5] = {1, 0};
+            schedule[8] = {0}; // One request leaves the active decode batch.
+            int counts[2] = {0, 0};
+            for (const auto &order : schedule) for (int sequence : order) ++counts[sequence];
+            std::vector<std::pair<Data,Data>> reference[2], candidate[2];
+            std::vector<std::vector<float>> expected[2];
+            std::vector<int> expectedTokens[2];
+            int lastToken = 0;
+            const int prompt[2] = {prompts.first, prompts.second};
+            GenerationConfig cfg[2];
+            auto forward = [&](std::vector<std::pair<Data,Data>> &kv, int sequence, int start, int rows) {
+                std::vector<float> ids(rows), positions(rows);
+                for (int j=0;j<rows;++j) { ids[j]=(start+j)*3%251+sequence; positions[j]=start+j; }
+                Data input(FLOAT32,{1,rows},ids), pos(FLOAT32,{1,rows},positions);
+                std::vector<float> logits;
+                lastToken = Forward(input,Data(),pos,kv,cfg[sequence],LastTokensManager(),&logits);
+                return logits;
+            };
+            for (int b=0;b<2;++b) {
+                cfg[b].input_token_length=prompt[b]; cfg[b].output_token_limit=64;
+                cfg[b].output_logits=true; cfg[b].top_k=1;
+                reference[b].resize(2);candidate[b].resize(2);
+                SetCudaGraph(false);
+                forward(reference[b],b,0,prompt[b]);
+                forward(candidate[b],b,0,prompt[b]);
+                for (int step=0;step<counts[b];++step) {
+                    expected[b].push_back(forward(reference[b],b,prompt[b]+step,1));
+                    expectedTokens[b].push_back(lastToken);
+                }
+            }
+            int steps[2]={0,0};
+            for (int round=0;round<(int)schedule.size();++round) {
+                const auto &order=schedule[round];
+                SetCudaGraph(graph);
+                if (order.size()==1) {
+                    int b=order[0];auto actual=forward(candidate[b],b,prompt[b]+steps[b],1);
+                    RequireCloseLogits(actual.data(),expected[b][steps[b]++],"batch survivor logits");
+                    ++checks;continue;
+                }
+                std::vector<std::pair<Data*,Data*>> caches;
+                std::vector<Data> positions(order.size());
+                std::vector<Data*> pos;
+                std::vector<float> ids;
+                std::vector<GenerationConfig> configs;
+                std::vector<std::vector<float>> actual(order.size());
+                std::vector<std::vector<float>*> out;
+                for (int i=0;i<(int)order.size();++i) {
+                    int b=order[i],past=prompt[b]+steps[b];
+                    ids.push_back(past*3%251+b);
+                    positions[i].dataType=FLOAT32;positions[i].Resize({1,1});positions[i].Allocate();
+                    ((float*)positions[i].cpuData)[0]=past;pos.push_back(&positions[i]);
+                    for (auto &layer:candidate[b]) caches.emplace_back(&layer.first,&layer.second);
+                    configs.push_back(cfg[b]);out.push_back(&actual[i]);
+                    // Exercise compact GPU selection as well as full-logit sampling.
+                    configs.back().output_logits = round != 3 && round != 6 && round != 10;
+                }
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+                int launches=verifyGraphLaunches, captures=verifyGraphCaptures;
+#endif
+                Data input(FLOAT32,{1,(int)order.size()},ids);
+                auto tokens = ForwardBatch(order.size(),input,{},pos,std::vector<int>(order.size(),1),caches,configs,LastTokensManager(),&out);
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+                if (graph && !failVerifyBegin && !failVerifyInstantiate && prompts.first==3 && round==2 &&
+                    (verifyGraphLaunches-launches!=ranks || verifyGraphCaptures!=captures))
+                    throw std::runtime_error("batch did not replay exactly one graph per rank");
+#endif
+                for (int i=0;i<(int)order.size();++i) {
+                    int b=order[i];
+                    const auto &logits = expected[b][steps[b]++];
+                    if (configs[i].output_logits) {
+                        if (actual[i].size() != logits.size()) throw std::runtime_error("batch logits missing");
+                        RequireCloseLogits(actual[i].data(), logits, "packed batch logits");
+                    } else if (tokens[i] != expectedTokens[b][steps[b] - 1]) {
+                        throw std::runtime_error("compact batch greedy token mismatch");
+                    }
+                    if (candidate[b][0].first.dims[1]!=prompt[b]+steps[b] ||
+                        candidate[b][1].first.dims[1]!=std::min(prompt[b]+steps[b],7))
+                        throw std::runtime_error("batch KV lengths crossed requests");
+                    ++checks;
+                }
+            }
+            for (int b=0;b<2;++b) for (int layer=0;layer<2;++layer) for (bool value:{false,true}) {
+                auto &a=value?candidate[b][layer].second:candidate[b][layer].first;
+                auto &e=value?reference[b][layer].second:reference[b][layer].first;
+                for (const auto &entry:a.multiDeviceDatas) {
+                    FastllmCudaSetDevice(entry.first);
+                    const Data &actual=*entry.second,&expected=*e.multiDeviceDatas.at(entry.first);
+                    if (actual.dims!=expected.dims) throw std::runtime_error("batch KV shape mismatch");
+                    std::vector<uint16_t> av(actual.Count(0)),ev(expected.Count(0));
+                    FastllmCudaCopyFromDeviceToHost(av.data(),actual.cudaData,actual.GetBytes());
+                    FastllmCudaCopyFromDeviceToHost(ev.data(),expected.cudaData,expected.GetBytes());
+                    std::vector<float> af(av.size()),ef(ev.size());
+                    for(size_t j=0;j<av.size();++j){uint32_t x=uint32_t(av[j])<<16,y=uint32_t(ev[j])<<16;std::memcpy(&af[j],&x,4);std::memcpy(&ef[j],&y,4);}
+                    RequireCloseLogits(af.data(),ef,"independent batch KV contents");++checks;
+                }
+            }
+        }
+        std::cout<<"BATCH PASS ranks="<<ranks<<" graph="<<graph<<" merged="<<merged
+                 <<" checks="<<checks<<" relative="<<largestLogitRelative<<std::endl;
+    }
+
+    void PackedPrefillChecks() {
+        GenerationConfig config;
+        config.output_logits = true;
+        config.output_token_limit = 16;
+        config.top_k = 1;
+        std::vector<int> lengths = {3, 7, 1};
+        std::vector<std::vector<std::pair<Data, Data>>> reference(3), candidate(3);
+        std::vector<Data> positions(3);
+        std::vector<Data *> positionPtrs;
+        std::vector<std::pair<Data *, Data *>> kv;
+        std::vector<float> ids;
+        std::vector<std::vector<float>> expected(3), actual(3);
+        std::vector<std::vector<float> *> outputs;
+        SetCudaGraph(false);
+        for (int b = 0; b < 3; ++b) {
+            reference[b].resize(2); candidate[b].resize(2);
+            std::vector<float> tokens(lengths[b]), pos(lengths[b]);
+            for (int j = 0; j < lengths[b]; ++j) { tokens[j] = 5 * j + b; pos[j] = j; }
+            Data input(FLOAT32, {1, lengths[b]}, tokens), position(FLOAT32, {1, lengths[b]}, pos);
+            Forward(input, Data(), position, reference[b], config, LastTokensManager(), &expected[b]);
+            positions[b].CopyFrom(position); positionPtrs.push_back(&positions[b]);
+            ids.insert(ids.end(), tokens.begin(), tokens.end());
+            for (auto &layer : candidate[b]) kv.emplace_back(&layer.first, &layer.second);
+            outputs.push_back(&actual[b]);
+        }
+        Data input(FLOAT32, {1, (int)ids.size()}, ids);
+        std::vector<GenerationConfig> configs(3, config);
+        ForwardBatch(3, input, {}, positionPtrs, lengths, kv, configs, LastTokensManager(), &outputs);
+        for (int b = 0; b < 3; ++b) {
+            if (actual[b].size() != expected[b].size()) throw std::runtime_error("prefill logits missing");
+            RequireCloseLogits(actual[b].data(), expected[b], "packed prefill logits");
+        }
+        // Mixed lengths become a three-request decode batch with independent KV.
+        for (int b = 0; b < 3; ++b) {
+            Data token(FLOAT32, {1, 1}, {float(50 + b)}), pos(FLOAT32, {1, 1}, {float(lengths[b])});
+            Forward(token, Data(), pos, reference[b], config, LastTokensManager(), &expected[b]);
+            positions[b].CopyFrom(pos);
+        }
+        Data decode(FLOAT32, {1, 3}, {50, 51, 52});
+        for (bool graph : {false, true}) {
+            SetCudaGraph(graph);
+            ForwardBatch(3, decode, {}, positionPtrs, {1, 1, 1}, kv, configs, LastTokensManager(), &outputs);
+            for (int b = 0; b < 3; ++b) {
+                RequireCloseLogits(actual[b].data(), expected[b], "prefill to batch decode logits");
+                if (graph) continue;
+                Data token(FLOAT32, {1, 1}, {float(50 + b)}), pos(FLOAT32, {1, 1}, {float(lengths[b] + 1)});
+                Forward(token, Data(), pos, reference[b], config, LastTokensManager(), &expected[b]);
+                positions[b].CopyFrom(pos);
+            }
+        }
+        std::cout << "PACKED PREFILL PASS ranks=" << ranks << " relative=" << largestLogitRelative << std::endl;
+    }
+
     std::vector<std::vector<float>> Run() {
         if (RetainCudaWorkspace() != (ranks > 1))
             throw std::runtime_error("unexpected serial/TP workspace policy");
@@ -908,6 +1083,22 @@ int main(int argc, char **argv) {
             failVerifyInstantiate = argc > 3 && std::string(argv[3]) == "failinstantiate";
             { DraftFixture fixture; fixture.Run(); }
             { DraftFixture fixture(true); fixture.Run(); }
+            return 0;
+        }
+        if (argc > 2 && std::string(argv[2]) == "batch_prefill") {
+            SetCudaEmbedding(true);
+            Fixture fixture(ranks, true, true);
+            fixture.PackedPrefillChecks();
+            return 0;
+        }
+        if (argc > 2 && std::string(argv[2]) == "batch") {
+            bool graph = argc <= 3 || std::string(argv[3]) != "eager";
+            SetCudaEmbedding(true); SetCudaGraph(graph);
+            failGraphDevice = ranks - 1;
+            failVerifyBegin = argc > 3 && std::string(argv[3]) == "failbegin";
+            failVerifyInstantiate = argc > 3 && std::string(argv[3]) == "failinstantiate";
+            Fixture fixture(ranks, true, true);
+            fixture.BatchChecks(graph, argc <= 4 || std::string(argv[4]) != "separate");
             return 0;
         }
         if (argc > 2 && std::string(argv[2]) == "verify_graph") {

@@ -1487,6 +1487,31 @@ if (UNIT_TEST)
                     PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
                     PASS_REGULAR_EXPRESSION "VERIFY GRAPH PASS")
             endforeach()
+            foreach(NAIVE_BATCH_RANKS 2 8)
+                foreach(NAIVE_BATCH_MODE eager graph)
+                    add_test(NAME naive_n05_batch_${NAIVE_BATCH_RANKS}_${NAIVE_BATCH_MODE}
+                        COMMAND naive_n05_verify_graph_test ${NAIVE_BATCH_RANKS} batch ${NAIVE_BATCH_MODE})
+                    set_tests_properties(naive_n05_batch_${NAIVE_BATCH_RANKS}_${NAIVE_BATCH_MODE}
+                        PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
+                        PASS_REGULAR_EXPRESSION "BATCH PASS")
+                endforeach()
+                add_test(NAME naive_n05_batch_prefill_${NAIVE_BATCH_RANKS}
+                    COMMAND naive_n05_verify_graph_test ${NAIVE_BATCH_RANKS} batch_prefill)
+                set_tests_properties(naive_n05_batch_prefill_${NAIVE_BATCH_RANKS}
+                    PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
+                    PASS_REGULAR_EXPRESSION "PACKED PREFILL PASS")
+            endforeach()
+            foreach(NAIVE_BATCH_FAILURE failbegin failinstantiate)
+                add_test(NAME naive_n05_batch_${NAIVE_BATCH_FAILURE}
+                    COMMAND naive_n05_verify_graph_test 2 batch ${NAIVE_BATCH_FAILURE})
+                set_tests_properties(naive_n05_batch_${NAIVE_BATCH_FAILURE}
+                    PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
+                    PASS_REGULAR_EXPRESSION "BATCH PASS")
+            endforeach()
+            add_test(NAME naive_n05_batch_separate_qkv COMMAND naive_n05_verify_graph_test 8 batch graph separate)
+            set_tests_properties(naive_n05_batch_separate_qkv
+                PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
+                PASS_REGULAR_EXPRESSION "BATCH PASS")
             foreach(NAIVE_DRAFT_MODE graph failbegin failinstantiate)
                 add_test(NAME naive_n05_draft_${NAIVE_DRAFT_MODE}
                     COMMAND naive_n05_verify_graph_test 1 draft_graph ${NAIVE_DRAFT_MODE})
