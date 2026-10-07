@@ -2458,10 +2458,74 @@ static void mul_mat_iq4_nl_q8_0_rows(int blocks, const char *vx, size_t bx,
     }
 }
 
+#if !defined(__AVX512F__)
+// Verifier rows sharing an expert also share its nonlinear nibble lookup.
+// Keep each row's even/odd accumulation order identical to single-row decode.
+template <int Inputs>
+static void mul_mat_iq4_nl_q8_0_multi(int n, const void *vx, size_t bx,
+                                     const DataInfo &info, int outputs) {
+    const auto values = _mm256_setr_epi8(
+        -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+        -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113);
+    const auto mask = _mm256_set1_epi8(15);
+    const auto ones = _mm256_set1_epi16(1);
+    const block_q8_0 *y[Inputs];
+    for (int t = 0; t < Inputs; ++t) y[t] = (const block_q8_0 *)info.src1_row(t);
+    for (int row = 0; row < outputs; ++row) {
+        const auto *x = (const block_iq4_nl *)((const char *)vx + row * bx);
+        __m256 even[Inputs] = {}, odd[Inputs] = {};
+        auto accumulate = [&](int b, __m256 *acc) {
+            const auto bits = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)x[b].qs));
+            const auto ix = _mm256_and_si256(
+                _mm256_blend_epi32(bits, _mm256_srli_epi16(bits, 4), 0xf0), mask);
+            const auto qx = _mm256_shuffle_epi8(values, ix);
+            const float dx = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(x[b].d)));
+            for (int t = 0; t < Inputs; ++t) {
+                const auto qy = _mm256_loadu_si256((const __m256i *)y[t][b].qs);
+                const auto sum = _mm256_madd_epi16(_mm256_maddubs_epi16(
+                    _mm256_abs_epi8(qy), _mm256_sign_epi8(qx, qy)), ones);
+                const float dy = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(y[t][b].d)));
+                acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(dx * dy), _mm256_cvtepi32_ps(sum), acc[t]);
+            }
+        };
+        int b = 0;
+        for (; b + 1 < n / QK4_NL; b += 2) {
+            if (b + 8 < n / QK4_NL) _mm_prefetch((const char *)(x + b + 8), _MM_HINT_T0);
+            accumulate(b, even); accumulate(b + 1, odd);
+        }
+        if (b < n / QK4_NL) accumulate(b, even);
+        for (int t = 0; t < Inputs; ++t) {
+            const auto acc = _mm256_add_ps(even[t], odd[t]);
+            auto sum = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+            sum = _mm_add_ps(sum, _mm_movehl_ps(sum, sum));
+            info.store(row, t, _mm_cvtss_f32(_mm_add_ss(sum, _mm_movehdup_ps(sum))));
+        }
+    }
+}
+#endif
+
 template <int nrc_y>
 static void mul_mat_iq4_nl_q8_0(int n, const void *vx, size_t bx,
                                const DataInfo &info, int nrc_x) {
     assert(n % QK4_NL == 0);
+#if !defined(__AVX512F__)
+    if constexpr (nrc_y > 1) {
+        if constexpr (nrc_y <= 4) {
+            mul_mat_iq4_nl_q8_0_multi<nrc_y>(n, vx, bx, info, nrc_x);
+        } else {
+            // Bound the live accumulators to the AVX2 register file.
+            for (int row = 0; row < nrc_x; row += 8) {
+                auto tile = info; tile.s += row;
+                const auto *x = (const char *)vx + row * bx;
+                const int count = std::min(8, nrc_x - row);
+                mul_mat_iq4_nl_q8_0_multi<4>(n, x, bx, tile, count);
+                tile.cur_y += 4;
+                mul_mat_iq4_nl_q8_0_multi<nrc_y - 4>(n, x, bx, tile, count);
+            }
+        }
+        return;
+    }
+#endif
 #if defined(__AVX512VNNI__) && defined(__AVX512VL__)
     // Two output rows reduce register pressure for short decode dots while
     // retaining the original even/odd block accumulation order.
