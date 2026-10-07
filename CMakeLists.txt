@@ -399,6 +399,14 @@ if (USE_CUDA)
         src/devices/cuda/gguf_mmq/fastllm-gguf-moe-grouped.cu
         src/devices/cuda/gguf_mmq/fastllm-gguf-moe-stream.cu
         src/devices/cuda/attention/fastllm-attention.cu
+        src/devices/cuda/attention/fastllm-attention-workspace.cu
+        src/devices/cuda/attention/fastllm-paged-cache.cu
+        src/devices/cuda/attention/fastllm-paged-attention.cu
+        src/devices/cuda/attention/fastllm-paged-attention-fp16-bf16.cu
+        src/devices/cuda/attention/fastllm-paged-attention-fp8.cu
+        src/devices/cuda/attention/fastllm-paged-attention-fp4-fp16.cu
+        src/devices/cuda/attention/fastllm-paged-attention-fp4-bf16.cu
+        src/devices/cuda/attention/fastllm-mla-paged.cu
         src/devices/cuda/attention/paged/fastllm-paged-attention-native.cu
         src/devices/cuda/linear/fastllm-linear-fp32.cu
         src/devices/cuda/linear/fastllm-linear-fp16.cu
