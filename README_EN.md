@@ -311,6 +311,8 @@ The CLI evolves continuously, so `ftllm <command> --help` is authoritative for t
 | `--ori` | Original model configuration and tokenizer directory for selected GGUF models |
 | `--mmproj` | Matching vision-module GGUF for Qwen3.5-family GGUF models; see [GGUF multimodal deployment](docs/qwen3_en.md#gguf-multimodal) for configuration requirements and an example |
 
+Qwen4 inference on a single CUDA GPU keeps MTP draft experts on the GPU by default, outside the target expert-cache budget set by `--moe_cuda_cache`. This requires additional VRAM for the draft experts. Set `FASTLLM_QWEN4_MTP_GPU_EXPERTS=0` before startup to retain the configured MoE placement when VRAM is limited. TP, pipelines across multiple devices, and CPU inference retain their existing placement policies.
+
 Qwen3.5 MTP and DFlash drafts support the following settings. Compatible paths use NVFP4 by default once the corresponding draft algorithm is enabled. Environment variables can override these defaults before startup:
 
 | Environment variable | Default | Description |

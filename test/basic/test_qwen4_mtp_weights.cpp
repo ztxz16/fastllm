@@ -67,6 +67,32 @@ static void TestSplit(DataType type, bool downFirst) {
 
 int main() {
     try {
+        {
+            Qwen4ExpModel model;
+            model.block_cnt = 4;
+            model.deviceMap = {{"cuda:0", 1}};
+            model.moeDeviceMap = {{"numa", 1}};
+            const std::string draft = "mtp.layers.0.mlp.experts.0.gateup_proj.weight";
+            const std::string target = "model.language_model.layers.3.mlp.experts.0.gateup_proj.weight";
+            setenv("FASTLLM_QWEN4_MTP_GPU_EXPERTS", "0", 1);
+            Check(model.SelectSpecialWeightDevice(draft, 3) == "numa", "draft placement opt-out ignored");
+            setenv("FASTLLM_QWEN4_MTP_GPU_EXPERTS", "1", 1);
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+            Check(model.SelectSpecialWeightDevice(draft, 3) == "cuda:0", "draft experts not placed on CUDA");
+            unsetenv("FASTLLM_QWEN4_MTP_GPU_EXPERTS");
+            Check(model.SelectSpecialWeightDevice(draft, 3) == "cuda:0", "default draft placement changed");
+#else
+            Check(model.SelectSpecialWeightDevice(draft, 3) == "numa", "CPU build changed draft placement");
+#endif
+            Check(model.SelectSpecialWeightDevice(target, 3) == "numa", "target expert placement changed");
+            model.deviceMap = {{"cuda:0", 1}, {"cuda:1", 1}};
+            Check(model.SelectSpecialWeightDevice(draft, 3) == "numa", "pipeline placement changed");
+            model.deviceMap = {{"cuda:0,1", 1}};
+            Check(model.SelectSpecialWeightDevice(draft, 3) == "numa", "multi-device placement changed");
+            model.deviceMap = {{"cpu", 1}};
+            Check(model.SelectSpecialWeightDevice(draft, 3) == "numa", "CPU target placement changed");
+            unsetenv("FASTLLM_QWEN4_MTP_GPU_EXPERTS");
+        }
         setenv("FASTLLM_QWEN4_ENABLE_MTP", "3", 1);
         for (DataType type : {DataType::FLOAT16, DataType::BFLOAT16, DataType::FLOAT32}) {
             TestSplit(type, false);
@@ -84,7 +110,7 @@ int main() {
         mapped = model.GetTensorMap({gate, down, marker});
         Check(mapped.count(gate) == 0 && mapped.count(down) == 0,
               "disabled MTP still loads packed experts");
-        std::cout << "PASS: 8 Qwen4 MTP packed-weight cases\n";
+        std::cout << "PASS: Qwen4 MTP placement and packed-weight cases\n";
         return 0;
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';
