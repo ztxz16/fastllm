@@ -189,7 +189,7 @@ inline void *CaptureWorkspace(State &state) {
     cudaStreamCaptureStatus status;
     unsigned long long id = 0;
     cudaGraph_t graph = nullptr;
-#if CUDART_VERSION >= 13000
+#if CUDART_VERSION >= 12000
     CheckCuda(cudaStreamGetCaptureInfo(cudaStreamPerThread, &status, &id, &graph));
 #else
     CheckCuda(cudaStreamGetCaptureInfo_v2(cudaStreamPerThread, &status, &id,

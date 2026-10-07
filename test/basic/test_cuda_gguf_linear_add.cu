@@ -171,9 +171,10 @@ int main() {
             return 77;
         Cuda(cudaSetDevice(0));
         Reject();
+        const std::pair<int, int> shapes[] = {{256, 13}, {5120, 129}, {6144, 5120}, {17408, 5121}};
         for (auto type : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K,
                           GGML_TYPE_Q2_K, GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XS}) {
-            for (auto shape : {std::pair<int, int>{256, 13}, {5120, 129}, {6144, 5120}, {17408, 5121}})
+            for (auto shape : shapes)
                 for (int tokens = 1; tokens <= 8; ++tokens)
                     Test(type, tokens, shape.first, shape.second);
             std::cout << "PASS " << ggml_type_name(type)

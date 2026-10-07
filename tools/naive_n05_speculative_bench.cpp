@@ -52,12 +52,15 @@ public:
             AssertInFastLLM(rawLogits.good(), "Cannot open logits output.");
         }
         std::vector<std::pair<Data, Data>> sequential(model.block_cnt), batched(model.block_cnt);
+        GenerationConfig config;
+        config.output_logits = true;
         auto forward = [&](const std::vector<int> &tokens, int start,
                            std::vector<std::pair<Data, Data>> &kv, TargetCapture *capture) {
             std::vector<float> values(tokens.begin(), tokens.end()), positions;
             for (int i = 0; i < (int)tokens.size(); ++i) positions.push_back(start + i);
             Data ids(FLOAT32, {1, (int)tokens.size()}, values), pos(FLOAT32, {1, (int)tokens.size()}, positions);
-            return (model.*(&NaiveBenchmarkAccess::RunTarget))(ids, pos, kv, capture);
+            return (model.*(&NaiveBenchmarkAccess::RunTarget))(
+                ids, pos, kv, config, capture, -1, nullptr, nullptr);
         };
         forward(prompt, 0, sequential, nullptr);
         for (int i = 0; i < model.block_cnt; ++i) {
