@@ -921,6 +921,13 @@ template<class T> static void RunHost(ggml_type type, fastllm::DataType dtype,
     Cuda(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal));
     Require(!launch(),"host uploads admitted during graph capture");
     Cuda(cudaStreamEndCapture(cudaStreamPerThread,&graph)); Cuda(cudaGraphDestroy(graph));
+    if (batch >= 1024) {
+        // Grow a previously used transfer/compute arena. The previous DMA
+        // must finish before its backing allocation can be released.
+        input.Resize({33, hidden});
+        Require(launch(), "host prefill growth warmup rejected");
+        input.Resize({batch, hidden});
+    }
     for (int pass = 0; pass < 3; ++pass) {
         selected = pass == 0 ? std::unordered_set<int>{1,3} :
             pass == 1 ? std::unordered_set<int>{2,4} : std::unordered_set<int>{1,2,3,4};
@@ -1617,6 +1624,10 @@ int main(int argc, char **argv) {
             // and a partial final group, including negative/duplicate routes.
             RunHost<float>(GGML_TYPE_IQ3_XXS, fastllm::FLOAT32, 0, 65, 320, true, GGML_TYPE_IQ4_NL, 67);
             RunHost<half>(GGML_TYPE_IQ2_S, fastllm::FLOAT16, 0, 1024, 320, true, GGML_TYPE_IQ4_NL, 67);
+            // Many experts with few routed tokens selects 32-row prefill
+            // tiles. Check both FP32 and BF16 activation rounding and K tails.
+            RunHost<float>(GGML_TYPE_IQ3_S, fastllm::FLOAT32, 0, 1024, 320, true, GGML_TYPE_IQ4_NL, 127);
+            RunHost<__nv_bfloat16>(GGML_TYPE_IQ2_S, fastllm::BFLOAT16, 0, 1024, 320, true, GGML_TYPE_Q2_0, 127);
             RunPrefillCached(0);
             if (count >= 2) RunPrefillCached(1);
             std::puts("PASS: streamed GGUF prefill, NUMA shards, selected subsets, immutable weights");

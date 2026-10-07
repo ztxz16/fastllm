@@ -5,6 +5,9 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#if !defined(USE_ROCM) && !defined(CUDA_NO_TENSOR_CORE)
+#include <mma.h>
+#endif
 #include <cub/block/block_scan.cuh>
 
 #include <algorithm>
@@ -13,6 +16,8 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <type_traits>
 #include <vector>
 
@@ -526,6 +531,56 @@ namespace {
             output[outputIndex] = sum / groups;
         }
     }
+
+#ifndef USE_ROCM
+    __global__ void Qwen4InitPromotedSigmoid(float *table) {
+        const unsigned int bits = blockIdx.x * blockDim.x + threadIdx.x;
+        table[bits] = Qwen4CudaSigmoidRounded<float>(__half2float(__ushort_as_half(bits)));
+    }
+
+    const float *Qwen4PromotedSigmoidTable() {
+        // Half logits have a finite domain. Evaluate the original expression
+        // once for each bit pattern, retaining its exact float rounding.
+        static std::mutex mutex;
+        static std::map<int, float *> tables;
+        std::lock_guard<std::mutex> lock(mutex);
+        const int device = FastllmCudaGetDevice();
+        const auto it = tables.find(device);
+        if (it != tables.end())
+            return it->second;
+        if (FastllmCudaGraphIsCapturingFast())
+            return nullptr;
+        float *table = nullptr;
+        if ((cudaMalloc)((void **)&table, 65536 * sizeof(float)) != cudaSuccess) {
+            cudaGetLastError();
+            return nullptr;
+        }
+        Qwen4InitPromotedSigmoid<<<256, 256, 0, cudaStreamPerThread>>>(table);
+        if (cudaStreamSynchronize(cudaStreamPerThread) != cudaSuccess) {
+            cudaFree(table);
+            return nullptr;
+        }
+        tables[device] = table;
+        return table;
+    }
+
+    __global__ void Qwen4HyperMixTable(const float *normalized, const half *mixLogits,
+                                       float *output, const float *table, uint64_t count,
+                                       int channels) {
+        const uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+        if (i >= count)
+            return;
+        const uint64_t at = (i / channels) * 4 * channels + i % channels;
+        float sum = __fmul_rn(normalized[at], __ldg(table + __half_as_ushort(mixLogits[at])));
+#pragma unroll
+        for (int g = 1; g < 4; ++g) {
+            const uint64_t k = at + uint64_t(g) * channels;
+            sum = __fmaf_rn(normalized[k], __ldg(table + __half_as_ushort(mixLogits[k])), sum);
+        }
+        output[i] = sum / 4;
+    }
+
+#endif
 
     template <typename T, typename LogitT>
     void Qwen4LaunchHyperMix(const void *normalized, const void *mixLogits,
@@ -2546,6 +2601,10 @@ namespace {
         }
     }
 
+#if !defined(USE_ROCM) && !defined(CUDA_NO_TENSOR_CORE)
+#include "qwen4-sparse-prefill.cuh"
+#endif
+
     template <typename T>
     __global__ void Qwen4PackSparseQueryKernel(
             const T *query, T *packedQuery, int queryHeads,
@@ -3012,6 +3071,17 @@ bool FastllmCudaQwen4HyperMixPromotedFloatLogits(
     const int outputChannels = normalized.dims.back() / groups;
     const uint64_t count = normalized.Count(0) / groups;
     constexpr int threads = 256;
+#ifndef USE_ROCM
+    if (groups == 4 && count >= 65536) {
+        if (const float *table = Qwen4PromotedSigmoidTable()) {
+            Qwen4HyperMixTable<<<(count + threads - 1) / threads, threads, 0, cudaStreamPerThread>>>(
+                (const float*)normalized.cudaData, (const half*)mixLogits.cudaData,
+                (float*)output.cudaData, table, count, outputChannels);
+            DeviceSync();
+            return cudaGetLastError() == cudaSuccess;
+        }
+    }
+#endif
     if (groups == 4) {
         const int itemsPerBlock = threads / groups;
         const int blocks = (int)((count + itemsPerBlock - 1) /
@@ -4781,4 +4851,76 @@ bool FastllmCudaQwen4ReplayLinearAttentionBatch(
     // rejected-prefix transition before publishing the restored caches.
     ForceDeviceSync();
     return cudaGetLastError() == cudaSuccess;
+}
+
+bool FastllmCudaQwen4SparsePrefill(const fastllm::Data &query, const fastllm::Data &key,
+                                   const fastllm::Data &value, const fastllm::Data &indices,
+                                   fastllm::Data &output, int groups, float scale) {
+#if defined(USE_ROCM) || defined(CUDA_NO_TENSOR_CORE)
+    return false;
+#else
+    using namespace fastllm;
+    if (query.dataType != FLOAT16 || key.dataType != FLOAT16 || value.dataType != FLOAT16 ||
+        output.dataType != FLOAT16 || indices.dataType != INT32 || query.dims.size() != 3 ||
+        key.dims.size() != 3 || value.dims != key.dims || indices.dims.size() != 2 || groups <= 0 ||
+        int64_t(query.dims[0]) != int64_t(key.dims[0]) * groups || query.dims[1] != indices.dims[0] ||
+        query.dims[2] != key.dims[2] || query.dims[2] % 16 || query.dims[2] <= 0 ||
+        query.dims[2] > 256 || key.dims[0] <= 0 || key.dims[1] <= 0 || query.dims[1] < 32 ||
+        query.dims[1] > 65535 || indices.dims[1] <= 0 || indices.dims[1] > 3072 ||
+        query.dataDevice != CUDA || key.dataDevice != CUDA || value.dataDevice != CUDA ||
+        indices.dataDevice != CUDA || output.dataDevice != CUDA || !query.cudaData ||
+        !key.cudaData || !value.cudaData || !indices.cudaData || FastllmCudaGraphIsCapturingFast())
+        return false;
+    if (query.strides.size() != 3 || key.strides.size() != 3 || value.strides.size() != 3 ||
+        indices.strides.size() != 2 || query.strides[2] != 1 || key.strides[2] != 1 ||
+        value.strides[2] != 1 || indices.strides[0] != indices.dims[1] || indices.strides[1] != 1 ||
+        query.strides[0] != uint64_t(query.dims[1]) * query.dims[2] ||
+        query.strides[1] != query.dims[2] || key.strides[1] != key.dims[2] ||
+        value.strides[1] != value.dims[2] || key.strides[0] % 8 || value.strides[0] % 8 ||
+        (reinterpret_cast<uintptr_t>(query.cudaData) & 15))
+        return false;
+    const int device = FastllmCudaGetDevice();
+    int major = 0, minor = 0;
+    if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess ||
+        major * 10 + minor < 75)
+        return false;
+    const int rows = query.dims[1], heads = query.dims[0], dim = query.dims[2],
+              width = indices.dims[1];
+    const uint64_t headTiles = uint64_t(key.dims[0]) * ((uint64_t(groups) + 15) / 16);
+    if (headTiles > 65535)
+        return false;
+    const auto address = Qwen4GetCacheAddress(key, value);
+    const auto *keyData = static_cast<const half *>(Qwen4CachePayload(key));
+    const auto *valueData = static_cast<const half *>(Qwen4CachePayload(value));
+    if (!keyData || !valueData || (reinterpret_cast<uintptr_t>(keyData) & 15) ||
+        (reinterpret_cast<uintptr_t>(valueData) & 15))
+        return false;
+    const int tileRows = std::min(rows, 128);
+    Data scores(FLOAT16, {tileRows, heads, width});
+    scores.dataDevice = CUDA;
+    scores.dataDeviceIds = {device};
+    scores.Allocate(false);
+    output.Resize(query.dims);
+    output.Allocate(false);
+    const float roundedScale = __half2float(__float2half_rn(scale));
+    for (int start = 0; start < rows; start += tileRows) {
+        const int n = std::min(tileRows, rows - start);
+        scores.Resize({n, heads, width});
+        const dim3 qkGrid((width + 63) / 64, n, static_cast<unsigned int>(headTiles));
+        Qwen4SparseQK<<<qkGrid, 128, (16 + 64) * (dim + 8) * sizeof(half) + 1024 * sizeof(float),
+                        cudaStreamPerThread>>>(
+            (const half *)query.cudaData, keyData,
+            (const int32_t *)indices.cudaData, (half *)scores.cudaData, rows, heads, groups,
+            key.dims[1], dim, width, start, key.strides[0], roundedScale, address);
+        FastllmCudaSoftmax(scores, scores, -1);
+        Qwen4SparsePV<<<dim3((dim + 63) / 64, n, qkGrid.z), 128, 0, cudaStreamPerThread>>>(
+            (const half *)scores.cudaData, valueData,
+            (const int32_t *)indices.cudaData, (half *)output.cudaData, rows, heads, groups,
+            key.dims[1], dim, width, start, value.strides[0], address);
+    }
+    AssertInFastLLM(cudaGetLastError() == cudaSuccess, "Qwen4 sparse prefill launch failed.");
+    FastllmCudaSyncCurrentThreadStream();
+    return true;
+#endif
 }

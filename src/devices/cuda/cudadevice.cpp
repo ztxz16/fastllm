@@ -5542,6 +5542,12 @@ namespace fastllm {
                     floatParams.find("scale")->second, output)) {
                 return;
             }
+            if (FastllmCudaQwen4SparsePrefill(
+                    query, key, value, indices, output,
+                    intParams.find("group")->second,
+                    floatParams.find("scale")->second)) {
+                return;
+            }
             output.Allocate(false);
             const int tileRows = std::min(
                 sequence, kQwen4SparsePrefillTileRows);
