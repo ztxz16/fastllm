@@ -13,6 +13,7 @@ struct NaiveN05FlashModel::TargetWorkspace {
     Data denseGate, denseUp, denseDown;
     FastllmNaiveDecodeScratch decode;
     int capacity = 0;
+    std::vector<std::unique_ptr<TargetWorkspace>> sequences;
 };
 
 struct NaiveN05FlashModel::TPDecodeState {
@@ -20,6 +21,7 @@ struct NaiveN05FlashModel::TPDecodeState {
     struct Rank {
         // Own the allocation longer than its input/position/length views.
         Data inputStorage;
+        std::vector<unsigned char> hostInput;
         TargetWorkspace buffers;
         TargetCapture features;
         Data logitsPartial, logitsCandidates;
@@ -31,6 +33,7 @@ struct NaiveN05FlashModel::TPDecodeState {
     std::vector<std::unique_ptr<Rank>> ranks;
     std::vector<void *> cachePointers, reservedPointers;
     std::vector<int> cacheCapacities;
+    std::vector<int> sequenceRegions, sequenceCapacities;
     uint64_t ncclGeneration = 0;
     int capacity = 0, region = 0, rows = 1;
     bool verifying = false;

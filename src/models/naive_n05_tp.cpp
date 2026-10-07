@@ -34,7 +34,7 @@ bool NaiveN05FlashModel::CanReuseTensorParallelCache(const ResponseContext *cont
     // With a single live handle, removal happens after its last forward and
     // creation precedes its first forward. Never touch another request's KV or
     // the worker-owned decode state from these callbacks.
-    return !isFree && tpDevices.size() > 1 && maxBatch == 1 &&
+    return !isFree && tpDevices.size() > 1 &&
         GetFastllmEnv().cudaGraph && !saveHistoryChat && !GetKVCacheInCPU() &&
         kvCacheDataType == BFLOAT16 && context->multimodalInput.empty() &&
         context->cacheLen == 0 && responseContextDict.dicts.size() == 1 &&
@@ -286,30 +286,37 @@ void NaiveN05FlashModel::TPDecodeState::ClearGraphs() {
 NaiveN05FlashModel::TPDecodeState::~TPDecodeState() { ClearGraphs(); }
 
 bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
-        std::vector<std::pair<Data, Data>> &kv, bool verifying, const LogitsSelection &selection) {
+        std::vector<std::pair<Data, Data>> &kv, bool verifying, const LogitsSelection &selection, const TargetBatch *batch) {
     // Prefill has its own scratch. Keep decode and registered communication
     // buffers alive across requests, but only replay after validating all KV
     // addresses/capacities and the collective generation below.
     if (tpDecodeState) tpDecodeState->active = false;
-    const int rows = verifying ? 8 : 1;
+    const int rows = batch ? batch->Size() : verifying ? 8 : 1;
+    if (batch && (!batch->Decode() || rows > 8)) return false;
+    auto key = [&](int sequence, int layer) -> Data & { return batch ? batch->Key(sequence, layer) : kv[layer].first; };
+    auto value = [&](int sequence, int layer) -> Data & { return batch ? batch->Value(sequence, layer) : kv[layer].second; };
     if (!GetFastllmEnv().cudaGraph || inputIds.dims != std::vector<int>({1, rows}) ||
         inputIds.dataType != FLOAT32 || isIntermediateChunkedPrefill ||
         !GetCudaEmbedding() || GetLowMemMode() || dataType != BFLOAT16 ||
         kvCacheDataType != BFLOAT16 || moeAtype != BFLOAT16 ||
         indexHeads != 16 || indexDim != 128 || indexTopK != 2048 ||
-        window < 2 || window > 128 || kv[0].first.dims.size() != 3)
+        window < 2 || window > 128 || key(0, 0).dims.size() != 3)
         return false;
-    const int firstLength = kv[0].first.dims[1] + 1;
-    const int nextLength = firstLength + rows - 1;
-    // At 2048 keys eager attention changes its PV reduction tree. Execute that
-    // boundary token eagerly and capture the sparse tree from the next token.
-    if (firstLength <= 1 || nextLength > max_positions ||
-        (firstLength <= indexTopK && nextLength >= indexTopK) ||
-        (verifying && firstLength <= 256 && nextLength > 256))
-        return false;
-    int region = nextLength <= 256 ? 0 : nextLength < indexTopK ? 1 : 2;
-    int capacity = region == 0 ? 256 : region == 1 ? indexTopK - 1 :
-        (int)std::min<int64_t>(max_positions, ((int64_t)nextLength + 4095) / 4096 * 4096);
+    std::vector<int> regions, sequenceCapacities;
+    const int sequences = batch ? batch->Size() : 1;
+    for (int sequence = 0; sequence < sequences; ++sequence) {
+        if (key(sequence, 0).dims.size() != 3) return false;
+        const int firstLength = key(sequence, 0).dims[1] + 1;
+        const int nextLength = firstLength + (batch ? 0 : rows - 1);
+        // Keep each request on its own dense/sparse attention reduction tree.
+        if (firstLength <= 1 || nextLength > max_positions ||
+            (firstLength <= indexTopK && nextLength >= indexTopK) ||
+            (verifying && firstLength <= 256 && nextLength > 256)) return false;
+        int region = nextLength <= 256 ? 0 : nextLength < indexTopK ? 1 : 2;
+        regions.push_back(region);
+        sequenceCapacities.push_back(region == 0 ? 256 : region == 1 ? indexTopK - 1 :
+            (int)std::min<int64_t>(max_positions, ((int64_t)nextLength + 4095) / 4096 * 4096));
+    }
     const int ranks = tpDevices.size();
     // Retain the existing FlashInfer path on larger shards until a graph-safe
     // dynamic-length equivalent is available.
@@ -318,23 +325,31 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
         return false;
     std::vector<void *> pointers;
     std::vector<int> capacities;
-    for (int layer = 0; layer < block_cnt; ++layer) {
-        for (int device : tpDevices) {
-            for (Data *root : {&kv[layer].first, &kv[layer].second}) {
-                Data &local = *root->multiDeviceDatas.at(device);
-                int required = slidingLayers[layer]
-                    ? (verifying ? std::min(firstLength - 1, window - 1) + rows
-                                 : std::min(nextLength, window)) : nextLength;
-                if (local.dims.size() != 3 || local.expansionDims.size() != 3 ||
-                    local.expansionDims[1] < required || !local.cudaData ||
-                    local.dataDevice != DataDevice::CUDA || local.dataType != BFLOAT16)
-                    return false;
-                pointers.push_back(local.cudaData);
-                capacities.push_back(local.expansionDims[1]);
-                if (!slidingLayers[layer]) capacity = std::min(capacity, local.expansionDims[1]);
+    for (int sequence = 0; sequence < sequences; ++sequence) {
+        const int firstLength = key(sequence, 0).dims[1] + 1;
+        const int nextLength = firstLength + (batch ? 0 : rows - 1);
+        for (int layer = 0; layer < block_cnt; ++layer) {
+            for (int device : tpDevices) {
+                for (Data *root : {&key(sequence, layer), &value(sequence, layer)}) {
+                    auto found = root->multiDeviceDatas.find(device);
+                    if (found == root->multiDeviceDatas.end() || !found->second) return false;
+                    Data &local = *found->second;
+                    int required = slidingLayers[layer]
+                        ? (verifying ? std::min(firstLength - 1, window - 1) + rows
+                                     : std::min(nextLength, window)) : nextLength;
+                    if (local.dims.size() != 3 || local.expansionDims.size() != 3 ||
+                        local.expansionDims[1] < required || !local.cudaData ||
+                        local.dataDevice != DataDevice::CUDA || local.dataType != BFLOAT16)
+                        return false;
+                    pointers.push_back(local.cudaData);
+                    capacities.push_back(local.expansionDims[1]);
+                    if (!slidingLayers[layer]) sequenceCapacities[sequence] =
+                        std::min(sequenceCapacities[sequence], local.expansionDims[1]);
+                }
             }
         }
     }
+    const int region = regions[0], capacity = sequenceCapacities[0];
     uint64_t generation = FastllmGetNcclGeneration();
     if (tpDecodeState && tpDecodeState->cachePointers == pointers &&
         tpDecodeState->cacheCapacities == capacities && tpDecodeState->region == region &&
@@ -342,10 +357,14 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
         tpDecodeState->selection.greedy == selection.greedy &&
         tpDecodeState->selection.count == selection.count &&
         tpDecodeState->selection.invTemperature == selection.invTemperature &&
-        tpDecodeState->capacity >= nextLength && tpDecodeState->ncclGeneration == generation)
+        tpDecodeState->sequenceRegions == regions &&
+        tpDecodeState->sequenceCapacities == sequenceCapacities && tpDecodeState->ncclGeneration == generation)
         return tpDecodeState->active = !tpDecodeState->disabled;
     auto state = tpDecodeState ? tpDecodeState : std::make_shared<TPDecodeState>();
     state->ClearGraphs();
+    if (state->rows != rows) state->ranks.clear();
+    state->sequenceRegions = std::move(regions);
+    state->sequenceCapacities = std::move(sequenceCapacities);
     state->disabled = true;
     state->devices = tpDevices;
     state->region = region;
@@ -377,7 +396,14 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
         }
         if (rank >= (int)state->ranks.size())
             state->ranks.emplace_back(new TPDecodeState::Rank());
-        state->ranks[rank]->buffers.capacity = capacity;
+        auto &buffers = state->ranks[rank]->buffers;
+        buffers.capacity = capacity;
+        if (batch) {
+            while ((int)buffers.sequences.size() < sequences)
+                buffers.sequences.emplace_back(new TargetWorkspace());
+            for (int sequence = 0; sequence < sequences; ++sequence)
+                buffers.sequences[sequence]->capacity = state->sequenceCapacities[sequence];
+        }
         state->ranks[rank]->features.verifying = verifying;
         state->ranks[rank]->features.collectHidden = verifying && rank == 0;
     }
@@ -390,7 +416,7 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
 Data NaiveN05FlashModel::ForwardTensorParallelDecode(int rank, const Data &inputIds,
         const Data &positions, std::vector<std::pair<Data, Data>> &kv,
         const GenerationConfig &config, const Data *embedding, TargetCapture *capture,
-        float *candidateResult) {
+        float *candidateResult, const TargetBatch *batch) {
     auto &state = *tpDecodeState;
     auto &r = *state.ranks.at(rank);
     auto &buf = r.buffers;
@@ -415,13 +441,14 @@ Data NaiveN05FlashModel::ForwardTensorParallelDecode(int rank, const Data &input
             buf.liveKeys.Resize({state.rows});
         }
         if (hostInputs && !r.inputStorage.dims.empty()) {
-            // Graph rows are bounded to one decode token or eight verify rows.
+            // Graphs accept up to eight request or verification rows.
             // Copy integer lengths as bytes, preserving their representation.
-            alignas(16) unsigned char input[3 * 8 * sizeof(float)];
+            r.hostInput.resize(3 * rowBytes);
+            unsigned char *input = r.hostInput.data();
             std::memcpy(input, inputIds.cpuData, rowBytes);
             std::memcpy(input + rowBytes, positions.cpuData, rowBytes);
             for (int row = 0; row < state.rows; ++row) {
-                int length = kv[0].first.dims[1] + row + 1;
+                int length = batch ? batch->Key(row, 0).dims[1] + 1 : kv[0].first.dims[1] + row + 1;
                 std::memcpy(input + 2 * rowBytes + row * sizeof(int), &length, sizeof(int));
             }
             FastllmCudaCopyFromHostToDevice(r.inputStorage.cudaData, input, 3 * rowBytes);
@@ -445,7 +472,7 @@ Data NaiveN05FlashModel::ForwardTensorParallelDecode(int rank, const Data &input
             ToDataType(localPositions, FLOAT32);
             copyInput(buf.positions, localPositions);
             int lengths[8];
-            for (int row = 0; row < state.rows; ++row) lengths[row] = kv[0].first.dims[1] + row + 1;
+            for (int row = 0; row < state.rows; ++row) lengths[row] = batch ? batch->Key(row, 0).dims[1] + 1 : kv[0].first.dims[1] + row + 1;
             if (buf.liveKeys.dims.empty()) {
                 buf.liveKeys.dataType = INT32;
                 buf.liveKeys.UpdateUnitSize();
@@ -463,7 +490,7 @@ Data NaiveN05FlashModel::ForwardTensorParallelDecode(int rank, const Data &input
     } else {
         if (state.mode == TPDecodeState::Warm) r.communicationPointers.clear();
         RunTarget(buf.inputIds, buf.positions, kv, config,
-                  state.verifying ? &r.features : nullptr, rank, embedding, &buf);
+                  state.verifying ? &r.features : nullptr, rank, embedding, &buf, batch);
         if (state.selection.count)
             FastllmCudaNaiveLogitsSelect(buf.logits, tpVocabRanges[rank].first,
                 state.selection.count, state.selection.greedy, state.selection.invTemperature,
@@ -493,7 +520,7 @@ Data NaiveN05FlashModel::ForwardTensorParallelDecode(int rank, const Data &input
 
 Data NaiveN05FlashModel::ForwardSingleGPU(int rank, const Data &inputIds, const Data &positions,
         std::vector<std::pair<Data, Data>> &kv, const GenerationConfig &config, const Data *embedding,
-        TargetCapture *capture, float *candidateResult, const LogitsSelection *selection) {
+        TargetCapture *capture, float *candidateResult, const LogitsSelection *selection, const TargetBatch *batch) {
 #ifdef USE_CUDA
     int device = tpDevices.at(rank);
     FastllmCudaSetDevice(device);
@@ -506,12 +533,12 @@ Data NaiveN05FlashModel::ForwardSingleGPU(int rank, const Data &inputIds, const 
     } restore{GetExecutor()};
     SetCurrentThreadExecutor(executor.get());
     if (tpDecodeState && tpDecodeState->active && !tpDecodeState->disabled)
-        return ForwardTensorParallelDecode(rank, inputIds, positions, kv, config, embedding, capture, candidateResult);
+        return ForwardTensorParallelDecode(rank, inputIds, positions, kv, config, embedding, capture, candidateResult, batch);
     // Generic operators can move their inputs. Give every worker its own IDs.
     Data localIds(inputIds), localPositions(positions);
-    TargetWorkspace *workspace = capture && capture->verifying
+    TargetWorkspace *workspace = batch ? tpBatchWorkspaces.at(rank).get() : capture && capture->verifying
         ? tpVerifyWorkspaces.at(rank).get() : nullptr;
-    Data logits = RunTarget(localIds, localPositions, kv, config, capture, rank, embedding, workspace);
+    Data logits = RunTarget(localIds, localPositions, kv, config, capture, rank, embedding, workspace, batch);
     if (candidateResult && !isIntermediateChunkedPrefill) {
         Data partial, top;
         FastllmCudaNaiveLogitsSelect(logits, tpVocabRanges[rank].first,
@@ -531,7 +558,7 @@ Data NaiveN05FlashModel::ForwardSingleGPU(int rank, const Data &inputIds, const 
 
 Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data &positions,
         std::vector<std::pair<Data, Data>> &kv, const GenerationConfig &config, TargetCapture *capture,
-        LogitsSelection *selection) {
+        LogitsSelection *selection, const TargetBatch *batch) {
 #ifdef USE_CUDA
     PrepareTensorParallel();
     const int vocab = weight["lm_head.weight"].dims[0];
@@ -543,11 +570,15 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
     if (compact) selection->count = std::min(selection->count, vocab);
     const int count = compact ? selection->count : 0;
     LogitsSelection fullLogits;
-    const int rows = capture && capture->verifying ? inputIds.dims[1] : 1;
+    const int rows = batch ? batch->Size() : capture && capture->verifying ? inputIds.dims[1] : 1;
+    const int sequences = batch ? batch->Size() : 1;
+    auto key = [&](int sequence, int layer) -> Data & { return batch ? batch->Key(sequence, layer) : kv[layer].first; };
+    auto value = [&](int sequence, int layer) -> Data & { return batch ? batch->Value(sequence, layer) : kv[layer].second; };
     AssertInFastLLM(!saveHistoryChat, "Naive TP currently requires --cache_history false.");
-    AssertInFastLLM((int)kv.size() == block_cnt, "Naive TP: incomplete KV cache.");
-    for (auto &layer : kv) {
-        for (Data *cache : {&layer.first, &layer.second}) {
+    AssertInFastLLM(batch || (int)kv.size() == block_cnt, "Naive TP: incomplete KV cache.");
+    for (int sequence = 0; sequence < sequences; ++sequence)
+    for (int layer = 0; layer < block_cnt; ++layer) {
+        for (Data *cache : {&key(sequence, layer), &value(sequence, layer)}) {
             if (cache->multiDeviceData) continue;
             AssertInFastLLM(cache->dims.empty(), "Naive TP cannot reuse a serial KV cache.");
             cache->multiDeviceData = true;
@@ -572,18 +603,22 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
     // ordinary decode. Smaller blocks and region boundaries remain eager.
     const bool verify = capture && capture->verifying;
     struct RestoreState {
-        std::shared_ptr<TPDecodeState> &active, &verifyState;
+        std::shared_ptr<TPDecodeState> &active, &saved;
         bool swapped;
-        ~RestoreState() { if (swapped) active.swap(verifyState); }
-    } restore{tpDecodeState, tpVerifyState, verify};
-    if (verify) tpDecodeState.swap(tpVerifyState);
+        ~RestoreState() { if (swapped) active.swap(saved); }
+    } restore{tpDecodeState, batch ? tpBatchState : tpVerifyState, verify || batch};
+    if (verify || batch) tpDecodeState.swap(batch ? tpBatchState : tpVerifyState);
     if (capture && tpDecodeState) tpDecodeState->active = false;
-    bool graphDecode = (!capture || verify) && PrepareTensorParallelDecode(inputIds, kv, verify, compact ? *selection : fullLogits);
-    // Retain each rank's verification scratch and communication addresses.
+    bool graphDecode = (!capture || verify) && PrepareTensorParallelDecode(inputIds, kv, verify, compact ? *selection : fullLogits, batch);
+    // Retain each rank's scratch and communication addresses per execution mode.
     // The existing collective registration still validates the complete tuple.
     if (capture && capture->verifying && tpVerifyWorkspaces.empty()) {
         for (size_t rank = 0; rank < tpDevices.size(); ++rank)
             tpVerifyWorkspaces.emplace_back(new TargetWorkspace());
+    }
+    if (batch && tpBatchWorkspaces.empty()) {
+        for (size_t rank = 0; rank < tpDevices.size(); ++rank)
+            tpBatchWorkspaces.emplace_back(new TargetWorkspace());
     }
     std::vector<TargetCapture> captures(capture ? tpDevices.size() : 0);
     if (capture) {
@@ -606,7 +641,7 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
                                           embedding.dims.empty() ? nullptr : &embedding,
                                           capture ? &captures[rank] : nullptr,
                                           compact ? candidates.data() + (size_t)rank * rows * count * 2 : nullptr,
-                                          compact ? selection : nullptr);
+                                          compact ? selection : nullptr, batch);
             if (!compact) logits[rank].CopyFrom(local);
         });
     };
@@ -674,21 +709,24 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
     forwardRanks();
     if (graphDecode) {
         tpDecodeState->warmed = true;
-        int oldLength = kv[0].first.dims[1];
-        int nextLength = oldLength + tpDecodeState->rows;
-        // Graph kernels append/trim on the device. Commit host metadata once,
-        // only after all ranks finish a successful warmup or replay.
-        for (int layer = 0; layer < block_cnt; ++layer) {
-            int length = slidingLayers[layer]
-                ? (verify ? std::min(oldLength, window - 1) + tpDecodeState->rows
-                          : std::min(nextLength, window - 1)) : nextLength;
-            for (int device : tpDevices)
-                for (Data *root : {&kv[layer].first, &kv[layer].second}) {
-                    Data &local = *root->multiDeviceDatas.at(device);
-                    ResizeKVLength(local, length, local.dims[2]);
-                }
+        for (int sequence = 0; sequence < sequences; ++sequence) {
+            int oldLength = key(sequence, 0).dims[1];
+            int nextLength = oldLength + (batch ? 1 : tpDecodeState->rows);
+            // Graph kernels append/trim on the device. Commit host metadata once,
+            // only after all ranks finish a successful warmup or replay.
+            for (int layer = 0; layer < block_cnt; ++layer) {
+                int length = slidingLayers[layer]
+                    ? (verify ? std::min(oldLength, window - 1) + tpDecodeState->rows
+                              : std::min(nextLength, window - 1)) : nextLength;
+                for (int device : tpDevices)
+                    for (Data *root : {&key(sequence, layer), &value(sequence, layer)}) {
+                        Data &local = *root->multiDeviceDatas.at(device);
+                        ResizeKVLength(local, length, local.dims[2]);
+                    }
+            }
         }
     }
+    for (int sequence = 0; sequence < sequences; ++sequence)
     for (int layer = 0; layer < block_cnt; ++layer) {
         const auto &cfg = slidingLayers[layer] ? sliding : full;
         auto syncMeta = [&](Data &root, int width) {
@@ -700,8 +738,8 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
                 root.expansionDims[2] = width;
             } else root.expansionDims = {1, local.expansionDims[1], width};
         };
-        syncMeta(kv[layer].first, cfg.kvHeads * cfg.headDim + (slidingLayers[layer] ? 0 : indexDim));
-        syncMeta(kv[layer].second, cfg.kvHeads * cfg.valueDim);
+        syncMeta(key(sequence, layer), cfg.kvHeads * cfg.headDim + (slidingLayers[layer] ? 0 : indexDim));
+        syncMeta(value(sequence, layer), cfg.kvHeads * cfg.valueDim);
     }
     if (capture) capture->hidden = std::move(captures[0].hidden);
     if (isIntermediateChunkedPrefill) return Data();

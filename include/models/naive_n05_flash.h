@@ -2,6 +2,7 @@
 #define FASTLLM_NAIVE_N05_FLASH_H
 
 #include "basellm.h"
+#include <algorithm>
 #include <memory>
 #include <deque>
 #include <random>
@@ -12,6 +13,7 @@ namespace fastllm {
     protected:
         struct TargetCapture;
         struct LogitsSelection;
+        struct TargetBatch;
     public:
         NaiveN05FlashModel();
         ~NaiveN05FlashModel() override;
@@ -24,11 +26,18 @@ namespace fastllm {
                     const GenerationConfig &generationConfig = GenerationConfig(),
                     const LastTokensManager &lastTokens = LastTokensManager(),
                     std::vector<float> *logits = nullptr) override;
+        std::vector<int> ForwardBatch(int batch, const Data &inputIds,
+                    const std::vector<Data *> &attentionMask,
+                    const std::vector<Data *> &positionIds, const std::vector<int> &seqLens,
+                    std::vector<std::pair<Data *, Data *>> &pastKeyValues,
+                    const std::vector<GenerationConfig> &generationConfigs,
+                    const LastTokensManager &lastTokens = LastTokensManager(),
+                    std::vector<std::vector<float> *> *logits = nullptr) override;
         Data ForwardSingleGPU(int rank, const Data &inputIds, const Data &positions,
                               std::vector<std::pair<Data, Data>> &kv,
                               const GenerationConfig &config, const Data *embedding = nullptr,
                               TargetCapture *capture = nullptr, float *candidateResult = nullptr,
-                              const LogitsSelection *selection = nullptr);
+                              const LogitsSelection *selection = nullptr, const TargetBatch *batch = nullptr);
         bool NeedAttentionMask(int, int) override { return false; }
         // Bound idle TP prefill workspace with the shared pressure-aware pool.
         bool RetainCudaWorkspace() const override { return tpDevices.size() > 1; }
@@ -49,6 +58,20 @@ namespace fastllm {
                                 const std::string &output) override { return history + input + output; }
 
     protected:
+        // Batch-major request descriptors, borrowed only for one forward. KV
+        // storage remains owned by each response; weights are shared by all rows.
+        struct TargetBatch {
+            const std::vector<std::pair<Data *, Data *>> &kv;
+            const std::vector<GenerationConfig> &configs;
+            const std::vector<int> &lengths;
+            int layers;
+            int Size() const { return lengths.size(); }
+            bool Decode() const {
+                return std::all_of(lengths.begin(), lengths.end(), [](int n) { return n == 1; });
+            }
+            Data &Key(int sequence, int layer) const { return *kv[sequence * layers + layer].first; }
+            Data &Value(int sequence, int layer) const { return *kv[sequence * layers + layer].second; }
+        };
         struct HistoryChunk {
             int length = 0;
             size_t bytes = 0;
@@ -92,7 +115,7 @@ namespace fastllm {
         Data RunTarget(const Data &inputIds, const Data &positions,
                        std::vector<std::pair<Data, Data>> &kv, const GenerationConfig &config,
                        TargetCapture *capture, int tpRank = -1, const Data *embedding = nullptr,
-                       TargetWorkspace *workspace = nullptr);
+                       TargetWorkspace *workspace = nullptr, const TargetBatch *batch = nullptr);
         int CacheReserveCapacity(const GenerationConfig &config) const;
         static void AppendCache(Data &cache, Data &input, int reserveCapacity = 0);
         static void TrimCache(Data &cache, int length);
@@ -142,22 +165,23 @@ namespace fastllm {
         bool InitTensorParallel();
         void PrepareTensorParallel();
         struct TPDecodeState;
-        std::shared_ptr<TPDecodeState> tpDecodeState, tpVerifyState;
+        std::shared_ptr<TPDecodeState> tpDecodeState, tpVerifyState, tpBatchState;
         bool HasVerificationGraph() const;
         bool PrepareTensorParallelDecode(const Data &inputIds,
                                         std::vector<std::pair<Data, Data>> &kv, bool verifying,
-                                        const LogitsSelection &selection);
+                                        const LogitsSelection &selection, const TargetBatch *batch = nullptr);
         Data ForwardTensorParallelDecode(int rank, const Data &inputIds, const Data &positions,
                                         std::vector<std::pair<Data, Data>> &kv,
                                         const GenerationConfig &config, const Data *embedding, TargetCapture *capture,
-                                        float *candidateResult);
+                                        float *candidateResult, const TargetBatch *batch = nullptr);
         Data ForwardTensorParallel(const Data &inputIds, const Data &positions,
                                    std::vector<std::pair<Data, Data>> &kv,
                                    const GenerationConfig &config, TargetCapture *capture = nullptr,
-                                   LogitsSelection *selection = nullptr);
+                                   LogitsSelection *selection = nullptr, const TargetBatch *batch = nullptr);
         std::vector<int> tpDevices;
         bool tpPrepared = false;
         std::vector<std::shared_ptr<TargetWorkspace>> tpVerifyWorkspaces;
+        std::vector<std::shared_ptr<TargetWorkspace>> tpBatchWorkspaces;
         std::vector<Data> tpDraftHeadInputs, tpDraftHeadLogits;
         Data tpDraftHeadOutput;
         PersistentWorkerGroup tpWorkers;

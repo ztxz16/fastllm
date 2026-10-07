@@ -94,6 +94,7 @@ NaiveN05FlashModel::~NaiveN05FlashModel() {
     tpWorkers.Stop();
     tpDecodeState.reset();
     tpVerifyState.reset();
+    tpBatchState.reset();
 }
 
 void NaiveN05FlashModel::InitParams() {
@@ -131,6 +132,7 @@ void NaiveN05FlashModel::InitParams() {
     indexFp8 = weight.dicts["indexer_activation_dtype"] != "bf16";
     InitDraft();
     InitTensorParallel();
+    canDoBatchForward = !draftEnabled && tpDevices.size() > 1;
     historyBytesPerToken = draftEnabled ? embed_dim * sizeof(uint16_t) : 0;
     for (int layer = 0; layer < block_cnt; ++layer) {
         const auto &cfg = slidingLayers[layer] ? sliding : full;
@@ -227,10 +229,87 @@ int NaiveN05FlashModel::Forward(
     return SampleTarget(logits, pastKeyValues, generationConfig, lastTokens, retLogits, &selection);
 }
 
+std::vector<int> NaiveN05FlashModel::ForwardBatch(int batch, const Data &inputIds,
+        const std::vector<Data *> &attentionMask, const std::vector<Data *> &positionIds,
+        const std::vector<int> &seqLens, std::vector<std::pair<Data *, Data *>> &pastKeyValues,
+        const std::vector<GenerationConfig> &configs, const LastTokensManager &lastTokens,
+        std::vector<std::vector<float> *> *retLogits) {
+    AssertInFastLLM(!draftEnabled && tpDevices.size() > 1 && batch > 0 &&
+        (int)seqLens.size() == batch && (int)configs.size() == batch &&
+        (int)positionIds.size() == batch && (int)pastKeyValues.size() == batch * block_cnt,
+        "Naive batch forward requires ordinary TP inference and complete request descriptors.");
+    TargetBatch requests{pastKeyValues, configs, seqLens, block_cnt};
+    std::vector<float> packedPositions;
+    auto selection = SelectLogits(configs[0]);
+    for (int b = 0; b < batch; ++b) {
+        AssertInFastLLM(seqLens[b] > 0 && positionIds[b] &&
+            (b >= (int)attentionMask.size() || !attentionMask[b] || attentionMask[b]->dims.empty()),
+            "Naive batch expects unpadded sequences with explicit positions.");
+        for (int layer = 0; layer < block_cnt; ++layer)
+            AssertInFastLLM(pastKeyValues[b * block_cnt + layer].first &&
+                pastKeyValues[b * block_cnt + layer].second, "Naive batch has a null KV descriptor.");
+        const auto &key = requests.Key(b, 0);
+        const int past = key.dims.empty() ? 0 : key.dims[1];
+        AssertInFastLLM((int64_t)past + seqLens[b] <= max_positions,
+            "Naive batch request exceeds the context window.");
+        Data positions(*positionIds[b]);
+        ToDataType(positions, FLOAT32);
+        positions.ToDevice(DataDevice::CPU);
+        AssertInFastLLM(positions.Count(0) == seqLens[b], "Naive batch position count mismatch.");
+        const float *values = (const float *)positions.cpuData;
+        packedPositions.insert(packedPositions.end(), values, values + seqLens[b]);
+        auto other = SelectLogits(configs[b]);
+        if (selection.count != other.count || selection.greedy != other.greedy ||
+            selection.invTemperature != other.invTemperature) selection.count = 0;
+    }
+    AssertInFastLLM(inputIds.dims == std::vector<int>({1, (int)packedPositions.size()}) &&
+        inputIds.dataType == FLOAT32, "Naive batch input must pack the unpadded sequences in order.");
+    Data positions(FLOAT32, inputIds.dims, packedPositions);
+    // The batch descriptor references response-owned KV. No KV payload or
+    // ownership is copied into the legacy single-sequence argument.
+    std::vector<std::pair<Data, Data>> unused;
+    Data logits = ForwardTensorParallel(inputIds, positions, unused, configs[0],
+                                        nullptr, &selection, &requests);
+    std::vector<int> tokens(batch);
+    if (!selection.candidates.dims.empty()) {
+        for (int b = 0; b < batch; ++b)
+            tokens[b] = selection.greedy
+                ? (int)((float *)selection.candidates.cpuData)[b * 2]
+                : LLMSamplingOnly(selection.candidates, b, configs[b]);
+        return tokens;
+    }
+    const int vocab = logits.dims.back();
+    for (int b = 0; b < batch; ++b)
+        if (configs[b].output_logits && retLogits && b < (int)retLogits->size() && (*retLogits)[b]) {
+            const float *row = (const float *)logits.cpuData + (size_t)b * vocab;
+            (*retLogits)[b]->assign(row, row + vocab);
+        }
+    ResetLogitsOfEOS(batch, &logits, pastKeyValues, configs);
+    for (int b = 0; b < batch; ++b) {
+        if (configs[b].IsSimpleGreedy()) {
+            const float *row = (const float *)logits.cpuData + (size_t)b * vocab;
+            // The owning TP result is already on CPU. Preserve CUDA Top1's
+            // tie order without asking the executor to move a borrowed view.
+            float best = -INFINITY;
+            for (int id = 0; id < vocab; ++id)
+                if (row[id] > -INFINITY && FastllmNaiveTop1Better(row[id], id, best, tokens[b])) {
+                    best = row[id];
+                    tokens[b] = id;
+                }
+        } else {
+            LastTokensUnit empty;
+            tokens[b] = LLMSampling(logits, b, configs[b],
+                b < (int)lastTokens.units.size() ? lastTokens.units[b] : empty);
+        }
+    }
+    return tokens;
+}
+
 Data NaiveN05FlashModel::RunTarget(
         const Data &inputIds, const Data &positionIds,
         std::vector<std::pair<Data, Data>> &pastKeyValues, const GenerationConfig &config,
-        TargetCapture *capture, int tpRank, const Data *embedding, TargetWorkspace *workspace) {
+        TargetCapture *capture, int tpRank, const Data *embedding, TargetWorkspace *workspace,
+        const TargetBatch *batch) {
 #ifndef USE_CUDA
     ErrorInFastLLM("Naive-N0.5 currently requires the CUDA backend for attention.");
     return Data();
@@ -238,7 +317,7 @@ Data NaiveN05FlashModel::RunTarget(
     AssertInFastLLM(dataType == DataType::BFLOAT16 && kvCacheDataType == DataType::BFLOAT16,
                     "Naive-N0.5 requires BF16 activations and KV cache (use auto or bfloat16).");
     AssertInFastLLM(inputIds.dims.size() == 2 && inputIds.dims[0] == 1 &&
-                    (int)pastKeyValues.size() == block_cnt,
+                    (batch || (int)pastKeyValues.size() == block_cnt),
                     "Naive-N0.5 expects one unpadded sequence and a complete KV cache.");
     const bool tensorParallel = tpRank >= 0;
     const bool decodeWorkspace = workspace && workspace->capacity > 0;
@@ -266,7 +345,7 @@ Data NaiveN05FlashModel::RunTarget(
             ++communication;
         }
         if (!tensorParallel) return;
-        if (capture && capture->verifying && inputIds.dims[1] > 1) {
+        if (((batch && batch->Decode()) || (capture && capture->verifying)) && inputIds.dims[1] > 1) {
             if (!FastllmCudaCustomAllReduceRows(data.cudaData, data.cudaData,
                     data.Count(0), embed_dim, data.dataType, gpu)) {
                 // An unsupported/disabled custom path must retain ordinary
@@ -289,12 +368,13 @@ Data NaiveN05FlashModel::RunTarget(
     // especially the FP32 router where rounding can change expert selection.
     // BF16-to-BF16 batches of eight or more rows use cuBLAS and allow bounded
     // floating-point differences from independent single-row decoding.
-    if (capture && capture->verifying)
+    if ((batch && batch->Decode()) || (capture && capture->verifying))
         FastllmCudaSetLinearExactBatchThreshold(std::max(previousExactThreshold, length + 1));
-    int pastLength = pastKeyValues[0].first.dims.empty() ? 0 : pastKeyValues[0].first.dims[1];
+    Data &firstKey = batch ? batch->Key(0, 0) : pastKeyValues[0].first;
+    int pastLength = firstKey.dims.empty() ? 0 : firstKey.dims[1];
     auto historyChunk = tensorParallel ? nullptr : BeginHistoryChunk(pastKeyValues, pastLength, length);
     if (capture) capture->history = historyChunk;
-    AssertInFastLLM(!slidingLayers[0] && pastLength + length <= max_positions,
+    AssertInFastLLM(!slidingLayers[0] && (batch || pastLength + length <= max_positions),
                     "Naive-N0.5 requires a DSA first layer and input within the context window.");
     if (moeWeights.empty()) {
         moeWeights.resize(block_cnt);
@@ -321,7 +401,6 @@ Data NaiveN05FlashModel::RunTarget(
     Data &k = buf.k;
     Data &v = buf.v;
     Data &qkv = buf.qkv;
-    Data &packed = buf.packed;
     Data &attn = buf.attn;
     Data &projected = buf.projected;
     Data &routerInput = buf.routerInput;
@@ -336,10 +415,6 @@ Data NaiveN05FlashModel::RunTarget(
     Data &moeOutput = buf.moeOutput;
     Data &moeInputTemp = buf.moeInputTemp;
     Data &moeOutputTemp = buf.moeOutputTemp;
-    Data &indexQ = buf.indexQ;
-    Data &indexKey = buf.indexKey;
-    Data &indexWeights = buf.indexWeights;
-    Data &indices = buf.indices;
     Data &positions = buf.positions;
     if (!decodeWorkspace) {
         positions.CopyFrom(positionIds);
@@ -402,110 +477,153 @@ Data NaiveN05FlashModel::RunTarget(
         AssertInFastLLM(q.dataDevice == DataDevice::CUDA,
                         "Naive-N0.5 attention requires --device cuda.");
         positions.ToDevice(q.dataDevice, q.dataDeviceIds);
-        auto &pastKey = tensorParallel ? *pastKeyValues[layer].first.multiDeviceDatas.at(gpu) : pastKeyValues[layer].first;
-        auto &pastValue = tensorParallel ? *pastKeyValues[layer].second.multiDeviceDatas.at(gpu) : pastKeyValues[layer].second;
-        int localPast = pastKey.dims.empty() ? 0 : pastKey.dims[1];
-        // Sliding layers retain only window-1 rows between chunks. Keep their
-        // reservation bounded even when the full request is very long.
-        const int layerCapacity = slidingLayers[layer]
-            ? (int)std::min<int64_t>(reserveCapacity, (int64_t)window - 1 + length)
-            : reserveCapacity;
-        if (!slidingLayers[layer]) {
-            std::string ip = ap + "indexer.";
-            Linear(normed, localWeight(ip + "wk.weight"), Data(), indexKey);
-            // LayerNorm accumulates in FP32; the generic CUDA operation does
-            // not accept BF16 storage, so round only its final result.
-            if (decodeWorkspace) {
-                ToDataType(indexKey, buf.indexKeyFloat, DataType::FLOAT32);
-                LayerNorm(buf.indexKeyFloat, localWeight(ip + "k_norm.weight"),
-                          localWeight(ip + "k_norm.bias"), -1, buf.indexKeyFloat);
-                ToDataType(buf.indexKeyFloat, indexKey, DataType::BFLOAT16);
-            } else {
-                ToDataType(indexKey, DataType::FLOAT32);
-                LayerNorm(indexKey, localWeight(ip + "k_norm.weight"), localWeight(ip + "k_norm.bias"), -1, indexKey);
-                ToDataType(indexKey, DataType::BFLOAT16);
-            }
-        }
-        Data noIndexKey, noLiveKeys;
-        bool fusedCache = !historyChunk &&
-            (decodeWorkspace || (!tensorParallel && length <= 8 && localPast > 0)) &&
-            FastllmCudaNaiveRopeAppendCache(q, k, v, slidingLayers[layer] ? noIndexKey : indexKey,
-                positions, pastKey, pastValue, decodeWorkspace ? buf.liveKeys : noLiveKeys, cfg.heads, cfg.kvHeads,
-                cfg.headDim, cfg.valueDim, rotaryDim, cfg.theta, valueScale,
-                slidingLayers[layer] ? window : 0, mergedQkv ? &qkv : nullptr);
-        if (fusedCache && !decodeWorkspace) {
-            pastKey.Resize({1, localPast + length, pastKey.dims[2]});
-            pastValue.Resize({1, localPast + length, pastValue.dims[2]});
-        }
-        if (!fusedCache) {
-            FastllmCudaNaiveRopeQKScaleV(q, k, v, positions, cfg.heads, cfg.kvHeads,
-                cfg.headDim, cfg.valueDim, rotaryDim, cfg.theta, valueScale, mergedQkv ? &qkv : nullptr);
+        auto attend = [&](Data &normed, Data &q, Data &k, Data &v, Data &qkv,
+                          Data &positions, Data &pastKey, Data &pastValue,
+                          TargetWorkspace &buf, int length, int reserveCapacity, Data &attn) {
+            Data &packed = buf.packed, &indexKey = buf.indexKey, &indexQ = buf.indexQ;
+            Data &indexWeights = buf.indexWeights, &indices = buf.indices;
+            int localPast = pastKey.dims.empty() ? 0 : pastKey.dims[1];
+            // Sliding layers retain only window-1 rows between chunks. Keep their
+            // reservation bounded even when the full request is very long.
+            const int layerCapacity = slidingLayers[layer]
+                ? (int)std::min<int64_t>(reserveCapacity, (int64_t)window - 1 + length)
+                : reserveCapacity;
             if (!slidingLayers[layer]) {
-                FastllmCudaNaiveRope(indexKey, positions, 1, indexDim, rotaryDim, cfg.theta);
-                Cat(k, indexKey, 2, packed);
-            } else {
-                packed.CopyFrom(k);
+                std::string ip = ap + "indexer.";
+                Linear(normed, localWeight(ip + "wk.weight"), Data(), indexKey);
+                // LayerNorm accumulates in FP32; the generic CUDA operation does
+                // not accept BF16 storage, so round only its final result.
+                if (decodeWorkspace) {
+                    ToDataType(indexKey, buf.indexKeyFloat, DataType::FLOAT32);
+                    LayerNorm(buf.indexKeyFloat, localWeight(ip + "k_norm.weight"),
+                              localWeight(ip + "k_norm.bias"), -1, buf.indexKeyFloat);
+                    ToDataType(buf.indexKeyFloat, indexKey, DataType::BFLOAT16);
+                } else {
+                    ToDataType(indexKey, DataType::FLOAT32);
+                    LayerNorm(indexKey, localWeight(ip + "k_norm.weight"), localWeight(ip + "k_norm.bias"), -1, indexKey);
+                    ToDataType(indexKey, DataType::BFLOAT16);
+                }
             }
-            if (historyChunk) {
-                CopyHistoryTensor(packed, historyChunk->layers[layer].first, historyChunk->length);
-                CopyHistoryTensor(v, historyChunk->layers[layer].second, historyChunk->length);
+            Data noIndexKey, noLiveKeys;
+            bool fusedCache = !historyChunk &&
+                (decodeWorkspace || (!tensorParallel && length <= 8 && localPast > 0)) &&
+                FastllmCudaNaiveRopeAppendCache(q, k, v, slidingLayers[layer] ? noIndexKey : indexKey,
+                    positions, pastKey, pastValue, decodeWorkspace ? buf.liveKeys : noLiveKeys, cfg.heads, cfg.kvHeads,
+                    cfg.headDim, cfg.valueDim, rotaryDim, cfg.theta, valueScale,
+                    slidingLayers[layer] ? window : 0, mergedQkv ? &qkv : nullptr);
+            if (fusedCache && !decodeWorkspace) {
+                pastKey.Resize({1, localPast + length, pastKey.dims[2]});
+                pastValue.Resize({1, localPast + length, pastValue.dims[2]});
+            }
+            if (!fusedCache) {
+                FastllmCudaNaiveRopeQKScaleV(q, k, v, positions, cfg.heads, cfg.kvHeads,
+                    cfg.headDim, cfg.valueDim, rotaryDim, cfg.theta, valueScale, mergedQkv ? &qkv : nullptr);
+                if (!slidingLayers[layer]) {
+                    FastllmCudaNaiveRope(indexKey, positions, 1, indexDim, rotaryDim, cfg.theta);
+                    Cat(k, indexKey, 2, packed);
+                } else {
+                    packed.CopyFrom(k);
+                }
+                if (historyChunk) {
+                    CopyHistoryTensor(packed, historyChunk->layers[layer].first, historyChunk->length);
+                    CopyHistoryTensor(v, historyChunk->layers[layer].second, historyChunk->length);
+                }
+                if (decodeWorkspace) {
+                    if (graphVerify) FastllmCudaNaiveAppendVerifyCache(pastKey, pastValue, packed, v,
+                        buf.liveKeys, slidingLayers[layer] ? window : 0);
+                    else FastllmCudaNaiveAppendDecodeCache(pastKey, pastValue, packed, v,
+                        buf.liveKeys, slidingLayers[layer] ? window : 0);
+                } else {
+                    AppendCache(pastKey, packed, layerCapacity);
+                    AppendCache(pastValue, v, layerCapacity);
+                }
+            }
+            Data noIndices;
+            Data *selected = &noIndices;
+            if (!slidingLayers[layer] && (decodeWorkspace ? buf.capacity : pastKey.dims[1]) > indexTopK) {
+                std::string ip = ap + "indexer.";
+                Linear(normed, localWeight(ip + "wq.weight"), Data(), indexQ);
+                FastllmCudaNaiveRope(indexQ, positions, indexHeads, indexDim, rotaryDim, cfg.theta);
+                Linear(normed, localWeight(ip + "weights_proj.weight"), Data(), indexWeights);
+                Mul(indexWeights, 1.0f / std::sqrt((float)indexHeads), indexWeights);
+                if (decodeWorkspace) {
+                    if (graphVerify) FastllmCudaNaiveGraphVerifyIndexer(indexQ, indexWeights, pastKey,
+                        buf.liveKeys, buf.capacity, indexFp8, buf.decode, indices);
+                    else FastllmCudaNaiveDecodeIndexer(indexQ, indexWeights, pastKey,
+                        buf.liveKeys, buf.capacity, indexFp8, buf.decode, indices);
+                } else {
+                    if (capture && capture->verifying && length <= 8)
+                        FastllmCudaNaiveVerifyIndexer(indexQ, indexWeights, pastKey, indexHeads,
+                            indexDim, localPast, indexTopK, indexFp8, indices);
+                    else FastllmCudaNaiveIndexer(indexQ, indexWeights, pastKey, indexHeads, indexDim,
+                                                localPast, indexTopK, indexFp8, indices);
+                }
+                selected = &indices;
+            }
+            Data &sink = localWeight(ap + "attention_sink_bias");
+            if (!sink.dims.empty()) {
+                ToDataType(sink, DataType::FLOAT32);
+                sink.ToDevice(q.dataDevice, q.dataDeviceIds);
             }
             if (decodeWorkspace) {
-                if (graphVerify) FastllmCudaNaiveAppendVerifyCache(pastKey, pastValue, packed, v,
-                    buf.liveKeys, slidingLayers[layer] ? window : 0);
-                else FastllmCudaNaiveAppendDecodeCache(pastKey, pastValue, packed, v,
-                    buf.liveKeys, slidingLayers[layer] ? window : 0);
-            } else {
-                AppendCache(pastKey, packed, layerCapacity);
-                AppendCache(pastValue, v, layerCapacity);
-            }
-        }
-        Data noIndices;
-        Data *selected = &noIndices;
-        if (!slidingLayers[layer] && (decodeWorkspace ? buf.capacity : pastKey.dims[1]) > indexTopK) {
-            std::string ip = ap + "indexer.";
-            Linear(normed, localWeight(ip + "wq.weight"), Data(), indexQ);
-            FastllmCudaNaiveRope(indexQ, positions, indexHeads, indexDim, rotaryDim, cfg.theta);
-            Linear(normed, localWeight(ip + "weights_proj.weight"), Data(), indexWeights);
-            Mul(indexWeights, 1.0f / std::sqrt((float)indexHeads), indexWeights);
-            if (decodeWorkspace) {
-                if (graphVerify) FastllmCudaNaiveGraphVerifyIndexer(indexQ, indexWeights, pastKey,
-                    buf.liveKeys, buf.capacity, indexFp8, buf.decode, indices);
-                else FastllmCudaNaiveDecodeIndexer(indexQ, indexWeights, pastKey,
-                    buf.liveKeys, buf.capacity, indexFp8, buf.decode, indices);
+                if (graphVerify) FastllmCudaNaiveGraphVerifyAttention(q, pastKey, pastValue, *selected, sink,
+                    buf.liveKeys, buf.capacity, cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
+                    slidingLayers[layer] ? window : 0, buf.decode, attn);
+                else FastllmCudaNaiveDecodeAttention(q, pastKey, pastValue, *selected, sink,
+                    buf.liveKeys, buf.capacity, cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
+                    slidingLayers[layer] ? window : 0, buf.decode, attn);
+                if (slidingLayers[layer] && !graphVerify)
+                    FastllmCudaNaiveTrimDecodeCache(pastKey, pastValue, buf.liveKeys, window);
             } else {
                 if (capture && capture->verifying && length <= 8)
-                    FastllmCudaNaiveVerifyIndexer(indexQ, indexWeights, pastKey, indexHeads,
-                        indexDim, localPast, indexTopK, indexFp8, indices);
-                else FastllmCudaNaiveIndexer(indexQ, indexWeights, pastKey, indexHeads, indexDim,
-                                            localPast, indexTopK, indexFp8, indices);
+                    FastllmCudaNaiveVerifyAttention(q, pastKey, pastValue, *selected, sink,
+                        cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
+                        localPast, slidingLayers[layer] ? window : 0, attn);
+                else FastllmCudaNaiveAttention(q, pastKey, pastValue, *selected, sink,
+                                               cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
+                                               localPast, slidingLayers[layer] ? window : 0, attn);
+                if (slidingLayers[layer] && (!capture || !capture->verifying))
+                    FastllmCudaNaiveTrimCache(pastKey, pastValue, window - 1);
             }
-            selected = &indices;
-        }
-        Data &sink = localWeight(ap + "attention_sink_bias");
-        if (!sink.dims.empty()) {
-            ToDataType(sink, DataType::FLOAT32);
-            sink.ToDevice(q.dataDevice, q.dataDeviceIds);
-        }
-        if (decodeWorkspace) {
-            if (graphVerify) FastllmCudaNaiveGraphVerifyAttention(q, pastKey, pastValue, *selected, sink,
-                buf.liveKeys, buf.capacity, cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
-                slidingLayers[layer] ? window : 0, buf.decode, attn);
-            else FastllmCudaNaiveDecodeAttention(q, pastKey, pastValue, *selected, sink,
-                buf.liveKeys, buf.capacity, cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
-                slidingLayers[layer] ? window : 0, buf.decode, attn);
-            if (slidingLayers[layer] && !graphVerify)
-                FastllmCudaNaiveTrimDecodeCache(pastKey, pastValue, buf.liveKeys, window);
+        };
+        if (batch) {
+            while ((int)buf.sequences.size() < batch->Size())
+                buf.sequences.emplace_back(new TargetWorkspace());
+            attn.dataType = BFLOAT16;
+            attn.Resize({1, length, cfg.heads * cfg.valueDim});
+            attn.ToDevice(q.dataDevice, q.dataDeviceIds, false);
+            attn.Allocate(false);
+            int offset = 0;
+            for (int sequence = 0; sequence < batch->Size(); ++sequence) {
+                const int count = batch->lengths[sequence];
+                auto view = [&](Data &dst, Data &src, int width) {
+                    dst.Resize({1, count, width});
+                    dst.FakeFrom(src, (size_t)offset * width * src.unitSize);
+                };
+                Data rowNorm, rowQ, rowK, rowV, rowQkv, rowPositions, rowAttention;
+                view(rowNorm, normed, embed_dim);
+                view(rowQ, q, cfg.heads * cfg.headDim);
+                view(rowK, k, cfg.kvHeads * cfg.headDim);
+                view(rowV, v, cfg.kvHeads * cfg.valueDim);
+                if (mergedQkv) view(rowQkv, qkv, qkv.dims.back());
+                view(rowAttention, attn, cfg.heads * cfg.valueDim);
+                rowPositions.Resize({1, count});
+                rowPositions.FakeFrom(positions, (size_t)offset * sizeof(float));
+                auto &part = *buf.sequences[sequence];
+                if (decodeWorkspace) {
+                    part.liveKeys.Resize({1});
+                    part.liveKeys.FakeFrom(buf.liveKeys, sequence * sizeof(int));
+                }
+                attend(rowNorm, rowQ, rowK, rowV, rowQkv, rowPositions,
+                       *batch->Key(sequence, layer).multiDeviceDatas.at(gpu),
+                       *batch->Value(sequence, layer).multiDeviceDatas.at(gpu), part, count,
+                       CacheReserveCapacity(batch->configs[sequence]), rowAttention);
+                offset += count;
+            }
         } else {
-            if (capture && capture->verifying && length <= 8)
-                FastllmCudaNaiveVerifyAttention(q, pastKey, pastValue, *selected, sink,
-                    cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
-                    localPast, slidingLayers[layer] ? window : 0, attn);
-            else FastllmCudaNaiveAttention(q, pastKey, pastValue, *selected, sink,
-                                           cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
-                                           localPast, slidingLayers[layer] ? window : 0, attn);
-            if (slidingLayers[layer] && (!capture || !capture->verifying))
-                FastllmCudaNaiveTrimCache(pastKey, pastValue, window - 1);
+            auto &pastKey = tensorParallel ? *pastKeyValues[layer].first.multiDeviceDatas.at(gpu) : pastKeyValues[layer].first;
+            auto &pastValue = tensorParallel ? *pastKeyValues[layer].second.multiDeviceDatas.at(gpu) : pastKeyValues[layer].second;
+            attend(normed, q, k, v, qkv, positions, pastKey, pastValue, buf, length, reserveCapacity, attn);
         }
         Linear(attn, localWeight(ap + "o_proj.weight"), Data(), projected);
         reduce(projected);
@@ -584,7 +702,7 @@ Data NaiveN05FlashModel::RunTarget(
                     {"biass___batch", (int)moeBiases[layer].size()},
                     {"layer", layer}, {"gateType", (int)MoeGateSwiglu}, {"fp8EagerMode", 1}
                 });
-            } else if (capture && capture->verifying && length > 1 &&
+            } else if (((batch && batch->Decode()) || (capture && capture->verifying)) && length > 1 &&
                        (moeWeights[layer][2]->dataType == DataType::BFLOAT16 ||
                         moeWeights[layer][2]->dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED) &&
                        normed.dataDevice == DataDevice::CUDA) {
@@ -599,7 +717,9 @@ Data NaiveN05FlashModel::RunTarget(
                     moeWeights[layer][2]->dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED &&
                     FastllmCudaNVFP4E4M3GroupedMoeSupported(normed.dataDeviceIds.at(0)) &&
                     FastllmCudaPrepareNVFP4E4M3Moe(moeWeights[layer].data(), moeWeights[layer].size());
-                const bool mergedRows = residentRows &&
+                // The verify kernel uses full-K expert tiles. Ordinary decode
+                // may split K, so keep its per-request reduction order here.
+                const bool mergedRows = !batch && residentRows &&
                     FastllmCudaMergeMOENVFP4E4M3MarlinRows(normed, w1, w2, moeOutput,
                         moeWeights[layer].data(), moeWeights[layer].size(),
                         (const int32_t *)expertIndex.cudaData, (const float *)expertScore.cudaData,
@@ -649,7 +769,18 @@ Data NaiveN05FlashModel::RunTarget(
     Data localLogits;
     Data &last = buf.last, &logits = decodeWorkspace ? buf.logits : localLogits;
     if (!decodeWorkspace) {
-        if (capture && capture->verifying) Copy(hidden, last);
+        if (batch) {
+            last.dataType = BFLOAT16;
+            last.Resize({1, batch->Size(), embed_dim});
+            last.ToDevice(hidden.dataDevice, hidden.dataDeviceIds, false);
+            last.Allocate(false);
+            int offset = 0;
+            for (int sequence = 0; sequence < batch->Size(); ++sequence) {
+                offset += batch->lengths[sequence];
+                FastllmCudaCopyFromDeviceToDevice((uint16_t *)last.cudaData + (size_t)sequence * embed_dim,
+                    (uint16_t *)hidden.cudaData + (size_t)(offset - 1) * embed_dim, (size_t)embed_dim * sizeof(uint16_t));
+            }
+        } else if (capture && capture->verifying) Copy(hidden, last);
         else Split(hidden, 1, length - 1, length, last);
         norm(last, localWeight("model.norm.weight"), last);
     }
