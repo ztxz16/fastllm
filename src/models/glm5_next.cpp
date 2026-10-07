@@ -2716,7 +2716,9 @@ namespace fastllm {
             for (size_t r = 0; r < tp.ranks.size(); ++r) {
                 ApplyDeviceMap(tp.ranks[r]->deviceMap, 0, block_cnt);
                 tp.ranks[r]->CaptureTargetRuntimeCheckpoint(r == 0 ? pastKeyValues : caches[r], checkpoint.ranks[r]);
+#ifdef USE_CUDA
                 ForceDeviceSync();
+#endif
             }
             ApplyDeviceMap(deviceMap, 0, block_cnt);
             checkpoint.ready = true;
@@ -2775,7 +2777,9 @@ namespace fastllm {
                 ApplyDeviceMap(tp.ranks[r]->deviceMap, 0, block_cnt);
                 tp.ranks[r]->CommitTargetVerificationPrefix(r == 0 ? pastKeyValues : caches[r],
                     checkpoint.ranks[r], replays[r], committedInputs, verificationInputs);
+#ifdef USE_CUDA
                 ForceDeviceSync();
+#endif
             }
             ApplyDeviceMap(deviceMap, 0, block_cnt);
             return;
