@@ -14113,7 +14113,11 @@ namespace fastllm {
                     ensureProjectedZSplit();
                 }
                 if (projectedConvBlock) {
-                    // The Block does not materialize qkvConvInput.
+                    // The GDN input Block already produced convOutput and z,
+                    // including its unfused fallback for weight types the fused
+                    // FP8 kernel cannot consume (for example signed INT8
+                    // per-channel weights).  There is no materialized
+                    // qkvConvInput to reshape on this path.
                 } else if (batchedConvSequence || directSingleVerifyConv) {
                     // Keep the flattened token-major projection. Each request
                     // is handled independently before its cache update.
@@ -14132,8 +14136,9 @@ namespace fastllm {
                 }
 
                 if (projectedConvBlock) {
-                    // Both Block implementations already updated the cache and
-                    // produced the activated convolution output.
+                    // CudaGdnInputConvBlock already produced convOutput and z
+                    // and owns the conv-cache update on both the fused and the
+                    // unfused fallback path.
                 } else if (directSingleVerifyConv) {
                     // Output and prefix snapshots were produced above in the
                     // recurrent consumer's [batch, token, channel] layout.
@@ -14432,7 +14437,8 @@ namespace fastllm {
 
                 Data *convOutputForRecurrent = &convOutput;
                 if (projectedConvBlock) {
-                    // Block output is already [1, batch, channels].
+                    // convOutput already carries the [1, batch, channels]
+                    // layout produced by the GDN input Block.
                 } else if (batchedConvSequence || directSingleVerifyConv) {
                     // Request-local outputs are already [1, seq, channels]
                     // and concatenated in flattened request order.
