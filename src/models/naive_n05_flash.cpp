@@ -145,6 +145,12 @@ void NaiveN05FlashModel::InitParams() {
                     "Unsupported Naive-N0.5 attention/indexer/router configuration.");
     if (!useCustomMoeAtype) moeAtype = DataType::BFLOAT16;
     for (int layer = 0; layer < block_cnt; layer++) {
+        const std::string ap = "model.layers." + std::to_string(layer) + ".self_attn.";
+        weightMergeRules.push_back(WeightMergeRule({
+            WeightMergeRuleSingle({ap + "q_proj.weight", ap + "k_proj.weight", ap + "v_proj.weight"},
+                                  ap + "mergeqkv.weight", "linear"),
+            WeightMergeRuleSingle({ap + "q_proj.bias", ap + "k_proj.bias", ap + "v_proj.bias"},
+                                  ap + "mergeqkv.bias", "bias")}));
         if (!moeLayers[layer]) continue;
         for (int expert = 0; expert < num_experts; expert++) {
             std::string base = "model.layers." + std::to_string(layer) +
@@ -314,6 +320,7 @@ Data NaiveN05FlashModel::RunTarget(
     Data &q = buf.q;
     Data &k = buf.k;
     Data &v = buf.v;
+    Data &qkv = buf.qkv;
     Data &packed = buf.packed;
     Data &attn = buf.attn;
     Data &projected = buf.projected;
@@ -373,14 +380,36 @@ Data NaiveN05FlashModel::RunTarget(
         // the affine weight, matching the checkpoint's LlamaRMSNorm.
         if (!decodeWorkspace || layer == 0)
             norm(hidden, localWeight(prefix + ".input_layernorm.weight"), normed);
-        Linear(normed, localWeight(ap + "q_proj.weight"), localWeight(ap + "q_proj.bias"), q);
-        Linear(normed, localWeight(ap + "k_proj.weight"), localWeight(ap + "k_proj.bias"), k);
-        Linear(normed, localWeight(ap + "v_proj.weight"), localWeight(ap + "v_proj.bias"), v);
+        const auto merged = weight.weight.find(ap + "mergeqkv.weight");
+        const bool mergedQkv = merged != weight.weight.end() && !merged->second.dims.empty();
+        if (mergedQkv) {
+            Linear(normed, localWeight(ap + "mergeqkv.weight"), localWeight(ap + "mergeqkv.bias"), qkv);
+            // Q/K and V have different head widths. Read packed projection rows
+            // directly in the RoPE/cache kernel instead of launching three Splits.
+            for (auto item : {std::make_pair(&q, cfg.heads * cfg.headDim),
+                              std::make_pair(&k, cfg.kvHeads * cfg.headDim),
+                              std::make_pair(&v, cfg.kvHeads * cfg.valueDim)}) {
+                item.first->dataType = qkv.dataType;
+                item.first->Resize({1, length, item.second});
+                item.first->ToDevice(qkv.dataDevice, qkv.dataDeviceIds, false);
+                item.first->Allocate(false);
+            }
+        } else {
+            Linear(normed, localWeight(ap + "q_proj.weight"), localWeight(ap + "q_proj.bias"), q);
+            Linear(normed, localWeight(ap + "k_proj.weight"), localWeight(ap + "k_proj.bias"), k);
+            Linear(normed, localWeight(ap + "v_proj.weight"), localWeight(ap + "v_proj.bias"), v);
+        }
         AssertInFastLLM(q.dataDevice == DataDevice::CUDA,
                         "Naive-N0.5 attention requires --device cuda.");
         positions.ToDevice(q.dataDevice, q.dataDeviceIds);
-        FastllmCudaNaiveRopeQKScaleV(q, k, v, positions, cfg.heads, cfg.kvHeads,
-            cfg.headDim, cfg.valueDim, rotaryDim, cfg.theta, valueScale);
+        auto &pastKey = tensorParallel ? *pastKeyValues[layer].first.multiDeviceDatas.at(gpu) : pastKeyValues[layer].first;
+        auto &pastValue = tensorParallel ? *pastKeyValues[layer].second.multiDeviceDatas.at(gpu) : pastKeyValues[layer].second;
+        int localPast = pastKey.dims.empty() ? 0 : pastKey.dims[1];
+        // Sliding layers retain only window-1 rows between chunks. Keep their
+        // reservation bounded even when the full request is very long.
+        const int layerCapacity = slidingLayers[layer]
+            ? (int)std::min<int64_t>(reserveCapacity, (int64_t)window - 1 + length)
+            : reserveCapacity;
         if (!slidingLayers[layer]) {
             std::string ip = ap + "indexer.";
             Linear(normed, localWeight(ip + "wk.weight"), Data(), indexKey);
@@ -396,31 +425,40 @@ Data NaiveN05FlashModel::RunTarget(
                 LayerNorm(indexKey, localWeight(ip + "k_norm.weight"), localWeight(ip + "k_norm.bias"), -1, indexKey);
                 ToDataType(indexKey, DataType::BFLOAT16);
             }
-            FastllmCudaNaiveRope(indexKey, positions, 1, indexDim, rotaryDim, cfg.theta);
-            Cat(k, indexKey, 2, packed);
-        } else {
-            packed.CopyFrom(k);
         }
-        if (historyChunk) {
-            CopyHistoryTensor(packed, historyChunk->layers[layer].first, historyChunk->length);
-            CopyHistoryTensor(v, historyChunk->layers[layer].second, historyChunk->length);
+        Data noIndexKey, noLiveKeys;
+        bool fusedCache = !historyChunk &&
+            (decodeWorkspace || (!tensorParallel && length <= 8 && localPast > 0)) &&
+            FastllmCudaNaiveRopeAppendCache(q, k, v, slidingLayers[layer] ? noIndexKey : indexKey,
+                positions, pastKey, pastValue, decodeWorkspace ? buf.liveKeys : noLiveKeys, cfg.heads, cfg.kvHeads,
+                cfg.headDim, cfg.valueDim, rotaryDim, cfg.theta, valueScale,
+                slidingLayers[layer] ? window : 0, mergedQkv ? &qkv : nullptr);
+        if (fusedCache && !decodeWorkspace) {
+            pastKey.Resize({1, localPast + length, pastKey.dims[2]});
+            pastValue.Resize({1, localPast + length, pastValue.dims[2]});
         }
-        auto &pastKey = tensorParallel ? *pastKeyValues[layer].first.multiDeviceDatas.at(gpu) : pastKeyValues[layer].first;
-        auto &pastValue = tensorParallel ? *pastKeyValues[layer].second.multiDeviceDatas.at(gpu) : pastKeyValues[layer].second;
-        int localPast = pastKey.dims.empty() ? 0 : pastKey.dims[1];
-        // Sliding layers retain only window-1 rows between chunks. Keep their
-        // reservation bounded even when the full request is very long.
-        const int layerCapacity = slidingLayers[layer]
-            ? (int)std::min<int64_t>(reserveCapacity, (int64_t)window - 1 + length)
-            : reserveCapacity;
-        if (decodeWorkspace) {
-            if (graphVerify) FastllmCudaNaiveAppendVerifyCache(pastKey, pastValue, packed, v,
-                buf.liveKeys, slidingLayers[layer] ? window : 0);
-            else FastllmCudaNaiveAppendDecodeCache(pastKey, pastValue, packed, v,
-                buf.liveKeys, slidingLayers[layer] ? window : 0);
-        } else {
-            AppendCache(pastKey, packed, layerCapacity);
-            AppendCache(pastValue, v, layerCapacity);
+        if (!fusedCache) {
+            FastllmCudaNaiveRopeQKScaleV(q, k, v, positions, cfg.heads, cfg.kvHeads,
+                cfg.headDim, cfg.valueDim, rotaryDim, cfg.theta, valueScale, mergedQkv ? &qkv : nullptr);
+            if (!slidingLayers[layer]) {
+                FastllmCudaNaiveRope(indexKey, positions, 1, indexDim, rotaryDim, cfg.theta);
+                Cat(k, indexKey, 2, packed);
+            } else {
+                packed.CopyFrom(k);
+            }
+            if (historyChunk) {
+                CopyHistoryTensor(packed, historyChunk->layers[layer].first, historyChunk->length);
+                CopyHistoryTensor(v, historyChunk->layers[layer].second, historyChunk->length);
+            }
+            if (decodeWorkspace) {
+                if (graphVerify) FastllmCudaNaiveAppendVerifyCache(pastKey, pastValue, packed, v,
+                    buf.liveKeys, slidingLayers[layer] ? window : 0);
+                else FastllmCudaNaiveAppendDecodeCache(pastKey, pastValue, packed, v,
+                    buf.liveKeys, slidingLayers[layer] ? window : 0);
+            } else {
+                AppendCache(pastKey, packed, layerCapacity);
+                AppendCache(pastValue, v, layerCapacity);
+            }
         }
         Data noIndices;
         Data *selected = &noIndices;

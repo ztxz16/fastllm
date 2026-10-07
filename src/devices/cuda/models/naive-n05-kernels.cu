@@ -402,15 +402,20 @@ __global__ void SelectTopKCompact(const float *scores, unsigned long long *selec
     }
 }
 
-__device__ void RopeHead(BF16 *x, float position, int rotaryDim, float theta) {
+__device__ void RopeHeadTo(const BF16 *x, BF16 *out, float position,
+                           int rotaryDim, float theta) {
     for (int d = threadIdx.x; d < rotaryDim / 2; d += blockDim.x) {
         float angle = position * powf(theta, -2.0f * d / rotaryDim);
         float c = RoundBF16(cosf(angle)), s = RoundBF16(sinf(angle));
         float a = (float)x[d], b = (float)x[d + rotaryDim / 2];
         // Match eager GPT-NeoX RoPE, including each BF16 multiplication.
-        x[d] = __float2bfloat16(RoundBF16(a * c) - RoundBF16(b * s));
-        x[d + rotaryDim / 2] = __float2bfloat16(RoundBF16(b * c) + RoundBF16(a * s));
+        out[d] = __float2bfloat16(RoundBF16(a * c) - RoundBF16(b * s));
+        out[d + rotaryDim / 2] = __float2bfloat16(RoundBF16(b * c) + RoundBF16(a * s));
     }
+}
+
+__device__ void RopeHead(BF16 *x, float position, int rotaryDim, float theta) {
+    RopeHeadTo(x, x, position, rotaryDim, theta);
 }
 
 __global__ void Rope(BF16 *data, const float *positions, int heads, int dim,
@@ -419,21 +424,67 @@ __global__ void Rope(BF16 *data, const float *positions, int heads, int dim,
     RopeHead(data + (size_t)row * dim, positions[row / heads], rotaryDim, theta);
 }
 
-// Q/K rotate in place; V keeps the eager Mul's BF16 coefficient rounding.
-// Each CTA owns one head, so all three outputs are independent.
+// Each CTA owns one head. Packed projection input is unpacked while rotating
+// Q/K and scaling V, without intermediate Split kernels.
+template <bool Packed>
 __global__ void RopeQKScaleV(BF16 *q, BF16 *k, BF16 *v, const float *positions,
                             int heads, int kvHeads, int dim, int valueDim,
-                            int rotaryDim, float theta, BF16 valueScale) {
+                            int rotaryDim, float theta, BF16 valueScale, const BF16 *qkv) {
     int totalHeads = heads + 2 * kvHeads;
     int token = blockIdx.x / totalHeads, head = blockIdx.x % totalHeads;
+    const size_t base = (size_t)token * ((heads + kvHeads) * dim + kvHeads * valueDim);
     if (head < heads + kvHeads) {
         BF16 *x = head < heads ? q + ((size_t)token * heads + head) * dim
             : k + ((size_t)token * kvHeads + head - heads) * dim;
-        RopeHead(x, positions[token], rotaryDim, theta);
+        const BF16 *src = Packed ? qkv + base + head * dim : x;
+        RopeHeadTo(src, x, positions[token], rotaryDim, theta);
+        if constexpr (Packed)
+            for (int d = rotaryDim + threadIdx.x; d < dim; d += blockDim.x) x[d] = src[d];
     } else {
         BF16 *x = v + ((size_t)token * kvHeads + head - heads - kvHeads) * valueDim;
+        const BF16 *src = Packed ? qkv + base + (heads + kvHeads) * dim
+            + (head - heads - kvHeads) * valueDim : x;
         for (int d = threadIdx.x; d < valueDim; d += blockDim.x)
-            x[d] = __float2bfloat16_rn((float)x[d] * (float)valueScale);
+            x[d] = __float2bfloat16_rn((float)src[d] * (float)valueScale);
+    }
+}
+
+template <bool Packed>
+__global__ void RopeAppendCache(BF16 *q, const BF16 *k, const BF16 *v,
+        const BF16 *indexKey, const float *positions, BF16 *key, BF16 *value,
+        const int *length, int heads, int kvHeads, int dim, int valueDim,
+        int indexDim, int rotaryDim, float theta, BF16 valueScale, int window,
+        int keyRows, int valueRows, int cachePast, const BF16 *qkv) {
+    const int totalHeads = heads + 2 * kvHeads + (indexDim != 0);
+    const int token = blockIdx.x / totalHeads, head = blockIdx.x % totalHeads;
+    const int past = length ? (window ? min(*length - 1, window - 1) : *length - 1) : cachePast;
+    const int row = past + token;
+    if (past < 0 || row >= keyRows || row >= valueRows) return;
+    const size_t base = (size_t)token * ((heads + kvHeads) * dim + kvHeads * valueDim);
+    if (head < heads) {
+        BF16 *dst = q + ((size_t)token * heads + head) * dim;
+        const BF16 *src = Packed ? qkv + base + head * dim : dst;
+        RopeHeadTo(src, dst, positions[token], rotaryDim, theta);
+        if constexpr (Packed)
+            for (int d = rotaryDim + threadIdx.x; d < dim; d += blockDim.x) dst[d] = src[d];
+    } else if (head < heads + kvHeads || head == heads + 2 * kvHeads) {
+        const bool index = head == heads + 2 * kvHeads;
+        const int width = index ? indexDim : dim;
+        const BF16 *src = index ? indexKey + (size_t)token * indexDim
+            : (Packed ? qkv + base + head * dim
+                      : k + ((size_t)token * kvHeads + head - heads) * dim);
+        BF16 *dst = key + (size_t)row * (kvHeads * dim + indexDim)
+            + (index ? kvHeads * dim : (head - heads) * dim);
+        RopeHeadTo(src, dst, positions[token], rotaryDim, theta);
+        for (int d = rotaryDim + threadIdx.x; d < width; d += blockDim.x)
+            dst[d] = src[d];
+    } else {
+        const int h = head - heads - kvHeads;
+        const BF16 *src = Packed ? qkv + base + (heads + kvHeads) * dim + h * valueDim
+                                : v + ((size_t)token * kvHeads + h) * valueDim;
+        BF16 *dst = value + ((size_t)row * kvHeads + h) * valueDim;
+        for (int d = threadIdx.x; d < valueDim; d += blockDim.x)
+            dst[d] = __float2bfloat16_rn((float)src[d] * (float)valueScale);
     }
 }
 
@@ -1525,7 +1576,7 @@ void FastllmCudaNaiveRope(fastllm::Data &input, const fastllm::Data &positions,
 void FastllmCudaNaiveRopeQKScaleV(fastllm::Data &q, fastllm::Data &k,
         fastllm::Data &v, const fastllm::Data &positions,
         int heads, int kvHeads, int dim, int valueDim,
-        int rotaryDim, float theta, float valueScale) {
+        int rotaryDim, float theta, float valueScale, const fastllm::Data *packedQkv) {
     using namespace fastllm;
     AssertInFastLLM(heads > 0 && kvHeads > 0 && dim > 0 && valueDim > 0 &&
         rotaryDim > 0 && rotaryDim % 2 == 0 && rotaryDim <= dim &&
@@ -1543,11 +1594,80 @@ void FastllmCudaNaiveRopeQKScaleV(fastllm::Data &q, fastllm::Data &k,
         q.dataDeviceIds == positions.dataDeviceIds &&
         q.cudaData && k.cudaData && v.cudaData && positions.cudaData,
         "Invalid Naive-N0.5 fused Q/K RoPE and V scale input.");
-    RopeQKScaleV<<<(uint64_t)q.dims[1] * (heads + 2 * kvHeads), 128>>>(
+    if (packedQkv) {
+        const auto &x = *packedQkv;
+        AssertInFastLLM(x.dims == std::vector<int>({1, q.dims[1], (heads + kvHeads) * dim + kvHeads * valueDim}) &&
+            x.dataType == BFLOAT16 && x.dataDevice == DataDevice::CUDA && x.dataDeviceIds == q.dataDeviceIds &&
+            x.cudaData && x.strides.size() == 3 && x.strides[2] == 1 && x.strides[1] == x.dims[2],
+            "Invalid Naive-N0.5 packed QKV input.");
+    }
+    auto kernel = packedQkv ? RopeQKScaleV<true> : RopeQKScaleV<false>;
+    kernel<<<(uint64_t)q.dims[1] * (heads + 2 * kvHeads), 128>>>(
         (BF16 *)q.cudaData, (BF16 *)k.cudaData, (BF16 *)v.cudaData,
         (const float *)positions.cudaData, heads, kvHeads, dim, valueDim,
-        rotaryDim, theta, __float2bfloat16_rn(valueScale));
+        rotaryDim, theta, __float2bfloat16_rn(valueScale), packedQkv ? (const BF16 *)packedQkv->cudaData : nullptr);
     CheckLaunch();
+}
+
+bool FastllmCudaNaiveRopeAppendCache(fastllm::Data &q, const fastllm::Data &k,
+        const fastllm::Data &v, const fastllm::Data &indexKey,
+        const fastllm::Data &positions, fastllm::Data &key, fastllm::Data &value,
+        const fastllm::Data &liveKeys, int heads, int kvHeads, int dim, int valueDim,
+        int rotaryDim, float theta, float valueScale, int window, const fastllm::Data *packedQkv) {
+    using namespace fastllm;
+    const std::vector<int> device{FastllmCudaGetDevice()};
+    const bool dynamicLength = !liveKeys.dims.empty();
+    auto resident = [&](const Data &x, DataType type) {
+        return x.dataType == type && x.dataDevice == DataDevice::CUDA &&
+            x.dataDeviceIds == device && x.cudaData;
+    };
+    auto matrix = [&](const Data &x, int64_t columns) {
+        return resident(x, BFLOAT16) && x.dims.size() == 3 && x.dims[0] == 1 &&
+            x.dims[1] >= 0 && x.dims[2] == columns && x.strides.size() == 3 &&
+            x.strides[2] == 1 && x.strides[1] == columns;
+    };
+    if (heads <= 0 || kvHeads <= 0 || dim <= 0 || valueDim <= 0 ||
+        rotaryDim <= 0 || rotaryDim % 2 || rotaryDim > dim || window < 0 ||
+        !std::isfinite(theta) || theta <= 0 || !std::isfinite(valueScale) ||
+        !matrix(q, (int64_t)heads * dim) || q.dims[1] <= 0 ||
+        !matrix(k, (int64_t)kvHeads * dim) || k.dims[1] != q.dims[1] ||
+        !matrix(v, (int64_t)kvHeads * valueDim) || v.dims[1] != q.dims[1] ||
+        !resident(positions, FLOAT32) || positions.Count(0) < (uint64_t)q.dims[1] ||
+        (dynamicLength && (!resident(liveKeys, INT32) || liveKeys.Count(0) < 1))) return false;
+    const int rows = q.dims[1];
+    if (packedQkv && (!matrix(*packedQkv, (int64_t)(heads + kvHeads) * dim + (int64_t)kvHeads * valueDim) ||
+                     packedQkv->dims[1] != rows)) return false;
+    int indexDim = 0;
+    if (!indexKey.dims.empty()) {
+        if (indexKey.dims.size() != 3 || indexKey.dims[2] < rotaryDim ||
+            !matrix(indexKey, indexKey.dims[2]) || indexKey.dims[1] != rows) return false;
+        indexDim = indexKey.dims[2];
+    }
+    const int64_t kc = (int64_t)kvHeads * dim + indexDim, vc = (int64_t)kvHeads * valueDim;
+    if (kc > INT_MAX || vc > INT_MAX ||
+        (int64_t)rows * ((int64_t)heads + 2LL * kvHeads + (indexDim != 0)) > INT_MAX ||
+        !matrix(key, kc) || !matrix(value, vc)) return false;
+    auto reservedRows = [](const Data &x) {
+        if (x.expansionDims.empty()) return x.dims[1];
+        return x.expansionDims.size() == 3 && x.expansionDims[0] == 1 &&
+            x.expansionDims[2] == x.dims[2] ? x.expansionDims[1] : 0;
+    };
+    int keyRows = reservedRows(key), valueRows = reservedRows(value);
+    if (keyRows < rows || valueRows < rows ||
+        (window && (int64_t)window - 1 + rows > std::min(keyRows, valueRows))) return false;
+    const int cachePast = key.dims[1];
+    if (!dynamicLength && (cachePast != value.dims[1] ||
+        (int64_t)cachePast + rows > std::min(keyRows, valueRows))) return false;
+    auto kernel = packedQkv ? RopeAppendCache<true> : RopeAppendCache<false>;
+    kernel<<<rows * (heads + 2 * kvHeads + (indexDim != 0)), 128>>>(
+        (BF16 *)q.cudaData, (const BF16 *)k.cudaData, (const BF16 *)v.cudaData,
+        indexDim ? (const BF16 *)indexKey.cudaData : nullptr,
+        (const float *)positions.cudaData, (BF16 *)key.cudaData, (BF16 *)value.cudaData,
+        dynamicLength ? (const int *)liveKeys.cudaData : nullptr, heads, kvHeads, dim, valueDim, indexDim,
+        rotaryDim, theta, __float2bfloat16_rn(valueScale), window, keyRows, valueRows, cachePast,
+        packedQkv ? (const BF16 *)packedQkv->cudaData : nullptr);
+    CheckLaunch();
+    return true;
 }
 
 bool FastllmCudaNaiveQuantizeIndexer(const fastllm::Data &input,

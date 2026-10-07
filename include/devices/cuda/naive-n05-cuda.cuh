@@ -50,11 +50,24 @@ bool FastllmCudaNaiveDraftKV(const fastllm::Data &raw, const fastllm::Data &norm
 
 void FastllmCudaNaiveRope(fastllm::Data &input, const fastllm::Data &positions,
                          int heads, int dim, int rotaryDim, float theta);
-// In-place Q/K RoPE and V scaling, preserving eager BF16 rounding.
+// Q/K RoPE and V scaling, preserving eager BF16 rounding. With packedQkv,
+// read [Q, K, V] within each row and write contiguous Q/K/V outputs; otherwise
+// operate in place. Q/K and V may have different head dimensions.
 void FastllmCudaNaiveRopeQKScaleV(fastllm::Data &q, fastllm::Data &k,
     fastllm::Data &v, const fastllm::Data &positions,
     int heads, int kvHeads, int dim, int valueDim,
-    int rotaryDim, float theta, float valueScale);
+    int rotaryDim, float theta, float valueScale, const fastllm::Data *packedQkv = nullptr);
+// Decode/verify: rotate Q in place and write rotated K/indexer K and scaled V
+// directly to reserved caches. Inputs K/V remain unchanged; no metadata update.
+// An empty indexKey denotes SWA. Unsupported layouts return false before writes.
+// An empty liveKeys appends at the cache's host length, using existing capacity.
+// packedQkv reads Q/K/V from a single projection; Q is written contiguously.
+bool FastllmCudaNaiveRopeAppendCache(fastllm::Data &q, const fastllm::Data &k,
+    const fastllm::Data &v, const fastllm::Data &indexKey,
+    const fastllm::Data &positions, fastllm::Data &key, fastllm::Data &value,
+    const fastllm::Data &liveKeys, int heads, int kvHeads, int dim, int valueDim,
+    int rotaryDim, float theta, float valueScale, int window,
+    const fastllm::Data *packedQkv = nullptr);
 // Keep the allocation and logical row order when retaining a sliding suffix.
 void FastllmCudaNaiveTrimCache(fastllm::Data &key, fastllm::Data &value, int keep);
 // Exact descending score / ascending position order for each query row.

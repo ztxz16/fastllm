@@ -171,7 +171,12 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
         const auto &cfg = slidingLayers[layer] ? sliding : full;
         replicate(prefix + ".input_layernorm.weight");
         replicate(prefix + ".post_attention_layernorm.weight");
-        split(ap + "q_proj.weight", rangeScheme(cfg.heads * cfg.headDim), 0, ap + "q_proj.bias");
+        const auto merged = weight.weight.find(ap + "mergeqkv.weight");
+        const bool mergedQkv = merged != weight.weight.end() && !merged->second.dims.empty();
+        DivisionScheme qkvScheme = rangeScheme(cfg.heads * cfg.headDim);
+        if (!mergedQkv)
+            split(ap + "q_proj.weight", qkvScheme, 0, ap + "q_proj.bias");
+        int offset = cfg.heads * cfg.headDim;
         for (auto item : {std::make_pair("k", cfg.headDim), std::make_pair("v", cfg.valueDim)}) {
             DivisionScheme scheme;
             for (int r = 0; r < ranks; ++r) {
@@ -179,9 +184,18 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
                 int begin = r * cfg.kvHeads / ranks;
                 int count = std::max(1, cfg.kvHeads / ranks);
                 scheme[tpDevices[r]] = {{begin * item.second, (begin + count) * item.second}};
+                qkvScheme[tpDevices[r]].push_back(
+                    {offset + begin * item.second, offset + (begin + count) * item.second});
             }
-            split(ap + item.first + "_proj.weight", scheme, 0, ap + item.first + "_proj.bias");
+            if (!mergedQkv)
+                split(ap + item.first + "_proj.weight", scheme, 0, ap + item.first + "_proj.bias");
+            offset += cfg.kvHeads * item.second;
         }
+        // Explicit Q/K/V ranges also support unequal K/V dimensions and KV
+        // replication when TP exceeds KV heads; the generic QKV pack assumes
+        // equal head dimensions.
+        if (mergedQkv)
+            split(ap + "mergeqkv.weight", qkvScheme, 0, ap + "mergeqkv.bias");
         split(ap + "o_proj.weight", rangeScheme(cfg.heads * cfg.valueDim), 1);
         auto sinkIt = weight.weight.find(ap + "attention_sink_bias");
         if (sinkIt != weight.weight.end() && !sinkIt->second.dims.empty()) {
