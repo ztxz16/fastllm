@@ -1527,3 +1527,11 @@ Graph replay 和后缀路由变化下的前缀比较仍要求逐 bit 一致。�
 `naive_n05_verify_selection_{2,4,8}`、`naive_n05_verify_selection_graph`（Linux）、
 `naive_n05_tp_graph`（Linux）、`cuda_nvfp4_marlin_grouped_rows` 和
 `cuda_nvfp4_marlin_cross_device_rows`。`speculative_sampling` 还覆盖 CPU 概率与残差采样。
+
+
+## 草稿投影融合
+
+草稿 Q/K/V 与 Gate/Up 在模型加载阶段分别合并，沿用 WeightMergeRule 的所有权规则，
+合并成功后删除原条目。上下文 K/V 从合并 QKV 建立只读行视图，不另存合并权重缓存。
+BF16 草稿支持 Q/K RMSNorm、RoPE 和 KV 写入融合；SwiGLU 保留先将 SiLU 舍入为
+BF16 再相乘的数值语义。布局不满足融合条件时保留原算子路径，Graph 和 eager 均可运行。

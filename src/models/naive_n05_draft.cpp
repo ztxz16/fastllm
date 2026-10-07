@@ -15,20 +15,15 @@ namespace {
         // The block backbone benefits from tensor-core GEMM even at 2..7 rows.
         // MatMulTransB uses the same BF16 weights and FP32 accumulation, and
         // avoids the generic Linear small-batch GEMV dispatch.
-        if (input.Count(0) / input.dims.back() > 1) MatMulTransB(input, weight, output);
+        // Non-owning weight views must not enter Linear's persistent bias cache.
+        if (weight.isFake || input.Count(0) / input.dims.back() > 1) MatMulTransB(input, weight, output);
         else Linear(input, weight, Data(), output);
     }
 }
 
 #ifdef USE_CUDA
-struct NaiveN05FlashModel::DraftKVProjection {
-    // Immutable source weights, in K/V/norm order for each layer.
-    std::vector<void *> sources;
-    Data weight, norm;
-};
-
 struct NaiveN05FlashModel::DraftWorkspace {
-    struct Layer { Data normed, q, k, v, attention, output, gate, up, scores; };
+    struct Layer { Data normed, q, k, v, qkv, attention, output, gate, up, gateUp, scores; };
     struct Graph {
         void *graph = nullptr, *exec = nullptr;
         std::vector<void *> reserved;
@@ -46,7 +41,7 @@ struct NaiveN05FlashModel::DraftWorkspace {
         std::vector<void *> weights;
         Data logits, ids, latent, bias, partial;
     } proposal;
-    struct ContextLayer { Data key, value; };
+    struct ContextLayer { Data raw, key, value; };
     int device = -1;
     bool disabled = false;
     std::vector<void *> inputs;
@@ -72,7 +67,6 @@ std::shared_ptr<NaiveN05FlashModel::DraftContext> NaiveN05FlashModel::CreateDraf
     if (idleDraftContext) {
         context->kv.swap(idleDraftContext->kv);
         context->workspace.swap(idleDraftContext->workspace);
-        context->projectedKV.swap(idleDraftContext->projectedKV);
         idleDraftContext.reset();
         for (auto &pair : context->kv)
             for (Data *cache : {&pair.first, &pair.second})
@@ -136,28 +130,47 @@ bool NaiveN05FlashModel::RunDraftGraph(int anchor, DraftContext &context, Data &
             const std::string layer = "dspark.layers." + std::to_string(i) + ".";
             auto &b = state.layers[i];
             KimiK3RMSNorm(state.hidden, weight[layer + "input_layernorm.weight"], draftEps, b.normed);
-            DraftLinear(b.normed, weight[layer + "self_attn.q_proj.weight"], b.q);
-            DraftLinear(b.normed, weight[layer + "self_attn.k_proj.weight"], b.k);
-            DraftLinear(b.normed, weight[layer + "self_attn.v_proj.weight"], b.v);
-            b.q.Reshape({1, draftBlock * draftHeads, draftHeadDim});
-            b.k.Reshape({1, draftBlock * draftKvHeads, draftHeadDim});
-            KimiK3RMSNorm(b.q, weight[layer + "self_attn.q_norm.weight"], draftEps, b.q);
-            KimiK3RMSNorm(b.k, weight[layer + "self_attn.k_norm.weight"], draftEps, b.k);
-            b.q.Reshape({1, draftBlock, draftHeads * draftHeadDim});
-            b.k.Reshape({1, draftBlock, draftKvHeads * draftHeadDim});
-            FastllmCudaNaiveRope(b.q, state.positions, draftHeads, draftHeadDim, draftHeadDim, draftTheta);
-            FastllmCudaNaiveRope(b.k, state.positions, draftKvHeads, draftHeadDim, draftHeadDim, draftTheta);
             auto &cache = context.kv[i];
-            FastllmCudaNaiveAppendVerifyCache(cache.first, cache.second, b.k, b.v, state.live, draftWindow);
+            const bool mergedQKV = weight.weight.count(layer + "self_attn.mergeqkv.weight");
+            if (mergedQKV) DraftLinear(b.normed, weight[layer + "self_attn.mergeqkv.weight"], b.qkv);
+            if (!mergedQKV || !FastllmCudaNaiveDraftQKV(b.qkv,
+                    weight[layer + "self_attn.q_norm.weight"], weight[layer + "self_attn.k_norm.weight"],
+                    state.positions, state.live, cache.first, cache.second, b.q,
+                    draftHeads, draftKvHeads, draftHeadDim, draftWindow, draftEps, draftTheta)) {
+                if (mergedQKV) {
+                    const int qw = draftHeads * draftHeadDim, kw = draftKvHeads * draftHeadDim;
+                    Split(b.qkv, -1, 0, qw, b.q);
+                    Split(b.qkv, -1, qw, qw + kw, b.k);
+                    Split(b.qkv, -1, qw + kw, qw + 2 * kw, b.v);
+                } else {
+                    DraftLinear(b.normed, weight[layer + "self_attn.q_proj.weight"], b.q);
+                    DraftLinear(b.normed, weight[layer + "self_attn.k_proj.weight"], b.k);
+                    DraftLinear(b.normed, weight[layer + "self_attn.v_proj.weight"], b.v);
+                }
+                b.q.Reshape({1, draftBlock * draftHeads, draftHeadDim});
+                b.k.Reshape({1, draftBlock * draftKvHeads, draftHeadDim});
+                KimiK3RMSNorm(b.q, weight[layer + "self_attn.q_norm.weight"], draftEps, b.q);
+                KimiK3RMSNorm(b.k, weight[layer + "self_attn.k_norm.weight"], draftEps, b.k);
+                b.q.Reshape({1, draftBlock, draftHeads * draftHeadDim});
+                b.k.Reshape({1, draftBlock, draftKvHeads * draftHeadDim});
+                FastllmCudaNaiveRope(b.q, state.positions, draftHeads, draftHeadDim, draftHeadDim, draftTheta);
+                FastllmCudaNaiveRope(b.k, state.positions, draftKvHeads, draftHeadDim, draftHeadDim, draftTheta);
+                FastllmCudaNaiveAppendVerifyCache(cache.first, cache.second, b.k, b.v, state.live, draftWindow);
+            }
             FastllmCudaNaiveDraftAttention(b.q, cache.first, cache.second, state.live,
                 draftHeads, draftKvHeads, draftHeadDim, draftWindow, shortAttention, b.scores, b.attention);
             DraftLinear(b.attention, weight[layer + "self_attn.o_proj.weight"], b.output);
             AddTo(state.hidden, b.output);
             KimiK3RMSNorm(state.hidden, weight[layer + "post_attention_layernorm.weight"], draftEps, b.normed);
-            DraftLinear(b.normed, weight[layer + "mlp.gate_proj.weight"], b.gate);
-            DraftLinear(b.normed, weight[layer + "mlp.up_proj.weight"], b.up);
-            Silu(b.gate, b.gate);
-            MulTo(b.gate, b.up);
+            if (weight.weight.count(layer + "mlp.gateup_proj.weight")) {
+                DraftLinear(b.normed, weight[layer + "mlp.gateup_proj.weight"], b.gateUp);
+                FastllmCudaNaiveDraftSwiGLU(b.gateUp, b.gate);
+            } else {
+                DraftLinear(b.normed, weight[layer + "mlp.gate_proj.weight"], b.gate);
+                DraftLinear(b.normed, weight[layer + "mlp.up_proj.weight"], b.up);
+                Silu(b.gate, b.gate);
+                MulTo(b.gate, b.up);
+            }
             DraftLinear(b.gate, weight[layer + "mlp.down_proj.weight"], b.output);
             AddTo(state.hidden, b.output);
         }
@@ -392,6 +405,18 @@ void NaiveN05FlashModel::InitDraft() {
     for (auto name : {"dspark.fc.weight", "dspark.markov_head.markov_w2.weight",
                       "dspark.confidence_head.proj.weight", "dspark.layers.*.self_attn.*_proj.weight",
                       "dspark.layers.*.mlp.*_proj.weight"}) weight.linearNames.insert(name);
+    // Use the loader's normal merge lifecycle: each merged weight owns its
+    // storage, and the original entries are erased before inference begins.
+    for (int i = 0; i < draftLayers; ++i) {
+        const std::string layer = "dspark.layers." + std::to_string(i) + ".";
+        const std::string attn = layer + "self_attn.", mlp = layer + "mlp.";
+        weightMergeRules.push_back(WeightMergeRule({WeightMergeRuleSingle(
+            {attn + "q_proj.weight", attn + "k_proj.weight", attn + "v_proj.weight"},
+            attn + "mergeqkv.weight", "linear")}));
+        weightMergeRules.push_back(WeightMergeRule({WeightMergeRuleSingle(
+            {mlp + "gate_proj.weight", mlp + "up_proj.weight"},
+            mlp + "gateup_proj.weight", "linear")}));
+    }
 }
 
 bool NaiveN05FlashModel::AppendDraftContextFused(Data &hidden, int start, DraftContext &context) {
@@ -412,62 +437,38 @@ bool NaiveN05FlashModel::AppendDraftContextFused(Data &hidden, int start, DraftC
     if (width64 > INT_MAX / 2 / draftLayers || hidden.dims[2] <= 0 ||
         (int64_t)draftWindow + draftBlock > INT_MAX) return false;
     const int width = (int)width64;
-    const std::vector<int> matrixDims{width, hidden.dims[2]}, normDims{draftHeadDim};
-    const std::vector<int> packedDims{draftLayers * 2 * width, hidden.dims[2]};
-    const std::vector<int> packedNormDims{draftLayers, draftHeadDim};
-    std::vector<void *> sources;
-    auto dense = [&](Data &tensor, DataType type, const std::vector<int> &dims) {
-        if (tensor.dataType != type || tensor.dims != dims ||
-            tensor.dataDevice != DataDevice::CUDA || !tensor.cudaData || tensor.multiDeviceData ||
-            tensor.dataDeviceIds != devices || tensor.strides.size() != dims.size()) return false;
-        uint64_t stride = 1;
-        for (int i = (int)dims.size() - 1; i >= 0; --i) {
-            if (tensor.strides[i] != stride) return false;
-            stride *= dims[i];
-        }
-        sources.push_back(tensor.cudaData);
-        return true;
-    };
-    // Prefill materializes the original weights. Do not move CPU/offloaded or
-    // sharded weights just to enable this optional optimization.
+    std::vector<Data> local(context.workspace ? 0 : draftLayers);
+    std::vector<const Data *> raw, norms;
+    // K/V are row views into the loader-owned QKV matrix. Never pack a second
+    // copy of the weights, even when all layers share the context input.
     for (int i = 0; i < draftLayers; ++i) {
         const auto name = "dspark.layers." + std::to_string(i) + ".self_attn.";
-        for (const char *suffix : {"k_proj.weight", "v_proj.weight"}) {
-            Data &tensor = weight[name + suffix];
-            if (!dense(tensor, BFLOAT16, matrixDims)) return false;
-        }
+        auto merged = weight.weight.find(name + "mergeqkv.weight");
+        if (merged == weight.weight.end()) return false;
+        const Data &qkv = merged->second;
+        if (qkv.dataType != BFLOAT16 || qkv.multiDeviceData ||
+            qkv.dims != std::vector<int>{(draftHeads + 2 * draftKvHeads) * draftHeadDim, hidden.dims[2]} ||
+            qkv.strides != std::vector<uint64_t>{(uint64_t)hidden.dims[2], 1} ||
+            qkv.dataDevice != DataDevice::CUDA || qkv.dataDeviceIds != devices || !qkv.cudaData)
+            return false;
         Data &norm = weight[name + "k_norm.weight"];
-        if (!dense(norm, FLOAT32, normDims)) return false;
+        if (norm.dataType != FLOAT32 || norm.multiDeviceData ||
+            norm.dims != std::vector<int>{draftHeadDim} || norm.strides != std::vector<uint64_t>{1} ||
+            norm.dataDevice != DataDevice::CUDA || norm.dataDeviceIds != devices || !norm.cudaData)
+            return false;
+        norms.push_back(&norm);
     }
-    if (!draftKVProjection || draftKVProjection->weight.dataDeviceIds != devices ||
-        draftKVProjection->sources != sources ||
-        draftKVProjection->weight.dims != packedDims || draftKVProjection->norm.dims != packedNormDims) {
-        auto packed = std::make_shared<DraftKVProjection>();
-        packed->sources = std::move(sources);
-        auto allocate = [&](Data &data, DataType type, const std::vector<int> &dims) {
-            data.dataType = type;
-            data.Resize(dims);
-            data.ToDevice(DataDevice::CUDA, devices, false);
-            data.Allocate(false);
-        };
-        allocate(packed->weight, BFLOAT16, packedDims);
-        allocate(packed->norm, FLOAT32, packedNormDims);
-        const size_t bytes = (size_t)width * hidden.dims[2] * sizeof(uint16_t);
-        for (int i = 0; i < draftLayers; ++i) {
-            for (int part = 0; part < 2; ++part)
-                FastllmCudaCopyFromDeviceToDevice((char *)packed->weight.cudaData + (i * 2 + part) * bytes,
-                                                 packed->sources[i * 3 + part], bytes);
-            FastllmCudaCopyFromDeviceToDevice((float *)packed->norm.cudaData + i * draftHeadDim,
-                                             packed->sources[i * 3 + 2], draftHeadDim * sizeof(float));
-        }
-        draftKVProjection = std::move(packed);
+    for (int i = 0; i < draftLayers; ++i) {
+        Data &qkv = weight["dspark.layers." + std::to_string(i) + ".self_attn.mergeqkv.weight"];
+        Data view;
+        view.FakeFrom(qkv, (size_t)draftHeads * draftHeadDim * hidden.dims[2] * sizeof(uint16_t));
+        view.Resize({2 * width, hidden.dims[2]});
+        Data &output = context.workspace ? context.workspace->contextLayers[i].raw : local[i];
+        DraftLinear(hidden, view, output);
+        raw.push_back(&output);
     }
-    if (!context.projectedKV) context.projectedKV = std::make_shared<Data>();
-    // Changing GEMM output width can change BF16 rounding; postprocessing retains
-    // the separate RMSNorm and RoPE operations' rounding and reduction order.
-    DraftLinear(hidden, draftKVProjection->weight, *context.projectedKV);
-    if (!FastllmCudaNaiveDraftKV(*context.projectedKV, draftKVProjection->norm, start,
-            context.kv, draftKvHeads, draftHeadDim, draftWindow,
+    if (!FastllmCudaNaiveDraftKV(raw, norms, start, context.kv,
+            draftKvHeads, draftHeadDim, draftWindow,
             draftWindow + draftBlock, draftEps, draftTheta)) return false;
     context.committed = start + hidden.dims[1];
     return true;
@@ -500,8 +501,22 @@ void NaiveN05FlashModel::AppendDraftContext(Data &hidden, int start, DraftContex
         Data localKey, localValue;
         Data &key = buffers ? buffers->contextLayers[i].key : localKey;
         Data &value = buffers ? buffers->contextLayers[i].value : localValue;
-        DraftLinear(selected, weight[layer + "k_proj.weight"], key);
-        DraftLinear(selected, weight[layer + "v_proj.weight"], value);
+        auto merged = weight.weight.find(layer + "mergeqkv.weight");
+        if (merged != weight.weight.end()) {
+            Data &qkvWeight = merged->second;
+            qkvWeight.ToDevice(DataDevice::CUDA, std::vector<int>{FastllmCudaGetDevice()});
+            Data keyWeight, valueWeight;
+            const int qw = draftHeads * draftHeadDim, kw = draftKvHeads * draftHeadDim;
+            keyWeight.FakeFrom(qkvWeight, (size_t)qw * embed_dim * sizeof(uint16_t));
+            valueWeight.FakeFrom(qkvWeight, (size_t)(qw + kw) * embed_dim * sizeof(uint16_t));
+            keyWeight.Resize({kw, embed_dim});
+            valueWeight.Resize({kw, embed_dim});
+            DraftLinear(selected, keyWeight, key);
+            DraftLinear(selected, valueWeight, value);
+        } else {
+            DraftLinear(selected, weight[layer + "k_proj.weight"], key);
+            DraftLinear(selected, weight[layer + "v_proj.weight"], value);
+        }
         key.Reshape({1, length * draftKvHeads, draftHeadDim});
         KimiK3RMSNorm(key, weight[layer + "k_norm.weight"], draftEps, key);
         key.Reshape({1, length, draftKvHeads * draftHeadDim});
@@ -587,24 +602,42 @@ Data NaiveN05FlashModel::RunDraft(int anchor, DraftContext &context) {
     Data pos(FLOAT32, {1, draftBlock}, positions);
     for (int i = 0; i < draftLayers; ++i) {
         const std::string layer = "dspark.layers." + std::to_string(i) + ".";
-        Data normed, q, k, v, attention, output, gate, up;
+        Data normed, q, k, v, qkv, attention, output, gate, up, gateUp;
         KimiK3RMSNorm(hidden, weight[layer + "input_layernorm.weight"], draftEps, normed);
-        DraftLinear(normed, weight[layer + "self_attn.q_proj.weight"], q);
-        DraftLinear(normed, weight[layer + "self_attn.k_proj.weight"], k);
-        DraftLinear(normed, weight[layer + "self_attn.v_proj.weight"], v);
-        q.Reshape({1, draftBlock * draftHeads, draftHeadDim});
-        k.Reshape({1, draftBlock * draftKvHeads, draftHeadDim});
-        KimiK3RMSNorm(q, weight[layer + "self_attn.q_norm.weight"], draftEps, q);
-        KimiK3RMSNorm(k, weight[layer + "self_attn.k_norm.weight"], draftEps, k);
-        q.Reshape({1, draftBlock, draftHeads * draftHeadDim});
-        k.Reshape({1, draftBlock, draftKvHeads * draftHeadDim});
-        pos.ToDevice(q.dataDevice, q.dataDeviceIds);
-        FastllmCudaNaiveRope(q, pos, draftHeads, draftHeadDim, draftHeadDim, draftTheta);
-        FastllmCudaNaiveRope(k, pos, draftKvHeads, draftHeadDim, draftHeadDim, draftTheta);
         auto &cache = context.kv[i];
-        int past = cache.first.dims[1];
-        AppendCache(cache.first, k);
-        AppendCache(cache.second, v);
+        const int past = cache.first.dims[1];
+        const bool mergedQKV = weight.weight.count(layer + "self_attn.mergeqkv.weight");
+        if (mergedQKV) DraftLinear(normed, weight[layer + "self_attn.mergeqkv.weight"], qkv);
+        pos.ToDevice(DataDevice::CUDA, std::vector<int>{FastllmCudaGetDevice()});
+        if (mergedQKV && FastllmCudaNaiveDraftQKV(qkv,
+                weight[layer + "self_attn.q_norm.weight"], weight[layer + "self_attn.k_norm.weight"],
+                pos, Data(), cache.first, cache.second, q,
+                draftHeads, draftKvHeads, draftHeadDim, draftWindow, draftEps, draftTheta)) {
+            cache.first.Resize({1, past + draftBlock, draftKvHeads * draftHeadDim});
+            cache.second.Resize({1, past + draftBlock, draftKvHeads * draftHeadDim});
+        } else {
+            if (mergedQKV) {
+                const int qw = draftHeads * draftHeadDim, kw = draftKvHeads * draftHeadDim;
+                Split(qkv, -1, 0, qw, q);
+                Split(qkv, -1, qw, qw + kw, k);
+                Split(qkv, -1, qw + kw, qw + 2 * kw, v);
+            } else {
+                DraftLinear(normed, weight[layer + "self_attn.q_proj.weight"], q);
+                DraftLinear(normed, weight[layer + "self_attn.k_proj.weight"], k);
+                DraftLinear(normed, weight[layer + "self_attn.v_proj.weight"], v);
+            }
+            q.Reshape({1, draftBlock * draftHeads, draftHeadDim});
+            k.Reshape({1, draftBlock * draftKvHeads, draftHeadDim});
+            KimiK3RMSNorm(q, weight[layer + "self_attn.q_norm.weight"], draftEps, q);
+            KimiK3RMSNorm(k, weight[layer + "self_attn.k_norm.weight"], draftEps, k);
+            q.Reshape({1, draftBlock, draftHeads * draftHeadDim});
+            k.Reshape({1, draftBlock, draftKvHeads * draftHeadDim});
+            pos.ToDevice(q.dataDevice, q.dataDeviceIds);
+            FastllmCudaNaiveRope(q, pos, draftHeads, draftHeadDim, draftHeadDim, draftTheta);
+            FastllmCudaNaiveRope(k, pos, draftKvHeads, draftHeadDim, draftHeadDim, draftTheta);
+            AppendCache(cache.first, k);
+            AppendCache(cache.second, v);
+        }
         FastllmCudaNaiveAttention(q, cache.first, cache.second, Data(), Data(),
             draftHeads, draftKvHeads, draftHeadDim, draftHeadDim, past, draftWindow, attention, false);
         cache.first.Resize({1, past, draftKvHeads * draftHeadDim});
@@ -612,10 +645,15 @@ Data NaiveN05FlashModel::RunDraft(int anchor, DraftContext &context) {
         DraftLinear(attention, weight[layer + "self_attn.o_proj.weight"], output);
         AddTo(hidden, output);
         KimiK3RMSNorm(hidden, weight[layer + "post_attention_layernorm.weight"], draftEps, normed);
-        DraftLinear(normed, weight[layer + "mlp.gate_proj.weight"], gate);
-        DraftLinear(normed, weight[layer + "mlp.up_proj.weight"], up);
-        Silu(gate, gate);
-        MulTo(gate, up);
+        if (weight.weight.count(layer + "mlp.gateup_proj.weight")) {
+            DraftLinear(normed, weight[layer + "mlp.gateup_proj.weight"], gateUp);
+            FastllmCudaNaiveDraftSwiGLU(gateUp, gate);
+        } else {
+            DraftLinear(normed, weight[layer + "mlp.gate_proj.weight"], gate);
+            DraftLinear(normed, weight[layer + "mlp.up_proj.weight"], up);
+            Silu(gate, gate);
+            MulTo(gate, up);
+        }
         DraftLinear(gate, weight[layer + "mlp.down_proj.weight"], output);
         AddTo(hidden, output);
     }

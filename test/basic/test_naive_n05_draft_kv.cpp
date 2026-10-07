@@ -6,6 +6,7 @@
 #include <cmath>
 #include <climits>
 #include <stdexcept>
+#include <algorithm>
 using namespace fastllm;
 static int device = 0;
 void Check(bool ok, const char *s) {
@@ -37,21 +38,36 @@ void Append(Data &cache, Data &input, int reserve) {
     CatDirect(cache, input, 1);
     cache.isKVCache = true;
 }
+// Construct independent layer inputs from the packed test reference.
+struct LayerInputs {
+    std::vector<Data> parts, normViews;
+    std::vector<const Data *> raw, norm;
+    LayerInputs(Data &input, Data &weights) : parts(weights.dims[0]), normViews(parts.size()) {
+        const int width = input.dims[2] / parts.size(), dim = weights.dims[1];
+        for (size_t i = 0; i < parts.size(); ++i) {
+            Split(input, 2, i * width, (i + 1) * width, parts[i]);
+            normViews[i].FakeFrom(weights, i * dim * sizeof(float));
+            normViews[i].Resize({dim});
+            raw.push_back(&parts[i]);
+            norm.push_back(&normViews[i]);
+        }
+    }
+};
 class ProjectionFixture : public NaiveN05FlashModel {
   public:
     using NaiveN05FlashModel::DraftContext;
     ProjectionFixture(int seed) {
         draftLayers = 3;
+        embed_dim = 256;
+        draftHeads = 4;
         draftKvHeads = 2;
         draftHeadDim = 64;
         draftWindow = 17;
         draftBlock = 7;
         for (int i = 0; i < draftLayers; ++i) {
             auto name = "dspark.layers." + std::to_string(i) + ".self_attn.";
-            for (auto suffix : {"k_proj.weight", "v_proj.weight"}) {
-                Data x = BF({128, 256}, seed + i + (suffix[0] == 'v' ? 37 : 0));
-                weight[name + suffix].CopyFrom(x);
-            }
+            Data x = BF({512, 256}, seed + i);
+            weight[name + "mergeqkv.weight"].CopyFrom(x);
             Data norm(FLOAT32, {64}, std::vector<float>(64, 1.0f));
             norm.ToDevice(DataDevice::CUDA, std::vector<int>{device});
             weight[name + "k_norm.weight"].CopyFrom(norm);
@@ -64,9 +80,7 @@ class ProjectionFixture : public NaiveN05FlashModel {
         draftBlock = -1;
         AppendDraftContext(x, start, ctx);
         draftBlock = saved;
-        Check(!ctx.projectedKV, "reference unexpectedly used the fused path");
     }
-    bool Packed() const { return bool(draftKVProjection); }
     Data &FirstNorm() { return weight["dspark.layers.0.self_attn.k_norm.weight"]; }
     std::shared_ptr<DraftContext> Reuse(std::shared_ptr<DraftContext> ctx, bool history = false) {
         SetSaveHistoryChat(history);
@@ -88,6 +102,8 @@ static double Relative(const Data &a, const Data &b) {
     }
     return std::sqrt(error / std::max(power, 1e-30));
 }
+// Exercise row views, changing row counts, multiple pointer-table groups,
+// reuse with different weights, and graph replay against separate GEMMs.
 int main() {
     try {
         int devices = 0;
@@ -113,8 +129,17 @@ int main() {
                             Append(a[i].second, v, 1152);
                             Append(b[i].second, v, 1152);
                         }
-                    Check(FastllmCudaNaiveDraftKV(raw, norm, start, a, heads, dim, 1024, 1031, 1e-5f, 10000),
-                          "valid fusion rejected");
+                    LayerInputs input(raw, norm);
+                    Check(FastllmCudaNaiveDraftKV(input.raw, input.norm, start, a,
+                          heads, dim, 1024, 1031, 1e-5f, 10000), "valid per-layer fusion rejected");
+                    auto before = Bits(a[0].first);
+                    auto last = input.raw.back();
+                    input.raw.back() = nullptr;
+                    Check(!FastllmCudaNaiveDraftKV(input.raw, input.norm, start, a,
+                          heads, dim, 1024, 1031, 1e-5f, 10000), "invalid per-layer fusion accepted");
+                    Check(Bits(a[0].first) == before, "invalid per-layer call wrote cache");
+                    input.raw.back() = last;
+                    checks += 3;
                     std::vector<float> positions(rows);
                     for (int j = 0; j < rows; j++)
                         positions[j] = start + j;
@@ -149,7 +174,8 @@ int main() {
                     Data norm(FLOAT32, {layers, dim}, std::vector<float>(layers * dim, 1));
                     norm.ToDevice(DataDevice::CUDA, std::vector<int>{device});
                     std::vector<std::pair<Data, Data>> kv;
-                    Check(FastllmCudaNaiveDraftKV(raw, norm, 91, kv, heads, dim, 8, 8, 1e-5f, 12345),
+                    LayerInputs input(raw, norm);
+                    Check(FastllmCudaNaiveDraftKV(input.raw, input.norm, 91, kv, heads, dim, 8, 8, 1e-5f, 12345),
                           "general shape rejected");
                     Data pos(FLOAT32, {1, rows}, {91, 92, 93});
                     pos.ToDevice(DataDevice::CUDA, std::vector<int>{device});
@@ -169,17 +195,17 @@ int main() {
                     auto dims = kv[0].first.dims;
                     // Reject a bad layer at the end before touching the first layer.
                     kv.back().second.dims[1]++;
-                    Check(!FastllmCudaNaiveDraftKV(raw, norm, 94, kv, heads, dim, 8, 8, 1e-5f, 12345),
+                    Check(!FastllmCudaNaiveDraftKV(input.raw, input.norm, 94, kv, heads, dim, 8, 8, 1e-5f, 12345),
                           "bad cache accepted");
                     Check(kv[0].first.dims == dims && Bits(kv[0].first) == before, "fallback mutated cache");
                     kv.back().second.dims[1]--;
-                    raw.strides[1]++;
-                    Check(!FastllmCudaNaiveDraftKV(raw, norm, 94, kv, heads, dim, 8, 8, 1e-5f, 12345),
+                    input.parts.back().strides[1]++;
+                    Check(!FastllmCudaNaiveDraftKV(input.raw, input.norm, 94, kv, heads, dim, 8, 8, 1e-5f, 12345),
                           "padded raw accepted");
-                    raw.strides[1]--;
-                    Check(!FastllmCudaNaiveDraftKV(raw, norm, INT_MAX, kv, heads, dim, 8, 8, 1e-5f, 12345),
+                    input.parts.back().strides[1]--;
+                    Check(!FastllmCudaNaiveDraftKV(input.raw, input.norm, INT_MAX, kv, heads, dim, 8, 8, 1e-5f, 12345),
                           "overflowing position accepted");
-                    Check(!FastllmCudaNaiveDraftKV(raw, norm, 94, kv, INT_MAX, dim, 8, 8, 1e-5f, 12345),
+                    Check(!FastllmCudaNaiveDraftKV(input.raw, input.norm, 94, kv, INT_MAX, dim, 8, 8, 1e-5f, 12345),
                           "overflowing projection shape accepted");
                     Check(kv[0].first.dims == dims && Bits(kv[0].first) == before, "rejection changed cache");
                     checks += 6;
@@ -193,7 +219,7 @@ int main() {
                     Data hidden = BF({1, rows, 256}, start + seed);
                     Check(model.Fused(hidden, start, *actual), "model fusion rejected");
                     model.Reference(hidden, start, reference);
-                    Check(!actual->workspace && model.Packed(), "fusion requires graph workspace");
+                    Check(!actual->workspace, "fusion requires graph workspace");
                     for (int layer = 0; layer < 3; ++layer) {
                         Check(actual->kv[layer].first.dims == reference.kv[layer].first.dims,
                               "model cache shape differs");
@@ -205,15 +231,15 @@ int main() {
                     Check(actual->committed == start, "committed count differs");
                     ++checks;
                 }
-                auto scratch = actual->projectedKV;
+                auto scratch = actual->kv[0].first.cudaData;
                 auto reused = model.Reuse(actual);
-                Check(reused->committed == 0 && reused->projectedKV == scratch, "request storage not recycled");
+                Check(reused->committed == 0 && reused->kv[0].first.cudaData == scratch, "request storage not recycled");
                 for (auto &p : reused->kv)
                     Check(p.first.dims[1] == 0 && p.second.dims[1] == 0, "request prefix leaked");
                 Data hidden = BF({1, 2, 256}, seed);
                 ProjectionFixture::DraftContext independent;
                 Check(model.Fused(hidden, 0, *reused) && model.Fused(hidden, 0, independent), "reused fusion rejected");
-                Check(reused->projectedKV != independent.projectedKV, "requests share mutable scratch");
+                Check(reused->kv[0].first.cudaData != independent.kv[0].first.cudaData, "requests share mutable scratch");
                 Check(Bits(reused->kv[0].first) == Bits(independent.kv[0].first), "reuse changed output");
                 Data longHidden = BF({1, 9, 256}, seed);
                 Check(!model.Fused(longHidden, 2, *reused) && reused->committed == 2,
@@ -236,9 +262,8 @@ int main() {
                       "fallback changed committed context");
                 model.FirstNorm().ToDevice(DataDevice::CUDA, std::vector<int>{device});
                 auto archived = model.Reuse(reused, true);
-                Check(!archived->projectedKV && archived->kv.empty(), "history request reused idle storage");
+                Check(archived->kv.empty(), "history request reused idle storage");
                 auto incomplete = std::make_shared<ProjectionFixture::DraftContext>();
-                incomplete->projectedKV = std::make_shared<Data>();
                 incomplete->kv.resize(3);
                 auto recovered = model.Reuse(incomplete);
                 Check(model.Fused(hidden, 0, *recovered), "partially initialized request storage failed reuse");

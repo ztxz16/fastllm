@@ -134,16 +134,17 @@ __global__ void VerifyRouter4096(const BF16 *input, const float *weight,
 
 constexpr int kDraftKVLayersPerLaunch = 16;
 struct DraftKVDestinations {
+    const BF16 *raw[kDraftKVLayersPerLaunch];
+    const float *norm[kDraftKVLayersPerLaunch];
     BF16 *key[kDraftKVLayersPerLaunch], *value[kDraftKVLayersPerLaunch];
     int length[kDraftKVLayersPerLaunch];
 };
-__global__ void DraftNormRopeWrite(const BF16 *raw, const float *norm,
-        DraftKVDestinations dst, int rows, int layers, int firstLayer,
+__global__ void DraftNormRopeWrite(DraftKVDestinations dst, int rows,
         int heads, int dim, int start, float eps, float theta) {
     int head = blockIdx.x % heads, row = (blockIdx.x / heads) % rows;
-    int slot = blockIdx.x / (heads * rows), layer = firstLayer + slot;
+    int slot = blockIdx.x / (heads * rows);
     int t = threadIdx.x, width = heads * dim;
-    const BF16 *key = raw + (size_t)row * layers * 2 * width + layer * 2 * width + head * dim;
+    const BF16 *key = dst.raw[slot] + (size_t)row * 2 * width + head * dim;
     __shared__ float sums[8];
     __shared__ BF16 normalized[256];
     float value = t < dim ? (float)key[t] : 0;
@@ -157,7 +158,7 @@ __global__ void DraftNormRopeWrite(const BF16 *raw, const float *norm,
     __syncthreads();
     // Match KimiK3RMSNorm: BF16 normalization, FP32 weight, then BF16.
     if (t < dim)
-        normalized[t] = __float2bfloat16(RoundBF16(value * rsqrtf(sums[0] / dim + eps)) * norm[layer * dim + t]);
+        normalized[t] = __float2bfloat16(RoundBF16(value * rsqrtf(sums[0] / dim + eps)) * dst.norm[slot][t]);
     __syncthreads();
     size_t offset = (size_t)(dst.length[slot] + row) * width + head * dim;
     if (t < dim / 2) {
@@ -1534,31 +1535,146 @@ __global__ void AttentionValuesTiled(const float *prob, const BF16 *v,
 }
 }
 
-bool FastllmCudaNaiveDraftKV(const fastllm::Data &raw, const fastllm::Data &norm,
-        int start, std::vector<std::pair<fastllm::Data, fastllm::Data>> &kv,
+namespace {
+// Q and K share the original 256-lane RMSNorm reduction and BF16 rounding.
+// Each K CTA also writes its V head; separate CTAs own disjoint cache columns.
+__global__ void DraftQKVNormRope(const BF16 *raw, const float *qNorm,
+        const float *kNorm, const float *positions, const int *live,
+        BF16 *key, BF16 *value, BF16 *query, int heads, int kvHeads,
+        int dim, int window, int past, float eps, float theta) {
+    const int head = blockIdx.x, row = blockIdx.y, t = threadIdx.x;
+    const bool isKey = head >= heads;
+    const int h = isKey ? head - heads : head;
+    const int qw = heads * dim, kw = kvHeads * dim, width = qw + 2 * kw;
+    const BF16 *src = raw + (size_t)row * width + (isKey ? qw : 0) + h * dim;
+    const float *norm = isKey ? kNorm : qNorm;
+    __shared__ float sums[8];
+    __shared__ BF16 normalized[256];
+    float v = t < dim ? (float)src[t] : 0;
+    float partial = WarpSum(v * v);
+    if ((t & 31) == 0) sums[t / 32] = partial;
+    __syncthreads();
+    if (t < 32) {
+        float total = WarpSum(t < 8 ? sums[t] : 0);
+        if (t == 0) sums[0] = total;
+    }
+    __syncthreads();
+    if (t < dim) normalized[t] = __float2bfloat16(RoundBF16(v * rsqrtf(sums[0] / dim + eps)) * norm[t]);
+    __syncthreads();
+    int base = live ? min(*live - 1, window - 1) : past;
+    BF16 *dst = isKey ? key + (size_t)(base + row) * kw + h * dim
+                     : query + (size_t)row * qw + h * dim;
+    if (t < dim / 2) {
+        float angle = positions[row] * powf(theta, -2.0f * t / dim);
+        float c = RoundBF16(cosf(angle)), s = RoundBF16(sinf(angle));
+        float a = (float)normalized[t], b = (float)normalized[t + dim / 2];
+        dst[t] = __float2bfloat16(RoundBF16(a * c) - RoundBF16(b * s));
+        dst[t + dim / 2] = __float2bfloat16(RoundBF16(b * c) + RoundBF16(a * s));
+    }
+    if (isKey && t < dim)
+        value[(size_t)(base + row) * kw + h * dim + t] = src[kw + t];
+}
+__global__ void DraftRoundedSwiGLU(const BF16 *input, BF16 *output, int width, int count) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    int at = (i / width) * 2 * width + i % width;
+    float gate = (float)input[at], up = (float)input[at + width];
+    output[i] = __float2bfloat16(RoundBF16(gate / (1.0f + expf(-gate))) * up);
+}
+bool DraftDense(const fastllm::Data &x, fastllm::DataType type) {
+    if (x.dataType != type || x.dataDevice != fastllm::DataDevice::CUDA ||
+        x.multiDeviceData || x.dataDeviceIds != std::vector<int>{FastllmCudaGetDevice()} ||
+        !x.cudaData || x.dims.empty() || x.strides.size() != x.dims.size()) return false;
+    uint64_t stride = 1;
+    for (int i = (int)x.dims.size() - 1; i >= 0; --i) {
+        if (x.dims[i] <= 0 || x.strides[i] != stride) return false;
+        stride *= x.dims[i];
+    }
+    return true;
+}
+}
+
+bool FastllmCudaNaiveDraftQKV(const fastllm::Data &raw,
+        const fastllm::Data &qNorm, const fastllm::Data &kNorm,
+        const fastllm::Data &positions, const fastllm::Data &liveKeys,
+        fastllm::Data &key, fastllm::Data &value, fastllm::Data &query,
+        int heads, int kvHeads, int dim, int window, float eps, float theta) {
+    using namespace fastllm;
+    if (heads <= 0 || kvHeads <= 0 || heads % kvHeads || dim <= 0 || dim > 256 || dim % 2 ||
+        window <= 1 || !std::isfinite(eps) || eps < 0 || !std::isfinite(theta) || theta <= 0 ||
+        (int64_t)(heads + 2LL * kvHeads) * dim > INT_MAX ||
+        !DraftDense(raw, BFLOAT16) || raw.dims.size() != 3 || raw.dims[0] != 1 ||
+        raw.dims[2] != (heads + 2 * kvHeads) * dim ||
+        !DraftDense(qNorm, FLOAT32) || qNorm.dims != std::vector<int>{dim} ||
+        !DraftDense(kNorm, FLOAT32) || kNorm.dims != std::vector<int>{dim} ||
+        !DraftDense(positions, FLOAT32) || positions.Count(0) != raw.dims[1]) return false;
+    const int rows = raw.dims[1], width = kvHeads * dim;
+    const bool dynamic = !liveKeys.dims.empty();
+    if (dynamic && (!DraftDense(liveKeys, INT32) || liveKeys.Count(0) != 1)) return false;
+    if (key.dims != value.dims || key.dims.size() != 3 || key.dims[0] != 1 ||
+        key.dims[1] < 0 || key.dims[2] != width) return false;
+    int64_t needed = (dynamic ? window - 1 : key.dims[1]) + (int64_t)rows;
+    for (const Data *cache : {&key, &value}) {
+        if (cache->dataType != BFLOAT16 || cache->dataDevice != DataDevice::CUDA ||
+            cache->multiDeviceData || cache->dataDeviceIds != raw.dataDeviceIds || !cache->cudaData ||
+            cache->expansionDims.size() != 3 || cache->expansionDims[0] != 1 ||
+            cache->expansionDims[1] < needed || cache->expansionDims[2] != width ||
+            cache->strides.size() != 3 || cache->strides[1] != width || cache->strides[2] != 1) return false;
+    }
+    for (const Data *src : {&raw, &qNorm, &kNorm, &positions, &liveKeys, (const Data *)&key, (const Data *)&value})
+        if (&query == src || (query.cudaData && query.cudaData == src->cudaData)) return false;
+    if (raw.cudaData == key.cudaData || raw.cudaData == value.cudaData || key.cudaData == value.cudaData) return false;
+    Output(query, BFLOAT16, {1, rows, heads * dim});
+    DraftQKVNormRope<<<dim3(heads + kvHeads, rows), 256, 0, cudaStreamPerThread>>>(
+        (const BF16 *)raw.cudaData, (const float *)qNorm.cudaData, (const float *)kNorm.cudaData,
+        (const float *)positions.cudaData, dynamic ? (const int *)liveKeys.cudaData : nullptr,
+        (BF16 *)key.cudaData, (BF16 *)value.cudaData, (BF16 *)query.cudaData,
+        heads, kvHeads, dim, window, key.dims[1], eps, theta);
+    CheckLaunch();
+    return true;
+}
+
+void FastllmCudaNaiveDraftSwiGLU(const fastllm::Data &gateUp, fastllm::Data &output) {
+    using namespace fastllm;
+    AssertInFastLLM(DraftDense(gateUp, BFLOAT16) && gateUp.dims.back() % 2 == 0 &&
+        gateUp.Count(0) <= INT_MAX && &gateUp != &output &&
+        (!output.cudaData || output.cudaData != gateUp.cudaData), "Invalid draft GateUp layout.");
+    auto dims = gateUp.dims;
+    dims.back() /= 2;
+    Output(output, BFLOAT16, dims);
+    const int count = gateUp.Count(0) / 2;
+    DraftRoundedSwiGLU<<<(count + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+        (const BF16 *)gateUp.cudaData, (BF16 *)output.cudaData, dims.back(), count);
+    CheckLaunch();
+}
+
+bool FastllmCudaNaiveDraftKV(const std::vector<const fastllm::Data *> &raw,
+        const std::vector<const fastllm::Data *> &norm, int start,
+        std::vector<std::pair<fastllm::Data, fastllm::Data>> &kv,
         int heads, int dim, int window, int reserve, float eps, float theta) {
     using namespace fastllm;
+    if (raw.empty() || raw.size() > INT_MAX || raw.size() != norm.size() ||
+        heads <= 0 || dim <= 0 || dim > 256 || dim % 2 || window <= 1 ||
+        reserve < 0 || start < 0 || (int64_t)heads * dim > INT_MAX / 2 ||
+        !std::isfinite(eps) || eps < 0 || !std::isfinite(theta) || theta <= 0) return false;
+    const int layers = (int)raw.size(), columns = 2 * heads * dim;
+    int rows = 0;
+    for (size_t i = 0; i < raw.size(); ++i) {
+        if (!raw[i] || !norm[i] || !DraftDense(*raw[i], BFLOAT16) ||
+            !DraftDense(*norm[i], FLOAT32) || norm[i]->dims != std::vector<int>{dim} ||
+            raw[i]->dims.size() != 3 || raw[i]->dims[0] != 1 || raw[i]->dims[2] != columns ||
+            (i && raw[i]->dims[1] != rows)) return false;
+        rows = raw[i]->dims[1];
+    }
     const std::vector<int> devices{FastllmCudaGetDevice()};
     auto resident = [&](const Data &data, DataType type) {
         return data.dataType == type && data.dataDevice == DataDevice::CUDA &&
-            data.dataDeviceIds == devices && data.cudaData;
+            data.dataDeviceIds == devices && data.cudaData && !data.multiDeviceData;
     };
-    if (heads <= 0 || dim <= 0 || dim > 256 || dim % 2 || window <= 1 ||
-        reserve < 0 || start < 0 ||
-        !std::isfinite(eps) || eps < 0 || !std::isfinite(theta) || theta <= 0 ||
-        !resident(raw, BFLOAT16) || !resident(norm, FLOAT32) ||
-        norm.dims.size() != 2 || norm.dims[0] <= 0 || norm.dims[1] != dim ||
-        norm.strides.size() != 2 || norm.strides[1] != 1 || norm.strides[0] != dim ||
-        raw.dims.size() != 3 || raw.dims[0] != 1 || raw.dims[1] <= 0 ||
-        (int64_t)start + raw.dims[1] > INT_MAX) return false;
-    int layers = norm.dims[0], rows = raw.dims[1];
-    int64_t width64 = (int64_t)heads * dim;
-    if (width64 > INT_MAX / 2 / layers) return false;
-    int width = (int)width64, columns = layers * 2 * width;
-    if (raw.dims[2] != columns ||
-        raw.strides.size() != 3 || raw.strides[2] != 1 || raw.strides[1] != columns ||
+    if ((int64_t)start + rows > INT_MAX ||
         (int64_t)std::min(layers, kDraftKVLayersPerLaunch) * rows * heads > INT_MAX ||
-        (!kv.empty() && kv.size() != (size_t)layers)) return false;
+        (!kv.empty() && kv.size() != raw.size())) return false;
+    const int width = heads * dim;
     // Validate every layer before resizing any cache; rejected calls are safe to
     // fall back to the separate projections and ordinary append operations.
     for (const auto &pair : kv) {
@@ -1585,6 +1701,8 @@ bool FastllmCudaNaiveDraftKV(const fastllm::Data &raw, const fastllm::Data &norm
         for (int i = 0; i < count; ++i) {
             auto &pair = kv[first + i];
             int old = pair.first.dims.empty() ? 0 : pair.first.dims[1];
+            dst.raw[i] = (const BF16 *)raw[first + i]->cudaData;
+            dst.norm[i] = (const float *)norm[first + i]->cudaData;
             dst.length[i] = old;
             for (Data *cache : {&pair.first, &pair.second}) {
                 cache->dataType = BFLOAT16;
@@ -1600,8 +1718,7 @@ bool FastllmCudaNaiveDraftKV(const fastllm::Data &raw, const fastllm::Data &norm
             dst.value[i] = (BF16 *)pair.second.cudaData;
         }
         DraftNormRopeWrite<<<count * rows * heads, 256, 0, cudaStreamPerThread>>>(
-            (const BF16 *)raw.cudaData, (const float *)norm.cudaData, dst,
-            rows, layers, first, heads, dim, start, eps, theta);
+            dst, rows, heads, dim, start, eps, theta);
         CheckLaunch();
     }
     for (auto &pair : kv) FastllmCudaNaiveTrimCache(pair.first, pair.second, window - 1);

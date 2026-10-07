@@ -601,7 +601,7 @@ static void VerifyRowAllReduce(int ranks) {
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
 class DraftFixture : public NaiveN05FlashModel {
   public:
-    DraftFixture() {
+    DraftFixture(bool merged = false) {
         embed_dim = 256;
         block_cnt = 2;
         draftLayers = 2;
@@ -645,6 +645,24 @@ class DraftFixture : public NaiveN05FlashModel {
             add(p + "mlp.gate_proj.weight", {512, 256});
             add(p + "mlp.up_proj.weight", {512, 256});
             add(p + "mlp.down_proj.weight", {256, 512});
+        }
+        if (merged) for (int i = 0; i < draftLayers; ++i) {
+            const std::string p = "dspark.layers." + std::to_string(i) + ".";
+            auto merge = [&](std::vector<std::string> names, std::string out) {
+                int rows = 0;
+                for (auto &name : names) rows += weight[p + name].dims[0];
+                Data &w = weight[p + out];
+                w.dataType = BFLOAT16; w.Resize({rows, embed_dim}); w.Allocate();
+                size_t offset = 0;
+                for (auto &name : names) {
+                    Data &part = weight[p + name];
+                    memcpy(w.cpuData + offset, part.cpuData, part.GetBytes());
+                    offset += part.GetBytes();
+                    weight.weight.erase(p + name);
+                }
+            };
+            merge({"self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight"}, "self_attn.mergeqkv.weight");
+            merge({"mlp.gate_proj.weight", "mlp.up_proj.weight"}, "mlp.gateup_proj.weight");
         }
         // Match the model loader's GPU embedding placement in both paths.
         weight["model.embed_tokens.weight"].ToDevice(DataDevice::CUDA, std::vector<int>{0});
@@ -783,7 +801,8 @@ int main(int argc, char **argv) {
             failGraphDevice = 0;
             failVerifyBegin = argc > 3 && std::string(argv[3]) == "failbegin";
             failVerifyInstantiate = argc > 3 && std::string(argv[3]) == "failinstantiate";
-            DraftFixture fixture; fixture.Run();
+            { DraftFixture fixture; fixture.Run(); }
+            { DraftFixture fixture(true); fixture.Run(); }
             return 0;
         }
         if (argc > 2 && std::string(argv[2]) == "verify_graph") {

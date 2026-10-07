@@ -42,11 +42,25 @@ void FastllmCudaNaiveLogitsSelect(const fastllm::Data &logits, int vocabOffset,
 
 // Model-specific CUDA operations use BF16 activations. Keys/values are packed
 // as [1, tokens, heads * dim (+ indexDim for DSA keys)].
-// raw is [1, rows, layers * 2 * heads * dim], in K0,V0,K1,V1 order.
+// Per-layer raw projections [1, rows, 2 * heads * dim] and norm weights [dim].
 // Returns false on unsupported layouts without changing cache contents/metadata.
-bool FastllmCudaNaiveDraftKV(const fastllm::Data &raw, const fastllm::Data &norm,
-    int start, std::vector<std::pair<fastllm::Data, fastllm::Data>> &kv,
+// No cross-layer weight copies are needed.
+bool FastllmCudaNaiveDraftKV(const std::vector<const fastllm::Data *> &raw,
+    const std::vector<const fastllm::Data *> &norm, int start,
+    std::vector<std::pair<fastllm::Data, fastllm::Data>> &kv,
     int heads, int dim, int window, int reserve, float eps, float theta);
+
+// Packed [Q,K,V] projection: head RMSNorm, RoPE, contiguous Q and direct K/V
+// cache writes. Preserve separate BF16 rounding; do not change cache metadata.
+// liveKeys is the graph's committed length + 1, or empty for host cache length.
+bool FastllmCudaNaiveDraftQKV(const fastllm::Data &raw,
+    const fastllm::Data &qNorm, const fastllm::Data &kNorm,
+    const fastllm::Data &positions, const fastllm::Data &liveKeys,
+    fastllm::Data &key, fastllm::Data &value, fastllm::Data &query,
+    int heads, int kvHeads, int dim, int window, float eps, float theta);
+// Unlike generic SwiGLU, round SiLU to BF16 before multiplication, matching
+// the draft's separate Silu + MulTo operations.
+void FastllmCudaNaiveDraftSwiGLU(const fastllm::Data &gateUp, fastllm::Data &output);
 
 void FastllmCudaNaiveRope(fastllm::Data &input, const fastllm::Data &positions,
                          int heads, int dim, int rotaryDim, float theta);
